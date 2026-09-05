@@ -1,0 +1,10 @@
+node_modules
+dist
+data
+.env
+.git
+*-preview.png
+test-results
+.build
+dist-static
+wasm/*.wasm

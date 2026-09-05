@@ -1,0 +1,35 @@
+{
+  "name": "tailterm",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "node server/index.js",
+    "build": "vite build",
+    "start": "NODE_ENV=production node server/index.js",
+    "test": "node --test tests/*.test.js",
+    "test:browser": "node tests/browser.mjs",
+    "build:wasm": "./scripts/build-wasm.sh",
+    "build:static": "vite build --mode static && node scripts/package-static.mjs",
+    "preview:static": "vite preview --outDir dist-static --host 127.0.0.1 --port 4318",
+    "test:static": "node tests/static-browser.mjs",
+    "export:vault": "node scripts/export-server-vault.mjs"
+  },
+  "dependencies": {
+    "@fontsource/fira-code": "^5.3.0",
+    "@fontsource/ibm-plex-mono": "^5.3.0",
+    "@fontsource/jetbrains-mono": "^5.3.0",
+    "@tailscale/connect": "1.102.3-3-tb31d8a75a-g5e651e16f",
+    "@xterm/addon-fit": "^0.11.0",
+    "@xterm/addon-search": "^0.16.0",
+    "@xterm/xterm": "^6.0.0",
+    "express": "^5.1.0",
+    "ssh2": "^1.17.0",
+    "ws": "^8.18.3"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.58.0",
+    "prettier": "^3.9.6",
+    "vite": "^7.3.0"
+  }
+}
