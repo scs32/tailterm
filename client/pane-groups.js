@@ -1,4 +1,4 @@
-import { PaneGroups, leaves, tileLayout } from "./pane-layout.js";
+import { PaneGroups, leaves, tileLayout, paneNeighbor } from "./pane-layout.js";
 import { setupPaneDrag } from "./pane-drag.js";
 
 export function setupPaneGroups({
@@ -201,8 +201,14 @@ export function setupPaneGroups({
     drag = null;
     release.hidden = true;
     document
-      .querySelectorAll(".group-drop-target")
-      .forEach((el) => el.classList.remove("group-drop-target"));
+      .querySelectorAll(".group-drop-target, .tab-drop-before, .tab-drop-after")
+      .forEach((el) =>
+        el.classList.remove(
+          "group-drop-target",
+          "tab-drop-before",
+          "tab-drop-after",
+        ),
+      );
   }
   setupPaneDrag(document.querySelector(".terminal-shell"), {
     start(source) {
@@ -213,10 +219,29 @@ export function setupPaneGroups({
     },
     move(element, x) {
       document
-        .querySelectorAll(".group-drop-target")
-        .forEach((el) => el.classList.remove("group-drop-target"));
+        .querySelectorAll(
+          ".group-drop-target, .tab-drop-before, .tab-drop-after",
+        )
+        .forEach((el) =>
+          el.classList.remove(
+            "group-drop-target",
+            "tab-drop-before",
+            "tab-drop-after",
+          ),
+        );
       const target = element?.closest("[data-pane], .tab, .pane-release");
-      target?.classList.add("group-drop-target");
+      if (drag?.whole && target?.matches(".tab")) {
+        const box = target.getBoundingClientRect(),
+          position = (x - box.left) / box.width;
+        drag.reorder =
+          position < 0.25 ? "before" : position > 0.75 ? "after" : null;
+        target.classList.add(
+          drag.reorder ? "tab-drop-" + drag.reorder : "group-drop-target",
+        );
+      } else {
+        if (drag) drag.reorder = null;
+        target?.classList.add("group-drop-target");
+      }
       if (element && strip.contains(element)) {
         const bounds = strip.getBoundingClientRect();
         if (x < bounds.left + 30) strip.scrollLeft -= 20;
@@ -237,7 +262,10 @@ export function setupPaneGroups({
       }
       const source = drag;
       clearDrag();
-      if (id) merge(source.id, id, source.whole);
+      if (id && source.whole && source.reorder) {
+        model.reorder(source.id, id, source.reorder === "after");
+        activate(getActive());
+      } else if (id) merge(source.id, id, source.whole);
       else if (!source.whole && element?.closest(".terminal-tabs"))
         detach(source.id);
     },
@@ -278,6 +306,16 @@ export function setupPaneGroups({
     members,
     merge,
     detach,
+    navigate(direction) {
+      const group = current();
+      if (!group) return;
+      const next = paneNeighbor(geometry(group).panes, getActive(), direction);
+      if (next) activate(next);
+    },
+    reorder(source, target, after) {
+      model.reorder(source, target, after);
+      activate(getActive());
+    },
     entries: () =>
       model.groups.map((g) => ({
         tab: getTabs().find((t) => t.id === g.active),

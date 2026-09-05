@@ -8,6 +8,7 @@ import {
   tmuxCommand,
   tmuxListCommand,
   validateTmuxPath,
+  tmuxRenameCommand,
 } from "../shared/tmux-command.js";
 
 test("tmux launch resolves SSH PATH and preserves real tmux failures", () => {
@@ -23,7 +24,10 @@ test("tmux launch resolves SSH PATH and preserves real tmux failures", () => {
       env: { ...process.env, PATH: dir },
     });
     assert.equal(result.status, 23);
-    assert.match(result.stdout, /^-T\nclipboard\nnew-session\n-A\n-s\nwork\n;/);
+    assert.match(
+      result.stdout,
+      /^-u\n-T\nclipboard\nnew-session\n-A\n-s\nwork\n;/,
+    );
     assert.match(result.stdout, /set-clipboard external/);
     assert.match(result.stderr, /terminal initialization failed/);
     assert.match(result.stderr, /exit status 23/);
@@ -47,7 +51,7 @@ test("explicit tmux executable works outside PATH, including spaces and quotes, 
     assert.equal(launch.status, 0);
     assert.match(
       launch.stdout,
-      /^-T\nclipboard\nnew-session\n-A\n-s\nwork-01\n;/,
+      /^-u\n-T\nclipboard\nnew-session\n-A\n-s\nwork-01\n;/,
     );
     assert.match(launch.stdout, /set-option\nmouse\non/);
     const list = spawnSync("/bin/sh", ["-c", tmuxListCommand(binary)], {
@@ -56,7 +60,7 @@ test("explicit tmux executable works outside PATH, including spaces and quotes, 
     assert.equal(list.status, 0);
     assert.equal(
       list.stdout,
-      "list-sessions\n-F\n#{session_name}|#{session_windows}|#{session_attached}\n",
+      "list-sessions\n-F\n#{session_name}|#{session_windows}|#{session_attached}|#{session_id}|#{session_created}\n",
     );
     const missing = spawnSync(
       "/bin/sh",
@@ -76,4 +80,8 @@ test("session and executable validation prevent command injection", () => {
   for (const value of ["../tmux", "tmux", "/bin/tmux\nwhoami"])
     assert.throws(() => validateTmuxPath(value));
   assert.throws(() => tmuxCommand("main'; echo injected"));
+  for (const name of ["", "a b", "a;b", "a'b", "a\nb", "x".repeat(65)]) {
+    assert.throws(() => tmuxRenameCommand("main", name));
+    assert.throws(() => tmuxRenameCommand(name, "new-name"));
+  }
 });

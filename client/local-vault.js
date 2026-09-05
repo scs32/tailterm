@@ -4,8 +4,13 @@ import {
   sealVault,
   portableData,
 } from "./vault-crypto.js";
-import { validateSession, validateTmuxPath } from "../shared/tmux-command.js";
+import {
+  validateSession,
+  validateTmuxPath,
+  validateTarget,
+} from "../shared/tmux-command.js";
 import { validatePrivateKey } from "./wasm-runtime.js";
+import { normalizeWorkspace } from "./workspace-state.js";
 let database,
   contents,
   key,
@@ -65,6 +70,47 @@ async function acquire() {
       .catch(reject);
   });
 }
+export async function resetVault() {
+  if (contents)
+    throw new Error("Lock this workspace before resetting its vault.");
+  const database = await db();
+  return navigator.locks.request(
+    "tailserve-vault-owner",
+    { ifAvailable: true },
+    async (lock) => {
+      if (!lock)
+        throw new Error(
+          "This workspace is open in another browser tab. Lock or close it before resetting this vault.",
+        );
+      await queue;
+      await new Promise((resolve, reject) => {
+        const tx = database.transaction("vault", "readwrite");
+        tx.objectStore("vault").clear();
+        tx.oncomplete = resolve;
+        tx.onerror = () => reject(tx.error);
+        tx.onabort = () =>
+          reject(tx.error || new Error("Vault reset aborted."));
+      });
+      contents = key = salt = undefined;
+    },
+  );
+}
+export async function forgetDevice() {
+  requireUnlocked();
+  await queue;
+  const database = await db();
+  await new Promise((resolve, reject) => {
+    const tx = database.transaction("vault", "readwrite");
+    tx.objectStore("vault").clear();
+    tx.oncomplete = resolve;
+    tx.onerror = () => reject(tx.error);
+    tx.onabort = () =>
+      reject(tx.error || new Error("Could not forget this device."));
+  });
+  contents = key = salt = undefined;
+  releaseLock?.();
+  releaseLock = undefined;
+}
 function requireUnlocked() {
   if (!contents || !key) throw new Error("Unlock your local vault first.");
 }
@@ -81,6 +127,11 @@ export function localData() {
       fingerprint,
     })),
     sessions: structuredClone(contents.sessions),
+    workspace: normalizeWorkspace(contents.workspace),
+    backup: {
+      changed: contents.backupChanged || null,
+      exported: contents.backupExported || null,
+    },
   };
 }
 export function credentials(id) {
@@ -96,11 +147,12 @@ export function privateKey(id) {
   requireUnlocked();
   return structuredClone(contents.keys.find((k) => k.id === id));
 }
-async function mutate(fn) {
+async function mutate(fn, backupChanged = false) {
   const task = queue.then(async () => {
     requireUnlocked();
     const next = structuredClone(contents);
     const result = await fn(next);
+    if (backupChanged) next.backupChanged = new Date().toISOString();
     const envelope = await sealVault(next, key, salt);
     await disk(envelope);
     contents = next;
@@ -121,8 +173,19 @@ export async function rememberCredential(id, changes, endpoint) {
         "Server profile changed during login; credentials were not saved.",
       );
     Object.assign(s, changes);
+  }, true);
+}
+export async function saveWorkspace(workspace) {
+  return mutate((d) => {
+    d.workspace = normalizeWorkspace(workspace);
   });
 }
+export async function markBackupExported(started = new Date().toISOString()) {
+  return mutate((d) => {
+    d.backupExported = started;
+  });
+}
+const editVault = (fn) => mutate(fn, true);
 export async function localAPI(url, method = "GET", body = {}) {
   if (url === "/status")
     return { initialized: !!(await disk()), unlocked: !!contents };
@@ -169,7 +232,7 @@ export async function localAPI(url, method = "GET", body = {}) {
       return { ok: true };
     });
   if (url === "/servers" && method === "POST")
-    return mutate((d) => {
+    return editVault((d) => {
       validateServer(body);
       const previous = d.servers.find((s) => s.id === body.id);
       if (body.id && !previous) throw new Error("Unknown server.");
@@ -200,7 +263,7 @@ export async function localAPI(url, method = "GET", body = {}) {
       else d.servers.push(server);
     });
   if (url.startsWith("/servers/") && method === "DELETE")
-    return mutate((d) => {
+    return editVault((d) => {
       const id = url.slice(9);
       d.servers = d.servers.filter((s) => s.id !== id);
       d.sessions = d.sessions.filter((s) => s.serverId !== id);
@@ -218,7 +281,7 @@ export async function localAPI(url, method = "GET", body = {}) {
       body.privateKey,
       body.passphrase || "",
     );
-    return mutate((d) => {
+    return editVault((d) => {
       d.keys.push({
         id: crypto.randomUUID(),
         name: body.name,
@@ -229,7 +292,7 @@ export async function localAPI(url, method = "GET", body = {}) {
     });
   }
   if (url.startsWith("/keys/") && method === "DELETE")
-    return mutate((d) => {
+    return editVault((d) => {
       const id = url.slice(6);
       if (d.servers.some((s) => s.keyId === id))
         throw new Error("Remove this key from server profiles first.");
@@ -238,12 +301,14 @@ export async function localAPI(url, method = "GET", body = {}) {
   if (url === "/sessions" && method === "POST")
     return mutate((d) => {
       validateSession(body.name);
+      if (body.target) validateTarget(body.target);
       if (!d.servers.some((s) => s.id === body.serverId))
         throw new Error("Unknown server.");
       let session = d.sessions.find(
         (s) => s.serverId === body.serverId && s.name === body.name,
       );
       if (!session) {
+        d.backupChanged = new Date().toISOString();
         session = {
           id: crypto.randomUUID(),
           serverId: body.serverId,
@@ -252,9 +317,14 @@ export async function localAPI(url, method = "GET", body = {}) {
         d.sessions.push(session);
       }
       session.lastConnected = new Date().toISOString();
+      if (body.target) {
+        if (JSON.stringify(session.target) !== JSON.stringify(body.target))
+          d.backupChanged = new Date().toISOString();
+        session.target = structuredClone(body.target);
+      }
     });
   if (url.startsWith("/sessions/") && method === "DELETE")
-    return mutate((d) => {
+    return editVault((d) => {
       d.sessions = d.sessions.filter((s) => s.id !== url.slice(10));
     });
   throw new Error("Unsupported local operation: " + method + " " + url);
@@ -264,11 +334,25 @@ export async function exportBackup() {
   requireUnlocked();
   return sealVault(portableData(contents), key, salt);
 }
+export async function renameSessionBookmark(serverId, name, nextName) {
+  validateSession(name);
+  validateSession(nextName);
+  return editVault((d) => {
+    const previous = d.sessions.find(
+      (s) => s.serverId === serverId && s.name === name,
+    );
+    if (!previous) return;
+    d.sessions = d.sessions.filter(
+      (s) => s === previous || s.serverId !== serverId || s.name !== nextName,
+    );
+    previous.name = nextName;
+  });
+}
 export async function importBackup(envelope, password) {
   const opened = await openVault(envelope, password);
   validateData(opened.data);
   // Never import another browser's node identity. Keep this browser's identity, if any.
-  return mutate((d) => {
+  return editVault((d) => {
     d.servers = opened.data.servers;
     d.keys = opened.data.keys;
     d.sessions = opened.data.sessions;

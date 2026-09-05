@@ -34,7 +34,7 @@ const palette = (name, background, foreground, accent, colors) => ({
 });
 // Inspired by the projects' Ghostty palettes; provenance is in docs/appearance.md.
 export const themes = {
-  tailserve: palette("Tailserve", "#101311", "#d2dbd4", "#b9ecc4", [
+  tailserve: palette("Tailterm", "#101311", "#d2dbd4", "#b9ecc4", [
     "#171d19",
     "#ed8e8e",
     "#a3d9ac",

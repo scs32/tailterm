@@ -33,10 +33,13 @@ export function fontShortcut(e) {
 }
 export function setupTerminalInput(
   t,
-  { preferences, isActive, notice, setFont, changed },
+  { preferences, isActive, notice, setFont, changed, pasteImages },
 ) {
   const canFocus = () =>
-    !t.disposed && isActive(t) && !document.querySelector("dialog[open]");
+    !t.disposed &&
+    isActive(t) &&
+    !t.el.querySelector(".local-history") &&
+    !document.querySelector("dialog[open]");
   // Real movement, rather than a layout-generated pointerenter after closing a dialog.
   t.el.addEventListener(
     "pointermove",
@@ -90,6 +93,30 @@ export function setupTerminalInput(
     }
   };
   t.paste = async () => {
+    t.history?.close();
+    if (pasteImages && navigator.clipboard.read) {
+      try {
+        const items = await navigator.clipboard.read(),
+          images = [];
+        for (const item of items) {
+          const type = item.types.find((type) => type.startsWith("image/"));
+          if (type)
+            images.push(
+              new File(
+                [await item.getType(type)],
+                `clipboard-${Date.now()}-${images.length}.${type.split("/")[1].replace(/[^a-z0-9]/gi, "")}`,
+                { type },
+              ),
+            );
+        }
+        if (images.length) {
+          await pasteImages(images);
+          return;
+        }
+      } catch {
+        /* Text paste and the manual fallback remain available. */
+      }
+    }
     try {
       await paste(await navigator.clipboard.readText());
     } catch {
@@ -101,6 +128,7 @@ export function setupTerminalInput(
   t.el.addEventListener(
     "paste",
     (e) => {
+      if (e.target.closest?.(".local-history")) return;
       e.preventDefault();
       e.stopImmediatePropagation();
       void paste(e.clipboardData?.getData("text/plain") || "");
@@ -110,6 +138,7 @@ export function setupTerminalInput(
   t.el.addEventListener(
     "copy",
     (e) => {
+      if (e.target.closest?.(".local-history")) return;
       const text = t.term.getSelection() || t.clipboardText;
       if (text) {
         e.preventDefault();
@@ -140,7 +169,11 @@ export function setupTerminalInput(
       // Let the browser emit its trusted paste event (works without readText permission).
       return false;
     }
-    if ((e.metaKey || e.ctrlKey) && e.shiftKey && ["k", "l", "f"].includes(key))
+    if (
+      (e.metaKey || e.ctrlKey) &&
+      e.shiftKey &&
+      ["k", "l", "f", "p"].includes(key)
+    )
       return false;
     return true;
   });
@@ -193,7 +226,19 @@ function clipboardFallback(text, title, editable = false) {
     };
     button.onclick = () => finish(editable ? input.value : null);
     d.oncancel = () => finish(null);
-    d.append(h, p, input, button);
+    const head = document.createElement("div");
+    head.className = "dialog-head";
+    h.id = "clipboard-title";
+    d.setAttribute("aria-labelledby", h.id);
+    const close = document.createElement("button");
+    close.textContent = "×";
+    close.setAttribute("aria-label", "Cancel clipboard action");
+    close.onclick = () => finish(null);
+    head.append(h, close);
+    const actions = document.createElement("div");
+    actions.className = "dialog-actions";
+    actions.append(button);
+    d.append(head, p, input, actions);
     (document.fullscreenElement || document.body).append(d);
     d.showModal();
     input.focus();
@@ -228,7 +273,16 @@ function pastePreview(text, t) {
     approve.onclick = () => finish(true);
     d.oncancel = () => finish(false);
     actions.append(cancel, approve);
-    d.append(title, p, preview, actions);
+    const head = document.createElement("div");
+    head.className = "dialog-head";
+    title.id = "paste-preview-title";
+    d.setAttribute("aria-labelledby", title.id);
+    const close = document.createElement("button");
+    close.textContent = "×";
+    close.setAttribute("aria-label", "Cancel paste");
+    close.onclick = () => finish(false);
+    head.append(title, close);
+    d.append(head, p, preview, actions);
     (document.fullscreenElement || document.body).append(d);
     d.showModal();
     cancel.focus();

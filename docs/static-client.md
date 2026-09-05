@@ -1,6 +1,6 @@
-# Tailserve browser distribution
+# Tailterm browser distribution
 
-The static build targets `https://tailterm.tailarr.com/`. It needs an HTTPS static file host, Tailscale coordination/relay services, and reachable destination SSH servers. It has no Tailserve API, websocket SSH gateway, central vault, or application process. Ordinary SSH connections use Tailscale network transport; public/LAN raw TCP outside that transport is not available to a normal webpage.
+The static build targets `https://tailterm.tailarr.com/`. It needs an HTTPS static file host, Tailscale coordination/relay services, and reachable destination SSH servers. It has no Tailterm API, websocket SSH gateway, central vault, or application process. Ordinary SSH connections use Tailscale network transport; public/LAN raw TCP outside that transport is not available to a normal webpage.
 
 ## Build and serve
 
@@ -31,10 +31,16 @@ The custom WASM registers a non-ephemeral browser node and accepts approved subn
 
 Backup & restore exports encrypted server profiles, credentials and bookmarks. It excludes Tailscale node state. Restore preserves this browser's current node identity and replaces its profiles/keys/bookmarks after confirmation. Browser storage can be cleared or evicted, so keep an encrypted backup. Same-origin application code can use unlocked secrets; the dedicated subdomain avoids sharing that origin with the main site.
 
+### Forgotten passphrase
+
+On the locked screen, choose **Forgot passphrase? Reset this browser’s vault**, type `RESET`, and choose **Delete local vault**. No old passphrase is required. This permanently removes this website’s local encrypted vault, including saved servers, SSH keys/passwords, bookmarks, and Tailscale device identity. Close or lock any other tab using the vault first. Create a new vault and authorize Tailscale again afterward.
+
+Remote servers and tmux sessions, other browser/origin vaults, appearance preferences, and downloaded backups are preserved. Backups still need their original passphrase; reset does not decrypt or recover forgotten credentials.
+
 ### Move the original server vault
 
 ```sh
-npm run export:vault -- data/vault.enc /path/to/tailserve-backup.json
+npm run export:vault -- data/vault.enc /path/to/tailterm-backup.json
 ```
 
 This offline command prompts for the existing passphrase without echoing it and writes a portable encrypted backup using the same passphrase. It refuses to overwrite an existing output file and leaves the old vault unchanged. Create/unlock a browser vault, open Backup & restore, select the file, and supply the backup passphrase. The browser authorizes its own Tailscale device; the former server-stored node is not cloned. Migration has not been performed against your actual vault.
@@ -50,6 +56,34 @@ Successful credentials are cached in memory for background session queries. Pass
 For standard SSH without a saved credential, connect opens the key/password/interactive-login chooser before contacting the server. The browser cannot read your computer's `~/.ssh/config`, private keys, or SSH agent: use the actual hostname or IP and explicitly import a key or enter a password. Background discovery waits for a trusted host and a usable credential. Authentication banners appear as plain text, including server approval instructions. An EOF identifies whether the server closed before host verification or during sign-in; it does not automatically trigger password retries. Cancelling interactive verification is reported as a cancelled sign-in.
 
 ## Terminal interactions
+
+### Workspace continuity
+
+After unlocking, the browser restores previously connected tabs, active tab, group layout, split proportions, and tab order from the encrypted vault. Server endpoints must still match the saved workspace. Plain SSH tabs start a fresh shell; tmux tabs resume the existing remote session. SSH passwords that were not remembered must be entered again. No vault key or passphrase is stored to bypass unlocking. Workspace changes save shortly after interaction; a refresh during the final fraction of a second of a change may retain the preceding layout.
+
+Verified tmux targets include the session ID and creation timestamp. Rename, resume, and reconnect can follow the same session after its name changes, and reject a missing or stale target. Remote rename changes are reflected when the session list is refreshed.
+
+SSH keepalives detect broken connections. Previously connected tmux tabs retry transient transport failures up to five times with increasing delays, reusing their terminal and scrollback. Authentication, changed host keys, missing sessions, and normal remote exits require manual action. Closing a tab or locking cancels retries. Network recovery and returning after sleep trigger recovery where appropriate; the inactivity lock remains in force.
+
+Drag to the left/right edge of a tab to reorder it; a highlighted edge previews placement. Drop in the center to group. The tab menu also offers **Move left** and **Move right**. Groups move as a unit.
+
+**Diagnostics** shows network, Tailscale, SSH, host-verification, and tmux status plus the last error and retry state. **Save output** downloads the terminal's currently retained scrollback as UTF-8 text. It does not retrieve remote tmux history that the browser has never received.
+
+### Image uploads
+
+Drop up to ten images onto a connected terminal to review an upload. Tailterm queries the verified tmux session's active pane directory; the destination is visible and editable. Plain SSH shells require an explicit absolute folder. Each image is limited to 20 MiB and each batch to 100 MiB.
+
+Uploads use SFTP directly over the existing browser SSH authentication path and Tailscale transport; the destination SSH server must offer SFTP. Files are written in chunks to private temporary files, then renamed into place using non-overwriting SFTP rename. Existing filenames are rejected. Cancellation or a broken connection can leave a temporary `.tailterm-upload-*.part` file if remote cleanup cannot complete.
+
+After success, Tailterm can insert shell-quoted paths into the same active terminal without pressing Enter, or leave the paths available to copy. The upload dialog never runs the image or submits a terminal command. Other panes are not used for path insertion if focus changes.
+
+### Backups and recovery
+
+Backups are available on demand without automatic reminders. **Backup & restore** displays the last backup-download date. Downloading a backup does not prove it was retained elsewhere; keep the file and its passphrase. Workspace layout and Tailscale node identity stay browser-local and are excluded from portable backups.
+
+- Use a tmux tab’s **...** session menu, or **Rename** beside a session in the launcher, to rename the real remote session. The dialog starts with its current name and accepts 1–64 letters, numbers, underscores, or dashes. Tmux rejects duplicates. Attached terminals and running processes continue; matching open-tab labels and encrypted bookmarks update after success. Other devices see the remote name when they refresh their session list. Sign in to the server once before using session management.
+
+- Tmux launch and resume explicitly enable UTF-8 output, even when SSH does not provide a UTF-8 locale. After updating from an older client, reload the page and resume the existing tmux session to restore symbols and punctuation that appeared as underscores.
 
 - **Discover devices** is the entry point for saving servers. It opens a centered modal with search and a live device list. Selecting a device opens its SSH setup in the modal; selecting a saved device edits its existing profile. The launcher also provides Discover, including in fullscreen. Connections may use ordinary SSH or Tailscale SSH; hosts behind approved subnet routes can still be reached using an edited connection profile.
 - **Expand** fills the browser window while retaining its tabs and address bar. **Restore** returns to the normal workspace. **Fullscreen** remains a separate display-filling mode. Tab/pane dragging uses pointer capture within the terminal, including fullscreen; dropping outside a valid target or cancelling a drag leaves the group unchanged.
@@ -76,3 +110,50 @@ For standard SSH without a saved credential, connect opens the key/password/inte
 `python3 tests/real-tmux.py /path/to/tmux` checks the generated commands, OSC 52 payload, session mouse setting, and persistence using an isolated real tmux socket and PTY. The local test binary is not installed on any destination server.
 
 Live tailnet authorization, subnet routing, persistent device reauthorization behavior, and deployment to the public hostname remain environment-dependent checks. This client does not provide background browser execution after closure, automatic cross-device sync, native ssh-agent access, local TCP listeners/port forwarding, or an SFTP file browser.
+
+## Everyday workspace controls
+
+- **Commands** (Ctrl/Cmd + Shift + P) searches session switching, rename, grouping/splitting existing terminals, reconnect, uploads, output download, diagnostics, and settings. Arrow keys select a result; Enter runs it. The palette does not execute arbitrary shell commands.
+- **Uploads** accepts dropped images, clipboard screenshots, or the palette’s image picker. Hide the upload dialog with × or Escape and reopen it from the persistent Uploads button. Cancel explicitly stops the active transfer. Uploads continue while the page stays open; locking, refreshing, or closing the page stops them. Completed paths are inserted only when the review dialog and original destination terminal are still active; otherwise reopen Uploads to copy them.
+- Inactive tabs show **New output**, **Bell**, **Needs attention**, or **Command finished**. Completion requires the remote shell to emit an OSC 133 command-finished marker; silence is not treated as completion. Selecting a tab clears its indicator.
+- On narrow screens, an open terminal uses the available viewport with a session switcher and Esc, Tab, Ctrl-C, and arrow controls. **Select text** opens retained output in a native selectable text area. The viewport adapts when the on-screen keyboard changes its height.
+- **Forget this device** requires typing FORGET and deletes this origin’s local vault and appearance settings. It keeps remote tmux sessions and downloaded backups. Removing the browser from the tailnet is a separate action in the [Tailscale Machines page](https://login.tailscale.com/admin/machines); follow [Tailscale’s removal instructions](https://tailscale.com/kb/1260/device-remove). The dialog links to device management and offers a backup first.
+
+### Optional local history and browser-tab activity
+
+Each tmux terminal has a small **Scroll off / Scroll on** toggle in its upper-right corner. It starts off; ordinary scrolling keeps working normally. Click to turn power scrolling on and fetch a local snapshot of up to 5,000 history lines plus the visible pane, bounded to 1 MiB. The view uses the terminal’s font and spacing and scrolls locally. Click again (or press Escape) to return to live input. Each activation fetches fresh history. The Commands palette also offers the toggle. History stays in memory and is discarded when switched off, closed, locked, or refreshed. Live output continues behind the snapshot. A program’s private history outside tmux’s retained pane buffer is not available through this feature.
+
+New-output activity compares rendered text instead of raw SSH traffic. Identical redraws, cursor-only updates, and changes limited to the usual bottom tmux status row do not count. Background comparisons are throttled; bells, explicit command completion, and connection errors take priority. The browser title shows an unread-session count and the highest-priority activity. Returning to a session clears its indicator. Applications that visibly change their content may still generate activity; this is not a semantic notification feed.
+
+### Keyboard navigation between grouped panes
+
+Use **Option + Shift + arrow** on Mac, or **Ctrl + Alt + arrow** on Windows/Linux, to focus a pane in that direction within the current group. Navigation follows the visible layout, including portrait stacking, and stops at the outside edge. It does not wrap or switch groups. These shortcuts do not send keystrokes to SSH and are inactive in dialogs and ordinary form fields. The Commands palette also includes **Focus pane left/right/up/down**.
+
+### Local voice dictation
+
+With a terminal connected, press **Option + Space** or **Shift + Option + V** on Mac (**Alt + Space** or **Alt + Shift + V** elsewhere), click **Mic**, or use **Voice dictation** in Commands. The model warms up after unlock without accessing the microphone. Opening the compact popup starts recording automatically, with a waveform driven by microphone volume and a matching recording progress bar. Press **Stop** to transcribe and insert directly into the selected terminal; the popup closes automatically. There is no live transcript or review step. Insertion never presses Enter; newlines and tabs become spaces. Closing the popup or pressing Escape cancels without inserting anything. Recording stops automatically at 60 seconds.
+
+If recording fails, **Record again** allows a retry. The destination is pinned when the popup opens; if it changes or disconnects, the text is preserved in the popup for copying rather than sent to another terminal.
+
+The English Whisper tiny.en q8 model runs locally in a dedicated WASM worker. First use downloads about 40 MB of model files from Hugging Face plus the self-hosted runtime. Model files are cached in `tailterm-speech-v1`. Audio and transcripts are not persisted or uploaded. Closing the popup, locking, or leaving the page stops recording and terminates the worker. Browser storage eviction may require another model download. HTTPS and microphone permission are required.
+
+`node tests/speech-browser.mjs` verifies real browser WASM inference with the public Transformers.js JFK speech fixture (`.build/speech-fixture.wav`), the model cache, no non-GET requests, and an AudioWorklet under the production CSP. The static browser suite uses a fake microphone and deterministic speech worker for permission denial, cancellation, automatic recording, waveform response, shortcut handling, and direct Stop insertion. The pinned ORT runtime uses basic graph optimization because its extended QDQ pass fails on Whisper's tied embeddings.
+
+Fetch the public test recording before the speech test:
+
+```sh
+curl -fL https://huggingface.co/datasets/Xenova/transformers.js-docs/resolve/main/jfk.wav -o .build/speech-fixture.wav
+node tests/speech-browser.mjs
+```
+
+Pass a deployed origin as the optional argument to run the same inference and microphone-worklet checks against published assets. The recording is decoded in the test browser; it is never uploaded to that origin.
+
+The dictation waveform responds to microphone volume. Option + Space is handled when the browser receives it; an OS launcher using that combination takes precedence. Shift + Option + V remains available.
+
+`node tests/dictation-safety-browser.mjs` checks single insertion without Enter, preservation of unsent text when the destination changes, and cancellation during transcription.
+
+### Popup presentation
+
+Dialogs share theme colors, compact fields, consistent headers and action rows, and sizes suited to their task. Advanced SSH options, restore controls and extended help expand on demand. Destructive actions still require explicit confirmation; their themed confirmation preserves the underlying form when canceled. Phone layouts use a single column with touch-sized controls and scroll inside the dialog.
+
+`npm run test:static` includes desktop/phone checks for the main popup families and captures screenshots in `.build/popup-*.png`. `node tests/popup-prompts-browser.mjs` covers host trust, SSH credentials, verification codes and confirmation dialogs in dark and light themes. Clipboard, upload, rename, vault reset and mobile flows remain covered by the browser regression suites.

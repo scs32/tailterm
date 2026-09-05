@@ -8,7 +8,7 @@ import {
   portableData,
   sealVault,
 } from "../client/vault-crypto.js";
-const [input = "data/vault.enc", output = "tailserve-backup.json"] =
+const [input = "data/vault.enc", output = "tailterm-backup.json"] =
   process.argv.slice(2);
 if (!process.stdin.isTTY)
   throw new Error(

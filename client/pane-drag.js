@@ -13,7 +13,7 @@ export function setupPaneDrag(shell, { start, move, drop, cancel }) {
     if (
       !source ||
       e.target.closest(
-        "[data-close], [data-detach], .pane-header button:not(.pane-label)",
+        "[data-close], [data-session-menu], [data-detach], .pane-header button:not(.pane-label)",
       )
     )
       return;

@@ -6,7 +6,7 @@ import {
   rememberCredential,
 } from "./local-vault.js";
 import { findPeer, isAuthenticationFailure } from "./connection-help.js";
-import { tmuxListCommand } from "../shared/tmux-command.js";
+import { tmuxListCommand, tmuxRenameCommand } from "../shared/tmux-command.js";
 const activeCredentials = new Map();
 
 export function browserSSH(ipn, server, peers, options = {}) {
@@ -82,6 +82,7 @@ export function browserSSH(ipn, server, peers, options = {}) {
           fingerprint: credentials(server.id).server.fingerprint || "",
           pty: options.pty !== false,
           command: options.command || "",
+          upload: options.upload,
           verifyHost: async (fingerprint) => {
             if (!interactive)
               throw new Error(
@@ -158,9 +159,9 @@ export function browserSSH(ipn, server, peers, options = {}) {
               changes.password = credential.password;
             if (credential.keyId) changes.keyId = credential.keyId;
             if (Object.keys(changes).length)
-              void rememberCredential(server.id, changes, server).catch((e) =>
-                options.onWarning?.(e.message),
-              );
+              void rememberCredential(server.id, changes, server)
+                .then(() => options.onCredentialsSaved?.())
+                .catch((e) => options.onWarning?.(e.message));
             options.onConnected?.();
           },
           onExit: (code) => {
@@ -276,11 +277,12 @@ export async function browserTmux(ipn, server, peers) {
         .split(/\r?\n/)
         .filter(Boolean)
         .map((line) => {
-          const [name, windows, attached] = line.split("|");
+          const [name, windows, attached, id, created] = line.split("|");
           return {
             name,
             windows: Number(windows) || 0,
             attached: Number(attached) || 0,
+            ...(id && created ? { target: { id, created } } : {}),
           };
         }),
     };
@@ -288,4 +290,97 @@ export async function browserTmux(ipn, server, peers) {
     clearTimeout(timer);
     session.close();
   }
+}
+
+export async function browserRenameTmux(
+  ipn,
+  server,
+  peers,
+  name,
+  nextName,
+  target,
+) {
+  let stderr = "";
+  const decoder = new TextDecoder();
+  const session = browserSSH(ipn, server, peers, {
+    pty: false,
+    interactive: false,
+    command: tmuxRenameCommand(name, nextName, server.tmuxPath, target),
+    onData: () => {},
+    onStderr: (chunk) => {
+      stderr += decoder.decode(chunk, { stream: true });
+      if (stderr.length > 65536) session.close();
+    },
+  });
+  const timer = setTimeout(() => session.close(), 25000);
+  try {
+    const result = await session.done;
+    stderr += decoder.decode();
+    if (!result)
+      throw new Error(
+        "Rename was not confirmed. Refresh the session list before trying again.",
+      );
+    if (result.exitCode !== 0)
+      throw new Error(stderr.trim() || "Could not rename the tmux session.");
+  } finally {
+    clearTimeout(timer);
+    session.close();
+  }
+}
+export async function browserCommand(
+  ipn,
+  server,
+  peers,
+  command,
+  maxOutput = 65536,
+) {
+  let output = "",
+    stderr = "",
+    overflow = false,
+    receivedBytes = 0;
+  const decoder = new TextDecoder(),
+    errors = new TextDecoder();
+  const session = browserSSH(ipn, server, peers, {
+    pty: false,
+    interactive: false,
+    command,
+    onData: (d) => {
+      receivedBytes += d.byteLength;
+      output += decoder.decode(d, { stream: true });
+      if (receivedBytes > maxOutput) {
+        overflow = true;
+        session.close();
+      }
+    },
+    onStderr: (d) => {
+      stderr += errors.decode(d, { stream: true });
+      if (stderr.length > 65536) session.close();
+    },
+  });
+  const timer = setTimeout(() => session.close(), 25000);
+  try {
+    const result = await session.done;
+    if (overflow) throw new Error("Remote output exceeded the size limit.");
+    output += decoder.decode();
+    stderr += errors.decode();
+    if (!result || result.exitCode !== 0)
+      throw new Error(stderr.trim() || "Remote command failed or timed out.");
+    return output;
+  } finally {
+    clearTimeout(timer);
+    session.close();
+  }
+}
+export function browserUpload(ipn, server, peers, file, path, progress) {
+  return browserSSH(ipn, server, peers, {
+    pty: false,
+    interactive: false,
+    upload: {
+      path,
+      size: file.size,
+      progress,
+      readChunk: async (offset, length) =>
+        new Uint8Array(await file.slice(offset, offset + length).arrayBuffer()),
+    },
+  });
 }

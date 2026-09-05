@@ -4,7 +4,6 @@ A browser SSH terminal that connects through Tailscale. Run it from a static web
 
 **Try it: [tailterm.tailarr.com](https://tailterm.tailarr.com)**
 
-The interface currently displays the earlier Tailserve name in some places.
 
 ## Features
 

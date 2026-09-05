@@ -66,6 +66,9 @@ export function setupTooltips() {
   convert(document.body);
   new MutationObserver((records) => {
     for (const r of records) {
+      // xterm redraws its rows continuously. Terminal content never has app
+      // tooltips, so don't scan those subtrees on every output/scroll frame.
+      if (r.target.nodeType === 1 && r.target.closest(".xterm")) continue;
       if (r.type === "attributes") convert(r.target);
       else
         for (const node of r.addedNodes)

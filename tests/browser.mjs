@@ -513,8 +513,8 @@ try {
   );
   // Deleting a server removes its connections and bookmarks, without killing remote tmux.
   await page.locator("#edit-server").click();
-  page.once("dialog", (d) => d.accept());
   await page.locator("#delete-server").click();
+  await page.locator(".confirmation-dialog [data-confirm]").click();
   await page.locator("#dialog").waitFor({ state: "hidden" });
   assert.equal(await page.locator("[data-tab]").count(), 0);
   assert.equal(await page.locator("[data-saved]").count(), 0);

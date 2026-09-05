@@ -274,6 +274,23 @@ p {
   height: 34px;
   font-size: 26px;
 }
+.brand-icon svg {
+  display: block;
+  width: 100%;
+  height: 100%;
+}
+.vault-reset-link {
+  background: transparent;
+  border: 0;
+  padding: 8px 0;
+  color: var(--muted);
+  text-decoration: underline;
+  text-underline-offset: 3px;
+  font-size: 12px;
+}
+#vault-reset-error {
+  color: #edada1;
+}
 .version {
   font-size: 9px;
   letter-spacing: 1px;
@@ -750,6 +767,10 @@ header {
 .terminal-instance {
   height: 100%;
   padding: 12px 12px 5px;
+}
+.terminal-viewport {
+  width: 100%;
+  height: 100%;
 }
 #empty-terminal {
   height: 100%;
@@ -1487,6 +1508,73 @@ dialog:modal {
   justify-content: center;
   height: 100%;
 }
+#tabs .tab button[data-session-menu] {
+  flex: 0 0 26px;
+  padding: 4px;
+  justify-content: center;
+  height: 100%;
+}
+#launcher-sessions .session-card {
+  min-width: 0;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  overflow: hidden;
+}
+#launcher-sessions .session-card .session-result {
+  border: 0;
+}
+#launcher-sessions .session-rename {
+  display: block;
+  margin: 0 8px 8px auto;
+  font-size: 11px;
+  padding: 5px 9px;
+}
+#rename-session-error {
+  color: #edada1;
+}
+#diagnostic-facts dt {
+  margin-top: 12px;
+  color: var(--muted);
+  font-size: 11px;
+}
+#diagnostic-facts dd {
+  margin: 4px 0 0;
+  overflow-wrap: anywhere;
+}
+.terminal-footer > div {
+  flex-wrap: wrap;
+}
+#tabs .tab {
+  position: relative;
+}
+.tab-drop-before::before,
+.tab-drop-after::after {
+  content: "";
+  position: absolute;
+  top: 3px;
+  bottom: 3px;
+  width: 3px;
+  background: var(--accent);
+  z-index: 3;
+  pointer-events: none;
+}
+.tab-drop-before::before {
+  left: 0;
+}
+.tab-drop-after::after {
+  right: 0;
+}
+#terminal-body.file-drop-active {
+  outline: 3px solid var(--accent);
+  outline-offset: -3px;
+}
+#upload-files {
+  max-height: 250px;
+  overflow: auto;
+}
+#upload-note {
+  overflow-wrap: anywhere;
+}
 .tab-scroll {
   flex: 0 0 26px;
   width: 26px;
@@ -2199,4 +2287,654 @@ aside #discover {
   #workspace > main {
     padding-bottom: 15px;
   }
+}
+/* Workspace actions and background transfers */
+#command-results,
+#mobile-sessions {
+  display: grid;
+  gap: 6px;
+  max-height: 50dvh;
+  overflow: auto;
+  margin-top: 14px;
+}
+#command-results button,
+#mobile-sessions button {
+  text-align: left;
+  min-height: 44px;
+  white-space: normal;
+}
+#command-results .selected {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+.tab-activity {
+  color: var(--accent);
+  font-size: 10px;
+}
+.tab-activity:empty {
+  display: none;
+}
+#upload-dialog {
+  width: min(580px, calc(100vw - 24px));
+  max-height: calc(100dvh - 24px);
+  overflow: auto;
+}
+#upload-dialog input:not([type="checkbox"]),
+#upload-dialog textarea {
+  width: 100%;
+}
+#upload-files {
+  overflow-wrap: anywhere;
+}
+#upload-tray {
+  max-width: 230px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+#mobile-output {
+  width: 100%;
+  height: 45dvh;
+  white-space: pre;
+  overflow: auto;
+}
+.mobile-terminal-keys {
+  display: none;
+}
+@media (max-width: 720px) {
+  button {
+    min-height: 44px;
+  }
+  input,
+  select,
+  textarea {
+    font-size: 16px;
+  }
+  .mobile-terminal-keys {
+    display: flex;
+    flex: none;
+    gap: 4px;
+    overflow-x: auto;
+    padding: 4px;
+    overscroll-behavior-x: contain;
+  }
+  .mobile-terminal-keys button {
+    flex: none;
+    min-width: 44px;
+    touch-action: manipulation;
+  }
+  body.terminal-open #workspace {
+    height: var(--visible-height, 100dvh);
+    min-height: 0;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+  }
+  body.terminal-open #workspace > aside {
+    display: none;
+  }
+  body.terminal-open #workspace > main {
+    display: flex;
+    flex: 1;
+    flex-direction: column;
+    min-height: 0;
+    padding: 6px;
+  }
+  body.terminal-open main > header {
+    flex: none;
+    padding: 0;
+    min-height: 44px;
+  }
+  body.terminal-open .terminal-shell {
+    flex: 1;
+    min-height: 0;
+    height: 0;
+    display: flex;
+    flex-direction: column;
+  }
+  body.terminal-open #terminal-body {
+    flex: 1;
+    min-height: 0;
+    height: 0;
+  }
+  body.terminal-open .terminal-tabs {
+    flex: none;
+  }
+  body.terminal-open .terminal-tools {
+    display: none;
+  }
+  body.terminal-open .terminal-footer {
+    flex: none;
+    gap: 4px;
+    padding: 4px;
+  }
+  body.terminal-open .terminal-footer > div {
+    flex-wrap: nowrap;
+    overflow-x: auto;
+    max-width: 100%;
+  }
+  body.terminal-open .terminal-footer button {
+    flex: none;
+  }
+  body.terminal-open #tail-status,
+  body.terminal-open #tail-dot {
+    display: none;
+  }
+  body.mobile-keyboard .terminal-footer > #terminal-status {
+    display: none;
+  }
+  .tab [data-close],
+  .tab [data-session-menu] {
+    min-width: 36px;
+  }
+  dialog {
+    max-height: calc(var(--visible-height, 100dvh) - 20px);
+  }
+}
+@media (max-width: 720px) {
+  #tabs .tab {
+    flex: 0 0 220px;
+    min-width: 220px;
+  }
+  body.terminal-open .terminal-footer button {
+    font-size: 13px;
+    padding: 8px 10px;
+  }
+}
+/* A per-terminal switch keeps live scrolling and local history explicit. */
+.power-scroll-toggle {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  z-index: 6;
+  padding: 4px 9px;
+  min-height: 28px;
+  border-radius: 16px;
+  font-size: 11px;
+  line-height: 18px;
+  background: var(--raised);
+  color: var(--muted);
+  opacity: 0.8;
+}
+.power-scroll-toggle:hover,
+.power-scroll-toggle:focus-visible {
+  opacity: 1;
+}
+.power-scroll-toggle[aria-pressed="true"] {
+  color: var(--accent);
+  border-color: var(--accent);
+  opacity: 1;
+}
+.power-scroll-toggle:disabled {
+  opacity: 0.4;
+}
+.local-history {
+  position: absolute;
+  inset: 0;
+  z-index: 4;
+  display: flex;
+  background: var(--terminal-bg);
+  color: var(--ink);
+}
+.local-history pre {
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+  overflow: auto;
+  padding: var(--terminal-padding);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  user-select: text;
+  touch-action: pan-x pan-y;
+  overscroll-behavior: contain;
+  margin: 0;
+}
+.history-status {
+  position: absolute;
+  bottom: 4px;
+  right: 8px;
+  max-width: calc(100% - 16px);
+  padding: 2px 6px;
+  background: var(--terminal-bg);
+  color: var(--muted);
+  font-size: 10px;
+  pointer-events: none;
+}
+.history-loading {
+  background: transparent;
+}
+.history-loading pre {
+  visibility: hidden;
+}
+@media (pointer: coarse) {
+  .power-scroll-toggle {
+    min-height: 44px;
+    padding: 8px 12px;
+  }
+}
+#voice-dialog {
+  width: min(380px, calc(100vw - 24px));
+  max-height: calc(var(--visible-height, 100dvh) - 24px);
+  overflow: auto;
+}
+#voice-transcript {
+  width: 100%;
+  resize: vertical;
+  min-height: 150px;
+  font: inherit;
+}
+#voice-status {
+  overflow-wrap: anywhere;
+  min-height: 2em;
+}
+#voice-dialog .dialog-actions {
+  flex-wrap: wrap;
+}
+
+.voice-visual {
+  margin: 18px 0;
+  padding: 22px 16px 16px;
+  border-radius: 18px;
+  border: 1px solid color-mix(in srgb, var(--accent, #56d8cc) 25%, transparent);
+  background: radial-gradient(ellipse at 50% 100%, #35bda51f, transparent 75%);
+}
+.voice-wave {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  height: 68px;
+}
+.voice-wave span {
+  --level: 0;
+  width: 7px;
+  height: calc(6px + var(--level) * 58px);
+  border-radius: 8px;
+  background: linear-gradient(0deg, #32bfa7, #91f2e2);
+  opacity: calc(0.4 + var(--level) * 0.6);
+  box-shadow: 0 0 calc(var(--level) * 16px) #59dec77a;
+  transition:
+    height 90ms ease-out,
+    opacity 90ms ease-out;
+}
+.voice-listening {
+  text-align: center;
+  margin-top: 10px;
+  font-size: 12px;
+  letter-spacing: 0.05em;
+  opacity: 0.8;
+}
+.voice-visual[data-state="listening"] {
+  border-color: #59dec755;
+}
+@media (prefers-reduced-motion: reduce) {
+  .voice-wave span {
+    transition: none;
+  }
+}
+
+#voice-dialog .dialog-actions {
+  justify-content: center;
+}
+#voice-dialog .dialog-actions button {
+  min-width: 120px;
+}
+#voice-status,
+.voice-hint {
+  text-align: center;
+}
+
+/* Shared popup language: compact forms, quiet surfaces and clear actions. */
+dialog {
+  width: 480px;
+  max-width: calc(100vw - 24px);
+  max-height: min(88dvh, calc(var(--visible-height, 100dvh) - 24px));
+  padding: 22px;
+  border-radius: 16px;
+  background: var(--surface);
+  border-color: var(--line);
+  overflow: auto;
+  overscroll-behavior: contain;
+  box-shadow:
+    0 24px 80px #0007,
+    0 2px 8px #0003;
+  animation: popup-appear 120ms ease-out;
+}
+dialog::backdrop {
+  background: #080c1090;
+  backdrop-filter: blur(3px);
+}
+dialog .dialog-head {
+  position: sticky;
+  top: 0;
+  z-index: 2;
+  gap: 16px;
+  margin: -4px 0 16px;
+  padding: 4px 0 12px;
+  background: var(--surface);
+  border-bottom: 1px solid var(--line);
+}
+dialog .dialog-head h2,
+dialog > h2 {
+  font-size: 18px;
+  line-height: 1.3;
+  font-weight: 600;
+  letter-spacing: -0.025em;
+  color: var(--ink);
+}
+dialog .dialog-head button {
+  display: grid;
+  place-items: center;
+  flex: none;
+  width: 30px;
+  min-height: 30px;
+  padding: 0;
+  font-size: 20px;
+  border-radius: 8px;
+  color: var(--muted);
+}
+dialog p {
+  font-size: 13px;
+  line-height: 1.55;
+  margin: 12px 0;
+  overflow-wrap: anywhere;
+}
+dialog .fine {
+  font-size: 11.5px;
+  line-height: 1.55;
+}
+dialog h3 {
+  margin: 20px 0 10px;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.07em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+dialog label {
+  margin-top: 12px;
+  font-size: 12px;
+}
+dialog label :is(input, select, textarea) {
+  margin-top: 6px;
+}
+dialog :is(input, select, textarea):not([type="checkbox"]):not([type="range"]) {
+  padding: 9px 11px;
+  border-radius: 8px;
+  background: var(--terminal-bg);
+  font-size: 13px;
+}
+dialog textarea {
+  resize: vertical;
+  min-height: 100px;
+}
+dialog button {
+  border-radius: 8px;
+  font-size: 12px;
+  min-height: 36px;
+}
+dialog .form-grid {
+  gap: 12px;
+}
+dialog .dialog-actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  align-items: center;
+  gap: 8px;
+  margin-top: 18px;
+  padding-top: 14px;
+  border-top: 1px solid var(--line);
+}
+dialog .dialog-actions > .danger {
+  margin-right: 0;
+}
+dialog .dialog-actions > #delete-server {
+  margin-right: auto;
+}
+dialog .dialog-actions > :is(.primary, .danger) {
+  font-weight: 600;
+}
+dialog .dialog-details {
+  border-top: 1px solid var(--line);
+  margin-top: 18px;
+  padding-top: 12px;
+}
+dialog .dialog-details summary {
+  cursor: pointer;
+  color: var(--muted);
+  font-size: 12px;
+  padding: 4px 0;
+}
+dialog .dialog-details summary:hover {
+  color: var(--ink);
+}
+dialog .dialog-details summary:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 4px;
+  border-radius: 3px;
+}
+dialog .dialog-details[open] > summary {
+  color: var(--ink);
+  margin-bottom: 10px;
+}
+dialog [role="alert"]:empty {
+  display: none;
+}
+dialog [role="alert"] {
+  color: #edada1;
+}
+.confirmation-dialog,
+#dialog:has(#rename-session-form) {
+  width: 400px;
+}
+#dialog:has(#rename-tab-session),
+#dialog:has(#move-tab-left) {
+  width: 340px;
+}
+#dialog:has(#command-query) {
+  width: 560px;
+}
+#dialog:has(.theme-grid) {
+  width: 680px;
+}
+#dialog:has(#mobile-output),
+.clipboard-dialog {
+  width: 620px;
+}
+#upload-dialog {
+  width: 520px;
+}
+#voice-dialog {
+  width: 380px;
+}
+#voice-dialog .dialog-head {
+  border-bottom: 0;
+  margin-bottom: 0;
+}
+#voice-dialog .dialog-actions {
+  border-top: 0;
+  justify-content: center;
+  padding-top: 0;
+}
+#voice-dialog .voice-hint {
+  margin-bottom: 0;
+}
+#voice-dialog .voice-listening {
+  margin-top: 10px;
+}
+.login-prompt .primary {
+  width: auto;
+  margin: 0;
+}
+dialog .host-fingerprint,
+dialog pre,
+dialog .key-list code {
+  font-family: var(--terminal-font);
+}
+dialog .key-list > div {
+  background: var(--terminal-bg);
+  border: 1px solid var(--line);
+  padding: 12px;
+  border-radius: 9px;
+}
+dialog .key-list button {
+  min-height: 24px;
+}
+dialog #command-results,
+dialog #discovery-results,
+dialog #mobile-sessions {
+  max-height: 48dvh;
+  overflow: auto;
+}
+dialog #command-results button,
+dialog #mobile-sessions button {
+  border-color: transparent;
+  background: transparent;
+  text-align: left;
+  padding: 10px 12px;
+}
+dialog #command-results button:hover,
+dialog #command-results button.selected,
+dialog #mobile-sessions button:hover {
+  background: var(--raised);
+  border-color: var(--line);
+}
+dialog .session-result {
+  border-radius: 9px;
+  margin: 6px 0;
+  padding: 12px;
+}
+dialog .theme-sample {
+  padding: 8px;
+}
+dialog .font-choice {
+  gap: 6px;
+}
+dialog .appearance-controls {
+  gap: 14px;
+  margin-top: 16px;
+}
+dialog #upload-files {
+  background: var(--terminal-bg);
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  padding: 0 12px;
+  max-height: 28dvh;
+  overflow: auto;
+}
+@keyframes popup-appear {
+  from {
+    opacity: 0;
+    transform: translateY(6px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  dialog {
+    animation: none;
+  }
+}
+@media (max-width: 600px) {
+  dialog {
+    padding: 18px;
+    border-radius: 14px;
+  }
+  dialog .form-grid,
+  dialog .appearance-controls {
+    grid-template-columns: 1fr;
+    gap: 0;
+  }
+  dialog
+    :is(input, select, textarea):not([type="checkbox"]):not([type="range"]) {
+    font-size: 16px;
+  }
+  dialog button,
+  dialog .dialog-head button {
+    min-height: 44px;
+  }
+  dialog .dialog-head button {
+    width: 44px;
+  }
+  dialog .dialog-actions {
+    gap: 8px;
+  }
+  dialog .appearance-toggles {
+    grid-template-columns: 1fr;
+  }
+}
+
+#voice-stop,
+#voice-record {
+  display: inline-flex;
+  justify-content: center;
+  align-items: center;
+  text-align: center;
+}
+#voice-status:empty {
+  display: none;
+}
+.voice-time {
+  height: 4px;
+  margin-top: 18px;
+  border-radius: 8px;
+  overflow: hidden;
+  background: #59dec718;
+}
+.voice-time > span {
+  display: block;
+  width: 0;
+  height: 100%;
+  border-radius: inherit;
+  background: linear-gradient(90deg, #32bfa7, #91f2e2);
+  box-shadow: 0 0 10px #59dec77a;
+  transition: width 250ms linear;
+}
+@media (prefers-reduced-motion: reduce) {
+  .voice-time > span {
+    transition: none;
+  }
+}
+
+dialog .dialog-menu {
+  display: grid;
+  gap: 4px;
+}
+dialog .dialog-menu button {
+  background: transparent;
+  border-color: transparent;
+  text-align: left;
+}
+dialog .dialog-menu button:hover {
+  background: var(--raised);
+  border-color: var(--line);
+}
+dialog .font-choice {
+  min-width: 0;
+}
+dialog .font-choice span {
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+/* Keep utility dialogs legible in light palettes too. */
+dialog .danger,
+dialog [role="alert"] {
+  color: light-dark(#a13f4e, #edada1);
+}
+dialog .danger {
+  border-color: light-dark(#bf7a83, #6b4137);
+}
+dialog .host-fingerprint,
+dialog .session-result {
+  background: var(--terminal-bg);
+  color: var(--ink);
+  border-color: var(--line);
+}
+dialog .session-result span,
+dialog .key-list code {
+  color: var(--muted);
 }

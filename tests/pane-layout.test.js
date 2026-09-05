@@ -62,3 +62,52 @@ test("nested resizing respects minimum sizes, leaves no overlaps, and adapts to 
     );
   }
 });
+
+test("directional navigation follows geometry without wrapping or crossing diagonally", async () => {
+  const { paneNeighbor } = await import("../client/pane-layout.js");
+  const panes = [
+    { id: "a", x: 0, y: 0, width: 400, height: 400 },
+    { id: "b", x: 404, y: 0, width: 400, height: 198 },
+    { id: "c", x: 404, y: 202, width: 400, height: 198 },
+  ];
+  assert.equal(paneNeighbor(panes, "a", "right"), "b");
+  assert.equal(paneNeighbor(panes, "b", "down"), "c");
+  assert.equal(paneNeighbor(panes, "c", "up"), "b");
+  assert.equal(paneNeighbor(panes, "c", "left"), "a");
+  assert.equal(paneNeighbor(panes, "b", "right"), null);
+  assert.equal(paneNeighbor(panes, "a", "up"), null);
+  const portrait = panes.map((p) => ({
+    ...p,
+    x: p.y,
+    y: p.x,
+    width: p.height,
+    height: p.width,
+  }));
+  assert.equal(paneNeighbor(portrait, "a", "down"), "b");
+});
+test("pane shortcuts require the dedicated modifiers and ignore composition", async () => {
+  const { paneDirection } = await import("../client/pane-shortcuts.js");
+  assert.equal(
+    paneDirection({ key: "ArrowLeft", shiftKey: true, altKey: true }),
+    "left",
+  );
+  assert.equal(
+    paneDirection({ key: "ArrowDown", ctrlKey: true, altKey: true }),
+    "down",
+  );
+  assert.equal(paneDirection({ key: "ArrowUp", ctrlKey: true }), null);
+  assert.equal(
+    paneDirection({ key: "ArrowLeft", metaKey: true, altKey: true }),
+    null,
+  );
+  assert.equal(paneDirection({ key: "ArrowLeft", altKey: true }), null);
+  assert.equal(
+    paneDirection({
+      key: "ArrowUp",
+      ctrlKey: true,
+      altKey: true,
+      isComposing: true,
+    }),
+    null,
+  );
+});

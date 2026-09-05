@@ -1,3 +1,4 @@
+import { SPEECH_RUNTIME } from "../client/speech-config.js";
 import {
   readdir,
   readFile,
@@ -52,7 +53,12 @@ for (const pkg of [
   "@fontsource/fira-code",
 ]) {
   await copyFile(
-    new URL("../node_modules/" + pkg + "/LICENSE", import.meta.url),
+    new URL(
+      pkg === "onnxruntime-web"
+        ? "../deploy/LICENSE.onnxruntime.txt"
+        : "../node_modules/" + pkg + "/LICENSE",
+      import.meta.url,
+    ),
     new URL(
       "licenses/" + pkg.replaceAll("/", "-").replace("@", "") + ".txt",
       root,
@@ -68,7 +74,7 @@ const modules = new Set(
     .split("\n")
     .filter(Boolean),
 );
-let notices = "Go dependencies linked into Tailserve WASM\n";
+let notices = "Go dependencies linked into Tailterm WASM\n";
 for (const item of [...modules].sort()) {
   const [name, dir] = item.split("|");
   for (const file of [
@@ -95,3 +101,27 @@ await writeFile(new URL("licenses/Go-dependencies.txt", root), notices);
 console.log(
   "Static distribution prepared in dist-static. Serve it over HTTPS; no application backend is required.",
 );
+
+const speechRoot = new URL(`speech-runtime/${SPEECH_RUNTIME}/`, root);
+await mkdir(speechRoot, { recursive: true });
+for (const name of [
+  "ort-wasm-simd-threaded.mjs",
+  "ort-wasm-simd-threaded.wasm",
+])
+  await copyFile(
+    new URL("../node_modules/onnxruntime-web/dist/" + name, import.meta.url),
+    new URL(name, speechRoot),
+  );
+for (const pkg of ["@huggingface/transformers", "onnxruntime-web"])
+  await copyFile(
+    new URL(
+      pkg === "onnxruntime-web"
+        ? "../deploy/LICENSE.onnxruntime.txt"
+        : "../node_modules/" + pkg + "/LICENSE",
+      import.meta.url,
+    ),
+    new URL(
+      "licenses/" + pkg.replaceAll("/", "-").replace("@", "") + ".txt",
+      root,
+    ),
+  );

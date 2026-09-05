@@ -27,6 +27,7 @@ export default defineConfig(({ mode }) => ({
       mode === "static" ? "true" : "false",
     ),
   },
+  worker: { format: "es" },
   build: {
     target: "esnext",
     outDir: mode === "static" ? "dist-static" : "dist",

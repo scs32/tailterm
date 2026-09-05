@@ -1,3 +1,13 @@
+import { exercisePopupReview } from "./popup-review-browser.mjs";
+import {
+  exerciseVoiceDictation,
+  mockSpeechWorker,
+} from "./voice-dictation-browser.mjs";
+import { exerciseLocalHistory } from "./local-history-browser.mjs";
+import {
+  exerciseWorkspaceActions,
+  exerciseForgetDevice,
+} from "./workspace-actions-browser.mjs";
 import { chromium } from "@playwright/test";
 import assert from "node:assert/strict";
 import { createServer } from "node:http";
@@ -11,6 +21,13 @@ import ssh2 from "ssh2";
 import { WebSocketServer } from "ws";
 import { gzipSync } from "node:zlib";
 import { exercisePaneGroups } from "./pane-groups-browser.mjs";
+import { assertTerminalBounds } from "./terminal-bounds.mjs";
+import { exerciseVaultReset } from "./vault-reset-browser.mjs";
+import { openVault } from "../client/vault-crypto.js";
+import { attachSFTP } from "./sftp-fixture.mjs";
+import { exerciseImageUpload } from "./upload-browser.mjs";
+import { finishRestoration } from "./restore-browser.mjs";
+import { exerciseWorkspaceContinuity } from "./workspace-browser.mjs";
 const hostKey = generateKeyPairSync("rsa", {
   modulusLength: 2048,
   privateKeyEncoding: { type: "pkcs1", format: "pem" },
@@ -27,6 +44,15 @@ let input = "",
   stream,
   discoveries = 0;
 const sessions = new Set(["main"]);
+const identities = new Map(),
+  uploadedFiles = new Map();
+const uploadControl = {};
+let nextSessionId = 0;
+function identity(name) {
+  if (!identities.has(name))
+    identities.set(name, { id: "$" + nextSessionId++, created: "1234" });
+  return identities.get(name);
+}
 const authMethods = [];
 const ssh = new ssh2.Server(
   { hostKeys: [hostKey], banner: "Fixture SSH sign-in message" },
@@ -57,6 +83,7 @@ const ssh = new ssh2.Server(
     client.on("ready", () =>
       client.on("session", (accept) => {
         const session = accept();
+        attachSFTP(session, uploadedFiles, uploadControl);
         session.on("pty", (accept) => accept());
         session.on("window-change", (accept) => accept?.());
         const terminal = (accepted) => {
@@ -70,12 +97,61 @@ const ssh = new ssh2.Server(
         session.on("shell", (accept) => terminal(accept()));
         session.on("exec", (accept, reject, info) => {
           const accepted = accept();
+          if (info.command.includes("capture-pane -p -J")) {
+            accepted.write(
+              Array.from(
+                { length: 300 },
+                (_, i) => `cached history line ${i}`,
+              ).join("\n"),
+            );
+            accepted.exit(0);
+            accepted.end();
+            return;
+          }
+          if (info.command.includes("pane_current_path")) {
+            accepted.write(
+              Buffer.from("/tmp/fixture uploads\n").toString("base64") + "\n",
+            );
+            accepted.exit(0);
+            accepted.end();
+            return;
+          }
+          if (info.command.includes("rename-session -t")) {
+            const names = info.command.match(
+              /\b(?:renamed-static(?:-launcher)?|named-static|main)\b/g,
+            );
+            const requestedId = info.command.match(/\$[0-9]+/)?.[0];
+            const oldName = requestedId
+                ? [...identities].find(
+                    ([, target]) => target.id === requestedId,
+                  )?.[0]
+                : names?.[0],
+              nextName = names?.at(-1);
+            if (!sessions.has(oldName) || sessions.has(nextName)) {
+              accepted.stderr.write("Duplicate name or missing session");
+              accepted.exit(1);
+            } else {
+              sessions.delete(oldName);
+              sessions.add(nextName);
+              identities.set(nextName, identity(oldName));
+              identities.delete(oldName);
+              accepted.exit(0);
+            }
+            accepted.end();
+            return;
+          }
           if (
             info.command.includes("list-sessions -F") &&
             !info.command.includes("attach-session")
           ) {
             discoveries++;
-            accepted.write([...sessions].map((s) => `${s}|2|1\n`).join(""));
+            accepted.write(
+              [...sessions]
+                .map(
+                  (s) => `${s}|2|1|${identity(s).id}|${identity(s).created}\n`,
+                )
+                .join(""),
+            );
             accepted.exit(0);
             accepted.end();
           } else {
@@ -93,6 +169,7 @@ await once(ssh, "listening");
 const mime = {
   ".html": "text/html",
   ".js": "text/javascript",
+  ".mjs": "text/javascript",
   ".css": "text/css",
   ".wasm": "application/wasm",
   ".woff2": "font/woff2",
@@ -152,7 +229,12 @@ const wait = async (fn) => {
   throw new Error("Condition timed out.");
 };
 try {
-  browser = await chromium.launch();
+  browser = await chromium.launch({
+    args: [
+      "--use-fake-device-for-media-stream",
+      "--use-fake-ui-for-media-stream",
+    ],
+  });
   const context = await browser.newContext({
     viewport: { width: 1440, height: 1100 },
     permissions: ["clipboard-read", "clipboard-write"],
@@ -169,7 +251,9 @@ try {
       contentType: "application/gzip",
     }),
   );
+  await mockSpeechWorker(context);
   const page = await context.newPage();
+  context.setDefaultTimeout(30000);
   debugPage = page;
   const errors = [];
   page.on("pageerror", (e) => errors.push(e.message));
@@ -213,6 +297,7 @@ try {
   }
   assert.equal(await page.locator("#launcher-server select").count(), 0);
   assert.equal(await page.locator("[data-launch-server]").count(), 5);
+  assert.equal(await page.locator("#backup-reminder").count(), 0);
   await page.locator("[data-launch-server]").first().click();
   assert.equal(await page.locator("#launcher-name").inputValue(), "");
   await page.screenshot({
@@ -260,6 +345,7 @@ try {
     "SSH authentication banners must be visible",
   );
   const terminal = page.locator(".terminal-instance:not([hidden])");
+  await assertTerminalBounds(page);
   const box = await terminal.boundingBox();
   await page.locator("#filter").focus();
   await page.mouse.move(0, 0);
@@ -337,7 +423,7 @@ try {
         .textContent.includes("Connected"),
     );
   }
-  await exercisePaneGroups(page);
+  await exercisePaneGroups(page, () => input);
   while ((await page.locator("[data-close]").count()) > 1)
     await page.locator("[data-close]").last().click();
   // Themes/fonts/cursor affect existing terminals and persist on reload.
@@ -397,7 +483,83 @@ try {
   await page.locator("#launcher-name").fill("named-static");
   await page.locator("#start-session").click();
   await wait(() => sessions.has("named-static"));
-  await page.locator("#fullscreen").click();
+  await page.waitForFunction(
+    () =>
+      !document.querySelector(".tab.active").textContent.includes("unverified"),
+  );
+  const renamedTabId = await page
+    .locator(".tab.active [data-tab]")
+    .getAttribute("data-tab");
+  await page.locator(".tab.active [data-session-menu]").click();
+  await page.locator("#rename-tab-session").click();
+  assert.equal(
+    await page.locator("#rename-session-name").inputValue(),
+    "named-static",
+  );
+  await page.locator("#rename-session-name").fill("bad name");
+  await page.locator("#rename-session-submit").click();
+  await page.locator("#rename-session-error").waitFor({ state: "visible" });
+  assert.ok(sessions.has("named-static"));
+  await page.locator("#rename-session-cancel").click();
+  await page.locator(".tab.active [data-session-menu]").click();
+  await page.locator("#rename-tab-session").click();
+  await page.locator("#rename-session-name").fill("main");
+  await page.locator("#rename-session-submit").click();
+  await page.locator("#rename-session-error").waitFor({ state: "visible" });
+  assert.ok(sessions.has("named-static"));
+  await page.locator("#rename-session-name").fill("renamed-static");
+  await page.screenshot({ path: "/tmp/tailterm-session-rename.png" });
+  await page.locator("#rename-session-submit").click();
+  await page.locator("#dialog").waitFor({ state: "hidden" });
+  assert.ok(sessions.has("renamed-static"));
+  assert.equal(
+    await page.locator(".tab.active [data-tab]").getAttribute("data-tab"),
+    renamedTabId,
+  );
+  assert.match(await page.locator(".tab.active").innerText(), /renamed-static/);
+  await page.keyboard.type("after-rename-probe");
+  await wait(() => input.includes("after-rename-probe"));
+  await page.locator("#new-tab").click();
+  await page
+    .getByRole("button", { name: "Rename session renamed-static", exact: true })
+    .click();
+  await page.locator("#rename-session-name").fill("renamed-static-launcher");
+  await page.locator("#rename-session-submit").click();
+  await page.locator("#dialog").waitFor({ state: "hidden" });
+  await page
+    .locator("[data-resume]")
+    .filter({ hasText: "renamed-static-launcher" })
+    .waitFor();
+  await page.locator(`[data-tab="${renamedTabId}"]`).click();
+  assert.match(
+    await page.locator(".tab.active").innerText(),
+    /renamed-static-launcher/,
+  );
+  await exercisePopupReview(page);
+  await exerciseVoiceDictation(page, () => input);
+  await exerciseImageUpload(page, uploadedFiles, () => input, uploadControl);
+  await page.locator("#connection-diagnostics").click();
+  await page.getByText("SSH connection", { exact: true }).count();
+  assert.match(
+    await page.locator("#diagnostic-facts").innerText(),
+    /renamed-static-launcher/,
+  );
+  await page.locator("#dialog-close").click();
+  const outputDownload = page.waitForEvent("download");
+  await page.locator("#download-scrollback").click();
+  assert.match(
+    await readFile(await (await outputDownload).path(), "utf8"),
+    /after-rename-probe/,
+  );
+  await exerciseLocalHistory(page, () => input);
+  await exerciseWorkspaceActions(page, stream);
+  await exerciseWorkspaceContinuity(page, context);
+  console.log(
+    "Uploads, reconnect, reordering and workspace restoration passed.",
+  );
+  await page.evaluate(
+    () => document.fullscreenElement && document.exitFullscreen(),
+  );
   // Load a real key via Go's key parser and authenticate with it.
   await page.locator("#keys").click();
   await page.locator("#key-form [name=name]").fill("Fixture key");
@@ -471,6 +633,7 @@ try {
   await page.locator(".server-item").filter({ hasText: "Key host" }).click();
   await page.locator("#edit-server").click();
   await page.locator("[name=username]").fill("keyuser");
+  await page.locator("#server-advanced").evaluate((el) => (el.open = true));
   await page.locator("[name=fingerprint]").fill("SHA256:" + "A".repeat(43));
   await page.getByRole("button", { name: "Save server" }).click();
   await page.locator("#launcher-shell").click();
@@ -500,8 +663,25 @@ try {
   const download = page.waitForEvent("download");
   await page.locator("#export-backup").click();
   const file = await download;
+  await page.waitForFunction(() =>
+    document
+      .querySelector("#backup-vault")
+      .dataset.tooltip?.startsWith("Last backup:"),
+  );
   const backup = JSON.parse(await readFile(await file.path(), "utf8"));
   assert.equal(backup.format, "tailserve-vault");
+  const savedBackup = await openVault(
+    backup,
+    "static browser vault passphrase",
+  );
+  assert.ok(
+    savedBackup.data.sessions.some((s) => s.name === "renamed-static-launcher"),
+  );
+  assert.ok(
+    !savedBackup.data.sessions.some((s) =>
+      ["named-static", "renamed-static"].includes(s.name),
+    ),
+  );
   await page.locator("#dialog-close").click();
   await page.locator("#lock").click();
   await page.locator("#lockscreen").waitFor();
@@ -509,6 +689,8 @@ try {
   await page.locator("#unlock-button").click();
   await page.locator("#workspace").waitFor();
   assert.equal(await page.locator("html").getAttribute("data-theme"), "tokyo");
+  await finishRestoration(page);
+  console.log("Backup and lock/unlock restoration passed.");
   assert.equal(await page.locator("[data-launch-server]").count(), 6);
   await page.setViewportSize({ width: 390, height: 844 });
   assert.ok(
@@ -522,6 +704,8 @@ try {
   );
   assert.deepEqual(errors, []);
   const productionContext = await browser.newContext();
+  await exerciseVaultReset(page, context, origin);
+  await exerciseForgetDevice(page);
   const productionPage = await productionContext.newPage();
   productionPage.on("pageerror", (e) => errors.push(e.message));
   await productionPage.goto(origin);
@@ -552,6 +736,8 @@ try {
       Object.fromEntries(
         [
           "#launcher-note",
+          "#upload-note",
+          "#upload-files",
           "#notice",
           "#terminal-status",
           "#launcher-sessions",

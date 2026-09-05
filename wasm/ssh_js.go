@@ -215,6 +215,41 @@ func (s *jsSSHSession) Run() {
 	authCancel()
 	client := ssh.NewClient(sshConn, chans, reqs)
 	defer client.Close()
+	go func() {
+		ticker := time.NewTicker(15 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				answered := make(chan error, 1)
+				go func() { _, _, err := client.SendRequest("keepalive@openssh.com", true, nil); answered <- err }()
+				select {
+				case err := <-answered:
+					if err != nil {
+						c.Close()
+						return
+					}
+				case <-time.After(10 * time.Second):
+					c.Close()
+					return
+				case <-ctx.Done():
+					return
+				}
+			}
+		}
+	}()
+	if upload := cfg.Get("upload"); upload.Type() == js.TypeObject && !upload.IsNull() {
+		callback(cfg, "onConnected")
+		if err := uploadFile(ctx, client, upload); err != nil {
+			fail("SFTP upload", err)
+			callback(cfg, "onExit", 1)
+		} else {
+			callback(cfg, "onExit", 0)
+		}
+		return
+	}
 	session, err := client.NewSession()
 	if err != nil {
 		fail("SSH session", err)

@@ -1,5 +1,34 @@
 export const leaves = (tree) =>
   tree.tab ? [tree.tab] : [...leaves(tree.a), ...leaves(tree.b)];
+export function paneNeighbor(panes, id, direction) {
+  const source = panes.find((p) => p.id === id);
+  if (!source || !["left", "right", "up", "down"].includes(direction))
+    return null;
+  const horizontal = direction === "left" || direction === "right";
+  const forward = direction === "right" || direction === "down";
+  const axis = horizontal ? "x" : "y",
+    size = horizontal ? "width" : "height";
+  const cross = horizontal ? "y" : "x",
+    crossSize = horizontal ? "height" : "width";
+  return (
+    panes
+      .filter((p) => p.id !== id)
+      .map((p) => ({
+        id: p.id,
+        gap: forward
+          ? p[axis] - source[axis] - source[size]
+          : source[axis] - p[axis] - p[size],
+        overlap:
+          Math.min(p[cross] + p[crossSize], source[cross] + source[crossSize]) -
+          Math.max(p[cross], source[cross]),
+        offset: Math.abs(
+          p[cross] + p[crossSize] / 2 - source[cross] - source[crossSize] / 2,
+        ),
+      }))
+      .filter((p) => p.gap >= -1 && p.overlap > 0)
+      .sort((a, b) => a.gap - b.gap || a.offset - b.offset)[0]?.id || null
+  );
+}
 function prune(tree, ids) {
   if (tree.tab) return ids.has(tree.tab) ? tree : null;
   const a = prune(tree.a, ids),
@@ -71,6 +100,14 @@ export class PaneGroups {
       tree: { tab },
       active: tab,
     });
+    return true;
+  }
+  reorder(source, target, after = false) {
+    const from = this.group(source),
+      to = this.group(target);
+    if (!from || !to || from === to) return false;
+    this.groups.splice(this.groups.indexOf(from), 1);
+    this.groups.splice(this.groups.indexOf(to) + (after ? 1 : 0), 0, from);
     return true;
   }
 }

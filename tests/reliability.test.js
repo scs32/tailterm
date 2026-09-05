@@ -1,0 +1,147 @@
+import test from "node:test";
+import assert from "node:assert/strict";
+import {
+  workspaceSnapshot,
+  normalizeWorkspace,
+  sameTarget,
+  reconnectable,
+  createReconnectController,
+} from "../client/workspace-state.js";
+import { terminalText, diagnosticStage } from "../client/terminal-extras.js";
+import { validateImageFiles, uploadPath } from "../client/image-upload.js";
+import { PaneGroups } from "../client/pane-layout.js";
+
+test("workspace snapshots retain order, layout and identity without credentials or terminal data", () => {
+  const model = new PaneGroups();
+  model.sync(["a", "b", "c"]);
+  model.merge("b", "a");
+  model.reorder("c", "a");
+  const tabs = ["a", "b", "c"].map((id) => ({
+    id,
+    server: {
+      id: "server",
+      host: "box",
+      port: 22,
+      username: "user",
+      password: "secret",
+    },
+    tmux: true,
+    session: id,
+    target: { id: "$1", created: "1" },
+    term: "private output",
+  }));
+  const snapshot = normalizeWorkspace(
+    workspaceSnapshot(tabs, model.groups, "b"),
+  );
+  assert.equal(snapshot.groups[0].tree.tab, "c");
+  assert.equal(snapshot.active, "b");
+  assert.equal(snapshot.groups[1].tree.b.tab, "b");
+  assert.doesNotMatch(JSON.stringify(snapshot), /secret|private output/);
+  assert.ok(sameTarget(snapshot.tabs[0].target, { id: "$1", created: 1 }));
+  assert.ok(!sameTarget(snapshot.tabs[0].target, { id: "$1", created: "2" }));
+});
+test("reconnection is bounded, cancellable, and excludes authentication or missing session failures", async () => {
+  const timers = new Map();
+  let next = 0,
+    attempts = 0;
+  const messages = [];
+  const controller = createReconnectController({
+    eligible: () => true,
+    changed: (t, m) => messages.push(m),
+    attempt: () => {
+      attempts++;
+      throw Error("network timeout");
+    },
+    setTimer: (fn) => {
+      timers.set(++next, fn);
+      return next;
+    },
+    clearTimer: (id) => timers.delete(id),
+  });
+  controller.schedule({ id: "a" });
+  for (let i = 0; i < 6; i++) {
+    const task = timers.values().next().value;
+    timers.clear();
+    if (task) await task();
+  }
+  assert.equal(attempts, 5);
+  assert.equal(messages.at(-1), "Reconnect manually");
+  controller.schedule({ id: "b" });
+  controller.cancel("b");
+  assert.equal(timers.size, 0);
+  for (const m of [
+    "SSH host fingerprint changed",
+    "unable to authenticate",
+    "original tmux session no longer exists",
+    "SSH sign-in cancelled",
+  ])
+    assert.equal(reconnectable(m), false);
+  assert.equal(reconnectable("SSH connection reset by peer"), true);
+});
+test("scrollback joins wrapped rows and diagnostics distinguish host verification", () => {
+  const values = [
+    { isWrapped: false, text: "hello " },
+    { isWrapped: true, text: "world" },
+    { isWrapped: false, text: "next" },
+  ];
+  const term = {
+    buffer: {
+      active: {
+        length: 3,
+        getLine: (i) =>
+          values[i] && {
+            ...values[i],
+            translateToString: (trim) =>
+              trim ? values[i].text.trimEnd() : values[i].text,
+          },
+      },
+    },
+  };
+  assert.equal(terminalText(term), "hello world\nnext\n");
+  assert.equal(
+    diagnosticStage("host fingerprint changed"),
+    "SSH host verification",
+  );
+});
+test("image drops enforce bounds and filenames while preserving spaces in remote paths", () => {
+  validateImageFiles([
+    { name: "Screenshot 1.png", type: "image/png", size: 4 },
+  ]);
+  assert.equal(
+    uploadPath("/home/user/project files/", "Screenshot 1.png"),
+    "/home/user/project files/Screenshot 1.png",
+  );
+  for (const file of [
+    { name: "../bad.png", size: 4, type: "image/png" },
+    { name: "x.png", size: 30 * 1024 * 1024, type: "image/png" },
+    { name: "script.sh", size: 4, type: "text/plain" },
+  ])
+    assert.throws(() => validateImageFiles([file]));
+  assert.throws(() => uploadPath("relative", "x.png"));
+  assert.throws(() => uploadPath("/tmp\nnext", "x.png"));
+});
+
+test("Activity ignores identical redraws, row movement and status-only changes", async () => {
+  const { screenLines, hasNewText, activityTitle } =
+    await import("../client/activity.js");
+  const make = (lines) => ({
+    rows: lines.length,
+    buffer: {
+      active: {
+        baseY: 0,
+        getLine: (i) => ({ translateToString: () => lines[i] }),
+      },
+    },
+  });
+  const before = screenLines(make(["hello", "world", "12:00"]), true);
+  assert.equal(
+    hasNewText(before, screenLines(make(["world", "hello", "12:01"]), true)),
+    false,
+  );
+  assert.equal(hasNewText(before, ["hello", "new output"]), true);
+  assert.match(
+    activityTitle([{ activity: "New output" }, { activity: "Bell" }]),
+    /^\(2\) Bell/,
+  );
+  assert.equal(activityTitle([]), "Tailterm · Your servers, one workspace");
+});

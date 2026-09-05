@@ -2,8 +2,11 @@
   Content-Security-Policy: default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline'; connect-src 'self' https: wss:; font-src 'self'; img-src 'self' data:; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'
   Referrer-Policy: no-referrer
   X-Content-Type-Options: nosniff
-  Permissions-Policy: camera=(), microphone=(), geolocation=(), clipboard-read=(self), clipboard-write=(self)
+  Permissions-Policy: camera=(), microphone=(self), geolocation=(), clipboard-read=(self), clipboard-write=(self)
   Cache-Control: no-cache
 
 /assets/*
+  Cache-Control: public, max-age=31536000, immutable
+
+/speech-runtime/*
   Cache-Control: public, max-age=31536000, immutable

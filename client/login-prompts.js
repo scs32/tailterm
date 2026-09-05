@@ -42,7 +42,14 @@ export function loginPrompt(prompt, signal) {
           fields = `${prompt.host ? `<p><strong>${esc(prompt.username)}@${esc(prompt.host)}</strong></p>` : ""}<p>${esc(prompt.name)}</p><p>${esc(prompt.instructions)}</p>${prompt.prompts.map((p, i) => `<label>${esc(p.prompt)}<input name="answer-${i}" type="${p.echo ? "text" : "password"}" autocomplete="off" maxlength="4096"></label>`).join("")}<button class="primary" type="submit">Continue</button>`;
         else
           fields = `<p><strong>${esc(prompt.username)}@${esc(prompt.host)}</strong></p>${prompt.retry ? '<p class="fine">The previous credential was not accepted, or another authentication step is required.</p>' : ""}<label>Sign in with<select name="method">${prompt.methods.includes("publickey") ? '<option value="publickey">SSH key</option>' : ""}${prompt.methods.includes("password") ? '<option value="password">Password</option>' : ""}${prompt.methods.includes("keyboard-interactive") ? '<option value="keyboard-interactive">Interactive login / verification code</option>' : ""}</select></label><div data-key><label>Saved key<select name="keyId">${prompt.keys.map((k) => `<option value="${esc(k.id)}">${esc(k.name)}</option>`).join("")}</select></label><p class="fine">Or import a key now:</p><label>Key file<input name="keyFile" type="file"></label><label>Key passphrase (if encrypted)<input name="keyPassphrase" type="password" autocomplete="off"></label></div><div data-password><label>Password<input name="password" type="password" autocomplete="current-password" maxlength="4096"></label><label class="remember-password"><input name="remember" type="checkbox"> Remember in encrypted vault</label></div><p class="prompt-error" role="alert"></p><button class="primary" type="submit">Sign in</button>`;
-        d.innerHTML = `<div class="dialog-head"><h2>${title}</h2><button type="button" data-cancel aria-label="Cancel login">×</button></div><form>${fields}</form>`;
+        fields = fields
+          .replace(
+            '<button class="primary" type="submit">',
+            '<div class="dialog-actions"><button class="primary" type="submit">',
+          )
+          .replace("</button>", "</button></div>");
+        d.setAttribute("aria-labelledby", "login-prompt-title");
+        d.innerHTML = `<div class="dialog-head"><h2 id="login-prompt-title">${title}</h2><button type="button" data-cancel aria-label="Cancel login">×</button></div><form>${fields}</form>`;
         (document.fullscreenElement || document.body).append(d);
         d.showModal();
         d.querySelector("[data-cancel]").onclick = abort;
@@ -62,6 +69,18 @@ export function loginPrompt(prompt, signal) {
           };
           form.elements.method.onchange = toggle;
           toggle();
+        }
+        if (prompt.kind === "keyboard") form.querySelector("input")?.focus();
+        if (prompt.kind === "credentials") {
+          const method = form.elements.method.value;
+          (method === "password"
+            ? form.elements.password
+            : method === "publickey"
+              ? prompt.keys.length
+                ? form.elements.keyId
+                : form.elements.keyFile
+              : form.elements.method
+          )?.focus();
         }
         form.onsubmit = async (e) => {
           e.preventDefault();

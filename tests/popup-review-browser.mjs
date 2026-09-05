@@ -1,0 +1,79 @@
+import assert from "node:assert/strict";
+export async function exercisePopupReview(page) {
+  const wasFullscreen = await page.evaluate(() => !!document.fullscreenElement);
+  if (wasFullscreen) {
+    await page.evaluate(() => document.exitFullscreen());
+    await page.waitForFunction(() => !document.fullscreenElement);
+  }
+  const original = page.viewportSize();
+  const fits = async (name) => {
+    await page.waitForTimeout(180);
+    const box = await page.locator("#dialog").evaluate((el) => {
+      const r = el.getBoundingClientRect();
+      return {
+        x: r.x,
+        y: r.y,
+        right: r.right,
+        bottom: r.bottom,
+        width: innerWidth,
+        height: innerHeight,
+        scroll: el.scrollWidth,
+        client: el.clientWidth,
+        label: el.getAttribute("aria-labelledby"),
+      };
+    });
+    assert.ok(
+      box.x >= 0 &&
+        box.y >= 0 &&
+        box.right <= box.width + 1 &&
+        box.bottom <= box.height + 1,
+      `${name}: ${JSON.stringify(box)}`,
+    );
+    assert.ok(
+      box.scroll <= box.client + 1,
+      `${name} horizontal overflow: ${JSON.stringify(box)}`,
+    );
+    assert.equal(box.label, "dialog-title");
+  };
+  for (const [name, selector] of [
+    ["server", "#edit-server"],
+    ["keys", "#keys"],
+    ["appearance", "#appearance"],
+    ["backup", "#backup-vault"],
+    ["commands", "#commands"],
+    ["forget", "#forget-device"],
+    ["diagnostics", "#connection-diagnostics"],
+    ["groups", "#group-tabs"],
+    ["session-actions", ".tab.active [data-session-menu]"],
+  ]) {
+    await page.locator(selector).click();
+    await fits(name);
+    await page.screenshot({ path: `.build/popup-${name}.png` });
+    if (name === "server") {
+      assert.ok(await page.locator("[name=tmuxPath]").isHidden());
+      await page.locator("#server-advanced > summary").click();
+      assert.ok(await page.locator("[name=tmuxPath]").isVisible());
+      await page.locator("#delete-server").click();
+      await page.locator(".confirmation-dialog").waitFor();
+      await page.screenshot({ path: ".build/popup-delete-confirmation.png" });
+      await page.locator(".confirmation-dialog [data-cancel]").click();
+      assert.ok(await page.locator("#server-form").isVisible());
+    }
+    if (name === "backup") {
+      await page
+        .locator("summary")
+        .filter({ hasText: "Restore a backup" })
+        .click();
+      assert.ok(await page.locator("#restore-backup").isVisible());
+    }
+    await page.setViewportSize({ width: 390, height: 650 });
+    await fits(name + " mobile");
+    await page.screenshot({ path: `.build/popup-${name}-mobile.png` });
+    await page.locator("#dialog-close").click();
+    await page.setViewportSize(original);
+  }
+  if (wasFullscreen) await page.locator("#fullscreen").click();
+  console.log(
+    "Popup review passed: desktop/mobile layouts, shared headers, advanced options and confirmation cancellation.",
+  );
+}
