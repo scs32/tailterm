@@ -1,3 +1,4 @@
+import { IDLE_MINUTES } from "./inactivity.js";
 const palette = (name, background, foreground, accent, colors) => ({
   name,
   background,
@@ -178,6 +179,7 @@ export const fonts = {
   },
 };
 const defaults = {
+  idleMinutes: 15,
   theme: "tailserve",
   font: "system",
   fontSize: 14,
@@ -191,6 +193,8 @@ const defaults = {
 };
 export function normalizeAppearance(value = {}) {
   const p = { ...defaults, ...value };
+  if (!IDLE_MINUTES.includes(Number(p.idleMinutes))) p.idleMinutes = 15;
+  else p.idleMinutes = Number(p.idleMinutes);
   if (!themes[p.theme]) p.theme = defaults.theme;
   if (!fonts[p.font]) p.font = defaults.font;
   for (const [key, min, max] of [

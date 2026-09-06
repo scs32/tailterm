@@ -11,6 +11,8 @@
     "test:browser": "node tests/browser.mjs",
     "build:wasm": "./scripts/build-wasm.sh",
     "build:static": "vite build --mode static && node scripts/package-static.mjs",
+    "deploy:static": "node scripts/deploy-static.mjs",
+    "verify:release": "node scripts/verify-release.mjs",
     "preview:static": "vite preview --outDir dist-static --host 127.0.0.1 --port 4318",
     "test:static": "node tests/static-browser.mjs",
     "export:vault": "node scripts/export-server-vault.mjs",

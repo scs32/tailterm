@@ -1,3 +1,4 @@
+import { credentialCache } from "./credential-cache.js";
 import {
   deriveVaultKey,
   openVault,
@@ -97,6 +98,7 @@ export async function resetVault() {
 }
 export async function forgetDevice() {
   requireUnlocked();
+  credentialCache.clear();
   // Serialize deletion with writes. Saves queued during deletion must observe
   // the locked state, rather than re-creating a vault after the clear commits.
   const task = queue.then(async () => {
@@ -231,6 +233,7 @@ export async function localAPI(url, method = "GET", body = {}) {
   };
   if (url === "/data") return localData();
   if (url === "/lock") {
+    credentialCache.clear();
     await queue;
     contents = key = salt = undefined;
     releaseLock?.();

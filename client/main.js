@@ -1,3 +1,5 @@
+import { credentialCache } from "./credential-cache.js";
+import { createInactivityLock, IDLE_MINUTES } from "./inactivity.js";
 import { createAppearancePreview } from "./appearance-preview.js";
 import { normalizeTabDecoration, showTabDecoration } from "./tab-decoration.js";
 let appearancePreview;
@@ -268,6 +270,11 @@ function guard(fn) {
 const icon = `<span class="brand-icon" aria-hidden="true">${logo}</span>`;
 $("#app").innerHTML =
   `<div id="notice" role="status" hidden></div><div id="lockscreen"><div class="login-brand">${icon} tailterm <span class="version">PREVIEW 01</span></div><section class="unlock-card"><span class="eyebrow">YOUR PRIVATE TERMINAL WORKSPACE</span><h1>Closer to<br>your servers.</h1><p>A real terminal. Your tailnet. Persistent sessions.<br>Everything you need, right here.</p><form id="unlock"><label for="password">Vault passphrase</label><input id="password" type="password" minlength="14" required autocomplete="current-password" placeholder="At least 14 characters"><button class="primary" id="unlock-button">Unlock workspace <span>↗</span></button></form><p class="fine" id="vault-hint">Checking encrypted vault…</p></section><div class="login-footer"><span>◈ Encrypted at rest</span><span>Powered by Tailscale + WebAssembly</span></div></div>`;
+const inactivity = createInactivityLock({
+  enabled: () => staticMode && !!$("#workspace"),
+  minutes: () => appearance.idleMinutes,
+  lock: guard(lock),
+});
 const status = await api("/status");
 $("#vault-hint").textContent = status.initialized
   ? staticMode
@@ -297,6 +304,7 @@ if (status.unlocked) {
   mount();
 }
 function mount() {
+  inactivity.reset();
   const previousWorkspace = data.workspace;
   $("#lockscreen")?.remove();
   $("#app").insertAdjacentHTML(
@@ -503,6 +511,7 @@ function mount() {
         backup: backupDialog,
         forget: async () => {
           locking = true;
+          credentialCache.clear();
           reconnects.clear();
           imageUploads?.cancel();
           voiceDictation?.cancel();
@@ -1128,6 +1137,7 @@ function appearanceDialog() {
       .join("")}</div>
     <p class="fine">Fonts are bundled locally except System Mono. Nerd Font Mono symbols fit terminal cells. This renderer displays individual characters rather than programming ligatures.</p>
     <div class="appearance-controls"><div><label>Font size</label><div class="size-stepper"><button id="appearance-smaller" aria-label="Decrease font size">−</button><output id="font-size-value">${appearance.fontSize} px</output><button id="appearance-larger" aria-label="Increase font size">+</button><button id="appearance-reset">Reset</button></div></div><label>Line height<input id="line-height" type="range" min="1" max="1.6" step="0.05" value="${appearance.lineHeight}"></label><label>Padding<input id="terminal-padding" type="range" min="0" max="32" step="2" value="${appearance.padding}"></label></div>
+    ${staticMode ? `<h3>Security</h3><label>Lock after inactivity<select id="idle-lock-minutes">${IDLE_MINUTES.map((n) => `<option value="${n}" ${appearance.idleMinutes === n ? "selected" : ""}>${n} minutes</option>`).join("")}</select></label><p class="fine">The vault locks when you stop interacting, including when you return after sleep. Temporary sign-in details expire five minutes after the last connection closes and are cleared when the vault locks.</p>` : ""}
     <h3>Cursor</h3><div class="segmented">${["block", "bar", "underline"].map((c) => `<button data-cursor="${c}" aria-pressed="${appearance.cursorStyle === c}">${c}</button>`).join("")}</div>
     <div class="appearance-toggles">${[
       ["cursorBlink", "Blink cursor"],
@@ -1163,6 +1173,12 @@ function appearanceDialog() {
   choose("data-theme-choice", "theme");
   choose("data-font-choice", "font");
   choose("data-cursor", "cursorStyle");
+  if ($("#idle-lock-minutes"))
+    $("#idle-lock-minutes").onchange = (e) => {
+      appearance.idleMinutes = Number(e.target.value);
+      updateAppearance();
+      inactivity.check();
+    };
   $("#appearance-smaller").onclick = () => setFont(-1);
   $("#appearance-larger").onclick = () => setFont(1);
   $("#appearance-reset").onclick = () => setFont(0);
@@ -1976,15 +1992,16 @@ function renderDiscoveredPeers() {
 async function lock() {
   if (locking) return;
   locking = true;
+  credentialCache.clear();
   reconnects.clear();
   imageUploads?.cancel();
   voiceDictation?.cancel();
+  tabs.forEach((t) => t.close?.());
   try {
     await flushWorkspace();
   } catch (e) {
     notice("Could not save the latest layout: " + e.message);
   }
-  tabs.forEach((t) => t.close?.());
   clearInterval(heartbeat);
   await persistQueue;
   await api("/lock", "POST", {});
@@ -2037,6 +2054,7 @@ window.addEventListener("beforeunload", () => {
   void flushWorkspace();
 });
 window.addEventListener("pagehide", () => {
+  credentialCache.clear();
   voiceDictation?.cancel();
   locking = true;
   reconnects.clear();
@@ -2229,26 +2247,27 @@ window.addEventListener("online", recoverConnections);
 document.addEventListener("visibilitychange", () => {
   // Returning to this page is not evidence that healthy SSH sessions are stale.
   // Retry connections already known to be interrupted; keep live sessions intact.
-  if (document.visibilityState === "visible") recoverConnections();
+  if (document.visibilityState === "visible" && !inactivity.check())
+    recoverConnections();
 });
-// The browser cannot keep SSH alive indefinitely while suspended. Lock after 15 minutes without local interaction.
-let lastInteraction = Date.now();
-for (const event of ["keydown", "pointerdown", "pointermove"])
-  document.addEventListener(
+// Timers can be suspended; check on resume before recovery or fresh input.
+for (const event of ["keydown", "pointerdown", "pointermove", "wheel"])
+  window.addEventListener(
     event,
-    () => {
-      lastInteraction = Date.now();
+    (e) => {
+      if (inactivity.activity()) {
+        e.preventDefault();
+        e.stopImmediatePropagation();
+      }
     },
-    { passive: true },
+    { capture: true, passive: false },
   );
 setInterval(() => {
-  if (
-    staticMode &&
-    $("#workspace") &&
-    Date.now() - lastInteraction > 15 * 60 * 1000
-  )
-    guard(lock)();
+  inactivity.check();
+  credentialCache.prune();
 }, 15000);
+window.addEventListener("focus", () => inactivity.check());
+window.addEventListener("pageshow", () => inactivity.check());
 
 function openCommands() {
   const t = currentTab();

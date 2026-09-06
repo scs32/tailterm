@@ -1,3 +1,5 @@
+import { packageSpeechModel } from "./package-speech-model.mjs";
+import { writeReleaseManifest } from "./release-manifest.mjs";
 import { SPEECH_RUNTIME } from "../client/speech-config.js";
 import {
   readdir,
@@ -132,3 +134,10 @@ for (const name of ["cascadia-nerd", "fira-nerd"]) {
     new URL(`licenses/${name}.txt`, root),
   );
 }
+
+await packageSpeechModel(root);
+await copyFile(
+  new URL("../deploy/LICENSE.whisper.txt", import.meta.url),
+  new URL("licenses/whisper.txt", root),
+);
+await writeReleaseManifest(root);

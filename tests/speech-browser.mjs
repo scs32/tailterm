@@ -42,8 +42,13 @@ const browser = await chromium.launch({
 try {
   const page = await browser.newPage();
   const bad = [];
+  const site = process.argv[2] || `http://127.0.0.1:${server.address().port}/`;
   page.context().on("request", (r) => {
-    if (r.method() !== "GET") bad.push(r.url());
+    if (
+      r.method() !== "GET" ||
+      new URL(r.url()).origin !== new URL(site).origin
+    )
+      bad.push(r.url());
   });
   page.on("console", (m) => {
     if (m.type() === "error") console.error(m.text());
@@ -144,7 +149,7 @@ try {
   }, recorder);
   assert.ok(count > 0);
   console.log(
-    "PASS local WASM speech, model cache, no audio upload, microphone worklet:",
+    "PASS self-hosted WASM speech, verified model cache, same-origin GET requests only, microphone worklet:",
     result.text,
   );
 } finally {
