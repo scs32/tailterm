@@ -319,7 +319,11 @@ try {
   assert.equal(await page.locator(".login-prompt").count(), 0);
   await page.waitForFunction(
     () =>
-      !document.querySelector(".tab.active").textContent.includes("unverified"),
+      !(
+        document.querySelector(".tab.active [data-tab]")?.dataset.tooltip ||
+        document.querySelector(".tab.active [data-tab]")?.title ||
+        ""
+      ).includes("unverified"),
   );
   const originalTmuxId = await page
     .locator(".tab.active [data-tab]")
@@ -439,7 +443,12 @@ try {
     await page.locator(".server-card.chosen strong").textContent(),
     "Renamed host",
   );
-  assert.match(await page.locator(".tab.active").textContent(), /Renamed host/);
+  assert.match(
+    await page
+      .locator(".tab.active [data-tab]")
+      .evaluate((el) => el.dataset.tooltip || el.title),
+    /Renamed host/,
+  );
   // New connection button is a draft and leaves existing connections intact.
   await page.locator("#new-tab").click();
   assert.equal(await page.locator(".terminal-instance:visible").count(), 0);
@@ -469,12 +478,18 @@ try {
   const autoId = await page
     .locator(".tab.active [data-tab]")
     .getAttribute("data-tab");
-  const autoTitle = await page.locator(".tab.active").textContent();
+  const autoTitle = await page
+    .locator(".tab.active [data-tab]")
+    .evaluate((el) => el.dataset.tooltip || el.title);
   assert.match(autoTitle, /tt-[a-f0-9]{16}/);
   const autoName = autoTitle.match(/tt-[a-f0-9]{16}/)[0];
   await page.waitForFunction(
     () =>
-      !document.querySelector(".tab.active").textContent.includes("unverified"),
+      !(
+        document.querySelector(".tab.active [data-tab]")?.dataset.tooltip ||
+        document.querySelector(".tab.active [data-tab]")?.title ||
+        ""
+      ).includes("unverified"),
   );
   await page.locator(`[data-close="${autoId}"]`).click();
   await page.locator("#new-tab").click();
@@ -485,7 +500,9 @@ try {
       .textContent.includes("Connected"),
   );
   assert.match(
-    await page.locator(".tab.active").textContent(),
+    await page
+      .locator(".tab.active [data-tab]")
+      .evaluate((el) => el.dataset.tooltip || el.title),
     new RegExp(autoName),
   );
   const resumedId = await page
@@ -501,7 +518,9 @@ try {
       .textContent.includes("Connected"),
   );
   assert.match(
-    await page.locator(".tab.active").textContent(),
+    await page
+      .locator(".tab.active [data-tab]")
+      .evaluate((el) => el.dataset.tooltip || el.title),
     /named-from-fullscreen/,
   );
   const namedId = await page
@@ -509,7 +528,11 @@ try {
     .getAttribute("data-tab");
   await page.waitForFunction(
     () =>
-      !document.querySelector(".tab.active").textContent.includes("unverified"),
+      !(
+        document.querySelector(".tab.active [data-tab]")?.dataset.tooltip ||
+        document.querySelector(".tab.active [data-tab]")?.title ||
+        ""
+      ).includes("unverified"),
   );
   await page.locator(`[data-close="${namedId}"]`).click();
   await page.locator("#fullscreen").click();
@@ -523,7 +546,9 @@ try {
   );
   assert.equal(await page.locator("[data-saved]").count(), 0);
   assert.match(
-    await page.locator(".tab.active").textContent(),
+    await page
+      .locator(".tab.active [data-tab]")
+      .evaluate((el) => el.dataset.tooltip || el.title),
     /missing \(unverified\)/,
   );
   // Closing a background tab must not switch away from the current one.

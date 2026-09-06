@@ -476,12 +476,20 @@ try {
   await page.locator("#dialog-close").click();
   await page.locator("#start-session").click();
   await page.waitForFunction(() =>
-    document.querySelector(".tab.active").textContent.includes("tt-"),
+    (
+      document.querySelector(".tab.active [data-tab]")?.dataset.tooltip ||
+      document.querySelector(".tab.active [data-tab]")?.title ||
+      ""
+    ).includes("tt-"),
   );
   await wait(() => sessions.size === 2);
   await page.waitForFunction(
     () =>
-      !document.querySelector(".tab.active").textContent.includes("unverified"),
+      !(
+        document.querySelector(".tab.active [data-tab]")?.dataset.tooltip ||
+        document.querySelector(".tab.active [data-tab]")?.title ||
+        ""
+      ).includes("unverified"),
   );
   const autoName = [...sessions].find((s) => s.startsWith("tt-"));
   assert.match(autoName, /^tt-[a-f0-9]{16}$/);
@@ -499,7 +507,11 @@ try {
   await wait(() => sessions.has("named-static"));
   await page.waitForFunction(
     () =>
-      !document.querySelector(".tab.active").textContent.includes("unverified"),
+      !(
+        document.querySelector(".tab.active [data-tab]")?.dataset.tooltip ||
+        document.querySelector(".tab.active [data-tab]")?.title ||
+        ""
+      ).includes("unverified"),
   );
   const renamedTabId = await page
     .locator(".tab.active [data-tab]")
@@ -530,7 +542,12 @@ try {
     await page.locator(".tab.active [data-tab]").getAttribute("data-tab"),
     renamedTabId,
   );
-  assert.match(await page.locator(".tab.active").innerText(), /renamed-static/);
+  assert.match(
+    await page
+      .locator(".tab.active [data-tab]")
+      .evaluate((el) => el.dataset.tooltip || el.title),
+    /renamed-static/,
+  );
   await page.keyboard.type("after-rename-probe");
   await wait(() => input.includes("after-rename-probe"));
   await page.locator("#new-tab").click();
@@ -546,7 +563,9 @@ try {
     .waitFor();
   await page.locator(`[data-tab="${renamedTabId}"]`).click();
   assert.match(
-    await page.locator(".tab.active").innerText(),
+    await page
+      .locator(".tab.active [data-tab]")
+      .evaluate((el) => el.dataset.tooltip || el.title),
     /renamed-static-launcher/,
   );
   await exerciseWorkspaceControls(page);
