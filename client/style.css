@@ -3394,3 +3394,34 @@ dialog .primary:hover {
   align-items: center;
   gap: 8px;
 }
+
+/* Fill communicates connection/selection; the border communicates hover. */
+#workspace #tailscale-login:has(.online),
+#workspace .server-item.selected,
+#workspace #all-servers[aria-pressed="true"] {
+  background: var(--raised);
+  border-color: var(--line);
+}
+#workspace #tailscale-login:has(.online):is(:hover, :focus-visible),
+#workspace .server-item.selected:is(:hover, :focus-visible),
+#workspace #all-servers[aria-pressed="true"]:is(:hover, :focus-visible) {
+  border-color: var(--accent);
+}
+
+#workspace .terminal-tools {
+  align-self: stretch;
+  align-items: stretch;
+  height: 100%;
+}
+#workspace .terminal-tools > button {
+  align-self: stretch;
+  min-height: 0;
+  height: 100%;
+  margin-block: 0;
+}
+@media (max-width: 700px) {
+  #workspace .terminal-tools {
+    height: 44px;
+    border-top: 0;
+  }
+}
