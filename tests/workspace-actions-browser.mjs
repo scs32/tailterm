@@ -28,6 +28,43 @@ export async function exerciseWorkspaceActions(page, stream) {
     await page.locator(`[data-tab="${original}"] .tab-activity`).textContent(),
     "",
   );
+  const other = await page
+    .locator(".tab.active [data-tab]")
+    .getAttribute("data-tab");
+  stream.write("\r\nUnread output pulse test\r\n");
+  await page.waitForFunction(
+    (id) =>
+      document
+        .querySelector(`[data-tab="${id}"]`)
+        ?.closest(".tab")
+        .classList.contains("has-new-output"),
+    original,
+  );
+  const unread = page.locator(`[data-tab="${original}"]`);
+  assert.equal(await unread.locator(".tab-activity").textContent(), "");
+  assert.match(await unread.getAttribute("title"), /New output/);
+  assert.equal(
+    await unread.evaluate((el) => getComputedStyle(el).animationName),
+    "tab-output-pulse",
+  );
+  await page.emulateMedia({ reducedMotion: "reduce" });
+  assert.equal(
+    await unread.evaluate((el) => getComputedStyle(el).animationName),
+    "none",
+  );
+  assert.notEqual(
+    await unread.evaluate((el) => getComputedStyle(el).boxShadow),
+    "none",
+  );
+  await page.emulateMedia({ reducedMotion: "no-preference" });
+  await unread.click();
+  assert.equal(
+    await unread.evaluate((el) =>
+      el.closest(".tab").classList.contains("has-new-output"),
+    ),
+    false,
+  );
+  await page.locator(`[data-tab="${other}"]`).click();
   stream.write("\x07");
   await page.waitForFunction(
     (id) =>
