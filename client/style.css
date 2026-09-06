@@ -3403,14 +3403,16 @@ dialog .primary:hover {
 /* Fill communicates connection/selection; the border communicates hover. */
 #workspace #tailscale-login:has(.online),
 #workspace .server-item.selected,
-#workspace #all-servers[aria-pressed="true"] {
+#workspace #all-servers[aria-pressed="true"],
+#workspace .power-scroll-toggle[aria-pressed="true"] {
   background: color-mix(in srgb, var(--accent) 25%, #063c2d);
   color: #f3fff9;
   border-color: var(--line);
 }
 #workspace #tailscale-login:has(.online):is(:hover, :focus-visible),
 #workspace .server-item.selected:is(:hover, :focus-visible),
-#workspace #all-servers[aria-pressed="true"]:is(:hover, :focus-visible) {
+#workspace #all-servers[aria-pressed="true"]:is(:hover, :focus-visible),
+#workspace .power-scroll-toggle[aria-pressed="true"]:is(:hover, :focus-visible) {
   background: color-mix(in srgb, var(--accent) 25%, #063c2d);
   color: #f3fff9;
   border-color: var(--accent);
