@@ -204,6 +204,43 @@ try {
         0,
         "Cancelled automatic capture stays closed",
       );
+      await page.setViewportSize({ width: 1200, height: 850 });
+      // Real wheel input exercises the browser's default page scrolling, which
+      // synthetic dispatchEvent cannot reproduce. Leave room above and below.
+      await page.evaluate(() => {
+        window.pauseCapture = false;
+        document.body.style.minHeight = "2000px";
+        tab.el.style.marginTop = "200px";
+        window.scrollTo(0, 100);
+      });
+      await page.waitForTimeout(220);
+      const pageY = await page.evaluate(() => scrollY);
+      const bounds = await page.locator(".terminal-instance").boundingBox();
+      await page.mouse.move(bounds.x + 2, bounds.y + 2);
+      await page.mouse.wheel(50, 1); // sideways-led first tick on terminal padding
+      await page.waitForTimeout(120);
+      assert.equal(await page.evaluate(() => scrollY), pageY);
+      await page.locator(".power-scroll-toggle").hover();
+      await page.mouse.wheel(0, 80);
+      await page.waitForTimeout(120);
+      assert.equal(await page.evaluate(() => scrollY), pageY);
+      await page.mouse.move(bounds.x + 40, bounds.y + 80);
+      await page.mouse.wheel(0, -80);
+      await page.waitForFunction(() =>
+        document.querySelector(".local-history:not(.history-loading)"),
+      );
+      await page.waitForTimeout(120);
+      assert.equal(
+        await page.evaluate(() => scrollY),
+        pageY,
+        "opening history must not move the page",
+      );
+      await page.evaluate(() => tab.history.close());
+      await page.mouse.move(1100, 620); // outside the terminal: normal page scrolling remains
+      await page.waitForTimeout(400);
+      await page.mouse.wheel(0, 120);
+      await page.waitForTimeout(200);
+      assert.ok(await page.evaluate((y) => scrollY > y, pageY));
       assert.equal(await page.evaluate(() => remoteInput), "");
       assert.deepEqual(errors, []);
       console.log(

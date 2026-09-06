@@ -224,6 +224,15 @@ export function setupLocalHistory(
     },
     { capture: true, passive: false },
   );
+  // xterm must handle its wheel event before we cancel the browser's fallback
+  // scrolling. Cancelling in capture would disable xterm's manual scrollback.
+  t.el.addEventListener(
+    "wheel",
+    (e) => {
+      if (!t.disposed && !e.ctrlKey && !e.metaKey) e.preventDefault();
+    },
+    { passive: false },
+  );
   toggle.onclick = () => (panel ? close() : void open());
   sync();
   return {
