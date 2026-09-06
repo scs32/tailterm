@@ -108,11 +108,12 @@ const ssh = new ssh2.Server(
         session.on("shell", (accept) => terminal(accept()));
         session.on("exec", (accept, reject, info) => {
           const accepted = accept();
-          if (info.command.includes("capture-pane -p -J")) {
+          if (info.command.includes("capture-pane -p -e -J")) {
             accepted.write(
               Array.from(
                 { length: 300 },
-                (_, i) => `cached history line ${i}`,
+                (_, i) =>
+                  `\x1b[38;2;255;160;90m\x1b[1mcached history line ${i}\x1b[0m`,
               ).join("\n"),
             );
             accepted.exit(0);

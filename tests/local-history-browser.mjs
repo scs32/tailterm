@@ -19,26 +19,69 @@ export async function exerciseLocalHistory(page, getInput) {
   );
   const before = getInput();
   await toggle.click();
-  const output = page.locator(".local-history pre");
+  const output = page.locator(".local-history .xterm-rows");
   await page.waitForFunction(() =>
     document
-      .querySelector(".local-history pre")
+      .querySelector(".local-history .xterm-rows")
       ?.textContent.includes("cached history line 299"),
   );
   assert.equal(await toggle.getAttribute("aria-pressed"), "true");
+  assert.ok(
+    (await page.locator(".local-history .xterm-rows > div").count()) < 100,
+    "Only visible history rows are rendered",
+  );
+  assert.ok(
+    await page
+      .locator(".local-history .xterm-rows span")
+      .evaluateAll((nodes) =>
+        nodes.some(
+          (el) =>
+            el.textContent.includes("cached history") &&
+            getComputedStyle(el).fontWeight === "700",
+        ),
+      ),
+    "Snapshot retains bold formatting",
+  );
+  assert.ok(
+    await page
+      .locator(".local-history .xterm-rows span")
+      .evaluateAll((nodes) =>
+        nodes.some(
+          (el) =>
+            el.textContent.includes("cached history") &&
+            getComputedStyle(el).color !==
+              getComputedStyle(el.closest(".local-history")).color,
+        ),
+      ),
+    "Snapshot retains color",
+  );
   assert.equal(
     getInput(),
     before,
     "History fetch must not send terminal input",
   );
-  const top = await output.evaluate((el) => el.scrollTop);
-  await output.hover();
+  const beforeScroll = await output.textContent();
+  await page.locator(".history-terminal").hover();
   await page.mouse.wheel(0, -150);
   await page.waitForFunction(
-    (top) => document.querySelector(".local-history pre").scrollTop < top,
-    top,
+    (text) =>
+      document.querySelector(".local-history .xterm-rows").textContent !== text,
+    beforeScroll,
   );
   assert.equal(getInput(), before, "Cached scrolling stays local");
+  await page.locator("#search-toggle").click();
+  await page.locator("#terminal-search").fill("cached history line 42");
+  await page.locator("#find-next").click();
+  await page.waitForFunction(() =>
+    document
+      .querySelector(".local-history .xterm-rows")
+      ?.textContent.includes("cached history line 42"),
+  );
+  await page.locator("#search-close").click();
+  await page.locator(".local-history .xterm-helper-textarea").focus();
+  await page.keyboard.type("do not send this");
+  await page.keyboard.press("Enter");
+  assert.equal(getInput(), before, "History typing never reaches SSH");
   await page.screenshot({ path: "/tmp/tailterm-power-scroll.png" });
   await toggle.click();
   assert.equal(await page.locator(".local-history").count(), 0);

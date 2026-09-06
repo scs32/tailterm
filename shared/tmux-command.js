@@ -92,7 +92,7 @@ export function tmuxHistoryCommand(target, path = "") {
     shellQuote(
       resolver(path) +
         exactTarget(target) +
-        `tailterm_history_pane=$("$tailterm_tmux_bin" display-message -p -t "$tailterm_tmux_target" '#{pane_id}') || exit; exec "$tailterm_tmux_bin" capture-pane -p -J -S -5000 -t "$tailterm_history_pane"`,
+        `tailterm_history_pane=$("$tailterm_tmux_bin" display-message -p -t "$tailterm_tmux_target" '#{pane_id}') || exit; exec "$tailterm_tmux_bin" capture-pane -p -e -J -S -5000 -t "$tailterm_history_pane"`,
     )
   );
 }

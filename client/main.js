@@ -380,8 +380,12 @@ function mount() {
     $("#terminal-search").focus();
   };
   $("#search-close").onclick = () => ($("#search-bar").hidden = true);
-  $("#find-next").onclick = () =>
-    currentTab()?.search.findNext($("#terminal-search").value);
+  $("#find-next").onclick = () => {
+    const t = currentTab();
+    (t?.history?.isOpen() ? t.history : t?.search)?.findNext(
+      $("#terminal-search").value,
+    );
+  };
   $("#terminal-search").onkeydown = (e) => {
     if (e.key === "Enter") $("#find-next").click();
   };
@@ -1126,6 +1130,7 @@ function updateAppearance() {
   saveAppearance(appearance);
   for (const t of tabs) {
     Object.assign(t.term.options, terminalAppearance(appearance));
+    t.history?.update();
     if (!t.el.hidden)
       requestAnimationFrame(() => {
         if (!t.disposed) t.fit.fit();
@@ -1380,7 +1385,7 @@ async function connect(
             tab.server,
             peers,
             tmuxHistoryCommand(tab.target, tab.server.tmuxPath),
-            1024 * 1024,
+            4 * 1024 * 1024,
           );
         },
         notice,

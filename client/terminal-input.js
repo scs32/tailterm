@@ -114,7 +114,9 @@ export function setupTerminalInput(
     t.term.focus();
   };
   t.copy = async () => {
-    const text = t.term.getSelection() || t.clipboardText;
+    const text = t.history?.isOpen()
+      ? t.history.getSelection()
+      : t.term.getSelection() || t.clipboardText;
     if (!text) {
       notice("Select text with Shift + drag, or copy in tmux copy mode first.");
       return;
