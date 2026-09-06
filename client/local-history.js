@@ -19,7 +19,9 @@ export function setupLocalHistory(
     bottomPush = 0,
     scrollRemainder = 0,
     quietUntil = 0,
-    retryAfter = 0;
+    retryAfter = 0,
+    reverseIntent = 0,
+    warmCapture = null;
   const toggle = document.createElement("button");
   toggle.className = "power-scroll-toggle";
   toggle.type = "button";
@@ -42,7 +44,8 @@ export function setupLocalHistory(
   const clear = () => {
     generation++;
     pending = false;
-    queuedLines = bottomPush = scrollRemainder = 0;
+    queuedLines = bottomPush = scrollRemainder = reverseIntent = 0;
+    warmCapture = null;
     cancelReveal?.();
     cancelReveal = null;
     observer?.disconnect();
@@ -58,6 +61,44 @@ export function setupLocalHistory(
     clear();
     if (!t.disposed) t.term.focus();
   };
+  function captureText() {
+    const now = performance.now();
+    if (warmCapture && (warmCapture.pending || now - warmCapture.time < 1500))
+      return warmCapture.promise;
+    const entry = { pending: true, time: now };
+    entry.promise = Promise.resolve()
+      .then(() => capture(t))
+      .then(
+        (text) => {
+          entry.pending = false;
+          entry.time = performance.now();
+          return text;
+        },
+        (error) => {
+          if (warmCapture === entry) warmCapture = null;
+          throw error;
+        },
+      );
+    warmCapture = entry;
+    return entry.promise;
+  }
+  // Warm only on pointer intent, not on a polling loop. New terminal output or
+  // closing/locking invalidates the snapshot; in-flight reads are shared.
+  t.term.onWriteParsed(() => {
+    warmCapture = null;
+  });
+  t.el.addEventListener("pointerenter", () => {
+    if (
+      !panel &&
+      !t.disposed &&
+      automatic() &&
+      t.tmux &&
+      t.target &&
+      t.status === "Connected" &&
+      performance.now() >= retryAfter
+    )
+      void captureText().catch(() => {});
+  });
   async function open(initialLines = 0) {
     if (panel || !t.tmux || !t.target || t.disposed || t.status !== "Connected")
       return;
@@ -101,7 +142,7 @@ export function setupLocalHistory(
     pending = true;
     sync();
     try {
-      const text = await capture(t);
+      const text = await captureText();
       if (token !== generation || t.disposed) return;
       await new Promise((resolve) =>
         terminal.write(historyText(text), resolve),
@@ -111,6 +152,7 @@ export function setupLocalHistory(
       terminal.scrollToBottom();
       // Preserve sub-row trackpad movement across the handoff. Rounding up
       // made even a one-pixel first tick jump an entire text row.
+      queuedLines = Math.max(0, queuedLines);
       const steps = Math.trunc(queuedLines);
       if (steps) terminal.scrollLines(-steps);
       scrollRemainder =
@@ -181,7 +223,8 @@ export function setupLocalHistory(
         e.metaKey ||
         e.altKey ||
         e.shiftKey ||
-        Math.abs(e.deltaX) >= Math.abs(e.deltaY) ||
+        !e.deltaY ||
+        Math.abs(e.deltaY) < Math.abs(e.deltaX) * 0.35 ||
         e.target.closest?.("button, a, input, select, .terminal-link-hint") ||
         document.querySelector("dialog[open]")
       )
@@ -191,12 +234,6 @@ export function setupLocalHistory(
         e.preventDefault();
         e.stopImmediatePropagation();
       };
-      // Absorb the tail of the gesture that returned to live, including inertia.
-      if (now < quietUntil) {
-        quietUntil = now + 180;
-        consume();
-        return;
-      }
       const rowHeight = t.term.options.fontSize * t.term.options.lineHeight;
       const pixels =
         e.deltaY *
@@ -206,6 +243,18 @@ export function setupLocalHistory(
             ? t.el.clientHeight
             : 1);
       const lines = Math.abs(pixels) / rowHeight;
+      // Suppress downward inertia after returning live, but let a deliberate
+      // upward reversal start immediately instead of extending a blanket delay.
+      if (now < quietUntil) {
+        reverseIntent = pixels < 0 ? reverseIntent - pixels : 0;
+        if (reverseIntent < 4) {
+          consume();
+          return;
+        }
+        quietUntil = 0;
+        reverseIntent = 0;
+      }
+
       if (!panel) {
         if (
           !automatic() ||
@@ -226,7 +275,7 @@ export function setupLocalHistory(
           200,
           queuedLines + (pixels < 0 ? lines : -lines),
         );
-        if (queuedLines < 0) close();
+        if (queuedLines * rowHeight <= -32) close();
         return;
       }
       if (!automatic() || !viewer) return;

@@ -127,7 +127,7 @@ export async function exerciseLocalHistory(page, getInput) {
   });
   assert.equal(await page.locator(".local-history").count(), 0);
   await terminal.dispatchEvent("wheel", {
-    deltaY: -120,
+    deltaY: -1,
     bubbles: true,
     cancelable: true,
   });
