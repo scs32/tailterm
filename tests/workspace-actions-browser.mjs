@@ -42,7 +42,12 @@ export async function exerciseWorkspaceActions(page, stream) {
   );
   const unread = page.locator(`[data-tab="${original}"]`);
   assert.equal(await unread.locator(".tab-activity").textContent(), "");
-  assert.match(await unread.getAttribute("title"), /New output/);
+  await unread.hover();
+  await page.locator(".workspace-tooltip").waitFor({ state: "visible" });
+  assert.match(
+    await page.locator(".workspace-tooltip").innerText(),
+    /New output/,
+  );
   assert.equal(
     await unread.evaluate((el) => getComputedStyle(el).animationName),
     "tab-output-pulse",
