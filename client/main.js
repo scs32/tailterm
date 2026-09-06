@@ -390,6 +390,12 @@ function mount() {
   $("#font-down").onclick = () => setFont(-1);
   $("#font-up").onclick = () => setFont(1);
   setupTerminalView();
+  $("#clear").title = "Clear terminal\nClear the visible terminal buffer";
+  $("#reconnect").title = "Reconnect\nReconnect this terminal session";
+  $("#lock").title =
+    "Lock vault\nDisconnect this browser and lock secure storage";
+  $("#search-close").title = "Close terminal search";
+  $("#find-next").title = "Find next match";
   $("#clear").onclick = () => currentTab()?.term.clear();
   $("#copy").onclick = guard(() => currentTab()?.copy());
   $("#paste").onclick = guard(() => currentTab()?.paste());
@@ -422,6 +428,7 @@ function mount() {
   const download = document.createElement("button");
   download.id = "download-scrollback";
   download.textContent = "Save output";
+  download.title = "Save output\nDownload this terminal’s retained scrollback";
   download.onclick = () => {
     const t = currentTab();
     if (t)

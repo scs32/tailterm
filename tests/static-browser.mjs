@@ -1,3 +1,4 @@
+import { exerciseWorkspaceControls } from "./workspace-controls-browser.mjs";
 import { exerciseGeneratedKey } from "./ssh-key-browser.mjs";
 import { exerciseServerFilters } from "./server-filters-browser.mjs";
 import { exercisePopupReview } from "./popup-review-browser.mjs";
@@ -545,6 +546,7 @@ try {
     await page.locator(".tab.active").innerText(),
     /renamed-static-launcher/,
   );
+  await exerciseWorkspaceControls(page);
   await exercisePopupReview(page);
   await exerciseVoiceDictation(page, () => input);
   await exerciseImageUpload(page, uploadedFiles, () => input, uploadControl);

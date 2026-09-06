@@ -4,6 +4,8 @@ export async function exercisePopupReview(page) {
   if (wasFullscreen) {
     await page.evaluate(() => document.exitFullscreen());
     await page.waitForFunction(() => !document.fullscreenElement);
+    // Chromium updates native window bounds after the DOM fullscreen event.
+    await page.waitForTimeout(250);
   }
   const original = page.viewportSize();
   const fits = async (name) => {
