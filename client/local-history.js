@@ -1,3 +1,4 @@
+import { renderHistoryLinks } from "./terminal-links.js";
 export function setupLocalHistory(t, { capture }) {
   let panel,
     pending = false,
@@ -57,7 +58,7 @@ export function setupLocalHistory(t, { capture }) {
     try {
       const text = await capture(t);
       if (token !== generation || t.disposed) return;
-      output.textContent = text;
+      renderHistoryLinks(output, text);
       status.textContent = `History snapshot · ${new Date().toLocaleTimeString()}`;
       view.classList.remove("history-loading");
       output.scrollTop = output.scrollHeight;

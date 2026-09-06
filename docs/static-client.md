@@ -167,3 +167,7 @@ Open **SSH keys** in the sidebar, enter a name (for example, TrueNAS), and choos
 Choose **Copy public key** beside the saved key and paste it into the destination account's SSH public key field (for TrueNAS, edit the user account). The same button derives the public key from imported private keys, including passphrase-protected keys already in the vault. If clipboard access is blocked, the public key is displayed and selected for manual copying. Only the public key is displayed or copied.
 
 Then open **Edit server**, choose **Standard SSH · key or password**, select the key and save. Use **+ → Open plain SSH shell** to test. **Import an existing key** still accepts private key files or pasted keys and an optional existing key passphrase. In the optional gateway deployment, generation and private-key storage take place on the gateway server.
+
+### Clickable terminal URLs
+
+Hover over an HTTP or HTTPS URL to see its destination. **Command-click** on Mac or **Ctrl-click** on Windows/Linux opens it in a new browser tab. Plain clicks retain normal terminal behavior. Wrapped URLs and OSC 8 labeled hyperlinks are supported; for labeled links the hover hint shows the destination. Links in cached power-scroll history use ordinary clicks, taps, or keyboard activation. Opening a link uses the browser's network connection.

@@ -15,6 +15,7 @@ A browser SSH terminal that connects through Tailscale. Run it from a static web
 - Select multiple servers in the sidebar to filter open sessions; **All** shows every server. Hidden sessions stay connected, and mixed-server groups retain their layout. Use **+** to choose a server when opening a session.
 - Drag terminal tabs together into groups, resize tiled panes, and move panes back into separate tabs.
 - Use fullscreen or expand the terminal inside the browser window.
+- Open terminal URLs with Command-click on Mac or Ctrl-click on Windows/Linux.
 - Copy and paste through tmux, including bracketed paste, multiline confirmation, and OSC 52 clipboard support.
 - Customize colors, fonts, cursor, spacing, and focus-following behavior.
 
@@ -65,6 +66,7 @@ See [the static-client guide](docs/static-client.md) for architecture, controls,
 
 ```sh
 npm test
+npm run test:links
 npx playwright install chromium
 npm run build
 npm run test:browser

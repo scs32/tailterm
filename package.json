@@ -13,7 +13,8 @@
     "build:static": "vite build --mode static && node scripts/package-static.mjs",
     "preview:static": "vite preview --outDir dist-static --host 127.0.0.1 --port 4318",
     "test:static": "node tests/static-browser.mjs",
-    "export:vault": "node scripts/export-server-vault.mjs"
+    "export:vault": "node scripts/export-server-vault.mjs",
+    "test:links": "node tests/terminal-links-browser.mjs"
   },
   "dependencies": {
     "@fontsource/fira-code": "^5.3.0",
@@ -23,6 +24,7 @@
     "@tailscale/connect": "1.102.3-3-tb31d8a75a-g5e651e16f",
     "@xterm/addon-fit": "^0.11.0",
     "@xterm/addon-search": "^0.16.0",
+    "@xterm/addon-web-links": "^0.12.0",
     "@xterm/xterm": "^6.0.0",
     "express": "^5.1.0",
     "ssh2": "^1.17.0",

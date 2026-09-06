@@ -3003,3 +3003,29 @@ dialog .key-list button {
   font-family: var(--terminal-font);
   overflow-wrap: anywhere;
 }
+
+.terminal-link-hint {
+  position: fixed;
+  z-index: 90;
+  max-width: min(520px, calc(100vw - 24px));
+  max-height: 56px;
+  overflow: hidden;
+  padding: 8px 10px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: var(--terminal-bg);
+  color: var(--ink);
+  font:
+    12px/1.4 system-ui,
+    sans-serif;
+  overflow-wrap: anywhere;
+  pointer-events: none;
+}
+.local-history pre a {
+  color: inherit;
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+.local-history pre a:hover {
+  color: var(--accent);
+}

@@ -1,3 +1,4 @@
+import { setupTerminalLinks } from "./terminal-links.js";
 import { confirmDialog } from "./confirm-dialog.js";
 import { setupVoiceDictation } from "./voice-dictation.js";
 let voiceDictation;
@@ -1180,6 +1181,7 @@ async function connect(
     viewport.className = "terminal-viewport";
     el.append(viewport);
     term.open(viewport);
+    setupTerminalLinks(term);
     const t = {
       id: options.replace?.id || options.restoreId || crypto.randomUUID(),
       number: options.replace?.number || ++connectionNumber,
