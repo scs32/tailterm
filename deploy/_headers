@@ -10,3 +10,6 @@
 
 /speech-runtime/*
   Cache-Control: public, max-age=31536000, immutable
+
+/speech-model/*
+  Cache-Control: public, max-age=31536000, immutable

@@ -7,7 +7,7 @@ import {
 } from "./local-vault.js";
 import { findPeer, isAuthenticationFailure } from "./connection-help.js";
 import { tmuxListCommand, tmuxRenameCommand } from "../shared/tmux-command.js";
-const activeCredentials = new Map();
+import { credentialCache } from "./credential-cache.js";
 
 export function browserSSH(ipn, server, peers, options = {}) {
   const abort = new AbortController();
@@ -25,14 +25,19 @@ export function browserSSH(ipn, server, peers, options = {}) {
   const saved = credentials(server.id);
   if (saved.key) credential = { ...saved.key, keyId: saved.key.id };
   if (saved.server.password) credential.password = saved.server.password;
+  saved.key = undefined;
   const cacheKey = JSON.stringify([
     server.id,
     server.host,
     server.port,
     server.username,
   ]);
-  if (activeCredentials.has(cacheKey))
-    credential = activeCredentials.get(cacheKey);
+  const cached = credentialCache.acquire(cacheKey, { retain: interactive });
+  let temporary = cached.get();
+  if (temporary?.keyId)
+    credential = { ...privateKey(temporary.keyId), keyId: temporary.keyId };
+  else if (temporary?.password) credential = temporary;
+  temporary = null;
   let remember = false,
     outputError,
     exitCode;
@@ -153,7 +158,15 @@ export function browserSSH(ipn, server, peers, options = {}) {
             }
             connected = true;
             if (authentication === "standard")
-              activeCredentials.set(cacheKey, { ...credential });
+              cached.set(
+                credential.keyId
+                  ? { keyId: credential.keyId }
+                  : !remember &&
+                      credential.password &&
+                      credential.password !== saved.server.password
+                    ? { password: credential.password }
+                    : {},
+              );
             const changes = {};
             if (remember && credential.password)
               changes.password = credential.password;
@@ -218,6 +231,9 @@ export function browserSSH(ipn, server, peers, options = {}) {
         );
       }
     } finally {
+      credential = {};
+      delete saved.server.password;
+      cached.release();
       abort.abort();
       options.onDone?.();
     }
@@ -226,6 +242,9 @@ export function browserSSH(ipn, server, peers, options = {}) {
     done,
     close() {
       closed = true;
+      credential = {};
+      delete saved.server.password;
+      cached.release();
       abort.abort();
       socket?.close();
       options.onInput?.(null);

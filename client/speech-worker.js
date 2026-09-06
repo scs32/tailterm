@@ -5,7 +5,18 @@ import {
   SPEECH_CACHE,
   SPEECH_RUNTIME,
 } from "./speech-config.js";
-env.allowLocalModels = false;
+import manifest from "./speech-model-manifest.json";
+import { createVerifiedModelFetch } from "./verified-model-fetch.js";
+env.allowLocalModels = true;
+env.allowRemoteModels = false;
+env.localModelPath = `/speech-model/${SPEECH_REVISION}/`;
+// All model reads, including cached bytes, go through our integrity verifier.
+env.useBrowserCache = false;
+env.fetch = createVerifiedModelFetch({
+  manifest,
+  origin: self.location.origin,
+  cacheName: SPEECH_CACHE,
+});
 env.useWasmCache = false;
 env.cacheKey = SPEECH_CACHE;
 env.backends.onnx.wasm.numThreads = 1;
@@ -31,6 +42,7 @@ self.onmessage = async ({ data }) => {
         SPEECH_MODEL,
         {
           revision: SPEECH_REVISION,
+          local_files_only: true,
           device: "wasm",
           dtype: "q8",
           // ORT 1.26 extended QDQ optimization breaks Whisper tied embeddings.
