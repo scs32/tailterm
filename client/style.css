@@ -3436,3 +3436,7 @@ dialog .primary:hover {
 #workspace .server-item.selected :is(strong, small) {
   color: #f3fff9;
 }
+
+#dialog:has(.theme-grid) {
+  --terminal-font: var(--appearance-ui-font, "IBM Plex Mono", monospace);
+}
