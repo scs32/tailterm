@@ -269,8 +269,7 @@ export function setupImageDrops({
   return {
     open,
     cancel: () => cancelActive?.(),
-    choose: () => {
-      const t = getTabs().find((t) => t.id === getActive());
+    choose: (t = getTabs().find((t) => t.id === getActive())) => {
       const picker = document.createElement("input");
       picker.type = "file";
       picker.accept = "image/*";
