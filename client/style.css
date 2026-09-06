@@ -3364,3 +3364,12 @@ dialog .primary:hover {
   :is(.tab-tmux, .tab-activity) {
   color: var(--ink);
 }
+
+/* Idle tabs devote their width to the name; actions and details return on
+   hover, keyboard focus, or selection (also the touch-screen path). */
+#tabs
+  .tab:not(.active):not(:hover):not(:focus-within)
+  > :is([data-close], [data-session-menu]),
+#tabs .tab:not(.active):not(:hover):not(:focus-within) .tab-tmux {
+  display: none;
+}

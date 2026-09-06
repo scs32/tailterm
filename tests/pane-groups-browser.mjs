@@ -8,6 +8,39 @@ export async function exercisePaneGroups(page, getInput = () => undefined) {
     .evaluateAll((nodes) => nodes.slice(-3).map((n) => n.dataset.tab));
   const tab = (id) => page.locator(`#tabs .tab:has([data-tab="${id}"])`);
   const pane = (id) => page.locator(`.pane-header[data-pane="${id}"]`);
+  // Inactive tabs hide controls and their separators, but remain keyboard usable.
+  await tab(ids[0]).locator("[data-tab]").click();
+  await page.mouse.move(0, 0);
+  const inactive = tab(ids[1]);
+  assert.ok(await inactive.locator("[data-close]").isHidden());
+  assert.ok(await inactive.locator("[data-session-menu]").isHidden());
+  assert.ok(await inactive.locator(".tab-tmux").isHidden());
+  const collapsedWidth = await inactive
+    .locator("[data-tab]")
+    .evaluate((el) => el.getBoundingClientRect().width);
+  await inactive.hover();
+  assert.ok(await inactive.locator("[data-close]").isVisible());
+  assert.ok(await inactive.locator("[data-session-menu]").isVisible());
+  assert.ok(await inactive.locator(".tab-tmux").isVisible());
+  assert.ok(
+    await inactive
+      .locator("[data-tab]")
+      .evaluate(
+        (el, before) => el.getBoundingClientRect().width < before,
+        collapsedWidth,
+      ),
+  );
+  await page.mouse.move(0, 0);
+  await inactive.locator("[data-tab]").focus();
+  assert.ok(await inactive.locator("[data-session-menu]").isVisible());
+  await page.keyboard.press("Tab");
+  assert.ok(
+    await inactive
+      .locator("[data-session-menu]")
+      .evaluate((el) => el === document.activeElement),
+  );
+  await page.evaluate(() => document.activeElement.blur());
+  await page.screenshot({ path: ".build/quiet-inactive-tabs.png" });
   const originalOrder = await page
     .locator("#tabs [data-tab]")
     .evaluateAll((nodes) => nodes.map((n) => n.dataset.tab));
@@ -32,6 +65,7 @@ export async function exercisePaneGroups(page, getInput = () => undefined) {
   );
   assert.equal(await page.locator("#tabs .tab").count(), originalCount);
   const decorate = async (target, values) => {
+    await target.hover();
     await target.locator("[data-session-menu]").click();
     await page.locator("#decorate-tab").click();
     for (const [key, value] of Object.entries(values)) {
@@ -322,6 +356,7 @@ export async function exercisePaneGroups(page, getInput = () => undefined) {
   assert.equal(await tab(ids[0]).locator(".tab-name").innerText(), "🍎 Air A");
   assert.equal(await tab(ids[1]).locator(".tab-name").innerText(), "🚀 Air B");
   for (const id of ids.slice(0, 2)) {
+    await tab(id).hover();
     await tab(id).locator("[data-session-menu]").click();
     await page.locator("#decorate-tab").click();
     await page.locator("#reset-tab-decoration").click();

@@ -290,8 +290,10 @@ try {
   });
   await page.setViewportSize({ width: 1440, height: 1050 });
   await exercisePaneGroups(page);
-  while ((await page.locator("[data-close]").count()) > 1)
+  while ((await page.locator("[data-close]").count()) > 1) {
+    await page.locator("#tabs .tab").last().hover();
     await page.locator("[data-close]").last().click();
+  }
   await page.waitForFunction(
     () =>
       document.querySelector("#tabs-left").hidden &&
@@ -513,6 +515,7 @@ try {
   const activeBeforeClose = await page
     .locator(".tab.active [data-tab]")
     .getAttribute("data-tab");
+  await page.locator("#tabs .tab").first().hover();
   await page.locator("[data-close]").first().click();
   assert.equal(
     await page.locator(".tab.active [data-tab]").getAttribute("data-tab"),

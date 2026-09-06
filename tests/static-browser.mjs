@@ -435,8 +435,10 @@ try {
     );
   }
   await exercisePaneGroups(page, () => input);
-  while ((await page.locator("[data-close]").count()) > 1)
+  while ((await page.locator("[data-close]").count()) > 1) {
+    await page.locator("#tabs .tab").last().hover();
     await page.locator("[data-close]").last().click();
+  }
   // Themes/fonts/cursor affect existing terminals and persist on reload.
   await page.locator("#appearance").click();
   await page.locator("[data-theme-choice=tokyo]").click();
