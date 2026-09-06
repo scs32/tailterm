@@ -32,6 +32,8 @@ import { setupTerminalInput, fontShortcut } from "./terminal-input.js";
 import { setupTooltips } from "./tooltips.js";
 import "@fontsource/jetbrains-mono/latin-400.css";
 import "@fontsource/ibm-plex-mono/latin-400.css";
+import "@fontsource/source-code-pro/latin-400.css";
+import "@fontsource/source-code-pro/latin-700.css";
 import "./fonts.css";
 import { setupTabStrip } from "./tab-strip.js";
 import { setupPaneGroups } from "./pane-groups.js";

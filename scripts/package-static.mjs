@@ -53,6 +53,7 @@ for (const pkg of [
   "@xterm/addon-web-links",
   "@fontsource/jetbrains-mono",
   "@fontsource/ibm-plex-mono",
+  "@fontsource/source-code-pro",
 ]) {
   await copyFile(
     new URL(

@@ -26,6 +26,8 @@ try {
         await import("/node_modules/@xterm/xterm/css/xterm.css");
         await import("/client/style.css");
         await import("/client/fonts.css");
+        await import("/node_modules/@fontsource/source-code-pro/latin-400.css");
+        await import("/node_modules/@fontsource/source-code-pro/latin-700.css");
         window.appearance = await import("/client/appearance.js");
         const { createAppearancePreview } =
           await import("/client/appearance-preview.js");
@@ -35,6 +37,9 @@ try {
         );
       });
       for (const theme of [
+        "ember",
+        "lagoon",
+        "voltage",
         "tailserve",
         "catppuccin",
         "tokyo",
@@ -102,7 +107,7 @@ try {
           path: `.build/theme-${engine.name()}-${theme}.png`,
         });
       }
-      for (const font of ["cascadia", "fira"]) {
+      for (const font of ["cascadia", "fira", "source"]) {
         assert.ok(
           await page.evaluate(async (id) => {
             const family = appearance.fonts[id].family.split(",")[0];
@@ -126,6 +131,44 @@ try {
           .locator("dialog")
           .evaluate((el) => el.scrollWidth <= el.clientWidth + 1),
       );
+      // The sticky header must cover the padding above and beside scrolled content.
+      await page.evaluate(() => {
+        const content = document.createElement("div");
+        content.style.height = "1800px";
+        content.textContent = "Scrolling content";
+        document.querySelector("dialog").append(content);
+      });
+      for (const width of [1000, 390]) {
+        await page.setViewportSize({ width, height: 650 });
+        for (const scrollTop of [0, 80, 400, 1200]) {
+          await page
+            .locator("dialog")
+            .evaluate((el, y) => (el.scrollTop = y), scrollTop);
+          const covered = await page.evaluate(() => {
+            const dialog = document
+              .querySelector("dialog")
+              .getBoundingClientRect();
+            const head = document
+              .querySelector(".dialog-head")
+              .getBoundingClientRect();
+            return (
+              Math.abs(head.top - dialog.top - 1) < 1 &&
+              Math.abs(head.left - dialog.left - 1) < 1 &&
+              Math.abs(head.right - dialog.right + 1) < 1 &&
+              !!document
+                .elementFromPoint(dialog.left + 5, dialog.top + 5)
+                ?.closest(".dialog-head")
+            );
+          });
+          assert.ok(
+            covered,
+            `${engine.name()} sticky header covers top/side padding at ${width}px, scroll ${scrollTop}`,
+          );
+        }
+      }
+      await page.screenshot({
+        path: `.build/appearance-scrolled-${engine.name()}.png`,
+      });
       console.log(
         `${engine.name()}: all themes meet contrast checks; Nerd Fonts load; square popup fits mobile.`,
       );

@@ -31,3 +31,11 @@ Source: [Nerd Fonts v3.5.1](https://github.com/ryanoasis/nerd-fonts/releases/tag
 Verification: `node tests/appearance-browser.mjs` checks sample terminal and popup contrast in every theme, font loading, and mobile bounds in Chromium and WebKit. `npm run test:static` exercises actual popup layouts and tab decoration persistence. `node tests/tooltip-rendering.mjs` checks shared hover styling, focus-to-hover transitions and that terminal redraws do not trigger tooltip scans.
 
 Workspace buttons share a real one-pixel border, square corners, terminal font, readable colors, and the same hover/focus treatment across the header, session toolbar, sidebar, footer, launcher and mobile keyboard bar. Selected states retain their accent border, primary actions retain their fill, and disabled actions stay visually disabled on hover. The built-app control audit in `tests/workspace-controls-browser.mjs` compares every visible control with Tailscale in light/dark desktop/mobile layouts and captures each toolbar.
+
+## Additional Tailterm palettes and typeface
+
+Ember, Lagoon, and Voltage are original Tailterm palettes. Ember pairs warm charcoal with amber; Lagoon uses deep blue with teal; Voltage pairs a violet background with saturated pink, cyan, and lime. All use the same terminal contrast correction and are included in the Chromium/WebKit readability checks.
+
+Source Code Pro is bundled locally from `@fontsource/source-code-pro` with regular and bold Latin weights; its license is included with deployed font licenses. It is available for terminal text and tab labels. It is not a Nerd Font edition.
+
+Popup headers cover the dialog’s full padded width and remain opaque all the way to its top edge while scrolling, on desktop and mobile.
