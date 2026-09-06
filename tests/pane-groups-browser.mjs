@@ -102,6 +102,45 @@ export async function exercisePaneGroups(page, getInput = () => undefined) {
     "default",
     "a new parent does not borrow the focused child's appearance",
   );
+  // Font controls belong to the focused session, not its group or the app default.
+  const paneSizes = () =>
+    page
+      .locator(".terminal-instance .xterm")
+      .evaluateAll((nodes) =>
+        nodes.map((node) => parseFloat(getComputedStyle(node).fontSize)),
+      );
+  await pane(ids[0]).click();
+  const beforeSizes = await paneSizes();
+  await page.locator("#font-up").click();
+  await page.waitForTimeout(100);
+  const largerSizes = await paneSizes();
+  assert.equal(
+    largerSizes.filter((size, i) => size !== beforeSizes[i]).length,
+    1,
+  );
+  assert.equal(
+    largerSizes.reduce((sum, size) => sum + size, 0),
+    beforeSizes.reduce((sum, size) => sum + size, 0) + 1,
+  );
+  await page.locator("#appearance").click();
+  await page.locator("#appearance-larger").click();
+  assert.deepEqual(
+    await paneSizes(),
+    largerSizes,
+    "changing the new-session default preserves existing sizes",
+  );
+  await page.locator("#appearance-smaller").click();
+  await page.locator("#dialog-close").click();
+  await pane(ids[1]).click();
+  assert.deepEqual(
+    await paneSizes(),
+    largerSizes,
+    "changing group focus preserves each size",
+  );
+  await pane(ids[0]).click();
+  await page.locator("#font-down").click();
+  await page.waitForTimeout(100);
+  assert.deepEqual(await paneSizes(), beforeSizes);
   await decorate(page.locator(".group-tab"), {
     label: "My machines",
     color: "violet",

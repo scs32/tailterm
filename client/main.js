@@ -45,6 +45,7 @@ import { showSessionRename } from "./session-rename.js";
 import {
   workspaceSnapshot,
   normalizeWorkspace,
+  normalizeSessionFontSize,
   endpointKey,
   sameTarget,
   reconnectable,
@@ -106,8 +107,7 @@ let data = { servers: [], keys: [], sessions: [] },
   state = {},
   heartbeat,
   leaseDeadline = 0,
-  persistQueue = Promise.resolve(),
-  fontSize = appearance.fontSize;
+  persistQueue = Promise.resolve();
 const remoteSnapshots = new Map();
 const pendingConnections = new Set();
 const remoteRequests = new Map();
@@ -199,6 +199,7 @@ async function restoreWorkspace(value) {
           resumeOnly: item.tmux,
           target: item.target,
           decoration: item.decoration,
+          fontSize: item.fontSize,
         });
         if (t) await t.initialReady;
       }
@@ -1125,11 +1126,12 @@ async function verifyTmux(t) {
 }
 function updateAppearance() {
   appearancePreview?.update(appearance);
-  fontSize = appearance.fontSize;
   applyChrome(appearance);
   saveAppearance(appearance);
   for (const t of tabs) {
-    Object.assign(t.term.options, terminalAppearance(appearance));
+    Object.assign(t.term.options, terminalAppearance(appearance), {
+      fontSize: t.fontSize,
+    });
     t.history?.update();
     t.history?.sync();
     if (!t.el.hidden)
@@ -1142,6 +1144,18 @@ function updateAppearance() {
   });
 }
 function setFont(delta) {
+  const t = tabs.find((t) => t.id === active);
+  if (!t || t.disposed) return;
+  t.fontSize =
+    delta === 0
+      ? appearance.fontSize
+      : Math.min(32, Math.max(10, t.fontSize + delta));
+  t.term.options.fontSize = t.fontSize;
+  t.history?.update();
+  if (!t.el.hidden) t.fit.fit();
+  scheduleWorkspaceSave();
+}
+function setDefaultFont(delta) {
   appearance.fontSize =
     delta === 0 ? 14 : Math.min(32, Math.max(10, appearance.fontSize + delta));
   updateAppearance();
@@ -1166,7 +1180,7 @@ function appearanceDialog() {
       )
       .join("")}</div>
     <p class="fine">Fonts are bundled locally except System Mono. Nerd Font Mono symbols fit terminal cells. This renderer displays individual characters rather than programming ligatures.</p>
-    <div class="appearance-controls"><div><label>Font size</label><div class="size-stepper"><button id="appearance-smaller" aria-label="Decrease font size">−</button><output id="font-size-value">${appearance.fontSize} px</output><button id="appearance-larger" aria-label="Increase font size">+</button><button id="appearance-reset">Reset</button></div></div><label>Line height<input id="line-height" type="range" min="1" max="1.6" step="0.05" value="${appearance.lineHeight}"></label><label>Padding<input id="terminal-padding" type="range" min="0" max="32" step="2" value="${appearance.padding}"></label></div>
+    <div class="appearance-controls"><div><label>New session font size</label><div class="size-stepper"><button id="appearance-smaller" aria-label="Decrease font size">−</button><output id="font-size-value">${appearance.fontSize} px</output><button id="appearance-larger" aria-label="Increase font size">+</button><button id="appearance-reset">Reset</button></div></div><label>Line height<input id="line-height" type="range" min="1" max="1.6" step="0.05" value="${appearance.lineHeight}"></label><label>Padding<input id="terminal-padding" type="range" min="0" max="32" step="2" value="${appearance.padding}"></label></div>
     ${staticMode ? `<h3>Security</h3><label>Lock after inactivity<select id="idle-lock-minutes">${IDLE_MINUTES.map((n) => `<option value="${n}" ${appearance.idleMinutes === n ? "selected" : ""}>${n} minutes</option>`).join("")}</select></label><p class="fine">The vault locks when you stop interacting, including when you return after sleep. Temporary sign-in details expire five minutes after the last connection closes and are cleared when the vault locks.</p>` : ""}
     <h3>Cursor</h3><div class="segmented">${["block", "bar", "underline"].map((c) => `<button data-cursor="${c}" aria-pressed="${appearance.cursorStyle === c}">${c}</button>`).join("")}</div>
     <div class="appearance-toggles">${[
@@ -1215,9 +1229,9 @@ function appearanceDialog() {
       updateAppearance();
       inactivity.check();
     };
-  $("#appearance-smaller").onclick = () => setFont(-1);
-  $("#appearance-larger").onclick = () => setFont(1);
-  $("#appearance-reset").onclick = () => setFont(0);
+  $("#appearance-smaller").onclick = () => setDefaultFont(-1);
+  $("#appearance-larger").onclick = () => setDefaultFont(1);
+  $("#appearance-reset").onclick = () => setDefaultFont(0);
   $("#line-height").oninput = (e) => {
     appearance.lineHeight = Number(e.target.value);
     updateAppearance();
@@ -1286,8 +1300,12 @@ async function connect(
     const el = document.createElement("div");
     el.className = "terminal-instance";
     $("#terminal-body").append(el);
+    const sessionFontSize =
+      normalizeSessionFontSize(options.replace?.fontSize ?? options.fontSize) ??
+      appearance.fontSize;
     const term = new Terminal({
       ...terminalAppearance(appearance),
+      fontSize: sessionFontSize,
       scrollback: 15000,
       allowProposedApi: false,
     });
@@ -1308,6 +1326,7 @@ async function connect(
       decoration: normalizeTabDecoration(
         options.replace?.decoration || options.decoration,
       ),
+      fontSize: sessionFontSize,
       server,
       transport,
       tmux,

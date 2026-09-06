@@ -191,3 +191,5 @@ Open a tab’s **... → Tab appearance** to set a personal label, emoji, outlin
 Inactive tabs show their label and any activity indicator. Hover or keyboard focus reveals session details, the three-dot menu, and Close; selecting a tab keeps these visible, including on touch screens. The hidden controls take no space, so their divider lines disappear and the label has more room.
 
 **Commands** lives with the bottom-right terminal controls. Use it for **Edit selected server** and **Manage terminal groups**, which no longer occupy the tab toolbar. The **+** button shares the tab strip’s height, followed by a small gap before the remaining tools.
+
+Terminal font-size buttons and keyboard shortcuts resize only the focused session, including within a group. Each session keeps its size when reconnecting or restoring the workspace. Appearance’s **New session font size** sets the starting size for newly opened sessions.

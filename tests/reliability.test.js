@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import {
   workspaceSnapshot,
   normalizeWorkspace,
+  normalizeSessionFontSize,
   sameTarget,
   reconnectable,
   createReconnectController,
@@ -29,12 +30,17 @@ test("workspace snapshots retain order, layout and identity without credentials 
     session: id,
     target: { id: "$1", created: "1" },
     term: "private output",
+    fontSize: { a: 12, b: 18, c: 24 }[id],
   }));
   const snapshot = normalizeWorkspace(
     workspaceSnapshot(tabs, model.groups, "b"),
   );
   assert.equal(snapshot.groups[0].tree.tab, "c");
   assert.equal(snapshot.active, "b");
+  assert.deepEqual(
+    snapshot.tabs.map((t) => t.fontSize),
+    [12, 18, 24],
+  );
   assert.equal(snapshot.groups[1].tree.b.tab, "b");
   assert.doesNotMatch(JSON.stringify(snapshot), /secret|private output/);
   assert.ok(sameTarget(snapshot.tabs[0].target, { id: "$1", created: 1 }));
@@ -261,4 +267,11 @@ test("workspace restores independent parent and session decoration", () => {
     restored.tabs.map((t) => t.decoration),
     [child, child],
   );
+});
+
+test("session font size rejects invalid persisted values and supports older workspaces", () => {
+  for (const value of [undefined, null, "18", 0, 9, 33, 14.5, NaN])
+    assert.equal(normalizeSessionFontSize(value), undefined);
+  for (const value of [10, 14, 32])
+    assert.equal(normalizeSessionFontSize(value), value);
 });
