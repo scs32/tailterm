@@ -3399,12 +3399,15 @@ dialog .primary:hover {
 #workspace #tailscale-login:has(.online),
 #workspace .server-item.selected,
 #workspace #all-servers[aria-pressed="true"] {
-  background: var(--raised);
+  background: color-mix(in srgb, var(--accent) 25%, #063c2d);
+  color: #f3fff9;
   border-color: var(--line);
 }
 #workspace #tailscale-login:has(.online):is(:hover, :focus-visible),
 #workspace .server-item.selected:is(:hover, :focus-visible),
 #workspace #all-servers[aria-pressed="true"]:is(:hover, :focus-visible) {
+  background: color-mix(in srgb, var(--accent) 25%, #063c2d);
+  color: #f3fff9;
   border-color: var(--accent);
 }
 
@@ -3424,4 +3427,8 @@ dialog .primary:hover {
     height: 44px;
     border-top: 0;
   }
+}
+
+#workspace .server-item.selected :is(strong, small) {
+  color: #f3fff9;
 }
