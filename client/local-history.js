@@ -14,20 +14,22 @@ export function setupLocalHistory(
     observer,
     cancelReveal,
     pending = false,
+    requested = false,
+    ready = false,
+    opening = null,
     generation = 0,
     queuedLines = 0,
     bottomPush = 0,
     scrollRemainder = 0,
     quietUntil = 0,
     retryAfter = 0,
-    reverseIntent = 0,
-    warmCapture = null;
+    reverseIntent = 0;
   const toggle = document.createElement("button");
   toggle.className = "power-scroll-toggle";
   toggle.type = "button";
   t.el.append(toggle);
   const sync = () => {
-    const on = !!panel;
+    const on = requested && !!panel;
     toggle.textContent = on ? "Scroll on" : "Scroll off";
     toggle.setAttribute("aria-pressed", String(on));
     toggle.setAttribute(
@@ -43,9 +45,9 @@ export function setupLocalHistory(
   };
   const clear = () => {
     generation++;
-    pending = false;
+    pending = requested = ready = false;
+    opening = null;
     queuedLines = bottomPush = scrollRemainder = reverseIntent = 0;
-    warmCapture = null;
     cancelReveal?.();
     cancelReveal = null;
     observer?.disconnect();
@@ -61,33 +63,12 @@ export function setupLocalHistory(
     clear();
     if (!t.disposed) t.term.focus();
   };
-  function captureText() {
-    const now = performance.now();
-    if (warmCapture && (warmCapture.pending || now - warmCapture.time < 1500))
-      return warmCapture.promise;
-    const entry = { pending: true, time: now };
-    entry.promise = Promise.resolve()
-      .then(() => capture(t))
-      .then(
-        (text) => {
-          entry.pending = false;
-          entry.time = performance.now();
-          return text;
-        },
-        (error) => {
-          if (warmCapture === entry) warmCapture = null;
-          throw error;
-        },
-      );
-    warmCapture = entry;
-    return entry.promise;
-  }
-  // Warm only on pointer intent, not on a polling loop. New terminal output or
-  // closing/locking invalidates the snapshot; in-flight reads are shared.
+  // Prepare a complete hidden renderer on pointer intent. Only actual use is
+  // "Scroll on"; background preparation must not capture input or take focus.
   t.term.onWriteParsed(() => {
-    warmCapture = null;
+    if (panel && !requested) clear();
   });
-  t.el.addEventListener("pointerenter", () => {
+  const prepare = () => {
     if (
       !panel &&
       !t.disposed &&
@@ -97,15 +78,57 @@ export function setupLocalHistory(
       t.status === "Connected" &&
       performance.now() >= retryAfter
     )
-      void captureText().catch(() => {});
+      void open(0, true);
+  };
+  t.el.addEventListener("pointerenter", prepare);
+  t.el.addEventListener("pointermove", prepare);
+  t.el.addEventListener("pointerleave", () => {
+    if (panel && !requested) clear();
   });
-  async function open(initialLines = 0) {
-    if (panel || !t.tmux || !t.target || t.disposed || t.status !== "Connected")
-      return;
+  async function reveal(token) {
+    const terminal = viewer,
+      view = panel;
+    terminal.scrollToBottom();
+    // Preserve sub-row movement across the handoff instead of rounding up.
+    queuedLines = Math.max(0, queuedLines);
+    const steps = Math.trunc(queuedLines);
+    if (steps) terminal.scrollLines(-steps);
+    scrollRemainder =
+      -(queuedLines - steps) *
+      t.term.options.fontSize *
+      t.term.options.lineHeight;
+    queuedLines = 0;
+    pending = false;
+    await new Promise((resolve) => {
+      const subscription = terminal.onRender(() => finish());
+      const finish = () => {
+        subscription.dispose();
+        cancelReveal = null;
+        resolve();
+      };
+      cancelReveal = finish;
+      terminal.refresh(0, terminal.rows - 1);
+    });
+    if (token !== generation || t.disposed || !requested) return;
+    view.classList.remove("history-loading");
+    if (t.el.contains(document.activeElement)) terminal.focus();
+  }
+  async function open(initialLines = 0, background = false) {
+    if (!t.tmux || !t.target || t.disposed || t.status !== "Connected") return;
+    if (panel) {
+      if (background || requested) return opening;
+      requested = true;
+      queuedLines = initialLines;
+      panel.classList.remove("history-prepared");
+      sync();
+      return ready ? reveal(generation) : opening;
+    }
+    requested = !background;
     const token = ++generation;
     queuedLines = initialLines;
     const view = (panel = document.createElement("section"));
-    view.className = "local-history history-loading";
+    view.className =
+      "local-history history-loading" + (background ? " history-prepared" : "");
     view.setAttribute("aria-label", "Power scrolling history");
     view.innerHTML =
       '<div class="history-terminal" aria-label="Cached tmux output"></div><span class="history-status" role="status">Loading history...</span>';
@@ -141,56 +164,38 @@ export function setupLocalHistory(
     };
     pending = true;
     sync();
-    try {
-      const text = await captureText();
-      if (token !== generation || t.disposed) return;
-      await new Promise((resolve) =>
-        terminal.write(historyText(text), resolve),
-      );
-      if (token !== generation || t.disposed) return;
-      status.textContent = `History snapshot · ${new Date().toLocaleTimeString()}`;
-      terminal.scrollToBottom();
-      // Preserve sub-row trackpad movement across the handoff. Rounding up
-      // made even a one-pixel first tick jump an entire text row.
-      queuedLines = Math.max(0, queuedLines);
-      const steps = Math.trunc(queuedLines);
-      if (steps) terminal.scrollLines(-steps);
-      scrollRemainder =
-        -(queuedLines - steps) *
-        t.term.options.fontSize *
-        t.term.options.lineHeight;
-      queuedLines = 0;
-      pending = false;
-      // write() completing only means the buffer is parsed. Reveal the cached
-      // terminal after its positioned rows are painted, not its initial frame.
-      await new Promise((resolve) => {
-        const subscription = terminal.onRender(() => finish());
-        const finish = () => {
-          subscription.dispose();
-          cancelReveal = null;
-          resolve();
-        };
-        cancelReveal = finish;
-        terminal.refresh(0, terminal.rows - 1);
-      });
-      if (token !== generation || t.disposed) return;
-      view.classList.remove("history-loading");
-      if (t.el.contains(document.activeElement)) terminal.focus();
-    } catch (e) {
-      if (token === generation) {
-        if (initialLines) {
-          clear();
-          quietUntil = performance.now() + 180;
-          retryAfter = performance.now() + 5000;
-          notice("Could not load local history: " + e.message);
-        } else status.textContent = e.message;
+    opening = (async () => {
+      try {
+        const text = await capture(t);
+        if (token !== generation || t.disposed) return;
+        await new Promise((resolve) =>
+          terminal.write(historyText(text), resolve),
+        );
+        if (token !== generation || t.disposed) return;
+        status.textContent = `History snapshot · ${new Date().toLocaleTimeString()}`;
+        ready = true;
+        if (requested) await reveal(token);
+        else {
+          terminal.scrollToBottom();
+          terminal.refresh(0, terminal.rows - 1);
+        }
+      } catch (e) {
+        if (token === generation) {
+          if (background || initialLines) {
+            const report = requested;
+            clear();
+            retryAfter = performance.now() + 5000;
+            if (report) notice("Could not load local history: " + e.message);
+          } else status.textContent = e.message;
+        }
+      } finally {
+        if (token === generation) {
+          pending = false;
+          sync();
+        }
       }
-    } finally {
-      if (token === generation) {
-        pending = false;
-        sync();
-      }
-    }
+    })();
+    return opening;
   }
   function options() {
     const o = t.term.options;
@@ -255,7 +260,7 @@ export function setupLocalHistory(
         reverseIntent = 0;
       }
 
-      if (!panel) {
+      if (!requested) {
         if (
           !automatic() ||
           pixels >= 0 ||
@@ -306,7 +311,7 @@ export function setupLocalHistory(
     },
     { passive: false },
   );
-  toggle.onclick = () => (panel ? close() : void open());
+  toggle.onclick = () => (requested ? close() : void open());
   sync();
   return {
     open,
@@ -316,7 +321,8 @@ export function setupLocalHistory(
     update,
     getSelection: () => viewer?.getSelection() || "",
     findNext: (text) => search?.findNext(text),
-    isOpen: () => !!panel,
-    focus: () => (pending ? toggle.focus() : viewer?.focus()),
+    isOpen: () => requested && !!panel,
+    focus: () =>
+      !requested ? t.term.focus() : pending ? toggle.focus() : viewer?.focus(),
   };
 }
