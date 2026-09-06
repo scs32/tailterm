@@ -38,10 +38,13 @@ with tempfile.TemporaryDirectory(prefix='tailserve-tmux-') as directory:
         target_id, target_created = tmux('display-message','-p','-t','clipboard-test','#{session_id}|#{session_created}').split('|')
         history_script='import {tmuxHistoryCommand} from "./shared/tmux-command.js";process.stdout.write(tmuxHistoryCommand(JSON.parse(process.argv[2]),process.argv[1]));'
         history_command=subprocess.check_output(['node','--input-type=module','-e',history_script,wrapper,json.dumps({'id':target_id,'created':target_created})],text=True)
+        tmux('send-keys','-t','clipboard-test',r"printf '\033[38;2;255;160;90mCOLORED_HISTORY\033[0m\n'",'Enter')
+        drain(.3)
         before_history_mode=tmux('display-message','-p','-t','clipboard-test','#{pane_in_mode}')
         history=subprocess.run(['/bin/sh','-c',history_command],capture_output=True,text=True)
         assert history.returncode==0, history.stderr
-        assert history.stdout.strip()==tmux('capture-pane','-p','-J','-S','-5000','-t','clipboard-test')
+        assert "\x1b[38;2;255;160;90mCOLORED_HISTORY" in history.stdout, repr(history.stdout)
+        assert history.stdout.strip()==tmux('capture-pane','-p','-e','-J','-S','-5000','-t','clipboard-test')
         assert tmux('display-message','-p','-t','clipboard-test','#{pane_in_mode}')==before_history_mode
 
         symbols='Unicode probe: ❯ ⌘ ⇧ ’ •'
