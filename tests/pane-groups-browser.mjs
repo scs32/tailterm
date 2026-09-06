@@ -19,6 +19,8 @@ export async function exercisePaneGroups(page, getInput = () => undefined) {
     .locator("[data-tab]")
     .evaluate((el) => el.getBoundingClientRect().width);
   await inactive.hover();
+  assert.ok(await tab(ids[0]).locator("[data-close]").isHidden());
+  assert.ok(await tab(ids[0]).locator(".tab-tmux").isHidden());
   assert.ok(await inactive.locator("[data-close]").isVisible());
   assert.ok(await inactive.locator("[data-session-menu]").isVisible());
   assert.ok(await inactive.locator(".tab-tmux").isVisible());
@@ -31,6 +33,7 @@ export async function exercisePaneGroups(page, getInput = () => undefined) {
       ),
   );
   await page.mouse.move(0, 0);
+  assert.ok(await tab(ids[0]).locator("[data-close]").isVisible());
   await inactive.locator("[data-tab]").focus();
   assert.ok(await inactive.locator("[data-session-menu]").isVisible());
   await page.keyboard.press("Tab");

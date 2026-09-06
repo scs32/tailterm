@@ -2396,10 +2396,6 @@ aside #discover {
   body.terminal-open .terminal-footer button {
     flex: none;
   }
-  body.terminal-open #tail-status,
-  body.terminal-open #tail-dot {
-    display: none;
-  }
   body.mobile-keyboard .terminal-footer > #terminal-status {
     display: none;
   }
@@ -3384,4 +3380,17 @@ dialog .primary:hover {
   #workspace .terminal-tools {
     margin-left: 0;
   }
+}
+
+/* Give the hovered tab the detail space without changing the active session. */
+#tabs:has(.tab:not(.active):hover)
+  .tab.active
+  > :is([data-close], [data-session-menu]),
+#tabs:has(.tab:not(.active):hover) .tab.active .tab-tmux {
+  display: none;
+}
+#tailscale-login {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
 }

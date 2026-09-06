@@ -90,7 +90,7 @@ try {
   });
   await page.waitForFunction(
     () =>
-      /NeedsLogin|Starting|Running|Tailnet connected/.test(
+      /Sign in to Tailscale|Starting|Running|Tailscale connected/.test(
         document.querySelector("#tail-status").textContent,
       ),
     { timeout: 90000 },

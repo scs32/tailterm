@@ -553,7 +553,7 @@ try {
   await page.locator("#tailscale-login").click();
   await page.waitForFunction(
     () =>
-      ["NeedsLogin", "Starting", "Running", "NeedsMachineAuth"].includes(
+      /Sign in to Tailscale|Starting|Tailscale connected|NeedsMachineAuth/.test(
         document.querySelector("#tail-status")?.textContent,
       ) ||
       document
