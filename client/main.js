@@ -335,7 +335,7 @@ function mount() {
     activate,
     close: closeTab,
     preferences: () => appearance,
-    label: tabName,
+    label: (t) => tabName(t, true),
   });
   const groupButton = document.createElement("button");
   groupButton.id = "group-tabs";
@@ -634,21 +634,30 @@ function renderTabs() {
   $("#tabs").innerHTML = (
     paneGroups?.entries() || tabs.map((tab) => ({ tab, ids: [tab.id] }))
   )
-    .map(({ tab: remembered, ids }) => {
+    .map(({ tab: remembered, ids, group }) => {
       const t = ids.includes(active) ? currentTab() : remembered;
-      const grouped = ids.length > 1;
+      const grouped = !!group && !group.tree.tab;
+      const decoration = normalizeTabDecoration(
+        grouped ? group.decoration : t.decoration,
+      );
       const activity = ids
         .map((id) => tabs.find((t) => t.id === id)?.activity)
         .filter(Boolean)
         .join(", ");
       const names = ids.map((id) => {
         const member = tabs.find((t) => t.id === id);
-        return `${tabName(member)} #${member.number}`;
+        return tabName(member, true);
       });
+      const groupName = [
+        decoration.emoji,
+        decoration.label || names.join(" + "),
+      ]
+        .filter(Boolean)
+        .join(" ");
       const title = grouped
-        ? `${ids.length} panes: ${names.join(", ")}\nDrag onto another tab to merge groups. × closes the focused pane.`
-        : `${tabName(t)} #${t.number}\n${t.server.username}@${t.server.host}:${t.server.port}\n${t.status}${t.tmux ? " · tmux launch: " + t.session : ""}\nDrop at a tab edge to reorder; drop in its center to group.`;
-      return `<div class="tab ${ids.includes(active) ? "active" : ""} ${grouped ? "group-tab" : ""}" data-tab-color="${normalizeTabDecoration(t.decoration).color}" style='--tab-font:${esc(fonts[t.decoration?.font]?.family || "var(--terminal-font)")}' draggable="false"><button data-tab="${t.id}" role="tab" aria-selected="${ids.includes(active)}" title="${esc(title)}"><span class="node-dot ${t.status === "Connected" ? "online" : ""}"></span><span class="tab-copy"><span class="tab-name">${grouped ? `<span class="pane-count">▦ ${ids.length}</span> ${esc(names.join(" + "))}` : `${esc(tabName(t))} #${t.number}`}</span><span class="tab-activity">${esc(activity)}</span><span class="tab-tmux">${grouped ? "Focused: " + esc(tabName(t)) + " · " : ""}${esc(t.status)}${t.tmux ? " · launch: " + esc(t.session) + (t.tmuxVerified ? "" : " (unverified)") : ""}</span></span></button>${staticMode ? `<button data-session-menu="${t.id}" aria-label="Session actions for ${esc(t.session)}" title="Session actions and tab order">...</button>` : ""}<button data-close="${t.id}" aria-label="Close ${esc(t.server.name)} ${grouped ? "focused pane" : "terminal"}">×</button></div>`;
+        ? `${groupName}\n${ids.length} panes: ${names.join(", ")}\nDrag onto another tab to merge groups. × closes the focused pane.`
+        : `${tabName(t, true)}\n${t.server.username}@${t.server.host}:${t.server.port}\n${t.status}${t.tmux ? " · tmux launch: " + t.session : ""}\nDrop at a tab edge to reorder; drop in its center to group.`;
+      return `<div class="tab ${ids.includes(active) ? "active" : ""} ${grouped ? "group-tab" : ""}" data-tab-color="${decoration.color}" data-tab-fill="${decoration.fill}" style='--tab-font:${esc(fonts[decoration.font]?.family || "var(--terminal-font)")}' draggable="false"><button data-tab="${t.id}" role="tab" aria-selected="${ids.includes(active)}" title="${esc(title)}"><span class="node-dot ${t.status === "Connected" ? "online" : ""}"></span><span class="tab-copy"><span class="tab-name">${grouped ? `<span class="pane-count">▦ ${ids.length}</span> ${esc(groupName)}` : `${esc(tabName(t, true))}`}</span><span class="tab-activity">${esc(activity)}</span><span class="tab-tmux">${grouped ? "Focused: " + esc(tabName(t)) + " · " : ""}${esc(t.status)}${t.tmux ? " · launch: " + esc(t.session) + (t.tmuxVerified ? "" : " (unverified)") : ""}</span></span></button>${staticMode ? `<button data-session-menu="${t.id}" aria-label="Session actions for ${esc(t.session)}" title="Session actions and tab order">...</button>` : ""}<button data-close="${t.id}" aria-label="Close ${esc(t.server.name)} ${grouped ? "focused pane" : "terminal"}">×</button></div>`;
     })
     .join("");
   $$("[data-tab]").forEach((b) => (b.onclick = () => activate(b.dataset.tab)));
@@ -657,24 +666,48 @@ function renderTabs() {
       (b.onclick = () => {
         const t = tabs.find((t) => t.id === b.dataset.sessionMenu);
         if (!t) return;
+        const grouped = !paneGroups.model.group(t.id)?.tree.tab;
         dialog(
           "Session actions",
-          `<div class="dialog-menu">${t.tmux ? '<button id="rename-tab-session">Rename session</button>' : ""}<button id="decorate-tab">Tab appearance</button><button id="move-tab-left">Move left</button><button id="move-tab-right">Move right</button></div>`,
+          `<div class="dialog-menu">${t.tmux ? '<button id="rename-tab-session">Rename session</button>' : ""}<button id="decorate-tab">${grouped ? "Group appearance" : "Tab appearance"}</button>${grouped ? '<button id="decorate-pane">Focused session appearance</button>' : ""}<button id="move-tab-left">Move left</button><button id="move-tab-right">Move right</button></div>`,
         );
         if (t.tmux)
           $("#rename-tab-session").onclick = () =>
             renameSession(t.server, t.session, t.target);
-        $("#decorate-tab").onclick = () =>
+        const decorate = (parent) => {
+          const currentGroup = paneGroups.model.group(t.id);
+          if (parent && (!currentGroup || currentGroup.tree.tab)) return;
           showTabDecoration({
-            tab: t,
-            name: t.server.name,
+            tab: parent ? currentGroup : t,
+            kind: parent ? "group" : "tab",
+            name: parent
+              ? paneGroups
+                  .members(t.id)
+                  .map((id) =>
+                    tabName(
+                      tabs.find((t) => t.id === id),
+                      true,
+                    ),
+                  )
+                  .join(" + ")
+              : `${t.server.name} #${t.number}`,
             dialog,
             close: closeDialog,
             save: (value) => {
-              t.decoration = value;
+              if (parent) {
+                const group = paneGroups.model.group(t.id);
+                if (!group || group.tree.tab) return;
+                group.decoration = value;
+              } else t.decoration = value;
               renderTabs();
+              paneGroups.render();
+              scheduleWorkspaceSave();
             },
           });
+        };
+        $("#decorate-tab").onclick = () => decorate(grouped);
+        if ($("#decorate-pane"))
+          $("#decorate-pane").onclick = () => decorate(false);
         const entries = paneGroups.entries(),
           index = entries.findIndex((entry) => entry.ids.includes(t.id));
         $("#move-tab-left").disabled = index <= 0;
@@ -719,13 +752,13 @@ function renderClipboard() {
   $("#copy").disabled = !t;
   $("#paste").disabled = !t || t.status !== "Connected";
 }
-function tabName(t) {
+function tabName(t, numbered = false) {
   const d = normalizeTabDecoration(t.decoration);
   return [
     d.emoji,
     d.label ||
-      data.servers.find((s) => s.id === t.server.id)?.name ||
-      t.server.name,
+      (data.servers.find((s) => s.id === t.server.id)?.name || t.server.name) +
+        (numbered ? ` #${t.number}` : ""),
   ]
     .filter(Boolean)
     .join(" ");
@@ -747,11 +780,11 @@ function groupDialog() {
         ? `<h3>This group · ${ids.length} panes</h3><div class="group-choices">${ids
             .map((id) => {
               const p = tabs.find((t) => t.id === id);
-              return `<button data-separate="${id}">↗ Separate ${esc(tabName(p))} #${p.number}</button>`;
+              return `<button data-separate="${id}">↗ Separate ${esc(tabName(p, true))}</button>`;
             })
             .join("")}</div>`
         : ""
-    }<h3>Group with</h3><div class="group-choices">${others.map((g) => `<button data-merge="${g.tab.id}">▦ ${esc(tabName(g.tab))} #${g.tab.number}${g.ids.length > 1 ? " · " + g.ids.length + " panes" : ""}</button>`).join("") || '<p class="fine">Open another terminal with + first.</p>'}</div><details class="dialog-details"><summary>Resizing & keyboard tips</summary><p class="fine">Drag dividers to resize. Focus a divider and use arrow keys; hold Shift for larger steps. Double-click or press Enter to reset that split. Closing a pane disconnects only that SSH connection; remote tmux keeps running.</p></details>`,
+    }<h3>Group with</h3><div class="group-choices">${others.map((g) => `<button data-merge="${g.tab.id}">▦ ${esc(tabName(g.tab, true))}${g.ids.length > 1 ? " · " + g.ids.length + " panes" : ""}</button>`).join("") || '<p class="fine">Open another terminal with + first.</p>'}</div><details class="dialog-details"><summary>Resizing & keyboard tips</summary><p class="fine">Drag dividers to resize. Focus a divider and use arrow keys; hold Shift for larger steps. Double-click or press Enter to reset that split. Closing a pane disconnects only that SSH connection; remote tmux keeps running.</p></details>`,
   );
   $$("[data-separate]").forEach(
     (b) =>

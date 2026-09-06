@@ -81,6 +81,7 @@ export function normalizeWorkspace(value) {
     .map((g) => ({
       tree: tree(g?.tree),
       active: ids.has(g?.active) ? g.active : null,
+      decoration: normalizeTabDecoration(g?.decoration),
     }))
     .filter((g) => g.tree);
   return {

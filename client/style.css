@@ -3112,10 +3112,10 @@ dialog .font-choice.chosen {
   --tab-marker: light-dark(#a03e5a, #ed8e8e);
 }
 .tab[data-tab-color] {
-  border-top: 2px solid var(--tab-marker);
+  border: 1px solid var(--tab-marker);
 }
 .tab.active[data-tab-color="default"] {
-  border-top-color: var(--accent);
+  border-color: var(--accent);
 }
 .tab-decoration-preview {
   margin-top: 16px;
@@ -3125,8 +3125,8 @@ dialog .font-choice.chosen {
 }
 #tab-decoration-sample {
   display: block;
-  border-top: 2px solid var(--tab-marker);
-  padding-top: 8px;
+  border: 1px solid var(--tab-marker);
+  padding: 10px;
   overflow-wrap: anywhere;
   color: var(--ink);
 }
@@ -3261,4 +3261,106 @@ dialog .primary:hover {
 #workspace :is(input, select, textarea):hover,
 #workspace :is(input, select, textarea):focus-visible {
   border-color: var(--accent);
+}
+
+/* A decorated tab owns its entire outline, including the buttons inside it.
+   Scope the shared hover colors to that tab so the base theme cannot overwrite it. */
+#tabs .tab[data-tab-color]:not([data-tab-color="default"]) {
+  --line: var(--tab-marker);
+  --accent: var(--tab-marker);
+  border-color: var(--tab-marker);
+}
+[data-tab-fill="mint"] {
+  --tab-fill-color: #4aaf78;
+}
+[data-tab-fill="blue"] {
+  --tab-fill-color: #548fd7;
+}
+[data-tab-fill="violet"] {
+  --tab-fill-color: #a17bd1;
+}
+[data-tab-fill="amber"] {
+  --tab-fill-color: #c99d42;
+}
+[data-tab-fill="rose"] {
+  --tab-fill-color: #d97091;
+}
+#tabs .tab[data-tab-fill]:not([data-tab-fill="default"]),
+#tab-decoration-sample[data-tab-fill]:not([data-tab-fill="default"]),
+.pane-header[data-tab-fill]:not([data-tab-fill="default"]) {
+  --surface: color-mix(in srgb, var(--tab-fill-color) 18%, var(--terminal-bg));
+  --raised: color-mix(in srgb, var(--tab-fill-color) 28%, var(--terminal-bg));
+  background: var(--surface);
+}
+#tabs .tab.active[data-tab-fill]:not([data-tab-fill="default"]) {
+  background: var(--raised);
+}
+#emoji-options {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(42px, 1fr));
+  gap: 5px;
+  max-height: 220px;
+  overflow-y: auto;
+  padding: 3px;
+  margin: 8px 0;
+}
+#emoji-options button {
+  min-height: 42px;
+  padding: 5px;
+  font:
+    22px/1.2 "Apple Color Emoji",
+    "Segoe UI Emoji",
+    "Noto Color Emoji",
+    sans-serif;
+}
+#emoji-options button[hidden] {
+  display: none;
+}
+#emoji-options button[aria-pressed="true"] {
+  border-color: var(--accent);
+  background: var(--raised);
+}
+
+#tabs
+  .tab.active:is(
+    [data-tab-color]:not([data-tab-color="default"]),
+    [data-tab-fill]:not([data-tab-fill="default"])
+  )
+  > button {
+  background: var(--raised);
+}
+#tabs .tab.active .tab-name {
+  font-weight: 600;
+}
+
+#tabs .tab[data-tab-color]:not([data-tab-color="default"]) .tab-activity {
+  color: var(--ink);
+}
+/* The focus frame and each session's identity stripe are separate lines. */
+.pane-header[data-tab-color] {
+  border-bottom: 2px solid var(--tab-marker);
+}
+#workspace .pane-header .pane-label {
+  font-family: var(--tab-font, var(--terminal-font));
+}
+.pane-header.active .pane-label {
+  font-weight: 600;
+}
+
+.pane-header.active[data-tab-color]:not([data-tab-color="default"]) {
+  --line: var(--tab-marker);
+  --accent: var(--tab-marker);
+  border-color: var(--tab-marker);
+}
+#terminal-body.has-panes
+  .terminal-instance.focused-pane[data-tab-color]:not(
+    [data-tab-color="default"]
+  ) {
+  border-color: var(--tab-marker);
+}
+
+#tabs
+  .tab[data-tab-fill]:not([data-tab-fill="default"])
+  :is(.tab-tmux, .tab-activity) {
+  color: var(--ink);
 }

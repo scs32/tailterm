@@ -1,3 +1,5 @@
+import { normalizeTabDecoration } from "./tab-decoration.js";
+import { fonts } from "./appearance.js";
 import {
   PaneGroups,
   leaves,
@@ -221,8 +223,16 @@ export function setupPaneGroups({
       const t = getTabs().find((t) => t.id === box.id);
       const header = chrome.querySelector(`[data-pane="${box.id}"]`);
       header.classList.toggle("active", box.id === getActive());
+      const decoration = normalizeTabDecoration(t.decoration);
+      header.dataset.tabColor = decoration.color;
+      t.el.dataset.tabColor = decoration.color;
+      header.dataset.tabFill = decoration.fill;
+      header.style.setProperty(
+        "--tab-font",
+        fonts[decoration.font]?.family || "var(--terminal-font)",
+      );
       const button = header.querySelector(".pane-label");
-      button.textContent = `${label(t)} #${t.number} · ${t.tmux ? t.session : "SSH"} · ${t.status}`;
+      button.textContent = `${label(t)} · ${t.tmux ? t.session : "SSH"} · ${t.status}`;
       button.title = `${t.server.username}@${t.server.host}\nDrag this header onto another group or out to the tab bar.`;
       position(header, { ...box, height: 30 });
       position(t.el, { ...box, y: box.y + 30, height: box.height - 30 });
@@ -366,6 +376,7 @@ export function setupPaneGroups({
         .map((g) => ({
           tab: getTabs().find((t) => t.id === g.active),
           ids: leaves(g.tree),
+          group: model.group(g.active),
         })),
   };
 }

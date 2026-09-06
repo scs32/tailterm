@@ -31,12 +31,102 @@ export async function exercisePaneGroups(page, getInput = () => undefined) {
     expectedOrder,
   );
   assert.equal(await page.locator("#tabs .tab").count(), originalCount);
+  const decorate = async (target, values) => {
+    await target.locator("[data-session-menu]").click();
+    await page.locator("#decorate-tab").click();
+    for (const [key, value] of Object.entries(values)) {
+      const control = page.locator(`#tab-decoration-form [name="${key}"]`);
+      if (["color", "fill", "font"].includes(key))
+        await control.selectOption(value);
+      else await control.fill(value);
+    }
+    await page.locator("#tab-decoration-form .primary").click();
+  };
+  await decorate(tab(ids[0]), {
+    label: "Air A",
+    color: "blue",
+    fill: "blue",
+    emoji: "🍎",
+  });
+  await decorate(tab(ids[1]), {
+    label: "Air B",
+    color: "rose",
+    fill: "rose",
+    emoji: "🚀",
+  });
   await tab(ids[1]).dragTo(tab(ids[0]));
   assert.equal(await page.locator("#tabs .tab").count(), originalCount - 1);
   assert.equal(
     await page.locator(".terminal-instance:not([hidden])").count(),
     2,
   );
+  assert.equal(
+    await page.locator(".group-tab").getAttribute("data-tab-color"),
+    "default",
+    "a new parent does not borrow the focused child's appearance",
+  );
+  await decorate(page.locator(".group-tab"), {
+    label: "My machines",
+    color: "violet",
+    fill: "amber",
+    emoji: "📦",
+  });
+  const checkParent = async () => {
+    assert.equal(
+      await page.locator(".group-tab").getAttribute("data-tab-color"),
+      "violet",
+    );
+    assert.equal(
+      await page.locator(".group-tab").getAttribute("data-tab-fill"),
+      "amber",
+    );
+    assert.match(
+      await page.locator(".group-tab .tab-name").innerText(),
+      /📦 My machines$/,
+    );
+  };
+  for (const [id, name, color] of [
+    [ids[0], "🍎 Air A", "blue"],
+    [ids[1], "🚀 Air B", "rose"],
+  ]) {
+    await pane(id).locator(".pane-label").click();
+    await checkParent();
+    assert.equal(await pane(id).getAttribute("data-tab-color"), color);
+    assert.ok(
+      (await pane(id).locator(".pane-label").innerText()).startsWith(
+        name + " ·",
+      ),
+    );
+    const frame = await pane(id).evaluate(
+      (el) => getComputedStyle(el).borderBottomColor,
+    );
+    const colors = await page
+      .locator(".focused-pane, .pane-header.active")
+      .evaluateAll((nodes) =>
+        nodes.flatMap((el) => {
+          const s = getComputedStyle(el);
+          return [
+            s.borderTopColor,
+            s.borderRightColor,
+            s.borderBottomColor,
+            s.borderLeftColor,
+          ];
+        }),
+      );
+    assert.ok(
+      colors.every((c) => c === frame),
+      "active session uses its own color for the entire outline",
+    );
+    const other = id === ids[0] ? ids[1] : ids[0];
+    assert.notEqual(
+      await pane(other).evaluate(
+        (el) => getComputedStyle(el).borderBottomColor,
+      ),
+      frame,
+      "inactive session keeps its own colored underline",
+    );
+  }
+  await page.screenshot({ path: ".build/independent-group-appearance.png" });
   await tab(ids[2]).dragTo(page.locator(".group-tab"));
   assert.equal(await page.locator("#tabs .tab").count(), originalCount - 2);
   assert.equal(
@@ -149,6 +239,7 @@ export async function exercisePaneGroups(page, getInput = () => undefined) {
       .textContent.includes("Connected"),
   );
   assert.equal(await page.locator(".pane-header").count(), 3);
+  await checkParent();
   await page.locator("#fullscreen").click();
   await page.waitForFunction(() => !!document.fullscreenElement);
   await page.screenshot({ path: "grouped-terminals-preview.png" });
@@ -226,4 +317,14 @@ export async function exercisePaneGroups(page, getInput = () => undefined) {
     await page.locator(".terminal-instance:not([hidden])").count(),
     1,
   );
+  assert.equal(await tab(ids[0]).getAttribute("data-tab-color"), "blue");
+  assert.equal(await tab(ids[1]).getAttribute("data-tab-color"), "rose");
+  assert.equal(await tab(ids[0]).locator(".tab-name").innerText(), "🍎 Air A");
+  assert.equal(await tab(ids[1]).locator(".tab-name").innerText(), "🚀 Air B");
+  for (const id of ids.slice(0, 2)) {
+    await tab(id).locator("[data-session-menu]").click();
+    await page.locator("#decorate-tab").click();
+    await page.locator("#reset-tab-decoration").click();
+    await page.locator("#tab-decoration-form .primary").click();
+  }
 }

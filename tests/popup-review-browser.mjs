@@ -66,7 +66,24 @@ export async function exercisePopupReview(page) {
     if (name === "session-actions") {
       await page.locator("#decorate-tab").click();
       await fits("tab appearance");
-      await page.locator("#tab-decoration-form [name=emoji]").fill("🔧");
+      await page
+        .locator("#tab-decoration-form [name=label]")
+        .fill("Build machine");
+      await page.locator(".emoji-picker > summary").click();
+      await page.locator("#emoji-search").fill("wrench");
+      await page.locator('#emoji-options [aria-label="Wrench tools"]').click();
+      assert.equal(
+        await page.locator("#tab-decoration-form [name=emoji]").inputValue(),
+        "🔧",
+      );
+      await page.setViewportSize({ width: 390, height: 650 });
+      await fits("emoji picker mobile");
+      await page.screenshot({ path: ".build/tab-emoji-picker-mobile.png" });
+      await page.setViewportSize(original);
+      await page.locator(".emoji-picker > summary").click();
+      await page
+        .locator("#tab-decoration-form [name=fill]")
+        .selectOption("blue");
       await page
         .locator("#tab-decoration-form [name=color]")
         .selectOption("amber");
@@ -78,9 +95,64 @@ export async function exercisePopupReview(page) {
         await page.locator(".tab.active").getAttribute("data-tab-color"),
         "amber",
       );
+      assert.equal(
+        await page.locator(".tab.active .tab-name").innerText(),
+        "🔧 Build machine",
+      );
+      assert.equal(
+        await page.locator(".tab.active").getAttribute("data-tab-fill"),
+        "blue",
+      );
+      const frame = await page
+        .locator(".tab.active")
+        .evaluate((el) => getComputedStyle(el).borderTopColor);
+      const assertFrame = async () => {
+        const colors = await page.locator(".tab.active").evaluate((el) =>
+          [el, ...el.querySelectorAll("button")].flatMap((item) => {
+            const s = getComputedStyle(item);
+            return [
+              s.borderTopColor,
+              s.borderRightColor,
+              s.borderBottomColor,
+              s.borderLeftColor,
+            ];
+          }),
+        );
+        assert.ok(
+          colors.every((color) => color === frame),
+          JSON.stringify(colors),
+        );
+      };
+      await assertFrame();
+      for (const button of await page.locator(".tab.active button").all()) {
+        await button.hover();
+        await assertFrame();
+        await button.focus();
+        await assertFrame();
+      }
+      const background = await page
+        .locator(".tab.active [data-tab]")
+        .evaluate((el) => getComputedStyle(el).backgroundColor);
+      assert.notEqual(
+        background,
+        await page
+          .locator("#tailscale-login")
+          .evaluate((el) => getComputedStyle(el).backgroundColor),
+      );
+      await page.screenshot({ path: ".build/tab-decoration-applied.png" });
+      await page.locator(".tab.active [data-session-menu]").click();
+      await page.locator("#decorate-tab").click();
+      assert.equal(
+        await page.locator("[name=label]").inputValue(),
+        "Build machine",
+      );
+      assert.equal(await page.locator("[name=fill]").inputValue(), "blue");
+      await page.locator("[name=label]").fill("");
+      await page.locator("[name=fill]").selectOption("default");
+      await page.locator("#tab-decoration-form .primary").click();
       assert.match(
         await page.locator(".tab.active .tab-name").innerText(),
-        /🔧/,
+        / #\d+$/,
       );
       await page.locator(".tab.active [data-session-menu]").click();
     }
