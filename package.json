@@ -14,7 +14,8 @@
     "preview:static": "vite preview --outDir dist-static --host 127.0.0.1 --port 4318",
     "test:static": "node tests/static-browser.mjs",
     "export:vault": "node scripts/export-server-vault.mjs",
-    "test:links": "node tests/terminal-links-browser.mjs"
+    "test:links": "node tests/terminal-links-browser.mjs",
+    "test:context-menu": "node tests/terminal-context-menu-browser.mjs"
   },
   "dependencies": {
     "@fontsource/fira-code": "^5.3.0",

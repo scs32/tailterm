@@ -171,3 +171,5 @@ Then open **Edit server**, choose **Standard SSH · key or password**, select th
 ### Clickable terminal URLs
 
 Hover over an HTTP or HTTPS URL to see its destination. **Command-click** on Mac or **Ctrl-click** on Windows/Linux opens it in a new browser tab. Plain clicks retain normal terminal behavior. Wrapped URLs and OSC 8 labeled hyperlinks are supported; for labeled links the hover hint shows the destination. Links in cached power-scroll history use ordinary clicks, taps, or keyboard activation. Opening a link uses the browser's network connection.
+
+When a remote application such as tmux enables mouse reporting, right-click opens its menu without the browser menu appearing over it. **Shift-right-click** opens the browser menu and keeps that click out of the remote application. The browser menu remains available normally in plain shells without mouse reporting, cached history, and the rest of the page.

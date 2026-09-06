@@ -1,3 +1,36 @@
+export function setupTerminalContextMenu(term) {
+  const element = term.element;
+  const contextMenu = (event) => {
+    if (!event.shiftKey && term.modes.mouseTrackingMode !== "none") {
+      event.preventDefault();
+      event.stopImmediatePropagation();
+    }
+  };
+  const browserClick = (event) => {
+    // On macOS, Shift does not bypass xterm mouse reporting by default.
+    // Keep this gesture out of the remote application but allow the browser menu.
+    if (
+      event.shiftKey &&
+      (event.button === 2 ||
+        (event.button === 0 && event.ctrlKey && /Mac/.test(navigator.platform)))
+    ) {
+      event.stopImmediatePropagation();
+      term.focus();
+    }
+  };
+  element.addEventListener("contextmenu", contextMenu, true);
+  element.addEventListener("mousedown", browserClick, true);
+  element.addEventListener("mouseup", browserClick, true);
+  term.loadAddon({
+    activate() {},
+    dispose() {
+      element.removeEventListener("contextmenu", contextMenu, true);
+      element.removeEventListener("mousedown", browserClick, true);
+      element.removeEventListener("mouseup", browserClick, true);
+    },
+  });
+}
+
 export function decodeClipboard(sequence) {
   const separator = sequence.indexOf(";");
   if (separator < 0) return null;
@@ -35,6 +68,7 @@ export function setupTerminalInput(
   t,
   { preferences, isActive, notice, setFont, changed, pasteImages },
 ) {
+  setupTerminalContextMenu(t.term);
   const canFocus = () =>
     !t.disposed &&
     isActive(t) &&

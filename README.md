@@ -67,6 +67,7 @@ See [the static-client guide](docs/static-client.md) for architecture, controls,
 ```sh
 npm test
 npm run test:links
+npm run test:context-menu
 npx playwright install chromium
 npm run build
 npm run test:browser
