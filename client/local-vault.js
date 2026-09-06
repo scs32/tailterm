@@ -97,20 +97,27 @@ export async function resetVault() {
 }
 export async function forgetDevice() {
   requireUnlocked();
-  await queue;
-  const database = await db();
-  await new Promise((resolve, reject) => {
-    const tx = database.transaction("vault", "readwrite");
-    tx.objectStore("vault").clear();
-    tx.oncomplete = resolve;
-    tx.onerror = () => reject(tx.error);
-    tx.onabort = () =>
-      reject(tx.error || new Error("Could not forget this device."));
+  // Serialize deletion with writes. Saves queued during deletion must observe
+  // the locked state, rather than re-creating a vault after the clear commits.
+  const task = queue.then(async () => {
+    requireUnlocked();
+    const database = await db();
+    await new Promise((resolve, reject) => {
+      const tx = database.transaction("vault", "readwrite");
+      tx.objectStore("vault").clear();
+      tx.oncomplete = resolve;
+      tx.onerror = () => reject(tx.error);
+      tx.onabort = () =>
+        reject(tx.error || new Error("Could not forget this device."));
+    });
+    contents = key = salt = undefined;
+    releaseLock?.();
+    releaseLock = undefined;
   });
-  contents = key = salt = undefined;
-  releaseLock?.();
-  releaseLock = undefined;
+  queue = task.catch(() => {});
+  return task;
 }
+
 function requireUnlocked() {
   if (!contents || !key) throw new Error("Unlock your local vault first.");
 }
