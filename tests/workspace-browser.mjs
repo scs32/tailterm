@@ -100,7 +100,7 @@ export async function exerciseWorkspaceContinuity(
     decoration,
   );
   assert.match(
-    await page.locator(".tab.active").innerText(),
+    await page.locator("#terminal-status").innerText(),
     /renamed-static-launcher/,
   );
   await page.screenshot({ path: "/tmp/tailterm-restored-workspace.png" });
