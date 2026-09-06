@@ -3476,3 +3476,16 @@ dialog .primary:hover {
   height: 100%;
   padding: 0;
 }
+
+/* Terminal wheel gestures stay inside the workspace, including the first
+   trackpad tick and the browser's rubber-band overscroll at page boundaries. */
+html:has(#workspace),
+body:has(#workspace) {
+  overscroll-behavior-y: none;
+}
+.terminal-instance,
+.terminal-instance .xterm-viewport,
+.terminal-instance .xterm-scrollable-element,
+.local-history .history-terminal {
+  overscroll-behavior: none;
+}
