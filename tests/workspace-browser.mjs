@@ -1,7 +1,11 @@
 import assert from "node:assert/strict";
 import { finishRestoration } from "./restore-browser.mjs";
 
-export async function exerciseWorkspaceContinuity(page, context) {
+export async function exerciseWorkspaceContinuity(
+  page,
+  context,
+  countTerminalStarts,
+) {
   const activeId = await page
     .locator(".tab.active [data-tab]")
     .getAttribute("data-tab");
@@ -10,6 +14,34 @@ export async function exerciseWorkspaceContinuity(page, context) {
       ".terminal-instance:not([hidden])",
     );
   });
+  // Simulate returning after two minutes without waiting or suspending the fixture.
+  const startsBeforeReturn = countTerminalStarts();
+  await page.evaluate(() => {
+    const now = Date.now;
+    try {
+      Object.defineProperty(document, "visibilityState", {
+        configurable: true,
+        get: () => "hidden",
+      });
+      document.dispatchEvent(new Event("visibilitychange"));
+      Date.now = () => now() + 120000;
+      Object.defineProperty(document, "visibilityState", {
+        configurable: true,
+        get: () => "visible",
+      });
+      document.dispatchEvent(new Event("visibilitychange"));
+    } finally {
+      Date.now = now;
+      delete document.visibilityState;
+    }
+  });
+  await page.waitForTimeout(1500);
+  assert.equal(
+    countTerminalStarts(),
+    startsBeforeReturn,
+    "returning to a browser tab must not reconnect healthy terminals",
+  );
+  assert.doesNotMatch(await page.title(), /Needs attention/);
   await context.setOffline(true);
   await page.waitForFunction(() =>
     document.querySelector("#terminal-status").textContent.includes("Error"),

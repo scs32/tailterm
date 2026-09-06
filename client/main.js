@@ -4,7 +4,12 @@ import { setupVoiceDictation } from "./voice-dictation.js";
 let voiceDictation;
 import { setupPaneShortcuts } from "./pane-shortcuts.js";
 import { setupLocalHistory } from "./local-history.js";
-import { screenLines, hasNewText, activityTitle } from "./activity.js";
+import {
+  screenLines,
+  hasNewText,
+  activityTitle,
+  connectionNeedsAttention,
+} from "./activity.js";
 import { tmuxHistoryCommand } from "../shared/tmux-command.js";
 import { showCommandPalette } from "./command-palette.js";
 import { setupMobileTerminal } from "./mobile-terminal.js";
@@ -119,6 +124,7 @@ const reconnects = createReconnectController({
   changed: (t, message) => {
     if (!t.disposed) {
       t.retryMessage = message;
+      refreshConnectionAttention(t);
       renderTabs();
     }
   },
@@ -127,6 +133,25 @@ const reconnects = createReconnectController({
     t.restart(false);
   },
 });
+function refreshConnectionAttention(t) {
+  // Error callbacks decide whether to retry immediately after updating status.
+  // Evaluate the final state, not the transient Error before recovery is scheduled.
+  queueMicrotask(() => {
+    if (t.disposed || locking) return;
+    const waitingForNetwork =
+      t.transport === "browser" &&
+      t.wasConnected &&
+      t.tmux &&
+      t.target &&
+      (!navigator.onLine || netState !== "Running");
+    if (connectionNeedsAttention(t, waitingForNetwork))
+      t.markActivity?.("Needs attention");
+    else if (t.activity === "Needs attention") {
+      t.activity = "";
+      renderTabs();
+    }
+  });
+}
 function scheduleWorkspaceSave() {
   if (!staticMode || !workspaceReady || restoring || locking) return;
   clearTimeout(workspaceTimer);
@@ -1292,8 +1317,7 @@ async function connect(
     const update = (status) => {
       if (t.disposed) return;
       t.status = status;
-      if (["Error", "Disconnected"].includes(status))
-        markActivity("Needs attention");
+      refreshConnectionAttention(t);
       renderTabs();
       renderSidebar();
       renderClipboard();
@@ -2142,22 +2166,10 @@ window.addEventListener("offline", () => {
     }
 });
 window.addEventListener("online", recoverConnections);
-let lastVisible = Date.now();
 document.addEventListener("visibilitychange", () => {
-  if (document.visibilityState === "visible") {
-    if (
-      Date.now() - lastVisible > 60000 &&
-      !locking &&
-      Date.now() - lastInteraction < 15 * 60 * 1000
-    )
-      for (const t of tabs)
-        if (t.status === "Connected" && t.tmux && t.target) {
-          t.networkInterrupted = true;
-          t.close?.();
-        }
-    recoverConnections();
-  }
-  lastVisible = Date.now();
+  // Returning to this page is not evidence that healthy SSH sessions are stale.
+  // Retry connections already known to be interrupted; keep live sessions intact.
+  if (document.visibilityState === "visible") recoverConnections();
 });
 // The browser cannot keep SSH alive indefinitely while suspended. Lock after 15 minutes without local interaction.
 let lastInteraction = Date.now();

@@ -63,7 +63,7 @@ After unlocking, the browser restores previously connected tabs, active tab, gro
 
 Verified tmux targets include the session ID and creation timestamp. Rename, resume, and reconnect can follow the same session after its name changes, and reject a missing or stale target. Remote rename changes are reflected when the session list is refreshed.
 
-SSH keepalives detect broken connections. Previously connected tmux tabs retry transient transport failures up to five times with increasing delays, reusing their terminal and scrollback. Authentication, changed host keys, missing sessions, and normal remote exits require manual action. Closing a tab or locking cancels retries. Network recovery and returning after sleep trigger recovery where appropriate; the inactivity lock remains in force.
+SSH keepalives detect broken connections. Previously connected tmux tabs retry transient transport failures up to five times with increasing delays, reusing their terminal and scrollback. Authentication, changed host keys, missing sessions, and normal remote exits require manual action. Closing a tab or locking cancels retries. Network recovery and returning after sleep retry connections already known to be interrupted; returning to the page does not reconnect healthy sessions. Automatic retries and waiting for network recovery do not raise **Needs attention** notifications. Failures requiring manual action still do, and reconnecting clears that warning. The inactivity lock remains in force.
 
 Drag to the left/right edge of a tab to reorder it; a highlighted edge previews placement. Drop in the center to group. The tab menu also offers **Move left** and **Move right**. Groups move as a unit.
 

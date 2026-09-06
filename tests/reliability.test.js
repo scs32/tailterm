@@ -145,3 +145,46 @@ test("Activity ignores identical redraws, row movement and status-only changes",
   );
   assert.equal(activityTitle([]), "Tailterm · Your servers, one workspace");
 });
+
+test("connection attention ignores healthy and recovering sessions but preserves actionable failures", async () => {
+  const { connectionNeedsAttention } = await import("../client/activity.js");
+  assert.equal(
+    connectionNeedsAttention({
+      status: "Connected",
+      activity: "Needs attention",
+    }),
+    false,
+  );
+  assert.equal(connectionNeedsAttention({ status: "Connecting" }), false);
+  for (const retryMessage of [
+    "Reconnecting in 1s",
+    "Reconnecting in 16s",
+    "Reconnecting...",
+  ])
+    assert.equal(
+      connectionNeedsAttention({ status: "Error", retryMessage }),
+      false,
+    );
+  assert.equal(
+    connectionNeedsAttention(
+      { status: "Error", retryMessage: "Reconnect manually" },
+      true,
+    ),
+    false,
+  );
+  assert.equal(
+    connectionNeedsAttention({
+      status: "Error",
+      retryMessage: "Reconnect manually",
+    }),
+    true,
+  );
+  assert.equal(
+    connectionNeedsAttention({
+      status: "Error",
+      retryMessage: "Reconnect manually after resolving the error",
+    }),
+    true,
+  );
+  assert.equal(connectionNeedsAttention({ status: "Disconnected" }), true);
+});

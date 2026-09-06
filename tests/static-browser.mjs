@@ -45,7 +45,8 @@ const parsedLogin = ssh2.utils.parseKey(loginKey, keyPassphrase);
 assert.equal(typeof parsedLogin.getPublicSSH, "function");
 let input = "",
   stream,
-  discoveries = 0;
+  discoveries = 0,
+  terminalStarts = 0;
 const sessions = new Set(["main"]);
 const identities = new Map(),
   uploadedFiles = new Map();
@@ -95,6 +96,7 @@ const ssh = new ssh2.Server(
         session.on("pty", (accept) => accept());
         session.on("window-change", (accept) => accept?.());
         const terminal = (accepted) => {
+          terminalStarts++;
           stream = accepted;
           stream.write("Tailserve fixture ready\r\n$ ");
           stream.on("data", (d) => {
@@ -561,7 +563,7 @@ try {
   );
   await exerciseLocalHistory(page, () => input);
   await exerciseWorkspaceActions(page, stream);
-  await exerciseWorkspaceContinuity(page, context);
+  await exerciseWorkspaceContinuity(page, context, () => terminalStarts);
   console.log(
     "Uploads, reconnect, reordering and workspace restoration passed.",
   );

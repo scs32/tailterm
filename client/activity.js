@@ -29,3 +29,11 @@ export function activityTitle(tabs) {
   )[0];
   return `(${pending.length}) ${first.activity} · Tailterm`;
 }
+
+export function connectionNeedsAttention(tab, waitingForNetwork = false) {
+  return (
+    ["Error", "Disconnected"].includes(tab.status) &&
+    !waitingForNetwork &&
+    !/^Reconnecting(?:\s|\.)/.test(tab.retryMessage || "")
+  );
+}
