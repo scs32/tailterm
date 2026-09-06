@@ -267,6 +267,58 @@ try {
       );
       assert.equal(await page.evaluate(() => captures), beforeWarm + 3);
       await page.evaluate(() => tab.history.close());
+      // Preparation parses and paints the complete viewer before the swipe.
+      await page.evaluate(() => {
+        window.pauseCapture = false;
+        window.focusBeforePrepare = document.activeElement;
+      });
+      const beforePrepared = await page.evaluate(() => captures);
+      await page.locator(".terminal-instance").dispatchEvent("pointerenter");
+      await page.waitForFunction(() =>
+        document
+          .querySelector(".history-prepared .xterm-rows")
+          ?.textContent.includes("history row 4999"),
+      );
+      assert.equal(await page.evaluate(() => tab.history.isOpen()), false);
+      assert.equal(
+        await page.locator(".power-scroll-toggle").getAttribute("aria-pressed"),
+        "false",
+      );
+      assert.equal(
+        await page.evaluate(
+          () => document.activeElement === focusBeforePrepare,
+        ),
+        true,
+      );
+      await page.evaluate(
+        () =>
+          (window.preparedScreen = document.querySelector(
+            ".history-prepared .xterm-screen",
+          )),
+      );
+      await page.waitForTimeout(1600); // unchanged content must not expire just before a swipe
+      const preparedRevealMs = await page.evaluate(async () => {
+        const start = performance.now();
+        await tab.history.open(3);
+        return performance.now() - start;
+      });
+      assert.equal(
+        await page.evaluate(
+          () =>
+            document.querySelector(".local-history .xterm-screen") ===
+            preparedScreen,
+        ),
+        true,
+      );
+      assert.equal(
+        await page.evaluate(() => captures),
+        beforePrepared + 1,
+        "prepared renderer is reused without another SSH capture",
+      );
+      console.log(
+        `${engine.name()}: prepared history revealed in ${Math.round(preparedRevealMs)}ms`,
+      );
+      await page.evaluate(() => tab.history.close());
       // A tiny first trackpad tick must not be rounded into a full-row jump.
       await page.evaluate(() => {
         window.pauseCapture = false;
