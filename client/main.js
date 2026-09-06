@@ -337,6 +337,9 @@ function mount() {
     isVisible: tabVisible,
     activate,
     close: closeTab,
+    upload: staticMode
+      ? (id) => imageUploads?.choose(tabs.find((t) => t.id === id))
+      : null,
     preferences: () => appearance,
     label: (t) => tabName(t, true),
   });

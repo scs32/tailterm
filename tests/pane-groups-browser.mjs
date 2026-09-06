@@ -8,8 +8,48 @@ export async function exercisePaneGroups(page, getInput = () => undefined) {
     .evaluateAll((nodes) => nodes.slice(-3).map((n) => n.dataset.tab));
   const tab = (id) => page.locator(`#tabs .tab:has([data-tab="${id}"])`);
   const pane = (id) => page.locator(`.pane-header[data-pane="${id}"]`);
+  async function checkUploadButton(id) {
+    const session = (await pane(id).locator(".pane-label").textContent())
+      .split(" · ")
+      .at(-2);
+    const chooserPromise = page.waitForEvent("filechooser");
+    await pane(id).locator("[data-pane-upload]").click();
+    const chooser = await chooserPromise;
+    await chooser.setFiles({
+      name: "pane-upload.png",
+      mimeType: "image/png",
+      buffer: Buffer.from([1, 2, 3]),
+    });
+    await page.locator("#upload-dialog").waitFor({ state: "visible" });
+    assert.ok(
+      (await page.locator("#upload-destination").textContent()).endsWith(
+        `— ${session === "SSH" ? "SSH shell" : session}`,
+      ),
+      "upload targets the clicked session",
+    );
+    await page.locator("#upload-cancel").click();
+  }
   // Inactive tabs hide controls and their separators, but remain keyboard usable.
   await tab(ids[0]).locator("[data-tab]").click();
+  assert.equal(
+    await page.locator(".pane-header").count(),
+    1,
+    "single sessions use the same pane header",
+  );
+  assert.equal(await pane(ids[0]).locator("[data-detach]").count(), 0);
+  assert.ok(
+    await pane(ids[0])
+      .getByRole("button", { name: "Close pane", exact: true })
+      .isVisible(),
+  );
+  await assertTerminalBounds(page);
+  const singleHeader = await pane(ids[0]).boundingBox();
+  const singleTerminal = await page
+    .locator(".terminal-instance:not([hidden])")
+    .boundingBox();
+  assert.equal(singleTerminal.y, singleHeader.y + singleHeader.height);
+  await page.screenshot({ path: "/tmp/tailterm-single-pane.png" });
+  await checkUploadButton(ids[0]);
   await page.mouse.move(0, 0);
   const inactive = tab(ids[1]);
   assert.ok(await inactive.locator("[data-close]").isHidden());
@@ -101,6 +141,13 @@ export async function exercisePaneGroups(page, getInput = () => undefined) {
     await page.locator(".group-tab").getAttribute("data-tab-color"),
     "default",
     "a new parent does not borrow the focused child's appearance",
+  );
+  await pane(ids[1]).locator(".pane-label").click();
+  await checkUploadButton(ids[0]);
+  assert.equal(
+    await page.locator(".pane-header.active").getAttribute("data-pane"),
+    ids[1],
+    "upload can target a different pane without changing focus",
   );
   // Font controls belong to the focused session, not its group or the app default.
   const paneSizes = () =>

@@ -15,6 +15,7 @@ export function setupPaneGroups({
   isVisible = () => true,
   activate,
   close,
+  upload,
   preferences,
   label,
 }) {
@@ -114,21 +115,25 @@ export function setupPaneGroups({
     const group = current(),
       ids = group ? leaves(group.tree) : [];
     if (group) model.group(getActive()).active = getActive();
-    const grouped = ids.length > 1;
-    body.classList.toggle("has-panes", grouped);
-    chrome.hidden = !grouped;
+    const grouped = group && leaves(model.group(getActive()).tree).length > 1;
+    body.classList.toggle("has-panes", ids.length > 0);
+    chrome.hidden = !ids.length;
     for (const t of getTabs()) {
       t.el.hidden = !ids.includes(t.id);
-      t.el.classList.toggle("focused-pane", grouped && t.id === getActive());
-      if (!grouped) t.el.removeAttribute("style");
+      t.el.classList.toggle("focused-pane", t.id === getActive());
+      if (!ids.length) t.el.removeAttribute("style");
     }
-    if (!grouped) {
+    if (!ids.length) {
       signature = "";
       chrome.replaceChildren();
       return;
     }
     layout = geometry(group);
-    const next = [...ids, ...layout.dividers.map((d) => d.node.id)].join("|");
+    const next = [
+      grouped,
+      ...ids,
+      ...layout.dividers.map((d) => d.node.id),
+    ].join("|");
     if (next !== signature) {
       signature = next;
       chrome.replaceChildren();
@@ -137,8 +142,9 @@ export function setupPaneGroups({
         header.className = "pane-header";
         header.dataset.pane = id;
         header.draggable = false;
-        header.title =
-          "Drag to rearrange\nDrop onto another pane in this group to swap positions, or onto the tab bar to ungroup.";
+        header.title = grouped
+          ? "Drag to rearrange\nDrop onto another pane in this group to swap positions, or onto the tab bar to ungroup."
+          : "Drag to group\nDrop onto another session tab to group these terminals.";
         const focus = document.createElement("button");
         focus.className = "pane-label";
         focus.onclick = () => activate(id);
@@ -153,7 +159,23 @@ export function setupPaneGroups({
         closeButton.textContent = "×";
         closeButton.setAttribute("aria-label", "Close pane");
         closeButton.onclick = () => close(id);
-        header.append(focus, detachButton, closeButton);
+        header.append(focus);
+        if (upload) {
+          const uploadButton = document.createElement("button");
+          uploadButton.dataset.paneUpload = id;
+          uploadButton.setAttribute(
+            "aria-label",
+            "Upload images to this session",
+          );
+          uploadButton.title =
+            "Upload images\nChoose images to send to this session’s remote folder.";
+          uploadButton.innerHTML =
+            '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><rect x="3" y="3" width="18" height="18"/><circle cx="8" cy="8" r="2"/><path d="m3 18 6-6 4 4 3-3 5 5"/></svg>';
+          uploadButton.onclick = () => upload(id);
+          header.append(uploadButton);
+        }
+        if (grouped) header.append(detachButton);
+        header.append(closeButton);
         chrome.append(header);
       }
       for (const d of layout.dividers) {
@@ -233,9 +255,11 @@ export function setupPaneGroups({
         "--tab-font",
         fonts[decoration.font]?.family || "var(--terminal-font)",
       );
+      const uploadButton = header.querySelector("[data-pane-upload]");
+      if (uploadButton) uploadButton.disabled = t.status !== "Connected";
       const button = header.querySelector(".pane-label");
       button.textContent = `${label(t)} · ${t.tmux ? t.session : "SSH"} · ${t.status}`;
-      button.title = `${t.server.username}@${t.server.host}\nDrag onto another pane to swap positions; onto another group to move; or onto the tab bar to ungroup.`;
+      button.title = `${t.server.username}@${t.server.host}\n${grouped ? "Drag onto another pane to swap positions; onto another group to move; or onto the tab bar to ungroup." : "Drag onto another session tab to group these terminals."}`;
       position(header, { ...box, height: 30 });
       position(t.el, { ...box, y: box.y + 30, height: box.height - 30 });
     }
