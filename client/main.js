@@ -84,6 +84,7 @@ applyChrome(appearance);
 setupTooltips();
 let data = { servers: [], keys: [], sessions: [] },
   selected = null,
+  serverFilter = null,
   tabs = [],
   active = null,
   ipn = null,
@@ -139,7 +140,12 @@ function scheduleWorkspaceSave() {
 async function flushWorkspace() {
   if (!staticMode || !workspaceReady || restoring) return;
   clearTimeout(workspaceTimer);
-  const snapshot = workspaceSnapshot(tabs, paneGroups.model.groups, active),
+  const snapshot = workspaceSnapshot(
+      tabs,
+      paneGroups.model.groups,
+      active,
+      serverFilter,
+    ),
     serialized = JSON.stringify(snapshot);
   if (serialized === savedWorkspace) return;
   await localVault.saveWorkspace(snapshot);
@@ -176,6 +182,23 @@ async function restoreWorkspace(value) {
   } catch (e) {
     notice("Workspace restoration paused: " + e.message);
   } finally {
+    serverFilter =
+      snapshot?.serverFilter === null || !snapshot
+        ? null
+        : new Set(
+            snapshot.serverFilter.filter((id) =>
+              data.servers.some((s) => s.id === id),
+            ),
+          );
+    if (!visibleTabs().length)
+      selected = data.servers.find(
+        (s) => serverFilter === null || serverFilter.has(s.id),
+      )?.id;
+    activate(
+      visibleTabs().some((t) => t.id === snapshot?.active)
+        ? snapshot.active
+        : visibleTabs()[0]?.id,
+    );
     restoring = false;
     if ($("#workspace")) $("#workspace").dataset.restoring = "false";
     workspaceReady = true;
@@ -248,7 +271,7 @@ function mount() {
   $("#lockscreen")?.remove();
   $("#app").insertAdjacentHTML(
     "beforeend",
-    `<div id="workspace"><aside><div class="brand">${icon}<strong>tailterm</strong><span class="version">01</span></div><div class="sidebar-section"><span>SERVERS</span></div><input id="filter" class="filter" placeholder="⌕  Find a server…" aria-label="Find a server"><nav id="server-list"></nav><button id="discover" class="sidebar-discover">⌕ Discover devices</button><div class="sidebar-bottom"><button id="keys">♧ <span>SSH key vault</span><span id="key-count">0</span></button><button id="lock">↪ <span>Lock workspace</span><kbd>⇧⌘L</kbd></button></div></aside><main><header><div class="header-right"><span class="status-dot" id="tail-dot"></span><span id="tail-status">Tailnet offline</span><button id="tailscale-login">Connect Tailscale ↗</button></div></header><section class="terminal-shell"><div class="terminal-tabs"><div class="tab-strip"><button id="tabs-left" class="tab-scroll" aria-label="Scroll tabs left" title="Scroll tabs left" hidden>‹</button><div id="tabs" role="tablist" aria-label="SSH connections"></div><button id="tabs-right" class="tab-scroll" aria-label="Scroll tabs right" title="Scroll tabs right" hidden>›</button></div><button id="new-tab" class="icon-button" title="Start or resume a session">+</button><div class="terminal-tools"><button id="edit-server" title="Edit selected server" aria-label="Edit selected server">Edit server</button><button id="search-toggle" title="Find in terminal">⌕</button><button id="font-down" title="Smaller text">A−</button><button id="font-up" title="Larger text">A+</button><button id="appearance" title="Appearance\nThemes, fonts, cursor and spacing" aria-label="Appearance">◐</button><button id="fullscreen" title="Fullscreen">⛶</button></div></div><div id="search-bar" hidden><input id="terminal-search" placeholder="Find in scrollback" aria-label="Find in terminal"><button id="find-next">Next ↓</button><button id="search-close">×</button></div><div id="terminal-body"><div id="empty-terminal"><div class="session-launcher"><span class="eyebrow">YOUR REMOTE WORKSPACE</span><h2>Pick up where you left off.</h2><p class="launcher-intro">Choose a server, then open a fresh workspace or return to a running session.</p><div id="launcher-server" class="server-grid" role="group" aria-label="Session server"></div><div class="launch-section"><div class="launch-section-title"><span class="step-dot">＋</span><div><h3>Start fresh</h3><p>A persistent tmux workspace on <strong id="launch-target"></strong></p></div></div><div class="launch-new"><input id="launcher-name" placeholder="Optional name · leave blank for an automatic ID" aria-label="New tmux session name" maxlength="64"><button id="start-session" class="primary">＋ Start session</button></div></div><div class="resume-heading"><strong>Pick up a session</strong><button id="launcher-refresh" title="Refresh sessions\nQuery this server now; no sessions are changed.">↻ Refresh</button></div><p id="launcher-note"></p><div id="launcher-sessions"></div><div class="launcher-secondary"><button id="launcher-shell">Open plain SSH shell</button><button id="launcher-discover">⌕ Discover devices</button></div></div></div></div><div class="terminal-footer"><span id="terminal-status">○ No active connection</span><div><button id="copy">Copy</button><button id="paste">Paste</button><button id="clear">Clear</button><button id="reconnect">Reconnect</button><span id="dimensions">— × —</span></div></div></section></main></div><dialog id="dialog"></dialog>`,
+    `<div id="workspace"><aside><div class="brand">${icon}<strong>tailterm</strong><span class="version">01</span></div><div class="sidebar-section"><span>SERVERS</span><button id="all-servers" aria-label="All servers" aria-pressed="true" title="Show sessions from all servers">All</button></div><input id="filter" class="filter" placeholder="⌕  Find a server…" aria-label="Find a server"><nav id="server-list"></nav><button id="discover" class="sidebar-discover">⌕ Discover devices</button><div class="sidebar-bottom"><button id="keys">♧ <span>SSH key vault</span><span id="key-count">0</span></button><button id="lock">↪ <span>Lock workspace</span><kbd>⇧⌘L</kbd></button></div></aside><main><header><div class="header-right"><span class="status-dot" id="tail-dot"></span><span id="tail-status">Tailnet offline</span><button id="tailscale-login">Connect Tailscale ↗</button></div></header><section class="terminal-shell"><div class="terminal-tabs"><div class="tab-strip"><button id="tabs-left" class="tab-scroll" aria-label="Scroll tabs left" title="Scroll tabs left" hidden>‹</button><div id="tabs" role="tablist" aria-label="SSH connections"></div><button id="tabs-right" class="tab-scroll" aria-label="Scroll tabs right" title="Scroll tabs right" hidden>›</button></div><button id="new-tab" class="icon-button" title="Start or resume a session">+</button><div class="terminal-tools"><button id="edit-server" title="Edit selected server" aria-label="Edit selected server">Edit server</button><button id="search-toggle" title="Find in terminal">⌕</button><button id="font-down" title="Smaller text">A−</button><button id="font-up" title="Larger text">A+</button><button id="appearance" title="Appearance\nThemes, fonts, cursor and spacing" aria-label="Appearance">◐</button><button id="fullscreen" title="Fullscreen">⛶</button></div></div><div id="search-bar" hidden><input id="terminal-search" placeholder="Find in scrollback" aria-label="Find in terminal"><button id="find-next">Next ↓</button><button id="search-close">×</button></div><div id="terminal-body"><div id="empty-terminal"><div class="session-launcher"><p id="server-filter-empty" class="fine" hidden></p><span class="eyebrow">YOUR REMOTE WORKSPACE</span><h2>Pick up where you left off.</h2><p class="launcher-intro">Choose a server, then open a fresh workspace or return to a running session.</p><div id="launcher-server" class="server-grid" role="group" aria-label="Session server"></div><div class="launch-section"><div class="launch-section-title"><span class="step-dot">＋</span><div><h3>Start fresh</h3><p>A persistent tmux workspace on <strong id="launch-target"></strong></p></div></div><div class="launch-new"><input id="launcher-name" placeholder="Optional name · leave blank for an automatic ID" aria-label="New tmux session name" maxlength="64"><button id="start-session" class="primary">＋ Start session</button></div></div><div class="resume-heading"><strong>Pick up a session</strong><button id="launcher-refresh" title="Refresh sessions\nQuery this server now; no sessions are changed.">↻ Refresh</button></div><p id="launcher-note"></p><div id="launcher-sessions"></div><div class="launcher-secondary"><button id="launcher-shell">Open plain SSH shell</button><button id="launcher-discover">⌕ Discover devices</button></div></div></div></div><div class="terminal-footer"><span id="terminal-status">○ No active connection</span><div><button id="copy">Copy</button><button id="paste">Paste</button><button id="clear">Clear</button><button id="reconnect">Reconnect</button><span id="dimensions">— × —</span></div></div></section></main></div><dialog id="dialog"></dialog>`,
   );
   if (staticMode) {
     $("#keys").insertAdjacentHTML(
@@ -270,6 +293,7 @@ function mount() {
   paneGroups = setupPaneGroups({
     getTabs: () => tabs,
     getActive: () => active,
+    isVisible: tabVisible,
     activate,
     close: closeTab,
     preferences: () => appearance,
@@ -301,6 +325,10 @@ function mount() {
   $("#launcher-refresh").onclick = () => backgroundRemote(selected);
   if (selected) backgroundRemote(selected);
   $("#filter").oninput = renderSidebar;
+  $("#all-servers").onclick = () => {
+    serverFilter = null;
+    applyServerFilter();
+  };
   $("#edit-server").onclick = () => {
     const s = currentServer();
     if (s) serverDialog(s);
@@ -417,7 +445,7 @@ function mount() {
   $(".header-right").prepend(commandsButton);
   setupMobileTerminal({
     current: currentTab,
-    tabs: () => tabs,
+    tabs: visibleTabs,
     activate,
     dialog,
     close: closeDialog,
@@ -489,30 +517,65 @@ function render() {
   scheduleWorkspaceSave();
   renderBackupStatus();
 }
+function tabVisible(t) {
+  return serverFilter === null || serverFilter.has(t.server.id);
+}
+function visibleTabs() {
+  return tabs.filter(tabVisible);
+}
+function applyServerFilter(id) {
+  if (id) {
+    if (serverFilter === null) serverFilter = new Set([id]);
+    else if (serverFilter.has(id)) serverFilter.delete(id);
+    else serverFilter.add(id);
+  }
+  const next =
+    currentTab() && tabVisible(currentTab()) ? currentTab() : visibleTabs()[0];
+  if (!next) {
+    selected =
+      id && serverFilter?.has(id)
+        ? id
+        : data.servers.find(
+            (s) => serverFilter === null || serverFilter.has(s.id),
+          )?.id;
+    if (selected) backgroundRemote(selected);
+  }
+  activate(next?.id);
+  requestAnimationFrame(() =>
+    (id
+      ? document.querySelector(`[data-server="${CSS.escape(id)}"]`)
+      : $("#all-servers")
+    )?.focus(),
+  );
+}
 function renderSidebar() {
   const q = $("#filter").value.toLowerCase();
   const servers = data.servers.filter((s) =>
     (s.name + s.host + s.group).toLowerCase().includes(q),
   );
+  $("#all-servers").setAttribute("aria-pressed", String(serverFilter === null));
+  $("#server-list").setAttribute("aria-label", "Filter sessions by server");
   $("#server-list").innerHTML =
     servers
       .map(
         (s) =>
-          `<button class="server-item ${s.id === selected ? "selected" : ""}" data-server="${esc(s.id)}"><span class="node-icon">${sidebarIcon("server")}</span><div><strong>${esc(s.name)}</strong><small>${esc(s.group)} · ${s.mode === "ssh" ? "SSH" : "Auto"}</small></div><span class="node-dot ${tabs.some((t) => t.server.id === s.id && t.status === "Connected") ? "online" : ""}"></span></button>`,
+          `<button class="server-item ${serverFilter?.has(s.id) ? "selected" : ""}" data-server="${esc(s.id)}" aria-pressed="${!!serverFilter?.has(s.id)}" title="Filter sessions from ${esc(s.name)}"><span class="node-icon">${sidebarIcon("server")}</span><div><strong>${esc(s.name)}</strong><small>${esc(s.group)} · ${s.mode === "ssh" ? "SSH" : "Auto"}</small></div><span class="node-dot ${tabs.some((t) => t.server.id === s.id && t.status === "Connected") ? "online" : ""}"></span></button>`,
       )
       .join("") ||
-    '<p class="sidebar-empty">No servers yet.<br>Your workspace starts here.</p>';
+    (q
+      ? '<p class="sidebar-empty">No matching servers.</p>'
+      : '<p class="sidebar-empty">No servers yet.<br>Your workspace starts here.</p>');
   $$("[data-server]").forEach(
     (b) =>
       (b.onclick = () => {
-        selectServer(b.dataset.server);
+        applyServerFilter(b.dataset.server);
       }),
   );
 }
 function renderTabs() {
   document.title = activityTitle(tabs);
   for (const t of tabs) t.history?.sync();
-  document.body.classList.toggle("terminal-open", tabs.length > 0);
+  document.body.classList.toggle("terminal-open", visibleTabs().length > 0);
   if (!$("#tabs")) return;
   paneGroups?.sync();
   const scrollPosition = $("#tabs").scrollLeft;
@@ -658,6 +721,7 @@ function selectServer(id, draft = false) {
   render();
 }
 function activate(id) {
+  if (id && !visibleTabs().some((t) => t.id === id)) id = visibleTabs()[0]?.id;
   const previous = currentTab();
   if (previous)
     previous.activitySnapshot = screenLines(previous.term, previous.tmux);
@@ -698,9 +762,10 @@ function closeTab(id) {
   const sibling = paneGroups?.members(id).find((member) => member !== id);
   disposeTab(t);
   if (wasActive) {
+    const visible = visibleTabs();
     const neighbor =
-      tabs.find((t) => t.id === sibling) ||
-      tabs[Math.min(index, tabs.length - 1)];
+      visible.find((t) => t.id === sibling) ||
+      visible[Math.min(index, visible.length - 1)];
     if (neighbor) activate(neighbor.id);
     else
       selectServer(
@@ -855,6 +920,12 @@ function renameSession(server, name, target) {
 function renderLauncher() {
   if (!$("#launcher-server")) return;
   const selector = $("#launcher-server");
+  const empty = $("#server-filter-empty");
+  empty.hidden = serverFilter === null || visibleTabs().length > 0;
+  empty.textContent =
+    serverFilter?.size === 0
+      ? "No servers selected. Select servers in the sidebar or choose All."
+      : "No open sessions match these server filters. Start a session below or choose All.";
   selector.innerHTML =
     data.servers
       .map((s) => {
@@ -1052,6 +1123,8 @@ async function connect(
   options = {},
 ) {
   if (!server) throw new Error("Add and select a server first.");
+  if (!restoring && !options.replace && serverFilter !== null)
+    serverFilter.add(server.id);
   if (tmux) session = resolveSessionName(session);
   if (tmux && !options.replace) {
     const existing = tabs.find(
@@ -2056,10 +2129,14 @@ setInterval(() => {
 
 function openCommands() {
   const t = currentTab();
-  const commands = tabs.map((tab) => ({
+  const commands = visibleTabs().map((tab) => ({
     label: `Switch: ${tab.session || "SSH shell"} · ${tab.server.name} #${tab.number}`,
     run: () => activate(tab.id),
   }));
+  commands.push({
+    label: "Show all servers",
+    run: () => $("#all-servers").click(),
+  });
   commands.push({ label: "New session", run: () => $("#new-tab").click() });
   if (t) {
     commands.push({
@@ -2098,7 +2175,7 @@ function openCommands() {
         label: "Upload images",
         run: () => imageUploads.choose(),
       });
-    for (const other of tabs.filter(
+    for (const other of visibleTabs().filter(
       (x) => x.id !== t.id && !paneGroups.members(t.id).includes(x.id),
     ))
       commands.push({

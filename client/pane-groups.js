@@ -1,9 +1,16 @@
-import { PaneGroups, leaves, tileLayout, paneNeighbor } from "./pane-layout.js";
+import {
+  PaneGroups,
+  leaves,
+  tileLayout,
+  paneNeighbor,
+  prune,
+} from "./pane-layout.js";
 import { setupPaneDrag } from "./pane-drag.js";
 
 export function setupPaneGroups({
   getTabs,
   getActive,
+  isVisible = () => true,
   activate,
   close,
   preferences,
@@ -27,11 +34,36 @@ export function setupPaneGroups({
   const sync = () => model.sync(getTabs().map((t) => t.id));
   const members = (id) => {
     const g = model.group(id);
-    return g ? leaves(g.tree) : [];
+    return g
+      ? leaves(g.tree).filter((id) =>
+          getTabs().some((t) => t.id === id && isVisible(t)),
+        )
+      : [];
   };
-  const current = () => model.group(getActive());
+  const project = (group) => {
+    if (!group) return null;
+    const tree = prune(
+      group.tree,
+      new Set(
+        getTabs()
+          .filter(isVisible)
+          .map((t) => t.id),
+      ),
+    );
+    if (!tree) return null;
+    const ids = leaves(tree);
+    return {
+      ...group,
+      tree,
+      active: ids.includes(group.active) ? group.active : ids[0],
+    };
+  };
+  const current = () => project(model.group(getActive()));
   function geometry(group) {
-    return tileLayout(group.tree, body.clientWidth, body.clientHeight);
+    const visible = project(group);
+    return visible
+      ? tileLayout(visible.tree, body.clientWidth, body.clientHeight)
+      : { panes: [], dividers: [] };
   }
   function merge(source, target, whole = true) {
     sync();
@@ -62,13 +94,24 @@ export function setupPaneGroups({
   function resizeDivider(el, value) {
     const d = layout?.dividers.find((d) => d.node.id === el.dataset.divider);
     if (!d) return;
-    d.node.ratio = Math.max(d.low / d.span, Math.min(d.high / d.span, value));
+    const find = (tree) =>
+      !tree || tree.tab
+        ? null
+        : tree.id === d.node.id
+          ? tree
+          : find(tree.a) || find(tree.b);
+    const original = find(model.group(getActive())?.tree);
+    if (original)
+      original.ratio = Math.max(
+        d.low / d.span,
+        Math.min(d.high / d.span, value),
+      );
     render();
   }
   function render() {
     const group = current(),
       ids = group ? leaves(group.tree) : [];
-    if (group) group.active = getActive();
+    if (group) model.group(getActive()).active = getActive();
     const grouped = ids.length > 1;
     body.classList.toggle("has-panes", grouped);
     chrome.hidden = !grouped;
@@ -317,9 +360,12 @@ export function setupPaneGroups({
       activate(getActive());
     },
     entries: () =>
-      model.groups.map((g) => ({
-        tab: getTabs().find((t) => t.id === g.active),
-        ids: leaves(g.tree),
-      })),
+      model.groups
+        .map(project)
+        .filter(Boolean)
+        .map((g) => ({
+          tab: getTabs().find((t) => t.id === g.active),
+          ids: leaves(g.tree),
+        })),
   };
 }

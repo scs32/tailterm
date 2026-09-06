@@ -1,3 +1,4 @@
+import { exerciseServerFilters } from "./server-filters-browser.mjs";
 import { exercisePopupReview } from "./popup-review-browser.mjs";
 import {
   exerciseVoiceDictation,
@@ -609,6 +610,7 @@ try {
   );
   // A server closing during authentication must preserve its banner and explain EOF.
   await page.locator(".tab.active [data-close]").click();
+  await page.locator("#all-servers").click();
   await page.locator(".server-item").filter({ hasText: "Key host" }).click();
   await page.locator("#edit-server").click();
   await page.locator("[name=username]").fill("closeduser");
@@ -630,6 +632,7 @@ try {
   );
   // Changing the pinned fingerprint fails closed, even with a working credential.
   await page.locator(".tab.active [data-close]").click();
+  await page.locator("#all-servers").click();
   await page.locator(".server-item").filter({ hasText: "Key host" }).click();
   await page.locator("#edit-server").click();
   await page.locator("[name=username]").fill("keyuser");
@@ -641,6 +644,7 @@ try {
     document.querySelector("#terminal-status").textContent.includes("Error"),
   );
   assert.equal(await page.locator(".login-prompt").count(), 0);
+  await page.locator("#all-servers").click();
   // Disk contains ciphertext only; backup excludes device state after decrypting in a unit test.
   const record = await page.evaluate(
     () =>
@@ -692,6 +696,7 @@ try {
   await finishRestoration(page);
   console.log("Backup and lock/unlock restoration passed.");
   assert.equal(await page.locator("[data-launch-server]").count(), 6);
+  await exerciseServerFilters(page);
   await page.setViewportSize({ width: 390, height: 844 });
   assert.ok(
     await page.evaluate(

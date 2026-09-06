@@ -29,7 +29,7 @@ export function paneNeighbor(panes, id, direction) {
       .sort((a, b) => a.gap - b.gap || a.offset - b.offset)[0]?.id || null
   );
 }
-function prune(tree, ids) {
+export function prune(tree, ids) {
   if (tree.tab) return ids.has(tree.tab) ? tree : null;
   const a = prune(tree.a, ids),
     b = prune(tree.b, ids);

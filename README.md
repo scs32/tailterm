@@ -11,6 +11,7 @@ A browser SSH terminal that connects through Tailscale. Run it from a static web
 - Use Tailscale SSH or standard SSH authentication with keys, passwords, and interactive verification.
 - Keep credentials and Tailscale identity in an encrypted browser vault, with encrypted backup and restore.
 - Start or resume remote tmux sessions. Blank session names receive random IDs.
+- Select multiple servers in the sidebar to filter open sessions; **All** shows every server. Hidden sessions stay connected, and mixed-server groups retain their layout. Use **+** to choose a server when opening a session.
 - Drag terminal tabs together into groups, resize tiled panes, and move panes back into separate tabs.
 - Use fullscreen or expand the terminal inside the browser window.
 - Copy and paste through tmux, including bracketed paste, multiline confirmation, and OSC 52 clipboard support.
@@ -54,7 +55,7 @@ No application backend is needed for the static deployment. It still uses Tailsc
 - Credentials are encrypted at rest in IndexedDB. Unlocking makes them available to this app in memory.
 - Vaults belong to their browser origin. Moving from localhost to another domain requires encrypted backup/restore and authorization of a new browser Tailscale identity.
 - One browser tab owns an unlocked vault; use terminal tabs and groups inside the app.
-- Closing the page disconnects SSH. Remote tmux sessions continue; local tabs, grouping, and scrollback do not survive a reload.
+- Closing the page disconnects SSH. Remote tmux sessions continue. The encrypted workspace remembers tabs, groups, and server filters and restores them after unlocking; plain SSH tabs open fresh shells. Local scrollback does not survive a reload.
 - This version does not provide SFTP, port forwarding, native ssh-agent integration, or automatic cross-device synchronization.
 
 See [the static-client guide](docs/static-client.md) for architecture, controls, deployment, and validation limits, and [appearance references](docs/appearance.md) for theme sources.

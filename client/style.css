@@ -2938,3 +2938,37 @@ dialog .session-result span,
 dialog .key-list code {
   color: var(--muted);
 }
+
+.sidebar-section:has(#all-servers) {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+#all-servers {
+  min-height: 26px;
+  padding: 3px 9px;
+  font-size: 11px;
+  border-radius: 7px;
+  background: transparent;
+}
+#all-servers[aria-pressed="true"] {
+  color: var(--accent);
+  border-color: var(--accent);
+}
+.server-item[aria-pressed="true"] .node-icon {
+  color: var(--accent);
+}
+.server-item[aria-pressed="true"] {
+  box-shadow: inset 3px 0 var(--accent);
+}
+#server-filter-empty {
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+}
+
+@media (max-width: 700px) {
+  #all-servers {
+    min-height: 44px;
+  }
+}

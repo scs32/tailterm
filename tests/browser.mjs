@@ -120,7 +120,7 @@ try {
   await page.reload();
   await page.locator("#workspace").waitFor();
   assert.equal(
-    await page.locator(".server-item.selected strong").textContent(),
+    await page.locator(".server-card.chosen strong").textContent(),
     "Development",
   );
   await page.locator("#edit-server").click();
@@ -128,7 +128,7 @@ try {
   await page.getByRole("button", { name: "Save server" }).click();
   await page.locator("#dialog").waitFor({ state: "hidden" });
   assert.equal(
-    await page.locator(".server-item.selected strong").textContent(),
+    await page.locator(".server-card.chosen strong").textContent(),
     "Development lab",
   );
   await page.locator("#keys").click();
@@ -155,7 +155,7 @@ try {
   await page.locator("#unlock-button").click();
   await page.locator("#workspace").waitFor();
   assert.equal(
-    await page.locator(".server-item.selected strong").textContent(),
+    await page.locator(".server-card.chosen strong").textContent(),
     "Development lab",
   );
   // Exercise the rendered trust/password prompts against a real SSH server.
@@ -332,19 +332,21 @@ try {
     await page.locator(".tab.active [data-tab]").getAttribute("data-tab"),
     originalTmuxId,
   );
-  // Selecting a server without a tab must hide the old terminal, not retarget it.
+  // Filtering to a server without a tab hides the old terminal without retargeting it.
+  await page.locator("#all-servers").click();
   await page
     .locator("[data-server]")
     .filter({ hasText: "Development lab" })
     .click();
   assert.equal(await page.locator(".terminal-instance:visible").count(), 0);
   assert.equal(
-    await page.locator(".server-item.selected strong").textContent(),
+    await page.locator(".server-card.chosen strong").textContent(),
     "Development lab",
   );
+  await page.locator("#all-servers").click();
   await page.locator(`[data-tab="${originalTmuxId}"]`).click();
   assert.equal(
-    await page.locator(".server-item.selected strong").textContent(),
+    await page.locator(".server-card.chosen strong").textContent(),
     "Password host",
   );
   assert.equal(await page.locator("#tmux").count(), 0);
@@ -392,13 +394,14 @@ try {
     await page.locator("#terminal-status").getAttribute("data-tooltip"),
     /second@127/,
   );
+  await page.locator("#all-servers").click();
   await page.locator(`[data-tab="${originalTmuxId}"]`).click();
   assert.equal(
-    await page.locator(".server-item.selected strong").textContent(),
+    await page.locator(".server-card.chosen strong").textContent(),
     "Password host",
   );
   assert.equal(
-    await page.locator(".server-item.selected strong").textContent(),
+    await page.locator(".server-card.chosen strong").textContent(),
     "Password host",
   );
   assert.equal(await page.locator("#tmux").count(), 0);
@@ -412,7 +415,7 @@ try {
   await page.getByRole("button", { name: "Save server" }).click();
   await page.locator("#dialog").waitFor({ state: "hidden" });
   assert.equal(
-    await page.locator(".server-item.selected strong").textContent(),
+    await page.locator(".server-card.chosen strong").textContent(),
     "Renamed host",
   );
   assert.match(await page.locator(".tab.active").textContent(), /Renamed host/);
@@ -423,7 +426,7 @@ try {
   assert.equal(await page.locator("[data-tab]").count(), initialTabCount);
   const beforeDiscovery = discoveryCount;
   await page
-    .locator("[data-server]")
+    .locator("[data-launch-server]")
     .filter({ hasText: "Renamed host" })
     .click();
   for (let i = 0; i < 100 && discoveryCount === beforeDiscovery; i++)

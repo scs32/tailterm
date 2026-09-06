@@ -8,7 +8,7 @@ export const endpointKey = (server) =>
 export const sameTarget = (a, b) =>
   !!a && !!b && a.id === b.id && String(a.created) === String(b.created);
 
-export function workspaceSnapshot(tabs, groups, active) {
+export function workspaceSnapshot(tabs, groups, active, serverFilter = null) {
   return {
     tabs: tabs
       .filter((t) => !t.disposed && t.wasConnected !== false)
@@ -20,6 +20,7 @@ export function workspaceSnapshot(tabs, groups, active) {
         session: t.session,
         target: t.target,
       })),
+    serverFilter: serverFilter === null ? null : [...serverFilter],
     groups: structuredClone(groups),
     active,
   };
@@ -81,6 +82,15 @@ export function normalizeWorkspace(value) {
     .filter((g) => g.tree);
   return {
     tabs,
+    serverFilter: Array.isArray(value.serverFilter)
+      ? [
+          ...new Set(
+            value.serverFilter.filter(
+              (id) => typeof id === "string" && id.length <= 80,
+            ),
+          ),
+        ].slice(0, 200)
+      : null,
     groups,
     active: ids.has(value.active) ? value.active : tabs[0]?.id,
   };
