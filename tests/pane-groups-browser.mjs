@@ -63,7 +63,11 @@ export async function exercisePaneGroups(page, getInput = () => undefined) {
   assert.ok(await tab(ids[0]).locator(".tab-tmux").isHidden());
   assert.ok(await inactive.locator("[data-close]").isVisible());
   assert.ok(await inactive.locator("[data-session-menu]").isVisible());
-  assert.ok(await inactive.locator(".tab-tmux").isVisible());
+  assert.equal(await inactive.locator(".tab-tmux, .tab-activity").count(), 0);
+  assert.equal(
+    await inactive.locator("[data-tab]").innerText(),
+    await inactive.locator(".tab-name").innerText(),
+  );
   assert.ok(
     await inactive
       .locator("[data-tab]")

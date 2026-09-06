@@ -640,9 +640,6 @@ function renderTabs() {
         .map((id) => tabs.find((t) => t.id === id)?.activity)
         .filter(Boolean);
       const newOutput = activities.includes("New output");
-      const activity = activities
-        .filter((label) => label !== "New output")
-        .join(", ");
       const names = ids.map((id) => {
         const member = tabs.find((t) => t.id === id);
         return tabName(member, true);
@@ -656,7 +653,7 @@ function renderTabs() {
       const title = grouped
         ? `${groupName}\n${ids.length} panes: ${names.join(", ")}\nFocused: ${tabName(t)} · ${t.status}\nDrag onto another tab to merge groups. × closes the focused pane.`
         : `${tabName(t, true)}\n${t.server.username}@${t.server.host}:${t.server.port}\n${t.status}${t.tmux ? " · tmux launch: " + t.session : ""}\nDrop at a tab edge to reorder; drop in its center to group.`;
-      return `<div class="tab ${ids.includes(active) ? "active" : ""} ${grouped ? "group-tab" : ""} ${newOutput ? "has-new-output" : ""}" data-tab-color="${decoration.color}" data-tab-fill="${decoration.fill}" style='--tab-font:${esc(fonts[decoration.font]?.family || "var(--terminal-font)")}' draggable="false"><button data-tab="${t.id}" role="tab" aria-selected="${ids.includes(active)}" title="${esc(activities.length ? title + "\n" + [...new Set(activities)].join(", ") : title)}"><span class="node-dot ${t.status === "Connected" ? "online" : ""}"></span><span class="tab-copy"><span class="tab-name">${esc(grouped ? groupName : tabName(t, true))}</span><span class="tab-activity">${esc(activity)}</span>${grouped ? "" : `<span class="tab-tmux">${esc(t.status)}${t.tmux ? " · launch: " + esc(t.session) + (t.tmuxVerified ? "" : " (unverified)") : ""}</span>`}</span></button>${staticMode ? `<button data-session-menu="${t.id}" aria-label="Session actions for ${esc(t.session)}" title="Session actions and tab order">...</button>` : ""}<button data-close="${t.id}" aria-label="Close ${esc(t.server.name)} ${grouped ? "focused pane" : "terminal"}">×</button></div>`;
+      return `<div class="tab ${ids.includes(active) ? "active" : ""} ${grouped ? "group-tab" : ""} ${newOutput ? "has-new-output" : ""}" data-tab-color="${decoration.color}" data-tab-fill="${decoration.fill}" style='--tab-font:${esc(fonts[decoration.font]?.family || "var(--terminal-font)")}' draggable="false"><button data-tab="${t.id}" role="tab" aria-selected="${ids.includes(active)}" title="${esc(activities.length ? title + "\n" + [...new Set(activities)].join(", ") : title)}"><span class="node-dot ${t.status === "Connected" ? "online" : ""}"></span><span class="tab-copy"><span class="tab-name">${esc(grouped ? groupName : tabName(t, true))}</span></span></button>${staticMode ? `<button data-session-menu="${t.id}" aria-label="Session actions for ${esc(t.session)}" title="Session actions and tab order">...</button>` : ""}<button data-close="${t.id}" aria-label="Close ${esc(t.server.name)} ${grouped ? "focused pane" : "terminal"}">×</button></div>`;
     })
     .join("");
   $$("[data-tab]").forEach((b) => (b.onclick = () => activate(b.dataset.tab)));

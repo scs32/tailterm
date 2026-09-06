@@ -25,8 +25,8 @@ export async function exerciseWorkspaceActions(page, stream) {
   stream.write("\x1b[?25l\x1b[?25h");
   await page.waitForTimeout(700);
   assert.equal(
-    await page.locator(`[data-tab="${original}"] .tab-activity`).textContent(),
-    "",
+    await page.locator(`[data-tab="${original}"] .tab-activity`).count(),
+    0,
   );
   const other = await page
     .locator(".tab.active [data-tab]")
@@ -41,7 +41,7 @@ export async function exerciseWorkspaceActions(page, stream) {
     original,
   );
   const unread = page.locator(`[data-tab="${original}"]`);
-  assert.equal(await unread.locator(".tab-activity").textContent(), "");
+  assert.equal(await unread.locator(".tab-activity").count(), 0);
   await unread.hover();
   await page.locator(".workspace-tooltip").waitFor({ state: "visible" });
   assert.match(
@@ -71,26 +71,22 @@ export async function exerciseWorkspaceActions(page, stream) {
   );
   await page.locator(`[data-tab="${other}"]`).click();
   stream.write("\x07");
-  await page.waitForFunction(
-    (id) =>
-      document
-        .querySelector(`[data-tab="${id}"] .tab-activity`)
-        ?.textContent.includes("Bell"),
-    original,
-  );
+  await page.waitForFunction((id) => {
+    const tab = document.querySelector(`[data-tab="${id}"]`);
+    return (tab?.dataset.tooltip || tab?.title || "").includes("Bell");
+  }, original);
   assert.match(await page.title(), /Bell.*Tailterm/);
   stream.write("\x1b]133;D;0\x07");
-  await page.waitForFunction(
-    (id) =>
-      document
-        .querySelector(`[data-tab="${id}"] .tab-activity`)
-        ?.textContent.includes("Command finished"),
-    original,
-  );
+  await page.waitForFunction((id) => {
+    const tab = document.querySelector(`[data-tab="${id}"]`);
+    return (tab?.dataset.tooltip || tab?.title || "").includes(
+      "Command finished",
+    );
+  }, original);
   await page.locator(`[data-tab="${original}"]`).click();
   assert.equal(
-    await page.locator(`[data-tab="${original}"] .tab-activity`).textContent(),
-    "",
+    await page.locator(`[data-tab="${original}"] .tab-activity`).count(),
+    0,
   );
   await page.setViewportSize({ width: 390, height: 600 });
   await page
@@ -115,7 +111,18 @@ export async function exerciseWorkspaceActions(page, stream) {
   await page.screenshot({ path: "/tmp/tailterm-mobile-controls.png" });
   await page.setViewportSize({ width: 1440, height: 1100 });
   await page.locator(`[data-tab="${original}"]`).click();
-  assert.match(await page.locator(".tab.active").innerText(), /Connected/);
+  const selectedTab = page.locator(".tab.active [data-tab]");
+  assert.equal(
+    await selectedTab.innerText(),
+    await selectedTab.locator(".tab-name").innerText(),
+  );
+  assert.equal(await selectedTab.locator(".node-dot.online").count(), 1);
+  await selectedTab.hover();
+  await page.locator(".workspace-tooltip").waitFor({ state: "visible" });
+  assert.match(
+    await page.locator(".workspace-tooltip").innerText(),
+    /Connected/,
+  );
   await page.locator("#commands").click();
   await page.locator("#command-query").fill("Forget this device");
   await page.locator("#command-results button").click();
