@@ -1174,6 +1174,11 @@ function appearanceDialog() {
     <details class="dialog-details"><summary>Keyboard & selection tips</summary><p class="fine">Switch grouped panes with Option + Shift + arrow keys on Mac, or Ctrl + Alt + arrow keys on Windows/Linux.</p>
     <p class="fine">Hold Shift while dragging to select text when tmux handles the mouse. Plain Ctrl+C still interrupts a command. Remote clipboard read requests are never answered.</p></details>`,
   );
+  // Preview terminal font changes without reflowing the controls being clicked.
+  $("#dialog").style.setProperty(
+    "--appearance-ui-font",
+    fonts[appearance.font].family,
+  );
   appearancePreview = createAppearancePreview(
     $("#appearance-preview"),
     appearance,
