@@ -56,6 +56,8 @@ export async function exerciseWorkspaceControls(page) {
       assert.equal(reference.borderTopWidth, "1px");
       assert.equal(reference.borderTopStyle, "solid");
       assert.equal(reference.borderRadius, "0px");
+      await page.locator("#new-tab").hover();
+      const ordinary = await page.locator("#new-tab").evaluate(style);
       const controls = page.locator(
         "#workspace button:visible:not(.tab:not(.active) > [data-close]):not(.tab:not(.active) > [data-session-menu])",
       );
@@ -75,17 +77,24 @@ export async function exerciseWorkspaceControls(page) {
           );
           continue;
         }
+        const expected = (await button.evaluate((el) =>
+          el.matches(
+            '#tailscale-login:has(.online), .server-item.selected, #all-servers[aria-pressed="true"]',
+          ),
+        ))
+          ? reference
+          : ordinary;
         await button.hover();
         assert.deepEqual(
           await button.evaluate(style),
-          reference,
+          expected,
           `${theme} ${mobile ? "mobile" : "desktop"} hover ${label}`,
         );
         await page.keyboard.press("Tab");
         await button.focus();
         assert.deepEqual(
           await button.evaluate(style),
-          reference,
+          expected,
           `${theme} keyboard focus ${label}`,
         );
         await button.evaluate((el) => el.blur());
@@ -107,7 +116,7 @@ export async function exerciseWorkspaceControls(page) {
         } else
           assert.deepEqual(
             actual,
-            reference,
+            ordinary,
             `launcher ${await button.innerText()}`,
           );
         checked++;

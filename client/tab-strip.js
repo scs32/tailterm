@@ -6,7 +6,12 @@ export function setupTabStrip() {
   let frame;
   function update() {
     const tab = viewport.querySelector(".tab");
-    const minimum = tab ? parseFloat(getComputedStyle(tab).minWidth) : 0;
+    const style = tab ? getComputedStyle(tab) : null;
+    const minimum = style ? parseFloat(style.minWidth) : 0;
+    // Stop the viewport at the last tab so the adjacent + never drifts away.
+    viewport.style.maxWidth = style
+      ? `${viewport.children.length * parseFloat(style.maxWidth)}px`
+      : "0px";
     const plus = strip.querySelector("#new-tab");
     const available = strip.clientWidth - (plus?.offsetWidth || 0);
     const overflow =
