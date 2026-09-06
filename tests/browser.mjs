@@ -1,3 +1,4 @@
+import { exerciseGeneratedKey } from "./ssh-key-browser.mjs";
 import { chromium, webkit } from "@playwright/test";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
@@ -90,6 +91,7 @@ try {
   ).launch();
   const page = await browser.newPage({
     viewport: { width: 1440, height: 1050 },
+    permissions: ["clipboard-read", "clipboard-write"],
   });
   const errors = [];
   page.on("pageerror", (e) => errors.push(e.message));
@@ -132,7 +134,9 @@ try {
     "Development lab",
   );
   await page.locator("#keys").click();
+  await page.locator("#import-key").evaluate((el) => (el.open = true));
   await page.locator("#key-form").waitFor();
+  await exerciseGeneratedKey(page);
   await page.locator("#dialog-close").click();
   await page.screenshot({
     path: path.join(process.cwd(), "workspace-preview.png"),

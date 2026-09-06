@@ -13,6 +13,7 @@ const browser = await chromium.launch({
 try {
   const page = await browser.newPage({
     viewport: { width: 1440, height: 900 },
+    permissions: ["clipboard-read", "clipboard-write"],
   });
   const errors = [];
   page.on("pageerror", (e) => errors.push(e.message));
@@ -28,6 +29,42 @@ try {
     .fill("temporary deployment verification vault");
   await page.locator("#unlock-button").click();
   await page.locator("#workspace").waitFor();
+  await page.locator("#keys").click();
+  await page
+    .locator("#generate-key-form [name=name]")
+    .fill("Deployment test key");
+  await page.locator("#generate-key").click();
+  await page.locator("[data-copy-public-key]").waitFor({ timeout: 90000 });
+  await page.locator("[data-copy-public-key]").click();
+  await page.waitForFunction(() =>
+    document
+      .querySelector("#public-key-text")
+      ?.value.startsWith("ssh-ed25519 "),
+  );
+  const publicKey = await page.locator("#public-key-text").inputValue();
+  await page.waitForFunction(
+    () =>
+      document.querySelector("[data-copy-public-key]")?.textContent ===
+      "Copied",
+  );
+  assert.equal(
+    await page.evaluate(() => navigator.clipboard.readText()),
+    publicKey,
+  );
+  await page.locator("#dialog-close").click();
+  await page.locator("#lock").click();
+  await page
+    .locator("#password")
+    .fill("temporary deployment verification vault");
+  await page.locator("#unlock-button").click();
+  await page.locator("#keys").click();
+  await page.locator("[data-copy-public-key]").click();
+  await page.waitForFunction(
+    (expected) =>
+      document.querySelector("#public-key-text")?.value === expected,
+    publicKey,
+  );
+  await page.locator("#dialog-close").click();
   for (const [width, height] of [
     [1440, 900],
     [1024, 768],
@@ -65,6 +102,7 @@ try {
       https: true,
       matchingMargins: true,
       productionWasmStarted: true,
+      generatedKeyRestored: true,
       state: await page.locator("#tail-status").textContent(),
     }),
   );

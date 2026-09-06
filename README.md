@@ -8,6 +8,7 @@ A browser SSH terminal that connects through Tailscale. Run it from a static web
 ## Features
 
 - Discover tailnet devices and save their SSH connection settings.
+- Generate Ed25519 SSH keys in the browser or import existing private keys; copy the matching public key for your server account.
 - Use Tailscale SSH or standard SSH authentication with keys, passwords, and interactive verification.
 - Keep credentials and Tailscale identity in an encrypted browser vault, with encrypted backup and restore.
 - Start or resume remote tmux sessions. Blank session names receive random IDs.

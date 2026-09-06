@@ -49,3 +49,10 @@ export async function validatePrivateKey(raw, passphrase) {
   if (result.error) throw new Error(result.error);
   return result;
 }
+
+export async function generatePrivateKey() {
+  await loadRuntime();
+  const result = globalThis.tailtermGenerateKey();
+  if (result.error) throw new Error(result.error);
+  return result.privateKey;
+}

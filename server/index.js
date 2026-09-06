@@ -187,18 +187,39 @@ app.delete("/api/servers/:id", (req, res) => {
   vault.save();
   res.json(publicData());
 });
-app.post("/api/keys", (req, res) => {
-  const { name, privateKey, passphrase } = req.body;
+app.get("/api/keys/:id/public-key", (req, res) => {
+  const saved = vault.data.keys.find((k) => k.id === req.params.id);
+  if (!saved) return res.status(404).json({ error: "SSH key not found." });
+  const parsed = utils.parseKey(
+    saved.privateKey,
+    saved.passphrase || undefined,
+  );
+  if (parsed instanceof Error || Array.isArray(parsed))
+    return res
+      .status(400)
+      .json({ error: "Invalid private key or passphrase." });
+  res.json({
+    publicKey: `${parsed.type} ${parsed.getPublicSSH().toString("base64")}`,
+  });
+});
+app.post(["/api/keys", "/api/keys/generate"], (req, res) => {
+  const { name, passphrase } = req.body;
+  let privateKey = req.body.privateKey;
+  const generating = req.path === "/api/keys/generate";
   if (
     typeof name !== "string" ||
     !name.trim() ||
     name.length > 80 ||
-    typeof privateKey !== "string"
+    (!generating && typeof privateKey !== "string")
   )
     return res
       .status(400)
       .json({ error: "Name and private key are required." });
-  const parsed = utils.parseKey(privateKey, passphrase || undefined);
+  if (generating) privateKey = utils.generateKeyPairSync("ed25519").private;
+  const parsed = utils.parseKey(
+    privateKey,
+    generating ? undefined : passphrase || undefined,
+  );
   if (
     parsed instanceof Error ||
     Array.isArray(parsed) ||
@@ -217,7 +238,7 @@ app.post("/api/keys", (req, res) => {
     id: randomUUID(),
     name,
     privateKey,
-    passphrase,
+    passphrase: generating ? "" : passphrase,
     fingerprint,
   });
   vault.save();
@@ -443,7 +464,9 @@ wss.on("connection", (ws, req) => {
         const s = vault.data.servers.find((x) => x.id === m.serverId);
         if (!s) throw new Error("Unknown SSH server");
         connectedProfile = { ...s };
-        const command = m.tmux ? tmuxCommand(m.session, s.tmuxPath, m.resumeOnly === true) : null;
+        const command = m.tmux
+          ? tmuxCommand(m.session, s.tmuxPath, m.resumeOnly === true)
+          : null;
         const auth = interactiveSSHConfig(
           { ...s },
           {

@@ -4,6 +4,9 @@ package main
 
 import (
 	"context"
+	"crypto/ed25519"
+	"crypto/rand"
+	"encoding/pem"
 	"errors"
 	"fmt"
 	"io"
@@ -377,5 +380,18 @@ func validateKey(_ js.Value, args []js.Value) any {
 	if err != nil {
 		return map[string]any{"error": "Invalid private key or passphrase"}
 	}
-	return map[string]any{"fingerprint": ssh.FingerprintSHA256(signer.PublicKey()), "type": signer.PublicKey().Type()}
+	return map[string]any{"fingerprint": ssh.FingerprintSHA256(signer.PublicKey()), "type": signer.PublicKey().Type(), "publicKey": strings.TrimSpace(string(ssh.MarshalAuthorizedKey(signer.PublicKey())))}
+}
+
+// Key material is generated locally using crypto/rand (Web Crypto in WASM).
+func generateKey(_ js.Value, _ []js.Value) any {
+	_, key, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		return map[string]any{"error": "Could not generate SSH key"}
+	}
+	block, err := ssh.MarshalPrivateKey(key, "tailterm")
+	if err != nil {
+		return map[string]any{"error": "Could not encode SSH key"}
+	}
+	return map[string]any{"privateKey": string(pem.EncodeToMemory(block))}
 }

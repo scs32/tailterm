@@ -2972,3 +2972,34 @@ dialog .key-list code {
     min-height: 44px;
   }
 }
+
+#generate-key-form {
+  margin-top: 18px;
+}
+dialog .key-list [data-copy-public-key] {
+  width: auto;
+  flex: 0 0 auto;
+  font-size: 12px;
+}
+dialog .key-list > div {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto;
+  align-items: center;
+  gap: 6px;
+}
+dialog .key-list strong {
+  overflow-wrap: anywhere;
+}
+dialog .key-list code {
+  grid-column: 1 / -1;
+}
+dialog .key-list button {
+  float: none;
+}
+#public-key-result {
+  margin: 16px 0;
+}
+#public-key-text {
+  font-family: var(--terminal-font);
+  overflow-wrap: anywhere;
+}

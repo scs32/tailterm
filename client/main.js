@@ -1639,8 +1639,57 @@ function serverDialog(s = {}) {
 function keyDialog() {
   dialog(
     "SSH key vault",
-    `<p class="fine">${staticMode ? "Private keys stay on this browser, encrypted with your vault passphrase." : "Private keys stay on the server, encrypted with your vault passphrase."}</p><div class="key-list">${data.keys.map((k) => `<div><strong>${esc(k.name)}</strong><button data-delete-key="${esc(k.id)}" title="Delete key">×</button><code>${esc(k.fingerprint)}</code></div>`).join("") || "<p>No keys stored yet.</p>"}</div><form id="key-form"><label>Key name<input name="name" required maxlength="80" placeholder="Personal Ed25519"></label><label>Import private key file<input id="key-file" type="file"></label><label>Private key<textarea name="privateKey" required rows="5" spellcheck="false" autocomplete="off" placeholder="-----BEGIN OPENSSH PRIVATE KEY-----"></textarea></label><label>Key passphrase (if encrypted)<input name="passphrase" type="password" autocomplete="off"></label><div class="dialog-actions"><button class="primary">Encrypt & save key</button></div></form>`,
+    `<p class="fine">${staticMode ? "Private keys stay on this browser, encrypted with your vault passphrase." : "Private keys stay on the server, encrypted with your vault passphrase."}</p><div class="key-list">${data.keys.map((k) => `<div><strong>${esc(k.name)}</strong><button data-copy-public-key="${esc(k.id)}">Copy public key</button><button data-delete-key="${esc(k.id)}" title="Delete key" aria-label="Delete ${esc(k.name)}">×</button><code>${esc(k.fingerprint)}</code></div>`).join("") || "<p>No keys stored yet.</p>"}</div><div id="public-key-result" hidden><label>Public key<textarea id="public-key-text" readonly rows="3" spellcheck="false"></textarea></label><p class="fine" id="public-key-note"></p></div><form id="generate-key-form"><label>New key name<input name="name" required maxlength="80" placeholder="TrueNAS"></label><p class="fine">Create an Ed25519 key and protect it with your vault passphrase.</p><div class="dialog-actions"><button class="primary" id="generate-key">Generate & save key</button></div></form><details class="dialog-details" id="import-key"><summary>Import an existing key</summary><form id="key-form"><label>Key name<input name="name" required maxlength="80" placeholder="Personal Ed25519"></label><label>Import private key file<input id="key-file" type="file"></label><label>Private key<textarea name="privateKey" required rows="5" spellcheck="false" autocomplete="off" placeholder="-----BEGIN OPENSSH PRIVATE KEY-----"></textarea></label><label>Key passphrase (if encrypted)<input name="passphrase" type="password" autocomplete="off"></label><div class="dialog-actions"><button class="primary">Encrypt & save key</button></div></form></details>`,
   );
+  $("#generate-key-form").onsubmit = guard(async (e) => {
+    e.preventDefault();
+    const form = e.target,
+      button = form.querySelector("button");
+    button.disabled = true;
+    button.textContent = "Generating…";
+    try {
+      data = await api("/keys/generate", "POST", {
+        name: form.elements.name.value,
+      });
+      if (form.isConnected) {
+        keyDialog();
+        render();
+        notice(
+          "Key saved. Copy its public key to your server, then select this key in Edit server.",
+        );
+      }
+    } finally {
+      button.disabled = false;
+      button.textContent = "Generate & save key";
+    }
+  });
+  $$("[data-copy-public-key]").forEach((button) => {
+    button.onclick = guard(async () => {
+      button.disabled = true;
+      try {
+        const { publicKey } = await api(
+          "/keys/" + button.dataset.copyPublicKey + "/public-key",
+        );
+        if (!button.isConnected) return;
+        $("#public-key-result").hidden = false;
+        $("#public-key-text").value = publicKey;
+        const note = $("#public-key-note");
+        note.textContent =
+          "Paste this into your server account’s SSH public key field. In TrueNAS, edit your user and find SSH Public Key.";
+        try {
+          await navigator.clipboard.writeText(publicKey);
+          button.textContent = "Copied";
+        } catch {
+          note.textContent =
+            "Select and copy the public key above, then paste it into your server account’s SSH public key field.";
+          $("#public-key-text")?.focus();
+          $("#public-key-text")?.select();
+        }
+      } finally {
+        button.disabled = false;
+      }
+    });
+  });
   $("#key-file").onchange = guard(async (e) => {
     const file = e.target.files[0];
     if (file) {

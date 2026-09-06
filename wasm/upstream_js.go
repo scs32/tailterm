@@ -51,6 +51,7 @@ var testIPNFactory func(js.Value) any
 
 func main() {
 	js.Global().Set("tailserveValidateKey", js.FuncOf(validateKey))
+	js.Global().Set("tailtermGenerateKey", js.FuncOf(generateKey))
 	js.Global().Set("newIPN", js.FuncOf(func(this js.Value, args []js.Value) any {
 		if len(args) != 1 {
 			log.Fatal("Usage: newIPN(config)")

@@ -1,3 +1,4 @@
+import { exerciseGeneratedKey } from "./ssh-key-browser.mjs";
 import { exerciseServerFilters } from "./server-filters-browser.mjs";
 import { exercisePopupReview } from "./popup-review-browser.mjs";
 import {
@@ -39,6 +40,7 @@ const loginKey = ssh2.utils.generateKeyPairSync("ed25519", {
   passphrase: keyPassphrase,
   cipher: "aes256-cbc",
 }).private;
+let generatedLogin;
 const parsedLogin = ssh2.utils.parseKey(loginKey, keyPassphrase);
 assert.equal(typeof parsedLogin.getPublicSSH, "function");
 let input = "",
@@ -68,9 +70,14 @@ const ssh = new ssh2.Server(
       if (ctx.username === "keyuser") {
         if (
           ctx.method === "publickey" &&
-          ctx.key.data.equals(parsedLogin.getPublicSSH()) &&
-          (!ctx.signature ||
-            parsedLogin.verify(ctx.blob, ctx.signature, ctx.hashAlgo))
+          [parsedLogin, generatedLogin]
+            .filter(Boolean)
+            .some(
+              (key) =>
+                ctx.key.data.equals(key.getPublicSSH()) &&
+                (!ctx.signature ||
+                  key.verify(ctx.blob, ctx.signature, ctx.hashAlgo)),
+            )
         )
           ctx.accept();
         else ctx.reject(["publickey"]);
@@ -563,11 +570,25 @@ try {
   );
   // Load a real key via Go's key parser and authenticate with it.
   await page.locator("#keys").click();
+  await page.locator("#import-key").evaluate((el) => (el.open = true));
   await page.locator("#key-form [name=name]").fill("Fixture key");
   await page.locator("#key-form [name=privateKey]").fill(loginKey);
   await page.locator("#key-form [name=passphrase]").fill(keyPassphrase);
   await page.getByRole("button", { name: "Encrypt & save key" }).click();
   await page.getByText("Fixture key", { exact: true }).waitFor();
+  await page.locator("[data-copy-public-key]").click();
+  await page.waitForFunction(() =>
+    document
+      .querySelector("#public-key-text")
+      ?.value.startsWith("ssh-ed25519 "),
+  );
+  assert.deepEqual(
+    ssh2.utils
+      .parseKey(await page.locator("#public-key-text").inputValue())
+      .getPublicSSH(),
+    parsedLogin.getPublicSSH(),
+  );
+  generatedLogin = await exerciseGeneratedKey(page);
   await page.locator("#dialog-close").click();
   await page.locator("#discover").click();
   await page.locator("[data-peer]").first().click();
@@ -578,7 +599,9 @@ try {
   await page.locator("[name=host]").fill("fixture.internal");
   await page.locator("[name=port]").fill("22022");
   await page.locator("[name=username]").fill("keyuser");
-  await page.locator("[name=keyId]").selectOption({ label: "Fixture key" });
+  await page
+    .locator("[name=keyId]")
+    .selectOption({ label: "Browser-generated key" });
   await page.getByRole("button", { name: "Save server" }).click();
   await page.locator("#launcher-shell").click();
   await page.getByRole("button", { name: "Trust & continue" }).click();

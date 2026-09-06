@@ -137,6 +137,27 @@ test("authenticated API and real SSH transport enforce vault, origin, host key a
     });
     assert.equal(key.status, 200);
     assert.ok(!JSON.stringify(key.body).includes("PRIVATE KEY"));
+    const exported = await request(`/keys/${key.body.keys[0].id}/public-key`);
+    assert.equal(exported.status, 200);
+    assert.deepEqual(Object.keys(exported.body), ["publicKey"]);
+    assert.ok(!exported.body.publicKey.includes("PRIVATE"));
+    assert.equal((await request("/keys/missing/public-key")).status, 404);
+    assert.equal(
+      (await request("/keys/generate", "POST", { name: " " })).status,
+      400,
+    );
+    const generated = await request("/keys/generate", "POST", {
+      name: "generated",
+    });
+    assert.equal(generated.status, 200);
+    assert.doesNotMatch(
+      JSON.stringify(generated.body),
+      /PRIVATE KEY|privateKey|passphrase/,
+    );
+    const generatedPublic = await request(
+      `/keys/${generated.body.keys.at(-1).id}/public-key`,
+    );
+    assert.match(generatedPublic.body.publicKey, /^ssh-ed25519 /);
     const saved = await request("/servers", "POST", {
       name: "Fixture",
       host: "127.0.0.1",

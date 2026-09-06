@@ -159,3 +159,11 @@ The dictation waveform responds to microphone volume. Option + Space is handled 
 Dialogs share theme colors, compact fields, consistent headers and action rows, and sizes suited to their task. Advanced SSH options, restore controls and extended help expand on demand. Destructive actions still require explicit confirmation; their themed confirmation preserves the underlying form when canceled. Phone layouts use a single column with touch-sized controls and scroll inside the dialog.
 
 `npm run test:static` includes desktop/phone checks for the main popup families and captures screenshots in `.build/popup-*.png`. `node tests/popup-prompts-browser.mjs` covers host trust, SSH credentials, verification codes and confirmation dialogs in dark and light themes. Clipboard, upload, rename, vault reset and mobile flows remain covered by the browser regression suites.
+
+### Generate or copy an SSH key
+
+Open **SSH keys** in the sidebar, enter a name (for example, TrueNAS), and choose **Generate & save key**. Tailterm generates an Ed25519 key locally using the browser WASM runtime and saves the private key in the encrypted vault. No terminal command or separate computer is needed. Generated private keys rely on the vault's encryption; they do not have a separate key passphrase.
+
+Choose **Copy public key** beside the saved key and paste it into the destination account's SSH public key field (for TrueNAS, edit the user account). The same button derives the public key from imported private keys, including passphrase-protected keys already in the vault. If clipboard access is blocked, the public key is displayed and selected for manual copying. Only the public key is displayed or copied.
+
+Then open **Edit server**, choose **Standard SSH · key or password**, select the key and save. Use **+ → Open plain SSH shell** to test. **Import an existing key** still accepts private key files or pasted keys and an optional existing key passphrase. In the optional gateway deployment, generation and private-key storage take place on the gateway server.

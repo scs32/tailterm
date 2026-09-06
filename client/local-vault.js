@@ -9,7 +9,7 @@ import {
   validateTmuxPath,
   validateTarget,
 } from "../shared/tmux-command.js";
-import { validatePrivateKey } from "./wasm-runtime.js";
+import { validatePrivateKey, generatePrivateKey } from "./wasm-runtime.js";
 import { normalizeWorkspace } from "./workspace-state.js";
 let database,
   contents,
@@ -217,6 +217,11 @@ export async function localAPI(url, method = "GET", body = {}) {
     }
   }
   requireUnlocked();
+  const operationKey = key;
+  const sameVault = () => {
+    if (!key || key !== operationKey)
+      throw new Error("Vault was locked. Unlock and try again.");
+  };
   if (url === "/data") return localData();
   if (url === "/lock") {
     await queue;
@@ -268,6 +273,27 @@ export async function localAPI(url, method = "GET", body = {}) {
       d.servers = d.servers.filter((s) => s.id !== id);
       d.sessions = d.sessions.filter((s) => s.serverId !== id);
     });
+  if (/^\/keys\/[^/]+\/public-key$/.test(url) && method === "GET") {
+    const saved = contents.keys.find((k) => k.id === url.split("/")[2]);
+    if (!saved) throw new Error("SSH key not found.");
+    const parsed = await validatePrivateKey(
+      saved.privateKey,
+      saved.passphrase || "",
+    );
+    sameVault();
+    return { publicKey: parsed.publicKey };
+  }
+  if (url === "/keys/generate" && method === "POST") {
+    if (
+      typeof body.name !== "string" ||
+      !body.name.trim() ||
+      body.name.length > 80
+    )
+      throw new Error("Enter a key name of up to 80 characters.");
+    const privateKey = await generatePrivateKey();
+    sameVault();
+    return localAPI("/keys", "POST", { name: body.name.trim(), privateKey });
+  }
   if (url === "/keys" && method === "POST") {
     if (
       typeof body.name !== "string" ||
@@ -282,6 +308,7 @@ export async function localAPI(url, method = "GET", body = {}) {
       body.passphrase || "",
     );
     return editVault((d) => {
+      sameVault();
       d.keys.push({
         id: crypto.randomUUID(),
         name: body.name,
