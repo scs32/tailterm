@@ -20,6 +20,7 @@ export async function exercisePopupReview(page) {
         scroll: el.scrollWidth,
         client: el.clientWidth,
         label: el.getAttribute("aria-labelledby"),
+        radius: getComputedStyle(el).borderRadius,
       };
     });
     assert.ok(
@@ -34,6 +35,7 @@ export async function exercisePopupReview(page) {
       `${name} horizontal overflow: ${JSON.stringify(box)}`,
     );
     assert.equal(box.label, "dialog-title");
+    assert.equal(box.radius, "0px", `${name} uses a straight frame`);
   };
   for (const [name, selector] of [
     ["server", "#edit-server"],
@@ -58,6 +60,27 @@ export async function exercisePopupReview(page) {
       await page.screenshot({ path: ".build/popup-delete-confirmation.png" });
       await page.locator(".confirmation-dialog [data-cancel]").click();
       assert.ok(await page.locator("#server-form").isVisible());
+    }
+    if (name === "session-actions") {
+      await page.locator("#decorate-tab").click();
+      await fits("tab appearance");
+      await page.locator("#tab-decoration-form [name=emoji]").fill("🔧");
+      await page
+        .locator("#tab-decoration-form [name=color]")
+        .selectOption("amber");
+      await page
+        .locator("#tab-decoration-form [name=font]")
+        .selectOption("cascadia");
+      await page.locator("#tab-decoration-form .primary").click();
+      assert.equal(
+        await page.locator(".tab.active").getAttribute("data-tab-color"),
+        "amber",
+      );
+      assert.match(
+        await page.locator(".tab.active .tab-name").innerText(),
+        /🔧/,
+      );
+      await page.locator(".tab.active [data-session-menu]").click();
     }
     if (name === "backup") {
       await page

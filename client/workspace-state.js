@@ -1,3 +1,4 @@
+import { normalizeTabDecoration } from "./tab-decoration.js";
 export const endpointKey = (server) =>
   JSON.stringify([
     server.host,
@@ -19,6 +20,7 @@ export function workspaceSnapshot(tabs, groups, active, serverFilter = null) {
         tmux: t.tmux,
         session: t.session,
         target: t.target,
+        decoration: normalizeTabDecoration(t.decoration),
       })),
     serverFilter: serverFilter === null ? null : [...serverFilter],
     groups: structuredClone(groups),
@@ -45,6 +47,7 @@ export function normalizeWorkspace(value) {
       serverId: t.serverId,
       endpoint: t.endpoint,
       tmux: !!t.tmux,
+      decoration: normalizeTabDecoration(t.decoration),
       session: t.tmux ? t.session : "",
       target:
         /^\$\d+$/.test(t.target?.id) && /^\d+$/.test(String(t.target?.created))

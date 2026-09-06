@@ -10,7 +10,13 @@ export function setupTooltips() {
   const hide = () => {
     clearTimeout(timer);
     if (tip.matches(":popover-open")) tip.hidePopover();
-    target?.removeAttribute("aria-describedby");
+    if (target) {
+      const ids = (target.getAttribute("aria-describedby") || "")
+        .split(/\s+/)
+        .filter((id) => id && id !== tip.id);
+      if (ids.length) target.setAttribute("aria-describedby", ids.join(" "));
+      else target.removeAttribute("aria-describedby");
+    }
     target = null;
   };
   const show = (el, delay = 350) => {
@@ -32,7 +38,10 @@ export function setupTooltips() {
         key.textContent = el.dataset.shortcut;
         tip.append(key);
       }
-      el.setAttribute("aria-describedby", tip.id);
+      el.setAttribute(
+        "aria-describedby",
+        [el.getAttribute("aria-describedby"), tip.id].filter(Boolean).join(" "),
+      );
       tip.showPopover();
       const r = el.getBoundingClientRect(),
         box = tip.getBoundingClientRect();
@@ -83,10 +92,9 @@ export function setupTooltips() {
     attributeFilter: ["title"],
   });
   document.addEventListener("pointerover", (e) => {
-    if (target === document.activeElement) return;
     const el = e.target.closest("[data-tooltip]");
     if (el) show(el);
-    else hide();
+    else if (target !== document.activeElement) hide();
   });
   document.addEventListener("pointerout", (e) => {
     if (

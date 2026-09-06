@@ -124,33 +124,58 @@ export const themes = {
     "#8fbcbb",
     "#eceff4",
   ]),
-  dawn: palette("Rosé Pine Dawn", "#faf4ed", "#575279", "#907aa9", [
+  dawn: palette("Rosé Pine Dawn", "#faf4ed", "#575279", "#705588", [
     "#f2e9e1",
     "#b4637a",
     "#286983",
-    "#ea9d34",
-    "#56949f",
+    "#946000",
+    "#326f79",
     "#907aa9",
-    "#d7827e",
+    "#a24e51",
     "#575279",
-    "#9893a5",
+    "#706980",
     "#b4637a",
     "#286983",
-    "#ea9d34",
-    "#56949f",
+    "#946000",
+    "#326f79",
     "#907aa9",
-    "#d7827e",
+    "#a24e51",
     "#575279",
   ]),
 };
 export const fonts = {
+  cascadia: {
+    name: "Cascadia · Nerd Font",
+    family: '"CaskaydiaCove Nerd Font Mono", monospace',
+    description:
+      "CaskaydiaCove Mono. Rounded forms, distinct 0/O and 1/l. Includes Nerd Font and Powerline symbols.",
+    nerd: true,
+  },
   system: {
     name: "System Mono",
     family: '"SFMono-Regular", Menlo, Consolas, monospace',
+    description:
+      "Uses your device’s monospace font. The exact face and symbol coverage vary by device.",
   },
-  jetbrains: { name: "JetBrains Mono", family: '"JetBrains Mono", monospace' },
-  ibm: { name: "IBM Plex Mono", family: '"IBM Plex Mono", monospace' },
-  fira: { name: "Fira Code", family: '"Fira Code", monospace' },
+  jetbrains: {
+    name: "JetBrains Mono",
+    family: '"JetBrains Mono", monospace',
+    description:
+      "Tall lowercase letters and clear punctuation. Bundled for consistent rendering.",
+  },
+  ibm: {
+    name: "IBM Plex Mono",
+    family: '"IBM Plex Mono", monospace',
+    description:
+      "Compact, structured letterforms. Bundled for consistent rendering.",
+  },
+  fira: {
+    name: "Fira Code · Nerd Font",
+    family: '"FiraCode Nerd Font Mono", monospace',
+    description:
+      "FiraCode Mono. Open letterforms and distinct punctuation. Includes Nerd Font and Powerline symbols.",
+    nerd: true,
+  },
 };
 const defaults = {
   theme: "tailserve",
@@ -205,6 +230,8 @@ export function saveAppearance(value) {
 export function terminalAppearance(p) {
   return {
     theme: themes[p.theme].terminal,
+    // Includes application-supplied RGB backgrounds; dim text retains half this ratio.
+    minimumContrastRatio: 7,
     fontFamily: fonts[p.font].family,
     fontSize: p.fontSize,
     lineHeight: p.lineHeight,
@@ -222,4 +249,47 @@ export function applyChrome(p) {
   root.style.setProperty("--terminal-padding", p.padding + "px");
   root.style.setProperty("--terminal-font", fonts[p.font].family);
   root.style.colorScheme = p.theme === "dawn" ? "light" : "dark";
+  // xterm's DOM renderer halves ANSI dim alpha after its contrast check.
+  // Keep fallback colors opaque; inline contrast corrections still take priority.
+  let dimStyle = document.querySelector("#terminal-dim-colors");
+  if (!dimStyle) {
+    dimStyle = document.createElement("style");
+    dimStyle.id = "terminal-dim-colors";
+    document.head.append(dimStyle);
+  }
+  const ansi = [
+    "black",
+    "red",
+    "green",
+    "yellow",
+    "blue",
+    "magenta",
+    "cyan",
+    "white",
+    "brightBlack",
+    "brightRed",
+    "brightGreen",
+    "brightYellow",
+    "brightBlue",
+    "brightMagenta",
+    "brightCyan",
+    "brightWhite",
+  ].map((key) => theme.terminal[key]);
+  const cube = [0, 95, 135, 175, 215, 255];
+  for (const r of cube)
+    for (const g of cube)
+      for (const b of cube) ansi.push(`rgb(${r},${g},${b})`);
+  for (let i = 0; i < 24; i++) {
+    const c = 8 + i * 10;
+    ansi.push(`rgb(${c},${c},${c})`);
+  }
+  dimStyle.textContent =
+    `.xterm .xterm-screen .xterm-rows .xterm-dim { color: ${theme.foreground}; }` +
+    ansi
+      .map(
+        (color, i) =>
+          `.xterm .xterm-screen .xterm-rows .xterm-dim.xterm-fg-${i} { color: ${color}; }`,
+      )
+      .join("") +
+    `.xterm .xterm-screen .xterm-rows .xterm-dim.xterm-fg-257 { color: ${theme.background}; }`;
 }

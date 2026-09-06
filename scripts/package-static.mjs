@@ -51,7 +51,6 @@ for (const pkg of [
   "@xterm/addon-web-links",
   "@fontsource/jetbrains-mono",
   "@fontsource/ibm-plex-mono",
-  "@fontsource/fira-code",
 ]) {
   await copyFile(
     new URL(
@@ -126,3 +125,10 @@ for (const pkg of ["@huggingface/transformers", "onnxruntime-web"])
       root,
     ),
   );
+
+for (const name of ["cascadia-nerd", "fira-nerd"]) {
+  await copyFile(
+    new URL(`../client/fonts/${name}-LICENSE.txt`, import.meta.url),
+    new URL(`licenses/${name}.txt`, root),
+  );
+}

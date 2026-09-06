@@ -188,3 +188,33 @@ test("connection attention ignores healthy and recovering sessions but preserves
   );
   assert.equal(connectionNeedsAttention({ status: "Disconnected" }), true);
 });
+
+test("tab decoration is bounded and preserved in encrypted workspace snapshots", async () => {
+  const { normalizeTabDecoration } =
+    await import("../client/tab-decoration.js");
+  const decoration = {
+    label: "Build",
+    emoji: "🔧",
+    color: "amber",
+    font: "cascadia",
+  };
+  const t = {
+    id: "a",
+    server: { id: "s", host: "box", port: 22, username: "me" },
+    tmux: true,
+    session: "main",
+    decoration,
+  };
+  assert.deepEqual(
+    normalizeWorkspace(workspaceSnapshot([t], [], "a")).tabs[0].decoration,
+    decoration,
+  );
+  assert.deepEqual(
+    normalizeTabDecoration({
+      label: "\x1bhello",
+      color: "red; background:url(x)",
+      font: "__proto__",
+    }),
+    { label: "hello", emoji: "", color: "default", font: "" },
+  );
+});

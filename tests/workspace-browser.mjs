@@ -79,6 +79,9 @@ export async function exerciseWorkspaceContinuity(
     .locator("#tabs [data-tab]")
     .evaluateAll((nodes) => nodes.map((n) => n.dataset.tab));
   const paneCount = await page.locator(".pane-header").count();
+  const decoration = await page
+    .locator(".tab.active")
+    .getAttribute("data-tab-color");
   await page.waitForTimeout(700);
   await page.reload();
   await page.locator("#password").fill("static browser vault passphrase");
@@ -92,6 +95,10 @@ export async function exerciseWorkspaceContinuity(
   );
   assert.equal(await page.locator(".pane-header").count(), paneCount);
   assert.equal(await page.locator(".focused-pane").count(), 1);
+  assert.equal(
+    await page.locator(".tab.active").getAttribute("data-tab-color"),
+    decoration,
+  );
   assert.match(
     await page.locator(".tab.active").innerText(),
     /renamed-static-launcher/,

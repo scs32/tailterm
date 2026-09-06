@@ -3029,3 +3029,182 @@ dialog .key-list button {
 .local-history pre a:hover {
   color: var(--accent);
 }
+
+/* Straight terminal frames: one shared treatment for every popup and tab. */
+:root {
+  --muted: color-mix(in srgb, var(--terminal-bg), var(--ink) 90%);
+  --line: color-mix(in srgb, var(--terminal-bg), var(--ink) 32%);
+}
+dialog,
+dialog *,
+.terminal-shell,
+.tab,
+.pane-header,
+.power-scroll-toggle {
+  border-radius: 0 !important;
+}
+dialog {
+  font-family: var(--terminal-font);
+  padding: 18px;
+  border: 1px solid var(--accent);
+  box-shadow: 8px 8px 0 color-mix(in srgb, var(--terminal-bg) 70%, transparent);
+  animation: none;
+}
+dialog::backdrop {
+  backdrop-filter: none;
+}
+dialog .dialog-head {
+  border-bottom-color: var(--accent);
+}
+dialog .dialog-head h2,
+dialog > h2 {
+  font: 600 15px/1.4 var(--terminal-font);
+  letter-spacing: 0;
+}
+dialog :is(button, input, select, textarea),
+dialog .font-choice strong {
+  font-family: var(--terminal-font);
+}
+dialog .fine,
+dialog .font-choice small {
+  font-size: 12px;
+  line-height: 1.5;
+}
+dialog .font-choice small {
+  color: var(--muted);
+  white-space: normal;
+}
+dialog .font-choice span {
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+dialog :is(input, textarea)::placeholder {
+  color: var(--muted);
+  opacity: 1;
+}
+dialog .theme-choice.chosen,
+dialog .font-choice.chosen {
+  box-shadow: none;
+  border-color: var(--accent);
+  background: var(--raised);
+}
+#appearance-preview {
+  height: 184px;
+  min-width: 0;
+  padding: 8px;
+  overflow: hidden;
+  background: var(--terminal-bg);
+  border: 1px solid var(--line);
+}
+#appearance-preview .xterm {
+  padding: 0;
+}
+.tab .tab-name {
+  font-family: var(--tab-font, var(--terminal-font));
+}
+[data-tab-color] {
+  --tab-marker: var(--line);
+}
+[data-tab-color="mint"] {
+  --tab-marker: light-dark(#286b49, #a3d9ac);
+}
+[data-tab-color="blue"] {
+  --tab-marker: light-dark(#305f95, #9bbdeb);
+}
+[data-tab-color="violet"] {
+  --tab-marker: light-dark(#744a96, #c1a5dc);
+}
+[data-tab-color="amber"] {
+  --tab-marker: light-dark(#835b12, #dfc68b);
+}
+[data-tab-color="rose"] {
+  --tab-marker: light-dark(#a03e5a, #ed8e8e);
+}
+.tab[data-tab-color] {
+  border-top: 2px solid var(--tab-marker);
+}
+.tab.active[data-tab-color="default"] {
+  border-top-color: var(--accent);
+}
+.tab-decoration-preview {
+  margin-top: 16px;
+  padding: 12px;
+  border: 1px solid var(--line);
+  background: var(--terminal-bg);
+}
+#tab-decoration-sample {
+  display: block;
+  border-top: 2px solid var(--tab-marker);
+  padding-top: 8px;
+  overflow-wrap: anywhere;
+  color: var(--ink);
+}
+.voice-visual {
+  background: var(--terminal-bg);
+  border-color: var(--line);
+}
+.voice-wave span {
+  background: var(--accent);
+  box-shadow: none;
+}
+.voice-visual[data-state="listening"] {
+  border-color: var(--accent);
+}
+.voice-listening,
+.power-scroll-toggle {
+  opacity: 1;
+}
+@media (max-width: 600px) {
+  dialog {
+    padding: 14px;
+  }
+  #appearance-preview {
+    height: 184px;
+  }
+}
+
+/* Hover states and hints share the Tailscale control's plain terminal treatment. */
+.workspace-tooltip,
+.terminal-link-hint {
+  border-radius: 0;
+  border: 1px solid var(--line);
+  background: var(--raised);
+  color: var(--ink);
+  box-shadow: none;
+  padding: 9px 11px;
+  font: 12px/1.5 var(--terminal-font);
+}
+.workspace-tooltip kbd {
+  border-radius: 0;
+}
+#tailscale-login,
+.sidebar-bottom button,
+#connection-diagnostics {
+  border-radius: 0;
+}
+#tailscale-login:hover,
+.sidebar-bottom button:hover,
+#connection-diagnostics:hover,
+.tab:hover,
+.tab button:hover,
+dialog button:hover {
+  background: var(--raised);
+  color: var(--ink);
+  border-color: var(--accent);
+}
+dialog .primary:hover {
+  background: var(--accent);
+  color: var(--terminal-bg);
+}
+#notice {
+  border-radius: 0;
+  border: 1px solid var(--accent);
+  background: var(--raised);
+  color: var(--ink);
+  font: 12px/1.5 var(--terminal-font);
+  box-shadow: none;
+}
+#vault-reset-error,
+#rename-session-error {
+  color: light-dark(#a13f4e, #edada1);
+}

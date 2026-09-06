@@ -1,3 +1,6 @@
+import { createAppearancePreview } from "./appearance-preview.js";
+import { normalizeTabDecoration, showTabDecoration } from "./tab-decoration.js";
+let appearancePreview;
 import { setupTerminalLinks } from "./terminal-links.js";
 import { confirmDialog } from "./confirm-dialog.js";
 import { setupVoiceDictation } from "./voice-dictation.js";
@@ -27,7 +30,7 @@ import { setupTerminalInput, fontShortcut } from "./terminal-input.js";
 import { setupTooltips } from "./tooltips.js";
 import "@fontsource/jetbrains-mono/latin-400.css";
 import "@fontsource/ibm-plex-mono/latin-400.css";
-import "@fontsource/fira-code/latin-400.css";
+import "./fonts.css";
 import { setupTabStrip } from "./tab-strip.js";
 import { setupPaneGroups } from "./pane-groups.js";
 import { setupTerminalView } from "./terminal-view.js";
@@ -191,6 +194,7 @@ async function restoreWorkspace(value) {
           restoreId: item.id,
           resumeOnly: item.tmux,
           target: item.target,
+          decoration: item.decoration,
         });
         if (t) await t.initialReady;
       }
@@ -361,6 +365,10 @@ function mount() {
   };
   $("#new-tab").title = "Start or resume a session";
   $("#new-tab").onclick = () => selectServer(selected, true);
+  $("#keys").title =
+    "SSH keys\nGenerate, import and manage keys in your encrypted vault";
+  $("#tailscale-login").title =
+    "Tailscale\nConnect this browser to your tailnet";
   $("#tailscale-login").onclick = guard(startTailscale);
   $("#discover").onclick = $("#launcher-discover").onclick = guard(async () => {
     showPeers();
@@ -399,6 +407,8 @@ function mount() {
   $("#font-down").setAttribute("aria-label", "Smaller text");
   const diagnostics = document.createElement("button");
   diagnostics.id = "connection-diagnostics";
+  diagnostics.title =
+    "Connection diagnostics\nNetwork, SSH, host verification and reconnect status";
   diagnostics.textContent = "Diagnostics";
   diagnostics.onclick = () =>
     showDiagnostics({
@@ -622,7 +632,7 @@ function renderTabs() {
       const title = grouped
         ? `${ids.length} panes: ${names.join(", ")}\nDrag onto another tab to merge groups. × closes the focused pane.`
         : `${tabName(t)} #${t.number}\n${t.server.username}@${t.server.host}:${t.server.port}\n${t.status}${t.tmux ? " · tmux launch: " + t.session : ""}\nDrop at a tab edge to reorder; drop in its center to group.`;
-      return `<div class="tab ${ids.includes(active) ? "active" : ""} ${grouped ? "group-tab" : ""}" draggable="false"><button data-tab="${t.id}" role="tab" aria-selected="${ids.includes(active)}" title="${esc(title)}"><span class="node-dot ${t.status === "Connected" ? "online" : ""}"></span><span class="tab-copy"><span class="tab-name">${grouped ? `<span class="pane-count">▦ ${ids.length}</span> ${esc(names.join(" + "))}` : `${esc(tabName(t))} #${t.number}`}</span><span class="tab-activity">${esc(activity)}</span><span class="tab-tmux">${grouped ? "Focused: " + esc(tabName(t)) + " · " : ""}${esc(t.status)}${t.tmux ? " · launch: " + esc(t.session) + (t.tmuxVerified ? "" : " (unverified)") : ""}</span></span></button>${staticMode ? `<button data-session-menu="${t.id}" aria-label="Session actions for ${esc(t.session)}" title="Session actions and tab order">...</button>` : ""}<button data-close="${t.id}" aria-label="Close ${esc(t.server.name)} ${grouped ? "focused pane" : "terminal"}">×</button></div>`;
+      return `<div class="tab ${ids.includes(active) ? "active" : ""} ${grouped ? "group-tab" : ""}" data-tab-color="${normalizeTabDecoration(t.decoration).color}" style='--tab-font:${esc(fonts[t.decoration?.font]?.family || "var(--terminal-font)")}' draggable="false"><button data-tab="${t.id}" role="tab" aria-selected="${ids.includes(active)}" title="${esc(title)}"><span class="node-dot ${t.status === "Connected" ? "online" : ""}"></span><span class="tab-copy"><span class="tab-name">${grouped ? `<span class="pane-count">▦ ${ids.length}</span> ${esc(names.join(" + "))}` : `${esc(tabName(t))} #${t.number}`}</span><span class="tab-activity">${esc(activity)}</span><span class="tab-tmux">${grouped ? "Focused: " + esc(tabName(t)) + " · " : ""}${esc(t.status)}${t.tmux ? " · launch: " + esc(t.session) + (t.tmuxVerified ? "" : " (unverified)") : ""}</span></span></button>${staticMode ? `<button data-session-menu="${t.id}" aria-label="Session actions for ${esc(t.session)}" title="Session actions and tab order">...</button>` : ""}<button data-close="${t.id}" aria-label="Close ${esc(t.server.name)} ${grouped ? "focused pane" : "terminal"}">×</button></div>`;
     })
     .join("");
   $$("[data-tab]").forEach((b) => (b.onclick = () => activate(b.dataset.tab)));
@@ -633,11 +643,22 @@ function renderTabs() {
         if (!t) return;
         dialog(
           "Session actions",
-          `<div class="dialog-menu">${t.tmux ? '<button id="rename-tab-session">Rename session</button>' : ""}<button id="move-tab-left">Move left</button><button id="move-tab-right">Move right</button></div>`,
+          `<div class="dialog-menu">${t.tmux ? '<button id="rename-tab-session">Rename session</button>' : ""}<button id="decorate-tab">Tab appearance</button><button id="move-tab-left">Move left</button><button id="move-tab-right">Move right</button></div>`,
         );
         if (t.tmux)
           $("#rename-tab-session").onclick = () =>
             renameSession(t.server, t.session, t.target);
+        $("#decorate-tab").onclick = () =>
+          showTabDecoration({
+            tab: t,
+            name: t.server.name,
+            dialog,
+            close: closeDialog,
+            save: (value) => {
+              t.decoration = value;
+              renderTabs();
+            },
+          });
         const entries = paneGroups.entries(),
           index = entries.findIndex((entry) => entry.ids.includes(t.id));
         $("#move-tab-left").disabled = index <= 0;
@@ -683,7 +704,15 @@ function renderClipboard() {
   $("#paste").disabled = !t || t.status !== "Connected";
 }
 function tabName(t) {
-  return data.servers.find((s) => s.id === t.server.id)?.name || t.server.name;
+  const d = normalizeTabDecoration(t.decoration);
+  return [
+    d.emoji,
+    d.label ||
+      data.servers.find((s) => s.id === t.server.id)?.name ||
+      t.server.name,
+  ]
+    .filter(Boolean)
+    .join(" ");
 }
 function groupDialog() {
   const t = currentTab();
@@ -1051,6 +1080,7 @@ async function verifyTmux(t) {
   }
 }
 function updateAppearance() {
+  appearancePreview?.update(appearance);
   fontSize = appearance.fontSize;
   applyChrome(appearance);
   saveAppearance(appearance);
@@ -1076,6 +1106,7 @@ function appearanceDialog() {
   dialog(
     "Make it yours",
     `<p class="fine">Changes apply immediately and are saved on this browser.</p>
+    <div id="appearance-preview" aria-label="Live terminal font and contrast preview"></div><p class="fine">Live terminal preview · includes light and dark app backgrounds.</p>
     <h3>Color palette</h3><div class="theme-grid">${Object.entries(themes)
       .map(
         ([id, t]) =>
@@ -1085,9 +1116,10 @@ function appearanceDialog() {
     <h3>Typeface</h3><div class="font-grid">${Object.entries(fonts)
       .map(
         ([id, f]) =>
-          `<button data-font-choice="${id}" class="font-choice ${appearance.font === id ? "chosen" : ""}" aria-pressed="${appearance.font === id}"><strong>${esc(f.name)}</strong><span style='font-family:${esc(f.family)}'>0O 1il {} =&gt; ~/work</span></button>`,
+          `<button data-font-choice="${id}" class="font-choice ${appearance.font === id ? "chosen" : ""}" aria-pressed="${appearance.font === id}"><strong>${esc(f.name)}</strong><span style='font-family:${esc(f.family)}'>0O 1il {} =&gt; ~/work${f.nerd ? " · &#xf07b; &#xe0a0; &#xf120;" : ""}</span><small>${esc(f.description)}</small></button>`,
       )
       .join("")}</div>
+    <p class="fine">Fonts are bundled locally except System Mono. Nerd Font Mono symbols fit terminal cells. This renderer displays individual characters rather than programming ligatures.</p>
     <div class="appearance-controls"><div><label>Font size</label><div class="size-stepper"><button id="appearance-smaller" aria-label="Decrease font size">−</button><output id="font-size-value">${appearance.fontSize} px</output><button id="appearance-larger" aria-label="Increase font size">+</button><button id="appearance-reset">Reset</button></div></div><label>Line height<input id="line-height" type="range" min="1" max="1.6" step="0.05" value="${appearance.lineHeight}"></label><label>Padding<input id="terminal-padding" type="range" min="0" max="32" step="2" value="${appearance.padding}"></label></div>
     <h3>Cursor</h3><div class="segmented">${["block", "bar", "underline"].map((c) => `<button data-cursor="${c}" aria-pressed="${appearance.cursorStyle === c}">${c}</button>`).join("")}</div>
     <div class="appearance-toggles">${[
@@ -1103,6 +1135,10 @@ function appearanceDialog() {
       .join("")}</div>
     <details class="dialog-details"><summary>Keyboard & selection tips</summary><p class="fine">Switch grouped panes with Option + Shift + arrow keys on Mac, or Ctrl + Alt + arrow keys on Windows/Linux.</p>
     <p class="fine">Hold Shift while dragging to select text when tmux handles the mouse. Plain Ctrl+C still interrupts a command. Remote clipboard read requests are never answered.</p></details>`,
+  );
+  appearancePreview = createAppearancePreview(
+    $("#appearance-preview"),
+    appearance,
   );
   const choose = (attribute, key) =>
     $$(`[${attribute}]`).forEach(
@@ -1210,6 +1246,9 @@ async function connect(
     const t = {
       id: options.replace?.id || options.restoreId || crypto.randomUUID(),
       number: options.replace?.number || ++connectionNumber,
+      decoration: normalizeTabDecoration(
+        options.replace?.decoration || options.decoration,
+      ),
       server,
       transport,
       tmux,
@@ -1599,9 +1638,17 @@ async function waitForTailscale() {
 }
 
 function dialog(title, body) {
+  appearancePreview?.dispose();
+  appearancePreview = null;
   const d = $("#dialog");
   if (d.open) d.close();
   d.oncancel = null;
+  d.onclose = () => {
+    if (!d.open) {
+      appearancePreview?.dispose();
+      appearancePreview = null;
+    }
+  };
   (document.fullscreenElement || $("#app")).append(d);
   delete d.dataset.discovery;
   delete d.dataset.tailscaleLogin;
@@ -1611,6 +1658,8 @@ function dialog(title, body) {
   if (!d.open) d.showModal();
 }
 function closeDialog() {
+  appearancePreview?.dispose();
+  appearancePreview = null;
   $("#dialog").close();
   $("#dialog").replaceChildren();
 }
@@ -1828,6 +1877,10 @@ async function startTailscale() {
             : s === "NeedsLogin"
               ? "Sign in to Tailscale ↗"
               : "Tailscale ↗";
+        $("#tailscale-login").title =
+          s === "Running"
+            ? "Tailscale connected\nThis browser is connected to your tailnet"
+            : "Tailscale\n" + s;
         if (s === "NeedsLogin") ipn.login();
         if (s === "Running") recoverConnections();
         if (s === "Running" && discoveryPending) {

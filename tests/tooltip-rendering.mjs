@@ -5,8 +5,11 @@ const browser = await chromium.launch();
 try {
   const page = await browser.newPage();
   await page.setContent(
-    '<button id="action" title="Workspace action">Action</button><div class="xterm"><div id="rows"></div></div>',
+    '<button id="action" title="Workspace action" aria-describedby="existing-help">Action</button><span id="existing-help">Help</span><button id="keys" title="SSH keys">Keys</button><button id="diagnostics" title="Connection diagnostics">Diagnostics</button><button id="tab" title="Workspace tab">Tab</button><div class="xterm"><div id="rows"></div></div>',
   );
+  await page.addStyleTag({
+    content: await readFile("client/style.css", "utf8"),
+  });
   const source = await readFile("client/tooltips.js", "utf8");
   await page.addScriptTag({
     content:
@@ -49,6 +52,33 @@ try {
       tooltip: action.dataset.tooltip,
     };
   });
+  await page.locator("#action").focus();
+  await page.locator("#workspace-tooltip:popover-open").waitFor();
+  for (const [id, title] of [
+    ["keys", "SSH keys"],
+    ["diagnostics", "Connection diagnostics"],
+    ["tab", "Workspace tab"],
+  ]) {
+    await page.locator("#" + id).hover();
+    await page.waitForFunction(
+      (text) =>
+        document.querySelector("#workspace-tooltip:popover-open")
+          ?.textContent === text,
+      title,
+    );
+    assert.equal(
+      await page
+        .locator("#workspace-tooltip")
+        .evaluate((el) => getComputedStyle(el).borderRadius),
+      "0px",
+    );
+    assert.equal(await page.locator("#" + id).getAttribute("title"), null);
+  }
+  await page.keyboard.press("Escape");
+  assert.equal(
+    await page.locator("#action").getAttribute("aria-describedby"),
+    "existing-help",
+  );
   console.log(JSON.stringify(result));
   assert.equal(result.tooltip, "Updated workspace action");
   if (!process.argv.includes("--baseline"))
