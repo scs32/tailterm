@@ -204,6 +204,60 @@ try {
         0,
         "Cancelled automatic capture stays closed",
       );
+      // A tiny first trackpad tick must not be rounded into a full-row jump.
+      await page.evaluate(() => {
+        window.pauseCapture = false;
+        autoHistory = true;
+      });
+      await page.waitForTimeout(220);
+      await page.evaluate(() => tab.history.open());
+      const bottomText = await page
+        .locator(".local-history .xterm-rows")
+        .textContent();
+      await page.evaluate(() => tab.history.close());
+      await page.waitForTimeout(220);
+      const rowHeight = await page.evaluate(
+        () => tab.term.options.fontSize * tab.term.options.lineHeight,
+      );
+      await page.locator(".terminal-instance").dispatchEvent("wheel", {
+        deltaY: -rowHeight / 4,
+        bubbles: true,
+        cancelable: true,
+      });
+      await page.waitForFunction(() =>
+        document.querySelector(".local-history:not(.history-loading)"),
+      );
+      assert.equal(
+        await page.locator(".local-history .xterm-rows").textContent(),
+        bottomText,
+        "first sub-row tick does not jump a whole line or reveal an unpainted frame",
+      );
+      await page
+        .locator(".local-history .xterm-screen")
+        .dispatchEvent("wheel", {
+          deltaY: -rowHeight / 2,
+          bubbles: true,
+          cancelable: true,
+        });
+      await page.waitForTimeout(80);
+      assert.equal(
+        await page.locator(".local-history .xterm-rows").textContent(),
+        bottomText,
+      );
+      await page
+        .locator(".local-history .xterm-screen")
+        .dispatchEvent("wheel", {
+          deltaY: -rowHeight / 4,
+          bubbles: true,
+          cancelable: true,
+        });
+      await page.waitForFunction(
+        (text) =>
+          document.querySelector(".local-history .xterm-rows").textContent !==
+          text,
+        bottomText,
+      );
+      await page.evaluate(() => tab.history.close());
       await page.setViewportSize({ width: 1200, height: 850 });
       // Real wheel input exercises the browser's default page scrolling, which
       // synthetic dispatchEvent cannot reproduce. Leave room above and below.
