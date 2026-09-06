@@ -56,6 +56,7 @@ export class PaneGroups {
       return [
         {
           ...g,
+          decoration: tree.tab ? undefined : g.decoration,
           tree,
           active: leaves(tree).includes(g.active) ? g.active : leaves(tree)[0],
         },
@@ -78,6 +79,8 @@ export class PaneGroups {
       if (!from.tree) this.groups = this.groups.filter((g) => g !== from);
       else if (from.active === source) from.active = leaves(from.tree)[0];
     }
+    if (to.tree.tab) delete to.decoration;
+    if (from.tree?.tab) delete from.decoration;
     to.tree = replace(to.tree, target, {
       id: crypto.randomUUID(),
       axis,
@@ -95,6 +98,7 @@ export class PaneGroups {
       group.tree,
       new Set(leaves(group.tree).filter((id) => id !== tab)),
     );
+    if (group.tree.tab) delete group.decoration;
     if (group.active === tab) group.active = leaves(group.tree)[0];
     this.groups.splice(this.groups.indexOf(group) + 1, 0, {
       tree: { tab },

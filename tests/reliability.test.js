@@ -196,6 +196,7 @@ test("tab decoration is bounded and preserved in encrypted workspace snapshots",
     label: "Build",
     emoji: "🔧",
     color: "amber",
+    fill: "blue",
     font: "cascadia",
   };
   const t = {
@@ -215,6 +216,49 @@ test("tab decoration is bounded and preserved in encrypted workspace snapshots",
       color: "red; background:url(x)",
       font: "__proto__",
     }),
-    { label: "hello", emoji: "", color: "default", font: "" },
+    { label: "hello", emoji: "", color: "default", fill: "default", font: "" },
+  );
+});
+
+test("workspace restores independent parent and session decoration", () => {
+  const child = {
+    label: "Air",
+    color: "blue",
+    fill: "blue",
+    emoji: "🍎",
+    font: "cascadia",
+  };
+  const parent = {
+    label: "Machines",
+    color: "violet",
+    fill: "amber",
+    emoji: "📦",
+    font: "fira",
+  };
+  const tabs = ["a", "b"].map((id) => ({
+    id,
+    server: { id: "s", host: "box", port: 22, username: "me" },
+    tmux: true,
+    session: "main",
+    decoration: child,
+  }));
+  const groups = [
+    {
+      tree: {
+        id: "split",
+        axis: "x",
+        ratio: 0.5,
+        a: { tab: "a" },
+        b: { tab: "b" },
+      },
+      active: "a",
+      decoration: parent,
+    },
+  ];
+  const restored = normalizeWorkspace(workspaceSnapshot(tabs, groups, "a"));
+  assert.deepEqual(restored.groups[0].decoration, parent);
+  assert.deepEqual(
+    restored.tabs.map((t) => t.decoration),
+    [child, child],
   );
 });

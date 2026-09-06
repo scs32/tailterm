@@ -45,7 +45,9 @@ export async function exerciseWorkspaceControls(page) {
       assert.equal(reference.borderTopWidth, "1px");
       assert.equal(reference.borderTopStyle, "solid");
       assert.equal(reference.borderRadius, "0px");
-      const controls = page.locator("#workspace button:visible");
+      const controls = page.locator(
+        "#workspace button:visible:not(.tab:not(.active) > [data-close]):not(.tab:not(.active) > [data-session-menu])",
+      );
       const count = await controls.count();
       for (let i = 0; i < count; i++) {
         const button = controls.nth(i);

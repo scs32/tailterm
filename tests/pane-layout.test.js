@@ -111,3 +111,25 @@ test("pane shortcuts require the dedicated modifiers and ignore composition", as
     null,
   );
 });
+
+test("group appearance survives focus/sync and never transfers to a separated session", () => {
+  const m = new PaneGroups();
+  m.sync(["a", "b", "c"]);
+  m.merge("b", "a");
+  m.group("a").decoration = { label: "Parent", color: "violet", fill: "amber" };
+  m.group("a").active = "a";
+  m.sync(["a", "b", "c"]);
+  assert.equal(m.group("b").decoration.label, "Parent");
+  m.merge("c", "a");
+  m.detach("b");
+  assert.equal(m.group("a").decoration.label, "Parent");
+  assert.equal(m.group("b").decoration, undefined);
+  m.detach("c");
+  assert.equal(m.group("a").decoration, undefined);
+  m.merge("c", "a");
+  assert.equal(
+    m.group("a").decoration,
+    undefined,
+    "new parents start independently",
+  );
+});
