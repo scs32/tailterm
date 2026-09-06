@@ -88,8 +88,34 @@ try {
         (await page.evaluate(() => input.join(""))).includes("\x1b[<2;"),
         "Right click still reaches tmux",
       );
+      assert.equal(
+        (await page.evaluate(() => input.join(""))).match(/\x1b\[<2;\d+;\d+m/g)
+          ?.length,
+        1,
+        "Normal release is sent exactly once",
+      );
       await page.keyboard.press("Escape");
       await page.evaluate(() => (input = []));
+      const box = await screen.boundingBox();
+      await page.mouse.move(box.x + 20, box.y + 20);
+      await page.mouse.down({ button: "right" });
+      await write("\x1b[?1000l\x1b[?1003h");
+      await page.mouse.move(box.x + 60, box.y + 40);
+      await page.mouse.up({ button: "right" });
+      const reports = await page.evaluate(() => input.join(""));
+      assert.match(
+        reports,
+        /\x1b\[<34;\d+;\d+M/,
+        "Drag survives a mode change",
+      );
+      assert.equal(
+        reports.match(/\x1b\[<2;\d+;\d+m/g)?.length,
+        1,
+        "Recovered release is sent exactly once",
+      );
+      await page.keyboard.press("Escape");
+      await page.evaluate(() => (input = []));
+      await write("\x1b[?1003l\x1b[?1000h");
       await screen.click({
         button: "right",
         modifiers: ["Shift"],

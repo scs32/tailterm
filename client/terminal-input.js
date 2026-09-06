@@ -1,3 +1,4 @@
+import { setupMouseContinuity } from "./terminal-mouse.js";
 export function setupTerminalContextMenu(term) {
   const element = term.element;
   const contextMenu = (event) => {
@@ -21,6 +22,7 @@ export function setupTerminalContextMenu(term) {
   element.addEventListener("contextmenu", contextMenu, true);
   element.addEventListener("mousedown", browserClick, true);
   element.addEventListener("mouseup", browserClick, true);
+  setupMouseContinuity(term);
   term.loadAddon({
     activate() {},
     dispose() {

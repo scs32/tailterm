@@ -97,3 +97,5 @@ A deployed-site smoke check is available as `node tests/deployed-browser.mjs htt
 - `server/`: the original optional Node.js SSH gateway, retained for development and migration. See [server-backed mode](docs/server-backed.md).
 
 Generated builds, vault files, credentials, local Cloudflare state, and test screenshots are excluded from version control. Tailscale and Go notices are retained in `wasm/`; static packaging includes the licenses of linked dependencies.
+
+`npm run test:tmux-menu` additionally requires `tmux` and Python 3 on PATH. It uses a separate temporary tmux server to verify actual menu selection in Chromium and WebKit without changing existing sessions.

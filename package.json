@@ -15,7 +15,8 @@
     "test:static": "node tests/static-browser.mjs",
     "export:vault": "node scripts/export-server-vault.mjs",
     "test:links": "node tests/terminal-links-browser.mjs",
-    "test:context-menu": "node tests/terminal-context-menu-browser.mjs"
+    "test:context-menu": "node tests/terminal-context-menu-browser.mjs",
+    "test:tmux-menu": "node tests/tmux-menu-browser.mjs"
   },
   "dependencies": {
     "@fontsource/fira-code": "^5.3.0",
