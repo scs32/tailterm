@@ -35,6 +35,60 @@ const palette = (name, background, foreground, accent, colors) => ({
 });
 // Inspired by the projects' Ghostty palettes; provenance is in docs/appearance.md.
 export const themes = {
+  ember: palette("Ember", "#1c1410", "#f5e6d3", "#ffb454", [
+    "#30231c",
+    "#ff8f85",
+    "#b9d88c",
+    "#ffd080",
+    "#9ec9ef",
+    "#dcb0ea",
+    "#8fd5c5",
+    "#eee0cb",
+    "#a48a78",
+    "#ffaaa2",
+    "#d1eca3",
+    "#ffe0a3",
+    "#bedfff",
+    "#efcaff",
+    "#b0efdf",
+    "#fff5e7",
+  ]),
+  lagoon: palette("Lagoon", "#081d29", "#d8eef3", "#48dfc6", [
+    "#143442",
+    "#ff929e",
+    "#85dca6",
+    "#e9cf85",
+    "#83bfff",
+    "#c5a6f2",
+    "#67dbe0",
+    "#d2e9ed",
+    "#759baa",
+    "#ffb0b9",
+    "#acf2c4",
+    "#ffe6a8",
+    "#abd8ff",
+    "#ddc7ff",
+    "#a1f4ef",
+    "#f0fcff",
+  ]),
+  voltage: palette("Voltage", "#180b2d", "#f5eaff", "#ff69dc", [
+    "#32184c",
+    "#ff779c",
+    "#a6f56b",
+    "#ffe66b",
+    "#8db7ff",
+    "#ef8cff",
+    "#55efff",
+    "#f0ddff",
+    "#ac89c4",
+    "#ffa1bc",
+    "#c7ff99",
+    "#fff3a3",
+    "#b5d1ff",
+    "#ffb0ee",
+    "#a0faff",
+    "#ffffff",
+  ]),
   tailserve: palette("Tailterm", "#101311", "#d2dbd4", "#b9ecc4", [
     "#171d19",
     "#ed8e8e",
@@ -145,6 +199,12 @@ export const themes = {
   ]),
 };
 export const fonts = {
+  source: {
+    name: "Source Code Pro",
+    family: '"Source Code Pro", monospace',
+    description:
+      "Open, balanced letterforms with clear punctuation. Regular and bold weights bundled locally for consistent rendering.",
+  },
   cascadia: {
     name: "Cascadia · Nerd Font",
     family: '"CaskaydiaCove Nerd Font Mono", monospace',

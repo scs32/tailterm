@@ -3022,7 +3022,8 @@ dialog *,
 }
 dialog {
   font-family: var(--terminal-font);
-  padding: 18px;
+  --dialog-padding: 18px;
+  padding: var(--dialog-padding);
   border: 1px solid var(--accent);
   box-shadow: 8px 8px 0 color-mix(in srgb, var(--terminal-bg) 70%, transparent);
   animation: none;
@@ -3031,6 +3032,9 @@ dialog::backdrop {
   backdrop-filter: none;
 }
 dialog .dialog-head {
+  top: calc(-1 * var(--dialog-padding));
+  margin: calc(-1 * var(--dialog-padding)) calc(-1 * var(--dialog-padding)) 16px;
+  padding: var(--dialog-padding);
   border-bottom-color: var(--accent);
 }
 dialog .dialog-head h2,
@@ -3133,7 +3137,7 @@ dialog .font-choice.chosen {
 }
 @media (max-width: 600px) {
   dialog {
-    padding: 14px;
+    --dialog-padding: 14px;
   }
   #appearance-preview {
     height: 184px;
