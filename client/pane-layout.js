@@ -91,6 +91,26 @@ export class PaneGroups {
     to.active = source;
     return true;
   }
+  swap(source, target) {
+    const group = this.group(source);
+    if (!group || source === target || this.group(target) !== group)
+      return false;
+    // Replace leaves together: divider geometry and group identity stay intact.
+    const exchange = (tree) =>
+      tree.tab
+        ? {
+            ...tree,
+            tab:
+              tree.tab === source
+                ? target
+                : tree.tab === target
+                  ? source
+                  : tree.tab,
+          }
+        : { ...tree, a: exchange(tree.a), b: exchange(tree.b) };
+    group.tree = exchange(group.tree);
+    return true;
+  }
   detach(tab) {
     const group = this.group(tab);
     if (!group || leaves(group.tree).length < 2) return false;

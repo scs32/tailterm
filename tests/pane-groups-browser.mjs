@@ -122,6 +122,39 @@ export async function exercisePaneGroups(page, getInput = () => undefined) {
       /📦 My machines$/,
     );
   };
+  const beforeSwap = await pane(ids[0]).boundingBox();
+  const otherBeforeSwap = await pane(ids[1]).boundingBox();
+  const connectionsBeforeSwap = await page
+    .locator(".terminal-instance")
+    .count();
+  await pane(ids[0]).dragTo(pane(ids[1]));
+  const swapped = await pane(ids[0]).boundingBox();
+  assert.ok(
+    Math.abs(swapped.x - otherBeforeSwap.x) < 1 &&
+      Math.abs(swapped.y - otherBeforeSwap.y) < 1,
+    "dragging within a group swaps positions",
+  );
+  await checkParent();
+  assert.equal(
+    await page.locator(".terminal-instance").count(),
+    connectionsBeforeSwap,
+  );
+  // The terminal body is also a drop target, not just the narrow header.
+  const destination = await pane(ids[1]).boundingBox();
+  await pane(ids[0]).hover();
+  await page.mouse.down();
+  await page.mouse.move(
+    destination.x + destination.width / 2,
+    destination.y + destination.height + 60,
+    { steps: 12 },
+  );
+  await page.mouse.up();
+  const restored = await pane(ids[0]).boundingBox();
+  assert.ok(
+    Math.abs(restored.x - beforeSwap.x) < 1 &&
+      Math.abs(restored.y - beforeSwap.y) < 1,
+  );
+  await checkParent();
   for (const [id, name, color] of [
     [ids[0], "🍎 Air A", "blue"],
     [ids[1], "🚀 Air B", "rose"],
