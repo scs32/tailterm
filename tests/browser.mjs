@@ -125,7 +125,12 @@ try {
     await page.locator(".server-card.chosen strong").textContent(),
     "Development",
   );
-  await page.locator("#edit-server").click();
+  await page.locator("#commands").click();
+  await page.locator("#command-query").fill("Edit selected server");
+  await page
+    .locator("#command-results button")
+    .filter({ hasText: "Edit selected server" })
+    .click();
   await page.locator("[name=name]").fill("Development lab");
   await page.getByRole("button", { name: "Save server" }).click();
   await page.locator("#dialog").waitFor({ state: "hidden" });
@@ -373,7 +378,12 @@ try {
     });
   });
   // Refresh profiles through a normal UI mutation without reloading live tabs.
-  await page.locator("#edit-server").click();
+  await page.locator("#commands").click();
+  await page.locator("#command-query").fill("Edit selected server");
+  await page
+    .locator("#command-results button")
+    .filter({ hasText: "Edit selected server" })
+    .click();
   await page.getByRole("button", { name: "Save server" }).click();
   await page.locator("#dialog").waitFor({ state: "hidden" });
   await page
@@ -416,7 +426,12 @@ try {
     await page.locator(".tab.active [data-tab]").getAttribute("data-tab"),
     originalTmuxId,
   );
-  await page.locator("#edit-server").click();
+  await page.locator("#commands").click();
+  await page.locator("#command-query").fill("Edit selected server");
+  await page
+    .locator("#command-results button")
+    .filter({ hasText: "Edit selected server" })
+    .click();
   await page.locator("[name=name]").fill("Renamed host");
   await page.getByRole("button", { name: "Save server" }).click();
   await page.locator("#dialog").waitFor({ state: "hidden" });
@@ -522,7 +537,12 @@ try {
     activeBeforeClose,
   );
   // Deleting a server removes its connections and bookmarks, without killing remote tmux.
-  await page.locator("#edit-server").click();
+  await page.locator("#commands").click();
+  await page.locator("#command-query").fill("Edit selected server");
+  await page
+    .locator("#command-results button")
+    .filter({ hasText: "Edit selected server" })
+    .click();
   await page.locator("#delete-server").click();
   await page.locator(".confirmation-dialog [data-confirm]").click();
   await page.locator("#dialog").waitFor({ state: "hidden" });

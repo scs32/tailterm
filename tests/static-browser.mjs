@@ -641,7 +641,12 @@ try {
   await page.locator(".tab.active [data-close]").click();
   await page.locator("#all-servers").click();
   await page.locator(".server-item").filter({ hasText: "Key host" }).click();
-  await page.locator("#edit-server").click();
+  await page.locator("#commands").click();
+  await page.locator("#command-query").fill("Edit selected server");
+  await page
+    .locator("#command-results button")
+    .filter({ hasText: "Edit selected server" })
+    .click();
   await page.locator("[name=username]").fill("closeduser");
   await page.getByRole("button", { name: "Save server" }).click();
   await page.locator("#launcher-shell").click();
@@ -663,7 +668,12 @@ try {
   await page.locator(".tab.active [data-close]").click();
   await page.locator("#all-servers").click();
   await page.locator(".server-item").filter({ hasText: "Key host" }).click();
-  await page.locator("#edit-server").click();
+  await page.locator("#commands").click();
+  await page.locator("#command-query").fill("Edit selected server");
+  await page
+    .locator("#command-results button")
+    .filter({ hasText: "Edit selected server" })
+    .click();
   await page.locator("[name=username]").fill("keyuser");
   await page.locator("#server-advanced").evaluate((el) => (el.open = true));
   await page.locator("[name=fingerprint]").fill("SHA256:" + "A".repeat(43));

@@ -26,6 +26,11 @@ export async function exerciseWorkspaceControls(page) {
     await page.locator(`[data-theme-choice="${theme}"]`).click();
     await page.locator("#dialog-close").click();
   };
+  assert.equal(
+    await page.locator(".terminal-footer > div > #commands").count(),
+    1,
+  );
+  assert.equal(await page.locator("#edit-server, #group-tabs").count(), 0);
   let checked = 0;
   for (const theme of ["tokyo", "dawn"]) {
     await setTheme(theme);
@@ -39,6 +44,12 @@ export async function exerciseWorkspaceControls(page) {
     for (const mobile of [false, true]) {
       await page.setViewportSize(
         mobile ? { width: 390, height: 650 } : original,
+      );
+      const plus = await page.locator("#new-tab").boundingBox();
+      const tab = await page.locator("#tabs .tab").first().boundingBox();
+      assert.ok(
+        Math.abs(plus.y - tab.y) < 1 && Math.abs(plus.height - tab.height) < 1,
+        "Plus matches the tab frame",
       );
       await page.locator("#tailscale-login").hover();
       const reference = await page.locator("#tailscale-login").evaluate(style);
@@ -103,8 +114,8 @@ export async function exerciseWorkspaceControls(page) {
       }
       await page.locator(`[data-tab="${activeId}"]`).click();
       for (const [name, selector] of [
-        ["upper-right", "#commands"],
-        ["edit-server-strip", "#edit-server"],
+        ["upper-right", "#tailscale-login"],
+        ["bottom-commands", "#commands"],
         ["lower-nav", "#keys"],
         ["lower-right", "#clear"],
         ["tabs", ".tab.active [data-tab]"],
