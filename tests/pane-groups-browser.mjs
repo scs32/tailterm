@@ -105,7 +105,7 @@ export async function exercisePaneGroups(page, getInput = () => undefined) {
   // Font controls belong to the focused session, not its group or the app default.
   const paneSizes = () =>
     page
-      .locator(".terminal-instance .xterm")
+      .locator(".terminal-instance .xterm-rows")
       .evaluateAll((nodes) =>
         nodes.map((node) => parseFloat(getComputedStyle(node).fontSize)),
       );
