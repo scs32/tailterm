@@ -12,6 +12,7 @@ export function setupLocalHistory(
     fit,
     search,
     observer,
+    cancelReveal,
     pending = false,
     generation = 0,
     queuedLines = 0,
@@ -42,6 +43,8 @@ export function setupLocalHistory(
     generation++;
     pending = false;
     queuedLines = bottomPush = scrollRemainder = 0;
+    cancelReveal?.();
+    cancelReveal = null;
     observer?.disconnect();
     observer = null;
     viewer?.dispose();
@@ -105,10 +108,31 @@ export function setupLocalHistory(
       );
       if (token !== generation || t.disposed) return;
       status.textContent = `History snapshot · ${new Date().toLocaleTimeString()}`;
-      view.classList.remove("history-loading");
       terminal.scrollToBottom();
-      if (queuedLines) terminal.scrollLines(-Math.ceil(queuedLines));
+      // Preserve sub-row trackpad movement across the handoff. Rounding up
+      // made even a one-pixel first tick jump an entire text row.
+      const steps = Math.trunc(queuedLines);
+      if (steps) terminal.scrollLines(-steps);
+      scrollRemainder =
+        -(queuedLines - steps) *
+        t.term.options.fontSize *
+        t.term.options.lineHeight;
       queuedLines = 0;
+      pending = false;
+      // write() completing only means the buffer is parsed. Reveal the cached
+      // terminal after its positioned rows are painted, not its initial frame.
+      await new Promise((resolve) => {
+        const subscription = terminal.onRender(() => finish());
+        const finish = () => {
+          subscription.dispose();
+          cancelReveal = null;
+          resolve();
+        };
+        cancelReveal = finish;
+        terminal.refresh(0, terminal.rows - 1);
+      });
+      if (token !== generation || t.disposed) return;
+      view.classList.remove("history-loading");
       if (t.el.contains(document.activeElement)) terminal.focus();
     } catch (e) {
       if (token === generation) {
