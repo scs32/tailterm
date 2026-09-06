@@ -1131,6 +1131,7 @@ function updateAppearance() {
   for (const t of tabs) {
     Object.assign(t.term.options, terminalAppearance(appearance));
     t.history?.update();
+    t.history?.sync();
     if (!t.el.hidden)
       requestAnimationFrame(() => {
         if (!t.disposed) t.fit.fit();
@@ -1171,6 +1172,7 @@ function appearanceDialog() {
     <div class="appearance-toggles">${[
       ["cursorBlink", "Blink cursor"],
       ["focusFollowsMouse", "Focus terminal on hover"],
+      ...(staticMode ? [["autoHistory", "Automatic local scrolling"]] : []),
       ["copyOnSelect", "Copy on selection"],
       ["remoteClipboard", "Receive tmux clipboard (OSC 52)"],
     ]
@@ -1372,6 +1374,7 @@ async function connect(
     });
     if (staticMode && tmux)
       t.history = setupLocalHistory(t, {
+        automatic: () => appearance.autoHistory,
         capture: (tab) => {
           if (
             endpointKey(tab.server) !==

@@ -42,12 +42,16 @@ try {
           status: "Connected",
         };
         tab.term.open(tab.el);
+        window.autoHistory = false;
         window.captures = 0;
         window.remoteInput = "";
         tab.term.onData((d) => (remoteInput += d));
         tab.history = setupLocalHistory(tab, {
+          automatic: () => autoHistory,
           capture: async () => {
             captures++;
+            if (window.pauseCapture)
+              await new Promise((resolve) => (window.finishCapture = resolve));
             return Array.from(
               { length: 5000 },
               (_, i) =>
@@ -60,6 +64,7 @@ try {
         await new Promise(requestAnimationFrame);
         return performance.now() - start;
       });
+      await page.waitForTimeout(150);
       await page.waitForFunction(() =>
         document
           .querySelector(".local-history .xterm-rows")
@@ -133,6 +138,73 @@ try {
       );
       await page.evaluate(() => tab.history.close());
       assert.equal(await page.locator(".local-history").count(), 0);
+      await page.evaluate(() => (autoHistory = true));
+      await page.waitForTimeout(220);
+      await page.locator(".terminal-instance").dispatchEvent("wheel", {
+        deltaY: -120,
+        bubbles: true,
+        cancelable: true,
+      });
+      await page.waitForFunction(() =>
+        document.querySelector(".local-history:not(.history-loading)"),
+      );
+      assert.equal(await page.evaluate(() => captures), 2);
+      await page
+        .locator(".local-history .xterm-screen")
+        .dispatchEvent("wheel", {
+          deltaY: 2000,
+          bubbles: true,
+          cancelable: true,
+        });
+      await page.waitForTimeout(200);
+      await page.waitForFunction(() =>
+        document
+          .querySelector(".local-history .xterm-rows")
+          ?.textContent.includes("history row 4999"),
+      );
+      await page
+        .locator(".local-history .xterm-screen")
+        .dispatchEvent("wheel", {
+          deltaY: 120,
+          bubbles: true,
+          cancelable: true,
+        });
+      assert.equal(await page.locator(".local-history").count(), 0);
+      await page.locator(".terminal-instance").dispatchEvent("wheel", {
+        deltaY: -120,
+        bubbles: true,
+        cancelable: true,
+      });
+      assert.equal(await page.locator(".local-history").count(), 0);
+      assert.equal(await page.evaluate(() => captures), 2);
+      await page.waitForTimeout(220);
+      await page.locator(".terminal-instance").dispatchEvent("wheel", {
+        deltaY: -120,
+        shiftKey: true,
+        bubbles: true,
+        cancelable: true,
+      });
+      assert.equal(await page.evaluate(() => captures), 2);
+      await page.evaluate(() => (window.pauseCapture = true));
+      await page.locator(".terminal-instance").dispatchEvent("wheel", {
+        deltaY: -120,
+        bubbles: true,
+        cancelable: true,
+      });
+      await page.locator(".terminal-instance").dispatchEvent("wheel", {
+        deltaY: 600,
+        bubbles: true,
+        cancelable: true,
+      });
+      assert.equal(await page.locator(".local-history").count(), 0);
+      await page.evaluate(() => window.finishCapture());
+      await page.waitForTimeout(100);
+      assert.equal(
+        await page.locator(".local-history").count(),
+        0,
+        "Cancelled automatic capture stays closed",
+      );
+      assert.equal(await page.evaluate(() => remoteInput), "");
       assert.deepEqual(errors, []);
       console.log(
         `${engine.name()}: 5,000 colored lines, ${rows} rendered rows; local load ${Math.round(loadMs)}ms, two-frame scroll median ${Math.round(frames[15])}ms / p95 ${Math.round(frames[28])}ms; one capture, no remote input, search/copy/resize passed.`,

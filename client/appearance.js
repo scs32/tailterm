@@ -248,6 +248,7 @@ const defaults = {
   cursorBlink: true,
   padding: 16,
   focusFollowsMouse: true,
+  autoHistory: true,
   copyOnSelect: false,
   remoteClipboard: true,
 };
@@ -270,6 +271,7 @@ export function normalizeAppearance(value = {}) {
   for (const key of [
     "cursorBlink",
     "focusFollowsMouse",
+    "autoHistory",
     "copyOnSelect",
     "remoteClipboard",
   ])
