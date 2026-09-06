@@ -171,7 +171,7 @@ try {
         });
       assert.equal(await page.locator(".local-history").count(), 0);
       await page.locator(".terminal-instance").dispatchEvent("wheel", {
-        deltaY: -120,
+        deltaY: -1,
         bubbles: true,
         cancelable: true,
       });
@@ -204,6 +204,69 @@ try {
         0,
         "Cancelled automatic capture stays closed",
       );
+      // A new short, diagonal swipe is intentional even immediately after close.
+      await page.evaluate(() => {
+        window.pauseCapture = true;
+        tab.history.close();
+      });
+      await page.locator(".terminal-instance").dispatchEvent("wheel", {
+        deltaX: 20,
+        deltaY: -12,
+        bubbles: true,
+        cancelable: true,
+      });
+      await page.waitForFunction(() =>
+        document.querySelector(".history-loading"),
+      );
+      await page.locator(".terminal-instance").dispatchEvent("wheel", {
+        deltaY: 14,
+        bubbles: true,
+        cancelable: true,
+      });
+      assert.equal(
+        await page.locator(".local-history").count(),
+        1,
+        "minor recoil must not cancel a short swipe while capture is loading",
+      );
+      await page.evaluate(() => window.finishCapture());
+      await page.waitForFunction(() =>
+        document.querySelector(".local-history:not(.history-loading)"),
+      );
+      await page.evaluate(() => tab.history.close());
+      // Pointer intent starts one read, shared by an immediately following swipe.
+      const beforeWarm = await page.evaluate(() => captures);
+      await page.locator(".terminal-instance").dispatchEvent("pointerenter");
+      await page.waitForFunction((n) => captures === n + 1, beforeWarm);
+      await page.locator(".terminal-instance").dispatchEvent("wheel", {
+        deltaY: -8,
+        bubbles: true,
+        cancelable: true,
+      });
+      assert.equal(await page.evaluate(() => captures), beforeWarm + 1);
+      await page.evaluate(() => window.finishCapture());
+      await page.waitForFunction(() =>
+        document.querySelector(".local-history:not(.history-loading)"),
+      );
+      await page.evaluate(() => {
+        tab.history.close();
+        window.pauseCapture = false;
+      });
+      // New output invalidates a warmed snapshot before opening it.
+      await page.locator(".terminal-instance").dispatchEvent("pointerenter");
+      await page.waitForFunction((n) => captures === n + 2, beforeWarm);
+      await page.evaluate(
+        () => new Promise((resolve) => tab.term.write("fresh output", resolve)),
+      );
+      await page.locator(".terminal-instance").dispatchEvent("wheel", {
+        deltaY: -8,
+        bubbles: true,
+        cancelable: true,
+      });
+      await page.waitForFunction(() =>
+        document.querySelector(".local-history:not(.history-loading)"),
+      );
+      assert.equal(await page.evaluate(() => captures), beforeWarm + 3);
+      await page.evaluate(() => tab.history.close());
       // A tiny first trackpad tick must not be rounded into a full-row jump.
       await page.evaluate(() => {
         window.pauseCapture = false;

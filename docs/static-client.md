@@ -193,3 +193,5 @@ Inactive tabs show their label and any activity indicator. Hover or keyboard foc
 **Commands** lives with the bottom-right terminal controls. Use it for **Edit selected server** and **Manage terminal groups**, which no longer occupy the tab toolbar. The **+** button shares the tab strip’s height, followed by a small gap before the remaining tools.
 
 Terminal font-size buttons and keyboard shortcuts resize only the focused session, including within a group. Each session keeps its size when reconnecting or restoring the workspace. Appearance’s **New session font size** sets the starting size for newly opened sessions.
+
+Automatic local scrolling prepares history when the pointer enters a connected terminal. It shares an in-flight capture with a following swipe, reuses completed captures for at most 1.5 seconds, and invalidates them on new terminal output or close/lock. It does not poll for history. Brief diagonal swipes and deliberate upward reversals are accepted; small recoil during loading does not cancel the gesture.
