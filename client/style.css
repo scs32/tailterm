@@ -1410,9 +1410,6 @@ dialog:modal {
 .terminal-footer > div {
   flex-shrink: 0;
 }
-.terminal-tools #edit-server {
-  white-space: nowrap;
-}
 
 .sidebar-discover {
   margin: 0 2px 8px;
@@ -1587,13 +1584,6 @@ dialog:modal {
   margin-left: 0;
 }
 @media (max-width: 600px) {
-  .terminal-tools #edit-server {
-    font-size: 0;
-  }
-  .terminal-tools #edit-server::before {
-    content: "✎";
-    font-size: 14px;
-  }
   .terminal-tools {
     padding: 0 3px;
   }
@@ -3372,4 +3362,26 @@ dialog .primary:hover {
   > :is([data-close], [data-session-menu]),
 #tabs .tab:not(.active):not(:hover):not(:focus-within) .tab-tmux {
   display: none;
+}
+
+/* New-session belongs to the tab strip; the remaining tools get a small gap. */
+#workspace .tab-strip > #new-tab {
+  align-self: stretch;
+  flex: 0 0 40px;
+  height: 100%;
+  min-height: 0;
+  margin: 0;
+  padding: 0;
+  border-radius: 0;
+}
+#workspace .terminal-tools {
+  margin-left: 12px;
+}
+@media (max-width: 700px) {
+  .terminal-tabs .tab-strip {
+    flex-basis: 100%;
+  }
+  #workspace .terminal-tools {
+    margin-left: 0;
+  }
 }

@@ -40,17 +40,24 @@ export async function exercisePopupReview(page) {
     assert.equal(box.radius, "0px", `${name} uses a straight frame`);
   };
   for (const [name, selector] of [
-    ["server", "#edit-server"],
+    ["server", "command:Edit selected server"],
     ["keys", "#keys"],
     ["appearance", "#appearance"],
     ["backup", "#backup-vault"],
     ["commands", "#commands"],
     ["forget", "#forget-device"],
     ["diagnostics", "#connection-diagnostics"],
-    ["groups", "#group-tabs"],
+    ["groups", "command:Manage terminal groups"],
     ["session-actions", ".tab.active [data-session-menu]"],
   ]) {
-    await page.locator(selector).click();
+    if (selector.startsWith("command:")) {
+      await page.locator("#commands").click();
+      await page.locator("#command-query").fill(selector.slice(8));
+      await page
+        .locator("#command-results button")
+        .filter({ hasText: selector.slice(8) })
+        .click();
+    } else await page.locator(selector).click();
     await fits(name);
     await page.screenshot({ path: `.build/popup-${name}.png` });
     if (name === "server") {

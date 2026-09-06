@@ -7,8 +7,10 @@ export function setupTabStrip() {
   function update() {
     const tab = viewport.querySelector(".tab");
     const minimum = tab ? parseFloat(getComputedStyle(tab).minWidth) : 0;
+    const plus = strip.querySelector("#new-tab");
+    const available = strip.clientWidth - (plus?.offsetWidth || 0);
     const overflow =
-      !!tab && viewport.children.length * minimum > strip.clientWidth + 1;
+      !!tab && viewport.children.length * minimum > available + 1;
     left.hidden = right.hidden = !overflow;
     left.disabled = viewport.scrollLeft <= 1;
     right.disabled =

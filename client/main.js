@@ -309,7 +309,7 @@ function mount() {
   $("#lockscreen")?.remove();
   $("#app").insertAdjacentHTML(
     "beforeend",
-    `<div id="workspace"><aside><div class="brand">${icon}<strong>tailterm</strong><span class="version">01</span></div><div class="sidebar-section"><span>SERVERS</span><button id="all-servers" aria-label="All servers" aria-pressed="true" title="Show sessions from all servers">All</button></div><input id="filter" class="filter" placeholder="⌕  Find a server…" aria-label="Find a server"><nav id="server-list"></nav><button id="discover" class="sidebar-discover">⌕ Discover devices</button><div class="sidebar-bottom"><button id="keys">♧ <span>SSH key vault</span><span id="key-count">0</span></button><button id="lock">↪ <span>Lock workspace</span><kbd>⇧⌘L</kbd></button></div></aside><main><header><div class="header-right"><span class="status-dot" id="tail-dot"></span><span id="tail-status">Tailnet offline</span><button id="tailscale-login">Connect Tailscale ↗</button></div></header><section class="terminal-shell"><div class="terminal-tabs"><div class="tab-strip"><button id="tabs-left" class="tab-scroll" aria-label="Scroll tabs left" title="Scroll tabs left" hidden>‹</button><div id="tabs" role="tablist" aria-label="SSH connections"></div><button id="tabs-right" class="tab-scroll" aria-label="Scroll tabs right" title="Scroll tabs right" hidden>›</button></div><button id="new-tab" class="icon-button" title="Start or resume a session">+</button><div class="terminal-tools"><button id="edit-server" title="Edit selected server" aria-label="Edit selected server">Edit server</button><button id="search-toggle" title="Find in terminal">⌕</button><button id="font-down" title="Smaller text">A−</button><button id="font-up" title="Larger text">A+</button><button id="appearance" title="Appearance\nThemes, fonts, cursor and spacing" aria-label="Appearance">◐</button><button id="fullscreen" title="Fullscreen">⛶</button></div></div><div id="search-bar" hidden><input id="terminal-search" placeholder="Find in scrollback" aria-label="Find in terminal"><button id="find-next">Next ↓</button><button id="search-close">×</button></div><div id="terminal-body"><div id="empty-terminal"><div class="session-launcher"><p id="server-filter-empty" class="fine" hidden></p><span class="eyebrow">YOUR REMOTE WORKSPACE</span><h2>Pick up where you left off.</h2><p class="launcher-intro">Choose a server, then open a fresh workspace or return to a running session.</p><div id="launcher-server" class="server-grid" role="group" aria-label="Session server"></div><div class="launch-section"><div class="launch-section-title"><span class="step-dot">＋</span><div><h3>Start fresh</h3><p>A persistent tmux workspace on <strong id="launch-target"></strong></p></div></div><div class="launch-new"><input id="launcher-name" placeholder="Optional name · leave blank for an automatic ID" aria-label="New tmux session name" maxlength="64"><button id="start-session" class="primary">＋ Start session</button></div></div><div class="resume-heading"><strong>Pick up a session</strong><button id="launcher-refresh" title="Refresh sessions\nQuery this server now; no sessions are changed.">↻ Refresh</button></div><p id="launcher-note"></p><div id="launcher-sessions"></div><div class="launcher-secondary"><button id="launcher-shell">Open plain SSH shell</button><button id="launcher-discover">⌕ Discover devices</button></div></div></div></div><div class="terminal-footer"><span id="terminal-status">○ No active connection</span><div><button id="copy">Copy</button><button id="paste">Paste</button><button id="clear">Clear</button><button id="reconnect">Reconnect</button><span id="dimensions">— × —</span></div></div></section></main></div><dialog id="dialog"></dialog>`,
+    `<div id="workspace"><aside><div class="brand">${icon}<strong>tailterm</strong><span class="version">01</span></div><div class="sidebar-section"><span>SERVERS</span><button id="all-servers" aria-label="All servers" aria-pressed="true" title="Show sessions from all servers">All</button></div><input id="filter" class="filter" placeholder="⌕  Find a server…" aria-label="Find a server"><nav id="server-list"></nav><button id="discover" class="sidebar-discover">⌕ Discover devices</button><div class="sidebar-bottom"><button id="keys">♧ <span>SSH key vault</span><span id="key-count">0</span></button><button id="lock">↪ <span>Lock workspace</span><kbd>⇧⌘L</kbd></button></div></aside><main><header><div class="header-right"><span class="status-dot" id="tail-dot"></span><span id="tail-status">Tailnet offline</span><button id="tailscale-login">Connect Tailscale ↗</button></div></header><section class="terminal-shell"><div class="terminal-tabs"><div class="tab-strip"><button id="tabs-left" class="tab-scroll" aria-label="Scroll tabs left" title="Scroll tabs left" hidden>‹</button><div id="tabs" role="tablist" aria-label="SSH connections"></div><button id="tabs-right" class="tab-scroll" aria-label="Scroll tabs right" title="Scroll tabs right" hidden>›</button><button id="new-tab" class="icon-button" title="Start or resume a session">+</button></div><div class="terminal-tools"><button id="search-toggle" title="Find in terminal">⌕</button><button id="font-down" title="Smaller text">A−</button><button id="font-up" title="Larger text">A+</button><button id="appearance" title="Appearance\nThemes, fonts, cursor and spacing" aria-label="Appearance">◐</button><button id="fullscreen" title="Fullscreen">⛶</button></div></div><div id="search-bar" hidden><input id="terminal-search" placeholder="Find in scrollback" aria-label="Find in terminal"><button id="find-next">Next ↓</button><button id="search-close">×</button></div><div id="terminal-body"><div id="empty-terminal"><div class="session-launcher"><p id="server-filter-empty" class="fine" hidden></p><span class="eyebrow">YOUR REMOTE WORKSPACE</span><h2>Pick up where you left off.</h2><p class="launcher-intro">Choose a server, then open a fresh workspace or return to a running session.</p><div id="launcher-server" class="server-grid" role="group" aria-label="Session server"></div><div class="launch-section"><div class="launch-section-title"><span class="step-dot">＋</span><div><h3>Start fresh</h3><p>A persistent tmux workspace on <strong id="launch-target"></strong></p></div></div><div class="launch-new"><input id="launcher-name" placeholder="Optional name · leave blank for an automatic ID" aria-label="New tmux session name" maxlength="64"><button id="start-session" class="primary">＋ Start session</button></div></div><div class="resume-heading"><strong>Pick up a session</strong><button id="launcher-refresh" title="Refresh sessions\nQuery this server now; no sessions are changed.">↻ Refresh</button></div><p id="launcher-note"></p><div id="launcher-sessions"></div><div class="launcher-secondary"><button id="launcher-shell">Open plain SSH shell</button><button id="launcher-discover">⌕ Discover devices</button></div></div></div></div><div class="terminal-footer"><span id="terminal-status">○ No active connection</span><div><button id="copy">Copy</button><button id="paste">Paste</button><button id="clear">Clear</button><button id="reconnect">Reconnect</button><span id="dimensions">— × —</span></div></div></section></main></div><dialog id="dialog"></dialog>`,
   );
   if (staticMode) {
     $("#keys").insertAdjacentHTML(
@@ -337,14 +337,6 @@ function mount() {
     preferences: () => appearance,
     label: (t) => tabName(t, true),
   });
-  const groupButton = document.createElement("button");
-  groupButton.id = "group-tabs";
-  groupButton.textContent = "▦";
-  groupButton.title =
-    "Group terminals\nDrag a tab onto another tab to tile them together. Manage groups here.";
-  groupButton.setAttribute("aria-label", "Manage terminal groups");
-  groupButton.onclick = groupDialog;
-  $(".terminal-tools").prepend(groupButton);
   selected = data.servers[0]?.id;
   render();
   $("#appearance").onclick = appearanceDialog;
@@ -366,10 +358,6 @@ function mount() {
   $("#all-servers").onclick = () => {
     serverFilter = null;
     applyServerFilter();
-  };
-  $("#edit-server").onclick = () => {
-    const s = currentServer();
-    if (s) serverDialog(s);
   };
   $("#new-tab").title = "Start or resume a session";
   $("#new-tab").onclick = () => selectServer(selected, true);
@@ -493,7 +481,7 @@ function mount() {
   commandsButton.textContent = "Commands";
   commandsButton.title = "Commands (Ctrl/Cmd + Shift + P)";
   commandsButton.onclick = openCommands;
-  $(".header-right").prepend(commandsButton);
+  $(".terminal-footer > div").prepend(commandsButton);
   setupMobileTerminal({
     current: currentTab,
     tabs: visibleTabs,
@@ -558,9 +546,7 @@ function currentTab() {
 }
 function render() {
   renderSidebar();
-  const s = currentTab()?.server || currentServer();
   renderLauncher();
-  $("#edit-server").disabled = !s;
   $("#key-count").textContent = data.keys.length;
   renderTabs();
   renderRemote();
@@ -2313,6 +2299,13 @@ function openCommands() {
     run: () => $("#all-servers").click(),
   });
   commands.push({ label: "New session", run: () => $("#new-tab").click() });
+  commands.push({ label: "Manage terminal groups", run: groupDialog });
+  const server = currentServer();
+  if (server)
+    commands.push({
+      label: "Edit selected server",
+      run: () => serverDialog(server),
+    });
   if (t) {
     commands.push({
       label: "Voice dictation · Option + Space",
