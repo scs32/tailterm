@@ -137,6 +137,8 @@ export function setupPaneGroups({
         header.className = "pane-header";
         header.dataset.pane = id;
         header.draggable = false;
+        header.title =
+          "Drag to rearrange\nDrop onto another pane in this group to swap positions, or onto the tab bar to ungroup.";
         const focus = document.createElement("button");
         focus.className = "pane-label";
         focus.onclick = () => activate(id);
@@ -233,7 +235,7 @@ export function setupPaneGroups({
       );
       const button = header.querySelector(".pane-label");
       button.textContent = `${label(t)} · ${t.tmux ? t.session : "SSH"} · ${t.status}`;
-      button.title = `${t.server.username}@${t.server.host}\nDrag this header onto another group or out to the tab bar.`;
+      button.title = `${t.server.username}@${t.server.host}\nDrag onto another pane to swap positions; onto another group to move; or onto the tab bar to ungroup.`;
       position(header, { ...box, height: 30 });
       position(t.el, { ...box, y: box.y + 30, height: box.height - 30 });
     }
@@ -249,6 +251,12 @@ export function setupPaneGroups({
       el.setAttribute("aria-valuemax", Math.round((d.high / d.span) * 100));
       el.setAttribute("aria-valuenow", Math.round(d.ratio * 100));
     }
+  }
+  function dragTarget(element) {
+    const direct = element?.closest("[data-pane], .tab, .pane-release");
+    if (direct) return direct;
+    const tab = getTabs().find((t) => !t.el.hidden && t.el.contains(element));
+    return tab ? chrome.querySelector(`[data-pane="${tab.id}"]`) : null;
   }
   function clearDrag() {
     drag = null;
@@ -282,7 +290,7 @@ export function setupPaneGroups({
             "tab-drop-after",
           ),
         );
-      const target = element?.closest("[data-pane], .tab, .pane-release");
+      const target = dragTarget(element);
       if (drag?.whole && target?.matches(".tab")) {
         const box = target.getBoundingClientRect(),
           position = (x - box.left) / box.width;
@@ -303,7 +311,7 @@ export function setupPaneGroups({
     },
     drop(element) {
       if (!drag) return;
-      const target = element?.closest("[data-pane], .tab");
+      const target = dragTarget(element);
       let id =
         target?.dataset.pane ||
         target?.querySelector("[data-tab]")?.dataset.tab;
@@ -318,6 +326,13 @@ export function setupPaneGroups({
       if (id && source.whole && source.reorder) {
         model.reorder(source.id, id, source.reorder === "after");
         activate(getActive());
+      } else if (
+        id &&
+        !source.whole &&
+        target.dataset.pane &&
+        model.group(source.id) === model.group(id)
+      ) {
+        if (model.swap(source.id, id)) activate(source.id);
       } else if (id) merge(source.id, id, source.whole);
       else if (!source.whole && element?.closest(".terminal-tabs"))
         detach(source.id);

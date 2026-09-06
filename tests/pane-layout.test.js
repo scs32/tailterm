@@ -133,3 +133,30 @@ test("group appearance survives focus/sync and never transfers to a separated se
     "new parents start independently",
   );
 });
+
+test("swapping grouped panes preserves geometry, identity and every connection", () => {
+  const m = new PaneGroups();
+  m.sync(["a", "b", "c", "outside"]);
+  m.merge("b", "a");
+  m.merge("c", "b", { axis: "y" });
+  const group = m.group("a");
+  group.decoration = { label: "Work" };
+  group.tree.ratio = 0.3;
+  const before = structuredClone(group);
+  const boxes = tileLayout(group.tree, 1200, 800).panes;
+  assert.equal(m.swap("a", "c"), true);
+  assert.equal(m.group("a"), group);
+  assert.deepEqual(group.decoration, before.decoration);
+  assert.equal(group.active, before.active);
+  for (const box of tileLayout(group.tree, 1200, 800).panes) {
+    const previous = boxes.find(
+      (p) => p.id === ({ a: "c", c: "a" }[box.id] || box.id),
+    );
+    assert.deepEqual({ ...box, id: previous.id }, previous);
+  }
+  assert.equal(m.swap("a", "outside"), false);
+  assert.equal(m.swap("a", "a"), false);
+  assert.equal(m.swap("missing", "a"), false);
+  assert.equal(m.swap("a", "c"), true);
+  assert.deepEqual(group, before);
+});

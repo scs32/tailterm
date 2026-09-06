@@ -127,6 +127,10 @@ Each tmux terminal has a small **Scroll off / Scroll on** toggle in its upper-ri
 
 New-output activity compares rendered text instead of raw SSH traffic. Identical redraws, cursor-only updates, and changes limited to the usual bottom tmux status row do not count. Background comparisons are throttled; bells, explicit command completion, and connection errors take priority. The browser title shows an unread-session count and the highest-priority activity. Returning to a session clears its indicator. Applications that visibly change their content may still generate activity; this is not a semantic notification feed.
 
+### Rearranging grouped panes
+
+Drag a pane’s header onto another pane in the same group to swap their positions. You can drop onto either the header or terminal area. Divider sizes, group appearance, and live SSH connections stay intact. Drag to the tab bar to make a separate tab, or onto a different group to move the pane there. Escape cancels a drag.
+
 ### Keyboard navigation between grouped panes
 
 Use **Option + Shift + arrow** on Mac, or **Ctrl + Alt + arrow** on Windows/Linux, to focus a pane in that direction within the current group. Navigation follows the visible layout, including portrait stacking, and stops at the outside edge. It does not wrap or switch groups. These shortcuts do not send keystrokes to SSH and are inactive in dialogs and ordinary form fields. The Commands palette also includes **Focus pane left/right/up/down**.
