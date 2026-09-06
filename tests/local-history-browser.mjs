@@ -3,6 +3,9 @@ export async function exerciseLocalHistory(page, getInput) {
   await page.evaluate(
     () => document.fullscreenElement && document.exitFullscreen(),
   );
+  await page.locator("#appearance").click();
+  await page.locator('[data-preference="autoHistory"]').uncheck();
+  await page.locator("#dialog-close").click();
   const terminal = page.locator(".terminal-instance:not([hidden])").first();
   const toggle = terminal.locator(".power-scroll-toggle");
   await toggle.waitFor();
@@ -15,7 +18,7 @@ export async function exerciseLocalHistory(page, getInput) {
   assert.equal(
     await page.locator(".local-history").count(),
     0,
-    "Ordinary scroll must never switch modes",
+    "Disabling automatic scrolling preserves manual mode",
   );
   const before = getInput();
   await toggle.click();
@@ -94,4 +97,48 @@ export async function exerciseLocalHistory(page, getInput) {
   await page.waitForTimeout(700);
   assert.equal(await page.locator(".local-history").count(), 0);
   assert.equal(await toggle.getAttribute("aria-pressed"), "false");
+  await page.locator("#appearance").click();
+  await page.locator('[data-preference="autoHistory"]').check();
+  await page.locator("#dialog-close").click();
+  const inputBeforeAuto = getInput();
+  await terminal.dispatchEvent("wheel", {
+    deltaY: -120,
+    bubbles: true,
+    cancelable: true,
+  });
+  await page.waitForFunction(() =>
+    document.querySelector(".local-history:not(.history-loading)"),
+  );
+  const screen = page.locator(".local-history .xterm-screen");
+  await screen.dispatchEvent("wheel", {
+    deltaY: 2000,
+    bubbles: true,
+    cancelable: true,
+  });
+  await page.waitForFunction(() =>
+    document
+      .querySelector(".local-history .xterm-rows")
+      ?.textContent.includes("cached history line 299"),
+  );
+  await screen.dispatchEvent("wheel", {
+    deltaY: 120,
+    bubbles: true,
+    cancelable: true,
+  });
+  assert.equal(await page.locator(".local-history").count(), 0);
+  await terminal.dispatchEvent("wheel", {
+    deltaY: -120,
+    bubbles: true,
+    cancelable: true,
+  });
+  assert.equal(
+    await page.locator(".local-history").count(),
+    0,
+    "Trailing momentum cannot reopen history",
+  );
+  assert.equal(
+    getInput(),
+    inputBeforeAuto,
+    "Automatic handoff never sends wheel input to SSH",
+  );
 }

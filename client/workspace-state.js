@@ -1,4 +1,6 @@
 import { normalizeTabDecoration } from "./tab-decoration.js";
+export const normalizeSessionFontSize = (value) =>
+  Number.isInteger(value) && value >= 10 && value <= 32 ? value : undefined;
 export const endpointKey = (server) =>
   JSON.stringify([
     server.host,
@@ -21,6 +23,7 @@ export function workspaceSnapshot(tabs, groups, active, serverFilter = null) {
         session: t.session,
         target: t.target,
         decoration: normalizeTabDecoration(t.decoration),
+        fontSize: normalizeSessionFontSize(t.fontSize),
       })),
     serverFilter: serverFilter === null ? null : [...serverFilter],
     groups: structuredClone(groups),
@@ -48,6 +51,7 @@ export function normalizeWorkspace(value) {
       endpoint: t.endpoint,
       tmux: !!t.tmux,
       decoration: normalizeTabDecoration(t.decoration),
+      fontSize: normalizeSessionFontSize(t.fontSize),
       session: t.tmux ? t.session : "",
       target:
         /^\$\d+$/.test(t.target?.id) && /^\d+$/.test(String(t.target?.created))
