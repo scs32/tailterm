@@ -100,3 +100,84 @@ export function tmuxHistoryCommand(target, path = "") {
 function exactSession(name) {
   return `tailterm_tmux_target=$("$tailterm_tmux_bin" list-sessions -F '#{session_name}|#{session_id}' | while IFS='|' read -r tailterm_tmux_name tailterm_tmux_id; do if [ "$tailterm_tmux_name" = ${shellQuote(name)} ]; then printf '%s' "$tailterm_tmux_id"; break; fi; done); if [ -z "$tailterm_tmux_target" ]; then printf 'That tmux session no longer exists. Start a new session from the launcher.\\n' >&2; exit 1; fi; `;
 }
+
+const TT_CANDIDATES = [
+  "/usr/local/bin/tt",
+  "/opt/homebrew/bin/tt",
+  "$HOME/.local/bin/tt",
+  "$HOME/bin/tt",
+  "/usr/bin/tt",
+];
+const ttResolver = (onMissing) =>
+  `tailterm_tt=$(command -v tt 2>/dev/null || :); if [ ! -x "$tailterm_tt" ]; then for tailterm_tt_candidate in ${TT_CANDIDATES.map(
+    (c) => (c.startsWith("$HOME") ? `"${c}"` : c),
+  ).join(
+    " ",
+  )}; do if [ -x "$tailterm_tt_candidate" ]; then tailterm_tt=$tailterm_tt_candidate; break; fi; done; fi; if [ ! -x "$tailterm_tt" ]; then ${onMissing}; fi; `;
+// Control characters (including escape) are refused so the approval dialog
+// and the remote shell see exactly the text the user typed.
+export function validateAgentText(value, max, label) {
+  if (
+    typeof value !== "string" ||
+    value.length > max ||
+    /[\u0000-\u001f\u007f]/.test(value)
+  )
+    throw new Error(`Invalid ${label}.`);
+}
+// Agent sessions are created host-side by the tt CLI, which registers the
+// agent with the hub and starts tmux with the task environment. Tailterm runs
+// this over a non-interactive SSH exec and attaches once the hub reports it.
+export function agentSpawnCommand({
+  hub,
+  task,
+  name,
+  run,
+  cwd = "",
+  prompt = "",
+  runtime = "",
+}) {
+  if (!/^https?:\/\/[A-Za-z0-9][A-Za-z0-9.:/_-]{0,199}$/.test(hub))
+    throw new Error("Invalid hub URL.");
+  if (!/^tsk_[0-9a-f]{16}$/.test(task)) throw new Error("Invalid task id.");
+  validateSession(name);
+  validateAgentText(run, 1024, "agent command");
+  if (!run.trim()) throw new Error("Agent command is required.");
+  validateAgentText(cwd, 512, "working directory");
+  if (cwd && !cwd.startsWith("/"))
+    throw new Error("Working directory must be absolute.");
+  validateAgentText(prompt, 8192, "prompt");
+  if (runtime && !/^[a-zA-Z0-9._-]{1,64}$/.test(runtime))
+    throw new Error("Invalid runtime.");
+  const args = [
+    "spawn",
+    "--json",
+    "--hub",
+    hub,
+    "--task",
+    task,
+    "--name",
+    name,
+    "--run",
+    run,
+  ];
+  if (cwd) args.push("--cwd", cwd);
+  if (prompt) args.push("--prompt", prompt);
+  if (runtime) args.push("--runtime", runtime);
+  return (
+    "/bin/sh -c " +
+    shellQuote(
+      ttResolver(
+        `printf 'The tt agent CLI is not installed on this server. Install it from the tailterm hub build and retry.\\n' >&2; exit 127`,
+      ) + `exec "$tailterm_tt" ${args.map(shellQuote).join(" ")}`,
+    )
+  );
+}
+export function agentRuntimesCommand() {
+  return (
+    "/bin/sh -c " +
+    shellQuote(
+      ttResolver(`printf '{"missing":true}'; exit 0`) +
+        `exec "$tailterm_tt" runtimes --json`,
+    )
+  );
+}

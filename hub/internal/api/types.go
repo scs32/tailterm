@@ -223,8 +223,9 @@ type PostEventRequest struct {
 }
 
 type TaskDetail struct {
-	Task   Task    `json:"task"`
-	Agents []Agent `json:"agents"`
+	Task      Task    `json:"task"`
+	Agents    []Agent `json:"agents"`
+	LatestSeq int64   `json:"latestSeq"`
 }
 
 type TaskList struct {

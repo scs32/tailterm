@@ -1,6 +1,8 @@
 import { credentialCache } from "./credential-cache.js";
 import { createAttentionSound } from "./attention-sound.js";
 import { createRenderer, webglSupported } from "./renderer.js";
+import { createTaskHub } from "./task-hub.js";
+import { normalizeTaskRef } from "./task-ref.js";
 import { createInactivityLock, IDLE_MINUTES } from "./inactivity.js";
 import { createAppearancePreview } from "./appearance-preview.js";
 import { normalizeTabDecoration, showTabDecoration } from "./tab-decoration.js";
@@ -106,6 +108,7 @@ for (const event of ["pointerdown", "keydown"])
     { capture: true },
   );
 let paneGroups;
+let taskHub = null;
 let discoveryPending = false;
 applyChrome(appearance);
 setupTooltips();
@@ -191,6 +194,7 @@ async function flushWorkspace() {
       paneGroups.model.groups,
       active,
       serverFilter,
+      taskHub?.bound() || [],
     ),
     serialized = JSON.stringify(snapshot);
   if (serialized === savedWorkspace) return;
@@ -207,17 +211,22 @@ async function restoreWorkspace(value) {
       for (const item of snapshot.tabs) {
         const server = data.servers.find((s) => s.id === item.serverId);
         if (!server || endpointKey(server) !== item.endpoint) continue;
+        const bookmark = data.sessions.find(
+          (b) => b.serverId === server.id && b.name === item.session,
+        );
         const t = await connect(server, item.tmux, item.session, {
           restoreId: item.id,
           resumeOnly: item.tmux,
           target: item.target,
           decoration: item.decoration,
           fontSize: item.fontSize,
+          task: item.task || bookmark?.task,
         });
         if (t) await t.initialReady;
       }
       paneGroups.model.groups = snapshot.groups;
       paneGroups.sync();
+      taskHub?.restore(snapshot.tasks);
       activate(
         tabs.some((t) => t.id === snapshot.active)
           ? snapshot.active
@@ -457,6 +466,54 @@ function mount() {
       );
   };
   $(".terminal-footer > div").prepend(download);
+  if (staticMode)
+    taskHub = createTaskHub({
+      getIPN: () => (netState === "Running" ? ipn : null),
+      getData: () => data,
+      reloadData: async () => {
+        data = await api("/data");
+        render();
+      },
+      api,
+      getTabs: () => tabs,
+      getServers: () => data.servers,
+      currentTab,
+      currentServer,
+      connect,
+      closeTab,
+      activate,
+      paneGroups: () => paneGroups,
+      dialog,
+      closeDialog,
+      notice,
+      browserCommand: (server, command, maxOutput) => {
+        if (
+          endpointKey(server) !==
+          endpointKey(data.servers.find((s) => s.id === server.id) || {})
+        )
+          throw new Error("Server profile changed. Reopen the dialog.");
+        return browserTransport.browserCommand(
+          ipn,
+          server,
+          peers,
+          command,
+          maxOutput,
+        );
+      },
+      render,
+      scheduleWorkspaceSave,
+      bookmark: (t) =>
+        api("/sessions", "POST", {
+          serverId: t.server.id,
+          name: t.session,
+          target: t.target,
+          task: t.task || null,
+        })
+          .then((updated) => {
+            data.sessions = updated.sessions;
+          })
+          .catch(() => {}),
+    });
   if (staticMode) void restoreWorkspace(previousWorkspace);
   if (staticMode)
     imageUploads = setupImageDrops({
@@ -570,6 +627,7 @@ function currentTab() {
 function render() {
   renderSidebar();
   renderLauncher();
+  taskHub?.sync();
   $("#key-count").textContent = data.keys.length;
   renderTabs();
   renderRemote();
@@ -663,10 +721,15 @@ function renderTabs() {
       ]
         .filter(Boolean)
         .join(" ");
-      const title = grouped
-        ? `${groupName}\n${ids.length} panes: ${names.join(", ")}\nFocused: ${tabName(t)} · ${t.status}\nDrag onto another tab to merge groups. × closes the focused pane.`
-        : `${tabName(t, true)}\n${t.server.username}@${t.server.host}:${t.server.port}\n${t.status}${t.tmux ? " · tmux launch: " + t.session + (t.tmuxVerified ? "" : " (unverified)") : ""}\nDrop at a tab edge to reorder; drop in its center to group.`;
-      return `<div class="tab ${ids.includes(active) ? "active" : ""} ${grouped ? "group-tab" : ""} ${newOutput ? "has-new-output" : ""}" data-tab-color="${decoration.color}" data-tab-fill="${decoration.fill}" style='--tab-font:${esc(fonts[decoration.font]?.family || "var(--terminal-font)")}' draggable="false"><button data-tab="${t.id}" role="tab" aria-selected="${ids.includes(active)}" title="${esc(activities.length ? title + "\n" + [...new Set(activities)].join(", ") : title)}"><span class="node-dot ${t.status === "Connected" ? "online" : ""}"></span><span class="tab-copy"><span class="tab-name">${esc(grouped ? groupName : tabName(t, true))}</span></span></button>${staticMode ? `<button data-session-menu="${t.id}" aria-label="Session actions for ${esc(t.session)}" title="Session actions and tab order">...</button>` : ""}<button data-close="${t.id}" aria-label="Close ${esc(t.server.name)} ${grouped ? "focused pane" : "terminal"}">×</button></div>`;
+      const taskLine = group?.taskId
+        ? `\n${taskHub?.rollup(group.taskId) || "Task " + group.taskId}`
+        : "";
+      const title =
+        (grouped
+          ? `${groupName}\n${ids.length} panes: ${names.join(", ")}\nFocused: ${tabName(t)} · ${t.status}\nDrag onto another tab to merge groups. × closes the focused pane.`
+          : `${tabName(t, true)}\n${t.server.username}@${t.server.host}:${t.server.port}\n${t.status}${t.tmux ? " · tmux launch: " + t.session + (t.tmuxVerified ? "" : " (unverified)") : ""}\nDrop at a tab edge to reorder; drop in its center to group.`) +
+        taskLine;
+      return `<div class="tab ${ids.includes(active) ? "active" : ""} ${grouped ? "group-tab" : ""} ${newOutput ? "has-new-output" : ""} ${group?.taskId ? "task-tab" : ""}" data-tab-color="${decoration.color}" data-tab-fill="${decoration.fill}" style='--tab-font:${esc(fonts[decoration.font]?.family || "var(--terminal-font)")}' draggable="false"><button data-tab="${t.id}" role="tab" aria-selected="${ids.includes(active)}" title="${esc(activities.length ? title + "\n" + [...new Set(activities)].join(", ") : title)}"><span class="node-dot ${t.status === "Connected" ? "online" : ""}"></span><span class="tab-copy"><span class="tab-name">${esc(grouped ? groupName : tabName(t, true))}</span></span></button>${staticMode ? `<button data-session-menu="${t.id}" aria-label="Session actions for ${esc(t.session)}" title="Session actions and tab order">...</button>` : ""}<button data-close="${t.id}" aria-label="Close ${esc(t.server.name)} ${grouped ? "focused pane" : "terminal"}">×</button></div>`;
     })
     .join("");
   $$("[data-tab]").forEach((b) => (b.onclick = () => activate(b.dataset.tab)));
@@ -1123,6 +1186,7 @@ async function verifyTmux(t) {
         serverId: t.server.id,
         name: t.session,
         target: t.target,
+        task: t.task || null,
       });
       data.sessions = updated.sessions;
       if (updated.backup) data.backup = updated.backup;
@@ -1356,6 +1420,7 @@ async function connect(
       session,
       resumeOnly: !!options.resumeOnly,
       target: options.target,
+      task: normalizeTaskRef(options.task) || undefined,
       wasConnected: false,
       retryCount: 0,
       lastError: "",
@@ -1975,6 +2040,7 @@ async function startTailscale() {
     ipn.run({
       notifyState: (s) => {
         netState = s;
+        if (s === "Running") taskHub?.refresh();
         $("#tail-dot").classList.toggle("online", s === "Running");
         $("#tail-status").textContent =
           s === "Running"
@@ -2076,6 +2142,7 @@ async function lock() {
   locking = true;
   credentialCache.clear();
   reconnects.clear();
+  taskHub?.stopAll();
   imageUploads?.cancel();
   voiceDictation?.cancel();
   tabs.forEach((t) => t.close?.());
@@ -2363,6 +2430,7 @@ function openCommands() {
   });
   commands.push({ label: "New session", run: () => $("#new-tab").click() });
   commands.push({ label: "Manage terminal groups", run: groupDialog });
+  if (taskHub) commands.push(...taskHub.commands());
   const server = currentServer();
   if (server)
     commands.push({

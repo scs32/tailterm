@@ -30,6 +30,13 @@ func init() {
 			}),
 			"login": js.FuncOf(func(_ js.Value, _ []js.Value) any { return nil }),
 			"ssh":   js.FuncOf(func(_ js.Value, a []js.Value) any { return ipn.ssh(a[0].String(), a[1].String(), a[2]) }),
+			"fetch": js.FuncOf(func(_ js.Value, a []js.Value) any {
+				init := js.Undefined()
+				if len(a) > 1 {
+					init = a[1]
+				}
+				return ipn.fetch(a[0].String(), init)
+			}),
 		}
 	}
 }

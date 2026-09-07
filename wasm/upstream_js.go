@@ -15,12 +15,14 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"math/rand/v2"
 	"net"
 	"net/http"
 	"net/netip"
 	"strings"
+	"sync"
 	"syscall/js"
 	"time"
 
@@ -221,13 +223,15 @@ func newIPN(jsConfig js.Value) map[string]any {
 				args[2])
 		}),
 		"fetch": js.FuncOf(func(this js.Value, args []js.Value) any {
-			if len(args) != 1 {
-				log.Printf("Usage: fetch(url)")
+			if len(args) < 1 || len(args) > 2 {
+				log.Printf("Usage: fetch(url[, init])")
 				return nil
 			}
-
-			url := args[0].String()
-			return jsIPN.fetch(url)
+			init := js.Undefined()
+			if len(args) == 2 {
+				init = args[1]
+			}
+			return jsIPN.fetch(args[0].String(), init)
 		}),
 	}
 }
@@ -239,6 +243,9 @@ type jsIPN struct {
 	controlURL string
 	authKey    string
 	hostname   string
+
+	httpOnce      sync.Once
+	httpTransport *http.Transport
 }
 
 var jsIPNState = map[ipn.State]string{
@@ -425,32 +432,85 @@ func (s *jsSSHSession) Resize(rows, cols int) error {
 	return s.session.WindowChange(rows, cols)
 }
 
-func (i *jsIPN) fetch(url string) js.Value {
-	return makePromise(func() (any, error) {
-		c := &http.Client{
-			Transport: &http.Transport{
-				DialContext: i.dialer.UserDial,
-			},
+// fetch performs an HTTP request over the tailnet. init mirrors a subset of the
+// browser Request init: {method, headers: {name: value}, body: string,
+// timeoutMs}. The response exposes status, statusText, headers, and text().
+func (i *jsIPN) fetch(url string, init js.Value) js.Value {
+	method, body, timeout := "GET", "", 30*time.Second
+	headers := map[string]string{}
+	if init.Type() == js.TypeObject {
+		if v := init.Get("method"); v.Type() == js.TypeString && v.String() != "" {
+			method = strings.ToUpper(v.String())
 		}
-		res, err := c.Get(url)
+		if v := init.Get("body"); v.Type() == js.TypeString {
+			body = v.String()
+		}
+		if v := init.Get("timeoutMs"); v.Type() == js.TypeNumber && v.Int() > 0 {
+			timeout = time.Duration(v.Int()) * time.Millisecond
+			if timeout > 60*time.Second {
+				timeout = 60 * time.Second
+			}
+		}
+		if h := init.Get("headers"); h.Type() == js.TypeObject {
+			keys := js.Global().Get("Object").Call("keys", h)
+			for n := 0; n < keys.Length(); n++ {
+				k := keys.Index(n).String()
+				headers[k] = h.Get(k).String()
+			}
+		}
+	}
+	i.httpOnce.Do(func() {
+		i.httpTransport = &http.Transport{
+			MaxIdleConnsPerHost: 4,
+			IdleConnTimeout:     90 * time.Second,
+		}
+		// With a dialer the request travels over the tailnet through Go's own
+		// HTTP stack. The test fixture has none and uses the browser's fetch.
+		if i.dialer != nil {
+			i.httpTransport.DialContext = i.dialer.UserDial
+		}
+	})
+	return makePromise(func() (any, error) {
+		ctx, cancel := context.WithTimeout(context.Background(), timeout)
+		req, err := http.NewRequestWithContext(ctx, method, url, strings.NewReader(body))
 		if err != nil {
+			cancel()
 			return nil, err
 		}
-
+		for k, v := range headers {
+			req.Header.Set(k, v)
+		}
+		c := &http.Client{Transport: i.httpTransport}
+		res, err := c.Do(req)
+		if err != nil {
+			cancel()
+			return nil, err
+		}
+		responseHeaders := map[string]any{}
+		for k, v := range res.Header {
+			if len(v) > 0 {
+				responseHeaders[strings.ToLower(k)] = v[0]
+			}
+		}
+		var readOnce sync.Once
 		return map[string]any{
 			"status":     res.StatusCode,
 			"statusText": res.Status,
+			"headers":    responseHeaders,
 			"text": js.FuncOf(func(this js.Value, args []js.Value) any {
 				return makePromise(func() (any, error) {
-					defer res.Body.Close()
-					buf := new(bytes.Buffer)
-					if _, err := buf.ReadFrom(res.Body); err != nil {
-						return nil, err
-					}
-					return buf.String(), nil
+					var out string
+					var readErr error
+					readOnce.Do(func() {
+						defer cancel()
+						defer res.Body.Close()
+						buf := new(bytes.Buffer)
+						_, readErr = buf.ReadFrom(io.LimitReader(res.Body, 8<<20))
+						out = buf.String()
+					})
+					return out, readErr
 				})
 			}),
-			// TODO: populate a more complete JS Response object
 		}, nil
 	})
 }

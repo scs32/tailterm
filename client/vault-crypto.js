@@ -100,6 +100,7 @@ export function portableData(data) {
     servers: structuredClone(data.servers),
     keys: structuredClone(data.keys),
     sessions: structuredClone(data.sessions),
+    hub: { url: data.hub?.url || "" },
     tailscale: {},
   };
 }

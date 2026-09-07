@@ -29,6 +29,9 @@ import { assertTerminalBounds } from "./terminal-bounds.mjs";
 import { exerciseVaultReset } from "./vault-reset-browser.mjs";
 import { openVault } from "../client/vault-crypto.js";
 import { attachSFTP } from "./sftp-fixture.mjs";
+import { createFixtureHub } from "./fixture-hub.mjs";
+import { exerciseTasks } from "./tasks-browser.mjs";
+const fixtureHub = createFixtureHub();
 import { exerciseImageUpload } from "./upload-browser.mjs";
 import { finishRestoration } from "./restore-browser.mjs";
 import { exerciseWorkspaceContinuity } from "./workspace-browser.mjs";
@@ -121,6 +124,39 @@ const ssh = new ssh2.Server(
             accepted.end();
             return;
           }
+          // The tt invocation is single-quoted inside the outer sh -c quote;
+          // undo that layer before reading its arguments.
+          const ttCommand = info.command.replace(/'\\''/g, "'");
+          if (ttCommand.includes(`"$tailterm_tt" 'spawn' '--json'`)) {
+            const arg = (flag) =>
+              ttCommand.match(new RegExp(`'${flag}' '([^']*)'`))?.[1];
+            const task = fixtureHub.api
+              .tasks()
+              .find((t) => t.id === arg("--task"));
+            if (!task) {
+              accepted.stderr.write("unknown task");
+              accepted.exit(1);
+              accepted.end();
+              return;
+            }
+            const agent = fixtureHub.api.addAgent(task.id, {
+              name: arg("--name"),
+              session: arg("--name"),
+              runtime: arg("--runtime") || "claude",
+              cwd: arg("--cwd") || "",
+            });
+            sessions.add(agent.session);
+            accepted.write(JSON.stringify(agent) + "\n");
+            accepted.exit(0);
+            accepted.end();
+            return;
+          }
+          if (info.command.includes("runtimes --json")) {
+            accepted.write('{"host":"production","runtimes":["claude"]}\n');
+            accepted.exit(0);
+            accepted.end();
+            return;
+          }
           if (info.command.includes("pane_current_path")) {
             accepted.write(
               Buffer.from("/tmp/fixture uploads\n").toString("base64") + "\n",
@@ -168,7 +204,9 @@ const ssh = new ssh2.Server(
             accepted.exit(0);
             accepted.end();
           } else {
-            const name = info.command.match(/tt-[a-f0-9]{16}|named-static/);
+            const name = info.command.match(
+              /tt-[a-f0-9]{16}|named-static|planner|tester/,
+            );
             if (name) sessions.add(name[0]);
             terminal(accepted);
           }
@@ -198,6 +236,8 @@ const http = createServer(async (req, res) => {
   requests.push(req.url);
   try {
     const url = new URL(req.url, "http://localhost");
+    if (url.pathname.startsWith("/fixture-hub/"))
+      return fixtureHub.handle(req, res, url);
     const name = url.pathname === "/" ? "/index.html" : url.pathname;
     const root = path.resolve("dist-static");
     const file = path.resolve(root, "." + name);
@@ -590,6 +630,7 @@ try {
   await exerciseLocalHistory(page, () => input);
   await exerciseWorkspaceActions(page, stream);
   await exerciseWorkspaceContinuity(page, context, () => terminalStarts);
+  await exerciseTasks(page, fixtureHub, origin);
   console.log(
     "Uploads, reconnect, reordering and workspace restoration passed.",
   );

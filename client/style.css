@@ -3499,3 +3499,118 @@ body:has(#workspace) {
   visibility: hidden;
   pointer-events: none;
 }
+
+/* Tasks: a tab that mirrors a hub task, and the task board dialog. */
+#tabs .tab.task-tab > button[role="tab"] .tab-name::before {
+  content: "◆ ";
+  color: var(--accent);
+  font-size: 9px;
+  vertical-align: 1px;
+}
+.status-dot.attention {
+  background: var(--accent);
+  box-shadow: 0 0 8px color-mix(in srgb, var(--accent) 40%, transparent);
+}
+.status-dot.done {
+  background: color-mix(in srgb, var(--accent) 55%, var(--muted));
+}
+.board {
+  display: grid;
+  grid-template-columns: minmax(150px, 190px) minmax(0, 1fr);
+  gap: 12px;
+  min-height: 300px;
+}
+.board-agents {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  border-right: 1px solid color-mix(in srgb, var(--muted) 25%, transparent);
+  padding-right: 12px;
+}
+.board-agents .eyebrow {
+  margin-bottom: 4px;
+}
+.board-agent {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  text-align: left;
+  padding: 6px 8px;
+  font-family: var(--terminal-font);
+  font-size: 12px;
+}
+.board-agent .fine {
+  margin-left: auto;
+  margin-top: 0;
+}
+.board-thread {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+.board-messages {
+  flex: 1;
+  min-height: 200px;
+  max-height: min(50vh, 420px);
+  overflow: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  font-family: var(--terminal-font);
+  font-size: 12px;
+}
+.board-message {
+  padding: 6px 0;
+  border-bottom: 1px solid color-mix(in srgb, var(--muted) 18%, transparent);
+}
+.board-meta {
+  display: block;
+  color: var(--muted);
+  font-size: 10px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  margin-bottom: 2px;
+}
+.board-text {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+#board-compose {
+  display: grid;
+  grid-template-columns: minmax(110px, 150px) minmax(0, 1fr) auto;
+  gap: 6px;
+  align-items: end;
+  margin-top: 10px;
+}
+#board-compose textarea {
+  width: 100%;
+  resize: vertical;
+  min-height: 38px;
+}
+label.check {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+}
+label.check input {
+  width: auto;
+}
+.dialog-menu button .fine {
+  display: block;
+  margin-top: 2px;
+}
+@media (max-width: 640px) {
+  .board {
+    grid-template-columns: 1fr;
+  }
+  .board-agents {
+    border-right: 0;
+    padding-right: 0;
+    border-bottom: 1px solid color-mix(in srgb, var(--muted) 25%, transparent);
+    padding-bottom: 8px;
+  }
+  #board-compose {
+    grid-template-columns: 1fr;
+  }
+}

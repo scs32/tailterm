@@ -1,4 +1,5 @@
 import { normalizeTabDecoration } from "./tab-decoration.js";
+import { normalizeTaskRef, normalizeTaskId } from "./task-ref.js";
 export const normalizeSessionFontSize = (value) =>
   Number.isInteger(value) && value >= 10 && value <= 32 ? value : undefined;
 export const endpointKey = (server) =>
@@ -11,8 +12,18 @@ export const endpointKey = (server) =>
 export const sameTarget = (a, b) =>
   !!a && !!b && a.id === b.id && String(a.created) === String(b.created);
 
-export function workspaceSnapshot(tabs, groups, active, serverFilter = null) {
+export function workspaceSnapshot(
+  tabs,
+  groups,
+  active,
+  serverFilter = null,
+  tasks = [],
+) {
   return {
+    tasks: [...new Set(tasks.map(normalizeTaskId).filter(Boolean))].slice(
+      0,
+      30,
+    ),
     tabs: tabs
       .filter((t) => !t.disposed && t.wasConnected !== false)
       .map((t) => ({
@@ -24,6 +35,7 @@ export function workspaceSnapshot(tabs, groups, active, serverFilter = null) {
         target: t.target,
         decoration: normalizeTabDecoration(t.decoration),
         fontSize: normalizeSessionFontSize(t.fontSize),
+        task: normalizeTaskRef(t.task) || undefined,
       })),
     serverFilter: serverFilter === null ? null : [...serverFilter],
     groups: structuredClone(groups),
@@ -53,6 +65,7 @@ export function normalizeWorkspace(value) {
       decoration: normalizeTabDecoration(t.decoration),
       fontSize: normalizeSessionFontSize(t.fontSize),
       session: t.tmux ? t.session : "",
+      task: normalizeTaskRef(t.task) || undefined,
       target:
         /^\$\d+$/.test(t.target?.id) && /^\d+$/.test(String(t.target?.created))
           ? { id: t.target.id, created: String(t.target.created) }
@@ -86,6 +99,7 @@ export function normalizeWorkspace(value) {
       tree: tree(g?.tree),
       active: ids.has(g?.active) ? g.active : null,
       decoration: normalizeTabDecoration(g?.decoration),
+      taskId: normalizeTaskId(g?.taskId),
     }))
     .filter((g) => g.tree);
   return {
@@ -100,6 +114,13 @@ export function normalizeWorkspace(value) {
         ].slice(0, 200)
       : null,
     groups,
+    tasks: [
+      ...new Set(
+        (Array.isArray(value.tasks) ? value.tasks : [])
+          .map(normalizeTaskId)
+          .filter(Boolean),
+      ),
+    ].slice(0, 30),
     active: ids.has(value.active) ? value.active : tabs[0]?.id,
   };
 }

@@ -34,7 +34,11 @@ export function setupPaneGroups({
     layout,
     signature = "",
     resizing = false;
-  const sync = () => model.sync(getTabs().map((t) => t.id));
+  const sync = () =>
+    model.sync(
+      getTabs().map((t) => t.id),
+      (id) => getTabs().find((t) => t.id === id)?.task?.taskId,
+    );
   const members = (id) => {
     const g = model.group(id);
     return g

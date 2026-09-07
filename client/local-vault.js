@@ -1,4 +1,6 @@
 import { credentialCache } from "./credential-cache.js";
+import { normalizeHubURL } from "./hub-client.js";
+import { normalizeTaskRef, normalizeRuntimes } from "./task-ref.js";
 import {
   deriveVaultKey,
   openVault,
@@ -18,7 +20,13 @@ let database,
   salt,
   releaseLock,
   queue = Promise.resolve();
-const empty = () => ({ servers: [], keys: [], sessions: [], tailscale: {} });
+const empty = () => ({
+  servers: [],
+  keys: [],
+  sessions: [],
+  tailscale: {},
+  hub: { url: "" },
+});
 async function db() {
   if (database) return database;
   if (!crypto.subtle || !navigator.locks)
@@ -137,6 +145,7 @@ export function localData() {
     })),
     sessions: structuredClone(contents.sessions),
     workspace: normalizeWorkspace(contents.workspace),
+    hub: { url: contents.hub?.url || "" },
     backup: {
       changed: contents.backupChanged || null,
       exported: contents.backupExported || null,
@@ -265,6 +274,7 @@ export async function localAPI(url, method = "GET", body = {}) {
         tmuxPath: body.tmuxPath || "",
         fingerprint: body.fingerprint || "",
         keyId: body.keyId || "",
+        runtimes: normalizeRuntimes(body.runtimes),
       };
       if (
         previous?.password &&
@@ -354,11 +364,27 @@ export async function localAPI(url, method = "GET", body = {}) {
         d.sessions.push(session);
       }
       session.lastConnected = new Date().toISOString();
+      if (body.task !== undefined) {
+        const task = normalizeTaskRef(body.task);
+        if (JSON.stringify(session.task || null) !== JSON.stringify(task))
+          d.backupChanged = new Date().toISOString();
+        if (task) session.task = task;
+        else delete session.task;
+      }
       if (body.target) {
         if (JSON.stringify(session.target) !== JSON.stringify(body.target))
           d.backupChanged = new Date().toISOString();
         session.target = structuredClone(body.target);
       }
+    });
+  if (url === "/hub" && method === "POST")
+    return editVault((d) => {
+      const value = String(body?.url || "").trim();
+      if (value && !normalizeHubURL(value))
+        throw new Error(
+          "Hub URL must look like http://tailterm-hub or http://host:port.",
+        );
+      d.hub = { url: value ? normalizeHubURL(value) : "" };
     });
   if (url.startsWith("/sessions/") && method === "DELETE")
     return editVault((d) => {
@@ -442,6 +468,12 @@ function validateData(d) {
     validateSession(s.name);
     if (!d.servers.some((x) => x.id === s.serverId))
       throw new Error("Invalid session bookmark.");
+    const task = normalizeTaskRef(s.task);
+    if (task) s.task = task;
+    else delete s.task;
   }
+  for (const s of d.servers) s.runtimes = normalizeRuntimes(s.runtimes);
   d.tailscale = d.tailscale || {};
+  const hubURL = normalizeHubURL(d.hub?.url || "");
+  d.hub = { url: hubURL || "" };
 }

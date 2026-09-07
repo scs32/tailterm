@@ -48,7 +48,9 @@ export class PaneGroups {
   group(tab) {
     return this.groups.find((g) => leaves(g.tree).includes(tab));
   }
-  sync(ids) {
+  // taskOf(tabId) supplies the task a newly grouped tab belongs to, so a
+  // singleton group created for an agent pane inherits its task binding.
+  sync(ids, taskOf = () => undefined) {
     const valid = new Set(ids);
     this.groups = this.groups.flatMap((g) => {
       const tree = prune(g.tree, valid);
@@ -63,7 +65,16 @@ export class PaneGroups {
       ];
     });
     for (const id of ids)
-      if (!this.group(id)) this.groups.push({ tree: { tab: id }, active: id });
+      if (!this.group(id)) {
+        const group = { tree: { tab: id }, active: id };
+        const taskId = taskOf(id);
+        if (taskId && !this.groups.some((g) => g.taskId === taskId))
+          group.taskId = taskId;
+        this.groups.push(group);
+      }
+  }
+  taskGroup(taskId) {
+    return this.groups.find((g) => g.taskId === taskId);
   }
   merge(source, target, { whole = true, axis = "x" } = {}) {
     const from = this.group(source),

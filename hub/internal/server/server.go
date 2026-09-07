@@ -188,7 +188,12 @@ func (s *Server) getTask(w http.ResponseWriter, r *http.Request) {
 		fail(w, err)
 		return
 	}
-	writeJSON(w, 200, api.TaskDetail{Task: t, Agents: agents})
+	latest, err := s.store.LatestSeq(r.Context(), id)
+	if err != nil {
+		fail(w, err)
+		return
+	}
+	writeJSON(w, 200, api.TaskDetail{Task: t, Agents: agents, LatestSeq: latest})
 }
 
 func (s *Server) updateTask(w http.ResponseWriter, r *http.Request) {
