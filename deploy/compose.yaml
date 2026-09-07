@@ -1,0 +1,23 @@
+# Docker Compose / TrueNAS Custom App definition for the tailterm stack.
+# The hub joins the tailnet as its own node; it publishes no host port.
+services:
+  hub:
+    image: tailterm-hub:latest
+    build: ../hub
+    restart: unless-stopped
+    environment:
+      TS_AUTHKEY: ${TS_AUTHKEY}
+      TS_HOSTNAME: ${TS_HOSTNAME:-tailterm-hub}
+      TAILTERM_STATE: /state
+    volumes:
+      - hub-state:/state
+  tailterm:
+    image: tailterm-static:latest
+    build:
+      context: ..
+      dockerfile: Dockerfile.static
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:4318:80"
+volumes:
+  hub-state:

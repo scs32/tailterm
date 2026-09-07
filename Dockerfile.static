@@ -1,0 +1,25 @@
+# syntax=docker/dockerfile:1
+# Static tailterm client: Tailscale WASM build, Vite static bundle, served by Caddy.
+FROM golang:1.26-bookworm AS wasm
+WORKDIR /app
+COPY scripts/build-wasm.sh scripts/build-wasm.sh
+COPY wasm wasm
+RUN ./scripts/build-wasm.sh
+
+FROM node:24-bookworm-slim AS web
+WORKDIR /app
+COPY package*.json ./
+RUN npm ci
+COPY . .
+COPY --from=wasm /app/wasm/tailserve.wasm wasm/tailserve.wasm
+COPY --from=wasm /app/wasm/wasm_exec.js wasm/wasm_exec.js
+COPY --from=wasm /app/wasm/LICENSE.go wasm/LICENSE.go
+COPY --from=wasm /app/.build/go-modules.txt .build/go-modules.txt
+ARG TAILTERM_SOURCE_COMMIT=unknown
+ENV TAILTERM_SOURCE_COMMIT=$TAILTERM_SOURCE_COMMIT
+RUN npm run build:static
+
+FROM caddy:2-alpine
+COPY deploy/Caddyfile.container /etc/caddy/Caddyfile
+COPY --from=web /app/dist-static /srv
+EXPOSE 80

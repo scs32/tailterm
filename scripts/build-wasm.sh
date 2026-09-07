@@ -7,7 +7,11 @@ source="$root/.build/tailscale-1.102.3"
 if [ ! -d "$source" ]; then
   mkdir -p .build
   curl -fL https://codeload.github.com/tailscale/tailscale/tar.gz/refs/tags/v1.102.3 -o .build/tailscale.tar.gz
-  printf '%s  %s\n' 0e94d961c31ce7d33e8b7ce4ac6fdbec83ee5658784eed69eb7fce300729d717 .build/tailscale.tar.gz | shasum -a 256 -c -
+  if command -v shasum >/dev/null 2>&1; then
+    printf '%s  %s\n' 0e94d961c31ce7d33e8b7ce4ac6fdbec83ee5658784eed69eb7fce300729d717 .build/tailscale.tar.gz | shasum -a 256 -c -
+  else
+    printf '%s  %s\n' 0e94d961c31ce7d33e8b7ce4ac6fdbec83ee5658784eed69eb7fce300729d717 .build/tailscale.tar.gz | sha256sum -c -
+  fi
   tar -xzf .build/tailscale.tar.gz -C .build
 fi
 cp wasm/upstream_js.go "$source/cmd/tsconnect/wasm/wasm_js.go"

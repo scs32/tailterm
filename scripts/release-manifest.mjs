@@ -4,6 +4,19 @@ import { createHash } from "node:crypto";
 const repository = new URL("../", import.meta.url);
 const git = (...args) =>
   execFileSync("git", args, { cwd: repository, encoding: "utf8" }).trim();
+// Container builds have no .git directory; the build passes the commit in.
+function sourceCommit() {
+  if (process.env.TAILTERM_SOURCE_COMMIT)
+    return { commit: process.env.TAILTERM_SOURCE_COMMIT, dirty: false };
+  try {
+    return {
+      commit: git("rev-parse", "HEAD"),
+      dirty: !!git("status", "--porcelain", "--untracked-files=normal"),
+    };
+  } catch {
+    return { commit: "unknown", dirty: true };
+  }
+}
 export const sha256 = (bytes) =>
   createHash("sha256").update(bytes).digest("hex");
 export async function assetInventory(root, prefix = "") {
@@ -29,8 +42,7 @@ export async function writeReleaseManifest(root) {
   const manifest = {
     schema: 1,
     source: "https://github.com/scs32/tailterm",
-    commit: git("rev-parse", "HEAD"),
-    dirty: !!git("status", "--porcelain", "--untracked-files=normal"),
+    ...sourceCommit(),
     builtAt: new Date().toISOString(),
     node: process.version,
     packageLockSha256: sha256(lock),

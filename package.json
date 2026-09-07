@@ -18,7 +18,11 @@
     "export:vault": "node scripts/export-server-vault.mjs",
     "test:links": "node tests/terminal-links-browser.mjs",
     "test:context-menu": "node tests/terminal-context-menu-browser.mjs",
-    "test:tmux-menu": "node tests/tmux-menu-browser.mjs"
+    "test:tmux-menu": "node tests/tmux-menu-browser.mjs",
+    "build:hub": "cd hub && CGO_ENABLED=0 go build -trimpath -ldflags='-s -w' -o ../.build/ttbin/ ./cmd/...",
+    "test:hub": "cd hub && go vet ./... && go test ./...",
+    "container:up": "./scripts/container-dev.sh up",
+    "container:down": "./scripts/container-dev.sh down"
   },
   "dependencies": {
     "@fontsource/fira-code": "^5.3.0",

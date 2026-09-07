@@ -20,3 +20,16 @@ jobs:
           cache: npm
       - run: npm ci
       - run: npm test
+  hub:
+    name: Hub and tt tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version-file: hub/go.mod
+          cache-dependency-path: hub/go.sum
+      - run: cd hub && go vet ./... && go test ./...
