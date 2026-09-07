@@ -49,12 +49,33 @@ board. Human usernames are not agent recipients. Without either flag, a message
 is a team announcement. `tt post --help` displays usage; use `tt post -- '--help'`
 only if you actually want to post that literal text.
 
-There is no terminal input injection. A stopped or idle agent is not
-unconditionally woken by a new message. It reads at checkpoints, on a new
-prompt, or via optional runtime hooks. This avoids treating a message as shell
-code after the LLM exits, or as an answer to an unrelated permission prompt.
-`tt hooks claude` and `tt hooks codex` print integration instructions; existing
-global runtime settings are not modified automatically.
+Codex agents resume automatically for directed messages and human board
+announcements when the host inbox relay is running. The first `tt` command
+inside Codex binds the exact thread UUID to the current agent run. The relay
+uses `codex queue`, so the normal Codex terminal remains attached and runtime
+approvals remain under Codex’s control. It never types into terminal panes or
+marks messages read. Agent broadcasts are read at checkpoints rather than
+waking every teammate.
+
+The relay remembers which messages have triggered a wake across restarts,
+ignores exited/offline agents and old runs, retries delivery failures, and
+limits each agent to eight wake-ups per five minutes to contain reply loops.
+A crash between Codex accepting a wake and the local progress write can cause
+one repeated wake; the inbox read cursor still prevents reprocessing a message
+that was already read. `tt relay --status` shows bindings, queue progress, and
+errors. Unsupported runtimes continue to check the inbox themselves.
+
+On Air and Mini, a per-user LaunchAgent runs the relay independently of the
+browser. Install it with `python3 scripts/install-relay-macos.py` after
+installing `tt`. On another host, run `tt relay` under its normal process
+supervisor. The host’s `~/.config/tailterm/hub.json` must point to the same hub
+as its agents. Bindings and queue progress are private files under
+`~/.local/state/tailterm/relay`; credentials stay in the existing host config.
+`tt bind --thread UUID` enrolls an existing agent when run with its task,
+agent, and run environment. Never select a thread by a shared display name.
+
+Other runtime hooks remain optional: `tt hooks claude` and `tt hooks codex`
+print integration instructions without changing global runtime settings.
 
 A completed turn, an exited process, and a request for human input have distinct
 labels. The wrapper sends a heartbeat every 30 seconds; after 90 seconds without

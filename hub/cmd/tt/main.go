@@ -28,6 +28,8 @@ Identity comes from the environment tailterm sets on agent sessions:
 
 Commands
   doctor                       check hub, tmux, and installed runtimes
+  relay [--status]             resume Codex agents for unread directed messages
+  bind [--thread UUID]        bind this agent to its exact Codex thread
   brief                        print the shared task briefing
   status                       identity, hub reachability, own agent, unread count
   tasks                        list tasks on the hub
@@ -100,8 +102,13 @@ func main() {
 	}
 	cmd, args := os.Args[1], os.Args[2:]
 	e := readEnv()
+	autoBindRuntime(e, cmd)
 	var err error
 	switch cmd {
+	case "relay":
+		err = cmdRelay(args)
+	case "bind":
+		err = cmdBind(e, args)
 	case "doctor":
 		err = cmdDoctor(e)
 	case "brief":
