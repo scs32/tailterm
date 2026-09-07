@@ -691,7 +691,7 @@ func cmdHook(e env, args []string) error {
 		fmt.Printf("You are agent %q (%s) on tailterm task %s. Other agents on this task can message you. "+
 			"Use `tt inbox --unread --mark-read` to read messages, `tt post --to agent \"text\"` to reply, "+
 			"`tt agents` to see teammates, `tt event needs_input --text \"...\"` to ask the humans, and "+
-			"`tt spawn --name N --run \"cmd\"` to add a sibling agent on this host.\n", e.agentName, e.agent, e.task)
+			"Check the task policy before adding helpers.\n", e.agentName, e.agent, e.task)
 		if n := unread(); n > 0 {
 			fmt.Printf("You have %d unread task message(s); read them first.\n", n)
 		}
@@ -733,6 +733,7 @@ func cmdNewTask(e env, args []string) error {
 	name := fs.String("name", "", "task name (required)")
 	goal := fs.String("goal", "", "task goal")
 	hub := fs.String("hub", e.hub, "hub URL")
+	allowSpawn := fs.Bool("allow-agent-spawn", false, "allow agents to add helpers")
 	asJSON := fs.Bool("json", false, "JSON output")
 	_ = fs.Parse(args)
 	if *name == "" {
@@ -746,7 +747,7 @@ func cmdNewTask(e env, args []string) error {
 	}
 	ctx, cancel := ctxTimeout(10 * time.Second)
 	defer cancel()
-	t, err := c.CreateTask(ctx, api.CreateTaskRequest{Name: *name, Goal: *goal})
+	t, err := c.CreateTask(ctx, api.CreateTaskRequest{Name: *name, Goal: *goal, AllowAgentSpawn: *allowSpawn})
 	if err != nil {
 		return err
 	}

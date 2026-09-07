@@ -136,13 +136,14 @@ var postableKinds = map[string]bool{
 func PostableKind(kind string) bool { return postableKinds[kind] }
 
 type Task struct {
-	ID        string     `json:"id"`
-	Name      string     `json:"name"`
-	Goal      string     `json:"goal"`
-	Status    string     `json:"status"`
-	CreatedAt time.Time  `json:"createdAt"`
-	CreatedBy Caller     `json:"createdBy"`
-	ClosedAt  *time.Time `json:"closedAt"`
+	AllowAgentSpawn bool       `json:"allowAgentSpawn"`
+	ID              string     `json:"id"`
+	Name            string     `json:"name"`
+	Goal            string     `json:"goal"`
+	Status          string     `json:"status"`
+	CreatedAt       time.Time  `json:"createdAt"`
+	CreatedBy       Caller     `json:"createdBy"`
+	ClosedAt        *time.Time `json:"closedAt"`
 }
 
 type Agent struct {
@@ -195,14 +196,16 @@ type Event struct {
 // Request and response bodies.
 
 type CreateTaskRequest struct {
-	Name string `json:"name"`
-	Goal string `json:"goal"`
+	AllowAgentSpawn bool   `json:"allowAgentSpawn"`
+	Name            string `json:"name"`
+	Goal            string `json:"goal"`
 }
 
 type UpdateTaskRequest struct {
-	Name   *string `json:"name"`
-	Goal   *string `json:"goal"`
-	Status *string `json:"status"`
+	AllowAgentSpawn *bool   `json:"allowAgentSpawn"`
+	Name            *string `json:"name"`
+	Goal            *string `json:"goal"`
+	Status          *string `json:"status"`
 }
 
 type AddAgentRequest struct {
@@ -269,8 +272,9 @@ type ErrorResponse struct {
 
 // Sentinel errors shared by store and server.
 var (
-	ErrNotFound = errors.New("not found")
-	ErrInvalid  = errors.New("invalid")
-	ErrLimit    = errors.New("limit reached")
-	ErrClosed   = errors.New("closed")
+	ErrNotFound           = errors.New("not found")
+	ErrInvalid            = errors.New("invalid")
+	ErrAgentSpawnDisabled = errors.New("agents cannot add agents to this task")
+	ErrLimit              = errors.New("limit reached")
+	ErrClosed             = errors.New("closed")
 )

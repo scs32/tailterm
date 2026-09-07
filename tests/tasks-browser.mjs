@@ -50,7 +50,7 @@ export async function exerciseTasks(page, hub, origin) {
   await page.locator("#task-name").fill("demo");
   await page.locator("#task-goal").fill("prove the mirror");
   await page.locator("#task-with-agent").check();
-  await page.locator("#task-attach").check();
+  await page.locator("#task-allow-spawn").check();
   await page.locator("#agent-name").fill("planner");
   await page.locator("#task-create").click();
   await waitFor(
@@ -69,8 +69,13 @@ export async function exerciseTasks(page, hub, origin) {
   const planner = hub.api.agents().find((a) => a.name === "planner");
   assert.ok(planner, "tt spawn registered the agent through the SSH fixture");
   await page.locator(".mode-switch [data-mode=terminals]").click();
-  await waitFor(async () => (await panes()) === before + 1, "planner pane");
+  await page.locator("#tabs .task-tab button[role=tab]").click();
+  await waitFor(async () => (await panes()) === 1, "planner pane");
   assert.equal(await page.locator("#tabs .tab.task-tab").count(), 1);
+  assert.equal(
+    await page.locator("#tabs .task-tab .tab-name").innerText(),
+    "demo",
+  );
   await waitFor(
     async () => /Task demo: 1 agent/.test(await taskTitle()),
     "task rollup in the tab tooltip",
@@ -81,8 +86,12 @@ export async function exerciseTasks(page, hub, origin) {
     name: "tester",
     session: "tester",
   });
-  await waitFor(async () => (await panes()) === before + 2, "tester pane");
+  await waitFor(async () => (await panes()) === 2, "tester pane");
   assert.equal(await page.locator("#tabs .tab.task-tab").count(), 1);
+  assert.equal(
+    await page.locator("#tabs .task-tab .tab-name").innerText(),
+    "demo",
+  );
 
   // Lifecycle events raise attention on the pane that is not focused.
   await page.locator(".terminal-instance:not([hidden])").first().click();
@@ -141,19 +150,18 @@ export async function exerciseTasks(page, hub, origin) {
       (await page.locator(".terminal-shell").getAttribute("hidden")) === null,
     "terminals mode",
   );
-  assert.equal(await panes(), before + 2);
+  assert.equal(await panes(), 2);
 
   // Closing an agent removes its pane; closing the task removes the rest.
   hub.api.event(task.id, "closed", tester.id);
-  await waitFor(
-    async () => (await panes()) === before + 1,
-    "tester pane closed",
-  );
+  await waitFor(async () => (await panes()) === 1, "tester pane closed");
   hub.api.closeTask(task.id);
-  await waitFor(async () => (await panes()) === before, "task panes closed");
+  await waitFor(
+    async () => (await page.locator("#tabs .tab.task-tab").count()) === 0,
+    "task panes closed",
+  );
 
-  // Detach through the palette leaves the tab without a task marker.
-  await palette("Task demo: detach from this tab");
+  // Closing the task removes its own group, preserving ordinary terminals.
   assert.equal(await page.locator("#tabs .tab.task-tab").count(), 0);
   // Group tabs show whichever member is focused, so restore by position.
   await page.locator("#tabs .tab button[role=tab]").nth(originalIndex).click();
@@ -168,6 +176,6 @@ export async function exerciseTasks(page, hub, origin) {
     "original tab reactivated",
   );
   console.log(
-    "Tasks passed: hub configuration, spawn over SSH, mirrored panes, attention labels, board, close and detach.",
+    "Tasks passed: dedicated task-named groups, automatic agent membership, hub configuration, spawn over SSH, attention, board, and close.",
   );
 }

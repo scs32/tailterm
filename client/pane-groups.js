@@ -34,11 +34,14 @@ export function setupPaneGroups({
     layout,
     signature = "",
     resizing = false;
-  const sync = () =>
+  const sync = () => {
+    const taskOf = (id) => getTabs().find((t) => t.id === id)?.task?.taskId;
     model.sync(
       getTabs().map((t) => t.id),
-      (id) => getTabs().find((t) => t.id === id)?.task?.taskId,
+      taskOf,
     );
+    model.isolateTasks(taskOf);
+  };
   const members = (id) => {
     const g = model.group(id);
     return g
@@ -135,6 +138,7 @@ export function setupPaneGroups({
     layout = geometry(group);
     const next = [
       grouped,
+      group?.taskId || "",
       ...ids,
       ...layout.dividers.map((d) => d.node.id),
     ].join("|");
@@ -178,7 +182,7 @@ export function setupPaneGroups({
           uploadButton.onclick = () => upload(id);
           header.append(uploadButton);
         }
-        if (grouped) header.append(detachButton);
+        if (grouped && !group.taskId) header.append(detachButton);
         header.append(closeButton);
         chrome.append(header);
       }

@@ -1,8 +1,9 @@
 # Tasks, Board and agent sessions
 
 A task holds a shared objective and a team across machines. The coordination
-hub owns task membership and message history. Tailterm groups are views into
-that team; hiding a pane does not remove the participant.
+hub owns task membership and message history. Each task has its own terminal group, named after the task. Agent panes are
+kept together, separate from ordinary sessions and other tasks. Hiding a pane
+does not remove the participant.
 
 The deployed hub is a TrueNAS custom app using the machine's existing private
 network address. It does not run or configure Tailscale. See
@@ -18,6 +19,11 @@ network address. It does not run or configure Tailscale. See
    **Start first agent now** and choose a server and runtime. Otherwise use
    **+ Agent** from the board when ready. If launch fails, retry uses the saved
    task; **Open created task** lets you continue without launching.
+   **Allow agents to add other agents** is off by default. You can change it
+   later under **Settings** on the Board or **More → Settings** in Tasks.
+   You can always add agents yourself. New helpers join the task’s group
+   automatically when their sessions start. **Terminals** on the board opens
+   that group; it never attaches the task to an unrelated tab.
 5. Use **Board** for announcements and targeted replies. **Needs you** lists
    agents reporting that they need input. Click an agent to reopen its pane.
 
@@ -26,6 +32,12 @@ Each new LLM agent receives the objective and instructions for communicating.
 New tmux sessions retain the task environment so agents can spawn local helpers
 with `tt spawn`. Remote launches use Tailterm's SSH connection; the hub itself
 does not run commands on agent hosts.
+
+The helper setting is checked by the hub on agent-originated `tt spawn`
+requests, including parent membership and the task’s agent limit. Turning it
+off leaves existing agents running. This is a coordination policy for the
+existing trusted, single-owner setup; the shared hub credential is not an
+isolation boundary against agents deliberately impersonating the owner.
 
 ## Messages and status
 

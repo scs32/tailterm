@@ -160,3 +160,40 @@ test("swapping grouped panes preserves geometry, identity and every connection",
   assert.equal(m.swap("a", "c"), true);
   assert.deepEqual(group, before);
 });
+
+test("task groups separate legacy mixed panes and gather newly spawned agents", () => {
+  const m = new PaneGroups();
+  m.sync(["shell", "planner", "other", "helper"]);
+  m.merge("planner", "shell");
+  m.merge("other", "shell");
+  m.group("shell").taskId = "review";
+  const owner = (id) =>
+    ({ planner: "review", helper: "review", other: "build" })[id];
+  m.isolateTasks(owner);
+  assert.deepEqual(leaves(m.taskGroup("review").tree).sort(), [
+    "helper",
+    "planner",
+  ]);
+  assert.deepEqual(leaves(m.taskGroup("build").tree), ["other"]);
+  assert.deepEqual(leaves(m.group("shell").tree), ["shell"]);
+  assert.equal(m.group("shell").taskId, undefined);
+  assert.equal(m.merge("shell", "planner"), false);
+  assert.equal(m.merge("other", "planner"), false);
+  assert.equal(m.detach("planner"), false);
+  m.sync(["shell", "planner", "other", "helper", "new"]);
+  const nextOwner = (id) => (id === "new" ? "review" : owner(id));
+  m.isolateTasks(nextOwner);
+  const saved = structuredClone(m.groups);
+  m.isolateTasks(nextOwner);
+  assert.deepEqual(
+    m.groups,
+    saved,
+    "sync must preserve layout and group identity",
+  );
+  assert.equal(m.groups.length, 3);
+  assert.deepEqual(leaves(m.taskGroup("review").tree).sort(), [
+    "helper",
+    "new",
+    "planner",
+  ]);
+});

@@ -43,11 +43,12 @@ export function createFixtureHub({
     ).length,
   });
   const api = {
-    createTask(name, goal = "") {
+    createTask(name, goal = "", allowAgentSpawn = false) {
       const t = {
         id: id("tsk"),
         name,
         goal,
+        allowAgentSpawn,
         status: "open",
         createdAt: now(),
         createdBy: { node, user },
@@ -165,7 +166,10 @@ export function createFixtureHub({
       if (req.method === "POST") {
         if (!/^[a-zA-Z0-9_-]{1,64}$/.test(body.name || ""))
           return json(400, { error: "invalid request" });
-        return json(201, api.createTask(body.name, body.goal || ""));
+        return json(
+          201,
+          api.createTask(body.name, body.goal || "", !!body.allowAgentSpawn),
+        );
       }
       return json(200, { tasks: api.tasks() });
     }
@@ -178,6 +182,11 @@ export function createFixtureHub({
         .map(withUnread);
     if (!sub) {
       if (req.method === "DELETE") return json(200, api.closeTask(taskId));
+      if (req.method === "PATCH") {
+        Object.assign(task, body);
+        emit(taskId, "task_updated");
+        return json(200, task);
+      }
       const latestSeq =
         events.filter((e) => e.taskId === taskId).at(-1)?.seq || 0;
       return json(200, { task, agents: taskAgents(), latestSeq });

@@ -27,6 +27,7 @@ export function createBoardView({
   activate,
   notice,
   addAgent,
+  settings = () => {},
   revealAgent,
   attachTask,
   newTask,
@@ -164,7 +165,7 @@ export function createBoardView({
     renderedTask = selected;
     root.innerHTML = `<div class="board mode-board"><aside class="board-rail"><div class="board-rail-head"><span class="eyebrow">TASKS</span><button id="board-new-task" title="New task">＋</button></div>${tasks.map((t) => `<button data-board-task="${esc(t.id)}" aria-pressed="${t.id === selected}"><span class="board-task-name">${esc(t.name)}</span><span class="fine">${esc(t.goal || "No objective yet")}</span></button>`).join("") || '<p class="fine">No open tasks.</p>'}</aside><section class="board-thread">${
       detail
-        ? `<div class="board-head"><div class="view-heading"><div><span class="eyebrow">BOARD</span><h2>${esc(detail.task.name)}</h2></div><button id="board-attach">Show terminals</button></div><p class="fine">${esc(detail.task.goal)}</p><div class="board-agents-row">${agents
+        ? `<div class="board-head"><div class="view-heading"><div><span class="eyebrow">BOARD</span><h2>${esc(detail.task.name)}</h2></div><div class="view-actions"><button id="board-attach">Terminals</button><button id="board-settings" title="Task settings">Settings</button></div></div><p class="fine">${esc(detail.task.goal)}</p><div class="board-agents-row">${agents
             .filter((a) => a.status !== "closed")
             .map(
               (a) =>
@@ -180,7 +181,7 @@ export function createBoardView({
             )
             .join(
               "",
-            )}</select></label><textarea ${sending.has(selected) ? "disabled" : ""} id="board-text" rows="2" maxlength="8192" placeholder="Write a message…" aria-label="Message">${esc(d.text)}</textarea><button class="primary" type="submit" ${sending.has(selected) ? "disabled" : ""}>${sending.has(selected) ? "Sending…" : "Send"}</button><p class="compose-note fine">Saved on the hub. Read means retrieved, not completed.</p></form>`
+            )}</select></label><textarea ${sending.has(selected) ? "disabled" : ""} id="board-text" rows="2" maxlength="8192" placeholder="Write a message…" aria-label="Message">${esc(d.text)}</textarea><button class="primary" type="submit" ${sending.has(selected) ? "disabled" : ""}>${sending.has(selected) ? "Sending…" : "Send"}</button><p class="compose-note fine">Messages wait until agents check their inbox.</p></form>`
         : '<div class="mode-empty"><h2>Bring a team together.</h2><p class="launcher-intro">Create a task with a shared objective, then add agents.</p></div>'
     }</section></div>`;
     root.querySelector("#board-new-task").onclick = () => newTask();
@@ -234,6 +235,8 @@ export function createBoardView({
         drafts.set(selected, { ...draft(), replyTo: 0 });
         render();
       };
+    const settingsButton = root.querySelector("#board-settings");
+    if (settingsButton) settingsButton.onclick = () => settings(selected);
     const form = root.querySelector("#board-compose");
     if (form)
       form.onsubmit = async (e) => {

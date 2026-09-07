@@ -93,6 +93,8 @@ func fail(w http.ResponseWriter, err error) {
 	switch {
 	case errors.Is(err, api.ErrNotFound):
 		writeError(w, http.StatusNotFound, "not found")
+	case errors.Is(err, api.ErrAgentSpawnDisabled):
+		writeError(w, http.StatusForbidden, "Agents cannot add agents to this task. Ask the owner to enable Allow agents to add other agents in task settings.")
 	case errors.Is(err, api.ErrInvalid):
 		writeError(w, http.StatusBadRequest, "invalid request")
 	case errors.Is(err, api.ErrLimit):

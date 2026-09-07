@@ -4496,3 +4496,427 @@ html:fullscreen {
     max-width: 100%;
   }
 }
+
+/* Secondary views use the terminal toolbar's scale and square geometry. */
+#mode-view {
+  padding: 12px 0 10px;
+}
+#mode-view button,
+#mode-view .button-like,
+#mode-view .task-more > summary {
+  box-sizing: border-box;
+  min-height: 28px;
+  padding: 4px 9px;
+  border-radius: 0;
+  font: 11px/18px var(--terminal-font);
+  letter-spacing: 0;
+  white-space: nowrap;
+}
+#mode-view input,
+#mode-view select,
+#mode-view textarea {
+  box-sizing: border-box;
+  border: 1px solid var(--line);
+  border-radius: 0;
+  background: var(--terminal-bg);
+  color: var(--ink);
+  font: 12px/18px var(--terminal-font);
+  padding: 5px 8px;
+  margin: 0;
+  min-width: 0;
+}
+#mode-view select {
+  height: 30px;
+}
+#mode-view .fine {
+  font: 11px/1.5 var(--terminal-font);
+}
+#mode-view h2 {
+  font: 500 16px/1.4 var(--terminal-font);
+  letter-spacing: -0.3px;
+}
+#mode-view h3 {
+  font: 500 13px/1.5 var(--terminal-font);
+}
+#mode-view .view-actions {
+  display: flex;
+  gap: 5px;
+  align-items: center;
+}
+#mode-view .mode-empty {
+  padding: 32px 16px;
+  max-width: 480px;
+}
+#mode-view .mode-board {
+  grid-template-columns: 190px minmax(0, 1fr);
+}
+#mode-view .board-rail {
+  padding: 0 10px 0 0;
+  gap: 3px;
+}
+#mode-view .board-rail-head {
+  padding: 0 3px 8px;
+  margin: 0;
+}
+#mode-view .board-rail [data-board-task] {
+  padding: 7px 8px;
+  margin: 0;
+  border-radius: 0;
+  gap: 3px;
+  min-height: 44px;
+}
+#mode-view .board-thread {
+  padding-left: 16px;
+}
+#mode-view .board-head {
+  padding-bottom: 10px;
+  margin: 0;
+}
+#mode-view .board-head .eyebrow {
+  display: none;
+}
+#mode-view .board-head .view-heading {
+  gap: 12px;
+  margin-bottom: 6px;
+}
+#mode-view .board-head h2 {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+#mode-view .board-head .fine {
+  margin: 0;
+}
+#mode-view .board-agents-row {
+  gap: 5px;
+  margin-top: 8px;
+}
+#mode-view .board-agent {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 7px;
+  min-height: 26px;
+}
+#mode-view .board-agent .fine {
+  font-size: 10px;
+}
+#mode-view .board-messages {
+  padding: 8px 0;
+  gap: 0;
+}
+#mode-view .board-message {
+  padding: 12px 0;
+  margin: 0;
+  border: 0;
+  border-bottom: 1px solid var(--line);
+  background: transparent;
+}
+#mode-view .board-meta {
+  gap: 8px;
+  font-size: 10px;
+  margin-bottom: 5px;
+}
+#mode-view .board-meta strong {
+  font-size: 11px;
+}
+#mode-view .board-text {
+  font: 12px/1.65 var(--terminal-font);
+}
+#mode-view .message-footer {
+  justify-content: flex-start;
+  gap: 12px;
+  margin-top: 5px;
+}
+#mode-view .message-footer button {
+  min-height: 24px;
+  padding: 1px 7px;
+  font-size: 10px;
+}
+#mode-view .board-empty {
+  padding: 20px 12px;
+}
+#mode-view #board-compose {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 8px;
+  padding-top: 10px;
+  margin: 0;
+  flex-shrink: 0;
+}
+#mode-view #board-compose textarea {
+  grid-column: 1 / -1;
+  grid-row: 2;
+  width: 100%;
+  height: 70px;
+  min-height: 54px;
+  max-height: 200px;
+  padding: 9px 10px;
+  resize: vertical;
+}
+#mode-view .compose-reply {
+  grid-row: 1;
+}
+#mode-view .compose-recipient {
+  grid-column: 1;
+  grid-row: 3;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0;
+  font: 11px/1.4 var(--terminal-font);
+}
+#mode-view #board-to {
+  width: auto;
+  max-width: 240px;
+  min-width: 125px;
+  height: 28px;
+  padding: 3px 7px;
+  font-size: 11px;
+}
+#mode-view #board-compose > button[type="submit"] {
+  grid-column: 2;
+  grid-row: 3;
+  height: 28px;
+  min-width: 60px;
+  padding: 4px 12px;
+}
+#mode-view .compose-note {
+  grid-row: 4;
+  font-size: 10px;
+  color: var(--muted);
+}
+#mode-view .tasks-view {
+  width: 100%;
+  max-width: 1120px;
+  margin: 0;
+}
+#mode-view .tasks-head {
+  flex-direction: row;
+  align-items: center;
+  gap: 16px;
+  max-width: none;
+  margin-bottom: 14px;
+}
+#mode-view .tasks-head h2 {
+  margin: 0 0 3px;
+}
+#mode-view .tasks-head .fine {
+  margin: 0;
+}
+#mode-view .count-badge {
+  border-radius: 0;
+  background: transparent;
+  padding: 0 4px;
+  font-size: 11px;
+}
+#mode-view .tasks-clear {
+  margin: 0 0 10px;
+  font-size: 10px;
+  color: var(--muted);
+}
+#mode-view .task-grid {
+  gap: 0;
+  border-top: 1px solid var(--line);
+}
+#mode-view .task-card {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  grid-template-areas: "heading actions" "goal actions" "agents actions";
+  gap: 5px 20px;
+  padding: 14px 0;
+  border: 0;
+  border-bottom: 1px solid var(--line);
+  background: transparent;
+}
+#mode-view .task-card header {
+  grid-area: heading;
+  display: flex;
+  justify-content: flex-start;
+  gap: 12px;
+  padding: 0;
+  margin: 0;
+  min-height: 0;
+}
+#mode-view .task-card h3 {
+  margin: 0;
+}
+#mode-view .task-card .task-goal {
+  grid-area: goal;
+  margin: 0;
+  font-size: 11px;
+}
+#mode-view .task-card .task-agents {
+  grid-area: agents;
+  margin: 0;
+  gap: 5px;
+}
+#mode-view .task-card .task-actions {
+  grid-area: actions;
+  align-self: center;
+  border: 0;
+  padding: 0;
+  margin: 0;
+  gap: 5px;
+  justify-content: flex-end;
+  max-width: 300px;
+}
+#mode-view .task-actions > .fine {
+  flex-basis: 100%;
+  text-align: right;
+  font-size: 10px;
+}
+#mode-view .task-more > div {
+  z-index: 5;
+}
+#mode-view .needs-you {
+  border-radius: 0;
+  padding: 10px;
+  margin: 0 0 12px;
+}
+#mode-view .attention-row {
+  margin-top: 5px;
+}
+#mode-view .tasks-empty {
+  padding: 28px 0;
+}
+#mode-view .files-view {
+  padding: 0;
+  border: 0;
+  border-radius: 0;
+  gap: 8px;
+}
+#mode-view .files-view.dragging {
+  outline: 1px dashed var(--accent);
+  outline-offset: -1px;
+}
+#mode-view .files-bar {
+  grid-template-columns: 190px minmax(0, 1fr);
+  gap: 6px 10px;
+}
+#mode-view #files-server {
+  grid-column: 1;
+  grid-row: 1;
+  width: 100%;
+}
+#mode-view #files-goto {
+  grid-column: 2;
+  grid-row: 1;
+}
+#mode-view #files-path {
+  height: 30px;
+}
+#mode-view .files-crumbs {
+  grid-column: 1 / -1;
+  grid-row: 2;
+  gap: 0;
+  flex-wrap: nowrap;
+  overflow-x: auto;
+}
+#mode-view .files-crumbs button {
+  min-height: 24px;
+  padding: 1px 6px;
+  font-size: 10px;
+}
+#mode-view .files-actions {
+  gap: 5px;
+  padding: 0 0 8px;
+}
+#mode-view .files-upload-label {
+  margin: 0;
+  display: inline-flex;
+}
+#mode-view .files-upload-label .button-like {
+  border-color: var(--line);
+  background: var(--surface);
+}
+#mode-view .files-status {
+  min-height: 16px;
+  margin: 0;
+  font-size: 10px;
+}
+#mode-view .files-table-wrap {
+  border-radius: 0;
+  border-color: var(--line);
+}
+#mode-view .files-table {
+  font-size: 11px;
+}
+#mode-view .files-table td {
+  padding: 7px 9px;
+}
+#mode-view .files-table th button {
+  min-height: 28px;
+  padding: 3px 9px;
+  font-size: 10px;
+}
+#mode-view .files-drop {
+  border: 0;
+  border-radius: 0;
+  padding: 3px 0;
+  margin: 0;
+  text-align: left;
+  font-size: 10px;
+}
+@media (max-width: 960px) {
+  #mode-view .task-card {
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-areas: "heading" "goal" "agents" "actions";
+    gap: 7px;
+  }
+  #mode-view .task-card .task-actions {
+    justify-content: flex-start;
+    max-width: none;
+  }
+  #mode-view .task-actions > .fine {
+    flex-basis: auto;
+    flex: 1;
+    text-align: left;
+  }
+}
+@media (max-width: 760px) {
+  #mode-view .mode-board {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  #mode-view .board-rail {
+    padding: 0 0 8px;
+  }
+  #mode-view .board-thread {
+    padding: 10px 0 0;
+  }
+  #mode-view .board-head .view-heading {
+    flex-wrap: wrap;
+    gap: 6px;
+  }
+  #mode-view .board-head h2 {
+    font-size: 14px;
+  }
+  #mode-view .files-bar {
+    grid-template-columns: 125px minmax(0, 1fr);
+  }
+  #mode-view .files-mtime,
+  #mode-view .files-table th:nth-child(3) {
+    display: none;
+  }
+  #mode-view .task-card header {
+    flex-wrap: wrap;
+    gap: 3px 10px;
+  }
+  #mode-view .tasks-head {
+    gap: 8px;
+  }
+}
+@media (pointer: coarse) {
+  #mode-view button,
+  #mode-view .button-like,
+  #mode-view .task-more > summary {
+    min-height: 36px;
+  }
+}
+
+#mode-view .board-task-name {
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}

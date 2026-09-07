@@ -133,9 +133,9 @@ func (s *Store) CreateTask(ctx context.Context, req api.CreateTaskRequest, by ap
 	if count >= api.MaxTasks {
 		return api.Task{}, api.ErrLimit
 	}
-	t := api.Task{ID: api.NewID("tsk"), Name: req.Name, Goal: req.Goal, Status: api.TaskOpen, CreatedAt: s.now(), CreatedBy: by}
-	_, err := s.db.ExecContext(ctx, `INSERT INTO tasks (id,name,goal,status,created_at,created_node,created_user) VALUES (?,?,?,?,?,?,?)`,
-		t.ID, t.Name, t.Goal, t.Status, ts(t.CreatedAt), by.Node, by.User)
+	t := api.Task{AllowAgentSpawn: req.AllowAgentSpawn, ID: api.NewID("tsk"), Name: req.Name, Goal: req.Goal, Status: api.TaskOpen, CreatedAt: s.now(), CreatedBy: by}
+	_, err := s.db.ExecContext(ctx, `INSERT INTO tasks (id,name,goal,status,created_at,created_node,created_user,allow_agent_spawn) VALUES (?,?,?,?,?,?,?,?)`,
+		t.ID, t.Name, t.Goal, t.Status, ts(t.CreatedAt), by.Node, by.User, t.AllowAgentSpawn)
 	if err != nil {
 		return api.Task{}, err
 	}
@@ -149,7 +149,7 @@ func scanTask(row interface{ Scan(...any) error }) (api.Task, error) {
 	var t api.Task
 	var created string
 	var closed sql.NullString
-	err := row.Scan(&t.ID, &t.Name, &t.Goal, &t.Status, &created, &t.CreatedBy.Node, &t.CreatedBy.User, &closed)
+	err := row.Scan(&t.ID, &t.Name, &t.Goal, &t.Status, &created, &t.CreatedBy.Node, &t.CreatedBy.User, &closed, &t.AllowAgentSpawn)
 	if err != nil {
 		return t, err
 	}
@@ -161,7 +161,7 @@ func scanTask(row interface{ Scan(...any) error }) (api.Task, error) {
 	return t, nil
 }
 
-const taskCols = `id,name,goal,status,created_at,created_node,created_user,closed_at`
+const taskCols = `id,name,goal,status,created_at,created_node,created_user,closed_at,allow_agent_spawn`
 
 func (s *Store) GetTask(ctx context.Context, id string) (api.Task, error) {
 	t, err := scanTask(s.db.QueryRowContext(ctx, `SELECT `+taskCols+` FROM tasks WHERE id=?`, id))
@@ -189,6 +189,11 @@ func (s *Store) ListTasks(ctx context.Context) ([]api.Task, error) {
 }
 
 func (s *Store) UpdateTask(ctx context.Context, id string, req api.UpdateTaskRequest, by api.Caller) (api.Task, error) {
+	if req.Status != nil && *req.Status == api.TaskClosed {
+		return s.CloseTask(ctx, id, by)
+	}
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
 	t, err := s.GetTask(ctx, id)
 	if err != nil {
 		return t, err
@@ -207,8 +212,6 @@ func (s *Store) UpdateTask(ctx context.Context, id string, req api.UpdateTaskReq
 	}
 	if req.Status != nil {
 		switch *req.Status {
-		case api.TaskClosed:
-			return s.CloseTask(ctx, id, by)
 		case api.TaskOpen:
 			t.Status = api.TaskOpen
 			t.ClosedAt = nil
@@ -216,8 +219,17 @@ func (s *Store) UpdateTask(ctx context.Context, id string, req api.UpdateTaskReq
 			return t, api.ErrInvalid
 		}
 	}
-	_, err = s.db.ExecContext(ctx, `UPDATE tasks SET name=?, goal=?, status=?, closed_at=NULL WHERE id=?`, t.Name, t.Goal, t.Status, id)
-	s.notify(id)
+	if req.AllowAgentSpawn != nil {
+		t.AllowAgentSpawn = *req.AllowAgentSpawn
+	}
+	var closedAt any
+	if t.ClosedAt != nil {
+		closedAt = ts(*t.ClosedAt)
+	}
+	_, err = s.db.ExecContext(ctx, `UPDATE tasks SET name=?, goal=?, status=?, closed_at=?, allow_agent_spawn=? WHERE id=?`, t.Name, t.Goal, t.Status, closedAt, t.AllowAgentSpawn, id)
+	if err == nil {
+		_, err = s.addEvent(ctx, id, "task_updated", "", t.Name, nil, by)
+	}
 	return t, err
 }
 
@@ -273,6 +285,15 @@ func (s *Store) AddAgent(ctx context.Context, taskID string, req api.AddAgentReq
 	}
 	if t.Status != api.TaskOpen {
 		return api.Agent{}, api.ErrClosed
+	}
+	if req.ParentAgentID != "" {
+		parent, err := s.GetAgent(ctx, req.ParentAgentID)
+		if err != nil || parent.TaskID != taskID || parent.Status == api.AgentClosed || parent.Status == api.AgentExited {
+			return api.Agent{}, api.ErrInvalid
+		}
+		if !t.AllowAgentSpawn {
+			return api.Agent{}, api.ErrAgentSpawnDisabled
+		}
 	}
 	if req.AgentID != "" {
 		if !api.ValidID(req.AgentID, "agt") {

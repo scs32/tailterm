@@ -161,6 +161,13 @@ export function createTaskHub(host) {
               .find((t) => !t.disposed && t.task?.agentId === agentId);
             if (tab) tab.markActivity?.(label);
           }
+          if (events.some((e) => e.kind === "task_updated")) {
+            try {
+              const detail = await client.getTask(taskId);
+              feed.task = detail.task;
+              cache.set(taskId, { task: feed.task, agents: feed.agents });
+            } catch {}
+          }
           if (events.some((e) => e.kind === "task_closed")) {
             feed.task = { ...feed.task, status: "closed" };
             cache.set(taskId, { task: feed.task, agents: feed.agents });
@@ -206,6 +213,7 @@ export function createTaskHub(host) {
       tab.task = taskBinding(feed.taskId, agent);
       host.bookmark(tab);
     }
+    host.paneGroups()?.sync();
     for (const tab of r.close) host.closeTab(tab.id, { fromHub: true });
     for (const { agent, server } of r.open) {
       if (feed.stopped) return;
@@ -235,13 +243,7 @@ export function createTaskHub(host) {
     host.render();
   }
 
-  function attach(taskId, tabId) {
-    const groups = host.paneGroups();
-    const group = groups.model.group(tabId);
-    if (!group) return;
-    for (const g of groups.model.groups)
-      if (g.taskId === taskId) delete g.taskId;
-    group.taskId = taskId;
+  function attach(taskId) {
     bound.add(taskId);
     sync();
     host.scheduleWorkspaceSave();
@@ -497,7 +499,8 @@ export function createTaskHub(host) {
       <label>Objective<textarea id="task-goal" rows="3" maxlength="8192" placeholder="What should be accomplished?"></textarea></label>
       <label class="check"><input type="checkbox" id="task-with-agent">Start the first agent now</label>
       <fieldset id="task-agent-fields" hidden disabled><label>Server<select id="task-server">${serverOptions(server?.id)}</select></label>${agentFields(server)}</fieldset>
-      <label class="check" ${tabId ? "" : "hidden"}><input type="checkbox" id="task-attach">Group agents with the current terminal tab</label>
+      <label class="check"><input type="checkbox" id="task-allow-spawn">Allow agents to add other agents</label>
+      <p class="fine">Agents appear together in a terminal group named after this task.</p>
       <div class="task-submit-area"><p id="task-error" class="fine" role="status" aria-live="polite"></p><div class="dialog-actions"><button type="button" id="task-open-created" hidden>Open created task</button><button type="submit" id="task-create" class="primary">Create task</button></div></div>
     </form>`,
     );
@@ -549,10 +552,11 @@ export function createTaskHub(host) {
           saved = await client.createTask({
             name,
             goal: form.querySelector("#task-goal").value.trim(),
+            allowAgentSpawn: form.querySelector("#task-allow-spawn").checked,
           });
           bound.add(saved.id);
-          if (form.querySelector("#task-attach").checked && tabId)
-            attach(saved.id, tabId);
+          cache.set(saved.id, { task: saved, agents: [] });
+          form.querySelector("#task-allow-spawn").disabled = true;
           form.querySelector("#task-name").disabled = true;
           form.querySelector("#task-goal").disabled = true;
           form.querySelector("#task-open-created").hidden = false;
@@ -593,50 +597,30 @@ export function createTaskHub(host) {
     form.querySelector("#task-name").focus();
   }
 
-  async function attachTask(tabId = host.currentTab()?.id) {
-    if (!requireHub() || !tabId) return;
-    host.dialog("Attach task", `<p class="fine">Loading tasks…</p>`);
-    let tasks;
+  async function attachTask() {
+    if (!requireHub()) return;
     try {
-      tasks = (await loadTasks()).filter((t) => t.status === "open");
-    } catch (e) {
-      host.dialog("Attach task", `<p class="fine">${esc(formatError(e))}</p>`);
-      return;
+      const tasks = (await loadTasks()).filter((t) => t.status === "open");
+      host.dialog(
+        "Task terminals",
+        `<div class="dialog-menu">${tasks.map((t) => `<button data-open-task="${esc(t.id)}">${esc(t.name)}</button>`).join("") || '<p class="fine">No open tasks.</p>'}</div>`,
+      );
+      document.querySelectorAll("[data-open-task]").forEach(
+        (b) =>
+          (b.onclick = () => {
+            host.closeDialog();
+            attachToCurrent(b.dataset.openTask);
+          }),
+      );
+    } catch (error) {
+      host.notice(formatError(error));
     }
-    const current = taskOfTab(tabId);
-    host.dialog(
-      "Attach task",
-      `<p class="fine">The tab mirrors every agent on the task: new agent sessions open as panes here and closed ones leave.</p><div class="dialog-menu">${
-        tasks.length
-          ? tasks
-              .map(
-                (t) =>
-                  `<button data-attach-task="${esc(t.id)}" ${t.id === current ? 'aria-pressed="true"' : ""}>${esc(t.name)}<span class="fine">${esc(t.goal || t.id)}</span></button>`,
-              )
-              .join("")
-          : '<p class="fine">No open tasks yet.</p>'
-      }<button id="attach-new-task">New task…</button>${current ? '<button id="attach-detach" class="danger">Detach current task</button>' : ""}</div>`,
-    );
-    document.querySelectorAll("[data-attach-task]").forEach(
-      (b) =>
-        (b.onclick = () => {
-          attach(b.dataset.attachTask, tabId);
-          host.closeDialog();
-        }),
-    );
-    document.querySelector("#attach-new-task").onclick = () => newTask(tabId);
-    const detachButton = document.querySelector("#attach-detach");
-    if (detachButton)
-      detachButton.onclick = () => {
-        detach(tabId);
-        host.closeDialog();
-      };
   }
 
   function addAgent(taskId = taskOfTab(host.currentTab()?.id)) {
     if (!requireHub()) return;
     if (!taskId) {
-      host.notice("Attach a task to this tab first.");
+      host.notice("Choose a task first.");
       return;
     }
     const info = cache.get(taskId);
@@ -690,15 +674,69 @@ export function createTaskHub(host) {
     if (!requireHub()) return;
     host.openBoard(taskId || null);
   }
-  function attachToCurrent(taskId) {
-    const tab = host.currentTab();
-    if (!tab) {
-      host.notice("Open a terminal tab first, then attach the task to it.");
-      return;
+  async function attachToCurrent(taskId) {
+    if (!requireHub()) return;
+    try {
+      const detail = await client.getTask(taskId);
+      cache.set(taskId, detail);
+      for (const agent of detail.agents) hidden.delete(agent.id);
+      attach(taskId);
+      const feed = feeds.get(taskId);
+      if (feed) {
+        feed.task = detail.task;
+        feed.agents = detail.agents;
+        await reconcile(feed);
+      }
+      const group = groupOf(taskId);
+      if (group) {
+        host.showTerminals?.();
+        host.activate?.(group.active);
+      } else if (detail.agents.some((a) => a.status !== "closed"))
+        host.notice(
+          "Agent terminals are starting or their servers are unavailable.",
+        );
+      else addAgent(taskId);
+    } catch (error) {
+      host.notice(formatError(error));
     }
-    attach(taskId, tab.id);
-    host.showTerminals?.();
-    host.notice("Task attached. Agent panes appear in this tab as they start.");
+  }
+  async function settings(taskId) {
+    if (!requireHub()) return;
+    try {
+      const { task } = await client.getTask(taskId);
+      host.dialog(
+        "Task settings",
+        `<form id="task-settings"><label>Task name<input id="task-settings-name" maxlength="120" value="${esc(task.name)}" required></label><label>Objective<textarea id="task-settings-goal" rows="3" maxlength="8192">${esc(task.goal)}</textarea></label><label class="check"><input id="task-settings-spawn" type="checkbox" ${task.allowAgentSpawn ? "checked" : ""}>Allow agents to add other agents</label><p class="fine">You can always add agents yourself. Turning this off prevents new helpers; existing agents keep running.</p><p id="task-settings-error" class="fine" role="alert"></p><div class="dialog-actions"><button type="submit" class="primary">Save</button></div></form>`,
+      );
+      const form = document.querySelector("#task-settings");
+      form.onsubmit = async (event) => {
+        event.preventDefault();
+        const button = form.querySelector("button");
+        if (button.disabled) return;
+        button.disabled = true;
+        try {
+          const task = await client.updateTask(taskId, {
+            name: form.querySelector("#task-settings-name").value.trim(),
+            goal: form.querySelector("#task-settings-goal").value.trim(),
+            allowAgentSpawn: form.querySelector("#task-settings-spawn").checked,
+          });
+          const info = cache.get(taskId);
+          cache.set(taskId, { ...info, task });
+          const feed = feeds.get(taskId);
+          if (feed) feed.task = task;
+          host.closeDialog();
+          host.render();
+          host.notice("Task settings saved.");
+        } catch (error) {
+          form.querySelector("#task-settings-error").textContent =
+            formatError(error);
+        } finally {
+          button.disabled = false;
+        }
+      };
+    } catch (error) {
+      host.notice(formatError(error));
+    }
   }
   function groupOf(taskId) {
     return host.paneGroups()?.model.taskGroup(taskId) || null;
@@ -724,7 +762,7 @@ export function createTaskHub(host) {
     if (client) {
       list.push({ label: "Task: new…", run: () => newTask() });
       list.push({
-        label: "Task: attach to this tab…",
+        label: "Task: open terminals…",
         run: () => attachTask(),
       });
       if (taskId) {
@@ -735,8 +773,8 @@ export function createTaskHub(host) {
           run: () => addAgent(taskId),
         });
         list.push({
-          label: `Task ${name}: detach from this tab`,
-          run: () => detach(tab.id),
+          label: `Task ${name}: settings`,
+          run: () => settings(taskId),
         });
       }
     }
@@ -760,6 +798,8 @@ export function createTaskHub(host) {
     sync,
     groupOf,
     attachToCurrent,
+    settings,
+    name: (id) => cache.get(id)?.task?.name,
     stopAll,
     attach,
     detach,

@@ -179,6 +179,7 @@ try {
         .filter({ hasText: "Enter a task name" })
         .waitFor();
       await page.locator("#task-name").fill(name + " task with spaces");
+      await page.locator("#task-allow-spawn").check();
       await page
         .locator("#task-goal")
         .fill("A normal multi-line objective.\nSecond line.");
@@ -191,6 +192,45 @@ try {
       assert.ok(
         (await getTasks()).some((t) => t.name === name + " task with spaces"),
       );
+      const created = (await getTasks()).find(
+        (t) => t.name === name + " task with spaces",
+      );
+      assert.equal(created.allowAgentSpawn, true);
+      await page.evaluate((id) => qa.hub.settings(id), created.id);
+      await page.locator("#task-settings-spawn").uncheck();
+      await page.locator("#task-settings button[type=submit]").click();
+      await page.locator("#dialog").waitFor({ state: "hidden" });
+      assert.equal(
+        (await getTasks()).find((t) => t.id === created.id).allowAgentSpawn,
+        false,
+      );
+      await page
+        .locator("#board-text")
+        .fill(
+          "The morning slips through curtains thin,\nAnd lets a little wonder in.",
+        );
+      await page.locator("#board-compose button[type=submit]").click();
+      await page
+        .locator(".board-text")
+        .filter({ hasText: "The morning slips" })
+        .waitFor();
+      const bounds = await page.locator("#board-compose").evaluate((el) => {
+        const box = (selector) =>
+          el.querySelector(selector).getBoundingClientRect().toJSON();
+        return {
+          text: box("textarea"),
+          send: box("button[type=submit]"),
+          to: box("select"),
+          width: el.clientWidth,
+        };
+      });
+      assert.ok(
+        bounds.send.height <= 30 && Math.abs(bounds.send.y - bounds.to.y) <= 1,
+        JSON.stringify(bounds),
+      );
+      assert.ok(bounds.text.width >= bounds.width - 2, JSON.stringify(bounds));
+      await page.mouse.move(0, 0);
+      await page.screenshot({ path: ".build/board-compact-" + name + ".png" });
       assert.equal(execs, name === "chromium" ? 0 : 2);
       await page.evaluate(() => qa.hub.newTask());
       await page.locator("#task-name").fill(name + " launch retry");

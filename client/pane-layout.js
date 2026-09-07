@@ -73,6 +73,49 @@ export class PaneGroups {
         this.groups.push(group);
       }
   }
+  // Split legacy mixed groups and gather each task's panes into one group.
+  isolateTasks(taskOf) {
+    const result = [],
+      tasks = new Map();
+    for (const group of this.groups) {
+      const ids = leaves(group.tree);
+      const keys = [...new Set(ids.map(taskOf))];
+      for (const taskId of keys) {
+        const tree = prune(
+          group.tree,
+          new Set(ids.filter((id) => taskOf(id) === taskId)),
+        );
+        const part = {
+          ...group,
+          tree,
+          active: leaves(tree).includes(group.active)
+            ? group.active
+            : leaves(tree)[0],
+        };
+        if (!taskId) {
+          delete part.taskId;
+          delete part.taskName;
+          result.push(part);
+          continue;
+        }
+        part.taskId = taskId;
+        const target = tasks.get(taskId);
+        if (target) {
+          target.tree = {
+            id: crypto.randomUUID(),
+            axis: "x",
+            ratio: 0.5,
+            a: target.tree,
+            b: tree,
+          };
+        } else {
+          tasks.set(taskId, part);
+          result.push(part);
+        }
+      }
+    }
+    this.groups = result;
+  }
   taskGroup(taskId) {
     return this.groups.find((g) => g.taskId === taskId);
   }
@@ -80,6 +123,7 @@ export class PaneGroups {
     const from = this.group(source),
       to = this.group(target);
     if (!from || !to || from === to) return false;
+    if ((from.taskId || to.taskId) && from.taskId !== to.taskId) return false;
     const incoming = whole ? from.tree : { tab: source };
     if (whole) this.groups = this.groups.filter((g) => g !== from);
     else {
@@ -124,7 +168,7 @@ export class PaneGroups {
   }
   detach(tab) {
     const group = this.group(tab);
-    if (!group || leaves(group.tree).length < 2) return false;
+    if (!group || group.taskId || leaves(group.tree).length < 2) return false;
     group.tree = prune(
       group.tree,
       new Set(leaves(group.tree).filter((id) => id !== tab)),

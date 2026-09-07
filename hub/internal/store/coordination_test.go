@@ -103,3 +103,65 @@ func TestTaskTitlesAreNotShellIdentifiers(t *testing.T) {
 		}
 	}
 }
+
+func TestTaskHelperPolicyPersistsAndIsEnforced(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "policy.sqlite")
+	s, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { s.Close() }()
+	by := api.Caller{Node: "owner", User: "owner"}
+	task, err := s.CreateTask(ctx, api.CreateTaskRequest{Name: "Review"}, by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	parent, err := s.AddAgent(ctx, task.ID, api.AddAgentRequest{Name: "planner", Host: "host", Session: "planner"}, by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	child := api.AddAgentRequest{Name: "helper", Host: "host", Session: "helper", ParentAgentID: parent.ID}
+	if _, err = s.AddAgent(ctx, task.ID, child, by); !errors.Is(err, api.ErrAgentSpawnDisabled) {
+		t.Fatalf("default policy: %v", err)
+	}
+	yes := true
+	updated, err := s.UpdateTask(ctx, task.ID, api.UpdateTaskRequest{AllowAgentSpawn: &yes}, by)
+	if err != nil || !updated.AllowAgentSpawn {
+		t.Fatalf("enable: %+v %v", updated, err)
+	}
+	s.Close()
+	s, err = Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	helper, err := s.AddAgent(ctx, task.ID, child, by)
+	if err != nil || helper.ParentAgentID != parent.ID {
+		t.Fatalf("helper: %+v %v", helper, err)
+	}
+	no := false
+	if _, err = s.UpdateTask(ctx, task.ID, api.UpdateTaskRequest{AllowAgentSpawn: &no}, by); err != nil {
+		t.Fatal(err)
+	}
+	child.Name = "another"
+	child.Session = "another"
+	if _, err = s.AddAgent(ctx, task.ID, child, by); !errors.Is(err, api.ErrAgentSpawnDisabled) {
+		t.Fatalf("disabled policy: %v", err)
+	}
+	child.ParentAgentID = ""
+	if _, err = s.AddAgent(ctx, task.ID, child, by); err != nil {
+		t.Fatalf("owner must still be able to add agents: %v", err)
+	}
+	other, err := s.CreateTask(ctx, api.CreateTaskRequest{Name: "Other", AllowAgentSpawn: true}, by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	child.ParentAgentID = parent.ID
+	if _, err = s.AddAgent(ctx, other.ID, child, by); !errors.Is(err, api.ErrInvalid) {
+		t.Fatalf("cross-task parent: %v", err)
+	}
+	agents, err := s.ListAgents(ctx, task.ID)
+	if err != nil || len(agents) != 3 {
+		t.Fatalf("existing agents affected: %v %v", agents, err)
+	}
+}
