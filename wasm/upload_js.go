@@ -3,13 +3,9 @@ package main
 
 import (
 	"context"
-	"crypto/rand"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
-	"os"
-	"path"
 	"strings"
 	"syscall/js"
 
@@ -59,61 +55,5 @@ func uploadFile(ctx context.Context, client *ssh.Client, cfg js.Value) error {
 		return fmt.Errorf("server must enable SFTP: %w", err)
 	}
 	defer remote.Close()
-	if _, err = remote.Lstat(destination); err == nil {
-		return errors.New("a file already exists at that path; choose another filename")
-	} else if !os.IsNotExist(err) {
-		return err
-	}
-	token := make([]byte, 12)
-	if _, err = rand.Read(token); err != nil {
-		return err
-	}
-	temporary := path.Join(path.Dir(destination), ".tailterm-upload-"+hex.EncodeToString(token)+".part")
-	file, err := remote.OpenFile(temporary, os.O_CREATE|os.O_EXCL|os.O_WRONLY)
-	if err != nil {
-		return err
-	}
-	complete := false
-	defer func() {
-		file.Close()
-		if !complete {
-			remote.Remove(temporary)
-		}
-	}()
-	if err = file.Chmod(0600); err != nil {
-		return err
-	}
-	for offset := 0; offset < size; {
-		if err = ctx.Err(); err != nil {
-			return err
-		}
-		length := min(32768, size-offset)
-		data, e := awaitJS(ctx, cfg.Get("readChunk"), offset, length)
-		if e != nil {
-			return e
-		}
-		if data.Type() != js.TypeObject || data.Get("byteLength").Int() != length {
-			return errors.New("invalid image chunk")
-		}
-		chunk := make([]byte, length)
-		js.CopyBytesToGo(chunk, data)
-		n, e := file.Write(chunk)
-		if e != nil {
-			return e
-		}
-		if n != length {
-			return errors.New("incomplete file write")
-		}
-		offset += n
-		callback(cfg, "progress", offset)
-	}
-	if err = file.Close(); err != nil {
-		return err
-	}
-	// Standard SFTP rename refuses to replace an existing destination. Do not use PosixRename.
-	if err = remote.Rename(temporary, destination); err != nil {
-		return fmt.Errorf("could not publish uploaded file (it may already exist): %w", err)
-	}
-	complete = true
-	return nil
+	return putFile(ctx, remote, destination, cfg, 20*1024*1024)
 }

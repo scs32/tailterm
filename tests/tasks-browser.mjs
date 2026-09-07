@@ -91,8 +91,16 @@ export async function exerciseTasks(page, hub, origin) {
   );
   assert.match(await taskTitle(), /1 done/);
 
-  // Board: post as the human, then receive an agent message live.
+  // Board mode: post as the human, then receive an agent message live.
   await palette("Task demo: board");
+  await waitFor(
+    async () =>
+      (await page
+        .locator(".mode-switch [data-mode=board]")
+        .getAttribute("aria-pressed")) === "true",
+    "board mode",
+  );
+  await page.locator("#board-text").waitFor();
   await page.locator("#board-text").fill("hello team");
   await page.locator("#board-compose button[type=submit]").click();
   await waitFor(
@@ -108,8 +116,29 @@ export async function exerciseTasks(page, hub, origin) {
   await page
     .locator(".board-text", { hasText: "planner reporting in" })
     .waitFor();
-  assert.equal(await page.locator(".board-agent").count(), 2);
-  await page.locator("#dialog-close").click();
+  assert.equal(await page.locator(".board-agents-row .board-agent").count(), 2);
+  await page.screenshot({ path: ".build/board-preview.png" });
+  // Terminals survive the mode switch: their buffers still hold the prompt.
+  assert.ok(
+    (await page.locator(".terminal-shell").getAttribute("hidden")) !== null,
+  );
+  // Tasks mode lists the task with its agents and rollup.
+  await page.locator(".mode-switch [data-mode=tasks]").click();
+  await page.locator(".task-card", { hasText: "demo" }).waitFor();
+  assert.equal(await page.locator(".task-card .board-agent").count(), 2);
+  assert.match(
+    await page.locator(".task-card header .fine").innerText(),
+    /2 agents/,
+  );
+  await page.screenshot({ path: ".build/tasks-preview.png" });
+  // Keyboard shortcut returns to Terminals with the panes intact.
+  await page.keyboard.press("Control+1");
+  await waitFor(
+    async () =>
+      (await page.locator(".terminal-shell").getAttribute("hidden")) === null,
+    "terminals mode",
+  );
+  assert.equal(await panes(), before + 2);
 
   // Closing an agent removes its pane; closing the task removes the rest.
   hub.api.event(task.id, "closed", tester.id);

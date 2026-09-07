@@ -85,3 +85,20 @@ test("session and executable validation prevent command injection", () => {
     assert.throws(() => tmuxRenameCommand(name, "new-name"));
   }
 });
+
+test("new-session honours an absolute start directory", () => {
+  const cmd = tmuxCommand("work", "", false, undefined, "/home/testuser/projects");
+  assert.ok(cmd.includes("new-session -A -s "));
+  assert.ok(cmd.includes("/home/testuser/projects"));
+  // Resuming an existing session ignores the directory (no tmux -c flag).
+  assert.ok(
+    !tmuxCommand(
+      "work",
+      "",
+      true,
+      undefined,
+      "/home/testuser/projects",
+    ).includes("/home/testuser/projects"),
+  );
+  assert.throws(() => tmuxCommand("work", "", false, undefined, "relative"));
+})

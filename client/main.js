@@ -2,6 +2,10 @@ import { credentialCache } from "./credential-cache.js";
 import { createAttentionSound } from "./attention-sound.js";
 import { createRenderer, webglSupported } from "./renderer.js";
 import { createTaskHub } from "./task-hub.js";
+import { setupModes } from "./modes.js";
+import { createBoardView } from "./board-view.js";
+import { createTasksView } from "./tasks-view.js";
+import { createFilesView } from "./files-view.js";
 import { normalizeTaskRef } from "./task-ref.js";
 import { createInactivityLock, IDLE_MINUTES } from "./inactivity.js";
 import { createAppearancePreview } from "./appearance-preview.js";
@@ -108,7 +112,11 @@ for (const event of ["pointerdown", "keydown"])
     { capture: true },
   );
 let paneGroups;
-let taskHub = null;
+let taskHub = null,
+  modes = null,
+  boardView = null,
+  tasksView = null,
+  filesView = null;
 let discoveryPending = false;
 applyChrome(appearance);
 setupTooltips();
@@ -502,6 +510,11 @@ function mount() {
       },
       render,
       scheduleWorkspaceSave,
+      openBoard: (id) => {
+        modes?.set("board");
+        boardView?.show(id);
+      },
+      showTerminals: () => modes?.set("terminals"),
       bookmark: (t) =>
         api("/sessions", "POST", {
           serverId: t.server.id,
@@ -514,6 +527,85 @@ function mount() {
           })
           .catch(() => {}),
     });
+  if (staticMode) {
+    boardView = createBoardView({
+      client: () => taskHub.client(),
+      getTabs: () => tabs,
+      activate,
+      notice,
+      addAgent: (id) => taskHub.addAgent(id),
+      attachTask: (id) => taskHub.attachToCurrent(id),
+      newTask: () => taskHub.newTask(),
+      configure: () => taskHub.configure(),
+    });
+    tasksView = createTasksView({
+      client: () => taskHub.client(),
+      taskHub,
+      getTabs: () => tabs,
+      activate,
+      notice,
+      confirm: (title, message) =>
+        confirmDialog({
+          title,
+          message,
+          action: "Close task",
+          destructive: true,
+        }),
+      openBoard: (id) => {
+        modes.set("board");
+        boardView.show(id);
+      },
+      configure: () => taskHub.configure(),
+    });
+    filesView = createFilesView({
+      getServers: () => data.servers,
+      currentServer,
+      openSFTP: (server) => {
+        if (netState !== "Running")
+          throw new Error("Connect Tailscale before browsing files.");
+        return browserTransport.browserSFTP(ipn, server, peers);
+      },
+      notice,
+      confirm: (title, message) =>
+        confirmDialog({ title, message, action: "Delete", destructive: true }),
+      dialog,
+      closeDialog,
+      openTerminal: (server, path) => {
+        modes.set("terminals");
+        selected = server.id;
+        void connect(server, true, "", { cwd: path }).catch((e) =>
+          notice(e.message),
+        );
+      },
+    });
+    modes = setupModes({
+      header: $("main > header"),
+      main: $("main"),
+      onChange: (mode, view) => {
+        boardView.hide();
+        tasksView.hide();
+        filesView.hide();
+        view.replaceChildren();
+        if (mode === "board") {
+          boardView.mount(view);
+          boardView.show();
+        } else if (mode === "tasks") {
+          tasksView.mount(view);
+          tasksView.show();
+        } else if (mode === "files") {
+          filesView.mount(view);
+          filesView.show();
+        } else {
+          requestAnimationFrame(() => {
+            tabs
+              .filter((t) => !t.el.hidden && !t.disposed)
+              .forEach((t) => t.fit.fit());
+            currentTab()?.term.focus();
+          });
+        }
+      },
+    });
+  }
   if (staticMode) void restoreWorkspace(previousWorkspace);
   if (staticMode)
     imageUploads = setupImageDrops({
@@ -897,6 +989,8 @@ function selectServer(id, draft = false) {
   render();
 }
 function activate(id) {
+  if (id && modes && modes.get() !== "terminals" && !restoring)
+    modes.set("terminals");
   if (id && !visibleTabs().some((t) => t.id === id)) id = visibleTabs()[0]?.id;
   const previous = currentTab();
   if (previous)
@@ -1335,8 +1429,10 @@ function appearanceDialog() {
       }),
   );
 }
-function tmuxCommand(name, path, resumeOnly = false) {
-  return "exec " + remoteTmuxCommand(name, path, resumeOnly) + "\r";
+function tmuxCommand(name, path, resumeOnly = false, cwd = "") {
+  return (
+    "exec " + remoteTmuxCommand(name, path, resumeOnly, undefined, cwd) + "\r"
+  );
 }
 async function connect(
   server = currentServer(),
@@ -1666,7 +1762,12 @@ async function connect(
               t.tmuxSent = true;
               queueMicrotask(() =>
                 t.send?.(
-                  tmuxCommand(session, server.tmuxPath, options.resumeOnly),
+                  tmuxCommand(
+                    session,
+                    server.tmuxPath,
+                    options.resumeOnly,
+                    options.cwd || "",
+                  ),
                 ),
               );
             }
@@ -1683,7 +1784,12 @@ async function connect(
               t.tmuxSent = true;
               queueMicrotask(() =>
                 t.send?.(
-                  tmuxCommand(session, server.tmuxPath, options.resumeOnly),
+                  tmuxCommand(
+                    session,
+                    server.tmuxPath,
+                    options.resumeOnly,
+                    options.cwd || "",
+                  ),
                 ),
               );
             }
@@ -2430,6 +2536,14 @@ function openCommands() {
   });
   commands.push({ label: "New session", run: () => $("#new-tab").click() });
   commands.push({ label: "Manage terminal groups", run: groupDialog });
+  if (modes)
+    for (const [mode, label] of [
+      ["terminals", "Terminals"],
+      ["board", "Board"],
+      ["files", "Files"],
+      ["tasks", "Tasks"],
+    ])
+      commands.push({ label: `Mode: ${label}`, run: () => modes.set(mode) });
   if (taskHub) commands.push(...taskHub.commands());
   const server = currentServer();
   if (server)

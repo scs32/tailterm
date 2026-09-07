@@ -17,6 +17,7 @@ fi
 cp wasm/upstream_js.go "$source/cmd/tsconnect/wasm/wasm_js.go"
 cp wasm/ssh_js.go "$source/cmd/tsconnect/wasm/ssh_js.go"
 cp wasm/upload_js.go "$source/cmd/tsconnect/wasm/upload_js.go"
+cp wasm/sftp_js.go "$source/cmd/tsconnect/wasm/sftp_js.go"
 cp wasm/fixture_js.go "$source/cmd/tsconnect/wasm/fixture_js.go"
 cd "$source"
 GOOS=js GOARCH=wasm go build -trimpath -ldflags='-s -w' -o "$root/wasm/tailserve.wasm" ./cmd/tsconnect/wasm

@@ -32,8 +32,24 @@ function exactTarget(target) {
   validateTarget(target);
   return `tailterm_tmux_target=${shellQuote(target.id)}; if [ "$("$tailterm_tmux_bin" display-message -p -t "$tailterm_tmux_target" '#{session_id}|#{session_created}' 2>/dev/null)" != ${shellQuote(target.id + "|" + target.created)} ]; then printf 'The original tmux session no longer exists. Choose a session from the launcher.\\n' >&2; exit 1; fi; `;
 }
-export function tmuxCommand(name, path = "", resumeOnly = false, target) {
+export function validateStartDirectory(cwd) {
+  if (
+    typeof cwd !== "string" ||
+    cwd.length > 1024 ||
+    (cwd && (!cwd.startsWith("/") || /[\u0000-\u001f\u007f]/.test(cwd)))
+  )
+    throw new Error("Start directory must be an absolute path.");
+}
+export function tmuxCommand(
+  name,
+  path = "",
+  resumeOnly = false,
+  target,
+  cwd = "",
+) {
   validateSession(name);
+  validateStartDirectory(cwd);
+  const start = cwd && !resumeOnly ? " -c " + shellQuote(cwd) : "";
   return (
     "/bin/sh -c " +
     shellQuote(
@@ -45,7 +61,7 @@ export function tmuxCommand(name, path = "", resumeOnly = false, target) {
             : exactSession(name)
           : "") +
         // Browser terminals always support UTF-8, even when SSH has no locale.
-        `"$tailterm_tmux_bin" -u $tailterm_tmux_features ${resumeOnly ? 'attach-session -t "$tailterm_tmux_target"' : "new-session -A -s " + shellQuote(name)} \\; if-shell -F '#{==:#{set-clipboard},off}' 'set-option -s set-clipboard external' \\; set-option mouse on; tailterm_tmux_status=$?; if [ "$tailterm_tmux_status" -ne 0 ]; then printf 'tmux failed with exit status %s; see its error above.\\n' "$tailterm_tmux_status" >&2; fi; exit "$tailterm_tmux_status"`,
+        `"$tailterm_tmux_bin" -u $tailterm_tmux_features ${resumeOnly ? 'attach-session -t "$tailterm_tmux_target"' : "new-session -A -s " + shellQuote(name) + start} \\; if-shell -F '#{==:#{set-clipboard},off}' 'set-option -s set-clipboard external' \\; set-option mouse on; tailterm_tmux_status=$?; if [ "$tailterm_tmux_status" -ne 0 ]; then printf 'tmux failed with exit status %s; see its error above.\\n' "$tailterm_tmux_status" >&2; fi; exit "$tailterm_tmux_status"`,
     )
   );
 }

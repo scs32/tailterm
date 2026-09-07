@@ -88,6 +88,7 @@ export function browserSSH(ipn, server, peers, options = {}) {
           pty: options.pty !== false,
           command: options.command || "",
           upload: options.upload,
+          sftp: options.sftp,
           verifyHost: async (fingerprint) => {
             if (!interactive)
               throw new Error(
@@ -401,5 +402,46 @@ export function browserUpload(ipn, server, peers, file, path, progress) {
       readChunk: async (offset, length) =>
         new Uint8Array(await file.slice(offset, offset + length).arrayBuffer()),
     },
+  });
+}
+// Open a persistent SFTP session for the Files view. Resolves to the operations
+// object exposed by the WASM (home, realpath, list, stat, mkdir, rename,
+// remove, read, write, close) plus `done`, which settles when the session ends.
+export function browserSFTP(ipn, server, peers) {
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const session = browserSSH(ipn, server, peers, {
+      pty: false,
+      interactive: false,
+      sftp: {
+        onReady: (ops) => {
+          settled = true;
+          resolve({
+            ...ops,
+            done: session.done,
+            close: () => {
+              try {
+                ops.close();
+              } finally {
+                session.close();
+              }
+            },
+          });
+        },
+      },
+    });
+    session.done.then(
+      (result) => {
+        if (!settled)
+          reject(
+            new Error(
+              result?.error || "SFTP session ended before it became ready.",
+            ),
+          );
+      },
+      (error) => {
+        if (!settled) reject(error);
+      },
+    );
   });
 }

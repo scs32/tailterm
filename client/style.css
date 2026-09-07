@@ -3614,3 +3614,409 @@ label.check input {
     grid-template-columns: 1fr;
   }
 }
+
+/* Modes: header selector and the Board, Files, and Tasks views. */
+.mode-switch {
+  gap: 0;
+  border: 1px solid color-mix(in srgb, var(--muted) 25%, transparent);
+  border-radius: 7px;
+  padding: 2px;
+}
+.mode-switch button {
+  border: 1px solid transparent;
+  background: transparent;
+  padding: 6px 12px;
+  font-size: 10px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--muted);
+  box-shadow: none;
+}
+.mode-switch button[aria-pressed="true"] {
+  color: var(--accent);
+  border-color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 12%, transparent);
+  box-shadow: none;
+}
+.mode-switch button:disabled {
+  opacity: 0.45;
+}
+#mode-view {
+  min-height: 0;
+  height: calc(100% - 77px);
+  overflow: auto;
+  padding: 26px 0 32px;
+  font-family: var(--terminal-font);
+  display: flex;
+  flex-direction: column;
+}
+body[data-mode="board"] #mode-view {
+  overflow: hidden;
+}
+.mode-empty {
+  max-width: 560px;
+  padding-top: 8vh;
+}
+.mode-empty h2,
+.tasks-head h2,
+.board-head h2 {
+  font-family:
+    Inter,
+    -apple-system,
+    BlinkMacSystemFont,
+    "Segoe UI",
+    sans-serif;
+  color: var(--ink);
+  font-size: 22px;
+  letter-spacing: -0.5px;
+  font-weight: 600;
+  margin: 8px 0 8px;
+}
+.mode-empty .launcher-intro,
+.tasks-head .launcher-intro,
+.board-head .fine {
+  font-family:
+    Inter,
+    -apple-system,
+    BlinkMacSystemFont,
+    "Segoe UI",
+    sans-serif;
+}
+.mode-empty .launcher-intro {
+  margin-bottom: 18px;
+}
+.mode-board {
+  grid-template-columns: minmax(200px, 260px) minmax(0, 1fr);
+  flex: 1;
+  min-height: 0;
+}
+.mode-board .board-rail {
+  overflow: auto;
+  min-height: 0;
+}
+.mode-board .board-thread {
+  min-height: 0;
+}
+.board-rail {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  border-right: 1px solid color-mix(in srgb, var(--muted) 25%, transparent);
+  padding-right: 16px;
+}
+.board-rail-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 6px;
+}
+.board-rail-head button {
+  padding: 2px 8px;
+  font-size: 14px;
+  line-height: 1.4;
+}
+.board-rail [data-board-task] {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 2px;
+  text-align: left;
+  padding: 8px 10px;
+  background: transparent;
+  border-color: transparent;
+}
+.board-rail [data-board-task][aria-pressed="true"] {
+  border-color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 10%, transparent);
+}
+.board-task-name {
+  font-size: 12px;
+}
+.board-rail .fine {
+  margin-top: 0;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.board-head {
+  border-bottom: 1px solid color-mix(in srgb, var(--muted) 25%, transparent);
+  padding-bottom: 10px;
+  margin-bottom: 8px;
+}
+.board-head .fine {
+  margin: 0 0 8px;
+}
+.board-agents-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  align-items: center;
+}
+.board-agents-row .board-agent {
+  padding: 4px 8px;
+}
+.board-agents-row .board-agent .fine {
+  margin-left: 4px;
+}
+.mode-board .board-messages {
+  max-height: none;
+  min-height: 0;
+  flex: 1;
+}
+.tasks-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 24px;
+  max-width: 920px;
+  margin-bottom: 22px;
+}
+.tasks-head .launcher-intro {
+  margin: 0;
+}
+.task-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
+  gap: 12px;
+}
+.task-card {
+  border: 1px solid color-mix(in srgb, var(--muted) 25%, transparent);
+  border-radius: 9px;
+  padding: 14px 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  background: color-mix(in srgb, var(--terminal-bg) 96%, var(--muted));
+}
+.task-card header {
+  height: auto;
+  border: 0;
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 12px;
+}
+.task-card h3 {
+  margin: 0;
+  font-size: 13px;
+}
+.task-card .fine {
+  margin: 0;
+}
+.task-goal {
+  margin: 0;
+  color: var(--muted);
+  font-size: 12px;
+}
+.task-agents {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.task-agents .board-agent {
+  padding: 4px 8px;
+}
+.task-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  align-items: center;
+  border-top: 1px solid color-mix(in srgb, var(--muted) 18%, transparent);
+  padding-top: 10px;
+}
+.task-actions .fine {
+  margin-right: auto;
+}
+.tasks-closed {
+  margin-top: 24px;
+  max-width: 560px;
+}
+.task-closed {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 6px 0;
+  border-bottom: 1px solid color-mix(in srgb, var(--muted) 18%, transparent);
+  font-size: 12px;
+}
+@media (max-width: 760px) {
+  .mode-switch button {
+    padding: 6px 8px;
+    letter-spacing: 0.04em;
+  }
+  .mode-board {
+    grid-template-columns: 1fr;
+  }
+  .board-rail {
+    border-right: 0;
+    padding-right: 0;
+    border-bottom: 1px solid color-mix(in srgb, var(--muted) 25%, transparent);
+    padding-bottom: 8px;
+    flex-direction: row;
+    flex-wrap: wrap;
+  }
+  .tasks-head {
+    flex-direction: column;
+  }
+}
+
+/* Files mode */
+.files-view {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  flex: 1;
+  min-height: 0;
+  border: 1px dashed transparent;
+  border-radius: 9px;
+}
+.files-view.dragging {
+  border-color: var(--accent);
+}
+.files-bar {
+  display: grid;
+  grid-template-columns: minmax(180px, 260px) minmax(0, 1fr) minmax(
+      200px,
+      320px
+    );
+  gap: 10px;
+  align-items: center;
+}
+.files-crumbs {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 2px;
+  font-size: 12px;
+  min-width: 0;
+}
+.files-crumbs button {
+  padding: 4px 6px;
+  background: transparent;
+  border-color: transparent;
+}
+.files-crumbs button:hover {
+  border-color: color-mix(in srgb, var(--muted) 35%, transparent);
+}
+.files-sep {
+  color: var(--muted);
+}
+#files-goto input {
+  width: 100%;
+}
+.files-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  align-items: center;
+}
+.files-spacer {
+  flex: 1;
+}
+.files-upload-label .button-like {
+  display: inline-block;
+  padding: 8px 10px;
+  border: 1px solid color-mix(in srgb, var(--muted) 25%, transparent);
+  border-radius: 6px;
+  font-size: 11px;
+  cursor: pointer;
+}
+.files-upload-label:has(input:disabled) .button-like {
+  opacity: 0.45;
+  cursor: default;
+}
+.files-status {
+  margin: 0;
+  min-height: 1.2em;
+}
+.files-error {
+  color: var(--accent);
+  margin-left: 8px;
+}
+.files-table-wrap {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  border: 1px solid color-mix(in srgb, var(--muted) 25%, transparent);
+  border-radius: 7px;
+}
+.files-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12px;
+}
+.files-table th {
+  position: sticky;
+  top: 0;
+  background: var(--terminal-bg);
+  text-align: left;
+  font-weight: normal;
+  border-bottom: 1px solid color-mix(in srgb, var(--muted) 25%, transparent);
+  padding: 0;
+}
+.files-table th button {
+  width: 100%;
+  text-align: left;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  padding: 8px 10px;
+  font-size: 10px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+.files-table td {
+  padding: 6px 10px;
+  border-bottom: 1px solid color-mix(in srgb, var(--muted) 14%, transparent);
+  white-space: nowrap;
+}
+.files-table tbody tr {
+  cursor: default;
+}
+.files-table tbody tr:hover td {
+  background: color-mix(in srgb, var(--muted) 10%, transparent);
+}
+.files-table tbody tr.selected td {
+  background: color-mix(in srgb, var(--accent) 12%, transparent);
+}
+.files-table tbody tr:focus-visible {
+  outline: 1px solid var(--accent);
+  outline-offset: -1px;
+}
+.files-name {
+  max-width: 50vw;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.files-icon {
+  display: inline-block;
+  width: 14px;
+  color: var(--muted);
+}
+.is-dir .files-icon {
+  color: var(--accent);
+}
+.files-size,
+.files-mtime,
+.files-mode {
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+.files-size {
+  text-align: right;
+}
+.files-drop {
+  margin: 0;
+  text-align: center;
+}
+@media (max-width: 760px) {
+  .files-bar {
+    grid-template-columns: 1fr;
+  }
+  .files-mode,
+  .files-table th:nth-child(4) {
+    display: none;
+  }
+}

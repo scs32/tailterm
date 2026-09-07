@@ -128,7 +128,6 @@ export function createTaskHub(host) {
           }
           await reconcile(feed);
           host.render();
-          boardRefresh?.(taskId, events);
         },
         {
           after: detail.latestSeq,
@@ -514,117 +513,23 @@ export function createTaskHub(host) {
     };
   }
 
-  let boardRefresh = null;
-  async function board(taskId = taskOfTab(host.currentTab()?.id)) {
+  // The board lives in Board mode; the host switches modes and selects the task.
+  function board(taskId = taskOfTab(host.currentTab()?.id)) {
     if (!requireHub()) return;
-    if (!taskId) {
-      host.notice("Attach a task to this tab first.");
+    host.openBoard(taskId || null);
+  }
+  function attachToCurrent(taskId) {
+    const tab = host.currentTab();
+    if (!tab) {
+      host.notice("Open a terminal tab first, then attach the task to it.");
       return;
     }
-    host.dialog("Task board", `<p class="fine">Loading…</p>`);
-    let detail, messages;
-    try {
-      [detail, messages] = await Promise.all([
-        client.getTask(taskId),
-        client.listMessages(taskId, { limit: 200 }),
-      ]);
-    } catch (e) {
-      host.dialog("Task board", `<p class="fine">${esc(formatError(e))}</p>`);
-      return;
-    }
-    cache.set(taskId, { task: detail.task, agents: detail.agents });
-    const names = new Map(detail.agents.map((a) => [a.id, a.name]));
-    // The feed and a post response can both deliver the same message.
-    const addMessages = (list) => {
-      const seen = new Set(messages.map((m) => m.seq));
-      for (const m of list)
-        if (!seen.has(m.seq)) {
-          messages.push(m);
-          seen.add(m.seq);
-        }
-      messages.sort((a, b) => a.seq - b.seq);
-    };
-    const render = () => {
-      const agentsHTML = detail.agents
-        .map(
-          (a) =>
-            `<button class="board-agent" data-board-agent="${esc(a.id)}" title="${esc(a.host)} · ${esc(a.session)}"><span class="status-dot ${STATUS_DOT[a.status] || ""}"></span><span>${esc(a.name)}</span><span class="fine">${esc(a.status.replace("_", " "))}${a.unread ? ` · ${a.unread} unread` : ""}</span></button>`,
-        )
-        .join("");
-      const thread = messages.length
-        ? messages
-            .map((m) => {
-              const from = m.from.agentId
-                ? names.get(m.from.agentId) || m.from.agentId
-                : m.from.user || "you";
-              const to = m.to ? ` → ${names.get(m.to) || m.to}` : "";
-              return `<div class="board-message"><span class="board-meta">${esc(from)}${esc(to)} · ${esc(new Date(m.createdAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }))}</span><div class="board-text">${esc(m.text)}</div></div>`;
-            })
-            .join("")
-        : '<p class="fine">No messages yet.</p>';
-      host.dialog(
-        `Task board · ${detail.task.name}`,
-        `<div class="board"><aside class="board-agents"><span class="eyebrow">AGENTS</span>${agentsHTML || '<p class="fine">No agents.</p>'}<button id="board-add-agent">＋ Add agent</button></aside><section class="board-thread"><div id="board-messages" class="board-messages">${thread}</div><form id="board-compose"><select id="board-to"><option value="">Everyone</option>${detail.agents
-          .filter((a) => a.status !== "closed")
-          .map((a) => `<option value="${esc(a.id)}">${esc(a.name)}</option>`)
-          .join(
-            "",
-          )}</select><textarea id="board-text" rows="2" placeholder="Message the task…" maxlength="8192"></textarea><button class="primary" type="submit">Post</button></form></section></div><p class="fine">${esc(detail.task.goal || "")}</p>`,
-      );
-      const list = document.querySelector("#board-messages");
-      list.scrollTop = list.scrollHeight;
-      document.querySelectorAll("[data-board-agent]").forEach((b) => {
-        b.onclick = () => {
-          const tab = host
-            .getTabs()
-            .find(
-              (t) => !t.disposed && t.task?.agentId === b.dataset.boardAgent,
-            );
-          if (tab) {
-            host.closeDialog();
-            host.activate(tab.id);
-          }
-        };
-      });
-      document.querySelector("#board-add-agent").onclick = () =>
-        addAgent(taskId);
-      document.querySelector("#board-compose").onsubmit = async (e) => {
-        e.preventDefault();
-        const text = document.querySelector("#board-text").value.trim();
-        if (!text) return;
-        try {
-          const m = await client.postMessage(taskId, {
-            text,
-            to: document.querySelector("#board-to").value,
-          });
-          addMessages([m]);
-          document.querySelector("#board-text").value = "";
-          render();
-        } catch (error) {
-          host.notice("Post failed: " + formatError(error));
-        }
-      };
-    };
-    render();
-    boardRefresh = async (id, events) => {
-      if (id !== taskId || !document.querySelector("#board-compose")) {
-        if (!document.querySelector("#board-compose")) boardRefresh = null;
-        return;
-      }
-      try {
-        const last = messages.at(-1)?.seq || 0;
-        const [fresh, agents] = await Promise.all([
-          client.listMessages(taskId, { after: last, limit: 200 }),
-          events.some((e) => e.kind !== "message")
-            ? client.listAgents(taskId)
-            : detail.agents,
-        ]);
-        addMessages(fresh);
-        detail.agents = agents;
-        for (const a of agents) names.set(a.id, a.name);
-        render();
-      } catch {}
-    };
+    attach(taskId, tab.id);
+    host.showTerminals?.();
+    host.notice("Task attached. Agent panes appear in this tab as they start.");
+  }
+  function groupOf(taskId) {
+    return host.paneGroups()?.model.taskGroup(taskId) || null;
   }
 
   async function refreshRuntimes(server) {
@@ -667,9 +572,12 @@ export function createTaskHub(host) {
   }
 
   return {
+    client: () => client,
     refresh,
     ready,
     sync,
+    groupOf,
+    attachToCurrent,
     stopAll,
     attach,
     detach,

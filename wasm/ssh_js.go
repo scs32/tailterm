@@ -243,6 +243,16 @@ func (s *jsSSHSession) Run() {
 			}
 		}
 	}()
+	if sftpCfg := cfg.Get("sftp"); sftpCfg.Type() == js.TypeObject && !sftpCfg.IsNull() {
+		callback(cfg, "onConnected")
+		if err := sftpSession(ctx, client, sftpCfg); err != nil {
+			fail("SFTP", err)
+			callback(cfg, "onExit", 1)
+		} else {
+			callback(cfg, "onExit", 0)
+		}
+		return
+	}
 	if upload := cfg.Get("upload"); upload.Type() == js.TypeObject && !upload.IsNull() {
 		callback(cfg, "onConnected")
 		if err := uploadFile(ctx, client, upload); err != nil {
