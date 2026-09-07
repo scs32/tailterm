@@ -1,4 +1,5 @@
 import { credentialCache } from "./credential-cache.js";
+import { createAttentionSound } from "./attention-sound.js";
 import { createInactivityLock, IDLE_MINUTES } from "./inactivity.js";
 import { createAppearancePreview } from "./appearance-preview.js";
 import { normalizeTabDecoration, showTabDecoration } from "./tab-decoration.js";
@@ -92,6 +93,17 @@ const browserTransport = staticMode ? await import("./browser-ssh.js") : null;
 if (staticMode) setKeyImporter((body) => api("/keys", "POST", body));
 const owner = crypto.randomUUID();
 let appearance = readAppearance();
+const attentionSound = createAttentionSound({
+  enabled: () => appearance.attentionSound,
+});
+for (const event of ["pointerdown", "keydown"])
+  document.addEventListener(
+    event,
+    () => {
+      if (appearance.attentionSound) void attentionSound.unlock();
+    },
+    { capture: true },
+  );
 let paneGroups;
 let discoveryPending = false;
 applyChrome(appearance);
@@ -1195,10 +1207,15 @@ function appearanceDialog() {
           `<label><input type="checkbox" data-preference="${k}" ${appearance[k] ? "checked" : ""}>${label}</label>`,
       )
       .join("")}</div>
+    <h3>Attention sound</h3><div class="appearance-toggles"><label><input type="checkbox" data-preference="attentionSound" ${appearance.attentionSound ? "checked" : ""}>Play a gentle chime</label></div><button id="preview-attention-sound">Preview sound</button><p class="fine">Off by default. Chimes for bells, command completion, and connection problems in unattended tabs, at most once every five seconds. Ordinary output stays silent. Keep Tailterm open and interact once after loading to enable browser audio.</p>
     <details class="dialog-details"><summary>Keyboard & selection tips</summary><p class="fine">Switch grouped panes with Option + Shift + arrow keys on Mac, or Ctrl + Alt + arrow keys on Windows/Linux.</p>
     <p class="fine">Hold Shift while dragging to select text when tmux handles the mouse. Plain Ctrl+C still interrupts a command. Remote clipboard read requests are never answered.</p></details>`,
   );
   // Preview terminal font changes without reflowing the controls being clicked.
+  $("#preview-attention-sound").onclick = async () => {
+    if (!(await attentionSound.preview()))
+      notice("Audio is unavailable. Check your browser’s sound settings.");
+  };
   $("#dialog").style.setProperty(
     "--appearance-ui-font",
     fonts[appearance.font].family,
@@ -1244,6 +1261,8 @@ function appearanceDialog() {
     (el) =>
       (el.onchange = () => {
         appearance[el.dataset.preference] = el.checked;
+        if (el.dataset.preference === "attentionSound" && el.checked)
+          void attentionSound.unlock();
         updateAppearance();
       }),
   );
@@ -1353,6 +1372,7 @@ async function connect(
       if (!t.el.hidden && !t.disposed) fit.fit();
     });
     t.observer.observe(el);
+    });
     activate(t.id);
     fit.fit();
     term.onTitleChange((title) => {
@@ -1371,6 +1391,7 @@ async function connect(
       if (t.activity === label || (label === "New output" && t.activity))
         return;
       t.activity = label;
+      attentionSound.notify(label);
       renderTabs();
     };
     t.activitySnapshot = screenLines(term, tmux);
