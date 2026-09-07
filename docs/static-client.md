@@ -61,6 +61,17 @@ For standard SSH without a saved credential, connect opens the key/password/inte
 
 Terminals draw with xterm's WebGL renderer when the browser offers WebGL2. Each terminal holds a GPU context only while visible and releases it when hidden, so grouped and background tabs stay within browser context limits. A lost context falls back to the DOM renderer and retries. Appearance → Rendering turns GPU rendering off; font ligatures only render with it off. Browser suites that read terminal rows from the DOM opt out through `tests/dom-renderer.mjs`; `tests/renderer-browser.mjs` covers the WebGL path.
 
+### Task teams and modes
+
+The workspace header switches between Terminals, Board, Files, and Tasks with a
+segmented control or Ctrl/Cmd + 1-4. A terminal tab can carry a **task** from
+the hub; it then mirrors that task's agents, opening a pane per agent and
+removing panes as agents close. See [tasks](tasks.md) for the hub, the `tt`
+agent CLI, and setup. Files browses and transfers files on one server over the
+same SFTP path as uploads. Browser storage keeps the hub URL, per-task session
+bindings, and the last folder per server; none of it is sent anywhere but the
+hub and the servers you configure.
+
 ### Workspace continuity
 
 After unlocking, the browser restores previously connected tabs, active tab, group layout, split proportions, and tab order from the encrypted vault. Server endpoints must still match the saved workspace. Plain SSH tabs start a fresh shell; tmux tabs resume the existing remote session. SSH passwords that were not remembered must be entered again. No vault key or passphrase is stored to bypass unlocking. Workspace changes save shortly after interaction; a refresh during the final fraction of a second of a change may retain the preceding layout.

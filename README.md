@@ -18,6 +18,9 @@ A browser SSH terminal that connects through Tailscale. Run it from a static web
 - Open terminal URLs with Command-click on Mac or Ctrl-click on Windows/Linux.
 - Copy and paste through tmux, including bracketed paste, multiline confirmation, and OSC 52 clipboard support.
 - Customize colors, fonts, cursor, spacing, and focus-following behavior.
+- Render terminals on the GPU with WebGL, with a toggle for ligature-friendly DOM rendering.
+- Run teams of AI coding agents as **tasks**: a terminal tab mirrors every agent on the task, agents message each other through a shared board, and lifecycle events surface as tab activity. See [tasks](docs/tasks.md).
+- Switch the workspace between Terminals, Board, Files, and Tasks modes. Files is a server-wide browser and transfer tool over SFTP.
 
 The terminal renderer is xterm.js. The appearance controls take inspiration from Ghostty configurations; this does not embed Ghostty.
 
@@ -60,12 +63,13 @@ No application backend is needed for the static deployment. It still uses Tailsc
 - Closing the page disconnects SSH. Remote tmux sessions continue. The encrypted workspace remembers tabs, groups, and server filters and restores them after unlocking; plain SSH tabs open fresh shells. Local scrollback does not survive a reload.
 - This version does not provide SFTP, port forwarding, native ssh-agent integration, or automatic cross-device synchronization.
 
-See [the static-client guide](docs/static-client.md) for architecture, controls, deployment, and validation limits, and [appearance references](docs/appearance.md) for theme sources.
+See [the static-client guide](docs/static-client.md) for architecture, controls, deployment, and validation limits, [tasks](docs/tasks.md) for the agent-team hub, and [appearance references](docs/appearance.md) for theme sources.
 
 ## Development and tests
 
 ```sh
 npm test
+npm run test:hub
 npm run test:links
 npm run test:context-menu
 npx playwright install chromium
@@ -76,7 +80,7 @@ npm run build:static
 npm run test:static
 ```
 
-The static browser suite uses a separately compiled test-only WASM transport connected to a local SSH fixture. That transport is excluded from the production module. It tests real SSH authentication, terminal input, tmux flows, grouping, encrypted storage, and UI behavior without requiring your tailnet credentials.
+The static browser suite uses a separately compiled test-only WASM transport connected to a local SSH fixture. That transport is excluded from the production module. It tests real SSH authentication, terminal input, tmux flows, grouping, encrypted storage, task mirroring against an in-memory hub, SFTP file operations, and UI behavior without requiring your tailnet credentials. `npm run test:hub` runs the Go hub and `tt` CLI tests.
 
 To test the original client with Safari's browser engine:
 
@@ -92,8 +96,9 @@ A deployed-site smoke check is available as `node tests/deployed-browser.mjs htt
 - `client/`: browser UI, encrypted vault, SSH orchestration, and WASM loader.
 - `wasm/`: Tailscale-derived Go WASM source and the SSH extensions.
 - `shared/`: remote tmux command generation.
-- `scripts/`: reproducible WASM builds, static packaging, and deployment helpers.
+- `scripts/`: reproducible WASM builds, static packaging, deployment, and the apple/container dev stack.
 - `tests/`: unit, SSH integration, browser, and real-tmux checks.
+- `hub/`: the Go task hub (`tailterm-hub`) and agent CLI (`tt`). See [tasks](docs/tasks.md) and [`hub/README.md`](hub/README.md).
 - `server/`: the original optional Node.js SSH gateway, retained for development and migration. See [server-backed mode](docs/server-backed.md).
 
 Generated builds, vault files, credentials, local Cloudflare state, and test screenshots are excluded from version control. Tailscale and Go notices are retained in `wasm/`; static packaging includes the licenses of linked dependencies.
