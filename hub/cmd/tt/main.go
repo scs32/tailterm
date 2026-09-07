@@ -287,11 +287,20 @@ func resolveAgent(ctx context.Context, c *api.Client, task, ref string) (string,
 }
 
 func cmdPost(e env, args []string) error {
-	fs := flag.NewFlagSet("post", flag.ExitOnError)
+	fs := flag.NewFlagSet("post", flag.ContinueOnError)
+	fs.Usage = func() {
+		fmt.Fprintln(fs.Output(), "Usage: tt post [--to AGENT] [--reply-to SEQ] [--task ID] <text>")
+		fmt.Fprintln(fs.Output(), "Reply to a human on the shared board: tt post --reply-to SEQ \"message\" (omit --to).")
+		fmt.Fprintln(fs.Output(), "Use -- before literal text starting with '-'; use - to read text from stdin.")
+		fs.PrintDefaults()
+	}
 	to := fs.String("to", "", "agent id or name")
 	reply := fs.Int64("reply-to", 0, "message sequence being answered")
 	task := fs.String("task", e.task, "task id")
 	if err := fs.Parse(postArgs(args)); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return nil
+		}
 		return err
 	}
 	text := strings.Join(fs.Args(), " ")
@@ -313,7 +322,7 @@ func cmdPost(e env, args []string) error {
 	defer cancel()
 	target, err := resolveAgent(ctx, c, *task, *to)
 	if err != nil {
-		return err
+		return fmt.Errorf("%w; --to accepts agents only. To reply to a human, use tt post --reply-to SEQ \"message\" without --to (shared board reply)", err)
 	}
 	m, err := c.PostMessage(ctx, *task, api.PostMessageRequest{Text: text, To: target, AgentID: e.agent, ReplyTo: *reply})
 	if err != nil {
@@ -402,13 +411,17 @@ func formatMessage(m api.Message, names map[string]string) string {
 	if m.From.AgentID != "" {
 		from = or(names[m.From.AgentID], m.From.AgentID)
 	} else if m.From.User != "" {
-		from = m.From.User
+		from = m.From.User + " (human)"
 	}
 	to := ""
 	if m.To != "" {
 		to = " → " + or(names[m.To], m.To)
 	}
-	return fmt.Sprintf("#%d %s %s%s: %s", m.Seq, m.CreatedAt.Local().Format("15:04"), from, to, m.Text)
+	line := fmt.Sprintf("#%d %s %s%s: %s", m.Seq, m.CreatedAt.Local().Format("15:04"), from, to, m.Text)
+	if m.From.AgentID == "" {
+		line += fmt.Sprintf("\n  Reply on the shared board: tt post --reply-to %d \"your reply\" (omit --to; sender is human).", m.Seq)
+	}
+	return line
 }
 
 func selfPath() string {

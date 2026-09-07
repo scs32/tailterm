@@ -31,7 +31,11 @@ does not run commands on agent hosts.
 
 `tt inbox --unread --mark-read` retrieves pending messages. Read receipts record
 retrieval, not task completion. `tt post 'message' --to reviewer --reply-to 17`
-sends a targeted reply. Without `--to`, a message is a team announcement.
+sends a targeted reply to an agent. To reply to a human such as `owner`, use
+`tt post --reply-to 17 'message'` without `--to`; the reply appears on the shared
+board. Human usernames are not agent recipients. Without either flag, a message
+is a team announcement. `tt post --help` displays usage; use `tt post -- '--help'`
+only if you actually want to post that literal text.
 
 There is no terminal input injection. A stopped or idle agent is not
 unconditionally woken by a new message. It reads at checkpoints, on a new
