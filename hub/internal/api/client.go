@@ -15,8 +15,9 @@ import (
 
 // Client is a small JSON client for the hub.
 type Client struct {
-	Base string
-	HTTP *http.Client
+	Base  string
+	Token string
+	HTTP  *http.Client
 }
 
 func NewClient(base string, timeout time.Duration) (*Client, error) {
@@ -47,6 +48,9 @@ func (c *Client) do(ctx context.Context, method, path string, body, out any) err
 	req, err := http.NewRequestWithContext(ctx, method, c.Base+path, buf)
 	if err != nil {
 		return err
+	}
+	if c.Token != "" {
+		req.Header.Set("Authorization", "Bearer "+c.Token)
 	}
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")

@@ -93,7 +93,7 @@ type Options struct {
 }
 
 // Create starts a detached tmux session with an agent window running the
-// command through `tt wrap` and a watcher window running `tt watch`.
+// command through `tt wrap`. Messages are retrieved from the inbox.
 func Create(o Options) error {
 	v, err := Version()
 	if err != nil {
@@ -109,19 +109,12 @@ func Create(o Options) error {
 	for k, val := range o.Env {
 		args = append(args, "-e", k+"="+val)
 	}
-	agentCmd := ShellQuote(o.Self) + " wrap -- " + o.Command
+	agentCmd := ShellQuote(o.Self) + " wrap --shell " + ShellQuote(o.Command)
 	args = append(args, agentCmd)
 	if out, err := tmux(args...).CombinedOutput(); err != nil {
 		return fmt.Errorf("tmux new-session: %s", strings.TrimSpace(string(out)))
 	}
-	watchArgs := []string{"new-window", "-d", "-t", "=" + o.Session, "-n", WatchWindow}
-	if o.Cwd != "" {
-		watchArgs = append(watchArgs, "-c", o.Cwd)
-	}
-	watchArgs = append(watchArgs, ShellQuote(o.Self)+" watch")
-	if out, err := tmux(watchArgs...).CombinedOutput(); err != nil {
-		return fmt.Errorf("tmux new-window: %s", strings.TrimSpace(string(out)))
-	}
+
 	return nil
 }
 
@@ -130,20 +123,6 @@ func Kill(session string) error {
 	out, err := tmux("kill-session", "-t", "="+session).CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("tmux kill-session: %s", strings.TrimSpace(string(out)))
-	}
-	return nil
-}
-
-// Inject types text followed by Enter into the agent window of a session.
-func Inject(session, text string) error {
-	target := "=" + session + ":" + AgentWindow
-	if out, err := tmux("send-keys", "-t", target, "-l", text).CombinedOutput(); err != nil {
-		return fmt.Errorf("tmux send-keys: %s", strings.TrimSpace(string(out)))
-	}
-	// A short pause lets full-screen agents render the pasted text before Enter.
-	time.Sleep(150 * time.Millisecond)
-	if out, err := tmux("send-keys", "-t", target, "Enter").CombinedOutput(); err != nil {
-		return fmt.Errorf("tmux send-keys Enter: %s", strings.TrimSpace(string(out)))
 	}
 	return nil
 }

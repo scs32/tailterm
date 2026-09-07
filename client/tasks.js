@@ -37,18 +37,35 @@ export const openAgent = (a) => a.status !== "closed";
 //   unknown:  open agents whose host matches no saved server
 //   close:    panes bound to this task whose agent is closed or gone
 //   adopt:    panes matching an agent by server and session but not yet bound
-export function reconcileTask({ taskId, agents, tabs, servers }) {
+export function reconcileTask({
+  taskId,
+  agents,
+  tabs,
+  servers,
+  hidden = new Set(),
+}) {
   const live = tabs.filter((t) => !t.disposed);
   const byAgent = new Map();
   for (const t of live)
-    if (t.task?.taskId === taskId && t.task.agentId)
+    if (
+      t.task?.taskId === taskId &&
+      t.task.agentId &&
+      !agents.some(
+        (a) => a.id === t.task.agentId && a.runId && t.task.runId !== a.runId,
+      )
+    )
       byAgent.set(t.task.agentId, t);
   const open = [],
     unknown = [],
     adopt = [];
   let bound = byAgent.size;
   for (const a of agents) {
-    if (!openAgent(a)) continue;
+    if (
+      !openAgent(a) ||
+      (a.status === "starting" && a.runId) ||
+      hidden.has(a.id)
+    )
+      continue;
     if (byAgent.has(a.id)) continue;
     const server = matchServer(a.host, servers);
     const existing =
@@ -74,7 +91,12 @@ export function reconcileTask({ taskId, agents, tabs, servers }) {
   }
   const ids = new Set(agents.filter(openAgent).map((a) => a.id));
   const close = live.filter(
-    (t) => t.task?.taskId === taskId && !ids.has(t.task.agentId),
+    (t) =>
+      t.task?.taskId === taskId &&
+      (!ids.has(t.task.agentId) ||
+        agents.some(
+          (a) => a.id === t.task.agentId && a.runId && t.task.runId !== a.runId,
+        )),
   );
   return { open, unknown, close, adopt };
 }
@@ -84,6 +106,7 @@ export function taskBinding(taskId, agent) {
     taskId,
     agentId: agent.id,
     agentName: agent.name,
+    runId: agent.runId,
   });
 }
 
@@ -92,6 +115,7 @@ const STATUS_LABEL = {
   running: "running",
   done: "done",
   needs_input: "needs input",
+  exited: "exited",
   closed: "closed",
 };
 
@@ -104,7 +128,7 @@ export function taskRollup(agents, unknownHosts = 0) {
     counts[a.status] = (counts[a.status] || 0) + 1;
   }
   const parts = [`${total} agent${total === 1 ? "" : "s"}`];
-  for (const status of ["needs_input", "running", "done", "starting"])
+  for (const status of ["needs_input", "running", "done", "starting", "exited"])
     if (counts[status]) parts.push(`${counts[status]} ${STATUS_LABEL[status]}`);
   if (unknownHosts)
     parts.push(
@@ -124,7 +148,7 @@ export function applyEvents(agents, events) {
     const a = byId.get(e.agentId);
     switch (e.kind) {
       case "agent_added":
-        if (!a) refresh = true;
+        refresh = true;
         break;
       case "started":
       case "running":
@@ -137,6 +161,19 @@ export function applyEvents(agents, events) {
       case "needs_input":
         if (a) a.status = "needs_input";
         attention.set(e.agentId, "Needs attention");
+        break;
+      case "heartbeat":
+        if (a) {
+          a.lastSeenAt = e.createdAt;
+          a.online = true;
+        }
+        break;
+      case "exited":
+        if (a) {
+          a.status = "exited";
+          a.online = false;
+        }
+        attention.set(e.agentId, "Agent exited");
         break;
       case "closed":
         if (a) a.status = "closed";

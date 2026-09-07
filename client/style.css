@@ -4020,3 +4020,273 @@ body[data-mode="board"] #mode-view {
     display: none;
   }
 }
+
+/* Shared workspace chrome stays visible in every mode, including fullscreen. */
+#workspace.expanded {
+  grid-template-columns: minmax(0, 1fr);
+}
+#workspace.expanded > aside {
+  display: none;
+}
+#workspace.expanded > main {
+  padding-left: 20px;
+  padding-right: 20px;
+}
+html:fullscreen {
+  background: var(--terminal-bg);
+  width: 100%;
+  height: 100%;
+}
+.header-right #expand-terminal,
+.header-right #fullscreen {
+  flex-shrink: 0;
+}
+#mode-view {
+  padding: 18px 0 20px;
+}
+.view-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+}
+.view-heading h2,
+.view-heading h3 {
+  margin: 4px 0;
+}
+.board {
+  gap: 0;
+}
+.board-rail {
+  padding-right: 18px;
+}
+.board-rail-head {
+  padding: 0 8px 12px;
+}
+.board-rail [data-board-task] {
+  padding: 12px;
+  margin-bottom: 6px;
+  border-radius: 8px;
+}
+.board-thread {
+  min-width: 0;
+  padding-left: 22px;
+}
+.board-head {
+  padding-bottom: 16px;
+  border-bottom: 1px solid color-mix(in srgb, var(--muted) 20%, transparent);
+}
+.mode-board .board-messages {
+  padding: 16px 4px;
+  gap: 12px;
+}
+.board-message {
+  padding: 14px 16px;
+  border: 1px solid color-mix(in srgb, var(--muted) 18%, transparent);
+  border-radius: 9px;
+  background: color-mix(in srgb, var(--muted) 4%, transparent);
+}
+.board-meta {
+  display: flex;
+  gap: 12px;
+  align-items: baseline;
+  text-transform: none;
+  font-size: 11px;
+  letter-spacing: 0;
+}
+.board-meta strong {
+  color: var(--ink);
+  font-size: 12px;
+}
+.board-text {
+  line-height: 1.65;
+}
+.message-footer {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  font-size: 10px;
+  color: var(--muted);
+  margin-top: 10px;
+}
+.message-footer button {
+  padding: 3px 8px;
+  font-size: 11px;
+}
+.reply-context {
+  margin: 8px 0;
+  border-left: 2px solid var(--accent);
+  padding: 5px 10px;
+  color: var(--muted);
+  font-size: 11px;
+}
+.compose-reply,
+.compose-note {
+  grid-column: 1 / -1;
+  margin: 0;
+}
+.compose-reply {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  font-size: 11px;
+  color: var(--accent);
+}
+.compose-recipient {
+  font-size: 10px;
+  color: var(--muted);
+  display: grid;
+  gap: 5px;
+}
+#board-compose {
+  border-top: 1px solid color-mix(in srgb, var(--muted) 20%, transparent);
+  padding-top: 14px;
+  gap: 10px;
+}
+#board-compose textarea {
+  min-height: 62px;
+}
+.board-empty {
+  margin: auto;
+  max-width: 350px;
+  text-align: center;
+  padding: 40px 16px;
+}
+.needs-you {
+  margin: 6px 0 24px;
+  padding: 16px 18px;
+  border: 1px solid color-mix(in srgb, var(--accent) 35%, transparent);
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--accent) 4%, transparent);
+}
+.needs-you h3 {
+  font-size: 14px;
+}
+.count-badge {
+  font-size: 11px;
+  color: var(--accent);
+  padding: 3px 8px;
+  border-radius: 20px;
+  background: color-mix(in srgb, var(--accent) 12%, transparent);
+}
+.attention-row {
+  display: flex;
+  gap: 14px;
+  align-items: center;
+  width: 100%;
+  text-align: left;
+  margin-top: 10px;
+}
+.attention-row span:last-child {
+  margin-left: auto;
+}
+.task-card {
+  padding: 20px;
+  border-radius: 10px;
+}
+.task-card header {
+  align-items: baseline;
+  gap: 12px;
+}
+.task-goal {
+  line-height: 1.6;
+}
+.task-actions {
+  flex-wrap: wrap;
+  padding-top: 16px;
+  margin-top: 16px;
+  border-top: 1px solid color-mix(in srgb, var(--muted) 18%, transparent);
+}
+.task-actions > .fine {
+  flex-basis: 100%;
+  margin-bottom: 4px;
+}
+.files-view {
+  border: 1px solid color-mix(in srgb, var(--muted) 20%, transparent);
+  border-radius: 10px;
+  padding: 16px;
+}
+.files-bar,
+.files-actions {
+  gap: 10px;
+}
+.files-actions {
+  padding: 12px 0;
+  border-bottom: 1px solid color-mix(in srgb, var(--muted) 18%, transparent);
+}
+.files-status {
+  min-height: 22px;
+  margin: 8px 0;
+}
+.files-table th {
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.07em;
+}
+.files-table td {
+  padding-top: 11px;
+  padding-bottom: 11px;
+}
+.files-table tbody tr:hover {
+  background: color-mix(in srgb, var(--accent) 6%, transparent);
+}
+.files-drop {
+  padding: 14px;
+  border: 1px dashed color-mix(in srgb, var(--muted) 30%, transparent);
+  border-radius: 7px;
+  margin-top: 14px;
+  text-align: center;
+}
+@media (max-width: 760px) {
+  #workspace > main > header {
+    flex-wrap: wrap;
+    gap: 8px;
+  }
+  .mode-switch {
+    flex: 1;
+  }
+  .mode-switch button {
+    padding: 7px 8px;
+    flex: 1;
+  }
+  .board-thread {
+    padding-left: 0;
+  }
+  .board-rail {
+    padding-right: 0;
+    max-height: 130px;
+    overflow: auto;
+  }
+  .view-heading {
+    flex-wrap: wrap;
+  }
+  .board-meta,
+  .files-actions,
+  .attention-row {
+    flex-wrap: wrap;
+  }
+  .files-view {
+    padding: 10px;
+  }
+}
+
+/* Header rows must participate in layout when controls wrap on a phone. */
+#workspace > main > #mode-view {
+  flex: 1;
+  height: 0;
+}
+@media (max-width: 760px) {
+  #workspace > main > header,
+  body.terminal-open #workspace > main > header {
+    flex: 0 0 auto;
+    height: auto;
+    min-height: 88px;
+    padding: 6px 0;
+  }
+  #workspace > main > header .mode-switch {
+    flex-basis: 100%;
+  }
+  #workspace > main > header .header-right {
+    margin-left: auto;
+  }
+}

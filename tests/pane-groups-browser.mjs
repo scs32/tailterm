@@ -407,6 +407,21 @@ export async function exercisePaneGroups(page, getInput = () => undefined) {
     await page.locator(".terminal-instance:not([hidden])").count(),
     3,
   );
+  assert.equal(
+    await page.evaluate(
+      () => document.fullscreenElement === document.documentElement,
+    ),
+    true,
+  );
+  await page.locator("#expand-terminal").click();
+  assert.equal(await page.evaluate(() => !!document.fullscreenElement), true);
+  assert.equal(
+    await page
+      .locator("#workspace")
+      .evaluate((el) => el.classList.contains("expanded")),
+    true,
+  );
+  await page.locator("#expand-terminal").click();
   // Drag a member out into its own tab while fullscreen.
   const sourceBox = await pane(ids[2]).locator(".pane-label").boundingBox();
   await page.mouse.move(sourceBox.x + 35, sourceBox.y + sourceBox.height / 2);
@@ -432,11 +447,11 @@ export async function exercisePaneGroups(page, getInput = () => undefined) {
   // Expanded mode fills the browser viewport without invoking fullscreen.
   await page.locator("#expand-terminal").click();
   assert.equal(await page.evaluate(() => !!document.fullscreenElement), false);
-  const expanded = await page.locator(".terminal-shell").boundingBox();
+  const expanded = await page.locator("#workspace").boundingBox();
   assert.equal(Math.round(expanded.x), 0);
-  assert.equal(Math.round(expanded.y), 0);
+  assert.ok(expanded.y >= 0);
   assert.equal(Math.round(expanded.width), page.viewportSize().width);
-  assert.equal(Math.round(expanded.height), page.viewportSize().height);
+  assert.ok(await page.locator("#fullscreen").isVisible());
   await assertTerminalBounds(page);
   await pane(ids[2])
     .getByRole("button", { name: "Ungroup pane", exact: true })

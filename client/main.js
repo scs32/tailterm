@@ -203,6 +203,7 @@ async function flushWorkspace() {
       active,
       serverFilter,
       taskHub?.bound() || [],
+      taskHub?.hidden() || [],
     ),
     serialized = JSON.stringify(snapshot);
   if (serialized === savedWorkspace) return;
@@ -234,7 +235,7 @@ async function restoreWorkspace(value) {
       }
       paneGroups.model.groups = snapshot.groups;
       paneGroups.sync();
-      taskHub?.restore(snapshot.tasks);
+      taskHub?.restore(snapshot.tasks, snapshot.hiddenAgents);
       activate(
         tabs.some((t) => t.id === snapshot.active)
           ? snapshot.active
@@ -533,6 +534,7 @@ function mount() {
       getTabs: () => tabs,
       activate,
       notice,
+      revealAgent: (id) => taskHub.revealAgent(id),
       addAgent: (id) => taskHub.addAgent(id),
       attachTask: (id) => taskHub.attachToCurrent(id),
       newTask: () => taskHub.newTask(),
@@ -1025,9 +1027,10 @@ function disposeTab(t, replacing = false) {
   tabs = tabs.filter((x) => x !== t);
   if (!replacing) paneGroups?.sync();
 }
-function closeTab(id) {
+function closeTab(id, { fromHub = false } = {}) {
   const t = tabs.find((t) => t.id === id);
   if (!t) return;
+  if (!fromHub && t.task) taskHub?.hideAgent(t.task.agentId);
   const index = tabs.indexOf(t),
     wasActive = active === id;
   const sibling = paneGroups?.members(id).find((member) => member !== id);
@@ -1540,7 +1543,7 @@ async function connect(
     t.renderer = createRenderer(term, viewport, {
       enabled: () => appearance.gpuRendering,
     });
-    activate(t.id);
+    if (!options.quiet) activate(t.id);
     fit.fit();
     term.onTitleChange((title) => {
       t.title = title.slice(0, 200);
@@ -2249,6 +2252,9 @@ async function lock() {
   credentialCache.clear();
   reconnects.clear();
   taskHub?.stopAll();
+  boardView?.hide();
+  tasksView?.hide();
+  filesView?.hide();
   imageUploads?.cancel();
   voiceDictation?.cancel();
   tabs.forEach((t) => t.close?.());

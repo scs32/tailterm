@@ -13,6 +13,9 @@ export function normalizeTaskRef(value) {
   if (!TASK_ID_RE.test(taskId) || !AGENT_ID_RE.test(agentId)) return null;
   return {
     taskId,
+    runId: /^run_[0-9a-f]{16}$/.test(value.runId || "")
+      ? value.runId
+      : undefined,
     agentId,
     agentName: AGENT_NAME_RE.test(agentName) ? agentName : "",
   };

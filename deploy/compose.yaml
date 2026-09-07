@@ -1,16 +1,20 @@
-# Docker Compose / TrueNAS Custom App definition for the tailterm stack.
-# The hub joins the tailnet as its own node; it publishes no host port.
+# Example for an existing private network. The deployed TrueNAS app is managed
+# by scripts/deploy-truenas-hub.py and uses a versioned binary mount.
 services:
   hub:
     image: tailterm-hub:latest
     build: ../hub
     restart: unless-stopped
     environment:
-      TS_AUTHKEY: ${TS_AUTHKEY}
-      TS_HOSTNAME: ${TS_HOSTNAME:-tailterm-hub}
+      TAILTERM_TCP_LISTEN: 0.0.0.0:18765
+      TAILTERM_TOKEN_FILE: /run/hub-token
       TAILTERM_STATE: /state
+      TAILTERM_MAX_AGENTS: '8'
+    ports:
+      - '${HUB_BIND_IP:?Set the existing private interface IP}:18765:18765'
     volumes:
       - hub-state:/state
+      - '${HUB_TOKEN_FILE:?Set a token file path}:/run/hub-token:ro'
   tailterm:
     image: tailterm-static:latest
     build:
@@ -18,6 +22,6 @@ services:
       dockerfile: Dockerfile.static
     restart: unless-stopped
     ports:
-      - "127.0.0.1:4318:80"
+      - '127.0.0.1:4318:80'
 volumes:
   hub-state:

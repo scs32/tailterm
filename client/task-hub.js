@@ -1,7 +1,7 @@
 // Task hub controller: owns the hub client, per-task event feeds, the mirror
 // loop that keeps a task tab's panes in step with the hub's agent list, and
 // the task dialogs reachable from the command palette.
-import { createHubClient } from "./hub-client.js";
+import { createHubClient, normalizeHubURL } from "./hub-client.js";
 import { normalizeTaskId, AGENT_NAME_RE } from "./task-ref.js";
 import {
   reconcileTask,
@@ -35,6 +35,7 @@ export function createTaskHub(host) {
   //   browserCommand, render, scheduleWorkspaceSave, bookmark}
   let client = null;
   const feeds = new Map(); // taskId -> {stop, agents, task, unknown, cursor}
+  const hidden = new Set();
   const bound = new Set(); // task ids mirrored into tabs
   const cache = new Map(); // taskId -> {task, agents} for tooltips/dialogs
   let tasksList = [];
@@ -47,11 +48,15 @@ export function createTaskHub(host) {
       stopAll();
       return null;
     }
-    if (client?.base !== url) {
+    if (
+      client?.base !== url ||
+      client?.token !== (host.getData()?.hub?.token || "")
+    ) {
       stopAll();
       client = createHubClient({
         fetchImpl: (u, init) => ipn.fetch(u, init),
         baseURL: url,
+        token: host.getData()?.hub?.token || "",
       });
     }
     sync();
@@ -82,7 +87,9 @@ export function createTaskHub(host) {
       taskId,
       agents: [],
       unknown: 0,
-      stop: () => {},
+      stop() {
+        this.stopped = true;
+      },
       stopped: false,
     };
     feeds.set(taskId, feed);
@@ -92,6 +99,12 @@ export function createTaskHub(host) {
         detail = await client.getTask(taskId);
       } catch (error) {
         host.notice(`Task hub: ${error.message}`);
+        if (!feed.stopped) {
+          feeds.delete(taskId);
+          setTimeout(() => {
+            if (!feed.stopped && client && bound.has(taskId)) sync();
+          }, 5000);
+        }
         return;
       }
       if (feed.stopped) return;
@@ -103,6 +116,7 @@ export function createTaskHub(host) {
         return;
       }
       await reconcile(feed);
+      if (feed.stopped) return;
       const subscription = client.subscribe(
         taskId,
         async (events) => {
@@ -156,13 +170,14 @@ export function createTaskHub(host) {
       agents: feed.agents,
       tabs: host.getTabs(),
       servers: host.getServers(),
+      hidden,
     });
     feed.unknown = r.unknown.length;
     for (const { tab, agent } of r.adopt) {
       tab.task = taskBinding(feed.taskId, agent);
       host.bookmark(tab);
     }
-    for (const tab of r.close) host.closeTab(tab.id);
+    for (const tab of r.close) host.closeTab(tab.id, { fromHub: true });
     for (const { agent, server } of r.open) {
       if (feed.stopped) return;
       try {
@@ -227,7 +242,8 @@ export function createTaskHub(host) {
     const line = `Task ${info.task.name}: ${taskRollup(info.agents, feed?.unknown || 0)}`;
     return feed?.error ? `${line}\nHub: ${feed.error}` : line;
   }
-  function restore(taskIds = []) {
+  function restore(taskIds = [], hiddenIds = []) {
+    for (const id of hiddenIds) hidden.add(id);
     for (const id of taskIds) if (normalizeTaskId(id)) bound.add(id);
     sync();
   }
@@ -253,9 +269,40 @@ export function createTaskHub(host) {
     const current = host.getData()?.hub?.url || "";
     host.dialog(
       "Task hub",
-      `<p class="fine">Tasks, agents, and the message board live on a hub that runs as its own Tailscale node. Tailterm reaches it through this browser’s Tailscale connection, so use the hub’s tailnet name.</p><label>Hub URL<input id="hub-url" value="${esc(current)}" placeholder="http://tailterm-hub" autocomplete="off" spellcheck="false"></label><p id="hub-status" class="fine">${current ? "Configured." : "Not configured."}</p><div class="dialog-actions"><button id="hub-test">Test connection</button><button id="hub-save" class="primary">Save</button>${current ? '<button id="hub-clear" class="danger">Remove</button>' : ""}</div>`,
+      `<p class="fine">Tasks and messages live on your coordination hub. Use its address on your private network. The access token is saved in your encrypted vault. Agent hosts also need this token in ~/.config/tailterm/hub.json.</p><label>Hub URL<input id="hub-url" value="${esc(current)}" placeholder="http://tailterm-hub" autocomplete="off" spellcheck="false"></label><label>Access token<input id="hub-token" type="password" value="${esc(host.getData()?.hub?.token || "")}" autocomplete="off" placeholder="Required for a network listener"></label><label>Agent host<select id="hub-config-server">${serverOptions(host.currentServer()?.id)}</select></label><button id="hub-load-host" type="button">Load configuration from server</button><p id="hub-status" class="fine">${current ? "Configured." : "Not configured."}</p><div class="dialog-actions"><button id="hub-test">Test connection</button><button id="hub-save" class="primary">Save</button>${current ? '<button id="hub-clear" class="danger">Remove</button>' : ""}</div>`,
     );
     const status = document.querySelector("#hub-status");
+    document.querySelector("#hub-load-host").onclick = async () => {
+      status.textContent = "Reading host configuration…";
+      try {
+        const server = host
+          .getServers()
+          .find(
+            (s) => s.id === document.querySelector("#hub-config-server").value,
+          );
+        if (!server) throw new Error("Choose a saved server first.");
+        const result = JSON.parse(
+          await host.browserCommand(
+            server,
+            'cat "$HOME/.config/tailterm/hub.json"',
+            4096,
+          ),
+        );
+        if (
+          !normalizeHubURL(result.url) ||
+          typeof result.token !== "string" ||
+          result.token.length > 512 ||
+          /[\x00-\x20\x7f]/.test(result.token)
+        )
+          throw new Error("Invalid host configuration.");
+        document.querySelector("#hub-url").value = result.url;
+        document.querySelector("#hub-token").value = result.token;
+        status.textContent =
+          "Loaded. Test the connection, then Save to your encrypted vault.";
+      } catch (error) {
+        status.textContent = "Could not load: " + formatError(error);
+      }
+    };
     document.querySelector("#hub-test").onclick = async () => {
       status.textContent = "Connecting…";
       try {
@@ -264,6 +311,7 @@ export function createTaskHub(host) {
         const probe = createHubClient({
           fetchImpl: (u, init) => ipn.fetch(u, init),
           baseURL: document.querySelector("#hub-url").value,
+          token: document.querySelector("#hub-token").value.trim(),
         });
         const who = await probe.whoami();
         status.textContent = `Hub sees this browser as ${who.node || "?"} (${who.user || "no user"}).`;
@@ -275,6 +323,7 @@ export function createTaskHub(host) {
       try {
         await host.api("/hub", "POST", {
           url: document.querySelector("#hub-url").value,
+          token: document.querySelector("#hub-token").value.trim(),
         });
         await host.reloadData();
         refresh();
@@ -325,14 +374,14 @@ export function createTaskHub(host) {
   };
 
   function agentFields(server) {
-    return `<div class="appearance-controls"><label>Agent name<input id="agent-name" value="agent1" maxlength="64" autocomplete="off" spellcheck="false"></label><label>Runtime<select id="agent-runtime">${runtimeOptions(server)}</select></label></div><label>Command<input id="agent-run" placeholder="claude" autocomplete="off" spellcheck="false"></label><p class="fine">Runs inside the agent’s tmux window through <code>tt wrap</code>, so any command reports started and done. Claude Code and Codex get richer status through <code>tt hooks</code>.</p><label>Working directory<input id="agent-cwd" placeholder="/home/ubuntu/project (optional)" autocomplete="off" spellcheck="false"></label><label>Prompt<textarea id="agent-prompt" rows="3" placeholder="Optional. Appended to the command as its first argument."></textarea></label>`;
+    return `<label>Launch profile<select id="agent-profile"><option value="">Custom setup</option>${(host.getData().launchProfiles || []).map((p) => `<option value="${esc(p.name)}">${esc(p.name)}</option>`).join("")}</select></label><div class="appearance-controls"><label>Agent name<input id="agent-name" value="agent1" maxlength="64" autocomplete="off" spellcheck="false"></label><label>Runtime<select id="agent-runtime">${runtimeOptions(server)}</select></label></div><label>Command<input id="agent-run" placeholder="claude" autocomplete="off" spellcheck="false"></label><p class="fine">Runs inside the agent’s tmux window through <code>tt wrap</code>, so any command reports started and exited. Claude Code and Codex get richer status through <code>tt hooks</code>.</p><label>Working directory<input id="agent-cwd" placeholder="/home/ubuntu/project (optional)" autocomplete="off" spellcheck="false"></label><label>Prompt<textarea id="agent-prompt" rows="3" placeholder="Optional. Included with the shared task briefing."></textarea></label><button id="agent-save-profile" type="button">Save launch profile</button>`;
   }
   function readAgentFields() {
     const runtime = document.querySelector("#agent-runtime").value;
     const run = document.querySelector("#agent-run").value.trim() || runtime;
     return {
       name: document.querySelector("#agent-name").value.trim(),
-      runtime: runtime || run.split(/\s+/)[0],
+      runtime: runtime || "generic",
       run,
       cwd: document.querySelector("#agent-cwd").value.trim(),
       prompt: document.querySelector("#agent-prompt").value.trim(),
@@ -351,6 +400,35 @@ export function createTaskHub(host) {
     runtime.onchange = update;
     run.oninput = () => (run.dataset.auto = "false");
     update();
+    const profiles = host.getData().launchProfiles || [];
+    document.querySelector("#agent-profile").onchange = (e) => {
+      const p = profiles.find((p) => p.name === e.target.value);
+      if (!p) return;
+      const selector = document.querySelector("#task-server");
+      selector.value = p.serverId;
+      selector.dispatchEvent(new Event("change"));
+      document.querySelector("#agent-profile").value = p.name;
+      document.querySelector("#agent-runtime").value =
+        p.runtime === "generic" ? "" : p.runtime;
+      document.querySelector("#agent-run").value = p.run;
+      document.querySelector("#agent-run").dataset.auto = "false";
+      document.querySelector("#agent-cwd").value = p.cwd;
+    };
+    const save = document.querySelector("#agent-save-profile");
+    if (save)
+      save.onclick = async () => {
+        try {
+          const f = readAgentFields();
+          await host.api("/launch-profiles", "POST", {
+            ...f,
+            serverId: document.querySelector("#task-server").value,
+          });
+          await host.reloadData();
+          host.notice(`Saved launch profile ${f.name}.`);
+        } catch (e) {
+          host.notice(e.message);
+        }
+      };
   }
 
   async function spawn(taskId, server, fields) {
@@ -572,6 +650,16 @@ export function createTaskHub(host) {
   }
 
   return {
+    hideAgent(id) {
+      hidden.add(id);
+      host.scheduleWorkspaceSave();
+    },
+    revealAgent(id) {
+      hidden.delete(id);
+      for (const f of feeds.values()) reconcile(f);
+      host.scheduleWorkspaceSave();
+    },
+    hidden: () => [...hidden],
     client: () => client,
     refresh,
     ready,

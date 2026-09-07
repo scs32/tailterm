@@ -1,6 +1,6 @@
 // Command tt is the tailterm agent CLI: it registers agent sessions with the
 // hub, posts events and messages, spawns sibling agents on this host, and runs
-// the per-session watcher that pushes messages into idle agents.
+// durable inbox integration for agent runtimes.
 package main
 
 import (
@@ -12,10 +12,8 @@ import (
 	"io"
 	"os"
 	"os/exec"
-	"os/signal"
 	"path/filepath"
 	"strings"
-	"syscall"
 	"time"
 
 	"github.com/scs32/tailterm/hub/internal/adapters"
@@ -29,17 +27,19 @@ Identity comes from the environment tailterm sets on agent sessions:
   TAILTERM_HUB   TAILTERM_TASK   TAILTERM_AGENT   TAILTERM_AGENT_NAME
 
 Commands
+  doctor                       check hub, tmux, and installed runtimes
+  brief                        print the shared task briefing
   status                       identity, hub reachability, own agent, unread count
   tasks                        list tasks on the hub
   agents [--json]              list agents on this task
-  event <kind> [--text T]      post started|running|done|needs_input|closed
+  event <kind> [--text T]      post started|running|done|needs_input|exited|closed
   post <text> [--to AGENT]     post a message to the task or one agent
   inbox [--unread] [--mark-read] [--json]
   spawn --name N --run CMD [--cwd D] [--prompt P] [--runtime R] [--task ID]
                                start a sibling agent session on this host
   close [AGENT]                close an agent session on this host (default: self)
-  watch                        push task messages into this agent when idle
-  wrap -- CMD                  run CMD, reporting started/done to the hub
+  watch                        deprecated; inbox delivery never types into panes
+  wrap -- CMD                  run CMD, reporting started/exited to the hub
   runtimes [--json]            agent CLIs available on this host
   hooks <claude|codex|generic> print integration snippets
   hook <session-start|prompt|stop|notification|codex>
@@ -48,24 +48,32 @@ Commands
 `
 
 type env struct {
-	hub, task, agent, agentName, session string
+	hub, task, agent, agentName, session, runID, token, configHub string
 }
 
 func readEnv() env {
-	return env{
+	e := env{
+		token:     os.Getenv("TAILTERM_TOKEN"),
+		runID:     os.Getenv("TAILTERM_RUN"),
 		hub:       os.Getenv(spawn.EnvHub),
 		task:      os.Getenv(spawn.EnvTask),
 		agent:     os.Getenv(spawn.EnvAgent),
 		agentName: os.Getenv(spawn.EnvAgentName),
 		session:   os.Getenv(spawn.EnvSession),
 	}
+	e.loadConfig()
+	return e
 }
 
 func (e env) client(timeout time.Duration) (*api.Client, error) {
 	if e.hub == "" {
 		return nil, errors.New("TAILTERM_HUB is not set")
 	}
-	return api.NewClient(e.hub, timeout)
+	c, err := api.NewClient(e.hub, timeout)
+	if c != nil {
+		c.Token = e.token
+	}
+	return c, err
 }
 
 func (e env) requireTask() (string, error) {
@@ -81,6 +89,11 @@ func die(err error) {
 }
 
 func main() {
+	// SSH exec and tmux often start without the interactive shell's PATH.
+	// Preserve existing precedence, then add standard user/package locations.
+	home, _ := os.UserHomeDir()
+	parts := []string{os.Getenv("PATH"), filepath.Dir(selfPath()), filepath.Join(home, ".local", "bin"), "/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin"}
+	_ = os.Setenv("PATH", strings.Join(parts, string(os.PathListSeparator)))
 	if len(os.Args) < 2 || os.Args[1] == "-h" || os.Args[1] == "--help" || os.Args[1] == "help" {
 		fmt.Print(usage)
 		return
@@ -89,6 +102,10 @@ func main() {
 	e := readEnv()
 	var err error
 	switch cmd {
+	case "doctor":
+		err = cmdDoctor(e)
+	case "brief":
+		err = cmdBrief(e)
 	case "status":
 		err = cmdStatus(e)
 	case "tasks":
@@ -236,7 +253,7 @@ func postEvent(e env, kind, text string, data map[string]any) error {
 	}
 	ctx, cancel := ctxTimeout(5 * time.Second)
 	defer cancel()
-	_, err = c.PostEvent(ctx, task, api.PostEventRequest{Kind: kind, AgentID: e.agent, Text: text, Data: data})
+	_, err = c.PostEvent(ctx, task, api.PostEventRequest{Kind: kind, AgentID: e.agent, RunID: e.runID, Text: text, Data: data})
 	return err
 }
 
@@ -248,7 +265,7 @@ func cmdEvent(e env, args []string) error {
 	text := fs.String("text", "", "event text")
 	_ = fs.Parse(args[1:])
 	if !api.PostableKind(args[0]) {
-		return fmt.Errorf("kind must be one of started running done needs_input closed")
+		return fmt.Errorf("kind must be one of started running done needs_input exited closed")
 	}
 	return postEvent(e, args[0], *text, nil)
 }
@@ -272,8 +289,11 @@ func resolveAgent(ctx context.Context, c *api.Client, task, ref string) (string,
 func cmdPost(e env, args []string) error {
 	fs := flag.NewFlagSet("post", flag.ExitOnError)
 	to := fs.String("to", "", "agent id or name")
+	reply := fs.Int64("reply-to", 0, "message sequence being answered")
 	task := fs.String("task", e.task, "task id")
-	_ = fs.Parse(args)
+	if err := fs.Parse(postArgs(args)); err != nil {
+		return err
+	}
 	text := strings.Join(fs.Args(), " ")
 	if text == "-" || (text == "" && !isTerminal(os.Stdin)) {
 		b, _ := io.ReadAll(os.Stdin)
@@ -295,7 +315,7 @@ func cmdPost(e env, args []string) error {
 	if err != nil {
 		return err
 	}
-	m, err := c.PostMessage(ctx, *task, api.PostMessageRequest{Text: text, To: target, AgentID: e.agent})
+	m, err := c.PostMessage(ctx, *task, api.PostMessageRequest{Text: text, To: target, AgentID: e.agent, ReplyTo: *reply})
 	if err != nil {
 		return err
 	}
@@ -413,7 +433,7 @@ func cmdSpawn(e env, args []string) error {
 	hub := fs.String("hub", e.hub, "hub URL")
 	asJSON := fs.Bool("json", false, "print the agent record as JSON")
 	_ = fs.Parse(args)
-	if *name == "" || *run == "" {
+	if *name == "" || strings.TrimSpace(*run) == "" {
 		return errors.New("usage: tt spawn --name N --run CMD [--cwd D] [--prompt P]")
 	}
 	if !api.ValidName(*name) {
@@ -439,15 +459,28 @@ func cmdSpawn(e env, args []string) error {
 	if *prompt != "" {
 		command += " " + spawn.ShellQuote(*prompt)
 	}
-	c, err := api.NewClient(*hub, 10*time.Second)
+	e.hub = *hub
+	e.loadConfig()
+	c, err := e.client(10 * time.Second)
 	if err != nil {
 		return err
 	}
 	ctx, cancel := ctxTimeout(15 * time.Second)
 	defer cancel()
 	session := spawn.UniqueSession(*name)
+	detail, err := c.GetTask(ctx, *task)
+	if err != nil {
+		return err
+	}
+	briefing := taskBriefing(detail.Task, *name)
+	if *prompt != "" {
+		briefing += "\nAssignment: " + *prompt
+	}
+	if *runtime != "generic" {
+		command = *run + " " + spawn.ShellQuote(briefing)
+	}
 	agent, err := c.AddAgent(ctx, *task, api.AddAgentRequest{
-		AgentID: api.NewID("agt"), Name: *name, Host: spawn.Host(), Session: session,
+		Name: *name, Host: spawn.Host(), Session: session,
 		Runtime: *runtime, Cwd: *cwd, ParentAgentID: e.agent,
 	})
 	if err != nil {
@@ -456,8 +489,8 @@ func cmdSpawn(e env, args []string) error {
 	err = spawn.Create(spawn.Options{
 		Session: session, Cwd: *cwd, Command: command, Self: selfPath(),
 		Env: map[string]string{
-			spawn.EnvHub: *hub, spawn.EnvTask: *task, spawn.EnvAgent: agent.ID,
-			spawn.EnvAgentName: agent.Name, spawn.EnvSession: session,
+			"TAILTERM_TOKEN": e.token, spawn.EnvHub: *hub, spawn.EnvTask: *task, spawn.EnvAgent: agent.ID,
+			spawn.EnvAgentName: agent.Name, spawn.EnvSession: session, "TAILTERM_RUN": agent.RunID, "TAILTERM_BRIEFING": briefing,
 		},
 	})
 	if err != nil {
@@ -513,142 +546,53 @@ func cmdClose(e env, args []string) error {
 }
 
 func cmdWrap(e env, args []string) error {
+	command, err := wrapCommand(args)
+	if err != nil {
+		return err
+	}
+	report := func(kind, text string) {
+		if e.task != "" && e.agent != "" && e.hub != "" {
+			_ = postEvent(e, kind, text, nil)
+		}
+	}
+	stopped := make(chan struct{})
+	return spawn.Wrap(command, func() {
+		report(api.EventStarted, "Process started")
+		go func() {
+			ticker := time.NewTicker(30 * time.Second)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-stopped:
+					return
+				case <-ticker.C:
+					report(api.EventHeartbeat, "")
+				}
+			}
+		}()
+	}, func(code int) { close(stopped); report(api.EventExited, fmt.Sprintf("Process exited (%d)", code)) })
+}
+
+func wrapCommand(args []string) (string, error) {
+	if len(args) == 2 && args[0] == "--shell" {
+		return args[1], nil
+	}
 	if len(args) > 0 && args[0] == "--" {
 		args = args[1:]
 	}
 	if len(args) == 0 {
-		return errors.New("usage: tt wrap -- CMD")
+		return "", errors.New("usage: tt wrap -- PROGRAM [ARGS] or tt wrap --shell COMMAND")
 	}
-	command := strings.Join(args, " ")
-	report := func(kind string, text string) {
-		if e.task == "" || e.agent == "" || e.hub == "" {
-			return
-		}
-		_ = postEvent(e, kind, text, nil)
+	words := make([]string, len(args))
+	for i, a := range args {
+		words[i] = spawn.ShellQuote(a)
 	}
-	return spawn.Wrap(command,
-		func() { report(api.EventStarted, command) },
-		func(code int) { report(api.EventDone, fmt.Sprintf("exit %d", code)) })
+	return strings.Join(words, " "), nil
 }
 
+// Old watcher windows can safely remain after an upgrade: never send pane input.
 func cmdWatch(e env) error {
-	task, err := e.requireTask()
-	if err != nil {
-		return err
-	}
-	if e.agent == "" || e.session == "" {
-		return errors.New("TAILTERM_AGENT and TAILTERM_SESSION must be set")
-	}
-	c, err := e.client(40 * time.Second)
-	if err != nil {
-		return err
-	}
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
-	fmt.Printf("[tt watch] agent %s (%s) on task %s\n", e.agentName, e.agent, task)
-	var after int64
-	if list, err := c.Events(ctx, task, 0, 0, 1); err == nil {
-		after = list.Next
-	}
-	if latest, err := c.Events(ctx, task, 0, 0, api.MaxLimit); err == nil && len(latest.Events) > 0 {
-		after = latest.Events[len(latest.Events)-1].Seq
-	}
-	backoff := time.Second
-	var lastInject time.Time
-	flush := func() {
-		// Space injections out so a burst of messages arrives as separate prompts.
-		if wait := 2*time.Second - time.Since(lastInject); wait > 0 {
-			select {
-			case <-time.After(wait):
-			case <-ctx.Done():
-				return
-			}
-		}
-		a, err := c.GetAgent(ctx, task, e.agent)
-		if err != nil || !api.IdleStatus(a.Status) || a.Unread == 0 {
-			return
-		}
-		cursor, err := readCursor(ctx, c, task, e.agent)
-		if err != nil {
-			return
-		}
-		msgs, err := c.ListMessages(ctx, task, cursor, e.agent, 20)
-		if err != nil {
-			return
-		}
-		names := map[string]string{}
-		if agents, err := c.ListAgents(ctx, task); err == nil {
-			for _, ag := range agents {
-				names[ag.ID] = ag.Name
-			}
-		}
-		var lines []string
-		var last int64
-		for _, m := range msgs {
-			if m.From.AgentID == e.agent {
-				continue
-			}
-			from := "human"
-			if m.From.AgentID != "" {
-				from = or(names[m.From.AgentID], m.From.AgentID)
-			}
-			lines = append(lines, fmt.Sprintf("[task message from %s] %s", from, strings.ReplaceAll(m.Text, "\n", " ")))
-			last = m.Seq
-		}
-		if len(lines) == 0 {
-			return
-		}
-		if err := spawn.Inject(e.session, strings.Join(lines, " ")); err != nil {
-			fmt.Printf("[tt watch] inject failed: %v\n", err)
-			return
-		}
-		lastInject = time.Now()
-		_ = c.MarkRead(ctx, task, api.MarkReadRequest{AgentID: e.agent, UpTo: last})
-		fmt.Printf("[tt watch] delivered %d message(s)\n", len(lines))
-	}
-	flush()
-	for ctx.Err() == nil {
-		list, err := c.Events(ctx, task, after, 25*time.Second, api.MaxLimit)
-		if err != nil {
-			if ctx.Err() != nil {
-				return nil
-			}
-			fmt.Printf("[tt watch] hub error: %v (retry in %s)\n", err, backoff)
-			select {
-			case <-time.After(backoff):
-			case <-ctx.Done():
-				return nil
-			}
-			if backoff < 30*time.Second {
-				backoff *= 2
-			}
-			continue
-		}
-		backoff = time.Second
-		relevant := false
-		for _, ev := range list.Events {
-			after = ev.Seq
-			switch ev.Kind {
-			case api.EventMessage:
-				to, _ := ev.Data["to"].(string)
-				if ev.AgentID != e.agent && (to == "" || to == e.agent) {
-					relevant = true
-				}
-			case api.EventDone:
-				if ev.AgentID == e.agent {
-					relevant = true
-				}
-			case api.EventClosed, api.EventTaskClosed:
-				if ev.AgentID == e.agent || ev.Kind == api.EventTaskClosed {
-					fmt.Println("[tt watch] agent closed; exiting")
-					return nil
-				}
-			}
-		}
-		if relevant {
-			flush()
-		}
-	}
+	fmt.Println("[tt] Automatic terminal injection is disabled. Messages stay in the durable inbox; use tt inbox --unread --mark-read.")
 	return nil
 }
 
@@ -729,9 +673,10 @@ func cmdHook(e env, args []string) error {
 	}
 	switch args[0] {
 	case "session-start":
+		_ = cmdBrief(e)
 		quiet(api.EventStarted, "session start")
 		fmt.Printf("You are agent %q (%s) on tailterm task %s. Other agents on this task can message you. "+
-			"Use `tt inbox --unread --mark-read` to read messages, `tt post \"text\" [--to agent]` to reply, "+
+			"Use `tt inbox --unread --mark-read` to read messages, `tt post --to agent \"text\"` to reply, "+
 			"`tt agents` to see teammates, `tt event needs_input --text \"...\"` to ask the humans, and "+
 			"`tt spawn --name N --run \"cmd\"` to add a sibling agent on this host.\n", e.agentName, e.agent, e.task)
 		if n := unread(); n > 0 {
@@ -780,7 +725,9 @@ func cmdNewTask(e env, args []string) error {
 	if *name == "" {
 		return errors.New("usage: tt new-task --name N [--goal G]")
 	}
-	c, err := api.NewClient(*hub, 10*time.Second)
+	e.hub = *hub
+	e.loadConfig()
+	c, err := e.client(10 * time.Second)
 	if err != nil {
 		return err
 	}

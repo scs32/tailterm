@@ -386,7 +386,11 @@ func (s *Server) listMessages(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid agent id")
 		return
 	}
-	msgs, err := s.store.ListMessages(r.Context(), id, queryInt(r, "after", 0), to, int(queryInt(r, "limit", 50)))
+	after := queryInt(r, "after", 0)
+	if r.URL.Query().Get("latest") == "1" {
+		after = -1
+	}
+	msgs, err := s.store.ListMessages(r.Context(), id, after, to, int(queryInt(r, "limit", 50)))
 	if err != nil {
 		fail(w, err)
 		return

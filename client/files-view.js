@@ -81,22 +81,28 @@ export function createFilesView({
     busy = "",
     error = "",
     selected = null,
-    generation = 0;
+    generation = 0,
+    listing = 0,
+    visible = false;
 
   function mount(container) {
     root = container;
   }
   async function show() {
     if (!root) return;
+    visible = true;
     if (!server) server = currentServer() || getServers()[0] || null;
     render();
     if (server && !sftp) await connect();
   }
   function hide() {
+    visible = false;
     disconnect();
   }
   function disconnect() {
     generation++;
+    listing++;
+    busy = "";
     try {
       sftp?.close();
     } catch {}
@@ -135,26 +141,29 @@ export function createFilesView({
     }
   }
   async function navigate(target, token = generation) {
-    if (!sftp) return;
+    if (!sftp || !visible) return;
+    const connection = sftp,
+      request = ++listing;
     busy = "Listing…";
     error = "";
     render();
     try {
-      const resolved = await sftp.realpath(target);
-      const result = await sftp.list(resolved);
-      if (token !== generation) return;
+      const resolved = await connection.realpath(target);
+      const result = await connection.list(resolved);
+      if (token !== generation || request !== listing || !visible) return;
       path = result.path;
       entries = result.entries;
       truncated = result.truncated;
       selected = null;
       remember(server.id, path);
     } catch (e) {
-      if (token !== generation) return;
+      if (token !== generation || request !== listing || !visible) return;
       error = errText(e);
       if (!path) {
         try {
-          const home = await sftp.home();
-          const result = await sftp.list(home);
+          const home = await connection.home();
+          const result = await connection.list(home);
+          if (token !== generation || request !== listing || !visible) return;
           path = result.path;
           entries = result.entries;
         } catch {}
@@ -166,23 +175,33 @@ export function createFilesView({
   async function refresh() {
     if (path) await navigate(path);
   }
-  async function run(label, action) {
-    if (!sftp) return;
+  async function run(label, action, token = generation) {
+    if (!sftp || !visible || token !== generation) return;
     busy = label;
     error = "";
     render();
     try {
       await action();
     } catch (e) {
+      if (token !== generation || !visible) return;
+      busy = "";
       error = errText(e);
-      notice(errText(e));
+      notice(error);
+      render();
+      return;
     }
+    if (token !== generation || !visible) return;
     busy = "";
     await refresh();
   }
 
   async function download(entry) {
-    const target = joinPath(path, entry.name);
+    const token = generation,
+      connection = sftp,
+      target = joinPath(path, entry.name);
+    if (busy || !connection) return;
+    transferred = 0;
+    transferTotal = entry.size;
     const chunks = [];
     let writable = null;
     // Small files download directly. Large ones stream to a chosen location
@@ -198,15 +217,30 @@ export function createFilesView({
         writable = null;
       }
     }
-    await run(`Downloading ${entry.name}…`, async () => {
-      await sftp.read(target, async (chunk) => {
-        if (writable) await writable.write(chunk);
-        else chunks.push(chunk);
-        progress(chunk.byteLength);
-      });
-      if (writable) await writable.close();
-      else downloadBlob(new Blob(chunks), entry.name);
-    });
+    await run(
+      `Downloading ${entry.name}…`,
+      async () => {
+        try {
+          await connection.read(target, async (chunk) => {
+            if (token !== generation || !visible)
+              throw new Error("Download cancelled after switching servers.");
+            if (writable) await writable.write(chunk);
+            else chunks.push(chunk);
+            progress(chunk.byteLength);
+          });
+          if (token !== generation || !visible) {
+            if (writable) await writable.abort();
+            return;
+          }
+          if (writable) await writable.close();
+          else downloadBlob(new Blob(chunks), entry.name);
+        } catch (error) {
+          if (writable) await writable.abort().catch(() => {});
+          throw error;
+        }
+      },
+      token,
+    );
   }
   let transferred = 0,
     transferTotal = 0;
@@ -219,7 +253,12 @@ export function createFilesView({
         : formatSize(transferred);
   }
   async function upload(files, overwrite = false) {
+    if (busy || !sftp) return;
+    const token = generation,
+      connection = sftp,
+      destination = path;
     for (const file of files) {
+      if (token !== generation || !visible || connection !== sftp) return;
       if (!NAME_RE.test(file.name)) {
         notice(`Skipped ${file.name}: unsupported filename.`);
         continue;
@@ -230,19 +269,22 @@ export function createFilesView({
       }
       transferred = 0;
       transferTotal = file.size;
-      await run(`Uploading ${file.name}…`, () =>
-        sftp.write(joinPath(path, file.name), {
-          size: file.size,
-          overwrite,
-          progress: (offset) => {
-            transferred = 0;
-            progress(offset);
-          },
-          readChunk: async (offset, length) =>
-            new Uint8Array(
-              await file.slice(offset, offset + length).arrayBuffer(),
-            ),
-        }),
+      await run(
+        `Uploading ${file.name}…`,
+        () =>
+          connection.write(joinPath(destination, file.name), {
+            size: file.size,
+            overwrite,
+            progress: (offset) => {
+              transferred = 0;
+              progress(offset);
+            },
+            readChunk: async (offset, length) =>
+              new Uint8Array(
+                await file.slice(offset, offset + length).arrayBuffer(),
+              ),
+          }),
+        token,
       );
       transferTotal = 0;
     }
@@ -269,7 +311,7 @@ export function createFilesView({
   }
 
   function render() {
-    if (!root) return;
+    if (!root || !visible) return;
     const servers = getServers();
     const options = servers
       .map(
@@ -309,6 +351,12 @@ export function createFilesView({
       `<tr><td colspan="4" class="fine">${sftp ? (path ? "Empty folder." : "") : server ? "Not connected." : "Add a server first."}</td></tr>`
     }</tbody></table></div><div class="files-drop fine">Drop files here to upload into ${esc(path || "the current folder")}.</div></div>`;
 
+    if (busy)
+      root
+        .querySelectorAll(
+          ".files-actions button, .files-actions input, [data-path], #files-path",
+        )
+        .forEach((el) => (el.disabled = true));
     root.querySelector("#files-server").onchange = async (e) => {
       server = servers.find((s) => s.id === e.target.value) || null;
       disconnect();
@@ -328,10 +376,18 @@ export function createFilesView({
     };
     root.querySelector("#files-up").onclick = () => navigate(parentPath(path));
     root.querySelector("#files-refresh").onclick = refresh;
-    root.querySelector("#files-mkdir").onclick = () =>
+    root.querySelector("#files-mkdir").onclick = () => {
+      const token = generation,
+        connection = sftp,
+        destination = path;
       prompt("New folder", "Folder name", "new-folder", (name) =>
-        run(`Creating ${name}…`, () => sftp.mkdir(joinPath(path, name))),
+        run(
+          `Creating ${name}…`,
+          () => connection.mkdir(joinPath(destination, name)),
+          token,
+        ),
       );
+    };
     root.querySelector("#files-upload").onchange = (e) => {
       const files = [...e.target.files];
       e.target.value = "";
@@ -358,6 +414,7 @@ export function createFilesView({
           ?.focus();
       };
       row.ondblclick = () => {
+        if (busy) return;
         if (entry.isDir) navigate(joinPath(path, entry.name));
         else download(entry);
       };
@@ -371,13 +428,26 @@ export function createFilesView({
       if (open) open.onclick = () => navigate(joinPath(path, current.name));
       const dl = root.querySelector("#files-download");
       if (dl) dl.onclick = () => download(current);
-      root.querySelector("#files-rename").onclick = () =>
+      root.querySelector("#files-rename").onclick = () => {
+        const token = generation,
+          connection = sftp,
+          destination = path;
         prompt("Rename", "New name", current.name, (name) =>
-          run(`Renaming ${current.name}…`, () =>
-            sftp.rename(joinPath(path, current.name), joinPath(path, name)),
+          run(
+            `Renaming ${current.name}…`,
+            () =>
+              connection.rename(
+                joinPath(destination, current.name),
+                joinPath(destination, name),
+              ),
+            token,
           ),
         );
+      };
       root.querySelector("#files-delete").onclick = async () => {
+        const token = generation,
+          connection = sftp,
+          target = joinPath(path, current.name);
         if (
           !(await confirm(
             `Delete ${current.name}?`,
@@ -387,8 +457,10 @@ export function createFilesView({
           ))
         )
           return;
-        await run(`Deleting ${current.name}…`, () =>
-          sftp.remove(joinPath(path, current.name)),
+        await run(
+          `Deleting ${current.name}…`,
+          () => connection.remove(target),
+          token,
         );
       };
     }

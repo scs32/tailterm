@@ -15,11 +15,12 @@ export class HubError extends Error {
     this.status = status;
   }
 }
-export function createHubClient({ fetchImpl, baseURL }) {
+export function createHubClient({ fetchImpl, baseURL, token = "" }) {
   const base = normalizeHubURL(baseURL);
   if (!base) throw new Error("Hub URL must be http(s)://host[:port]");
   async function request(path, { method = "GET", body, timeoutMs } = {}) {
     const init = { method, headers: {}, timeoutMs };
+    if (token) init.headers.Authorization = "Bearer " + token;
     if (body !== undefined) {
       init.body = JSON.stringify(body);
       init.headers["Content-Type"] = "application/json";
@@ -50,6 +51,7 @@ export function createHubClient({ fetchImpl, baseURL }) {
   };
   const client = {
     base,
+    token,
     request,
     whoami: () => request("/v1/whoami"),
     listTasks: async () => (await request("/v1/tasks")).tasks,

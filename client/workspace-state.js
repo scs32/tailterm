@@ -18,8 +18,12 @@ export function workspaceSnapshot(
   active,
   serverFilter = null,
   tasks = [],
+  hiddenAgents = [],
 ) {
   return {
+    hiddenAgents: hiddenAgents
+      .filter((id) => /^agt_[0-9a-f]{16}$/.test(id))
+      .slice(0, 400),
     tasks: [...new Set(tasks.map(normalizeTaskId).filter(Boolean))].slice(
       0,
       30,
@@ -121,6 +125,9 @@ export function normalizeWorkspace(value) {
           .filter(Boolean),
       ),
     ].slice(0, 30),
+    hiddenAgents: (Array.isArray(value.hiddenAgents) ? value.hiddenAgents : [])
+      .filter((id) => /^agt_[0-9a-f]{16}$/.test(id))
+      .slice(0, 400),
     active: ids.has(value.active) ? value.active : tabs[0]?.id,
   };
 }

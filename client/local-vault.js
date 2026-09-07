@@ -145,7 +145,8 @@ export function localData() {
     })),
     sessions: structuredClone(contents.sessions),
     workspace: normalizeWorkspace(contents.workspace),
-    hub: { url: contents.hub?.url || "" },
+    hub: { url: contents.hub?.url || "", token: contents.hub?.token || "" },
+    launchProfiles: structuredClone(contents.launchProfiles || []),
     backup: {
       changed: contents.backupChanged || null,
       exported: contents.backupExported || null,
@@ -377,6 +378,36 @@ export async function localAPI(url, method = "GET", body = {}) {
         session.target = structuredClone(body.target);
       }
     });
+  if (url === "/launch-profiles" && method === "POST")
+    return editVault((d) => {
+      const p = body;
+      if (
+        !/^[A-Za-z0-9_-]{1,64}$/.test(p.name || "") ||
+        !d.servers.some((s) => s.id === p.serverId) ||
+        typeof p.run !== "string" ||
+        !p.run.trim() ||
+        p.run.length > 1024 ||
+        /[\x00-\x1f\x7f]/.test(p.run) ||
+        typeof p.cwd !== "string" ||
+        p.cwd.length > 512 ||
+        (p.cwd && !p.cwd.startsWith("/"))
+      )
+        throw new Error("Invalid launch profile.");
+      const profiles = (d.launchProfiles || []).filter(
+        (x) => x.name !== p.name,
+      );
+      if (profiles.length >= 30) throw new Error("At most 30 launch profiles.");
+      d.launchProfiles = [
+        ...profiles,
+        {
+          name: p.name,
+          serverId: p.serverId,
+          run: p.run,
+          cwd: p.cwd,
+          runtime: String(p.runtime || "").slice(0, 64),
+        },
+      ];
+    });
   if (url === "/hub" && method === "POST")
     return editVault((d) => {
       const value = String(body?.url || "").trim();
@@ -384,7 +415,13 @@ export async function localAPI(url, method = "GET", body = {}) {
         throw new Error(
           "Hub URL must look like http://tailterm-hub or http://host:port.",
         );
-      d.hub = { url: value ? normalizeHubURL(value) : "" };
+      const token = String(body?.token || "").trim();
+      if (token.length > 512 || /[\x00-\x20\x7f]/.test(token))
+        throw new Error("Invalid hub token.");
+      d.hub = {
+        url: value ? normalizeHubURL(value) : "",
+        token: value ? token : "",
+      };
     });
   if (url.startsWith("/sessions/") && method === "DELETE")
     return editVault((d) => {
@@ -475,5 +512,25 @@ function validateData(d) {
   for (const s of d.servers) s.runtimes = normalizeRuntimes(s.runtimes);
   d.tailscale = d.tailscale || {};
   const hubURL = normalizeHubURL(d.hub?.url || "");
-  d.hub = { url: hubURL || "" };
+  const token = typeof d.hub?.token === "string" ? d.hub.token : "";
+  if (token.length > 512 || /[\x00-\x20\x7f]/.test(token))
+    throw new Error("Invalid hub token.");
+  d.hub = { url: hubURL || "", token };
+  d.launchProfiles = (Array.isArray(d.launchProfiles) ? d.launchProfiles : [])
+    .filter(
+      (p) =>
+        p &&
+        /^[A-Za-z0-9_-]{1,64}$/.test(p.name || "") &&
+        d.servers.some((s) => s.id === p.serverId) &&
+        typeof p.run === "string" &&
+        p.run.trim() &&
+        p.run.length <= 1024 &&
+        !/[\x00-\x1f\x7f]/.test(p.run) &&
+        typeof p.cwd === "string" &&
+        p.cwd.length <= 512 &&
+        (!p.cwd || p.cwd.startsWith("/")) &&
+        typeof p.runtime === "string" &&
+        /^[A-Za-z0-9._-]{0,64}$/.test(p.runtime),
+    )
+    .slice(0, 30);
 }

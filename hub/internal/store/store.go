@@ -20,10 +20,12 @@ import (
 const Global = "*"
 
 type Store struct {
-	db      *sql.DB
-	mu      sync.Mutex
-	waiters map[string]chan struct{}
-	now     func() time.Time
+	writeMu   sync.Mutex
+	MaxAgents int
+	db        *sql.DB
+	mu        sync.Mutex
+	waiters   map[string]chan struct{}
+	now       func() time.Time
 }
 
 const schema = `
@@ -77,7 +79,11 @@ func Open(path string) (*Store, error) {
 		db.Close()
 		return nil, fmt.Errorf("schema: %w", err)
 	}
-	return &Store{db: db, waiters: map[string]chan struct{}{}, now: func() time.Time { return time.Now().UTC() }}, nil
+	if err := migrate(db); err != nil {
+		db.Close()
+		return nil, err
+	}
+	return &Store{MaxAgents: api.MaxAgentsPerTask, db: db, waiters: map[string]chan struct{}{}, now: func() time.Time { return time.Now().UTC() }}, nil
 }
 
 func (s *Store) Close() error { return s.db.Close() }
@@ -115,6 +121,8 @@ func parseTS(s string) time.Time {
 // Tasks
 
 func (s *Store) CreateTask(ctx context.Context, req api.CreateTaskRequest, by api.Caller) (api.Task, error) {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
 	if !api.ValidName(req.Name) || !api.ValidText(req.Goal, api.MaxTextLen) {
 		return api.Task{}, api.ErrInvalid
 	}
@@ -215,6 +223,8 @@ func (s *Store) UpdateTask(ctx context.Context, id string, req api.UpdateTaskReq
 
 // CloseTask closes every open agent and then the task.
 func (s *Store) CloseTask(ctx context.Context, id string, by api.Caller) (api.Task, error) {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
 	t, err := s.GetTask(ctx, id)
 	if err != nil {
 		return t, err
@@ -242,17 +252,21 @@ func (s *Store) CloseTask(ctx context.Context, id string, by api.Caller) (api.Ta
 
 // Agents
 
-const agentCols = `id,task_id,name,host,session,runtime,cwd,parent_agent_id,status,title,created_at,last_event_at`
+const agentCols = `id,task_id,name,host,session,runtime,cwd,parent_agent_id,status,title,created_at,last_event_at,run_id,last_seen_at`
 
 func scanAgent(row interface{ Scan(...any) error }) (api.Agent, error) {
 	var a api.Agent
-	var created, last string
-	err := row.Scan(&a.ID, &a.TaskID, &a.Name, &a.Host, &a.Session, &a.Runtime, &a.Cwd, &a.ParentAgentID, &a.Status, &a.Title, &created, &last)
+	var created, last, seen string
+	err := row.Scan(&a.ID, &a.TaskID, &a.Name, &a.Host, &a.Session, &a.Runtime, &a.Cwd, &a.ParentAgentID, &a.Status, &a.Title, &created, &last, &a.RunID, &seen)
 	a.CreatedAt, a.LastEventAt = parseTS(created), parseTS(last)
+	a.LastSeenAt = parseTS(seen)
+	a.Online = !a.LastSeenAt.IsZero() && time.Since(a.LastSeenAt) < 90*time.Second && a.Status != api.AgentExited && a.Status != api.AgentClosed
 	return a, err
 }
 
 func (s *Store) AddAgent(ctx context.Context, taskID string, req api.AddAgentRequest, by api.Caller) (api.Agent, error) {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
 	t, err := s.GetTask(ctx, taskID)
 	if err != nil {
 		return api.Agent{}, err
@@ -279,20 +293,45 @@ func (s *Store) AddAgent(ctx context.Context, taskID string, req api.AddAgentReq
 		return api.Agent{}, api.ErrInvalid
 	}
 	var count int
-	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM agents WHERE task_id=? AND status<>'closed'`, taskID).Scan(&count); err != nil {
+	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM agents WHERE task_id=? AND status NOT IN ('closed','exited')`, taskID).Scan(&count); err != nil {
 		return api.Agent{}, err
 	}
-	if count >= api.MaxAgentsPerTask {
+	if count >= s.MaxAgents {
 		return api.Agent{}, api.ErrLimit
 	}
+	// An exited participant may start a new run, retaining identity and inbox.
+	var previousID string
+	err = s.db.QueryRowContext(ctx, `SELECT id FROM agents WHERE task_id=? AND name=? AND status<>'closed' ORDER BY created_at LIMIT 1`, taskID, req.Name).Scan(&previousID)
+	if err == nil {
+		previous, e := s.GetAgent(ctx, previousID)
+		if e != nil {
+			return api.Agent{}, e
+		}
+		if previous.Status != api.AgentExited || previous.Host != req.Host {
+			return api.Agent{}, api.ErrLimit
+		}
+		runID := api.NewID("run")
+		_, err = s.db.ExecContext(ctx, `UPDATE agents SET session=?,runtime=?,cwd=?,run_id=?,status='starting',last_seen_at='' WHERE id=?`, req.Session, req.Runtime, req.Cwd, runID, previousID)
+		if err != nil {
+			return api.Agent{}, err
+		}
+		_, err = s.addEvent(ctx, taskID, api.EventAgentAdded, previousID, req.Name, map[string]any{"runId": runID}, by)
+		if err != nil {
+			return api.Agent{}, err
+		}
+		return s.GetAgent(ctx, previousID)
+	}
+	if err != sql.ErrNoRows {
+		return api.Agent{}, err
+	}
 	now := s.now()
-	a := api.Agent{ID: req.AgentID, TaskID: taskID, Name: req.Name, Host: req.Host, Session: req.Session, Runtime: req.Runtime,
+	a := api.Agent{RunID: api.NewID("run"), ID: req.AgentID, TaskID: taskID, Name: req.Name, Host: req.Host, Session: req.Session, Runtime: req.Runtime,
 		Cwd: req.Cwd, ParentAgentID: req.ParentAgentID, Status: api.AgentStarting, CreatedAt: now, LastEventAt: now}
 	if a.ID == "" {
 		a.ID = api.NewID("agt")
 	}
-	_, err = s.db.ExecContext(ctx, `INSERT INTO agents (`+agentCols+`) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`,
-		a.ID, a.TaskID, a.Name, a.Host, a.Session, a.Runtime, a.Cwd, a.ParentAgentID, a.Status, a.Title, ts(now), ts(now))
+	_, err = s.db.ExecContext(ctx, `INSERT INTO agents (`+agentCols+`) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		a.ID, a.TaskID, a.Name, a.Host, a.Session, a.Runtime, a.Cwd, a.ParentAgentID, a.Status, a.Title, ts(now), ts(now), a.RunID, "")
 	if err != nil {
 		return a, err
 	}
@@ -344,6 +383,8 @@ func (s *Store) ListAgents(ctx context.Context, taskID string) ([]api.Agent, err
 }
 
 func (s *Store) UpdateAgent(ctx context.Context, id string, req api.UpdateAgentRequest, by api.Caller) (api.Agent, error) {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
 	a, err := s.GetAgent(ctx, id)
 	if err != nil {
 		return a, err
@@ -360,7 +401,7 @@ func (s *Store) UpdateAgent(ctx context.Context, id string, req api.UpdateAgentR
 	}
 	if req.Status != nil {
 		switch *req.Status {
-		case api.AgentRunning, api.AgentDone, api.AgentNeedsInput, api.AgentClosed:
+		case api.AgentRunning, api.AgentDone, api.AgentNeedsInput, api.AgentClosed, api.AgentExited:
 		default:
 			return a, api.ErrInvalid
 		}
@@ -371,6 +412,8 @@ func (s *Store) UpdateAgent(ctx context.Context, id string, req api.UpdateAgentR
 
 // CloseAgent marks an agent closed and emits a closed event.
 func (s *Store) CloseAgent(ctx context.Context, id string, by api.Caller) (api.Agent, error) {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
 	return s.setAgentStatus(ctx, id, api.AgentClosed, by, true)
 }
 
@@ -385,7 +428,7 @@ func (s *Store) setAgentStatus(ctx context.Context, id, status string, by api.Ca
 	}
 	a.Status, a.LastEventAt = status, now
 	if emit {
-		kind := map[string]string{api.AgentRunning: api.EventRunning, api.AgentDone: api.EventDone, api.AgentNeedsInput: api.EventNeedsInput, api.AgentClosed: api.EventClosed}[status]
+		kind := map[string]string{api.AgentRunning: api.EventRunning, api.AgentDone: api.EventDone, api.AgentNeedsInput: api.EventNeedsInput, api.AgentClosed: api.EventClosed, api.AgentExited: api.EventExited}[status]
 		if _, err := s.addEvent(ctx, a.TaskID, kind, id, "", nil, by); err != nil {
 			return a, err
 		}
@@ -398,6 +441,8 @@ func (s *Store) setAgentStatus(ctx context.Context, id, status string, by api.Ca
 // Messages
 
 func (s *Store) PostMessage(ctx context.Context, taskID string, req api.PostMessageRequest, by api.Caller) (api.Message, error) {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
 	t, err := s.GetTask(ctx, taskID)
 	if err != nil {
 		return api.Message{}, err
@@ -417,9 +462,18 @@ func (s *Store) PostMessage(ctx context.Context, taskID string, req api.PostMess
 			return api.Message{}, api.ErrInvalid
 		}
 	}
-	m := api.Message{TaskID: taskID, From: api.Sender{AgentID: req.AgentID, Node: by.Node, User: by.User}, To: req.To, Text: req.Text, CreatedAt: s.now()}
-	res, err := s.db.ExecContext(ctx, `INSERT INTO messages (task_id,from_agent,from_node,from_user,to_agent,text,created_at) VALUES (?,?,?,?,?,?,?)`,
-		taskID, req.AgentID, by.Node, by.User, req.To, req.Text, ts(m.CreatedAt))
+	if req.ReplyTo < 0 {
+		return api.Message{}, api.ErrInvalid
+	}
+	if req.ReplyTo > 0 {
+		var replyTask string
+		if err := s.db.QueryRowContext(ctx, `SELECT task_id FROM messages WHERE seq=?`, req.ReplyTo).Scan(&replyTask); err != nil || replyTask != taskID {
+			return api.Message{}, api.ErrInvalid
+		}
+	}
+	m := api.Message{ReplyTo: req.ReplyTo, TaskID: taskID, From: api.Sender{AgentID: req.AgentID, Node: by.Node, User: by.User}, To: req.To, Text: req.Text, CreatedAt: s.now()}
+	res, err := s.db.ExecContext(ctx, `INSERT INTO messages (task_id,from_agent,from_node,from_user,to_agent,text,created_at,reply_to) VALUES (?,?,?,?,?,?,?,?)`,
+		taskID, req.AgentID, by.Node, by.User, req.To, req.Text, ts(m.CreatedAt), req.ReplyTo)
 	if err != nil {
 		return m, err
 	}
@@ -438,13 +492,17 @@ func (s *Store) ListMessages(ctx context.Context, taskID string, after int64, ag
 	if limit <= 0 || limit > api.MaxLimit {
 		limit = api.MaxLimit
 	}
-	q := `SELECT seq,task_id,from_agent,from_node,from_user,to_agent,text,created_at FROM messages WHERE task_id=? AND seq>?`
+	q := `SELECT seq,task_id,from_agent,from_node,from_user,to_agent,text,created_at,reply_to FROM messages WHERE task_id=? AND seq>?`
 	args := []any{taskID, after}
 	if agentID != "" {
 		q += ` AND (to_agent='' OR to_agent=?)`
 		args = append(args, agentID)
 	}
-	q += ` ORDER BY seq LIMIT ?`
+	if after < 0 {
+		q += ` ORDER BY seq DESC LIMIT ?`
+	} else {
+		q += ` ORDER BY seq LIMIT ?`
+	}
 	args = append(args, limit)
 	rows, err := s.db.QueryContext(ctx, q, args...)
 	if err != nil {
@@ -455,11 +513,16 @@ func (s *Store) ListMessages(ctx context.Context, taskID string, after int64, ag
 	for rows.Next() {
 		var m api.Message
 		var created string
-		if err := rows.Scan(&m.Seq, &m.TaskID, &m.From.AgentID, &m.From.Node, &m.From.User, &m.To, &m.Text, &created); err != nil {
+		if err := rows.Scan(&m.Seq, &m.TaskID, &m.From.AgentID, &m.From.Node, &m.From.User, &m.To, &m.Text, &created, &m.ReplyTo); err != nil {
 			return nil, err
 		}
 		m.CreatedAt = parseTS(created)
 		out = append(out, m)
+	}
+	if after < 0 {
+		for i, j := 0, len(out)-1; i < j; i, j = i+1, j-1 {
+			out[i], out[j] = out[j], out[i]
+		}
 	}
 	return out, rows.Err()
 }
@@ -500,6 +563,8 @@ func (s *Store) Unread(ctx context.Context, taskID, agentID string) (int, error)
 // Events
 
 func (s *Store) PostEvent(ctx context.Context, taskID string, req api.PostEventRequest, by api.Caller) (api.Event, error) {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
 	if !api.PostableKind(req.Kind) || !api.ValidText(req.Text, api.MaxTextLen) {
 		return api.Event{}, api.ErrInvalid
 	}
@@ -519,6 +584,17 @@ func (s *Store) PostEvent(ctx context.Context, taskID string, req api.PostEventR
 		a, err := s.GetAgent(ctx, req.AgentID)
 		if err != nil || a.TaskID != taskID {
 			return api.Event{}, api.ErrInvalid
+		}
+		if req.RunID != "" && req.RunID != a.RunID {
+			return api.Event{}, api.ErrInvalid
+		}
+		if a.Status == api.AgentExited || a.Status == api.AgentClosed {
+			return api.Event{}, api.ErrClosed
+		}
+		if req.RunID != "" {
+			if _, err := s.db.ExecContext(ctx, `UPDATE agents SET last_seen_at=? WHERE id=?`, ts(s.now()), a.ID); err != nil {
+				return api.Event{}, err
+			}
 		}
 		if status := api.LifecycleStatus(req.Kind); status != "" && a.Status != status {
 			if _, err := s.setAgentStatus(ctx, req.AgentID, status, by, false); err != nil {

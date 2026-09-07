@@ -78,6 +78,7 @@ const (
 	AgentDone       = "done"
 	AgentNeedsInput = "needs_input"
 	AgentClosed     = "closed"
+	AgentExited     = "exited"
 )
 
 // Event kinds.
@@ -91,6 +92,8 @@ const (
 	EventNeedsInput  = "needs_input"
 	EventClosed      = "closed"
 	EventMessage     = "message"
+	EventExited      = "exited"
+	EventHeartbeat   = "heartbeat"
 )
 
 // LifecycleStatus maps an event kind to the agent status it implies, or "".
@@ -102,22 +105,17 @@ func LifecycleStatus(kind string) string {
 		return AgentDone
 	case EventNeedsInput:
 		return AgentNeedsInput
+	case EventExited:
+		return AgentExited
 	case EventClosed:
 		return AgentClosed
 	}
 	return ""
 }
 
-// IdleStatus reports whether an agent in this status can accept a pushed
-// message typed into its pane. Only "done" qualifies: an agent waiting on a
-// permission or selection prompt would misread injected text as an answer.
-func IdleStatus(status string) bool {
-	return status == AgentDone
-}
-
 var postableKinds = map[string]bool{
 	EventStarted: true, EventRunning: true, EventDone: true,
-	EventNeedsInput: true, EventClosed: true,
+	EventNeedsInput: true, EventClosed: true, EventExited: true, EventHeartbeat: true,
 }
 
 // PostableKind reports whether clients may post this event kind directly.
@@ -134,6 +132,9 @@ type Task struct {
 }
 
 type Agent struct {
+	RunID         string    `json:"runId"`
+	LastSeenAt    time.Time `json:"lastSeenAt"`
+	Online        bool      `json:"online"`
 	ID            string    `json:"id"`
 	TaskID        string    `json:"taskId"`
 	Name          string    `json:"name"`
@@ -157,6 +158,7 @@ type Sender struct {
 }
 
 type Message struct {
+	ReplyTo   int64     `json:"replyTo,omitempty"`
 	Seq       int64     `json:"seq"`
 	TaskID    string    `json:"taskId"`
 	From      Sender    `json:"from"`
@@ -205,6 +207,7 @@ type UpdateAgentRequest struct {
 }
 
 type PostMessageRequest struct {
+	ReplyTo int64  `json:"replyTo,omitempty"`
 	Text    string `json:"text"`
 	To      string `json:"to"`
 	AgentID string `json:"agentId"`
@@ -216,6 +219,7 @@ type MarkReadRequest struct {
 }
 
 type PostEventRequest struct {
+	RunID   string         `json:"runId,omitempty"`
 	Kind    string         `json:"kind"`
 	AgentID string         `json:"agentId"`
 	Text    string         `json:"text"`

@@ -29,19 +29,28 @@ export function createTasksView({
   let root = null,
     details = [],
     subscription = null,
-    loading = false;
+    loading = false,
+    visible = false,
+    generation = 0;
+  let clock = null;
   function mount(container) {
     root = container;
   }
   async function show() {
     if (!root) return;
+    visible = true;
+    const token = generation + 1;
+    clearInterval(clock);
+    clock = setInterval(() => {
+      if (visible) render();
+    }, 30000);
     if (!client()) {
-      root.innerHTML = `<div class="mode-empty"><span class="eyebrow">TASKS</span><h2>Connect a task hub.</h2><p class="launcher-intro">Tasks bind a team of agent sessions to a terminal tab. They live on a hub that runs as its own Tailscale node.</p><button id="tasks-configure" class="primary">Configure task hub</button></div>`;
+      root.innerHTML = `<div class="mode-empty"><span class="eyebrow">TASKS</span><h2>Connect a task hub.</h2><p class="launcher-intro">Tasks bind a team of agent sessions to a terminal tab. They live on your coordination hub across your private network.</p><button id="tasks-configure" class="primary">Configure task hub</button></div>`;
       root.querySelector("#tasks-configure").onclick = configure;
       return;
     }
     await reload();
-    if (!subscription)
+    if (visible && token === generation && !subscription)
       subscription = client().subscribe(
         "",
         async () => {
@@ -51,27 +60,36 @@ export function createTasksView({
       );
   }
   function hide() {
+    visible = false;
+    generation++;
+    loading = false;
+    clearInterval(clock);
     subscription?.stop();
     subscription = null;
   }
   async function reload() {
-    if (loading) return;
+    if (loading || !visible) return;
+    const token = ++generation;
     loading = true;
     try {
       const tasks = await client().listTasks();
-      details = await Promise.all(
+      const next = await Promise.all(
         tasks.map((t) =>
           t.status === "open"
             ? client().getTask(t.id)
             : Promise.resolve({ task: t, agents: [] }),
         ),
       );
+      if (!visible || token !== generation) return;
+      details = next;
     } catch (error) {
+      if (!visible || token !== generation) return;
       root.innerHTML = `<div class="mode-empty"><span class="eyebrow">TASKS</span><h2>Hub unavailable.</h2><p class="launcher-intro">${esc(error.message)}</p><button id="tasks-retry">Retry</button></div>`;
       root.querySelector("#tasks-retry").onclick = () => show();
       loading = false;
       return;
     }
+    if (!visible || token !== generation) return;
     loading = false;
     render();
   }
@@ -79,9 +97,29 @@ export function createTasksView({
     const group = taskHub.groupOf(taskId);
     return group ? getTabs().find((t) => t.id === group.active) : null;
   }
+  const agentState = (a) => {
+    const label =
+      { done: "Turn complete", needs_input: "Needs you", exited: "Exited" }[
+        a.status
+      ] || a.status;
+    const seen = Date.parse(a.lastSeenAt);
+    const last = seen > 0 ? seen : Date.parse(a.createdAt);
+    return a.runId &&
+      !["exited", "closed"].includes(a.status) &&
+      last > 0 &&
+      Date.now() - last > 90000
+      ? label + " · offline"
+      : label;
+  };
   function render() {
+    if (!visible) return;
     if (!root) return;
     const open = details.filter((d) => d.task.status === "open");
+    const needs = open.flatMap((d) =>
+      d.agents
+        .filter((a) => a.status === "needs_input")
+        .map((a) => ({ task: d.task, agent: a })),
+    );
     const closed = details.filter((d) => d.task.status !== "open");
     const card = ({ task, agents }) => {
       const tab = boundTab(task.id);
@@ -90,12 +128,12 @@ export function createTasksView({
           .filter((a) => a.status !== "closed")
           .map(
             (a) =>
-              `<button class="board-agent" data-task-agent="${esc(a.id)}" title="${esc(a.host)} · ${esc(a.session)}"><span class="status-dot ${STATUS_DOT[a.status] || ""}"></span><span>${esc(a.name)}</span><span class="fine">${esc(a.runtime || "")} · ${esc(a.host)}</span></button>`,
+              `<button class="board-agent" data-task-agent="${esc(a.id)}" title="${esc(a.host)} · ${esc(a.session)}"><span class="status-dot ${STATUS_DOT[a.status] || ""}"></span><span>${esc(a.name)}</span><span class="fine">${esc(agentState(a))} · ${esc(a.host)}</span></button>`,
           )
           .join("") || '<span class="fine">No agents yet.</span>'
       }</div><footer class="task-actions"><span class="fine">${tab ? `Mirrored in tab · ${esc(tab.session || tab.server.name)}` : "Not attached to a tab"}</span><button data-task-board="${esc(task.id)}">Board</button><button data-task-add="${esc(task.id)}">＋ Agent</button><button data-task-attach="${esc(task.id)}">${tab ? "Attach elsewhere" : "Attach to current tab"}</button><button data-task-close="${esc(task.id)}" class="danger">Close task</button></footer></article>`;
     };
-    root.innerHTML = `<div class="tasks-view"><div class="tasks-head"><div><span class="eyebrow">TASKS</span><h2>Teams of agents, one tab each.</h2><p class="launcher-intro">A task binds agent sessions to a terminal tab. Every agent on the task can message the others; the tab gains and loses panes as agents come and go.</p></div><button id="tasks-new" class="primary">＋ New task</button></div>${
+    root.innerHTML = `<div class="tasks-view"><div class="tasks-head"><div><span class="eyebrow">TASKS</span><h2>Give every team a shared purpose.</h2><p class="launcher-intro">Keep objectives, conversations, and agents together across your machines. Terminal panes are your view into the team.</p></div><button id="tasks-new" class="primary">＋ New task</button></div><section class="needs-you"><div class="view-heading"><h3>Needs you</h3><span class="count-badge">${needs.length}</span></div>${needs.length ? needs.map(({ task, agent }) => `<button class="attention-row" data-task-agent="${esc(agent.id)}"><strong>${esc(agent.name)}</strong><span>${esc(task.name)} · ${esc(agent.host)}</span><span>Open →</span></button>`).join("") : '<p class="fine">No agents are waiting for your input.</p>'}</section>${
       open.length
         ? `<div class="task-grid">${open.map(card).join("")}</div>`
         : `<p class="fine">No open tasks. Start one to spawn the first agent.</p>`
@@ -148,7 +186,10 @@ export function createTasksView({
           (t) => !t.disposed && t.task?.agentId === b.dataset.taskAgent,
         );
         if (tab) activate(tab.id);
-        else notice("That agent has no open pane in this browser yet.");
+        else {
+          taskHub.revealAgent(b.dataset.taskAgent);
+          notice("Agent pane requested. Attach the task to a tab if needed.");
+        }
       };
     });
   }

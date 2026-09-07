@@ -1,6 +1,10 @@
-// Command tailterm-hub serves the task hub as its own Tailscale node.
+// Command tailterm-hub serves coordination on an existing private network or optional tsnet node.
 //
 // Environment:
+//
+// TAILTERM_TCP_LISTEN normal TCP listener; disables embedded Tailscale
+// TAILTERM_TOKEN_FILE required credential file for TCP mode
+// TAILTERM_MAX_AGENTS active agent limit per task (1..32)
 //
 //	TS_AUTHKEY        Tailscale auth key (first start only; state persists)
 //	TS_HOSTNAME       tailnet hostname (default tailterm-hub)
@@ -20,6 +24,8 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -47,13 +53,30 @@ func main() {
 		log.Fatalf("open store: %v", err)
 	}
 	defer st.Close()
+	if n, err := strconv.Atoi(os.Getenv("TAILTERM_MAX_AGENTS")); err == nil && n > 0 && n <= api.MaxAgentsPerTask {
+		st.MaxAgents = n
+	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
 	var ln net.Listener
 	var identity server.Identity
-	if dev := os.Getenv("TAILTERM_DEV_LISTEN"); dev != "" {
+	if addr := os.Getenv("TAILTERM_TCP_LISTEN"); addr != "" {
+		token, readErr := os.ReadFile(os.Getenv("TAILTERM_TOKEN_FILE"))
+		if readErr != nil {
+			log.Fatalf("read hub token: %v", readErr)
+		}
+		identity, err = server.TokenIdentity(strings.TrimSpace(string(token)), api.Caller{Node: "workspace", User: "owner"})
+		if err != nil {
+			log.Fatal(err)
+		}
+		ln, err = net.Listen("tcp", addr)
+		if err != nil {
+			log.Fatalf("TCP listen: %v", err)
+		}
+		log.Printf("hub listening on %s with token authentication (no embedded Tailscale)", addr)
+	} else if dev := os.Getenv("TAILTERM_DEV_LISTEN"); dev != "" {
 		ln, err = net.Listen("tcp", dev)
 		if err != nil {
 			log.Fatalf("dev listen: %v", err)
@@ -65,7 +88,7 @@ func main() {
 			Dir:      filepath.Join(stateDir, "tsnet"),
 			Hostname: env("TS_HOSTNAME", "tailterm-hub"),
 			AuthKey:  os.Getenv("TS_AUTHKEY"),
-			Logf:     func(string, ...any) {},
+			Logf:     log.Printf,
 		}
 		defer ts.Close()
 		if _, err := ts.Up(ctx); err != nil {
