@@ -3,14 +3,16 @@ import { FitAddon } from "@xterm/addon-fit";
 import { SearchAddon } from "@xterm/addon-search";
 import { setupTerminalLinks } from "./terminal-links.js";
 import { historyText } from "./history-format.js";
+import { createRenderer } from "./renderer.js";
 export function setupLocalHistory(
   t,
-  { capture, automatic = () => true, notice = () => {} },
+  { capture, automatic = () => true, notice = () => {}, gpu = () => true },
 ) {
   let panel,
     viewer,
     fit,
     search,
+    renderer,
     observer,
     cancelReveal,
     pending = false,
@@ -52,6 +54,8 @@ export function setupLocalHistory(
     cancelReveal = null;
     observer?.disconnect();
     observer = null;
+    renderer?.dispose();
+    renderer = null;
     viewer?.dispose();
     viewer = fit = search = null;
     panel?.remove();
@@ -147,6 +151,7 @@ export function setupLocalHistory(
     terminal.loadAddon(fit);
     terminal.loadAddon(search);
     terminal.open(output);
+    renderer = createRenderer(terminal, output, { enabled: gpu });
     setupTerminalLinks(terminal);
     terminal.write("\x1b[?25l");
     fit.fit();
@@ -213,6 +218,7 @@ export function setupLocalHistory(
   function update() {
     if (!viewer) return;
     Object.assign(viewer.options, options());
+    renderer?.update();
     fit.fit();
     const current = viewer;
     document.fonts.ready.then(() => {

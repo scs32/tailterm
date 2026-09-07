@@ -1,5 +1,6 @@
 import { credentialCache } from "./credential-cache.js";
 import { createAttentionSound } from "./attention-sound.js";
+import { createRenderer, webglSupported } from "./renderer.js";
 import { createInactivityLock, IDLE_MINUTES } from "./inactivity.js";
 import { createAppearancePreview } from "./appearance-preview.js";
 import { normalizeTabDecoration, showTabDecoration } from "./tab-decoration.js";
@@ -861,6 +862,7 @@ function disposeTab(t, replacing = false) {
   t.history?.clear();
   t.close?.();
   t.observer.disconnect();
+  t.renderer?.dispose();
   t.term.dispose();
   t.el.remove();
   tabs = tabs.filter((x) => x !== t);
@@ -1144,6 +1146,7 @@ function updateAppearance() {
     Object.assign(t.term.options, terminalAppearance(appearance), {
       fontSize: t.fontSize,
     });
+    t.renderer?.update();
     t.history?.update();
     t.history?.sync();
     if (!t.el.hidden)
@@ -1207,6 +1210,7 @@ function appearanceDialog() {
           `<label><input type="checkbox" data-preference="${k}" ${appearance[k] ? "checked" : ""}>${label}</label>`,
       )
       .join("")}</div>
+    <h3>Rendering</h3><div class="appearance-toggles"><label><input type="checkbox" data-preference="gpuRendering" ${appearance.gpuRendering ? "checked" : ""} ${webglSupported() ? "" : "disabled"}>GPU rendering (WebGL)</label></div><p class="fine">${webglSupported() ? "Faster scrolling and output for large histories and grouped panes. Font ligatures such as -> and => only render with GPU rendering off." : "WebGL is unavailable in this browser; the standard renderer is in use."}</p>
     <h3>Attention sound</h3><div class="appearance-toggles"><label><input type="checkbox" data-preference="attentionSound" ${appearance.attentionSound ? "checked" : ""}>Play a gentle chime</label></div><button id="preview-attention-sound">Preview sound</button><p class="fine">Off by default. Chimes for bells, command completion, and connection problems in unattended tabs, at most once every five seconds. Ordinary output stays silent. Keep Tailterm open and interact once after loading to enable browser audio.</p>
     <details class="dialog-details"><summary>Keyboard & selection tips</summary><p class="fine">Switch grouped panes with Option + Shift + arrow keys on Mac, or Ctrl + Alt + arrow keys on Windows/Linux.</p>
     <p class="fine">Hold Shift while dragging to select text when tmux handles the mouse. Plain Ctrl+C still interrupts a command. Remote clipboard read requests are never answered.</p></details>`,
@@ -1372,6 +1376,8 @@ async function connect(
       if (!t.el.hidden && !t.disposed) fit.fit();
     });
     t.observer.observe(el);
+    t.renderer = createRenderer(term, viewport, {
+      enabled: () => appearance.gpuRendering,
     });
     activate(t.id);
     fit.fit();
@@ -1415,6 +1421,7 @@ async function connect(
     if (staticMode && tmux)
       t.history = setupLocalHistory(t, {
         automatic: () => appearance.autoHistory,
+        gpu: () => appearance.gpuRendering,
         capture: (tab) => {
           if (
             endpointKey(tab.server) !==

@@ -1,3 +1,4 @@
+import { useDomRenderer } from "./dom-renderer.mjs";
 import { exerciseGeneratedKey } from "./ssh-key-browser.mjs";
 import { chromium, webkit } from "@playwright/test";
 import assert from "node:assert/strict";
@@ -93,6 +94,7 @@ try {
     viewport: { width: 1440, height: 1050 },
     permissions: ["clipboard-read", "clipboard-write"],
   });
+  await useDomRenderer(page);
   const errors = [];
   page.on("pageerror", (e) => errors.push(e.message));
   await page.goto("http://127.0.0.1:14318");

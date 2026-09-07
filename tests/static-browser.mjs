@@ -1,3 +1,4 @@
+import { useDomRenderer } from "./dom-renderer.mjs";
 import { exerciseWorkspaceControls } from "./workspace-controls-browser.mjs";
 import { exerciseGeneratedKey } from "./ssh-key-browser.mjs";
 import { exerciseServerFilters } from "./server-filters-browser.mjs";
@@ -251,6 +252,7 @@ try {
     viewport: { width: 1440, height: 1100 },
     permissions: ["clipboard-read", "clipboard-write"],
   });
+  await useDomRenderer(context);
   await context.addInitScript(
     (url) => {
       globalThis.__tailserveTestSocketURL = url;
@@ -768,6 +770,7 @@ try {
   );
   assert.deepEqual(errors, []);
   const productionContext = await browser.newContext();
+  await useDomRenderer(productionContext);
   await exerciseVaultReset(page, context, origin);
   await exerciseForgetDevice(page);
   const productionPage = await productionContext.newPage();
