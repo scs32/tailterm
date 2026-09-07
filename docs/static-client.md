@@ -57,6 +57,10 @@ For standard SSH without a saved credential, connect opens the key/password/inte
 
 ## Terminal interactions
 
+### Rendering
+
+Terminals draw with xterm's WebGL renderer when the browser offers WebGL2. Each terminal holds a GPU context only while visible and releases it when hidden, so grouped and background tabs stay within browser context limits. A lost context falls back to the DOM renderer and retries. Appearance → Rendering turns GPU rendering off; font ligatures only render with it off. Browser suites that read terminal rows from the DOM opt out through `tests/dom-renderer.mjs`; `tests/renderer-browser.mjs` covers the WebGL path.
+
 ### Workspace continuity
 
 After unlocking, the browser restores previously connected tabs, active tab, group layout, split proportions, and tab order from the encrypted vault. Server endpoints must still match the saved workspace. Plain SSH tabs start a fresh shell; tmux tabs resume the existing remote session. SSH passwords that were not remembered must be entered again. No vault key or passphrase is stored to bypass unlocking. Workspace changes save shortly after interaction; a refresh during the final fraction of a second of a change may retain the preceding layout.

@@ -251,6 +251,8 @@ const defaults = {
   autoHistory: true,
   copyOnSelect: false,
   remoteClipboard: true,
+  attentionSound: false,
+  gpuRendering: true,
 };
 export function normalizeAppearance(value = {}) {
   const p = { ...defaults, ...value };
@@ -274,6 +276,8 @@ export function normalizeAppearance(value = {}) {
     "autoHistory",
     "copyOnSelect",
     "remoteClipboard",
+    "attentionSound",
+    "gpuRendering",
   ])
     p[key] = typeof p[key] === "boolean" ? p[key] : defaults[key];
   return p;

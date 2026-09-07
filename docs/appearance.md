@@ -22,6 +22,8 @@ Font cards identify the family, show distinguishable characters and symbol sampl
 
 ## Tab appearance
 
+**Make it yours → Attention sound** enables a quiet two-note chime, saved in this browser and off by default. Preview sound works even with the preference off. Bells, OSC 133 command completion, and connection problems chime only when the terminal is unattended; ordinary output does not. Repeated alerts share a five-second cooldown. Audio needs a browser interaction after loading and works only while Tailterm is open. Agent prompts must emit a terminal bell to signal attention; Tailterm does not infer questions from screen text.
+
 Open a tab's **… → Tab appearance** to set a local label, emoji/symbol, color marker and label typeface. Colors mark the edge rather than coloring text, preserving readability. Reset restores the defaults; Save applies the choice. The terminal font stays independent. Group tabs use the focused pane's color and typeface and include the member labels. Decorations survive reconnects and encrypted workspace restoration in this browser; they do not rename remote tmux sessions.
 
 ## Bundled Nerd Fonts

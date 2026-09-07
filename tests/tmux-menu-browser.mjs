@@ -1,3 +1,4 @@
+import { useDomRenderer } from "./dom-renderer.mjs";
 import { once } from "node:events";
 import { createServer } from "vite";
 import { chromium, webkit } from "@playwright/test";
@@ -62,6 +63,7 @@ try {
       const page = await browser.newPage({
         viewport: { width: 1200, height: 850 },
       });
+      await useDomRenderer(page);
       page.setDefaultTimeout(10000);
       page.on("pageerror", (e) => console.error(e.message));
       await page.route("**/menu-test", (r) =>

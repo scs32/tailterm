@@ -1,3 +1,4 @@
+import { useDomRenderer } from "./dom-renderer.mjs";
 import { createServer } from "vite";
 import { chromium } from "@playwright/test";
 import assert from "node:assert/strict";
@@ -9,6 +10,7 @@ await server.listen();
 const browser = await chromium.launch();
 try {
   const page = await browser.newPage();
+  await useDomRenderer(page);
   const errors = [];
   page.on("pageerror", (e) => errors.push(e.message));
   await page.route("**/links-test", (route) =>

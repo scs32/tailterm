@@ -1,6 +1,7 @@
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import { terminalAppearance } from "./appearance.js";
+import { createRenderer } from "./renderer.js";
 
 // The preview uses the same renderer, colors and fonts as connected terminals.
 export function createAppearancePreview(element, appearance) {
@@ -15,7 +16,11 @@ export function createAppearancePreview(element, appearance) {
   const fit = new FitAddon();
   term.loadAddon(fit);
   term.open(element);
-  let disposed = false;
+  let disposed = false,
+    current = appearance;
+  const renderer = createRenderer(term, element, {
+    enabled: () => current.gpuRendering,
+  });
   const resize = () => {
     if (!disposed && element.isConnected && element.clientWidth) fit.fit();
   };
@@ -23,7 +28,7 @@ export function createAppearancePreview(element, appearance) {
   observer.observe(element);
   term.write(
     [
-      "\x1b[?25l\x1b[1m~/workspace\x1b[0m  main  0O 1il {} []",
+      "\x1b[?25l\x1b[1m~/workspace\x1b[0m  main  0O 1il {} [] -> => != <=",
       "\x1b[32m✓ Connected\x1b[0m  \x1b[33m! Warning\x1b[0m  \x1b[31m× Error\x1b[0m",
       "\x1b[2mMuted output · ready for the next command\x1b[0m",
       "\x1b[48;2;48;48;48m\x1b[38;2;87;82;121m❯ Dark prompt with explicit app colors\x1b[K\x1b[0m",
@@ -33,9 +38,11 @@ export function createAppearancePreview(element, appearance) {
     ].join("\r\n"),
   );
   const update = (value) => {
+    current = value;
     Object.assign(term.options, terminalAppearance(value), {
       cursorBlink: false,
     });
+    renderer.update();
     resize();
     document.fonts.ready.then(resize);
   };
@@ -45,6 +52,7 @@ export function createAppearancePreview(element, appearance) {
     dispose() {
       disposed = true;
       observer.disconnect();
+      renderer.dispose();
       term.dispose();
     },
   };

@@ -1,3 +1,4 @@
+import { useDomRenderer } from "./dom-renderer.mjs";
 import { createServer } from "vite";
 import { chromium, webkit } from "@playwright/test";
 import assert from "node:assert/strict";
@@ -13,6 +14,7 @@ try {
       const page = await browser.newPage({
         viewport: { width: 1200, height: 850 },
       });
+      await useDomRenderer(page);
       const errors = [];
       page.on("pageerror", (e) => errors.push(e.message));
       await page.route("**/history-test", (r) =>
