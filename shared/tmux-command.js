@@ -161,7 +161,12 @@ export function agentSpawnCommand({
   validateAgentText(cwd, 512, "working directory");
   if (cwd && !cwd.startsWith("/"))
     throw new Error("Working directory must be absolute.");
-  validateAgentText(prompt, 8192, "prompt");
+  if (
+    typeof prompt !== "string" ||
+    prompt.length > 8192 ||
+    /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/.test(prompt)
+  )
+    throw new Error("Invalid prompt.");
   if (runtime && !/^[a-zA-Z0-9._-]{1,64}$/.test(runtime))
     throw new Error("Invalid runtime.");
   const args = [

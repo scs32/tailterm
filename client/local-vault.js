@@ -408,6 +408,11 @@ export async function localAPI(url, method = "GET", body = {}) {
         },
       ];
     });
+  if (url === "/hub/forget-task" && method === "POST")
+    return mutate((d) => {
+      for (const session of d.sessions)
+        if (session.task?.taskId === body.taskId) delete session.task;
+    });
   if (url === "/hub" && method === "POST")
     return editVault((d) => {
       const value = String(body?.url || "").trim();

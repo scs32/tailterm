@@ -123,7 +123,7 @@ func parseTS(s string) time.Time {
 func (s *Store) CreateTask(ctx context.Context, req api.CreateTaskRequest, by api.Caller) (api.Task, error) {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
-	if !api.ValidName(req.Name) || !api.ValidText(req.Goal, api.MaxTextLen) {
+	if !api.ValidTaskName(req.Name) || !api.ValidText(req.Goal, api.MaxTextLen) {
 		return api.Task{}, api.ErrInvalid
 	}
 	var count int
@@ -194,7 +194,7 @@ func (s *Store) UpdateTask(ctx context.Context, id string, req api.UpdateTaskReq
 		return t, err
 	}
 	if req.Name != nil {
-		if !api.ValidName(*req.Name) {
+		if !api.ValidTaskName(*req.Name) {
 			return t, api.ErrInvalid
 		}
 		t.Name = *req.Name

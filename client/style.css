@@ -4290,3 +4290,209 @@ html:fullscreen {
     margin-left: auto;
   }
 }
+
+/* Selection is a fill; hover/focus is an outline, shared with server controls. */
+#workspace .mode-switch {
+  border: 0;
+  padding: 0;
+  border-radius: 0;
+}
+#workspace .mode-switch button[aria-pressed="true"],
+#workspace .board-rail button[aria-pressed="true"] {
+  background: color-mix(in srgb, var(--accent) 25%, #063c2d);
+  color: #f3fff9;
+  border-color: var(--line);
+}
+#workspace .mode-switch button[aria-pressed="true"]:is(:hover, :focus-visible),
+#workspace .board-rail button[aria-pressed="true"]:is(:hover, :focus-visible) {
+  background: color-mix(in srgb, var(--accent) 25%, #063c2d);
+  color: #f3fff9;
+  border-color: var(--accent);
+}
+#workspace
+  .mode-switch
+  button:not([aria-pressed="true"]):is(:hover, :focus-visible) {
+  background: var(--surface);
+  border-color: var(--accent);
+}
+#task-agent-fields {
+  border: 0;
+  padding: 10px 0 0;
+  margin: 0;
+  min-width: 0;
+}
+.task-submit-area {
+  position: sticky;
+  bottom: -18px;
+  background: var(--surface);
+  padding: 8px 0 0;
+}
+#task-error:not(:empty) {
+  border-left: 2px solid var(--accent);
+  padding: 6px 10px;
+}
+#task-error[role="alert"] {
+  color: var(--ink);
+}
+#task-form .dialog-actions {
+  margin-top: 8px;
+}
+.tasks-head {
+  align-items: center;
+  margin-bottom: 18px;
+}
+.tasks-head h2 {
+  margin: 0;
+}
+.task-grid {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+.task-card {
+  border-radius: 0;
+  padding: 16px;
+}
+.task-card header {
+  height: auto;
+  min-height: 0;
+  padding: 0;
+  border: 0;
+}
+.task-card h3 {
+  font-size: 16px;
+}
+.task-card .task-goal {
+  margin: 10px 0;
+  color: var(--muted);
+}
+.task-card .task-agents {
+  margin: 12px 0;
+}
+.task-card .task-actions {
+  margin-top: 12px;
+  padding-top: 12px;
+  align-items: center;
+}
+.task-card .task-actions > .fine {
+  flex: 1;
+  margin: 0;
+}
+.task-more {
+  position: relative;
+  margin-left: auto;
+}
+.task-more summary {
+  cursor: pointer;
+  padding: 10px;
+  border: 1px solid var(--line);
+}
+.task-more[open] > div {
+  display: flex;
+  gap: 6px;
+  padding-top: 8px;
+}
+.needs-you {
+  border-radius: 0;
+  margin-bottom: 16px;
+}
+.tasks-clear {
+  margin: 0 0 16px;
+  color: var(--muted);
+  font-size: 12px;
+}
+.tasks-empty {
+  border: 1px dashed var(--line);
+  padding: 32px 20px;
+}
+.tasks-empty h3 {
+  margin: 0 0 8px;
+}
+.board-message {
+  border-radius: 0;
+  border: 0;
+  border-bottom: 1px solid var(--line);
+  padding: 12px 0;
+  background: transparent;
+}
+.board-messages {
+  gap: 4px;
+}
+#board-compose {
+  grid-template-columns: minmax(180px, 220px) minmax(0, 1fr) auto;
+  gap: 10px;
+}
+#board-compose .compose-note {
+  grid-column: 1 / -1;
+}
+@media (max-width: 760px) {
+  #board-compose {
+    grid-template-columns: minmax(0, 1fr) auto;
+  }
+  #board-compose .compose-recipient {
+    grid-column: 1 / -1;
+  }
+  .task-card .task-actions {
+    gap: 8px;
+  }
+  .task-card .task-actions > .fine {
+    flex-basis: 100%;
+  }
+}
+/* Board/Tasks/Files need a viewport even when no terminal has been opened. */
+@media (max-width: 760px) {
+  body:is([data-mode="board"], [data-mode="tasks"], [data-mode="files"])
+    #workspace {
+    display: flex;
+    flex-direction: column;
+    height: var(--visible-height, 100dvh);
+    min-height: 0;
+    overflow: hidden;
+  }
+  body:is([data-mode="board"], [data-mode="tasks"], [data-mode="files"])
+    #workspace
+    > aside {
+    display: none;
+  }
+  body:is([data-mode="board"], [data-mode="tasks"], [data-mode="files"])
+    #workspace
+    > main {
+    display: flex;
+    flex: 1;
+    flex-direction: column;
+    min-height: 0;
+    padding: 6px;
+  }
+  .mode-board {
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-rows: auto minmax(0, 1fr);
+  }
+  .mode-board .board-rail {
+    flex-direction: row;
+    flex-wrap: nowrap;
+    align-items: center;
+    max-height: 86px;
+    overflow-x: auto;
+    margin-bottom: 10px;
+    padding-bottom: 8px;
+  }
+  .board-rail-head {
+    padding: 0 8px;
+    margin: 0;
+    flex: 0 0 auto;
+    gap: 8px;
+  }
+  .board-rail [data-board-task] {
+    min-width: 140px;
+    max-width: 170px;
+    flex: 0 0 auto;
+    margin-bottom: 0;
+    padding: 8px;
+  }
+  .board-task-name {
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    max-width: 100%;
+  }
+}

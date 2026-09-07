@@ -42,6 +42,8 @@ export function createBoardView({
     messages = [],
     subscription = null,
     pending = false;
+  let reloadAgain = false;
+  const sending = new Set();
   const drafts = new Map();
   const draft = () => drafts.get(selected) || { text: "", to: "", replyTo: 0 };
   function saveDraft() {
@@ -88,7 +90,12 @@ export function createBoardView({
     });
   }
   async function reload(token = epoch) {
-    if (!visible || pending) return;
+    if (!visible) return;
+    if (pending) {
+      reloadAgain = true;
+      return;
+    }
+    reloadAgain = false;
     pending = true;
     try {
       const list = await client().listTasks();
@@ -114,7 +121,13 @@ export function createBoardView({
         root.querySelector("#board-retry").onclick = () => show();
       }
     } finally {
-      if (token === epoch) pending = false;
+      if (token === epoch) {
+        pending = false;
+        if (reloadAgain && visible) {
+          reloadAgain = false;
+          void reload();
+        }
+      }
     }
   }
   function render() {
@@ -149,9 +162,9 @@ export function createBoardView({
       return read ? `Read by ${read}/${recipients.length}` : "Stored · unread";
     };
     renderedTask = selected;
-    root.innerHTML = `<div class="board mode-board"><aside class="board-rail"><div class="board-rail-head"><span class="eyebrow">CONVERSATIONS</span><button id="board-new-task" title="New task">＋</button></div>${tasks.map((t) => `<button data-board-task="${esc(t.id)}" aria-pressed="${t.id === selected}"><span class="board-task-name">${esc(t.name)}</span><span class="fine">${esc(t.goal || "No objective yet")}</span></button>`).join("") || '<p class="fine">No open tasks.</p>'}</aside><section class="board-thread">${
+    root.innerHTML = `<div class="board mode-board"><aside class="board-rail"><div class="board-rail-head"><span class="eyebrow">TASKS</span><button id="board-new-task" title="New task">＋</button></div>${tasks.map((t) => `<button data-board-task="${esc(t.id)}" aria-pressed="${t.id === selected}"><span class="board-task-name">${esc(t.name)}</span><span class="fine">${esc(t.goal || "No objective yet")}</span></button>`).join("") || '<p class="fine">No open tasks.</p>'}</aside><section class="board-thread">${
       detail
-        ? `<div class="board-head"><div class="view-heading"><div><span class="eyebrow">TEAM BOARD</span><h2>${esc(detail.task.name)}</h2></div><button id="board-attach">Show terminals</button></div><p class="fine">${esc(detail.task.goal)}</p><div class="board-agents-row">${agents
+        ? `<div class="board-head"><div class="view-heading"><div><span class="eyebrow">BOARD</span><h2>${esc(detail.task.name)}</h2></div><button id="board-attach">Show terminals</button></div><p class="fine">${esc(detail.task.goal)}</p><div class="board-agents-row">${agents
             .filter((a) => a.status !== "closed")
             .map(
               (a) =>
@@ -159,7 +172,7 @@ export function createBoardView({
             )
             .join(
               "",
-            )}<button id="board-add-agent">＋ Agent</button></div></div><div id="board-messages" class="board-messages">${messages.length === 200 ? '<p class="fine">Latest 200 messages. Full history remains on the hub.</p>' : ""}${messages.map((m) => `<article class="board-message" data-message="${m.seq}"><div class="board-meta"><strong>${esc(name(m))}</strong><span>${m.to ? "to " + esc(names.get(m.to) || m.to) : "Team announcement"} · ${esc(new Date(m.createdAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }))}</span></div>${m.replyTo ? `<div class="reply-context">Reply to #${m.replyTo}: ${esc(messages.find((x) => x.seq === m.replyTo)?.text.slice(0, 100) || "Earlier message")}</div>` : ""}<div class="board-text">${esc(m.text)}</div><div class="message-footer"><span>${receipt(m)} · #${m.seq}</span><button data-reply="${m.seq}">Reply</button></div></article>`).join("") || '<div class="board-empty"><h3>Start the conversation.</h3><p class="fine">Send an assignment to an agent or an announcement to the team.</p></div>'}</div><form id="board-compose">${d.replyTo ? `<div class="compose-reply">Replying to #${d.replyTo}<button type="button" id="board-cancel-reply">Cancel reply</button></div>` : ""}<label class="compose-recipient">To<select id="board-to" aria-label="Recipient"><option value="">Everyone · announcement</option>${agents
+            )}<button id="board-add-agent">＋ Agent</button></div></div><div id="board-messages" class="board-messages">${messages.length === 200 ? '<p class="fine">Latest 200 messages. Full history remains on the hub.</p>' : ""}${messages.map((m) => `<article class="board-message" data-message="${m.seq}"><div class="board-meta"><strong>${esc(name(m))}</strong><span>${m.to ? "to " + esc(names.get(m.to) || m.to) : "Team announcement"} · ${esc(new Date(m.createdAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }))}</span></div>${m.replyTo ? `<div class="reply-context">Reply to #${m.replyTo}: ${esc(messages.find((x) => x.seq === m.replyTo)?.text.slice(0, 100) || "Earlier message")}</div>` : ""}<div class="board-text">${esc(m.text)}</div><div class="message-footer"><span>${receipt(m)}</span><button data-reply="${m.seq}">Reply</button></div></article>`).join("") || '<div class="board-empty"><h3>No messages yet.</h3><p class="fine">Leave a note for the team or add an agent to get started.</p></div>'}</div><form id="board-compose">${d.replyTo ? `<div class="compose-reply">Replying to #${d.replyTo}<button type="button" id="board-cancel-reply">Cancel reply</button></div>` : ""}<label class="compose-recipient">To<select ${sending.has(selected) ? "disabled" : ""} id="board-to" aria-label="Recipient"><option value="">Everyone</option>${agents
             .filter((a) => a.status !== "closed")
             .map(
               (a) =>
@@ -167,7 +180,7 @@ export function createBoardView({
             )
             .join(
               "",
-            )}</select></label><textarea id="board-text" rows="2" maxlength="8192" placeholder="Write a message…" aria-label="Message">${esc(d.text)}</textarea><button class="primary" type="submit">Post</button><p class="compose-note fine">Saved on the hub. Read means retrieved, not completed.</p></form>`
+            )}</select></label><textarea ${sending.has(selected) ? "disabled" : ""} id="board-text" rows="2" maxlength="8192" placeholder="Write a message…" aria-label="Message">${esc(d.text)}</textarea><button class="primary" type="submit" ${sending.has(selected) ? "disabled" : ""}>${sending.has(selected) ? "Sending…" : "Send"}</button><p class="compose-note fine">Saved on the hub. Read means retrieved, not completed.</p></form>`
         : '<div class="mode-empty"><h2>Bring a team together.</h2><p class="launcher-intro">Create a task with a shared objective, then add agents.</p></div>'
     }</section></div>`;
     root.querySelector("#board-new-task").onclick = () => newTask();
@@ -228,7 +241,8 @@ export function createBoardView({
         saveDraft();
         const id = selected,
           body = { ...draft() };
-        if (!body.text.trim()) return;
+        if (!body.text.trim() || sending.has(id)) return;
+        sending.add(id);
         const button = form.querySelector("[type=submit]");
         button.disabled = true;
         try {
@@ -245,6 +259,8 @@ export function createBoardView({
         } catch (error) {
           notice("Post failed: " + error.message);
         } finally {
+          sending.delete(id);
+          if (visible && selected === id) render();
           if (button.isConnected) button.disabled = false;
         }
       };

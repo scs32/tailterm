@@ -516,6 +516,12 @@ function mount() {
         boardView?.show(id);
       },
       showTerminals: () => modes?.set("terminals"),
+      clearTaskBookmarks: (id) =>
+        api("/hub/forget-task", "POST", { taskId: id })
+          .then((updated) => {
+            data.sessions = updated.sessions;
+          })
+          .catch(() => {}),
       bookmark: (t) =>
         api("/sessions", "POST", {
           serverId: t.server.id,

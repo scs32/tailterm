@@ -81,3 +81,25 @@ func TestRunsInboxRepliesAndPersistence(t *testing.T) {
 		t.Fatalf("restart: %+v %v", restored, err)
 	}
 }
+
+func TestTaskTitlesAreNotShellIdentifiers(t *testing.T) {
+	s, err := Open(filepath.Join(t.TempDir(), "hub.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	ctx := context.Background()
+	task, err := s.CreateTask(ctx, api.CreateTaskRequest{Name: "Review API changes — phase 2"}, api.Caller{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	name := "Plan the next release"
+	if _, err = s.UpdateTask(ctx, task.ID, api.UpdateTaskRequest{Name: &name}, api.Caller{}); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"", "  ", "bad\nname"} {
+		if _, err = s.CreateTask(ctx, api.CreateTaskRequest{Name: name}, api.Caller{}); !errors.Is(err, api.ErrInvalid) {
+			t.Fatalf("invalid title accepted: %q", name)
+		}
+	}
+}

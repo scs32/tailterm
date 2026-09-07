@@ -59,7 +59,7 @@ export async function exerciseWorkspaceControls(page) {
       await page.locator("#new-tab").hover();
       const ordinary = await page.locator("#new-tab").evaluate(style);
       const controls = page.locator(
-        "#workspace button:visible:not(.tab:not(.active) > [data-close]):not(.tab:not(.active) > [data-session-menu])",
+        "#workspace button:visible:not(.mode-switch button):not(.tab:not(.active) > [data-close]):not(.tab:not(.active) > [data-session-menu])",
       );
       const count = await controls.count();
       for (let i = 0; i < count; i++) {

@@ -49,6 +49,8 @@ export async function exerciseTasks(page, hub, origin) {
   await palette("Task: new…");
   await page.locator("#task-name").fill("demo");
   await page.locator("#task-goal").fill("prove the mirror");
+  await page.locator("#task-with-agent").check();
+  await page.locator("#task-attach").check();
   await page.locator("#agent-name").fill("planner");
   await page.locator("#task-create").click();
   await waitFor(
@@ -66,6 +68,7 @@ export async function exerciseTasks(page, hub, origin) {
   assert.ok(task, "task created on the hub");
   const planner = hub.api.agents().find((a) => a.name === "planner");
   assert.ok(planner, "tt spawn registered the agent through the SSH fixture");
+  await page.locator(".mode-switch [data-mode=terminals]").click();
   await waitFor(async () => (await panes()) === before + 1, "planner pane");
   assert.equal(await page.locator("#tabs .tab.task-tab").count(), 1);
   await waitFor(

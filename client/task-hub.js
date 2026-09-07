@@ -82,6 +82,25 @@ export function createTaskHub(host) {
       }
   }
 
+  function forgetTask(taskId) {
+    feeds.get(taskId)?.stop();
+    feeds.delete(taskId);
+    bound.delete(taskId);
+    cache.delete(taskId);
+    for (const group of host.paneGroups()?.model.groups || []) {
+      if (group.taskId === taskId) delete group.taskId;
+    }
+    for (const tab of host.getTabs()) {
+      if (tab.task?.taskId !== taskId) continue;
+      hidden.delete(tab.task.agentId);
+      delete tab.task;
+      host.bookmark(tab);
+    }
+    host.clearTaskBookmarks?.(taskId);
+    host.scheduleWorkspaceSave();
+    host.render();
+  }
+
   function startFeed(taskId) {
     const feed = {
       taskId,
@@ -98,7 +117,13 @@ export function createTaskHub(host) {
       try {
         detail = await client.getTask(taskId);
       } catch (error) {
-        host.notice(`Task hub: ${error.message}`);
+        if (feed.stopped) return;
+        if (error.status === 404) {
+          forgetTask(taskId);
+          return;
+        }
+        if (!feed.error) host.notice(`Task hub: ${error.message}`);
+        feed.error = error.message;
         if (!feed.stopped) {
           feeds.delete(taskId);
           setTimeout(() => {
@@ -146,6 +171,10 @@ export function createTaskHub(host) {
         {
           after: detail.latestSeq,
           onError: (error) => {
+            if (error.status === 404) {
+              forgetTask(taskId);
+              return;
+            }
             feed.error = error.message;
           },
         },
@@ -374,7 +403,7 @@ export function createTaskHub(host) {
   };
 
   function agentFields(server) {
-    return `<label>Launch profile<select id="agent-profile"><option value="">Custom setup</option>${(host.getData().launchProfiles || []).map((p) => `<option value="${esc(p.name)}">${esc(p.name)}</option>`).join("")}</select></label><div class="appearance-controls"><label>Agent name<input id="agent-name" value="agent1" maxlength="64" autocomplete="off" spellcheck="false"></label><label>Runtime<select id="agent-runtime">${runtimeOptions(server)}</select></label></div><label>Command<input id="agent-run" placeholder="claude" autocomplete="off" spellcheck="false"></label><p class="fine">Runs inside the agent’s tmux window through <code>tt wrap</code>, so any command reports started and exited. Claude Code and Codex get richer status through <code>tt hooks</code>.</p><label>Working directory<input id="agent-cwd" placeholder="/home/ubuntu/project (optional)" autocomplete="off" spellcheck="false"></label><label>Prompt<textarea id="agent-prompt" rows="3" placeholder="Optional. Included with the shared task briefing."></textarea></label><button id="agent-save-profile" type="button">Save launch profile</button>`;
+    return `<div class="appearance-controls"><label>Agent name<input id="agent-name" value="agent1" maxlength="64" autocomplete="off" spellcheck="false"></label><label>Runtime<select id="agent-runtime">${runtimeOptions(server)}</select></label></div><label>Assignment<textarea id="agent-prompt" rows="2" placeholder="Optional instructions for this agent"></textarea></label><details class="dialog-details"><summary>Launch options &amp; profiles</summary><label>Launch profile<select id="agent-profile"><option value="">Custom setup</option>${(host.getData().launchProfiles || []).map((p) => `<option value="${esc(p.name)}">${esc(p.name)}</option>`).join("")}</select></label><label>Command<input id="agent-run" placeholder="claude" autocomplete="off" spellcheck="false"></label><label>Working directory<input id="agent-cwd" placeholder="/absolute/project/path (optional)" autocomplete="off" spellcheck="false"></label><button id="agent-save-profile" type="button">Save launch profile</button></details>`;
   }
   function readAgentFields() {
     const runtime = document.querySelector("#agent-runtime").value;
@@ -463,57 +492,105 @@ export function createTaskHub(host) {
     const server = host.currentServer() || host.getServers()[0];
     host.dialog(
       "New task",
-      `<div class="appearance-controls"><label>Task name<input id="task-name" placeholder="refactor-auth" maxlength="64" autocomplete="off" spellcheck="false"></label><label>First agent on<select id="task-server">${serverOptions(server?.id)}</select></label></div><label>Goal<textarea id="task-goal" rows="2" placeholder="What the team is working toward (optional)"></textarea></label>${agentFields(server)}<label class="check"><input type="checkbox" id="task-attach" ${tabId ? "checked" : ""}>Attach the task to the current tab</label><p id="task-error" class="fine" role="alert"></p><div class="dialog-actions"><button id="task-create" class="primary">Create task and start agent</button><button id="task-create-only">Create task only</button></div>`,
+      `<form id="task-form" novalidate>
+      <label>Task name<input id="task-name" placeholder="Review the API changes" maxlength="120" autocomplete="off" required></label>
+      <label>Objective<textarea id="task-goal" rows="3" maxlength="8192" placeholder="What should be accomplished?"></textarea></label>
+      <label class="check"><input type="checkbox" id="task-with-agent">Start the first agent now</label>
+      <fieldset id="task-agent-fields" hidden disabled><label>Server<select id="task-server">${serverOptions(server?.id)}</select></label>${agentFields(server)}</fieldset>
+      <label class="check" ${tabId ? "" : "hidden"}><input type="checkbox" id="task-attach">Group agents with the current terminal tab</label>
+      <div class="task-submit-area"><p id="task-error" class="fine" role="status" aria-live="polite"></p><div class="dialog-actions"><button type="button" id="task-open-created" hidden>Open created task</button><button type="submit" id="task-create" class="primary">Create task</button></div></div>
+    </form>`,
     );
-    wireAgentFields();
-    document.querySelector("#task-server").onchange = (e) => {
-      const s = host.getServers().find((x) => x.id === e.target.value);
-      document.querySelector("#agent-runtime").innerHTML = runtimeOptions(s);
-      wireAgentFields();
+    const form = document.querySelector("#task-form"),
+      error = form.querySelector("#task-error"),
+      button = form.querySelector("#task-create"),
+      withAgent = form.querySelector("#task-with-agent"),
+      agentFieldsEl = form.querySelector("#task-agent-fields");
+    let pending = false,
+      saved = null;
+    const open = () => {
+      host.closeDialog();
+      host.openBoard(saved.id);
     };
-    const error = document.querySelector("#task-error");
-    const create = async (withAgent) => {
+    form.querySelector("#task-open-created").onclick = open;
+    withAgent.onchange = () => {
+      agentFieldsEl.hidden = !withAgent.checked;
+      agentFieldsEl.disabled = !withAgent.checked;
+      button.textContent = withAgent.checked
+        ? "Create task and start agent"
+        : "Create task";
+    };
+    form.onsubmit = async (event) => {
+      event.preventDefault();
+      if (pending) return;
       error.textContent = "";
-      const name = document.querySelector("#task-name").value.trim();
-      if (!AGENT_NAME_RE.test(name)) {
-        error.textContent =
-          "Task name: 1–64 letters, numbers, dashes or underscores.";
-        return;
-      }
-      const serverId = document.querySelector("#task-server").value;
-      const target = host.getServers().find((s) => s.id === serverId);
-      const attachHere =
-        document.querySelector("#task-attach").checked && tabId;
-      const fields = withAgent ? readAgentFields() : null;
       try {
-        if (withAgent && !AGENT_NAME_RE.test(fields.name))
-          throw new Error(
-            "Agent name: 1–64 letters, numbers, dashes or underscores.",
-          );
-        error.textContent = "Creating task…";
-        const task = await client.createTask({
-          name,
-          goal: document.querySelector("#task-goal").value.trim(),
-        });
-        bound.add(task.id);
-        if (attachHere) attach(task.id, tabId);
-        if (withAgent) {
-          error.textContent = `Starting ${fields.name} on ${target.name}…`;
-          await spawn(task.id, target, fields);
+        const name = form.querySelector("#task-name").value.trim();
+        if (!name || [...name].length > 120 || /[\x00-\x1f\x7f]/.test(name))
+          throw new Error("Enter a task name of up to 120 characters.");
+        const target = host
+          .getServers()
+          .find((s) => s.id === form.querySelector("#task-server").value);
+        const fields = withAgent.checked ? readAgentFields() : null;
+        if (fields) {
+          if (!target) throw new Error("Choose a server for the first agent.");
+          // Validate all launch input before creating persistent task records.
+          agentSpawnCommand({
+            hub: client.base,
+            task: "tsk_0000000000000000",
+            ...fields,
+          });
+        }
+        pending = true;
+        button.disabled = true;
+        withAgent.disabled = true;
+        error.textContent = saved ? "Retrying agent launch…" : "Creating task…";
+        if (!saved) {
+          saved = await client.createTask({
+            name,
+            goal: form.querySelector("#task-goal").value.trim(),
+          });
+          bound.add(saved.id);
+          if (form.querySelector("#task-attach").checked && tabId)
+            attach(saved.id, tabId);
+          form.querySelector("#task-name").disabled = true;
+          form.querySelector("#task-goal").disabled = true;
+          form.querySelector("#task-open-created").hidden = false;
+        }
+        if (fields) {
+          error.textContent = `Task created. Starting ${fields.name} on ${target.name}…`;
+          await spawn(saved.id, target, fields);
         }
         sync();
-        host.closeDialog();
+        open();
         host.notice(
-          withAgent
-            ? `Task ${task.name} created; ${fields.name} is starting.`
-            : `Task ${task.name} created.`,
+          fields
+            ? `Task created; ${fields.name} is starting.`
+            : "Task created.",
         );
       } catch (e) {
-        error.textContent = formatError(e);
+        error.textContent =
+          (saved ? "Task created. Agent launch failed: " : "") + formatError(e);
+        error.setAttribute("role", "alert");
+        error.scrollIntoView({ block: "nearest" });
+        button.textContent = saved
+          ? "Retry agent launch"
+          : withAgent.checked
+            ? "Create task and start agent"
+            : "Create task";
+      } finally {
+        pending = false;
+        button.disabled = false;
+        withAgent.disabled = !!saved;
       }
     };
-    document.querySelector("#task-create").onclick = () => create(true);
-    document.querySelector("#task-create-only").onclick = () => create(false);
+    wireAgentFields();
+    form.querySelector("#task-server").onchange = (e) => {
+      const target = host.getServers().find((s) => s.id === e.target.value);
+      form.querySelector("#agent-runtime").innerHTML = runtimeOptions(target);
+      wireAgentFields();
+    };
+    form.querySelector("#task-name").focus();
   }
 
   async function attachTask(tabId = host.currentTab()?.id) {
@@ -574,19 +651,36 @@ export function createTaskHub(host) {
       document.querySelector("#agent-runtime").innerHTML = runtimeOptions(s);
       wireAgentFields();
     };
-    document.querySelector("#agent-start").onclick = async () => {
+    const startButton = document.querySelector("#agent-start");
+    let nextName = 1;
+    while (
+      info?.agents?.some(
+        (a) =>
+          a.name === `agent${nextName}` &&
+          !["closed", "exited"].includes(a.status),
+      )
+    )
+      nextName++;
+    document.querySelector("#agent-name").value = `agent${nextName}`;
+    startButton.onclick = async () => {
+      if (startButton.disabled) return;
       const error = document.querySelector("#task-error");
       const target = host
         .getServers()
         .find((s) => s.id === document.querySelector("#task-server").value);
       try {
         const fields = readAgentFields();
+        if (!target) throw new Error("Choose a server for the agent.");
+        startButton.disabled = true;
         error.textContent = `Starting ${fields.name} on ${target.name}…`;
         const agent = await spawn(taskId, target, fields);
         host.closeDialog();
         host.notice(`${agent.name} is starting on ${target.name}.`);
       } catch (e) {
         error.textContent = formatError(e);
+        error.scrollIntoView({ block: "nearest" });
+      } finally {
+        startButton.disabled = false;
       }
     };
   }

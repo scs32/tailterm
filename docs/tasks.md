@@ -13,7 +13,11 @@ network address. It does not run or configure Tailscale. See
 1. Open Commands → **Task hub: configure**.
 2. Select the Air or Mini and **Load configuration from server**.
 3. **Test connection**, then **Save**. The token stays in the encrypted vault.
-4. Open **Tasks**, create an objective, choose a server and launch an agent.
+4. Open **Tasks** → **New task**, enter a name and objective, then **Create task**.
+   The dialog closes and opens its board. To launch immediately, check
+   **Start first agent now** and choose a server and runtime. Otherwise use
+   **+ Agent** from the board when ready. If launch fails, retry uses the saved
+   task; **Open created task** lets you continue without launching.
 5. Use **Board** for announcements and targeted replies. **Needs you** lists
    agents reporting that they need input. Click an agent to reopen its pane.
 

@@ -8,6 +8,7 @@ import (
 	"regexp"
 	"strings"
 	"time"
+	"unicode/utf8"
 )
 
 const (
@@ -24,8 +25,21 @@ const (
 
 var nameRE = regexp.MustCompile(`^[a-zA-Z0-9_-]{1,64}$`)
 
-// ValidName reports whether s is an acceptable task, agent, or session name.
+// ValidName reports whether s is an acceptable agent or session name.
 func ValidName(s string) bool { return nameRE.MatchString(s) }
+
+// Task titles are display text, independent of tmux session names.
+func ValidTaskName(s string) bool {
+	if s == "" || strings.TrimSpace(s) != s || utf8.RuneCountInString(s) > 120 {
+		return false
+	}
+	for _, r := range s {
+		if r < 0x20 || r == 0x7f {
+			return false
+		}
+	}
+	return true
+}
 
 // ValidText rejects oversized text and control characters other than tab and newline.
 func ValidText(s string, max int) bool {

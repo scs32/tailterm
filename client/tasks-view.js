@@ -30,6 +30,8 @@ export function createTasksView({
     details = [],
     subscription = null,
     loading = false,
+    reloadAgain = false,
+    hasData = false,
     visible = false,
     generation = 0;
   let clock = null;
@@ -39,10 +41,11 @@ export function createTasksView({
   async function show() {
     if (!root) return;
     visible = true;
+    hasData = false;
     const token = generation + 1;
     clearInterval(clock);
     clock = setInterval(() => {
-      if (visible) render();
+      if (visible && hasData) render();
     }, 30000);
     if (!client()) {
       root.innerHTML = `<div class="mode-empty"><span class="eyebrow">TASKS</span><h2>Connect a task hub.</h2><p class="launcher-intro">Tasks bind a team of agent sessions to a terminal tab. They live on your coordination hub across your private network.</p><button id="tasks-configure" class="primary">Configure task hub</button></div>`;
@@ -68,7 +71,12 @@ export function createTasksView({
     subscription = null;
   }
   async function reload() {
-    if (loading || !visible) return;
+    if (!visible) return;
+    if (loading) {
+      reloadAgain = true;
+      return;
+    }
+    reloadAgain = false;
     const token = ++generation;
     loading = true;
     try {
@@ -82,8 +90,10 @@ export function createTasksView({
       );
       if (!visible || token !== generation) return;
       details = next;
+      hasData = true;
     } catch (error) {
       if (!visible || token !== generation) return;
+      hasData = false;
       root.innerHTML = `<div class="mode-empty"><span class="eyebrow">TASKS</span><h2>Hub unavailable.</h2><p class="launcher-intro">${esc(error.message)}</p><button id="tasks-retry">Retry</button></div>`;
       root.querySelector("#tasks-retry").onclick = () => show();
       loading = false;
@@ -92,6 +102,10 @@ export function createTasksView({
     if (!visible || token !== generation) return;
     loading = false;
     render();
+    if (reloadAgain) {
+      reloadAgain = false;
+      void reload();
+    }
   }
   function boundTab(taskId) {
     const group = taskHub.groupOf(taskId);
@@ -131,12 +145,12 @@ export function createTasksView({
               `<button class="board-agent" data-task-agent="${esc(a.id)}" title="${esc(a.host)} · ${esc(a.session)}"><span class="status-dot ${STATUS_DOT[a.status] || ""}"></span><span>${esc(a.name)}</span><span class="fine">${esc(agentState(a))} · ${esc(a.host)}</span></button>`,
           )
           .join("") || '<span class="fine">No agents yet.</span>'
-      }</div><footer class="task-actions"><span class="fine">${tab ? `Mirrored in tab · ${esc(tab.session || tab.server.name)}` : "Not attached to a tab"}</span><button data-task-board="${esc(task.id)}">Board</button><button data-task-add="${esc(task.id)}">＋ Agent</button><button data-task-attach="${esc(task.id)}">${tab ? "Attach elsewhere" : "Attach to current tab"}</button><button data-task-close="${esc(task.id)}" class="danger">Close task</button></footer></article>`;
+      }</div><footer class="task-actions"><span class="fine">${tab ? `Mirrored in tab · ${esc(tab.session || tab.server.name)}` : ""}</span><button data-task-board="${esc(task.id)}">Open board →</button><button data-task-add="${esc(task.id)}">＋ Add agent</button><details class="task-more"><summary>More</summary><div><button data-task-attach="${esc(task.id)}">${tab ? "Group with another tab" : "Group with current tab"}</button><button data-task-close="${esc(task.id)}" class="danger">Close task</button></div></details></footer></article>`;
     };
-    root.innerHTML = `<div class="tasks-view"><div class="tasks-head"><div><span class="eyebrow">TASKS</span><h2>Give every team a shared purpose.</h2><p class="launcher-intro">Keep objectives, conversations, and agents together across your machines. Terminal panes are your view into the team.</p></div><button id="tasks-new" class="primary">＋ New task</button></div><section class="needs-you"><div class="view-heading"><h3>Needs you</h3><span class="count-badge">${needs.length}</span></div>${needs.length ? needs.map(({ task, agent }) => `<button class="attention-row" data-task-agent="${esc(agent.id)}"><strong>${esc(agent.name)}</strong><span>${esc(task.name)} · ${esc(agent.host)}</span><span>Open →</span></button>`).join("") : '<p class="fine">No agents are waiting for your input.</p>'}</section>${
+    root.innerHTML = `<div class="tasks-view"><div class="tasks-head"><div><h2>Tasks <span class="count-badge">${open.length}</span></h2><p class="fine">Shared objectives and the agents working on them.</p></div><button id="tasks-new" class="primary">＋ New task</button></div>${needs.length ? `<section class="needs-you"><div class="view-heading"><h3>Needs you</h3><span class="count-badge">${needs.length}</span></div>${needs.map(({ task, agent }) => `<button class="attention-row" data-task-agent="${esc(agent.id)}"><strong>${esc(agent.name)}</strong><span>${esc(task.name)} · ${esc(agent.host)}</span><span>Open →</span></button>`).join("")}</section>` : '<p class="tasks-clear">No agents waiting for your input.</p>'}${
       open.length
         ? `<div class="task-grid">${open.map(card).join("")}</div>`
-        : `<p class="fine">No open tasks. Start one to spawn the first agent.</p>`
+        : `<div class="tasks-empty"><h3>What are you working on?</h3><p class="fine">Create a task with an objective. Add agents when you’re ready.</p><button id="tasks-empty-new">Create a task</button></div>`
     }${
       closed.length
         ? `<details class="dialog-details tasks-closed"><summary>${closed.length} closed task${closed.length === 1 ? "" : "s"}</summary>${closed
@@ -148,6 +162,8 @@ export function createTasksView({
         : ""
     }</div>`;
     root.querySelector("#tasks-new").onclick = () => taskHub.newTask();
+    const emptyNew = root.querySelector("#tasks-empty-new");
+    if (emptyNew) emptyNew.onclick = () => taskHub.newTask();
     root
       .querySelectorAll("[data-task-board]")
       .forEach((b) => (b.onclick = () => openBoard(b.dataset.taskBoard)));

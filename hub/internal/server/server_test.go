@@ -252,7 +252,7 @@ func TestLongPollWakesAndTimesOut(t *testing.T) {
 
 func TestLimitsAndValidation(t *testing.T) {
 	c := newClient(t)
-	if code := c.do("POST", "/v1/tasks", api.CreateTaskRequest{Name: "bad name!"}, nil); code != 400 {
+	if code := c.do("POST", "/v1/tasks", api.CreateTaskRequest{Name: "bad\nname"}, nil); code != 400 {
 		t.Fatalf("expected 400 for bad name, got %d", code)
 	}
 	if code := c.do("POST", "/v1/tasks", "{not json", nil); code != 400 {
