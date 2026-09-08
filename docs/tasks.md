@@ -16,7 +16,7 @@ network address. It does not run or configure Tailscale. See
 3. **Test connection**, then **Save**. The token stays in the encrypted vault.
 4. Open **Tasks** → **New task**, enter a name and objective, then **Create task**.
    The dialog closes and opens its board. To launch immediately, check
-   **Start first agent now** and choose a server and runtime. Otherwise use
+   **Start first agent now** and choose a server and agent app. Otherwise use
    **+ Agent** from the board when ready. If launch fails, retry uses the saved
    task; **Open created task** lets you continue without launching.
    **Allow agents to add other agents** is off by default. You can change it
@@ -27,7 +27,16 @@ network address. It does not run or configure Tailscale. See
 5. Use **Board** for announcements and targeted replies. **Needs you** lists
    agents reporting that they need input. Click an agent to reopen its pane.
 
-Launch profiles save a server, command and working directory for reuse.
+**Model** accepts a model name or alias for Codex, Claude, Aider, or Gemini.
+Leave it blank to keep that app’s configured default on the selected server.
+The model must be available to the account used by that app; Tailterm does not
+change credentials or validate provider access. Custom apps take model options
+in **Command override**. From an agent, use `tt spawn --runtime codex --run codex --model MODEL --name helper`.
+
+**Advanced setup → Saved setup** (previously “launch profile”) saves the server,
+agent app, model, command, and working directory in the encrypted vault. Give
+it a separate setup name, then choose it when adding another agent. It does
+not save the assignment or change agents already running.
 Each new LLM agent receives the objective and instructions for communicating.
 New tmux sessions retain the task environment so agents can spawn local helpers
 with `tt spawn`. Remote launches use Tailterm's SSH connection; the hub itself

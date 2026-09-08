@@ -405,14 +405,30 @@ export function createTaskHub(host) {
   };
 
   function agentFields(server) {
-    return `<div class="appearance-controls"><label>Agent name<input id="agent-name" value="agent1" maxlength="64" autocomplete="off" spellcheck="false"></label><label>Runtime<select id="agent-runtime">${runtimeOptions(server)}</select></label></div><label>Assignment<textarea id="agent-prompt" rows="2" placeholder="Optional instructions for this agent"></textarea></label><details class="dialog-details"><summary>Launch options &amp; profiles</summary><label>Launch profile<select id="agent-profile"><option value="">Custom setup</option>${(host.getData().launchProfiles || []).map((p) => `<option value="${esc(p.name)}">${esc(p.name)}</option>`).join("")}</select></label><label>Command<input id="agent-run" placeholder="claude" autocomplete="off" spellcheck="false"></label><label>Working directory<input id="agent-cwd" placeholder="/absolute/project/path (optional)" autocomplete="off" spellcheck="false"></label><button id="agent-save-profile" type="button">Save launch profile</button></details>`;
+    return `<div class="agent-launch-fields">
+      <div class="appearance-controls"><label>Agent name<input id="agent-name" value="agent1" maxlength="64" autocomplete="off" spellcheck="false"></label><label>Agent app<select id="agent-runtime">${runtimeOptions(server)}</select></label></div>
+      <label>Model<input id="agent-model" maxlength="200" placeholder="Use the app’s configured default" autocomplete="off" spellcheck="false" aria-describedby="agent-model-help"></label>
+      <p id="agent-model-help" class="fine field-help">Enter a model name or alias available to this app on the selected server.</p>
+      <label>Assignment<textarea id="agent-prompt" rows="2" placeholder="Optional instructions for this agent"></textarea></label>
+      <details class="dialog-details"><summary>Advanced setup</summary>
+        <label>Saved setup<select id="agent-profile"><option value="">Choose a saved setup…</option>${(host.getData().launchProfiles || []).map((p) => `<option value="${esc(p.name)}">${esc(p.name)}</option>`).join("")}</select></label>
+        <p class="fine field-help">Reuse a server, agent app, model, command, and working directory. Assignments stay with each agent.</p>
+        <label>Command override<input id="agent-run" placeholder="claude" autocomplete="off" spellcheck="false"></label>
+        <label>Working directory<input id="agent-cwd" placeholder="/absolute/project/path (optional)" autocomplete="off" spellcheck="false"></label>
+        <div class="agent-save-setup"><label>Setup name<input id="agent-profile-name" placeholder="e.g. code-review" maxlength="64" autocomplete="off"></label><button id="agent-save-profile" type="button">Save setup</button></div>
+        <p id="agent-profile-status" class="fine field-help" role="status"></p>
+      </details></div>`;
   }
+
   function readAgentFields() {
     const runtime = document.querySelector("#agent-runtime").value;
     const run = document.querySelector("#agent-run").value.trim() || runtime;
     return {
       name: document.querySelector("#agent-name").value.trim(),
       runtime: runtime || "generic",
+      model: document.querySelector("#agent-model").disabled
+        ? ""
+        : document.querySelector("#agent-model").value.trim(),
       run,
       cwd: document.querySelector("#agent-cwd").value.trim(),
       prompt: document.querySelector("#agent-prompt").value.trim(),
@@ -420,18 +436,23 @@ export function createTaskHub(host) {
   }
   function wireAgentFields() {
     const runtime = document.querySelector("#agent-runtime"),
-      run = document.querySelector("#agent-run");
+      run = document.querySelector("#agent-run"),
+      model = document.querySelector("#agent-model");
     const update = () => {
       run.placeholder = runtime.value || "your-agent --flag";
-      if (runtime.value && (!run.value || run.dataset.auto === "true")) {
-        run.value = runtime.value;
-        run.dataset.auto = "true";
-      }
+      model.disabled = !["claude", "codex", "aider", "gemini"].includes(
+        runtime.value,
+      );
+      document.querySelector("#agent-model-help").textContent = model.disabled
+        ? "For custom apps, include the model option in the command below."
+        : "Enter a model name or alias available to this app on the selected server. Leave blank to use its configured default.";
     };
-    runtime.onchange = update;
-    run.oninput = () => (run.dataset.auto = "false");
+    runtime.onchange = () => {
+      model.value = "";
+      update();
+    };
     update();
-    const profiles = host.getData().launchProfiles || [];
+    const profiles = [...(host.getData().launchProfiles || [])];
     document.querySelector("#agent-profile").onchange = (e) => {
       const p = profiles.find((p) => p.name === e.target.value);
       if (!p) return;
@@ -441,8 +462,11 @@ export function createTaskHub(host) {
       document.querySelector("#agent-profile").value = p.name;
       document.querySelector("#agent-runtime").value =
         p.runtime === "generic" ? "" : p.runtime;
-      document.querySelector("#agent-run").value = p.run;
-      document.querySelector("#agent-run").dataset.auto = "false";
+      document.querySelector("#agent-run").value =
+        p.run === p.runtime ? "" : p.run;
+      document.querySelector("#agent-model").value = p.model || "";
+      document.querySelector("#agent-profile-name").value = p.name;
+      update();
       document.querySelector("#agent-cwd").value = p.cwd;
     };
     const save = document.querySelector("#agent-save-profile");
@@ -450,12 +474,30 @@ export function createTaskHub(host) {
       save.onclick = async () => {
         try {
           const f = readAgentFields();
+          f.name = document.querySelector("#agent-profile-name").value.trim();
+          if (!AGENT_NAME_RE.test(f.name))
+            throw new Error(
+              "Setup name: 1–64 letters, numbers, dashes or underscores.",
+            );
           await host.api("/launch-profiles", "POST", {
             ...f,
             serverId: document.querySelector("#task-server").value,
           });
           await host.reloadData();
-          host.notice(`Saved launch profile ${f.name}.`);
+          const saved = (host.getData().launchProfiles || []).find(
+            (p) => p.name === f.name,
+          );
+          if (saved) {
+            const index = profiles.findIndex((p) => p.name === f.name);
+            if (index >= 0) profiles[index] = saved;
+            else profiles.push(saved);
+          }
+          const selector = document.querySelector("#agent-profile");
+          if (![...selector.options].some((o) => o.value === f.name))
+            selector.add(new Option(f.name, f.name));
+          selector.value = f.name;
+          document.querySelector("#agent-profile-status").textContent =
+            `Saved ${f.name}.`;
         } catch (e) {
           host.notice(e.message);
         }
@@ -475,6 +517,7 @@ export function createTaskHub(host) {
       cwd: fields.cwd,
       prompt: fields.prompt,
       runtime: fields.runtime,
+      model: fields.model,
     });
     const out = await host.browserCommand(server, command, 65536);
     let agent;

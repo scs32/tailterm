@@ -87,7 +87,13 @@ test("session and executable validation prevent command injection", () => {
 });
 
 test("new-session honours an absolute start directory", () => {
-  const cmd = tmuxCommand("work", "", false, undefined, "/home/testuser/projects");
+  const cmd = tmuxCommand(
+    "work",
+    "",
+    false,
+    undefined,
+    "/home/testuser/projects",
+  );
   assert.ok(cmd.includes("new-session -A -s "));
   assert.ok(cmd.includes("/home/testuser/projects"));
   // Resuming an existing session ignores the directory (no tmux -c flag).
@@ -101,4 +107,35 @@ test("new-session honours an absolute start directory", () => {
     ).includes("/home/testuser/projects"),
   );
   assert.throws(() => tmuxCommand("work", "", false, undefined, "relative"));
-})
+});
+
+test("agent launch forwards an explicit model as one argument and omits defaults", async () => {
+  const { agentSpawnCommand } = await import("../shared/tmux-command.js");
+  const dir = mkdtempSync(path.join(tmpdir(), "tailterm-model-"));
+  try {
+    writeFileSync(path.join(dir, "tt"), "#!/bin/sh\nprintf '%s\\n' \"$@\"\n", {
+      mode: 0o700,
+    });
+    const fields = {
+      hub: "http://127.0.0.1:18765",
+      task: "tsk_0123456789abcdef",
+      name: "reviewer",
+      runtime: "codex",
+      run: "codex",
+      prompt: "First line\nSecond line",
+    };
+    const launch = (extra) =>
+      spawnSync("/bin/sh", ["-c", agentSpawnCommand({ ...fields, ...extra })], {
+        encoding: "utf8",
+        env: { ...process.env, PATH: dir },
+      });
+    const selected = launch({ model: "provider/model:latest" });
+    assert.equal(selected.status, 0);
+    assert.match(selected.stdout, /--model\nprovider\/model:latest\n$/);
+    assert.doesNotMatch(launch({}).stdout, /--model/);
+    for (const model of ["--help", "$(id)", "a\nb", "two words"])
+      assert.throws(() => agentSpawnCommand({ ...fields, model }));
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});

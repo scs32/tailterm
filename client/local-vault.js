@@ -386,17 +386,18 @@ export async function localAPI(url, method = "GET", body = {}) {
         !d.servers.some((s) => s.id === p.serverId) ||
         typeof p.run !== "string" ||
         !p.run.trim() ||
+        (p.model && !/^[A-Za-z0-9][A-Za-z0-9._:/@+-]{0,199}$/.test(p.model)) ||
         p.run.length > 1024 ||
         /[\x00-\x1f\x7f]/.test(p.run) ||
         typeof p.cwd !== "string" ||
         p.cwd.length > 512 ||
         (p.cwd && !p.cwd.startsWith("/"))
       )
-        throw new Error("Invalid launch profile.");
+        throw new Error("Invalid saved setup.");
       const profiles = (d.launchProfiles || []).filter(
         (x) => x.name !== p.name,
       );
-      if (profiles.length >= 30) throw new Error("At most 30 launch profiles.");
+      if (profiles.length >= 30) throw new Error("At most 30 saved setups.");
       d.launchProfiles = [
         ...profiles,
         {
@@ -405,6 +406,7 @@ export async function localAPI(url, method = "GET", body = {}) {
           run: p.run,
           cwd: p.cwd,
           runtime: String(p.runtime || "").slice(0, 64),
+          model: p.model || "",
         },
       ];
     });
@@ -534,6 +536,7 @@ function validateData(d) {
         typeof p.cwd === "string" &&
         p.cwd.length <= 512 &&
         (!p.cwd || p.cwd.startsWith("/")) &&
+        (!p.model || /^[A-Za-z0-9][A-Za-z0-9._:/@+-]{0,199}$/.test(p.model)) &&
         typeof p.runtime === "string" &&
         /^[A-Za-z0-9._-]{0,64}$/.test(p.runtime),
     )

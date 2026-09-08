@@ -449,6 +449,7 @@ func cmdSpawn(e env, args []string) error {
 	cwd := fs.String("cwd", "", "working directory")
 	prompt := fs.String("prompt", "", "appended to the command as a quoted argument")
 	runtime := fs.String("runtime", "", "runtime label (default: first word of --run)")
+	model := fs.String("model", "", "model name or alias (default: runtime configuration)")
 	task := fs.String("task", e.task, "task id")
 	hub := fs.String("hub", e.hub, "hub URL")
 	asJSON := fs.Bool("json", false, "print the agent record as JSON")
@@ -475,7 +476,11 @@ func cmdSpawn(e env, args []string) error {
 	if *runtime == "" {
 		*runtime = strings.Fields(*run)[0]
 	}
-	command := *run
+	baseCommand, err := modelCommand(*run, *runtime, *model)
+	if err != nil {
+		return err
+	}
+	command := baseCommand
 	if *prompt != "" {
 		command += " " + spawn.ShellQuote(*prompt)
 	}
@@ -497,7 +502,7 @@ func cmdSpawn(e env, args []string) error {
 		briefing += "\nAssignment: " + *prompt
 	}
 	if *runtime != "generic" {
-		command = *run + " " + spawn.ShellQuote(briefing)
+		command = baseCommand + " " + spawn.ShellQuote(briefing)
 	}
 	agent, err := c.AddAgent(ctx, *task, api.AddAgentRequest{
 		Name: *name, Host: spawn.Host(), Session: session,

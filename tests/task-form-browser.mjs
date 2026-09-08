@@ -27,7 +27,7 @@ const backend = spawn(path.join(root, ".build/ttbin/tailterm-hub-test"), {
 });
 let failLaunch = false,
   execs = 0;
-const html = `<!doctype html><html><head><link rel="stylesheet" href="/client/style.css"></head><body><div id="app"><div id="workspace"><aside></aside><main><header><div class="header-right"><button id="tailscale-login"><span class="online"></span>Connected</button></div></header><section class="terminal-shell"></section></main></div><dialog id="dialog"></dialog><div id="notice" hidden></div></div><script type="module">
+const html = `<!doctype html><html><head><meta charset="utf-8"><link rel="stylesheet" href="/client/style.css"></head><body><div id="app"><div id="workspace"><aside></aside><main><header><div class="header-right"><button id="tailscale-login"><span class="online"></span>Connected</button></div></header><section class="terminal-shell"></section></main></div><dialog id="dialog"></dialog><div id="notice" hidden></div></div><script type="module">
 import {createTaskHub} from '/client/task-hub.js';
 import {createBoardView} from '/client/board-view.js';
 import {createTasksView} from '/client/tasks-view.js';
@@ -35,7 +35,7 @@ import {setupModes} from '/client/modes.js';
 let board, tasks, modes;const data={hub:{url:location.origin},launchProfiles:[]};
 const servers=[{id:'local',name:'Test host',host:'stephens-macbook-air',username:'test',runtimes:['claude']}];
 const model={groups:[],taskGroup:()=>null};
-const host={getIPN:()=>({fetch:(url,init)=>fetch(url,init)}),getData:()=>data,getServers:()=>servers,currentServer:()=>servers[0],currentTab:()=>null,getTabs:()=>[],paneGroups:()=>({model,sync(){}}),render(){},scheduleWorkspaceSave(){},bookmark(){},closeTab(){},connect:async()=>null,notice:t=>{document.querySelector('#notice').textContent=t},api:async()=>({sessions:[]}),
+const host={getIPN:()=>({fetch:(url,init)=>fetch(url,init)}),getData:()=>data,getServers:()=>servers,currentServer:()=>servers[0],currentTab:()=>null,getTabs:()=>[],paneGroups:()=>({model,sync(){}}),render(){},scheduleWorkspaceSave(){},bookmark(){},closeTab(){},connect:async()=>null,notice:t=>{document.querySelector('#notice').textContent=t},api:async(url,method,body)=>{if(url==="/launch-profiles")data.launchProfiles=[...data.launchProfiles.filter(p=>p.name!==body.name),body];return {sessions:[]}},reloadData:async()=>{},
  dialog:(title,body)=>{const d=document.querySelector('#dialog');if(d.open)d.close();d.innerHTML='<div class="dialog-head"><h2>'+title+'</h2><button id="dialog-close">×</button></div>'+body;d.querySelector('#dialog-close').onclick=()=>host.closeDialog();d.showModal()},
  closeDialog:()=>{const d=document.querySelector('#dialog');d.close();d.replaceChildren()},
  openBoard:id=>{modes.set('board');board.show(id)},
@@ -196,7 +196,22 @@ try {
         (t) => t.name === name + " task with spaces",
       );
       assert.equal(created.allowAgentSpawn, true);
-      await page.evaluate((id) => qa.hub.settings(id), created.id);
+      await page.evaluate(() => qa.modes.set("tasks"));
+      const card = page.locator(`[data-task-card="${created.id}"]`);
+      await card.waitFor();
+      const beforeMore = await card.boundingBox();
+      await card.locator("[data-task-more]").click();
+      await card.locator(".task-menu:popover-open").waitFor();
+      assert.deepEqual(
+        await card.boundingBox(),
+        beforeMore,
+        "More must not reflow the task row",
+      );
+      await page.screenshot({ path: ".build/task-menu-" + name + ".png" });
+      await page.keyboard.press("Escape");
+      assert.equal(await card.locator(".task-menu:popover-open").count(), 0);
+      await card.locator("[data-task-more]").click();
+      await card.locator("[data-task-settings]").click();
       await page.locator("#task-settings-spawn").uncheck();
       await page.locator("#task-settings button[type=submit]").click();
       await page.locator("#dialog").waitFor({ state: "hidden" });
@@ -204,6 +219,10 @@ try {
         (await getTasks()).find((t) => t.id === created.id).allowAgentSpawn,
         false,
       );
+      await page.evaluate((id) => {
+        qa.modes.set("board");
+        qa.board.show(id);
+      }, created.id);
       await page
         .locator("#board-text")
         .fill(
@@ -235,8 +254,45 @@ try {
       await page.evaluate(() => qa.hub.newTask());
       await page.locator("#task-name").fill(name + " launch retry");
       await page.locator("#task-with-agent").check();
-      await page.locator("#agent-runtime").selectOption("");
+      await page.locator("#agent-runtime").selectOption("codex");
+      await page.locator("#agent-model").fill("test-model-v2");
       await page.locator("#task-agent-fields summary").click();
+      await page.locator("#agent-profile-name").fill("review-setup");
+      await page.locator("#agent-save-profile").click();
+      await page
+        .locator("#agent-profile-status")
+        .filter({ hasText: "Saved review-setup" })
+        .waitFor();
+      await page.locator("#agent-runtime").selectOption("claude");
+      assert.equal(await page.locator("#agent-model").inputValue(), "");
+      await page.locator("#agent-profile").selectOption("review-setup");
+      assert.equal(
+        await page.locator("#agent-model").inputValue(),
+        "test-model-v2",
+      );
+      assert.equal(await page.locator("#agent-runtime").inputValue(), "codex");
+      const controls = await page
+        .locator("#task-agent-fields")
+        .evaluate((el) =>
+          [...el.querySelectorAll("input,select")].map((e) => [
+            e.id,
+            e.getBoundingClientRect().height,
+          ]),
+        );
+      assert.ok(
+        controls.every(([, height]) => height === 36),
+        JSON.stringify(controls),
+      );
+      const ink = await page
+        .locator("#agent-model")
+        .evaluate((el) => [
+          getComputedStyle(el).color,
+          getComputedStyle(el, "::placeholder").color,
+        ]);
+      assert.notEqual(ink[0], ink[1]);
+      await page.screenshot({ path: ".build/task-setup-" + name + ".png" });
+      await page.locator("#agent-runtime").selectOption("");
+      assert.ok(await page.locator("#agent-model").isDisabled());
       await page.locator("#agent-run").fill("sleep 10");
       await page.locator("#agent-name").fill("probe-" + name);
       await page.locator("#agent-prompt").fill("Multi-line\nassignment");
@@ -273,6 +329,7 @@ try {
         .locator(".board-head h2")
         .filter({ hasText: name + " mobile task" })
         .waitFor();
+      await page.locator("#board-compose").waitFor({ state: "visible" });
       const compose = await page.locator("#board-compose").boundingBox();
       assert.ok(
         compose.y >= 0 && compose.y + compose.height <= 650,

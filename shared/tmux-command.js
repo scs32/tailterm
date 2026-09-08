@@ -151,6 +151,7 @@ export function agentSpawnCommand({
   cwd = "",
   prompt = "",
   runtime = "",
+  model = "",
 }) {
   if (!/^https?:\/\/[A-Za-z0-9][A-Za-z0-9.:/_-]{0,199}$/.test(hub))
     throw new Error("Invalid hub URL.");
@@ -169,6 +170,12 @@ export function agentSpawnCommand({
     throw new Error("Invalid prompt.");
   if (runtime && !/^[a-zA-Z0-9._-]{1,64}$/.test(runtime))
     throw new Error("Invalid runtime.");
+  if (
+    model &&
+    (!/^[A-Za-z0-9][A-Za-z0-9._:/@+-]{0,199}$/.test(model) ||
+      !["claude", "codex", "aider", "gemini"].includes(runtime))
+  )
+    throw new Error("Enter a valid model name for a supported agent app.");
   const args = [
     "spawn",
     "--json",
@@ -184,6 +191,7 @@ export function agentSpawnCommand({
   if (cwd) args.push("--cwd", cwd);
   if (prompt) args.push("--prompt", prompt);
   if (runtime) args.push("--runtime", runtime);
+  if (model) args.push("--model", model);
   return (
     "/bin/sh -c " +
     shellQuote(

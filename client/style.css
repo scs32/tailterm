@@ -224,7 +224,8 @@ textarea {
 }
 input::placeholder,
 textarea::placeholder {
-  color: #6f7c73;
+  color: var(--placeholder);
+  opacity: 1;
 }
 label {
   display: block;
@@ -3011,6 +3012,7 @@ dialog .key-list button {
 /* Straight terminal frames: one shared treatment for every popup and tab. */
 :root {
   --muted: color-mix(in srgb, var(--terminal-bg), var(--ink) 90%);
+  --placeholder: color-mix(in srgb, var(--terminal-bg), var(--ink) 48%);
   --line: color-mix(in srgb, var(--terminal-bg), var(--ink) 32%);
 }
 dialog,
@@ -3061,7 +3063,7 @@ dialog .font-choice span {
   overflow-wrap: anywhere;
 }
 dialog :is(input, textarea)::placeholder {
-  color: var(--muted);
+  color: var(--placeholder);
   opacity: 1;
 }
 dialog .theme-choice.chosen,
@@ -3246,7 +3248,7 @@ dialog .primary:hover {
   font-family: var(--terminal-font);
 }
 #workspace :is(input, textarea)::placeholder {
-  color: var(--muted);
+  color: var(--placeholder);
   opacity: 1;
 }
 #workspace :is(input, select, textarea):hover,
@@ -4382,15 +4384,26 @@ html:fullscreen {
   position: relative;
   margin-left: auto;
 }
-.task-more summary {
-  cursor: pointer;
-  padding: 10px;
+#mode-view .task-menu {
+  position: fixed;
+  inset: auto;
+  margin: 0;
+  padding: 4px;
+  width: 172px;
+  max-height: calc(100dvh - 16px);
+  overflow: auto;
   border: 1px solid var(--line);
+  background: var(--terminal-bg);
+  color: var(--ink);
+  box-shadow: 4px 4px 0 color-mix(in srgb, var(--terminal-bg) 70%, transparent);
 }
-.task-more[open] > div {
-  display: flex;
-  gap: 6px;
-  padding-top: 8px;
+#mode-view .task-menu:popover-open {
+  display: grid;
+  gap: 2px;
+}
+#mode-view .task-menu button {
+  text-align: left;
+  width: 100%;
 }
 .needs-you {
   border-radius: 0;
@@ -4502,8 +4515,7 @@ html:fullscreen {
   padding: 12px 0 10px;
 }
 #mode-view button,
-#mode-view .button-like,
-#mode-view .task-more > summary {
+#mode-view .button-like {
   box-sizing: border-box;
   min-height: 28px;
   padding: 4px 9px;
@@ -4909,7 +4921,7 @@ html:fullscreen {
 @media (pointer: coarse) {
   #mode-view button,
   #mode-view .button-like,
-  #mode-view .task-more > summary {
+  #mode-view .task-more > button {
     min-height: 36px;
   }
 }
@@ -4919,4 +4931,64 @@ html:fullscreen {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+/* Native selects and text fields share geometry in every dialog, including
+   nested setup fields. Placeholder examples have a separate visual weight. */
+dialog
+  :is(input, select):not([type="checkbox"]):not([type="radio"]):not(
+    [type="range"]
+  ):not([type="color"]) {
+  box-sizing: border-box;
+  height: 36px;
+  min-height: 36px;
+  padding: 7px 10px;
+  line-height: 20px;
+}
+dialog select:not([multiple]):not([size]) {
+  appearance: none;
+  padding-right: 28px !important;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 12 12'%3E%3Cpath d='m3 4.5 3 3 3-3' fill='none' stroke='%23858b87' stroke-width='1.5'/%3E%3C/svg%3E");
+  background-position: right 9px center;
+  background-repeat: no-repeat;
+}
+dialog .field-help {
+  margin: 5px 0 10px;
+  color: color-mix(in srgb, var(--terminal-bg), var(--ink) 65%);
+  font-size: 11px;
+}
+dialog .agent-launch-fields textarea {
+  min-height: 62px;
+}
+dialog .agent-save-setup {
+  display: flex;
+  align-items: flex-end;
+  gap: 8px;
+}
+dialog .agent-save-setup label {
+  flex: 1;
+  min-width: 0;
+  margin-bottom: 0;
+}
+dialog .agent-save-setup button {
+  height: 36px;
+  white-space: nowrap;
+  padding: 6px 10px;
+}
+@media (pointer: coarse) {
+  dialog
+    :is(input, select):not([type="checkbox"]):not([type="radio"]):not(
+      [type="range"]
+    ):not([type="color"]),
+  dialog .agent-save-setup button {
+    height: 44px;
+    min-height: 44px;
+  }
+}
+
+#agent-profile:has(option:checked[value=""]) {
+  color: var(--placeholder);
+}
+#agent-profile option {
+  color: var(--ink);
 }

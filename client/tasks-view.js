@@ -145,7 +145,7 @@ export function createTasksView({
               `<button class="board-agent" data-task-agent="${esc(a.id)}" title="${esc(a.host)} · ${esc(a.session)}"><span class="status-dot ${STATUS_DOT[a.status] || ""}"></span><span>${esc(a.name)}</span><span class="fine">${esc(agentState(a))} · ${esc(a.host)}</span></button>`,
           )
           .join("") || '<span class="fine">No agents yet.</span>'
-      }</div><footer class="task-actions"><span class="fine">${task.allowAgentSpawn ? "Helpers allowed" : "Helpers off"}</span><button data-task-board="${esc(task.id)}">Open board →</button><button data-task-add="${esc(task.id)}">＋ Add agent</button><details class="task-more"><summary>More</summary><div><button data-task-attach="${esc(task.id)}">Open terminals</button><button data-task-settings="${esc(task.id)}">Settings</button><button data-task-close="${esc(task.id)}" class="danger">Close task</button></div></details></footer></article>`;
+      }</div><footer class="task-actions"><span class="fine">${task.allowAgentSpawn ? "Helpers allowed" : "Helpers off"}</span><button data-task-board="${esc(task.id)}">Open board →</button><button data-task-add="${esc(task.id)}">＋ Add agent</button><div class="task-more"><button type="button" data-task-more="${esc(task.id)}" aria-expanded="false" aria-controls="task-menu-${esc(task.id)}">More</button><div id="task-menu-${esc(task.id)}" class="task-menu" popover="auto" aria-label="More task actions"><button data-task-attach="${esc(task.id)}">Open terminals</button><button data-task-settings="${esc(task.id)}">Settings</button><button data-task-close="${esc(task.id)}" class="danger">Close task</button></div></div></footer></article>`;
     };
     root.innerHTML = `<div class="tasks-view"><div class="tasks-head"><div><h2>Tasks <span class="count-badge">${open.length}</span></h2><p class="fine">Shared objectives and the agents working on them.</p></div><button id="tasks-new" class="primary">＋ New task</button></div>${needs.length ? `<section class="needs-you"><div class="view-heading"><h3>Needs you</h3><span class="count-badge">${needs.length}</span></div>${needs.map(({ task, agent }) => `<button class="attention-row" data-task-agent="${esc(agent.id)}"><strong>${esc(agent.name)}</strong><span>${esc(task.name)} · ${esc(agent.host)}</span><span>Open →</span></button>`).join("")}</section>` : '<p class="tasks-clear">No agents waiting for your input.</p>'}${
       open.length
@@ -161,6 +161,29 @@ export function createTasksView({
             .join("")}</details>`
         : ""
     }</div>`;
+    root.querySelectorAll("[data-task-more]").forEach((button) => {
+      const menu = root.querySelector(`#task-menu-${button.dataset.taskMore}`);
+      menu.addEventListener("toggle", () =>
+        button.setAttribute(
+          "aria-expanded",
+          String(menu.matches(":popover-open")),
+        ),
+      );
+      button.onclick = () => {
+        if (menu.matches(":popover-open")) {
+          menu.hidePopover();
+          return;
+        }
+        menu.showPopover();
+        const anchor = button.getBoundingClientRect(),
+          bounds = menu.getBoundingClientRect();
+        menu.style.left = `${Math.max(8, Math.min(anchor.right - bounds.width, innerWidth - bounds.width - 8))}px`;
+        menu.style.top = `${Math.max(8, anchor.bottom + bounds.height + 4 <= innerHeight ? anchor.bottom + 4 : anchor.top - bounds.height - 4)}px`;
+      };
+      menu.addEventListener("click", (event) => {
+        if (event.target.closest("button")) menu.hidePopover();
+      });
+    });
     root.querySelector("#tasks-new").onclick = () => taskHub.newTask();
     const emptyNew = root.querySelector("#tasks-empty-new");
     if (emptyNew) emptyNew.onclick = () => taskHub.newTask();
