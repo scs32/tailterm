@@ -4384,12 +4384,14 @@ html:fullscreen {
   position: relative;
   margin-left: auto;
 }
+/* Safari stretches grid popovers to max-height; keep this menu sized to its rows. */
 #mode-view .task-menu {
   position: fixed;
   inset: auto;
   margin: 0;
   padding: 4px;
   width: 172px;
+  height: max-content;
   max-height: calc(100dvh - 16px);
   overflow: auto;
   border: 1px solid var(--line);
@@ -4398,10 +4400,12 @@ html:fullscreen {
   box-shadow: 4px 4px 0 color-mix(in srgb, var(--terminal-bg) 70%, transparent);
 }
 #mode-view .task-menu:popover-open {
-  display: grid;
+  display: flex;
+  flex-direction: column;
   gap: 2px;
 }
 #mode-view .task-menu button {
+  flex: none;
   text-align: left;
   width: 100%;
 }

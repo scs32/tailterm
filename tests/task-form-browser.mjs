@@ -207,10 +207,23 @@ try {
         beforeMore,
         "More must not reflow the task row",
       );
+      const menuSize = await card
+        .locator(".task-menu")
+        .evaluate((el) => ({
+          height: el.getBoundingClientRect().height,
+          rows: [...el.children].map((b) => b.getBoundingClientRect().height),
+        }));
+      assert.equal(menuSize.height, 98, JSON.stringify(menuSize));
+      assert.deepEqual(menuSize.rows, [28, 28, 28]);
       await page.screenshot({ path: ".build/task-menu-" + name + ".png" });
       await page.keyboard.press("Escape");
       assert.equal(await card.locator(".task-menu:popover-open").count(), 0);
       await card.locator("[data-task-more]").click();
+      assert.equal(
+        (await card.locator(".task-menu").boundingBox()).height,
+        98,
+        "Reopened menus must stay compact",
+      );
       await card.locator("[data-task-settings]").click();
       await page.locator("#task-settings-spawn").uncheck();
       await page.locator("#task-settings button[type=submit]").click();
