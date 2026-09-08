@@ -200,6 +200,25 @@ async function assertRowInModeViewport(page, label) {
     `${label} row is clipped outside the mode viewport`,
   );
 }
+async function assertControlsInModeViewport(page, label) {
+  const geometry = await page.evaluate(() => {
+    const viewport = document.querySelector("#mode-view")?.getBoundingClientRect();
+    const controls = ["[data-items-project]", "[data-items-status]", "[data-items-new]"]
+      .map((selector) => document.querySelector(selector)?.getBoundingClientRect())
+      .filter(Boolean);
+    return viewport && controls.length === 3
+      ? { viewport: { left: viewport.left, top: viewport.top, right: viewport.right, bottom: viewport.bottom }, controls: controls.map(({ left, top, right, bottom, width, height }) => ({ left, top, right, bottom, width, height })) }
+      : null;
+  });
+  assert.equal(geometry?.controls.length, 3, `${label} controls are missing`);
+  for (const control of geometry.controls) {
+    assert.ok(control.width > 0 && control.height > 0, `${label} control has no size`);
+    assert.ok(
+      control.left >= geometry.viewport.left && control.right <= geometry.viewport.right && control.top >= geometry.viewport.top && control.bottom <= geometry.viewport.bottom,
+      `${label} control is clipped outside the mode viewport`,
+    );
+  }
+}
 
 try {
   for (const [name, engine] of [["chromium", chromium], ["webkit", webkit]]) {
@@ -281,6 +300,7 @@ try {
         bugsBounds && bugsBounds.y >= 0 && bugsBounds.y + bugsBounds.height <= 720,
         "populated Bugs controls are vertically clipped at 390px",
       );
+      await assertControlsInModeViewport(page, "Bugs");
       await assertRowInModeViewport(page, "Bugs");
       await page.screenshot({ path: `.build/project-work-items-bugs-${name}.png` });
       await page.locator(`[data-item-edit="${createdID}"]`).click();
@@ -304,6 +324,7 @@ try {
         window.scrollTo(0, 0);
         document.querySelector('#mode-view').scrollTop = 0;
       });
+      await assertControlsInModeViewport(page, "Features");
       await assertRowInModeViewport(page, "Features");
       await page.screenshot({ path: `.build/project-work-items-features-${name}.png` });
 
@@ -351,7 +372,9 @@ try {
       await api("DELETE", `/v1/tasks/${source.task.id}`);
       await page.locator('#dialog-close').click();
       await page.evaluate(() => qa.bugs.reload());
-      await page.locator(`[data-item-send="${createdID}"]`).waitFor();
+      // A subscription refresh may already be running; wait for the closed
+      // state to render instead of accepting the still-visible previous row.
+      await page.locator(`[data-item-send="${createdID}"]:disabled`).waitFor();
       assert.equal(await page.locator(`[data-item-send="${createdID}"]`).isDisabled(), true);
       await page.locator(`[data-item-edit="${createdID}"]`).click();
       assert.equal(await page.locator('#work-item-title').isDisabled(), true);
