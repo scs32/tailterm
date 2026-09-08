@@ -1,6 +1,40 @@
 # Development handoff — September 8, 2026
 
-## September 8 cache release — current deployment
+## September 8 layout release — current deployment; Air update pending
+
+Application commit `b2e85b814ac742a4100298dca6141c936f182d1e` is deployed to
+`https://tailos.tailarr.com` (`https://f9b41492.tailos.pages.dev`) and Mini
+`http://127.0.0.1:4318`. Projects, Teams, Bugs and Features now reuse Board's
+full-height divided layout and boxed selectors. Project terminal groups retain
+exact splits, proportions, pane order and focused agent across same-origin
+reloads and reconnects using stable agent identities in the encrypted local vault.
+Layouts remain local to a browser origin; they do not sync between devices.
+
+**Air deployment is blocked by SSH connectivity.** Bounded attempts to
+`theAir` (`100.96.77.33:22`) timed out before transferring or changing any files.
+Its last verified preview remains `78498da834122f648fac1ee35f6127b50e0fab1d`.
+Feature `wi_b5ad1646826c44c5` remains in progress solely for this required preview
+update. When Air is reachable, run `python3 scripts/deploy-remote-static.py theAir`
+from a clean isolated checkout of the application commit above, with the retained
+matching `dist-static` artifacts and Node dependencies available. The script
+requires an exact clean HEAD; this later documentation commit deliberately does
+not match the deployed manifest. Do not switch or overwrite an active checkout
+or rebuild only Air from a different commit. Verify all served hashes and record
+the new Air receipt before marking the feature done.
+
+[Release receipt](releases/tailos-2026-09-08-layout.json) records both successful
+origins and the Air blocker. All 101 unit tests passed. Chromium/WebKit acceptance
+covered 90 independent layout screenshots, encrypted layout restoration and
+existing project launch, work-item, cache and layout regressions. All 81 served
+assets match on TailOS and Mini; production Chromium started the real WASM and
+restored an isolated synthetic vault key. No hub or host CLI changes were needed.
+
+All implementation and QA results were accepted and workers retired; the lead
+remains available. Per the owner's latest instruction, take further work only
+from an owner message or a logged database bug. The proposed discipline feature
+still awaits owner details; do not invent its behavior or resume unrelated work.
+
+## September 8 cache release (previous)
 
 Application commit `78498da834122f648fac1ee35f6127b50e0fab1d` is deployed to
 `https://tailos.tailarr.com` (`https://801220fd.tailos.pages.dev`). **Both Mini and

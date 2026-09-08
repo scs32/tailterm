@@ -1,0 +1,56 @@
+{
+  "origin": "https://tailos.tailarr.com",
+  "deployment": "https://f9b41492.tailos.pages.dev",
+  "commit": "b2e85b814ac742a4100298dca6141c936f182d1e",
+  "verifiedAssets": 81,
+  "releaseSha256": "6debe48e44aeedbc614851e6e8dd81e808d7f9bea4609e7f85877f2ec983b02a",
+  "verifiedAt": "2026-09-08T19:46:10.286Z",
+  "status": "public and Mini deployed; Air preview update blocked by SSH timeout",
+  "localPreviews": [
+    {
+      "host": "Mini",
+      "origin": "http://127.0.0.1:4318",
+      "commit": "b2e85b814ac742a4100298dca6141c936f182d1e",
+      "releaseSha256": "6debe48e44aeedbc614851e6e8dd81e808d7f9bea4609e7f85877f2ec983b02a",
+      "verifiedAssets": 81,
+      "mode": "npm run preview:static serving verified dist-static"
+    },
+    {
+      "host": "theAir",
+      "origin": "http://127.0.0.1:4318",
+      "commit": "78498da834122f648fac1ee35f6127b50e0fab1d",
+      "releaseSha256": "5b9344e477a55f9a162408e66125e9c51f3e29d8080f34d7fe63f7d76c1119d0",
+      "verifiedAssets": 81,
+      "mode": "changed static files in existing container",
+      "containerImage": "tailterm-static:56ded4133c7a",
+      "rollbackImage": "tailterm-static:56ded4133c7a",
+      "previousCommit": "56ded4133c7a9ec952004dd51fa11e94a6c7d382",
+      "artifactDirectory": "/Users/stephenspeicher/.local/share/tailterm/web-releases/78498da83412",
+      "status": "last verified previous release; update attempt failed before file transfer",
+      "pendingCommit": "b2e85b814ac742a4100298dca6141c936f182d1e",
+      "blocker": "SSH connection to 100.96.77.33 port 22 timed out on bounded attempts"
+    }
+  ],
+  "workItem": {
+    "id": "wi_b5ad1646826c44c5",
+    "status": "in_progress",
+    "remaining": "Air preview deployment"
+  },
+  "unchangedComponents": {
+    "hubAndHostCLIs": "See tailos-2026-09-08-cache.json; not updated for this frontend release"
+  },
+  "verification": [
+    "101 JavaScript unit tests passed",
+    "Independent Board layout matrix passed in Chromium and WebKit: 1440/1024/390 widths, populated/empty/long-label data, 90 screenshots, zero failures",
+    "Encrypted project-layout browser fixture passed in Chromium and WebKit: exact splits, resize/focus, new pane IDs, out-of-order arrival, hide all/reopen, authoritative deletion",
+    "Existing task-layout, task-form, project-work-items, hub-cache and teams-vault browser regressions passed in Chromium and WebKit",
+    "Clean static build and all 82 manifest entries verified; all 81 public and Mini served assets match",
+    "Production Chromium smoke passed: HTTPS, matching margins, production WASM startup and isolated synthetic vault key restoration"
+  ],
+  "limits": [
+    "Project split layouts and focused agent remain encrypted local browser-origin state; they do not sync between devices",
+    "Air remains on the last verified previous preview until SSH is reachable and deployment succeeds",
+    "All implementation and QA workers accepted and retired; orchestrator remains available",
+    "Further work requires an owner message or a logged database bug; discipline feature awaits owner details"
+  ]
+}
