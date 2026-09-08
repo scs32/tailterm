@@ -6,6 +6,7 @@ export const MODES = [
   ["board", "Board", "2"],
   ["files", "Files", "3"],
   ["tasks", "Tasks", "4"],
+  ["teams", "Teams", "5"],
 ];
 export function setupModes({ header, main, onChange, available = () => true }) {
   let current = "terminals";

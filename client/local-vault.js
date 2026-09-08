@@ -1,3 +1,9 @@
+import { normalizeTeam, savedTeams } from "./teams.js";
+import {
+  normalizeUsername,
+  validUsername,
+  profileMaster,
+} from "./profile-crypto.js";
 import { credentialCache } from "./credential-cache.js";
 import { normalizeHubURL } from "./hub-client.js";
 import { normalizeTaskRef, normalizeRuntimes } from "./task-ref.js";
@@ -14,6 +20,8 @@ import {
 } from "../shared/tmux-command.js";
 import { validatePrivateKey, generatePrivateKey } from "./wasm-runtime.js";
 import { normalizeWorkspace } from "./workspace-state.js";
+let profileUnlockKey,
+  profileSerial = 0;
 let database,
   contents,
   key,
@@ -100,7 +108,8 @@ export async function resetVault() {
         tx.onabort = () =>
           reject(tx.error || new Error("Vault reset aborted."));
       });
-      contents = key = salt = undefined;
+      contents = key = salt = profileUnlockKey = undefined;
+      localStorage.removeItem("tailterm.username");
     },
   );
 }
@@ -120,9 +129,10 @@ export async function forgetDevice() {
       tx.onabort = () =>
         reject(tx.error || new Error("Could not forget this device."));
     });
-    contents = key = salt = undefined;
+    contents = key = salt = profileUnlockKey = undefined;
     releaseLock?.();
     releaseLock = undefined;
+    localStorage.removeItem("tailterm.username");
   });
   queue = task.catch(() => {});
   return task;
@@ -147,6 +157,9 @@ export function localData() {
     workspace: normalizeWorkspace(contents.workspace),
     hub: { url: contents.hub?.url || "", token: contents.hub?.token || "" },
     launchProfiles: structuredClone(contents.launchProfiles || []),
+    teams: savedTeams(contents),
+    profile: structuredClone(contents.profile || {}),
+    profileAppearance: structuredClone(contents.profileAppearance || null),
     backup: {
       changed: contents.backupChanged || null,
       exported: contents.backupExported || null,
@@ -171,10 +184,21 @@ async function mutate(fn, backupChanged = false) {
     requireUnlocked();
     const next = structuredClone(contents);
     const result = await fn(next);
-    if (backupChanged) next.backupChanged = new Date().toISOString();
+    const sharedChanged =
+      (backupChanged || next.backupChanged !== contents.backupChanged) &&
+      JSON.stringify(sharedProfileData(next)) !==
+        JSON.stringify(sharedProfileData(contents));
+    if (sharedChanged) {
+      next.backupChanged = new Date().toISOString();
+      if (next.profile?.hub) next.profile.dirty = true;
+    }
     const envelope = await sealVault(next, key, salt);
     await disk(envelope);
     contents = next;
+    if (sharedChanged) {
+      profileSerial++;
+      window.dispatchEvent(new Event("tailterm-profile-change"));
+    }
     return result === undefined ? localData() : result;
   });
   queue = task.catch(() => {});
@@ -207,15 +231,31 @@ export async function markBackupExported(started = new Date().toISOString()) {
 const editVault = (fn) => mutate(fn, true);
 export async function localAPI(url, method = "GET", body = {}) {
   if (url === "/status")
-    return { initialized: !!(await disk()), unlocked: !!contents };
+    return {
+      initialized: !!(await disk()),
+      unlocked: !!contents,
+      username: localStorage.getItem("tailterm.username") || "",
+    };
   if (url === "/unlock") {
     await db();
     await acquire();
+    const username = normalizeUsername(
+      body.username || localStorage.getItem("tailterm.username"),
+    );
     try {
+      if (username && !validUsername(username))
+        throw new Error("Enter a valid username.");
       const envelope = await disk();
       if (envelope) {
         const opened = await openVault(envelope, body.password);
         validateData(opened.data);
+        if (
+          opened.data.profile?.username &&
+          opened.data.profile.username !== username
+        )
+          throw new Error(
+            "This browser has a different local profile. Use its username or Forget this device first.",
+          );
         contents = opened.data;
         key = opened.key;
         salt = opened.salt;
@@ -226,10 +266,18 @@ export async function localAPI(url, method = "GET", body = {}) {
         await disk(await sealVault(initial, key, salt));
         contents = initial;
       }
+      profileUnlockKey = username
+        ? await profileMaster(body.password, username)
+        : null;
+      if (username) {
+        contents.profile = { ...contents.profile, username };
+        await disk(await sealVault(contents, key, salt));
+        localStorage.setItem("tailterm.username", username);
+      }
       void navigator.storage?.persist?.().catch(() => {});
       return localData();
     } catch (e) {
-      contents = key = salt = undefined;
+      contents = key = salt = profileUnlockKey = undefined;
       releaseLock?.();
       releaseLock = undefined;
       throw e;
@@ -244,8 +292,9 @@ export async function localAPI(url, method = "GET", body = {}) {
   if (url === "/data") return localData();
   if (url === "/lock") {
     credentialCache.clear();
+    profileUnlockKey = undefined;
     await queue;
-    contents = key = salt = undefined;
+    contents = key = salt = profileUnlockKey = undefined;
     releaseLock?.();
     releaseLock = undefined;
     return { ok: true };
@@ -378,6 +427,19 @@ export async function localAPI(url, method = "GET", body = {}) {
         session.target = structuredClone(body.target);
       }
     });
+  if (url === "/teams" && method === "POST")
+    return editVault((d) => {
+      const team = normalizeTeam(body);
+      if (team.members.some((m) => !d.servers.some((s) => s.id === m.serverId)))
+        throw new Error("Choose a saved server for every team member.");
+      const teams = savedTeams(d).filter((t) => t.id !== team.id);
+      if (teams.length >= 30) throw new Error("At most 30 teams.");
+      d.teams = [...teams, team];
+    });
+  if (url.startsWith("/teams/") && method === "DELETE")
+    return editVault((d) => {
+      d.teams = savedTeams(d).filter((t) => t.id !== url.slice(7));
+    });
   if (url === "/launch-profiles" && method === "POST")
     return editVault((d) => {
       const p = body;
@@ -457,12 +519,22 @@ export async function renameSessionBookmark(serverId, name, nextName) {
 }
 export async function importBackup(envelope, password) {
   const opened = await openVault(envelope, password);
+  const hasTeams =
+    Object.hasOwn(opened.data, "teams") ||
+    Object.hasOwn(opened.data, "launchProfiles");
+  const hasHub = Object.hasOwn(opened.data, "hub"),
+    hasSetups = Object.hasOwn(opened.data, "launchProfiles");
   validateData(opened.data);
   // Never import another browser's node identity. Keep this browser's identity, if any.
   return editVault((d) => {
     d.servers = opened.data.servers;
     d.keys = opened.data.keys;
     d.sessions = opened.data.sessions;
+    if (hasHub) d.hub = opened.data.hub;
+    if (hasSetups) d.launchProfiles = opened.data.launchProfiles;
+    if (hasTeams) d.teams = savedTeams(opened.data);
+    if (opened.data.profileAppearance)
+      d.profileAppearance = opened.data.profileAppearance;
   });
 }
 function validateServer(s) {
@@ -523,6 +595,7 @@ function validateData(d) {
   if (token.length > 512 || /[\x00-\x20\x7f]/.test(token))
     throw new Error("Invalid hub token.");
   d.hub = { url: hubURL || "", token };
+  d.teams = savedTeams(d);
   d.launchProfiles = (Array.isArray(d.launchProfiles) ? d.launchProfiles : [])
     .filter(
       (p) =>
@@ -541,4 +614,90 @@ function validateData(d) {
         /^[A-Za-z0-9._-]{0,64}$/.test(p.runtime),
     )
     .slice(0, 30);
+}
+
+export function profileMasterKey() {
+  requireUnlocked();
+  return profileUnlockKey;
+}
+export async function nameProfile(username, password) {
+  requireUnlocked();
+  username = normalizeUsername(username);
+  if (!validUsername(username)) throw new Error("Enter a valid username.");
+  if (contents.profile?.hub && contents.profile.username !== username)
+    throw new Error("Disconnect profile sync before changing usernames.");
+  const currentKey = key;
+  await openVault(await disk(), password); // Confirm this local vault's passphrase.
+  const master = await profileMaster(password, username);
+  if (!key || key !== currentKey)
+    throw new Error("Vault was locked. Unlock and retry.");
+  await mutate((d) => {
+    d.profile = { ...d.profile, username };
+  });
+  if (!key || key !== currentKey)
+    throw new Error("Vault was locked. Unlock and retry.");
+  profileUnlockKey = master;
+  localStorage.setItem("tailterm.username", username);
+}
+function sharedProfileData(d) {
+  return {
+    ...portableData(d),
+    teams: savedTeams(d),
+    profileAppearance: structuredClone(d.profileAppearance || null),
+  };
+}
+export async function profileSnapshot() {
+  await queue;
+  requireUnlocked();
+  return {
+    serial: profileSerial,
+    data: sharedProfileData(contents),
+  };
+}
+export async function saveProfileAppearance(value) {
+  requireUnlocked();
+  if (JSON.stringify(contents.profileAppearance) === JSON.stringify(value))
+    return;
+  return mutate((d) => {
+    d.profileAppearance = structuredClone(value);
+  }, true);
+}
+export async function setProfileConnection(connection, serial) {
+  return mutate((d) => {
+    d.profile = {
+      ...d.profile,
+      ...connection,
+      dirty: serial !== undefined && serial !== profileSerial,
+    };
+  });
+}
+export async function applyRemoteProfile(payload, connection, serial) {
+  return mutate((d) => {
+    if (serial !== profileSerial)
+      throw new Error(
+        "Local settings changed during sync. Retry after saving.",
+      );
+    validateData(payload);
+    // Retain the previous local snapshot inside the encrypted local vault.
+    d.profileRecovery = {
+      ...portableData(d),
+      profileAppearance: d.profileAppearance || null,
+    };
+    d.servers = payload.servers;
+    d.keys = payload.keys;
+    d.sessions = payload.sessions;
+    d.hub = payload.hub;
+    d.launchProfiles = payload.launchProfiles;
+    d.teams = savedTeams(payload);
+    d.profileAppearance = payload.profileAppearance || null;
+    d.profile = { ...d.profile, ...connection, dirty: false };
+    // d.tailscale and d.workspace are deliberately device-specific.
+  });
+}
+export async function exportProfileRecovery() {
+  await queue;
+  requireUnlocked();
+  if (!contents.profileRecovery)
+    throw new Error("No earlier local profile is stored.");
+  return sealVault(contents.profileRecovery, key, salt);
 }

@@ -139,6 +139,7 @@ export function setupPaneGroups({
     const next = [
       grouped,
       group?.taskId || "",
+      ...(group?.guests || []),
       ...ids,
       ...layout.dividers.map((d) => d.node.id),
     ].join("|");
@@ -150,9 +151,12 @@ export function setupPaneGroups({
         header.className = "pane-header";
         header.dataset.pane = id;
         header.draggable = false;
-        header.title = grouped
-          ? "Drag to rearrange\nDrop onto another pane in this group to swap positions, or onto the tab bar to ungroup."
-          : "Drag to group\nDrop onto another session tab to group these terminals.";
+        header.title =
+          group?.taskId && !group.guests?.includes(id)
+            ? "Drag to rearrange within this task. Task agents stay in their task group."
+            : grouped
+              ? "Drag to rearrange\nDrop onto another pane in this group to swap positions, or onto the tab bar to ungroup."
+              : "Drag to group\nDrop onto another session tab to group these terminals.";
         const focus = document.createElement("button");
         focus.className = "pane-label";
         focus.onclick = () => activate(id);
@@ -182,7 +186,7 @@ export function setupPaneGroups({
           uploadButton.onclick = () => upload(id);
           header.append(uploadButton);
         }
-        if (grouped && !group.taskId) header.append(detachButton);
+        if (grouped && model.canDetach(id)) header.append(detachButton);
         header.append(closeButton);
         chrome.append(header);
       }
@@ -308,7 +312,7 @@ export function setupPaneGroups({
       const id =
         source.dataset.pane || source.querySelector("[data-tab]")?.dataset.tab;
       drag = { id, whole: !source.dataset.pane };
-      release.hidden = !source.dataset.pane;
+      release.hidden = !source.dataset.pane || !model.canDetach(id);
     },
     move(element, x) {
       document
@@ -335,6 +339,17 @@ export function setupPaneGroups({
         if (drag) drag.reorder = null;
         target?.classList.add("group-drop-target");
       }
+      const targetId =
+        target?.dataset.pane ||
+        target?.querySelector("[data-tab]")?.dataset.tab;
+      if (
+        drag &&
+        targetId &&
+        !drag.reorder &&
+        !model.canMerge(drag.id, targetId, drag.whole) &&
+        !(!drag.whole && model.group(drag.id) === model.group(targetId))
+      )
+        target.classList.remove("group-drop-target");
       if (element && strip.contains(element)) {
         const bounds = strip.getBoundingClientRect();
         if (x < bounds.left + 30) strip.scrollLeft -= 20;

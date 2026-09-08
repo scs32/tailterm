@@ -1,3 +1,4 @@
+import { leaves } from "./pane-layout.js";
 import { normalizeTabDecoration } from "./tab-decoration.js";
 import { normalizeTaskRef, normalizeTaskId } from "./task-ref.js";
 export const normalizeSessionFontSize = (value) =>
@@ -104,8 +105,21 @@ export function normalizeWorkspace(value) {
       active: ids.has(g?.active) ? g.active : null,
       decoration: normalizeTabDecoration(g?.decoration),
       taskId: normalizeTaskId(g?.taskId),
+      guests: Array.isArray(g?.guests)
+        ? g.guests.filter((id) => ids.has(id)).slice(0, 30)
+        : [],
     }))
-    .filter((g) => g.tree);
+    .filter((g) => g.tree)
+    .map((g) => ({
+      ...g,
+      guests: g.taskId
+        ? g.guests.filter(
+            (id) =>
+              leaves(g.tree).includes(id) &&
+              !tabs.find((t) => t.id === id)?.task,
+          )
+        : [],
+    }));
   return {
     tabs,
     serverFilter: Array.isArray(value.serverFilter)

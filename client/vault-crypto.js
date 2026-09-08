@@ -102,6 +102,12 @@ export function portableData(data) {
     sessions: structuredClone(data.sessions),
     hub: { url: data.hub?.url || "", token: data.hub?.token || "" },
     launchProfiles: structuredClone(data.launchProfiles || []),
+    ...(Array.isArray(data.teams)
+      ? { teams: structuredClone(data.teams) }
+      : {}),
+    ...(data.profileAppearance
+      ? { profileAppearance: structuredClone(data.profileAppearance) }
+      : {}),
     tailscale: {},
   };
 }

@@ -1,6 +1,7 @@
 package store
 
 import "database/sql"
+import "github.com/scs32/tailterm/hub/internal/api"
 
 // Additive migrations preserve existing task history and encrypted tailnet state.
 func migrate(db *sql.DB) error {
@@ -20,5 +21,12 @@ func migrate(db *sql.DB) error {
 			}
 		}
 	}
-	return nil
+
+	if _, err := db.Exec(`CREATE TABLE IF NOT EXISTS profile_meta (key TEXT PRIMARY KEY,value TEXT NOT NULL);
+ CREATE TABLE IF NOT EXISTS profiles(username TEXT PRIMARY KEY,key_hash TEXT NOT NULL,revision INTEGER NOT NULL,updated_at TEXT NOT NULL,envelope BLOB NOT NULL);
+ CREATE TABLE IF NOT EXISTS profile_history(username TEXT NOT NULL,revision INTEGER NOT NULL,updated_at TEXT NOT NULL,envelope BLOB NOT NULL,PRIMARY KEY(username,revision));`); err != nil {
+		return err
+	}
+	_, err := db.Exec(`INSERT OR IGNORE INTO profile_meta(key,value) VALUES('instance',?)`, api.NewID("profilehub"))
+	return err
 }

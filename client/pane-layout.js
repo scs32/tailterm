@@ -79,11 +79,13 @@ export class PaneGroups {
       tasks = new Map();
     for (const group of this.groups) {
       const ids = leaves(group.tree);
-      const keys = [...new Set(ids.map(taskOf))];
+      const membership = (id) =>
+        taskOf(id) || (group.guests?.includes(id) ? group.taskId : undefined);
+      const keys = [...new Set(ids.map(membership))];
       for (const taskId of keys) {
         const tree = prune(
           group.tree,
-          new Set(ids.filter((id) => taskOf(id) === taskId)),
+          new Set(ids.filter((id) => membership(id) === taskId)),
         );
         const part = {
           ...group,
@@ -95,12 +97,15 @@ export class PaneGroups {
         if (!taskId) {
           delete part.taskId;
           delete part.taskName;
+          delete part.guests;
           result.push(part);
           continue;
         }
         part.taskId = taskId;
+        part.guests = leaves(tree).filter((id) => !taskOf(id));
         const target = tasks.get(taskId);
         if (target) {
+          target.guests = [...(target.guests || []), ...part.guests];
           target.tree = {
             id: crypto.randomUUID(),
             axis: "x",
@@ -119,11 +124,27 @@ export class PaneGroups {
   taskGroup(taskId) {
     return this.groups.find((g) => g.taskId === taskId);
   }
-  merge(source, target, { whole = true, axis = "x" } = {}) {
+  canMerge(source, target, whole = true) {
     const from = this.group(source),
       to = this.group(target);
     if (!from || !to || from === to) return false;
-    if ((from.taskId || to.taskId) && from.taskId !== to.taskId) return false;
+    if (whole) return !from.taskId && !to.taskId;
+    return !from.taskId || !!from.guests?.includes(source);
+  }
+  canDetach(tab) {
+    const group = this.group(tab);
+    return (
+      !!group &&
+      leaves(group.tree).length > 1 &&
+      (!group.taskId || !!group.guests?.includes(tab))
+    );
+  }
+  merge(source, target, { whole = true, axis = "x" } = {}) {
+    const from = this.group(source),
+      to = this.group(target);
+    if (!this.canMerge(source, target, whole)) return false;
+    if (to.taskId) to.guests = [...(to.guests || []), source];
+    if (from.guests) from.guests = from.guests.filter((id) => id !== source);
     const incoming = whole ? from.tree : { tab: source };
     if (whole) this.groups = this.groups.filter((g) => g !== from);
     else {
@@ -168,7 +189,8 @@ export class PaneGroups {
   }
   detach(tab) {
     const group = this.group(tab);
-    if (!group || group.taskId || leaves(group.tree).length < 2) return false;
+    if (!this.canDetach(tab)) return false;
+    if (group.guests) group.guests = group.guests.filter((id) => id !== tab);
     group.tree = prune(
       group.tree,
       new Set(leaves(group.tree).filter((id) => id !== tab)),

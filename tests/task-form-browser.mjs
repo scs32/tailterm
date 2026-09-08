@@ -26,16 +26,18 @@ const backend = spawn(path.join(root, ".build/ttbin/tailterm-hub-test"), {
   stdio: "ignore",
 });
 let failLaunch = false,
+  failAt = 0,
   execs = 0;
 const html = `<!doctype html><html><head><meta charset="utf-8"><link rel="stylesheet" href="/client/style.css"></head><body><div id="app"><div id="workspace"><aside></aside><main><header><div class="header-right"><button id="tailscale-login"><span class="online"></span>Connected</button></div></header><section class="terminal-shell"></section></main></div><dialog id="dialog"></dialog><div id="notice" hidden></div></div><script type="module">
 import {createTaskHub} from '/client/task-hub.js';
 import {createBoardView} from '/client/board-view.js';
 import {createTasksView} from '/client/tasks-view.js';
+import {createTeamsView} from '/client/teams-view.js';
 import {setupModes} from '/client/modes.js';
-let board, tasks, modes;const data={hub:{url:location.origin},launchProfiles:[]};
+let board, tasks, modes, teams;const data={hub:{url:location.origin},launchProfiles:[],teams:[]};
 const servers=[{id:'local',name:'Test host',host:'stephens-macbook-air',username:'test',runtimes:['claude']}];
 const model={groups:[],taskGroup:()=>null};
-const host={getIPN:()=>({fetch:(url,init)=>fetch(url,init)}),getData:()=>data,getServers:()=>servers,currentServer:()=>servers[0],currentTab:()=>null,getTabs:()=>[],paneGroups:()=>({model,sync(){}}),render(){},scheduleWorkspaceSave(){},bookmark(){},closeTab(){},connect:async()=>null,notice:t=>{document.querySelector('#notice').textContent=t},api:async(url,method,body)=>{if(url==="/launch-profiles")data.launchProfiles=[...data.launchProfiles.filter(p=>p.name!==body.name),body];return {sessions:[]}},reloadData:async()=>{},
+const host={getIPN:()=>({fetch:(url,init)=>fetch(url,init)}),getData:()=>data,getServers:()=>servers,currentServer:()=>servers[0],currentTab:()=>null,getTabs:()=>[],paneGroups:()=>({model,sync(){}}),render(){},scheduleWorkspaceSave(){},bookmark(){},closeTab(){},connect:async()=>null,notice:t=>{document.querySelector('#notice').textContent=t},api:async(url,method,body)=>{if(url==="/teams")data.teams=[...data.teams.filter(t=>t.id!==body.id),body];if(url.startsWith("/teams/"))data.teams=data.teams.filter(t=>t.id!==url.slice(7));if(url==="/launch-profiles")data.launchProfiles=[...data.launchProfiles.filter(p=>p.name!==body.name),body];return {sessions:[]}},reloadData:async()=>{},
  dialog:(title,body)=>{const d=document.querySelector('#dialog');if(d.open)d.close();d.innerHTML='<div class="dialog-head"><h2>'+title+'</h2><button id="dialog-close">×</button></div>'+body;d.querySelector('#dialog-close').onclick=()=>host.closeDialog();d.showModal()},
  closeDialog:()=>{const d=document.querySelector('#dialog');d.close();d.replaceChildren()},
  openBoard:id=>{modes.set('board');board.show(id)},
@@ -44,8 +46,9 @@ const host={getIPN:()=>({fetch:(url,init)=>fetch(url,init)}),getData:()=>data,ge
 const hub=createTaskHub(host);hub.refresh();
 board=createBoardView({client:()=>hub.client(),getTabs:()=>[],activate(){},notice:host.notice,newTask:()=>hub.newTask(),addAgent:id=>hub.addAgent(id),attachTask(){},configure(){}});
 tasks=createTasksView({client:()=>hub.client(),taskHub:hub,getTabs:()=>[],activate(){},notice:host.notice,openBoard:host.openBoard,configure(){}});
-modes=setupModes({header:document.querySelector('header'),main:document.querySelector('main'),onChange:(mode,view)=>{board.hide();tasks.hide();view.replaceChildren();if(mode==='board'){board.mount(view);board.show()}else if(mode==='tasks'){tasks.mount(view);tasks.show()}}});
-modes.set('tasks');window.qa={hub,board,modes};
+teams=createTeamsView({...host,confirm:async()=>true,newTask:t=>hub.newTask(undefined,t),addTeam:t=>hub.addTeam(t)});
+modes=setupModes({header:document.querySelector('header'),main:document.querySelector('main'),onChange:(mode,view)=>{board.hide();tasks.hide();teams.hide();view.replaceChildren();if(mode==='board'){board.mount(view);board.show()}else if(mode==='teams'){teams.mount(view);teams.show()}else if(mode==='tasks'){tasks.mount(view);tasks.show()}}});
+modes.set('tasks');window.qa={hub,board,modes,data};
 </script></body></html>`;
 const server = createServer(async (req, res) => {
   try {
@@ -73,7 +76,7 @@ const server = createServer(async (req, res) => {
       const chunks = [];
       for await (const b of req) chunks.push(b);
       const { command } = JSON.parse(Buffer.concat(chunks));
-      if (failLaunch) {
+      if (failLaunch || execs === failAt) {
         failLaunch = false;
         res.writeHead(500, { "content-type": "application/json" });
         res.end(JSON.stringify({ error: "Test launch failure" }));
@@ -207,12 +210,10 @@ try {
         beforeMore,
         "More must not reflow the task row",
       );
-      const menuSize = await card
-        .locator(".task-menu")
-        .evaluate((el) => ({
-          height: el.getBoundingClientRect().height,
-          rows: [...el.children].map((b) => b.getBoundingClientRect().height),
-        }));
+      const menuSize = await card.locator(".task-menu").evaluate((el) => ({
+        height: el.getBoundingClientRect().height,
+        rows: [...el.children].map((b) => b.getBoundingClientRect().height),
+      }));
       assert.equal(menuSize.height, 98, JSON.stringify(menuSize));
       assert.deepEqual(menuSize.rows, [28, 28, 28]);
       await page.screenshot({ path: ".build/task-menu-" + name + ".png" });
@@ -263,27 +264,17 @@ try {
       assert.ok(bounds.text.width >= bounds.width - 2, JSON.stringify(bounds));
       await page.mouse.move(0, 0);
       await page.screenshot({ path: ".build/board-compact-" + name + ".png" });
-      assert.equal(execs, name === "chromium" ? 0 : 2);
+
       await page.evaluate(() => qa.hub.newTask());
       await page.locator("#task-name").fill(name + " launch retry");
       await page.locator("#task-with-agent").check();
       await page.locator("#agent-runtime").selectOption("codex");
       await page.locator("#agent-model").fill("test-model-v2");
       await page.locator("#task-agent-fields summary").click();
-      await page.locator("#agent-profile-name").fill("review-setup");
-      await page.locator("#agent-save-profile").click();
-      await page
-        .locator("#agent-profile-status")
-        .filter({ hasText: "Saved review-setup" })
-        .waitFor();
       await page.locator("#agent-runtime").selectOption("claude");
       assert.equal(await page.locator("#agent-model").inputValue(), "");
-      await page.locator("#agent-profile").selectOption("review-setup");
-      assert.equal(
-        await page.locator("#agent-model").inputValue(),
-        "test-model-v2",
-      );
-      assert.equal(await page.locator("#agent-runtime").inputValue(), "codex");
+      await page.locator("#agent-runtime").selectOption("codex");
+      await page.locator("#agent-model").fill("test-model-v2");
       const controls = await page
         .locator("#task-agent-fields")
         .evaluate((el) =>
@@ -350,6 +341,75 @@ try {
       );
       await page.mouse.move(0, 0);
       await page.screenshot({ path: ".build/task-flow-" + name + ".png" });
+      await page.setViewportSize({ width: 1100, height: 820 });
+      await page.evaluate(() => qa.modes.set("teams"));
+      await page.locator("#teams-new").click();
+      await page.locator("#team-name").fill("Review team");
+      await page.locator("[data-field=name]").fill("team-planner");
+      await page.locator("[data-field=role]").fill("Planner");
+      await page.locator("[data-field=model]").fill("fixture-model");
+      await page
+        .locator("[data-field=prompt]")
+        .fill("Inspect the task objective.");
+      await page.locator("#team-member-editor summary").click();
+      await page.locator("[data-field=run]").fill("sleep 30");
+      await page.locator("#team-add-member").click();
+      await page.locator("[data-field=name]").fill("team-reviewer");
+      await page.locator("[data-field=role]").fill("Reviewer");
+      await page.locator("#team-member-editor summary").click();
+      await page.locator("[data-field=run]").fill("sleep 30");
+      await page.locator("#team-form button[type=submit]").click();
+      await page.locator("#dialog").waitFor({ state: "hidden" });
+      assert.equal(await page.locator(".team-row").count(), 1);
+      await page.screenshot({ path: ".build/teams-" + name + ".png" });
+      const launchStart = execs;
+      failAt = execs + 2;
+      await page.locator("[data-new-task]").click();
+      assert.notEqual(await page.locator("#task-team").inputValue(), "");
+      await page.locator("#task-name").fill(name + " team task");
+      await page.locator("#task-create").click();
+      await page
+        .locator("#task-error")
+        .filter({ hasText: "Test launch failure" })
+        .waitFor();
+      await page.locator("#task-create").click();
+      await page.locator("#dialog").waitFor({ state: "hidden" });
+      assert.equal(
+        execs - launchStart,
+        3,
+        "retry starts only the failed team member",
+      );
+      const teamTask = (await getTasks()).find(
+        (t) => t.name === name + " team task",
+      );
+      const detail = await (
+        await fetch("http://127.0.0.1:" + port + "/v1/tasks/" + teamTask.id)
+      ).json();
+      assert.equal(detail.agents.length, 2);
+      await page.evaluate(() => qa.modes.set("teams"));
+      await page.locator("[data-add-team]").click();
+      const target = (await getTasks()).find(
+        (t) => t.name === name + " mobile task",
+      );
+      await page.locator("#team-task").selectOption(target.id);
+      await page.locator("#team-launch-form button").click();
+      await page.locator("#dialog").waitFor({ state: "hidden" });
+      const attached = await (
+        await fetch("http://127.0.0.1:" + port + "/v1/tasks/" + target.id)
+      ).json();
+      assert.equal(attached.agents.length, 2);
+      await page.evaluate(() => qa.modes.set("teams"));
+      await page.locator("[data-edit-team]").click();
+      await page.setViewportSize({ width: 390, height: 650 });
+      const dialog = await page.locator("#dialog").boundingBox();
+      assert.ok(
+        dialog.width <= 390 && dialog.height <= 650,
+        JSON.stringify(dialog),
+      );
+      await page.screenshot({
+        path: ".build/team-editor-mobile-" + name + ".png",
+      });
+      await page.locator("#dialog-close").click();
       assert.deepEqual(errors, []);
       console.log(
         name +

@@ -33,10 +33,23 @@ The model must be available to the account used by that app; Tailterm does not
 change credentials or validate provider access. Custom apps take model options
 in **Command override**. From an agent, use `tt spawn --runtime codex --run codex --model MODEL --name helper`.
 
-**Advanced setup → Saved setup** (previously “launch profile”) saves the server,
-agent app, model, command, and working directory in the encrypted vault. Give
-it a separate setup name, then choose it when adding another agent. It does
-not save the assignment or change agents already running.
+**Teams**, next to Tasks, replaces saved launch setups. Create a team of one
+or up to eight members, each with a server, agent app, model, role, instructions,
+command and working directory. Existing saved setups become one-member teams.
+Use **New task** on a team, or select a team in the task creation dialog.
+**Add to task** launches its members into an existing open task. Editing a
+team changes future launches only. Roles and instructions are included in each
+member's briefing. A failed partial launch retains progress; retry starts only
+remaining members. An already-registered name requires inspection instead of
+silently launching a duplicate. Teams travel with encrypted profile sync.
+
+Every terminal tab is a group, including a single session. Drag a group to a
+**tab edge** to reorder it. Task groups cannot be merged into any other group.
+To add an ordinary session to a task group, drag its **pane header** onto that
+task's tab or a pane. It joins visually as a guest, without becoming an agent.
+Guests may leave again; task agents stay within their task. Closing a task
+releases guest sessions into an ordinary group. Two tasks never combine.
+
 Each new LLM agent receives the objective and instructions for communicating.
 New tmux sessions retain the task environment so agents can spawn local helpers
 with `tt spawn`. Remote launches use Tailterm's SSH connection; the hub itself
@@ -108,3 +121,6 @@ remaining files in an upload batch. It does not reroute them to another host.
 **Fullscreen** uses the browser Fullscreen API for the entire UI. **Expand**
 hides the server sidebar to give the current view more room; it works independently
 of fullscreen and leaves navigation available.
+
+The same hub can optionally store [encrypted shared profiles](profile-sync.md).
+Profile credentials are separate from the token used by task agents.

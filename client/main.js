@@ -1,3 +1,5 @@
+import { createTeamsView } from "./teams-view.js";
+import { createProfileSync } from "./profile-sync.js";
 import { credentialCache } from "./credential-cache.js";
 import { createAttentionSound } from "./attention-sound.js";
 import { createRenderer, webglSupported } from "./renderer.js";
@@ -84,6 +86,7 @@ import { SearchAddon } from "@xterm/addon-search";
 import wasmURL from "@tailscale/connect/main.wasm?url";
 import "@xterm/xterm/css/xterm.css";
 import "./style.css";
+let teamsView, profileSync;
 const $ = (s) => document.querySelector(s),
   $$ = (s) => [...document.querySelectorAll(s)];
 const esc = (s) =>
@@ -303,13 +306,14 @@ function guard(fn) {
 }
 const icon = `<span class="brand-icon" aria-hidden="true">${logo}</span>`;
 $("#app").innerHTML =
-  `<div id="notice" role="status" hidden></div><div id="lockscreen"><div class="login-brand">${icon} tailterm <span class="version">PREVIEW 01</span></div><section class="unlock-card"><span class="eyebrow">YOUR PRIVATE TERMINAL WORKSPACE</span><h1>Closer to<br>your servers.</h1><p>A real terminal. Your tailnet. Persistent sessions.<br>Everything you need, right here.</p><form id="unlock"><label for="password">Vault passphrase</label><input id="password" type="password" minlength="14" required autocomplete="current-password" placeholder="At least 14 characters"><button class="primary" id="unlock-button">Unlock workspace <span>↗</span></button></form><p class="fine" id="vault-hint">Checking encrypted vault…</p></section><div class="login-footer"><span>◈ Encrypted at rest</span><span>Powered by Tailscale + WebAssembly</span></div></div>`;
+  `<div id="notice" role="status" hidden></div><div id="lockscreen"><div class="login-brand">${icon} tailterm <span class="version">PREVIEW 01</span></div><section class="unlock-card"><span class="eyebrow">YOUR PRIVATE TERMINAL WORKSPACE</span><h1>Closer to<br>your servers.</h1><p>A real terminal. Your tailnet. Persistent sessions.<br>Everything you need, right here.</p><form id="unlock">${staticMode ? '<label for="username">Username</label><input id="username" autocomplete="username" maxlength="64" placeholder="Optional for a local-only profile">' : ""}<label for="password">Vault passphrase</label><input id="password" type="password" minlength="14" required autocomplete="current-password" placeholder="At least 14 characters"><button class="primary" id="unlock-button">Unlock workspace <span>↗</span></button></form><p class="fine" id="vault-hint">Checking encrypted vault…</p></section><div class="login-footer"><span>◈ Encrypted at rest</span><span>Powered by Tailscale + WebAssembly</span></div></div>`;
 const inactivity = createInactivityLock({
   enabled: () => staticMode && !!$("#workspace"),
   minutes: () => appearance.idleMinutes,
   lock: guard(lock),
 });
 const status = await api("/status");
+if ($("#username")) $("#username").value = status.username || "";
 $("#vault-hint").textContent = status.initialized
   ? staticMode
     ? "Your passphrase unlocks the encrypted vault on this browser. It is never stored."
@@ -324,7 +328,10 @@ $("#unlock").onsubmit = async (e) => {
   const btn = $("#unlock-button");
   btn.disabled = true;
   try {
-    data = await api("/unlock", "POST", { password: $("#password").value });
+    data = await api("/unlock", "POST", {
+      password: $("#password").value,
+      username: $("#username")?.value || "",
+    });
     $("#password").value = "";
     mount();
   } catch (e) {
@@ -339,6 +346,11 @@ if (status.unlocked) {
 }
 function mount() {
   inactivity.reset();
+  if (data.profileAppearance) {
+    saveAppearance(data.profileAppearance);
+    appearance = readAppearance();
+    applyChrome(appearance);
+  }
   const previousWorkspace = data.workspace;
   $("#lockscreen")?.remove();
   $("#app").insertAdjacentHTML(
@@ -587,6 +599,21 @@ function mount() {
         );
       },
     });
+    teamsView = createTeamsView({
+      getData: () => data,
+      getServers: () => data.servers,
+      api,
+      reloadData: async () => {
+        data = await api("/data");
+        render();
+      },
+      dialog,
+      closeDialog,
+      notice,
+      confirm: (title, message) => confirmDialog({ title, message }),
+      newTask: (team) => taskHub.newTask(undefined, team),
+      addTeam: (team) => taskHub.addTeam(team),
+    });
     modes = setupModes({
       header: $("main > header"),
       main: $("main"),
@@ -594,6 +621,7 @@ function mount() {
         boardView.hide();
         tasksView.hide();
         filesView.hide();
+        teamsView.hide();
         view.replaceChildren();
         if (mode === "board") {
           boardView.mount(view);
@@ -601,6 +629,9 @@ function mount() {
         } else if (mode === "tasks") {
           tasksView.mount(view);
           tasksView.show();
+        } else if (mode === "teams") {
+          teamsView.mount(view);
+          teamsView.show();
         } else if (mode === "files") {
           filesView.mount(view);
           filesView.show();
@@ -615,7 +646,44 @@ function mount() {
       },
     });
   }
-  if (staticMode) void restoreWorkspace(previousWorkspace);
+  if (staticMode) {
+    $("#backup-vault").insertAdjacentHTML(
+      "afterend",
+      '<button id="profile-sync"><span aria-hidden="true">↥</span><span class="nav-label">Profile sync</span></button>',
+    );
+    profileSync = createProfileSync(
+      {
+        getIPN: () => (netState === "Running" ? ipn : null),
+        getPeers: () => peers,
+        getData: () => data,
+        getAppearance: () => appearance,
+        connect: startTailscale,
+        dialog,
+        notice,
+        confirm: (title, message) => confirmDialog({ title, message }),
+        download: (value, name) =>
+          downloadBlob(
+            new Blob([JSON.stringify(value)], { type: "application/json" }),
+            name,
+          ),
+        reloadData: async () => {
+          data = await api("/data");
+          if (data.profileAppearance) {
+            saveAppearance(data.profileAppearance);
+            appearance = readAppearance();
+            updateAppearance();
+          }
+          render();
+          taskHub?.refresh();
+          teamsView?.refresh();
+        },
+      },
+      localVault,
+    );
+    $("#profile-sync").onclick = () => profileSync.show();
+    if (data.profile?.hub) void startTailscale();
+    void restoreWorkspace(previousWorkspace);
+  }
   if (staticMode)
     imageUploads = setupImageDrops({
       body: $("#terminal-body"),
@@ -1310,6 +1378,10 @@ function updateAppearance() {
   appearancePreview?.update(appearance);
   applyChrome(appearance);
   saveAppearance(appearance);
+  if (staticMode && $("#workspace"))
+    void localVault
+      .saveProfileAppearance(appearance)
+      .catch((e) => notice(e.message));
   for (const t of tabs) {
     Object.assign(t.term.options, terminalAppearance(appearance), {
       fontSize: t.fontSize,
@@ -2002,7 +2074,7 @@ function serverDialog(s = {}) {
 function keyDialog() {
   dialog(
     "SSH key vault",
-    `<p class="fine">${staticMode ? "Private keys stay on this browser, encrypted with your vault passphrase." : "Private keys stay on the server, encrypted with your vault passphrase."}</p><div class="key-list">${data.keys.map((k) => `<div><strong>${esc(k.name)}</strong><button data-copy-public-key="${esc(k.id)}">Copy public key</button><button data-delete-key="${esc(k.id)}" title="Delete key" aria-label="Delete ${esc(k.name)}">×</button><code>${esc(k.fingerprint)}</code></div>`).join("") || "<p>No keys stored yet.</p>"}</div><div id="public-key-result" hidden><label>Public key<textarea id="public-key-text" readonly rows="3" spellcheck="false"></textarea></label><p class="fine" id="public-key-note"></p></div><form id="generate-key-form"><label>New key name<input name="name" required maxlength="80" placeholder="TrueNAS"></label><p class="fine">Create an Ed25519 key and protect it with your vault passphrase.</p><div class="dialog-actions"><button class="primary" id="generate-key">Generate & save key</button></div></form><details class="dialog-details" id="import-key"><summary>Import an existing key</summary><form id="key-form"><label>Key name<input name="name" required maxlength="80" placeholder="Personal Ed25519"></label><label>Import private key file<input id="key-file" type="file"></label><label>Private key<textarea name="privateKey" required rows="5" spellcheck="false" autocomplete="off" placeholder="-----BEGIN OPENSSH PRIVATE KEY-----"></textarea></label><label>Key passphrase (if encrypted)<input name="passphrase" type="password" autocomplete="off"></label><div class="dialog-actions"><button class="primary">Encrypt & save key</button></div></form></details>`,
+    `<p class="fine">${staticMode ? "Private keys are encrypted with your vault passphrase. Profile sync, when enabled, stores an encrypted copy on your hub." : "Private keys stay on the server, encrypted with your vault passphrase."}</p><div class="key-list">${data.keys.map((k) => `<div><strong>${esc(k.name)}</strong><button data-copy-public-key="${esc(k.id)}">Copy public key</button><button data-delete-key="${esc(k.id)}" title="Delete key" aria-label="Delete ${esc(k.name)}">×</button><code>${esc(k.fingerprint)}</code></div>`).join("") || "<p>No keys stored yet.</p>"}</div><div id="public-key-result" hidden><label>Public key<textarea id="public-key-text" readonly rows="3" spellcheck="false"></textarea></label><p class="fine" id="public-key-note"></p></div><form id="generate-key-form"><label>New key name<input name="name" required maxlength="80" placeholder="TrueNAS"></label><p class="fine">Create an Ed25519 key and protect it with your vault passphrase.</p><div class="dialog-actions"><button class="primary" id="generate-key">Generate & save key</button></div></form><details class="dialog-details" id="import-key"><summary>Import an existing key</summary><form id="key-form"><label>Key name<input name="name" required maxlength="80" placeholder="Personal Ed25519"></label><label>Import private key file<input id="key-file" type="file"></label><label>Private key<textarea name="privateKey" required rows="5" spellcheck="false" autocomplete="off" placeholder="-----BEGIN OPENSSH PRIVATE KEY-----"></textarea></label><label>Key passphrase (if encrypted)<input name="passphrase" type="password" autocomplete="off"></label><div class="dialog-actions"><button class="primary">Encrypt & save key</button></div></form></details>`,
   );
   $("#generate-key-form").onsubmit = guard(async (e) => {
     e.preventDefault();
@@ -2156,7 +2228,10 @@ async function startTailscale() {
     ipn.run({
       notifyState: (s) => {
         netState = s;
-        if (s === "Running") taskHub?.refresh();
+        if (s === "Running") {
+          taskHub?.refresh();
+        }
+        profileSync?.connected();
         $("#tail-dot").classList.toggle("online", s === "Running");
         $("#tail-status").textContent =
           s === "Running"
@@ -2178,6 +2253,7 @@ async function startTailscale() {
       },
       notifyNetMap: (raw) => {
         peers = JSON.parse(raw).peers || [];
+        if (netState === "Running") profileSync?.connected();
         renderDiscoveredPeers();
       },
       notifyBrowseToURL: (url) => {
@@ -2258,10 +2334,12 @@ async function lock() {
   locking = true;
   credentialCache.clear();
   reconnects.clear();
+  profileSync?.stop();
   taskHub?.stopAll();
   boardView?.hide();
   tasksView?.hide();
   filesView?.hide();
+  teamsView?.hide();
   imageUploads?.cancel();
   voiceDictation?.cancel();
   tabs.forEach((t) => t.close?.());
@@ -2464,7 +2542,7 @@ function backupDialog() {
       !(await confirmDialog({
         title: "Restore this backup?",
         message:
-          "Replace this browser’s saved servers, keys and bookmarks? Your Tailscale identity stays on this browser.",
+          "Replace this browser’s saved servers, keys, bookmarks and any hub settings, agent setups and appearance included in the backup? Your Tailscale identity stays on this browser.",
         action: "Replace & restore",
         destructive: true,
       }))
@@ -2474,6 +2552,12 @@ function backupDialog() {
       JSON.parse(await file.text()),
       e.target.elements.password.value,
     );
+    if (data.profileAppearance) {
+      saveAppearance(data.profileAppearance);
+      appearance = readAppearance();
+      updateAppearance();
+    }
+    taskHub?.refresh();
     remoteSnapshots.clear();
     closeDialog();
     selectServer(data.servers[0]?.id, true);
@@ -2627,6 +2711,7 @@ function openCommands() {
   if (staticMode)
     commands.push(
       { label: "Backup and restore", run: backupDialog },
+      { label: "Profile sync", run: () => profileSync?.show() },
       { label: "Forget this device", run: () => $("#forget-device").click() },
     );
   showCommandPalette({ dialog, close: closeDialog, commands });

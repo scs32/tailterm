@@ -275,3 +275,33 @@ test("session font size rejects invalid persisted values and supports older work
   for (const value of [10, 14, 32])
     assert.equal(normalizeSessionFontSize(value), value);
 });
+
+test("workspace restores only ordinary guest sessions inside their task group", () => {
+  const taskId = "tsk_0123456789abcdef";
+  const tabs = ["agent", "guest", "outside"].map((id) => ({
+    id,
+    server: { id: "s", host: "box", port: 22, username: "me" },
+    tmux: true,
+    session: id,
+    task:
+      id === "agent"
+        ? { taskId, agentId: "agt_0123456789abcdef", name: "planner" }
+        : undefined,
+  }));
+  const group = {
+    taskId,
+    active: "agent",
+    guests: ["guest", "agent", "outside", "missing"],
+    tree: {
+      id: "split",
+      axis: "x",
+      ratio: 0.5,
+      a: { tab: "agent" },
+      b: { tab: "guest" },
+    },
+  };
+  const restored = normalizeWorkspace(
+    workspaceSnapshot(tabs, [group], "agent"),
+  );
+  assert.deepEqual(restored.groups[0].guests, ["guest"]);
+});

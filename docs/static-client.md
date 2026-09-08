@@ -126,7 +126,7 @@ Backups are available on demand without automatic reminders. **Backup & restore*
 
 `python3 tests/real-tmux.py /path/to/tmux` checks the generated commands, OSC 52 payload, session mouse setting, and persistence using an isolated real tmux socket and PTY. The local test binary is not installed on any destination server.
 
-Live tailnet authorization, subnet routing, persistent device reauthorization behavior, and deployment to the public hostname remain environment-dependent checks. This client does not provide background browser execution after closure, automatic cross-device sync, native ssh-agent access, local TCP listeners/port forwarding, or an SFTP file browser.
+Live tailnet authorization, subnet routing, persistent device reauthorization behavior, and deployment to the public hostname remain environment-dependent checks. This client does not provide background browser execution after closure, native ssh-agent access, local TCP listeners/port forwarding, or an SFTP file browser.
 
 ## Everyday workspace controls
 
@@ -210,3 +210,11 @@ Inactive tabs show their label and any activity indicator. Hover or keyboard foc
 Terminal font-size buttons and keyboard shortcuts resize only the focused session, including within a group. Each session keeps its size when reconnecting or restoring the workspace. Appearance’s **New session font size** sets the starting size for newly opened sessions.
 
 Automatic local scrolling prepares and renders history while the pointer is over a connected terminal. A following swipe reuses that renderer, including any capture already in flight. Preparation stays hidden, does not take focus, and keeps the button off. New terminal output invalidates the prepared snapshot; leaving the terminal or closing/locking discards unused preparation. It does not poll for history. Brief diagonal swipes and deliberate upward reversals are accepted; small recoil during loading does not cancel the gesture.
+
+
+## Optional shared profiles
+
+[Profile sync](profile-sync.md) reuses the coordination hub after Tailscale
+connects. A username and the existing vault passphrase identify and decrypt
+one saved profile across devices. Startup still works with only a local vault.
+The server stores encrypted snapshots; each browser keeps its own Tailscale node.

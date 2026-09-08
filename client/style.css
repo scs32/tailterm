@@ -4996,3 +4996,88 @@ dialog .agent-save-setup button {
 #agent-profile option {
   color: var(--ink);
 }
+
+/* Teams use the same compact rows and controls as tasks. */
+#mode-view .teams-view {
+  width: 100%;
+  max-width: 1120px;
+}
+#mode-view .team-list {
+  border-top: 1px solid var(--line);
+}
+#mode-view .team-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px 20px;
+  padding: 14px 0;
+  border-bottom: 1px solid var(--line);
+}
+#mode-view .team-row > div:first-child {
+  min-width: 0;
+}
+#mode-view .team-row h3 {
+  margin: 0 0 5px;
+  font-size: 12px;
+}
+#mode-view .team-row p {
+  margin: 0;
+  font-size: 11px;
+  overflow-wrap: anywhere;
+}
+#mode-view .team-row .view-actions {
+  flex-shrink: 0;
+}
+.team-members-bar {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  margin: 14px 0;
+}
+#team-members {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  flex: 1;
+}
+#team-members button {
+  height: 28px;
+  padding: 3px 8px;
+  font-size: 11px;
+}
+#team-members button[aria-pressed="true"] {
+  background: var(--accent);
+  color: var(--terminal-bg);
+  border-color: var(--accent);
+}
+#team-member-editor {
+  border-top: 1px solid var(--line);
+  padding-top: 12px;
+}
+#mode-view .tasks-closed {
+  max-width: none;
+  margin-top: 12px;
+}
+#mode-view .tasks-closed summary {
+  font-size: 11px;
+  line-height: 18px;
+  padding: 6px 0;
+  color: var(--muted);
+  cursor: pointer;
+}
+#mode-view .task-closed {
+  font-size: 11px;
+  padding: 7px 0;
+  align-items: baseline;
+  color: var(--muted);
+}
+#mode-view .task-closed time {
+  white-space: nowrap;
+  font-size: 10px;
+}
+@media (max-width: 760px) {
+  #mode-view .team-row {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+}

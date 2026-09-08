@@ -29,6 +29,7 @@ type Server struct {
 
 func New(st *store.Store, identity Identity) *Server {
 	s := &Server{store: st, identity: identity, mux: http.NewServeMux(), limiter: newLimiter(20, 40), logf: log.Printf}
+	s.profileRoutes()
 	m := s.mux
 	m.HandleFunc("GET /v1/whoami", s.whoami)
 	m.HandleFunc("GET /v1/tasks", s.listTasks)

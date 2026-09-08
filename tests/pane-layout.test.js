@@ -197,3 +197,28 @@ test("task groups separate legacy mixed panes and gather newly spawned agents", 
     "planner",
   ]);
 });
+
+test("ordinary session guests survive task reconciliation and can leave without moving agents", () => {
+  const m = new PaneGroups();
+  const owner = (id) =>
+    ({ planner: "review", reviewer: "review", builder: "build" })[id];
+  m.sync(["shell", "planner", "reviewer", "builder"], owner);
+  m.isolateTasks(owner);
+  assert.equal(
+    m.merge("shell", "planner"),
+    false,
+    "a whole group never merges into a task",
+  );
+  assert.equal(m.merge("shell", "planner", { whole: false }), true);
+  m.sync(["shell", "planner", "reviewer", "builder"], owner);
+  m.isolateTasks(owner);
+  assert.equal(m.group("shell").taskId, "review");
+  assert.equal(m.canDetach("planner"), false);
+  assert.equal(m.canDetach("shell"), true);
+  assert.equal(m.merge("planner", "builder", { whole: false }), false);
+  assert.equal(m.merge("planner", "builder"), false);
+  assert.equal(m.reorder("planner", "builder"), true);
+  assert.equal(m.detach("shell"), true);
+  assert.equal(m.group("shell").taskId, undefined);
+  assert.deepEqual(m.taskGroup("review").guests, []);
+});
