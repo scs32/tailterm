@@ -39,5 +39,11 @@
     "TrueNAS middleware app RUNNING; deployed hub hash and additive schema verified without reading user record contents",
     "Mini and Air tt binaries installed atomically with matching SHA-256, old binary rollback copies retained; only per-user inbox relays restarted and verified running",
     "Pre-update consistent SQLite backup mode 0600 and integrity_check ok"
-  ]
+  ],
+  "localPreviewHost": "Mini",
+  "airPreview": {
+    "status": "update blocked by SSH timeout during staging",
+    "observedCommit": "56ded4133c7a9ec952004dd51fa11e94a6c7d382",
+    "existingContainerUnchanged": true
+  }
 }

@@ -4,7 +4,7 @@
 
 Commit `86551cdc901e1d429fc7ced9d8c892f5b19625c2` is deployed to
 `https://tailos.tailarr.com` (`https://fcc49680.tailos.pages.dev`) and served by the
-local preview at `http://127.0.0.1:4318`. It includes the Projects rename,
+Mini local preview at `http://127.0.0.1:4318`. It includes the Projects rename,
 project-owned Bugs/Features, directed Send to project receipts, automatically
 launched database handlers for new browser projects, recoverable handler setup,
 and physical Left/Right Option pane placement (right/above).
@@ -21,6 +21,18 @@ The [release receipt](releases/tailos-2026-09-08-projects.json) records the veri
 and browser/Go checks. [Projects, Bugs, and Features](project-work-items.md)
 describes dispatch semantics and handler recovery. Existing/headless projects
 need explicit handler setup because the hub cannot launch SSH sessions itself.
+
+**Air preview correction pending:** the owner uses Air's own localhost preview.
+At the September 8 check, that separate Apple container still served `56ded41`.
+Updating its host CLI does not update its webpage. The current static release
+was only partially staged at
+`~/.local/share/tailterm/web-releases/86551cdc901e/site` before SSH to `theAir`
+(`100.96.77.33:22`) timed out. The old `tailterm-static:56ded4133c7a` web container
+was never stopped or replaced. Resume this preview update when Air is reachable;
+verify the staging manifest/assets, candidate port 4319, and final port 4318.
+Air had approximately 527 MB free before staging, so retain the current image and
+check disk space before building. Future local releases must verify **both Mini
+and Air** localhost manifests; one machine's localhost is not the other's.
 
 Documentation commits after this release intentionally do not require another
 application deployment. The sections below preserve earlier handoff history;
