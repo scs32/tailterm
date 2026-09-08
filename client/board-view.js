@@ -9,9 +9,16 @@ const esc = (s) =>
   );
 const status = (a) => {
   const label =
-    { done: "Turn complete", needs_input: "Needs you", exited: "Exited" }[
-      a.status
-    ] || a.status;
+    {
+      done: "Turn complete",
+      needs_input:
+        {
+          permission: "Permission blocked",
+          authentication: "Login required",
+          tool: "Tool unavailable",
+        }[a.blockedReason] || "Needs you",
+      exited: "Exited",
+    }[a.status] || a.status;
   const seen = Date.parse(a.lastSeenAt);
   const last = seen > 0 ? seen : Date.parse(a.createdAt);
   return a.runId &&
@@ -169,7 +176,7 @@ export function createBoardView({
             .filter((a) => a.status !== "closed")
             .map(
               (a) =>
-                `<button class="board-agent" data-board-agent="${esc(a.id)}" title="${esc(a.host)} · ${esc(a.session)}"><span class="status-dot ${a.status === "running" ? "online" : a.status === "needs_input" ? "attention" : ""}"></span>${esc(a.name)}<span class="fine">${esc(status(a))}</span></button>`,
+                `<button class="board-agent" data-board-agent="${esc(a.id)}" title="${esc(a.blockedText || a.host + " · " + a.session)}"><span class="status-dot ${a.status === "running" ? "online" : a.status === "needs_input" ? "attention" : ""}"></span>${esc(a.name)}<span class="fine">${esc(status(a))}</span></button>`,
             )
             .join(
               "",

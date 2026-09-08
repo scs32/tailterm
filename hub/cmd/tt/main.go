@@ -42,6 +42,7 @@ Commands
   close [AGENT]                close an agent session on this host (default: self)
   watch                        deprecated; inbox delivery never types into panes
   wrap -- CMD                  run CMD, reporting started/exited to the hub
+  tools [--runtime APP] [--cwd DIR] [--json]  inspect host or current Codex thread tools
   runtimes [--json]            agent CLIs available on this host
   hooks <claude|codex|generic> print integration snippets
   hook <session-start|prompt|stop|notification|codex>
@@ -133,6 +134,8 @@ func main() {
 		err = cmdWatch(e)
 	case "wrap":
 		err = cmdWrap(e, args)
+	case "tools":
+		err = cmdTools(args)
 	case "runtimes":
 		err = cmdRuntimes(args)
 	case "hooks":
@@ -270,11 +273,19 @@ func cmdEvent(e env, args []string) error {
 	}
 	fs := flag.NewFlagSet("event", flag.ExitOnError)
 	text := fs.String("text", "", "event text")
+	reason := fs.String("reason", "", "needs_input reason: permission, authentication or tool")
 	_ = fs.Parse(args[1:])
 	if !api.PostableKind(args[0]) {
 		return fmt.Errorf("kind must be one of started running done needs_input exited closed")
 	}
-	return postEvent(e, args[0], *text, nil)
+	var data map[string]any
+	if *reason != "" {
+		if args[0] != api.EventNeedsInput || (*reason != "permission" && *reason != "authentication" && *reason != "tool") {
+			return errors.New("reason requires needs_input and must be permission, authentication or tool")
+		}
+		data = map[string]any{"reason": *reason}
+	}
+	return postEvent(e, args[0], *text, data)
 }
 
 func resolveAgent(ctx context.Context, c *api.Client, task, ref string) (string, error) {
@@ -453,6 +464,8 @@ func cmdSpawn(e env, args []string) error {
 	prompt := fs.String("prompt", "", "appended to the command as a quoted argument")
 	runtime := fs.String("runtime", "", "runtime label (default: first word of --run)")
 	model := fs.String("model", "", "model name or alias (default: runtime configuration)")
+	permissionMode := fs.String("permission-mode", "", "permission preset (default: host settings)")
+	allowedJSON := fs.String("allowed-tools-json", "[]", "Claude preapproved tool rules as JSON")
 	task := fs.String("task", e.task, "task id")
 	hub := fs.String("hub", e.hub, "hub URL")
 	asJSON := fs.Bool("json", false, "print the agent record as JSON")
@@ -479,9 +492,43 @@ func cmdSpawn(e env, args []string) error {
 	if *runtime == "" {
 		*runtime = strings.Fields(*run)[0]
 	}
+	// Helpers inherit an explicit policy only when using the same app.
+	explicitMode, explicitTools := false, false
+	fs.Visit(func(f *flag.Flag) {
+		if f.Name == "permission-mode" {
+			explicitMode = true
+		}
+		if f.Name == "allowed-tools-json" {
+			explicitTools = true
+		}
+	})
+	if e.agent != "" && os.Getenv("TAILTERM_PERMISSION_RUNTIME") == *runtime {
+		if !explicitMode {
+			*permissionMode = os.Getenv("TAILTERM_PERMISSION_MODE")
+		}
+		if !explicitTools && os.Getenv("TAILTERM_ALLOWED_TOOLS") != "" {
+			*allowedJSON = os.Getenv("TAILTERM_ALLOWED_TOOLS")
+		}
+		if *cwd == "" && *permissionMode == "workspace-auto" {
+			*cwd = os.Getenv("TAILTERM_LAUNCH_CWD")
+		}
+	}
 	baseCommand, err := modelCommand(*run, *runtime, *model)
 	if err != nil {
 		return err
+	}
+	var allowed []string
+	if err := json.Unmarshal([]byte(*allowedJSON), &allowed); err != nil {
+		return errors.New("invalid allowed tools JSON")
+	}
+	baseCommand, err = permissionCommand(baseCommand, *runtime, *permissionMode, *cwd, allowed)
+	if err != nil {
+		return err
+	}
+	if *permissionMode == "workspace-auto" {
+		if err := os.MkdirAll(relayDir(), 0700); err != nil {
+			return err
+		}
 	}
 	command := baseCommand
 	if *prompt != "" {
@@ -501,6 +548,9 @@ func cmdSpawn(e env, args []string) error {
 		return err
 	}
 	briefing := taskBriefing(detail.Task, *name)
+	if *permissionMode != "" {
+		briefing += "\nRequested launch permission mode: " + *permissionMode + ". Permission denials are real failures, not approvals. Do not repeat an unchanged denied action. Report a precise Permission blocked status to the orchestrator and continue independent permitted work."
+	}
 	if *prompt != "" {
 		briefing += "\nAssignment: " + *prompt
 	}
@@ -517,6 +567,7 @@ func cmdSpawn(e env, args []string) error {
 	err = spawn.Create(spawn.Options{
 		Session: session, Cwd: *cwd, Command: command, Self: selfPath(),
 		Env: map[string]string{
+			"TAILTERM_PERMISSION_RUNTIME": *runtime, "TAILTERM_PERMISSION_MODE": *permissionMode, "TAILTERM_ALLOWED_TOOLS": *allowedJSON, "TAILTERM_LAUNCH_CWD": *cwd,
 			"TAILTERM_TOKEN": e.token, spawn.EnvHub: *hub, spawn.EnvTask: *task, spawn.EnvAgent: agent.ID,
 			spawn.EnvAgentName: agent.Name, spawn.EnvSession: session, "TAILTERM_RUN": agent.RunID, "TAILTERM_BRIEFING": briefing,
 		},
@@ -685,7 +736,13 @@ func cmdHook(e env, args []string) error {
 		b, _ := io.ReadAll(io.LimitReader(os.Stdin, 1<<20))
 		input = spawn.ReadJSON(b)
 	}
-	quiet := func(kind, text string) { _ = postEvent(e, kind, text, nil) }
+	quiet := func(kind, text string) {
+		var data map[string]any
+		if kind == api.EventDone {
+			data = map[string]any{"runtimeStop": true}
+		}
+		_ = postEvent(e, kind, text, data)
+	}
 	unread := func() int {
 		c, err := e.client(2 * time.Second)
 		if err != nil {
@@ -725,7 +782,9 @@ func cmdHook(e env, args []string) error {
 		kind, _ := input["notification_type"].(string)
 		msg, _ := input["message"].(string)
 		switch kind {
-		case "permission_prompt", "idle_prompt", "elicitation_dialog":
+		case "permission_prompt":
+			quiet(api.EventNeedsInput, "Permission blocked: "+msg)
+		case "idle_prompt", "elicitation_dialog":
 			quiet(api.EventNeedsInput, msg)
 		}
 	case "codex":

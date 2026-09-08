@@ -611,6 +611,7 @@ function mount() {
       closeDialog,
       notice,
       confirm: (title, message) => confirmDialog({ title, message }),
+      inspectTools: (fields) => taskHub.inspectTools(fields),
       newTask: (team) => taskHub.newTask(undefined, team),
       addTeam: (team) => taskHub.addTeam(team),
     });

@@ -39,6 +39,7 @@ const backend = spawn(path.join(root, ".build/ttbin/tailterm-hub-test"), {
   stdio: "ignore",
 });
 const launchServers = [];
+const launchCommands = [];
 let failLaunch = false,
   failAt = 0,
   execs = 0;
@@ -91,6 +92,7 @@ const server = createServer(async (req, res) => {
       for await (const b of req) chunks.push(b);
       const { command, serverId } = JSON.parse(Buffer.concat(chunks));
       launchServers.push(serverId);
+      launchCommands.push(command);
       if (failLaunch || execs === failAt) {
         failLaunch = false;
         res.writeHead(500, { "content-type": "application/json" });
@@ -221,11 +223,20 @@ try {
       await page.evaluate(() => qa.modes.set("tasks"));
       const card = page.locator(`[data-task-card="${created.id}"]`);
       await card.waitFor();
-      const beforeMore = await card.boundingBox();
+      const cardRect = async () =>
+        (
+          await page.waitForFunction((id) => {
+            const el = document.querySelector(`[data-task-card="${id}"]`);
+            if (!el || !el.getClientRects().length) return false;
+            const { x, y, width, height } = el.getBoundingClientRect();
+            return { x, y, width, height };
+          }, created.id)
+        ).jsonValue();
+      const beforeMore = await cardRect();
       await card.locator("[data-task-more]").click();
       await card.locator(".task-menu:popover-open").waitFor();
       assert.deepEqual(
-        await card.boundingBox(),
+        await cardRect(),
         beforeMore,
         "More must not reflow the task row",
       );
@@ -290,7 +301,9 @@ try {
       await page.locator("#agent-runtime").selectOption("codex");
       await page.locator("#agent-model-choice").selectOption("__custom");
       await page.locator("#agent-model").fill("test-model-v2");
-      await page.locator("#task-agent-fields summary").click();
+      await page
+        .locator("#task-agent-fields .agent-launch-fields > details > summary")
+        .click();
       await page.locator("#agent-runtime").selectOption("claude");
       assert.equal(await page.locator("#agent-model").inputValue(), "");
       await page.locator("#agent-runtime").selectOption("codex");
@@ -375,18 +388,26 @@ try {
       await page.locator("#team-name").fill("Review team");
       await page.locator("#team-swarm").check();
       await page.locator("[data-field=name]").fill("team-planner");
+      await page.locator(".agent-controls > summary").click();
+      await page
+        .locator("[data-field=permissionMode]")
+        .selectOption("on-request");
       await page.locator("[data-field=role]").fill("Planner");
       await page.locator("#team-model-choice").selectOption("__custom");
       await page.locator("[data-field=model]").fill("fixture-model");
       await page
         .locator("[data-field=prompt]")
         .fill("Inspect the task objective.");
-      await page.locator("#team-member-editor summary").click();
+      await page
+        .locator("#team-member-editor > details:not(.agent-controls) > summary")
+        .click();
       await page.locator("[data-field=run]").fill("sleep 30");
       await page.locator("#team-add-member").click();
       await page.locator("[data-field=name]").fill("team-reviewer");
       await page.locator("[data-field=role]").fill("Reviewer");
-      await page.locator("#team-member-editor summary").click();
+      await page
+        .locator("#team-member-editor > details:not(.agent-controls) > summary")
+        .click();
       await page.locator("[data-field=run]").fill("sleep 30");
       await page.locator("#team-form button[type=submit]").click();
       await page.locator("#dialog").waitFor({ state: "hidden" });
@@ -422,6 +443,47 @@ try {
       assert.equal(detail.task.maxNewAgents, 3);
       assert.equal(detail.task.swarm, true);
       assert.equal(detail.task.orchestrator, "team-planner");
+      assert.match(launchCommands.at(-3), /--permission-mode/);
+      assert.match(launchCommands.at(-3), /on-request/);
+      const blockedAgent = await (
+        await fetch(`http://127.0.0.1:${port}/v1/tasks/${teamTask.id}/agents`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            name: "blocked-fixture",
+            host: "stephens-macbook-air",
+            session: "blocked-fixture",
+          }),
+        })
+      ).json();
+      const blockerResponse = await fetch(
+        `http://127.0.0.1:${port}/v1/tasks/${teamTask.id}/events`,
+        {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            agentId: blockedAgent.id,
+            runId: blockedAgent.runId,
+            kind: "needs_input",
+            text: "Test command requires permission",
+            data: { reason: "permission" },
+          }),
+        },
+      );
+      assert.equal(blockerResponse.status, 201);
+      await page
+        .locator(".board-agent")
+        .filter({ hasText: "blocked-fixture" })
+        .filter({ hasText: "Permission blocked" })
+        .waitFor();
+      assert.equal(
+        await page
+          .locator(".board-agent")
+          .filter({ hasText: "blocked-fixture" })
+          .getAttribute("title"),
+        "Test command requires permission",
+      );
+
       assert.deepEqual(launchServers.slice(-3), [
         "secondary",
         "secondary",

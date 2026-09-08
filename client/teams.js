@@ -44,6 +44,13 @@ export function normalizeTeam(value) {
       serverId: String(m.serverId || ""),
       runtime: String(m.runtime || "generic"),
       model: String(m.model || "").trim(),
+      permissionMode: String(m.permissionMode || ""),
+      allowedTools: Array.isArray(m.allowedTools)
+        ? m.allowedTools
+        : String(m.allowedTools || "")
+            .split("\n")
+            .map((s) => s.trim())
+            .filter(Boolean),
       run: String(
         m.run || (m.runtime !== "generic" ? m.runtime : "") || "",
       ).trim(),
@@ -63,15 +70,19 @@ export function normalizeTeam(value) {
           .join("\n\n"),
       });
     } catch (error) {
-      const field = /model/i.test(error.message)
-        ? "model"
-        : /directory/i.test(error.message)
-          ? "cwd"
-          : /prompt/i.test(error.message)
-            ? "prompt"
-            : /runtime/i.test(error.message)
-              ? "runtime"
-              : "run";
+      const field = /permission/i.test(error.message)
+        ? "permissionMode"
+        : /allowed tool/i.test(error.message)
+          ? "allowedTools"
+          : /model/i.test(error.message)
+            ? "model"
+            : /directory/i.test(error.message)
+              ? "cwd"
+              : /prompt/i.test(error.message)
+                ? "prompt"
+                : /runtime/i.test(error.message)
+                  ? "runtime"
+                  : "run";
       invalid(error.message, field);
     }
     return member;

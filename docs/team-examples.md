@@ -907,3 +907,13 @@ Read the objective and inspect relevant instructions while waiting for your firs
 
 Share new evidence that changes another member's work: a reproduced failure, an interface constraint, a material risk, a completed artifact, or a concrete correction. Keep routine findings concise and link the detailed artifact. Do not broadcast speculative streams of thought, duplicate an existing result, acknowledge acknowledgements, or ask everyone to review everything. Independently verify your result against the assigned acceptance checks and send the orchestrator the artifact location, tests/outcomes and remaining limitations. Cross-check another lane only when assigned or when you have a concrete disconfirming fact. If no action remains for you, finish quietly; the inbox relay can resume you for later substantive messages.
 ```
+
+## Permissions when using these examples
+
+Examples preserve **Host settings**. Choose each member's permission preset under
+**Permissions & tools** if desired; workspace automation requires an explicit
+project directory. **Inspect host tools** reports the host inventory before
+launch. The task briefing asks Codex members to inspect their tool registry and
+distinguish host information from a thread-specific report during introductions.
+See [agent permissions and tools](agent-permissions.md) for modes, tool rules and
+visible permission/login/tool blockers.

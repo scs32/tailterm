@@ -1,3 +1,4 @@
+import { validateAgentPermissions } from "./agent-permissions.js";
 export function validateSession(name) {
   if (!/^[a-zA-Z0-9_-]{1,64}$/.test(name))
     throw new Error(
@@ -152,6 +153,8 @@ export function agentSpawnCommand({
   prompt = "",
   runtime = "",
   model = "",
+  permissionMode = "",
+  allowedTools = [],
 }) {
   if (!/^https?:\/\/[A-Za-z0-9][A-Za-z0-9.:/_-]{0,199}$/.test(hub))
     throw new Error("Invalid hub URL.");
@@ -176,6 +179,7 @@ export function agentSpawnCommand({
       !["claude", "codex", "aider", "gemini"].includes(runtime))
   )
     throw new Error("Enter a valid model name for a supported agent app.");
+  validateAgentPermissions(runtime, permissionMode, allowedTools, cwd);
   const args = [
     "spawn",
     "--json",
@@ -192,6 +196,9 @@ export function agentSpawnCommand({
   if (prompt) args.push("--prompt", prompt);
   if (runtime) args.push("--runtime", runtime);
   if (model) args.push("--model", model);
+  if (permissionMode) args.push("--permission-mode", permissionMode);
+  if (allowedTools.length)
+    args.push("--allowed-tools-json", JSON.stringify(allowedTools));
   return (
     "/bin/sh -c " +
     shellQuote(
@@ -207,6 +214,22 @@ export function agentRuntimesCommand() {
     shellQuote(
       ttResolver(`printf '{"missing":true}'; exit 0`) +
         `exec "$tailterm_tt" runtimes --json`,
+    )
+  );
+}
+
+export function agentToolsCommand(runtime, cwd = "") {
+  if (!["codex", "claude", "gemini", "aider"].includes(runtime))
+    throw new Error("Choose a supported agent app to inspect tools.");
+  validateStartDirectory(cwd);
+  const args = ["tools", "--runtime", runtime, "--json"];
+  if (cwd) args.push("--cwd", cwd);
+  return (
+    "/bin/sh -c " +
+    shellQuote(
+      ttResolver(
+        "printf 'Update the tt CLI on this host to inspect tools.\\n' >&2; exit 127",
+      ) + `exec "$tailterm_tt" ${args.map(shellQuote).join(" ")}`,
     )
   );
 }

@@ -150,6 +150,8 @@ type Task struct {
 }
 
 type Agent struct {
+	BlockedReason string    `json:"blockedReason,omitempty"`
+	BlockedText   string    `json:"blockedText,omitempty"`
 	RunID         string    `json:"runId"`
 	LastSeenAt    time.Time `json:"lastSeenAt"`
 	Online        bool      `json:"online"`

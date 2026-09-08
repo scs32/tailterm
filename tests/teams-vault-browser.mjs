@@ -7,7 +7,7 @@ import * as vault from '/client/local-vault.js';
 import {createTeamsView} from '/client/teams-view.js';
 await vault.localAPI('/unlock','POST',{password:'isolated team vault passphrase'});
 if(!vault.localData().servers.length)await vault.localAPI('/servers','POST',{name:'Test host',host:'test.example',port:22,username:'test',mode:'ssh'});
-const view=createTeamsView({getData:()=>vault.localData(),getServers:()=>vault.localData().servers,api:vault.localAPI,reloadData:async()=>{},notice:t=>document.querySelector('#notice').textContent=t,confirm:async()=>true,newTask(){},addTeam(){},dialog(title,body){const d=document.querySelector('#dialog');d.innerHTML='<div class="dialog-head"><h2>'+title+'</h2></div>'+body;d.showModal()},closeDialog(){document.querySelector('#dialog').close()}});
+const view=createTeamsView({getData:()=>vault.localData(),getServers:()=>vault.localData().servers,api:vault.localAPI,reloadData:async()=>{},notice:t=>document.querySelector('#notice').textContent=t,confirm:async()=>true,inspectTools:async fields=>{window.inspected=fields;return {runtime:fields.runtime,version:'test',host:'fixture host',scope:'host',commands:['git','tt'],servers:[{name:'<img src=x onerror=alert(1)>',runtimeStatus:'authenticationRequired',authStatus:'notLoggedIn',tools:['safe_tool']}],notes:['Host inventory is not a launched agent manifest.']}},newTask(){},addTeam(){},dialog(title,body){const d=document.querySelector('#dialog');d.innerHTML='<div class="dialog-head"><h2>'+title+'</h2></div>'+body;d.showModal()},closeDialog(){document.querySelector('#dialog').close()}});
 view.mount(document.querySelector('#mode-view'));view.show();window.qa={vault,view};
 </script></body></html>`;
 const server = await createServer({
@@ -47,6 +47,10 @@ try {
       await page.locator("#team-swarm").check();
       await page.locator("[data-field=name]").fill("planner");
       await page.locator("#team-model-choice").selectOption("gpt-6-astra");
+      await page.locator(".agent-controls > summary").click();
+      await page
+        .locator("[data-field=permissionMode]")
+        .selectOption("full-auto");
       await page.locator("[data-field=prompt]").fill("Coordinate the review.");
       for (let i = 2; i <= 11; i++) {
         await page.locator("#team-add-member").click();
@@ -97,6 +101,7 @@ try {
       assert.equal(team.swarm, true);
       assert.equal(team.orchestrator, "reviewer");
       assert.equal(team.members[0].model, "gpt-6-astra");
+      assert.equal(team.members[0].permissionMode, "full-auto");
       assert.equal(team.members[1].model, "sonnet");
       assert.equal(team.members[7].model, "custom-model-v2");
       await page.reload();
@@ -111,7 +116,13 @@ try {
         await page.locator("#team-model-choice").inputValue(),
         "gpt-6-astra",
       );
-      await page.locator("#team-member-editor summary").click();
+      assert.equal(
+        await page.locator("[data-field=permissionMode]").inputValue(),
+        "full-auto",
+      );
+      await page
+        .locator("#team-member-editor > details:not(.agent-controls) > summary")
+        .click();
       await page.locator("[data-field=cwd]").fill("~/project");
       await page.locator('[data-member="7"]').click();
       await page.setViewportSize({ width: 390, height: 650 });

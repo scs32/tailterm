@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -289,12 +290,12 @@ func (s *Store) CloseTask(ctx context.Context, id string, by api.Caller) (api.Ta
 
 // Agents
 
-const agentCols = `id,task_id,name,host,session,runtime,cwd,parent_agent_id,status,title,created_at,last_event_at,run_id,last_seen_at`
+const agentCols = `id,task_id,name,host,session,runtime,cwd,parent_agent_id,status,title,created_at,last_event_at,run_id,last_seen_at,blocked_reason,blocked_text`
 
 func scanAgent(row interface{ Scan(...any) error }) (api.Agent, error) {
 	var a api.Agent
 	var created, last, seen string
-	err := row.Scan(&a.ID, &a.TaskID, &a.Name, &a.Host, &a.Session, &a.Runtime, &a.Cwd, &a.ParentAgentID, &a.Status, &a.Title, &created, &last, &a.RunID, &seen)
+	err := row.Scan(&a.ID, &a.TaskID, &a.Name, &a.Host, &a.Session, &a.Runtime, &a.Cwd, &a.ParentAgentID, &a.Status, &a.Title, &created, &last, &a.RunID, &seen, &a.BlockedReason, &a.BlockedText)
 	a.CreatedAt, a.LastEventAt = parseTS(created), parseTS(last)
 	a.LastSeenAt = parseTS(seen)
 	a.Online = !a.LastSeenAt.IsZero() && time.Since(a.LastSeenAt) < 90*time.Second && a.Status != api.AgentExited && a.Status != api.AgentClosed
@@ -385,8 +386,8 @@ func (s *Store) AddAgent(ctx context.Context, taskID string, req api.AddAgentReq
 	if a.ID == "" {
 		a.ID = api.NewID("agt")
 	}
-	_, err = s.db.ExecContext(ctx, `INSERT INTO agents (`+agentCols+`) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-		a.ID, a.TaskID, a.Name, a.Host, a.Session, a.Runtime, a.Cwd, a.ParentAgentID, a.Status, a.Title, ts(now), ts(now), a.RunID, "")
+	_, err = s.db.ExecContext(ctx, `INSERT INTO agents (`+agentCols+`) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		a.ID, a.TaskID, a.Name, a.Host, a.Session, a.Runtime, a.Cwd, a.ParentAgentID, a.Status, a.Title, ts(now), ts(now), a.RunID, "", "", "")
 	if err != nil {
 		return a, err
 	}
@@ -478,10 +479,11 @@ func (s *Store) setAgentStatus(ctx context.Context, id, status string, by api.Ca
 		return a, err
 	}
 	now := s.now()
-	if _, err := s.db.ExecContext(ctx, `UPDATE agents SET status=?, last_event_at=? WHERE id=?`, status, ts(now), id); err != nil {
+	if _, err := s.db.ExecContext(ctx, `UPDATE agents SET status=?, last_event_at=?,blocked_reason='',blocked_text='' WHERE id=?`, status, ts(now), id); err != nil {
 		return a, err
 	}
 	a.Status, a.LastEventAt = status, now
+	a.BlockedReason, a.BlockedText = "", ""
 	if emit {
 		kind := map[string]string{api.AgentRunning: api.EventRunning, api.AgentDone: api.EventDone, api.AgentNeedsInput: api.EventNeedsInput, api.AgentClosed: api.EventClosed, api.AgentExited: api.EventExited}[status]
 		if _, err := s.addEvent(ctx, a.TaskID, kind, id, "", nil, by); err != nil {
@@ -651,11 +653,31 @@ func (s *Store) PostEvent(ctx context.Context, taskID string, req api.PostEventR
 				return api.Event{}, err
 			}
 		}
-		if status := api.LifecycleStatus(req.Kind); status != "" && a.Status != status {
+		if status := api.LifecycleStatus(req.Kind); status != "" && a.Status != status && !(req.Kind == api.EventDone && req.Data["runtimeStop"] == true && a.Status == api.AgentNeedsInput) {
 			if _, err := s.setAgentStatus(ctx, req.AgentID, status, by, false); err != nil {
 				return api.Event{}, err
 			}
 		}
+		if req.Kind == api.EventNeedsInput {
+			reason, _ := req.Data["reason"].(string)
+			if reason != "permission" && reason != "authentication" && reason != "tool" {
+				reason = ""
+			}
+			if reason == "" {
+				switch {
+				case strings.HasPrefix(req.Text, "Permission blocked"):
+					reason = "permission"
+				case strings.HasPrefix(req.Text, "Login required"):
+					reason = "authentication"
+				case strings.HasPrefix(req.Text, "Tool unavailable"):
+					reason = "tool"
+				}
+			}
+			if _, err := s.db.ExecContext(ctx, `UPDATE agents SET blocked_reason=?,blocked_text=? WHERE id=?`, reason, req.Text, a.ID); err != nil {
+				return api.Event{}, err
+			}
+		}
+
 	}
 	return s.addEvent(ctx, taskID, req.Kind, req.AgentID, req.Text, req.Data, by)
 }

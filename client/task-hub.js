@@ -1,3 +1,5 @@
+import { agentControlsHTML, wireAgentControls } from "./agent-controls.js";
+import { agentToolsCommand } from "../shared/tmux-command.js";
 import { modelPickerHTML, wireModelPicker } from "./model-picker.js";
 import { teamLaunches } from "./teams.js";
 // Task hub controller: owns the hub client, per-task event feeds, the mirror
@@ -420,7 +422,7 @@ export function createTaskHub(host) {
   function agentFields(server) {
     return `<div class="agent-launch-fields">
       <div class="appearance-controls"><label>Agent name<input id="agent-name" value="agent1" maxlength="64" autocomplete="off" spellcheck="false"></label><label>Agent app<select id="agent-runtime">${runtimeOptions(server)}</select></label></div>
-      <div id="agent-model-picker"></div>
+      <div id="agent-model-picker"></div><div id="agent-controls"></div>
       <p id="agent-model-help" class="fine field-help">Enter a model name or alias available to this app on the selected server.</p>
       <label>Assignment<textarea id="agent-prompt" rows="2" placeholder="Optional instructions for this agent"></textarea></label>
       <details class="dialog-details"><summary>Advanced setup</summary>
@@ -441,6 +443,16 @@ export function createTaskHub(host) {
       run,
       cwd: document.querySelector("#agent-cwd").value.trim(),
       prompt: document.querySelector("#agent-prompt").value.trim(),
+      permissionMode: document.querySelector(
+        "#agent-controls [data-field=permissionMode]",
+      ).value,
+      allowedTools: (
+        document.querySelector("#agent-controls [data-field=allowedTools]")
+          ?.value || ""
+      )
+        .split("\n")
+        .map((s) => s.trim())
+        .filter(Boolean),
     };
   }
   function wireAgentFields() {
@@ -448,6 +460,18 @@ export function createTaskHub(host) {
       run = document.querySelector("#agent-run");
     const update = () => {
       run.placeholder = runtime.value || "your-agent --flag";
+      document.querySelector("#agent-controls").innerHTML = agentControlsHTML(
+        runtime.value,
+      );
+      wireAgentControls(
+        document.querySelector("#agent-controls .agent-controls"),
+        () =>
+          inspectTools({
+            runtime: runtime.value,
+            cwd: document.querySelector("#agent-cwd").value.trim(),
+            serverId: document.querySelector("#task-server").value,
+          }),
+      );
       const picker = document.querySelector("#agent-model-picker");
       picker.innerHTML = modelPickerHTML("agent-model", runtime.value);
       wireModelPicker(picker);
@@ -473,6 +497,8 @@ export function createTaskHub(host) {
       prompt: fields.prompt,
       runtime: fields.runtime,
       model: fields.model,
+      permissionMode: fields.permissionMode,
+      allowedTools: fields.allowedTools,
     });
     const out = await host.browserCommand(server, command, 65536);
     let agent;
@@ -485,6 +511,26 @@ export function createTaskHub(host) {
     }
     if (!agent?.id) throw new Error("tt spawn did not return an agent.");
     return agent;
+  }
+
+  async function inspectTools(fields) {
+    const server = fields.serverId
+      ? host.getServers().find((s) => s.id === fields.serverId)
+      : host.currentServer() || host.getServers()[0];
+    if (!server)
+      throw new Error("Choose a saved machine before inspecting tools.");
+    const raw = await host.browserCommand(
+      server,
+      agentToolsCommand(fields.runtime, fields.cwd || ""),
+      262144,
+    );
+    try {
+      return JSON.parse(raw);
+    } catch {
+      throw new Error(
+        "The host returned an invalid inventory. Update its tt CLI and retry.",
+      );
+    }
   }
 
   function newTask(tabId = host.currentTab()?.id, initialTeam = null) {
@@ -968,6 +1014,7 @@ export function createTaskHub(host) {
     bound: () => [...bound],
     configure,
     newTask,
+    inspectTools,
     attachTask,
     addAgent,
     addTeam,

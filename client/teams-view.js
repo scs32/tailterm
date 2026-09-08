@@ -1,3 +1,4 @@
+import { agentControlsHTML, wireAgentControls } from "./agent-controls.js";
 import { TEAM_EXAMPLES, exampleTeam } from "./team-examples.js";
 import { modelPickerHTML, wireModelPicker } from "./model-picker.js";
 import { normalizeTeam, MAX_TEAM_MEMBERS } from "./teams.js";
@@ -70,8 +71,16 @@ export function createTeamsView(host) {
           )
           .join(
             "",
-          )}</select></label><div class="appearance-controls"><label>Agent app<select data-field="runtime">${known.map((r) => `<option value="${esc(r)}" ${r === m.runtime ? "selected" : ""}>${r === "generic" ? "Custom command" : esc(r)}</option>`).join("")}</select></label>${modelPickerHTML("team-model", m.runtime, m.model)}</div><label>Instructions<textarea data-field="prompt" rows="3" maxlength="8192" placeholder="What this member should do on every task…">${esc(m.prompt)}</textarea></label><details class="dialog-details"><summary>Command &amp; directory</summary><label>Command override<input data-field="run" value="${esc(m.run)}" placeholder="${m.runtime === "generic" ? "your-agent --flag" : esc(m.runtime)}"></label><label>Working directory<input data-field="cwd" value="${esc(m.cwd)}" placeholder="/absolute/project/path (optional)"></label></details>`;
+          )}</select></label><div class="appearance-controls"><label>Agent app<select data-field="runtime">${known.map((r) => `<option value="${esc(r)}" ${r === m.runtime ? "selected" : ""}>${r === "generic" ? "Custom command" : esc(r)}</option>`).join("")}</select></label>${modelPickerHTML("team-model", m.runtime, m.model)}</div>${agentControlsHTML(m.runtime, m.permissionMode, m.allowedTools)}<label>Instructions<textarea data-field="prompt" rows="3" maxlength="8192" placeholder="What this member should do on every task…">${esc(m.prompt)}</textarea></label><details class="dialog-details"><summary>Command &amp; directory</summary><label>Command override<input data-field="run" value="${esc(m.run)}" placeholder="${m.runtime === "generic" ? "your-agent --flag" : esc(m.runtime)}"></label><label>Working directory<input data-field="cwd" value="${esc(m.cwd)}" placeholder="/absolute/project/path (optional)"></label></details>`;
       wireModelPicker(form.querySelector("[data-model-picker]"));
+      wireAgentControls(form.querySelector(".agent-controls"), async () => {
+        capture();
+        if (!host.inspectTools)
+          throw new Error(
+            "Tool inspection is unavailable in this environment.",
+          );
+        return host.inspectTools({ ...draft.members[selected] });
+      });
       form.querySelector("[data-field=name]").oninput = (e) => {
         form.querySelector("#team-orchestrator").options[selected].textContent =
           e.target.value || "Agent " + (selected + 1);
@@ -90,6 +99,8 @@ export function createTeamsView(host) {
         if (draft.members[selected].run === oldRuntime)
           draft.members[selected].run = "";
         draft.members[selected].model = "";
+        draft.members[selected].permissionMode = "";
+        draft.members[selected].allowedTools = [];
         renderEditor();
       };
     }

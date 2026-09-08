@@ -138,3 +138,12 @@ The Codex inbox relay wakes recipients for swarm broadcasts, excluding the sende
 Teams and the deployed hub now allow up to 32 open members per task; helper limits
 remain separately enforced. See [team examples](team-examples.md) for full rules,
 model choices, and the Astra/four-Terra starting swarm.
+
+### Permissions and tool visibility
+
+Team members and individual agents now offer **Permissions & tools**, with
+per-app launch presets, optional Claude preapproval rules, and host tool
+inspection. Existing host settings remain the default. Explicitly reported
+permission/authentication/tool blockers are visible in Tasks and Board and survive
+a runtime's automatic turn-complete hook. See [agent permissions and tools](agent-permissions.md)
+for exact behavior, inheritance and the limits of unattended operation.

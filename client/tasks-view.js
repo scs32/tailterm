@@ -113,9 +113,16 @@ export function createTasksView({
   }
   const agentState = (a) => {
     const label =
-      { done: "Turn complete", needs_input: "Needs you", exited: "Exited" }[
-        a.status
-      ] || a.status;
+      {
+        done: "Turn complete",
+        needs_input:
+          {
+            permission: "Permission blocked",
+            authentication: "Login required",
+            tool: "Tool unavailable",
+          }[a.blockedReason] || "Needs you",
+        exited: "Exited",
+      }[a.status] || a.status;
     const seen = Date.parse(a.lastSeenAt);
     const last = seen > 0 ? seen : Date.parse(a.createdAt);
     return a.runId &&
@@ -142,7 +149,7 @@ export function createTasksView({
           .filter((a) => a.status !== "closed")
           .map(
             (a) =>
-              `<button class="board-agent" data-task-agent="${esc(a.id)}" title="${esc(a.host)} · ${esc(a.session)}"><span class="status-dot ${STATUS_DOT[a.status] || ""}"></span><span>${esc(a.name)}</span><span class="fine">${esc(agentState(a))} · ${esc(a.host)}</span></button>`,
+              `<button class="board-agent" data-task-agent="${esc(a.id)}" title="${esc(a.blockedText || a.host + " · " + a.session)}"><span class="status-dot ${STATUS_DOT[a.status] || ""}"></span><span>${esc(a.name)}</span><span class="fine">${esc(agentState(a))} · ${esc(a.host)}</span></button>`,
           )
           .join("") || '<span class="fine">No agents yet.</span>'
       }</div><footer class="task-actions"><span class="fine">${task.allowAgentSpawn ? "Helpers allowed" : "Helpers off"}</span><button data-task-board="${esc(task.id)}">Open board →</button><button data-task-add="${esc(task.id)}">＋ Add agent</button><div class="task-more"><button type="button" data-task-more="${esc(task.id)}" aria-expanded="false" aria-controls="task-menu-${esc(task.id)}">More</button><div id="task-menu-${esc(task.id)}" class="task-menu" popover="auto" aria-label="More task actions"><button data-task-attach="${esc(task.id)}">Open terminals</button><button data-task-settings="${esc(task.id)}">Settings</button><button data-task-close="${esc(task.id)}" class="danger">Close task</button></div></div></footer></article>`;
