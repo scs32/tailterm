@@ -1,3 +1,4 @@
+import { modelPickerHTML, wireModelPicker } from "./model-picker.js";
 import { teamLaunches } from "./teams.js";
 // Task hub controller: owns the hub client, per-task event feeds, the mirror
 // loop that keeps a task tab's panes in step with the hub's agent list, and
@@ -419,7 +420,7 @@ export function createTaskHub(host) {
   function agentFields(server) {
     return `<div class="agent-launch-fields">
       <div class="appearance-controls"><label>Agent name<input id="agent-name" value="agent1" maxlength="64" autocomplete="off" spellcheck="false"></label><label>Agent app<select id="agent-runtime">${runtimeOptions(server)}</select></label></div>
-      <label>Model<input id="agent-model" maxlength="200" placeholder="Use the app’s configured default" autocomplete="off" spellcheck="false" aria-describedby="agent-model-help"></label>
+      <div id="agent-model-picker"></div>
       <p id="agent-model-help" class="fine field-help">Enter a model name or alias available to this app on the selected server.</p>
       <label>Assignment<textarea id="agent-prompt" rows="2" placeholder="Optional instructions for this agent"></textarea></label>
       <details class="dialog-details"><summary>Advanced setup</summary>
@@ -444,21 +445,17 @@ export function createTaskHub(host) {
   }
   function wireAgentFields() {
     const runtime = document.querySelector("#agent-runtime"),
-      run = document.querySelector("#agent-run"),
-      model = document.querySelector("#agent-model");
+      run = document.querySelector("#agent-run");
     const update = () => {
       run.placeholder = runtime.value || "your-agent --flag";
-      model.disabled = !["claude", "codex", "aider", "gemini"].includes(
-        runtime.value,
-      );
-      document.querySelector("#agent-model-help").textContent = model.disabled
-        ? "For custom apps, include the model option in the command below."
-        : "Enter a model name or alias available to this app on the selected server. Leave blank to use its configured default.";
+      const picker = document.querySelector("#agent-model-picker");
+      picker.innerHTML = modelPickerHTML("agent-model", runtime.value);
+      wireModelPicker(picker);
+      document.querySelector("#agent-model-help").textContent = runtime.value
+        ? "Choose a model available to this app on the server, or enter a custom model ID. App default keeps its configured model."
+        : "For custom apps, include the model option in the command below.";
     };
-    runtime.onchange = () => {
-      model.value = "";
-      update();
-    };
+    runtime.onchange = update;
     update();
   }
 

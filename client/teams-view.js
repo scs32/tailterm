@@ -1,3 +1,4 @@
+import { modelPickerHTML, wireModelPicker } from "./model-picker.js";
 import { normalizeTeam, MAX_TEAM_MEMBERS } from "./teams.js";
 const esc = (s) =>
   String(s ?? "").replace(
@@ -27,7 +28,7 @@ export function createTeamsView(host) {
     let selected = 0;
     host.dialog(
       existing ? "Edit team" : "New team",
-      `<form id="team-form" novalidate><label>Team name<input id="team-name" maxlength="80" value="${esc(draft.name)}" placeholder="e.g. Code review"></label><div class="team-members-bar"><div id="team-members" class="segmented" role="group" aria-label="Team members"></div><button id="team-add-member" type="button">＋ Agent</button></div><div id="team-member-editor"></div><p id="team-error" class="fine" role="status"></p><div class="dialog-actions"><button id="team-remove-member" type="button">Remove member</button><button class="primary" type="submit">Save team</button></div></form>`,
+      `<form id="team-form" novalidate><label>Team name<input id="team-name" maxlength="80" value="${esc(draft.name)}" placeholder="e.g. Code review"></label><div class="team-members-bar"><div id="team-members" class="segmented" role="group" aria-label="Team members"></div><button id="team-add-member" type="button">＋ Agent</button></div><div id="team-member-editor"></div><div class="task-submit-area"><p id="team-error" class="fine" role="alert" aria-live="assertive" tabindex="-1"></p><div class="dialog-actions"><button id="team-remove-member" type="button">Remove member</button><button class="primary" type="submit">Save team</button></div></div></form>`,
     );
     const form = document.querySelector("#team-form");
     function capture() {
@@ -58,7 +59,8 @@ export function createTeamsView(host) {
           )
           .join(
             "",
-          )}</select></label><div class="appearance-controls"><label>Agent app<select data-field="runtime">${known.map((r) => `<option value="${esc(r)}" ${r === m.runtime ? "selected" : ""}>${r === "generic" ? "Custom command" : esc(r)}</option>`).join("")}</select></label><label>Model<input data-field="model" value="${esc(m.model)}" placeholder="App default" maxlength="200" ${["codex", "claude", "aider", "gemini"].includes(m.runtime) ? "" : "disabled"}></label></div><label>Instructions<textarea data-field="prompt" rows="3" maxlength="8192" placeholder="What this member should do on every task…">${esc(m.prompt)}</textarea></label><details class="dialog-details"><summary>Command &amp; directory</summary><label>Command override<input data-field="run" value="${esc(m.run)}" placeholder="${m.runtime === "generic" ? "your-agent --flag" : esc(m.runtime)}"></label><label>Working directory<input data-field="cwd" value="${esc(m.cwd)}" placeholder="/absolute/project/path (optional)"></label></details>`;
+          )}</select></label><div class="appearance-controls"><label>Agent app<select data-field="runtime">${known.map((r) => `<option value="${esc(r)}" ${r === m.runtime ? "selected" : ""}>${r === "generic" ? "Custom command" : esc(r)}</option>`).join("")}</select></label>${modelPickerHTML("team-model", m.runtime, m.model)}</div><label>Instructions<textarea data-field="prompt" rows="3" maxlength="8192" placeholder="What this member should do on every task…">${esc(m.prompt)}</textarea></label><details class="dialog-details"><summary>Command &amp; directory</summary><label>Command override<input data-field="run" value="${esc(m.run)}" placeholder="${m.runtime === "generic" ? "your-agent --flag" : esc(m.runtime)}"></label><label>Working directory<input data-field="cwd" value="${esc(m.cwd)}" placeholder="/absolute/project/path (optional)"></label></details>`;
+      wireModelPicker(form.querySelector("[data-model-picker]"));
       form.querySelectorAll("[data-member]").forEach(
         (b) =>
           (b.onclick = () => {
@@ -96,6 +98,9 @@ export function createTeamsView(host) {
       e.preventDefault();
       const button = form.querySelector("button[type=submit]");
       if (button.disabled) return;
+      button.disabled = true;
+      button.textContent = "Saving…";
+      form.querySelector("#team-error").textContent = "";
       try {
         capture();
         draft.name = form.querySelector("#team-name").value;
@@ -113,9 +118,25 @@ export function createTeamsView(host) {
         render();
         host.notice("Saved team " + team.name + ".");
       } catch (error) {
-        form.querySelector("#team-error").textContent = error.message;
+        if (Number.isInteger(error.memberIndex)) {
+          selected = error.memberIndex;
+          renderEditor();
+          const field = form.querySelector(`[data-field="${error.field}"]`);
+          if (field) {
+            const details = field.closest("details");
+            if (details) details.open = true;
+            field.setAttribute("aria-invalid", "true");
+            field.setAttribute("aria-describedby", "team-error");
+          }
+        }
+        const status = form.querySelector("#team-error");
+        status.textContent =
+          error.message || "Could not save the team. Try again.";
+        status.focus();
+        status.scrollIntoView({ block: "nearest" });
       } finally {
         button.disabled = false;
+        button.textContent = "Save team";
       }
     };
     renderEditor();

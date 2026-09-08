@@ -269,11 +269,13 @@ try {
       await page.locator("#task-name").fill(name + " launch retry");
       await page.locator("#task-with-agent").check();
       await page.locator("#agent-runtime").selectOption("codex");
+      await page.locator("#agent-model-choice").selectOption("__custom");
       await page.locator("#agent-model").fill("test-model-v2");
       await page.locator("#task-agent-fields summary").click();
       await page.locator("#agent-runtime").selectOption("claude");
       assert.equal(await page.locator("#agent-model").inputValue(), "");
       await page.locator("#agent-runtime").selectOption("codex");
+      await page.locator("#agent-model-choice").selectOption("__custom");
       await page.locator("#agent-model").fill("test-model-v2");
       const controls = await page
         .locator("#task-agent-fields")
@@ -347,6 +349,7 @@ try {
       await page.locator("#team-name").fill("Review team");
       await page.locator("[data-field=name]").fill("team-planner");
       await page.locator("[data-field=role]").fill("Planner");
+      await page.locator("#team-model-choice").selectOption("__custom");
       await page.locator("[data-field=model]").fill("fixture-model");
       await page
         .locator("[data-field=prompt]")

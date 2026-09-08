@@ -17,11 +17,25 @@ export function normalizeTeam(value) {
   )
     throw new Error("A team needs 1–8 agents.");
   const names = new Set();
-  const members = value.members.map((m) => {
+  const members = value.members.map((m, memberIndex) => {
+    const invalid = (message, field) => {
+      throw Object.assign(
+        new Error(
+          `Agent ${memberIndex + 1}${m.name ? " (" + m.name + ")" : ""}: ${message}`,
+        ),
+        { memberIndex, field },
+      );
+    };
     const name = String(m.name || "").trim();
-    if (!AGENT_NAME_RE.test(name) || names.has(name.toLowerCase()))
-      throw new Error(
-        "Give every member a unique agent name (letters, numbers, dashes or underscores).",
+    if (!AGENT_NAME_RE.test(name))
+      invalid(
+        "Use an agent name of 1–64 letters, numbers, dashes or underscores, without spaces.",
+        "name",
+      );
+    if (names.has(name.toLowerCase()))
+      invalid(
+        `The name "${name}" is already used in this team. Each agent needs a unique name.`,
+        "name",
       );
     names.add(name.toLowerCase());
     const member = {
@@ -37,17 +51,30 @@ export function normalizeTeam(value) {
       prompt: String(m.prompt || "").trim(),
     };
     if (!member.serverId || member.serverId.length > 80)
-      throw new Error("Choose a server for each member.");
+      invalid("Choose a server.", "serverId");
     if (member.role.length > 80 || /[\x00-\x1f\x7f]/.test(member.role))
-      throw new Error("Keep roles under 80 characters.");
-    agentSpawnCommand({
-      hub: "http://localhost",
-      task: "tsk_0000000000000000",
-      ...member,
-      prompt: [member.role && "Role: " + member.role, member.prompt]
-        .filter(Boolean)
-        .join("\n\n"),
-    });
+      invalid("Keep roles under 80 characters.", "role");
+    try {
+      agentSpawnCommand({
+        hub: "http://localhost",
+        task: "tsk_0000000000000000",
+        ...member,
+        prompt: [member.role && "Role: " + member.role, member.prompt]
+          .filter(Boolean)
+          .join("\n\n"),
+      });
+    } catch (error) {
+      const field = /model/i.test(error.message)
+        ? "model"
+        : /directory/i.test(error.message)
+          ? "cwd"
+          : /prompt/i.test(error.message)
+            ? "prompt"
+            : /runtime/i.test(error.message)
+              ? "runtime"
+              : "run";
+      invalid(error.message, field);
+    }
     return member;
   });
   return {

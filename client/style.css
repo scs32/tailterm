@@ -5081,3 +5081,22 @@ dialog .agent-save-setup button {
     flex-direction: column;
   }
 }
+
+#team-error:not(:empty) {
+  color: var(--ink);
+  border-left: 2px solid var(--accent);
+  padding: 6px 10px;
+  font-size: 11px;
+}
+#team-form .task-submit-area {
+  z-index: 2;
+}
+#team-form .dialog-actions {
+  margin-top: 8px;
+}
+.model-picker {
+  min-width: 0;
+}
+.model-picker [hidden] {
+  display: none !important;
+}
