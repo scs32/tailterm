@@ -1,6 +1,32 @@
 # Development handoff — September 8, 2026
 
-## September 8 follow-up release
+## September 8 Projects release — current deployment
+
+Commit `86551cdc901e1d429fc7ced9d8c892f5b19625c2` is deployed to
+`https://tailos.tailarr.com` (`https://fcc49680.tailos.pages.dev`) and served by the
+local preview at `http://127.0.0.1:4318`. It includes the Projects rename,
+project-owned Bugs/Features, directed Send to project receipts, automatically
+launched database handlers for new browser projects, recoverable handler setup,
+and physical Left/Right Option pane placement (right/above).
+
+The hub is running
+`/mnt/deepfreeze/tailterm-hub/releases/20260908-project-work-items-86551cdc901e/tailterm-hub`.
+Mini and Air have the matching `tt` build; their per-user inbox relays were
+restarted and verified running. Each retains the previous executable as
+`~/.local/bin/tt-before-project-work-items-86551cdc901e`. No TrueNAS Tailscale
+configuration or live project sessions were changed for testing.
+
+The [release receipt](releases/tailos-2026-09-08-projects.json) records the verified
+81 served assets, manifest hash, hub/CLI binary hashes, consistent database backup,
+and browser/Go checks. [Projects, Bugs, and Features](project-work-items.md)
+describes dispatch semantics and handler recovery. Existing/headless projects
+need explicit handler setup because the hub cannot launch SSH sessions itself.
+
+Documentation commits after this release intentionally do not require another
+application deployment. The sections below preserve earlier handoff history;
+this section and its receipt are the current deployment inventory.
+
+## September 8 follow-up release (previous)
 
 Commit `63a341c2de61d4945ac38a5c96e0a9f3d33ef284` is now deployed to
 `https://tailos.tailarr.com` (`https://f0a7b147.tailos.pages.dev`). It adds local
@@ -18,10 +44,8 @@ binary verification. The pre-update SQLite backup passed integrity verification
 and is recorded there. All QR acceptance used synthetic URLs; a real phone scan
 with the owner's account is still an owner acceptance check.
 
-Current owner follow-ups under development: rename Tasks to Projects, add scoped
-Bugs/Features with a database-handler agent and dispatch to a project, and physical
-Left/Right Option drag placement (right/above respectively). The original restart
-snapshot below is retained for context; it predates this follow-up release.
+The Projects release above completes the follow-ups to this release. The original
+restart snapshot below is retained for context; it predates both follow-up releases.
 
 This is the restart guide for the next computer and developer/agent. Read
 [Project overview](project-overview.md) for the product model and source map.

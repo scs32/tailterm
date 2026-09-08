@@ -1,0 +1,43 @@
+{
+  "origin": "https://tailos.tailarr.com",
+  "deployment": "https://fcc49680.tailos.pages.dev",
+  "commit": "86551cdc901e1d429fc7ced9d8c892f5b19625c2",
+  "verifiedAssets": 81,
+  "releaseSha256": "406e74c586b6b7335ad3f3f0aede586fe42fa5e55babdaf9c5a8e699b2578979",
+  "verifiedAt": "2026-09-08T16:49:56.718Z",
+  "hubBackup": "/mnt/deepfreeze/tailterm-hub/backups/before-project-work-items-20260908T164653Z.sqlite",
+  "backupIntegrity": "ok",
+  "backupMode": "0600",
+  "hubRelease": "20260908-project-work-items-86551cdc901e",
+  "hubBinarySha256": "0e2e44a040af218b0c00fbd9a5c39ccf11bc257e6bc4441a6826500899542a9a",
+  "hubState": "RUNNING",
+  "additiveSchemaVerified": true,
+  "hostCLIs": [
+    {
+      "host": "Stephens-Mini.localdomain",
+      "binarySha256": "73bb500541059e616008ad7a31747141c1181f0445d9347e958fc10e1b784017",
+      "previousBinarySha256": "afa8173c348b89f95950e01fb259b2675cf7f5b852a3dedef735a91e6e581218",
+      "rollbackBinary": "/Users/stephenspeicher/.local/bin/tt-before-project-work-items-86551cdc901e",
+      "relay": "running"
+    },
+    {
+      "host": "Stephens-MacBook-Air.local",
+      "binarySha256": "73bb500541059e616008ad7a31747141c1181f0445d9347e958fc10e1b784017",
+      "previousBinarySha256": "afa8173c348b89f95950e01fb259b2675cf7f5b852a3dedef735a91e6e581218",
+      "rollbackBinary": "/Users/stephenspeicher/.local/bin/tt-before-project-work-items-86551cdc901e",
+      "relay": "running"
+    }
+  ],
+  "localPreview": "http://127.0.0.1:4318",
+  "verification": [
+    "Clean source release verification: all 82 manifest entries match; 81 served assets plus release.json verified against production",
+    "Chromium deployed smoke: HTTPS CSP, production WASM startup, isolated synthetic vault key persistence",
+    "Chromium and WebKit integrated local app: 390px Projects/Bugs/Features navigation, hidden Files, no overflow or page errors",
+    "Chromium and WebKit work-item fixture: scoped CRUD, reload, stale revision, create response-loss retry, dispatch ownership/receipts, missing/exited target errors, closed source read-only, handler settings recovery and stable identity, mobile control/row geometry",
+    "Chromium and WebKit task-form, project-folder, encrypted handler-plan vault, and physical Option drag fixtures passed",
+    "83 JavaScript unit tests passed; hub go test ./..., go vet ./..., store/CLI race suites and final focused store/server/CLI regressions passed",
+    "TrueNAS middleware app RUNNING; deployed hub hash and additive schema verified without reading user record contents",
+    "Mini and Air tt binaries installed atomically with matching SHA-256, old binary rollback copies retained; only per-user inbox relays restarted and verified running",
+    "Pre-update consistent SQLite backup mode 0600 and integrity_check ok"
+  ]
+}
