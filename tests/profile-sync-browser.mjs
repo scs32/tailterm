@@ -26,9 +26,9 @@ const backend = spawn(".build/ttbin/tailterm-hub-test", {
 });
 const html = `<!doctype html><html><head><meta charset="utf-8"><link rel="stylesheet" href="/client/style.css"></head><body><div id="app"><div id="workspace"><aside><button id="profile-sync"><span class="nav-label">Profile sync</span></button></aside><main><header>Profile check</header><div id="status"></div></main></div><dialog id="dialog"></dialog></div><script type="module">
 import * as vault from '/client/local-vault.js';import {createProfileSync} from '/client/profile-sync.js';import {confirmDialog} from '/client/confirm-dialog.js';
-let online=false, sync, requests=0;
-const host={getIPN:()=>online?{fetch:async(url,init)=>{requests++;return fetch(url.replace('http://profile-fixture:18765',location.origin+'/profile-hub'),init)}}:null,getPeers:()=>[{name:'profile-fixture.',online:true}],getData:()=>vault.localData(),getAppearance:()=>({theme:'default',font:'system',idleMinutes:15}),connect(){},notice:text=>document.querySelector('#status').textContent=text,download(){},confirm:(title,message)=>confirmDialog({title,message}),reloadData:async()=>{},dialog:(title,body)=>{const d=document.querySelector('#dialog');if(d.open)d.close();d.innerHTML='<div class="dialog-head"><h2>'+title+'</h2><button id="dialog-close">×</button></div>'+body;d.querySelector('#dialog-close').onclick=()=>d.close();d.showModal()}};
-window.qa={vault,async unlock(username,password){await vault.localAPI('/unlock','POST',{username,password});sync=createProfileSync(host,vault);document.querySelector('#profile-sync').onclick=()=>sync.show();},online:async(value)=>{online=value;return sync.connected()},show:()=>sync.show(),data:()=>vault.localData(),requests:()=>requests,stop:()=>sync.stop(),async addServer(name,password){await vault.localAPI('/servers','POST',{name,host:'test.example',port:22,username:'test',mode:'ssh'});await vault.rememberCredential(vault.localData().servers.at(-1).id,{password})},async rename(name){const s=vault.localData().servers[0];return vault.localAPI('/servers','POST',{...s,name})},async configure(){await vault.localAPI('/hub','POST',{url:location.origin+'/profile-hub',token:'fixture-token-not-live'})}};
+let online=false, sync, requests=0, unavailable=false;
+const host={getIPN:()=>online?{fetch:async(url,init)=>{requests++;if(unavailable)throw new Error("Host temporarily unavailable");return fetch(url.replace('http://profile-fixture:18765',location.origin+'/profile-hub'),init)}}:null,getPeers:()=>[{name:'profile-fixture.',online:true}],getData:()=>vault.localData(),getAppearance:()=>({theme:'default',font:'system',idleMinutes:15}),connect(){},notice:text=>document.querySelector('#status').textContent=text,download(){},confirm:(title,message)=>confirmDialog({title,message}),reloadData:async()=>{},dialog:(title,body)=>{const d=document.querySelector('#dialog');if(d.open)d.close();d.innerHTML='<div class="dialog-head"><h2>'+title+'</h2><button id="dialog-close">×</button></div>'+body;d.querySelector('#dialog-close').onclick=()=>d.close();d.showModal()}};
+window.qa={vault,unavailable:value=>unavailable=value,async unlock(username,password){await vault.localAPI('/unlock','POST',{username,password});sync=createProfileSync(host,vault);document.querySelector('#profile-sync').onclick=()=>sync.show();},online:async(value)=>{online=value;return sync.connected()},show:()=>sync.show(),data:()=>vault.localData(),requests:()=>requests,stop:()=>sync.stop(),async addServer(name,password){await vault.localAPI('/servers','POST',{name,host:'test.example',port:22,username:'test',mode:'ssh'});await vault.rememberCredential(vault.localData().servers.at(-1).id,{password})},async rename(name){const s=vault.localData().servers[0];return vault.localAPI('/servers','POST',{...s,name})},async configure(){await vault.localAPI('/hub','POST',{url:location.origin+'/profile-hub',token:'fixture-token-not-live'})}};
 </script></body></html>`;
 const vite = await createVite({
   configFile: false,
@@ -125,6 +125,10 @@ try {
       const b = await fresh();
       assert.equal(await b.evaluate(() => qa.data().servers.length), 0);
       await b.evaluate(async () => {
+        qa.unavailable(true);
+        await qa.online(true);
+        await qa.online(false);
+        qa.unavailable(false);
         await qa.vault.localAPI("/tailscale/state", "PUT", {
           state: { node: "device-b" },
         });

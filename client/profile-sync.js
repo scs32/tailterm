@@ -480,12 +480,19 @@ export function createProfileSync(host, vault) {
       }),
     );
   }
-  const periodic = setInterval(() => void tick(), 15000);
+  let discoveryTicks = 0;
+  const periodic = setInterval(() => {
+    if (!state().hub && !discovered.length && ++discoveryTicks % 4 === 0) {
+      checked.clear();
+      void discover();
+    } else void tick();
+  }, 15000);
   window.addEventListener("tailterm-profile-change", schedule);
   window.addEventListener("focus", schedule);
   const connected = () => {
     if (stopped) return;
     if (!host.getIPN()) {
+      checked.clear();
       if (state().hub) report("Saved locally · waiting for Tailscale");
       return;
     }
