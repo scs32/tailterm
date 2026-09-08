@@ -237,6 +237,22 @@ export function createTaskHub(host) {
   }
   async function doReconcile(feed) {
     if (feed.stopped) return;
+    const syncLayout = () => {
+      const groups = host.paneGroups();
+      const orchestrator = feed.agents.find(
+        (agent) =>
+          agent.name.toLowerCase() === feed.task?.orchestrator?.toLowerCase(),
+      );
+      const tab = host
+        .getTabs()
+        .find(
+          (tab) =>
+            tab.task?.taskId === feed.taskId &&
+            tab.task?.agentId === orchestrator?.id,
+        );
+      groups?.model.setTaskOrchestrator?.(feed.taskId, tab?.id);
+      groups?.sync();
+    };
     const reconcileCurrent = () =>
       reconcileTask({
         taskId: feed.taskId,
@@ -260,7 +276,7 @@ export function createTaskHub(host) {
       tab.task = taskBinding(feed.taskId, agent);
       host.bookmark(tab);
     }
-    host.paneGroups()?.sync();
+    syncLayout();
     for (const tab of r.close) host.closeTab(tab.id, { fromHub: true });
     if (feed.task?.status === "closed") {
       const group = host.paneGroups()?.model.taskGroup(feed.taskId);
@@ -282,6 +298,7 @@ export function createTaskHub(host) {
         host.notice(`Could not open ${agent.name}: ${error.message}`);
       }
     }
+    syncLayout();
     host.scheduleWorkspaceSave();
   }
   // Put a pane into the task's tab, or make its own tab carry the task.

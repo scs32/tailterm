@@ -23,6 +23,10 @@ func TestRetirementPersistsAcrossHooksAndExplicitResume(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	peer, err := s.AddAgent(ctx, task.ID, api.AddAgentRequest{Name: "peer", Host: "remote", Session: "peer", Runtime: "codex"}, by)
+	if err != nil {
+		t.Fatal(err)
+	}
 	status := api.AgentRetired
 	a, err = s.UpdateAgent(ctx, a.ID, api.UpdateAgentRequest{Status: &status}, by)
 	if err != nil {
@@ -41,8 +45,8 @@ func TestRetirementPersistsAcrossHooksAndExplicitResume(t *testing.T) {
 	if _, err = s.AddAgent(ctx, task.ID, api.AddAgentRequest{Name: "helper", Host: "remote", Session: "helper", ParentAgentID: a.ID}, by); err == nil {
 		t.Fatal("retired parent spawned helper")
 	}
-	// The record and mailbox remain usable across database reopen.
-	if _, err = s.PostMessage(ctx, task.ID, api.PostMessageRequest{To: a.ID, Text: "Follow-up retained"}, by); err != nil {
+	// Agent-authored messages retain retirement while leaving the mailbox usable.
+	if _, err = s.PostMessage(ctx, task.ID, api.PostMessageRequest{AgentID: peer.ID, To: a.ID, Text: "Follow-up retained"}, by); err != nil {
 		t.Fatal(err)
 	}
 	s.Close()

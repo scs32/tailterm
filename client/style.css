@@ -3402,6 +3402,62 @@ dialog .primary:hover {
   gap: 8px;
 }
 
+.tailscale-login-flow {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 208px;
+  align-items: start;
+  gap: 18px;
+  margin: 16px 0 12px;
+}
+.tailscale-login-flow strong {
+  display: block;
+  color: var(--ink);
+  font-size: 13px;
+  line-height: 1.5;
+}
+.tailscale-login-flow .fine {
+  margin-bottom: 0;
+}
+#tailscale-login-qr {
+  display: grid;
+  place-items: center;
+  width: 208px;
+  height: 208px;
+  overflow: hidden;
+  background: #fff;
+  color: #07110c;
+}
+#tailscale-login-qr > .fine {
+  max-width: 150px;
+  margin: 0;
+  color: #38453d;
+  text-align: center;
+}
+.tailscale-login-qr-image {
+  display: block;
+  width: 208px;
+  height: 208px;
+}
+#tailscale-login-link {
+  justify-content: center;
+  margin: 0;
+}
+#tailscale-login-state {
+  margin-bottom: 0;
+}
+@media (max-width: 520px) {
+  .tailscale-login-flow {
+    grid-template-columns: 1fr;
+  }
+  #tailscale-login-qr {
+    justify-self: center;
+  }
+  #tailscale-login-link {
+    display: flex;
+    width: 100%;
+  }
+}
+
 /* Fill communicates connection/selection; the border communicates hover. */
 #workspace #tailscale-login:has(.online),
 #workspace .server-item.selected,

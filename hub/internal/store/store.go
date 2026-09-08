@@ -531,6 +531,7 @@ func (s *Store) PostMessage(ctx context.Context, taskID string, req api.PostMess
 	if req.Text == "" || !api.ValidText(req.Text, api.MaxTextLen) {
 		return api.Message{}, api.ErrInvalid
 	}
+	var target api.Agent
 	for _, id := range []string{req.To, req.AgentID} {
 		if id == "" {
 			continue
@@ -538,6 +539,9 @@ func (s *Store) PostMessage(ctx context.Context, taskID string, req api.PostMess
 		a, err := s.GetAgent(ctx, id)
 		if err != nil || a.TaskID != taskID {
 			return api.Message{}, api.ErrInvalid
+		}
+		if id == req.To {
+			target = a
 		}
 	}
 	if req.ReplyTo < 0 {
@@ -549,8 +553,13 @@ func (s *Store) PostMessage(ctx context.Context, taskID string, req api.PostMess
 			return api.Message{}, api.ErrInvalid
 		}
 	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return api.Message{}, err
+	}
+	defer tx.Rollback()
 	m := api.Message{Broadcast: t.Swarm, ReplyTo: req.ReplyTo, TaskID: taskID, From: api.Sender{AgentID: req.AgentID, Node: by.Node, User: by.User}, To: req.To, Text: req.Text, CreatedAt: s.now()}
-	res, err := s.db.ExecContext(ctx, `INSERT INTO messages (task_id,from_agent,from_node,from_user,to_agent,text,created_at,reply_to,broadcast) VALUES (?,?,?,?,?,?,?,?,?)`,
+	res, err := tx.ExecContext(ctx, `INSERT INTO messages (task_id,from_agent,from_node,from_user,to_agent,text,created_at,reply_to,broadcast) VALUES (?,?,?,?,?,?,?,?,?)`,
 		taskID, req.AgentID, by.Node, by.User, req.To, req.Text, ts(m.CreatedAt), req.ReplyTo, m.Broadcast)
 	if err != nil {
 		return m, err
@@ -560,8 +569,34 @@ func (s *Store) PostMessage(ctx context.Context, taskID string, req api.PostMess
 	if len(preview) > 200 {
 		preview = preview[:200]
 	}
-	_, err = s.addEvent(ctx, taskID, api.EventMessage, req.AgentID, preview, map[string]any{"seq": m.Seq, "to": req.To, "broadcast": m.Broadcast}, by)
-	return m, err
+	if _, err = s.insertEvent(ctx, tx, taskID, api.EventMessage, req.AgentID, preview, map[string]any{"seq": m.Seq, "to": req.To, "broadcast": m.Broadcast}, by); err != nil {
+		return m, err
+	}
+	// A direct human message is an explicit request to continue an existing
+	// retired run. The heartbeat-derived Online flag prevents recreating or
+	// waking stale sessions; agent-authored and unaddressed messages do not resume.
+	if req.AgentID == "" && req.To != "" && target.Status == api.AgentRetired && target.Online {
+		now := s.now()
+		result, err := tx.ExecContext(ctx, `UPDATE agents SET status=?,last_event_at=?,blocked_reason='',blocked_text='' WHERE id=? AND task_id=? AND status=?`,
+			api.AgentDone, ts(now), target.ID, taskID, api.AgentRetired)
+		if err != nil {
+			return m, err
+		}
+		changed, err := result.RowsAffected()
+		if err != nil {
+			return m, err
+		}
+		if changed == 1 {
+			if _, err = s.insertEvent(ctx, tx, taskID, api.EventResumed, target.ID, "", nil, by); err != nil {
+				return m, err
+			}
+		}
+	}
+	if err = tx.Commit(); err != nil {
+		return m, err
+	}
+	s.notify(taskID)
+	return m, nil
 }
 
 // ListMessages returns messages after seq. When agentID is set, only broadcast
@@ -704,6 +739,18 @@ func (s *Store) PostEvent(ctx context.Context, taskID string, req api.PostEventR
 }
 
 func (s *Store) addEvent(ctx context.Context, taskID, kind, agentID, text string, data map[string]any, by api.Caller) (api.Event, error) {
+	e, err := s.insertEvent(ctx, s.db, taskID, kind, agentID, text, data, by)
+	if err == nil {
+		s.notify(taskID)
+	}
+	return e, err
+}
+
+type eventExecer interface {
+	ExecContext(context.Context, string, ...any) (sql.Result, error)
+}
+
+func (s *Store) insertEvent(ctx context.Context, execer eventExecer, taskID, kind, agentID, text string, data map[string]any, by api.Caller) (api.Event, error) {
 	e := api.Event{TaskID: taskID, Kind: kind, AgentID: agentID, Text: text, Data: data, By: by, CreatedAt: s.now()}
 	encoded := ""
 	if data != nil {
@@ -713,18 +760,17 @@ func (s *Store) addEvent(ctx context.Context, taskID, kind, agentID, text string
 		}
 		encoded = string(b)
 	}
-	res, err := s.db.ExecContext(ctx, `INSERT INTO events (task_id,kind,agent_id,text,data,by_node,by_user,created_at) VALUES (?,?,?,?,?,?,?,?)`,
+	res, err := execer.ExecContext(ctx, `INSERT INTO events (task_id,kind,agent_id,text,data,by_node,by_user,created_at) VALUES (?,?,?,?,?,?,?,?)`,
 		taskID, kind, agentID, text, encoded, by.Node, by.User, ts(e.CreatedAt))
 	if err != nil {
 		return e, err
 	}
 	e.Seq, _ = res.LastInsertId()
 	if agentID != "" {
-		_, _ = s.db.ExecContext(ctx, `UPDATE agents SET last_event_at=? WHERE id=?`, ts(e.CreatedAt), agentID)
+		_, _ = execer.ExecContext(ctx, `UPDATE agents SET last_event_at=? WHERE id=?`, ts(e.CreatedAt), agentID)
 	}
-	_, _ = s.db.ExecContext(ctx, `DELETE FROM events WHERE task_id=? AND seq <= (SELECT seq FROM events WHERE task_id=? ORDER BY seq DESC LIMIT 1 OFFSET ?)`,
+	_, _ = execer.ExecContext(ctx, `DELETE FROM events WHERE task_id=? AND seq <= (SELECT seq FROM events WHERE task_id=? ORDER BY seq DESC LIMIT 1 OFFSET ?)`,
 		taskID, taskID, api.MaxEventsPerTask)
-	s.notify(taskID)
 	return e, nil
 }
 

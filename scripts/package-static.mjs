@@ -54,12 +54,16 @@ for (const pkg of [
   "@fontsource/jetbrains-mono",
   "@fontsource/ibm-plex-mono",
   "@fontsource/source-code-pro",
+  "qrcode",
+  "dijkstrajs",
 ]) {
   await copyFile(
     new URL(
       pkg === "onnxruntime-web"
         ? "../deploy/LICENSE.onnxruntime.txt"
-        : "../node_modules/" + pkg + "/LICENSE",
+        : "../node_modules/" +
+            pkg +
+            (pkg === "dijkstrajs" ? "/LICENSE.md" : "/LICENSE"),
       import.meta.url,
     ),
     new URL(

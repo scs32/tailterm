@@ -222,3 +222,147 @@ test("ordinary session guests survive task reconciliation and can leave without 
   assert.equal(m.group("shell").taskId, undefined);
   assert.deepEqual(m.taskGroup("review").guests, []);
 });
+
+test("task agents grow into two worker columns while the orchestrator stays full-height", () => {
+  const model = new PaneGroups();
+  const ids = [
+    "lead",
+    "second",
+    "third",
+    "fourth",
+    "fifth",
+    "sixth",
+    "seventh",
+  ];
+  for (let count = 1; count <= ids.length; count++) {
+    model.sync(ids.slice(0, count), () => "task");
+    model.setTaskOrchestrator("task", "lead");
+    model.isolateTasks(() => "task");
+    const group = model.taskGroup("task");
+    const { panes } = tileLayout(group.tree, 1200, 800);
+    const byId = Object.fromEntries(panes.map((pane) => [pane.id, pane]));
+    assert.equal(byId.lead.x, 0);
+    assert.equal(byId.lead.y, 0);
+    assert.equal(byId.lead.height, 800);
+    assert.equal(new Set(panes.map((pane) => pane.x)).size, Math.min(count, 3));
+    if (count >= 4) {
+      assert.equal(byId.second.x, byId.fourth.x);
+      assert.ok(byId.fourth.y > byId.second.y);
+    }
+    if (count >= 5) {
+      assert.equal(byId.third.x, byId.fifth.x);
+      assert.ok(byId.fifth.y > byId.third.y);
+    }
+    assert.deepEqual(leaves(group.tree).sort(), ids.slice(0, count).sort());
+    const saved = structuredClone(model.groups);
+    model.isolateTasks(() => "task");
+    assert.deepEqual(
+      model.groups,
+      saved,
+      "repeated sync preserves divider IDs and focus",
+    );
+  }
+});
+
+test("task layout uses the named orchestrator even when it arrives after workers", () => {
+  const model = new PaneGroups();
+  model.sync(
+    ["worker1", "worker2", "lead", "worker3", "worker4"],
+    () => "task",
+  );
+  model.isolateTasks(() => "task");
+  model.setTaskOrchestrator("task", "lead");
+  model.isolateTasks(() => "task");
+  const panes = tileLayout(model.taskGroup("task").tree, 1200, 800).panes;
+  assert.equal(panes.find((p) => p.id === "lead").height, 800);
+  assert.equal(panes.find((p) => p.id === "lead").x, 0);
+  assert.equal(
+    panes.find((p) => p.id === "worker1").x,
+    panes.find((p) => p.id === "worker3").x,
+  );
+  assert.equal(
+    panes.find((p) => p.id === "worker2").x,
+    panes.find((p) => p.id === "worker4").x,
+  );
+});
+
+test("task layout migrates untouched horizontal groups and preserves customized layouts", async () => {
+  const { normalizeWorkspace, workspaceSnapshot, endpointKey } =
+    await import("../client/workspace-state.js");
+  const taskId = "tsk_0123456789abcdef";
+  const ids = ["lead", "two", "three", "four", "five"];
+  const model = new PaneGroups();
+  model.sync(ids);
+  model.groups = [
+    {
+      active: "lead",
+      tree: ids.slice(1).reduce(
+        (tree, tab) => ({
+          id: crypto.randomUUID(),
+          axis: "x",
+          ratio: 0.5,
+          a: tree,
+          b: { tab },
+        }),
+        { tab: ids[0] },
+      ),
+    },
+  ];
+  model.isolateTasks(() => taskId);
+  assert.equal(model.taskGroup(taskId).taskLayout, "auto");
+  assert.equal(
+    tileLayout(model.taskGroup(taskId).tree, 1200, 800).panes.find(
+      (p) => p.id === "lead",
+    ).height,
+    800,
+  );
+  model.customize("lead");
+  model.taskGroup(taskId).tree.ratio = 0.42;
+  model.swap("two", "four");
+  const before = structuredClone(model.taskGroup(taskId).tree);
+  const server = { id: "server", host: "fixture", port: 22, username: "test" };
+  const tabs = ids.map((id, i) => ({
+    id,
+    server,
+    serverId: server.id,
+    endpoint: endpointKey(server),
+    task: { taskId, agentId: `agt_${String(i).padStart(16, "0")}` },
+  }));
+  const saved = normalizeWorkspace(
+    workspaceSnapshot(tabs, model.groups, "lead"),
+  );
+  assert.equal(saved.groups[0].taskLayout, "manual");
+  model.groups = saved.groups;
+  model.sync(ids, () => taskId);
+  model.isolateTasks(() => taskId);
+  assert.deepEqual(model.taskGroup(taskId).tree, before);
+  model.sync([...ids, "six"], () => taskId);
+  model.isolateTasks(() => taskId);
+  assert.deepEqual(
+    model.taskGroup(taskId).tree.a,
+    before,
+    "adding a pane preserves the customized subtree",
+  );
+});
+
+test("legacy task layouts with manual swaps are preserved during migration", () => {
+  const model = new PaneGroups();
+  model.sync(["lead", "two", "three"]);
+  const saved = {
+    id: "outer",
+    axis: "x",
+    ratio: 0.5,
+    a: {
+      id: "inner",
+      axis: "x",
+      ratio: 0.5,
+      a: { tab: "lead" },
+      b: { tab: "three" },
+    },
+    b: { tab: "two" },
+  };
+  model.groups = [{ tree: saved, active: "lead", taskId: "task" }];
+  model.isolateTasks(() => "task");
+  assert.equal(model.taskGroup("task").taskLayout, "manual");
+  assert.deepEqual(model.taskGroup("task").tree, saved);
+});

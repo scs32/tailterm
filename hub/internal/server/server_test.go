@@ -200,6 +200,42 @@ func TestMessagesAndUnread(t *testing.T) {
 	}
 }
 
+func TestHumanDirectMessageResumesOnlineRetiredAgent(t *testing.T) {
+	c := newClient(t)
+	task := c.task("resume-message")
+	a := c.agent(task, "worker")
+	if code := c.do("POST", "/v1/tasks/"+task.ID+"/events", api.PostEventRequest{Kind: api.EventHeartbeat, AgentID: a.ID, RunID: a.RunID}, nil); code != 201 {
+		t.Fatalf("heartbeat status = %d", code)
+	}
+	retired := api.AgentRetired
+	if code := c.do("PATCH", "/v1/tasks/"+task.ID+"/agents/"+a.ID, api.UpdateAgentRequest{Status: &retired}, nil); code != 200 {
+		t.Fatalf("retire status = %d", code)
+	}
+	var message api.Message
+	if code := c.do("POST", "/v1/tasks/"+task.ID+"/messages", api.PostMessageRequest{To: a.ID, Text: "Please continue"}, &message); code != 201 {
+		t.Fatalf("message status = %d", code)
+	}
+	if message.From.AgentID != "" || message.To != a.ID {
+		t.Fatalf("message contract changed: %+v", message)
+	}
+	var got api.Agent
+	c.do("GET", "/v1/tasks/"+task.ID+"/agents/"+a.ID, nil, &got)
+	if got.Status != api.AgentDone || got.ID != a.ID || got.RunID != a.RunID || got.Session != a.Session {
+		t.Fatalf("agent was not resumed in place: before=%+v after=%+v", a, got)
+	}
+	var events api.EventList
+	c.do("GET", "/v1/tasks/"+task.ID+"/events", nil, &events)
+	resumeCount := 0
+	for _, event := range events.Events {
+		if event.Kind == api.EventResumed && event.AgentID == a.ID {
+			resumeCount++
+		}
+	}
+	if resumeCount != 1 {
+		t.Fatalf("resume events = %d, want 1", resumeCount)
+	}
+}
+
 func TestLongPollWakesAndTimesOut(t *testing.T) {
 	c := newClient(t)
 	task := c.task("delta")

@@ -91,6 +91,49 @@ func TestRelayTargetsUnreadOnceAndPreservesReadReceipts(t *testing.T) {
 		t.Fatalf("retry: %v %d", err, calls)
 	}
 }
+
+func TestRelayQueuesResumedRunAndRejectsStaleBinding(t *testing.T) {
+	b := runtimeBinding{Hub: "http://hub", Task: "tsk_0000000000000001", Agent: "agt_0000000000000001", Run: "run_0000000000000001", Thread: "00000000-0000-4000-8000-000000000001", Codex: "/usr/local/bin/codex"}
+	a := api.Agent{ID: b.Agent, RunID: b.Run, Status: api.AgentDone, Online: true, Unread: 1}
+	messages := []api.Message{{Seq: 12, To: b.Agent, From: api.Sender{}, Text: "Human follow-up"}}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if strings.Contains(r.URL.Path, "/messages") {
+			json.NewEncoder(w).Encode(api.MessageList{Messages: messages})
+			return
+		}
+		json.NewEncoder(w).Encode(a)
+	}))
+	defer server.Close()
+	b.Hub = server.URL
+	c, err := api.NewClient(server.URL, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	queued := 0
+	queue := func(_ context.Context, got runtimeBinding, prompt string) error {
+		queued++
+		if got.Agent != b.Agent || got.Run != b.Run || got.Thread != b.Thread || !strings.Contains(prompt, "through message #12") {
+			t.Fatalf("wrong resumed binding/prompt: %+v %q", got, prompt)
+		}
+		return nil
+	}
+	if err := relayOne(context.Background(), b, &relayProgress{}, c, time.Now(), queue); err != nil {
+		t.Fatal(err)
+	}
+	if queued != 1 {
+		t.Fatalf("resumed run queue calls = %d, want 1", queued)
+	}
+	stale := b
+	stale.Run = "run_0000000000000002"
+	if err := relayOne(context.Background(), stale, &relayProgress{}, c, time.Now(), queue); err != nil {
+		t.Fatal(err)
+	}
+	if queued != 1 {
+		t.Fatalf("stale run binding queued: %d calls", queued)
+	}
+}
+
 func TestWakeEligibility(t *testing.T) {
 	for _, tc := range []struct {
 		from, to string

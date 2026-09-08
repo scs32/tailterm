@@ -111,11 +111,13 @@ export function setupPaneGroups({
           ? tree
           : find(tree.a) || find(tree.b);
     const original = find(model.group(getActive())?.tree);
-    if (original)
+    if (original) {
+      model.customize(getActive());
       original.ratio = Math.max(
         d.low / d.span,
         Math.min(d.high / d.span, value),
       );
+    }
     render();
   }
   function render() {

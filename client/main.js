@@ -13,6 +13,7 @@ import { createInactivityLock, IDLE_MINUTES } from "./inactivity.js";
 import { createAppearancePreview } from "./appearance-preview.js";
 import { normalizeTabDecoration, showTabDecoration } from "./tab-decoration.js";
 let appearancePreview;
+let dialogSequence = 0;
 import { setupTerminalLinks } from "./terminal-links.js";
 import { confirmDialog } from "./confirm-dialog.js";
 import { setupVoiceDictation } from "./voice-dictation.js";
@@ -53,6 +54,10 @@ import logo from "./logo.svg?raw";
 import { setupVaultReset } from "./vault-reset.js";
 import { showSessionRename } from "./session-rename.js";
 import {
+  createTailscaleLoginController,
+  safeTailscaleAuthURL,
+} from "./tailscale-login.js";
+import {
   workspaceSnapshot,
   normalizeWorkspace,
   normalizeSessionFontSize,
@@ -89,6 +94,7 @@ import "./style.css";
 let teamsView, profileSync;
 const $ = (s) => document.querySelector(s),
   $$ = (s) => [...document.querySelectorAll(s)];
+const tailscaleLogin = createTailscaleLoginController();
 const esc = (s) =>
   String(s ?? "").replace(
     /[&<>"']/g,
@@ -2005,17 +2011,21 @@ function dialog(title, body) {
   appearancePreview?.dispose();
   appearancePreview = null;
   const d = $("#dialog");
+  tailscaleLogin.clear();
   if (d.open) d.close();
+  const dialogId = String(++dialogSequence);
   d.oncancel = null;
   d.onclose = () => {
-    if (!d.open) {
-      appearancePreview?.dispose();
-      appearancePreview = null;
-    }
+    if (d.open || d.dataset.dialogId !== dialogId) return;
+    tailscaleLogin.clear();
+    appearancePreview?.dispose();
+    appearancePreview = null;
   };
   (document.fullscreenElement || $("#app")).append(d);
   delete d.dataset.discovery;
   delete d.dataset.tailscaleLogin;
+  delete d.dataset.tailscaleLoginId;
+  d.dataset.dialogId = dialogId;
   d.innerHTML = `<div class="dialog-head"><h2 id="dialog-title">${esc(title)}</h2><button id="dialog-close" aria-label="Close dialog">×</button></div>${body}`;
   d.setAttribute("aria-labelledby", "dialog-title");
   $("#dialog-close").onclick = closeDialog;
@@ -2024,6 +2034,7 @@ function dialog(title, body) {
 function closeDialog() {
   appearancePreview?.dispose();
   appearancePreview = null;
+  tailscaleLogin.clear();
   $("#dialog").close();
   $("#dialog").replaceChildren();
 }
@@ -2166,12 +2177,6 @@ function keyDialog() {
       })),
   );
 }
-function safeAuthURL(raw) {
-  const u = new URL(raw);
-  if (u.protocol !== "https:" || u.hostname !== "login.tailscale.com")
-    throw new Error("Unexpected Tailscale login URL");
-  return u.href;
-}
 let starting = null;
 async function startTailscale() {
   if (starting) return starting;
@@ -2232,6 +2237,7 @@ async function startTailscale() {
     ipn.run({
       notifyState: (s) => {
         netState = s;
+        tailscaleLogin.updateState(s);
         if (s === "Running") {
           taskHub?.refresh();
         }
@@ -2242,17 +2248,24 @@ async function startTailscale() {
             ? "Tailscale connected"
             : s === "NeedsLogin"
               ? "Sign in to Tailscale ↗"
-              : "Tailscale · " + s;
+              : s === "NeedsMachineAuth"
+                ? "Tailscale approval pending"
+                : "Tailscale · " + s;
         $("#tailscale-login").title =
           s === "Running"
             ? "Tailscale connected\nThis browser is connected to your tailnet"
             : "Tailscale\n" + s;
         if (s === "NeedsLogin") ipn.login();
-        if (s === "Running") recoverConnections();
-        if (s === "Running" && discoveryPending) {
-          if ($("#dialog")?.dataset.tailscaleLogin === "true") showPeers();
-          else renderDiscoveredPeers();
-          discoveryPending = false;
+        if (s === "Running") {
+          const loginDialog = $("#dialog");
+          if (discoveryPending) {
+            if (tailscaleLogin.isCurrentDialog(loginDialog)) showPeers();
+            else renderDiscoveredPeers();
+            discoveryPending = false;
+          } else {
+            tailscaleLogin.closeIfCurrent(loginDialog, closeDialog);
+          }
+          recoverConnections();
         }
       },
       notifyNetMap: (raw) => {
@@ -2261,13 +2274,20 @@ async function startTailscale() {
         renderDiscoveredPeers();
       },
       notifyBrowseToURL: (url) => {
+        if (locking || netState === "Running") return;
         try {
-          const href = safeAuthURL(url);
+          const href = safeTailscaleAuthURL(url);
           dialog(
             "Sign in to Tailscale",
-            `<p>Authorize this browser node in your tailnet. ${staticMode ? "Your identity is saved in this browser’s encrypted vault." : "Your identity is saved in the encrypted server vault."}</p><a class="primary auth-link" href="${esc(href)}" target="_blank" rel="noopener noreferrer">Continue to Tailscale ↗</a><p class="fine">This window updates automatically after sign-in.</p>`,
+            `<p>Authorize this browser node in your tailnet. ${staticMode ? "Your identity is saved in this browser’s encrypted vault." : "Your identity is saved in the encrypted server vault."}</p><div class="tailscale-login-flow"><div><strong>Scan to sign in on your phone</strong><p class="fine">Keep this Tailterm tab open while you finish sign-in.</p></div><div id="tailscale-login-qr"><span class="fine">Preparing QR code…</span></div></div><a id="tailscale-login-link" class="primary auth-link" href="${esc(href)}" target="_blank" rel="noopener noreferrer">Continue to Tailscale ↗</a><p class="fine" id="tailscale-login-state" role="status">Waiting for sign-in. This window updates automatically.</p>`,
           );
-          $("#dialog").dataset.tailscaleLogin = "true";
+          void tailscaleLogin.show({
+            dialog: $("#dialog"),
+            host: $("#tailscale-login-qr"),
+            status: $("#tailscale-login-state"),
+            href,
+            state: netState,
+          });
         } catch (e) {
           fatal(e.message);
         }
@@ -2336,6 +2356,7 @@ function renderDiscoveredPeers() {
 async function lock() {
   if (locking) return;
   locking = true;
+  tailscaleLogin.clear();
   credentialCache.clear();
   reconnects.clear();
   profileSync?.stop();
@@ -2407,6 +2428,7 @@ window.addEventListener("pagehide", () => {
   credentialCache.clear();
   voiceDictation?.cancel();
   locking = true;
+  tailscaleLogin.clear();
   reconnects.clear();
   tabs.forEach((t) => t.close?.());
 });

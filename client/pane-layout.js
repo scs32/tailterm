@@ -43,14 +43,61 @@ function replace(tree, id, replacement) {
     b: replace(tree.b, id, replacement),
   };
 }
+const split = (axis, a, b, ratio = 0.5) => ({
+  id: crypto.randomUUID(),
+  axis,
+  ratio,
+  a,
+  b,
+});
+const sameShape = (a, b) =>
+  a.tab || b.tab
+    ? a.tab === b.tab
+    : a.axis === b.axis && sameShape(a.a, b.a) && sameShape(a.b, b.b);
+const legacyTaskTree = (tree) =>
+  !!tree.tab ||
+  (tree.axis === "x" &&
+    tree.ratio === 0.5 &&
+    legacyTaskTree(tree.a) &&
+    legacyTaskTree(tree.b));
+function taskTree(ids) {
+  const column = (tabs) =>
+    tabs.length === 1
+      ? { tab: tabs[0] }
+      : split("y", { tab: tabs[0] }, column(tabs.slice(1)), 1 / tabs.length);
+  if (ids.length === 1) return { tab: ids[0] };
+  if (ids.length === 2) return split("x", { tab: ids[0] }, { tab: ids[1] });
+  const workers = ids.slice(1);
+  return split(
+    "x",
+    { tab: ids[0] },
+    split(
+      "x",
+      column(workers.filter((_, i) => i % 2 === 0)),
+      column(workers.filter((_, i) => i % 2 === 1)),
+    ),
+    1 / 3,
+  );
+}
 export class PaneGroups {
   groups = [];
+  tabOrder = [];
+  taskOrchestrators = new Map();
+  setTaskOrchestrator(taskId, tabId) {
+    if (tabId) this.taskOrchestrators.set(taskId, tabId);
+    else this.taskOrchestrators.delete(taskId);
+  }
+  customize(tab) {
+    const group = this.group(tab);
+    if (group?.taskId) group.taskLayout = "manual";
+  }
   group(tab) {
     return this.groups.find((g) => leaves(g.tree).includes(tab));
   }
   // taskOf(tabId) supplies the task a newly grouped tab belongs to, so a
   // singleton group created for an agent pane inherits its task binding.
   sync(ids, taskOf = () => undefined) {
+    this.tabOrder = [...ids];
     const valid = new Set(ids);
     this.groups = this.groups.flatMap((g) => {
       const tree = prune(g.tree, valid);
@@ -98,13 +145,22 @@ export class PaneGroups {
           delete part.taskId;
           delete part.taskName;
           delete part.guests;
+          delete part.taskLayout;
           result.push(part);
           continue;
         }
         part.taskId = taskId;
         part.guests = leaves(tree).filter((id) => !taskOf(id));
+        const ordered = this.tabOrder.filter((id) => leaves(tree).includes(id));
+        const originalOrder = leaves(tree).every((id, i) => id === ordered[i]);
+        part.taskLayout =
+          group.taskLayout ||
+          (!part.guests.length && originalOrder && legacyTaskTree(tree)
+            ? "auto"
+            : "manual");
         const target = tasks.get(taskId);
         if (target) {
+          if (part.taskLayout === "manual") target.taskLayout = "manual";
           target.guests = [...(target.guests || []), ...part.guests];
           target.tree = {
             id: crypto.randomUUID(),
@@ -120,6 +176,20 @@ export class PaneGroups {
       }
     }
     this.groups = result;
+    for (const group of tasks.values()) {
+      if (group.taskLayout !== "auto" || group.guests.length) continue;
+      const members = leaves(group.tree);
+      const ids = [
+        ...this.tabOrder.filter((id) => members.includes(id)),
+        ...members.filter((id) => !this.tabOrder.includes(id)),
+      ];
+      const anchor = this.taskOrchestrators.get(group.taskId);
+      if (ids.includes(anchor))
+        ids.unshift(...ids.splice(ids.indexOf(anchor), 1));
+      const tree = taskTree(ids);
+      // Stable membership preserves divider IDs/ratios and focused terminals.
+      if (!sameShape(group.tree, tree)) group.tree = tree;
+    }
   }
   taskGroup(taskId) {
     return this.groups.find((g) => g.taskId === taskId);
@@ -143,7 +213,10 @@ export class PaneGroups {
     const from = this.group(source),
       to = this.group(target);
     if (!this.canMerge(source, target, whole)) return false;
-    if (to.taskId) to.guests = [...(to.guests || []), source];
+    if (to.taskId) {
+      to.guests = [...(to.guests || []), source];
+      to.taskLayout = "manual";
+    }
     if (from.guests) from.guests = from.guests.filter((id) => id !== source);
     const incoming = whole ? from.tree : { tab: source };
     if (whole) this.groups = this.groups.filter((g) => g !== from);
@@ -171,6 +244,7 @@ export class PaneGroups {
     const group = this.group(source);
     if (!group || source === target || this.group(target) !== group)
       return false;
+    this.customize(source);
     // Replace leaves together: divider geometry and group identity stay intact.
     const exchange = (tree) =>
       tree.tab

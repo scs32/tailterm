@@ -105,6 +105,9 @@ export function normalizeWorkspace(value) {
       active: ids.has(g?.active) ? g.active : null,
       decoration: normalizeTabDecoration(g?.decoration),
       taskId: normalizeTaskId(g?.taskId),
+      taskLayout: ["auto", "manual"].includes(g?.taskLayout)
+        ? g.taskLayout
+        : undefined,
       guests: Array.isArray(g?.guests)
         ? g.guests.filter((id) => ids.has(id)).slice(0, 30)
         : [],

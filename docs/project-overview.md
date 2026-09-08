@@ -56,6 +56,10 @@ The deployed frontend uses `npm run build:static` instead.
 
 ### Connections, sessions, tabs, and groups
 
+- Tailscale sign-in displays a locally generated QR code for phone login and
+  keeps the original browser login link available. The sign-in dialog closes
+  when the browser node connects; pending discovery can continue in its place.
+  The phone authorizes this browser node, while vault and SSH login stay separate.
 - A saved server describes SSH access to a tailnet destination.
 - A tmux session lives on a remote machine. Browser panes attach to it.
 - Every main terminal tab is a group, even if it contains one session.
@@ -64,6 +68,10 @@ The deployed frontend uses `npm run build:static` instead.
   causes its pane to appear in that group, including agents spawned later.
 - Task groups cannot merge into another task or ordinary group. An ordinary
   session can join a task group visually as a guest without becoming an agent.
+- Default task layouts keep the orchestrator full-height on the left and add
+  workers across two columns on the right, stacking the fourth/fifth agents
+  beneath the second/third. Later workers extend those columns. Manual divider
+  resizing, swaps and guest layouts are retained; narrow screens still stack.
 - Closing or hiding a browser pane is distinct from terminating a remote session.
   Closing the page disconnects SSH but leaves ordinary remote tmux sessions alive.
 - Closing a task explicitly terminates its owned agent sessions. Guest sessions
@@ -136,7 +144,10 @@ agent per five minutes and persists progress across relay restarts.
 
 Ordinary directed messages and human announcements can wake Codex. In swarm mode,
 broadcast messages can also wake peers. Retired, closed, exited, offline, or stale
-runs are excluded. Other runtimes use their supported hooks/checkpoints and do
+runs are excluded. A direct human message resumes its explicitly addressed retired
+agent if its current session is online, allowing the existing eligible run to
+receive the message; broadcasts and agent-authored messages do not resume it.
+Other runtimes use their supported hooks/checkpoints and do
 not have equivalent guaranteed automatic resumption.
 
 `running`, `done` (turn complete), `needs_input`, `retired`, `exited`, and `closed`
@@ -148,7 +159,8 @@ new IDs, preventing stale lifecycle hooks from overwriting the current run.
 
 Retirement stops automatic inbox wake-ups and preserves the terminal for review.
 A running/queued turn can finish. Late runtime hooks cannot silently unretire a
-worker; explicit Resume is required. See [retirement](agent-retirement.md).
+worker. Explicit Resume or a direct human message to that online retired worker
+makes it available again. See [retirement](agent-retirement.md).
 
 Close task records durable closure on the hub. The browser requests immediate
 cleanup over each saved SSH host, and the host relay also processes closure
