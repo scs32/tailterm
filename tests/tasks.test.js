@@ -86,7 +86,7 @@ test("reconcileTask opens, adopts, closes, and reports unknown hosts", () => {
 });
 
 test("reconcileTask caps the panes it opens", () => {
-  const agents = Array.from({ length: 20 }, (_, i) => agent(i + 1));
+  const agents = Array.from({ length: 50 }, (_, i) => agent(i + 1));
   const r = reconcileTask({ taskId: TASK, agents, tabs: [], servers });
   assert.equal(r.open.length, MAX_TASK_PANES);
 });
@@ -123,4 +123,25 @@ test("applyEvents updates statuses and raises attention labels", () => {
   assert.equal(refresh, true);
   applyEvents(agents, [{ kind: "task_closed" }]);
   assert.ok(agents.every((a) => a.status === "closed"));
+});
+
+test("cached terminal task state preserves a reported blocker across a runtime stop", () => {
+  const agents = [agent(1)];
+  applyEvents(agents, [
+    {
+      kind: "needs_input",
+      agentId: agents[0].id,
+      text: "Denied test command",
+      data: { reason: "permission" },
+    },
+  ]);
+  const result = applyEvents(agents, [
+    { kind: "done", agentId: agents[0].id, data: { runtimeStop: true } },
+  ]);
+  assert.equal(agents[0].status, "needs_input");
+  assert.equal(agents[0].blockedReason, "permission");
+  assert.equal(result.attention.size, 0);
+  applyEvents(agents, [{ kind: "running", agentId: agents[0].id }]);
+  assert.equal(agents[0].status, "running");
+  assert.equal(agents[0].blockedReason, "");
 });

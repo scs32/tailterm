@@ -2,7 +2,7 @@
 // task tab should gain or lose, and summarizing agent status.
 import { normalizeTaskRef } from "./task-ref.js";
 
-export const MAX_TASK_PANES = 12;
+export const MAX_TASK_PANES = 32;
 const shortHost = (value) =>
   String(value || "")
     .trim()
@@ -152,14 +152,34 @@ export function applyEvents(agents, events) {
         break;
       case "started":
       case "running":
-        if (a) a.status = "running";
+        if (a) {
+          a.status = "running";
+          a.blockedReason = "";
+          a.blockedText = "";
+        }
         break;
       case "done":
-        if (a) a.status = "done";
+        if (a?.status === "needs_input" && e.data?.runtimeStop) break;
+        if (a) {
+          a.status = "done";
+          a.blockedReason = "";
+          a.blockedText = "";
+        }
         attention.set(e.agentId, "Command finished");
         break;
       case "needs_input":
-        if (a) a.status = "needs_input";
+        if (a) {
+          a.status = "needs_input";
+          a.blockedReason =
+            e.data?.reason ||
+            [
+              ["Permission blocked", "permission"],
+              ["Login required", "authentication"],
+              ["Tool unavailable", "tool"],
+            ].find(([prefix]) => e.text?.startsWith(prefix))?.[1] ||
+            "";
+          a.blockedText = e.text || "";
+        }
         attention.set(e.agentId, "Needs attention");
         break;
       case "heartbeat":
