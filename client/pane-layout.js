@@ -79,10 +79,99 @@ function taskTree(ids) {
     1 / 3,
   );
 }
+
+const stableLeaves = (tree) =>
+  !tree
+    ? []
+    : tree.agentId
+      ? [{ agentId: tree.agentId }]
+      : tree.tabId
+        ? [{ tabId: tree.tabId }]
+        : [...stableLeaves(tree.a), ...stableLeaves(tree.b)];
+const stableKey = (leaf) =>
+  leaf?.agentId ? `agent:${leaf.agentId}` : `tab:${leaf?.tabId}`;
+const stablePrune = (tree, keep) => {
+  if (!tree) return null;
+  if (tree.agentId || tree.tabId)
+    return keep.has(stableKey(tree)) ? tree : null;
+  const a = stablePrune(tree.a, keep),
+    b = stablePrune(tree.b, keep);
+  return a && b ? { ...tree, a, b } : a || b;
+};
+const stableTaskTree = (agentIds) => {
+  const convert = (tree) =>
+    tree.tab
+      ? { agentId: tree.tab }
+      : { ...tree, a: convert(tree.a), b: convert(tree.b) };
+  return convert(taskTree(agentIds));
+};
+const stableTree = (tree, taskId, taskOf, agentOf) => {
+  if (tree.tab) {
+    const agentId = taskOf(tree.tab) === taskId && agentOf(tree.tab);
+    return agentId ? { agentId } : { tabId: tree.tab };
+  }
+  return {
+    id: tree.id,
+    axis: tree.axis,
+    ratio: tree.ratio,
+    a: stableTree(tree.a, taskId, taskOf, agentOf),
+    b: stableTree(tree.b, taskId, taskOf, agentOf),
+  };
+};
+const appendStable = (tree, leaf) =>
+  tree ? split("x", tree, leaf) : structuredClone(leaf);
+
 export class PaneGroups {
   groups = [];
   tabOrder = [];
   taskOrchestrators = new Map();
+  projectLayouts = new Map();
+  taskMembers = new Map();
+  tabTasks = new Map();
+  tabAgents = new Map();
+  loadProjectLayouts(layouts = []) {
+    this.projectLayouts.clear();
+    for (const layout of layouts)
+      if (layout?.taskId && layout.tree)
+        this.projectLayouts.set(layout.taskId, structuredClone(layout));
+  }
+  projectLayoutSnapshot() {
+    return [...this.projectLayouts.values()].map((layout) =>
+      structuredClone(layout),
+    );
+  }
+  // A successful hub roster is authoritative. An empty roster deliberately
+  // removes the template and prevents stale live panes from recreating it.
+  setTaskMembers(taskId, agentIds) {
+    const members = [...new Set(agentIds.filter(Boolean))].slice(0, 32);
+    this.taskMembers.set(taskId, members);
+    if (!members.length) {
+      this.projectLayouts.delete(taskId);
+      return;
+    }
+    const layout = this.projectLayouts.get(taskId);
+    if (layout) this.#reconcileMembers(layout, members);
+  }
+  rememberActive(tab) {
+    const group = this.group(tab);
+    if (!group?.taskId || this.taskMembers.get(group.taskId)?.length === 0)
+      return;
+    const layout = this.projectLayouts.get(group.taskId);
+    if (!layout) return;
+    const agentId = this.tabAgents.get(tab);
+    if (this.tabTasks.get(tab) === group.taskId && agentId) {
+      layout.activeAgentId = agentId;
+      delete layout.activeTabId;
+    } else {
+      layout.activeTabId = tab;
+      delete layout.activeAgentId;
+    }
+    group.active = tab;
+  }
+  remember(tab) {
+    const group = this.group(tab);
+    if (group?.taskId) this.#capture(group);
+  }
   setTaskOrchestrator(taskId, tabId) {
     if (tabId) this.taskOrchestrators.set(taskId, tabId);
     else this.taskOrchestrators.delete(taskId);
@@ -96,8 +185,17 @@ export class PaneGroups {
   }
   // taskOf(tabId) supplies the task a newly grouped tab belongs to, so a
   // singleton group created for an agent pane inherits its task binding.
-  sync(ids, taskOf = () => undefined) {
+  sync(ids, taskOf = () => undefined, agentOf = () => undefined) {
     this.tabOrder = [...ids];
+    this.tabTasks = new Map(ids.map((id) => [id, taskOf(id)]));
+    this.tabAgents = new Map(ids.map((id) => [id, agentOf(id)]));
+    for (const group of this.groups)
+      if (
+        group.taskId &&
+        !this.projectLayouts.has(group.taskId) &&
+        this.taskMembers.get(group.taskId)?.length > 0
+      )
+        this.#capture(group);
     const valid = new Set(ids);
     this.groups = this.groups.flatMap((g) => {
       const tree = prune(g.tree, valid);
@@ -121,7 +219,7 @@ export class PaneGroups {
       }
   }
   // Split legacy mixed groups and gather each task's panes into one group.
-  isolateTasks(taskOf) {
+  isolateTasks(taskOf, agentOf = (id) => this.tabAgents.get(id)) {
     const result = [],
       tasks = new Map();
     for (const group of this.groups) {
@@ -190,6 +288,7 @@ export class PaneGroups {
       // Stable membership preserves divider IDs/ratios and focused terminals.
       if (!sameShape(group.tree, tree)) group.tree = tree;
     }
+    this.#applyProjectLayouts(taskOf, agentOf);
   }
   taskGroup(taskId) {
     return this.groups.find((g) => g.taskId === taskId);
@@ -238,6 +337,9 @@ export class PaneGroups {
       b: before ? { tab: target } : incoming,
     });
     to.active = source;
+    if (to.taskId) this.#capture(to);
+    if (from.taskId && from !== to && this.groups.includes(from))
+      this.#capture(from);
     return true;
   }
   place(source, target, placement) {
@@ -267,6 +369,7 @@ export class PaneGroups {
       b: before ? { tab: target } : { tab: source },
     });
     from.active = source;
+    if (from.taskId) this.#capture(from);
     return true;
   }
   swap(source, target) {
@@ -288,6 +391,7 @@ export class PaneGroups {
           }
         : { ...tree, a: exchange(tree.a), b: exchange(tree.b) };
     group.tree = exchange(group.tree);
+    if (group.taskId) this.#capture(group);
     return true;
   }
   detach(tab) {
@@ -304,6 +408,7 @@ export class PaneGroups {
       tree: { tab },
       active: tab,
     });
+    if (group.taskId) this.#capture(group);
     return true;
   }
   reorder(source, target, after = false) {
@@ -313,6 +418,132 @@ export class PaneGroups {
     this.groups.splice(this.groups.indexOf(from), 1);
     this.groups.splice(this.groups.indexOf(to) + (after ? 1 : 0), 0, from);
     return true;
+  }
+
+  #capture(group) {
+    if (
+      !group?.taskId ||
+      !group.tree ||
+      this.taskMembers.get(group.taskId)?.length === 0
+    )
+      return;
+    let tree = stableTree(
+      group.tree,
+      group.taskId,
+      (id) => this.tabTasks.get(id),
+      (id) => this.tabAgents.get(id),
+    );
+    const previous = this.projectLayouts.get(group.taskId);
+    if (!previous && !this.taskMembers.has(group.taskId)) return;
+    // Legacy task groups without stable agent bindings continue to use the
+    // existing auto-layout path; tab IDs alone cannot provide resume identity.
+    if (!previous && !stableLeaves(tree).some((leaf) => leaf.agentId)) return;
+    const present = new Set(stableLeaves(tree).map(stableKey));
+    for (const leaf of stableLeaves(previous?.tree))
+      if (!present.has(stableKey(leaf))) tree = appendStable(tree, leaf);
+    const activeAgentId =
+      this.tabTasks.get(group.active) === group.taskId
+        ? this.tabAgents.get(group.active)
+        : undefined;
+    const layout = {
+      taskId: group.taskId,
+      tree,
+      taskLayout: group.taskLayout === "manual" ? "manual" : "auto",
+      ...(activeAgentId
+        ? { activeAgentId }
+        : group.active
+          ? { activeTabId: group.active }
+          : {}),
+    };
+    this.projectLayouts.set(group.taskId, layout);
+    const members = this.taskMembers.get(group.taskId);
+    if (members) this.#reconcileMembers(layout, members);
+  }
+  #reconcileMembers(layout, members) {
+    const memberSet = new Set(members);
+    const guestKeys = stableLeaves(layout.tree)
+      .filter((leaf) => leaf.tabId)
+      .map(stableKey);
+    if (layout.taskLayout === "auto" && !guestKeys.length) {
+      const anchor = this.tabAgents.get(
+        this.taskOrchestrators.get(layout.taskId),
+      );
+      const ordered = [...members];
+      if (ordered.includes(anchor))
+        ordered.unshift(...ordered.splice(ordered.indexOf(anchor), 1));
+      const current = stableLeaves(layout.tree)
+        .filter((leaf) => leaf.agentId)
+        .map((leaf) => leaf.agentId);
+      if (
+        current.length !== ordered.length ||
+        current.some((id, index) => id !== ordered[index])
+      )
+        layout.tree = stableTaskTree(ordered);
+    } else {
+      const keep = new Set([
+        ...guestKeys,
+        ...members.map((id) => `agent:${id}`),
+      ]);
+      layout.tree = stablePrune(layout.tree, keep);
+      const present = new Set(stableLeaves(layout.tree).map(stableKey));
+      for (const agentId of members)
+        if (!present.has(`agent:${agentId}`))
+          layout.tree = appendStable(layout.tree, { agentId });
+    }
+    if (layout.activeAgentId && !memberSet.has(layout.activeAgentId))
+      layout.activeAgentId = members[0];
+  }
+  #applyProjectLayouts(taskOf, agentOf) {
+    for (const group of this.groups) {
+      if (!group.taskId || this.taskMembers.get(group.taskId)?.length === 0)
+        continue;
+      if (
+        !this.projectLayouts.has(group.taskId) &&
+        !this.taskMembers.has(group.taskId)
+      )
+        continue;
+      if (!this.projectLayouts.has(group.taskId)) this.#capture(group);
+      const layout = this.projectLayouts.get(group.taskId);
+      if (!layout) continue;
+      const members = this.taskMembers.get(group.taskId);
+      if (members) this.#reconcileMembers(layout, members);
+      const byKey = new Map();
+      for (const id of leaves(group.tree)) {
+        const agentId = taskOf(id) === group.taskId && agentOf(id);
+        byKey.set(agentId ? `agent:${agentId}` : `tab:${id}`, id);
+      }
+      const keep = new Set(byKey.keys());
+      const projected = stablePrune(layout.tree, keep);
+      const materialize = (tree) => {
+        if (tree.agentId || tree.tabId)
+          return { tab: byKey.get(stableKey(tree)) };
+        return {
+          id: tree.id,
+          axis: tree.axis,
+          ratio: tree.ratio,
+          a: materialize(tree.a),
+          b: materialize(tree.b),
+        };
+      };
+      let tree = projected && materialize(projected);
+      const represented = new Set(stableLeaves(layout.tree).map(stableKey));
+      for (const id of leaves(group.tree)) {
+        const agentId = taskOf(id) === group.taskId && agentOf(id);
+        const key = agentId ? `agent:${agentId}` : `tab:${id}`;
+        if (!represented.has(key))
+          tree = tree ? split("x", tree, { tab: id }) : { tab: id };
+      }
+      if (!tree) continue;
+      group.tree = tree;
+      group.taskLayout = layout.taskLayout;
+      const preferred = layout.activeAgentId
+        ? byKey.get(`agent:${layout.activeAgentId}`)
+        : byKey.get(`tab:${layout.activeTabId}`);
+      const ids = leaves(tree);
+      group.active =
+        preferred || (ids.includes(group.active) ? group.active : ids[0]);
+      group.guests = (group.guests || []).filter((id) => ids.includes(id));
+    }
   }
 }
 

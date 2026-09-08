@@ -89,6 +89,12 @@ Terminal layouts and bound project groups are local to each browser origin.
 After restoring a profile on another origin, use Board → project → Terminals
 or Projects → More → Open terminals to attach the existing agents. A same-origin
 saved project binding is restored even if its previous workspace had zero panes.
+Project layouts also retain their split tree, divider proportions, pane order and
+focused agent in the encrypted local workspace. Templates use project and agent
+IDs, so changed browser pane IDs and out-of-order reconnects preserve the layout.
+Temporary missing/hidden agents retain their positions; a confirmed hub roster
+removes deleted agents, while new agents extend a customized layout. Closing or
+forgetting a project clears its template. This remains local to the browser origin.
 
 ### Projects, Bugs, and Features
 
@@ -96,7 +102,11 @@ Projects is the UI name for the existing task hub; task IDs, routes, CLI command
 and environment variables remain compatible. Bugs and Features are durable,
 project-owned records with status, priority, revision checks, and retry receipts.
 Both tabs can filter by project or show all projects. Closed projects stay readable.
-Their project rail follows Board's layout, with open projects on the left.
+Projects, Teams, Bugs and Features reuse Board's full-height split layout and
+boxed left selectors. Projects and Teams show one selected record's details and
+actions on the right; closed projects remain selectable for history and cleanup.
+Bugs/Features retain All projects and status filters. Narrow screens use Board's
+horizontal selector rail.
 
 Previously visited hub views use an encrypted local read cache and refresh in
 the background, including small incremental Board message reads. The cache is
@@ -269,7 +279,7 @@ hub currently uses one shared trusted-workspace credential.
 | --- | --- |
 | Application bootstrap, static/gateway integration | `client/main.js` |
 | Task synchronization, launch dialogs, host aliases | `client/task-hub.js` |
-| Task/group reconciliation | `client/tasks.js`, `client/pane-groups.js` |
+| Task/group reconciliation and saved layouts | `client/tasks.js`, `client/pane-groups.js`, `client/pane-layout.js`, `client/workspace-state.js` |
 | Projects, messages, teams | `client/tasks-view.js`, `client/board-view.js`, `client/teams-view.js` |
 | Bugs/Features and handler launch plans | `client/work-items-view.js`, `client/work-items.css`, `client/project-handler.js`, `hub/internal/api/work_items.go` |
 | Encrypted cached hub reads | `client/cached-hub-client.js`, `client/hub-read-cache.js`, `client/local-vault.js` |

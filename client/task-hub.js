@@ -16,6 +16,7 @@ import {
   taskRollup,
   applyEvents,
   matchServer,
+  openAgent,
 } from "./tasks.js";
 import {
   agentCleanupCommand,
@@ -135,6 +136,7 @@ export function createTaskHub(host) {
   }
 
   function forgetTask(taskId) {
+    host.paneGroups()?.model.setTaskMembers?.(taskId, []);
     feeds.get(taskId)?.stop();
     feeds.delete(taskId);
     bound.delete(taskId);
@@ -256,6 +258,12 @@ export function createTaskHub(host) {
   }
   async function doReconcile(feed) {
     if (feed.stopped) return;
+    host.paneGroups()?.model.setTaskMembers?.(
+      feed.taskId,
+      feed.task?.status === "closed"
+        ? []
+        : feed.agents.filter(openAgent).map((agent) => agent.id),
+    );
     const syncLayout = () => {
       const groups = host.paneGroups();
       const orchestrator = feed.agents.find(

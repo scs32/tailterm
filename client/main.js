@@ -218,6 +218,7 @@ async function flushWorkspace() {
       serverFilter,
       taskHub?.bound() || [],
       taskHub?.hidden() || [],
+      paneGroups.model.projectLayoutSnapshot(),
     ),
     serialized = JSON.stringify(snapshot);
   if (serialized === savedWorkspace) return;
@@ -229,6 +230,7 @@ async function restoreWorkspace(value) {
   restoring = true;
   if ($("#workspace")) $("#workspace").dataset.restoring = "true";
   try {
+    paneGroups.model.loadProjectLayouts(snapshot?.projectLayouts || []);
     if (snapshot?.tabs.length) {
       notice("Restoring your terminal workspace...");
       for (const item of snapshot.tabs) {
@@ -396,6 +398,7 @@ function mount() {
       : null,
     preferences: () => appearance,
     label: (t) => tabName(t, true),
+    changed: scheduleWorkspaceSave,
   });
   selected = data.servers[0]?.id;
   render();
@@ -1117,6 +1120,7 @@ function activate(id) {
   if (previous)
     previous.activitySnapshot = screenLines(previous.term, previous.tmux);
   active = id;
+  if (!restoring) paneGroups?.model.rememberActive?.(id);
   const t = currentTab();
   if (t) {
     t.activity = "";

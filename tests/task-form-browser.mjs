@@ -253,6 +253,7 @@ try {
       );
       assert.equal(created.allowAgentSpawn, true);
       await page.evaluate(() => qa.modes.set("tasks"));
+      await page.locator(`[data-task-select="${created.id}"]`).click();
       const card = page.locator(`[data-task-card="${created.id}"]`);
       await card.waitFor();
       const cardRect = async () =>
@@ -619,6 +620,7 @@ try {
       await page.locator("#dialog-close").click();
       await page.setViewportSize({ width: 1200, height: 800 });
       await page.evaluate(() => qa.modes.set("tasks"));
+      await page.locator(`[data-task-select="${teamTask.id}"]`).click();
       await page.locator(`[data-task-more="${teamTask.id}"]`).click();
       // Seed only this temporary database, bypassing write-rate limits for a
       // long-history fixture. Production task/message data is never touched.

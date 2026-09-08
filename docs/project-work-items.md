@@ -5,9 +5,12 @@ Projects is the user-facing name for the existing task hub. Existing `tsk_` IDs,
 routes remain compatible. The Bugs and Features tabs store records in the hub,
 independently of whether agents are online. Files remains hidden.
 
-Both tabs use the Board's project rail: open projects on the left, All projects,
-and a secondary closed-project list. On narrow screens the rail scrolls across
-the top and a labelled project selector remains available.
+Projects, Teams, Bugs and Features use Board's full-height divider, boxed left
+selectors and compact controls. Projects and Teams show the selected project or
+template on the right, with their existing actions. Bugs/Features list open
+projects on the left, All projects and a secondary closed-project list. On narrow
+screens the rail scrolls across the top and a labelled project filter remains
+available. The rail's + button creates a record for that view.
 
 ## Slow and offline connections
 
@@ -90,7 +93,9 @@ The hub owns work-item records, revisions, dispatch receipts and board messages.
 The browser owns forms and local launch selections; the handler's conversation is
 not the database. Project identity, task-owned pane groups, guest boundaries,
 exact runtime threads, retirement and cleanup receipts retain their existing
-meaning. Work-item storage is an additive migration; it does not change encrypted
+meaning. Exact terminal arrangements are encrypted local workspace data keyed by
+project/agent identity, independent of transient pane IDs; they do not change or
+resume native agent processes. Work-item storage is an additive migration; it does not change encrypted
 profile contents or create a new multi-user authorization model.
 
 See `tests/project-work-items-browser.mjs` for isolated browser acceptance and

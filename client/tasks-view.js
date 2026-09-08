@@ -34,7 +34,9 @@ export function createTasksView({
     reloadAgain = false,
     hasData = false,
     visible = false,
-    generation = 0;
+    generation = 0,
+    selected = "",
+    hiddenTaskIds = new Set();
   let clock = null;
   function mount(container) {
     root = container;
@@ -65,6 +67,7 @@ export function createTasksView({
   }
   function hide() {
     visible = false;
+    hiddenTaskIds = new Set(details.map((d) => d.task.id));
     generation++;
     loading = false;
     clearInterval(clock);
@@ -90,7 +93,16 @@ export function createTasksView({
         ),
       );
       if (!visible || token !== generation) return;
+      const added = !hasData
+          ? [...next]
+              .reverse()
+              .find(
+                (d) =>
+                  d.task.status === "open" && !hiddenTaskIds.has(d.task.id),
+              )
+          : null;
       details = next;
+      if (added) selected = added.task.id;
       hasData = true;
     } catch (error) {
       if (!visible || token !== generation) return;
@@ -145,16 +157,21 @@ export function createTasksView({
     if (!visible) return;
     if (!root) return;
     const open = details.filter((d) => d.task.status === "open");
-    const needs = open.flatMap((d) =>
-      d.agents
-        .filter((a) => a.status === "needs_input")
-        .map((a) => ({ task: d.task, agent: a })),
-    );
     const closed = details.filter((d) => d.task.status !== "open");
-    const card = ({ task, agents }) => {
-      const tab = boundTab(task.id);
+    let current = details.find((d) => d.task.id === selected);
+    if (!current) current = open[0] || closed[0] || null;
+    selected = current?.task.id || "";
+    const projectButton = ({ task, agents }) =>
+      `<button type="button" data-board-task="${esc(task.id)}" data-task-select="${esc(task.id)}" aria-pressed="${task.id === selected}" title="${esc(task.name)}"><span class="board-task-name">${esc(task.name)}</span><span class="fine">${esc(taskRollup(agents))}</span></button>`;
+    const detail = (entry) => {
+      if (!entry)
+        return `<div class="board-head"><div class="view-heading"><div><span class="eyebrow">PROJECTS</span><h2>Projects</h2></div></div><p class="fine">No projects yet.</p></div>`;
+      const { task, agents } = entry;
+      if (task.status !== "open")
+        return `<div class="board-head"><div class="view-heading"><div><span class="eyebrow">PROJECT</span><h2>${esc(task.name)}</h2></div><div class="view-actions"><span class="fine hub-sync-status" role="status">${esc(client()?.cacheStatus?.().label || "")}</span><button data-task-board="${esc(task.id)}">View history</button>${task.cleanupPending ? `<button data-task-cleanup="${esc(task.id)}">Retry cleanup</button>` : ""}</div></div><p class="fine">Closed · ${task.cleanupPending ? `${task.cleanupPending} session${task.cleanupPending === 1 ? "" : "s"} pending cleanup` : "Sessions closed"}</p></div><article class="task-card task-detail-card" data-task-card="${esc(task.id)}"><header><h3>${esc(task.name)}</h3></header>${task.goal ? `<p class="task-goal">${esc(task.goal)}</p>` : ""}</article>`;
+      const needs = agents.filter((a) => a.status === "needs_input");
       const handler = agents.find((a) => a.role === "database_handler");
-      return `<article class="task-card" data-task-card="${esc(task.id)}"><header><h3>${esc(task.name)}</h3><span class="fine">${esc(taskRollup(agents))}</span></header>${task.goal ? `<p class="task-goal">${esc(task.goal)}</p>` : ""}<div class="task-agents">${agents
+      return `<div class="board-head"><div class="view-heading"><div><span class="eyebrow">PROJECT</span><h2>${esc(task.name)}</h2></div><div class="view-actions"><span class="fine hub-sync-status" role="status">${esc(client()?.cacheStatus?.().label || "")}</span></div></div><p class="fine">${esc(task.goal || taskRollup(agents))}</p></div>${needs.length ? `<section class="needs-you"><div class="view-heading"><h3>Needs you</h3><span class="count-badge">${needs.length}</span></div>${needs.map((agent) => `<button class="attention-row" data-task-agent="${esc(agent.id)}"><strong>${esc(agent.name)}</strong><span>${esc(agent.host)}</span><span>Open →</span></button>`).join("")}</section>` : ""}<article class="task-card task-detail-card" data-task-card="${esc(task.id)}"><header><h3>Agents · ${esc(task.name)}</h3><span class="fine">${esc(taskRollup(agents))}</span></header><div class="task-agents">${agents
         .filter((a) => a.status !== "closed")
         .map(
           (a) =>
@@ -164,25 +181,14 @@ export function createTasksView({
           "",
         )}</div><footer class="task-actions"><span class="fine">${task.allowAgentSpawn ? "Helpers allowed" : "Helpers off"}</span><button data-task-board="${esc(task.id)}">Open board →</button><button data-task-add="${esc(task.id)}">＋ Add agent</button>${!handler || handler.status === "exited" || (!handler.online && !["retired", "closed"].includes(handler.status)) ? `<button data-handler-setup="${esc(task.id)}">${handler ? (handler.status === "exited" ? "Restart" : "Check") : "Set up"} database handler</button>` : ""}${openWorkItems ? `<button data-project-bugs="${esc(task.id)}">Bugs</button><button data-project-features="${esc(task.id)}">Features</button>` : ""}<div class="task-more"><button type="button" data-task-more="${esc(task.id)}" aria-expanded="false" aria-controls="task-menu-${esc(task.id)}">More</button><div id="task-menu-${esc(task.id)}" class="task-menu" popover="auto" aria-label="More project actions"><button data-task-attach="${esc(task.id)}">Open terminals</button><button data-task-settings="${esc(task.id)}">Settings</button><button data-task-close="${esc(task.id)}" class="danger">Close project</button></div></div></footer></article>`;
     };
-    root.innerHTML = `<div class="tasks-view"><div class="tasks-head"><div><h2>Projects <span class="count-badge">${open.length}</span></h2><span class="fine hub-sync-status" role="status">${esc(client()?.cacheStatus?.().label || "")}</span></div><button id="tasks-new" class="primary">＋ New project</button></div>${needs.length ? `<section class="needs-you"><div class="view-heading"><h3>Needs you</h3><span class="count-badge">${needs.length}</span></div>${needs.map(({ task, agent }) => `<button class="attention-row" data-task-agent="${esc(agent.id)}"><strong>${esc(agent.name)}</strong><span>${esc(task.name)} · ${esc(agent.host)}</span><span>Open →</span></button>`).join("")}</section>` : ""}${
-      open.length
-        ? `<div class="task-grid">${open.map(card).join("")}</div>`
-        : ""
-    }${
-      closed.length
-        ? `<details class="dialog-details tasks-closed"><summary>${closed.length} closed project${closed.length === 1 ? "" : "s"}</summary>${closed
-            .map(
-              (d) =>
-                `<div class="task-closed"><span>${esc(d.task.name)}</span><span class="fine" title="${esc(
-                  d.agents
-                    .filter((a) => a.cleanupError)
-                    .map((a) => `${a.name}: ${a.cleanupError}`)
-                    .join("; "),
-                )}">${d.task.cleanupPending ? `${d.task.cleanupPending} session${d.task.cleanupPending === 1 ? "" : "s"} pending` : "Sessions closed"}</span><button data-task-board="${esc(d.task.id)}">View history</button>${d.task.cleanupPending ? `<button data-task-cleanup="${esc(d.task.id)}">Retry cleanup</button>` : ""}</div>`,
-            )
-            .join("")}</details>`
-        : ""
-    }</div>`;
+    root.innerHTML = `<div class="board mode-board tasks-view"><aside class="board-rail"><div class="board-rail-head"><span class="eyebrow">PROJECTS</span><button id="tasks-new" title="New project" aria-label="New project">＋</button></div>${open.map(projectButton).join("")}${closed.length ? `<details class="board-closed tasks-closed" ${current?.task.status !== "open" ? "open" : ""}><summary>Closed · ${closed.length}</summary>${closed.map(projectButton).join("")}</details>` : ""}</aside><section class="board-thread tasks-detail">${detail(current)}</section></div>`;
+    root.querySelectorAll("[data-task-select]").forEach(
+      (button) =>
+        (button.onclick = () => {
+          selected = button.dataset.taskSelect;
+          render();
+        }),
+    );
     root.querySelectorAll("[data-task-more]").forEach((button) => {
       const menu = root.querySelector(`#task-menu-${button.dataset.taskMore}`);
       menu.addEventListener("toggle", () =>

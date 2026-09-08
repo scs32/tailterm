@@ -1,6 +1,8 @@
 import { leaves } from "./pane-layout.js";
 import { normalizeTabDecoration } from "./tab-decoration.js";
-import { normalizeTaskRef, normalizeTaskId } from "./task-ref.js";
+import { AGENT_ID_RE, normalizeTaskRef, normalizeTaskId } from "./task-ref.js";
+const MAX_PROJECT_LAYOUTS = 30;
+const MAX_PROJECT_MEMBERS = 32;
 export const normalizeSessionFontSize = (value) =>
   Number.isInteger(value) && value >= 10 && value <= 32 ? value : undefined;
 export const endpointKey = (server) =>
@@ -13,6 +15,114 @@ export const endpointKey = (server) =>
 export const sameTarget = (a, b) =>
   !!a && !!b && a.id === b.id && String(a.created) === String(b.created);
 
+function projectLayoutsFromGroups(tabs, groups) {
+  const byId = new Map(tabs.map((tab) => [tab.id, tab]));
+  const convert = (tree, taskId) => {
+    if (tree.tab) {
+      const tab = byId.get(tree.tab),
+        agentId = tab?.task?.taskId === taskId && tab.task.agentId;
+      return agentId ? { agentId } : { tabId: tree.tab };
+    }
+    return {
+      id: tree.id,
+      axis: tree.axis,
+      ratio: tree.ratio,
+      a: convert(tree.a, taskId),
+      b: convert(tree.b, taskId),
+    };
+  };
+  return groups
+    .filter((group) => normalizeTaskId(group.taskId) && group.tree)
+    .map((group) => {
+      const active = byId.get(group.active),
+        activeAgentId =
+          active?.task?.taskId === group.taskId
+            ? active.task.agentId
+            : undefined;
+      return {
+        taskId: group.taskId,
+        tree: convert(group.tree, group.taskId),
+        taskLayout: group.taskLayout === "manual" ? "manual" : "auto",
+        ...(activeAgentId
+          ? { activeAgentId }
+          : group.active
+            ? { activeTabId: group.active }
+            : {}),
+      };
+    });
+}
+
+export function normalizeProjectLayouts(value) {
+  if (!Array.isArray(value)) return [];
+  const tasks = new Set();
+  return value
+    .slice(0, MAX_PROJECT_LAYOUTS)
+    .map((layout) => {
+      const taskId = normalizeTaskId(layout?.taskId);
+      if (!taskId || tasks.has(taskId)) return null;
+      const used = new Set();
+      let members = 0;
+      const tree = (node, depth = 0) => {
+        if (!node || depth > 30 || members >= MAX_PROJECT_MEMBERS) return null;
+        if (AGENT_ID_RE.test(node.agentId || "")) {
+          const key = `agent:${node.agentId}`;
+          if (used.has(key)) return null;
+          used.add(key);
+          members++;
+          return { agentId: node.agentId };
+        }
+        if (
+          typeof node.tabId === "string" &&
+          node.tabId.length > 0 &&
+          node.tabId.length <= 64
+        ) {
+          const key = `tab:${node.tabId}`;
+          if (used.has(key)) return null;
+          used.add(key);
+          members++;
+          return { tabId: node.tabId };
+        }
+        const ratio = node.ratio === undefined ? 0.5 : node.ratio;
+        if (!Number.isFinite(ratio) || ratio <= 0 || ratio >= 1) return null;
+        const a = tree(node.a, depth + 1),
+          b = tree(node.b, depth + 1);
+        if (!a || !b) return null;
+        return {
+          id:
+            typeof node.id === "string" && node.id.length <= 64
+              ? node.id
+              : crypto.randomUUID(),
+          axis: node.axis === "y" ? "y" : "x",
+          ratio,
+          a,
+          b,
+        };
+      };
+      const normalizedTree = tree(layout.tree);
+      if (!normalizedTree) return null;
+      tasks.add(taskId);
+      const activeAgentId = AGENT_ID_RE.test(layout.activeAgentId || "")
+          ? layout.activeAgentId
+          : undefined,
+        activeTabId =
+          typeof layout.activeTabId === "string" &&
+          layout.activeTabId.length <= 64
+            ? layout.activeTabId
+            : undefined;
+      return {
+        taskId,
+        tree: normalizedTree,
+        taskLayout: layout.taskLayout === "manual" ? "manual" : "auto",
+        ...(activeAgentId && used.has(`agent:${activeAgentId}`)
+          ? { activeAgentId }
+          : activeTabId && used.has(`tab:${activeTabId}`)
+            ? { activeTabId }
+            : {}),
+      };
+    })
+    .filter(Boolean);
+}
+
 export function workspaceSnapshot(
   tabs,
   groups,
@@ -20,6 +130,7 @@ export function workspaceSnapshot(
   serverFilter = null,
   tasks = [],
   hiddenAgents = [],
+  projectLayouts,
 ) {
   return {
     hiddenAgents: hiddenAgents
@@ -44,6 +155,9 @@ export function workspaceSnapshot(
       })),
     serverFilter: serverFilter === null ? null : [...serverFilter],
     groups: structuredClone(groups),
+    projectLayouts: normalizeProjectLayouts(
+      projectLayouts || projectLayoutsFromGroups(tabs, groups),
+    ),
     active,
   };
 }
@@ -85,15 +199,15 @@ export function normalizeWorkspace(value) {
       used.add(node.tab);
       return { tab: node.tab };
     }
+    const ratio = node.ratio === undefined ? 0.5 : node.ratio;
+    if (!Number.isFinite(ratio) || ratio <= 0 || ratio >= 1) return null;
     const a = tree(node.a, depth + 1),
       b = tree(node.b, depth + 1);
     if (!a || !b) return a || b;
     return {
       id: typeof node.id === "string" ? node.id : crypto.randomUUID(),
       axis: node.axis === "y" ? "y" : "x",
-      ratio: Number.isFinite(node.ratio)
-        ? Math.max(0.1, Math.min(0.9, node.ratio))
-        : 0.5,
+      ratio,
       a,
       b,
     };
@@ -135,6 +249,9 @@ export function normalizeWorkspace(value) {
         ].slice(0, 200)
       : null,
     groups,
+    projectLayouts: normalizeProjectLayouts(
+      value.projectLayouts || projectLayoutsFromGroups(tabs, groups),
+    ),
     tasks: [
       ...new Set(
         (Array.isArray(value.tasks) ? value.tasks : [])

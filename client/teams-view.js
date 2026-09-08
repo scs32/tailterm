@@ -13,7 +13,8 @@ const esc = (s) =>
   );
 export function createTeamsView(host) {
   let root,
-    visible = false;
+    visible = false,
+    selectedTeam = "";
   const blank = () => ({
     name: "agent1",
     role: "",
@@ -168,6 +169,7 @@ export function createTeamsView(host) {
         button.disabled = true;
         await host.api("/teams", "POST", team);
         await host.reloadData();
+        selectedTeam = team.id;
         host.closeDialog();
         render();
         host.notice("Saved team " + team.name + ".");
@@ -211,25 +213,40 @@ export function createTeamsView(host) {
   function render() {
     if (!root || !visible) return;
     const teams = host.getData().teams || [];
-    root.innerHTML = `<div class="teams-view"><div class="tasks-head"><div><h2>Teams <span class="count-badge">${teams.length}</span></h2></div><div class="view-actions"><button id="teams-examples">Examples</button><button id="teams-new" class="primary">＋ New team</button></div></div><div class="team-list">${teams.map((t) => `<article class="team-row" data-team="${esc(t.id)}"><div><h3>${esc(t.name)}${t.swarm ? ' <span class="fine">Swarm</span>' : ""}</h3><p class="fine">${t.members.map((m) => esc(m.role || m.name) + " · " + esc(m.runtime) + (m.model ? " / " + esc(m.model) : "")).join(" &nbsp; · &nbsp; ")}</p></div><div class="view-actions"><button data-new-task="${esc(t.id)}">New project</button><button data-add-team="${esc(t.id)}">Add to project</button><button data-edit-team="${esc(t.id)}">Edit</button><button data-delete-team="${esc(t.id)}" aria-label="Delete ${esc(t.name)}">×</button></div></article>`).join("")}</div></div>`;
+    let selected = teams.find((team) => team.id === selectedTeam);
+    if (!selected) selected = teams[0] || null;
+    selectedTeam = selected?.id || "";
+    const teamButton = (team) =>
+      `<button type="button" data-board-task="${esc(team.id)}" data-team-select="${esc(team.id)}" aria-pressed="${team.id === selectedTeam}" title="${esc(team.name)}"><span class="board-task-name">${esc(team.name)}</span><span class="fine">${team.members.length} agent${team.members.length === 1 ? "" : "s"}${team.swarm ? " · Swarm" : ""}</span></button>`;
+    const detail = selected
+      ? `<div class="board-head"><div class="view-heading"><div><span class="eyebrow">TEAM</span><h2>${esc(selected.name)}</h2></div><div class="view-actions"><button id="teams-examples">Examples</button><button data-new-task="${esc(selected.id)}">New project</button><button data-add-team="${esc(selected.id)}">Add to project</button><button data-edit-team="${esc(selected.id)}">Edit</button><button data-delete-team="${esc(selected.id)}" aria-label="Delete ${esc(selected.name)}">Delete</button></div></div><p class="fine">${selected.members.length} agent${selected.members.length === 1 ? "" : "s"}${selected.swarm ? " · Swarm enabled" : ""} · Main orchestrator: ${esc(selected.orchestrator)}</p></div><div class="team-list"><article class="team-row" data-team="${esc(selected.id)}"><div><h3>Agents · ${esc(selected.name)}</h3><p class="fine">${selected.members.map((m) => esc(m.role || m.name) + " · " + esc(m.runtime) + (m.model ? " / " + esc(m.model) : "")).join(" &nbsp; · &nbsp; ")}</p></div></article></div>`
+      : `<div class="board-head"><div class="view-heading"><div><span class="eyebrow">TEAMS</span><h2>No saved teams.</h2></div><button id="teams-examples">Examples</button></div><p class="fine">Save a reusable group of agents, roles and launch settings.</p></div>`;
+    root.innerHTML = `<div class="board mode-board teams-view"><aside class="board-rail"><div class="board-rail-head"><span class="eyebrow">TEAMS</span><button id="teams-new" title="New team" aria-label="New team">＋</button></div>${teams.map(teamButton).join("")}</aside><section class="board-thread teams-detail">${detail}</section></div>`;
     root.querySelector("#teams-new").onclick = () => edit();
     root.querySelector("#teams-examples").onclick = examples;
-    for (const t of teams) {
-      const row = root.querySelector(`[data-team="${t.id}"]`);
-      row.querySelector("[data-edit-team]").onclick = () => edit(t);
-      row.querySelector("[data-new-task]").onclick = () => host.newTask(t);
-      row.querySelector("[data-add-team]").onclick = () => host.addTeam(t);
-      row.querySelector("[data-delete-team]").onclick = async () => {
+    root.querySelectorAll("[data-team-select]").forEach(
+      (button) =>
+        (button.onclick = () => {
+          selectedTeam = button.dataset.teamSelect;
+          render();
+        }),
+    );
+    if (selected) {
+      root.querySelector("[data-edit-team]").onclick = () => edit(selected);
+      root.querySelector("[data-new-task]").onclick = () => host.newTask(selected);
+      root.querySelector("[data-add-team]").onclick = () => host.addTeam(selected);
+      root.querySelector("[data-delete-team]").onclick = async () => {
         if (
           !(await host.confirm(
-            "Delete team " + t.name + "?",
+            "Delete team " + selected.name + "?",
             "This removes the saved template. Agents already launched keep running.",
           ))
         )
           return;
         try {
-          await host.api("/teams/" + t.id, "DELETE");
+          await host.api("/teams/" + selected.id, "DELETE");
           await host.reloadData();
+          selectedTeam = "";
           render();
         } catch (e) {
           host.notice(e.message);

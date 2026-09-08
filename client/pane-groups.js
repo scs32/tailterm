@@ -18,6 +18,7 @@ export function setupPaneGroups({
   upload,
   preferences,
   label,
+  changed = () => {},
 }) {
   const model = new PaneGroups();
   const body = document.querySelector("#terminal-body"),
@@ -39,12 +40,15 @@ export function setupPaneGroups({
     signature = "",
     resizing = false;
   const sync = () => {
-    const taskOf = (id) => getTabs().find((t) => t.id === id)?.task?.taskId;
+    const tab = (id) => getTabs().find((t) => t.id === id),
+      taskOf = (id) => tab(id)?.task?.taskId,
+      agentOf = (id) => tab(id)?.task?.agentId;
     model.sync(
       getTabs().map((t) => t.id),
       taskOf,
+      agentOf,
     );
-    model.isolateTasks(taskOf);
+    model.isolateTasks(taskOf, agentOf);
   };
   const members = (id) => {
     const g = model.group(id);
@@ -91,15 +95,23 @@ export function setupPaneGroups({
         whole,
         axis: box.width > box.height ? "x" : "y",
       })
-    )
+    ) {
+      changed();
       activate(source);
+    }
   }
   function place(source, target, placement) {
     sync();
-    if (model.place(source, target, placement)) activate(source);
+    if (model.place(source, target, placement)) {
+      changed();
+      activate(source);
+    }
   }
   function detach(id) {
-    if (model.detach(id)) activate(id);
+    if (model.detach(id)) {
+      changed();
+      activate(id);
+    }
   }
   function position(el, box) {
     Object.assign(el.style, {
@@ -125,13 +137,16 @@ export function setupPaneGroups({
         d.low / d.span,
         Math.min(d.high / d.span, value),
       );
+      model.remember(getActive());
+      changed();
     }
     render();
   }
   function render() {
     const group = current(),
       ids = group ? leaves(group.tree) : [];
-    if (group) model.group(getActive()).active = getActive();
+    if (group && !model.projectLayouts.has(group.taskId))
+      model.group(getActive()).active = getActive();
     const grouped = group && leaves(model.group(getActive()).tree).length > 1;
     body.classList.toggle("has-panes", ids.length > 0);
     chrome.hidden = !ids.length;
@@ -169,7 +184,11 @@ export function setupPaneGroups({
               : "Drag to group\nDrop onto another session tab to group these terminals.";
         const focus = document.createElement("button");
         focus.className = "pane-label";
-        focus.onclick = () => activate(id);
+        focus.onclick = () => {
+          model.rememberActive(id);
+          changed();
+          activate(id);
+        };
         const detachButton = document.createElement("button");
         detachButton.textContent = "↗";
         detachButton.title =
@@ -454,8 +473,15 @@ export function setupPaneGroups({
     "pointerdown",
     (e) => {
       const t = getTabs().find((t) => t.el.contains(e.target));
-      if (t && t.id !== getActive() && !document.querySelector("dialog[open]"))
+      if (
+        t &&
+        t.id !== getActive() &&
+        !document.querySelector("dialog[open]")
+      ) {
+        model.rememberActive(t.id);
+        changed();
         activate(t.id);
+      }
     },
     true,
   );
@@ -472,7 +498,11 @@ export function setupPaneGroups({
       )
         return;
       const t = getTabs().find((t) => !t.el.hidden && t.el.contains(e.target));
-      if (t && t.id !== getActive()) activate(t.id);
+      if (t && t.id !== getActive()) {
+        model.rememberActive(t.id);
+        changed();
+        activate(t.id);
+      }
     },
     { passive: true },
   );
@@ -483,6 +513,7 @@ export function setupPaneGroups({
     render,
     members,
     merge,
+    place,
     detach,
     navigate(direction) {
       const group = current();
@@ -492,6 +523,7 @@ export function setupPaneGroups({
     },
     reorder(source, target, after) {
       model.reorder(source, target, after);
+      changed();
       activate(getActive());
     },
     entries: () =>
