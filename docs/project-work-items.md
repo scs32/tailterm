@@ -61,10 +61,24 @@ command. It occupies one open-agent slot but does not consume the additional
 helper allowance. A new project can therefore launch at most 31 ordinary members
 plus its handler, subject to the hub's per-project active-agent capacity.
 
-Agents send discoveries to the handler's actual roster name. The handler records
-them through the work-item CLI and replies with a durable item ID. Direct writes
-remain available when it is offline. The handler stays available during ordinary
-project work cycles; explicit retirement remains respected. Closing a project
+All agent implementation, investigation, validation and deployment requires a
+durable bug/feature ID and a bounded work order. Intake and board/inbox/roster
+coordination can establish the record first. Agents send all work-item database
+requests, including list/get/create/update/dispatch, to the handler's actual
+roster name. An unavailable or missing handler requires authorized setup/resume
+or an explicit dependency; agents must not bypass it through CLI, API or database
+files. Human UI access remains available. This is an agent instruction and audit
+workflow, not new API authorization enforcement.
+
+The handler preserves source context, source-message sequences, stable retry keys,
+body files and expected revisions. It reads back committed records before returning
+IDs/revisions and work orders with owner, scope, owned files/artifacts, acceptance
+checks and dependencies. Assignments and results cite the item and work-order
+message. Scope changes go through the handler before additional work. The handler
+retains assignment/result links and verification alongside the original owner
+text, and confirms completion only after accepted verification and resolved
+required dependencies. The handler stays available during ordinary project work
+cycles; explicit retirement remains respected. Closing a project
 includes the handler in the existing durable session-cleanup process and keeps
 the saved records.
 

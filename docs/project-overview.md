@@ -119,8 +119,12 @@ orchestrator. It defaults to the owning project; choosing another does not move
 the record or start a team. The receipt confirms message storage, not execution.
 
 Browser-created projects launch a database handler after the orchestrator. The
-handler inherits its resolved launch settings and records agent discoveries in
-the same database; direct UI/CLI writes remain available while it is offline.
+handler inherits its resolved launch settings and owns all agent work-item database
+reads/writes. Agents require a durable bug/feature and a bounded work order before
+implementation, investigation, validation or deployment. Intake/coordination may
+establish that record first. Missing/unavailable handlers are explicit dependencies,
+not permission for direct agent CLI/API access. Human UI access remains available;
+this instruction/audit workflow does not add API authorization enforcement.
 Existing and headless-created projects offer explicit handler setup because the
 hub does not launch remote processes. Encrypted local launch plans and verified
 host receipts make retries safe; ambiguous interrupted launches require inspection.

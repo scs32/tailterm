@@ -5,6 +5,20 @@ The current work is on `tasks-hub`, not `main`.
 
 Persistent owner instructions:
 
+- All implementation, investigation, validation and deployment must originate
+  from a durable bug or feature and a bounded work order. Intake and coordination
+  may establish that record first. Cite its ID and work-order message in handoffs,
+  results and release evidence; route scope changes through the database handler.
+- All agent work-item database reads/writes (including list/get/create/update/
+  dispatch) go through the project's actual database handler roster name. Do not
+  bypass it with CLI/API/database access if unavailable; arrange authorized
+  setup/resume or report the dependency. Human UI access remains available.
+- The database handler verifies committed records, preserves source provenance,
+  revision checks and retry identities, and records assignment/result links and
+  acceptance evidence. Only report item completion after its saved confirmation.
+  Keep the handler available while the project remains open; respect explicit
+  owner retirement. AIV/MCP integration remains deferred.
+
 - Develop/deploy this branch to `https://tailos.tailarr.com` (Cloudflare project
   `tailos`), plus the local preview when appropriate. Do not deploy it to
   `https://tailterm.tailarr.com`. `npm run deploy:static` targets the old site;

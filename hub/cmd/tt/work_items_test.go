@@ -153,3 +153,62 @@ func TestAgentBriefingNamesDatabaseHandlerAndItsIntakeContract(t *testing.T) {
 		t.Fatal(leadBrief)
 	}
 }
+
+// The audit workflow must remain intact for every role and handler lifecycle.
+// In particular, losing a handler must never turn into direct database access.
+func TestAgentWorkAuditAcrossRolesAndHandlerAvailability(t *testing.T) {
+	task := api.Task{ID: "tsk_0000000000000001", Name: "Project", Goal: "Ship", Status: api.TaskOpen, Orchestrator: "lead", AllowAgentSpawn: true, MaxNewAgents: 2, Swarm: true}
+	handler := api.Agent{ID: "agt_0000000000000002", Name: "records-custom", Role: api.AgentRoleDatabaseHandler, Status: api.AgentDone}
+	for _, name := range []string{"lead", "worker"} {
+		for _, state := range []string{api.AgentDone, api.AgentRunning, api.AgentRetired, api.AgentExited, api.AgentClosed, "missing"} {
+			t.Run(name+"/"+state, func(t *testing.T) {
+				h := handler
+				h.Status = state
+				agents := []api.Agent{h}
+				if state == "missing" {
+					agents = nil
+				}
+				got := agentTaskBriefing(task, name, "", agents)
+				for _, required := range []string{"durable bug or feature", "recorded bounded work order", "Intake and board/inbox/roster coordination", "work-item ID and work-order message sequence", "list/get/create/update/dispatch", "Do not use tt work-items, direct API calls, or database files yourself", "even if the handler is unavailable", "human UI access remains available", "at most 2 additional helper identities", "SWARM ENABLED"} {
+					if !strings.Contains(got, required) {
+						t.Fatalf("missing %q in %s", required, got)
+					}
+				}
+				if state == api.AgentClosed || state == api.AgentExited || state == "missing" {
+					if !strings.Contains(got, "No active Database handler") || !strings.Contains(got, "no direct database-access fallback") {
+						t.Fatal(got)
+					}
+				} else {
+					// LastSeenAt is absent: offline/unknown liveness must still name the handler,
+					// while directing the caller to its current roster rather than assuming it works.
+					for _, required := range []string{"Database handler is records-custom", "retired/offline/unavailable", "Respect explicit owner retirement"} {
+						if !strings.Contains(got, required) {
+							t.Fatalf("missing %q", required)
+						}
+					}
+				}
+				for _, forbidden := range []string{"use tt work-items directly", "Use tt work-items directly", "Then do independent inspection within your role"} {
+					if strings.Contains(got, forbidden) {
+						t.Fatalf("unsafe fallback: %q", forbidden)
+					}
+				}
+				if name == "lead" {
+					for _, required := range []string{"delivery ledger", "readUpTo", "active database_handler is the exception"} {
+						if !strings.Contains(got, required) {
+							t.Fatalf("lost lead safeguard %q", required)
+						}
+					}
+				}
+			})
+		}
+	}
+	got := agentTaskBriefing(task, handler.Name, handler.Role, []api.Agent{handler})
+	for _, required := range []string{"sole agent owner", "list/get/create/update/dispatch", "--source-seq", "--request-id", "--body-file", "--revision", "Read back the committed record", "assignment/result message links", "preserve owner text", "scope changes", "required dependencies are resolved", "Stay done and available", "respect explicit owner retirement"} {
+		if !strings.Contains(got, required) {
+			t.Fatalf("handler missing %q", required)
+		}
+	}
+	if strings.Contains(got, "Do not use tt work-items") {
+		t.Fatal("handler must retain its work-item tools")
+	}
+}

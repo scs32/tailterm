@@ -30,9 +30,13 @@ assets match on TailOS and Mini; production Chromium started the real WASM and
 restored an isolated synthetic vault key. No hub or host CLI changes were needed.
 
 All implementation and QA results were accepted and workers retired; the lead
-remains available. Per the owner's latest instruction, take further work only
-from an owner message or a logged database bug. The proposed discipline feature
-still awaits owner details; do not invent its behavior or resume unrelated work.
+remains available. The subsequent discipline feature is
+`wi_207f20d6eefcfa09`, work order #399: all agent work must have a durable bug or
+feature and a bounded work order, with all work-item database reads/writes routed
+through the actual database handler. Intake/coordination may establish that record
+first. The database handler remains available for the open project and owns
+revision-checked audit/completion updates. See root `AGENTS.md` and
+[the workflow](project-work-items.md#database-handler). AIV/MCP remains deferred.
 
 ## September 8 cache release (previous)
 
