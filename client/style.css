@@ -5036,11 +5036,21 @@ dialog .agent-save-setup button {
 }
 #team-members {
   display: flex;
-  flex-wrap: wrap;
+  flex-wrap: nowrap;
   gap: 4px;
   flex: 1;
+  min-width: 0;
+  overflow-x: auto;
+}
+#team-add-member {
+  flex-shrink: 0;
 }
 #team-members button {
+  flex: 0 0 auto;
+  max-width: 160px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
   height: 28px;
   padding: 3px 8px;
   font-size: 11px;

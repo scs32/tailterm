@@ -53,9 +53,17 @@ export function createTeamsView(host) {
       form.querySelector("#team-members").innerHTML = draft.members
         .map(
           (member, i) =>
-            `<button type="button" data-member="${i}" aria-pressed="${selected === i}">${esc(member.name || "Agent " + (i + 1))}</button>`,
+            `<button type="button" data-member="${i}" title="${esc(member.name || "Agent " + (i + 1))}" aria-pressed="${selected === i}">${esc(member.name || "Agent " + (i + 1))}</button>`,
         )
         .join("");
+      const memberStrip = form.querySelector("#team-members");
+      const activeMember = memberStrip.querySelector('[aria-pressed="true"]');
+      const stripRect = memberStrip.getBoundingClientRect();
+      const activeRect = activeMember.getBoundingClientRect();
+      if (activeRect.left < stripRect.left)
+        memberStrip.scrollLeft -= stripRect.left - activeRect.left;
+      else if (activeRect.right > stripRect.right)
+        memberStrip.scrollLeft += activeRect.right - stripRect.right;
       form.querySelector("#team-add-member").disabled =
         draft.members.length >= MAX_TEAM_MEMBERS;
       form.querySelector("#team-remove-member").disabled =
