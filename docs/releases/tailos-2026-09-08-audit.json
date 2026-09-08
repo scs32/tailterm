@@ -1,0 +1,90 @@
+{
+  "origin": "https://tailos.tailarr.com",
+  "deployment": "https://f696ab58.tailos.pages.dev",
+  "commit": "955bf43358c0d600028295f5466275cbae9e4714",
+  "verifiedAssets": 81,
+  "releaseSha256": "e7de612f667b3da811f918b7b89b4daf51d5447bb2882893b0feda90ffd472c9",
+  "verifiedAt": "2026-09-08T22:56:26.429Z",
+  "workItems": [
+    {
+      "id": "wi_207f20d6eefcfa09",
+      "workOrders": [
+        399,
+        408,
+        410
+      ],
+      "scope": "instruction workflow and structured audit specification; policy prompt and CLI rollout"
+    },
+    {
+      "id": "wi_b5ad1646826c44c5",
+      "workOrders": [
+        417
+      ],
+      "scope": "remaining Air frontend rollout containing accepted project layout persistence"
+    }
+  ],
+  "localPreviews": [
+    {
+      "host": "Mini",
+      "origin": "http://127.0.0.1:4318",
+      "commit": "955bf43358c0d600028295f5466275cbae9e4714",
+      "releaseSha256": "e7de612f667b3da811f918b7b89b4daf51d5447bb2882893b0feda90ffd472c9",
+      "verifiedAssets": 81,
+      "mode": "npm run preview:static serving verified dist-static"
+    },
+    {
+      "host": "theAir",
+      "origin": "http://127.0.0.1:4318",
+      "commit": "955bf43358c0d600028295f5466275cbae9e4714",
+      "releaseSha256": "e7de612f667b3da811f918b7b89b4daf51d5447bb2882893b0feda90ffd472c9",
+      "verifiedAssets": 81,
+      "mode": "changed static files in existing container",
+      "containerImage": "tailterm-static:56ded4133c7a",
+      "rollbackImage": "tailterm-static:56ded4133c7a",
+      "previousCommit": "78498da834122f648fac1ee35f6127b50e0fab1d",
+      "artifactDirectory": "/Users/stephenspeicher/.local/share/tailterm/web-releases/955bf43358c0"
+    }
+  ],
+  "airVerifiedAt": "2026-09-08T22:58:22.636760+00:00",
+  "hostCLIs": [
+    {
+      "host": "Mini",
+      "binarySha256": "0b82422547a0d386d6b1c212e28419888d2036437d434bddff8ea87b4f56abb2",
+      "previousBinarySha256": "6103b639e7b1bdd21a7fecb4e7fc2bc7a0f3b75be8c2997a703c321c7d22e3b8",
+      "rollbackBinary": "/Users/stephenspeicher/.local/bin/tt-before-audit-955bf43",
+      "mode": "atomic CLI install; existing relay unchanged"
+    },
+    {
+      "host": "theAir",
+      "binarySha256": "0b82422547a0d386d6b1c212e28419888d2036437d434bddff8ea87b4f56abb2",
+      "previousBinarySha256": "6103b639e7b1bdd21a7fecb4e7fc2bc7a0f3b75be8c2997a703c321c7d22e3b8",
+      "rollbackBinary": "/Users/stephenspeicher/.local/bin/tt-before-audit-955bf43",
+      "mode": "atomic CLI install; existing relay unchanged"
+    }
+  ],
+  "verification": [
+    "101 JavaScript unit tests passed",
+    "go test ./cmd/tt -count=1 passed; go vet ./cmd/tt passed",
+    "Focused role/lifecycle acceptance passed for lead, worker, handler, missing/retired/exited/closed and unknown-liveness handler; no direct work-item database fallback; helper/delivery/retirement safeguards retained",
+    "Both installed host CLIs produced the new work-order policy and exact db-handler routing through tt brief",
+    "Spec local source links and JSON example verified; database handler scope review #414/#417 accepted after consistent-export and staged-work-order clarifications",
+    "Clean static build and 82 manifest entries verified; all 81 served assets match on public TailOS, Mini and Air",
+    "Production Chromium: HTTPS, matching margins, production WASM startup, isolated synthetic vault key restoration passed",
+    "Air: existing stopped frontend container started; 17 changed assets / 1466490 bytes staged and verified before activation; final 81 served hashes verified"
+  ],
+  "review": {
+    "implementationAndTests": "lead; QA assignment #400 remained unread and was explicitly cancelled/transferred in #412; no independent QA pass claimed",
+    "specification": "db-handler read-only scope review #414, fixes accepted #417"
+  },
+  "hub": {
+    "updated": false,
+    "previousReceipt": "tailos-2026-09-08-cache.json"
+  },
+  "limits": [
+    "Instruction/audit workflow is implemented; structured message schema, API enforcement, typed work orders and AIV/MCP adapter remain proposed future work",
+    "Spec proposes temporary intake and a coordination feature; owner decisions are explicitly identified before schema implementation",
+    "Current shared workspace credentials do not provide authenticated per-agent work-item access enforcement",
+    "Air retains static files in the existing container writable layer; recreating the historical image rolls back; restart preserves files",
+    "Existing relays were not restarted because this release changes CLI-generated briefings only; active-thread policy sent in #402"
+  ]
+}

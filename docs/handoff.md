@@ -1,6 +1,44 @@
 # Development handoff — September 8, 2026
 
-## September 8 layout release — current deployment; Air update pending
+## September 8 audit workflow release — current deployment
+
+Application/source commit `955bf43358c0d600028295f5466275cbae9e4714` is deployed to
+`https://tailos.tailarr.com` (`https://f696ab58.tailos.pages.dev`) and **both Mini
+and Air** at their own `http://127.0.0.1:4318`. All 81 served asset hashes match
+on all three origins. Air is now current, resolving the earlier layout deployment
+blocker. Its existing stopped frontend container was started and updated with
+17 changed assets (~1.47 MB); the hub and network settings were unchanged.
+
+Both hosts have matching CLI SHA-256
+`0b82422547a0d386d6b1c212e28419888d2036437d434bddff8ea87b4f56abb2`;
+rollback binaries are `~/.local/bin/tt-before-audit-955bf43`. Installed `tt brief`
+was verified on both. Existing relays remain running on their prior executable;
+no relay restart was required for the generated briefing changes. Current threads
+received the new policy on the board (#402).
+
+Feature `wi_207f20d6eefcfa09` implements the instruction/audit workflow: all agent
+work needs a durable bug/feature and bounded work order, and all agent work-item
+database reads/writes go through the actual database handler. The handler owns
+revision-checked provenance and completion tracking and remains available during
+ordinary project closeout. This is instructional, not authenticated API role
+enforcement. Human UI access remains available.
+
+The [structured audit specification](work-item-audit-spec.md), work orders #408
+and #410, proposes typed message/work-item links, versioned orders, immutable
+corrections, consistent audit exports and an AIV evidence boundary. Intake and
+coordination-message handling are explicit owner decisions before implementation.
+No structured schema or MCP integration was implemented in this release.
+
+[Release receipt](releases/tailos-2026-09-08-audit.json) distinguishes policy/CLI
+work from layout feature `wi_b5ad1646826c44c5` Air rollout order #417. Validation:
+101 JS tests, CLI tests/vet and role/availability cases passed; deployed Chromium
+started production WASM and restored an isolated synthetic vault key. The handler
+accepted the spec scope review after export-snapshot and phased-order clarifications.
+QA's unread assignment was explicitly transferred to lead, who ran the checks;
+no independent implementation QA pass is claimed. Later receipt/handoff commits
+intentionally trail this application deployment.
+
+## September 8 layout release (previous; Air dependency resolved above)
 
 Application commit `b2e85b814ac742a4100298dca6141c936f182d1e` is deployed to
 `https://tailos.tailarr.com` (`https://f9b41492.tailos.pages.dev`) and Mini
@@ -10,7 +48,7 @@ exact splits, proportions, pane order and focused agent across same-origin
 reloads and reconnects using stable agent identities in the encrypted local vault.
 Layouts remain local to a browser origin; they do not sync between devices.
 
-**Air deployment is blocked by SSH connectivity.** Bounded attempts to
+**Historical blocker, resolved by the audit release above:** bounded attempts to
 `theAir` (`100.96.77.33:22`) timed out before transferring or changing any files.
 Its last verified preview remains `78498da834122f648fac1ee35f6127b50e0fab1d`.
 Feature `wi_b5ad1646826c44c5` remains in progress solely for this required preview
