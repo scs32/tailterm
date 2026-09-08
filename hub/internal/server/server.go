@@ -42,6 +42,7 @@ func New(st *store.Store, identity Identity) *Server {
 	m.HandleFunc("GET /v1/tasks/{id}/agents/{aid}", s.getAgent)
 	m.HandleFunc("PATCH /v1/tasks/{id}/agents/{aid}", s.updateAgent)
 	m.HandleFunc("DELETE /v1/tasks/{id}/agents/{aid}", s.closeAgent)
+	m.HandleFunc("POST /v1/tasks/{id}/agents/{aid}/cleanup", s.agentCleanup)
 	m.HandleFunc("POST /v1/tasks/{id}/messages", s.postMessage)
 	m.HandleFunc("GET /v1/tasks/{id}/messages", s.listMessages)
 	m.HandleFunc("POST /v1/tasks/{id}/messages/read", s.markRead)
@@ -552,3 +553,24 @@ func StaticIdentity(c api.Caller) Identity {
 
 // Shutdown is a placeholder for symmetry with net/http servers.
 func (s *Server) Shutdown(context.Context) error { return nil }
+
+func (s *Server) agentCleanup(w http.ResponseWriter, r *http.Request) {
+	by, ok := s.writer(w, r)
+	if !ok {
+		return
+	}
+	a, ok := s.agentInTask(w, r)
+	if !ok {
+		return
+	}
+	var req api.CleanupRequest
+	if !decode(w, r, &req) {
+		return
+	}
+	a, err := s.store.ReportCleanup(r.Context(), a.ID, req, by)
+	if err != nil {
+		fail(w, err)
+		return
+	}
+	writeJSON(w, 200, a)
+}

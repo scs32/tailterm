@@ -141,6 +141,7 @@ var postableKinds = map[string]bool{
 func PostableKind(kind string) bool { return postableKinds[kind] }
 
 type Task struct {
+	CleanupPending  int        `json:"cleanupPending"`
 	Orchestrator    string     `json:"orchestrator"`
 	Swarm           bool       `json:"swarm"`
 	MaxNewAgents    int        `json:"maxNewAgents"`
@@ -155,6 +156,8 @@ type Task struct {
 }
 
 type Agent struct {
+	CleanupDone   bool      `json:"cleanupDone"`
+	CleanupError  string    `json:"cleanupError,omitempty"`
 	BlockedReason string    `json:"blockedReason,omitempty"`
 	BlockedText   string    `json:"blockedText,omitempty"`
 	RunID         string    `json:"runId"`
@@ -296,3 +299,8 @@ var (
 	ErrLimit              = errors.New("limit reached")
 	ErrClosed             = errors.New("closed")
 )
+
+type CleanupRequest struct {
+	RunID string `json:"runId"`
+	Error string `json:"error"`
+}

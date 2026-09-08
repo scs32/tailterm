@@ -172,3 +172,8 @@ func (c *Client) Events(ctx context.Context, task string, after int64, wait time
 	var out EventList
 	return out, c.do(ctx, "GET", path+q.Encode(), nil, &out)
 }
+
+func (c *Client) ReportCleanup(ctx context.Context, task, agent string, req CleanupRequest) (Agent, error) {
+	var out Agent
+	return out, c.do(ctx, "POST", "/v1/tasks/"+task+"/agents/"+agent+"/cleanup", req, &out)
+}

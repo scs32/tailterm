@@ -247,6 +247,7 @@ func cmdRelay(args []string) error {
 	}
 	for {
 		if !*status {
+			relayCleanup()
 			inspectStartupPrompts()
 		}
 		paths, _ := filepath.Glob(filepath.Join(dir, "*.binding.json"))

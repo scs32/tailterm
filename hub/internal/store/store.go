@@ -160,7 +160,7 @@ func scanTask(row interface{ Scan(...any) error }) (api.Task, error) {
 	var t api.Task
 	var created string
 	var closed sql.NullString
-	err := row.Scan(&t.ID, &t.Name, &t.Goal, &t.Status, &created, &t.CreatedBy.Node, &t.CreatedBy.User, &closed, &t.AllowAgentSpawn, &t.MaxNewAgents, &t.Swarm, &t.Orchestrator)
+	err := row.Scan(&t.ID, &t.Name, &t.Goal, &t.Status, &created, &t.CreatedBy.Node, &t.CreatedBy.User, &closed, &t.AllowAgentSpawn, &t.MaxNewAgents, &t.Swarm, &t.Orchestrator, &t.CleanupPending)
 	if err != nil {
 		return t, err
 	}
@@ -172,7 +172,7 @@ func scanTask(row interface{ Scan(...any) error }) (api.Task, error) {
 	return t, nil
 }
 
-const taskCols = `id,name,goal,status,created_at,created_node,created_user,closed_at,allow_agent_spawn,max_new_agents,swarm,orchestrator`
+const taskCols = `id,name,goal,status,created_at,created_node,created_user,closed_at,allow_agent_spawn,max_new_agents,swarm,orchestrator,CASE WHEN status='closed' THEN (SELECT count(*) FROM agents WHERE task_id=tasks.id AND cleanup_done=0) ELSE 0 END`
 
 func (s *Store) GetTask(ctx context.Context, id string) (api.Task, error) {
 	t, err := scanTask(s.db.QueryRowContext(ctx, `SELECT `+taskCols+` FROM tasks WHERE id=?`, id))
@@ -267,6 +267,9 @@ func (s *Store) CloseTask(ctx context.Context, id string, by api.Caller) (api.Ta
 	if err != nil {
 		return t, err
 	}
+	if t.Status == api.TaskClosed {
+		return t, nil
+	}
 	agents, err := s.ListAgents(ctx, id)
 	if err != nil {
 		return t, err
@@ -278,6 +281,10 @@ func (s *Store) CloseTask(ctx context.Context, id string, by api.Caller) (api.Ta
 			}
 		}
 	}
+	if _, err := s.db.ExecContext(ctx, `UPDATE agents SET cleanup_done=0,cleanup_error='' WHERE task_id=?`, id); err != nil {
+		return t, err
+	}
+	t.CleanupPending = len(agents)
 	now := s.now()
 	if _, err := s.db.ExecContext(ctx, `UPDATE tasks SET status=?, closed_at=? WHERE id=?`, api.TaskClosed, ts(now), id); err != nil {
 		return t, err
@@ -290,12 +297,12 @@ func (s *Store) CloseTask(ctx context.Context, id string, by api.Caller) (api.Ta
 
 // Agents
 
-const agentCols = `id,task_id,name,host,session,runtime,cwd,parent_agent_id,status,title,created_at,last_event_at,run_id,last_seen_at,blocked_reason,blocked_text`
+const agentCols = `id,task_id,name,host,session,runtime,cwd,parent_agent_id,status,title,created_at,last_event_at,run_id,last_seen_at,blocked_reason,blocked_text,cleanup_done,cleanup_error`
 
 func scanAgent(row interface{ Scan(...any) error }) (api.Agent, error) {
 	var a api.Agent
 	var created, last, seen string
-	err := row.Scan(&a.ID, &a.TaskID, &a.Name, &a.Host, &a.Session, &a.Runtime, &a.Cwd, &a.ParentAgentID, &a.Status, &a.Title, &created, &last, &a.RunID, &seen, &a.BlockedReason, &a.BlockedText)
+	err := row.Scan(&a.ID, &a.TaskID, &a.Name, &a.Host, &a.Session, &a.Runtime, &a.Cwd, &a.ParentAgentID, &a.Status, &a.Title, &created, &last, &a.RunID, &seen, &a.BlockedReason, &a.BlockedText, &a.CleanupDone, &a.CleanupError)
 	a.CreatedAt, a.LastEventAt = parseTS(created), parseTS(last)
 	a.LastSeenAt = parseTS(seen)
 	a.Online = !a.LastSeenAt.IsZero() && time.Since(a.LastSeenAt) < 90*time.Second && a.Status != api.AgentExited && a.Status != api.AgentClosed
@@ -358,7 +365,7 @@ func (s *Store) AddAgent(ctx context.Context, taskID string, req api.AddAgentReq
 			return api.Agent{}, api.ErrLimit
 		}
 		runID := api.NewID("run")
-		_, err = s.db.ExecContext(ctx, `UPDATE agents SET session=?,runtime=?,cwd=?,run_id=?,status='starting',last_seen_at='' WHERE id=?`, req.Session, req.Runtime, req.Cwd, runID, previousID)
+		_, err = s.db.ExecContext(ctx, `UPDATE agents SET session=?,runtime=?,cwd=?,run_id=?,status='starting',last_seen_at='',cleanup_done=0,cleanup_error='' WHERE id=?`, req.Session, req.Runtime, req.Cwd, runID, previousID)
 		if err != nil {
 			return api.Agent{}, err
 		}
@@ -386,8 +393,8 @@ func (s *Store) AddAgent(ctx context.Context, taskID string, req api.AddAgentReq
 	if a.ID == "" {
 		a.ID = api.NewID("agt")
 	}
-	_, err = s.db.ExecContext(ctx, `INSERT INTO agents (`+agentCols+`) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-		a.ID, a.TaskID, a.Name, a.Host, a.Session, a.Runtime, a.Cwd, a.ParentAgentID, a.Status, a.Title, ts(now), ts(now), a.RunID, "", "", "")
+	_, err = s.db.ExecContext(ctx, `INSERT INTO agents (`+agentCols+`) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		a.ID, a.TaskID, a.Name, a.Host, a.Session, a.Runtime, a.Cwd, a.ParentAgentID, a.Status, a.Title, ts(now), ts(now), a.RunID, "", "", "", false, "")
 	if err != nil {
 		return a, err
 	}

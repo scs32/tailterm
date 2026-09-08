@@ -5076,6 +5076,7 @@ dialog .agent-save-setup button {
   cursor: pointer;
 }
 #mode-view .task-closed {
+  flex-wrap: wrap;
   font-size: 11px;
   padding: 7px 0;
   align-items: baseline;

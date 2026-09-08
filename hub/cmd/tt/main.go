@@ -42,6 +42,7 @@ Commands
   retire [AGENT]              disable inbox wake-ups; preserve terminal and results
   resume [AGENT]              re-enable inbox wake-ups for a retired agent
   close [AGENT]                close an agent session on this host (default: self)
+  cleanup --task ID [--json]  stop local sessions belonging to a closed task
   watch                        deprecated; inbox delivery never types into panes
   wrap -- CMD                  run CMD, reporting started/exited to the hub
   tools [--runtime APP] [--cwd DIR] [--json]  inspect host or current Codex thread tools
@@ -132,6 +133,8 @@ func main() {
 		err = cmdSpawn(e, args)
 	case "retire", "resume":
 		err = cmdRetirement(e, cmd, args)
+	case "cleanup":
+		err = cmdCleanup(e, args)
 	case "close":
 		err = cmdClose(e, args)
 	case "watch":
@@ -579,6 +582,10 @@ func cmdSpawn(e env, args []string) error {
 	if err != nil {
 		_, _ = c.CloseAgent(ctx, *task, agent.ID)
 		return err
+	}
+	// The relay also adopts already-running sessions.
+	if _, rememberErr := rememberSessions(ctx, *hub); rememberErr != nil {
+		fmt.Fprintln(os.Stderr, "[tt] Session cleanup registration will retry on the host relay.")
 	}
 	if *asJSON {
 		printJSON(agent)

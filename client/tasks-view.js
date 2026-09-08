@@ -83,7 +83,7 @@ export function createTasksView({
       const tasks = await client().listTasks();
       const next = await Promise.all(
         tasks.map((t) =>
-          t.status === "open"
+          t.status === "open" || t.cleanupPending > 0
             ? client().getTask(t.id)
             : Promise.resolve({ task: t, agents: [] }),
         ),
@@ -133,6 +133,13 @@ export function createTasksView({
       ? label + " · offline"
       : label;
   };
+  function cleanupNotice(result, name) {
+    notice(
+      result.cleanupPending
+        ? `Task ${name} closed · ${result.cleanupPending} session${result.cleanupPending === 1 ? "" : "s"} pending cleanup.${result.cleanupErrors?.length ? " " + result.cleanupErrors[0] : " Hosts will retry automatically."}`
+        : `Task ${name} closed · agent sessions stopped.`,
+    );
+  }
   function render() {
     if (!visible) return;
     if (!root) return;
@@ -164,7 +171,12 @@ export function createTasksView({
         ? `<details class="dialog-details tasks-closed"><summary>${closed.length} closed task${closed.length === 1 ? "" : "s"}</summary>${closed
             .map(
               (d) =>
-                `<div class="task-closed"><span>${esc(d.task.name)}</span><span class="fine">${esc(d.task.closedAt ? new Date(d.task.closedAt).toLocaleString() : "")}</span></div>`,
+                `<div class="task-closed"><span>${esc(d.task.name)}</span><span class="fine" title="${esc(
+                  d.agents
+                    .filter((a) => a.cleanupError)
+                    .map((a) => `${a.name}: ${a.cleanupError}`)
+                    .join("; "),
+                )}">${d.task.cleanupPending ? `${d.task.cleanupPending} session${d.task.cleanupPending === 1 ? "" : "s"} pending` : "Sessions closed"}</span>${d.task.cleanupPending ? `<button data-task-cleanup="${esc(d.task.id)}">Retry cleanup</button>` : ""}</div>`,
             )
             .join("")}</details>`
         : ""
@@ -219,19 +231,34 @@ export function createTasksView({
           if (
             !(await confirm(
               `Close task ${d.task.name}?`,
-              "Every agent on the task is marked closed and its panes leave the tab. Remote tmux sessions keep running until their hosts stop them.",
+              "Stop all of this task’s agent tmux sessions, including retired agents and running work. Task history stays saved. Offline hosts will finish cleanup when their host service reconnects.",
             ))
           )
             return;
           try {
-            await client().closeTask(d.task.id);
-            notice(`Task ${d.task.name} closed.`);
+            b.disabled = true;
+            const result = await taskHub.closeTask(d.task.id);
+            cleanupNotice(result, d.task.name);
             await reload();
           } catch (error) {
             notice("Close failed: " + error.message);
+            b.disabled = false;
           }
         }),
     );
+    root.querySelectorAll("[data-task-cleanup]").forEach((b) => {
+      b.onclick = async () => {
+        b.disabled = true;
+        try {
+          const result = await taskHub.cleanupTask(b.dataset.taskCleanup);
+          cleanupNotice(result, result.name);
+          await reload();
+        } catch (error) {
+          notice("Cleanup pending: " + error.message);
+          b.disabled = false;
+        }
+      };
+    });
     root.querySelectorAll("[data-task-agent]").forEach((b) => {
       b.onclick = () => {
         const tab = getTabs().find(

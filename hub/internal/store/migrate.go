@@ -6,6 +6,8 @@ import "github.com/scs32/tailterm/hub/internal/api"
 // Additive migrations preserve existing task history and encrypted tailnet state.
 func migrate(db *sql.DB) error {
 	for _, c := range []struct{ table, name, definition string }{
+		{"agents", "cleanup_done", "INTEGER NOT NULL DEFAULT 0"},
+		{"agents", "cleanup_error", "TEXT NOT NULL DEFAULT ''"},
 		{"agents", "blocked_reason", "TEXT NOT NULL DEFAULT ''"},
 		{"agents", "blocked_text", "TEXT NOT NULL DEFAULT ''"},
 		{"agents", "run_id", "TEXT NOT NULL DEFAULT ''"},

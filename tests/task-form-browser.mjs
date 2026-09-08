@@ -60,7 +60,7 @@ const host={openSFTP:async server=>({done:new Promise(()=>{}),home:async()=>${JS
 };
 const hub=createTaskHub(host);hub.refresh();
 board=createBoardView({client:()=>hub.client(),getTabs:()=>[],activate(){},notice:host.notice,newTask:()=>hub.newTask(),addAgent:id=>hub.addAgent(id),attachTask(){},configure(){}});
-tasks=createTasksView({client:()=>hub.client(),taskHub:hub,getTabs:()=>[],activate(){},notice:host.notice,openBoard:host.openBoard,configure(){}});
+tasks=createTasksView({confirm:async()=>true,client:()=>hub.client(),taskHub:hub,getTabs:()=>[],activate(){},notice:host.notice,openBoard:host.openBoard,configure(){}});
 teams=createTeamsView({...host,confirm:async()=>true,newTask:t=>hub.newTask(undefined,t),addTeam:t=>hub.addTeam(t)});
 modes=setupModes({header:document.querySelector('header'),main:document.querySelector('main'),onChange:(mode,view)=>{board.hide();tasks.hide();teams.hide();view.replaceChildren();if(mode==='board'){board.mount(view);board.show()}else if(mode==='teams'){teams.mount(view);teams.show()}else if(mode==='tasks'){tasks.mount(view);tasks.show()}}});
 modes.set('tasks');window.qa={hub,board,modes,data};
@@ -108,6 +108,7 @@ const server = createServer(async (req, res) => {
             ...process.env,
             PATH: state + path.delimiter + process.env.PATH,
             TT_TMUX_SOCKET: "tailterm-form-check",
+            TAILTERM_RELAY_STATE: path.join(state, "relay"),
           },
           timeout: 20000,
         },
@@ -576,6 +577,52 @@ try {
         path: ".build/team-editor-mobile-" + name + ".png",
       });
       await page.locator("#dialog-close").click();
+      await page.setViewportSize({ width: 1200, height: 800 });
+      await page.evaluate(() => qa.modes.set("tasks"));
+      await page.locator(`[data-task-more="${teamTask.id}"]`).click();
+      failLaunch = true;
+      await page.locator(`[data-task-close="${teamTask.id}"]`).click();
+      await page.waitForFunction(() =>
+        document
+          .querySelector("#notice")
+          .textContent.includes("pending cleanup"),
+      );
+      await page.locator(".tasks-closed summary").click();
+      await page.locator(`[data-task-cleanup="${teamTask.id}"]`).waitFor();
+      await page.screenshot({
+        path: `.build/task-cleanup-pending-${name}.png`,
+      });
+      await page.locator(`[data-task-cleanup="${teamTask.id}"]`).click();
+      await page.waitForFunction(() =>
+        document
+          .querySelector("#notice")
+          .textContent.includes("agent sessions stopped"),
+      );
+      const closedDetail = await (
+        await fetch(`http://127.0.0.1:${port}/v1/tasks/${teamTask.id}`)
+      ).json();
+      assert.equal(closedDetail.task.status, "closed");
+      assert.equal(closedDetail.task.cleanupPending, 0);
+      assert.ok(
+        closedDetail.agents.every(
+          (a) => a.status === "closed" && a.cleanupDone,
+        ),
+      );
+      for (const agent of closedDetail.agents) {
+        const exists = await exec("tmux", [
+          "-L",
+          "tailterm-form-check",
+          "has-session",
+          "-t",
+          "=" + agent.session,
+        ]).then(
+          () => true,
+          () => false,
+        );
+        assert.equal(exists, false, "closed agent session survived");
+      }
+      await page.locator(".tasks-closed summary").click();
+      await page.screenshot({ path: `.build/task-cleanup-${name}.png` });
       assert.deepEqual(errors, []);
       console.log(
         name +

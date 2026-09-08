@@ -16,6 +16,7 @@ import {
   matchServer,
 } from "./tasks.js";
 import {
+  agentCleanupCommand,
   agentSpawnCommand,
   agentRuntimesCommand,
 } from "../shared/tmux-command.js";
@@ -1190,7 +1191,56 @@ export function createTaskHub(host) {
     return list;
   }
 
+  async function cleanupTask(taskId) {
+    const detail = await client.getTask(taskId);
+    if (detail.task.status !== "closed") throw new Error("Task is still open.");
+    const pending = detail.agents.filter((a) => !a.cleanupDone);
+    if (pending.some((a) => !matchServer(a.host, taskServers())))
+      await resolveAgentHosts();
+    const hosts = new Map(),
+      errors = [];
+    for (const agent of pending) {
+      const server = matchServer(agent.host, taskServers());
+      if (!server) {
+        errors.push(`${agent.host}: saved host unavailable`);
+        continue;
+      }
+      const key = serverKey(server);
+      if (!hosts.has(key)) hosts.set(key, { server, agents: [] });
+      hosts.get(key).agents.push(agent.id);
+    }
+    await Promise.all(
+      [...hosts.values()].map(async ({ server, agents }) => {
+        try {
+          const result = JSON.parse(
+            await host.browserCommand(
+              server,
+              agentCleanupCommand(client.base, taskId, agents),
+              16384,
+            ),
+          );
+          for (const error of result.errors || [])
+            errors.push(`${server.name || server.host}: ${error}`);
+        } catch (error) {
+          errors.push(`${server.name || server.host}: ${error.message}`);
+        }
+      }),
+    );
+    const updated = await client.getTask(taskId);
+    return { ...updated.task, cleanupErrors: errors };
+  }
+  async function closeTask(taskId) {
+    const closed = await client.closeTask(taskId);
+    try {
+      return await cleanupTask(taskId);
+    } catch (error) {
+      return { ...closed, cleanupErrors: [error.message] };
+    }
+  }
+
   return {
+    closeTask,
+    cleanupTask,
     hideAgent(id) {
       hidden.add(id);
       host.scheduleWorkspaceSave();

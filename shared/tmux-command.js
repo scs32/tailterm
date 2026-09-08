@@ -233,3 +233,35 @@ export function agentToolsCommand(runtime, cwd = "") {
     )
   );
 }
+
+// Called on the saved SSH host for these agents; the CLI only stops sessions
+// whose task/run metadata matches and confirms already-absent local sessions.
+export function agentCleanupCommand(hub, task, agents) {
+  if (!/^https?:\/\/[A-Za-z0-9][A-Za-z0-9.:/_-]{0,199}$/.test(hub))
+    throw new Error("Invalid hub URL.");
+  if (
+    !/^tsk_[0-9a-f]{16}$/.test(task) ||
+    !Array.isArray(agents) ||
+    !agents.length ||
+    agents.some((id) => !/^agt_[0-9a-f]{16}$/.test(id))
+  )
+    throw new Error("Invalid cleanup identities.");
+  const args = [
+    "cleanup",
+    "--json",
+    "--hub",
+    hub,
+    "--task",
+    task,
+    "--agents",
+    agents.join(","),
+  ];
+  return (
+    "/bin/sh -c " +
+    shellQuote(
+      ttResolver(
+        "printf 'Update the tt CLI on this host to clean up task sessions.\\n' >&2; exit 127",
+      ) + `exec "$tailterm_tt" ${args.map(shellQuote).join(" ")}`,
+    )
+  );
+}
