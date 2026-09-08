@@ -5,6 +5,30 @@ Projects is the user-facing name for the existing task hub. Existing `tsk_` IDs,
 routes remain compatible. The Bugs and Features tabs store records in the hub,
 independently of whether agents are online. Files remains hidden.
 
+Both tabs use the Board's project rail: open projects on the left, All projects,
+and a secondary closed-project list. On narrow screens the rail scrolls across
+the top and a labelled project selector remains available.
+
+## Slow and offline connections
+
+Board, Projects, Bugs and Features show previously saved reads immediately while
+refreshing from the hub. The saved/offline label describes that local copy.
+The cache is encrypted in this browser's vault, isolated by hub and credential,
+and excluded from profile sync and portable exports. It retains up to 100 reads
+or 4 MiB for at most seven days, evicting older entries. An unvisited view or a
+new browser origin may need a connection before it has anything to show.
+
+Board refreshes normally fetch only messages newer than the saved conversation.
+Terminal reconciliation, launches and cleanup still require authoritative hub
+reads. Changes and dispatches require a confirmed hub response: failures retain
+the form draft and are never queued or replayed automatically. Teams already
+live in the local vault and can be edited while the hub is unavailable.
+
+This is a data cache, not an offline installation of the app: the page and its
+runtime assets must still be available. A browser-origin change also does not
+copy terminal layout. To reattach a project, use Board → project → Terminals,
+or Projects → More → Open terminals; existing agent sessions are reused.
+
 ## Recording and assigning work
 
 Each bug or feature belongs to one project. Both tabs can show all projects or

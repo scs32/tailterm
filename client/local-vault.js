@@ -230,6 +230,32 @@ export async function saveWorkspace(workspace) {
     d.workspace = normalizeWorkspace(workspace);
   });
 }
+export function hubReadCachePersistence() {
+  requireUnlocked();
+  const vaultKey = key;
+  const requireSameVault = () => {
+    requireUnlocked();
+    if (key !== vaultKey)
+      throw new Error(
+        "Hub cache persistence belongs to a different vault unlock.",
+      );
+  };
+  return {
+    load: async () => {
+      await queue;
+      requireSameVault();
+      return structuredClone(contents.hubReadCache || null);
+    },
+    save: async (value) => {
+      const copy = structuredClone(value);
+      await mutate((d) => {
+        requireSameVault();
+        d.hubReadCache = copy;
+        return true;
+      });
+    },
+  };
+}
 export async function markBackupExported(started = new Date().toISOString()) {
   return mutate((d) => {
     d.backupExported = started;

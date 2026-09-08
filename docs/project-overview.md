@@ -85,12 +85,24 @@ bounded `hostname -s` probe. This matters because Mini reports `Stephens-Mini`,
 which differs from some saved Tailscale/DNS names. Do not simplify matching back
 to literal hostname equality.
 
+Terminal layouts and bound project groups are local to each browser origin.
+After restoring a profile on another origin, use Board → project → Terminals
+or Projects → More → Open terminals to attach the existing agents. A same-origin
+saved project binding is restored even if its previous workspace had zero panes.
+
 ### Projects, Bugs, and Features
 
 Projects is the UI name for the existing task hub; task IDs, routes, CLI commands,
 and environment variables remain compatible. Bugs and Features are durable,
 project-owned records with status, priority, revision checks, and retry receipts.
 Both tabs can filter by project or show all projects. Closed projects stay readable.
+Their project rail follows Board's layout, with open projects on the left.
+
+Previously visited hub views use an encrypted local read cache and refresh in
+the background, including small incremental Board message reads. The cache is
+bounded to 100 entries/4 MiB/seven days and isolated by hub credential. Saved data
+remains readable while the hub is offline; hub mutations are never queued.
+Terminal lifecycle operations continue using live authoritative reads.
 
 Send to project saves a directed board message to the selected open project's
 orchestrator. It defaults to the owning project; choosing another does not move
@@ -242,7 +254,7 @@ from the shared task token.
 Synced: saved servers and SSH credentials/keys, bookmarks, hub configuration,
 teams, appearance. Local only: Tailscale identity, current pane/window layout,
 scrollback, clipboard, transient authentication, voice state, and project handler
-recovery plans. Projects, work items, and messages
+recovery plans, and the encrypted hub read cache. Projects, work items, and messages
 already live on the hub. Conflicts pause sync for an explicit local/server choice;
 it does not silently merge divergent vaults. The server retains ten prior encrypted
 profile revisions. See [profile sync](profile-sync.md).
@@ -260,6 +272,7 @@ hub currently uses one shared trusted-workspace credential.
 | Task/group reconciliation | `client/tasks.js`, `client/pane-groups.js` |
 | Projects, messages, teams | `client/tasks-view.js`, `client/board-view.js`, `client/teams-view.js` |
 | Bugs/Features and handler launch plans | `client/work-items-view.js`, `client/work-items.css`, `client/project-handler.js`, `hub/internal/api/work_items.go` |
+| Encrypted cached hub reads | `client/cached-hub-client.js`, `client/hub-read-cache.js`, `client/local-vault.js` |
 | History pagination/export | `client/task-history.js` |
 | Team schema, presets, models, permissions UI | `client/teams.js`, `client/team-examples.js`, `client/model-picker.js`, `client/agent-controls.js` |
 | Remote folder selection | `client/project-folder.js` |

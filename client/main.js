@@ -4,6 +4,7 @@ import { credentialCache } from "./credential-cache.js";
 import { createAttentionSound } from "./attention-sound.js";
 import { createRenderer, webglSupported } from "./renderer.js";
 import { createTaskHub } from "./task-hub.js";
+import { createHubReadCache } from "./hub-read-cache.js";
 import { MODES, setupModes } from "./modes.js";
 import { createBoardView } from "./board-view.js";
 import { createTasksView } from "./tasks-view.js";
@@ -248,7 +249,6 @@ async function restoreWorkspace(value) {
       }
       paneGroups.model.groups = snapshot.groups;
       paneGroups.sync();
-      taskHub?.restore(snapshot.tasks, snapshot.hiddenAgents);
       activate(
         tabs.some((t) => t.id === snapshot.active)
           ? snapshot.active
@@ -258,6 +258,7 @@ async function restoreWorkspace(value) {
         "Workspace restored. Plain SSH tabs open a fresh shell; tmux sessions resume.",
       );
     }
+    if (snapshot) taskHub?.restore(snapshot.tasks, snapshot.hiddenAgents);
   } catch (e) {
     notice("Workspace restoration paused: " + e.message);
   } finally {
@@ -501,6 +502,11 @@ function mount() {
     taskHub = createTaskHub({
       getIPN: () => (netState === "Running" ? ipn : null),
       getData: () => data,
+      createReadCache: () => createHubReadCache(localVault.hubReadCachePersistence()),
+      onClientChange: () => {
+        const view = { board: boardView, tasks: tasksView, bugs: bugsView, features: featuresView }[modes?.get()];
+        if (view) { view.hide(); void view.show(); }
+      },
       reloadData: async () => {
         data = await api("/data");
         render();
@@ -558,8 +564,9 @@ function mount() {
           .catch(() => {}),
     });
   if (staticMode) {
+    taskHub.refresh();
     boardView = createBoardView({
-      client: () => taskHub.client(),
+      client: () => taskHub.viewClient(),
       getTabs: () => tabs,
       activate,
       notice,
@@ -575,7 +582,7 @@ function mount() {
         modes.set(kind);
         (kind === "bugs" ? bugsView : featuresView).show(id);
       },
-      client: () => taskHub.client(),
+      client: () => taskHub.viewClient(),
       taskHub,
       getTabs: () => tabs,
       activate,
@@ -594,7 +601,7 @@ function mount() {
       configure: () => taskHub.configure(),
     });
     const workItemHost = {
-      client: () => taskHub.client(),
+      client: () => taskHub.viewClient(),
       dialog,
       closeDialog,
       notice,
@@ -711,7 +718,7 @@ function mount() {
             updateAppearance();
           }
           render();
-          taskHub?.refresh();
+          taskHub?.refresh({ resetCache: true });
           teamsView?.refresh();
         },
       },
@@ -2265,9 +2272,7 @@ async function startTailscale() {
       notifyState: (s) => {
         netState = s;
         tailscaleLogin.updateState(s);
-        if (s === "Running") {
-          taskHub?.refresh();
-        }
+        taskHub?.refresh();
         profileSync?.connected();
         $("#tail-dot").classList.toggle("online", s === "Running");
         $("#tail-status").textContent =
@@ -2387,7 +2392,7 @@ async function lock() {
   credentialCache.clear();
   reconnects.clear();
   profileSync?.stop();
-  taskHub?.stopAll();
+  taskHub?.dispose();
   boardView?.hide();
   tasksView?.hide();
   bugsView?.hide();
@@ -2612,7 +2617,7 @@ function backupDialog() {
       appearance = readAppearance();
       updateAppearance();
     }
-    taskHub?.refresh();
+    taskHub?.refresh({ resetCache: true });
     remoteSnapshots.clear();
     closeDialog();
     selectServer(data.servers[0]?.id, true);

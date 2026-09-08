@@ -18,6 +18,7 @@ export class HubError extends Error {
 export function createHubClient({ fetchImpl, baseURL, token = "" }) {
   const base = normalizeHubURL(baseURL);
   if (!base) throw new Error("Hub URL must be http(s)://host[:port]");
+  const mutationListeners = new Set();
   async function request(path, { method = "GET", body, timeoutMs } = {}) {
     const init = { method, headers: {}, timeoutMs };
     if (token) init.headers.Authorization = "Bearer " + token;
@@ -40,6 +41,9 @@ export function createHubClient({ fetchImpl, baseURL, token = "" }) {
         res.status,
         data?.error || res.statusText || "hub error",
       );
+    if (method !== "GET") for (const listener of mutationListeners) {
+      try { listener(); } catch { /* A view cannot undo a confirmed write. */ }
+    }
     return data;
   }
   const q = (params) => {
@@ -53,6 +57,10 @@ export function createHubClient({ fetchImpl, baseURL, token = "" }) {
     base,
     token,
     request,
+    onMutation(listener) {
+      mutationListeners.add(listener);
+      return () => mutationListeners.delete(listener);
+    },
     whoami: () => request("/v1/whoami"),
     listTasks: async () => (await request("/v1/tasks")).tasks,
     createTask: (body) => request("/v1/tasks", { method: "POST", body }),

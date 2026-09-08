@@ -39,6 +39,17 @@ session limit, because it keeps the process/session. Actual session termination
 remains a separate explicit action. Exited or closed agents need the appropriate
 launch workflow rather than retirement resume.
 
+For important assignments, the orchestrator records the posted message sequence
+and recipient, then checks `readUpTo`, status and availability at meaningful
+checkpoints and before waiting, retirement or completion. A read cursor proves
+retrieval, not completed work. If a required assignment is still unread after a
+resume-then-retire race, or its recipient is retired, offline or idle, the
+orchestrator makes one explicit recovery decision: resume and reference the
+existing assignment when retirement should be reversed, transfer ownership to
+another worker, or report a concrete blocker. It does not busy-poll,
+duplicate-blast the assignment, override an intentional retirement or owner
+instruction, or retire unfinished work merely for idleness.
+
 Prompt guidance applies to new launches and `tt brief` after the host CLI update;
 it does not rewrite prompts already loaded by running agents. The lifecycle state
 and wake-up suppression apply immediately to existing agents when retired.

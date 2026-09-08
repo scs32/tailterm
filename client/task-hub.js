@@ -8,6 +8,7 @@ import { withDatabaseHandler } from "./project-handler.js";
 // loop that keeps a project tab's panes in step with the hub's agent list, and
 // the project dialogs reachable from the command palette.
 import { createHubClient, normalizeHubURL } from "./hub-client.js";
+import { createCachedHubClient } from "./cached-hub-client.js";
 import { normalizeTaskId, AGENT_NAME_RE } from "./task-ref.js";
 import {
   reconcileTask,
@@ -40,7 +41,7 @@ export function createTaskHub(host) {
   // host: {getIPN, getData, api, getTabs, getServers, currentTab, currentServer,
   //   connect, closeTab, activate, paneGroups, dialog, closeDialog, notice,
   //   browserCommand, render, scheduleWorkspaceSave, bookmark}
-  let client = null;
+  let client = null, viewClient = null, connected = false;
   const feeds = new Map(); // taskId -> {stop, agents, task, unknown, cursor}
   const hidden = new Set();
   const bound = new Set(); // task ids mirrored into tabs
@@ -74,29 +75,46 @@ export function createTaskHub(host) {
     );
   }
 
-  function refresh() {
-    const url = host.getData()?.hub?.url;
+  function refresh({ resetCache = false } = {}) {
+    const url = normalizeHubURL(host.getData()?.hub?.url);
     const ipn = host.getIPN();
-    if (!url || !ipn) {
+    if (!url) {
+      const hadClient = !!client;
+      viewClient?.dispose?.();
+      viewClient = null;
       client = null;
+      connected = false;
       stopAll();
+      if (hadClient) host.onClientChange?.();
       return null;
     }
     if (
       client?.base !== url ||
-      client?.token !== (host.getData()?.hub?.token || "")
+      client?.token !== (host.getData()?.hub?.token || "") || resetCache
     ) {
       stopAll();
+      viewClient?.dispose?.();
       client = createHubClient({
-        fetchImpl: (u, init) => ipn.fetch(u, init),
+        fetchImpl: (u, init) => {
+          const network = host.getIPN();
+          if (!network) throw new Error("Offline. Connect Tailscale to update the project hub.");
+          return network.fetch(u, init);
+        },
         baseURL: url,
         token: host.getData()?.hub?.token || "",
       });
+      viewClient = host.createReadCache
+        ? createCachedHubClient({ client, cache: host.createReadCache(), online: () => !!host.getIPN() })
+        : client;
+      host.onClientChange?.();
     }
-    sync();
+    if (!!ipn !== connected) viewClient?.refreshConnection?.();
+    connected = !!ipn;
+    if (ipn) sync();
+    else stopAll();
     return client;
   }
-  const ready = () => !!client;
+  const ready = () => !!client && !!host.getIPN();
 
   function stopAll() {
     for (const feed of feeds.values()) feed.stop();
@@ -105,7 +123,7 @@ export function createTaskHub(host) {
 
   // Ensure one feed per bound task; drop feeds whose task is no longer bound.
   function sync() {
-    if (!client) return;
+    if (!client || !host.getIPN()) return;
     for (const g of host.paneGroups()?.model.groups || [])
       if (g.taskId) bound.add(g.taskId);
     for (const id of bound) if (!feeds.has(id)) startFeed(id);
@@ -1538,6 +1556,8 @@ export function createTaskHub(host) {
     },
     hidden: () => [...hidden],
     client: () => client,
+    viewClient: () => viewClient,
+    dispose() { stopAll(); viewClient?.dispose?.(); },
     refresh,
     ready,
     sync,

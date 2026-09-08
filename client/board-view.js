@@ -189,7 +189,7 @@ export function createBoardView({
         "",
       )}${closedTasks.length ? `<details class="board-closed" ${archived ? "open" : ""}><summary>Closed projects · ${closedTasks.length}</summary>${closedTasks.map(taskButton).join("")}</details>` : ""}</aside><section class="board-thread">${
       detail
-        ? `<div class="board-head"><div class="view-heading"><div><span class="eyebrow">BOARD</span><h2>${esc(detail.task.name)}</h2></div><div class="view-actions">${archived ? `<span class="fine">Closed · ${esc(new Date(detail.task.closedAt).toLocaleDateString())}</span><button id="board-download">Download history</button>` : '<button id="board-attach">Terminals</button><button id="board-settings" title="Project settings">Settings</button>'}</div></div><p class="fine">${esc(detail.task.goal)}</p><div class="board-agents-row">${agents
+        ? `<div class="board-head"><div class="view-heading"><div><span class="eyebrow">BOARD</span><h2>${esc(detail.task.name)}</h2></div><div class="view-actions">${archived ? `<span class="fine">Closed · ${esc(new Date(detail.task.closedAt).toLocaleDateString())}</span><button id="board-download">Download history</button>` : '<button id="board-attach">Terminals</button><button id="board-settings" title="Project settings">Settings</button>'}</div></div><p class="fine">${esc(detail.task.goal)}</p><span class="fine hub-sync-status" role="status">${esc(client()?.cacheStatus?.().label || "")}</span><div class="board-agents-row">${agents
             .filter((a) => archived || a.status !== "closed")
             .map(
               (a) =>
