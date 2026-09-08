@@ -1,0 +1,19 @@
+{
+  "origin": "https://tailos.tailarr.com",
+  "deployment": "https://f0a7b147.tailos.pages.dev",
+  "commit": "63a341c2de61d4945ac38a5c96e0a9f3d33ef284",
+  "verifiedAssets": 81,
+  "releaseSha256": "54b2d47a0bb5b2a25bd057c39b53e5f016432090d28ae3d9304d67c1749795f3",
+  "verifiedAt": "2026-09-08T15:36:43.446Z",
+  "hubRelease": "20260908-owner-resume-63a341c2de61",
+  "hubBinarySha256": "ca8023d27c29571ad4d2822fcd9d6ea38042403e56a1b8769700fd9e989996e0",
+  "hubBackup": "/mnt/deepfreeze/tailterm-hub/backups/before-owner-resume-20260908T152008Z.sqlite",
+  "verification": [
+    "81 served assets and production release.json match local manifest",
+    "Chromium deployed smoke including production WASM and isolated vault key restore",
+    "QR browser fixture passes Chromium/WebKit with synthetic URL decoding and fallback/lifecycle checks",
+    "Task layout browser fixture passes Chromium/WebKit",
+    "72 JS unit tests passed before final migration correction; corrected layout regression suite then passed 14/14",
+    "Hub go test ./..., go vet ./..., store race tests passed"
+  ]
+}

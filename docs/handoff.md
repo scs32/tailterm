@@ -1,5 +1,28 @@
 # Development handoff — September 8, 2026
 
+## September 8 follow-up release
+
+Commit `63a341c2de61d4945ac38a5c96e0a9f3d33ef284` is now deployed to
+`https://tailos.tailarr.com` (`https://f0a7b147.tailos.pages.dev`). It adds local
+QR Tailscale sign-in with the original link and automatic dialog closure,
+full-height orchestrator/two-column worker stacking, and human-directed resumption
+of online retired agents. The hub executable is now
+`/mnt/deepfreeze/tailterm-hub/releases/20260908-owner-resume-63a341c2de61/tailterm-hub`.
+Existing host CLIs/relays are compatible and were not restarted. No TrueNAS
+Tailscale settings or live tasks were changed for testing. The current Mini has
+a local static preview at `http://127.0.0.1:4318`; the older container inventory
+below describes the earlier handoff machine.
+
+[Release receipt](releases/tailos-2026-09-08-qr.json) records manifest/asset and hub
+binary verification. The pre-update SQLite backup passed integrity verification
+and is recorded there. All QR acceptance used synthetic URLs; a real phone scan
+with the owner's account is still an owner acceptance check.
+
+Current owner follow-ups under development: rename Tasks to Projects, add scoped
+Bugs/Features with a database-handler agent and dispatch to a project, and physical
+Left/Right Option drag placement (right/above respectively). The original restart
+snapshot below is retained for context; it predates this follow-up release.
+
 This is the restart guide for the next computer and developer/agent. Read
 [Project overview](project-overview.md) for the product model and source map.
 The repository root `AGENTS.md` captures the owner's persistent constraints.
