@@ -497,9 +497,10 @@ export function createTaskHub(host) {
       <label>Task name<input id="task-name" placeholder="Review the API changes" maxlength="120" autocomplete="off" required></label>
       <label>Objective<textarea id="task-goal" rows="3" maxlength="8192" placeholder="What should be accomplished?"></textarea></label>
       ${teams.length ? `<label>Team<select id="task-team"><option value="">No team · choose an agent below</option>${teams.map((t) => `<option value="${esc(t.id)}" ${t.id === initialTeam?.id ? "selected" : ""}>${esc(t.name)} · ${t.members.length} agents</option>`).join("")}</select></label>` : ""}
+      <label id="task-main-machine" hidden>Main machine<select id="task-main-server">${serverOptions(server?.id)}</select><span class="fine">Used by team members without an assigned machine.</span></label>
       <label class="check" id="task-manual-agent"><input type="checkbox" id="task-with-agent">Start the first agent now</label>
       <fieldset id="task-agent-fields" hidden disabled><label>Server<select id="task-server">${serverOptions(server?.id)}</select></label>${agentFields(server)}</fieldset>
-      <label class="check"><input type="checkbox" id="task-allow-spawn">Allow agents to add other agents</label>
+      <label class="check"><input type="checkbox" id="task-swarm">Enable swarm</label><p class="fine">Every new message reaches every agent on this task. Named recipients indicate who should act.</p><label class="check"><input type="checkbox" id="task-allow-spawn">Allow agents to add other agents</label><label>Max new agents<input id="task-max-new-agents" type="number" min="0" max="32" step="1" value="2" disabled></label><p class="fine">Additional helpers across this task, including finished helpers. Agents you add manually do not count.</p>
       <p class="fine">Agents appear together in a terminal group named after this task.</p>
       <div class="task-submit-area"><p id="task-error" class="fine" role="status" aria-live="polite"></p><div class="dialog-actions"><button type="button" id="task-open-created" hidden>Open created task</button><button type="submit" id="task-create" class="primary">Create task</button></div></div>
     </form>`,
@@ -519,9 +520,14 @@ export function createTaskHub(host) {
       host.openBoard(saved.id);
     };
     form.querySelector("#task-open-created").onclick = open;
+    form.querySelector("#task-allow-spawn").onchange = (e) =>
+      (form.querySelector("#task-max-new-agents").disabled = !e.target.checked);
     withAgent.onchange = () => {
       const hasTeam = !!teamSelect?.value;
       form.querySelector("#task-manual-agent").hidden = hasTeam;
+      form.querySelector("#task-main-machine").hidden = !teams
+        .find((t) => t.id === teamSelect?.value)
+        ?.members.some((m) => !m.serverId);
       agentFieldsEl.hidden = hasTeam || !withAgent.checked;
       agentFieldsEl.disabled = hasTeam || !withAgent.checked;
       button.textContent = hasTeam
@@ -530,7 +536,14 @@ export function createTaskHub(host) {
           ? "Create task and start agent"
           : "Create task";
     };
-    if (teamSelect) teamSelect.onchange = withAgent.onchange;
+    const selectTeam = () => {
+      withAgent.onchange();
+      form.querySelector("#task-swarm").checked = !!teams.find(
+        (t) => t.id === teamSelect?.value,
+      )?.swarm;
+    };
+    if (teamSelect) teamSelect.onchange = selectTeam;
+    selectTeam();
     withAgent.onchange();
     form.onsubmit = async (event) => {
       event.preventDefault();
@@ -540,6 +553,17 @@ export function createTaskHub(host) {
         const name = form.querySelector("#task-name").value.trim();
         if (!name || [...name].length > 120 || /[\x00-\x1f\x7f]/.test(name))
           throw new Error("Enter a task name of up to 120 characters.");
+        const maxNewAgents = Number(
+          form.querySelector("#task-max-new-agents").value,
+        );
+        if (
+          !Number.isInteger(maxNewAgents) ||
+          maxNewAgents < 0 ||
+          maxNewAgents > 32
+        )
+          throw new Error(
+            "Max new agents must be a whole number from 0 to 32.",
+          );
         const target = host
           .getServers()
           .find((s) => s.id === form.querySelector("#task-server").value);
@@ -548,7 +572,11 @@ export function createTaskHub(host) {
         const plan =
           launchPlan ||
           (team
-            ? teamLaunches(team, host.getServers())
+            ? teamLaunches(
+                team,
+                host.getServers(),
+                form.querySelector("#task-main-server").value,
+              )
             : fields
               ? [{ server: target, fields }]
               : []);
@@ -570,12 +598,22 @@ export function createTaskHub(host) {
             name,
             goal: form.querySelector("#task-goal").value.trim(),
             allowAgentSpawn: form.querySelector("#task-allow-spawn").checked,
+            maxNewAgents,
+            swarm: form.querySelector("#task-swarm").checked,
+            orchestrator:
+              team?.orchestrator ||
+              team?.members[0]?.name ||
+              fields?.name ||
+              "",
           });
           launchPlan = plan;
           if (teamSelect) teamSelect.disabled = true;
+          form.querySelector("#task-main-server").disabled = true;
           bound.add(saved.id);
           cache.set(saved.id, { task: saved, agents: [] });
           form.querySelector("#task-allow-spawn").disabled = true;
+          form.querySelector("#task-swarm").disabled = true;
+          form.querySelector("#task-max-new-agents").disabled = true;
           form.querySelector("#task-name").disabled = true;
           form.querySelector("#task-goal").disabled = true;
           form.querySelector("#task-open-created").hidden = false;
@@ -647,11 +685,12 @@ export function createTaskHub(host) {
   async function addTeam(team) {
     if (!requireHub()) return;
     try {
-      const plan = teamLaunches(team, host.getServers());
+      let plan = null;
+      const mainServer = host.currentServer() || host.getServers()[0];
       const tasks = (await loadTasks()).filter((t) => t.status === "open");
       host.dialog(
         `Add team · ${team.name}`,
-        `<form id="team-launch-form"><label>Task<select id="team-task">${tasks.map((t) => `<option value="${esc(t.id)}">${esc(t.name)}</option>`).join("")}</select></label><p class="fine">${plan.map((p) => esc(p.fields.name) + " · " + esc(p.server.name)).join("<br>")}</p><p id="team-launch-status" class="fine" role="status">${tasks.length ? "" : "Create a task first."}</p><div class="dialog-actions"><button type="submit" class="primary" ${tasks.length ? "" : "disabled"}>Start team</button></div></form>`,
+        `<form id="team-launch-form"><label>Task<select id="team-task">${tasks.map((t) => `<option value="${esc(t.id)}">${esc(t.name)}</option>`).join("")}</select></label>${team.members.some((m) => !m.serverId) ? `<label>Main machine<select id="team-main-server">${serverOptions(mainServer?.id)}</select></label>` : ""}<p class="fine">${team.members.map((m) => esc(m.name) + " · " + esc(m.serverId ? host.getServers().find((s) => s.id === m.serverId)?.name || "Missing machine" : "Main machine")).join("<br>")}</p>${team.swarm ? '<p class="fine">Starting this swarm enables broadcast for every agent on the selected task, including its existing agents.</p>' : ""}<p class="fine">An existing task keeps its main orchestrator; new members introduce themselves to that leader.</p><p id="team-launch-status" class="fine" role="status">${tasks.length ? "" : "Create a task first."}</p><div class="dialog-actions"><button type="submit" class="primary" ${tasks.length ? "" : "disabled"}>Start team</button></div></form>`,
       );
       const form = document.querySelector("#team-launch-form"),
         selector = form.querySelector("#team-task"),
@@ -665,6 +704,19 @@ export function createTaskHub(host) {
         selector.disabled = true;
         const id = selector.value;
         try {
+          plan ||= teamLaunches(
+            team,
+            host.getServers(),
+            form.querySelector("#team-main-server")?.value || mainServer?.id,
+          );
+          const mainChoice = form.querySelector("#team-main-server");
+          if (mainChoice) mainChoice.disabled = true;
+          const existingTask = await client.getTask(id);
+          const policy = {};
+          if (team.swarm) policy.swarm = true;
+          if (!existingTask.task.orchestrator)
+            policy.orchestrator = team.orchestrator || team.members[0].name;
+          if (Object.keys(policy).length) await client.updateTask(id, policy);
           bound.add(id);
           await launchMembers(
             id,
@@ -679,7 +731,12 @@ export function createTaskHub(host) {
         } catch (error) {
           status.textContent = formatError(error);
           button.textContent = "Retry remaining agents";
-          if (!progress.size) selector.disabled = false;
+          if (!progress.size) {
+            selector.disabled = false;
+            plan = null;
+            const mainChoice = form.querySelector("#team-main-server");
+            if (mainChoice) mainChoice.disabled = false;
+          }
         } finally {
           button.disabled = false;
         }
@@ -798,9 +855,12 @@ export function createTaskHub(host) {
       const { task } = await client.getTask(taskId);
       host.dialog(
         "Task settings",
-        `<form id="task-settings"><label>Task name<input id="task-settings-name" maxlength="120" value="${esc(task.name)}" required></label><label>Objective<textarea id="task-settings-goal" rows="3" maxlength="8192">${esc(task.goal)}</textarea></label><label class="check"><input id="task-settings-spawn" type="checkbox" ${task.allowAgentSpawn ? "checked" : ""}>Allow agents to add other agents</label><p class="fine">You can always add agents yourself. Turning this off prevents new helpers; existing agents keep running.</p><p id="task-settings-error" class="fine" role="alert"></p><div class="dialog-actions"><button type="submit" class="primary">Save</button></div></form>`,
+        `<form id="task-settings"><label>Task name<input id="task-settings-name" maxlength="120" value="${esc(task.name)}" required></label><label>Objective<textarea id="task-settings-goal" rows="3" maxlength="8192">${esc(task.goal)}</textarea></label><label>Main orchestrator<input id="task-settings-orchestrator" maxlength="64" value="${esc(task.orchestrator || "")}" placeholder="Agent name (optional)"></label><label class="check"><input id="task-settings-swarm" type="checkbox" ${task.swarm ? "checked" : ""}>Enable swarm</label><p class="fine">Every new message reaches all task agents. Existing messages keep their original delivery scope.</p><label class="check"><input id="task-settings-spawn" type="checkbox" ${task.allowAgentSpawn ? "checked" : ""}>Allow agents to add other agents</label><label>Max new agents<input id="task-settings-max-new-agents" type="number" min="0" max="32" step="1" value="${task.maxNewAgents ?? 2}" ${task.allowAgentSpawn ? "" : "disabled"}></label><p class="fine">Additional helpers across the task, including finished helpers. Agents you add manually do not count.</p><p class="fine">You can always add agents yourself. Turning this off prevents new helpers; existing agents keep running.</p><p id="task-settings-error" class="fine" role="alert"></p><div class="dialog-actions"><button type="submit" class="primary">Save</button></div></form>`,
       );
       const form = document.querySelector("#task-settings");
+      form.querySelector("#task-settings-spawn").onchange = (e) =>
+        (form.querySelector("#task-settings-max-new-agents").disabled =
+          !e.target.checked);
       form.onsubmit = async (event) => {
         event.preventDefault();
         const button = form.querySelector("button");
@@ -810,7 +870,14 @@ export function createTaskHub(host) {
           const task = await client.updateTask(taskId, {
             name: form.querySelector("#task-settings-name").value.trim(),
             goal: form.querySelector("#task-settings-goal").value.trim(),
+            maxNewAgents: Number(
+              form.querySelector("#task-settings-max-new-agents").value,
+            ),
             allowAgentSpawn: form.querySelector("#task-settings-spawn").checked,
+            swarm: form.querySelector("#task-settings-swarm").checked,
+            orchestrator: form
+              .querySelector("#task-settings-orchestrator")
+              .value.trim(),
           });
           const info = cache.get(taskId);
           cache.set(taskId, { ...info, task });

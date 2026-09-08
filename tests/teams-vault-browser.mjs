@@ -43,11 +43,12 @@ try {
       page.on("pageerror", (e) => errors.push(e.message));
       await page.goto(url);
       await page.locator("#teams-new").click();
-      await page.locator("#team-name").fill("Eight agents");
+      await page.locator("#team-name").fill("Eleven agents");
+      await page.locator("#team-swarm").check();
       await page.locator("[data-field=name]").fill("planner");
       await page.locator("#team-model-choice").selectOption("gpt-6-astra");
       await page.locator("[data-field=prompt]").fill("Coordinate the review.");
-      for (let i = 2; i <= 8; i++) {
+      for (let i = 2; i <= 11; i++) {
         await page.locator("#team-add-member").click();
         await page
           .locator("[data-field=name]")
@@ -61,7 +62,8 @@ try {
           await page.locator("#team-model").fill("custom-model-v2");
         }
       }
-      assert.ok(await page.locator("#team-add-member").isDisabled());
+      assert.equal(await page.locator("#team-add-member").isDisabled(), false);
+      await page.locator("#team-orchestrator").selectOption("2");
       await page.locator("#team-form button[type=submit]").click();
       await page
         .locator("#team-error")
@@ -91,7 +93,9 @@ try {
       await page.locator("#team-form button[type=submit]").click();
       await page.locator("#dialog").waitFor({ state: "hidden" });
       let team = await page.evaluate(() => qa.vault.localData().teams[0]);
-      assert.equal(team.members.length, 8);
+      assert.equal(team.members.length, 11);
+      assert.equal(team.swarm, true);
+      assert.equal(team.orchestrator, "reviewer");
       assert.equal(team.members[0].model, "gpt-6-astra");
       assert.equal(team.members[1].model, "sonnet");
       assert.equal(team.members[7].model, "custom-model-v2");
@@ -130,11 +134,35 @@ try {
       await page.locator("#dialog").waitFor({ state: "hidden" });
       team = await page.evaluate(() => qa.vault.localData().teams[0]);
       assert.equal(team.members[0].cwd, "/project");
-      assert.equal(team.members.length, 8);
+      assert.equal(team.members.length, 11);
+      assert.equal(team.swarm, true);
+      assert.equal(team.orchestrator, "reviewer");
+      await page.setViewportSize({ width: 1050, height: 780 });
+      await page.locator("#teams-examples").click();
+      assert.equal(await page.locator(".team-example").count(), 9);
+      await page.locator("[data-example=feature]").click();
+      assert.equal(
+        await page.locator("[data-field=serverId]").inputValue(),
+        "",
+      );
+      assert.ok(
+        (await page.locator("[data-field=prompt]").inputValue()).length > 2500,
+      );
+      await page.locator("#team-form button[type=submit]").click();
+      await page.locator("#dialog").waitFor({ state: "hidden" });
+      const example = await page.evaluate(() =>
+        qa.vault.localData().teams.find((t) => t.name === "Feature delivery"),
+      );
+      assert.equal(example.members.length, 4);
+      assert.ok(
+        example.members.every(
+          (m) => m.serverId === "" && m.prompt.length > 2500,
+        ),
+      );
       assert.deepEqual(errors, []);
       console.log(
         name +
-          ": eight-member save, encrypted reload, per-agent preset/custom models, hidden-member validation, correction and mobile error visibility passed.",
+          ": eleven-member save, encrypted reload, per-agent preset/custom models, hidden-member validation, correction and mobile error visibility passed.",
       );
     } finally {
       await browser.close();

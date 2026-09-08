@@ -424,6 +424,9 @@ func formatMessage(m api.Message, names map[string]string) string {
 	if m.To != "" {
 		to = " → " + or(names[m.To], m.To)
 	}
+	if m.Broadcast {
+		to += " [swarm: everyone]"
+	}
 	line := fmt.Sprintf("#%d %s %s%s: %s", m.Seq, m.CreatedAt.Local().Format("15:04"), from, to, m.Text)
 	if m.From.AgentID == "" {
 		line += fmt.Sprintf("\n  Reply on the shared board: tt post --reply-to %d \"your reply\" (omit --to; sender is human).", m.Seq)

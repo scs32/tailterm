@@ -11,6 +11,19 @@ import assert from "node:assert/strict";
 const exec = promisify(execFile),
   root = process.cwd(),
   state = await mkdtemp(path.join(tmpdir(), "tailterm-task-form-"));
+await exec(
+  "go",
+  [
+    "build",
+    "-o",
+    path.join(root, ".build/ttbin/tailterm-hub-test"),
+    "./cmd/tailterm-hub",
+  ],
+  { cwd: path.join(root, "hub") },
+);
+await exec("go", ["build", "-o", path.join(state, "tt"), "./cmd/tt"], {
+  cwd: path.join(root, "hub"),
+});
 const reserve = createServer();
 reserve.listen(0, "127.0.0.1");
 await once(reserve, "listening");
@@ -25,6 +38,7 @@ const backend = spawn(path.join(root, ".build/ttbin/tailterm-hub-test"), {
   },
   stdio: "ignore",
 });
+const launchServers = [];
 let failLaunch = false,
   failAt = 0,
   execs = 0;
@@ -35,13 +49,13 @@ import {createTasksView} from '/client/tasks-view.js';
 import {createTeamsView} from '/client/teams-view.js';
 import {setupModes} from '/client/modes.js';
 let board, tasks, modes, teams;const data={hub:{url:location.origin},launchProfiles:[],teams:[]};
-const servers=[{id:'local',name:'Test host',host:'stephens-macbook-air',username:'test',runtimes:['claude']}];
+const servers=[{id:'local',name:'Test host',host:'stephens-macbook-air',username:'test',runtimes:['claude']},{id:'secondary',name:'Second host',host:'second-fixture',username:'test',runtimes:['codex']}];
 const model={groups:[],taskGroup:()=>null};
 const host={getIPN:()=>({fetch:(url,init)=>fetch(url,init)}),getData:()=>data,getServers:()=>servers,currentServer:()=>servers[0],currentTab:()=>null,getTabs:()=>[],paneGroups:()=>({model,sync(){}}),render(){},scheduleWorkspaceSave(){},bookmark(){},closeTab(){},connect:async()=>null,notice:t=>{document.querySelector('#notice').textContent=t},api:async(url,method,body)=>{if(url==="/teams")data.teams=[...data.teams.filter(t=>t.id!==body.id),body];if(url.startsWith("/teams/"))data.teams=data.teams.filter(t=>t.id!==url.slice(7));if(url==="/launch-profiles")data.launchProfiles=[...data.launchProfiles.filter(p=>p.name!==body.name),body];return {sessions:[]}},reloadData:async()=>{},
  dialog:(title,body)=>{const d=document.querySelector('#dialog');if(d.open)d.close();d.innerHTML='<div class="dialog-head"><h2>'+title+'</h2><button id="dialog-close">×</button></div>'+body;d.querySelector('#dialog-close').onclick=()=>host.closeDialog();d.showModal()},
  closeDialog:()=>{const d=document.querySelector('#dialog');d.close();d.replaceChildren()},
  openBoard:id=>{modes.set('board');board.show(id)},
- browserCommand:async(server,command)=>{const r=await fetch('/exec',{method:'POST',body:JSON.stringify({command})});const d=await r.json();if(!r.ok)throw new Error(d.error);return d.output}
+ browserCommand:async(server,command)=>{const r=await fetch('/exec',{method:'POST',body:JSON.stringify({command,serverId:server.id})});const d=await r.json();if(!r.ok)throw new Error(d.error);return d.output}
 };
 const hub=createTaskHub(host);hub.refresh();
 board=createBoardView({client:()=>hub.client(),getTabs:()=>[],activate(){},notice:host.notice,newTask:()=>hub.newTask(),addAgent:id=>hub.addAgent(id),attachTask(){},configure(){}});
@@ -75,7 +89,8 @@ const server = createServer(async (req, res) => {
       execs++;
       const chunks = [];
       for await (const b of req) chunks.push(b);
-      const { command } = JSON.parse(Buffer.concat(chunks));
+      const { command, serverId } = JSON.parse(Buffer.concat(chunks));
+      launchServers.push(serverId);
       if (failLaunch || execs === failAt) {
         failLaunch = false;
         res.writeHead(500, { "content-type": "application/json" });
@@ -87,7 +102,11 @@ const server = createServer(async (req, res) => {
         "/bin/sh",
         ["-c", command.replaceAll(origin, `http://127.0.0.1:${port}`)],
         {
-          env: { ...process.env, TT_TMUX_SOCKET: "tailterm-form-check" },
+          env: {
+            ...process.env,
+            PATH: state + path.delimiter + process.env.PATH,
+            TT_TMUX_SOCKET: "tailterm-form-check",
+          },
           timeout: 20000,
         },
       );
@@ -336,7 +355,14 @@ try {
         .filter({ hasText: name + " mobile task" })
         .waitFor();
       await page.locator("#board-compose").waitFor({ state: "visible" });
-      const compose = await page.locator("#board-compose").boundingBox();
+      const compose = await (
+        await page.waitForFunction(() => {
+          const el = document.querySelector("#board-compose");
+          if (!el || !el.getClientRects().length) return false;
+          const r = el.getBoundingClientRect();
+          return { y: r.y, height: r.height };
+        })
+      ).jsonValue();
       assert.ok(
         compose.y >= 0 && compose.y + compose.height <= 650,
         JSON.stringify(compose),
@@ -347,6 +373,7 @@ try {
       await page.evaluate(() => qa.modes.set("teams"));
       await page.locator("#teams-new").click();
       await page.locator("#team-name").fill("Review team");
+      await page.locator("#team-swarm").check();
       await page.locator("[data-field=name]").fill("team-planner");
       await page.locator("[data-field=role]").fill("Planner");
       await page.locator("#team-model-choice").selectOption("__custom");
@@ -369,6 +396,9 @@ try {
       failAt = execs + 2;
       await page.locator("[data-new-task]").click();
       assert.notEqual(await page.locator("#task-team").inputValue(), "");
+      await page.locator("#task-main-server").selectOption("secondary");
+      await page.locator("#task-allow-spawn").check();
+      await page.locator("#task-max-new-agents").fill("3");
       await page.locator("#task-name").fill(name + " team task");
       await page.locator("#task-create").click();
       await page
@@ -389,12 +419,21 @@ try {
         await fetch("http://127.0.0.1:" + port + "/v1/tasks/" + teamTask.id)
       ).json();
       assert.equal(detail.agents.length, 2);
+      assert.equal(detail.task.maxNewAgents, 3);
+      assert.equal(detail.task.swarm, true);
+      assert.equal(detail.task.orchestrator, "team-planner");
+      assert.deepEqual(launchServers.slice(-3), [
+        "secondary",
+        "secondary",
+        "secondary",
+      ]);
       await page.evaluate(() => qa.modes.set("teams"));
       await page.locator("[data-add-team]").click();
       const target = (await getTasks()).find(
         (t) => t.name === name + " mobile task",
       );
       await page.locator("#team-task").selectOption(target.id);
+      await page.locator("#team-main-server").selectOption("local");
       await page.locator("#team-launch-form button").click();
       await page.locator("#dialog").waitFor({ state: "hidden" });
       const attached = await (

@@ -136,6 +136,9 @@ var postableKinds = map[string]bool{
 func PostableKind(kind string) bool { return postableKinds[kind] }
 
 type Task struct {
+	Orchestrator    string     `json:"orchestrator"`
+	Swarm           bool       `json:"swarm"`
+	MaxNewAgents    int        `json:"maxNewAgents"`
 	AllowAgentSpawn bool       `json:"allowAgentSpawn"`
 	ID              string     `json:"id"`
 	Name            string     `json:"name"`
@@ -173,6 +176,7 @@ type Sender struct {
 }
 
 type Message struct {
+	Broadcast bool      `json:"broadcast,omitempty"`
 	ReplyTo   int64     `json:"replyTo,omitempty"`
 	Seq       int64     `json:"seq"`
 	TaskID    string    `json:"taskId"`
@@ -196,12 +200,18 @@ type Event struct {
 // Request and response bodies.
 
 type CreateTaskRequest struct {
+	Orchestrator    string `json:"orchestrator"`
+	Swarm           bool   `json:"swarm"`
+	MaxNewAgents    *int   `json:"maxNewAgents"`
 	AllowAgentSpawn bool   `json:"allowAgentSpawn"`
 	Name            string `json:"name"`
 	Goal            string `json:"goal"`
 }
 
 type UpdateTaskRequest struct {
+	Orchestrator    *string `json:"orchestrator"`
+	Swarm           *bool   `json:"swarm"`
+	MaxNewAgents    *int    `json:"maxNewAgents"`
 	AllowAgentSpawn *bool   `json:"allowAgentSpawn"`
 	Name            *string `json:"name"`
 	Goal            *string `json:"goal"`
@@ -274,6 +284,7 @@ type ErrorResponse struct {
 var (
 	ErrNotFound           = errors.New("not found")
 	ErrInvalid            = errors.New("invalid")
+	ErrAgentSpawnLimit    = errors.New("maximum additional agents reached for this task")
 	ErrAgentSpawnDisabled = errors.New("agents cannot add agents to this task")
 	ErrLimit              = errors.New("limit reached")
 	ErrClosed             = errors.New("closed")

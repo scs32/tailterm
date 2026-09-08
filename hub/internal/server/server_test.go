@@ -293,3 +293,22 @@ func TestRateLimit(t *testing.T) {
 		t.Fatal("expected the write rate limit to trigger")
 	}
 }
+
+func TestTaskHelperBudgetAPI(t *testing.T) {
+	c := newClient(t)
+	var task api.Task
+	if code := c.do("POST", "/v1/tasks", map[string]any{"name": "budget", "allowAgentSpawn": true, "maxNewAgents": 0}, &task); code != 201 || task.MaxNewAgents != 0 {
+		t.Fatalf("create: %d %+v", code, task)
+	}
+	parent := c.agent(task, "parent")
+	request := api.AddAgentRequest{Name: "helper", Host: "host", Session: "helper", ParentAgentID: parent.ID}
+	if code := c.do("POST", "/v1/tasks/"+task.ID+"/agents", request, nil); code != 409 {
+		t.Fatalf("zero budget allowed helper: %d", code)
+	}
+	if code := c.do("PATCH", "/v1/tasks/"+task.ID, map[string]any{"maxNewAgents": 1}, &task); code != 200 || task.MaxNewAgents != 1 {
+		t.Fatalf("update: %d %+v", code, task)
+	}
+	if code := c.do("POST", "/v1/tasks/"+task.ID+"/agents", request, nil); code != 201 {
+		t.Fatalf("enabled budget: %d", code)
+	}
+}

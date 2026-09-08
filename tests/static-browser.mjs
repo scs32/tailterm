@@ -31,7 +31,6 @@ import { openVault } from "../client/vault-crypto.js";
 import { attachSFTP } from "./sftp-fixture.mjs";
 import { createFixtureHub } from "./fixture-hub.mjs";
 import { exerciseTasks } from "./tasks-browser.mjs";
-import { exerciseFiles } from "./files-browser.mjs";
 const fixtureHub = createFixtureHub();
 import { exerciseImageUpload } from "./upload-browser.mjs";
 import { finishRestoration } from "./restore-browser.mjs";
@@ -632,7 +631,11 @@ try {
   await exerciseWorkspaceActions(page, stream);
   await exerciseWorkspaceContinuity(page, context, () => terminalStarts);
   await exerciseTasks(page, fixtureHub, origin);
-  await exerciseFiles(page, uploadedFiles, () => input);
+  assert.equal(
+    await page.locator("[data-mode=files]").count(),
+    0,
+    "Files stays hidden while deferred",
+  );
   console.log(
     "Uploads, reconnect, reordering and workspace restoration passed.",
   );

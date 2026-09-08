@@ -133,9 +133,19 @@ func (s *Store) CreateTask(ctx context.Context, req api.CreateTaskRequest, by ap
 	if count >= api.MaxTasks {
 		return api.Task{}, api.ErrLimit
 	}
-	t := api.Task{AllowAgentSpawn: req.AllowAgentSpawn, ID: api.NewID("tsk"), Name: req.Name, Goal: req.Goal, Status: api.TaskOpen, CreatedAt: s.now(), CreatedBy: by}
-	_, err := s.db.ExecContext(ctx, `INSERT INTO tasks (id,name,goal,status,created_at,created_node,created_user,allow_agent_spawn) VALUES (?,?,?,?,?,?,?,?)`,
-		t.ID, t.Name, t.Goal, t.Status, ts(t.CreatedAt), by.Node, by.User, t.AllowAgentSpawn)
+	maxNewAgents := 2
+	if req.MaxNewAgents != nil {
+		maxNewAgents = *req.MaxNewAgents
+	}
+	if maxNewAgents < 0 || maxNewAgents > api.MaxAgentsPerTask {
+		return api.Task{}, api.ErrInvalid
+	}
+	if req.Orchestrator != "" && !api.ValidName(req.Orchestrator) {
+		return api.Task{}, api.ErrInvalid
+	}
+	t := api.Task{Orchestrator: req.Orchestrator, Swarm: req.Swarm, MaxNewAgents: maxNewAgents, AllowAgentSpawn: req.AllowAgentSpawn, ID: api.NewID("tsk"), Name: req.Name, Goal: req.Goal, Status: api.TaskOpen, CreatedAt: s.now(), CreatedBy: by}
+	_, err := s.db.ExecContext(ctx, `INSERT INTO tasks (id,name,goal,status,created_at,created_node,created_user,allow_agent_spawn,max_new_agents,swarm,orchestrator) VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
+		t.ID, t.Name, t.Goal, t.Status, ts(t.CreatedAt), by.Node, by.User, t.AllowAgentSpawn, t.MaxNewAgents, t.Swarm, t.Orchestrator)
 	if err != nil {
 		return api.Task{}, err
 	}
@@ -149,7 +159,7 @@ func scanTask(row interface{ Scan(...any) error }) (api.Task, error) {
 	var t api.Task
 	var created string
 	var closed sql.NullString
-	err := row.Scan(&t.ID, &t.Name, &t.Goal, &t.Status, &created, &t.CreatedBy.Node, &t.CreatedBy.User, &closed, &t.AllowAgentSpawn)
+	err := row.Scan(&t.ID, &t.Name, &t.Goal, &t.Status, &created, &t.CreatedBy.Node, &t.CreatedBy.User, &closed, &t.AllowAgentSpawn, &t.MaxNewAgents, &t.Swarm, &t.Orchestrator)
 	if err != nil {
 		return t, err
 	}
@@ -161,7 +171,7 @@ func scanTask(row interface{ Scan(...any) error }) (api.Task, error) {
 	return t, nil
 }
 
-const taskCols = `id,name,goal,status,created_at,created_node,created_user,closed_at,allow_agent_spawn`
+const taskCols = `id,name,goal,status,created_at,created_node,created_user,closed_at,allow_agent_spawn,max_new_agents,swarm,orchestrator`
 
 func (s *Store) GetTask(ctx context.Context, id string) (api.Task, error) {
 	t, err := scanTask(s.db.QueryRowContext(ctx, `SELECT `+taskCols+` FROM tasks WHERE id=?`, id))
@@ -219,14 +229,29 @@ func (s *Store) UpdateTask(ctx context.Context, id string, req api.UpdateTaskReq
 			return t, api.ErrInvalid
 		}
 	}
+	if req.Orchestrator != nil {
+		if *req.Orchestrator != "" && !api.ValidName(*req.Orchestrator) {
+			return api.Task{}, api.ErrInvalid
+		}
+		t.Orchestrator = *req.Orchestrator
+	}
+	if req.Swarm != nil {
+		t.Swarm = *req.Swarm
+	}
 	if req.AllowAgentSpawn != nil {
 		t.AllowAgentSpawn = *req.AllowAgentSpawn
+	}
+	if req.MaxNewAgents != nil {
+		if *req.MaxNewAgents < 0 || *req.MaxNewAgents > api.MaxAgentsPerTask {
+			return t, api.ErrInvalid
+		}
+		t.MaxNewAgents = *req.MaxNewAgents
 	}
 	var closedAt any
 	if t.ClosedAt != nil {
 		closedAt = ts(*t.ClosedAt)
 	}
-	_, err = s.db.ExecContext(ctx, `UPDATE tasks SET name=?, goal=?, status=?, closed_at=?, allow_agent_spawn=? WHERE id=?`, t.Name, t.Goal, t.Status, closedAt, t.AllowAgentSpawn, id)
+	_, err = s.db.ExecContext(ctx, `UPDATE tasks SET name=?, goal=?, status=?, closed_at=?, allow_agent_spawn=?,max_new_agents=?,swarm=?,orchestrator=? WHERE id=?`, t.Name, t.Goal, t.Status, closedAt, t.AllowAgentSpawn, t.MaxNewAgents, t.Swarm, t.Orchestrator, id)
 	if err == nil {
 		_, err = s.addEvent(ctx, id, "task_updated", "", t.Name, nil, by)
 	}
@@ -328,7 +353,7 @@ func (s *Store) AddAgent(ctx context.Context, taskID string, req api.AddAgentReq
 		if e != nil {
 			return api.Agent{}, e
 		}
-		if previous.Status != api.AgentExited || previous.Host != req.Host {
+		if previous.Status != api.AgentExited || previous.Host != req.Host || previous.ParentAgentID != req.ParentAgentID {
 			return api.Agent{}, api.ErrLimit
 		}
 		runID := api.NewID("run")
@@ -344,6 +369,15 @@ func (s *Store) AddAgent(ctx context.Context, taskID string, req api.AddAgentReq
 	}
 	if err != sql.ErrNoRows {
 		return api.Agent{}, err
+	}
+	if req.ParentAgentID != "" {
+		var helpers int
+		if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM agents WHERE task_id=? AND parent_agent_id<>''`, taskID).Scan(&helpers); err != nil {
+			return api.Agent{}, err
+		}
+		if helpers >= t.MaxNewAgents {
+			return api.Agent{}, api.ErrAgentSpawnLimit
+		}
 	}
 	now := s.now()
 	a := api.Agent{RunID: api.NewID("run"), ID: req.AgentID, TaskID: taskID, Name: req.Name, Host: req.Host, Session: req.Session, Runtime: req.Runtime,
@@ -492,9 +526,9 @@ func (s *Store) PostMessage(ctx context.Context, taskID string, req api.PostMess
 			return api.Message{}, api.ErrInvalid
 		}
 	}
-	m := api.Message{ReplyTo: req.ReplyTo, TaskID: taskID, From: api.Sender{AgentID: req.AgentID, Node: by.Node, User: by.User}, To: req.To, Text: req.Text, CreatedAt: s.now()}
-	res, err := s.db.ExecContext(ctx, `INSERT INTO messages (task_id,from_agent,from_node,from_user,to_agent,text,created_at,reply_to) VALUES (?,?,?,?,?,?,?,?)`,
-		taskID, req.AgentID, by.Node, by.User, req.To, req.Text, ts(m.CreatedAt), req.ReplyTo)
+	m := api.Message{Broadcast: t.Swarm, ReplyTo: req.ReplyTo, TaskID: taskID, From: api.Sender{AgentID: req.AgentID, Node: by.Node, User: by.User}, To: req.To, Text: req.Text, CreatedAt: s.now()}
+	res, err := s.db.ExecContext(ctx, `INSERT INTO messages (task_id,from_agent,from_node,from_user,to_agent,text,created_at,reply_to,broadcast) VALUES (?,?,?,?,?,?,?,?,?)`,
+		taskID, req.AgentID, by.Node, by.User, req.To, req.Text, ts(m.CreatedAt), req.ReplyTo, m.Broadcast)
 	if err != nil {
 		return m, err
 	}
@@ -503,7 +537,7 @@ func (s *Store) PostMessage(ctx context.Context, taskID string, req api.PostMess
 	if len(preview) > 200 {
 		preview = preview[:200]
 	}
-	_, err = s.addEvent(ctx, taskID, api.EventMessage, req.AgentID, preview, map[string]any{"seq": m.Seq, "to": req.To}, by)
+	_, err = s.addEvent(ctx, taskID, api.EventMessage, req.AgentID, preview, map[string]any{"seq": m.Seq, "to": req.To, "broadcast": m.Broadcast}, by)
 	return m, err
 }
 
@@ -513,10 +547,10 @@ func (s *Store) ListMessages(ctx context.Context, taskID string, after int64, ag
 	if limit <= 0 || limit > api.MaxLimit {
 		limit = api.MaxLimit
 	}
-	q := `SELECT seq,task_id,from_agent,from_node,from_user,to_agent,text,created_at,reply_to FROM messages WHERE task_id=? AND seq>?`
+	q := `SELECT seq,task_id,from_agent,from_node,from_user,to_agent,text,created_at,reply_to,broadcast FROM messages WHERE task_id=? AND seq>?`
 	args := []any{taskID, after}
 	if agentID != "" {
-		q += ` AND (to_agent='' OR to_agent=?)`
+		q += ` AND (broadcast=1 OR to_agent='' OR to_agent=?)`
 		args = append(args, agentID)
 	}
 	if after < 0 {
@@ -534,7 +568,7 @@ func (s *Store) ListMessages(ctx context.Context, taskID string, after int64, ag
 	for rows.Next() {
 		var m api.Message
 		var created string
-		if err := rows.Scan(&m.Seq, &m.TaskID, &m.From.AgentID, &m.From.Node, &m.From.User, &m.To, &m.Text, &created, &m.ReplyTo); err != nil {
+		if err := rows.Scan(&m.Seq, &m.TaskID, &m.From.AgentID, &m.From.Node, &m.From.User, &m.To, &m.Text, &created, &m.ReplyTo, &m.Broadcast); err != nil {
 			return nil, err
 		}
 		m.CreatedAt = parseTS(created)
@@ -576,7 +610,7 @@ func (s *Store) Unread(ctx context.Context, taskID, agentID string) (int, error)
 		return 0, err
 	}
 	var n int
-	err = s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM messages WHERE task_id=? AND seq>? AND from_agent<>? AND (to_agent='' OR to_agent=?)`,
+	err = s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM messages WHERE task_id=? AND seq>? AND from_agent<>? AND (broadcast=1 OR to_agent='' OR to_agent=?)`,
 		taskID, cursor, agentID, agentID).Scan(&n)
 	return n, err
 }

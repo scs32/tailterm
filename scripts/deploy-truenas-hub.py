@@ -25,7 +25,7 @@ compose = {'services': {'hub': {
     'read_only': True,
     'cap_drop': ['ALL'], 'security_opt': ['no-new-privileges:true'],
     'ports': ['100.116.238.37:18765:18765'],
-    'environment': {'TAILTERM_TCP_LISTEN': '0.0.0.0:18765', 'TAILTERM_STATE': '/state', 'TAILTERM_TOKEN_FILE': '/run/hub-token', 'TAILTERM_MAX_AGENTS': '8'},
+    'environment': {'TAILTERM_TCP_LISTEN': '0.0.0.0:18765', 'TAILTERM_STATE': '/state', 'TAILTERM_TOKEN_FILE': '/run/hub-token', 'TAILTERM_MAX_AGENTS': '32'},
     'volumes': [f'{base}/releases/{release}/tailterm-hub:/opt/tailterm-hub:ro', f'{base}/state:/state', f'{base}/hub-token:/run/hub-token:ro'],
     'mem_limit': '512m', 'cpus': '1.0',
 }}}

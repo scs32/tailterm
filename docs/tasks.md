@@ -33,8 +33,8 @@ The model must be available to the account used by that app; Tailterm does not
 change credentials or validate provider access. Custom apps take model options
 in **Command override**. From an agent, use `tt spawn --runtime codex --run codex --model MODEL --name helper`.
 
-**Teams**, next to Tasks, replaces saved launch setups. Create a team of one
-or up to eight members, each with a server, agent app, model, role, instructions,
+**Teams**, next to Tasks, replaces saved launch setups. **Examples** contains nine researched starting points with full prompts; see [team examples and rationale](team-examples.md). Create a team of one
+or up to 32 members, each with a server, agent app, model, role, instructions,
 command and working directory. Existing saved setups become one-member teams.
 Use **New task** on a team, or select a team in the task creation dialog.
 **Add to task** launches its members into an existing open task. Editing a
@@ -50,13 +50,15 @@ task's tab or a pane. It joins visually as a guest, without becoming an agent.
 Guests may leave again; task agents stay within their task. Closing a task
 releases guest sessions into an ordinary group. Two tasks never combine.
 
+Members set to **Main machine** inherit the machine selected when launching a task or adding a team. Explicit member machines take precedence. Templates can be saved before any machine is configured.
+
 Each new LLM agent receives the objective and instructions for communicating.
 New tmux sessions retain the task environment so agents can spawn local helpers
 with `tt spawn`. Remote launches use Tailterm's SSH connection; the hub itself
 does not run commands on agent hosts.
 
 The helper setting is checked by the hub on agent-originated `tt spawn`
-requests, including parent membership and the task’s agent limit. Turning it
+requests, including parent membership, **Max new agents**, and the task’s active-agent limit. Max new agents defaults to 2 and caps additional helper identities across all parents and descendants, including finished/closed helpers. Resuming the same helper identity is permitted without consuming another slot. Manually added agents do not consume this allowance. Turning it
 off leaves existing agents running. This is a coordination policy for the
 existing trusted, single-owner setup; the shared hub credential is not an
 isolation boundary against agents deliberately impersonating the owner.
@@ -124,3 +126,15 @@ of fullscreen and leaves navigation available.
 
 The same hub can optionally store [encrypted shared profiles](profile-sync.md).
 Profile credentials are separate from the token used by task agents.
+
+### Team coordination
+
+Teams have a main orchestrator and an optional Enable swarm checkbox. The leader
+launches first; other members and later helpers are instructed to introduce
+themselves before working. Swarm tasks broadcast every new message to all members
+while retaining named recipients as assignment owners. Message delivery scope is
+persisted per message; toggling swarm does not replay older directed messages.
+The Codex inbox relay wakes recipients for swarm broadcasts, excluding the sender.
+Teams and the deployed hub now allow up to 32 open members per task; helper limits
+remain separately enforced. See [team examples](team-examples.md) for full rules,
+model choices, and the Astra/four-Terra starting swarm.

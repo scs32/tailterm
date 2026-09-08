@@ -10,6 +10,10 @@ func migrate(db *sql.DB) error {
 		{"agents", "last_seen_at", "TEXT NOT NULL DEFAULT ''"},
 		{"messages", "reply_to", "INTEGER NOT NULL DEFAULT 0"},
 		{"tasks", "allow_agent_spawn", "INTEGER NOT NULL DEFAULT 0"},
+		{"tasks", "max_new_agents", "INTEGER NOT NULL DEFAULT 2"},
+		{"tasks", "swarm", "INTEGER NOT NULL DEFAULT 0"},
+		{"tasks", "orchestrator", "TEXT NOT NULL DEFAULT ''"},
+		{"messages", "broadcast", "INTEGER NOT NULL DEFAULT 0"},
 	} {
 		var n int
 		if err := db.QueryRow(`SELECT count(*) FROM pragma_table_info(?) WHERE name=?`, c.table, c.name).Scan(&n); err != nil {

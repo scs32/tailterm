@@ -1,10 +1,9 @@
-// Header mode selector: Terminals (the existing workspace), Board, Files, and
-// Tasks. Non-terminal modes render into #mode-view while the terminal shell
+// Header mode selector: Terminals, Board, Tasks, and Teams. Files is hidden
+// while its interface is being reconsidered. Non-terminal modes render into #mode-view while the terminal shell
 // stays mounted but hidden, so connections and scrollback survive switching.
 export const MODES = [
   ["terminals", "Terminals", "1"],
   ["board", "Board", "2"],
-  ["files", "Files", "3"],
   ["tasks", "Tasks", "4"],
   ["teams", "Teams", "5"],
 ];

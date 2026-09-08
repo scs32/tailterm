@@ -156,7 +156,7 @@ export function createBoardView({
         (a) =>
           a.id !== m.from.agentId &&
           a.status !== "closed" &&
-          (!m.to || a.id === m.to),
+          (m.broadcast || !m.to || a.id === m.to),
       );
       if (!recipients.length) return "Stored";
       const read = recipients.filter((a) => a.readUpTo >= m.seq).length;
@@ -173,7 +173,7 @@ export function createBoardView({
             )
             .join(
               "",
-            )}<button id="board-add-agent">＋ Agent</button></div></div><div id="board-messages" class="board-messages">${messages.length === 200 ? '<p class="fine">Latest 200 messages. Full history remains on the hub.</p>' : ""}${messages.map((m) => `<article class="board-message" data-message="${m.seq}"><div class="board-meta"><strong>${esc(name(m))}</strong><span>${m.to ? "to " + esc(names.get(m.to) || m.to) : "Team announcement"} · ${esc(new Date(m.createdAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }))}</span></div>${m.replyTo ? `<div class="reply-context">Reply to #${m.replyTo}: ${esc(messages.find((x) => x.seq === m.replyTo)?.text.slice(0, 100) || "Earlier message")}</div>` : ""}<div class="board-text">${esc(m.text)}</div><div class="message-footer"><span>${receipt(m)}</span><button data-reply="${m.seq}">Reply</button></div></article>`).join("") || '<div class="board-empty"><h3>No messages yet.</h3><p class="fine">Leave a note for the team or add an agent to get started.</p></div>'}</div><form id="board-compose">${d.replyTo ? `<div class="compose-reply">Replying to #${d.replyTo}<button type="button" id="board-cancel-reply">Cancel reply</button></div>` : ""}<label class="compose-recipient">To<select ${sending.has(selected) ? "disabled" : ""} id="board-to" aria-label="Recipient"><option value="">Everyone</option>${agents
+            )}<button id="board-add-agent">＋ Agent</button></div></div><div id="board-messages" class="board-messages">${messages.length === 200 ? '<p class="fine">Latest 200 messages. Full history remains on the hub.</p>' : ""}${messages.map((m) => `<article class="board-message" data-message="${m.seq}"><div class="board-meta"><strong>${esc(name(m))}</strong><span>${m.to ? "to " + esc(names.get(m.to) || m.to) : "Team announcement"}${m.broadcast ? " · Swarm broadcast" : ""} · ${esc(new Date(m.createdAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }))}</span></div>${m.replyTo ? `<div class="reply-context">Reply to #${m.replyTo}: ${esc(messages.find((x) => x.seq === m.replyTo)?.text.slice(0, 100) || "Earlier message")}</div>` : ""}<div class="board-text">${esc(m.text)}</div><div class="message-footer"><span>${receipt(m)}</span><button data-reply="${m.seq}">Reply</button></div></article>`).join("") || '<div class="board-empty"><h3>No messages yet.</h3><p class="fine">Leave a note for the team or add an agent to get started.</p></div>'}</div><form id="board-compose">${d.replyTo ? `<div class="compose-reply">Replying to #${d.replyTo}<button type="button" id="board-cancel-reply">Cancel reply</button></div>` : ""}<label class="compose-recipient">To<select ${sending.has(selected) ? "disabled" : ""} id="board-to" aria-label="Recipient"><option value="">Everyone</option>${agents
             .filter((a) => a.status !== "closed")
             .map(
               (a) =>
@@ -181,7 +181,7 @@ export function createBoardView({
             )
             .join(
               "",
-            )}</select></label><textarea ${sending.has(selected) ? "disabled" : ""} id="board-text" rows="2" maxlength="8192" placeholder="Write a message…" aria-label="Message">${esc(d.text)}</textarea><button class="primary" type="submit" ${sending.has(selected) ? "disabled" : ""}>${sending.has(selected) ? "Sending…" : "Send"}</button><p class="compose-note fine">Messages wait until agents check their inbox.</p></form>`
+            )}</select></label><textarea ${sending.has(selected) ? "disabled" : ""} id="board-text" rows="2" maxlength="8192" placeholder="Write a message…" aria-label="Message">${esc(d.text)}</textarea><button class="primary" type="submit" ${sending.has(selected) ? "disabled" : ""}>${sending.has(selected) ? "Sending…" : "Send"}</button><p class="compose-note fine">${detail.task.swarm ? "Swarm: everyone receives each message. To names the agent responsible for acting." : "Messages wait until agents check their inbox."}</p></form>`
         : '<div class="mode-empty"><h2>Bring a team together.</h2><p class="launcher-intro">Create a task with a shared objective, then add agents.</p></div>'
     }</section></div>`;
     root.querySelector("#board-new-task").onclick = () => newTask();

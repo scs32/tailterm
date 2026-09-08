@@ -4,7 +4,7 @@ import { credentialCache } from "./credential-cache.js";
 import { createAttentionSound } from "./attention-sound.js";
 import { createRenderer, webglSupported } from "./renderer.js";
 import { createTaskHub } from "./task-hub.js";
-import { setupModes } from "./modes.js";
+import { MODES, setupModes } from "./modes.js";
 import { createBoardView } from "./board-view.js";
 import { createTasksView } from "./tasks-view.js";
 import { createFilesView } from "./files-view.js";
@@ -2634,12 +2634,7 @@ function openCommands() {
   commands.push({ label: "New session", run: () => $("#new-tab").click() });
   commands.push({ label: "Manage terminal groups", run: groupDialog });
   if (modes)
-    for (const [mode, label] of [
-      ["terminals", "Terminals"],
-      ["board", "Board"],
-      ["files", "Files"],
-      ["tasks", "Tasks"],
-    ])
+    for (const [mode, label] of MODES)
       commands.push({ label: `Mode: ${label}`, run: () => modes.set(mode) });
   if (taskHub) commands.push(...taskHub.commands());
   const server = currentServer();

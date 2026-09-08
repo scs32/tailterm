@@ -430,7 +430,11 @@ export async function localAPI(url, method = "GET", body = {}) {
   if (url === "/teams" && method === "POST")
     return editVault((d) => {
       const team = normalizeTeam(body);
-      if (team.members.some((m) => !d.servers.some((s) => s.id === m.serverId)))
+      if (
+        team.members.some(
+          (m) => m.serverId && !d.servers.some((s) => s.id === m.serverId),
+        )
+      )
         throw new Error("Choose a saved server for every team member.");
       const teams = savedTeams(d).filter((t) => t.id !== team.id);
       if (teams.length >= 30) throw new Error("At most 30 teams.");

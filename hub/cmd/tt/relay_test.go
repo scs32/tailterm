@@ -104,3 +104,28 @@ func TestWakeEligibility(t *testing.T) {
 		}
 	}
 }
+
+func TestSwarmWakePreservesOwnershipAndExcludesSelf(t *testing.T) {
+	for _, c := range []struct {
+		m    api.Message
+		want bool
+	}{
+		{api.Message{Seq: 1, To: "worker", From: api.Sender{AgentID: "lead"}, Broadcast: true}, true},
+		{api.Message{Seq: 2, From: api.Sender{AgentID: "lead"}, Broadcast: true}, true},
+		{api.Message{Seq: 3, From: api.Sender{AgentID: "peer"}, Broadcast: true}, false},
+		{api.Message{Seq: 4, To: "worker", From: api.Sender{AgentID: "lead"}}, false},
+		{api.Message{Seq: 5, From: api.Sender{AgentID: "lead"}}, false},
+	} {
+		_, wake := wakeThrough([]api.Message{c.m}, "peer")
+		if wake != c.want {
+			t.Fatalf("%+v: %v", c.m, wake)
+		}
+	}
+	task := api.Task{Name: "Swarm", Swarm: true, Orchestrator: "lead"}
+	if got := taskBriefing(task, "worker"); !strings.Contains(got, "FIRST ORDER OF BUSINESS") || !strings.Contains(got, "tt post --to lead") || !strings.Contains(got, "SWARM ENABLED") {
+		t.Fatal(got)
+	}
+	if got := taskBriefing(task, "lead"); !strings.Contains(got, "MAIN ORCHESTRATOR") || strings.Contains(got, "tt post --to lead") {
+		t.Fatal(got)
+	}
+}

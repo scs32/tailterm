@@ -5100,3 +5100,31 @@ dialog .agent-save-setup button {
 .model-picker [hidden] {
   display: none !important;
 }
+
+.team-example {
+  padding: 12px 0;
+  border-bottom: 1px solid var(--line);
+}
+.team-example-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+.team-example h3 {
+  margin: 0;
+  font-size: 12px;
+}
+.team-example p {
+  margin: 6px 0;
+  font-size: 11px;
+}
+.team-example summary {
+  font-size: 11px;
+  cursor: pointer;
+  color: var(--muted);
+}
+.team-example-head button {
+  flex: none;
+  padding: 4px 9px;
+}

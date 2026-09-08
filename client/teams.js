@@ -1,6 +1,6 @@
 import { AGENT_NAME_RE } from "./task-ref.js";
 import { agentSpawnCommand } from "../shared/tmux-command.js";
-export const MAX_TEAM_MEMBERS = 8;
+export const MAX_TEAM_MEMBERS = 32;
 export function normalizeTeam(value) {
   if (
     !value ||
@@ -15,7 +15,7 @@ export function normalizeTeam(value) {
     !value.members.length ||
     value.members.length > MAX_TEAM_MEMBERS
   )
-    throw new Error("A team needs 1–8 agents.");
+    throw new Error("A team needs 1–32 agents.");
   const names = new Set();
   const members = value.members.map((m, memberIndex) => {
     const invalid = (message, field) => {
@@ -50,8 +50,7 @@ export function normalizeTeam(value) {
       cwd: String(m.cwd || "").trim(),
       prompt: String(m.prompt || "").trim(),
     };
-    if (!member.serverId || member.serverId.length > 80)
-      invalid("Choose a server.", "serverId");
+    if (member.serverId.length > 80) invalid("Choose a server.", "serverId");
     if (member.role.length > 80 || /[\x00-\x1f\x7f]/.test(member.role))
       invalid("Keep roles under 80 characters.", "role");
     try {
@@ -77,11 +76,16 @@ export function normalizeTeam(value) {
     }
     return member;
   });
+  const orchestrator = value.orchestrator || members[0].name;
+  if (!members.some((m) => m.name === orchestrator))
+    throw new Error("Choose a main orchestrator from this team.");
   return {
+    orchestrator,
     id: /^[A-Za-z0-9_-]{1,80}$/.test(value.id || "")
       ? value.id
       : "team_" + crypto.randomUUID().replaceAll("-", ""),
     name: value.name.trim(),
+    swarm: value.swarm === true,
     members,
   };
 }
@@ -102,12 +106,22 @@ export function savedTeams(data) {
   }
   return result;
 }
-export function teamLaunches(team, servers) {
-  return normalizeTeam(team).members.map((member) => {
-    const server = servers.find((s) => s.id === member.serverId);
+export function teamLaunches(team, servers, mainServerId = servers[0]?.id) {
+  const normalized = normalizeTeam(team);
+  const ordered = [...normalized.members].sort(
+    (a, b) =>
+      Number(b.name === normalized.orchestrator) -
+      Number(a.name === normalized.orchestrator),
+  );
+  return ordered.map((member) => {
+    const server = servers.find(
+      (s) => s.id === (member.serverId || mainServerId),
+    );
     if (!server)
       throw new Error(
-        `Choose an available server for ${member.name} in Teams.`,
+        member.serverId
+          ? `Choose an available server for ${member.name} in Teams.`
+          : `Choose a main machine to launch ${member.name}.`,
       );
     return {
       server,
