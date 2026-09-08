@@ -1,0 +1,73 @@
+# Projects, Bugs, and Features
+
+Projects is the user-facing name for the existing task hub. Existing `tsk_` IDs,
+`taskId` fields, task environment variables, history exports and `/v1/tasks`
+routes remain compatible. The Bugs and Features tabs store records in the hub,
+independently of whether agents are online. Files remains hidden.
+
+## Recording and assigning work
+
+Each bug or feature belongs to one project. Both tabs can show all projects or
+filter by owning project and status. New items start Open with Normal priority.
+Items can be edited and marked In progress, Blocked, Done or Dismissed. Closed
+projects and their items remain readable; they cannot be edited or dispatched.
+
+Send to project sends the selected item revision to an existing open project's
+orchestrator. The owning project is selected initially. Choosing another project
+does not move the record, start a team or change its status. A successful receipt
+means the directed board message was saved, not that an agent has read it or
+finished the work. Missing or closed orchestrators produce a visible error.
+
+Create and dispatch requests retain an idempotency key across response-loss
+retries. Reusing a key with different input conflicts. Edits and dispatches
+check the expected record revision so stale forms cannot overwrite newer work.
+An agent-authored dispatch is limited to its own project; human UI dispatches
+can target another project. Sender and source-message attribution are retained.
+
+## Database handler
+
+New projects launch their orchestrator, a visible Database handler, then the
+remaining team members. The handler inherits the orchestrator's resolved host,
+app, model, folder and permission settings. Supported apps use their normal
+command with handler-specific instructions; custom apps retain their explicit
+command. It occupies one open-agent slot but does not consume the additional
+helper allowance. A new project can therefore launch at most 31 ordinary members
+plus its handler, subject to the hub's per-project active-agent capacity.
+
+Agents send discoveries to the handler's actual roster name. The handler records
+them through the work-item CLI and replies with a durable item ID. Direct writes
+remain available when it is offline. The handler stays available during ordinary
+project work cycles; explicit retirement remains respected. Closing a project
+includes the handler in the existing durable session-cleanup process and keeps
+the saved records.
+
+The browser saves the handler's resolved launch plan and stable agent identity in
+its encrypted local vault before SSH launch. Retry uses that identity. Host-side
+recovery must verify the exact project, agent and run before reusing a session;
+ambiguous interrupted launches require inspection instead of starting another
+process. Successful members of a partial team launch retain their sessions.
+An edited launch candidate retains the previous settings until SSH confirms its
+launch. If an attempt fails, reopening handler setup offers Restore previous
+settings. Recovery never discards the previous plan merely because a request was
+sent or its response was lost.
+
+Existing projects and projects created through the API without host selections
+show Set up database handler. The hub cannot launch SSH processes itself. Missing
+model or permission selections use visibly stated host defaults; missing saved
+machines must be selected explicitly. Saved handler plans are local recovery data,
+excluded from portable profile sync and exports. Moving browsers may therefore
+require reviewing the handler's launch settings again.
+For an existing handler, the roster's host, runtime and folder take precedence
+over the orchestrator's settings when local launch selections are unavailable.
+
+## Ownership and compatibility
+
+The hub owns work-item records, revisions, dispatch receipts and board messages.
+The browser owns forms and local launch selections; the handler's conversation is
+not the database. Project identity, task-owned pane groups, guest boundaries,
+exact runtime threads, retirement and cleanup receipts retain their existing
+meaning. Work-item storage is an additive migration; it does not change encrypted
+profile contents or create a new multi-user authorization model.
+
+See `tests/project-work-items-browser.mjs` for isolated browser acceptance and
+`tests/project-handler-vault-browser.mjs` for encrypted launch-plan persistence.

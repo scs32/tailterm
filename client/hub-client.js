@@ -60,6 +60,17 @@ export function createHubClient({ fetchImpl, baseURL, token = "" }) {
     updateTask: (id, body) =>
       request(`/v1/tasks/${id}`, { method: "PATCH", body }),
     closeTask: (id) => request(`/v1/tasks/${id}`, { method: "DELETE" }),
+    listWorkItems: (params = {}) => request("/v1/work-items" + q(params)),
+    getWorkItem: (task, id) => request(`/v1/tasks/${task}/work-items/${id}`),
+    createWorkItem: (task, body) =>
+      request(`/v1/tasks/${task}/work-items`, { method: "POST", body }),
+    updateWorkItem: (task, id, body) =>
+      request(`/v1/tasks/${task}/work-items/${id}`, { method: "PATCH", body }),
+    dispatchWorkItem: (task, id, body) =>
+      request(`/v1/tasks/${task}/work-items/${id}/dispatch`, {
+        method: "POST",
+        body,
+      }),
     addAgent: (task, body) =>
       request(`/v1/tasks/${task}/agents`, { method: "POST", body }),
     listAgents: async (task) =>

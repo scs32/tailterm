@@ -3,9 +3,10 @@ import { agentControlsHTML, wireAgentControls } from "./agent-controls.js";
 import { agentToolsCommand } from "../shared/tmux-command.js";
 import { modelPickerHTML, wireModelPicker } from "./model-picker.js";
 import { teamLaunches } from "./teams.js";
-// Task hub controller: owns the hub client, per-task event feeds, the mirror
-// loop that keeps a task tab's panes in step with the hub's agent list, and
-// the task dialogs reachable from the command palette.
+import { withDatabaseHandler } from "./project-handler.js";
+// Project hub controller: owns the hub client, per-task event feeds, the mirror
+// loop that keeps a project tab's panes in step with the hub's agent list, and
+// the project dialogs reachable from the command palette.
 import { createHubClient, normalizeHubURL } from "./hub-client.js";
 import { normalizeTaskId, AGENT_NAME_RE } from "./task-ref.js";
 import {
@@ -158,7 +159,7 @@ export function createTaskHub(host) {
           forgetTask(taskId);
           return;
         }
-        if (!feed.error) host.notice(`Task hub: ${error.message}`);
+        if (!feed.error) host.notice(`Project hub: ${error.message}`);
         feed.error = error.message;
         if (!feed.stopped) {
           feeds.delete(taskId);
@@ -301,7 +302,7 @@ export function createTaskHub(host) {
     syncLayout();
     host.scheduleWorkspaceSave();
   }
-  // Put a pane into the task's tab, or make its own tab carry the task.
+  // Put a pane into the project's tab, or make its own tab carry the project.
   function place(taskId, tab) {
     const groups = host.paneGroups();
     groups.sync();
@@ -341,8 +342,8 @@ export function createTaskHub(host) {
   function rollup(taskId) {
     const feed = feeds.get(taskId);
     const info = cache.get(taskId);
-    if (!info) return `Task ${taskId}`;
-    const line = `Task ${info.task.name}: ${taskRollup(info.agents, feed?.unknown || 0)}`;
+    if (!info) return `Project ${taskId}`;
+    const line = `Project ${info.task.name}: ${taskRollup(info.agents, feed?.unknown || 0)}`;
     return feed?.error ? `${line}\nHub: ${feed.error}` : line;
   }
   function restore(taskIds = [], hiddenIds = []) {
@@ -371,8 +372,8 @@ export function createTaskHub(host) {
   function configure() {
     const current = host.getData()?.hub?.url || "";
     host.dialog(
-      "Task hub",
-      `<p class="fine">Tasks and messages live on your coordination hub. Use its address on your private network. The access token is saved in your encrypted vault. Agent hosts also need this token in ~/.config/tailterm/hub.json.</p><label>Hub URL<input id="hub-url" value="${esc(current)}" placeholder="http://tailterm-hub" autocomplete="off" spellcheck="false"></label><label>Access token<input id="hub-token" type="password" value="${esc(host.getData()?.hub?.token || "")}" autocomplete="off" placeholder="Required for a network listener"></label><label>Agent host<select id="hub-config-server">${serverOptions(host.currentServer()?.id)}</select></label><button id="hub-load-host" type="button">Load configuration from server</button><p id="hub-status" class="fine">${current ? "Configured." : "Not configured."}</p><div class="dialog-actions"><button id="hub-test">Test connection</button><button id="hub-save" class="primary">Save</button>${current ? '<button id="hub-clear" class="danger">Remove</button>' : ""}</div>`,
+      "Project hub",
+      `<p class="fine">Projects and messages live on your coordination hub. Use its address on your private network. The access token is saved in your encrypted vault. Agent hosts also need this token in ~/.config/tailterm/hub.json.</p><label>Hub URL<input id="hub-url" value="${esc(current)}" placeholder="http://tailterm-hub" autocomplete="off" spellcheck="false"></label><label>Access token<input id="hub-token" type="password" value="${esc(host.getData()?.hub?.token || "")}" autocomplete="off" placeholder="Required for a network listener"></label><label>Agent host<select id="hub-config-server">${serverOptions(host.currentServer()?.id)}</select></label><button id="hub-load-host" type="button">Load configuration from server</button><p id="hub-status" class="fine">${current ? "Configured." : "Not configured."}</p><div class="dialog-actions"><button id="hub-test">Test connection</button><button id="hub-save" class="primary">Save</button>${current ? '<button id="hub-clear" class="danger">Remove</button>' : ""}</div>`,
     );
     const status = document.querySelector("#hub-status");
     document.querySelector("#hub-load-host").onclick = async () => {
@@ -431,7 +432,7 @@ export function createTaskHub(host) {
         await host.reloadData();
         refresh();
         host.closeDialog();
-        host.notice(client ? "Task hub saved." : "Task hub removed.");
+        host.notice(client ? "Project hub saved." : "Project hub removed.");
       } catch (error) {
         status.textContent = formatError(error);
       }
@@ -624,6 +625,9 @@ export function createTaskHub(host) {
       model: fields.model,
       permissionMode: fields.permissionMode,
       allowedTools: fields.allowedTools,
+      agentRole: fields.agentRole,
+      agentId: fields.agentId,
+      expectedRunId: fields.expectedRunId,
     });
     const out = await host.browserCommand(server, command, 65536);
     let agent;
@@ -636,6 +640,20 @@ export function createTaskHub(host) {
     }
     if (!agent?.id) throw new Error("tt spawn did not return an agent.");
     rememberHost(server, agent.host);
+    const candidate = handlerPlan(taskId);
+    if (
+      fields.agentRole === "database_handler" &&
+      candidate?.serverId === server.id &&
+      handlerSettingsKey(candidate.fields) === handlerSettingsKey(fields)
+    ) {
+      await host.api("/project-handler-plans", "POST", {
+        hub: client.base,
+        taskId,
+        serverId: server.id,
+        fields,
+      });
+      await host.reloadData();
+    }
     return agent;
   }
 
@@ -664,18 +682,18 @@ export function createTaskHub(host) {
     const server = host.currentServer() || host.getServers()[0];
     const teams = host.getData().teams || [];
     host.dialog(
-      "New task",
+      "New project",
       `<form id="task-form" novalidate>
-      <label>Task name<input id="task-name" placeholder="Review the API changes" maxlength="120" autocomplete="off" required></label>
+      <label>Project name<input id="task-name" placeholder="Review the API changes" maxlength="120" autocomplete="off" required></label>
       <label>Objective<textarea id="task-goal" rows="3" maxlength="8192" placeholder="What should be accomplished?"></textarea></label>
       ${teams.length ? `<label>Team<select id="task-team"><option value="">No team · choose an agent below</option>${teams.map((t) => `<option value="${esc(t.id)}" ${t.id === initialTeam?.id ? "selected" : ""}>${esc(t.name)} · ${t.members.length} agents</option>`).join("")}</select></label>` : ""}
       <label id="task-main-machine" hidden>Main machine<select id="task-main-server">${serverOptions(server?.id)}</select><span class="fine">Used by team members without an assigned machine.</span></label>
       <div id="task-project-folders" hidden></div>
-      <label class="check" id="task-manual-agent"><input type="checkbox" id="task-with-agent">Start the first agent now</label>
+      <label class="check" id="task-manual-agent"><input type="checkbox" id="task-with-agent" checked disabled>Start the project orchestrator</label>
       <fieldset id="task-agent-fields" hidden disabled><label>Server<select id="task-server">${serverOptions(server?.id)}</select></label>${agentFields(server)}</fieldset>
-      <label class="check"><input type="checkbox" id="task-swarm">Enable swarm</label><p class="fine">Every new message reaches every agent on this task. Named recipients indicate who should act.</p><label class="check"><input type="checkbox" id="task-allow-spawn">Allow agents to add other agents</label><label>Max new agents<input id="task-max-new-agents" type="number" min="0" max="32" step="1" value="2" disabled></label><p class="fine">Additional helpers across this task, including finished helpers. Agents you add manually do not count.</p>
-      <p class="fine">Agents appear together in a terminal group named after this task.</p>
-      <div class="task-submit-area"><p id="task-error" class="fine" role="status" aria-live="polite"></p><div class="dialog-actions"><button type="button" id="task-open-created" hidden>Open created task</button><button type="submit" id="task-create" class="primary">Create task</button></div></div>
+      <label class="check"><input type="checkbox" id="task-swarm">Enable swarm</label><p class="fine">Every new message reaches every agent on this project. Named recipients indicate who should act.</p><label class="check"><input type="checkbox" id="task-allow-spawn">Allow agents to add other agents</label><label>Max new agents<input id="task-max-new-agents" type="number" min="0" max="32" step="1" value="2" disabled></label><p class="fine">Additional helpers across this project, including finished helpers. Agents you add manually do not count.</p>
+      <p class="fine">A database handler starts automatically with the orchestrator’s machine, app, model, folder and permissions. It records Bugs and Features and does not use the helper allowance.</p><p class="fine">Agents appear together in a terminal group named after this project.</p>
+      <div class="task-submit-area"><p id="task-error" class="fine" role="status" aria-live="polite"></p><div class="dialog-actions"><button type="button" id="task-open-created" hidden>Open created project</button><button type="submit" id="task-create" class="primary">Create project</button></div></div>
     </form>`,
     );
     const form = document.querySelector("#task-form"),
@@ -685,7 +703,8 @@ export function createTaskHub(host) {
       agentFieldsEl = form.querySelector("#task-agent-fields");
     let pending = false,
       saved = null,
-      launchPlan = null;
+      launchPlan = null,
+      inheritedHandler = null;
     const progress = new Set();
     const teamSelect = form.querySelector("#task-team");
     const projects = teamProjectFolders(
@@ -710,10 +729,10 @@ export function createTaskHub(host) {
       agentFieldsEl.hidden = hasTeam || !withAgent.checked;
       agentFieldsEl.disabled = hasTeam || !withAgent.checked;
       button.textContent = hasTeam
-        ? "Create task and start team"
+        ? "Create project and start team"
         : withAgent.checked
-          ? "Create task and start agent"
-          : "Create task";
+          ? "Create project and start agent"
+          : "Create project";
     };
     const selectTeam = () => {
       withAgent.onchange();
@@ -732,7 +751,7 @@ export function createTaskHub(host) {
       try {
         const name = form.querySelector("#task-name").value.trim();
         if (!name || [...name].length > 120 || /[\x00-\x1f\x7f]/.test(name))
-          throw new Error("Enter a task name of up to 120 characters.");
+          throw new Error("Enter a project name of up to 120 characters.");
         const maxNewAgents = Number(
           form.querySelector("#task-max-new-agents").value,
         );
@@ -749,18 +768,6 @@ export function createTaskHub(host) {
           .find((s) => s.id === form.querySelector("#task-server").value);
         const team = teams.find((t) => t.id === teamSelect?.value);
         const fields = !team && withAgent.checked ? readAgentFields() : null;
-        const plan =
-          launchPlan ||
-          (team
-            ? teamLaunches(
-                team,
-                host.getServers(),
-                form.querySelector("#task-main-server").value,
-                projects.read(),
-              )
-            : fields
-              ? [{ server: target, fields }]
-              : []);
         if (fields) {
           if (!target) throw new Error("Choose a server for the first agent.");
           if (!fields.cwd)
@@ -772,6 +779,20 @@ export function createTaskHub(host) {
             ...fields,
           });
         }
+        const plan =
+          launchPlan ||
+          withDatabaseHandler(
+            team
+              ? teamLaunches(
+                  team,
+                  host.getServers(),
+                  form.querySelector("#task-main-server").value,
+                  projects.read(),
+                )
+              : fields
+                ? [{ server: target, fields }]
+                : [],
+          );
         pending = true;
         form
           .querySelectorAll(
@@ -780,7 +801,9 @@ export function createTaskHub(host) {
           .forEach((el) => (el.disabled = true));
         button.disabled = true;
         withAgent.disabled = true;
-        error.textContent = saved ? "Retrying agent launch…" : "Creating task…";
+        error.textContent = saved
+          ? "Retrying agent launch…"
+          : "Creating project…";
         if (!saved) {
           saved = await client.createTask({
             name,
@@ -813,19 +836,40 @@ export function createTaskHub(host) {
         }
         launchPlan ||= plan;
         if (!team && fields && progress.size === 0)
-          launchPlan = [{ server: target, fields }];
-        await launchMembers(
-          saved.id,
-          launchPlan,
-          progress,
-          (text) => (error.textContent = text),
+          launchPlan = withDatabaseHandler([{ server: target, fields }]);
+        const handler = launchPlan.find(
+          (member) => member.fields.agentRole === "database_handler",
         );
+        if (inheritedHandler && handler) {
+          handler.server = inheritedHandler.server;
+          handler.fields = structuredClone(inheritedHandler.fields);
+        }
+        try {
+          await launchMembers(
+            saved.id,
+            launchPlan,
+            progress,
+            (text) => (error.textContent = text),
+          );
+        } finally {
+          // A successful lead launch fixes its handler's inherited settings.
+          // Folder corrections for remaining workers must not change them.
+          if (
+            !inheritedHandler &&
+            handler &&
+            progress.has(launchPlan[0].fields.name)
+          )
+            inheritedHandler = {
+              server: handler.server,
+              fields: structuredClone(handler.fields),
+            };
+        }
         sync();
         open();
         host.notice(
           launchPlan.length
-            ? `Task created; ${launchPlan.length} agent${launchPlan.length === 1 ? "" : "s"} starting.`
-            : "Task created.",
+            ? `Project created; ${launchPlan.length} agent${launchPlan.length === 1 ? "" : "s"} starting.`
+            : "Project created.",
         );
       } catch (e) {
         if (teamSelect?.value) {
@@ -837,22 +881,22 @@ export function createTaskHub(host) {
             .forEach((el) => (el.disabled = false));
         }
         error.textContent =
-          (saved ? "Task created. Agent launch failed: " : "") +
+          (saved ? "Project created. Agent launch failed: " : "") +
           formatError(e) +
           (progress.size
-            ? " Already started agents keep their folders; corrections apply to remaining agents."
+            ? " Started agents keep their folders. The database handler keeps the lead’s settings; corrections apply to remaining workers."
             : "");
         error.setAttribute("role", "alert");
         error.scrollIntoView({ block: "nearest" });
         button.textContent = saved
           ? "Retry agent launch"
           : withAgent.checked
-            ? "Create task and start agent"
-            : "Create task";
+            ? "Create project and start agent"
+            : "Create project";
       } finally {
         pending = false;
         button.disabled = false;
-        withAgent.disabled = !!saved;
+        withAgent.disabled = true;
       }
     };
     wireAgentFields();
@@ -865,6 +909,220 @@ export function createTaskHub(host) {
     form.querySelector("#task-name").focus();
   }
 
+  function handlerPlan(taskId) {
+    return host
+      .getData()
+      ?.projectHandlerPlans?.find(
+        (p) => p.hub === client.base && p.taskId === taskId,
+      );
+  }
+  function handlerSettingsKey(fields) {
+    return JSON.stringify(
+      [
+        "name",
+        "run",
+        "cwd",
+        "runtime",
+        "model",
+        "permissionMode",
+        "prompt",
+        "agentRole",
+        "agentId",
+        "expectedRunId",
+      ]
+        .map((key) => fields[key] || "")
+        .concat([fields.allowedTools || []]),
+    );
+  }
+  async function saveHandlerPlan(taskId, server, fields) {
+    const saved = handlerPlan(taskId);
+    fields.agentId ||=
+      saved?.fields.agentId ||
+      "agt_" + crypto.randomUUID().replaceAll("-", "").slice(0, 16);
+    const previous =
+      saved?.previous ||
+      (saved ? { serverId: saved.serverId, fields: saved.fields } : undefined);
+    await host.api("/project-handler-plans", "POST", {
+      hub: client.base,
+      taskId,
+      serverId: server.id,
+      fields,
+      ...(previous && { previous }),
+    });
+    await host.reloadData();
+  }
+  async function setupHandler(taskId) {
+    if (!requireHub()) return;
+    try {
+      const detail = await client.getTask(taskId);
+      if (detail.task.status !== "open")
+        throw new Error("This project is closed.");
+      const current = detail.agents.find((a) => a.role === "database_handler");
+      const saved = handlerPlan(taskId);
+      if (current && !["exited", "closed"].includes(current.status)) {
+        if (current.status === "retired") {
+          host.notice(
+            "The database handler is retired. Resume it in Project settings when needed.",
+          );
+          return;
+        }
+        if (current.online || !saved) {
+          host.openBoard(taskId);
+          host.notice(
+            `Database handler: ${current.name}${current.online ? "" : " · offline; no saved launch settings on this browser"}.`,
+          );
+          return;
+        }
+      }
+      if (current?.status === "closed")
+        throw new Error(
+          "The database handler was explicitly closed. Its identity cannot be restarted.",
+        );
+      const lead = detail.agents.find(
+        (a) => a.name.toLowerCase() === detail.task.orchestrator?.toLowerCase(),
+      );
+      const server = saved
+        ? host.getServers().find((s) => s.id === saved.serverId)
+        : current
+          ? matchServer(current.host, taskServers())
+          : (lead && matchServer(lead.host, taskServers())) ||
+            host.currentServer() ||
+            host.getServers()[0];
+      host.dialog(
+        `Database handler · ${detail.task.name}`,
+        `<form id="project-handler-form"><label>Server<select id="task-server">${serverOptions(server?.id)}</select></label>${agentFields(server)}<p class="fine">${saved ? "Review the saved handler launch settings." : "This project has no saved handler settings. Choose its app, model and folder; app default uses the host’s configuration."}</p><p id="task-error" class="fine" role="status"></p><div class="dialog-actions"><button type="submit" id="handler-start" class="primary">${current ? "Restart" : "Start"} database handler</button></div></form>`,
+      );
+      const form = document.querySelector("#project-handler-form");
+      const agentId =
+        current?.id ||
+        saved?.fields.agentId ||
+        "agt_" + crypto.randomUUID().replaceAll("-", "").slice(0, 16);
+      if ((saved || current) && !server) {
+        const select = form.querySelector("#task-server");
+        select.prepend(
+          new Option(
+            "Saved machine unavailable · choose a machine",
+            "",
+            true,
+            true,
+          ),
+        );
+        form.querySelector("#task-error").textContent =
+          "The saved handler machine is unavailable. Restore its server entry before retrying an existing handler.";
+      }
+      wireAgentFields();
+      const fill = (fields) => {
+        const runtime = form.querySelector("#agent-runtime");
+        if (
+          fields.runtime &&
+          ![...runtime.options].some((o) => o.value === fields.runtime)
+        )
+          runtime.add(new Option(fields.runtime, fields.runtime));
+        runtime.value =
+          fields.runtime === "generic" ? "" : fields.runtime || runtime.value;
+        runtime.onchange();
+        for (const [key, value] of Object.entries({
+          name: fields.name,
+          cwd: fields.cwd,
+          run: fields.run,
+          model: fields.model,
+          prompt: fields.prompt,
+        }))
+          if (value !== undefined)
+            form.querySelector(`#agent-${key}`).value = value;
+        if (fields.permissionMode) {
+          const select = form.querySelector('[data-field="permissionMode"]');
+          select.value = fields.permissionMode;
+          select.dispatchEvent(new Event("change"));
+        }
+        const tools = form.querySelector('[data-field="allowedTools"]');
+        if (tools) tools.value = (fields.allowedTools || []).join("\n");
+      };
+      const names = new Set(detail.agents.map((a) => a.name.toLowerCase()));
+      let name = current?.name || "db-handler",
+        suffix = 1;
+      while (!current && names.has(name.toLowerCase()))
+        name = `db-handler-${suffix++}`;
+      fill(
+        saved?.fields || {
+          name,
+          runtime: current?.runtime || lead?.runtime,
+          cwd: current?.cwd || lead?.cwd || "",
+        },
+      );
+      if (saved?.previous) {
+        const restore = document.createElement("button");
+        restore.type = "button";
+        restore.id = "handler-restore-settings";
+        restore.textContent = "Restore previous settings";
+        form.querySelector(".dialog-actions").prepend(restore);
+        restore.onclick = async () => {
+          restore.disabled = true;
+          try {
+            await host.api("/project-handler-plans", "POST", {
+              hub: client.base,
+              taskId,
+              ...saved.previous,
+              previous: { serverId: saved.serverId, fields: saved.fields },
+            });
+            await host.reloadData();
+            if (form.isConnected) await setupHandler(taskId);
+          } catch (error) {
+            form.querySelector("#task-error").textContent = formatError(error);
+            restore.disabled = false;
+          }
+        };
+      }
+      form.querySelector("#agent-name").disabled = true;
+      form.querySelector("#agent-name").value =
+        current?.name || saved?.fields.name || name;
+      form.querySelector("#task-server").onchange = (e) => {
+        const target = host.getServers().find((s) => s.id === e.target.value);
+        form.querySelector("#agent-runtime").innerHTML = runtimeOptions(target);
+        wireAgentFields();
+        form.querySelector("#agent-cwd").value = "";
+      };
+      form.onsubmit = async (event) => {
+        event.preventDefault();
+        const button = form.querySelector("#handler-start"),
+          error = form.querySelector("#task-error");
+        if (button.disabled) return;
+        form.querySelectorAll("button").forEach((b) => (b.disabled = true));
+        try {
+          const target = host
+            .getServers()
+            .find((s) => s.id === form.querySelector("#task-server").value);
+          if (!target) throw new Error("Choose a saved server.");
+          const fields = {
+            ...readAgentFields(),
+            agentRole: "database_handler",
+            agentId,
+          };
+          if (current?.status === "exited") {
+            fields.expectedRunId = current.runId;
+          }
+          agentSpawnCommand({ hub: client.base, task: taskId, ...fields });
+          await saveHandlerPlan(taskId, target, fields);
+          error.textContent = "Starting database handler…";
+          await spawn(taskId, target, fields);
+          if (form.isConnected) host.closeDialog();
+          attach(taskId);
+          host.notice("Database handler started.");
+        } catch (e) {
+          error.textContent =
+            formatError(e) +
+            (handlerPlan(taskId)?.previous
+              ? " Previous settings are retained; reopen handler setup to restore them."
+              : "");
+        } finally {
+          form.querySelectorAll("button").forEach((b) => (b.disabled = false));
+        }
+      };
+    } catch (e) {
+      host.notice(formatError(e));
+    }
+  }
+
   async function launchMembers(taskId, plan, progress, report) {
     const detail = await client.getTask(taskId);
     const open = detail.agents.filter(
@@ -873,11 +1131,17 @@ export function createTaskHub(host) {
     for (const { fields } of plan) {
       if (
         !progress.has(fields.name) &&
+        fields.agentRole !== "database_handler" &&
         open.some((a) => a.name.toLowerCase() === fields.name.toLowerCase())
       )
         throw new Error(
-          `An agent named ${fields.name} already exists. Open the task to inspect it before launching more agents.`,
+          `An agent named ${fields.name} already exists. Open the project to inspect it before launching more agents.`,
         );
+    }
+    for (const { server, fields } of plan) {
+      if (fields.agentRole === "database_handler")
+        if (!progress.has(fields.name))
+          await saveHandlerPlan(taskId, server, fields);
     }
     for (const [i, { server, fields }] of plan.entries()) {
       if (progress.has(fields.name)) continue;
@@ -897,7 +1161,7 @@ export function createTaskHub(host) {
       const tasks = (await loadTasks()).filter((t) => t.status === "open");
       host.dialog(
         `Add team · ${team.name}`,
-        `<form id="team-launch-form"><label>Task<select id="team-task">${tasks.map((t) => `<option value="${esc(t.id)}">${esc(t.name)}</option>`).join("")}</select></label>${team.members.some((m) => !m.serverId) ? `<label>Main machine<select id="team-main-server">${serverOptions(mainServer?.id)}</select></label>` : ""}<p class="fine">${team.members.map((m) => esc(m.name) + " · " + esc(m.serverId ? host.getServers().find((s) => s.id === m.serverId)?.name || "Missing machine" : "Main machine")).join("<br>")}</p>${team.swarm ? '<p class="fine">Starting this swarm enables broadcast for every agent on the selected task, including its existing agents.</p>' : ""}<p class="fine">An existing task keeps its main orchestrator; new members introduce themselves to that leader.</p><div id="team-project-folders"></div><p id="team-launch-status" class="fine" role="status">${tasks.length ? "" : "Create a task first."}</p><div class="dialog-actions"><button type="submit" class="primary" ${tasks.length ? "" : "disabled"}>Start team</button></div></form>`,
+        `<form id="team-launch-form"><label>Project<select id="team-task">${tasks.map((t) => `<option value="${esc(t.id)}">${esc(t.name)}</option>`).join("")}</select></label>${team.members.some((m) => !m.serverId) ? `<label>Main machine<select id="team-main-server">${serverOptions(mainServer?.id)}</select></label>` : ""}<p class="fine">${team.members.map((m) => esc(m.name) + " · " + esc(m.serverId ? host.getServers().find((s) => s.id === m.serverId)?.name || "Missing machine" : "Main machine")).join("<br>")}</p>${team.swarm ? '<p class="fine">Starting this swarm enables broadcast for every agent on the selected project, including its existing agents.</p>' : ""}<p class="fine">An existing project keeps its main orchestrator; new members introduce themselves to that leader.</p><div id="team-project-folders"></div><p id="team-launch-status" class="fine" role="status">${tasks.length ? "" : "Create a project first."}</p><div class="dialog-actions"><button type="submit" class="primary" ${tasks.length ? "" : "disabled"}>Start team</button></div></form>`,
       );
       const form = document.querySelector("#team-launch-form"),
         selector = form.querySelector("#team-task"),
@@ -985,8 +1249,8 @@ export function createTaskHub(host) {
     try {
       const tasks = (await loadTasks()).filter((t) => t.status === "open");
       host.dialog(
-        "Task terminals",
-        `<div class="dialog-menu">${tasks.map((t) => `<button data-open-task="${esc(t.id)}">${esc(t.name)}</button>`).join("") || '<p class="fine">No open tasks.</p>'}</div>`,
+        "Project terminals",
+        `<div class="dialog-menu">${tasks.map((t) => `<button data-open-task="${esc(t.id)}">${esc(t.name)}</button>`).join("") || '<p class="fine">No open projects.</p>'}</div>`,
       );
       document.querySelectorAll("[data-open-task]").forEach(
         (b) =>
@@ -1003,7 +1267,7 @@ export function createTaskHub(host) {
   function addAgent(taskId = taskOfTab(host.currentTab()?.id)) {
     if (!requireHub()) return;
     if (!taskId) {
-      host.notice("Choose a task first.");
+      host.notice("Choose a project first.");
       return;
     }
     const info = cache.get(taskId);
@@ -1053,7 +1317,7 @@ export function createTaskHub(host) {
     };
   }
 
-  // The board lives in Board mode; the host switches modes and selects the task.
+  // The board lives in Board mode; the host switches modes and selects the project.
   function board(taskId = taskOfTab(host.currentTab()?.id)) {
     if (!requireHub()) return;
     host.openBoard(taskId || null);
@@ -1089,8 +1353,8 @@ export function createTaskHub(host) {
     try {
       const { task, agents } = await client.getTask(taskId);
       host.dialog(
-        "Task settings",
-        `<form id="task-settings"><label>Task name<input id="task-settings-name" maxlength="120" value="${esc(task.name)}" required></label><label>Objective<textarea id="task-settings-goal" rows="3" maxlength="8192">${esc(task.goal)}</textarea></label><label>Main orchestrator<input id="task-settings-orchestrator" maxlength="64" value="${esc(task.orchestrator || "")}" placeholder="Agent name (optional)"></label><label class="check"><input id="task-settings-swarm" type="checkbox" ${task.swarm ? "checked" : ""}>Enable swarm</label><p class="fine">Every new message reaches all task agents. Existing messages keep their original delivery scope.</p><label class="check"><input id="task-settings-spawn" type="checkbox" ${task.allowAgentSpawn ? "checked" : ""}>Allow agents to add other agents</label><label>Max new agents<input id="task-settings-max-new-agents" type="number" min="0" max="32" step="1" value="${task.maxNewAgents ?? 2}" ${task.allowAgentSpawn ? "" : "disabled"}></label><p class="fine">Additional helpers across the task, including finished helpers. Agents you add manually do not count.</p><p class="fine">You can always add agents yourself. Turning this off prevents new helpers; existing agents keep running.</p><details class="dialog-details"><summary>Agents</summary><p class="fine">Retire stops automatic inbox wake-ups and keeps the terminal and results. It does not interrupt a running or already queued turn. Resume allows unread messages to wake the agent again.</p><div class="task-agent-lifecycle">${
+        "Project settings",
+        `<form id="task-settings"><label>Project name<input id="task-settings-name" maxlength="120" value="${esc(task.name)}" required></label><label>Objective<textarea id="task-settings-goal" rows="3" maxlength="8192">${esc(task.goal)}</textarea></label><label>Main orchestrator<input id="task-settings-orchestrator" maxlength="64" value="${esc(task.orchestrator || "")}" placeholder="Agent name (optional)"></label><label class="check"><input id="task-settings-swarm" type="checkbox" ${task.swarm ? "checked" : ""}>Enable swarm</label><p class="fine">Every new message reaches all project agents. Existing messages keep their original delivery scope.</p><label class="check"><input id="task-settings-spawn" type="checkbox" ${task.allowAgentSpawn ? "checked" : ""}>Allow agents to add other agents</label><label>Max new agents<input id="task-settings-max-new-agents" type="number" min="0" max="32" step="1" value="${task.maxNewAgents ?? 2}" ${task.allowAgentSpawn ? "" : "disabled"}></label><p class="fine">Additional helpers across the project, including finished helpers. Agents you add manually do not count.</p><p class="fine">You can always add agents yourself. Turning this off prevents new helpers; existing agents keep running.</p><details class="dialog-details"><summary>Agents</summary><p class="fine">Retire stops automatic inbox wake-ups and keeps the terminal and results. It does not interrupt a running or already queued turn. Resume allows unread messages to wake the agent again.</p><div class="task-agent-lifecycle">${
           agents
             .filter((a) => !["closed", "exited"].includes(a.status))
             .map(
@@ -1152,7 +1416,7 @@ export function createTaskHub(host) {
           if (feed) feed.task = task;
           host.closeDialog();
           host.render();
-          host.notice("Task settings saved.");
+          host.notice("Project settings saved.");
         } catch (error) {
           form.querySelector("#task-settings-error").textContent =
             formatError(error);
@@ -1185,22 +1449,25 @@ export function createTaskHub(host) {
     const list = [];
     const tab = host.currentTab();
     const taskId = tab && taskOfTab(tab.id);
-    list.push({ label: "Task hub: configure", run: configure });
+    list.push({ label: "Project hub: configure", run: configure });
     if (client) {
-      list.push({ label: "Task: new…", run: () => newTask() });
+      list.push({ label: "Project: new…", run: () => newTask() });
       list.push({
-        label: "Task: open terminals…",
+        label: "Project: open terminals…",
         run: () => attachTask(),
       });
       if (taskId) {
         const name = cache.get(taskId)?.task?.name || taskId;
-        list.push({ label: `Task ${name}: board`, run: () => board(taskId) });
         list.push({
-          label: `Task ${name}: add agent…`,
+          label: `Project ${name}: board`,
+          run: () => board(taskId),
+        });
+        list.push({
+          label: `Project ${name}: add agent…`,
           run: () => addAgent(taskId),
         });
         list.push({
-          label: `Task ${name}: settings`,
+          label: `Project ${name}: settings`,
           run: () => settings(taskId),
         });
       }
@@ -1210,7 +1477,8 @@ export function createTaskHub(host) {
 
   async function cleanupTask(taskId) {
     const detail = await client.getTask(taskId);
-    if (detail.task.status !== "closed") throw new Error("Task is still open.");
+    if (detail.task.status !== "closed")
+      throw new Error("Project is still open.");
     const pending = detail.agents.filter((a) => !a.cleanupDone);
     if (pending.some((a) => !matchServer(a.host, taskServers())))
       await resolveAgentHosts();
@@ -1256,6 +1524,7 @@ export function createTaskHub(host) {
   }
 
   return {
+    setupHandler,
     closeTask,
     cleanupTask,
     hideAgent(id) {

@@ -366,3 +366,63 @@ test("legacy task layouts with manual swaps are preserved during migration", () 
   assert.equal(model.taskGroup("task").taskLayout, "manual");
   assert.deepEqual(model.taskGroup("task").tree, saved);
 });
+
+test("directional placement reparents one pane and preserves unrelated splits", () => {
+  const model = new PaneGroups();
+  model.sync(["source", "target", "other"]);
+  model.groups = [
+    {
+      taskId: "task",
+      taskLayout: "auto",
+      active: "target",
+      tree: {
+        id: "removed-parent",
+        axis: "x",
+        ratio: 0.37,
+        a: { tab: "source" },
+        b: {
+          id: "preserved-split",
+          axis: "y",
+          ratio: 0.62,
+          a: { tab: "target" },
+          b: { tab: "other" },
+        },
+      },
+    },
+  ];
+
+  assert.equal(model.place("source", "target", "right"), true);
+  let tree = model.taskGroup("task").tree;
+  assert.equal(tree.id, "preserved-split");
+  assert.equal(tree.ratio, 0.62);
+  assert.equal(tree.a.axis, "x");
+  assert.deepEqual([tree.a.a.tab, tree.a.b.tab], ["target", "source"]);
+  assert.equal(tree.b.tab, "other");
+  assert.equal(model.taskGroup("task").taskLayout, "manual");
+  assert.equal(model.taskGroup("task").active, "source");
+
+  assert.equal(model.place("source", "other", "above"), true);
+  tree = model.taskGroup("task").tree;
+  assert.equal(tree.id, "preserved-split");
+  assert.equal(tree.ratio, 0.62);
+  assert.equal(tree.a.tab, "target");
+  assert.equal(tree.b.axis, "y");
+  assert.deepEqual([tree.b.a.tab, tree.b.b.tab], ["source", "other"]);
+  assert.deepEqual(leaves(tree).sort(), ["other", "source", "target"]);
+});
+
+test("directional placement respects task ownership and guest rules", () => {
+  const model = new PaneGroups();
+  const owner = (id) => ({ lead: "one", peer: "one", other: "two" })[id];
+  model.sync(["lead", "peer", "other", "shell"], owner);
+  model.isolateTasks(owner);
+
+  assert.equal(model.place("lead", "other", "right"), false);
+  assert.equal(model.place("lead", "peer", "right"), true);
+  assert.equal(model.taskGroup("one").taskLayout, "manual");
+  assert.equal(model.place("shell", "lead", "above"), true);
+  assert.deepEqual(model.taskGroup("one").guests, ["shell"]);
+  assert.equal(model.place("missing", "lead", "right"), false);
+  assert.equal(model.place("lead", "lead", "above"), false);
+  assert.equal(model.place("lead", "peer", "below"), false);
+});

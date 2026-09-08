@@ -209,7 +209,7 @@ export class PaneGroups {
       (!group.taskId || !!group.guests?.includes(tab))
     );
   }
-  merge(source, target, { whole = true, axis = "x" } = {}) {
+  merge(source, target, { whole = true, axis = "x", before = false } = {}) {
     const from = this.group(source),
       to = this.group(target);
     if (!this.canMerge(source, target, whole)) return false;
@@ -234,10 +234,39 @@ export class PaneGroups {
       id: crypto.randomUUID(),
       axis,
       ratio: 0.5,
-      a: { tab: target },
-      b: incoming,
+      a: before ? incoming : { tab: target },
+      b: before ? { tab: target } : incoming,
     });
     to.active = source;
+    return true;
+  }
+  place(source, target, placement) {
+    if (
+      source === target ||
+      !["right", "above"].includes(placement) ||
+      !this.group(source) ||
+      !this.group(target)
+    )
+      return false;
+    const from = this.group(source),
+      to = this.group(target),
+      axis = placement === "right" ? "x" : "y",
+      before = placement === "above";
+    if (from !== to)
+      return this.merge(source, target, { whole: false, axis, before });
+    this.customize(source);
+    const remaining = prune(
+      from.tree,
+      new Set(leaves(from.tree).filter((id) => id !== source)),
+    );
+    from.tree = replace(remaining, target, {
+      id: crypto.randomUUID(),
+      axis,
+      ratio: 0.5,
+      a: before ? { tab: source } : { tab: target },
+      b: before ? { tab: target } : { tab: source },
+    });
+    from.active = source;
     return true;
   }
   swap(source, target) {

@@ -11,6 +11,11 @@ import assert from "node:assert/strict";
 const exec = promisify(execFile),
   root = process.cwd(),
   state = await mkdtemp(path.join(tmpdir(), "tailterm-task-form-"));
+// The test process is itself task-aware. Never leak its live coordinator
+// identity into the isolated hub or a fixture tt child.
+const fixtureEnv = Object.fromEntries(
+  Object.entries(process.env).filter(([key]) => !key.startsWith("TAILTERM_")),
+);
 await exec(
   "go",
   [
@@ -36,7 +41,7 @@ const port = reserve.address().port;
 await new Promise((r) => reserve.close(r));
 const backend = spawn(path.join(root, ".build/ttbin/tailterm-hub-test"), {
   env: {
-    ...process.env,
+    ...fixtureEnv,
     TAILTERM_STATE: state,
     TAILTERM_DEV_LISTEN: `127.0.0.1:${port}`,
     TAILTERM_TCP_LISTEN: "",
@@ -54,10 +59,10 @@ import {createBoardView} from '/client/board-view.js';
 import {createTasksView} from '/client/tasks-view.js';
 import {createTeamsView} from '/client/teams-view.js';
 import {setupModes} from '/client/modes.js';
-let board, tasks, modes, teams;const data={hub:{url:location.origin},launchProfiles:[],teams:[]};
+let board, tasks, modes, teams;const data={hub:{url:location.origin},launchProfiles:[],teams:[],projectHandlerPlans:[]};
 const servers=[{id:'local',name:'Test host',host:'stephens-macbook-air',username:'test',runtimes:['claude']},{id:'secondary',name:'Second host',host:'second-fixture',username:'test',runtimes:['codex']}];
 const model={groups:[],taskGroup:()=>null};
-const host={openSFTP:async server=>({done:new Promise(()=>{}),home:async()=>${JSON.stringify(root)},realpath:async p=>p,list:async p=>({path:p,entries:p===${JSON.stringify(root)}?[{name:'hub',isDir:true},{name:'ignored.txt',isDir:false}]:[]}),close(){}}),getIPN:()=>({fetch:(url,init)=>fetch(url,init)}),getData:()=>data,getServers:()=>servers,currentServer:()=>servers[0],currentTab:()=>null,getTabs:()=>[],paneGroups:()=>({model,sync(){}}),render(){},scheduleWorkspaceSave(){},bookmark(){},closeTab(){},connect:async()=>null,notice:t=>{document.querySelector('#notice').textContent=t},api:async(url,method,body)=>{if(url==="/teams")data.teams=[...data.teams.filter(t=>t.id!==body.id),body];if(url.startsWith("/teams/"))data.teams=data.teams.filter(t=>t.id!==url.slice(7));if(url==="/launch-profiles")data.launchProfiles=[...data.launchProfiles.filter(p=>p.name!==body.name),body];return {sessions:[]}},reloadData:async()=>{},
+const host={openSFTP:async server=>({done:new Promise(()=>{}),home:async()=>${JSON.stringify(root)},realpath:async p=>p,list:async p=>({path:p,entries:p===${JSON.stringify(root)}?[{name:'hub',isDir:true},{name:'ignored.txt',isDir:false}]:[]}),close(){}}),getIPN:()=>({fetch:(url,init)=>fetch(url,init)}),getData:()=>data,getServers:()=>servers,currentServer:()=>servers[0],currentTab:()=>null,getTabs:()=>[],paneGroups:()=>({model,sync(){}}),render(){},scheduleWorkspaceSave(){},bookmark(){},closeTab(){},connect:async()=>null,notice:t=>{document.querySelector('#notice').textContent=t},api:async(url,method,body)=>{if(url==="/teams")data.teams=[...data.teams.filter(t=>t.id!==body.id),body];if(url.startsWith("/teams/"))data.teams=data.teams.filter(t=>t.id!==url.slice(7));if(url==="/launch-profiles")data.launchProfiles=[...data.launchProfiles.filter(p=>p.name!==body.name),body];if(url==="/project-handler-plans"&&method==="POST")data.projectHandlerPlans=[...data.projectHandlerPlans.filter(p=>p.hub!==body.hub||p.taskId!==body.taskId),structuredClone(body)];return {sessions:[]}},reloadData:async()=>{},
  dialog:(title,body)=>{const d=document.querySelector('#dialog');if(d.open)d.close();d.innerHTML='<div class="dialog-head"><h2>'+title+'</h2><button id="dialog-close">×</button></div>'+body;d.querySelector('#dialog-close').onclick=()=>host.closeDialog();d.showModal()},
  closeDialog:()=>{const d=document.querySelector('#dialog');d.close();d.replaceChildren()},
  openBoard:id=>{modes.set('board');board.show(id)},
@@ -110,8 +115,9 @@ const server = createServer(async (req, res) => {
         ["-c", command.replaceAll(origin, `http://127.0.0.1:${port}`)],
         {
           env: {
-            ...process.env,
+            ...fixtureEnv,
             PATH: state + path.delimiter + process.env.PATH,
+            TAILTERM_HUB: `http://127.0.0.1:${port}`,
             TT_TMUX_SOCKET: "tailterm-form-check",
             TAILTERM_RELAY_STATE: path.join(state, "relay"),
           },
@@ -167,7 +173,11 @@ try {
         console.error(name, e.message);
       });
       await page.goto(origin);
-      await page.waitForFunction(() => !!window.qa);
+      try {
+        await page.waitForFunction(() => !!window.qa);
+      } catch (error) {
+        throw new Error(`${error.message}\n${errors.join("\n")}`);
+      }
       await page.locator("#tasks-new").waitFor({ state: "attached" });
       assert.equal(await page.locator(".tasks-empty, .tasks-clear").count(), 0);
       await page.evaluate(() => qa.modes.set("teams"));
@@ -215,15 +225,22 @@ try {
       await page.locator("#task-create").click();
       await page
         .locator("#task-error")
-        .filter({ hasText: "Enter a task name" })
+        .filter({ hasText: "Enter a project name" })
         .waitFor();
       await page.locator("#task-name").fill(name + " task with spaces");
       await page.locator("#task-allow-spawn").check();
+      await page.locator("#agent-cwd").fill(root);
       await page
         .locator("#task-goal")
         .fill("A normal multi-line objective.\nSecond line.");
       await page.locator("#task-create").click();
-      await page.locator("#dialog").waitFor({ state: "hidden" });
+      try {
+        await page.locator("#dialog").waitFor({ state: "hidden" });
+      } catch (error) {
+        throw new Error(
+          `${error.message}\n${await page.locator("#task-error").innerText()}`,
+        );
+      }
       await page
         .locator(".board-head h2")
         .filter({ hasText: name + " task with spaces" })
@@ -312,7 +329,6 @@ try {
 
       await page.evaluate(() => qa.hub.newTask());
       await page.locator("#task-name").fill(name + " launch retry");
-      await page.locator("#task-with-agent").check();
       await page.locator("#task-create").click();
       await page
         .locator("#task-error")
@@ -371,7 +387,7 @@ try {
       await page
         .locator("#task-error")
         .filter({
-          hasText: "Task created. Agent launch failed: Test launch failure",
+          hasText: "Project created. Agent launch failed: Test launch failure",
         })
         .waitFor();
       assert.equal(
@@ -393,6 +409,7 @@ try {
       await page.setViewportSize({ width: 390, height: 650 });
       await page.evaluate(() => qa.hub.newTask());
       await page.locator("#task-name").fill(name + " mobile task");
+      await page.locator("#agent-cwd").fill(root);
       await page.locator("#task-create").click();
       await page.locator("#dialog").waitFor({ state: "hidden" });
       await page
@@ -467,8 +484,8 @@ try {
       await page.locator("#dialog").waitFor({ state: "hidden" });
       assert.equal(
         execs - launchStart,
-        3,
-        "retry starts only the failed team member",
+        4,
+        "retry starts only the failed member after the mandatory handler launch",
       );
       const teamTask = (await getTasks()).find(
         (t) => t.name === name + " team task",
@@ -476,11 +493,16 @@ try {
       const detail = await (
         await fetch("http://127.0.0.1:" + port + "/v1/tasks/" + teamTask.id)
       ).json();
-      assert.equal(detail.agents.length, 2);
+      assert.equal(detail.agents.length, 3);
       assert.equal(detail.task.maxNewAgents, 3);
       assert.deepEqual(
         detail.agents.map((a) => a.cwd),
-        [root, path.join(root, "hub")],
+        [root, root, path.join(root, "hub")],
+      );
+      assert.equal(
+        detail.agents.filter((a) => a.role === "database_handler").length,
+        1,
+        "project gets one visible database handler",
       );
       assert.equal(detail.task.swarm, true);
       assert.equal(detail.task.orchestrator, "team-planner");
@@ -578,7 +600,11 @@ try {
       const attached = await (
         await fetch("http://127.0.0.1:" + port + "/v1/tasks/" + target.id)
       ).json();
-      assert.equal(attached.agents.length, 2);
+      assert.equal(
+        attached.agents.length,
+        4,
+        "existing project keeps its orchestrator and handler when a team joins",
+      );
       await page.evaluate(() => qa.modes.set("teams"));
       await page.locator("[data-edit-team]").click();
       await page.setViewportSize({ width: 390, height: 650 });

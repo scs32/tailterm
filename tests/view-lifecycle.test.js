@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { createFilesView } from "../client/files-view.js";
 import { createBoardView } from "../client/board-view.js";
 import { createTasksView } from "../client/tasks-view.js";
+import { createWorkItemsView } from "../client/work-items-view.js";
 const root = () => ({
   innerHTML: "",
   nodes: new Map(),
@@ -73,6 +74,7 @@ test("switching SFTP servers cancels remaining files in an upload batch", async 
 for (const [name, create] of [
   ["Board", createBoardView],
   ["Tasks", createTasksView],
+  ["Bugs", (props) => createWorkItemsView({ ...props, kind: "bug" })],
 ]) {
   test(`${name} cannot repaint or start polling after hiding during a request`, async () => {
     const barrier = deferred();
@@ -119,5 +121,43 @@ test("Board handles a second show while the first request is pending", async () 
   first.resolve([]);
   await old;
   assert.equal(subscriptions, 1);
+  view.hide();
+});
+test("work item pagination keeps one project scope while a new filter is pending", async () => {
+  const first = deferred(),
+    calls = [];
+  const client = {
+    listTasks: async () => [
+      { id: "a", name: "A", status: "open" },
+      { id: "b", name: "B", status: "open" },
+    ],
+    listWorkItems: async (p) => {
+      calls.push(p);
+      if (calls.length === 1) return first.promise;
+      return { items: [], next: 0 };
+    },
+    subscribe: () => ({ stop() {} }),
+  };
+  const view = createWorkItemsView({ kind: "bug", client: () => client }),
+    el = root();
+  view.mount(el);
+  const initial = view.show("a");
+  await new Promise((r) => setImmediate(r));
+  await view.show("b");
+  first.resolve({
+    items: [{ id: "old", seq: 1, taskId: "a", title: "Old project result" }],
+    next: 1,
+  });
+  await initial;
+  await new Promise((r) => setImmediate(r));
+  assert.deepEqual(
+    calls.map((c) => [c.taskId, c.after]),
+    [
+      ["a", 0],
+      ["a", 1],
+      ["b", 0],
+    ],
+  );
+  assert.doesNotMatch(el.innerHTML, /Old project result/);
   view.hide();
 });

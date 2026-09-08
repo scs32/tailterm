@@ -1,11 +1,13 @@
-// Header mode selector: Terminals, Board, Tasks, and Teams. Files is hidden
+// Header mode selector: Terminals, Board, Projects, and Teams. Files is hidden
 // while its interface is being reconsidered. Non-terminal modes render into #mode-view while the terminal shell
 // stays mounted but hidden, so connections and scrollback survive switching.
 export const MODES = [
   ["terminals", "Terminals", "1"],
   ["board", "Board", "2"],
-  ["tasks", "Tasks", "4"],
+  ["tasks", "Projects", "4"],
   ["teams", "Teams", "5"],
+  ["bugs", "Bugs", "6"],
+  ["features", "Features", "7"],
 ];
 export function setupModes({ header, main, onChange, available = () => true }) {
   let current = "terminals";

@@ -200,3 +200,92 @@ Verification: read owner #111 from the shared board and inspected the local file
 linked above. No external research, tests, implementation edits, helper launches
 or live database writes were performed for this design. Remaining dependencies:
 lead's final contract/owner decisions and subsequent isolated implementation tests.
+
+## Follow-up #144: minimum durable handler launch/retry recommendation
+
+Read-only review of `client/task-hub.js`, `client/local-vault.js`,
+`client/workspace-state.js`, `hub/cmd/tt/main.go`, `cleanup.go` and current
+`Store.AddAgent`. Backend/CLI implementation belongs to lead and api. The
+recommendation below narrows the broader role-slot design above; an always-on
+launch scheduler is unnecessary for browser reload/SSH-response recovery.
+
+**Current hazards:** `launchMembers` progress is an in-memory Set; roster has no
+model or permission configuration. `cmdSpawn` chooses `UniqueSession` before
+registration and always calls `spawn.Create` afterward. `AddAgent` with an
+existing explicit ID returns that record without checking host/session/runtime;
+the no-ID path restarts an exited same-name/host/parent record with a new run,
+while rejecting another open same-name record. Neither path proves a session
+should be created. A create error currently closes the registered agent without
+distinguishing certain failure from an ambiguous command response.
+
+1. **Persist browser intent before SSH.** Add a bounded, validated
+   `handlerLaunches` map to the encrypted local vault, keyed by normalized hub
+   URL and task ID. Store role, stable attempt ID, reserved name, server ID plus
+   endpoint identity (host/port/SSH username/tmux target), and resolved
+   runtime/model/base command/cwd/permission mode/allowed tools/prompt version.
+   Copy the orchestrator's resolved selections, not a mutable team reference.
+   Use an awaited `mutate` operation: it clones, encrypts and waits for IndexedDB
+   transaction completion before publishing new contents. Do not piggyback on
+   `scheduleWorkspaceSave` (150ms debounce), or put it into the tab snapshot that
+   `normalizeWorkspace` filters. Expose validated plans through `localData`.
+   Missing/changed server endpoints require review before executing the plan.
+
+2. **Keep the first recovery scope local.** The new map need not enter
+   `portableData`/profile sync for this MVP; `applyRemoteProfile` should preserve
+   it like workspace state. Another browser can see/reconcile the existing
+   handler through hub identity, but cannot reconstruct missing launch settings.
+   Add explicit setup there. This avoids turning synced profiles into competing
+   launch queues. The vault owner lock only coordinates tabs on this origin;
+   it is not sufficient for host/process concurrency.
+
+3. **Use one recoverable host operation.** Add handler-specific behavior to
+   `tt spawn` (or a small `ensure-handler` command). Hold a process-releasing OS
+   lock keyed by hub/task/role and actual tmux execution context. Persist a
+   private journal before side effects, using the existing atomic private JSON
+   writer pattern. Record attempt/config hash, agent/run IDs and phases such as
+   registered, creating and started. Derive one fixed session name per attempt;
+   do not find another free suffix on replay. On retry, look for exact
+   hub/task/agent/run environment ownership using `localSessions` and existing
+   cleanup receipts, including renamed sessions. Return an existing matching
+   session; never create a second one just because the browser lost its receipt.
+
+4. **Minimal additive registration semantics.** Keep `Role=database_handler`,
+   one unique role per project, and ordinary `ParentAgentID` empty. Add a stable
+   `launchId` and optional `expectedRunId` for explicit restart; persist the last
+   accepted launch ID/config fingerprint with the role/agent. Replaying that
+   launch ID returns the same run. Changed configuration under the same ID,
+   another host, or a stale expected run conflicts. A restart of an exited run
+   atomically retains agent/inbox identity and creates a new run only once.
+   Existing open/retired roles are inspected/reused, never restarted implicitly.
+   A closed identity needs explicit replacement policy. API owns slot uniqueness
+   and capacity; host journal/lock owns the actual create decision. A response
+   returning an Agent is not by itself permission to create a session.
+
+5. **Fail safely in irreducible crash windows.** Write `creating` before tmux
+   creation. If that journal exists but no exact session can be found, the command
+   may have started and exited before recording success: report an ambiguous
+   attempt, not permission to replay its prompt. A known pre-create failure can
+   retry the same attempt; a confirmed exit can explicitly start a new run.
+   Retain old receipts. Never close an existing registration on a timeout or
+   duplicate-session error before reconciling ownership. Report malformed or
+   multiple matching sessions as a blocker instead of choosing one arbitrarily.
+
+The role still occupies one of 32 open-agent slots and does not consume helper
+allowance. Add it to the real browser launch plan. Existing projects without a
+saved plan get “Set up database handler”: prefill known host/runtime/cwd, ask for
+missing model/settings, and label host-default model honestly if selected. Do
+not inspect private runtime configuration or claim exact inheritance from fields
+the roster never stored. API-only project creation can expose pending setup;
+it cannot execute a browser-owned SSH plan.
+
+Required isolated checks: vault write failure prevents SSH; reload before/after
+registration and after tmux creation; lost SSH/API response; concurrent retries;
+renamed/reused session names; same attempt with changed payload; explicit exited
+restart replay with one new run; retired/closed role handling; old run receipts;
+different SSH account/socket/host; missing vault plan; 31+handler capacity and
+zero helper allowance. The host cleanup currently distinguishes older-run
+receipts from current-run acknowledgement, so preserve that behavior.
+
+No tests were run for this read-only recommendation. A role-only registration
+change without the host journal/reconciliation path is insufficient to claim
+safe durable launch retry.

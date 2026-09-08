@@ -32,7 +32,8 @@ Commands
   bind [--thread UUID]        bind this agent to its exact Codex thread
   brief                        print the shared task briefing
   status                       identity, hub reachability, own agent, unread count
-  tasks                        list tasks on the hub
+  projects                     list projects on the hub (tasks is an alias)
+  work-items <command>         list/get/create/update/dispatch bugs and features
   agents [--json]              list agents on this task
   event <kind> [--text T]      post started|running|done|needs_input|exited|closed
   post <text> [--to AGENT]     post a message to the task or one agent
@@ -50,7 +51,7 @@ Commands
   hooks <claude|codex|generic> print integration snippets
   hook <session-start|prompt|stop|notification|codex>
                                handlers invoked by agent runtimes
-  new-task --name N [--goal G] create a task (prints its id)
+  new-project --name N [--goal G] create a project (new-task is an alias)
 `
 
 type env struct {
@@ -119,8 +120,10 @@ func main() {
 		err = cmdBrief(e)
 	case "status":
 		err = cmdStatus(e)
-	case "tasks":
+	case "tasks", "projects":
 		err = cmdTasks(e, args)
+	case "work-items":
+		err = cmdWorkItems(e, args)
 	case "agents":
 		err = cmdAgents(e, args)
 	case "event":
@@ -149,7 +152,7 @@ func main() {
 		err = cmdHooks(args)
 	case "hook":
 		err = cmdHook(e, args)
-	case "new-task":
+	case "new-task", "new-project":
 		err = cmdNewTask(e, args)
 	default:
 		fmt.Fprint(os.Stderr, usage)
@@ -254,7 +257,11 @@ func cmdAgents(e env, args []string) error {
 		if a.ID == e.agent {
 			self = "*"
 		}
-		fmt.Printf("%s %s  %-12s %-12s %s@%s unread=%d\n", self, a.ID, a.Status, a.Name, a.Session, a.Host, a.Unread)
+		role := ""
+		if a.Role != "" {
+			role = " role=" + a.Role
+		}
+		fmt.Printf("%s %s  %-12s %-12s %s@%s%s unread=%d\n", self, a.ID, a.Status, a.Name, a.Session, a.Host, role, a.Unread)
 	}
 	return nil
 }
@@ -466,6 +473,9 @@ func selfPath() string {
 func cmdSpawn(e env, args []string) error {
 	fs := flag.NewFlagSet("spawn", flag.ExitOnError)
 	name := fs.String("name", "", "agent name (required)")
+	agentID := fs.String("agent-id", "", "stable agent identity for database_handler launch/retry")
+	expectedRunID := fs.String("expected-run-id", "", "exited database_handler run to restart")
+	role := fs.String("role", "", "project role (database_handler)")
 	run := fs.String("run", "", "command to run in the agent window (required)")
 	cwd := fs.String("cwd", "", "working directory")
 	prompt := fs.String("prompt", "", "appended to the command as a quoted argument")
@@ -482,6 +492,15 @@ func cmdSpawn(e env, args []string) error {
 	}
 	if !api.ValidName(*name) {
 		return errors.New("name must match [A-Za-z0-9_-]{1,64}")
+	}
+	if *role != "" && *role != api.AgentRoleDatabaseHandler {
+		return errors.New("role must be database_handler when set")
+	}
+	if *role == api.AgentRoleDatabaseHandler && !api.ValidID(*agentID, "agt") {
+		return errors.New("database_handler requires a stable --agent-id")
+	}
+	if *role == "" && (*agentID != "" || *expectedRunID != "") {
+		return errors.New("--agent-id and --expected-run-id are reserved for database_handler launches")
 	}
 	if *task == "" || *hub == "" {
 		return errors.New("task and hub are required (TAILTERM_TASK/TAILTERM_HUB or --task/--hub)")
@@ -549,12 +568,15 @@ func cmdSpawn(e env, args []string) error {
 	}
 	ctx, cancel := ctxTimeout(15 * time.Second)
 	defer cancel()
-	session := spawn.UniqueSession(*name)
+	session := ""
+	if *role == "" {
+		session = spawn.UniqueSession(*name)
+	}
 	detail, err := c.GetTask(ctx, *task)
 	if err != nil {
 		return err
 	}
-	briefing := taskBriefing(detail.Task, *name)
+	briefing := agentTaskBriefing(detail.Task, *name, *role, detail.Agents)
 	if *permissionMode != "" {
 		briefing += "\nRequested launch permission mode: " + *permissionMode + ". Permission denials are real failures, not approvals. Do not repeat an unchanged denied action. Report a precise Permission blocked status to the orchestrator and continue independent permitted work."
 	}
@@ -564,24 +586,41 @@ func cmdSpawn(e env, args []string) error {
 	if *runtime != "generic" {
 		command = baseCommand + " " + spawn.ShellQuote(briefing)
 	}
-	agent, err := c.AddAgent(ctx, *task, api.AddAgentRequest{
-		Name: *name, Host: spawn.Host(), Session: session,
-		Runtime: *runtime, Cwd: *cwd, ParentAgentID: e.agent,
-	})
-	if err != nil {
-		return fmt.Errorf("register agent: %w", err)
+	parent := e.agent
+	if *role == api.AgentRoleDatabaseHandler {
+		parent = ""
 	}
-	err = spawn.Create(spawn.Options{
+	req := api.AddAgentRequest{
+		ExpectedRunID: *expectedRunID, Role: *role, AgentID: *agentID,
+		Name: *name, Host: spawn.Host(), Session: session,
+		Runtime: *runtime, Cwd: *cwd, ParentAgentID: parent,
+	}
+	opts := spawn.Options{
 		Session: session, Cwd: *cwd, Command: command, Self: selfPath(),
 		Env: map[string]string{
 			"TAILTERM_PERMISSION_RUNTIME": *runtime, "TAILTERM_PERMISSION_MODE": *permissionMode, "TAILTERM_ALLOWED_TOOLS": *allowedJSON, "TAILTERM_LAUNCH_CWD": *cwd,
-			"TAILTERM_TOKEN": e.token, spawn.EnvHub: *hub, spawn.EnvTask: *task, spawn.EnvAgent: agent.ID,
-			spawn.EnvAgentName: agent.Name, spawn.EnvSession: session, "TAILTERM_RUN": agent.RunID, "TAILTERM_BRIEFING": briefing,
+			"TAILTERM_TOKEN": e.token, spawn.EnvHub: *hub, spawn.EnvTask: *task,
+			"TAILTERM_HANDLER_COMMAND": baseCommand, "TAILTERM_HANDLER_PROMPT": *prompt, "TAILTERM_BRIEFING": briefing,
 		},
-	})
-	if err != nil {
-		_, _ = c.CloseAgent(ctx, *task, agent.ID)
-		return err
+	}
+	var agent api.Agent
+	if *role == api.AgentRoleDatabaseHandler {
+		agent, err = ensureHandler(ctx, c, *task, req, opts)
+		if err != nil {
+			return err
+		}
+	} else {
+		agent, err = c.AddAgent(ctx, *task, req)
+		if err != nil {
+			return fmt.Errorf("register agent: %w", err)
+		}
+		opts.Env[spawn.EnvAgent], opts.Env[spawn.EnvAgentName], opts.Env[spawn.EnvSession], opts.Env["TAILTERM_RUN"] = agent.ID, agent.Name, session, agent.RunID
+		delete(opts.Env, "TAILTERM_HANDLER_COMMAND")
+		delete(opts.Env, "TAILTERM_HANDLER_PROMPT")
+		if err = spawn.Create(opts); err != nil {
+			_, _ = c.CloseAgent(ctx, *task, agent.ID)
+			return err
+		}
 	}
 	// The relay also adopts already-running sessions.
 	if _, rememberErr := rememberSessions(ctx, *hub); rememberErr != nil {
@@ -590,7 +629,7 @@ func cmdSpawn(e env, args []string) error {
 	if *asJSON {
 		printJSON(agent)
 	} else {
-		fmt.Printf("spawned %s as %s in tmux session %s\n", agent.Name, agent.ID, session)
+		fmt.Printf("spawned %s as %s in tmux session %s\n", agent.Name, agent.ID, agent.Session)
 	}
 	return nil
 }

@@ -7,6 +7,8 @@ import { createTaskHub } from "./task-hub.js";
 import { MODES, setupModes } from "./modes.js";
 import { createBoardView } from "./board-view.js";
 import { createTasksView } from "./tasks-view.js";
+import { createWorkItemsView } from "./work-items-view.js";
+import "./work-items.css";
 import { createFilesView } from "./files-view.js";
 import { normalizeTaskRef } from "./task-ref.js";
 import { createInactivityLock, IDLE_MINUTES } from "./inactivity.js";
@@ -125,6 +127,8 @@ let taskHub = null,
   modes = null,
   boardView = null,
   tasksView = null,
+  bugsView = null,
+  featuresView = null,
   filesView = null;
 let discoveryPending = false;
 applyChrome(appearance);
@@ -567,6 +571,10 @@ function mount() {
       configure: () => taskHub.configure(),
     });
     tasksView = createTasksView({
+      openWorkItems: (kind, id) => {
+        modes.set(kind);
+        (kind === "bugs" ? bugsView : featuresView).show(id);
+      },
       client: () => taskHub.client(),
       taskHub,
       getTabs: () => tabs,
@@ -576,7 +584,7 @@ function mount() {
         confirmDialog({
           title,
           message,
-          action: "Close task",
+          action: "Close project",
           destructive: true,
         }),
       openBoard: (id) => {
@@ -585,6 +593,19 @@ function mount() {
       },
       configure: () => taskHub.configure(),
     });
+    const workItemHost = {
+      client: () => taskHub.client(),
+      dialog,
+      closeDialog,
+      notice,
+      configure: () => taskHub.configure(),
+      openBoard: (id) => {
+        modes.set("board");
+        boardView.show(id);
+      },
+    };
+    bugsView = createWorkItemsView({ ...workItemHost, kind: "bug" });
+    featuresView = createWorkItemsView({ ...workItemHost, kind: "feature" });
     filesView = createFilesView({
       getServers: () => data.servers,
       currentServer,
@@ -630,6 +651,8 @@ function mount() {
       onChange: (mode, view) => {
         boardView.hide();
         tasksView.hide();
+        bugsView.hide();
+        featuresView.hide();
         filesView.hide();
         teamsView.hide();
         view.replaceChildren();
@@ -639,6 +662,10 @@ function mount() {
         } else if (mode === "tasks") {
           tasksView.mount(view);
           tasksView.show();
+        } else if (mode === "bugs" || mode === "features") {
+          const items = mode === "bugs" ? bugsView : featuresView;
+          items.mount(view);
+          items.show();
         } else if (mode === "teams") {
           teamsView.mount(view);
           teamsView.show();
@@ -901,7 +928,7 @@ function renderTabs() {
         .filter(Boolean)
         .join(" ");
       const taskLine = group?.taskId
-        ? `\n${taskHub?.rollup(group.taskId) || "Task " + group.taskId}`
+        ? `\n${taskHub?.rollup(group.taskId) || "Project " + group.taskId}`
         : "";
       const title =
         (grouped
@@ -2363,6 +2390,8 @@ async function lock() {
   taskHub?.stopAll();
   boardView?.hide();
   tasksView?.hide();
+  bugsView?.hide();
+  featuresView?.hide();
   filesView?.hide();
   teamsView?.hide();
   imageUploads?.cancel();

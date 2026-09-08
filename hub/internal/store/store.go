@@ -119,6 +119,18 @@ func parseTS(s string) time.Time {
 	return t
 }
 
+func validRunID(id string) bool {
+	if len(id) != 20 || !strings.HasPrefix(id, "run_") {
+		return false
+	}
+	for _, r := range id[4:] {
+		if !((r >= '0' && r <= '9') || (r >= 'a' && r <= 'f')) {
+			return false
+		}
+	}
+	return true
+}
+
 // Tasks
 
 func (s *Store) CreateTask(ctx context.Context, req api.CreateTaskRequest, by api.Caller) (api.Task, error) {
@@ -297,12 +309,12 @@ func (s *Store) CloseTask(ctx context.Context, id string, by api.Caller) (api.Ta
 
 // Agents
 
-const agentCols = `id,task_id,name,host,session,runtime,cwd,parent_agent_id,status,title,created_at,last_event_at,run_id,last_seen_at,blocked_reason,blocked_text,cleanup_done,cleanup_error`
+const agentCols = `id,task_id,name,host,session,runtime,cwd,parent_agent_id,role,status,title,created_at,last_event_at,run_id,last_seen_at,blocked_reason,blocked_text,cleanup_done,cleanup_error`
 
 func scanAgent(row interface{ Scan(...any) error }) (api.Agent, error) {
 	var a api.Agent
 	var created, last, seen string
-	err := row.Scan(&a.ID, &a.TaskID, &a.Name, &a.Host, &a.Session, &a.Runtime, &a.Cwd, &a.ParentAgentID, &a.Status, &a.Title, &created, &last, &a.RunID, &seen, &a.BlockedReason, &a.BlockedText, &a.CleanupDone, &a.CleanupError)
+	err := row.Scan(&a.ID, &a.TaskID, &a.Name, &a.Host, &a.Session, &a.Runtime, &a.Cwd, &a.ParentAgentID, &a.Role, &a.Status, &a.Title, &created, &last, &a.RunID, &seen, &a.BlockedReason, &a.BlockedText, &a.CleanupDone, &a.CleanupError)
 	a.CreatedAt, a.LastEventAt = parseTS(created), parseTS(last)
 	a.LastSeenAt = parseTS(seen)
 	a.Online = !a.LastSeenAt.IsZero() && time.Since(a.LastSeenAt) < 90*time.Second && a.Status != api.AgentExited && a.Status != api.AgentClosed
@@ -318,6 +330,18 @@ func (s *Store) AddAgent(ctx context.Context, taskID string, req api.AddAgentReq
 	}
 	if t.Status != api.TaskOpen {
 		return api.Agent{}, api.ErrClosed
+	}
+	if req.Role != "" && req.Role != api.AgentRoleDatabaseHandler {
+		return api.Agent{}, api.ErrInvalid
+	}
+	if req.Role == api.AgentRoleDatabaseHandler && req.ParentAgentID != "" {
+		return api.Agent{}, api.ErrInvalid
+	}
+	if req.Role == api.AgentRoleDatabaseHandler && !api.ValidID(req.AgentID, "agt") {
+		return api.Agent{}, api.ErrInvalid
+	}
+	if req.ExpectedRunID != "" && (req.Role != api.AgentRoleDatabaseHandler || !api.ValidID(req.AgentID, "agt") || !validRunID(req.ExpectedRunID)) {
+		return api.Agent{}, api.ErrInvalid
 	}
 	if req.ParentAgentID != "" {
 		parent, err := s.GetAgent(ctx, req.ParentAgentID)
@@ -335,6 +359,55 @@ func (s *Store) AddAgent(ctx context.Context, taskID string, req api.AddAgentReq
 		if existing, err := s.GetAgent(ctx, req.AgentID); err == nil {
 			if existing.TaskID != taskID {
 				return api.Agent{}, api.ErrInvalid
+			}
+			if (existing.Role == api.AgentRoleDatabaseHandler || req.Role == api.AgentRoleDatabaseHandler) &&
+				(existing.Name != req.Name || existing.Host != req.Host || existing.Session != req.Session || existing.Runtime != req.Runtime || existing.Cwd != req.Cwd || existing.ParentAgentID != req.ParentAgentID || existing.Role != req.Role) {
+				return api.Agent{}, fmt.Errorf("%w: database handler launch settings changed", api.ErrConflict)
+			}
+			if existing.Role == api.AgentRoleDatabaseHandler {
+				if existing.Status == api.AgentClosed {
+					return api.Agent{}, api.ErrClosed
+				}
+				if req.ExpectedRunID != "" && req.ExpectedRunID != existing.RunID {
+					return api.Agent{}, fmt.Errorf("%w: database handler run changed; refresh before restarting", api.ErrConflict)
+				}
+				if existing.Status == api.AgentExited {
+					if req.ExpectedRunID == "" {
+						return api.Agent{}, fmt.Errorf("%w: exited database handler requires expectedRunId", api.ErrConflict)
+					}
+					var active int
+					if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM agents WHERE task_id=? AND status NOT IN ('closed','exited')`, taskID).Scan(&active); err != nil {
+						return api.Agent{}, err
+					}
+					if active >= s.MaxAgents {
+						return api.Agent{}, api.ErrLimit
+					}
+					runID := api.NewID("run")
+					tx, err := s.db.BeginTx(ctx, nil)
+					if err != nil {
+						return api.Agent{}, err
+					}
+					defer tx.Rollback()
+					result, err := tx.ExecContext(ctx, `UPDATE agents SET run_id=?,status='starting',last_seen_at='',cleanup_done=0,cleanup_error='' WHERE id=? AND run_id=? AND status='exited'`, runID, existing.ID, req.ExpectedRunID)
+					if err != nil {
+						return api.Agent{}, err
+					}
+					changed, err := result.RowsAffected()
+					if err != nil {
+						return api.Agent{}, err
+					}
+					if changed != 1 {
+						return api.Agent{}, fmt.Errorf("%w: database handler run changed during restart", api.ErrConflict)
+					}
+					if _, err = s.insertEvent(ctx, tx, taskID, api.EventAgentAdded, existing.ID, existing.Name, map[string]any{"runId": runID, "role": existing.Role}, by); err != nil {
+						return api.Agent{}, err
+					}
+					if err = tx.Commit(); err != nil {
+						return api.Agent{}, err
+					}
+					s.notify(taskID)
+					return s.GetAgent(ctx, existing.ID)
+				}
 			}
 			return existing, nil
 		}
@@ -361,7 +434,10 @@ func (s *Store) AddAgent(ctx context.Context, taskID string, req api.AddAgentReq
 		if e != nil {
 			return api.Agent{}, e
 		}
-		if previous.Status != api.AgentExited || previous.Host != req.Host || previous.ParentAgentID != req.ParentAgentID {
+		if req.Role == api.AgentRoleDatabaseHandler {
+			return api.Agent{}, fmt.Errorf("%w: database handler restart requires its stable agentId and expectedRunId", api.ErrConflict)
+		}
+		if previous.Status != api.AgentExited || previous.Host != req.Host || previous.ParentAgentID != req.ParentAgentID || previous.Role != req.Role {
 			return api.Agent{}, api.ErrLimit
 		}
 		runID := api.NewID("run")
@@ -378,6 +454,16 @@ func (s *Store) AddAgent(ctx context.Context, taskID string, req api.AddAgentReq
 	if err != sql.ErrNoRows {
 		return api.Agent{}, err
 	}
+	if req.Role == api.AgentRoleDatabaseHandler {
+		var existingID string
+		err = s.db.QueryRowContext(ctx, `SELECT id FROM agents WHERE task_id=? AND role=? AND status<>'closed' LIMIT 1`, taskID, api.AgentRoleDatabaseHandler).Scan(&existingID)
+		if err == nil {
+			return api.Agent{}, fmt.Errorf("%w: project already has a database handler", api.ErrConflict)
+		}
+		if err != sql.ErrNoRows {
+			return api.Agent{}, err
+		}
+	}
 	if req.ParentAgentID != "" {
 		var helpers int
 		if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM agents WHERE task_id=? AND parent_agent_id<>''`, taskID).Scan(&helpers); err != nil {
@@ -389,16 +475,16 @@ func (s *Store) AddAgent(ctx context.Context, taskID string, req api.AddAgentReq
 	}
 	now := s.now()
 	a := api.Agent{RunID: api.NewID("run"), ID: req.AgentID, TaskID: taskID, Name: req.Name, Host: req.Host, Session: req.Session, Runtime: req.Runtime,
-		Cwd: req.Cwd, ParentAgentID: req.ParentAgentID, Status: api.AgentStarting, CreatedAt: now, LastEventAt: now}
+		Cwd: req.Cwd, ParentAgentID: req.ParentAgentID, Role: req.Role, Status: api.AgentStarting, CreatedAt: now, LastEventAt: now}
 	if a.ID == "" {
 		a.ID = api.NewID("agt")
 	}
-	_, err = s.db.ExecContext(ctx, `INSERT INTO agents (`+agentCols+`) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-		a.ID, a.TaskID, a.Name, a.Host, a.Session, a.Runtime, a.Cwd, a.ParentAgentID, a.Status, a.Title, ts(now), ts(now), a.RunID, "", "", "", false, "")
+	_, err = s.db.ExecContext(ctx, `INSERT INTO agents (`+agentCols+`) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		a.ID, a.TaskID, a.Name, a.Host, a.Session, a.Runtime, a.Cwd, a.ParentAgentID, a.Role, a.Status, a.Title, ts(now), ts(now), a.RunID, "", "", "", false, "")
 	if err != nil {
 		return a, err
 	}
-	_, err = s.addEvent(ctx, taskID, api.EventAgentAdded, a.ID, a.Name, map[string]any{"host": a.Host, "session": a.Session, "runtime": a.Runtime, "parentAgentId": a.ParentAgentID}, by)
+	_, err = s.addEvent(ctx, taskID, api.EventAgentAdded, a.ID, a.Name, map[string]any{"host": a.Host, "session": a.Session, "runtime": a.Runtime, "parentAgentId": a.ParentAgentID, "role": a.Role}, by)
 	return a, err
 }
 
@@ -558,7 +644,20 @@ func (s *Store) PostMessage(ctx context.Context, taskID string, req api.PostMess
 		return api.Message{}, err
 	}
 	defer tx.Rollback()
-	m := api.Message{Broadcast: t.Swarm, ReplyTo: req.ReplyTo, TaskID: taskID, From: api.Sender{AgentID: req.AgentID, Node: by.Node, User: by.User}, To: req.To, Text: req.Text, CreatedAt: s.now()}
+	m, err := s.insertMessage(ctx, tx, t, req, target, by)
+	if err != nil {
+		return m, err
+	}
+	if err = tx.Commit(); err != nil {
+		return m, err
+	}
+	s.notify(taskID)
+	return m, nil
+}
+
+func (s *Store) insertMessage(ctx context.Context, tx *sql.Tx, task api.Task, req api.PostMessageRequest, target api.Agent, by api.Caller) (api.Message, error) {
+	taskID := task.ID
+	m := api.Message{Broadcast: task.Swarm, ReplyTo: req.ReplyTo, TaskID: taskID, From: api.Sender{AgentID: req.AgentID, Node: by.Node, User: by.User}, To: req.To, Text: req.Text, CreatedAt: s.now()}
 	res, err := tx.ExecContext(ctx, `INSERT INTO messages (task_id,from_agent,from_node,from_user,to_agent,text,created_at,reply_to,broadcast) VALUES (?,?,?,?,?,?,?,?,?)`,
 		taskID, req.AgentID, by.Node, by.User, req.To, req.Text, ts(m.CreatedAt), req.ReplyTo, m.Broadcast)
 	if err != nil {
@@ -592,10 +691,6 @@ func (s *Store) PostMessage(ctx context.Context, taskID string, req api.PostMess
 			}
 		}
 	}
-	if err = tx.Commit(); err != nil {
-		return m, err
-	}
-	s.notify(taskID)
 	return m, nil
 }
 

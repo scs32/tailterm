@@ -34,6 +34,7 @@ func New(st *store.Store, identity Identity) *Server {
 	m.HandleFunc("GET /v1/whoami", s.whoami)
 	m.HandleFunc("GET /v1/tasks", s.listTasks)
 	m.HandleFunc("POST /v1/tasks", s.createTask)
+	m.HandleFunc("GET /v1/work-items", s.listAllWorkItems)
 	m.HandleFunc("GET /v1/tasks/{id}", s.getTask)
 	m.HandleFunc("PATCH /v1/tasks/{id}", s.updateTask)
 	m.HandleFunc("DELETE /v1/tasks/{id}", s.closeTask)
@@ -48,6 +49,11 @@ func New(st *store.Store, identity Identity) *Server {
 	m.HandleFunc("POST /v1/tasks/{id}/messages/read", s.markRead)
 	m.HandleFunc("POST /v1/tasks/{id}/events", s.postEvent)
 	m.HandleFunc("GET /v1/tasks/{id}/events", s.taskEvents)
+	m.HandleFunc("GET /v1/tasks/{id}/work-items", s.listTaskWorkItems)
+	m.HandleFunc("POST /v1/tasks/{id}/work-items", s.createWorkItem)
+	m.HandleFunc("GET /v1/tasks/{id}/work-items/{wid}", s.getWorkItem)
+	m.HandleFunc("PATCH /v1/tasks/{id}/work-items/{wid}", s.updateWorkItem)
+	m.HandleFunc("POST /v1/tasks/{id}/work-items/{wid}/dispatch", s.dispatchWorkItem)
 	m.HandleFunc("GET /v1/events", s.globalEvents)
 	return s
 }
@@ -101,6 +107,8 @@ func fail(w http.ResponseWriter, err error) {
 		writeError(w, http.StatusForbidden, "Agents cannot add agents to this task. Ask the owner to enable Allow agents to add other agents in task settings.")
 	case errors.Is(err, api.ErrInvalid):
 		writeError(w, http.StatusBadRequest, "invalid request")
+	case errors.Is(err, api.ErrConflict):
+		writeError(w, http.StatusConflict, err.Error())
 	case errors.Is(err, api.ErrLimit):
 		writeError(w, http.StatusConflict, "limit reached")
 	case errors.Is(err, api.ErrClosed):

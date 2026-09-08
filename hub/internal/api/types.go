@@ -66,7 +66,7 @@ func NewID(prefix string) string {
 	return prefix + "_" + hex.EncodeToString(b[:])
 }
 
-var idRE = regexp.MustCompile(`^(tsk|agt)_[0-9a-f]{16}$`)
+var idRE = regexp.MustCompile(`^(tsk|agt|wi)_[0-9a-f]{16}$`)
 
 // ValidID reports whether s is a well-formed task or agent id with the given prefix.
 func ValidID(s, prefix string) bool {
@@ -156,6 +156,7 @@ type Task struct {
 }
 
 type Agent struct {
+	Role          string    `json:"role,omitempty"`
 	CleanupDone   bool      `json:"cleanupDone"`
 	CleanupError  string    `json:"cleanupError,omitempty"`
 	BlockedReason string    `json:"blockedReason,omitempty"`
@@ -229,6 +230,8 @@ type UpdateTaskRequest struct {
 }
 
 type AddAgentRequest struct {
+	ExpectedRunID string `json:"expectedRunId,omitempty"`
+	Role          string `json:"role,omitempty"`
 	AgentID       string `json:"agentId"`
 	Name          string `json:"name"`
 	Host          string `json:"host"`
@@ -294,6 +297,7 @@ type ErrorResponse struct {
 var (
 	ErrNotFound           = errors.New("not found")
 	ErrInvalid            = errors.New("invalid")
+	ErrConflict           = errors.New("conflict")
 	ErrAgentSpawnLimit    = errors.New("maximum additional agents reached for this task")
 	ErrAgentSpawnDisabled = errors.New("agents cannot add agents to this task")
 	ErrLimit              = errors.New("limit reached")

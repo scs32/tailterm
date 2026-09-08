@@ -10,8 +10,8 @@ servers feel like one place. SSH connections and the Tailscale client run in the
 browser through Go WebAssembly; xterm.js renders terminals. Remote tmux keeps
 sessions alive independently of a page or SSH connection.
 
-The current development branch adds coordinated AI-agent teams, tasks, shared
-messages, and encrypted cross-device profiles. It is published at
+The current development branch adds coordinated AI-agent teams, projects, scoped
+Bugs and Features, shared messages, and encrypted cross-device profiles. It is published at
 **https://tailos.tailarr.com**. The original **https://tailterm.tailarr.com** is a
 separate, older release and must not be overwritten by this work.
 
@@ -27,7 +27,7 @@ are not implemented.
 ```text
 HTTPS static site (Cloudflare Pages project: tailos)
   └─ Browser
-      ├─ UI: terminal groups, Tasks, Board, Teams, settings
+      ├─ UI: terminal groups, Projects, Board, Teams, Bugs, Features, settings
       ├─ encrypted local vault and optional encrypted profile sync
       ├─ xterm.js + WebGL / optional DOM rendering
       └─ Go WASM: Tailscale transport, SSH, SFTP
@@ -64,6 +64,9 @@ The deployed frontend uses `npm run build:static` instead.
 - A tmux session lives on a remote machine. Browser panes attach to it.
 - Every main terminal tab is a group, even if it contains one session.
 - Ordinary groups can be rearranged and combined; panes can be resized.
+- Ordinary pane dragging swaps positions. Holding physical Left Option places
+  the dragged pane to the target's right; Right Option places it above. The
+  preview follows modifier changes while preserving project-group boundaries.
 - Each task owns a dedicated group named after the task. Agent registration
   causes its pane to appear in that group, including agents spawned later.
 - Task groups cannot merge into another task or ordinary group. An ordinary
@@ -82,6 +85,25 @@ bounded `hostname -s` probe. This matters because Mini reports `Stephens-Mini`,
 which differs from some saved Tailscale/DNS names. Do not simplify matching back
 to literal hostname equality.
 
+### Projects, Bugs, and Features
+
+Projects is the UI name for the existing task hub; task IDs, routes, CLI commands,
+and environment variables remain compatible. Bugs and Features are durable,
+project-owned records with status, priority, revision checks, and retry receipts.
+Both tabs can filter by project or show all projects. Closed projects stay readable.
+
+Send to project saves a directed board message to the selected open project's
+orchestrator. It defaults to the owning project; choosing another does not move
+the record or start a team. The receipt confirms message storage, not execution.
+
+Browser-created projects launch a database handler after the orchestrator. The
+handler inherits its resolved launch settings and records agent discoveries in
+the same database; direct UI/CLI writes remain available while it is offline.
+Existing and headless-created projects offer explicit handler setup because the
+hub does not launch remote processes. Encrypted local launch plans and verified
+host receipts make retries safe; ambiguous interrupted launches require inspection.
+See [Projects, Bugs, and Features](project-work-items.md) for recovery and dispatch.
+
 ### Teams and launching
 
 Teams are reusable templates. They supersede older saved launch profiles; a team
@@ -89,6 +111,9 @@ of one covers the original single-agent setup. Templates contain up to 32 member
 with names, runtime, model, role, instructions, optional machine/folder overrides,
 command overrides, and permissions/tool settings. Editing a team changes future
 launches, not running agents.
+
+New-project launches reserve one of the 32 active-agent slots for the database
+handler, allowing at most 31 ordinary template members for that launch.
 
 A member without an assigned machine uses the **Main machine** selected for that
 launch. A member without a folder override uses the explicit project folder
@@ -118,7 +143,7 @@ while staying available to the owner.
 **Allow agents to add other agents** controls agent-originated helper launches.
 **Max new agents** is a separate lifetime allowance for additional identities,
 including descendants and finished helpers. It defaults to two. Manual additions
-do not consume it; the deployed hub's overall open-agent cap is 32. Retired agents
+do not consume it; the deployed hub's per-project active-agent cap is 32. Retired agents
 still occupy open-agent slots because their sessions and identities remain.
 
 **Enable swarm** broadcasts new messages to all members while preserving an
@@ -174,7 +199,7 @@ after termination, the host retries the receipt without needing the old session.
 Older sessions are adopted; already-absent legacy sessions can be confirmed on
 the corresponding saved SSH host through Retry cleanup.
 
-Closed task rows expose **View history**. Board also has **Closed tasks**. The
+Closed task rows expose **View history**. Board also has **Closed projects**. The
 closed board is read-only; **Download history** exports JSON containing the task,
 roster, all retained messages and activity events. The board previews the latest
 200 messages and can load the full conversation; exports paginate independently.
@@ -216,7 +241,8 @@ from the shared task token.
 
 Synced: saved servers and SSH credentials/keys, bookmarks, hub configuration,
 teams, appearance. Local only: Tailscale identity, current pane/window layout,
-scrollback, clipboard, transient authentication, and voice state. Tasks/messages
+scrollback, clipboard, transient authentication, voice state, and project handler
+recovery plans. Projects, work items, and messages
 already live on the hub. Conflicts pause sync for an explicit local/server choice;
 it does not silently merge divergent vaults. The server retains ten prior encrypted
 profile revisions. See [profile sync](profile-sync.md).
@@ -232,7 +258,8 @@ hub currently uses one shared trusted-workspace credential.
 | Application bootstrap, static/gateway integration | `client/main.js` |
 | Task synchronization, launch dialogs, host aliases | `client/task-hub.js` |
 | Task/group reconciliation | `client/tasks.js`, `client/pane-groups.js` |
-| Tasks, messages, teams | `client/tasks-view.js`, `client/board-view.js`, `client/teams-view.js` |
+| Projects, messages, teams | `client/tasks-view.js`, `client/board-view.js`, `client/teams-view.js` |
+| Bugs/Features and handler launch plans | `client/work-items-view.js`, `client/work-items.css`, `client/project-handler.js`, `hub/internal/api/work_items.go` |
 | History pagination/export | `client/task-history.js` |
 | Team schema, presets, models, permissions UI | `client/teams.js`, `client/team-examples.js`, `client/model-picker.js`, `client/agent-controls.js` |
 | Remote folder selection | `client/project-folder.js` |
@@ -252,7 +279,7 @@ Use compact, consistent controls: selected state has background fill; hover uses
 an outline. Dropdowns align in height with adjacent inputs/buttons. Placeholder
 text must look like a placeholder. Avoid decorative filler, oversized action
 buttons, motivational empty-state text, and expanding menus that become huge
-panels. Tasks/Board/Teams intentionally leave empty areas quiet.
+panels. Projects/Board/Teams intentionally leave empty areas quiet.
 
 Fullscreen uses the browser Fullscreen API for the whole UI. Expand changes the
 workspace view by hiding the sidebar. The two controls are independent. Files is

@@ -1,0 +1,82 @@
+.work-items-view {
+  padding: 20px;
+  max-width: 1400px;
+  margin: 0 auto;
+}
+#workspace .mode-switch {
+  flex-wrap: wrap;
+}
+.work-items-head,
+.work-items-controls,
+.work-item {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+.work-items-head {
+  justify-content: space-between;
+  flex-wrap: wrap;
+  margin-bottom: 16px;
+}
+.work-items-head h2 {
+  margin: 0;
+}
+.work-items-controls {
+  flex-wrap: wrap;
+  align-items: end;
+}
+.work-items-controls label,
+.work-item-fields label {
+  display: grid;
+  gap: 4px;
+  font-size: 12px;
+}
+.work-items-controls select {
+  max-width: 260px;
+}
+.work-items-controls select,
+.work-items-controls button,
+.work-item > button {
+  height: 32px;
+}
+.work-items-list {
+  display: grid;
+  gap: 6px;
+}
+.work-item {
+  padding: 10px 0;
+  border-bottom: 1px solid
+    var(--line, color-mix(in srgb, var(--muted) 25%, transparent));
+  justify-content: space-between;
+}
+.work-item-copy {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+}
+.work-item-title {
+  text-align: left;
+  padding: 4px 6px;
+  margin-left: -6px;
+  overflow-wrap: anywhere;
+}
+.work-item > button {
+  flex-shrink: 0;
+}
+.work-item-fields {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px;
+}
+@media (max-width: 640px) {
+  .work-items-view {
+    padding: 12px;
+  }
+  .work-item {
+    align-items: start;
+    flex-wrap: wrap;
+  }
+  .work-items-controls select {
+    max-width: 180px;
+  }
+}

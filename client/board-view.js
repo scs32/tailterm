@@ -89,7 +89,7 @@ export function createBoardView({
     subscription = null;
     if (!client()) {
       root.innerHTML =
-        '<div class="mode-empty"><span class="eyebrow">BOARD</span><h2>Connect a task hub.</h2><button id="board-configure" class="primary">Configure task hub</button></div>';
+        '<div class="mode-empty"><span class="eyebrow">BOARD</span><h2>Connect a project hub.</h2><button id="board-configure" class="primary">Configure project hub</button></div>';
       root.querySelector("#board-configure").onclick = configure;
       return;
     }
@@ -182,14 +182,14 @@ export function createBoardView({
       `<button data-board-task="${esc(t.id)}" aria-pressed="${t.id === selected}"><span class="board-task-name">${esc(t.name)}</span>${t.goal ? `<span class="fine">${esc(t.goal)}</span>` : ""}</button>`;
     const closedTasks = tasks.filter((t) => t.status === "closed");
     renderedTask = selected;
-    root.innerHTML = `<div class="board mode-board"><aside class="board-rail"><div class="board-rail-head"><span class="eyebrow">TASKS</span><button id="board-new-task" title="New task">＋</button></div>${tasks
+    root.innerHTML = `<div class="board mode-board"><aside class="board-rail"><div class="board-rail-head"><span class="eyebrow">PROJECTS</span><button id="board-new-task" title="New project">＋</button></div>${tasks
       .filter((t) => t.status === "open")
       .map(taskButton)
       .join(
         "",
-      )}${closedTasks.length ? `<details class="board-closed" ${archived ? "open" : ""}><summary>Closed tasks · ${closedTasks.length}</summary>${closedTasks.map(taskButton).join("")}</details>` : ""}</aside><section class="board-thread">${
+      )}${closedTasks.length ? `<details class="board-closed" ${archived ? "open" : ""}><summary>Closed projects · ${closedTasks.length}</summary>${closedTasks.map(taskButton).join("")}</details>` : ""}</aside><section class="board-thread">${
       detail
-        ? `<div class="board-head"><div class="view-heading"><div><span class="eyebrow">BOARD</span><h2>${esc(detail.task.name)}</h2></div><div class="view-actions">${archived ? `<span class="fine">Closed · ${esc(new Date(detail.task.closedAt).toLocaleDateString())}</span><button id="board-download">Download history</button>` : '<button id="board-attach">Terminals</button><button id="board-settings" title="Task settings">Settings</button>'}</div></div><p class="fine">${esc(detail.task.goal)}</p><div class="board-agents-row">${agents
+        ? `<div class="board-head"><div class="view-heading"><div><span class="eyebrow">BOARD</span><h2>${esc(detail.task.name)}</h2></div><div class="view-actions">${archived ? `<span class="fine">Closed · ${esc(new Date(detail.task.closedAt).toLocaleDateString())}</span><button id="board-download">Download history</button>` : '<button id="board-attach">Terminals</button><button id="board-settings" title="Project settings">Settings</button>'}</div></div><p class="fine">${esc(detail.task.goal)}</p><div class="board-agents-row">${agents
             .filter((a) => archived || a.status !== "closed")
             .map(
               (a) =>
@@ -232,7 +232,7 @@ export function createBoardView({
           else {
             revealAgent?.(b.dataset.boardAgent);
             notice(
-              "Agent pane requested. Attach this task to a terminal tab if needed.",
+              "Agent pane requested. Attach this project to a terminal tab if needed.",
             );
           }
         }),

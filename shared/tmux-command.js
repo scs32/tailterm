@@ -155,6 +155,9 @@ export function agentSpawnCommand({
   model = "",
   permissionMode = "",
   allowedTools = [],
+  agentRole = "",
+  agentId = "",
+  expectedRunId = "",
 }) {
   if (!/^https?:\/\/[A-Za-z0-9][A-Za-z0-9.:/_-]{0,199}$/.test(hub))
     throw new Error("Invalid hub URL.");
@@ -180,6 +183,12 @@ export function agentSpawnCommand({
   )
     throw new Error("Enter a valid model name for a supported agent app.");
   validateAgentPermissions(runtime, permissionMode, allowedTools, cwd);
+  if (agentRole && agentRole !== "database_handler")
+    throw new Error("Invalid agent role.");
+  if (agentId && !/^agt_[0-9a-f]{16}$/.test(agentId))
+    throw new Error("Invalid agent identity.");
+  if (expectedRunId && !/^run_[0-9a-f]{16}$/.test(expectedRunId))
+    throw new Error("Invalid run identity.");
   const args = [
     "spawn",
     "--json",
@@ -193,6 +202,9 @@ export function agentSpawnCommand({
     run,
   ];
   if (cwd) args.push("--cwd", cwd);
+  if (agentRole) args.push("--role", agentRole);
+  if (agentId) args.push("--agent-id", agentId);
+  if (expectedRunId) args.push("--expected-run-id", expectedRunId);
   if (prompt) args.push("--prompt", prompt);
   if (runtime) args.push("--runtime", runtime);
   if (model) args.push("--model", model);

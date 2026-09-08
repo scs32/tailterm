@@ -20,6 +20,12 @@ import {
 } from "../shared/tmux-command.js";
 import { validatePrivateKey, generatePrivateKey } from "./wasm-runtime.js";
 import { normalizeWorkspace } from "./workspace-state.js";
+import {
+  MAX_HANDLER_PLANS,
+  normalizeHandlerPlan,
+  normalizeHandlerPlanKey,
+  normalizeHandlerPlans,
+} from "./project-handler.js";
 let profileUnlockKey,
   profileSerial = 0;
 let database,
@@ -158,6 +164,7 @@ export function localData() {
     hub: { url: contents.hub?.url || "", token: contents.hub?.token || "" },
     launchProfiles: structuredClone(contents.launchProfiles || []),
     teams: savedTeams(contents),
+    projectHandlerPlans: structuredClone(contents.projectHandlerPlans || []),
     profile: structuredClone(contents.profile || {}),
     profileAppearance: structuredClone(contents.profileAppearance || null),
     backup: {
@@ -427,6 +434,23 @@ export async function localAPI(url, method = "GET", body = {}) {
         session.target = structuredClone(body.target);
       }
     });
+  if (url === "/project-handler-plans" && method === "POST")
+    return mutate((d) => {
+      const plan = normalizeHandlerPlan(body, d.servers);
+      const plans = (d.projectHandlerPlans || []).filter(
+        (p) => p.hub !== plan.hub || p.taskId !== plan.taskId,
+      );
+      if (plans.length >= MAX_HANDLER_PLANS)
+        throw new Error(`At most ${MAX_HANDLER_PLANS} database handler plans.`);
+      d.projectHandlerPlans = [...plans, plan];
+    });
+  if (url === "/project-handler-plans" && method === "DELETE")
+    return mutate((d) => {
+      const key = normalizeHandlerPlanKey(body);
+      d.projectHandlerPlans = (d.projectHandlerPlans || []).filter(
+        (p) => p.hub !== key.hub || p.taskId !== key.taskId,
+      );
+    });
   if (url === "/teams" && method === "POST")
     return editVault((d) => {
       const team = normalizeTeam(body);
@@ -600,6 +624,10 @@ function validateData(d) {
     throw new Error("Invalid hub token.");
   d.hub = { url: hubURL || "", token };
   d.teams = savedTeams(d);
+  d.projectHandlerPlans = normalizeHandlerPlans(
+    d.projectHandlerPlans,
+    d.servers,
+  );
   d.launchProfiles = (Array.isArray(d.launchProfiles) ? d.launchProfiles : [])
     .filter(
       (p) =>

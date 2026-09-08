@@ -347,4 +347,16 @@ func TestTaskHelperBudgetAPI(t *testing.T) {
 	if code := c.do("POST", "/v1/tasks/"+task.ID+"/agents", request, nil); code != 201 {
 		t.Fatalf("enabled budget: %d", code)
 	}
+	// An agent identity retained across an explicit project scope must not be
+	// silently converted into an owner/manual registration.
+	other := c.task("other-scope")
+	crossScope := api.AddAgentRequest{Name: "cross", Host: "host", Session: "cross", ParentAgentID: parent.ID}
+	if code := c.do("POST", "/v1/tasks/"+other.ID+"/agents", crossScope, nil); code != 400 {
+		t.Fatalf("cross-project parent provenance = %d", code)
+	}
+	var agents api.AgentList
+	c.do("GET", "/v1/tasks/"+other.ID+"/agents", nil, &agents)
+	if len(agents.Agents) != 0 {
+		t.Fatalf("cross-project request registered manually: %+v", agents.Agents)
+	}
 }

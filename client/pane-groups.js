@@ -30,6 +30,10 @@ export function setupPaneGroups({
   release.textContent = "Drop here to make a separate tab";
   release.hidden = true;
   document.querySelector(".terminal-tabs").append(release);
+  const placementPreview = document.createElement("div");
+  placementPreview.className = "pane-drop-preview";
+  placementPreview.setAttribute("aria-hidden", "true");
+  placementPreview.hidden = true;
   let drag,
     layout,
     signature = "",
@@ -89,6 +93,10 @@ export function setupPaneGroups({
       })
     )
       activate(source);
+  }
+  function place(source, target, placement) {
+    sync();
+    if (model.place(source, target, placement)) activate(source);
   }
   function detach(id) {
     if (model.detach(id)) activate(id);
@@ -155,9 +163,9 @@ export function setupPaneGroups({
         header.draggable = false;
         header.title =
           group?.taskId && !group.guests?.includes(id)
-            ? "Drag to rearrange within this task. Task agents stay in their task group."
+            ? "Drag to rearrange within this project. Project agents stay in their project group.\nLeft Option: split right · Right Option: split above."
             : grouped
-              ? "Drag to rearrange\nDrop onto another pane in this group to swap positions, or onto the tab bar to ungroup."
+              ? "Drag to rearrange\nDrop onto another pane in this group to swap positions, or onto the tab bar to ungroup.\nLeft Option: split right · Right Option: split above."
               : "Drag to group\nDrop onto another session tab to group these terminals.";
         const focus = document.createElement("button");
         focus.className = "pane-label";
@@ -254,6 +262,7 @@ export function setupPaneGroups({
         };
         chrome.append(divider);
       }
+      chrome.append(placementPreview);
     }
     chrome.style.width = layout.width + "px";
     chrome.style.height = layout.height + "px";
@@ -296,9 +305,15 @@ export function setupPaneGroups({
     const tab = getTabs().find((t) => !t.el.hidden && t.el.contains(element));
     return tab ? chrome.querySelector(`[data-pane="${tab.id}"]`) : null;
   }
-  function clearDrag() {
-    drag = null;
-    release.hidden = true;
+  const canPlace = (source, target) => {
+    if (!source || !target || source === target) return false;
+    const from = model.group(source),
+      to = model.group(target);
+    return (
+      !!from && !!to && (from === to || model.canMerge(source, target, false))
+    );
+  };
+  function clearDropFeedback() {
     document
       .querySelectorAll(".group-drop-target, .tab-drop-before, .tab-drop-after")
       .forEach((el) =>
@@ -308,6 +323,38 @@ export function setupPaneGroups({
           "tab-drop-after",
         ),
       );
+    placementPreview.hidden = true;
+    delete placementPreview.dataset.placement;
+  }
+  function showPlacement(target, placement) {
+    const box = layout?.panes.find((pane) => pane.id === target);
+    if (!box) return;
+    const gap = 8;
+    if (placement === "right") {
+      const first = (box.width - gap) / 2;
+      position(placementPreview, {
+        x: box.x + first + gap,
+        y: box.y,
+        width: box.width - gap - first,
+        height: box.height,
+      });
+      placementPreview.textContent = "Split right";
+    } else {
+      position(placementPreview, {
+        x: box.x,
+        y: box.y,
+        width: box.width,
+        height: (box.height - gap) / 2,
+      });
+      placementPreview.textContent = "Split above";
+    }
+    placementPreview.dataset.placement = placement;
+    placementPreview.hidden = false;
+  }
+  function clearDrag() {
+    drag = null;
+    release.hidden = true;
+    clearDropFeedback();
   }
   setupPaneDrag(document.querySelector(".terminal-shell"), {
     start(source) {
@@ -316,19 +363,16 @@ export function setupPaneGroups({
       drag = { id, whole: !source.dataset.pane };
       release.hidden = !source.dataset.pane || !model.canDetach(id);
     },
-    move(element, x) {
-      document
-        .querySelectorAll(
-          ".group-drop-target, .tab-drop-before, .tab-drop-after",
-        )
-        .forEach((el) =>
-          el.classList.remove(
-            "group-drop-target",
-            "tab-drop-before",
-            "tab-drop-after",
-          ),
-        );
+    move(element, x, _y, gesture) {
+      clearDropFeedback();
       const target = dragTarget(element);
+      const targetId =
+        target?.dataset.pane ||
+        target?.querySelector("[data-tab]")?.dataset.tab;
+      if (drag) {
+        drag.reorder = null;
+        drag.placement = null;
+      }
       if (drag?.whole && target?.matches(".tab")) {
         const box = target.getBoundingClientRect(),
           position = (x - box.left) / box.width;
@@ -337,28 +381,37 @@ export function setupPaneGroups({
         target.classList.add(
           drag.reorder ? "tab-drop-" + drag.reorder : "group-drop-target",
         );
-      } else {
-        if (drag) drag.reorder = null;
-        target?.classList.add("group-drop-target");
-      }
-      const targetId =
-        target?.dataset.pane ||
-        target?.querySelector("[data-tab]")?.dataset.tab;
-      if (
+      } else if (
         drag &&
-        targetId &&
-        !drag.reorder &&
-        !model.canMerge(drag.id, targetId, drag.whole) &&
-        !(!drag.whole && model.group(drag.id) === model.group(targetId))
-      )
-        target.classList.remove("group-drop-target");
+        !drag.whole &&
+        target?.dataset.pane &&
+        gesture?.placement &&
+        canPlace(drag.id, targetId)
+      ) {
+        drag.placement = gesture.placement;
+        showPlacement(targetId, drag.placement);
+      } else {
+        const sameGroupPane =
+          drag &&
+          !drag.whole &&
+          target?.dataset.pane &&
+          drag.id !== targetId &&
+          model.group(drag.id) === model.group(targetId);
+        if (
+          drag &&
+          targetId &&
+          drag.id !== targetId &&
+          (sameGroupPane || model.canMerge(drag.id, targetId, drag.whole))
+        )
+          target.classList.add("group-drop-target");
+      }
       if (element && strip.contains(element)) {
         const bounds = strip.getBoundingClientRect();
         if (x < bounds.left + 30) strip.scrollLeft -= 20;
         if (x > bounds.right - 30) strip.scrollLeft += 20;
       }
     },
-    drop(element) {
+    drop(element, gesture) {
       if (!drag) return;
       const target = dragTarget(element);
       let id =
@@ -372,7 +425,15 @@ export function setupPaneGroups({
       }
       const source = drag;
       clearDrag();
-      if (id && source.whole && source.reorder) {
+      if (
+        id &&
+        !source.whole &&
+        target.dataset.pane &&
+        gesture?.placement &&
+        canPlace(source.id, id)
+      ) {
+        place(source.id, id, gesture.placement);
+      } else if (id && source.whole && source.reorder) {
         model.reorder(source.id, id, source.reorder === "after");
         activate(getActive());
       } else if (

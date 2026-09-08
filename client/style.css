@@ -158,6 +158,21 @@ body:has(.terminal-shell.expanded) {
     var(--terminal-bg)
   ) !important;
 }
+.pane-drop-preview {
+  position: absolute;
+  z-index: 4;
+  display: grid;
+  place-items: center;
+  pointer-events: none;
+  border: 2px solid var(--accent);
+  background: color-mix(in srgb, var(--accent) 24%, var(--terminal-bg));
+  color: var(--ink);
+  font: 600 11px/1.3 var(--terminal-font);
+  text-align: center;
+}
+.pane-drop-preview[hidden] {
+  display: none;
+}
 .pane-count {
   color: var(--accent);
   font-weight: 600;
@@ -4512,9 +4527,9 @@ html:fullscreen {
     flex-basis: 100%;
   }
 }
-/* Board/Tasks/Files need a viewport even when no terminal has been opened. */
+/* Data views need a viewport even when no terminal has been opened. */
 @media (max-width: 760px) {
-  body:is([data-mode="board"], [data-mode="tasks"], [data-mode="files"])
+  body:is([data-mode="board"], [data-mode="tasks"], [data-mode="files"], [data-mode="bugs"], [data-mode="features"])
     #workspace {
     display: flex;
     flex-direction: column;
@@ -4522,12 +4537,12 @@ html:fullscreen {
     min-height: 0;
     overflow: hidden;
   }
-  body:is([data-mode="board"], [data-mode="tasks"], [data-mode="files"])
+  body:is([data-mode="board"], [data-mode="tasks"], [data-mode="files"], [data-mode="bugs"], [data-mode="features"])
     #workspace
     > aside {
     display: none;
   }
-  body:is([data-mode="board"], [data-mode="tasks"], [data-mode="files"])
+  body:is([data-mode="board"], [data-mode="tasks"], [data-mode="files"], [data-mode="bugs"], [data-mode="features"])
     #workspace
     > main {
     display: flex;
