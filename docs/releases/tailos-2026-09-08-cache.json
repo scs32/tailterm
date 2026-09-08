@@ -1,0 +1,75 @@
+{
+  "origin": "https://tailos.tailarr.com",
+  "deployment": "https://801220fd.tailos.pages.dev",
+  "commit": "78498da834122f648fac1ee35f6127b50e0fab1d",
+  "verifiedAssets": 81,
+  "releaseSha256": "5b9344e477a55f9a162408e66125e9c51f3e29d8080f34d7fe63f7d76c1119d0",
+  "verifiedAt": "2026-09-08T18:51:54.901Z",
+  "localPreviews": [
+    {
+      "host": "Mini",
+      "origin": "http://127.0.0.1:4318",
+      "commit": "78498da834122f648fac1ee35f6127b50e0fab1d",
+      "mode": "npm run preview:static serving verified dist-static"
+    },
+    {
+      "host": "theAir",
+      "origin": "http://127.0.0.1:4318",
+      "commit": "78498da834122f648fac1ee35f6127b50e0fab1d",
+      "releaseSha256": "5b9344e477a55f9a162408e66125e9c51f3e29d8080f34d7fe63f7d76c1119d0",
+      "verifiedAssets": 81,
+      "mode": "changed static files in existing container",
+      "containerImage": "tailterm-static:56ded4133c7a",
+      "rollbackImage": "tailterm-static:56ded4133c7a",
+      "previousCommit": "56ded4133c7a9ec952004dd51fa11e94a6c7d382",
+      "artifactDirectory": "/Users/stephenspeicher/.local/share/tailterm/web-releases/78498da83412"
+    }
+  ],
+  "hostCLIs": [
+    {
+      "host": "Stephens-Mini.localdomain",
+      "binarySha256": "6103b639e7b1bdd21a7fecb4e7fc2bc7a0f3b75be8c2997a703c321c7d22e3b8",
+      "previousBinarySha256": "73bb500541059e616008ad7a31747141c1181f0445d9347e958fc10e1b784017",
+      "rollbackBinary": "/Users/stephenspeicher/.local/bin/tt-before-cache-78498da83412",
+      "relay": "running"
+    },
+    {
+      "host": "Stephens-MacBook-Air.local",
+      "binarySha256": "6103b639e7b1bdd21a7fecb4e7fc2bc7a0f3b75be8c2997a703c321c7d22e3b8",
+      "previousBinarySha256": "73bb500541059e616008ad7a31747141c1181f0445d9347e958fc10e1b784017",
+      "rollbackBinary": "/Users/stephenspeicher/.local/bin/tt-before-cache-78498da83412",
+      "relay": "running"
+    }
+  ],
+  "hub": {
+    "updated": false,
+    "release": "20260908-project-work-items-86551cdc901e",
+    "binarySha256": "0e2e44a040af218b0c00fbd9a5c39ccf11bc257e6bc4441a6826500899542a9a",
+    "previousReceipt": "tailos-2026-09-08-projects.json"
+  },
+  "verification": [
+    "98 JavaScript unit tests passed",
+    "Chromium and WebKit cache fixture passed: cached reads before held responses, offline reload, reconnect refresh, seven failed writes retain drafts without automatic replay, local Teams offline, credential/hub/profile isolation",
+    "Chromium and WebKit vault cache fixture passed: encrypted persistence, export exclusion, lock and new-profile isolation",
+    "Chromium and WebKit work-item navigation fixture passed; view lifecycle regressions passed",
+    "CLI briefing and swarm ownership tests passed; go vet ./cmd/tt passed",
+    "Clean static build and all 82 manifest entries verified; all 81 public served assets match",
+    "Chromium public smoke passed: production WASM startup, HTTPS CSP, synthetic vault key persistence",
+    "Air verified staged delta and unchanged assets before switching index; all 81 final localhost served assets match public release",
+    "Mini and Air host CLI hashes match; atomic installs retain previous binaries; both per-user relays verified running"
+  ],
+  "limits": [
+    "Saved hub reads are previously visited views, not a complete offline replica; app assets must load",
+    "Cache does not queue writes or drive agent/terminal lifecycle decisions",
+    "CLI delivery-audit prompt applies to new briefings; existing threads are not rewritten",
+    "Unread cursor starvation after a full page of own messages and unbounded read-up-to remain analysis findings, not fixed in this release",
+    "AIV and CLI documents are research; adapter implementation and live native control mutation tests are not included"
+  ],
+  "airBrowser": {
+    "origin": "Air localhost:4318 through temporary SSH forwarding",
+    "isolatedContext": true,
+    "projectsBugsFeaturesTeamsNavigation": true,
+    "filesHidden": true,
+    "pageErrors": []
+  }
+}

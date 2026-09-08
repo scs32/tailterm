@@ -1,6 +1,54 @@
 # Development handoff — September 8, 2026
 
-## September 8 Projects release — current deployment
+## September 8 cache release — current deployment
+
+Application commit `78498da834122f648fac1ee35f6127b50e0fab1d` is deployed to
+`https://tailos.tailarr.com` (`https://801220fd.tailos.pages.dev`). **Both Mini and
+Air** now serve this commit at their own `http://127.0.0.1:4318`.
+
+Previously visited Board, Projects, Bugs, and Features views load encrypted saved
+reads immediately and refresh in the background. Saved/offline state is labelled;
+failed writes retain drafts and are never queued. Teams remain local vault data.
+The cache is bounded, excluded from profile sync/exports, and never drives agent
+lifecycle operations. Bugs/Features now use an open-project rail like Board, with
+mobile controls. Same-origin project bindings restore even with zero saved panes;
+on a fresh origin use Board → project → Terminals to attach existing groups.
+
+Both host CLIs now include the orchestrator assignment-delivery audit in newly
+generated briefings. Matching binary SHA-256:
+`6103b639e7b1bdd21a7fecb4e7fc2bc7a0f3b75be8c2997a703c321c7d22e3b8`.
+Each retains `~/.local/bin/tt-before-cache-78498da83412`; both per-user inbox relays
+were restarted and verified running. The hub remains on the Projects release
+below; no hub restart, Tailscale change, or live project closure was needed.
+
+Air was updated with 26 changed public assets (~10 MB), retaining its existing
+`tailterm-static` container and image `tailterm-static:56ded4133c7a`. The new files
+are in the container writable layer: restarting that container preserves them;
+recreating from the old image rolls back. Verified delta, previous index/manifest,
+and receipt are at `~/.local/share/tailterm/web-releases/78498da83412`. The first
+copy-path validation failed before any served writes; the corrected activation
+then passed all 81 served asset hashes. `scripts/deploy-remote-static.py theAir`
+contains the tested Apple Container directory-path correction for future updates.
+It transfers only changed assets after clean-source release verification.
+
+[Release receipt](releases/tailos-2026-09-08-cache.json) records public/local assets,
+host binary hashes and acceptance evidence. All 98 unit tests and Chromium/WebKit
+cache, vault and project-navigation scenarios passed; production Chromium started
+the production WASM and restored an isolated synthetic vault key. Air
+localhost also passed a fresh-context mobile navigation check through temporary
+SSH forwarding, with Files hidden and no page errors.
+
+Research is complete in [AIV project agents proposal](research/aiv-project-agents-proposal.md)
+and [native LLM CLI controls](research/llm-cli-control-reference.md). Neither adds
+an MCP adapter or promises untested runtime configuration changes. The unread
+analysis also found two remaining cursor edge cases (own-message page starvation
+and unbounded read-up-to); this release changes the coordination briefing only.
+
+Later deployment-tool/documentation commits intentionally do not require another
+application deployment. Both localhost origins must be verified on future releases;
+updating one host CLI or webpage does not update the other host's webpage.
+
+## September 8 Projects release (previous)
 
 Commit `86551cdc901e1d429fc7ced9d8c892f5b19625c2` is deployed to
 `https://tailos.tailarr.com` (`https://fcc49680.tailos.pages.dev`) and served by the
@@ -22,17 +70,8 @@ and browser/Go checks. [Projects, Bugs, and Features](project-work-items.md)
 describes dispatch semantics and handler recovery. Existing/headless projects
 need explicit handler setup because the hub cannot launch SSH sessions itself.
 
-**Air preview correction pending:** the owner uses Air's own localhost preview.
-At the September 8 check, that separate Apple container still served `56ded41`.
-Updating its host CLI does not update its webpage. The current static release
-was only partially staged at
-`~/.local/share/tailterm/web-releases/86551cdc901e/site` before SSH to `theAir`
-(`100.96.77.33:22`) timed out. The old `tailterm-static:56ded4133c7a` web container
-was never stopped or replaced. Resume this preview update when Air is reachable;
-verify the staging manifest/assets, candidate port 4319, and final port 4318.
-Air had approximately 527 MB free before staging, so retain the current image and
-check disk space before building. Future local releases must verify **both Mini
-and Air** localhost manifests; one machine's localhost is not the other's.
+The stale Air preview identified after this release was corrected by the cache
+release above. The older receipt retains the observed failure as historical evidence.
 
 Documentation commits after this release intentionally do not require another
 application deployment. The sections below preserve earlier handoff history;

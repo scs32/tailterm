@@ -106,10 +106,12 @@ app='/opt/homebrew/bin/container'
 destination='/tmp/tailterm-web-'+p['commit'][:12]
 subprocess.run([app,'exec','tailterm-static','mkdir','-p',destination],check=True,stdout=subprocess.DEVNULL)
 subprocess.run([app,'cp',str(site)+'/.','tailterm-static:'+destination],check=True,stdout=subprocess.DEVNULL)
+# Apple Container preserves the source directory inside an existing destination.
+copied=destination+'/site'
 commands=[]
 for name in p['changed']:
     expected=p['releaseSha256'] if name=='release.json' else manifest['files'][name]['sha256']
-    path=destination+'/'+name
+    path=copied+'/'+name
     commands.append('test "$(sha256sum '+shlex.quote(path)+' | cut -d " " -f 1)" = '+shlex.quote(expected))
 # Verify the entire delta before changing any served file. Immutable assets go
 # first, then the two small entry/receipt files are each renamed atomically.
@@ -117,10 +119,10 @@ for name in p['changed']:
     if name in ('index.html','release.json'):continue
     target='/srv/'+name
     commands.extend(['mkdir -p '+shlex.quote(str(Path(target).parent)),
-                     'cp '+shlex.quote(destination+'/'+name)+' '+shlex.quote(target)])
+                     'cp '+shlex.quote(copied+'/'+name)+' '+shlex.quote(target)])
 for name in ('index.html','release.json'):
     if name in p['changed']:
-        commands.extend(['cp '+shlex.quote(destination+'/'+name)+' '+shlex.quote('/srv/'+name+'.next'),
+        commands.extend(['cp '+shlex.quote(copied+'/'+name)+' '+shlex.quote('/srv/'+name+'.next'),
                          'mv '+shlex.quote('/srv/'+name+'.next')+' '+shlex.quote('/srv/'+name)])
 subprocess.run([app,'exec','-i','tailterm-static','sh','-eu'],input='\\n'.join(commands)+'\\n',text=True,check=True,stdout=subprocess.DEVNULL)
 assert hashlib.sha256(fetch('release.json')).hexdigest()==p['releaseSha256']
