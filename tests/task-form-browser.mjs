@@ -484,6 +484,41 @@ try {
         "Test command requires permission",
       );
 
+      await page.evaluate((id) => qa.hub.settings(id), teamTask.id);
+      await page.locator("#task-settings details > summary").click();
+      const retirement = page.locator(
+        `[data-agent-retirement="${blockedAgent.id}"]`,
+      );
+      await retirement.click();
+      await page.waitForFunction(
+        (id) =>
+          document.querySelector(`[data-agent-retirement="${id}"]`)
+            ?.textContent === "Resume",
+        blockedAgent.id,
+      );
+      let retired = await (
+        await fetch(
+          `http://127.0.0.1:${port}/v1/tasks/${teamTask.id}/agents/${blockedAgent.id}`,
+        )
+      ).json();
+      assert.equal(retired.status, "retired");
+      assert.equal(retired.session, "blocked-fixture");
+      await page.screenshot({ path: `.build/retirement-settings-${name}.png` });
+      await retirement.click();
+      await page.waitForFunction(
+        (id) =>
+          document.querySelector(`[data-agent-retirement="${id}"]`)
+            ?.textContent === "Retire",
+        blockedAgent.id,
+      );
+      retired = await (
+        await fetch(
+          `http://127.0.0.1:${port}/v1/tasks/${teamTask.id}/agents/${blockedAgent.id}`,
+        )
+      ).json();
+      assert.equal(retired.status, "done");
+      await page.locator("#dialog-close").click();
+
       assert.deepEqual(launchServers.slice(-3), [
         "secondary",
         "secondary",

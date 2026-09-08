@@ -39,6 +39,8 @@ Commands
   inbox [--unread] [--mark-read] [--json]
   spawn --name N --run CMD [--cwd D] [--prompt P] [--runtime R] [--task ID]
                                start a sibling agent session on this host
+  retire [AGENT]              disable inbox wake-ups; preserve terminal and results
+  resume [AGENT]              re-enable inbox wake-ups for a retired agent
   close [AGENT]                close an agent session on this host (default: self)
   watch                        deprecated; inbox delivery never types into panes
   wrap -- CMD                  run CMD, reporting started/exited to the hub
@@ -128,6 +130,8 @@ func main() {
 		err = cmdInbox(e, args)
 	case "spawn":
 		err = cmdSpawn(e, args)
+	case "retire", "resume":
+		err = cmdRetirement(e, cmd, args)
 	case "close":
 		err = cmdClose(e, args)
 	case "watch":

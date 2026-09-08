@@ -314,7 +314,7 @@ func (s *Store) AddAgent(ctx context.Context, taskID string, req api.AddAgentReq
 	}
 	if req.ParentAgentID != "" {
 		parent, err := s.GetAgent(ctx, req.ParentAgentID)
-		if err != nil || parent.TaskID != taskID || parent.Status == api.AgentClosed || parent.Status == api.AgentExited {
+		if err != nil || parent.TaskID != taskID || parent.Status == api.AgentClosed || parent.Status == api.AgentExited || parent.Status == api.AgentRetired {
 			return api.Agent{}, api.ErrInvalid
 		}
 		if !t.AllowAgentSpawn {
@@ -456,8 +456,18 @@ func (s *Store) UpdateAgent(ctx context.Context, id string, req api.UpdateAgentR
 		s.notify(a.TaskID)
 	}
 	if req.Status != nil {
+		if (a.Status == api.AgentClosed || a.Status == api.AgentExited) && (*req.Status == api.AgentRetired || *req.Status == api.AgentDone) {
+			return a, api.ErrClosed
+		}
+		task, err := s.GetTask(ctx, a.TaskID)
+		if err != nil {
+			return a, err
+		}
+		if task.Status != api.TaskOpen {
+			return a, api.ErrClosed
+		}
 		switch *req.Status {
-		case api.AgentRunning, api.AgentDone, api.AgentNeedsInput, api.AgentClosed, api.AgentExited:
+		case api.AgentRunning, api.AgentDone, api.AgentNeedsInput, api.AgentClosed, api.AgentExited, api.AgentRetired:
 		default:
 			return a, api.ErrInvalid
 		}
@@ -478,6 +488,7 @@ func (s *Store) setAgentStatus(ctx context.Context, id, status string, by api.Ca
 	if err != nil {
 		return a, err
 	}
+	previousStatus := a.Status
 	now := s.now()
 	if _, err := s.db.ExecContext(ctx, `UPDATE agents SET status=?, last_event_at=?,blocked_reason='',blocked_text='' WHERE id=?`, status, ts(now), id); err != nil {
 		return a, err
@@ -485,7 +496,10 @@ func (s *Store) setAgentStatus(ctx context.Context, id, status string, by api.Ca
 	a.Status, a.LastEventAt = status, now
 	a.BlockedReason, a.BlockedText = "", ""
 	if emit {
-		kind := map[string]string{api.AgentRunning: api.EventRunning, api.AgentDone: api.EventDone, api.AgentNeedsInput: api.EventNeedsInput, api.AgentClosed: api.EventClosed, api.AgentExited: api.EventExited}[status]
+		kind := map[string]string{api.AgentRunning: api.EventRunning, api.AgentDone: api.EventDone, api.AgentRetired: api.EventRetired, api.AgentNeedsInput: api.EventNeedsInput, api.AgentClosed: api.EventClosed, api.AgentExited: api.EventExited}[status]
+		if previousStatus == api.AgentRetired && status == api.AgentDone {
+			kind = api.EventResumed
+		}
 		if _, err := s.addEvent(ctx, a.TaskID, kind, id, "", nil, by); err != nil {
 			return a, err
 		}
@@ -653,12 +667,12 @@ func (s *Store) PostEvent(ctx context.Context, taskID string, req api.PostEventR
 				return api.Event{}, err
 			}
 		}
-		if status := api.LifecycleStatus(req.Kind); status != "" && a.Status != status && !(req.Kind == api.EventDone && req.Data["runtimeStop"] == true && a.Status == api.AgentNeedsInput) {
+		if status := api.LifecycleStatus(req.Kind); status != "" && a.Status != status && !(a.Status == api.AgentRetired && status != api.AgentClosed && status != api.AgentExited) && !(req.Kind == api.EventDone && req.Data["runtimeStop"] == true && a.Status == api.AgentNeedsInput) {
 			if _, err := s.setAgentStatus(ctx, req.AgentID, status, by, false); err != nil {
 				return api.Event{}, err
 			}
 		}
-		if req.Kind == api.EventNeedsInput {
+		if req.Kind == api.EventNeedsInput && a.Status != api.AgentRetired {
 			reason, _ := req.Data["reason"].(string)
 			if reason != "permission" && reason != "authentication" && reason != "tool" {
 				reason = ""

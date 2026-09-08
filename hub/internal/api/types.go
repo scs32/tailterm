@@ -90,6 +90,7 @@ const (
 	AgentStarting   = "starting"
 	AgentRunning    = "running"
 	AgentDone       = "done"
+	AgentRetired    = "retired"
 	AgentNeedsInput = "needs_input"
 	AgentClosed     = "closed"
 	AgentExited     = "exited"
@@ -103,6 +104,8 @@ const (
 	EventStarted     = "started"
 	EventRunning     = "running"
 	EventDone        = "done"
+	EventRetired     = "retired"
+	EventResumed     = "resumed"
 	EventNeedsInput  = "needs_input"
 	EventClosed      = "closed"
 	EventMessage     = "message"
@@ -115,8 +118,10 @@ func LifecycleStatus(kind string) string {
 	switch kind {
 	case EventStarted, EventRunning:
 		return AgentRunning
-	case EventDone:
+	case EventDone, EventResumed:
 		return AgentDone
+	case EventRetired:
+		return AgentRetired
 	case EventNeedsInput:
 		return AgentNeedsInput
 	case EventExited:

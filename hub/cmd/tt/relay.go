@@ -107,7 +107,7 @@ func bindRuntime(e env, thread string) error {
 	if err != nil {
 		return err
 	}
-	if a.RunID != b.Run || a.Runtime != "codex" || a.Status == api.AgentClosed || a.Status == api.AgentExited {
+	if a.RunID != b.Run || a.Runtime != "codex" || a.Status == api.AgentClosed || a.Status == api.AgentExited || a.Status == api.AgentRetired {
 		return errors.New("binding does not match an open Codex agent run")
 	}
 	path := filepath.Join(relayDir(), bindingKey(b)+".binding.json")
@@ -192,7 +192,7 @@ func relayOne(ctx context.Context, b runtimeBinding, p *relayProgress, c *api.Cl
 	if err != nil {
 		return err
 	}
-	if a.RunID != b.Run || a.Status == api.AgentClosed || a.Status == api.AgentExited || !a.Online {
+	if a.RunID != b.Run || a.Status == api.AgentClosed || a.Status == api.AgentExited || a.Status == api.AgentRetired || !a.Online {
 		return nil
 	}
 	if a.Unread == 0 || now.Sub(p.LastAttempt) < 15*time.Second {

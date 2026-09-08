@@ -115,6 +115,7 @@ export function createTasksView({
     const label =
       {
         done: "Turn complete",
+        retired: "Retired",
         needs_input:
           {
             permission: "Permission blocked",
@@ -126,7 +127,7 @@ export function createTasksView({
     const seen = Date.parse(a.lastSeenAt);
     const last = seen > 0 ? seen : Date.parse(a.createdAt);
     return a.runId &&
-      !["exited", "closed"].includes(a.status) &&
+      !["exited", "closed", "retired"].includes(a.status) &&
       last > 0 &&
       Date.now() - last > 90000
       ? label + " · offline"

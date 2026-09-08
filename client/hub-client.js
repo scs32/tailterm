@@ -65,6 +65,8 @@ export function createHubClient({ fetchImpl, baseURL, token = "" }) {
     listAgents: async (task) =>
       (await request(`/v1/tasks/${task}/agents`)).agents,
     getAgent: (task, agent) => request(`/v1/tasks/${task}/agents/${agent}`),
+    updateAgent: (task, agent, body) =>
+      request(`/v1/tasks/${task}/agents/${agent}`, { method: "PATCH", body }),
     closeAgent: (task, agent) =>
       request(`/v1/tasks/${task}/agents/${agent}`, { method: "DELETE" }),
     postMessage: (task, body) =>

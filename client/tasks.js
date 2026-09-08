@@ -115,6 +115,7 @@ const STATUS_LABEL = {
   starting: "starting",
   running: "running",
   done: "done",
+  retired: "retired",
   needs_input: "needs input",
   exited: "exited",
   closed: "closed",
@@ -129,7 +130,14 @@ export function taskRollup(agents, unknownHosts = 0) {
     counts[a.status] = (counts[a.status] || 0) + 1;
   }
   const parts = [`${total} agent${total === 1 ? "" : "s"}`];
-  for (const status of ["needs_input", "running", "done", "starting", "exited"])
+  for (const status of [
+    "needs_input",
+    "running",
+    "done",
+    "retired",
+    "starting",
+    "exited",
+  ])
     if (counts[status]) parts.push(`${counts[status]} ${STATUS_LABEL[status]}`);
   if (unknownHosts)
     parts.push(
@@ -147,7 +155,20 @@ export function applyEvents(agents, events) {
   const byId = new Map(agents.map((a) => [a.id, a]));
   for (const e of events) {
     const a = byId.get(e.agentId);
+    if (
+      a?.status === "retired" &&
+      ["started", "running", "done", "needs_input"].includes(e.kind)
+    )
+      continue;
     switch (e.kind) {
+      case "retired":
+      case "resumed":
+        if (a) {
+          a.status = e.kind === "retired" ? "retired" : "done";
+          a.blockedReason = "";
+          a.blockedText = "";
+        }
+        break;
       case "agent_added":
         refresh = true;
         break;

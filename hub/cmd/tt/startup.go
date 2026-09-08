@@ -33,7 +33,7 @@ func reportTrustBlocker(ctx context.Context, c *api.Client, task, agent, run, se
 	if err != nil {
 		return err
 	}
-	if a.RunID != run || a.Session != session || a.Runtime != "codex" || a.Status == api.AgentClosed || a.Status == api.AgentExited {
+	if a.RunID != run || a.Session != session || a.Runtime != "codex" || a.Status == api.AgentClosed || a.Status == api.AgentExited || a.Status == api.AgentRetired {
 		return nil
 	}
 	if a.Status == api.AgentNeedsInput && a.BlockedText == trustBlocker {

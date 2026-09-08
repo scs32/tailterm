@@ -68,7 +68,7 @@ func TestRelayTargetsUnreadOnceAndPreservesReadReceipts(t *testing.T) {
 	if calls != 1 {
 		t.Fatal("same unread message woke twice")
 	}
-	for _, status := range []string{api.AgentClosed, api.AgentExited} {
+	for _, status := range []string{api.AgentClosed, api.AgentExited, api.AgentRetired} {
 		a.Status = status
 		p.Through = 0
 		relayOne(context.Background(), b, &p, c, now.Add(time.Minute), queue)

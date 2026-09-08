@@ -53,12 +53,10 @@ export function createTaskHub(host) {
     serverHosts.get(key).add(name);
   }
   const taskServers = () =>
-    host
-      .getServers()
-      .map((s) => ({
-        ...s,
-        agentHosts: [...(serverHosts.get(serverKey(s)) || [])],
-      }));
+    host.getServers().map((s) => ({
+      ...s,
+      agentHosts: [...(serverHosts.get(serverKey(s)) || [])],
+    }));
   async function resolveAgentHosts() {
     await Promise.allSettled(
       host.getServers().map(async (server) => {
@@ -939,18 +937,50 @@ export function createTaskHub(host) {
   async function settings(taskId) {
     if (!requireHub()) return;
     try {
-      const { task } = await client.getTask(taskId);
+      const { task, agents } = await client.getTask(taskId);
       host.dialog(
         "Task settings",
-        `<form id="task-settings"><label>Task name<input id="task-settings-name" maxlength="120" value="${esc(task.name)}" required></label><label>Objective<textarea id="task-settings-goal" rows="3" maxlength="8192">${esc(task.goal)}</textarea></label><label>Main orchestrator<input id="task-settings-orchestrator" maxlength="64" value="${esc(task.orchestrator || "")}" placeholder="Agent name (optional)"></label><label class="check"><input id="task-settings-swarm" type="checkbox" ${task.swarm ? "checked" : ""}>Enable swarm</label><p class="fine">Every new message reaches all task agents. Existing messages keep their original delivery scope.</p><label class="check"><input id="task-settings-spawn" type="checkbox" ${task.allowAgentSpawn ? "checked" : ""}>Allow agents to add other agents</label><label>Max new agents<input id="task-settings-max-new-agents" type="number" min="0" max="32" step="1" value="${task.maxNewAgents ?? 2}" ${task.allowAgentSpawn ? "" : "disabled"}></label><p class="fine">Additional helpers across the task, including finished helpers. Agents you add manually do not count.</p><p class="fine">You can always add agents yourself. Turning this off prevents new helpers; existing agents keep running.</p><p id="task-settings-error" class="fine" role="alert"></p><div class="dialog-actions"><button type="submit" class="primary">Save</button></div></form>`,
+        `<form id="task-settings"><label>Task name<input id="task-settings-name" maxlength="120" value="${esc(task.name)}" required></label><label>Objective<textarea id="task-settings-goal" rows="3" maxlength="8192">${esc(task.goal)}</textarea></label><label>Main orchestrator<input id="task-settings-orchestrator" maxlength="64" value="${esc(task.orchestrator || "")}" placeholder="Agent name (optional)"></label><label class="check"><input id="task-settings-swarm" type="checkbox" ${task.swarm ? "checked" : ""}>Enable swarm</label><p class="fine">Every new message reaches all task agents. Existing messages keep their original delivery scope.</p><label class="check"><input id="task-settings-spawn" type="checkbox" ${task.allowAgentSpawn ? "checked" : ""}>Allow agents to add other agents</label><label>Max new agents<input id="task-settings-max-new-agents" type="number" min="0" max="32" step="1" value="${task.maxNewAgents ?? 2}" ${task.allowAgentSpawn ? "" : "disabled"}></label><p class="fine">Additional helpers across the task, including finished helpers. Agents you add manually do not count.</p><p class="fine">You can always add agents yourself. Turning this off prevents new helpers; existing agents keep running.</p><details class="dialog-details"><summary>Agents</summary><p class="fine">Retire stops automatic inbox wake-ups and keeps the terminal and results. It does not interrupt a running or already queued turn. Resume allows unread messages to wake the agent again.</p><div class="task-agent-lifecycle">${
+          agents
+            .filter((a) => !["closed", "exited"].includes(a.status))
+            .map(
+              (a) =>
+                `<div><span>${esc(a.name)}${a.name.toLowerCase() === task.orchestrator?.toLowerCase() ? " · orchestrator" : ""}</span><button type="button" data-agent-retirement="${esc(a.id)}" data-retired="${a.status === "retired"}">${a.status === "retired" ? "Resume" : "Retire"}</button></div>`,
+            )
+            .join("") || '<p class="fine">No agents available.</p>'
+        }</div></details><p id="task-settings-error" class="fine" role="alert"></p><div class="dialog-actions"><button type="submit" class="primary">Save</button></div></form>`,
       );
       const form = document.querySelector("#task-settings");
       form.querySelector("#task-settings-spawn").onchange = (e) =>
         (form.querySelector("#task-settings-max-new-agents").disabled =
           !e.target.checked);
+      form.querySelectorAll("[data-agent-retirement]").forEach((button) => {
+        button.onclick = async () => {
+          const retired = button.dataset.retired === "true";
+          button.disabled = true;
+          const error = form.querySelector("#task-settings-error");
+          error.textContent = "";
+          try {
+            await client.updateAgent(taskId, button.dataset.agentRetirement, {
+              status: retired ? "done" : "retired",
+            });
+            button.dataset.retired = String(!retired);
+            button.textContent = retired ? "Retire" : "Resume";
+            host.notice(
+              retired
+                ? "Agent resumed; inbox wake-ups enabled."
+                : "Agent retired; terminal retained.",
+            );
+          } catch (e) {
+            error.textContent = formatError(e);
+          } finally {
+            button.disabled = false;
+          }
+        };
+      });
       form.onsubmit = async (event) => {
         event.preventDefault();
-        const button = form.querySelector("button");
+        const button = form.querySelector('button[type="submit"]');
         if (button.disabled) return;
         button.disabled = true;
         try {

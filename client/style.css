@@ -5138,3 +5138,14 @@ dialog .agent-save-setup button {
   flex: none;
   padding: 4px 9px;
 }
+
+.task-agent-lifecycle > div {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 6px 0;
+  border-bottom: 1px solid var(--line);
+}
+.task-agent-lifecycle > div > span { min-width: 0; overflow-wrap: anywhere; }
+.task-agent-lifecycle button { flex-shrink: 0; }

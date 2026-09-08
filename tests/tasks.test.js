@@ -145,3 +145,24 @@ test("cached terminal task state preserves a reported blocker across a runtime s
   assert.equal(agents[0].status, "running");
   assert.equal(agents[0].blockedReason, "");
 });
+
+test("retired agents retain panes and ignore late lifecycle hooks until explicit resume", () => {
+  const agents = [
+    { id: "worker", status: "retired", host: "oracle1", session: "worker" },
+  ];
+  const before = reconcileTask({ taskId: "task", agents, tabs: [], servers });
+  assert.equal(before.open.length, 1);
+  assert.equal(before.close.length, 0);
+  applyEvents(
+    agents,
+    ["running", "done", "needs_input"].map((kind) => ({
+      kind,
+      agentId: "worker",
+    })),
+  );
+  assert.equal(agents[0].status, "retired");
+  applyEvents(agents, [{ kind: "resumed", agentId: "worker" }]);
+  assert.equal(agents[0].status, "done");
+  applyEvents(agents, [{ kind: "retired", agentId: "worker" }]);
+  assert.equal(agents[0].status, "retired");
+});
