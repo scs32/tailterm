@@ -246,6 +246,9 @@ func cmdRelay(args []string) error {
 		defer syscall.Flock(int(lock.Fd()), syscall.LOCK_UN)
 	}
 	for {
+		if !*status {
+			inspectStartupPrompts()
+		}
 		paths, _ := filepath.Glob(filepath.Join(dir, "*.binding.json"))
 		for _, path := range paths {
 			data, err := os.ReadFile(path)

@@ -96,6 +96,8 @@ unavailable**, with the explanation in the agent tooltip. Ordinary questions
 remain **Needs you**. The reason and explanation persist on the hub and clear on
 an explicit running/done transition. Runtime stop hooks do not erase a blocker.
 Claude's configured notification hook classifies permission prompts automatically.
+The host relay also detects the visible Codex directory-trust startup prompt in
+Tailterm-owned panes and reports it without accepting trust or sending terminal input.
 Other blockers depend on the agent reporting them; Tailterm does not currently
 intercept every runtime approval or detect every stalled subprocess.
 

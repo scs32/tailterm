@@ -43,6 +43,35 @@ export function createTaskHub(host) {
   const bound = new Set(); // task ids mirrored into tabs
   const cache = new Map(); // taskId -> {task, agents} for tooltips/dialogs
   let tasksList = [];
+  const serverHosts = new Map();
+  const probedServers = new Set();
+  const serverKey = (s) => JSON.stringify([s.id, s.host, s.port, s.username]);
+  function rememberHost(server, name) {
+    if (!name || typeof name !== "string" || name.length > 255) return;
+    const key = serverKey(server);
+    if (!serverHosts.has(key)) serverHosts.set(key, new Set());
+    serverHosts.get(key).add(name);
+  }
+  const taskServers = () =>
+    host
+      .getServers()
+      .map((s) => ({
+        ...s,
+        agentHosts: [...(serverHosts.get(serverKey(s)) || [])],
+      }));
+  async function resolveAgentHosts() {
+    await Promise.allSettled(
+      host.getServers().map(async (server) => {
+        const key = serverKey(server);
+        if (probedServers.has(key)) return;
+        probedServers.add(key);
+        const name = (
+          await host.browserCommand(server, "hostname -s", 1024)
+        ).trim();
+        if (/^[A-Za-z0-9_.-]+$/.test(name)) rememberHost(server, name);
+      }),
+    );
+  }
 
   function refresh() {
     const url = host.getData()?.hub?.url;
@@ -208,13 +237,24 @@ export function createTaskHub(host) {
   }
   async function doReconcile(feed) {
     if (feed.stopped) return;
-    const r = reconcileTask({
-      taskId: feed.taskId,
-      agents: feed.agents,
-      tabs: host.getTabs(),
-      servers: host.getServers(),
-      hidden,
-    });
+    const reconcileCurrent = () =>
+      reconcileTask({
+        taskId: feed.taskId,
+        agents: feed.agents,
+        tabs: host.getTabs(),
+        servers: taskServers(),
+        hidden,
+      });
+    let r = reconcileCurrent();
+    if (r.unknown.length) {
+      await resolveAgentHosts();
+      if (feed.stopped) return;
+      r = reconcileCurrent();
+    }
+    if (r.unknown.length && feed.unknown !== r.unknown.length)
+      host.notice(
+        `Could not open ${r.unknown.length} agent terminal(s): no saved machine matches ${[...new Set(r.unknown.map((a) => a.host))].join(", ")}.`,
+      );
     feed.unknown = r.unknown.length;
     for (const { tab, agent } of r.adopt) {
       tab.task = taskBinding(feed.taskId, agent);
@@ -510,6 +550,7 @@ export function createTaskHub(host) {
       );
     }
     if (!agent?.id) throw new Error("tt spawn did not return an agent.");
+    rememberHost(server, agent.host);
     return agent;
   }
 
@@ -956,6 +997,7 @@ export function createTaskHub(host) {
     );
     const parsed = JSON.parse(out);
     if (parsed.missing) return null;
+    rememberHost(server, parsed.host);
     return parsed.runtimes || [];
   }
 
@@ -1021,6 +1063,6 @@ export function createTaskHub(host) {
     board,
     commands,
     refreshRuntimes,
-    matchServer: (h) => matchServer(h, host.getServers()),
+    matchServer: (h) => matchServer(h, taskServers()),
   };
 }

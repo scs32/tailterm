@@ -18,6 +18,7 @@ export function matchServer(host, servers) {
   const candidates = servers.filter(
     (s) =>
       shortHost(s.host) === want ||
+      s.agentHosts?.some((alias) => shortHost(alias) === want) ||
       String(s.name || "")
         .trim()
         .toLowerCase() === want,

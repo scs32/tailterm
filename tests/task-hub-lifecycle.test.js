@@ -43,3 +43,78 @@ test("deleted tasks are forgotten without closing terminals or retrying", async 
   hub.sync();
   assert.equal(requests, 1);
 });
+
+test("existing task terminals resolve a machine's different local hostname", async () => {
+  const taskId = "tsk_0123456789abcdef";
+  const agent = {
+    id: "agt_0123456789abcdef",
+    name: "orchestrator",
+    host: "Stephens-Mini",
+    session: "orchestrator",
+    status: "needs_input",
+  };
+  const machine = {
+    id: "mini",
+    name: "Mini",
+    host: "stephens-mac-mini.tail123.ts.net",
+    username: "stephen",
+  };
+  const connected = [],
+    probes = [],
+    notices = [],
+    groups = [];
+  const hub = createTaskHub({
+    getData: () => ({ hub: { url: "http://hub" } }),
+    getIPN: () => ({
+      fetch: async (url) => {
+        if (url.includes("/events")) return new Promise(() => {});
+        return {
+          status: 200,
+          text: async () =>
+            JSON.stringify({
+              task: { id: taskId, name: "Best dad joke", status: "open" },
+              agents: [agent],
+              latestSeq: 0,
+            }),
+        };
+      },
+    }),
+    getServers: () => [machine],
+    getTabs: () => [],
+    browserCommand: async (server, command) => {
+      probes.push([server.id, command]);
+      return "Stephens-Mini\n";
+    },
+    paneGroups: () => ({
+      model: {
+        groups,
+        taskGroup: () => groups.find((g) => g.taskId === taskId),
+        group: () => groups[0],
+      },
+      sync() {},
+    }),
+    connect: async (server, tmux, session, options) => {
+      connected.push({ server, session, options });
+      groups.push({ active: "pane" });
+      return { id: "pane" };
+    },
+    render() {},
+    scheduleWorkspaceSave() {},
+    bookmark() {},
+    closeTab() {},
+    notice: (s) => notices.push(s),
+  });
+  hub.refresh();
+  hub.restore([taskId]);
+  for (let i = 0; i < 10 && !connected.length; i++)
+    await new Promise((r) => setImmediate(r));
+  hub.stopAll();
+  assert.deepEqual(probes, [["mini", "hostname -s"]]);
+  assert.equal(connected.length, 1);
+  assert.equal(connected[0].server.id, "mini");
+  assert.equal(connected[0].session, "orchestrator");
+  assert.equal(connected[0].options.resumeOnly, true);
+  assert.equal(groups[0].taskId, taskId);
+  assert.equal(hub.matchServer("Stephens-Mini").id, "mini");
+  assert.deepEqual(notices, []);
+});
