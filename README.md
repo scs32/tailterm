@@ -2,7 +2,13 @@
 
 A browser SSH terminal that connects through Tailscale. Run it from a static website: SSH, the Tailscale node, and the encrypted vault run in your browser through WebAssembly.
 
-**Try it: [tailterm.tailarr.com](https://tailterm.tailarr.com)**
+**Current development release: [tailos.tailarr.com](https://tailos.tailarr.com)**
+
+**Moving computers or taking over development?** Start with the
+[handoff guide](docs/handoff.md) and [project overview](docs/project-overview.md).
+The current implementation is on `tasks-hub`; the original Tailterm site and
+`main` remain a separate older release. A clone of `origin/main` does not include
+this branch's work.
 
 
 ## Features
@@ -20,7 +26,11 @@ A browser SSH terminal that connects through Tailscale. Run it from a static web
 - Customize colors, fonts, cursor, spacing, and focus-following behavior.
 - Render terminals on the GPU with WebGL, with a toggle for ligature-friendly DOM rendering.
 - Run teams of AI coding agents as **tasks**: a terminal tab mirrors every agent on the task, agents message each other through a shared board, and lifecycle events surface as tab activity. See [tasks](docs/tasks.md).
-- Switch the workspace between Terminals, Board, Files, and Tasks modes. Files is a server-wide browser and transfer tool over SFTP.
+- Switch between Terminals, Board, Tasks, and Teams. Files is intentionally hidden; SFTP still powers project-folder selection and uploads.
+- Save reusable teams with explicit models, roles, prompts, permissions, orchestrators, helper limits and optional swarm messaging.
+- Retire workers while preserving their terminals, or close a task to clean up its owned remote tmux sessions with durable host retries.
+- Read closed task conversations and download their retained messages, roster, objective and activity history.
+- Optionally sync encrypted profiles across computers through the existing coordination hub.
 
 The terminal renderer is xterm.js. The appearance controls take inspiration from Ghostty configurations; this does not embed Ghostty.
 
@@ -41,29 +51,36 @@ tmux must be installed on the destination for persistent sessions. Standard SSH 
 
 ## Hosting
 
-Deploy only `dist-static/` to an HTTPS static host. The production site uses Cloudflare Pages:
+Deploy only `dist-static/` to an HTTPS static host. This branch uses Cloudflare Pages project **tailos**. From a clean committed checkout:
 
 ```sh
+npm run build:static
+npm run verify:release
 npx wrangler login
-npx wrangler pages project create tailterm --production-branch main
-npx wrangler pages deploy dist-static --project-name tailterm --branch main
+npx wrangler pages deploy dist-static --project-name tailos --branch main --commit-hash "$(git rev-parse HEAD)" --commit-dirty=false
 ```
 
-Choose your own project name when deploying a fork. Connect your custom domain through Cloudflare Pages and DNS. The included `_headers` file configures security and cache headers.
+The Pages production branch setting is `main`; the source checkout remains
+`tasks-hub`. **Do not use `npm run deploy:static` for this branch**: that older
+script targets `tailterm.tailarr.com`. Do not overwrite the original site.
+The existing TailOS custom domain is already configured. For forks, select your
+own project/domain. The included `_headers` configures security and cache headers.
+See the [handoff](docs/handoff.md) for exact current release and deployment details.
 
 The approximately 37.5 MB WASM module ships as an approximately 8.5 MB gzip asset, below Cloudflare's 25 MiB per-file limit. The browser decompresses it before streaming it into the WASM compiler. Serve `.wasm.gz` as gzip data without adding `Content-Encoding`; the client handles decompression.
 
-No application backend is needed for the static deployment. It still uses Tailscale coordination and relay services. Standard SSH also travels through Tailscale, directly to a device or through an approved subnet route.
+No SSH gateway backend is needed for the static terminal deployment. Tasks, messaging and optional profile sync use the separate coordination hub. It still uses Tailscale coordination and relay services. Standard SSH also travels through Tailscale, directly to a device or through an approved subnet route.
 
 ## Data and session behavior
 
 - Credentials are encrypted at rest in IndexedDB. Unlocking makes them available to this app in memory.
-- Vaults belong to their browser origin. Moving from localhost to another domain requires encrypted backup/restore and authorization of a new browser Tailscale identity.
+- Vaults belong to their browser origin. Moving computers or origins uses encrypted backup/restore or optional [profile sync](docs/profile-sync.md), plus authorization of a new browser Tailscale identity.
 - One browser tab owns an unlocked vault; use terminal tabs and groups inside the app.
 - Closing the page disconnects SSH. Remote tmux sessions continue. The encrypted workspace remembers tabs, groups, and server filters and restores them after unlocking; plain SSH tabs open fresh shells. Local scrollback does not survive a reload.
-- This version does not provide SFTP, port forwarding, native ssh-agent integration, or automatic cross-device synchronization.
+- SFTP supports folder selection and uploads; the Files workspace remains hidden. No local TCP forwarding/listener or native ssh-agent integration is provided. Profile sync is optional and does not copy browser Tailscale identities or current window layout.
+- Closing a task terminates its agent tmux sessions and preserves shared board history. Full terminal output/private agent chats are not archived.
 
-See [the static-client guide](docs/static-client.md) for architecture, controls, deployment, and validation limits, [tasks](docs/tasks.md) for the agent-team hub, and [appearance references](docs/appearance.md) for theme sources.
+See [the project overview](docs/project-overview.md) for the complete architecture and current limits, [the static-client guide](docs/static-client.md) for architecture, controls, deployment, and validation limits, [tasks](docs/tasks.md) for the agent-team hub, and [appearance references](docs/appearance.md) for theme sources.
 
 ## Development and tests
 

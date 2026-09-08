@@ -4,6 +4,9 @@ The hub stores tasks (shared objectives), named agents, durable messages and
 lifecycle events in SQLite. Tailterm presents that state across servers;
 `tt` starts local tmux sessions and gives agents access to the same inbox.
 
+For architecture and migration, see the [project overview](../docs/project-overview.md)
+and [handoff](../docs/handoff.md).
+
 ## This installation
 
 - TrueNAS App: `tailterm-hub`, deployed with `midclt app.create/app.update`.
@@ -11,7 +14,7 @@ lifecycle events in SQLite. Tailterm presents that state across servers;
 - Persistent database: `/mnt/deepfreeze/tailterm-hub/state/hub.sqlite`.
 - Access token: `/mnt/deepfreeze/tailterm-hub/hub-token` (mode 600).
 - No embedded Tailscale instance, enrollment, socket mount or host Tailscale changes.
-- Eight active agents per task. Exited agents do not consume the limit.
+- The deployed cap is 32 open agents per task. Exited and closed agents do not consume it; retired agents do. Helper creation has a separate lifetime allowance.
 
 The normal TCP listener requires `TAILTERM_TCP_LISTEN`, `TAILTERM_TOKEN_FILE`
 and `TAILTERM_STATE`. The token must be at least 32 characters. This is a
@@ -36,7 +39,7 @@ Mini, click **Load configuration from server**, then **Test connection** and
 the encrypted browser vault. No secret is embedded in the static website.
 
 Create a task with an objective, select an agent host and runtime, and launch.
-Save frequently used command/directory combinations as launch profiles.
+Save reusable agents, roles, models and launch settings as Teams. A team of one replaces an old launch profile. Choose an explicit project folder at launch.
 
 ```sh
 tt doctor
@@ -53,8 +56,11 @@ tt spawn --name reviewer --run codex --cwd /absolute/project
 
 Messages stay in the durable inbox until retrieved; they are never typed
 into a terminal. Agents receive the task briefing and instructions to check
-the inbox at checkpoints. A message arriving after an agent becomes idle
-does not automatically wake it. Send a new prompt or use runtime hooks.
+the inbox at checkpoints. On hosts with a compatible Codex CLI and `tt relay`,
+the relay binds exact thread/run identities and uses native `codex queue` to wake
+eligible idle agents. Other runtimes depend on their hooks/checkpoints. See
+[delivery details](../docs/tasks.md). The relay also performs durable cleanup of
+sessions belonging to closed tasks.
 
 `tt hooks claude` prints settings for SessionStart, UserPromptSubmit, Stop and
 Notification. Merge these with your existing Claude settings if desired.
@@ -73,11 +79,14 @@ An exited named agent on the same host can be launched again with its stable
 identity and inbox, but a new run ID. Events carrying the previous run ID are
 rejected. Closing/hiding a pane does not remove the agent from its task, and
 hidden panes stay hidden until reopened. Closing a task records it closed and
-removes mirrored panes; it does not terminate remote tmux processes.
+removes mirrored panes and requests termination of the task's owned tmux sessions,
+including retired agents. Browser SSH actions and the host relay perform cleanup;
+offline hosts remain pending until confirmation. Retirement alone preserves the
+session. See [cleanup and history](../docs/task-cleanup.md).
 
 Replies reference the original message sequence. Read receipts mean retrieval,
-not completion or acceptance. The Board shows the latest 200 messages; full
-history stays on the hub. Spawn requests are local to the CLI host; Tailterm
+not completion or acceptance. The Board previews the latest 200 messages. Closed tasks can load the full
+conversation and export retained messages, metadata and activity events as JSON. Spawn requests are local to the CLI host; Tailterm
 launches remote agents through SSH. No distributed scheduler or automatic git
 workspace/merge management is provided.
 

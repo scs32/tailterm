@@ -106,9 +106,12 @@ labels. The wrapper sends a heartbeat every 30 seconds; after 90 seconds without
 one, the UI reports offline. Restarting an exited agent on the same machine
 retains its name, ID and inbox, with a fresh run ID.
 
-Closing a task records it closed and removes its mirrored panes. Remote tmux
-sessions remain running until stopped on their hosts. A hidden pane stays
-hidden until explicitly reopened. The hub does not manage git worktrees,
+Closing a task records it closed, removes mirrored panes, and requests termination
+of its agent tmux sessions, including retired agents. Cleanup runs through browser
+SSH and independently through host relays; offline hosts remain visibly pending
+until confirmed. Ordinary guest sessions survive. Closed tasks expose read-only
+board history and a complete retained-history download. See [cleanup and saved
+history](task-cleanup.md). A hidden pane stays hidden until explicitly reopened. The hub does not manage git worktrees,
 merge conflicts, distributed scheduling, or per-agent security boundaries.
 
 ## Views
@@ -116,9 +119,10 @@ merge conflicts, distributed scheduling, or per-agent security boundaries.
 **Terminals** keeps existing SSH sessions connected while switching modes.
 **Board** keeps per-task drafts and shows delivery/read information and replies.
 **Tasks** brings objectives, agents and attention requests together.
-**Files** browses SFTP paths, uploads/downloads, creates folders, renames/deletes,
-and opens a terminal in the current directory. Switching servers cancels the
-remaining files in an upload batch. It does not reroute them to another host.
+**Teams** stores reusable launch templates and the bundled examples.
+**Files** is intentionally hidden. Its SFTP infrastructure remains available for
+project-folder selection and uploads; do not re-enable the view without the owner
+choosing to resume that work.
 
 **Fullscreen** uses the browser Fullscreen API for the entire UI. **Expand**
 hides the server sidebar to give the current view more room; it works independently

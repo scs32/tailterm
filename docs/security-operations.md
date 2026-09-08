@@ -4,6 +4,11 @@ The production Pages project is the static browser distribution. It has no
 Node gateway, server vault, or application backend. The optional legacy gateway
 in this repository is a separate deployment, not a fallback used by Pages.
 
+The current `tasks-hub` deployment is **TailOS**, a separate Pages project.
+The older `npm run deploy:static` workflow described below applies to the original
+Tailterm/main release only. Use the explicit `--project-name tailos` workflow in
+[the handoff](handoff.md) for this branch; do not publish it over the old site.
+
 ## Repository and releases
 
 - `.github/workflows/checks.yml` runs unit and real SSH integration tests on pull

@@ -1,6 +1,13 @@
 # Tailterm browser distribution
 
-The static build targets `https://tailterm.tailarr.com/`. It needs an HTTPS static file host, Tailscale coordination/relay services, and reachable destination SSH servers. It has no Tailterm API, websocket SSH gateway, central vault, or application process. Ordinary SSH connections use Tailscale network transport; public/LAN raw TCP outside that transport is not available to a normal webpage.
+The current `tasks-hub` branch is deployed at `https://tailos.tailarr.com/`.
+The original `tailterm.tailarr.com` remains a separate older release. The browser
+needs an HTTPS static host, Tailscale coordination/relay services and reachable
+SSH destinations. It uses no Node SSH gateway; tasks and optional encrypted
+profile sync use the separate private coordination hub. See [project overview](project-overview.md)
+and [handoff](handoff.md) for the current deployment and migration instructions.
+Ordinary SSH connections use Tailscale network transport; raw public/LAN TCP
+outside that transport is not available to a normal webpage.
 
 ## Build and serve
 
@@ -17,9 +24,14 @@ Preview uses `http://127.0.0.1:4318/`, a browser secure-context exception for lo
 
 ## Cloudflare deployment
 
-The static client uses its own Cloudflare Pages project, `tailterm`, in the website’s account. After building and testing a clean committed main checkout, publish with `npm run deploy:static`. It verifies the release inventory before invoking Wrangler for the existing project. The custom domain is `tailterm.tailarr.com`, pointing to `tailterm.pages.dev`. No Tailarr product server is involved.
+For this branch, deploy the verified `dist-static/` to the existing `tailos`
+project with the explicit Wrangler command in [the handoff](handoff.md).
+Do not run `npm run deploy:static`: that script targets the older `tailterm`
+project and enforces Git main. No DNS or project recreation is necessary.
 
-Browser storage is origin-specific: existing localhost profiles and credentials do not automatically appear on the public domain. Use Backup & restore to move the encrypted profiles; authorize a new Tailscale browser identity on the public domain.
+Browser storage is origin-specific. Use encrypted backup/restore or optional
+[profile sync](profile-sync.md) to move saved settings, then authorize each new
+browser's own Tailscale identity.
 
 ## Browser vault and identity
 
@@ -63,14 +75,12 @@ Terminals draw with xterm's WebGL renderer when the browser offers WebGL2. Each 
 
 ### Task teams and modes
 
-The workspace header switches between Terminals, Board, Files, and Tasks with a
-segmented control or Ctrl/Cmd + 1-4. A terminal tab can carry a **task** from
-the hub; it then mirrors that task's agents, opening a pane per agent and
-removing panes as agents close. See [tasks](tasks.md) for the hub, the `tt`
-agent CLI, and setup. Files browses and transfers files on one server over the
-same SFTP path as uploads. Browser storage keeps the hub URL, per-task session
-bindings, and the last folder per server; none of it is sent anywhere but the
-hub and the servers you configure.
+The header switches between Terminals, Board, Tasks and Teams. Shortcuts are
+Ctrl/Cmd + 1, 2, 4 and 5 respectively; Files remains hidden. Each task has its own
+named terminal group, kept separate from other tasks. Board includes read-only
+closed-task conversations and history downloads. See [tasks](tasks.md),
+[cleanup](task-cleanup.md) and [project folders](project-folders.md) for details.
+SFTP remains available to folder selection and uploads even while Files is hidden.
 
 ### Workspace continuity
 
@@ -126,7 +136,7 @@ Backups are available on demand without automatic reminders. **Backup & restore*
 
 `python3 tests/real-tmux.py /path/to/tmux` checks the generated commands, OSC 52 payload, session mouse setting, and persistence using an isolated real tmux socket and PTY. The local test binary is not installed on any destination server.
 
-Live tailnet authorization, subnet routing, persistent device reauthorization behavior, and deployment to the public hostname remain environment-dependent checks. This client does not provide background browser execution after closure, native ssh-agent access, local TCP listeners/port forwarding, or an SFTP file browser.
+Live tailnet authorization, subnet routing, persistent device reauthorization behavior, and deployment to the public hostname remain environment-dependent checks. This client does not provide background browser execution after closure, native ssh-agent access, local TCP listeners/port forwarding, or a currently enabled Files workspace. SFTP is implemented for uploads and folder selection.
 
 ## Everyday workspace controls
 
