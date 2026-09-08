@@ -22,8 +22,19 @@ test("permission modes are portable team fields and explicit launch arguments", 
   });
   assert.match(cmd, /--permission-mode/);
   assert.match(cmd, /workspace-auto/);
+  assert.equal(
+    normalizeTeam({ name: "Team", members: [{ ...m, cwd: "" }] }).members[0]
+      .cwd,
+    "",
+  );
   assert.throws(
-    () => normalizeTeam({ name: "Team", members: [{ ...m, cwd: "" }] }),
+    () =>
+      agentSpawnCommand({
+        hub: "http://hub",
+        task: "tsk_0000000000000001",
+        ...m,
+        cwd: "",
+      }),
     /absolute working directory/,
   );
   assert.throws(

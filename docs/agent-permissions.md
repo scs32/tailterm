@@ -31,8 +31,8 @@ currently retain host settings; their custom launch flags can be supplied throug
 the command override. Preset support requires a compatible installed agent CLI.
 
 Same-app helpers inherit their parent's explicit permission preset and Claude
-allow rules when those flags are omitted from `tt spawn`. A workspace-mode helper
-also inherits the launch directory when no directory is supplied. An explicit
+allow rules when those flags are omitted from `tt spawn`. Helpers inherit the parent’s project folder when no directory is supplied,
+including helpers using a different app. An explicit
 child flag overrides that default. This is launch configuration, not a hub-enforced
 privilege ceiling: task agents already run as the selected SSH user. Different
 apps do not inherit incompatible permission modes.

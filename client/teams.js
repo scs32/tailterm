@@ -65,6 +65,11 @@ export function normalizeTeam(value) {
         hub: "http://localhost",
         task: "tsk_0000000000000000",
         ...member,
+        cwd:
+          member.cwd ||
+          (member.permissionMode === "workspace-auto"
+            ? "/__launch_project__"
+            : ""),
         prompt: [member.role && "Role: " + member.role, member.prompt]
           .filter(Boolean)
           .join("\n\n"),
@@ -117,7 +122,12 @@ export function savedTeams(data) {
   }
   return result;
 }
-export function teamLaunches(team, servers, mainServerId = servers[0]?.id) {
+export function teamLaunches(
+  team,
+  servers,
+  mainServerId = servers[0]?.id,
+  projectFolders,
+) {
   const normalized = normalizeTeam(team);
   const ordered = [...normalized.members].sort(
     (a, b) =>
@@ -134,10 +144,23 @@ export function teamLaunches(team, servers, mainServerId = servers[0]?.id) {
           ? `Choose an available server for ${member.name} in Teams.`
           : `Choose a main machine to launch ${member.name}.`,
       );
+    const cwd = member.cwd || projectFolders?.[server.id] || "";
+    if (projectFolders && !cwd)
+      throw new Error(
+        `Choose a project folder on ${server.name} for ${member.name}.`,
+      );
+    if (cwd)
+      agentSpawnCommand({
+        hub: "http://localhost",
+        task: "tsk_0000000000000000",
+        ...member,
+        cwd,
+      });
     return {
       server,
       fields: {
         ...member,
+        cwd,
         prompt: [member.role && "Role: " + member.role, member.prompt]
           .filter(Boolean)
           .join("\n\n"),

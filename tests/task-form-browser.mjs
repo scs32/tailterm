@@ -52,7 +52,7 @@ import {setupModes} from '/client/modes.js';
 let board, tasks, modes, teams;const data={hub:{url:location.origin},launchProfiles:[],teams:[]};
 const servers=[{id:'local',name:'Test host',host:'stephens-macbook-air',username:'test',runtimes:['claude']},{id:'secondary',name:'Second host',host:'second-fixture',username:'test',runtimes:['codex']}];
 const model={groups:[],taskGroup:()=>null};
-const host={getIPN:()=>({fetch:(url,init)=>fetch(url,init)}),getData:()=>data,getServers:()=>servers,currentServer:()=>servers[0],currentTab:()=>null,getTabs:()=>[],paneGroups:()=>({model,sync(){}}),render(){},scheduleWorkspaceSave(){},bookmark(){},closeTab(){},connect:async()=>null,notice:t=>{document.querySelector('#notice').textContent=t},api:async(url,method,body)=>{if(url==="/teams")data.teams=[...data.teams.filter(t=>t.id!==body.id),body];if(url.startsWith("/teams/"))data.teams=data.teams.filter(t=>t.id!==url.slice(7));if(url==="/launch-profiles")data.launchProfiles=[...data.launchProfiles.filter(p=>p.name!==body.name),body];return {sessions:[]}},reloadData:async()=>{},
+const host={openSFTP:async server=>({done:new Promise(()=>{}),home:async()=>${JSON.stringify(root)},realpath:async p=>p,list:async p=>({path:p,entries:p===${JSON.stringify(root)}?[{name:'hub',isDir:true},{name:'ignored.txt',isDir:false}]:[]}),close(){}}),getIPN:()=>({fetch:(url,init)=>fetch(url,init)}),getData:()=>data,getServers:()=>servers,currentServer:()=>servers[0],currentTab:()=>null,getTabs:()=>[],paneGroups:()=>({model,sync(){}}),render(){},scheduleWorkspaceSave(){},bookmark(){},closeTab(){},connect:async()=>null,notice:t=>{document.querySelector('#notice').textContent=t},api:async(url,method,body)=>{if(url==="/teams")data.teams=[...data.teams.filter(t=>t.id!==body.id),body];if(url.startsWith("/teams/"))data.teams=data.teams.filter(t=>t.id!==url.slice(7));if(url==="/launch-profiles")data.launchProfiles=[...data.launchProfiles.filter(p=>p.name!==body.name),body];return {sessions:[]}},reloadData:async()=>{},
  dialog:(title,body)=>{const d=document.querySelector('#dialog');if(d.open)d.close();d.innerHTML='<div class="dialog-head"><h2>'+title+'</h2><button id="dialog-close">×</button></div>'+body;d.querySelector('#dialog-close').onclick=()=>host.closeDialog();d.showModal()},
  closeDialog:()=>{const d=document.querySelector('#dialog');d.close();d.replaceChildren()},
  openBoard:id=>{modes.set('board');board.show(id)},
@@ -298,6 +298,23 @@ try {
       await page.evaluate(() => qa.hub.newTask());
       await page.locator("#task-name").fill(name + " launch retry");
       await page.locator("#task-with-agent").check();
+      await page.locator("#task-create").click();
+      await page
+        .locator("#task-error")
+        .filter({ hasText: "Choose a project folder" })
+        .waitFor();
+      await page
+        .locator("#agent-cwd")
+        .locator("..")
+        .locator("[data-folder-browse]")
+        .click();
+      await page.locator('[data-folder-entry="0"]').click();
+      await page.locator("[data-folder-use]").click();
+      assert.equal(
+        await page.locator("#agent-cwd").inputValue(),
+        path.join(root, "hub"),
+      );
+
       await page.locator("#agent-runtime").selectOption("codex");
       await page.locator("#agent-model-choice").selectOption("__custom");
       await page.locator("#agent-model").fill("test-model-v2");
@@ -418,6 +435,8 @@ try {
       await page.locator("[data-new-task]").click();
       assert.notEqual(await page.locator("#task-team").inputValue(), "");
       await page.locator("#task-main-server").selectOption("secondary");
+      await page.locator('[data-project-server="secondary"]').fill(root);
+
       await page.locator("#task-allow-spawn").check();
       await page.locator("#task-max-new-agents").fill("3");
       await page.locator("#task-name").fill(name + " team task");
@@ -531,7 +550,8 @@ try {
       );
       await page.locator("#team-task").selectOption(target.id);
       await page.locator("#team-main-server").selectOption("local");
-      await page.locator("#team-launch-form button").click();
+      await page.locator('[data-project-server="local"]').fill(root);
+      await page.locator('#team-launch-form button[type="submit"]').click();
       await page.locator("#dialog").waitFor({ state: "hidden" });
       const attached = await (
         await fetch("http://127.0.0.1:" + port + "/v1/tasks/" + target.id)

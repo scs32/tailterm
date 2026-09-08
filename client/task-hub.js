@@ -1,3 +1,4 @@
+import { projectFolderHTML, wireProjectFolder } from "./project-folder.js";
 import { agentControlsHTML, wireAgentControls } from "./agent-controls.js";
 import { agentToolsCommand } from "../shared/tmux-command.js";
 import { modelPickerHTML, wireModelPicker } from "./model-picker.js";
@@ -457,15 +458,68 @@ export function createTaskHub(host) {
     );
   };
 
+  function teamProjectFolders(container, getTeam, getMain) {
+    const paths = {};
+    const read = () => {
+      container
+        .querySelectorAll("[data-project-server]")
+        .forEach(
+          (input) => (paths[input.dataset.projectServer] = input.value.trim()),
+        );
+      return { ...paths };
+    };
+    function render() {
+      read();
+      const team = getTeam();
+      container.hidden = !team;
+      if (!team) return;
+      const servers = host.getServers();
+      const needed = [
+        ...new Set(
+          team.members
+            .filter((m) => !m.cwd)
+            .map((m) => m.serverId || getMain()),
+        ),
+      ];
+      container.innerHTML =
+        needed
+          .map((id, i) => {
+            const server = servers.find((s) => s.id === id);
+            return projectFolderHTML(
+              `team-project-${i}`,
+              paths[id] || "",
+              `${server?.name || "Missing machine"} · Project folder`,
+            );
+          })
+          .join("") +
+        team.members
+          .filter((m) => m.cwd)
+          .map(
+            (m) =>
+              `<p class="fine">${esc(m.name)} uses ${esc(m.cwd)} on ${esc(servers.find((s) => s.id === (m.serverId || getMain()))?.name || "Missing machine")} (team override).</p>`,
+          )
+          .join("") +
+        '<p class="fine">Folders are local to each machine. Codex may ask you to trust a folder in its terminal on first use.</p>';
+      container.querySelectorAll(".project-folder").forEach((root, i) => {
+        root.querySelector("input").dataset.projectServer = needed[i];
+        wireProjectFolder(root, host, () =>
+          host.getServers().find((s) => s.id === needed[i]),
+        );
+      });
+    }
+    return { read, render };
+  }
+
   function agentFields(server) {
     return `<div class="agent-launch-fields">
+      ${projectFolderHTML("agent-cwd")}
+      <p class="fine">Choose a folder on the selected machine. Codex may ask you to trust it in the terminal on first use.</p>
       <div class="appearance-controls"><label>Agent name<input id="agent-name" value="agent1" maxlength="64" autocomplete="off" spellcheck="false"></label><label>Agent app<select id="agent-runtime">${runtimeOptions(server)}</select></label></div>
       <div id="agent-model-picker"></div><div id="agent-controls"></div>
       <p id="agent-model-help" class="fine field-help">Enter a model name or alias available to this app on the selected server.</p>
       <label>Assignment<textarea id="agent-prompt" rows="2" placeholder="Optional instructions for this agent"></textarea></label>
       <details class="dialog-details"><summary>Advanced setup</summary>
         <label>Command override<input id="agent-run" placeholder="claude" autocomplete="off" spellcheck="false"></label>
-        <label>Working directory<input id="agent-cwd" placeholder="/absolute/project/path (optional)" autocomplete="off" spellcheck="false"></label>
       </details></div>`;
   }
 
@@ -494,6 +548,19 @@ export function createTaskHub(host) {
     };
   }
   function wireAgentFields() {
+    document.querySelector("#agent-cwd").oninput = () => {
+      const error = document.querySelector("#task-error");
+      if (error?.textContent.startsWith("Choose a project folder"))
+        error.textContent = "";
+    };
+    wireProjectFolder(
+      document.querySelector("#agent-cwd").closest(".project-folder"),
+      host,
+      () =>
+        host
+          .getServers()
+          .find((s) => s.id === document.querySelector("#task-server")?.value),
+    );
     const runtime = document.querySelector("#agent-runtime"),
       run = document.querySelector("#agent-run");
     const update = () => {
@@ -522,6 +589,8 @@ export function createTaskHub(host) {
   }
 
   async function spawn(taskId, server, fields) {
+    if (!fields.cwd)
+      throw new Error("Choose a project folder before launching the agent.");
     if (!AGENT_NAME_RE.test(fields.name))
       throw new Error(
         "Agent name: 1–64 letters, numbers, dashes or underscores.",
@@ -583,6 +652,7 @@ export function createTaskHub(host) {
       <label>Objective<textarea id="task-goal" rows="3" maxlength="8192" placeholder="What should be accomplished?"></textarea></label>
       ${teams.length ? `<label>Team<select id="task-team"><option value="">No team · choose an agent below</option>${teams.map((t) => `<option value="${esc(t.id)}" ${t.id === initialTeam?.id ? "selected" : ""}>${esc(t.name)} · ${t.members.length} agents</option>`).join("")}</select></label>` : ""}
       <label id="task-main-machine" hidden>Main machine<select id="task-main-server">${serverOptions(server?.id)}</select><span class="fine">Used by team members without an assigned machine.</span></label>
+      <div id="task-project-folders" hidden></div>
       <label class="check" id="task-manual-agent"><input type="checkbox" id="task-with-agent">Start the first agent now</label>
       <fieldset id="task-agent-fields" hidden disabled><label>Server<select id="task-server">${serverOptions(server?.id)}</select></label>${agentFields(server)}</fieldset>
       <label class="check"><input type="checkbox" id="task-swarm">Enable swarm</label><p class="fine">Every new message reaches every agent on this task. Named recipients indicate who should act.</p><label class="check"><input type="checkbox" id="task-allow-spawn">Allow agents to add other agents</label><label>Max new agents<input id="task-max-new-agents" type="number" min="0" max="32" step="1" value="2" disabled></label><p class="fine">Additional helpers across this task, including finished helpers. Agents you add manually do not count.</p>
@@ -600,6 +670,12 @@ export function createTaskHub(host) {
       launchPlan = null;
     const progress = new Set();
     const teamSelect = form.querySelector("#task-team");
+    const projects = teamProjectFolders(
+      form.querySelector("#task-project-folders"),
+      () => teams.find((t) => t.id === teamSelect?.value),
+      () => form.querySelector("#task-main-server").value,
+    );
+    form.querySelector("#task-main-server").onchange = projects.render;
     const open = () => {
       host.closeDialog();
       host.openBoard(saved.id);
@@ -623,6 +699,7 @@ export function createTaskHub(host) {
     };
     const selectTeam = () => {
       withAgent.onchange();
+      projects.render();
       form.querySelector("#task-swarm").checked = !!teams.find(
         (t) => t.id === teamSelect?.value,
       )?.swarm;
@@ -661,12 +738,15 @@ export function createTaskHub(host) {
                 team,
                 host.getServers(),
                 form.querySelector("#task-main-server").value,
+                projects.read(),
               )
             : fields
               ? [{ server: target, fields }]
               : []);
         if (fields) {
           if (!target) throw new Error("Choose a server for the first agent.");
+          if (!fields.cwd)
+            throw new Error("Choose a project folder for the first agent.");
           // Validate all launch input before creating persistent task records.
           agentSpawnCommand({
             hub: client.base,
@@ -694,6 +774,11 @@ export function createTaskHub(host) {
           launchPlan = plan;
           if (teamSelect) teamSelect.disabled = true;
           form.querySelector("#task-main-server").disabled = true;
+          form
+            .querySelectorAll(
+              "#task-project-folders input, #task-project-folders button",
+            )
+            .forEach((el) => (el.disabled = true));
           bound.add(saved.id);
           cache.set(saved.id, { task: saved, agents: [] });
           form.querySelector("#task-allow-spawn").disabled = true;
@@ -737,6 +822,7 @@ export function createTaskHub(host) {
     wireAgentFields();
     form.querySelector("#task-server").onchange = (e) => {
       const target = host.getServers().find((s) => s.id === e.target.value);
+      form.querySelector("#agent-cwd").value = "";
       form.querySelector("#agent-runtime").innerHTML = runtimeOptions(target);
       wireAgentFields();
     };
@@ -775,13 +861,21 @@ export function createTaskHub(host) {
       const tasks = (await loadTasks()).filter((t) => t.status === "open");
       host.dialog(
         `Add team · ${team.name}`,
-        `<form id="team-launch-form"><label>Task<select id="team-task">${tasks.map((t) => `<option value="${esc(t.id)}">${esc(t.name)}</option>`).join("")}</select></label>${team.members.some((m) => !m.serverId) ? `<label>Main machine<select id="team-main-server">${serverOptions(mainServer?.id)}</select></label>` : ""}<p class="fine">${team.members.map((m) => esc(m.name) + " · " + esc(m.serverId ? host.getServers().find((s) => s.id === m.serverId)?.name || "Missing machine" : "Main machine")).join("<br>")}</p>${team.swarm ? '<p class="fine">Starting this swarm enables broadcast for every agent on the selected task, including its existing agents.</p>' : ""}<p class="fine">An existing task keeps its main orchestrator; new members introduce themselves to that leader.</p><p id="team-launch-status" class="fine" role="status">${tasks.length ? "" : "Create a task first."}</p><div class="dialog-actions"><button type="submit" class="primary" ${tasks.length ? "" : "disabled"}>Start team</button></div></form>`,
+        `<form id="team-launch-form"><label>Task<select id="team-task">${tasks.map((t) => `<option value="${esc(t.id)}">${esc(t.name)}</option>`).join("")}</select></label>${team.members.some((m) => !m.serverId) ? `<label>Main machine<select id="team-main-server">${serverOptions(mainServer?.id)}</select></label>` : ""}<p class="fine">${team.members.map((m) => esc(m.name) + " · " + esc(m.serverId ? host.getServers().find((s) => s.id === m.serverId)?.name || "Missing machine" : "Main machine")).join("<br>")}</p>${team.swarm ? '<p class="fine">Starting this swarm enables broadcast for every agent on the selected task, including its existing agents.</p>' : ""}<p class="fine">An existing task keeps its main orchestrator; new members introduce themselves to that leader.</p><div id="team-project-folders"></div><p id="team-launch-status" class="fine" role="status">${tasks.length ? "" : "Create a task first."}</p><div class="dialog-actions"><button type="submit" class="primary" ${tasks.length ? "" : "disabled"}>Start team</button></div></form>`,
       );
       const form = document.querySelector("#team-launch-form"),
         selector = form.querySelector("#team-task"),
-        button = form.querySelector("button"),
+        button = form.querySelector('button[type="submit"]'),
         status = form.querySelector("#team-launch-status");
       const progress = new Set();
+      const projects = teamProjectFolders(
+        form.querySelector("#team-project-folders"),
+        () => team,
+        () => form.querySelector("#team-main-server")?.value || mainServer?.id,
+      );
+      projects.render();
+      if (form.querySelector("#team-main-server"))
+        form.querySelector("#team-main-server").onchange = projects.render;
       form.onsubmit = async (e) => {
         e.preventDefault();
         if (button.disabled) return;
@@ -793,9 +887,15 @@ export function createTaskHub(host) {
             team,
             host.getServers(),
             form.querySelector("#team-main-server")?.value || mainServer?.id,
+            projects.read(),
           );
           const mainChoice = form.querySelector("#team-main-server");
           if (mainChoice) mainChoice.disabled = true;
+          form
+            .querySelectorAll(
+              "#team-project-folders input, #team-project-folders button",
+            )
+            .forEach((el) => (el.disabled = true));
           const existingTask = await client.getTask(id);
           const policy = {};
           if (team.swarm) policy.swarm = true;
@@ -821,6 +921,11 @@ export function createTaskHub(host) {
             plan = null;
             const mainChoice = form.querySelector("#team-main-server");
             if (mainChoice) mainChoice.disabled = false;
+            form
+              .querySelectorAll(
+                "#team-project-folders input, #team-project-folders button",
+              )
+              .forEach((el) => (el.disabled = false));
           }
         } finally {
           button.disabled = false;
@@ -866,6 +971,7 @@ export function createTaskHub(host) {
     wireAgentFields();
     document.querySelector("#task-server").onchange = (e) => {
       const s = host.getServers().find((x) => x.id === e.target.value);
+      document.querySelector("#agent-cwd").value = "";
       document.querySelector("#agent-runtime").innerHTML = runtimeOptions(s);
       wireAgentFields();
     };

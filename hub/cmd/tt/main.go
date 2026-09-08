@@ -483,16 +483,6 @@ func cmdSpawn(e env, args []string) error {
 	if *task == "" || *hub == "" {
 		return errors.New("task and hub are required (TAILTERM_TASK/TAILTERM_HUB or --task/--hub)")
 	}
-	if *cwd != "" {
-		abs, err := filepath.Abs(*cwd)
-		if err != nil {
-			return err
-		}
-		if info, err := os.Stat(abs); err != nil || !info.IsDir() {
-			return fmt.Errorf("cwd %s is not a directory", abs)
-		}
-		*cwd = abs
-	}
 	if *runtime == "" {
 		*runtime = strings.Fields(*run)[0]
 	}
@@ -513,9 +503,19 @@ func cmdSpawn(e env, args []string) error {
 		if !explicitTools && os.Getenv("TAILTERM_ALLOWED_TOOLS") != "" {
 			*allowedJSON = os.Getenv("TAILTERM_ALLOWED_TOOLS")
 		}
-		if *cwd == "" && *permissionMode == "workspace-auto" {
-			*cwd = os.Getenv("TAILTERM_LAUNCH_CWD")
+	}
+	if *cwd == "" && e.agent != "" {
+		*cwd = os.Getenv("TAILTERM_LAUNCH_CWD")
+	}
+	if *cwd != "" {
+		abs, err := filepath.Abs(*cwd)
+		if err != nil {
+			return err
 		}
+		if info, err := os.Stat(abs); err != nil || !info.IsDir() {
+			return fmt.Errorf("cwd %s is not a directory", abs)
+		}
+		*cwd = abs
 	}
 	baseCommand, err := modelCommand(*run, *runtime, *model)
 	if err != nil {

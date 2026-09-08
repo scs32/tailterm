@@ -1,3 +1,4 @@
+import { projectFolderHTML, wireProjectFolder } from "./project-folder.js";
 import { agentControlsHTML, wireAgentControls } from "./agent-controls.js";
 import { TEAM_EXAMPLES, exampleTeam } from "./team-examples.js";
 import { modelPickerHTML, wireModelPicker } from "./model-picker.js";
@@ -79,7 +80,18 @@ export function createTeamsView(host) {
           )
           .join(
             "",
-          )}</select></label><div class="appearance-controls"><label>Agent app<select data-field="runtime">${known.map((r) => `<option value="${esc(r)}" ${r === m.runtime ? "selected" : ""}>${r === "generic" ? "Custom command" : esc(r)}</option>`).join("")}</select></label>${modelPickerHTML("team-model", m.runtime, m.model)}</div>${agentControlsHTML(m.runtime, m.permissionMode, m.allowedTools)}<label>Instructions<textarea data-field="prompt" rows="3" maxlength="8192" placeholder="What this member should do on every task…">${esc(m.prompt)}</textarea></label><details class="dialog-details"><summary>Command &amp; directory</summary><label>Command override<input data-field="run" value="${esc(m.run)}" placeholder="${m.runtime === "generic" ? "your-agent --flag" : esc(m.runtime)}"></label><label>Working directory<input data-field="cwd" value="${esc(m.cwd)}" placeholder="/absolute/project/path (optional)"></label></details>`;
+          )}</select></label><div class="appearance-controls"><label>Agent app<select data-field="runtime">${known.map((r) => `<option value="${esc(r)}" ${r === m.runtime ? "selected" : ""}>${r === "generic" ? "Custom command" : esc(r)}</option>`).join("")}</select></label>${modelPickerHTML("team-model", m.runtime, m.model)}</div>${agentControlsHTML(m.runtime, m.permissionMode, m.allowedTools)}${projectFolderHTML("team-cwd", m.cwd, "Project folder override", true)}<p class="fine">Leave blank to choose the project when launching this team.</p><label>Instructions<textarea data-field="prompt" rows="3" maxlength="8192" placeholder="What this member should do on every task…">${esc(m.prompt)}</textarea></label><details class="dialog-details"><summary>Command override</summary><label>Command override<input data-field="run" value="${esc(m.run)}" placeholder="${m.runtime === "generic" ? "your-agent --flag" : esc(m.runtime)}"></label></details>`;
+      form.querySelector("#team-cwd").dataset.field = "cwd";
+      wireProjectFolder(
+        form.querySelector("#team-cwd").closest(".project-folder"),
+        host,
+        () => {
+          const id = form.querySelector("[data-field=serverId]").value;
+          return id
+            ? host.getServers().find((s) => s.id === id)
+            : host.currentServer?.() || host.getServers()[0];
+        },
+      );
       wireModelPicker(form.querySelector("[data-model-picker]"));
       wireAgentControls(form.querySelector(".agent-controls"), async () => {
         capture();

@@ -504,6 +504,7 @@ function mount() {
       closeTab,
       activate,
       paneGroups: () => paneGroups,
+      openSFTP: (server) => browserTransport.browserSFTP(ipn, server, peers),
       dialog,
       closeDialog,
       notice,
@@ -600,6 +601,8 @@ function mount() {
       },
     });
     teamsView = createTeamsView({
+      currentServer,
+      openSFTP: (server) => browserTransport.browserSFTP(ipn, server, peers),
       getData: () => data,
       getServers: () => data.servers,
       api,

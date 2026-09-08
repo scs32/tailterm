@@ -85,3 +85,45 @@ test("orchestrator launches first and teams support an orchestrator plus ten wor
     "planner",
   );
 });
+
+test("project folders are scoped to each launch machine and preserve explicit member overrides", () => {
+  const machines = [
+    { id: "main", name: "Main" },
+    { id: "remote", name: "Remote" },
+  ];
+  const team = {
+    name: "Portable",
+    members: [
+      {
+        name: "lead",
+        runtime: "codex",
+        run: "codex",
+        permissionMode: "workspace-auto",
+      },
+      { name: "worker", runtime: "codex", run: "codex", serverId: "remote" },
+      {
+        name: "reviewer",
+        runtime: "codex",
+        run: "codex",
+        cwd: "/fixed/review",
+      },
+    ],
+  };
+  assert.throws(
+    () => teamLaunches(team, machines, "main", {}),
+    /Choose a project folder on Main/,
+  );
+  assert.throws(
+    () => teamLaunches(team, machines, "main", { main: "/local/project" }),
+    /Choose a project folder on Remote/,
+  );
+  const plan = teamLaunches(team, machines, "main", {
+    main: "/local/project with spaces",
+    remote: "/remote/project",
+  });
+  assert.deepEqual(
+    plan.map((p) => p.fields.cwd),
+    ["/local/project with spaces", "/remote/project", "/fixed/review"],
+  );
+  assert.equal(normalizeTeam(team).members[0].cwd, "");
+});

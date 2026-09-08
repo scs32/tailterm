@@ -5149,3 +5149,14 @@ dialog .agent-save-setup button {
 }
 .task-agent-lifecycle > div > span { min-width: 0; overflow-wrap: anywhere; }
 .task-agent-lifecycle button { flex-shrink: 0; }
+
+.project-folder { display: flex; flex-direction: column; gap: 6px; min-width: 0; }
+.project-folder-input { display: flex; gap: 8px; align-items: stretch; }
+.project-folder-input input { flex: 1; min-width: 0; width: 0; }
+.project-folder-input button { flex-shrink: 0; }
+.project-folder-browser { padding: 10px; border: 1px solid var(--line); }
+.project-folder-browser[hidden] { display: none; }
+.folder-navigation { display: flex; gap: 6px; }
+.folder-current { overflow-wrap: anywhere; }
+.folder-directories { max-height: 180px; overflow: auto; margin-bottom: 8px; }
+.folder-directories button { display: block; width: 100%; text-align: left; overflow-wrap: anywhere; }
