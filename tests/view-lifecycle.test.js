@@ -114,7 +114,8 @@ test("Board handles a second show while the first request is pending", async () 
   view.mount(el);
   const old = view.show();
   await view.show();
-  assert.match(el.innerHTML, /Bring a team together/);
+  assert.match(el.innerHTML, /board-thread/);
+  assert.doesNotMatch(el.innerHTML, /Bring a team together/);
   first.resolve([]);
   await old;
   assert.equal(subscriptions, 1);

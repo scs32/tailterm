@@ -15,15 +15,20 @@ await exec(
   "go",
   [
     "build",
+    "-ldflags=-s -w",
     "-o",
     path.join(root, ".build/ttbin/tailterm-hub-test"),
     "./cmd/tailterm-hub",
   ],
   { cwd: path.join(root, "hub") },
 );
-await exec("go", ["build", "-o", path.join(state, "tt"), "./cmd/tt"], {
-  cwd: path.join(root, "hub"),
-});
+await exec(
+  "go",
+  ["build", "-ldflags=-s -w", "-o", path.join(state, "tt"), "./cmd/tt"],
+  {
+    cwd: path.join(root, "hub"),
+  },
+);
 const reserve = createServer();
 reserve.listen(0, "127.0.0.1");
 await once(reserve, "listening");
@@ -164,6 +169,15 @@ try {
       await page.goto(origin);
       await page.waitForFunction(() => !!window.qa);
       await page.locator("#tasks-new").waitFor({ state: "attached" });
+      assert.equal(await page.locator(".tasks-empty, .tasks-clear").count(), 0);
+      await page.evaluate(() => qa.modes.set("teams"));
+      await page.locator("#teams-new").waitFor();
+      assert.equal(await page.locator(".tasks-empty").count(), 0);
+      await page.evaluate(() => qa.modes.set("board"));
+      await page.locator("#board-new-task").waitFor();
+      assert.equal(await page.locator(".mode-empty, .board-empty").count(), 0);
+      await page.evaluate(() => qa.modes.set("tasks"));
+      await page.locator("#tasks-new").waitFor();
       if (!(await page.locator("#tasks-new").isVisible())) {
         console.error(
           await page.locator("#tasks-new").evaluate((el) => {
@@ -580,6 +594,18 @@ try {
       await page.setViewportSize({ width: 1200, height: 800 });
       await page.evaluate(() => qa.modes.set("tasks"));
       await page.locator(`[data-task-more="${teamTask.id}"]`).click();
+      // Seed only this temporary database, bypassing write-rate limits for a
+      // long-history fixture. Production task/message data is never touched.
+      await exec("python3", [
+        "-c",
+        `import sqlite3,sys,datetime
+s=sqlite3.connect(sys.argv[1])
+s.executemany("insert into messages(task_id,from_node,from_user,text,created_at) values(?,?,?,?,?)", [(sys.argv[2],"fixture","owner",f"Archived message {i}",datetime.datetime.now(datetime.timezone.utc).isoformat()) for i in range(1,206)])
+s.commit()
+`,
+        path.join(state, "hub.sqlite"),
+        teamTask.id,
+      ]);
       failLaunch = true;
       await page.locator(`[data-task-close="${teamTask.id}"]`).click();
       await page.waitForFunction(() =>
@@ -623,6 +649,31 @@ try {
       }
       await page.locator(".tasks-closed summary").click();
       await page.screenshot({ path: `.build/task-cleanup-${name}.png` });
+      await page.locator(`[data-task-board="${teamTask.id}"]`).click();
+      await page.locator("#board-download").waitFor();
+      assert.equal(
+        await page
+          .locator(
+            "#board-compose, #board-attach, #board-add-agent, [data-reply]",
+          )
+          .count(),
+        0,
+      );
+      assert.equal(await page.locator(".board-message").count(), 200);
+      await page.locator("#board-full-history").click();
+      await page.waitForFunction(
+        () => document.querySelectorAll(".board-message").length === 205,
+      );
+      const downloadReady = page.waitForEvent("download");
+      await page.locator("#board-download").click();
+      const download = await downloadReady;
+      const history = JSON.parse(await readFile(await download.path(), "utf8"));
+      assert.equal(history.task.id, teamTask.id);
+      assert.equal(history.messages.length, 205);
+      assert.equal(history.agents.length, closedDetail.agents.length);
+      assert.ok(history.events.some((e) => e.kind === "task_closed"));
+      assert.equal(history.messages[0].text, "Archived message 1");
+      await page.screenshot({ path: `.build/task-history-${name}.png` });
       assert.deepEqual(errors, []);
       console.log(
         name +

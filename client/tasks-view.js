@@ -48,7 +48,7 @@ export function createTasksView({
       if (visible && hasData) render();
     }, 30000);
     if (!client()) {
-      root.innerHTML = `<div class="mode-empty"><span class="eyebrow">TASKS</span><h2>Connect a task hub.</h2><p class="launcher-intro">Tasks bind a team of agent sessions to a terminal tab. They live on your coordination hub across your private network.</p><button id="tasks-configure" class="primary">Configure task hub</button></div>`;
+      root.innerHTML = `<div class="mode-empty"><span class="eyebrow">TASKS</span><h2>Connect a task hub.</h2><button id="tasks-configure" class="primary">Configure task hub</button></div>`;
       root.querySelector("#tasks-configure").onclick = configure;
       return;
     }
@@ -152,20 +152,20 @@ export function createTasksView({
     const closed = details.filter((d) => d.task.status !== "open");
     const card = ({ task, agents }) => {
       const tab = boundTab(task.id);
-      return `<article class="task-card" data-task-card="${esc(task.id)}"><header><h3>${esc(task.name)}</h3><span class="fine">${esc(taskRollup(agents))}</span></header>${task.goal ? `<p class="task-goal">${esc(task.goal)}</p>` : ""}<div class="task-agents">${
-        agents
-          .filter((a) => a.status !== "closed")
-          .map(
-            (a) =>
-              `<button class="board-agent" data-task-agent="${esc(a.id)}" title="${esc(a.blockedText || a.host + " · " + a.session)}"><span class="status-dot ${STATUS_DOT[a.status] || ""}"></span><span>${esc(a.name)}</span><span class="fine">${esc(agentState(a))} · ${esc(a.host)}</span></button>`,
-          )
-          .join("") || '<span class="fine">No agents yet.</span>'
-      }</div><footer class="task-actions"><span class="fine">${task.allowAgentSpawn ? "Helpers allowed" : "Helpers off"}</span><button data-task-board="${esc(task.id)}">Open board →</button><button data-task-add="${esc(task.id)}">＋ Add agent</button><div class="task-more"><button type="button" data-task-more="${esc(task.id)}" aria-expanded="false" aria-controls="task-menu-${esc(task.id)}">More</button><div id="task-menu-${esc(task.id)}" class="task-menu" popover="auto" aria-label="More task actions"><button data-task-attach="${esc(task.id)}">Open terminals</button><button data-task-settings="${esc(task.id)}">Settings</button><button data-task-close="${esc(task.id)}" class="danger">Close task</button></div></div></footer></article>`;
+      return `<article class="task-card" data-task-card="${esc(task.id)}"><header><h3>${esc(task.name)}</h3><span class="fine">${esc(taskRollup(agents))}</span></header>${task.goal ? `<p class="task-goal">${esc(task.goal)}</p>` : ""}<div class="task-agents">${agents
+        .filter((a) => a.status !== "closed")
+        .map(
+          (a) =>
+            `<button class="board-agent" data-task-agent="${esc(a.id)}" title="${esc(a.blockedText || a.host + " · " + a.session)}"><span class="status-dot ${STATUS_DOT[a.status] || ""}"></span><span>${esc(a.name)}</span><span class="fine">${esc(agentState(a))} · ${esc(a.host)}</span></button>`,
+        )
+        .join(
+          "",
+        )}</div><footer class="task-actions"><span class="fine">${task.allowAgentSpawn ? "Helpers allowed" : "Helpers off"}</span><button data-task-board="${esc(task.id)}">Open board →</button><button data-task-add="${esc(task.id)}">＋ Add agent</button><div class="task-more"><button type="button" data-task-more="${esc(task.id)}" aria-expanded="false" aria-controls="task-menu-${esc(task.id)}">More</button><div id="task-menu-${esc(task.id)}" class="task-menu" popover="auto" aria-label="More task actions"><button data-task-attach="${esc(task.id)}">Open terminals</button><button data-task-settings="${esc(task.id)}">Settings</button><button data-task-close="${esc(task.id)}" class="danger">Close task</button></div></div></footer></article>`;
     };
-    root.innerHTML = `<div class="tasks-view"><div class="tasks-head"><div><h2>Tasks <span class="count-badge">${open.length}</span></h2><p class="fine">Shared objectives and the agents working on them.</p></div><button id="tasks-new" class="primary">＋ New task</button></div>${needs.length ? `<section class="needs-you"><div class="view-heading"><h3>Needs you</h3><span class="count-badge">${needs.length}</span></div>${needs.map(({ task, agent }) => `<button class="attention-row" data-task-agent="${esc(agent.id)}"><strong>${esc(agent.name)}</strong><span>${esc(task.name)} · ${esc(agent.host)}</span><span>Open →</span></button>`).join("")}</section>` : '<p class="tasks-clear">No agents waiting for your input.</p>'}${
+    root.innerHTML = `<div class="tasks-view"><div class="tasks-head"><div><h2>Tasks <span class="count-badge">${open.length}</span></h2></div><button id="tasks-new" class="primary">＋ New task</button></div>${needs.length ? `<section class="needs-you"><div class="view-heading"><h3>Needs you</h3><span class="count-badge">${needs.length}</span></div>${needs.map(({ task, agent }) => `<button class="attention-row" data-task-agent="${esc(agent.id)}"><strong>${esc(agent.name)}</strong><span>${esc(task.name)} · ${esc(agent.host)}</span><span>Open →</span></button>`).join("")}</section>` : ""}${
       open.length
         ? `<div class="task-grid">${open.map(card).join("")}</div>`
-        : `<div class="tasks-empty"><h3>What are you working on?</h3><p class="fine">Create a task with an objective. Add agents when you’re ready.</p><button id="tasks-empty-new">Create a task</button></div>`
+        : ""
     }${
       closed.length
         ? `<details class="dialog-details tasks-closed"><summary>${closed.length} closed task${closed.length === 1 ? "" : "s"}</summary>${closed
@@ -176,7 +176,7 @@ export function createTasksView({
                     .filter((a) => a.cleanupError)
                     .map((a) => `${a.name}: ${a.cleanupError}`)
                     .join("; "),
-                )}">${d.task.cleanupPending ? `${d.task.cleanupPending} session${d.task.cleanupPending === 1 ? "" : "s"} pending` : "Sessions closed"}</span>${d.task.cleanupPending ? `<button data-task-cleanup="${esc(d.task.id)}">Retry cleanup</button>` : ""}</div>`,
+                )}">${d.task.cleanupPending ? `${d.task.cleanupPending} session${d.task.cleanupPending === 1 ? "" : "s"} pending` : "Sessions closed"}</span><button data-task-board="${esc(d.task.id)}">View history</button>${d.task.cleanupPending ? `<button data-task-cleanup="${esc(d.task.id)}">Retry cleanup</button>` : ""}</div>`,
             )
             .join("")}</details>`
         : ""

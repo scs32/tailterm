@@ -5161,3 +5161,19 @@ dialog .agent-save-setup button {
 .folder-current { overflow-wrap: anywhere; }
 .folder-directories { max-height: 180px; overflow: auto; margin-bottom: 8px; }
 .folder-directories button { display: block; width: 100%; text-align: left; overflow-wrap: anywhere; }
+
+#mode-view .board-closed {
+  margin-top: 12px;
+}
+#mode-view .board-closed summary {
+  color: var(--muted);
+  font: 11px/1.5 var(--terminal-font);
+  cursor: pointer;
+  padding: 6px 3px;
+}
+#mode-view .board-closed [data-board-task] {
+  width: 100%;
+}
+#mode-view .task-closed > span:first-child {
+  margin-right: auto;
+}
