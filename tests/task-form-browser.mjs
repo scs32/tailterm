@@ -445,6 +445,9 @@ try {
         .locator("#task-error")
         .filter({ hasText: "Test launch failure" })
         .waitFor();
+      await page
+        .locator('[data-project-server="secondary"]')
+        .fill(path.join(root, "hub"));
       await page.locator("#task-create").click();
       await page.locator("#dialog").waitFor({ state: "hidden" });
       assert.equal(
@@ -460,6 +463,10 @@ try {
       ).json();
       assert.equal(detail.agents.length, 2);
       assert.equal(detail.task.maxNewAgents, 3);
+      assert.deepEqual(
+        detail.agents.map((a) => a.cwd),
+        [root, path.join(root, "hub")],
+      );
       assert.equal(detail.task.swarm, true);
       assert.equal(detail.task.orchestrator, "team-planner");
       assert.match(launchCommands.at(-3), /--permission-mode/);

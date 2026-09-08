@@ -755,6 +755,11 @@ export function createTaskHub(host) {
           });
         }
         pending = true;
+        form
+          .querySelectorAll(
+            "#task-project-folders input, #task-project-folders button",
+          )
+          .forEach((el) => (el.disabled = true));
         button.disabled = true;
         withAgent.disabled = true;
         error.textContent = saved ? "Retrying agent launch…" : "Creating task…";
@@ -788,6 +793,7 @@ export function createTaskHub(host) {
           form.querySelector("#task-goal").disabled = true;
           form.querySelector("#task-open-created").hidden = false;
         }
+        launchPlan ||= plan;
         if (!team && fields && progress.size === 0)
           launchPlan = [{ server: target, fields }];
         await launchMembers(
@@ -804,8 +810,20 @@ export function createTaskHub(host) {
             : "Task created.",
         );
       } catch (e) {
+        if (teamSelect?.value) {
+          launchPlan = null;
+          form
+            .querySelectorAll(
+              "#task-project-folders input, #task-project-folders button",
+            )
+            .forEach((el) => (el.disabled = false));
+        }
         error.textContent =
-          (saved ? "Task created. Agent launch failed: " : "") + formatError(e);
+          (saved ? "Task created. Agent launch failed: " : "") +
+          formatError(e) +
+          (progress.size
+            ? " Already started agents keep their folders; corrections apply to remaining agents."
+            : "");
         error.setAttribute("role", "alert");
         error.scrollIntoView({ block: "nearest" });
         button.textContent = saved
@@ -883,7 +901,7 @@ export function createTaskHub(host) {
         selector.disabled = true;
         const id = selector.value;
         try {
-          plan ||= teamLaunches(
+          plan = teamLaunches(
             team,
             host.getServers(),
             form.querySelector("#team-main-server")?.value || mainServer?.id,
@@ -916,6 +934,14 @@ export function createTaskHub(host) {
         } catch (error) {
           status.textContent = formatError(error);
           button.textContent = "Retry remaining agents";
+          form
+            .querySelectorAll(
+              "#team-project-folders input, #team-project-folders button",
+            )
+            .forEach((el) => (el.disabled = false));
+          if (progress.size)
+            status.textContent +=
+              " Already started agents keep their folders; corrections apply to remaining agents.";
           if (!progress.size) {
             selector.disabled = false;
             plan = null;
