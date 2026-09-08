@@ -72,6 +72,7 @@ implementation; workers do not infer answers independently.
 
 ## Stage ownership, contracts and exit evidence
 
+Decision IDs are D1–D6; implementation slice IDs are A1/A2/B1/B2/C1/E1/E2.
 Names below are proposed lanes, not active assignments. Lead owns shared API
 contracts, migration coordination and integration. API owns store/server behavior;
 UI owns client rendering/state; QA owns isolated acceptance. db-handler owns all
@@ -85,11 +86,11 @@ use explicit file ownership or isolated worktrees for shared-file overlap.
 | B1: CLI and Board context, versioned export | A2; UI: `client/board-view.js`, `hub-client.js`, `cached-hub-client.js`, `task-history.js`, relevant styles; CLI: `hub/cmd/tt/main.go`, `coordination.go`, proposed `message_audit.go`; API: export/capabilities routes | Composer primary chip and explicit intake, deliberate reply context, work-order message reference, receipt recovery; cached correction updates; immutable export artifact from one SQLite read snapshot. Chromium/WebKit + mixed-client fixtures. |
 | B2: required-context rollout | B1 + D4 and verified host/client inventory; lead deployment + docs, API policy/capability validation | Required context rejects unlinked work with actionable errors; explicit intake remains possible. Human UI does not lose drafts. Record policy revision, exact versions and rollback criteria. Unreachable clients remain blockers. |
 | C1: typed orders, assignments and native evidence | A2; B1 timeline/UI extension when ready; lead API/schema; API proposed `work_orders.go`, `work_evidence.go`; UI timeline rendering | Versioned order snapshots, explicit assignment transfers, exact-run results, accepted/stale/rejected evidence, per-target deployment receipts. Typed-order capability is separate from item-link enforcement; preserve earlier `workOrderMessage` references. |
-| D1: exact AIV submission contract | D5/D6 + separate AIV repo order; proposed AIV `src/verify.ts`, `src/serve/mcp.ts`, new DB migration and isolated run-submission tests; no Tailterm worker edits AIV without explicit ownership | Require explicit repository/snapshot/extractor/commit/check/environment; durable operation key and lookup; same request recovers same receipt, changed payload conflicts. Reuse core verifier and audit, not a second run ledger. |
-| D2: handler adapter and native Go pilot | C1 + D1 + D6; new adapter package/path chosen in its order, Tailterm mapping/outbox tables and isolated integration fixtures | Handler-only work administration, host-session attribution, durable submission/reconciliation, AIV outage recovery. Native shell/editor preserved. One logged issue traced from source message to accepted exact evidence and completion. |
+| E1: exact AIV submission contract | D5/D6 + separate AIV repo order; proposed AIV `src/verify.ts`, `src/serve/mcp.ts`, new DB migration and isolated run-submission tests; no Tailterm worker edits AIV without explicit ownership | Require explicit repository/snapshot/extractor/commit/check/environment; durable operation key and lookup; same request recovers same receipt, changed payload conflicts. Reuse core verifier and audit, not a second run ledger. |
+| E2: handler adapter and native Go pilot | C1 + E1 + decision D6; new adapter package/path chosen in its order, Tailterm mapping/outbox tables and isolated integration fixtures | Handler-only work administration, host-session attribution, durable submission/reconciliation, AIV outage recovery. Native shell/editor preserved. One logged issue traced from source message to accepted exact evidence and completion. |
 
 These names replace ambiguous numbers: B1/B2 correspond to client/enforcement work
-in the audit spec; D1/D2 implement exact evidence binding/retry safety from the
+in the audit spec; E1/E2 implement exact evidence binding/retry safety from the
 older AIV proposal. C1 can proceed alongside B1 after contracts stabilize. B2 must
 advertise only capabilities that are actually installed; typed orders cannot be
 required merely because item linkage is required.
@@ -144,6 +145,9 @@ Acceptance owned by QA using synthetic tasks/items/agents and temporary SQLite:
 2. A valid primary post and dispatch return a real relationship with the correct
    owning project and revision, including existing human cross-project dispatch;
    malformed/missing items or foreign ordinary-post item/reply references fail.
+   Cross-project human dispatch keeps source item ownership and target recipient,
+   and exact dispatch receipt replay remains unchanged. Agent-authored
+   cross-project dispatch must still be rejected.
 3. Exact replay, concurrent duplicate submissions and lost-response recovery yield
    one message/link/event set and the same original receipt. Changed body, target,
    context or order under that key conflicts. Requests declaring different actor/project scopes cannot recover another scope's
@@ -198,7 +202,7 @@ new run identity. Its [MCP schema](/Users/stephenspeicher/projects/aidevelopment
 does not expose commit/check-version selection or a durable submission key. Passing
 only a repository name therefore cannot establish exact binding/retry safety.
 
-D1 must select and validate an explicit repository ID and snapshot ID together with
+E1 must select and validate an explicit repository ID and snapshot ID together with
 commit/extractor identity, retain check-version and environment digests and store
 a canonical request fingerprint and response in the same transaction as the run.
 An exact receipt lookup must reconcile a response lost after commit. Same commit
@@ -206,7 +210,7 @@ with a different extractor snapshot is a distinct binding. Empty executed
 population cannot produce a pass; submitted verdict is an attributed claim,
 separate from derived/calibrated status. Extend the core and MCP wrapper together.
 
-D2 stores Tailterm-to-AIV mapping by service/repository identity, not checkout
+E2 stores Tailterm-to-AIV mapping by service/repository identity, not checkout
 basename. Record host/absolute checkout/commit separately. An outbox operation
 retains exact target/binding/payload/key and pending/submitted/reconciled/failed
 state. Network failure does not trigger a second check execution or a blind
