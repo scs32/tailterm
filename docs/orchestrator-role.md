@@ -7,8 +7,9 @@ evidence. Builders own implementation, including shared schemas/types and
 integration code. Lead accepted the clean build candidate and its evidence in
 message #889; database-handler result recording is linked from message #882.
 The bounded release order is `wi_0edddf71905d6186-release-1` (#893), delivered
-with its exact scope in #894 and still gated on the lead's explicit post-Enter
-integration-slot handoff.
+with its exact scope in #894. Lead handed off the clean post-Enter integration
+slot in #940. The Mini serving correction was recorded as same-item release
+amendment `wi_0edddf71905d6186-release-1-amendment-974` in #980.
 
 ## Implemented behavior
 
@@ -65,12 +66,48 @@ All fixtures used isolated databases, browser contexts and tmux sockets. No live
 work-item/profile data, deployment, installation, network change, service stop or
 session teardown was used for build acceptance.
 
-## Release plan
+## Release result
 
-Release is authorized only by `wi_0edddf71905d6186-release-1` (#893/#894) and
-still requires the lead's explicit release of the shared frontend integration
-slot. Integrate this commit into the current `tasks-hub` release candidate only
-after the active `board-enter` work lands.
+The accepted product was integrated without conflict after the Enter release.
+The application/package commit is
+`75f1cdbc5b9689ec6db9a8ba23c7eaa1dcfaa835`; the later preview-serving
+correction is `b587741627c54bac80eccb536e7470320a65e3bc` and does not alter the
+deployed application package. Focused post-integration JavaScript tests passed
+8/8, `go test ./cmd/tt` passed, and the preview correction's isolated unit test
+passed.
+
+Both Mini and Air atomically installed Darwin arm64 `tt` SHA-256
+`ff7829a96a5c7902172991a944f6ab57d0bee1631ba98c8060066e51373c5551`
+before frontend publication. Both retained the prior `c926e400...` binary at
+`~/.local/bin/tt-before-orchestrator-role-75f1cdbc5b96`. Installed flag,
+orchestrator-boundary, instruction-only and worker-boundary checks passed on both
+hosts. Existing relay processes were observed and were not restarted.
+
+The isolated retained package has 82 manifest entries (81 served assets), commit
+`75f1cdbc5b9689ec6db9a8ba23c7eaa1dcfaa835`, and release-manifest SHA-256
+`e4c607d59fa4c194916117867c46bbd84fb745a8d8fc1455076f9278a0f3595d`.
+TailOS deployment `451b0332-d7be-443c-9d64-4ec90595fd8f` and its production
+domain match all assets. Public Chromium started production WASM and restored an
+isolated synthetic vault.
+
+Mini initially matched every raw asset but failed the browser acceptance because
+Vite preview labeled the already-compressed, application-decompressed
+`.wasm.gz` response with `Content-Encoding: gzip`. Amendment #980 authorized a
+preview-only fix. The old PID 39792 and exact Vite command were revalidated, the
+correction passed first on candidate port 4319, and only that listener was then
+gracefully replaced. PID 28664 serves the same package through
+`scripts/preview-static.mjs`, with `Content-Type: application/gzip` and no
+`Content-Encoding`. Raw 81/81 asset verification and real Mini Chromium
+production-WASM/synthetic-vault smoke pass.
+
+The exact evidence and rollback identities are in
+`docs/releases/tailos-2026-09-09-orchestrator-role.json`.
+
+## Release procedure
+
+Release was authorized by `wi_0edddf71905d6186-release-1` (#893/#894), slot
+handoff #940 and Mini amendment #980. The sequence below is retained as the
+operational compatibility contract for rollback and later releases.
 Resolve only concrete conflicts in the changed files, inspect the final changed
 bytes, and rerun checks implicated by those conflicts rather than inventing a new
 broad gate.

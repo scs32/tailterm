@@ -1,5 +1,47 @@
 # Development handoff — September 9, 2026
 
+## September 9 orchestrator role boundary — release verified pending final record
+
+Application `75f1cdbc5b9689ec6db9a8ba23c7eaa1dcfaa835` is deployed to
+`https://tailos.tailarr.com` (`https://451b0332.tailos.pages.dev`) and served by
+the Stephens-Mini preview at `http://127.0.0.1:4318`. Both origins match all 81
+served asset hashes and manifest SHA-256
+`e4c607d59fa4c194916117867c46bbd84fb745a8d8fc1455076f9278a0f3595d`.
+Real Chromium on each origin started the production WASM and restored an isolated
+synthetic vault without browser errors.
+
+Generated role instructions now limit the main orchestrator to decisions,
+planning, routing and evidence review. Builders own implementation, including
+shared schema/types and integration work. The sole implementation exception
+requires both one non-database team member and disabled spawning; retired or idle
+workers, capacity, quota, cost and helper allowance do not qualify. This is an
+instruction-level guarantee, not a runtime sandbox or API authorization boundary.
+
+The matching Darwin arm64 `tt` SHA-256 on both Mini and Air is
+`ff7829a96a5c7902172991a944f6ab57d0bee1631ba98c8060066e51373c5551`.
+Installed flag and task-aware orchestrator/worker briefing checks passed. Each
+host retains `~/.local/bin/tt-before-orchestrator-role-75f1cdbc5b96` at prior
+SHA-256 `c926e400c25490c9c67ea6cbd24871139b683b0e06b319e42d5edbfbdefe93cf`;
+the already-running relays were observed but not restarted.
+
+Mini's prior Vite preview added `Content-Encoding: gzip` to the intentionally
+self-decompressed `.wasm.gz`, so raw hashes passed while the required browser
+smoke could not. Same-item release amendment
+`wi_0edddf71905d6186-release-1-amendment-974` authorized the focused serving
+correction. Preview commit `b587741627c54bac80eccb536e7470320a65e3bc` now
+serves the unchanged retained package as `application/gzip` without
+`Content-Encoding`; focused unit, candidate-port, 81-asset and real-browser
+checks pass. Only the identified localhost listener was gracefully replaced.
+
+Feature `wi_0edddf71905d6186`, build order #821, release order #893 and amendment
+#980 are documented in [the implementation report](orchestrator-role.md) and
+[the release receipt](releases/tailos-2026-09-09-orchestrator-role.json). The
+exact clean package and CLI builds are retained at
+`.build/releases/orchestrator-role-75f1cdb`. Previous frontend rollback remains
+`.build/releases/board-enter-d441722` / `https://cd03fb64.tailos.pages.dev`.
+No hub, database, schema, TrueNAS, Tailscale, Air preview, live task/profile or
+agent-session change accompanied this release.
+
 ## September 9 Board Enter-to-send — release verified
 
 Application `d441722a8f7f06d8a097621a24a5e58dcba4ea95` is deployed to

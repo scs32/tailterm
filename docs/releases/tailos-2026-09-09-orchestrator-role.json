@@ -1,0 +1,187 @@
+{
+  "status": "builder_release_verified_pending_final_acceptance",
+  "recordedAt": "2026-09-09T19:05:48Z",
+  "workItem": {
+    "id": "wi_0edddf71905d6186",
+    "buildOrder": {
+      "id": "wi_0edddf71905d6186-build-1",
+      "message": 821,
+      "handlerConfirmationMessage": 835
+    },
+    "releaseOrder": {
+      "id": "wi_0edddf71905d6186-release-1",
+      "message": 893,
+      "handlerConfirmationMessage": 894,
+      "slotHandoffMessage": 940
+    },
+    "releaseAmendment": {
+      "id": "wi_0edddf71905d6186-release-1-amendment-974",
+      "sourceMessage": 974,
+      "operationalRelayMessage": 975,
+      "handlerConfirmationMessage": 980,
+      "handlerRevision": 15
+    }
+  },
+  "source": {
+    "base": "4de29d028842a24b391f3e9dc6086e398c10ea7f",
+    "preservedEnterBaseline": "48606394112c87e686d8b812d58f77176d50d64d",
+    "acceptedCandidate": "561a0db32d70bf7371db539a3f66506e89f344a5",
+    "integratedApplicationCommit": "75f1cdbc5b9689ec6db9a8ba23c7eaa1dcfaa835",
+    "previewCorrectionCommit": "b587741627c54bac80eccb536e7470320a65e3bc",
+    "integration": "Accepted product and corrected report commits cherry-picked without conflict onto the clean Enter baseline. The later preview-only correction does not change packaged application bytes."
+  },
+  "package": {
+    "worktree": "/Users/stephenspeicher/projects/tailterm/.build/releases/orchestrator-role-75f1cdb",
+    "commit": "75f1cdbc5b9689ec6db9a8ba23c7eaa1dcfaa835",
+    "cleanSource": true,
+    "manifestEntries": 82,
+    "servedAssetsPerOrigin": 81,
+    "releaseSha256": "e4c607d59fa4c194916117867c46bbd84fb745a8d8fc1455076f9278a0f3595d",
+    "productionWasmSha256": "f1701ab700d140255e9b19c48b0bf60c4a5858f31458dbd363fafbaa226ed9fa",
+    "packagedWasmGzip": {
+      "path": "assets/tailserve-CDY1ZPXa.wasm.gz",
+      "size": 8598265,
+      "sha256": "14d96247fddc9174958892a262dbc8cfe4bf297fe74ae39995040e7d8322480c"
+    },
+    "commands": [
+      "npm ci",
+      "npm run build:wasm",
+      "npm run build:static",
+      "npm run verify:release",
+      "npm run build:tt"
+    ],
+    "verifyResult": "82 manifest entries match release.json"
+  },
+  "cli": {
+    "darwinArm64Sha256": "ff7829a96a5c7902172991a944f6ab57d0bee1631ba98c8060066e51373c5551",
+    "linuxAmd64Sha256": "32ab221994de1927712068c09a10fefd900cd262469711f2a09fa773227becc6",
+    "linuxArm64Sha256": "1d7482a032ec2c380ee5d17421ab0ceece57a9f4832e79c0cde354907ea10482",
+    "previousDarwinArm64Sha256": "c926e400c25490c9c67ea6cbd24871139b683b0e06b319e42d5edbfbdefe93cf",
+    "hosts": [
+      {
+        "host": "Stephens-Mini",
+        "installed": "/Users/stephenspeicher/.local/bin/tt",
+        "rollbackBinary": "/Users/stephenspeicher/.local/bin/tt-before-orchestrator-role-75f1cdbc5b96",
+        "verifiedAt": "2026-09-09T18:33:49Z",
+        "plannedTeamMembersFlag": true,
+        "orchestratorBoundary": true,
+        "instructionOnlyLimitation": true,
+        "workerBoundary": true,
+        "relayPidObserved": 83457,
+        "relayRestarted": false
+      },
+      {
+        "host": "theAir",
+        "installed": "/Users/stephenspeicher/.local/bin/tt",
+        "rollbackBinary": "/Users/stephenspeicher/.local/bin/tt-before-orchestrator-role-75f1cdbc5b96",
+        "verifiedAt": "2026-09-09T18:34:25Z",
+        "plannedTeamMembersFlag": true,
+        "orchestratorBoundary": true,
+        "instructionOnlyLimitation": true,
+        "workerBoundary": true,
+        "relayPidObserved": 912,
+        "relayRestarted": false
+      }
+    ]
+  },
+  "tailos": {
+    "origin": "https://tailos.tailarr.com",
+    "cloudflareProject": "tailos",
+    "deploymentId": "451b0332-d7be-443c-9d64-4ec90595fd8f",
+    "deployment": "https://451b0332.tailos.pages.dev",
+    "branch": "main",
+    "commit": "75f1cdbc5b9689ec6db9a8ba23c7eaa1dcfaa835",
+    "verifiedAssets": 81,
+    "releaseSha256": "e4c607d59fa4c194916117867c46bbd84fb745a8d8fc1455076f9278a0f3595d",
+    "assetVerification": "Production origin and immutable deployment each match 81/81 served files and release.json",
+    "assetsVerifiedAt": "2026-09-09T18:54:25Z",
+    "chromiumSmoke": {
+      "productionWasmStarted": true,
+      "syntheticVaultRestored": true,
+      "uncaughtErrors": [],
+      "verifiedAt": "2026-09-09T18:54:01Z"
+    }
+  },
+  "miniPreview": {
+    "origin": "http://127.0.0.1:4318",
+    "servedDirectory": "/Users/stephenspeicher/projects/tailterm/dist-static",
+    "activation": "rsync -a --delete from the exact retained package; listener later replaced only under same-item amendment",
+    "commit": "75f1cdbc5b9689ec6db9a8ba23c7eaa1dcfaa835",
+    "verifiedAssets": 81,
+    "releaseSha256": "e4c607d59fa4c194916117867c46bbd84fb745a8d8fc1455076f9278a0f3595d",
+    "priorListener": {
+      "pid": 39792,
+      "parentPid": 39776,
+      "started": "2026-09-08T08:36:20-07:00",
+      "cwd": "/Users/stephenspeicher/projects/tailterm",
+      "command": "node /Users/stephenspeicher/projects/tailterm/node_modules/.bin/vite preview --outDir dist-static --host 127.0.0.1 --port 4318",
+      "problemHeader": "Content-Encoding: gzip",
+      "reversibleConfig": "package.json at 75f1cdbc5b9689ec6db9a8ba23c7eaa1dcfaa835",
+      "shutdown": "Exact PID, command, cwd and listening port revalidated; SIGTERM exited gracefully before replacement"
+    },
+    "currentListener": {
+      "pid": 28664,
+      "command": "node scripts/preview-static.mjs dist-static 127.0.0.1 4318",
+      "sourceCommit": "b587741627c54bac80eccb536e7470320a65e3bc",
+      "wasmContentType": "application/gzip",
+      "wasmContentEncoding": null,
+      "listenerRestartScope": "localhost frontend preview only"
+    },
+    "candidatePortVerification": "Port 4319 passed corrected header, 81/81 assets and real Chromium production-WASM/synthetic-vault smoke before activation",
+    "rawAssetVerification": "81/81 served bytes and release.json match with Accept-Encoding: identity",
+    "assetsVerifiedAt": "2026-09-09T19:05:47.730Z",
+    "chromiumSmoke": {
+      "productionWasmStarted": true,
+      "syntheticVaultRestored": true,
+      "matchingMargins": true,
+      "uncaughtErrors": [],
+      "verifiedAt": "2026-09-09T19:05:48Z"
+    },
+    "receipt": ".build/orchestrator-role-release/mini.json",
+    "receiptSha256": "898c891aac9ee92b4c8fbc2e1b75a74732b8e2e97308646af205959cfb635922"
+  },
+  "acceptance": {
+    "candidateJavascript": "npm test: 123/123 passed",
+    "candidateHub": "go vet ./... and go test ./... passed",
+    "candidateBrowser": "task-form-browser Chromium and WebKit passed isolated real-hub/private-tmux coverage",
+    "postIntegration": [
+      "node --test tests/team-examples.test.js tests/tmux-command.test.js: 8/8 passed",
+      "go test ./cmd/tt: passed",
+      "git diff --check: passed"
+    ],
+    "previewCorrection": [
+      "node --test tests/preview-static.test.js: 1/1 passed",
+      "Candidate port 4319: corrected headers, 81/81 assets and real Chromium smoke passed",
+      "Activated port 4318: corrected headers, raw 81/81 assets and real Chromium smoke passed"
+    ]
+  },
+  "guarantee": "Generated launch and refreshed briefings instruct orchestrators to decide, plan, route and review while builders implement. The exception requires both a sole non-database member and disabled spawning. This is instruction-level guidance, not runtime or API enforcement.",
+  "rollback": {
+    "frontendCommit": "d441722a8f7f06d8a097621a24a5e58dcba4ea95",
+    "tailosDeploymentId": "cd03fb64-9b8f-48c3-b341-8dad7fa5f87b",
+    "tailosDeployment": "https://cd03fb64.tailos.pages.dev",
+    "retainedPackage": "/Users/stephenspeicher/projects/tailterm/.build/releases/board-enter-d441722",
+    "releaseSha256": "4da7c372e2dde9813c1fd63afb590aead8f6033360c7a6fb2e3456b63dc15a34",
+    "cli": "Restore both uniquely named prior binaries atomically only after restoring old frontend compatibility; do not restart relays",
+    "previewServer": "Gracefully stop only the current localhost listener and run the exact prior Vite command from the recorded cwd; package.json at application commit 75f1cdbc is the prior config",
+    "warning": "Never pair the new frontend with an old CLI. Hub and database have no release change to roll back."
+  },
+  "excluded": [
+    "https://tailterm.tailarr.com",
+    "Air webpage preview",
+    "production hub",
+    "database/schema",
+    "TrueNAS",
+    "Tailscale/networking",
+    "live tasks/profiles",
+    "agent sessions",
+    "relay restart"
+  ],
+  "cleanup": {
+    "candidatePort4319Stopped": true,
+    "browserContextsClosed": true,
+    "oldMiniListenerExitedGracefully": true,
+    "currentMiniListenerRunning": true,
+    "retainedReleasePreserved": true
+  }
+}
