@@ -1,0 +1,162 @@
+{
+  "status": "builder_release_verified_pending_final_acceptance",
+  "recordedAt": "2026-09-09T22:28:45Z",
+  "workItem": {
+    "id": "wi_539c0062cebde9b8",
+    "revision": 3,
+    "ownerMessage": 1114,
+    "workOrder": {
+      "id": "wi_539c0062cebde9b8-activity-1",
+      "message": 1166
+    },
+    "candidateResultMessages": [1196, 1197],
+    "handlerCandidateConfirmationMessage": 1198,
+    "leadCandidateAcceptanceMessage": 1199,
+    "releaseSlotMessage": 1207
+  },
+  "source": {
+    "integrationBase": "641967ad1b43ca31633f68288b4144f4c51faeef",
+    "acceptedBuilderCandidate": "a121aa06072264cda24d9f7aea6e7d049990f65d",
+    "integratedApplicationCommit": "8ed8c65ef85006bac04b3d212f89b7b66622a25e",
+    "integration": "Rebased without conflict onto clean tasks-hub after the accepted Board-scroll release; all six owned files are byte-identical to the accepted candidate.",
+    "files": [
+      "client/activity.js",
+      "client/main.js",
+      "tests/activity.test.js",
+      "tests/static-browser.mjs",
+      "tests/workspace-actions-browser.mjs",
+      "docs/activity-notices.md"
+    ]
+  },
+  "diagnosis": {
+    "cause": "The background-output path retained only a set of visible line strings, so a spinner, progress value, clock or counter repaint introduced a new string and raised New output without terminal advancement.",
+    "before": "A clean 310130f Chromium build set has-new-output=true when an inactive pane repainted Activity progress 41% as Activity progress 42% on the same row.",
+    "correction": "Retain rendered lines with xterm scrollback and cursor position; suppress fixed-row replacement while preserving cursor appends, downward/scrolling output, tmux visible-region scrolling and independent Bell, OSC completion and actionable-error signals."
+  },
+  "package": {
+    "worktree": "/Users/stephenspeicher/projects/tailterm/.build/releases/activity-notices-8ed8c65",
+    "commit": "8ed8c65ef85006bac04b3d212f89b7b66622a25e",
+    "cleanSource": true,
+    "manifestEntries": 82,
+    "servedAssetsPerOrigin": 81,
+    "releaseSha256": "8b0760761535c03271a34899481f72795316ff62f88e3cbc8c4c80b8a3b2fb44",
+    "buildCommands": [
+      "./scripts/build-wasm.sh --test",
+      "npm run build:static",
+      "npm run verify:release"
+    ],
+    "verifyResult": "82/82 manifest entries passed",
+    "assets": {
+      "mainScript": {
+        "path": "assets/index-CM5bywGl.js",
+        "size": 805555,
+        "sha256": "7a8c93b44b2fc9a8f2ecf7133b30d0487867b1172bc43f5bd0de7eb8ca2757ef"
+      },
+      "stylesheet": {
+        "path": "assets/index-Bkm6l0FY.css",
+        "size": 94771,
+        "sha256": "ee70f291a094abe1bff819c0c2b789bb9f594c3b836284483cad719f9f9d9cf1"
+      },
+      "productionWasmGzip": {
+        "path": "assets/tailserve-DMRvIrni.wasm.gz",
+        "size": 8598275,
+        "sha256": "214352cb023ead9fe9387616599565b799662c6c428cc95de1c0cd29087e1f68"
+      }
+    }
+  },
+  "tailos": {
+    "origin": "https://tailos.tailarr.com",
+    "cloudflareProject": "tailos",
+    "branch": "main",
+    "deploymentId": "c15f5470-310a-4dba-b87f-8a014c4a1794",
+    "deployment": "https://c15f5470.tailos.pages.dev",
+    "commit": "8ed8c65ef85006bac04b3d212f89b7b66622a25e",
+    "verifiedAssets": 81,
+    "releaseSha256": "8b0760761535c03271a34899481f72795316ff62f88e3cbc8c4c80b8a3b2fb44",
+    "assetVerification": "The immutable deployment and custom domain each matched release.json and all 81 served file hashes.",
+    "mime": {
+      "releaseJson": "200 application/json",
+      "mainScript": "200 application/javascript",
+      "stylesheet": "200 text/css; charset=utf-8",
+      "productionWasmGzip": "200 application/gzip; no Content-Encoding"
+    },
+    "observedCustomDomainCache": "release.json no-cache; hashed JS/CSS/WASM max-age=14400 from the separately documented external override"
+  },
+  "miniPreview": {
+    "origin": "http://127.0.0.1:4318",
+    "servedDirectory": "/Users/stephenspeicher/projects/tailterm/dist-static",
+    "activation": "rsync -a --delete from the exact retained package",
+    "commit": "8ed8c65ef85006bac04b3d212f89b7b66622a25e",
+    "verifiedAssets": 81,
+    "releaseSha256": "8b0760761535c03271a34899481f72795316ff62f88e3cbc8c4c80b8a3b2fb44",
+    "mime": {
+      "releaseJson": "200 application/json; charset=utf-8",
+      "mainScript": "200 text/javascript; charset=utf-8",
+      "stylesheet": "200 text/css; charset=utf-8",
+      "productionWasmGzip": "200 application/gzip; no Content-Encoding"
+    },
+    "listener": {
+      "pidBefore": 28664,
+      "pidAfter": 28664,
+      "command": "node scripts/preview-static.mjs dist-static 127.0.0.1 4318",
+      "restarted": false
+    }
+  },
+  "browserAcceptance": {
+    "deployedBrowser": "Real Chromium on TailOS and Mini started production WASM, generated and restored an isolated synthetic local vault/key, retained matching margins and reported no page errors.",
+    "focusedActivity": "The retained integrated source passed fixed-row progress suppression plus genuine output, Bell and OSC completion behavior in Chromium.",
+    "screenshots": {
+      "tailos": ".build/activity-notices-release/tailos-layout.png",
+      "mini": ".build/activity-notices-release/mini-layout.png",
+      "sharedSha256": "dee008e5bb73ff69cb91fb1e43b1dc1241bc26b73201661e1427f62041b71664"
+    },
+    "nativeSafari": "Not run; Chromium automation is not reported as native Safari."
+  },
+  "verification": {
+    "builder": [
+      "Clean-base focused Chromium reproduced the progress-only false alert",
+      "Accepted candidate focused activity/reliability checks passed 11/11",
+      "Accepted candidate npm test passed 129/129",
+      "Accepted candidate focused Chromium activity check passed"
+    ],
+    "release": [
+      "Retained integrated source focused activity/reliability checks passed 11/11",
+      "Retained integrated-source focused Chromium activity check passed",
+      "Clean production/test WASM/static build and 82-entry release verification passed",
+      "TailOS immutable origin, custom domain and Mini matched 81/81 served hashes and release.json",
+      "Status and MIME checks passed on all three origins",
+      "Deployed production Chromium smoke passed on TailOS and Mini"
+    ],
+    "historicalNonpasses": [
+      "The first broad candidate browser pass used a carriage-return fixture that overwrote its own continuity sentinel; the fixture was corrected without product-code change.",
+      "A corrected broad candidate rerun passed activity and continuity, then timed out in the unrelated Task hub: configure palette scenario; that scenario was not reported as passing and was not repeated for release."
+    ],
+    "releaseNonpasses": []
+  },
+  "rollback": {
+    "commit": "c8a7552b84460b6ba06dcb0561460a109f2bf5e0",
+    "tailosDeploymentId": "123605a6-bf6e-4c57-9271-04cd349eb4af",
+    "tailosDeployment": "https://123605a6.tailos.pages.dev",
+    "retainedPackage": "/Users/stephenspeicher/projects/tailterm/.build/releases/board-scroll-c8a7552/dist-static",
+    "releaseSha256": "c239f7bf341b23cb4266cd4bcdd97b03912a6b5a2b71f8739538a30edb2bb489",
+    "verifyResult": "82 manifest entries passed before release",
+    "procedure": "Deploy the exact retained package explicitly to Cloudflare project tailos, then rsync it to Mini without restarting listener 28664.",
+    "warning": "Rollback removes the activity filtering fix while retaining the accepted Board-scroll release."
+  },
+  "cleanup": {
+    "browserContextsClosed": true,
+    "focusedFixtureServerClosed": true,
+    "miniListenerRestarted": false,
+    "temporaryBaselineBuildAndHarnessesRemoved": true,
+    "temporaryReleaseCheckout": "Retained as the authorized clean source/package and not removed."
+  },
+  "excluded": [
+    "https://tailterm.tailarr.com",
+    "Air preview",
+    "hub, CLI, database or schema",
+    "Tailscale, TrueNAS networking or relays",
+    "live tasks or profiles",
+    "owner browser storage",
+    "agent sessions or lifecycle"
+  ]
+}

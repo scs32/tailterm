@@ -1,5 +1,35 @@
 # Development handoff — September 9, 2026
 
+## September 9 terminal activity notice filtering — release verified pending final acceptance
+
+Application commit `8ed8c65ef85006bac04b3d212f89b7b66622a25e` is deployed to
+`https://tailos.tailarr.com` (`https://c15f5470.tailos.pages.dev`, deployment
+`c15f5470-310a-4dba-b87f-8a014c4a1794`) and served by unchanged Mini preview
+PID 28664 at `http://127.0.0.1:4318`. The immutable deployment, custom domain
+and Mini match the retained package's 81 served files and release-manifest
+SHA-256 `8b0760761535c03271a34899481f72795316ff62f88e3cbc8c4c80b8a3b2fb44`.
+Real Chromium on TailOS and Mini started production WASM, restored an isolated
+synthetic vault/key, preserved matching layout margins and reported no page
+errors.
+
+Background terminal activity now uses rendered text plus terminal position.
+Fixed-row spinner, progress, clock and counter repaints stay quiet, while text
+appended at the cursor, downward or scrolling output, bells, OSC 133 completion
+and actionable connection errors retain their existing per-pane and group/tab
+ownership. The clean base reproduced the false alert in Chromium; the identical
+focused candidate and retained integrated-source runs passed. Focused unit and
+reliability checks pass 11/11; the candidate's complete JavaScript suite passed
+129/129 before integration.
+
+Bug `wi_539c0062cebde9b8` revision 3 and bounded order #1166 are documented in
+[the implementation report](activity-notices.md) and
+[the release receipt](releases/tailos-2026-09-09-activity-notices.json). The
+clean source/package is retained at `.build/releases/activity-notices-8ed8c65`.
+Rollback is the retained Board-scroll package `.build/releases/board-scroll-c8a7552`
+and deployment `https://123605a6.tailos.pages.dev`. Neither hub, CLI, schema,
+Tailscale, TrueNAS, relays, Air preview, the old site, live tasks/profiles nor
+agent sessions changed.
+
 ## September 9 Board history scroll stability — release verified pending final acceptance
 
 Application commit `c8a7552b84460b6ba06dcb0561460a109f2bf5e0` is deployed to
