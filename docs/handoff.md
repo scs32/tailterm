@@ -26,8 +26,10 @@ The separate work-item create/edit/history bug remains in investigation. Ordinar
 CRUD passed 8/8 on both current and pre-dropdown baselines; no repair is claimed.
 The revised storage contract is accepted in
 [the history plan](work-item-revision-history-plan.md); owner failure details
-requested in #752 remain pending. The next bounded foundation order must be
-recorded before product changes. Both deployed UI bugs are confirmed Done by
+requested in #752 remain pending. The next bounded combined history build order must be
+recorded before product changes. Owner #791 requests fewer coordination gates;
+#794 requires workers dedicated to one item, and #796 limits lead to planning,
+decisions and routing. Implementation and shared integration belong to builders. Both deployed UI bugs are confirmed Done by
 db-handler #788 (dropdown revision13, send-dialog revision10). Narrative/AIV work is not activated. Air preview remains
 retired; no hub/CLI/network change accompanied this frontend release.
 

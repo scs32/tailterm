@@ -53,20 +53,20 @@ Lead implementation clarifications:
   credential-scoped vault where persistence is required, with bounded storage and
   explicit dismissal cleanup. No plaintext local storage or offline mutation queue.
 
-## Bounded delivery stages and ownership
+## Implementation dependencies and ownership
 
 1. **History foundation:** additive snapshots/gaps/state, migration/reconciliation,
    snapshots in existing create/PATCH transactions, bounded revision/gap/message
-   readers and matching Go client. Root owns shared schema/types and integration;
-   API owns store/service/client implementation files under explicit assignment.
+   readers and matching Go client. Under owner #796, API owns implementation, shared schema/types and integration;
+   lead owns decisions, work routing and review of acceptance evidence.
    Acceptance is the snapshot/read/conversation/migration/byte-budget matrix below,
    including actual old/new/old/new executable compatibility. Current clients keep
    working. No keyed update, browser UI, CLI commands or deployment in this stage.
-2. **Recoverable editing and history UI:** after foundation acceptance, a separately
-   recorded order activates keyed updates/receipt recovery, CLI history controls
-   and compact shared Bugs/Features UI. Root owns shared contracts/integration, API
-   server/data files, UI client files, and an independent reviewer tests behavior
-   against an isolated real hub. Exercise failures, concurrent edits, lost responses,
+2. **Recoverable editing and history UI:** after the foundation contract is available, the same
+   build order covers keyed updates/receipt recovery, CLI history controls
+   and compact shared Bugs/Features UI. The same history-assigned API worker owns backend, CLI and browser implementation
+   under owner #794; do not reuse a worker carrying another item’s context. Verify
+   behavior against an isolated real hub and report who ran each acceptance check. Exercise failures, concurrent edits, lost responses,
    history after reload, mobile layout and closed-project reads.
 3. **Release and final acceptance:** record a release order for required hub/CLI and
    TailOS/Mini changes, preserve additive rollback and verify deployed identities.
@@ -74,7 +74,9 @@ Lead implementation clarifications:
    turn passing fresh CRUD cases into a causal repair claim. Save the complete final
    write-up through db-handler before any Done transition.
 
-Each stage needs its own committed work order before product changes. Scope remains
+Owner feedback #791 consolidates stages 1 and 2 into one recorded build order;
+they are internal implementation dependencies, not additional approval gates.
+Release remains separately recorded for the verified candidate. Scope remains
 this bug; narrative reports, historical-comment writes, broad dispatch viewing,
 versioned exports and AIV stay separate. Planning worker acceptance releases the
 worker until an explicit resume with a concrete implementation assignment.
