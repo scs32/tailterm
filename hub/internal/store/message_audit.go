@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 
 	"github.com/scs32/tailterm/hub/internal/api"
@@ -11,7 +12,15 @@ import (
 const messageSelectCols = `m.seq,m.task_id,m.from_agent,m.from_node,m.from_user,m.to_agent,m.text,m.created_at,m.reply_to,m.broadcast,
 COALESCE(l.item_task_id,''),COALESCE(l.item_id,''),COALESCE(l.item_revision,0),COALESCE(l.relationship,''),
 COALESCE(l.work_order_task_id,''),COALESCE(l.work_order_message_seq,0),
-COALESCE(r.receipt_id,''),COALESCE(r.request_id,''),COALESCE(r.task_id,''),COALESCE(r.message_seq,0),COALESCE(r.created_at,'')`
+COALESCE(r.receipt_id,''),COALESCE(r.request_id,''),COALESCE(r.task_id,''),COALESCE(r.message_seq,0),COALESCE(r.created_at,''),
+COALESCE(dr.question,''),COALESCE(dr.options,''),COALESCE(dr.recommended_option_id,''),COALESCE(dr.recommendation_reason,''),
+COALESCE(da.request_seq,0),COALESCE(da.option_id,''),COALESCE(da.text,'')`
+
+const messageSelectJoins = `
+LEFT JOIN message_work_item_links l ON l.message_seq=m.seq
+LEFT JOIN message_post_requests r ON r.message_seq=m.seq
+LEFT JOIN decision_requests dr ON dr.message_seq=m.seq
+LEFT JOIN decision_answers da ON da.message_seq=m.seq`
 
 type rowScanner interface {
 	Scan(...any) error
@@ -22,6 +31,9 @@ func scanMessage(row rowScanner) (api.Message, error) {
 	var created, itemTaskID, itemID, relationship, orderTaskID string
 	var receipt api.MessagePostReceipt
 	var receiptCreated string
+	var decisionRequest api.DecisionRequest
+	var decisionOptions string
+	var decisionAnswer api.DecisionAnswer
 	var itemRevision, orderSeq int64
 	err := row.Scan(
 		&message.Seq, &message.TaskID,
@@ -30,6 +42,8 @@ func scanMessage(row rowScanner) (api.Message, error) {
 		&itemTaskID, &itemID, &itemRevision, &relationship,
 		&orderTaskID, &orderSeq,
 		&receipt.ID, &receipt.RequestID, &receipt.TaskID, &receipt.MessageSeq, &receiptCreated,
+		&decisionRequest.Question, &decisionOptions, &decisionRequest.RecommendedOptionID, &decisionRequest.RecommendationReason,
+		&decisionAnswer.RequestSeq, &decisionAnswer.OptionID, &decisionAnswer.Text,
 	)
 	if err != nil {
 		return message, err
@@ -50,14 +64,22 @@ func scanMessage(row rowScanner) (api.Message, error) {
 		receipt.CreatedAt = parseTS(receiptCreated)
 		message.PostReceipt = &receipt
 	}
+	if decisionRequest.Question != "" {
+		if err := json.Unmarshal([]byte(decisionOptions), &decisionRequest.Options); err != nil {
+			return message, err
+		}
+		message.DecisionRequest = &decisionRequest
+	}
+	if decisionAnswer.RequestSeq > 0 {
+		message.DecisionAnswer = &decisionAnswer
+	}
 	return message, nil
 }
 
 func loadMessage(q queryRower, ctx context.Context, taskID string, seq int64) (api.Message, error) {
 	message, err := scanMessage(q.QueryRowContext(ctx, `SELECT `+messageSelectCols+`
 FROM messages m
-LEFT JOIN message_work_item_links l ON l.message_seq=m.seq
-LEFT JOIN message_post_requests r ON r.message_seq=m.seq
+`+messageSelectJoins+`
 WHERE m.task_id=? AND m.seq=?`, taskID, seq))
 	if errors.Is(err, sql.ErrNoRows) {
 		return message, api.ErrNotFound

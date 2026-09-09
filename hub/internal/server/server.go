@@ -47,6 +47,9 @@ func New(st *store.Store, identity Identity) *Server {
 	m.HandleFunc("POST /v1/tasks/{id}/messages", s.postMessage)
 	m.HandleFunc("GET /v1/tasks/{id}/messages", s.listMessages)
 	m.HandleFunc("GET /v1/tasks/{id}/messages/receipts/{requestID}", s.getMessagePostReceipt)
+	m.HandleFunc("POST /v1/tasks/{id}/decisions", s.createDecision)
+	m.HandleFunc("GET /v1/tasks/{id}/decisions", s.listDecisions)
+	m.HandleFunc("POST /v1/tasks/{id}/decisions/{seq}/answer", s.answerDecision)
 	m.HandleFunc("POST /v1/tasks/{id}/messages/read", s.markRead)
 	m.HandleFunc("POST /v1/tasks/{id}/events", s.postEvent)
 	m.HandleFunc("GET /v1/tasks/{id}/events", s.taskEvents)
@@ -106,6 +109,8 @@ func fail(w http.ResponseWriter, err error) {
 		writeError(w, 409, err.Error())
 	case errors.Is(err, api.ErrAgentSpawnDisabled):
 		writeError(w, http.StatusForbidden, "Agents cannot add agents to this task. Ask the owner to enable Allow agents to add other agents in task settings.")
+	case errors.Is(err, store.ErrDecisionAnswerForbidden):
+		writeError(w, http.StatusForbidden, "only a human can answer a decision request")
 	case errors.Is(err, api.ErrInvalid):
 		writeError(w, http.StatusBadRequest, "invalid request")
 	case errors.Is(err, api.ErrConflict):

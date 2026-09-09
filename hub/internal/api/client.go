@@ -37,6 +37,10 @@ type HTTPError struct {
 func (e *HTTPError) Error() string { return fmt.Sprintf("hub: %d %s", e.Status, e.Msg) }
 
 func (c *Client) do(ctx context.Context, method, path string, body, out any) error {
+	return c.doLimited(ctx, method, path, body, out, 4<<20)
+}
+
+func (c *Client) doLimited(ctx context.Context, method, path string, body, out any, maxResponse int64) error {
 	var buf io.Reader
 	if body != nil {
 		b, err := json.Marshal(body)
@@ -60,7 +64,7 @@ func (c *Client) do(ctx context.Context, method, path string, body, out any) err
 		return err
 	}
 	defer res.Body.Close()
-	data, err := io.ReadAll(io.LimitReader(res.Body, 4<<20))
+	data, err := io.ReadAll(io.LimitReader(res.Body, maxResponse))
 	if err != nil {
 		return err
 	}

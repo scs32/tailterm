@@ -92,6 +92,13 @@ export function createHubClient({ fetchImpl, baseURL, token = "" }) {
       request(`/v1/tasks/${task}/messages`, { method: "POST", body }),
     listMessages: async (task, params = {}) =>
       (await request(`/v1/tasks/${task}/messages` + q(params))).messages,
+    listDecisions: (task, params = {}) =>
+      request(`/v1/tasks/${task}/decisions` + q(params)),
+    answerDecision: (task, seq, body) =>
+      request(`/v1/tasks/${task}/decisions/${seq}/answer`, {
+        method: "POST",
+        body,
+      }),
     markRead: (task, body) =>
       request(`/v1/tasks/${task}/messages/read`, { method: "POST", body }),
     postEvent: (task, body) =>

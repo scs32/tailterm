@@ -37,6 +37,7 @@ Commands
   agents [--json]              list agents on this task
   event <kind> [--text T]      post started|running|done|needs_input|exited|closed
   post <text> [--to AGENT]     post a message to the task or one agent
+  ask --request-id KEY --file PATH [--json]  request an owner decision on the Board
   inbox [--unread] [--mark-read] [--json]
   spawn --name N --run CMD [--cwd D] [--prompt P] [--runtime R] [--task ID]
                                start a sibling agent session on this host
@@ -130,6 +131,8 @@ func main() {
 		err = cmdEvent(e, args)
 	case "post":
 		err = cmdPost(e, args)
+	case "ask":
+		err = cmdAsk(e, args)
 	case "inbox":
 		err = cmdInbox(e, args)
 	case "spawn":

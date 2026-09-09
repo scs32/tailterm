@@ -3,7 +3,8 @@
 Feature `wi_65e8fd62e46a4eb8`, owner dispatch #494. Discovery order
 `wi_65e8fd62e46a4eb8-plan-1` (#497), baseline `4e49888762ede18b46ae065dbbf5a0239101a318`
 on `tasks-hub`, Stephens-Mini, `/Users/stephenspeicher/projects/tailterm`.
-Status: implementation contract; release requires a separate recorded order.
+Implementation order `wi_65e8fd62e46a4eb8-build-1` (#500). This document defines
+the implemented contract; release requires a separate recorded order.
 
 ## User flow
 
@@ -42,8 +43,9 @@ Routes under `/v1/tasks/{id}`:
 - `POST /decisions` accepts CreateDecisionRequest, returns original request Message
   with A1-style postReceipt, status 201 including exact replay.
 - `GET /decisions?after=0&limit=100` returns records in ascending request message
-  sequence order; nextAfter is present only when another page exists. The list
-  includes pending and answered requests and remains readable after closure.
+  sequence order, with a maximum page size of 100; nextAfter is present only when
+  another page exists. The list includes pending and answered requests and remains
+  readable after closure.
 - `POST /decisions/{seq}/answer` accepts AnswerDecisionRequest, returns immutable
   answer Message with postReceipt, status 201 including exact replay.
 - Existing receipt recovery also recovers these messages in their caller/project/
@@ -53,11 +55,12 @@ Routes under `/v1/tasks/{id}`:
 Request keys use existing A1 validation. New requests require a current same-task
 agent and no agent recipient; the message text includes the full question,
 explained choices and recommendation so old clients/inboxes remain useful.
-Question length 1–2000, 2–5 options, each unique ASCII alphanumeric/underscore/hyphen
-ID 1–32, label 1–120, description 1–1000, recommendation reason 1–1000.
+Text limits below are UTF-8 bytes, matching existing hub limits. Question length
+1–2000, 2–5 options, each unique ASCII alphanumeric/underscore/hyphen ID 1–32,
+label 1–120, description 1–1000, recommendation reason 1–1000.
 Exactly one recommendedOptionId must match an option. Reject whitespace-only
 required values; total rendered message text must fit existing message limits.
-Selected answers require a valid option ID, with optional text up to 4000 chars;
+Selected answers require a valid option ID, with optional text up to 4000 bytes;
 custom answers require nonblank text up to 4000. No automatic default answer.
 
 Malformed/invalid references return 400, missing request/project returns 404,
@@ -80,8 +83,10 @@ existing encrypted bounded cache, with truthful saved/offline labels. Writes are
 never queued. Preserve selected option, custom text and a stable key across a
 failed/ambiguous submission and view refresh; exact retry must recover it. If a
 user changes the payload after a failed attempt, use a new key and let the server
-report whether an earlier answer already won. Show a concurrent winner after409.
-History messages export all immutable request and answer metadata.
+report whether an earlier answer already won. Show a concurrent winner after 409.
+Decision-panel scroll and expanded answer history persist through redraws and
+project navigation. History messages export all immutable request and answer
+metadata.
 
 ## Ownership and acceptance
 

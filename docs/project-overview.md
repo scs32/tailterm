@@ -242,6 +242,14 @@ Full terminal scrollback and private agent-runtime conversations are **not**
 archived by this feature. A persistent full transcript would require a separate
 capture/retention design. See [task cleanup and history](task-cleanup.md).
 
+Workers can post structured Board decisions with `tt ask --request-id KEY --file
+request.json`. Requests contain explained choices and one reasoned recommendation;
+the owner explicitly submits a listed choice or custom answer. Pending decisions
+remain reachable beyond the latest 200 messages. Answers are immutable directed
+human replies with recoverable receipts; recommendations and ordinary text replies
+do not resolve a request. Closed projects retain readable decision history. See
+[Board decisions](board-decisions.md) for retry behavior and the API contract.
+
 ### Permissions and tools
 
 Launch defaults preserve host settings. Explicit supported presets can choose

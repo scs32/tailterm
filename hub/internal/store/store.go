@@ -743,8 +743,7 @@ func (s *Store) ListMessages(ctx context.Context, taskID string, after int64, ag
 		limit = api.MaxLimit
 	}
 	q := `SELECT ` + messageSelectCols + ` FROM messages m
-LEFT JOIN message_work_item_links l ON l.message_seq=m.seq
-LEFT JOIN message_post_requests r ON r.message_seq=m.seq
+` + messageSelectJoins + `
 WHERE m.task_id=? AND m.seq>?`
 	args := []any{taskID, after}
 	if agentID != "" {

@@ -1,5 +1,12 @@
 import { readTaskHistory } from "./task-history.js";
 import { downloadBlob } from "./terminal-extras.js";
+import {
+  captureDecisionPresentation,
+  createDecisionDrafts,
+  readAllDecisions,
+  renderDecisionPanel,
+  restoreDecisionPresentation,
+} from "./board-decisions.js";
 // The hub owns messages; view changes only affect presentation and drafts.
 const esc = (s) =>
   String(s ?? "").replace(
@@ -31,6 +38,9 @@ const status = (a) => {
     ? label + " · offline"
     : label;
 };
+export const shouldReleaseRailPointer = (activePointer, event) =>
+  activePointer !== null &&
+  (event.type === "blur" || event.pointerId === activePointer);
 export function createBoardView({
   client,
   getTabs,
@@ -51,10 +61,21 @@ export function createBoardView({
     tasks = [],
     detail = null,
     messages = [],
+    decisions = [],
+    decisionsTask = null,
+    decisionLoadError = "",
     subscription = null,
     pending = false;
   let reloadAgain = false;
+  let railPointer = null,
+    railReleasePending = false,
+    renderHeldForPointer = false;
   const sending = new Set();
+  const decisionSending = new Set();
+  const decisionErrors = new Map();
+  const revealedAnswers = new Set();
+  const decisionDrafts = createDecisionDrafts();
+  const decisionPresentation = new Map();
   const completeConversations = new Map();
   const drafts = new Map();
   const draft = () => drafts.get(selected) || { text: "", to: "", replyTo: 0 };
@@ -66,21 +87,89 @@ export function createBoardView({
       to: root.querySelector("#board-to").value,
     });
   }
-  function mount(container) {
-    root = container;
+  function captureDecisionForm(form, clearError = false) {
+    const requestSeq = Number(form?.dataset.decisionForm || 0);
+    if (!requestSeq || !renderedTask) return;
+    decisionDrafts.update(renderedTask, requestSeq, {
+      optionId:
+        form.querySelector(
+          'input[name="decision-choice"]:checked:not([data-decision-custom-choice])',
+        )?.value || "",
+      customMode: Boolean(
+        form.querySelector("[data-decision-custom-choice]:checked"),
+      ),
+      custom: form.querySelector("[data-decision-custom]")?.value || "",
+      explanation:
+        form.querySelector("[data-decision-explanation]")?.value || "",
+    });
+    if (clearError) decisionErrors.delete(requestSeq);
   }
+  function saveDecisionDrafts() {
+    root
+      ?.querySelectorAll?.("[data-decision-form]")
+      .forEach((form) => captureDecisionForm(form));
+  }
+  function saveDecisionPresentation() {
+    if (!renderedTask) return;
+    decisionPresentation.set(
+      renderedTask,
+      captureDecisionPresentation(root, decisionPresentation.get(renderedTask)),
+    );
+  }
+  function revealDecisionAnswer(taskId, requestSeq) {
+    revealedAnswers.add(requestSeq);
+    const state = decisionPresentation.get(taskId) || {};
+    decisionPresentation.set(taskId, { ...state, historyOpen: true });
+    if (visible && renderedTask === taskId) {
+      const history = root?.querySelector?.(".decision-history");
+      if (history) history.open = true;
+    }
+  }
+  function finishRailPointer(event) {
+    if (!shouldReleaseRailPointer(railPointer, event)) return;
+    railPointer = null;
+    railReleasePending = true;
+    setTimeout(() => {
+      railReleasePending = false;
+      if (!renderHeldForPointer) return;
+      renderHeldForPointer = false;
+      // A navigation request that is still loading owns its eventual render.
+      if (visible && !pending) render();
+    }, 0);
+  }
+  function mount(container) {
+    if (root !== container) {
+      root?.removeEventListener?.("pointerdown", holdRailPointer);
+      root = container;
+      root.addEventListener?.("pointerdown", holdRailPointer);
+    }
+  }
+  function holdRailPointer(event) {
+    if (event.button === 0 && event.target.closest?.("[data-board-task]"))
+      railPointer = event.pointerId;
+  }
+  globalThis.addEventListener?.("pointerup", finishRailPointer);
+  globalThis.addEventListener?.("pointercancel", finishRailPointer);
+  globalThis.addEventListener?.("blur", finishRailPointer);
   function hide() {
     saveDraft();
+    saveDecisionDrafts();
+    saveDecisionPresentation();
     visible = false;
     epoch++;
     subscription?.stop();
     subscription = null;
     pending = false;
+    railPointer = null;
+    railReleasePending = false;
+    renderHeldForPointer = false;
   }
   async function show(taskId) {
     visible = true;
     if (taskId && taskId !== selected) {
       saveDraft();
+      saveDecisionDrafts();
+      saveDecisionPresentation();
       selected = taskId;
     }
     const token = ++epoch;
@@ -126,10 +215,23 @@ export function createBoardView({
             completeConversations.has(id)
               ? Promise.resolve(completeConversations.get(id))
               : client().listMessages(id, { limit: 200, latest: 1 }),
+            readAllDecisions(client(), id).then(
+              (value) => ({ value }),
+              (error) => ({ error }),
+            ),
           ])
-        : [null, []];
+        : [null, [], { value: [] }];
       if (!visible || token !== epoch || id !== selected) return;
       [detail, messages] = result;
+      const decisionResult = result[2];
+      if (decisionResult.error) {
+        if (decisionsTask !== id) decisions = [];
+        decisionLoadError = decisionResult.error.message;
+      } else {
+        decisions = decisionResult.value;
+        decisionLoadError = "";
+      }
+      decisionsTask = id;
       render();
     } catch (e) {
       if (visible && token === epoch) {
@@ -148,8 +250,39 @@ export function createBoardView({
   }
   function render() {
     if (!visible) return;
+    if (railPointer !== null || railReleasePending) {
+      renderHeldForPointer = true;
+      return;
+    }
     saveDraft();
+    saveDecisionDrafts();
+    saveDecisionPresentation();
     const d = draft();
+    const active = document.activeElement;
+    const activeDecision = active?.closest?.("[data-decision-request]");
+    let decisionFocus = null;
+    if (activeDecision && root.contains(active)) {
+      let selector = "";
+      if (active.matches("[data-decision-custom]"))
+        selector = "[data-decision-custom]";
+      else if (active.matches("[data-decision-explanation]"))
+        selector = "[data-decision-explanation]";
+      else if (active.matches("[data-decision-custom-choice]"))
+        selector = "[data-decision-custom-choice]";
+      else if (active.matches("[data-decision-submit]"))
+        selector = "[data-decision-submit]";
+      else if (active.dataset.decisionOption)
+        selector = `[data-decision-option="${active.dataset.decisionOption}"]`;
+      if (selector)
+        decisionFocus = {
+          requestSeq: activeDecision.dataset.decisionRequest,
+          selector,
+          selection:
+            typeof active.selectionStart === "number"
+              ? [active.selectionStart, active.selectionEnd]
+              : null,
+        };
+    }
     const focus = root.querySelector("#board-text") === document.activeElement;
     const selection = focus
       ? [
@@ -197,7 +330,7 @@ export function createBoardView({
             )
             .join(
               "",
-            )}${archived ? "" : '<button id="board-add-agent">＋ Agent</button>'}</div></div><div id="board-messages" class="board-messages">${messages.length === 200 && !completeConversations.has(selected) ? `<p class="fine">Latest 200 messages.${archived ? ' <button id="board-full-history">Show full conversation</button>' : " Full history remains on the hub."}</p>` : ""}${messages.map((m) => `<article class="board-message" data-message="${m.seq}"><div class="board-meta"><strong>${esc(name(m))}</strong><span>${m.to ? "to " + esc(names.get(m.to) || m.to) : "Team announcement"}${m.broadcast ? " · Swarm broadcast" : ""} · ${esc(archived ? new Date(m.createdAt).toLocaleString() : new Date(m.createdAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }))}</span></div>${m.replyTo ? `<div class="reply-context">Reply to #${m.replyTo}: ${esc(messages.find((x) => x.seq === m.replyTo)?.text.slice(0, 100) || "Earlier message")}</div>` : ""}<div class="board-text">${esc(m.text)}</div><div class="message-footer"><span>${receipt(m)}</span>${archived ? "" : `<button data-reply="${m.seq}">Reply</button>`}</div></article>`).join("")}</div>${
+            )}${archived ? "" : '<button id="board-add-agent">＋ Agent</button>'}</div></div>${renderDecisionPanel({ records: decisions, taskId: selected, archived, name, drafts: decisionDrafts, sending: decisionSending, errors: decisionErrors, revealedAnswers, historyOpen: decisionPresentation.get(selected)?.historyOpen, loadError: decisionLoadError })}<div id="board-messages" class="board-messages">${messages.length === 200 && !completeConversations.has(selected) ? `<p class="fine">Latest 200 messages.${archived ? ' <button id="board-full-history">Show full conversation</button>' : " Full history remains on the hub."}</p>` : ""}${messages.map((m) => `<article class="board-message" data-message="${m.seq}"><div class="board-meta"><strong>${esc(name(m))}</strong><span>${m.to ? "to " + esc(names.get(m.to) || m.to) : "Team announcement"}${m.broadcast ? " · Swarm broadcast" : ""} · ${esc(archived ? new Date(m.createdAt).toLocaleString() : new Date(m.createdAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }))}</span></div>${m.replyTo ? `<div class="reply-context">Reply to #${m.replyTo}: ${esc(messages.find((x) => x.seq === m.replyTo)?.text.slice(0, 100) || "Earlier message")}</div>` : ""}<div class="board-text">${esc(m.text)}</div><div class="message-footer"><span>${receipt(m)}</span>${archived ? "" : `<button data-reply="${m.seq}">Reply</button>`}</div></article>`).join("")}</div>${
             archived
               ? ""
               : `<form id="board-compose">${d.replyTo ? `<div class="compose-reply">Replying to #${d.replyTo}<button type="button" id="board-cancel-reply">Cancel reply</button></div>` : ""}<label class="compose-recipient">To<select ${sending.has(selected) ? "disabled" : ""} id="board-to" aria-label="Recipient"><option value="">Everyone</option>${agents
@@ -217,6 +350,8 @@ export function createBoardView({
       (b) =>
         (b.onclick = () => {
           saveDraft();
+          saveDecisionDrafts();
+          saveDecisionPresentation();
           selected = b.dataset.boardTask;
           pending = false;
           void show();
@@ -265,6 +400,121 @@ export function createBoardView({
       };
     const settingsButton = root.querySelector("#board-settings");
     if (settingsButton) settingsButton.onclick = () => settings(selected);
+    const decisionRetry = root.querySelector("[data-decisions-retry]");
+    if (decisionRetry)
+      decisionRetry.onclick = async () => {
+        const id = selected;
+        decisionRetry.disabled = true;
+        try {
+          await client().refreshDecisions?.(id);
+        } catch {
+          // reload renders the authoritative client error with a retry action.
+        }
+        if (visible && selected === id) await reload();
+      };
+    restoreDecisionPresentation(root, decisionPresentation.get(selected));
+    const decisionHistory = root.querySelector(".decision-history");
+    if (decisionHistory) {
+      const historyTask = selected;
+      decisionHistory.ontoggle = () => {
+        const state = decisionPresentation.get(historyTask) || {};
+        decisionPresentation.set(historyTask, {
+          ...state,
+          historyOpen: decisionHistory.open,
+        });
+      };
+    }
+    root.querySelectorAll("[data-decision-form]").forEach((form) => {
+      const requestSeq = Number(form.dataset.decisionForm);
+      const record = decisions.find(
+        (candidate) => candidate.request.seq === requestSeq,
+      );
+      if (archived) return;
+      const sync = () => {
+        const customMode = Boolean(
+          form.querySelector("[data-decision-custom-choice]:checked"),
+        );
+        const selected = form.querySelector("[data-decision-option]:checked");
+        const custom = form.querySelector("[data-decision-custom-field]");
+        const explanation = form.querySelector(
+          "[data-decision-explanation-field]",
+        );
+        if (custom) custom.hidden = !customMode;
+        if (explanation) explanation.hidden = customMode || !selected;
+      };
+      form.oninput = () => {
+        captureDecisionForm(form, true);
+        const error = form.querySelector("[data-decision-error]");
+        if (error) error.textContent = "";
+      };
+      form.onchange = () => {
+        captureDecisionForm(form, true);
+        sync();
+        const error = form.querySelector("[data-decision-error]");
+        if (error) error.textContent = "";
+      };
+      sync();
+      form.onsubmit = async (event) => {
+        event.preventDefault();
+        if (!record || decisionSending.has(requestSeq)) return;
+        captureDecisionForm(form);
+        let body;
+        try {
+          body = decisionDrafts.begin(selected, record);
+        } catch (error) {
+          decisionErrors.set(requestSeq, error.message);
+          const output = form.querySelector("[data-decision-error]");
+          if (output) output.textContent = error.message;
+          return;
+        }
+        const id = selected;
+        decisionErrors.delete(requestSeq);
+        decisionSending.add(requestSeq);
+        render();
+        try {
+          await client().answerDecision(id, requestSeq, body);
+          decisionDrafts.resolve(id, requestSeq);
+          revealDecisionAnswer(id, requestSeq);
+          notice("Answer stored and sent to the requesting worker.");
+          try {
+            await client().refreshDecisions?.(id);
+          } catch (refreshError) {
+            if (visible && selected === id)
+              decisionLoadError = refreshError.message;
+          }
+          if (visible && selected === id) await reload();
+        } catch (error) {
+          if (error.status === 409) {
+            let latestRecords = null;
+            try {
+              if (client().refreshDecisions)
+                await client().refreshDecisions(id);
+              else client().invalidateDecisions?.(id);
+              latestRecords = await readAllDecisions(client(), id);
+              if (visible && selected === id) {
+                decisions = latestRecords;
+                decisionsTask = id;
+                decisionLoadError = "";
+              }
+            } catch (refreshError) {
+              if (visible && selected === id)
+                decisionLoadError = refreshError.message;
+            }
+            const winner = (latestRecords || []).find(
+              (candidate) =>
+                candidate.request.seq === requestSeq && candidate.answer,
+            );
+            if (winner) {
+              decisionDrafts.resolve(id, requestSeq);
+              revealDecisionAnswer(id, requestSeq);
+            } else decisionErrors.set(requestSeq, error.message);
+          } else decisionErrors.set(requestSeq, error.message);
+        } finally {
+          decisionSending.delete(requestSeq);
+          if (visible && selected === id) render();
+        }
+      };
+    });
     for (const [selector, download] of [
       ["#board-download", true],
       ["#board-full-history", false],
@@ -335,6 +585,14 @@ export function createBoardView({
       const input = root.querySelector("#board-text");
       input?.focus();
       if (selection) input?.setSelectionRange(...selection);
+    }
+    if (decisionFocus) {
+      const input = root.querySelector(
+        `[data-decision-request="${decisionFocus.requestSeq}"] ${decisionFocus.selector}`,
+      );
+      input?.focus();
+      if (decisionFocus.selection)
+        input?.setSelectionRange?.(...decisionFocus.selection);
     }
   }
   return { mount, show, hide, reload, selected: () => selected };

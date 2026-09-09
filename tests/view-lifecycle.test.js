@@ -1,7 +1,10 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { createFilesView } from "../client/files-view.js";
-import { createBoardView } from "../client/board-view.js";
+import {
+  createBoardView,
+  shouldReleaseRailPointer,
+} from "../client/board-view.js";
 import { createTasksView } from "../client/tasks-view.js";
 import { createWorkItemsView } from "../client/work-items-view.js";
 const root = () => ({
@@ -23,6 +26,23 @@ const deferred = () => {
 };
 globalThis.localStorage = { getItem: () => null, setItem() {} };
 globalThis.document = { activeElement: null };
+
+test("Board rail pointer holds release outside, on cancel, or on window blur", () => {
+  assert.equal(
+    shouldReleaseRailPointer(7, { type: "pointerup", pointerId: 7 }),
+    true,
+  );
+  assert.equal(
+    shouldReleaseRailPointer(7, { type: "pointercancel", pointerId: 7 }),
+    true,
+  );
+  assert.equal(shouldReleaseRailPointer(7, { type: "blur" }), true);
+  assert.equal(
+    shouldReleaseRailPointer(7, { type: "pointerup", pointerId: 8 }),
+    false,
+  );
+  assert.equal(shouldReleaseRailPointer(null, { type: "blur" }), false);
+});
 
 test("switching SFTP servers cancels remaining files in an upload batch", async () => {
   const servers = [

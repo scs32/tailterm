@@ -137,6 +137,29 @@ export function createCachedHubClient({
     for (const path of paths) { dirty.add(path); checked.delete(path); }
     notify(true);
   }
+  function invalidateDecisions(task) {
+    revision++;
+    const prefix = `/v1/tasks/${task}/decisions`;
+    for (const path of paths)
+      if (new URL(path, client.base).pathname === prefix) {
+        dirty.add(path);
+        checked.delete(path);
+      }
+    notify(true);
+  }
+  async function refreshDecisions(task) {
+    invalidateDecisions(task);
+    const prefix = `/v1/tasks/${task}/decisions`;
+    const targets = [...paths].filter(
+      (path) => new URL(path, client.base).pathname === prefix,
+    );
+    await Promise.all(
+      targets.map(async (path) => {
+        await pending.get(path)?.catch(() => {});
+        if (dirty.has(path)) await refresh(path);
+      }),
+    );
+  }
   const stopMutation = client.onMutation?.(invalidate);
   const query = (params = {}) => {
     const values = Object.entries(params).filter(([, value]) => value !== undefined && value !== null && value !== "");
@@ -151,9 +174,13 @@ export function createCachedHubClient({
     listAgents: async (id) => (await read(`/v1/tasks/${id}/agents`)).agents,
     getAgent: (task, id) => read(`/v1/tasks/${task}/agents/${id}`),
     listMessages: async (task, params) => (await read(`/v1/tasks/${task}/messages` + query(params))).messages,
+    listDecisions: (task, params) =>
+      read(`/v1/tasks/${task}/decisions` + query(params)),
     listWorkItems: (params) => read("/v1/work-items" + query(params)),
     getWorkItem: (task, id) => read(`/v1/tasks/${task}/work-items/${id}`),
     invalidate,
+    invalidateDecisions,
+    refreshDecisions,
     refreshConnection() {
       if (disposed) return;
       failed = !online();

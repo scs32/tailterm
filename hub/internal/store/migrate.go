@@ -126,6 +126,30 @@ CREATE TABLE IF NOT EXISTS message_post_requests (
   created_at TEXT NOT NULL,
   UNIQUE(task_id,agent_id,by_node,by_user,request_id),
   FOREIGN KEY(task_id,message_seq) REFERENCES messages(task_id,seq)
+);
+CREATE TABLE IF NOT EXISTS decision_requests (
+  message_seq INTEGER PRIMARY KEY,
+  task_id TEXT NOT NULL,
+  question TEXT NOT NULL,
+  options TEXT NOT NULL,
+  recommended_option_id TEXT NOT NULL,
+  recommendation_reason TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  UNIQUE(task_id,message_seq),
+  FOREIGN KEY(task_id,message_seq) REFERENCES messages(task_id,seq)
+);
+CREATE INDEX IF NOT EXISTS decision_requests_task ON decision_requests(task_id,message_seq);
+CREATE TABLE IF NOT EXISTS decision_answers (
+  message_seq INTEGER PRIMARY KEY,
+  task_id TEXT NOT NULL,
+  request_seq INTEGER NOT NULL UNIQUE,
+  option_id TEXT,
+  text TEXT,
+  created_at TEXT NOT NULL,
+  CHECK(option_id IS NOT NULL OR text IS NOT NULL),
+  UNIQUE(task_id,message_seq),
+  FOREIGN KEY(task_id,message_seq) REFERENCES messages(task_id,seq),
+  FOREIGN KEY(task_id,request_seq) REFERENCES decision_requests(task_id,message_seq)
 );`); err != nil {
 		return err
 	}
