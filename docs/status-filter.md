@@ -5,6 +5,11 @@ Bug `wi_a65c688c4b09f458`, revision 3, bounded work order
 base is `310130f0b4564ab38dd796b4d2fd18247a6f7647` on `fix/status-filter` in the
 dedicated Stephens-Mini worktree.
 
+The accepted builder candidate is
+`b96fc32dba98172408d43b63f34dcf0ec98d73f5`. Its complete delta was integrated
+after the Board-scroll and activity-notices releases as application commit
+`0c1a3ce62301c415ab51d2c0c3438893702622db` on `tasks-hub`.
+
 ## Diagnosis and implementation
 
 The status filter already handled the native `change` event and asked the shared
@@ -65,8 +70,29 @@ cases were stopped; no served package or production process was changed.
 
 ## Release state
 
-No deployment was performed. Work order #1165 permits TailOS and the existing
-Mini preview only after lead accepts and sequences an exact candidate release.
-The existing Mini PID 28664 and its served `dist-static` bytes were not touched.
-Air, TrueNAS, Tailscale, hub/CLI/relay configuration, the old Tailterm site, live
-tasks, and owner profiles were unchanged.
+Lead accepted the corrected candidate in message #1202 and activated its ordered
+release slot in #1215. The detached clean source and static package are retained
+at `.build/releases/status-filter-0c1a3ce`; its 82-entry manifest verifies and
+`release.json` has SHA-256
+`e591b6c3d9d5ea58b9aea3a52e77c3b7832439988214dcdd790e2a48902cddea`.
+
+Application `0c1a3ce62301c415ab51d2c0c3438893702622db` is deployed to
+TailOS as `https://ea5b1191.tailos.pages.dev` (deployment
+`ea5b1191-c233-43d8-b9bc-ac766f533ee8`) and through the custom domain. The exact
+package was synchronized to Mini `http://127.0.0.1:4318`; listener PID 28664 was
+unchanged. All three origins match all 81 served assets and the manifest. The
+hashed JavaScript, CSS and production `.wasm.gz` have the expected MIME types;
+the WASM gzip has no `Content-Encoding`.
+
+Real Chromium on TailOS and Mini started production WASM, generated and restored
+an isolated synthetic vault/key, retained matching margins and reported no page
+errors. The integrated source passed 50/50 Chromium/WebKit shared dropdown and
+disclosure cases, 10/10 focused presentation tests and 130/130 JavaScript tests.
+The missing-WASM layout-fixture setup nonpass occurred before the release build;
+the clean release subsequently built and verified production WASM successfully.
+
+Rollback is application `8ed8c65ef85006bac04b3d212f89b7b66622a25e`, retained at
+`.build/releases/activity-notices-8ed8c65/dist-static`, with TailOS deployment
+`https://c15f5470.tailos.pages.dev`. Air, TrueNAS, Tailscale, hub/CLI/relay
+configuration, the old Tailterm site, live tasks, and owner profiles were
+unchanged.

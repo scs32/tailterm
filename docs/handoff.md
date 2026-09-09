@@ -1,5 +1,39 @@
 # Development handoff — September 9, 2026
 
+## September 9 Bugs and Features status filtering — release verified pending final acceptance
+
+Application commit `0c1a3ce62301c415ab51d2c0c3438893702622db` is deployed to
+`https://tailos.tailarr.com` (`https://ea5b1191.tailos.pages.dev`, deployment
+`ea5b1191-c233-43d8-b9bc-ac766f533ee8`) and served by the unchanged Mini
+preview PID 28664 at `http://127.0.0.1:4318`. The immutable deployment, custom
+domain and Mini match all 81 served files in the retained package and its
+release-manifest SHA-256
+`e591b6c3d9d5ea58b9aea3a52e77c3b7832439988214dcdd790e2a48902cddea`.
+Real Chromium on TailOS and Mini started production WASM, restored an isolated
+synthetic vault/key, preserved matching layout margins and reported no page
+errors.
+
+Committing a Bugs or Features status choice now ends both the native-select hold
+and its initiating pointer hold. A platform picker that consumes the document
+`pointerup` can no longer leave the filtered repaint queued until an outside
+click. Native `change`, keyboard typeahead, ordinary matching pointer release,
+background-refresh continuity and the other Board/Projects consumers remain
+intact. The exact owner browser event trace was unavailable, so the consumed
+release is a labelled synthetic causal reproduction rather than claimed native
+OS popup automation.
+
+Bug `wi_a65c688c4b09f458` revision 3 and bounded order #1165 are documented in
+[the implementation report](status-filter.md) and
+[the release receipt](releases/tailos-2026-09-09-status-filter.json). Clean-base
+consumed-release cases failed 0/2; the final focused Chromium/WebKit cases passed
+12/12, integrated shared-consumer continuity passed 50/50, presentation tests
+passed 10/10 and the JavaScript suite passed 130/130. The retained clean source
+and package are `.build/releases/status-filter-0c1a3ce`. Rollback is the retained
+activity-notices package `.build/releases/activity-notices-8ed8c65` and
+deployment `https://c15f5470.tailos.pages.dev`. Neither hub, CLI, schema,
+Tailscale, TrueNAS, relays, Air preview, the old site, live tasks/profiles nor
+agent sessions changed.
+
 ## September 9 terminal activity notice filtering — release verified pending final acceptance
 
 Application commit `8ed8c65ef85006bac04b3d212f89b7b66622a25e` is deployed to

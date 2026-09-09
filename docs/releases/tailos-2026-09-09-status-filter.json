@@ -1,0 +1,161 @@
+{
+  "status": "builder_release_verified_pending_final_acceptance",
+  "recordedAt": "2026-09-09T22:41:59Z",
+  "workItem": {
+    "id": "wi_a65c688c4b09f458",
+    "revision": 3,
+    "ownerMessage": 1115,
+    "workOrder": {
+      "id": "wi_a65c688c4b09f458-status-filter-1",
+      "message": 1165
+    },
+    "correctedCandidateResultMessages": [1200, 1201],
+    "handlerCandidateConfirmationMessage": 1203,
+    "leadCandidateAcceptanceMessage": 1202,
+    "releaseSlotMessage": 1215,
+    "releaseStartMessage": 1216
+  },
+  "source": {
+    "integrationBase": "87e555c43226c0e587cc9735e231c72b63ed05d0",
+    "acceptedBuilderCandidate": "b96fc32dba98172408d43b63f34dcf0ec98d73f5",
+    "integratedApplicationCommit": "0c1a3ce62301c415ab51d2c0c3438893702622db",
+    "integration": "The complete two-commit builder delta from base 310130f through b96fc32 was cherry-picked without conflict after the accepted Board-scroll and activity-notices releases. The resulting application delta is identical to the accepted candidate and preserves those earlier releases.",
+    "files": [
+      "client/view-refresh-presentation.js",
+      "tests/view-refresh-presentation.test.js",
+      "tests/dropdown-continuity-browser.mjs",
+      "docs/status-filter.md"
+    ]
+  },
+  "diagnosis": {
+    "cause": "The presentation commit released the native-select hold but not its initiating pointer hold. When a platform picker consumed the document pointerup that committed an option, the updated filtered data could arrive while repaint remained queued until the next outside pointer sequence.",
+    "evidenceLimit": "The consumed-release sequence is a labelled synthetic causal reproduction, not an observed event trace from the owner's browser or native OS popup automation.",
+    "correction": "An explicit select commit now clears the initiating pointer and pending-release delay together with the native-select hold. The work-item filter retains its native change semantics."
+  },
+  "package": {
+    "worktree": "/Users/stephenspeicher/projects/tailterm/.build/releases/status-filter-0c1a3ce",
+    "commit": "0c1a3ce62301c415ab51d2c0c3438893702622db",
+    "cleanSource": true,
+    "manifestEntries": 82,
+    "servedAssetsPerOrigin": 81,
+    "releaseSha256": "e591b6c3d9d5ea58b9aea3a52e77c3b7832439988214dcdd790e2a48902cddea",
+    "buildCommands": [
+      "./scripts/build-wasm.sh --test",
+      "npm run build:static",
+      "npm run verify:release"
+    ],
+    "verifyResult": "82/82 manifest entries passed",
+    "assets": {
+      "mainScript": {
+        "path": "assets/index-B73DRn-q.js",
+        "size": 805567,
+        "sha256": "15a52efecba0eb1d59550644e4c988fedeb8d981d8faa1d9a89f87293e2bf695"
+      },
+      "stylesheet": {
+        "path": "assets/index-Bkm6l0FY.css",
+        "size": 94771,
+        "sha256": "ee70f291a094abe1bff819c0c2b789bb9f594c3b836284483cad719f9f9d9cf1"
+      },
+      "productionWasmGzip": {
+        "path": "assets/tailserve-DvZn7aQh.wasm.gz",
+        "size": 8598272,
+        "sha256": "a875049b8e61d110edf839f9412fd0fc8cbca3c1f53f0ee310522e7a17e7b252"
+      }
+    }
+  },
+  "tailos": {
+    "origin": "https://tailos.tailarr.com",
+    "cloudflareProject": "tailos",
+    "branch": "main",
+    "deploymentId": "ea5b1191-c233-43d8-b9bc-ac766f533ee8",
+    "deployment": "https://ea5b1191.tailos.pages.dev",
+    "commit": "0c1a3ce62301c415ab51d2c0c3438893702622db",
+    "verifiedAssets": 81,
+    "releaseSha256": "e591b6c3d9d5ea58b9aea3a52e77c3b7832439988214dcdd790e2a48902cddea",
+    "assetVerification": "The immutable deployment and custom domain each matched release.json and all 81 served file sizes and SHA-256 hashes using raw Accept */* requests.",
+    "mime": {
+      "releaseJson": "200 application/json",
+      "mainScript": "200 application/javascript",
+      "stylesheet": "200 text/css; charset=utf-8",
+      "productionWasmGzip": "200 application/gzip; no Content-Encoding"
+    },
+    "observedCustomDomainCache": "release.json no-cache; hashed JavaScript, CSS and WASM max-age=14400 from the separately documented external override"
+  },
+  "miniPreview": {
+    "origin": "http://127.0.0.1:4318",
+    "servedDirectory": "/Users/stephenspeicher/projects/tailterm/dist-static",
+    "activation": "rsync -a --delete from the exact retained package",
+    "commit": "0c1a3ce62301c415ab51d2c0c3438893702622db",
+    "verifiedAssets": 81,
+    "releaseSha256": "e591b6c3d9d5ea58b9aea3a52e77c3b7832439988214dcdd790e2a48902cddea",
+    "mime": {
+      "releaseJson": "200 application/json; charset=utf-8",
+      "mainScript": "200 text/javascript; charset=utf-8",
+      "stylesheet": "200 text/css; charset=utf-8",
+      "productionWasmGzip": "200 application/gzip; no Content-Encoding"
+    },
+    "listener": {
+      "pidBefore": 28664,
+      "pidAfter": 28664,
+      "command": "node scripts/preview-static.mjs dist-static 127.0.0.1 4318",
+      "restarted": false
+    }
+  },
+  "browserAcceptance": {
+    "deployedBrowser": "Real Chromium on TailOS and Mini started production WASM, generated and restored an isolated synthetic local vault/key, retained matching margins and reported no page errors.",
+    "focusedStatus": "The integrated source passed consumed pointer release, matching pointer release and keyboard status selection for Bugs and Features in Chromium and WebKit.",
+    "screenshots": {
+      "tailos": ".build/releases/status-filter-0c1a3ce/.build/status-filter-release/tailos-layout.png",
+      "mini": ".build/releases/status-filter-0c1a3ce/.build/status-filter-release/mini-layout.png",
+      "sharedSha256": "dee008e5bb73ff69cb91fb1e43b1dc1241bc26b73201661e1427f62041b71664"
+    },
+    "nativeOsPopup": "Not automated. Native pointer opening/continuity/outside dismissal and closed-select engine keyboard typeahead are verified; synthetic consumed-release evidence remains separately labelled."
+  },
+  "verification": {
+    "builder": [
+      "Clean-base consumed-release Chromium Bugs and Features cases failed 0/2",
+      "Corrected candidate focused Chromium/WebKit status cases passed 12/12",
+      "Corrected candidate complete continuity suite passed 50/50",
+      "Corrected candidate presentation tests passed 10/10 and JavaScript suite passed 130/130"
+    ],
+    "release": [
+      "Integrated application presentation tests passed 10/10",
+      "Integrated shared-consumer Chromium/WebKit continuity passed 50/50",
+      "Clean production/test WASM and static build plus 82-entry release verification passed",
+      "TailOS immutable origin, custom domain and Mini matched 81/81 served hashes and release.json",
+      "Status, MIME and no-Content-Encoding checks passed on all three origins",
+      "Deployed production Chromium smoke passed on TailOS and Mini"
+    ],
+    "historicalNonpasses": [
+      "The first candidate's input-only explanation did not exercise the initiating pointer hold; lead rejected it and the immutable corrected candidate superseded it.",
+      "The pre-release board-layout fixture could not bootstrap because the clean builder worktree lacked generated wasm/tailserve.wasm; it timed out before the changed view and was stopped. The later clean release build generated and verified production WASM."
+    ],
+    "releaseNonpasses": []
+  },
+  "rollback": {
+    "commit": "8ed8c65ef85006bac04b3d212f89b7b66622a25e",
+    "tailosDeploymentId": "c15f5470-310a-4dba-b87f-8a014c4a1794",
+    "tailosDeployment": "https://c15f5470.tailos.pages.dev",
+    "retainedPackage": "/Users/stephenspeicher/projects/tailterm/.build/releases/activity-notices-8ed8c65/dist-static",
+    "releaseSha256": "8b0760761535c03271a34899481f72795316ff62f88e3cbc8c4c80b8a3b2fb44",
+    "verifyResult": "82 manifest entries passed before release",
+    "procedure": "Deploy the exact retained package explicitly to Cloudflare project tailos, then rsync it to Mini without restarting listener 28664.",
+    "warning": "Rollback removes the status-filter pointer-release fix while retaining the accepted activity-notices and Board-scroll releases."
+  },
+  "cleanup": {
+    "browserContextsClosed": true,
+    "isolatedHubProcessesClosed": true,
+    "miniListenerRestarted": false,
+    "temporaryBaselineCheckoutRemoved": true,
+    "temporaryReleaseCheckout": "Retained as the authorized clean source/package and not removed."
+  },
+  "excluded": [
+    "https://tailterm.tailarr.com",
+    "Air preview",
+    "hub, CLI, database or schema",
+    "Tailscale, TrueNAS networking or relays",
+    "live tasks or profiles",
+    "owner browser storage",
+    "agent sessions or lifecycle"
+  ]
+}
