@@ -8,7 +8,7 @@ const headers = await readFile("deploy/_headers", "utf8");
 const assetRule = headers.match(/\/assets\/\*\s+Cache-Control:\s*([^\n]+)/);
 assert.ok(assetRule, "deploy/_headers must define the asset cache policy");
 const assetCacheControl = assetRule[1].trim();
-assert.equal(assetCacheControl, "public, max-age=0, must-revalidate");
+assert.equal(assetCacheControl, "no-cache");
 
 for (const engine of [chromium, webkit]) {
   let cssRequests = 0;
