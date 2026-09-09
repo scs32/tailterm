@@ -6,6 +6,9 @@ agent instructions so a main orchestrator decides, plans, routes work and review
 evidence. Builders own implementation, including shared schemas/types and
 integration code. Lead accepted the clean build candidate and its evidence in
 message #889; database-handler result recording is linked from message #882.
+The bounded release order is `wi_0edddf71905d6186-release-1` (#893), delivered
+with its exact scope in #894 and still gated on the lead's explicit post-Enter
+integration-slot handoff.
 
 ## Implemented behavior
 
@@ -64,9 +67,10 @@ session teardown was used for build acceptance.
 
 ## Release plan
 
-Release requires a separate recorded order and the lead's explicit release of the
-shared frontend integration slot. Integrate this commit into the current
-`tasks-hub` release candidate only after the active `board-enter` work lands.
+Release is authorized only by `wi_0edddf71905d6186-release-1` (#893/#894) and
+still requires the lead's explicit release of the shared frontend integration
+slot. Integrate this commit into the current `tasks-hub` release candidate only
+after the active `board-enter` work lands.
 Resolve only concrete conflicts in the changed files, inspect the final changed
 bytes, and rerun checks implicated by those conflicts rather than inventing a new
 broad gate.
