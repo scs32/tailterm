@@ -24,8 +24,11 @@ package is `.build/releases/dropdown-dispatch-fd8d102/dist-static`.
 
 The separate work-item create/edit/history bug remains in investigation. Ordinary
 CRUD passed 8/8 on both current and pre-dropdown baselines; no repair is claimed.
-API owns the unfinished storage-plan revision, and owner failure details requested
-in #752 remain pending. Narrative/AIV work is not activated. Air preview remains
+The revised storage contract is accepted in
+[the history plan](work-item-revision-history-plan.md); owner failure details
+requested in #752 remain pending. The next bounded foundation order must be
+recorded before product changes. Both deployed UI bugs are confirmed Done by
+db-handler #788 (dropdown revision13, send-dialog revision10). Narrative/AIV work is not activated. Air preview remains
 retired; no hub/CLI/network change accompanied this frontend release.
 
 ## September 9 Board decisions — release verified, Air preview retired
