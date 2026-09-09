@@ -121,6 +121,76 @@ test("a native select queues one repaint until its choice is committed", async (
   assert.equal(renders, 1);
 });
 
+test("a native select commit releases a pointer consumed by the platform picker", async () => {
+  let renders = 0;
+  const root = fakeRoot();
+  const presentation = createViewRefreshPresentation({
+    render() {
+      renders++;
+    },
+  });
+  const select = {
+    disabled: false,
+    isConnected: true,
+    closest(selector) {
+      return selector.includes("select") ? this : null;
+    },
+    matches(selector) {
+      return selector === "select";
+    },
+  };
+  presentation.mount(root);
+  root.dispatch("pointerdown", {
+    target: select,
+    button: 0,
+    pointerId: 7,
+  });
+  assert.equal(presentation.beforeRender("project-a"), false);
+  root.dispatch("change", { target: select });
+  await tick();
+  assert.equal(renders, 1);
+});
+
+test("a matching pointerup and commit release an ordinary select gesture", async () => {
+  const previousAddEventListener = globalThis.addEventListener;
+  const listeners = new Map();
+  globalThis.addEventListener = (type, listener) => listeners.set(type, listener);
+  try {
+    let renders = 0;
+    const root = fakeRoot();
+    const presentation = createViewRefreshPresentation({
+      render() {
+        renders++;
+      },
+    });
+    const select = {
+      disabled: false,
+      isConnected: true,
+      closest(selector) {
+        return selector.includes("select") ? this : null;
+      },
+      matches(selector) {
+        return selector === "select";
+      },
+    };
+    presentation.mount(root);
+    root.dispatch("pointerdown", {
+      target: select,
+      button: 0,
+      pointerId: 7,
+    });
+    assert.equal(presentation.beforeRender("project-a"), false);
+    listeners.get("pointerup")({ type: "pointerup", pointerId: 7 });
+    root.dispatch("change", { target: select });
+    await tick();
+    assert.equal(renders, 1);
+  } finally {
+    if (previousAddEventListener)
+      globalThis.addEventListener = previousAddEventListener;
+    else delete globalThis.addEventListener;
+  }
+});
+
 test("focus alone does not claim that a native popup is open", () => {
   const root = fakeRoot();
   const presentation = createViewRefreshPresentation({ render() {} });

@@ -227,6 +227,10 @@ export function createViewRefreshPresentation({ render }) {
 
   function commit(control = nativeSelect, { flush = true } = {}) {
     if (control && nativeSelect && control !== nativeSelect) return;
+    // A platform picker can consume the release that commits its selection,
+    // leaving no document pointerup. The committed control ends that gesture.
+    pointer = null;
+    pointerReleasePending = false;
     nativeSelect = null;
     nativeSelectWatch++;
     if (flush) scheduleFlush();

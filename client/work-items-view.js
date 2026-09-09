@@ -154,18 +154,11 @@ export function createWorkItemsView({
       scope = e.target.value;
       void reload();
     };
-    const statusControl = root.querySelector("[data-items-status]"),
-      commitStatus = (e) => {
-        presentation.commit(e.target, { flush: false });
-        const next = e.target.value;
-        if (state === next) return;
-        state = next;
-        void reload();
-      };
-    // Some native pickers expose the committed option through `input` before
-    // deferring `change` until blur. Handle both, and suppress the later duplicate.
-    statusControl.oninput = commitStatus;
-    statusControl.onchange = commitStatus;
+    root.querySelector("[data-items-status]").onchange = (e) => {
+      presentation.commit(e.target, { flush: false });
+      state = e.target.value;
+      void reload();
+    };
     root.querySelector("[data-items-new]").onclick = () => edit();
     root.querySelector("[data-items-new-rail]").onclick = () => edit();
     root
