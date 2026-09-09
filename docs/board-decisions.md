@@ -5,8 +5,9 @@ Feature `wi_65e8fd62e46a4eb8`, owner dispatch #494. Discovery order
 on `tasks-hub`, Stephens-Mini, `/Users/stephenspeicher/projects/tailterm`.
 Implementation order `wi_65e8fd62e46a4eb8-build-1` (#500). This document defines
 the implemented contract. Release order `wi_65e8fd62e46a4eb8-release-1` (#619)
-is active; [the release receipt](releases/tailos-2026-09-09-decisions.json) records
-verified targets and the remaining Air rollout dependency.
+and Air retirement amendment #641 are verified;
+[the release receipt](releases/tailos-2026-09-09-decisions.json) records the hub,
+TailOS, Mini preview, both CLIs and owner-requested Air preview retirement.
 
 ## User flow
 
@@ -114,7 +115,8 @@ transaction failures, A1 receipts, unchanged legacy posts/history, migrations an
 rollback using isolated databases/contexts only. Real Chromium/WebKit acceptance
 must use an isolated real hub and the actual CLI before release.
 
-Release targets are hub, both host CLIs, TailOS and both local previews. Use a
+Release targets are hub, both host CLIs, TailOS and Mini local preview. Owner #638
+replaced the Air preview update with its retirement under amendment #641. Use a
 verified consistent SQLite backup and existing middleware/TCP listener, preserve
 prior binaries/assets, and never change TrueNAS Tailscale. No live test tasks or
 profiles, no unrelated roadmap implementation. Completion closes this feature

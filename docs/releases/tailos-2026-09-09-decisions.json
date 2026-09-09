@@ -9,9 +9,8 @@
     "message": 619
   },
   "commit": "39896c9c3a1779bdd1b6eb77ad2edab6d447cacc",
-  "recordedAt": "2026-09-09T15:02:04.182347+00:00",
-  "status": "partial_release_air_blocked",
-  "featureComplete": false,
+  "recordedAt": "2026-09-09T15:45:56.502379+00:00",
+  "status": "amended_release_verified",
   "tailos": {
     "origin": "https://tailos.tailarr.com",
     "deployment": "https://23a174e0.tailos.pages.dev",
@@ -68,19 +67,6 @@
     "uncaughtErrors": [],
     "verifiedAt": "2026-09-09T15:00:09.224Z"
   },
-  "air": {
-    "status": "blocked_before_mutation",
-    "host": "theAir",
-    "endpoint": "100.96.77.33:22",
-    "reason": "Two bounded SSH connect checks timed out; no remote writes attempted.",
-    "pendingTargets": [
-      "Darwin arm64 tt CLI",
-      "localhost4318 static preview"
-    ],
-    "lastVerifiedCommit": "955bf43358c0d600028295f5466275cbae9e4714",
-    "lastVerifiedCliSha256": "0b82422547a0d386d6b1c212e28419888d2036437d434bddff8ea87b4f56abb2",
-    "lastVerificationReceipt": "tailos-2026-09-08-audit.json"
-  },
   "retainedRelease": {
     "worktree": "/Users/stephenspeicher/projects/tailterm/.build/releases/board-decisions-39896c9c3a17",
     "commit": "39896c9c3a1779bdd1b6eb77ad2edab6d447cacc",
@@ -136,7 +122,7 @@
     ]
   },
   "limits": [
-    "Both Air targets still block feature Done; last-known inventory is not a current success claim.",
+    "Air localhost4318 is intentionally retired by owner638; public TailOS is the owner-selected frontend. Shared/base images and the separate hub/buildkit containers remain on Air.",
     "Host relays remain on their existing executable; no restart required for ask/generated briefing changes.",
     "Unsubmitted drafts persist within the current Board instance across redraw/mode/project navigation, not full browser restart.",
     "Shared workspace credentials do not provide individual-owner/per-agent authentication.",
@@ -144,6 +130,102 @@
   ],
   "verificationNotes": [
     "Initial backup inspection expected a wrapper around middleware app.config; corrected read-only parsing before backup/deployment.",
-    "Mini raw compressed assets were verified using undecoded HTTP bytes because Fetch automatically applies Vite Content-Encoding."
-  ]
+    "Mini raw compressed assets were verified using undecoded HTTP bytes because Fetch automatically applies Vite Content-Encoding.",
+    "Reclaimed allocated file bytes and observed filesystem free-space increase are reported separately; APFS sharing and background writes affect the latter."
+  ],
+  "previousPartialReceiptCommit": "7d6d51ed78e0e4f2222e3a81faf7314257018e81",
+  "releaseAcceptanceComplete": true,
+  "releaseAmendment": {
+    "id": "wi_65e8fd62e46a4eb8-release-1-air-retirement-1",
+    "message": 641,
+    "ownerMessage": 638,
+    "scope": "Replace Air preview rollout with retirement and dedicated storage reclamation; keep Air CLI update."
+  },
+  "previousAirBlocker": {
+    "status": "blocked_before_mutation",
+    "host": "theAir",
+    "endpoint": "100.96.77.33:22",
+    "reason": "Two bounded SSH connect checks timed out; no remote writes attempted.",
+    "pendingTargets": [
+      "Darwin arm64 tt CLI",
+      "localhost4318 static preview"
+    ],
+    "lastVerifiedCommit": "955bf43358c0d600028295f5466275cbae9e4714",
+    "lastVerifiedCliSha256": "0b82422547a0d386d6b1c212e28419888d2036437d434bddff8ea87b4f56abb2",
+    "lastVerificationReceipt": "tailos-2026-09-08-audit.json",
+    "resolvedBy": "Owner scope amendment638/641 and verified Air CLI install/preview retirement"
+  },
+  "airCLI": {
+    "host": "theAir",
+    "binarySha256": "c926e400c25490c9c67ea6cbd24871139b683b0e06b319e42d5edbfbdefe93cf",
+    "previousBinarySha256": "0b82422547a0d386d6b1c212e28419888d2036437d434bddff8ea87b4f56abb2",
+    "rollbackBinary": "/Users/stephenspeicher/.local/bin/tt-before-decisions-39896c9c3a17",
+    "askHelpVerified": true,
+    "briefVerified": true,
+    "relayRestarted": false
+  },
+  "airPreviewRetirement": {
+    "host": "theAir",
+    "ownerMessage": 638,
+    "amendmentMessage": 641,
+    "status": "preview_retired",
+    "container": "tailterm-static",
+    "priorState": "stopped",
+    "removedImages": [
+      {
+        "name": "tailterm-static:56ded4133c7a",
+        "id": "58f32e17875f88c67eae11052405ffb80cca4f9fc3c8acec8af51b51a98a7335"
+      },
+      {
+        "name": "tailterm-static:c30436529ecb",
+        "id": "47550d2f041181692455e225c93b87c9f20651b6657344551934ded24971577f"
+      },
+      {
+        "name": "tailterm-static:dev",
+        "id": "d1e662dc9067366b24ae929e5fd330bde378b4cd4f8f303fe957fe941eb4a05b"
+      }
+    ],
+    "removedStaticDirectories": [
+      "/Users/stephenspeicher/.local/share/tailterm/web-releases/78498da83412/site",
+      "/Users/stephenspeicher/.local/share/tailterm/web-releases/955bf43358c0/site"
+    ],
+    "preservedContainers": [
+      {
+        "id": "buildkit",
+        "state": "stopped"
+      },
+      {
+        "id": "tailterm-hub",
+        "state": "stopped"
+      }
+    ],
+    "preservedImageNames": [
+      "docker.io/library/caddy:2-alpine",
+      "docker.io/library/golang:1.25-bookworm",
+      "docker.io/library/golang:1.26-bookworm",
+      "docker.io/library/node:24-bookworm-slim",
+      "docker.io/tailscale/tailscale:latest",
+      "tailterm-hub:dev"
+    ],
+    "endpoint": "http://127.0.0.1:4318",
+    "endpointOpen": false,
+    "beforeBytes": {
+      "containerStore": 30904799232,
+      "webReleases": 11685888,
+      "diskFree": 5922476032
+    },
+    "afterBytes": {
+      "containerStore": 29702520832,
+      "webReleases": 49152,
+      "diskFree": 6743289856
+    },
+    "allocatedBytesRemoved": 1213915136,
+    "observedFreeSpaceIncrease": 820813824,
+    "notes": [
+      "Existing stopped preview removed; no service stop was needed.",
+      "Shared/base images, buildkit and separate tailterm-hub container preserved.",
+      "Public source/rollback references and small deployment receipts retained; no broad prune or network/relay changes."
+    ],
+    "verifiedAt": "2026-09-09T15:44:19.430599+00:00"
+  }
 }

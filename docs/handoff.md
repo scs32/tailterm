@@ -1,6 +1,6 @@
 # Development handoff — September 9, 2026
 
-## September 9 Board decisions — Air rollout pending
+## September 9 Board decisions — release verified, Air preview retired
 
 Application `39896c9c3a1779bdd1b6eb77ad2edab6d447cacc` is deployed to
 `https://tailos.tailarr.com` (`https://23a174e0.tailos.pages.dev`) and Mini
@@ -9,10 +9,10 @@ SHA-256 `65cafae10ccfc33ff9133caeb960ce3023780da56da78b59112eb7e22739856d`.
 Production Chromium started the real WASM and restored an isolated synthetic
 local vault key without browser errors.
 
-Workers can use `tt ask` to present explained choices and a recommendation.
-The owner explicitly submits a choice or custom answer on Board; the immutable
-human reply resolves the request. Pending decisions remain discoverable beyond
-the latest 200 messages. Retry receipts prevent duplicate answers. See
+Workers use `tt ask` to present explained choices and a recommendation. The owner
+explicitly submits a choice or custom answer on Board; the immutable human reply
+resolves the request. Pending decisions remain discoverable beyond the latest
+200 messages. Retry receipts prevent duplicate answers. See
 [the contract](board-decisions.md) for failures, history and draft lifetime.
 
 The hub is RUNNING through existing TrueNAS middleware/TCP at
@@ -22,38 +22,48 @@ Decision tables, SQLite integrity/FK checks and authenticated read-only readines
 passed. Consistent mode-0600 backup:
 `/mnt/deepfreeze/tailterm-hub/backups/before-board-decisions-20260909T145726Z.sqlite`.
 The prior A1 hub binary remains available for rollback with additive tables intact;
-isolated rollback/re-upgrade preserved existing receipts and decision metadata.
+isolated rollback/re-upgrade preserved receipts and decision metadata.
 
-Mini's installed CLI hash is
-`c926e400c25490c9c67ea6cbd24871139b683b0e06b319e42d5edbfbdefe93cf`;
-`tt ask --help` and its generated decision briefing pass. Its previous binary is
-`~/.local/bin/tt-before-decisions-39896c9c3a17`. Existing relays were not restarted.
+**Both Mini and Air CLIs** now have SHA-256
+`c926e400c25490c9c67ea6cbd24871139b683b0e06b319e42d5edbfbdefe93cf`.
+Installed `tt ask --help` and generated decision briefings pass on both hosts.
+Each retains `~/.local/bin/tt-before-decisions-39896c9c3a17`; existing relays were
+not restarted.
 
-**Feature `wi_65e8fd62e46a4eb8` remains in progress.** Build order #500 is accepted;
-release order `wi_65e8fd62e46a4eb8-release-1` (#619) still requires **both Air CLI
-and Air localhost4318 updates**. Two bounded SSH checks to `theAir`
-(`100.96.77.33:22`) timed out before any remote writes. Its last verified frontend
-and CLI remain the September 8 audit release below; this is historical inventory,
-not a fresh verification. Do not mark the feature Done until Air is updated and
-the handler verifies the saved completion.
+Owner #638 explicitly replaced the Air preview update with retirement, preferring
+public TailOS. Release amendment
+`wi_65e8fd62e46a4eb8-release-1-air-retirement-1` (#641) records that change. Air's
+already-stopped `tailterm-static` container, its three unreferenced static images
+(`56ded4133c7a`, `c30436529ecb`, `dev`) and two verified staged static asset folders
+were removed. Localhost4318 is closed. Allocated files decreased by
+1,213,915,136 bytes; observed free disk space increased by 820,813,824 bytes.
+These differ because of filesystem sharing/accounting and background writes.
+The separate stopped `tailterm-hub` and `buildkit` containers, shared/base images,
+credentials, user data, networking and task sessions remain unchanged. Small
+release receipts remain at `~/.local/share/tailterm/web-releases/`, including
+`retirement-39896c9c3a17.json`. Do not recreate Air's preview without a new request.
 
-Exact clean source, packaged static assets and both candidate binaries are retained
-at `.build/releases/board-decisions-39896c9c3a17` on Mini. When Air connectivity
-returns, run `python3 scripts/deploy-remote-static.py theAir` **from that retained
-worktree**, atomically install its `.build/ttbin/tt-darwin-arm64` with a backup of
-Air's current CLI, and verify served assets plus installed help/briefing. Later
-documentation commits deliberately differ from the deployed application commit.
-The previous TailOS deployment `https://f696ab58.tailos.pages.dev` and its source
-commit remain the frontend rollback references.
+Feature `wi_65e8fd62e46a4eb8` build #500, release #619 and amended Air acceptance
+#641 are verified. The database handler owns the saved completion record. Earlier
+SSH timeouts and the old preview requirement are historical and resolved by the
+owner's amendment and completed Air work. Future releases must follow the current
+owner-selected targets rather than treating older two-preview notes as a mandate.
 
-[Release receipt](releases/tailos-2026-09-09-decisions.json) distinguishes successful
-targets from the Air blocker. Independent QA passed 32/32 real-hub/CLI scenarios
-in Chromium/WebKit, including lost-response recovery, concurrent answers, pointer
-refresh and project navigation, mobile controls and closed history. Final JS
-tests passed 113/113; Go suite/vet/race and existing project browser compatibility
-passed. Lead accepted all worker results and retired ordinary workers after their
-dependencies cleared; lead and db-handler remain available. No live task/profile
-test records, Tailscale changes or task closures were used.
+Exact clean source, packaged static assets and both binaries are retained at
+`.build/releases/board-decisions-39896c9c3a17` on Mini. Later documentation commits
+intentionally differ from the application commit. Previous frontend source
+`955bf43358c0d600028295f5466275cbae9e4714` and deployment
+`https://f696ab58.tailos.pages.dev` remain rollback references; Air's retired local
+images were intentionally removed to reclaim storage.
+
+[Release receipt](releases/tailos-2026-09-09-decisions.json) records per-target
+identities, backup and storage measurements. Independent QA passed 32/32 real-hub/
+CLI scenarios in Chromium/WebKit, including retries, concurrency, pointer refresh,
+project navigation, mobile controls and closed history. Final JS passed 113/113;
+Go suite/vet/race and existing project browser compatibility passed. Lead accepted
+all worker results and retired ordinary workers after dependencies cleared; lead
+and db-handler remain available. No live task/profile test records, Tailscale
+changes or task closures were used.
 
 ## September 8 message audit foundation — previous hub
 
