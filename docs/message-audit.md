@@ -2,7 +2,9 @@
 
 Feature `wi_abc84eb23688d903`, order `wi_abc84eb23688d903-a1`, recorded #454.
 The A1 source contract and isolated acceptance checks were accepted by lead in
-#480; deployment is a separate recorded release. See [the plan](work-item-audit-implementation-plan.md)
+#480. The hub is deployed under release order #483; see the
+[release receipt](releases/tailos-2026-09-08-message-audit.json).
+See [the plan](work-item-audit-implementation-plan.md)
 for later intake, correction, client, enforcement and AIV slices.
 
 Ordinary message posting remains compatible with existing clients. New callers

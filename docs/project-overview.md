@@ -181,6 +181,13 @@ is not a mandatory default or evidence of better performance.
 
 ### Messages, wake-up, and lifecycle
 
+The hub supports optional primary work-item and recorded order-message references,
+plus request-key posting receipts. Exact retries recover the original committed
+message without repeating events or agent resumption. Human cross-project work-item
+dispatch includes its source-owned link. Existing clients may still post unlinked
+messages; UI/CLI controls and strict enforcement are later slices. See
+[message audit foundation](message-audit.md).
+
 The hub durably stores shared messages. `tt inbox --unread --mark-read` retrieves
 messages; the read cursor means retrieval, not completion. `tt post --to NAME`
 addresses an agent. To reply to the human owner, use `--reply-to SEQ` without

@@ -1,5 +1,44 @@
 # Development handoff — September 8, 2026
 
+## September 8 message audit foundation — current hub
+
+Hub source `e95f65044c6dd554f1530a0dccf9d9a209cafd61` is deployed through TrueNAS
+middleware at the existing TCP listener. Its binary is
+`/mnt/deepfreeze/tailterm-hub/releases/20260908-message-audit-e95f65044c6d/tailterm-hub`,
+SHA-256 `01c9e61043597832c7ef30089f9f583c9156c250192778ca6ea2fe9b9298a960`.
+The app is RUNNING; additive tables/indexes, SQLite integrity/foreign keys and
+authenticated read-only route checks passed. No live task or profile records
+were used for acceptance tests, and no Tailscale or relay changes were made.
+
+Feature `wi_abc84eb23688d903`, A1 order #454, adds optional same-project primary
+message/item links, recorded order references and recoverable posting receipts.
+Exact retries return the original message without another event or agent resume,
+even after an item edit, replacement run or project closure. Human cross-project
+dispatch preserves source ownership and now stores its typed primary link.
+Existing unlinked clients remain compatible. See [the contract](message-audit.md).
+The larger structured audit/AIV roadmap remains in progress; no new client
+controls, strict enforcement or AIV adapter are included.
+
+Release order `wi_abc84eb23688d903-a1-release-1` (#483) is hub-only. TailOS and
+Mini manifests still verify application `955bf43358c0d600028295f5466275cbae9e4714`;
+Air's last verified application is the same, but its optional read-only inventory
+refresh timed out over SSH during this release. No frontend or host CLI files
+changed. The prior audit receipt below remains their full asset verification.
+
+Consistent pre-migration backup:
+`/mnt/deepfreeze/tailterm-hub/backups/before-message-audit-20260909T003406Z.sqlite`,
+mode 0600, integrity `ok`. Retain the prior Projects-release hub binary for
+rollback and keep the additive tables. Isolated old-binary/new-database writes
+and re-upgrade preserved receipts and passed integrity/FK checks. Restore the
+snapshot only for explicit disaster recovery, accounting for subsequent writes.
+
+[Release receipt](releases/tailos-2026-09-08-message-audit.json) records exact
+versions and attributed evidence: full Go suite/vet and store/server race checks;
+independent seven-scenario HTTP acceptance with fourteen invalid-reference cases;
+101 JavaScript tests; Chromium/WebKit real isolated-hub compatibility. Lead accepted
+both workers and retired them after all review dependencies cleared. The database
+handler remains available, and lead owns subsequent scope and release coordination.
+
 ## September 8 audit workflow release — current deployment
 
 Application/source commit `955bf43358c0d600028295f5466275cbae9e4714` is deployed to

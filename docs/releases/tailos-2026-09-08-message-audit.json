@@ -1,0 +1,108 @@
+{
+  "featureId": "wi_abc84eb23688d903",
+  "implementationOrder": "wi_abc84eb23688d903-a1",
+  "implementationOrderMessage": 454,
+  "releaseOrder": "wi_abc84eb23688d903-a1-release-1",
+  "releaseOrderMessage": 483,
+  "sourceCommit": "e95f65044c6dd554f1530a0dccf9d9a209cafd61",
+  "branch": "tasks-hub",
+  "scope": "hub only",
+  "hub": {
+    "hubBinary": "/mnt/deepfreeze/tailterm-hub/releases/20260908-message-audit-e95f65044c6d/tailterm-hub",
+    "hubBinarySha256": "01c9e61043597832c7ef30089f9f583c9156c250192778ca6ea2fe9b9298a960",
+    "state": "RUNNING",
+    "auditSchemaVerified": true,
+    "integrity": "ok",
+    "foreignKeyViolations": 0,
+    "authenticatedIdentityStatus": 200,
+    "malformedReceiptStatus": 400,
+    "verifiedAt": "2026-09-09T00:34:59.917126+00:00"
+  },
+  "backup": {
+    "priorHubBinary": "/mnt/deepfreeze/tailterm-hub/releases/20260908-project-work-items-86551cdc901e/tailterm-hub",
+    "priorHubBinarySha256": "0e2e44a040af218b0c00fbd9a5c39ccf11bc257e6bc4441a6826500899542a9a",
+    "priorState": "RUNNING",
+    "backup": "/mnt/deepfreeze/tailterm-hub/backups/before-message-audit-20260909T003406Z.sqlite",
+    "backupIntegrity": "ok",
+    "backupMode": "0o600",
+    "createdAt": "20260909T003406Z"
+  },
+  "frontends": {
+    "changed": false,
+    "verifiedManifests": [
+      {
+        "origin": "https://tailos.tailarr.com",
+        "commit": "955bf43358c0d600028295f5466275cbae9e4714",
+        "manifestSha256": "e7de612f667b3da811f918b7b89b4daf51d5447bb2882893b0feda90ffd472c9"
+      },
+      {
+        "origin": "http://127.0.0.1:4318",
+        "commit": "955bf43358c0d600028295f5466275cbae9e4714",
+        "manifestSha256": "e7de612f667b3da811f918b7b89b4daf51d5447bb2882893b0feda90ffd472c9"
+      }
+    ],
+    "air": {
+      "changed": false,
+      "lastVerifiedCommit": "955bf43358c0d600028295f5466275cbae9e4714",
+      "lastVerificationReceipt": "tailos-2026-09-08-audit.json",
+      "currentReadOnlyCheck": "SSH timed out before any command or transfer; not an A1 release target"
+    }
+  },
+  "hostCLIs": {
+    "changed": false,
+    "miniVerifiedSha256": "0b82422547a0d386d6b1c212e28419888d2036437d434bddff8ea87b4f56abb2",
+    "airLastVerifiedSha256": "0b82422547a0d386d6b1c212e28419888d2036437d434bddff8ea87b4f56abb2"
+  },
+  "verification": [
+    {
+      "by": "api",
+      "boardMessages": [
+        473,
+        475
+      ],
+      "commands": [
+        "cd hub && go test -count=1 ./...",
+        "cd hub && go vet ./...",
+        "cd hub && go test -race -count=1 ./internal/store ./internal/server"
+      ],
+      "result": "PASS"
+    },
+    {
+      "by": "cache-qa",
+      "boardMessage": 469,
+      "commands": [
+        "cd hub && go test ./internal/server -run ^TestMessageAuditAcceptance -count=1 -v",
+        "cd hub && go test -race ./internal/server -run ^TestMessageAuditAcceptance -count=1"
+      ],
+      "result": "PASS: 7 HTTP scenarios, 14 invalid-reference subcases; concurrency, lost response, caller scope, lifecycle/reopen and cross-project dispatch"
+    },
+    {
+      "by": "lead",
+      "boardMessage": 480,
+      "commands": [
+        "npm test",
+        "node tests/project-work-items-browser.mjs",
+        "git diff --check"
+      ],
+      "result": "PASS: 101 JS tests; Chromium and WebKit real isolated hub CRUD/scopes/retries/dispatch/closure/handler recovery; clean diff"
+    },
+    {
+      "by": "lead",
+      "boardMessage": 484,
+      "artifact": "/tmp/tailterm-a1-rollback-check.py",
+      "result": "PASS after correcting harness message-list envelope: pre-A1 662ed72 binary reads/writes migrated synthetic DB; A1 re-upgrade retains original typed receipt and new legacy message; integrity/FKs valid"
+    },
+    {
+      "by": "lead",
+      "result": "Production checks read only: middleware RUNNING, mounted binary exact SHA256, additive tables/indexes, SQLite integrity/FKs, authenticated identity200 and malformed receipt route400. No live work-item content read or synthetic production record created."
+    }
+  ],
+  "rollback": {
+    "binary": "/mnt/deepfreeze/tailterm-hub/releases/20260908-project-work-items-86551cdc901e/tailterm-hub",
+    "retainAdditiveAuditTables": true,
+    "backupRestore": "Explicit disaster recovery only; restoring a snapshot loses later writes",
+    "limitation": "Observe mode permits old clients/binary to write unlinked messages"
+  },
+  "remainingScope": "Parent roadmap remains in_progress; A2/B1/B2/C1/E1/E2 require separate work orders. No UI/CLI posting flags, strict enforcement, correction APIs, typed order tables or AIV adapter shipped.",
+  "operationalChanges": "TrueNAS middleware updated existing hub app/TCP listener. No frontend, CLI, relay, Tailscale/network or live-task lifecycle changes."
+}

@@ -260,7 +260,8 @@ inspection and document/link consistency, not a claim that proposed behavior was
 tested. No product files were edited and no runtime/deployment action occurred.
 Planning acceptance and owner decisions are recorded in #442/#445/#454. A1 source
 and verification were accepted by lead in #480; see the
-[implemented contract and evidence](message-audit.md). Deployment remains a
-separately recorded release order. Later slices still require their own work orders. Return
+[implemented contract and evidence](message-audit.md). The hub-only deployment
+ran under release order #483; its [receipt](releases/tailos-2026-09-08-message-audit.json)
+records exact versions and checks. Later slices still require their own work orders. Return
 results and changes through db-handler; preserve the roadmap feature rather than
 marking it complete after the plan or A1 alone.
