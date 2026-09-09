@@ -13,7 +13,7 @@
     "build:static": "vite build --mode static && node scripts/package-static.mjs",
     "deploy:static": "node scripts/deploy-static.mjs",
     "verify:release": "node scripts/verify-release.mjs",
-    "preview:static": "vite preview --outDir dist-static --host 127.0.0.1 --port 4318",
+    "preview:static": "node scripts/preview-static.mjs dist-static 127.0.0.1 4318",
     "test:static": "node tests/static-browser.mjs",
     "export:vault": "node scripts/export-server-vault.mjs",
     "test:links": "node tests/terminal-links-browser.mjs",
