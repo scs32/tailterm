@@ -4,6 +4,7 @@ import { agentToolsCommand } from "../shared/tmux-command.js";
 import { modelPickerHTML, wireModelPicker } from "./model-picker.js";
 import { teamLaunches } from "./teams.js";
 import { withDatabaseHandler } from "./project-handler.js";
+import { prepareWorkItemContext } from "./work-item-context.js";
 // Project hub controller: owns the hub client, per-task event feeds, the mirror
 // loop that keeps a project tab's panes in step with the hub's agent list, and
 // the project dialogs reachable from the command palette.
@@ -42,7 +43,9 @@ export function createTaskHub(host) {
   // host: {getIPN, getData, api, getTabs, getServers, currentTab, currentServer,
   //   connect, closeTab, activate, paneGroups, dialog, closeDialog, notice,
   //   browserCommand, render, scheduleWorkspaceSave, bookmark}
-  let client = null, viewClient = null, connected = false;
+  let client = null,
+    viewClient = null,
+    connected = false;
   const feeds = new Map(); // taskId -> {stop, agents, task, unknown, cursor}
   const hidden = new Set();
   const bound = new Set(); // task ids mirrored into tabs
@@ -91,21 +94,29 @@ export function createTaskHub(host) {
     }
     if (
       client?.base !== url ||
-      client?.token !== (host.getData()?.hub?.token || "") || resetCache
+      client?.token !== (host.getData()?.hub?.token || "") ||
+      resetCache
     ) {
       stopAll();
       viewClient?.dispose?.();
       client = createHubClient({
         fetchImpl: (u, init) => {
           const network = host.getIPN();
-          if (!network) throw new Error("Offline. Connect Tailscale to update the project hub.");
+          if (!network)
+            throw new Error(
+              "Offline. Connect Tailscale to update the project hub.",
+            );
           return network.fetch(u, init);
         },
         baseURL: url,
         token: host.getData()?.hub?.token || "",
       });
       viewClient = host.createReadCache
-        ? createCachedHubClient({ client, cache: host.createReadCache(), online: () => !!host.getIPN() })
+        ? createCachedHubClient({
+            client,
+            cache: host.createReadCache(),
+            online: () => !!host.getIPN(),
+          })
         : client;
       host.onClientChange?.();
     }
@@ -258,12 +269,14 @@ export function createTaskHub(host) {
   }
   async function doReconcile(feed) {
     if (feed.stopped) return;
-    host.paneGroups()?.model.setTaskMembers?.(
-      feed.taskId,
-      feed.task?.status === "closed"
-        ? []
-        : feed.agents.filter(openAgent).map((agent) => agent.id),
-    );
+    host
+      .paneGroups()
+      ?.model.setTaskMembers?.(
+        feed.taskId,
+        feed.task?.status === "closed"
+          ? []
+          : feed.agents.filter(openAgent).map((agent) => agent.id),
+      );
     const syncLayout = () => {
       const groups = host.paneGroups();
       const orchestrator = feed.agents.find(
@@ -655,6 +668,13 @@ export function createTaskHub(host) {
       agentId: fields.agentId,
       expectedRunId: fields.expectedRunId,
       plannedTeamMembers: fields.plannedTeamMembers,
+      workItemTaskId: fields.workItemTaskId,
+      workItemId: fields.workItemId,
+      workItemRevision: fields.workItemRevision,
+      workOrderTaskId: fields.workOrderTaskId,
+      workOrderMessageSeq: fields.workOrderMessageSeq,
+      replacesAgentId: fields.replacesAgentId,
+      workContextBundle: fields.workContextBundle,
     });
     const out = await host.browserCommand(server, command, 65536);
     let agent;
@@ -1203,12 +1223,14 @@ export function createTaskHub(host) {
       const tasks = (await loadTasks()).filter((t) => t.status === "open");
       host.dialog(
         `Add team · ${team.name}`,
-        `<form id="team-launch-form"><label>Project<select id="team-task">${tasks.map((t) => `<option value="${esc(t.id)}">${esc(t.name)}</option>`).join("")}</select></label>${team.members.some((m) => !m.serverId) ? `<label>Main machine<select id="team-main-server">${serverOptions(mainServer?.id)}</select></label>` : ""}<p class="fine">${team.members.map((m) => esc(m.name) + " · " + esc(m.serverId ? host.getServers().find((s) => s.id === m.serverId)?.name || "Missing machine" : "Main machine")).join("<br>")}</p>${team.swarm ? '<p class="fine">Starting this swarm enables broadcast for every agent on the selected project, including its existing agents.</p>' : ""}<p class="fine">An existing project keeps its main orchestrator; new members introduce themselves to that leader.</p><div id="team-project-folders"></div><p id="team-launch-status" class="fine" role="status">${tasks.length ? "" : "Create a project first."}</p><div class="dialog-actions"><button type="submit" class="primary" ${tasks.length ? "" : "disabled"}>Start team</button></div></form>`,
+        `<form id="team-launch-form"><label>Project<select id="team-task">${tasks.map((t) => `<option value="${esc(t.id)}">${esc(t.name)}</option>`).join("")}</select></label><label>Bug or feature<select id="team-work-item"></select></label><label>Work-order Board message<input id="team-work-order" type="number" min="1" step="1" placeholder="Message number"></label>${team.members.some((m) => !m.serverId) ? `<label>Main machine<select id="team-main-server">${serverOptions(mainServer?.id)}</select></label>` : ""}<p class="fine">${team.members.map((m) => esc(m.name) + " · " + esc(m.serverId ? host.getServers().find((s) => s.id === m.serverId)?.name || "Missing machine" : "Main machine")).join("<br>")}</p>${team.swarm ? '<p class="fine">Starting this swarm enables broadcast for every agent on the selected project, including its existing agents.</p>' : ""}<p class="fine">Each new member gets a fresh item-scoped name, starts after existing Board history, and restores only the selected item’s durable linked context. The work-order message must be linked to that item. Existing sessions and results remain unchanged.</p><p class="fine">An existing project keeps its main orchestrator; new members introduce themselves to that leader.</p><div id="team-project-folders"></div><p id="team-launch-status" class="fine" role="status">${tasks.length ? "Loading work items…" : "Create a project first."}</p><div class="dialog-actions"><button type="submit" class="primary" disabled>Start team</button></div></form>`,
       );
       const form = document.querySelector("#team-launch-form"),
         selector = form.querySelector("#team-task"),
+        itemSelector = form.querySelector("#team-work-item"),
         button = form.querySelector('button[type="submit"]'),
         status = form.querySelector("#team-launch-status");
+      let items = [];
       const progress = new Set();
       const projects = teamProjectFolders(
         form.querySelector("#team-project-folders"),
@@ -1216,6 +1238,38 @@ export function createTaskHub(host) {
         () => form.querySelector("#team-main-server")?.value || mainServer?.id,
       );
       projects.render();
+      const loadItems = async () => {
+        button.disabled = true;
+        itemSelector.disabled = true;
+        status.textContent = tasks.length
+          ? "Loading work items…"
+          : "Create a project first.";
+        items = [];
+        itemSelector.replaceChildren();
+        if (!selector.value) return;
+        try {
+          const result = await client.listWorkItems({ task: selector.value });
+          items = (result.items || []).filter(
+            (item) => !["done", "dismissed"].includes(item.status),
+          );
+          itemSelector.innerHTML = items
+            .map(
+              (item) =>
+                `<option value="${esc(item.id)}">${esc(item.kind === "bug" ? "Bug" : "Feature")} · ${esc(item.title)} · r${item.revision}</option>`,
+            )
+            .join("");
+          status.textContent = items.length
+            ? ""
+            : "This project has no active bug or feature to bind the team to.";
+          button.disabled = !items.length;
+        } catch (error) {
+          status.textContent = formatError(error);
+        } finally {
+          itemSelector.disabled = !items.length;
+        }
+      };
+      selector.onchange = loadItems;
+      await loadItems();
       if (form.querySelector("#team-main-server"))
         form.querySelector("#team-main-server").onchange = projects.render;
       form.onsubmit = async (e) => {
@@ -1225,11 +1279,42 @@ export function createTaskHub(host) {
         selector.disabled = true;
         const id = selector.value;
         try {
+          const item = items.find(
+            (candidate) => candidate.id === itemSelector.value,
+          );
+          const workOrderMessageSeq = Number(
+            form.querySelector("#team-work-order").value,
+          );
+          if (
+            !item ||
+            !Number.isSafeInteger(workOrderMessageSeq) ||
+            workOrderMessageSeq < 1
+          )
+            throw new Error(
+              "Choose an active bug or feature and enter its recorded work-order Board message number.",
+            );
+          const routing = {
+            workItemTaskId: item.taskId,
+            workItemId: item.id,
+            workItemRevision: item.revision,
+            workOrderTaskId: item.taskId,
+            workOrderMessageSeq,
+          };
+          routing.workContextBundle = await prepareWorkItemContext(client, {
+            itemTaskId: item.taskId,
+            itemId: item.id,
+            itemRevision: item.revision,
+            workOrderMessage: {
+              taskId: item.taskId,
+              seq: workOrderMessageSeq,
+            },
+          });
           plan = teamLaunches(
             team,
             host.getServers(),
             form.querySelector("#team-main-server")?.value || mainServer?.id,
             projects.read(),
+            routing,
           );
           const mainChoice = form.querySelector("#team-main-server");
           if (mainChoice) mainChoice.disabled = true;
@@ -1590,7 +1675,10 @@ export function createTaskHub(host) {
     hidden: () => [...hidden],
     client: () => client,
     viewClient: () => viewClient,
-    dispose() { stopAll(); viewClient?.dispose?.(); },
+    dispose() {
+      stopAll();
+      viewClient?.dispose?.();
+    },
     refresh,
     ready,
     sync,

@@ -601,7 +601,57 @@ try {
       const target = (await getTasks()).find(
         (t) => t.name === name + " mobile task",
       );
+      const targetBefore = await (
+        await fetch("http://127.0.0.1:" + port + "/v1/tasks/" + target.id)
+      ).json();
+      const targetLead = targetBefore.agents.find((agent) => !agent.role);
+      const routedItem = await (
+        await fetch(
+          `http://127.0.0.1:${port}/v1/tasks/${target.id}/work-items`,
+          {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({
+              kind: "bug",
+              title: "Synthetic routed browser item " + name,
+              description: "Restore this item and no other browser history.",
+              agentId: targetLead.id,
+              requestId: "browser-route-item-" + name,
+            }),
+          },
+        )
+      ).json();
+      const routedOrder = await (
+        await fetch(`http://127.0.0.1:${port}/v1/tasks/${target.id}/messages`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            text: "Synthetic bounded browser work order",
+            agentId: targetLead.id,
+            requestId: "browser-route-order-" + name,
+            workItems: [
+              {
+                itemTaskId: target.id,
+                itemId: routedItem.id,
+                itemRevision: routedItem.revision,
+                relationship: "primary",
+              },
+            ],
+          }),
+        })
+      ).json();
+      const unrelatedRouteMessage = await (
+        await fetch(`http://127.0.0.1:${port}/v1/tasks/${target.id}/messages`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ text: "UNRELATED BROWSER ROUTING HISTORY" }),
+        })
+      ).json();
       await page.locator("#team-task").selectOption(target.id);
+      await page
+        .locator("#team-work-item")
+        .selectOption({ value: routedItem.id });
+      await page.locator("#team-work-order").fill(String(routedOrder.seq));
       await page.locator("#team-main-server").selectOption("local");
       await page.locator('[data-project-server="local"]').fill(root);
       await page.locator('#team-launch-form button[type="submit"]').click();
@@ -613,6 +663,38 @@ try {
         attached.agents.length,
         4,
         "existing project keeps its orchestrator and handler when a team joins",
+      );
+      const routedAgents = attached.agents.filter(
+        (agent) => agent.workItem?.itemId === routedItem.id,
+      );
+      assert.equal(routedAgents.length, 2);
+      assert.ok(
+        routedAgents.every(
+          (agent) =>
+            agent.parentAgentId === "" &&
+            agent.readUpTo === unrelatedRouteMessage.seq &&
+            agent.name.endsWith("-" + routedItem.id.slice(-8)),
+        ),
+        JSON.stringify(routedAgents),
+      );
+      const restoredContext = await (
+        await fetch(
+          `http://127.0.0.1:${port}/v1/tasks/${target.id}/agents/${routedAgents[0].id}/work-context?runId=${routedAgents[0].runId}`,
+        )
+      ).json();
+      assert.deepEqual(
+        restoredContext.messages.map((message) => message.text),
+        ["Synthetic bounded browser work order"],
+      );
+      assert.ok(
+        launchCommands
+          .slice(-2)
+          .every(
+            (command) =>
+              command.includes("--work-item") &&
+              command.includes(routedItem.id) &&
+              command.includes("--work-order-message"),
+          ),
       );
       await page.evaluate(() => qa.modes.set("teams"));
       await page.locator("[data-edit-team]").click();

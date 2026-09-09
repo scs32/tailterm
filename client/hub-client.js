@@ -41,9 +41,14 @@ export function createHubClient({ fetchImpl, baseURL, token = "" }) {
         res.status,
         data?.error || res.statusText || "hub error",
       );
-    if (method !== "GET") for (const listener of mutationListeners) {
-      try { listener(); } catch { /* A view cannot undo a confirmed write. */ }
-    }
+    if (method !== "GET")
+      for (const listener of mutationListeners) {
+        try {
+          listener();
+        } catch {
+          /* A view cannot undo a confirmed write. */
+        }
+      }
     return data;
   }
   const q = (params) => {
@@ -70,6 +75,14 @@ export function createHubClient({ fetchImpl, baseURL, token = "" }) {
     closeTask: (id) => request(`/v1/tasks/${id}`, { method: "DELETE" }),
     listWorkItems: (params = {}) => request("/v1/work-items" + q(params)),
     getWorkItem: (task, id) => request(`/v1/tasks/${task}/work-items/${id}`),
+    listWorkItemRevisions: (task, id, params = {}) =>
+      request(`/v1/tasks/${task}/work-items/${id}/revisions` + q(params)),
+    getWorkItemRevision: (task, id, revision) =>
+      request(`/v1/tasks/${task}/work-items/${id}/revisions/${revision}`),
+    listWorkItemHistoryGaps: (task, id, params = {}) =>
+      request(`/v1/tasks/${task}/work-items/${id}/history-gaps` + q(params)),
+    listWorkItemMessages: (task, id, params = {}) =>
+      request(`/v1/tasks/${task}/work-items/${id}/messages` + q(params)),
     createWorkItem: (task, body) =>
       request(`/v1/tasks/${task}/work-items`, { method: "POST", body }),
     updateWorkItem: (task, id, body) =>
@@ -102,6 +115,8 @@ export function createHubClient({ fetchImpl, baseURL, token = "" }) {
     listAgents: async (task) =>
       (await request(`/v1/tasks/${task}/agents`)).agents,
     getAgent: (task, agent) => request(`/v1/tasks/${task}/agents/${agent}`),
+    getAgentWorkContext: (task, agent, runId) =>
+      request(`/v1/tasks/${task}/agents/${agent}/work-context` + q({ runId })),
     updateAgent: (task, agent, body) =>
       request(`/v1/tasks/${task}/agents/${agent}`, { method: "PATCH", body }),
     closeAgent: (task, agent) =>

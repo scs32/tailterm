@@ -5,6 +5,7 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -39,6 +40,7 @@ Commands
   post <text> [--to AGENT]     post a message to the task or one agent
   ask --request-id KEY --file PATH [--json]  request an owner decision on the Board
   inbox [--unread] [--mark-read] [--json]
+  context [--json]             print this exact run's bound work-item context
   spawn --name N --run CMD [--cwd D] [--prompt P] [--runtime R] [--task ID]
                                start a sibling agent session on this host
   retire [AGENT]              disable inbox wake-ups; preserve terminal and results
@@ -135,6 +137,8 @@ func main() {
 		err = cmdAsk(e, args)
 	case "inbox":
 		err = cmdInbox(e, args)
+	case "context":
+		err = cmdContext(e, args)
 	case "spawn":
 		err = cmdSpawn(e, args)
 	case "retire", "resume":
@@ -332,6 +336,12 @@ func cmdPost(e env, args []string) error {
 	to := fs.String("to", "", "agent id or name")
 	reply := fs.Int64("reply-to", 0, "message sequence being answered")
 	task := fs.String("task", e.task, "task id")
+	requestID := fs.String("request-id", "", "stable retry identity for a linked item message")
+	workItemTask := fs.String("work-item-task", "", "project owning the linked item (default: --task)")
+	workItemID := fs.String("work-item", "", "bug or feature linked to this message")
+	workItemRevision := fs.Int64("work-item-revision", 0, "exact linked item revision")
+	workOrderTask := fs.String("work-order-task", "", "project containing the work-order message")
+	workOrderMessage := fs.Int64("work-order-message", 0, "recorded work-order message sequence")
 	if err := fs.Parse(postArgs(args)); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return nil
@@ -359,7 +369,37 @@ func cmdPost(e env, args []string) error {
 	if err != nil {
 		return fmt.Errorf("%w; --to accepts agents only. To reply to a human, use tt post --reply-to SEQ \"message\" without --to (shared board reply)", err)
 	}
-	m, err := c.PostMessage(ctx, *task, api.PostMessageRequest{Text: text, To: target, AgentID: e.agent, ReplyTo: *reply})
+	req := api.PostMessageRequest{Text: text, To: target, AgentID: e.agent, ReplyTo: *reply}
+	if e.agent != "" && os.Getenv("TAILTERM_WORK_ITEM") != "" {
+		self, selfErr := c.GetAgent(ctx, *task, e.agent)
+		if selfErr != nil {
+			return selfErr
+		}
+		if self.WorkItem != nil && *workItemID == "" {
+			*workItemTask, *workItemID, *workItemRevision = self.WorkItem.ItemTaskID, self.WorkItem.ItemID, self.WorkItem.ItemRevision
+			*workOrderTask, *workOrderMessage = self.WorkItem.WorkOrderMessage.TaskID, self.WorkItem.WorkOrderMessage.Seq
+			if *requestID == "" {
+				digest := sha256.Sum256([]byte(e.runID + "\x00" + target + "\x00" + fmt.Sprint(*reply) + "\x00" + text))
+				*requestID = fmt.Sprintf("item-post-%x", digest[:12])
+			}
+		}
+	}
+	linked := *workItemID != "" || *workItemTask != "" || *workItemRevision != 0 || *workOrderTask != "" || *workOrderMessage != 0 || *requestID != ""
+	if linked {
+		if *workItemTask == "" {
+			*workItemTask = *task
+		}
+		if *workOrderTask == "" {
+			*workOrderTask = *workItemTask
+		}
+		if !api.ValidID(*workItemTask, "tsk") || !api.ValidID(*workItemID, "wi") || *workItemRevision < 1 || !api.ValidID(*workOrderTask, "tsk") || *workOrderMessage < 1 || *requestID == "" {
+			return errors.New("linked post requires --request-id, --work-item, --work-item-revision and --work-order-message")
+		}
+		req.RequestID = *requestID
+		req.WorkItems = []api.MessageWorkItem{{ItemTaskID: *workItemTask, ItemID: *workItemID, ItemRevision: *workItemRevision, Relationship: "primary"}}
+		req.WorkOrderMessage = &api.MessageReference{TaskID: *workOrderTask, Seq: *workOrderMessage}
+	}
+	m, err := c.PostMessage(ctx, *task, req)
 	if err != nil {
 		return err
 	}
@@ -478,6 +518,14 @@ func cmdSpawn(e env, args []string) error {
 	name := fs.String("name", "", "agent name (required)")
 	agentID := fs.String("agent-id", "", "stable agent identity for database_handler launch/retry")
 	expectedRunID := fs.String("expected-run-id", "", "exited database_handler run to restart")
+	workItemTask := fs.String("work-item-task", "", "project owning the bound bug or feature (default: --task)")
+	workItemID := fs.String("work-item", "", "single bug or feature bound to this new session")
+	workItemRevision := fs.Int64("work-item-revision", 0, "exact work-item revision to restore")
+	workOrderTask := fs.String("work-order-task", "", "project containing the recorded work-order message (default: work-item project)")
+	workOrderMessage := fs.Int64("work-order-message", 0, "recorded bounded work-order message sequence")
+	replacesAgent := fs.String("replaces-agent", "", "prior item-bound agent preserved by this new session")
+	workContextFile := fs.String("work-context-file", "", "handler-prepared item context JSON file")
+	workContextJSON := fs.String("work-context-json", "", "handler/authorized-launch-prepared item context JSON")
 	role := fs.String("role", "", "project role (database_handler)")
 	plannedTeamMembers := fs.Int("planned-team-members", 0, "planned non-database team members for this launch (1-32)")
 	run := fs.String("run", "", "command to run in the agent window (required)")
@@ -509,11 +557,37 @@ func cmdSpawn(e env, args []string) error {
 	if *plannedTeamMembers < 0 || *plannedTeamMembers > 32 {
 		return errors.New("planned team members must be from 1 to 32 when set")
 	}
+	itemFlagCount := 0
+	for _, set := range []bool{*workItemID != "", *workItemTask != "", *workItemRevision != 0, *workOrderTask != "", *workOrderMessage != 0, *replacesAgent != "", *workContextFile != "", *workContextJSON != ""} {
+		if set {
+			itemFlagCount++
+		}
+	}
+	if itemFlagCount > 0 {
+		if *role != "" || *workItemID == "" || *workItemRevision < 1 || *workOrderMessage < 1 || (*workContextFile == "") == (*workContextJSON == "") {
+			return errors.New("item routing requires --work-item, --work-item-revision, --work-order-message and exactly one prepared --work-context-file/--work-context-json on an ordinary agent")
+		}
+		if *runtime == "generic" {
+			return errors.New("item context restoration requires a supported agent runtime")
+		}
+		if *workItemTask == "" {
+			*workItemTask = *task
+		}
+		if *workOrderTask == "" {
+			*workOrderTask = *workItemTask
+		}
+		if !api.ValidID(*workItemTask, "tsk") || !api.ValidID(*workItemID, "wi") || !api.ValidID(*workOrderTask, "tsk") || (*replacesAgent != "" && !api.ValidID(*replacesAgent, "agt")) {
+			return errors.New("invalid work-item routing identity")
+		}
+	}
 	if *task == "" || *hub == "" {
 		return errors.New("task and hub are required (TAILTERM_TASK/TAILTERM_HUB or --task/--hub)")
 	}
 	if *runtime == "" {
 		*runtime = strings.Fields(*run)[0]
+	}
+	if itemFlagCount > 0 && *runtime == "generic" {
+		return errors.New("item context restoration requires a supported agent runtime")
 	}
 	// Helpers inherit an explicit policy only when using the same app.
 	explicitMode, explicitTools := false, false
@@ -602,6 +676,25 @@ func cmdSpawn(e env, args []string) error {
 		Name: *name, Host: spawn.Host(), Session: session,
 		Runtime: *runtime, Cwd: *cwd, ParentAgentID: parent,
 	}
+	if itemFlagCount > 0 {
+		contextData := []byte(*workContextJSON)
+		if *workContextFile != "" {
+			var readErr error
+			contextData, readErr = os.ReadFile(*workContextFile)
+			if readErr != nil {
+				return fmt.Errorf("read prepared work-item context: %w", readErr)
+			}
+		}
+		if !json.Valid(contextData) {
+			return errors.New("prepared work-item context is not valid JSON")
+		}
+		req.WorkItem = &api.AgentWorkItemRequest{
+			ItemTaskID: *workItemTask, ItemID: *workItemID, ItemRevision: *workItemRevision,
+			WorkOrderMessage: api.MessageReference{TaskID: *workOrderTask, Seq: *workOrderMessage},
+			ReplacesAgentID:  *replacesAgent,
+			ContextBundle:    append(json.RawMessage(nil), contextData...),
+		}
+	}
 	opts := spawn.Options{
 		Session: session, Cwd: *cwd, Command: command, Self: selfPath(),
 		Env: map[string]string{
@@ -620,6 +713,24 @@ func cmdSpawn(e env, args []string) error {
 		agent, err = c.AddAgent(ctx, *task, req)
 		if err != nil {
 			return fmt.Errorf("register agent: %w", err)
+		}
+		if agent.WorkItem != nil {
+			workContext, contextErr := c.GetAgentWorkItemContext(ctx, *task, agent.ID, agent.RunID)
+			if contextErr != nil {
+				_, _ = c.CloseAgent(ctx, *task, agent.ID)
+				return fmt.Errorf("restore work-item context: %w", contextErr)
+			}
+			contextBriefing, contextErr := formatWorkItemContext(workContext)
+			if contextErr != nil {
+				_, _ = c.CloseAgent(ctx, *task, agent.ID)
+				return contextErr
+			}
+			briefing += contextBriefing
+			opts.Command = baseCommand + " " + spawn.ShellQuote(briefing)
+			opts.Env["TAILTERM_BRIEFING"] = briefing
+			opts.Env["TAILTERM_WORK_ITEM_TASK"] = agent.WorkItem.ItemTaskID
+			opts.Env["TAILTERM_WORK_ITEM"] = agent.WorkItem.ItemID
+			opts.Env["TAILTERM_WORK_ITEM_REVISION"] = fmt.Sprint(agent.WorkItem.ItemRevision)
 		}
 		opts.Env[spawn.EnvAgent], opts.Env[spawn.EnvAgentName], opts.Env[spawn.EnvSession], opts.Env["TAILTERM_RUN"] = agent.ID, agent.Name, session, agent.RunID
 		delete(opts.Env, "TAILTERM_HANDLER_COMMAND")

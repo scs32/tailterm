@@ -1,6 +1,11 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { normalizeTeam, savedTeams, teamLaunches } from "../client/teams.js";
+import {
+  itemScopedAgentName,
+  normalizeTeam,
+  savedTeams,
+  teamLaunches,
+} from "../client/teams.js";
 const member = {
   name: "planner",
   serverId: "host",
@@ -126,4 +131,62 @@ test("project folders are scoped to each launch machine and preserve explicit me
     ["/local/project with spaces", "/remote/project", "/fixed/review"],
   );
   assert.equal(normalizeTeam(team).members[0].cwd, "");
+});
+
+test("reusable team launches receive deterministic one-item session identities", () => {
+  const team = normalizeTeam({
+    name: "Reusable",
+    members: [member, { ...member, name: "reviewer", role: "Review" }],
+  });
+  const routing = {
+    workItemTaskId: "tsk_0123456789abcdef",
+    workItemId: "wi_abcdef0123456789",
+    workItemRevision: 4,
+    workOrderTaskId: "tsk_0123456789abcdef",
+    workOrderMessageSeq: 814,
+    workContextBundle: {
+      version: 1,
+      itemTaskId: "tsk_0123456789abcdef",
+      itemId: "wi_abcdef0123456789",
+      itemRevision: 4,
+      workOrderMessage: { taskId: "tsk_0123456789abcdef", seq: 814 },
+      history: { coverage: { complete: true } },
+    },
+  };
+  const first = teamLaunches(
+    team,
+    [{ id: "host" }],
+    "host",
+    undefined,
+    routing,
+  );
+  const retry = teamLaunches(
+    team,
+    [{ id: "host" }],
+    "host",
+    undefined,
+    routing,
+  );
+  assert.deepEqual(
+    first,
+    retry,
+    "partial retry must keep exact scoped names and routing",
+  );
+  assert.deepEqual(
+    first.map((launch) => launch.fields.name),
+    ["planner-23456789", "reviewer-23456789"],
+  );
+  assert.deepEqual(first[0].fields.workItemId, routing.workItemId);
+  assert.equal(
+    itemScopedAgentName("a".repeat(64), routing.workItemId).length,
+    64,
+  );
+  assert.throws(
+    () =>
+      teamLaunches(team, [{ id: "host" }], "host", undefined, {
+        ...routing,
+        workOrderMessageSeq: 0,
+      }),
+    /work-order/,
+  );
 });

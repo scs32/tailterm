@@ -1,6 +1,16 @@
 import { AGENT_NAME_RE } from "./task-ref.js";
 import { agentSpawnCommand } from "../shared/tmux-command.js";
 export const MAX_TEAM_MEMBERS = 32;
+export function itemScopedAgentName(name, itemId) {
+  if (!AGENT_NAME_RE.test(name) || !/^wi_[0-9a-f]{16}$/.test(itemId))
+    throw new Error("Invalid item-scoped agent identity.");
+  const suffix = itemId.slice(-8);
+  if (name.length + suffix.length + 1 <= 64) return `${name}-${suffix}`;
+  let hash = 2166136261;
+  for (const char of name)
+    hash = Math.imul(hash ^ char.codePointAt(0), 16777619) >>> 0;
+  return `${name.slice(0, 46)}-${hash.toString(16).padStart(8, "0")}-${suffix}`;
+}
 export function normalizeTeam(value) {
   if (
     !value ||
@@ -127,6 +137,7 @@ export function teamLaunches(
   servers,
   mainServerId = servers[0]?.id,
   projectFolders,
+  itemRouting = null,
 ) {
   const normalized = normalizeTeam(team);
   const ordered = [...normalized.members].sort(
@@ -134,6 +145,20 @@ export function teamLaunches(
       Number(b.name === normalized.orchestrator) -
       Number(a.name === normalized.orchestrator),
   );
+  if (
+    itemRouting &&
+    (!/^tsk_[0-9a-f]{16}$/.test(itemRouting.workItemTaskId) ||
+      !/^wi_[0-9a-f]{16}$/.test(itemRouting.workItemId) ||
+      !Number.isSafeInteger(itemRouting.workItemRevision) ||
+      itemRouting.workItemRevision < 1 ||
+      !/^tsk_[0-9a-f]{16}$/.test(itemRouting.workOrderTaskId) ||
+      !Number.isSafeInteger(itemRouting.workOrderMessageSeq) ||
+      itemRouting.workOrderMessageSeq < 1 ||
+      !itemRouting.workContextBundle)
+  )
+    throw new Error(
+      "Choose a recorded work item and bounded work-order message.",
+    );
   return ordered.map((member) => {
     const server = servers.find(
       (s) => s.id === (member.serverId || mainServerId),
@@ -160,6 +185,10 @@ export function teamLaunches(
       server,
       fields: {
         ...member,
+        ...(itemRouting || {}),
+        name: itemRouting
+          ? itemScopedAgentName(member.name, itemRouting.workItemId)
+          : member.name,
         cwd,
         prompt: [member.role && "Role: " + member.role, member.prompt]
           .filter(Boolean)

@@ -123,6 +123,14 @@ func (c *Client) GetAgent(ctx context.Context, task, agent string) (Agent, error
 	return out, c.do(ctx, "GET", "/v1/tasks/"+task+"/agents/"+agent, nil, &out)
 }
 
+func (c *Client) GetAgentWorkItemContext(ctx context.Context, task, agent, runID string) (AgentWorkItemContext, error) {
+	var out AgentWorkItemContext
+	q := url.Values{}
+	q.Set("runId", runID)
+	err := c.do(ctx, "GET", "/v1/tasks/"+task+"/agents/"+agent+"/work-context?"+q.Encode(), nil, &out)
+	return out, err
+}
+
 func (c *Client) ListAgents(ctx context.Context, task string) ([]Agent, error) {
 	var out AgentList
 	return out.Agents, c.do(ctx, "GET", "/v1/tasks/"+task+"/agents", nil, &out)

@@ -337,6 +337,9 @@ func (s *Store) AddAgent(ctx context.Context, taskID string, req api.AddAgentReq
 	if req.Role == api.AgentRoleDatabaseHandler && req.ParentAgentID != "" {
 		return api.Agent{}, api.ErrInvalid
 	}
+	if req.Role == api.AgentRoleDatabaseHandler && req.WorkItem != nil {
+		return api.Agent{}, api.ErrInvalid
+	}
 	if req.Role == api.AgentRoleDatabaseHandler && !api.ValidID(req.AgentID, "agt") {
 		return api.Agent{}, api.ErrInvalid
 	}
@@ -352,6 +355,10 @@ func (s *Store) AddAgent(ctx context.Context, taskID string, req api.AddAgentReq
 			return api.Agent{}, api.ErrAgentSpawnDisabled
 		}
 	}
+	contextThrough, err := validateAgentWorkItemRequest(s.db, ctx, taskID, req.WorkItem)
+	if err != nil {
+		return api.Agent{}, err
+	}
 	if req.AgentID != "" {
 		if !api.ValidID(req.AgentID, "agt") {
 			return api.Agent{}, api.ErrInvalid
@@ -359,6 +366,9 @@ func (s *Store) AddAgent(ctx context.Context, taskID string, req api.AddAgentReq
 		if existing, err := s.GetAgent(ctx, req.AgentID); err == nil {
 			if existing.TaskID != taskID {
 				return api.Agent{}, api.ErrInvalid
+			}
+			if existing.WorkItem != nil || (req.WorkItem != nil && req.Role == "") {
+				return api.Agent{}, fmt.Errorf("%w: item-bound agents require a fresh name and identity", api.ErrConflict)
 			}
 			if (existing.Role == api.AgentRoleDatabaseHandler || req.Role == api.AgentRoleDatabaseHandler) &&
 				(existing.Name != req.Name || existing.Host != req.Host || existing.Session != req.Session || existing.Runtime != req.Runtime || existing.Cwd != req.Cwd || existing.ParentAgentID != req.ParentAgentID || existing.Role != req.Role) {
@@ -437,6 +447,16 @@ func (s *Store) AddAgent(ctx context.Context, taskID string, req api.AddAgentReq
 		if req.Role == api.AgentRoleDatabaseHandler {
 			return api.Agent{}, fmt.Errorf("%w: database handler restart requires its stable agentId and expectedRunId", api.ErrConflict)
 		}
+		if req.WorkItem != nil {
+			return api.Agent{}, fmt.Errorf("%w: item-bound replacement requires a new agent name and identity", api.ErrConflict)
+		}
+		var priorBindings int
+		if err = s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM agent_work_item_bindings WHERE agent_id=?`, previousID).Scan(&priorBindings); err != nil {
+			return api.Agent{}, err
+		}
+		if priorBindings > 0 {
+			return api.Agent{}, fmt.Errorf("%w: item-bound agents cannot restart into an unscoped session; create a fresh replacement", api.ErrConflict)
+		}
 		if previous.Status != api.AgentExited || previous.Host != req.Host || previous.ParentAgentID != req.ParentAgentID || previous.Role != req.Role {
 			return api.Agent{}, api.ErrLimit
 		}
@@ -479,13 +499,34 @@ func (s *Store) AddAgent(ctx context.Context, taskID string, req api.AddAgentReq
 	if a.ID == "" {
 		a.ID = api.NewID("agt")
 	}
-	_, err = s.db.ExecContext(ctx, `INSERT INTO agents (`+agentCols+`) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return a, err
+	}
+	defer tx.Rollback()
+	_, err = tx.ExecContext(ctx, `INSERT INTO agents (`+agentCols+`) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		a.ID, a.TaskID, a.Name, a.Host, a.Session, a.Runtime, a.Cwd, a.ParentAgentID, a.Role, a.Status, a.Title, ts(now), ts(now), a.RunID, "", "", "", false, "")
 	if err != nil {
 		return a, err
 	}
-	_, err = s.addEvent(ctx, taskID, api.EventAgentAdded, a.ID, a.Name, map[string]any{"host": a.Host, "session": a.Session, "runtime": a.Runtime, "parentAgentId": a.ParentAgentID, "role": a.Role}, by)
-	return a, err
+	if a.WorkItem, err = insertAgentWorkItemBinding(ctx, tx, a, req.WorkItem, contextThrough); err != nil {
+		return a, err
+	}
+	if a.WorkItem != nil {
+		a.ReadUpTo = contextThrough
+	}
+	eventData := map[string]any{"host": a.Host, "session": a.Session, "runtime": a.Runtime, "parentAgentId": a.ParentAgentID, "role": a.Role, "runId": a.RunID}
+	if a.WorkItem != nil {
+		eventData["workItem"] = a.WorkItem
+	}
+	if _, err = s.insertEvent(ctx, tx, taskID, api.EventAgentAdded, a.ID, a.Name, eventData, by); err != nil {
+		return a, err
+	}
+	if err = tx.Commit(); err != nil {
+		return a, err
+	}
+	s.notify(taskID)
+	return a, nil
 }
 
 func (s *Store) GetAgent(ctx context.Context, id string) (api.Agent, error) {
@@ -494,6 +535,9 @@ func (s *Store) GetAgent(ctx context.Context, id string) (api.Agent, error) {
 		return a, api.ErrNotFound
 	}
 	if err != nil {
+		return a, err
+	}
+	if err = s.loadAgentWorkItem(ctx, &a); err != nil {
 		return a, err
 	}
 	if a.ReadUpTo, err = s.ReadCursor(ctx, a.TaskID, a.ID); err != nil {
@@ -521,6 +565,9 @@ func (s *Store) ListAgents(ctx context.Context, taskID string) ([]api.Agent, err
 		return nil, err
 	}
 	for i := range out {
+		if err = s.loadAgentWorkItem(ctx, &out[i]); err != nil {
+			return nil, err
+		}
 		if out[i].ReadUpTo, err = s.ReadCursor(ctx, taskID, out[i].ID); err != nil {
 			return nil, err
 		}
@@ -742,10 +789,29 @@ func (s *Store) ListMessages(ctx context.Context, taskID string, after int64, ag
 	if limit <= 0 || limit > api.MaxLimit {
 		limit = api.MaxLimit
 	}
+	var binding *api.AgentWorkItemBinding
+	if agentID != "" {
+		var runID, agentTaskID string
+		if err := s.db.QueryRowContext(ctx, `SELECT run_id,task_id FROM agents WHERE id=?`, agentID).Scan(&runID, &agentTaskID); err != nil || agentTaskID != taskID {
+			return nil, api.ErrInvalid
+		}
+		var err error
+		binding, err = loadAgentWorkItemBinding(s.db, ctx, agentID, runID)
+		if err != nil {
+			return nil, err
+		}
+	}
 	q := `SELECT ` + messageSelectCols + ` FROM messages m
-` + messageSelectJoins + `
+` + messageSelectJoins
+	args := []any{}
+	if binding != nil {
+		q += `
+JOIN message_work_item_links item_scope ON item_scope.message_seq=m.seq AND item_scope.item_task_id=? AND item_scope.item_id=?`
+		args = append(args, binding.ItemTaskID, binding.ItemID)
+	}
+	q += `
 WHERE m.task_id=? AND m.seq>?`
-	args := []any{taskID, after}
+	args = append(args, taskID, after)
 	if agentID != "" {
 		q += ` AND (broadcast=1 OR to_agent='' OR to_agent=?)`
 		args = append(args, agentID)
@@ -804,9 +870,24 @@ func (s *Store) Unread(ctx context.Context, taskID, agentID string) (int, error)
 	if err != nil {
 		return 0, err
 	}
+	var runID string
+	if err = s.db.QueryRowContext(ctx, `SELECT run_id FROM agents WHERE id=? AND task_id=?`, agentID, taskID).Scan(&runID); err != nil {
+		return 0, err
+	}
+	binding, err := loadAgentWorkItemBinding(s.db, ctx, agentID, runID)
+	if err != nil {
+		return 0, err
+	}
+	query := `SELECT COUNT(*) FROM messages m`
+	args := []any{}
+	if binding != nil {
+		query += ` JOIN message_work_item_links scope ON scope.message_seq=m.seq AND scope.item_task_id=? AND scope.item_id=?`
+		args = append(args, binding.ItemTaskID, binding.ItemID)
+	}
+	query += ` WHERE m.task_id=? AND m.seq>? AND m.from_agent<>? AND (m.broadcast=1 OR m.to_agent='' OR m.to_agent=?)`
+	args = append(args, taskID, cursor, agentID, agentID)
 	var n int
-	err = s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM messages WHERE task_id=? AND seq>? AND from_agent<>? AND (broadcast=1 OR to_agent='' OR to_agent=?)`,
-		taskID, cursor, agentID, agentID).Scan(&n)
+	err = s.db.QueryRowContext(ctx, query, args...).Scan(&n)
 	return n, err
 }
 

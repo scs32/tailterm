@@ -156,28 +156,29 @@ type Task struct {
 }
 
 type Agent struct {
-	Role          string    `json:"role,omitempty"`
-	CleanupDone   bool      `json:"cleanupDone"`
-	CleanupError  string    `json:"cleanupError,omitempty"`
-	BlockedReason string    `json:"blockedReason,omitempty"`
-	BlockedText   string    `json:"blockedText,omitempty"`
-	RunID         string    `json:"runId"`
-	LastSeenAt    time.Time `json:"lastSeenAt"`
-	Online        bool      `json:"online"`
-	ID            string    `json:"id"`
-	TaskID        string    `json:"taskId"`
-	Name          string    `json:"name"`
-	Host          string    `json:"host"`
-	Session       string    `json:"session"`
-	Runtime       string    `json:"runtime"`
-	Cwd           string    `json:"cwd"`
-	ParentAgentID string    `json:"parentAgentId,omitempty"`
-	Status        string    `json:"status"`
-	Title         string    `json:"title"`
-	CreatedAt     time.Time `json:"createdAt"`
-	LastEventAt   time.Time `json:"lastEventAt"`
-	Unread        int       `json:"unread"`
-	ReadUpTo      int64     `json:"readUpTo"`
+	WorkItem      *AgentWorkItemBinding `json:"workItem,omitempty"`
+	Role          string                `json:"role,omitempty"`
+	CleanupDone   bool                  `json:"cleanupDone"`
+	CleanupError  string                `json:"cleanupError,omitempty"`
+	BlockedReason string                `json:"blockedReason,omitempty"`
+	BlockedText   string                `json:"blockedText,omitempty"`
+	RunID         string                `json:"runId"`
+	LastSeenAt    time.Time             `json:"lastSeenAt"`
+	Online        bool                  `json:"online"`
+	ID            string                `json:"id"`
+	TaskID        string                `json:"taskId"`
+	Name          string                `json:"name"`
+	Host          string                `json:"host"`
+	Session       string                `json:"session"`
+	Runtime       string                `json:"runtime"`
+	Cwd           string                `json:"cwd"`
+	ParentAgentID string                `json:"parentAgentId,omitempty"`
+	Status        string                `json:"status"`
+	Title         string                `json:"title"`
+	CreatedAt     time.Time             `json:"createdAt"`
+	LastEventAt   time.Time             `json:"lastEventAt"`
+	Unread        int                   `json:"unread"`
+	ReadUpTo      int64                 `json:"readUpTo"`
 }
 
 type Sender struct {
@@ -235,15 +236,16 @@ type UpdateTaskRequest struct {
 }
 
 type AddAgentRequest struct {
-	ExpectedRunID string `json:"expectedRunId,omitempty"`
-	Role          string `json:"role,omitempty"`
-	AgentID       string `json:"agentId"`
-	Name          string `json:"name"`
-	Host          string `json:"host"`
-	Session       string `json:"session"`
-	Runtime       string `json:"runtime"`
-	Cwd           string `json:"cwd"`
-	ParentAgentID string `json:"parentAgentId"`
+	WorkItem      *AgentWorkItemRequest `json:"workItem,omitempty"`
+	ExpectedRunID string                `json:"expectedRunId,omitempty"`
+	Role          string                `json:"role,omitempty"`
+	AgentID       string                `json:"agentId"`
+	Name          string                `json:"name"`
+	Host          string                `json:"host"`
+	Session       string                `json:"session"`
+	Runtime       string                `json:"runtime"`
+	Cwd           string                `json:"cwd"`
+	ParentAgentID string                `json:"parentAgentId"`
 }
 
 type UpdateAgentRequest struct {
@@ -308,6 +310,7 @@ var (
 	ErrConflict           = errors.New("conflict")
 	ErrAgentSpawnLimit    = errors.New("maximum additional agents reached for this task")
 	ErrAgentSpawnDisabled = errors.New("agents cannot add agents to this task")
+	ErrContextLimit       = errors.New("work-item context exceeds the launch limit")
 	ErrLimit              = errors.New("limit reached")
 	ErrClosed             = errors.New("closed")
 )

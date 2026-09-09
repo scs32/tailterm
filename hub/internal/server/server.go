@@ -41,6 +41,7 @@ func New(st *store.Store, identity Identity) *Server {
 	m.HandleFunc("POST /v1/tasks/{id}/agents", s.addAgent)
 	m.HandleFunc("GET /v1/tasks/{id}/agents", s.listAgents)
 	m.HandleFunc("GET /v1/tasks/{id}/agents/{aid}", s.getAgent)
+	m.HandleFunc("GET /v1/tasks/{id}/agents/{aid}/work-context", s.getAgentWorkContext)
 	m.HandleFunc("PATCH /v1/tasks/{id}/agents/{aid}", s.updateAgent)
 	m.HandleFunc("DELETE /v1/tasks/{id}/agents/{aid}", s.closeAgent)
 	m.HandleFunc("POST /v1/tasks/{id}/agents/{aid}/cleanup", s.agentCleanup)
@@ -115,6 +116,8 @@ func fail(w http.ResponseWriter, err error) {
 		writeError(w, 409, err.Error())
 	case errors.Is(err, api.ErrAgentSpawnDisabled):
 		writeError(w, http.StatusForbidden, "Agents cannot add agents to this task. Ask the owner to enable Allow agents to add other agents in task settings.")
+	case errors.Is(err, api.ErrContextLimit):
+		writeError(w, http.StatusConflict, err.Error())
 	case errors.Is(err, store.ErrDecisionAnswerForbidden):
 		writeError(w, http.StatusForbidden, "only a human can answer a decision request")
 	case errors.Is(err, api.ErrInvalid):
@@ -325,6 +328,22 @@ func (s *Server) getAgent(w http.ResponseWriter, r *http.Request) {
 	if a, ok := s.agentInTask(w, r); ok {
 		writeJSON(w, 200, a)
 	}
+}
+
+func (s *Server) getAgentWorkContext(w http.ResponseWriter, r *http.Request) {
+	if _, ok := s.caller(w, r); !ok {
+		return
+	}
+	a, ok := s.agentInTask(w, r)
+	if !ok {
+		return
+	}
+	context, err := s.store.GetAgentWorkItemContext(r.Context(), a.TaskID, a.ID, r.URL.Query().Get("runId"))
+	if err != nil {
+		fail(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, context)
 }
 
 func (s *Server) updateAgent(w http.ResponseWriter, r *http.Request) {

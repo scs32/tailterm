@@ -159,6 +159,13 @@ export function agentSpawnCommand({
   agentId = "",
   expectedRunId = "",
   plannedTeamMembers = 0,
+  workItemTaskId = "",
+  workItemId = "",
+  workItemRevision = 0,
+  workOrderTaskId = "",
+  workOrderMessageSeq = 0,
+  replacesAgentId = "",
+  workContextBundle = null,
 }) {
   if (!/^https?:\/\/[A-Za-z0-9][A-Za-z0-9.:/_-]{0,199}$/.test(hub))
     throw new Error("Invalid hub URL.");
@@ -197,6 +204,41 @@ export function agentSpawnCommand({
       plannedTeamMembers > 32)
   )
     throw new Error("Invalid planned team member count.");
+  const hasWorkItemRouting =
+    workItemTaskId ||
+    workItemId ||
+    workItemRevision ||
+    workOrderTaskId ||
+    workOrderMessageSeq ||
+    replacesAgentId;
+  if (
+    hasWorkItemRouting &&
+    (!/^tsk_[0-9a-f]{16}$/.test(workItemTaskId) ||
+      !/^wi_[0-9a-f]{16}$/.test(workItemId) ||
+      !Number.isSafeInteger(workItemRevision) ||
+      workItemRevision < 1 ||
+      !/^tsk_[0-9a-f]{16}$/.test(workOrderTaskId) ||
+      !Number.isSafeInteger(workOrderMessageSeq) ||
+      workOrderMessageSeq < 1 ||
+      (replacesAgentId && !/^agt_[0-9a-f]{16}$/.test(replacesAgentId)) ||
+      agentRole ||
+      runtime === "generic")
+  )
+    throw new Error("Invalid work-item session routing.");
+  let workContextJSON = "";
+  if (hasWorkItemRouting) {
+    workContextJSON =
+      typeof workContextBundle === "string"
+        ? workContextBundle
+        : JSON.stringify(workContextBundle);
+    try {
+      if (!workContextJSON || workContextJSON.length > 131072)
+        throw new Error();
+      JSON.parse(workContextJSON);
+    } catch {
+      throw new Error("Invalid prepared work-item context.");
+    }
+  }
   const args = [
     "spawn",
     "--json",
@@ -215,6 +257,23 @@ export function agentSpawnCommand({
   if (expectedRunId) args.push("--expected-run-id", expectedRunId);
   if (plannedTeamMembers)
     args.push("--planned-team-members", String(plannedTeamMembers));
+  if (hasWorkItemRouting) {
+    args.push(
+      "--work-item-task",
+      workItemTaskId,
+      "--work-item",
+      workItemId,
+      "--work-item-revision",
+      String(workItemRevision),
+      "--work-order-task",
+      workOrderTaskId,
+      "--work-order-message",
+      String(workOrderMessageSeq),
+      "--work-context-json",
+      workContextJSON,
+    );
+    if (replacesAgentId) args.push("--replaces-agent", replacesAgentId);
+  }
   if (prompt) args.push("--prompt", prompt);
   if (runtime) args.push("--runtime", runtime);
   if (model) args.push("--model", model);

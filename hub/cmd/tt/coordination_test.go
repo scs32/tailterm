@@ -79,6 +79,41 @@ func TestPostHumanReplyAndLiteralHelp(t *testing.T) {
 	}
 }
 
+func TestBoundAgentPostCarriesItsRecordedItemAndRetryIdentity(t *testing.T) {
+	var posted api.PostMessageRequest
+	binding := &api.AgentWorkItemBinding{
+		ItemTaskID: "tsk_0000000000000001", ItemID: "wi_0000000000000002", ItemRevision: 3,
+		WorkOrderMessage: api.MessageReference{TaskID: "tsk_0000000000000001", Seq: 814},
+	}
+	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == "GET" && strings.Contains(r.URL.Path, "/agents/"):
+			_ = json.NewEncoder(w).Encode(api.Agent{ID: "agt_0000000000000001", WorkItem: binding})
+		case r.Method == "POST" && strings.HasSuffix(r.URL.Path, "/messages"):
+			if err := json.NewDecoder(r.Body).Decode(&posted); err != nil {
+				t.Error(err)
+			}
+			_ = json.NewEncoder(w).Encode(api.Message{Seq: 1})
+		default:
+			http.Error(w, "unexpected route", 500)
+		}
+	}))
+	defer s.Close()
+	t.Setenv("TAILTERM_WORK_ITEM", binding.ItemID)
+	e := env{hub: s.URL, task: binding.ItemTaskID, agent: "agt_0000000000000001", runID: "run_0000000000000003"}
+	if err := cmdPost(e, []string{"Verified exact synthetic result"}); err != nil {
+		t.Fatal(err)
+	}
+	if posted.RequestID == "" || len(posted.WorkItems) != 1 || posted.WorkItems[0].ItemID != binding.ItemID || posted.WorkOrderMessage == nil || *posted.WorkOrderMessage != binding.WorkOrderMessage {
+		t.Fatalf("bound post lost durable context: %+v", posted)
+	}
+	firstKey := posted.RequestID
+	if err := cmdPost(e, []string{"Verified exact synthetic result"}); err != nil || posted.RequestID != firstKey {
+		t.Fatalf("exact retry identity changed: %+v %v", posted, err)
+	}
+}
+
 func TestInboxDistinguishesHumanFromAgentNamedOwner(t *testing.T) {
 	m := api.Message{Seq: 5, From: api.Sender{User: "owner"}, Text: "A poem please"}
 	human := formatMessage(m, nil)
