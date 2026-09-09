@@ -38,6 +38,7 @@ async function transport(url,init){
  const match=p.match(/^\\/v1\\/tasks\\/([^/]+)(.*)$/);if(!match)throw Error('Unexpected synthetic route '+p);
  const [,id,tail]=match,task=tasks.find(t=>t.id===id);
  if(!tail)return response({task,agents:agents(id)});
+ if(tail==='/decisions')return response({decisions:[],nextAfter:0});
  if(tail==='/messages'){
    if(method==='POST'){const list=messages.get(id);const row={...body,from:{user:'fixture'},seq:list.length+1,createdAt:'2026-09-08T12:00:00Z'};list.push(row);return response(row)}
    return response({messages:messages.get(id).filter(m=>m.seq>Number(u.searchParams.get('after')||0))});
@@ -260,8 +261,8 @@ async function actions(page) {
     await expect(item).toContainText("In progress");
     await item.locator("[data-item-send]").click();
     await page.locator("#work-item-dispatch button[type=submit]").click();
-    await expect(page.locator("#work-item-dispatch-status")).toContainText("message #2");
-    await page.locator("#dialog-close").click();
+    await expect(page.locator("#dialog")).not.toBeVisible();
+    await expect(page.locator("#notice")).toContainText("board message #2");
   }
   await show(page, "tasks");
   await page.locator('[data-task-select="tsk_2222222222222222"]').click();

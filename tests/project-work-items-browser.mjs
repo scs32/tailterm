@@ -335,13 +335,14 @@ try {
       await page.locator(`[data-item-send="${createdID}"]`).click();
       assert.equal(await page.locator('#work-item-target').inputValue(), source.task.id, "dispatch did not default to the owning project");
       await page.locator('#work-item-dispatch button[type=submit]').click();
-      await page.locator('#work-item-dispatch-status').filter({ hasText: "message #" }).waitFor();
+      await page.locator('#dialog').waitFor({ state: "hidden" });
+      await page.locator('#notice').filter({ hasText: "board message #" }).waitFor();
       assert.equal((await item(source.task.id, createdID)).lastDispatch.targetTaskId, source.task.id);
-      await page.locator('#dialog-close').click();
       await page.locator(`[data-item-send="${createdID}"]`).click();
       await page.locator('#work-item-target').selectOption(target.task.id);
       await page.locator('#work-item-dispatch button[type=submit]').click();
-      await page.locator('#work-item-dispatch-status').filter({ hasText: "message #" }).waitFor();
+      await page.locator('#dialog').waitFor({ state: "hidden" });
+      await page.locator('#notice').filter({ hasText: "board message #" }).waitFor();
       const cross = await item(source.task.id, createdID);
       assert.equal(cross.taskId, source.task.id, "cross-project dispatch moved item ownership");
       assert.equal(cross.lastDispatch.targetTaskId, target.task.id);
@@ -357,7 +358,7 @@ try {
         [missing.task, "has no open agent"],
         [exited.task, "has no open agent"],
       ]) {
-        await page.locator('#dialog-close').click();
+        if (await page.locator('#dialog').isVisible()) await page.locator('#dialog-close').click();
         await page.locator(`[data-item-send="${createdID}"]`).click();
         await page.locator('#work-item-target').selectOption(badTarget.id);
         await page.locator('#work-item-dispatch button[type=submit]').click();
