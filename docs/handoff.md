@@ -1,5 +1,46 @@
 # Development handoff — September 9, 2026
 
+## September 9 immutable work-item history — release verified
+
+Application `d913d79f5b44b27062aa42c8776b16c6a801babf` is deployed to
+`https://tailos.tailarr.com` (`https://a95003ee.tailos.pages.dev`) and served by
+the unchanged Stephens-Mini preview at `http://127.0.0.1:4318`. All three origins
+match the retained package's 81 served-file hashes and manifest SHA-256
+`f68376732f2250d39aeab5f9a687a47aa33424e01f084b44ef4847ac72b896f4`.
+Real Chromium on each origin started production WASM and restored an isolated
+synthetic vault without browser errors. Cloudflare Web Analytics transforms
+browser HTML by adding its beacon, so raw hash verification used `Accept: */*`;
+the actual transformed browser path was verified separately.
+
+The hub is RUNNING through existing TrueNAS middleware/TCP from
+`/mnt/deepfreeze/tailterm-hub/releases/20260909-work-item-history-d913d79/tailterm-hub`,
+SHA-256 `c9a4cc2b07d210798fd69991ecbe39c899dbb6b2300ea9eb42747c101d5e2b47`.
+The four additive history/update tables, database integrity/FK checks,
+authentication boundary, read-only readiness and invalid history limits pass.
+The pre-update SQLite online backup is mode 0600 at
+`/mnt/deepfreeze/tailterm-hub/backups/before-work-item-history-20260909T192023Z.sqlite`.
+No live task/profile fixture was created or mutated for release testing.
+
+Mini and Air now run the matching Darwin arm64 `tt` SHA-256
+`d38d4871f55c32ff1f9eb3a41eaf8077ec5c2104b4866922fe815fd289dd05f5`.
+Revision/message pagination and durable update-request help checks pass on both.
+Each host retains `~/.local/bin/tt-before-work-item-history-d913d79` at the prior
+hash, and relay PIDs stayed unchanged. Air's webpage preview remains retired.
+
+The release adds immutable native/reconstructed revision history, explicit
+history gaps, exact historical reads, linked-message pagination, idempotent
+update receipts with run attribution, optimistic conflicts and encrypted
+draft/retry preservation. Integrated Go vet/test/race, 124 JavaScript tests and
+the Chromium/WebKit history/vault suites pass. The original Bugs-only create/edit
+report still was not reproduced, so no causal repair is claimed. See
+[the behavior report](work-item-history.md) and
+[the release receipt](releases/tailos-2026-09-09-work-item-history.json).
+The exact clean source/package and all binaries remain at
+`.build/releases/work-item-history-d913d79`; the previous orchestrator-role
+package/deployment, Board-decisions hub binary, mode-0600 database backup and
+per-host CLI copies are the rollback chain. Neither Tailscale, networking,
+`https://tailterm.tailarr.com`, agent sessions nor live task lifecycle changed.
+
 ## September 9 orchestrator role boundary — release verified pending final record
 
 Application `75f1cdbc5b9689ec6db9a8ba23c7eaa1dcfaa835` is deployed to

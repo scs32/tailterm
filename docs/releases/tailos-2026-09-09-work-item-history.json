@@ -1,0 +1,214 @@
+{
+  "status": "builder_release_verified_pending_final_acceptance",
+  "recordedAt": "2026-09-09T19:33:03Z",
+  "workItem": {
+    "id": "wi_f0d39d54a76011c7",
+    "buildOrder": {
+      "id": "wi_f0d39d54a76011c7-build-1"
+    },
+    "releaseOrder": {
+      "id": "wi_f0d39d54a76011c7-release-1",
+      "leadAcceptanceMessage": 984,
+      "handlerConfirmationMessage": 989,
+      "fullReleaseOrderMessage": 990,
+      "releaseSlotHandoffMessage": 1015
+    }
+  },
+  "source": {
+    "integrationBase": "6dfc64416ab4372c13ed70a1687076e8bbb07dda",
+    "acceptedCandidateChain": [
+      "75e4ba3",
+      "d8269f4",
+      "9ea86535e2e401e879d4fa1316483772de5e674e"
+    ],
+    "integratedApplicationCommit": "d913d79f5b44b27062aa42c8776b16c6a801babf",
+    "integrationCommits": [
+      "cbca77f",
+      "566e912",
+      "74c1278",
+      "d913d79"
+    ],
+    "postPackageDocsCommit": "c951827",
+    "integration": "The complete accepted source chain and behavior report cherry-picked without conflict onto tasks-hub, preserving the previously released Enter, role-boundary and Mini preview corrections. The later audit commit changes only docs/bug-time-audit-enter.md and is not part of the application/package identity."
+  },
+  "package": {
+    "worktree": "/Users/stephenspeicher/projects/tailterm/.build/releases/work-item-history-d913d79",
+    "commit": "d913d79f5b44b27062aa42c8776b16c6a801babf",
+    "cleanSource": true,
+    "manifestEntries": 82,
+    "servedAssetsPerOrigin": 81,
+    "releaseSha256": "f68376732f2250d39aeab5f9a687a47aa33424e01f084b44ef4847ac72b896f4",
+    "productionWasmSha256": "c577557bf740f8263f39f7143fbf25e2c4437595f60e4c0d013d7b71d27f2b9e",
+    "packagedTailserveWasmGzip": {
+      "path": "assets/tailserve-BvZhPTN1.wasm.gz",
+      "size": 8598264,
+      "sha256": "11844cee96734c92a339d312fb18122d96323880c95beffa5d43726ae9a0b780"
+    },
+    "packageLockSha256": "a4175ff8886d6c2ee8443e7a928bc1f6f9500cd3b2c24b55fb967175d9eb3f98",
+    "commands": [
+      "npm ci",
+      "npm run build:wasm",
+      "npm run build:static",
+      "npm run verify:release",
+      "npm run build:tt",
+      "CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags='-s -w' -o ../.build/ttbin/tailterm-hub-linux-amd64 ./cmd/tailterm-hub"
+    ],
+    "verifyResult": "82 manifest entries match release.json"
+  },
+  "hub": {
+    "host": "truenas",
+    "state": "RUNNING",
+    "origin": "http://100.116.238.37:18765",
+    "binary": "/mnt/deepfreeze/tailterm-hub/releases/20260909-work-item-history-d913d79/tailterm-hub",
+    "binarySha256": "c9a4cc2b07d210798fd69991ecbe39c899dbb6b2300ea9eb42747c101d5e2b47",
+    "configuredUser": "950:950",
+    "readOnlyRoot": true,
+    "listener": "100.116.238.37:18765:18765",
+    "integrity": "ok",
+    "foreignKeyViolations": 0,
+    "historyTables": [
+      "work_item_history_gaps",
+      "work_item_history_state",
+      "work_item_revisions",
+      "work_item_update_requests"
+    ],
+    "readiness": {
+      "unauthenticatedWhoami": 403,
+      "authenticatedWhoami": 200,
+      "authenticatedTasks": 200,
+      "invalidRevisionCursor": 400,
+      "oversizedMessagePageLimit": 400
+    },
+    "previousBinary": "/mnt/deepfreeze/tailterm-hub/releases/20260909-board-decisions-39896c9c3a17/tailterm-hub",
+    "previousBinarySha256": "b74f66108ece08708b0fa2b9275828143bf29133cce4917fdecc2e315a80c183"
+  },
+  "backup": {
+    "path": "/mnt/deepfreeze/tailterm-hub/backups/before-work-item-history-20260909T192023Z.sqlite",
+    "sha256": "f08c415dae1a43638348e8883aa13db0d9a08b98bbf45888d8a42dd6371eb7cd",
+    "size": 6275072,
+    "mode": "0600",
+    "owner": "950:950",
+    "method": "SQLite online backup API through sqlite3 .backup before app update",
+    "integrity": "ok",
+    "foreignKeyViolations": 0
+  },
+  "cli": {
+    "darwinArm64Sha256": "d38d4871f55c32ff1f9eb3a41eaf8077ec5c2104b4866922fe815fd289dd05f5",
+    "linuxAmd64Sha256": "9fbfd4beb4d87f2b5440274d38e3cb1b3ef02dfbf7ab3d5cceb39f22943154c2",
+    "linuxArm64Sha256": "a4faa9fc40f7952f529ea08fc55abf25e81d18ee7ecade9df8f48bb4a5006747",
+    "previousDarwinArm64Sha256": "ff7829a96a5c7902172991a944f6ab57d0bee1631ba98c8060066e51373c5551",
+    "behaviorVerified": [
+      "work-items revisions exposes after/limit pagination with default 32",
+      "work-items messages exposes revision filtering",
+      "work-items update exposes durable request-id retry identity"
+    ],
+    "hosts": [
+      {
+        "host": "Stephens-Mini",
+        "architecture": "Darwin arm64",
+        "installed": "/Users/stephenspeicher/.local/bin/tt",
+        "rollbackBinary": "/Users/stephenspeicher/.local/bin/tt-before-work-item-history-d913d79",
+        "relayPidBefore": 83457,
+        "relayPidAfter": 83457,
+        "relayRestarted": false
+      },
+      {
+        "host": "theAir",
+        "architecture": "Darwin arm64",
+        "installed": "/Users/stephenspeicher/.local/bin/tt",
+        "rollbackBinary": "/Users/stephenspeicher/.local/bin/tt-before-work-item-history-d913d79",
+        "relayPidBefore": 912,
+        "relayPidAfter": 912,
+        "relayRestarted": false
+      }
+    ]
+  },
+  "tailos": {
+    "origin": "https://tailos.tailarr.com",
+    "cloudflareProject": "tailos",
+    "deploymentId": "a95003ee-108a-44d2-ac01-0f795d105aee",
+    "deployment": "https://a95003ee.tailos.pages.dev",
+    "branch": "main",
+    "commit": "d913d79f5b44b27062aa42c8776b16c6a801babf",
+    "verifiedAssets": 81,
+    "releaseSha256": "f68376732f2250d39aeab5f9a687a47aa33424e01f084b44ef4847ac72b896f4",
+    "assetVerification": "Production origin and immutable deployment each match 81/81 served package files when requested as raw bytes with Accept */* and Accept-Encoding identity.",
+    "chromiumSmoke": {
+      "productionWasmStarted": true,
+      "syntheticVaultRestored": true,
+      "matchingMargins": true,
+      "uncaughtErrors": [],
+      "screenshotSha256": "dee008e5bb73ff69cb91fb1e43b1dc1241bc26b73201661e1427f62041b71664"
+    }
+  },
+  "miniPreview": {
+    "origin": "http://127.0.0.1:4318",
+    "servedDirectory": "/Users/stephenspeicher/projects/tailterm/dist-static",
+    "activation": "rsync -a --delete from the exact retained package",
+    "commit": "d913d79f5b44b27062aa42c8776b16c6a801babf",
+    "verifiedAssets": 81,
+    "releaseSha256": "f68376732f2250d39aeab5f9a687a47aa33424e01f084b44ef4847ac72b896f4",
+    "listener": {
+      "pidBefore": 28664,
+      "pidAfter": 28664,
+      "command": "node scripts/preview-static.mjs dist-static 127.0.0.1 4318",
+      "cwd": "/Users/stephenspeicher/projects/tailterm",
+      "sourceCommit": "b587741627c54bac80eccb536e7470320a65e3bc",
+      "wasmContentType": "application/gzip",
+      "wasmContentEncoding": null,
+      "restarted": false
+    },
+    "chromiumSmoke": {
+      "productionWasmStarted": true,
+      "syntheticVaultRestored": true,
+      "matchingMargins": true,
+      "uncaughtErrors": [],
+      "screenshotSha256": "dee008e5bb73ff69cb91fb1e43b1dc1241bc26b73201661e1427f62041b71664"
+    }
+  },
+  "acceptance": {
+    "integratedGo": [
+      "go vet ./...: passed",
+      "go test ./...: passed",
+      "go test -race ./...: passed"
+    ],
+    "integratedJavascript": "npm test: 124/124 passed",
+    "integratedBrowsers": [
+      "node tests/work-item-draft-vault-browser.mjs: Chromium and WebKit passed",
+      "node tests/project-work-items-browser.mjs: Chromium and WebKit passed"
+    ],
+    "deployedBrowsers": [
+      "TailOS production: real Chromium production WASM and isolated synthetic-vault restoration passed",
+      "TailOS immutable deployment: real Chromium production WASM and isolated synthetic-vault restoration passed",
+      "Mini preview: real Chromium production WASM and isolated synthetic-vault restoration passed"
+    ],
+    "behavior": [
+      "Immutable native and reconstructed revision history, explicit gaps and closed-project reads",
+      "Idempotent update receipts with exact run/thread attribution and optimistic revision conflicts",
+      "Bounded revision and linked-message pagination, response limits and race-safe client rendering",
+      "Encrypted draft reload replay, close/navigation retention and explicit discard"
+    ]
+  },
+  "rollback": {
+    "frontendCommit": "75f1cdbc5b9689ec6db9a8ba23c7eaa1dcfaa835",
+    "tailosDeploymentId": "451b0332-d7be-443c-9d64-4ec90595fd8f",
+    "tailosDeployment": "https://451b0332.tailos.pages.dev",
+    "retainedPackage": "/Users/stephenspeicher/projects/tailterm/.build/releases/orchestrator-role-75f1cdb",
+    "releaseSha256": "e4c607d59fa4c194916117867c46bbd84fb745a8d8fc1455076f9278a0f3595d",
+    "hub": "Use TrueNAS middleware to restore the prior versioned binary volume, then verify RUNNING, its recorded hash, integrity/FK and authenticated readiness. The new tables are additive; restore the recorded database backup only with the app stopped if state rollback is actually required.",
+    "cli": "Atomically restore each host's uniquely named rollback binary after restoring compatible frontend/hub behavior; do not restart relays.",
+    "frontend": "Deploy the retained prior package explicitly to Cloudflare project tailos and rsync that exact package to Mini's served directory without changing the listener."
+  },
+  "excluded": [
+    "https://tailterm.tailarr.com",
+    "Air webpage preview",
+    "Tailscale installation, configuration, restart or networking changes",
+    "live task/profile fixtures or task closure",
+    "agent-session or relay restart"
+  ],
+  "limits": [
+    "The originally reported Bugs-only create/edit failure was not reproduced by the isolated CRUD matrix; this release does not claim a causal repair for that report.",
+    "The full old/new/old/new migration matrix belongs to accepted commit d8269f4. The bounded correction at 9ea8653 changed no schema, store migration or receipt semantics and was verified with focused integration/browser checks rather than rerunning that entire matrix.",
+    "Cloudflare Web Analytics adds its beacon to browser HTML requests. Raw package verification therefore uses Accept */* to avoid the HTML transform; the actual browser path, including that transform, separately passed the production-WASM and vault smoke."
+  ]
+}
