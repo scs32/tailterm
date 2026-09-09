@@ -56,12 +56,12 @@ try {
   await page.goto(
     process.argv[2] || `http://127.0.0.1:${server.address().port}/`,
   );
-  const worker = (await readdir("dist-static/bundles")).find((x) =>
+  const worker = (await readdir("dist-static/assets")).find((x) =>
     /^speech-worker-.*\.js$/.test(x),
   );
   const result = await page.evaluate(
     async ({ worker, fixture }) => {
-      const w = new Worker("/bundles/" + worker, { type: "module" });
+      const w = new Worker("/assets/" + worker, { type: "module" });
       const call = (type, audio) =>
         new Promise((resolve, reject) => {
           const timeout = setTimeout(
@@ -127,14 +127,14 @@ try {
     ),
   );
   assert.deepEqual(bad, []);
-  const recorder = (await readdir("dist-static/bundles")).find((x) =>
+  const recorder = (await readdir("dist-static/assets")).find((x) =>
     /^speech-recorder-.*\.js$/.test(x),
   );
   assert.ok(recorder, "AudioWorklet must be a self-hosted file under CSP");
   const count = await page.evaluate(async (recorder) => {
     const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
     const context = new AudioContext();
-    await context.audioWorklet.addModule("/bundles/" + recorder);
+    await context.audioWorklet.addModule("/assets/" + recorder);
     const node = new AudioWorkletNode(context, "tailterm-dictation-recorder");
     const source = context.createMediaStreamSource(stream);
     let count = 0;

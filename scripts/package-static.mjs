@@ -12,10 +12,9 @@ import {
 import path from "node:path";
 import { gzipSync, brotliCompressSync, constants } from "node:zlib";
 const root = new URL("../dist-static/", import.meta.url);
-const bundleDirectory = "bundles/";
-for (const name of await readdir(new URL(bundleDirectory, root))) {
+for (const name of await readdir(new URL("assets/", root))) {
   if (!/\.(wasm|js|css)$/.test(name)) continue;
-  const url = new URL(bundleDirectory + name, root),
+  const url = new URL("assets/" + name, root),
     raw = await readFile(url);
   await writeFile(new URL(url.href + ".gz"), gzipSync(raw, { level: 9 }));
   await writeFile(

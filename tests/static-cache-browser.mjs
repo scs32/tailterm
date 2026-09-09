@@ -5,15 +5,15 @@ import { once } from "node:events";
 import { readFile } from "node:fs/promises";
 
 const headers = await readFile("deploy/_headers", "utf8");
-const assetRule = headers.match(/\/bundles\/\*\s+Cache-Control:\s*([^\n]+)/);
-assert.ok(assetRule, "deploy/_headers must define the bundle cache policy");
+const assetRule = headers.match(/\/assets\/\*\s+Cache-Control:\s*([^\n]+)/);
+assert.ok(assetRule, "deploy/_headers must define the asset cache policy");
 const assetCacheControl = assetRule[1].trim();
 assert.equal(assetCacheControl, "no-cache");
 
 for (const engine of [chromium, webkit]) {
   let cssRequests = 0;
   const server = createServer((request, response) => {
-    if (request.url === "/bundles/index-upgrade.css") {
+    if (request.url === "/assets/index-upgrade.css") {
       cssRequests++;
       if (cssRequests === 1) {
         // Cloudflare Pages' SPA fallback when a deploy-time asset is not yet
@@ -40,7 +40,7 @@ for (const engine of [chromium, webkit]) {
     }
 
     const body =
-      '<!doctype html><link rel="stylesheet" href="/bundles/index-upgrade.css"><p>TailOS</p>';
+      '<!doctype html><link rel="stylesheet" href="/assets/index-upgrade.css"><p>TailOS</p>';
     response.writeHead(200, {
       "Cache-Control": "no-cache",
       "Content-Type": "text/html; charset=utf-8",

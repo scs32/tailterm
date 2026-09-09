@@ -31,7 +31,6 @@ export default defineConfig(({ mode }) => ({
   build: {
     target: "esnext",
     outDir: mode === "static" ? "dist-static" : "dist",
-    assetsDir: mode === "static" ? "bundles" : "assets",
   },
   server: {
     fs: {

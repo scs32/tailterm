@@ -13,15 +13,18 @@ release at `https://tailos.tailarr.com`: the stylesheet returned 200 as
 normal load and reload. This does not disprove the owner observation and is not
 native Safari evidence.
 
-A matching failure mechanism was reproduced in isolated Chromium and WebKit.
+A matching failure mechanism was reproduced in isolated Chromium and WebKit
+with the ignored diagnostic fixture `.build/safari-css-cache-fixture.mjs`.
 Cloudflare Pages serves the application shell as a 200 `text/html` SPA fallback
 when a requested hashed stylesheet is absent. If that response is cached as an
 immutable asset, the browser rejects it because of its MIME type and continues
 to reuse it on reload. Each browser requested the stylesheet once and remained
 unstyled with a one-year immutable response. With revalidation enabled, each
 browser requested it twice, received the corrected `text/css` response on
-reload, and became styled. The permanent regression is
-`tests/static-cache-browser.mjs`.
+reload, and became styled. The committed regression
+`tests/static-cache-browser.mjs` retains the supported half of that comparison:
+it verifies that the shipped `no-cache` policy performs the second request and
+recovers styling on reload; it does not itself rerun the immutable baseline.
 
 The test establishes the failure and recovery behavior, but it cannot prove
 that a deploy-time absence or stale hashed URL caused the owner's exact session.
@@ -38,8 +41,9 @@ released. It includes the original focused fix from
 - `:root` sets both `-webkit-text-size-adjust: 100%` and
   `text-size-adjust: 100%`, producing a fresh stylesheet hash and stable mobile
   text sizing; and
-- the browser regression covers stale fallback recovery in Chromium and
-  WebKit.
+- the committed browser regression covers `no-cache` reload recovery in
+  Chromium and WebKit; the separate ignored diagnostic fixture supplied the
+  immutable failing baseline.
 
 The retained clean package is `.build/releases/safari-css-37bfbd2`. Its
 `release.json` SHA-256 is
@@ -101,8 +105,11 @@ invalidated its delivery premise.
 ## Verification boundaries
 
 - `npm test`: 128/128 passed for both released and retained follow-up source.
-- `node tests/static-cache-browser.mjs`: Chromium and WebKit passed the
-  failing-before/passing-after cache recovery scenario.
+- `.build/safari-css-cache-fixture.mjs`: the initial ignored diagnostic fixture
+  observed the immutable failing baseline and revalidated recovery in Chromium
+  and WebKit.
+- `node tests/static-cache-browser.mjs`: the committed regression verified the
+  shipped `no-cache` second request and styled reload in Chromium and WebKit.
 - `npm run verify:release`: all 82 manifest entries passed for both retained
   packages.
 - `node tests/deployed-browser.mjs`: Chromium passed TailOS and Mini with
@@ -134,3 +141,7 @@ restores the reproduced stale-fallback risk.
 No hub, CLI, database, schema, Tailscale, TrueNAS networking, relay, Air preview,
 old `tailterm.tailarr.com`, live profile/task, task lifecycle or owner-session
 change was made under this work order.
+
+The original `safari-css` worker failed before implementation and remains exited
+rather than retired. Its earlier 409 admission/retirement path admitted nobody;
+this recorded replacement did not reuse, alter or retire that identity.

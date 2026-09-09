@@ -22,6 +22,7 @@
     "freshCurrentRelease": "Isolated Playwright WebKit desktop and mobile loaded 1,015 CSS rules and remained styled on normal load and reload; the fresh current release did not reproduce the owner report.",
     "reproducedFailure": "Chromium and WebKit each cached one immutable 200 text/html SPA fallback for a missing hashed stylesheet, rejected it because of MIME type, and remained unstyled on reload.",
     "reproducedRecovery": "With revalidation/no-cache each browser made a second stylesheet request on reload, received text/css, and became styled.",
+    "diagnosticEvidence": "The ignored .build/safari-css-cache-fixture.mjs produced the immutable failing baseline and revalidated recovery. The committed tests/static-cache-browser.mjs verifies only the supported no-cache second-request and styled-reload behavior.",
     "supportedConclusion": "A stale cached SPA fallback is a matching, test-covered failure mechanism; the exact cause and recovery of the owner's Safari session are not proven.",
     "externalDelivery": "tailos.tailarr.com changes the package's no-cache asset response to max-age=14400. A missing CSS URL is a 200 text/html SPA fallback with the same four-hour lifetime. A /bundles probe receives the same override, invalidating a path-only workaround."
   },
@@ -31,7 +32,7 @@
     "changes": [
       "deploy/_headers requests Cache-Control: no-cache for /assets/*",
       "client/style.css adds -webkit-text-size-adjust and text-size-adjust at 100%",
-      "tests/static-cache-browser.mjs covers immutable fallback failure and revalidated reload recovery in Chromium and WebKit"
+      "tests/static-cache-browser.mjs covers shipped no-cache second-request and styled-reload recovery in Chromium and WebKit; the ignored diagnostic fixture supplied the immutable failing baseline"
     ]
   },
   "releasedPackage": {
@@ -114,7 +115,8 @@
     ],
     "results": [
       "npm test: 128/128 passed",
-      "static-cache-browser: Chromium and WebKit passed",
+      "ignored diagnostic fixture: Chromium and WebKit reproduced immutable failure and revalidated recovery",
+      "static-cache-browser: Chromium and WebKit passed the committed no-cache reload recovery",
       "verify:release: 82/82 manifest entries passed",
       "served asset hashes: 81/81 matched on each origin",
       "deployed Chromium and focused WebKit checks passed"
@@ -161,6 +163,11 @@
     "The exact external Cloudflare rule is unidentified because the authorized read attempts returned 403.",
     "The canonical custom domain does not currently provide immediate fallback recovery because its asset responses retain max-age=14400."
   ],
+  "replacedWorker": {
+    "name": "safari-css",
+    "result": "Failed before implementation and remains exited rather than retired.",
+    "limitation": "The earlier 409 admission/retirement path admitted nobody. This recorded replacement did not reuse, alter or retire that identity."
+  },
   "excluded": [
     "hub, CLI, database or schema changes",
     "Tailscale, TrueNAS networking or relay changes",

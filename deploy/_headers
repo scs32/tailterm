@@ -8,9 +8,6 @@
 /assets/*
   Cache-Control: no-cache
 
-/bundles/*
-  Cache-Control: no-cache
-
 /speech-runtime/*
   Cache-Control: public, max-age=31536000, immutable
 

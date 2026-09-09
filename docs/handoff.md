@@ -6,6 +6,8 @@ Work item `wi_2d5111fd8c42d8e7`, bounded order #1082 and cache-delivery
 amendment #1122/#1124 produced a matching isolated failure and recovery test.
 Chromium and WebKit remain unstyled when a missing hashed stylesheet's 200 HTML
 SPA fallback is cached immutable; both recover on reload when it is revalidated.
+That comparison came from an ignored diagnostic fixture; the committed browser
+regression verifies the shipped `no-cache` second request and styled reload.
 Fresh current-release WebKit did not reproduce the owner report, so the exact
 owner-session cause is not claimed.
 
@@ -34,6 +36,8 @@ Rollback is the retained routing package
 `https://1967ad21.tailos.pages.dev`; it restores the reproduced immutable-cache
 risk. Hub, CLI, database, Tailscale, TrueNAS networking, relays, Air preview,
 the old site, live records and owner sessions were unchanged.
+The original `safari-css` worker failed before implementation and remains exited
+rather than retired; its earlier 409 admission/retirement path admitted nobody.
 
 ## September 9 work-item session routing — release verified pending final acceptance
 
