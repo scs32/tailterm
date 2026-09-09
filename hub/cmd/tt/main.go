@@ -479,6 +479,7 @@ func cmdSpawn(e env, args []string) error {
 	agentID := fs.String("agent-id", "", "stable agent identity for database_handler launch/retry")
 	expectedRunID := fs.String("expected-run-id", "", "exited database_handler run to restart")
 	role := fs.String("role", "", "project role (database_handler)")
+	plannedTeamMembers := fs.Int("planned-team-members", 0, "planned non-database team members for this launch (1-32)")
 	run := fs.String("run", "", "command to run in the agent window (required)")
 	cwd := fs.String("cwd", "", "working directory")
 	prompt := fs.String("prompt", "", "appended to the command as a quoted argument")
@@ -504,6 +505,9 @@ func cmdSpawn(e env, args []string) error {
 	}
 	if *role == "" && (*agentID != "" || *expectedRunID != "") {
 		return errors.New("--agent-id and --expected-run-id are reserved for database_handler launches")
+	}
+	if *plannedTeamMembers < 0 || *plannedTeamMembers > 32 {
+		return errors.New("planned team members must be from 1 to 32 when set")
 	}
 	if *task == "" || *hub == "" {
 		return errors.New("task and hub are required (TAILTERM_TASK/TAILTERM_HUB or --task/--hub)")
@@ -579,7 +583,7 @@ func cmdSpawn(e env, args []string) error {
 	if err != nil {
 		return err
 	}
-	briefing := agentTaskBriefing(detail.Task, *name, *role, detail.Agents)
+	briefing := agentTaskBriefingForLaunch(detail.Task, *name, *role, detail.Agents, *plannedTeamMembers)
 	if *permissionMode != "" {
 		briefing += "\nRequested launch permission mode: " + *permissionMode + ". Permission denials are real failures, not approvals. Do not repeat an unchanged denied action. Report a precise Permission blocked status to the orchestrator and continue independent permitted work."
 	}
@@ -620,6 +624,9 @@ func cmdSpawn(e env, args []string) error {
 		opts.Env[spawn.EnvAgent], opts.Env[spawn.EnvAgentName], opts.Env[spawn.EnvSession], opts.Env["TAILTERM_RUN"] = agent.ID, agent.Name, session, agent.RunID
 		delete(opts.Env, "TAILTERM_HANDLER_COMMAND")
 		delete(opts.Env, "TAILTERM_HANDLER_PROMPT")
+		// The briefing is already the runtime's quoted command argument. Keeping
+		// a second copy in tmux's environment can exceed tmux's command limit.
+		delete(opts.Env, "TAILTERM_BRIEFING")
 		if err = spawn.Create(opts); err != nil {
 			_, _ = c.CloseAgent(ctx, *task, agent.ID)
 			return err

@@ -654,6 +654,7 @@ export function createTaskHub(host) {
       agentRole: fields.agentRole,
       agentId: fields.agentId,
       expectedRunId: fields.expectedRunId,
+      plannedTeamMembers: fields.plannedTeamMembers,
     });
     const out = await host.browserCommand(server, command, 65536);
     let agent;
@@ -1151,6 +1152,15 @@ export function createTaskHub(host) {
 
   async function launchMembers(taskId, plan, progress, report) {
     const detail = await client.getTask(taskId);
+    const plannedNames = new Set([
+      ...detail.agents
+        .filter((agent) => agent.role !== "database_handler")
+        .map((agent) => agent.name.toLowerCase()),
+      ...plan
+        .filter(({ fields }) => fields.agentRole !== "database_handler")
+        .map(({ fields }) => fields.name.toLowerCase()),
+    ]);
+    const plannedTeamMembers = plannedNames.size;
     const open = detail.agents.filter(
       (a) => !["closed", "exited"].includes(a.status),
     );
@@ -1174,7 +1184,13 @@ export function createTaskHub(host) {
       report(
         `Starting ${fields.name} on ${server.name} (${i + 1}/${plan.length})…`,
       );
-      await spawn(taskId, server, fields);
+      await spawn(
+        taskId,
+        server,
+        fields.agentRole === "database_handler"
+          ? fields
+          : { ...fields, plannedTeamMembers },
+      );
       progress.add(fields.name);
     }
   }
@@ -1331,7 +1347,16 @@ export function createTaskHub(host) {
         if (!target) throw new Error("Choose a server for the agent.");
         startButton.disabled = true;
         error.textContent = `Starting ${fields.name} on ${target.name}…`;
-        const agent = await spawn(taskId, target, fields);
+        const existingMembers = new Set(
+          (info?.agents || [])
+            .filter((agent) => agent.role !== "database_handler")
+            .map((agent) => agent.name.toLowerCase()),
+        );
+        existingMembers.add(fields.name.toLowerCase());
+        const agent = await spawn(taskId, target, {
+          ...fields,
+          plannedTeamMembers: existingMembers.size,
+        });
         host.closeDialog();
         host.notice(`${agent.name} is starting on ${target.name}.`);
       } catch (e) {

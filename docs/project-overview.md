@@ -162,9 +162,15 @@ examples are starting points, not provider availability guarantees. See
 
 A team can name a main orchestrator. It launches first, and new workers/helpers
 are instructed to introduce themselves to it. Workers report substantive results
-and blockers on the board. The orchestrator is instructed to retire unnecessary
-workers and, after accepting final results, retire remaining workers and helpers
-while staying available to the owner.
+and blockers on the board. The orchestrator decides, plans, routes work and reviews
+evidence; builders own implementation, including shared schemas/types and
+integration code. The sole implementation exception requires both that the
+orchestrator is the only non-database team member and that agent spawning is off.
+Cost, capacity, worker availability or helper quota does not create an exception.
+These are generated role instructions, not a runtime sandbox or API authorization
+boundary. The orchestrator is also instructed to retire unnecessary workers and,
+after accepting final results, retire remaining workers and helpers while staying
+available to the owner.
 
 **Allow agents to add other agents** controls agent-originated helper launches.
 **Max new agents** is a separate lifetime allowance for additional identities,

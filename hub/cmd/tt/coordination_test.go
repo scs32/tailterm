@@ -113,3 +113,84 @@ func TestPostTrailingFlagsAndLiteralSeparator(t *testing.T) {
 		t.Fatal("literal separator broken")
 	}
 }
+
+func TestOrchestratorImplementationBoundaryAcrossLaunchAndResumeRosters(t *testing.T) {
+	lead := api.Agent{ID: "agt_0000000000000001", Name: "lead", Status: api.AgentRunning}
+	handler := api.Agent{ID: "agt_0000000000000002", Name: "db-handler", Role: api.AgentRoleDatabaseHandler, Status: api.AgentDone}
+	worker := api.Agent{ID: "agt_0000000000000003", Name: "builder", Status: api.AgentRunning}
+	cases := []struct {
+		name       string
+		allowSpawn bool
+		maxHelpers int
+		planned    int
+		agents     []api.Agent
+		mayBuild   bool
+	}{
+		{name: "fresh_launch_sole_spawn_disabled", agents: nil, mayBuild: true},
+		{name: "resume_sole_spawn_disabled", agents: []api.Agent{lead}, mayBuild: true},
+		{name: "database_handler_is_not_a_team_builder", agents: []api.Agent{lead, handler}, mayBuild: true},
+		{name: "fresh_launch_sole_spawn_enabled", allowSpawn: true, maxHelpers: 2},
+		{name: "sole_spawn_enabled_with_exhausted_quota", allowSpawn: true, maxHelpers: 0, agents: []api.Agent{lead}},
+		{name: "fresh_multi_member_launch_spawn_disabled", planned: 2},
+		{name: "fresh_multi_member_launch_spawn_enabled", allowSpawn: true, maxHelpers: 2, planned: 2},
+		{name: "multiple_members_spawn_disabled", agents: []api.Agent{lead, worker}},
+		{name: "multiple_members_spawn_enabled", allowSpawn: true, maxHelpers: 2, agents: []api.Agent{lead, worker}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			task := api.Task{ID: "tsk_0000000000000001", Name: "Project", Orchestrator: "lead", AllowAgentSpawn: tc.allowSpawn, MaxNewAgents: tc.maxHelpers}
+			got := agentTaskBriefingForLaunch(task, "lead", "", tc.agents, tc.planned)
+			for _, required := range []string{"decisions, planning, routing work, and reviewing evidence", "shared schema/types and integration code", "not a runtime sandbox or API authorization boundary"} {
+				if !strings.Contains(got, required) {
+					t.Fatalf("missing %q", required)
+				}
+			}
+			if tc.mayBuild {
+				if !strings.Contains(got, "both required exception conditions are present") || strings.Contains(got, "You must not implement") {
+					t.Fatal(got)
+				}
+			} else {
+				for _, required := range []string{"You must not implement", "only implementation exception requires both", "idle or retired workers", "unavailable capacity", "quota exhaustion", "cost", "consumed helper allowance"} {
+					if !strings.Contains(got, required) {
+						t.Fatalf("missing %q", required)
+					}
+				}
+			}
+		})
+	}
+}
+
+func TestRetiredIdleAndExitedWorkersStillPreventTheSoleMemberException(t *testing.T) {
+	for _, status := range []string{api.AgentDone, api.AgentRetired, api.AgentNeedsInput, api.AgentExited, api.AgentClosed} {
+		t.Run(status, func(t *testing.T) {
+			task := api.Task{Name: "Project", Orchestrator: "lead"}
+			agents := []api.Agent{{Name: "lead", Status: api.AgentRunning}, {Name: "builder", Status: status}}
+			got := agentTaskBriefing(task, "lead", "", agents)
+			if !strings.Contains(got, "You must not implement") {
+				t.Fatal(got)
+			}
+		})
+	}
+}
+
+func TestWorkerBriefingPreservesAssignedBuilderAndReadOnlyRoles(t *testing.T) {
+	task := api.Task{Name: "Project", Orchestrator: "lead"}
+	agents := []api.Agent{{Name: "lead", Status: api.AgentRunning}, {Name: "worker", Status: api.AgentRunning}}
+	got := agentTaskBriefing(task, "worker", "", agents)
+	for _, required := range []string{"decides, plans, routes work and reviews evidence", "builders own assigned implementation", "shared schema/types and integration code", "Preserve any assigned read-only or other non-builder role"} {
+		if !strings.Contains(got, required) {
+			t.Fatalf("missing %q", required)
+		}
+	}
+	if strings.Contains(got, "You are the MAIN ORCHESTRATOR") || strings.Contains(got, "sole non-database team member") {
+		t.Fatal(got)
+	}
+}
+
+func TestSpawnRejectsInvalidPlannedTeamSizeBeforeContactingHub(t *testing.T) {
+	e := env{hub: "http://127.0.0.1:1", task: "tsk_0000000000000001"}
+	err := cmdSpawn(e, []string{"--name", "lead", "--run", "codex", "--planned-team-members", "33"})
+	if err == nil || !strings.Contains(err.Error(), "planned team members") {
+		t.Fatal(err)
+	}
+}

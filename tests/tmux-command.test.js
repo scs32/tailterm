@@ -132,9 +132,17 @@ test("agent launch forwards an explicit model as one argument and omits defaults
     const selected = launch({ model: "provider/model:latest" });
     assert.equal(selected.status, 0);
     assert.match(selected.stdout, /--model\nprovider\/model:latest\n$/);
+    assert.match(
+      launch({ plannedTeamMembers: 4 }).stdout,
+      /--planned-team-members\n4\n/,
+    );
     assert.doesNotMatch(launch({}).stdout, /--model/);
     for (const model of ["--help", "$(id)", "a\nb", "two words"])
       assert.throws(() => agentSpawnCommand({ ...fields, model }));
+    for (const plannedTeamMembers of [-1, 1.5, 33, "2"])
+      assert.throws(() =>
+        agentSpawnCommand({ ...fields, plannedTeamMembers }),
+      );
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

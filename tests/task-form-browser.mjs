@@ -509,6 +509,14 @@ try {
       assert.equal(detail.task.orchestrator, "team-planner");
       assert.match(launchCommands.at(-3), /--permission-mode/);
       assert.match(launchCommands.at(-3), /on-request/);
+      const plannerLaunch = launchCommands
+        .slice(launchStart)
+        .find((command) => command.includes("team-planner"));
+      assert.match(
+        plannerLaunch,
+        /--planned-team-members.*2/,
+        "first team launch carries the complete ordinary-member count",
+      );
       const blockedAgent = await (
         await fetch(`http://127.0.0.1:${port}/v1/tasks/${teamTask.id}/agents`, {
           method: "POST",

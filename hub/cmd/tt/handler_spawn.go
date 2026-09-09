@@ -241,7 +241,7 @@ func ensureHandler(ctx context.Context, c *api.Client, taskID string, req api.Ad
 		launch.Session = req.Session
 		launch.Env = make(map[string]string, len(opts.Env)+6)
 		for k, v := range opts.Env {
-			if k != "TAILTERM_HANDLER_COMMAND" && k != "TAILTERM_HANDLER_PROMPT" {
+			if k != "TAILTERM_HANDLER_COMMAND" && k != "TAILTERM_HANDLER_PROMPT" && k != "TAILTERM_BRIEFING" {
 				launch.Env[k] = v
 			}
 		}

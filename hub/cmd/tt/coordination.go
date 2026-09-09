@@ -43,16 +43,46 @@ func postArgs(args []string) []string {
 	return append(append(flags, "--"), text...)
 }
 
-func taskBriefing(t api.Task, name string) string {
+func ordinaryTeamMemberCount(agents []api.Agent, currentName string) int {
+	members := map[string]struct{}{}
+	for _, agent := range agents {
+		if agent.Role == api.AgentRoleDatabaseHandler || agent.Name == "" {
+			continue
+		}
+		members[strings.ToLower(agent.Name)] = struct{}{}
+	}
+	if currentName != "" {
+		members[strings.ToLower(currentName)] = struct{}{}
+	}
+	return len(members)
+}
+
+func orchestratorRolePolicy(t api.Task, name string, agents []api.Agent, plannedTeamMembers int) string {
+	policy := "Your role is limited to decisions, planning, routing work, and reviewing evidence. Builders own all implementation, including shared schema/types and integration code; assign those files explicitly and review the resulting evidence instead of editing them yourself."
+	teamMembers := ordinaryTeamMemberCount(agents, name)
+	if plannedTeamMembers > teamMembers {
+		teamMembers = plannedTeamMembers
+	}
+	if teamMembers == 1 && !t.AllowAgentSpawn {
+		return policy + " You may implement only because both required exception conditions are present: you are the sole non-database team member and agent spawning is disabled. Re-check the roster and task setting before relying on this exception."
+	}
+	return policy + " You must not implement. The only implementation exception requires both that you are the sole non-database team member and that agent spawning is disabled. Expensive model choice, idle or retired workers, unavailable capacity, quota exhaustion, cost, or a consumed helper allowance do not create an exception."
+}
+
+func taskBriefing(t api.Task, name string, agents ...api.Agent) string {
+	return taskBriefingForRoster(t, name, agents, 0)
+}
+
+func taskBriefingForRoster(t api.Task, name string, agents []api.Agent, plannedTeamMembers int) string {
 	policy := "Agent spawning is disabled for this task; ask the owner to add helpers or enable it in task settings."
 	if t.AllowAgentSpawn {
 		policy = fmt.Sprintf("You may use tt spawn for concrete independent assignments. This task allows at most %d additional helper identities in total, including finished helpers; descendants share the same allowance. Existing helpers can resume. The hub also limits simultaneously open agents.", t.MaxNewAgents)
 	}
 	if t.Orchestrator != "" {
 		if strings.EqualFold(name, t.Orchestrator) {
-			policy += "\nYou are the MAIN ORCHESTRATOR. Your first order of business is to introduce yourself on the board, state the objective and how members should check in. Receive introductions, assign bounded work with explicit ownership and acceptance checks, integrate results, resolve conflicts, and own the final response. Do not acknowledge acknowledgements or duplicate work already assigned. Do not wait indefinitely for a missing member: use the roster and report an actual blocker. Keep a delivery ledger for important assignments with the posted message sequence and named recipient. At meaningful checkpoints and before waiting, retiring a worker, or claiming completion, run tt agents --json and compare that sequence with the recipient's readUpTo, status, and availability. A cursor at or beyond the sequence proves retrieval, not completion; require the assigned result and verification. Detect a resume followed by retirement before the assignment was retrieved. If required work remains unread and its recipient is retired, offline, or idle, verify availability and make one explicit recovery decision: when appropriate resume a retired worker and point it to the existing assignment, reassign with a clear ownership transfer, or report a concrete blocker. Do not busy-poll, blast duplicate assignments, or create acknowledgement loops. Respect intentional retirement and owner instructions; never override them merely to clear unread mail. You own team retirement: accept each worker's results and verification, confirm no review or dependent work still needs them, then run tt retire NAME. This works across machines and preserves terminals and results. The database_handler is a continuing project role: do not retire it during ordinary worker closeout while the project remains open; explicit owner retirement is still respected. Do not retire an agent with unfinished work merely because it is temporarily idle. When acceptance checks pass, post the integrated final result and retire all remaining workers including helpers; the active database_handler is the exception. Verify the roster and leave yourself available for the owner. To reuse a retired worker, explicitly run tt resume NAME and send a concrete assignment. Never use tt close or kill tmux sessions as routine cleanup."
+			policy += "\nYou are the MAIN ORCHESTRATOR. " + orchestratorRolePolicy(t, name, agents, plannedTeamMembers) + " These are instructions, not a runtime sandbox or API authorization boundary; report work evidence, not technical enforcement. First introduce yourself on the board, state the objective and check-in request. Assign bounded work with explicit owners and acceptance checks, review results, route conflict resolution, and own the final response. Avoid duplicate work and acknowledgement loops. Keep a delivery ledger of important assignment message sequences and recipients. At checkpoints and before waiting, retirement or completion, run tt agents --json; compare each sequence with readUpTo, status and availability. Retrieval is not completion: require results and verification. For unread required work, make one explicit choice to tt resume NAME and point to the existing order, transfer ownership, or report a concrete blocker; respect intentional retirement and do not busy-poll. Accept a worker's evidence and check dependencies before tt retire NAME. Never retire unfinished work merely because it is idle. The database_handler is a continuing project role; respect explicit owner retirement. At acceptance, post the integrated result and retire all remaining workers including helpers; the active database_handler is the exception. Verify the roster and leave yourself available for the owner. Never use tt close or kill tmux sessions as routine cleanup."
 		} else {
-			policy += fmt.Sprintf("\nMain orchestrator: %s. Your FIRST ORDER OF BUSINESS is to introduce yourself to this orchestrator using tt post --to %s. State your name, role, machine/working directory, available tools, and readiness or blocker in one concise message. Use tt tools --runtime codex --json for a Codex tool inventory when available; distinguish a live thread inventory from host configuration and do not claim an untested tool works. If the orchestrator has not registered yet, post one introduction on the board explicitly addressed to %s; do not busy-poll or repeat it. Then inspect or edit only within a recorded work order assigned by the orchestrator. Do not reply just to acknowledge other members' introductions.", t.Orchestrator, t.Orchestrator, t.Orchestrator)
+			policy += fmt.Sprintf("\nMain orchestrator: %s. It decides, plans, routes work and reviews evidence; builders own assigned implementation, including shared schema/types and integration code. Preserve any assigned read-only or other non-builder role. Your FIRST ORDER OF BUSINESS is one concise introduction using tt post --to %s with your name, role, machine/directory, tool inventory and readiness/blocker. For Codex use tt tools --runtime codex --json when available; distinguish the live thread from host configuration and do not claim untested tools. If the orchestrator is not registered, post once on the board addressed to %s; do not poll or repeat it. Then work only within its recorded order and do not acknowledge introductions.", t.Orchestrator, t.Orchestrator, t.Orchestrator)
 		}
 	}
 	policy += "\nWORK AUDIT: All implementation, investigation, validation and deployment work must originate from a durable bug or feature. Before starting, obtain a recorded bounded work order through the project Database handler. Intake and board/inbox/roster coordination may establish that record first. Cite the work-item ID and work-order message sequence in assignments, progress, results and release evidence. Keep scope, file ownership, acceptance checks and dependencies explicit. Send scope changes and new discoveries to the handler before starting additional work. A message alone is intake, not a substitute for a committed record. Report results and verification to the handler for revision-checked completion tracking; do not declare the work item complete before the handler confirms the saved update. This is an agent instruction/audit workflow, not API authorization enforcement; human UI access remains available."
@@ -63,7 +93,11 @@ func taskBriefing(t api.Task, name string) string {
 }
 
 func agentTaskBriefing(t api.Task, name, role string, agents []api.Agent) string {
-	briefing := taskBriefing(t, name)
+	return agentTaskBriefingForLaunch(t, name, role, agents, 0)
+}
+
+func agentTaskBriefingForLaunch(t api.Task, name, role string, agents []api.Agent, plannedTeamMembers int) string {
+	briefing := taskBriefingForRoster(t, name, agents, plannedTeamMembers)
 	if role == api.AgentRoleDatabaseHandler {
 		return briefing + "\nYou are this project's durable Database handler and the sole agent owner of ALL work-item database interactions: list/get/create/update/dispatch through tt work-items. Handle intake, lookup, work orders, scope changes and completion requests for other agents. Convert requested bugs and features into the hub's authoritative records before issuing a work order; this intake/coordination establishes the audit record and does not require a pre-existing item. Preserve original source context. For board intake, use the original message sequence as --source-seq and a stable retry key such as source-SEQ-item-N with --request-id; use --body-file for descriptions and expected --revision for updates/dispatches. Read back the committed record and verify its ID, revision and intended contents before reporting success. Similar titles are not proof of duplication. Return the saved work-item ID/revision and a bounded work order naming implementation owner, scope, owned files/artifacts, acceptance checks and dependencies. Retain assignment/result message links and verification evidence in the record; preserve owner text when appending the audit trail. Record scope changes before authorizing additional work. Track completion only after the lead accepts implementation and verification and required dependencies are resolved; report saved status/revision after read-back. Do not implement reported work or launch helpers merely because you logged it. Stay done and available while the project is open; do not poll continuously, and respect explicit owner retirement. AIV/MCP integration is deferred."
 	}
