@@ -5,7 +5,9 @@ import (
 	"flag"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -26,6 +28,27 @@ func TestWrapPreservesArguments(t *testing.T) {
 	out, runErr := exec.Command("/bin/sh", "-c", command).Output()
 	if err != nil || runErr != nil || string(out) != "explicitshell" {
 		t.Fatal("explicit shell broken")
+	}
+}
+
+func TestWrapConsumesPrivateAgentCommandFileOnce(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "launch")
+	if err := os.WriteFile(path, []byte("printf exact-context"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	command, err := wrapCommand([]string{"--shell-file", path})
+	if err != nil || command != "printf exact-context" {
+		t.Fatalf("consume: %q %v", command, err)
+	}
+	if _, err = os.Stat(path); !os.IsNotExist(err) {
+		t.Fatalf("consumed command survived: %v", err)
+	}
+	unsafe := filepath.Join(t.TempDir(), "unsafe")
+	if err = os.WriteFile(unsafe, []byte("true"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = wrapCommand([]string{"--shell-file", unsafe}); err == nil {
+		t.Fatal("unsafe command file accepted")
 	}
 }
 

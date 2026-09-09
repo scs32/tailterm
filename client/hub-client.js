@@ -75,14 +75,6 @@ export function createHubClient({ fetchImpl, baseURL, token = "" }) {
     closeTask: (id) => request(`/v1/tasks/${id}`, { method: "DELETE" }),
     listWorkItems: (params = {}) => request("/v1/work-items" + q(params)),
     getWorkItem: (task, id) => request(`/v1/tasks/${task}/work-items/${id}`),
-    listWorkItemRevisions: (task, id, params = {}) =>
-      request(`/v1/tasks/${task}/work-items/${id}/revisions` + q(params)),
-    getWorkItemRevision: (task, id, revision) =>
-      request(`/v1/tasks/${task}/work-items/${id}/revisions/${revision}`),
-    listWorkItemHistoryGaps: (task, id, params = {}) =>
-      request(`/v1/tasks/${task}/work-items/${id}/history-gaps` + q(params)),
-    listWorkItemMessages: (task, id, params = {}) =>
-      request(`/v1/tasks/${task}/work-items/${id}/messages` + q(params)),
     createWorkItem: (task, body) =>
       request(`/v1/tasks/${task}/work-items`, { method: "POST", body }),
     updateWorkItem: (task, id, body) =>

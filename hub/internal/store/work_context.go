@@ -20,12 +20,20 @@ const maxAgentWorkItemContextBytes = 128 * 1024
 // immutable history reader. Its history payload is owned by that reader; routing
 // verifies only the source coordinates and stores the payload byte-for-byte.
 type preparedContextEnvelope struct {
-	Version          int                  `json:"version"`
-	ItemTaskID       string               `json:"itemTaskId"`
-	ItemID           string               `json:"itemId"`
-	ItemRevision     int64                `json:"itemRevision"`
-	WorkOrderMessage api.MessageReference `json:"workOrderMessage"`
-	History          json.RawMessage      `json:"history"`
+	Version          int                    `json:"version"`
+	ItemTaskID       string                 `json:"itemTaskId"`
+	ItemID           string                 `json:"itemId"`
+	ItemRevision     int64                  `json:"itemRevision"`
+	WorkOrderMessage api.MessageReference   `json:"workOrderMessage"`
+	History          preparedContextHistory `json:"history"`
+}
+
+type preparedContextHistory struct {
+	Revision  api.WorkItemRevision      `json:"revision"`
+	Revisions []api.WorkItemRevision    `json:"revisions"`
+	Gaps      []api.HistoryGap          `json:"gaps"`
+	Messages  []api.WorkItemMessageLink `json:"messages"`
+	Coverage  api.HistoryCoverage       `json:"coverage"`
 }
 
 func validateAgentWorkItemRequest(q queryRower, ctx context.Context, targetTaskID string, req *api.AgentWorkItemRequest) (int64, error) {
@@ -38,9 +46,37 @@ func validateAgentWorkItemRequest(q queryRower, ctx context.Context, targetTaskI
 		return 0, api.ErrInvalid
 	}
 	var envelope preparedContextEnvelope
-	if err := json.Unmarshal(req.ContextBundle, &envelope); err != nil || envelope.Version != 1 || len(envelope.History) == 0 || string(envelope.History) == "null" ||
+	if err := json.Unmarshal(req.ContextBundle, &envelope); err != nil || envelope.Version != 1 ||
 		envelope.ItemTaskID != req.ItemTaskID || envelope.ItemID != req.ItemID || envelope.ItemRevision != req.ItemRevision || envelope.WorkOrderMessage != req.WorkOrderMessage {
 		return 0, api.ErrInvalid
+	}
+	exact := envelope.History.Revision
+	if exact.TaskID != req.ItemTaskID || exact.ItemID != req.ItemID || exact.Revision != req.ItemRevision ||
+		exact.AttributionKind != "shared_workspace_claim" ||
+		(exact.Provenance != "native" && exact.Provenance != "reconstructed_change_log" && exact.Provenance != "current_row_checkpoint") ||
+		envelope.History.Coverage.ObservedCurrentRevision != req.ItemRevision || envelope.History.Coverage.ConversationLinks != "explicit_only" {
+		return 0, api.ErrInvalid
+	}
+	seenExact := false
+	previousRevision := int64(0)
+	for _, revision := range envelope.History.Revisions {
+		if revision.TaskID != req.ItemTaskID || revision.ItemID != req.ItemID || revision.Revision <= previousRevision || revision.Revision > req.ItemRevision {
+			return 0, api.ErrInvalid
+		}
+		previousRevision = revision.Revision
+		seenExact = seenExact || revision.Revision == req.ItemRevision
+	}
+	if !seenExact {
+		return 0, api.ErrInvalid
+	}
+	orderInBundle := false
+	for _, link := range envelope.History.Messages {
+		if link.Message.TaskID == req.WorkOrderMessage.TaskID && link.Message.Seq == req.WorkOrderMessage.Seq && link.Relationship == "primary" {
+			orderInBundle = true
+		}
+	}
+	if !orderInBundle {
+		return 0, workItemConflict("work-order message is absent from the prepared explicit history")
 	}
 	// Admission retains the current-row CAS and structured order relationship.
 	// The bundle's immutable revision/history payload is prepared by the handler

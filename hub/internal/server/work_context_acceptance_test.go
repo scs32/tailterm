@@ -55,10 +55,20 @@ func TestAgentWorkItemContextHTTPAcceptanceAndLegacyCompatibility(t *testing.T) 
 
 func syntheticHTTPContext(t *testing.T, item api.WorkItem, order api.Message) []byte {
 	t.Helper()
+	revision := api.WorkItemRevision{
+		ItemID: item.ID, TaskID: item.TaskID, Kind: item.Kind, Title: item.Title, Description: item.Description,
+		Status: item.Status, Priority: item.Priority, ItemSeq: item.Seq, Revision: item.Revision,
+		CreatedBy: item.CreatedBy, UpdatedBy: item.UpdatedBy, CreatedAt: item.CreatedAt, UpdatedAt: item.UpdatedAt,
+		AttributionKind: "shared_workspace_claim", ChangeKind: "created", Provenance: "native",
+	}
 	data, err := json.Marshal(map[string]any{
 		"version": 1, "itemTaskId": item.TaskID, "itemId": item.ID, "itemRevision": item.Revision,
 		"workOrderMessage": api.MessageReference{TaskID: item.TaskID, Seq: order.Seq},
-		"history":          map[string]any{"revision": item, "messages": []api.Message{order}, "coverage": map[string]any{"complete": true, "conversationLinks": "explicit_only"}},
+		"history": map[string]any{
+			"revision": revision, "revisions": []api.WorkItemRevision{revision},
+			"messages": []api.WorkItemMessageLink{{ItemRevision: item.Revision, RevisionCoverage: "verified", Relationship: "primary", Message: order}},
+			"coverage": api.HistoryCoverage{Complete: true, ObservedCurrentRevision: item.Revision, LatestMaterialized: item.Revision, SnapshotCount: 1, ConversationLinks: "explicit_only"},
+		},
 	})
 	if err != nil {
 		t.Fatal(err)

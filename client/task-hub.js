@@ -1279,57 +1279,59 @@ export function createTaskHub(host) {
         selector.disabled = true;
         const id = selector.value;
         try {
-          const item = items.find(
-            (candidate) => candidate.id === itemSelector.value,
-          );
-          const workOrderMessageSeq = Number(
-            form.querySelector("#team-work-order").value,
-          );
-          if (
-            !item ||
-            !Number.isSafeInteger(workOrderMessageSeq) ||
-            workOrderMessageSeq < 1
-          )
-            throw new Error(
-              "Choose an active bug or feature and enter its recorded work-order Board message number.",
+          if (!plan) {
+            const item = items.find(
+              (candidate) => candidate.id === itemSelector.value,
             );
-          const routing = {
-            workItemTaskId: item.taskId,
-            workItemId: item.id,
-            workItemRevision: item.revision,
-            workOrderTaskId: item.taskId,
-            workOrderMessageSeq,
-          };
-          routing.workContextBundle = await prepareWorkItemContext(client, {
-            itemTaskId: item.taskId,
-            itemId: item.id,
-            itemRevision: item.revision,
-            workOrderMessage: {
-              taskId: item.taskId,
-              seq: workOrderMessageSeq,
-            },
-          });
-          plan = teamLaunches(
-            team,
-            host.getServers(),
-            form.querySelector("#team-main-server")?.value || mainServer?.id,
-            projects.read(),
-            routing,
-          );
-          const mainChoice = form.querySelector("#team-main-server");
-          if (mainChoice) mainChoice.disabled = true;
-          form
-            .querySelectorAll(
-              "#team-project-folders input, #team-project-folders button",
+            const workOrderMessageSeq = Number(
+              form.querySelector("#team-work-order").value,
+            );
+            if (
+              !item ||
+              !Number.isSafeInteger(workOrderMessageSeq) ||
+              workOrderMessageSeq < 1
             )
-            .forEach((el) => (el.disabled = true));
-          const existingTask = await client.getTask(id);
-          const policy = {};
-          if (team.swarm) policy.swarm = true;
-          if (!existingTask.task.orchestrator)
-            policy.orchestrator = team.orchestrator || team.members[0].name;
-          if (Object.keys(policy).length) await client.updateTask(id, policy);
-          bound.add(id);
+              throw new Error(
+                "Choose an active bug or feature and enter its recorded work-order Board message number.",
+              );
+            const routing = {
+              workItemTaskId: item.taskId,
+              workItemId: item.id,
+              workItemRevision: item.revision,
+              workOrderTaskId: item.taskId,
+              workOrderMessageSeq,
+            };
+            routing.workContextBundle = await prepareWorkItemContext(client, {
+              itemTaskId: item.taskId,
+              itemId: item.id,
+              itemRevision: item.revision,
+              workOrderMessage: {
+                taskId: item.taskId,
+                seq: workOrderMessageSeq,
+              },
+            });
+            plan = teamLaunches(
+              team,
+              host.getServers(),
+              form.querySelector("#team-main-server")?.value || mainServer?.id,
+              projects.read(),
+              routing,
+            );
+            const mainChoice = form.querySelector("#team-main-server");
+            if (mainChoice) mainChoice.disabled = true;
+            form
+              .querySelectorAll(
+                "#team-project-folders input, #team-project-folders button",
+              )
+              .forEach((el) => (el.disabled = true));
+            const existingTask = await client.getTask(id);
+            const policy = {};
+            if (team.swarm) policy.swarm = true;
+            if (!existingTask.task.orchestrator)
+              policy.orchestrator = team.orchestrator || team.members[0].name;
+            if (Object.keys(policy).length) await client.updateTask(id, policy);
+            bound.add(id);
+          }
           await launchMembers(
             id,
             plan,
@@ -1343,14 +1345,9 @@ export function createTaskHub(host) {
         } catch (error) {
           status.textContent = formatError(error);
           button.textContent = "Retry remaining agents";
-          form
-            .querySelectorAll(
-              "#team-project-folders input, #team-project-folders button",
-            )
-            .forEach((el) => (el.disabled = false));
           if (progress.size)
             status.textContent +=
-              " Already started agents keep their folders; corrections apply to remaining agents.";
+              " Already started agents and the prepared item context stay fixed; retry starts only the remaining agents.";
           if (!progress.size) {
             selector.disabled = false;
             plan = null;

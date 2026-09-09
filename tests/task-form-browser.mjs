@@ -52,7 +52,8 @@ const launchServers = [];
 const launchCommands = [];
 let failLaunch = false,
   failAt = 0,
-  execs = 0;
+  execs = 0,
+  historyRequests = 0;
 const html = `<!doctype html><html><head><meta charset="utf-8"><link rel="stylesheet" href="/client/style.css"></head><body><div id="app"><div id="workspace"><aside></aside><main><header><div class="header-right"><button id="tailscale-login"><span class="online"></span>Connected</button></div></header><section class="terminal-shell"></section></main></div><dialog id="dialog"></dialog><div id="notice" hidden></div></div><script type="module">
 import {createTaskHub} from '/client/task-hub.js';
 import {createBoardView} from '/client/board-view.js';
@@ -82,7 +83,19 @@ const server = createServer(async (req, res) => {
       res.end(html);
       return;
     }
+    if (req.url === "/qa/history-requests") {
+      res.setHeader("content-type", "application/json");
+      res.end(JSON.stringify({ historyRequests }));
+      return;
+    }
     if (req.url.startsWith("/v1/")) {
+      if (
+        req.method === "GET" &&
+        /\/work-items\/wi_[0-9a-f]{16}\/(?:revisions|history-gaps|messages)/.test(
+          req.url,
+        )
+      )
+        historyRequests++;
       const chunks = [];
       for await (const b of req) chunks.push(b);
       const r = await fetch(`http://127.0.0.1:${port}` + req.url, {
@@ -654,8 +667,43 @@ try {
       await page.locator("#team-work-order").fill(String(routedOrder.seq));
       await page.locator("#team-main-server").selectOption("local");
       await page.locator('[data-project-server="local"]').fill(root);
+      const routedLaunchStart = execs;
+      const historyBefore = await (
+        await fetch(origin + "/qa/history-requests")
+      ).json();
+      failAt = execs + 2;
+      await page.locator('#team-launch-form button[type="submit"]').click();
+      await page
+        .locator("#team-launch-status")
+        .filter({ hasText: "Test launch failure" })
+        .waitFor();
+      const historyAfterFailure = await (
+        await fetch(origin + "/qa/history-requests")
+      ).json();
       await page.locator('#team-launch-form button[type="submit"]').click();
       await page.locator("#dialog").waitFor({ state: "hidden" });
+      const historyAfterRetry = await (
+        await fetch(origin + "/qa/history-requests")
+      ).json();
+      assert.equal(
+        historyAfterFailure.historyRequests - historyBefore.historyRequests,
+        4,
+      );
+      assert.equal(
+        historyAfterRetry.historyRequests,
+        historyAfterFailure.historyRequests,
+        "partial retry must not rebuild the immutable history bundle",
+      );
+      assert.equal(
+        execs - routedLaunchStart,
+        3,
+        "item-scoped retry starts only the failed team member",
+      );
+      assert.equal(
+        launchCommands.at(-1),
+        launchCommands.at(-2),
+        "item-scoped retry reuses the exact prepared launch bundle",
+      );
       const attached = await (
         await fetch("http://127.0.0.1:" + port + "/v1/tasks/" + target.id)
       ).json();
@@ -671,7 +719,7 @@ try {
       assert.ok(
         routedAgents.every(
           (agent) =>
-            agent.parentAgentId === "" &&
+            !agent.parentAgentId &&
             agent.readUpTo === unrelatedRouteMessage.seq &&
             agent.name.endsWith("-" + routedItem.id.slice(-8)),
         ),
@@ -683,12 +731,14 @@ try {
         )
       ).json();
       assert.deepEqual(
-        restoredContext.messages.map((message) => message.text),
+        restoredContext.bundle.history.messages.map(
+          (link) => link.message.text,
+        ),
         ["Synthetic bounded browser work order"],
       );
       assert.ok(
         launchCommands
-          .slice(-2)
+          .slice(-3)
           .every(
             (command) =>
               command.includes("--work-item") &&

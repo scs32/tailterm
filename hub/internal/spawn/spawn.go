@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
@@ -107,13 +108,43 @@ func Create(o Options) error {
 		args = append(args, "-c", o.Cwd)
 	}
 	for k, val := range o.Env {
+		// The full briefing is already present in the private one-shot command
+		// file below. Repeating it as a tmux -e argument can exceed tmux's
+		// command limit and is unnecessary after the model process starts.
+		if k == "TAILTERM_BRIEFING" {
+			continue
+		}
 		args = append(args, "-e", k+"="+val)
 	}
-	agentCmd := ShellQuote(o.Self) + " wrap --shell " + ShellQuote(o.Command)
+	launch, err := os.CreateTemp("", ".tailterm-agent-command-*")
+	if err != nil {
+		return fmt.Errorf("create private agent command: %w", err)
+	}
+	launchPath := launch.Name()
+	removeLaunch := true
+	defer func() {
+		if removeLaunch {
+			_ = os.Remove(launchPath)
+		}
+	}()
+	if err = launch.Chmod(0600); err == nil {
+		_, err = launch.WriteString(o.Command)
+	}
+	closeErr := launch.Close()
+	if err != nil {
+		return fmt.Errorf("write private agent command: %w", err)
+	}
+	if closeErr != nil {
+		return fmt.Errorf("close private agent command: %w", closeErr)
+	}
+	agentCmd := ShellQuote(o.Self) + " wrap --shell-file " + ShellQuote(filepath.Clean(launchPath))
 	args = append(args, agentCmd)
 	if out, err := tmux(args...).CombinedOutput(); err != nil {
 		return fmt.Errorf("tmux new-session: %s", strings.TrimSpace(string(out)))
 	}
+	// The wrapper owns deletion after tmux accepts the session. It may not have
+	// opened the file yet when new-session returns.
+	removeLaunch = false
 
 	return nil
 }

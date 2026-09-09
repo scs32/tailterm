@@ -827,11 +827,33 @@ func wrapCommand(args []string) (string, error) {
 	if len(args) == 2 && args[0] == "--shell" {
 		return args[1], nil
 	}
+	if len(args) == 2 && args[0] == "--shell-file" {
+		path := args[1]
+		if !filepath.IsAbs(path) {
+			return "", errors.New("agent command file must be absolute")
+		}
+		info, err := os.Lstat(path)
+		if err != nil || !info.Mode().IsRegular() || info.Mode().Perm() != 0600 || info.Size() > 512*1024 {
+			return "", errors.New("agent command file is missing, unsafe or oversized")
+		}
+		data, err := os.ReadFile(path)
+		removeErr := os.Remove(path)
+		if err != nil {
+			return "", err
+		}
+		if removeErr != nil {
+			return "", fmt.Errorf("remove consumed agent command: %w", removeErr)
+		}
+		if len(data) == 0 {
+			return "", errors.New("agent command file is empty")
+		}
+		return string(data), nil
+	}
 	if len(args) > 0 && args[0] == "--" {
 		args = args[1:]
 	}
 	if len(args) == 0 {
-		return "", errors.New("usage: tt wrap -- PROGRAM [ARGS] or tt wrap --shell COMMAND")
+		return "", errors.New("usage: tt wrap -- PROGRAM [ARGS], tt wrap --shell COMMAND, or tt wrap --shell-file PATH")
 	}
 	words := make([]string, len(args))
 	for i, a := range args {

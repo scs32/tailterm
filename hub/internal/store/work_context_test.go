@@ -23,6 +23,34 @@ func syntheticPreparedContext(t *testing.T, item api.WorkItem, order api.Message
 	return data
 }
 
+func syntheticHistory(item api.WorkItem, messages ...api.Message) map[string]any {
+	revisions := make([]api.WorkItemRevision, 0, item.Revision)
+	for revision := int64(1); revision <= item.Revision; revision++ {
+		revisions = append(revisions, api.WorkItemRevision{
+			ItemID: item.ID, TaskID: item.TaskID, Kind: item.Kind, Title: item.Title, Description: item.Description,
+			Status: item.Status, Priority: item.Priority, ItemSeq: item.Seq, Revision: revision,
+			CreatedBy: item.CreatedBy, UpdatedBy: item.UpdatedBy, CreatedAt: item.CreatedAt, UpdatedAt: item.UpdatedAt,
+			AttributionKind: "shared_workspace_claim", ChangeKind: "updated", Provenance: "native",
+		})
+	}
+	links := make([]api.WorkItemMessageLink, 0, len(messages))
+	for _, message := range messages {
+		link := api.WorkItemMessageLink{Message: message, RevisionCoverage: "verified"}
+		if len(message.WorkItems) == 1 {
+			link.ItemRevision = message.WorkItems[0].ItemRevision
+			link.Relationship = message.WorkItems[0].Relationship
+		} else {
+			link.ItemRevision = 1
+			link.Source = true
+		}
+		links = append(links, link)
+	}
+	return map[string]any{
+		"revision": revisions[len(revisions)-1], "revisions": revisions, "messages": links,
+		"coverage": api.HistoryCoverage{Complete: true, ObservedCurrentRevision: item.Revision, LatestMaterialized: item.Revision, SnapshotCount: item.Revision, ConversationLinks: "explicit_only"},
+	}
+}
+
 func contextLinkedMessage(t *testing.T, s *Store, task api.Task, item api.WorkItem, text, key string, order *api.MessageReference) api.Message {
 	t.Helper()
 	message, err := s.PostMessage(context.Background(), task.ID, api.PostMessageRequest{
@@ -82,9 +110,7 @@ func TestAgentWorkItemContextAdmissionRestorationAndReplacement(t *testing.T) {
 	binding := &api.AgentWorkItemRequest{
 		ItemTaskID: task.ID, ItemID: item.ID, ItemRevision: item.Revision,
 		WorkOrderMessage: *orderRef,
-		ContextBundle: syntheticPreparedContext(t, item, *orderRef, map[string]any{
-			"revision": item, "messages": []api.Message{source, order, evidence}, "coverage": map[string]any{"complete": true, "conversationLinks": "explicit_only"},
-		}),
+		ContextBundle:    syntheticPreparedContext(t, item, *orderRef, syntheticHistory(item, source, order, evidence)),
 	}
 	worker, err := s.AddAgent(ctx, task.ID, api.AddAgentRequest{
 		Name: "worker-context", Host: "fixture", Session: "worker-context", Runtime: "codex", WorkItem: binding,
@@ -187,22 +213,22 @@ func TestAgentWorkItemContextRejectsStaleMismatchedAndHelperAdmission(t *testing
 		t.Fatal(err)
 	}
 	req := &api.AgentWorkItemRequest{ItemTaskID: task.ID, ItemID: item.ID, ItemRevision: item.Revision, WorkOrderMessage: api.MessageReference{TaskID: task.ID, Seq: unlinked.Seq}}
-	req.ContextBundle = syntheticPreparedContext(t, item, req.WorkOrderMessage, map[string]any{"revision": item})
+	req.ContextBundle = syntheticPreparedContext(t, item, req.WorkOrderMessage, syntheticHistory(item, unlinked))
 	if _, err = s.AddAgent(ctx, task.ID, api.AddAgentRequest{Name: "bad-order", Host: "fixture", Session: "bad-order", Runtime: "codex", WorkItem: req}, by); !errors.Is(err, api.ErrConflict) {
 		t.Fatalf("unlinked order accepted: %v", err)
 	}
 	order := contextLinkedMessage(t, s, task, item, "Linked order", "fail-order", nil)
 	req.WorkOrderMessage.Seq = order.Seq
-	req.ContextBundle = syntheticPreparedContext(t, item, req.WorkOrderMessage, map[string]any{"revision": item})
+	req.ContextBundle = syntheticPreparedContext(t, item, req.WorkOrderMessage, syntheticHistory(item, order))
 	req.ItemRevision++
 	staleItem := item
 	staleItem.Revision = req.ItemRevision
-	req.ContextBundle = syntheticPreparedContext(t, staleItem, req.WorkOrderMessage, map[string]any{"revision": staleItem})
+	req.ContextBundle = syntheticPreparedContext(t, staleItem, req.WorkOrderMessage, syntheticHistory(staleItem, order))
 	if _, err = s.AddAgent(ctx, task.ID, api.AddAgentRequest{Name: "stale", Host: "fixture", Session: "stale", Runtime: "codex", WorkItem: req}, by); !errors.Is(err, api.ErrConflict) {
 		t.Fatalf("stale revision accepted: %v", err)
 	}
 	req.ItemRevision = item.Revision
-	req.ContextBundle = syntheticPreparedContext(t, item, req.WorkOrderMessage, map[string]any{"revision": item})
+	req.ContextBundle = syntheticPreparedContext(t, item, req.WorkOrderMessage, syntheticHistory(item, order))
 	if _, err = s.AddAgent(ctx, task.ID, api.AddAgentRequest{Name: "helper", Host: "fixture", Session: "helper", Runtime: "codex", ParentAgentID: parent.ID, WorkItem: req}, by); !errors.Is(err, api.ErrAgentSpawnLimit) {
 		t.Fatalf("item binding bypassed helper limit: %v", err)
 	}
