@@ -1,5 +1,40 @@
 # Development handoff — September 9, 2026
 
+## September 9 Safari stylesheet recovery — mitigation released, cache rule blocked
+
+Work item `wi_2d5111fd8c42d8e7`, bounded order #1082 and cache-delivery
+amendment #1122/#1124 produced a matching isolated failure and recovery test.
+Chromium and WebKit remain unstyled when a missing hashed stylesheet's 200 HTML
+SPA fallback is cached immutable; both recover on reload when it is revalidated.
+Fresh current-release WebKit did not reproduce the owner report, so the exact
+owner-session cause is not claimed.
+
+Application commit `37bfbd25085ef1706d6893891471142ec03ce984` is deployed to
+`https://tailos.tailarr.com` (`https://a2069721.tailos.pages.dev`, deployment
+`a2069721-e7f0-4e37-a58f-63d9cf0579ad`) and served by unchanged Mini preview
+PID 28664 at `http://127.0.0.1:4318`. All three origins match the retained
+package's 81 served files and manifest SHA-256
+`84d3600051f20e1d3efd7e0d7307202bbca863c4d5807ac36eb5c6fc8609d2cc`.
+Chromium and Playwright WebKit passed styled desktop/mobile load and reload,
+production WASM startup, and isolated synthetic-vault restoration with preserved
+server/session identities and no page errors. Native Safari was unavailable
+because remote automation is disabled; no owner preference or profile changed.
+
+The custom domain still overrides packaged `no-cache` asset headers with
+`max-age=14400`, including a missing CSS URL served as 200 `text/html`. The same
+override applies to a `/bundles` probe, so the tested bundle-path commit
+`d8190d7a4d8f9c02722249a731f8db0cf02b3b76` is retained but deliberately
+unshipped. Authorized Cloudflare settings/rule reads returned 403, no setting was
+changed, and immediate reload recovery remains blocked pending least-privileged
+access or an owner-performed host-scoped Dashboard change. See
+[the investigation report](safari-css.md) and
+[the release/blocker receipt](releases/tailos-2026-09-09-safari-css.json).
+Rollback is the retained routing package
+`.build/releases/work-item-routing-1e482f6/dist-static` and prior deployment
+`https://1967ad21.tailos.pages.dev`; it restores the reproduced immutable-cache
+risk. Hub, CLI, database, Tailscale, TrueNAS networking, relays, Air preview,
+the old site, live records and owner sessions were unchanged.
+
 ## September 9 work-item session routing — release verified pending final acceptance
 
 Application `1e482f63c049727f77510d9d8561aee5ca5f7234` is deployed to

@@ -1,0 +1,171 @@
+{
+  "status": "mitigation_released_external_cache_rule_blocked",
+  "recordedAt": "2026-09-09T21:03:32Z",
+  "workItem": {
+    "id": "wi_2d5111fd8c42d8e7",
+    "revision": 9,
+    "sourceMessage": 1075,
+    "workOrder": {
+      "id": "wi_2d5111fd8c42d8e7-safari-css-1",
+      "message": 1082
+    },
+    "cacheDeliveryAmendment": {
+      "id": "wi_2d5111fd8c42d8e7-safari-css-1-amendment-1122",
+      "sourceMessage": 1122,
+      "handlerConfirmationMessage": 1124
+    },
+    "leadReviews": [1104, 1113, 1132],
+    "handlerInterimConfirmationMessage": 1110,
+    "latestEvidenceHandoffMessage": 1134
+  },
+  "diagnosis": {
+    "freshCurrentRelease": "Isolated Playwright WebKit desktop and mobile loaded 1,015 CSS rules and remained styled on normal load and reload; the fresh current release did not reproduce the owner report.",
+    "reproducedFailure": "Chromium and WebKit each cached one immutable 200 text/html SPA fallback for a missing hashed stylesheet, rejected it because of MIME type, and remained unstyled on reload.",
+    "reproducedRecovery": "With revalidation/no-cache each browser made a second stylesheet request on reload, received text/css, and became styled.",
+    "supportedConclusion": "A stale cached SPA fallback is a matching, test-covered failure mechanism; the exact cause and recovery of the owner's Safari session are not proven.",
+    "externalDelivery": "tailos.tailarr.com changes the package's no-cache asset response to max-age=14400. A missing CSS URL is a 200 text/html SPA fallback with the same four-hour lifetime. A /bundles probe receives the same override, invalidating a path-only workaround."
+  },
+  "releasedSource": {
+    "initialFixCommit": "95fdf867a3b5342a11dfac04f59ff0ca01e9997b",
+    "deployedCommit": "37bfbd25085ef1706d6893891471142ec03ce984",
+    "changes": [
+      "deploy/_headers requests Cache-Control: no-cache for /assets/*",
+      "client/style.css adds -webkit-text-size-adjust and text-size-adjust at 100%",
+      "tests/static-cache-browser.mjs covers immutable fallback failure and revalidated reload recovery in Chromium and WebKit"
+    ]
+  },
+  "releasedPackage": {
+    "worktree": "/Users/stephenspeicher/projects/tailterm/.build/releases/safari-css-37bfbd2",
+    "commit": "37bfbd25085ef1706d6893891471142ec03ce984",
+    "cleanSource": true,
+    "manifestEntries": 82,
+    "servedAssetsPerOrigin": 81,
+    "releaseSha256": "84d3600051f20e1d3efd7e0d7307202bbca863c4d5807ac36eb5c6fc8609d2cc",
+    "stylesheet": {
+      "path": "assets/index-Bkm6l0FY.css",
+      "sha256": "ee70f291a094abe1bff819c0c2b789bb9f594c3b836284483cad719f9f9d9cf1"
+    },
+    "mainScript": "assets/index-C6t4eEsv.js",
+    "productionWasmGzip": {
+      "path": "assets/tailserve-4uARE7-V.wasm.gz",
+      "sha256": "9930c542c204eaa46a5b239460ab07542a66596ea368cbec5e545a113861f41b"
+    }
+  },
+  "tailos": {
+    "origin": "https://tailos.tailarr.com",
+    "cloudflareProject": "tailos",
+    "deploymentId": "a2069721-e7f0-4e37-a58f-63d9cf0579ad",
+    "deployment": "https://a2069721.tailos.pages.dev",
+    "commit": "37bfbd25085ef1706d6893891471142ec03ce984",
+    "verifiedAssets": 81,
+    "customDomainHeaders": {
+      "releaseJson": "200 application/json; Cache-Control: no-cache",
+      "releasedCss": "200 text/css; charset=utf-8; Cache-Control: max-age=14400",
+      "missingCss": "200 text/html; charset=utf-8; Cache-Control: max-age=14400"
+    },
+    "deploymentHeaders": {
+      "releasedCss": "200 text/css; charset=utf-8; Cache-Control: no-cache, no-cache"
+    }
+  },
+  "miniPreview": {
+    "origin": "http://127.0.0.1:4318",
+    "servedDirectory": "/Users/stephenspeicher/projects/tailterm/dist-static",
+    "activation": "rsync -a --delete from the exact retained package",
+    "commit": "37bfbd25085ef1706d6893891471142ec03ce984",
+    "verifiedAssets": 81,
+    "releasedCss": "200 text/css; charset=utf-8; Cache-Control: no-cache",
+    "listener": {
+      "pidBefore": 28664,
+      "pidAfter": 28664,
+      "command": "node scripts/preview-static.mjs dist-static 127.0.0.1 4318",
+      "restarted": false
+    }
+  },
+  "browserAcceptance": {
+    "engines": ["Chromium", "Playwright WebKit"],
+    "origins": ["https://tailos.tailarr.com", "http://127.0.0.1:4318"],
+    "results": [
+      "normal load and reload styled with 1,015 CSS rules",
+      "CSS and JavaScript returned 200 with correct MIME types",
+      "production WASM started",
+      "isolated synthetic vault was generated and restored",
+      "server and session identities were preserved",
+      "desktop matching margins and 390-pixel mobile width passed",
+      "selection fill and muted placeholder styling passed",
+      "no page errors"
+    ],
+    "screenshots": {
+      "desktopTailosAndMiniSha256": "a2b99ec1e9343789f7bf9f5f28941267538be05e43a6e54103946dcde28d4c64",
+      "mobileTailosAndMiniSha256": "33ac34146a38a45f3716753b7b368f6566850e3120ec95cbd0e4e935c029ce93"
+    },
+    "nativeSafari": "Not run. Safari 26.5.2 on macOS 26.5.2 has remote automation disabled; no preference or owner profile was changed."
+  },
+  "verification": {
+    "commands": [
+      "npm test",
+      "node tests/static-cache-browser.mjs",
+      "npm run verify:release",
+      "node tests/deployed-browser.mjs https://tailos.tailarr.com",
+      "node tests/deployed-browser.mjs http://127.0.0.1:4318",
+      "focused deployed Playwright WebKit checks on TailOS and Mini",
+      "isolated preceding-release WebKit upgrade check",
+      "curl -fsSIL checks for release.json, released CSS, missing CSS, immutable Pages CSS and Mini CSS",
+      "81-file raw SHA-256 comparison on TailOS, immutable Pages URL and Mini"
+    ],
+    "results": [
+      "npm test: 128/128 passed",
+      "static-cache-browser: Chromium and WebKit passed",
+      "verify:release: 82/82 manifest entries passed",
+      "served asset hashes: 81/81 matched on each origin",
+      "deployed Chromium and focused WebKit checks passed"
+    ],
+    "knownUnrelatedFailure": "One broader npm run test:static attempt passed preceding phases but timed out at the existing task-form #command-results button (Task hub: configure); it was not treated as fix evidence or repeatedly rerun."
+  },
+  "cloudflareInspection": {
+    "authorization": "Read-only inspection and a narrow host-scoped correction were authorized by amendment #1122/#1124.",
+    "result": "Wrangler OAuth could list the tailarr.com zone, but sanitized GETs for browser_cache_ttl, http_request_cache_settings entrypoint ruleset, and active page rules each returned HTTP 403 unauthorized.",
+    "mutationAttempted": false,
+    "credentialDisclosure": false,
+    "remainingOptions": [
+      "Provide least-privileged tailarr.com cache/settings read and cache-rules edit access off Board, then inspect and propose a tailos-host-scoped reversible rule for lead review.",
+      "Have the owner inspect/change the rule in Cloudflare Dashboard, limited to tailos.tailarr.com, and return sanitized before/after evidence.",
+      "Explicitly accept four-hour fallback caching, which does not meet immediate reload recovery."
+    ]
+  },
+  "unshippedCandidate": {
+    "commit": "d8190d7a4d8f9c02722249a731f8db0cf02b3b76",
+    "worktree": "/Users/stephenspeicher/projects/tailterm/.build/releases/safari-css-d8190d7",
+    "releaseSha256": "e0418faf42b1647009e90bcbb606e252363b594f24f2fc29717f53d9eedda9b8",
+    "stylesheet": {
+      "path": "bundles/index-DwhUmdj4.css",
+      "sha256": "c9f617a93992d44468422555ae334405b40ecdaced4feb665a9a6de64901b67d"
+    },
+    "productionWasmGzip": {
+      "path": "bundles/tailserve-9bNf9sE9.wasm.gz",
+      "sha256": "d634825901dcc280ae3092c5a786045219f8bd19d75f3f0f691a68b5459f24d2"
+    },
+    "verification": "82-entry release verification, 128/128 JavaScript, Chromium/WebKit cache regression, speech browser and isolated WebKit upgrade passed.",
+    "activation": "Not deployed. /bundles/safari-cache-probe.css also received max-age=14400 on the custom domain, invalidating the path-only premise."
+  },
+  "rollback": {
+    "frontendCommit": "1e482f63c049727f77510d9d8561aee5ca5f7234",
+    "tailosDeployment": "https://1967ad21.tailos.pages.dev",
+    "retainedPackage": "/Users/stephenspeicher/projects/tailterm/.build/releases/work-item-routing-1e482f6/dist-static",
+    "procedure": "Deploy the exact retained package explicitly to Cloudflare project tailos, then rsync that exact package to Mini without restarting listener 28664.",
+    "warning": "This rollback restores immutable /assets caching and the reproduced stale-fallback risk."
+  },
+  "limits": [
+    "No native Safari validation; Playwright WebKit is not reported as native Safari.",
+    "No proof that the owner's exact session encountered the reproduced stale-fallback mechanism.",
+    "No owner confirmation that the affected session recovered.",
+    "The exact external Cloudflare rule is unidentified because the authorized read attempts returned 403.",
+    "The canonical custom domain does not currently provide immediate fallback recovery because its asset responses retain max-age=14400."
+  ],
+  "excluded": [
+    "hub, CLI, database or schema changes",
+    "Tailscale, TrueNAS networking or relay changes",
+    "Air preview or https://tailterm.tailarr.com",
+    "live task/profile fixtures, task closure or owner browser storage",
+    "existing session teardown"
+  ]
+}
