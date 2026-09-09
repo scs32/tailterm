@@ -124,7 +124,7 @@ func cmdWorkItemGet(e env, args []string) error {
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	if fs.NArg() != 1 || !api.ValidID(fs.Arg(0), "wi") {
+	if fs.NArg() != 1 || !api.ValidID(fs.Arg(0), "wi") || *revision < 0 {
 		return errors.New("usage: tt work-items get [--project ID] WI_ID")
 	}
 	project, err := workItemProject(e, *projectFlag)
@@ -345,7 +345,7 @@ func cmdWorkItemMessages(e env, args []string) error {
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	if fs.NArg() != 1 || !api.ValidID(fs.Arg(0), "wi") {
+	if fs.NArg() != 1 || !api.ValidID(fs.Arg(0), "wi") || *revision < 0 {
 		return errors.New("usage: tt work-items messages [--revision N] [--after N] WI_ID")
 	}
 	project, err := workItemProject(e, *projectFlag)

@@ -33,6 +33,10 @@ func TestWorkItemHistoryNativeKeyedReceiptsAndExplicitMessages(t *testing.T) {
 		t.Fatal(err)
 	}
 	title, empty, status := "Unicode こんにちは", "", "in_progress"
+	wrongRun := api.CreateWorkItemUpdate{ExpectedRevision: 1, Status: &status, AgentID: handler.ID, RunID: "run_0000000000000000", RequestID: "wrong-run"}
+	if _, _, err := s.CreateWorkItemUpdate(ctx, project.ID, item.ID, wrongRun, by); !errors.Is(err, api.ErrConflict) {
+		t.Fatalf("stale run = %v", err)
+	}
 	req := api.CreateWorkItemUpdate{ExpectedRevision: 1, Title: &title, Description: &empty, Status: &status, AgentID: handler.ID, RunID: handler.RunID, RequestID: "history-update"}
 	result, replay, err := s.CreateWorkItemUpdate(ctx, project.ID, item.ID, req, by)
 	if err != nil || replay {
@@ -68,6 +72,26 @@ func TestWorkItemHistoryNativeKeyedReceiptsAndExplicitMessages(t *testing.T) {
 	}
 	if messages.Coverage.ConversationLinks != "explicit_only" || messages.Coverage.SourceMessageCount != 1 || messages.Coverage.ExplicitMessageCount != 1 {
 		t.Fatalf("coverage: %+v", messages.Coverage)
+	}
+	target, _ := workItemProject(t, s, ctx, by, "History target", "target-lead")
+	if _, err := s.DispatchWorkItem(ctx, project.ID, item.ID, api.DispatchWorkItemRequest{Revision: 2, TargetTaskID: target.ID, RequestID: "history-cross-dispatch"}, by); err != nil {
+		t.Fatal(err)
+	}
+	dispatchMessages, err := s.ListWorkItemMessages(ctx, project.ID, item.ID, 2, 0, 65)
+	if err != nil || len(dispatchMessages.Links) != 1 || dispatchMessages.Links[0].Message.TaskID != target.ID || dispatchMessages.Links[0].ItemRevision != 2 || dispatchMessages.Coverage.DispatchCount != 1 {
+		t.Fatalf("cross-project message: %+v err=%v", dispatchMessages, err)
+	}
+	if _, err := s.GetWorkItemUpdateReceipt(ctx, project.ID, item.ID, req.RequestID, handler.ID, api.Caller{Node: "other-node", User: by.User}); !errors.Is(err, api.ErrNotFound) {
+		t.Fatalf("cross-caller receipt = %v", err)
+	}
+	other, err := s.CreateWorkItem(ctx, project.ID, api.CreateWorkItemRequest{Kind: "feature", Title: "Other item", RequestID: "other-item"}, by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	otherReq := req
+	otherReq.ExpectedRevision = 1
+	if _, _, err := s.CreateWorkItemUpdate(ctx, project.ID, other.ID, otherReq, by); !errors.Is(err, api.ErrConflict) {
+		t.Fatalf("cross-item request key = %v", err)
 	}
 
 	if _, err := s.CloseTask(ctx, project.ID, by); err != nil {
@@ -304,5 +328,109 @@ func TestWorkItemExactRevisionDistinguishesGapFromNotFound(t *testing.T) {
 	}
 	if _, err := s.GetWorkItemRevision(ctx, project.ID, item.ID, 4); !errors.Is(err, api.ErrNotFound) {
 		t.Fatalf("future revision=%v", err)
+	}
+}
+
+func TestWorkItemHistoryReconciliationContainsMalformedItems(t *testing.T) {
+	for _, tc := range []struct {
+		name, reason, mutation string
+	}{
+		{"invalid-json", "invalid_change_json", `UPDATE work_item_changes SET fields='{' WHERE item_id=? AND revision=2`},
+		{"duplicate", "duplicate_revision", `INSERT INTO work_item_changes(item_id,revision,kind,fields,agent_id,by_node,by_user,created_at) SELECT item_id,revision,kind,fields,agent_id,by_node,by_user,created_at FROM work_item_changes WHERE item_id=? AND revision=2`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "hub.sqlite")
+			ctx := context.Background()
+			by := api.Caller{Node: "malformed-node", User: "owner"}
+			s, err := Open(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			project, _ := workItemProject(t, s, ctx, by, "Malformed "+tc.name, "lead")
+			bad := createWorkItem(t, s, ctx, by, project, "malformed-create")
+			title := "revision two"
+			bad, err = s.UpdateWorkItem(ctx, project.ID, bad.ID, api.UpdateWorkItemRequest{Revision: 1, Title: &title}, by)
+			if err != nil {
+				t.Fatal(err)
+			}
+			good := createWorkItem(t, s, ctx, by, project, "unrelated-create")
+			if err := s.Close(); err != nil {
+				t.Fatal(err)
+			}
+			db, err := sql.Open("sqlite", path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err = db.Exec(`PRAGMA foreign_keys=OFF; DROP TABLE work_item_update_requests; DROP TABLE work_item_history_state; DROP TABLE work_item_history_gaps; DROP TABLE work_item_revisions`); err != nil {
+				t.Fatal(err)
+			}
+			if _, err = db.Exec(tc.mutation, bad.ID); err != nil {
+				t.Fatal(err)
+			}
+			if err := db.Close(); err != nil {
+				t.Fatal(err)
+			}
+			s, err = Open(path)
+			if err != nil {
+				t.Fatalf("one malformed item aborted the hub: %v", err)
+			}
+			defer s.Close()
+			gaps, err := s.ListWorkItemHistoryGaps(ctx, project.ID, bad.ID, 0, 65)
+			if err != nil || len(gaps.Gaps) != 1 || gaps.Gaps[0].ReasonCode != tc.reason {
+				t.Fatalf("gaps=%+v err=%v", gaps, err)
+			}
+			checkpoint, err := s.GetWorkItemRevision(ctx, project.ID, bad.ID, 2)
+			if err != nil || checkpoint.Provenance != "current_row_checkpoint" {
+				t.Fatalf("checkpoint=%+v err=%v", checkpoint, err)
+			}
+			status := "done"
+			if _, err := s.UpdateWorkItem(ctx, project.ID, good.ID, api.UpdateWorkItemRequest{Revision: 1, Status: &status}, by); err != nil {
+				t.Fatalf("unrelated item disabled: %v", err)
+			}
+		})
+	}
+}
+
+func TestWorkItemHistoryPreservesCollisionAndSnapshotsProspectiveEdit(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "hub.sqlite")
+	ctx := context.Background()
+	by := api.Caller{Node: "collision-node", User: "owner"}
+	s, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	project, _ := workItemProject(t, s, ctx, by, "Collision", "lead")
+	item := createWorkItem(t, s, ctx, by, project, "collision-create")
+	if _, err := s.db.Exec(`UPDATE work_items SET title='different current projection' WHERE id=?`, item.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	s, err = Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	gaps, err := s.ListWorkItemHistoryGaps(ctx, project.ID, item.ID, 0, 65)
+	if err != nil || len(gaps.Gaps) != 1 || gaps.Gaps[0].ReasonCode != "immutable_snapshot_collision" {
+		t.Fatalf("collision gaps=%+v err=%v", gaps, err)
+	}
+	preserved, err := s.GetWorkItemRevision(ctx, project.ID, item.ID, 1)
+	if err != nil || preserved.Title != "Retry loses state" {
+		t.Fatalf("preserved=%+v err=%v", preserved, err)
+	}
+	title := "prospective native revision"
+	updated, err := s.UpdateWorkItem(ctx, project.ID, item.ID, api.UpdateWorkItemRequest{Revision: 1, Title: &title}, by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	prospective, err := s.GetWorkItemRevision(ctx, project.ID, item.ID, 2)
+	if err != nil || prospective.Title != updated.Title || prospective.Provenance != "native" {
+		t.Fatalf("prospective=%+v err=%v", prospective, err)
+	}
+	history, err := s.ListWorkItemRevisions(ctx, project.ID, item.ID, 0, 65)
+	if err != nil || history.Coverage.Complete || history.Coverage.GapCount != 1 {
+		t.Fatalf("coverage=%+v err=%v", history.Coverage, err)
 	}
 }

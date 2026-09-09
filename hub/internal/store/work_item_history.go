@@ -169,6 +169,10 @@ func addHistoryGap(ctx context.Context, tx *sql.Tx, item api.WorkItem, first, la
 }
 
 func parseChange(item api.WorkItem, base *api.WorkItemRevision, c historyChange) (api.WorkItemRevision, error) {
+	changedAt, err := time.Parse(time.RFC3339Nano, c.created)
+	if err != nil {
+		return api.WorkItemRevision{}, fmt.Errorf("invalid change timestamp")
+	}
 	var fields map[string]json.RawMessage
 	if err := json.Unmarshal([]byte(c.fields), &fields); err != nil || fields == nil {
 		return api.WorkItemRevision{}, fmt.Errorf("invalid JSON")
@@ -181,15 +185,15 @@ func parseChange(item api.WorkItem, base *api.WorkItemRevision, c historyChange)
 	}
 	var r api.WorkItemRevision
 	if c.revision == 1 {
-		if base != nil || c.kind != "created" {
+		if base != nil || c.kind != "created" || len(fields) != 6 {
 			return r, fmt.Errorf("revision 1 is not a creation")
 		}
 		r = revisionFromItem(item, "", "created", "reconstructed_change_log", nil)
 		r.Title, r.Description, r.Status, r.Priority, r.Kind, r.SourceMessageSeq = "", "", "", "", "", 0
 		r.CreatedBy = api.Sender{AgentID: c.agent, Node: c.node, User: c.user}
-		r.CreatedAt = parseTS(c.created)
+		r.CreatedAt = changedAt
 	} else {
-		if base == nil || c.kind != "updated" {
+		if base == nil || c.kind != "updated" || len(fields) == 0 {
 			return r, fmt.Errorf("revision %d has no trusted predecessor", c.revision)
 		}
 		r = *base
@@ -198,7 +202,7 @@ func parseChange(item api.WorkItem, base *api.WorkItemRevision, c historyChange)
 	}
 	r.Revision = c.revision
 	r.UpdatedBy = api.Sender{AgentID: c.agent, Node: c.node, User: c.user}
-	r.UpdatedAt = parseTS(c.created)
+	r.UpdatedAt = changedAt
 	keys := make([]string, 0, len(fields))
 	for key, raw := range fields {
 		keys = append(keys, key)
@@ -295,6 +299,11 @@ func reconcileOneWorkItem(ctx context.Context, tx *sql.Tx, item api.WorkItem, de
 			}
 		}
 	}
+	if maxRevision > item.Revision {
+		if err := addHistoryGap(ctx, tx, item, item.Revision, maxRevision, "immutable_snapshot_collision", "an immutable snapshot revision exceeds the current projection", detected); err != nil {
+			return err
+		}
+	}
 	if maxRevision == item.Revision && base != nil && !sameProjection(*base, item) {
 		if err := addHistoryGap(ctx, tx, item, item.Revision, item.Revision, "immutable_snapshot_collision", "current projection differs from the preserved immutable snapshot", detected); err != nil {
 			return err
@@ -325,17 +334,23 @@ func reconcileOneWorkItem(ctx context.Context, tx *sql.Tx, item api.WorkItem, de
 	}
 	var staged []candidate
 	broken := false
+	gapEnd := func(revision int64) int64 {
+		if revision < item.Revision {
+			return item.Revision - 1
+		}
+		return revision
+	}
 	for revision := maxRevision + 1; revision <= item.Revision; revision++ {
 		group := changes[revision]
 		if len(group) == 0 {
-			if err := addHistoryGap(ctx, tx, item, revision, revision, "missing_revision", "no change row exists for revision", detected); err != nil {
+			if err := addHistoryGap(ctx, tx, item, revision, gapEnd(revision), "missing_revision", "the change chain is unavailable from this revision through the checkpoint", detected); err != nil {
 				return err
 			}
 			broken = true
 			break
 		}
 		if len(group) != 1 {
-			if err := addHistoryGap(ctx, tx, item, revision, revision, "duplicate_revision", fmt.Sprintf("%d change rows exist for revision", len(group)), detected); err != nil {
+			if err := addHistoryGap(ctx, tx, item, revision, gapEnd(revision), "duplicate_revision", fmt.Sprintf("%d change rows exist at the start of the unverified interval", len(group)), detected); err != nil {
 				return err
 			}
 			broken = true
@@ -343,7 +358,7 @@ func reconcileOneWorkItem(ctx context.Context, tx *sql.Tx, item api.WorkItem, de
 		}
 		next, parseErr := parseChange(item, base, group[0])
 		if parseErr != nil {
-			if err := addHistoryGap(ctx, tx, item, revision, revision, "invalid_change_json", parseErr.Error(), detected); err != nil {
+			if err := addHistoryGap(ctx, tx, item, revision, gapEnd(revision), "invalid_change_json", parseErr.Error(), detected); err != nil {
 				return err
 			}
 			broken = true
@@ -391,31 +406,54 @@ func reconcileOneWorkItem(ctx context.Context, tx *sql.Tx, item api.WorkItem, de
 }
 
 func validateHistoricalLinks(ctx context.Context, tx *sql.Tx, item api.WorkItem, detected string) error {
-	rows, err := tx.QueryContext(ctx, `SELECT item_revision FROM message_work_item_links WHERE item_task_id=? AND item_id=? ORDER BY message_seq`, item.TaskID, item.ID)
+	if item.SourceMessageSeq > 0 {
+		var n int
+		if err := tx.QueryRowContext(ctx, `SELECT count(*) FROM messages WHERE task_id=? AND seq=?`, item.TaskID, item.SourceMessageSeq).Scan(&n); err != nil {
+			return err
+		}
+		if n == 0 {
+			if err := addHistoryGap(ctx, tx, item, 1, 1, "unresolved_revision_link", "creation source message is unavailable", detected); err != nil {
+				return err
+			}
+		}
+	}
+	rows, err := tx.QueryContext(ctx, `SELECT message_task_id,message_seq,item_revision FROM message_work_item_links WHERE item_task_id=? AND item_id=? ORDER BY message_seq`, item.TaskID, item.ID)
 	if err != nil {
 		return err
 	}
-	var linked []int64
+	type linkedMessage struct {
+		task          string
+		seq, revision int64
+	}
+	var linked []linkedMessage
 	for rows.Next() {
-		var rev int64
-		if err := rows.Scan(&rev); err != nil {
+		var link linkedMessage
+		if err := rows.Scan(&link.task, &link.seq, &link.revision); err != nil {
 			rows.Close()
 			return err
 		}
-		linked = append(linked, rev)
+		linked = append(linked, link)
 	}
 	if err := rows.Err(); err != nil {
 		rows.Close()
 		return err
 	}
 	rows.Close()
-	for _, rev := range linked {
+	for _, link := range linked {
 		var n int
-		if err := tx.QueryRowContext(ctx, `SELECT count(*) FROM work_item_revisions WHERE item_task_id=? AND item_id=? AND revision=?`, item.TaskID, item.ID, rev).Scan(&n); err != nil {
+		if err := tx.QueryRowContext(ctx, `SELECT count(*) FROM work_item_revisions WHERE item_task_id=? AND item_id=? AND revision=?`, item.TaskID, item.ID, link.revision).Scan(&n); err != nil {
 			return err
 		}
 		if n == 0 {
-			if err := addHistoryGap(ctx, tx, item, rev, rev, "unresolved_revision_link", "explicit message link refers to an unavailable revision", detected); err != nil {
+			if err := addHistoryGap(ctx, tx, item, link.revision, link.revision, "unresolved_revision_link", "explicit message link refers to an unavailable revision", detected); err != nil {
+				return err
+			}
+		}
+		if err := tx.QueryRowContext(ctx, `SELECT count(*) FROM messages WHERE task_id=? AND seq=?`, link.task, link.seq).Scan(&n); err != nil {
+			return err
+		}
+		if n == 0 {
+			if err := addHistoryGap(ctx, tx, item, link.revision, link.revision, "unresolved_revision_link", "explicit linked message is unavailable", detected); err != nil {
 				return err
 			}
 		}
@@ -483,21 +521,26 @@ func (s *Store) GetWorkItemRevision(ctx context.Context, taskID, itemID string, 
 	if !api.ValidID(taskID, "tsk") || !api.ValidID(itemID, "wi") || revision < 1 {
 		return api.WorkItemRevision{}, api.ErrInvalid
 	}
-	r, err := scanWorkItemRevision(s.db.QueryRowContext(ctx, `SELECT `+workItemRevisionCols+` FROM work_item_revisions WHERE item_task_id=? AND item_id=? AND revision=?`, taskID, itemID, revision))
+	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		return api.WorkItemRevision{}, err
+	}
+	defer tx.Rollback()
+	item, itemErr := getWorkItem(tx, ctx, taskID, itemID)
+	if itemErr != nil {
+		return api.WorkItemRevision{}, itemErr
+	}
+	if revision > item.Revision {
+		return api.WorkItemRevision{}, api.ErrNotFound
+	}
+	r, err := scanWorkItemRevision(tx.QueryRowContext(ctx, `SELECT `+workItemRevisionCols+` FROM work_item_revisions WHERE item_task_id=? AND item_id=? AND revision=?`, taskID, itemID, revision))
 	if err == nil {
-		return r, nil
+		return r, tx.Commit()
 	}
 	if !errors.Is(err, sql.ErrNoRows) {
 		return r, err
 	}
-	item, itemErr := getWorkItem(s.db, ctx, taskID, itemID)
-	if itemErr != nil {
-		return r, itemErr
-	}
-	if revision > item.Revision {
-		return r, api.ErrNotFound
-	}
-	gap, gapErr := scanHistoryGap(s.db.QueryRowContext(ctx, `SELECT seq,first_revision,last_revision,reason_code,reason_detail,detected_at FROM work_item_history_gaps WHERE item_task_id=? AND item_id=? AND first_revision<=? AND last_revision>=? ORDER BY seq LIMIT 1`, taskID, itemID, revision, revision))
+	gap, gapErr := scanHistoryGap(tx.QueryRowContext(ctx, `SELECT seq,first_revision,last_revision,reason_code,reason_detail,detected_at FROM work_item_history_gaps WHERE item_task_id=? AND item_id=? AND first_revision<=? AND last_revision>=? ORDER BY seq LIMIT 1`, taskID, itemID, revision, revision))
 	if gapErr == nil {
 		return r, &WorkItemHistoryGapError{Gap: gap}
 	}

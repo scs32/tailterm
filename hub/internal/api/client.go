@@ -69,6 +69,12 @@ func (c *Client) doLimited(ctx context.Context, method, path string, body, out a
 		return err
 	}
 	if res.StatusCode >= 400 {
+		if res.StatusCode == http.StatusConflict {
+			var gap WorkItemHistoryGapResponse
+			if json.Unmarshal(data, &gap) == nil && gap.Gap.ReasonCode != "" {
+				return &WorkItemHistoryGapError{Response: gap}
+			}
+		}
 		var e ErrorResponse
 		_ = json.Unmarshal(data, &e)
 		if e.Error == "" {

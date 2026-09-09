@@ -174,3 +174,9 @@ type WorkItemHistoryGapResponse struct {
 	Error string     `json:"error"`
 	Gap   HistoryGap `json:"gap"`
 }
+
+type WorkItemHistoryGapError struct {
+	Response WorkItemHistoryGapResponse
+}
+
+func (e *WorkItemHistoryGapError) Error() string { return e.Response.Error }

@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"reflect"
@@ -176,6 +177,68 @@ func TestWorkItemHTTPHistoryPagesStayUnderNormalClientLimit(t *testing.T) {
 	}
 	if len(seen) != 105 {
 		t.Fatalf("saw %d revisions", len(seen))
+	}
+}
+
+func TestWorkItemHTTPMessagePagesStayUnderNormalClientLimit(t *testing.T) {
+	c := newClient(t)
+	task := c.task("bounded-history-messages")
+	item, err := c.st.CreateWorkItem(context.Background(), task.ID, api.CreateWorkItemRequest{Kind: "feature", Title: "Messages", RequestID: "bounded-message-create"}, c.who)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for index := 0; index < 105; index++ {
+		_, err := c.st.PostMessage(context.Background(), task.ID, api.PostMessageRequest{Text: strings.Repeat("<", api.MaxTextLen-16) + fmt.Sprintf("-%03d", index), RequestID: fmt.Sprintf("bounded-message-%03d", index), WorkItems: []api.MessageWorkItem{{ItemTaskID: task.ID, ItemID: item.ID, ItemRevision: 1, Relationship: "primary"}}}, c.who)
+		if err != nil {
+			t.Fatalf("message %d: %v", index, err)
+		}
+	}
+	url := c.srv.URL + "/v1/tasks/" + task.ID + "/work-items/" + item.ID + "/messages?limit=64"
+	res, err := http.Get(url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, err := io.ReadAll(res.Body)
+	res.Body.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.StatusCode != 200 || len(body) > api.MaxWorkItemHistoryBytes {
+		t.Fatalf("status=%d bytes=%d", res.StatusCode, len(body))
+	}
+	var first api.WorkItemMessageList
+	if err := json.Unmarshal(body, &first); err != nil {
+		t.Fatal(err)
+	}
+	if first.NextAfter == 0 || len(first.Links) >= 64 {
+		t.Fatalf("byte bound did not cut messages: count=%d next=%d bytes=%d", len(first.Links), first.NextAfter, len(body))
+	}
+	client, err := api.NewClient(c.srv.URL, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	after, seen := int64(0), map[int64]bool{}
+	for {
+		page, err := client.ListWorkItemMessages(context.Background(), task.ID, item.ID, 1, after, 64)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, link := range page.Links {
+			if seen[link.Message.Seq] {
+				t.Fatalf("duplicate message %d", link.Message.Seq)
+			}
+			seen[link.Message.Seq] = true
+		}
+		if page.NextAfter == 0 {
+			break
+		}
+		if page.NextAfter <= after {
+			t.Fatalf("message cursor did not advance: %d", page.NextAfter)
+		}
+		after = page.NextAfter
+	}
+	if len(seen) != 105 {
+		t.Fatalf("saw %d linked messages", len(seen))
 	}
 }
 

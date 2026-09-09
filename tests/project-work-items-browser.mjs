@@ -350,6 +350,7 @@ try {
       await page.locator('#work-item-form button[type=submit]').click();
       await page.locator('#dialog').waitFor({ state: "hidden" });
       await page.locator(`[data-item-history="${feature.id}"]`).click();
+      await page.locator('[data-history-revision="2"]').waitFor();
       assert.equal(await page.locator('[data-history-revision]').count(), 2, "feature history did not retain both revisions");
       await page.locator('[data-history-revision="2"]').click();
       await page.locator('[data-history-detail]').filter({ hasText: `${name} feature revision two` }).waitFor();
@@ -385,6 +386,12 @@ try {
       const first = await api("POST", `/v1/tasks/${source.task.id}/work-items/${createdID}/dispatch`, replayBody);
       const second = await api("POST", `/v1/tasks/${source.task.id}/work-items/${createdID}/dispatch`, replayBody);
       assert.equal(first.dispatch.messageSeq, second.dispatch.messageSeq, "dispatch response-loss replay created a second message");
+      await page.locator(`[data-item-history="${createdID}"]`).click();
+      await page.locator('[data-history-revision="3"]').waitFor();
+      await page.locator('[data-history-revision="3"]').click();
+      await page.locator(`[data-history-message-task="${target.task.id}"]`).first().waitFor();
+      assert.match(await page.locator(`[data-history-message-task="${target.task.id}"]`).first().textContent(), /verified/, "history did not show the exact cross-project message link");
+      await page.locator('#dialog-close').click();
 
       // Targets that name a missing or exited orchestrator are actionable errors:
       // no board message/dispatch receipt may be represented as a success.
