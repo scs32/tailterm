@@ -1,5 +1,51 @@
 # Development handoff — September 9, 2026
 
+## September 9 work-item session routing — release verified pending final acceptance
+
+Application `1e482f63c049727f77510d9d8561aee5ca5f7234` is deployed to
+`https://tailos.tailarr.com` (`https://1967ad21.tailos.pages.dev`) and served by
+the unchanged Stephens-Mini preview at `http://127.0.0.1:4318`. All three
+origins match the retained package's 81 served-file hashes and manifest SHA-256
+`c482b52b6a799c6d62d77643407010bb61f374ceb44736abdbb2abf928af24d2`.
+Real Chromium on every origin started production WASM and restored an isolated
+synthetic vault without browser errors. The Mini preview remains PID 28664 and
+continues to serve `.wasm.gz` as `application/gzip` without content encoding.
+
+The hub is RUNNING through existing TrueNAS middleware/TCP from
+`/mnt/deepfreeze/tailterm-hub/releases/20260909-work-item-routing-1e482f6/tailterm-hub`,
+SHA-256 `edaec95e25f62ac0c8b5660ca3841803b7c836df265e4a3ed5cfd68fe296f706`.
+The additive history/routing tables, database integrity/FK checks and
+authenticated boundary pass. The pre-update online SQLite backup is mode 0600
+at `/mnt/deepfreeze/tailterm-hub/backups/before-work-item-routing-20260909T195220Z.sqlite`.
+No live task/profile fixture was created or inspected for release testing.
+
+Mini and Air run matching Darwin arm64 `tt` SHA-256
+`909220a58f79592479ff49c7f19722f24da8779592d09c17b4d992a21fd7218b`.
+Both retain `~/.local/bin/tt-before-work-item-routing-1e482f6` at the prior hash;
+relay PIDs 83457 and 912 did not change. Air's webpage preview remains retired.
+
+The release binds each reusable-team worker to one exact item/run, restores only
+complete accepted immutable history, filters later traffic through explicit item
+links, preserves originals and failed replacement identities, separates normal
+base-team admission from parented helper accounting, and makes partial launch
+retry correct only the unlaunched member's folder. Bound posts, asks and human
+answers retain exact considered attribution after later item revisions only when
+the current-run binding and stored history validate.
+
+Integrated Go/vet/race, 128 JavaScript tests and Chromium/WebKit routing,
+history, decision and vault suites pass. The first concurrent JavaScript run had
+one presentation timing failure; its focused and isolated full reruns passed
+without code changes. Complete history over 128 KiB remains unsupported without
+truncation, provider commands are synthetic, and current-run association is
+shared-workspace provenance rather than per-message cryptographic/runtime
+authentication. See [the implementation report](work-item-session-routing.md)
+and [the release receipt](releases/tailos-2026-09-09-work-item-routing.json).
+The exact clean source/package is retained at
+`.build/releases/work-item-routing-1e482f6`; the immediately preceding history
+package/deployment, versioned hub binary, database backup and per-host CLI copies
+are the rollback chain. Neither Tailscale, networking,
+`https://tailterm.tailarr.com`, Air preview, existing sessions nor relays changed.
+
 ## September 9 immutable work-item history — release verified
 
 Application `d913d79f5b44b27062aa42c8776b16c6a801babf` is deployed to

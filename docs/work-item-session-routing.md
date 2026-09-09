@@ -4,10 +4,12 @@ Final implementation report for bug `wi_c97ba465a6f2a3ab`, work order
 `wi_c97ba465a6f2a3ab-routing-1`, assigned on Board #814. The implementation was
 accepted by lead on Board #1040 at candidate
 `d495aa80847528c647729f7b704b068c5785f82f`. The database handler recorded the
-final documentation scope on Board #1042. Release and deployment still require
-the explicit main-slot handoff described below. The database handler committed
-release order `wi_c97ba465a6f2a3ab-release-1` at item revision 18, dispatch #1045,
-with exact readback on Board #1046.
+final documentation scope on Board #1042. The database handler committed release
+order `wi_c97ba465a6f2a3ab-release-1` at item revision 18, dispatch #1045, with
+exact readback on Board #1046. Lead granted the main/release slot on Board #1066.
+The integrated application source is
+`1e482f63c049727f77510d9d8561aee5ca5f7234`; deployed evidence is retained in
+[`tailos-2026-09-09-work-item-routing.json`](releases/tailos-2026-09-09-work-item-routing.json).
 
 ## Source and dependency record
 
@@ -183,17 +185,19 @@ unavailable until the compatible hub/CLI/client is restored. A pre-migration
 database backup is disaster recovery only because restoring it would discard
 writes made afterward.
 
-Release order `wi_c97ba465a6f2a3ab-release-1` requires a clean exact integrated
-commit and coordinates compatible hub, installed CLI and browser assets. It must
-preserve the accepted immutable-history implementation, role and
-planned-team-member flags, and the Mini preview fix; retain the prior binary and
-additive database for rollback; and record deployed identities,
-migration/backup integrity, receipts and served-asset verification. The active
-history release owns main until lead explicitly hands over that slot, so this
-report does not authorize early integration or target activation.
+Release order `wi_c97ba465a6f2a3ab-release-1` was executed from a clean retained
+package after the history release and explicit slot handoff. Compatible hub, Mini
+and Air CLI, Cloudflare project `tailos`, and Mini's existing preview directory
+were updated and verified. The history implementation, role and
+planned-team-member flags, and Mini serving fix remain present. The prior
+history package, versioned hub binary, additive database, mode-0600 online backup
+and per-host CLI copies are retained for rollback.
 
-The implementation order did not perform live database/profile reads, migration,
-installation, network changes, hub/CLI replacement, browser deployment, target
-activation or existing-session shutdown. Those operations, if explicitly handed
-off, must use isolated acceptance fixtures rather than live task/profile data and
-must follow the saved release order and its sequencing dependency.
+Normal rollback keeps the additive tables and their rows, restores the retained
+history executable/package and matching CLIs, and does not restart relays. The
+older executable cannot launch or restore item-scoped sessions until the routing
+hub, CLI and client are restored. Snapshot restoration is disaster recovery only
+because it would discard subsequent writes. Release checks used isolated
+database/browser/tmux/provider fixtures; they did not read or mutate live
+work-item/profile records, close tasks, stop existing sessions, change Tailscale
+or networking, revive Air's preview, or touch `https://tailterm.tailarr.com`.

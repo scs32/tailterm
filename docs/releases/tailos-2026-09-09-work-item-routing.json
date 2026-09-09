@@ -1,0 +1,228 @@
+{
+  "status": "builder_release_verified_pending_final_acceptance",
+  "recordedAt": "2026-09-09T19:57:27Z",
+  "workItem": {
+    "id": "wi_c97ba465a6f2a3ab",
+    "buildOrder": {
+      "id": "wi_c97ba465a6f2a3ab-routing-1",
+      "assignmentMessage": 814,
+      "leadAcceptanceMessage": 1040,
+      "handlerReportConfirmationMessage": 1054
+    },
+    "releaseOrder": {
+      "id": "wi_c97ba465a6f2a3ab-release-1",
+      "dispatchMessage": 1045,
+      "handlerConfirmationMessage": 1046,
+      "releaseSlotHandoffMessage": 1066
+    }
+  },
+  "source": {
+    "integrationBase": "ddc0a529a604e18b7b0504161ed6e467e117757f",
+    "acceptedRoutingCandidate": "d495aa80847528c647729f7b704b068c5785f82f",
+    "acceptedReportCandidate": "7663a10e812c04d44e2f12d38c72f6e3cf5da185",
+    "acceptedHistorySource": "9ea86535e2e401e879d4fa1316483772de5e674e",
+    "integratedRoutingCode": "bc340f696068645e62bc6dad3de5a38d8a1a2631",
+    "integratedApplicationCommit": "1e482f63c049727f77510d9d8561aee5ca5f7234",
+    "integrationCommits": [
+      "83993e7698611dc838d1a7c779c48ca6b4d06c82",
+      "57f0f987383f1ffeae0091ff7db78886b90e9a4e",
+      "8e0c082423962698025c9536ed998b6501affea1",
+      "508459bdd497aebced3421a6b96898aac18ba1cb",
+      "1dcfc323d96f9561dba06b586901a22cda5f7ad5",
+      "4ad1cc30dd59b805772a0b6b3c474022c6e521b3",
+      "bc340f696068645e62bc6dad3de5a38d8a1a2631",
+      "1e482f63c049727f77510d9d8561aee5ca5f7234"
+    ],
+    "integration": "Routing-only commits were cherry-picked in order. The initial conflicts combined routing fields with the already released planned-team-member fields in client/task-hub.js, hub/cmd/tt/main.go and shared/tmux-command.js. Released history commits were not replayed; the final accepted main history, role boundary and Mini preview behavior were preserved.",
+    "preparationNote": "One detached-worktree command used an unverified expanded suffix for 1e482f6 and failed with invalid reference before creating any path. Git then resolved the exact SHA and the retained worktree was created successfully."
+  },
+  "package": {
+    "worktree": "/Users/stephenspeicher/projects/tailterm/.build/releases/work-item-routing-1e482f6",
+    "commit": "1e482f63c049727f77510d9d8561aee5ca5f7234",
+    "cleanSource": true,
+    "manifestEntries": 82,
+    "servedAssetsPerOrigin": 81,
+    "releaseSha256": "c482b52b6a799c6d62d77643407010bb61f374ceb44736abdbb2abf928af24d2",
+    "productionWasmSha256": "719f410b9237ea0bbd326db8ec4ef640f4626900c735b49bf96cb092d9d48b58",
+    "packagedTailserveWasmGzip": {
+      "path": "assets/tailserve-DySuDP3X.wasm.gz",
+      "size": 8598270,
+      "sha256": "86b9a716c0f8c5ebcbcf6d2642f3fc13619364995a71f49ecb6aee9cff8de8bb"
+    },
+    "packageLockSha256": "a4175ff8886d6c2ee8443e7a928bc1f6f9500cd3b2c24b55fb967175d9eb3f98",
+    "commands": [
+      "reuse node_modules and .build caches from retained work-item-history-d913d79 package",
+      "npm run build:wasm",
+      "npm run build:static",
+      "npm run verify:release",
+      "npm run build:tt",
+      "CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags='-s -w' -o ../.build/ttbin/tailterm-hub-linux-amd64 ./cmd/tailterm-hub"
+    ],
+    "verifyResult": "82 manifest entries match release.json"
+  },
+  "hub": {
+    "host": "truenas",
+    "state": "RUNNING",
+    "origin": "http://100.116.238.37:18765",
+    "binary": "/mnt/deepfreeze/tailterm-hub/releases/20260909-work-item-routing-1e482f6/tailterm-hub",
+    "binarySha256": "edaec95e25f62ac0c8b5660ca3841803b7c836df265e4a3ed5cfd68fe296f706",
+    "configuredUser": "950:950",
+    "readOnlyRoot": true,
+    "listener": "100.116.238.37:18765:18765",
+    "integrity": "ok",
+    "foreignKeyViolations": 0,
+    "verifiedTables": [
+      "agent_work_item_bindings",
+      "message_work_item_links",
+      "work_item_history_gaps",
+      "work_item_history_state",
+      "work_item_revisions",
+      "work_item_update_requests"
+    ],
+    "readiness": {
+      "unauthenticatedWhoami": 403,
+      "authenticatedWhoami": 200,
+      "invalidHistoryLimit": 400,
+      "unknownExactContext": 404
+    },
+    "previousBinary": "/mnt/deepfreeze/tailterm-hub/releases/20260909-work-item-history-d913d79/tailterm-hub",
+    "previousBinarySha256": "c9a4cc2b07d210798fd69991ecbe39c899dbb6b2300ea9eb42747c101d5e2b47"
+  },
+  "backup": {
+    "path": "/mnt/deepfreeze/tailterm-hub/backups/before-work-item-routing-20260909T195220Z.sqlite",
+    "sha256": "3fcd55fda85cf9baa6ff75833cb1d90aab050e1fd8f42d4c96dd92def14e053f",
+    "size": 7602176,
+    "mode": "0600",
+    "owner": "950:950",
+    "method": "SQLite online backup API through sqlite3 .backup before middleware update",
+    "integrity": "ok",
+    "foreignKeyViolations": 0
+  },
+  "cli": {
+    "darwinArm64Sha256": "909220a58f79592479ff49c7f19722f24da8779592d09c17b4d992a21fd7218b",
+    "linuxAmd64Sha256": "75429ba301a7c4c13943f652d736c8f55bdaf4845abbd0cff4e0c6b88ff2cc73",
+    "linuxArm64Sha256": "a1dae36df7c5a2764edff53fc98db67641a5bc39189a9f7819f4bb303ca7911a",
+    "previousDarwinArm64Sha256": "d38d4871f55c32ff1f9eb3a41eaf8077ec5c2104b4866922fe815fd289dd05f5",
+    "behaviorVerified": [
+      "tt context help exposes exact bound-context restoration",
+      "tt spawn help exposes work-item, work-context, replacement and planned-team-member flags",
+      "the integrated CLI/store tests cover bound post and ask retry identities"
+    ],
+    "hosts": [
+      {
+        "host": "Stephens-Mini",
+        "architecture": "Darwin arm64",
+        "installed": "/Users/stephenspeicher/.local/bin/tt",
+        "rollbackBinary": "/Users/stephenspeicher/.local/bin/tt-before-work-item-routing-1e482f6",
+        "relayPidBefore": 83457,
+        "relayPidAfter": 83457,
+        "relayRestarted": false
+      },
+      {
+        "host": "theAir",
+        "architecture": "Darwin arm64",
+        "installed": "/Users/stephenspeicher/.local/bin/tt",
+        "rollbackBinary": "/Users/stephenspeicher/.local/bin/tt-before-work-item-routing-1e482f6",
+        "relayPidBefore": 912,
+        "relayPidAfter": 912,
+        "relayRestarted": false
+      }
+    ]
+  },
+  "tailos": {
+    "origin": "https://tailos.tailarr.com",
+    "cloudflareProject": "tailos",
+    "deploymentId": "1967ad21-8448-4a68-98f5-5be5d30bf718",
+    "deployment": "https://1967ad21.tailos.pages.dev",
+    "branch": "main",
+    "commit": "1e482f63c049727f77510d9d8561aee5ca5f7234",
+    "verifiedAssets": 81,
+    "releaseSha256": "c482b52b6a799c6d62d77643407010bb61f374ceb44736abdbb2abf928af24d2",
+    "wasmContentType": "application/gzip",
+    "wasmContentEncoding": null,
+    "assetVerification": "Production and immutable deployment each match 81/81 retained package files with raw Accept */* and Accept-Encoding identity requests.",
+    "chromiumSmoke": {
+      "productionWasmStarted": true,
+      "syntheticVaultRestored": true,
+      "matchingMargins": true,
+      "uncaughtErrors": [],
+      "screenshotSha256": "dee008e5bb73ff69cb91fb1e43b1dc1241bc26b73201661e1427f62041b71664"
+    }
+  },
+  "miniPreview": {
+    "origin": "http://127.0.0.1:4318",
+    "servedDirectory": "/Users/stephenspeicher/projects/tailterm/dist-static",
+    "activation": "rsync -a --delete from the exact retained package",
+    "commit": "1e482f63c049727f77510d9d8561aee5ca5f7234",
+    "verifiedAssets": 81,
+    "releaseSha256": "c482b52b6a799c6d62d77643407010bb61f374ceb44736abdbb2abf928af24d2",
+    "wasmContentType": "application/gzip",
+    "wasmContentEncoding": null,
+    "listener": {
+      "pidBefore": 28664,
+      "pidAfter": 28664,
+      "command": "node scripts/preview-static.mjs dist-static 127.0.0.1 4318",
+      "sourceCommit": "b587741627c54bac80eccb536e7470320a65e3bc",
+      "restarted": false
+    },
+    "chromiumSmoke": {
+      "productionWasmStarted": true,
+      "syntheticVaultRestored": true,
+      "matchingMargins": true,
+      "uncaughtErrors": [],
+      "screenshotSha256": "dee008e5bb73ff69cb91fb1e43b1dc1241bc26b73201661e1427f62041b71664"
+    }
+  },
+  "acceptance": {
+    "integratedGo": [
+      "go test -count=1 ./...: passed",
+      "go vet ./...: passed",
+      "go test -count=1 -race ./internal/store ./internal/server: passed"
+    ],
+    "integratedJavascript": "npm test: isolated rerun 128/128 passed",
+    "integratedJavascriptFirstRun": "A concurrent build/test run passed 127/128; one unrelated queued-repaint timing assertion observed 0 rather than 1. Its focused 8/8 rerun and the subsequent isolated full 128/128 suite passed without code changes.",
+    "integratedBrowsers": [
+      "task-form-browser: Chromium and WebKit passed item routing, planned handler/team admission and partial retry",
+      "project-work-items-browser: Chromium and WebKit passed 65-link history and encrypted reload",
+      "board-decisions-browser: Chromium and WebKit passed real CLI request/replay and decision lifecycle",
+      "work-item-draft-vault-browser: Chromium and WebKit passed"
+    ],
+    "deployedBrowsers": [
+      "TailOS production: real Chromium production WASM and isolated synthetic-vault restoration passed",
+      "TailOS immutable deployment: real Chromium production WASM and isolated synthetic-vault restoration passed",
+      "Mini preview: real Chromium production WASM and isolated synthetic-vault restoration passed"
+    ],
+    "behavior": [
+      "One exact bug or feature per reusable-team worker with atomic item/run binding and inbox cutoff",
+      "Complete accepted immutable history restoration with explicit-only later message filtering",
+      "Normal parentless base-team admission remains distinct from parented extra-helper accounting",
+      "Model replacement preserves original and failed identities, runs, sessions, results and cleanup receipts",
+      "Partial launch retry freezes item/order/prepared history and completed members while permitting only unlaunched folder correction",
+      "Bound post, ask and human answer preserve exact considered attribution after later item revisions only through the validated current-run binding"
+    ]
+  },
+  "rollback": {
+    "frontendCommit": "d913d79f5b44b27062aa42c8776b16c6a801babf",
+    "tailosDeploymentId": "a95003ee-108a-44d2-ac01-0f795d105aee",
+    "tailosDeployment": "https://a95003ee.tailos.pages.dev",
+    "retainedPackage": "/Users/stephenspeicher/projects/tailterm/.build/releases/work-item-history-d913d79",
+    "releaseSha256": "f68376732f2250d39aeab5f9a687a47aa33424e01f084b44ef4847ac72b896f4",
+    "hub": "Use TrueNAS middleware to restore the retained work-item-history binary volume while preserving additive history and routing tables/data. Verify RUNNING, exact binary hash, database integrity/FK and authenticated readiness. Do not use the database backup for normal rollback.",
+    "cli": "Atomically restore each host's tt-before-work-item-routing-1e482f6 binary after restoring compatible frontend/hub behavior; do not restart relays.",
+    "frontend": "Deploy the retained history package explicitly to Cloudflare project tailos and rsync that exact package to Mini without changing listener 28664.",
+    "compatibility": "The older executable does not provide item-scoped launch/restoration. Additive binding/history rows remain intact but routing capability is unavailable until the compatible hub, CLI and client are restored."
+  },
+  "excluded": [
+    "https://tailterm.tailarr.com",
+    "Air webpage preview",
+    "Tailscale installation, configuration, restart or networking changes",
+    "live task/profile fixtures or task closure",
+    "existing agent-session or relay restart"
+  ],
+  "limits": [
+    "Complete immutable all-history context over 128 KiB is unsupported and is rejected without truncation; a later item revision cannot shrink prior history.",
+    "Provider commands in acceptance tests are synthetic. No live model conversation was used to claim context restoration.",
+    "Current-run binding validation operates within the shared-workspace caller trust model; it is not per-message cryptographic or runtime-process authentication.",
+    "Cloudflare Web Analytics may transform browser HTML. Raw package verification uses Accept */* and Accept-Encoding identity; the actual browser path passed separate production-WASM and synthetic-vault checks."
+  ]
+}
