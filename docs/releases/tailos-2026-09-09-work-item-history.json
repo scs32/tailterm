@@ -184,7 +184,7 @@
     ],
     "behavior": [
       "Immutable native and reconstructed revision history, explicit gaps and closed-project reads",
-      "Idempotent update receipts with exact run/thread attribution and optimistic revision conflicts",
+      "Idempotent update receipts with exact recorded actor/run attribution within shared-workspace trust and optimistic revision conflicts",
       "Bounded revision and linked-message pagination, response limits and race-safe client rendering",
       "Encrypted draft reload replay, close/navigation retention and explicit discard"
     ]
@@ -195,7 +195,7 @@
     "tailosDeployment": "https://451b0332.tailos.pages.dev",
     "retainedPackage": "/Users/stephenspeicher/projects/tailterm/.build/releases/orchestrator-role-75f1cdb",
     "releaseSha256": "e4c607d59fa4c194916117867c46bbd84fb745a8d8fc1455076f9278a0f3595d",
-    "hub": "Use TrueNAS middleware to restore the prior versioned binary volume, then verify RUNNING, its recorded hash, integrity/FK and authenticated readiness. The new tables are additive; restore the recorded database backup only with the app stopped if state rollback is actually required.",
+    "hub": "Use TrueNAS middleware to restore the prior versioned binary volume while preserving the additive history tables, then verify RUNNING, its recorded hash, integrity/FK and authenticated readiness. Snapshot restoration is not part of normal rollback; it is separately authorized disaster recovery and must keep the app stopped until the restored database ownership, mode, integrity and foreign keys are verified.",
     "cli": "Atomically restore each host's uniquely named rollback binary after restoring compatible frontend/hub behavior; do not restart relays.",
     "frontend": "Deploy the retained prior package explicitly to Cloudflare project tailos and rsync that exact package to Mini's served directory without changing the listener."
   },
