@@ -95,9 +95,11 @@ with the new CLI.
    with `npm run build:static` and `npm run verify:release`. Record the source
    commit, manifest hash and asset inventory.
 4. Publish only to Cloudflare Pages project `tailos` using the explicit TailOS
-   command in `docs/handoff.md`, then update the Mini local preview through the
-   existing Apple webpage procedure. Do not deploy to the old `tailterm` project
-   or recreate Air's retired webpage preview.
+   command in `docs/handoff.md`, then update Mini's existing `main/dist-static`
+   preview from the exact retained package with an in-place `rsync`. Verify Mini
+   over raw HTTP using served-byte hashes. Do not build a new Apple Container
+   image: Rosetta is absent and no host setup is authorized. Do not deploy to the
+   old `tailterm` project or recreate Air's retired webpage preview.
 5. Verify `/release.json`, every served asset, production Chromium startup and an
    isolated synthetic vault restore on TailOS and Mini. Record URLs, hashes,
    installed CLI hashes and the instruction-only limitation with the handler.
@@ -108,9 +110,11 @@ needed for this release.
 ## Rollback
 
 Retain the immediately preceding clean static package, Pages deployment identity,
-Mini image and both host CLI backups before activation. If the new frontend fails,
-restore the prior TailOS deployment and Mini image; the new CLI may remain because
-old frontend/new CLI is compatible. If the CLI itself must be rolled back, restore
-the frontend first, then atomically restore both previous CLI binaries without
-restarting the preserved relay processes. Never leave the new frontend paired
-with an old CLI. The hub and database have no change to roll back.
+Mini `main/dist-static` package and both host CLI backups before activation. If
+the new frontend fails, restore the prior TailOS deployment and rsync the retained
+prior Mini package back in place, then repeat served-byte verification; the new
+CLI may remain because old frontend/new CLI is compatible. If the CLI itself must
+be rolled back, restore the frontend first, then atomically restore both previous
+CLI binaries without restarting the preserved relay processes. Never leave the
+new frontend paired with an old CLI. The hub and database have no change to roll
+back.
