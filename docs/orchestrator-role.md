@@ -82,12 +82,15 @@ with the new CLI.
 
 1. From the clean integrated commit, run `npm run build:tt` and record the tested
    Darwin arm64 binary SHA-256. Preserve each host's existing `tt` as a uniquely
-   named rollback binary, install the matching build atomically on Mini and Air,
-   and restart only that user's Tailterm inbox relay.
+   named rollback binary and install the matching build atomically on Mini and
+   Air. Preserve the already-running Tailterm inbox relay processes; this release
+   does not restart or claim to update their in-memory executable versions.
 2. On both hosts, verify the installed checksum, `tt spawn --help` contains
-   `--planned-team-members`, relay status is healthy, and an authorized
-   task-aware `tt brief` shows the expected orchestrator/worker boundary for its
-   current roster. Do not print hub tokens or private configuration.
+   `--planned-team-members`, and an authorized task-aware `tt brief` shows the
+   expected orchestrator/worker boundary for its current roster. Record any
+   read-only relay observation separately as the existing process state, not proof
+   that it reloaded the installed binary. Do not print hub tokens or private
+   configuration.
 3. Build/package the static application from that same clean integrated commit
    with `npm run build:static` and `npm run verify:release`. Record the source
    commit, manifest hash and asset inventory.
@@ -108,6 +111,6 @@ Retain the immediately preceding clean static package, Pages deployment identity
 Mini image and both host CLI backups before activation. If the new frontend fails,
 restore the prior TailOS deployment and Mini image; the new CLI may remain because
 old frontend/new CLI is compatible. If the CLI itself must be rolled back, restore
-the frontend first, then atomically restore both previous CLI binaries and restart
-only their per-user relays. Never leave the new frontend paired with an old CLI.
-The hub and database have no change to roll back.
+the frontend first, then atomically restore both previous CLI binaries without
+restarting the preserved relay processes. Never leave the new frontend paired
+with an old CLI. The hub and database have no change to roll back.
