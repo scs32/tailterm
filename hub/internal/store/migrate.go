@@ -132,7 +132,7 @@ CREATE TABLE IF NOT EXISTS agent_work_item_bindings (
   FOREIGN KEY(work_order_task_id,work_order_message_seq) REFERENCES messages(task_id,seq)
 );
 CREATE INDEX IF NOT EXISTS agent_work_item_bindings_item ON agent_work_item_bindings(item_task_id,item_id,created_at);
-CREATE UNIQUE INDEX IF NOT EXISTS agent_work_item_bindings_replacement ON agent_work_item_bindings(replaces_agent_id) WHERE replaces_agent_id IS NOT NULL;
+DROP INDEX IF EXISTS agent_work_item_bindings_replacement;
 CREATE TABLE IF NOT EXISTS message_post_requests (
   receipt_id TEXT PRIMARY KEY,
   task_id TEXT NOT NULL REFERENCES tasks(id),

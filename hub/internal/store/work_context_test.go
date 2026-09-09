@@ -160,6 +160,15 @@ func TestAgentWorkItemContextAdmissionRestorationAndReplacement(t *testing.T) {
 
 	replacementRequest := *binding
 	replacementRequest.ReplacesAgentID = worker.ID
+	failedReplacement, err := s.AddAgent(ctx, task.ID, api.AddAgentRequest{
+		Name: "worker-context-failed", Host: "fixture", Session: "worker-context-failed", Runtime: "codex", WorkItem: &replacementRequest,
+	}, by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = s.CloseAgent(ctx, failedReplacement.ID, by); err != nil {
+		t.Fatal(err)
+	}
 	replacement, err := s.AddAgent(ctx, task.ID, api.AddAgentRequest{
 		Name: "worker-context-r2", Host: "fixture", Session: "worker-context-r2", Runtime: "codex", WorkItem: &replacementRequest,
 	}, by)
@@ -168,6 +177,10 @@ func TestAgentWorkItemContextAdmissionRestorationAndReplacement(t *testing.T) {
 	}
 	if replacement.ID == worker.ID || replacement.RunID == worker.RunID || replacement.WorkItem.ReplacesAgentID != worker.ID {
 		t.Fatalf("replacement reused identity: before=%+v after=%+v", worker, replacement)
+	}
+	failedNow, err := s.GetAgent(ctx, failedReplacement.ID)
+	if err != nil || failedNow.Status != api.AgentClosed || failedNow.RunID != failedReplacement.RunID || failedNow.WorkItem == nil {
+		t.Fatalf("failed replacement attempt changed: %+v %v", failedNow, err)
 	}
 	preserved, err := s.GetAgent(ctx, worker.ID)
 	if err != nil || preserved.RunID != worker.RunID || preserved.Session != worker.Session || preserved.WorkItem == nil {
