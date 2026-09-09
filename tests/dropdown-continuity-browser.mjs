@@ -1,6 +1,7 @@
 // Independent QA: wi_b1d07b59cdf519eb-fix-1 (#661), assignment #663.
-// Only throwaway hub, encrypted vault and browser state. Native selections use
-// actual pointer/keyboard input; this fixture never calls selectOption().
+// Only throwaway hub, encrypted vault and browser state. Native continuity uses
+// actual pointer/keyboard input and never selectOption(); the status regression
+// separately labels its synthetic input-only event sequence.
 import { chromium, webkit, expect } from "@playwright/test";
 import { createServer } from "node:http";
 import { once } from "node:events";
@@ -219,6 +220,50 @@ async function nativeCase(engine, mode, selector, width = 1440) {
     assert.ok(r.width > 0 && r.left >= 0 && r.right <= 391, "native control must fit390px viewport");
   }).toPass({ timeout: 5000 });
 }
+async function inputOnlyStatusCommitCase(engine, mode) {
+  await open(mode);
+  const selector = "[data-items-status]";
+  const before = await page.locator(".work-item").count();
+  assert.ok(before > 0, "fixture must start with an unfiltered work item");
+  await page.evaluate(selector => {
+    const control = document.querySelector(selector);
+    control.value = "done";
+    control.dispatchEvent(new Event("input", { bubbles: true }));
+  }, selector);
+  await expect(page.locator(selector)).toHaveValue("done");
+  await expect(page.locator(".work-items-empty")).toContainText(
+    `No ${mode} match these filters.`,
+  );
+  assert.equal(
+    await page.locator(".work-item").count(),
+    0,
+    "input-only commit must filter without change, blur, or outside click",
+  );
+  observations.push({
+    engine,
+    mode,
+    selector,
+    commitSequence: "synthetic input only; no change/blur/outside click",
+    filteredImmediately: true,
+  });
+}
+async function keyboardStatusCommitCase(engine, mode) {
+  await open(mode);
+  const selector = "[data-items-status]";
+  await page.locator(selector).focus();
+  await page.keyboard.press("i");
+  await expect(page.locator(selector)).toHaveValue("in_progress");
+  await expect(page.locator(".work-items-empty")).toContainText(
+    `No ${mode} match these filters.`,
+  );
+  observations.push({
+    engine,
+    mode,
+    selector,
+    commitSequence: "Playwright engine keyboard typeahead from focused closed select",
+    filteredImmediately: true,
+  });
+}
 
 try {
   const binary = path.join(stateDir, "tailterm-hub");
@@ -264,6 +309,10 @@ try {
     });
     for (const [mode, selector] of [["board", "#board-to"], ["bugs", "[data-items-project]"], ["bugs", "[data-items-status]"], ["features", "[data-items-project]"], ["features", "[data-items-status]"]])
       await check(`${name} ${mode} native ${selector} continuity`, () => nativeCase(name, mode, selector, selector === "[data-items-project]" ? 390 : 1440));
+    for (const mode of ["bugs", "features"]) {
+      await check(`${name} ${mode} input-only status commit filters before blur`, () => inputOnlyStatusCommitCase(name, mode));
+      await check(`${name} ${mode} keyboard status selection filters immediately`, () => keyboardStatusCommitCase(name, mode));
+    }
     await check(`${name} Board physical rail press survives changed-data refresh`, async () => {
       await open("board");
       try {
@@ -368,10 +417,10 @@ finally {
   if (backend && backend.exitCode === null && backend.signalCode === null) { const ended=once(backend,"exit"); backend.kill("SIGTERM"); await ended; }
   await rm(stateDir, { recursive:true,force:true });
   const report={ label,source,fixtureHash,engines,caseFilter:caseFilter?.source||null,results,observations,screenshots,servedSources,
-    nativeObservationLimit:"Browser screenshots do not reliably capture OS-native menu layers. nativeOpenObserved records actual :open visibility; OS menu appearance and keyboard commit/Escape/same-value dismissal remain unverified because Playwright protocol keys do not reach the native layer on this macOS host (confirmed in both headless and headed bare-form probes). Pointer outside dismissal is verified. No selectOption or synthetic DOM events substitute for native acceptance." };
+    nativeObservationLimit:"Browser screenshots do not reliably capture OS-native menu layers. nativeOpenObserved records actual :open visibility; OS menu appearance and keyboard commit/Escape/same-value dismissal remain unverified because Playwright protocol keys do not reach the native layer on this macOS host (confirmed in both headless and headed bare-form probes). Pointer outside dismissal is verified. The separately labelled input-only regression is synthetic; neither it nor selectOption substitutes for native acceptance." };
   await writeFile(path.join(artifacts,"results.json"),JSON.stringify(report,null,2));
   const esc=s=>String(s).replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"})[c]);
-  await writeFile(path.join(artifacts,"index.html"),`<!doctype html><meta charset="utf-8"><title>Dropdown continuity ${esc(label)}</title><style>body{font:16px system-ui;max-width:1100px;margin:32px auto}img{max-width:100%;border:1px solid #aaa}pre{white-space:pre-wrap}</style><h1>Dropdown continuity: ${esc(label)}</h1><p>wi_b1d07b59cdf519eb-fix-1/#661 · QA #663</p><p>${esc(report.nativeObservationLimit)}</p><ul>${results.map(r=>`<li>${r.pass?'PASS':'FAIL'} ${esc(r.name)}${r.error?`<pre>${esc(r.error)}</pre>`:''}</li>`).join('')}</ul>${screenshots.map(f=>`<h2>${esc(f)}</h2><a href="${esc(f)}"><img src="${esc(f)}"></a>`).join('')}`);
+  await writeFile(path.join(artifacts,"index.html"),`<!doctype html><meta charset="utf-8"><title>Dropdown continuity ${esc(label)}</title><style>body{font:16px system-ui;max-width:1100px;margin:32px auto}img{max-width:100%;border:1px solid #aaa}pre{white-space:pre-wrap}</style><h1>Dropdown continuity: ${esc(label)}</h1><p>wi_b1d07b59cdf519eb-fix-1/#661 · QA #663 · status regression wi_a65c688c4b09f458/#1165</p><p>${esc(report.nativeObservationLimit)}</p><ul>${results.map(r=>`<li>${r.pass?'PASS':'FAIL'} ${esc(r.name)}${r.error?`<pre>${esc(r.error)}</pre>`:''}</li>`).join('')}</ul>${screenshots.map(f=>`<h2>${esc(f)}</h2><a href="${esc(f)}"><img src="${esc(f)}"></a>`).join('')}`);
 }
 assert.ok(results.length > 0, "No acceptance cases ran");
 assert.equal(results.filter(r=>!r.pass).length,0,`Dropdown continuity failures: ${results.filter(r=>!r.pass).map(r=>r.name).join(', ')}`);
