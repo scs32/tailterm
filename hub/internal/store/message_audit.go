@@ -135,8 +135,17 @@ func validateMessageContext(q queryRower, ctx context.Context, messageTaskID str
 		}
 		return err
 	}
-	if item.Revision != link.ItemRevision && (!allowHistoricalRevision || link.ItemRevision > item.Revision) {
-		return workItemConflict("work item revision changed; refresh it before posting")
+	if item.Revision != link.ItemRevision {
+		historicalAllowed := allowHistoricalRevision && link.ItemRevision < item.Revision
+		if !historicalAllowed && link.ItemRevision < item.Revision {
+			historicalAllowed, err = validatedBoundHistoricalMessage(q, ctx, messageTaskID, req)
+			if err != nil {
+				return err
+			}
+		}
+		if !historicalAllowed {
+			return workItemConflict("work item revision changed; refresh it before posting")
+		}
 	}
 	if order := req.WorkOrderMessage; order != nil {
 		if order.TaskID != link.ItemTaskID {

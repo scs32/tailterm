@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 
 	"github.com/scs32/tailterm/hub/internal/api"
 )
@@ -35,41 +36,38 @@ type preparedContextHistory struct {
 	Coverage  api.HistoryCoverage       `json:"coverage"`
 }
 
-func validateAgentWorkItemRequest(q queryRower, ctx context.Context, targetTaskID string, req *api.AgentWorkItemRequest) (int64, error) {
-	if req == nil {
-		return 0, nil
-	}
+func validatePreparedContextBundle(req *api.AgentWorkItemRequest) error {
 	if len(req.ContextBundle) > maxAgentWorkItemContextBytes {
-		return 0, api.ErrContextLimit
+		return api.ErrContextLimit
 	}
-	if !api.ValidID(req.ItemTaskID, "tsk") || req.ItemTaskID != targetTaskID || !api.ValidID(req.ItemID, "wi") || req.ItemRevision < 1 ||
+	if !api.ValidID(req.ItemTaskID, "tsk") || !api.ValidID(req.ItemID, "wi") || req.ItemRevision < 1 ||
 		!api.ValidID(req.WorkOrderMessage.TaskID, "tsk") || req.WorkOrderMessage.Seq < 1 || req.WorkOrderMessage.TaskID != req.ItemTaskID ||
 		(req.ReplacesAgentID != "" && !api.ValidID(req.ReplacesAgentID, "agt")) || len(req.ContextBundle) == 0 {
-		return 0, api.ErrInvalid
+		return api.ErrInvalid
 	}
 	var envelope preparedContextEnvelope
 	if err := json.Unmarshal(req.ContextBundle, &envelope); err != nil || envelope.Version != 1 ||
 		envelope.ItemTaskID != req.ItemTaskID || envelope.ItemID != req.ItemID || envelope.ItemRevision != req.ItemRevision || envelope.WorkOrderMessage != req.WorkOrderMessage {
-		return 0, api.ErrInvalid
+		return api.ErrInvalid
 	}
 	exact := envelope.History.Revision
 	if exact.TaskID != req.ItemTaskID || exact.ItemID != req.ItemID || exact.Revision != req.ItemRevision ||
 		exact.AttributionKind != "shared_workspace_claim" ||
 		(exact.Provenance != "native" && exact.Provenance != "reconstructed_change_log" && exact.Provenance != "current_row_checkpoint") ||
 		envelope.History.Coverage.ObservedCurrentRevision != req.ItemRevision || envelope.History.Coverage.ConversationLinks != "explicit_only" {
-		return 0, api.ErrInvalid
+		return api.ErrInvalid
 	}
 	seenExact := false
 	previousRevision := int64(0)
 	for _, revision := range envelope.History.Revisions {
 		if revision.TaskID != req.ItemTaskID || revision.ItemID != req.ItemID || revision.Revision <= previousRevision || revision.Revision > req.ItemRevision {
-			return 0, api.ErrInvalid
+			return api.ErrInvalid
 		}
 		previousRevision = revision.Revision
 		seenExact = seenExact || revision.Revision == req.ItemRevision
 	}
 	if !seenExact {
-		return 0, api.ErrInvalid
+		return api.ErrInvalid
 	}
 	orderInBundle := false
 	for _, link := range envelope.History.Messages {
@@ -78,7 +76,20 @@ func validateAgentWorkItemRequest(q queryRower, ctx context.Context, targetTaskI
 		}
 	}
 	if !orderInBundle {
-		return 0, workItemConflict("work-order message is absent from the prepared explicit history")
+		return workItemConflict("work-order message is absent from the prepared explicit history")
+	}
+	return nil
+}
+
+func validateAgentWorkItemRequest(q queryRower, ctx context.Context, targetTaskID string, req *api.AgentWorkItemRequest) (int64, error) {
+	if req == nil {
+		return 0, nil
+	}
+	if req.ItemTaskID != targetTaskID {
+		return 0, api.ErrInvalid
+	}
+	if err := validatePreparedContextBundle(req); err != nil {
+		return 0, err
 	}
 	// Admission retains the current-row CAS and structured order relationship.
 	// The bundle's immutable revision/history payload is prepared by the handler
@@ -119,6 +130,51 @@ func validateAgentWorkItemRequest(q queryRower, ctx context.Context, targetTaskI
 		return 0, err
 	}
 	return through, nil
+}
+
+// validatedBoundHistoricalMessage reports whether a stale message revision is
+// the immutable launch revision for the author's exact current run. Merely
+// naming a bound agent or an old item revision is insufficient: the item/order
+// coordinates must match the binding, and its stored prepared history must
+// still pass the same validation and digest check used at admission.
+func validatedBoundHistoricalMessage(q queryRower, ctx context.Context, messageTaskID string, req api.PostMessageRequest) (bool, error) {
+	if req.AgentID == "" || len(req.WorkItems) != 1 || req.WorkOrderMessage == nil {
+		return false, nil
+	}
+	var binding api.AgentWorkItemBinding
+	var contextDigest string
+	var contextBundle []byte
+	err := q.QueryRowContext(ctx, `SELECT b.agent_id,b.run_id,b.item_task_id,b.item_id,b.item_revision,
+b.work_order_task_id,b.work_order_message_seq,b.context_digest,b.context_json
+FROM agents a
+JOIN agent_work_item_bindings b ON b.agent_id=a.id AND b.run_id=a.run_id
+WHERE a.id=? AND a.task_id=?`, req.AgentID, messageTaskID).Scan(
+		&binding.AgentID, &binding.RunID, &binding.ItemTaskID, &binding.ItemID, &binding.ItemRevision,
+		&binding.WorkOrderMessage.TaskID, &binding.WorkOrderMessage.Seq, &contextDigest, &contextBundle,
+	)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	link := req.WorkItems[0]
+	if link.ItemTaskID != binding.ItemTaskID || link.ItemID != binding.ItemID || link.ItemRevision != binding.ItemRevision ||
+		link.Relationship != "primary" || *req.WorkOrderMessage != binding.WorkOrderMessage {
+		return false, nil
+	}
+	digestBytes := sha256.Sum256(contextBundle)
+	if hex.EncodeToString(digestBytes[:]) != contextDigest {
+		return false, errors.New("stored work-item context digest mismatch")
+	}
+	stored := &api.AgentWorkItemRequest{
+		ItemTaskID: binding.ItemTaskID, ItemID: binding.ItemID, ItemRevision: binding.ItemRevision,
+		WorkOrderMessage: binding.WorkOrderMessage, ContextBundle: json.RawMessage(contextBundle),
+	}
+	if err := validatePreparedContextBundle(stored); err != nil {
+		return false, fmt.Errorf("stored work-item context is invalid: %w", err)
+	}
+	return true, nil
 }
 
 func insertAgentWorkItemBinding(ctx context.Context, tx *sql.Tx, agent api.Agent, req *api.AgentWorkItemRequest, through int64) (*api.AgentWorkItemBinding, error) {

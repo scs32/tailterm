@@ -157,9 +157,28 @@ func TestAgentWorkItemContextAdmissionRestorationAndReplacement(t *testing.T) {
 	if _, err = s.GetAgentWorkItemContext(ctx, task.ID, worker.ID, api.NewID("run")); !errors.Is(err, api.ErrConflict) {
 		t.Fatalf("stale run restored context: %v", err)
 	}
+	launchRevision := item.Revision
+	advancedDescription := description + "; handler-confirmed follow-up"
+	if _, replayed, updateErr := s.CreateWorkItemUpdate(ctx, task.ID, item.ID, api.CreateWorkItemUpdate{
+		ExpectedRevision: item.Revision, Description: &advancedDescription, AgentID: legacy.ID, RequestID: "context-item-r2",
+	}, by); updateErr != nil || replayed {
+		t.Fatalf("keyed item advance: replayed=%v err=%v", replayed, updateErr)
+	}
+	item, err = s.GetWorkItem(ctx, task.ID, item.ID)
+	if err != nil || item.Revision != launchRevision+1 {
+		t.Fatalf("advanced item: %+v %v", item, err)
+	}
+	staleUnbound := api.PostMessageRequest{
+		Text: "Unbound stale revision claim", AgentID: legacy.ID, RequestID: "context-unbound-stale",
+		WorkItems:        []api.MessageWorkItem{{ItemTaskID: binding.ItemTaskID, ItemID: binding.ItemID, ItemRevision: binding.ItemRevision, Relationship: "primary"}},
+		WorkOrderMessage: orderRef,
+	}
+	if _, err = s.PostMessage(ctx, task.ID, staleUnbound, by); !errors.Is(err, api.ErrConflict) {
+		t.Fatalf("unbound stale revision claim accepted: %v", err)
+	}
 	relevant, err := s.PostMessage(ctx, task.ID, api.PostMessageRequest{
-		Text: "New item-scoped direction", To: worker.ID, RequestID: "context-new-direction",
-		WorkItems:        []api.MessageWorkItem{{ItemTaskID: item.TaskID, ItemID: item.ID, ItemRevision: item.Revision, Relationship: "primary"}},
+		Text: "Bound worker progress at its launch revision", AgentID: worker.ID, RequestID: "context-worker-progress",
+		WorkItems:        []api.MessageWorkItem{{ItemTaskID: binding.ItemTaskID, ItemID: binding.ItemID, ItemRevision: binding.ItemRevision, Relationship: "primary"}},
 		WorkOrderMessage: orderRef,
 	}, by)
 	if err != nil {
@@ -173,7 +192,7 @@ func TestAgentWorkItemContextAdmissionRestorationAndReplacement(t *testing.T) {
 		t.Fatalf("bound inbox leaked or lost messages: %+v %v", inbox, err)
 	}
 	workerNow, err := s.GetAgent(ctx, worker.ID)
-	if err != nil || workerNow.Unread != 1 {
+	if err != nil || workerNow.Unread != 0 {
 		t.Fatalf("bound unread count included unrelated traffic: %+v %v", workerNow, err)
 	}
 	if err = s.MarkRead(ctx, task.ID, api.MarkReadRequest{AgentID: worker.ID, UpTo: relevant.Seq}); err != nil {
@@ -189,7 +208,7 @@ func TestAgentWorkItemContextAdmissionRestorationAndReplacement(t *testing.T) {
 			RecommendedOptionID: "yes", RecommendationReason: "It preserves the recorded contract.",
 		},
 		AgentID: worker.ID, RequestID: "context-decision",
-		WorkItems:        []api.MessageWorkItem{{ItemTaskID: item.TaskID, ItemID: item.ID, ItemRevision: item.Revision, Relationship: "primary"}},
+		WorkItems:        []api.MessageWorkItem{{ItemTaskID: binding.ItemTaskID, ItemID: binding.ItemID, ItemRevision: binding.ItemRevision, Relationship: "primary"}},
 		WorkOrderMessage: orderRef,
 	}
 	decision, err := s.CreateDecision(ctx, task.ID, decisionRequest, by)
@@ -212,6 +231,10 @@ func TestAgentWorkItemContextAdmissionRestorationAndReplacement(t *testing.T) {
 	if _, err = s.PostMessage(ctx, task.ID, api.PostMessageRequest{Text: "UNRELATED AFTER DECISION", To: worker.ID}, by); err != nil {
 		t.Fatal(err)
 	}
+	allScoped, err := s.ListMessages(ctx, task.ID, worker.ReadUpTo, worker.ID, 50)
+	if err != nil || len(allScoped) != 3 || allScoped[0].Seq != relevant.Seq || allScoped[1].Seq != decision.Seq || allScoped[2].Seq != answer.Seq {
+		t.Fatalf("bound inbox did not retain exact progress/ask/answer evidence: %+v %v", allScoped, err)
+	}
 	decisionInbox, err := s.ListMessages(ctx, task.ID, decision.Seq, worker.ID, 50)
 	if err != nil || len(decisionInbox) != 1 || decisionInbox[0].Seq != answer.Seq || decisionInbox[0].DecisionAnswer == nil {
 		t.Fatalf("bound decision inbox leaked or lost answer: %+v %v", decisionInbox, err)
@@ -220,6 +243,19 @@ func TestAgentWorkItemContextAdmissionRestorationAndReplacement(t *testing.T) {
 	if err != nil || workerNow.Unread != 1 {
 		t.Fatalf("bound decision unread lost answer or counted unrelated: %+v %v", workerNow, err)
 	}
+	historyLinks, err := s.ListWorkItemMessages(ctx, task.ID, item.ID, 0, 0, 64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	linkedRevisions := map[int64]int64{}
+	for _, link := range historyLinks.Links {
+		linkedRevisions[link.Message.Seq] = link.ItemRevision
+	}
+	for _, seq := range []int64{relevant.Seq, decision.Seq, answer.Seq} {
+		if linkedRevisions[seq] != launchRevision {
+			t.Fatalf("linked evidence %d lost launch revision %d: %+v", seq, launchRevision, historyLinks.Links)
+		}
+	}
 	if _, err = s.PostEvent(ctx, task.ID, api.PostEventRequest{AgentID: worker.ID, RunID: worker.RunID, Kind: api.EventExited}, by); err != nil {
 		t.Fatal(err)
 	}
@@ -227,9 +263,11 @@ func TestAgentWorkItemContextAdmissionRestorationAndReplacement(t *testing.T) {
 		t.Fatalf("item-bound identity restarted without context: %v", err)
 	}
 
-	replacementRequest := *binding
-	replacementRequest.ContextBundle = preparedContextFromAcceptedHistory(t, s, item, *orderRef)
-	replacementRequest.ReplacesAgentID = worker.ID
+	replacementRequest := api.AgentWorkItemRequest{
+		ItemTaskID: item.TaskID, ItemID: item.ID, ItemRevision: item.Revision,
+		WorkOrderMessage: *orderRef, ContextBundle: preparedContextFromAcceptedHistory(t, s, item, *orderRef),
+		ReplacesAgentID: worker.ID,
+	}
 	failedReplacement, err := s.AddAgent(ctx, task.ID, api.AddAgentRequest{
 		Name: "worker-context-failed", Host: "fixture", Session: "worker-context-failed", Runtime: "codex", WorkItem: &replacementRequest,
 	}, by)
@@ -266,7 +304,9 @@ func TestAgentWorkItemContextAdmissionRestorationAndReplacement(t *testing.T) {
 	}
 	restored, err := s.GetAgentWorkItemContext(ctx, task.ID, replacement.ID, replacement.RunID)
 	if err != nil || restored.Binding.ReplacesAgentID != worker.ID || !bytes.Equal(restored.Bundle, replacementRequest.ContextBundle) ||
-		!bytes.Contains(restored.Bundle, []byte(answerRequest.Text)) || bytes.Contains(restored.Bundle, []byte("UNRELATED AFTER DECISION")) {
+		!bytes.Contains(restored.Bundle, []byte(relevant.Text)) || !bytes.Contains(restored.Bundle, []byte(decisionRequest.Question)) ||
+		!bytes.Contains(restored.Bundle, []byte(answerRequest.Text)) || bytes.Contains(restored.Bundle, []byte("UNRELATED AFTER DECISION")) ||
+		bytes.Contains(restored.Bundle, []byte(staleUnbound.Text)) {
 		t.Fatalf("restart lost context/history: %+v %v", restored, err)
 	}
 }
