@@ -56,6 +56,7 @@ const sessions = new Set(["main"]);
 const identities = new Map(),
   uploadedFiles = new Map();
 const uploadControl = {};
+class FocusedActivityComplete extends Error {}
 let nextSessionId = 0;
 function identity(name) {
   if (!identities.has(name))
@@ -629,6 +630,7 @@ try {
   );
   await exerciseLocalHistory(page, () => input);
   await exerciseWorkspaceActions(page, stream);
+  if (process.env.TAILTERM_ACTIVITY_ONLY) throw new FocusedActivityComplete();
   await exerciseWorkspaceContinuity(page, context, () => terminalStarts);
   await exerciseTasks(page, fixtureHub, origin);
   assert.equal(
@@ -843,23 +845,27 @@ try {
     "Static browser checks passed: local encrypted vault, exclusive tabs, server cards, Go WASM password/key SSH, strict fingerprints, memory-only auth discovery, hover focus, font keys, bracketed/native/multiline paste, OSC52 and denied clipboard fallback, themes/fonts, tooltips, fullscreen create/resume, backups, lock/reopen, mobile, zero application API requests.",
   );
 } catch (error) {
-  console.error(browserLog.slice(-45).join("\n"));
-  console.error(
-    await debugPage?.evaluate(() =>
-      Object.fromEntries(
-        [
-          "#launcher-note",
-          "#upload-note",
-          "#upload-files",
-          "#notice",
-          "#terminal-status",
-          "#launcher-sessions",
-          ".terminal-instance:not([hidden]) .xterm-rows",
-        ].map((s) => [s, document.querySelector(s)?.textContent]),
+  if (error instanceof FocusedActivityComplete)
+    console.log("Focused terminal activity browser checks passed.");
+  else {
+    console.error(browserLog.slice(-45).join("\n"));
+    console.error(
+      await debugPage?.evaluate(() =>
+        Object.fromEntries(
+          [
+            "#launcher-note",
+            "#upload-note",
+            "#upload-files",
+            "#notice",
+            "#terminal-status",
+            "#launcher-sessions",
+            ".terminal-instance:not([hidden]) .xterm-rows",
+          ].map((s) => [s, document.querySelector(s)?.textContent]),
+        ),
       ),
-    ),
-  );
-  throw error;
+    );
+    throw error;
+  }
 } finally {
   await browser?.close();
   for (const ws of sockets) ws.terminate();

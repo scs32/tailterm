@@ -22,6 +22,25 @@ export async function exerciseWorkspaceActions(page, stream) {
     await page.locator("#command-query").fill("Switch:");
     await page.locator("#command-results button").nth(1).click();
   }
+  const background = await page
+    .locator(".tab.active [data-tab]")
+    .getAttribute("data-tab");
+  // Establish a mutable progress row while this pane is selected, then repaint
+  // it in place after switching away. The repaint must stay quiet.
+  await page.locator(`[data-tab="${original}"]`).click();
+  stream.write("\r\nActivity progress 41%");
+  await page.waitForTimeout(100);
+  await page.locator(`[data-tab="${background}"]`).click();
+  stream.write("\rActivity progress 42%");
+  await page.waitForTimeout(700);
+  assert.equal(
+    await page
+      .locator(`[data-tab="${original}"]`)
+      .evaluate((el) =>
+        el.closest(".tab").classList.contains("has-new-output"),
+      ),
+    false,
+  );
   stream.write("\x1b[?25l\x1b[?25h");
   await page.waitForTimeout(700);
   assert.equal(

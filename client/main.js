@@ -24,7 +24,7 @@ let voiceDictation;
 import { setupPaneShortcuts } from "./pane-shortcuts.js";
 import { setupLocalHistory } from "./local-history.js";
 import {
-  screenLines,
+  activitySnapshot,
   hasNewText,
   activityTitle,
   connectionNeedsAttention,
@@ -1119,7 +1119,7 @@ function activate(id) {
   if (id && !visibleTabs().some((t) => t.id === id)) id = visibleTabs()[0]?.id;
   const previous = currentTab();
   if (previous)
-    previous.activitySnapshot = screenLines(previous.term, previous.tmux);
+    previous.activitySnapshot = activitySnapshot(previous.term, previous.tmux);
   active = id;
   if (!restoring) paneGroups?.model.rememberActive?.(id);
   const t = currentTab();
@@ -1692,7 +1692,7 @@ async function connect(
       attentionSound.notify(label);
       renderTabs();
     };
-    t.activitySnapshot = screenLines(term, tmux);
+    t.activitySnapshot = activitySnapshot(term, tmux);
     term.onWriteParsed(() => {
       if (
         t.disposed ||
@@ -1705,7 +1705,7 @@ async function connect(
       t.activityTimer = setTimeout(() => {
         t.activityTimer = null;
         if (t.disposed) return;
-        const next = screenLines(term, tmux);
+        const next = activitySnapshot(term, tmux);
         if (hasNewText(t.activitySnapshot, next)) markActivity("New output");
         t.activitySnapshot = next;
       }, 500);
@@ -1740,7 +1740,7 @@ async function connect(
       return false;
     });
     term.onResize(({ rows, cols }) => {
-      t.activitySnapshot = screenLines(term, tmux);
+      t.activitySnapshot = activitySnapshot(term, tmux);
       t.resize?.(rows, cols);
       if (active === t.id) $("#dimensions").textContent = `${cols} × ${rows}`;
     });
@@ -2780,7 +2780,7 @@ function openCommands() {
 function browserAttentionChanged() {
   const t = currentTab();
   if (!t) return;
-  t.activitySnapshot = screenLines(t.term, t.tmux);
+  t.activitySnapshot = activitySnapshot(t.term, t.tmux);
   if (document.visibilityState === "visible" && document.hasFocus()) {
     t.activity = "";
     renderTabs();
