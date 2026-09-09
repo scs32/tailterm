@@ -1,0 +1,136 @@
+{
+  "status": "builder_release_verified_pending_final_acceptance",
+  "recordedAt": "2026-09-09T18:22:41Z",
+  "workItem": {
+    "id": "wi_fc695f0cbc3f7a42",
+    "ownerMessage": 795,
+    "buildOrder": {
+      "id": "wi_fc695f0cbc3f7a42-build-1",
+      "message": 820
+    },
+    "releaseOrder": {
+      "id": "wi_fc695f0cbc3f7a42-release-1",
+      "message": 883,
+      "handlerConfirmationMessage": 885,
+      "handlerRevision": 11
+    }
+  },
+  "source": {
+    "base": "4de29d028842a24b391f3e9dc6086e398c10ea7f",
+    "acceptedApplicationCandidate": "c045440f511d534efdacb2b02d942463191bb715",
+    "integratedReleaseCommit": "d441722a8f7f06d8a097621a24a5e58dcba4ea95",
+    "integration": "Fast-forward into clean tasks-hub; accepted product and focused-test files were byte-identical to the candidate.",
+    "applicationFiles": [
+      "client/board-view.js",
+      "tests/board-compose-browser.mjs"
+    ],
+    "reportFilesAtReleaseCommit": [
+      "docs/board-enter.md",
+      "docs/releases/tailos-2026-09-09-board-enter.template.json"
+    ]
+  },
+  "package": {
+    "worktree": "/Users/stephenspeicher/projects/tailterm/.build/releases/board-enter-d441722",
+    "commit": "d441722a8f7f06d8a097621a24a5e58dcba4ea95",
+    "cleanSource": true,
+    "manifestEntries": 82,
+    "servedAssetsPerOrigin": 81,
+    "releaseSha256": "4da7c372e2dde9813c1fd63afb590aead8f6033360c7a6fb2e3456b63dc15a34",
+    "buildCommand": "npm run build:static",
+    "verifyCommand": "npm run verify:release",
+    "verifyResult": "pass"
+  },
+  "tailos": {
+    "origin": "https://tailos.tailarr.com",
+    "cloudflareProject": "tailos",
+    "deploymentId": "cd03fb64-9b8f-48c3-b341-8dad7fa5f87b",
+    "deployment": "https://cd03fb64.tailos.pages.dev",
+    "branch": "main",
+    "commit": "d441722a8f7f06d8a097621a24a5e58dcba4ea95",
+    "verifiedAssets": 81,
+    "releaseSha256": "4da7c372e2dde9813c1fd63afb590aead8f6033360c7a6fb2e3456b63dc15a34",
+    "assetVerification": {
+      "origins": [
+        "https://tailos.tailarr.com",
+        "https://cd03fb64.tailos.pages.dev"
+      ],
+      "result": "81/81 served assets and release.json match on each origin",
+      "verifiedAt": "2026-09-09T18:19:08Z",
+      "transcript": ".build/board-enter-release/asset-verification.log",
+      "transcriptSha256": "1b4d9f647faf04494658e26c97e13456f0c7a1c35abe55c9161135bcd91847f8"
+    }
+  },
+  "miniPreview": {
+    "origin": "http://127.0.0.1:4318",
+    "server": "existing Node static-preview listener",
+    "servedDirectory": "/Users/stephenspeicher/projects/tailterm/dist-static",
+    "activation": "rsync -a --delete from the exact retained package; listener not restarted",
+    "commit": "d441722a8f7f06d8a097621a24a5e58dcba4ea95",
+    "verifiedAssets": 81,
+    "releaseSha256": "4da7c372e2dde9813c1fd63afb590aead8f6033360c7a6fb2e3456b63dc15a34",
+    "verifiedAt": "2026-09-09T18:20:36.585Z",
+    "receipt": ".build/board-enter-release/mini.json",
+    "receiptSha256": "dc85aaaf4bfd9a92b4b80e5ac7dc58499eabbf03b0bfc0e4a4defb78d3fe864a",
+    "sequenceNote": "The root clean build populated the directory already served by Mini, so read-only inventory showed the new commit before the explicit retained-package rsync reapplied the same bytes."
+  },
+  "productionSmoke": {
+    "origin": "https://tailos.tailarr.com",
+    "browser": "Chromium",
+    "commit": "d441722a8f7f06d8a097621a24a5e58dcba4ea95",
+    "mainScript": "/assets/index-DAdzlxlR.js",
+    "productionWasm": true,
+    "syntheticLocalVaultRestoration": true,
+    "uncaughtErrors": [],
+    "verifiedAt": "2026-09-09T18:19:29Z",
+    "transcript": ".build/board-enter-release/public-smoke.log",
+    "transcriptSha256": "5eae24c801dd7a6c78f4f0b2743324990d3c012e3db0f5e7dbc20b72e0f56fc7",
+    "screenshot": ".build/board-enter-release/public-layout.png"
+  },
+  "acceptance": {
+    "builderFocusedBrowser": "Chromium and WebKit pass against a disposable compiled real hub/SQLite database",
+    "builderUnit": "121/121 pass",
+    "builderBoardLayout": "Chromium and WebKit pass at 1440, 1024 and 390 pixels",
+    "independentQa": {
+      "agent": "board-enter-qa",
+      "message": 876,
+      "acceptedByLeadMessage": 879,
+      "result": "pass",
+      "report": ".build/board-enter-independent/qa-report.md",
+      "reportSha256": "2074f8cde68640f7244c8e89342bb04b85215e5eb9e3b396c836e1cb702affc1"
+    },
+    "taskFormBrowser": "nonpass: Board coverage ran, then the unchanged command timed out in unrelated team-launch retry at tests/task-form-browser.mjs:485"
+  },
+  "cleanup": {
+    "focusedFixtureTemporaryDirectories": [],
+    "focusedFixtureRemainingProcesses": [],
+    "publicBrowserClosed": true,
+    "assetVerifierExited": true,
+    "appleContainerAttempt": "Failed before image creation or preview replacement because Rosetta was unavailable; no install, container, listener or network change.",
+    "failedAppleStage": "Generated duplicate removed after explicit path verification; not recoverable. The retained release package remains intact.",
+    "miniListenerRestarted": false
+  },
+  "coverageLimitation": {
+    "nativeIme": "Not observed. Composition/isComposing/keyCode 229 were synthetic DOM events in real Chromium and WebKit; no native OS IME pass is claimed.",
+    "physicalHeldKey": "Not observed. The repeat flag was synthetic; no physical autorepeat pass is claimed."
+  },
+  "rollback": {
+    "commit": "fd8d10273a46877b6bd7a6eb0c1dd9b2bc228bce",
+    "tailosDeploymentId": "14bee768-905f-453b-b24e-b064a236f96a",
+    "tailosDeployment": "https://14bee768.tailos.pages.dev",
+    "retainedPackage": "/Users/stephenspeicher/projects/tailterm/.build/releases/dropdown-dispatch-fd8d102",
+    "releaseSha256": "ec83e3e7faf22b7c15d9c5e499cb0db579537513f4c8669bf39d7e06dc401e2d",
+    "verifyResult": "82 manifest entries pass npm run verify:release",
+    "warning": "Rollback re-serves prior frontend bytes only; it does not roll back subsequent live hub or user writes."
+  },
+  "excluded": [
+    "https://tailterm.tailarr.com",
+    "Air preview",
+    "hub",
+    "CLI",
+    "schema",
+    "TrueNAS",
+    "Tailscale/networking",
+    "live profiles/tasks",
+    "agent sessions"
+  ]
+}

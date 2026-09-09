@@ -1,5 +1,37 @@
 # Development handoff — September 9, 2026
 
+## September 9 Board Enter-to-send — release verified
+
+Application `d441722a8f7f06d8a097621a24a5e58dcba4ea95` is deployed to
+`https://tailos.tailarr.com` (`https://cd03fb64.tailos.pages.dev`) and served by
+the Stephens-Mini preview at `http://127.0.0.1:4318`. Both origins match all 81
+served asset hashes and manifest SHA-256
+`4da7c372e2dde9813c1fd63afb590aead8f6033360c7a6fb2e3456b63dc15a34`.
+Public Chromium checked the exact main script, production WASM and isolated
+synthetic-vault restoration without browser errors.
+
+Board's message textarea now sends on bare Enter and keeps Shift+Enter for a
+newline. Composition/repeat/pending/empty guards prevent unintended or duplicate
+sends. Failed sends retain their draft, recipient, reply, selection and stable
+retry identity; a committed response-loss retry stores exactly one message.
+Builder and independent Chromium/WebKit evidence passed. Composition and repeat
+flags were synthetic browser events; no native OS IME or physical autorepeat pass
+is claimed. The larger task-form browser command retains an unrelated team-launch
+dialog timeout and is not reported as passing.
+
+Bug `wi_fc695f0cbc3f7a42`, build order #820 and frontend release order #883 are
+documented in [the behavior/report](board-enter.md) and
+[the release receipt](releases/tailos-2026-09-09-board-enter.json). Clean source
+and package are retained at `.build/releases/board-enter-d441722`. The previous
+`fd8d10273a46877b6bd7a6eb0c1dd9b2bc228bce` package remains the rollback at
+`.build/releases/dropdown-dispatch-fd8d102`.
+
+Mini's Apple Container build path was unavailable because Rosetta is not installed;
+no host setup or container change was made. The authorized existing Node preview
+serves root `dist-static`, so the exact retained package was synchronized there
+without restarting its listener. Air stays retired. Hub, CLI, schema, TrueNAS,
+Tailscale, networking, live profiles/tasks and agent sessions were unchanged.
+
 ## September 9 dropdown and send-dialog fixes — release verified
 
 Application `fd8d10273a46877b6bd7a6eb0c1dd9b2bc228bce` is now deployed to

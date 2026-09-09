@@ -124,3 +124,53 @@ The reviewable release template is
 the integrated application commit, manifests, deployments, served asset checks
 and final cleanup confirmation unset. Those fields may be filled only from
 observed release evidence.
+
+## Verified release
+
+The accepted application bytes and this report/template were integrated by
+fast-forward into `tasks-hub` as
+`d441722a8f7f06d8a097621a24a5e58dcba4ea95`. Git confirmed that the accepted
+product and focused-test files at `c045440f511d534efdacb2b02d942463191bb715`
+were unchanged in the integrated commit.
+
+`npm run build:static` created a clean package with 82 manifest entries, and
+`npm run verify:release` passed. Its `release.json` SHA-256 is
+`4da7c372e2dde9813c1fd63afb590aead8f6033360c7a6fb2e3456b63dc15a34`.
+The clean source and package are retained at
+`.build/releases/board-enter-d441722`.
+
+TailOS production deployment `cd03fb64-9b8f-48c3-b341-8dad7fa5f87b` is
+`https://cd03fb64.tailos.pages.dev`. Both that immutable origin and
+`https://tailos.tailarr.com` matched the release manifest and all 81 served
+asset hashes; `_headers` is the unserved hosting configuration entry. The public
+main script is `/assets/index-DAdzlxlR.js`. Public Chromium loaded the production
+WASM, restored an isolated synthetic local vault/key and reported no page errors.
+Retained logs:
+
+- `.build/board-enter-release/asset-verification.log`, SHA-256
+  `1b4d9f647faf04494658e26c97e13456f0c7a1c35abe55c9161135bcd91847f8`
+- `.build/board-enter-release/public-smoke.log`, SHA-256
+  `5eae24c801dd7a6c78f4f0b2743324990d3c012e3db0f5e7dbc20b72e0f56fc7`
+- `.build/board-enter-release/public-layout.png`
+
+The first Mini command used the documented Apple Container replacement script,
+but failed before a candidate image or preview replacement because BuildKit could
+not start without Rosetta. No Rosetta, container, service or network change was
+made. Lead #914 authorized the actual existing preview path: the already-running
+Node listener on `127.0.0.1:4318` serves the root `dist-static` directory. Because
+the clean build was made in that served directory, the read-only inventory already
+showed the new commit. The exact retained package was then reapplied with the
+authorized `rsync -a --delete` path, without restarting the listener. Mini matched
+the manifest and all 81 served asset hashes. Its receipt is
+`.build/board-enter-release/mini.json`, SHA-256
+`dc85aaaf4bfd9a92b4b80e5ac7dc58499eabbf03b0bfc0e4a4defb78d3fe864a`.
+
+The failed Apple Container staging copy was removed after its explicit path was
+verified. It was a generated duplicate and is not recoverable; the source
+package remains intact in the retained release worktree. The prior rollback
+package was reverified clean with 82 manifest entries and its original
+`ec83e3e7faf22b7c15d9c5e499cb0db579537513f4c8669bf39d7e06dc401e2d`
+manifest hash. No Air, hub, CLI, schema, Tailscale, network, profile, task or agent
+session was changed.
+
+See [the durable release receipt](releases/tailos-2026-09-09-board-enter.json).

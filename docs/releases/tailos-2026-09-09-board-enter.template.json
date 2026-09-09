@@ -1,5 +1,6 @@
 {
-  "status": "template_pending_release_execution",
+  "status": "template_superseded_by_verified_receipt",
+  "filledBy": "docs/releases/tailos-2026-09-09-board-enter.json",
   "workItem": {
     "id": "wi_fc695f0cbc3f7a42",
     "ownerMessage": 795,
