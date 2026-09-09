@@ -216,14 +216,13 @@ export function createWorkItemsView({
         )
         .join(
           "",
-        )}</select></label><label>Title<input id="work-item-title" required maxlength="120" value="${esc(savedValues.title ?? item?.title ?? "")}" ${readonly ? "disabled" : ""}></label><label>Description<textarea id="work-item-description" rows="5" maxlength="8192" ${readonly ? "disabled" : ""}>${esc(savedValues.description ?? item?.description ?? "")}</textarea></label><div class="work-item-fields"><label>Status<select id="work-item-status" ${!item || readonly ? "disabled" : ""}>${options(statuses, savedValues.status || item?.status || "open")}</select></label><label>Priority<select id="work-item-priority" ${readonly ? "disabled" : ""}>${options(priorities, savedValues.priority || item?.priority || "normal")}</select></label></div><p id="work-item-error" class="fine" role="status">${readonly ? "This project is closed. Its records are read-only." : saved ? "Recovered unsent changes from this encrypted workspace." : ""}</p><div class="dialog-actions">${readonly ? "" : '<button type="submit" class="primary">Save</button>'}${item && !readonly ? '<button type="button" data-item-dispatch>Send to project</button>' : ""}</div></form>`,
+        )}</select></label><label>Title<input id="work-item-title" required maxlength="120" value="${esc(savedValues.title ?? item?.title ?? "")}" ${readonly ? "disabled" : ""}></label><label>Description<textarea id="work-item-description" rows="5" maxlength="8192" ${readonly ? "disabled" : ""}>${esc(savedValues.description ?? item?.description ?? "")}</textarea></label><div class="work-item-fields"><label>Status<select id="work-item-status" ${!item || readonly ? "disabled" : ""}>${options(statuses, savedValues.status || item?.status || "open")}</select></label><label>Priority<select id="work-item-priority" ${readonly ? "disabled" : ""}>${options(priorities, savedValues.priority || item?.priority || "normal")}</select></label></div><p id="work-item-error" class="fine" role="status">${readonly ? "This project is closed. Its records are read-only." : saved ? "Recovered unsent changes from this encrypted workspace." : ""}</p><div class="dialog-actions">${readonly ? "" : '<button type="button" data-item-discard>Discard draft</button><button type="submit" class="primary">Save</button>'}${item && !readonly ? '<button type="button" data-item-dispatch>Send to project</button>' : ""}</div></form>`,
     );
     const form = document.querySelector("#work-item-form"),
       error = form.querySelector("#work-item-error");
     let pending = false,
-      completed = false,
       key = saved?.requestId || crypto.randomUUID(),
-      lastPayload = saved?.lastPayload || "";
+      intent = saved?.intent || null;
     const values = () => ({
       taskId: item?.taskId || form.querySelector("#work-item-project").value,
       title: form.querySelector("#work-item-title").value,
@@ -236,7 +235,7 @@ export function createWorkItemsView({
         scope: credentialScope,
         id: draftID,
         requestId: key,
-        lastPayload,
+        intent,
         values: values(),
         updatedAt: new Date().toISOString(),
       });
@@ -244,13 +243,10 @@ export function createWorkItemsView({
       form.querySelectorAll("input,textarea,select").forEach((control) =>
         control.addEventListener("input", () => void persist().catch(() => {})),
       );
-    document.querySelector("#dialog")?.addEventListener(
-      "close",
-      () => {
-        if (!completed) void drafts.remove(credentialScope, draftID).catch(() => {});
-      },
-      { once: true },
-    );
+    form.querySelector("[data-item-discard]")?.addEventListener("click", async () => {
+      await drafts.remove(credentialScope, draftID).catch(() => {});
+      if (form.isConnected) closeDialog();
+    });
     form
       .querySelector("[data-item-dispatch]")
       ?.addEventListener("click", () => dispatch(item));
@@ -275,32 +271,62 @@ export function createWorkItemsView({
           ? { status: form.querySelector("#work-item-status").value }
           : {}),
       });
-      if (lastPayload && lastPayload !== payload) key = crypto.randomUUID();
-      lastPayload = payload;
+      const intentPayload = intent
+        ? JSON.stringify({
+            taskId: intent.taskId,
+            title: intent.request?.title,
+            description: intent.request?.description,
+            priority: intent.request?.priority,
+            ...(item ? { status: intent.request?.status } : {}),
+          })
+        : "";
+      if (
+        intent &&
+        (intentPayload !== payload ||
+          (!item && intent.request?.kind !== kind))
+      ) {
+        key = crypto.randomUUID();
+        intent = null;
+      }
+      if (
+        !intent ||
+        intent.taskId !== taskId ||
+        intent.itemId !== (item?.id || "") ||
+        intent.request?.requestId !== key
+      ) {
+        intent = null;
+        const request = item
+          ? {
+              ...body,
+              status: form.querySelector("#work-item-status").value,
+              expectedRevision: item.revision,
+              requestId: key,
+            }
+          : { ...body, kind, requestId: key };
+        intent = { taskId, itemId: item?.id || "", request };
+      }
       await persist().catch(() => {});
       pending = true;
       form.querySelectorAll("button").forEach((b) => (b.disabled = true));
       error.textContent = "Saving…";
       try {
         if (item)
-          await client().createWorkItemUpdate(taskId, item.id, {
-            ...body,
-            status: form.querySelector("#work-item-status").value,
-            expectedRevision: item.revision,
-            requestId: key,
-          });
-        else
-          await client().createWorkItem(taskId, {
-            ...body,
-            kind,
-            requestId: key,
-          });
-        completed = true;
+          await client().createWorkItemUpdate(
+            intent.taskId,
+            intent.itemId,
+            intent.request,
+          );
+        else await client().createWorkItem(intent.taskId, intent.request);
         await drafts.remove(credentialScope, draftID).catch(() => {});
         if (form.isConnected) closeDialog();
         notice(`${singular} saved.`);
         await reload();
       } catch (e) {
+        if (e.status === 409) {
+          key = crypto.randomUUID();
+          intent = null;
+          await persist().catch(() => {});
+        }
         if (form.isConnected)
           error.textContent =
             e.status === 409
@@ -342,20 +368,47 @@ export function createWorkItemsView({
         .reverse()
         .map((r) => `<button type="button" data-history-revision="${r.revision}" aria-pressed="false"><strong>v${r.revision}</strong><span>${esc(r.changeKind)} · ${esc(r.updatedAt)}</span></button>`)
         .join("")}</nav><div data-history-detail></div></div>${gaps.length ? `<details class="work-item-history-gaps"><summary>History gaps · ${gaps.length}</summary>${gaps.map((gap) => `<p><strong>v${gap.firstRevision}${gap.lastRevision === gap.firstRevision ? "" : `–${gap.lastRevision}`}</strong> ${esc(gap.reasonCode)}${gap.detail ? ` · ${esc(gap.detail)}` : ""}</p>`).join("")}</details>` : ""}`;
+      let selection = 0;
       const show = async (revision) => {
+        const selectedAt = ++selection;
         const selected = revisions.find((entry) => entry.revision === revision);
         if (!selected || !panel.isConnected) return;
         panel.querySelectorAll("[data-history-revision]").forEach((button) => button.setAttribute("aria-pressed", String(Number(button.dataset.historyRevision) === revision)));
         const detail = panel.querySelector("[data-history-detail]");
+        detail.dataset.historyDetailRevision = String(revision);
         detail.innerHTML = `<span class="eyebrow">REVISION ${revision}</span><h3>${esc(selected.title)}</h3><p class="fine">${esc(statuses[selected.status] || selected.status)} · ${esc(priorities[selected.priority] || selected.priority)} · ${esc(selected.provenance)}</p><pre>${esc(selected.description)}</pre><p class="fine" data-history-messages>Loading linked messages…</p>`;
         try {
-          const page = await client().listWorkItemMessages(item.taskId, item.id, { revision, limit: 64 });
-          if (!detail.isConnected) return;
-          detail.querySelector("[data-history-messages]").outerHTML = page.links.length
-            ? `<div class="work-item-history-messages"><span class="eyebrow">EXPLICIT MESSAGES</span>${page.links.map((link) => `<button type="button" data-history-message-task="${esc(link.message.taskId)}"><strong>#${link.message.seq}</strong> ${esc(link.message.text)}<span>${esc(link.revisionCoverage)}${link.source ? " · source" : ""}</span></button>`).join("")}</div>`
+          const links = [];
+          let after = 0;
+          do {
+            const page = await client().listWorkItemMessages(item.taskId, item.id, { revision, after, limit: 64 });
+            if (
+              selectedAt !== selection ||
+              !detail.isConnected ||
+              detail.dataset.historyDetailRevision !== String(revision)
+            ) return;
+            links.push(...page.links);
+            if (!page.nextAfter) break;
+            if (page.nextAfter <= after)
+              throw new Error("Linked-message cursor did not advance.");
+            after = page.nextAfter;
+          } while (true);
+          if (
+            selectedAt !== selection ||
+            !detail.isConnected ||
+            detail.dataset.historyDetailRevision !== String(revision)
+          ) return;
+          detail.querySelector("[data-history-messages]").outerHTML = links.length
+            ? `<div class="work-item-history-messages"><span class="eyebrow">EXPLICIT MESSAGES</span>${links.map((link) => `<button type="button" data-history-message-task="${esc(link.message.taskId)}"><strong>#${link.message.seq}</strong> ${esc(link.message.text)}<span>${esc(link.revisionCoverage)}${link.source ? " · source" : ""}</span></button>`).join("")}</div>`
             : `<p class="fine">No messages were explicitly linked to this revision.</p>`;
           detail.querySelectorAll("[data-history-message-task]").forEach((button) => button.onclick = () => openBoard(button.dataset.historyMessageTask));
-        } catch (error) { if (detail.isConnected) detail.querySelector("[data-history-messages]").textContent = error.message; }
+        } catch (error) {
+          if (
+            selectedAt === selection &&
+            detail.isConnected &&
+            detail.dataset.historyDetailRevision === String(revision)
+          ) detail.querySelector("[data-history-messages]").textContent = error.message;
+        }
       };
       panel.querySelectorAll("[data-history-revision]").forEach((button) => button.onclick = () => void show(Number(button.dataset.historyRevision)));
       if (revisions.length) await show(revisions.at(-1).revision);

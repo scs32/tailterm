@@ -117,6 +117,88 @@ func TestWorkItemHTTPHistoryKeyedUpdateAndReceipt(t *testing.T) {
 	}
 }
 
+func historyBoundaryPadding(t *testing.T, build func(string) any) string {
+	t.Helper()
+	body, err := json.Marshal(build(""))
+	if err != nil {
+		t.Fatal(err)
+	}
+	one, err := json.Marshal(build("x"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	fieldOverhead := len(one) - len(body) - 1
+	padding := api.MaxWorkItemHistoryBytes - len(body) - fieldOverhead - 1
+	if padding < 1 {
+		t.Fatalf("boundary fixture base is too large: %d", len(body))
+	}
+	value := strings.Repeat("x", padding)
+	body, err = json.Marshal(build(value))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(body)+1 != api.MaxWorkItemHistoryBytes {
+		t.Fatalf("boundary fixture bytes=%d", len(body)+1)
+	}
+	return value
+}
+
+func TestWorkItemHistoryBoundsMeasureFinalCursor(t *testing.T) {
+	revisionBuild := func(padding string) any {
+		return api.WorkItemRevisionList{Revisions: []api.WorkItemRevision{
+			{Revision: 1},
+			{Revision: 922337203685477580, Description: padding},
+		}}
+	}
+	revisionPadding := historyBoundaryPadding(t, revisionBuild)
+	revisionCandidate := revisionBuild(revisionPadding).(api.WorkItemRevisionList)
+	revisionCandidate.NextAfter = revisionCandidate.Revisions[1].Revision
+	if fitsHistoryBody(revisionCandidate) {
+		t.Fatal("revision fixture must cross the bound only when nextAfter is encoded")
+	}
+	revisionCandidate.Revisions = append(revisionCandidate.Revisions, api.WorkItemRevision{Revision: 922337203685477581})
+	revisions, ok := boundRevisionList(revisionCandidate, 2)
+	if !ok || len(revisions.Revisions) != 1 || revisions.NextAfter != 1 || !fitsHistoryBody(revisions) {
+		t.Fatalf("revision bound=%+v ok=%v bytesFit=%v", revisions, ok, fitsHistoryBody(revisions))
+	}
+
+	gapBuild := func(padding string) any {
+		return api.HistoryGapList{Gaps: []api.HistoryGap{
+			{Seq: 1},
+			{Seq: 922337203685477580, Detail: padding},
+		}}
+	}
+	gapPadding := historyBoundaryPadding(t, gapBuild)
+	gapCandidate := gapBuild(gapPadding).(api.HistoryGapList)
+	gapCandidate.NextAfter = gapCandidate.Gaps[1].Seq
+	if fitsHistoryBody(gapCandidate) {
+		t.Fatal("gap fixture must cross the bound only when nextAfter is encoded")
+	}
+	gapCandidate.Gaps = append(gapCandidate.Gaps, api.HistoryGap{Seq: 922337203685477581})
+	gaps, ok := boundGapList(gapCandidate, 2)
+	if !ok || len(gaps.Gaps) != 1 || gaps.NextAfter != 1 || !fitsHistoryBody(gaps) {
+		t.Fatalf("gap bound=%+v ok=%v bytesFit=%v", gaps, ok, fitsHistoryBody(gaps))
+	}
+
+	messageBuild := func(padding string) any {
+		return api.WorkItemMessageList{Links: []api.WorkItemMessageLink{
+			{Message: api.Message{Seq: 1}},
+			{Message: api.Message{Seq: 922337203685477580, Text: padding}},
+		}}
+	}
+	messagePadding := historyBoundaryPadding(t, messageBuild)
+	messageCandidate := messageBuild(messagePadding).(api.WorkItemMessageList)
+	messageCandidate.NextAfter = messageCandidate.Links[1].Message.Seq
+	if fitsHistoryBody(messageCandidate) {
+		t.Fatal("message fixture must cross the bound only when nextAfter is encoded")
+	}
+	messageCandidate.Links = append(messageCandidate.Links, api.WorkItemMessageLink{Message: api.Message{Seq: 922337203685477581}})
+	messages, ok := boundMessageList(messageCandidate, 2)
+	if !ok || len(messages.Links) != 1 || messages.NextAfter != 1 || !fitsHistoryBody(messages) {
+		t.Fatalf("message bound=%+v ok=%v bytesFit=%v", messages, ok, fitsHistoryBody(messages))
+	}
+}
+
 func TestWorkItemHTTPHistoryPagesStayUnderNormalClientLimit(t *testing.T) {
 	c := newClient(t)
 	task := c.task("bounded-history")

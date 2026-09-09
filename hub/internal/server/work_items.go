@@ -39,17 +39,20 @@ func boundRevisionList(list api.WorkItemRevisionList, limit int) (api.WorkItemRe
 	if hasMore {
 		list.Revisions = list.Revisions[:limit]
 	}
-	for len(list.Revisions) > 0 && !fitsHistoryBody(list) {
+	for {
+		list.NextAfter = 0
+		if hasMore && len(list.Revisions) > 0 {
+			list.NextAfter = list.Revisions[len(list.Revisions)-1].Revision
+		}
+		if fitsHistoryBody(list) {
+			return list, !hasMore || len(list.Revisions) > 0
+		}
+		if len(list.Revisions) == 0 {
+			return list, false
+		}
 		hasMore = true
 		list.Revisions = list.Revisions[:len(list.Revisions)-1]
 	}
-	if len(list.Revisions) == 0 && !fitsHistoryBody(list) {
-		return list, false
-	}
-	if hasMore && len(list.Revisions) > 0 {
-		list.NextAfter = list.Revisions[len(list.Revisions)-1].Revision
-	}
-	return list, true
 }
 
 func boundGapList(list api.HistoryGapList, limit int) (api.HistoryGapList, bool) {
@@ -57,17 +60,20 @@ func boundGapList(list api.HistoryGapList, limit int) (api.HistoryGapList, bool)
 	if hasMore {
 		list.Gaps = list.Gaps[:limit]
 	}
-	for len(list.Gaps) > 0 && !fitsHistoryBody(list) {
+	for {
+		list.NextAfter = 0
+		if hasMore && len(list.Gaps) > 0 {
+			list.NextAfter = list.Gaps[len(list.Gaps)-1].Seq
+		}
+		if fitsHistoryBody(list) {
+			return list, !hasMore || len(list.Gaps) > 0
+		}
+		if len(list.Gaps) == 0 {
+			return list, false
+		}
 		hasMore = true
 		list.Gaps = list.Gaps[:len(list.Gaps)-1]
 	}
-	if len(list.Gaps) == 0 && !fitsHistoryBody(list) {
-		return list, false
-	}
-	if hasMore && len(list.Gaps) > 0 {
-		list.NextAfter = list.Gaps[len(list.Gaps)-1].Seq
-	}
-	return list, true
 }
 
 func boundMessageList(list api.WorkItemMessageList, limit int) (api.WorkItemMessageList, bool) {
@@ -75,17 +81,20 @@ func boundMessageList(list api.WorkItemMessageList, limit int) (api.WorkItemMess
 	if hasMore {
 		list.Links = list.Links[:limit]
 	}
-	for len(list.Links) > 0 && !fitsHistoryBody(list) {
+	for {
+		list.NextAfter = 0
+		if hasMore && len(list.Links) > 0 {
+			list.NextAfter = list.Links[len(list.Links)-1].Message.Seq
+		}
+		if fitsHistoryBody(list) {
+			return list, !hasMore || len(list.Links) > 0
+		}
+		if len(list.Links) == 0 {
+			return list, false
+		}
 		hasMore = true
 		list.Links = list.Links[:len(list.Links)-1]
 	}
-	if len(list.Links) == 0 && !fitsHistoryBody(list) {
-		return list, false
-	}
-	if hasMore && len(list.Links) > 0 {
-		list.NextAfter = list.Links[len(list.Links)-1].Message.Seq
-	}
-	return list, true
 }
 
 func workItemID(w http.ResponseWriter, r *http.Request) (string, bool) {

@@ -21,7 +21,19 @@ try {
         const scopeA = "a".repeat(64), scopeB = "b".repeat(64);
         for (let index = 0; index < 30; index++)
           await drafts.save({ scope: scopeA, id: `feature:task:${index}`, requestId: `key-${index}`, values: { title: `draft-${index}` }, updatedAt: new Date(Date.now()+index).toISOString() });
-        await drafts.save({ scope: scopeA, id: "bug:task:item", requestId: "PRIVATE_RETRY_KEY", lastPayload: "payload", values: { title: "PRIVATE_DRAFT_MARKER" }, updatedAt: new Date(Date.now()+1000).toISOString() });
+        const description = "x".repeat(8192);
+        await drafts.save({
+          scope: scopeA,
+          id: "bug:task:item",
+          requestId: "PRIVATE_RETRY_KEY",
+          values: { taskId: "task", title: "PRIVATE_DRAFT_MARKER", description, status: "open", priority: "normal" },
+          intent: {
+            taskId: "task",
+            itemId: "item",
+            request: { title: "PRIVATE_DRAFT_MARKER", description, status: "open", priority: "normal", expectedRevision: 42, requestId: "PRIVATE_RETRY_KEY" },
+          },
+          updatedAt: new Date(Date.now()+1000).toISOString(),
+        });
         return {
           found: await drafts.load(scopeA, "bug:task:item"),
           otherScope: await drafts.load(scopeB, "bug:task:item"),
@@ -32,6 +44,7 @@ try {
         };
       }, password);
       assert.equal(first.found?.requestId, "PRIVATE_RETRY_KEY");
+      assert.equal(first.found?.intent.request.expectedRevision, 42);
       assert.equal(first.otherScope, null);
       assert.equal(first.oldestEvicted, null);
       assert.equal(first.latestRetained?.values.title, "draft-29");
@@ -66,6 +79,7 @@ try {
         };
       }, password);
       assert.equal(reloaded.found?.requestId, "PRIVATE_RETRY_KEY");
+      assert.equal(reloaded.found?.intent.request.expectedRevision, 42);
       assert.equal(reloaded.removed, null);
       assert.equal(reloaded.backupHasDrafts, false);
       assert.equal(reloaded.profileHasDrafts, false);

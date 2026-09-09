@@ -53,6 +53,16 @@ async function api(method, route, body) {
   }
   return data;
 }
+async function rateLimitedAPI(method, route, body) {
+  for (let attempt = 0; ; attempt++) {
+    try {
+      return await api(method, route, body);
+    } catch (error) {
+      if (error.status !== 429 || attempt === 100) throw error;
+      await new Promise((resolve) => setTimeout(resolve, 75));
+    }
+  }
+}
 for (let i = 0; i < 50; i++) {
   try {
     await api("GET", "/v1/tasks");
@@ -106,12 +116,15 @@ async function fixture(label) {
   return { source, target, other, missing, exited, legacy, legacyHandlerID };
 }
 
-let dropNextCreate = false, dropNextUpdate = false;
+let dropNextCreate = false, dropNextUpdate = false, delayNextHistoryMessage = false;
 const html = `<!doctype html><html><head><meta charset="utf-8"><link rel="stylesheet" href="/client/style.css"><link rel="stylesheet" href="/client/work-items.css"></head><body><div id="app"><div id="workspace"><main><header></header></main></div><dialog id="dialog"></dialog><p id="notice"></p></div><script type="module">
 import {createHubClient} from '/client/hub-client.js';
 import {createWorkItemsView} from '/client/work-items-view.js';
 import {createTaskHub} from '/client/task-hub.js';
 import {setupModes} from '/client/modes.js';
+import * as localVault from '/client/local-vault.js';
+await localVault.localAPI('/unlock','POST',{password:'isolated work-item browser passphrase'});
+const draftPersistence=localVault.workItemDraftPersistence();
 const data={hub:{url:location.origin},projectHandlerPlans:[]};
 const servers=[
   {id:'a',name:'Host A',host:'host-a',username:'fixture',runtimes:['codex','claude']},
@@ -128,8 +141,8 @@ const host={
   browserCommand:async(server,command)=>{window.qa.commands.push({server:server.id,command});if(window.qa.failLaunch)throw Error('Synthetic response loss after launch');return JSON.stringify({id:'agt_abcdef0123456789',host:server.host})}
 };
 const taskHub=createTaskHub(host);taskHub.refresh();
-const bugs=createWorkItemsView({kind:'bug',client:()=>client,dialog,closeDialog:host.closeDialog,notice:host.notice,configure(){},openBoard:host.openBoard});
-const features=createWorkItemsView({kind:'feature',client:()=>client,dialog,closeDialog:host.closeDialog,notice:host.notice,configure(){},openBoard:host.openBoard});
+const bugs=createWorkItemsView({kind:'bug',client:()=>client,dialog,closeDialog:host.closeDialog,notice:host.notice,configure(){},openBoard:host.openBoard,draftPersistence});
+const features=createWorkItemsView({kind:'feature',client:()=>client,dialog,closeDialog:host.closeDialog,notice:host.notice,configure(){},openBoard:host.openBoard,draftPersistence});
 const modes=setupModes({header:document.querySelector('header'),main:document.querySelector('main'),onChange:(mode,view)=>{bugs.hide();features.hide();view.replaceChildren();if(mode==='bugs'){bugs.mount(view);bugs.show()}if(mode==='features'){features.mount(view);features.show()}}});
 window.qa={client,bugs,features,modes,taskHub,data,commands:[],failLaunch:false,lastBoard:null};
 </script></body></html>`;
@@ -148,6 +161,11 @@ const web = createServer(async (req, res) => {
     }
     if (req.url === "/qa/drop-next-update" && req.method === "POST") {
       dropNextUpdate = true;
+      res.end("ok");
+      return;
+    }
+    if (req.url === "/qa/delay-next-history-message" && req.method === "POST") {
+      delayNextHistoryMessage = true;
       res.end("ok");
       return;
     }
@@ -174,8 +192,19 @@ const web = createServer(async (req, res) => {
         res.end(JSON.stringify({ error: "Synthetic update response loss" }));
         return;
       }
+      if (delayNextHistoryMessage && req.method === "GET" && /\/work-items\/wi_[a-f0-9]+\/messages\?.*revision=1(?:&|$)/.test(req.url)) {
+        delayNextHistoryMessage = false;
+        await new Promise((resolve) => setTimeout(resolve, 400));
+      }
       res.writeHead(upstream.status, { "content-type": "application/json" });
       res.end(body);
+      return;
+    }
+    // Emulate Vite's ?url module transform; the SSH runtime itself is never
+    // loaded by this isolated encrypted-vault fixture.
+    if (req.url === "/wasm/tailserve.wasm?url") {
+      res.setHeader("content-type", "text/javascript");
+      res.end('export default "/wasm/tailserve.wasm";');
       return;
     }
     const file = path.resolve(root, "." + decodeURIComponent(req.url));
@@ -240,7 +269,11 @@ try {
       const errors = [];
       page.on("pageerror", (error) => errors.push(error.message));
       await page.goto(origin);
-      await page.waitForFunction(() => !!window.qa);
+      try {
+        await page.waitForFunction(() => !!window.qa, null, { timeout: 10000 });
+      } catch (error) {
+        throw new Error(`fixture did not initialize: ${errors.join(" | ") || error.message}`);
+      }
       assert.equal(await page.locator('[data-mode="tasks"]').textContent(), "Projects");
       await page.locator('[data-mode="bugs"]').click();
       await page.locator('[data-items-new]').waitFor();
@@ -253,7 +286,8 @@ try {
       await page.evaluate(() => (document.querySelector('#work-item-project').value = ''));
       await page.locator('#work-item-form button[type=submit]').click();
       await page.locator('#work-item-error').filter({ hasText: "Choose a project" }).waitFor();
-      await page.locator('#dialog-close').click();
+      await page.locator('[data-item-discard]').click();
+      await page.locator('#dialog').waitFor({ state: "hidden" });
 
       // A create whose HTTP response is lost must replay one durable record.
       await fetch(origin + "/qa/drop-next-create", { method: "POST" });
@@ -269,11 +303,17 @@ try {
       assert.equal(created.length, 1, "response-loss retry duplicated a bug");
       const createdID = created[0].id;
       await page.locator(`[data-work-item="${createdID}"]`).waitFor();
+      await api("POST", `/v1/tasks/${source.task.id}/messages`, {
+        text: `${name} revision-one explicit message`,
+        requestId: `${name}-revision-one-message`,
+        workItems: [{ itemTaskId: source.task.id, itemId: createdID, itemRevision: 1, relationship: "primary" }],
+      });
 
       // Scope, update, reload persistence, and stale CAS rejection.
       const targetBug = await api("POST", `/v1/tasks/${target.task.id}/work-items`, { kind: "bug", title: `${name} target bug`, requestId: `${name}-target-bug` });
       await page.evaluate(() => qa.bugs.reload());
       await page.locator(`[data-work-item="${createdID}"]`).waitFor();
+      await page.locator(`[data-work-item="${targetBug.id}"]`).waitFor();
       assert.ok(await page.locator(`[data-work-item="${targetBug.id}"]`).count(), "all-project scope omitted a record");
       await page.locator('[data-items-project]').selectOption(source.task.id);
       await page.locator(`[data-work-item="${createdID}"]`).waitFor();
@@ -292,16 +332,42 @@ try {
       await page.locator('#work-item-title').fill(`${name} persisted edit`);
       await page.locator('#work-item-status').selectOption("in_progress");
       await page.locator('#work-item-priority').selectOption("high");
+      // Ordinary dismissal and mode navigation retain the encrypted draft.
+      await page.locator('#dialog-close').click();
+      await page.locator('[data-mode="features"]').click();
+      await page.locator('[data-items-new]').waitFor();
+      await page.locator('[data-mode="bugs"]').click();
+      await page.locator(`[data-item-edit="${createdID}"]`).click();
+      await page.locator('#work-item-error').filter({ hasText: "Recovered unsent changes" }).waitFor();
+      assert.equal(await page.locator('#work-item-title').inputValue(), `${name} persisted edit`);
+      assert.equal(await page.locator('#work-item-status').inputValue(), "in_progress");
+      assert.equal(await page.locator('#work-item-priority').inputValue(), "high");
       await fetch(origin + "/qa/drop-next-update", { method: "POST" });
       await page.locator('#work-item-form button[type=submit]').click();
       await page.locator('#work-item-error').filter({ hasText: "Synthetic update response loss" }).waitFor();
       assert.equal(await page.locator('#work-item-title').inputValue(), `${name} persisted edit`, "lost update response discarded the draft");
+      // Reload after the hub commit but before confirmation. The recovered draft
+      // must replay the original key and original expectedRevision exactly.
+      await page.reload();
+      await page.waitForFunction(() => !!window.qa);
+      await page.locator('[data-mode="bugs"]').click();
+      await page.locator('[data-items-new]').waitFor();
+      await page.locator('[data-items-project]').selectOption(source.task.id);
+      await page.locator(`[data-item-edit="${createdID}"]`).click();
+      await page.locator('#work-item-error').filter({ hasText: "Recovered unsent changes" }).waitFor();
+      assert.equal(await page.locator('#work-item-title').inputValue(), `${name} persisted edit`);
       await page.locator('#work-item-form button[type=submit]').click();
       await page.locator('#dialog').waitFor({ state: "hidden" });
       const edited = await item(source.task.id, createdID);
       assert.equal(edited.title, `${name} persisted edit`);
       assert.equal(edited.status, "in_progress");
       assert.equal(edited.priority, "high");
+      for (let index = 0; index < 65; index++)
+        await rateLimitedAPI("POST", `/v1/tasks/${source.task.id}/messages`, {
+          text: `${name} revision-three explicit message ${String(index).padStart(2, "0")}`,
+          requestId: `${name}-revision-three-message-${index}`,
+          workItems: [{ itemTaskId: source.task.id, itemId: createdID, itemRevision: 3, relationship: "primary" }],
+        });
       await page.evaluate(() => qa.bugs.reload());
       await page.locator(`[data-work-item="${createdID}"]`).filter({ hasText: "In progress" }).waitFor();
       await page.locator(`[data-item-history="${createdID}"]`).click();
@@ -311,8 +377,18 @@ try {
       await page.locator('[data-history-detail]').filter({ hasText: "Created once even when the response disappears." }).waitFor();
       await page.locator('[data-history-revision="2"]').click();
       await page.locator('[data-history-detail]').filter({ hasText: "Changed by another writer." }).waitFor();
+      // A delayed earlier selection cannot overwrite a later revision, and the
+      // later revision must load every linked-message page (more than max 64).
+      await fetch(origin + "/qa/delay-next-history-message", { method: "POST" });
+      await page.locator('[data-history-revision="1"]').click();
+      await page.waitForTimeout(25);
       await page.locator('[data-history-revision="3"]').click();
-      await page.locator('[data-history-detail]').filter({ hasText: `${name} persisted edit` }).waitFor();
+      await page.waitForFunction(() => document.querySelectorAll('.work-item-history-messages button').length === 65);
+      await page.waitForTimeout(450);
+      assert.equal(await page.locator('[data-history-detail]').getAttribute('data-history-detail-revision'), "3");
+      assert.equal(await page.locator('.work-item-history-messages button').count(), 65, "history stopped after its first linked-message page");
+      assert.match(await page.locator('.work-item-history-messages').innerText(), /revision-three explicit message 64/);
+      assert.doesNotMatch(await page.locator('[data-history-detail]').innerText(), /revision-one explicit message/, "delayed older history response replaced the selected revision");
       await page.locator('#dialog-close').click();
       await page.locator('[data-items-project]').waitFor();
       await page.waitForTimeout(150);
@@ -473,7 +549,7 @@ try {
       assert.match(commands.at(-1), new RegExp(legacyHandlerID));
       assert.equal(await page.evaluate(() => qa.data.projectHandlerPlans[0].previous), undefined, "successful handler start did not clear recovered previous settings");
       assert.deepEqual(errors, [], `${name} page errors`);
-      console.log(`${name}: project work-item CRUD, scopes, retries, dispatch, closed state, and handler recovery passed.`);
+      console.log(`${name}: work-item encrypted reload replay, retained/discarded drafts, 65-link pagination, selection-race safety, CRUD, dispatch, and closed reads passed.`);
     } finally {
       await browser.close();
     }
