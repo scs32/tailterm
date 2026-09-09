@@ -43,6 +43,47 @@ const status = (a) => {
     : label;
 };
 export const shouldReleaseRailPointer = shouldReleaseViewPointer;
+const BOARD_BOTTOM_FOLLOW_DISTANCE = 60;
+const captureMessageScroll = (list) => {
+  if (!list) return { followBottom: true, scrollTop: 0 };
+  const scrollTop = Number(list.scrollTop) || 0;
+  const distanceBottom =
+    (Number(list.scrollHeight) || 0) -
+    (Number(list.clientHeight) || 0) -
+    scrollTop;
+  if (distanceBottom < BOARD_BOTTOM_FOLLOW_DISTANCE)
+    return { followBottom: true, scrollTop };
+  const bounds = list.getBoundingClientRect?.();
+  const anchor = bounds
+    ? [...(list.querySelectorAll?.("[data-message]") || [])].find((row) => {
+        const rect = row.getBoundingClientRect();
+        return rect.bottom > bounds.top && rect.top < bounds.bottom;
+      })
+    : null;
+  return {
+    followBottom: false,
+    scrollTop,
+    anchorSeq: anchor?.dataset.message || "",
+    anchorOffset: anchor
+      ? anchor.getBoundingClientRect().top - bounds.top
+      : null,
+  };
+};
+const restoreMessageScroll = (list, saved) => {
+  if (!list) return;
+  if (!saved || saved.followBottom) {
+    list.scrollTop = list.scrollHeight;
+    return;
+  }
+  list.scrollTop = saved.scrollTop;
+  const anchor = [...(list.querySelectorAll?.("[data-message]") || [])].find(
+    (row) => row.dataset.message === saved.anchorSeq,
+  );
+  if (!anchor || saved.anchorOffset === null) return;
+  const bounds = list.getBoundingClientRect();
+  list.scrollTop +=
+    anchor.getBoundingClientRect().top - bounds.top - saved.anchorOffset;
+};
 export function createBoardView({
   client,
   getTabs,
@@ -286,9 +327,11 @@ export function createBoardView({
           document.activeElement.selectionEnd,
         ]
       : null;
-    const old = root.querySelector("#board-messages"),
-      scroll = old?.scrollTop || 0,
-      bottom = !old || old.scrollHeight - old.clientHeight - scroll < 60;
+    const old =
+        renderedTask === selected
+          ? root.querySelector("#board-messages")
+          : null,
+      messageScroll = captureMessageScroll(old);
     const agents = detail?.agents || [],
       names = new Map(agents.map((a) => [a.id, a.name]));
     const name = (m) =>
@@ -604,7 +647,7 @@ export function createBoardView({
       }
     }
     const list = root.querySelector("#board-messages");
-    if (list) list.scrollTop = bottom ? list.scrollHeight : scroll;
+    restoreMessageScroll(list, messageScroll);
     if (focus) {
       const input = root.querySelector("#board-text");
       input?.focus();
