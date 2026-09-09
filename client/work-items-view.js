@@ -281,14 +281,13 @@ export function createWorkItemsView({
           requestId: key,
         });
         if (form.isConnected) {
-          status.textContent = `Sent to the project board · message #${result.dispatch.messageSeq}.`;
-          button.type = "button";
-          button.textContent = "Open board";
-          button.onclick = () => {
-            closeDialog();
-            openBoard(result.dispatch.targetTaskId);
-          };
-          form.onsubmit = (e) => e.preventDefault();
+          const targetName =
+            project(result.dispatch.targetTaskId)?.name ||
+            result.dispatch.targetTaskId;
+          closeDialog();
+          notice(
+            `${singular} sent to ${targetName} · board message #${result.dispatch.messageSeq}.`,
+          );
         }
         await reload();
       } catch (error) {
