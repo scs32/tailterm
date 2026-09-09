@@ -1,0 +1,130 @@
+{
+  "status": "template_pending_release_execution",
+  "workItem": {
+    "id": "wi_fc695f0cbc3f7a42",
+    "ownerMessage": 795,
+    "buildOrder": {
+      "id": "wi_fc695f0cbc3f7a42-build-1",
+      "message": 820
+    },
+    "releaseOrder": {
+      "id": "wi_fc695f0cbc3f7a42-release-1",
+      "message": 883
+    },
+    "handlerRevisionAtDocumentationStart": 9,
+    "handlerConfirmationMessage": 874,
+    "handlerRevisionAtReleaseOrder": 11,
+    "releaseOrderConfirmationMessage": 885
+  },
+  "applicationCandidate": {
+    "commit": "c045440f511d534efdacb2b02d942463191bb715",
+    "base": "4de29d028842a24b391f3e9dc6086e398c10ea7f",
+    "branch": "fix/board-enter-fc695f0c",
+    "files": ["client/board-view.js", "tests/board-compose-browser.mjs"],
+    "outcome": "Bare non-repeated Enter submits the Board message form; Shift+Enter inserts a newline. Composition, repeat, empty, disabled and pending guards prevent unintended or duplicate sends, while failed sends retain draft state and exact retry identity."
+  },
+  "integration": {
+    "applicationCommit": null,
+    "documentationCommit": null,
+    "cleanSource": null,
+    "acceptedByLeadMessage": 879
+  },
+  "acceptance": {
+    "builder": {
+      "focusedBrowser": {
+        "command": "node tests/board-compose-browser.mjs",
+        "result": "pass",
+        "engines": ["Chromium", "WebKit"],
+        "realKeyboard": ["Enter", "Shift+Enter multiline"],
+        "syntheticEventFlags": [
+          "isComposing",
+          "compositionstart/compositionend",
+          "repeat",
+          "disabled"
+        ],
+        "durableHubChecks": "Committed response loss retried with the identical requestId and payload; one message persisted with its recipient and reply target.",
+        "transcript": ".build/board-enter-evidence/board-compose-browser.log",
+        "transcriptSha256": "052650b49fa531f7523c0d4056c00a9644b10afb312340c5320036a0f762f29c"
+      },
+      "unit": {
+        "command": "npm test",
+        "passed": 121,
+        "failed": 0,
+        "transcript": ".build/board-enter-evidence/unit-tests.log",
+        "transcriptSha256": "64b4126ddee923bcee8e5652af05da4060fa1a62c5e48759f91ba2c5d8a3e7d5"
+      },
+      "boardLayout": {
+        "command": "node tests/board-layout-browser.mjs",
+        "result": "pass",
+        "engines": ["Chromium", "WebKit"],
+        "viewports": [1440, 1024, 390],
+        "transcript": ".build/board-enter-evidence/board-layout-browser.log",
+        "transcriptSha256": "44391f93467ead052df872419f59387dc5bcc4c2b2e4699608d0564d57828f79"
+      },
+      "taskForm": {
+        "command": "node tests/task-form-browser.mjs",
+        "result": "nonpass_unrelated_timeout",
+        "detail": "Board coverage ran; the command later timed out at tests/task-form-browser.mjs:485 while waiting for a team-launch retry dialog to close. The unchanged retry reproduced the timeout.",
+        "transcript": ".build/board-enter-evidence/task-form-browser.log",
+        "transcriptSha256": "2cd048390c7590b8fea3b740fbb54c26c6d0bb4dc32371d0d501a5211625ca65"
+      }
+    },
+    "independent": {
+      "agent": "board-enter-qa",
+      "candidate": "c045440f511d534efdacb2b02d942463191bb715",
+      "result": "pass",
+      "message": 876,
+      "acceptedByLeadMessage": 879,
+      "focusedBrowser": "Chromium and WebKit exit 0 in 10.10 seconds",
+      "supplement": "Chromium and WebKit synthetic keyCode 229 no-send plus edited failure retry requestId/payload rotation through the unchanged Send button",
+      "evidence": ".build/board-enter-independent/qa-report.md",
+      "evidenceSha256": "2074f8cde68640f7244c8e89342bb04b85215e5eb9e3b396c836e1cb702affc1"
+    }
+  },
+  "coverageLimitation": {
+    "nativeIme": "Not observed. Composition and isComposing guards were exercised with synthetic DOM events in real Chromium and WebKit; no native OS IME pass is claimed.",
+    "physicalHeldKey": "Not observed. The repeat flag was exercised synthetically in real Chromium and WebKit.",
+    "releaseGateDisposition": "Accepted as an explicit non-native limitation by QA #876, lead #879 and release order #883; no human pass is claimed."
+  },
+  "tailos": {
+    "origin": "https://tailos.tailarr.com",
+    "cloudflareProject": "tailos",
+    "deployment": null,
+    "commit": null,
+    "verifiedAssets": null,
+    "releaseSha256": null,
+    "verifiedAt": null
+  },
+  "miniPreview": {
+    "origin": "http://127.0.0.1:4318",
+    "deployment": null,
+    "commit": null,
+    "verifiedAssets": null,
+    "releaseSha256": null,
+    "verifiedAt": null
+  },
+  "productionSmoke": {
+    "origin": "https://tailos.tailarr.com",
+    "browser": "Chromium",
+    "commit": null,
+    "mainScript": null,
+    "productionWasm": null,
+    "syntheticLocalVaultRestoration": null,
+    "uncaughtErrors": null,
+    "verifiedAt": null
+  },
+  "cleanup": {
+    "builderFixture": "The focused fixture closes browsers, HTTP server and compiled hub in finally and removes its temporary SQLite/state directory.",
+    "independentFixture": null,
+    "remainingOwnedProcesses": null,
+    "temporaryDirectories": null
+  },
+  "rollback": {
+    "commit": "fd8d10273a46877b6bd7a6eb0c1dd9b2bc228bce",
+    "tailosDeployment": "https://14bee768.tailos.pages.dev",
+    "retainedPackage": "/Users/stephenspeicher/projects/tailterm/.build/releases/dropdown-dispatch-fd8d102/dist-static",
+    "releaseSha256": "ec83e3e7faf22b7c15d9c5e499cb0db579537513f4c8669bf39d7e06dc401e2d"
+  },
+  "verificationNotes": [],
+  "scope": "Frontend only. TailOS and Stephens-Mini preview are the intended release targets. No hub, CLI, schema, network/Tailscale, Air preview or tailterm.tailarr.com change is authorized."
+}
