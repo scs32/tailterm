@@ -28,3 +28,16 @@ func TestReadJSON(t *testing.T) {
 		t.Errorf("expected empty map, got %v", m)
 	}
 }
+
+func TestBriefingEnvironmentIsKeptOnlyWhenItIsNotEmbedded(t *testing.T) {
+	briefing := "exact task briefing with 'quotes'"
+	if !forwardSessionEnv("generic-script", "TAILTERM_BRIEFING", briefing) {
+		t.Fatal("generic runtime lost its briefing environment")
+	}
+	if forwardSessionEnv("codex "+ShellQuote(briefing), "TAILTERM_BRIEFING", briefing) {
+		t.Fatal("embedded model briefing was duplicated in the tmux environment")
+	}
+	if !forwardSessionEnv("codex", "TAILTERM_WORK_ITEM", "wi_0123456789abcdef") {
+		t.Fatal("unrelated session environment was suppressed")
+	}
+}

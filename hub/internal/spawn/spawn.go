@@ -111,7 +111,7 @@ func Create(o Options) error {
 		// The full briefing is already present in the private one-shot command
 		// file below. Repeating it as a tmux -e argument can exceed tmux's
 		// command limit and is unnecessary after the model process starts.
-		if k == "TAILTERM_BRIEFING" {
+		if !forwardSessionEnv(o.Command, k, val) {
 			continue
 		}
 		args = append(args, "-e", k+"="+val)
@@ -147,6 +147,10 @@ func Create(o Options) error {
 	removeLaunch = false
 
 	return nil
+}
+
+func forwardSessionEnv(command, key, value string) bool {
+	return key != "TAILTERM_BRIEFING" || value == "" || !strings.Contains(command, ShellQuote(value))
 }
 
 // Kill terminates a session.
