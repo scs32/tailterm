@@ -4,7 +4,9 @@ Feature `wi_65e8fd62e46a4eb8`, owner dispatch #494. Discovery order
 `wi_65e8fd62e46a4eb8-plan-1` (#497), baseline `4e49888762ede18b46ae065dbbf5a0239101a318`
 on `tasks-hub`, Stephens-Mini, `/Users/stephenspeicher/projects/tailterm`.
 Implementation order `wi_65e8fd62e46a4eb8-build-1` (#500). This document defines
-the implemented contract; release requires a separate recorded order.
+the implemented contract. Release order `wi_65e8fd62e46a4eb8-release-1` (#619)
+is active; [the release receipt](releases/tailos-2026-09-09-decisions.json) records
+verified targets and the remaining Air rollout dependency.
 
 ## User flow
 
@@ -86,7 +88,9 @@ user changes the payload after a failed attempt, use a new key and let the serve
 report whether an earlier answer already won. Show a concurrent winner after 409.
 Decision-panel scroll and expanded answer history persist through redraws and
 project navigation. History messages export all immutable request and answer
-metadata.
+metadata. Unsubmitted drafts persist within the current Board instance across
+redraws and mode/project navigation; they are not restored after a full browser
+restart. Stored answers and history are durable on the hub.
 
 ## Ownership and acceptance
 

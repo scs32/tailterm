@@ -1,6 +1,61 @@
-# Development handoff — September 8, 2026
+# Development handoff — September 9, 2026
 
-## September 8 message audit foundation — current hub
+## September 9 Board decisions — Air rollout pending
+
+Application `39896c9c3a1779bdd1b6eb77ad2edab6d447cacc` is deployed to
+`https://tailos.tailarr.com` (`https://23a174e0.tailos.pages.dev`) and Mini
+`http://127.0.0.1:4318`. Both origins match all 81 served asset hashes and manifest
+SHA-256 `65cafae10ccfc33ff9133caeb960ce3023780da56da78b59112eb7e22739856d`.
+Production Chromium started the real WASM and restored an isolated synthetic
+local vault key without browser errors.
+
+Workers can use `tt ask` to present explained choices and a recommendation.
+The owner explicitly submits a choice or custom answer on Board; the immutable
+human reply resolves the request. Pending decisions remain discoverable beyond
+the latest 200 messages. Retry receipts prevent duplicate answers. See
+[the contract](board-decisions.md) for failures, history and draft lifetime.
+
+The hub is RUNNING through existing TrueNAS middleware/TCP at
+`/mnt/deepfreeze/tailterm-hub/releases/20260909-board-decisions-39896c9c3a17/tailterm-hub`,
+SHA-256 `b74f66108ece08708b0fa2b9275828143bf29133cce4917fdecc2e315a80c183`.
+Decision tables, SQLite integrity/FK checks and authenticated read-only readiness
+passed. Consistent mode-0600 backup:
+`/mnt/deepfreeze/tailterm-hub/backups/before-board-decisions-20260909T145726Z.sqlite`.
+The prior A1 hub binary remains available for rollback with additive tables intact;
+isolated rollback/re-upgrade preserved existing receipts and decision metadata.
+
+Mini's installed CLI hash is
+`c926e400c25490c9c67ea6cbd24871139b683b0e06b319e42d5edbfbdefe93cf`;
+`tt ask --help` and its generated decision briefing pass. Its previous binary is
+`~/.local/bin/tt-before-decisions-39896c9c3a17`. Existing relays were not restarted.
+
+**Feature `wi_65e8fd62e46a4eb8` remains in progress.** Build order #500 is accepted;
+release order `wi_65e8fd62e46a4eb8-release-1` (#619) still requires **both Air CLI
+and Air localhost4318 updates**. Two bounded SSH checks to `theAir`
+(`100.96.77.33:22`) timed out before any remote writes. Its last verified frontend
+and CLI remain the September 8 audit release below; this is historical inventory,
+not a fresh verification. Do not mark the feature Done until Air is updated and
+the handler verifies the saved completion.
+
+Exact clean source, packaged static assets and both candidate binaries are retained
+at `.build/releases/board-decisions-39896c9c3a17` on Mini. When Air connectivity
+returns, run `python3 scripts/deploy-remote-static.py theAir` **from that retained
+worktree**, atomically install its `.build/ttbin/tt-darwin-arm64` with a backup of
+Air's current CLI, and verify served assets plus installed help/briefing. Later
+documentation commits deliberately differ from the deployed application commit.
+The previous TailOS deployment `https://f696ab58.tailos.pages.dev` and its source
+commit remain the frontend rollback references.
+
+[Release receipt](releases/tailos-2026-09-09-decisions.json) distinguishes successful
+targets from the Air blocker. Independent QA passed 32/32 real-hub/CLI scenarios
+in Chromium/WebKit, including lost-response recovery, concurrent answers, pointer
+refresh and project navigation, mobile controls and closed history. Final JS
+tests passed 113/113; Go suite/vet/race and existing project browser compatibility
+passed. Lead accepted all worker results and retired ordinary workers after their
+dependencies cleared; lead and db-handler remain available. No live task/profile
+test records, Tailscale changes or task closures were used.
+
+## September 8 message audit foundation — previous hub
 
 Hub source `e95f65044c6dd554f1530a0dccf9d9a209cafd61` is deployed through TrueNAS
 middleware at the existing TCP listener. Its binary is
@@ -39,7 +94,7 @@ independent seven-scenario HTTP acceptance with fourteen invalid-reference cases
 both workers and retired them after all review dependencies cleared. The database
 handler remains available, and lead owns subsequent scope and release coordination.
 
-## September 8 audit workflow release — current deployment
+## September 8 audit workflow release — previous deployment
 
 Application/source commit `955bf43358c0d600028295f5466275cbae9e4714` is deployed to
 `https://tailos.tailarr.com` (`https://f696ab58.tailos.pages.dev`) and **both Mini
