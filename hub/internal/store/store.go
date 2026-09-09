@@ -715,7 +715,7 @@ func (s *Store) PostMessage(ctx context.Context, taskID string, req api.PostMess
 			return api.Message{}, api.ErrInvalid
 		}
 	}
-	m, err := s.insertMessage(ctx, tx, t, req, target, by, false)
+	m, err := s.insertMessage(ctx, tx, t, req, target, by, false, false)
 	if err != nil {
 		return m, err
 	}
@@ -731,9 +731,9 @@ func (s *Store) PostMessage(ctx context.Context, taskID string, req api.PostMess
 	return m, nil
 }
 
-func (s *Store) insertMessage(ctx context.Context, tx *sql.Tx, task api.Task, req api.PostMessageRequest, target api.Agent, by api.Caller, allowCrossProject bool) (api.Message, error) {
+func (s *Store) insertMessage(ctx context.Context, tx *sql.Tx, task api.Task, req api.PostMessageRequest, target api.Agent, by api.Caller, allowCrossProject, allowHistoricalRevision bool) (api.Message, error) {
 	taskID := task.ID
-	if err := validateMessageContext(tx, ctx, taskID, req, allowCrossProject); err != nil {
+	if err := validateMessageContext(tx, ctx, taskID, req, allowCrossProject, allowHistoricalRevision); err != nil {
 		return api.Message{}, err
 	}
 	m := api.Message{Broadcast: task.Swarm, ReplyTo: req.ReplyTo, TaskID: taskID, From: api.Sender{AgentID: req.AgentID, Node: by.Node, User: by.User}, To: req.To, Text: req.Text, CreatedAt: s.now()}

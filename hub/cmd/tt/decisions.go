@@ -106,6 +106,29 @@ func cmdAsk(e env, args []string) error {
 	}
 	ctx, cancel := ctxTimeout(10 * time.Second)
 	defer cancel()
+	if os.Getenv("TAILTERM_WORK_ITEM") != "" {
+		self, selfErr := c.GetAgent(ctx, *task, e.agent)
+		if selfErr != nil {
+			return selfErr
+		}
+		if binding := self.WorkItem; binding != nil {
+			inheritedItem := api.MessageWorkItem{
+				ItemTaskID: binding.ItemTaskID, ItemID: binding.ItemID,
+				ItemRevision: binding.ItemRevision, Relationship: "primary",
+			}
+			if len(input.WorkItems) == 0 {
+				input.WorkItems = []api.MessageWorkItem{inheritedItem}
+			} else if input.WorkItems[0] != inheritedItem {
+				return errors.New("decision context must match this session's bound work item")
+			}
+			if input.WorkOrderMessage == nil {
+				order := binding.WorkOrderMessage
+				input.WorkOrderMessage = &order
+			} else if *input.WorkOrderMessage != binding.WorkOrderMessage {
+				return errors.New("decision order must match this session's recorded work order")
+			}
+		}
+	}
 	message, err := c.CreateDecision(ctx, *task, api.CreateDecisionRequest{
 		DecisionRequest: input.DecisionRequest, AgentID: e.agent, RequestID: *key,
 		WorkItems: input.WorkItems, WorkOrderMessage: input.WorkOrderMessage,

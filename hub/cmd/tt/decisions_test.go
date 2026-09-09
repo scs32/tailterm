@@ -142,6 +142,47 @@ func TestAskPreservesIdentityContextAndReplayPayload(t *testing.T) {
 	}
 }
 
+func TestBoundAskInheritsExactSessionItemContext(t *testing.T) {
+	binding := &api.AgentWorkItemBinding{
+		ItemTaskID: "tsk_0000000000000001", ItemID: "wi_0000000000000002", ItemRevision: 4,
+		WorkOrderMessage: api.MessageReference{TaskID: "tsk_0000000000000001", Seq: 814},
+	}
+	var posted api.CreateDecisionRequest
+	posts := 0
+	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == "GET" && strings.HasSuffix(r.URL.Path, "/agents/agt_0000000000000001"):
+			_ = json.NewEncoder(w).Encode(api.Agent{ID: "agt_0000000000000001", WorkItem: binding})
+		case r.Method == "POST" && strings.HasSuffix(r.URL.Path, "/decisions"):
+			posts++
+			if err := json.NewDecoder(r.Body).Decode(&posted); err != nil {
+				t.Error(err)
+			}
+			w.WriteHeader(http.StatusCreated)
+			_ = json.NewEncoder(w).Encode(api.Message{Seq: 9})
+		default:
+			http.Error(w, "unexpected route", http.StatusInternalServerError)
+		}
+	}))
+	defer s.Close()
+	t.Setenv("TAILTERM_WORK_ITEM", binding.ItemID)
+	e := env{hub: s.URL, task: binding.ItemTaskID, agent: "agt_0000000000000001", runID: "run_0000000000000003"}
+	if err := cmdAsk(e, []string{"--request-id", "bound-decision", "--file", askFixtureFile(t, askFixture())}); err != nil {
+		t.Fatal(err)
+	}
+	wantItem := api.MessageWorkItem{ItemTaskID: binding.ItemTaskID, ItemID: binding.ItemID, ItemRevision: binding.ItemRevision, Relationship: "primary"}
+	if len(posted.WorkItems) != 1 || posted.WorkItems[0] != wantItem || posted.WorkOrderMessage == nil || *posted.WorkOrderMessage != binding.WorkOrderMessage {
+		t.Fatalf("bound decision lost inherited context: %+v", posted)
+	}
+	mismatched := askFixture()
+	mismatched.WorkItems = []api.MessageWorkItem{{ItemTaskID: binding.ItemTaskID, ItemID: "wi_0000000000000003", ItemRevision: binding.ItemRevision, Relationship: "primary"}}
+	mismatched.WorkOrderMessage = &binding.WorkOrderMessage
+	if err := cmdAsk(e, []string{"--request-id", "wrong-bound-decision", "--file", askFixtureFile(t, mismatched)}); err == nil || posts != 1 {
+		t.Fatalf("bound decision accepted a different item or posted it: posts=%d err=%v", posts, err)
+	}
+}
+
 func TestAskAmbiguousFailureRetainsRecoveryKey(t *testing.T) {
 	var calls atomic.Int32
 	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

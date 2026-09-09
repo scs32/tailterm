@@ -85,7 +85,7 @@ export async function prepareWorkItemContext(
     new TextEncoder().encode(JSON.stringify(bundle)).length > MAX_CONTEXT_BYTES
   )
     throw new Error(
-      "This item’s complete context is too large for one model launch. Ask the database handler to consolidate it into a new revision.",
+      "This item’s complete immutable history exceeds the 128 KiB session-context limit. Starting this team is currently unsupported; no context was truncated.",
     );
   return bundle;
 }

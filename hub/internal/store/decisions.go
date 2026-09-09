@@ -153,7 +153,7 @@ func (s *Store) CreateDecision(ctx context.Context, taskID string, req api.Creat
 	if author.Status == api.AgentClosed || author.Status == api.AgentExited {
 		return api.Message{}, api.ErrConflict
 	}
-	message, err := s.insertMessage(ctx, tx, task, messageReq, api.Agent{}, by, false)
+	message, err := s.insertMessage(ctx, tx, task, messageReq, api.Agent{}, by, false, false)
 	if err != nil {
 		return message, err
 	}
@@ -231,9 +231,14 @@ func (s *Store) AnswerDecision(ctx context.Context, taskID string, requestSeq in
 	}
 	messageReq := api.PostMessageRequest{
 		RequestID: req.RequestID, ReplyTo: requestSeq, To: target.ID,
-		Text: api.FormatDecisionAnswer(requestSeq, req, request),
+		Text:             api.FormatDecisionAnswer(requestSeq, req, request),
+		WorkItems:        requestMessage.WorkItems,
+		WorkOrderMessage: requestMessage.WorkOrderMessage,
 	}
-	message, err := s.insertMessage(ctx, tx, task, messageReq, target, by, false)
+	// This typed answer copies the immutable request's exact item coordinates.
+	// The item may have advanced since the owner was asked, so the preserved
+	// considered revision is valid even when it is no longer current.
+	message, err := s.insertMessage(ctx, tx, task, messageReq, target, by, false, true)
 	if err != nil {
 		return message, err
 	}

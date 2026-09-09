@@ -11,9 +11,8 @@ import (
 	"github.com/scs32/tailterm/hub/internal/api"
 )
 
-// Keep the complete prepared bundle and generated launch prompt below common
-// exec argument limits. Nothing is truncated: the authorized preparer must
-// consolidate an oversized item's durable context and create a new revision.
+// Keep the complete prepared bundle and generated launch prompt bounded.
+// Nothing is truncated; launching oversized immutable histories is unsupported.
 const maxAgentWorkItemContextBytes = 128 * 1024
 
 // preparedContextEnvelope is the narrow integration boundary for the accepted

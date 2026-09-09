@@ -28,8 +28,9 @@ history routes from `docs/work-item-revision-history-plan.md`: exact revision,
 all revision pages, all gap pages and all explicit source/A1 message-link pages.
 The bundle retains their source coordinates, provenance, coverage and gaps. It
 does not create another revision/snapshot authority and does not include ordinary
-Board history. The stored bundle is capped at 128 KiB and is never truncated; an
-oversized bundle fails with instructions to consolidate the durable item record.
+Board history. The stored bundle is capped at 128 KiB and is never truncated.
+Launching a team whose complete immutable history exceeds that limit is currently
+unsupported; creating another revision does not reduce the history collected.
 
 `GET /v1/tasks/{task}/agents/{agent}/work-context?runId={exact-run}` returns only
 the immutable stored bundle and binding. A stale run conflicts. `tt context`
@@ -43,6 +44,12 @@ recorded order and a content-derived retry identity. Database-handler messages
 may supply the same explicit flags. This makes new requirements, decisions,
 artifacts, results and evidence eligible for later history bundles without
 classifying unlinked conversation.
+
+Bound-agent `tt ask` requests inherit the same item and recorded order when the
+decision file omits them. The human answer copies that stored typed metadata, so
+it reaches the bound inbox and later replacement bundles even if the item has
+advanced while awaiting consent. Receipt replay still returns the original
+immutable request or answer without inferring context from prose or reply chains.
 
 ## Replacements and lifecycle
 
@@ -58,10 +65,13 @@ Parentless browser/team admission remains a normal base-team addition and does
 not consume `maxNewAgents`. A nonempty parent remains a helper and all existing
 spawn-enable, lifetime helper allowance and active-agent checks still apply.
 Partial team retries reuse the in-memory prepared bundle and deterministic
-item-suffixed names only for members that have not launched. Registration or
-context failure leaves no partial binding; a host-process failure closes only the
-new failed agent record under the existing cleanup behavior. Task-owned groups,
-retirement versus closure and run-scoped cleanup receipts are unchanged.
+item-suffixed names only for members that have not launched. After a partial
+success, the selected item and work order stay frozen; folder controls reopen
+only for remaining members, and only their planned folder is refreshed.
+Registration or context failure leaves no partial binding; a host-process failure
+closes only the new failed agent record under the existing cleanup behavior.
+Task-owned groups, retirement versus closure and run-scoped cleanup receipts are
+unchanged.
 
 ## Compatibility and release boundary
 

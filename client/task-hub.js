@@ -565,7 +565,17 @@ export function createTaskHub(host) {
         );
       });
     }
-    return { read, render };
+    function setEditable(serverIDs = null) {
+      const editable = serverIDs && new Set(serverIDs);
+      container.querySelectorAll(".project-folder").forEach((root) => {
+        const input = root.querySelector("[data-project-server]");
+        const enabled = !editable || editable.has(input?.dataset.projectServer);
+        root
+          .querySelectorAll("input, button")
+          .forEach((control) => (control.disabled = !enabled));
+      });
+    }
+    return { read, render, setEditable };
   }
 
   function agentFields(server) {
@@ -1218,7 +1228,8 @@ export function createTaskHub(host) {
   async function addTeam(team) {
     if (!requireHub()) return;
     try {
-      let plan = null;
+      let plan = null,
+        routing = null;
       const mainServer = host.currentServer() || host.getServers()[0];
       const tasks = (await loadTasks()).filter((t) => t.status === "open");
       host.dialog(
@@ -1277,8 +1288,28 @@ export function createTaskHub(host) {
         if (button.disabled) return;
         button.disabled = true;
         selector.disabled = true;
+        itemSelector.disabled = true;
+        form.querySelector("#team-work-order").disabled = true;
         const id = selector.value;
         try {
+          if (plan && progress.size) {
+            const refreshed = teamLaunches(
+              team,
+              host.getServers(),
+              form.querySelector("#team-main-server")?.value || mainServer?.id,
+              projects.read(),
+              routing,
+            );
+            const remaining = new Map(
+              refreshed.map((entry) => [entry.fields.name, entry]),
+            );
+            plan = plan.map((entry) =>
+              progress.has(entry.fields.name)
+                ? entry
+                : remaining.get(entry.fields.name),
+            );
+            projects.setEditable([]);
+          }
           if (!plan) {
             const item = items.find(
               (candidate) => candidate.id === itemSelector.value,
@@ -1294,7 +1325,7 @@ export function createTaskHub(host) {
               throw new Error(
                 "Choose an active bug or feature and enter its recorded work-order Board message number.",
               );
-            const routing = {
+            routing = {
               workItemTaskId: item.taskId,
               workItemId: item.id,
               workItemRevision: item.revision,
@@ -1324,6 +1355,7 @@ export function createTaskHub(host) {
                 "#team-project-folders input, #team-project-folders button",
               )
               .forEach((el) => (el.disabled = true));
+            projects.setEditable([]);
             const existingTask = await client.getTask(id);
             const policy = {};
             if (team.swarm) policy.swarm = true;
@@ -1347,17 +1379,22 @@ export function createTaskHub(host) {
           button.textContent = "Retry remaining agents";
           if (progress.size)
             status.textContent +=
-              " Already started agents and the prepared item context stay fixed; retry starts only the remaining agents.";
+              " Already started agents and the prepared item context stay fixed; correct folders only for the remaining agents.";
+          if (progress.size)
+            projects.setEditable(
+              plan
+                .filter((entry) => !progress.has(entry.fields.name))
+                .map((entry) => entry.server.id),
+            );
           if (!progress.size) {
             selector.disabled = false;
+            itemSelector.disabled = !items.length;
+            form.querySelector("#team-work-order").disabled = false;
             plan = null;
+            routing = null;
             const mainChoice = form.querySelector("#team-main-server");
             if (mainChoice) mainChoice.disabled = false;
-            form
-              .querySelectorAll(
-                "#team-project-folders input, #team-project-folders button",
-              )
-              .forEach((el) => (el.disabled = false));
+            projects.setEditable();
           }
         } finally {
           button.disabled = false;

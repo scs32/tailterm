@@ -468,6 +468,7 @@ try {
       await page.locator("#team-add-member").click();
       await page.locator("[data-field=name]").fill("team-reviewer");
       await page.locator("[data-field=role]").fill("Reviewer");
+      await page.locator('[data-field="serverId"]').selectOption("secondary");
       await page
         .locator("#team-member-editor > details:not(.agent-controls) > summary")
         .click();
@@ -667,19 +668,39 @@ try {
       await page.locator("#team-work-order").fill(String(routedOrder.seq));
       await page.locator("#team-main-server").selectOption("local");
       await page.locator('[data-project-server="local"]').fill(root);
+      const badRoutedFolder = "/missing-tailterm-item-routing-folder";
+      const correctedRoutedFolder = path.join(root, "hub");
+      await page
+        .locator('[data-project-server="secondary"]')
+        .fill(badRoutedFolder);
       const routedLaunchStart = execs;
       const historyBefore = await (
         await fetch(origin + "/qa/history-requests")
       ).json();
-      failAt = execs + 2;
       await page.locator('#team-launch-form button[type="submit"]').click();
       await page
         .locator("#team-launch-status")
-        .filter({ hasText: "Test launch failure" })
+        .filter({ hasText: "is not a directory" })
         .waitFor();
+      assert.equal(await page.locator("#team-task").isDisabled(), true);
+      assert.equal(await page.locator("#team-work-item").isDisabled(), true);
+      assert.equal(await page.locator("#team-work-order").isDisabled(), true);
+      assert.equal(
+        await page.locator('[data-project-server="local"]').isDisabled(),
+        true,
+        "completed member's folder remained editable",
+      );
+      assert.equal(
+        await page.locator('[data-project-server="secondary"]').isDisabled(),
+        false,
+        "failed member's folder could not be corrected",
+      );
       const historyAfterFailure = await (
         await fetch(origin + "/qa/history-requests")
       ).json();
+      await page
+        .locator('[data-project-server="secondary"]')
+        .fill(correctedRoutedFolder);
       await page.locator('#team-launch-form button[type="submit"]').click();
       await page.locator("#dialog").waitFor({ state: "hidden" });
       const historyAfterRetry = await (
@@ -700,9 +721,11 @@ try {
         "item-scoped retry starts only the failed team member",
       );
       assert.equal(
+        launchCommands
+          .at(-2)
+          .replaceAll(badRoutedFolder, correctedRoutedFolder),
         launchCommands.at(-1),
-        launchCommands.at(-2),
-        "item-scoped retry reuses the exact prepared launch bundle",
+        "item-scoped retry changed fields other than the failed member's folder",
       );
       const attached = await (
         await fetch("http://127.0.0.1:" + port + "/v1/tasks/" + target.id)
@@ -716,6 +739,10 @@ try {
         (agent) => agent.workItem?.itemId === routedItem.id,
       );
       assert.equal(routedAgents.length, 2);
+      assert.deepEqual(
+        routedAgents.map((agent) => agent.cwd).sort(),
+        [root, correctedRoutedFolder].sort(),
+      );
       assert.ok(
         routedAgents.every(
           (agent) =>

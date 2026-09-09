@@ -51,6 +51,31 @@ func syntheticHistory(item api.WorkItem, messages ...api.Message) map[string]any
 	}
 }
 
+func preparedContextFromAcceptedHistory(t *testing.T, s *Store, item api.WorkItem, order api.MessageReference) json.RawMessage {
+	t.Helper()
+	ctx := context.Background()
+	exact, err := s.GetWorkItemRevision(ctx, item.TaskID, item.ID, item.Revision)
+	if err != nil {
+		t.Fatal(err)
+	}
+	revisions, err := s.ListWorkItemRevisions(ctx, item.TaskID, item.ID, 0, 64)
+	if err != nil || revisions.NextAfter != 0 {
+		t.Fatalf("fixture revisions: %+v %v", revisions, err)
+	}
+	gaps, err := s.ListWorkItemHistoryGaps(ctx, item.TaskID, item.ID, 0, 64)
+	if err != nil || gaps.NextAfter != 0 {
+		t.Fatalf("fixture gaps: %+v %v", gaps, err)
+	}
+	messages, err := s.ListWorkItemMessages(ctx, item.TaskID, item.ID, 0, 0, 64)
+	if err != nil || messages.NextAfter != 0 {
+		t.Fatalf("fixture messages: %+v %v", messages, err)
+	}
+	return syntheticPreparedContext(t, item, order, map[string]any{
+		"revision": exact, "revisions": revisions.Revisions, "gaps": gaps.Gaps,
+		"messages": messages.Links, "coverage": messages.Coverage,
+	})
+}
+
 func contextLinkedMessage(t *testing.T, s *Store, task api.Task, item api.WorkItem, text, key string, order *api.MessageReference) api.Message {
 	t.Helper()
 	message, err := s.PostMessage(context.Background(), task.ID, api.PostMessageRequest{
@@ -102,7 +127,7 @@ func TestAgentWorkItemContextAdmissionRestorationAndReplacement(t *testing.T) {
 	}
 	order := contextLinkedMessage(t, s, task, item, "Bounded saved work order", "context-order", nil)
 	orderRef := &api.MessageReference{TaskID: task.ID, Seq: order.Seq}
-	evidence := contextLinkedMessage(t, s, task, item, "Verification artifact", "context-evidence", orderRef)
+	contextLinkedMessage(t, s, task, item, "Verification artifact", "context-evidence", orderRef)
 	leak, err := s.PostMessage(ctx, task.ID, api.PostMessageRequest{Text: "UNRELATED LATE CONVERSATION"}, by)
 	if err != nil {
 		t.Fatal(err)
@@ -110,7 +135,7 @@ func TestAgentWorkItemContextAdmissionRestorationAndReplacement(t *testing.T) {
 	binding := &api.AgentWorkItemRequest{
 		ItemTaskID: task.ID, ItemID: item.ID, ItemRevision: item.Revision,
 		WorkOrderMessage: *orderRef,
-		ContextBundle:    syntheticPreparedContext(t, item, *orderRef, syntheticHistory(item, source, order, evidence)),
+		ContextBundle:    preparedContextFromAcceptedHistory(t, s, item, *orderRef),
 	}
 	worker, err := s.AddAgent(ctx, task.ID, api.AddAgentRequest{
 		Name: "worker-context", Host: "fixture", Session: "worker-context", Runtime: "codex", WorkItem: binding,
@@ -151,6 +176,50 @@ func TestAgentWorkItemContextAdmissionRestorationAndReplacement(t *testing.T) {
 	if err != nil || workerNow.Unread != 1 {
 		t.Fatalf("bound unread count included unrelated traffic: %+v %v", workerNow, err)
 	}
+	if err = s.MarkRead(ctx, task.ID, api.MarkReadRequest{AgentID: worker.ID, UpTo: relevant.Seq}); err != nil {
+		t.Fatal(err)
+	}
+	decisionRequest := api.CreateDecisionRequest{
+		DecisionRequest: api.DecisionRequest{
+			Question: "Use the bounded synthetic approach?",
+			Options: []api.DecisionOption{
+				{ID: "yes", Label: "Proceed", Description: "Keep the exact item scope."},
+				{ID: "no", Label: "Stop", Description: "Do not make the change."},
+			},
+			RecommendedOptionID: "yes", RecommendationReason: "It preserves the recorded contract.",
+		},
+		AgentID: worker.ID, RequestID: "context-decision",
+		WorkItems:        []api.MessageWorkItem{{ItemTaskID: item.TaskID, ItemID: item.ID, ItemRevision: item.Revision, Relationship: "primary"}},
+		WorkOrderMessage: orderRef,
+	}
+	decision, err := s.CreateDecision(ctx, task.ID, decisionRequest, by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = s.MarkRead(ctx, task.ID, api.MarkReadRequest{AgentID: worker.ID, UpTo: decision.Seq}); err != nil {
+		t.Fatal(err)
+	}
+	answerRequest := api.AnswerDecisionRequest{RequestID: "context-answer", OptionID: "yes", Text: "Approved for this item."}
+	answer, err := s.AnswerDecision(ctx, task.ID, decision.Seq, answerRequest, api.Caller{Node: "browser", User: "owner"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	replayedAnswer, err := s.AnswerDecision(ctx, task.ID, decision.Seq, answerRequest, api.Caller{Node: "browser", User: "owner"})
+	if err != nil || replayedAnswer.Seq != answer.Seq || answer.PostReceipt == nil || replayedAnswer.PostReceipt == nil ||
+		len(answer.WorkItems) != 1 || answer.WorkItems[0].ItemID != item.ID || answer.WorkOrderMessage == nil || *answer.WorkOrderMessage != *orderRef {
+		t.Fatalf("typed answer/replay changed: answer=%+v replay=%+v err=%v", answer, replayedAnswer, err)
+	}
+	if _, err = s.PostMessage(ctx, task.ID, api.PostMessageRequest{Text: "UNRELATED AFTER DECISION", To: worker.ID}, by); err != nil {
+		t.Fatal(err)
+	}
+	decisionInbox, err := s.ListMessages(ctx, task.ID, decision.Seq, worker.ID, 50)
+	if err != nil || len(decisionInbox) != 1 || decisionInbox[0].Seq != answer.Seq || decisionInbox[0].DecisionAnswer == nil {
+		t.Fatalf("bound decision inbox leaked or lost answer: %+v %v", decisionInbox, err)
+	}
+	workerNow, err = s.GetAgent(ctx, worker.ID)
+	if err != nil || workerNow.Unread != 1 {
+		t.Fatalf("bound decision unread lost answer or counted unrelated: %+v %v", workerNow, err)
+	}
 	if _, err = s.PostEvent(ctx, task.ID, api.PostEventRequest{AgentID: worker.ID, RunID: worker.RunID, Kind: api.EventExited}, by); err != nil {
 		t.Fatal(err)
 	}
@@ -159,6 +228,7 @@ func TestAgentWorkItemContextAdmissionRestorationAndReplacement(t *testing.T) {
 	}
 
 	replacementRequest := *binding
+	replacementRequest.ContextBundle = preparedContextFromAcceptedHistory(t, s, item, *orderRef)
 	replacementRequest.ReplacesAgentID = worker.ID
 	failedReplacement, err := s.AddAgent(ctx, task.ID, api.AddAgentRequest{
 		Name: "worker-context-failed", Host: "fixture", Session: "worker-context-failed", Runtime: "codex", WorkItem: &replacementRequest,
@@ -195,7 +265,8 @@ func TestAgentWorkItemContextAdmissionRestorationAndReplacement(t *testing.T) {
 		t.Fatal(err)
 	}
 	restored, err := s.GetAgentWorkItemContext(ctx, task.ID, replacement.ID, replacement.RunID)
-	if err != nil || restored.Binding.ReplacesAgentID != worker.ID || !bytes.Equal(restored.Bundle, binding.ContextBundle) {
+	if err != nil || restored.Binding.ReplacesAgentID != worker.ID || !bytes.Equal(restored.Bundle, replacementRequest.ContextBundle) ||
+		!bytes.Contains(restored.Bundle, []byte(answerRequest.Text)) || bytes.Contains(restored.Bundle, []byte("UNRELATED AFTER DECISION")) {
 		t.Fatalf("restart lost context/history: %+v %v", restored, err)
 	}
 }

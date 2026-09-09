@@ -126,6 +126,6 @@ test("prepared context rejects inferred orders, cursor loops and oversized compl
         },
         source,
       ),
-    /too large/,
+    /exceeds the 128 KiB session-context limit.*currently unsupported.*no context was truncated/,
   );
 });

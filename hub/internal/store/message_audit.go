@@ -109,7 +109,7 @@ func validateMessageRequestShape(req api.PostMessageRequest) error {
 	return nil
 }
 
-func validateMessageContext(q queryRower, ctx context.Context, messageTaskID string, req api.PostMessageRequest, allowCrossProject bool) error {
+func validateMessageContext(q queryRower, ctx context.Context, messageTaskID string, req api.PostMessageRequest, allowCrossProject, allowHistoricalRevision bool) error {
 	if allowCrossProject {
 		if len(req.WorkItems) != 1 {
 			return api.ErrInvalid
@@ -135,7 +135,7 @@ func validateMessageContext(q queryRower, ctx context.Context, messageTaskID str
 		}
 		return err
 	}
-	if item.Revision != link.ItemRevision {
+	if item.Revision != link.ItemRevision && (!allowHistoricalRevision || link.ItemRevision > item.Revision) {
 		return workItemConflict("work item revision changed; refresh it before posting")
 	}
 	if order := req.WorkOrderMessage; order != nil {

@@ -110,7 +110,8 @@ func TestDecisionsRoundTripReplayProjectionAndLifecycle(t *testing.T) {
 		t.Fatal(err)
 	}
 	wantAnswer := api.DecisionAnswer{RequestSeq: created.Seq, OptionID: answerReq.OptionID, Text: answerReq.Text}
-	if answer.DecisionAnswer == nil || *answer.DecisionAnswer != wantAnswer || answer.From.AgentID != "" || answer.To != author.ID || answer.ReplyTo != created.Seq || answer.Text != api.FormatDecisionAnswer(created.Seq, answerReq, req.DecisionRequest) {
+	if answer.DecisionAnswer == nil || *answer.DecisionAnswer != wantAnswer || answer.From.AgentID != "" || answer.To != author.ID || answer.ReplyTo != created.Seq || answer.Text != api.FormatDecisionAnswer(created.Seq, answerReq, req.DecisionRequest) ||
+		!reflect.DeepEqual(answer.WorkItems, created.WorkItems) || !reflect.DeepEqual(answer.WorkOrderMessage, created.WorkOrderMessage) {
 		t.Fatalf("answer changed: %+v", answer)
 	}
 	resumed, err := s.GetAgent(ctx, author.ID)

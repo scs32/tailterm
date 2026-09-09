@@ -679,7 +679,7 @@ func (s *Store) DispatchWorkItem(ctx context.Context, taskID, itemID string, req
 			ItemRevision: item.Revision,
 			Relationship: "primary",
 		}},
-	}, targetAgent, by, true)
+	}, targetAgent, by, true, false)
 	if err != nil {
 		return api.WorkItemDispatchResult{}, err
 	}
