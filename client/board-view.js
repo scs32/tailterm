@@ -77,6 +77,22 @@ export function createBoardView({
   const decisionPresentation = new Map();
   const completeConversations = new Map();
   const drafts = new Map();
+  const beginMessage = (taskId, value) => {
+    const body = {
+      text: value.text.trim(),
+      to: value.to,
+      replyTo: value.replyTo,
+    };
+    const attemptedPayload = JSON.stringify(body);
+    if (
+      !value.requestId ||
+      (value.attemptedPayload && value.attemptedPayload !== attemptedPayload)
+    )
+      value.requestId = crypto.randomUUID();
+    value.attemptedPayload = attemptedPayload;
+    drafts.set(taskId, value);
+    return { requestId: value.requestId, ...body };
+  };
   const presentation = createViewRefreshPresentation({
     render: () => {
       if (visible && !pending) render();
@@ -531,35 +547,62 @@ export function createBoardView({
       };
     }
     const form = root.querySelector("#board-compose");
-    if (form)
+    if (form) {
       form.onsubmit = async (e) => {
         e.preventDefault();
         saveDraft();
         const id = selected,
           body = { ...draft() };
         if (!body.text.trim() || sending.has(id)) return;
+        const message = beginMessage(id, body);
+        const submittedInput = form.querySelector("#board-text");
+        const submittedSelection =
+          document.activeElement === submittedInput
+            ? [submittedInput.selectionStart, submittedInput.selectionEnd]
+            : null;
+        let failed = false;
         sending.add(id);
         const button = form.querySelector("[type=submit]");
         button.disabled = true;
         try {
-          await client().postMessage(id, {
-            text: body.text.trim(),
-            to: body.to,
-            replyTo: body.replyTo,
-          });
+          await client().postMessage(id, message);
           drafts.set(id, { text: "", to: body.to, replyTo: 0 });
           if (visible && id === selected) {
             root.querySelector("#board-text").value = "";
             await reload();
           }
         } catch (error) {
+          failed = true;
           notice("Post failed: " + error.message);
         } finally {
           sending.delete(id);
           if (visible && selected === id) render();
+          if (failed && visible && selected === id && submittedSelection) {
+            const restoredInput = root.querySelector("#board-text");
+            restoredInput?.focus();
+            restoredInput?.setSelectionRange(...submittedSelection);
+          }
           if (button.isConnected) button.disabled = false;
         }
       };
+      const input = form.querySelector?.("#board-text");
+      if (input) {
+        let composing = false;
+        input.addEventListener("compositionstart", () => {
+          composing = true;
+        });
+        input.addEventListener("compositionend", () => {
+          composing = false;
+        });
+        input.onkeydown = (event) => {
+          if (event.key !== "Enter" || event.shiftKey) return;
+          if (event.isComposing || composing || event.keyCode === 229) return;
+          event.preventDefault();
+          if (event.repeat || input.disabled || sending.has(selected)) return;
+          form.requestSubmit();
+        };
+      }
+    }
     const list = root.querySelector("#board-messages");
     if (list) list.scrollTop = bottom ? list.scrollHeight : scroll;
     if (focus) {
