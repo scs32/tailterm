@@ -40,9 +40,12 @@ func validateAgentWorkItemRequest(q queryRower, ctx context.Context, targetTaskI
 	if req == nil {
 		return 0, nil
 	}
+	if len(req.ContextBundle) > maxAgentWorkItemContextBytes {
+		return 0, api.ErrContextLimit
+	}
 	if !api.ValidID(req.ItemTaskID, "tsk") || req.ItemTaskID != targetTaskID || !api.ValidID(req.ItemID, "wi") || req.ItemRevision < 1 ||
 		!api.ValidID(req.WorkOrderMessage.TaskID, "tsk") || req.WorkOrderMessage.Seq < 1 || req.WorkOrderMessage.TaskID != req.ItemTaskID ||
-		(req.ReplacesAgentID != "" && !api.ValidID(req.ReplacesAgentID, "agt")) || len(req.ContextBundle) == 0 || len(req.ContextBundle) > maxAgentWorkItemContextBytes {
+		(req.ReplacesAgentID != "" && !api.ValidID(req.ReplacesAgentID, "agt")) || len(req.ContextBundle) == 0 {
 		return 0, api.ErrInvalid
 	}
 	var envelope preparedContextEnvelope

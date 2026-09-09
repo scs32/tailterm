@@ -229,6 +229,12 @@ func TestAgentWorkItemContextRejectsStaleMismatchedAndHelperAdmission(t *testing
 	}
 	req.ItemRevision = item.Revision
 	req.ContextBundle = syntheticPreparedContext(t, item, req.WorkOrderMessage, syntheticHistory(item, order))
+	completeContext := append([]byte(nil), req.ContextBundle...)
+	req.ContextBundle = make([]byte, maxAgentWorkItemContextBytes+1)
+	if _, err = s.AddAgent(ctx, task.ID, api.AddAgentRequest{Name: "oversized", Host: "fixture", Session: "oversized", Runtime: "codex", WorkItem: req}, by); !errors.Is(err, api.ErrContextLimit) {
+		t.Fatalf("oversized context did not fail explicitly: %v", err)
+	}
+	req.ContextBundle = completeContext
 	if _, err = s.AddAgent(ctx, task.ID, api.AddAgentRequest{Name: "helper", Host: "fixture", Session: "helper", Runtime: "codex", ParentAgentID: parent.ID, WorkItem: req}, by); !errors.Is(err, api.ErrAgentSpawnLimit) {
 		t.Fatalf("item binding bypassed helper limit: %v", err)
 	}
