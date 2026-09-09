@@ -7,6 +7,10 @@ import {
   renderDecisionPanel,
   restoreDecisionPresentation,
 } from "./board-decisions.js";
+import {
+  createViewRefreshPresentation,
+  shouldReleaseViewPointer,
+} from "./view-refresh-presentation.js";
 // The hub owns messages; view changes only affect presentation and drafts.
 const esc = (s) =>
   String(s ?? "").replace(
@@ -38,9 +42,7 @@ const status = (a) => {
     ? label + " · offline"
     : label;
 };
-export const shouldReleaseRailPointer = (activePointer, event) =>
-  activePointer !== null &&
-  (event.type === "blur" || event.pointerId === activePointer);
+export const shouldReleaseRailPointer = shouldReleaseViewPointer;
 export function createBoardView({
   client,
   getTabs,
@@ -67,9 +69,6 @@ export function createBoardView({
     subscription = null,
     pending = false;
   let reloadAgain = false;
-  let railPointer = null,
-    railReleasePending = false,
-    renderHeldForPointer = false;
   const sending = new Set();
   const decisionSending = new Set();
   const decisionErrors = new Map();
@@ -78,6 +77,11 @@ export function createBoardView({
   const decisionPresentation = new Map();
   const completeConversations = new Map();
   const drafts = new Map();
+  const presentation = createViewRefreshPresentation({
+    render: () => {
+      if (visible && !pending) render();
+    },
+  });
   const draft = () => drafts.get(selected) || { text: "", to: "", replyTo: 0 };
   function saveDraft() {
     if (!root?.querySelector("#board-text")) return;
@@ -125,33 +129,12 @@ export function createBoardView({
       if (history) history.open = true;
     }
   }
-  function finishRailPointer(event) {
-    if (!shouldReleaseRailPointer(railPointer, event)) return;
-    railPointer = null;
-    railReleasePending = true;
-    setTimeout(() => {
-      railReleasePending = false;
-      if (!renderHeldForPointer) return;
-      renderHeldForPointer = false;
-      // A navigation request that is still loading owns its eventual render.
-      if (visible && !pending) render();
-    }, 0);
-  }
   function mount(container) {
-    if (root !== container) {
-      root?.removeEventListener?.("pointerdown", holdRailPointer);
-      root = container;
-      root.addEventListener?.("pointerdown", holdRailPointer);
-    }
+    root = container;
+    presentation.mount(container);
   }
-  function holdRailPointer(event) {
-    if (event.button === 0 && event.target.closest?.("[data-board-task]"))
-      railPointer = event.pointerId;
-  }
-  globalThis.addEventListener?.("pointerup", finishRailPointer);
-  globalThis.addEventListener?.("pointercancel", finishRailPointer);
-  globalThis.addEventListener?.("blur", finishRailPointer);
   function hide() {
+    const wasVisible = visible;
     saveDraft();
     saveDecisionDrafts();
     saveDecisionPresentation();
@@ -160,9 +143,7 @@ export function createBoardView({
     subscription?.stop();
     subscription = null;
     pending = false;
-    railPointer = null;
-    railReleasePending = false;
-    renderHeldForPointer = false;
+    presentation.interrupt({ capture: wasVisible });
   }
   async function show(taskId) {
     visible = true;
@@ -177,6 +158,7 @@ export function createBoardView({
     subscription?.stop();
     subscription = null;
     if (!client()) {
+      presentation.interrupt();
       root.innerHTML =
         '<div class="mode-empty"><span class="eyebrow">BOARD</span><h2>Connect a project hub.</h2><button id="board-configure" class="primary">Configure project hub</button></div>';
       root.querySelector("#board-configure").onclick = configure;
@@ -235,6 +217,7 @@ export function createBoardView({
       render();
     } catch (e) {
       if (visible && token === epoch) {
+        presentation.interrupt();
         root.innerHTML = `<div class="mode-empty"><h2>Hub unavailable</h2><p>${esc(e.message)}</p><button id="board-retry">Retry connection</button></div>`;
         root.querySelector("#board-retry").onclick = () => show();
       }
@@ -250,10 +233,7 @@ export function createBoardView({
   }
   function render() {
     if (!visible) return;
-    if (railPointer !== null || railReleasePending) {
-      renderHeldForPointer = true;
-      return;
-    }
+    if (!presentation.beforeRender(selected)) return;
     saveDraft();
     saveDecisionDrafts();
     saveDecisionPresentation();
@@ -320,7 +300,7 @@ export function createBoardView({
       .map(taskButton)
       .join(
         "",
-      )}${closedTasks.length ? `<details class="board-closed" ${archived ? "open" : ""}><summary>Closed projects · ${closedTasks.length}</summary>${closedTasks.map(taskButton).join("")}</details>` : ""}</aside><section class="board-thread">${
+      )}${closedTasks.length ? `<details class="board-closed" data-view-disclosure="closed" ${archived ? "open" : ""}><summary>Closed projects · ${closedTasks.length}</summary>${closedTasks.map(taskButton).join("")}</details>` : ""}</aside><section class="board-thread">${
       detail
         ? `<div class="board-head"><div class="view-heading"><div><span class="eyebrow">BOARD</span><h2>${esc(detail.task.name)}</h2></div><div class="view-actions">${archived ? `<span class="fine">Closed · ${esc(new Date(detail.task.closedAt).toLocaleDateString())}</span><button id="board-download">Download history</button>` : '<button id="board-attach">Terminals</button><button id="board-settings" title="Project settings">Settings</button>'}</div></div><p class="fine">${esc(detail.task.goal)}</p><span class="fine hub-sync-status" role="status">${esc(client()?.cacheStatus?.().label || "")}</span><div class="board-agents-row">${agents
             .filter((a) => archived || a.status !== "closed")
@@ -333,7 +313,7 @@ export function createBoardView({
             )}${archived ? "" : '<button id="board-add-agent">＋ Agent</button>'}</div></div>${renderDecisionPanel({ records: decisions, taskId: selected, archived, name, drafts: decisionDrafts, sending: decisionSending, errors: decisionErrors, revealedAnswers, historyOpen: decisionPresentation.get(selected)?.historyOpen, loadError: decisionLoadError })}<div id="board-messages" class="board-messages">${messages.length === 200 && !completeConversations.has(selected) ? `<p class="fine">Latest 200 messages.${archived ? ' <button id="board-full-history">Show full conversation</button>' : " Full history remains on the hub."}</p>` : ""}${messages.map((m) => `<article class="board-message" data-message="${m.seq}"><div class="board-meta"><strong>${esc(name(m))}</strong><span>${m.to ? "to " + esc(names.get(m.to) || m.to) : "Team announcement"}${m.broadcast ? " · Swarm broadcast" : ""} · ${esc(archived ? new Date(m.createdAt).toLocaleString() : new Date(m.createdAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }))}</span></div>${m.replyTo ? `<div class="reply-context">Reply to #${m.replyTo}: ${esc(messages.find((x) => x.seq === m.replyTo)?.text.slice(0, 100) || "Earlier message")}</div>` : ""}<div class="board-text">${esc(m.text)}</div><div class="message-footer"><span>${receipt(m)}</span>${archived ? "" : `<button data-reply="${m.seq}">Reply</button>`}</div></article>`).join("")}</div>${
             archived
               ? ""
-              : `<form id="board-compose">${d.replyTo ? `<div class="compose-reply">Replying to #${d.replyTo}<button type="button" id="board-cancel-reply">Cancel reply</button></div>` : ""}<label class="compose-recipient">To<select ${sending.has(selected) ? "disabled" : ""} id="board-to" aria-label="Recipient"><option value="">Everyone</option>${agents
+              : `<form id="board-compose">${d.replyTo ? `<div class="compose-reply">Replying to #${d.replyTo}<button type="button" id="board-cancel-reply">Cancel reply</button></div>` : ""}<label class="compose-recipient">To<select ${sending.has(selected) ? "disabled" : ""} id="board-to" data-view-control="recipient" aria-label="Recipient"><option value="">Everyone</option>${agents
                   .filter((a) => a.status !== "closed")
                   .map(
                     (a) =>
@@ -345,6 +325,7 @@ export function createBoardView({
           }`
         : ""
     }</section></div>`;
+    presentation.afterRender(selected);
     root.querySelector("#board-new-task").onclick = () => newTask();
     root.querySelectorAll("[data-board-task]").forEach(
       (b) =>

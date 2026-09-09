@@ -44,6 +44,7 @@ async function transport(url,init){
   state.responses++;
   if(path.pathname==='/v1/tasks')return response({tasks:[project()]});
   if(path.pathname==='/v1/tasks/'+taskId)return response({task:project(),agents:[agent()]});
+  if(path.pathname.endsWith('/decisions'))return response({decisions:[],nextAfter:0});
   if(path.pathname.endsWith('/messages')){
     const after=Number(path.searchParams.get('after')||0);
     return response({messages:Array.from({length:state.version},(_,i)=>message(i+1)).filter(m=>m.seq>after)});

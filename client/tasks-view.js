@@ -1,6 +1,7 @@
 // Projects mode: start and manage tasks. Lists open and closed projects with their
 // agents, and offers attach, board, add agent, and close actions.
 import { taskRollup } from "./tasks.js";
+import { createViewRefreshPresentation } from "./view-refresh-presentation.js";
 
 const esc = (s) =>
   String(s ?? "").replace(
@@ -38,8 +39,14 @@ export function createTasksView({
     selected = "",
     hiddenTaskIds = new Set();
   let clock = null;
+  const presentation = createViewRefreshPresentation({
+    render: () => {
+      if (visible && !loading) render();
+    },
+  });
   function mount(container) {
     root = container;
+    presentation.mount(container);
   }
   async function show() {
     if (!root) return;
@@ -51,6 +58,7 @@ export function createTasksView({
       if (visible && hasData) render();
     }, 30000);
     if (!client()) {
+      presentation.interrupt();
       root.innerHTML = `<div class="mode-empty"><span class="eyebrow">PROJECTS</span><h2>Connect a project hub.</h2><button id="tasks-configure" class="primary">Configure project hub</button></div>`;
       root.querySelector("#tasks-configure").onclick = configure;
       return;
@@ -66,6 +74,7 @@ export function createTasksView({
       );
   }
   function hide() {
+    const wasVisible = visible;
     visible = false;
     hiddenTaskIds = new Set(details.map((d) => d.task.id));
     generation++;
@@ -73,6 +82,7 @@ export function createTasksView({
     clearInterval(clock);
     subscription?.stop();
     subscription = null;
+    presentation.interrupt({ capture: wasVisible });
   }
   async function reload() {
     if (!visible) return;
@@ -94,19 +104,19 @@ export function createTasksView({
       );
       if (!visible || token !== generation) return;
       const added = !hasData
-          ? [...next]
-              .reverse()
-              .find(
-                (d) =>
-                  d.task.status === "open" && !hiddenTaskIds.has(d.task.id),
-              )
-          : null;
+        ? [...next]
+            .reverse()
+            .find(
+              (d) => d.task.status === "open" && !hiddenTaskIds.has(d.task.id),
+            )
+        : null;
       details = next;
       if (added) selected = added.task.id;
       hasData = true;
     } catch (error) {
       if (!visible || token !== generation) return;
       hasData = false;
+      presentation.interrupt();
       root.innerHTML = `<div class="mode-empty"><span class="eyebrow">PROJECTS</span><h2>Hub unavailable.</h2><p class="launcher-intro">${esc(error.message)}</p><button id="tasks-retry">Retry</button></div>`;
       root.querySelector("#tasks-retry").onclick = () => show();
       loading = false;
@@ -161,6 +171,7 @@ export function createTasksView({
     let current = details.find((d) => d.task.id === selected);
     if (!current) current = open[0] || closed[0] || null;
     selected = current?.task.id || "";
+    if (!presentation.beforeRender(selected)) return;
     const projectButton = ({ task, agents }) =>
       `<button type="button" data-board-task="${esc(task.id)}" data-task-select="${esc(task.id)}" aria-pressed="${task.id === selected}" title="${esc(task.name)}"><span class="board-task-name">${esc(task.name)}</span><span class="fine">${esc(taskRollup(agents))}</span></button>`;
     const detail = (entry) => {
@@ -181,7 +192,8 @@ export function createTasksView({
           "",
         )}</div><footer class="task-actions"><span class="fine">${task.allowAgentSpawn ? "Helpers allowed" : "Helpers off"}</span><button data-task-board="${esc(task.id)}">Open board →</button><button data-task-add="${esc(task.id)}">＋ Add agent</button>${!handler || handler.status === "exited" || (!handler.online && !["retired", "closed"].includes(handler.status)) ? `<button data-handler-setup="${esc(task.id)}">${handler ? (handler.status === "exited" ? "Restart" : "Check") : "Set up"} database handler</button>` : ""}${openWorkItems ? `<button data-project-bugs="${esc(task.id)}">Bugs</button><button data-project-features="${esc(task.id)}">Features</button>` : ""}<div class="task-more"><button type="button" data-task-more="${esc(task.id)}" aria-expanded="false" aria-controls="task-menu-${esc(task.id)}">More</button><div id="task-menu-${esc(task.id)}" class="task-menu" popover="auto" aria-label="More project actions"><button data-task-attach="${esc(task.id)}">Open terminals</button><button data-task-settings="${esc(task.id)}">Settings</button><button data-task-close="${esc(task.id)}" class="danger">Close project</button></div></div></footer></article>`;
     };
-    root.innerHTML = `<div class="board mode-board tasks-view"><aside class="board-rail"><div class="board-rail-head"><span class="eyebrow">PROJECTS</span><button id="tasks-new" title="New project" aria-label="New project">＋</button></div>${open.map(projectButton).join("")}${closed.length ? `<details class="board-closed tasks-closed" ${current?.task.status !== "open" ? "open" : ""}><summary>Closed · ${closed.length}</summary>${closed.map(projectButton).join("")}</details>` : ""}</aside><section class="board-thread tasks-detail">${detail(current)}</section></div>`;
+    root.innerHTML = `<div class="board mode-board tasks-view"><aside class="board-rail"><div class="board-rail-head"><span class="eyebrow">PROJECTS</span><button id="tasks-new" title="New project" aria-label="New project">＋</button></div>${open.map(projectButton).join("")}${closed.length ? `<details class="board-closed tasks-closed" data-view-disclosure="closed" ${current?.task.status !== "open" ? "open" : ""}><summary>Closed · ${closed.length}</summary>${closed.map(projectButton).join("")}</details>` : ""}</aside><section class="board-thread tasks-detail">${detail(current)}</section></div>`;
+    presentation.afterRender(selected);
     root.querySelectorAll("[data-task-select]").forEach(
       (button) =>
         (button.onclick = () => {
@@ -191,12 +203,13 @@ export function createTasksView({
     );
     root.querySelectorAll("[data-task-more]").forEach((button) => {
       const menu = root.querySelector(`#task-menu-${button.dataset.taskMore}`);
-      menu.addEventListener("toggle", () =>
+      menu.addEventListener("toggle", () => {
         button.setAttribute(
           "aria-expanded",
           String(menu.matches(":popover-open")),
-        ),
-      );
+        );
+        presentation.settle();
+      });
       button.onclick = () => {
         if (menu.matches(":popover-open")) {
           menu.hidePopover();
