@@ -106,7 +106,7 @@ async function fixture(label) {
   return { source, target, other, missing, exited, legacy, legacyHandlerID };
 }
 
-let dropNextCreate = false;
+let dropNextCreate = false, dropNextUpdate = false;
 const html = `<!doctype html><html><head><meta charset="utf-8"><link rel="stylesheet" href="/client/style.css"><link rel="stylesheet" href="/client/work-items.css"></head><body><div id="app"><div id="workspace"><main><header></header></main></div><dialog id="dialog"></dialog><p id="notice"></p></div><script type="module">
 import {createHubClient} from '/client/hub-client.js';
 import {createWorkItemsView} from '/client/work-items-view.js';
@@ -146,6 +146,11 @@ const web = createServer(async (req, res) => {
       res.end("ok");
       return;
     }
+    if (req.url === "/qa/drop-next-update" && req.method === "POST") {
+      dropNextUpdate = true;
+      res.end("ok");
+      return;
+    }
     if (req.url.startsWith("/v1/")) {
       const chunks = [];
       for await (const chunk of req) chunks.push(chunk);
@@ -161,6 +166,12 @@ const web = createServer(async (req, res) => {
         dropNextCreate = false;
         res.writeHead(503, { "content-type": "application/json" });
         res.end(JSON.stringify({ error: "Synthetic response loss" }));
+        return;
+      }
+      if (dropNextUpdate && req.method === "POST" && /\/work-items\/wi_[a-f0-9]+\/updates$/.test(req.url)) {
+        dropNextUpdate = false;
+        res.writeHead(503, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: "Synthetic update response loss" }));
         return;
       }
       res.writeHead(upstream.status, { "content-type": "application/json" });
@@ -281,6 +292,10 @@ try {
       await page.locator('#work-item-title').fill(`${name} persisted edit`);
       await page.locator('#work-item-status').selectOption("in_progress");
       await page.locator('#work-item-priority').selectOption("high");
+      await fetch(origin + "/qa/drop-next-update", { method: "POST" });
+      await page.locator('#work-item-form button[type=submit]').click();
+      await page.locator('#work-item-error').filter({ hasText: "Synthetic update response loss" }).waitFor();
+      assert.equal(await page.locator('#work-item-title').inputValue(), `${name} persisted edit`, "lost update response discarded the draft");
       await page.locator('#work-item-form button[type=submit]').click();
       await page.locator('#dialog').waitFor({ state: "hidden" });
       const edited = await item(source.task.id, createdID);
@@ -289,6 +304,16 @@ try {
       assert.equal(edited.priority, "high");
       await page.evaluate(() => qa.bugs.reload());
       await page.locator(`[data-work-item="${createdID}"]`).filter({ hasText: "In progress" }).waitFor();
+      await page.locator(`[data-item-history="${createdID}"]`).click();
+      await page.locator('[data-history-revision="3"]').waitFor();
+      assert.equal(await page.locator('[data-history-revision]').count(), 3, "history did not retain all exact revisions");
+      await page.locator('[data-history-revision="1"]').click();
+      await page.locator('[data-history-detail]').filter({ hasText: "Created once even when the response disappears." }).waitFor();
+      await page.locator('[data-history-revision="2"]').click();
+      await page.locator('[data-history-detail]').filter({ hasText: "Changed by another writer." }).waitFor();
+      await page.locator('[data-history-revision="3"]').click();
+      await page.locator('[data-history-detail]').filter({ hasText: `${name} persisted edit` }).waitFor();
+      await page.locator('#dialog-close').click();
       await page.locator('[data-items-project]').waitFor();
       await page.waitForTimeout(150);
       await page.evaluate(() => {
@@ -320,6 +345,15 @@ try {
       await page.reload();
       await page.locator('[data-mode="features"]').click();
       await page.locator(`[data-work-item="${feature.id}"]`).waitFor();
+      await page.locator(`[data-item-edit="${feature.id}"]`).click();
+      await page.locator('#work-item-description').fill(`${name} feature revision two`);
+      await page.locator('#work-item-form button[type=submit]').click();
+      await page.locator('#dialog').waitFor({ state: "hidden" });
+      await page.locator(`[data-item-history="${feature.id}"]`).click();
+      assert.equal(await page.locator('[data-history-revision]').count(), 2, "feature history did not retain both revisions");
+      await page.locator('[data-history-revision="2"]').click();
+      await page.locator('[data-history-detail]').filter({ hasText: `${name} feature revision two` }).waitFor();
+      await page.locator('#dialog-close').click();
       await page.evaluate(() => {
         window.scrollTo(0, 0);
         document.querySelector('#mode-view').scrollTop = 0;
@@ -380,6 +414,10 @@ try {
       await page.locator(`[data-item-edit="${createdID}"]`).click();
       assert.equal(await page.locator('#work-item-title').isDisabled(), true);
       await page.locator('#work-item-error').filter({ hasText: "read-only" }).waitFor();
+      await page.locator('#dialog-close').click();
+      await page.locator(`[data-item-history="${createdID}"]`).click();
+      await page.locator('[data-history-revision="3"]').waitFor();
+      await page.locator('[data-history-detail]').filter({ hasText: `${name} persisted edit` }).waitFor();
 
       // An exited legacy handler without local settings uses that handler's host,
       // runtime, and folder rather than silently falling back to the lead.

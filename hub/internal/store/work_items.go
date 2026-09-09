@@ -261,7 +261,19 @@ func (s *Store) CreateWorkItem(ctx context.Context, taskID string, req api.Creat
 	}
 	item.Seq, _ = result.LastInsertId()
 	fields, _ := json.Marshal(map[string]any{"kind": item.Kind, "title": item.Title, "description": item.Description, "status": item.Status, "priority": item.Priority, "sourceMessageSeq": item.SourceMessageSeq})
-	if _, err = tx.ExecContext(ctx, `INSERT INTO work_item_changes(item_id,revision,kind,fields,agent_id,by_node,by_user,created_at) VALUES(?,1,'created',?,?,?,?,?)`, item.ID, string(fields), req.AgentID, by.Node, by.User, ts(now)); err != nil {
+	changeResult, err := tx.ExecContext(ctx, `INSERT INTO work_item_changes(item_id,revision,kind,fields,agent_id,by_node,by_user,created_at) VALUES(?,1,'created',?,?,?,?,?)`, item.ID, string(fields), req.AgentID, by.Node, by.User, ts(now))
+	if err != nil {
+		return api.WorkItem{}, err
+	}
+	changeSeq, err := changeResult.LastInsertId()
+	if err != nil {
+		return api.WorkItem{}, err
+	}
+	creationFields := []string{"description", "kind", "priority", "sourceMessageSeq", "status", "title"}
+	if err = insertWorkItemRevision(ctx, tx, revisionFromItem(item, "", "created", "native", creationFields), changeSeq); err != nil {
+		return api.WorkItem{}, err
+	}
+	if err = refreshWorkItemHistoryState(ctx, tx, item, ts(now)); err != nil {
 		return api.WorkItem{}, err
 	}
 	if _, err = tx.ExecContext(ctx, `INSERT INTO work_item_requests(task_id,operation,request_id,payload_hash,item_id,created_at) VALUES(?,'create',?,?,?,?)`, taskID, req.RequestID, payload, item.ID, ts(now)); err != nil {
@@ -359,7 +371,18 @@ func (s *Store) UpdateWorkItem(ctx context.Context, taskID, itemID string, req a
 		return api.WorkItem{}, workItemConflict("work item revision changed; refresh it before updating")
 	}
 	fields, _ := json.Marshal(changed)
-	if _, err = tx.ExecContext(ctx, `INSERT INTO work_item_changes(item_id,revision,kind,fields,agent_id,by_node,by_user,created_at) VALUES(?,?,'updated',?,?,?,?,?)`, item.ID, item.Revision, string(fields), req.AgentID, by.Node, by.User, ts(now)); err != nil {
+	changeResult, err := tx.ExecContext(ctx, `INSERT INTO work_item_changes(item_id,revision,kind,fields,agent_id,by_node,by_user,created_at) VALUES(?,?,'updated',?,?,?,?,?)`, item.ID, item.Revision, string(fields), req.AgentID, by.Node, by.User, ts(now))
+	if err != nil {
+		return api.WorkItem{}, err
+	}
+	changeSeq, err := changeResult.LastInsertId()
+	if err != nil {
+		return api.WorkItem{}, err
+	}
+	if err = insertWorkItemRevision(ctx, tx, revisionFromItem(item, "", "updated", "native", changedFields), changeSeq); err != nil {
+		return api.WorkItem{}, err
+	}
+	if err = refreshWorkItemHistoryState(ctx, tx, item, ts(now)); err != nil {
 		return api.WorkItem{}, err
 	}
 	if _, err = s.insertEvent(ctx, tx, taskID, "work_item_updated", req.AgentID, item.Title, map[string]any{"itemId": item.ID, "kind": item.Kind, "revision": item.Revision, "fields": changedFields}, by); err != nil {
@@ -370,6 +393,192 @@ func (s *Store) UpdateWorkItem(ctx context.Context, taskID, itemID string, req a
 	}
 	s.notify(taskID)
 	return item, nil
+}
+
+func validateCreateWorkItemUpdate(taskID, itemID string, req api.CreateWorkItemUpdate) error {
+	if !api.ValidID(taskID, "tsk") || !api.ValidID(itemID, "wi") || req.ExpectedRevision < 1 || !validRequestID(req.RequestID) ||
+		(req.Title == nil && req.Description == nil && req.Status == nil && req.Priority == nil) ||
+		(req.AgentID != "" && !api.ValidID(req.AgentID, "agt")) || (req.RunID != "" && (req.AgentID == "" || !validRunID(req.RunID))) {
+		return api.ErrInvalid
+	}
+	if req.Title != nil && !validWorkItemTitle(*req.Title) {
+		return api.ErrInvalid
+	}
+	if req.Description != nil && !api.ValidText(*req.Description, api.MaxTextLen) {
+		return api.ErrInvalid
+	}
+	if req.Status != nil && !validWorkItemStatus(*req.Status) {
+		return api.ErrInvalid
+	}
+	if req.Priority != nil && !validWorkItemPriority(*req.Priority) {
+		return api.ErrInvalid
+	}
+	return nil
+}
+
+func scanWorkItemUpdateReceipt(row rowScanner) (api.WorkItemUpdateReceipt, string, error) {
+	var receipt api.WorkItemUpdateReceipt
+	var created, payload string
+	err := row.Scan(&receipt.ID, &receipt.RequestID, &receipt.TaskID, &receipt.ItemID, &receipt.ResultRevision, &created, &payload)
+	receipt.CreatedAt = parseTS(created)
+	return receipt, payload, err
+}
+
+func findWorkItemUpdateReceipt(q queryRower, ctx context.Context, taskID, itemID, requestID, agentID string, by api.Caller) (api.WorkItemUpdateReceipt, string, error) {
+	receipt, payload, err := scanWorkItemUpdateReceipt(q.QueryRowContext(ctx, `SELECT receipt_id,request_id,task_id,item_id,result_revision,created_at,payload_hash FROM work_item_update_requests WHERE task_id=? AND item_id=? AND agent_id=? AND by_node=? AND by_user=? AND request_id=?`, taskID, itemID, agentID, by.Node, by.User, requestID))
+	if errors.Is(err, sql.ErrNoRows) {
+		return receipt, payload, api.ErrNotFound
+	}
+	return receipt, payload, err
+}
+
+func findAnyWorkItemUpdateReceipt(q queryRower, ctx context.Context, taskID, requestID, agentID string, by api.Caller) (api.WorkItemUpdateReceipt, string, error) {
+	receipt, payload, err := scanWorkItemUpdateReceipt(q.QueryRowContext(ctx, `SELECT receipt_id,request_id,task_id,item_id,result_revision,created_at,payload_hash FROM work_item_update_requests WHERE task_id=? AND agent_id=? AND by_node=? AND by_user=? AND request_id=?`, taskID, agentID, by.Node, by.User, requestID))
+	if errors.Is(err, sql.ErrNoRows) {
+		return receipt, payload, api.ErrNotFound
+	}
+	return receipt, payload, err
+}
+
+func loadWorkItemUpdateResult(q queryRower, ctx context.Context, receipt api.WorkItemUpdateReceipt) (api.WorkItemUpdateResult, error) {
+	revision, err := scanWorkItemRevision(q.QueryRowContext(ctx, `SELECT `+workItemRevisionCols+` FROM work_item_revisions WHERE item_task_id=? AND item_id=? AND revision=?`, receipt.TaskID, receipt.ItemID, receipt.ResultRevision))
+	return api.WorkItemUpdateResult{Revision: revision, Receipt: receipt}, err
+}
+
+// CreateWorkItemUpdate performs a recoverable CAS update. Receipt lookup occurs
+// before mutable lifecycle checks so an exact retry remains valid after later
+// edits, project closure, agent retirement, or hub restart.
+func (s *Store) CreateWorkItemUpdate(ctx context.Context, taskID, itemID string, req api.CreateWorkItemUpdate, by api.Caller) (api.WorkItemUpdateResult, bool, error) {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	if err := validateCreateWorkItemUpdate(taskID, itemID, req); err != nil {
+		return api.WorkItemUpdateResult{}, false, err
+	}
+	payload := requestHash(struct {
+		ItemID  string                   `json:"itemId"`
+		Request api.CreateWorkItemUpdate `json:"request"`
+	}{itemID, req})
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return api.WorkItemUpdateResult{}, false, err
+	}
+	defer tx.Rollback()
+	receipt, priorHash, receiptErr := findAnyWorkItemUpdateReceipt(tx, ctx, taskID, req.RequestID, req.AgentID, by)
+	if receiptErr == nil {
+		if priorHash != payload {
+			return api.WorkItemUpdateResult{}, false, workItemConflict("request ID was already used with different update data")
+		}
+		result, err := loadWorkItemUpdateResult(tx, ctx, receipt)
+		return result, true, err
+	}
+	if !errors.Is(receiptErr, api.ErrNotFound) {
+		return api.WorkItemUpdateResult{}, false, receiptErr
+	}
+	task, err := scanTask(tx.QueryRowContext(ctx, `SELECT `+taskCols+` FROM tasks WHERE id=?`, taskID))
+	if errors.Is(err, sql.ErrNoRows) {
+		return api.WorkItemUpdateResult{}, false, api.ErrNotFound
+	}
+	if err != nil {
+		return api.WorkItemUpdateResult{}, false, err
+	}
+	if task.Status != api.TaskOpen {
+		return api.WorkItemUpdateResult{}, false, api.ErrClosed
+	}
+	item, err := getWorkItem(tx, ctx, taskID, itemID)
+	if err != nil {
+		return api.WorkItemUpdateResult{}, false, err
+	}
+	if item.Revision != req.ExpectedRevision {
+		return api.WorkItemUpdateResult{}, false, workItemConflict("work item revision changed; refresh it before updating")
+	}
+	if err = validateWorkItemAgent(tx, ctx, taskID, req.AgentID); err != nil {
+		return api.WorkItemUpdateResult{}, false, err
+	}
+	if req.RunID != "" {
+		var currentRun string
+		if err := tx.QueryRowContext(ctx, `SELECT run_id FROM agents WHERE task_id=? AND id=?`, taskID, req.AgentID).Scan(&currentRun); err != nil {
+			return api.WorkItemUpdateResult{}, false, err
+		}
+		if currentRun != req.RunID {
+			return api.WorkItemUpdateResult{}, false, workItemConflict("agent run changed; refresh identity before updating")
+		}
+	}
+	changed := map[string]any{}
+	changedFields := []string{}
+	if req.Title != nil {
+		item.Title = *req.Title
+		changed["title"] = item.Title
+		changedFields = append(changedFields, "title")
+	}
+	if req.Description != nil {
+		item.Description = *req.Description
+		changed["description"] = item.Description
+		changedFields = append(changedFields, "description")
+	}
+	if req.Status != nil {
+		item.Status = *req.Status
+		changed["status"] = item.Status
+		changedFields = append(changedFields, "status")
+	}
+	if req.Priority != nil {
+		item.Priority = *req.Priority
+		changed["priority"] = item.Priority
+		changedFields = append(changedFields, "priority")
+	}
+	now := s.now()
+	item.Revision++
+	item.UpdatedAt = now
+	item.UpdatedBy = api.Sender{AgentID: req.AgentID, Node: by.Node, User: by.User}
+	update, err := tx.ExecContext(ctx, `UPDATE work_items SET title=?,description=?,status=?,priority=?,revision=?,updated_agent=?,updated_node=?,updated_user=?,updated_at=? WHERE task_id=? AND id=? AND revision=?`, item.Title, item.Description, item.Status, item.Priority, item.Revision, item.UpdatedBy.AgentID, item.UpdatedBy.Node, item.UpdatedBy.User, ts(now), taskID, itemID, req.ExpectedRevision)
+	if err != nil {
+		return api.WorkItemUpdateResult{}, false, err
+	}
+	rows, err := update.RowsAffected()
+	if err != nil {
+		return api.WorkItemUpdateResult{}, false, err
+	}
+	if rows != 1 {
+		return api.WorkItemUpdateResult{}, false, workItemConflict("work item revision changed; refresh it before updating")
+	}
+	fields, _ := json.Marshal(changed)
+	change, err := tx.ExecContext(ctx, `INSERT INTO work_item_changes(item_id,revision,kind,fields,agent_id,by_node,by_user,created_at) VALUES(?,?,'updated',?,?,?,?,?)`, item.ID, item.Revision, string(fields), req.AgentID, by.Node, by.User, ts(now))
+	if err != nil {
+		return api.WorkItemUpdateResult{}, false, err
+	}
+	changeSeq, err := change.LastInsertId()
+	if err != nil {
+		return api.WorkItemUpdateResult{}, false, err
+	}
+	revision := revisionFromItem(item, req.RunID, "updated", "native", changedFields)
+	if err = insertWorkItemRevision(ctx, tx, revision, changeSeq); err != nil {
+		return api.WorkItemUpdateResult{}, false, err
+	}
+	receipt = api.WorkItemUpdateReceipt{ID: api.NewID("wir"), RequestID: req.RequestID, TaskID: taskID, ItemID: itemID, ResultRevision: item.Revision, CreatedAt: now}
+	if _, err = tx.ExecContext(ctx, `INSERT INTO work_item_update_requests(receipt_id,task_id,item_id,agent_id,run_id,by_node,by_user,request_id,payload_hash,result_revision,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)`, receipt.ID, taskID, itemID, req.AgentID, req.RunID, by.Node, by.User, req.RequestID, payload, item.Revision, ts(now)); err != nil {
+		return api.WorkItemUpdateResult{}, false, err
+	}
+	if err = refreshWorkItemHistoryState(ctx, tx, item, ts(now)); err != nil {
+		return api.WorkItemUpdateResult{}, false, err
+	}
+	if _, err = s.insertEvent(ctx, tx, taskID, "work_item_updated", req.AgentID, item.Title, map[string]any{"itemId": item.ID, "kind": item.Kind, "revision": item.Revision, "fields": changedFields, "requestId": req.RequestID}, by); err != nil {
+		return api.WorkItemUpdateResult{}, false, err
+	}
+	if err = tx.Commit(); err != nil {
+		return api.WorkItemUpdateResult{}, false, err
+	}
+	s.notify(taskID)
+	return api.WorkItemUpdateResult{Revision: revision, Receipt: receipt}, false, nil
+}
+
+func (s *Store) GetWorkItemUpdateReceipt(ctx context.Context, taskID, itemID, requestID, agentID string, by api.Caller) (api.WorkItemUpdateResult, error) {
+	if !api.ValidID(taskID, "tsk") || !api.ValidID(itemID, "wi") || !validRequestID(requestID) || (agentID != "" && !api.ValidID(agentID, "agt")) {
+		return api.WorkItemUpdateResult{}, api.ErrInvalid
+	}
+	receipt, _, err := findWorkItemUpdateReceipt(s.db, ctx, taskID, itemID, requestID, agentID, by)
+	if err != nil {
+		return api.WorkItemUpdateResult{}, err
+	}
+	return loadWorkItemUpdateResult(s.db, ctx, receipt)
 }
 
 func (s *Store) DispatchWorkItem(ctx context.Context, taskID, itemID string, req api.DispatchWorkItemRequest, by api.Caller) (api.WorkItemDispatchResult, error) {

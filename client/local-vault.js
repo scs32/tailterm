@@ -41,6 +41,27 @@ const empty = () => ({
   tailscale: {},
   hub: { url: "" },
 });
+const MAX_WORK_ITEM_DRAFTS = 24;
+const MAX_WORK_ITEM_DRAFT_BYTES = 24000;
+function normalizeWorkItemDrafts(value) {
+  if (!Array.isArray(value)) return [];
+  return value
+    .filter(
+      (draft) =>
+        draft &&
+        typeof draft.scope === "string" &&
+        /^[a-f0-9]{64}$/.test(draft.scope) &&
+        typeof draft.id === "string" &&
+        draft.id.length <= 256 &&
+        typeof draft.requestId === "string" &&
+        draft.requestId.length <= 128 &&
+        typeof draft.updatedAt === "string" &&
+        JSON.stringify(draft).length <= MAX_WORK_ITEM_DRAFT_BYTES,
+    )
+    .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt))
+    .slice(0, MAX_WORK_ITEM_DRAFTS)
+    .map((draft) => structuredClone(draft));
+}
 async function db() {
   if (database) return database;
   if (!crypto.subtle || !navigator.locks)
@@ -254,6 +275,47 @@ export function hubReadCachePersistence() {
         return true;
       });
     },
+  };
+}
+export function workItemDraftPersistence() {
+  requireUnlocked();
+  const vaultKey = key;
+  const requireSameVault = () => {
+    requireUnlocked();
+    if (key !== vaultKey)
+      throw new Error("Work-item drafts belong to a different vault unlock.");
+  };
+  return {
+    load: async (scope, id) => {
+      await queue;
+      requireSameVault();
+      const draft = (contents.workItemDrafts || []).find(
+        (entry) => entry.scope === scope && entry.id === id,
+      );
+      return draft ? structuredClone(draft) : null;
+    },
+    save: async (draft) => {
+      const copy = normalizeWorkItemDrafts([draft])[0];
+      if (!copy) throw new Error("Invalid work-item draft.");
+      await mutate((d) => {
+        requireSameVault();
+        d.workItemDrafts = normalizeWorkItemDrafts([
+          copy,
+          ...(d.workItemDrafts || []).filter(
+            (entry) => entry.scope !== copy.scope || entry.id !== copy.id,
+          ),
+        ]);
+        return true;
+      });
+    },
+    remove: async (scope, id) =>
+      mutate((d) => {
+        requireSameVault();
+        d.workItemDrafts = (d.workItemDrafts || []).filter(
+          (entry) => entry.scope !== scope || entry.id !== id,
+        );
+        return true;
+      }),
   };
 }
 export async function markBackupExported(started = new Date().toISOString()) {
@@ -654,6 +716,7 @@ function validateData(d) {
     d.projectHandlerPlans,
     d.servers,
   );
+  d.workItemDrafts = normalizeWorkItemDrafts(d.workItemDrafts);
   d.launchProfiles = (Array.isArray(d.launchProfiles) ? d.launchProfiles : [])
     .filter(
       (p) =>

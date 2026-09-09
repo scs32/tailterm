@@ -58,7 +58,7 @@ func bodyFile(path string) (string, error) {
 
 func cmdWorkItems(e env, args []string) error {
 	if len(args) == 0 {
-		return errors.New("usage: tt work-items <list|get|create|update|dispatch>")
+		return errors.New("usage: tt work-items <list|get|create|update|receipt|dispatch|revisions|messages>")
 	}
 	switch args[0] {
 	case "list":
@@ -69,8 +69,14 @@ func cmdWorkItems(e env, args []string) error {
 		return cmdWorkItemCreate(e, args[1:])
 	case "update":
 		return cmdWorkItemUpdate(e, args[1:])
+	case "receipt":
+		return cmdWorkItemReceipt(e, args[1:])
 	case "dispatch":
 		return cmdWorkItemDispatch(e, args[1:])
+	case "revisions":
+		return cmdWorkItemRevisions(e, args[1:])
+	case "messages":
+		return cmdWorkItemMessages(e, args[1:])
 	default:
 		return fmt.Errorf("unknown work-items command %q", args[0])
 	}
@@ -113,6 +119,7 @@ func cmdWorkItemList(e env, args []string) error {
 func cmdWorkItemGet(e env, args []string) error {
 	fs := flag.NewFlagSet("work-items get", flag.ContinueOnError)
 	projectFlag := fs.String("project", e.task, "owning project id")
+	revision := fs.Int64("revision", 0, "exact historical revision")
 	asJSON := fs.Bool("json", false, "JSON output")
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -130,6 +137,18 @@ func cmdWorkItemGet(e env, args []string) error {
 	}
 	ctx, cancel := ctxTimeout(10 * time.Second)
 	defer cancel()
+	if *revision > 0 {
+		item, err := c.GetWorkItemRevision(ctx, project, fs.Arg(0), *revision)
+		if err != nil {
+			return err
+		}
+		if *asJSON {
+			printJSON(item)
+			return nil
+		}
+		fmt.Printf("%s %s revision %d %s [%s]\n%s\n", strings.ToUpper(item.Kind), item.ItemID, item.Revision, item.Title, item.Status, item.Description)
+		return nil
+	}
 	item, err := c.GetWorkItem(ctx, project, fs.Arg(0))
 	if err != nil {
 		return err
@@ -189,12 +208,13 @@ func cmdWorkItemUpdate(e env, args []string) error {
 	body := fs.String("body-file", "", "new description file, or - for stdin")
 	status := fs.String("status", "", "new status")
 	priority := fs.String("priority", "", "new priority")
+	requestID := fs.String("request-id", "", "stable retry key (required)")
 	asJSON := fs.Bool("json", false, "JSON output")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 	if fs.NArg() != 1 || !api.ValidID(fs.Arg(0), "wi") || *revision < 1 {
-		return errors.New("usage: tt work-items update --revision N [fields] WI_ID")
+		return errors.New("usage: tt work-items update --revision N --request-id KEY [fields] WI_ID")
 	}
 	project, err := workItemProject(e, *projectFlag)
 	if err != nil {
@@ -202,7 +222,7 @@ func cmdWorkItemUpdate(e env, args []string) error {
 	}
 	visited := map[string]bool{}
 	fs.Visit(func(f *flag.Flag) { visited[f.Name] = true })
-	req := api.UpdateWorkItemRequest{Revision: *revision, AgentID: e.agent}
+	req := api.CreateWorkItemUpdate{ExpectedRevision: *revision, AgentID: e.agent, RunID: e.runID, RequestID: *requestID}
 	if visited["title"] {
 		req.Title = title
 	}
@@ -228,14 +248,129 @@ func cmdWorkItemUpdate(e env, args []string) error {
 	}
 	ctx, cancel := ctxTimeout(10 * time.Second)
 	defer cancel()
-	item, err := c.UpdateWorkItem(ctx, project, fs.Arg(0), req)
+	if *requestID == "" {
+		return errors.New("--request-id is required")
+	}
+	result, err := c.CreateWorkItemUpdate(ctx, project, fs.Arg(0), req)
 	if err != nil {
 		return err
 	}
 	if *asJSON {
-		printJSON(item)
+		printJSON(result)
 	} else {
-		fmt.Printf("%s revision %d\n", item.ID, item.Revision)
+		fmt.Printf("%s revision %d receipt %s\n", result.Revision.ItemID, result.Revision.Revision, result.Receipt.ID)
+	}
+	return nil
+}
+
+func cmdWorkItemReceipt(e env, args []string) error {
+	fs := flag.NewFlagSet("work-items receipt", flag.ContinueOnError)
+	projectFlag := fs.String("project", e.task, "owning project id")
+	requestID := fs.String("request-id", "", "stable update retry key (required)")
+	asJSON := fs.Bool("json", false, "JSON output")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if fs.NArg() != 1 || !api.ValidID(fs.Arg(0), "wi") || *requestID == "" {
+		return errors.New("usage: tt work-items receipt --request-id KEY WI_ID")
+	}
+	project, err := workItemProject(e, *projectFlag)
+	if err != nil {
+		return err
+	}
+	c, err := e.client(10 * time.Second)
+	if err != nil {
+		return err
+	}
+	ctx, cancel := ctxTimeout(10 * time.Second)
+	defer cancel()
+	result, err := c.GetWorkItemUpdateReceipt(ctx, project, fs.Arg(0), *requestID, e.agent)
+	if err != nil {
+		return err
+	}
+	if *asJSON {
+		printJSON(result)
+	} else {
+		fmt.Printf("%s revision %d receipt %s\n", result.Revision.ItemID, result.Revision.Revision, result.Receipt.ID)
+	}
+	return nil
+}
+
+func cmdWorkItemRevisions(e env, args []string) error {
+	fs := flag.NewFlagSet("work-items revisions", flag.ContinueOnError)
+	projectFlag := fs.String("project", e.task, "owning project id")
+	after := fs.Int64("after", 0, "return revisions after this revision")
+	limit := fs.Int("limit", api.DefaultWorkItemHistoryPage, "maximum revisions")
+	asJSON := fs.Bool("json", false, "JSON output")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if fs.NArg() != 1 || !api.ValidID(fs.Arg(0), "wi") {
+		return errors.New("usage: tt work-items revisions [--after N] [--limit N] WI_ID")
+	}
+	project, err := workItemProject(e, *projectFlag)
+	if err != nil {
+		return err
+	}
+	c, err := e.client(10 * time.Second)
+	if err != nil {
+		return err
+	}
+	ctx, cancel := ctxTimeout(10 * time.Second)
+	defer cancel()
+	list, err := c.ListWorkItemRevisions(ctx, project, fs.Arg(0), *after, *limit)
+	if err != nil {
+		return err
+	}
+	if *asJSON {
+		printJSON(list)
+		return nil
+	}
+	for _, revision := range list.Revisions {
+		fmt.Printf("%d  %-10s %-11s %s\n", revision.Revision, revision.Provenance, revision.Status, revision.Title)
+	}
+	if list.NextAfter > 0 {
+		fmt.Printf("next after %d\n", list.NextAfter)
+	}
+	return nil
+}
+
+func cmdWorkItemMessages(e env, args []string) error {
+	fs := flag.NewFlagSet("work-items messages", flag.ContinueOnError)
+	projectFlag := fs.String("project", e.task, "owning project id")
+	revision := fs.Int64("revision", 0, "only messages explicitly linked to this revision")
+	after := fs.Int64("after", 0, "return messages after this sequence")
+	limit := fs.Int("limit", api.DefaultWorkItemHistoryPage, "maximum messages")
+	asJSON := fs.Bool("json", false, "JSON output")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if fs.NArg() != 1 || !api.ValidID(fs.Arg(0), "wi") {
+		return errors.New("usage: tt work-items messages [--revision N] [--after N] WI_ID")
+	}
+	project, err := workItemProject(e, *projectFlag)
+	if err != nil {
+		return err
+	}
+	c, err := e.client(10 * time.Second)
+	if err != nil {
+		return err
+	}
+	ctx, cancel := ctxTimeout(10 * time.Second)
+	defer cancel()
+	list, err := c.ListWorkItemMessages(ctx, project, fs.Arg(0), *revision, *after, *limit)
+	if err != nil {
+		return err
+	}
+	if *asJSON {
+		printJSON(list)
+		return nil
+	}
+	for _, link := range list.Links {
+		fmt.Printf("#%d  revision %d %-10s %s\n", link.Message.Seq, link.ItemRevision, link.RevisionCoverage, link.Message.Text)
+	}
+	if list.NextAfter > 0 {
+		fmt.Printf("next after %d\n", list.NextAfter)
 	}
 	return nil
 }

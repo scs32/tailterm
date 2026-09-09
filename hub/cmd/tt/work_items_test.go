@@ -92,10 +92,16 @@ func TestWorkItemsCLIUsesBodyFilesAndDurableReceipts(t *testing.T) {
 	}
 
 	updatedOut, err := captureCLIOutput(t, func() error {
-		return cmdWorkItems(e, []string{"update", "--revision", "1", "--status", "in_progress", itemID})
+		return cmdWorkItems(e, []string{"update", "--revision", "1", "--request-id", "cli-update-1", "--status", "in_progress", itemID})
 	})
 	if err != nil || !strings.Contains(updatedOut, "revision 2") {
 		t.Fatalf("update = %q %v", updatedOut, err)
+	}
+	receiptOut, err := captureCLIOutput(t, func() error {
+		return cmdWorkItems(e, []string{"receipt", "--request-id", "cli-update-1", itemID})
+	})
+	if err != nil || !strings.Contains(receiptOut, "revision 2") || !strings.Contains(receiptOut, "receipt wir_") {
+		t.Fatalf("receipt = %q %v", receiptOut, err)
 	}
 	listOut, err := captureCLIOutput(t, func() error {
 		return cmdWorkItems(e, []string{"list", "--kind", "bug", "--status", "in_progress"})

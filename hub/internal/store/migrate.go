@@ -153,6 +153,9 @@ CREATE TABLE IF NOT EXISTS decision_answers (
 );`); err != nil {
 		return err
 	}
+	if err := reconcileWorkItemHistory(db); err != nil {
+		return err
+	}
 	_, err := db.Exec(`INSERT OR IGNORE INTO profile_meta(key,value) VALUES('instance',?)`, api.NewID("profilehub"))
 	return err
 }

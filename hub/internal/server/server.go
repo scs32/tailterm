@@ -57,6 +57,12 @@ func New(st *store.Store, identity Identity) *Server {
 	m.HandleFunc("POST /v1/tasks/{id}/work-items", s.createWorkItem)
 	m.HandleFunc("GET /v1/tasks/{id}/work-items/{wid}", s.getWorkItem)
 	m.HandleFunc("PATCH /v1/tasks/{id}/work-items/{wid}", s.updateWorkItem)
+	m.HandleFunc("GET /v1/tasks/{id}/work-items/{wid}/revisions", s.listWorkItemRevisions)
+	m.HandleFunc("GET /v1/tasks/{id}/work-items/{wid}/revisions/{revision}", s.getWorkItemRevision)
+	m.HandleFunc("GET /v1/tasks/{id}/work-items/{wid}/history-gaps", s.listWorkItemHistoryGaps)
+	m.HandleFunc("GET /v1/tasks/{id}/work-items/{wid}/messages", s.listWorkItemMessages)
+	m.HandleFunc("POST /v1/tasks/{id}/work-items/{wid}/updates", s.createWorkItemUpdate)
+	m.HandleFunc("GET /v1/tasks/{id}/work-items/{wid}/updates/receipts/{requestID}", s.getWorkItemUpdateReceipt)
 	m.HandleFunc("POST /v1/tasks/{id}/work-items/{wid}/dispatch", s.dispatchWorkItem)
 	m.HandleFunc("GET /v1/events", s.globalEvents)
 	return s

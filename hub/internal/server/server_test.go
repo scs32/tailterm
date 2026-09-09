@@ -18,6 +18,7 @@ import (
 type client struct {
 	t   *testing.T
 	srv *httptest.Server
+	st  *store.Store
 	who api.Caller
 }
 
@@ -28,7 +29,7 @@ func newClient(t *testing.T) *client {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { st.Close() })
-	c := &client{t: t, who: api.Caller{Node: "devbox", User: "stephen@example.com"}}
+	c := &client{t: t, st: st, who: api.Caller{Node: "devbox", User: "stephen@example.com"}}
 	s := New(st, func(r *http.Request) (api.Caller, error) {
 		if r.Header.Get("X-Test-Deny") != "" {
 			return api.Caller{}, fmt.Errorf("denied")

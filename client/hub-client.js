@@ -74,6 +74,24 @@ export function createHubClient({ fetchImpl, baseURL, token = "" }) {
       request(`/v1/tasks/${task}/work-items`, { method: "POST", body }),
     updateWorkItem: (task, id, body) =>
       request(`/v1/tasks/${task}/work-items/${id}`, { method: "PATCH", body }),
+    createWorkItemUpdate: (task, id, body) =>
+      request(`/v1/tasks/${task}/work-items/${id}/updates`, {
+        method: "POST",
+        body,
+      }),
+    getWorkItemUpdateReceipt: (task, id, requestId, agentId = "") =>
+      request(
+        `/v1/tasks/${task}/work-items/${id}/updates/receipts/${encodeURIComponent(requestId)}` +
+          q({ agentId }),
+      ),
+    listWorkItemRevisions: (task, id, params = {}) =>
+      request(`/v1/tasks/${task}/work-items/${id}/revisions` + q(params)),
+    getWorkItemRevision: (task, id, revision) =>
+      request(`/v1/tasks/${task}/work-items/${id}/revisions/${revision}`),
+    listWorkItemHistoryGaps: (task, id, params = {}) =>
+      request(`/v1/tasks/${task}/work-items/${id}/history-gaps` + q(params)),
+    listWorkItemMessages: (task, id, params = {}) =>
+      request(`/v1/tasks/${task}/work-items/${id}/messages` + q(params)),
     dispatchWorkItem: (task, id, body) =>
       request(`/v1/tasks/${task}/work-items/${id}/dispatch`, {
         method: "POST",

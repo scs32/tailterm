@@ -613,6 +613,7 @@ function mount() {
         modes.set("board");
         boardView.show(id);
       },
+      draftPersistence: localVault.workItemDraftPersistence(),
     };
     bugsView = createWorkItemsView({ ...workItemHost, kind: "bug" });
     featuresView = createWorkItemsView({ ...workItemHost, kind: "feature" });
