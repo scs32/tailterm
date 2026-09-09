@@ -460,7 +460,17 @@ func (s *Store) DispatchWorkItem(ctx context.Context, taskID, itemID string, req
 		description += "…"
 	}
 	messageText := fmt.Sprintf("Work item %s revision %d from project %q (%s)\n%s: %s\nStatus: %s · Priority: %s\nDescription: %s", item.ID, item.Revision, sourceTask.Name, sourceTask.ID, strings.ToUpper(item.Kind), item.Title, item.Status, item.Priority, description)
-	message, err := s.insertMessage(ctx, tx, targetTask, api.PostMessageRequest{AgentID: req.AgentID, To: targetAgent.ID, Text: messageText}, targetAgent, by)
+	message, err := s.insertMessage(ctx, tx, targetTask, api.PostMessageRequest{
+		AgentID: req.AgentID,
+		To:      targetAgent.ID,
+		Text:    messageText,
+		WorkItems: []api.MessageWorkItem{{
+			ItemTaskID:   item.TaskID,
+			ItemID:       item.ID,
+			ItemRevision: item.Revision,
+			Relationship: "primary",
+		}},
+	}, targetAgent, by, true)
 	if err != nil {
 		return api.WorkItemDispatchResult{}, err
 	}

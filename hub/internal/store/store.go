@@ -607,14 +607,46 @@ func (s *Store) setAgentStatus(ctx context.Context, id, status string, by api.Ca
 func (s *Store) PostMessage(ctx context.Context, taskID string, req api.PostMessageRequest, by api.Caller) (api.Message, error) {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
-	t, err := s.GetTask(ctx, taskID)
+	if !api.ValidID(taskID, "tsk") || validateMessageRequestShape(req) != nil {
+		return api.Message{}, api.ErrInvalid
+	}
+	payload := ""
+	if req.RequestID != "" {
+		payload = requestHash(req)
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return api.Message{}, err
+	}
+	defer tx.Rollback()
+	if req.RequestID != "" {
+		receipt, priorHash, receiptErr := findMessagePostReceipt(tx, ctx, taskID, req.RequestID, req.AgentID, by)
+		if receiptErr == nil {
+			if priorHash != payload {
+				return api.Message{}, workItemConflict("request ID was already used with different message data")
+			}
+			message, loadErr := loadMessage(tx, ctx, taskID, receipt.MessageSeq)
+			if loadErr != nil {
+				return message, loadErr
+			}
+			message.PostReceipt = &receipt
+			return message, nil
+		}
+		if !errors.Is(receiptErr, api.ErrNotFound) {
+			return api.Message{}, receiptErr
+		}
+	}
+	t, err := scanTask(tx.QueryRowContext(ctx, `SELECT `+taskCols+` FROM tasks WHERE id=?`, taskID))
+	if errors.Is(err, sql.ErrNoRows) {
+		return api.Message{}, api.ErrNotFound
+	}
 	if err != nil {
 		return api.Message{}, err
 	}
 	if t.Status != api.TaskOpen {
 		return api.Message{}, api.ErrClosed
 	}
-	if req.Text == "" || !api.ValidText(req.Text, api.MaxTextLen) {
+	if req.Text == "" || !api.ValidText(req.Text, api.MaxTextLen) || req.ReplyTo < 0 {
 		return api.Message{}, api.ErrInvalid
 	}
 	var target api.Agent
@@ -622,31 +654,28 @@ func (s *Store) PostMessage(ctx context.Context, taskID string, req api.PostMess
 		if id == "" {
 			continue
 		}
-		a, err := s.GetAgent(ctx, id)
-		if err != nil || a.TaskID != taskID {
+		a, agentErr := scanAgent(tx.QueryRowContext(ctx, `SELECT `+agentCols+` FROM agents WHERE id=?`, id))
+		if agentErr != nil || a.TaskID != taskID {
 			return api.Message{}, api.ErrInvalid
 		}
 		if id == req.To {
 			target = a
 		}
 	}
-	if req.ReplyTo < 0 {
-		return api.Message{}, api.ErrInvalid
-	}
 	if req.ReplyTo > 0 {
 		var replyTask string
-		if err := s.db.QueryRowContext(ctx, `SELECT task_id FROM messages WHERE seq=?`, req.ReplyTo).Scan(&replyTask); err != nil || replyTask != taskID {
+		if err := tx.QueryRowContext(ctx, `SELECT task_id FROM messages WHERE seq=?`, req.ReplyTo).Scan(&replyTask); err != nil || replyTask != taskID {
 			return api.Message{}, api.ErrInvalid
 		}
 	}
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return api.Message{}, err
-	}
-	defer tx.Rollback()
-	m, err := s.insertMessage(ctx, tx, t, req, target, by)
+	m, err := s.insertMessage(ctx, tx, t, req, target, by, false)
 	if err != nil {
 		return m, err
+	}
+	if req.RequestID != "" {
+		if err = insertMessagePostReceipt(ctx, tx, &m, req.RequestID, payload, by); err != nil {
+			return m, err
+		}
 	}
 	if err = tx.Commit(); err != nil {
 		return m, err
@@ -655,8 +684,11 @@ func (s *Store) PostMessage(ctx context.Context, taskID string, req api.PostMess
 	return m, nil
 }
 
-func (s *Store) insertMessage(ctx context.Context, tx *sql.Tx, task api.Task, req api.PostMessageRequest, target api.Agent, by api.Caller) (api.Message, error) {
+func (s *Store) insertMessage(ctx context.Context, tx *sql.Tx, task api.Task, req api.PostMessageRequest, target api.Agent, by api.Caller, allowCrossProject bool) (api.Message, error) {
 	taskID := task.ID
+	if err := validateMessageContext(tx, ctx, taskID, req, allowCrossProject); err != nil {
+		return api.Message{}, err
+	}
 	m := api.Message{Broadcast: task.Swarm, ReplyTo: req.ReplyTo, TaskID: taskID, From: api.Sender{AgentID: req.AgentID, Node: by.Node, User: by.User}, To: req.To, Text: req.Text, CreatedAt: s.now()}
 	res, err := tx.ExecContext(ctx, `INSERT INTO messages (task_id,from_agent,from_node,from_user,to_agent,text,created_at,reply_to,broadcast) VALUES (?,?,?,?,?,?,?,?,?)`,
 		taskID, req.AgentID, by.Node, by.User, req.To, req.Text, ts(m.CreatedAt), req.ReplyTo, m.Broadcast)
@@ -664,11 +696,21 @@ func (s *Store) insertMessage(ctx context.Context, tx *sql.Tx, task api.Task, re
 		return m, err
 	}
 	m.Seq, _ = res.LastInsertId()
+	if err = insertMessageContext(ctx, tx, &m, req); err != nil {
+		return m, err
+	}
 	preview := req.Text
 	if len(preview) > 200 {
 		preview = preview[:200]
 	}
-	if _, err = s.insertEvent(ctx, tx, taskID, api.EventMessage, req.AgentID, preview, map[string]any{"seq": m.Seq, "to": req.To, "broadcast": m.Broadcast}, by); err != nil {
+	eventData := map[string]any{"seq": m.Seq, "to": req.To, "broadcast": m.Broadcast}
+	if len(m.WorkItems) > 0 {
+		eventData["workItems"] = m.WorkItems
+	}
+	if m.WorkOrderMessage != nil {
+		eventData["workOrderMessage"] = m.WorkOrderMessage
+	}
+	if _, err = s.insertEvent(ctx, tx, taskID, api.EventMessage, req.AgentID, preview, eventData, by); err != nil {
 		return m, err
 	}
 	// A direct human message is an explicit request to continue an existing
@@ -700,7 +742,10 @@ func (s *Store) ListMessages(ctx context.Context, taskID string, after int64, ag
 	if limit <= 0 || limit > api.MaxLimit {
 		limit = api.MaxLimit
 	}
-	q := `SELECT seq,task_id,from_agent,from_node,from_user,to_agent,text,created_at,reply_to,broadcast FROM messages WHERE task_id=? AND seq>?`
+	q := `SELECT ` + messageSelectCols + ` FROM messages m
+LEFT JOIN message_work_item_links l ON l.message_seq=m.seq
+LEFT JOIN message_post_requests r ON r.message_seq=m.seq
+WHERE m.task_id=? AND m.seq>?`
 	args := []any{taskID, after}
 	if agentID != "" {
 		q += ` AND (broadcast=1 OR to_agent='' OR to_agent=?)`
@@ -719,12 +764,10 @@ func (s *Store) ListMessages(ctx context.Context, taskID string, after int64, ag
 	defer rows.Close()
 	out := []api.Message{}
 	for rows.Next() {
-		var m api.Message
-		var created string
-		if err := rows.Scan(&m.Seq, &m.TaskID, &m.From.AgentID, &m.From.Node, &m.From.User, &m.To, &m.Text, &created, &m.ReplyTo, &m.Broadcast); err != nil {
+		m, err := scanMessage(rows)
+		if err != nil {
 			return nil, err
 		}
-		m.CreatedAt = parseTS(created)
 		out = append(out, m)
 	}
 	if after < 0 {

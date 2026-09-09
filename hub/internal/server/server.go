@@ -46,6 +46,7 @@ func New(st *store.Store, identity Identity) *Server {
 	m.HandleFunc("POST /v1/tasks/{id}/agents/{aid}/cleanup", s.agentCleanup)
 	m.HandleFunc("POST /v1/tasks/{id}/messages", s.postMessage)
 	m.HandleFunc("GET /v1/tasks/{id}/messages", s.listMessages)
+	m.HandleFunc("GET /v1/tasks/{id}/messages/receipts/{requestID}", s.getMessagePostReceipt)
 	m.HandleFunc("POST /v1/tasks/{id}/messages/read", s.markRead)
 	m.HandleFunc("POST /v1/tasks/{id}/events", s.postEvent)
 	m.HandleFunc("GET /v1/tasks/{id}/events", s.taskEvents)
@@ -372,6 +373,25 @@ func (s *Server) postMessage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, 201, m)
+}
+
+func (s *Server) getMessagePostReceipt(w http.ResponseWriter, r *http.Request) {
+	c, ok := s.writer(w, r)
+	if !ok {
+		return
+	}
+	id, ok := taskID(w, r)
+	if !ok {
+		return
+	}
+	message, err := s.store.GetMessagePostReceipt(
+		r.Context(), id, r.PathValue("requestID"), r.URL.Query().Get("agentId"), c,
+	)
+	if err != nil {
+		fail(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, message)
 }
 
 func queryInt(r *http.Request, key string, fallback int64) int64 {

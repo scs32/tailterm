@@ -95,6 +95,37 @@ CREATE TABLE IF NOT EXISTS work_item_requests (
   dispatch_id TEXT NOT NULL DEFAULT '',
   created_at TEXT NOT NULL,
   PRIMARY KEY(task_id,operation,request_id)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS messages_task_seq_unique ON messages(task_id,seq);
+CREATE UNIQUE INDEX IF NOT EXISTS work_items_task_id_unique ON work_items(task_id,id);
+CREATE TABLE IF NOT EXISTS message_work_item_links (
+  message_seq INTEGER PRIMARY KEY,
+  message_task_id TEXT NOT NULL,
+  item_task_id TEXT NOT NULL,
+  item_id TEXT NOT NULL,
+  item_revision INTEGER NOT NULL CHECK(item_revision > 0),
+  relationship TEXT NOT NULL CHECK(relationship = 'primary'),
+  work_order_task_id TEXT,
+  work_order_message_seq INTEGER,
+  created_at TEXT NOT NULL,
+  CHECK((work_order_task_id IS NULL) = (work_order_message_seq IS NULL)),
+  FOREIGN KEY(message_task_id,message_seq) REFERENCES messages(task_id,seq),
+  FOREIGN KEY(item_task_id,item_id) REFERENCES work_items(task_id,id),
+  FOREIGN KEY(work_order_task_id,work_order_message_seq) REFERENCES messages(task_id,seq)
+);
+CREATE INDEX IF NOT EXISTS message_work_item_links_item ON message_work_item_links(item_task_id,item_id,message_seq);
+CREATE TABLE IF NOT EXISTS message_post_requests (
+  receipt_id TEXT PRIMARY KEY,
+  task_id TEXT NOT NULL REFERENCES tasks(id),
+  agent_id TEXT NOT NULL DEFAULT '',
+  by_node TEXT NOT NULL,
+  by_user TEXT NOT NULL,
+  request_id TEXT NOT NULL,
+  payload_hash TEXT NOT NULL,
+  message_seq INTEGER NOT NULL UNIQUE,
+  created_at TEXT NOT NULL,
+  UNIQUE(task_id,agent_id,by_node,by_user,request_id),
+  FOREIGN KEY(task_id,message_seq) REFERENCES messages(task_id,seq)
 );`); err != nil {
 		return err
 	}

@@ -1,11 +1,14 @@
 # Structured audit and AIV implementation plan
 
-Planning revision 1 — September 8, 2026.
+Planning revision 2 — September 8, 2026. Owner recommendations approved in #445;
+handler record #454 activates A1 only. Later implementation/release orders remain
+separate gates.
 Feature `wi_abc84eb23688d903`; planning order `source-426-plan-1`, activated by
 owner dispatch #433 and lead #435, recorded by db-handler #437 at item revision 3.
-Owner: lead. Database/audit owner: db-handler. This document proposes implementation
-orders; none is activated by delivery of this plan. The roadmap remains open after
-planning. Owner decisions below are unresolved until recorded by the handler.
+Owner: lead. Database/audit owner: db-handler. Planning was accepted in #442.
+Owner #445 approved the recommendations; db-handler #454 recorded decisions D1–D6
+and activated A1. The roadmap remains in progress. Later slices are proposed orders
+and do not become active merely because their design defaults are approved.
 
 Baseline: Tailterm `6abd105` on `tasks-hub`, following deployed application
 `955bf43358c0d600028295f5466275cbae9e4714`; working tree was clean before this
@@ -30,18 +33,17 @@ meet the binding contract.
 
 | Decision | Recommendation and consequence | Owner disposition / gate |
 | --- | --- | --- |
-| D1: messages before an item exists | Explicit temporary Intake; preserve the original message and atomically attach the eventual item. Strict mode rejects work claims without a link but still accepts intake. Alternative: require a pre-existing intake feature, which needs a separate bootstrap path. | Unresolved; before intake UX/required-mode implementation |
-| D2: project-wide messages | One ordinary, ongoing Project coordination feature created by the handler, for introductions and genuine operational coordination. Actual operational work still needs bounded orders; unrelated development gets its own item. Bootstrap remains Intake under D1. | Unresolved; before automatic coordination-item creation |
-| D3: links and cross-project work | Exactly one primary item and up to 15 related items. Initial build supports same-project primary only; later cross-project context requires an existing dispatch or explicit attributed handler/human linkage. Text mentions and replies never grant linkage. | Unresolved; primary semantics before A1; broader links before A2 |
-| D4: rollout enforcement | Observe mode first, with explicit capability discovery and visible unlinked state. Enable required mode only after TailOS, Mini, Air and active supported clients pass compatibility checks. No automatic deadline-based switch. | Unresolved; observe compatibility assumption before A1, activation before B2 |
-| D5: attribution and access | Preserve the current trusted workspace; label agent identity as a claim under the shared credential. Handler-only agent database use remains a workflow rule. Do not claim authenticated per-agent enforcement. Scoped credentials are a separately designed feature if the owner requires that stronger boundary now. | Unresolved; before exposing new mutation interfaces/AIV credentials |
-| D6: first AIV acceptance target | An isolated synthetic Go module representing one logged Tailterm issue; native tools execute against an exact checkout. Record repository/commit/snapshot/check/environment and measured population. Defer JavaScript assurance, DSH hooks and automatic test interception. | Unresolved; before the AIV pilot order and any MCP configuration |
+| D1: messages before an item exists | Explicit temporary Intake; preserve the original message and atomically attach the eventual item. Strict mode rejects work claims without a link but still accepts intake. Alternative: require a pre-existing intake feature, which needs a separate bootstrap path. | Approved #445/#454; before intake UX/required-mode implementation |
+| D2: project-wide messages | One ordinary, ongoing Project coordination feature created by the handler, for introductions and genuine operational coordination. Actual operational work still needs bounded orders; unrelated development gets its own item. Bootstrap remains Intake under D1. | Approved #445/#454; before automatic coordination-item creation |
+| D3: links and cross-project work | Exactly one primary item and up to 15 related items. Initial build supports same-project primary only; later cross-project context requires an existing dispatch or explicit attributed handler/human linkage. Text mentions and replies never grant linkage. | Approved #445/#454; primary semantics before A1; broader links before A2 |
+| D4: rollout enforcement | Observe mode first, with explicit capability discovery and visible unlinked state. Enable required mode only after TailOS, Mini, Air and active supported clients pass compatibility checks. No automatic deadline-based switch. | Approved #445/#454; observe compatibility assumption before A1, activation before B2 |
+| D5: attribution and access | Preserve the current trusted workspace; label agent identity as a claim under the shared credential. Handler-only agent database use remains a workflow rule. Do not claim authenticated per-agent enforcement. Scoped credentials are a separately designed feature if the owner requires that stronger boundary now. | Approved #445/#454; before exposing new mutation interfaces/AIV credentials |
+| D6: first AIV acceptance target | An isolated synthetic Go module representing one logged Tailterm issue; native tools execute against an exact checkout. Record repository/commit/snapshot/check/environment and measured population. Defer JavaScript assurance, DSH hooks and automatic test interception. | Approved #445/#454; before the AIV pilot order and any MCP configuration |
 
-Recommended approval bundles: D1–D4 define product behavior; D5 defines the trust
-boundary; D6 selects pilot scope. A reply approving a bundle must be recorded with
-its source sequence by db-handler. Recommendations are not silently treated as
-answers. Any changed decision updates this document and affected orders before
-implementation; workers do not infer answers independently.
+D1–D4 define product behavior; D5 defines the trust boundary; D6 selects pilot
+scope. These recommendations were explicitly approved in owner #445 and recorded
+by db-handler #454. Any subsequent changed decision must update this document and
+affected orders before implementation; workers do not infer changes independently.
 
 ## Current implementation boundaries that matter
 
@@ -97,7 +99,9 @@ required merely because item linkage is required.
 
 ## First implementation order proposed for activation
 
-Proposed key `wi_abc84eb23688d903-a1`; not assigned yet. Objective: persist a verified
+Active key `wi_abc84eb23688d903-a1`; activated in #446/#454. Root owns shared API
+and integration; api owns store/server/migration; cache-qa owns independent HTTP
+acceptance under #449/#450 and fixed contract #452/#453. Objective: persist a verified
 same-project primary item relationship on an ordinary message and recover a
 committed post without duplicating its events. Existing validated cross-project
 work-item dispatch remains supported and emits its owning-item relationship;
@@ -254,8 +258,9 @@ and closes the roadmap only after its chosen acceptance scope is actually met.
 Delivered artifact: this plan. Verification for planning is source-path/contract
 inspection and document/link consistency, not a claim that proposed behavior was
 tested. No product files were edited and no runtime/deployment action occurred.
-Remaining dependency before A1: owner disposition of D3 primary-link semantics,
-D4 observe-first compatibility and D5 trust boundary, followed by the handler's
-recorded A1 activation. D1/D2 and D6 can be resolved now or at their explicit later
-gates. Return plan review findings and owner answers through db-handler; preserve
-the roadmap feature rather than marking it complete after this document.
+Planning acceptance and owner decisions are recorded in #442/#445/#454. A1 source
+and verification were accepted by lead in #480; see the
+[implemented contract and evidence](message-audit.md). Deployment remains a
+separately recorded release order. Later slices still require their own work orders. Return
+results and changes through db-handler; preserve the roadmap feature rather than
+marking it complete after the plan or A1 alone.

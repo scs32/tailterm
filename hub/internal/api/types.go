@@ -187,14 +187,17 @@ type Sender struct {
 }
 
 type Message struct {
-	Broadcast bool      `json:"broadcast,omitempty"`
-	ReplyTo   int64     `json:"replyTo,omitempty"`
-	Seq       int64     `json:"seq"`
-	TaskID    string    `json:"taskId"`
-	From      Sender    `json:"from"`
-	To        string    `json:"to,omitempty"`
-	Text      string    `json:"text"`
-	CreatedAt time.Time `json:"createdAt"`
+	WorkItems        []MessageWorkItem   `json:"workItems,omitempty"`
+	WorkOrderMessage *MessageReference   `json:"workOrderMessage,omitempty"`
+	PostReceipt      *MessagePostReceipt `json:"postReceipt,omitempty"`
+	Broadcast        bool                `json:"broadcast,omitempty"`
+	ReplyTo          int64               `json:"replyTo,omitempty"`
+	Seq              int64               `json:"seq"`
+	TaskID           string              `json:"taskId"`
+	From             Sender              `json:"from"`
+	To               string              `json:"to,omitempty"`
+	Text             string              `json:"text"`
+	CreatedAt        time.Time           `json:"createdAt"`
 }
 
 type Event struct {
@@ -247,10 +250,13 @@ type UpdateAgentRequest struct {
 }
 
 type PostMessageRequest struct {
-	ReplyTo int64  `json:"replyTo,omitempty"`
-	Text    string `json:"text"`
-	To      string `json:"to"`
-	AgentID string `json:"agentId"`
+	WorkItems        []MessageWorkItem `json:"workItems,omitempty"`
+	WorkOrderMessage *MessageReference `json:"workOrderMessage,omitempty"`
+	RequestID        string            `json:"requestId,omitempty"`
+	ReplyTo          int64             `json:"replyTo,omitempty"`
+	Text             string            `json:"text"`
+	To               string            `json:"to"`
+	AgentID          string            `json:"agentId"`
 }
 
 type MarkReadRequest struct {
