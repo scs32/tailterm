@@ -10,6 +10,8 @@
   font-synthesis: none;
   font-size: 14px;
   color-scheme: dark;
+  -webkit-text-size-adjust: 100%;
+  text-size-adjust: 100%;
 }
 .tab,
 .pane-header {
