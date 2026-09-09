@@ -1,5 +1,33 @@
 # Development handoff — September 9, 2026
 
+## September 9 dropdown and send-dialog fixes — release verified
+
+Application `fd8d10273a46877b6bd7a6eb0c1dd9b2bc228bce` is now deployed to
+`https://tailos.tailarr.com` (`https://14bee768.tailos.pages.dev`) and Mini
+`http://127.0.0.1:4318`. Both origins match 81 served asset hashes and manifest
+`ec83e3e7faf22b7c15d9c5e499cb0db579537513f4c8669bf39d7e06dc401e2d`.
+Public Chromium checked the new commit/main script, real WASM and synthetic
+local-vault restoration without errors. This supersedes the older frontend
+inventory below; hub and installed CLIs remain at the Board decisions release.
+
+Dropdowns/disclosures retain their interaction state during refresh, and confirmed
+bug/feature dispatch closes its originating dialog. Independent browser evidence:
+38/38 dropdown cases and 28/28 dispatch cases, plus passing work-item, cache and
+layout integration suites. Native OS keyboard observation remains an accepted
+coverage limitation, not a claimed manual pass. Temporary QA resources are cleaned;
+UI and cache-qa are retired. Release orders #778/#779 and full receipts:
+[dropdown and dispatch release](releases/tailos-2026-09-09-dropdown-dispatch.json).
+Contracts/outcomes: [dropdown continuity](dropdown-continuity.md) and
+[dispatch dialog](dispatch-dialog.md). Prior public rollback package remains at
+`.build/releases/board-decisions-39896c9c3a17/dist-static`; current clean release
+package is `.build/releases/dropdown-dispatch-fd8d102/dist-static`.
+
+The separate work-item create/edit/history bug remains in investigation. Ordinary
+CRUD passed 8/8 on both current and pre-dropdown baselines; no repair is claimed.
+API owns the unfinished storage-plan revision, and owner failure details requested
+in #752 remain pending. Narrative/AIV work is not activated. Air preview remains
+retired; no hub/CLI/network change accompanied this frontend release.
+
 ## September 9 Board decisions — release verified, Air preview retired
 
 Application `39896c9c3a1779bdd1b6eb77ad2edab6d447cacc` is deployed to

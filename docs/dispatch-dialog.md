@@ -16,7 +16,7 @@ response, that response cannot close or alter the replacement dialog. Records
 still refresh. Dispatch APIs, revision association and database behavior are
 unchanged.
 
-## Evidence and remaining release dependency
+## Evidence and verified release
 
 UI reported 121/121 unit tests and 16/16 focused browser scenarios. Independent
 QA passed 28/28 scenarios across Chromium and WebKit, using real disposable hub
@@ -39,7 +39,18 @@ with populated, empty and long-content scenarios. Both commands exited 0;
 `git diff --check` passed. Layout setup needed the existing ignored compiled WASM
 asset copied into the isolated checkout before its successful run.
 
-No static build or deployment was performed for this bug. The branch includes
-the separate dropdown candidate, whose native keyboard acceptance remains
-pending. Release requires a separately recorded order and satisfaction of that
-dependency; accepted implementation is not a completed release.
+Release order `wi_47ef43c93987b091-release-1` (#779) deployed combined application
+`fd8d10273a46877b6bd7a6eb0c1dd9b2bc228bce` to TailOS
+(`https://14bee768.tailos.pages.dev`) and Mini. Both origins match all 81 served
+asset hashes and manifest SHA-256
+`ec83e3e7faf22b7c15d9c5e499cb0db579537513f4c8669bf39d7e06dc401e2d`.
+Public Chromium verified the new commit/main script, real WASM and restoration
+of a synthetic local vault without errors. UI and QA work was accepted and those
+workers retired after cleanup. No backend, CLI, schema or network changes.
+
+The accompanying dropdown fix retains an explicitly accepted coverage limitation:
+native OS keyboard commit/Escape/same-value observation was unavailable to the
+host automation. Lead decision #776 removed the manual release gate; no human
+pass is claimed. The dispatch success/failure/retry/cancel matrix passed in both
+engines. See [the release receipt](releases/tailos-2026-09-09-dropdown-dispatch.json)
+for distinct orders, outcomes, cleanup and rollback references.

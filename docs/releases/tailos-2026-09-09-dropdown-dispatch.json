@@ -1,0 +1,166 @@
+{
+  "status": "release_verified",
+  "recordedAt": "2026-09-09T17:11:39.573373+00:00",
+  "commit": "fd8d10273a46877b6bd7a6eb0c1dd9b2bc228bce",
+  "workItems": [
+    {
+      "id": "wi_b1d07b59cdf519eb",
+      "fixOrder": {
+        "id": "wi_b1d07b59cdf519eb-fix-1",
+        "message": 661
+      },
+      "releaseOrder": {
+        "id": "wi_b1d07b59cdf519eb-release-1",
+        "message": 778
+      },
+      "outcome": "Native dropdowns, Closed disclosures and Projects More retain interaction state through background refresh; latest received data renders after dismissal."
+    },
+    {
+      "id": "wi_47ef43c93987b091",
+      "fixOrder": {
+        "id": "wi_47ef43c93987b091-fix-1",
+        "message": 739
+      },
+      "releaseOrder": {
+        "id": "wi_47ef43c93987b091-release-1",
+        "message": 779
+      },
+      "outcome": "Successful bug/feature dispatch closes its originating dialog; failure retains destination/error and retry identity, and late responses cannot close replacement dialogs."
+    }
+  ],
+  "tailos": {
+    "origin": "https://tailos.tailarr.com",
+    "deployment": "https://14bee768.tailos.pages.dev",
+    "commit": "fd8d10273a46877b6bd7a6eb0c1dd9b2bc228bce",
+    "verifiedAssets": 81,
+    "releaseSha256": "ec83e3e7faf22b7c15d9c5e499cb0db579537513f4c8669bf39d7e06dc401e2d",
+    "verifiedAt": "2026-09-09T17:09:59.682Z"
+  },
+  "miniPreview": {
+    "origin": "http://127.0.0.1:4318",
+    "deployment": "local-preview",
+    "commit": "fd8d10273a46877b6bd7a6eb0c1dd9b2bc228bce",
+    "verifiedAssets": 81,
+    "releaseSha256": "ec83e3e7faf22b7c15d9c5e499cb0db579537513f4c8669bf39d7e06dc401e2d",
+    "verifiedAt": "2026-09-09T17:09:12.592Z"
+  },
+  "productionSmoke": {
+    "commit": "fd8d10273a46877b6bd7a6eb0c1dd9b2bc228bce",
+    "mainScript": "/assets/index-D6fzXaqg.js",
+    "origin": "https://tailos.tailarr.com",
+    "browser": "Chromium",
+    "productionWasm": true,
+    "syntheticLocalVaultRestoration": true,
+    "uncaughtErrors": [],
+    "verifiedAt": "2026-09-09T17:09:59.862Z"
+  },
+  "acceptance": {
+    "dropdownBrowser": {
+      "passed": 38,
+      "engines": [
+        "Chromium",
+        "WebKit"
+      ],
+      "message": 713
+    },
+    "dispatchBrowser": {
+      "passed": 28,
+      "engines": [
+        "Chromium",
+        "WebKit"
+      ],
+      "message": 762
+    },
+    "uiDispatchBrowserPassed": 16,
+    "unitPassed": 121,
+    "leadFocusedPassed": 15,
+    "cacheBrowser": "Both engines pass with missing synthetic decisions route restored",
+    "projectWorkItemsBrowser": "Both engines pass",
+    "boardLayoutBrowser": "Both engines;1440/1024/390;populated/empty/long pass",
+    "cleanPackageManifestEntries": 82,
+    "servedAssetHashesPerOrigin": 81
+  },
+  "cleanup": {
+    "task": "tsk_2cfcff70a0fbe967",
+    "bug": "wi_b1d07b59cdf519eb",
+    "workOrder": "wi_b1d07b59cdf519eb-fix-1/#661",
+    "cleanupOrder": "#777",
+    "completedAt": "2026-09-09T17:07:21.285837+00:00",
+    "sessionExitCodes": {
+      "chromium": 0,
+      "webkit": 0
+    },
+    "remainingOwnedProcesses": [],
+    "temporaryDirectories": [
+      {
+        "path": "/var/folders/p8/3rs14vyj49qcyw14jy7dddcr0000gn/T/playwright_chromiumdev_profile-gmr1CI",
+        "exists": false
+      },
+      {
+        "path": "/var/folders/p8/3rs14vyj49qcyw14jy7dddcr0000gn/T/tailterm-dropdown-1ZhPNS",
+        "exists": false
+      },
+      {
+        "path": "/var/folders/p8/3rs14vyj49qcyw14jy7dddcr0000gn/T/tailterm-dropdown-stp1Z1",
+        "exists": false
+      }
+    ],
+    "listeners": [
+      {
+        "pid": 55366,
+        "address": "127.0.0.1:59140",
+        "acceptingConnections": false
+      },
+      {
+        "pid": 55379,
+        "address": "127.0.0.1:59147",
+        "acceptingConnections": false
+      },
+      {
+        "pid": 55429,
+        "address": "127.0.0.1:59127",
+        "acceptingConnections": false
+      },
+      {
+        "pid": 55430,
+        "address": "127.0.0.1:59129",
+        "acceptingConnections": false
+      }
+    ],
+    "nativeKeyboardObservation": "Unverified; lead accepted documented coverage limitation in #775/#777. No manual pass claimed.",
+    "productFilesChanged": false
+  },
+  "coverageLimitation": {
+    "nativeKeyboardCommitEscapeSameValue": "Unverified: browser protocol keys did not reach macOS native menu layer in bare-form/headed/headless control experiments; native event permission absent. No manual pass claimed.",
+    "acceptedByLeadMessage": 776,
+    "releaseGate": false
+  },
+  "rollback": {
+    "tailosCommit": "39896c9c3a1779bdd1b6eb77ad2edab6d447cacc",
+    "tailosDeployment": "https://23a174e0.tailos.pages.dev",
+    "tailosRetainedPackage": "/Users/stephenspeicher/projects/tailterm/.build/releases/board-decisions-39896c9c3a17/dist-static",
+    "priorManifests": {
+      "tailos": {
+        "commit": "39896c9c3a1779bdd1b6eb77ad2edab6d447cacc",
+        "releaseSha256": "65cafae10ccfc33ff9133caeb960ce3023780da56da78b59112eb7e22739856d"
+      },
+      "mini": {
+        "commit": "c0396e10dfd446572978058f764209571a6eb20f",
+        "releaseSha256": "fcf2d001de4dc3bc5b621a8aec74013f1c6ff97cde71ba7a0dff601d4083458c"
+      }
+    },
+    "miniRetainedPackage": "/Users/stephenspeicher/projects/tailterm/.build/releases/mini-before-dropdown-dispatch"
+  },
+  "retainedRelease": {
+    "worktree": "/Users/stephenspeicher/projects/tailterm/.build/releases/dropdown-dispatch-fd8d102",
+    "cleanSource": true,
+    "verifyReleasePassed": true
+  },
+  "verificationNotes": [
+    "Initial package verification identified the local dependency symlink as untracked; excluded that local dependency link and rebuilt cleanly before deployment.",
+    "First immediate custom-domain verification still saw the old manifest during propagation. Later exact asset/manifest verification passed; final smoke asserted the new commit and main script.",
+    "Mini compressed files verified as raw HTTP bytes."
+  ],
+  "scope": "Frontend only. No hub, CLI, schema, network/Tailscale or Air changes; Air preview stays retired.",
+  "team": "UI and cache-qa accepted and retired. API remains assigned to separate unfinished history plan; lead and database handler remain available."
+}

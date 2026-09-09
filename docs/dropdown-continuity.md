@@ -56,8 +56,10 @@ QA's bare-form control experiments (#674, #677) found that both headed and
 headless automation could open native menus but could not reliably commit or
 dismiss them with keyboard input. Retain that evidence separately from product
 results. Pointer-open state, node continuity and outside dismissal remain
-observable; native keyboard commit and Escape require additional evidence before
-release acceptance. Shared-helper tests do not replace that browser evidence.
+observable. Native keyboard commit and Escape remain unverified; shared-helper
+tests do not replace that browser evidence. Lead decision #776 accepted this
+coverage limitation for release and removed the earlier manual gate. No human
+verification is claimed.
 
 ## Candidate evidence
 
@@ -81,11 +83,21 @@ lead integrated the identical correction in `tests/hub-cache-browser.mjs`.
 This was a test fixture gap, not a dropdown regression. Diagnostic logs and the
 passing companion remain under `.build/dropdown-continuity/`.
 
-A candidate static build updated `dist-static`, which the existing Mini preview
-serves. TailOS has not been deployed for this change. Final release acceptance
-and native keyboard evidence remain pending.
+Release order `wi_b1d07b59cdf519eb-release-1` (#778) deployed combined application
+`fd8d10273a46877b6bd7a6eb0c1dd9b2bc228bce` to TailOS
+(`https://14bee768.tailos.pages.dev`) and Mini on September 9. Both origins match
+all 81 served asset hashes and manifest SHA-256
+`ec83e3e7faf22b7c15d9c5e499cb0db579537513f4c8669bf39d7e06dc401e2d`.
+Public Chromium verified the new commit/main script, real WASM and restoration
+of an isolated local vault without uncaught errors. All synthetic manual-session
+processes, listeners and temporary state were cleaned up (#780). UI and QA were
+accepted and retired. Native keyboard coverage remains unverified and explicitly
+accepted as a limitation (#776), not a failed test or claimed manual pass.
+
+See [the release receipt](releases/tailos-2026-09-09-dropdown-dispatch.json) for
+separate bug/order associations, verification and retained rollback packages.
 
 This work excludes the separate bug-creation/edit-history request, narrative/AIV
-features, server/CLI changes and dependency upgrades. Deployment requires a later
-recorded release order after acceptance. Current frontend targets are TailOS and
+features, server/CLI changes and dependency upgrades. The completed frontend release is recorded separately from those items.
+Current frontend targets are TailOS and
 Mini preview; Air's preview remains intentionally retired.
