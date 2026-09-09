@@ -1,5 +1,35 @@
 # Development handoff — September 9, 2026
 
+## September 9 Board history scroll stability — release verified pending final acceptance
+
+Application commit `c8a7552b84460b6ba06dcb0561460a109f2bf5e0` is deployed to
+`https://tailos.tailarr.com` (`https://123605a6.tailos.pages.dev`, deployment
+`123605a6-bf6e-4c57-9271-04cd349eb4af`) and served by the unchanged Mini
+preview PID 28664 at `http://127.0.0.1:4318`. All three origins match the
+retained package's 81 served files and manifest SHA-256
+`c239f7bf341b23cb4266cd4bcdd97b03912a6b5a2b71f8739538a30edb2bb489`.
+Real Chromium on TailOS and Mini started production WASM, restored an isolated
+synthetic vault/key, preserved matching layout margins and reported no page
+errors.
+
+Board refreshes now preserve the first visible immutable message and its exact
+intra-row offset instead of reusing an absolute `scrollTop`. Prepending history,
+read updates, incoming messages and an owner send no longer displace a reader
+who is away from the bottom; a viewport within the existing 60-pixel follow zone
+still follows new content. Composer and structured-decision drafts remain intact.
+The focused integrated-source fixture passes in Chromium and WebKit; 128 unit
+tests plus the real isolated-hub composer and full decision browser suites also
+pass in both engines.
+
+Bug `wi_a1b959960975589a` revision 3 and bounded order #1167 are documented in
+[the implementation report](board-scroll.md) and
+[the release receipt](releases/tailos-2026-09-09-board-scroll.json). The clean
+source/package is retained at `.build/releases/board-scroll-c8a7552`. Rollback
+is the retained Safari-mitigation package `.build/releases/safari-css-37bfbd2`
+and deployment `https://a2069721.tailos.pages.dev`. Neither hub, CLI, schema,
+Tailscale, TrueNAS, relays, Air preview, the old site, live tasks/profiles nor
+agent sessions changed.
+
 ## September 9 Safari stylesheet recovery — mitigation released, cache rule blocked
 
 Work item `wi_2d5111fd8c42d8e7`, bounded order #1082 and cache-delivery

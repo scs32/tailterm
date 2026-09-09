@@ -1,0 +1,153 @@
+{
+  "status": "builder_release_verified_pending_final_acceptance",
+  "recordedAt": "2026-09-09T22:12:43Z",
+  "workItem": {
+    "id": "wi_a1b959960975589a",
+    "revision": 3,
+    "ownerMessage": 1116,
+    "workOrder": {
+      "id": "wi_a1b959960975589a-board-scroll-1",
+      "message": 1167
+    },
+    "candidateResultMessages": [1190, 1191],
+    "leadCandidateAcceptanceMessage": 1193,
+    "handlerCandidateConfirmationMessage": 1194
+  },
+  "source": {
+    "base": "310130f0b4564ab38dd796b4d2fd18247a6f7647",
+    "acceptedBuilderCandidate": "1e3ab79be2f3318ee8b721c7a717ae1d4f20c17a",
+    "integratedApplicationCommit": "c8a7552b84460b6ba06dcb0561460a109f2bf5e0",
+    "integration": "Cherry-picked without conflict into a clean tasks-hub checkout; client/board-view.js, tests/board-scroll-browser.mjs and docs/board-scroll.md were byte-identical to the accepted candidate.",
+    "files": [
+      "client/board-view.js",
+      "tests/board-scroll-browser.mjs",
+      "docs/board-scroll.md"
+    ]
+  },
+  "diagnosis": {
+    "cause": "Whole-thread DOM replacement reapplied an absolute scrollTop, which did not preserve the reader's content anchor when earlier content was inserted or changed height.",
+    "before": "The isolated Chromium baseline changed the top visible message from #31 to #11 after prepending 20 older messages.",
+    "correction": "Capture the first visible immutable message and intra-row offset before replacement, then restore that anchor after rendering. Keep the existing less-than-60-pixel bottom-follow zone and numeric fallback when an anchor leaves the bounded window."
+  },
+  "package": {
+    "worktree": "/Users/stephenspeicher/projects/tailterm/.build/releases/board-scroll-c8a7552",
+    "commit": "c8a7552b84460b6ba06dcb0561460a109f2bf5e0",
+    "cleanSource": true,
+    "manifestEntries": 82,
+    "servedAssetsPerOrigin": 81,
+    "releaseSha256": "c239f7bf341b23cb4266cd4bcdd97b03912a6b5a2b71f8739538a30edb2bb489",
+    "buildCommands": [
+      "npm run build:wasm",
+      "npm run build:static",
+      "npm run verify:release"
+    ],
+    "verifyResult": "82/82 manifest entries passed",
+    "assets": {
+      "mainScript": {
+        "path": "assets/index-pOG8b-C3.js",
+        "size": 805022,
+        "sha256": "f22738d1cef070f5592d29aecc1e3054cd91f778f22c23d01f48748c4c529b79"
+      },
+      "stylesheet": {
+        "path": "assets/index-Bkm6l0FY.css",
+        "size": 94771,
+        "sha256": "ee70f291a094abe1bff819c0c2b789bb9f594c3b836284483cad719f9f9d9cf1"
+      },
+      "productionWasmGzip": {
+        "path": "assets/tailserve-BxE9iBHL.wasm.gz",
+        "size": 8598267,
+        "sha256": "13cd5183f59fdefdf2936367b02118657ab26895604ad51af05377b2598afc38"
+      }
+    }
+  },
+  "tailos": {
+    "origin": "https://tailos.tailarr.com",
+    "cloudflareProject": "tailos",
+    "branch": "main",
+    "deploymentId": "123605a6-bf6e-4c57-9271-04cd349eb4af",
+    "deployment": "https://123605a6.tailos.pages.dev",
+    "commit": "c8a7552b84460b6ba06dcb0561460a109f2bf5e0",
+    "verifiedAssets": 81,
+    "releaseSha256": "c239f7bf341b23cb4266cd4bcdd97b03912a6b5a2b71f8739538a30edb2bb489",
+    "assetVerification": "The immutable deployment and custom domain each matched release.json and all 81 served file hashes.",
+    "mime": {
+      "releaseJson": "200 application/json",
+      "mainScript": "200 application/javascript",
+      "stylesheet": "200 text/css; charset=utf-8",
+      "productionWasmGzip": "200 application/gzip; no Content-Encoding"
+    },
+    "observedCustomDomainCache": "release.json no-cache; hashed JS/CSS/WASM max-age=14400 from the separately documented external override"
+  },
+  "miniPreview": {
+    "origin": "http://127.0.0.1:4318",
+    "servedDirectory": "/Users/stephenspeicher/projects/tailterm/dist-static",
+    "activation": "rsync -a --delete from the exact retained package",
+    "commit": "c8a7552b84460b6ba06dcb0561460a109f2bf5e0",
+    "verifiedAssets": 81,
+    "releaseSha256": "c239f7bf341b23cb4266cd4bcdd97b03912a6b5a2b71f8739538a30edb2bb489",
+    "mime": {
+      "releaseJson": "200 application/json; charset=utf-8",
+      "mainScript": "200 text/javascript; charset=utf-8",
+      "stylesheet": "200 text/css; charset=utf-8",
+      "productionWasmGzip": "200 application/gzip; no Content-Encoding"
+    },
+    "listener": {
+      "pidBefore": 28664,
+      "pidAfter": 28664,
+      "command": "node scripts/preview-static.mjs dist-static 127.0.0.1 4318",
+      "restarted": false
+    }
+  },
+  "browserAcceptance": {
+    "deployedBrowser": "Real Chromium on TailOS and Mini started production WASM, generated and restored an isolated synthetic local vault/key, retained matching margins and reported no page errors.",
+    "focusedBoardScroll": "The retained integrated source passed exact message/intra-row anchor, read update, incoming/own-send, near-bottom follow and composer/decision draft checks in Chromium and WebKit.",
+    "screenshots": {
+      "tailos": ".build/board-scroll-release/tailos-layout.png",
+      "mini": ".build/board-scroll-release/mini-layout.png",
+      "sharedSha256": "dee008e5bb73ff69cb91fb1e43b1dc1241bc26b73201661e1427f62041b71664"
+    },
+    "nativeSafari": "Not run; Playwright WebKit is not reported as native Safari."
+  },
+  "verification": {
+    "builder": [
+      "npm test: 128/128 passed",
+      "node tests/board-compose-browser.mjs: Chromium and WebKit passed",
+      "node tests/board-decisions-browser.mjs: Chromium and WebKit passed",
+      "focused Board-scroll Chromium and WebKit passed",
+      "Prettier and git diff checks passed"
+    ],
+    "release": [
+      "Clean retained production WASM/static build and 82-entry release verification passed",
+      "TailOS immutable origin, custom domain and Mini matched 81/81 served hashes and release.json",
+      "Status and MIME checks passed on all three origins",
+      "Deployed production Chromium smoke passed on TailOS and Mini",
+      "Focused Board-scroll Chromium/WebKit rerun passed from retained integrated source"
+    ],
+    "postFixNonpasses": []
+  },
+  "rollback": {
+    "commit": "37bfbd25085ef1706d6893891471142ec03ce984",
+    "tailosDeploymentId": "a2069721-e7f0-4e37-a58f-63d9cf0579ad",
+    "tailosDeployment": "https://a2069721.tailos.pages.dev",
+    "retainedPackage": "/Users/stephenspeicher/projects/tailterm/.build/releases/safari-css-37bfbd2/dist-static",
+    "releaseSha256": "84d3600051f20e1d3efd7e0d7307202bbca863c4d5807ac36eb5c6fc8609d2cc",
+    "verifyResult": "82 manifest entries passed before release",
+    "procedure": "Deploy the exact retained package explicitly to Cloudflare project tailos, then rsync it to Mini without restarting listener 28664.",
+    "warning": "Rollback removes the Board scroll fix and retains the previously documented custom-domain cache override limitation."
+  },
+  "cleanup": {
+    "browserContextsClosed": true,
+    "focusedFixtureServerClosed": true,
+    "miniListenerRestarted": false,
+    "temporaryReleaseCheckout": "Retained as the authorized clean source/package and not removed."
+  },
+  "excluded": [
+    "https://tailterm.tailarr.com",
+    "Air preview",
+    "hub, CLI, database or schema",
+    "Tailscale, TrueNAS networking or relays",
+    "live tasks or profiles",
+    "owner browser storage",
+    "agent sessions or lifecycle"
+  ]
+}
