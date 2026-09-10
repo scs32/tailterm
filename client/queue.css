@@ -1,41 +1,103 @@
-.queue-layout {
+#mode-view .queue-view.mode-board {
+  width: 100%;
+  max-width: none;
+  min-width: 0;
+  margin: 0;
+}
+
+body[data-mode="queue"] #mode-view {
+  overflow: hidden;
+}
+
+#mode-view .queue-view > .queue-main {
+  min-width: 0;
+  overflow: auto;
+}
+
+#mode-view .queue-view .board-rail [data-queue-task] {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 3px;
+  width: 100%;
+  max-width: 100%;
+  min-height: 44px;
+  padding: 7px 8px;
+  margin: 0;
+  text-align: left;
+  white-space: normal;
+}
+
+#mode-view .queue-view .board-rail [data-queue-task] > span {
+  display: block;
+  min-width: 0;
+  max-width: 100%;
+  overflow: visible;
+  text-overflow: clip;
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+
+#mode-view .queue-view .queue-layout {
   display: grid;
   grid-template-columns: minmax(210px, 0.8fr) minmax(280px, 1.2fr);
   gap: 14px;
+  width: 100%;
   min-height: 0;
+  min-width: 0;
 }
 
-.queue-list,
-.queue-detail,
+#mode-view .queue-view .queue-list,
+#mode-view .queue-view .queue-detail,
 .queue-history {
   display: grid;
   align-content: start;
   gap: 7px;
   min-width: 0;
+  max-width: 100%;
 }
 
-.queue-row {
+#mode-view .queue-view .queue-row {
   display: flex;
+  align-items: flex-start;
   justify-content: space-between;
   gap: 10px;
+  width: 100%;
+  max-width: 100%;
+  min-width: 0;
   height: auto !important;
   padding: 8px;
   text-align: left;
+  white-space: normal;
+  overflow-wrap: anywhere;
 }
 
-.queue-row > span {
+#mode-view .queue-view .queue-row > span {
   display: grid;
   gap: 3px;
   min-width: 0;
+  max-width: 100%;
 }
 
-.queue-row > span:last-child {
+#mode-view .queue-view .queue-row > span:first-child {
+  flex: 1 1 auto;
+}
+
+#mode-view .queue-view .queue-row > span:last-child {
+  flex: 0 0 auto;
+  max-width: 35%;
   text-align: right;
 }
 
-.queue-row small {
-  color: var(--muted);
+#mode-view .queue-view .queue-row :is(strong, small) {
+  min-width: 0;
+  max-width: 100%;
+  white-space: normal;
   overflow-wrap: anywhere;
+}
+
+#mode-view .queue-view .queue-row small {
+  color: var(--muted);
 }
 
 .queue-row[aria-pressed="true"] {
@@ -45,13 +107,28 @@
   );
 }
 
-.queue-detail {
+#mode-view .queue-view .queue-detail {
   padding: 2px 0 20px;
 }
 
-.queue-detail :is(h3, p) {
+#mode-view .queue-view .queue-detail > header {
+  display: grid;
+  align-items: start;
+  gap: 3px;
+  min-width: 0;
+  height: auto;
+  min-height: 0;
+  padding: 0;
+  border: 0;
+}
+
+#mode-view .queue-view .queue-detail :is(h3, p) {
+  min-width: 0;
+  max-width: 100%;
   margin: 0;
+  white-space: normal;
   overflow-wrap: anywhere;
+  word-break: break-word;
 }
 
 .queue-markers,
@@ -126,16 +203,97 @@
   font-size: 11px;
 }
 
-.queue-history-toggle {
-  display: flex;
+#mode-view .queue-view .queue-history-toggle {
+  display: inline-flex;
+  flex: 0 0 auto;
   align-items: center;
   gap: 6px;
+  width: auto;
+  max-width: 100%;
+  margin: 0;
   font-size: 12px;
+  white-space: normal;
 }
 
-@media (max-width: 700px) {
-  .queue-layout,
+#mode-view .queue-view .queue-history-toggle input[type="checkbox"] {
+  flex: 0 0 14px;
+  width: 14px;
+  min-width: 14px;
+  height: 14px;
+  padding: 0;
+  margin: 0;
+  accent-color: var(--accent);
+}
+
+#mode-view .queue-view .queue-history-toggle span {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+@media (max-width: 760px) {
+  body[data-mode="queue"] #workspace {
+    display: flex;
+    flex-direction: column;
+    height: var(--visible-height, 100dvh);
+    min-height: 0;
+    overflow: hidden;
+  }
+
+  body[data-mode="queue"] #workspace > aside {
+    display: none;
+  }
+
+  body[data-mode="queue"] #workspace > main {
+    display: flex;
+    flex: 1;
+    flex-direction: column;
+    min-height: 0;
+    padding: 6px;
+  }
+
+  #mode-view .queue-view.mode-board {
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-rows: auto minmax(0, 1fr);
+  }
+
+  #mode-view .queue-view > .board-rail {
+    flex-direction: row;
+    flex-wrap: nowrap;
+    align-items: center;
+    max-height: 108px;
+    margin-bottom: 10px;
+    padding: 0 0 8px;
+    overflow-x: auto;
+  }
+
+  #mode-view .queue-view .board-rail-head {
+    flex: 0 0 auto;
+    padding: 0 8px;
+    margin: 0;
+  }
+
+  #mode-view .queue-view .board-rail [data-queue-task] {
+    flex: 0 0 auto;
+    width: 170px;
+    max-width: 170px;
+    min-width: 140px;
+    margin: 0;
+  }
+
+  #mode-view .queue-view .board-rail .board-task-name {
+    display: -webkit-box;
+    max-height: 36px;
+    overflow: hidden;
+    -webkit-box-orient: vertical;
+    -webkit-line-clamp: 2;
+  }
+
+  #mode-view .queue-view .queue-layout,
   .queue-recovery {
-    grid-template-columns: 1fr;
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  #mode-view .queue-view .queue-history-toggle {
+    justify-content: flex-start;
   }
 }
