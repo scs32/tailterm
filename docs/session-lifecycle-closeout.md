@@ -5,6 +5,11 @@ Work item `wi_af4cb8d286da4163` revision 2, bounded work order #1304
 candidate is `2b4c4f96fddabb524cdc1ebb4100c21952abf36e`, based on
 `d102ab01b085677eea92c8b4411cb2f9119272c2`.
 
+After lead acceptance, the implementation was replayed without conflict onto
+released scrolling base `fb37de22235125e5d4dae96870c9688507c40657` as
+`c18dfaf2ea60dee6372706cc92759778d2dcd8c8`. Release artifacts use this
+integrated source line and therefore preserve the scrolling release.
+
 ## Behavior
 
 An implementation worker session belongs to one bug or feature. After its result
