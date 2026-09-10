@@ -45,7 +45,7 @@ All fixtures used temporary SQLite databases, private tmux sockets and disposabl
 browser contexts. No live task/profile data, runtime transcripts or the handler's
 operational eligibility audit were used.
 
-- `npm test`: 132/132 passed.
+- `npm test`: 133/133 passed on the integrated scrolling baseline.
 - `node tests/task-form-browser.mjs`: Chromium and WebKit passed. The isolated
   real hub/CLI path kept the parent open, displayed and retried one absent closed
   worker, saved its receipt, then preserved that receipt through later task
