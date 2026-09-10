@@ -9,6 +9,8 @@ After lead acceptance, the implementation was replayed without conflict onto
 released scrolling base `fb37de22235125e5d4dae96870c9688507c40657` as
 `c18dfaf2ea60dee6372706cc92759778d2dcd8c8`. Release artifacts use this
 integrated source line and therefore preserve the scrolling release.
+The final revision-3 application commit is
+`9c7bb254a590c073e9a1f6901757dc7448a7478c`.
 
 ## Behavior
 
@@ -88,5 +90,8 @@ and the detached replacement. The handler saved this evidence and the bounded
 descendant-service guidance amendment as work-item revision 3 in #1368.
 
 The final source, deployment identities, backup/rollback evidence, hashes and
-per-agent receipt inventory are recorded in the release receipt after rebuilding
-and reverifying the revision-3 guidance. The old PID is not claimed as preserved.
+per-agent receipt inventory are recorded in the release receipt. The revision-3
+guidance was rebuilt and reverified on every changed component. The old PID is
+not claimed as preserved.
+See
+[the release and cleanup receipt](releases/tailos-2026-09-09-lifecycle-closeout.json).

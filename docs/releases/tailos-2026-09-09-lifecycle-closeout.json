@@ -1,0 +1,426 @@
+{
+  "status": "builder_release_verified_pending_final_acceptance",
+  "recordedAt": "2026-09-10T03:33:38Z",
+  "workItem": {
+    "id": "wi_af4cb8d286da4163",
+    "revision": 3,
+    "ownerMessage": 1297,
+    "workOrder": {
+      "id": "wi_af4cb8d286da4163-lifecycle-closeout-1",
+      "message": 1304
+    },
+    "candidateHandoffMessage": 1346,
+    "handlerCandidateVerificationMessage": 1347,
+    "leadCandidateAcceptanceAndReleaseMessage": 1349,
+    "descendantServiceAmendmentMessage": 1366,
+    "handlerAmendmentReadbackMessage": 1368
+  },
+  "source": {
+    "releaseBase": "fb37de22235125e5d4dae96870c9688507c40657",
+    "acceptedBuilderImplementation": "2b4c4f96fddabb524cdc1ebb4100c21952abf36e",
+    "integratedImplementationCommit": "c18dfaf2ea60dee6372706cc92759778d2dcd8c8",
+    "firstOperationalReleaseCommit": "1d9d75dfeab32c554ad61988820a292077fc59e2",
+    "finalApplicationCommit": "9c7bb254a590c073e9a1f6901757dc7448a7478c",
+    "integration": "The accepted lifecycle implementation was rebased without conflict onto the exact released items-scroll base. The later revision-3 commit adds only lead-directed descendant-service guidance, its generated-template coverage and actual operational evidence.",
+    "retainedCleanSource": "/Users/stephenspeicher/projects/tailterm/.build/releases/lifecycle-closeout-9c7bb25",
+    "cleanSource": true,
+    "implementationReport": "docs/session-lifecycle-closeout.md"
+  },
+  "package": {
+    "worktree": "/Users/stephenspeicher/projects/tailterm/.build/releases/lifecycle-closeout-9c7bb25",
+    "commit": "9c7bb254a590c073e9a1f6901757dc7448a7478c",
+    "manifestEntries": 82,
+    "servedAssetsPerOrigin": 81,
+    "releaseSha256": "de5186514dc4dbf82eebb10605ebac9657222d8f0cc8cdb3f9fd20500921b656",
+    "verifyResult": "82/82 manifest entries passed from clean source",
+    "assets": {
+      "mainScript": {
+        "path": "assets/index-BrlO6t2X.js",
+        "size": 810423,
+        "sha256": "25e824ecaf7a90eef3a891d0153c67d76c796f1279798633b9794e6b63b3bd0e"
+      },
+      "stylesheet": {
+        "path": "assets/index-Bkm6l0FY.css",
+        "size": 94771,
+        "sha256": "ee70f291a094abe1bff819c0c2b789bb9f594c3b836284483cad719f9f9d9cf1"
+      },
+      "productionWasmGzip": {
+        "path": "assets/tailserve-UGa8_OEn.wasm.gz",
+        "size": 8598268,
+        "sha256": "ea63e2e3bee467e17095151bb40cae164113b587d7fa525f62b9584a04200b4a"
+      }
+    }
+  },
+  "hub": {
+    "state": "RUNNING",
+    "origin": "http://100.116.238.37:18765",
+    "release": "20260909-lifecycle-closeout-1d9d75d",
+    "binary": "/mnt/deepfreeze/tailterm-hub/releases/20260909-lifecycle-closeout-1d9d75d/tailterm-hub",
+    "binarySha256": "f55018914dd7fa0b3eb454c452c1cae4749ce6b297ffddca3ce8e77c41d66d18",
+    "listener": "100.116.238.37:18765:18765",
+    "containers": 1,
+    "integrity": "ok",
+    "foreignKeyViolations": 0,
+    "deployment": "Source-inspected scripts/deploy-truenas-hub.py with the explicit release name and --update through TrueNAS middleware. The final guidance-only source builds the identical hub hash, so the healthy binary was not redundantly redeployed.",
+    "previousBinary": "/mnt/deepfreeze/tailterm-hub/releases/20260909-context-admission-03129ac/tailterm-hub",
+    "previousBinarySha256": "f561f7743454e956e9da3bafedea083682ef08008bb84a7ca99e5210b48fe8ae"
+  },
+  "backup": {
+    "path": "/mnt/deepfreeze/tailterm-hub/backups/before-lifecycle-closeout-20260910T031106Z.sqlite",
+    "method": "SQLite online backup API before middleware update",
+    "mode": "0600",
+    "owner": "950:950",
+    "size": 9195520,
+    "sha256": "7b14240c4a0ee41e9d63414ba77a9282d339e900e42061a8229671598d201d7d",
+    "integrity": "ok",
+    "foreignKeyViolations": 0
+  },
+  "cli": {
+    "darwinArm64Sha256": "6ad14fa7e8562b782faf2632e878f2371c5f66c69b70610ec93884fb37c6ed29",
+    "linuxAmd64Sha256": "6e32ba87e5503f4d0454cdc2fdb785ceb6d8d01cc6c0d90a5a9d0174ac0a89d1",
+    "linuxArm64Sha256": "455bdefcf2f7810461770eab36e3afe97fd0bcffcdc758836c6c97980367fa36",
+    "hosts": [
+      {
+        "host": "Stephens-Mini",
+        "installed": "/Users/stephenspeicher/.local/bin/tt",
+        "installedSha256": "6ad14fa7e8562b782faf2632e878f2371c5f66c69b70610ec93884fb37c6ed29",
+        "rollback": "/Users/stephenspeicher/.local/bin/tt-before-lifecycle-closeout-9c7bb25",
+        "rollbackSha256": "f1a795a887da41196f724eb1b081c0fb7b1237072fd34b8349683aa91fc25788",
+        "preFeatureRollback": "/Users/stephenspeicher/.local/bin/tt-before-lifecycle-closeout-1d9d75d",
+        "preFeatureRollbackSha256": "d07329684ef558d61737bcbf81bf7aa61271263190d303f8c008b4ebef6cfe0e",
+        "doctor": "passed",
+        "relayPidBefore": 83457,
+        "relayPidAfter": 83457,
+        "relayRestarted": false
+      },
+      {
+        "host": "theAir",
+        "installed": "/Users/stephenspeicher/.local/bin/tt",
+        "installedSha256": "6ad14fa7e8562b782faf2632e878f2371c5f66c69b70610ec93884fb37c6ed29",
+        "rollback": "/Users/stephenspeicher/.local/bin/tt-before-lifecycle-closeout-9c7bb25",
+        "rollbackSha256": "f1a795a887da41196f724eb1b081c0fb7b1237072fd34b8349683aa91fc25788",
+        "preFeatureRollback": "/Users/stephenspeicher/.local/bin/tt-before-lifecycle-closeout-1d9d75d",
+        "preFeatureRollbackSha256": "d07329684ef558d61737bcbf81bf7aa61271263190d303f8c008b4ebef6cfe0e",
+        "doctor": "passed",
+        "relayPidBefore": 912,
+        "relayPidAfter": 912,
+        "relayRestarted": false
+      }
+    ]
+  },
+  "tailos": {
+    "origin": "https://tailos.tailarr.com",
+    "cloudflareProject": "tailos",
+    "branch": "main",
+    "deploymentId": "45be5874-b3de-4e27-bf11-b8fecb93ab34",
+    "deployment": "https://45be5874.tailos.pages.dev",
+    "commit": "9c7bb254a590c073e9a1f6901757dc7448a7478c",
+    "verifiedAssets": 81,
+    "releaseSha256": "de5186514dc4dbf82eebb10605ebac9657222d8f0cc8cdb3f9fd20500921b656",
+    "mime": {
+      "releaseJson": "200 application/json",
+      "mainScript": "200 application/javascript",
+      "stylesheet": "200 text/css; charset=utf-8",
+      "productionWasmGzip": "200 application/gzip; no Content-Encoding"
+    },
+    "observedCustomDomainCache": "release.json no-cache; hashed JavaScript, CSS and WASM max-age=14400"
+  },
+  "miniPreview": {
+    "origin": "http://127.0.0.1:4318",
+    "servedDirectory": "/Users/stephenspeicher/projects/tailterm/dist-static",
+    "activation": "rsync -a --delete from the exact retained package",
+    "commit": "9c7bb254a590c073e9a1f6901757dc7448a7478c",
+    "verifiedAssets": 81,
+    "releaseSha256": "de5186514dc4dbf82eebb10605ebac9657222d8f0cc8cdb3f9fd20500921b656",
+    "listener": {
+      "originalPid": 28664,
+      "interruptedByApprovedItemsScrollCloseout": true,
+      "restoredPid": 60799,
+      "restoredPpid": 1,
+      "command": "node scripts/preview-static.mjs dist-static 127.0.0.1 4318",
+      "finalPackageSyncRestartedListener": false
+    },
+    "mime": {
+      "releaseJson": "200 application/json; charset=utf-8",
+      "mainScript": "200 text/javascript; charset=utf-8",
+      "stylesheet": "200 text/css; charset=utf-8",
+      "productionWasmGzip": "200 application/gzip; no Content-Encoding"
+    }
+  },
+  "browserAcceptance": {
+    "result": "Fresh Chromium contexts on TailOS and Mini started production WASM, generated and restored an isolated synthetic local vault/key, retained matching margins and reported no page errors. Mini passed both before its interruption and after detached recovery; the final revision-3 package passed on both origins.",
+    "screenshots": {
+      "tailos": ".build/releases/lifecycle-closeout-9c7bb25/.build/lifecycle-closeout-release/tailos/deployed-layout-preview.png",
+      "mini": ".build/releases/lifecycle-closeout-9c7bb25/.build/lifecycle-closeout-release/mini/deployed-layout-preview.png",
+      "sharedSha256": "dee008e5bb73ff69cb91fb1e43b1dc1241bc26b73201661e1427f62041b71664"
+    }
+  },
+  "individualCleanup": {
+    "authorization": {
+      "firstSixteen": 1311,
+      "itemsScrollAddition": 1339,
+      "itemsScrollHandlerDoneEvidence": 1340,
+      "releaseSlot": 1349
+    },
+    "parentProject": "open",
+    "preflight": "All 17 current roster run IDs matched the approved exact runs. Every tmux session matched its hub/task/agent/run metadata, stable session ID and creation time immediately before closeout.",
+    "receipts": [
+      {
+        "name": "ui",
+        "agentId": "agt_7fd57e22184c0e25",
+        "runId": "run_942093664f724f4b",
+        "tmuxId": "$24",
+        "tmuxCreated": "1788876994",
+        "classification": "lead-adjudicated legacy unbound release; no fabricated item binding",
+        "status": "closed",
+        "cleanupDone": true
+      },
+      {
+        "name": "api",
+        "agentId": "agt_80f15fe9d6fae0ce",
+        "runId": "run_e924ea8935a4a630",
+        "tmuxId": "$25",
+        "tmuxCreated": "1788876994",
+        "classification": "lead-adjudicated legacy unbound release",
+        "status": "closed",
+        "cleanupDone": true
+      },
+      {
+        "name": "qa",
+        "agentId": "agt_63300bb8642deda0",
+        "runId": "run_dad00cbcb78116c1",
+        "tmuxId": "$26",
+        "tmuxCreated": "1788876995",
+        "classification": "lead-adjudicated legacy cancellation before retrieval; not a QA pass",
+        "status": "closed",
+        "cleanupDone": true
+      },
+      {
+        "name": "discord-research",
+        "agentId": "agt_5f76794823cdd84a",
+        "runId": "run_4a1f4450158683e0",
+        "tmuxId": "$27",
+        "tmuxCreated": "1788877311",
+        "classification": "accepted legacy research handoff without item binding",
+        "status": "closed",
+        "cleanupDone": true
+      },
+      {
+        "name": "cache-qa",
+        "agentId": "agt_583cb27082114c6c",
+        "runId": "run_bc76ca76447f0680",
+        "tmuxId": "$28",
+        "tmuxCreated": "1788892711",
+        "classification": "lead-adjudicated legacy unbound release; synthetic fixtures already cleaned",
+        "status": "closed",
+        "cleanupDone": true
+      },
+      {
+        "name": "item-routing",
+        "agentId": "agt_e1ac3361d9cf36a2",
+        "runId": "run_47204d108e111fd6",
+        "tmuxId": "$30",
+        "tmuxCreated": "1788975276",
+        "classification": "lead-adjudicated legacy unbound release",
+        "status": "closed",
+        "cleanupDone": true
+      },
+      {
+        "name": "board-enter",
+        "agentId": "agt_d052bf4cad8facf4",
+        "runId": "run_7ca136f79198d47d",
+        "tmuxId": "$31",
+        "tmuxCreated": "1788975360",
+        "classification": "lead-adjudicated legacy unbound release",
+        "status": "closed",
+        "cleanupDone": true
+      },
+      {
+        "name": "orchestrator-role",
+        "agentId": "agt_5c53d70b0cdd5fce",
+        "runId": "run_3cd3634541f41b2a",
+        "tmuxId": "$32",
+        "tmuxCreated": "1788975361",
+        "classification": "lead-adjudicated legacy unbound release",
+        "status": "closed",
+        "cleanupDone": true
+      },
+      {
+        "name": "board-enter-qa",
+        "agentId": "agt_81f8d3a12885663e",
+        "runId": "run_d521f3e70f46cca4",
+        "tmuxId": "$33",
+        "tmuxCreated": "1788976786",
+        "classification": "lead-adjudicated legacy unbound release",
+        "status": "closed",
+        "cleanupDone": true
+      },
+      {
+        "name": "safari-css",
+        "agentId": "agt_6d15ddd260a63fcf",
+        "runId": "run_6625d75ad03d15d6",
+        "tmuxId": "$34",
+        "tmuxCreated": "1788984826",
+        "classification": "failed pre-work identity superseded by retry; no implementation completion claim",
+        "status": "closed",
+        "cleanupDone": true
+      },
+      {
+        "name": "safari-css-retry",
+        "agentId": "agt_e2b7b3fe36c10994",
+        "runId": "run_c291068fae9c2037",
+        "tmuxId": "$35",
+        "tmuxCreated": "1788984999",
+        "classification": "exact-bound accepted completed worker",
+        "status": "closed",
+        "cleanupDone": true
+      },
+      {
+        "name": "status-filter",
+        "agentId": "agt_cf20265abe5978b4",
+        "runId": "run_29d82f96ae2d5b07",
+        "tmuxId": "$36",
+        "tmuxCreated": "1788990448",
+        "classification": "exact-bound accepted completed worker",
+        "status": "closed",
+        "cleanupDone": true
+      },
+      {
+        "name": "activity-notices",
+        "agentId": "agt_4c74d6915929bf82",
+        "runId": "run_a44d631841c15420",
+        "tmuxId": "$37",
+        "tmuxCreated": "1788990448",
+        "classification": "exact-bound accepted completed worker",
+        "status": "closed",
+        "cleanupDone": true
+      },
+      {
+        "name": "board-scroll",
+        "agentId": "agt_36e81f794d328a84",
+        "runId": "run_711a69f7bd2dd125",
+        "tmuxId": "$38",
+        "tmuxCreated": "1788990448",
+        "classification": "exact-bound replaced completed worker identity",
+        "status": "closed",
+        "cleanupDone": true
+      },
+      {
+        "name": "context-admission",
+        "agentId": "agt_f298523708f279f1",
+        "runId": "run_0c316169dc3bc777",
+        "tmuxId": "$39",
+        "tmuxCreated": "1788999923",
+        "classification": "exact-bound accepted completed worker",
+        "status": "closed",
+        "cleanupDone": true
+      },
+      {
+        "name": "board-scroll-followup",
+        "agentId": "agt_2905525a6ade3b74",
+        "runId": "run_b101f40faeeb7c68",
+        "tmuxId": "$41",
+        "tmuxCreated": "1789002694",
+        "classification": "exact-bound accepted replacement worker",
+        "status": "closed",
+        "cleanupDone": true
+      },
+      {
+        "name": "items-scroll",
+        "agentId": "agt_737511ac2742b590",
+        "runId": "run_7e44dd56b37872af",
+        "tmuxId": "$42",
+        "tmuxCreated": "1789006374",
+        "classification": "handler-confirmed Done and lead-approved completed worker",
+        "status": "closed",
+        "cleanupDone": true
+      }
+    ],
+    "confirmedReceipts": 17,
+    "failedReceipts": 0,
+    "approvedTmuxSessionsRemaining": 0,
+    "historyPreserved": true,
+    "independentLeadVerificationMessage": 1366,
+    "protectedAfterCleanup": [
+      {
+        "name": "lead",
+        "agentId": "agt_1186df8d710c0fd7",
+        "runId": "run_9e0ddb28df5ae63e"
+      },
+      {
+        "name": "db-handler",
+        "agentId": "agt_3760a4361c514a03",
+        "runId": "run_2dd77d68cb7bcb39"
+      },
+      {
+        "name": "narrative-history",
+        "agentId": "agt_ea578e8df86512b0",
+        "runId": "run_af3bded54f70a108"
+      },
+      {
+        "name": "lifecycle-closeout",
+        "agentId": "agt_553012a7f2e4fc04",
+        "runId": "run_1d01e13ffaefe0fa"
+      },
+      {
+        "name": "dropdown-dialog",
+        "agentId": "agt_f2480b3dad177ffe",
+        "runId": "run_1f75adf6a0690df3"
+      }
+    ]
+  },
+  "verification": {
+    "passed": [
+      "JavaScript unit suite 133/133",
+      "Chromium and WebKit isolated task-form lifecycle path",
+      "full store and server Go packages",
+      "focused exact-close, cleanup, protection, ambiguity, retirement and generated-briefing CLI tests",
+      "race detector on full store/server and focused CLI paths",
+      "go vet ./...",
+      "82-entry clean static manifest verification",
+      "81/81 served assets, status, MIME and no-Content-Encoding on immutable TailOS, custom TailOS and Mini",
+      "production Chromium WASM, isolated synthetic-vault restoration and layout on TailOS and Mini",
+      "Mini and Air CLI doctor",
+      "hub RUNNING with exact hash, integrity OK and zero foreign-key violations",
+      "17/17 exact durable closeout receipts; open parent and five protected exact sessions survived"
+    ],
+    "knownBroadSuiteNonpasses": [
+      "The complete cmd/tt package is not claimed: pre-existing TestPostHumanReplyAndLiteralHelp route expectation and TestAskPreservesIdentityContextAndReplayPayload channel-send timeout reproduce outside closeout. Focused lifecycle tests pass."
+    ],
+    "operationalNonpassesAndCorrections": [
+      "The first hub build command guessed ./cmd/hub and failed before writing an artifact; the repository's actual ./cmd/tailterm-hub package then built and deployed successfully.",
+      "Python urllib received a 403 from the TailOS custom domain; raw curl with Accept */* performed the authoritative verification.",
+      "The first immutable asset verifier omitted redirect following for /index.html and observed the expected empty 308 response; rerunning with redirects verified all 81 assets.",
+      "A broad process preflight unintentionally matched an agent runtime and printed its launch arguments. No terminal scrollback, runtime transcript file, token, key, vault content or output was read or persisted; every later process check used an exact executable path or PID.",
+      "Approved items-scroll tmux closeout also terminated Mini preview PID 28664. The same exact package was restored immediately as detached PID 60799/PPID 1, then all assets and production browser acceptance passed again. Guidance and tests now require descendant-service inventory and handoff/detachment before closeout."
+    ],
+    "warnings": [
+      "npm ci reported three existing moderate audit findings and install-script approval notices; installation and all builds completed.",
+      "Vite reported its existing large-chunk advisory; the release build and manifest verification completed."
+    ]
+  },
+  "rollback": {
+    "immediateFrontendCommit": "1d9d75dfeab32c554ad61988820a292077fc59e2",
+    "immediateTailosDeploymentId": "65304106-907f-489e-895b-2128491c8e12",
+    "immediateTailosDeployment": "https://65304106.tailos.pages.dev",
+    "immediateRetainedPackage": "/Users/stephenspeicher/projects/tailterm/.build/releases/lifecycle-closeout-1d9d75d/dist-static",
+    "preFeatureFrontendCommit": "f59ce7c804b78a149689979e85a7bf1b2b50c620",
+    "preFeatureTailosDeploymentId": "35a9032e-babb-4159-b13a-3cae1f9bbac5",
+    "preFeatureTailosDeployment": "https://35a9032e.tailos.pages.dev",
+    "preFeatureRetainedPackage": "/Users/stephenspeicher/projects/tailterm/.build/releases/items-scroll-f59ce7c/dist-static",
+    "frontendProcedure": "Deploy the chosen exact retained package explicitly to Cloudflare project tailos, then rsync it to Mini without restarting detached listener 60799.",
+    "hubProcedure": "Use TrueNAS middleware to point the app to the retained context-admission binary while preserving current state; verify RUNNING, exact hash, listener and database integrity. The online snapshot is disaster-recovery evidence only and restoring it loses later writes.",
+    "cliProcedure": "Atomically restore the selected per-host rollback binary on Mini and Air; do not restart relays."
+  },
+  "excluded": [
+    "https://tailterm.tailarr.com and npm run deploy:static",
+    "Air webpage preview",
+    "Tailscale installation, configuration, restart or networking changes",
+    "relay restart",
+    "live task/profile fixtures or owner browser storage",
+    "parent project closure",
+    "unapproved agent-session cleanup",
+    "handler-owned /tmp/tailterm-lifecycle-audit-1301.json as test input",
+    "independent narrative-history and dropdown-dialog implementation"
+  ]
+}

@@ -1,5 +1,57 @@
 # Development handoff — September 9, 2026
 
+## September 9 per-agent lifecycle closeout — release verified pending final acceptance
+
+Application commit `9c7bb254a590c073e9a1f6901757dc7448a7478c` is deployed to
+`https://tailos.tailarr.com` (`https://45be5874.tailos.pages.dev`, deployment
+`45be5874-b3de-4e27-bf11-b8fecb93ab34`) and served by Mini preview PID 60799,
+PPID 1, at `http://127.0.0.1:4318`. All three origins match the 81 served files
+and release-manifest SHA-256
+`de5186514dc4dbf82eebb10605ebac9657222d8f0cc8cdb3f9fd20500921b656`.
+Fresh Chromium on TailOS and Mini started production WASM, restored an isolated
+synthetic vault/key, preserved matching layout margins and reported no page
+errors.
+
+The hub is running the exact final-source hub hash
+`f55018914dd7fa0b3eb454c452c1cae4749ce6b297ffddca3ce8e77c41d66d18`
+from versioned release `20260909-lifecycle-closeout-1d9d75d`; revision-3 changed
+only CLI/client instructions, so it builds the identical hub binary and was not
+redundantly redeployed. Database integrity and foreign keys pass. The pre-update
+online backup is mode 0600 at
+`/mnt/deepfreeze/tailterm-hub/backups/before-lifecycle-closeout-20260910T031106Z.sqlite`.
+Mini and Air run matching Darwin arm64 `tt` SHA-256
+`6ad14fa7e8562b782faf2632e878f2371c5f66c69b70610ec93884fb37c6ed29`;
+relay PIDs 83457 and 912 did not change.
+
+Individual closeout now binds durable closure intent to the exact current run,
+then verifies hub/task/agent/run plus tmux stable ID and creation time before
+termination. It works while the parent project remains open, supports renamed or
+absent sessions and retryable lost receipts, and preserves mismatched successors.
+Retirement remains intentional same-item retention. Generated role/team guidance
+uses a fresh worker per bug or feature and requires useful descendant services to
+be handed off or detached and reverified before exact closeout.
+
+All 17 lead-approved exact identities saved `closed` and `cleanupDone=true`; none
+of their tmux sessions remains. Tailterm Development stayed open, and lead,
+db-handler, narrative-history, lifecycle-closeout and the later dropdown-dialog
+worker retained their exact sessions. Closing `items-scroll` also stopped Mini
+preview PID 28664 because it was still a descendant of that worker session. The
+same package was immediately restored as detached PID 60799 and passed all 81
+asset checks and production-browser acceptance again. The old PID is not claimed
+as preserved.
+
+Bug `wi_af4cb8d286da4163` revision 3 and bounded order #1304 are documented in
+[the implementation report](session-lifecycle-closeout.md) and
+[the release/cleanup receipt](releases/tailos-2026-09-09-lifecycle-closeout.json).
+The exact clean source/package is retained at
+`.build/releases/lifecycle-closeout-9c7bb25`. Immediate rollback is the retained
+first lifecycle package/deployment `1d9d75d` / `https://65304106.tailos.pages.dev`;
+pre-feature rollback is the items-scroll package/deployment. The receipt records
+the hub/database/CLI rollback chain, all exact cleanup receipts, focused/full
+checks, known broad-suite failures and operational corrections. No Tailscale,
+network, relay, Air-preview, old-site, live fixture, parent-task or unapproved
+session change accompanied the release.
+
 ## September 9 Bugs and Features active-scroll refresh — release verified pending final acceptance
 
 Application commit `f59ce7c804b78a149689979e85a7bf1b2b50c620` is deployed to
