@@ -7,7 +7,7 @@ Work Order Board message `1726` and lead selection `1717`. The immutable admitte
 context was read in full before implementation:
 
 - `/tmp/tailterm-queue-layout-context-1726-76fe4b649874.json`
-- 51,518 bytes, SHA-256
+- 51,518 bytes, mode 0400, SHA-256
   `76fe4b649874b94713c45a51218664a13dbca3b69d9a30ca0009bb77612aba9e`
 - all three revisions, zero gaps, all four explicitly linked messages, and both
   full source messages (`1713` and `1717`)
@@ -15,8 +15,12 @@ context was read in full before implementation:
 Implementation began from exact clean commit
 `4e8e6c5b38905b25b5173d0044560be45e5b6e88` on `fix/queue-layout` in the
 isolated `queue-layout` worktree. The exact application/source candidate is
-`APPLICATION_COMMIT_PENDING`; a later report-only commit records that immutable
-identity without changing the tested application tree.
+`952f36bf5867dfe84d2bc3c99a98c491a46c51b6`, tree
+`9459fbf6c6c8f48385f9ca13a602a325bf83ca0d`. Its complete four-file
+`+801/-16` binary diff from the accepted baseline has SHA-256
+`52d5422a46d0fdc6ab9036b02bff14fc2a4470cdd38b73a40c9b9f0145bf3aec`.
+This later report-only commit records that immutable identity without changing
+the tested application tree.
 
 The owner evidence is
 `/Users/stephenspeicher/projects/tailterm/Screenshot 2026-09-10 at 1.31.31 PM.png`,
@@ -133,23 +137,53 @@ review evidence, not release assets.
 
 ## Validation
 
-The exact final commands and hashes are filled by the report-only commit after
-the application/source commit is clean. The completed checks include:
+Exact clean source `952f36b` passed:
 
-- baseline and candidate focused Queue layout runs in Chromium and WebKit;
-- the same focused suite against Vite's emitted production CSS composition;
-- existing real isolated-hub Chromium/WebKit Queue Send, priority, uncertain
-  retry, Pull, history, terminal-history, unsupported-hub, and no-launch checks;
-- the complete JavaScript unit suite;
-- static production build and release-manifest generation;
-- formatting and whitespace checks.
+- `QUEUE_LAYOUT_BASELINE=1 node tests/queue-layout-browser.mjs` — 10/10
+  Chromium/WebKit cases reproduced the baseline failures, including desktop
+  pointer interception and ten-pixel narrow thread viewports.
+- `node tests/queue-layout-browser.mjs` — 10/10 corresponding candidate cases
+  had no geometry issue, browser error, text/control overflow, or selection,
+  focus, hit-test, and scroll failure.
+- `npm run build:static` — clean Vite production build and packaging passed;
+  `npm run verify:release` verified all 82 assets for exact commit `952f36b`.
+- `QUEUE_LAYOUT_BUILT_CSS=dist-static/assets/index-CscScl6m.css node
+tests/queue-layout-browser.mjs` — 10/10 Chromium/WebKit cases passed against
+  the emitted 102,737-byte production stylesheet, SHA-256
+  `8a1eb227a514ef8d9a8fbce1210fecf23874482a9c828868eccaba65e6342a61`.
+  The 222,874-byte built-composition result has SHA-256
+  `0e4473588578b5ac85744edf718b6bf38958a2f515dc09ee23cdfcabbc56f004`.
+- `node tests/project-queue-browser.mjs` — Chromium/WebKit existing real
+  isolated-hub Send, priority, exact uncertain retry, Pull, history,
+  terminal-history, unsupported-hub, and no-launch checks passed.
+- `node tests/project-queue-review-browser.mjs` — Chromium/WebKit Queue
+  connection/view epochs and distinct uncertain actions passed.
+- `node tests/project-queue-vault-browser.mjs` — Chromium/WebKit encrypted,
+  bounded, connection-scoped, newer-edit-safe Queue intent checks passed.
+- `npm test` — 149/149 JavaScript unit tests passed.
+- `npx prettier --check client/queue.css client/queue-view.js
+tests/queue-layout-browser.mjs docs/queue-layout.md`, `git diff --check`, and
+  JavaScript syntax checks passed.
+
+The clean release manifest is 14,861 bytes, SHA-256
+`984c4fdc56ae1b9e6062abc692a988630e27c2f7fb0a7f39013712e8a678e40a`.
+The source files tested at the application commit are:
+
+- `client/queue.css`: 5,433 bytes, SHA-256
+  `80d87767c8007f1ff398888ff8c6e18a05d86d0e3ffe78d89a949c1b3b9a1e3e`
+- `client/queue-view.js`: 20,158 bytes, SHA-256
+  `71fbd80d5a5a87681ffa07ec5c9e3b75005e0a8b6948dc9ea240a0d82aa68b93`
+- `tests/queue-layout-browser.mjs`: 19,545 bytes, SHA-256
+  `abe87119dc26a3ab4524d35fd4aad1075d95d55a8e9e011b0e45f85267a29f2f`
 
 One pre-candidate static build stopped because the fresh worktree had no generated
 `wasm/tailserve.wasm`; the pinned `npm run build:wasm` prerequisite then passed.
 A subsequent build emitted the production CSS and completed packaging after
 `npm ci` supplied worktree-local license sources. `verify:release` correctly
 rejected that dirty-tree package; it is not claimed as release-ready. Final clean
-build/verification evidence follows after the source commit.
+build and verification then passed as recorded above. `npm ci` reported three
+moderate dependency advisories; no dependency or lockfile change was authorized
+or made.
 
 ## Limitations and rollback
 
