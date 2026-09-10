@@ -1,5 +1,39 @@
 # Development handoff — September 9, 2026
 
+## September 9 Board active-scroll refresh — release verified pending final acceptance
+
+Application commit `8e78f5508ddb0e15912ff39b397474f7df5b20fd` is deployed to
+`https://tailos.tailarr.com` (`https://0d7863de.tailos.pages.dev`, deployment
+`0d7863de-37c3-4463-a504-1d4e8e9c4c91`) and served by unchanged Mini preview
+PID 28664 at `http://127.0.0.1:4318`. The immutable deployment, custom domain
+and Mini match all 81 served files in the retained package and its
+release-manifest SHA-256
+`7080d78e74573ceca7552af76f6783e7c123d62037439d5dffdde81a20b6f5a5`.
+Real Chromium on TailOS and Mini started production WASM, restored an isolated
+synthetic vault/key, preserved matching layout margins and reported no page
+errors.
+
+The owner reopened `wi_a1b959960975589a` in message #1232 because Board
+scrolling remained broken after the earlier prepend-anchor release. The
+follow-up reproduced a separate failure: an active refresh disconnected the
+scrolling message element and focused composer in Chromium and WebKit. Board now
+coalesces repaint during wheel/scroll/touch activity and renders the latest state
+after 120 milliseconds of scroll idle, retaining the earlier anchor, bottom
+follow, own-send and draft behavior. Focused integrated-source checks pass in
+Chromium and WebKit. Browser-injected wheel input, browser-managed smooth motion
+and synthetic touch lifecycle are repeatable automated evidence; no physical
+trackpad/touch, native Safari or owner-device confirmation is claimed.
+
+Bug `wi_a1b959960975589a` revision 7 and bounded order #1237 are documented in
+[the follow-up report](board-scroll-followup.md) and
+[the release receipt](releases/tailos-2026-09-09-board-scroll-followup.json).
+The clean source/package is retained at
+`.build/releases/board-scroll-followup-8e78f55`. Rollback is the retained
+status-filter package `.build/releases/status-filter-0c1a3ce` and deployment
+`https://ea5b1191.tailos.pages.dev`. Neither hub, CLI, schema, database,
+Tailscale, TrueNAS, relays, Air preview, old site, live tasks/profiles nor agent
+sessions changed.
+
 ## September 9 agent context admission — release verified pending final acceptance
 
 Application/backend commit `03129acd724a9064fe67576058ca91cf473b9c78`

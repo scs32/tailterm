@@ -92,5 +92,45 @@ was observed; any resulting native soft-keyboard interruption is an inference.
 Fixtures are in-memory and use disposable browser contexts, not live project or
 profile data. No deployment, served package, Mini listener, hub, CLI, database,
 network, Tailscale, TrueNAS, relay, old site, Air preview, or live session was
-changed. TailOS/Mini release remains gated on lead candidate acceptance and an
-assigned release slot under Board order #1237.
+changed during candidate work.
+
+Lead accepted candidate `65b7375549fcc274140c6068fe9f393c94ebca19` in Board
+message #1281. It was integrated without conflict as application commit
+`8e78f5508ddb0e15912ff39b397474f7df5b20fd`, preserving the prerequisite and
+all current fixes. The exact clean source/package is retained at
+`.build/releases/board-scroll-followup-8e78f55`; its 82-entry manifest passed
+local verification and has SHA-256
+`7080d78e74573ceca7552af76f6783e7c123d62037439d5dffdde81a20b6f5a5`.
+
+Cloudflare Pages project `tailos` deployment
+`0d7863de-37c3-4463-a504-1d4e8e9c4c91` is available at
+`https://0d7863de.tailos.pages.dev` and `https://tailos.tailarr.com`. The same
+package was synchronized to Mini `http://127.0.0.1:4318`; preview PID 28664 was
+not restarted. The immutable URL, custom domain and Mini each matched the
+manifest and all 81 served files. JavaScript, CSS and compressed production WASM
+statuses/MIME passed; the `.wasm.gz` response remained `application/gzip`
+without `Content-Encoding` on both required targets.
+
+Real production Chromium on TailOS and Mini started WASM, created and restored
+an isolated synthetic vault/key, retained matching desktop margins and reported
+no page errors. The two layout screenshots are byte-identical with SHA-256
+`dee008e5bb73ff69cb91fb1e43b1dc1241bc26b73201661e1427f62041b71664`.
+The exact retained integrated source also passed the focused scrolling fixture
+in Chromium and WebKit after packaging.
+
+Rollback is the reverified retained status-filter package
+`.build/releases/status-filter-0c1a3ce` at application commit
+`0c1a3ce62301c415ab51d2c0c3438893702622db`, manifest SHA-256
+`e591b6c3d9d5ea58b9aea3a52e77c3b7832439988214dcdd790e2a48902cddea`,
+and deployment `https://ea5b1191.tailos.pages.dev`. Explicitly deploy that
+package to Cloudflare project `tailos`, then exact-sync it to Mini without
+restarting PID 28664. Rollback removes only this follow-up while retaining the
+previously accepted Board anchor, activity and status-filter fixes.
+
+No hub, CLI, database, schema, network, Tailscale, TrueNAS, relay, old-site, Air
+preview, live task/profile, owner storage, agent lifecycle or existing session
+change accompanied the release. Browser contexts and fixture servers closed;
+the exact release worktree and evidence are retained. Physical trackpad/touch,
+native Safari and owner-device behavior remain explicit acceptance limits, so
+the release is not described as a confirmed reproduction or fix on the owner's
+unknown browser/device.
