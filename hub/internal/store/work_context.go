@@ -168,6 +168,9 @@ func validateCrossProjectQueueAdmission(q queryRower, ctx context.Context, targe
 	if targetStatus != api.TaskOpen || sourceStatus != api.TaskOpen || itemStatus == "done" || itemStatus == "dismissed" {
 		return workItemConflict("cross-project Queue claim is no longer eligible for admission")
 	}
+	if err = validateQueueWorkOrder(ctx, q, entry, &req.WorkOrderMessage, req.ItemRevision); err != nil {
+		return err
+	}
 	var claimantTask, claimantRun, claimantStatus, claimantRole, claimantName, orchestratorName string
 	if err = q.QueryRowContext(ctx, `SELECT a.task_id,a.run_id,a.status,a.role,a.name,t.orchestrator FROM agents a JOIN tasks t ON t.id=a.task_id WHERE a.id=?`, claim.ClaimantAgentID).Scan(
 		&claimantTask, &claimantRun, &claimantStatus, &claimantRole, &claimantName, &orchestratorName); err != nil {

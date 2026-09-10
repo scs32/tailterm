@@ -341,13 +341,13 @@ func scanQueueNotification(row rowScanner) (api.QueueNotification, error) {
 
 const queueNotificationCols = `id,event_seq,entry_id,cycle,kind,causal_agent_id,causal_node,causal_user,recipient_agent_id,recipient_run_id,recipient_generation,status,message_seq,unavailable_reason,created_at`
 
-func (s *Store) createQueueNotification(ctx context.Context, tx *sql.Tx, entry api.QueueEntry, event api.QueueEvent, causal api.Sender, existingMessageSeq int64) (*api.QueueNotification, error) {
+func (s *Store) createQueueNotificationGeneration(ctx context.Context, tx *sql.Tx, entry api.QueueEntry, event api.QueueEvent, causal api.Sender, recipientAgentID, recipientRunID string, generation, existingMessageSeq int64) (*api.QueueNotification, error) {
 	now := s.now()
-	n := api.QueueNotification{ID: api.NewID("qnt"), EventSeq: event.Seq, EntryID: entry.ID, Cycle: entry.Cycle,
-		Kind: api.QueueNoticeChanged, CausalAuthor: causal, RecipientAgentID: entry.OrchestratorAgentID,
-		RecipientRunID: entry.OrchestratorRunID, RecipientGeneration: 1, Status: "pending", CreatedAt: now}
+	n := api.QueueNotification{ID: api.NewID("qnt"), EventSeq: event.Seq, EntryID: event.EntryID, Cycle: event.Cycle,
+		Kind: api.QueueNoticeChanged, CausalAuthor: causal, RecipientAgentID: recipientAgentID,
+		RecipientRunID: recipientRunID, RecipientGeneration: generation, Status: "pending", CreatedAt: now}
 	if existingMessageSeq > 0 {
-		result, updateErr := tx.ExecContext(ctx, `UPDATE messages SET from_agent='',from_run_id='',from_node='system',from_user='queue',system_notice_kind=?,system_notice_id=? WHERE task_id=? AND seq=? AND to_agent=?`, api.QueueNoticeChanged, n.ID, entry.TargetTaskID, existingMessageSeq, entry.OrchestratorAgentID)
+		result, updateErr := tx.ExecContext(ctx, `UPDATE messages SET from_agent='',from_run_id='',from_node='system',from_user='queue',system_notice_kind=?,system_notice_id=? WHERE task_id=? AND seq=? AND to_agent=?`, api.QueueNoticeChanged, n.ID, entry.TargetTaskID, existingMessageSeq, n.RecipientAgentID)
 		if updateErr != nil {
 			return nil, updateErr
 		}
@@ -362,17 +362,17 @@ func (s *Store) createQueueNotification(ctx context.Context, tx *sql.Tx, entry a
 	} else {
 		var recipient api.Agent
 		var err error
-		if entry.OrchestratorAgentID != "" {
-			recipient, err = scanAgent(tx.QueryRowContext(ctx, `SELECT `+agentCols+` FROM agents WHERE id=? AND task_id=?`, entry.OrchestratorAgentID, entry.TargetTaskID))
+		if n.RecipientAgentID != "" {
+			recipient, err = scanAgent(tx.QueryRowContext(ctx, `SELECT `+agentCols+` FROM agents WHERE id=? AND task_id=?`, n.RecipientAgentID, entry.TargetTaskID))
 		}
-		if entry.OrchestratorAgentID == "" || errors.Is(err, sql.ErrNoRows) {
+		if n.RecipientAgentID == "" || errors.Is(err, sql.ErrNoRows) {
 			n.Status, n.UnavailableReason = "unavailable", "project has no current orchestrator agent"
 		} else if err != nil {
 			return nil, err
-		} else if recipient.RunID != entry.OrchestratorRunID || recipient.Status == api.AgentRetired || recipient.Status == api.AgentClosed || recipient.Status == api.AgentExited {
+		} else if recipient.RunID != n.RecipientRunID || recipient.Status == api.AgentRetired || recipient.Status == api.AgentClosed || recipient.Status == api.AgentExited {
 			n.Status, n.UnavailableReason = "unavailable", "the pinned orchestrator run is not deliverable"
 		} else {
-			text := fmt.Sprintf("Queue updated: %s cycle %d is %s. Review and deliberately Pull if appropriate; this notice is not a work order and does not start an agent.", entry.ID, entry.Cycle, entry.State)
+			text := fmt.Sprintf("Queue updated: %s cycle %d is %s. Review and deliberately Pull if appropriate; this notice is not a work order and does not start an agent.", event.EntryID, event.Cycle, event.Snapshot.State)
 			result, insertErr := tx.ExecContext(ctx, `INSERT INTO messages(task_id,from_agent,from_node,from_user,to_agent,text,created_at,reply_to,broadcast,system_notice_kind,system_notice_id) VALUES(?,?,?,?,?,?,?,?,?,?,?)`,
 				entry.TargetTaskID, "", "system", "queue", recipient.ID, text, ts(now), 0, false, api.QueueNoticeChanged, n.ID)
 			if insertErr != nil {
@@ -392,6 +392,35 @@ func (s *Store) createQueueNotification(ctx context.Context, tx *sql.Tx, entry a
 		return nil, err
 	}
 	return &n, nil
+}
+
+func (s *Store) createQueueNotification(ctx context.Context, tx *sql.Tx, entry api.QueueEntry, event api.QueueEvent, causal api.Sender, existingMessageSeq int64) (*api.QueueNotification, error) {
+	return s.createQueueNotificationGeneration(ctx, tx, entry, event, causal, entry.OrchestratorAgentID, entry.OrchestratorRunID, 1, existingMessageSeq)
+}
+
+// recoverQueueNotification deliberately creates a new recipient generation for
+// one outstanding unavailable semantic event. The original unavailable row is
+// retained, while the Queue reconciliation action has its own separate event
+// and receipt. A read, restart, or ordinary Queue mutation never calls this.
+func (s *Store) recoverQueueNotification(ctx context.Context, tx *sql.Tx, entry api.QueueEntry, recipient api.Agent) (*api.QueueNotification, error) {
+	if recipient.Status == api.AgentRetired || recipient.Status == api.AgentClosed || recipient.Status == api.AgentExited || recipient.RunID == "" {
+		return nil, workItemConflict("the current orchestrator run is not deliverable")
+	}
+	prior, err := scanQueueNotification(tx.QueryRowContext(ctx, `SELECT `+queueNotificationCols+` FROM queue_notifications n
+WHERE n.entry_id=? AND n.cycle=? AND n.status='unavailable'
+AND n.recipient_generation=(SELECT MAX(n2.recipient_generation) FROM queue_notifications n2 WHERE n2.event_seq=n.event_seq)
+ORDER BY n.event_seq DESC LIMIT 1`, entry.ID, entry.Cycle))
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, workItemConflict("Queue has no outstanding unavailable notification to reconcile")
+	}
+	if err != nil {
+		return nil, err
+	}
+	event, err := scanQueueEvent(tx.QueryRowContext(ctx, `SELECT `+queueEventCols+` FROM queue_events WHERE target_task_id=? AND seq=? AND entry_id=?`, entry.TargetTaskID, prior.EventSeq, entry.ID))
+	if err != nil {
+		return nil, err
+	}
+	return s.createQueueNotificationGeneration(ctx, tx, entry, event, prior.CausalAuthor, recipient.ID, recipient.RunID, prior.RecipientGeneration+1, 0)
 }
 
 func currentQueueOrchestrator(q queryRower, ctx context.Context, task api.Task) (api.Agent, error) {
@@ -557,18 +586,37 @@ func validateQueueClaimant(ctx context.Context, tx *sql.Tx, entry api.QueueEntry
 	return agent, nil
 }
 
-func validateQueueWorkOrder(ctx context.Context, tx *sql.Tx, entry api.QueueEntry, ref *api.MessageReference, revision int64) error {
+func validateQueueWorkOrder(ctx context.Context, q queryRower, entry api.QueueEntry, ref *api.MessageReference, revision int64) error {
 	if ref == nil || !api.ValidID(ref.TaskID, "tsk") || ref.Seq < 1 {
 		return api.ErrInvalid
 	}
+	var noticeKind string
+	if err := q.QueryRowContext(ctx, `SELECT system_notice_kind FROM messages WHERE task_id=? AND seq=?`, ref.TaskID, ref.Seq).Scan(&noticeKind); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return workItemConflict("work order message does not exist")
+		}
+		return err
+	}
+	if noticeKind != "" {
+		return workItemConflict("automated system notices are not bounded work orders")
+	}
 	var found int
-	err := tx.QueryRowContext(ctx, `SELECT count(*) FROM message_work_item_links WHERE message_task_id=? AND message_seq=? AND item_task_id=? AND item_id=? AND item_revision=? AND relationship='primary'`,
+	err := q.QueryRowContext(ctx, `SELECT count(*) FROM message_audit_states s JOIN message_audit_links l ON l.message_task_id=s.message_task_id AND l.message_seq=s.message_seq
+WHERE s.message_task_id=? AND s.message_seq=? AND s.classification='work' AND l.item_task_id=? AND l.item_id=? AND l.item_revision=? AND l.relationship='primary'`,
 		ref.TaskID, ref.Seq, entry.SourceTaskID, entry.ItemID, revision).Scan(&found)
 	if err != nil {
 		return err
 	}
 	if found != 1 {
 		return workItemConflict("work order is not linked to the exact offered item revision")
+	}
+	var dispatchOnly int
+	if err = q.QueryRowContext(ctx, `SELECT count(*) FROM work_item_dispatches WHERE target_task_id=? AND message_seq=? AND item_id=? AND item_revision=?`,
+		ref.TaskID, ref.Seq, entry.ItemID, revision).Scan(&dispatchOnly); err != nil {
+		return err
+	}
+	if dispatchOnly != 0 {
+		return workItemConflict("dispatch enqueue messages are not bounded work orders")
 	}
 	return nil
 }
@@ -653,6 +701,7 @@ func (s *Store) QueueAction(ctx context.Context, targetTaskID, entryID string, r
 	}
 	now := s.now()
 	kind, reason := req.Operation, req.Reason
+	var recoveryRecipient *api.Agent
 	switch req.Operation {
 	case "priority":
 		if terminalQueueState(entry.State) || !validWorkItemPriority(req.Priority) || req.Priority == entry.QueuePriority {
@@ -746,10 +795,11 @@ func (s *Store) QueueAction(ctx context.Context, targetTaskID, entryID string, r
 		if reconcileErr != nil {
 			return api.QueueActionResult{}, reconcileErr
 		}
-		if orchestrator.ID == entry.OrchestratorAgentID && orchestrator.RunID == entry.OrchestratorRunID {
-			return api.QueueActionResult{}, api.ErrInvalid
+		if orchestrator.Status == api.AgentRetired || orchestrator.Status == api.AgentClosed || orchestrator.Status == api.AgentExited || orchestrator.RunID == "" {
+			return api.QueueActionResult{}, workItemConflict("the current orchestrator run is not deliverable")
 		}
 		entry.OrchestratorAgentID, entry.OrchestratorRunID = orchestrator.ID, orchestrator.RunID
+		recoveryRecipient = &orchestrator
 	case "withdraw":
 		if terminalQueueState(entry.State) || !validQueueReason(reason, true) {
 			return api.QueueActionResult{}, api.ErrInvalid
@@ -799,7 +849,12 @@ func (s *Store) QueueAction(ctx context.Context, targetTaskID, entryID string, r
 	if err != nil {
 		return api.QueueActionResult{}, err
 	}
-	notification, err := s.createQueueNotification(ctx, tx, entry, event, actor, 0)
+	var notification *api.QueueNotification
+	if recoveryRecipient != nil {
+		notification, err = s.recoverQueueNotification(ctx, tx, entry, *recoveryRecipient)
+	} else {
+		notification, err = s.createQueueNotification(ctx, tx, entry, event, actor, 0)
+	}
 	if err != nil {
 		return api.QueueActionResult{}, err
 	}

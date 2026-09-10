@@ -93,6 +93,52 @@ func TestQueueConcurrentDispatchDedupAndClaimCAS(t *testing.T) {
 	}
 }
 
+func TestQueueClaimRejectsEnqueueNoticesAndAdmissionRevalidatesOrder(t *testing.T) {
+	s, ctx, by := workItemStore(t)
+	source, _ := workItemProject(t, s, ctx, by, "Order authority source", "sourcelead")
+	target, lead := workItemProject(t, s, ctx, by, "Order authority target", "targetlead")
+	item := createWorkItem(t, s, ctx, by, source, "order-authority")
+	sent, err := s.DispatchWorkItem(ctx, source.ID, item.ID, api.DispatchWorkItemRequest{Revision: item.Revision, TargetTaskID: target.ID, RequestID: "order-authority-send"}, by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	claimFromDispatch := func(key string) error {
+		_, claimErr := s.QueueAction(ctx, target.ID, sent.Queue.Entry.ID, api.QueueActionRequest{Operation: "claim", RequestID: key, ExpectedRevision: sent.Queue.Entry.Revision, Cycle: sent.Queue.Entry.Cycle, ExpectedItemRevision: item.Revision, ClaimantAgentID: lead.ID, ClaimantRunID: lead.RunID, WorkOrderMessage: &api.MessageReference{TaskID: target.ID, Seq: sent.Dispatch.MessageSeq}}, by)
+		return claimErr
+	}
+	if err = claimFromDispatch("order-authority-typed"); !errors.Is(err, api.ErrConflict) {
+		t.Fatalf("typed enqueue notice used as work order: %v", err)
+	}
+	// An older Queue-capability binary left dispatch messages untyped. Dispatch
+	// provenance still prevents such a linked enqueue from becoming authority.
+	if _, err = s.db.Exec(`UPDATE messages SET system_notice_kind='',system_notice_id='' WHERE task_id=? AND seq=?`, target.ID, sent.Dispatch.MessageSeq); err != nil {
+		t.Fatal(err)
+	}
+	if err = claimFromDispatch("order-authority-legacy"); !errors.Is(err, api.ErrConflict) {
+		t.Fatalf("legacy dispatch message used as work order: %v", err)
+	}
+
+	order := queueOrder(t, s, item, "Separately bounded implementation order", "order-authority-valid")
+	claim, err := s.QueueAction(ctx, target.ID, sent.Queue.Entry.ID, api.QueueActionRequest{Operation: "claim", RequestID: "order-authority-claim", ExpectedRevision: sent.Queue.Entry.Revision, Cycle: sent.Queue.Entry.Cycle, ExpectedItemRevision: item.Revision, ClaimantAgentID: lead.ID, ClaimantRunID: lead.RunID, WorkOrderMessage: &api.MessageReference{TaskID: source.ID, Seq: order.Seq}}, by)
+	if err != nil || claim.Entry.State != api.QueueStateClaimed {
+		t.Fatalf("separately bounded order rejected: %+v %v", claim, err)
+	}
+	bundle := syntheticPreparedContext(t, item, api.MessageReference{TaskID: source.ID, Seq: order.Seq}, syntheticHistory(item, order))
+	work := api.AgentWorkItemRequest{ItemTaskID: source.ID, ItemID: item.ID, ItemRevision: item.Revision, WorkOrderMessage: api.MessageReference{TaskID: source.ID, Seq: order.Seq}, QueueClaim: &api.QueueAdmissionClaim{EntryID: claim.Entry.ID, Cycle: claim.Entry.Cycle, ExpectedRevision: claim.Entry.Revision, ClaimantAgentID: lead.ID, ClaimantRunID: lead.RunID}, ContextBundle: bundle}
+	// Admission independently validates the retained order, preventing a legacy
+	// or externally restored claimed row from bypassing the claim-time guard.
+	if _, err = s.db.Exec(`UPDATE messages SET system_notice_kind=?,system_notice_id=? WHERE task_id=? AND seq=?`, api.QueueNoticeChanged, api.NewID("qnt"), source.ID, order.Seq); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = s.AddAgent(ctx, target.ID, api.AddAgentRequest{Name: "invalid-order-worker", Host: "fixture", Session: "invalid-order-worker", Runtime: "codex", WorkItem: &work}, by); !errors.Is(err, api.ErrConflict) {
+		t.Fatalf("invalid retained work order reached cross-project admission: %v", err)
+	}
+	entry, err := s.GetQueueEntry(ctx, target.ID, claim.Entry.ID)
+	if err != nil || entry.State != api.QueueStateClaimed || entry.WorkerAgentID != "" || entry.WorkerRunID != "" {
+		t.Fatalf("rejected admission changed claim: %+v %v", entry, err)
+	}
+}
+
 func TestQueueDispatchCASClaimStartTerminalAndSourcePreservation(t *testing.T) {
 	s, ctx, by := workItemStore(t)
 	source, _ := workItemProject(t, s, ctx, by, "Queue source", "sourcelead")
@@ -454,9 +500,87 @@ func TestQueueNotificationUnavailableDoesNotResumeAndExplicitlyRetargets(t *test
 	if err != nil || reconciled.Entry.OrchestratorAgentID != replacement.ID || reconciled.Notification == nil || reconciled.Notification.Status != "stored" || reconciled.Notification.RecipientRunID != replacement.RunID {
 		t.Fatalf("recipient reconciliation: %+v %v", reconciled, err)
 	}
+	if reconciled.Notification.EventSeq != priority.Notification.EventSeq || reconciled.Notification.RecipientGeneration != priority.Notification.RecipientGeneration+1 || reconciled.Event.Seq == reconciled.Notification.EventSeq {
+		t.Fatalf("recipient recovery did not retain semantic event/generation history: %+v", reconciled)
+	}
 	var generations int
 	if err = s.db.QueryRow(`SELECT count(*) FROM queue_notifications WHERE entry_id=?`, sent.Queue.Entry.ID).Scan(&generations); err != nil || generations != 3 {
 		t.Fatalf("notification history=%d err=%v", generations, err)
+	}
+}
+
+func TestQueueNotificationSameRunRecoveryReplayAndRestartDedup(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "queue-recipient-recovery.sqlite")
+	s, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, by := context.Background(), api.Caller{Node: "fixture", User: "owner"}
+	source, _ := workItemProject(t, s, ctx, by, "Recipient recovery source", "sourcelead")
+	target, lead := workItemProject(t, s, ctx, by, "Recipient recovery target", "targetlead")
+	item := createWorkItem(t, s, ctx, by, source, "recipient-recovery")
+	sent, err := s.DispatchWorkItem(ctx, source.ID, item.ID, api.DispatchWorkItemRequest{Revision: item.Revision, TargetTaskID: target.ID, RequestID: "recipient-recovery-send"}, by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	retired := api.AgentRetired
+	if _, err = s.UpdateAgent(ctx, lead.ID, api.UpdateAgentRequest{Status: &retired}, by); err != nil {
+		t.Fatal(err)
+	}
+	priority, err := s.QueueAction(ctx, target.ID, sent.Queue.Entry.ID, api.QueueActionRequest{Operation: "priority", RequestID: "recipient-recovery-priority", ExpectedRevision: sent.Queue.Entry.Revision, Cycle: 1, Priority: "high"}, by)
+	if err != nil || priority.Notification == nil || priority.Notification.Status != "unavailable" {
+		t.Fatalf("unavailable setup: %+v %v", priority, err)
+	}
+	if _, err = s.QueueAction(ctx, target.ID, sent.Queue.Entry.ID, api.QueueActionRequest{Operation: "reconcile_recipient", RequestID: "recipient-still-retired", ExpectedRevision: priority.Entry.Revision, Cycle: 1, Reason: "not yet resumed"}, by); !errors.Is(err, api.ErrConflict) {
+		t.Fatalf("still-retired run reconciled an unavailable notice: %v", err)
+	}
+	var before int
+	if err = s.db.QueryRow(`SELECT count(*) FROM queue_notifications WHERE event_seq=?`, priority.Notification.EventSeq).Scan(&before); err != nil || before != 1 {
+		t.Fatalf("retired rejection changed notification history=%d err=%v", before, err)
+	}
+	if _, err = s.db.Exec(`UPDATE agents SET status=? WHERE id=? AND run_id=?`, lead.Status, lead.ID, lead.RunID); err != nil {
+		t.Fatal(err)
+	}
+	reconcileRequest := api.QueueActionRequest{Operation: "reconcile_recipient", RequestID: "recipient-same-run", ExpectedRevision: priority.Entry.Revision, Cycle: 1, Reason: "exact original run resumed"}
+	recovered, err := s.QueueAction(ctx, target.ID, sent.Queue.Entry.ID, reconcileRequest, by)
+	if err != nil || recovered.Notification == nil || recovered.Notification.Status != "stored" || recovered.Notification.RecipientAgentID != lead.ID || recovered.Notification.RecipientRunID != lead.RunID {
+		t.Fatalf("same-run recovery: %+v %v", recovered, err)
+	}
+	if recovered.Notification.EventSeq != priority.Notification.EventSeq || recovered.Notification.RecipientGeneration != 2 || recovered.Event.Seq == recovered.Notification.EventSeq || recovered.Notification.CausalAuthor != priority.Notification.CausalAuthor {
+		t.Fatalf("same-run recovery lost semantic/generation identity: %+v", recovered)
+	}
+	var generations, unavailable, stored int
+	if err = s.db.QueryRow(`SELECT count(*),sum(status='unavailable'),sum(status='stored') FROM queue_notifications WHERE event_seq=?`, priority.Notification.EventSeq).Scan(&generations, &unavailable, &stored); err != nil || generations != 2 || unavailable != 1 || stored != 1 {
+		t.Fatalf("same-run generation history count=%d unavailable=%d stored=%d err=%v", generations, unavailable, stored, err)
+	}
+	var beforeReadEvents int
+	if err = s.db.QueryRow(`SELECT count(*) FROM queue_events WHERE entry_id=?`, sent.Queue.Entry.ID).Scan(&beforeReadEvents); err != nil {
+		t.Fatal(err)
+	}
+	if err = s.MarkRead(ctx, target.ID, api.MarkReadRequest{AgentID: lead.ID, UpTo: recovered.Notification.MessageSeq}); err != nil {
+		t.Fatal(err)
+	}
+	var afterReadEvents, afterReadNotifications int
+	if err = s.db.QueryRow(`SELECT (SELECT count(*) FROM queue_events WHERE entry_id=?),(SELECT count(*) FROM queue_notifications WHERE event_seq=?)`, sent.Queue.Entry.ID, priority.Notification.EventSeq).Scan(&afterReadEvents, &afterReadNotifications); err != nil || afterReadEvents != beforeReadEvents || afterReadNotifications != 2 {
+		t.Fatalf("recovery notice read created an ACK loop events=%d/%d notifications=%d err=%v", beforeReadEvents, afterReadEvents, afterReadNotifications, err)
+	}
+	if err = s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	s, err = Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	replay, err := s.QueueAction(ctx, target.ID, sent.Queue.Entry.ID, reconcileRequest, by)
+	if err != nil || !replay.Replay || replay.Notification == nil || replay.Notification.ID != recovered.Notification.ID || replay.Notification.RecipientGeneration != 2 {
+		t.Fatalf("restart replay created a different recovery: %+v %v", replay, err)
+	}
+	if err = s.db.QueryRow(`SELECT count(*) FROM queue_notifications WHERE event_seq=?`, priority.Notification.EventSeq).Scan(&generations); err != nil || generations != 2 {
+		t.Fatalf("restart replay duplicated generation count=%d err=%v", generations, err)
+	}
+	if _, err = s.QueueAction(ctx, target.ID, sent.Queue.Entry.ID, api.QueueActionRequest{Operation: "reconcile_recipient", RequestID: "recipient-no-outstanding", ExpectedRevision: recovered.Entry.Revision, Cycle: 1, Reason: "duplicate explicit recovery"}, by); !errors.Is(err, api.ErrConflict) {
+		t.Fatalf("new-key recovery without an outstanding notice: %v", err)
 	}
 }
 
