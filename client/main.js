@@ -88,6 +88,7 @@ import {
   findPeer,
   discoveryMode,
 } from "./connection-help.js";
+import { installDialogSelectInteraction } from "./dialog-interaction.js";
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import { SearchAddon } from "@xterm/addon-search";
@@ -2071,7 +2072,7 @@ function dialog(title, body) {
   tailscaleLogin.clear();
   if (d.open) d.close();
   const dialogId = String(++dialogSequence);
-  d.oncancel = null;
+  installDialogSelectInteraction(d);
   d.onclose = () => {
     if (d.open || d.dataset.dialogId !== dialogId) return;
     tailscaleLogin.clear();
