@@ -26,7 +26,14 @@ package, manifest `e7919f9448fa0dc9d5938315c6747dbc9c035645398c48c2ce0ff34e21a23
 Publish explicitly to Pages project `tailos` and atomically replace the Mini
 package without restarting its preview. The hub and both CLIs remain the
 Project Queue release below. Agents-library is still under review and is not
-included. Handler completion and exact worker closeout follow acceptance.
+included. Handler #1796 verified Bug Done revision 4/scope 3, receipt
+`wir_347e24bbcd58616e`, and atomic Queue completion (cycle 1/revision 6,
+event 72, `source_done`). Complete accepted evidence is retained in Board
+manifest #1792; the native Feature report pin is inapplicable to Bugs.
+Lead closed exact worker `agt_f582d87e39b0bc82` /
+`run_276b5571615e136e` after verifying completion and its process tree.
+The durable receipt reports `closed`, `cleanupDone: true`; Mini preview remains
+PID 60799 / PPID 1. No project, orchestrator, or handler was closed.
 
 ## September 10 Project Queue — release verified pending final acceptance
 
