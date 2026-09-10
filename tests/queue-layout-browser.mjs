@@ -24,6 +24,11 @@ const queueCSS = expectBaseline
       encoding: "utf8",
     })
   : readFileSync(new URL("../client/queue.css", import.meta.url), "utf8");
+const queueView = expectBaseline
+  ? execFileSync("git", ["show", `${baselineCommit}:client/queue-view.js`], {
+      encoding: "utf8",
+    })
+  : readFileSync(new URL("../client/queue-view.js", import.meta.url), "utf8");
 const builtCSS = builtCSSPath
   ? readFileSync(path.resolve(builtCSSPath), "utf8")
   : "";
@@ -31,16 +36,25 @@ const runKind = expectBaseline ? "baseline" : builtCSS ? "built" : "candidate";
 const artifactDir = path.resolve(".build/queue-layout");
 mkdirSync(artifactDir, { recursive: true });
 const queueStylePath = path.join(artifactDir, "fixture-queue.css");
+const queueViewPath = path.join(artifactDir, "fixture-queue-view.js");
 const fixtureScriptPath = path.join(artifactDir, "fixture.js");
 writeFileSync(queueStylePath, queueCSS);
+writeFileSync(queueViewPath, queueView);
 
 const scenarios = [
+  { name: "narrow-320", width: 320, height: 720, deviceScaleFactor: 1 },
+  { name: "narrow-390", width: 390, height: 780, deviceScaleFactor: 1 },
+  { name: "boundary-760", width: 760, height: 900, deviceScaleFactor: 1 },
+  { name: "boundary-761", width: 761, height: 900, deviceScaleFactor: 1 },
+  { name: "boundary-768", width: 768, height: 900, deviceScaleFactor: 1 },
+  { name: "boundary-800", width: 800, height: 900, deviceScaleFactor: 1 },
+  { name: "boundary-900", width: 900, height: 900, deviceScaleFactor: 1 },
+  { name: "boundary-1024", width: 1024, height: 900, deviceScaleFactor: 1 },
   { name: "desktop-1366", width: 1366, height: 900, deviceScaleFactor: 1 },
   // 1397 CSS pixels is a plausible half-scale comparison to the supplied
   // 2794px raster, not a claim about the owner's actual viewport or DPR.
   { name: "desktop-1397", width: 1397, height: 852, deviceScaleFactor: 2 },
   { name: "desktop-1920", width: 1920, height: 1080, deviceScaleFactor: 1 },
-  { name: "narrow-390", width: 390, height: 780, deviceScaleFactor: 1 },
   // Models a 1366x900 display at 200% zoom with a constrained CSS viewport.
   // This is emulation, not native browser zoom.
   {
@@ -69,7 +83,7 @@ const stylesheet = builtCSS
   ? '<link rel="stylesheet" href="/qa/built.css">'
   : "";
 const fixtureScript = `${styleImports}
-import {createQueueView} from '/client/queue-view.js';
+import {createQueueView} from '/@fs/${queueViewPath}';
 import {setupModes} from '/client/modes.js';
 const longProject='Tailterm Development Receiving Coordination With An Intentionally Long Synthetic Project Name';
 const tasks=[
@@ -258,7 +272,7 @@ async function geometry(page) {
   });
 }
 
-function issuesFor(measured, narrow) {
+function issuesFor(measured, outerStacked) {
   const issues = [];
   const overlapX = (left, right) =>
     Math.min(left.right, right.right) - Math.max(left.x, right.x) > 1;
@@ -266,29 +280,31 @@ function issuesFor(measured, narrow) {
     Math.min(top.bottom, bottom.bottom) - Math.max(top.y, bottom.y) > 1;
   if (measured.document.scrollWidth > measured.document.clientWidth + 1)
     issues.push("document-horizontal-overflow");
-  if (narrow) {
+  if (outerStacked) {
     if (
       overlapY(measured.rail, measured.main) ||
       measured.rail.bottom > measured.main.y + 1
     )
       issues.push("rail-main-overlap");
-    if (
-      overlapY(measured.list, measured.detail) ||
-      measured.list.bottom > measured.detail.y + 1
-    )
-      issues.push("list-detail-overlap");
   } else {
     if (
       overlapX(measured.rail, measured.main) ||
       measured.rail.right > measured.main.x + 1
     )
       issues.push("rail-main-overlap");
+  }
+  const detailShouldStack = outerStacked || measured.layout.width <= 540;
+  if (detailShouldStack) {
     if (
-      overlapX(measured.rows[0], measured.detail) ||
-      measured.rows.some((row) => row.right > measured.detail.x + 1)
+      overlapY(measured.list, measured.detail) ||
+      measured.list.bottom > measured.detail.y + 1
     )
       issues.push("list-detail-overlap");
-  }
+  } else if (
+    overlapX(measured.rows[0], measured.detail) ||
+    measured.rows.some((row) => row.right > measured.detail.x + 1)
+  )
+    issues.push("list-detail-overlap");
   if (
     measured.railTitle.bottom > measured.railSubtitle.y + 1 ||
     measured.railSubtitle.y - measured.railTitle.bottom < 1

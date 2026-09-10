@@ -12,6 +12,7 @@ body[data-mode="queue"] #mode-view {
 #mode-view .queue-view > .queue-main {
   min-width: 0;
   overflow: auto;
+  container: queue-main / inline-size;
 }
 
 #mode-view .queue-view .board-rail [data-queue-task] {
@@ -228,6 +229,15 @@ body[data-mode="queue"] #mode-view {
 #mode-view .queue-view .queue-history-toggle span {
   min-width: 0;
   overflow-wrap: anywhere;
+}
+
+/* The desktop project rail remains useful below a 760px viewport breakpoint,
+   but it can leave less than the two Queue columns' combined minimum width.
+   Stack from the actual thread width instead of guessing from the viewport. */
+@container queue-main (max-width: 540px) {
+  #mode-view .queue-view .queue-layout {
+    grid-template-columns: minmax(0, 1fr);
+  }
 }
 
 @media (max-width: 760px) {
