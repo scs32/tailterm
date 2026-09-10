@@ -198,7 +198,7 @@ func TestOrchestratorImplementationBoundaryAcrossLaunchAndResumeRosters(t *testi
 		t.Run(tc.name, func(t *testing.T) {
 			task := api.Task{ID: "tsk_0000000000000001", Name: "Project", Orchestrator: "lead", AllowAgentSpawn: tc.allowSpawn, MaxNewAgents: tc.maxHelpers}
 			got := agentTaskBriefingForLaunch(task, "lead", "", tc.agents, tc.planned)
-			for _, required := range []string{"decisions, planning, routing work, and reviewing evidence", "shared schema/types and integration code", "not a runtime sandbox or API authorization boundary"} {
+			for _, required := range []string{"decisions, planning, routing work, and reviewing evidence", "shared schema/types and integration code", "not a runtime sandbox or API authorization boundary", "inventory useful long-lived services descended from its tmux session"} {
 				if !strings.Contains(got, required) {
 					t.Fatalf("missing %q", required)
 				}
@@ -235,7 +235,7 @@ func TestWorkerBriefingPreservesAssignedBuilderAndReadOnlyRoles(t *testing.T) {
 	task := api.Task{Name: "Project", Orchestrator: "lead"}
 	agents := []api.Agent{{Name: "lead", Status: api.AgentRunning}, {Name: "worker", Status: api.AgentRunning}}
 	got := agentTaskBriefing(task, "worker", "", agents)
-	for _, required := range []string{"decides, plans, routes work and reviews evidence", "builders own assigned implementation", "shared schema/types and integration code", "Preserve any assigned read-only or other non-builder role"} {
+	for _, required := range []string{"decides, plans, routes work and reviews evidence", "builders own assigned implementation", "shared schema/types and integration code", "Preserve any assigned read-only or other non-builder role", "report any useful long-lived service descended from your tmux session"} {
 		if !strings.Contains(got, required) {
 			t.Fatalf("missing %q", required)
 		}

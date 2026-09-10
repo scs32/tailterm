@@ -88,6 +88,9 @@ worker is closed through its exact run and durable cleanup receipt while the
 project stays open. A later item receives a fresh identity and context. Retirement
 means intentional temporary retention for same-item follow-up, not completed-item
 closeout.
+Useful long-lived services descended from a worker's tmux session must be handed
+off or detached and reverified before closeout; exact cleanup terminates the
+remaining descendants.
 
 The browser saves the handler's resolved launch plan and stable agent identity in
 its encrypted local vault before SSH launch. Retry uses that identity. Host-side

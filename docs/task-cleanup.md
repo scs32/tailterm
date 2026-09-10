@@ -8,6 +8,11 @@ that the session stopped: `cleanupDone` confirms termination, while
 context. `tt retire` remains available for intentional temporary retention of
 the same item session.
 
+Inventory useful long-lived descendant services before closing a worker. Hand
+them to a durable owner or detach them from the worker's tmux session and verify
+their new process identity/readiness; otherwise exact tmux termination will stop
+them along with the worker.
+
 Close task stops the task's agent tmux sessions, including retired agents and
 helpers, and removes their terminal panes. Messages and task history remain on
 the hub. Ordinary sessions added to a task group are not agent sessions and are

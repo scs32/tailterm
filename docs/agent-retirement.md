@@ -50,6 +50,12 @@ name alone. A renamed exact session closes; a missing exact session can be
 confirmed; reused names, replacement runs and mismatched tmux creation identities
 remain open. Receipt delivery is retryable, and success is monotonic.
 
+Before closeout, inventory useful long-lived services descended from the worker's
+tmux session. Hand each continuing service to a durable owner or detach it from
+the worker session, then reverify its process identity and readiness. An exact
+tmux close correctly terminates all remaining descendants; it cannot distinguish
+an intentionally retained preview from disposable worker subprocesses.
+
 For important assignments, the orchestrator records the posted message sequence
 and recipient, then checks `readUpTo`, status and availability at meaningful
 checkpoints and before waiting, retirement or completion. A read cursor proves

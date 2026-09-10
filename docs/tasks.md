@@ -112,6 +112,8 @@ After an accepted worker handoff and resolved dependencies, `tt close NAME`
 records exact-run closure and safely terminates only that worker's matching owned
 tmux session while the project remains open. Closure intent and verified cleanup
 are separate; pending receipts stay visible and retryable under project settings.
+First hand off or detach and reverify useful long-lived services descended from
+the worker's tmux session so exact cleanup does not remove required infrastructure.
 Use retirement only for intentional temporary retention of the same item context.
 The project orchestrator and active database handler remain available.
 

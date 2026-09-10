@@ -83,7 +83,9 @@ removes mirrored panes and requests termination of the task's owned tmux session
 including retired agents. An accepted worker can be closed separately with an
 exact run-scoped `tt close` while the project stays open. Browser SSH actions and
 the host relay perform cleanup; offline hosts remain pending until confirmation.
-Retirement alone preserves the session for intentional temporary retention. See
+Before individual closeout, move any useful long-lived descendant service to a
+durable owner or detach and reverify it; remaining tmux descendants terminate
+with the worker. Retirement alone preserves the session for intentional temporary retention. See
 [cleanup and history](../docs/task-cleanup.md).
 
 Replies reference the original message sequence. Read receipts mean retrieval,

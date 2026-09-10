@@ -1,6 +1,6 @@
 # Session lifecycle closeout
 
-Work item `wi_af4cb8d286da4163` revision 2, bounded work order #1304
+Work item `wi_af4cb8d286da4163` revision 3, bounded work order #1304
 (`wi_af4cb8d286da4163-lifecycle-closeout-1`) owns this change. The implementation
 candidate is `2b4c4f96fddabb524cdc1ebb4100c21952abf36e`, based on
 `d102ab01b085677eea92c8b4411cb2f9119272c2`.
@@ -34,6 +34,11 @@ it, the local receipt remains and an exact retry recovers the monotonic success.
 A later task close preserves prior individual cleanup success and cleans only the
 remaining agents.
 
+Before closeout, the worker and orchestrator inventory useful long-lived services
+descended from the worker's tmux session. A service that must continue is handed
+off or detached and reverified first; exact tmux cleanup intentionally terminates
+all remaining descendants.
+
 Project settings compactly expose closed agents whose cleanup receipt is still
 pending and offer the same exact-host retry. Confirmed closed agents leave the
 active roster; immutable messages, item bindings, revisions, results and event
@@ -65,9 +70,23 @@ operational eligibility audit were used.
 
 ## Release and operational cleanup
 
-No live component or agent session changed during candidate construction. Hub,
-Mini/Air CLI, TailOS and Mini preview release identities, backup/rollback evidence,
-and exact eligible-agent cleanup receipts will be appended only after lead accepts
-the candidate and assigns the release slot. The parent project must remain open;
-lead, db-handler, narrative-history, items-scroll and lifecycle-closeout remain
-protected until separately released.
+Lead accepted the candidate and assigned the release/cleanup slot in Board message
+#1349. Handler-confirmed completion made `items-scroll` the seventeenth exact
+eligible identity. During the first exact release, all 17 approved agent/run
+records saved `closed` plus `cleanupDone=true`, their matching tmux sessions
+disappeared, the project stayed open, and lead, db-handler, narrative-history and
+lifecycle-closeout retained their exact sessions. No candidate mismatched.
+
+The Mini preview initially survived exact-package activation and production
+browser acceptance as PID 28664. Closing the approved `items-scroll` tmux also
+terminated that preview and its parent, revealing that the supposedly shared
+listener was still a descendant of a disposable worker session. The same exact
+package was immediately restored on port 4318 as detached PID 60799 with PPID 1;
+all 81 assets and the production browser acceptance passed again. Lead's
+independent check #1366 confirmed both the 17 durable receipts/protected roster
+and the detached replacement. The handler saved this evidence and the bounded
+descendant-service guidance amendment as work-item revision 3 in #1368.
+
+The final source, deployment identities, backup/rollback evidence, hashes and
+per-agent receipt inventory are recorded in the release receipt after rebuilding
+and reverifying the revision-3 guidance. The old PID is not claimed as preserved.

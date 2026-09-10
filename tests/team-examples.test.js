@@ -15,6 +15,7 @@ test("nine complete examples are portable, launchable, bounded and independently
       assert.ok(m.prompt.length > 2500);
       assert.ok(Buffer.byteLength(m.prompt) < 8192);
       assert.ok(MODEL_OPTIONS[m.runtime].some(([id]) => id === m.model));
+      assert.match(m.prompt, /inventory useful long-lived services/);
     }
     const plan = teamLaunches(team, [{ id: "main" }]);
     assert.ok(plan.every((p) => p.server.id === "main"));

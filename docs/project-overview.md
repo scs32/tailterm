@@ -170,7 +170,8 @@ Cost, capacity, worker availability or helper quota does not create an exception
 These are generated role instructions, not a runtime sandbox or API authorization
 boundary. An implementation worker session belongs to exactly one bug or feature.
 After accepting its result and resolving its dependencies, the orchestrator closes
-that worker session; a new item gets a fresh identity and context. Retirement is
+that worker session after handing off or detaching and reverifying any useful
+long-lived descendant services; a new item gets a fresh identity and context. Retirement is
 only for intentional temporary retention of the same item context. The
 orchestrator and active database handler stay available while the project remains
 open.
@@ -313,26 +314,26 @@ hub currently uses one shared trusted-workspace credential.
 
 ## Source map
 
-| Area | Main locations |
-| --- | --- |
-| Application bootstrap, static/gateway integration | `client/main.js` |
-| Task synchronization, launch dialogs, host aliases | `client/task-hub.js` |
-| Task/group reconciliation and saved layouts | `client/tasks.js`, `client/pane-groups.js`, `client/pane-layout.js`, `client/workspace-state.js` |
-| Projects, messages, teams | `client/tasks-view.js`, `client/board-view.js`, `client/teams-view.js` |
-| Bugs/Features and handler launch plans | `client/work-items-view.js`, `client/work-items.css`, `client/project-handler.js`, `hub/internal/api/work_items.go` |
-| Encrypted cached hub reads | `client/cached-hub-client.js`, `client/hub-read-cache.js`, `client/local-vault.js` |
-| History pagination/export | `client/task-history.js` |
-| Team schema, presets, models, permissions UI | `client/teams.js`, `client/team-examples.js`, `client/model-picker.js`, `client/agent-controls.js` |
-| Remote folder selection | `client/project-folder.js` |
-| Hub transport and API | `client/hub-client.js`, `hub/internal/api/`, `hub/internal/server/` |
-| Durable state and migrations | `hub/internal/store/` |
-| Host CLI and relay | `hub/cmd/tt/`, especially `relay.go`, `cleanup.go`, `startup.go` |
-| Process/tmux creation and runtime adapters | `hub/internal/spawn/`, `hub/internal/adapters/` |
-| Vault/profile encryption and synchronization | `client/local-vault.js`, profile-related client files, `hub/internal/server/profiles.go`, `hub/internal/store/profiles.go` |
-| WASM transport and SSH/SFTP extensions | `wasm/`, `client/browser-ssh.js`, `scripts/build-wasm.sh` |
-| Static release packaging and verification | `scripts/package-static.mjs`, `scripts/release-manifest.mjs`, `scripts/verify-release.mjs` |
-| Deployment | `scripts/deploy-apple-web.py`, `scripts/deploy-truenas-hub.py`; explicit Wrangler command for TailOS |
-| Regression coverage | `tests/`, Go `*_test.go` alongside hub/CLI code |
+| Area                                               | Main locations                                                                                                             |
+| --------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------- |
+| Application bootstrap, static/gateway integration  | `client/main.js`                                                                                                           |
+| Task synchronization, launch dialogs, host aliases | `client/task-hub.js`                                                                                                       |
+| Task/group reconciliation and saved layouts        | `client/tasks.js`, `client/pane-groups.js`, `client/pane-layout.js`, `client/workspace-state.js`                           |
+| Projects, messages, teams                          | `client/tasks-view.js`, `client/board-view.js`, `client/teams-view.js`                                                     |
+| Bugs/Features and handler launch plans             | `client/work-items-view.js`, `client/work-items.css`, `client/project-handler.js`, `hub/internal/api/work_items.go`        |
+| Encrypted cached hub reads                         | `client/cached-hub-client.js`, `client/hub-read-cache.js`, `client/local-vault.js`                                         |
+| History pagination/export                          | `client/task-history.js`                                                                                                   |
+| Team schema, presets, models, permissions UI       | `client/teams.js`, `client/team-examples.js`, `client/model-picker.js`, `client/agent-controls.js`                         |
+| Remote folder selection                            | `client/project-folder.js`                                                                                                 |
+| Hub transport and API                              | `client/hub-client.js`, `hub/internal/api/`, `hub/internal/server/`                                                        |
+| Durable state and migrations                       | `hub/internal/store/`                                                                                                      |
+| Host CLI and relay                                 | `hub/cmd/tt/`, especially `relay.go`, `cleanup.go`, `startup.go`                                                           |
+| Process/tmux creation and runtime adapters         | `hub/internal/spawn/`, `hub/internal/adapters/`                                                                            |
+| Vault/profile encryption and synchronization       | `client/local-vault.js`, profile-related client files, `hub/internal/server/profiles.go`, `hub/internal/store/profiles.go` |
+| WASM transport and SSH/SFTP extensions             | `wasm/`, `client/browser-ssh.js`, `scripts/build-wasm.sh`                                                                  |
+| Static release packaging and verification          | `scripts/package-static.mjs`, `scripts/release-manifest.mjs`, `scripts/verify-release.mjs`                                 |
+| Deployment                                         | `scripts/deploy-apple-web.py`, `scripts/deploy-truenas-hub.py`; explicit Wrangler command for TailOS                       |
+| Regression coverage                                | `tests/`, Go `*_test.go` alongside hub/CLI code                                                                            |
 
 ## Design conventions
 
