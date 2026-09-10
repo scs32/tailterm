@@ -744,7 +744,7 @@ func (s *Store) insertMessage(ctx context.Context, tx *sql.Tx, task api.Task, re
 		return m, err
 	}
 	m.Seq, _ = res.LastInsertId()
-	if err = insertMessageContext(ctx, tx, &m, req); err != nil {
+	if err = insertMessageContext(ctx, tx, &m, req, allowCrossProject); err != nil {
 		return m, err
 	}
 	preview := req.Text
@@ -752,6 +752,9 @@ func (s *Store) insertMessage(ctx context.Context, tx *sql.Tx, task api.Task, re
 		preview = preview[:200]
 	}
 	eventData := map[string]any{"seq": m.Seq, "to": req.To, "broadcast": m.Broadcast}
+	if auditKind := auditClassificationForPost(req); auditKind != api.MessageAuditUnclassified {
+		eventData["auditKind"] = auditKind
+	}
 	if len(m.WorkItems) > 0 {
 		eventData["workItems"] = m.WorkItems
 	}
@@ -807,7 +810,7 @@ func (s *Store) ListMessages(ctx context.Context, taskID string, after int64, ag
 	args := []any{}
 	if binding != nil {
 		q += `
-JOIN message_work_item_links item_scope ON item_scope.message_seq=m.seq AND item_scope.item_task_id=? AND item_scope.item_id=?`
+JOIN message_audit_links item_scope ON item_scope.message_task_id=m.task_id AND item_scope.message_seq=m.seq AND item_scope.item_task_id=? AND item_scope.item_id=?`
 		args = append(args, binding.ItemTaskID, binding.ItemID)
 	}
 	q += `
@@ -827,21 +830,36 @@ WHERE m.task_id=? AND m.seq>?`
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
 	out := []api.Message{}
 	for rows.Next() {
 		m, err := scanMessage(rows)
 		if err != nil {
+			rows.Close()
 			return nil, err
 		}
 		out = append(out, m)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return nil, err
+	}
+	rows.Close()
+	for index := range out {
+		original, err := loadAuditOriginal(s.db, ctx, out[index].TaskID, out[index].Seq)
+		if err != nil {
+			return nil, err
+		}
+		if original.Classification != api.MessageAuditUnclassified {
+			out[index].WorkItems = append([]api.MessageWorkItem(nil), original.WorkItems...)
+			out[index].WorkOrderMessage = original.WorkOrderMessage
+		}
 	}
 	if after < 0 {
 		for i, j := 0, len(out)-1; i < j; i, j = i+1, j-1 {
 			out[i], out[j] = out[j], out[i]
 		}
 	}
-	return out, rows.Err()
+	return out, nil
 }
 
 func (s *Store) ReadCursor(ctx context.Context, taskID, agentID string) (int64, error) {

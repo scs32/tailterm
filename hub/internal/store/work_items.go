@@ -18,6 +18,7 @@ const workItemCols = `seq,id,task_id,kind,title,description,status,priority,revi
 
 type queryRower interface {
 	QueryRowContext(context.Context, string, ...any) *sql.Row
+	QueryContext(context.Context, string, ...any) (*sql.Rows, error)
 }
 
 func validWorkItemKind(kind string) bool { return kind == "bug" || kind == "feature" }

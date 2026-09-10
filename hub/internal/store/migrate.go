@@ -195,6 +195,9 @@ CREATE TABLE IF NOT EXISTS decision_answers (
 	if err := reconcileWorkItemHistory(db); err != nil {
 		return err
 	}
+	if err := migrateMessageAudit(db); err != nil {
+		return err
+	}
 	if err := migrateNarrative(db); err != nil {
 		return err
 	}

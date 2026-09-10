@@ -262,6 +262,7 @@ type UpdateAgentRequest struct {
 type PostMessageRequest struct {
 	WorkItems        []MessageWorkItem `json:"workItems,omitempty"`
 	WorkOrderMessage *MessageReference `json:"workOrderMessage,omitempty"`
+	AuditKind        string            `json:"auditKind,omitempty"`
 	RequestID        string            `json:"requestId,omitempty"`
 	ReplyTo          int64             `json:"replyTo,omitempty"`
 	Text             string            `json:"text"`

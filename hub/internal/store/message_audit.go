@@ -84,22 +84,38 @@ WHERE m.task_id=? AND m.seq=?`, taskID, seq))
 	if errors.Is(err, sql.ErrNoRows) {
 		return message, api.ErrNotFound
 	}
+	if err == nil {
+		original, auditErr := loadAuditOriginal(q, ctx, taskID, seq)
+		if auditErr != nil {
+			return message, auditErr
+		}
+		if original.Classification != api.MessageAuditUnclassified {
+			message.WorkItems = append([]api.MessageWorkItem(nil), original.WorkItems...)
+			message.WorkOrderMessage = original.WorkOrderMessage
+		}
+	}
 	return message, err
 }
 
 func validateMessageRequestShape(req api.PostMessageRequest) error {
-	if len(req.WorkItems) > 1 || (req.RequestID != "" && !validRequestID(req.RequestID)) {
+	classification := auditClassificationForPost(req)
+	if !validAuditClassification(classification, true) || (req.RequestID != "" && !validRequestID(req.RequestID)) {
 		return api.ErrInvalid
 	}
-	if len(req.WorkItems) == 0 {
-		if req.WorkOrderMessage != nil {
+	if classification == api.MessageAuditUnclassified {
+		if req.AuditKind != "" || len(req.WorkItems) != 0 || req.WorkOrderMessage != nil {
 			return api.ErrInvalid
 		}
 		return nil
 	}
-	link := req.WorkItems[0]
-	if req.RequestID == "" || link.Relationship != "primary" || !api.ValidID(link.ItemTaskID, "tsk") || !api.ValidID(link.ItemID, "wi") || link.ItemRevision < 1 {
+	if req.RequestID == "" || validateAuditLinkShape(classification, req.WorkItems) != nil {
 		return api.ErrInvalid
+	}
+	if classification == api.MessageAuditIntake {
+		if req.WorkOrderMessage != nil {
+			return api.ErrInvalid
+		}
+		return nil
 	}
 	if order := req.WorkOrderMessage; order != nil {
 		if !api.ValidID(order.TaskID, "tsk") || order.Seq < 1 {
@@ -121,23 +137,23 @@ func validateMessageContext(q queryRower, ctx context.Context, messageTaskID str
 	} else if err := validateMessageRequestShape(req); err != nil {
 		return err
 	}
-	if len(req.WorkItems) == 0 {
+	classification := auditClassificationForPost(req)
+	if classification != api.MessageAuditWork {
 		return nil
 	}
-	link := req.WorkItems[0]
-	if !allowCrossProject && link.ItemTaskID != messageTaskID {
-		return api.ErrInvalid
-	}
-	item, err := getWorkItem(q, ctx, link.ItemTaskID, link.ItemID)
-	if err != nil {
-		if errors.Is(err, api.ErrNotFound) {
-			return api.ErrInvalid
-		}
+	if _, err := validateAuditLinks(q, ctx, messageTaskID, classification, req.WorkItems, allowCrossProject); err != nil {
 		return err
 	}
-	if item.Revision != link.ItemRevision {
+	for _, link := range req.WorkItems {
+		item, err := getWorkItem(q, ctx, link.ItemTaskID, link.ItemID)
+		if err != nil {
+			return err
+		}
+		if item.Revision == link.ItemRevision {
+			continue
+		}
 		historicalAllowed := allowHistoricalRevision && link.ItemRevision < item.Revision
-		if !historicalAllowed && link.ItemRevision < item.Revision {
+		if !historicalAllowed && link.Relationship == "primary" && link.ItemRevision < item.Revision {
 			historicalAllowed, err = validatedBoundHistoricalMessage(q, ctx, messageTaskID, req)
 			if err != nil {
 				return err
@@ -148,7 +164,14 @@ func validateMessageContext(q queryRower, ctx context.Context, messageTaskID str
 		}
 	}
 	if order := req.WorkOrderMessage; order != nil {
-		if order.TaskID != link.ItemTaskID {
+		var primary api.MessageWorkItem
+		for _, link := range req.WorkItems {
+			if link.Relationship == "primary" {
+				primary = link
+				break
+			}
+		}
+		if order.TaskID != primary.ItemTaskID {
 			return api.ErrInvalid
 		}
 		var found int64
@@ -162,30 +185,39 @@ func validateMessageContext(q queryRower, ctx context.Context, messageTaskID str
 	return nil
 }
 
-func insertMessageContext(ctx context.Context, tx *sql.Tx, message *api.Message, req api.PostMessageRequest) error {
-	if len(req.WorkItems) == 0 {
+func insertMessageContext(ctx context.Context, tx *sql.Tx, message *api.Message, req api.PostMessageRequest, dispatch bool) error {
+	classification := auditClassificationForPost(req)
+	if classification == api.MessageAuditUnclassified {
 		return nil
 	}
-	link := req.WorkItems[0]
 	var orderTask any
 	var orderSeq any
 	if req.WorkOrderMessage != nil {
 		orderTask = req.WorkOrderMessage.TaskID
 		orderSeq = req.WorkOrderMessage.Seq
 	}
-	if _, err := tx.ExecContext(ctx, `INSERT INTO message_work_item_links
+	if classification == api.MessageAuditWork {
+		var primary api.MessageWorkItem
+		for _, link := range req.WorkItems {
+			if link.Relationship == "primary" {
+				primary = link
+				break
+			}
+		}
+		if _, err := tx.ExecContext(ctx, `INSERT INTO message_work_item_links
 (message_seq,message_task_id,item_task_id,item_id,item_revision,relationship,work_order_task_id,work_order_message_seq,created_at)
 VALUES(?,?,?,?,?,?,?,?,?)`,
-		message.Seq, message.TaskID, link.ItemTaskID, link.ItemID, link.ItemRevision, link.Relationship,
-		orderTask, orderSeq, ts(message.CreatedAt)); err != nil {
-		return err
+			message.Seq, message.TaskID, primary.ItemTaskID, primary.ItemID, primary.ItemRevision, primary.Relationship,
+			orderTask, orderSeq, ts(message.CreatedAt)); err != nil {
+			return err
+		}
 	}
-	message.WorkItems = append([]api.MessageWorkItem(nil), req.WorkItems...)
+	message.WorkItems = orderAuditLinks(req.WorkItems)
 	if req.WorkOrderMessage != nil {
 		order := *req.WorkOrderMessage
 		message.WorkOrderMessage = &order
 	}
-	return nil
+	return insertInitialMessageAudit(ctx, tx, message, req, dispatch)
 }
 
 func insertMessagePostReceipt(ctx context.Context, tx *sql.Tx, message *api.Message, requestID, payload string, by api.Caller) error {
