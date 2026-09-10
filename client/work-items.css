@@ -100,7 +100,10 @@
   font-size: 11px;
 }
 .work-item-history-layout nav button[aria-pressed="true"] {
-  background: var(--selection, color-mix(in srgb, var(--accent) 18%, transparent));
+  background: var(
+    --selection,
+    color-mix(in srgb, var(--accent) 18%, transparent)
+  );
 }
 .work-item-history-detail {
   display: grid;
@@ -116,7 +119,8 @@
 }
 .work-item-history-message {
   padding-top: 8px;
-  border-top: 1px solid var(--line, color-mix(in srgb, var(--muted) 25%, transparent));
+  border-top: 1px solid
+    var(--line, color-mix(in srgb, var(--muted) 25%, transparent));
 }
 .work-item-history-gaps {
   margin-top: 10px;
@@ -125,6 +129,75 @@
   display: grid;
   grid-template-columns: 1fr 1fr;
   gap: 12px;
+}
+.feature-narrative {
+  display: grid;
+  gap: 18px;
+  max-width: 900px;
+  max-height: 72vh;
+  overflow: auto;
+  padding-right: 4px;
+}
+.feature-narrative > section,
+.feature-narrative > header {
+  display: grid;
+  gap: 7px;
+}
+.feature-narrative h3,
+.feature-narrative h4,
+.feature-narrative p {
+  margin: 0;
+}
+.feature-report pre,
+.feature-chronology pre,
+.feature-artifact-detail pre {
+  margin: 0;
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}
+.feature-coverage,
+.feature-chronology,
+.feature-artifacts {
+  display: grid;
+  gap: 6px;
+}
+.feature-coverage article,
+.feature-chronology article,
+.feature-artifact-detail {
+  display: grid;
+  gap: 4px;
+  padding: 8px 0;
+  border-top: 1px solid
+    var(--line, color-mix(in srgb, var(--muted) 25%, transparent));
+}
+.feature-coverage article span,
+.feature-chronology article > span,
+.feature-chronology time,
+.feature-artifacts button span {
+  color: var(--muted);
+  font-size: 11px;
+}
+.feature-artifacts button {
+  display: grid;
+  gap: 3px;
+  height: auto;
+  padding: 7px 8px;
+  text-align: left;
+}
+.feature-artifact-versions {
+  display: flex;
+  gap: 6px;
+  margin-top: 8px;
+  overflow-x: auto;
+}
+.feature-artifact-versions button[aria-pressed="true"] {
+  background: var(
+    --selection,
+    color-mix(in srgb, var(--accent) 18%, transparent)
+  );
+}
+.feature-gap {
+  color: var(--muted);
 }
 
 @media (max-width: 760px) {

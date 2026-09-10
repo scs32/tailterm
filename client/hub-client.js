@@ -10,9 +10,10 @@ export function normalizeHubURL(value) {
   return url.length <= 200 && HUB_URL_RE.test(url) ? url : null;
 }
 export class HubError extends Error {
-  constructor(status, message) {
+  constructor(status, message, code = "") {
     super(message);
     this.status = status;
+    this.code = code;
   }
 }
 export function createHubClient({ fetchImpl, baseURL, token = "" }) {
@@ -40,6 +41,7 @@ export function createHubClient({ fetchImpl, baseURL, token = "" }) {
       throw new HubError(
         res.status,
         data?.error || res.statusText || "hub error",
+        data?.code || "",
       );
     if (method !== "GET")
       for (const listener of mutationListeners) {
@@ -97,6 +99,64 @@ export function createHubClient({ fetchImpl, baseURL, token = "" }) {
       request(`/v1/tasks/${task}/work-items/${id}/history-gaps` + q(params)),
     listWorkItemMessages: (task, id, params = {}) =>
       request(`/v1/tasks/${task}/work-items/${id}/messages` + q(params)),
+    getNarrativeOverview: (task, id) =>
+      request(`/v1/tasks/${task}/work-items/${id}/narrative`),
+    listNarrativeTimeline: (task, id, params = {}) =>
+      request(
+        `/v1/tasks/${task}/work-items/${id}/narrative/timeline` + q(params),
+      ),
+    listNarrativeArtifacts: (task, id, params = {}) =>
+      request(
+        `/v1/tasks/${task}/work-items/${id}/narrative/artifacts` + q(params),
+      ),
+    listNarrativeArtifactVersions: (task, id, artifact, params = {}) =>
+      request(
+        `/v1/tasks/${task}/work-items/${id}/narrative/artifacts/${encodeURIComponent(artifact)}/versions` +
+          q(params),
+      ),
+    getNarrativeArtifactVersion: (task, id, artifact, version) =>
+      request(
+        `/v1/tasks/${task}/work-items/${id}/narrative/artifacts/${encodeURIComponent(artifact)}/versions/${version}`,
+      ),
+    putNarrativeArtifact: (task, id, body) =>
+      request(`/v1/tasks/${task}/work-items/${id}/narrative/artifacts`, {
+        method: "POST",
+        body,
+      }),
+    listNarrativeLinks: (task, id, params = {}) =>
+      request(`/v1/tasks/${task}/work-items/${id}/narrative/links` + q(params)),
+    putNarrativeLink: (task, id, body) =>
+      request(`/v1/tasks/${task}/work-items/${id}/narrative/links`, {
+        method: "POST",
+        body,
+      }),
+    listNarrativeCoverage: (task, id, params = {}) =>
+      request(
+        `/v1/tasks/${task}/work-items/${id}/narrative/coverage` + q(params),
+      ),
+    putNarrativeCoverage: (task, id, body) =>
+      request(`/v1/tasks/${task}/work-items/${id}/narrative/coverage`, {
+        method: "POST",
+        body,
+      }),
+    listNarrativeReports: (task, id, params = {}) =>
+      request(
+        `/v1/tasks/${task}/work-items/${id}/narrative/reports` + q(params),
+      ),
+    getNarrativeReportVersion: (task, id, report, version) =>
+      request(
+        `/v1/tasks/${task}/work-items/${id}/narrative/reports/${encodeURIComponent(report)}/versions/${version}`,
+      ),
+    putNarrativeReport: (task, id, body) =>
+      request(`/v1/tasks/${task}/work-items/${id}/narrative/reports`, {
+        method: "POST",
+        body,
+      }),
+    getNarrativeReceipt: (task, id, requestId, params = {}) =>
+      request(
+        `/v1/tasks/${task}/work-items/${id}/narrative/receipts/${encodeURIComponent(requestId)}` +
+          q(params),
+      ),
     dispatchWorkItem: (task, id, body) =>
       request(`/v1/tasks/${task}/work-items/${id}/dispatch`, {
         method: "POST",

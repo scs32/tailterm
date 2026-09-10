@@ -172,7 +172,30 @@ CREATE TABLE IF NOT EXISTS decision_answers (
 );`); err != nil {
 		return err
 	}
+	for _, c := range []struct{ name, definition string }{
+		{"narrative_scope_revision", "INTEGER NOT NULL DEFAULT 0"},
+		{"completion_report_id", "TEXT NOT NULL DEFAULT ''"},
+		{"completion_report_version", "INTEGER NOT NULL DEFAULT 0"},
+		{"completion_report_digest", "TEXT NOT NULL DEFAULT ''"},
+		{"completion_scope_revision", "INTEGER NOT NULL DEFAULT 0"},
+	} {
+		var n int
+		if err := db.QueryRow(`SELECT count(*) FROM pragma_table_info('work_items') WHERE name=?`, c.name).Scan(&n); err != nil {
+			return err
+		}
+		if n == 0 {
+			if _, err := db.Exec("ALTER TABLE work_items ADD COLUMN " + c.name + " " + c.definition); err != nil {
+				return err
+			}
+		}
+	}
+	if _, err := db.Exec(`UPDATE work_items SET narrative_scope_revision=revision WHERE narrative_scope_revision=0`); err != nil {
+		return err
+	}
 	if err := reconcileWorkItemHistory(db); err != nil {
+		return err
+	}
+	if err := migrateNarrative(db); err != nil {
 		return err
 	}
 	_, err := db.Exec(`INSERT OR IGNORE INTO profile_meta(key,value) VALUES('instance',?)`, api.NewID("profilehub"))

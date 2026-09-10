@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -138,6 +139,46 @@ func TestWorkItemsCLIRejectsUnsafeScopeAndOversizedBody(t *testing.T) {
 	}
 	if _, err := bodyFile(large); err == nil || !strings.Contains(err.Error(), "exceeds") {
 		t.Fatalf("oversized body = %v", err)
+	}
+}
+
+func TestWorkItemsCLINarrativeReportQueryAndDonePin(t *testing.T) {
+	e, c, task, _ := cliWorkItemFixture(t)
+	item, err := c.CreateWorkItem(context.Background(), task.ID, api.CreateWorkItemRequest{Kind: "feature", Title: "CLI narrative", AgentID: e.agent, RequestID: "cli-narrative-item"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := api.PutNarrativeReportRequest{RequestID: "cli-report-1", ScopeRevision: item.ScopeRevision, Sections: api.NarrativeReportSections{RequestedOutcome: "Store a full report.", DeliveredWork: strings.Repeat("durable CLI content ", 500), Verification: "Isolated CLI and HTTP readback.", Limitations: "No release claim.", RemainingWork: "Release separately."}, References: []api.NarrativeReference{{Kind: "work-item-revision", TaskID: task.ID, ItemID: item.ID, Revision: 1, Label: "scope"}}}
+	reportFile := filepath.Join(t.TempDir(), "report.json")
+	raw, _ := json.Marshal(req)
+	if err = os.WriteFile(reportFile, raw, 0600); err != nil {
+		t.Fatal(err)
+	}
+	out, err := captureCLIOutput(t, func() error {
+		return cmdWorkItems(e, []string{"narrative", "report-put", "--file", reportFile, item.ID})
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var report api.NarrativeReportVersion
+	if err = json.Unmarshal([]byte(out), &report); err != nil || report.Digest == "" || len(report.Sections.DeliveredWork) <= 8192 {
+		t.Fatalf("report output=%d %v", len(out), err)
+	}
+	overview, err := captureCLIOutput(t, func() error { return cmdWorkItems(e, []string{"narrative", "overview", item.ID}) })
+	if err != nil || !strings.Contains(overview, report.ReportID) || !strings.Contains(overview, "not-ingested") {
+		t.Fatalf("overview=%q %v", overview, err)
+	}
+	doneOut, err := captureCLIOutput(t, func() error {
+		return cmdWorkItems(e, []string{"update", "--revision", "1", "--request-id", "cli-done-1", "--status", "done", "--report-id", report.ReportID, "--report-version", "1", "--report-digest", report.Digest, "--report-scope-revision", "1", item.ID})
+	})
+	if err != nil || !strings.Contains(doneOut, "revision 2") {
+		t.Fatalf("done=%q %v", doneOut, err)
+	}
+	receipt, err := captureCLIOutput(t, func() error {
+		return cmdWorkItems(e, []string{"narrative", "receipt", "--operation", "report", "--request-id", "cli-report-1", item.ID})
+	})
+	if err != nil || !strings.Contains(receipt, "cli-report-1") {
+		t.Fatalf("receipt=%q %v", receipt, err)
 	}
 }
 

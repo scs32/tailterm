@@ -505,10 +505,19 @@ function mount() {
     taskHub = createTaskHub({
       getIPN: () => (netState === "Running" ? ipn : null),
       getData: () => data,
-      createReadCache: () => createHubReadCache(localVault.hubReadCachePersistence()),
+      createReadCache: () =>
+        createHubReadCache(localVault.hubReadCachePersistence()),
       onClientChange: () => {
-        const view = { board: boardView, tasks: tasksView, bugs: bugsView, features: featuresView }[modes?.get()];
-        if (view) { view.hide(); void view.show(); }
+        const view = {
+          board: boardView,
+          tasks: tasksView,
+          bugs: bugsView,
+          features: featuresView,
+        }[modes?.get()];
+        if (view) {
+          view.hide();
+          void view.show();
+        }
       },
       reloadData: async () => {
         data = await api("/data");
@@ -693,6 +702,15 @@ function mount() {
         }
       },
     });
+    const featureRoute = location.hash.match(
+      /^#feature-history\/(tsk_[0-9a-f]{16})\/(wi_[0-9a-f]{16})$/,
+    );
+    if (featureRoute) {
+      modes.set("features");
+      void featuresView
+        .show(featureRoute[1])
+        .then(() => featuresView.openNarrative(featureRoute[2], false));
+    }
   }
   if (staticMode) {
     $("#backup-vault").insertAdjacentHTML(

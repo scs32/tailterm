@@ -65,6 +65,20 @@ func New(st *store.Store, identity Identity) *Server {
 	m.HandleFunc("POST /v1/tasks/{id}/work-items/{wid}/updates", s.createWorkItemUpdate)
 	m.HandleFunc("GET /v1/tasks/{id}/work-items/{wid}/updates/receipts/{requestID}", s.getWorkItemUpdateReceipt)
 	m.HandleFunc("POST /v1/tasks/{id}/work-items/{wid}/dispatch", s.dispatchWorkItem)
+	m.HandleFunc("GET /v1/tasks/{id}/work-items/{wid}/narrative", s.getNarrativeOverview)
+	m.HandleFunc("GET /v1/tasks/{id}/work-items/{wid}/narrative/timeline", s.listNarrativeTimeline)
+	m.HandleFunc("GET /v1/tasks/{id}/work-items/{wid}/narrative/artifacts", s.listNarrativeArtifacts)
+	m.HandleFunc("POST /v1/tasks/{id}/work-items/{wid}/narrative/artifacts", s.putNarrativeArtifact)
+	m.HandleFunc("GET /v1/tasks/{id}/work-items/{wid}/narrative/artifacts/{artifact}/versions", s.listNarrativeArtifactVersions)
+	m.HandleFunc("GET /v1/tasks/{id}/work-items/{wid}/narrative/artifacts/{artifact}/versions/{version}", s.getNarrativeArtifactVersion)
+	m.HandleFunc("GET /v1/tasks/{id}/work-items/{wid}/narrative/links", s.listNarrativeLinks)
+	m.HandleFunc("POST /v1/tasks/{id}/work-items/{wid}/narrative/links", s.putNarrativeLink)
+	m.HandleFunc("GET /v1/tasks/{id}/work-items/{wid}/narrative/coverage", s.listNarrativeCoverage)
+	m.HandleFunc("POST /v1/tasks/{id}/work-items/{wid}/narrative/coverage", s.putNarrativeCoverage)
+	m.HandleFunc("GET /v1/tasks/{id}/work-items/{wid}/narrative/reports", s.listNarrativeReports)
+	m.HandleFunc("POST /v1/tasks/{id}/work-items/{wid}/narrative/reports", s.putNarrativeReport)
+	m.HandleFunc("GET /v1/tasks/{id}/work-items/{wid}/narrative/reports/{report}/versions/{version}", s.getNarrativeReportVersion)
+	m.HandleFunc("GET /v1/tasks/{id}/work-items/{wid}/narrative/receipts/{requestID}", s.getNarrativeReceipt)
 	m.HandleFunc("GET /v1/events", s.globalEvents)
 	return s
 }
@@ -124,6 +138,10 @@ func fail(w http.ResponseWriter, err error) {
 		writeError(w, http.StatusBadRequest, "invalid request")
 	case errors.Is(err, api.ErrConflict):
 		writeError(w, http.StatusConflict, err.Error())
+	case errors.Is(err, api.ErrNarrativeReportRequired):
+		writeJSON(w, http.StatusConflict, api.ErrorResponse{Error: err.Error(), Code: "report-required"})
+	case errors.Is(err, api.ErrNarrativeReportStale):
+		writeJSON(w, http.StatusConflict, api.ErrorResponse{Error: err.Error(), Code: "report-stale"})
 	case errors.Is(err, api.ErrLimit):
 		writeError(w, http.StatusConflict, "limit reached")
 	case errors.Is(err, api.ErrClosed):

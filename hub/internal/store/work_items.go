@@ -14,7 +14,7 @@ import (
 	"github.com/scs32/tailterm/hub/internal/api"
 )
 
-const workItemCols = `seq,id,task_id,kind,title,description,status,priority,revision,source_message_seq,created_agent,created_node,created_user,updated_agent,updated_node,updated_user,created_at,updated_at`
+const workItemCols = `seq,id,task_id,kind,title,description,status,priority,revision,source_message_seq,created_agent,created_node,created_user,updated_agent,updated_node,updated_user,created_at,updated_at,narrative_scope_revision,completion_report_id,completion_report_version,completion_report_digest,completion_scope_revision`
 
 type queryRower interface {
 	QueryRowContext(context.Context, string, ...any) *sql.Row
@@ -67,9 +67,14 @@ func workItemConflict(message string) error {
 func scanWorkItem(row interface{ Scan(...any) error }) (api.WorkItem, error) {
 	var item api.WorkItem
 	var created, updated string
+	var completion api.NarrativeReportPin
 	err := row.Scan(&item.Seq, &item.ID, &item.TaskID, &item.Kind, &item.Title, &item.Description, &item.Status, &item.Priority, &item.Revision, &item.SourceMessageSeq,
-		&item.CreatedBy.AgentID, &item.CreatedBy.Node, &item.CreatedBy.User, &item.UpdatedBy.AgentID, &item.UpdatedBy.Node, &item.UpdatedBy.User, &created, &updated)
+		&item.CreatedBy.AgentID, &item.CreatedBy.Node, &item.CreatedBy.User, &item.UpdatedBy.AgentID, &item.UpdatedBy.Node, &item.UpdatedBy.User, &created, &updated,
+		&item.ScopeRevision, &completion.ReportID, &completion.Version, &completion.Digest, &completion.ScopeRevision)
 	item.CreatedAt, item.UpdatedAt = parseTS(created), parseTS(updated)
+	if completion.ReportID != "" {
+		item.CompletionReport = &completion
+	}
 	return item, err
 }
 
@@ -252,10 +257,10 @@ func (s *Store) CreateWorkItem(ctx context.Context, taskID string, req api.Creat
 		return api.WorkItem{}, err
 	}
 	now := s.now()
-	item := api.WorkItem{ID: api.NewID("wi"), TaskID: taskID, Kind: req.Kind, Title: req.Title, Description: req.Description, Status: "open", Priority: req.Priority, Revision: 1, SourceMessageSeq: req.SourceMessageSeq,
+	item := api.WorkItem{ID: api.NewID("wi"), TaskID: taskID, Kind: req.Kind, Title: req.Title, Description: req.Description, Status: "open", Priority: req.Priority, Revision: 1, ScopeRevision: 1, SourceMessageSeq: req.SourceMessageSeq,
 		CreatedBy: api.Sender{AgentID: req.AgentID, Node: by.Node, User: by.User}, UpdatedBy: api.Sender{AgentID: req.AgentID, Node: by.Node, User: by.User}, CreatedAt: now, UpdatedAt: now}
-	result, err := tx.ExecContext(ctx, `INSERT INTO work_items(id,task_id,kind,title,description,status,priority,revision,source_message_seq,created_agent,created_node,created_user,updated_agent,updated_node,updated_user,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-		item.ID, item.TaskID, item.Kind, item.Title, item.Description, item.Status, item.Priority, item.Revision, item.SourceMessageSeq, item.CreatedBy.AgentID, item.CreatedBy.Node, item.CreatedBy.User, item.UpdatedBy.AgentID, item.UpdatedBy.Node, item.UpdatedBy.User, ts(now), ts(now))
+	result, err := tx.ExecContext(ctx, `INSERT INTO work_items(id,task_id,kind,title,description,status,priority,revision,source_message_seq,created_agent,created_node,created_user,updated_agent,updated_node,updated_user,created_at,updated_at,narrative_scope_revision) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		item.ID, item.TaskID, item.Kind, item.Title, item.Description, item.Status, item.Priority, item.Revision, item.SourceMessageSeq, item.CreatedBy.AgentID, item.CreatedBy.Node, item.CreatedBy.User, item.UpdatedBy.AgentID, item.UpdatedBy.Node, item.UpdatedBy.User, ts(now), ts(now), item.ScopeRevision)
 	if err != nil {
 		return api.WorkItem{}, err
 	}
@@ -317,6 +322,15 @@ func (s *Store) UpdateWorkItem(ctx context.Context, taskID, itemID string, req a
 	if item.Revision != req.Revision {
 		return api.WorkItem{}, workItemConflict("work item revision changed; refresh it before updating")
 	}
+	transitioningDone := item.Kind == "feature" && item.Status != "done" && req.Status != nil && *req.Status == "done"
+	if transitioningDone {
+		if req.Title != nil || req.Description != nil {
+			return api.WorkItem{}, api.ErrNarrativeReportStale
+		}
+		if err = validateNarrativeCompletion(ctx, tx, item, req.CompletionReport); err != nil {
+			return api.WorkItem{}, err
+		}
+	}
 	if err = validateWorkItemAgent(tx, ctx, taskID, req.AgentID); err != nil {
 		return api.WorkItem{}, err
 	}
@@ -338,6 +352,9 @@ func (s *Store) UpdateWorkItem(ctx context.Context, taskID, itemID string, req a
 		changed["description"] = item.Description
 		changedFields = append(changedFields, "description")
 	}
+	if req.Title != nil || req.Description != nil {
+		item.ScopeRevision++
+	}
 	if req.Status != nil {
 		if !validWorkItemStatus(*req.Status) {
 			return api.WorkItem{}, api.ErrInvalid
@@ -358,8 +375,15 @@ func (s *Store) UpdateWorkItem(ctx context.Context, taskID, itemID string, req a
 	item.Revision++
 	item.UpdatedAt = now
 	item.UpdatedBy = api.Sender{AgentID: req.AgentID, Node: by.Node, User: by.User}
-	result, err := tx.ExecContext(ctx, `UPDATE work_items SET title=?,description=?,status=?,priority=?,revision=?,updated_agent=?,updated_node=?,updated_user=?,updated_at=? WHERE task_id=? AND id=? AND revision=?`,
-		item.Title, item.Description, item.Status, item.Priority, item.Revision, item.UpdatedBy.AgentID, item.UpdatedBy.Node, item.UpdatedBy.User, ts(now), taskID, itemID, req.Revision)
+	if transitioningDone {
+		item.CompletionReport = req.CompletionReport
+	}
+	completion := api.NarrativeReportPin{}
+	if item.CompletionReport != nil {
+		completion = *item.CompletionReport
+	}
+	result, err := tx.ExecContext(ctx, `UPDATE work_items SET title=?,description=?,status=?,priority=?,revision=?,updated_agent=?,updated_node=?,updated_user=?,updated_at=?,narrative_scope_revision=?,completion_report_id=?,completion_report_version=?,completion_report_digest=?,completion_scope_revision=? WHERE task_id=? AND id=? AND revision=?`,
+		item.Title, item.Description, item.Status, item.Priority, item.Revision, item.UpdatedBy.AgentID, item.UpdatedBy.Node, item.UpdatedBy.User, ts(now), item.ScopeRevision, completion.ReportID, completion.Version, completion.Digest, completion.ScopeRevision, taskID, itemID, req.Revision)
 	if err != nil {
 		return api.WorkItem{}, err
 	}
@@ -381,6 +405,11 @@ func (s *Store) UpdateWorkItem(ctx context.Context, taskID, itemID string, req a
 	}
 	if err = insertWorkItemRevision(ctx, tx, revisionFromItem(item, "", "updated", "native", changedFields), changeSeq); err != nil {
 		return api.WorkItem{}, err
+	}
+	if transitioningDone {
+		if err = insertNarrativeCompletion(ctx, tx, item, completion, req.AgentID, "", by, now); err != nil {
+			return api.WorkItem{}, err
+		}
 	}
 	if err = refreshWorkItemHistoryState(ctx, tx, item, ts(now)); err != nil {
 		return api.WorkItem{}, err
@@ -491,6 +520,15 @@ func (s *Store) CreateWorkItemUpdate(ctx context.Context, taskID, itemID string,
 	if item.Revision != req.ExpectedRevision {
 		return api.WorkItemUpdateResult{}, false, workItemConflict("work item revision changed; refresh it before updating")
 	}
+	transitioningDone := item.Kind == "feature" && item.Status != "done" && req.Status != nil && *req.Status == "done"
+	if transitioningDone {
+		if req.Title != nil || req.Description != nil {
+			return api.WorkItemUpdateResult{}, false, api.ErrNarrativeReportStale
+		}
+		if err = validateNarrativeCompletion(ctx, tx, item, req.CompletionReport); err != nil {
+			return api.WorkItemUpdateResult{}, false, err
+		}
+	}
 	if err = validateWorkItemAgent(tx, ctx, taskID, req.AgentID); err != nil {
 		return api.WorkItemUpdateResult{}, false, err
 	}
@@ -525,11 +563,21 @@ func (s *Store) CreateWorkItemUpdate(ctx context.Context, taskID, itemID string,
 		changed["priority"] = item.Priority
 		changedFields = append(changedFields, "priority")
 	}
+	if req.Title != nil || req.Description != nil {
+		item.ScopeRevision++
+	}
 	now := s.now()
 	item.Revision++
 	item.UpdatedAt = now
 	item.UpdatedBy = api.Sender{AgentID: req.AgentID, Node: by.Node, User: by.User}
-	update, err := tx.ExecContext(ctx, `UPDATE work_items SET title=?,description=?,status=?,priority=?,revision=?,updated_agent=?,updated_node=?,updated_user=?,updated_at=? WHERE task_id=? AND id=? AND revision=?`, item.Title, item.Description, item.Status, item.Priority, item.Revision, item.UpdatedBy.AgentID, item.UpdatedBy.Node, item.UpdatedBy.User, ts(now), taskID, itemID, req.ExpectedRevision)
+	if transitioningDone {
+		item.CompletionReport = req.CompletionReport
+	}
+	completion := api.NarrativeReportPin{}
+	if item.CompletionReport != nil {
+		completion = *item.CompletionReport
+	}
+	update, err := tx.ExecContext(ctx, `UPDATE work_items SET title=?,description=?,status=?,priority=?,revision=?,updated_agent=?,updated_node=?,updated_user=?,updated_at=?,narrative_scope_revision=?,completion_report_id=?,completion_report_version=?,completion_report_digest=?,completion_scope_revision=? WHERE task_id=? AND id=? AND revision=?`, item.Title, item.Description, item.Status, item.Priority, item.Revision, item.UpdatedBy.AgentID, item.UpdatedBy.Node, item.UpdatedBy.User, ts(now), item.ScopeRevision, completion.ReportID, completion.Version, completion.Digest, completion.ScopeRevision, taskID, itemID, req.ExpectedRevision)
 	if err != nil {
 		return api.WorkItemUpdateResult{}, false, err
 	}
@@ -552,6 +600,11 @@ func (s *Store) CreateWorkItemUpdate(ctx context.Context, taskID, itemID string,
 	revision := revisionFromItem(item, req.RunID, "updated", "native", changedFields)
 	if err = insertWorkItemRevision(ctx, tx, revision, changeSeq); err != nil {
 		return api.WorkItemUpdateResult{}, false, err
+	}
+	if transitioningDone {
+		if err = insertNarrativeCompletion(ctx, tx, item, completion, req.AgentID, req.RunID, by, now); err != nil {
+			return api.WorkItemUpdateResult{}, false, err
+		}
 	}
 	receipt = api.WorkItemUpdateReceipt{ID: api.NewID("wir"), RequestID: req.RequestID, TaskID: taskID, ItemID: itemID, ResultRevision: item.Revision, CreatedAt: now}
 	if _, err = tx.ExecContext(ctx, `INSERT INTO work_item_update_requests(receipt_id,task_id,item_id,agent_id,run_id,by_node,by_user,request_id,payload_hash,result_revision,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)`, receipt.ID, taskID, itemID, req.AgentID, req.RunID, by.Node, by.User, req.RequestID, payload, item.Revision, ts(now)); err != nil {

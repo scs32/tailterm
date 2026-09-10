@@ -58,7 +58,7 @@ func bodyFile(path string) (string, error) {
 
 func cmdWorkItems(e env, args []string) error {
 	if len(args) == 0 {
-		return errors.New("usage: tt work-items <list|get|create|update|receipt|dispatch|revisions|messages>")
+		return errors.New("usage: tt work-items <list|get|create|update|receipt|dispatch|revisions|messages|narrative>")
 	}
 	switch args[0] {
 	case "list":
@@ -77,6 +77,8 @@ func cmdWorkItems(e env, args []string) error {
 		return cmdWorkItemRevisions(e, args[1:])
 	case "messages":
 		return cmdWorkItemMessages(e, args[1:])
+	case "narrative":
+		return cmdWorkItemNarrative(e, args[1:])
 	default:
 		return fmt.Errorf("unknown work-items command %q", args[0])
 	}
@@ -209,6 +211,10 @@ func cmdWorkItemUpdate(e env, args []string) error {
 	status := fs.String("status", "", "new status")
 	priority := fs.String("priority", "", "new priority")
 	requestID := fs.String("request-id", "", "stable retry key (required)")
+	reportID := fs.String("report-id", "", "completion report id (required when marking a feature done)")
+	reportVersion := fs.Int64("report-version", 0, "completion report version")
+	reportDigest := fs.String("report-digest", "", "completion report SHA-256")
+	reportScope := fs.Int64("report-scope-revision", 0, "completion report feature scope revision")
 	asJSON := fs.Bool("json", false, "JSON output")
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -223,6 +229,9 @@ func cmdWorkItemUpdate(e env, args []string) error {
 	visited := map[string]bool{}
 	fs.Visit(func(f *flag.Flag) { visited[f.Name] = true })
 	req := api.CreateWorkItemUpdate{ExpectedRevision: *revision, AgentID: e.agent, RunID: e.runID, RequestID: *requestID}
+	if *reportID != "" || *reportVersion != 0 || *reportDigest != "" || *reportScope != 0 {
+		req.CompletionReport = &api.NarrativeReportPin{ReportID: *reportID, Version: *reportVersion, Digest: *reportDigest, ScopeRevision: *reportScope}
+	}
 	if visited["title"] {
 		req.Title = title
 	}

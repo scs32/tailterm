@@ -52,7 +52,8 @@ export function createWorkItemsView({
     scope = "",
     state = "",
     loading = false,
-    again = false;
+    again = false,
+    narrativeGeneration = 0;
   const presentation = createViewRefreshPresentation({
     render: () => {
       if (visible && !loading) render();
@@ -154,7 +155,7 @@ export function createWorkItemsView({
       projectButton = (task) =>
         `<button type="button" data-board-task="${esc(task.id)}" data-items-scope="${esc(task.id)}" aria-pressed="${scope === task.id}" title="${esc(task.name)}"><span class="board-task-name">${esc(task.name)}</span><span class="fine">${esc(task.goal || (task.status === "closed" ? "Closed project" : "Open project"))}</span></button>`;
     if (!presentation.beforeRender(scope || "all")) return;
-    root.innerHTML = `<div class="board mode-board work-items-view"><aside class="board-rail work-items-rail" aria-label="Projects"><div class="board-rail-head"><span class="eyebrow">PROJECTS</span><button type="button" data-items-new-rail title="New ${singular.toLowerCase()}" aria-label="New ${singular.toLowerCase()}" ${!open.length || selectedProject?.status === "closed" ? "disabled" : ""}>＋</button></div><button type="button" data-board-task="all" data-items-scope="" aria-pressed="${!scope}"><span class="board-task-name">All projects</span><span class="fine">${open.length} open project${open.length === 1 ? "" : "s"}</span></button>${open.map(projectButton).join("")}${closed.length ? `<details class="board-closed work-items-closed" data-view-disclosure="closed" ${selectedProject?.status === "closed" ? "open" : ""}><summary>Closed · ${closed.length}</summary>${closed.map(projectButton).join("")}</details>` : ""}</aside><section class="board-thread work-items-main"><div class="board-head work-items-head"><div class="view-heading"><div class="work-items-heading"><span class="eyebrow">${selectedProject ? "PROJECT" : "ALL PROJECTS"}</span><h2>${plural} <span class="count-badge">${items.length}</span></h2></div><div class="work-items-controls"><label class="work-items-project-select"><span>Project</span><select data-items-project data-view-control="project"><option value="">All projects</option>${tasks.map((t) => `<option value="${esc(t.id)}" ${scope === t.id ? "selected" : ""}>${esc(t.name)}${t.status === "closed" ? " · closed" : ""}</option>`).join("")}</select></label><label class="work-items-status-select"><span>Status</span><select data-items-status data-view-control="status"><option value="">All statuses</option>${options(statuses, state)}</select></label><span class="work-items-sync fine" data-work-items-sync role="status" aria-live="polite">${esc(syncLabel)}</span><button data-items-new class="primary" ${!open.length || selectedProject?.status === "closed" ? "disabled" : ""}>＋ New ${singular.toLowerCase()}</button></div></div><p class="fine">${esc(selectedProject?.name || "All projects")}</p></div><div class="work-items-list">${items.length ? items.map((item) => `<article class="work-item" data-work-item="${esc(item.id)}"><div class="work-item-copy"><button class="work-item-title" data-item-edit="${esc(item.id)}">${esc(item.title)}</button><span class="fine">${esc(project(item.taskId)?.name || item.taskId)} · ${esc(statuses[item.status])} · ${esc(priorities[item.priority])}${item.lastDispatch ? ` · Sent to ${esc(project(item.lastDispatch.targetTaskId)?.name || item.lastDispatch.targetTaskId)}` : ""}</span></div><div class="work-item-actions"><button data-item-history="${esc(item.id)}">History · ${item.revision}</button><button data-item-send="${esc(item.id)}" ${project(item.taskId)?.status === "closed" ? "disabled" : ""}>Send to project</button></div></article>`).join("") : `<p class="work-items-empty fine">No ${plural.toLowerCase()} match these filters.</p>`}</div></section></div>`;
+    root.innerHTML = `<div class="board mode-board work-items-view"><aside class="board-rail work-items-rail" aria-label="Projects"><div class="board-rail-head"><span class="eyebrow">PROJECTS</span><button type="button" data-items-new-rail title="New ${singular.toLowerCase()}" aria-label="New ${singular.toLowerCase()}" ${!open.length || selectedProject?.status === "closed" ? "disabled" : ""}>＋</button></div><button type="button" data-board-task="all" data-items-scope="" aria-pressed="${!scope}"><span class="board-task-name">All projects</span><span class="fine">${open.length} open project${open.length === 1 ? "" : "s"}</span></button>${open.map(projectButton).join("")}${closed.length ? `<details class="board-closed work-items-closed" data-view-disclosure="closed" ${selectedProject?.status === "closed" ? "open" : ""}><summary>Closed · ${closed.length}</summary>${closed.map(projectButton).join("")}</details>` : ""}</aside><section class="board-thread work-items-main"><div class="board-head work-items-head"><div class="view-heading"><div class="work-items-heading"><span class="eyebrow">${selectedProject ? "PROJECT" : "ALL PROJECTS"}</span><h2>${plural} <span class="count-badge">${items.length}</span></h2></div><div class="work-items-controls"><label class="work-items-project-select"><span>Project</span><select data-items-project data-view-control="project"><option value="">All projects</option>${tasks.map((t) => `<option value="${esc(t.id)}" ${scope === t.id ? "selected" : ""}>${esc(t.name)}${t.status === "closed" ? " · closed" : ""}</option>`).join("")}</select></label><label class="work-items-status-select"><span>Status</span><select data-items-status data-view-control="status"><option value="">All statuses</option>${options(statuses, state)}</select></label><span class="work-items-sync fine" data-work-items-sync role="status" aria-live="polite">${esc(syncLabel)}</span><button data-items-new class="primary" ${!open.length || selectedProject?.status === "closed" ? "disabled" : ""}>＋ New ${singular.toLowerCase()}</button></div></div><p class="fine">${esc(selectedProject?.name || "All projects")}</p></div><div class="work-items-list">${items.length ? items.map((item) => `<article class="work-item" data-work-item="${esc(item.id)}"><div class="work-item-copy"><button class="work-item-title" data-item-edit="${esc(item.id)}">${esc(item.title)}</button><span class="fine">${esc(project(item.taskId)?.name || item.taskId)} · ${esc(statuses[item.status])} · ${esc(priorities[item.priority])}${item.lastDispatch ? ` · Sent to ${esc(project(item.lastDispatch.targetTaskId)?.name || item.lastDispatch.targetTaskId)}` : ""}</span></div><div class="work-item-actions">${kind === "feature" ? `<button data-item-narrative="${esc(item.id)}">History &amp; report</button>` : ""}<button data-item-history="${esc(item.id)}">History · ${item.revision}</button><button data-item-send="${esc(item.id)}" ${project(item.taskId)?.status === "closed" ? "disabled" : ""}>Send to project</button></div></article>`).join("") : `<p class="work-items-empty fine">No ${plural.toLowerCase()} match these filters.</p>`}</div></section></div>`;
     presentation.afterRender(scope || "all");
     root.querySelectorAll("[data-items-scope]").forEach(
       (button) =>
@@ -176,7 +177,7 @@ export function createWorkItemsView({
     root.querySelector("[data-items-new]").onclick = () => edit();
     root.querySelector("[data-items-new-rail]").onclick = () => edit();
     root
-        .querySelectorAll("[data-item-edit]")
+      .querySelectorAll("[data-item-edit]")
       .forEach(
         (b) =>
           (b.onclick = () =>
@@ -190,6 +191,13 @@ export function createWorkItemsView({
             history(items.find((i) => i.id === b.dataset.itemHistory))),
       );
     root
+      .querySelectorAll("[data-item-narrative]")
+      .forEach(
+        (b) =>
+          (b.onclick = () =>
+            narrative(items.find((i) => i.id === b.dataset.itemNarrative))),
+      );
+    root
       .querySelectorAll("[data-item-send]")
       .forEach(
         (b) =>
@@ -199,12 +207,11 @@ export function createWorkItemsView({
     itemScroll.afterRender(itemScrollFrame);
   }
   const memoryDrafts = new Map();
-  const drafts =
-    draftPersistence || {
-      load: async (_, id) => structuredClone(memoryDrafts.get(id) || null),
-      save: async (draft) => memoryDrafts.set(draft.id, structuredClone(draft)),
-      remove: async (_, id) => memoryDrafts.delete(id),
-    };
+  const drafts = draftPersistence || {
+    load: async (_, id) => structuredClone(memoryDrafts.get(id) || null),
+    save: async (draft) => memoryDrafts.set(draft.id, structuredClone(draft)),
+    remove: async (_, id) => memoryDrafts.delete(id),
+  };
   async function draftScope() {
     const value = JSON.stringify([client()?.base || "", client()?.token || ""]),
       bytes = await crypto.subtle.digest(
@@ -219,7 +226,9 @@ export function createWorkItemsView({
     const readonly = item && project(item.taskId)?.status === "closed";
     const credentialScope = await draftScope(),
       draftID = `${kind}:${item?.taskId || scope || "all"}:${item?.id || "new"}`,
-      saved = readonly ? null : await drafts.load(credentialScope, draftID).catch(() => null),
+      saved = readonly
+        ? null
+        : await drafts.load(credentialScope, draftID).catch(() => null),
       savedValues = saved?.values || {};
     dialog(
       item ? singular : `New ${singular.toLowerCase()}`,
@@ -255,13 +264,20 @@ export function createWorkItemsView({
         updatedAt: new Date().toISOString(),
       });
     if (!readonly)
-      form.querySelectorAll("input,textarea,select").forEach((control) =>
-        control.addEventListener("input", () => void persist().catch(() => {})),
-      );
-    form.querySelector("[data-item-discard]")?.addEventListener("click", async () => {
-      await drafts.remove(credentialScope, draftID).catch(() => {});
-      if (form.isConnected) closeDialog();
-    });
+      form
+        .querySelectorAll("input,textarea,select")
+        .forEach((control) =>
+          control.addEventListener(
+            "input",
+            () => void persist().catch(() => {}),
+          ),
+        );
+    form
+      .querySelector("[data-item-discard]")
+      ?.addEventListener("click", async () => {
+        await drafts.remove(credentialScope, draftID).catch(() => {});
+        if (form.isConnected) closeDialog();
+      });
     form
       .querySelector("[data-item-dispatch]")
       ?.addEventListener("click", () => dispatch(item));
@@ -297,8 +313,7 @@ export function createWorkItemsView({
         : "";
       if (
         intent &&
-        (intentPayload !== payload ||
-          (!item && intent.request?.kind !== kind))
+        (intentPayload !== payload || (!item && intent.request?.kind !== kind))
       ) {
         key = crypto.randomUUID();
         intent = null;
@@ -362,17 +377,29 @@ export function createWorkItemsView({
     );
     const panel = document.querySelector(".work-item-history");
     try {
-      const revisions = [], gaps = [];
+      const revisions = [],
+        gaps = [];
       let after = 0;
       do {
-        const page = await client().listWorkItemRevisions(item.taskId, item.id, { after, limit: 32 });
+        const page = await client().listWorkItemRevisions(
+          item.taskId,
+          item.id,
+          { after, limit: 32 },
+        );
         revisions.push(...page.revisions);
-        if (!page.nextAfter) { after = 0; break; }
+        if (!page.nextAfter) {
+          after = 0;
+          break;
+        }
         after = page.nextAfter;
       } while (panel.isConnected);
       let gapAfter = 0;
       do {
-        const page = await client().listWorkItemHistoryGaps(item.taskId, item.id, { after: gapAfter, limit: 32 });
+        const page = await client().listWorkItemHistoryGaps(
+          item.taskId,
+          item.id,
+          { after: gapAfter, limit: 32 },
+        );
         gaps.push(...page.gaps);
         if (!page.nextAfter) break;
         gapAfter = page.nextAfter;
@@ -381,14 +408,26 @@ export function createWorkItemsView({
       panel.innerHTML = `<div class="work-item-history-layout"><nav aria-label="Revisions">${revisions
         .slice()
         .reverse()
-        .map((r) => `<button type="button" data-history-revision="${r.revision}" aria-pressed="false"><strong>v${r.revision}</strong><span>${esc(r.changeKind)} · ${esc(r.updatedAt)}</span></button>`)
-        .join("")}</nav><div data-history-detail></div></div>${gaps.length ? `<details class="work-item-history-gaps"><summary>History gaps · ${gaps.length}</summary>${gaps.map((gap) => `<p><strong>v${gap.firstRevision}${gap.lastRevision === gap.firstRevision ? "" : `–${gap.lastRevision}`}</strong> ${esc(gap.reasonCode)}${gap.detail ? ` · ${esc(gap.detail)}` : ""}</p>`).join("")}</details>` : ""}`;
+        .map(
+          (r) =>
+            `<button type="button" data-history-revision="${r.revision}" aria-pressed="false"><strong>v${r.revision}</strong><span>${esc(r.changeKind)} · ${esc(r.updatedAt)}</span></button>`,
+        )
+        .join(
+          "",
+        )}</nav><div data-history-detail></div></div>${gaps.length ? `<details class="work-item-history-gaps"><summary>History gaps · ${gaps.length}</summary>${gaps.map((gap) => `<p><strong>v${gap.firstRevision}${gap.lastRevision === gap.firstRevision ? "" : `–${gap.lastRevision}`}</strong> ${esc(gap.reasonCode)}${gap.detail ? ` · ${esc(gap.detail)}` : ""}</p>`).join("")}</details>` : ""}`;
       let selection = 0;
       const show = async (revision) => {
         const selectedAt = ++selection;
         const selected = revisions.find((entry) => entry.revision === revision);
         if (!selected || !panel.isConnected) return;
-        panel.querySelectorAll("[data-history-revision]").forEach((button) => button.setAttribute("aria-pressed", String(Number(button.dataset.historyRevision) === revision)));
+        panel
+          .querySelectorAll("[data-history-revision]")
+          .forEach((button) =>
+            button.setAttribute(
+              "aria-pressed",
+              String(Number(button.dataset.historyRevision) === revision),
+            ),
+          );
         const detail = panel.querySelector("[data-history-detail]");
         detail.dataset.historyDetailRevision = String(revision);
         detail.innerHTML = `<span class="eyebrow">REVISION ${revision}</span><h3>${esc(selected.title)}</h3><p class="fine">${esc(statuses[selected.status] || selected.status)} · ${esc(priorities[selected.priority] || selected.priority)} · ${esc(selected.provenance)}</p><pre>${esc(selected.description)}</pre><p class="fine" data-history-messages>Loading linked messages…</p>`;
@@ -396,12 +435,17 @@ export function createWorkItemsView({
           const links = [];
           let after = 0;
           do {
-            const page = await client().listWorkItemMessages(item.taskId, item.id, { revision, after, limit: 64 });
+            const page = await client().listWorkItemMessages(
+              item.taskId,
+              item.id,
+              { revision, after, limit: 64 },
+            );
             if (
               selectedAt !== selection ||
               !detail.isConnected ||
               detail.dataset.historyDetailRevision !== String(revision)
-            ) return;
+            )
+              return;
             links.push(...page.links);
             if (!page.nextAfter) break;
             if (page.nextAfter <= after)
@@ -412,23 +456,278 @@ export function createWorkItemsView({
             selectedAt !== selection ||
             !detail.isConnected ||
             detail.dataset.historyDetailRevision !== String(revision)
-          ) return;
-          detail.querySelector("[data-history-messages]").outerHTML = links.length
-            ? `<div class="work-item-history-messages"><span class="eyebrow">EXPLICIT MESSAGES</span>${links.map((link) => `<button type="button" data-history-message-task="${esc(link.message.taskId)}"><strong>#${link.message.seq}</strong> ${esc(link.message.text)}<span>${esc(link.revisionCoverage)}${link.source ? " · source" : ""}</span></button>`).join("")}</div>`
-            : `<p class="fine">No messages were explicitly linked to this revision.</p>`;
-          detail.querySelectorAll("[data-history-message-task]").forEach((button) => button.onclick = () => openBoard(button.dataset.historyMessageTask));
+          )
+            return;
+          detail.querySelector("[data-history-messages]").outerHTML =
+            links.length
+              ? `<div class="work-item-history-messages"><span class="eyebrow">EXPLICIT MESSAGES</span>${links.map((link) => `<button type="button" data-history-message-task="${esc(link.message.taskId)}"><strong>#${link.message.seq}</strong> ${esc(link.message.text)}<span>${esc(link.revisionCoverage)}${link.source ? " · source" : ""}</span></button>`).join("")}</div>`
+              : `<p class="fine">No messages were explicitly linked to this revision.</p>`;
+          detail
+            .querySelectorAll("[data-history-message-task]")
+            .forEach(
+              (button) =>
+                (button.onclick = () =>
+                  openBoard(button.dataset.historyMessageTask)),
+            );
         } catch (error) {
           if (
             selectedAt === selection &&
             detail.isConnected &&
             detail.dataset.historyDetailRevision === String(revision)
-          ) detail.querySelector("[data-history-messages]").textContent = error.message;
+          )
+            detail.querySelector("[data-history-messages]").textContent =
+              error.message;
         }
       };
-      panel.querySelectorAll("[data-history-revision]").forEach((button) => button.onclick = () => void show(Number(button.dataset.historyRevision)));
+      panel
+        .querySelectorAll("[data-history-revision]")
+        .forEach(
+          (button) =>
+            (button.onclick = () =>
+              void show(Number(button.dataset.historyRevision))),
+        );
       if (revisions.length) await show(revisions.at(-1).revision);
     } catch (error) {
-      if (panel.isConnected) panel.innerHTML = `<p class="fine" role="alert">${esc(error.message)}</p>`;
+      if (panel.isConnected)
+        panel.innerHTML = `<p class="fine" role="alert">${esc(error.message)}</p>`;
+    }
+  }
+  const allPages = async (load, field) => {
+    const values = [],
+      seen = new Set();
+    let cursor = "";
+    do {
+      const page = await load(cursor);
+      values.push(...(page[field] || []));
+      cursor = page.nextCursor || page.cursor || "";
+      if (cursor && seen.has(cursor))
+        throw new Error("Narrative cursor did not advance.");
+      if (cursor) seen.add(cursor);
+    } while (cursor);
+    return values;
+  };
+  const reportSection = (label, value) =>
+    `<section><h4>${esc(label)}</h4><pre>${esc(value)}</pre></section>`;
+  async function narrative(item, updateLocation = true) {
+    if (!item || kind !== "feature") return;
+    if (updateLocation && globalThis.history?.replaceState)
+      globalThis.history.replaceState(
+        null,
+        "",
+        `#feature-history/${encodeURIComponent(item.taskId)}/${encodeURIComponent(item.id)}`,
+      );
+    dialog(
+      "Feature history & report",
+      `<section class="feature-narrative" aria-live="polite"><p class="fine">Loading durable report and linked history…</p></section>`,
+    );
+    const panel = document.querySelector(".feature-narrative"),
+      selectedAt = ++narrativeGeneration;
+    try {
+      const [
+        overview,
+        revisions,
+        messages,
+        artifacts,
+        links,
+        coverage,
+        timeline,
+      ] = await Promise.all([
+        client().getNarrativeOverview(item.taskId, item.id),
+        (async () => {
+          const out = [];
+          let after = 0;
+          do {
+            const page = await client().listWorkItemRevisions(
+              item.taskId,
+              item.id,
+              { after, limit: 64 },
+            );
+            out.push(...page.revisions);
+            if (!page.nextAfter) break;
+            after = page.nextAfter;
+          } while (true);
+          return out;
+        })(),
+        (async () => {
+          const out = [];
+          let after = 0;
+          do {
+            const page = await client().listWorkItemMessages(
+              item.taskId,
+              item.id,
+              { after, limit: 64 },
+            );
+            out.push(...page.links);
+            if (!page.nextAfter) break;
+            after = page.nextAfter;
+          } while (true);
+          return out;
+        })(),
+        allPages(
+          (cursor) =>
+            client().listNarrativeArtifacts(item.taskId, item.id, {
+              cursor,
+              limit: 64,
+            }),
+          "artifacts",
+        ),
+        allPages(
+          (cursor) =>
+            client().listNarrativeLinks(item.taskId, item.id, {
+              cursor,
+              limit: 64,
+            }),
+          "links",
+        ),
+        allPages(
+          (cursor) =>
+            client().listNarrativeCoverage(item.taskId, item.id, {
+              cursor,
+              limit: 64,
+            }),
+          "coverage",
+        ),
+        allPages(
+          (cursor) =>
+            client().listNarrativeTimeline(item.taskId, item.id, {
+              cursor,
+              limit: 64,
+            }),
+          "entries",
+        ),
+      ]);
+      if (!panel.isConnected || selectedAt !== narrativeGeneration) return;
+      const seenMessages = new Set(messages.map((entry) => entry.message.seq));
+      const linkedMessages = [];
+      if (client().listMessages)
+        for (const link of links) {
+          if (
+            link.action !== "retract" &&
+            ["message", "decision-request", "decision-answer"].includes(
+              link.target?.kind,
+            ) &&
+            !seenMessages.has(link.target.messageSeq)
+          ) {
+            const found = await client().listMessages(link.target.taskId, {
+              after: link.target.messageSeq - 1,
+              limit: 1,
+            });
+            if (found[0]?.seq === link.target.messageSeq) {
+              linkedMessages.push({
+                message: found[0],
+                revisionCoverage: "explicit narrative link",
+              });
+              seenMessages.add(found[0].seq);
+            }
+          }
+        }
+      if (!panel.isConnected || selectedAt !== narrativeGeneration) return;
+      const reportPin = overview.completionReport || overview.latestReport;
+      const report = reportPin
+        ? await client().getNarrativeReportVersion(
+            item.taskId,
+            item.id,
+            reportPin.reportId,
+            reportPin.version,
+          )
+        : null;
+      if (!panel.isConnected || selectedAt !== narrativeGeneration) return;
+      const coverageRows = [...coverage, ...(overview.defaultGaps || [])];
+      const chronology = [
+        ...revisions.map((value) => ({
+          at: value.updatedAt,
+          label: `Feature revision ${value.revision}`,
+          detail: `${value.changeKind} · ${value.provenance}`,
+          text: value.description,
+        })),
+        ...[...messages, ...linkedMessages].map((value) => ({
+          at: value.message.createdAt,
+          label: `${value.message.decisionRequest ? "Decision request" : value.message.decisionAnswer ? "Decision answer" : "Board message"} #${value.message.seq}`,
+          detail: `${value.revisionCoverage}${value.source ? " · original source" : ""}${value.message.decisionAnswer?.optionId ? ` · answer ${value.message.decisionAnswer.optionId}` : ""}`,
+          text: value.message.text,
+        })),
+        ...timeline.map((value) => ({
+          at: value.sourceTime || value.createdAt,
+          label: `${value.kind} ${value.objectId} v${value.version}`,
+          detail: [value.source, value.relationship, value.captureState]
+            .filter(Boolean)
+            .join(" · "),
+          text: "",
+        })),
+      ].sort((a, b) => String(a.at).localeCompare(String(b.at)));
+      panel.innerHTML = `<header><span class="eyebrow">DURABLE FEATURE NARRATIVE</span><h3>${esc(overview.item.title)}</h3><p class="fine">${esc(statuses[overview.item.status] || overview.item.status)} · scope ${overview.item.scopeRevision} · ${overview.history.complete ? "retained work-item history complete" : "work-item history has gaps"}</p></header>
+        <section class="feature-report"><span class="eyebrow">FINAL REPORT</span>${report ? `<p class="fine">${esc(report.reportId)} v${report.version} · SHA-256 ${esc(report.digest)}</p>${reportSection("Requested outcome", report.sections.requestedOutcome)}${reportSection("Delivered work or audit findings", report.sections.deliveredWork)}${reportSection("Verification and scope", report.sections.verification)}${reportSection("Limitations", report.sections.limitations)}${reportSection("Remaining work", report.sections.remainingWork)}<h4>References</h4><ul>${report.references.map((ref) => `<li>${esc(ref.label || ref.kind)} · ${esc(ref.taskId || ref.sourceId || ref.artifactId || "")}${ref.messageSeq ? ` #${ref.messageSeq}` : ""}${ref.revision || ref.version ? ` v${ref.revision || ref.version}` : ""}${ref.locator ? ` · ${esc(ref.locator)}` : ""}</li>`).join("")}</ul>` : `<p class="feature-gap" role="status">${overview.legacyReportMissing ? "Legacy completed feature: its retained description is available below, but no dedicated report was imported." : "No dedicated feature report has been stored."}</p>`}</section>
+        <section><span class="eyebrow">SOURCE COVERAGE</span><div class="feature-coverage">${coverageRows.length ? coverageRows.map((entry) => `<article><strong>${esc(entry.source || "unspecified source")}</strong><span>${esc(entry.captureState)} · ${esc(entry.assessment || "unverified")}${entry.unknownExtent ? " · extent unknown" : ""}</span><p>${esc(entry.scope)}</p>${entry.knownGaps?.length ? `<p class="feature-gap">Gaps: ${esc(entry.knownGaps.join("; "))}</p>` : ""}</article>`).join("") : '<p class="feature-gap">No coverage declarations were submitted.</p>'}</div></section>
+        <section><span class="eyebrow">ARTIFACTS & LINKS</span>${artifacts.length ? `<div class="feature-artifacts">${artifacts.map((artifact) => `<button type="button" data-narrative-artifact="${esc(artifact.artifactId)}" data-version="${artifact.latest.version}"><strong>${esc(artifact.latest.title)}</strong><span>${esc(artifact.namespace)} · ${esc(artifact.latest.captureState)} · v${artifact.latest.version}</span></button>`).join("")}</div>` : '<p class="fine">No submitted external or supporting artifacts.</p>'}<p class="fine">${links.length} explicit narrative link event${links.length === 1 ? "" : "s"}; corrections and retractions remain in history.</p><div data-narrative-artifact-detail></div></section>
+        <section><span class="eyebrow">CHRONOLOGY</span><div class="feature-chronology">${chronology.map((entry) => `<article><time>${esc(entry.at)}</time><strong>${esc(entry.label)}</strong><span>${esc(entry.detail)}</span>${entry.text ? `<pre>${esc(entry.text)}</pre>` : ""}</article>`).join("")}</div></section>`;
+      panel.querySelectorAll("[data-narrative-artifact]").forEach((button) => {
+        button.onclick = async () => {
+          const detail = panel.querySelector(
+              "[data-narrative-artifact-detail]",
+            ),
+            requestAt = ++narrativeGeneration;
+          detail.innerHTML = '<p class="fine">Loading artifact versions…</p>';
+          try {
+            const versions = await allPages(
+              (cursor) =>
+                client().listNarrativeArtifactVersions(
+                  item.taskId,
+                  item.id,
+                  button.dataset.narrativeArtifact,
+                  { cursor, limit: 64 },
+                ),
+              "versions",
+            );
+            if (!detail.isConnected || requestAt !== narrativeGeneration)
+              return;
+            detail.innerHTML = `<nav class="feature-artifact-versions" aria-label="Artifact versions">${versions.map((version) => `<button type="button" data-artifact-version="${version.version}">v${version.version}${version.supersedesVersion ? ` · corrects v${version.supersedesVersion}` : ""}</button>`).join("")}</nav><article class="feature-artifact-detail"></article>`;
+            const showVersion = async (version) => {
+              const versionAt = ++narrativeGeneration,
+                body = detail.querySelector(".feature-artifact-detail");
+              body.innerHTML =
+                '<p class="fine">Loading exact artifact content…</p>';
+              try {
+                const artifact = await client().getNarrativeArtifactVersion(
+                  item.taskId,
+                  item.id,
+                  button.dataset.narrativeArtifact,
+                  version,
+                );
+                if (!body.isConnected || versionAt !== narrativeGeneration)
+                  return;
+                detail
+                  .querySelectorAll("[data-artifact-version]")
+                  .forEach((choice) =>
+                    choice.setAttribute(
+                      "aria-pressed",
+                      String(
+                        Number(choice.dataset.artifactVersion) === version,
+                      ),
+                    ),
+                  );
+                body.innerHTML = `<h4>${esc(artifact.title)}</h4><p class="fine">${esc(artifact.provenance)} · ${esc(artifact.availability)}${artifact.contentDigest ? ` · SHA-256 ${esc(artifact.contentDigest)}` : ""}</p>${artifact.content ? `<pre>${esc(artifact.content)}</pre>` : `<p>${artifact.locator ? `Durable reference: ${esc(artifact.locator)}` : "Content was not ingested."}</p>`}`;
+              } catch (error) {
+                if (body.isConnected)
+                  body.innerHTML = `<p role="alert">${esc(error.message)}</p>`;
+              }
+            };
+            detail
+              .querySelectorAll("[data-artifact-version]")
+              .forEach(
+                (choice) =>
+                  (choice.onclick = () =>
+                    showVersion(Number(choice.dataset.artifactVersion))),
+              );
+            await showVersion(Number(button.dataset.version));
+          } catch (error) {
+            if (detail.isConnected)
+              detail.innerHTML = `<p role="alert">${esc(error.message)}</p>`;
+          }
+        };
+      });
+    } catch (error) {
+      if (panel.isConnected && selectedAt === narrativeGeneration)
+        panel.innerHTML = `<p class="fine" role="alert">${esc(error.message)}</p>`;
     }
   }
   function dispatch(item) {
@@ -485,5 +784,15 @@ export function createWorkItemsView({
       }
     };
   }
-  return { mount, show, hide, reload };
+  return {
+    mount,
+    show,
+    hide,
+    reload,
+    openNarrative: (id, updateLocation = true) =>
+      narrative(
+        items.find((item) => item.id === id),
+        updateLocation,
+      ),
+  };
 }

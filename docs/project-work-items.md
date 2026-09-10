@@ -51,6 +51,51 @@ check the expected record revision so stale forms cannot overwrite newer work.
 An agent-authored dispatch is limited to its own project; human UI dispatches
 can target another project. Sender and source-message attribution are retained.
 
+## Feature history and reports
+
+Every feature has a reloadable **History & report** reader. It combines the
+feature's immutable work-item revisions and explicitly retained messages with
+narrative artifacts, links, coverage declarations and full report revisions.
+It does not infer relationships from titles or prose. Missing PR or CI history
+is shown as not ingested with unknown extent until an attributed declaration is
+saved. External locations are references only: the hub neither crawls nor
+embeds them.
+
+Narrative writes append immutable versions and advance a sequence independent
+of the work-item revision. Artifact corrections and link retractions preserve
+the original version. Stored content has a server-computed digest; a submitted
+digest remains separately labelled. Capture state, availability, declared
+coverage and evidence assessment remain distinct, so successful storage is not
+presented as successful execution or independent verification. AIV entries are
+opaque evidence references and do not activate or duplicate that service.
+
+List endpoints return metadata in frozen pages of 32 entries by default and at
+most 64. Continue with the returned opaque cursor; entries appended after the
+first page are excluded from that traversal. Fetch exact artifact and report
+versions separately to read their full content. Stored narrative text is UTF-8,
+limited to 1 MiB per version and never truncated. Closed projects retain reader
+access but reject new narrative writes.
+
+A feature can transition to Done only after a complete structured report has
+been stored, read back and pinned by report ID, exact version, server digest and
+current scope revision. This check applies to keyed and legacy update routes.
+Changing title or description advances the scope revision and makes an older
+report stale; status and priority changes do not. Bugs are unaffected. Existing
+Done features remain Done and show their retained legacy description together
+with an explicit missing-dedicated-report warning until real source material is
+deliberately imported. Later report corrections do not rewrite the report pin
+that originally completed a feature.
+
+The API root is
+`/v1/tasks/{task}/work-items/{item}/narrative`. Its overview, timeline,
+artifacts, links, coverage, reports and receipts resources use request IDs,
+expected-version checks and exact retry receipts. The CLI mirrors them under
+`tt work-items narrative`; use `--file PATH` (or `--file -`) for artifact,
+link, coverage and report writes. `tt work-items update` accepts
+`--report-id`, `--report-version`, `--report-digest` and
+`--report-scope-revision` when completing a feature. Agent database workflow
+still routes these operations through the project's Database handler.
+
 ## Database handler
 
 New projects launch their orchestrator, a visible Database handler, then the
@@ -124,3 +169,6 @@ profile contents or create a new multi-user authorization model.
 
 See `tests/project-work-items-browser.mjs` for isolated browser acceptance and
 `tests/project-handler-vault-browser.mjs` for encrypted launch-plan persistence.
+Narrative storage/API acceptance is in `hub/internal/store/narrative_test.go` and
+`hub/internal/server/narrative_test.go`; the safe reader and reload contract is
+covered by `tests/narrative-history-browser.mjs`.

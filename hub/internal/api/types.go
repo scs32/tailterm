@@ -307,18 +307,21 @@ type EventList struct {
 
 type ErrorResponse struct {
 	Error string `json:"error"`
+	Code  string `json:"code,omitempty"`
 }
 
 // Sentinel errors shared by store and server.
 var (
-	ErrNotFound           = errors.New("not found")
-	ErrInvalid            = errors.New("invalid")
-	ErrConflict           = errors.New("conflict")
-	ErrAgentSpawnLimit    = errors.New("maximum additional agents reached for this task")
-	ErrAgentSpawnDisabled = errors.New("agents cannot add agents to this task")
-	ErrContextLimit       = errors.New("work-item context exceeds the launch limit")
-	ErrLimit              = errors.New("limit reached")
-	ErrClosed             = errors.New("closed")
+	ErrNotFound                = errors.New("not found")
+	ErrInvalid                 = errors.New("invalid")
+	ErrConflict                = errors.New("conflict")
+	ErrAgentSpawnLimit         = errors.New("maximum additional agents reached for this task")
+	ErrAgentSpawnDisabled      = errors.New("agents cannot add agents to this task")
+	ErrContextLimit            = errors.New("work-item context exceeds the launch limit")
+	ErrLimit                   = errors.New("limit reached")
+	ErrClosed                  = errors.New("closed")
+	ErrNarrativeReportRequired = errors.New("a complete narrative report is required before marking a feature done")
+	ErrNarrativeReportStale    = errors.New("the selected narrative report does not match the current feature scope")
 )
 
 type CleanupRequest struct {
