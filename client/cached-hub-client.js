@@ -256,8 +256,8 @@ export function createCachedHubClient({
       read(`/v1/tasks/${task}/work-items/${id}/history-gaps` + query(params)),
     listWorkItemMessages: (task, id, params) =>
       read(`/v1/tasks/${task}/work-items/${id}/messages` + query(params)),
-    getNarrativeOverview: (task, id) =>
-      read(`/v1/tasks/${task}/work-items/${id}/narrative`),
+    getNarrativeOverview: (task, id, params = {}) =>
+      read(`/v1/tasks/${task}/work-items/${id}/narrative` + query(params)),
     listNarrativeTimeline: (task, id, params) =>
       read(
         `/v1/tasks/${task}/work-items/${id}/narrative/timeline` + query(params),

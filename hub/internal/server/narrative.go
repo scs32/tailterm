@@ -39,7 +39,12 @@ func (s *Server) getNarrativeOverview(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	result, err := s.store.GetNarrativeOverview(r.Context(), task, item)
+	cursor, limit, ok := narrativePage(r)
+	if !ok {
+		writeError(w, 400, "invalid narrative cursor or limit")
+		return
+	}
+	result, err := s.store.GetNarrativeOverviewPage(r.Context(), task, item, cursor, limit)
 	if err != nil {
 		fail(w, err)
 		return

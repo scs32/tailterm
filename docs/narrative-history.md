@@ -29,8 +29,10 @@ queries, exact artifact/report versions, links, coverage and receipts. The `tt`
 CLI exposes the same reads and JSON-file writes. Request IDs, actor identity,
 canonical-payload receipts and expected-version checks provide response-loss
 recovery and conflict safety. Frozen cursors separate stable traversal order
-from source timestamps. Content is fetched separately, capped at 1 MiB and
-never silently truncated.
+from source timestamps. Metadata is byte-bounded and continues through a frozen
+cursor, including overview coverage. Content is fetched separately, capped at 1
+MiB of decoded UTF-8 and never silently truncated; escaped transport bytes use
+the separate larger request/response bounds.
 
 Feature completion now atomically validates a complete structured report and
 its exact ID, version, digest and current scope revision on both update paths.
@@ -43,8 +45,12 @@ full report sections and references, work-item revision history, explicitly
 linked retained messages and decisions, artifact corrections/content, coverage
 claims and gaps, and the narrative chronology. Stored text is escaped, external
 resources are not fetched or embedded, stale requests are ignored, draft state
-is retained and the feature-specific URL reloads the same reader. No change was
-made to the separately owned `client/board-view.js`.
+is retained and the feature-specific URL reloads the same reader. Latest report
+corrections are shown alongside the preserved completion pin and every exact
+report version remains selectable. Coverage shows captured IDs, gaps, as-of
+time, declaration author, assessment verifier and exact evidence versions;
+retracted links remain visible as history but no longer resolve as current
+sources. No change was made to the separately owned `client/board-view.js`.
 
 ## Verification and scope
 
@@ -52,12 +58,14 @@ All verification used isolated temporary databases, mock browser contexts and
 throwaway hub processes; live tasks and the retained audit were not fixtures.
 Focused store tests cover artifact corrections, exact retry after later
 versions, payload conflicts, link retraction, coverage, reports larger than
-8192 bytes, report-before-Done through both update forms, stale scope, immutable
-completion pins, closed reads, concurrent CAS and frozen pagination beyond 64
-entries. Server and CLI tests cover request limits, exact full-content reads,
-structured completion errors, retries and unsafe locators. Chromium and WebKit
-exercise safe rendering, report reload after completion, coverage gaps,
-artifact versions, chronology and retained drafts. The broader internal Go,
+8192 bytes, decoded/escaped 1 MiB boundaries, evidence-required assessments,
+report-before-Done through both update forms, stale scope, immutable completion
+pins, closed reads, concurrent CAS and count/byte-bounded frozen pagination.
+Server and CLI tests cover request limits, exact full-content reads, structured
+completion errors, retries and unsafe locators. Chromium and WebKit exercise
+safe rendering, post-Done corrections and historical report selection,
+retraction semantics, provenance, stale artifact failures, reload, coverage
+gaps and retained drafts. The broader internal Go,
 race, CLI, JavaScript and existing work-item browser suites are part of the
 candidate verification handoff.
 

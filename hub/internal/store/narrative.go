@@ -66,6 +66,7 @@ CREATE TABLE IF NOT EXISTS narrative_coverage_versions (
   source TEXT NOT NULL, scope TEXT NOT NULL, capture_state TEXT NOT NULL,
   captured_ids TEXT NOT NULL, known_gaps TEXT NOT NULL, unknown_extent INTEGER NOT NULL,
   as_of TEXT, assessment TEXT NOT NULL, assessment_text TEXT NOT NULL DEFAULT '',
+  evidence_refs TEXT NOT NULL DEFAULT '[]', assessment_by TEXT NOT NULL DEFAULT '{}',
   created_by TEXT NOT NULL, created_at TEXT NOT NULL,
   PRIMARY KEY(coverage_id,revision), UNIQUE(task_id,item_id,narrative_seq),
   FOREIGN KEY(task_id,item_id) REFERENCES work_items(task_id,id)
@@ -108,8 +109,24 @@ CREATE TABLE IF NOT EXISTS narrative_completion_pins (
 );`
 
 func migrateNarrative(db *sql.DB) error {
-	_, err := db.Exec(narrativeSchema)
-	return err
+	if _, err := db.Exec(narrativeSchema); err != nil {
+		return err
+	}
+	for _, c := range []struct{ name, definition string }{
+		{"evidence_refs", "TEXT NOT NULL DEFAULT '[]'"},
+		{"assessment_by", "TEXT NOT NULL DEFAULT '{}'"},
+	} {
+		var n int
+		if err := db.QueryRow(`SELECT count(*) FROM pragma_table_info('narrative_coverage_versions') WHERE name=?`, c.name).Scan(&n); err != nil {
+			return err
+		}
+		if n == 0 {
+			if _, err := db.Exec("ALTER TABLE narrative_coverage_versions ADD COLUMN " + c.name + " " + c.definition); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }
 
 type narrativeCursor struct{ High, After int64 }
@@ -286,6 +303,15 @@ func replayNarrativeReceipt[T any](q queryRower, ctx context.Context, taskID, it
 }
 
 func marshalJSON(v any) string { b, _ := json.Marshal(v); return string(b) }
+
+func appendNarrativeMetadata[T any](values []T, value T) ([]T, bool) {
+	next := append(values, value)
+	raw, err := json.Marshal(next)
+	if err != nil || len(raw) > api.MaxNarrativeResponseBytes-(64<<10) {
+		return values, false
+	}
+	return next, true
+}
 
 func parseOptionalTime(raw sql.NullString) *time.Time {
 	if !raw.Valid {
@@ -467,23 +493,30 @@ func (s *Store) ListNarrativeArtifacts(ctx context.Context, taskID, itemID, curs
 	defer rows.Close()
 	out := api.NarrativeArtifactList{Artifacts: []api.NarrativeArtifactSummary{}}
 	var last int64
+	hasMore := false
 	for rows.Next() {
 		v, e := scanArtifactVersion(rows)
 		if e != nil {
 			return out, e
 		}
-		last = v.NarrativeSeq
 		v.Content = ""
-		out.Artifacts = append(out.Artifacts, api.NarrativeArtifactSummary{ArtifactID: v.ArtifactID, Namespace: v.Namespace, SourceID: v.SourceID, Latest: v})
+		if len(out.Artifacts) == limit {
+			hasMore = true
+			break
+		}
+		next, fits := appendNarrativeMetadata(out.Artifacts, api.NarrativeArtifactSummary{ArtifactID: v.ArtifactID, Namespace: v.Namespace, SourceID: v.SourceID, Latest: v})
+		if !fits {
+			hasMore = true
+			break
+		}
+		out.Artifacts = next
+		last = v.NarrativeSeq
 	}
 	if err = rows.Err(); err != nil {
 		return out, err
 	}
-	if len(out.Artifacts) > limit {
-		out.Artifacts = out.Artifacts[:limit]
-		out.NextCursor = encodeNarrativeCursor(narrativeCursor{c.High, out.Artifacts[limit-1].Latest.NarrativeSeq})
-	} else {
-		_ = last
+	if hasMore {
+		out.NextCursor = encodeNarrativeCursor(narrativeCursor{c.High, last})
 	}
 	return out, nil
 }
@@ -511,17 +544,28 @@ func (s *Store) ListNarrativeArtifactVersions(ctx context.Context, taskID, itemI
 	}
 	defer rows.Close()
 	out := api.NarrativeArtifactVersionList{Versions: []api.NarrativeArtifactVersion{}}
+	var last int64
+	hasMore := false
 	for rows.Next() {
 		v, e := scanArtifactVersion(rows)
 		if e != nil {
 			return out, e
 		}
 		v.Content = ""
-		out.Versions = append(out.Versions, v)
+		if len(out.Versions) == limit {
+			hasMore = true
+			break
+		}
+		next, fits := appendNarrativeMetadata(out.Versions, v)
+		if !fits {
+			hasMore = true
+			break
+		}
+		out.Versions = next
+		last = v.NarrativeSeq
 	}
-	if len(out.Versions) > limit {
-		out.Versions = out.Versions[:limit]
-		out.NextCursor = encodeNarrativeCursor(narrativeCursor{c.High, out.Versions[limit-1].NarrativeSeq})
+	if hasMore {
+		out.NextCursor = encodeNarrativeCursor(narrativeCursor{c.High, last})
 	}
 	return out, rows.Err()
 }
@@ -587,11 +631,11 @@ func validateNarrativeReference(q queryRower, ctx context.Context, taskID, itemI
 			return api.ErrInvalid
 		}
 	case "external":
-		if r.SourceID == "" || !validLocator(r.Locator) || r.Locator == "" {
+		if !validNarrativeText(r.SourceID, 512, true) || !validLocator(r.Locator) || r.Locator == "" {
 			return api.ErrInvalid
 		}
 	case "aiv":
-		if r.SourceID == "" || r.Version < 1 || r.Digest == "" {
+		if !validNarrativeText(r.SourceID, 512, true) || r.Version < 1 || r.Digest == "" {
 			return api.ErrInvalid
 		}
 	default:
@@ -725,30 +769,43 @@ func (s *Store) ListNarrativeLinks(ctx context.Context, taskID, itemID, cursor s
 	}
 	defer rows.Close()
 	out := api.NarrativeLinkList{Links: []api.NarrativeLinkVersion{}}
+	var last int64
+	hasMore := false
 	for rows.Next() {
 		v, e := scanLinkVersion(rows)
 		if e != nil {
 			return out, e
 		}
-		out.Links = append(out.Links, v)
+		if len(out.Links) == limit {
+			hasMore = true
+			break
+		}
+		next, fits := appendNarrativeMetadata(out.Links, v)
+		if !fits {
+			hasMore = true
+			break
+		}
+		out.Links = next
+		last = v.NarrativeSeq
 	}
-	if len(out.Links) > limit {
-		out.Links = out.Links[:limit]
-		out.NextCursor = encodeNarrativeCursor(narrativeCursor{c.High, out.Links[limit-1].NarrativeSeq})
+	if hasMore {
+		out.NextCursor = encodeNarrativeCursor(narrativeCursor{c.High, last})
 	}
 	return out, rows.Err()
 }
 
 func scanCoverageVersion(row rowScanner) (api.NarrativeCoverageVersion, error) {
 	var v api.NarrativeCoverageVersion
-	var captured, gaps, actor, asof, created string
+	var captured, gaps, evidence, assessor, actor, asof, created string
 	var unknown int
-	err := row.Scan(&v.CoverageID, &v.TaskID, &v.ItemID, &v.Revision, &v.NarrativeSeq, &v.Source, &v.Scope, &v.CaptureState, &captured, &gaps, &unknown, &asof, &v.Assessment, &v.AssessmentText, &actor, &created)
+	err := row.Scan(&v.CoverageID, &v.TaskID, &v.ItemID, &v.Revision, &v.NarrativeSeq, &v.Source, &v.Scope, &v.CaptureState, &captured, &gaps, &unknown, &asof, &v.Assessment, &v.AssessmentText, &evidence, &assessor, &actor, &created)
 	if err != nil {
 		return v, err
 	}
 	_ = json.Unmarshal([]byte(captured), &v.CapturedIDs)
 	_ = json.Unmarshal([]byte(gaps), &v.KnownGaps)
+	_ = json.Unmarshal([]byte(evidence), &v.EvidenceReferences)
+	_ = json.Unmarshal([]byte(assessor), &v.AssessmentBy)
 	_ = json.Unmarshal([]byte(actor), &v.CreatedBy)
 	v.UnknownExtent = unknown == 1
 	v.CreatedAt = parseTS(created)
@@ -759,7 +816,7 @@ func scanCoverageVersion(row rowScanner) (api.NarrativeCoverageVersion, error) {
 	return v, nil
 }
 
-const coverageVersionCols = `coverage_id,task_id,item_id,revision,narrative_seq,source,scope,capture_state,captured_ids,known_gaps,unknown_extent,COALESCE(as_of,''),assessment,assessment_text,created_by,created_at`
+const coverageVersionCols = `coverage_id,task_id,item_id,revision,narrative_seq,source,scope,capture_state,captured_ids,known_gaps,unknown_extent,COALESCE(as_of,''),assessment,assessment_text,evidence_refs,assessment_by,created_by,created_at`
 
 func validateStringList(values []string) bool {
 	if len(values) > 256 {
@@ -777,7 +834,7 @@ func validateStringList(values []string) bool {
 func (s *Store) PutNarrativeCoverage(ctx context.Context, taskID, itemID string, req api.PutNarrativeCoverageRequest, by api.Caller) (api.NarrativeCoverageVersion, bool, error) {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
-	if !api.ValidID(taskID, "tsk") || !api.ValidID(itemID, "wi") || !validRequestID(req.RequestID) || req.ExpectedRevision < 0 || (req.CoverageID != "" && !validNarrativeID(req.CoverageID, "ncov")) || !validNarrativeText(req.Source, 128, true) || !validNarrativeText(req.Scope, 4096, true) || !validCaptureState(req.CaptureState) || !validAssessment(req.Assessment) || !validNarrativeText(req.AssessmentText, 8192, false) || !validateStringList(req.CapturedIDs) || !validateStringList(req.KnownGaps) {
+	if !api.ValidID(taskID, "tsk") || !api.ValidID(itemID, "wi") || !validRequestID(req.RequestID) || req.ExpectedRevision < 0 || (req.CoverageID != "" && !validNarrativeID(req.CoverageID, "ncov")) || !validNarrativeText(req.Source, 128, true) || !validNarrativeText(req.Scope, 4096, true) || !validCaptureState(req.CaptureState) || !validAssessment(req.Assessment) || !validNarrativeText(req.AssessmentText, 8192, false) || !validateStringList(req.CapturedIDs) || !validateStringList(req.KnownGaps) || len(req.EvidenceReferences) > 256 || (req.Assessment != "unverified" && len(req.EvidenceReferences) == 0) {
 		return api.NarrativeCoverageVersion{}, false, api.ErrInvalid
 	}
 	payload := narrativePayloadHash(req)
@@ -794,6 +851,11 @@ func (s *Store) PutNarrativeCoverage(ctx context.Context, taskID, itemID string,
 	}
 	if err = validateNarrativeActor(tx, ctx, taskID, req.AgentID, req.RunID); err != nil {
 		return api.NarrativeCoverageVersion{}, false, err
+	}
+	for _, ref := range req.EvidenceReferences {
+		if err = validateNarrativeReference(tx, ctx, taskID, itemID, ref); err != nil {
+			return api.NarrativeCoverageVersion{}, false, err
+		}
 	}
 	id, current := req.CoverageID, int64(0)
 	if id == "" {
@@ -819,7 +881,8 @@ func (s *Store) PutNarrativeCoverage(ctx context.Context, taskID, itemID string,
 	if err != nil {
 		return api.NarrativeCoverageVersion{}, false, err
 	}
-	v := api.NarrativeCoverageVersion{CoverageID: id, TaskID: taskID, ItemID: itemID, Revision: rev, NarrativeSeq: seq, Source: req.Source, Scope: req.Scope, CaptureState: req.CaptureState, CapturedIDs: req.CapturedIDs, KnownGaps: req.KnownGaps, UnknownExtent: req.UnknownExtent, AsOf: req.AsOf, Assessment: req.Assessment, AssessmentText: req.AssessmentText, CreatedBy: narrativeActor(req.AgentID, req.RunID, by), CreatedAt: now}
+	actor := narrativeActor(req.AgentID, req.RunID, by)
+	v := api.NarrativeCoverageVersion{CoverageID: id, TaskID: taskID, ItemID: itemID, Revision: rev, NarrativeSeq: seq, Source: req.Source, Scope: req.Scope, CaptureState: req.CaptureState, CapturedIDs: req.CapturedIDs, KnownGaps: req.KnownGaps, UnknownExtent: req.UnknownExtent, AsOf: req.AsOf, Assessment: req.Assessment, AssessmentText: req.AssessmentText, EvidenceReferences: req.EvidenceReferences, AssessmentBy: actor, CreatedBy: actor, CreatedAt: now}
 	if current == 0 {
 		_, err = tx.ExecContext(ctx, `INSERT INTO narrative_coverage(id,task_id,item_id,source,latest_revision,created_at)VALUES(?,?,?,?,?,?)`, id, taskID, itemID, req.Source, rev, ts(now))
 	} else {
@@ -832,7 +895,7 @@ func (s *Store) PutNarrativeCoverage(ctx context.Context, taskID, itemID string,
 	if req.AsOf != nil {
 		asof = ts(*req.AsOf)
 	}
-	_, err = tx.ExecContext(ctx, `INSERT INTO narrative_coverage_versions(coverage_id,revision,task_id,item_id,narrative_seq,source,scope,capture_state,captured_ids,known_gaps,unknown_extent,as_of,assessment,assessment_text,created_by,created_at)VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, id, rev, taskID, itemID, seq, req.Source, req.Scope, req.CaptureState, marshalJSON(req.CapturedIDs), marshalJSON(req.KnownGaps), req.UnknownExtent, asof, req.Assessment, req.AssessmentText, marshalJSON(v.CreatedBy), ts(now))
+	_, err = tx.ExecContext(ctx, `INSERT INTO narrative_coverage_versions(coverage_id,revision,task_id,item_id,narrative_seq,source,scope,capture_state,captured_ids,known_gaps,unknown_extent,as_of,assessment,assessment_text,evidence_refs,assessment_by,created_by,created_at)VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, id, rev, taskID, itemID, seq, req.Source, req.Scope, req.CaptureState, marshalJSON(req.CapturedIDs), marshalJSON(req.KnownGaps), req.UnknownExtent, asof, req.Assessment, req.AssessmentText, marshalJSON(req.EvidenceReferences), marshalJSON(v.AssessmentBy), marshalJSON(v.CreatedBy), ts(now))
 	if err != nil {
 		return v, false, err
 	}
@@ -873,30 +936,42 @@ func (s *Store) ListNarrativeCoverage(ctx context.Context, taskID, itemID, curso
 	}
 	defer rows.Close()
 	out := api.NarrativeCoverageList{Coverage: []api.NarrativeCoverageVersion{}}
+	var last int64
+	hasMore := false
 	for rows.Next() {
 		v, e := scanCoverageVersion(rows)
 		if e != nil {
 			return out, e
 		}
-		out.Coverage = append(out.Coverage, v)
+		if len(out.Coverage) == limit {
+			hasMore = true
+			break
+		}
+		next, fits := appendNarrativeMetadata(out.Coverage, v)
+		if !fits {
+			hasMore = true
+			break
+		}
+		out.Coverage = next
+		last = v.NarrativeSeq
 	}
-	if len(out.Coverage) > limit {
-		out.Coverage = out.Coverage[:limit]
-		out.NextCursor = encodeNarrativeCursor(narrativeCursor{c.High, out.Coverage[limit-1].NarrativeSeq})
+	if hasMore {
+		out.NextCursor = encodeNarrativeCursor(narrativeCursor{c.High, last})
 	}
 	return out, rows.Err()
 }
 
 func reportCanonical(sections api.NarrativeReportSections, refs []api.NarrativeReference) (string, string, error) {
+	contentBytes := len(sections.RequestedOutcome) + len(sections.DeliveredWork) + len(sections.Verification) + len(sections.Limitations) + len(sections.RemainingWork)
+	if contentBytes > api.MaxNarrativeContentBytes {
+		return "", "", api.ErrInvalid
+	}
 	raw, err := json.Marshal(struct {
 		Sections   api.NarrativeReportSections `json:"sections"`
 		References []api.NarrativeReference    `json:"references"`
 	}{sections, refs})
 	if err != nil {
 		return "", "", err
-	}
-	if len(raw) > api.MaxNarrativeContentBytes {
-		return "", "", api.ErrInvalid
 	}
 	return string(raw), contentDigest(string(raw)), nil
 }
@@ -1040,7 +1115,8 @@ func (s *Store) ListNarrativeReports(ctx context.Context, taskID, itemID, cursor
 	}
 	defer rows.Close()
 	out := api.NarrativeReportList{Reports: []api.NarrativeReportSummary{}}
-	var seqs []int64
+	var last int64
+	hasMore := false
 	for rows.Next() {
 		var v api.NarrativeReportSummary
 		var created string
@@ -1049,12 +1125,20 @@ func (s *Store) ListNarrativeReports(ctx context.Context, taskID, itemID, cursor
 			return out, err
 		}
 		v.CreatedAt = parseTS(created)
-		out.Reports = append(out.Reports, v)
-		seqs = append(seqs, seq)
+		if len(out.Reports) == limit {
+			hasMore = true
+			break
+		}
+		next, fits := appendNarrativeMetadata(out.Reports, v)
+		if !fits {
+			hasMore = true
+			break
+		}
+		out.Reports = next
+		last = seq
 	}
-	if len(out.Reports) > limit {
-		out.Reports = out.Reports[:limit]
-		out.NextCursor = encodeNarrativeCursor(narrativeCursor{c.High, seqs[limit-1]})
+	if hasMore {
+		out.NextCursor = encodeNarrativeCursor(narrativeCursor{c.High, last})
 	}
 	return out, rows.Err()
 }
@@ -1160,6 +1244,8 @@ func (s *Store) ListNarrativeTimeline(ctx context.Context, taskID, itemID, curso
 	}
 	defer rows.Close()
 	out := api.NarrativeTimelinePage{Entries: []api.NarrativeTimelineEntry{}, HighWatermark: c.High}
+	var last int64
+	hasMore := false
 	for rows.Next() {
 		var v api.NarrativeTimelineEntry
 		var sourceTime, created string
@@ -1171,11 +1257,20 @@ func (s *Store) ListNarrativeTimeline(ctx context.Context, taskID, itemID, curso
 			t := parseTS(sourceTime)
 			v.SourceTime = &t
 		}
-		out.Entries = append(out.Entries, v)
+		if len(out.Entries) == limit {
+			hasMore = true
+			break
+		}
+		next, fits := appendNarrativeMetadata(out.Entries, v)
+		if !fits {
+			hasMore = true
+			break
+		}
+		out.Entries = next
+		last = v.Seq
 	}
-	if len(out.Entries) > limit {
-		out.Entries = out.Entries[:limit]
-		out.Cursor = encodeNarrativeCursor(narrativeCursor{c.High, out.Entries[limit-1].Seq})
+	if hasMore {
+		out.Cursor = encodeNarrativeCursor(narrativeCursor{c.High, last})
 	}
 	return out, rows.Err()
 }
@@ -1189,6 +1284,17 @@ func (s *Store) GetNarrativeReceipt(ctx context.Context, taskID, itemID, operati
 }
 
 func (s *Store) GetNarrativeOverview(ctx context.Context, taskID, itemID string) (api.NarrativeOverview, error) {
+	return s.GetNarrativeOverviewPage(ctx, taskID, itemID, "", api.DefaultNarrativePage)
+}
+
+func (s *Store) GetNarrativeOverviewPage(ctx context.Context, taskID, itemID, cursor string, limit int) (api.NarrativeOverview, error) {
+	if limit < 1 || limit > api.MaxNarrativePage {
+		return api.NarrativeOverview{}, api.ErrInvalid
+	}
+	c, err := decodeNarrativeCursor(cursor)
+	if err != nil {
+		return api.NarrativeOverview{}, err
+	}
 	item, err := s.GetWorkItem(ctx, taskID, itemID)
 	if err != nil {
 		return api.NarrativeOverview{}, err
@@ -1198,6 +1304,12 @@ func (s *Store) GetNarrativeOverview(ctx context.Context, taskID, itemID string)
 		return api.NarrativeOverview{}, err
 	}
 	defer tx.Rollback()
+	if c.High == 0 {
+		c.High, err = currentNarrativeSeq(tx, ctx, taskID, itemID)
+		if err != nil {
+			return api.NarrativeOverview{}, err
+		}
+	}
 	history, err := historyCoverage(ctx, tx, item)
 	if err != nil {
 		return api.NarrativeOverview{}, err
@@ -1209,23 +1321,46 @@ func (s *Store) GetNarrativeOverview(ctx context.Context, taskID, itemID string)
 	} else if !errors.Is(err, sql.ErrNoRows) {
 		return out, err
 	}
-	rows, err := tx.QueryContext(ctx, `SELECT `+coverageVersionCols+` FROM narrative_coverage_versions v WHERE task_id=? AND item_id=? AND revision=(SELECT max(v2.revision) FROM narrative_coverage_versions v2 WHERE v2.coverage_id=v.coverage_id) ORDER BY narrative_seq`, taskID, itemID)
+	rows, err := tx.QueryContext(ctx, `SELECT `+coverageVersionCols+` FROM narrative_coverage_versions v WHERE task_id=? AND item_id=? AND narrative_seq>? AND narrative_seq<=? AND revision=(SELECT max(v2.revision) FROM narrative_coverage_versions v2 WHERE v2.coverage_id=v.coverage_id AND v2.narrative_seq<=?) ORDER BY narrative_seq LIMIT ?`, taskID, itemID, c.After, c.High, c.High, limit+1)
 	if err != nil {
 		return out, err
 	}
-	seen := map[string]bool{}
+	var last int64
+	hasMore := false
 	for rows.Next() {
 		c, e := scanCoverageVersion(rows)
 		if e != nil {
 			rows.Close()
 			return out, e
 		}
-		out.Coverage = append(out.Coverage, c)
-		seen[c.Source] = true
+		if len(out.Coverage) == limit {
+			hasMore = true
+			break
+		}
+		next, fits := appendNarrativeMetadata(out.Coverage, c)
+		if !fits {
+			hasMore = true
+			break
+		}
+		out.Coverage = next
+		last = c.NarrativeSeq
 	}
-	rows.Close()
+	if err = rows.Err(); err != nil {
+		rows.Close()
+		return out, err
+	}
+	if err = rows.Close(); err != nil {
+		return out, err
+	}
+	if hasMore {
+		out.CoverageNextCursor = encodeNarrativeCursor(narrativeCursor{c.High, last})
+	}
 	for _, source := range []string{"pr", "ci"} {
-		if !seen[source] {
+		var seen int
+		if err = tx.QueryRowContext(ctx, `SELECT count(*) FROM narrative_coverage_versions WHERE task_id=? AND item_id=? AND source=? AND narrative_seq<=?`, taskID, itemID, source, c.High).Scan(&seen); err != nil {
+			return out, err
+		}
+		if seen == 0 {
 			out.DefaultGaps = append(out.DefaultGaps, api.NarrativeCoverageVersion{Source: source, Scope: "No capture declaration has been submitted.", CaptureState: "not-ingested", KnownGaps: []string{"source history is not captured"}, UnknownExtent: true, Assessment: "unverified"})
 		}
 	}

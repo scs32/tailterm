@@ -55,8 +55,11 @@ func (c *Client) narrativeDo(ctx context.Context, method, path string, body, out
 }
 
 func (c *Client) GetNarrativeOverview(ctx context.Context, taskID, itemID string) (NarrativeOverview, error) {
+	return c.GetNarrativeOverviewPage(ctx, taskID, itemID, "", DefaultNarrativePage)
+}
+func (c *Client) GetNarrativeOverviewPage(ctx context.Context, taskID, itemID, cursor string, limit int) (NarrativeOverview, error) {
 	var out NarrativeOverview
-	err := c.do(ctx, "GET", narrativePath(taskID, itemID, ""), nil, &out)
+	err := c.do(ctx, "GET", narrativePath(taskID, itemID, "")+narrativePageQuery(cursor, limit), nil, &out)
 	return out, err
 }
 func (c *Client) ListNarrativeTimeline(ctx context.Context, taskID, itemID, cursor string, limit int) (NarrativeTimelinePage, error) {

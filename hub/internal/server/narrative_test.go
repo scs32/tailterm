@@ -55,6 +55,16 @@ func TestNarrativeHTTPFullReportArtifactAndCompletionGate(t *testing.T) {
 	if code := c.do("POST", path+"/reports", reportReq, &replay); code != 200 || replay.Digest != report.Digest || replay.ReportID != report.ReportID {
 		t.Fatalf("report replay=%d %+v", code, replay)
 	}
+	escaped := reportReq
+	escaped.RequestID = "http-report-escaped"
+	escaped.ReportID = report.ReportID
+	escaped.ExpectedVersion = 1
+	fixed := len(escaped.Sections.RequestedOutcome) + len(escaped.Sections.Verification) + len(escaped.Sections.Limitations) + len(escaped.Sections.RemainingWork)
+	escaped.Sections.DeliveredWork = strings.Repeat("<", api.MaxNarrativeContentBytes-fixed)
+	var escapedReport api.NarrativeReportVersion
+	if code := c.do("POST", path+"/reports", escaped, &escapedReport); code != 201 || len(escapedReport.Sections.DeliveredWork) != api.MaxNarrativeContentBytes-fixed {
+		t.Fatalf("escaped report=%d len=%d", code, len(escapedReport.Sections.DeliveredWork))
+	}
 }
 
 func TestNarrativeHTTPRejectsUnsafeReferencesAndOversizeContent(t *testing.T) {

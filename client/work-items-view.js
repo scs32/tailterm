@@ -508,6 +508,19 @@ export function createWorkItemsView({
   };
   const reportSection = (label, value) =>
     `<section><h4>${esc(label)}</h4><pre>${esc(value)}</pre></section>`;
+  const actorLabel = (actor) =>
+    actor?.agentId ||
+    actor?.user ||
+    actor?.node ||
+    actor?.caller?.user ||
+    actor?.caller?.node ||
+    "unattributed";
+  const referenceLabel = (ref) =>
+    `${ref.label || ref.kind}${ref.taskId ? ` · ${ref.taskId}` : ""}${ref.messageSeq ? ` #${ref.messageSeq}` : ""}${ref.sourceId ? ` · ${ref.sourceId}` : ""}${ref.artifactId ? ` · ${ref.artifactId}` : ""}${ref.revision || ref.version ? ` v${ref.revision || ref.version}` : ""}${ref.locator ? ` · ${ref.locator}` : ""}`;
+  const reportMarkup = (report) =>
+    report
+      ? `<p class="fine">${esc(report.reportId)} v${report.version} · scope ${report.scopeRevision} · SHA-256 ${esc(report.digest)} · submitted by ${esc(actorLabel(report.createdBy))}</p>${reportSection("Requested outcome", report.sections.requestedOutcome)}${reportSection("Delivered work or audit findings", report.sections.deliveredWork)}${reportSection("Verification and scope", report.sections.verification)}${reportSection("Limitations", report.sections.limitations)}${reportSection("Remaining work", report.sections.remainingWork)}<h4>References</h4><ul>${report.references.map((ref) => `<li>${esc(referenceLabel(ref))}</li>`).join("")}</ul>`
+      : "";
   async function narrative(item, updateLocation = true) {
     if (!item || kind !== "feature") return;
     if (updateLocation && globalThis.history?.replaceState)
@@ -530,6 +543,7 @@ export function createWorkItemsView({
         artifacts,
         links,
         coverage,
+        reports,
         timeline,
       ] = await Promise.all([
         client().getNarrativeOverview(item.taskId, item.id),
@@ -589,6 +603,14 @@ export function createWorkItemsView({
         ),
         allPages(
           (cursor) =>
+            client().listNarrativeReports(item.taskId, item.id, {
+              cursor,
+              limit: 64,
+            }),
+          "reports",
+        ),
+        allPages(
+          (cursor) =>
             client().listNarrativeTimeline(item.taskId, item.id, {
               cursor,
               limit: 64,
@@ -597,12 +619,16 @@ export function createWorkItemsView({
         ),
       ]);
       if (!panel.isConnected || selectedAt !== narrativeGeneration) return;
+      const latestLinks = new Map();
+      for (const link of links) latestLinks.set(link.linkId, link);
+      const currentLinks = [...latestLinks.values()].filter(
+        (link) => link.action !== "retract",
+      );
       const seenMessages = new Set(messages.map((entry) => entry.message.seq));
       const linkedMessages = [];
       if (client().listMessages)
-        for (const link of links) {
+        for (const link of currentLinks) {
           if (
-            link.action !== "retract" &&
             ["message", "decision-request", "decision-answer"].includes(
               link.target?.kind,
             ) &&
@@ -622,7 +648,7 @@ export function createWorkItemsView({
           }
         }
       if (!panel.isConnected || selectedAt !== narrativeGeneration) return;
-      const reportPin = overview.completionReport || overview.latestReport;
+      const reportPin = overview.latestReport;
       const report = reportPin
         ? await client().getNarrativeReportVersion(
             item.taskId,
@@ -656,10 +682,42 @@ export function createWorkItemsView({
         })),
       ].sort((a, b) => String(a.at).localeCompare(String(b.at)));
       panel.innerHTML = `<header><span class="eyebrow">DURABLE FEATURE NARRATIVE</span><h3>${esc(overview.item.title)}</h3><p class="fine">${esc(statuses[overview.item.status] || overview.item.status)} · scope ${overview.item.scopeRevision} · ${overview.history.complete ? "retained work-item history complete" : "work-item history has gaps"}</p></header>
-        <section class="feature-report"><span class="eyebrow">FINAL REPORT</span>${report ? `<p class="fine">${esc(report.reportId)} v${report.version} · SHA-256 ${esc(report.digest)}</p>${reportSection("Requested outcome", report.sections.requestedOutcome)}${reportSection("Delivered work or audit findings", report.sections.deliveredWork)}${reportSection("Verification and scope", report.sections.verification)}${reportSection("Limitations", report.sections.limitations)}${reportSection("Remaining work", report.sections.remainingWork)}<h4>References</h4><ul>${report.references.map((ref) => `<li>${esc(ref.label || ref.kind)} · ${esc(ref.taskId || ref.sourceId || ref.artifactId || "")}${ref.messageSeq ? ` #${ref.messageSeq}` : ""}${ref.revision || ref.version ? ` v${ref.revision || ref.version}` : ""}${ref.locator ? ` · ${esc(ref.locator)}` : ""}</li>`).join("")}</ul>` : `<p class="feature-gap" role="status">${overview.legacyReportMissing ? "Legacy completed feature: its retained description is available below, but no dedicated report was imported." : "No dedicated feature report has been stored."}</p>`}</section>
-        <section><span class="eyebrow">SOURCE COVERAGE</span><div class="feature-coverage">${coverageRows.length ? coverageRows.map((entry) => `<article><strong>${esc(entry.source || "unspecified source")}</strong><span>${esc(entry.captureState)} · ${esc(entry.assessment || "unverified")}${entry.unknownExtent ? " · extent unknown" : ""}</span><p>${esc(entry.scope)}</p>${entry.knownGaps?.length ? `<p class="feature-gap">Gaps: ${esc(entry.knownGaps.join("; "))}</p>` : ""}</article>`).join("") : '<p class="feature-gap">No coverage declarations were submitted.</p>'}</div></section>
-        <section><span class="eyebrow">ARTIFACTS & LINKS</span>${artifacts.length ? `<div class="feature-artifacts">${artifacts.map((artifact) => `<button type="button" data-narrative-artifact="${esc(artifact.artifactId)}" data-version="${artifact.latest.version}"><strong>${esc(artifact.latest.title)}</strong><span>${esc(artifact.namespace)} · ${esc(artifact.latest.captureState)} · v${artifact.latest.version}</span></button>`).join("")}</div>` : '<p class="fine">No submitted external or supporting artifacts.</p>'}<p class="fine">${links.length} explicit narrative link event${links.length === 1 ? "" : "s"}; corrections and retractions remain in history.</p><div data-narrative-artifact-detail></div></section>
+        <section class="feature-report"><span class="eyebrow">FINAL REPORT</span>${overview.completionReport ? `<p class="feature-completion-pin"><strong>Completion pin:</strong> ${esc(overview.completionReport.reportId)} v${overview.completionReport.version} · scope ${overview.completionReport.scopeRevision} · SHA-256 ${esc(overview.completionReport.digest)}</p>` : ""}${overview.completionReport && overview.latestReport && (overview.completionReport.reportId !== overview.latestReport.reportId || overview.completionReport.version !== overview.latestReport.version) ? '<p class="feature-gap">Showing the latest corrected report below. The exact report used for completion remains pinned and available in report history.</p>' : ""}${reports.length ? `<nav class="feature-report-versions" aria-label="Report versions">${reports.map((entry) => `<button type="button" data-report-id="${esc(entry.reportId)}" data-report-version="${entry.version}" aria-pressed="${entry.reportId === report?.reportId && entry.version === report?.version}">${entry.reportId === overview.completionReport?.reportId && entry.version === overview.completionReport?.version ? "Completion · " : ""}${entry.reportId === overview.latestReport?.reportId && entry.version === overview.latestReport?.version ? "Latest · " : ""}${esc(entry.reportId)} v${entry.version}</button>`).join("")}</nav><div data-feature-report-detail>${reportMarkup(report)}</div>` : `<p class="feature-gap" role="status">${overview.legacyReportMissing ? "Legacy completed feature: its retained description is available below, but no dedicated report was imported." : "No dedicated feature report has been stored."}</p>`}</section>
+        <section><span class="eyebrow">SOURCE COVERAGE</span><div class="feature-coverage">${coverageRows.length ? coverageRows.map((entry) => `<article><strong>${esc(entry.source || "unspecified source")}</strong><span>${esc(entry.captureState)} · ${esc(entry.assessment || "unverified")}${entry.unknownExtent ? " · extent unknown" : ""}${entry.asOf ? ` · as of ${esc(entry.asOf)}` : ""}</span><p>${esc(entry.scope)}</p><p class="fine">Declared by ${esc(actorLabel(entry.createdBy))}; assessment attributed to ${esc(actorLabel(entry.assessmentBy))}.</p>${entry.assessmentText ? `<p>${esc(entry.assessmentText)}</p>` : ""}${entry.capturedIds?.length ? `<p class="fine">Captured IDs: ${esc(entry.capturedIds.join("; "))}</p>` : ""}${entry.evidenceReferences?.length ? `<p class="fine">Assessment evidence: ${entry.evidenceReferences.map((ref) => esc(referenceLabel(ref))).join("; ")}</p>` : '<p class="feature-gap">No exact evidence versions support an execution assessment.</p>'}${entry.knownGaps?.length ? `<p class="feature-gap">Gaps: ${esc(entry.knownGaps.join("; "))}</p>` : ""}</article>`).join("") : '<p class="feature-gap">No coverage declarations were submitted.</p>'}</div></section>
+        <section><span class="eyebrow">ARTIFACTS & LINKS</span>${artifacts.length ? `<div class="feature-artifacts">${artifacts.map((artifact) => `<button type="button" data-narrative-artifact="${esc(artifact.artifactId)}" data-version="${artifact.latest.version}"><strong>${esc(artifact.latest.title)}</strong><span>${esc(artifact.namespace)} · ${esc(artifact.latest.captureState)} · v${artifact.latest.version}</span><span>original ${esc(actorLabel(artifact.latest.originalAuthor))} · ingested ${esc(actorLabel(artifact.latest.ingestedBy))}</span></button>`).join("")}</div>` : '<p class="fine">No submitted external or supporting artifacts.</p>'}<p class="fine">${currentLinks.length} current explicit link${currentLinks.length === 1 ? "" : "s"}; ${links.length} immutable link event${links.length === 1 ? "" : "s"} retained.</p>${links.length ? `<div class="feature-link-history">${links.map((link) => `<article class="${link.action === "retract" ? "is-retracted" : ""}"><strong>${esc(link.action)} · ${esc(link.relationship)}</strong><span>${esc(referenceLabel(link.target))} · feature scope ${link.featureRevision || "unknown"}</span><span>by ${esc(actorLabel(link.createdBy))}${link.reason ? ` · ${esc(link.reason)}` : ""}</span></article>`).join("")}</div>` : ""}<div data-narrative-artifact-detail></div></section>
         <section><span class="eyebrow">CHRONOLOGY</span><div class="feature-chronology">${chronology.map((entry) => `<article><time>${esc(entry.at)}</time><strong>${esc(entry.label)}</strong><span>${esc(entry.detail)}</span>${entry.text ? `<pre>${esc(entry.text)}</pre>` : ""}</article>`).join("")}</div></section>`;
+      panel.querySelectorAll("[data-report-id]").forEach((button) => {
+        button.onclick = async () => {
+          const reportAt = ++narrativeGeneration,
+            detail = panel.querySelector("[data-feature-report-detail]");
+          detail.innerHTML = '<p class="fine">Loading exact report…</p>';
+          try {
+            const selectedReport = await client().getNarrativeReportVersion(
+              item.taskId,
+              item.id,
+              button.dataset.reportId,
+              Number(button.dataset.reportVersion),
+            );
+            if (!detail.isConnected || reportAt !== narrativeGeneration) return;
+            panel
+              .querySelectorAll("[data-report-id]")
+              .forEach((choice) =>
+                choice.setAttribute(
+                  "aria-pressed",
+                  String(
+                    choice.dataset.reportId === selectedReport.reportId &&
+                      Number(choice.dataset.reportVersion) ===
+                        selectedReport.version,
+                  ),
+                ),
+              );
+            detail.innerHTML = reportMarkup(selectedReport);
+          } catch (error) {
+            if (detail.isConnected && reportAt === narrativeGeneration)
+              detail.innerHTML = `<p role="alert">${esc(error.message)}</p>`;
+          }
+        };
+      });
       panel.querySelectorAll("[data-narrative-artifact]").forEach((button) => {
         button.onclick = async () => {
           const detail = panel.querySelector(
@@ -705,9 +763,9 @@ export function createWorkItemsView({
                       ),
                     ),
                   );
-                body.innerHTML = `<h4>${esc(artifact.title)}</h4><p class="fine">${esc(artifact.provenance)} · ${esc(artifact.availability)}${artifact.contentDigest ? ` · SHA-256 ${esc(artifact.contentDigest)}` : ""}</p>${artifact.content ? `<pre>${esc(artifact.content)}</pre>` : `<p>${artifact.locator ? `Durable reference: ${esc(artifact.locator)}` : "Content was not ingested."}</p>`}`;
+                body.innerHTML = `<h4>${esc(artifact.title)}</h4><p class="fine">${esc(artifact.provenance)} · ${esc(artifact.availability)}${artifact.sourceTime ? ` · source time ${esc(artifact.sourceTime)}` : ""}${artifact.contentDigest ? ` · SHA-256 ${esc(artifact.contentDigest)}` : ""}</p><p class="fine">Original author: ${esc(actorLabel(artifact.originalAuthor))}; ingested by: ${esc(actorLabel(artifact.ingestedBy))} at ${esc(artifact.ingestedAt)}.</p>${artifact.content ? `<pre>${esc(artifact.content)}</pre>` : `<p>${artifact.locator ? `Durable reference: ${esc(artifact.locator)}` : "Content was not ingested."}</p>`}`;
               } catch (error) {
-                if (body.isConnected)
+                if (body.isConnected && versionAt === narrativeGeneration)
                   body.innerHTML = `<p role="alert">${esc(error.message)}</p>`;
               }
             };
@@ -720,7 +778,7 @@ export function createWorkItemsView({
               );
             await showVersion(Number(button.dataset.version));
           } catch (error) {
-            if (detail.isConnected)
+            if (detail.isConnected && requestAt === narrativeGeneration)
               detail.innerHTML = `<p role="alert">${esc(error.message)}</p>`;
           }
         };

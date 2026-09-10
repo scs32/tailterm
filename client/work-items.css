@@ -190,6 +190,41 @@
   margin-top: 8px;
   overflow-x: auto;
 }
+.feature-report-versions {
+  display: flex;
+  gap: 6px;
+  overflow-x: auto;
+}
+.feature-report-versions button[aria-pressed="true"] {
+  background: var(
+    --selection,
+    color-mix(in srgb, var(--accent) 18%, transparent)
+  );
+}
+.feature-completion-pin {
+  padding: 7px 8px;
+  border-left: 2px solid var(--accent);
+  background: color-mix(in srgb, var(--accent) 8%, transparent);
+  overflow-wrap: anywhere;
+}
+.feature-link-history {
+  display: grid;
+  gap: 4px;
+}
+.feature-link-history article {
+  display: grid;
+  gap: 2px;
+  padding: 6px 0;
+  border-top: 1px solid
+    var(--line, color-mix(in srgb, var(--muted) 25%, transparent));
+}
+.feature-link-history article > span {
+  color: var(--muted);
+  font-size: 11px;
+}
+.feature-link-history .is-retracted strong {
+  text-decoration: line-through;
+}
 .feature-artifact-versions button[aria-pressed="true"] {
   background: var(
     --selection,

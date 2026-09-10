@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"strconv"
 	"strings"
@@ -80,10 +81,17 @@ func TestNarrativeArtifactsLinksCoverageReportsRetriesAndCompletion(t *testing.T
 	if got, _, err := s.PutNarrativeLink(ctx, project.ID, item.ID, retract, by); err != nil || got.Revision != 2 || got.Action != "retract" {
 		t.Fatalf("retract=%+v err=%v", got, err)
 	}
-	coverageReq := api.PutNarrativeCoverageRequest{RequestID: "coverage-1", Source: "pr", Scope: "Selected body revisions only", CaptureState: "stored-content", CapturedIDs: []string{"body@abc", "body@def"}, KnownGaps: []string{"comments were not supplied"}, UnknownExtent: true, Assessment: "unverified", AssessmentText: "Storage does not prove review."}
+	coverageReq := api.PutNarrativeCoverageRequest{RequestID: "coverage-1", Source: "pr", Scope: "Selected body revisions only", CaptureState: "stored-content", CapturedIDs: []string{"body@abc", "body@def"}, KnownGaps: []string{"comments were not supplied"}, UnknownExtent: true, Assessment: "independently-verified", AssessmentText: "The submitted body versions were compared.", EvidenceReferences: []api.NarrativeReference{{Kind: "artifact-version", ArtifactID: artifact.ArtifactID, Version: 1, Label: "exact submitted body"}}}
 	coverage, _, err := s.PutNarrativeCoverage(ctx, project.ID, item.ID, coverageReq, by)
-	if err != nil || coverage.Revision != 1 || !coverage.UnknownExtent {
+	if err != nil || coverage.Revision != 1 || !coverage.UnknownExtent || len(coverage.EvidenceReferences) != 1 || coverage.AssessmentBy.Caller.Node != by.Node {
 		t.Fatalf("coverage=%+v err=%v", coverage, err)
+	}
+	unreferenced := coverageReq
+	unreferenced.RequestID = "coverage-unreferenced"
+	unreferenced.CoverageID = ""
+	unreferenced.EvidenceReferences = nil
+	if _, _, err = s.PutNarrativeCoverage(ctx, project.ID, item.ID, unreferenced, by); !errors.Is(err, api.ErrInvalid) {
+		t.Fatalf("verified assessment without evidence=%v", err)
 	}
 	reportReq := completeReportRequest(item, "report-1", 500)
 	report, replay, err := s.PutNarrativeReport(ctx, project.ID, item.ID, reportReq, by)
@@ -112,7 +120,7 @@ func TestNarrativeArtifactsLinksCoverageReportsRetriesAndCompletion(t *testing.T
 		t.Fatalf("post-done correction=%+v err=%v", correctedReport, err)
 	}
 	overview, err := s.GetNarrativeOverview(ctx, project.ID, item.ID)
-	if err != nil || overview.CompletionReport.Version != 1 || overview.LatestReport.Version != 2 || len(overview.Coverage) != 1 || len(overview.DefaultGaps) != 1 {
+	if err != nil || overview.CompletionReport.Version != 1 || overview.LatestReport.Version != 2 || len(overview.Coverage) != 1 || len(overview.Coverage[0].EvidenceReferences) != 1 || overview.Coverage[0].AssessmentBy.Caller.Node != by.Node || len(overview.DefaultGaps) != 1 {
 		t.Fatalf("overview=%+v err=%v", overview, err)
 	}
 	if _, err = s.CloseTask(ctx, project.ID, by); err != nil {
@@ -216,3 +224,79 @@ func TestNarrativeFrozenPaginationConcurrencyAndStaleScope(t *testing.T) {
 }
 
 func fmtKey(prefix string, n int) string { return prefix + "-" + strconv.Itoa(n) }
+
+func TestNarrativeDecodedReportLimitAndBoundedOverviewCoverage(t *testing.T) {
+	s, ctx, by := workItemStore(t)
+	project, _ := workItemProject(t, s, ctx, by, "Bounds", "lead")
+	item := narrativeFeature(t, s, ctx, by, project, "Decoded bounds", "bounds-item")
+	req := completeReportRequest(item, "escaped-report", 1)
+	fixed := len(req.Sections.RequestedOutcome) + len(req.Sections.Verification) + len(req.Sections.Limitations) + len(req.Sections.RemainingWork)
+	req.Sections.DeliveredWork = strings.Repeat("<", api.MaxNarrativeContentBytes-fixed)
+	if _, _, err := s.PutNarrativeReport(ctx, project.ID, item.ID, req, by); err != nil {
+		t.Fatalf("decoded 1MiB report with JSON escaping rejected: %v", err)
+	}
+	req.RequestID = "escaped-report-too-large"
+	req.Sections.DeliveredWork += "x"
+	if _, _, err := s.PutNarrativeReport(ctx, project.ID, item.ID, req, by); !errors.Is(err, api.ErrInvalid) {
+		t.Fatalf("decoded report above 1MiB=%v", err)
+	}
+
+	references := make([]api.NarrativeReference, 256)
+	for i := range references {
+		references[i] = api.NarrativeReference{Kind: "external", SourceID: strings.Repeat("s", 512), Locator: "https://example.invalid/" + strings.Repeat("p", 1700), Label: strings.Repeat("l", 512)}
+	}
+	for i := 0; i < 8; i++ {
+		coverage := api.PutNarrativeCoverageRequest{RequestID: fmtKey("bounded-coverage", i), Source: fmtKey("source", i), Scope: strings.Repeat("q", 4096), CaptureState: "reference-only", CapturedIDs: []string{"submitted-enumeration"}, KnownGaps: []string{"unknown remote extent"}, UnknownExtent: true, Assessment: "unverified", AssessmentText: strings.Repeat("a", 8192), EvidenceReferences: references}
+		if _, _, err := s.PutNarrativeCoverage(ctx, project.ID, item.ID, coverage, by); err != nil {
+			t.Fatal(err)
+		}
+	}
+	first, err := s.GetNarrativeOverviewPage(ctx, project.ID, item.ID, "", 32)
+	if err != nil || first.CoverageNextCursor == "" || len(first.Coverage) >= 8 {
+		t.Fatalf("bounded overview count=%d cursor=%q err=%v", len(first.Coverage), first.CoverageNextCursor, err)
+	}
+	raw, _ := json.Marshal(first)
+	if len(raw) > api.MaxNarrativeResponseBytes {
+		t.Fatalf("overview metadata=%d", len(raw))
+	}
+	coverageFirst, err := s.ListNarrativeCoverage(ctx, project.ID, item.ID, "", 32)
+	if err != nil || coverageFirst.NextCursor == "" || len(coverageFirst.Coverage) >= 8 {
+		t.Fatalf("bounded coverage count=%d cursor=%q err=%v", len(coverageFirst.Coverage), coverageFirst.NextCursor, err)
+	}
+	raw, _ = json.Marshal(coverageFirst)
+	if len(raw) > api.MaxNarrativeResponseBytes {
+		t.Fatalf("coverage metadata=%d", len(raw))
+	}
+	lateCoverage := api.PutNarrativeCoverageRequest{RequestID: "bounded-coverage-late", Source: "late-source", Scope: "appended after frozen overview page", CaptureState: "not-ingested", KnownGaps: []string{"late"}, UnknownExtent: true, Assessment: "unverified"}
+	if _, _, err := s.PutNarrativeCoverage(ctx, project.ID, item.ID, lateCoverage, by); err != nil {
+		t.Fatal(err)
+	}
+	second, err := s.GetNarrativeOverviewPage(ctx, project.ID, item.ID, first.CoverageNextCursor, 32)
+	if err != nil || len(first.Coverage)+len(second.Coverage) != 8 {
+		t.Fatalf("overview continuation total=%d err=%v", len(first.Coverage)+len(second.Coverage), err)
+	}
+	seenSources := map[string]bool{}
+	for _, entry := range append(first.Coverage, second.Coverage...) {
+		if entry.Source == "late-source" {
+			t.Fatal("late coverage leaked into frozen overview traversal")
+		}
+		if seenSources[entry.Source] {
+			t.Fatalf("overview cursor repeated source %q", entry.Source)
+		}
+		seenSources[entry.Source] = true
+	}
+	coverageSecond, err := s.ListNarrativeCoverage(ctx, project.ID, item.ID, coverageFirst.NextCursor, 32)
+	if err != nil || len(coverageFirst.Coverage)+len(coverageSecond.Coverage) != 8 {
+		t.Fatalf("coverage continuation total=%d err=%v", len(coverageFirst.Coverage)+len(coverageSecond.Coverage), err)
+	}
+	seenSources = map[string]bool{}
+	for _, entry := range append(coverageFirst.Coverage, coverageSecond.Coverage...) {
+		if entry.Source == "late-source" {
+			t.Fatal("late coverage leaked into frozen metadata traversal")
+		}
+		if seenSources[entry.Source] {
+			t.Fatalf("coverage cursor repeated source %q", entry.Source)
+		}
+		seenSources[entry.Source] = true
+	}
+}

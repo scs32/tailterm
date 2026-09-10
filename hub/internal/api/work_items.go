@@ -214,39 +214,42 @@ type NarrativeLinkList struct {
 }
 
 type NarrativeCoverageVersion struct {
-	CoverageID     string         `json:"coverageId"`
-	TaskID         string         `json:"taskId"`
-	ItemID         string         `json:"itemId"`
-	Revision       int64          `json:"revision"`
-	NarrativeSeq   int64          `json:"narrativeSeq"`
-	Source         string         `json:"source"`
-	Scope          string         `json:"scope"`
-	CaptureState   string         `json:"captureState"`
-	CapturedIDs    []string       `json:"capturedIds"`
-	KnownGaps      []string       `json:"knownGaps"`
-	UnknownExtent  bool           `json:"unknownExtent"`
-	AsOf           *time.Time     `json:"asOf,omitempty"`
-	Assessment     string         `json:"assessment"`
-	AssessmentText string         `json:"assessmentText,omitempty"`
-	CreatedBy      NarrativeActor `json:"createdBy"`
-	CreatedAt      time.Time      `json:"createdAt"`
+	CoverageID         string               `json:"coverageId"`
+	TaskID             string               `json:"taskId"`
+	ItemID             string               `json:"itemId"`
+	Revision           int64                `json:"revision"`
+	NarrativeSeq       int64                `json:"narrativeSeq"`
+	Source             string               `json:"source"`
+	Scope              string               `json:"scope"`
+	CaptureState       string               `json:"captureState"`
+	CapturedIDs        []string             `json:"capturedIds"`
+	KnownGaps          []string             `json:"knownGaps"`
+	UnknownExtent      bool                 `json:"unknownExtent"`
+	AsOf               *time.Time           `json:"asOf,omitempty"`
+	Assessment         string               `json:"assessment"`
+	AssessmentText     string               `json:"assessmentText,omitempty"`
+	EvidenceReferences []NarrativeReference `json:"evidenceReferences"`
+	AssessmentBy       NarrativeActor       `json:"assessmentBy"`
+	CreatedBy          NarrativeActor       `json:"createdBy"`
+	CreatedAt          time.Time            `json:"createdAt"`
 }
 
 type PutNarrativeCoverageRequest struct {
-	RequestID        string     `json:"requestId"`
-	CoverageID       string     `json:"coverageId,omitempty"`
-	ExpectedRevision int64      `json:"expectedRevision"`
-	Source           string     `json:"source"`
-	Scope            string     `json:"scope"`
-	CaptureState     string     `json:"captureState"`
-	CapturedIDs      []string   `json:"capturedIds"`
-	KnownGaps        []string   `json:"knownGaps"`
-	UnknownExtent    bool       `json:"unknownExtent"`
-	AsOf             *time.Time `json:"asOf,omitempty"`
-	Assessment       string     `json:"assessment"`
-	AssessmentText   string     `json:"assessmentText,omitempty"`
-	AgentID          string     `json:"agentId,omitempty"`
-	RunID            string     `json:"runId,omitempty"`
+	RequestID          string               `json:"requestId"`
+	CoverageID         string               `json:"coverageId,omitempty"`
+	ExpectedRevision   int64                `json:"expectedRevision"`
+	Source             string               `json:"source"`
+	Scope              string               `json:"scope"`
+	CaptureState       string               `json:"captureState"`
+	CapturedIDs        []string             `json:"capturedIds"`
+	KnownGaps          []string             `json:"knownGaps"`
+	UnknownExtent      bool                 `json:"unknownExtent"`
+	AsOf               *time.Time           `json:"asOf,omitempty"`
+	Assessment         string               `json:"assessment"`
+	AssessmentText     string               `json:"assessmentText,omitempty"`
+	EvidenceReferences []NarrativeReference `json:"evidenceReferences"`
+	AgentID            string               `json:"agentId,omitempty"`
+	RunID              string               `json:"runId,omitempty"`
 }
 
 type NarrativeCoverageList struct {
@@ -346,6 +349,7 @@ type NarrativeOverview struct {
 	CompletionReport    *NarrativeReportPin        `json:"completionReport,omitempty"`
 	LegacyReportMissing bool                       `json:"legacyReportMissing"`
 	Coverage            []NarrativeCoverageVersion `json:"coverage"`
+	CoverageNextCursor  string                     `json:"coverageNextCursor,omitempty"`
 	DefaultGaps         []NarrativeCoverageVersion `json:"defaultGaps"`
 }
 

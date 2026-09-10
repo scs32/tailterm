@@ -158,7 +158,7 @@ func cmdWorkItemNarrative(e env, args []string) error {
 	var out any
 	switch name {
 	case "overview":
-		out, err = c.GetNarrativeOverview(ctx, project, item)
+		out, err = c.GetNarrativeOverviewPage(ctx, project, item, *cursor, *limit)
 	case "timeline":
 		out, err = c.QueryNarrativeTimeline(ctx, project, item, api.NarrativeTimelineQuery{
 			Cursor: *cursor, Limit: *limit, Kind: *kind, Source: *source,

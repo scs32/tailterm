@@ -99,8 +99,8 @@ export function createHubClient({ fetchImpl, baseURL, token = "" }) {
       request(`/v1/tasks/${task}/work-items/${id}/history-gaps` + q(params)),
     listWorkItemMessages: (task, id, params = {}) =>
       request(`/v1/tasks/${task}/work-items/${id}/messages` + q(params)),
-    getNarrativeOverview: (task, id) =>
-      request(`/v1/tasks/${task}/work-items/${id}/narrative`),
+    getNarrativeOverview: (task, id, params = {}) =>
+      request(`/v1/tasks/${task}/work-items/${id}/narrative` + q(params)),
     listNarrativeTimeline: (task, id, params = {}) =>
       request(
         `/v1/tasks/${task}/work-items/${id}/narrative/timeline` + q(params),

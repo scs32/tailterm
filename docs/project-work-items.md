@@ -66,15 +66,19 @@ of the work-item revision. Artifact corrections and link retractions preserve
 the original version. Stored content has a server-computed digest; a submitted
 digest remains separately labelled. Capture state, availability, declared
 coverage and evidence assessment remain distinct, so successful storage is not
-presented as successful execution or independent verification. AIV entries are
+presented as successful execution or independent verification. Passed, failed
+and independently verified assessments must cite exact evidence versions and
+retain the verifier separately from the declaration author. AIV entries are
 opaque evidence references and do not activate or duplicate that service.
 
 List endpoints return metadata in frozen pages of 32 entries by default and at
 most 64. Continue with the returned opaque cursor; entries appended after the
 first page are excluded from that traversal. Fetch exact artifact and report
 versions separately to read their full content. Stored narrative text is UTF-8,
-limited to 1 MiB per version and never truncated. Closed projects retain reader
-access but reject new narrative writes.
+limited to 1 MiB of decoded content per version and never truncated; JSON
+escaping uses the larger transport bound. Metadata responses stop below 3 MiB
+and return an advancing cursor instead of truncating a record set. Closed
+projects retain reader access but reject new narrative writes.
 
 A feature can transition to Done only after a complete structured report has
 been stored, read back and pinned by report ID, exact version, server digest and
@@ -84,7 +88,9 @@ report stale; status and priority changes do not. Bugs are unaffected. Existing
 Done features remain Done and show their retained legacy description together
 with an explicit missing-dedicated-report warning until real source material is
 deliberately imported. Later report corrections do not rewrite the report pin
-that originally completed a feature.
+that originally completed a feature. The reader shows the latest correction by
+default while keeping the completion pin and every exact historical report
+version selectable.
 
 The API root is
 `/v1/tasks/{task}/work-items/{item}/narrative`. Its overview, timeline,
