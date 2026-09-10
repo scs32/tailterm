@@ -9,6 +9,10 @@ import {
   launchPlanForStorage,
   restoreLaunchMembers,
 } from "./launch-journal.js";
+import {
+  reconciledAgentProblem,
+  taskCreationMatches,
+} from "./launch-reconciliation.js";
 // Project hub controller: owns the hub client, per-task event feeds, the mirror
 // loop that keeps a project tab's panes in step with the hub's agent list, and
 // the project dialogs reachable from the command palette.
@@ -72,7 +76,13 @@ export function createTaskHub(host) {
       .map((byte) => byte.toString(16).padStart(2, "0"))
       .join("");
   }
-  async function prepareLaunchJournal(kind, taskId, plan, teamId = "") {
+  async function prepareLaunchJournal(
+    kind,
+    taskId,
+    plan,
+    teamId = "",
+    creation = undefined,
+  ) {
     const now = new Date().toISOString();
     for (const entry of plan)
       entry.fields.agentId ||=
@@ -86,6 +96,7 @@ export function createTaskHub(host) {
       createdAt: now,
       updatedAt: now,
       members: plan.map((entry) => ({ ...entry, state: "unstarted" })),
+      ...(creation && { creation }),
     });
     await host.api("/team-launch-plans/validate", "POST", journal);
     return journal;
@@ -95,6 +106,28 @@ export function createTaskHub(host) {
       ...journal,
       updatedAt: new Date().toISOString(),
     });
+  async function reconcileTaskCreation(journal) {
+    if (journal?.creation?.state !== "uncertain" || journal.taskId)
+      throw new Error("This project creation is not awaiting reconciliation.");
+    const matches = taskCreationMatches(
+      await client.listTasks(),
+      journal.creation,
+    );
+    if (matches.length !== 1)
+      throw new Error(
+        matches.length
+          ? "More than one project matches the unresolved creation. Inspect Projects and reconcile it manually before discarding the frozen record."
+          : "The prior project-creation response is still unknown. Inspect Projects before discarding the frozen record; Tailterm will not create another project automatically.",
+      );
+    const confirmed = {
+      ...structuredClone(journal),
+      taskId: matches[0].id,
+      creation: { ...structuredClone(journal.creation), state: "confirmed" },
+    };
+    await saveLaunchJournal(confirmed);
+    Object.assign(journal, confirmed);
+    return matches[0];
+  }
   async function amendUnstartedFolders(plan, journal, refreshed) {
     const candidates = new Map(
       refreshed.map((entry) => [entry.fields.name, entry]),
@@ -888,6 +921,53 @@ export function createTaskHub(host) {
       host.closeDialog();
       host.openBoard(saved.id);
     };
+    const freezeCreation = () => {
+      for (const selector of [
+        "#task-name",
+        "#task-goal",
+        "#task-team",
+        "#task-main-server",
+        "#task-with-agent",
+        "#task-swarm",
+        "#task-allow-spawn",
+        "#task-max-new-agents",
+      ]) {
+        const control = form.querySelector(selector);
+        if (control) control.disabled = true;
+      }
+      form
+        .querySelectorAll(
+          "#task-project-folders input, #task-project-folders button",
+        )
+        .forEach((control) => (control.disabled = true));
+    };
+    const showUnknownCreation = () => {
+      freezeCreation();
+      button.disabled = false;
+      button.textContent = "Reconcile project creation";
+      error.textContent =
+        "A prior project-creation response is unknown. Tailterm will inspect Projects for the exact frozen request and will not create another project automatically.";
+      if (form.querySelector("#task-discard-creation")) return;
+      const discard = document.createElement("button");
+      discard.type = "button";
+      discard.id = "task-discard-creation";
+      discard.textContent = "Discard unresolved record";
+      discard.onclick = async () => {
+        if (
+          !(await host.confirm(
+            "Discard unresolved project launch?",
+            "Only do this after verifying that the project was not created.",
+          ))
+        )
+          return;
+        await host.api(`/team-launch-plans/${launchJournal.id}`, "DELETE");
+        host.closeDialog();
+        host.notice(
+          "The unresolved launch record was discarded. Open New project to start over.",
+        );
+      };
+      form.querySelector(".dialog-actions").prepend(discard);
+    };
     form.querySelector("#task-open-created").onclick = open;
     form.querySelector("#task-allow-spawn").onchange = (e) =>
       (form.querySelector("#task-max-new-agents").disabled = !e.target.checked);
@@ -921,6 +1001,21 @@ export function createTaskHub(host) {
       if (pending) return;
       error.textContent = "";
       try {
+        if (
+          !saved &&
+          launchJournal?.creation?.state === "uncertain" &&
+          !launchJournal.taskId
+        ) {
+          error.textContent = "Reconciling the prior project creation…";
+          saved = await reconcileTaskCreation(launchJournal);
+          launchPlan = restoreLaunchMembers(launchJournal, host.getServers());
+          for (const member of launchJournal.members)
+            if (member.state === "started") progress.add(member.fields.name);
+          freezeCreation();
+          bound.add(saved.id);
+          cache.set(saved.id, { task: saved, agents: [] });
+          form.querySelector("#task-open-created").hidden = false;
+        }
         const name = form.querySelector("#task-name").value.trim();
         if (!name || [...name].length > 120 || /[\x00-\x1f\x7f]/.test(name))
           throw new Error("Enter a project name of up to 120 characters.");
@@ -939,6 +1034,19 @@ export function createTaskHub(host) {
           .getServers()
           .find((s) => s.id === form.querySelector("#task-server").value);
         const team = teams.find((t) => t.id === teamSelect?.value);
+        const createRequest = {
+          name,
+          goal: form.querySelector("#task-goal").value.trim(),
+          allowAgentSpawn: form.querySelector("#task-allow-spawn").checked,
+          maxNewAgents,
+          swarm: form.querySelector("#task-swarm").checked,
+          orchestrator:
+            team?.orchestrator ||
+            team?.members[0]?.name ||
+            (!team && withAgent.checked
+              ? form.querySelector("#agent-name").value.trim()
+              : ""),
+        };
         const fields = !team && withAgent.checked ? readAgentFields() : null;
         if (fields) {
           if (!target) throw new Error("Choose a server for the first agent.");
@@ -982,13 +1090,21 @@ export function createTaskHub(host) {
             withDatabaseHandler(refreshed),
           );
         }
-        if (!launchJournal && plan.length && team)
+        if (!launchJournal && plan.length && team) {
+          const preparedAt = new Date().toISOString();
           launchJournal = await prepareLaunchJournal(
             "new-project",
             saved?.id,
             plan,
             team?.id,
+            {
+              state: "prepared",
+              request: createRequest,
+              knownTaskIds: (await client.listTasks()).map((task) => task.id),
+              preparedAt,
+            },
           );
+        }
         if (!saved && launchJournal) await saveLaunchJournal(launchJournal);
         pending = true;
         form
@@ -1002,21 +1118,35 @@ export function createTaskHub(host) {
           ? "Retrying agent launch…"
           : "Creating project…";
         if (!saved) {
-          saved = await client.createTask({
-            name,
-            goal: form.querySelector("#task-goal").value.trim(),
-            allowAgentSpawn: form.querySelector("#task-allow-spawn").checked,
-            maxNewAgents,
-            swarm: form.querySelector("#task-swarm").checked,
-            orchestrator:
-              team?.orchestrator ||
-              team?.members[0]?.name ||
-              fields?.name ||
-              "",
-          });
+          if (launchJournal?.creation) {
+            launchJournal.creation.state = "uncertain";
+            launchJournal.creation.attemptedAt = new Date().toISOString();
+            await saveLaunchJournal(launchJournal);
+          }
+          try {
+            saved = await client.createTask(createRequest);
+          } catch (createError) {
+            if (
+              launchJournal &&
+              Number.isInteger(createError?.status) &&
+              createError.status >= 400 &&
+              createError.status < 500
+            ) {
+              await host.api(
+                `/team-launch-plans/${launchJournal.id}`,
+                "DELETE",
+              );
+              launchJournal = null;
+              launchPlan = null;
+            } else if (launchJournal) {
+              showUnknownCreation();
+            }
+            throw createError;
+          }
           launchPlan = plan;
           if (launchJournal) {
             launchJournal.taskId = saved.id;
+            launchJournal.creation.state = "confirmed";
             await saveLaunchJournal(launchJournal);
           }
           if (teamSelect) teamSelect.disabled = true;
@@ -1074,6 +1204,10 @@ export function createTaskHub(host) {
             : "Project created.",
         );
       } catch (e) {
+        const unknownCreation =
+          !saved &&
+          launchJournal?.creation?.state === "uncertain" &&
+          !launchJournal.taskId;
         if (teamSelect?.value && !launchJournal) {
           launchPlan = null;
           form
@@ -1082,12 +1216,14 @@ export function createTaskHub(host) {
             )
             .forEach((el) => (el.disabled = false));
         }
-        error.textContent =
-          (saved ? "Project created. Agent launch failed: " : "") +
-          formatError(e) +
-          (progress.size
-            ? " Started agents keep their folders. The database handler keeps the lead’s settings; corrections apply to remaining workers."
-            : "");
+        if (unknownCreation) showUnknownCreation();
+        else
+          error.textContent =
+            (saved ? "Project created. Agent launch failed: " : "") +
+            formatError(e) +
+            (progress.size
+              ? " Started agents keep their folders. The database handler keeps the lead’s settings; corrections apply to remaining workers."
+              : "");
         if (progress.size && launchJournal)
           projects.setEditable(
             launchPlan
@@ -1102,11 +1238,12 @@ export function createTaskHub(host) {
           );
         error.setAttribute("role", "alert");
         error.scrollIntoView({ block: "nearest" });
-        button.textContent = saved
-          ? "Retry agent launch"
-          : withAgent.checked
-            ? "Create project and start agent"
-            : "Create project";
+        if (!unknownCreation)
+          button.textContent = saved
+            ? "Retry agent launch"
+            : withAgent.checked
+              ? "Create project and start agent"
+              : "Create project";
       } finally {
         pending = false;
         button.disabled = false;
@@ -1132,27 +1269,20 @@ export function createTaskHub(host) {
         if (!recovered || !form.isConnected) return;
         if (!recovered.taskId) {
           launchJournal = structuredClone(recovered);
-          button.disabled = true;
-          error.textContent =
-            "A prior project-creation response is unknown. Inspect Projects before deciding whether to discard its frozen launch record.";
-          const discard = document.createElement("button");
-          discard.type = "button";
-          discard.textContent = "Discard unresolved record";
-          discard.onclick = async () => {
-            if (
-              !(await host.confirm(
-                "Discard unresolved project launch?",
-                "Only do this after verifying that the project was not created.",
-              ))
-            )
-              return;
-            await host.api(`/team-launch-plans/${launchJournal.id}`, "DELETE");
-            launchJournal = null;
-            discard.remove();
-            error.textContent = "";
-            button.disabled = false;
-          };
-          form.querySelector(".dialog-actions").prepend(discard);
+          launchPlan = restoreLaunchMembers(launchJournal, host.getServers());
+          const request = launchJournal.creation?.request;
+          if (!request)
+            throw new Error(
+              "The unresolved project record is missing its frozen creation request.",
+            );
+          form.querySelector("#task-name").value = request.name;
+          form.querySelector("#task-goal").value = request.goal;
+          form.querySelector("#task-swarm").checked = request.swarm;
+          form.querySelector("#task-allow-spawn").checked =
+            request.allowAgentSpawn;
+          form.querySelector("#task-max-new-agents").value =
+            request.maxNewAgents;
+          showUnknownCreation();
           return;
         }
         const detail = await client.getTask(recovered.taskId);
@@ -1411,19 +1541,57 @@ export function createTaskHub(host) {
         .map(({ fields }) => fields.name.toLowerCase()),
     ]);
     const plannedTeamMembers = plannedNames.size;
-    const open = detail.agents.filter(
-      (a) => !["closed", "exited"].includes(a.status),
-    );
-    for (const { fields } of plan) {
+    let reconciled = false;
+    for (const entry of plan) {
+      const { fields } = entry;
+      const member = journal?.members.find(
+        (candidate) => candidate.fields.name === fields.name,
+      );
+      const exact = detail.agents.find((agent) => agent.id === fields.agentId);
+      if (member && ["uncertain", "started"].includes(member.state)) {
+        if (!exact)
+          throw new Error(
+            `The saved ${member.state} identity for ${fields.name} is not present. Reconcile the exact agent and run before continuing.`,
+          );
+        const problem = await reconciledAgentProblem(
+          taskId,
+          entry,
+          member,
+          exact,
+        );
+        if (problem)
+          throw new Error(
+            `The saved identity for ${fields.name} has a ${problem} mismatch. Inspect the project before continuing.`,
+          );
+        if (member.state === "uncertain") {
+          member.state = "started";
+          member.agent = {
+            id: exact.id,
+            runId: exact.runId,
+            name: exact.name,
+          };
+          reconciled = true;
+        }
+        progress.add(fields.name);
+        continue;
+      }
+      if (member?.state === "unstarted" && exact)
+        throw new Error(
+          `The unstarted record for ${fields.name} already has its preallocated identity in the project. Inspect it before continuing.`,
+        );
       if (
         !progress.has(fields.name) &&
-        fields.agentRole !== "database_handler" &&
-        open.some((a) => a.name.toLowerCase() === fields.name.toLowerCase())
+        detail.agents.some(
+          (agent) =>
+            !["closed", "exited"].includes(agent.status) &&
+            agent.name.toLowerCase() === fields.name.toLowerCase(),
+        )
       )
         throw new Error(
-          `An agent named ${fields.name} already exists. Open the project to inspect it before launching more agents.`,
+          `An agent named ${fields.name} already exists with a different identity. Open the project to inspect it before launching more agents.`,
         );
     }
+    if (reconciled) await saveLaunchJournal(journal);
     for (const { server, fields } of plan) {
       if (fields.agentRole === "database_handler")
         if (!progress.has(fields.name))
@@ -1434,30 +1602,6 @@ export function createTaskHub(host) {
       const journalMember = journal?.members.find(
         (member) => member.fields.name === fields.name,
       );
-      if (journalMember?.state === "uncertain") {
-        const reconciled = detail.agents.find(
-          (agent) =>
-            agent.id === fields.agentId &&
-            !["closed", "exited"].includes(agent.status),
-        );
-        if (!reconciled)
-          throw new Error(
-            `The prior response for ${fields.name} is unknown. Reconcile its exact agent identity in the project before retrying.`,
-          );
-        if (reconciled.name !== fields.name)
-          throw new Error(
-            `The saved identity for ${fields.name} belongs to a different project member.`,
-          );
-        journalMember.state = "started";
-        journalMember.agent = {
-          id: reconciled.id,
-          runId: reconciled.runId,
-          name: reconciled.name,
-        };
-        progress.add(fields.name);
-        await saveLaunchJournal(journal);
-        continue;
-      }
       report(
         `Starting ${fields.name} on ${server.name} (${i + 1}/${plan.length})…`,
       );

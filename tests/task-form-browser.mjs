@@ -52,6 +52,8 @@ const launchServers = [];
 const launchCommands = [];
 let failLaunch = false,
   failAt = 0,
+  loseLaunchAt = 0,
+  loseTaskCreateReply = false,
   execs = 0,
   historyRequests = 0;
 const html = `<!doctype html><html><head><meta charset="utf-8"><link rel="stylesheet" href="/client/style.css"></head><body><div id="app"><div id="workspace"><aside></aside><main><header><div class="header-right"><button id="tailscale-login"><span class="online"></span>Connected</button></div></header><section class="terminal-shell"></section></main></div><dialog id="dialog"></dialog><div id="notice" hidden></div></div><script type="module">
@@ -60,10 +62,14 @@ import {createBoardView} from '/client/board-view.js';
 import {createTasksView} from '/client/tasks-view.js';
 import {createTeamsView} from '/client/teams-view.js';
 import {setupModes} from '/client/modes.js';
-let board, tasks, modes, teams;const baseAgent=(id,name,serverId,role)=>({id,revision:1,name,launchName:name,role,serverId,runtime:'codex',model:'gpt-5.3-codex',reasoning:'high',approvalMode:'on-request',sandboxMode:'workspace-write',permissionMode:'',allowedTools:[],run:'sleep 30',cwd:'',prompt:'Inspect the exact bounded assignment.'});const data={hub:{url:location.origin},launchProfiles:[],agentCatalog:{version:2,definitions:[baseAgent('agent_team_planner','team-planner','', 'Planner'),baseAgent('agent_team_reviewer','team-reviewer','secondary','Reviewer')]},teamsVersion:2,teams:[],teamLaunchPlans:[],projectHandlerPlans:[]};
-const servers=[{id:'local',name:'Test host',host:'stephens-macbook-air',username:'test',runtimes:['claude']},{id:'secondary',name:'Second host',host:'second-fixture',username:'test',runtimes:['codex']}];
+import {localAPI} from '/client/local-vault.js';
+import {reconciledAgentProblem} from '/client/launch-reconciliation.js';
+await localAPI('/unlock','POST',{password:'synthetic vault passphrase'});
+const savedLocal=await localAPI('/data');
+let board, tasks, modes, teams;const baseAgent=(id,name,serverId,role)=>({id,revision:1,name,launchName:name,role,serverId,runtime:'codex',model:'gpt-5.3-codex',reasoning:'high',approvalMode:'on-request',sandboxMode:'workspace-write',permissionMode:'',allowedTools:[],run:"sh -c 'sleep 300' --",cwd:'',prompt:'Inspect the exact bounded assignment.'});const data={hub:{url:location.origin},launchProfiles:[],agentCatalog:{version:2,definitions:[baseAgent('agent_team_planner','team-planner','', 'Planner'),baseAgent('agent_team_reviewer','team-reviewer','secondary','Reviewer')]},teamsVersion:2,teams:JSON.parse(localStorage.getItem('qa-teams')||'[]'),teamLaunchPlans:savedLocal.teamLaunchPlans,projectHandlerPlans:[]};
+const servers=[{id:'local',name:'Test host',host:'stephens-macbook-air',username:'test',runtimes:['claude']},{id:'secondary',name:'Second host',host:'second-fixture',username:'test',runtimes:['codex']}];let failJournalWrite=false;
 const model={groups:[],taskGroup:()=>null};
-const host={openSFTP:async server=>({done:new Promise(()=>{}),home:async()=>${JSON.stringify(root)},realpath:async p=>p,list:async p=>({path:p,entries:p===${JSON.stringify(root)}?[{name:'hub',isDir:true},{name:'ignored.txt',isDir:false}]:[]}),close(){}}),getIPN:()=>({fetch:(url,init)=>fetch(url,init)}),getData:()=>data,getServers:()=>servers,currentServer:()=>servers[0],currentTab:()=>null,getTabs:()=>[],paneGroups:()=>({model,sync(){}}),render(){},scheduleWorkspaceSave(){},bookmark(){},closeTab(){},connect:async()=>null,notice:t=>{document.querySelector('#notice').textContent=t},api:async(url,method,body)=>{if(url==="/teams")data.teams=[...data.teams.filter(t=>t.id!==body.id),body];if(url.startsWith("/teams/"))data.teams=data.teams.filter(t=>t.id!==url.slice(7));if(url==="/launch-profiles")data.launchProfiles=[...data.launchProfiles.filter(p=>p.name!==body.name),body];if(url==="/project-handler-plans"&&method==="POST")data.projectHandlerPlans=[...data.projectHandlerPlans.filter(p=>p.hub!==body.hub||p.taskId!==body.taskId),structuredClone(body)];return {sessions:[]}},reloadData:async()=>{},
+const host={openSFTP:async server=>({done:new Promise(()=>{}),home:async()=>${JSON.stringify(root)},realpath:async p=>p,list:async p=>({path:p,entries:p===${JSON.stringify(root)}?[{name:'hub',isDir:true},{name:'ignored.txt',isDir:false}]:[]}),close(){}}),getIPN:()=>({fetch:(url,init)=>fetch(url,init)}),getData:()=>data,getServers:()=>servers,currentServer:()=>servers[0],currentTab:()=>null,getTabs:()=>[],paneGroups:()=>({model,sync(){}}),render(){},scheduleWorkspaceSave(){},bookmark(){},closeTab(){},connect:async()=>null,confirm:async()=>true,notice:t=>{document.querySelector('#notice').textContent=t},api:async(url,method,body)=>{if(url.startsWith('/team-launch-plans')){if(url==='/team-launch-plans'&&method==='POST'&&failJournalWrite){failJournalWrite=false;throw new Error('Synthetic encrypted journal write failure')}const result=await localAPI(url,method,body);data.teamLaunchPlans=(await localAPI('/data')).teamLaunchPlans;return result}if(url==="/teams"){data.teams=[...data.teams.filter(t=>t.id!==body.id),body];localStorage.setItem('qa-teams',JSON.stringify(data.teams))}if(url.startsWith("/teams/")){data.teams=data.teams.filter(t=>t.id!==url.slice(7));localStorage.setItem('qa-teams',JSON.stringify(data.teams))}if(url==="/launch-profiles")data.launchProfiles=[...data.launchProfiles.filter(p=>p.name!==body.name),body];if(url==="/project-handler-plans"&&method==="POST")data.projectHandlerPlans=[...data.projectHandlerPlans.filter(p=>p.hub!==body.hub||p.taskId!==body.taskId),structuredClone(body)];return {sessions:[]}},reloadData:async()=>{data.teamLaunchPlans=(await localAPI('/data')).teamLaunchPlans},
  dialog:(title,body)=>{const d=document.querySelector('#dialog');if(d.open)d.close();d.innerHTML='<div class="dialog-head"><h2>'+title+'</h2><button id="dialog-close">×</button></div>'+body;d.querySelector('#dialog-close').onclick=()=>host.closeDialog();d.showModal()},
  closeDialog:()=>{const d=document.querySelector('#dialog');d.close();d.replaceChildren()},
  openBoard:id=>{modes.set('board');board.show(id)},
@@ -74,7 +80,7 @@ board=createBoardView({client:()=>hub.client(),getTabs:()=>[],activate(){},notic
 tasks=createTasksView({confirm:async()=>true,client:()=>hub.client(),taskHub:hub,getTabs:()=>[],activate(){},notice:host.notice,openBoard:host.openBoard,configure(){}});
 teams=createTeamsView({...host,confirm:async()=>true,newTask:t=>hub.newTask(undefined,t),addTeam:t=>hub.addTeam(t)});
 modes=setupModes({header:document.querySelector('header'),main:document.querySelector('main'),onChange:(mode,view)=>{board.hide();tasks.hide();teams.hide();view.replaceChildren();if(mode==='board'){board.mount(view);board.show()}else if(mode==='teams'){teams.mount(view);teams.show()}else if(mode==='tasks'){tasks.mount(view);tasks.show()}}});
-modes.set('tasks');window.qa={hub,board,modes,data};
+modes.set('tasks');window.qa={hub,board,modes,data,localData:()=>localAPI('/data'),reconciledAgentProblem,failJournalWrite:()=>{failJournalWrite=true}};
 </script></body></html>`;
 const server = createServer(async (req, res) => {
   try {
@@ -86,6 +92,16 @@ const server = createServer(async (req, res) => {
     if (req.url === "/qa/history-requests") {
       res.setHeader("content-type", "application/json");
       res.end(JSON.stringify({ historyRequests }));
+      return;
+    }
+    if (req.url === "/qa/lose-task-create-reply") {
+      loseTaskCreateReply = true;
+      res.end("ok");
+      return;
+    }
+    if (req.url === "/qa/lose-launch-reply") {
+      loseLaunchAt = execs + 1;
+      res.end("ok");
       return;
     }
     if (req.url.startsWith("/v1/")) {
@@ -105,6 +121,17 @@ const server = createServer(async (req, res) => {
           ? undefined
           : Buffer.concat(chunks),
       });
+      if (
+        loseTaskCreateReply &&
+        req.method === "POST" &&
+        req.url === "/v1/tasks"
+      ) {
+        loseTaskCreateReply = false;
+        await r.text();
+        res.writeHead(500, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: "Synthetic lost create response" }));
+        return;
+      }
       res.writeHead(r.status, { "content-type": "application/json" });
       res.end(await r.text());
       return;
@@ -140,11 +167,25 @@ const server = createServer(async (req, res) => {
           timeout: 20000,
         },
       );
+      if (execs === loseLaunchAt) {
+        loseLaunchAt = 0;
+        res.writeHead(500, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: "Synthetic lost launch response" }));
+        return;
+      }
       res.setHeader("content-type", "application/json");
       res.end(JSON.stringify({ output: result.stdout }));
       return;
     }
-    const file = path.resolve(root, "." + decodeURIComponent(req.url));
+    if (req.url.endsWith("?url")) {
+      res.setHeader("content-type", "text/javascript");
+      res.end(`export default ${JSON.stringify(req.url.slice(0, -4))}`);
+      return;
+    }
+    const file = path.resolve(
+      root,
+      "." + decodeURIComponent(req.url.split("?", 1)[0]),
+    );
     if (!file.startsWith(root + "/")) throw new Error("invalid path");
     res.setHeader(
       "content-type",
@@ -412,7 +453,13 @@ try {
         1,
       );
       await page.locator("#task-create").click();
-      await page.locator("#dialog").waitFor({ state: "hidden" });
+      try {
+        await page.locator("#dialog").waitFor({ state: "hidden" });
+      } catch (error) {
+        throw new Error(
+          `${error.message}\n${await page.locator("#task-error").innerText()}`,
+        );
+      }
       assert.equal(
         (await getTasks()).filter((t) => t.name === name + " launch retry")
           .length,
@@ -462,6 +509,184 @@ try {
       await page.locator("#dialog").waitFor({ state: "hidden" });
       assert.equal(await page.locator(".team-row").count(), 1);
       await page.screenshot({ path: ".build/teams-" + name + ".png" });
+
+      const journalFailureName = name + " journal failure";
+      const tasksBeforeJournalFailure = (await getTasks()).length;
+      const execsBeforeJournalFailure = execs;
+      await page.locator("[data-new-task]").click();
+      await page.locator("#task-main-server").selectOption("secondary");
+      await page.locator('[data-project-server="secondary"]').fill(root);
+      await page.locator("#task-name").fill(journalFailureName);
+      await page.evaluate(() => qa.failJournalWrite());
+      await page.locator("#task-create").click();
+      await page
+        .locator("#task-error")
+        .filter({ hasText: "Synthetic encrypted journal write failure" })
+        .waitFor();
+      assert.equal((await getTasks()).length, tasksBeforeJournalFailure);
+      assert.equal(execs, execsBeforeJournalFailure);
+      assert.equal(
+        (
+          await page.evaluate(
+            async () => (await qa.localData()).teamLaunchPlans,
+          )
+        ).some((plan) => plan.creation?.request?.name === journalFailureName),
+        false,
+      );
+      await page.locator("#dialog-close").click();
+
+      // A committed project with a lost HTTP reply is persisted as uncertain.
+      // A second submit reconciles that exact frozen creation rather than
+      // issuing another POST, then a lost worker reply reconciles its exact
+      // registered identity before the remaining members continue.
+      await page.locator("[data-new-task]").click();
+      await page.locator("#task-main-server").selectOption("secondary");
+      await page.locator('[data-project-server="secondary"]').fill(root);
+      const lostCreateName = name + " lost create same dialog";
+      await page.locator("#task-name").fill(lostCreateName);
+      await fetch(origin + "/qa/lose-task-create-reply");
+      await page.locator("#task-create").click();
+      await page
+        .locator("#task-error")
+        .filter({ hasText: "prior project-creation response is unknown" })
+        .waitFor();
+      assert.equal(
+        (await getTasks()).filter((task) => task.name === lostCreateName)
+          .length,
+        1,
+      );
+      let persistedPlans = await page.evaluate(
+        async () => (await qa.localData()).teamLaunchPlans,
+      );
+      const uncertainCreate = persistedPlans.find(
+        (plan) => plan.creation?.request?.name === lostCreateName,
+      );
+      assert.equal(uncertainCreate.creation.state, "uncertain");
+      assert.equal(uncertainCreate.taskId, undefined);
+      const encryptedJournal = await page.evaluate(
+        () =>
+          new Promise((resolve, reject) => {
+            const open = indexedDB.open("tailserve", 1);
+            open.onerror = () => reject(open.error);
+            open.onsuccess = () => {
+              const read = open.result
+                .transaction("vault", "readonly")
+                .objectStore("vault")
+                .get("encrypted-v2");
+              read.onerror = () => reject(read.error);
+              read.onsuccess = () => resolve(read.result);
+            };
+          }),
+      );
+      assert.equal(encryptedJournal.version, 2);
+      assert.doesNotMatch(encryptedJournal.ciphertext, /lost create/);
+      const lostWorkerStart = execs;
+      await fetch(origin + "/qa/lose-launch-reply");
+      await page.locator("#task-create").click();
+      await page
+        .locator("#task-error")
+        .filter({ hasText: "Synthetic lost launch response" })
+        .waitFor();
+      const lostCreateTask = (await getTasks()).find(
+        (task) => task.name === lostCreateName,
+      );
+      let lostCreateDetail = await (
+        await fetch(`http://127.0.0.1:${port}/v1/tasks/${lostCreateTask.id}`)
+      ).json();
+      assert.equal(lostCreateDetail.agents.length, 1);
+      const originalLostAgent = lostCreateDetail.agents[0];
+      persistedPlans = await page.evaluate(
+        async () => (await qa.localData()).teamLaunchPlans,
+      );
+      assert.equal(
+        persistedPlans
+          .find((plan) => plan.taskId === lostCreateTask.id)
+          .members.find(
+            (member) => member.fields.agentId === originalLostAgent.id,
+          ).state,
+        "uncertain",
+      );
+      await page.locator("#task-create").click();
+      try {
+        await page.locator("#dialog").waitFor({ state: "hidden" });
+      } catch (error) {
+        throw new Error(
+          `${error.message}\n${await page.locator("#task-error").innerText()}`,
+        );
+      }
+      lostCreateDetail = await (
+        await fetch(`http://127.0.0.1:${port}/v1/tasks/${lostCreateTask.id}`)
+      ).json();
+      assert.equal(lostCreateDetail.agents.length, 3);
+      assert.ok(
+        lostCreateDetail.agents.some(
+          (agent) =>
+            agent.id === originalLostAgent.id &&
+            agent.runId === originalLostAgent.runId,
+        ),
+        "lost worker identity/run changed during reconciliation",
+      );
+      assert.equal(
+        execs - lostWorkerStart,
+        3,
+        "reconciliation spawned the lost worker twice or skipped a remaining member",
+      );
+      assert.equal(
+        (await getTasks()).filter((task) => task.name === lostCreateName)
+          .length,
+        1,
+        "same-dialog retry duplicated a committed project",
+      );
+      assert.equal(
+        (
+          await page.evaluate(
+            async () => (await qa.localData()).teamLaunchPlans,
+          )
+        ).some((plan) => plan.taskId === lostCreateTask.id),
+        false,
+      );
+
+      // The same uncertain creation boundary survives an actual page reload
+      // through the encrypted local vault, then reconciles without a new POST.
+      await page.evaluate(() => qa.modes.set("teams"));
+      await page.locator("[data-new-task]").click();
+      await page.locator("#task-main-server").selectOption("secondary");
+      await page.locator('[data-project-server="secondary"]').fill(root);
+      const reloadCreateName = name + " lost create reload";
+      await page.locator("#task-name").fill(reloadCreateName);
+      await fetch(origin + "/qa/lose-task-create-reply");
+      await page.locator("#task-create").click();
+      await page
+        .locator("#task-error")
+        .filter({ hasText: "prior project-creation response is unknown" })
+        .waitFor();
+      assert.equal(
+        (await getTasks()).filter((task) => task.name === reloadCreateName)
+          .length,
+        1,
+      );
+      await page.reload();
+      await page.waitForFunction(() => !!window.qa);
+      await page.evaluate(() => qa.modes.set("teams"));
+      await page.locator("[data-new-task]").click();
+      await page
+        .locator("#task-create")
+        .filter({ hasText: "Reconcile project creation" })
+        .waitFor();
+      assert.equal(
+        await page.locator("#task-name").inputValue(),
+        reloadCreateName,
+      );
+      await page.locator("#task-create").click();
+      await page.locator("#dialog").waitFor({ state: "hidden" });
+      assert.equal(
+        (await getTasks()).filter((task) => task.name === reloadCreateName)
+          .length,
+        1,
+        "reload reconciliation duplicated a committed project",
+      );
+
+      await page.evaluate(() => qa.modes.set("teams"));
       const launchStart = execs;
       failAt = execs + 2;
       await page.locator("[data-new-task]").click();
@@ -721,11 +946,64 @@ try {
       const historyAfterFailure = await (
         await fetch(origin + "/qa/history-requests")
       ).json();
+      const reconciliationChecks = await page.evaluate(async (taskId) => {
+        const journal = (await qa.localData()).teamLaunchPlans.find(
+          (plan) => plan.kind === "add-team" && plan.taskId === taskId,
+        );
+        const member = journal.members.find(
+          (candidate) => candidate.state === "started",
+        );
+        const detail = await qa.hub.client().getTask(taskId);
+        const agent = detail.agents.find(
+          (candidate) => candidate.id === member.fields.agentId,
+        );
+        const entry = {
+          fields: {
+            ...member.fields,
+            workContextBundle: journal.workContextBundle,
+          },
+        };
+        return {
+          exact: await qa.reconciledAgentProblem(taskId, entry, member, agent),
+          run: await qa.reconciledAgentProblem(
+            taskId,
+            entry,
+            {
+              ...member,
+              agent: { ...member.agent, runId: "run_ffffffffffffffff" },
+            },
+            agent,
+          ),
+          lifecycle: await qa.reconciledAgentProblem(taskId, entry, member, {
+            ...agent,
+            status: "closed",
+          }),
+          binding: await qa.reconciledAgentProblem(taskId, entry, member, {
+            ...agent,
+            workItem: {
+              ...agent.workItem,
+              itemRevision: agent.workItem.itemRevision + 1,
+            },
+          }),
+        };
+      }, target.id);
+      assert.deepEqual(reconciliationChecks, {
+        exact: "",
+        run: "agent run",
+        lifecycle: "lifecycle",
+        binding: "work-item/order/context binding",
+      });
       await page
         .locator('[data-project-server="secondary"]')
         .fill(correctedRoutedFolder);
       await page.locator('#team-launch-form button[type="submit"]').click();
-      await page.locator("#dialog").waitFor({ state: "hidden" });
+      try {
+        await page.locator("#dialog").waitFor({ state: "hidden" });
+      } catch (error) {
+        throw new Error(
+          `${error.message}\n${await page.locator("#team-launch-status").innerText()}`,
+        );
+      }
       const historyAfterRetry = await (
         await fetch(origin + "/qa/history-requests")
       ).json();
@@ -895,7 +1173,7 @@ s.commit()
       assert.deepEqual(errors, []);
       console.log(
         name +
-          ": creation, inline validation, optional launch, multiline assignment, failure/retry without duplicates, mobile, mode selection passed.",
+          ": creation, encrypted journal failure/reload, lost task/worker response reconciliation, exact identity/mismatch checks, remaining-member retry, mobile and mode selection passed.",
       );
     } finally {
       await browser.close();

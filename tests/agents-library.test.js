@@ -12,6 +12,10 @@ import {
   normalizeTeamLaunchPlans,
   restoreLaunchMembers,
 } from "../client/launch-journal.js";
+import {
+  reconciledAgentProblem,
+  taskCreationMatches,
+} from "../client/launch-reconciliation.js";
 import { agentSpawnCommand } from "../shared/tmux-command.js";
 
 const legacyMember = (name, overrides = {}) => ({
@@ -273,5 +277,120 @@ test("encrypted retry journal is bounded, stores context once and preserves unce
         ],
       }),
     /512 KiB/,
+  );
+});
+
+test("project creation journal and agent reconciliation preserve exact identities", async () => {
+  const creation = {
+    state: "uncertain",
+    request: {
+      name: "Synthetic frozen project",
+      goal: "Exercise a lost response.",
+      allowAgentSpawn: true,
+      maxNewAgents: 2,
+      swarm: false,
+      orchestrator: "builder",
+    },
+    knownTaskIds: ["tsk_0000000000000001"],
+    preparedAt: new Date(0).toISOString(),
+    attemptedAt: new Date(1).toISOString(),
+  };
+  const tasks = [
+    {
+      id: "tsk_0000000000000001",
+      status: "open",
+      ...creation.request,
+    },
+    {
+      id: "tsk_0000000000000002",
+      status: "open",
+      ...creation.request,
+    },
+    {
+      id: "tsk_0000000000000003",
+      status: "open",
+      ...creation.request,
+      goal: "Different bytes",
+    },
+  ];
+  assert.deepEqual(
+    taskCreationMatches(tasks, creation).map((task) => task.id),
+    ["tsk_0000000000000002"],
+  );
+
+  const context = JSON.stringify({ version: 1, exact: "context bytes" });
+  const digest = Buffer.from(
+    await crypto.subtle.digest("SHA-256", new TextEncoder().encode(context)),
+  ).toString("hex");
+  const fields = {
+    name: "builder",
+    agentId: "agt_1111111111111111",
+    run: "codex",
+    runtime: "codex",
+    cwd: "/synthetic/project",
+    workItemTaskId: "tsk_0123456789abcdef",
+    workItemId: "wi_abcdef0123456789",
+    workItemRevision: 2,
+    workOrderTaskId: "tsk_0123456789abcdef",
+    workOrderMessageSeq: 1720,
+    workContextBundle: context,
+  };
+  const member = {
+    state: "started",
+    fields,
+    agent: {
+      id: fields.agentId,
+      runId: "run_2222222222222222",
+      name: fields.name,
+    },
+  };
+  const agent = {
+    taskId: fields.workItemTaskId,
+    id: fields.agentId,
+    runId: member.agent.runId,
+    name: fields.name,
+    status: "running",
+    role: "",
+    parentAgentId: "",
+    runtime: fields.runtime,
+    cwd: fields.cwd,
+    workItem: {
+      agentId: fields.agentId,
+      runId: member.agent.runId,
+      itemTaskId: fields.workItemTaskId,
+      itemId: fields.workItemId,
+      itemRevision: fields.workItemRevision,
+      workOrderMessage: {
+        taskId: fields.workOrderTaskId,
+        seq: fields.workOrderMessageSeq,
+      },
+      contextDigest: digest,
+    },
+  };
+  const entry = { fields };
+  assert.equal(
+    await reconciledAgentProblem(fields.workItemTaskId, entry, member, agent),
+    "",
+  );
+  assert.equal(
+    await reconciledAgentProblem(fields.workItemTaskId, entry, member, {
+      ...agent,
+      runId: "run_3333333333333333",
+    }),
+    "agent run",
+  );
+  assert.equal(
+    await reconciledAgentProblem(fields.workItemTaskId, entry, member, {
+      ...agent,
+      status: "closed",
+    }),
+    "lifecycle",
+  );
+  assert.equal(
+    await reconciledAgentProblem(fields.workItemTaskId, entry, member, {
+      ...agent,
+      workItem: { ...agent.workItem, itemRevision: 3 },
+    }),
+    "work-item/order/context binding",
   );
 });

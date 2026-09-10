@@ -33,6 +33,59 @@ const FIELD_KEYS = new Set([
 
 const bytes = (value) => encoder.encode(JSON.stringify(value)).byteLength;
 
+function normalizeCreation(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value))
+    throw new Error("Invalid project creation retry state.");
+  const request = value.request;
+  if (
+    !request ||
+    typeof request !== "object" ||
+    Array.isArray(request) ||
+    Object.keys(request).some(
+      (key) =>
+        ![
+          "name",
+          "goal",
+          "allowAgentSpawn",
+          "maxNewAgents",
+          "swarm",
+          "orchestrator",
+        ].includes(key),
+    ) ||
+    typeof request.name !== "string" ||
+    !request.name ||
+    request.name.trim() !== request.name ||
+    [...request.name].length > 120 ||
+    /[\x00-\x1f\x7f]/.test(request.name) ||
+    typeof request.goal !== "string" ||
+    encoder.encode(request.goal).byteLength > 8192 ||
+    typeof request.allowAgentSpawn !== "boolean" ||
+    !Number.isInteger(request.maxNewAgents) ||
+    request.maxNewAgents < 0 ||
+    request.maxNewAgents > 32 ||
+    typeof request.swarm !== "boolean" ||
+    typeof request.orchestrator !== "string" ||
+    (request.orchestrator &&
+      !/^[A-Za-z0-9_-]{1,64}$/.test(request.orchestrator)) ||
+    !["prepared", "uncertain", "confirmed"].includes(value.state) ||
+    !Array.isArray(value.knownTaskIds) ||
+    value.knownTaskIds.length > 200 ||
+    value.knownTaskIds.some((id) => !/^tsk_[a-f0-9]{16}$/.test(id)) ||
+    new Set(value.knownTaskIds).size !== value.knownTaskIds.length ||
+    typeof value.preparedAt !== "string" ||
+    (value.state !== "prepared" && typeof value.attemptedAt !== "string") ||
+    (value.attemptedAt !== undefined && typeof value.attemptedAt !== "string")
+  )
+    throw new Error("Invalid project creation retry state.");
+  return {
+    state: value.state,
+    request: structuredClone(request),
+    knownTaskIds: [...value.knownTaskIds],
+    preparedAt: value.preparedAt,
+    ...(value.attemptedAt && { attemptedAt: value.attemptedAt }),
+  };
+}
+
 export function normalizeTeamLaunchPlans(value) {
   if (value === undefined) return [];
   if (!Array.isArray(value) || value.length > MAX_TEAM_LAUNCH_PLANS)
@@ -63,6 +116,16 @@ export function normalizeTeamLaunchPlans(value) {
     if (ids.has(raw.id)) throw new Error("Duplicate team launch retry plan.");
     ids.add(raw.id);
     const plan = structuredClone(raw);
+    if (plan.kind === "new-project") {
+      plan.creation = normalizeCreation(plan.creation);
+      if (
+        (plan.creation.state === "confirmed") !==
+        /^tsk_[a-f0-9]{16}$/.test(plan.taskId || "")
+      )
+        throw new Error("Project creation state does not match its task ID.");
+    } else if (plan.creation !== undefined) {
+      throw new Error("Only new-project retries can contain creation state.");
+    }
     if (plan.workContextBundle !== undefined) {
       try {
         JSON.parse(plan.workContextBundle);
