@@ -1,8 +1,9 @@
 # Agent registration context admission
 
 Work item `wi_649b1999c31d8fb9` revision 2, bounded work order #1240.
-The owner report is #1239; lead approved the concrete API-client scope refinement
-in #1247, recorded to the database handler in #1252.
+The prerequisite discovery and failed live launch evidence were reported by lead
+in #1239, not directly by the human owner. Lead approved the concrete API-client
+scope refinement in #1247, recorded to the database handler in #1252.
 
 ## Problem and boundary
 
@@ -57,10 +58,47 @@ timed out after ten minutes in `TestAskPreservesIdentityContextAndReplayPayload`
 while its test server waited on a fixture channel. The focused CLI context test
 passed separately; neither broad failure executes the changed registration path.
 
-## Release scope
+## Release
 
-Release is pending lead candidate acceptance. The approved release updates the
-existing TrueNAS hub through middleware and its existing TCP listener, and
-installs matching rebuilt `tt` binaries on Mini and Air with atomic prior-binary
-rollback copies. It does not restart relays or change the frontend, Tailscale,
-networking, owner sessions, live work-item data or retained launch contexts.
+Lead accepted candidate `03129acd724a9064fe67576058ca91cf473b9c78`
+in #1256 and assigned the release slot. The root `tasks-hub` branch was
+fast-forwarded from `ed12c0d` to that exact application commit. The exact clean
+source and builds are retained at
+`.build/releases/context-admission-03129ac`.
+
+The hub is RUNNING through TrueNAS middleware and the unchanged private TCP
+listener from
+`/mnt/deepfreeze/tailterm-hub/releases/20260909-context-admission-03129ac/tailterm-hub`,
+SHA-256 `f561f7743454e956e9da3bafedea083682ef08008bb84a7ca99e5210b48fe8ae`.
+Unauthenticated/authenticated readiness returns 403/200, an unknown exact context
+returns 404, and the live database integrity/FK checks pass.
+
+The pre-update online backup is mode 0600 at
+`/mnt/deepfreeze/tailterm-hub/backups/before-context-admission-20260910T005733Z.sqlite`,
+SHA-256 `df70fc9bbccd975ae31d2aab01b25709b2012277774c8f3b21394409be7bb8fe`.
+The previous routing hub binary remains the normal rollback at SHA-256
+`edaec95e25f62ac0c8b5660ca3841803b7c836df265e4a3ed5cfd68fe296f706`;
+the database snapshot is disaster-recovery evidence, not the normal rollback.
+
+Mini and Air now have matching Darwin arm64 `tt` SHA-256
+`d07329684ef558d61737bcbf81bf7aa61271263190d303f8c008b4ebef6cfe0e`.
+Each retains `tt-before-context-admission-03129ac` at prior SHA-256
+`909220a58f79592479ff49c7f19722f24da8779592d09c17b4d992a21fd7218b`.
+Installed help and doctor checks pass; relay PIDs stayed 83457 and 912 and were
+not restarted.
+
+Two pre-release invocations incorrectly treated `--help` as a deployment release
+name. Each uploaded the same unused candidate artifact before `app.create`
+failed with `EEXIST`; initial reports incorrectly said no file was transferred
+and were explicitly corrected in #1264/#1265. The unused file was mode 0755,
+26,579,106 bytes, SHA-256
+`c36530e4b8966c448348d8761c16919ad39ff47108a7e5fdd0804ef2aa7c253e`.
+It carried stale `ed12c0d` VCS build metadata and was never referenced by the
+running app. Under lead's exact cleanup authorization #1266, its hash and
+non-reference were reverified, then only that file and its empty `--help` parent
+were removed without recursion. The successful update used the source-inspected
+explicit release name and `--update` path.
+
+No frontend, Tailscale, network, listener, relay, owner session, live work-item
+data, retained launch context or task lifecycle changed. The two held contexts
+remain launch inputs for lead; they were never opened or used as fixtures here.

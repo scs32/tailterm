@@ -1,0 +1,178 @@
+{
+  "status": "builder_release_verified_pending_final_acceptance",
+  "recordedAt": "2026-09-10T01:04:14Z",
+  "workItem": {
+    "id": "wi_649b1999c31d8fb9",
+    "revision": 2,
+    "sourceMessage": 1239,
+    "sourceAttribution": "lead-reported prerequisite discovery and failed launch evidence; not a direct human owner report",
+    "workOrderMessage": 1240,
+    "scopeApprovalMessage": 1247,
+    "candidateAcceptanceAndReleaseSlotMessage": 1256,
+    "cleanupAuthorizationMessage": 1266,
+    "handlerCandidateConfirmationMessage": 1257,
+    "handlerRolloutProgressMessage": 1269
+  },
+  "source": {
+    "integrationBase": "ed12c0de1e29d690d9196b8a5b51dd58a43bed2c",
+    "acceptedApplicationCommit": "03129acd724a9064fe67576058ca91cf473b9c78",
+    "rootBranch": "tasks-hub",
+    "integration": "fast-forward",
+    "retainedCleanSource": "/Users/stephenspeicher/projects/tailterm/.build/releases/context-admission-03129ac",
+    "implementationReport": "docs/context-admission.md"
+  },
+  "behavior": {
+    "ordinaryRequestBodyBytes": 65536,
+    "preparedContextBytes": 131072,
+    "agentRegistrationBodyBytes": 802816,
+    "agentRegistrationBodyFormula": "6 * 128 KiB prepared context plus 16 KiB bounded envelope allowance",
+    "clientChange": "AddAgent alone serializes JSON with HTML escaping disabled",
+    "unchanged": [
+      "independent 128 KiB decoded context validation",
+      "work-item revision and recorded order validation",
+      "replacement and exact run identity",
+      "all unrelated endpoint request bounds",
+      "request and response schemas",
+      "CLI flags and invocation"
+    ]
+  },
+  "acceptance": {
+    "before": {
+      "fixture": "isolated synthetic SQLite/API request",
+      "contextBytes": 66560,
+      "requestBytes": 66861,
+      "result": "HTTP 413 before any identity admission"
+    },
+    "after": [
+      "the same 66560-byte context registers successfully",
+      "exact 131072-byte HTML-sensitive context registers with exact binding and digest",
+      "exact 131072-byte multibyte Unicode context registers with exact binding and digest",
+      "131073-byte context returns independent HTTP 409 context limit",
+      "invalid context and malformed JSON return HTTP 400",
+      "request beyond 802816-byte registration envelope returns HTTP 413",
+      "unrelated endpoint remains HTTP 413 above 65536 bytes",
+      "wrong exact run returns HTTP 409",
+      "exact retry creates no second identity and does not change the first run"
+    ],
+    "passingCommands": [
+      "go test ./internal/api ./internal/store ./internal/server -count=1",
+      "go test ./cmd/tt -run focused context and briefing tests -count=1",
+      "go vet ./...",
+      "go test -race ./internal/server -run focused context/limits tests -count=1"
+    ],
+    "broadCliNonpass": {
+      "command": "go test ./cmd/tt -count=1",
+      "failures": [
+        "TestPostHumanReplyAndLiteralHelp: unexpected fixture route",
+        "TestAskPreservesIdentityContextAndReplayPayload: ten-minute timeout while httptest server waited on a fixture channel"
+      ],
+      "relationship": "neither test executes the changed registration path; focused CLI context test passed separately",
+      "rerun": false
+    },
+    "fixtures": "temporary SQLite databases and synthetic tasks/messages/items/contexts only; retained live launch contexts were not opened"
+  },
+  "build": {
+    "goVersion": "go1.26.6",
+    "commands": [
+      "npm run build:tt",
+      "CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags=-s -w tailterm-hub"
+    ],
+    "hubLinuxAmd64Sha256": "f561f7743454e956e9da3bafedea083682ef08008bb84a7ca99e5210b48fe8ae",
+    "ttDarwinArm64Sha256": "d07329684ef558d61737bcbf81bf7aa61271263190d303f8c008b4ebef6cfe0e",
+    "ttLinuxArm64Sha256": "2233c71221fe90e418a27b40f455be5b6253de6510c22e14324e8619ffd44cab",
+    "ttLinuxAmd64Sha256": "9b2f827006fd037027b884fc38fddef13df455874d4082955a9010164e8031a7"
+  },
+  "hub": {
+    "state": "RUNNING",
+    "origin": "http://100.116.238.37:18765",
+    "release": "20260909-context-admission-03129ac",
+    "binary": "/mnt/deepfreeze/tailterm-hub/releases/20260909-context-admission-03129ac/tailterm-hub",
+    "binarySha256": "f561f7743454e956e9da3bafedea083682ef08008bb84a7ca99e5210b48fe8ae",
+    "binaryMode": "0755",
+    "stateMount": "/mnt/deepfreeze/tailterm-hub/state",
+    "tokenMount": "/mnt/deepfreeze/tailterm-hub/hub-token",
+    "listener": "100.116.238.37:18765:18765",
+    "deployment": "source-inspected scripts/deploy-truenas-hub.py with explicit unique release name and --update",
+    "integrity": "ok",
+    "foreignKeyViolations": 0,
+    "readiness": {
+      "unauthenticatedWhoami": 403,
+      "authenticatedWhoami": 200,
+      "unknownExactContext": 404
+    },
+    "previousBinary": "/mnt/deepfreeze/tailterm-hub/releases/20260909-work-item-routing-1e482f6/tailterm-hub",
+    "previousBinarySha256": "edaec95e25f62ac0c8b5660ca3841803b7c836df265e4a3ed5cfd68fe296f706"
+  },
+  "backup": {
+    "path": "/mnt/deepfreeze/tailterm-hub/backups/before-context-admission-20260910T005733Z.sqlite",
+    "method": "SQLite online backup API through sqlite3 .backup before middleware update",
+    "mode": "0600",
+    "owner": "truenas_admin:truenas_admin",
+    "size": 8638464,
+    "sha256": "df70fc9bbccd975ae31d2aab01b25709b2012277774c8f3b21394409be7bb8fe",
+    "integrity": "ok",
+    "foreignKeyViolations": 0
+  },
+  "cli": {
+    "installedDarwinArm64Sha256": "d07329684ef558d61737bcbf81bf7aa61271263190d303f8c008b4ebef6cfe0e",
+    "previousDarwinArm64Sha256": "909220a58f79592479ff49c7f19722f24da8779592d09c17b4d992a21fd7218b",
+    "rollbackName": "tt-before-context-admission-03129ac",
+    "hosts": [
+      {
+        "host": "Stephens-Mini",
+        "installed": "/Users/stephenspeicher/.local/bin/tt",
+        "rollback": "/Users/stephenspeicher/.local/bin/tt-before-context-admission-03129ac",
+        "doctor": "passed",
+        "spawnHelp": "passed",
+        "relayPidBefore": 83457,
+        "relayPidAfter": 83457,
+        "relayRestarted": false
+      },
+      {
+        "host": "theAir",
+        "installed": "/Users/stephenspeicher/.local/bin/tt",
+        "rollback": "/Users/stephenspeicher/.local/bin/tt-before-context-admission-03129ac",
+        "doctor": "passed",
+        "spawnHelp": "passed",
+        "relayPidBefore": 912,
+        "relayPidAfter": 912,
+        "relayRestarted": false
+      }
+    ]
+  },
+  "preReleaseIncidents": [
+    {
+      "attempts": 2,
+      "cause": "deploy script has no help parser; the second invocation was also triggered by shell backticks in an evidence post",
+      "releaseName": "--help",
+      "uploadedArtifact": "/mnt/deepfreeze/tailterm-hub/releases/--help/tailterm-hub",
+      "artifactMode": "0755",
+      "artifactOwner": "truenas_admin:truenas_admin",
+      "artifactSize": 26579106,
+      "artifactSha256": "c36530e4b8966c448348d8761c16919ad39ff47108a7e5fdd0804ef2aa7c253e",
+      "artifactBuildMetadataRevision": "ed12c0de1e29d690d9196b8a5b51dd58a43bed2c",
+      "middlewareResult": "app.create rejected EEXIST both times; app.update was not invoked",
+      "correctionMessages": [1260, 1264, 1265],
+      "cleanup": "after accepted release, reverified exact hash and that current app did not reference it; removed only the exact file and empty parent with no recursive or wildcard operation",
+      "cleanupEvidenceMessage": 1268
+    },
+    {
+      "cause": "one local Python argument-list inventory command had invalid quoting",
+      "result": "SyntaxError before any subprocess or external state change"
+    }
+  ],
+  "rollback": {
+    "hub": "Use TrueNAS middleware to point the app back to the retained work-item-routing binary while preserving current state and additive data; verify RUNNING, hash, listener, integrity/FK and readiness.",
+    "cli": "Atomically restore tt-before-context-admission-03129ac on Mini and Air; no relay restart is needed for the still-running old relay processes.",
+    "database": "The online snapshot is for explicit disaster recovery only, not normal executable rollback; account for all writes after the snapshot."
+  },
+  "excluded": [
+    "TailOS and static frontend deployment",
+    "https://tailterm.tailarr.com",
+    "Tailscale installation, configuration, restart or networking changes",
+    "relay restart",
+    "live task/profile/context fixtures",
+    "owner session or task lifecycle changes",
+    "narrative or Board-scroll implementation/completion"
+  ]
+}

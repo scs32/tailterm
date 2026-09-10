@@ -1,5 +1,44 @@
 # Development handoff — September 9, 2026
 
+## September 9 agent context admission — release verified pending final acceptance
+
+Application/backend commit `03129acd724a9064fe67576058ca91cf473b9c78`
+fixes agent registration for complete prepared work-item contexts above 64 KiB
+through the existing 128 KiB bound. Only the agent-registration HTTP envelope is
+wider; decoded bundle validation stays at 128 KiB and unrelated endpoints remain
+at 64 KiB. The Go API client avoids HTML-safe expansion only for AddAgent.
+
+The hub is RUNNING through existing TrueNAS middleware/TCP from
+`/mnt/deepfreeze/tailterm-hub/releases/20260909-context-admission-03129ac/tailterm-hub`,
+SHA-256 `f561f7743454e956e9da3bafedea083682ef08008bb84a7ca99e5210b48fe8ae`.
+Its existing state/token mounts, private address and listener are unchanged.
+The pre-update online backup is mode 0600 at
+`/mnt/deepfreeze/tailterm-hub/backups/before-context-admission-20260910T005733Z.sqlite`.
+Mini and Air run matching Darwin arm64 `tt` SHA-256
+`d07329684ef558d61737bcbf81bf7aa61271263190d303f8c008b4ebef6cfe0e`;
+both retain `tt-before-context-admission-03129ac` at the prior hash and their
+relay PIDs were not restarted.
+
+The isolated failing-first fixture returned HTTP 413 for a 66,560-byte context.
+The released path admits that request and exact 128 KiB HTML-sensitive and
+Unicode contexts while preserving binding/digest identity. A 128 KiB+1 bundle,
+invalid/malformed bundles, the bounded registration envelope, unrelated request
+limits, wrong-run lookup and duplicate retry behavior all retain their distinct
+rejections. Focused tests, race and vet pass. The broad CLI suite had unrelated
+coordination/decision fixture failures and a ten-minute channel-wait timeout; it
+was not rerun or reported as passing.
+
+Two mistaken pre-release `--help` script invocations uploaded the same unused
+binary before middleware rejected `app.create` with `EEXIST`. The initially
+incorrect no-transfer report was corrected. The running app never referenced
+that path; after exact hash/non-reference verification and lead authorization,
+only the unused file and empty parent were removed. See
+[the implementation report](context-admission.md) and
+[the release receipt](releases/tailos-2026-09-09-context-admission.json).
+Neither TailOS/static frontend, Tailscale/networking, live records, owner sessions,
+retained context files nor task lifecycle changed. Lead owns retrying the two
+held launches; this prerequisite does not complete either original work item.
+
 ## September 9 Bugs and Features status filtering — release verified pending final acceptance
 
 Application commit `0c1a3ce62301c415ab51d2c0c3438893702622db` is deployed to
