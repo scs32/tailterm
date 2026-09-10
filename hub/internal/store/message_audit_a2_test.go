@@ -10,6 +10,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/scs32/tailterm/hub/internal/api"
 )
@@ -93,23 +94,23 @@ func TestMessageAuditA2FullStateHistoryFeedAndFrozenPostReplay(t *testing.T) {
 		t.Fatalf("complete history: %+v err=%v", allHistory, err)
 	}
 
-	feed, err := s.ListMessageAuditChanges(ctx, task.ID, "", 1, "")
+	feed, err := s.ListMessageAuditChanges(ctx, task.ID, "", "", 1, "")
 	if err != nil || len(feed.Events) != 1 || feed.NextCursor == "" || feed.Cutoff < intake.Event.Cursor {
 		t.Fatalf("first feed: %+v err=%v", feed, err)
 	}
 	frozen := feed.Cutoff
 	seen := len(feed.Events)
 	for feed.NextCursor != "" {
-		feed, err = s.ListMessageAuditChanges(ctx, task.ID, feed.NextCursor, 1, "")
+		feed, err = s.ListMessageAuditChanges(ctx, task.ID, feed.NextCursor, "", 1, "")
 		if err != nil || feed.Cutoff != frozen {
 			t.Fatalf("continued feed: %+v err=%v", feed, err)
 		}
 		seen += len(feed.Events)
 	}
-	if seen != 3 {
-		t.Fatalf("feed event count=%d want=3", seen)
+	if seen != 3 || feed.Checkpoint == "" {
+		t.Fatalf("feed event count=%d checkpoint=%q want=3 and resumable", seen, feed.Checkpoint)
 	}
-	if _, err := s.ListMessageAuditChanges(ctx, task.ID, encodeMessageAuditCursor(messageAuditCursor{Task: task.ID, High: frozen + 99, After: 0}), 1, ""); !errors.Is(err, api.ErrInvalid) {
+	if _, err := s.ListMessageAuditChanges(ctx, task.ID, encodeMessageAuditCursor(messageAuditCursor{Task: task.ID, High: frozen + 99, After: 0}), "", 1, ""); !errors.Is(err, api.ErrInvalid) {
 		t.Fatalf("future cursor accepted: %v", err)
 	}
 
@@ -159,6 +160,55 @@ func TestMessageAuditA2FullStateHistoryFeedAndFrozenPostReplay(t *testing.T) {
 	validCallerCheck.Sources = []api.MessageReference{{TaskID: task.ID, Seq: source.Seq}}
 	if _, _, err := s.CorrectMessageAudit(ctx, task.ID, original.Seq, validCallerCheck, oversizedCaller); !errors.Is(err, api.ErrInvalid) {
 		t.Fatalf("oversized correction caller=%v", err)
+	}
+	var lastMessageBefore int64
+	if err := s.db.QueryRowContext(ctx, `SELECT max(seq) FROM messages WHERE task_id=?`, task.ID).Scan(&lastMessageBefore); err != nil {
+		t.Fatal(err)
+	}
+	resumeCorrection := correct
+	resumeCorrection.RequestID = "a2-resume-after-cutoff"
+	resumeCorrection.ExpectedRevision = 3
+	resumedEvent, _, err := s.CorrectMessageAudit(ctx, task.ID, original.Seq, resumeCorrection, by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resumed, err := s.ListMessageAuditChanges(ctx, task.ID, "", feed.Checkpoint, api.MaxMessageAuditPage, "")
+	if err != nil || len(resumed.Events) != 1 || resumed.Events[0].Cursor != resumedEvent.Event.Cursor || resumed.Cutoff <= frozen || resumed.Checkpoint == "" {
+		t.Fatalf("incremental resume: %+v err=%v", resumed, err)
+	}
+	emptyResume, err := s.ListMessageAuditChanges(ctx, task.ID, "", resumed.Checkpoint, api.MaxMessageAuditPage, "")
+	if err != nil || len(emptyResume.Events) != 0 || emptyResume.Checkpoint == "" {
+		t.Fatalf("empty incremental resume: %+v err=%v", emptyResume, err)
+	}
+	intakeFeed, err := s.ListMessageAuditChanges(ctx, task.ID, "", "", api.MaxMessageAuditPage, api.MessageAuditIntake)
+	if err != nil || len(intakeFeed.Events) != 1 || intakeFeed.Checkpoint == "" {
+		t.Fatalf("initial filtered feed: %+v err=%v", intakeFeed, err)
+	}
+	workOnly := resumeCorrection
+	workOnly.RequestID = "a2-filtered-empty-resume"
+	workOnly.ExpectedRevision = 4
+	workOnly.Desired.WorkItems = workOnly.Desired.WorkItems[:1]
+	if _, _, err := s.CorrectMessageAudit(ctx, task.ID, original.Seq, workOnly, by); err != nil {
+		t.Fatal(err)
+	}
+	emptyFiltered, err := s.ListMessageAuditChanges(ctx, task.ID, "", intakeFeed.Checkpoint, api.MaxMessageAuditPage, api.MessageAuditIntake)
+	if err != nil || len(emptyFiltered.Events) != 0 || emptyFiltered.Cutoff <= intakeFeed.Cutoff || emptyFiltered.Checkpoint == "" {
+		t.Fatalf("empty filtered resume: %+v err=%v", emptyFiltered, err)
+	}
+	backToIntake := toIntake
+	backToIntake.RequestID = "a2-filtered-later-intake"
+	backToIntake.ExpectedRevision = 5
+	intakeAgain, _, err := s.CorrectMessageAudit(ctx, task.ID, original.Seq, backToIntake, by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	filteredResume, err := s.ListMessageAuditChanges(ctx, task.ID, "", emptyFiltered.Checkpoint, api.MaxMessageAuditPage, api.MessageAuditIntake)
+	if err != nil || len(filteredResume.Events) != 1 || filteredResume.Events[0].Cursor != intakeAgain.Event.Cursor || filteredResume.Checkpoint == "" {
+		t.Fatalf("filtered incremental resume: %+v err=%v", filteredResume, err)
+	}
+	var lastMessageAfter int64
+	if err := s.db.QueryRowContext(ctx, `SELECT max(seq) FROM messages WHERE task_id=?`, task.ID).Scan(&lastMessageAfter); err != nil || lastMessageAfter != lastMessageBefore {
+		t.Fatalf("audit resume required new message: before=%d after=%d err=%v", lastMessageBefore, lastMessageAfter, err)
 	}
 
 	if _, err := s.CloseTask(ctx, task.ID, by); err != nil {
@@ -658,5 +708,135 @@ func TestMessageAuditA2SchemaIsAdditive(t *testing.T) {
 		if err := db.QueryRow(`SELECT name FROM sqlite_master WHERE type='table' AND name=?`, table).Scan(&found); err != nil {
 			t.Fatalf("missing table %s: %v", table, err)
 		}
+	}
+}
+
+func TestMessageAuditA2ExactReadUsesOneSnapshot(t *testing.T) {
+	s, ctx, by := workItemStore(t)
+	s.db.SetMaxOpenConns(2)
+	task, _ := workItemProject(t, s, ctx, by, "A2 snapshot read", "lead")
+	source := a2Source(t, s, ctx, by, task, "Snapshot correction evidence")
+	itemA := a2Item(t, s, ctx, by, task, "snapshot-a")
+	itemB := a2Item(t, s, ctx, by, task, "snapshot-b")
+	message, err := s.PostMessage(ctx, task.ID, api.PostMessageRequest{Text: "Snapshot original", AuditKind: api.MessageAuditWork, RequestID: "snapshot-original",
+		WorkItems: []api.MessageWorkItem{{ItemTaskID: task.ID, ItemID: itemA.ID, ItemRevision: itemA.Revision, Relationship: "primary"}}}, by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	correction := api.CorrectMessageAuditRequest{RequestID: "snapshot-correction", ExpectedRevision: 1, Reason: "Move to item B while the old snapshot is open.",
+		Sources: []api.MessageReference{{TaskID: task.ID, Seq: source.Seq}}, Desired: api.MessageAuditDesiredState{Classification: api.MessageAuditWork,
+			WorkItems: []api.MessageWorkItem{{ItemTaskID: task.ID, ItemID: itemB.ID, ItemRevision: itemB.Revision, Relationship: "primary"}}}}
+
+	headerRead := make(chan struct{})
+	releaseRead := make(chan struct{})
+	var hookOnce sync.Once
+	readCtx := context.WithValue(ctx, messageAuditReadStateHookKey{}, func() {
+		hookOnce.Do(func() { close(headerRead) })
+		<-releaseRead
+	})
+	type readResult struct {
+		record api.MessageAuditRecord
+		err    error
+	}
+	readDone := make(chan readResult, 1)
+	go func() {
+		record, readErr := s.GetMessageAudit(readCtx, task.ID, message.Seq)
+		readDone <- readResult{record: record, err: readErr}
+	}()
+	select {
+	case <-headerRead:
+	case <-time.After(2 * time.Second):
+		close(releaseRead)
+		t.Fatal("snapshot read did not reach the state/link boundary")
+	}
+	writeDone := make(chan error, 1)
+	go func() {
+		_, _, writeErr := s.CorrectMessageAudit(ctx, task.ID, message.Seq, correction, by)
+		writeDone <- writeErr
+	}()
+	select {
+	case err := <-writeDone:
+		if err != nil {
+			close(releaseRead)
+			t.Fatal(err)
+		}
+	case <-time.After(2 * time.Second):
+		close(releaseRead)
+		t.Fatal("concurrent correction did not commit while read snapshot was open")
+	}
+	close(releaseRead)
+	old := <-readDone
+	if old.err != nil || old.record.Current == nil || old.record.Current.Revision != 1 || len(old.record.Current.WorkItems) != 1 || old.record.Current.WorkItems[0].ItemID != itemA.ID {
+		t.Fatalf("torn snapshot result: %+v err=%v", old.record, old.err)
+	}
+	current, err := s.GetMessageAudit(ctx, task.ID, message.Seq)
+	if err != nil || current.Current == nil || current.Current.Revision != 2 || current.Current.WorkItems[0].ItemID != itemB.ID {
+		t.Fatalf("fresh snapshot did not see correction: %+v err=%v", current, err)
+	}
+}
+
+func TestMessageAuditA2PreservesLegacyBoundInboxScope(t *testing.T) {
+	s, ctx, by := workItemStore(t)
+	task, _ := workItemProject(t, s, ctx, by, "A2 legacy bound routing", "lead")
+	itemA := a2Item(t, s, ctx, by, task, "legacy-a")
+	itemB := a2Item(t, s, ctx, by, task, "legacy-b")
+	orderA := contextLinkedMessage(t, s, task, itemA, "Item A work order", "legacy-order-a", nil)
+	orderB := contextLinkedMessage(t, s, task, itemB, "Item B work order", "legacy-order-b", nil)
+	workerA, err := s.AddAgent(ctx, task.ID, api.AddAgentRequest{Name: "legacy-worker-a", Host: "fixture", Session: "legacy-worker-a", Runtime: "codex", WorkItem: &api.AgentWorkItemRequest{
+		ItemTaskID: task.ID, ItemID: itemA.ID, ItemRevision: itemA.Revision, WorkOrderMessage: api.MessageReference{TaskID: task.ID, Seq: orderA.Seq},
+		ContextBundle: preparedContextFromAcceptedHistory(t, s, itemA, api.MessageReference{TaskID: task.ID, Seq: orderA.Seq}),
+	}}, by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	workerB, err := s.AddAgent(ctx, task.ID, api.AddAgentRequest{Name: "legacy-worker-b", Host: "fixture", Session: "legacy-worker-b", Runtime: "codex", WorkItem: &api.AgentWorkItemRequest{
+		ItemTaskID: task.ID, ItemID: itemB.ID, ItemRevision: itemB.Revision, WorkOrderMessage: api.MessageReference{TaskID: task.ID, Seq: orderB.Seq},
+		ContextBundle: preparedContextFromAcceptedHistory(t, s, itemB, api.MessageReference{TaskID: task.ID, Seq: orderB.Seq}),
+	}}, by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	target, err := s.PostMessage(ctx, task.ID, api.PostMessageRequest{Text: "Immutable item A message", AuditKind: api.MessageAuditWork, RequestID: "legacy-scope-target",
+		WorkItems: []api.MessageWorkItem{{ItemTaskID: task.ID, ItemID: itemA.ID, ItemRevision: itemA.Revision, Relationship: "primary"}}}, by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	move := api.CorrectMessageAuditRequest{RequestID: "legacy-scope-move", ExpectedRevision: 1, Reason: "Current audit authority moves to B.",
+		Sources: []api.MessageReference{{TaskID: task.ID, Seq: orderA.Seq}}, Desired: api.MessageAuditDesiredState{Classification: api.MessageAuditWork,
+			WorkItems: []api.MessageWorkItem{{ItemTaskID: task.ID, ItemID: itemB.ID, ItemRevision: itemB.Revision, Relationship: "primary"}}}}
+	if _, _, err := s.CorrectMessageAudit(ctx, task.ID, target.Seq, move, by); err != nil {
+		t.Fatal(err)
+	}
+	aInbox, err := s.ListMessages(ctx, task.ID, target.Seq-1, workerA.ID, 10)
+	if err != nil || len(aInbox) != 1 || aInbox[0].Seq != target.Seq || aInbox[0].WorkItems[0].ItemID != itemA.ID {
+		t.Fatalf("original A-bound inbox changed after move: %+v err=%v", aInbox, err)
+	}
+	bInbox, err := s.ListMessages(ctx, task.ID, target.Seq-1, workerB.ID, 10)
+	if err != nil || len(bInbox) != 0 {
+		t.Fatalf("B-bound legacy inbox gained current-only message: %+v err=%v", bInbox, err)
+	}
+	detach := api.CorrectMessageAuditRequest{RequestID: "legacy-scope-detach", ExpectedRevision: 2, Reason: "Current audit authority returns to Intake.",
+		Sources: []api.MessageReference{{TaskID: task.ID, Seq: orderA.Seq}}, Desired: api.MessageAuditDesiredState{Classification: api.MessageAuditIntake}}
+	if _, _, err := s.CorrectMessageAudit(ctx, task.ID, target.Seq, detach, by); err != nil {
+		t.Fatal(err)
+	}
+	aInbox, err = s.ListMessages(ctx, task.ID, target.Seq-1, workerA.ID, 10)
+	if err != nil || len(aInbox) != 1 || aInbox[0].WorkItems[0].ItemID != itemA.ID {
+		t.Fatalf("original A-bound inbox changed after detach: %+v err=%v", aInbox, err)
+	}
+	bInbox, err = s.ListMessages(ctx, task.ID, target.Seq-1, workerB.ID, 10)
+	if err != nil || len(bInbox) != 0 {
+		t.Fatalf("B-bound legacy inbox changed after detach: %+v err=%v", bInbox, err)
+	}
+	for _, worker := range []api.Agent{workerA, workerB} {
+		later, listErr := s.ListMessages(ctx, task.ID, target.Seq, worker.ID, 10)
+		if listErr != nil || len(later) != 0 {
+			t.Fatalf("correction leaked through message cursor for %s: %+v err=%v", worker.Name, later, listErr)
+		}
+	}
+	replayed, err := s.GetMessagePostReceipt(ctx, task.ID, "legacy-scope-target", "", by)
+	current, currentErr := s.GetMessageAudit(ctx, task.ID, target.Seq)
+	if err != nil || currentErr != nil || replayed.WorkItems[0].ItemID != itemA.ID || current.Current == nil || current.Current.Classification != api.MessageAuditIntake || len(current.Current.WorkItems) != 0 {
+		t.Fatalf("legacy/original versus explicit current mismatch: replay=%+v current=%+v err=%v currentErr=%v", replayed, current, err, currentErr)
 	}
 }

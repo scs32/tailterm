@@ -64,12 +64,97 @@ func TestMessageAuditA2HTTPWireAndGoClient(t *testing.T) {
 	if err != nil || !reflect.DeepEqual(postReceipt, intake) {
 		t.Fatalf("post receipt gained current audit state: %+v original=%+v err=%v", postReceipt, intake, err)
 	}
+	correctionTargetA, err := client.PostMessage(ctx, task.ID, api.PostMessageRequest{Text: "Wrong-target correction A", AuditKind: api.MessageAuditIntake, RequestID: "a2-wrong-correction-a"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	correctionTargetB, err := client.PostMessage(ctx, task.ID, api.PostMessageRequest{Text: "Wrong-target correction B", AuditKind: api.MessageAuditIntake, RequestID: "a2-wrong-correction-b"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sameCorrection := api.CorrectMessageAuditRequest{RequestID: "a2-same-correction-key", ExpectedRevision: 1, Reason: "The path target is part of the receipt identity.",
+		Sources: []api.MessageReference{{TaskID: task.ID, Seq: source.Seq}}, Desired: api.MessageAuditDesiredState{Classification: api.MessageAuditWork,
+			WorkItems: []api.MessageWorkItem{{ItemTaskID: task.ID, ItemID: item.ID, ItemRevision: item.Revision, Relationship: "primary"}}}}
+	if _, err := client.CorrectMessageAudit(ctx, task.ID, correctionTargetA.Seq, sameCorrection); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.CorrectMessageAudit(ctx, task.ID, correctionTargetB.Seq, sameCorrection); err == nil {
+		t.Fatal("same correction key silently replayed onto a different message")
+	} else {
+		var httpErr *api.HTTPError
+		if !errors.As(err, &httpErr) || httpErr.Status != http.StatusConflict {
+			t.Fatalf("wrong-message correction error=%v", err)
+		}
+	}
+	unchangedCorrectionTarget, err := client.GetMessageAudit(ctx, task.ID, correctionTargetB.Seq)
+	if err != nil || unchangedCorrectionTarget.Current == nil || unchangedCorrectionTarget.Current.Revision != 1 || unchangedCorrectionTarget.Current.Classification != api.MessageAuditIntake {
+		t.Fatalf("wrong-message correction changed second target: %+v err=%v", unchangedCorrectionTarget, err)
+	}
+
+	resolveTargetA, err := client.PostMessage(ctx, task.ID, api.PostMessageRequest{Text: "Wrong-target resolve A", AuditKind: api.MessageAuditIntake, RequestID: "a2-wrong-resolve-a"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	resolveTargetB, err := client.PostMessage(ctx, task.ID, api.PostMessageRequest{Text: "Wrong-target resolve B", AuditKind: api.MessageAuditIntake, RequestID: "a2-wrong-resolve-b"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sameResolve := api.ResolveMessageAuditRequest{RequestID: "a2-same-resolve-key", ExpectedRevision: 1, Reason: "The path target is part of the resolution receipt identity.",
+		Sources: []api.MessageReference{{TaskID: task.ID, Seq: source.Seq}}, ExistingItem: &api.MessageWorkItem{ItemTaskID: task.ID, ItemID: item.ID, ItemRevision: item.Revision, Relationship: "primary"}}
+	if _, err := client.ResolveMessageAudit(ctx, task.ID, resolveTargetA.Seq, sameResolve); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.ResolveMessageAudit(ctx, task.ID, resolveTargetB.Seq, sameResolve); err == nil {
+		t.Fatal("same resolution key silently replayed onto a different message")
+	} else {
+		var httpErr *api.HTTPError
+		if !errors.As(err, &httpErr) || httpErr.Status != http.StatusConflict {
+			t.Fatalf("wrong-message resolution error=%v", err)
+		}
+	}
+	unchangedResolveTarget, err := client.GetMessageAudit(ctx, task.ID, resolveTargetB.Seq)
+	if err != nil || unchangedResolveTarget.Current == nil || unchangedResolveTarget.Current.Revision != 1 || unchangedResolveTarget.Current.Classification != api.MessageAuditIntake {
+		t.Fatalf("wrong-message resolution changed second target: %+v err=%v", unchangedResolveTarget, err)
+	}
 
 	feed, err := client.ListMessageAuditChanges(ctx, task.ID, api.MessageAuditChangeQuery{Limit: 1})
 	if err != nil || len(feed.Events) != 1 || feed.NextCursor == "" {
 		t.Fatalf("change feed: %+v err=%v", feed, err)
 	}
-	code, body, exchangeErr := auditExchange(c, "GET", "/v1/tasks/"+task.ID+"/message-audit/changes?limit=1&kind=intake&cursor="+feed.NextCursor, nil, nil)
+	frozenCursor := feed.NextCursor
+	for feed.NextCursor != "" {
+		feed, err = client.ListMessageAuditChanges(ctx, task.ID, api.MessageAuditChangeQuery{Cursor: feed.NextCursor, Limit: 1})
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	if feed.Checkpoint == "" {
+		t.Fatalf("completed feed has no resume checkpoint: %+v", feed)
+	}
+	incrementalCorrection := api.CorrectMessageAuditRequest{RequestID: "a2-http-incremental-correction", ExpectedRevision: 3, Reason: "Emit a later audit event without a new message.",
+		Sources: []api.MessageReference{{TaskID: task.ID, Seq: source.Seq}}, Desired: api.MessageAuditDesiredState{Classification: api.MessageAuditWork,
+			WorkItems: []api.MessageWorkItem{{ItemTaskID: task.ID, ItemID: item.ID, ItemRevision: item.Revision, Relationship: "primary"}}}}
+	incrementalResult, err := client.CorrectMessageAudit(ctx, task.ID, intake.Seq, incrementalCorrection)
+	if err != nil {
+		t.Fatal(err)
+	}
+	incrementalFeed, err := client.ListMessageAuditChanges(ctx, task.ID, api.MessageAuditChangeQuery{Checkpoint: feed.Checkpoint, Limit: api.MaxMessageAuditPage})
+	if err != nil || len(incrementalFeed.Events) != 1 || incrementalFeed.Events[0].Cursor != incrementalResult.Event.Cursor || incrementalFeed.Checkpoint == "" {
+		t.Fatalf("incremental HTTP feed: %+v err=%v", incrementalFeed, err)
+	}
+	emptyIncremental, err := client.ListMessageAuditChanges(ctx, task.ID, api.MessageAuditChangeQuery{Checkpoint: incrementalFeed.Checkpoint, Limit: api.MaxMessageAuditPage})
+	if err != nil || len(emptyIncremental.Events) != 0 || emptyIncremental.Checkpoint == "" {
+		t.Fatalf("empty incremental HTTP feed: %+v err=%v", emptyIncremental, err)
+	}
+	if _, err := client.ListMessageAuditChanges(ctx, task.ID, api.MessageAuditChangeQuery{Checkpoint: incrementalFeed.Checkpoint, Kind: api.MessageAuditIntake, Limit: 1}); err == nil {
+		t.Fatal("filter-swapped checkpoint accepted")
+	} else {
+		var httpErr *api.HTTPError
+		if !errors.As(err, &httpErr) || httpErr.Status != http.StatusBadRequest {
+			t.Fatalf("filter-swapped checkpoint error=%v", err)
+		}
+	}
+	code, body, exchangeErr := auditExchange(c, "GET", "/v1/tasks/"+task.ID+"/message-audit/changes?limit=1&kind=intake&cursor="+frozenCursor, nil, nil)
 	if exchangeErr != nil || code != http.StatusBadRequest {
 		t.Fatalf("filter-swapped cursor status=%d err=%v body=%s", code, exchangeErr, body)
 	}

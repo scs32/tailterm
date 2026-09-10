@@ -29,6 +29,14 @@ type messageAuditHistoryCursor struct {
 	After int64  `json:"after"`
 }
 
+type messageAuditCheckpoint struct {
+	Task  string `json:"task"`
+	Kind  string `json:"kind,omitempty"`
+	After int64  `json:"after"`
+}
+
+type messageAuditReadStateHookKey struct{}
+
 func encodeMessageAuditCursor(c messageAuditCursor) string {
 	b, _ := json.Marshal(c)
 	return base64.RawURLEncoding.EncodeToString(b)
@@ -53,6 +61,20 @@ func decodeMessageAuditHistoryCursor(raw string) (messageAuditHistoryCursor, err
 	b, err := base64.RawURLEncoding.DecodeString(raw)
 	if err != nil || json.Unmarshal(b, &c) != nil || !api.ValidID(c.Task, "tsk") || c.Seq < 1 || c.High < 0 || c.After < 0 || c.After > c.High {
 		return messageAuditHistoryCursor{}, api.ErrInvalid
+	}
+	return c, nil
+}
+
+func encodeMessageAuditCheckpoint(c messageAuditCheckpoint) string {
+	b, _ := json.Marshal(c)
+	return base64.RawURLEncoding.EncodeToString(b)
+}
+
+func decodeMessageAuditCheckpoint(raw string) (messageAuditCheckpoint, error) {
+	var c messageAuditCheckpoint
+	b, err := base64.RawURLEncoding.DecodeString(raw)
+	if err != nil || json.Unmarshal(b, &c) != nil || !api.ValidID(c.Task, "tsk") || c.After < 0 {
+		return messageAuditCheckpoint{}, api.ErrInvalid
 	}
 	return c, nil
 }
@@ -258,6 +280,9 @@ FROM message_audit_states WHERE message_task_id=? AND message_seq=?`, taskID, se
 		return nil, err
 	}
 	projection.UpdatedAt = parseTS(updated)
+	if hook, ok := ctx.Value(messageAuditReadStateHookKey{}).(func()); ok {
+		hook()
+	}
 	rows, err := q.QueryContext(ctx, `SELECT item_task_id,item_id,item_revision,relationship
 FROM message_audit_links WHERE message_task_id=? AND message_seq=? ORDER BY ordinal`, taskID, seq)
 	if err != nil {
@@ -471,7 +496,19 @@ func (s *Store) GetMessageAudit(ctx context.Context, taskID string, seq int64) (
 	if !api.ValidID(taskID, "tsk") || seq < 1 {
 		return api.MessageAuditRecord{}, api.ErrInvalid
 	}
-	return loadMessageAuditRecord(s.db, ctx, taskID, seq)
+	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		return api.MessageAuditRecord{}, err
+	}
+	defer tx.Rollback()
+	record, err := loadMessageAuditRecord(tx, ctx, taskID, seq)
+	if err != nil {
+		return api.MessageAuditRecord{}, err
+	}
+	if err = tx.Commit(); err != nil {
+		return api.MessageAuditRecord{}, err
+	}
+	return record, nil
 }
 
 func (s *Store) ListMessageAuditHistory(ctx context.Context, taskID string, seq, afterVersion int64, cursor string, limit int) (api.MessageAuditHistory, error) {
@@ -555,8 +592,8 @@ func (s *Store) GetMessageAuditReceipt(ctx context.Context, taskID, requestID, o
 	return result, err
 }
 
-func (s *Store) ListMessageAuditChanges(ctx context.Context, taskID, cursor string, limit int, kind string) (api.MessageAuditChangePage, error) {
-	if !api.ValidID(taskID, "tsk") || limit < 1 || limit > api.MaxMessageAuditPage || (kind != "" && kind != api.MessageAuditIntake && kind != api.MessageAuditWork) {
+func (s *Store) ListMessageAuditChanges(ctx context.Context, taskID, cursor, checkpoint string, limit int, kind string) (api.MessageAuditChangePage, error) {
+	if !api.ValidID(taskID, "tsk") || (cursor != "" && checkpoint != "") || limit < 1 || limit > api.MaxMessageAuditPage || (kind != "" && kind != api.MessageAuditIntake && kind != api.MessageAuditWork) {
 		return api.MessageAuditChangePage{}, api.ErrInvalid
 	}
 	if _, err := s.GetTask(ctx, taskID); err != nil {
@@ -564,17 +601,21 @@ func (s *Store) ListMessageAuditChanges(ctx context.Context, taskID, cursor stri
 	}
 	var c messageAuditCursor
 	var err error
+	var currentHigh int64
+	if err = s.db.QueryRowContext(ctx, `SELECT COALESCE(max(seq),0) FROM message_audit_events WHERE message_task_id=?`, taskID).Scan(&currentHigh); err != nil {
+		return api.MessageAuditChangePage{}, err
+	}
 	if cursor == "" {
-		c = messageAuditCursor{Task: taskID, Kind: kind}
-		if err := s.db.QueryRowContext(ctx, `SELECT COALESCE(max(seq),0) FROM message_audit_events WHERE message_task_id=?`, taskID).Scan(&c.High); err != nil {
-			return api.MessageAuditChangePage{}, err
+		c = messageAuditCursor{Task: taskID, Kind: kind, High: currentHigh}
+		if checkpoint != "" {
+			resume, decodeErr := decodeMessageAuditCheckpoint(checkpoint)
+			if decodeErr != nil || resume.Task != taskID || resume.Kind != kind || resume.After > currentHigh {
+				return api.MessageAuditChangePage{}, api.ErrInvalid
+			}
+			c.After = resume.After
 		}
 	} else {
 		c, err = decodeMessageAuditCursor(cursor)
-		var currentHigh int64
-		if err == nil {
-			err = s.db.QueryRowContext(ctx, `SELECT COALESCE(max(seq),0) FROM message_audit_events WHERE message_task_id=?`, taskID).Scan(&currentHigh)
-		}
 		if err != nil || c.Task != taskID || c.Kind != kind || c.High > currentHigh {
 			return api.MessageAuditChangePage{}, api.ErrInvalid
 		}
@@ -629,6 +670,8 @@ func (s *Store) ListMessageAuditChanges(ctx context.Context, taskID, cursor stri
 	if more && len(out.Events) > 0 {
 		c.After = out.Events[len(out.Events)-1].Cursor
 		out.NextCursor = encodeMessageAuditCursor(c)
+	} else if !more {
+		out.Checkpoint = encodeMessageAuditCheckpoint(messageAuditCheckpoint{Task: taskID, Kind: kind, After: c.High})
 	}
 	return out, nil
 }

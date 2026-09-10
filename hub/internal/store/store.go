@@ -810,7 +810,7 @@ func (s *Store) ListMessages(ctx context.Context, taskID string, after int64, ag
 	args := []any{}
 	if binding != nil {
 		q += `
-JOIN message_audit_links item_scope ON item_scope.message_task_id=m.task_id AND item_scope.message_seq=m.seq AND item_scope.item_task_id=? AND item_scope.item_id=?`
+JOIN message_work_item_links item_scope ON item_scope.message_seq=m.seq AND item_scope.item_task_id=? AND item_scope.item_id=?`
 		args = append(args, binding.ItemTaskID, binding.ItemID)
 	}
 	q += `

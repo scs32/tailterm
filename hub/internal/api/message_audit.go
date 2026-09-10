@@ -153,14 +153,16 @@ type MessageAuditMutationResult struct {
 }
 
 type MessageAuditChangeQuery struct {
-	Cursor string
-	Limit  int
-	Kind   string
+	Cursor     string
+	Checkpoint string
+	Limit      int
+	Kind       string
 }
 
 type MessageAuditChangePage struct {
 	Events     []MessageAuditEvent `json:"events"`
 	NextCursor string              `json:"nextCursor,omitempty"`
+	Checkpoint string              `json:"checkpoint,omitempty"`
 	Cutoff     int64               `json:"cutoff"`
 }
 
@@ -296,6 +298,9 @@ func (c *Client) ListMessageAuditChanges(ctx context.Context, taskID string, que
 	q := url.Values{}
 	if query.Cursor != "" {
 		q.Set("cursor", query.Cursor)
+	}
+	if query.Checkpoint != "" {
+		q.Set("checkpoint", query.Checkpoint)
 	}
 	if query.Limit > 0 {
 		q.Set("limit", strconv.Itoa(query.Limit))

@@ -164,7 +164,7 @@ func (s *Server) listMessageAuditChanges(w http.ResponseWriter, r *http.Request)
 		writeError(w, http.StatusBadRequest, "invalid audit change limit")
 		return
 	}
-	result, err := s.store.ListMessageAuditChanges(r.Context(), task, r.URL.Query().Get("cursor"), limit, r.URL.Query().Get("kind"))
+	result, err := s.store.ListMessageAuditChanges(r.Context(), task, r.URL.Query().Get("cursor"), r.URL.Query().Get("checkpoint"), limit, r.URL.Query().Get("kind"))
 	if err != nil {
 		fail(w, err)
 		return

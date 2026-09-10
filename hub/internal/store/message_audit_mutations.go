@@ -30,6 +30,15 @@ func basicAuditMutationScope(taskID string, seq int64, requestID, agentID, runID
 	return nil
 }
 
+func messageAuditMutationHash(taskID string, seq int64, operation string, req any) string {
+	return requestHash(struct {
+		TaskID     string
+		MessageSeq int64
+		Operation  string
+		Request    any
+	}{TaskID: taskID, MessageSeq: seq, Operation: operation, Request: req})
+}
+
 func loadOpenAuditMessage(tx *sql.Tx, ctx context.Context, taskID string, seq int64) (api.Task, *api.MessageAuditProjection, error) {
 	task, err := scanTask(tx.QueryRowContext(ctx, `SELECT `+taskCols+` FROM tasks WHERE id=?`, taskID))
 	if errors.Is(err, sql.ErrNoRows) {
@@ -142,7 +151,7 @@ func (s *Store) CorrectMessageAudit(ctx context.Context, taskID string, seq int6
 	}
 	req.Desired.WorkItems = orderAuditLinks(req.Desired.WorkItems)
 	req.Sources = normalizeAuditSources(req.Sources)
-	payload := requestHash(req)
+	payload := messageAuditMutationHash(taskID, seq, "correct", req)
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return api.MessageAuditMutationResult{}, false, err
@@ -222,7 +231,7 @@ func (s *Store) ResolveMessageAudit(ctx context.Context, taskID string, seq int6
 		req.NewItem.Priority = "normal"
 	}
 	req.Sources = normalizeAuditSources(req.Sources)
-	payload := requestHash(req)
+	payload := messageAuditMutationHash(taskID, seq, "resolve", req)
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return api.MessageAuditMutationResult{}, false, err
