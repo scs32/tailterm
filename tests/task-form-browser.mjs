@@ -69,10 +69,10 @@ import {localAPI} from '/client/local-vault.js';
 import {reconciledAgentProblem} from '/client/launch-reconciliation.js';
 await localAPI('/unlock','POST',{password:'synthetic vault passphrase'});
 const savedLocal=await localAPI('/data');
-let board, tasks, modes, teams;const baseAgent=(id,name,serverId,role)=>({id,revision:1,name,launchName:name,role,serverId,runtime:'codex',model:'gpt-5.3-codex',reasoning:'',approvalMode:'on-request',sandboxMode:'workspace-write',permissionMode:'',allowedTools:[],run:"sh -c 'sleep 300' --",cwd:'',prompt:'Inspect the exact bounded assignment.'});const data={hub:{url:location.origin,token:'synthetic-token'},profile:{username:'synthetic',instanceId:'profile-one'},launchProfiles:[],agentCatalog:{version:2,definitions:[baseAgent('agent_team_planner','team-planner','', 'Planner'),baseAgent('agent_team_reviewer','team-reviewer','secondary','Reviewer')]},teamsVersion:2,teams:JSON.parse(localStorage.getItem('qa-teams')||'[]'),teamLaunchPlans:savedLocal.teamLaunchPlans,projectHandlerPlans:[]};
-const servers=[{id:'local',name:'Test host',host:'stephens-macbook-air',username:'test',runtimes:['claude'],credentialRevision:1},{id:'secondary',name:'Second host',host:'second-fixture',username:'test',runtimes:['codex'],credentialRevision:1}];let failJournalWrite=false,commandDelay=null,journalDelay=null;
+let board, tasks, modes, teams;const baseAgent=(id,name,serverId,role)=>({id,revision:1,name,launchName:name,role,serverId,runtime:'codex',model:'gpt-5.3-codex',reasoning:'',approvalMode:'on-request',sandboxMode:'workspace-write',permissionMode:'',allowedTools:[],run:"sh -c 'sleep 300' --",cwd:'',prompt:'Inspect the exact bounded assignment.'});const initialAgentCatalog={version:2,definitions:[baseAgent('agent_team_planner','team-planner','', 'Planner'),baseAgent('agent_team_reviewer','team-reviewer','secondary','Reviewer')]};const data={hub:{url:location.origin,token:'synthetic-token'},profile:{username:'synthetic',instanceId:'profile-one'},launchProfiles:[],agentCatalog:JSON.parse(localStorage.getItem('qa-agent-catalog')||JSON.stringify(initialAgentCatalog)),teamsVersion:2,teams:JSON.parse(localStorage.getItem('qa-teams')||'[]'),teamLaunchPlans:savedLocal.teamLaunchPlans,projectHandlerPlans:[]};
+const servers=[{id:'local',name:'Test host',host:'stephens-macbook-air',username:'test',runtimes:['claude'],credentialRevision:1},{id:'secondary',name:'Second host',host:'second-fixture',username:'test',runtimes:['codex'],credentialRevision:1}];let failJournalWrite=false,commandDelay=null,journalDelay=null,lastSavedLaunchPlan=null;
 const model={groups:[],taskGroup:()=>null};
-const host={openSFTP:async server=>({done:new Promise(()=>{}),home:async()=>${JSON.stringify(root)},realpath:async p=>p,list:async p=>({path:p,entries:p===${JSON.stringify(root)}?[{name:'hub',isDir:true},{name:'ignored.txt',isDir:false}]:[]}),close(){}}),getIPN:()=>({fetch:(url,init)=>fetch(url,init)}),getData:()=>data,getServers:()=>servers,launchServerProfile:id=>structuredClone(servers.find(server=>server.id===id)),currentServer:()=>servers[0],currentTab:()=>null,getTabs:()=>[],paneGroups:()=>({model,sync(){}}),render(){},scheduleWorkspaceSave(){},bookmark(){},closeTab(){},connect:async()=>null,confirm:async()=>true,notice:t=>{document.querySelector('#notice').textContent=t},api:async(url,method,body)=>{if(url.startsWith('/team-launch-plans')){if(journalDelay){const gate=journalDelay;gate.entered();await gate.wait;if(journalDelay===gate)journalDelay=null}if(url==='/team-launch-plans'&&method==='POST'&&failJournalWrite){failJournalWrite=false;throw new Error('Synthetic encrypted journal write failure')}const result=await localAPI(url,method,body);data.teamLaunchPlans=(await localAPI('/data')).teamLaunchPlans;return result}if(url==="/teams"){data.teams=[...data.teams.filter(t=>t.id!==body.id),body];localStorage.setItem('qa-teams',JSON.stringify(data.teams))}if(url.startsWith("/teams/")){data.teams=data.teams.filter(t=>t.id!==url.slice(7));localStorage.setItem('qa-teams',JSON.stringify(data.teams))}if(url==="/launch-profiles")data.launchProfiles=[...data.launchProfiles.filter(p=>p.name!==body.name),body];if(url==="/project-handler-plans"&&method==="POST")data.projectHandlerPlans=[...data.projectHandlerPlans.filter(p=>p.hub!==body.hub||p.taskId!==body.taskId),structuredClone(body)];return {sessions:[]}},reloadData:async()=>{data.teamLaunchPlans=(await localAPI('/data')).teamLaunchPlans},
+const host={openSFTP:async server=>({done:new Promise(()=>{}),home:async()=>${JSON.stringify(root)},realpath:async p=>p,list:async p=>({path:p,entries:p===${JSON.stringify(root)}?[{name:'hub',isDir:true},{name:'ignored.txt',isDir:false}]:[]}),close(){}}),getIPN:()=>({fetch:(url,init)=>fetch(url,init)}),getData:()=>data,getServers:()=>servers,launchServerProfile:id=>structuredClone(servers.find(server=>server.id===id)),currentServer:()=>servers[0],currentTab:()=>null,getTabs:()=>[],paneGroups:()=>({model,sync(){}}),render(){},scheduleWorkspaceSave(){},bookmark(){},closeTab(){},connect:async()=>null,confirm:async()=>true,notice:t=>{document.querySelector('#notice').textContent=t},api:async(url,method,body)=>{if(url.startsWith('/team-launch-plans')){if(journalDelay){const gate=journalDelay;gate.entered();await gate.wait;if(journalDelay===gate)journalDelay=null}if(url==='/team-launch-plans'&&method==='POST'&&failJournalWrite){failJournalWrite=false;throw new Error('Synthetic encrypted journal write failure')}const result=await localAPI(url,method,body);data.teamLaunchPlans=(await localAPI('/data')).teamLaunchPlans;if(url==='/team-launch-plans'&&method==='POST')lastSavedLaunchPlan=structuredClone(body);return result}if(url==="/teams"){data.teams=[...data.teams.filter(t=>t.id!==body.id),body];localStorage.setItem('qa-teams',JSON.stringify(data.teams))}if(url.startsWith("/teams/")){data.teams=data.teams.filter(t=>t.id!==url.slice(7));localStorage.setItem('qa-teams',JSON.stringify(data.teams))}if(url==="/launch-profiles")data.launchProfiles=[...data.launchProfiles.filter(p=>p.name!==body.name),body];if(url==="/project-handler-plans"&&method==="POST")data.projectHandlerPlans=[...data.projectHandlerPlans.filter(p=>p.hub!==body.hub||p.taskId!==body.taskId),structuredClone(body)];return {sessions:[]}},reloadData:async()=>{data.teamLaunchPlans=(await localAPI('/data')).teamLaunchPlans},
  dialog:(title,body)=>{const d=document.querySelector('#dialog');if(d.open)d.close();d.innerHTML='<div class="dialog-head"><h2>'+title+'</h2><button id="dialog-close">×</button></div>'+body;d.querySelector('#dialog-close').onclick=()=>host.closeDialog();d.showModal()},
  closeDialog:()=>{const d=document.querySelector('#dialog');d.close();d.replaceChildren()},
  openBoard:id=>{modes.set('board');board.show(id)},
@@ -83,7 +83,7 @@ board=createBoardView({client:()=>hub.client(),getTabs:()=>[],activate(){},notic
 tasks=createTasksView({confirm:async()=>true,client:()=>hub.client(),taskHub:hub,getTabs:()=>[],activate(){},notice:host.notice,openBoard:host.openBoard,configure(){}});
 teams=createTeamsView({...host,confirm:async()=>true,newTask:t=>hub.newTask(undefined,t),addTeam:t=>hub.addTeam(t)});
 modes=setupModes({header:document.querySelector('header'),main:document.querySelector('main'),onChange:(mode,view)=>{board.hide();tasks.hide();teams.hide();view.replaceChildren();if(mode==='board'){board.mount(view);board.show()}else if(mode==='teams'){teams.mount(view);teams.show()}else if(mode==='tasks'){tasks.mount(view);tasks.show()}}});
-modes.set('tasks');window.qa={hub,board,modes,data,servers,localData:()=>localAPI('/data'),reconciledAgentProblem,failJournalWrite:()=>{failJournalWrite=true},delayNextJournal:()=>{let release,entered;const wait=new Promise(resolve=>release=resolve),started=new Promise(resolve=>entered=resolve);journalDelay={wait,release,entered,started}},waitForDelayedJournal:()=>journalDelay?.started,releaseJournal:()=>journalDelay?.release(),delayNextCommand:()=>{let release,entered;const wait=new Promise(resolve=>release=resolve),started=new Promise(resolve=>entered=resolve);commandDelay={wait,release,entered,started}},waitForDelayedCommand:()=>commandDelay?.started,releaseCommand:()=>commandDelay?.release(),clearLaunchPlans:async()=>{for(const plan of (await localAPI('/data')).teamLaunchPlans)await localAPI('/team-launch-plans/'+plan.id,'DELETE');data.teamLaunchPlans=(await localAPI('/data')).teamLaunchPlans},changeToken:token=>{data.hub={...data.hub,token}},changeProfile:instanceId=>{data.profile={...data.profile,instanceId};hub.refresh()},cycleProfile:()=>{data.profile={...data.profile,instanceId:'profile-two'};hub.refresh();data.profile={...data.profile,instanceId:'profile-one'};hub.refresh()},changeServerCredentials:()=>{servers[1].credentialRevision++;}};
+modes.set('tasks');window.qa={hub,board,modes,data,servers,localData:()=>localAPI('/data'),lastSavedLaunchPlan:()=>structuredClone(lastSavedLaunchPlan),reconciledAgentProblem,editDefinition:(id,patch)=>{const definition=data.agentCatalog.definitions.find(entry=>entry.id===id);Object.assign(definition,patch);localStorage.setItem('qa-agent-catalog',JSON.stringify(data.agentCatalog))},failJournalWrite:()=>{failJournalWrite=true},delayNextJournal:()=>{let release,entered;const wait=new Promise(resolve=>release=resolve),started=new Promise(resolve=>entered=resolve);journalDelay={wait,release,entered,started}},waitForDelayedJournal:()=>journalDelay?.started,releaseJournal:()=>journalDelay?.release(),delayNextCommand:()=>{let release,entered;const wait=new Promise(resolve=>release=resolve),started=new Promise(resolve=>entered=resolve);commandDelay={wait,release,entered,started}},waitForDelayedCommand:()=>commandDelay?.started,releaseCommand:()=>commandDelay?.release(),clearLaunchPlans:async()=>{for(const plan of (await localAPI('/data')).teamLaunchPlans)await localAPI('/team-launch-plans/'+plan.id,'DELETE');data.teamLaunchPlans=(await localAPI('/data')).teamLaunchPlans},changeToken:token=>{data.hub={...data.hub,token}},changeProfile:instanceId=>{data.profile={...data.profile,instanceId};hub.refresh()},cycleProfile:()=>{data.profile={...data.profile,instanceId:'profile-two'};hub.refresh();data.profile={...data.profile,instanceId:'profile-one'};hub.refresh()},changeServerCredentials:()=>{servers[1].credentialRevision++;}};
 </script></body></html>`;
 const server = createServer(async (req, res) => {
   try {
@@ -835,8 +835,18 @@ try {
         .locator("#task-error")
         .filter({ hasText: "Test launch failure" })
         .waitFor();
+      const failedHandlerId = await page.evaluate(async (taskName) => {
+        const journal = (await qa.localData()).teamLaunchPlans.find(
+          (plan) => plan.creation?.request?.name === taskName,
+        );
+        return journal.members.find(
+          (member) =>
+            member.state === "unstarted" &&
+            member.fields.agentRole === "database_handler",
+        ).fields.agentId;
+      }, name + " team task");
       await page
-        .locator('[data-project-server="secondary"]')
+        .locator(`[data-launch-agent-id="${failedHandlerId}"]`)
         .fill(path.join(root, "hub"));
       await page.locator("#task-create").click();
       await page.locator("#dialog").waitFor({ state: "hidden" });
@@ -855,7 +865,7 @@ try {
       assert.equal(detail.task.maxNewAgents, 3);
       assert.deepEqual(
         detail.agents.map((a) => a.cwd),
-        [root, root, path.join(root, "hub")],
+        [root, path.join(root, "hub"), root],
       );
       assert.equal(
         detail.agents.filter((a) => a.role === "database_handler").length,
@@ -1071,9 +1081,9 @@ try {
       assert.equal(await page.locator("#team-work-item").isDisabled(), true);
       assert.equal(await page.locator("#team-work-order").isDisabled(), true);
       assert.equal(
-        await page.locator('[data-project-server="local"]').isDisabled(),
-        true,
-        "completed member's folder remained editable",
+        await page.locator('[data-project-server="local"]').count(),
+        0,
+        "completed member retained a retry folder control",
       );
       assert.equal(
         await page.locator('[data-project-server="secondary"]').isDisabled(),
@@ -1130,17 +1140,124 @@ try {
         lifecycle: "lifecycle",
         binding: "work-item/order/context binding",
       });
+      const frozenRetry = await page.evaluate(async (taskId) => {
+        const journal = (await qa.localData()).teamLaunchPlans.find(
+          (plan) => plan.kind === "add-team" && plan.taskId === taskId,
+        );
+        const member = journal.members.find(
+          (candidate) => candidate.state === "unstarted",
+        );
+        qa.editDefinition(member.fields.agentDefinitionId, {
+          revision: member.fields.agentDefinitionRevision + 1,
+          launchName: "edited-live-name",
+          runtime: "claude",
+          model: "",
+          reasoning: "",
+          run: "claude",
+          cwd: "/edited-live-default",
+        });
+        return {
+          agentId: member.fields.agentId,
+          definitionId: member.fields.agentDefinitionId,
+          fields: member.fields,
+          command: null,
+        };
+      }, target.id);
+      frozenRetry.command = launchCommands.at(-1);
+      const unchangedRetryExecs = execs;
+      await page.locator('#team-launch-form button[type="submit"]').click();
+      for (
+        let attempt = 0;
+        attempt < 100 && execs === unchangedRetryExecs;
+        attempt++
+      )
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      assert.equal(execs, unchangedRetryExecs + 1);
       await page
-        .locator('[data-project-server="secondary"]')
-        .fill(correctedRoutedFolder);
+        .locator("#team-launch-status")
+        .filter({ hasText: "is not a directory" })
+        .waitFor();
+      assert.equal(
+        launchCommands.at(-1),
+        frozenRetry.command,
+        "live definition edits changed a frozen retry command",
+      );
+      const unchangedRetry = await page.evaluate(
+        async ({ taskId, agentId }) => {
+          const journal = (await qa.localData()).teamLaunchPlans.find(
+            (plan) => plan.kind === "add-team" && plan.taskId === taskId,
+          );
+          return journal.members.find(
+            (member) => member.fields.agentId === agentId,
+          );
+        },
+        { taskId: target.id, agentId: frozenRetry.agentId },
+      );
+      assert.deepEqual(unchangedRetry.fields, frozenRetry.fields);
+      assert.equal(unchangedRetry.folderAmendments, undefined);
+
+      // Reload restores controls from the frozen member identities, not the
+      // now-edited shared definition. Only changing this exact pending
+      // member's folder produces an amendment receipt.
+      await page.reload();
+      await page.waitForFunction(() => !!window.qa);
+      await page.evaluate(() => qa.modes.set("teams"));
+      await page.locator("[data-add-team]").click();
+      await page.locator("#team-task").selectOption(target.id);
+      await page
+        .locator('#team-launch-form button[type="submit"]')
+        .filter({ hasText: "Retry remaining agents" })
+        .waitFor();
+      assert.equal(
+        await page.evaluate(
+          (id) =>
+            qa.data.agentCatalog.definitions.find(
+              (definition) => definition.id === id,
+            ).launchName,
+          frozenRetry.definitionId,
+        ),
+        "edited-live-name",
+      );
+      const frozenFolder = page.locator(
+        `[data-launch-agent-id="${frozenRetry.agentId}"]`,
+      );
+      assert.equal(await frozenFolder.inputValue(), badRoutedFolder);
+      await frozenFolder.fill(correctedRoutedFolder);
       await page.locator('#team-launch-form button[type="submit"]').click();
       try {
-        await page.locator("#dialog").waitFor({ state: "hidden" });
+        await page
+          .locator("#dialog")
+          .waitFor({ state: "hidden", timeout: 10000 });
       } catch (error) {
         throw new Error(
           `${error.message}\n${await page.locator("#team-launch-status").innerText()}`,
         );
       }
+      const amendedRetry = await page.evaluate(
+        (agentId) =>
+          qa
+            .lastSavedLaunchPlan()
+            .members.find((member) => member.fields.agentId === agentId),
+        frozenRetry.agentId,
+      );
+      assert.deepEqual(amendedRetry.fields, {
+        ...frozenRetry.fields,
+        cwd: correctedRoutedFolder,
+      });
+      assert.deepEqual(
+        amendedRetry.folderAmendments.map(({ agentId, from, to }) => ({
+          agentId,
+          from,
+          to,
+        })),
+        [
+          {
+            agentId: frozenRetry.agentId,
+            from: badRoutedFolder,
+            to: correctedRoutedFolder,
+          },
+        ],
+      );
       const historyAfterRetry = await (
         await fetch(origin + "/qa/history-requests")
       ).json();
@@ -1155,13 +1272,11 @@ try {
       );
       assert.equal(
         execs - routedLaunchStart,
-        3,
-        "item-scoped retry starts only the failed team member",
+        4,
+        "item-scoped retries start only the verified-unstarted team member",
       );
       assert.equal(
-        launchCommands
-          .at(-2)
-          .replaceAll(badRoutedFolder, correctedRoutedFolder),
+        frozenRetry.command.replaceAll(badRoutedFolder, correctedRoutedFolder),
         launchCommands.at(-1),
         "item-scoped retry changed fields other than the failed member's folder",
       );
@@ -1211,6 +1326,17 @@ try {
               command.includes("--work-order-message"),
           ),
       );
+      await page.evaluate((definitionId) => {
+        qa.editDefinition(definitionId, {
+          revision: 3,
+          launchName: "team-reviewer",
+          runtime: "codex",
+          model: "gpt-5.3-codex",
+          reasoning: "",
+          run: "sh -c 'sleep 300' --",
+          cwd: "",
+        });
+      }, frozenRetry.definitionId);
       await page.evaluate(() => qa.modes.set("teams"));
       await page.locator("[data-edit-team]").click();
       await page.setViewportSize({ width: 390, height: 650 });
@@ -1346,7 +1472,7 @@ s.commit()
       assert.deepEqual(errors, []);
       console.log(
         name +
-          ": creation single-flight across task-list/journal delays, encrypted journal failure/reload, unknown-create and foreign-match blocking, lost-worker reconciliation, delayed token/profile/endpoint guards, exact identity/mismatch checks, remaining-member retry, mobile and mode selection passed.",
+          ": creation single-flight across task-list/journal delays, encrypted journal failure/reload, unknown-create and foreign-match blocking, lost-worker reconciliation, frozen-definition retry with identity-scoped folder receipts, delayed token/profile/endpoint guards, exact identity/mismatch checks, remaining-member retry, mobile and mode selection passed.",
       );
     } finally {
       await browser.close();

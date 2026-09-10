@@ -14,7 +14,9 @@ const get=(name)=>new Promise((resolve,reject)=>{const tx=db.transaction('vault'
 const del=(name)=>new Promise((resolve,reject)=>{const tx=db.transaction('vault','readwrite');tx.objectStore('vault').delete(name);tx.oncomplete=resolve;tx.onerror=()=>reject(tx.error)});
 await put(original,'encrypted');
 const vault=await import('/client/local-vault.js');
-window.qa={password,original,vault,get,put,del,async seedInvalid(){const invalid={...legacy,teams:[{name:'Invalid',members:[{name:'has spaces',runtime:'codex',run:'codex'}]}]};const envelope=await sealVault(invalid,key,salt,1);await put(envelope,'encrypted');return envelope}};
+const strictV2={...legacy,agentCatalog:{version:2,definitions:[{id:'agent_strict',revision:1,name:'Strict agent',launchName:'strict-agent',role:'Lead',serverId:'machine-demo-01',runtime:'codex',model:'gpt-5.3-codex',reasoning:'high',approvalMode:'on-request',sandboxMode:'workspace-write',permissionMode:'',allowedTools:[],run:'codex',cwd:'/synthetic/project',prompt:'Strict persisted identity'}]},teamsVersion:2,teams:[{id:'team_strict',name:'Strict team',swarm:false,orchestrator:'strict-agent',members:[{agentDefinitionId:'agent_strict'}]}]};
+const invalidV2=kind=>{const value=structuredClone(strictV2);if(kind==='missing-definition-id')delete value.agentCatalog.definitions[0].id;else value.teams=[{...value.teams[0],id:'invalid/id'},{...value.teams[0],id:'invalid/id',name:'Second invalid team'}];return value};
+window.qa={password,original,vault,get,put,del,async invalidV2Envelope(kind){return sealVault(invalidV2(kind),key,salt,2)},async seedInvalidV2(kind){const envelope=await sealVault(invalidV2(kind),key,salt,2);await put(envelope,'encrypted-v2');await put({version:2},'active-vault');return envelope},async seedInvalid(){const invalid={...legacy,teams:[{name:'Invalid',members:[{name:'has spaces',runtime:'codex',run:'codex'}]}]};const envelope=await sealVault(invalid,key,salt,1);await put(envelope,'encrypted');return envelope}};
 </script></body></html>`;
 const server = await createServer({
   configFile: false,
@@ -91,6 +93,35 @@ try {
         ),
         "lead",
       );
+      const rejectedImport = await page.evaluate(async () => {
+        const before = {
+          pointer: await qa.get("active-vault"),
+          v2: await qa.get("encrypted-v2"),
+          legacy: await qa.get("encrypted"),
+          recovery: await qa.get("migration-source-v1"),
+        };
+        let error = "";
+        try {
+          await qa.vault.importBackup(
+            await qa.invalidV2Envelope("missing-definition-id"),
+            qa.password,
+          );
+        } catch (reason) {
+          error = reason.message;
+        }
+        return {
+          before,
+          after: {
+            pointer: await qa.get("active-vault"),
+            v2: await qa.get("encrypted-v2"),
+            legacy: await qa.get("encrypted"),
+            recovery: await qa.get("migration-source-v1"),
+          },
+          error,
+        };
+      });
+      assert.match(rejectedImport.error, /agent definition ID/);
+      assert.deepEqual(rejectedImport.after, rejectedImport.before);
       await page.evaluate(async () => {
         await qa.vault.localAPI("/lock", "POST");
         await qa.del("encrypted-v2");
@@ -135,8 +166,44 @@ try {
       assert.deepEqual(invalid.legacy, invalid.envelope);
       assert.equal(invalid.recovery, undefined);
       await invalidContext.close();
+      const invalidV2Context = await browser.newContext(),
+        invalidV2Page = await invalidV2Context.newPage();
+      await invalidV2Page.goto(url);
+      await invalidV2Page.waitForFunction(() => window.qa);
+      const invalidV2 = await invalidV2Page.evaluate(async () => {
+        const envelope = await qa.seedInvalidV2("invalid-team-ids");
+        const before = {
+          pointer: await qa.get("active-vault"),
+          v2: await qa.get("encrypted-v2"),
+          legacy: await qa.get("encrypted"),
+          recovery: await qa.get("migration-source-v1"),
+        };
+        let error = "";
+        try {
+          await qa.vault.localAPI("/unlock", "POST", {
+            password: qa.password,
+          });
+        } catch (reason) {
+          error = reason.message;
+        }
+        return {
+          envelope,
+          before,
+          after: {
+            pointer: await qa.get("active-vault"),
+            v2: await qa.get("encrypted-v2"),
+            legacy: await qa.get("encrypted"),
+            recovery: await qa.get("migration-source-v1"),
+          },
+          error,
+        };
+      });
+      assert.match(invalidV2.error, /Invalid team ID/);
+      assert.deepEqual(invalidV2.after, invalidV2.before);
+      assert.deepEqual(invalidV2.after.v2, invalidV2.envelope);
+      await invalidV2Context.close();
       console.log(
-        `${name}: v1-to-v2 atomic namespace migration, immutable locked recovery, stale old-write fence, and interrupted-pointer failure passed.`,
+        `${name}: v1-to-v2 atomic namespace migration, strict v2 identity rejection, unchanged unlock/import storage, immutable locked recovery, stale old-write fence, and interrupted-pointer failure passed.`,
       );
     } finally {
       await browser.close();

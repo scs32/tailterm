@@ -96,6 +96,39 @@ test("raw catalog migration is lossless, separate per legacy member, atomic and 
       }),
     /Unsupported/,
   );
+  const missingDefinitionId = structuredClone(first);
+  delete missingDefinitionId.agentCatalog.definitions[0].id;
+  assert.throws(
+    () => migrateAgentData(missingDefinitionId),
+    /agent definition ID/,
+  );
+  const missingDefinitionRevision = structuredClone(first);
+  delete missingDefinitionRevision.agentCatalog.definitions[0].revision;
+  assert.throws(
+    () => migrateAgentData(missingDefinitionRevision),
+    /definition revision/,
+  );
+  const duplicateDefinitionId = structuredClone(first);
+  duplicateDefinitionId.agentCatalog.definitions.push({
+    ...duplicateDefinitionId.agentCatalog.definitions[0],
+  });
+  assert.throws(
+    () => migrateAgentData(duplicateDefinitionId),
+    /Duplicate agent definition ID/,
+  );
+  const invalidDuplicateTeamIds = structuredClone(first);
+  invalidDuplicateTeamIds.teams = [
+    { ...invalidDuplicateTeamIds.teams[0], id: "invalid/id" },
+    {
+      ...invalidDuplicateTeamIds.teams[0],
+      id: "invalid/id",
+      name: "Second invalid persisted team",
+    },
+  ];
+  assert.throws(
+    () => migrateAgentData(invalidDuplicateTeamIds),
+    /Invalid team ID/,
+  );
 });
 
 test("stable references share future edits while copied launches keep their revision", () => {

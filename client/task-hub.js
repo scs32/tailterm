@@ -125,7 +125,7 @@ export function createTaskHub(host) {
     const members = entry
       ? [
           journal.members.find(
-            (member) => member.fields.name === entry.fields.name,
+            (member) => member.fields.agentId === entry.fields.agentId,
           ),
         ]
       : journal.members;
@@ -169,38 +169,42 @@ export function createTaskHub(host) {
         updatedAt: new Date().toISOString(),
       }),
     );
-  async function amendUnstartedFolders(plan, journal, refreshed) {
-    const candidates = new Map(
-      refreshed.map((entry) => [entry.fields.name, entry]),
-    );
+  async function amendUnstartedFolders(plan, journal, requestedFolders) {
+    const nextJournal = structuredClone(journal);
+    let changed = false;
     const amended = plan.map((entry) => {
-      const member = journal?.members.find(
-        (candidate) => candidate.fields.name === entry.fields.name,
+      const member = nextJournal?.members.find(
+        (candidate) => candidate.fields.agentId === entry.fields.agentId,
       );
       if (!member || member.state !== "unstarted") return entry;
-      const next = candidates.get(entry.fields.name);
-      if (!next || next.server.id !== entry.server.id)
-        throw new Error(
-          "A pending member's machine cannot change during retry.",
-        );
-      if (next.fields.cwd === entry.fields.cwd) return entry;
+      if (!Object.hasOwn(requestedFolders, entry.fields.agentId)) return entry;
+      const cwd = String(requestedFolders[entry.fields.agentId] || "").trim();
+      if (cwd === entry.fields.cwd) return entry;
+      agentSpawnCommand({
+        hub: client.base,
+        task: journal.taskId || "tsk_0000000000000000",
+        ...entry.fields,
+        cwd,
+      });
       const receipt = {
+        agentId: entry.fields.agentId,
         from: entry.fields.cwd,
-        to: next.fields.cwd,
+        to: cwd,
         amendedAt: new Date().toISOString(),
       };
-      member.fields.cwd = next.fields.cwd;
+      member.fields.cwd = cwd;
       member.folderAmendments = [...(member.folderAmendments || []), receipt];
+      changed = true;
       return {
         ...entry,
-        fields: {
-          ...entry.fields,
-          cwd: next.fields.cwd,
-          folderAmendments: [...(entry.fields.folderAmendments || []), receipt],
-        },
+        fields: { ...entry.fields, cwd },
+        folderAmendments: structuredClone(member.folderAmendments),
       };
     });
-    if (journal) await saveLaunchJournal(journal);
+    if (changed) {
+      await saveLaunchJournal(nextJournal);
+      Object.assign(journal, nextJournal);
+    }
     return amended;
   }
   const probedServers = new Set();
@@ -669,7 +673,8 @@ export function createTaskHub(host) {
   };
 
   function teamProjectFolders(container, getTeam, getMain) {
-    const paths = {};
+    const paths = {},
+      retryPaths = {};
     const read = () => {
       container
         .querySelectorAll("[data-project-server]")
@@ -677,6 +682,15 @@ export function createTaskHub(host) {
           (input) => (paths[input.dataset.projectServer] = input.value.trim()),
         );
       return { ...paths };
+    };
+    const readRetry = () => {
+      container
+        .querySelectorAll("[data-launch-agent-id]")
+        .forEach(
+          (input) =>
+            (retryPaths[input.dataset.launchAgentId] = input.value.trim()),
+        );
+      return { ...retryPaths };
     };
     function render() {
       read();
@@ -727,7 +741,34 @@ export function createTaskHub(host) {
           .forEach((control) => (control.disabled = !enabled));
       });
     }
-    return { read, render, setEditable };
+    function renderRetry(plan, journal) {
+      readRetry();
+      const pending = plan.filter((entry) =>
+        journal?.members.some(
+          (member) =>
+            member.fields.agentId === entry.fields.agentId &&
+            member.state === "unstarted",
+        ),
+      );
+      container.hidden = !pending.length;
+      container.innerHTML = pending
+        .map((entry, index) =>
+          projectFolderHTML(
+            `team-retry-project-${index}`,
+            retryPaths[entry.fields.agentId] ?? entry.fields.cwd,
+            `${entry.fields.name} · ${entry.server.name} · Project folder`,
+          ),
+        )
+        .join("");
+      container.querySelectorAll(".project-folder").forEach((root, index) => {
+        const entry = pending[index];
+        const input = root.querySelector("input");
+        input.dataset.launchAgentId = entry.fields.agentId;
+        input.dataset.projectServer = entry.server.id;
+        wireProjectFolder(root, host, () => entry.server);
+      });
+    }
+    return { read, readRetry, render, renderRetry, setEditable };
   }
 
   function agentFields(server) {
@@ -1116,19 +1157,11 @@ export function createTaskHub(host) {
                 ? [{ server: target, fields }]
                 : [],
           );
-        if (launchPlan && team && progress.size) {
-          const refreshed = teamLaunches(
-            team,
-            host.getServers(),
-            form.querySelector("#task-main-server").value,
-            projects.read(),
-            null,
-            host.getData().agentCatalog,
-          );
+        if (launchPlan && launchJournal) {
           launchPlan = await amendUnstartedFolders(
             launchPlan,
             launchJournal,
-            withDatabaseHandler(refreshed),
+            projects.readRetry(),
           );
         }
         if (!launchJournal && plan.length && team) {
@@ -1213,8 +1246,12 @@ export function createTaskHub(host) {
           (member) => member.fields.agentRole === "database_handler",
         );
         if (inheritedHandler && handler) {
+          const amendedFolder = handler.fields.cwd;
           handler.server = inheritedHandler.server;
-          handler.fields = structuredClone(inheritedHandler.fields);
+          handler.fields = {
+            ...structuredClone(inheritedHandler.fields),
+            cwd: amendedFolder,
+          };
         }
         try {
           await launchMembers(
@@ -1226,7 +1263,7 @@ export function createTaskHub(host) {
           );
         } finally {
           // A successful lead launch fixes its handler's inherited settings.
-          // Folder corrections for remaining workers must not change them.
+          // A separately receipted folder correction is the only exception.
           if (
             !inheritedHandler &&
             handler &&
@@ -1265,18 +1302,11 @@ export function createTaskHub(host) {
             (progress.size
               ? " Started agents keep their folders. The database handler keeps the lead’s settings; corrections apply to remaining workers."
               : "");
-        if (progress.size && launchJournal)
-          projects.setEditable(
-            launchPlan
-              .filter((entry) =>
-                launchJournal.members.some(
-                  (member) =>
-                    member.fields.name === entry.fields.name &&
-                    member.state === "unstarted",
-                ),
-              )
-              .map((entry) => entry.server.id),
-          );
+        if (
+          saved &&
+          launchJournal?.members.some((member) => member.state === "unstarted")
+        )
+          projects.renderRetry(launchPlan, launchJournal);
         error.setAttribute("role", "alert");
         error.scrollIntoView({ block: "nearest" });
         if (!unknownCreation)
@@ -1356,6 +1386,7 @@ export function createTaskHub(host) {
         error.textContent =
           "Recovered the encrypted frozen launch plan. Retry reconciles uncertain identities before starting unstarted members.";
         button.textContent = "Retry agent launch";
+        projects.renderRetry(launchPlan, launchJournal);
       })()
         .catch((error) => {
           if (form.isConnected)
@@ -1612,7 +1643,7 @@ export function createTaskHub(host) {
     for (const entry of plan) {
       const { fields } = entry;
       const member = journal?.members.find(
-        (candidate) => candidate.fields.name === fields.name,
+        (candidate) => candidate.fields.agentId === fields.agentId,
       );
       const exact = detail.agents.find((agent) => agent.id === fields.agentId);
       if (member && ["uncertain", "started"].includes(member.state)) {
@@ -1672,7 +1703,7 @@ export function createTaskHub(host) {
       const { server, fields } = entry;
       if (progress.has(fields.name)) continue;
       const journalMember = journal?.members.find(
-        (member) => member.fields.name === fields.name,
+        (member) => member.fields.agentId === fields.agentId,
       );
       report(
         `Starting ${fields.name} on ${server.name} (${i + 1}/${plan.length})…`,
@@ -1816,17 +1847,7 @@ export function createTaskHub(host) {
         form.querySelector("#team-work-order").disabled = true;
         const mainChoice = form.querySelector("#team-main-server");
         if (mainChoice) mainChoice.disabled = true;
-        projects.setEditable(
-          plan
-            .filter((entry) =>
-              launchJournal.members.some(
-                (member) =>
-                  member.fields.name === entry.fields.name &&
-                  member.state === "unstarted",
-              ),
-            )
-            .map((entry) => entry.server.id),
-        );
+        projects.renderRetry(plan, launchJournal);
         status.textContent =
           "Recovered the encrypted frozen launch plan. Retry reconciles uncertain identities before starting unstarted members.";
         button.textContent = "Retry remaining agents";
@@ -1848,18 +1869,12 @@ export function createTaskHub(host) {
         form.querySelector("#team-work-order").disabled = true;
         const id = selector.value;
         try {
-          if (plan && progress.size) {
-            const refreshed = teamLaunches(
-              referencedTeam,
-              host.getServers(),
-              form.querySelector("#team-main-server")?.value || mainServer?.id,
-              projects.read(),
-              routing,
-              host.getData().agentCatalog,
+          if (plan && launchJournal)
+            plan = await amendUnstartedFolders(
+              plan,
+              launchJournal,
+              projects.readRetry(),
             );
-            plan = await amendUnstartedFolders(plan, launchJournal, refreshed);
-            projects.setEditable([]);
-          }
           if (!plan) {
             const item = items.find(
               (candidate) => candidate.id === itemSelector.value,
@@ -1946,19 +1961,12 @@ export function createTaskHub(host) {
           if (progress.size)
             status.textContent +=
               " Already started agents and the prepared item context stay fixed; correct folders only for the remaining agents.";
-          if (progress.size)
-            projects.setEditable(
-              plan
-                .filter((entry) => !progress.has(entry.fields.name))
-                .filter((entry) =>
-                  launchJournal?.members.some(
-                    (member) =>
-                      member.fields.name === entry.fields.name &&
-                      member.state === "unstarted",
-                  ),
-                )
-                .map((entry) => entry.server.id),
-            );
+          if (
+            launchJournal?.members.some(
+              (member) => member.state === "unstarted",
+            )
+          )
+            projects.renderRetry(plan, launchJournal);
           if (!progress.size && !launchJournal) {
             selector.disabled = false;
             itemSelector.disabled = !items.length;

@@ -23,7 +23,11 @@ function text(value, max, label, { required = false, control = false } = {}) {
   return result;
 }
 
-export function normalizeAgentDefinition(value, index = 0) {
+export function normalizeAgentDefinition(
+  value,
+  index = 0,
+  { requireIdentity = false } = {},
+) {
   const invalid = (message, field) => {
     throw Object.assign(new Error(message), { definitionIndex: index, field });
   };
@@ -64,8 +68,11 @@ export function normalizeAgentDefinition(value, index = 0) {
       /launch name/i.test(error.message) ? "launchName" : "name",
     );
   }
-  const id = value.id || newId("agent");
-  if (!ID_RE.test(id)) invalid("Invalid agent definition ID.", "id");
+  const id = value.id || (requireIdentity ? "" : newId("agent"));
+  if (typeof id !== "string" || !ID_RE.test(id))
+    invalid("Invalid agent definition ID.", "id");
+  if (requireIdentity && !Object.hasOwn(value, "revision"))
+    invalid("Missing agent definition revision.", "revision");
   const revision = value.revision === undefined ? 1 : value.revision;
   if (!Number.isSafeInteger(revision) || revision < 1)
     invalid("Invalid agent definition revision.", "revision");
@@ -149,7 +156,9 @@ export function normalizeAgentCatalog(value) {
     throw new Error(`At most ${MAX_AGENT_DEFINITIONS} agent definitions.`);
   const ids = new Set();
   const definitions = value.definitions.map((entry, index) => {
-    const definition = normalizeAgentDefinition(entry, index);
+    const definition = normalizeAgentDefinition(entry, index, {
+      requireIdentity: true,
+    });
     if (ids.has(definition.id))
       throw new Error(`Duplicate agent definition ID: ${definition.id}.`);
     ids.add(definition.id);
@@ -164,7 +173,8 @@ function normalizeTeamReference(value, definitions, memberIndex) {
       new Error(`Agent ${memberIndex + 1}: Choose an agent definition.`),
       { memberIndex, field: "agentDefinitionId" },
     );
-  const agentDefinitionId = String(value.agentDefinitionId || "");
+  const agentDefinitionId =
+    typeof value.agentDefinitionId === "string" ? value.agentDefinitionId : "";
   const definition = definitions.find(
     (entry) => entry.id === agentDefinitionId,
   );
@@ -209,7 +219,11 @@ export function resolveTeamMember(reference, definitions) {
   };
 }
 
-export function normalizeReferencedTeam(value, definitions) {
+export function normalizeReferencedTeam(
+  value,
+  definitions,
+  { requireIdentity = false } = {},
+) {
   if (
     !value ||
     typeof value.name !== "string" ||
@@ -244,8 +258,11 @@ export function normalizeReferencedTeam(value, definitions) {
   const orchestrator = String(value.orchestrator || resolved[0].name);
   if (!resolved.some((entry) => entry.name === orchestrator))
     throw new Error("Choose a main orchestrator from this team.");
+  const id = value.id || (requireIdentity ? "" : newId("team"));
+  if (typeof id !== "string" || !ID_RE.test(id))
+    throw new Error("Invalid team ID.");
   return {
-    id: ID_RE.test(value.id || "") ? value.id : newId("team"),
+    id,
     name: value.name.trim(),
     swarm: value.swarm === true,
     orchestrator,
@@ -294,7 +311,9 @@ export function migrateAgentData(raw) {
       throw new Error(`At most ${MAX_TEAMS} teams.`);
     const ids = new Set();
     const teams = raw.teams.map((entry) => {
-      const team = normalizeReferencedTeam(entry, agentCatalog.definitions);
+      const team = normalizeReferencedTeam(entry, agentCatalog.definitions, {
+        requireIdentity: true,
+      });
       if (ids.has(team.id)) throw new Error(`Duplicate team ID: ${team.id}.`);
       ids.add(team.id);
       return team;
