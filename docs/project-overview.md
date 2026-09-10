@@ -1,6 +1,6 @@
 # Project overview
 
-Updated September 8, 2026. Start here for the architecture and product model;
+Updated September 10, 2026. Start here for the architecture and product model;
 use [the handoff guide](handoff.md) for the actual deployment and migration.
 
 ## Product and direction
@@ -107,6 +107,11 @@ boxed left selectors. Projects and Teams show one selected record's details and
 actions on the right; closed projects remain selectable for history and cleanup.
 Bugs/Features retain All projects and status filters. Narrow screens use Board's
 horizontal selector rail.
+
+Queue uses the same compact layout, with list and detail stacked when the
+available content width is narrow. Long titles and identifiers wrap within
+their columns; project titles and subtitles occupy separate lines. Selection
+uses fill, hover uses outline, and the history checkbox stays beside its label.
 
 Previously visited hub views use an encrypted local read cache and refresh in
 the background, including small incremental Board message reads. The cache is

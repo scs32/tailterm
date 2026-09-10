@@ -1,5 +1,33 @@
 # Development handoff — September 10, 2026
 
+## September 10 Queue layout — actual release accepted
+
+Lead acceptance #1790 verifies application
+`a974c9870b64d0e4cb5387011d1a68515af6ce82` for Bug
+`wi_c36a4696771a2072`, scope 3, implementation #1726 and release #1763.
+The Queue list/detail now fit their available width, rail titles and subtitles
+stack correctly, and the history checkbox stays compact. Selected rows retain
+their fill through hover and keyboard focus. Details and complete evidence are
+in [the report](queue-layout.md) and [release receipt](releases/tailos-2026-09-10-queue-layout.json).
+
+Current frontend: deployment `876448a7-d913-4e68-9033-522230a57558`,
+`https://876448a7.tailos.pages.dev`, `https://tailos.tailarr.com`, and Mini
+`http://127.0.0.1:4318`. The existing preview remains PID 60799 / PPID 1.
+All 81 public assets, canonical index and release manifest were independently
+verified on all three origins. Manifest SHA-256:
+`7eb67bf14d940dee93792b624a2665ce3e53d155c6171956c90fe9f3faa30170`.
+Fresh custom-origin Chromium passed production WASM and synthetic vault recovery;
+the downloaded production CSS passed all 24 Chromium/WebKit layout cases.
+Native Safari and owner-device confirmation remain unverified.
+
+Retained clean source/package: `.build/releases/queue-layout-a974c98`.
+Frontend rollback is the retained `.build/releases/project-queue-cfb2172`
+package, manifest `e7919f9448fa0dc9d5938315c6747dbc9c035645398c48c2ce0ff34e21a234a4`.
+Publish explicitly to Pages project `tailos` and atomically replace the Mini
+package without restarting its preview. The hub and both CLIs remain the
+Project Queue release below. Agents-library is still under review and is not
+included. Handler completion and exact worker closeout follow acceptance.
+
 ## September 10 Project Queue — release verified pending final acceptance
 
 Feature `wi_a222a4d8a69c1d53` revision/scope 2, work order #1640 plus complete
