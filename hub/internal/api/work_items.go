@@ -229,7 +229,7 @@ type NarrativeCoverageVersion struct {
 	Assessment         string               `json:"assessment"`
 	AssessmentText     string               `json:"assessmentText,omitempty"`
 	EvidenceReferences []NarrativeReference `json:"evidenceReferences"`
-	AssessmentBy       NarrativeActor       `json:"assessmentBy"`
+	AssessmentBy       Sender               `json:"assessmentBy"`
 	CreatedBy          NarrativeActor       `json:"createdBy"`
 	CreatedAt          time.Time            `json:"createdAt"`
 }
@@ -248,6 +248,7 @@ type PutNarrativeCoverageRequest struct {
 	Assessment         string               `json:"assessment"`
 	AssessmentText     string               `json:"assessmentText,omitempty"`
 	EvidenceReferences []NarrativeReference `json:"evidenceReferences"`
+	AssessedBy         Sender               `json:"assessedBy"`
 	AgentID            string               `json:"agentId,omitempty"`
 	RunID              string               `json:"runId,omitempty"`
 }

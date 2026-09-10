@@ -184,6 +184,13 @@ func validAssessment(s string) bool {
 	return false
 }
 
+func validNarrativeSender(sender api.Sender, required bool) bool {
+	if required && sender.AgentID == "" && strings.TrimSpace(sender.Node) == "" && strings.TrimSpace(sender.User) == "" {
+		return false
+	}
+	return (sender.AgentID == "" || api.ValidID(sender.AgentID, "agt")) && validNarrativeText(sender.Node, 512, false) && validNarrativeText(sender.User, 512, false)
+}
+
 func validLocator(raw string) bool {
 	if raw == "" {
 		return true
@@ -834,7 +841,7 @@ func validateStringList(values []string) bool {
 func (s *Store) PutNarrativeCoverage(ctx context.Context, taskID, itemID string, req api.PutNarrativeCoverageRequest, by api.Caller) (api.NarrativeCoverageVersion, bool, error) {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
-	if !api.ValidID(taskID, "tsk") || !api.ValidID(itemID, "wi") || !validRequestID(req.RequestID) || req.ExpectedRevision < 0 || (req.CoverageID != "" && !validNarrativeID(req.CoverageID, "ncov")) || !validNarrativeText(req.Source, 128, true) || !validNarrativeText(req.Scope, 4096, true) || !validCaptureState(req.CaptureState) || !validAssessment(req.Assessment) || !validNarrativeText(req.AssessmentText, 8192, false) || !validateStringList(req.CapturedIDs) || !validateStringList(req.KnownGaps) || len(req.EvidenceReferences) > 256 || (req.Assessment != "unverified" && len(req.EvidenceReferences) == 0) {
+	if !api.ValidID(taskID, "tsk") || !api.ValidID(itemID, "wi") || !validRequestID(req.RequestID) || req.ExpectedRevision < 0 || (req.CoverageID != "" && !validNarrativeID(req.CoverageID, "ncov")) || !validNarrativeText(req.Source, 128, true) || !validNarrativeText(req.Scope, 4096, true) || !validCaptureState(req.CaptureState) || !validAssessment(req.Assessment) || !validNarrativeText(req.AssessmentText, 8192, false) || !validateStringList(req.CapturedIDs) || !validateStringList(req.KnownGaps) || len(req.EvidenceReferences) > 256 || !validNarrativeSender(req.AssessedBy, req.Assessment != "unverified") || (req.Assessment != "unverified" && len(req.EvidenceReferences) == 0) {
 		return api.NarrativeCoverageVersion{}, false, api.ErrInvalid
 	}
 	payload := narrativePayloadHash(req)
@@ -851,6 +858,11 @@ func (s *Store) PutNarrativeCoverage(ctx context.Context, taskID, itemID string,
 	}
 	if err = validateNarrativeActor(tx, ctx, taskID, req.AgentID, req.RunID); err != nil {
 		return api.NarrativeCoverageVersion{}, false, err
+	}
+	if req.AssessedBy.AgentID != "" {
+		if err = validateWorkItemAgent(tx, ctx, taskID, req.AssessedBy.AgentID); err != nil {
+			return api.NarrativeCoverageVersion{}, false, err
+		}
 	}
 	for _, ref := range req.EvidenceReferences {
 		if err = validateNarrativeReference(tx, ctx, taskID, itemID, ref); err != nil {
@@ -882,7 +894,7 @@ func (s *Store) PutNarrativeCoverage(ctx context.Context, taskID, itemID string,
 		return api.NarrativeCoverageVersion{}, false, err
 	}
 	actor := narrativeActor(req.AgentID, req.RunID, by)
-	v := api.NarrativeCoverageVersion{CoverageID: id, TaskID: taskID, ItemID: itemID, Revision: rev, NarrativeSeq: seq, Source: req.Source, Scope: req.Scope, CaptureState: req.CaptureState, CapturedIDs: req.CapturedIDs, KnownGaps: req.KnownGaps, UnknownExtent: req.UnknownExtent, AsOf: req.AsOf, Assessment: req.Assessment, AssessmentText: req.AssessmentText, EvidenceReferences: req.EvidenceReferences, AssessmentBy: actor, CreatedBy: actor, CreatedAt: now}
+	v := api.NarrativeCoverageVersion{CoverageID: id, TaskID: taskID, ItemID: itemID, Revision: rev, NarrativeSeq: seq, Source: req.Source, Scope: req.Scope, CaptureState: req.CaptureState, CapturedIDs: req.CapturedIDs, KnownGaps: req.KnownGaps, UnknownExtent: req.UnknownExtent, AsOf: req.AsOf, Assessment: req.Assessment, AssessmentText: req.AssessmentText, EvidenceReferences: req.EvidenceReferences, AssessmentBy: req.AssessedBy, CreatedBy: actor, CreatedAt: now}
 	if current == 0 {
 		_, err = tx.ExecContext(ctx, `INSERT INTO narrative_coverage(id,task_id,item_id,source,latest_revision,created_at)VALUES(?,?,?,?,?,?)`, id, taskID, itemID, req.Source, rev, ts(now))
 	} else {

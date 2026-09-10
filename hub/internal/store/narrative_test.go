@@ -81,9 +81,9 @@ func TestNarrativeArtifactsLinksCoverageReportsRetriesAndCompletion(t *testing.T
 	if got, _, err := s.PutNarrativeLink(ctx, project.ID, item.ID, retract, by); err != nil || got.Revision != 2 || got.Action != "retract" {
 		t.Fatalf("retract=%+v err=%v", got, err)
 	}
-	coverageReq := api.PutNarrativeCoverageRequest{RequestID: "coverage-1", Source: "pr", Scope: "Selected body revisions only", CaptureState: "stored-content", CapturedIDs: []string{"body@abc", "body@def"}, KnownGaps: []string{"comments were not supplied"}, UnknownExtent: true, Assessment: "independently-verified", AssessmentText: "The submitted body versions were compared.", EvidenceReferences: []api.NarrativeReference{{Kind: "artifact-version", ArtifactID: artifact.ArtifactID, Version: 1, Label: "exact submitted body"}}}
+	coverageReq := api.PutNarrativeCoverageRequest{RequestID: "coverage-1", Source: "pr", Scope: "Selected body revisions only", CaptureState: "stored-content", CapturedIDs: []string{"body@abc", "body@def"}, KnownGaps: []string{"comments were not supplied"}, UnknownExtent: true, Assessment: "independently-verified", AssessmentText: "The submitted body versions were compared.", EvidenceReferences: []api.NarrativeReference{{Kind: "artifact-version", ArtifactID: artifact.ArtifactID, Version: 1, Label: "exact submitted body"}}, AssessedBy: api.Sender{Node: "independent-review", User: "verifier"}}
 	coverage, _, err := s.PutNarrativeCoverage(ctx, project.ID, item.ID, coverageReq, by)
-	if err != nil || coverage.Revision != 1 || !coverage.UnknownExtent || len(coverage.EvidenceReferences) != 1 || coverage.AssessmentBy.Caller.Node != by.Node {
+	if err != nil || coverage.Revision != 1 || !coverage.UnknownExtent || len(coverage.EvidenceReferences) != 1 || coverage.AssessmentBy.User != "verifier" {
 		t.Fatalf("coverage=%+v err=%v", coverage, err)
 	}
 	unreferenced := coverageReq
@@ -92,6 +92,12 @@ func TestNarrativeArtifactsLinksCoverageReportsRetriesAndCompletion(t *testing.T
 	unreferenced.EvidenceReferences = nil
 	if _, _, err = s.PutNarrativeCoverage(ctx, project.ID, item.ID, unreferenced, by); !errors.Is(err, api.ErrInvalid) {
 		t.Fatalf("verified assessment without evidence=%v", err)
+	}
+	unattributed := coverageReq
+	unattributed.RequestID = "coverage-unattributed"
+	unattributed.AssessedBy = api.Sender{}
+	if _, _, err = s.PutNarrativeCoverage(ctx, project.ID, item.ID, unattributed, by); !errors.Is(err, api.ErrInvalid) {
+		t.Fatalf("verified assessment without verifier=%v", err)
 	}
 	reportReq := completeReportRequest(item, "report-1", 500)
 	report, replay, err := s.PutNarrativeReport(ctx, project.ID, item.ID, reportReq, by)
@@ -120,7 +126,7 @@ func TestNarrativeArtifactsLinksCoverageReportsRetriesAndCompletion(t *testing.T
 		t.Fatalf("post-done correction=%+v err=%v", correctedReport, err)
 	}
 	overview, err := s.GetNarrativeOverview(ctx, project.ID, item.ID)
-	if err != nil || overview.CompletionReport.Version != 1 || overview.LatestReport.Version != 2 || len(overview.Coverage) != 1 || len(overview.Coverage[0].EvidenceReferences) != 1 || overview.Coverage[0].AssessmentBy.Caller.Node != by.Node || len(overview.DefaultGaps) != 1 {
+	if err != nil || overview.CompletionReport.Version != 1 || overview.LatestReport.Version != 2 || len(overview.Coverage) != 1 || len(overview.Coverage[0].EvidenceReferences) != 1 || overview.Coverage[0].AssessmentBy.User != "verifier" || len(overview.DefaultGaps) != 1 {
 		t.Fatalf("overview=%+v err=%v", overview, err)
 	}
 	if _, err = s.CloseTask(ctx, project.ID, by); err != nil {
