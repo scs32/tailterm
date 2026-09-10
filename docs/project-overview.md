@@ -168,15 +168,19 @@ integration code. The sole implementation exception requires both that the
 orchestrator is the only non-database team member and that agent spawning is off.
 Cost, capacity, worker availability or helper quota does not create an exception.
 These are generated role instructions, not a runtime sandbox or API authorization
-boundary. The orchestrator is also instructed to retire unnecessary workers and,
-after accepting final results, retire remaining workers and helpers while staying
-available to the owner.
+boundary. An implementation worker session belongs to exactly one bug or feature.
+After accepting its result and resolving its dependencies, the orchestrator closes
+that worker session; a new item gets a fresh identity and context. Retirement is
+only for intentional temporary retention of the same item context. The
+orchestrator and active database handler stay available while the project remains
+open.
 
 **Allow agents to add other agents** controls agent-originated helper launches.
 **Max new agents** is a separate lifetime allowance for additional identities,
 including descendants and finished helpers. It defaults to two. Manual additions
-do not consume it; the deployed hub's per-project active-agent cap is 32. Retired agents
-still occupy open-agent slots because their sessions and identities remain.
+do not consume it; the deployed hub's per-project active-agent cap is 32. Retired
+agents still occupy open-agent slots because their sessions and identities remain;
+verified individual closeout releases the slot without closing the parent project.
 
 **Enable swarm** broadcasts new messages to all members while preserving an
 addressed recipient as the person responsible for acting. Delivery scope is saved
@@ -225,6 +229,15 @@ Retirement stops automatic inbox wake-ups and preserves the terminal for review.
 A running/queued turn can finish. Late runtime hooks cannot silently unretire a
 worker. Explicit Resume or a direct human message to that online retired worker
 makes it available again. See [retirement](agent-retirement.md).
+
+Individual closeout records the exact agent/run as closed, then asks only its
+saved host to stop the tmux session whose hub/task/agent/run, stable tmux ID and
+creation time all match. The parent project stays open. Closure intent and the
+host cleanup receipt are separate, so an offline host or lost response remains
+visibly retryable. Renamed owned sessions still close; absent sessions can be
+confirmed; a reused name, changed run or mismatched tmux identity is preserved.
+Late hooks cannot reopen the closed run, and a late cleanup failure cannot undo
+an already successful receipt.
 
 Close task records durable closure on the hub. The browser requests immediate
 cleanup over each saved SSH host, and the host relay also processes closure

@@ -1524,12 +1524,17 @@ export function createTaskHub(host) {
       const { task, agents } = await client.getTask(taskId);
       host.dialog(
         "Project settings",
-        `<form id="task-settings"><label>Project name<input id="task-settings-name" maxlength="120" value="${esc(task.name)}" required></label><label>Objective<textarea id="task-settings-goal" rows="3" maxlength="8192">${esc(task.goal)}</textarea></label><label>Main orchestrator<input id="task-settings-orchestrator" maxlength="64" value="${esc(task.orchestrator || "")}" placeholder="Agent name (optional)"></label><label class="check"><input id="task-settings-swarm" type="checkbox" ${task.swarm ? "checked" : ""}>Enable swarm</label><p class="fine">Every new message reaches all project agents. Existing messages keep their original delivery scope.</p><label class="check"><input id="task-settings-spawn" type="checkbox" ${task.allowAgentSpawn ? "checked" : ""}>Allow agents to add other agents</label><label>Max new agents<input id="task-settings-max-new-agents" type="number" min="0" max="32" step="1" value="${task.maxNewAgents ?? 2}" ${task.allowAgentSpawn ? "" : "disabled"}></label><p class="fine">Additional helpers across the project, including finished helpers. Agents you add manually do not count.</p><p class="fine">You can always add agents yourself. Turning this off prevents new helpers; existing agents keep running.</p><details class="dialog-details"><summary>Agents</summary><p class="fine">Retire stops automatic inbox wake-ups and keeps the terminal and results. It does not interrupt a running or already queued turn. Resume allows unread messages to wake the agent again.</p><div class="task-agent-lifecycle">${
+        `<form id="task-settings"><label>Project name<input id="task-settings-name" maxlength="120" value="${esc(task.name)}" required></label><label>Objective<textarea id="task-settings-goal" rows="3" maxlength="8192">${esc(task.goal)}</textarea></label><label>Main orchestrator<input id="task-settings-orchestrator" maxlength="64" value="${esc(task.orchestrator || "")}" placeholder="Agent name (optional)"></label><label class="check"><input id="task-settings-swarm" type="checkbox" ${task.swarm ? "checked" : ""}>Enable swarm</label><p class="fine">Every new message reaches all project agents. Existing messages keep their original delivery scope.</p><label class="check"><input id="task-settings-spawn" type="checkbox" ${task.allowAgentSpawn ? "checked" : ""}>Allow agents to add other agents</label><label>Max new agents<input id="task-settings-max-new-agents" type="number" min="0" max="32" step="1" value="${task.maxNewAgents ?? 2}" ${task.allowAgentSpawn ? "" : "disabled"}></label><p class="fine">Additional helpers across the project, including finished helpers. Agents you add manually do not count.</p><p class="fine">You can always add agents yourself. Turning this off prevents new helpers; existing agents keep running.</p><details class="dialog-details"><summary>Agents</summary><p class="fine">Close an accepted worker after its dependencies resolve. Retire only when you intentionally want to keep the same item session for follow-up.</p><div class="task-agent-lifecycle">${
           agents
-            .filter((a) => !["closed", "exited"].includes(a.status))
-            .map(
+            .filter(
               (a) =>
-                `<div><span>${esc(a.name)}${a.name.toLowerCase() === task.orchestrator?.toLowerCase() ? " · orchestrator" : ""}</span><button type="button" data-agent-retirement="${esc(a.id)}" data-retired="${a.status === "retired"}">${a.status === "retired" ? "Resume" : "Retire"}</button></div>`,
+                !["closed", "exited"].includes(a.status) ||
+                (a.status === "closed" && !a.cleanupDone),
+            )
+            .map((a) =>
+              a.status === "closed"
+                ? `<div data-agent-lifecycle-row="${esc(a.id)}"><span title="${esc(a.cleanupError || "Waiting for the saved host")}">${esc(a.name)} · Cleanup pending</span><button type="button" data-agent-cleanup="${esc(a.id)}">Retry cleanup</button></div>`
+                : `<div><span>${esc(a.name)}${a.name.toLowerCase() === task.orchestrator?.toLowerCase() ? " · orchestrator" : ""}</span><button type="button" data-agent-retirement="${esc(a.id)}" data-retired="${a.status === "retired"}">${a.status === "retired" ? "Resume" : "Retire"}</button></div>`,
             )
             .join("") || '<p class="fine">No agents available.</p>'
         }</div></details><p id="task-settings-error" class="fine" role="alert"></p><div class="dialog-actions"><button type="submit" class="primary">Save</button></div></form>`,
@@ -1555,6 +1560,30 @@ export function createTaskHub(host) {
                 ? "Agent resumed; inbox wake-ups enabled."
                 : "Agent retired; terminal retained.",
             );
+          } catch (e) {
+            error.textContent = formatError(e);
+          } finally {
+            button.disabled = false;
+          }
+        };
+      });
+      form.querySelectorAll("[data-agent-cleanup]").forEach((button) => {
+        button.onclick = async () => {
+          button.disabled = true;
+          const error = form.querySelector("#task-settings-error");
+          error.textContent = "";
+          try {
+            const result = await cleanupAgent(
+              taskId,
+              button.dataset.agentCleanup,
+            );
+            if (result.cleanupDone) {
+              button.closest("[data-agent-lifecycle-row]")?.remove();
+              host.notice("Agent session cleanup confirmed.");
+            } else {
+              error.textContent =
+                result.cleanupErrors?.[0] || "Cleanup remains pending.";
+            }
           } catch (e) {
             error.textContent = formatError(e);
           } finally {
@@ -1645,11 +1674,7 @@ export function createTaskHub(host) {
     return list;
   }
 
-  async function cleanupTask(taskId) {
-    const detail = await client.getTask(taskId);
-    if (detail.task.status !== "closed")
-      throw new Error("Project is still open.");
-    const pending = detail.agents.filter((a) => !a.cleanupDone);
+  async function cleanupAgents(taskId, pending) {
     if (pending.some((a) => !matchServer(a.host, taskServers())))
       await resolveAgentHosts();
     const hosts = new Map(),
@@ -1682,6 +1707,24 @@ export function createTaskHub(host) {
       }),
     );
     const updated = await client.getTask(taskId);
+    return { updated, errors };
+  }
+  async function cleanupAgent(taskId, agentId) {
+    const detail = await client.getTask(taskId);
+    const agent = detail.agents.find((a) => a.id === agentId);
+    if (!agent || agent.status !== "closed")
+      throw new Error("Agent is not closed.");
+    if (agent.cleanupDone) return agent;
+    const { updated, errors } = await cleanupAgents(taskId, [agent]);
+    const current = updated.agents.find((a) => a.id === agentId) || agent;
+    return { ...current, cleanupErrors: errors };
+  }
+  async function cleanupTask(taskId) {
+    const detail = await client.getTask(taskId);
+    if (detail.task.status !== "closed")
+      throw new Error("Project is still open.");
+    const pending = detail.agents.filter((a) => !a.cleanupDone);
+    const { updated, errors } = await cleanupAgents(taskId, pending);
     return { ...updated.task, cleanupErrors: errors };
   }
   async function closeTask(taskId) {
@@ -1696,6 +1739,7 @@ export function createTaskHub(host) {
   return {
     setupHandler,
     closeTask,
+    cleanupAgent,
     cleanupTask,
     hideAgent(id) {
       hidden.add(id);

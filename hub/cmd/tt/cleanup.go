@@ -118,9 +118,14 @@ type cleanupResult struct {
 }
 
 // Explicit IDs come from the owner's SSH action on an agent's saved host and
-// allow confirming already-absent legacy sessions without guessing host names.
+// allow confirming already-absent sessions without guessing host names. They
+// apply to individually closed agents as well as agents in a closed task.
 func cleanupSessions(ctx context.Context, e env, task string, selected []string) (cleanupResult, error) {
 	result := cleanupResult{Errors: []string{}}
+	selectedSet := map[string]bool{}
+	for _, id := range selected {
+		selectedSet[id] = true
+	}
 	c, err := e.client(3 * time.Second)
 	if err != nil {
 		return result, err
@@ -151,16 +156,12 @@ func cleanupSessions(ctx context.Context, e env, task string, selected []string)
 			continue
 		}
 		var s ownedSession
-		if json.Unmarshal(data, &s) != nil || !s.valid() || s.Hub != e.hub || (task != "" && s.Task != task) {
+		if json.Unmarshal(data, &s) != nil || !s.valid() || s.Hub != e.hub || (task != "" && s.Task != task) || (len(selectedSet) > 0 && !selectedSet[s.Agent]) {
 			continue
 		}
-		seen[s.Agent] = true
 		d, err := get(s.Task)
 		if err != nil {
 			result.Errors = append(result.Errors, "Hub unavailable; local session retained")
-			continue
-		}
-		if d.Task.Status != api.TaskClosed {
 			continue
 		}
 		var a *api.Agent
@@ -172,6 +173,14 @@ func cleanupSessions(ctx context.Context, e env, task string, selected []string)
 		}
 		if a == nil || a.Status != api.AgentClosed {
 			continue
+		}
+		// Individual closeout of an open project applies only to the exact
+		// current run. Task closure may additionally remove older owned runs.
+		if d.Task.Status != api.TaskClosed && a.RunID != s.Run {
+			continue
+		}
+		if a.RunID == s.Run {
+			seen[s.Agent] = true
 		}
 		err = stopOwnedSession(ctx, s)
 		message := ""
@@ -196,19 +205,31 @@ func cleanupSessions(ctx context.Context, e env, task string, selected []string)
 		}
 	}
 	if len(selected) > 0 {
-		d, err := get(task)
+		// Receipt processing may have removed older sessions. Re-read tmux before
+		// deciding whether an already-absent selected run can be confirmed.
+		sessions, err = localSessions(ctx)
 		if err != nil {
 			return result, err
 		}
-		if d.Task.Status != api.TaskClosed {
-			return result, errors.New("task is still open")
+		d, err := get(task)
+		if err != nil {
+			return result, err
 		}
 		for _, id := range selected {
 			if seen[id] {
 				continue
 			}
+			found := false
 			for _, a := range d.Agents {
-				if a.ID != id || a.CleanupDone {
+				if a.ID != id {
+					continue
+				}
+				found = true
+				if a.CleanupDone {
+					continue
+				}
+				if a.Status != api.AgentClosed {
+					result.Errors = append(result.Errors, "Agent is not closed")
 					continue
 				}
 				occupied := false
@@ -228,13 +249,16 @@ func cleanupSessions(ctx context.Context, e env, task string, selected []string)
 					result.Confirmed++
 				}
 			}
+			if !found {
+				result.Errors = append(result.Errors, "Agent is not registered")
+			}
 		}
 	}
 	return result, nil
 }
 func cmdCleanup(e env, args []string) error {
 	fs := flag.NewFlagSet("cleanup", flag.ContinueOnError)
-	task := fs.String("task", e.task, "closed task id")
+	task := fs.String("task", e.task, "task containing closed agents")
 	hub := fs.String("hub", e.hub, "hub URL")
 	agents := fs.String("agents", "", "agent IDs assigned to this host")
 	jsonOut := fs.Bool("json", false, "JSON result")
@@ -242,7 +266,7 @@ func cmdCleanup(e env, args []string) error {
 		return err
 	}
 	if !api.ValidID(*task, "tsk") {
-		return errors.New("a valid closed task id is required")
+		return errors.New("a valid task id is required")
 	}
 	var selected []string
 	if *agents != "" {

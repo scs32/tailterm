@@ -111,8 +111,10 @@ export function createHubClient({ fetchImpl, baseURL, token = "" }) {
       request(`/v1/tasks/${task}/agents/${agent}/work-context` + q({ runId })),
     updateAgent: (task, agent, body) =>
       request(`/v1/tasks/${task}/agents/${agent}`, { method: "PATCH", body }),
-    closeAgent: (task, agent) =>
-      request(`/v1/tasks/${task}/agents/${agent}`, { method: "DELETE" }),
+    closeAgent: (task, agent, runId) =>
+      request(`/v1/tasks/${task}/agents/${agent}` + q({ runId }), {
+        method: "DELETE",
+      }),
     postMessage: (task, body) =>
       request(`/v1/tasks/${task}/messages`, { method: "POST", body }),
     listMessages: async (task, params = {}) =>

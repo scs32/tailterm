@@ -118,3 +118,52 @@ test("existing task terminals resolve a machine's different local hostname", asy
   assert.equal(hub.matchServer("Stephens-Mini").id, "mini");
   assert.deepEqual(notices, []);
 });
+
+test("individual cleanup retries one closed agent while its project stays open", async () => {
+  const taskId = "tsk_0123456789abcdef";
+  const agentId = "agt_0123456789abcdef";
+  let cleaned = false;
+  const commands = [];
+  const detail = () => ({
+    task: { id: taskId, name: "Open project", status: "open" },
+    agents: [
+      {
+        id: agentId,
+        runId: "run_0123456789abcdef",
+        name: "finished-worker",
+        host: "Mini",
+        session: "finished-worker",
+        status: "closed",
+        cleanupDone: cleaned,
+      },
+    ],
+    latestSeq: 0,
+  });
+  const machine = { id: "mini", name: "Mini", host: "Mini" };
+  const hub = createTaskHub({
+    getData: () => ({ hub: { url: "http://hub" } }),
+    getIPN: () => ({
+      fetch: async () => ({
+        status: 200,
+        text: async () => JSON.stringify(detail()),
+      }),
+    }),
+    getServers: () => [machine],
+    getTabs: () => [],
+    paneGroups: () => ({ model: { groups: [] } }),
+    browserCommand: async (server, command) => {
+      commands.push([server.id, command]);
+      cleaned = true;
+      return JSON.stringify({ confirmed: 1, errors: [] });
+    },
+    render() {},
+  });
+  hub.refresh();
+  const result = await hub.cleanupAgent(taskId, agentId);
+  assert.equal(result.cleanupDone, true);
+  assert.deepEqual(result.cleanupErrors, []);
+  assert.equal(commands.length, 1);
+  assert.equal(commands[0][0], "mini");
+  assert.match(commands[0][1], new RegExp(agentId));
+  assert.equal(detail().task.status, "open");
+});

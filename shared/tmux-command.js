@@ -341,7 +341,7 @@ export function agentCleanupCommand(hub, task, agents) {
     "/bin/sh -c " +
     shellQuote(
       ttResolver(
-        "printf 'Update the tt CLI on this host to clean up task sessions.\\n' >&2; exit 127",
+        "printf 'Update the tt CLI on this host to clean up agent sessions.\\n' >&2; exit 127",
       ) + `exec "$tailterm_tt" ${args.map(shellQuote).join(" ")}`,
     )
   );

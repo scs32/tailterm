@@ -293,10 +293,11 @@ func (s *Store) CloseTask(ctx context.Context, id string, by api.Caller) (api.Ta
 			}
 		}
 	}
-	if _, err := s.db.ExecContext(ctx, `UPDATE agents SET cleanup_done=0,cleanup_error='' WHERE task_id=?`, id); err != nil {
-		return t, err
+	for _, a := range agents {
+		if !a.CleanupDone {
+			t.CleanupPending++
+		}
 	}
-	t.CleanupPending = len(agents)
 	now := s.now()
 	if _, err := s.db.ExecContext(ctx, `UPDATE tasks SET status=?, closed_at=? WHERE id=?`, api.TaskClosed, ts(now), id); err != nil {
 		return t, err

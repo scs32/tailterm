@@ -103,8 +103,17 @@ print integration instructions without changing global runtime settings.
 
 A completed turn, an exited process, and a request for human input have distinct
 labels. The wrapper sends a heartbeat every 30 seconds; after 90 seconds without
-one, the UI reports offline. Restarting an exited agent on the same machine
-retains its name, ID and inbox, with a fresh run ID.
+one, the UI reports offline. Restarting an unbound exited agent on the same
+machine retains its name, ID and inbox, with a fresh run ID. Item-bound
+implementation workers instead use a fresh identity and context for each new
+bug or feature.
+
+After an accepted worker handoff and resolved dependencies, `tt close NAME`
+records exact-run closure and safely terminates only that worker's matching owned
+tmux session while the project remains open. Closure intent and verified cleanup
+are separate; pending receipts stay visible and retryable under project settings.
+Use retirement only for intentional temporary retention of the same item context.
+The project orchestrator and active database handler remain available.
 
 Closing a task records it closed, removes mirrored panes, and requests termination
 of its agent tmux sessions, including retired agents. Cleanup runs through browser

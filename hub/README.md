@@ -60,7 +60,7 @@ the inbox at checkpoints. On hosts with a compatible Codex CLI and `tt relay`,
 the relay binds exact thread/run identities and uses native `codex queue` to wake
 eligible idle agents. Other runtimes depend on their hooks/checkpoints. See
 [delivery details](../docs/tasks.md). The relay also performs durable cleanup of
-sessions belonging to closed tasks.
+individually closed agents and of all agents belonging to closed tasks.
 
 `tt hooks claude` prints settings for SessionStart, UserPromptSubmit, Stop and
 Notification. Merge these with your existing Claude settings if desired.
@@ -80,9 +80,11 @@ identity and inbox, but a new run ID. Events carrying the previous run ID are
 rejected. Closing/hiding a pane does not remove the agent from its task, and
 hidden panes stay hidden until reopened. Closing a task records it closed and
 removes mirrored panes and requests termination of the task's owned tmux sessions,
-including retired agents. Browser SSH actions and the host relay perform cleanup;
-offline hosts remain pending until confirmation. Retirement alone preserves the
-session. See [cleanup and history](../docs/task-cleanup.md).
+including retired agents. An accepted worker can be closed separately with an
+exact run-scoped `tt close` while the project stays open. Browser SSH actions and
+the host relay perform cleanup; offline hosts remain pending until confirmation.
+Retirement alone preserves the session for intentional temporary retention. See
+[cleanup and history](../docs/task-cleanup.md).
 
 Replies reference the original message sequence. Read receipts mean retrieval,
 not completion or acceptance. The Board previews the latest 200 messages. Closed tasks can load the full

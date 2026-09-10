@@ -159,9 +159,11 @@ func (c *Client) UpdateAgent(ctx context.Context, task, agent string, req Update
 	return out, c.do(ctx, "PATCH", "/v1/tasks/"+task+"/agents/"+agent, req, &out)
 }
 
-func (c *Client) CloseAgent(ctx context.Context, task, agent string) (Agent, error) {
+func (c *Client) CloseAgent(ctx context.Context, task, agent, runID string) (Agent, error) {
 	var out Agent
-	return out, c.do(ctx, "DELETE", "/v1/tasks/"+task+"/agents/"+agent, nil, &out)
+	q := url.Values{}
+	q.Set("runId", runID)
+	return out, c.do(ctx, "DELETE", "/v1/tasks/"+task+"/agents/"+agent+"?"+q.Encode(), nil, &out)
 }
 
 func (c *Client) PostMessage(ctx context.Context, task string, req PostMessageRequest) (Message, error) {

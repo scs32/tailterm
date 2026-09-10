@@ -380,7 +380,7 @@ func (s *Server) closeAgent(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	a, err := s.store.CloseAgent(r.Context(), a.ID, c)
+	a, err := s.store.CloseAgentRun(r.Context(), a.ID, r.URL.Query().Get("runId"), c)
 	if err != nil {
 		fail(w, err)
 		return

@@ -82,6 +82,13 @@ cycles; explicit retirement remains respected. Closing a project
 includes the handler in the existing durable session-cleanup process and keeps
 the saved records.
 
+Each implementation worker is dedicated to one bounded bug or feature. After
+the handler's recorded result and lead acceptance resolve its dependencies, the
+worker is closed through its exact run and durable cleanup receipt while the
+project stays open. A later item receives a fresh identity and context. Retirement
+means intentional temporary retention for same-item follow-up, not completed-item
+closeout.
+
 The browser saves the handler's resolved launch plan and stable agent identity in
 its encrypted local vault before SSH launch. Retry uses that identity. Host-side
 recovery must verify the exact project, agent and run before reusing a session;

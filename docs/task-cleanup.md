@@ -1,4 +1,12 @@
-# Closing a task
+# Closing agents and tasks
+
+`tt close NAME` closes one accepted worker while its project remains open. It
+binds the intent to the exact current agent/run and uses the same durable host
+receipt and tmux ownership checks as task cleanup. Closure intent is not a claim
+that the session stopped: `cleanupDone` confirms termination, while
+`cleanupError` remains retryable. A fresh bug or feature uses a fresh session and
+context. `tt retire` remains available for intentional temporary retention of
+the same item session.
 
 Close task stops the task's agent tmux sessions, including retired agents and
 helpers, and removes their terminal panes. Messages and task history remain on
@@ -23,8 +31,9 @@ saved host. An unavailable or unverifiable host remains pending rather than
 claiming success.
 
 Retire remains different: it disables automatic inbox wake-ups while keeping
-the terminal available for inspection. Close task is the explicit end of the
-whole task and terminates any running work in its agent sessions.
+the terminal available for inspection. Individual closeout stops one completed
+worker and keeps the project open. Close task is the explicit end of the whole
+project and terminates any running work in all its agent sessions.
 
 ## Saved history
 

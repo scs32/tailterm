@@ -13,11 +13,7 @@ func (s *Store) ReportCleanup(ctx context.Context, id string, req api.CleanupReq
 	if err != nil {
 		return a, err
 	}
-	task, err := s.GetTask(ctx, a.TaskID)
-	if err != nil {
-		return a, err
-	}
-	if task.Status != api.TaskClosed || a.Status != api.AgentClosed || req.RunID == "" || req.RunID != a.RunID || !api.ValidText(req.Error, 500) {
+	if a.Status != api.AgentClosed || req.RunID == "" || req.RunID != a.RunID || !api.ValidText(req.Error, 500) {
 		return a, api.ErrInvalid
 	}
 	done := req.Error == ""

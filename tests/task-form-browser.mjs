@@ -610,6 +610,43 @@ try {
         "secondary",
         "secondary",
       ]);
+      const closeResponse = await fetch(
+        `http://127.0.0.1:${port}/v1/tasks/${teamTask.id}/agents/${blockedAgent.id}?runId=${blockedAgent.runId}`,
+        { method: "DELETE" },
+      );
+      assert.equal(closeResponse.status, 200);
+      let closedWorker = await closeResponse.json();
+      assert.equal(closedWorker.status, "closed");
+      assert.equal(closedWorker.cleanupDone, false);
+      let openDetail = await (
+        await fetch(`http://127.0.0.1:${port}/v1/tasks/${teamTask.id}`)
+      ).json();
+      assert.equal(openDetail.task.status, "open");
+      await page.evaluate((id) => qa.hub.settings(id), teamTask.id);
+      await page.locator("#task-settings details > summary").click();
+      const cleanupRetry = page.locator(
+        `[data-agent-cleanup="${blockedAgent.id}"]`,
+      );
+      await cleanupRetry.waitFor();
+      await page.screenshot({
+        path: `.build/agent-cleanup-pending-${name}.png`,
+      });
+      await cleanupRetry.click();
+      await page.waitForFunction(
+        (id) => !document.querySelector(`[data-agent-cleanup="${id}"]`),
+        blockedAgent.id,
+      );
+      closedWorker = await (
+        await fetch(
+          `http://127.0.0.1:${port}/v1/tasks/${teamTask.id}/agents/${blockedAgent.id}`,
+        )
+      ).json();
+      assert.equal(closedWorker.cleanupDone, true);
+      openDetail = await (
+        await fetch(`http://127.0.0.1:${port}/v1/tasks/${teamTask.id}`)
+      ).json();
+      assert.equal(openDetail.task.status, "open");
+      await page.locator("#dialog-close").click();
       await page.evaluate(() => qa.modes.set("teams"));
       await page.locator("[data-add-team]").click();
       const target = (await getTasks()).find(

@@ -45,8 +45,8 @@ Commands
                                start a sibling agent session on this host
   retire [AGENT]              disable inbox wake-ups; preserve terminal and results
   resume [AGENT]              re-enable inbox wake-ups for a retired agent
-  close [AGENT]                close an agent session on this host (default: self)
-  cleanup --task ID [--json]  stop local sessions belonging to a closed task
+  close [--json] [AGENT]       exact-run closeout on this host (default: self)
+  cleanup --task ID [--json]   retry exact cleanup for closed local agents
   watch                        deprecated; inbox delivery never types into panes
   wrap -- CMD                  run CMD, reporting started/exited to the hub
   tools [--runtime APP] [--cwd DIR] [--json]  inspect host or current Codex thread tools
@@ -323,6 +323,29 @@ func resolveAgent(ctx context.Context, c *api.Client, task, ref string) (string,
 		}
 	}
 	return "", fmt.Errorf("no open agent named %q on this task", ref)
+}
+
+func resolveCloseAgent(ctx context.Context, c *api.Client, task, ref string) (string, error) {
+	if ref == "" || api.ValidID(ref, "agt") {
+		return ref, nil
+	}
+	agents, err := c.ListAgents(ctx, task)
+	if err != nil {
+		return "", err
+	}
+	var matches []api.Agent
+	for _, a := range agents {
+		if a.Name == ref && (a.Status != api.AgentClosed || !a.CleanupDone) {
+			matches = append(matches, a)
+		}
+	}
+	if len(matches) == 1 {
+		return matches[0].ID, nil
+	}
+	if len(matches) > 1 {
+		return "", fmt.Errorf("multiple current or pending agents are named %q; use the exact agent ID", ref)
+	}
+	return "", fmt.Errorf("no current or pending agent named %q on this task", ref)
 }
 
 func cmdPost(e env, args []string) error {
@@ -717,12 +740,12 @@ func cmdSpawn(e env, args []string) error {
 		if agent.WorkItem != nil {
 			workContext, contextErr := c.GetAgentWorkItemContext(ctx, *task, agent.ID, agent.RunID)
 			if contextErr != nil {
-				_, _ = c.CloseAgent(ctx, *task, agent.ID)
+				_, _ = c.CloseAgent(ctx, *task, agent.ID, agent.RunID)
 				return fmt.Errorf("restore work-item context: %w", contextErr)
 			}
 			contextBriefing, contextErr := formatWorkItemContext(workContext)
 			if contextErr != nil {
-				_, _ = c.CloseAgent(ctx, *task, agent.ID)
+				_, _ = c.CloseAgent(ctx, *task, agent.ID, agent.RunID)
 				return contextErr
 			}
 			briefing += contextBriefing
@@ -739,7 +762,7 @@ func cmdSpawn(e env, args []string) error {
 		// a second copy in tmux's environment can exceed tmux's command limit.
 		delete(opts.Env, "TAILTERM_BRIEFING")
 		if err = spawn.Create(opts); err != nil {
-			_, _ = c.CloseAgent(ctx, *task, agent.ID)
+			_, _ = c.CloseAgent(ctx, *task, agent.ID, agent.RunID)
 			return err
 		}
 	}
@@ -758,6 +781,7 @@ func cmdSpawn(e env, args []string) error {
 func cmdClose(e env, args []string) error {
 	fs := flag.NewFlagSet("close", flag.ExitOnError)
 	task := fs.String("task", e.task, "task id")
+	jsonOut := fs.Bool("json", false, "JSON result")
 	_ = fs.Parse(args)
 	ref := e.agent
 	if fs.NArg() > 0 {
@@ -772,7 +796,7 @@ func cmdClose(e env, args []string) error {
 	}
 	ctx, cancel := ctxTimeout(10 * time.Second)
 	defer cancel()
-	id, err := resolveAgent(ctx, c, *task, ref)
+	id, err := resolveCloseAgent(ctx, c, *task, ref)
 	if err != nil {
 		return err
 	}
@@ -780,17 +804,46 @@ func cmdClose(e env, args []string) error {
 	if err != nil {
 		return err
 	}
+	detail, err := c.GetTask(ctx, *task)
+	if err != nil {
+		return err
+	}
+	if a.Role == api.AgentRoleDatabaseHandler {
+		return errors.New("the active database handler remains available while the project is open")
+	}
+	if detail.Task.Status == api.TaskOpen && detail.Task.Orchestrator != "" && strings.EqualFold(a.Name, detail.Task.Orchestrator) {
+		return errors.New("the project orchestrator remains available while the project is open")
+	}
 	if a.Host != spawn.Host() {
 		return fmt.Errorf("agent %s runs on %s; tt close only controls sessions on this host", a.Name, a.Host)
 	}
-	if _, err := c.CloseAgent(ctx, *task, id); err != nil {
+	if _, err := rememberSessions(ctx, e.hub); err != nil {
+		return fmt.Errorf("verify local session ownership: %w", err)
+	}
+	if _, err := c.CloseAgent(ctx, *task, id, a.RunID); err != nil {
 		return err
 	}
 	if a.ID == e.agent {
 		fmt.Println("closing this session")
 	}
-	if spawn.HasSession(a.Session) {
-		return spawn.Kill(a.Session)
+	result, err := cleanupSessions(ctx, e, *task, []string{id})
+	if err != nil {
+		return err
+	}
+	if len(result.Errors) > 0 {
+		return errors.New(strings.Join(result.Errors, "; "))
+	}
+	confirmed, err := c.GetAgent(ctx, *task, id)
+	if err != nil {
+		return fmt.Errorf("verify cleanup receipt: %w", err)
+	}
+	if !confirmed.CleanupDone {
+		return errors.New("cleanup receipt pending; will retry")
+	}
+	if *jsonOut {
+		printJSON(confirmed)
+	} else {
+		fmt.Printf("Closed %s (%s); session cleanup confirmed.\n", confirmed.Name, confirmed.RunID)
 	}
 	return nil
 }
