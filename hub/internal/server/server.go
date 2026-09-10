@@ -32,6 +32,7 @@ func New(st *store.Store, identity Identity) *Server {
 	s.profileRoutes()
 	m := s.mux
 	m.HandleFunc("GET /v1/whoami", s.whoami)
+	m.HandleFunc("GET /v1/capabilities", s.capabilities)
 	m.HandleFunc("GET /v1/tasks", s.listTasks)
 	m.HandleFunc("POST /v1/tasks", s.createTask)
 	m.HandleFunc("GET /v1/work-items", s.listAllWorkItems)
@@ -56,6 +57,8 @@ func New(st *store.Store, identity Identity) *Server {
 	m.HandleFunc("GET /v1/tasks/{id}/message-audit/changes", s.listMessageAuditChanges)
 	m.HandleFunc("POST /v1/tasks/{id}/message-audit/associations", s.createMessageAuditAssociation)
 	m.HandleFunc("GET /v1/tasks/{id}/message-audit/associations/receipts/{requestID}", s.getMessageAuditAssociationReceipt)
+	m.HandleFunc("POST /v1/tasks/{id}/audit-exports", s.createAuditExport)
+	m.HandleFunc("GET /v1/tasks/{id}/audit-exports/{exportID}", s.getAuditExportChunk)
 	m.HandleFunc("POST /v1/tasks/{id}/decisions", s.createDecision)
 	m.HandleFunc("GET /v1/tasks/{id}/decisions", s.listDecisions)
 	m.HandleFunc("POST /v1/tasks/{id}/decisions/{seq}/answer", s.answerDecision)
@@ -154,8 +157,16 @@ func fail(w http.ResponseWriter, err error) {
 		writeError(w, http.StatusConflict, "limit reached")
 	case errors.Is(err, api.ErrClosed):
 		writeError(w, http.StatusConflict, "task is closed")
+	case errors.Is(err, api.ErrExpired):
+		writeJSON(w, http.StatusGone, api.ErrorResponse{Error: "audit export expired or unavailable", Code: "export-expired"})
 	default:
 		writeError(w, http.StatusInternalServerError, "internal error")
+	}
+}
+
+func (s *Server) capabilities(w http.ResponseWriter, r *http.Request) {
+	if _, ok := s.caller(w, r); ok {
+		writeJSON(w, http.StatusOK, api.CurrentCapabilities())
 	}
 }
 

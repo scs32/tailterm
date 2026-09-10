@@ -589,6 +589,7 @@ function mount() {
       attachTask: (id) => taskHub.attachToCurrent(id),
       newTask: () => taskHub.newTask(),
       configure: () => taskHub.configure(),
+      intentPersistence: localVault.boardIntentPersistence(),
     });
     tasksView = createTasksView({
       openWorkItems: (kind, id) => {

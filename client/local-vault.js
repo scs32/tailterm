@@ -43,6 +43,44 @@ const empty = () => ({
 });
 const MAX_WORK_ITEM_DRAFTS = 24;
 const MAX_WORK_ITEM_DRAFT_BYTES = 24000;
+export const MAX_BOARD_INTENTS = 32;
+export const MAX_BOARD_INTENT_BYTES = 64 * 1024;
+export const MAX_BOARD_INTENTS_BYTES = 1024 * 1024;
+const vaultEncoder = new TextEncoder();
+function normalizeBoardIntents(value) {
+  if (!Array.isArray(value)) return [];
+  const intents = value
+    .filter(
+      (intent) =>
+        intent &&
+        /^[a-f0-9]{64}$/.test(intent.scope || "") &&
+        typeof intent.id === "string" &&
+        intent.id.length > 0 &&
+        intent.id.length <= 256 &&
+        ["draft", "uncertain"].includes(intent.state) &&
+        typeof intent.requestId === "string" &&
+        intent.requestId.length <= 128 &&
+        typeof intent.updatedAt === "string" &&
+        vaultEncoder.encode(JSON.stringify(intent)).byteLength <=
+          MAX_BOARD_INTENT_BYTES,
+    )
+    .map((intent) => structuredClone(intent));
+  const unique = new Map();
+  for (const intent of intents)
+    unique.set(`${intent.scope}\0${intent.id}`, intent);
+  const out = [...unique.values()].sort((a, b) =>
+    a.updatedAt.localeCompare(b.updatedAt),
+  );
+  if (
+    out.length > MAX_BOARD_INTENTS ||
+    vaultEncoder.encode(JSON.stringify(out)).byteLength >
+      MAX_BOARD_INTENTS_BYTES
+  )
+    throw new Error(
+      "Board intent storage is full. Retry, recover, or discard an existing intent before saving another.",
+    );
+  return out;
+}
 function normalizeWorkItemDrafts(value) {
   if (!Array.isArray(value)) return [];
   return value
@@ -312,6 +350,46 @@ export function workItemDraftPersistence() {
       mutate((d) => {
         requireSameVault();
         d.workItemDrafts = (d.workItemDrafts || []).filter(
+          (entry) => entry.scope !== scope || entry.id !== id,
+        );
+        return true;
+      }),
+  };
+}
+export function boardIntentPersistence() {
+  requireUnlocked();
+  const vaultKey = key;
+  const requireSameVault = () => {
+    requireUnlocked();
+    if (key !== vaultKey)
+      throw new Error("Board intents belong to a different vault unlock.");
+  };
+  return {
+    list: async (scope) => {
+      await queue;
+      requireSameVault();
+      return normalizeBoardIntents(contents.boardIntents).filter(
+        (intent) => intent.scope === scope,
+      );
+    },
+    save: async (intent) => {
+      const copy = normalizeBoardIntents([intent])[0];
+      if (!copy) throw new Error("Invalid Board intent.");
+      await mutate((data) => {
+        requireSameVault();
+        data.boardIntents = normalizeBoardIntents([
+          ...(data.boardIntents || []).filter(
+            (entry) => entry.scope !== copy.scope || entry.id !== copy.id,
+          ),
+          copy,
+        ]);
+        return true;
+      });
+    },
+    remove: async (scope, id) =>
+      mutate((data) => {
+        requireSameVault();
+        data.boardIntents = (data.boardIntents || []).filter(
           (entry) => entry.scope !== scope || entry.id !== id,
         );
         return true;
@@ -717,6 +795,7 @@ function validateData(d) {
     d.servers,
   );
   d.workItemDrafts = normalizeWorkItemDrafts(d.workItemDrafts);
+  d.boardIntents = normalizeBoardIntents(d.boardIntents);
   d.launchProfiles = (Array.isArray(d.launchProfiles) ? d.launchProfiles : [])
     .filter(
       (p) =>

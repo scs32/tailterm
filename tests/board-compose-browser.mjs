@@ -25,7 +25,13 @@ let web;
 let origin = "";
 let hold = null;
 let loseNextResponse = false;
+let loseNextExportCreate = false;
+let failNextExportChunk = false;
+let failNextAuditMutation = false;
 const attempts = [];
+const exportAttempts = [];
+const exportChunks = [];
+const auditMutationAttempts = [];
 
 const pause = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 async function waitFor(check, label) {
@@ -51,6 +57,16 @@ function holdNextMessage() {
   hold = { started, releasePromise };
   return { started: startedPromise, release };
 }
+async function selectAuditKind(page, value) {
+  const select = page.locator("#board-audit-kind");
+  await select.evaluate((element) => (element.closest("details").open = true));
+  await select.selectOption(value, { force: true });
+  await page.waitForFunction(
+    (expected) =>
+      document.querySelector("#board-audit-kind")?.value === expected,
+    value,
+  );
+}
 
 const html = `<!doctype html><html><head><meta charset="utf-8">
 <link rel="stylesheet" href="/client/style.css"></head><body>
@@ -62,8 +78,13 @@ const task=new URLSearchParams(location.search).get('task');
 const client=createHubClient({baseURL:location.origin,fetchImpl:(url,init)=>fetch(url,init)});
 const notice=text=>document.querySelector('#notice').textContent=text;
 const noop=()=>{};
+const intentPersistence={
+  async list(scope){return JSON.parse(sessionStorage.getItem('intents:'+scope)||'[]')},
+  async save(record){const key='intents:'+record.scope;const rows=JSON.parse(sessionStorage.getItem(key)||'[]');sessionStorage.setItem(key,JSON.stringify([...rows.filter(row=>row.id!==record.id),record]))},
+  async remove(scope,id){const key='intents:'+scope;const rows=JSON.parse(sessionStorage.getItem(key)||'[]');sessionStorage.setItem(key,JSON.stringify(rows.filter(row=>row.id!==id)))},
+};
 const board=createBoardView({client:()=>client,getTabs:()=>[],activate:noop,notice,addAgent:noop,
-  settings:noop,revealAgent:noop,attachTask:noop,newTask:noop,configure:noop});
+  settings:noop,revealAgent:noop,attachTask:noop,newTask:noop,configure:noop,intentPersistence});
 board.mount(document.querySelector('#mode-view'));
 await board.show(task);
 window.qa={board};
@@ -128,7 +149,33 @@ try {
       { agentId: agent.id, text: "Synthetic worker source" },
       201,
     );
-    return { task, agent, source };
+    const primary = await api(
+      "POST",
+      `/v1/tasks/${task.id}/work-items`,
+      {
+        kind: "feature",
+        title: `${label} primary`,
+        description: "Synthetic only",
+        priority: "normal",
+        sourceMessageSeq: source.seq,
+        requestId: `${label}-primary`,
+      },
+      201,
+    );
+    const related = await api(
+      "POST",
+      `/v1/tasks/${task.id}/work-items`,
+      {
+        kind: "bug",
+        title: `${label} related`,
+        description: "Synthetic only",
+        priority: "normal",
+        sourceMessageSeq: source.seq,
+        requestId: `${label}-related`,
+      },
+      201,
+    );
+    return { task, agent, source, primary, related };
   }
   async function messages(project) {
     return (await api("GET", `/v1/tasks/${project.task.id}/messages?limit=200`))
@@ -150,6 +197,17 @@ try {
         const isMessagePost =
           req.method === "POST" &&
           /\/v1\/tasks\/[^/]+\/messages$/.test(url.pathname);
+        const isExportCreate =
+          req.method === "POST" &&
+          /\/v1\/tasks\/[^/]+\/audit-exports$/.test(url.pathname);
+        const isExportChunk =
+          req.method === "GET" &&
+          /\/v1\/tasks\/[^/]+\/audit-exports\/[^/]+$/.test(url.pathname);
+        const isAuditMutation =
+          req.method === "POST" &&
+          /\/v1\/tasks\/[^/]+\/message-audit\/messages\/\d+\/(corrections|resolve)$/.test(
+            url.pathname,
+          );
         let gate = null;
         let lost = false;
         if (isMessagePost) {
@@ -162,6 +220,32 @@ try {
           if (gate) {
             gate.started();
             await gate.releasePromise;
+          }
+        }
+        if (isExportCreate) {
+          exportAttempts.push({ path: url.pathname, body: JSON.parse(raw) });
+          lost = loseNextExportCreate;
+          loseNextExportCreate = false;
+        }
+        if (isExportChunk) {
+          exportChunks.push(req.url);
+          if (failNextExportChunk) {
+            failNextExportChunk = false;
+            res.writeHead(503, { "content-type": "application/json" });
+            res.end(JSON.stringify({ error: "Synthetic chunk interruption" }));
+            return;
+          }
+        }
+        if (isAuditMutation) {
+          auditMutationAttempts.push({
+            path: url.pathname,
+            body: JSON.parse(raw),
+          });
+          if (failNextAuditMutation) {
+            failNextAuditMutation = false;
+            res.writeHead(503, { "content-type": "application/json" });
+            res.end(JSON.stringify({ error: "Synthetic audit interruption" }));
+            return;
           }
         }
         const response = await fetch(hub + req.url, {
@@ -177,14 +261,16 @@ try {
           assert.equal(
             response.status,
             201,
-            "response loss must follow a committed message",
+            "response loss must follow a committed operation",
           );
+          if (isExportCreate) exportAttempts.at(-1).metadata = JSON.parse(text);
           res.writeHead(503, { "content-type": "application/json" });
           res.end(
             JSON.stringify({ error: "Synthetic response lost after commit" }),
           );
           return;
         }
+        if (isExportCreate) exportAttempts.at(-1).metadata = JSON.parse(text);
         res.writeHead(response.status, { "content-type": "application/json" });
         res.end(text);
         return;
@@ -232,7 +318,312 @@ try {
       const postCount = () =>
         attempts.filter((attempt) => attempt.path === path).length;
 
+      await selectAuditKind(page, "intake");
+      await page.locator("#board-text").fill("Explicit synthetic Intake");
+      await page.locator("#board-compose button[type=submit]").click();
+      await waitFor(() => postCount() >= 1, `${name} Intake post`);
+      assert.equal(
+        attempts.filter((attempt) => attempt.path === path).at(-1).body
+          .auditKind,
+        "intake",
+      );
+      const intakeRow = page
+        .locator(".board-message", { hasText: "Explicit synthetic Intake" })
+        .last();
+      await intakeRow.locator('[data-audit-kind="intake"]').waitFor();
+      await intakeRow.locator("[data-audit-resolve-open]").click();
+      await intakeRow
+        .locator('[data-audit-resolve] input[name="existing"]')
+        .fill(fixture.primary.id);
+      await intakeRow
+        .locator('[data-audit-resolve] input[name="existingRevision"]')
+        .fill(String(fixture.primary.revision));
+      await intakeRow
+        .locator('[data-audit-resolve] input[name="reason"]')
+        .fill("Synthetic intake has an exact owner.");
+      await intakeRow
+        .locator('[data-audit-resolve] textarea[name="sources"]')
+        .fill(`${fixture.task.id}#${fixture.source.seq}`);
+      await intakeRow
+        .locator('[data-audit-resolve] button[type="submit"]')
+        .click();
+      await intakeRow.locator('[data-audit-kind="work"]').waitFor();
+
+      await selectAuditKind(page, "intake");
+      await page.locator("#board-text").fill("Persistent new-item Intake");
+      await page.locator("#board-compose button[type=submit]").click();
+      const newItemRow = page
+        .locator(".board-message", { hasText: "Persistent new-item Intake" })
+        .last();
+      await newItemRow.locator('[data-audit-kind="intake"]').waitFor();
+      await newItemRow.locator("[data-audit-resolve-open]").click();
+      const resolveForm = newItemRow.locator("[data-audit-resolve]");
+      await resolveForm.locator('select[name="target"]').selectOption("new");
+      await resolveForm.locator('select[name="kind"]').selectOption("feature");
+      await resolveForm
+        .locator('input[name="title"]')
+        .fill("Synthetic recovered feature");
+      await resolveForm
+        .locator('input[name="reason"]')
+        .fill("Exercise pinned new-item recovery.");
+      await resolveForm
+        .locator('textarea[name="sources"]')
+        .fill(`${fixture.task.id}#${fixture.source.seq}`);
+      await page.evaluate(() => qa.board.reload());
+      assert.equal(
+        await resolveForm.locator('select[name="target"]').inputValue(),
+        "new",
+      );
+      assert.equal(
+        await resolveForm.locator('select[name="kind"]').inputValue(),
+        "feature",
+      );
+      assert.equal(
+        await resolveForm.locator('input[name="title"]').inputValue(),
+        "Synthetic recovered feature",
+      );
+      const resolveAttemptStart = auditMutationAttempts.length;
+      failNextAuditMutation = true;
+      await resolveForm.locator('button[type="submit"]').click();
+      const resolveIntent = page.locator(".board-intent-recovery", {
+        hasText: "Uncertain resolve",
+      });
+      await resolveIntent.waitFor();
+      await page.evaluate(() => qa.board.hide());
+      await page.reload();
+      const restoredNewItemRow = page
+        .locator(".board-message", { hasText: "Persistent new-item Intake" })
+        .last();
+      const restoredResolve = restoredNewItemRow.locator(
+        "[data-audit-resolve]",
+      );
+      assert.equal(
+        await restoredResolve.locator('select[name="target"]').inputValue(),
+        "new",
+      );
+      assert.equal(
+        await restoredResolve.locator('select[name="kind"]').inputValue(),
+        "feature",
+      );
+      assert.match(
+        await restoredResolve.locator("strong").innerText(),
+        /pinned r1/,
+      );
+      await page
+        .locator(".board-intent-recovery", { hasText: "Uncertain resolve" })
+        .locator("[data-intent-retry]")
+        .click();
+      await restoredNewItemRow.locator('[data-audit-kind="work"]').waitFor();
+      assert.equal(auditMutationAttempts.length, resolveAttemptStart + 2);
+      assert.deepEqual(
+        auditMutationAttempts.at(-1).body,
+        auditMutationAttempts.at(-2).body,
+        `${name}: resolution recovery changed pinned intent`,
+      );
+      assert.equal(auditMutationAttempts.at(-1).body.expectedRevision, 1);
+      assert.equal(auditMutationAttempts.at(-1).body.newItem.kind, "feature");
+
+      await selectAuditKind(page, "work");
+      await page.locator("#board-primary-task").fill(fixture.task.id);
+      await page.locator("#board-primary-item").fill(fixture.primary.id);
+      await page
+        .locator("#board-primary-revision")
+        .fill(String(fixture.primary.revision));
+      await page.locator("#board-order-task").fill(fixture.task.id);
+      await page.locator("#board-order-seq").fill(String(fixture.source.seq));
+      await page
+        .locator("#board-related")
+        .fill(
+          `${fixture.task.id}/${fixture.related.id}@${fixture.related.revision}`,
+        );
+      await page.locator("#board-text").fill("Explicit synthetic Work");
+      const beforeCorrectionCount = (await messages(fixture)).length + 1;
+      await page.locator("#board-compose button[type=submit]").click();
+      const workRow = page
+        .locator(".board-message", { hasText: "Explicit synthetic Work" })
+        .last();
+      await workRow.locator('[data-audit-kind="work"]').waitFor();
+      await workRow.locator("[data-reply]").click();
+      assert.equal(
+        await page.locator("#board-audit-kind").inputValue(),
+        "work",
+      );
+      assert.equal(
+        await page.locator("#board-primary-item").inputValue(),
+        fixture.primary.id,
+      );
+      assert.equal(
+        await page.locator("#board-order-seq").inputValue(),
+        String(fixture.source.seq),
+      );
+      await page.locator("#board-cancel-reply").click();
+      await page.locator("#board-audit-kind").selectOption("");
+      await workRow.locator("[data-audit-correct-open]").click();
+      await workRow
+        .locator('[data-audit-correct] select[name="classification"]')
+        .selectOption("intake");
+      await workRow
+        .locator('[data-audit-correct] input[name="reason"]')
+        .fill("Synthetic reclassification without a new message.");
+      await workRow
+        .locator('[data-audit-correct] textarea[name="sources"]')
+        .fill(`${fixture.task.id}#${fixture.source.seq}`);
+      await page.evaluate(() => qa.board.reload());
+      assert.equal(
+        await workRow
+          .locator('[data-audit-correct] select[name="classification"]')
+          .inputValue(),
+        "intake",
+      );
+      assert.equal(
+        await workRow
+          .locator('[data-audit-correct] input[name="reason"]')
+          .inputValue(),
+        "Synthetic reclassification without a new message.",
+      );
+      const correctionAttemptStart = auditMutationAttempts.length;
+      failNextAuditMutation = true;
+      await workRow
+        .locator('[data-audit-correct] button[type="submit"]')
+        .click();
+      const correctionIntent = page.locator(".board-intent-recovery", {
+        hasText: "Uncertain correct",
+      });
+      await correctionIntent.waitFor();
+      assert.equal(
+        await workRow
+          .locator('[data-audit-correct] input[name="reason"]')
+          .inputValue(),
+        "Synthetic reclassification without a new message.",
+      );
+      await page.evaluate(() => qa.board.hide());
+      await page.reload();
+      const restoredWorkRow = page
+        .locator(".board-message", { hasText: "Explicit synthetic Work" })
+        .last();
+      assert.equal(
+        await restoredWorkRow
+          .locator('[data-audit-correct] select[name="classification"]')
+          .inputValue(),
+        "intake",
+      );
+      const restoredCorrectionIntent = page.locator(".board-intent-recovery", {
+        hasText: "Uncertain correct",
+      });
+      await restoredCorrectionIntent.locator("[data-intent-retry]").click();
+      await workRow.locator('[data-audit-kind="intake"]').waitFor();
+      assert.equal(auditMutationAttempts.length, correctionAttemptStart + 2);
+      assert.deepEqual(
+        auditMutationAttempts.at(-1).body,
+        auditMutationAttempts.at(-2).body,
+        `${name}: correction recovery changed pinned intent`,
+      );
+      const correctedContext = await workRow
+        .locator(".message-audit")
+        .innerText();
+      assert.match(correctedContext, /Original: work/);
+      assert.match(correctedContext, /Current: intake/);
+      assert.match(correctedContext, new RegExp(fixture.primary.id));
+      await workRow.locator("[data-audit-history]").click();
+      const correctionHistory = workRow.locator(".message-audit-history");
+      await correctionHistory.waitFor();
+      const historyText = await correctionHistory.textContent();
+      assert.match(historyText, /Before: work/);
+      assert.match(historyText, /After: intake/);
+      assert.match(historyText, /Actor:/);
+      assert.match(historyText, /Sources:/);
+      assert.equal(
+        (await messages(fixture)).length,
+        beforeCorrectionCount,
+        `${name}: correction created a new message`,
+      );
+      const openDownload = page.waitForEvent("download");
+      await page.locator("#board-audit-export").click();
+      const openPath = await (await openDownload).path();
+      const openExport = JSON.parse(await readFile(openPath, "utf8"));
+      assert.equal(openExport.formatVersion, 2);
+      assert.equal(openExport.sourceProject, fixture.task.id);
+      assert.ok(
+        openExport.streams.messageAuditEvents.some(
+          (event) => event.operation === "correct",
+        ),
+        `${name}: open Board export omitted audit correction`,
+      );
+
+      const lostCreateStart = exportAttempts.length;
+      loseNextExportCreate = true;
+      await page.locator("#board-audit-export").click();
+      const lostIntent = page.locator(".board-intent-recovery", {
+        hasText: "Uncertain export",
+      });
+      await lostIntent.waitFor();
+      assert.equal(exportAttempts.length, lostCreateStart + 1);
+      const lostRequest = exportAttempts.at(-1);
+      await lostIntent.locator("[data-intent-recover]").click();
+      await waitFor(
+        async () =>
+          exportAttempts.length === lostCreateStart + 2 &&
+          exportAttempts.at(-1).metadata,
+        `${name} export receipt recovery`,
+      );
+      assert.deepEqual(
+        exportAttempts.at(-1).body,
+        lostRequest.body,
+        `${name}: export receipt recovery changed intent`,
+      );
+      assert.equal(
+        exportAttempts.at(-1).metadata.id,
+        lostRequest.metadata.id,
+        `${name}: export receipt recovery changed frozen ID`,
+      );
+      const lostDownload = page.waitForEvent("download");
+      await lostIntent.locator("[data-intent-retry]").click();
+      const lostPath = await (await lostDownload).path();
+      assert.equal(
+        JSON.parse(await readFile(lostPath, "utf8")).sourceProject,
+        fixture.task.id,
+      );
+      await lostIntent.waitFor({ state: "detached" });
+
+      const interruptedCreateStart = exportAttempts.length;
+      const interruptedChunkStart = exportChunks.length;
+      failNextExportChunk = true;
+      await page.locator("#board-audit-export").click();
+      const interruptedIntent = page.locator(".board-intent-recovery", {
+        hasText: "Uncertain export",
+      });
+      await interruptedIntent.waitFor();
+      await waitFor(
+        async () =>
+          exportAttempts.length === interruptedCreateStart + 1 &&
+          exportAttempts.at(-1).metadata,
+        `${name} interrupted export metadata`,
+      );
+      const interruptedID = exportAttempts.at(-1).metadata.id;
+      const interruptedDownload = page.waitForEvent("download");
+      await interruptedIntent.locator("[data-intent-retry]").click();
+      await (await interruptedDownload).path();
+      assert.equal(
+        exportAttempts.length,
+        interruptedCreateStart + 1,
+        `${name}: chunk retry created a replacement export`,
+      );
+      const retryChunks = exportChunks.slice(interruptedChunkStart);
+      assert.ok(retryChunks.length >= 2, `${name}: no interrupted chunk retry`);
+      assert.ok(
+        retryChunks.every((url) =>
+          url.includes(`/audit-exports/${interruptedID}`),
+        ),
+        `${name}: chunk retry changed immutable export ID`,
+      );
+      await interruptedIntent.waitFor({ state: "detached" });
+
       await input.focus();
+      assert.equal(
+        await input.inputValue(),
+        "",
+        `${name}: confirmed post draft was not cleared`,
+      );
       const emptyBefore = postCount();
       await page.keyboard.press("Enter");
       await pause(75);
@@ -473,6 +864,20 @@ try {
         retried[0].postReceipt.requestId,
         failureAttempts[0].body.requestId,
       );
+      await api("DELETE", `/v1/tasks/${fixture.task.id}`);
+      await page.evaluate(() => qa.board.hide());
+      await page.reload();
+      await page.locator("#board-audit-export").waitFor();
+      const closedWorkRow = page
+        .locator(".board-message", { hasText: "Explicit synthetic Work" })
+        .last();
+      await closedWorkRow.locator("[data-audit-history]").click();
+      await closedWorkRow.locator(".message-audit-history").waitFor();
+      const closedDownload = page.waitForEvent("download");
+      await page.locator("#board-audit-export").click();
+      const closedPath = await (await closedDownload).path();
+      const closedExport = JSON.parse(await readFile(closedPath, "utf8"));
+      assert.equal(closedExport.streams.task[0].status, "closed");
       assert.deepEqual(pageErrors, [], `${name}: browser errors`);
       results.push(name);
       await page.evaluate(() => qa.board.hide());
@@ -481,7 +886,7 @@ try {
     }
   }
   console.log(
-    `Board composer passed in ${results.join(", ")}: real Enter, Shift+Enter multiline, synthetic composition/repeat guards, empty/disabled/pending suppression, recipient/cancel retention, and committed failure retry exactly once.`,
+    `Board audit/composer passed in ${results.join(", ")}: explicit Intake/work/related/resolve/correct, open+closed verified v2 exports, real Enter, Shift+Enter, synthetic composition/repeat guards, recipient/cancel retention, and committed failure retry exactly once.`,
   );
 } finally {
   if (web) await new Promise((resolve) => web.close(resolve));

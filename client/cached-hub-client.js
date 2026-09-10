@@ -19,6 +19,10 @@ export function createCachedHubClient({
   const listeners = new Set(),
     pending = new Map(),
     checked = new Map();
+  const auditJobs = new Map(),
+    auditEpochs = new Map(),
+    auditMemory = new Map(),
+    auditSaveQueues = new Map();
   const paths = new Set(),
     dirty = new Set(),
     touched = new Map(),
@@ -196,6 +200,8 @@ export function createCachedHubClient({
   }
   function invalidate() {
     revision++;
+    for (const task of new Set([...auditEpochs.keys(), ...auditMemory.keys()]))
+      auditEpochs.set(task, (auditEpochs.get(task) || 0) + 1);
     for (const path of paths) {
       dirty.add(path);
       checked.delete(path);
@@ -235,15 +241,183 @@ export function createCachedHubClient({
     ).toString();
     return q ? "?" + q : "";
   };
+  const auditKey = (task) => `/v1/tasks/${task}/message-audit/overlay`;
+  async function auditOverlay(task) {
+    if (auditMemory.has(task)) return structuredClone(auditMemory.get(task));
+    const entry = await stored(auditKey(task));
+    const value = entry?.value?.data;
+    if (
+      value?.version === 1 &&
+      value.taskId === task &&
+      value.records &&
+      typeof value.records === "object"
+    ) {
+      auditMemory.set(task, value);
+      saved = true;
+      return structuredClone(value);
+    }
+    return { version: 1, taskId: task, checkpoint: "", records: {} };
+  }
+  async function saveAuditOverlay(task, value, epoch) {
+    const previous = auditSaveQueues.get(task) || Promise.resolve();
+    const save = previous
+      .catch(() => {})
+      .then(async () => {
+        if (disposed) throw new Error("Workspace is locked.");
+        if (auditEpochs.get(task) !== epoch) return false;
+        const before = await auditOverlay(task);
+        if (disposed) throw new Error("Workspace is locked.");
+        if (auditEpochs.get(task) !== epoch) return false;
+        const retained = await cache.put(await scope, auditKey(task), {
+          data: value,
+        });
+        if (!retained)
+          throw new Error(
+            "The current audit overlay exceeds the encrypted 4 MiB cache bound.",
+          );
+        if (disposed) throw new Error("Workspace is locked.");
+        if (auditEpochs.get(task) !== epoch) {
+          // The complete write is serialized with all other audit saves. Restore
+          // the last accepted projection before allowing a newer epoch to save.
+          await cache.put(await scope, auditKey(task), { data: before });
+          return false;
+        }
+        auditMemory.set(task, structuredClone(value));
+        saved = true;
+        return true;
+      });
+    auditSaveQueues.set(task, save);
+    try {
+      return await save;
+    } finally {
+      if (auditSaveQueues.get(task) === save) auditSaveQueues.delete(task);
+    }
+  }
+  async function refreshAuditOverlay(task) {
+    if (disposed) throw new Error("Workspace is locked.");
+    const current = auditJobs.get(task);
+    if (current && current.epoch === auditEpochs.get(task))
+      return current.promise;
+    const epoch = (auditEpochs.get(task) || 0) + 1;
+    auditEpochs.set(task, epoch);
+    let job;
+    job = (async () => {
+      let next = await auditOverlay(task);
+      if (!online()) {
+        failed = true;
+        return next;
+      }
+      const records = structuredClone(next.records);
+      let cursor = "";
+      for (;;) {
+        const page = await client.listMessageAuditChanges(task, {
+          ...(cursor ? { cursor } : { checkpoint: next.checkpoint }),
+          limit: 64,
+        });
+        for (const event of page.events || []) {
+          const key = String(event.message.seq);
+          records[key] = {
+            ...records[key],
+            message: event.message,
+            current: event.after,
+          };
+        }
+        if (page.nextCursor) {
+          cursor = page.nextCursor;
+          continue;
+        }
+        if (!page.checkpoint)
+          throw new Error(
+            "Audit feed ended without a completely-applied checkpoint.",
+          );
+        next = {
+          version: 1,
+          taskId: task,
+          checkpoint: page.checkpoint,
+          records,
+          savedAt: now(),
+        };
+        if (!(await saveAuditOverlay(task, next, epoch)))
+          return auditOverlay(task);
+        failed = false;
+        return next;
+      }
+    })()
+      .catch((error) => {
+        failed = true;
+        notify(true);
+        throw error;
+      })
+      .finally(() => {
+        if (auditJobs.get(task)?.promise === job) auditJobs.delete(task);
+      });
+    auditJobs.set(task, { epoch, promise: job });
+    return job;
+  }
+  async function loadMessageAudits(task, messages = []) {
+    let overlay = await auditOverlay(task);
+    if (online()) {
+      try {
+        overlay = await refreshAuditOverlay(task);
+      } catch {
+        // A complete prior checkpoint remains usable and truthfully stale.
+      }
+    }
+    // Feed events carry the changing projection, not immutable creation
+    // context. Bootstrap every visible record without an original so the UI
+    // never invents an unclassified origin or loses an exact order reference.
+    const missing = messages.filter(
+      (message) => !overlay.records[String(message.seq)]?.original,
+    );
+    if (missing.length && online()) {
+      const epoch = (auditEpochs.get(task) || 0) + 1;
+      auditEpochs.set(task, epoch);
+      const records = structuredClone(overlay.records);
+      try {
+        for (let start = 0; start < missing.length; start += 16) {
+          const batch = await Promise.all(
+            missing
+              .slice(start, start + 16)
+              .map((message) => client.getMessageAudit(task, message.seq)),
+          );
+          for (const record of batch)
+            records[String(record.message.seq)] = record;
+        }
+        overlay = { ...overlay, records, savedAt: now() };
+        if (!(await saveAuditOverlay(task, overlay, epoch)))
+          overlay = await auditOverlay(task);
+      } catch (error) {
+        if (disposed) throw error;
+        overlay = await auditOverlay(task);
+        if (disposed) throw new Error("Workspace is locked.");
+        failed = true;
+        notify(true);
+      }
+    }
+    return structuredClone(overlay.records);
+  }
   return {
     ...client,
     cacheStatus: status,
+    // Capability negotiation must reflect the connected hub. Persisting a 404
+    // would strand this client on the legacy path after a hub upgrade, while
+    // serving stale success offline could expose controls the hub cannot honor.
+    capabilities: () => client.capabilities(),
     listTasks: async () => (await read("/v1/tasks")).tasks,
     getTask: (id) => read(`/v1/tasks/${id}`),
     listAgents: async (id) => (await read(`/v1/tasks/${id}/agents`)).agents,
     getAgent: (task, id) => read(`/v1/tasks/${task}/agents/${id}`),
     listMessages: async (task, params) =>
       (await read(`/v1/tasks/${task}/messages` + query(params))).messages,
+    getMessageAudit: (task, seq) =>
+      read(`/v1/tasks/${task}/message-audit/messages/${seq}`),
+    listMessageAuditHistory: (task, seq, params) =>
+      read(
+        `/v1/tasks/${task}/message-audit/messages/${seq}/history` +
+          query(params),
+      ),
+    loadMessageAudits,
+    refreshMessageAuditOverlay: refreshAuditOverlay,
     listDecisions: (task, params) =>
       read(`/v1/tasks/${task}/decisions` + query(params)),
     listWorkItems: (params) => read("/v1/work-items" + query(params)),
@@ -348,6 +522,8 @@ export function createCachedHubClient({
     },
     dispose() {
       disposed = true;
+      for (const task of auditEpochs.keys())
+        auditEpochs.set(task, (auditEpochs.get(task) || 0) + 1);
       for (const stop of stops) stop();
       listeners.clear();
       clearTimeout(notification);

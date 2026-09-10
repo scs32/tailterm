@@ -11,13 +11,20 @@ import (
 // Allow the documented positional message before flags. A literal -- ends parsing.
 func postArgs(args []string) []string {
 	flags, text := []string{}, []string{}
+	valueFlags := map[string]bool{
+		"--to": true, "--task": true, "--reply-to": true,
+		"--request-id": true, "--work-item-task": true,
+		"--work-item": true, "--work-item-revision": true,
+		"--work-order-task": true, "--work-order-message": true,
+		"--related": true,
+	}
 	for i := 0; i < len(args); i++ {
 		a := args[i]
 		if a == "--" {
 			text = append(text, args[i+1:]...)
 			break
 		}
-		if a == "--to" || a == "--task" || a == "--reply-to" {
+		if valueFlags[a] {
 			flags = append(flags, a)
 			if i+1 < len(args) {
 				i++
@@ -28,7 +35,8 @@ func postArgs(args []string) []string {
 			}
 			continue
 		}
-		if strings.HasPrefix(a, "--to=") || strings.HasPrefix(a, "--task=") || strings.HasPrefix(a, "--reply-to=") {
+		name, _, hasValue := strings.Cut(a, "=")
+		if hasValue && valueFlags[name] {
 			flags = append(flags, a)
 			continue
 		}

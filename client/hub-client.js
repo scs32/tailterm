@@ -69,6 +69,7 @@ export function createHubClient({ fetchImpl, baseURL, token = "" }) {
       return () => mutationListeners.delete(listener);
     },
     whoami: () => request("/v1/whoami"),
+    capabilities: () => request("/v1/capabilities"),
     listTasks: async () => (await request("/v1/tasks")).tasks,
     createTask: (body) => request("/v1/tasks", { method: "POST", body }),
     getTask: (id) => request(`/v1/tasks/${id}`),
@@ -177,6 +178,51 @@ export function createHubClient({ fetchImpl, baseURL, token = "" }) {
       }),
     postMessage: (task, body) =>
       request(`/v1/tasks/${task}/messages`, { method: "POST", body }),
+    getMessagePostReceipt: (task, requestId, agentId = "") =>
+      request(
+        `/v1/tasks/${task}/messages/receipts/${encodeURIComponent(requestId)}` +
+          q({ agentId }),
+      ),
+    getMessageAudit: (task, seq) =>
+      request(`/v1/tasks/${task}/message-audit/messages/${seq}`),
+    listMessageAuditHistory: (task, seq, params = {}) =>
+      request(
+        `/v1/tasks/${task}/message-audit/messages/${seq}/history` + q(params),
+      ),
+    listMessageAuditChanges: (task, params = {}) =>
+      request(`/v1/tasks/${task}/message-audit/changes` + q(params)),
+    correctMessageAudit: (task, seq, body) =>
+      request(`/v1/tasks/${task}/message-audit/messages/${seq}/corrections`, {
+        method: "POST",
+        body,
+      }),
+    resolveMessageAudit: (task, seq, body) =>
+      request(`/v1/tasks/${task}/message-audit/messages/${seq}/resolve`, {
+        method: "POST",
+        body,
+      }),
+    getMessageAuditReceipt: (task, requestId, params = {}) =>
+      request(
+        `/v1/tasks/${task}/message-audit/receipts/${encodeURIComponent(requestId)}` +
+          q(params),
+      ),
+    createMessageAuditAssociation: (task, body) =>
+      request(`/v1/tasks/${task}/message-audit/associations`, {
+        method: "POST",
+        body,
+      }),
+    getMessageAuditAssociationReceipt: (task, requestId, agentId = "") =>
+      request(
+        `/v1/tasks/${task}/message-audit/associations/receipts/${encodeURIComponent(requestId)}` +
+          q({ agentId }),
+      ),
+    createAuditExport: (task, body) =>
+      request(`/v1/tasks/${task}/audit-exports`, { method: "POST", body }),
+    getAuditExportChunk: (task, exportId, params = {}) =>
+      request(
+        `/v1/tasks/${task}/audit-exports/${encodeURIComponent(exportId)}` +
+          q(params),
+      ),
     listMessages: async (task, params = {}) =>
       (await request(`/v1/tasks/${task}/messages` + q(params))).messages,
     listDecisions: (task, params = {}) =>

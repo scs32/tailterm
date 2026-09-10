@@ -40,6 +40,29 @@ and synchronize the identical package to Mini without restarting PID 60799.
 Lead actual-release acceptance and database-handler revision-checked report
 save/readback remain pending; no Done or completion pin is claimed.
 
+## September 10 message audit B1 — source accepted, combined candidate pending review
+
+Bounded feature `wi_6148d93f013c1e1f` revision 2, work order #1460,
+implements the integrated observe-mode Board/CLI/cache/encrypted-intent clients,
+authenticated capabilities, and immutable consistent project audit export v2
+from original exact A2 baseline
+`58f9185981625b148b30ad4b5070a1a658e17f77`. Lead accepted source candidate
+`42e323a872f94db42ce6cc6cd755b6c414e62579` in Board message #1582, then
+ordered it rebased onto exact released History-width root baseline
+`23d8371c97fb5be13f7268f5ed84e3e06047ac8a` in #1594. The complete wire
+schema, supported snapshot streams, exclusions, exact limits,
+migration/rollback, Chromium/WebKit and Go acceptance, combined-width
+verification, and baseline CLI-suite nonpasses are in
+[the B1 implementation report](message-audit-b1.md).
+
+The rebased combined candidate is not deployed or finally accepted yet. Lead
+integration review and database-handler revision-checked result storage are
+required before item completion. A separate recorded release order must name
+the hub, Mini/Air CLI, TailOS and Mini frontend targets with backup and rollback.
+Parent `wi_edd77038c629a76c` remains in progress with B2/C1/E1/E2 pending. No
+live fixture, backfill, required-mode/AIV activation, network/Tailscale change,
+or preview PID 60799 restart occurred.
+
 ## September 10 message audit A2 — hub release verified pending final acceptance
 
 Accepted candidate `b7dd55d7190cf1932ef4cd13ea3bd883dd440276` was
@@ -974,22 +997,22 @@ The repository root `AGENTS.md` captures the owner's persistent constraints.
 
 ### Deployment inventory
 
-| Component | Location / current version |
-| --- | --- |
-| Current public application | `https://tailos.tailarr.com`, Cloudflare Pages project `tailos`, production branch setting `main` |
-| Pages release | `https://5e02332e.tailos.pages.dev`, commit `56ded4133c7a9ec952004dd51fa11e94a6c7d382` |
+| Component                             | Location / current version                                                                            |
+| ------------------------------------- | ----------------------------------------------------------------------------------------------------- |
+| Current public application            | `https://tailos.tailarr.com`, Cloudflare Pages project `tailos`, production branch setting `main`     |
+| Pages release                         | `https://5e02332e.tailos.pages.dev`, commit `56ded4133c7a9ec952004dd51fa11e94a6c7d382`                |
 | Original application, leave unchanged | `https://tailterm.tailarr.com`, project `tailterm`, commit `d9c884ed6d006d23de69ecb0a4b5f4980e12e40e` |
-| Local frontend on old MacBook | `http://127.0.0.1:4318`, Apple container `tailterm-static`, image `tailterm-static:56ded4133c7a` |
-| Local rollback image | `tailterm-static:c30436529ecb` |
-| Coordination hub | TrueNAS custom app `tailterm-hub`, `http://100.116.238.37:18765` |
-| Hub executable | `/mnt/deepfreeze/tailterm-hub/releases/20260908-task-cleanup/tailterm-hub` |
-| Hub state | `/mnt/deepfreeze/tailterm-hub/state/hub.sqlite` |
-| Hub token, private | `/mnt/deepfreeze/tailterm-hub/hub-token` |
-| Host CLI on Air and Mini | `~/.local/bin/tt`, task-cleanup implementation from `c304365` |
-| Host credential file, private | `~/.config/tailterm/hub.json` |
-| Host service | per-user `com.tailterm.inbox-relay`, running `tt relay` |
-| Host relay state | `~/.local/state/tailterm/relay/` |
-| macOS relay log | `~/Library/Logs/Tailterm/inbox-relay.log` |
+| Local frontend on old MacBook         | `http://127.0.0.1:4318`, Apple container `tailterm-static`, image `tailterm-static:56ded4133c7a`      |
+| Local rollback image                  | `tailterm-static:c30436529ecb`                                                                        |
+| Coordination hub                      | TrueNAS custom app `tailterm-hub`, `http://100.116.238.37:18765`                                      |
+| Hub executable                        | `/mnt/deepfreeze/tailterm-hub/releases/20260908-task-cleanup/tailterm-hub`                            |
+| Hub state                             | `/mnt/deepfreeze/tailterm-hub/state/hub.sqlite`                                                       |
+| Hub token, private                    | `/mnt/deepfreeze/tailterm-hub/hub-token`                                                              |
+| Host CLI on Air and Mini              | `~/.local/bin/tt`, task-cleanup implementation from `c304365`                                         |
+| Host credential file, private         | `~/.config/tailterm/hub.json`                                                                         |
+| Host service                          | per-user `com.tailterm.inbox-relay`, running `tt relay`                                               |
+| Host relay state                      | `~/.local/state/tailterm/relay/`                                                                      |
+| macOS relay log                       | `~/Library/Logs/Tailterm/inbox-relay.log`                                                             |
 
 The [retained deployment receipt](releases/tailos-2026-09-08.json) records the
 manifest SHA-256 and verification time. All 79 served assets matched the manifest;
@@ -1105,8 +1128,7 @@ npm run build:tt
 That script creates Linux arm64/amd64 and Darwin arm64 binaries under `.build/tt/`.
 Install the matching binary as `~/.local/bin/tt` with executable permissions.
 For Intel macOS, build `GOOS=darwin GOARCH=amd64` explicitly. Provision
-`~/.config/tailterm/hub.json` privately with the existing hub URL/token and mode
-600. Never put the token into source, pasted prompts, logs or the static build.
+`~/.config/tailterm/hub.json` privately with the existing hub URL/token and mode 600. Never put the token into source, pasted prompts, logs or the static build.
 
 On macOS, after installing `tt` and its configuration:
 

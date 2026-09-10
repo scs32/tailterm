@@ -38,6 +38,9 @@ Commands
   agents [--json]              list agents on this task
   event <kind> [--text T]      post started|running|done|needs_input|exited|closed
   post <text> [--to AGENT]     post a message to the task or one agent
+  message-audit <command>      get/history/changes/correct/resolve/associate/receipt
+  capabilities [--json]       show supported audit contracts and policy mode
+  audit-export <command>       create/download an immutable project audit export
   ask --request-id KEY --file PATH [--json]  request an owner decision on the Board
   inbox [--unread] [--mark-read] [--json]
   context [--json]             print this exact run's bound work-item context
@@ -133,6 +136,12 @@ func main() {
 		err = cmdEvent(e, args)
 	case "post":
 		err = cmdPost(e, args)
+	case "message-audit":
+		err = cmdMessageAudit(e, args)
+	case "capabilities":
+		err = cmdCapabilities(e, args)
+	case "audit-export":
+		err = cmdAuditExport(e, args)
 	case "ask":
 		err = cmdAsk(e, args)
 	case "inbox":
@@ -359,12 +368,15 @@ func cmdPost(e env, args []string) error {
 	to := fs.String("to", "", "agent id or name")
 	reply := fs.Int64("reply-to", 0, "message sequence being answered")
 	task := fs.String("task", e.task, "task id")
-	requestID := fs.String("request-id", "", "stable retry identity for a linked item message")
+	requestID := fs.String("request-id", "", "stable retry identity for this exact post")
+	intake := fs.Bool("intake", false, "explicitly classify this message as Intake")
 	workItemTask := fs.String("work-item-task", "", "project owning the linked item (default: --task)")
 	workItemID := fs.String("work-item", "", "bug or feature linked to this message")
 	workItemRevision := fs.Int64("work-item-revision", 0, "exact linked item revision")
 	workOrderTask := fs.String("work-order-task", "", "project containing the work-order message")
 	workOrderMessage := fs.Int64("work-order-message", 0, "recorded work-order message sequence")
+	var related stringListFlag
+	fs.Var(&related, "related", "related exact item as TASK/ITEM@REVISION (repeatable)")
 	if err := fs.Parse(postArgs(args)); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return nil
@@ -407,8 +419,18 @@ func cmdPost(e env, args []string) error {
 			}
 		}
 	}
-	linked := *workItemID != "" || *workItemTask != "" || *workItemRevision != 0 || *workOrderTask != "" || *workOrderMessage != 0 || *requestID != ""
+	linked := *workItemID != "" || *workItemTask != "" || *workItemRevision != 0 || *workOrderTask != "" || *workOrderMessage != 0 || len(related) > 0
+	if *intake {
+		if linked || *requestID == "" {
+			return errors.New("--intake requires --request-id and forbids work-item, related, and work-order flags")
+		}
+		req.AuditKind = api.MessageAuditIntake
+		req.RequestID = *requestID
+	}
 	if linked {
+		if *intake {
+			return errors.New("--intake cannot be combined with work context")
+		}
 		if *workItemTask == "" {
 			*workItemTask = *task
 		}
@@ -418,9 +440,30 @@ func cmdPost(e env, args []string) error {
 		if !api.ValidID(*workItemTask, "tsk") || !api.ValidID(*workItemID, "wi") || *workItemRevision < 1 || !api.ValidID(*workOrderTask, "tsk") || *workOrderMessage < 1 || *requestID == "" {
 			return errors.New("linked post requires --request-id, --work-item, --work-item-revision and --work-order-message")
 		}
+		req.AuditKind = api.MessageAuditWork
 		req.RequestID = *requestID
 		req.WorkItems = []api.MessageWorkItem{{ItemTaskID: *workItemTask, ItemID: *workItemID, ItemRevision: *workItemRevision, Relationship: "primary"}}
+		if len(related) > api.MaxMessageAuditRelated {
+			return fmt.Errorf("at most %d related items are allowed", api.MaxMessageAuditRelated)
+		}
+		seen := map[string]bool{fmt.Sprintf("%s/%s", *workItemTask, *workItemID): true}
+		for _, raw := range related {
+			item, parseErr := parseRelatedItem(raw)
+			if parseErr != nil {
+				return parseErr
+			}
+			identity := item.ItemTaskID + "/" + item.ItemID
+			if seen[identity] {
+				return fmt.Errorf("duplicate primary/related item %s", identity)
+			}
+			seen[identity] = true
+			req.WorkItems = append(req.WorkItems, item)
+		}
 		req.WorkOrderMessage = &api.MessageReference{TaskID: *workOrderTask, Seq: *workOrderMessage}
+	} else if *requestID != "" && !*intake {
+		// A retry key alone is a keyed legacy/unclassified post, not evidence of
+		// linked work context.
+		req.RequestID = *requestID
 	}
 	m, err := c.PostMessage(ctx, *task, req)
 	if err != nil {

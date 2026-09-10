@@ -321,6 +321,7 @@ var (
 	ErrContextLimit            = errors.New("work-item context exceeds the launch limit")
 	ErrLimit                   = errors.New("limit reached")
 	ErrClosed                  = errors.New("closed")
+	ErrExpired                 = errors.New("expired")
 	ErrNarrativeReportRequired = errors.New("a complete narrative report is required before marking a feature done")
 	ErrNarrativeReportStale    = errors.New("the selected narrative report does not match the current feature scope")
 )
