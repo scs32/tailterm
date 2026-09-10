@@ -14,11 +14,11 @@ context was read in full before implementation:
 
 Implementation began from exact clean commit
 `4e8e6c5b38905b25b5173d0044560be45e5b6e88` on `fix/queue-layout` in the
-isolated `queue-layout` worktree. The exact application/source candidate is
-`952f36bf5867dfe84d2bc3c99a98c491a46c51b6`, tree
-`9459fbf6c6c8f48385f9ca13a602a325bf83ca0d`. Its complete four-file
-`+801/-16` binary diff from the accepted baseline has SHA-256
-`52d5422a46d0fdc6ab9036b02bff14fc2a4470cdd38b73a40c9b9f0145bf3aec`.
+isolated `queue-layout` worktree. The superseding exact application/source
+candidate is `699ecd42eca6193e81b5e10ffbcd6884b6e2423a`, tree
+`68b1c9b14e0a91f58eab0460b8f99207f06609bb`. Its complete four-file
+`+861/-16` binary diff from the accepted baseline has SHA-256
+`6d20ffe9ecc46ed60ae00278117878cc58d0cedba23505553fe2a890210c63ac`.
 This later report-only commit records that immutable identity without changing
 the tested application tree.
 
@@ -37,6 +37,31 @@ network, Tailscale, TrueNAS, relay, service, or agent-lifecycle state was read o
 changed. No deployment was performed. All browser data and contexts were
 synthetic and disposable. Files remains hidden.
 
+## Independent review correction
+
+The first application commit `952f36bf5867dfe84d2bc3c99a98c491a46c51b6`
+and its report-only child `2d0560557f29417f919b07bdd4fae60e24e3eb9b`
+are retained as review provenance, not as accepted candidates. Lead review Board
+message `1742` rejected that candidate after reproducing a 761px viewport seam:
+the persistent 190px project rail left a 326px main region (310px Queue layout),
+but the inner grid still required 504px and the selected detail escaped by about
+194px. Review also found that the initial baseline run used baseline Queue CSS
+with current Queue markup rather than pinning both owned baseline files.
+
+Commit `699ecd42eca6193e81b5e10ffbcd6884b6e2423a` corrects both findings without a
+scope expansion:
+
+- the Queue main establishes an inline-size container, and list/detail stack
+  when the actual Queue thread is at most 540px wide, independent of viewport;
+- the regression now uses both `client/queue.css` and `client/queue-view.js` from
+  exact baseline `4e8e6c5...` in baseline mode;
+- the matrix adds 320, 760, 761, 768, 800, 900, and 1024px boundaries to the
+  original desktop, narrow, and zoom-equivalent cases.
+
+The corrected 761px WebKit screenshot was visually inspected alongside the
+exact-baseline screenshot. The baseline detail paints through the rows; the
+candidate list and detail are a vertical stack within the 310px Queue thread.
+
 ## Reproduction and root cause
 
 The focused regression mounts the actual Queue view inside the production
@@ -46,8 +71,8 @@ and supplies 18 synthetic Queue rows, multiple projects, a selected detail,
 long titles and descriptions, unbroken identifiers, statuses, markers, and
 controls.
 
-The accepted baseline reproduced the three owner-observed failure classes in
-both Chromium and WebKit:
+The exact accepted baseline reproduced the three owner-observed failure classes
+in both Chromium and WebKit:
 
 - Queue rows kept the later global `#mode-view button { white-space: nowrap; }`
   rule. Their intrinsic width escaped the first grid track; on desktop the
@@ -60,8 +85,8 @@ both Chromium and WebKit:
 - The shared narrow data-view workspace selector did not include Queue, leaving
   it without the intended mobile viewport/sidebar behavior.
 
-This is a Queue-local production import/specificity mismatch. No global CSS
-change is needed or included.
+This is a Queue-local production import/specificity mismatch plus an
+intermediate-width grid minimum. No global CSS change is needed or included.
 
 ## Repair
 
@@ -70,6 +95,8 @@ global stylesheet composition:
 
 - the outer Queue rail/thread and inner list/detail grids explicitly permit
   their tracks and children to shrink;
+- list/detail stack from actual Queue-main inline size when the desktop rail
+  leaves insufficient room, closing the 761–1024px transition seam;
 - Queue rows, detail headers, paragraphs, facts, titles, metadata, and unbroken
   identifiers wrap within their assigned region;
 - `data-queue-task` buttons receive the intended stacked rail geometry, with
@@ -88,20 +115,22 @@ subscription epochs, admission, export, or launch behavior changed.
 
 ## Measured browser evidence
 
-The fixture covers CSS viewports 1366×900, 1397×852, 1920×1080, 390×780, and a
-683×450/DPR-2 constrained viewport modeling a 1366×900 display at 200% zoom.
-The 1397/DPR-2 case is only a plausible comparison to the supplied raster, not a
-claim about the owner's viewport. The zoom case is emulation, not native browser
-zoom.
+The fixture covers twelve CSS viewports per engine: 320×720, 390×780, 760×900,
+761×900, 768×900, 800×900, 900×900, 1024×900, 1366×900, 1397×852/DPR-2,
+1920×1080, and 683×450/DPR-2. The last case models a constrained viewport such
+as 200% zoom; it is not native browser zoom. The 1397/DPR-2 case is only a
+plausible comparison to the supplied raster, not a claim about the owner's
+viewport.
 
-Representative WebKit measurements (pixels):
+Representative WebKit measurements after the fixture scroll (pixels):
 
-| Case            |         Baseline row right / detail left | Candidate row right / detail left | Baseline checkbox | Candidate checkbox | Candidate thread client / scroll height |
-| --------------- | ---------------------------------------: | --------------------------------: | ----------------: | -----------------: | --------------------------------------: |
-| 1366 desktop    |                         2730.70 / 830.42 |                   816.42 / 830.42 |             57.80 |                 14 |                              780 / 2471 |
-| 1920 desktop    |                        2744.56 / 1054.80 |                 1040.80 / 1054.80 |             57.80 |                 14 |                              946 / 1885 |
-| 390 narrow      | stacked baseline with 10px usable thread |          384 / 6 (vertical stack) |             57.80 |                 14 |                              501 / 5289 |
-| 200%-equivalent | stacked baseline with 10px usable thread |          677 / 6 (vertical stack) |             57.80 |                 14 |                              217 / 3320 |
+| Case            | Baseline row right / detail left |                       Candidate geometry | Baseline / candidate checkbox | Candidate thread client / scroll height |
+| --------------- | -------------------------------: | ---------------------------------------: | ----------------------------: | --------------------------------------: |
+| 761 boundary    |                    2679.56 / 655 | list bottom 2727.39 / detail top 2741.39 |                     57.8 / 14 |                              794 / 6587 |
+| 1366 desktop    |                 2730.70 / 830.42 |    row right 816.42 / detail left 830.42 |                     57.8 / 14 |                              780 / 2471 |
+| 1920 desktop    |                2744.56 / 1054.80 |  row right 1040.80 / detail left 1054.80 |                     57.8 / 14 |                              946 / 1885 |
+| 390 narrow      |      baseline 10px usable thread | list bottom 2238.09 / detail top 2252.09 |                     57.8 / 14 |                              501 / 5289 |
+| 200%-equivalent |      baseline 10px usable thread | list bottom 1437.59 / detail top 1451.59 |                     57.8 / 14 |                              217 / 3320 |
 
 Every candidate case asserts:
 
@@ -111,48 +140,53 @@ Every candidate case asserts:
 - long Queue text has no horizontal scroll overflow and every measured text
   range stays within its assigned rail or thread region;
 - the narrow rail is internally horizontally scrollable without document
-  overflow, and list/detail becomes a vertical stack;
+  overflow, and list/detail becomes a vertical stack when viewport or actual
+  thread width requires it;
 - the Queue thread has a usable vertical viewport and actually scrolls;
 - keyboard focus has a visible outline, Enter selects exactly one row, pointer
   selection remains hit-testable, and selected fill is retained;
 - the checkbox remains 14×14, within ten pixels of its label text, and the full
   history label remains visible.
 
-Baseline artifacts:
+Exact-baseline artifacts (24 cases, exact baseline CSS and Queue view):
 
-- `.build/queue-layout/baseline-results.json`, SHA-256
-  `8ecd575c5c3aea37c1bc713b9c78afa8942ba2f604f28c9f76ae16c1a16f4872`
-- `.build/queue-layout/baseline-webkit-desktop-1366.png`, SHA-256
-  `f41372c2ea3c364f7bf012592761ce73bf1b75fb16d623efda557136dfa69682`
+- `.build/queue-layout/baseline-results.json`, 536,811 bytes, SHA-256
+  `d4bf7dffeda8f90b89f8e2af7bb32c293cd5b7d895388ac34691a238c1199f3e`
+- `.build/queue-layout/baseline-webkit-boundary-761.png`, 205,161 bytes,
+  SHA-256 `214295c0be45eaebb4233ee453bbf091e33a0c81226ff71c78a3438014e1f81a`
 
-Candidate artifacts:
+Corrected candidate artifacts (24 cases):
 
-- `.build/queue-layout/candidate-results.json`, SHA-256
-  `5f1edf0b17429f75136ea0f33bbc7efedfa5b2642227ae074908a63f17703623`
-- `.build/queue-layout/candidate-webkit-desktop-1366.png`, SHA-256
-  `d789961c7698d0eb91ca9db71c496592890152daf0d6da50ecb3f4cab29c9571`
+- `.build/queue-layout/candidate-results.json`, 533,269 bytes, SHA-256
+  `df7c2e128348f4b2d1e8336377e16357c550b499a773cad4b9dc8e1cd1cb253d`
+- `.build/queue-layout/candidate-webkit-boundary-761.png`, 173,054 bytes,
+  SHA-256 `ef7d53369a1298fbe3dc7286799a4db97d57b68fa4795c701f4aea446efdb914`
+
+Built-production artifacts (24 cases):
+
+- `.build/queue-layout/built-results.json`, 533,110 bytes, SHA-256
+  `3d961f738c6667bb43c44d18b62e888a173122993869d8eecb11b2b3bd32b3e0`
+- `.build/queue-layout/built-webkit-boundary-761.png`, 173,054 bytes,
+  SHA-256 `ef7d53369a1298fbe3dc7286799a4db97d57b68fa4795c701f4aea446efdb914`
 
 These ignored `.build` artifacts contain only synthetic fixture output. They are
 review evidence, not release assets.
 
 ## Validation
 
-Exact clean source `952f36b` passed:
+Exact clean source `699ecd42eca6193e81b5e10ffbcd6884b6e2423a` passed:
 
-- `QUEUE_LAYOUT_BASELINE=1 node tests/queue-layout-browser.mjs` — 10/10
-  Chromium/WebKit cases reproduced the baseline failures, including desktop
-  pointer interception and ten-pixel narrow thread viewports.
-- `node tests/queue-layout-browser.mjs` — 10/10 corresponding candidate cases
-  had no geometry issue, browser error, text/control overflow, or selection,
-  focus, hit-test, and scroll failure.
+- `QUEUE_LAYOUT_BASELINE=1 node tests/queue-layout-browser.mjs` — 24/24
+  Chromium/WebKit cases reproduced all three owner-observed baseline failure
+  classes; this run pins both exact baseline Queue-owned files.
+- `node tests/queue-layout-browser.mjs` — 24/24 candidate cases had no geometry,
+  browser, text/control overflow, selection, focus, hit-test, or scroll failure.
 - `npm run build:static` — clean Vite production build and packaging passed;
-  `npm run verify:release` verified all 82 assets for exact commit `952f36b`.
-- `QUEUE_LAYOUT_BUILT_CSS=dist-static/assets/index-CscScl6m.css node
-tests/queue-layout-browser.mjs` — 10/10 Chromium/WebKit cases passed against
-  the emitted 102,737-byte production stylesheet, SHA-256
-  `8a1eb227a514ef8d9a8fbce1210fecf23874482a9c828868eccaba65e6342a61`.
-  The 222,874-byte built-composition result has SHA-256
-  `0e4473588578b5ac85744edf718b6bf38958a2f515dc09ee23cdfcabbc56f004`.
+  `npm run verify:release` verified all 82 assets for exact commit `699ecd4`.
+- `QUEUE_LAYOUT_BUILT_CSS=dist-static/assets/index-fPZ6XyzZ.css node
+tests/queue-layout-browser.mjs` — 24/24 Chromium/WebKit cases passed against
+  the emitted 102,887-byte production stylesheet, SHA-256
+  `a1094a0a8d4d4b768274449555ac94018ad6e27f67ba135e9540b674ffdc62b4`.
 - `node tests/project-queue-browser.mjs` — Chromium/WebKit existing real
   isolated-hub Send, priority, exact uncertain retry, Pull, history,
   terminal-history, unsupported-hub, and no-launch checks passed.
@@ -162,28 +196,24 @@ tests/queue-layout-browser.mjs` — 10/10 Chromium/WebKit cases passed against
   bounded, connection-scoped, newer-edit-safe Queue intent checks passed.
 - `npm test` — 149/149 JavaScript unit tests passed.
 - `npx prettier --check client/queue.css client/queue-view.js
-tests/queue-layout-browser.mjs docs/queue-layout.md`, `git diff --check`, and
-  JavaScript syntax checks passed.
+tests/queue-layout-browser.mjs`, `git diff --check`, and JavaScript syntax
+  checks passed.
 
 The clean release manifest is 14,861 bytes, SHA-256
-`984c4fdc56ae1b9e6062abc692a988630e27c2f7fb0a7f39013712e8a678e40a`.
+`515720a5d2757bbe15ce34fb2f74c1b679ccbae1c884f710e34833bfac050550`.
 The source files tested at the application commit are:
 
-- `client/queue.css`: 5,433 bytes, SHA-256
-  `80d87767c8007f1ff398888ff8c6e18a05d86d0e3ffe78d89a949c1b3b9a1e3e`
+- `client/queue.css`: 5,841 bytes, SHA-256
+  `1ae85bdd8eee520aa7cf960069b130725fd9e69686852c58f20d794b43606195`
 - `client/queue-view.js`: 20,158 bytes, SHA-256
   `71fbd80d5a5a87681ffa07ec5c9e3b75005e0a8b6948dc9ea240a0d82aa68b93`
-- `tests/queue-layout-browser.mjs`: 19,545 bytes, SHA-256
-  `abe87119dc26a3ab4524d35fd4aad1075d95d55a8e9e011b0e45f85267a29f2f`
+- `tests/queue-layout-browser.mjs`: 20,513 bytes, SHA-256
+  `e822ff89798a14300cea7ee6d48002bf839107563e92779e9708ceadf491e7dd`
 
-One pre-candidate static build stopped because the fresh worktree had no generated
-`wasm/tailserve.wasm`; the pinned `npm run build:wasm` prerequisite then passed.
-A subsequent build emitted the production CSS and completed packaging after
-`npm ci` supplied worktree-local license sources. `verify:release` correctly
-rejected that dirty-tree package; it is not claimed as release-ready. Final clean
-build and verification then passed as recorded above. `npm ci` reported three
-moderate dependency advisories; no dependency or lockfile change was authorized
-or made.
+The static build retained Vite's pre-existing large-chunk advisory. `npm ci`
+reported three moderate dependency advisories while preparing the original
+candidate; no dependency or lockfile change was authorized or made. No nonpass
+remains in the corrected matrix or relevant regressions.
 
 ## Limitations and rollback
 
@@ -192,7 +222,8 @@ viewport, zoom, or DPR is known, and no owner-device confirmation is claimed.
 The source-level and emitted-production-CSS fixtures establish repeatable engine
 geometry, not the exact cause of an already-open native Safari session.
 
-Rollback is source-only: revert the Queue layout application/source commit
-recorded above. No migration, database rollback, hub/CLI rollback, service
-restart, profile cleanup, or production action is involved. Deployment remains
-subject to independent lead review and a later explicit release order.
+Rollback is source-only: revert correction commit `699ecd42e...` and original
+application commit `952f36bf...`; `2d056055...` is documentation only. No
+migration, database rollback, hub/CLI rollback, service restart, profile cleanup,
+or production action is involved. Deployment remains subject to independent lead
+review and a later explicit release order.
