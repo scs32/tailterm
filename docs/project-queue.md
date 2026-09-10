@@ -88,7 +88,7 @@ item/run corrected both findings:
   exact run and an explicitly selected replacement run are supported; a still
   retired run or an event already recovered is rejected.
 
-The final second-correction application/source candidate is exact commit
+The second-correction application/source candidate was exact commit
 `895b859960a1c771ea05ea23e5b41428ba9f26d2`, tree
 `cfbdd34051102b579fd3434a962d32f4c20bc5ff`. Its complete 36-file
 `+5399/-49` binary diff from baseline
@@ -97,6 +97,32 @@ The final second-correction application/source candidate is exact commit
 The three-file `+197/-15` second-correction diff from report commit
 `d7ac78e4a931ffb0778a25b022b4d0666339278f` has SHA-256
 `3c3f5142547771f9389ad277271d2bd8216b05bcb5ac190feaffe56300bec225`.
+Report-only commit `c705432053d72dadb7417dd6c7c35b5db9b8d3f9` recorded that
+identity without changing its tested application tree.
+
+Lead message `1692` confirmed all prior review cases and hashes, then rejected a
+replacement-recipient regression introduced by the second correction. The exact
+expanded overlay reproduced that a deliberately installed replacement
+orchestrator could not be pinned unless an unrelated unavailable notice existed.
+The bounded third correction distinguishes the two operations:
+
+- when the actual current orchestrator ID/run differs from the pinned recipient,
+  explicit reconciliation updates the pin and emits a generation-1 notice owned
+  by the new reconciliation event; previously stored or unavailable messages
+  remain pinned and immutable;
+- when the actual current orchestrator is the already pinned ID/run, explicit
+  reconciliation remains recovery-only and requires an outstanding unavailable
+  notice, whose original semantic event receives the next recipient generation.
+
+The final third-correction application/source candidate is exact commit
+`cfb2172ae81095c035c58eab3c345ed4e489241e`, tree
+`35e01c8f3a3118ac6a3ba563c489637ef1609352`. Its complete 36-file
+`+5493/-49` binary diff from baseline
+`0d3ecf7e20462a585a305ea85f64571f1ec5f10c` has SHA-256
+`03509d4e855fd17ac2fcaaf077eaa9d15974287cfbcd4bf64c42d64ce5aaa033`.
+The two-file `+47/-3` third-correction diff from report commit
+`c705432053d72dadb7417dd6c7c35b5db9b8d3f9` has SHA-256
+`c0f76ac225aae23a2996c242d69ab8cd215c9637b4bb1b9f80ffb25a2be5d085`.
 The following report-only commit records this final identity and does not change
 the tested application tree.
 
@@ -208,11 +234,14 @@ and use a bounded semantic dedup identity. Automated notices never pretend to be
 human and never trigger the human continuation/resume path. An unavailable,
 retired, replaced, or mismatched recipient is recorded as pending/unavailable;
 explicit recipient reconciliation creates a retained new generation. Reads and
-delivery do not create Queue events or acknowledgement loops. Reconciliation
-records its own action event/receipt, but the recovered notice remains linked to
+delivery do not create Queue events or acknowledgement loops. Same-recipient
+recovery records its own action event/receipt, but its notice remains linked to
 the original unavailable semantic event with incremented recipient generation
-and original causal author. Exact replay, including after store restart, returns
-that frozen recovery receipt without another message or generation.
+and original causal author. Changed-recipient retargeting instead keeps all old
+messages immutable and creates a new notice linked to the reconciliation event.
+Exact replay, including after store restart, returns the frozen receipt without
+another message or generation. Same-recipient reconciliation without an
+outstanding unavailable notice remains an explicit no-op conflict.
 
 Inbox filtering has one narrow exception: a typed Queue notice may reach the
 actual project orchestrator even when it is item-bound. It does not widen ordinary
@@ -300,7 +329,7 @@ Passed on the final candidate:
 - `go test -overlay=/tmp/tailterm-queue-review-overlay.json ./internal/store -run '^TestReviewQueue' -count=1`
 - `go test ./cmd/tt -run 'TestQueue' -count=1 -v`
 - `go test -race ./internal/store ./internal/server ./internal/api`
-  (`internal/store` completed in 61.557 seconds, server in 23.605 seconds, and API
+  (`internal/store` completed in 61.158 seconds, server in 22.058 seconds, and API
   passed)
 - `go test -race ./internal/store -run 'TestQueueConcurrent|TestQueueDispatchCAS'`
 - `go vet ./...`
@@ -327,6 +356,12 @@ Passed on the final candidate:
   touch-hold, prepend/read/incoming/own-send anchors, focus and drafts
 - `git diff --check`
 
+The full backend, race, vet, build, expanded external overlay, and focused
+recipient tests were rerun on exact application commit `cfb2172…`. The npm and
+Chromium/WebKit results were run on `895b859…`; the third correction changes only
+`hub/internal/store/queue.go` and its Go test, so the tested frontend tree and
+browser fixtures are byte-identical in `cfb2172…`.
+
 Store coverage includes atomic Send and exact replay, new-key duplicate provenance,
 same item across receiving projects, independent priorities, stale/newer offers,
 concurrent dispatch and claim races, exact cross-project admission and retry,
@@ -345,6 +380,12 @@ replacement-run reconciliation, immutable unavailable generation history,
 separate semantic versus reconciliation event identity, still-retired rejection,
 new-key duplicate rejection, exact replay after store restart, and no read-driven
 acknowledgement loop.
+
+Changed-recipient coverage additionally starts with a successfully stored Send
+notice, closes that lead, installs the exact ordinary replacement, retargets
+without manufacturing an unrelated failure, preserves the old stored message,
+returns the same keyed receipt on replay, and proves a subsequent Send succeeds.
+The expanded supplied overlay case and the permanent regression both pass.
 
 Authority coverage explicitly rejects a typed Queue notice as the handler's
 selection while retaining positive genuine-human and exact current-orchestrator
