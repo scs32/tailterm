@@ -119,7 +119,7 @@ test("Enter from an open picker and keys from other controls retain defaults", (
   );
 });
 
-test("Enter falls back to a trusted click when showPicker is unavailable", () => {
+test("Enter falls back to a programmatic click when showPicker is unavailable", () => {
   const state = fixture({ open: false });
   state.control.disabled = false;
   state.control.closest = () => state.control;
@@ -138,7 +138,7 @@ test("Enter falls back to a trusted click when showPicker is unavailable", () =>
   assert.deepEqual(state.calls, [["preventDefault"], ["click"]]);
 });
 
-test("Enter falls back to a trusted click when showPicker rejects the request", () => {
+test("Enter falls back to a programmatic click when showPicker rejects the request", () => {
   const state = fixture({ open: false });
   state.control.disabled = false;
   state.control.closest = () => state.control;

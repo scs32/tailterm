@@ -43,7 +43,7 @@ export function openDialogSelectOnEnter(event, dialog) {
       pickerRequested = true;
     }
   } catch {
-    // A trusted click below is the compatibility fallback.
+    // A programmatic click within this user activation is the fallback.
   }
   if (!pickerRequested) {
     try {

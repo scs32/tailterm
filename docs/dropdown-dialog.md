@@ -32,8 +32,9 @@ behavior. DOM-level `selectOption` commits remained live and did not submit.
 boundary used by `client/main.js`:
 
 - Enter on a closed single-select prevents implicit form submission, then uses
-  the trusted user activation to call `showPicker()`, with `click()` as the
-  compatibility fallback. Enter reaching an already-open picker is left to the
+  the trusted user activation to call `showPicker()`. A programmatic `click()`
+  within that activation is the compatibility fallback; it is not claimed as a
+  trusted native click. Enter reaching an already-open picker is left to the
   browser for native commit.
 - A modal cancellation request is intercepted only when focus is inside that
   modal and the single-select actually matches `:open`. The handler prevents
