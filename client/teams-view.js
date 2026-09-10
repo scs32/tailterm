@@ -1,140 +1,122 @@
-import { projectFolderHTML, wireProjectFolder } from "./project-folder.js";
-import { agentControlsHTML, wireAgentControls } from "./agent-controls.js";
 import { TEAM_EXAMPLES, exampleTeam } from "./team-examples.js";
-import { modelPickerHTML, wireModelPicker } from "./model-picker.js";
-import { normalizeTeam, MAX_TEAM_MEMBERS } from "./teams.js";
-const esc = (s) =>
-  String(s ?? "").replace(
+import {
+  migrateAgentData,
+  normalizeReferencedTeam,
+  resolveTeamMember,
+} from "./agents.js";
+import { MAX_TEAM_MEMBERS } from "./teams.js";
+
+const esc = (value) =>
+  String(value ?? "").replace(
     /[&<>"']/g,
     (c) =>
       ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[
         c
       ],
   );
+const newId = (prefix) => prefix + crypto.randomUUID().replaceAll("-", "");
+
 export function createTeamsView(host) {
-  let root,
-    visible = false,
-    selectedTeam = "";
-  const blank = () => ({
-    name: "agent1",
-    role: "",
-    serverId: "",
-    runtime: "codex",
-    model: "",
-    run: "",
-    cwd: "",
-    prompt: "",
-  });
-  function edit(existing) {
+  let root;
+  let visible = false;
+  let selectedTeam = "";
+  const definitions = () => host.getData().agentCatalog?.definitions || [];
+  const resolved = (team) =>
+    team.members.map((member) => resolveTeamMember(member, definitions()));
+
+  function edit(existing, pendingDefinitions = []) {
+    const agents = [...definitions(), ...pendingDefinitions];
+    if (!agents.length) {
+      host.notice("Create an Agent before creating a team.");
+      host.openAgents?.();
+      return;
+    }
     const draft = existing
       ? structuredClone(existing)
-      : { name: "", members: [blank()] };
+      : {
+          id: "",
+          name: "",
+          swarm: false,
+          orchestrator: agents[0].launchName,
+          members: [{ agentDefinitionId: agents[0].id, alias: "", role: "" }],
+        };
     let selected = 0;
     let orchestratorIndex = Math.max(
       0,
-      draft.members.findIndex((m) => m.name === draft.orchestrator),
+      draft.members.findIndex(
+        (member) =>
+          (member.alias ||
+            agents.find((agent) => agent.id === member.agentDefinitionId)
+              ?.launchName) === draft.orchestrator,
+      ),
     );
     host.dialog(
       existing?.id ? "Edit team" : "New team",
-      `<form id="team-form" novalidate><label>Team name<input id="team-name" maxlength="80" value="${esc(draft.name)}" placeholder="e.g. Code review"></label><label>Main orchestrator<select id="team-orchestrator"></select><span class="fine">Launches first, receives member introductions, assigns work and owns the final result.</span></label><label class="check"><input id="team-swarm" type="checkbox" ${draft.swarm ? "checked" : ""}>Enable swarm</label><p class="fine">Broadcast every new project message to all agents, including helpers. A named recipient still owns the assignment. Applies to the whole project.</p><div class="team-members-bar"><div id="team-members" class="segmented" role="group" aria-label="Team members"></div><button id="team-add-member" type="button">＋ Agent</button></div><div id="team-member-editor"></div><div class="task-submit-area"><p id="team-error" class="fine" role="alert" aria-live="assertive" tabindex="-1"></p><div class="dialog-actions"><button id="team-remove-member" type="button">Remove member</button><button class="primary" type="submit">Save team</button></div></div></form>`,
+      '<form id="team-form" novalidate><label>Team name<input id="team-name" maxlength="80" placeholder="e.g. Code review"></label><label>Main orchestrator<select id="team-orchestrator"></select><span class="fine">Launches first and owns the final result.</span></label><label class="check"><input id="team-swarm" type="checkbox">Enable swarm</label><p class="fine">Every member references a reusable Agent. Alias and role are the only team-specific overrides.</p><div class="team-members-bar"><div id="team-members" class="segmented" role="group" aria-label="Team members"></div><button id="team-add-member" type="button">＋ Agent</button></div><div id="team-member-editor"></div><div class="task-submit-area"><p id="team-error" class="fine" role="alert" aria-live="assertive" tabindex="-1"></p><div class="dialog-actions"><button id="team-remove-member" type="button">Remove member</button><button class="primary" type="submit">Save team</button></div></div></form>',
     );
     const form = document.querySelector("#team-form");
-    function capture() {
-      const editor = form.querySelector("#team-member-editor");
-      for (const el of editor.querySelectorAll("[data-field]"))
+    form.querySelector("#team-name").value = draft.name;
+    form.querySelector("#team-swarm").checked = draft.swarm;
+    const memberName = (member) =>
+      member.alias ||
+      agents.find((agent) => agent.id === member.agentDefinitionId)
+        ?.launchName ||
+      "Missing agent";
+    const capture = () => {
+      for (const el of form.querySelectorAll(
+        "#team-member-editor [data-field]",
+      ))
         draft.members[selected][el.dataset.field] = el.value;
-    }
+    };
     function renderEditor() {
-      const m = draft.members[selected];
+      const member = draft.members[selected];
       form.querySelector("#team-orchestrator").innerHTML = draft.members
         .map(
-          (member, i) =>
-            `<option value="${i}" ${i === orchestratorIndex ? "selected" : ""}>${esc(member.name || "Agent " + (i + 1))}</option>`,
+          (item, index) =>
+            `<option value="${index}" ${index === orchestratorIndex ? "selected" : ""}>${esc(memberName(item))}</option>`,
         )
         .join("");
       form.querySelector("#team-members").innerHTML = draft.members
         .map(
-          (member, i) =>
-            `<button type="button" data-member="${i}" title="${esc(member.name || "Agent " + (i + 1))}" aria-pressed="${selected === i}">${esc(member.name || "Agent " + (i + 1))}</button>`,
+          (item, index) =>
+            `<button type="button" data-member="${index}" aria-pressed="${index === selected}" title="${esc(memberName(item))}">${esc(memberName(item))}</button>`,
         )
         .join("");
-      const memberStrip = form.querySelector("#team-members");
-      const activeMember = memberStrip.querySelector('[aria-pressed="true"]');
-      const stripRect = memberStrip.getBoundingClientRect();
-      const activeRect = activeMember.getBoundingClientRect();
-      if (activeRect.left < stripRect.left)
-        memberStrip.scrollLeft -= stripRect.left - activeRect.left;
-      else if (activeRect.right > stripRect.right)
-        memberStrip.scrollLeft += activeRect.right - stripRect.right;
       form.querySelector("#team-add-member").disabled =
         draft.members.length >= MAX_TEAM_MEMBERS;
       form.querySelector("#team-remove-member").disabled =
         draft.members.length === 1;
-      const known = ["codex", "claude", "aider", "gemini", "generic"];
-      if (!known.includes(m.runtime)) known.unshift(m.runtime);
       form.querySelector("#team-member-editor").innerHTML =
-        `<div class="appearance-controls"><label>Agent name<input data-field="name" value="${esc(m.name)}" maxlength="64"></label><label>Role<input data-field="role" value="${esc(m.role)}" placeholder="e.g. Reviewer" maxlength="80"></label></div><label>Machine<select data-field="serverId"><option value="">Main machine</option>${m.serverId && !host.getServers().some((s) => s.id === m.serverId) ? `<option value="${esc(m.serverId)}" selected>Missing machine · choose another</option>` : ""}${host
-          .getServers()
-          .map(
-            (s) =>
-              `<option value="${esc(s.id)}" ${s.id === m.serverId ? "selected" : ""}>${esc(s.name)}</option>`,
-          )
-          .join(
-            "",
-          )}</select></label><div class="appearance-controls"><label>Agent app<select data-field="runtime">${known.map((r) => `<option value="${esc(r)}" ${r === m.runtime ? "selected" : ""}>${r === "generic" ? "Custom command" : esc(r)}</option>`).join("")}</select></label>${modelPickerHTML("team-model", m.runtime, m.model)}</div>${agentControlsHTML(m.runtime, m.permissionMode, m.allowedTools)}${projectFolderHTML("team-cwd", m.cwd, "Project folder override", true)}<p class="fine">Leave blank to choose the project when launching this team.</p><label>Instructions<textarea data-field="prompt" rows="3" maxlength="8192" placeholder="What this member should do on every project…">${esc(m.prompt)}</textarea></label><details class="dialog-details"><summary>Command override</summary><label>Command override<input data-field="run" value="${esc(m.run)}" placeholder="${m.runtime === "generic" ? "your-agent --flag" : esc(m.runtime)}"></label></details>`;
-      form.querySelector("#team-cwd").dataset.field = "cwd";
-      wireProjectFolder(
-        form.querySelector("#team-cwd").closest(".project-folder"),
-        host,
-        () => {
-          const id = form.querySelector("[data-field=serverId]").value;
-          return id
-            ? host.getServers().find((s) => s.id === id)
-            : host.currentServer?.() || host.getServers()[0];
-        },
-      );
-      wireModelPicker(form.querySelector("[data-model-picker]"));
-      wireAgentControls(form.querySelector(".agent-controls"), async () => {
-        capture();
-        if (!host.inspectTools)
-          throw new Error(
-            "Tool inspection is unavailable in this environment.",
-          );
-        return host.inspectTools({ ...draft.members[selected] });
-      });
-      form.querySelector("[data-field=name]").oninput = (e) => {
-        form.querySelector("#team-orchestrator").options[selected].textContent =
-          e.target.value || "Agent " + (selected + 1);
-      };
+        `<label>Agent definition<select data-field="agentDefinitionId">${agents.map((agent) => `<option value="${esc(agent.id)}" ${agent.id === member.agentDefinitionId ? "selected" : ""}>${esc(agent.name)} · ${esc(agent.runtime)}${agent.model ? " / " + esc(agent.model) : ""}</option>`).join("")}</select></label><div class="appearance-controls"><label>Team alias<input data-field="alias" maxlength="64" value="${esc(member.alias)}" placeholder="${esc(agents.find((agent) => agent.id === member.agentDefinitionId)?.launchName || "agent")}"></label><label>Role override<input data-field="role" maxlength="80" value="${esc(member.role)}" placeholder="${esc(agents.find((agent) => agent.id === member.agentDefinitionId)?.role || "Use Agent default")}"></label></div><p class="fine">Runtime, model, reasoning, permissions, machine, folder and instructions come from the selected Agent.</p>`;
       form.querySelectorAll("[data-member]").forEach(
-        (b) =>
-          (b.onclick = () => {
+        (button) =>
+          (button.onclick = () => {
             capture();
-            selected = Number(b.dataset.member);
+            selected = Number(button.dataset.member);
             renderEditor();
           }),
       );
-      form.querySelector("[data-field=runtime]").onchange = () => {
-        const oldRuntime = m.runtime;
-        capture();
-        if (draft.members[selected].run === oldRuntime)
-          draft.members[selected].run = "";
-        draft.members[selected].model = "";
-        draft.members[selected].permissionMode = "";
-        draft.members[selected].allowedTools = [];
-        renderEditor();
-      };
+      for (const el of form.querySelectorAll(
+        "#team-member-editor [data-field]",
+      ))
+        el.oninput = () => {
+          capture();
+          const option = form.querySelector(
+            `#team-orchestrator option[value="${selected}"]`,
+          );
+          if (option) option.textContent = memberName(draft.members[selected]);
+        };
     }
-    form.querySelector("#team-orchestrator").onchange = (e) => {
-      orchestratorIndex = Number(e.target.value);
+    form.querySelector("#team-orchestrator").onchange = (event) => {
+      orchestratorIndex = Number(event.target.value);
     };
     form.querySelector("#team-add-member").onclick = () => {
       capture();
-      const m = blank();
-      let n = 1;
-      while (draft.members.some((x) => x.name === "agent" + n)) n++;
-      m.name = "agent" + n;
-      draft.members.push(m);
+      draft.members.push({
+        agentDefinitionId: agents[0].id,
+        alias: "",
+        role: "",
+      });
       selected = draft.members.length - 1;
       renderEditor();
     };
@@ -146,50 +128,41 @@ export function createTeamsView(host) {
       selected = Math.max(0, selected - 1);
       renderEditor();
     };
-    form.onsubmit = async (e) => {
-      e.preventDefault();
-      const button = form.querySelector("button[type=submit]");
-      if (button.disabled) return;
+    form.onsubmit = async (event) => {
+      event.preventDefault();
+      const button = form.querySelector('button[type="submit"]');
+      const status = form.querySelector("#team-error");
       button.disabled = true;
       button.textContent = "Saving…";
-      form.querySelector("#team-error").textContent = "";
+      status.textContent = "";
       try {
         capture();
         draft.name = form.querySelector("#team-name").value;
         draft.swarm = form.querySelector("#team-swarm").checked;
-        draft.orchestrator = draft.members[orchestratorIndex].name.trim();
-        const team = normalizeTeam(draft);
-        if (
-          team.members.some(
-            (m) =>
-              m.serverId && !host.getServers().some((s) => s.id === m.serverId),
-          )
-        )
-          throw new Error("Choose an available server for each agent.");
-        button.disabled = true;
-        await host.api("/teams", "POST", team);
+        draft.orchestrator = memberName(draft.members[orchestratorIndex]);
+        const team = normalizeReferencedTeam(draft, agents);
+        await host.api(
+          "/teams",
+          "POST",
+          pendingDefinitions.length
+            ? { definitions: pendingDefinitions, team }
+            : team,
+        );
         await host.reloadData();
         selectedTeam = team.id;
         host.closeDialog();
         render();
-        host.notice("Saved team " + team.name + ".");
+        host.notice(`Saved team ${team.name}.`);
       } catch (error) {
         if (Number.isInteger(error.memberIndex)) {
           selected = error.memberIndex;
           renderEditor();
-          const field = form.querySelector(`[data-field="${error.field}"]`);
-          if (field) {
-            const details = field.closest("details");
-            if (details) details.open = true;
-            field.setAttribute("aria-invalid", "true");
-            field.setAttribute("aria-describedby", "team-error");
-          }
+          form
+            .querySelector(`[data-field="${error.field}"]`)
+            ?.setAttribute("aria-invalid", "true");
         }
-        const status = form.querySelector("#team-error");
-        status.textContent =
-          error.message || "Could not save the team. Try again.";
+        status.textContent = error.message || "Could not save the team.";
         status.focus();
-        status.scrollIntoView({ block: "nearest" });
       } finally {
         button.disabled = false;
         button.textContent = "Save team";
@@ -198,30 +171,58 @@ export function createTeamsView(host) {
     renderEditor();
     form.querySelector("#team-name").focus();
   }
+
   function examples() {
     host.dialog(
       "Team examples",
-      `<p class="fine">Nine starting points, including an Astra-led swarm with four Terra workers. All members use the main machine unless you assign another. Customize before saving.</p><div class="team-examples">${TEAM_EXAMPLES.map((e) => `<article class="team-example"><div class="team-example-head"><h3>${esc(e.name)} <span class="fine">${e.members.length} agent${e.members.length === 1 ? "" : "s"}</span></h3><button data-example="${esc(e.id)}">Customize</button></div><p>${esc(e.summary)}</p><p class="fine">${esc(e.fit)}</p><details><summary>Workflow, models &amp; example project</summary><p class="fine">${esc(e.workflow)}</p><p class="fine">${e.members.map((m) => esc(m.name) + " · " + esc(m.model)).join("<br>")}</p><p class="fine">${esc(e.goal)}</p></details></article>`).join("")}</div>`,
+      `<p class="fine">Customize an example to copy its members into the Agents catalog and create one referenced team atomically.</p><div class="team-examples">${TEAM_EXAMPLES.map((example) => `<article class="team-example"><div class="team-example-head"><h3>${esc(example.name)} <span class="fine">${example.members.length} agents</span></h3><button data-example="${esc(example.id)}">Customize</button></div><p>${esc(example.summary)}</p><p class="fine">${esc(example.fit)}</p></article>`).join("")}</div>`,
     );
-    document
-      .querySelectorAll("[data-example]")
-      .forEach(
-        (button) =>
-          (button.onclick = () => edit(exampleTeam(button.dataset.example))),
-      );
+    document.querySelectorAll("[data-example]").forEach(
+      (button) =>
+        (button.onclick = () => {
+          const legacy = exampleTeam(button.dataset.example);
+          const migrated = migrateAgentData({ teams: [legacy] });
+          const created = migrated.agentCatalog.definitions.map(
+            (definition) => ({
+              ...definition,
+              id: newId("agent_"),
+              name: `${legacy.name} · ${definition.name}`,
+            }),
+          );
+          const team = {
+            id: "",
+            name: legacy.name,
+            swarm: legacy.swarm,
+            orchestrator: legacy.orchestrator,
+            members: legacy.members.map((member, index) => ({
+              agentDefinitionId: created[index].id,
+              alias: member.name,
+              role: "",
+            })),
+          };
+          edit(team, created);
+        }),
+    );
   }
+
   function render() {
     if (!root || !visible) return;
     const teams = host.getData().teams || [];
-    let selected = teams.find((team) => team.id === selectedTeam);
-    if (!selected) selected = teams[0] || null;
+    let selected =
+      teams.find((team) => team.id === selectedTeam) || teams[0] || null;
     selectedTeam = selected?.id || "";
-    const teamButton = (team) =>
-      `<button type="button" data-board-task="${esc(team.id)}" data-team-select="${esc(team.id)}" aria-pressed="${team.id === selectedTeam}" title="${esc(team.name)}"><span class="board-task-name">${esc(team.name)}</span><span class="fine">${team.members.length} agent${team.members.length === 1 ? "" : "s"}${team.swarm ? " · Swarm" : ""}</span></button>`;
+    let members = [];
+    let resolutionError = "";
+    if (selected)
+      try {
+        members = resolved(selected);
+      } catch (error) {
+        resolutionError = error.message;
+      }
     const detail = selected
-      ? `<div class="board-head"><div class="view-heading"><div><span class="eyebrow">TEAM</span><h2>${esc(selected.name)}</h2></div><div class="view-actions"><button id="teams-examples">Examples</button><button data-new-task="${esc(selected.id)}">New project</button><button data-add-team="${esc(selected.id)}">Add to project</button><button data-edit-team="${esc(selected.id)}">Edit</button><button data-delete-team="${esc(selected.id)}" aria-label="Delete ${esc(selected.name)}">Delete</button></div></div><p class="fine">${selected.members.length} agent${selected.members.length === 1 ? "" : "s"}${selected.swarm ? " · Swarm enabled" : ""} · Main orchestrator: ${esc(selected.orchestrator)}</p></div><div class="team-list"><article class="team-row" data-team="${esc(selected.id)}"><div><h3>Agents · ${esc(selected.name)}</h3><p class="fine">${selected.members.map((m) => esc(m.role || m.name) + " · " + esc(m.runtime) + (m.model ? " / " + esc(m.model) : "")).join(" &nbsp; · &nbsp; ")}</p></div></article></div>`
-      : `<div class="board-head"><div class="view-heading"><div><span class="eyebrow">TEAMS</span><h2>No saved teams.</h2></div><button id="teams-examples">Examples</button></div><p class="fine">Save a reusable group of agents, roles and launch settings.</p></div>`;
-    root.innerHTML = `<div class="board mode-board teams-view"><aside class="board-rail"><div class="board-rail-head"><span class="eyebrow">TEAMS</span><button id="teams-new" title="New team" aria-label="New team">＋</button></div>${teams.map(teamButton).join("")}</aside><section class="board-thread teams-detail">${detail}</section></div>`;
+      ? `<div class="board-head"><div class="view-heading"><div><span class="eyebrow">TEAM</span><h2>${esc(selected.name)}</h2></div><div class="view-actions"><button id="teams-examples">Examples</button><button data-new-task>New project</button><button data-add-team>Add to project</button><button data-edit-team>Edit</button><button data-delete-team>Delete</button></div></div><p class="fine">${selected.members.length} agents${selected.swarm ? " · Swarm enabled" : ""} · Main orchestrator: ${esc(selected.orchestrator)}</p></div><div class="team-list"><article class="team-row"><div><h3>Reusable Agents</h3><p class="fine">${resolutionError ? esc(resolutionError) : members.map((member) => `${esc(member.role || member.name)} · ${esc(member.runtime)}${member.model ? " / " + esc(member.model) : ""}${member.reasoning ? " · " + esc(member.reasoning) : ""}`).join(" &nbsp; · &nbsp; ")}</p></div></article></div>`
+      : `<div class="board-head"><div class="view-heading"><div><span class="eyebrow">TEAMS</span><h2>No saved teams.</h2></div><button id="teams-examples">Examples</button></div><p class="fine">Create Agents first, then combine stable references into reusable teams.</p></div>`;
+    root.innerHTML = `<div class="board mode-board teams-view"><aside class="board-rail"><div class="board-rail-head"><span class="eyebrow">TEAMS</span><button id="teams-new" title="New team" aria-label="New team">＋</button></div>${teams.map((team) => `<button type="button" data-board-task="${esc(team.id)}" data-team-select="${esc(team.id)}" aria-pressed="${team.id === selectedTeam}" title="${esc(team.name)}"><span class="board-task-name">${esc(team.name)}</span><span class="fine">${team.members.length} agents${team.swarm ? " · Swarm" : ""}</span></button>`).join("")}</aside><section class="board-thread teams-detail">${detail}</section></div>`;
     root.querySelector("#teams-new").onclick = () => edit();
     root.querySelector("#teams-examples").onclick = examples;
     root.querySelectorAll("[data-team-select]").forEach(
@@ -231,28 +232,29 @@ export function createTeamsView(host) {
           render();
         }),
     );
-    if (selected) {
-      root.querySelector("[data-edit-team]").onclick = () => edit(selected);
-      root.querySelector("[data-new-task]").onclick = () => host.newTask(selected);
-      root.querySelector("[data-add-team]").onclick = () => host.addTeam(selected);
-      root.querySelector("[data-delete-team]").onclick = async () => {
-        if (
-          !(await host.confirm(
-            "Delete team " + selected.name + "?",
-            "This removes the saved template. Agents already launched keep running.",
-          ))
-        )
-          return;
-        try {
-          await host.api("/teams/" + selected.id, "DELETE");
-          await host.reloadData();
-          selectedTeam = "";
-          render();
-        } catch (e) {
-          host.notice(e.message);
-        }
-      };
-    }
+    if (!selected) return;
+    root.querySelector("[data-edit-team]").onclick = () => edit(selected);
+    root.querySelector("[data-new-task]").onclick = () =>
+      host.newTask(selected);
+    root.querySelector("[data-add-team]").onclick = () =>
+      host.addTeam(selected);
+    root.querySelector("[data-delete-team]").onclick = async () => {
+      if (
+        !(await host.confirm(
+          `Delete team ${selected.name}?`,
+          "Agents and running sessions remain unchanged.",
+        ))
+      )
+        return;
+      try {
+        await host.api(`/teams/${selected.id}`, "DELETE");
+        await host.reloadData();
+        selectedTeam = "";
+        render();
+      } catch (error) {
+        host.notice(error.message);
+      }
+    };
   }
   return {
     mount(container) {

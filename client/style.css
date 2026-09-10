@@ -4537,7 +4537,15 @@ html:fullscreen {
 }
 /* Data views need a viewport even when no terminal has been opened. */
 @media (max-width: 760px) {
-  body:is([data-mode="board"], [data-mode="tasks"], [data-mode="teams"], [data-mode="files"], [data-mode="bugs"], [data-mode="features"])
+  body:is(
+      [data-mode="board"],
+      [data-mode="tasks"],
+      [data-mode="agents"],
+      [data-mode="teams"],
+      [data-mode="files"],
+      [data-mode="bugs"],
+      [data-mode="features"]
+    )
     #workspace {
     display: flex;
     flex-direction: column;
@@ -4545,12 +4553,28 @@ html:fullscreen {
     min-height: 0;
     overflow: hidden;
   }
-  body:is([data-mode="board"], [data-mode="tasks"], [data-mode="teams"], [data-mode="files"], [data-mode="bugs"], [data-mode="features"])
+  body:is(
+      [data-mode="board"],
+      [data-mode="tasks"],
+      [data-mode="agents"],
+      [data-mode="teams"],
+      [data-mode="files"],
+      [data-mode="bugs"],
+      [data-mode="features"]
+    )
     #workspace
     > aside {
     display: none;
   }
-  body:is([data-mode="board"], [data-mode="tasks"], [data-mode="teams"], [data-mode="files"], [data-mode="bugs"], [data-mode="features"])
+  body:is(
+      [data-mode="board"],
+      [data-mode="tasks"],
+      [data-mode="agents"],
+      [data-mode="teams"],
+      [data-mode="files"],
+      [data-mode="bugs"],
+      [data-mode="features"]
+    )
     #workspace
     > main {
     display: flex;
@@ -5144,9 +5168,14 @@ dialog .agent-save-setup button {
 }
 
 /* Teams use the same compact rows and controls as tasks. */
-#mode-view .teams-view {
+#mode-view :is(.agents-view, .teams-view) {
   width: 100%;
   max-width: 1120px;
+}
+body:is([data-mode="agents"], [data-mode="teams"]) #workspace .mode-switch {
+  min-width: 0;
+  max-width: 100%;
+  overflow-x: auto;
 }
 #mode-view .team-list {
   border-top: 1px solid var(--line);
@@ -5294,19 +5323,58 @@ dialog .agent-save-setup button {
   padding: 6px 0;
   border-bottom: 1px solid var(--line);
 }
-.task-agent-lifecycle > div > span { min-width: 0; overflow-wrap: anywhere; }
-.task-agent-lifecycle button { flex-shrink: 0; }
+.task-agent-lifecycle > div > span {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.task-agent-lifecycle button {
+  flex-shrink: 0;
+}
 
-.project-folder { display: flex; flex-direction: column; gap: 6px; min-width: 0; }
-.project-folder-input { display: flex; gap: 8px; align-items: stretch; }
-.project-folder-input input { flex: 1; min-width: 0; width: 0; }
-.project-folder-input button { flex-shrink: 0; }
-.project-folder-browser { padding: 10px; border: 1px solid var(--line); }
-.project-folder-browser[hidden] { display: none; }
-.folder-navigation { display: flex; gap: 6px; }
-.folder-current { overflow-wrap: anywhere; }
-.folder-directories { max-height: 180px; overflow: auto; margin-bottom: 8px; }
-.folder-directories button { display: block; width: 100%; text-align: left; overflow-wrap: anywhere; }
+.project-folder {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 0;
+}
+.project-folder-input {
+  display: flex;
+  gap: 8px;
+  align-items: stretch;
+}
+.project-folder-input input {
+  flex: 1;
+  min-width: 0;
+  width: 0;
+}
+.project-folder-input button {
+  flex-shrink: 0;
+}
+.project-folder-browser {
+  padding: 10px;
+  border: 1px solid var(--line);
+}
+.project-folder-browser[hidden] {
+  display: none;
+}
+.folder-navigation {
+  display: flex;
+  gap: 6px;
+}
+.folder-current {
+  overflow-wrap: anywhere;
+}
+.folder-directories {
+  max-height: 180px;
+  overflow: auto;
+  margin-bottom: 8px;
+}
+.folder-directories button {
+  display: block;
+  width: 100%;
+  text-align: left;
+  overflow-wrap: anywhere;
+}
 
 #mode-view .board-closed {
   margin-top: 12px;
@@ -5326,18 +5394,25 @@ dialog .agent-save-setup button {
 
 /* Projects, Teams and work-item modes share Board's outer shell verbatim.
    Their detail content scrolls independently so the rail divider stays full-height. */
-body:is([data-mode="board"], [data-mode="tasks"], [data-mode="teams"], [data-mode="bugs"], [data-mode="features"])
+body:is(
+    [data-mode="board"],
+    [data-mode="tasks"],
+    [data-mode="agents"],
+    [data-mode="teams"],
+    [data-mode="bugs"],
+    [data-mode="features"]
+  )
   #mode-view {
   overflow: hidden;
 }
 #mode-view
-  :is(.tasks-view, .teams-view, .work-items-view).mode-board {
+  :is(.tasks-view, .agents-view, .teams-view, .work-items-view).mode-board {
   width: 100%;
   max-width: none;
   margin: 0;
 }
 #mode-view
-  :is(.tasks-view, .teams-view, .work-items-view)
+  :is(.tasks-view, .agents-view, .teams-view, .work-items-view)
   > .board-thread {
   overflow: auto;
 }
@@ -5364,6 +5439,14 @@ body:is([data-mode="board"], [data-mode="tasks"], [data-mode="teams"], [data-mod
 }
 #mode-view .teams-detail .team-list {
   border-top: 0;
+}
+#mode-view .agents-detail .agent-detail-list {
+  display: grid;
+  gap: 10px;
+}
+#mode-view .agent-prompt-preview {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
 }
 #mode-view .teams-detail .team-row {
   align-items: flex-start;

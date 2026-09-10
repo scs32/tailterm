@@ -1,4 +1,5 @@
 import { createTeamsView } from "./teams-view.js";
+import { createAgentsView } from "./agents-view.js";
 import { createProfileSync } from "./profile-sync.js";
 import { credentialCache } from "./credential-cache.js";
 import { createAttentionSound } from "./attention-sound.js";
@@ -97,7 +98,7 @@ import { SearchAddon } from "@xterm/addon-search";
 import wasmURL from "@tailscale/connect/main.wasm?url";
 import "@xterm/xterm/css/xterm.css";
 import "./style.css";
-let teamsView, profileSync;
+let agentsView, teamsView, profileSync;
 const $ = (s) => document.querySelector(s),
   $$ = (s) => [...document.querySelectorAll(s)];
 const tailscaleLogin = createTailscaleLoginController();
@@ -531,6 +532,7 @@ function mount() {
       api,
       getTabs: () => tabs,
       getServers: () => data.servers,
+      launchServerProfile: (id) => localVault.launchServerProfile(id),
       currentTab,
       currentServer,
       connect,
@@ -661,7 +663,7 @@ function mount() {
         );
       },
     });
-    teamsView = createTeamsView({
+    const libraryHost = {
       currentServer,
       openSFTP: (server) => browserTransport.browserSFTP(ipn, server, peers),
       getData: () => data,
@@ -676,6 +678,14 @@ function mount() {
       notice,
       confirm: (title, message) => confirmDialog({ title, message }),
       inspectTools: (fields) => taskHub.inspectTools(fields),
+    };
+    agentsView = createAgentsView({
+      ...libraryHost,
+      openAgents: () => modes?.set("agents"),
+    });
+    teamsView = createTeamsView({
+      ...libraryHost,
+      openAgents: () => modes?.set("agents"),
       newTask: (team) => taskHub.newTask(undefined, team),
       addTeam: (team) => taskHub.addTeam(team),
     });
@@ -689,6 +699,7 @@ function mount() {
         featuresView.hide();
         queueView.hide();
         filesView.hide();
+        agentsView.hide();
         teamsView.hide();
         view.replaceChildren();
         if (mode === "board") {
@@ -704,6 +715,9 @@ function mount() {
         } else if (mode === "queue") {
           queueView.mount(view);
           queueView.show();
+        } else if (mode === "agents") {
+          agentsView.mount(view);
+          agentsView.show();
         } else if (mode === "teams") {
           teamsView.mount(view);
           teamsView.show();
@@ -759,6 +773,7 @@ function mount() {
           }
           render();
           taskHub?.refresh({ resetCache: true });
+          agentsView?.refresh();
           teamsView?.refresh();
         },
       },
@@ -2440,6 +2455,7 @@ async function lock() {
   featuresView?.hide();
   queueView?.hide();
   filesView?.hide();
+  agentsView?.hide();
   teamsView?.hide();
   imageUploads?.cancel();
   voiceDictation?.cancel();

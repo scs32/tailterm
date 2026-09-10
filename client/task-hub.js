@@ -2,9 +2,18 @@ import { projectFolderHTML, wireProjectFolder } from "./project-folder.js";
 import { agentControlsHTML, wireAgentControls } from "./agent-controls.js";
 import { agentToolsCommand } from "../shared/tmux-command.js";
 import { modelPickerHTML, wireModelPicker } from "./model-picker.js";
-import { teamLaunches } from "./teams.js";
+import { resolveTeam, teamLaunches } from "./teams.js";
 import { withDatabaseHandler } from "./project-handler.js";
 import { prepareWorkItemContext } from "./work-item-context.js";
+import {
+  launchPlanForStorage,
+  restoreLaunchMembers,
+  serverLaunchScope,
+} from "./launch-journal.js";
+import {
+  guardedLaunchEffect,
+  reconciledAgentProblem,
+} from "./launch-reconciliation.js";
 // Project hub controller: owns the hub client, per-task event feeds, the mirror
 // loop that keeps a project tab's panes in step with the hub's agent list, and
 // the project dialogs reachable from the command palette.
@@ -51,7 +60,153 @@ export function createTaskHub(host) {
   const bound = new Set(); // task ids mirrored into tabs
   const cache = new Map(); // taskId -> {task, agents} for tooltips/dialogs
   let tasksList = [];
+  let launchEpoch = 0;
   const serverHosts = new Map();
+  const launchScopeSource = () => {
+    const data = host.getData();
+    return JSON.stringify([
+      client?.base || "",
+      data?.hub?.token || "",
+      data?.profile?.username || "",
+      data?.profile?.instanceId || "",
+    ]);
+  };
+  async function launchScope() {
+    const input = launchScopeSource();
+    const digest = await crypto.subtle.digest(
+      "SHA-256",
+      new TextEncoder().encode(input),
+    );
+    if (input !== launchScopeSource())
+      throw new Error(
+        "The hub credential or profile changed. Reopen the launch dialog.",
+      );
+    return [...new Uint8Array(digest)]
+      .map((byte) => byte.toString(16).padStart(2, "0"))
+      .join("");
+  }
+  async function prepareLaunchJournal(
+    kind,
+    taskId,
+    plan,
+    teamId = "",
+    creation = undefined,
+  ) {
+    const now = new Date().toISOString();
+    for (const entry of plan) {
+      entry.fields.agentId ||=
+        "agt_" + crypto.randomUUID().replaceAll("-", "").slice(0, 16);
+      if (host.launchServerProfile)
+        entry.server = host.launchServerProfile(entry.server.id);
+      entry.serverScope = await serverLaunchScope(entry.server);
+    }
+    const journal = launchPlanForStorage({
+      id: "launch_" + crypto.randomUUID().replaceAll("-", ""),
+      kind,
+      scope: await launchScope(),
+      taskId: taskId || undefined,
+      teamId: teamId || undefined,
+      createdAt: now,
+      updatedAt: now,
+      members: plan.map((entry) => ({ ...entry, state: "unstarted" })),
+      ...(creation && { creation }),
+    });
+    await guardedJournalEffect(journal, null, () =>
+      host.api("/team-launch-plans/validate", "POST", journal),
+    );
+    return journal;
+  }
+  async function assertLaunchScope(journal, entry = null) {
+    if (!journal) return;
+    if ((await launchScope()) !== journal.scope)
+      throw new Error(
+        "The hub credential or profile changed. Reopen the launch dialog.",
+      );
+    const members = entry
+      ? [
+          journal.members.find(
+            (member) => member.fields.agentId === entry.fields.agentId,
+          ),
+        ]
+      : journal.members;
+    for (const member of members) {
+      if (!member?.serverScope)
+        throw new Error(
+          "The frozen launch plan does not contain an exact machine scope.",
+        );
+      const current = host.launchServerProfile
+        ? host.launchServerProfile(member.serverId)
+        : host.getServers().find((server) => server.id === member.serverId);
+      if (
+        !current ||
+        (await serverLaunchScope(current)) !== member.serverScope ||
+        (entry &&
+          (await serverLaunchScope(entry.server)) !== member.serverScope)
+      )
+        throw new Error(
+          `The saved machine profile for ${member.fields.name} changed. Restore the exact endpoint and credentials or discard the frozen plan.`,
+        );
+    }
+  }
+  async function guardedJournalEffect(journal, entry, effect) {
+    const epoch = launchEpoch;
+    return guardedLaunchEffect(async () => {
+      if (epoch !== launchEpoch)
+        throw new Error(
+          "The launch view changed. Reopen it before continuing.",
+        );
+      await assertLaunchScope(journal, entry);
+      if (epoch !== launchEpoch)
+        throw new Error(
+          "The launch view changed. Reopen it before continuing.",
+        );
+    }, effect);
+  }
+  const saveLaunchJournal = (journal) =>
+    guardedJournalEffect(journal, null, () =>
+      host.api("/team-launch-plans", "POST", {
+        ...journal,
+        updatedAt: new Date().toISOString(),
+      }),
+    );
+  async function amendUnstartedFolders(plan, journal, requestedFolders) {
+    const nextJournal = structuredClone(journal);
+    let changed = false;
+    const amended = plan.map((entry) => {
+      const member = nextJournal?.members.find(
+        (candidate) => candidate.fields.agentId === entry.fields.agentId,
+      );
+      if (!member || member.state !== "unstarted") return entry;
+      if (!Object.hasOwn(requestedFolders, entry.fields.agentId)) return entry;
+      const cwd = String(requestedFolders[entry.fields.agentId] || "").trim();
+      if (cwd === entry.fields.cwd) return entry;
+      agentSpawnCommand({
+        hub: client.base,
+        task: journal.taskId || "tsk_0000000000000000",
+        ...entry.fields,
+        cwd,
+      });
+      const receipt = {
+        agentId: entry.fields.agentId,
+        from: entry.fields.cwd,
+        to: cwd,
+        amendedAt: new Date().toISOString(),
+      };
+      member.fields.cwd = cwd;
+      member.folderAmendments = [...(member.folderAmendments || []), receipt];
+      changed = true;
+      return {
+        ...entry,
+        fields: { ...entry.fields, cwd },
+        folderAmendments: structuredClone(member.folderAmendments),
+      };
+    });
+    if (changed) {
+      await saveLaunchJournal(nextJournal);
+      Object.assign(journal, nextJournal);
+    }
+    return amended;
+  }
   const probedServers = new Set();
   const serverKey = (s) => JSON.stringify([s.id, s.host, s.port, s.username]);
   function rememberHost(server, name) {
@@ -80,6 +235,7 @@ export function createTaskHub(host) {
   }
 
   function refresh({ resetCache = false } = {}) {
+    launchEpoch++;
     const url = normalizeHubURL(host.getData()?.hub?.url);
     const ipn = host.getIPN();
     if (!url) {
@@ -517,7 +673,8 @@ export function createTaskHub(host) {
   };
 
   function teamProjectFolders(container, getTeam, getMain) {
-    const paths = {};
+    const paths = {},
+      retryPaths = {};
     const read = () => {
       container
         .querySelectorAll("[data-project-server]")
@@ -525,6 +682,15 @@ export function createTaskHub(host) {
           (input) => (paths[input.dataset.projectServer] = input.value.trim()),
         );
       return { ...paths };
+    };
+    const readRetry = () => {
+      container
+        .querySelectorAll("[data-launch-agent-id]")
+        .forEach(
+          (input) =>
+            (retryPaths[input.dataset.launchAgentId] = input.value.trim()),
+        );
+      return { ...retryPaths };
     };
     function render() {
       read();
@@ -575,7 +741,34 @@ export function createTaskHub(host) {
           .forEach((control) => (control.disabled = !enabled));
       });
     }
-    return { read, render, setEditable };
+    function renderRetry(plan, journal) {
+      readRetry();
+      const pending = plan.filter((entry) =>
+        journal?.members.some(
+          (member) =>
+            member.fields.agentId === entry.fields.agentId &&
+            member.state === "unstarted",
+        ),
+      );
+      container.hidden = !pending.length;
+      container.innerHTML = pending
+        .map((entry, index) =>
+          projectFolderHTML(
+            `team-retry-project-${index}`,
+            retryPaths[entry.fields.agentId] ?? entry.fields.cwd,
+            `${entry.fields.name} · ${entry.server.name} · Project folder`,
+          ),
+        )
+        .join("");
+      container.querySelectorAll(".project-folder").forEach((root, index) => {
+        const entry = pending[index];
+        const input = root.querySelector("input");
+        input.dataset.launchAgentId = entry.fields.agentId;
+        input.dataset.projectServer = entry.server.id;
+        wireProjectFolder(root, host, () => entry.server);
+      });
+    }
+    return { read, readRetry, render, renderRetry, setEditable };
   }
 
   function agentFields(server) {
@@ -600,12 +793,21 @@ export function createTaskHub(host) {
       model: document.querySelector("#agent-model").disabled
         ? ""
         : document.querySelector("#agent-model").value.trim(),
+      reasoning:
+        document.querySelector('#agent-controls [data-field="reasoning"]')
+          ?.value || "",
       run,
       cwd: document.querySelector("#agent-cwd").value.trim(),
       prompt: document.querySelector("#agent-prompt").value.trim(),
       permissionMode: document.querySelector(
         "#agent-controls [data-field=permissionMode]",
       ).value,
+      approvalMode:
+        document.querySelector('#agent-controls [data-field="approvalMode"]')
+          ?.value || "",
+      sandboxMode:
+        document.querySelector('#agent-controls [data-field="sandboxMode"]')
+          ?.value || "",
       allowedTools: (
         document.querySelector("#agent-controls [data-field=allowedTools]")
           ?.value || ""
@@ -635,6 +837,7 @@ export function createTaskHub(host) {
       run.placeholder = runtime.value || "your-agent --flag";
       document.querySelector("#agent-controls").innerHTML = agentControlsHTML(
         runtime.value,
+        { model: document.querySelector("#agent-model")?.value || "" },
       );
       wireAgentControls(
         document.querySelector("#agent-controls .agent-controls"),
@@ -648,6 +851,24 @@ export function createTaskHub(host) {
       const picker = document.querySelector("#agent-model-picker");
       picker.innerHTML = modelPickerHTML("agent-model", runtime.value);
       wireModelPicker(picker);
+      const modelChoice = picker.querySelector("select");
+      const chooseModel = modelChoice.onchange;
+      modelChoice.onchange = () => {
+        chooseModel();
+        document.querySelector("#agent-controls").innerHTML = agentControlsHTML(
+          runtime.value,
+          { model: document.querySelector("#agent-model")?.value || "" },
+        );
+        wireAgentControls(
+          document.querySelector("#agent-controls .agent-controls"),
+          () =>
+            inspectTools({
+              runtime: runtime.value,
+              cwd: document.querySelector("#agent-cwd").value.trim(),
+              serverId: document.querySelector("#task-server").value,
+            }),
+        );
+      };
       document.querySelector("#agent-model-help").textContent = runtime.value
         ? "Choose a model available to this app on the server, or enter a custom model ID. App default keeps its configured model."
         : "For custom apps, include the model option in the command below.";
@@ -672,7 +893,10 @@ export function createTaskHub(host) {
       prompt: fields.prompt,
       runtime: fields.runtime,
       model: fields.model,
+      reasoning: fields.reasoning,
       permissionMode: fields.permissionMode,
+      approvalMode: fields.approvalMode,
+      sandboxMode: fields.sandboxMode,
       allowedTools: fields.allowedTools,
       agentRole: fields.agentRole,
       agentId: fields.agentId,
@@ -761,18 +985,73 @@ export function createTaskHub(host) {
     let pending = false,
       saved = null,
       launchPlan = null,
-      inheritedHandler = null;
+      inheritedHandler = null,
+      launchJournal = null;
     const progress = new Set();
     const teamSelect = form.querySelector("#task-team");
     const projects = teamProjectFolders(
       form.querySelector("#task-project-folders"),
-      () => teams.find((t) => t.id === teamSelect?.value),
+      () => {
+        const selectedTeam = teams.find((t) => t.id === teamSelect?.value);
+        return selectedTeam
+          ? resolveTeam(selectedTeam, host.getData().agentCatalog)
+          : null;
+      },
       () => form.querySelector("#task-main-server").value,
     );
     form.querySelector("#task-main-server").onchange = projects.render;
     const open = () => {
       host.closeDialog();
       host.openBoard(saved.id);
+    };
+    const freezeCreation = () => {
+      for (const selector of [
+        "#task-name",
+        "#task-goal",
+        "#task-team",
+        "#task-main-server",
+        "#task-with-agent",
+        "#task-swarm",
+        "#task-allow-spawn",
+        "#task-max-new-agents",
+      ]) {
+        const control = form.querySelector(selector);
+        if (control) control.disabled = true;
+      }
+      form
+        .querySelectorAll(
+          "#task-project-folders input, #task-project-folders button",
+        )
+        .forEach((control) => (control.disabled = true));
+    };
+    const showUnknownCreation = () => {
+      freezeCreation();
+      button.disabled = true;
+      button.textContent = "Creation status unknown";
+      error.textContent =
+        "A prior project-creation response is unknown. Tailterm cannot safely identify it from project fields and will not create another project or adopt a possible match. Inspect Projects, then discard this unresolved record only after verifying the outcome.";
+      if (form.querySelector("#task-discard-creation")) return;
+      const discard = document.createElement("button");
+      discard.type = "button";
+      discard.id = "task-discard-creation";
+      discard.textContent = "Discard unresolved record";
+      discard.onclick = async () => {
+        if (
+          !(await host.confirm(
+            "Discard unresolved project launch?",
+            "Only do this after verifying that the project was not created.",
+          ))
+        )
+          return;
+        await guardedJournalEffect(launchJournal, null, () =>
+          host.api(`/team-launch-plans/${launchJournal.id}`, "DELETE"),
+        );
+        host.closeDialog();
+        host.notice(
+          "The unresolved launch record was discarded. Open New project to start over.",
+        );
+      };
+      form.querySelector(".dialog-actions").prepend(discard);
     };
     form.querySelector("#task-open-created").onclick = open;
     form.querySelector("#task-allow-spawn").onchange = (e) =>
@@ -781,6 +1060,7 @@ export function createTaskHub(host) {
       const hasTeam = !!teamSelect?.value;
       form.querySelector("#task-manual-agent").hidden = hasTeam;
       form.querySelector("#task-main-machine").hidden = !teams
+        .map((candidate) => resolveTeam(candidate, host.getData().agentCatalog))
         .find((t) => t.id === teamSelect?.value)
         ?.members.some((m) => !m.serverId);
       agentFieldsEl.hidden = hasTeam || !withAgent.checked;
@@ -804,8 +1084,20 @@ export function createTaskHub(host) {
     form.onsubmit = async (event) => {
       event.preventDefault();
       if (pending) return;
+      pending = true;
+      button.disabled = true;
+      withAgent.disabled = true;
       error.textContent = "";
       try {
+        if (
+          !saved &&
+          launchJournal?.creation?.state === "uncertain" &&
+          !launchJournal.taskId
+        ) {
+          throw new Error(
+            "The prior project-creation response is still unknown. No authoritative creation receipt is available, so Tailterm will not adopt a project or create another one.",
+          );
+        }
         const name = form.querySelector("#task-name").value.trim();
         if (!name || [...name].length > 120 || /[\x00-\x1f\x7f]/.test(name))
           throw new Error("Enter a project name of up to 120 characters.");
@@ -824,6 +1116,19 @@ export function createTaskHub(host) {
           .getServers()
           .find((s) => s.id === form.querySelector("#task-server").value);
         const team = teams.find((t) => t.id === teamSelect?.value);
+        const createRequest = {
+          name,
+          goal: form.querySelector("#task-goal").value.trim(),
+          allowAgentSpawn: form.querySelector("#task-allow-spawn").checked,
+          maxNewAgents,
+          swarm: form.querySelector("#task-swarm").checked,
+          orchestrator:
+            team?.orchestrator ||
+            team?.members[0]?.name ||
+            (!team && withAgent.checked
+              ? form.querySelector("#agent-name").value.trim()
+              : ""),
+        };
         const fields = !team && withAgent.checked ? readAgentFields() : null;
         if (fields) {
           if (!target) throw new Error("Choose a server for the first agent.");
@@ -845,12 +1150,36 @@ export function createTaskHub(host) {
                   host.getServers(),
                   form.querySelector("#task-main-server").value,
                   projects.read(),
+                  null,
+                  host.getData().agentCatalog,
                 )
               : fields
                 ? [{ server: target, fields }]
                 : [],
           );
-        pending = true;
+        if (launchPlan && launchJournal) {
+          launchPlan = await amendUnstartedFolders(
+            launchPlan,
+            launchJournal,
+            projects.readRetry(),
+          );
+        }
+        if (!launchJournal && plan.length && team) {
+          const preparedAt = new Date().toISOString();
+          launchJournal = await prepareLaunchJournal(
+            "new-project",
+            saved?.id,
+            plan,
+            team?.id,
+            {
+              state: "prepared",
+              request: createRequest,
+              knownTaskIds: (await client.listTasks()).map((task) => task.id),
+              preparedAt,
+            },
+          );
+        }
+        if (!saved && launchJournal) await saveLaunchJournal(launchJournal);
         form
           .querySelectorAll(
             "#task-project-folders input, #task-project-folders button",
@@ -862,19 +1191,38 @@ export function createTaskHub(host) {
           ? "Retrying agent launch…"
           : "Creating project…";
         if (!saved) {
-          saved = await client.createTask({
-            name,
-            goal: form.querySelector("#task-goal").value.trim(),
-            allowAgentSpawn: form.querySelector("#task-allow-spawn").checked,
-            maxNewAgents,
-            swarm: form.querySelector("#task-swarm").checked,
-            orchestrator:
-              team?.orchestrator ||
-              team?.members[0]?.name ||
-              fields?.name ||
-              "",
-          });
+          if (launchJournal?.creation) {
+            launchJournal.creation.state = "uncertain";
+            launchJournal.creation.attemptedAt = new Date().toISOString();
+            await saveLaunchJournal(launchJournal);
+          }
+          try {
+            saved = await guardedJournalEffect(launchJournal, null, () =>
+              client.createTask(createRequest),
+            );
+          } catch (createError) {
+            if (
+              launchJournal &&
+              Number.isInteger(createError?.status) &&
+              createError.status >= 400 &&
+              createError.status < 500
+            ) {
+              await guardedJournalEffect(launchJournal, null, () =>
+                host.api(`/team-launch-plans/${launchJournal.id}`, "DELETE"),
+              );
+              launchJournal = null;
+              launchPlan = null;
+            } else if (launchJournal) {
+              showUnknownCreation();
+            }
+            throw createError;
+          }
           launchPlan = plan;
+          if (launchJournal) {
+            launchJournal.taskId = saved.id;
+            launchJournal.creation.state = "confirmed";
+            await saveLaunchJournal(launchJournal);
+          }
           if (teamSelect) teamSelect.disabled = true;
           form.querySelector("#task-main-server").disabled = true;
           form
@@ -898,8 +1246,12 @@ export function createTaskHub(host) {
           (member) => member.fields.agentRole === "database_handler",
         );
         if (inheritedHandler && handler) {
+          const amendedFolder = handler.fields.cwd;
           handler.server = inheritedHandler.server;
-          handler.fields = structuredClone(inheritedHandler.fields);
+          handler.fields = {
+            ...structuredClone(inheritedHandler.fields),
+            cwd: amendedFolder,
+          };
         }
         try {
           await launchMembers(
@@ -907,10 +1259,11 @@ export function createTaskHub(host) {
             launchPlan,
             progress,
             (text) => (error.textContent = text),
+            launchJournal,
           );
         } finally {
           // A successful lead launch fixes its handler's inherited settings.
-          // Folder corrections for remaining workers must not change them.
+          // A separately receipted folder correction is the only exception.
           if (
             !inheritedHandler &&
             handler &&
@@ -929,7 +1282,11 @@ export function createTaskHub(host) {
             : "Project created.",
         );
       } catch (e) {
-        if (teamSelect?.value) {
+        const unknownCreation =
+          !saved &&
+          launchJournal?.creation?.state === "uncertain" &&
+          !launchJournal.taskId;
+        if (teamSelect?.value && !launchJournal) {
           launchPlan = null;
           form
             .querySelectorAll(
@@ -937,22 +1294,33 @@ export function createTaskHub(host) {
             )
             .forEach((el) => (el.disabled = false));
         }
-        error.textContent =
-          (saved ? "Project created. Agent launch failed: " : "") +
-          formatError(e) +
-          (progress.size
-            ? " Started agents keep their folders. The database handler keeps the lead’s settings; corrections apply to remaining workers."
-            : "");
+        if (unknownCreation) showUnknownCreation();
+        else
+          error.textContent =
+            (saved ? "Project created. Agent launch failed: " : "") +
+            formatError(e) +
+            (progress.size
+              ? " Started agents keep their folders. The database handler keeps the lead’s settings; corrections apply to remaining workers."
+              : "");
+        if (
+          saved &&
+          launchJournal?.members.some((member) => member.state === "unstarted")
+        )
+          projects.renderRetry(launchPlan, launchJournal);
         error.setAttribute("role", "alert");
         error.scrollIntoView({ block: "nearest" });
-        button.textContent = saved
-          ? "Retry agent launch"
-          : withAgent.checked
-            ? "Create project and start agent"
-            : "Create project";
+        if (!unknownCreation)
+          button.textContent = saved
+            ? "Retry agent launch"
+            : withAgent.checked
+              ? "Create project and start agent"
+              : "Create project";
       } finally {
         pending = false;
-        button.disabled = false;
+        button.disabled =
+          !saved &&
+          launchJournal?.creation?.state === "uncertain" &&
+          !launchJournal.taskId;
         withAgent.disabled = true;
       }
     };
@@ -963,6 +1331,76 @@ export function createTaskHub(host) {
       form.querySelector("#agent-runtime").innerHTML = runtimeOptions(target);
       wireAgentFields();
     };
+    if (initialTeam?.id) {
+      pending = true;
+      button.disabled = true;
+      void (async () => {
+        const scope = await launchScope();
+        const recovered = (host.getData().teamLaunchPlans || []).find(
+          (entry) =>
+            entry.kind === "new-project" &&
+            entry.scope === scope &&
+            entry.teamId === initialTeam.id,
+        );
+        if (!recovered || !form.isConnected) return;
+        if (!recovered.taskId) {
+          launchJournal = structuredClone(recovered);
+          await assertLaunchScope(launchJournal);
+          launchPlan = await restoreLaunchMembers(
+            launchJournal,
+            host.getServers(),
+          );
+          const request = launchJournal.creation?.request;
+          if (!request)
+            throw new Error(
+              "The unresolved project record is missing its frozen creation request.",
+            );
+          form.querySelector("#task-name").value = request.name;
+          form.querySelector("#task-goal").value = request.goal;
+          form.querySelector("#task-swarm").checked = request.swarm;
+          form.querySelector("#task-allow-spawn").checked =
+            request.allowAgentSpawn;
+          form.querySelector("#task-max-new-agents").value =
+            request.maxNewAgents;
+          showUnknownCreation();
+          return;
+        }
+        const detail = await guardedJournalEffect(recovered, null, () =>
+          client.getTask(recovered.taskId),
+        );
+        if (!form.isConnected) return;
+        saved = detail.task;
+        launchJournal = structuredClone(recovered);
+        launchPlan = await restoreLaunchMembers(
+          launchJournal,
+          host.getServers(),
+        );
+        for (const member of launchJournal.members)
+          if (member.state === "started") progress.add(member.fields.name);
+        form.querySelector("#task-name").value = saved.name;
+        form.querySelector("#task-goal").value = saved.goal || "";
+        form.querySelector("#task-name").disabled = true;
+        form.querySelector("#task-goal").disabled = true;
+        if (teamSelect) teamSelect.disabled = true;
+        form.querySelector("#task-open-created").hidden = false;
+        error.textContent =
+          "Recovered the encrypted frozen launch plan. Retry reconciles uncertain identities before starting unstarted members.";
+        button.textContent = "Retry agent launch";
+        projects.renderRetry(launchPlan, launchJournal);
+      })()
+        .catch((error) => {
+          if (form.isConnected)
+            form.querySelector("#task-error").textContent = formatError(error);
+        })
+        .finally(() => {
+          if (!form.isConnected) return;
+          pending = false;
+          button.disabled =
+            !saved &&
+            launchJournal?.creation?.state === "uncertain" &&
+            !launchJournal.taskId;
+        });
+    }
     form.querySelector("#task-name").focus();
   }
 
@@ -981,6 +1419,9 @@ export function createTaskHub(host) {
         "cwd",
         "runtime",
         "model",
+        "reasoning",
+        "approvalMode",
+        "sandboxMode",
         "permissionMode",
         "prompt",
         "agentRole",
@@ -1083,6 +1524,7 @@ export function createTaskHub(host) {
           cwd: fields.cwd,
           run: fields.run,
           model: fields.model,
+          reasoning: fields.reasoning,
           prompt: fields.prompt,
         }))
           if (value !== undefined)
@@ -1091,6 +1533,10 @@ export function createTaskHub(host) {
           const select = form.querySelector('[data-field="permissionMode"]');
           select.value = fields.permissionMode;
           select.dispatchEvent(new Event("change"));
+        }
+        for (const key of ["reasoning", "approvalMode", "sandboxMode"]) {
+          const control = form.querySelector(`[data-field="${key}"]`);
+          if (control && fields[key] !== undefined) control.value = fields[key];
         }
         const tools = form.querySelector('[data-field="allowedTools"]');
         if (tools) tools.value = (fields.allowedTools || []).join("\n");
@@ -1180,8 +1626,10 @@ export function createTaskHub(host) {
     }
   }
 
-  async function launchMembers(taskId, plan, progress, report) {
-    const detail = await client.getTask(taskId);
+  async function launchMembers(taskId, plan, progress, report, journal = null) {
+    const detail = journal
+      ? await guardedJournalEffect(journal, null, () => client.getTask(taskId))
+      : await client.getTask(taskId);
     const plannedNames = new Set([
       ...detail.agents
         .filter((agent) => agent.role !== "database_handler")
@@ -1191,44 +1639,131 @@ export function createTaskHub(host) {
         .map(({ fields }) => fields.name.toLowerCase()),
     ]);
     const plannedTeamMembers = plannedNames.size;
-    const open = detail.agents.filter(
-      (a) => !["closed", "exited"].includes(a.status),
-    );
-    for (const { fields } of plan) {
+    let reconciled = false;
+    for (const entry of plan) {
+      const { fields } = entry;
+      const member = journal?.members.find(
+        (candidate) => candidate.fields.agentId === fields.agentId,
+      );
+      const exact = detail.agents.find((agent) => agent.id === fields.agentId);
+      if (member && ["uncertain", "started"].includes(member.state)) {
+        if (!exact)
+          throw new Error(
+            `The saved ${member.state} identity for ${fields.name} is not present. Reconcile the exact agent and run before continuing.`,
+          );
+        const problem = journal
+          ? await guardedJournalEffect(journal, entry, () =>
+              reconciledAgentProblem(taskId, entry, member, exact),
+            )
+          : await reconciledAgentProblem(taskId, entry, member, exact);
+        if (problem)
+          throw new Error(
+            `The saved identity for ${fields.name} has a ${problem} mismatch. Inspect the project before continuing.`,
+          );
+        if (member.state === "uncertain") {
+          member.state = "started";
+          member.agent = {
+            id: exact.id,
+            runId: exact.runId,
+            name: exact.name,
+          };
+          reconciled = true;
+        }
+        progress.add(fields.name);
+        continue;
+      }
+      if (member?.state === "unstarted" && exact)
+        throw new Error(
+          `The unstarted record for ${fields.name} already has its preallocated identity in the project. Inspect it before continuing.`,
+        );
       if (
         !progress.has(fields.name) &&
-        fields.agentRole !== "database_handler" &&
-        open.some((a) => a.name.toLowerCase() === fields.name.toLowerCase())
+        detail.agents.some(
+          (agent) =>
+            !["closed", "exited"].includes(agent.status) &&
+            agent.name.toLowerCase() === fields.name.toLowerCase(),
+        )
       )
         throw new Error(
-          `An agent named ${fields.name} already exists. Open the project to inspect it before launching more agents.`,
+          `An agent named ${fields.name} already exists with a different identity. Open the project to inspect it before launching more agents.`,
         );
     }
-    for (const { server, fields } of plan) {
+    if (reconciled) await saveLaunchJournal(journal);
+    for (const entry of plan) {
+      const { server, fields } = entry;
       if (fields.agentRole === "database_handler")
         if (!progress.has(fields.name))
-          await saveHandlerPlan(taskId, server, fields);
+          if (journal)
+            await guardedJournalEffect(journal, entry, () =>
+              saveHandlerPlan(taskId, server, fields),
+            );
+          else await saveHandlerPlan(taskId, server, fields);
     }
-    for (const [i, { server, fields }] of plan.entries()) {
+    for (const [i, entry] of plan.entries()) {
+      const { server, fields } = entry;
       if (progress.has(fields.name)) continue;
+      const journalMember = journal?.members.find(
+        (member) => member.fields.agentId === fields.agentId,
+      );
       report(
         `Starting ${fields.name} on ${server.name} (${i + 1}/${plan.length})…`,
       );
-      await spawn(
-        taskId,
-        server,
-        fields.agentRole === "database_handler"
-          ? fields
-          : { ...fields, plannedTeamMembers },
-      );
+      if (journalMember) {
+        journalMember.state = "uncertain";
+        await saveLaunchJournal(journal);
+      }
+      let agent;
+      try {
+        const effect = () =>
+          spawn(
+            taskId,
+            server,
+            fields.agentRole === "database_handler"
+              ? fields
+              : { ...fields, plannedTeamMembers },
+          );
+        agent = journal
+          ? await guardedJournalEffect(journal, entry, effect)
+          : await effect();
+      } catch (error) {
+        const verifiedUnstarted =
+          error?.verifiedUnstarted === true ||
+          /\bcwd\b[\s\S]{0,1024}\bis not a directory\b/.test(
+            error?.message || "",
+          );
+        if (journalMember && verifiedUnstarted) {
+          journalMember.state = "unstarted";
+          await saveLaunchJournal(journal);
+        }
+        throw error;
+      }
+      if (journalMember) {
+        journalMember.state = "started";
+        journalMember.agent = {
+          id: agent.id,
+          runId: agent.runId,
+          name: agent.name || fields.name,
+        };
+        await saveLaunchJournal(journal);
+      }
       progress.add(fields.name);
     }
+    if (
+      journal &&
+      journal.members.every((member) => member.state === "started")
+    )
+      await guardedJournalEffect(journal, null, () =>
+        host.api(`/team-launch-plans/${journal.id}`, "DELETE"),
+      );
   }
 
   async function addTeam(team) {
     if (!requireHub()) return;
     try {
+      const referencedTeam = team;
+      team = resolveTeam(team, host.getData().agentCatalog);
       let plan = null,
+        launchJournal = null,
         routing = null;
       const mainServer = host.currentServer() || host.getServers()[0];
       const tasks = (await loadTasks()).filter((t) => t.status === "open");
@@ -1281,6 +1816,48 @@ export function createTaskHub(host) {
       };
       selector.onchange = loadItems;
       await loadItems();
+      const recover = async () => {
+        if (plan || !selector.value) return;
+        const scope = await launchScope();
+        const savedPlan = (host.getData().teamLaunchPlans || []).find(
+          (entry) =>
+            entry.kind === "add-team" &&
+            entry.scope === scope &&
+            entry.taskId === selector.value &&
+            entry.teamId === referencedTeam.id,
+        );
+        if (!savedPlan) return;
+        launchJournal = structuredClone(savedPlan);
+        await assertLaunchScope(launchJournal);
+        plan = await restoreLaunchMembers(launchJournal, host.getServers());
+        const frozen = plan.find((member) => member.fields.workItemId)?.fields;
+        if (frozen)
+          routing = {
+            workItemTaskId: frozen.workItemTaskId,
+            workItemId: frozen.workItemId,
+            workItemRevision: frozen.workItemRevision,
+            workOrderTaskId: frozen.workOrderTaskId,
+            workOrderMessageSeq: frozen.workOrderMessageSeq,
+            workContextBundle: frozen.workContextBundle,
+          };
+        for (const member of launchJournal.members)
+          if (member.state === "started") progress.add(member.fields.name);
+        selector.disabled = true;
+        itemSelector.disabled = true;
+        form.querySelector("#team-work-order").disabled = true;
+        const mainChoice = form.querySelector("#team-main-server");
+        if (mainChoice) mainChoice.disabled = true;
+        projects.renderRetry(plan, launchJournal);
+        status.textContent =
+          "Recovered the encrypted frozen launch plan. Retry reconciles uncertain identities before starting unstarted members.";
+        button.textContent = "Retry remaining agents";
+        button.disabled = false;
+      };
+      await recover();
+      selector.onchange = async () => {
+        await loadItems();
+        await recover();
+      };
       if (form.querySelector("#team-main-server"))
         form.querySelector("#team-main-server").onchange = projects.render;
       form.onsubmit = async (e) => {
@@ -1292,24 +1869,12 @@ export function createTaskHub(host) {
         form.querySelector("#team-work-order").disabled = true;
         const id = selector.value;
         try {
-          if (plan && progress.size) {
-            const refreshed = teamLaunches(
-              team,
-              host.getServers(),
-              form.querySelector("#team-main-server")?.value || mainServer?.id,
-              projects.read(),
-              routing,
+          if (plan && launchJournal)
+            plan = await amendUnstartedFolders(
+              plan,
+              launchJournal,
+              projects.readRetry(),
             );
-            const remaining = new Map(
-              refreshed.map((entry) => [entry.fields.name, entry]),
-            );
-            plan = plan.map((entry) =>
-              progress.has(entry.fields.name)
-                ? entry
-                : remaining.get(entry.fields.name),
-            );
-            projects.setEditable([]);
-          }
           if (!plan) {
             const item = items.find(
               (candidate) => candidate.id === itemSelector.value,
@@ -1342,12 +1907,20 @@ export function createTaskHub(host) {
               },
             });
             plan = teamLaunches(
-              team,
+              referencedTeam,
               host.getServers(),
               form.querySelector("#team-main-server")?.value || mainServer?.id,
               projects.read(),
               routing,
+              host.getData().agentCatalog,
             );
+            launchJournal = await prepareLaunchJournal(
+              "add-team",
+              id,
+              plan,
+              referencedTeam.id,
+            );
+            await saveLaunchJournal(launchJournal);
             const mainChoice = form.querySelector("#team-main-server");
             if (mainChoice) mainChoice.disabled = true;
             form
@@ -1356,12 +1929,19 @@ export function createTaskHub(host) {
               )
               .forEach((el) => (el.disabled = true));
             projects.setEditable([]);
-            const existingTask = await client.getTask(id);
+            const existingTask = await guardedJournalEffect(
+              launchJournal,
+              null,
+              () => client.getTask(id),
+            );
             const policy = {};
             if (team.swarm) policy.swarm = true;
             if (!existingTask.task.orchestrator)
               policy.orchestrator = team.orchestrator || team.members[0].name;
-            if (Object.keys(policy).length) await client.updateTask(id, policy);
+            if (Object.keys(policy).length)
+              await guardedJournalEffect(launchJournal, null, () =>
+                client.updateTask(id, policy),
+              );
             bound.add(id);
           }
           await launchMembers(
@@ -1369,6 +1949,7 @@ export function createTaskHub(host) {
             plan,
             progress,
             (text) => (status.textContent = text),
+            launchJournal,
           );
           sync();
           host.closeDialog();
@@ -1380,13 +1961,13 @@ export function createTaskHub(host) {
           if (progress.size)
             status.textContent +=
               " Already started agents and the prepared item context stay fixed; correct folders only for the remaining agents.";
-          if (progress.size)
-            projects.setEditable(
-              plan
-                .filter((entry) => !progress.has(entry.fields.name))
-                .map((entry) => entry.server.id),
-            );
-          if (!progress.size) {
+          if (
+            launchJournal?.members.some(
+              (member) => member.state === "unstarted",
+            )
+          )
+            projects.renderRetry(plan, launchJournal);
+          if (!progress.size && !launchJournal) {
             selector.disabled = false;
             itemSelector.disabled = !items.length;
             form.querySelector("#team-work-order").disabled = false;

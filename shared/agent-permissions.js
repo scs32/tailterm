@@ -19,13 +19,41 @@ export function validateAgentPermissions(
   mode = "",
   allowedTools = [],
   cwd = "",
+  approvalMode = "",
+  sandboxMode = "",
 ) {
   if (
     typeof mode !== "string" ||
     (mode && !PERMISSION_MODES[runtime]?.some(([id]) => id === mode))
   )
     throw new Error("Choose a supported permission mode for this agent app.");
-  if (mode === "workspace-auto" && !cwd.startsWith("/"))
+  if (
+    typeof approvalMode !== "string" ||
+    typeof sandboxMode !== "string" ||
+    (approvalMode &&
+      (runtime !== "codex" ||
+        !["on-request", "never"].includes(approvalMode))) ||
+    (sandboxMode &&
+      (runtime !== "codex" ||
+        !["read-only", "workspace-write", "danger-full-access"].includes(
+          sandboxMode,
+        )))
+  )
+    throw new Error(
+      "Choose supported approval and sandbox settings for Codex.",
+    );
+  if (runtime === "codex" && mode && (approvalMode || sandboxMode))
+    throw new Error(
+      "Use independent approval and sandbox settings, or one legacy permission preset, not both.",
+    );
+  if (runtime !== "codex" && (approvalMode || sandboxMode))
+    throw new Error(
+      "Approval and sandbox overrides are currently supported for Codex only.",
+    );
+  if (
+    (mode === "workspace-auto" || sandboxMode === "workspace-write") &&
+    !cwd.startsWith("/")
+  )
     throw new Error(
       "Workspace permissions require an explicit absolute working directory.",
     );

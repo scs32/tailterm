@@ -1,4 +1,5 @@
 import { validateAgentPermissions } from "./agent-permissions.js";
+import { validateReasoning } from "../client/reasoning.js";
 export function validateSession(name) {
   if (!/^[a-zA-Z0-9_-]{1,64}$/.test(name))
     throw new Error(
@@ -153,7 +154,10 @@ export function agentSpawnCommand({
   prompt = "",
   runtime = "",
   model = "",
+  reasoning = "",
   permissionMode = "",
+  approvalMode = "",
+  sandboxMode = "",
   allowedTools = [],
   agentRole = "",
   agentId = "",
@@ -190,7 +194,15 @@ export function agentSpawnCommand({
       !["claude", "codex", "aider", "gemini"].includes(runtime))
   )
     throw new Error("Enter a valid model name for a supported agent app.");
-  validateAgentPermissions(runtime, permissionMode, allowedTools, cwd);
+  validateReasoning(runtime, model, reasoning, run);
+  validateAgentPermissions(
+    runtime,
+    permissionMode,
+    allowedTools,
+    cwd,
+    approvalMode,
+    sandboxMode,
+  );
   if (agentRole && agentRole !== "database_handler")
     throw new Error("Invalid agent role.");
   if (agentId && !/^agt_[0-9a-f]{16}$/.test(agentId))
@@ -277,7 +289,10 @@ export function agentSpawnCommand({
   if (prompt) args.push("--prompt", prompt);
   if (runtime) args.push("--runtime", runtime);
   if (model) args.push("--model", model);
+  if (reasoning) args.push("--reasoning", reasoning);
   if (permissionMode) args.push("--permission-mode", permissionMode);
+  if (approvalMode) args.push("--approval-mode", approvalMode);
+  if (sandboxMode) args.push("--sandbox-mode", sandboxMode);
   if (allowedTools.length)
     args.push("--allowed-tools-json", JSON.stringify(allowedTools));
   return (

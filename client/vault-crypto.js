@@ -40,21 +40,24 @@ export async function deriveVaultKey(password, salt) {
     ["encrypt", "decrypt"],
   );
 }
-const aad = encoder.encode("tailserve-vault:1:PBKDF2-SHA256:600000");
-export async function sealVault(data, key, salt) {
+const aad = (version) =>
+  encoder.encode(`tailserve-vault:${version}:PBKDF2-SHA256:600000`);
+export async function sealVault(data, key, salt, version = 2) {
+  if (![1, 2].includes(version))
+    throw new Error("Unsupported encrypted vault format.");
   const iv = crypto.getRandomValues(new Uint8Array(12));
   const bytes = encoder.encode(JSON.stringify(data));
   try {
     const ciphertext = new Uint8Array(
       await crypto.subtle.encrypt(
-        { name: "AES-GCM", iv, additionalData: aad },
+        { name: "AES-GCM", iv, additionalData: aad(version) },
         key,
         bytes,
       ),
     );
     return {
       format: "tailserve-vault",
-      version: 1,
+      version,
       kdf: "PBKDF2-SHA256",
       iterations: VAULT_ITERATIONS,
       salt: b64(salt),
@@ -68,7 +71,7 @@ export async function sealVault(data, key, salt) {
 export async function openVault(envelope, password) {
   if (
     envelope?.format !== "tailserve-vault" ||
-    envelope.version !== 1 ||
+    ![1, 2].includes(envelope.version) ||
     envelope.kdf !== "PBKDF2-SHA256" ||
     envelope.iterations !== VAULT_ITERATIONS
   )
@@ -81,7 +84,11 @@ export async function openVault(envelope, password) {
   try {
     bytes = new Uint8Array(
       await crypto.subtle.decrypt(
-        { name: "AES-GCM", iv, additionalData: aad },
+        {
+          name: "AES-GCM",
+          iv,
+          additionalData: aad(envelope.version),
+        },
         key,
         ciphertext,
       ),
@@ -102,9 +109,9 @@ export function portableData(data) {
     sessions: structuredClone(data.sessions),
     hub: { url: data.hub?.url || "", token: data.hub?.token || "" },
     launchProfiles: structuredClone(data.launchProfiles || []),
-    ...(Array.isArray(data.teams)
-      ? { teams: structuredClone(data.teams) }
-      : {}),
+    agentCatalog: structuredClone(data.agentCatalog),
+    teamsVersion: data.teamsVersion,
+    teams: structuredClone(data.teams || []),
     ...(data.profileAppearance
       ? { profileAppearance: structuredClone(data.profileAppearance) }
       : {}),

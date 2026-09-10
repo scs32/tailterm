@@ -18,7 +18,10 @@ func (s *Server) profileRoutes() {
 			fail(w, err)
 			return
 		}
-		writeJSON(w, 200, map[string]any{"service": "tailterm-profiles", "version": 1, "instanceId": id})
+		writeJSON(w, 200, map[string]any{
+			"service": "tailterm-profiles", "version": 2, "instanceId": id,
+			"envelopeVersions": []int{1, 2}, "minimumWriteEnvelopeVersion": 2,
+		})
 	})
 	s.mux.HandleFunc("POST /v1/profiles/{username}", s.createProfile)
 	s.mux.HandleFunc("GET /v1/profiles/{username}", s.getProfile)
@@ -37,6 +40,8 @@ func profileFailure(w http.ResponseWriter, err error) {
 		writeError(w, 403, "Username or passphrase did not match a saved profile.")
 	case errors.Is(err, store.ErrProfileConflict):
 		writeError(w, 409, "This profile already exists or has changed on another device.")
+	case errors.Is(err, store.ErrProfileDowngrade):
+		writeError(w, 409, "A newer encrypted profile is already stored; downgrade was rejected.")
 	default:
 		fail(w, err)
 	}
