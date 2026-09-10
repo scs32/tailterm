@@ -6,6 +6,8 @@ import assert from "node:assert/strict";
 
 const taskId = "tsk_scroll_fixture";
 const agentId = "agt_scroll_fixture";
+const expectReplacementBaseline =
+  process.env.BOARD_SCROLL_REPLACEMENT_BASELINE === "1";
 
 const html = `<!doctype html><html><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
@@ -35,7 +37,13 @@ await board.show(taskId);
 const list=()=>document.querySelector('#board-messages');
 const viewport=()=>{const container=list(),bounds=container.getBoundingClientRect(),rows=[...container.querySelectorAll('[data-message]')],anchor=rows.find(row=>row.getBoundingClientRect().bottom>bounds.top+.5),rect=anchor?.getBoundingClientRect(),receipt=rows[0]?.querySelector('.message-footer span');return {seq:Number(anchor?.dataset.message||0),top:rect?rect.top-bounds.top:0,scrollTop:container.scrollTop,scrollHeight:container.scrollHeight,clientHeight:container.clientHeight,distanceBottom:container.scrollHeight-container.clientHeight-container.scrollTop,rowCount:rows.length,stateCount:state.messages.length,receiptText:receipt?.textContent,receiptHeight:receipt?.getBoundingClientRect().height}};
 const place=(seq,top=-12)=>{const container=list(),row=container.querySelector(\`[data-message="${"${seq}"}"]\`),bounds=container.getBoundingClientRect(),rect=row.getBoundingClientRect();container.scrollTop+=rect.top-bounds.top-top;return viewport()};
+let watchedList=null,watchedInput=null;
+const watchScroll=()=>{watchedList=list();watchedInput=document.querySelector('#board-text');return scrollWatch()};
+const scrollWatch=()=>({sameList:watchedList===list(),listConnected:Boolean(watchedList?.isConnected),watchedScrollTop:watchedList?.scrollTop||0,sameInput:watchedInput===document.querySelector('#board-text'),inputConnected:Boolean(watchedInput?.isConnected),focused:document.activeElement?.id||'',...viewport()});
 window.qa={state,board,viewport,place,message,
+  watchScroll,scrollWatch,
+  smoothScroll(distance=600){const watched=watchScroll();watchedList.scrollBy({top:distance,behavior:'smooth'});return watched},
+  moveWatched(distance=120){watchedList.scrollTop+=distance;return viewport()},
   async reload(){await board.reload()},
   async prepend(){state.messages=[...Array.from({length:20},(_,index)=>message(index+1,'Older')),...state.messages];await board.reload()},
   async markRead(){state.readUpTo=10000;await board.reload()},
@@ -204,6 +212,144 @@ try {
         0,
         `${engine.name()} own-send bottom follow`,
       );
+
+      await page.locator("#board-text").fill("Retain focus while scrolling.");
+      await page.locator("#board-text").focus();
+      await page.evaluate(() => qa.place(38));
+      const watched = await page.evaluate(() => qa.watchScroll());
+      const listBox = await page.locator("#board-messages").boundingBox();
+      assert.ok(listBox, `${engine.name()}: missing message viewport`);
+      await page.mouse.move(
+        listBox.x + listBox.width / 2,
+        listBox.y + listBox.height / 2,
+      );
+      await page.mouse.wheel(0, 180);
+      await page.waitForFunction(
+        (scrollTop) => qa.scrollWatch().watchedScrollTop > scrollTop,
+        watched.watchedScrollTop,
+      );
+      const beforeActiveRefresh = await page.evaluate(() => qa.scrollWatch());
+      await page.evaluate(() => qa.append());
+      const duringActiveRefresh = await page.evaluate(() => qa.scrollWatch());
+      if (expectReplacementBaseline) {
+        assert.equal(
+          duringActiveRefresh.sameList,
+          false,
+          `${engine.name()}: baseline refresh unexpectedly retained the scrolling element`,
+        );
+        assert.equal(duringActiveRefresh.listConnected, false);
+        assert.equal(duringActiveRefresh.sameInput, false);
+        assert.equal(duringActiveRefresh.inputConnected, false);
+        assert.equal(duringActiveRefresh.focused, "board-text");
+        console.log(
+          `${engine.name()}: baseline active refresh replaced the scrolling element and focused composer`,
+        );
+      } else {
+        assert.equal(
+          duringActiveRefresh.sameList,
+          true,
+          `${engine.name()}: active refresh replaced the scrolling element`,
+        );
+        assert.equal(duringActiveRefresh.listConnected, true);
+        assert.equal(duringActiveRefresh.sameInput, true);
+        assert.equal(duringActiveRefresh.inputConnected, true);
+        assert.equal(duringActiveRefresh.focused, "board-text");
+        assert.equal(
+          duringActiveRefresh.rowCount,
+          duringActiveRefresh.stateCount - 1,
+          `${engine.name()}: active refresh was not held until scrolling settled`,
+        );
+        await page.mouse.wheel(0, 180);
+        await page.waitForFunction(
+          (scrollTop) => qa.scrollWatch().watchedScrollTop > scrollTop,
+          beforeActiveRefresh.watchedScrollTop,
+        );
+        const beforeIdleRefresh = await page.evaluate(() => qa.viewport());
+        await page.waitForFunction(
+          () => qa.viewport().rowCount === qa.state.messages.length,
+        );
+        const afterIdleRefresh = await page.evaluate(() => qa.viewport());
+        sameAnchor(
+          beforeIdleRefresh,
+          afterIdleRefresh,
+          `${engine.name()} active-scroll idle refresh`,
+        );
+        assert.equal(
+          await page.locator("#board-text").inputValue(),
+          "Retain focus while scrolling.",
+        );
+        assert.equal(
+          await page.evaluate(() => document.activeElement?.id),
+          "board-text",
+        );
+        console.log(
+          `${engine.name()}: active wheel sequence retained DOM/focus, continued scrolling, then refreshed at idle`,
+        );
+
+        await page.evaluate(() => qa.place(34));
+        const smoothStart = await page.evaluate(() => qa.smoothScroll());
+        await page.waitForFunction(
+          (scrollTop) => qa.scrollWatch().watchedScrollTop > scrollTop + 10,
+          smoothStart.watchedScrollTop,
+        );
+        const beforeSmoothRefresh = await page.evaluate(() => qa.scrollWatch());
+        await page.evaluate(() => qa.append());
+        const duringSmoothRefresh = await page.evaluate(() => qa.scrollWatch());
+        assert.equal(
+          duringSmoothRefresh.sameList,
+          true,
+          `${engine.name()}: smooth motion refresh replaced the scrolling element`,
+        );
+        assert.equal(
+          duringSmoothRefresh.rowCount,
+          duringSmoothRefresh.stateCount - 1,
+        );
+        await page.waitForFunction(
+          (scrollTop) => qa.scrollWatch().watchedScrollTop > scrollTop + 20,
+          beforeSmoothRefresh.watchedScrollTop,
+        );
+        await page.waitForFunction(
+          () => qa.viewport().rowCount === qa.state.messages.length,
+        );
+        assert.equal(
+          await page.locator("#board-text").inputValue(),
+          "Retain focus while scrolling.",
+        );
+        console.log(
+          `${engine.name()}: browser-managed smooth-motion surrogate continued through refresh and repainted at idle`,
+        );
+
+        await page.evaluate(() => qa.place(34));
+        const touchWatch = await page.evaluate(() => qa.watchScroll());
+        await page.locator("#board-messages").dispatchEvent("touchstart");
+        await page.evaluate(() => qa.append());
+        const duringTouchRefresh = await page.evaluate(() => qa.scrollWatch());
+        assert.equal(
+          duringTouchRefresh.sameList,
+          true,
+          `${engine.name()}: synthetic touch hold replaced the scrolling element`,
+        );
+        assert.equal(
+          duringTouchRefresh.rowCount,
+          duringTouchRefresh.stateCount - 1,
+        );
+        assert.equal(duringTouchRefresh.sameInput, true);
+        assert.equal(duringTouchRefresh.focused, "board-text");
+        const beforeTouchIdle = await page.evaluate(() => qa.moveWatched());
+        assert.ok(beforeTouchIdle.scrollTop > touchWatch.scrollTop);
+        await page.locator("#board-messages").dispatchEvent("touchend");
+        await page.waitForFunction(
+          () => qa.viewport().rowCount === qa.state.messages.length,
+        );
+        sameAnchor(
+          beforeTouchIdle,
+          await page.evaluate(() => qa.viewport()),
+          `${engine.name()} synthetic touch idle refresh`,
+        );
+        console.log(
+          `${engine.name()}: synthetic touch hold retained DOM/focus and refreshed after release idle`,
+        );
+      }
       assert.deepEqual(errors, [], `${engine.name()} browser errors`);
       console.log(
         `${engine.name()}: stable prepend/read/incoming/own-send anchors, near-bottom follow, and retained drafts`,

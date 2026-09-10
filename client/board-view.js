@@ -44,6 +44,7 @@ const status = (a) => {
 };
 export const shouldReleaseRailPointer = shouldReleaseViewPointer;
 const BOARD_BOTTOM_FOLLOW_DISTANCE = 60;
+const BOARD_SCROLL_IDLE_MS = 120;
 const captureMessageScroll = (list) => {
   if (!list) return { followBottom: true, scrollTop: 0 };
   const scrollTop = Number(list.scrollTop) || 0;
@@ -109,7 +110,13 @@ export function createBoardView({
     decisionLoadError = "",
     subscription = null,
     pending = false;
-  let reloadAgain = false;
+  let reloadAgain = false,
+    messageScrollActive = false,
+    messageTouchActive = false,
+    messageScrollTimer = null,
+    renderHeldForMessageScroll = false,
+    ignoredScrollElement = null,
+    ignoredScrollTop = 0;
   const sending = new Set();
   const decisionSending = new Set();
   const decisionErrors = new Map();
@@ -139,6 +146,69 @@ export function createBoardView({
       if (visible && !pending) render();
     },
   });
+  function flushHeldMessageRender() {
+    if (
+      !renderHeldForMessageScroll ||
+      messageScrollActive ||
+      !visible ||
+      pending
+    )
+      return;
+    renderHeldForMessageScroll = false;
+    render();
+  }
+  function scheduleMessageScrollIdle() {
+    clearTimeout(messageScrollTimer);
+    messageScrollTimer = null;
+    if (messageTouchActive) return;
+    messageScrollTimer = setTimeout(() => {
+      messageScrollTimer = null;
+      messageScrollActive = false;
+      flushHeldMessageRender();
+    }, BOARD_SCROLL_IDLE_MS);
+  }
+  function holdMessageScroll() {
+    messageScrollActive = true;
+    scheduleMessageScrollIdle();
+  }
+  function currentMessageList(event) {
+    const list = event.currentTarget;
+    return list === root?.querySelector?.("#board-messages") ? list : null;
+  }
+  function noteMessageScroll(event) {
+    const list = currentMessageList(event);
+    if (!list) return;
+    if (
+      event.type === "scroll" &&
+      list === ignoredScrollElement &&
+      Math.abs(list.scrollTop - ignoredScrollTop) < 0.5
+    ) {
+      ignoredScrollElement = null;
+      return;
+    }
+    ignoredScrollElement = null;
+    holdMessageScroll();
+  }
+  function startMessageTouch(event) {
+    if (!currentMessageList(event)) return;
+    messageTouchActive = true;
+    messageScrollActive = true;
+    clearTimeout(messageScrollTimer);
+    messageScrollTimer = null;
+  }
+  function endMessageTouch(event) {
+    if (!currentMessageList(event)) return;
+    messageTouchActive = false;
+    if (messageScrollActive) scheduleMessageScrollIdle();
+  }
+  function interruptMessageScroll() {
+    clearTimeout(messageScrollTimer);
+    messageScrollTimer = null;
+    messageScrollActive = false;
+    messageTouchActive = false;
+    renderHeldForMessageScroll = false;
+    ignoredScrollElement = null;
+  }
   const draft = () => drafts.get(selected) || { text: "", to: "", replyTo: 0 };
   function saveDraft() {
     if (!root?.querySelector("#board-text")) return;
@@ -200,11 +270,13 @@ export function createBoardView({
     subscription?.stop();
     subscription = null;
     pending = false;
+    interruptMessageScroll();
     presentation.interrupt({ capture: wasVisible });
   }
   async function show(taskId) {
     visible = true;
     if (taskId && taskId !== selected) {
+      interruptMessageScroll();
       saveDraft();
       saveDecisionDrafts();
       saveDecisionPresentation();
@@ -284,12 +356,22 @@ export function createBoardView({
         if (reloadAgain && visible) {
           reloadAgain = false;
           void reload();
-        }
+        } else flushHeldMessageRender();
       }
     }
   }
   function render() {
     if (!visible) return;
+    if (renderedTask !== selected) interruptMessageScroll();
+    if (
+      messageScrollActive &&
+      renderedTask === selected &&
+      root?.querySelector?.("#board-messages")
+    ) {
+      renderHeldForMessageScroll = true;
+      return;
+    }
+    renderHeldForMessageScroll = false;
     if (!presentation.beforeRender(selected)) return;
     saveDraft();
     saveDecisionDrafts();
@@ -648,6 +730,19 @@ export function createBoardView({
     }
     const list = root.querySelector("#board-messages");
     restoreMessageScroll(list, messageScroll);
+    if (list) {
+      ignoredScrollElement = list;
+      ignoredScrollTop = list.scrollTop;
+      list.addEventListener?.("scroll", noteMessageScroll, { passive: true });
+      list.addEventListener?.("wheel", noteMessageScroll, { passive: true });
+      list.addEventListener?.("touchstart", startMessageTouch, {
+        passive: true,
+      });
+      list.addEventListener?.("touchend", endMessageTouch, { passive: true });
+      list.addEventListener?.("touchcancel", endMessageTouch, {
+        passive: true,
+      });
+    }
     if (focus) {
       const input = root.querySelector("#board-text");
       input?.focus();
