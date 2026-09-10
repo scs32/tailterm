@@ -798,8 +798,11 @@ func (s *Store) QueueAction(ctx context.Context, targetTaskID, entryID string, r
 		if orchestrator.Status == api.AgentRetired || orchestrator.Status == api.AgentClosed || orchestrator.Status == api.AgentExited || orchestrator.RunID == "" {
 			return api.QueueActionResult{}, workItemConflict("the current orchestrator run is not deliverable")
 		}
+		sameRecipient := orchestrator.ID == entry.OrchestratorAgentID && orchestrator.RunID == entry.OrchestratorRunID
 		entry.OrchestratorAgentID, entry.OrchestratorRunID = orchestrator.ID, orchestrator.RunID
-		recoveryRecipient = &orchestrator
+		if sameRecipient {
+			recoveryRecipient = &orchestrator
+		}
 	case "withdraw":
 		if terminalQueueState(entry.State) || !validQueueReason(reason, true) {
 			return api.QueueActionResult{}, api.ErrInvalid

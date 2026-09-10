@@ -500,12 +500,53 @@ func TestQueueNotificationUnavailableDoesNotResumeAndExplicitlyRetargets(t *test
 	if err != nil || reconciled.Entry.OrchestratorAgentID != replacement.ID || reconciled.Notification == nil || reconciled.Notification.Status != "stored" || reconciled.Notification.RecipientRunID != replacement.RunID {
 		t.Fatalf("recipient reconciliation: %+v %v", reconciled, err)
 	}
-	if reconciled.Notification.EventSeq != priority.Notification.EventSeq || reconciled.Notification.RecipientGeneration != priority.Notification.RecipientGeneration+1 || reconciled.Event.Seq == reconciled.Notification.EventSeq {
-		t.Fatalf("recipient recovery did not retain semantic event/generation history: %+v", reconciled)
+	if reconciled.Notification.EventSeq != reconciled.Event.Seq || reconciled.Notification.RecipientGeneration != 1 || reconciled.Notification.EventSeq == priority.Notification.EventSeq {
+		t.Fatalf("replacement retarget did not create its own semantic notice: %+v", reconciled)
 	}
 	var generations int
 	if err = s.db.QueryRow(`SELECT count(*) FROM queue_notifications WHERE entry_id=?`, sent.Queue.Entry.ID).Scan(&generations); err != nil || generations != 3 {
 		t.Fatalf("notification history=%d err=%v", generations, err)
+	}
+	var oldUnavailable int
+	if err = s.db.QueryRow(`SELECT count(*) FROM queue_notifications WHERE id=? AND status='unavailable'`, priority.Notification.ID).Scan(&oldUnavailable); err != nil || oldUnavailable != 1 {
+		t.Fatalf("replacement retarget rewrote prior unavailable notice=%d err=%v", oldUnavailable, err)
+	}
+}
+
+func TestQueueReplacementRetargetsWithoutUnavailableNotice(t *testing.T) {
+	s, ctx, by := workItemStore(t)
+	source, _ := workItemProject(t, s, ctx, by, "Clean replacement source", "sourcelead")
+	target, lead := workItemProject(t, s, ctx, by, "Clean replacement target", "targetlead")
+	item := createWorkItem(t, s, ctx, by, source, "clean-replacement")
+	sent, err := s.DispatchWorkItem(ctx, source.ID, item.ID, api.DispatchWorkItemRequest{Revision: item.Revision, TargetTaskID: target.ID, RequestID: "clean-replacement-send"}, by)
+	if err != nil || sent.Queue.Notification == nil || sent.Queue.Notification.Status != "stored" {
+		t.Fatalf("stored initial notice: %+v %v", sent.Queue.Notification, err)
+	}
+	if _, err = s.CloseAgent(ctx, lead.ID, by); err != nil {
+		t.Fatal(err)
+	}
+	replacement, err := s.AddAgent(ctx, target.ID, api.AddAgentRequest{Name: lead.Name, Host: "fixture", Session: "clean-replacement", Runtime: "codex"}, by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := api.QueueActionRequest{Operation: "reconcile_recipient", RequestID: "clean-replacement-retarget", ExpectedRevision: sent.Queue.Entry.Revision, Cycle: sent.Queue.Entry.Cycle, Reason: "explicit current orchestrator replacement"}
+	retargeted, err := s.QueueAction(ctx, target.ID, sent.Queue.Entry.ID, request, by)
+	if err != nil || retargeted.Entry.OrchestratorAgentID != replacement.ID || retargeted.Entry.OrchestratorRunID != replacement.RunID || retargeted.Notification == nil || retargeted.Notification.Status != "stored" {
+		t.Fatalf("replacement retarget: %+v %v", retargeted, err)
+	}
+	if retargeted.Notification.EventSeq != retargeted.Event.Seq || retargeted.Notification.RecipientGeneration != 1 || retargeted.Notification.RecipientAgentID != replacement.ID {
+		t.Fatalf("replacement notice is not its own semantic event: %+v", retargeted)
+	}
+	var initialRows int
+	if err = s.db.QueryRow(`SELECT count(*) FROM queue_notifications WHERE event_seq=? AND status='stored' AND recipient_agent_id=?`, sent.Queue.Event.Seq, lead.ID).Scan(&initialRows); err != nil || initialRows != 1 {
+		t.Fatalf("retarget rewrote original stored notice=%d err=%v", initialRows, err)
+	}
+	replay, err := s.QueueAction(ctx, target.ID, sent.Queue.Entry.ID, request, by)
+	if err != nil || !replay.Replay || replay.Notification == nil || replay.Notification.ID != retargeted.Notification.ID {
+		t.Fatalf("retarget replay: %+v %v", replay, err)
+	}
+	if _, err = s.DispatchWorkItem(ctx, source.ID, item.ID, api.DispatchWorkItemRequest{Revision: item.Revision, TargetTaskID: target.ID, RequestID: "clean-replacement-send-again"}, by); err != nil {
+		t.Fatalf("Send after explicit retarget: %v", err)
 	}
 }
 
