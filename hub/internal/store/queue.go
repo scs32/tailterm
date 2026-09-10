@@ -83,6 +83,10 @@ CREATE TABLE IF NOT EXISTS queue_events (
   actor_run_id TEXT NOT NULL DEFAULT '',
   reason TEXT NOT NULL DEFAULT '',
   dispatch_id TEXT NOT NULL DEFAULT '',
+  state TEXT NOT NULL DEFAULT '',
+  priority_rank INTEGER NOT NULL DEFAULT 3,
+  first_enqueued_at TEXT NOT NULL DEFAULT '',
+  entry_seq INTEGER NOT NULL DEFAULT 0,
   snapshot TEXT NOT NULL,
   observed_at TEXT NOT NULL,
   effective_at TEXT NOT NULL
@@ -161,6 +165,33 @@ func migrateQueue(db *sql.DB) error {
 		}
 	}
 	if _, err := db.Exec(queueSchema); err != nil {
+		return err
+	}
+	for _, column := range []struct{ name, definition string }{
+		{"state", "TEXT NOT NULL DEFAULT ''"},
+		{"priority_rank", "INTEGER NOT NULL DEFAULT 3"},
+		{"first_enqueued_at", "TEXT NOT NULL DEFAULT ''"},
+		{"entry_seq", "INTEGER NOT NULL DEFAULT 0"},
+	} {
+		var found int
+		if err := db.QueryRow(`SELECT count(*) FROM pragma_table_info('queue_events') WHERE name=?`, column.name).Scan(&found); err != nil {
+			return err
+		}
+		if found == 0 {
+			if _, err := db.Exec("ALTER TABLE queue_events ADD COLUMN " + column.name + " " + column.definition); err != nil {
+				return err
+			}
+		}
+	}
+	if _, err := db.Exec(`UPDATE queue_events SET
+		state=json_extract(snapshot,'$.state'),
+		priority_rank=CASE json_extract(snapshot,'$.queuePriority') WHEN 'urgent' THEN 0 WHEN 'high' THEN 1 WHEN 'normal' THEN 2 ELSE 3 END,
+		first_enqueued_at=json_extract(snapshot,'$.firstEnqueuedAt'),
+		entry_seq=CAST(json_extract(snapshot,'$.seq') AS INTEGER)
+		WHERE state='' OR first_enqueued_at='' OR entry_seq=0`); err != nil {
+		return err
+	}
+	if _, err := db.Exec(`CREATE INDEX IF NOT EXISTS queue_events_list ON queue_events(target_task_id,entry_id,seq,state,priority_rank,first_enqueued_at,entry_seq)`); err != nil {
 		return err
 	}
 	return reconcileLegacyQueue(db, time.Now().UTC())
@@ -270,8 +301,8 @@ func appendQueueEvent(ctx context.Context, tx *sql.Tx, entry api.QueueEntry, kin
 	if err != nil {
 		return api.QueueEvent{}, err
 	}
-	result, err := tx.ExecContext(ctx, `INSERT INTO queue_events(target_task_id,entry_id,cycle,revision,kind,actor_agent_id,actor_node,actor_user,actor_run_id,reason,dispatch_id,snapshot,observed_at,effective_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-		entry.TargetTaskID, entry.ID, entry.Cycle, entry.Revision, kind, actor.AgentID, actor.Node, actor.User, actorRunID, reason, dispatchID, string(snapshot), ts(observed), ts(effective))
+	result, err := tx.ExecContext(ctx, `INSERT INTO queue_events(target_task_id,entry_id,cycle,revision,kind,actor_agent_id,actor_node,actor_user,actor_run_id,reason,dispatch_id,state,priority_rank,first_enqueued_at,entry_seq,snapshot,observed_at,effective_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		entry.TargetTaskID, entry.ID, entry.Cycle, entry.Revision, kind, actor.AgentID, actor.Node, actor.User, actorRunID, reason, dispatchID, entry.State, priorityRank(entry.QueuePriority), ts(entry.FirstEnqueuedAt), entry.Seq, string(snapshot), ts(observed), ts(effective))
 	if err != nil {
 		return api.QueueEvent{}, err
 	}
@@ -487,11 +518,14 @@ func (s *Store) authorizeQueueAction(ctx context.Context, tx *sql.Tx, entry api.
 	if req.Selection.TaskID != entry.TargetTaskID || req.Selection.MessageSeq < 1 {
 		return api.ErrInvalid
 	}
-	var fromAgent, fromRun string
-	if err := tx.QueryRowContext(ctx, `SELECT from_agent,from_run_id FROM messages WHERE task_id=? AND seq=?`, req.Selection.TaskID, req.Selection.MessageSeq).Scan(&fromAgent, &fromRun); err != nil {
+	var fromAgent, fromRun, systemNoticeKind, systemNoticeID string
+	if err := tx.QueryRowContext(ctx, `SELECT from_agent,from_run_id,system_notice_kind,system_notice_id FROM messages WHERE task_id=? AND seq=?`, req.Selection.TaskID, req.Selection.MessageSeq).Scan(&fromAgent, &fromRun, &systemNoticeKind, &systemNoticeID); err != nil {
 		return api.ErrInvalid
 	}
 	if fromAgent == "" {
+		if systemNoticeKind != "" || systemNoticeID != "" {
+			return api.ErrInvalid
+		}
 		return nil
 	}
 	task, err := scanTask(tx.QueryRowContext(ctx, `SELECT `+taskCols+` FROM tasks WHERE id=?`, entry.TargetTaskID))
@@ -841,7 +875,31 @@ func (s *Store) ListQueue(ctx context.Context, taskID, rawCursor string, limit i
 	} else if err = s.db.QueryRowContext(ctx, `SELECT coalesce(max(seq),0) FROM queue_events WHERE target_task_id=?`, taskID).Scan(&cursor.Cutoff); err != nil {
 		return api.QueueList{}, err
 	}
-	rows, err := s.db.QueryContext(ctx, `SELECT e.snapshot FROM queue_events e JOIN (SELECT entry_id,max(seq) seq FROM queue_events WHERE target_task_id=? AND seq<=? GROUP BY entry_id) latest ON latest.seq=e.seq ORDER BY e.entry_id`, taskID, cursor.Cutoff)
+	terminal := 0
+	if includeTerminal {
+		terminal = 1
+	}
+	const latestQueue = `WITH latest AS (
+		SELECT entry_id,max(seq) seq FROM queue_events WHERE target_task_id=? AND seq<=? GROUP BY entry_id
+	)`
+	var total int64
+	if err = s.db.QueryRowContext(ctx, latestQueue+`
+		SELECT count(*) FROM queue_events e JOIN latest ON latest.seq=e.seq
+		WHERE ?=1 OR e.state NOT IN ('completed','cancelled')`, taskID, cursor.Cutoff, terminal).Scan(&total); err != nil {
+		return api.QueueList{}, err
+	}
+	if cursor.Offset > total {
+		return api.QueueList{}, api.ErrInvalid
+	}
+	rows, err := s.db.QueryContext(ctx, latestQueue+`, page AS (
+		SELECT e.seq,e.priority_rank,e.first_enqueued_at,e.entry_seq
+		FROM queue_events e JOIN latest ON latest.seq=e.seq
+		WHERE ?=1 OR e.state NOT IN ('completed','cancelled')
+		ORDER BY e.priority_rank,e.first_enqueued_at,e.entry_seq
+		LIMIT ? OFFSET ?
+	)
+		SELECT e.snapshot FROM page JOIN queue_events e ON e.seq=page.seq
+		ORDER BY page.priority_rank,page.first_enqueued_at,page.entry_seq`, taskID, cursor.Cutoff, terminal, limit+1, cursor.Offset)
 	if err != nil {
 		return api.QueueList{}, err
 	}
@@ -856,35 +914,24 @@ func (s *Store) ListQueue(ctx context.Context, taskID, rawCursor string, limit i
 			}
 			return api.QueueList{}, err
 		}
-		if includeTerminal || !terminalQueueState(entry.State) {
-			entries = append(entries, entry)
-		}
+		entries = append(entries, entry)
 	}
 	if err = rows.Close(); err != nil {
 		return api.QueueList{}, err
 	}
-	sort.SliceStable(entries, func(i, j int) bool {
-		a, b := entries[i], entries[j]
-		if priorityRank(a.QueuePriority) != priorityRank(b.QueuePriority) {
-			return priorityRank(a.QueuePriority) < priorityRank(b.QueuePriority)
+	if len(entries) > limit {
+		entries = entries[:limit]
+	}
+	out := api.QueueList{Entries: entries, Cutoff: cursor.Cutoff}
+	setCursor := func() {
+		next := cursor.Offset + int64(len(out.Entries))
+		out.Complete = next == total
+		out.Cursor = ""
+		if !out.Complete {
+			out.Cursor = encodeQueueCursor(queueCursor{TaskID: taskID, Kind: "list", Cutoff: cursor.Cutoff, Offset: next, Terminal: includeTerminal})
 		}
-		if !a.FirstEnqueuedAt.Equal(b.FirstEnqueuedAt) {
-			return a.FirstEnqueuedAt.Before(b.FirstEnqueuedAt)
-		}
-		return a.Seq < b.Seq
-	})
-	if cursor.Offset > int64(len(entries)) {
-		return api.QueueList{}, api.ErrInvalid
 	}
-	start := int(cursor.Offset)
-	end := start + limit
-	if end > len(entries) {
-		end = len(entries)
-	}
-	out := api.QueueList{Entries: append([]api.QueueEntry{}, entries[start:end]...), Cutoff: cursor.Cutoff, Complete: end == len(entries)}
-	if !out.Complete {
-		out.Cursor = encodeQueueCursor(queueCursor{TaskID: taskID, Kind: "list", Cutoff: cursor.Cutoff, Offset: int64(end), Terminal: includeTerminal})
-	}
+	setCursor()
 	for {
 		b, marshalErr := json.Marshal(out)
 		if marshalErr != nil {
@@ -897,9 +944,7 @@ func (s *Store) ListQueue(ctx context.Context, taskID, rawCursor string, limit i
 			return api.QueueList{}, api.ErrLimit
 		}
 		out.Entries = out.Entries[:len(out.Entries)-1]
-		end--
-		out.Complete = false
-		out.Cursor = encodeQueueCursor(queueCursor{TaskID: taskID, Kind: "list", Cutoff: cursor.Cutoff, Offset: int64(end), Terminal: includeTerminal})
+		setCursor()
 	}
 	return out, nil
 }

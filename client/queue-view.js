@@ -33,6 +33,9 @@ export function createQueueView({
     visible = false,
     generation = 0,
     subscription,
+    subscriptionClient,
+    activeClient,
+    activeClientScope = "",
     tasks = [],
     entries = [],
     scope = "",
@@ -65,9 +68,9 @@ export function createQueueView({
     generation++;
     subscription?.stop();
     subscription = null;
+    subscriptionClient = null;
   }
-  async function scopeKey() {
-    const connected = client();
+  async function scopeKey(connected) {
     if (!connected) return "";
     const bytes = await crypto.subtle.digest(
       "SHA-256",
@@ -87,19 +90,22 @@ export function createQueueView({
     if (taskId !== undefined) scope = taskId || scope;
     visible = true;
     await reload();
-    if (visible && client() && !subscription)
-      subscription = client().subscribe("", () => reload(), {
-        onError: () => {},
-      });
   }
   async function reload() {
     if (!visible || !root) return;
     if (loading) {
       reloadAgain = true;
+      generation++;
       return;
     }
     const connected = client();
     if (!connected) {
+      generation++;
+      activeClient = null;
+      activeClientScope = "";
+      subscription?.stop();
+      subscription = null;
+      subscriptionClient = null;
       root.innerHTML =
         '<div class="mode-empty"><span class="eyebrow">QUEUE</span><h2>Connect a project hub.</h2><button data-queue-configure>Configure project hub</button></div>';
       root.querySelector("button").onclick = configure;
@@ -107,7 +113,11 @@ export function createQueueView({
     }
     loading = true;
     reloadAgain = false;
-    const requestAt = ++generation;
+    const requestAt = ++generation,
+      requestedScope = scope,
+      requestedTerminal = includeTerminal,
+      stillCurrent = () =>
+        visible && requestAt === generation && client() === connected;
     try {
       let caps;
       try {
@@ -117,42 +127,67 @@ export function createQueueView({
         else throw error;
       }
       const nextTasks = await connected.listTasks();
-      if (!visible || requestAt !== generation) return;
-      capability = caps?.queue?.versions?.includes(1) ? caps.queue : null;
-      tasks = nextTasks;
-      if (!scope || !tasks.some((task) => task.id === scope))
-        scope =
-          tasks.find((task) => task.status === "open")?.id ||
-          tasks[0]?.id ||
-          "";
-      persistenceScope = await scopeKey();
-      intents.clear();
-      for (const intent of await persistence.list(persistenceScope))
-        intents.set(intent.id, intent);
+      if (!stillCurrent()) return;
+      const nextCapability = caps?.queue?.versions?.includes(1)
+          ? caps.queue
+          : null,
+        nextScope = nextTasks.some((task) => task.id === requestedScope)
+          ? requestedScope
+          : nextTasks.find((task) => task.status === "open")?.id ||
+            nextTasks[0]?.id ||
+            "",
+        nextPersistenceScope = await scopeKey(connected);
+      if (!stillCurrent()) return;
+      const savedIntents = await persistence.list(nextPersistenceScope),
+        nextIntents = new Map(
+          savedIntents.map((intent) => [intent.id, intent]),
+        );
+      if (!stillCurrent()) return;
       const next = [];
-      if (scope && capability) {
+      if (nextScope && nextCapability) {
         let cursor = "";
         do {
-          const page = await connected.listQueue(scope, {
+          const page = await connected.listQueue(nextScope, {
             cursor,
             limit: 64,
-            includeTerminal: includeTerminal ? 1 : "",
+            includeTerminal: requestedTerminal ? 1 : "",
           });
+          if (!stillCurrent()) return;
           next.push(...page.entries);
           cursor = page.cursor || "";
-        } while (cursor && visible && requestAt === generation);
+        } while (cursor);
       }
-      if (!visible || requestAt !== generation) return;
+      if (!stillCurrent()) return;
+      capability = nextCapability;
+      tasks = nextTasks;
+      scope = nextScope;
+      persistenceScope = nextPersistenceScope;
+      intents.clear();
+      for (const [id, intent] of nextIntents) intents.set(id, intent);
       entries = next;
       if (!entries.some((entry) => entry.id === selected))
         selected = entries[0]?.id || "";
+      activeClient = connected;
+      activeClientScope = nextPersistenceScope;
+      if (subscriptionClient !== connected) {
+        subscription?.stop();
+        subscription = null;
+        subscriptionClient = null;
+      }
+      if (!subscription && connected.subscribe) {
+        subscription = connected.subscribe("", () => reload(), {
+          onError: () => {},
+        });
+        subscriptionClient = connected;
+      }
       render();
     } catch (error) {
-      if (!visible || requestAt !== generation) return;
+      if (!stillCurrent()) return;
       root.innerHTML = `<div class="mode-empty"><span class="eyebrow">QUEUE</span><h2>Hub unavailable.</h2><p role="alert">${esc(error.message)}</p><button data-queue-retry>Retry</button></div>`;
       root.querySelector("button").onclick = reload;
     } finally {
       loading = false;
+      if (visible && client() !== connected) reloadAgain = true;
       if (reloadAgain && visible) queueMicrotask(() => void reload());
     }
   }
@@ -243,7 +278,10 @@ export function createQueueView({
     const markerList = markers(entry),
       entryIntents = [...intents.values()].filter(
         (intent) => intent.entryId === entry.id,
-      );
+      ),
+      entryError =
+        errors.get(entry.id) ||
+        entryIntents.map((intent) => errors.get(intent.id)).find(Boolean);
     return `<header><span class="eyebrow">${esc(stateLabels[entry.state] || entry.state)} · CYCLE ${entry.cycle}</span><h3>${esc(entry.item.title)}</h3><p class="fine">${esc(entry.sourceTaskId)} / ${esc(entry.itemId)} · offered r${entry.offeredItemRevision} · current r${entry.currentItemRevision}</p></header>${markerList.length ? `<div class="queue-markers">${markerList.map((marker) => `<span>${esc(marker)}</span>`).join("")}</div>` : ""}<p>${esc(entry.item.description || "No description.")}</p><dl class="queue-facts"><div><dt>Source status</dt><dd>${esc(entry.item.status)}</dd></div><div><dt>Queue revision</dt><dd>${entry.revision}</dd></div><div><dt>Claimant</dt><dd>${esc(entry.claimantAgentId || "Not claimed")}</dd></div><div><dt>Worker run</dt><dd>${esc(entry.workerRunId || "Not started")}</dd></div></dl><div class="queue-actions"><label>Queue priority<select data-queue-priority ${["completed", "cancelled"].includes(entry.state) ? "disabled" : ""}>${Object.entries(
       priorities,
     )
@@ -253,11 +291,27 @@ export function createQueueView({
       )
       .join(
         "",
-      )}</select></label><button type="button" data-queue-pull class="primary" ${entry.state !== "waiting" || !entry.eligible || entry.stale || entry.reviewNeeded || !entry.orchestratorAgentId ? "disabled" : ""}>Pull</button><button type="button" data-queue-history>History</button></div><p class="fine">Pull records selection only. Starting requires a separately admitted exact worker/run/order/context binding through the Database handler.</p>${errors.get(entry.id) ? `<p role="alert">${esc(errors.get(entry.id))}</p>` : ""}${entryIntents.map((intent) => `<div class="queue-recovery" role="status"><span>Uncertain ${esc(intent.payload.operation)} request · ${esc(intent.requestId)}</span><button type="button" data-queue-retry-intent="${esc(intent.id)}">Retry exact request</button><button type="button" data-queue-discard-intent="${esc(intent.id)}">Discard</button></div>`).join("")}`;
+      )}</select></label><button type="button" data-queue-pull class="primary" ${entry.state !== "waiting" || !entry.eligible || entry.stale || entry.reviewNeeded || !entry.orchestratorAgentId ? "disabled" : ""}>Pull</button><button type="button" data-queue-history>History</button></div><p class="fine">Pull records selection only. Starting requires a separately admitted exact worker/run/order/context binding through the Database handler.</p>${entryError ? `<p role="alert">${esc(entryError)}</p>` : ""}${entryIntents.map((intent) => `<div class="queue-recovery" role="status"><span>Uncertain ${esc(intent.payload.operation)} request · ${esc(intent.requestId)}</span><button type="button" data-queue-retry-intent="${esc(intent.id)}">Retry exact request</button><button type="button" data-queue-discard-intent="${esc(intent.id)}">Discard</button></div>`).join("")}`;
   }
-  async function saveIntent(id, entry, payload) {
+  function canSend(session) {
+    return (
+      visible &&
+      generation === session.generation &&
+      scope === session.taskId &&
+      persistenceScope === session.connectionScope
+    );
+  }
+  function isCurrent(session) {
+    return (
+      canSend(session) &&
+      client() === session.connected &&
+      activeClient === session.connected &&
+      activeClientScope === session.connectionScope
+    );
+  }
+  async function saveIntent(id, entry, payload, session) {
     const intent = {
-      scope: persistenceScope,
+      scope: session.connectionScope,
       id,
       state: "uncertain",
       requestId: payload.requestId,
@@ -266,54 +320,90 @@ export function createQueueView({
       payload: structuredClone(payload),
       updatedAt: new Date().toISOString(),
     };
-    intents.set(id, intent);
     await persistence.save(intent);
-    render();
+    if (isCurrent(session)) {
+      intents.set(id, intent);
+      render();
+    }
     return intent;
   }
-  async function submitIntent(intent) {
-    errors.delete(intent.entryId);
+  async function submitIntent(intent, session) {
+    if (!canSend(session)) return;
     try {
-      const result = await client().queueAction(
+      const result = await session.connected.queueAction(
         intent.taskId,
         intent.entryId,
         intent.payload,
       );
+      await persistence.remove(intent.scope, intent.id, intent.requestId);
       const current = intents.get(intent.id);
       if (
         current?.requestId === intent.requestId &&
         JSON.stringify(current.payload) === JSON.stringify(intent.payload)
       ) {
-        intents.delete(intent.id);
-        await persistence.remove(persistenceScope, intent.id, intent.requestId);
+        if (
+          persistenceScope === intent.scope &&
+          intents.get(intent.id) === current
+        )
+          intents.delete(intent.id);
       }
-      entries = entries.map((entry) =>
-        entry.id === result.entry.id ? result.entry : entry,
-      );
-      selected = result.entry.id;
-      notice(
-        `${stateLabels[result.entry.state] || result.entry.state} · Queue revision ${result.entry.revision}. No agent was started.`,
-      );
+      if (isCurrent(session)) {
+        errors.delete(intent.id);
+        entries = entries.map((entry) =>
+          entry.id === result.entry.id &&
+          result.entry.revision >= entry.revision
+            ? result.entry
+            : entry,
+        );
+        selected = result.entry.id;
+        notice(
+          `${stateLabels[result.entry.state] || result.entry.state} · Queue revision ${result.entry.revision}. No agent was started.`,
+        );
+      }
     } catch (error) {
-      errors.set(intent.entryId, error.message);
+      if (isCurrent(session)) errors.set(intent.id, error.message);
     }
-    render();
+    if (isCurrent(session)) render();
   }
   async function runNewAction(entry, operation, fields = {}) {
     if (!entry) return;
-    const id = `${entry.targetTaskId}:${entry.id}:${operation}`;
+    const currentEntry = entries.find((value) => value.id === entry.id);
+    if (
+      !visible ||
+      client() !== activeClient ||
+      scope !== entry.targetTaskId ||
+      currentEntry?.revision !== entry.revision ||
+      currentEntry?.cycle !== entry.cycle
+    ) {
+      errors.set(entry.id, "Queue view changed. Refresh before acting.");
+      render();
+      return;
+    }
+    const session = {
+        connected: activeClient,
+        connectionScope: activeClientScope,
+        generation,
+        taskId: entry.targetTaskId,
+      },
+      requestId = crypto.randomUUID(),
+      id = `${entry.targetTaskId}:${entry.id}:${operation}:${requestId}`;
     const payload = {
       operation,
-      requestId: crypto.randomUUID(),
+      requestId,
       expectedRevision: entry.revision,
       cycle: entry.cycle,
       ...fields,
     };
     try {
-      await submitIntent(await saveIntent(id, entry, payload));
+      await submitIntent(
+        await saveIntent(id, entry, payload, session),
+        session,
+      );
     } catch (error) {
-      errors.set(entry.id, error.message);
-      render();
+      if (isCurrent(session)) {
+        errors.set(entry.id, error.message);
+        render();
+      }
     }
   }
   function pull(entry) {
@@ -347,6 +437,14 @@ export function createQueueView({
   }
   async function history(entry) {
     if (!entry) return;
+    const session = {
+      connected: activeClient,
+      connectionScope: activeClientScope,
+      generation,
+      taskId: entry.targetTaskId,
+      entryId: entry.id,
+    };
+    if (!isCurrent(session) || selected !== entry.id) return;
     dialog(
       "Queue history",
       '<div class="queue-history"><p class="fine">Loading immutable transitions…</p></div>',
@@ -356,15 +454,20 @@ export function createQueueView({
     try {
       let cursor = "";
       do {
-        const page = await client().listQueueHistory(
+        const page = await session.connected.listQueueHistory(
           entry.targetTaskId,
           entry.id,
           { cursor, limit: 64 },
         );
+        if (!isCurrent(session) || selected !== session.entryId) return;
         events.push(...page.events);
         cursor = page.cursor || "";
       } while (cursor && panel.isConnected);
-      if (panel.isConnected)
+      if (
+        panel.isConnected &&
+        isCurrent(session) &&
+        selected === session.entryId
+      )
         panel.innerHTML = events
           .map(
             (event) =>
@@ -372,19 +475,49 @@ export function createQueueView({
           )
           .join("");
     } catch (error) {
-      if (panel.isConnected)
+      if (
+        panel.isConnected &&
+        isCurrent(session) &&
+        selected === session.entryId
+      )
         panel.innerHTML = `<p role="alert">${esc(error.message)}</p>`;
     }
   }
   async function retryIntent(id) {
     const intent = intents.get(id);
-    if (intent) await submitIntent(intent);
+    if (!intent) return;
+    const connected = client(),
+      requestAt = generation,
+      connectionScope = await scopeKey(connected);
+    if (
+      !visible ||
+      generation !== requestAt ||
+      client() !== connected ||
+      connectionScope !== intent.scope ||
+      persistenceScope !== intent.scope ||
+      scope !== intent.taskId
+    ) {
+      if (visible && intents.get(id) === intent) {
+        errors.set(
+          id,
+          "This request belongs to another connection or project.",
+        );
+        render();
+      }
+      return;
+    }
+    await submitIntent(intent, {
+      connected,
+      connectionScope,
+      generation: requestAt,
+      taskId: intent.taskId,
+    });
   }
   async function discardIntent(id) {
     const intent = intents.get(id);
     if (!intent) return;
     intents.delete(id);
-    await persistence.remove(persistenceScope, id, intent.requestId);
+    await persistence.remove(intent.scope, id, intent.requestId);
     render();
   }
   return { mount, show, hide, reload };

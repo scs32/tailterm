@@ -4,7 +4,9 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 
@@ -559,6 +561,12 @@ func TestQueueAgentMutationsRequireExactHandlerRunAndRetainedSelection(t *testin
 	if _, err = s.QueueAction(ctx, target.ID, sent.Queue.Entry.ID, untrustedSelection, by); err == nil {
 		t.Fatal("builder prose authorized Queue mutation")
 	}
+	systemSelection := base
+	systemSelection.RequestID = "authority-system-notice"
+	systemSelection.Selection = &api.QueueSelection{TaskID: target.ID, MessageSeq: sent.Queue.Notification.MessageSeq}
+	if _, err = s.QueueAction(ctx, target.ID, sent.Queue.Entry.ID, systemSelection, by); err == nil {
+		t.Fatal("typed Queue system notice authorized Queue mutation as a human selection")
+	}
 	changed, err := s.QueueAction(ctx, target.ID, sent.Queue.Entry.ID, base, by)
 	if err != nil || changed.Entry.QueuePriority != "urgent" {
 		t.Fatalf("authorized handler mutation: %+v %v", changed, err)
@@ -644,6 +652,69 @@ func TestQueueFrozenPagesChangesAndBounds(t *testing.T) {
 	}
 	if _, err = s.ListQueue(ctx, target.ID, "", 65, false); !errors.Is(err, api.ErrInvalid) {
 		t.Fatalf("oversize list=%v", err)
+	}
+}
+
+func TestQueueListBoundsFullSnapshotMaterialization(t *testing.T) {
+	s, ctx, by := workItemStore(t)
+	source, _ := workItemProject(t, s, ctx, by, "Bounded source", "sourcelead")
+	target, _ := workItemProject(t, s, ctx, by, "Bounded target", "targetlead")
+	lastEntryID := ""
+	for i := 0; i < 70; i++ {
+		item, err := s.CreateWorkItem(ctx, source.ID, api.CreateWorkItemRequest{
+			Kind:        "bug",
+			Title:       fmt.Sprintf("Bounded item %03d", i),
+			Description: strings.Repeat(string(rune('a'+i%26)), 7*1024),
+			RequestID:   fmt.Sprintf("bounded-item-%03d", i),
+		}, by)
+		if err != nil {
+			t.Fatal(err)
+		}
+		sent, err := s.DispatchWorkItem(ctx, source.ID, item.ID, api.DispatchWorkItemRequest{
+			Revision: item.Revision, TargetTaskID: target.ID, RequestID: fmt.Sprintf("bounded-send-%03d", i),
+		}, by)
+		if err != nil {
+			t.Fatal(err)
+		}
+		lastEntryID = sent.Queue.Entry.ID
+	}
+	seen := map[string]bool{}
+	cursor := ""
+	for {
+		page, err := s.ListQueue(ctx, target.ID, cursor, api.MaxQueuePage, false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		encoded, err := json.Marshal(page)
+		if err != nil || len(encoded)+1 > api.MaxQueuePageBytes {
+			t.Fatalf("unbounded page bytes=%d err=%v", len(encoded)+1, err)
+		}
+		for _, entry := range page.Entries {
+			if seen[entry.ID] {
+				t.Fatalf("duplicate entry %s", entry.ID)
+			}
+			seen[entry.ID] = true
+		}
+		if page.Complete {
+			break
+		}
+		if page.Cursor == "" || page.Cursor == cursor {
+			t.Fatalf("Queue cursor did not advance: %q", page.Cursor)
+		}
+		cursor = page.Cursor
+	}
+	if len(seen) != 70 {
+		t.Fatalf("bounded traversal returned %d entries", len(seen))
+	}
+	// A later off-page full snapshot must not be selected or deserialized for a
+	// one-row first page. The list query materializes at most limit+1 snapshot
+	// blobs; its cutoff/group/order work uses only indexed scalar event fields.
+	if _, err := s.db.Exec(`UPDATE queue_events SET snapshot='not-json' WHERE entry_id=?`, lastEntryID); err != nil {
+		t.Fatal(err)
+	}
+	page, err := s.ListQueue(ctx, target.ID, "", 1, false)
+	if err != nil || len(page.Entries) != 1 || page.Complete {
+		t.Fatalf("first bounded page materialized an off-page snapshot: %+v %v", page, err)
 	}
 }
 
