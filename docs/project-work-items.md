@@ -76,9 +76,11 @@ most 64. Continue with the returned opaque cursor; entries appended after the
 first page are excluded from that traversal. Fetch exact artifact and report
 versions separately to read their full content. Stored narrative text is UTF-8,
 limited to 1 MiB of decoded content per version and never truncated; JSON
-escaping uses the larger transport bound. Metadata responses stop below 3 MiB
-and return an advancing cursor instead of truncating a record set. Closed
-projects retain reader access but reject new narrative writes.
+escaping uses the larger transport bound. A report or coverage declaration can
+carry at most 384 KiB of aggregate reference metadata; the HTTP envelopes cover
+the worst-case escaping of both legal content and references. Metadata responses
+stop below 3 MiB and return an advancing cursor instead of truncating a record
+set. Closed projects retain reader access but reject new narrative writes.
 
 A feature can transition to Done only after a complete structured report has
 been stored, read back and pinned by report ID, exact version, server digest and

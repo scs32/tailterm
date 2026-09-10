@@ -247,18 +247,18 @@ func TestNarrativeDecodedReportLimitAndBoundedOverviewCoverage(t *testing.T) {
 		t.Fatalf("decoded report above 1MiB=%v", err)
 	}
 
-	references := make([]api.NarrativeReference, 256)
+	references := make([]api.NarrativeReference, 128)
 	for i := range references {
 		references[i] = api.NarrativeReference{Kind: "external", SourceID: strings.Repeat("s", 512), Locator: "https://example.invalid/" + strings.Repeat("p", 1700), Label: strings.Repeat("l", 512)}
 	}
-	for i := 0; i < 8; i++ {
+	for i := 0; i < 12; i++ {
 		coverage := api.PutNarrativeCoverageRequest{RequestID: fmtKey("bounded-coverage", i), Source: fmtKey("source", i), Scope: strings.Repeat("q", 4096), CaptureState: "reference-only", CapturedIDs: []string{"submitted-enumeration"}, KnownGaps: []string{"unknown remote extent"}, UnknownExtent: true, Assessment: "unverified", AssessmentText: strings.Repeat("a", 8192), EvidenceReferences: references}
 		if _, _, err := s.PutNarrativeCoverage(ctx, project.ID, item.ID, coverage, by); err != nil {
 			t.Fatal(err)
 		}
 	}
 	first, err := s.GetNarrativeOverviewPage(ctx, project.ID, item.ID, "", 32)
-	if err != nil || first.CoverageNextCursor == "" || len(first.Coverage) >= 8 {
+	if err != nil || first.CoverageNextCursor == "" || len(first.Coverage) >= 12 {
 		t.Fatalf("bounded overview count=%d cursor=%q err=%v", len(first.Coverage), first.CoverageNextCursor, err)
 	}
 	raw, _ := json.Marshal(first)
@@ -266,7 +266,7 @@ func TestNarrativeDecodedReportLimitAndBoundedOverviewCoverage(t *testing.T) {
 		t.Fatalf("overview metadata=%d", len(raw))
 	}
 	coverageFirst, err := s.ListNarrativeCoverage(ctx, project.ID, item.ID, "", 32)
-	if err != nil || coverageFirst.NextCursor == "" || len(coverageFirst.Coverage) >= 8 {
+	if err != nil || coverageFirst.NextCursor == "" || len(coverageFirst.Coverage) >= 12 {
 		t.Fatalf("bounded coverage count=%d cursor=%q err=%v", len(coverageFirst.Coverage), coverageFirst.NextCursor, err)
 	}
 	raw, _ = json.Marshal(coverageFirst)
@@ -278,7 +278,7 @@ func TestNarrativeDecodedReportLimitAndBoundedOverviewCoverage(t *testing.T) {
 		t.Fatal(err)
 	}
 	second, err := s.GetNarrativeOverviewPage(ctx, project.ID, item.ID, first.CoverageNextCursor, 32)
-	if err != nil || len(first.Coverage)+len(second.Coverage) != 8 {
+	if err != nil || len(first.Coverage)+len(second.Coverage) != 12 {
 		t.Fatalf("overview continuation total=%d err=%v", len(first.Coverage)+len(second.Coverage), err)
 	}
 	seenSources := map[string]bool{}
@@ -292,7 +292,7 @@ func TestNarrativeDecodedReportLimitAndBoundedOverviewCoverage(t *testing.T) {
 		seenSources[entry.Source] = true
 	}
 	coverageSecond, err := s.ListNarrativeCoverage(ctx, project.ID, item.ID, coverageFirst.NextCursor, 32)
-	if err != nil || len(coverageFirst.Coverage)+len(coverageSecond.Coverage) != 8 {
+	if err != nil || len(coverageFirst.Coverage)+len(coverageSecond.Coverage) != 12 {
 		t.Fatalf("coverage continuation total=%d err=%v", len(coverageFirst.Coverage)+len(coverageSecond.Coverage), err)
 	}
 	seenSources = map[string]bool{}

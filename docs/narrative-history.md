@@ -32,7 +32,9 @@ recovery and conflict safety. Frozen cursors separate stable traversal order
 from source timestamps. Metadata is byte-bounded and continues through a frozen
 cursor, including overview coverage. Content is fetched separately, capped at 1
 MiB of decoded UTF-8 and never silently truncated; escaped transport bytes use
-the separate larger request/response bounds.
+the separate larger request/response bounds. Report and coverage references
+have a 384 KiB aggregate logical-JSON limit; the transport bounds include its
+worst legal encoding together with a full report.
 
 Feature completion now atomically validates a complete structured report and
 its exact ID, version, digest and current scope revision on both update paths.
@@ -65,7 +67,9 @@ Server and CLI tests cover request limits, exact full-content reads, structured
 completion errors, retries and unsafe locators. Chromium and WebKit exercise
 safe rendering, post-Done corrections and historical report selection,
 retraction semantics, provenance, stale artifact failures, reload, coverage
-gaps and retained drafts. The broader internal Go,
+gaps, distinct Board/reviser attribution and retained drafts. The actual Go HTTP
+client also round-trips a full escaped report plus the largest supported
+reference set and rejects the next reference without truncation. The broader internal Go,
 race, CLI, JavaScript and existing work-item browser suites are part of the
 candidate verification handoff.
 

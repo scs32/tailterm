@@ -234,7 +234,7 @@ func (s *Server) putNarrativeCoverage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req api.PutNarrativeCoverageRequest
-	if !decode(w, r, &req) {
+	if !decodeLimited(w, r, &req, api.MaxNarrativeMetadataBody) {
 		return
 	}
 	result, replay, err := s.store.PutNarrativeCoverage(r.Context(), task, item, req, caller)

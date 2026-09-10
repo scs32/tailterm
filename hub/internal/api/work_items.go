@@ -14,9 +14,11 @@ const (
 	DefaultNarrativePage       = 32
 	MaxNarrativePage           = 64
 	MaxNarrativeContentBytes   = 1 << 20
+	MaxNarrativeReferenceBytes = 384 << 10
 	MaxNarrativeResponseBytes  = 3 << 20
-	MaxNarrativeRequestBody    = 6*MaxNarrativeContentBytes + 256*1024
-	MaxNarrativeEncodedBytes   = 7 << 20
+	MaxNarrativeMetadataBody   = 6*MaxNarrativeReferenceBytes + 256*1024
+	MaxNarrativeRequestBody    = 6*(MaxNarrativeContentBytes+MaxNarrativeReferenceBytes) + 256*1024
+	MaxNarrativeEncodedBytes   = MaxNarrativeRequestBody + 256*1024
 )
 
 type WorkItem struct {

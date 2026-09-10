@@ -1,6 +1,7 @@
 package store
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"database/sql"
@@ -838,10 +839,20 @@ func validateStringList(values []string) bool {
 	}
 	return total <= 8192
 }
+
+func validNarrativeReferences(values []api.NarrativeReference) bool {
+	if len(values) > 256 {
+		return false
+	}
+	var encoded bytes.Buffer
+	encoder := json.NewEncoder(&encoded)
+	encoder.SetEscapeHTML(false)
+	return encoder.Encode(values) == nil && encoded.Len() <= api.MaxNarrativeReferenceBytes
+}
 func (s *Store) PutNarrativeCoverage(ctx context.Context, taskID, itemID string, req api.PutNarrativeCoverageRequest, by api.Caller) (api.NarrativeCoverageVersion, bool, error) {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
-	if !api.ValidID(taskID, "tsk") || !api.ValidID(itemID, "wi") || !validRequestID(req.RequestID) || req.ExpectedRevision < 0 || (req.CoverageID != "" && !validNarrativeID(req.CoverageID, "ncov")) || !validNarrativeText(req.Source, 128, true) || !validNarrativeText(req.Scope, 4096, true) || !validCaptureState(req.CaptureState) || !validAssessment(req.Assessment) || !validNarrativeText(req.AssessmentText, 8192, false) || !validateStringList(req.CapturedIDs) || !validateStringList(req.KnownGaps) || len(req.EvidenceReferences) > 256 || !validNarrativeSender(req.AssessedBy, req.Assessment != "unverified") || (req.Assessment != "unverified" && len(req.EvidenceReferences) == 0) {
+	if !api.ValidID(taskID, "tsk") || !api.ValidID(itemID, "wi") || !validRequestID(req.RequestID) || req.ExpectedRevision < 0 || (req.CoverageID != "" && !validNarrativeID(req.CoverageID, "ncov")) || !validNarrativeText(req.Source, 128, true) || !validNarrativeText(req.Scope, 4096, true) || !validCaptureState(req.CaptureState) || !validAssessment(req.Assessment) || !validNarrativeText(req.AssessmentText, 8192, false) || !validateStringList(req.CapturedIDs) || !validateStringList(req.KnownGaps) || !validNarrativeReferences(req.EvidenceReferences) || !validNarrativeSender(req.AssessedBy, req.Assessment != "unverified") || (req.Assessment != "unverified" && len(req.EvidenceReferences) == 0) {
 		return api.NarrativeCoverageVersion{}, false, api.ErrInvalid
 	}
 	payload := narrativePayloadHash(req)
@@ -1009,7 +1020,7 @@ const reportVersionCols = `report_id,task_id,item_id,version,narrative_seq,scope
 func (s *Store) PutNarrativeReport(ctx context.Context, taskID, itemID string, req api.PutNarrativeReportRequest, by api.Caller) (api.NarrativeReportVersion, bool, error) {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
-	if !api.ValidID(taskID, "tsk") || !api.ValidID(itemID, "wi") || !validRequestID(req.RequestID) || req.ExpectedVersion < 0 || req.ScopeRevision < 1 || (req.ReportID != "" && !validNarrativeID(req.ReportID, "nrpt")) || !validReportSections(req.Sections) || len(req.References) < 1 || len(req.References) > 256 {
+	if !api.ValidID(taskID, "tsk") || !api.ValidID(itemID, "wi") || !validRequestID(req.RequestID) || req.ExpectedVersion < 0 || req.ScopeRevision < 1 || (req.ReportID != "" && !validNarrativeID(req.ReportID, "nrpt")) || !validReportSections(req.Sections) || len(req.References) < 1 || !validNarrativeReferences(req.References) {
 		return api.NarrativeReportVersion{}, false, api.ErrInvalid
 	}
 	canonical, digest, err := reportCanonical(req.Sections, req.References)

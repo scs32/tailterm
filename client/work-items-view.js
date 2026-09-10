@@ -663,13 +663,13 @@ export function createWorkItemsView({
         ...revisions.map((value) => ({
           at: value.updatedAt,
           label: `Feature revision ${value.revision}`,
-          detail: `${value.changeKind} · ${value.provenance}`,
+          detail: `${value.changeKind} · ${value.provenance} · revised by ${actorLabel(value.updatedBy)}`,
           text: value.description,
         })),
         ...[...messages, ...linkedMessages].map((value) => ({
           at: value.message.createdAt,
           label: `${value.message.decisionRequest ? "Decision request" : value.message.decisionAnswer ? "Decision answer" : "Board message"} #${value.message.seq}`,
-          detail: `${value.revisionCoverage}${value.source ? " · original source" : ""}${value.message.decisionAnswer?.optionId ? ` · answer ${value.message.decisionAnswer.optionId}` : ""}`,
+          detail: `${value.revisionCoverage}${value.source ? " · original source" : ""} · from ${actorLabel(value.message.from)}${value.message.decisionAnswer?.optionId ? ` · answer ${value.message.decisionAnswer.optionId}` : ""}`,
           text: value.message.text,
         })),
         ...timeline.map((value) => ({

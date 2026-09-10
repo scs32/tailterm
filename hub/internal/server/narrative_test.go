@@ -1,8 +1,12 @@
 package server
 
 import (
+	"bytes"
+	"context"
+	"encoding/json"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/scs32/tailterm/hub/internal/api"
 )
@@ -64,6 +68,57 @@ func TestNarrativeHTTPFullReportArtifactAndCompletionGate(t *testing.T) {
 	var escapedReport api.NarrativeReportVersion
 	if code := c.do("POST", path+"/reports", escaped, &escapedReport); code != 201 || len(escapedReport.Sections.DeliveredWork) != api.MaxNarrativeContentBytes-fixed {
 		t.Fatalf("escaped report=%d len=%d", code, len(escapedReport.Sections.DeliveredWork))
+	}
+	reference := api.NarrativeReference{Kind: "external", SourceID: strings.Repeat("<", 512), Locator: "https://example.invalid/" + strings.Repeat("p", 1700), Label: strings.Repeat("<", 512)}
+	refs := []api.NarrativeReference{}
+	for len(refs) < 256 {
+		candidate := append(append([]api.NarrativeReference{}, refs...), reference)
+		var encoded bytes.Buffer
+		encoder := json.NewEncoder(&encoded)
+		encoder.SetEscapeHTML(false)
+		if err := encoder.Encode(candidate); err != nil {
+			t.Fatal(err)
+		}
+		if encoded.Len() > api.MaxNarrativeReferenceBytes {
+			break
+		}
+		refs = candidate
+	}
+	if len(refs) == 0 || len(refs) == 256 {
+		t.Fatalf("reference boundary was not exercised: %d", len(refs))
+	}
+	largest := escaped
+	largest.RequestID = "http-report-largest-envelope"
+	largest.ReportID = ""
+	largest.ExpectedVersion = 0
+	largest.References = refs
+	goClient, err := api.NewClient(c.srv.URL, 30*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stored, err := goClient.PutNarrativeReport(context.Background(), task.ID, item.ID, largest)
+	if err != nil {
+		t.Fatalf("Go client largest report write: %v", err)
+	}
+	readback, err := goClient.GetNarrativeReportVersion(context.Background(), task.ID, item.ID, stored.ReportID, stored.Version)
+	if err != nil || readback.Sections.DeliveredWork != largest.Sections.DeliveredWork || len(readback.References) != len(refs) || readback.Digest != stored.Digest {
+		t.Fatalf("Go client largest report readback refs=%d err=%v", len(readback.References), err)
+	}
+	coverageReq := api.PutNarrativeCoverageRequest{RequestID: "http-coverage-largest-envelope", Source: "pr", Scope: "deliberately submitted reference enumeration", CaptureState: "reference-only", UnknownExtent: true, Assessment: "unverified", EvidenceReferences: refs}
+	coverage, err := goClient.PutNarrativeCoverage(context.Background(), task.ID, item.ID, coverageReq)
+	if err != nil || len(coverage.EvidenceReferences) != len(refs) {
+		t.Fatalf("Go client coverage envelope refs=%d err=%v", len(coverage.EvidenceReferences), err)
+	}
+	tooLarge := largest
+	tooLarge.RequestID = "http-report-reference-metadata-too-large"
+	tooLarge.References = append(append([]api.NarrativeReference{}, refs...), reference)
+	if _, err = goClient.PutNarrativeReport(context.Background(), task.ID, item.ID, tooLarge); err == nil {
+		t.Fatal("report reference metadata above the declared bound was accepted")
+	}
+	coverageReq.RequestID = "http-coverage-reference-metadata-too-large"
+	coverageReq.EvidenceReferences = tooLarge.References
+	if _, err = goClient.PutNarrativeCoverage(context.Background(), task.ID, item.ID, coverageReq); err == nil {
+		t.Fatal("coverage reference metadata above the declared bound was accepted")
 	}
 }
 
