@@ -1,5 +1,40 @@
 # Development handoff — September 9, 2026
 
+## September 9 Bugs and Features active-scroll refresh — release verified pending final acceptance
+
+Application commit `f59ce7c804b78a149689979e85a7bf1b2b50c620` is deployed to
+`https://tailos.tailarr.com` (`https://35a9032e.tailos.pages.dev`, deployment
+`35a9032e-babb-4159-b13a-3cae1f9bbac5`) and served by unchanged Mini preview
+PID 28664 at `http://127.0.0.1:4318`. The immutable deployment, custom domain
+and Mini match all 81 served files in the retained package and its
+release-manifest SHA-256
+`c2d110fc75b4a42f9dd36cfe1840290959a6d923431ce6155f288570cdd94ea3`.
+Real Chromium on TailOS and Mini started production WASM, restored an isolated
+synthetic vault/key, preserved matching layout margins and reported no page
+errors.
+
+The clean baseline reproduced Bugs and Features replacing their scrolling main
+element during a browser-injected wheel refresh in Chromium and WebKit. Both
+views now retain the exact scrolling DOM during wheel, scroll and touch activity,
+coalesce the newest repaint after 120 milliseconds of idle, and restore the first
+visible immutable item and focused row action. Filter-context changes interrupt
+a stale hold. Shared refresh focus restoration uses `preventScroll`, preventing
+WebKit from moving an offscreen restored filter back to the top. Filter commits,
+pagination, history, dispatch and encrypted drafts retain their existing behavior.
+
+Bug `wi_72084e89ad88fd3f` revision 2 and bounded order #1294 are documented in
+[the implementation report](items-scroll.md) and
+[the release receipt](releases/tailos-2026-09-09-items-scroll.json). The clean
+source/package is retained at `.build/releases/items-scroll-f59ce7c`. Rollback is
+the retained Board-scroll package `.build/releases/board-scroll-followup-8e78f55`
+and deployment `https://0d7863de.tailos.pages.dev`. Automated evidence used
+browser-injected wheel input, browser-managed smooth motion and a synthetic touch
+lifecycle; no physical trackpad/touch, native Safari or owner-device pass is
+claimed. The separate narrative-history candidate remains unchanged and
+unreleased pending its own integration. Neither hub, CLI, schema, database,
+Tailscale, TrueNAS, relays, Air preview, the old site, live tasks/profiles nor
+agent sessions changed.
+
 ## September 9 Board active-scroll refresh — release verified pending final acceptance
 
 Application commit `8e78f5508ddb0e15912ff39b397474f7df5b20fd` is deployed to

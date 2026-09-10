@@ -1,0 +1,167 @@
+{
+  "status": "builder_release_verified_pending_final_acceptance",
+  "recordedAt": "2026-09-10T02:44:38Z",
+  "workItem": {
+    "id": "wi_72084e89ad88fd3f",
+    "revision": 2,
+    "ownerMessage": 1290,
+    "workOrder": {
+      "id": "wi_72084e89ad88fd3f-items-scroll-1",
+      "message": 1294
+    },
+    "candidateHandoffMessage": 1329,
+    "leadCandidateAcceptanceMessage": 1331,
+    "handlerCandidateVerificationMessage": 1330
+  },
+  "source": {
+    "integrationBase": "d102ab01b085677eea92c8b4411cb2f9119272c2",
+    "acceptedBuilderCandidate": "2414f95f583fdaa598a8539be4d1b58c4981b863",
+    "integratedApplicationCommit": "f59ce7c804b78a149689979e85a7bf1b2b50c620",
+    "integration": "The accepted five-file candidate was applied to clean root tasks-hub. Its changed-file content is identical to the candidate. The separate narrative-history candidate remains unchanged and unreleased.",
+    "files": [
+      "client/view-refresh-presentation.js",
+      "client/work-items-scroll.js",
+      "client/work-items-view.js",
+      "tests/view-refresh-presentation.test.js",
+      "tests/work-items-scroll-browser.mjs"
+    ]
+  },
+  "diagnosis": {
+    "cause": "Every Bugs/Features refresh replaced the actual .work-items-main scroll element during active motion, disconnecting the browser scroll target and focused control. Absolute offsets also could not retain a reader against inserted or resized rows.",
+    "baseline": "On clean d102ab0, the isolated in-memory fixture reproduced active wheel DOM/focus replacement in Bugs and Features on Chromium and Playwright WebKit, four cases total.",
+    "correction": "The view retains its exact scroll DOM through wheel, scroll and touch activity, coalesces the latest repaint after 120 milliseconds of idle, restores the first visible item/offset and focused row action, and interrupts stale filter contexts. Shared view focus restoration uses preventScroll for WebKit.",
+    "evidenceLimit": "Wheel input is Playwright browser automation, browser smooth scroll is a momentum surrogate, and touch events are synthetic. No physical input, native Safari, owner trace or owner-device pass is claimed."
+  },
+  "package": {
+    "worktree": "/Users/stephenspeicher/projects/tailterm/.build/releases/items-scroll-f59ce7c",
+    "commit": "f59ce7c804b78a149689979e85a7bf1b2b50c620",
+    "cleanSource": true,
+    "manifestEntries": 82,
+    "servedAssetsPerOrigin": 81,
+    "releaseSha256": "c2d110fc75b4a42f9dd36cfe1840290959a6d923431ce6155f288570cdd94ea3",
+    "buildCommands": [
+      "npm ci",
+      "npm run build:wasm",
+      "npm run build:static",
+      "npm run verify:release"
+    ],
+    "verifyResult": "82/82 manifest entries passed",
+    "assets": {
+      "mainScript": {
+        "path": "assets/index-yUpjYpCi.js",
+        "size": 808966,
+        "sha256": "c786a5ab6c39e883c17e216aaf4993d5c829cf650d3bdf1d3b4006d9bbdb55f4"
+      },
+      "stylesheet": {
+        "path": "assets/index-Bkm6l0FY.css",
+        "size": 94771,
+        "sha256": "ee70f291a094abe1bff819c0c2b789bb9f594c3b836284483cad719f9f9d9cf1"
+      },
+      "productionWasmGzip": {
+        "path": "assets/tailserve-UhGLA7XM.wasm.gz",
+        "size": 8598274,
+        "sha256": "5bebd5461d73211eb952f33fc3a857ec61b00b95ed09f1b1c08841354bb1f861"
+      }
+    }
+  },
+  "tailos": {
+    "origin": "https://tailos.tailarr.com",
+    "cloudflareProject": "tailos",
+    "branch": "main",
+    "deploymentId": "35a9032e-babb-4159-b13a-3cae1f9bbac5",
+    "deployment": "https://35a9032e.tailos.pages.dev",
+    "commit": "f59ce7c804b78a149689979e85a7bf1b2b50c620",
+    "verifiedAssets": 81,
+    "releaseSha256": "c2d110fc75b4a42f9dd36cfe1840290959a6d923431ce6155f288570cdd94ea3",
+    "assetVerification": "The immutable deployment and custom domain each matched release.json and all 81 served file sizes and SHA-256 hashes using raw Accept */* requests.",
+    "mime": {
+      "releaseJson": "200 application/json",
+      "mainScript": "200 application/javascript",
+      "stylesheet": "200 text/css; charset=utf-8",
+      "productionWasmGzip": "200 application/gzip; no Content-Encoding"
+    },
+    "observedCustomDomainCache": "release.json no-cache; hashed JavaScript, CSS and WASM max-age=14400 from the previously documented external override"
+  },
+  "miniPreview": {
+    "origin": "http://127.0.0.1:4318",
+    "servedDirectory": "/Users/stephenspeicher/projects/tailterm/dist-static",
+    "activation": "rsync -a --delete from the exact retained package",
+    "commit": "f59ce7c804b78a149689979e85a7bf1b2b50c620",
+    "verifiedAssets": 81,
+    "releaseSha256": "c2d110fc75b4a42f9dd36cfe1840290959a6d923431ce6155f288570cdd94ea3",
+    "mime": {
+      "releaseJson": "200 application/json; charset=utf-8",
+      "mainScript": "200 text/javascript; charset=utf-8",
+      "stylesheet": "200 text/css; charset=utf-8",
+      "productionWasmGzip": "200 application/gzip; no Content-Encoding"
+    },
+    "listener": {
+      "pidBefore": 28664,
+      "pidAfter": 28664,
+      "command": "node scripts/preview-static.mjs dist-static 127.0.0.1 4318",
+      "restarted": false
+    }
+  },
+  "browserAcceptance": {
+    "deployedBrowser": "Fresh Chromium contexts on TailOS and Mini started production WASM, generated and restored an isolated synthetic local vault/key, retained matching margins and reported no page errors.",
+    "focusedScroll": "The exact integrated source passed Bugs and Features in Chromium and WebKit for active wheel DOM/focus continuity, continued input, latest idle repaint, item anchors, browser-managed smooth motion, synthetic touch hold/release, filter pagination, history and dispatch wiring.",
+    "screenshots": {
+      "tailos": ".build/releases/items-scroll-f59ce7c/.build/items-scroll-release/tailos/deployed-layout-preview.png",
+      "mini": ".build/releases/items-scroll-f59ce7c/.build/items-scroll-release/mini/deployed-layout-preview.png",
+      "sharedSha256": "dee008e5bb73ff69cb91fb1e43b1dc1241bc26b73201661e1427f62041b71664"
+    },
+    "nativeInput": "Physical wheel/trackpad/touch, native Safari and the owner's unknown browser/device were not observed."
+  },
+  "verification": {
+    "builder": [
+      "Clean-base active-refresh replacement reproduced in both work-item views and both engines, four cases total",
+      "Candidate focused Bugs/Features Chromium/WebKit scrolling matrix passed",
+      "JavaScript unit suite passed 132/132",
+      "Existing project work-item, dispatch 16/16, encrypted draft-vault and Board-scroll suites passed in Chromium and WebKit"
+    ],
+    "release": [
+      "Integrated changed files exactly matched the accepted candidate",
+      "Integrated focused work-item scroll, shared presentation and Board scroll checks passed",
+      "Clean production WASM and static build plus 82-entry release verification passed",
+      "TailOS immutable origin, custom domain and Mini matched 81/81 served hashes and release.json",
+      "Status, MIME and no-Content-Encoding checks passed on all three origins",
+      "Production Chromium WASM, isolated synthetic-vault restoration and layout passed on TailOS and Mini"
+    ],
+    "historicalNonpasses": [
+      "Fixture construction initially had an inner-template syntax error and browser/Node scope error; both were corrected before the causal baseline.",
+      "The first WebKit candidate restored an offscreen filter with plain focus and returned scrollTop to zero; lead authorized preventScroll and the final candidate passed.",
+      "One integrated test orchestration wrapper misspelled its reporting variable after commands ran; the identical checks were rerun with captured passing output."
+    ],
+    "releaseNonpasses": [],
+    "warnings": [
+      "npm ci reported three existing moderate audit findings and install-script approval notices; installation and all builds completed.",
+      "Vite reported its existing large-chunk advisory; the release build and manifest verification completed."
+    ]
+  },
+  "rollback": {
+    "commit": "8e78f5508ddb0e15912ff39b397474f7df5b20fd",
+    "tailosDeploymentId": "0d7863de-37c3-4463-a504-1d4e8e9c4c91",
+    "tailosDeployment": "https://0d7863de.tailos.pages.dev",
+    "retainedPackage": "/Users/stephenspeicher/projects/tailterm/.build/releases/board-scroll-followup-8e78f55/dist-static",
+    "releaseSha256": "7080d78e74573ceca7552af76f6783e7c123d62037439d5dffdde81a20b6f5a5",
+    "verifyResult": "TailOS and Mini matched this retained release before activation",
+    "procedure": "Deploy the exact retained package explicitly to Cloudflare project tailos, then rsync it to Mini without restarting listener 28664.",
+    "warning": "Rollback removes this Bugs/Features scrolling fix while retaining the prior Board scrolling fixes and earlier accepted frontend work."
+  },
+  "cleanup": {
+    "browserContextsClosed": true,
+    "fixtureServersClosed": true,
+    "miniListenerRestarted": false,
+    "temporaryReleaseCheckout": "Retained as the authorized clean source/package and not removed."
+  },
+  "excluded": [
+    "https://tailterm.tailarr.com",
+    "Air preview",
+    "hub, CLI, database or schema",
+    "Tailscale, TrueNAS networking or relays",
+    "live tasks or profiles",
+    "owner browser storage",
+    "agent sessions or lifecycle",
+    "independent narrative-history candidate"
+  ]
+}
