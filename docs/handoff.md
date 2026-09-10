@@ -1,5 +1,45 @@
 # Development handoff — September 10, 2026
 
+## September 10 Project Queue — release verified pending final acceptance
+
+Feature `wi_a222a4d8a69c1d53` revision/scope 2, work order #1640 plus complete
+supplement #1642 and admission amendment #1672, is deployed from accepted exact
+application `cfb2172ae81095c035c58eab3c345ed4e489241e`. Root `tasks-hub`
+integrated only that application and accepted report commit `b5adb1d…` from the
+clean B1 baseline. The complete contract, migration/compatibility behavior,
+isolated Chromium/WebKit and Go evidence, release corrections and limitations are
+in [the Queue report](project-queue.md); exact machine-readable release evidence
+is in [the Queue receipt](releases/tailos-2026-09-10-project-queue.json).
+
+The hub is RUNNING from unique TrueNAS release
+`20260910-project-queue-cfb2172`, Linux amd64 SHA-256
+`150b53846b2fecfa20b2ced36789de0a1d3bcb2152b67ccd9f46ab448a9af1d6`,
+with the same single distroless container, UID/GID, private listener and mounts.
+The mode-0600 pre-update online backup is
+`/mnt/deepfreeze/tailterm-hub/backups/before-project-queue-20260910T201142Z.sqlite`,
+SHA-256 `b2ffb31f9867a3bb175ef59f85770c66347d994e12065414604e84d7a4b995a8`;
+backup and live integrity are OK with zero foreign-key violations. Capabilities
+advertise Queue v1, message audit v1/v2, export v2/v3 and observe mode.
+
+Mini and Air run exact Darwin arm64 CLI SHA-256
+`ec8bf996bbde9761563ed67c200c65641d8769aa1f504843653b0980a671d493`
+and retain matching B1 rollback copies. No relay was changed or restarted.
+TailOS deployment `552de3bf-9453-4992-b0fb-1bf12d84dcd3` /
+`https://552de3bf.tailos.pages.dev`, `https://tailos.tailarr.com`, and Mini
+PID 60799 / PPID 1 serve all 81 public assets from exact manifest SHA-256
+`e7919f9448fa0dc9d5938315c6747dbc9c035645398c48c2ce0ff34e21a234a4`.
+Fresh production-WASM/synthetic-vault Chromium checks pass on all three origins.
+The retained clean source, binaries and package are at
+`.build/releases/project-queue-cfb2172`.
+
+Normal rollback restores retained B1 hub release
+`20260910-message-audit-b1-da3b686`, each host's
+`tt-before-project-queue-cfb2172`, and the exact B1 frontend package/deployment,
+while preserving all additive Queue schema/receipts. The backup is disaster
+recovery only. This stage remains builder-verified pending lead actual-release
+acceptance and database-handler revision-checked report storage/readback; no Done,
+completion pin or agent closure is claimed.
+
 ## September 10 work-item History width — release verified pending final acceptance
 
 Application/source commit `9cd38d37cb7466e8fc57ccf2da994d8457b8be24` is

@@ -445,9 +445,129 @@ unrelated UI, providers, deployment code, and production operations are untouche
 
 The trusted shared credential boundary remains explicit: server-side checks bind
 the current recorded role/run/selection/claim, but this feature does not create
-per-agent cryptographic credentials. Actual Queue release still requires lead
-candidate review, db-handler revision-checked result/acceptance storage, a later
-explicit root integration order, new isolated release builds/hashes/backups, hub
-and CLI rollout, and TailOS/Mini frontend deployment verification. This work order
-does not authorize deployment, changes to `tailterm.tailarr.com`, agent closure, or
-self-acceptance.
+per-agent cryptographic credentials. At candidate handoff, actual Queue release
+still required lead review, db-handler revision-checked result/acceptance storage,
+a later explicit root integration order, new isolated release builds/hashes and
+backups, hub and CLI rollout, and TailOS/Mini frontend deployment verification.
+The implementation order itself did not authorize deployment, changes to
+`tailterm.tailarr.com`, agent closure, or self-acceptance; the separate release
+order and its result follow below.
+
+## Released stage
+
+Lead accepted exact source `cfb2172ae81095c035c58eab3c345ed4e489241e`
+in message `1697`; db-handler independently saved and read back the complete
+source acceptance in message `1701`. Lead then issued the concrete integration
+and production release order in message `1702` for this same item, agent and run.
+The tracked-clean root `tasks-hub` branch fast-forwarded from accepted baseline
+`0d3ecf7e20462a585a305ea85f64571f1ec5f10c` through only the accepted Queue
+application and report commit
+`b5adb1dd41d588ff5ea88613da8107714e2f5708`. Research-owned documents and
+unrelated pending work were not integrated, and the preserved owner screenshots
+were untouched.
+
+The clean retained release source and complete package are at
+`.build/releases/project-queue-cfb2172`, detached at exact application commit
+`cfb2172…`. Its Linux amd64 hub is 27,226,274 bytes, SHA-256
+`150b53846b2fecfa20b2ced36789de0a1d3bcb2152b67ccd9f46ab448a9af1d6`;
+its Darwin arm64 CLI is 6,698,098 bytes, SHA-256
+`ec8bf996bbde9761563ed67c200c65641d8769aa1f504843653b0980a671d493`.
+Both binaries embed exact `cfb2172…` with `vcs.modified=false`. The complete
+82-entry static manifest is 14,861 bytes, SHA-256
+`e7919f9448fa0dc9d5938315c6747dbc9c035645398c48c2ce0ff34e21a234a4`,
+and identifies commit `cfb2172…`, dirty false. The dependency lock and tracked
+WASM inputs/scripts were unchanged from B1, so the build reused the exact
+independently verified Tailscale 1.102.3 production WASM: raw SHA-256
+`dc841019c8a28670b3a44e0657f3a1e081648dbb561d5072eb735e987e577cb8`,
+gzip asset SHA-256
+`3fbd89103e04af9fdafe9a7f38da9100f5b9c71d39a5c82c4e5fa59dc8bbdf82`,
+and module inventory SHA-256
+`2c33e75b00b437e19377989a0fd36a631dd4a9cbd94b8fd17833ea4496e6778b`.
+
+Before mutation, the exact B1 hub, both CLIs, retained package, immutable
+deployment and all 81 served rollback assets were reverified. The new online
+SQLite backup is mode `0600` at
+`/mnt/deepfreeze/tailterm-hub/backups/before-project-queue-20260910T201142Z.sqlite`,
+14,503,936 bytes, SHA-256
+`b2ffb31f9867a3bb175ef59f85770c66347d994e12065414604e84d7a4b995a8`;
+its integrity is OK with zero foreign-key violations. Focused synthetic migration,
+legacy reconciliation, frozen-page bound, and v2/v3 export tests passed without
+using the backup or any live database as fixture.
+
+TrueNAS middleware updated only `tailterm-hub` to unique release
+`20260910-project-queue-cfb2172`. Final inspection shows one RUNNING `hub`
+container, the unchanged distroless image and UID/GID `950:950`, private
+`100.116.238.37:18765` listener, read-only exact binary/token mounts and the same
+writable state mount. Installed binary hash matches the retained build. Live
+integrity remains OK with zero foreign-key violations and the six expected Queue
+tables plus their eight indexes. Authenticated capabilities advertise Queue v1,
+message audit v1/v2, export v2/v3 and observe policy; doctor passes and
+unauthenticated `whoami` remains 403. No live Queue/content mutation was used.
+
+Mini and Air atomically installed the exact matching CLI and retain mode-preserved
+B1 rollback copies named `tt-before-project-queue-cfb2172`, SHA-256
+`3f00c6002476acb4f9dcac8b43e9fb16c9c201f96efb8d36d2ba1631f5885571`.
+Both installed hashes, doctor and capabilities pass. No relay was restarted or
+changed, and Air preview was untouched.
+
+Wrangler 4.131.0 published the exact retained package to Pages project `tailos`,
+production branch `main`, commit `cfb2172…`, dirty false. Deployment
+`552de3bf-9453-4992-b0fb-1bf12d84dcd3` is available at
+`https://552de3bf.tailos.pages.dev` and through
+`https://tailos.tailarr.com`. A staged local replacement made Mini serve the
+byte-identical package at `http://127.0.0.1:4318` while preserving detached
+PID 60799 / PPID 1. All three origins match the exact manifest, canonical index,
+and all 81 public assets by status, size, SHA-256 and origin-appropriate MIME.
+Fresh disposable Chromium contexts on all three origins started production WASM,
+generated and restored only a synthetic local vault/key, passed three layout
+sizes, and reported no page errors.
+
+### Release command corrections and nonpasses
+
+- A first retained checkout made with `git worktree` caused Go to embed root
+  report commit `b5adb1d…`. Nothing was deployed. Only that new checkout was
+  replaced with a standalone local clone; the final binaries embed exact
+  `cfb2172…` and a clean VCS stamp.
+- The first standalone setup was invoked from `hub`, creating only new misplaced
+  dependency/build links before its copy failed. Those exact new paths were
+  removed, and setup restarted from release root. A temporary `node_modules`
+  symlink was also removed because it dirtied the Go stamp; the existing ignored
+  dependency tree was clone-copied without any install for static packaging.
+- `npm run test:static` required a separate test-only `.build/test.wasm`. The
+  fixture never entered the package and was removed afterward. The suite reached
+  its browser section, where unchanged retained B1 fixture
+  `tests/tasks-browser.mjs` still searches for `Task hub: configure` while the
+  unchanged product text is `Project hub: configure`. Earlier workspace, popup
+  and dictation sections passed. This baseline mismatch is not claimed as a pass;
+  the release itself passed the 82-entry package check and deployed browser test.
+- A verification command accidentally run from report-only root correctly
+  rejected the `cfb2172…` manifest against root `b5adb1d…`; the identical command
+  passed in the clean retained release checkout.
+- One read-only live SQLite recheck first named a nonexistent database file and
+  one quoted query failed. Corrected read-only checks of `hub.sqlite` and the
+  backup passed. No database mutation resulted.
+- The deployment helper has no help parser. A final `--help` attempt uploaded the
+  exact Queue binary into a new stray `releases/--help` directory, then failed at
+  duplicate app creation before changing the running app. The exact stray binary
+  was hash-verified and removed with its empty directory; final middleware
+  inspection proved the actual Queue app and topology unchanged.
+- One `lsof` diagnostic used broader OR semantics than intended and displayed
+  unrelated processes. It changed no relay, listener or process. No relay was
+  subsequently inspected or restarted.
+- Repository-wide `go test ./cmd/tt` remains unclaimed for the two documented,
+  untouched B1 baseline failures. Queue-focused CLI tests pass. Native Safari,
+  physical IME and native macOS popup automation remain outside the evidence.
+
+Normal rollback uses the retained B1 hub release
+`20260910-message-audit-b1-da3b686`, each host's saved B1 CLI, and exact B1
+frontend package/deployment `e59f1292-8c6f-41f6-95e1-37e98f13a686`, while
+preserving additive Queue tables and receipts. Mini's pre-release B1 package is
+also staged at `.build/static-before-project-queue-da3b686`. The online backup is
+disaster recovery only because restoring it loses every write after
+`2026-09-10T20:11:42Z`.
+
+The complete machine-readable receipt is
+`docs/releases/tailos-2026-09-10-project-queue.json`. This release is
+builder-verified, not self-accepted. Lead actual-release acceptance and
+db-handler revision-checked storage/readback of this complete report remain
+required before item completion or agent closure.
