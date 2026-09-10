@@ -194,7 +194,7 @@ export function agentSpawnCommand({
       !["claude", "codex", "aider", "gemini"].includes(runtime))
   )
     throw new Error("Enter a valid model name for a supported agent app.");
-  validateReasoning(runtime, model, reasoning);
+  validateReasoning(runtime, model, reasoning, run);
   validateAgentPermissions(
     runtime,
     permissionMode,

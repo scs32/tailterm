@@ -66,21 +66,21 @@ import {localAPI} from '/client/local-vault.js';
 import {reconciledAgentProblem} from '/client/launch-reconciliation.js';
 await localAPI('/unlock','POST',{password:'synthetic vault passphrase'});
 const savedLocal=await localAPI('/data');
-let board, tasks, modes, teams;const baseAgent=(id,name,serverId,role)=>({id,revision:1,name,launchName:name,role,serverId,runtime:'codex',model:'gpt-5.3-codex',reasoning:'high',approvalMode:'on-request',sandboxMode:'workspace-write',permissionMode:'',allowedTools:[],run:"sh -c 'sleep 300' --",cwd:'',prompt:'Inspect the exact bounded assignment.'});const data={hub:{url:location.origin},launchProfiles:[],agentCatalog:{version:2,definitions:[baseAgent('agent_team_planner','team-planner','', 'Planner'),baseAgent('agent_team_reviewer','team-reviewer','secondary','Reviewer')]},teamsVersion:2,teams:JSON.parse(localStorage.getItem('qa-teams')||'[]'),teamLaunchPlans:savedLocal.teamLaunchPlans,projectHandlerPlans:[]};
-const servers=[{id:'local',name:'Test host',host:'stephens-macbook-air',username:'test',runtimes:['claude']},{id:'secondary',name:'Second host',host:'second-fixture',username:'test',runtimes:['codex']}];let failJournalWrite=false;
+let board, tasks, modes, teams;const baseAgent=(id,name,serverId,role)=>({id,revision:1,name,launchName:name,role,serverId,runtime:'codex',model:'gpt-5.3-codex',reasoning:'',approvalMode:'on-request',sandboxMode:'workspace-write',permissionMode:'',allowedTools:[],run:"sh -c 'sleep 300' --",cwd:'',prompt:'Inspect the exact bounded assignment.'});const data={hub:{url:location.origin,token:'synthetic-token'},profile:{username:'synthetic',instanceId:'profile-one'},launchProfiles:[],agentCatalog:{version:2,definitions:[baseAgent('agent_team_planner','team-planner','', 'Planner'),baseAgent('agent_team_reviewer','team-reviewer','secondary','Reviewer')]},teamsVersion:2,teams:JSON.parse(localStorage.getItem('qa-teams')||'[]'),teamLaunchPlans:savedLocal.teamLaunchPlans,projectHandlerPlans:[]};
+const servers=[{id:'local',name:'Test host',host:'stephens-macbook-air',username:'test',runtimes:['claude'],credentialRevision:1},{id:'secondary',name:'Second host',host:'second-fixture',username:'test',runtimes:['codex'],credentialRevision:1}];let failJournalWrite=false,commandDelay=null;
 const model={groups:[],taskGroup:()=>null};
-const host={openSFTP:async server=>({done:new Promise(()=>{}),home:async()=>${JSON.stringify(root)},realpath:async p=>p,list:async p=>({path:p,entries:p===${JSON.stringify(root)}?[{name:'hub',isDir:true},{name:'ignored.txt',isDir:false}]:[]}),close(){}}),getIPN:()=>({fetch:(url,init)=>fetch(url,init)}),getData:()=>data,getServers:()=>servers,currentServer:()=>servers[0],currentTab:()=>null,getTabs:()=>[],paneGroups:()=>({model,sync(){}}),render(){},scheduleWorkspaceSave(){},bookmark(){},closeTab(){},connect:async()=>null,confirm:async()=>true,notice:t=>{document.querySelector('#notice').textContent=t},api:async(url,method,body)=>{if(url.startsWith('/team-launch-plans')){if(url==='/team-launch-plans'&&method==='POST'&&failJournalWrite){failJournalWrite=false;throw new Error('Synthetic encrypted journal write failure')}const result=await localAPI(url,method,body);data.teamLaunchPlans=(await localAPI('/data')).teamLaunchPlans;return result}if(url==="/teams"){data.teams=[...data.teams.filter(t=>t.id!==body.id),body];localStorage.setItem('qa-teams',JSON.stringify(data.teams))}if(url.startsWith("/teams/")){data.teams=data.teams.filter(t=>t.id!==url.slice(7));localStorage.setItem('qa-teams',JSON.stringify(data.teams))}if(url==="/launch-profiles")data.launchProfiles=[...data.launchProfiles.filter(p=>p.name!==body.name),body];if(url==="/project-handler-plans"&&method==="POST")data.projectHandlerPlans=[...data.projectHandlerPlans.filter(p=>p.hub!==body.hub||p.taskId!==body.taskId),structuredClone(body)];return {sessions:[]}},reloadData:async()=>{data.teamLaunchPlans=(await localAPI('/data')).teamLaunchPlans},
+const host={openSFTP:async server=>({done:new Promise(()=>{}),home:async()=>${JSON.stringify(root)},realpath:async p=>p,list:async p=>({path:p,entries:p===${JSON.stringify(root)}?[{name:'hub',isDir:true},{name:'ignored.txt',isDir:false}]:[]}),close(){}}),getIPN:()=>({fetch:(url,init)=>fetch(url,init)}),getData:()=>data,getServers:()=>servers,launchServerProfile:id=>structuredClone(servers.find(server=>server.id===id)),currentServer:()=>servers[0],currentTab:()=>null,getTabs:()=>[],paneGroups:()=>({model,sync(){}}),render(){},scheduleWorkspaceSave(){},bookmark(){},closeTab(){},connect:async()=>null,confirm:async()=>true,notice:t=>{document.querySelector('#notice').textContent=t},api:async(url,method,body)=>{if(url.startsWith('/team-launch-plans')){if(url==='/team-launch-plans'&&method==='POST'&&failJournalWrite){failJournalWrite=false;throw new Error('Synthetic encrypted journal write failure')}const result=await localAPI(url,method,body);data.teamLaunchPlans=(await localAPI('/data')).teamLaunchPlans;return result}if(url==="/teams"){data.teams=[...data.teams.filter(t=>t.id!==body.id),body];localStorage.setItem('qa-teams',JSON.stringify(data.teams))}if(url.startsWith("/teams/")){data.teams=data.teams.filter(t=>t.id!==url.slice(7));localStorage.setItem('qa-teams',JSON.stringify(data.teams))}if(url==="/launch-profiles")data.launchProfiles=[...data.launchProfiles.filter(p=>p.name!==body.name),body];if(url==="/project-handler-plans"&&method==="POST")data.projectHandlerPlans=[...data.projectHandlerPlans.filter(p=>p.hub!==body.hub||p.taskId!==body.taskId),structuredClone(body)];return {sessions:[]}},reloadData:async()=>{data.teamLaunchPlans=(await localAPI('/data')).teamLaunchPlans},
  dialog:(title,body)=>{const d=document.querySelector('#dialog');if(d.open)d.close();d.innerHTML='<div class="dialog-head"><h2>'+title+'</h2><button id="dialog-close">×</button></div>'+body;d.querySelector('#dialog-close').onclick=()=>host.closeDialog();d.showModal()},
  closeDialog:()=>{const d=document.querySelector('#dialog');d.close();d.replaceChildren()},
  openBoard:id=>{modes.set('board');board.show(id)},
- browserCommand:async(server,command)=>{const r=await fetch('/exec',{method:'POST',body:JSON.stringify({command,serverId:server.id})});const d=await r.json();if(!r.ok){const error=new Error(d.error);error.verifiedUnstarted=d.verifiedUnstarted===true;throw error}return d.output}
+ browserCommand:async(server,command)=>{if(commandDelay){const gate=commandDelay;gate.entered();await gate.wait;if(commandDelay===gate)commandDelay=null}const r=await fetch('/exec',{method:'POST',body:JSON.stringify({command,serverId:server.id})});const d=await r.json();if(!r.ok){const error=new Error(d.error);error.verifiedUnstarted=d.verifiedUnstarted===true;throw error}return d.output}
 };
 const hub=createTaskHub(host);hub.refresh();
 board=createBoardView({client:()=>hub.client(),getTabs:()=>[],activate(){},notice:host.notice,newTask:()=>hub.newTask(),addAgent:id=>hub.addAgent(id),attachTask(){},configure(){}});
 tasks=createTasksView({confirm:async()=>true,client:()=>hub.client(),taskHub:hub,getTabs:()=>[],activate(){},notice:host.notice,openBoard:host.openBoard,configure(){}});
 teams=createTeamsView({...host,confirm:async()=>true,newTask:t=>hub.newTask(undefined,t),addTeam:t=>hub.addTeam(t)});
 modes=setupModes({header:document.querySelector('header'),main:document.querySelector('main'),onChange:(mode,view)=>{board.hide();tasks.hide();teams.hide();view.replaceChildren();if(mode==='board'){board.mount(view);board.show()}else if(mode==='teams'){teams.mount(view);teams.show()}else if(mode==='tasks'){tasks.mount(view);tasks.show()}}});
-modes.set('tasks');window.qa={hub,board,modes,data,localData:()=>localAPI('/data'),reconciledAgentProblem,failJournalWrite:()=>{failJournalWrite=true}};
+modes.set('tasks');window.qa={hub,board,modes,data,servers,localData:()=>localAPI('/data'),reconciledAgentProblem,failJournalWrite:()=>{failJournalWrite=true},delayNextCommand:()=>{let release,entered;const wait=new Promise(resolve=>release=resolve),started=new Promise(resolve=>entered=resolve);commandDelay={wait,release,entered,started}},waitForDelayedCommand:()=>commandDelay?.started,releaseCommand:()=>commandDelay?.release(),clearLaunchPlans:async()=>{for(const plan of (await localAPI('/data')).teamLaunchPlans)await localAPI('/team-launch-plans/'+plan.id,'DELETE');data.teamLaunchPlans=(await localAPI('/data')).teamLaunchPlans},changeToken:token=>{data.hub={...data.hub,token}},changeProfile:instanceId=>{data.profile={...data.profile,instanceId};hub.refresh()},cycleProfile:()=>{data.profile={...data.profile,instanceId:'profile-two'};hub.refresh();data.profile={...data.profile,instanceId:'profile-one'};hub.refresh()},changeServerCredentials:()=>{servers[1].credentialRevision++;}};
 </script></body></html>`;
 const server = createServer(async (req, res) => {
   try {
@@ -733,7 +733,11 @@ try {
       assert.equal(detail.task.orchestrator, "team-planner");
       assert.match(launchCommands.at(-3), /--approval-mode/);
       assert.match(launchCommands.at(-3), /--sandbox-mode/);
-      assert.match(launchCommands.at(-3), /--reasoning/);
+      assert.doesNotMatch(
+        launchCommands.at(-3),
+        /--reasoning/,
+        "synthetic custom wrappers must inherit reasoning",
+      );
       const plannerLaunch = launchCommands
         .slice(launchStart)
         .find((command) => command.includes("team-planner"));
@@ -1170,10 +1174,46 @@ s.commit()
       assert.ok(history.events.some((e) => e.kind === "task_closed"));
       assert.equal(history.messages[0].text, "Archived message 1");
       await page.screenshot({ path: `.build/task-history-${name}.png` });
+
+      const delayedScopeCheck = async (suffix, mutate, expected) => {
+        await page.evaluate(() => qa.hub.newTask(undefined, qa.data.teams[0]));
+        await page.locator("#task-main-server").selectOption("secondary");
+        await page.locator('[data-project-server="secondary"]').fill(root);
+        await page.locator("#task-name").fill(`${name} ${suffix}`);
+        await page.evaluate(() => qa.delayNextCommand());
+        await page.locator("#task-create").click();
+        await page.evaluate(() => qa.waitForDelayedCommand());
+        await page.evaluate(mutate);
+        await page.evaluate(() => qa.releaseCommand());
+        await page
+          .locator("#task-error")
+          .filter({ hasText: expected })
+          .waitFor();
+        await page.evaluate(() => qa.clearLaunchPlans());
+      };
+      await delayedScopeCheck(
+        "delayed token scope",
+        () => qa.changeToken("replacement-token"),
+        "hub credential or profile changed",
+      );
+      await page.evaluate(() => {
+        qa.changeToken("synthetic-token");
+        qa.hub.refresh();
+      });
+      await delayedScopeCheck(
+        "delayed profile scope",
+        () => qa.cycleProfile(),
+        "launch view changed",
+      );
+      await delayedScopeCheck(
+        "delayed endpoint scope",
+        () => qa.changeServerCredentials(),
+        "saved machine profile",
+      );
       assert.deepEqual(errors, []);
       console.log(
         name +
-          ": creation, encrypted journal failure/reload, lost task/worker response reconciliation, exact identity/mismatch checks, remaining-member retry, mobile and mode selection passed.",
+          ": creation, encrypted journal failure/reload, lost task/worker response reconciliation, delayed token/profile/endpoint guards, exact identity/mismatch checks, remaining-member retry, mobile and mode selection passed.",
       );
     } finally {
       await browser.close();

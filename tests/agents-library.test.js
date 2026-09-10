@@ -11,8 +11,10 @@ import {
   launchPlanForStorage,
   normalizeTeamLaunchPlans,
   restoreLaunchMembers,
+  serverLaunchScope,
 } from "../client/launch-journal.js";
 import {
+  guardedLaunchEffect,
   reconciledAgentProblem,
   taskCreationMatches,
 } from "../client/launch-reconciliation.js";
@@ -46,7 +48,7 @@ test("raw catalog migration is lossless, separate per legacy member, atomic and 
           legacyMember("lead", { prompt: "\n  preserve exactly  \n" }),
           legacyMember("worker", {
             model: "gpt-5.6-terra",
-            reasoning: "medium",
+            reasoning: "",
             run: "codex --search",
           }),
         ],
@@ -202,14 +204,39 @@ test("reasoning and independent Codex permission intent reach actual tt argv", (
       }),
     /not supported/,
   );
+  assert.throws(
+    () =>
+      agentSpawnCommand({
+        hub: "http://127.0.0.1:18765",
+        task: "tsk_0123456789abcdef",
+        name: "builder",
+        runtime: "codex",
+        run: "node unknown-wrapper.js",
+        model: "gpt-5.6-sol",
+        reasoning: "high",
+        cwd: "/synthetic/project",
+      }),
+    /native codex command/,
+  );
 });
 
-test("encrypted retry journal is bounded, stores context once and preserves uncertain identity", () => {
+test("encrypted retry journal is bounded, stores exact machine scope and preserves uncertain identity", async () => {
   const context = JSON.stringify({
     version: 1,
     itemId: "wi_abcdef0123456789",
     payload: "x".repeat(2048),
   });
+  const server = {
+    id: "machine-demo-01",
+    host: "example.invalid",
+    port: 22,
+    username: "synthetic",
+    mode: "ssh",
+    credentialRevision: 3,
+    password: "never-copy",
+    hasPassword: true,
+  };
+  const scope = await serverLaunchScope(server);
   const stored = launchPlanForStorage({
     id: "launch_test",
     kind: "add-team",
@@ -219,7 +246,8 @@ test("encrypted retry journal is bounded, stores context once and preserves unce
     updatedAt: new Date(0).toISOString(),
     members: [
       {
-        server: { id: "machine-demo-01", password: "never-copy" },
+        server,
+        serverScope: scope,
         state: "uncertain",
         fields: {
           name: "builder",
@@ -230,7 +258,8 @@ test("encrypted retry journal is bounded, stores context once and preserves unce
         },
       },
       {
-        server: { id: "machine-demo-01" },
+        server,
+        serverScope: scope,
         state: "unstarted",
         fields: {
           name: "reviewer",
@@ -245,9 +274,15 @@ test("encrypted retry journal is bounded, stores context once and preserves unce
   assert.equal(stored.workContextBundle, context);
   assert.equal(JSON.stringify(stored).match(/wi_abcdef0123456789/g).length, 1);
   assert.doesNotMatch(JSON.stringify(stored), /never-copy/);
-  const restored = restoreLaunchMembers(stored, [{ id: "machine-demo-01" }]);
+  const restored = await restoreLaunchMembers(stored, [server]);
   assert.equal(restored[0].state, "uncertain");
   assert.equal(restored[0].fields.workContextBundle, context);
+  await assert.rejects(
+    restoreLaunchMembers(stored, [
+      { ...server, credentialRevision: server.credentialRevision + 1 },
+    ]),
+    /machine profile.*changed/,
+  );
   assert.throws(
     () =>
       normalizeTeamLaunchPlans(
@@ -278,6 +313,22 @@ test("encrypted retry journal is bounded, stores context once and preserves unce
       }),
     /512 KiB/,
   );
+});
+
+test("launch guard rejects profile or endpoint changes across delayed effects", async () => {
+  let scope = "scope-a";
+  let release;
+  const delayed = new Promise((resolve) => (release = resolve));
+  const result = guardedLaunchEffect(
+    async () => {
+      if (scope !== "scope-a") throw new Error("launch scope changed");
+    },
+    () => delayed,
+  );
+  await Promise.resolve();
+  scope = "scope-b";
+  release("late response");
+  await assert.rejects(result, /launch scope changed/);
 });
 
 test("project creation journal and agent reconciliation preserve exact identities", async () => {

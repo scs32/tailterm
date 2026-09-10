@@ -532,6 +532,7 @@ function mount() {
       api,
       getTabs: () => tabs,
       getServers: () => data.servers,
+      launchServerProfile: (id) => localVault.launchServerProfile(id),
       currentTab,
       currentServer,
       connect,

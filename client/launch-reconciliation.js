@@ -71,3 +71,12 @@ export function taskCreationMatches(tasks, creation) {
       !known.has(task.id) && taskMatchesCreation(task, creation.request),
   );
 }
+
+export async function guardedLaunchEffect(guard, effect) {
+  await guard();
+  try {
+    return await effect();
+  } finally {
+    await guard();
+  }
+}

@@ -218,7 +218,7 @@ async function vaultRecord(name) {
     tx.onabort = () => reject(tx.error || new Error("Vault read aborted."));
   });
 }
-async function writeV2(envelope) {
+async function writeV2(envelope, legacySource) {
   if (
     envelope?.version !== 2 ||
     typeof envelope.ciphertext !== "string" ||
@@ -231,8 +231,20 @@ async function writeV2(envelope) {
   return new Promise((resolve, reject) => {
     const tx = database.transaction("vault", "readwrite");
     const store = tx.objectStore("vault");
-    store.put(envelope, "encrypted-v2");
-    store.put({ version: 2 }, "active-vault");
+    const writeActive = () => {
+      store.put(envelope, "encrypted-v2");
+      store.put({ version: 2 }, "active-vault");
+    };
+    if (legacySource !== undefined) {
+      const retained = store.get("migration-source-v1");
+      retained.onsuccess = () => {
+        if (retained.result === undefined)
+          store.put(structuredClone(legacySource), "migration-source-v1");
+        writeActive();
+      };
+    } else {
+      writeActive();
+    }
     tx.oncomplete = resolve;
     tx.onerror = () => reject(tx.error);
     tx.onabort = () => reject(tx.error || new Error("Vault save aborted."));
@@ -366,6 +378,17 @@ export function credentials(id) {
     key: structuredClone(contents.keys.find((k) => k.id === server.keyId)),
   };
 }
+export function launchServerProfile(id) {
+  requireUnlocked();
+  const server = contents.servers.find((entry) => entry.id === id);
+  if (!server) throw new Error("Unknown server.");
+  const { password, ...profile } = server;
+  return {
+    ...structuredClone(profile),
+    hasPassword: !!password,
+    credentialRevision: server.credentialRevision || 1,
+  };
+}
 export function privateKey(id) {
   requireUnlocked();
   return structuredClone(contents.keys.find((k) => k.id === id));
@@ -406,6 +429,12 @@ export async function rememberCredential(id, changes, endpoint) {
       throw new Error(
         "Server profile changed during login; credentials were not saved.",
       );
+    if (
+      Object.entries(changes).some(
+        ([field, value]) => JSON.stringify(s[field]) !== JSON.stringify(value),
+      )
+    )
+      s.credentialRevision = (s.credentialRevision || 1) + 1;
     Object.assign(s, changes);
   }, true);
 }
@@ -577,6 +606,15 @@ export async function localAPI(url, method = "GET", body = {}) {
       unlocked: !!contents,
       username: localStorage.getItem("tailterm.username") || "",
     };
+  if (url === "/vault/legacy-envelope" && method === "GET") {
+    const pointer = await vaultRecord("active-vault");
+    const legacy = pointer
+      ? await vaultRecord("migration-source-v1")
+      : await disk();
+    if (!legacy)
+      throw new Error("No retained legacy vault source is available.");
+    return structuredClone(legacy);
+  }
   if (url === "/unlock") {
     await db();
     await acquire();
@@ -602,7 +640,10 @@ export async function localAPI(url, method = "GET", body = {}) {
             "This browser has a different local profile. Use its username or Forget this device first.",
           );
         if (stored.version === 1)
-          await writeV2(await sealVault(restored, opened.key, opened.salt));
+          await writeV2(
+            await sealVault(restored, opened.key, opened.salt),
+            envelope,
+          );
         contents = restored;
         key = opened.key;
         salt = opened.salt;
@@ -637,12 +678,6 @@ export async function localAPI(url, method = "GET", body = {}) {
       throw new Error("Vault was locked. Unlock and try again.");
   };
   if (url === "/data") return localData();
-  if (url === "/vault/legacy-envelope" && method === "GET") {
-    const legacy = await disk();
-    if (!legacy)
-      throw new Error("No retained legacy vault source is available.");
-    return structuredClone(legacy);
-  }
   if (url === "/lock") {
     credentialCache.clear();
     profileUnlockKey = undefined;
@@ -678,6 +713,7 @@ export async function localAPI(url, method = "GET", body = {}) {
         fingerprint: body.fingerprint || "",
         keyId: body.keyId || "",
         runtimes: normalizeRuntimes(body.runtimes),
+        credentialRevision: previous?.credentialRevision || 1,
       };
       if (
         previous?.password &&
@@ -687,6 +723,25 @@ export async function localAPI(url, method = "GET", body = {}) {
         previous.username === server.username
       )
         server.password = previous.password;
+      if (
+        previous &&
+        ([
+          "host",
+          "port",
+          "username",
+          "mode",
+          "tmuxPath",
+          "fingerprint",
+          "keyId",
+          "tailnet",
+        ].some(
+          (field) =>
+            JSON.stringify(previous[field] ?? "") !==
+            JSON.stringify(server[field] ?? ""),
+        ) ||
+          !!previous.password !== !!server.password)
+      )
+        server.credentialRevision++;
       if (previous) d.servers[d.servers.indexOf(previous)] = server;
       else d.servers.push(server);
     });
@@ -1072,7 +1127,13 @@ function validateData(d) {
     throw new Error("Invalid vault contents.");
   for (const s of d.servers) {
     validateServer(s);
-    if (typeof s.id !== "string") throw new Error("Invalid server ID.");
+    if (
+      typeof s.id !== "string" ||
+      (s.credentialRevision !== undefined &&
+        (!Number.isSafeInteger(s.credentialRevision) ||
+          s.credentialRevision < 1))
+    )
+      throw new Error("Invalid server ID or credential revision.");
   }
   for (const k of d.keys)
     if (

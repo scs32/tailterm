@@ -94,7 +94,12 @@ export function normalizeAgentDefinition(value, index = 0) {
     prompt,
   };
   try {
-    validateReasoning(result.runtime, result.model, result.reasoning);
+    validateReasoning(
+      result.runtime,
+      result.model,
+      result.reasoning,
+      result.run,
+    );
     agentSpawnCommand({
       hub: "http://localhost",
       task: "tsk_0000000000000000",

@@ -734,7 +734,7 @@ func cmdSpawn(e env, args []string) error {
 	if err != nil {
 		return err
 	}
-	baseCommand, err = reasoningCommand(baseCommand, *runtime, *model, *reasoning)
+	baseCommand, err = reasoningCommand(baseCommand, *runtime, *model, *reasoning, *run)
 	if err != nil {
 		return err
 	}

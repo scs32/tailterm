@@ -53,12 +53,14 @@ try {
           pointer: await qa.get("active-vault"),
           v2: await qa.get("encrypted-v2"),
           legacy: await qa.get("encrypted"),
+          recovery: await qa.get("migration-source-v1"),
           original: qa.original,
         };
       });
       assert.equal(migrated.pointer.version, 2);
       assert.equal(migrated.v2.version, 2);
       assert.deepEqual(migrated.legacy, migrated.original);
+      assert.deepEqual(migrated.recovery, migrated.original);
       assert.deepEqual(
         await page.evaluate(() =>
           qa.vault.localAPI("/vault/legacy-envelope", "GET"),
@@ -73,6 +75,14 @@ try {
         await qa.vault.localAPI("/lock", "POST");
         const stale = { ...qa.original, iv: "AAAAAAAAAAAAAAAA" };
         await qa.put(stale, "encrypted");
+      });
+      assert.deepEqual(
+        await page.evaluate(() =>
+          qa.vault.localAPI("/vault/legacy-envelope", "GET"),
+        ),
+        migrated.original,
+      );
+      await page.evaluate(async () => {
         await qa.vault.localAPI("/unlock", "POST", { password: qa.password });
       });
       assert.equal(
@@ -94,6 +104,12 @@ try {
         }
       });
       assert.match(error, /migration is incomplete/);
+      assert.deepEqual(
+        await page.evaluate(() =>
+          qa.vault.localAPI("/vault/legacy-envelope", "GET"),
+        ),
+        migrated.original,
+      );
       const invalidContext = await browser.newContext(),
         invalidPage = await invalidContext.newPage();
       await invalidPage.goto(url);
@@ -111,14 +127,16 @@ try {
           error,
           pointer: await qa.get("active-vault"),
           legacy: await qa.get("encrypted"),
+          recovery: await qa.get("migration-source-v1"),
         };
       });
       assert.match(invalid.error, /Invalid launch name/);
       assert.equal(invalid.pointer, undefined);
       assert.deepEqual(invalid.legacy, invalid.envelope);
+      assert.equal(invalid.recovery, undefined);
       await invalidContext.close();
       console.log(
-        `${name}: v1-to-v2 atomic namespace migration, stale old-write fence, and interrupted-pointer failure passed.`,
+        `${name}: v1-to-v2 atomic namespace migration, immutable locked recovery, stale old-write fence, and interrupted-pointer failure passed.`,
       );
     } finally {
       await browser.close();

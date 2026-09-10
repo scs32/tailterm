@@ -8,8 +8,10 @@ import { prepareWorkItemContext } from "./work-item-context.js";
 import {
   launchPlanForStorage,
   restoreLaunchMembers,
+  serverLaunchScope,
 } from "./launch-journal.js";
 import {
+  guardedLaunchEffect,
   reconciledAgentProblem,
   taskCreationMatches,
 } from "./launch-reconciliation.js";
@@ -59,19 +61,27 @@ export function createTaskHub(host) {
   const bound = new Set(); // task ids mirrored into tabs
   const cache = new Map(); // taskId -> {task, agents} for tooltips/dialogs
   let tasksList = [];
+  let launchEpoch = 0;
   const serverHosts = new Map();
-  async function launchScope() {
+  const launchScopeSource = () => {
     const data = host.getData();
-    const input = JSON.stringify([
+    return JSON.stringify([
       client?.base || "",
       data?.hub?.token || "",
       data?.profile?.username || "",
-      data?.profile?.instance || "",
+      data?.profile?.instanceId || "",
     ]);
+  };
+  async function launchScope() {
+    const input = launchScopeSource();
     const digest = await crypto.subtle.digest(
       "SHA-256",
       new TextEncoder().encode(input),
     );
+    if (input !== launchScopeSource())
+      throw new Error(
+        "The hub credential or profile changed. Reopen the launch dialog.",
+      );
     return [...new Uint8Array(digest)]
       .map((byte) => byte.toString(16).padStart(2, "0"))
       .join("");
@@ -84,9 +94,13 @@ export function createTaskHub(host) {
     creation = undefined,
   ) {
     const now = new Date().toISOString();
-    for (const entry of plan)
+    for (const entry of plan) {
       entry.fields.agentId ||=
         "agt_" + crypto.randomUUID().replaceAll("-", "").slice(0, 16);
+      if (host.launchServerProfile)
+        entry.server = host.launchServerProfile(entry.server.id);
+      entry.serverScope = await serverLaunchScope(entry.server);
+    }
     const journal = launchPlanForStorage({
       id: "launch_" + crypto.randomUUID().replaceAll("-", ""),
       kind,
@@ -98,19 +112,69 @@ export function createTaskHub(host) {
       members: plan.map((entry) => ({ ...entry, state: "unstarted" })),
       ...(creation && { creation }),
     });
-    await host.api("/team-launch-plans/validate", "POST", journal);
+    await guardedJournalEffect(journal, null, () =>
+      host.api("/team-launch-plans/validate", "POST", journal),
+    );
     return journal;
   }
+  async function assertLaunchScope(journal, entry = null) {
+    if (!journal) return;
+    if ((await launchScope()) !== journal.scope)
+      throw new Error(
+        "The hub credential or profile changed. Reopen the launch dialog.",
+      );
+    const members = entry
+      ? [
+          journal.members.find(
+            (member) => member.fields.name === entry.fields.name,
+          ),
+        ]
+      : journal.members;
+    for (const member of members) {
+      if (!member?.serverScope)
+        throw new Error(
+          "The frozen launch plan does not contain an exact machine scope.",
+        );
+      const current = host.launchServerProfile
+        ? host.launchServerProfile(member.serverId)
+        : host.getServers().find((server) => server.id === member.serverId);
+      if (
+        !current ||
+        (await serverLaunchScope(current)) !== member.serverScope ||
+        (entry &&
+          (await serverLaunchScope(entry.server)) !== member.serverScope)
+      )
+        throw new Error(
+          `The saved machine profile for ${member.fields.name} changed. Restore the exact endpoint and credentials or discard the frozen plan.`,
+        );
+    }
+  }
+  async function guardedJournalEffect(journal, entry, effect) {
+    const epoch = launchEpoch;
+    return guardedLaunchEffect(async () => {
+      if (epoch !== launchEpoch)
+        throw new Error(
+          "The launch view changed. Reopen it before continuing.",
+        );
+      await assertLaunchScope(journal, entry);
+      if (epoch !== launchEpoch)
+        throw new Error(
+          "The launch view changed. Reopen it before continuing.",
+        );
+    }, effect);
+  }
   const saveLaunchJournal = (journal) =>
-    host.api("/team-launch-plans", "POST", {
-      ...journal,
-      updatedAt: new Date().toISOString(),
-    });
+    guardedJournalEffect(journal, null, () =>
+      host.api("/team-launch-plans", "POST", {
+        ...journal,
+        updatedAt: new Date().toISOString(),
+      }),
+    );
   async function reconcileTaskCreation(journal) {
     if (journal?.creation?.state !== "uncertain" || journal.taskId)
       throw new Error("This project creation is not awaiting reconciliation.");
     const matches = taskCreationMatches(
-      await client.listTasks(),
+      await guardedJournalEffect(journal, null, () => client.listTasks()),
       journal.creation,
     );
     if (matches.length !== 1)
@@ -190,6 +254,7 @@ export function createTaskHub(host) {
   }
 
   function refresh({ resetCache = false } = {}) {
+    launchEpoch++;
     const url = normalizeHubURL(host.getData()?.hub?.url);
     const ipn = host.getIPN();
     if (!url) {
@@ -1008,7 +1073,10 @@ export function createTaskHub(host) {
         ) {
           error.textContent = "Reconciling the prior project creation…";
           saved = await reconcileTaskCreation(launchJournal);
-          launchPlan = restoreLaunchMembers(launchJournal, host.getServers());
+          launchPlan = await restoreLaunchMembers(
+            launchJournal,
+            host.getServers(),
+          );
           for (const member of launchJournal.members)
             if (member.state === "started") progress.add(member.fields.name);
           freezeCreation();
@@ -1124,7 +1192,9 @@ export function createTaskHub(host) {
             await saveLaunchJournal(launchJournal);
           }
           try {
-            saved = await client.createTask(createRequest);
+            saved = await guardedJournalEffect(launchJournal, null, () =>
+              client.createTask(createRequest),
+            );
           } catch (createError) {
             if (
               launchJournal &&
@@ -1132,9 +1202,8 @@ export function createTaskHub(host) {
               createError.status >= 400 &&
               createError.status < 500
             ) {
-              await host.api(
-                `/team-launch-plans/${launchJournal.id}`,
-                "DELETE",
+              await guardedJournalEffect(launchJournal, null, () =>
+                host.api(`/team-launch-plans/${launchJournal.id}`, "DELETE"),
               );
               launchJournal = null;
               launchPlan = null;
@@ -1269,7 +1338,11 @@ export function createTaskHub(host) {
         if (!recovered || !form.isConnected) return;
         if (!recovered.taskId) {
           launchJournal = structuredClone(recovered);
-          launchPlan = restoreLaunchMembers(launchJournal, host.getServers());
+          await assertLaunchScope(launchJournal);
+          launchPlan = await restoreLaunchMembers(
+            launchJournal,
+            host.getServers(),
+          );
           const request = launchJournal.creation?.request;
           if (!request)
             throw new Error(
@@ -1285,11 +1358,16 @@ export function createTaskHub(host) {
           showUnknownCreation();
           return;
         }
-        const detail = await client.getTask(recovered.taskId);
+        const detail = await guardedJournalEffect(recovered, null, () =>
+          client.getTask(recovered.taskId),
+        );
         if (!form.isConnected) return;
         saved = detail.task;
         launchJournal = structuredClone(recovered);
-        launchPlan = restoreLaunchMembers(launchJournal, host.getServers());
+        launchPlan = await restoreLaunchMembers(
+          launchJournal,
+          host.getServers(),
+        );
         for (const member of launchJournal.members)
           if (member.state === "started") progress.add(member.fields.name);
         form.querySelector("#task-name").value = saved.name;
@@ -1531,7 +1609,9 @@ export function createTaskHub(host) {
   }
 
   async function launchMembers(taskId, plan, progress, report, journal = null) {
-    const detail = await client.getTask(taskId);
+    const detail = journal
+      ? await guardedJournalEffect(journal, null, () => client.getTask(taskId))
+      : await client.getTask(taskId);
     const plannedNames = new Set([
       ...detail.agents
         .filter((agent) => agent.role !== "database_handler")
@@ -1553,12 +1633,11 @@ export function createTaskHub(host) {
           throw new Error(
             `The saved ${member.state} identity for ${fields.name} is not present. Reconcile the exact agent and run before continuing.`,
           );
-        const problem = await reconciledAgentProblem(
-          taskId,
-          entry,
-          member,
-          exact,
-        );
+        const problem = journal
+          ? await guardedJournalEffect(journal, entry, () =>
+              reconciledAgentProblem(taskId, entry, member, exact),
+            )
+          : await reconciledAgentProblem(taskId, entry, member, exact);
         if (problem)
           throw new Error(
             `The saved identity for ${fields.name} has a ${problem} mismatch. Inspect the project before continuing.`,
@@ -1592,12 +1671,18 @@ export function createTaskHub(host) {
         );
     }
     if (reconciled) await saveLaunchJournal(journal);
-    for (const { server, fields } of plan) {
+    for (const entry of plan) {
+      const { server, fields } = entry;
       if (fields.agentRole === "database_handler")
         if (!progress.has(fields.name))
-          await saveHandlerPlan(taskId, server, fields);
+          if (journal)
+            await guardedJournalEffect(journal, entry, () =>
+              saveHandlerPlan(taskId, server, fields),
+            );
+          else await saveHandlerPlan(taskId, server, fields);
     }
-    for (const [i, { server, fields }] of plan.entries()) {
+    for (const [i, entry] of plan.entries()) {
+      const { server, fields } = entry;
       if (progress.has(fields.name)) continue;
       const journalMember = journal?.members.find(
         (member) => member.fields.name === fields.name,
@@ -1611,13 +1696,17 @@ export function createTaskHub(host) {
       }
       let agent;
       try {
-        agent = await spawn(
-          taskId,
-          server,
-          fields.agentRole === "database_handler"
-            ? fields
-            : { ...fields, plannedTeamMembers },
-        );
+        const effect = () =>
+          spawn(
+            taskId,
+            server,
+            fields.agentRole === "database_handler"
+              ? fields
+              : { ...fields, plannedTeamMembers },
+          );
+        agent = journal
+          ? await guardedJournalEffect(journal, entry, effect)
+          : await effect();
       } catch (error) {
         const verifiedUnstarted =
           error?.verifiedUnstarted === true ||
@@ -1645,7 +1734,9 @@ export function createTaskHub(host) {
       journal &&
       journal.members.every((member) => member.state === "started")
     )
-      await host.api(`/team-launch-plans/${journal.id}`, "DELETE");
+      await guardedJournalEffect(journal, null, () =>
+        host.api(`/team-launch-plans/${journal.id}`, "DELETE"),
+      );
   }
 
   async function addTeam(team) {
@@ -1719,7 +1810,8 @@ export function createTaskHub(host) {
         );
         if (!savedPlan) return;
         launchJournal = structuredClone(savedPlan);
-        plan = restoreLaunchMembers(launchJournal, host.getServers());
+        await assertLaunchScope(launchJournal);
+        plan = await restoreLaunchMembers(launchJournal, host.getServers());
         const frozen = plan.find((member) => member.fields.workItemId)?.fields;
         if (frozen)
           routing = {
@@ -1835,12 +1927,19 @@ export function createTaskHub(host) {
               )
               .forEach((el) => (el.disabled = true));
             projects.setEditable([]);
-            const existingTask = await client.getTask(id);
+            const existingTask = await guardedJournalEffect(
+              launchJournal,
+              null,
+              () => client.getTask(id),
+            );
             const policy = {};
             if (team.swarm) policy.swarm = true;
             if (!existingTask.task.orchestrator)
               policy.orchestrator = team.orchestrator || team.members[0].name;
-            if (Object.keys(policy).length) await client.updateTask(id, policy);
+            if (Object.keys(policy).length)
+              await guardedJournalEffect(launchJournal, null, () =>
+                client.updateTask(id, policy),
+              );
             bound.add(id);
           }
           await launchMembers(

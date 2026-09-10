@@ -16,7 +16,7 @@ export function reasoningOptions(runtime, model) {
   return runtime === "codex" ? CODEX_REASONING_MODELS[model] || [] : [];
 }
 
-export function validateReasoning(runtime, model, value = "") {
+export function validateReasoning(runtime, model, value = "", run = "") {
   if (typeof value !== "string") throw new Error("Invalid reasoning level.");
   if (!value) return "";
   const supported = reasoningOptions(runtime, model);
@@ -27,6 +27,10 @@ export function validateReasoning(runtime, model, value = "") {
         : !model
           ? "Choose a documented Codex model before setting reasoning, or use Inherit."
           : "This model and reasoning level are not in Tailterm’s verified Codex support matrix. Choose Inherit.",
+    );
+  if (run.trim() !== "codex")
+    throw new Error(
+      "Explicit reasoning requires Tailterm’s verified native codex command. Custom command overrides must use Inherit.",
     );
   return value;
 }

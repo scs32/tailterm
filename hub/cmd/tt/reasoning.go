@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"regexp"
+	"strings"
 
 	"github.com/scs32/tailterm/hub/internal/spawn"
 )
@@ -20,7 +21,7 @@ var codexReasoningModels = map[string]map[string]bool{
 // Explicit reasoning is supported only for exact documented Codex model IDs.
 // Empty reasoning preserves the runtime's host/model default without an argv
 // override. Unknown/custom models intentionally remain inherit-only.
-func reasoningCommand(command, runtime, model, reasoning string) (string, error) {
+func reasoningCommand(command, runtime, model, reasoning, run string) (string, error) {
 	if reasoning == "" {
 		return command, nil
 	}
@@ -29,6 +30,9 @@ func reasoningCommand(command, runtime, model, reasoning string) (string, error)
 	}
 	if !codexReasoningModels[model][reasoning] {
 		return "", fmt.Errorf("unsupported Codex model and reasoning combination; choose inherit")
+	}
+	if strings.TrimSpace(run) != "codex" {
+		return "", fmt.Errorf("explicit reasoning requires the verified native codex command; custom command overrides must use inherit")
 	}
 	if reasoningFlag.MatchString(command) {
 		return "", fmt.Errorf("remove model_reasoning_effort from the command override or choose inherit")

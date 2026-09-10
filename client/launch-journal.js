@@ -33,6 +33,31 @@ const FIELD_KEYS = new Set([
 
 const bytes = (value) => encoder.encode(JSON.stringify(value)).byteLength;
 
+async function digest(value) {
+  const result = await crypto.subtle.digest(
+    "SHA-256",
+    encoder.encode(JSON.stringify(value)),
+  );
+  return [...new Uint8Array(result)]
+    .map((byte) => byte.toString(16).padStart(2, "0"))
+    .join("");
+}
+
+export const serverLaunchScope = (server) =>
+  digest([
+    server?.id || "",
+    server?.host || "",
+    server?.port || 0,
+    server?.username || "",
+    server?.mode || "",
+    server?.tmuxPath || "",
+    server?.fingerprint || "",
+    server?.keyId || "",
+    !!server?.hasPassword,
+    server?.credentialRevision || 1,
+    !!server?.tailnet,
+  ]);
+
 function normalizeCreation(value) {
   if (!value || typeof value !== "object" || Array.isArray(value))
     throw new Error("Invalid project creation retry state.");
@@ -138,6 +163,8 @@ export function normalizeTeamLaunchPlans(value) {
         !member ||
         typeof member !== "object" ||
         !/^[A-Za-z0-9_-]{1,80}$/.test(member.serverId || "") ||
+        (member.serverScope !== undefined &&
+          !/^[a-f0-9]{64}$/.test(member.serverScope)) ||
         !["unstarted", "uncertain", "started"].includes(member.state) ||
         !member.fields ||
         typeof member.fields !== "object" ||
@@ -201,8 +228,17 @@ export function launchPlanForStorage(plan) {
         typeof context === "string" ? context : JSON.stringify(context),
     }),
     members: plan.members.map(
-      ({ server, serverId, fields, state, agent, folderAmendments }) => ({
+      ({
+        server,
+        serverId,
+        serverScope,
+        fields,
+        state,
+        agent,
+        folderAmendments,
+      }) => ({
         serverId: server?.id || serverId,
+        ...(serverScope && { serverScope }),
         state,
         ...(agent && { agent: structuredClone(agent) }),
         ...(folderAmendments && {
@@ -219,26 +255,36 @@ export function launchPlanForStorage(plan) {
   return normalizeTeamLaunchPlans([stored])[0];
 }
 
-export function restoreLaunchMembers(plan, servers) {
-  return plan.members.map((member) => {
-    const server = servers.find((entry) => entry.id === member.serverId);
-    if (!server)
-      throw new Error(
-        `The saved machine for ${member.fields.name} is unavailable.`,
-      );
-    return {
-      server,
-      fields: {
-        ...structuredClone(member.fields),
-        ...(plan.workContextBundle && {
-          workContextBundle: plan.workContextBundle,
+export async function restoreLaunchMembers(plan, servers) {
+  return Promise.all(
+    plan.members.map(async (member) => {
+      const server = servers.find((entry) => entry.id === member.serverId);
+      if (!server)
+        throw new Error(
+          `The saved machine for ${member.fields.name} is unavailable.`,
+        );
+      if (!member.serverScope)
+        throw new Error(
+          `The saved machine scope for ${member.fields.name} is unavailable. Recreate the frozen launch plan.`,
+        );
+      if ((await serverLaunchScope(server)) !== member.serverScope)
+        throw new Error(
+          `The saved machine profile for ${member.fields.name} changed. Restore the exact endpoint and credentials or discard the frozen plan.`,
+        );
+      return {
+        server,
+        fields: {
+          ...structuredClone(member.fields),
+          ...(plan.workContextBundle && {
+            workContextBundle: plan.workContextBundle,
+          }),
+        },
+        state: member.state || "unstarted",
+        ...(member.agent && { agent: structuredClone(member.agent) }),
+        ...(member.folderAmendments && {
+          folderAmendments: structuredClone(member.folderAmendments),
         }),
-      },
-      state: member.state || "unstarted",
-      ...(member.agent && { agent: structuredClone(member.agent) }),
-      ...(member.folderAmendments && {
-        folderAmendments: structuredClone(member.folderAmendments),
-      }),
-    };
-  });
+      };
+    }),
+  );
 }
