@@ -1,5 +1,42 @@
 # Development handoff — September 9, 2026
 
+## September 9 work-item dropdown dialog — release verified pending final acceptance
+
+Application commit `8d47e9b4b6c34cc1b9331517ba893156d28e23e8` is deployed to
+`https://tailos.tailarr.com` (`https://9a5a97b3.tailos.pages.dev`, deployment
+`9a5a97b3-c3ad-4b34-bc16-59a66632c7b9`) and served by the preserved detached
+Mini preview PID 60799 / PPID 1 at `http://127.0.0.1:4318`. All three origins
+match the clean retained package's 81 public assets and release-manifest SHA-256
+`9280148ec37f1dcbbf51300ed04f973597abfeb7956da3bfdb21c4380480b17e`,
+with expected MIME behavior and no content encoding. Fresh Chromium on every
+origin started production WASM, restored an isolated synthetic vault/key,
+retained matching layout margins at three viewport sizes and reported no page
+errors.
+
+The actual Bugs and Features editors previously reproduced two dialog-close
+paths in Chromium and WebKit: Enter on focused Status implicitly submitted the
+form before selection, and Escape while Status or Priority matched `:open`
+closed the containing modal. The shared dialog boundary now opens a closed
+single-select from Enter without implicit submission and keeps Escape inside an
+open native picker while preserving ordinary Escape, close, submit, commit,
+draft, scroll and focus behavior. The fallback is a programmatic `click()`
+within user activation, not a claimed trusted native click.
+
+Bug `wi_85a66e159b50a309` revision 2 and bounded order #1358 are documented in
+[the implementation report](dropdown-dialog.md) and
+[the release receipt](releases/tailos-2026-09-09-dropdown-dialog.json). Lead
+accepted the demonstrated keyboard repairs in #1387 and assigned release in
+#1401. The clean exact source/package is retained at
+`.build/releases/dropdown-dialog-8d47e9b`. Immediate rollback is the narrative
+package `.build/releases/narrative-history-4cb6e6c` and deployment
+`https://fa7bd9ec.tailos.pages.dev`. The original report did not identify the
+exact control/input/browser/device, and native macOS popup option selection was
+not automatable, so a physical pointer-option fix is not claimed by direct
+reproduction. No hub, CLI, schema, database, Tailscale/network, TrueNAS, relay,
+Air-preview, old-site, live fixture or agent-lifecycle change accompanied this
+release. Lead actual-release acceptance and handler revision-checked report save
+remain pending.
+
 ## September 9 feature narrative history — release verified pending final acceptance
 
 Application commit `4cb6e6c6a28cf5d4b94e0f8a572be0eec62ae16a` is deployed to

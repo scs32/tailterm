@@ -69,9 +69,19 @@ hub, CLI, schema, or deployment code changed.
   pagination, focus, history, and dispatch checks passed in both engines on an
   isolated rerun. An earlier concurrent run passed its scenarios while Vite
   logged an `ENOTEMPTY` dependency-cache rename warning.
-- `npm run build:static`: not passed in this isolated worktree because the
-  generated `wasm/tailserve.wasm` prerequisite is absent. No production package
-  or deployment is claimed at candidate stage.
+- Candidate-stage `npm run build:static` did not pass in the isolated builder
+  worktree because generated `wasm/tailserve.wasm` was absent. The accepted
+  candidate was later integrated on the released root, and a clean detached
+  source built pinned production WASM and passed the 82-entry release check.
+
+After integration on `tasks-hub`, the affected dialog/presentation tests passed
+19/19. The dropdown dialog, narrative reader, project work-item and active-scroll
+browser suites passed in Chromium and WebKit. The clean exact application commit
+`8d47e9b4b6c34cc1b9331517ba893156d28e23e8` is deployed to immutable TailOS,
+the custom TailOS domain and Mini. Every origin matched `release.json` and all
+81 served assets by size and SHA-256, with expected MIME behavior and no content
+encoding. Fresh Chromium on every origin passed production WASM startup,
+isolated synthetic-vault restoration and three-viewport layout checks.
 
 Playwright pointer and keyboard events are real browser input, and `:open` is a
 browser-observed state. `selectOption` is a synthetic DOM-level commit. Protocol
@@ -81,12 +91,20 @@ no native Safari, physical mouse/keyboard, owner-profile, live-data, or
 owner-device pass. Exact physical pointer-option selection therefore remains an
 acceptance limitation rather than a claimed reproduction.
 
-## Remaining dependencies
+## Release and remaining acceptance
 
-Lead candidate acceptance and a sequenced integration/release slot remain
-required. Integration must preserve the then-current lifecycle, narrative,
-status-filter and active-scroll changes, generate the clean WASM/static package,
-and verify TailOS plus the unchanged Mini listener. The database handler must
-save revision-checked result/acceptance links before the item can be reported
-complete. Owner confirmation of the exact dropdown and physical interaction is
-still useful for deployed acceptance.
+Lead accepted the two demonstrated keyboard defects in Board message #1387 and
+assigned release in #1401. Cloudflare deployment
+`9a5a97b3-c3ad-4b34-bc16-59a66632c7b9` serves
+`https://9a5a97b3.tailos.pages.dev` and `https://tailos.tailarr.com`; Mini serves
+the byte-identical package at `http://127.0.0.1:4318` without restarting detached
+listener PID 60799 / PPID 1. The clean source/package is retained at
+`.build/releases/dropdown-dialog-8d47e9b`. Immediate rollback is the narrative
+package `.build/releases/narrative-history-4cb6e6c` and deployment
+`https://fa7bd9ec.tailos.pages.dev`.
+
+Owner confirmation of the exact pulldown and physical interaction remains useful:
+native macOS popup option selection was not automatable, so the original physical
+pointer-option symptom is not claimed fixed by direct reproduction. The database
+handler must still save the revision-checked final report and lead acceptance
+before the item can be reported complete.

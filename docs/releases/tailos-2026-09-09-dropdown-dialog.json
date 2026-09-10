@@ -1,0 +1,116 @@
+{
+  "status": "builder_release_verified_pending_lead_acceptance_and_report_pin",
+  "recordedAt": "2026-09-10T04:14:15Z",
+  "workItem": {
+    "id": "wi_85a66e159b50a309",
+    "currentRevision": 2,
+    "workOrder": "wi_85a66e159b50a309-dropdown-dialog-1",
+    "workOrderMessage": 1358,
+    "candidateEvidenceMessage": 1385,
+    "candidateAcceptanceMessage": 1387,
+    "handlerCandidateVerificationMessage": 1388,
+    "releaseAssignmentMessage": 1401
+  },
+  "source": {
+    "releasedBaseAtIntake": "fb37de22235125e5d4dae96870c9688507c40657",
+    "releaseIntegrationBase": "a6429944a5e95350e0e2f303446d6f2d9359b243",
+    "acceptedCandidate": "c80d3e93febd451a3951338d3e350ebe4258d95b",
+    "integratedApplicationCommit": "8d47e9b4b6c34cc1b9331517ba893156d28e23e8",
+    "integrationCommit": "0952fd7",
+    "wordingCorrectionCommit": "8d47e9b",
+    "integration": "Conflict-free candidate cherry-pick followed by evidence-wording correction, preserving narrative history, exact-run lifecycle closeout, active-scroll and native-select continuity.",
+    "retainedCleanSource": "/Users/stephenspeicher/projects/tailterm/.build/releases/dropdown-dialog-8d47e9b",
+    "cleanSource": true,
+    "implementationReport": "docs/dropdown-dialog.md",
+    "files": {
+      "client/main.js": "ec74fe00143a0d18d01a9143ffd87e8106be03f4e6e03bf8e29a45ed6740aba3",
+      "client/dialog-interaction.js": "ba857a80d93ef2e8e983b19e45e62a8d753abbfdd763a85bd96c9f385995afc5",
+      "tests/dialog-interaction.test.js": "1de47e44b4c51df6e74e68c591a1ee2fd604a818b42112758c15b1735909f9c8",
+      "tests/dropdown-dialog-browser.mjs": "2e13578c85c0f20daf998c7561995024a4ba5bbde8c1c59705f641e12f6c2359"
+    }
+  },
+  "causeAndRepair": {
+    "demonstratedCause": "Enter on focused Status implicitly submitted the editor, and Escape from a focused Status/Priority select while it matched :open propagated as modal cancellation.",
+    "repair": "The shared dialog interaction boundary prevents implicit Enter submission while opening a closed single-select, and consumes modal cancellation only for a focused select that actually matches :open before blur/refocus with preventScroll.",
+    "preserved": "Native select commit and keyboard behavior, selected values, encrypted drafts/retry/discard, ordinary Escape, close-button and submit paths, active scroll holds/anchors and preventScroll focus restoration.",
+    "limit": "The owner report did not identify an exact control, browser, device or input trace. Playwright cannot select a macOS native popup option through physical input, so the original pointer-option symptom is not claimed reproduced or fixed directly. The click fallback is programmatic within user activation, not a trusted native click."
+  },
+  "package": {
+    "commit": "8d47e9b4b6c34cc1b9331517ba893156d28e23e8",
+    "manifestEntries": 82,
+    "servedAssetsPerOrigin": 81,
+    "releaseSha256": "9280148ec37f1dcbbf51300ed04f973597abfeb7956da3bfdb21c4380480b17e",
+    "packageLockSha256": "a4175ff8886d6c2ee8443e7a928bc1f6f9500cd3b2c24b55fb967175d9eb3f98",
+    "verifyResult": "82/82 manifest entries passed from clean detached source",
+    "productionWasmBuild": "Pinned production build without tailserve_test tag",
+    "node": "v26.5.1",
+    "assets": {
+      "mainScript": {
+        "path": "assets/index-wBW22YC1.js",
+        "size": 823424,
+        "sha256": "16ea8e4fe7b91c7dc66ca98febb99e9f936001c7e13a5bdb27974769649747b2"
+      },
+      "stylesheet": {
+        "path": "assets/index-Ck2a0xYT.css",
+        "size": 96605,
+        "sha256": "109c57856f3279a9210d2dbee8d9c5079ec774e7a67142be8a797ef696c3fd3a"
+      },
+      "productionWasmGzip": {
+        "path": "assets/tailserve-ovlsNBij.wasm.gz",
+        "size": 8598270,
+        "sha256": "d2db6e51bf422ba1ba96743a7dbf23fc8edb7a70bb9384ed41b846728ec71c2d"
+      }
+    }
+  },
+  "frontend": {
+    "cloudflareProject": "tailos",
+    "deploymentId": "9a5a97b3-c3ad-4b34-bc16-59a66632c7b9",
+    "immutableOrigin": "https://9a5a97b3.tailos.pages.dev",
+    "customOrigin": "https://tailos.tailarr.com",
+    "miniOrigin": "http://127.0.0.1:4318",
+    "miniPreviewPid": 60799,
+    "miniPreviewPpid": 1,
+    "miniPreviewRestarted": false,
+    "assetVerification": "release.json and 81/81 served assets on immutable TailOS, custom TailOS and Mini matched exact size and SHA-256. Content-Encoding was absent. MIME matched each origin's serving contract; Mini intentionally serves unmapped .txt and .mjs files as application/octet-stream.",
+    "browserVerification": "Fresh Chromium on all three origins started production WASM, generated and restored an isolated synthetic vault/key, retained matching margins at 1440x900, 1024x768 and 1920x1080, and reported no page errors."
+  },
+  "verification": {
+    "passed": [
+      "Baseline Chromium/WebKit actual-view fixtures reproduced implicit Enter submission and open-picker Escape closing in Bugs and Features",
+      "Candidate Chromium/WebKit actual-view fixtures passed Status/Priority picker cancellation, editor liveness, preventScroll focus, ordinary Escape and close, retained draft, synthetic value commit and submission",
+      "Candidate JavaScript suite passed 140/140",
+      "Candidate dropdown continuity passed 38/38 plus encrypted draft-vault, project work-item and active-scroll browser suites in Chromium and WebKit",
+      "Integrated affected dialog and refresh-presentation checks passed 19/19",
+      "Integrated dropdown dialog, narrative reader, project work-item and active-scroll checks passed in Chromium and WebKit",
+      "Clean production WASM/static build and 82-entry release verification passed",
+      "TailOS immutable origin, custom domain and Mini matched release.json and 81/81 served assets by hash and size",
+      "Status, MIME and no-Content-Encoding checks passed on all three origins",
+      "Production Chromium WASM, isolated synthetic-vault restoration and three-viewport layout passed on all three origins"
+    ],
+    "operationalNonpassesAndCorrections": [
+      "Candidate-stage static build stopped because ignored production WASM was absent in the isolated worktree; the clean release source built pinned production WASM and then packaged successfully.",
+      "One concurrent candidate WebKit work-item run logged an access-control fetch error and one concurrent active-scroll run logged a Vite dependency-cache rename warning; isolated reruns passed without code changes.",
+      "The first deployed header probe could not run because curl and awk are absent on this host; it made no change and a disposable Node verifier covered the checks instead.",
+      "The first two Mini MIME verifier runs assumed Cloudflare MIME for license .txt and runtime .mjs files; the unchanged Mini preview contract was inspected, the verifier was corrected to accept its documented application/octet-stream fallback, and 81/81 assets then passed."
+    ],
+    "warnings": [
+      "npm ci reported three existing moderate audit findings and install-script approval notices; installation and all builds completed.",
+      "Vite reported its existing large-chunk advisory; the release build and manifest verification completed."
+    ]
+  },
+  "rollback": {
+    "frontendCommit": "4cb6e6c6a28cf5d4b94e0f8a572be0eec62ae16a",
+    "frontendDeploymentId": "fa7bd9ec-545d-4f07-aefe-4f574d568e9f",
+    "frontendDeployment": "https://fa7bd9ec.tailos.pages.dev",
+    "frontendPackage": "/Users/stephenspeicher/projects/tailterm/.build/releases/narrative-history-4cb6e6c/dist-static",
+    "procedure": "Deploy the exact retained narrative package explicitly to Cloudflare project tailos, then rsync it to Mini without restarting detached listener 60799.",
+    "warning": "Rollback removes this dropdown-dialog repair while retaining narrative history, lifecycle closeout, active-scroll and earlier frontend work."
+  },
+  "scopeExclusions": [
+    "hub, CLI, schema or database changes",
+    "Tailscale, network or TrueNAS changes",
+    "old tailterm site or Air preview changes",
+    "live tasks, profiles, storage or owner data as test fixtures",
+    "relay restarts or agent/session lifecycle changes"
+  ]
+}
