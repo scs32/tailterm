@@ -4540,6 +4540,7 @@ html:fullscreen {
   body:is(
       [data-mode="board"],
       [data-mode="tasks"],
+      [data-mode="agents"],
       [data-mode="teams"],
       [data-mode="files"],
       [data-mode="bugs"],
@@ -4555,6 +4556,7 @@ html:fullscreen {
   body:is(
       [data-mode="board"],
       [data-mode="tasks"],
+      [data-mode="agents"],
       [data-mode="teams"],
       [data-mode="files"],
       [data-mode="bugs"],
@@ -4567,6 +4569,7 @@ html:fullscreen {
   body:is(
       [data-mode="board"],
       [data-mode="tasks"],
+      [data-mode="agents"],
       [data-mode="teams"],
       [data-mode="files"],
       [data-mode="bugs"],
@@ -5168,6 +5171,11 @@ dialog .agent-save-setup button {
 #mode-view :is(.agents-view, .teams-view) {
   width: 100%;
   max-width: 1120px;
+}
+body:is([data-mode="agents"], [data-mode="teams"]) #workspace .mode-switch {
+  min-width: 0;
+  max-width: 100%;
+  overflow-x: auto;
 }
 #mode-view .team-list {
   border-top: 1px solid var(--line);
