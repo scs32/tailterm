@@ -75,6 +75,12 @@
   gap: 7px;
   flex-shrink: 0;
 }
+#dialog:has(.work-item-history) {
+  width: min(900px, calc(100vw - 24px));
+}
+.work-item-history {
+  min-width: 0;
+}
 .work-item-history-layout {
   display: grid;
   grid-template-columns: minmax(120px, 180px) minmax(0, 1fr);
@@ -105,22 +111,45 @@
     color-mix(in srgb, var(--accent) 18%, transparent)
   );
 }
-.work-item-history-detail {
+.work-item-history-layout [data-history-detail] {
   display: grid;
   align-content: start;
   gap: 8px;
   min-width: 0;
 }
-.work-item-history-description,
-.work-item-history-message p {
-  margin: 0;
+.work-item-history-layout [data-history-detail] > :is(h3, p, pre) {
+  min-width: 0;
+  max-width: 100%;
   overflow-wrap: anywhere;
-  white-space: pre-wrap;
 }
-.work-item-history-message {
+.work-item-history-layout [data-history-detail] > pre {
+  margin: 0;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.work-item-history-messages {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
   padding-top: 8px;
   border-top: 1px solid
     var(--line, color-mix(in srgb, var(--muted) 25%, transparent));
+}
+.work-item-history-messages button {
+  display: grid;
+  gap: 3px;
+  min-width: 0;
+  max-width: 100%;
+  height: auto;
+  padding: 7px 8px;
+  overflow-wrap: anywhere;
+  text-align: left;
+  white-space: normal;
+  word-break: break-word;
+}
+.work-item-history-messages button span {
+  color: var(--muted);
+  font-size: 11px;
 }
 .work-item-history-gaps {
   margin-top: 10px;
@@ -263,6 +292,9 @@
     display: flex;
     max-height: none;
     overflow-x: auto;
+  }
+  .work-item-history-layout nav button {
+    flex: 0 0 min(180px, 72vw);
   }
   #mode-view .work-items-controls select {
     max-width: 180px;
