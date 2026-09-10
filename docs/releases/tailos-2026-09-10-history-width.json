@@ -1,0 +1,114 @@
+{
+  "status": "builder_release_verified_pending_lead_acceptance_and_handler_completion",
+  "recordedAt": "2026-09-10T17:09:12Z",
+  "workItem": {
+    "id": "wi_f44641a045d49ded",
+    "currentRevision": 2,
+    "workOrderMessage": 1551,
+    "completeSupplementMessage": 1552,
+    "candidateEvidenceMessage": 1571,
+    "handlerCandidateMessage": 1572,
+    "candidateAcceptanceMessage": 1576,
+    "releaseAssignmentMessage": 1577,
+    "integrationProgressMessage": 1584,
+    "admittedContextSha256": "9f544cf2768cebba7b4efa648d8d32ca8d7f6a1b9cb4901ed9ea16bedbaad753"
+  },
+  "source": {
+    "authorizedBaseline": "58f9185981625b148b30ad4b5070a1a658e17f77",
+    "acceptedCandidate": "9cd38d37cb7466e8fc57ccf2da994d8457b8be24",
+    "integratedApplicationCommit": "9cd38d37cb7466e8fc57ccf2da994d8457b8be24",
+    "integration": "Conflict-free exact fast-forward from the authorized baseline; no B1 change was included.",
+    "retainedCleanSource": "/Users/stephenspeicher/projects/tailterm/.build/releases/history-width-9cd38d3",
+    "cleanSource": true,
+    "implementationReport": "docs/work-item-history-width.md",
+    "files": {
+      "client/work-items.css": "a4cf2b023e05544ad0117724cc35ed38dc23495e66859c3deeef9927261dac52",
+      "tests/work-item-history-width-browser.mjs": "7636fdd2bdc0edc9c7ee425d6d07344312e2dd9cd8a0409f0e86a279e2baa6f5"
+    }
+  },
+  "causeAndRepair": {
+    "demonstratedCause": "The generic 480px dialog left a narrow detail column beside the revision rail, while old wrapping hooks did not match the rendered [data-history-detail] pre or explicit-message buttons. Synthetic long content overflowed horizontally in all 20 baseline browser cases.",
+    "repair": "A History-only dialog width is clamped inside the CSS viewport, and actual detail, pre, metadata, and message-button elements can shrink and wrap anywhere. Narrow revision choices remain usable through horizontal navigation.",
+    "preserved": "All stored content, descriptions and messages; revision selection; pagination; vertical scrolling; sticky close; Escape and focus behavior; generic work-item editors; and the separate Feature History & Report.",
+    "limit": "Playwright WebKit is not native Safari. The device-scale case is a repeatable 200%-zoom-equivalent CSS viewport simulation, not native browser zoom or owner-device testing."
+  },
+  "package": {
+    "commit": "9cd38d37cb7466e8fc57ccf2da994d8457b8be24",
+    "builtAt": "2026-09-10T16:59:08.942Z",
+    "manifestEntries": 82,
+    "servedAssetsPerOrigin": 81,
+    "releaseSha256": "671872613c224d7d9fc57275c18bbd68732872136ae10cb9dcf4e0c3cf10ae6f",
+    "packageLockSha256": "a4175ff8886d6c2ee8443e7a928bc1f6f9500cd3b2c24b55fb967175d9eb3f98",
+    "verifyResult": "82/82 manifest entries passed from clean detached source",
+    "productionWasmBuild": "Pinned Tailscale 1.102.3 production build without test tags",
+    "rawProductionWasmSha256": "dc841019c8a28670b3a44e0657f3a1e081648dbb561d5072eb735e987e577cb8",
+    "goModuleInventorySha256": "2c33e75b00b437e19377989a0fd36a631dd4a9cbd94b8fd17833ea4496e6778b",
+    "pinnedTailscaleArchiveSha256": "0e94d961c31ce7d33e8b7ce4ac6fdbec83ee5658784eed69eb7fce300729d717",
+    "node": "v26.5.1",
+    "assets": {
+      "mainScript": {
+        "path": "assets/index-Dyf9cgDM.js",
+        "size": 823424,
+        "sha256": "3e59a0c86450dcf89bc4c211459aa2553ac25d8192799455648a52fe941da194"
+      },
+      "stylesheet": {
+        "path": "assets/index-B-MR83xR.css",
+        "size": 97190,
+        "sha256": "d6878b64e2bfe9d1271d74e4aff645f3d5c7f34a43ad309d989c4a8eb3006627"
+      },
+      "productionWasmGzip": {
+        "path": "assets/tailserve-qM5zcVoK.wasm.gz",
+        "size": 8598273,
+        "sha256": "3fbd89103e04af9fdafe9a7f38da9100f5b9c71d39a5c82c4e5fa59dc8bbdf82"
+      }
+    }
+  },
+  "frontend": {
+    "cloudflareProject": "tailos",
+    "deploymentId": "08760468-ec79-4953-bd07-18f51564d232",
+    "immutableOrigin": "https://08760468.tailos.pages.dev",
+    "customOrigin": "https://tailos.tailarr.com",
+    "miniOrigin": "http://127.0.0.1:4318",
+    "miniPreviewPid": 60799,
+    "miniPreviewPpid": 1,
+    "miniPreviewRestarted": false,
+    "assetVerification": "release.json and 81/81 served assets on immutable TailOS, custom TailOS, and Mini matched exact size and SHA-256 with identity encoding. MIME matched each origin's serving contract; Mini intentionally serves unmapped .txt and .mjs files as application/octet-stream.",
+    "browserVerification": "Fresh Chromium on all three origins started production WASM, generated and restored an isolated synthetic vault/key, retained matching margins at 1440x900, 1024x768, and 1920x1080, and reported no page errors.",
+    "layoutScreenshotSha256": "dee008e5bb73ff69cb91fb1e43b1dc1241bc26b73201661e1427f62041b71664"
+  },
+  "verification": {
+    "passed": [
+      "Exact-release baseline Chromium/WebKit fixture reproduced horizontal overflow in all 20 Bug/Feature and viewport cases",
+      "Exact-release candidate Chromium/WebKit fixture passed all 20 readability, wrapping, selection, navigation, scroll, close, Escape, focus, and unrelated-dialog cases",
+      "Project work-items, narrative History & Report, and unrelated dropdown-dialog suites passed in Chromium and WebKit",
+      "JavaScript suite passed 141/141",
+      "Clean pinned production WASM/static build and 82-entry release verification passed",
+      "TailOS immutable origin, custom domain, and Mini matched release.json and 81/81 served assets by hash, size, status, and MIME",
+      "Production Chromium WASM, isolated synthetic-vault restoration, and three-viewport layout passed on all three origins"
+    ],
+    "operationalNonpassesAndCorrections": [
+      "Candidate-stage static build stopped because ignored production WASM was absent in the isolated builder worktree; the exact clean release source rebuilt pinned production WASM and packaged successfully.",
+      "The first deployed verifier allowed Cloudflare's normal Brotli negotiation, so a null Content-Encoding assertion failed for JavaScript. It made no deployment change; the read-only verifier requested identity bytes and all three origins passed."
+    ],
+    "warnings": [
+      "Vite reported its existing large-chunk advisory; the release build and manifest verification completed."
+    ]
+  },
+  "rollback": {
+    "frontendCommit": "8d47e9b4b6c34cc1b9331517ba893156d28e23e8",
+    "frontendDeploymentId": "9a5a97b3-c3ad-4b34-bc16-59a66632c7b9",
+    "frontendDeployment": "https://9a5a97b3.tailos.pages.dev",
+    "frontendReleaseSha256": "9280148ec37f1dcbbf51300ed04f973597abfeb7956da3bfdb21c4380480b17e",
+    "frontendPackage": "/Users/stephenspeicher/projects/tailterm/.build/releases/dropdown-dialog-8d47e9b/dist-static",
+    "procedure": "Deploy the exact retained dropdown package explicitly to Cloudflare project tailos, then synchronize it to Mini without restarting detached listener 60799.",
+    "warning": "Rollback removes this History-width repair while retaining the dropdown-dialog and earlier accepted frontend work."
+  },
+  "scopeExclusions": [
+    "B1 implementation or integration",
+    "hub, CLI, schema, or database changes",
+    "Tailscale, network, or TrueNAS changes",
+    "old tailterm site or Air preview changes",
+    "live tasks, profiles, storage, or owner data as test fixtures",
+    "relay restarts or agent/session lifecycle changes"
+  ]
+}

@@ -1,5 +1,45 @@
 # Development handoff — September 10, 2026
 
+## September 10 work-item History width — release verified pending final acceptance
+
+Application/source commit `9cd38d37cb7466e8fc57ccf2da994d8457b8be24` is
+deployed to `https://tailos.tailarr.com`
+(`https://08760468.tailos.pages.dev`, deployment
+`08760468-ec79-4953-bd07-18f51564d232`) and served by the preserved detached
+Mini preview PID 60799 / PPID 1 at `http://127.0.0.1:4318`. All three origins
+match the clean retained package's 81 public assets and release-manifest SHA-256
+`671872613c224d7d9fc57275c18bbd68732872136ae10cb9dcf4e0c3cf10ae6f`.
+The exact clean source/package is retained at
+`.build/releases/history-width-9cd38d3`.
+
+Classic Bug and Feature History now use a viewport-clamped 900px preferred
+dialog and wrap actual detail text, unbroken identifiers, URLs, and explicit
+message controls without shortening stored history. Revision selection,
+horizontal revision navigation on narrow screens, vertical scrolling, sticky
+close, Escape/focus behavior, the work-item editor, and the separate Feature
+History & Report remain intact. The exact-release test matrix reproduced all 20
+baseline overflow cases and passed all 20 candidate cases across Chromium and
+WebKit at desktop, narrow, and 200%-zoom-equivalent CSS viewports. The full
+JavaScript suite passed 141/141; production WASM/static builds and the 82-entry
+manifest check passed. Fresh Chromium on each deployed origin started production
+WASM, generated and restored only an isolated synthetic vault/key, passed three
+layout sizes, and reported no page errors.
+
+Bug `wi_f44641a045d49ded` revision 2, bounded work order #1551 plus complete
+supplement #1552, candidate acceptance #1576, and release order #1577 are
+documented in [the implementation and release report](work-item-history-width.md)
+and [the release receipt](releases/tailos-2026-09-10-history-width.json). No B1,
+hub, CLI, schema, database, Tailscale/network, TrueNAS, relay, Air-preview,
+old-site, live-fixture, or agent-lifecycle change accompanied this release. The
+current hub remains the A2 release described below. Immediate frontend rollback
+is the independently reverified clean dropdown package
+`.build/releases/dropdown-dialog-8d47e9b`, application
+`8d47e9b4b6c34cc1b9331517ba893156d28e23e8`, and deployment
+`https://9a5a97b3.tailos.pages.dev`; deploy it explicitly to project `tailos`
+and synchronize the identical package to Mini without restarting PID 60799.
+Lead actual-release acceptance and database-handler revision-checked report
+save/readback remain pending; no Done or completion pin is claimed.
+
 ## September 10 message audit A2 — hub release verified pending final acceptance
 
 Accepted candidate `b7dd55d7190cf1932ef4cd13ea3bd883dd440276` was

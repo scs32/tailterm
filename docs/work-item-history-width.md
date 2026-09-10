@@ -2,7 +2,7 @@
 
 ## Recorded scope
 
-This candidate implements bug `wi_f44641a045d49ded` revision 2 under bounded
+This release implements bug `wi_f44641a045d49ded` revision 2 under bounded
 work order Board message #1551 and its complete supplement #1552. The admitted
 context SHA-256 is
 `9f544cf2768cebba7b4efa648d8d32ca8d7f6a1b9cb4901ed9ea16bedbaad753`;
@@ -84,9 +84,10 @@ the separate Feature History & Report retain the generic dialog width.
 - `npx prettier --check client/work-items.css tests/work-item-history-width-browser.mjs docs/work-item-history-width.md`:
   all owned files match project formatting.
 - `git diff --check`: passed.
-- `npm run build:static`: did not reach bundling because this isolated worktree
-  has no generated `wasm/tailserve.wasm`. No production/static build pass is
-  claimed, and no retained or deployed artifact was copied into the worktree.
+- Candidate-stage `npm run build:static` did not reach bundling because the
+  isolated builder worktree had no generated `wasm/tailserve.wasm`. The exact
+  clean release source later rebuilt production WASM and passed static packaging
+  and release verification; details follow below.
 
 The browser test writes ignored screenshots under `.build/history-width/`.
 Selected evidence SHA-256 values:
@@ -114,19 +115,90 @@ Final formatted source SHA-256 values before commit are:
 - `tests/work-item-history-width-browser.mjs`:
   `7636fdd2bdc0edc9c7ee425d6d07344312e2dd9cd8a0409f0e86a279e2baa6f5`
 
-## Limits and release boundary
+## Integration and release evidence
+
+Lead accepted the bounded source candidate in Board message #1576 and issued the
+concrete width-first release order in #1577. The shared `tasks-hub` branch had no
+tracked or staged change at exact baseline
+`58f9185981625b148b30ad4b5070a1a658e17f77`; three untracked owner screenshot
+files were preserved and excluded. Because the candidate's parent was that exact
+baseline, integration was a conflict-free fast-forward to application/source
+commit `9cd38d37cb7466e8fc57ccf2da994d8457b8be24`. No B1 change was included.
+
+The exact clean source and package are retained at
+`.build/releases/history-width-9cd38d3`. Production WASM was rebuilt from the
+unchanged pinned Tailscale 1.102.3 source using the verified prior release cache.
+The module identity list exactly matched the prior verified inventory; rebuilding
+regenerated its paths inside the new retained tree. Relevant hashes:
+
+- pinned Tailscale source archive:
+  `0e94d961c31ce7d33e8b7ce4ac6fdbec83ee5658784eed69eb7fce300729d717`
+- raw production `wasm/tailserve.wasm`:
+  `dc841019c8a28670b3a44e0657f3a1e081648dbb561d5072eb735e987e577cb8`
+- regenerated `.build/go-modules.txt`:
+  `2c33e75b00b437e19377989a0fd36a631dd4a9cbd94b8fd17833ea4496e6778b`
+- packaged release manifest:
+  `671872613c224d7d9fc57275c18bbd68732872136ae10cb9dcf4e0c3cf10ae6f`
+- package-lock:
+  `a4175ff8886d6c2ee8443e7a928bc1f6f9500cd3b2c24b55fb967175d9eb3f98`
+
+`npm run build:wasm`, `npm run build:static`, and `npm run verify:release`
+passed. The clean Node v26.5.1 build records 82 manifest entries. The main
+stylesheet is `assets/index-B-MR83xR.css`, 97,190 bytes, SHA-256
+`d6878b64e2bfe9d1271d74e4aff645f3d5c7f34a43ad309d989c4a8eb3006627`;
+the production WASM gzip is `assets/tailserve-qM5zcVoK.wasm.gz`, 8,598,273
+bytes, SHA-256
+`3fbd89103e04af9fdafe9a7f38da9100f5b9c71d39a5c82c4e5fa59dc8bbdf82`.
+The build emitted only Vite's existing large-chunk advisory.
+
+The exact release-source History suite again reproduced all 20 baseline cases
+and passed all 20 candidate cases in Chromium and WebKit. The package was
+deployed with the explicit Wrangler command to Cloudflare Pages project
+`tailos`, production branch `main`, commit hash `9cd38d37…`, and
+`--commit-dirty=false`:
+
+- deployment ID `08760468-ec79-4953-bd07-18f51564d232`
+- immutable origin `https://08760468.tailos.pages.dev`
+- custom origin `https://tailos.tailarr.com`
+
+The byte-identical retained package was synchronized only to the existing Mini
+served `dist-static` directory. Detached preview PID 60799, PPID 1, its September
+9 start time, cwd, command, and listener were preserved; no preview restart
+occurred. Immutable TailOS, custom TailOS, and Mini each matched the release JSON
+and all 81 served public assets by exact size, SHA-256, and origin-appropriate
+MIME with identity encoding. The first verifier request allowed Cloudflare's
+normal Brotli negotiation and therefore could not assert a null encoding header;
+the read-only verifier was corrected to request identity bytes, then all three
+origins passed without a deployment change.
+
+Fresh disposable Chromium contexts on all three origins started the real
+production WASM, generated and restored an isolated synthetic vault/key, retained
+matching application margins at 1440×900, 1024×768, and 1920×1080, and reported
+no page errors. Their layout screenshots have identical SHA-256
+`dee008e5bb73ff69cb91fb1e43b1dc1241bc26b73201661e1427f62041b71664`.
+
+Immediate rollback is the independently reverified clean source/package
+`.build/releases/dropdown-dialog-8d47e9b`, application
+`8d47e9b4b6c34cc1b9331517ba893156d28e23e8`, deployment
+`9a5a97b3-c3ad-4b34-bc16-59a66632c7b9` at
+`https://9a5a97b3.tailos.pages.dev`, and manifest SHA-256
+`9280148ec37f1dcbbf51300ed04f973597abfeb7956da3bfdb21c4380480b17e`.
+Rollback deploys that retained `dist-static` explicitly to Pages project
+`tailos`, then synchronizes it to Mini without restarting PID 60799.
+
+## Limits and final acceptance boundary
 
 Playwright WebKit is not native Safari. No native Safari, owner device/profile,
-physical input, native browser-zoom control, production service, local preview,
-or live work-item/profile data was used. The device-scale case is explicitly a
-repeatable zoom-equivalent emulation, not a claim of native 200% browser zoom.
-Static packaging remains unverified in this worktree because its generated WASM
-prerequisite is absent; the browser fixture loaded the owned production CSS and
-view source directly through Vite.
+physical input, or native browser-zoom control was used. The device-scale case is
+explicitly a repeatable zoom-equivalent emulation, not a claim of native 200%
+browser zoom. Deployment browser checks used only disposable synthetic vault
+state; no live work-item/profile fixture or owner storage was read or changed.
 
-This is an unaccepted builder candidate. It was not integrated, deployed,
-self-accepted, or marked Done. Lead review and database-handler revision-checked
-result/acceptance storage remain required. Any later integration must serialize
-with the accepted B1 shared changes and rerun the scoped CSS/UI checks on that
-exact integration candidate. A separate reviewed release order must name the
-TailOS and local-preview targets and cleanup ownership.
+No hub, CLI, schema, database, Tailscale, networking, TrueNAS, relay, Air preview,
+old `tailterm.tailarr.com` site, live task/profile, or agent-session change
+accompanied this release. B1 remained isolated and unaccepted during the sole
+shared integration window.
+
+This is a builder-verified actual release, not self-acceptance or a Done claim.
+Lead actual-release verification and database-handler revision-checked report
+storage/readback plus final acceptance remain required before completing the bug.
