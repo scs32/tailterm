@@ -16,7 +16,6 @@ import {
 import {
   guardedLaunchEffect,
   reconciledAgentProblem,
-  taskCreationMatches,
 } from "../client/launch-reconciliation.js";
 import { agentSpawnCommand } from "../shared/tmux-command.js";
 
@@ -346,29 +345,6 @@ test("project creation journal and agent reconciliation preserve exact identitie
     preparedAt: new Date(0).toISOString(),
     attemptedAt: new Date(1).toISOString(),
   };
-  const tasks = [
-    {
-      id: "tsk_0000000000000001",
-      status: "open",
-      ...creation.request,
-    },
-    {
-      id: "tsk_0000000000000002",
-      status: "open",
-      ...creation.request,
-    },
-    {
-      id: "tsk_0000000000000003",
-      status: "open",
-      ...creation.request,
-      goal: "Different bytes",
-    },
-  ];
-  assert.deepEqual(
-    taskCreationMatches(tasks, creation).map((task) => task.id),
-    ["tsk_0000000000000002"],
-  );
-
   const context = JSON.stringify({ version: 1, exact: "context bytes" });
   const digest = Buffer.from(
     await crypto.subtle.digest("SHA-256", new TextEncoder().encode(context)),

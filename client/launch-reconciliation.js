@@ -55,23 +55,6 @@ export async function reconciledAgentProblem(taskId, entry, member, agent) {
   return "";
 }
 
-export const taskMatchesCreation = (task, request) =>
-  task.status === "open" &&
-  task.name === request.name &&
-  task.goal === request.goal &&
-  task.allowAgentSpawn === request.allowAgentSpawn &&
-  task.maxNewAgents === request.maxNewAgents &&
-  task.swarm === request.swarm &&
-  (task.orchestrator || "") === request.orchestrator;
-
-export function taskCreationMatches(tasks, creation) {
-  const known = new Set(creation.knownTaskIds);
-  return tasks.filter(
-    (task) =>
-      !known.has(task.id) && taskMatchesCreation(task, creation.request),
-  );
-}
-
 export async function guardedLaunchEffect(guard, effect) {
   await guard();
   try {

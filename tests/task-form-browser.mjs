@@ -54,6 +54,9 @@ let failLaunch = false,
   failAt = 0,
   loseLaunchAt = 0,
   loseTaskCreateReply = false,
+  dropTaskCreateBeforeCommit = false,
+  taskCreateRequests = 0,
+  taskListGate = null,
   execs = 0,
   historyRequests = 0;
 const html = `<!doctype html><html><head><meta charset="utf-8"><link rel="stylesheet" href="/client/style.css"></head><body><div id="app"><div id="workspace"><aside></aside><main><header><div class="header-right"><button id="tailscale-login"><span class="online"></span>Connected</button></div></header><section class="terminal-shell"></section></main></div><dialog id="dialog"></dialog><div id="notice" hidden></div></div><script type="module">
@@ -67,9 +70,9 @@ import {reconciledAgentProblem} from '/client/launch-reconciliation.js';
 await localAPI('/unlock','POST',{password:'synthetic vault passphrase'});
 const savedLocal=await localAPI('/data');
 let board, tasks, modes, teams;const baseAgent=(id,name,serverId,role)=>({id,revision:1,name,launchName:name,role,serverId,runtime:'codex',model:'gpt-5.3-codex',reasoning:'',approvalMode:'on-request',sandboxMode:'workspace-write',permissionMode:'',allowedTools:[],run:"sh -c 'sleep 300' --",cwd:'',prompt:'Inspect the exact bounded assignment.'});const data={hub:{url:location.origin,token:'synthetic-token'},profile:{username:'synthetic',instanceId:'profile-one'},launchProfiles:[],agentCatalog:{version:2,definitions:[baseAgent('agent_team_planner','team-planner','', 'Planner'),baseAgent('agent_team_reviewer','team-reviewer','secondary','Reviewer')]},teamsVersion:2,teams:JSON.parse(localStorage.getItem('qa-teams')||'[]'),teamLaunchPlans:savedLocal.teamLaunchPlans,projectHandlerPlans:[]};
-const servers=[{id:'local',name:'Test host',host:'stephens-macbook-air',username:'test',runtimes:['claude'],credentialRevision:1},{id:'secondary',name:'Second host',host:'second-fixture',username:'test',runtimes:['codex'],credentialRevision:1}];let failJournalWrite=false,commandDelay=null;
+const servers=[{id:'local',name:'Test host',host:'stephens-macbook-air',username:'test',runtimes:['claude'],credentialRevision:1},{id:'secondary',name:'Second host',host:'second-fixture',username:'test',runtimes:['codex'],credentialRevision:1}];let failJournalWrite=false,commandDelay=null,journalDelay=null;
 const model={groups:[],taskGroup:()=>null};
-const host={openSFTP:async server=>({done:new Promise(()=>{}),home:async()=>${JSON.stringify(root)},realpath:async p=>p,list:async p=>({path:p,entries:p===${JSON.stringify(root)}?[{name:'hub',isDir:true},{name:'ignored.txt',isDir:false}]:[]}),close(){}}),getIPN:()=>({fetch:(url,init)=>fetch(url,init)}),getData:()=>data,getServers:()=>servers,launchServerProfile:id=>structuredClone(servers.find(server=>server.id===id)),currentServer:()=>servers[0],currentTab:()=>null,getTabs:()=>[],paneGroups:()=>({model,sync(){}}),render(){},scheduleWorkspaceSave(){},bookmark(){},closeTab(){},connect:async()=>null,confirm:async()=>true,notice:t=>{document.querySelector('#notice').textContent=t},api:async(url,method,body)=>{if(url.startsWith('/team-launch-plans')){if(url==='/team-launch-plans'&&method==='POST'&&failJournalWrite){failJournalWrite=false;throw new Error('Synthetic encrypted journal write failure')}const result=await localAPI(url,method,body);data.teamLaunchPlans=(await localAPI('/data')).teamLaunchPlans;return result}if(url==="/teams"){data.teams=[...data.teams.filter(t=>t.id!==body.id),body];localStorage.setItem('qa-teams',JSON.stringify(data.teams))}if(url.startsWith("/teams/")){data.teams=data.teams.filter(t=>t.id!==url.slice(7));localStorage.setItem('qa-teams',JSON.stringify(data.teams))}if(url==="/launch-profiles")data.launchProfiles=[...data.launchProfiles.filter(p=>p.name!==body.name),body];if(url==="/project-handler-plans"&&method==="POST")data.projectHandlerPlans=[...data.projectHandlerPlans.filter(p=>p.hub!==body.hub||p.taskId!==body.taskId),structuredClone(body)];return {sessions:[]}},reloadData:async()=>{data.teamLaunchPlans=(await localAPI('/data')).teamLaunchPlans},
+const host={openSFTP:async server=>({done:new Promise(()=>{}),home:async()=>${JSON.stringify(root)},realpath:async p=>p,list:async p=>({path:p,entries:p===${JSON.stringify(root)}?[{name:'hub',isDir:true},{name:'ignored.txt',isDir:false}]:[]}),close(){}}),getIPN:()=>({fetch:(url,init)=>fetch(url,init)}),getData:()=>data,getServers:()=>servers,launchServerProfile:id=>structuredClone(servers.find(server=>server.id===id)),currentServer:()=>servers[0],currentTab:()=>null,getTabs:()=>[],paneGroups:()=>({model,sync(){}}),render(){},scheduleWorkspaceSave(){},bookmark(){},closeTab(){},connect:async()=>null,confirm:async()=>true,notice:t=>{document.querySelector('#notice').textContent=t},api:async(url,method,body)=>{if(url.startsWith('/team-launch-plans')){if(journalDelay){const gate=journalDelay;gate.entered();await gate.wait;if(journalDelay===gate)journalDelay=null}if(url==='/team-launch-plans'&&method==='POST'&&failJournalWrite){failJournalWrite=false;throw new Error('Synthetic encrypted journal write failure')}const result=await localAPI(url,method,body);data.teamLaunchPlans=(await localAPI('/data')).teamLaunchPlans;return result}if(url==="/teams"){data.teams=[...data.teams.filter(t=>t.id!==body.id),body];localStorage.setItem('qa-teams',JSON.stringify(data.teams))}if(url.startsWith("/teams/")){data.teams=data.teams.filter(t=>t.id!==url.slice(7));localStorage.setItem('qa-teams',JSON.stringify(data.teams))}if(url==="/launch-profiles")data.launchProfiles=[...data.launchProfiles.filter(p=>p.name!==body.name),body];if(url==="/project-handler-plans"&&method==="POST")data.projectHandlerPlans=[...data.projectHandlerPlans.filter(p=>p.hub!==body.hub||p.taskId!==body.taskId),structuredClone(body)];return {sessions:[]}},reloadData:async()=>{data.teamLaunchPlans=(await localAPI('/data')).teamLaunchPlans},
  dialog:(title,body)=>{const d=document.querySelector('#dialog');if(d.open)d.close();d.innerHTML='<div class="dialog-head"><h2>'+title+'</h2><button id="dialog-close">×</button></div>'+body;d.querySelector('#dialog-close').onclick=()=>host.closeDialog();d.showModal()},
  closeDialog:()=>{const d=document.querySelector('#dialog');d.close();d.replaceChildren()},
  openBoard:id=>{modes.set('board');board.show(id)},
@@ -80,7 +83,7 @@ board=createBoardView({client:()=>hub.client(),getTabs:()=>[],activate(){},notic
 tasks=createTasksView({confirm:async()=>true,client:()=>hub.client(),taskHub:hub,getTabs:()=>[],activate(){},notice:host.notice,openBoard:host.openBoard,configure(){}});
 teams=createTeamsView({...host,confirm:async()=>true,newTask:t=>hub.newTask(undefined,t),addTeam:t=>hub.addTeam(t)});
 modes=setupModes({header:document.querySelector('header'),main:document.querySelector('main'),onChange:(mode,view)=>{board.hide();tasks.hide();teams.hide();view.replaceChildren();if(mode==='board'){board.mount(view);board.show()}else if(mode==='teams'){teams.mount(view);teams.show()}else if(mode==='tasks'){tasks.mount(view);tasks.show()}}});
-modes.set('tasks');window.qa={hub,board,modes,data,servers,localData:()=>localAPI('/data'),reconciledAgentProblem,failJournalWrite:()=>{failJournalWrite=true},delayNextCommand:()=>{let release,entered;const wait=new Promise(resolve=>release=resolve),started=new Promise(resolve=>entered=resolve);commandDelay={wait,release,entered,started}},waitForDelayedCommand:()=>commandDelay?.started,releaseCommand:()=>commandDelay?.release(),clearLaunchPlans:async()=>{for(const plan of (await localAPI('/data')).teamLaunchPlans)await localAPI('/team-launch-plans/'+plan.id,'DELETE');data.teamLaunchPlans=(await localAPI('/data')).teamLaunchPlans},changeToken:token=>{data.hub={...data.hub,token}},changeProfile:instanceId=>{data.profile={...data.profile,instanceId};hub.refresh()},cycleProfile:()=>{data.profile={...data.profile,instanceId:'profile-two'};hub.refresh();data.profile={...data.profile,instanceId:'profile-one'};hub.refresh()},changeServerCredentials:()=>{servers[1].credentialRevision++;}};
+modes.set('tasks');window.qa={hub,board,modes,data,servers,localData:()=>localAPI('/data'),reconciledAgentProblem,failJournalWrite:()=>{failJournalWrite=true},delayNextJournal:()=>{let release,entered;const wait=new Promise(resolve=>release=resolve),started=new Promise(resolve=>entered=resolve);journalDelay={wait,release,entered,started}},waitForDelayedJournal:()=>journalDelay?.started,releaseJournal:()=>journalDelay?.release(),delayNextCommand:()=>{let release,entered;const wait=new Promise(resolve=>release=resolve),started=new Promise(resolve=>entered=resolve);commandDelay={wait,release,entered,started}},waitForDelayedCommand:()=>commandDelay?.started,releaseCommand:()=>commandDelay?.release(),clearLaunchPlans:async()=>{for(const plan of (await localAPI('/data')).teamLaunchPlans)await localAPI('/team-launch-plans/'+plan.id,'DELETE');data.teamLaunchPlans=(await localAPI('/data')).teamLaunchPlans},changeToken:token=>{data.hub={...data.hub,token}},changeProfile:instanceId=>{data.profile={...data.profile,instanceId};hub.refresh()},cycleProfile:()=>{data.profile={...data.profile,instanceId:'profile-two'};hub.refresh();data.profile={...data.profile,instanceId:'profile-one'};hub.refresh()},changeServerCredentials:()=>{servers[1].credentialRevision++;}};
 </script></body></html>`;
 const server = createServer(async (req, res) => {
   try {
@@ -99,6 +102,11 @@ const server = createServer(async (req, res) => {
       res.end("ok");
       return;
     }
+    if (req.url === "/qa/drop-task-create-before-commit") {
+      dropTaskCreateBeforeCommit = true;
+      res.end("ok");
+      return;
+    }
     if (req.url === "/qa/lose-launch-reply") {
       loseLaunchAt = execs + 1;
       res.end("ok");
@@ -114,6 +122,23 @@ const server = createServer(async (req, res) => {
         historyRequests++;
       const chunks = [];
       for await (const b of req) chunks.push(b);
+      if (req.method === "GET" && req.url === "/v1/tasks" && taskListGate) {
+        const gate = taskListGate;
+        gate.entered = true;
+        await gate.wait;
+        if (taskListGate === gate) taskListGate = null;
+      }
+      if (req.method === "POST" && req.url === "/v1/tasks") {
+        taskCreateRequests++;
+        if (dropTaskCreateBeforeCommit) {
+          dropTaskCreateBeforeCommit = false;
+          res.writeHead(500, { "content-type": "application/json" });
+          res.end(
+            JSON.stringify({ error: "Synthetic uncommitted create response" }),
+          );
+          return;
+        }
+      }
       const r = await fetch(`http://127.0.0.1:${port}` + req.url, {
         method: req.method,
         headers: { "content-type": "application/json" },
@@ -535,17 +560,69 @@ try {
       );
       await page.locator("#dialog-close").click();
 
-      // A committed project with a lost HTTP reply is persisted as uncertain.
-      // A second submit reconciles that exact frozen creation rather than
-      // issuing another POST, then a lost worker reply reconciles its exact
-      // registered identity before the remaining members continue.
+      // The synchronous single-flight guard also holds while the first
+      // encrypted journal write is delayed and more submit signals arrive.
+      await page.locator("[data-new-task]").click();
+      await page.locator("#task-main-server").selectOption("secondary");
+      await page.locator('[data-project-server="secondary"]').fill(root);
+      const journalDelayName = name + " delayed journal single flight";
+      await page.locator("#task-name").fill(journalDelayName);
+      const journalDelayRequests = taskCreateRequests;
+      const journalDelayExecs = execs;
+      await page.evaluate(() => qa.delayNextJournal());
+      await page.evaluate(() => {
+        const form = document.querySelector("#task-form");
+        document.querySelector("#task-create").click();
+        form.requestSubmit();
+      });
+      await page.evaluate(() => qa.waitForDelayedJournal());
+      await page.evaluate(() => {
+        const form = document.querySelector("#task-form");
+        form.requestSubmit();
+        form.requestSubmit();
+      });
+      await page.evaluate(() => qa.releaseJournal());
+      await page.locator("#dialog").waitFor({ state: "hidden" });
+      assert.equal(
+        (await getTasks()).filter((task) => task.name === journalDelayName)
+          .length,
+        1,
+      );
+      assert.equal(taskCreateRequests, journalDelayRequests + 1);
+      assert.equal(execs, journalDelayExecs + 3);
+
+      // A committed project with a lost HTTP reply remains uncertain. Field
+      // equality is not a receipt, so neither same-dialog nor reload attempts
+      // can adopt it or issue another create.
+      await page.evaluate(() => qa.modes.set("teams"));
       await page.locator("[data-new-task]").click();
       await page.locator("#task-main-server").selectOption("secondary");
       await page.locator('[data-project-server="secondary"]').fill(root);
       const lostCreateName = name + " lost create same dialog";
       await page.locator("#task-name").fill(lostCreateName);
+      const lostCreateRequests = taskCreateRequests;
+      const lostCreateExecs = execs;
       await fetch(origin + "/qa/lose-task-create-reply");
-      await page.locator("#task-create").click();
+      let releaseTaskList;
+      taskListGate = {
+        entered: false,
+        wait: new Promise((resolve) => (releaseTaskList = resolve)),
+        release: () => releaseTaskList(),
+      };
+      await page.evaluate(() => {
+        const form = document.querySelector("#task-form");
+        document.querySelector("#task-create").click();
+        form.requestSubmit();
+      });
+      for (let attempt = 0; attempt < 100 && !taskListGate?.entered; attempt++)
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      assert.equal(taskListGate?.entered, true);
+      await page.evaluate(() => {
+        const form = document.querySelector("#task-form");
+        form.requestSubmit();
+        form.requestSubmit();
+      });
+      taskListGate.release();
       await page
         .locator("#task-error")
         .filter({ hasText: "prior project-creation response is unknown" })
@@ -563,6 +640,8 @@ try {
       );
       assert.equal(uncertainCreate.creation.state, "uncertain");
       assert.equal(uncertainCreate.taskId, undefined);
+      assert.equal(taskCreateRequests, lostCreateRequests + 1);
+      assert.equal(execs, lostCreateExecs);
       const encryptedJournal = await page.evaluate(
         () =>
           new Promise((resolve, reject) => {
@@ -580,46 +659,148 @@ try {
       );
       assert.equal(encryptedJournal.version, 2);
       assert.doesNotMatch(encryptedJournal.ciphertext, /lost create/);
-      const lostWorkerStart = execs;
-      await fetch(origin + "/qa/lose-launch-reply");
+      await page.evaluate(() =>
+        document
+          .querySelector("#task-form")
+          .dispatchEvent(
+            new Event("submit", { bubbles: true, cancelable: true }),
+          ),
+      );
+      await page
+        .locator("#task-error")
+        .filter({ hasText: "cannot safely identify" })
+        .waitFor();
+      assert.equal(
+        taskCreateRequests,
+        lostCreateRequests + 1,
+        "uncertain retry sent another project create",
+      );
+      assert.equal(
+        execs,
+        lostCreateExecs,
+        "uncertain retry launched into a possible match",
+      );
+      await page.reload();
+      await page.waitForFunction(() => !!window.qa);
+      await page.evaluate(() => qa.modes.set("teams"));
+      await page.locator("[data-new-task]").click();
+      await page
+        .locator("#task-create")
+        .filter({ hasText: "Creation status unknown" })
+        .waitFor();
+      assert.equal(
+        await page.locator("#task-name").inputValue(),
+        lostCreateName,
+      );
+      assert.equal(await page.locator("#task-create").isDisabled(), true);
+      assert.equal(
+        taskCreateRequests,
+        lostCreateRequests + 1,
+        "reload sent another project create",
+      );
+      await page.evaluate(() => qa.clearLaunchPlans());
+      await page.locator("#dialog-close").click();
+
+      // If our POST never committed, one unrelated project with identical
+      // fields is still not an authoritative match and must never be adopted.
+      await page.evaluate(() => qa.modes.set("teams"));
+      await page.locator("[data-new-task]").click();
+      await page.locator("#task-main-server").selectOption("secondary");
+      await page.locator('[data-project-server="secondary"]').fill(root);
+      const foreignName = name + " foreign exact fields";
+      await page.locator("#task-name").fill(foreignName);
+      const foreignRequests = taskCreateRequests;
+      const foreignExecs = execs;
+      await fetch(origin + "/qa/drop-task-create-before-commit");
       await page.locator("#task-create").click();
       await page
         .locator("#task-error")
-        .filter({ hasText: "Synthetic lost launch response" })
+        .filter({ hasText: "prior project-creation response is unknown" })
         .waitFor();
-      const lostCreateTask = (await getTasks()).find(
-        (task) => task.name === lostCreateName,
+      persistedPlans = await page.evaluate(
+        async () => (await qa.localData()).teamLaunchPlans,
       );
-      let lostCreateDetail = await (
-        await fetch(`http://127.0.0.1:${port}/v1/tasks/${lostCreateTask.id}`)
-      ).json();
-      assert.equal(lostCreateDetail.agents.length, 1);
-      const originalLostAgent = lostCreateDetail.agents[0];
+      const foreignPlan = persistedPlans.find(
+        (plan) => plan.creation?.request?.name === foreignName,
+      );
+      assert.ok(foreignPlan);
+      assert.equal(
+        (await getTasks()).filter((task) => task.name === foreignName).length,
+        0,
+      );
+      const foreignCreate = await fetch(`http://127.0.0.1:${port}/v1/tasks`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(foreignPlan.creation.request),
+      });
+      assert.equal(foreignCreate.status, 201);
+      await page.evaluate(() =>
+        document
+          .querySelector("#task-form")
+          .dispatchEvent(
+            new Event("submit", { bubbles: true, cancelable: true }),
+          ),
+      );
+      await page
+        .locator("#task-error")
+        .filter({ hasText: "cannot safely identify" })
+        .waitFor();
+      assert.equal(taskCreateRequests, foreignRequests + 1);
+      assert.equal(execs, foreignExecs);
       persistedPlans = await page.evaluate(
         async () => (await qa.localData()).teamLaunchPlans,
       );
       assert.equal(
-        persistedPlans
-          .find((plan) => plan.taskId === lostCreateTask.id)
-          .members.find(
-            (member) => member.fields.agentId === originalLostAgent.id,
-          ).state,
-        "uncertain",
+        persistedPlans.find(
+          (plan) => plan.creation?.request?.name === foreignName,
+        ).taskId,
+        undefined,
       );
-      await page.locator("#task-create").click();
-      try {
-        await page.locator("#dialog").waitFor({ state: "hidden" });
-      } catch (error) {
-        throw new Error(
-          `${error.message}\n${await page.locator("#task-error").innerText()}`,
-        );
-      }
-      lostCreateDetail = await (
-        await fetch(`http://127.0.0.1:${port}/v1/tasks/${lostCreateTask.id}`)
+      await page.evaluate(() => qa.clearLaunchPlans());
+      await page.locator("#dialog-close").click();
+
+      // Concurrent submits are single-flight from the first synchronous turn.
+      // A known successful create can then reconcile a lost worker response by
+      // exact preallocated agent/run identity and continue remaining members.
+      await page.evaluate(() => qa.modes.set("teams"));
+      await page.locator("[data-new-task]").click();
+      await page.locator("#task-main-server").selectOption("secondary");
+      await page.locator('[data-project-server="secondary"]').fill(root);
+      const lostWorkerName = name + " lost worker";
+      await page.locator("#task-name").fill(lostWorkerName);
+      const lostWorkerRequests = taskCreateRequests;
+      const lostWorkerStart = execs;
+      await fetch(origin + "/qa/lose-launch-reply");
+      await page.evaluate(() => {
+        const form = document.querySelector("#task-form");
+        form.requestSubmit();
+        form.requestSubmit();
+      });
+      await page
+        .locator("#task-error")
+        .filter({ hasText: "Synthetic lost launch response" })
+        .waitFor();
+      assert.equal(
+        taskCreateRequests,
+        lostWorkerRequests + 1,
+        "concurrent submit created more than one project",
+      );
+      const lostWorkerTask = (await getTasks()).find(
+        (task) => task.name === lostWorkerName,
+      );
+      let lostWorkerDetail = await (
+        await fetch(`http://127.0.0.1:${port}/v1/tasks/${lostWorkerTask.id}`)
       ).json();
-      assert.equal(lostCreateDetail.agents.length, 3);
+      assert.equal(lostWorkerDetail.agents.length, 1);
+      const originalLostAgent = lostWorkerDetail.agents[0];
+      await page.locator("#task-create").click();
+      await page.locator("#dialog").waitFor({ state: "hidden" });
+      lostWorkerDetail = await (
+        await fetch(`http://127.0.0.1:${port}/v1/tasks/${lostWorkerTask.id}`)
+      ).json();
+      assert.equal(lostWorkerDetail.agents.length, 3);
       assert.ok(
-        lostCreateDetail.agents.some(
+        lostWorkerDetail.agents.some(
           (agent) =>
             agent.id === originalLostAgent.id &&
             agent.runId === originalLostAgent.runId,
@@ -632,58 +813,10 @@ try {
         "reconciliation spawned the lost worker twice or skipped a remaining member",
       );
       assert.equal(
-        (await getTasks()).filter((task) => task.name === lostCreateName)
+        (await getTasks()).filter((task) => task.name === lostWorkerName)
           .length,
         1,
-        "same-dialog retry duplicated a committed project",
-      );
-      assert.equal(
-        (
-          await page.evaluate(
-            async () => (await qa.localData()).teamLaunchPlans,
-          )
-        ).some((plan) => plan.taskId === lostCreateTask.id),
-        false,
-      );
-
-      // The same uncertain creation boundary survives an actual page reload
-      // through the encrypted local vault, then reconciles without a new POST.
-      await page.evaluate(() => qa.modes.set("teams"));
-      await page.locator("[data-new-task]").click();
-      await page.locator("#task-main-server").selectOption("secondary");
-      await page.locator('[data-project-server="secondary"]').fill(root);
-      const reloadCreateName = name + " lost create reload";
-      await page.locator("#task-name").fill(reloadCreateName);
-      await fetch(origin + "/qa/lose-task-create-reply");
-      await page.locator("#task-create").click();
-      await page
-        .locator("#task-error")
-        .filter({ hasText: "prior project-creation response is unknown" })
-        .waitFor();
-      assert.equal(
-        (await getTasks()).filter((task) => task.name === reloadCreateName)
-          .length,
-        1,
-      );
-      await page.reload();
-      await page.waitForFunction(() => !!window.qa);
-      await page.evaluate(() => qa.modes.set("teams"));
-      await page.locator("[data-new-task]").click();
-      await page
-        .locator("#task-create")
-        .filter({ hasText: "Reconcile project creation" })
-        .waitFor();
-      assert.equal(
-        await page.locator("#task-name").inputValue(),
-        reloadCreateName,
-      );
-      await page.locator("#task-create").click();
-      await page.locator("#dialog").waitFor({ state: "hidden" });
-      assert.equal(
-        (await getTasks()).filter((task) => task.name === reloadCreateName)
-          .length,
-        1,
-        "reload reconciliation duplicated a committed project",
+        "concurrent submit duplicated a known project",
       );
 
       await page.evaluate(() => qa.modes.set("teams"));
@@ -1213,7 +1346,7 @@ s.commit()
       assert.deepEqual(errors, []);
       console.log(
         name +
-          ": creation, encrypted journal failure/reload, lost task/worker response reconciliation, delayed token/profile/endpoint guards, exact identity/mismatch checks, remaining-member retry, mobile and mode selection passed.",
+          ": creation single-flight across task-list/journal delays, encrypted journal failure/reload, unknown-create and foreign-match blocking, lost-worker reconciliation, delayed token/profile/endpoint guards, exact identity/mismatch checks, remaining-member retry, mobile and mode selection passed.",
       );
     } finally {
       await browser.close();

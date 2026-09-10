@@ -13,7 +13,6 @@ import {
 import {
   guardedLaunchEffect,
   reconciledAgentProblem,
-  taskCreationMatches,
 } from "./launch-reconciliation.js";
 // Project hub controller: owns the hub client, per-task event feeds, the mirror
 // loop that keeps a project tab's panes in step with the hub's agent list, and
@@ -170,28 +169,6 @@ export function createTaskHub(host) {
         updatedAt: new Date().toISOString(),
       }),
     );
-  async function reconcileTaskCreation(journal) {
-    if (journal?.creation?.state !== "uncertain" || journal.taskId)
-      throw new Error("This project creation is not awaiting reconciliation.");
-    const matches = taskCreationMatches(
-      await guardedJournalEffect(journal, null, () => client.listTasks()),
-      journal.creation,
-    );
-    if (matches.length !== 1)
-      throw new Error(
-        matches.length
-          ? "More than one project matches the unresolved creation. Inspect Projects and reconcile it manually before discarding the frozen record."
-          : "The prior project-creation response is still unknown. Inspect Projects before discarding the frozen record; Tailterm will not create another project automatically.",
-      );
-    const confirmed = {
-      ...structuredClone(journal),
-      taskId: matches[0].id,
-      creation: { ...structuredClone(journal.creation), state: "confirmed" },
-    };
-    await saveLaunchJournal(confirmed);
-    Object.assign(journal, confirmed);
-    return matches[0];
-  }
   async function amendUnstartedFolders(plan, journal, refreshed) {
     const candidates = new Map(
       refreshed.map((entry) => [entry.fields.name, entry]),
@@ -1008,10 +985,10 @@ export function createTaskHub(host) {
     };
     const showUnknownCreation = () => {
       freezeCreation();
-      button.disabled = false;
-      button.textContent = "Reconcile project creation";
+      button.disabled = true;
+      button.textContent = "Creation status unknown";
       error.textContent =
-        "A prior project-creation response is unknown. Tailterm will inspect Projects for the exact frozen request and will not create another project automatically.";
+        "A prior project-creation response is unknown. Tailterm cannot safely identify it from project fields and will not create another project or adopt a possible match. Inspect Projects, then discard this unresolved record only after verifying the outcome.";
       if (form.querySelector("#task-discard-creation")) return;
       const discard = document.createElement("button");
       discard.type = "button";
@@ -1025,7 +1002,9 @@ export function createTaskHub(host) {
           ))
         )
           return;
-        await host.api(`/team-launch-plans/${launchJournal.id}`, "DELETE");
+        await guardedJournalEffect(launchJournal, null, () =>
+          host.api(`/team-launch-plans/${launchJournal.id}`, "DELETE"),
+        );
         host.closeDialog();
         host.notice(
           "The unresolved launch record was discarded. Open New project to start over.",
@@ -1064,6 +1043,9 @@ export function createTaskHub(host) {
     form.onsubmit = async (event) => {
       event.preventDefault();
       if (pending) return;
+      pending = true;
+      button.disabled = true;
+      withAgent.disabled = true;
       error.textContent = "";
       try {
         if (
@@ -1071,18 +1053,9 @@ export function createTaskHub(host) {
           launchJournal?.creation?.state === "uncertain" &&
           !launchJournal.taskId
         ) {
-          error.textContent = "Reconciling the prior project creation…";
-          saved = await reconcileTaskCreation(launchJournal);
-          launchPlan = await restoreLaunchMembers(
-            launchJournal,
-            host.getServers(),
+          throw new Error(
+            "The prior project-creation response is still unknown. No authoritative creation receipt is available, so Tailterm will not adopt a project or create another one.",
           );
-          for (const member of launchJournal.members)
-            if (member.state === "started") progress.add(member.fields.name);
-          freezeCreation();
-          bound.add(saved.id);
-          cache.set(saved.id, { task: saved, agents: [] });
-          form.querySelector("#task-open-created").hidden = false;
         }
         const name = form.querySelector("#task-name").value.trim();
         if (!name || [...name].length > 120 || /[\x00-\x1f\x7f]/.test(name))
@@ -1174,7 +1147,6 @@ export function createTaskHub(host) {
           );
         }
         if (!saved && launchJournal) await saveLaunchJournal(launchJournal);
-        pending = true;
         form
           .querySelectorAll(
             "#task-project-folders input, #task-project-folders button",
@@ -1315,7 +1287,10 @@ export function createTaskHub(host) {
               : "Create project";
       } finally {
         pending = false;
-        button.disabled = false;
+        button.disabled =
+          !saved &&
+          launchJournal?.creation?.state === "uncertain" &&
+          !launchJournal.taskId;
         withAgent.disabled = true;
       }
     };
@@ -1326,7 +1301,9 @@ export function createTaskHub(host) {
       form.querySelector("#agent-runtime").innerHTML = runtimeOptions(target);
       wireAgentFields();
     };
-    if (initialTeam?.id)
+    if (initialTeam?.id) {
+      pending = true;
+      button.disabled = true;
       void (async () => {
         const scope = await launchScope();
         const recovered = (host.getData().teamLaunchPlans || []).find(
@@ -1379,10 +1356,20 @@ export function createTaskHub(host) {
         error.textContent =
           "Recovered the encrypted frozen launch plan. Retry reconciles uncertain identities before starting unstarted members.";
         button.textContent = "Retry agent launch";
-      })().catch((error) => {
-        if (form.isConnected)
-          form.querySelector("#task-error").textContent = formatError(error);
-      });
+      })()
+        .catch((error) => {
+          if (form.isConnected)
+            form.querySelector("#task-error").textContent = formatError(error);
+        })
+        .finally(() => {
+          if (!form.isConnected) return;
+          pending = false;
+          button.disabled =
+            !saved &&
+            launchJournal?.creation?.state === "uncertain" &&
+            !launchJournal.taskId;
+        });
+    }
     form.querySelector("#task-name").focus();
   }
 
