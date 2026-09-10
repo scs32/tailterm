@@ -1,4 +1,55 @@
-# Development handoff — September 9, 2026
+# Development handoff — September 10, 2026
+
+## September 10 message audit A2 — hub release verified pending final acceptance
+
+Accepted candidate `b7dd55d7190cf1932ef4cd13ea3bd883dd440276` was
+integrated conflict-free on `tasks-hub` as application/source commit
+`eba02aa935ecbb1cd696ff970300e7a5e2e458d5`. The hub is RUNNING through
+the existing TrueNAS middleware and private TCP listener from unique release
+`20260910-message-audit-a2-eba02aa`, exact Linux amd64 SHA-256
+`16786368ccd79221df58001a65b88894fd1f99611b9ba76c2c7f25dd3bf1fa01`.
+It retains the existing state and token mounts, one container, the distroless
+image, and no embedded Tailscale or network change. The exact clean source is
+retained at `.build/releases/message-audit-a2-eba02aa`.
+
+The pre-update SQLite online backup is mode 0600 at
+`/mnt/deepfreeze/tailterm-hub/backups/before-message-audit-a2-20260910T134441Z.sqlite`,
+9,977,856 bytes, SHA-256
+`4d68adfb62a0873c4990d977b4106f4ec27f2c65cbca46becdb51e49e8065012`.
+Backup and post-update live integrity are OK with zero foreign-key violations;
+all seven additive message-audit tables are present. Authenticated existing-CLI
+doctor and agent reads pass, and unauthenticated whoami remains 403. No live
+probe item, historical correction, backfill, feature/status mutation or live
+work-item read was used for release validation.
+
+A2 adds explicit Intake and atomic resolution, one primary plus up to 15 related
+targets, current-versus-original full-state CAS correction history, exact scoped
+recovery receipts, revision-pinned cross-project authority, snapshot-consistent
+exact reads, and a frozen count/byte-bounded feed with incremental checkpoints.
+Legacy bound inbox reads and original message/posting receipts continue to use
+immutable creation context. Observe mode remains enabled.
+
+Feature `wi_edd77038c629a76c` revision 2, work order #1425, candidate acceptance
+#1445 and release order #1446 are documented in
+[the A2 implementation/stage report](message-audit-a2.md) and
+[the release receipt](releases/tailos-2026-09-10-message-audit-a2.json). The
+parent remains in progress because B1/B2/C1/E1/E2 are not implemented. The
+frontend remains exact dropdown release commit
+`8d47e9b4b6c34cc1b9331517ba893156d28e23e8`, manifest SHA-256
+`9280148ec37f1dcbbf51300ed04f973597abfeb7956da3bfdb21c4380480b17e`
+on TailOS and Mini; preview PID 60799/PPID 1 was not restarted. Mini and Air
+retain Darwin arm64 `tt` SHA-256
+`a2a640d18e3d3014bcd8afdafbaf1f8994c5fbaf4623ea168014aeba7f68b49a`
+and relay PIDs 83457/912.
+
+Immediate hub rollback points middleware at retained narrative binary
+`/mnt/deepfreeze/tailterm-hub/releases/20260909-narrative-history-4cb6e6c/tailterm-hub`
+SHA-256 `49591cd6083a590c0afca68c05f50ba416c1e98f01ae006e92bb341e956b5475`
+while preserving additive database state. If that old binary writes A1 links,
+returning to A2 reconciles them only on the next new-binary open. Restoring the
+backup is disaster recovery, not normal rollback, because it discards every
+later write. Lead actual-release acceptance and handler stage-report save/readback
+remain pending; no parent Done or completion pin is claimed.
 
 ## September 9 work-item dropdown dialog — release verified pending final acceptance
 

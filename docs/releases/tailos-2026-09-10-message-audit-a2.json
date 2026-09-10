@@ -1,0 +1,128 @@
+{
+  "status": "builder_release_verified_pending_lead_acceptance_and_report_pin",
+  "recordedAt": "2026-09-10T13:47:53Z",
+  "workItem": {
+    "id": "wi_edd77038c629a76c",
+    "revision": 2,
+    "workOrderMessage": 1425,
+    "contractMessage": 1426,
+    "candidateAcceptanceMessage": 1445,
+    "releaseAssignmentMessage": 1446,
+    "parentStatus": "in_progress",
+    "remainingSlices": ["B1", "B2", "C1", "E1", "E2"]
+  },
+  "source": {
+    "cleanBase": "c7730738611555bd5474ceca166a23c239ca1690",
+    "initialCandidate": "348ff3018fbb2b9c7bc53aca4f729a7f3b5340b9",
+    "acceptedCandidate": "b7dd55d7190cf1932ef4cd13ea3bd883dd440276",
+    "integratedCandidateCommits": [
+      "9810bcd",
+      "eba02aa"
+    ],
+    "applicationSourceCommit": "eba02aa935ecbb1cd696ff970300e7a5e2e458d5",
+    "documentationHead": "Reported in the Board stage result because a commit cannot contain its own hash.",
+    "retainedCleanSource": "/Users/stephenspeicher/projects/tailterm/.build/releases/message-audit-a2-eba02aa",
+    "cleanRetainedSource": true,
+    "implementationAndStageReport": "docs/message-audit-a2.md"
+  },
+  "hub": {
+    "state": "RUNNING",
+    "release": "20260910-message-audit-a2-eba02aa",
+    "binary": "/mnt/deepfreeze/tailterm-hub/releases/20260910-message-audit-a2-eba02aa/tailterm-hub",
+    "localBuild": ".build/ttbin/tailterm-hub-linux-amd64",
+    "platform": "linux/amd64",
+    "size": 26960034,
+    "sha256": "16786368ccd79221df58001a65b88894fd1f99611b9ba76c2c7f25dd3bf1fa01",
+    "image": "gcr.io/distroless/static-debian12:nonroot",
+    "containers": 1,
+    "containerState": "running",
+    "listener": "100.116.238.37:18765:18765/tcp",
+    "stateMount": "/mnt/deepfreeze/tailterm-hub/state:/state",
+    "tokenMount": "/mnt/deepfreeze/tailterm-hub/hub-token:/run/hub-token:ro",
+    "binaryMountReadOnly": true,
+    "integrity": "ok",
+    "foreignKeyViolations": 0,
+    "messageAuditTables": 7,
+    "messageAuditSchemaExact": true,
+    "authenticatedExistingCliDoctor": "passed",
+    "authenticatedExistingCliAgentsRead": "passed",
+    "unauthenticatedWhoami": 403,
+    "deployment": "Source-inspected scripts/deploy-truenas-hub.py; invoked explicit unique release with --update through TrueNAS middleware. Existing TCP/state/token topology was retained."
+  },
+  "backup": {
+    "path": "/mnt/deepfreeze/tailterm-hub/backups/before-message-audit-a2-20260910T134441Z.sqlite",
+    "method": "SQLite online backup API before middleware update",
+    "createdBeforeDeployment": true,
+    "mode": "0600",
+    "size": 9977856,
+    "sha256": "4d68adfb62a0873c4990d977b4106f4ec27f2c65cbca46becdb51e49e8065012",
+    "integrity": "ok",
+    "foreignKeyViolations": 0
+  },
+  "candidateVerification": {
+    "passed": [
+      "go test ./internal/store -run TestMessageAuditA2 -count=1",
+      "go test ./internal/server -run TestMessageAuditA2 -count=1",
+      "go test ./internal/store ./internal/server ./internal/api",
+      "go vet ./...",
+      "go test -race ./internal/store ./internal/server ./internal/api",
+      "Exact old c773073 binary opened additive schema and wrote an A1-linked message; reviewed A2 reopen produced work revision 1 with frozen original posting receipt",
+      "Lead independently reran focused store and server A2 suites before acceptance"
+    ],
+    "reviewCorrections": [
+      "Correction and resolution receipt hashes bind exact task, message and operation",
+      "Frozen change-feed pagination emits project/filter-bound incremental checkpoints",
+      "Exact audit state reads use one SQLite snapshot transaction",
+      "Legacy bound inbox scope remains creation-time A1 authority; current routing stays on explicit A2 surfaces"
+    ],
+    "knownNonpasses": [
+      "Repository-wide go test ./... reaches untouched-base cmd/tt failures in TestPostHumanReplyAndLiteralHelp and TestAskPreservesIdentityContextAndReplayPayload. Both reproduce from an exact c773073 archive without A2 code; no green full-suite claim is made."
+    ],
+    "operationalCorrections": [
+      "The initial candidate 348ff30 was not accepted after read-only review identified four contract gaps; corrected candidate b7dd55d added failing-first coverage and was accepted in message 1445.",
+      "Early compatibility hashes included path/VCS build metadata; the retained report reran executable compatibility with -trimpath -buildvcs=false before recording deterministic hashes.",
+      "No broad unaffected suite was repeated after release integration because integration changed no source semantics and the release order limited validation to affected checks."
+    ]
+  },
+  "frontend": {
+    "changed": false,
+    "applicationCommit": "8d47e9b4b6c34cc1b9331517ba893156d28e23e8",
+    "releaseSha256": "9280148ec37f1dcbbf51300ed04f973597abfeb7956da3bfdb21c4380480b17e",
+    "tailosOrigin": "https://tailos.tailarr.com",
+    "miniOrigin": "http://127.0.0.1:4318",
+    "tailosAndMiniReleaseJsonMatch": true,
+    "miniPreviewPid": 60799,
+    "miniPreviewPpid": 1,
+    "miniPreviewRestarted": false,
+    "cloudflareDeploymentChanged": false,
+    "wasmRebuilt": false,
+    "airPreviewChanged": false
+  },
+  "cli": {
+    "changed": false,
+    "darwinArm64Sha256": "a2a640d18e3d3014bcd8afdafbaf1f8994c5fbaf4623ea168014aeba7f68b49a",
+    "miniRelayPid": 83457,
+    "airRelayPid": 912,
+    "relaysRestarted": false,
+    "reason": "A2 adds Go client methods but no new CLI command; the hub remains compatible with installed clients."
+  },
+  "rollback": {
+    "release": "20260909-narrative-history-4cb6e6c",
+    "binary": "/mnt/deepfreeze/tailterm-hub/releases/20260909-narrative-history-4cb6e6c/tailterm-hub",
+    "sha256": "49591cd6083a590c0afca68c05f50ba416c1e98f01ae006e92bb341e956b5475",
+    "verifiedBeforeRelease": true,
+    "normalProcedure": "Use TrueNAS middleware to point tailterm-hub at the retained narrative binary while preserving the additive current SQLite database and existing mounts/listener.",
+    "forwardCompatibility": "A1 links written by an old rollback binary are reconciled only when an A2 binary next opens the database.",
+    "disasterRecovery": "Restore the online backup only for database disaster recovery; doing so loses every write after 2026-09-10T13:44:41Z."
+  },
+  "scopeExclusions": [
+    "live backfill or historical correction manifest",
+    "Board UI, cached/project export or required-mode activation",
+    "AIV repository, runtime, installation or pilot",
+    "B1, B2, C1, E1 or E2",
+    "frontend, WASM, Cloudflare, Mini package or Air preview deployment",
+    "CLI installation or relay restart",
+    "Tailscale, network, listener or service-topology changes",
+    "live task/profile data as test fixtures or direct live work-item reads"
+  ]
+}
