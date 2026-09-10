@@ -1,0 +1,215 @@
+{
+  "status": "builder_release_verified_pending_lead_acceptance_and_handler_completion",
+  "recordedAt": "2026-09-10T21:45:55Z",
+  "workItem": {
+    "id": "wi_c36a4696771a2072",
+    "revision": 3,
+    "scopeRevision": 3,
+    "sourceMessage": 1713,
+    "selectionMessage": 1717,
+    "implementationWorkOrderMessage": 1726,
+    "sourceResultMessage": 1754,
+    "sourceAcceptanceMessage": 1761,
+    "frontendReleaseOrderMessage": 1763,
+    "releaseOrderHandlerConfirmationMessages": [1769, 1770],
+    "releaseOrderReceipt": "mpr_90930733b718d031",
+    "releaseOrderBytes": 3758,
+    "releaseOrderSha256": "baeeafc40a523485c5121be218a5a73da30a0697298b0b9f3c98e647c9b7dfdd"
+  },
+  "source": {
+    "acceptedBaseline": "4e8e6c5b38905b25b5173d0044560be45e5b6e88",
+    "acceptedApplicationCommit": "a974c9870b64d0e4cb5387011d1a68515af6ce82",
+    "acceptedApplicationTree": "71f78a5bb789ce84b484900670a5a92078361bb0",
+    "acceptedReportCommit": "b37929e6aba9f4a5c170621ec5697bf3c63902f0",
+    "acceptedReportTree": "06e859dc6b20629c55945c5cd851a1b2479a56b3",
+    "baselineToApplicationDiffSha256": "dd5941a284d7323a83b15ebbb95e525e924b0610e976f61a297003d30cda0ec0",
+    "releaseDocumentationCommit": "Reported in the Board result because a commit cannot contain its own hash.",
+    "retainedCleanSource": "/Users/stephenspeicher/projects/tailterm/.build/releases/queue-layout-a974c98",
+    "cleanSource": true,
+    "implementationAndReleaseReport": "docs/queue-layout.md"
+  },
+  "package": {
+    "commit": "a974c9870b64d0e4cb5387011d1a68515af6ce82",
+    "dirty": false,
+    "builtAt": "2026-09-10T21:40:05.800Z",
+    "manifestEntries": 82,
+    "servedAssetsPerOrigin": 81,
+    "totalPublicBytes": 80106528,
+    "releaseSize": 14861,
+    "releaseSha256": "7eb67bf14d940dee93792b624a2665ce3e53d155c6171956c90fe9f3faa30170",
+    "packageLockSha256": "a4175ff8886d6c2ee8443e7a928bc1f6f9500cd3b2c24b55fb967175d9eb3f98",
+    "productionWasm": {
+      "tailscaleVersion": "1.102.3",
+      "sourceArchiveSha256": "0e94d961c31ce7d33e8b7ce4ac6fdbec83ee5658784eed69eb7fce300729d717",
+      "goDirective": "1.26.6",
+      "hostGo": "go1.26.5 darwin/arm64",
+      "rawSize": 37951858,
+      "rawSha256": "8e54cce586f20e9ae03dd7b8315bc100819c81818a8896b06bbd29aa183b4af6",
+      "gzipPath": "assets/tailserve-Dc3Y6ELU.wasm.gz",
+      "gzipSize": 8598270,
+      "gzipSha256": "3b24253d0113365e41a1fec077ba68ea3da7cc3a6ca9e2277b9a0d1cb891680f",
+      "moduleInventoryEntries": 305,
+      "moduleInventorySize": 41520,
+      "moduleInventorySha256": "625c3372eeea0b69c0c73ddc4b5f21012facc705c87315e6ef961923e72e0b26",
+      "normalizedModuleInventorySha256": "beccf5f0c0c61f0fdd462185e47a79ea2c85047fa6edfa41856b7f368bfb0282",
+      "normalizedInventoryMatchesPreviousRelease": true
+    },
+    "assets": {
+      "mainScript": {
+        "path": "assets/index-Cuh6-kWE.js",
+        "size": 863312,
+        "sha256": "28c567889867fcb723339e986acda2a559838b50bd31554a7e710d598ed417fb"
+      },
+      "stylesheet": {
+        "path": "assets/index-D55uo5kC.css",
+        "size": 103270,
+        "sha256": "4b0a3ac5459db6f96e28c0fe34bd879da9db411e45cbc70ff63602d88ff113c1"
+      }
+    }
+  },
+  "frontend": {
+    "cloudflareProject": "tailos",
+    "productionBranch": "main",
+    "deploymentId": "876448a7-d913-4e68-9033-522230a57558",
+    "immutableOrigin": "https://876448a7.tailos.pages.dev",
+    "customOrigin": "https://tailos.tailarr.com",
+    "miniOrigin": "http://127.0.0.1:4318",
+    "miniPreviewPid": 60799,
+    "miniPreviewPpid": 1,
+    "miniPreviewRestarted": false,
+    "airPreviewChanged": false,
+    "oldTailtermSiteChanged": false,
+    "publishCommand": "npx wrangler pages deploy dist-static --project-name tailos --branch main --commit-hash a974c9870b64d0e4cb5387011d1a68515af6ce82 --commit-dirty=false",
+    "miniPublish": "A clone-copy of the exact retained dist-static package was staged beside the live root, then renameatx_np RENAME_SWAP atomically exchanged directories. PID 60799 and its listener were not stopped or restarted.",
+    "assetVerification": {
+      "description": "release.json, canonical root index, and all 81 manifest-served assets on immutable TailOS, custom TailOS, and Mini matched exact SHA-256, size, HTTP status, and each origin's MIME contract; _headers was excluded as hosting configuration.",
+      "evidence": ".build/queue-layout-release/public-assets.json",
+      "evidenceSize": 73179,
+      "evidenceSha256": "ef3c4b7df74d3c0c7a968eac5bd367c11a0a246c9c9ba48038e02faa49c1464d",
+      "rootIndexSha256": "215619caaffb85724e3fa5f7ee2c46f1c9f8df129c7d327a3a0367387cdbc372",
+      "manifestContainsAllPublicHashes": true,
+      "cloudflareMimeCounts": {
+        "application/gzip": 12,
+        "application/javascript": 10,
+        "application/json": 1,
+        "application/octet-stream": 24,
+        "application/wasm": 1,
+        "font/woff": 4,
+        "font/woff2": 8,
+        "image/svg+xml": 1,
+        "text/css; charset=utf-8": 1,
+        "text/html; charset=utf-8": 1,
+        "text/plain; charset=utf-8": 18
+      },
+      "miniMimeCounts": {
+        "application/gzip": 12,
+        "application/json; charset=utf-8": 1,
+        "application/octet-stream": 43,
+        "application/wasm": 1,
+        "font/woff": 4,
+        "font/woff2": 8,
+        "image/svg+xml": 1,
+        "text/css; charset=utf-8": 1,
+        "text/html; charset=utf-8": 1,
+        "text/javascript; charset=utf-8": 9
+      }
+    },
+    "browserVerification": {
+      "origins": [
+        "https://876448a7.tailos.pages.dev",
+        "https://tailos.tailarr.com",
+        "http://127.0.0.1:4318"
+      ],
+      "freshContexts": true,
+      "syntheticLocalVaultOnly": true,
+      "liveHubRequests": false,
+      "productionWasmStarted": true,
+      "generatedKeyRestored": true,
+      "matchingMargins": true,
+      "pageErrors": 0,
+      "lastScreenshot": {
+        "path": ".build/releases/queue-layout-a974c98/deployed-layout-preview.png",
+        "size": 88540,
+        "sha256": "e0c841c01372c157acfd0233fec1b35d49a271fcfea12e7569044a2d123c7754"
+      }
+    },
+    "servedCssVerification": {
+      "casesPerOrigin": 24,
+      "engines": ["chromium", "webkit"],
+      "verifiedBehaviors": [
+        "real production global CSS and import composition",
+        "761px content-width stacking",
+        "long text and identifier bounds",
+        "selected fill distinct from resting unselected fill",
+        "hover/focus fill retention and outline",
+        "keyboard and pointer selection movement",
+        "compact label-associated checkbox toggling",
+        "vertical scrolling and absence of page/browser errors"
+      ],
+      "results": [
+        {
+          "origin": "https://876448a7.tailos.pages.dev",
+          "path": ".build/queue-layout-release/served-unique-results.json",
+          "size": 582658,
+          "sha256": "193840911e61c6dd8ef0dfa8a482bfd423a22d6952912de3990a9e05addcf051"
+        },
+        {
+          "origin": "https://tailos.tailarr.com",
+          "path": ".build/queue-layout-release/served-custom-results.json",
+          "size": 582658,
+          "sha256": "51c9b032ab4b1721d00e67453045e955aa453b3244f0fc0a8b0254f7e7918f29"
+        },
+        {
+          "origin": "http://127.0.0.1:4318",
+          "path": ".build/queue-layout-release/served-mini-results.json",
+          "size": 582656,
+          "sha256": "ada9ff8a97cfe029253986c809bd09fe18806a35412da4c1ca60bfdbb3121d54"
+        }
+      ],
+      "webkit761ScreenshotSha256": "2cd1375e43150e1592dc3f671e1f5b6729a554a1ce63eccae6b782b8fb2c5df3"
+    }
+  },
+  "verification": {
+    "passed": [
+      "The standalone retained release checkout is exact a974c98, tracked-clean, and contains no Agents-library integration.",
+      "The previous project-queue-cfb2172 package passed verify:release and was byte-identical to the pre-release live Mini package.",
+      "A fresh production WASM build verified the pinned Tailscale archive and produced a normalized module inventory identical to the retained previous release inventory.",
+      "The new clean package passed verify:release with all 82 manifest entries before publication.",
+      "Wrangler published only dist-static to Cloudflare Pages project tailos production branch main with exact commit a974c98.",
+      "The Mini package was exchanged atomically without stopping or reparenting PID 60799.",
+      "All three origins matched release.json and every one of the 81 public assets, including MIME and canonical root index.",
+      "Fresh Chromium on each origin started production WASM and restored a synthetic local-only vault key with no page errors or live hub access.",
+      "The actual CSS downloaded from each origin passed all 24 Queue layout and interaction cases in Chromium and WebKit."
+    ],
+    "knownNonpasses": [
+      "No native Safari, owner-device viewport, zoom, DPR, or authenticated owner-vault confirmation is claimed.",
+      "The existing deployed-browser script emits a hard-coded https:true field even for the explicit Mini HTTP origin; the recorded origin remains http://127.0.0.1:4318 and no HTTPS claim is made for Mini.",
+      "Vite retained its pre-existing large-chunk advisory; build, packaging, verification, deployment, and browser checks passed.",
+      "The implementation-stage npm ci reported three moderate dependency advisories; no dependency or lockfile change was authorized or made."
+    ],
+    "operationalCorrections": [
+      "A read-only prerequisite hash command initially referenced nonexistent wasm/go.mod and wasm/go.sum paths. It stopped before mutation; the actual production Tailscale module inventory generated by build-wasm.sh was then verified.",
+      "A direct module-inventory diff initially differed only because retained files embed distinct absolute release-directory paths. Normalizing that path prefix produced identical 305-entry inventories and SHA-256 beccf5f0c0c61f0fdd462185e47a79ea2c85047fa6edfa41856b7f368bfb0282.",
+      "The first public-asset verifier pass expected text/plain for local license .txt files, while the unchanged long-lived preview intentionally falls back to application/octet-stream for unmapped text extensions. The verifier was corrected to accept that existing per-origin MIME contract; no served file changed, and the complete rerun passed."
+    ]
+  },
+  "rollback": {
+    "frontend": {
+      "commit": "cfb2172ae81095c035c58eab3c345ed4e489241e",
+      "deploymentId": "552de3bf-9453-4992-b0fb-1bf12d84dcd3",
+      "immutableOrigin": "https://552de3bf.tailos.pages.dev",
+      "releaseSha256": "e7919f9448fa0dc9d5938315c6747dbc9c035645398c48c2ce0ff34e21a234a4",
+      "package": "/Users/stephenspeicher/projects/tailterm/.build/releases/project-queue-cfb2172/dist-static",
+      "miniStagedPackage": "/Users/stephenspeicher/projects/tailterm/.build/static-before-queue-layout-cfb2172",
+      "miniSwappedLivePackage": "/Users/stephenspeicher/projects/tailterm/.build/static-live-before-queue-layout-cfb2172-swap",
+      "verifiedBeforePublish": true,
+      "procedure": "Publish the exact retained project-queue package explicitly to Pages project tailos, then atomically swap its staged dist-static directory with the Mini live root without stopping PID 60799."
+    }
+  },
+  "scopeExclusions": [
+    "live Queue, item, Board, hub, profile, or vault data",
+    "provider execution, automatic launch, Agents-library integration, Files mode, pulldown, or flashes work",
+    "hub, CLI, database, schema, TrueNAS, Tailscale, network, DNS, or relay changes",
+    "Air preview, old tailterm Pages project, unrelated process, agent, task, or worker lifecycle changes"
+  ]
+}

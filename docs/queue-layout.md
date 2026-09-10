@@ -255,6 +255,133 @@ The static build retained Vite's pre-existing large-chunk advisory, and `npm ci`
 reported three moderate dependency advisories. No dependency or lockfile change
 was authorized or made. No nonpass remains in the final corrected matrix.
 
+## Actual frontend release
+
+Lead accepted exact source `a974c98` in Board message `1761`. The Database
+handler then committed and read back separately bounded frontend release order
+`1763` under the same Bug revision and original implementation order `1726`.
+Handler messages `1769` and `1770` verified receipt
+`mpr_90930733b718d031` and the complete 3,758-byte order text, SHA-256
+`baeeafc40a523485c5121be218a5a73da30a0697298b0b9f3c98e647c9b7dfdd`.
+The retained verification file is
+`/tmp/tailterm-queue-layout-release-order-verified-1766.json`, 12,790 bytes,
+SHA-256 `475caae0eaf33ccf59b25f01b35ad1bd3e228cbbb62481275df154d061507cfd`.
+
+### Clean package and rollback
+
+A standalone, tracked-clean checkout at exact application `a974c98` is retained
+at `.build/releases/queue-layout-a974c98`. Its ignored dependency tree was
+clone-copied from the previous retained release only after both `package-lock.json`
+files matched SHA-256
+`a4175ff8886d6c2ee8443e7a928bc1f6f9500cd3b2c24b55fb967175d9eb3f98`.
+No Agents-library source is present.
+
+`npm run build:wasm` freshly fetched the pinned Tailscale 1.102.3 archive and
+verified archive SHA-256
+`0e94d961c31ce7d33e8b7ce4ac6fdbec83ee5658784eed69eb7fce300729d717`.
+The build used the upstream Go 1.26.6 directive and produced:
+
+- raw production WASM: 37,951,858 bytes, SHA-256
+  `8e54cce586f20e9ae03dd7b8315bc100819c81818a8896b06bbd29aa183b4af6`;
+- packaged `assets/tailserve-Dc3Y6ELU.wasm.gz`: 8,598,270 bytes, SHA-256
+  `3b24253d0113365e41a1fec077ba68ea3da7cc3a6ca9e2277b9a0d1cb891680f`;
+- 305-entry module inventory: 41,520 bytes, SHA-256
+  `625c3372eeea0b69c0c73ddc4b5f21012facc705c87315e6ef961923e72e0b26`.
+  Its release-path-normalized SHA-256
+  `beccf5f0c0c61f0fdd462185e47a79ea2c85047fa6edfa41856b7f368bfb0282`
+  exactly matches the previous retained release inventory.
+
+The fresh static package passed `npm run verify:release`: exact clean commit
+`a974c98`, 82 manifest entries, of which 81 are public files and `_headers` is
+hosting configuration. Public bytes total 80,106,528. Exact release assets are:
+
+- `release.json`: 14,861 bytes, SHA-256
+  `7eb67bf14d940dee93792b624a2665ce3e53d155c6171956c90fe9f3faa30170`;
+- `assets/index-D55uo5kC.css`: 103,270 bytes, SHA-256
+  `4b0a3ac5459db6f96e28c0fe34bd879da9db411e45cbc70ff63602d88ff113c1`;
+- `assets/index-Cuh6-kWE.js`: 863,312 bytes, SHA-256
+  `28c567889867fcb723339e986acda2a559838b50bd31554a7e710d598ed417fb`.
+
+Before publication, the retained previous package
+`.build/releases/project-queue-cfb2172/dist-static` passed its own 82-entry
+verification and matched the Mini live directory byte for byte. Its release
+manifest SHA-256 is
+`e7919f9448fa0dc9d5938315c6747dbc9c035645398c48c2ce0ff34e21a234a4`.
+It is staged at `.build/static-before-queue-layout-cfb2172`; the actual swapped
+live directory is additionally preserved at
+`.build/static-live-before-queue-layout-cfb2172-swap`.
+
+### Publication and origin verification
+
+The exact retained package was published with the order-specified command:
+
+```sh
+npx wrangler pages deploy dist-static --project-name tailos --branch main --commit-hash a974c9870b64d0e4cb5387011d1a68515af6ce82 --commit-dirty=false
+```
+
+This created production deployment
+`876448a7-d913-4e68-9033-522230a57558` at
+`https://876448a7.tailos.pages.dev`. `--branch main` selected the existing
+Cloudflare Pages production branch; Git stayed on `tasks-hub`. The custom origin
+is `https://tailos.tailarr.com`. The old `tailterm` Pages project was not touched,
+and `npm run deploy:static` was not used.
+
+For Mini, an exact clone-copy of the retained package was staged beside the live
+directory and `renameatx_np(RENAME_SWAP)` atomically exchanged them. The existing
+preview remained PID 60799 / PPID 1, with the same listener on
+`127.0.0.1:4318`; it was never stopped, restarted, or reparented.
+
+The immutable Pages URL, custom TailOS domain, and Mini preview each returned the
+exact release-manifest hash above. A complete verifier then fetched `release.json`,
+canonical root index, and all 81 public assets from every origin with identity
+encoding and checked HTTP success, byte count, SHA-256, and each origin's MIME
+contract. `_headers` was correctly excluded. All 243 asset fetches and all three
+root/release checks passed. The full synthetic evidence is
+`.build/queue-layout-release/public-assets.json`, 73,179 bytes, SHA-256
+`ef3c4b7df74d3c0c7a968eac5bd367c11a0a246c9c9ba48038e02faa49c1464d`.
+
+Fresh disposable Chromium contexts on all three origins unlocked only a synthetic
+local vault, generated and restored a synthetic key, verified layout margins,
+started the production Tailscale WASM, and reported no page errors. No live hub
+configuration or hub request was used. The script's `https:true` output field is
+hard-coded even for an explicitly supplied origin; Mini remained correctly
+verified as HTTP, not HTTPS.
+
+Finally, the actual CSS was downloaded independently from each origin. All three
+copies matched SHA-256
+`4b0a3ac5459db6f96e28c0fe34bd879da9db411e45cbc70ff63602d88ff113c1`.
+Each copy separately passed all 24 Chromium/WebKit cases in the accepted fixture:
+real production composition, 761px/content-width stacking, long text/IDs,
+selection fill, hover/focus retention, keyboard/pointer selection movement,
+compact label-associated checkbox toggling, bounds, and scrolling. Results:
+
+- immutable URL: 582,658 bytes, SHA-256
+  `193840911e61c6dd8ef0dfa8a482bfd423a22d6952912de3990a9e05addcf051`;
+- custom domain: 582,658 bytes, SHA-256
+  `51c9b032ab4b1721d00e67453045e955aa453b3244f0fc0a8b0254f7e7918f29`;
+- Mini: 582,656 bytes, SHA-256
+  `ada9ff8a97cfe029253986c809bd09fe18806a35412da4c1ca60bfdbb3121d54`.
+
+The complete machine-readable receipt is
+`docs/releases/tailos-2026-09-10-queue-layout.json`.
+
+### Release-stage corrections and nonpasses
+
+- A read-only prerequisite hash command initially referenced nonexistent
+  `wasm/go.mod` and `wasm/go.sum`. It stopped without mutation; the actual module
+  inventory generated by `build-wasm.sh` was then verified.
+- A direct module inventory diff initially differed because the retained files
+  embed different absolute release-directory paths. Normalizing only that path
+  prefix produced identical 305-entry inventories and the matching hash above.
+- The first public-asset verifier pass expected `text/plain` for Mini license
+  `.txt` files. The unchanged long-lived preview uses its octet-stream fallback
+  for unmapped text extensions. The verifier was corrected to accept this
+  existing per-origin MIME contract; no served file changed, and the full rerun
+  passed.
+- Vite retained its existing large-chunk advisory. The earlier three moderate
+  npm audit advisories and every original implementation/build nonpass remain
+  recorded above. No dependency or lockfile change was made.
+
 ## Limitations and rollback
 
 Playwright WebKit is not native Safari. No native Safari version, owner-device
@@ -262,9 +389,16 @@ viewport, zoom, or DPR is known, and no owner-device confirmation is claimed.
 The source-level and emitted-production-CSS fixtures establish repeatable engine
 geometry, not the exact cause of an already-open native Safari session.
 
-Rollback is source-only: revert selection correction `a974c987...`, geometry
-correction `699ecd42...`, and original application commit `952f36bf...`;
-`2d056055...`, `b5c86af3...`, and this final report are documentation only. No
-migration, database rollback, hub/CLI rollback, service restart, profile cleanup,
-or production action is involved. Deployment remains subject to independent lead
-review and a later explicit release order.
+Frontend rollback publishes exact retained package
+`.build/releases/project-queue-cfb2172/dist-static` to Pages project `tailos`,
+then atomically swaps the identical staged package into Mini without stopping PID 60799. The rollback identity is application `cfb2172ae810...`, deployment
+`552de3bf-9453-4992-b0fb-1bf12d84dcd3` /
+`https://552de3bf.tailos.pages.dev`, release SHA-256
+`e7919f9448fa0dc9d5938315c6747dbc9c035645398c48c2ce0ff34e21a234a4`.
+
+Source rollback reverts selection correction `a974c987...`, geometry correction
+`699ecd42...`, and original application commit `952f36bf...`; intervening report
+commits are documentation only. No database, hub, CLI, schema, provider,
+TrueNAS, Tailscale, network, relay, Air preview, profile, vault, old-site, or
+agent-lifecycle change accompanied this release. Actual release remains pending
+independent lead verification, handler evidence retention, and ordered completion.
