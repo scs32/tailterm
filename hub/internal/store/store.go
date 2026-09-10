@@ -299,12 +299,31 @@ func (s *Store) CloseTask(ctx context.Context, id string, by api.Caller) (api.Ta
 		}
 	}
 	now := s.now()
-	if _, err := s.db.ExecContext(ctx, `UPDATE tasks SET status=?, closed_at=? WHERE id=?`, api.TaskClosed, ts(now), id); err != nil {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return t, err
+	}
+	defer tx.Rollback()
+	if _, err = tx.ExecContext(ctx, `UPDATE tasks SET status=?, closed_at=? WHERE id=?`, api.TaskClosed, ts(now), id); err != nil {
 		return t, err
 	}
 	t.Status = api.TaskClosed
 	t.ClosedAt = &now
-	_, err = s.addEvent(ctx, id, api.EventTaskClosed, "", t.Name, nil, by)
+	affectedQueues, err := s.cancelQueuesForProjectTx(ctx, tx, id, by)
+	if err != nil {
+		return t, err
+	}
+	if _, err = s.insertEvent(ctx, tx, id, api.EventTaskClosed, "", t.Name, nil, by); err != nil {
+		return t, err
+	}
+	if err = tx.Commit(); err == nil {
+		s.notify(id)
+		for _, targetID := range affectedQueues {
+			if targetID != id {
+				s.notify(targetID)
+			}
+		}
+	}
 	return t, err
 }
 
@@ -356,9 +375,10 @@ func (s *Store) AddAgent(ctx context.Context, taskID string, req api.AddAgentReq
 			return api.Agent{}, api.ErrAgentSpawnDisabled
 		}
 	}
-	contextThrough, err := validateAgentWorkItemRequest(s.db, ctx, taskID, req.WorkItem)
-	if err != nil {
-		return api.Agent{}, err
+	if req.WorkItem != nil {
+		if err := validatePreparedContextBundle(req.WorkItem); err != nil {
+			return api.Agent{}, err
+		}
 	}
 	if req.AgentID != "" {
 		if !api.ValidID(req.AgentID, "agt") {
@@ -367,6 +387,11 @@ func (s *Store) AddAgent(ctx context.Context, taskID string, req api.AddAgentReq
 		if existing, err := s.GetAgent(ctx, req.AgentID); err == nil {
 			if existing.TaskID != taskID {
 				return api.Agent{}, api.ErrInvalid
+			}
+			if exact, retryErr := exactExistingQueueAdmission(s.db, ctx, taskID, req, existing); retryErr != nil {
+				return api.Agent{}, retryErr
+			} else if exact {
+				return existing, nil
 			}
 			if existing.WorkItem != nil || (req.WorkItem != nil && req.Role == "") {
 				return api.Agent{}, fmt.Errorf("%w: item-bound agents require a fresh name and identity", api.ErrConflict)
@@ -505,12 +530,19 @@ func (s *Store) AddAgent(ctx context.Context, taskID string, req api.AddAgentReq
 		return a, err
 	}
 	defer tx.Rollback()
+	contextThrough, err := validateAgentWorkItemRequest(tx, ctx, taskID, req.WorkItem)
+	if err != nil {
+		return a, err
+	}
 	_, err = tx.ExecContext(ctx, `INSERT INTO agents (`+agentCols+`) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		a.ID, a.TaskID, a.Name, a.Host, a.Session, a.Runtime, a.Cwd, a.ParentAgentID, a.Role, a.Status, a.Title, ts(now), ts(now), a.RunID, "", "", "", false, "")
 	if err != nil {
 		return a, err
 	}
 	if a.WorkItem, err = insertAgentWorkItemBinding(ctx, tx, a, req.WorkItem, contextThrough); err != nil {
+		return a, err
+	}
+	if err = s.pinCrossProjectQueueAdmission(ctx, tx, taskID, req.WorkItem, a); err != nil {
 		return a, err
 	}
 	if a.WorkItem != nil {
@@ -738,8 +770,14 @@ func (s *Store) insertMessage(ctx context.Context, tx *sql.Tx, task api.Task, re
 		return api.Message{}, err
 	}
 	m := api.Message{Broadcast: task.Swarm, ReplyTo: req.ReplyTo, TaskID: taskID, From: api.Sender{AgentID: req.AgentID, Node: by.Node, User: by.User}, To: req.To, Text: req.Text, CreatedAt: s.now()}
-	res, err := tx.ExecContext(ctx, `INSERT INTO messages (task_id,from_agent,from_node,from_user,to_agent,text,created_at,reply_to,broadcast) VALUES (?,?,?,?,?,?,?,?,?)`,
-		taskID, req.AgentID, by.Node, by.User, req.To, req.Text, ts(m.CreatedAt), req.ReplyTo, m.Broadcast)
+	fromRun := ""
+	if req.AgentID != "" {
+		if err := tx.QueryRowContext(ctx, `SELECT run_id FROM agents WHERE id=?`, req.AgentID).Scan(&fromRun); err != nil {
+			return m, err
+		}
+	}
+	res, err := tx.ExecContext(ctx, `INSERT INTO messages (task_id,from_agent,from_node,from_user,to_agent,text,created_at,reply_to,broadcast,from_run_id) VALUES (?,?,?,?,?,?,?,?,?,?)`,
+		taskID, req.AgentID, by.Node, by.User, req.To, req.Text, ts(m.CreatedAt), req.ReplyTo, m.Broadcast, fromRun)
 	if err != nil {
 		return m, err
 	}
@@ -810,7 +848,7 @@ func (s *Store) ListMessages(ctx context.Context, taskID string, after int64, ag
 	args := []any{}
 	if binding != nil {
 		q += `
-JOIN message_work_item_links item_scope ON item_scope.message_seq=m.seq AND item_scope.item_task_id=? AND item_scope.item_id=?`
+LEFT JOIN message_work_item_links item_scope ON item_scope.message_seq=m.seq AND item_scope.item_task_id=? AND item_scope.item_id=?`
 		args = append(args, binding.ItemTaskID, binding.ItemID)
 	}
 	q += `
@@ -818,6 +856,10 @@ WHERE m.task_id=? AND m.seq>?`
 	args = append(args, taskID, after)
 	if agentID != "" {
 		q += ` AND (broadcast=1 OR to_agent='' OR to_agent=?)`
+		args = append(args, agentID)
+	}
+	if binding != nil {
+		q += ` AND (item_scope.message_seq IS NOT NULL OR (m.system_notice_kind='queue_changed' AND m.to_agent=?))`
 		args = append(args, agentID)
 	}
 	if after < 0 {
@@ -845,6 +887,9 @@ WHERE m.task_id=? AND m.seq>?`
 	}
 	rows.Close()
 	for index := range out {
+		if err := loadSystemNotice(s.db, ctx, &out[index]); err != nil {
+			return nil, err
+		}
 		original, err := loadAuditOriginal(s.db, ctx, out[index].TaskID, out[index].Seq)
 		if err != nil {
 			return nil, err

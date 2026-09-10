@@ -282,6 +282,9 @@ func (s *Store) CreateWorkItem(ctx context.Context, taskID string, req api.Creat
 	if err = refreshWorkItemHistoryState(ctx, tx, item, ts(now)); err != nil {
 		return api.WorkItem{}, err
 	}
+	if err = s.syncQueueForWorkItem(ctx, tx, item, "", by); err != nil {
+		return api.WorkItem{}, err
+	}
 	if _, err = tx.ExecContext(ctx, `INSERT INTO work_item_requests(task_id,operation,request_id,payload_hash,item_id,created_at) VALUES(?,'create',?,?,?,?)`, taskID, req.RequestID, payload, item.ID, ts(now)); err != nil {
 		return api.WorkItem{}, err
 	}
@@ -413,6 +416,9 @@ func (s *Store) UpdateWorkItem(ctx context.Context, taskID, itemID string, req a
 		}
 	}
 	if err = refreshWorkItemHistoryState(ctx, tx, item, ts(now)); err != nil {
+		return api.WorkItem{}, err
+	}
+	if err = s.syncQueueForWorkItem(ctx, tx, item, "", by); err != nil {
 		return api.WorkItem{}, err
 	}
 	if _, err = s.insertEvent(ctx, tx, taskID, "work_item_updated", req.AgentID, item.Title, map[string]any{"itemId": item.ID, "kind": item.Kind, "revision": item.Revision, "fields": changedFields}, by); err != nil {
@@ -614,6 +620,9 @@ func (s *Store) CreateWorkItemUpdate(ctx context.Context, taskID, itemID string,
 	if err = refreshWorkItemHistoryState(ctx, tx, item, ts(now)); err != nil {
 		return api.WorkItemUpdateResult{}, false, err
 	}
+	if err = s.syncQueueForWorkItem(ctx, tx, item, req.RunID, by); err != nil {
+		return api.WorkItemUpdateResult{}, false, err
+	}
 	if _, err = s.insertEvent(ctx, tx, taskID, "work_item_updated", req.AgentID, item.Title, map[string]any{"itemId": item.ID, "kind": item.Kind, "revision": item.Revision, "fields": changedFields, "requestId": req.RequestID}, by); err != nil {
 		return api.WorkItemUpdateResult{}, false, err
 	}
@@ -668,7 +677,12 @@ func (s *Store) DispatchWorkItem(ctx context.Context, taskID, itemID string, req
 			return api.WorkItemDispatchResult{}, err
 		}
 		item.LastDispatch = &dispatch
-		return api.WorkItemDispatchResult{Item: item, Dispatch: dispatch}, nil
+		queueReceipt, err := loadQueueDispatchReceipt(tx, ctx, dispatch.ID)
+		if err != nil {
+			return api.WorkItemDispatchResult{}, err
+		}
+		queueReceipt.Replay = true
+		return api.WorkItemDispatchResult{Item: item, Dispatch: dispatch, Queue: &queueReceipt}, nil
 	}
 	if err != sql.ErrNoRows {
 		return api.WorkItemDispatchResult{}, err
@@ -699,7 +713,7 @@ func (s *Store) DispatchWorkItem(ctx context.Context, taskID, itemID string, req
 	if targetTask.Orchestrator == "" {
 		return api.WorkItemDispatchResult{}, workItemConflict("target project has no orchestrator")
 	}
-	targetAgent, err := scanAgent(tx.QueryRowContext(ctx, `SELECT `+agentCols+` FROM agents WHERE task_id=? AND name=? COLLATE NOCASE AND role='' AND status NOT IN ('closed','exited') ORDER BY created_at DESC LIMIT 1`, targetTask.ID, targetTask.Orchestrator))
+	targetAgent, err := currentQueueOrchestrator(tx, ctx, targetTask)
 	if errors.Is(err, sql.ErrNoRows) {
 		var currentRole string
 		roleErr := tx.QueryRowContext(ctx, `SELECT role FROM agents WHERE task_id=? AND name=? COLLATE NOCASE AND status NOT IN ('closed','exited') ORDER BY created_at DESC LIMIT 1`, targetTask.ID, targetTask.Orchestrator).Scan(&currentRole)
@@ -714,6 +728,9 @@ func (s *Store) DispatchWorkItem(ctx context.Context, taskID, itemID string, req
 	if err != nil {
 		return api.WorkItemDispatchResult{}, err
 	}
+	if item.Status == "done" || item.Status == "dismissed" {
+		return api.WorkItemDispatchResult{}, workItemConflict("terminal work item is not enqueueable")
+	}
 	description := item.Description
 	if len(description) > 6000 {
 		description = description[:6000]
@@ -722,23 +739,43 @@ func (s *Store) DispatchWorkItem(ctx context.Context, taskID, itemID string, req
 		}
 		description += "…"
 	}
-	messageText := fmt.Sprintf("Work item %s revision %d from project %q (%s)\n%s: %s\nStatus: %s · Priority: %s\nDescription: %s", item.ID, item.Revision, sourceTask.Name, sourceTask.ID, strings.ToUpper(item.Kind), item.Title, item.Status, item.Priority, description)
-	message, err := s.insertMessage(ctx, tx, targetTask, api.PostMessageRequest{
-		AgentID: req.AgentID,
-		To:      targetAgent.ID,
-		Text:    messageText,
-		WorkItems: []api.MessageWorkItem{{
-			ItemTaskID:   item.TaskID,
-			ItemID:       item.ID,
-			ItemRevision: item.Revision,
-			Relationship: "primary",
-		}},
-	}, targetAgent, by, true, false)
+	messageText := fmt.Sprintf("Work item %s revision %d from project %q (%s)\n%s: %s\nStatus: %s · Priority: %s\nDescription: %s\n\nQueued for deliberate review. This notice is not a bounded work order and does not start an agent.", item.ID, item.Revision, sourceTask.Name, sourceTask.ID, strings.ToUpper(item.Kind), item.Title, item.Status, item.Priority, description)
+	messageSeq := int64(0)
+	priorEntry, priorEntryErr := getQueueEntryByItem(tx, ctx, targetTask.ID, item.TaskID, item.ID)
+	duplicateOffer := priorEntryErr == nil && !terminalQueueState(priorEntry.State) && priorEntry.OfferedItemRevision == item.Revision
+	if priorEntryErr != nil && !errors.Is(priorEntryErr, api.ErrNotFound) {
+		return api.WorkItemDispatchResult{}, priorEntryErr
+	}
+	if priorEntryErr == nil && (priorEntry.OrchestratorAgentID != targetAgent.ID || priorEntry.OrchestratorRunID != targetAgent.RunID) {
+		return api.WorkItemDispatchResult{}, workItemConflict("Queue recipient changed; explicitly reconcile the pinned orchestrator before sending again")
+	}
+	if duplicateOffer {
+		if err = tx.QueryRowContext(ctx, `SELECT message_seq FROM queue_dispatch_links WHERE entry_id=? ORDER BY event_seq DESC LIMIT 1`, priorEntry.ID).Scan(&messageSeq); err != nil {
+			return api.WorkItemDispatchResult{}, err
+		}
+	} else {
+		message, messageErr := s.insertMessage(ctx, tx, targetTask, api.PostMessageRequest{
+			AgentID: req.AgentID,
+			To:      targetAgent.ID,
+			Text:    messageText,
+			WorkItems: []api.MessageWorkItem{{
+				ItemTaskID: item.TaskID, ItemID: item.ID, ItemRevision: item.Revision, Relationship: "primary",
+			}},
+		}, targetAgent, by, true, false)
+		if messageErr != nil {
+			return api.WorkItemDispatchResult{}, messageErr
+		}
+		messageSeq = message.Seq
+	}
+	now := s.now()
+	dispatch := api.WorkItemDispatch{ID: api.NewID("wid"), ItemID: item.ID, Revision: item.Revision, TargetTaskID: targetTask.ID, TargetAgentID: targetAgent.ID, MessageSeq: messageSeq, CreatedAt: now}
+	queueReceipt, messageSeq, err := s.enqueueWorkItemDispatch(ctx, tx, item, targetTask, targetAgent, dispatch, api.Sender{AgentID: req.AgentID, Node: by.Node, User: by.User})
 	if err != nil {
 		return api.WorkItemDispatchResult{}, err
 	}
-	now := s.now()
-	dispatch := api.WorkItemDispatch{ID: api.NewID("wid"), ItemID: item.ID, Revision: item.Revision, TargetTaskID: targetTask.ID, TargetAgentID: targetAgent.ID, MessageSeq: message.Seq, CreatedAt: now}
+	if messageSeq != dispatch.MessageSeq {
+		return api.WorkItemDispatchResult{}, errors.New("queue dispatch provenance message mismatch")
+	}
 	snapshot, _ := json.Marshal(item)
 	if _, err = tx.ExecContext(ctx, `INSERT INTO work_item_dispatches(id,item_id,item_revision,snapshot,target_task_id,target_agent_id,message_seq,agent_id,by_node,by_user,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)`,
 		dispatch.ID, dispatch.ItemID, dispatch.Revision, string(snapshot), dispatch.TargetTaskID, dispatch.TargetAgentID, dispatch.MessageSeq, req.AgentID, by.Node, by.User, ts(now)); err != nil {
@@ -747,7 +784,7 @@ func (s *Store) DispatchWorkItem(ctx context.Context, taskID, itemID string, req
 	if _, err = tx.ExecContext(ctx, `INSERT INTO work_item_requests(task_id,operation,request_id,payload_hash,item_id,dispatch_id,created_at) VALUES(?,'dispatch',?,?,?,?,?)`, taskID, req.RequestID, payload, item.ID, dispatch.ID, ts(now)); err != nil {
 		return api.WorkItemDispatchResult{}, err
 	}
-	if _, err = s.insertEvent(ctx, tx, taskID, "work_item_dispatched", req.AgentID, item.Title, map[string]any{"itemId": item.ID, "revision": item.Revision, "dispatchId": dispatch.ID, "targetTaskId": targetTask.ID, "targetAgentId": targetAgent.ID, "messageSeq": message.Seq}, by); err != nil {
+	if _, err = s.insertEvent(ctx, tx, taskID, "work_item_dispatched", req.AgentID, item.Title, map[string]any{"itemId": item.ID, "revision": item.Revision, "dispatchId": dispatch.ID, "targetTaskId": targetTask.ID, "targetAgentId": targetAgent.ID, "messageSeq": dispatch.MessageSeq, "queueEntryId": queueReceipt.Entry.ID, "queueEventSeq": queueReceipt.Event.Seq}, by); err != nil {
 		return api.WorkItemDispatchResult{}, err
 	}
 	if err = tx.Commit(); err != nil {
@@ -758,5 +795,5 @@ func (s *Store) DispatchWorkItem(ctx context.Context, taskID, itemID string, req
 		s.notify(targetTask.ID)
 	}
 	item.LastDispatch = &dispatch
-	return api.WorkItemDispatchResult{Item: item, Dispatch: dispatch}, nil
+	return api.WorkItemDispatchResult{Item: item, Dispatch: dispatch, Queue: &queueReceipt}, nil
 }

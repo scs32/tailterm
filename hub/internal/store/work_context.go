@@ -85,10 +85,14 @@ func validateAgentWorkItemRequest(q queryRower, ctx context.Context, targetTaskI
 	if req == nil {
 		return 0, nil
 	}
-	if req.ItemTaskID != targetTaskID {
-		return 0, api.ErrInvalid
-	}
 	if err := validatePreparedContextBundle(req); err != nil {
+		return 0, err
+	}
+	if req.ItemTaskID == targetTaskID {
+		if req.QueueClaim != nil {
+			return 0, api.ErrInvalid
+		}
+	} else if err := validateCrossProjectQueueAdmission(q, ctx, targetTaskID, req); err != nil {
 		return 0, err
 	}
 	// Admission retains the current-row CAS and structured order relationship.
@@ -130,6 +134,131 @@ func validateAgentWorkItemRequest(q queryRower, ctx context.Context, targetTaskI
 		return 0, err
 	}
 	return through, nil
+}
+
+func validateCrossProjectQueueAdmission(q queryRower, ctx context.Context, targetTaskID string, req *api.AgentWorkItemRequest) error {
+	claim := req.QueueClaim
+	if claim == nil || !validQueueEntryID(claim.EntryID) || claim.Cycle < 1 || claim.ExpectedRevision < 1 ||
+		!api.ValidID(claim.ClaimantAgentID, "agt") || !validRunID(claim.ClaimantRunID) {
+		return api.ErrInvalid
+	}
+	entry, err := getQueueEntry(q, ctx, targetTaskID, claim.EntryID)
+	if err != nil {
+		return err
+	}
+	if entry.SourceTaskID != req.ItemTaskID || entry.ItemID != req.ItemID || entry.Cycle != claim.Cycle ||
+		entry.Revision != claim.ExpectedRevision || entry.State != api.QueueStateClaimed || entry.Stale ||
+		entry.ReviewNeeded || entry.ReconciliationNeeded || entry.ClaimedItemRevision != req.ItemRevision ||
+		entry.OfferedItemRevision != req.ItemRevision || entry.CurrentItemRevision != req.ItemRevision ||
+		entry.ClaimantAgentID != claim.ClaimantAgentID || entry.ClaimantRunID != claim.ClaimantRunID ||
+		entry.WorkOrderMessage == nil || *entry.WorkOrderMessage != req.WorkOrderMessage ||
+		entry.WorkerAgentID != "" || entry.WorkerRunID != "" || entry.ContextDigest != "" {
+		return workItemConflict("cross-project admission does not match the exact current Queue claim")
+	}
+	var targetStatus, sourceStatus, itemStatus string
+	if err = q.QueryRowContext(ctx, `SELECT status FROM tasks WHERE id=?`, targetTaskID).Scan(&targetStatus); err != nil {
+		return err
+	}
+	if err = q.QueryRowContext(ctx, `SELECT status FROM tasks WHERE id=?`, req.ItemTaskID).Scan(&sourceStatus); err != nil {
+		return err
+	}
+	if err = q.QueryRowContext(ctx, `SELECT status FROM work_items WHERE task_id=? AND id=? AND revision=?`, req.ItemTaskID, req.ItemID, req.ItemRevision).Scan(&itemStatus); err != nil {
+		return err
+	}
+	if targetStatus != api.TaskOpen || sourceStatus != api.TaskOpen || itemStatus == "done" || itemStatus == "dismissed" {
+		return workItemConflict("cross-project Queue claim is no longer eligible for admission")
+	}
+	var claimantTask, claimantRun, claimantStatus, claimantRole, claimantName, orchestratorName string
+	if err = q.QueryRowContext(ctx, `SELECT a.task_id,a.run_id,a.status,a.role,a.name,t.orchestrator FROM agents a JOIN tasks t ON t.id=a.task_id WHERE a.id=?`, claim.ClaimantAgentID).Scan(
+		&claimantTask, &claimantRun, &claimantStatus, &claimantRole, &claimantName, &orchestratorName); err != nil {
+		return err
+	}
+	if claimantTask != targetTaskID || claimantRun != claim.ClaimantRunID || claimantRole != "" || claimantName != orchestratorName ||
+		claimantStatus == api.AgentRetired || claimantStatus == api.AgentClosed || claimantStatus == api.AgentExited {
+		return workItemConflict("Queue claimant is not the exact current project orchestrator run")
+	}
+	if entry.Selection != nil {
+		var selectionFromAgent, selectionFromRun, selectionNoticeKind string
+		if err = q.QueryRowContext(ctx, `SELECT from_agent,from_run_id,system_notice_kind FROM messages WHERE task_id=? AND seq=?`, entry.Selection.TaskID, entry.Selection.MessageSeq).Scan(&selectionFromAgent, &selectionFromRun, &selectionNoticeKind); err != nil {
+			return err
+		}
+		if selectionNoticeKind != "" || (selectionFromAgent != "" && (selectionFromAgent != claim.ClaimantAgentID || selectionFromRun != claim.ClaimantRunID)) {
+			return workItemConflict("Queue selection is not retained human/current-orchestrator authority")
+		}
+	} else {
+		var actorAgent, actorNode, actorUser string
+		if err = q.QueryRowContext(ctx, `SELECT actor_agent_id,actor_node,actor_user FROM queue_events WHERE entry_id=? AND revision=? AND kind='claim'`, entry.ID, entry.Revision).Scan(&actorAgent, &actorNode, &actorUser); err != nil {
+			return err
+		}
+		if actorAgent != "" || actorNode == "" || actorUser == "" {
+			return workItemConflict("Queue claim has no retained human selection")
+		}
+	}
+	return nil
+}
+
+func (s *Store) pinCrossProjectQueueAdmission(ctx context.Context, tx *sql.Tx, targetTaskID string, req *api.AgentWorkItemRequest, agent api.Agent) error {
+	if req == nil || req.ItemTaskID == targetTaskID {
+		return nil
+	}
+	entry, err := getQueueEntry(tx, ctx, targetTaskID, req.QueueClaim.EntryID)
+	if err != nil {
+		return err
+	}
+	digestBytes := sha256.Sum256(req.ContextBundle)
+	entry.WorkerAgentID, entry.WorkerRunID = agent.ID, agent.RunID
+	entry.ContextDigest = hex.EncodeToString(digestBytes[:])
+	entry.Revision++
+	entry.UpdatedAt = agent.CreatedAt
+	if err = updateQueueEntry(ctx, tx, entry); err != nil {
+		return err
+	}
+	actor := api.Sender{AgentID: agent.ID}
+	event, err := appendQueueEvent(ctx, tx, entry, "admitted", "", "", agent.RunID, actor, agent.CreatedAt, agent.CreatedAt)
+	if err != nil {
+		return err
+	}
+	_, err = s.createQueueNotification(ctx, tx, entry, event, actor, 0)
+	return err
+}
+
+func exactExistingQueueAdmission(q queryRower, ctx context.Context, targetTaskID string, req api.AddAgentRequest, existing api.Agent) (bool, error) {
+	work := req.WorkItem
+	if work == nil || work.ItemTaskID == targetTaskID || work.QueueClaim == nil || existing.WorkItem == nil {
+		return false, nil
+	}
+	if existing.Name != req.Name || existing.Host != req.Host || existing.Session != req.Session || existing.Runtime != req.Runtime ||
+		existing.Cwd != req.Cwd || existing.ParentAgentID != req.ParentAgentID || existing.Role != req.Role {
+		return false, workItemConflict("Queue admission retry changed agent launch settings")
+	}
+	digestBytes := sha256.Sum256(work.ContextBundle)
+	digest := hex.EncodeToString(digestBytes[:])
+	binding := existing.WorkItem
+	if binding.ItemTaskID != work.ItemTaskID || binding.ItemID != work.ItemID || binding.ItemRevision != work.ItemRevision ||
+		binding.WorkOrderMessage != work.WorkOrderMessage || binding.ReplacesAgentID != work.ReplacesAgentID || binding.ContextDigest != digest {
+		return false, workItemConflict("Queue admission retry changed its exact item/order/context binding")
+	}
+	rows, err := q.QueryContext(ctx, `SELECT snapshot FROM queue_events WHERE target_task_id=? AND entry_id=? AND cycle=? AND kind='admitted' ORDER BY seq`, targetTaskID, work.QueueClaim.EntryID, work.QueueClaim.Cycle)
+	if err != nil {
+		return false, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var raw string
+		var entry api.QueueEntry
+		if err = rows.Scan(&raw); err != nil || json.Unmarshal([]byte(raw), &entry) != nil {
+			if err == nil {
+				err = errors.New("invalid Queue admission snapshot")
+			}
+			return false, err
+		}
+		if entry.Revision == work.QueueClaim.ExpectedRevision+1 && entry.WorkerAgentID == existing.ID && entry.WorkerRunID == existing.RunID &&
+			entry.ContextDigest == digest && entry.ClaimantAgentID == work.QueueClaim.ClaimantAgentID && entry.ClaimantRunID == work.QueueClaim.ClaimantRunID &&
+			entry.SourceTaskID == work.ItemTaskID && entry.ItemID == work.ItemID && entry.ClaimedItemRevision == work.ItemRevision {
+			return true, nil
+		}
+	}
+	return false, rows.Err()
 }
 
 // validatedBoundHistoricalMessage reports whether a stale message revision is

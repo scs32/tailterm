@@ -92,7 +92,7 @@ func cmdCapabilities(e env, args []string) error {
 	if *asJSON {
 		printJSON(out)
 	} else {
-		fmt.Printf("schema %d\nmessage-audit %v\naudit-export %v\npolicy %s\n", out.SchemaVersion, out.MessageAudit.Versions, out.AuditExport.Versions, out.Policy.MessageAudit)
+		fmt.Printf("schema %d\nmessage-audit %v\naudit-export %v\nqueue %v\npolicy %s\n", out.SchemaVersion, out.MessageAudit.Versions, out.AuditExport.Versions, out.Queue.Versions, out.Policy.MessageAudit)
 	}
 	return nil
 }

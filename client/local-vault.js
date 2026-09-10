@@ -46,6 +46,9 @@ const MAX_WORK_ITEM_DRAFT_BYTES = 24000;
 export const MAX_BOARD_INTENTS = 32;
 export const MAX_BOARD_INTENT_BYTES = 64 * 1024;
 export const MAX_BOARD_INTENTS_BYTES = 1024 * 1024;
+export const MAX_QUEUE_INTENTS = 24;
+export const MAX_QUEUE_INTENT_BYTES = 64 * 1024;
+export const MAX_QUEUE_INTENTS_BYTES = 1024 * 1024;
 const vaultEncoder = new TextEncoder();
 function normalizeBoardIntents(value) {
   if (!Array.isArray(value)) return [];
@@ -99,6 +102,65 @@ function normalizeWorkItemDrafts(value) {
     .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt))
     .slice(0, MAX_WORK_ITEM_DRAFTS)
     .map((draft) => structuredClone(draft));
+}
+function normalizeQueueIntents(value) {
+  if (!Array.isArray(value)) return [];
+  const intents = value
+    .filter(
+      (intent) =>
+        intent &&
+        /^[a-f0-9]{64}$/.test(intent.scope || "") &&
+        typeof intent.id === "string" &&
+        intent.id.length > 0 &&
+        intent.id.length <= 256 &&
+        typeof intent.requestId === "string" &&
+        intent.requestId.length > 0 &&
+        intent.requestId.length <= 128 &&
+        ["draft", "uncertain"].includes(intent.state) &&
+        typeof intent.payload === "object" &&
+        intent.payload !== null &&
+        intent.payload.requestId === intent.requestId &&
+        [
+          "priority",
+          "adopt",
+          "claim",
+          "start",
+          "launch_unknown",
+          "release",
+          "transfer",
+          "withdraw",
+          "requeue",
+          "reconcile_recipient",
+        ].includes(intent.payload.operation) &&
+        Number.isSafeInteger(intent.payload.expectedRevision) &&
+        intent.payload.expectedRevision > 0 &&
+        Number.isSafeInteger(intent.payload.cycle) &&
+        intent.payload.cycle > 0 &&
+        /^tsk_[a-f0-9]{16}$/.test(intent.taskId || "") &&
+        /^que_[a-f0-9]{16}$/.test(intent.entryId || "") &&
+        (intent.payload.reason === undefined ||
+          (typeof intent.payload.reason === "string" &&
+            vaultEncoder.encode(intent.payload.reason).byteLength <= 1024)) &&
+        typeof intent.updatedAt === "string" &&
+        vaultEncoder.encode(JSON.stringify(intent)).byteLength <=
+          MAX_QUEUE_INTENT_BYTES,
+    )
+    .map((intent) => structuredClone(intent));
+  const unique = new Map();
+  for (const intent of intents)
+    unique.set(`${intent.scope}\0${intent.id}`, intent);
+  const out = [...unique.values()].sort((a, b) =>
+    a.updatedAt.localeCompare(b.updatedAt),
+  );
+  if (
+    out.length > MAX_QUEUE_INTENTS ||
+    vaultEncoder.encode(JSON.stringify(out)).byteLength >
+      MAX_QUEUE_INTENTS_BYTES
+  )
+    throw new Error(
+      "Queue intent storage is full. Retry or discard an existing action first.",
+    );
+  return out;
 }
 async function db() {
   if (database) return database;
@@ -391,6 +453,49 @@ export function boardIntentPersistence() {
         requireSameVault();
         data.boardIntents = (data.boardIntents || []).filter(
           (entry) => entry.scope !== scope || entry.id !== id,
+        );
+        return true;
+      }),
+  };
+}
+export function queueIntentPersistence() {
+  requireUnlocked();
+  const vaultKey = key;
+  const requireSameVault = () => {
+    requireUnlocked();
+    if (key !== vaultKey)
+      throw new Error("Queue intents belong to a different vault unlock.");
+  };
+  return {
+    list: async (scope) => {
+      await queue;
+      requireSameVault();
+      return normalizeQueueIntents(contents.queueIntents).filter(
+        (intent) => intent.scope === scope,
+      );
+    },
+    save: async (intent) => {
+      const copy = normalizeQueueIntents([intent])[0];
+      if (!copy) throw new Error("Invalid Queue intent.");
+      await mutate((data) => {
+        requireSameVault();
+        data.queueIntents = normalizeQueueIntents([
+          ...(data.queueIntents || []).filter(
+            (entry) => entry.scope !== copy.scope || entry.id !== copy.id,
+          ),
+          copy,
+        ]);
+        return true;
+      });
+    },
+    remove: async (scope, id, requestId) =>
+      mutate((data) => {
+        requireSameVault();
+        data.queueIntents = (data.queueIntents || []).filter(
+          (entry) =>
+            entry.scope !== scope ||
+            entry.id !== id ||
+            (requestId && entry.requestId !== requestId),
         );
         return true;
       }),
@@ -796,6 +901,7 @@ function validateData(d) {
   );
   d.workItemDrafts = normalizeWorkItemDrafts(d.workItemDrafts);
   d.boardIntents = normalizeBoardIntents(d.boardIntents);
+  d.queueIntents = normalizeQueueIntents(d.queueIntents);
   d.launchProfiles = (Array.isArray(d.launchProfiles) ? d.launchProfiles : [])
     .filter(
       (p) =>

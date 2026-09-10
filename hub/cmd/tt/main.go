@@ -35,6 +35,7 @@ Commands
   status                       identity, hub reachability, own agent, unread count
   projects                     list projects on the hub (tasks is an alias)
   work-items <command>         list/get/create/update/dispatch/history for bugs and features
+  queue <command>              list/get/history/changes/action/receipt for deliberate Queue work
   agents [--json]              list agents on this task
   event <kind> [--text T]      post started|running|done|needs_input|exited|closed
   post <text> [--to AGENT]     post a message to the task or one agent
@@ -130,6 +131,8 @@ func main() {
 		err = cmdTasks(e, args)
 	case "work-items":
 		err = cmdWorkItems(e, args)
+	case "queue":
+		err = cmdQueue(e, args)
 	case "agents":
 		err = cmdAgents(e, args)
 	case "event":
@@ -592,6 +595,11 @@ func cmdSpawn(e env, args []string) error {
 	replacesAgent := fs.String("replaces-agent", "", "prior item-bound agent preserved by this new session")
 	workContextFile := fs.String("work-context-file", "", "handler-prepared item context JSON file")
 	workContextJSON := fs.String("work-context-json", "", "handler/authorized-launch-prepared item context JSON")
+	queueEntry := fs.String("queue-entry", "", "exact receiving Queue entry for cross-project admission")
+	queueCycle := fs.Int64("queue-cycle", 0, "exact claimed Queue cycle")
+	queueRevision := fs.Int64("queue-revision", 0, "exact claimed Queue entry revision")
+	queueClaimantAgent := fs.String("queue-claimant-agent", "", "exact current orchestrator claimant identity")
+	queueClaimantRun := fs.String("queue-claimant-run", "", "exact current orchestrator claimant run")
 	role := fs.String("role", "", "project role (database_handler)")
 	plannedTeamMembers := fs.Int("planned-team-members", 0, "planned non-database team members for this launch (1-32)")
 	run := fs.String("run", "", "command to run in the agent window (required)")
@@ -645,6 +653,18 @@ func cmdSpawn(e env, args []string) error {
 		if !api.ValidID(*workItemTask, "tsk") || !api.ValidID(*workItemID, "wi") || !api.ValidID(*workOrderTask, "tsk") || (*replacesAgent != "" && !api.ValidID(*replacesAgent, "agt")) {
 			return errors.New("invalid work-item routing identity")
 		}
+	}
+	queueFlagCount := 0
+	for _, set := range []bool{*queueEntry != "", *queueCycle != 0, *queueRevision != 0, *queueClaimantAgent != "", *queueClaimantRun != ""} {
+		if set {
+			queueFlagCount++
+		}
+	}
+	if queueFlagCount > 0 && (itemFlagCount == 0 || queueFlagCount != 5 || *workItemTask == *task || len(*queueEntry) != 20 || !strings.HasPrefix(*queueEntry, "que_") || *queueCycle < 1 || *queueRevision < 1 || !api.ValidID(*queueClaimantAgent, "agt") || !strings.HasPrefix(*queueClaimantRun, "run_")) {
+		return errors.New("cross-project Queue admission requires the exact --queue-entry, --queue-cycle, --queue-revision, --queue-claimant-agent and --queue-claimant-run claim")
+	}
+	if itemFlagCount > 0 && *workItemTask != *task && queueFlagCount == 0 {
+		return errors.New("cross-project item admission requires an exact current Queue claim")
 	}
 	if *task == "" || *hub == "" {
 		return errors.New("task and hub are required (TAILTERM_TASK/TAILTERM_HUB or --task/--hub)")
@@ -759,6 +779,9 @@ func cmdSpawn(e env, args []string) error {
 			WorkOrderMessage: api.MessageReference{TaskID: *workOrderTask, Seq: *workOrderMessage},
 			ReplacesAgentID:  *replacesAgent,
 			ContextBundle:    append(json.RawMessage(nil), contextData...),
+		}
+		if queueFlagCount > 0 {
+			req.WorkItem.QueueClaim = &api.QueueAdmissionClaim{EntryID: *queueEntry, Cycle: *queueCycle, ExpectedRevision: *queueRevision, ClaimantAgentID: *queueClaimantAgent, ClaimantRunID: *queueClaimantRun}
 		}
 	}
 	opts := spawn.Options{

@@ -163,6 +163,27 @@ export function createHubClient({ fetchImpl, baseURL, token = "" }) {
         method: "POST",
         body,
       }),
+    listQueue: (task, params = {}) =>
+      request(`/v1/tasks/${task}/queue` + q(params)),
+    getQueueEntry: (task, entry) =>
+      request(`/v1/tasks/${task}/queue/${encodeURIComponent(entry)}`),
+    listQueueHistory: (task, entry, params = {}) =>
+      request(
+        `/v1/tasks/${task}/queue/${encodeURIComponent(entry)}/history` +
+          q(params),
+      ),
+    listQueueChanges: (task, params = {}) =>
+      request(`/v1/tasks/${task}/queue/changes` + q(params)),
+    queueAction: (task, entry, body) =>
+      request(`/v1/tasks/${task}/queue/${encodeURIComponent(entry)}/actions`, {
+        method: "POST",
+        body,
+      }),
+    getQueueReceipt: (task, requestId, agentId = "") =>
+      request(
+        `/v1/tasks/${task}/queue-receipts/${encodeURIComponent(requestId)}` +
+          q({ agentId }),
+      ),
     addAgent: (task, body) =>
       request(`/v1/tasks/${task}/agents`, { method: "POST", body }),
     listAgents: async (task) =>

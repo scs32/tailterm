@@ -8,7 +8,8 @@ import (
 )
 
 const (
-	AuditExportFormatVersion = 2
+	AuditExportFormatVersion = 3
+	AuditExportLegacyVersion = 2
 	MaxAuditExportBytes      = 32 * 1024 * 1024
 	MaxAuditExportChunkBytes = 256 * 1024
 	MaxReadyAuditExports     = 8
@@ -28,6 +29,12 @@ type Capabilities struct {
 		MaxChunkBytes    int   `json:"maxChunkBytes"`
 		RetentionSeconds int64 `json:"retentionSeconds"`
 	} `json:"auditExport"`
+	Queue struct {
+		Versions     []int `json:"versions"`
+		DefaultPage  int   `json:"defaultPage"`
+		MaxPage      int   `json:"maxPage"`
+		MaxPageBytes int   `json:"maxPageBytes"`
+	} `json:"queue"`
 	Policy struct {
 		MessageAudit string `json:"messageAudit"`
 	} `json:"policy"`
@@ -38,11 +45,15 @@ func CurrentCapabilities() Capabilities {
 	out.SchemaVersion = 1
 	out.MessageAudit.Versions = []int{1, 2}
 	out.MessageAudit.MaxRelated = MaxMessageAuditRelated
-	out.AuditExport.Versions = []int{AuditExportFormatVersion}
+	out.AuditExport.Versions = []int{AuditExportLegacyVersion, AuditExportFormatVersion}
 	out.AuditExport.MaxBytes = MaxAuditExportBytes
 	out.AuditExport.MaxChunkBytes = MaxAuditExportChunkBytes
 	out.AuditExport.RetentionSeconds = int64(AuditExportRetention / time.Second)
 	out.Policy.MessageAudit = "observe"
+	out.Queue.Versions = []int{QueueVersion}
+	out.Queue.DefaultPage = DefaultQueuePage
+	out.Queue.MaxPage = MaxQueuePage
+	out.Queue.MaxPageBytes = MaxQueuePageBytes
 	return out
 }
 

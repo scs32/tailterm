@@ -199,6 +199,7 @@ type Message struct {
 	WorkItems        []MessageWorkItem   `json:"workItems,omitempty"`
 	WorkOrderMessage *MessageReference   `json:"workOrderMessage,omitempty"`
 	PostReceipt      *MessagePostReceipt `json:"postReceipt,omitempty"`
+	SystemNotice     *SystemNotice       `json:"systemNotice,omitempty"`
 	Broadcast        bool                `json:"broadcast,omitempty"`
 	ReplyTo          int64               `json:"replyTo,omitempty"`
 	Seq              int64               `json:"seq"`

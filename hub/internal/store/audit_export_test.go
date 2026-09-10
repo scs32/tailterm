@@ -135,6 +135,70 @@ func TestAuditExportFrozenReplayChunksClosedAndExpiration(t *testing.T) {
 	}
 }
 
+func TestAuditExportV3AddsFrozenQueueStreamsWithoutChangingV2Coverage(t *testing.T) {
+	s, ctx, caller := workItemStore(t)
+	now := time.Date(2026, 9, 10, 13, 0, 0, 0, time.UTC)
+	s.now = func() time.Time { return now }
+	source, _ := workItemProject(t, s, ctx, caller, "v3 source", "sourcelead")
+	target, _ := workItemProject(t, s, ctx, caller, "v3 target", "targetlead")
+	item := createWorkItem(t, s, ctx, caller, source, "v3-queue-item")
+	sent, err := s.DispatchWorkItem(ctx, source.ID, item.ID, api.DispatchWorkItemRequest{Revision: item.Revision, TargetTaskID: target.ID, RequestID: "v3-send"}, caller)
+	if err != nil {
+		t.Fatal(err)
+	}
+	v2, err := s.CreateAuditExport(ctx, target.ID, api.CreateAuditExportRequest{RequestID: "queue-v2", FormatVersion: 2}, caller)
+	if err != nil {
+		t.Fatal(err)
+	}
+	v3, err := s.CreateAuditExport(ctx, target.ID, api.CreateAuditExportRequest{RequestID: "queue-v3", FormatVersion: 3}, caller)
+	if err != nil {
+		t.Fatal(err)
+	}
+	read := func(meta api.AuditExport) []byte {
+		t.Helper()
+		var content []byte
+		for offset := int64(0); ; {
+			chunk, chunkErr := s.GetAuditExportChunk(ctx, target.ID, meta.ID, offset, 31, caller)
+			if chunkErr != nil {
+				t.Fatal(chunkErr)
+			}
+			content = append(content, chunk.Data...)
+			offset = chunk.NextOffset
+			if chunk.Complete {
+				return content
+			}
+		}
+	}
+	v2Bytes, v3Bytes := read(v2), read(v3)
+	var v2Document, v3Document struct {
+		FormatVersion int                         `json:"formatVersion"`
+		Streams       map[string][]map[string]any `json:"streams"`
+		Cutoffs       map[string]any              `json:"streamCutoffs"`
+	}
+	if err = json.Unmarshal(v2Bytes, &v2Document); err != nil {
+		t.Fatal(err)
+	}
+	if err = json.Unmarshal(v3Bytes, &v3Document); err != nil {
+		t.Fatal(err)
+	}
+	if v2Document.FormatVersion != 2 || v2Document.Streams["queueEntries"] != nil || v2Document.Cutoffs["queueEvents"] != nil {
+		t.Fatalf("v2 claimed Queue coverage: streams=%v cutoffs=%v", v2Document.Streams["queueEntries"], v2Document.Cutoffs)
+	}
+	if v3Document.FormatVersion != 3 || len(v3Document.Streams["queueEntries"]) != 1 || len(v3Document.Streams["queueCycles"]) != 1 || len(v3Document.Streams["queueEvents"]) != 1 || len(v3Document.Streams["queueDispatchLinks"]) != 1 || len(v3Document.Streams["queueNotifications"]) != 1 || v3Document.Cutoffs["queueEvents"] == nil {
+		t.Fatalf("v3 Queue coverage incomplete: streams=%v cutoffs=%v", v3Document.Streams, v3Document.Cutoffs)
+	}
+	if _, err = s.QueueAction(ctx, target.ID, sent.Queue.Entry.ID, api.QueueActionRequest{Operation: "priority", RequestID: "after-v3", ExpectedRevision: sent.Queue.Entry.Revision, Cycle: 1, Priority: "urgent"}, caller); err != nil {
+		t.Fatal(err)
+	}
+	if later := read(v3); !json.Valid(later) || string(later) != string(v3Bytes) || len(later) != int(v3.ByteCount) {
+		t.Fatal("frozen v3 Queue export changed after a later Queue mutation")
+	}
+	digest := sha256.Sum256(v3Bytes)
+	if hex.EncodeToString(digest[:]) != v3.SHA256 {
+		t.Fatal("v3 Queue export digest mismatch")
+	}
+}
+
 func TestAuditExportContentAndProjectByteLimitsFailBeforeReceipt(t *testing.T) {
 	ctx := context.Background()
 	caller := api.Caller{Node: "n", User: "u"}

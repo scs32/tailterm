@@ -466,6 +466,17 @@ export function createCachedHubClient({
       read(
         `/v1/tasks/${task}/work-items/${id}/narrative/reports/${encodeURIComponent(report)}/versions/${version}`,
       ),
+    listQueue: (task, params = {}) =>
+      read(`/v1/tasks/${task}/queue` + query(params)),
+    getQueueEntry: (task, entry) =>
+      read(`/v1/tasks/${task}/queue/${encodeURIComponent(entry)}`),
+    listQueueHistory: (task, entry, params = {}) =>
+      read(
+        `/v1/tasks/${task}/queue/${encodeURIComponent(entry)}/history` +
+          query(params),
+      ),
+    listQueueChanges: (task, params = {}) =>
+      read(`/v1/tasks/${task}/queue/changes` + query(params)),
     invalidate,
     invalidateDecisions,
     refreshDecisions,

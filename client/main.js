@@ -9,7 +9,9 @@ import { MODES, setupModes } from "./modes.js";
 import { createBoardView } from "./board-view.js";
 import { createTasksView } from "./tasks-view.js";
 import { createWorkItemsView } from "./work-items-view.js";
+import { createQueueView } from "./queue-view.js";
 import "./work-items.css";
+import "./queue.css";
 import { createFilesView } from "./files-view.js";
 import { normalizeTaskRef } from "./task-ref.js";
 import { createInactivityLock, IDLE_MINUTES } from "./inactivity.js";
@@ -131,6 +133,7 @@ let taskHub = null,
   tasksView = null,
   bugsView = null,
   featuresView = null,
+  queueView = null,
   filesView = null;
 let discoveryPending = false;
 applyChrome(appearance);
@@ -514,6 +517,7 @@ function mount() {
           tasks: tasksView,
           bugs: bugsView,
           features: featuresView,
+          queue: queueView,
         }[modes?.get()];
         if (view) {
           view.hide();
@@ -628,6 +632,14 @@ function mount() {
     };
     bugsView = createWorkItemsView({ ...workItemHost, kind: "bug" });
     featuresView = createWorkItemsView({ ...workItemHost, kind: "feature" });
+    queueView = createQueueView({
+      client: () => taskHub.viewClient(),
+      dialog,
+      closeDialog,
+      notice,
+      configure: () => taskHub.configure(),
+      intentPersistence: localVault.queueIntentPersistence(),
+    });
     filesView = createFilesView({
       getServers: () => data.servers,
       currentServer,
@@ -675,6 +687,7 @@ function mount() {
         tasksView.hide();
         bugsView.hide();
         featuresView.hide();
+        queueView.hide();
         filesView.hide();
         teamsView.hide();
         view.replaceChildren();
@@ -688,6 +701,9 @@ function mount() {
           const items = mode === "bugs" ? bugsView : featuresView;
           items.mount(view);
           items.show();
+        } else if (mode === "queue") {
+          queueView.mount(view);
+          queueView.show();
         } else if (mode === "teams") {
           teamsView.mount(view);
           teamsView.show();
@@ -2422,6 +2438,7 @@ async function lock() {
   tasksView?.hide();
   bugsView?.hide();
   featuresView?.hide();
+  queueView?.hide();
   filesView?.hide();
   teamsView?.hide();
   imageUploads?.cancel();

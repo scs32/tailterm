@@ -22,7 +22,7 @@ func TestCapabilitiesAndAuditExportHTTP(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if caps.SchemaVersion != 1 || caps.Policy.MessageAudit != "observe" || len(caps.AuditExport.Versions) != 1 || caps.AuditExport.Versions[0] != 2 {
+	if caps.SchemaVersion != 1 || caps.Policy.MessageAudit != "observe" || len(caps.AuditExport.Versions) != 2 || caps.AuditExport.Versions[0] != 2 || caps.AuditExport.Versions[1] != 3 || len(caps.Queue.Versions) != 1 || caps.Queue.Versions[0] != 1 {
 		t.Fatalf("capabilities: %+v", caps)
 	}
 	created, err := client.CreateAuditExport(ctx, task.ID, api.CreateAuditExportRequest{RequestID: "http-export", FormatVersion: 2})

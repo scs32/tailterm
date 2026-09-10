@@ -1,0 +1,141 @@
+.queue-layout {
+  display: grid;
+  grid-template-columns: minmax(210px, 0.8fr) minmax(280px, 1.2fr);
+  gap: 14px;
+  min-height: 0;
+}
+
+.queue-list,
+.queue-detail,
+.queue-history {
+  display: grid;
+  align-content: start;
+  gap: 7px;
+  min-width: 0;
+}
+
+.queue-row {
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+  height: auto !important;
+  padding: 8px;
+  text-align: left;
+}
+
+.queue-row > span {
+  display: grid;
+  gap: 3px;
+  min-width: 0;
+}
+
+.queue-row > span:last-child {
+  text-align: right;
+}
+
+.queue-row small {
+  color: var(--muted);
+  overflow-wrap: anywhere;
+}
+
+.queue-row[aria-pressed="true"] {
+  background: var(
+    --selection,
+    color-mix(in srgb, var(--accent) 18%, transparent)
+  );
+}
+
+.queue-detail {
+  padding: 2px 0 20px;
+}
+
+.queue-detail :is(h3, p) {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.queue-markers,
+.queue-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 7px;
+  align-items: end;
+}
+
+.queue-markers span {
+  padding: 3px 6px;
+  border: 1px solid var(--line);
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.queue-actions label {
+  display: grid;
+  gap: 4px;
+  font-size: 12px;
+}
+
+.queue-actions :is(select, button) {
+  height: 28px !important;
+}
+
+.queue-facts {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 7px;
+  margin: 0;
+}
+
+.queue-facts div {
+  min-width: 0;
+}
+
+.queue-facts :is(dt, dd) {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.queue-facts dt {
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.queue-recovery {
+  display: grid;
+  grid-template-columns: 1fr auto auto;
+  align-items: center;
+  gap: 6px;
+  padding: 7px;
+  border: 1px solid var(--line);
+}
+
+.queue-history {
+  max-height: 70vh;
+  overflow: auto;
+}
+
+.queue-history article {
+  display: grid;
+  gap: 3px;
+  padding: 7px 0;
+  border-bottom: 1px solid var(--line);
+}
+
+.queue-history article span {
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.queue-history-toggle {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+}
+
+@media (max-width: 700px) {
+  .queue-layout,
+  .queue-recovery {
+    grid-template-columns: 1fr;
+  }
+}

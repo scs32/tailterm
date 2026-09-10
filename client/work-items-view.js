@@ -800,7 +800,7 @@ export function createWorkItemsView({
         )
         .join(
           "",
-        )}</select></label><p class="fine">Send this revision to the project’s orchestrator. The item stays in ${esc(project(item.taskId)?.name || item.taskId)}.</p><p id="work-item-dispatch-status" class="fine" role="status"></p><div class="dialog-actions"><button type="submit" class="primary">Send to project</button></div></form>`,
+        )}</select></label><p class="fine">Send this revision for deliberate project review. On a Queue-capable hub it is enqueued atomically; it never starts an agent. The item stays in ${esc(project(item.taskId)?.name || item.taskId)}.</p><p id="work-item-dispatch-status" class="fine" role="status"></p><div class="dialog-actions"><button type="submit" class="primary">Send to project</button></div></form>`,
     );
     const form = document.querySelector("#work-item-dispatch"),
       button = form.querySelector("button"),
@@ -828,7 +828,9 @@ export function createWorkItemsView({
             result.dispatch.targetTaskId;
           closeDialog();
           notice(
-            `${singular} sent to ${targetName} · board message #${result.dispatch.messageSeq}.`,
+            result.queue
+              ? `${singular} enqueued for ${targetName} · Queue cycle ${result.queue.entry.cycle} · notice #${result.dispatch.messageSeq}.`
+              : `${singular} sent using a legacy hub · Queue support was not confirmed · board message #${result.dispatch.messageSeq}.`,
           );
         }
         await reload();

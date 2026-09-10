@@ -84,7 +84,17 @@ var exportQueries = []exportQuery{
 	{"narrativeCompletionPins", `SELECT * FROM narrative_completion_pins WHERE task_id=? ORDER BY item_id,item_revision`, oneArg},
 }
 
-func oneArg(taskID string) []any { return []any{taskID} }
+var queueExportQueries = []exportQuery{
+	{"queueEntries", `SELECT * FROM queue_entries WHERE target_task_id=? OR source_task_id=? ORDER BY seq`, twoArgs},
+	{"queueCycles", `SELECT c.* FROM queue_cycles c JOIN queue_entries e ON e.id=c.entry_id WHERE e.target_task_id=? OR e.source_task_id=? ORDER BY e.seq,c.cycle`, twoArgs},
+	{"queueEvents", `SELECT v.* FROM queue_events v JOIN queue_entries e ON e.id=v.entry_id WHERE e.target_task_id=? OR e.source_task_id=? ORDER BY v.seq`, twoArgs},
+	{"queueDispatchLinks", `SELECT l.* FROM queue_dispatch_links l JOIN queue_entries e ON e.id=l.entry_id WHERE e.target_task_id=? OR e.source_task_id=? ORDER BY l.event_seq,l.dispatch_id`, twoArgs},
+	{"queueReceipts", `SELECT r.* FROM queue_requests r JOIN queue_entries e ON e.id=r.entry_id WHERE e.target_task_id=? OR e.source_task_id=? ORDER BY r.created_at,r.receipt_id`, twoArgs},
+	{"queueNotifications", `SELECT n.* FROM queue_notifications n JOIN queue_entries e ON e.id=n.entry_id WHERE e.target_task_id=? OR e.source_task_id=? ORDER BY n.event_seq,n.recipient_generation`, twoArgs},
+}
+
+func oneArg(taskID string) []any  { return []any{taskID} }
+func twoArgs(taskID string) []any { return []any{taskID, taskID} }
 
 type auditExportWriter struct {
 	ctx    context.Context
@@ -355,7 +365,7 @@ func (s *Store) CreateAuditExport(ctx context.Context, taskID string, req api.Cr
 	if !errors.Is(scanErr, sql.ErrNoRows) {
 		return api.AuditExport{}, scanErr
 	}
-	if req.FormatVersion != api.AuditExportFormatVersion {
+	if req.FormatVersion != api.AuditExportLegacyVersion && req.FormatVersion != api.AuditExportFormatVersion {
 		return api.AuditExport{}, api.ErrInvalid
 	}
 	var taskExists int
@@ -396,7 +406,7 @@ func (s *Store) CreateAuditExport(ctx context.Context, taskID string, req api.Cr
 		value  any
 	}{
 		{"", "tailterm-project-audit"},
-		{`,"formatVersion":`, api.AuditExportFormatVersion},
+		{`,"formatVersion":`, req.FormatVersion},
 		{`,"sourceProject":`, taskID},
 		{`,"recordedBy":`, by},
 		{`,"createdAt":`, now},
@@ -412,7 +422,11 @@ func (s *Store) CreateAuditExport(ctx context.Context, taskID string, req api.Cr
 	if err := content.append([]byte(`,"streams":{`)); err != nil {
 		return api.AuditExport{}, err
 	}
-	for index, q := range exportQueries {
+	queries := exportQueries
+	if req.FormatVersion == api.AuditExportFormatVersion {
+		queries = append(append([]exportQuery(nil), exportQueries...), queueExportQueries...)
+	}
+	for index, q := range queries {
 		if index > 0 {
 			if err := content.append([]byte(",")); err != nil {
 				return api.AuditExport{}, err
@@ -451,6 +465,13 @@ func (s *Store) CreateAuditExport(ctx context.Context, taskID string, req api.Cr
 		return api.AuditExport{}, err
 	}
 	cutoffs["narrativeByItem"] = narrativeCutoffs
+	if req.FormatVersion == api.AuditExportFormatVersion {
+		var queueCutoff int64
+		if err := tx.QueryRowContext(ctx, `SELECT coalesce(max(v.seq),0) FROM queue_events v JOIN queue_entries e ON e.id=v.entry_id WHERE e.target_task_id=? OR e.source_task_id=?`, taskID, taskID).Scan(&queueCutoff); err != nil {
+			return api.AuditExport{}, err
+		}
+		cutoffs["queueEvents"] = queueCutoff
+	}
 	if err := content.append([]byte(`},"streamCutoffs":`)); err != nil {
 		return api.AuditExport{}, err
 	}

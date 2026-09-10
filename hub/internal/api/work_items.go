@@ -369,8 +369,9 @@ type WorkItemList struct {
 }
 
 type WorkItemDispatchResult struct {
-	Item     WorkItem         `json:"item"`
-	Dispatch WorkItemDispatch `json:"dispatch"`
+	Item     WorkItem              `json:"item"`
+	Dispatch WorkItemDispatch      `json:"dispatch"`
+	Queue    *QueueDispatchReceipt `json:"queue,omitempty"`
 }
 
 type WorkItemRevision struct {

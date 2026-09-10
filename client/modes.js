@@ -8,6 +8,7 @@ export const MODES = [
   ["teams", "Teams", "5"],
   ["bugs", "Bugs", "6"],
   ["features", "Features", "7"],
+  ["queue", "Queue", "8"],
 ];
 export function setupModes({ header, main, onChange, available = () => true }) {
   let current = "terminals";

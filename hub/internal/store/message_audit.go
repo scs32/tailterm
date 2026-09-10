@@ -14,7 +14,8 @@ COALESCE(l.item_task_id,''),COALESCE(l.item_id,''),COALESCE(l.item_revision,0),C
 COALESCE(l.work_order_task_id,''),COALESCE(l.work_order_message_seq,0),
 COALESCE(r.receipt_id,''),COALESCE(r.request_id,''),COALESCE(r.task_id,''),COALESCE(r.message_seq,0),COALESCE(r.created_at,''),
 COALESCE(dr.question,''),COALESCE(dr.options,''),COALESCE(dr.recommended_option_id,''),COALESCE(dr.recommendation_reason,''),
-COALESCE(da.request_seq,0),COALESCE(da.option_id,''),COALESCE(da.text,'')`
+COALESCE(da.request_seq,0),COALESCE(da.option_id,''),COALESCE(da.text,''),
+COALESCE(m.system_notice_kind,''),COALESCE(m.system_notice_id,'')`
 
 const messageSelectJoins = `
 LEFT JOIN message_work_item_links l ON l.message_seq=m.seq
@@ -34,6 +35,7 @@ func scanMessage(row rowScanner) (api.Message, error) {
 	var decisionRequest api.DecisionRequest
 	var decisionOptions string
 	var decisionAnswer api.DecisionAnswer
+	var systemNoticeKind, systemNoticeID string
 	var itemRevision, orderSeq int64
 	err := row.Scan(
 		&message.Seq, &message.TaskID,
@@ -44,6 +46,7 @@ func scanMessage(row rowScanner) (api.Message, error) {
 		&receipt.ID, &receipt.RequestID, &receipt.TaskID, &receipt.MessageSeq, &receiptCreated,
 		&decisionRequest.Question, &decisionOptions, &decisionRequest.RecommendedOptionID, &decisionRequest.RecommendationReason,
 		&decisionAnswer.RequestSeq, &decisionAnswer.OptionID, &decisionAnswer.Text,
+		&systemNoticeKind, &systemNoticeID,
 	)
 	if err != nil {
 		return message, err
@@ -73,7 +76,18 @@ func scanMessage(row rowScanner) (api.Message, error) {
 	if decisionAnswer.RequestSeq > 0 {
 		message.DecisionAnswer = &decisionAnswer
 	}
+	if systemNoticeKind != "" {
+		message.SystemNotice = &api.SystemNotice{Kind: systemNoticeKind, ID: systemNoticeID}
+	}
 	return message, nil
+}
+
+func loadSystemNotice(q queryRower, ctx context.Context, message *api.Message) error {
+	if message.SystemNotice == nil || message.SystemNotice.Kind != api.QueueNoticeChanged {
+		return nil
+	}
+	return q.QueryRowContext(ctx, `SELECT entry_id,cycle,event_seq FROM queue_notifications WHERE id=?`, message.SystemNotice.ID).Scan(
+		&message.SystemNotice.Queue.EntryID, &message.SystemNotice.Queue.Cycle, &message.SystemNotice.Queue.EventSeq)
 }
 
 func loadMessage(q queryRower, ctx context.Context, taskID string, seq int64) (api.Message, error) {
@@ -85,6 +99,9 @@ WHERE m.task_id=? AND m.seq=?`, taskID, seq))
 		return message, api.ErrNotFound
 	}
 	if err == nil {
+		if err = loadSystemNotice(q, ctx, &message); err != nil {
+			return message, err
+		}
 		original, auditErr := loadAuditOriginal(q, ctx, taskID, seq)
 		if auditErr != nil {
 			return message, auditErr
