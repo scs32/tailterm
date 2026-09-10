@@ -2,6 +2,7 @@
 // Sources and review date: docs/agent-models.md.
 export const MODEL_OPTIONS = {
   codex: [
+    ["gpt-5.3-codex", "GPT-5.3 Codex"],
     ["gpt-6-astra", "Astra (GPT-6)"],
     ["gpt-5.6-sol", "Sol (GPT-5.6)"],
     ["gpt-5.6-terra", "Terra (GPT-5.6)"],

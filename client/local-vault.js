@@ -1,4 +1,16 @@
-import { normalizeTeam, savedTeams } from "./teams.js";
+import {
+  AGENT_CATALOG_VERSION,
+  MAX_AGENT_DEFINITIONS,
+  definitionUsers,
+  migrateAgentData,
+  normalizeAgentCatalog,
+  normalizeAgentDefinition,
+  normalizeReferencedTeam,
+} from "./agents.js";
+import {
+  MAX_TEAM_LAUNCH_PLANS,
+  normalizeTeamLaunchPlans,
+} from "./launch-journal.js";
 import {
   normalizeUsername,
   validUsername,
@@ -40,6 +52,9 @@ const empty = () => ({
   sessions: [],
   tailscale: {},
   hub: { url: "" },
+  agentCatalog: { version: AGENT_CATALOG_VERSION, definitions: [] },
+  teamsVersion: 2,
+  teams: [],
 });
 const MAX_WORK_ITEM_DRAFTS = 24;
 const MAX_WORK_ITEM_DRAFT_BYTES = 24000;
@@ -193,6 +208,50 @@ async function disk(value) {
     tx.onabort = () => reject(tx.error || new Error("Vault save aborted."));
   });
 }
+async function vaultRecord(name) {
+  const database = await db();
+  return new Promise((resolve, reject) => {
+    const tx = database.transaction("vault", "readonly");
+    const request = tx.objectStore("vault").get(name);
+    tx.oncomplete = () => resolve(request.result);
+    tx.onerror = () => reject(tx.error);
+    tx.onabort = () => reject(tx.error || new Error("Vault read aborted."));
+  });
+}
+async function writeV2(envelope) {
+  if (
+    envelope?.version !== 2 ||
+    typeof envelope.ciphertext !== "string" ||
+    envelope.ciphertext.length > 16 * 1024 * 1024
+  )
+    throw new Error(
+      "The encrypted vault exceeds this browser's 16 MiB recovery boundary.",
+    );
+  const database = await db();
+  return new Promise((resolve, reject) => {
+    const tx = database.transaction("vault", "readwrite");
+    const store = tx.objectStore("vault");
+    store.put(envelope, "encrypted-v2");
+    store.put({ version: 2 }, "active-vault");
+    tx.oncomplete = resolve;
+    tx.onerror = () => reject(tx.error);
+    tx.onabort = () => reject(tx.error || new Error("Vault save aborted."));
+  });
+}
+async function activeEnvelope() {
+  const pointer = await vaultRecord("active-vault");
+  if (pointer !== undefined) {
+    if (pointer?.version !== 2)
+      throw new Error("Unsupported local vault namespace.");
+    const envelope = await vaultRecord("encrypted-v2");
+    if (!envelope)
+      throw new Error(
+        "The v2 vault migration is incomplete. Restore the preserved legacy backup explicitly.",
+      );
+    return { envelope, version: 2 };
+  }
+  return { envelope: await disk(), version: 1 };
+}
 async function acquire() {
   if (releaseLock) return;
   await new Promise((resolve, reject) => {
@@ -284,8 +343,12 @@ export function localData() {
     workspace: normalizeWorkspace(contents.workspace),
     hub: { url: contents.hub?.url || "", token: contents.hub?.token || "" },
     launchProfiles: structuredClone(contents.launchProfiles || []),
-    teams: savedTeams(contents),
+    agentCatalog: structuredClone(contents.agentCatalog),
+    agents: structuredClone(contents.agentCatalog.definitions),
+    teamsVersion: contents.teamsVersion,
+    teams: structuredClone(contents.teams),
     projectHandlerPlans: structuredClone(contents.projectHandlerPlans || []),
+    teamLaunchPlans: structuredClone(contents.teamLaunchPlans || []),
     profile: structuredClone(contents.profile || {}),
     profileAppearance: structuredClone(contents.profileAppearance || null),
     backup: {
@@ -321,7 +384,7 @@ async function mutate(fn, backupChanged = false) {
       if (next.profile?.hub) next.profile.dirty = true;
     }
     const envelope = await sealVault(next, key, salt);
-    await disk(envelope);
+    await writeV2(envelope);
     contents = next;
     if (sharedChanged) {
       profileSerial++;
@@ -510,7 +573,7 @@ const editVault = (fn) => mutate(fn, true);
 export async function localAPI(url, method = "GET", body = {}) {
   if (url === "/status")
     return {
-      initialized: !!(await disk()),
+      initialized: !!(await vaultRecord("active-vault")) || !!(await disk()),
       unlocked: !!contents,
       username: localStorage.getItem("tailterm.username") || "",
     };
@@ -523,25 +586,31 @@ export async function localAPI(url, method = "GET", body = {}) {
     try {
       if (username && !validUsername(username))
         throw new Error("Enter a valid username.");
-      const envelope = await disk();
+      const stored = await activeEnvelope();
+      const envelope = stored.envelope;
       if (envelope) {
         const opened = await openVault(envelope, body.password);
-        validateData(opened.data);
+        const migrated = migrateAgentData(opened.data);
+        const restored = { ...opened.data, ...migrated };
+        validateData(restored);
         if (
           opened.data.profile?.username &&
-          opened.data.profile.username !== username
+          restored.profile?.username &&
+          restored.profile.username !== username
         )
           throw new Error(
             "This browser has a different local profile. Use its username or Forget this device first.",
           );
-        contents = opened.data;
+        if (stored.version === 1)
+          await writeV2(await sealVault(restored, opened.key, opened.salt));
+        contents = restored;
         key = opened.key;
         salt = opened.salt;
       } else {
         salt = crypto.getRandomValues(new Uint8Array(16));
         key = await deriveVaultKey(body.password, salt);
         const initial = empty();
-        await disk(await sealVault(initial, key, salt));
+        await writeV2(await sealVault(initial, key, salt));
         contents = initial;
       }
       profileUnlockKey = username
@@ -549,7 +618,7 @@ export async function localAPI(url, method = "GET", body = {}) {
         : null;
       if (username) {
         contents.profile = { ...contents.profile, username };
-        await disk(await sealVault(contents, key, salt));
+        await writeV2(await sealVault(contents, key, salt));
         localStorage.setItem("tailterm.username", username);
       }
       void navigator.storage?.persist?.().catch(() => {});
@@ -568,6 +637,12 @@ export async function localAPI(url, method = "GET", body = {}) {
       throw new Error("Vault was locked. Unlock and try again.");
   };
   if (url === "/data") return localData();
+  if (url === "/vault/legacy-envelope" && method === "GET") {
+    const legacy = await disk();
+    if (!legacy)
+      throw new Error("No retained legacy vault source is available.");
+    return structuredClone(legacy);
+  }
   if (url === "/lock") {
     credentialCache.clear();
     profileUnlockKey = undefined;
@@ -618,6 +693,21 @@ export async function localAPI(url, method = "GET", body = {}) {
   if (url.startsWith("/servers/") && method === "DELETE")
     return editVault((d) => {
       const id = url.slice(9);
+      const used = d.agentCatalog.definitions
+        .filter((definition) => definition.serverId === id)
+        .map((definition) => definition.name);
+      if (used.length)
+        throw new Error(
+          `Remove this machine from agent definitions first: ${used.join(", ")}.`,
+        );
+      if (
+        normalizeTeamLaunchPlans(d.teamLaunchPlans).some((plan) =>
+          plan.members.some((member) => member.serverId === id),
+        )
+      )
+        throw new Error(
+          "Reconcile or discard the pending team launch that uses this machine first.",
+        );
       d.servers = d.servers.filter((s) => s.id !== id);
       d.sessions = d.sessions.filter((s) => s.serverId !== id);
     });
@@ -722,22 +812,130 @@ export async function localAPI(url, method = "GET", body = {}) {
         (p) => p.hub !== key.hub || p.taskId !== key.taskId,
       );
     });
+  if (url === "/team-launch-plans/validate" && method === "POST") {
+    normalizeTeamLaunchPlans([
+      ...normalizeTeamLaunchPlans(contents.teamLaunchPlans).filter(
+        (entry) => entry.id !== body.id,
+      ),
+      body,
+    ]);
+    return { ok: true };
+  }
+  if (url === "/team-launch-plans" && method === "POST")
+    return mutate((d) => {
+      const plan = normalizeTeamLaunchPlans([body])[0];
+      const plans = normalizeTeamLaunchPlans(d.teamLaunchPlans).filter(
+        (entry) => entry.id !== plan.id,
+      );
+      if (plans.length >= MAX_TEAM_LAUNCH_PLANS)
+        throw new Error(
+          `At most ${MAX_TEAM_LAUNCH_PLANS} unresolved team launch plans. Reconcile or discard one first.`,
+        );
+      d.teamLaunchPlans = normalizeTeamLaunchPlans([...plans, plan]);
+    });
+  if (url.startsWith("/team-launch-plans/") && method === "DELETE")
+    return mutate((d) => {
+      const id = url.slice("/team-launch-plans/".length);
+      d.teamLaunchPlans = normalizeTeamLaunchPlans(d.teamLaunchPlans).filter(
+        (entry) => entry.id !== id,
+      );
+    });
+  if (url === "/agents" && method === "POST")
+    return editVault((d) => {
+      const previous = d.agentCatalog.definitions.find(
+        (entry) => entry.id === body.id,
+      );
+      if (previous && body.revision !== previous.revision)
+        throw new Error(
+          "This agent changed in another editor. Reopen it and review the latest revision.",
+        );
+      const definition = normalizeAgentDefinition({
+        ...body,
+        revision: previous ? previous.revision + 1 : 1,
+      });
+      if (
+        definition.serverId &&
+        !d.servers.some((server) => server.id === definition.serverId)
+      )
+        throw new Error("Choose a saved machine for this agent.");
+      const definitions = d.agentCatalog.definitions.filter(
+        (entry) => entry.id !== definition.id,
+      );
+      if (!previous && definitions.length >= MAX_AGENT_DEFINITIONS)
+        throw new Error(`At most ${MAX_AGENT_DEFINITIONS} agent definitions.`);
+      const catalog = normalizeAgentCatalog({
+        version: AGENT_CATALOG_VERSION,
+        definitions: [...definitions, definition],
+      });
+      // Editing a shared default may change resolved aliases/roles. Validate
+      // every referencing team in the same encrypted mutation before commit.
+      d.teams = d.teams.map((team) => {
+        let next = team;
+        if (previous) {
+          const reference = team.members.find(
+            (member) => member.agentDefinitionId === previous.id,
+          );
+          const oldName = reference?.alias || previous.launchName;
+          if (reference && team.orchestrator === oldName)
+            next = {
+              ...team,
+              orchestrator: reference.alias || definition.launchName,
+            };
+        }
+        return normalizeReferencedTeam(next, catalog.definitions);
+      });
+      d.agentCatalog = catalog;
+    });
+  if (url.startsWith("/agents/") && method === "DELETE")
+    return editVault((d) => {
+      const id = url.slice(8);
+      const users = definitionUsers(id, d.teams);
+      if (users.length)
+        throw new Error(`This agent is used by teams: ${users.join(", ")}.`);
+      d.agentCatalog = normalizeAgentCatalog({
+        version: AGENT_CATALOG_VERSION,
+        definitions: d.agentCatalog.definitions.filter(
+          (entry) => entry.id !== id,
+        ),
+      });
+    });
   if (url === "/teams" && method === "POST")
     return editVault((d) => {
-      const team = normalizeTeam(body);
+      let submittedTeam = body.team || body;
+      let additions = Array.isArray(body.definitions)
+        ? body.definitions.map((entry) => normalizeAgentDefinition(entry))
+        : [];
+      // Updated callers save references. This compatibility seam converts an
+      // in-memory legacy editor submission atomically; it never reads or merges
+      // the retained v1 storage namespace.
       if (
-        team.members.some(
-          (m) => m.serverId && !d.servers.some((s) => s.id === m.serverId),
+        !body.team &&
+        Array.isArray(body.members) &&
+        body.members.some((member) => !member?.agentDefinitionId)
+      ) {
+        const migrated = migrateAgentData({ teams: [body] });
+        submittedTeam = migrated.teams[0];
+        additions = migrated.agentCatalog.definitions;
+      }
+      const catalog = normalizeAgentCatalog({
+        version: AGENT_CATALOG_VERSION,
+        definitions: [...d.agentCatalog.definitions, ...additions],
+      });
+      for (const definition of additions)
+        if (
+          definition.serverId &&
+          !d.servers.some((server) => server.id === definition.serverId)
         )
-      )
-        throw new Error("Choose a saved server for every team member.");
-      const teams = savedTeams(d).filter((t) => t.id !== team.id);
+          throw new Error("Choose a saved server for every agent definition.");
+      const team = normalizeReferencedTeam(submittedTeam, catalog.definitions);
+      const teams = d.teams.filter((t) => t.id !== team.id);
       if (teams.length >= 30) throw new Error("At most 30 teams.");
+      d.agentCatalog = catalog;
       d.teams = [...teams, team];
     });
   if (url.startsWith("/teams/") && method === "DELETE")
     return editVault((d) => {
-      d.teams = savedTeams(d).filter((t) => t.id !== url.slice(7));
+      d.teams = d.teams.filter((t) => t.id !== url.slice(7));
     });
   if (url === "/launch-profiles" && method === "POST")
     return editVault((d) => {
@@ -818,22 +1016,27 @@ export async function renameSessionBookmark(serverId, name, nextName) {
 }
 export async function importBackup(envelope, password) {
   const opened = await openVault(envelope, password);
+  const imported = { ...opened.data, ...migrateAgentData(opened.data) };
   const hasTeams =
-    Object.hasOwn(opened.data, "teams") ||
-    Object.hasOwn(opened.data, "launchProfiles");
-  const hasHub = Object.hasOwn(opened.data, "hub"),
-    hasSetups = Object.hasOwn(opened.data, "launchProfiles");
-  validateData(opened.data);
+    Object.hasOwn(imported, "teams") ||
+    Object.hasOwn(imported, "launchProfiles");
+  const hasHub = Object.hasOwn(imported, "hub"),
+    hasSetups = Object.hasOwn(imported, "launchProfiles");
+  validateData(imported);
   // Never import another browser's node identity. Keep this browser's identity, if any.
   return editVault((d) => {
-    d.servers = opened.data.servers;
-    d.keys = opened.data.keys;
-    d.sessions = opened.data.sessions;
-    if (hasHub) d.hub = opened.data.hub;
-    if (hasSetups) d.launchProfiles = opened.data.launchProfiles;
-    if (hasTeams) d.teams = savedTeams(opened.data);
-    if (opened.data.profileAppearance)
-      d.profileAppearance = opened.data.profileAppearance;
+    d.servers = imported.servers;
+    d.keys = imported.keys;
+    d.sessions = imported.sessions;
+    if (hasHub) d.hub = imported.hub;
+    if (hasSetups) d.launchProfiles = imported.launchProfiles;
+    if (hasTeams) {
+      d.agentCatalog = imported.agentCatalog;
+      d.teamsVersion = imported.teamsVersion;
+      d.teams = imported.teams;
+    }
+    if (imported.profileAppearance)
+      d.profileAppearance = imported.profileAppearance;
   });
 }
 function validateServer(s) {
@@ -894,7 +1097,18 @@ function validateData(d) {
   if (token.length > 512 || /[\x00-\x20\x7f]/.test(token))
     throw new Error("Invalid hub token.");
   d.hub = { url: hubURL || "", token };
-  d.teams = savedTeams(d);
+  const migrated = migrateAgentData(d);
+  d.agentCatalog = migrated.agentCatalog;
+  d.teamsVersion = migrated.teamsVersion;
+  d.teams = migrated.teams;
+  for (const definition of d.agentCatalog.definitions)
+    if (
+      definition.serverId &&
+      !d.servers.some((server) => server.id === definition.serverId)
+    )
+      throw new Error(
+        `Agent definition ${definition.name} references a missing server.`,
+      );
   d.projectHandlerPlans = normalizeHandlerPlans(
     d.projectHandlerPlans,
     d.servers,
@@ -902,6 +1116,7 @@ function validateData(d) {
   d.workItemDrafts = normalizeWorkItemDrafts(d.workItemDrafts);
   d.boardIntents = normalizeBoardIntents(d.boardIntents);
   d.queueIntents = normalizeQueueIntents(d.queueIntents);
+  d.teamLaunchPlans = normalizeTeamLaunchPlans(d.teamLaunchPlans);
   d.launchProfiles = (Array.isArray(d.launchProfiles) ? d.launchProfiles : [])
     .filter(
       (p) =>
@@ -933,7 +1148,7 @@ export async function nameProfile(username, password) {
   if (contents.profile?.hub && contents.profile.username !== username)
     throw new Error("Disconnect profile sync before changing usernames.");
   const currentKey = key;
-  await openVault(await disk(), password); // Confirm this local vault's passphrase.
+  await openVault((await activeEnvelope()).envelope, password); // Confirm this local vault's passphrase.
   const master = await profileMaster(password, username);
   if (!key || key !== currentKey)
     throw new Error("Vault was locked. Unlock and retry.");
@@ -948,7 +1163,6 @@ export async function nameProfile(username, password) {
 function sharedProfileData(d) {
   return {
     ...portableData(d),
-    teams: savedTeams(d),
     profileAppearance: structuredClone(d.profileAppearance || null),
   };
 }
@@ -983,6 +1197,7 @@ export async function applyRemoteProfile(payload, connection, serial) {
       throw new Error(
         "Local settings changed during sync. Retry after saving.",
       );
+    payload = { ...payload, ...migrateAgentData(payload) };
     validateData(payload);
     // Retain the previous local snapshot inside the encrypted local vault.
     d.profileRecovery = {
@@ -994,7 +1209,9 @@ export async function applyRemoteProfile(payload, connection, serial) {
     d.sessions = payload.sessions;
     d.hub = payload.hub;
     d.launchProfiles = payload.launchProfiles;
-    d.teams = savedTeams(payload);
+    d.agentCatalog = payload.agentCatalog;
+    d.teamsVersion = payload.teamsVersion;
+    d.teams = payload.teams;
     d.profileAppearance = payload.profileAppearance || null;
     d.profile = { ...d.profile, ...connection, dirty: false };
     // d.tailscale and d.workspace are deliberately device-specific.

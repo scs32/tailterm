@@ -154,11 +154,11 @@ try {
       );
       assert.equal(await b.evaluate(() => qa.data().profile.revision), 1);
       assert.equal(
-        await b.evaluate(() => qa.data().teams[0].members[0].model),
+        await b.evaluate(() => qa.data().agentCatalog.definitions[0].model),
         "test-model",
       );
       assert.equal(
-        await b.evaluate(() => qa.data().teams[0].members[0].prompt),
+        await b.evaluate(() => qa.data().agentCatalog.definitions[0].prompt),
         "Review the objective",
       );
       await a.evaluate(async () => {

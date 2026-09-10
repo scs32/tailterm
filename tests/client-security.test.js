@@ -31,6 +31,9 @@ test("browser vault encrypts, authenticates metadata, rejects tampering and excl
     /secret|private ssh|private node/,
   );
   assert.deepEqual((await openVault(envelope, password)).data, data);
+  const legacy = await sealVault(data, key, salt, 1);
+  assert.equal(legacy.version, 1);
+  assert.deepEqual((await openVault(legacy, password)).data, data);
   await assert.rejects(openVault(envelope, "incorrect passphrase"));
   await assert.rejects(openVault({ ...envelope, iterations: 1 }, password));
   await assert.rejects(
@@ -40,6 +43,11 @@ test("browser vault encrypts, authenticates metadata, rejects tampering and excl
     ),
   );
   assert.deepEqual(portableData(data).tailscale, {});
+  assert.equal(
+    portableData({ ...data, teamLaunchPlans: [{ secret: "local-only" }] })
+      .teamLaunchPlans,
+    undefined,
+  );
   assert.equal(data.tailscale.node, "private node identity");
 });
 test("OSC 52 preserves UTF-8, rejects malformed/oversized payloads and never supplies clipboard reads", () => {

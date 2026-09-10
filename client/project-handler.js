@@ -30,6 +30,9 @@ function spawnFields(value) {
     "cwd",
     "runtime",
     "model",
+    "reasoning",
+    "approvalMode",
+    "sandboxMode",
     "permissionMode",
     "prompt",
   ]) {

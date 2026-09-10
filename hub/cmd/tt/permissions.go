@@ -12,7 +12,17 @@ var permissionFlag = regexp.MustCompile(`(^|\s)(--sandbox|--ask-for-approval|--p
 
 // The owner can still use host configuration or a custom wrapper. Explicit UI
 // choices reject conflicting flags rather than relying on last-flag precedence.
-func permissionCommand(command, runtime, mode, cwd string, allowed []string) (string, error) {
+func permissionCommand(command, runtime, mode, cwd string, allowed []string, independent ...string) (string, error) {
+	approvalMode, sandboxMode := "", ""
+	if len(independent) > 0 {
+		approvalMode = independent[0]
+	}
+	if len(independent) > 1 {
+		sandboxMode = independent[1]
+	}
+	if len(independent) > 2 {
+		return "", fmt.Errorf("invalid independent permission settings")
+	}
 	if len(allowed) > 30 {
 		return "", fmt.Errorf("too many allowed tool rules")
 	}
@@ -24,12 +34,37 @@ func permissionCommand(command, runtime, mode, cwd string, allowed []string) (st
 	if len(allowed) > 0 && runtime != "claude" {
 		return "", fmt.Errorf("allowed tool rules require Claude Code")
 	}
-	if mode != "" && permissionFlag.MatchString(command) {
+	if (mode != "" || approvalMode != "" || sandboxMode != "") && permissionFlag.MatchString(command) {
 		return "", fmt.Errorf("remove permission flags from the command override or choose Host settings")
 	}
 	args := []string{}
 	switch runtime {
 	case "codex":
+		if mode != "" && (approvalMode != "" || sandboxMode != "") {
+			return "", fmt.Errorf("use independent approval and sandbox settings or a legacy preset, not both")
+		}
+		if approvalMode != "" || sandboxMode != "" {
+			switch approvalMode {
+			case "":
+			case "on-request", "never":
+				args = append(args, "--ask-for-approval", approvalMode)
+			default:
+				return "", fmt.Errorf("unsupported Codex approval mode")
+			}
+			switch sandboxMode {
+			case "":
+			case "read-only", "danger-full-access":
+				args = append(args, "--sandbox", sandboxMode)
+			case "workspace-write":
+				if !filepath.IsAbs(cwd) {
+					return "", fmt.Errorf("workspace permissions require an explicit absolute working directory")
+				}
+				args = append(args, "--sandbox", sandboxMode, "-c", "sandbox_workspace_write.network_access=true", "--add-dir", relayDir())
+			default:
+				return "", fmt.Errorf("unsupported Codex sandbox mode")
+			}
+			break
+		}
 		switch mode {
 		case "":
 		case "on-request":
@@ -45,6 +80,9 @@ func permissionCommand(command, runtime, mode, cwd string, allowed []string) (st
 			return "", fmt.Errorf("unsupported Codex permission mode")
 		}
 	case "claude":
+		if approvalMode != "" || sandboxMode != "" {
+			return "", fmt.Errorf("independent approval and sandbox settings require Codex")
+		}
 		switch mode {
 		case "":
 		case "acceptEdits", "auto", "dontAsk", "bypassPermissions":
@@ -56,7 +94,7 @@ func permissionCommand(command, runtime, mode, cwd string, allowed []string) (st
 			args = append(args, "--allowedTools", rule)
 		}
 	default:
-		if mode != "" {
+		if mode != "" || approvalMode != "" || sandboxMode != "" {
 			return "", fmt.Errorf("permission presets are supported for Codex and Claude Code only")
 		}
 	}

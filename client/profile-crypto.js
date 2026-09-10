@@ -80,23 +80,26 @@ export async function profileKeys(master, username, instanceId) {
     b.toString(16).padStart(2, "0"),
   ).join("");
   credential.fill(0);
-  const aad = encoder.encode(
-    JSON.stringify(["tailterm-profile", 1, username, instanceId]),
-  );
+  const aad = (version) =>
+    encoder.encode(
+      JSON.stringify(["tailterm-profile", version, username, instanceId]),
+    );
   return {
     token,
-    async seal(data) {
+    async seal(data, version = 2) {
+      if (![1, 2].includes(version))
+        throw new Error("Unsupported encrypted profile.");
       const iv = crypto.getRandomValues(new Uint8Array(12)),
         raw = encoder.encode(JSON.stringify(data));
       try {
         return {
           format: "tailterm-profile",
-          version: 1,
+          version,
           iv: b64(iv),
           ciphertext: b64(
             new Uint8Array(
               await crypto.subtle.encrypt(
-                { name: "AES-GCM", iv, additionalData: aad },
+                { name: "AES-GCM", iv, additionalData: aad(version) },
                 encryption,
                 raw,
               ),
@@ -108,7 +111,10 @@ export async function profileKeys(master, username, instanceId) {
       }
     },
     async open(envelope) {
-      if (envelope?.format !== "tailterm-profile" || envelope.version !== 1)
+      if (
+        envelope?.format !== "tailterm-profile" ||
+        ![1, 2].includes(envelope.version)
+      )
         throw new Error("Unsupported encrypted profile.");
       let raw;
       try {
@@ -116,7 +122,11 @@ export async function profileKeys(master, username, instanceId) {
         if (iv.length !== 12) throw new Error("Invalid IV");
         raw = new Uint8Array(
           await crypto.subtle.decrypt(
-            { name: "AES-GCM", iv, additionalData: aad },
+            {
+              name: "AES-GCM",
+              iv,
+              additionalData: aad(envelope.version),
+            },
             encryption,
             decode(envelope.ciphertext),
           ),

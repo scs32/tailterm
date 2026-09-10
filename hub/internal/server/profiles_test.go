@@ -34,6 +34,9 @@ func TestProfileRoutesRequireSeparateCredentials(t *testing.T) {
 	if w := request("GET", "/v1/profiles", "", "", nil); w.Code != 200 || !strings.Contains(w.Body.String(), "instanceId") {
 		t.Fatal(w.Code, w.Body.String())
 	}
+	if w := request("GET", "/v1/profiles", "", "", nil); !strings.Contains(w.Body.String(), `"envelopeVersions":[1,2]`) || !strings.Contains(w.Body.String(), `"minimumWriteEnvelopeVersion":2`) {
+		t.Fatal("missing v2 capability", w.Body.String())
+	}
 	if w := request("POST", "/v1/profiles/alice", "Profile "+key, key, body); w.Code != 403 {
 		t.Fatal("unauthorized enrollment", w.Code)
 	}
@@ -62,5 +65,15 @@ func TestProfileRoutesRequireSeparateCredentials(t *testing.T) {
 	}
 	if w := request("GET", "/v1/profiles/bob", "Profile "+key, "", nil); w.Code != 403 {
 		t.Fatal("enumeration", w.Code)
+	}
+	v2 := []byte(`{"revision":1,"envelope":{"format":"tailterm-profile","version":2,"iv":"AAAAAAAAAAAAAAAA","ciphertext":"AAAAAAAAAAAAAAAAAAAAAA=="}}`)
+	if w := request("POST", "/v1/profiles/carol", "Bearer "+admin, key, v2); w.Code != http.StatusCreated {
+		t.Fatal("v2 create", w.Code, w.Body.String())
+	}
+	if w := request("PUT", "/v1/profiles/carol", "Profile "+key, "", body); w.Code != http.StatusConflict || !strings.Contains(w.Body.String(), "downgrade") {
+		t.Fatal("v2 downgrade", w.Code, w.Body.String())
+	}
+	if w := request("GET", "/v1/profiles/carol", "Profile "+key, "", nil); w.Code != http.StatusOK || !strings.Contains(w.Body.String(), `"revision":1`) || !strings.Contains(w.Body.String(), `"version":2`) {
+		t.Fatal("downgrade mutated profile", w.Code, w.Body.String())
 	}
 }

@@ -585,7 +585,7 @@ func selfPath() string {
 func cmdSpawn(e env, args []string) error {
 	fs := flag.NewFlagSet("spawn", flag.ExitOnError)
 	name := fs.String("name", "", "agent name (required)")
-	agentID := fs.String("agent-id", "", "stable agent identity for database_handler launch/retry")
+	agentID := fs.String("agent-id", "", "stable preallocated agent identity for launch/retry")
 	expectedRunID := fs.String("expected-run-id", "", "exited database_handler run to restart")
 	workItemTask := fs.String("work-item-task", "", "project owning the bound bug or feature (default: --task)")
 	workItemID := fs.String("work-item", "", "single bug or feature bound to this new session")
@@ -607,7 +607,10 @@ func cmdSpawn(e env, args []string) error {
 	prompt := fs.String("prompt", "", "appended to the command as a quoted argument")
 	runtime := fs.String("runtime", "", "runtime label (default: first word of --run)")
 	model := fs.String("model", "", "model name or alias (default: runtime configuration)")
+	reasoning := fs.String("reasoning", "", "reasoning effort (default: model/runtime configuration)")
 	permissionMode := fs.String("permission-mode", "", "permission preset (default: host settings)")
+	approvalMode := fs.String("approval-mode", "", "Codex approval policy (default: host setting)")
+	sandboxMode := fs.String("sandbox-mode", "", "Codex sandbox mode (default: host setting)")
 	allowedJSON := fs.String("allowed-tools-json", "[]", "Claude preapproved tool rules as JSON")
 	task := fs.String("task", e.task, "task id")
 	hub := fs.String("hub", e.hub, "hub URL")
@@ -625,8 +628,11 @@ func cmdSpawn(e env, args []string) error {
 	if *role == api.AgentRoleDatabaseHandler && !api.ValidID(*agentID, "agt") {
 		return errors.New("database_handler requires a stable --agent-id")
 	}
-	if *role == "" && (*agentID != "" || *expectedRunID != "") {
-		return errors.New("--agent-id and --expected-run-id are reserved for database_handler launches")
+	if *agentID != "" && !api.ValidID(*agentID, "agt") {
+		return errors.New("invalid --agent-id")
+	}
+	if *role == "" && *expectedRunID != "" {
+		return errors.New("--expected-run-id is reserved for database_handler launches")
 	}
 	if *plannedTeamMembers < 0 || *plannedTeamMembers > 32 {
 		return errors.New("planned team members must be from 1 to 32 when set")
@@ -676,13 +682,22 @@ func cmdSpawn(e env, args []string) error {
 		return errors.New("item context restoration requires a supported agent runtime")
 	}
 	// Helpers inherit an explicit policy only when using the same app.
-	explicitMode, explicitTools := false, false
+	explicitMode, explicitTools, explicitReasoning, explicitApproval, explicitSandbox := false, false, false, false, false
 	fs.Visit(func(f *flag.Flag) {
 		if f.Name == "permission-mode" {
 			explicitMode = true
 		}
 		if f.Name == "allowed-tools-json" {
 			explicitTools = true
+		}
+		if f.Name == "reasoning" {
+			explicitReasoning = true
+		}
+		if f.Name == "approval-mode" {
+			explicitApproval = true
+		}
+		if f.Name == "sandbox-mode" {
+			explicitSandbox = true
 		}
 	})
 	if e.agent != "" && os.Getenv("TAILTERM_PERMISSION_RUNTIME") == *runtime {
@@ -691,6 +706,15 @@ func cmdSpawn(e env, args []string) error {
 		}
 		if !explicitTools && os.Getenv("TAILTERM_ALLOWED_TOOLS") != "" {
 			*allowedJSON = os.Getenv("TAILTERM_ALLOWED_TOOLS")
+		}
+		if !explicitReasoning {
+			*reasoning = os.Getenv("TAILTERM_REASONING")
+		}
+		if !explicitApproval {
+			*approvalMode = os.Getenv("TAILTERM_APPROVAL_MODE")
+		}
+		if !explicitSandbox {
+			*sandboxMode = os.Getenv("TAILTERM_SANDBOX_MODE")
 		}
 	}
 	if *cwd == "" && e.agent != "" {
@@ -710,15 +734,19 @@ func cmdSpawn(e env, args []string) error {
 	if err != nil {
 		return err
 	}
+	baseCommand, err = reasoningCommand(baseCommand, *runtime, *model, *reasoning)
+	if err != nil {
+		return err
+	}
 	var allowed []string
 	if err := json.Unmarshal([]byte(*allowedJSON), &allowed); err != nil {
 		return errors.New("invalid allowed tools JSON")
 	}
-	baseCommand, err = permissionCommand(baseCommand, *runtime, *permissionMode, *cwd, allowed)
+	baseCommand, err = permissionCommand(baseCommand, *runtime, *permissionMode, *cwd, allowed, *approvalMode, *sandboxMode)
 	if err != nil {
 		return err
 	}
-	if *permissionMode == "workspace-auto" {
+	if *permissionMode == "workspace-auto" || *sandboxMode == "workspace-write" {
 		if err := os.MkdirAll(relayDir(), 0700); err != nil {
 			return err
 		}
@@ -746,6 +774,12 @@ func cmdSpawn(e env, args []string) error {
 	briefing := agentTaskBriefingForLaunch(detail.Task, *name, *role, detail.Agents, *plannedTeamMembers)
 	if *permissionMode != "" {
 		briefing += "\nRequested launch permission mode: " + *permissionMode + ". Permission denials are real failures, not approvals. Do not repeat an unchanged denied action. Report a precise Permission blocked status to the orchestrator and continue independent permitted work."
+	}
+	if *reasoning != "" {
+		briefing += "\nRequested reasoning effort: " + *reasoning + "."
+	}
+	if *approvalMode != "" || *sandboxMode != "" {
+		briefing += "\nRequested Codex approval/sandbox intent: approval=" + or(*approvalMode, "inherit") + ", sandbox=" + or(*sandboxMode, "inherit") + ". Permission denials are real failures, not approvals."
 	}
 	if *prompt != "" {
 		briefing += "\nAssignment: " + *prompt
@@ -788,6 +822,7 @@ func cmdSpawn(e env, args []string) error {
 		Session: session, Cwd: *cwd, Command: command, Self: selfPath(),
 		Env: map[string]string{
 			"TAILTERM_PERMISSION_RUNTIME": *runtime, "TAILTERM_PERMISSION_MODE": *permissionMode, "TAILTERM_ALLOWED_TOOLS": *allowedJSON, "TAILTERM_LAUNCH_CWD": *cwd,
+			"TAILTERM_REASONING": *reasoning, "TAILTERM_APPROVAL_MODE": *approvalMode, "TAILTERM_SANDBOX_MODE": *sandboxMode,
 			"TAILTERM_TOKEN": e.token, spawn.EnvHub: *hub, spawn.EnvTask: *task,
 			"TAILTERM_HANDLER_COMMAND": baseCommand, "TAILTERM_HANDLER_PROMPT": *prompt, "TAILTERM_BRIEFING": briefing,
 		},

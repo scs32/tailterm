@@ -3,8 +3,10 @@ import assert from "node:assert/strict";
 import { createHubClient } from "../client/hub-client.js";
 import { MODES } from "../client/modes.js";
 
-test("Queue follows Features while Files remains hidden", () => {
+test("Agents sits between Projects and Teams; Queue follows Features while Files remains hidden", () => {
   const ids = MODES.map(([id]) => id);
+  assert.equal(ids.at(ids.indexOf("tasks") + 1), "agents");
+  assert.equal(ids.at(ids.indexOf("agents") + 1), "teams");
   assert.equal(ids.at(ids.indexOf("features") + 1), "queue");
   assert.equal(ids.includes("files"), false);
   assert.equal(new Set(MODES.map(([, , key]) => key)).size, MODES.length);

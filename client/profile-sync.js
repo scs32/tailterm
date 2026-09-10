@@ -79,7 +79,10 @@ export function createProfileSync(host, vault) {
     const info = await request(base, "/v1/profiles");
     if (
       info.service !== "tailterm-profiles" ||
-      info.version !== 1 ||
+      info.version !== 2 ||
+      !Array.isArray(info.envelopeVersions) ||
+      !info.envelopeVersions.includes(2) ||
+      info.minimumWriteEnvelopeVersion !== 2 ||
       !/^profilehub_[0-9a-f]{16}$/.test(info.instanceId)
     )
       throw new Error("Unsupported profile server.");

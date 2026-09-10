@@ -21,6 +21,7 @@ var ProfileName = regexp.MustCompile(`^[a-z0-9][a-z0-9._-]{0,63}$`)
 var ProfileKey = regexp.MustCompile(`^[0-9a-f]{64}$`)
 var ErrProfileAuth = errors.New("profile authentication failed")
 var ErrProfileConflict = errors.New("profile changed on another device")
+var ErrProfileDowngrade = errors.New("profile envelope downgrade rejected")
 
 type Profile struct {
 	Username  string          `json:"username"`
@@ -29,9 +30,9 @@ type Profile struct {
 	Envelope  json.RawMessage `json:"envelope"`
 }
 
-func validEnvelope(raw json.RawMessage) bool {
+func profileEnvelopeVersion(raw json.RawMessage) (int, bool) {
 	if len(raw) > MaxProfileBytes {
-		return false
+		return 0, false
 	}
 	var e struct {
 		Format     string `json:"format"`
@@ -39,12 +40,13 @@ func validEnvelope(raw json.RawMessage) bool {
 		IV         string `json:"iv"`
 		Ciphertext string `json:"ciphertext"`
 	}
-	if json.Unmarshal(raw, &e) != nil || e.Format != "tailterm-profile" || e.Version != 1 {
-		return false
+	if json.Unmarshal(raw, &e) != nil || e.Format != "tailterm-profile" || (e.Version != 1 && e.Version != 2) {
+		return 0, false
 	}
-	return validProfileBase64(e.IV, 12) && validProfileBase64(e.Ciphertext, 0)
+	return e.Version, validProfileBase64(e.IV, 12) && validProfileBase64(e.Ciphertext, 0)
 }
-func profileHash(key string) string { h := sha256.Sum256([]byte(key)); return hex.EncodeToString(h[:]) }
+func validEnvelope(raw json.RawMessage) bool { _, ok := profileEnvelopeVersion(raw); return ok }
+func profileHash(key string) string          { h := sha256.Sum256([]byte(key)); return hex.EncodeToString(h[:]) }
 func (s *Store) ProfileServiceID(ctx context.Context) (string, error) {
 	var id string
 	err := s.db.QueryRowContext(ctx, `SELECT value FROM profile_meta WHERE key='instance'`).Scan(&id)
@@ -92,7 +94,8 @@ func (s *Store) CreateProfile(ctx context.Context, username, key string, envelop
 	return Profile{Username: username, Revision: 1, UpdatedAt: now, Envelope: envelope}, err
 }
 func (s *Store) WriteProfile(ctx context.Context, username, key string, revision int64, envelope json.RawMessage) (Profile, error) {
-	if revision < 1 || !validEnvelope(envelope) {
+	incomingVersion, valid := profileEnvelopeVersion(envelope)
+	if revision < 1 || !valid {
 		return Profile{}, api.ErrInvalid
 	}
 	s.writeMu.Lock()
@@ -103,6 +106,13 @@ func (s *Store) WriteProfile(ctx context.Context, username, key string, revision
 	}
 	if previous.Revision != revision {
 		return Profile{}, ErrProfileConflict
+	}
+	previousVersion, valid := profileEnvelopeVersion(previous.Envelope)
+	if !valid {
+		return Profile{}, api.ErrInvalid
+	}
+	if incomingVersion < previousVersion {
+		return Profile{}, ErrProfileDowngrade
 	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {

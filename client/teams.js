@@ -1,5 +1,10 @@
 import { AGENT_NAME_RE } from "./task-ref.js";
 import { agentSpawnCommand } from "../shared/tmux-command.js";
+import {
+  migrateAgentData,
+  normalizeReferencedTeam,
+  resolveTeamMember,
+} from "./agents.js";
 export const MAX_TEAM_MEMBERS = 32;
 export function itemScopedAgentName(name, itemId) {
   if (!AGENT_NAME_RE.test(name) || !/^wi_[0-9a-f]{16}$/.test(itemId))
@@ -11,7 +16,7 @@ export function itemScopedAgentName(name, itemId) {
     hash = Math.imul(hash ^ char.codePointAt(0), 16777619) >>> 0;
   return `${name.slice(0, 46)}-${hash.toString(16).padStart(8, "0")}-${suffix}`;
 }
-export function normalizeTeam(value) {
+function normalizeLegacyTeam(value) {
   if (
     !value ||
     typeof value.name !== "string" ||
@@ -115,22 +120,29 @@ export function normalizeTeam(value) {
     members,
   };
 }
-export function savedTeams(data) {
-  const input = Array.isArray(data.teams)
-    ? data.teams
-    : (data.launchProfiles || []).map((p) => ({
-        id: "legacy-" + p.name,
-        name: p.name,
-        members: [{ ...p, role: "", prompt: "" }],
-      }));
-  const result = [];
-  for (const value of input.slice(0, 30)) {
-    try {
-      const team = normalizeTeam(value);
-      if (!result.some((t) => t.id === team.id)) result.push(team);
-    } catch {}
+export function normalizeTeam(value, catalog) {
+  const definitions = Array.isArray(catalog) ? catalog : catalog?.definitions;
+  if (value?.members?.every((member) => member?.agentDefinitionId)) {
+    if (!definitions)
+      throw new Error("Choose an Agents catalog for this team.");
+    return normalizeReferencedTeam(value, definitions);
   }
-  return result;
+  return normalizeLegacyTeam(value);
+}
+export function savedTeams(data) {
+  return migrateAgentData(data).teams;
+}
+export function resolveTeam(team, catalog) {
+  const definitions = Array.isArray(catalog) ? catalog : catalog?.definitions;
+  const normalized = normalizeTeam(team, definitions);
+  return definitions
+    ? {
+        ...normalized,
+        members: normalized.members.map((member) =>
+          resolveTeamMember(member, definitions),
+        ),
+      }
+    : normalized;
 }
 export function teamLaunches(
   team,
@@ -138,9 +150,14 @@ export function teamLaunches(
   mainServerId = servers[0]?.id,
   projectFolders,
   itemRouting = null,
+  catalog = null,
 ) {
-  const normalized = normalizeTeam(team);
-  const ordered = [...normalized.members].sort(
+  const definitions = Array.isArray(catalog) ? catalog : catalog?.definitions;
+  const normalized = normalizeTeam(team, definitions);
+  const resolvedMembers = definitions
+    ? normalized.members.map((member) => resolveTeamMember(member, definitions))
+    : normalized.members;
+  const ordered = [...resolvedMembers].sort(
     (a, b) =>
       Number(b.name === normalized.orchestrator) -
       Number(a.name === normalized.orchestrator),
@@ -184,15 +201,28 @@ export function teamLaunches(
     return {
       server,
       fields: {
-        ...member,
-        ...(itemRouting || {}),
         name: itemRouting
           ? itemScopedAgentName(member.name, itemRouting.workItemId)
           : member.name,
+        role: member.role,
+        serverId: member.serverId,
+        runtime: member.runtime,
+        model: member.model,
+        reasoning: member.reasoning || "",
+        approvalMode: member.approvalMode || "",
+        sandboxMode: member.sandboxMode || "",
+        permissionMode: member.permissionMode || "",
+        allowedTools: [...(member.allowedTools || [])],
+        run: member.run,
         cwd,
         prompt: [member.role && "Role: " + member.role, member.prompt]
           .filter(Boolean)
           .join("\n\n"),
+        ...(member.agentDefinitionId && {
+          agentDefinitionId: member.agentDefinitionId,
+          agentDefinitionRevision: member.agentDefinitionRevision,
+        }),
+        ...(itemRouting || {}),
       },
     };
   });

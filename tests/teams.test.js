@@ -6,6 +6,7 @@ import {
   savedTeams,
   teamLaunches,
 } from "../client/teams.js";
+import { migrateAgentData, resolveTeamMember } from "../client/agents.js";
 const member = {
   name: "planner",
   serverId: "host",
@@ -23,11 +24,16 @@ test("teams migrate old setups once and preserve explicit empty teams", () => {
     cwd: "/repo",
     model: "model-v2",
   };
-  const teams = savedTeams({ launchProfiles: [legacy] });
-  assert.equal(teams[0].members[0].model, "model-v2");
-  assert.equal(teams[0].members[0].cwd, "/repo");
+  const migrated = migrateAgentData({ launchProfiles: [legacy] });
+  const teams = migrated.teams;
+  const resolved = resolveTeamMember(
+    teams[0].members[0],
+    migrated.agentCatalog.definitions,
+  );
+  assert.equal(resolved.model, "model-v2");
+  assert.equal(resolved.cwd, "/repo");
   assert.deepEqual(savedTeams({ teams: [], launchProfiles: [legacy] }), []);
-  assert.deepEqual(savedTeams({ teams, launchProfiles: [legacy] }), teams);
+  assert.deepEqual(savedTeams(migrated), teams);
 });
 test("team validation rejects duplicate names, unsupported models and oversized combined instructions", () => {
   const make = (members) => normalizeTeam({ name: "Review", members });

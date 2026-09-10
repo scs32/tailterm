@@ -10,6 +10,7 @@ import (
 )
 
 var profileFixture = json.RawMessage(`{"format":"tailterm-profile","version":1,"iv":"AAAAAAAAAAAAAAAA","ciphertext":"AAAAAAAAAAAAAAAAAAAAAA=="}`)
+var profileFixtureV2 = json.RawMessage(`{"format":"tailterm-profile","version":2,"iv":"AAAAAAAAAAAAAAAA","ciphertext":"AAAAAAAAAAAAAAAAAAAAAA=="}`)
 
 func TestProfilesIsolationCASAndHistory(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "hub.sqlite")
@@ -74,5 +75,33 @@ func TestProfilesIsolationCASAndHistory(t *testing.T) {
 	p, err = s.ReadProfile(ctx, "alice", alice)
 	if err != nil || p.Revision != 13 {
 		t.Fatal("restart", p, err)
+	}
+}
+
+func TestProfileEnvelopeDowngradeIsAtomic(t *testing.T) {
+	s, err := Open(filepath.Join(t.TempDir(), "hub.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	ctx := context.Background()
+	key := strings.Repeat("a", 64)
+	profile, err := s.CreateProfile(ctx, "alice", key, profileFixtureV2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.WriteProfile(ctx, "alice", key, profile.Revision, profileFixture); !errors.Is(err, ErrProfileDowngrade) {
+		t.Fatalf("downgrade = %v", err)
+	}
+	current, err := s.ReadProfile(ctx, "alice", key)
+	if err != nil || current.Revision != profile.Revision || string(current.Envelope) != string(profileFixtureV2) {
+		t.Fatalf("mutated current: %#v %v", current, err)
+	}
+	var history int
+	if err := s.db.QueryRow(`SELECT count(*) FROM profile_history WHERE username='alice'`).Scan(&history); err != nil || history != 0 {
+		t.Fatalf("history = %d, %v", history, err)
+	}
+	if _, err := s.WriteProfile(ctx, "alice", key, profile.Revision+1, profileFixture); !errors.Is(err, ErrProfileConflict) {
+		t.Fatalf("CAS did not precede downgrade: %v", err)
 	}
 }

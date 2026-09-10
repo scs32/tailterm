@@ -60,14 +60,14 @@ import {createBoardView} from '/client/board-view.js';
 import {createTasksView} from '/client/tasks-view.js';
 import {createTeamsView} from '/client/teams-view.js';
 import {setupModes} from '/client/modes.js';
-let board, tasks, modes, teams;const data={hub:{url:location.origin},launchProfiles:[],teams:[],projectHandlerPlans:[]};
+let board, tasks, modes, teams;const baseAgent=(id,name,serverId,role)=>({id,revision:1,name,launchName:name,role,serverId,runtime:'codex',model:'gpt-5.3-codex',reasoning:'high',approvalMode:'on-request',sandboxMode:'workspace-write',permissionMode:'',allowedTools:[],run:'sleep 30',cwd:'',prompt:'Inspect the exact bounded assignment.'});const data={hub:{url:location.origin},launchProfiles:[],agentCatalog:{version:2,definitions:[baseAgent('agent_team_planner','team-planner','', 'Planner'),baseAgent('agent_team_reviewer','team-reviewer','secondary','Reviewer')]},teamsVersion:2,teams:[],teamLaunchPlans:[],projectHandlerPlans:[]};
 const servers=[{id:'local',name:'Test host',host:'stephens-macbook-air',username:'test',runtimes:['claude']},{id:'secondary',name:'Second host',host:'second-fixture',username:'test',runtimes:['codex']}];
 const model={groups:[],taskGroup:()=>null};
 const host={openSFTP:async server=>({done:new Promise(()=>{}),home:async()=>${JSON.stringify(root)},realpath:async p=>p,list:async p=>({path:p,entries:p===${JSON.stringify(root)}?[{name:'hub',isDir:true},{name:'ignored.txt',isDir:false}]:[]}),close(){}}),getIPN:()=>({fetch:(url,init)=>fetch(url,init)}),getData:()=>data,getServers:()=>servers,currentServer:()=>servers[0],currentTab:()=>null,getTabs:()=>[],paneGroups:()=>({model,sync(){}}),render(){},scheduleWorkspaceSave(){},bookmark(){},closeTab(){},connect:async()=>null,notice:t=>{document.querySelector('#notice').textContent=t},api:async(url,method,body)=>{if(url==="/teams")data.teams=[...data.teams.filter(t=>t.id!==body.id),body];if(url.startsWith("/teams/"))data.teams=data.teams.filter(t=>t.id!==url.slice(7));if(url==="/launch-profiles")data.launchProfiles=[...data.launchProfiles.filter(p=>p.name!==body.name),body];if(url==="/project-handler-plans"&&method==="POST")data.projectHandlerPlans=[...data.projectHandlerPlans.filter(p=>p.hub!==body.hub||p.taskId!==body.taskId),structuredClone(body)];return {sessions:[]}},reloadData:async()=>{},
  dialog:(title,body)=>{const d=document.querySelector('#dialog');if(d.open)d.close();d.innerHTML='<div class="dialog-head"><h2>'+title+'</h2><button id="dialog-close">×</button></div>'+body;d.querySelector('#dialog-close').onclick=()=>host.closeDialog();d.showModal()},
  closeDialog:()=>{const d=document.querySelector('#dialog');d.close();d.replaceChildren()},
  openBoard:id=>{modes.set('board');board.show(id)},
- browserCommand:async(server,command)=>{const r=await fetch('/exec',{method:'POST',body:JSON.stringify({command,serverId:server.id})});const d=await r.json();if(!r.ok)throw new Error(d.error);return d.output}
+ browserCommand:async(server,command)=>{const r=await fetch('/exec',{method:'POST',body:JSON.stringify({command,serverId:server.id})});const d=await r.json();if(!r.ok){const error=new Error(d.error);error.verifiedUnstarted=d.verifiedUnstarted===true;throw error}return d.output}
 };
 const hub=createTaskHub(host);hub.refresh();
 board=createBoardView({client:()=>hub.client(),getTabs:()=>[],activate(){},notice:host.notice,newTask:()=>hub.newTask(),addAgent:id=>hub.addAgent(id),attachTask(){},configure(){}});
@@ -117,9 +117,12 @@ const server = createServer(async (req, res) => {
       launchServers.push(serverId);
       launchCommands.push(command);
       if (failLaunch || execs === failAt) {
+        const verifiedUnstarted = !failLaunch && execs === failAt;
         failLaunch = false;
         res.writeHead(500, { "content-type": "application/json" });
-        res.end(JSON.stringify({ error: "Test launch failure" }));
+        res.end(
+          JSON.stringify({ error: "Test launch failure", verifiedUnstarted }),
+        );
         return;
       }
       // Point the SSH-generated command at the isolated hub listener.
@@ -374,10 +377,9 @@ try {
       const controls = await page
         .locator("#task-agent-fields")
         .evaluate((el) =>
-          [...el.querySelectorAll("input,select")].map((e) => [
-            e.id,
-            e.getBoundingClientRect().height,
-          ]),
+          [...el.querySelectorAll("input:not([type=hidden]),select")].map(
+            (e) => [e.id, e.getBoundingClientRect().height],
+          ),
         );
       assert.ok(
         controls.every(([, height]) => height === 36),
@@ -450,29 +452,12 @@ try {
       await page.locator("#teams-new").click();
       await page.locator("#team-name").fill("Review team");
       await page.locator("#team-swarm").check();
-      await page.locator("[data-field=name]").fill("team-planner");
-      await page.locator(".agent-controls > summary").click();
-      await page
-        .locator("[data-field=permissionMode]")
-        .selectOption("on-request");
       await page.locator("[data-field=role]").fill("Planner");
-      await page.locator("#team-model-choice").selectOption("__custom");
-      await page.locator("[data-field=model]").fill("fixture-model");
-      await page
-        .locator("[data-field=prompt]")
-        .fill("Inspect the task objective.");
-      await page
-        .locator("#team-member-editor > details:not(.agent-controls) > summary")
-        .click();
-      await page.locator("[data-field=run]").fill("sleep 30");
       await page.locator("#team-add-member").click();
-      await page.locator("[data-field=name]").fill("team-reviewer");
-      await page.locator("[data-field=role]").fill("Reviewer");
-      await page.locator('[data-field="serverId"]').selectOption("secondary");
       await page
-        .locator("#team-member-editor > details:not(.agent-controls) > summary")
-        .click();
-      await page.locator("[data-field=run]").fill("sleep 30");
+        .locator('[data-field="agentDefinitionId"]')
+        .selectOption("agent_team_reviewer");
+      await page.locator("[data-field=role]").fill("Reviewer");
       await page.locator("#team-form button[type=submit]").click();
       await page.locator("#dialog").waitFor({ state: "hidden" });
       assert.equal(await page.locator(".team-row").count(), 1);
@@ -521,8 +506,9 @@ try {
       );
       assert.equal(detail.task.swarm, true);
       assert.equal(detail.task.orchestrator, "team-planner");
-      assert.match(launchCommands.at(-3), /--permission-mode/);
-      assert.match(launchCommands.at(-3), /on-request/);
+      assert.match(launchCommands.at(-3), /--approval-mode/);
+      assert.match(launchCommands.at(-3), /--sandbox-mode/);
+      assert.match(launchCommands.at(-3), /--reasoning/);
       const plannerLaunch = launchCommands
         .slice(launchStart)
         .find((command) => command.includes("team-planner"));

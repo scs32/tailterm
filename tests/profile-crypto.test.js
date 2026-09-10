@@ -23,8 +23,17 @@ test("profile encryption is portable, authenticated, and separate from authentic
     sessions: [],
   };
   const envelope = await a.seal(payload);
+  assert.equal(envelope.version, 2);
   assert.ok(!JSON.stringify(envelope).includes("private secret"));
   assert.deepEqual(await b.open(envelope), payload);
+  const legacy = await a.seal(payload, 1);
+  assert.equal(legacy.version, 1);
+  assert.deepEqual(await b.open(legacy), payload);
+  assert.equal(
+    a.token,
+    b.token,
+    "profile authentication derivation must not change with envelope version",
+  );
   const otherHub = await profileKeys(
     master,
     "alice",
