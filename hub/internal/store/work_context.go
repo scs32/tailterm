@@ -14,7 +14,7 @@ import (
 
 // Keep the complete prepared bundle and generated launch prompt bounded.
 // Nothing is truncated; launching oversized immutable histories is unsupported.
-const maxAgentWorkItemContextBytes = 128 * 1024
+const maxAgentWorkItemContextBytes = api.MaxAgentWorkItemContextBytes
 
 // preparedContextEnvelope is the narrow integration boundary for the accepted
 // immutable history reader. Its history payload is owned by that reader; routing

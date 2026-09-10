@@ -41,13 +41,29 @@ func (c *Client) do(ctx context.Context, method, path string, body, out any) err
 }
 
 func (c *Client) doLimited(ctx context.Context, method, path string, body, out any, maxResponse int64) error {
+	return c.doLimitedJSON(ctx, method, path, body, out, maxResponse, true)
+}
+
+func (c *Client) doLimitedJSON(ctx context.Context, method, path string, body, out any, maxResponse int64, escapeHTML bool) error {
 	var buf io.Reader
 	if body != nil {
-		b, err := json.Marshal(body)
-		if err != nil {
-			return err
+		var data []byte
+		if escapeHTML {
+			var err error
+			data, err = json.Marshal(body)
+			if err != nil {
+				return err
+			}
+		} else {
+			var encoded bytes.Buffer
+			encoder := json.NewEncoder(&encoded)
+			encoder.SetEscapeHTML(false)
+			if err := encoder.Encode(body); err != nil {
+				return err
+			}
+			data = bytes.TrimSuffix(encoded.Bytes(), []byte("\n"))
 		}
-		buf = bytes.NewReader(b)
+		buf = bytes.NewReader(data)
 	}
 	req, err := http.NewRequestWithContext(ctx, method, c.Base+path, buf)
 	if err != nil {
@@ -115,7 +131,9 @@ func (c *Client) CloseTask(ctx context.Context, id string) (Task, error) {
 
 func (c *Client) AddAgent(ctx context.Context, task string, req AddAgentRequest) (Agent, error) {
 	var out Agent
-	return out, c.do(ctx, "POST", "/v1/tasks/"+task+"/agents", req, &out)
+	// Preserve the prepared context's byte bound instead of expanding raw JSON
+	// with HTML-safe escapes inside the registration envelope.
+	return out, c.doLimitedJSON(ctx, "POST", "/v1/tasks/"+task+"/agents", req, &out, 4<<20, false)
 }
 
 func (c *Client) GetAgent(ctx context.Context, task, agent string) (Agent, error) {

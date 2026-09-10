@@ -134,7 +134,11 @@ func fail(w http.ResponseWriter, err error) {
 }
 
 func decode(w http.ResponseWriter, r *http.Request, v any) bool {
-	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, api.MaxBody))
+	return decodeLimited(w, r, v, api.MaxBody)
+}
+
+func decodeLimited(w http.ResponseWriter, r *http.Request, v any, maxBytes int64) bool {
+	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxBytes))
 	if err != nil {
 		writeError(w, http.StatusRequestEntityTooLarge, "body too large")
 		return false
@@ -273,7 +277,7 @@ func (s *Server) addAgent(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req api.AddAgentRequest
-	if !decode(w, r, &req) {
+	if !decodeLimited(w, r, &req, api.MaxAgentRegistrationBody) {
 		return
 	}
 	a, err := s.store.AddAgent(r.Context(), id, req, c)

@@ -19,8 +19,14 @@ const (
 	MaxTasks         = 200
 	MaxEventsPerTask = 10000
 	MaxBody          = 64 * 1024
-	MaxWait          = 30 * time.Second
-	MaxLimit         = 200
+	// Agent registration embeds a complete prepared work-item context. The
+	// context remains independently limited to 128 KiB after JSON decoding.
+	MaxAgentWorkItemContextBytes = 128 * 1024
+	// Go's JSON encoder can expand each raw context byte to a six-byte HTML-safe
+	// escape. The extra 16 KiB covers the other validated registration fields.
+	MaxAgentRegistrationBody = 6*MaxAgentWorkItemContextBytes + 16*1024
+	MaxWait                  = 30 * time.Second
+	MaxLimit                 = 200
 )
 
 var nameRE = regexp.MustCompile(`^[a-zA-Z0-9_-]{1,64}$`)
