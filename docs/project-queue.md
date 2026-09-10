@@ -59,7 +59,7 @@ The supplied review-only fixtures remained in `/tmp`; they were not copied into
 the product or used as live data. Permanent negative/positive Go and
 Chromium/WebKit regressions cover the corrected behavior below.
 
-The corrected application/source candidate is exact commit
+The first corrected application/source candidate was exact commit
 `f1605a2db0ce7d5d8e09399b10c741d24c709257`, tree
 `5116f40916425aef43ad517dd6a28c1e4771749d`. Its complete 36-file
 `+5143/-49` binary diff from baseline
@@ -68,8 +68,37 @@ The corrected application/source candidate is exact commit
 The four-file `+670/-86` correction diff from rejected candidate `0c26e69…` has
 SHA-256
 `c1372844ec7e7eed078cc58dd08f795007158bc837b9db788ccfb54c9eed6059`.
-The following report-only commit records this identity and does not change the
-tested application tree.
+Report-only commit `d7ac78e4a931ffb0778a25b022b4d0666339278f` recorded that
+identity without changing its tested application tree.
+
+Lead message `1685` rejected that first correction after two further isolated
+findings. Before the second correction, the supplied complete review command
+failed because an enqueue notice could be used as a bounded order and an exact
+resumed recipient run could not recover an unavailable notice. This same
+item/run corrected both findings:
+
+- claim now requires a current audited Work message with the exact primary item
+  revision and rejects typed system notices plus dispatch provenance even when
+  an older binary left its enqueue message untyped; cross-project admission
+  independently revalidates that retained order before an agent row can commit;
+- explicit recipient reconciliation recovers one outstanding unavailable
+  semantic notice as the next recipient generation of its original Queue event.
+  The unavailable generation remains immutable, while the reconciliation action
+  has its own distinct Queue event and keyed receipt. The same now-deliverable
+  exact run and an explicitly selected replacement run are supported; a still
+  retired run or an event already recovered is rejected.
+
+The final second-correction application/source candidate is exact commit
+`895b859960a1c771ea05ea23e5b41428ba9f26d2`, tree
+`cfbdd34051102b579fd3434a962d32f4c20bc5ff`. Its complete 36-file
+`+5399/-49` binary diff from baseline
+`0d3ecf7e20462a585a305ea85f64571f1ec5f10c` has SHA-256
+`807d3514cf140e09e00d3e3115227e53113b5026b2b49b49799ae8d83532dfc5`.
+The three-file `+197/-15` second-correction diff from report commit
+`d7ac78e4a931ffb0778a25b022b4d0666339278f` has SHA-256
+`3c3f5142547771f9389ad277271d2bd8216b05bcb5ac190feaffe56300bec225`.
+The following report-only commit records this final identity and does not change
+the tested application tree.
 
 ## Delivered contract
 
@@ -137,6 +166,14 @@ separately retained exact bounded work-order message. Claim races are serialized
 by SQLite plus entry CAS, so one winner is recorded and losing requests cannot
 cause worker effects.
 
+An enqueue/dispatch message is never a bounded order. Claim validates the
+message's current audited Work classification and exact primary link, rejects
+all typed system notices, and separately rejects the retained dispatch row so an
+untyped older-binary enqueue cannot bypass the rule. Cross-project admission
+repeats this validation against the claim's pinned order before persisting the
+worker or binding. The complete separately prepared context must still contain
+that exact valid order.
+
 Human actions remain explicit. Agent Queue access requires the task's exact active
 database-handler role and run. The selected claimant must be that receiving
 project's actual current ordinary orchestrator. Ordinary workers cannot read or
@@ -171,7 +208,11 @@ and use a bounded semantic dedup identity. Automated notices never pretend to be
 human and never trigger the human continuation/resume path. An unavailable,
 retired, replaced, or mismatched recipient is recorded as pending/unavailable;
 explicit recipient reconciliation creates a retained new generation. Reads and
-delivery do not create Queue events or acknowledgement loops.
+delivery do not create Queue events or acknowledgement loops. Reconciliation
+records its own action event/receipt, but the recovered notice remains linked to
+the original unavailable semantic event with incremented recipient generation
+and original causal author. Exact replay, including after store restart, returns
+that frozen recovery receipt without another message or generation.
 
 Inbox filtering has one narrow exception: a typed Queue notice may reach the
 actual project orchestrator even when it is item-bound. It does not widen ordinary
@@ -256,7 +297,7 @@ Passed on the final candidate:
 - `go test ./internal/store ./internal/server ./internal/api`
 - `go test ./internal/server -run 'TestCapabilitiesAndAuditExportHTTP|TestQueue' -count=1 -v`
 - `go test ./internal/store -run 'TestAuditExport|TestQueue' -count=1 -v`
-- `go test -overlay=/tmp/tailterm-queue-review-overlay.json ./internal/store -run '^TestReviewQueueSystemNoticeIsNotHumanSelection$' -count=1`
+- `go test -overlay=/tmp/tailterm-queue-review-overlay.json ./internal/store -run '^TestReviewQueue' -count=1`
 - `go test ./cmd/tt -run 'TestQueue' -count=1 -v`
 - `go test -race ./internal/store ./internal/server ./internal/api`
   (`internal/store` completed in 61.557 seconds, server in 23.605 seconds, and API
@@ -295,6 +336,15 @@ and replaced notice recipients, narrow bound-orchestrator delivery, restart dedu
 no acknowledgement loop, legacy migration/adoption/late writes, frozen lists and
 history, incremental checkpoints, response-size bounds, and absence of private
 context in Queue entries.
+
+Work-order authority coverage includes a positive separately bounded exact order,
+negative typed Queue and untyped legacy-dispatch enqueue references, and
+admission-time revalidation proving an invalid retained order cannot commit a
+cross-project worker. Recipient coverage includes same-run explicit recovery,
+replacement-run reconciliation, immutable unavailable generation history,
+separate semantic versus reconciliation event identity, still-retired rejection,
+new-key duplicate rejection, exact replay after store restart, and no read-driven
+acknowledgement loop.
 
 Authority coverage explicitly rejects a typed Queue notice as the handler's
 selection while retaining positive genuine-human and exact current-orchestrator
