@@ -1,0 +1,183 @@
+{
+  "status": "builder_release_verified_pending_lead_acceptance_and_report_pin",
+  "recordedAt": "2026-09-10T04:00:00Z",
+  "workItem": {
+    "id": "wi_0535c67103994980",
+    "workOrderRevision": 5,
+    "currentRevision": 6,
+    "workOrderMessage": 1235,
+    "contractMessage": 1229,
+    "candidateAcceptanceMessage": 1352,
+    "releaseAssignmentMessage": 1378,
+    "auditLinkScopeAmendmentMessage": 1395
+  },
+  "source": {
+    "releaseBase": "9f700e90e6f76ca111d6eafad0e7d7cc41e2e3b8",
+    "acceptedCandidate": "c9024893dfe7510d6c80859887d833844911b3fa",
+    "integratedApplicationCommit": "4cb6e6c6a28cf5d4b94e0f8a572be0eec62ae16a",
+    "integration": "Conflict-free rebase preserving lifecycle close semantics, work-item scroll/native-select hooks and the dropdown dialog implementation.",
+    "retainedCleanSource": "/Users/stephenspeicher/projects/tailterm/.build/releases/narrative-history-4cb6e6c",
+    "cleanSource": true,
+    "implementationReport": "docs/narrative-history.md"
+  },
+  "package": {
+    "commit": "4cb6e6c6a28cf5d4b94e0f8a572be0eec62ae16a",
+    "manifestEntries": 82,
+    "servedAssetsPerOrigin": 81,
+    "releaseSha256": "a90d44e82dabd0ecbb7514468fd19c18195cdb001f61a8cb5b4fefaec5f8baa1",
+    "verifyResult": "82/82 manifest entries passed from clean detached source",
+    "productionWasmBuild": "Pinned production build without tailserve_test tag",
+    "assets": {
+      "mainScript": {
+        "path": "assets/index-D0DTVFVO.js",
+        "size": 822751,
+        "sha256": "0e4e39c279c9bc31a0b19c195f4acc8a4ddb0befa0c7bb79910d2ed4e414a354"
+      },
+      "stylesheet": {
+        "path": "assets/index-Ck2a0xYT.css",
+        "size": 96605,
+        "sha256": "109c57856f3279a9210d2dbee8d9c5079ec774e7a67142be8a797ef696c3fd3a"
+      },
+      "productionWasmGzip": {
+        "path": "assets/tailserve-dLtbYZ-Y.wasm.gz",
+        "size": 8598268,
+        "sha256": "7dd988b0bd79a1a28088d3d66f5371a32dcb3db8e9583ebc05ca21719402349d"
+      }
+    }
+  },
+  "frontend": {
+    "cloudflareProject": "tailos",
+    "deploymentId": "fa7bd9ec-545d-4f07-aefe-4f574d568e9f",
+    "immutableOrigin": "https://fa7bd9ec.tailos.pages.dev",
+    "customOrigin": "https://tailos.tailarr.com",
+    "miniOrigin": "http://127.0.0.1:4318",
+    "miniPreviewPid": 60799,
+    "miniPreviewPpid": 1,
+    "miniPreviewRestarted": false,
+    "assetVerification": "81/81 served assets on immutable TailOS, custom TailOS and Mini match size/SHA-256, have non-empty appropriate MIME and no unexpected Content-Encoding.",
+    "browserVerification": "Fresh Chromium on all three origins started production WASM, generated and restored an isolated synthetic vault/key, retained matching margins and reported no page errors."
+  },
+  "hub": {
+    "state": "RUNNING",
+    "origin": "http://100.116.238.37:18765",
+    "release": "20260909-narrative-history-4cb6e6c",
+    "binary": "/mnt/deepfreeze/tailterm-hub/releases/20260909-narrative-history-4cb6e6c/tailterm-hub",
+    "binarySha256": "49591cd6083a590c0afca68c05f50ba416c1e98f01ae006e92bb341e956b5475",
+    "listener": "100.116.238.37:18765:18765",
+    "containers": 1,
+    "integrity": "ok",
+    "foreignKeyViolations": 0,
+    "narrativeTables": 12,
+    "unauthenticatedWhoami": 403,
+    "authenticatedDoctor": "passed",
+    "deployment": "Source-inspected scripts/deploy-truenas-hub.py with explicit unique release name and --update through TrueNAS middleware. Existing state/token mounts and TCP listener were preserved."
+  },
+  "backup": {
+    "path": "/mnt/deepfreeze/tailterm-hub/backups/before-narrative-history-20260910T034609Z.sqlite",
+    "method": "SQLite online backup API before middleware update",
+    "mode": "0600",
+    "size": 9367552,
+    "sha256": "e82c421c38229a21e74c2a44d4e97d8a941a20b08ee54df3c3df280a3c3f5113",
+    "integrity": "ok",
+    "foreignKeyViolations": 0
+  },
+  "cli": {
+    "darwinArm64Sha256": "a2a640d18e3d3014bcd8afdafbaf1f8994c5fbaf4623ea168014aeba7f68b49a",
+    "linuxAmd64Sha256": "1331a98ec1c3eec1f572c27c33c431a58e3f78319efb9cdd90be2a806ad26842",
+    "linuxArm64Sha256": "649cf4ff07944f74f640b402f546804f1db41ed47eef91b7ed1573bf8ca11bdc",
+    "hosts": [
+      {
+        "host": "Stephens-Mini",
+        "installed": "/Users/stephenspeicher/.local/bin/tt",
+        "installedSha256": "a2a640d18e3d3014bcd8afdafbaf1f8994c5fbaf4623ea168014aeba7f68b49a",
+        "rollback": "/Users/stephenspeicher/.local/bin/tt-before-narrative-history-4cb6e6c",
+        "rollbackSha256": "6ad14fa7e8562b782faf2632e878f2371c5f66c69b70610ec93884fb37c6ed29",
+        "doctor": "passed",
+        "relayPidBefore": 83457,
+        "relayPidAfter": 83457,
+        "relayRestarted": false
+      },
+      {
+        "host": "theAir",
+        "installed": "/Users/stephenspeicher/.local/bin/tt",
+        "installedSha256": "a2a640d18e3d3014bcd8afdafbaf1f8994c5fbaf4623ea168014aeba7f68b49a",
+        "rollback": "/Users/stephenspeicher/.local/bin/tt-before-narrative-history-4cb6e6c",
+        "rollbackSha256": "6ad14fa7e8562b782faf2632e878f2371c5f66c69b70610ec93884fb37c6ed29",
+        "doctor": "passed",
+        "relayPidBefore": 912,
+        "relayPidAfter": 912,
+        "relayRestarted": false
+      }
+    ]
+  },
+  "actualAuditDiscovery": {
+    "handlerRequestMessage": 1389,
+    "handlerInitialResultMessage": 1390,
+    "linkRequestMessage": 1391,
+    "scopeAmendmentMessage": 1395,
+    "handlerVerificationMessage": 1397,
+    "status": "verified",
+    "auditItem": "wi_630de1aee298c3c7",
+    "auditRevision": 3,
+    "auditStatus": "done",
+    "auditDescriptionSha256": "fafb92ead2477307abf7c6c00cb3f04460da78dca04b9352ac569ba748a78a4f",
+    "source606TextSha256": "59d19f44d53143612dc5a98d8ac014cb871de5429cf75b4a801005c15427cdf3",
+    "initialTruthfulGap": "Before explicit linkage, source606 was retained but not item-linked or discoverable in the audit narrative timeline.",
+    "link": {
+      "requestId": "source-606-audit-link-1",
+      "linkId": "nlnk_d6a962ac7361eb16",
+      "revision": 1,
+      "narrativeSequence": 1,
+      "relationship": "final-report-source",
+      "receiptId": "nrr_3bf6fcc960fdb262",
+      "sourceTime": "2026-09-09T14:51:09.846666727Z",
+      "verificationArtifact": "/tmp/tailterm-audit606-link-verification-1395.json",
+      "verificationArtifactSha256": "3ea5c87b5e73075687c09754809d759195742adf5b19e723fb7fa88e25d87564"
+    },
+    "limits": "Only the exact retained native-message relationship was added after lead's saved scope amendment. Original message authorship/content and audit Done r3/scope r3 stayed unchanged; no report, artifact, coverage declaration, content import, inferred match or backfill was added."
+  },
+  "verification": {
+    "passed": [
+      "Focused narrative plus lifecycle closeout/cleanup/retirement store, server and CLI tests after integration",
+      "go vet on affected API, store, server and CLI packages",
+      "Chromium and WebKit isolated narrative reader acceptance",
+      "Chromium and WebKit integrated Bugs/Features active-scroll acceptance",
+      "Chromium and WebKit existing project work-item reader acceptance",
+      "Affected lifecycle JavaScript checks 6/6",
+      "82-entry clean static manifest verification",
+      "81/81 served assets, hashes, MIME and encoding on immutable TailOS, custom TailOS and Mini",
+      "Production Chromium WASM, isolated synthetic-vault restoration and layout on all three origins",
+      "Mini and Air CLI doctor with unchanged relay PIDs",
+      "Hub RUNNING with exact hash, additive schema, integrity OK and zero foreign-key violations"
+    ],
+    "acceptedCandidateEvidence": "Board messages 1319, 1343 and 1351 retain the broader isolated store/server/CLI/race/browser verification; lead message 1352 accepted it. Unchanged broad suites were not repeated after final integration per lead direction.",
+    "operationalNonpassesAndCorrections": [
+      "The first clean static build stopped before packaging because ignored production WASM was absent; the pinned production build script generated it without the test tag and the clean build then passed.",
+      "The first read-only TrueNAS preflight used macOS stat flags on Linux; it made no mutation and the corrected Linux form passed.",
+      "The first read-only midclt app.query used job mode and failed; it made no mutation and the corrected query confirmed the one RUNNING workload.",
+      "The first deployment-list JSON projection guessed lowercase field names and returned nulls; the unchanged result was re-read with its actual capitalized schema."
+    ],
+    "warnings": [
+      "npm ci reported three existing moderate audit findings and install-script approval notices; installation and all builds completed.",
+      "Vite reported its existing large-chunk advisory; the release build and manifest verification completed."
+    ]
+  },
+  "rollback": {
+    "frontendCommit": "9c7bb254a590c073e9a1f6901757dc7448a7478c",
+    "frontendDeployment": "https://45be5874.tailos.pages.dev",
+    "frontendPackage": "/Users/stephenspeicher/projects/tailterm/.build/releases/lifecycle-closeout-9c7bb25/dist-static",
+    "hubRelease": "20260909-lifecycle-closeout-1d9d75d",
+    "hubSha256": "f55018914dd7fa0b3eb454c452c1cae4749ce6b297ffddca3ce8e77c41d66d18",
+    "frontendProcedure": "Deploy the exact retained lifecycle package explicitly to Cloudflare project tailos and rsync it to Mini without restarting detached listener 60799.",
+    "hubProcedure": "Use TrueNAS middleware to point the app to the retained lifecycle binary while preserving additive current state. The online backup is disaster-recovery evidence only; restoring it loses later writes.",
+    "cliProcedure": "Atomically restore the per-host tt-before-narrative-history-4cb6e6c binaries without restarting relays."
+  },
+  "scopeExclusions": [
+    "remote crawling or private-source ingestion",
+    "AIV activation or a second editable work database",
+    "Tailscale or network changes",
+    "old tailterm site or Air preview changes",
+    "live tasks or profiles as test fixtures",
+    "relay restarts or unrelated session changes"
+  ]
+}

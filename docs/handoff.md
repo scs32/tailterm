@@ -1,5 +1,62 @@
 # Development handoff — September 9, 2026
 
+## September 9 feature narrative history — release verified pending final acceptance
+
+Application commit `4cb6e6c6a28cf5d4b94e0f8a572be0eec62ae16a` is deployed to
+`https://tailos.tailarr.com` (`https://fa7bd9ec.tailos.pages.dev`, deployment
+`fa7bd9ec-545d-4f07-aefe-4f574d568e9f`) and served by the preserved detached
+Mini preview PID 60799 / PPID 1 at `http://127.0.0.1:4318`. All three origins
+match the clean retained package's 81 public assets and release-manifest SHA-256
+`a90d44e82dabd0ecbb7514468fd19c18195cdb001f61a8cb5b4fefaec5f8baa1`.
+Fresh Chromium on every origin started production WASM, restored an isolated
+synthetic vault/key, retained matching layout margins and reported no page
+errors.
+
+The hub is RUNNING from named TrueNAS release
+`20260909-narrative-history-4cb6e6c`, exact Linux amd64 SHA-256
+`49591cd6083a590c0afca68c05f50ba416c1e98f01ae006e92bb341e956b5475`,
+using its existing state/token mounts and private TCP listener. All 12 additive
+narrative tables are present; database integrity and foreign keys pass.
+Pre-update online backup
+`/mnt/deepfreeze/tailterm-hub/backups/before-narrative-history-20260910T034609Z.sqlite`
+is mode 0600 and has SHA-256
+`e82c421c38229a21e74c2a44d4e97d8a941a20b08ee54df3c3df280a3c3f5113`.
+Mini and Air run matching Darwin arm64 `tt` SHA-256
+`a2a640d18e3d3014bcd8afdafbaf1f8994c5fbaf4623ea168014aeba7f68b49a`;
+both retained the previous binary and relay PIDs 83457 and 912 did not change.
+
+Features now store and query immutable artifact versions, explicit relationship
+events, attributed coverage claims and revisions, full structured reports,
+stable frozen pages and keyed transactional receipts. Both feature-Done update
+paths require a current complete report pin while historical Done records and
+bugs remain compatible. Each Features row exposes a safe reloadable **History &
+report** reader with latest corrections, the immutable completion pin, exact
+versions, source/reviser/ingester/verifier attribution, current versus retracted
+links and truthful capture/coverage gaps. External sources are deliberately
+submitted captures or references only; Tailterm does not crawl them, activate
+AIV or treat storage as proof of execution.
+
+The actual instruction audit remains Done r3 unchanged. Handler discovery first
+showed that retained original Board message 606 was not explicitly item-linked.
+After lead's saved scope amendment in message 1395, keyed link
+`nlnk_d6a962ac7361eb16` / receipt `nrr_3bf6fcc960fdb262` made only that exact
+native lead-authored source discoverable; no report, artifact, coverage claim,
+content import or inferred backfill was added. Its missing dedicated report and
+unknown PR/CI coverage remain visible.
+
+Feature `wi_0535c67103994980`, current revision 6 and bounded order #1235 are
+documented in [the complete implementation report](narrative-history.md) and
+[the release receipt](releases/tailos-2026-09-09-narrative-history.json). The
+clean exact source/package is retained at
+`.build/releases/narrative-history-4cb6e6c`. Immediate frontend rollback is the
+retained lifecycle package/application `9c7bb25` and deployment
+`https://45be5874.tailos.pages.dev`; hub rollback points middleware at the
+retained lifecycle binary while preserving additive state, and CLI rollback uses
+the per-host `tt-before-narrative-history-4cb6e6c` files without relay restarts.
+No Tailscale/network, old-site, Air-preview, unrelated service/session, live
+fixture or private-source change accompanied this release. Lead actual-release
+acceptance and handler exact report save/readback plus separate Done pin remain.
+
 ## September 9 per-agent lifecycle closeout — release verified pending final acceptance
 
 Application commit `9c7bb254a590c073e9a1f6901757dc7448a7478c` is deployed to
