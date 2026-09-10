@@ -39,6 +39,38 @@ No helper identity was created. No live work-item read or write was performed by
 this worker. No provider, production service, deployment, network, Tailscale,
 TrueNAS, relay, profile, or live vault was used or changed.
 
+### Independent review correction
+
+Lead message `1679` rejected source candidate
+`0c26e69cbfae105e41ebc21761e976ff2eed8876` after four isolated review
+findings. That commit is retained as provenance only and is not an accepted
+candidate. This same item/run corrected every finding:
+
+- typed Queue system notices can no longer be presented as a human selection;
+- actions capture their immutable connection and credential scope before any
+  delayed persistence or request, and view epochs prevent late list, history, or
+  mutation results from repainting a replacement connection/project;
+- every unresolved action has a distinct durable identity, so a later priority
+  or Pull cannot overwrite an older uncertain receipt/retry;
+- frozen Queue list ordering uses scalar event metadata and SQL `LIMIT`, so a
+  page never selects or deserializes every full description.
+
+The supplied review-only fixtures remained in `/tmp`; they were not copied into
+the product or used as live data. Permanent negative/positive Go and
+Chromium/WebKit regressions cover the corrected behavior below.
+
+The corrected application/source candidate is exact commit
+`f1605a2db0ce7d5d8e09399b10c741d24c709257`, tree
+`5116f40916425aef43ad517dd6a28c1e4771749d`. Its complete 36-file
+`+5143/-49` binary diff from baseline
+`0d3ecf7e20462a585a305ea85f64571f1ec5f10c` has SHA-256
+`ef385c14370eb96d028b57629f4639a11338240a527097c6227151289154adb3`.
+The four-file `+670/-86` correction diff from rejected candidate `0c26e69…` has
+SHA-256
+`c1372844ec7e7eed078cc58dd08f795007158bc837b9db788ccfb54c9eed6059`.
+The following report-only commit records this identity and does not change the
+tested application tree.
+
 ## Delivered contract
 
 ### Durable Queue state
@@ -55,7 +87,8 @@ The migration creates:
   context document;
 - `queue_cycles`, retaining terminal cycle outcomes;
 - `queue_events`, immutable transition snapshots with causal actor and effective
-  versus observed time;
+  versus observed time, plus indexed scalar state/priority/enqueue fields used
+  for bounded frozen listing;
 - `queue_dispatch_links`, retaining every dispatch, exact offered item revision,
   original message, author, and timing;
 - `queue_requests`, scoped keyed payload hashes and frozen mutation receipts;
@@ -107,7 +140,11 @@ cause worker effects.
 Human actions remain explicit. Agent Queue access requires the task's exact active
 database-handler role and run. The selected claimant must be that receiving
 project's actual current ordinary orchestrator. Ordinary workers cannot read or
-mutate Queue through the CLI, and prose cannot supply authority.
+mutate Queue through the CLI, and prose cannot supply authority. A retained
+selection with a typed system-notice kind or ID is rejected even though its
+message author is intentionally `system`; only an actual untyped human message or
+the actual current orchestrator's exact agent/run message can authorize the
+handler action.
 
 Cross-project `tt spawn` admission accepts only the complete set of
 `--queue-entry`, `--queue-cycle`, `--queue-revision`,
@@ -160,6 +197,16 @@ under 128 bytes and reasons are 1–1024 bytes. Page code shrinks a page as need
 and explicitly rejects an impossible single-row page instead of silently evicting
 history.
 
+A frozen list page first computes its cutoff and latest event IDs, filters and
+orders using scalar `state`, `priority_rank`, `first_enqueued_at`, and `entry_seq`
+columns, and asks SQLite for only `limit+1` snapshot blobs. Go therefore holds and
+deserializes at most 65 full descriptions before enforcing the 1 MiB serialized
+response bound. The metadata count/group/order scan still scales with the total
+number of Queue entries and offset traversal can scan preceding scalar rows, but
+it does not load those rows' description blobs into the response process. There
+is no total-entry cap; the frozen cursor/cutoff retains complete deterministic
+priority/enqueue traversal.
+
 `tt queue` implements `list`, `get`, `history`, `changes`, `action`, and `receipt`.
 Actions use complete typed JSON files and stable request identities. CLI reads and
 mutations from an agent verify the exact active database-handler run. Queue-specific
@@ -180,7 +227,14 @@ Queue intents are encrypted in the existing project/credential-scoped local vaul
 excluded from portable backup, limited to 24 records, 64 KiB per record, and 1 MiB
 total. Exact successful replay clears only the same request key plus submitted
 generation/payload; a newer edit survives delayed cleanup and rotates identity on
-its next deliberate attempt.
+its next deliberate attempt. Each action attempt has its own bounded durable ID,
+including multiple unresolved actions of the same operation. Mutation submission
+uses the client captured when the user created the action; it never calls a
+replacement credential client with the old task/entry/payload. Persisted retries
+first match the current connection hash and project. Confirmed cleanup always uses
+the original intent scope. Late persistence, list, history, fetch, retry, or
+cleanup completion may resolve that exact intent but cannot replace a newer
+projection or delete another unresolved attempt.
 
 Audit export now advertises formats 2 and 3. Format 3 includes complete Queue
 entries, cycles, events, dispatch links, receipts, and notification metadata for
@@ -202,9 +256,11 @@ Passed on the final candidate:
 - `go test ./internal/store ./internal/server ./internal/api`
 - `go test ./internal/server -run 'TestCapabilitiesAndAuditExportHTTP|TestQueue' -count=1 -v`
 - `go test ./internal/store -run 'TestAuditExport|TestQueue' -count=1 -v`
+- `go test -overlay=/tmp/tailterm-queue-review-overlay.json ./internal/store -run '^TestReviewQueueSystemNoticeIsNotHumanSelection$' -count=1`
 - `go test ./cmd/tt -run 'TestQueue' -count=1 -v`
 - `go test -race ./internal/store ./internal/server ./internal/api`
-  (`internal/store` completed in 58.522 seconds; server and API passed)
+  (`internal/store` completed in 61.557 seconds, server in 23.605 seconds, and API
+  passed)
 - `go test -race ./internal/store -run 'TestQueueConcurrent|TestQueueDispatchCAS'`
 - `go vet ./...`
 - `go build ./...`
@@ -216,6 +272,14 @@ Passed on the final candidate:
   count/no launch
 - `node tests/project-queue-vault-browser.mjs` — Chromium and WebKit encrypted,
   bounded, credential/project-scoped, newer-edit-safe recovery across reload
+- `node tests/project-queue-review-browser.mjs` — Chromium and WebKit delayed
+  persistence/fetch/list/history, connection replacement, stale-view suppression,
+  original-scope cleanup, distinct same-operation attempts, exact older replay,
+  reload, and delayed cleanup retaining newer unresolved intents
+- `node /tmp/tailterm-queue-review-client.mjs` — supplied credential replacement
+  reproducer passes with the original action sent only through captured client A
+- `node /tmp/tailterm-queue-review-uncertain.mjs` — supplied reproducer retains
+  both request IDs and two exact retry controls
 - `node tests/work-item-history-width-browser.mjs` — Chromium and WebKit, all 20
   Bug/Feature and 1366/1024/640/390/200%-zoom-equivalent cases
 - `node tests/board-scroll-browser.mjs` — Chromium and WebKit wheel, smooth-motion,
@@ -231,6 +295,14 @@ and replaced notice recipients, narrow bound-orchestrator delivery, restart dedu
 no acknowledgement loop, legacy migration/adoption/late writes, frozen lists and
 history, incremental checkpoints, response-size bounds, and absence of private
 context in Queue entries.
+
+Authority coverage explicitly rejects a typed Queue notice as the handler's
+selection while retaining positive genuine-human and exact current-orchestrator
+selection cases. List coverage creates 70 entries with 7 KiB descriptions,
+traverses every frozen page exactly once below 1 MiB, and proves a deliberately
+invalid far off-page snapshot is not selected or deserialized by a one-row first
+page. The list query's full-blob materialization bound is therefore tested rather
+than inferred only from response length.
 
 Export coverage proves that v2 omits Queue streams/cutoffs, v3 contains all Queue
 streams and an independent cutoff, a later Queue mutation cannot change frozen v3
@@ -249,7 +321,9 @@ routes.
 
 ## Compatibility, migration, and rollback
 
-The schema change is additive. Older clients can continue calling Send against an
+The schema change is additive. The corrected migration also adds/backfills the
+four scalar Queue-event list fields and their index from immutable event snapshots
+when opening a database created by the first candidate. Older clients can continue calling Send against an
 upgraded hub and receive their original fields while the hub atomically enqueues.
 A new client on an older hub exposes unsupported Queue capability and does not
 downgrade priority, Pull, or receipt intent into an item mutation or ordinary
