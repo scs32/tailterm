@@ -101,11 +101,28 @@ body[data-mode="queue"] #mode-view {
   color: var(--muted);
 }
 
-.queue-row[aria-pressed="true"] {
-  background: var(
-    --selection,
-    color-mix(in srgb, var(--accent) 18%, transparent)
-  );
+#workspace #mode-view .queue-view .queue-row[aria-pressed="true"] {
+  background: color-mix(in srgb, var(--accent) 25%, #063c2d);
+  color: #f3fff9;
+  border-color: var(--line);
+}
+
+/* Queue selection remains a fill; hover/focus only changes its outline. */
+#workspace
+  #mode-view
+  .queue-view
+  .queue-row[aria-pressed="true"]:is(:hover, :focus-visible) {
+  background: color-mix(in srgb, var(--accent) 25%, #063c2d);
+  color: #f3fff9;
+  border-color: var(--accent);
+}
+
+#workspace
+  #mode-view
+  .queue-view
+  .queue-row:not([aria-pressed="true"]):is(:hover, :focus-visible) {
+  background: var(--surface);
+  border-color: var(--accent);
 }
 
 #mode-view .queue-view .queue-detail {

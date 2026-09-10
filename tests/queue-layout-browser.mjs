@@ -272,6 +272,18 @@ async function geometry(page) {
   });
 }
 
+async function rowStyle(locator) {
+  return locator.evaluate((node) => {
+    const style = getComputedStyle(node);
+    return {
+      background: style.backgroundColor,
+      border: style.borderTopColor,
+      outlineStyle: style.outlineStyle,
+      outlineWidth: style.outlineWidth,
+    };
+  });
+}
+
 function issuesFor(measured, outerStacked) {
   const issues = [];
   const overlapX = (left, right) =>
@@ -387,15 +399,36 @@ try {
           );
           const screenshot = path.join(artifactDir, `${label}.png`);
           await page.screenshot({ path: screenshot, fullPage: false });
+          const interactionIssues = [];
+          const first = page.locator("[data-queue-entry]").first();
           const second = page.locator("[data-queue-entry]").nth(1);
+
+          const selectedRest = await rowStyle(first);
+          const unselectedRest = await rowStyle(second);
+          if (selectedRest.background === unselectedRest.background)
+            interactionIssues.push("selection-fill-missing");
+
+          let unselectedHover = null;
+          if (!expectBaseline) {
+            await second.hover();
+            unselectedHover = await rowStyle(second);
+            if (unselectedHover.background !== unselectedRest.background)
+              interactionIssues.push("hover-changed-unselected-fill");
+            if (unselectedHover.border === unselectedRest.border)
+              interactionIssues.push("hover-outline-missing");
+            await page.mouse.move(0, 0);
+          }
+
+          await first.focus();
+          const selectedFocus = await rowStyle(first);
+          if (selectedFocus.background !== selectedRest.background)
+            interactionIssues.push("focus-changed-selected-fill");
+
           await second.focus();
           await expect(second).toBeFocused();
-          const focusOutline = await second.evaluate((node) => {
-            const style = getComputedStyle(node);
-            return { style: style.outlineStyle, width: style.outlineWidth };
-          });
+          const focusOutline = await rowStyle(second);
           assert.notEqual(
-            focusOutline.style,
+            focusOutline.outlineStyle,
             "none",
             `${label}: focus outline missing`,
           );
@@ -406,23 +439,67 @@ try {
           await expect(
             page.locator('[data-queue-entry][aria-pressed="true"]'),
           ).toContainText("Synthetic Queue row 02");
+          const keyboardSelected = await rowStyle(second);
+          const keyboardUnselected = await rowStyle(first);
+          if (
+            keyboardSelected.background !== selectedRest.background ||
+            keyboardUnselected.background !== unselectedRest.background
+          )
+            interactionIssues.push("keyboard-selection-fill-did-not-move");
+
+          let selectedHover = null;
+          if (!expectBaseline) {
+            await second.hover();
+            selectedHover = await rowStyle(second);
+            if (selectedHover.background !== selectedRest.background)
+              interactionIssues.push("hover-changed-selected-fill");
+            await page.mouse.move(0, 0);
+          }
+
           // The baseline's detail physically intercepts the row. A programmatic
           // click is used only to continue collecting all baseline geometry
           // after that known failure; candidate runs retain a real pointer
           // hit-test.
-          const first = page.locator("[data-queue-entry]").first();
           if (expectBaseline) await first.evaluate((node) => node.click());
           else await first.click();
           await expect(
             page.locator('[data-queue-entry][aria-pressed="true"]'),
           ).toContainText("Complete remaining structured audit");
+          const pointerSelected = await rowStyle(first);
+          const pointerUnselected = await rowStyle(second);
+          if (
+            pointerSelected.background !== selectedRest.background ||
+            pointerUnselected.background !== unselectedRest.background
+          )
+            interactionIssues.push("pointer-selection-fill-did-not-move");
+
+          if (!expectBaseline) {
+            const historyLabel = page.locator(".queue-history-toggle span");
+            await historyLabel.click();
+            await expect(
+              page.locator(".queue-history-toggle input"),
+            ).toBeChecked();
+            await page.locator(".queue-history-toggle span").click();
+            await expect(
+              page.locator(".queue-history-toggle input"),
+            ).not.toBeChecked();
+            await expect(page.locator(".queue-detail h3")).toContainText(
+              "Complete remaining structured audit",
+            );
+          }
+
           const main = page.locator(".queue-main");
           await main.evaluate((node) => node.scrollTo(0, 240));
           await expect
             .poll(() => main.evaluate((node) => node.scrollTop))
             .toBeGreaterThan(0);
           const measured = await geometry(page);
-          const issues = issuesFor(measured, scenario.width <= 760);
+          const issues = [
+            ...new Set([
+              ...issuesFor(measured, scenario.width <= 760),
+              ...interactionIssues,
+            ]),
+          ];
           for (const issue of issues) baselineCodes.add(issue);
           if (!expectBaseline)
             assert.deepEqual(
@@ -438,6 +515,17 @@ try {
             screenshot,
             issues,
             measured,
+            selectionStyles: {
+              selectedRest,
+              unselectedRest,
+              unselectedHover,
+              selectedFocus,
+              keyboardSelected,
+              keyboardUnselected,
+              selectedHover,
+              pointerSelected,
+              pointerUnselected,
+            },
           });
           console.log(
             `${label}: ${issues.length ? issues.join(", ") : "nonoverlapping and bounded"}`,
@@ -463,6 +551,7 @@ if (expectBaseline) {
     "list-detail-overlap",
     "rail-label-collision",
     "history-control-stretched",
+    "selection-fill-missing",
   ])
     assert.ok(
       baselineCodes.has(expected),
