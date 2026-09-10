@@ -220,7 +220,9 @@ export function createViewRefreshPresentation({ render }) {
       });
     if (focusKey) {
       const key = focusKey.replaceAll('"', '\\"');
-      root?.querySelector?.(`[data-view-control="${key}"]`)?.focus?.();
+      root
+        ?.querySelector?.(`[data-view-control="${key}"]`)
+        ?.focus?.({ preventScroll: true });
     }
     focusKey = "";
   }

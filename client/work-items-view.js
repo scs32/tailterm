@@ -1,4 +1,5 @@
 import { createViewRefreshPresentation } from "./view-refresh-presentation.js";
+import { createWorkItemsScroll } from "./work-items-scroll.js";
 
 const esc = (s) =>
   String(s ?? "").replace(
@@ -58,6 +59,11 @@ export function createWorkItemsView({
     },
   });
   const project = (id) => tasks.find((t) => t.id === id);
+  const itemScroll = createWorkItemsScroll({
+    getContainer: () => root?.querySelector?.(".work-items-main"),
+    render: () => render(),
+    canRender: () => visible && !loading,
+  });
   function mount(container) {
     root = container;
     presentation.mount(container);
@@ -69,6 +75,7 @@ export function createWorkItemsView({
     loading = false;
     subscription?.stop();
     subscription = null;
+    itemScroll.interrupt();
     presentation.interrupt({ capture: wasVisible });
   }
   async function show(taskId) {
@@ -87,6 +94,7 @@ export function createWorkItemsView({
       return;
     }
     if (!client()) {
+      itemScroll.interrupt();
       presentation.interrupt();
       root.innerHTML = `<div class="mode-empty"><span class="eyebrow">${plural.toUpperCase()}</span><h2>Connect a project hub.</h2><button data-items-configure>Configure project hub</button></div>`;
       root.querySelector("button").onclick = configure;
@@ -122,6 +130,7 @@ export function createWorkItemsView({
       render();
     } catch (error) {
       if (!visible || token !== generation) return;
+      itemScroll.interrupt();
       presentation.interrupt();
       root.innerHTML = `<div class="mode-empty"><span class="eyebrow">${plural.toUpperCase()}</span><h2>Hub unavailable.</h2><p class="launcher-intro" role="alert">${esc(error.message)}</p><button data-items-retry>Retry</button></div>`;
       root.querySelector("button").onclick = reload;
@@ -129,10 +138,15 @@ export function createWorkItemsView({
       if (token === generation) {
         loading = false;
         if (again) void reload();
+        else itemScroll.flush();
       }
     }
   }
   function render() {
+    if (!visible) return;
+    const filterKey = JSON.stringify([scope, state]);
+    const itemScrollFrame = itemScroll.beforeRender(filterKey);
+    if (!itemScrollFrame) return;
     const open = tasks.filter((task) => task.status === "open"),
       closed = tasks.filter((task) => task.status === "closed"),
       selectedProject = project(scope),
@@ -182,6 +196,7 @@ export function createWorkItemsView({
           (b.onclick = () =>
             dispatch(items.find((i) => i.id === b.dataset.itemSend))),
       );
+    itemScroll.afterRender(itemScrollFrame);
   }
   const memoryDrafts = new Map();
   const drafts =

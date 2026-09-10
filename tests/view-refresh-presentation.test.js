@@ -198,6 +198,32 @@ test("focus alone does not claim that a native popup is open", () => {
   assert.equal(presentation.beforeRender("project-a"), true);
 });
 
+test("focused controls are restored without moving their scroll container", () => {
+  const previousDocument = globalThis.document;
+  const active = { dataset: { viewControl: "status" } };
+  let focusOptions = null;
+  const replacement = {
+    focus(options) {
+      focusOptions = options;
+    },
+  };
+  const root = fakeRoot();
+  root.contains = (node) => node === active;
+  root.querySelector = (selector) =>
+    selector === '[data-view-control="status"]' ? replacement : null;
+  globalThis.document = { activeElement: active };
+  try {
+    const presentation = createViewRefreshPresentation({ render() {} });
+    presentation.mount(root);
+    assert.equal(presentation.beforeRender("project-a"), true);
+    presentation.afterRender("project-a");
+    assert.deepEqual(focusOptions, { preventScroll: true });
+  } finally {
+    if (previousDocument) globalThis.document = previousDocument;
+    else delete globalThis.document;
+  }
+});
+
 test("a keyboard disclosure press finishes before its queued repaint", async () => {
   let renders = 0;
   const root = fakeRoot();
