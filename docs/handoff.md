@@ -40,7 +40,7 @@ and synchronize the identical package to Mini without restarting PID 60799.
 Lead actual-release acceptance and database-handler revision-checked report
 save/readback remain pending; no Done or completion pin is claimed.
 
-## September 10 message audit B1 — source accepted, combined candidate pending review
+## September 10 message audit B1 — release verified pending final acceptance
 
 Bounded feature `wi_6148d93f013c1e1f` revision 2, work order #1460,
 implements the integrated observe-mode Board/CLI/cache/encrypted-intent clients,
@@ -49,19 +49,46 @@ from original exact A2 baseline
 `58f9185981625b148b30ad4b5070a1a658e17f77`. Lead accepted source candidate
 `42e323a872f94db42ce6cc6cd755b6c414e62579` in Board message #1582, then
 ordered it rebased onto exact released History-width root baseline
-`23d8371c97fb5be13f7268f5ed84e3e06047ac8a` in #1594. The complete wire
-schema, supported snapshot streams, exclusions, exact limits,
-migration/rollback, Chromium/WebKit and Go acceptance, combined-width
-verification, and baseline CLI-suite nonpasses are in
+`23d8371c97fb5be13f7268f5ed84e3e06047ac8a` in #1594. Lead accepted combined
+application/source commit `da3b6867dbf9c655888060ea7c497948cc94357a`
+in #1615 and issued release order #1616. The complete wire schema, supported
+snapshot streams, exclusions, exact limits, migration/rollback,
+Chromium/WebKit and Go acceptance, combined-width verification, actual release,
+operational corrections, and baseline CLI-suite nonpasses are in
 [the B1 implementation report](message-audit-b1.md).
 
-The rebased combined candidate is not deployed or finally accepted yet. Lead
-integration review and database-handler revision-checked result storage are
-required before item completion. A separate recorded release order must name
-the hub, Mini/Air CLI, TailOS and Mini frontend targets with backup and rollback.
-Parent `wi_edd77038c629a76c` remains in progress with B2/C1/E1/E2 pending. No
-live fixture, backfill, required-mode/AIV activation, network/Tailscale change,
-or preview PID 60799 restart occurred.
+The hub is RUNNING from unique release `20260910-message-audit-b1-da3b686`,
+Linux amd64 SHA-256
+`5244f92ee1497c4e3ee7893d4dcf6eab34969e6cee8e6dcd4f9309ae446397cd`,
+through the unchanged private listener and mounts. A new pre-update online
+backup is mode 0600 at
+`/mnt/deepfreeze/tailterm-hub/backups/before-message-audit-b1-20260910T172749Z.sqlite`,
+SHA-256 `4a906c69573546d1c662619a4419fa964aca3a14edb4336f7857d15891eb634e`;
+backup and live integrity are OK with zero foreign-key violations. Capabilities
+report message-audit v1/v2, audit-export v2 and observe mode. The exact retained
+source/package and binaries are `.build/releases/message-audit-b1-da3b686`.
+
+Mini and Air atomically installed matching Darwin arm64 `tt` SHA-256
+`3f00c6002476acb4f9dcac8b43e9fb16c9c201f96efb8d36d2ba1631f5885571`
+and retain exact previous binaries as
+`~/.local/bin/tt-before-message-audit-b1-da3b686`; relay PIDs 83457 and 912
+were not restarted. TailOS deployment
+`e59f1292-8c6f-41f6-95e1-37e98f13a686` /
+`https://e59f1292.tailos.pages.dev`, the custom domain, and Mini PID 60799/PPID
+1 serve all 81 public assets from exact manifest SHA-256
+`61047c0e2153c07d51ad354f1114ef78de6033070b3ab32bc200fab61f74fc1d`.
+Fresh Chromium production-WASM, synthetic-vault and layout checks pass on all
+three origins. Immediate frontend rollback is retained width package
+`.build/releases/history-width-9cd38d3`, deployment
+`https://08760468.tailos.pages.dev`; hub rollback is the retained A2 binary and
+CLI rollback is the per-host saved copy. Preserve the additive database; the
+online backup is disaster recovery only.
+
+This stage is builder-verified and still requires lead actual-release acceptance
+plus database-handler report storage before bounded item completion. Parent
+`wi_edd77038c629a76c` remains in progress with B2/C1/E1/E2 pending. No live
+fixture/content mutation, backfill, required-mode/AIV activation,
+network/Tailscale change, relay restart, or preview PID restart occurred.
 
 ## September 10 message audit A2 — hub release verified pending final acceptance
 

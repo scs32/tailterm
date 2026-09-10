@@ -1,0 +1,217 @@
+{
+  "status": "builder_release_verified_pending_lead_acceptance_and_handler_completion",
+  "recordedAt": "2026-09-10T17:34:52Z",
+  "workItem": {
+    "id": "wi_6148d93f013c1e1f",
+    "revision": 2,
+    "workOrderMessage": 1460,
+    "contractMessages": [1456, 1457],
+    "sourceCandidateAcceptanceMessage": 1582,
+    "combinedCandidateAcceptanceMessage": 1615,
+    "releaseOrderMessage": 1616,
+    "parent": "wi_edd77038c629a76c",
+    "parentStatus": "in_progress",
+    "remainingParentSlices": ["B2", "C1", "E1", "E2"]
+  },
+  "source": {
+    "originalA2Baseline": "58f9185981625b148b30ad4b5070a1a658e17f77",
+    "acceptedSourceCandidate": "42e323a872f94db42ce6cc6cd755b6c414e62579",
+    "releasedWidthBaseline": "23d8371c97fb5be13f7268f5ed84e3e06047ac8a",
+    "integratedApplicationCommit": "da3b6867dbf9c655888060ea7c497948cc94357a",
+    "integration": "Tracked-clean exact fast-forward of the sole accepted B1 commit onto the released width baseline; three owner screenshots remained preserved and locally excluded from release dirtiness.",
+    "documentationCommit": "Reported in the Board release result because a commit cannot contain its own hash.",
+    "retainedCleanSource": "/Users/stephenspeicher/projects/tailterm/.build/releases/message-audit-b1-da3b686",
+    "cleanSource": true,
+    "implementationAndReleaseReport": "docs/message-audit-b1.md"
+  },
+  "build": {
+    "goToolchainRequested": "go1.26.6",
+    "goDriver": "go1.26.5 darwin/arm64 with automatic toolchain selection",
+    "node": "v26.5.1",
+    "npm": "11.17.0",
+    "trimpath": true,
+    "stripped": true,
+    "vcsRevision": "da3b6867dbf9c655888060ea7c497948cc94357a",
+    "vcsModified": false
+  },
+  "hub": {
+    "release": "20260910-message-audit-b1-da3b686",
+    "binary": "/mnt/deepfreeze/tailterm-hub/releases/20260910-message-audit-b1-da3b686/tailterm-hub",
+    "retainedLocalBuild": ".build/releases/message-audit-b1-da3b686/.build/ttbin/tailterm-hub-linux-amd64",
+    "platform": "linux/amd64",
+    "size": 27009186,
+    "sha256": "5244f92ee1497c4e3ee7893d4dcf6eab34969e6cee8e6dcd4f9309ae446397cd",
+    "state": "RUNNING",
+    "containers": 1,
+    "containerState": "running",
+    "image": "gcr.io/distroless/static-debian12:nonroot",
+    "listener": "100.116.238.37:18765:18765/tcp",
+    "stateMount": "/mnt/deepfreeze/tailterm-hub/state:/state",
+    "tokenMount": "/mnt/deepfreeze/tailterm-hub/hub-token:/run/hub-token:ro",
+    "binaryMountReadOnly": true,
+    "integrity": "ok",
+    "foreignKeyViolations": 0,
+    "additiveSchema": {
+      "tables": ["audit_export_receipts", "audit_exports"],
+      "readyIndex": "audit_exports_task_ready"
+    },
+    "capabilities": {
+      "schemaVersion": 1,
+      "messageAuditVersions": [1, 2],
+      "maxRelated": 15,
+      "auditExportVersions": [2],
+      "maxBytes": 33554432,
+      "maxChunkBytes": 262144,
+      "retentionSeconds": 604800,
+      "policy": "observe"
+    },
+    "authenticatedDoctor": "passed",
+    "authenticatedPublicAgentRead": "passed",
+    "unauthenticatedWhoami": 403,
+    "deployment": "Source-inspected scripts/deploy-truenas-hub.py invoked with the unique release and --update through TrueNAS middleware; existing image, state/token mounts and private listener were retained."
+  },
+  "backup": {
+    "path": "/mnt/deepfreeze/tailterm-hub/backups/before-message-audit-b1-20260910T172749Z.sqlite",
+    "method": "Python SQLite online backup API before middleware update",
+    "createdBeforeDeployment": true,
+    "mode": "0600",
+    "size": 12509184,
+    "sha256": "4a906c69573546d1c662619a4419fa964aca3a14edb4336f7857d15891eb634e",
+    "integrity": "ok",
+    "foreignKeyViolations": 0
+  },
+  "cli": {
+    "platform": "darwin/arm64",
+    "size": 6646722,
+    "sha256": "3f00c6002476acb4f9dcac8b43e9fb16c9c201f96efb8d36d2ba1631f5885571",
+    "previousSha256": "a2a640d18e3d3014bcd8afdafbaf1f8994c5fbaf4623ea168014aeba7f68b49a",
+    "rollbackName": "tt-before-message-audit-b1-da3b686",
+    "installation": "Mode-0755 same-directory temporary file followed by atomic rename after exact previous and candidate hash checks.",
+    "hosts": [
+      {
+        "host": "Stephens-Mini",
+        "installed": "/Users/stephenspeicher/.local/bin/tt",
+        "rollback": "/Users/stephenspeicher/.local/bin/tt-before-message-audit-b1-da3b686",
+        "installedSha256": "3f00c6002476acb4f9dcac8b43e9fb16c9c201f96efb8d36d2ba1631f5885571",
+        "rollbackSha256": "a2a640d18e3d3014bcd8afdafbaf1f8994c5fbaf4623ea168014aeba7f68b49a",
+        "doctor": "passed",
+        "capabilities": "passed",
+        "relayPidBefore": 83457,
+        "relayPidAfter": 83457
+      },
+      {
+        "host": "theAir",
+        "installed": "/Users/stephenspeicher/.local/bin/tt",
+        "rollback": "/Users/stephenspeicher/.local/bin/tt-before-message-audit-b1-da3b686",
+        "installedSha256": "3f00c6002476acb4f9dcac8b43e9fb16c9c201f96efb8d36d2ba1631f5885571",
+        "rollbackSha256": "a2a640d18e3d3014bcd8afdafbaf1f8994c5fbaf4623ea168014aeba7f68b49a",
+        "doctor": "passed",
+        "capabilities": "passed",
+        "relayPidBefore": 912,
+        "relayPidAfter": 912
+      }
+    ],
+    "relaysRestarted": false
+  },
+  "package": {
+    "commit": "da3b6867dbf9c655888060ea7c497948cc94357a",
+    "dirty": false,
+    "builtAt": "2026-09-10T17:26:33.789Z",
+    "manifestEntries": 82,
+    "servedAssetsPerOrigin": 81,
+    "releaseSha256": "61047c0e2153c07d51ad354f1114ef78de6033070b3ab32bc200fab61f74fc1d",
+    "packageLockSha256": "a4175ff8886d6c2ee8443e7a928bc1f6f9500cd3b2c24b55fb967175d9eb3f98",
+    "productionWasm": {
+      "provenance": "Reused exact independently verified width-release production artifact after confirming tracked WASM inputs and the dependency lock were unchanged.",
+      "tailscaleVersion": "1.102.3",
+      "rawSha256": "dc841019c8a28670b3a44e0657f3a1e081648dbb561d5072eb735e987e577cb8",
+      "gzipPath": "assets/tailserve-qM5zcVoK.wasm.gz",
+      "gzipSize": 8598273,
+      "gzipSha256": "3fbd89103e04af9fdafe9a7f38da9100f5b9c71d39a5c82c4e5fa59dc8bbdf82",
+      "goModuleInventorySha256": "2c33e75b00b437e19377989a0fd36a631dd4a9cbd94b8fd17833ea4496e6778b"
+    },
+    "assets": {
+      "mainScript": {
+        "path": "assets/index-CSzRQsUR.js",
+        "size": 851021,
+        "sha256": "7cbd0d8098514c8a6d16c9425366c35af9c287e1f91dff9a127b4b2eb3c1a76a"
+      },
+      "stylesheet": {
+        "path": "assets/index-oKn23ntr.css",
+        "size": 98348,
+        "sha256": "b7ed366818ad56130e304a8a95ead2c665911995e2f456d14a073cd8aee3fce9"
+      }
+    }
+  },
+  "frontend": {
+    "cloudflareProject": "tailos",
+    "productionBranch": "main",
+    "deploymentId": "e59f1292-8c6f-41f6-95e1-37e98f13a686",
+    "immutableOrigin": "https://e59f1292.tailos.pages.dev",
+    "customOrigin": "https://tailos.tailarr.com",
+    "miniOrigin": "http://127.0.0.1:4318",
+    "miniPreviewPid": 60799,
+    "miniPreviewPpid": 1,
+    "miniPreviewRestarted": false,
+    "airPreviewChanged": false,
+    "assetVerification": "release.json, canonical root index and 81/81 served assets on immutable TailOS, custom TailOS and Mini matched exact identity SHA-256, size, status and each origin's MIME contract.",
+    "browserVerification": "Fresh disposable Chromium contexts on all three origins started production WASM, generated and restored only a synthetic local vault/key, passed three viewport layout checks and reported no page errors.",
+    "browserLimit": "Playwright Chromium/WebKit acceptance is not a native Safari claim."
+  },
+  "verification": {
+    "passed": [
+      "Accepted exact-source Chromium and WebKit Board intent cleanup, compose, async, cache, encrypted vault and History-width suites",
+      "JavaScript unit suite 147/147 and production build",
+      "Affected backend store/server/API suites, race suite, vet and build as precisely attributed in the implementation report",
+      "Exact hub binary, one RUNNING container, listener/mount topology, integrity/FK and additive audit-export schema",
+      "Authenticated observe-mode capabilities, doctor and public agent read; unauthenticated whoami 403",
+      "Mini and Air installed CLI hashes, doctor and capabilities with unchanged relay PIDs",
+      "Clean pinned production WASM/static build and 82-entry release-manifest verification",
+      "Rollback width package and immutable/custom origins before publish",
+      "New immutable/custom/Mini origins matched all 81 served assets and passed fresh production Chromium checks"
+    ],
+    "knownNonpasses": [
+      "Repository-wide go test ./... is not claimed: the accepted A2 baseline has untouched cmd/tt failures in TestPostHumanReplyAndLiteralHelp and TestAskPreservesIdentityContextAndReplayPayload.",
+      "No native Safari, physical IME or native macOS popup-option automation is claimed."
+    ],
+    "operationalCorrections": [
+      "A read-only preflight mistakenly passed -j to the non-job app.get_instance method; it failed without mutation and the correct call verified topology.",
+      "The local mini SSH alias was unavailable, so the current Stephens-Mini host was inspected and updated directly instead of treating alias resolution as a host failure.",
+      "Root ignored raw WASM and module inventory differed from the verified width release and were rejected; exact verified width production artifacts replaced only those ignored inputs before full clean packaging.",
+      "PID 60799 directly serves root dist-static, so build:static made Mini serve B1 after hub and CLI rollout and before the rollback-origin comparison; the process was not restarted and the exact package passed full verification.",
+      "Immediately after Pages deployment, the custom domain exposed the new manifest while one new CSS path briefly returned the HTML fallback; it converged on the next five-second check and then all 81 assets plus browser verification passed without redeployment."
+    ],
+    "warnings": [
+      "Vite emitted its existing large-chunk advisory; packaging and release verification completed."
+    ]
+  },
+  "rollback": {
+    "hub": {
+      "release": "20260910-message-audit-a2-eba02aa",
+      "binary": "/mnt/deepfreeze/tailterm-hub/releases/20260910-message-audit-a2-eba02aa/tailterm-hub",
+      "sha256": "16786368ccd79221df58001a65b88894fd1f99611b9ba76c2c7f25dd3bf1fa01",
+      "procedure": "Use TrueNAS middleware to point tailterm-hub at the retained A2 binary while preserving the additive current SQLite database, receipts, mounts and listener; never drop additive tables.",
+      "disasterRecovery": "Restore the online backup only for database disaster recovery; it loses all writes after 2026-09-10T17:27:49Z."
+    },
+    "cli": {
+      "procedure": "Atomically restore each host's verified tt-before-message-audit-b1-da3b686 binary without restarting either relay."
+    },
+    "frontend": {
+      "commit": "9cd38d37cb7466e8fc57ccf2da994d8457b8be24",
+      "deploymentId": "08760468-ec79-4953-bd07-18f51564d232",
+      "immutableOrigin": "https://08760468.tailos.pages.dev",
+      "releaseSha256": "671872613c224d7d9fc57275c18bbd68732872136ae10cb9dcf4e0c3cf10ae6f",
+      "package": "/Users/stephenspeicher/projects/tailterm/.build/releases/history-width-9cd38d3/dist-static",
+      "verifiedBeforePublish": true,
+      "procedure": "Publish the exact retained package explicitly to Pages project tailos and synchronize its dist-static contents to Mini without restarting PID 60799."
+    }
+  },
+  "scopeExclusions": [
+    "live audit export creation, item/message/correction fixtures, history correction or backfill",
+    "B2 required-mode activation, C1, E1/E2 or AIV implementation",
+    "Tailscale, network, listener or service-topology changes",
+    "relay, preview, agent or task lifecycle changes",
+    "old tailterm Pages project or Air preview deployment",
+    "live task/profile/vault contents in tests or release records"
+  ]
+}
