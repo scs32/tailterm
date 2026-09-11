@@ -1,5 +1,20 @@
 # Development handoff — September 10, 2026
 
+## September 11 Random Flashes — release verified pending final acceptance
+
+Bug `wi_16377f2bff53f918` revision 1, order #2227 and release supplement
+#2685 is published from application `727d91b389149cf9f2044f8c4dd4da3f0fb607de`
+(report source `ff1381697f6079f45b970daa93c0b214e0b28f30`). Deployment
+`a104e9e7-b931-41d7-ae23-bbd3135cbc79`, TailOS, and Mini match 81 served assets;
+the 82-entry release manifest SHA-256 is
+`dba8628f67bbe9da003dfad11588566d060c22c1b67a182d30aa736d729fbd02`.
+Production WASM/synthetic-vault checks pass on all three origins, and the
+served composer CSS fixture passes Chromium/WebKit. Mini PID 60799/PPID 1 was
+preserved by atomic exchange; rollback is `.build/releases/tailos-flashes-previous-mini-2685`.
+Search rollback remains `8a6862e` / manifest `6aa5857a4f821e1e79f991e52f042014cec17e41ed463d0704b567ca47656497`.
+Native Safari, owner-device, and pulldown Open10 remain unverified. Receipt:
+[tailos-2026-09-11-flashes.json](releases/tailos-2026-09-11-flashes.json).
+
 ## September 11 live Bugs and Features search — released, acceptance pending
 
 Feature `wi_1b3c05505232a68e` revision 3, integration-preparation order #2519

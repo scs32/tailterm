@@ -55,3 +55,23 @@ Verification reported all 82 assets matching the report-only source commit
 `ff1381697f6079f45b970daa93c0b214e0b28f30`. This resolves only the local
 packaging evidence blocker; it does not publish or alter the frozen application
 candidate.
+
+## Actual release
+
+Release supplement #2685 used Start #2660 / `qrr_bdecdfaf0cb41501`. Source
+report commit `ff1381697f6079f45b970daa93c0b214e0b28f30` is distinct from the
+published application `727d91b389149cf9f2044f8c4dd4da3f0fb607de`. Cloudflare
+deployment `a104e9e7-b931-41d7-ae23-bbd3135cbc79` serves
+`https://a104e9e7.tailos.pages.dev`; it, `https://tailos.tailarr.com`, and
+Mini `http://127.0.0.1:4318` match 81 served public assets. The 82-entry
+manifest includes Pages-only `_headers`, SHA-256
+`dba8628f67bbe9da003dfad11588566d060c22c1b67a182d30aa736d729fbd02`.
+
+The immutable deployed-browser command was run against each origin and passed
+production WASM start plus isolated synthetic-vault generation/restoration.
+The served CSS focus fixture is `tests/board-compose-browser.mjs`, which loads
+`/client/style.css` and passed Chromium/WebKit with the composer no-outline,
+inset-shadow assertion; its CSS source is `client/style.css` in application
+`727d91b`. Mini was atomically swapped without restarting PID 60799/PPID 1;
+rollback is `.build/releases/tailos-flashes-previous-mini-2685` (Search rollback
+remains app `8a6862e` / manifest `6aa5857a4f821e1e79f991e52f042014cec17e41ed463d0704b567ca47656497`).
