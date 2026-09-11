@@ -314,6 +314,33 @@ try {
       const input = page.locator("#board-text");
       const sendButton = page.locator("#board-compose button[type=submit]");
       await input.waitFor();
+      for (let step = 0; step < 40; step++) {
+        if (await input.evaluate((element) => element === document.activeElement))
+          break;
+        await page.keyboard.press("Tab");
+      }
+      assert.equal(
+        await input.evaluate((element) => element === document.activeElement),
+        true,
+        `${name}: keyboard focus did not reach the composer`,
+      );
+      const composerFocus = await input.evaluate((element) => {
+        const style = getComputedStyle(element);
+        return {
+          borderColor: style.borderColor,
+          boxShadow: style.boxShadow,
+          outlineStyle: style.outlineStyle,
+        };
+      });
+      assert.ok(
+        ["", "none"].includes(composerFocus.outlineStyle),
+        `${name}: composer focus retained a detached outline`,
+      );
+      assert.match(
+        composerFocus.boxShadow,
+        /inset/,
+        `${name}: composer focus lost its inset keyboard indicator`,
+      );
       const path = `/v1/tasks/${fixture.task.id}/messages`;
       const postCount = () =>
         attempts.filter((attempt) => attempt.path === path).length;

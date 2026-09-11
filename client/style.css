@@ -3273,10 +3273,11 @@ dialog .primary:hover {
   border-color: var(--accent);
 }
 
-/* Keep the composer focus indicator on its border, without a second frame. */
-#mode-view #board-compose textarea:focus-visible {
-  outline: 2px solid var(--accent);
-  outline-offset: -2px;
+/* Keep a strong keyboard focus signal inside the composer border: unlike an
+   offset outline it cannot create a second, detached orange frame. */
+#board-compose textarea:focus-visible {
+  outline: 0;
+  box-shadow: inset 0 0 0 2px var(--accent);
 }
 
 /* A decorated tab owns its entire outline, including the buttons inside it.

@@ -353,3 +353,29 @@ test("composition holds a repaint until the composition finishes", async () => {
   await new Promise((resolve) => setTimeout(resolve, 140));
   assert.equal(renders, 1);
 });
+
+test("interrupt clears a queued composition before hide and remount", async () => {
+  let renders = 0;
+  const oldRoot = fakeRoot();
+  const nextRoot = fakeRoot();
+  const presentation = createViewRefreshPresentation({
+    render() {
+      renders++;
+    },
+  });
+  const text = {
+    isConnected: true,
+    closest(selector) {
+      return selector.includes("textarea") ? this : null;
+    },
+  };
+  presentation.mount(oldRoot);
+  oldRoot.dispatch("compositionstart", { target: text });
+  assert.equal(presentation.beforeRender("project-a"), false);
+  presentation.interrupt();
+  presentation.mount(nextRoot);
+  assert.equal(presentation.beforeRender("project-a"), true);
+  presentation.settle();
+  await new Promise((resolve) => setTimeout(resolve, 140));
+  assert.equal(renders, 0);
+});

@@ -65,6 +65,13 @@ export function createViewRefreshPresentation({ render }) {
     scheduleFlush();
   }
 
+  function clearTextEntry() {
+    clearTimeout(textEntryTimer);
+    textEntryTimer = null;
+    textEntry = null;
+    composingTextEntry = null;
+  }
+
   function noteTextEntry(target) {
     if (!target || composingTextEntry === target) return;
     textEntry = target;
@@ -229,6 +236,7 @@ export function createViewRefreshPresentation({ render }) {
     root?.removeEventListener?.("input", onInput);
     root?.removeEventListener?.("compositionstart", onCompositionStart);
     root?.removeEventListener?.("compositionend", onCompositionEnd);
+    clearTextEntry();
     root = container;
     root?.addEventListener?.("pointerdown", onPointerDown);
     root?.addEventListener?.("keydown", onKeyDown);
@@ -284,10 +292,7 @@ export function createViewRefreshPresentation({ render }) {
     pointerReleasePending = false;
     nativeSelect = null;
     nativeSelectWatch++;
-    clearTimeout(textEntryTimer);
-    textEntryTimer = null;
-    textEntry = null;
-    composingTextEntry = null;
+    clearTextEntry();
     if (flush) scheduleFlush();
     else queued = false;
   }
@@ -303,6 +308,7 @@ export function createViewRefreshPresentation({ render }) {
     keyboardTarget = null;
     nativeSelect = null;
     nativeSelectWatch++;
+    clearTextEntry();
     queued = false;
     scheduled = false;
     focusKey = "";
