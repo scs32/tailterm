@@ -190,12 +190,28 @@ only for intentional temporary retention of the same item context. The
 orchestrator and active database handler stay available while the project remains
 open.
 
-**Allow agents to add other agents** controls agent-originated helper launches.
-**Max new agents** is a separate lifetime allowance for additional identities,
-including descendants and finished helpers. It defaults to two. Manual additions
-do not consume it; the deployed hub's per-project active-agent cap is 32. Retired
-agents still occupy open-agent slots because their sessions and identities remain;
-verified individual closeout releases the slot without closing the parent project.
+**Allow agents to add other agents** controls agent-originated extra-helper
+launches specifically; it does not gate a genuine regular team member bound to
+a work item (see below).
+**Max new agents** is the per-item extra allowance (see
+[docs/item-extra-capacity.md](item-extra-capacity.md)), not a project-wide
+lifetime quota: it bounds only extras, on top of each item's own allocated
+team member(s), and is checked independently per bug/feature. It defaults to
+two. A fresh (non-replacement), parented, item-bound launch must explicitly
+declare `--team-role member` (this item's allocated team member, never
+charged) or `--team-role extra` (checked against that item's allowance); a
+replacement (`--replaces-agent`) inherits the role of the binding it
+replaces. Manual (parentless) admissions are always resolved as members and
+never consume the extra allowance. Closing an extra frees exactly one slot
+for its own item; exited or retired extras stay reserved. Classification is
+declared by the caller and, on this single-workspace-token private hub, is
+not cryptographically distinguishable from any other caller with hub access
+— a request could misdeclare itself. This is a disclosed limitation, not a
+solved one; there is no per-agent authentication layer to enforce it.
+Separately, the deployed hub's per-project active-agent cap is 32 (all
+roles, all classifications). Retired agents still occupy open-agent slots
+because their sessions and identities remain; verified individual closeout
+releases the slot without closing the parent project.
 
 **Enable swarm** broadcasts new messages to all members while preserving an
 addressed recipient as the person responsible for acting. Delivery scope is saved
