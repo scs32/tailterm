@@ -55,6 +55,7 @@ func scheduleMonitorConfig() (monitor.Config, error) {
 		{"TAILTERM_SCHEDULE_MONITOR_WORKER_SILENCE", &config.WorkerSilence},
 		{"TAILTERM_SCHEDULE_MONITOR_INITIAL_BACKOFF", &config.InitialBackoff},
 		{"TAILTERM_SCHEDULE_MONITOR_MAX_BACKOFF", &config.MaxBackoff},
+		{"TAILTERM_SCHEDULE_MONITOR_NOTICE_RETENTION", &config.NoticeRetention},
 	} {
 		if raw := os.Getenv(setting.key); raw != "" {
 			value, err := time.ParseDuration(raw)

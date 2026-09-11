@@ -17,19 +17,20 @@ import (
 const notificationText = "GO! Schedule monitor detected an actionable Queue stall (%s). Review the Queue and worker state. This is a notification only: it does not approve, claim, start, reassign, retire, close, or otherwise mutate task work."
 
 type Config struct {
-	Interval       time.Duration
-	StallAfter     time.Duration
-	WorkerSilence  time.Duration
-	InitialBackoff time.Duration
-	MaxBackoff     time.Duration
+	Interval        time.Duration
+	StallAfter      time.Duration
+	WorkerSilence   time.Duration
+	InitialBackoff  time.Duration
+	MaxBackoff      time.Duration
+	NoticeRetention time.Duration
 }
 
 func DefaultConfig() Config {
-	return Config{Interval: 30 * time.Second, StallAfter: 5 * time.Minute, WorkerSilence: 2 * time.Minute, InitialBackoff: 5 * time.Minute, MaxBackoff: time.Hour}
+	return Config{Interval: 30 * time.Second, StallAfter: 5 * time.Minute, WorkerSilence: 2 * time.Minute, InitialBackoff: 5 * time.Minute, MaxBackoff: time.Hour, NoticeRetention: 7 * 24 * time.Hour}
 }
 
 func (c Config) valid() bool {
-	return c.Interval > 0 && c.StallAfter > 0 && c.WorkerSilence > 0 && c.InitialBackoff > 0 && c.MaxBackoff >= c.InitialBackoff
+	return c.Interval > 0 && c.StallAfter > 0 && c.WorkerSilence > 0 && c.InitialBackoff > 0 && c.MaxBackoff >= c.InitialBackoff && c.NoticeRetention > 0
 }
 
 type Outcome struct {
@@ -73,6 +74,9 @@ func (e *Enforcer) Start(ctx context.Context, report func(Outcome)) {
 // observation error is fail-closed: it produces an unknown outcome and sends
 // no notification.
 func (e *Enforcer) Tick(ctx context.Context, report func(Outcome)) {
+	if _, err := e.store.PruneScheduleMonitorNotices(ctx, e.now().UTC().Add(-e.config.NoticeRetention)); err != nil {
+		report(Outcome{State: "unknown", Err: fmt.Errorf("prune monitor notices: %w", err)})
+	}
 	tasks, err := e.store.ListTasks(ctx)
 	if err != nil {
 		report(Outcome{State: "unknown", Err: err})
@@ -216,8 +220,15 @@ func (e *Enforcer) detect(entries []api.QueueEntry, agents map[string]api.Agent,
 				if candidate == "" {
 					candidate = fingerprint("worker_silent", entry)
 				}
+			} else if age >= e.config.StallAfter && candidate == "" {
+				// Queue state is durable progress evidence. A fresh heartbeat only
+				// says the process lives; it does not prove the active work advances.
+				candidate = fingerprint("active_stale", entry)
 			}
 		}
+	}
+	if candidate != "" {
+		return candidate, false, false
 	}
 	if unknown {
 		return "", false, true
@@ -225,7 +236,7 @@ func (e *Enforcer) detect(entries []api.QueueEntry, agents map[string]api.Agent,
 	if intentional {
 		return "", true, false
 	}
-	return candidate, false, false
+	return "", false, false
 }
 
 func fingerprint(kind string, entry api.QueueEntry) string {
@@ -242,7 +253,7 @@ func (e *Enforcer) deliver(ctx context.Context, taskID string, lead api.Agent, f
 		notice = store.ScheduleMonitorNotice{TaskID: taskID, Fingerprint: fingerprint, FirstDetectedAt: now}
 	}
 	notice.LastObservedAt = now
-	if notice.NotificationCount > 0 && now.Sub(notice.LastNotifiedAt) < e.backoff(notice.NotificationCount) {
+	if !notice.LastAttemptAt.IsZero() && now.Sub(notice.LastAttemptAt) < e.backoff(backoffCount(notice)) {
 		if err := e.store.SaveScheduleMonitorNotice(ctx, notice); err != nil {
 			report(Outcome{TaskID: taskID, Fingerprint: fingerprint, State: "unknown", Err: err})
 			return
@@ -251,23 +262,31 @@ func (e *Enforcer) deliver(ctx context.Context, taskID string, lead api.Agent, f
 		return
 	}
 	requestID := fmt.Sprintf("schedule-monitor:%s:%d", fingerprint, notice.NotificationCount+1)
+	notice.LastAttemptAt = now
 	message, postErr := e.store.PostMessage(ctx, taskID, api.PostMessageRequest{
 		To: lead.ID, Text: fmt.Sprintf(notificationText, fingerprint), RequestID: requestID,
 	}, api.Caller{Node: "system", User: "schedule-monitor"})
 	if postErr != nil {
-		notice.LastError = postErr.Error()
+		notice.FailureCount, notice.LastError = notice.FailureCount+1, postErr.Error()
 		if saveErr := e.store.SaveScheduleMonitorNotice(ctx, notice); saveErr != nil {
 			postErr = fmt.Errorf("delivery: %v; state: %w", postErr, saveErr)
 		}
 		report(Outcome{TaskID: taskID, Fingerprint: fingerprint, State: "delivery_failed", Err: postErr})
 		return
 	}
-	notice.LastNotifiedAt, notice.NotificationCount, notice.MessageSeq, notice.LastError = now, notice.NotificationCount+1, message.Seq, ""
+	notice.LastNotifiedAt, notice.NotificationCount, notice.FailureCount, notice.MessageSeq, notice.LastError = now, notice.NotificationCount+1, 0, message.Seq, ""
 	if err := e.store.SaveScheduleMonitorNotice(ctx, notice); err != nil {
 		report(Outcome{TaskID: taskID, Fingerprint: fingerprint, State: "unknown", Err: err})
 		return
 	}
 	report(Outcome{TaskID: taskID, Fingerprint: fingerprint, State: "notified", MessageSeq: message.Seq})
+}
+
+func backoffCount(notice store.ScheduleMonitorNotice) int {
+	if notice.FailureCount > 0 {
+		return notice.FailureCount
+	}
+	return notice.NotificationCount
 }
 
 func (e *Enforcer) backoff(count int) time.Duration {

@@ -49,7 +49,15 @@ func TestDetectStallMatrix(t *testing.T) {
 	entry.State, entry.WorkerAgentID, entry.WorkerRunID = api.QueueStateActive, "agt_1111111111111111", "run_1111111111111111"
 	entry.Revision = 4
 	entry.UpdatedAt = now.Add(-time.Minute)
-	worker := api.Agent{ID: entry.WorkerAgentID, RunID: entry.WorkerRunID, Status: api.AgentRunning, LastSeenAt: now.Add(-time.Minute)}
+	worker := api.Agent{ID: entry.WorkerAgentID, RunID: entry.WorkerRunID, Status: api.AgentRunning, LastSeenAt: *now}
+	got, intentional, unknown = e.detect([]api.QueueEntry{entry}, map[string]api.Agent{worker.ID: worker}, *now)
+	if got == "" || intentional || unknown {
+		t.Fatalf("healthy-heartbeat stale-work detection = %q intentional=%v unknown=%v", got, intentional, unknown)
+	}
+	if got[:12] != "active_stale" {
+		t.Fatalf("healthy heartbeat hid stale Queue evidence: %q", got)
+	}
+	worker.LastSeenAt = now.Add(-time.Minute)
 	got, intentional, unknown = e.detect([]api.QueueEntry{entry}, map[string]api.Agent{worker.ID: worker}, *now)
 	if got == "" || intentional || unknown {
 		t.Fatalf("silent worker detection = %q intentional=%v unknown=%v", got, intentional, unknown)
@@ -63,6 +71,21 @@ func TestDetectStallMatrix(t *testing.T) {
 	got, intentional, unknown = e.detect([]api.QueueEntry{entry}, map[string]api.Agent{worker.ID: worker}, *now)
 	if got != "" || intentional || !unknown {
 		t.Fatalf("unknown worker = %q intentional=%v unknown=%v", got, intentional, unknown)
+	}
+	blocked := entry
+	blocked.ID, blocked.Revision = "que_2222222222222222", 5
+	worker.Status, worker.LastSeenAt = api.AgentNeedsInput, *now
+	got, intentional, unknown = e.detect([]api.QueueEntry{blocked, api.QueueEntry{ID: "que_3333333333333333", Cycle: 1, Revision: 1, State: api.QueueStateWaiting, Eligible: true, UpdatedAt: now.Add(-time.Minute)}}, map[string]api.Agent{worker.ID: worker}, *now)
+	if got == "" || intentional || unknown {
+		t.Fatalf("blocked entry hid independent waiting work = %q intentional=%v unknown=%v", got, intentional, unknown)
+	}
+	unknownEntry := blocked
+	unknownEntry.ID = "que_4444444444444444"
+	unknownWorker := worker
+	unknownWorker.Status, unknownWorker.LastSeenAt = api.AgentRunning, time.Time{}
+	got, intentional, unknown = e.detect([]api.QueueEntry{unknownEntry, api.QueueEntry{ID: "que_5555555555555555", Cycle: 1, Revision: 1, State: api.QueueStateWaiting, Eligible: true, UpdatedAt: now.Add(-time.Minute)}}, map[string]api.Agent{unknownWorker.ID: unknownWorker}, *now)
+	if got == "" || intentional || unknown {
+		t.Fatalf("unknown entry hid independent waiting work = %q intentional=%v unknown=%v", got, intentional, unknown)
 	}
 }
 
@@ -132,5 +155,26 @@ func TestDeliveryFailureIsRecordedWithoutLifecycleMutation(t *testing.T) {
 	}
 	if got, err := st.GetAgent(context.Background(), lead.ID); err != nil || got.Status != api.AgentClosed {
 		t.Fatalf("failed delivery changed lifecycle: %+v %v", got, err)
+	}
+	e.deliver(context.Background(), task.ID, lead, "waiting:que_1111111111111111:1:3:", now.Add(time.Minute), func(out Outcome) { outcomes = append(outcomes, out) })
+	if len(outcomes) != 2 || outcomes[1].State != "suppressed" {
+		t.Fatalf("failed delivery did not back off: %+v", outcomes)
+	}
+	notice, err := st.GetScheduleMonitorNotice(context.Background(), task.ID, "waiting:que_1111111111111111:1:3:")
+	if err != nil || notice.FailureCount != 1 || notice.LastAttemptAt != *now {
+		t.Fatalf("failed delivery state: %+v %v", notice, err)
+	}
+}
+
+func TestTickPrunesExpiredNoticeMetadata(t *testing.T) {
+	st, _, task, _, e, now := fixture(t)
+	fingerprint := "waiting:que_1111111111111111:1:3:"
+	old := now.Add(-8 * 24 * time.Hour)
+	if err := st.SaveScheduleMonitorNotice(context.Background(), store.ScheduleMonitorNotice{TaskID: task.ID, Fingerprint: fingerprint, FirstDetectedAt: old, LastObservedAt: old}); err != nil {
+		t.Fatal(err)
+	}
+	e.Tick(context.Background(), func(Outcome) {})
+	if _, err := st.GetScheduleMonitorNotice(context.Background(), task.ID, fingerprint); err != api.ErrNotFound {
+		t.Fatalf("expired notice retained: %v", err)
 	}
 }
