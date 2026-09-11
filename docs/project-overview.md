@@ -27,7 +27,7 @@ are not implemented.
 ```text
 HTTPS static site (Cloudflare Pages project: tailos)
   └─ Browser
-      ├─ UI: terminal groups, Projects, Board, Teams, Bugs, Features, settings
+      ├─ UI: terminal groups, Projects, Board, Agents, Teams, Bugs, Features, settings
       ├─ encrypted local vault and optional encrypted profile sync
       ├─ xterm.js + WebGL / optional DOM rendering
       └─ Go WASM: Tailscale transport, SSH, SFTP
@@ -135,13 +135,18 @@ hub does not launch remote processes. Encrypted local launch plans and verified
 host receipts make retries safe; ambiguous interrupted launches require inspection.
 See [Projects, Bugs, and Features](project-work-items.md) for recovery and dispatch.
 
-### Teams and launching
+### Agents, Teams, and launching
 
-Teams are reusable templates. They supersede older saved launch profiles; a team
-of one covers the original single-agent setup. Templates contain up to 32 members
-with names, runtime, model, role, instructions, optional machine/folder overrides,
-command overrides, and permissions/tool settings. Editing a team changes future
-launches, not running agents.
+Agents holds up to 1,000 reusable definitions with stable IDs and revisions,
+runtime, model, role, instructions, machine/folder defaults, command overrides,
+and independent reasoning and permission settings. Teams contains up to 30
+templates, each with 1–32 references to those definitions and optional member
+alias/role overrides. A team of one covers a single-agent setup. Editing a shared
+definition changes future launches; running agents and saved retry plans retain
+their resolved settings and definition revision.
+
+Agents and Teams use the full-height list/detail layout, with a horizontal
+selector rail on narrow screens. Long content scrolls inside the available view.
 
 New-project launches reserve one of the 32 active-agent slots for the database
 handler, allowing at most 31 ordinary template members for that launch.
@@ -153,9 +158,13 @@ SFTP browser. Paths do not silently transfer between different machines. Helpers
 inherit their parent's launch folder unless an explicit `--cwd` is supplied.
 
 Partial launch failure retains the task and completed launches. Retrying launches
-only remaining members; their folder selections can be corrected. Existing agent
-names are not silently duplicated. These behaviors fixed real failures and need
-to remain covered by browser checks.
+only remaining members; a verified unstarted member's folder can be deliberately
+corrected with an identity-specific receipt. Its other resolved settings remain
+frozen. A lost worker response is reconciled against the exact registered agent
+and run before continuing. An unknown project-create outcome blocks another
+creation attempt, including after reload, until manually verified; matching
+project fields are not proof of ownership. These behaviors prevent duplicate
+projects and agents and need to remain covered by browser checks.
 
 Models can be selected for supported runtimes or entered explicitly. Installed
 runtime versions, account/model access, credentials, and host configuration remain
@@ -306,12 +315,22 @@ or plaintext profile. Enrollment and ongoing profile authentication are separate
 from the shared task token.
 
 Synced: saved servers and SSH credentials/keys, bookmarks, hub configuration,
-teams, appearance. Local only: Tailscale identity, current pane/window layout,
-scrollback, clipboard, transient authentication, voice state, and project handler
-recovery plans, and the encrypted hub read cache. Projects, work items, and messages
+Agents definitions, Teams references, appearance. Local only: Tailscale identity,
+current pane/window layout, scrollback, clipboard, transient authentication,
+voice state, project handler recovery plans, bounded encrypted launch retry
+plans, and the encrypted hub read cache. Projects, work items, and messages
 already live on the hub. Conflicts pause sync for an explicit local/server choice;
 it does not silently merge divergent vaults. The server retains ten prior encrypted
 profile revisions. See [profile sync](profile-sync.md).
+
+The Agents release uses v2 vault/profile envelopes. Legacy embedded team members
+migrate one-for-one into definitions; invalid or oversized input rejects the
+whole migration. Local migration atomically retains the original encrypted v1
+envelope as an immutable recovery copy. The upgraded hub accepts v1 and v2
+envelopes but prevents v1 writes from replacing a current v2 profile. After
+migration, keep a v2-compatible frontend and hub: old software cannot read the
+current v2 data, and the legacy recovery copy must not be mistaken for current
+settings or silently merged back. See [Agents implementation](agents-library.md).
 
 This is one active local profile per browser origin. Separate encrypted profiles
 on the hub do **not** make the task/message API a multi-tenant workspace. The task
@@ -324,11 +343,11 @@ hub currently uses one shared trusted-workspace credential.
 | Application bootstrap, static/gateway integration  | `client/main.js`                                                                                                           |
 | Task synchronization, launch dialogs, host aliases | `client/task-hub.js`                                                                                                       |
 | Task/group reconciliation and saved layouts        | `client/tasks.js`, `client/pane-groups.js`, `client/pane-layout.js`, `client/workspace-state.js`                           |
-| Projects, messages, teams                          | `client/tasks-view.js`, `client/board-view.js`, `client/teams-view.js`                                                     |
+| Projects, messages, agents, teams                  | `client/tasks-view.js`, `client/board-view.js`, `client/agents-view.js`, `client/teams-view.js`                            |
 | Bugs/Features and handler launch plans             | `client/work-items-view.js`, `client/work-items.css`, `client/project-handler.js`, `hub/internal/api/work_items.go`        |
 | Encrypted cached hub reads                         | `client/cached-hub-client.js`, `client/hub-read-cache.js`, `client/local-vault.js`                                         |
 | History pagination/export                          | `client/task-history.js`                                                                                                   |
-| Team schema, presets, models, permissions UI       | `client/teams.js`, `client/team-examples.js`, `client/model-picker.js`, `client/agent-controls.js`                         |
+| Agent/team schemas, models, runtime controls      | `client/agents.js`, `client/teams.js`, `client/reasoning.js`, `client/model-picker.js`, `client/agent-controls.js`           |
 | Remote folder selection                            | `client/project-folder.js`                                                                                                 |
 | Hub transport and API                              | `client/hub-client.js`, `hub/internal/api/`, `hub/internal/server/`                                                        |
 | Durable state and migrations                       | `hub/internal/store/`                                                                                                      |

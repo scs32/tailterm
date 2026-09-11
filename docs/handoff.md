@@ -1,5 +1,54 @@
 # Development handoff — September 10, 2026
 
+## September 10 Agents library — deployed, final closeout pending
+
+Accepted Agents source `e6e927b045931210ca3702c3c0c70a2e39330b4f`
+and accepted Queue layout are integrated in exact application
+`22ab0005795c9a1201766159e7b910fcff8e2a03`. Feature
+`wi_a8f6e4e08f3a1cef` remains In progress revision 2/scope 2, original
+implementation order #1720, preparation #1821 and actual release #1840.
+Agents now holds reusable definitions; Teams references them, and launch retries
+retain frozen settings and exact identity. See [the implementation report](agents-library.md).
+
+The retained clean source, binaries and static package are at
+`.build/releases/agents-library-22ab000`. Current frontend is
+`https://53780e9d.tailos.pages.dev`, `https://tailos.tailarr.com`, and Mini
+`http://127.0.0.1:4318`. Manifest SHA-256:
+`bd9c2ac5753ec8455f3c85ce5a94f5fe6d4955d049e57ce210ca59204dd886f3`.
+Lead independently verified all 81 public assets, canonical index and manifest
+on all three origins, plus fresh custom-origin Chromium production WASM and
+synthetic vault recovery. The served CSS matches the exact compiled bytes that
+passed independent Agents/Teams and Queue Chromium/WebKit layout checks.
+Native Safari and owner-device confirmation are not claimed. Mini preview
+remains PID 60799 / PPID 1; Air webpage preview was not changed.
+
+The existing TrueNAS hub is RUNNING from immutable release
+`20260910-agents-library-22ab000`, Linux amd64 SHA-256
+`4c093f2936985d4031bb3a5c834ed991a233a0f0215599b07a3b8f053dac20a6`.
+Lead verified its single container, existing private listener and state/token
+mounts. Profile service v2 retains instance `profilehub_67c148b93820fd03`,
+supports envelopes 1/2 and advertises minimum write envelope version 2.
+Mini and Air installed Darwin arm64 CLI SHA-256
+`465498d97465994aaecdfb44ba9c7725b55dc5858547495ed0bcfaffc8d9346d`;
+both were independently checked and retain
+`~/.local/bin/tt-before-agents-library-22ab000`. No relay was restarted.
+
+Handler verified the mode-0600 online backup
+`/mnt/deepfreeze/tailterm-hub/backups/before-agents-library-20260911T003758289138Z.sqlite`,
+17,047,552 bytes, SHA-256
+`92f1445fdab9143bef79b355f7d7f630c820490a615b8b04cdd63d96389943f0`.
+Backup and live integrity checks passed with zero foreign-key violations.
+This is disaster recovery, not a routine rollback over newer data.
+
+After any v2 vault/profile migration, keep a v2-readable frontend and hub with
+the monotonic write fence. Do not restore the old Queue frontend/Project Queue
+hub as a complete rollback, delete v2 pointers/envelopes, or treat the retained
+v1 recovery snapshot as current. Use this compatible release or a reviewed
+compatible correction; retain the new CLI while launch plans can depend on
+explicit reasoning settings. Earlier packages below are historical references.
+Final complete release-report retention, lead acceptance and handler-verified
+completion remain pending. The assigned worker remains open.
+
 ## September 10 Queue layout — actual release accepted
 
 Lead acceptance #1790 verifies application
@@ -10,7 +59,7 @@ stack correctly, and the history checkbox stays compact. Selected rows retain
 their fill through hover and keyboard focus. Details and complete evidence are
 in [the report](queue-layout.md) and [release receipt](releases/tailos-2026-09-10-queue-layout.json).
 
-Current frontend: deployment `876448a7-d913-4e68-9033-522230a57558`,
+Previous frontend: deployment `876448a7-d913-4e68-9033-522230a57558`,
 `https://876448a7.tailos.pages.dev`, `https://tailos.tailarr.com`, and Mini
 `http://127.0.0.1:4318`. The existing preview remains PID 60799 / PPID 1.
 All 81 public assets, canonical index and release manifest were independently
@@ -24,9 +73,9 @@ Retained clean source/package: `.build/releases/queue-layout-a974c98`.
 Frontend rollback is the retained `.build/releases/project-queue-cfb2172`
 package, manifest `e7919f9448fa0dc9d5938315c6747dbc9c035645398c48c2ce0ff34e21a234a4`.
 Publish explicitly to Pages project `tailos` and atomically replace the Mini
-package without restarting its preview. The hub and both CLIs remain the
-Project Queue release below. Agents-library is still under review and is not
-included. Handler #1796 verified Bug Done revision 4/scope 3, receipt
+package without restarting its preview. At this release, the hub and both CLIs
+remained the Project Queue release below; Agents was not yet included.
+Handler #1796 verified Bug Done revision 4/scope 3, receipt
 `wir_347e24bbcd58616e`, and atomic Queue completion (cycle 1/revision 6,
 event 72, `source_done`). Complete accepted evidence is retained in Board
 manifest #1792; the native Feature report pin is inapplicable to Bugs.
