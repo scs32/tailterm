@@ -1,0 +1,212 @@
+{
+  "status": "actual_release_verified_pending_lead_acceptance_and_handler_completion",
+  "recordedAt": "2026-09-11T00:51:58Z",
+  "workItem": {
+    "taskId": "tsk_2cfcff70a0fbe967",
+    "itemId": "wi_a8f6e4e08f3a1cef",
+    "revision": 2,
+    "scopeRevision": 2,
+    "implementationWorkOrderMessage": 1720,
+    "preparationWorkOrderMessage": 1821,
+    "preparationRecordingMessage": 1824,
+    "preparationRecordingAuthor": "agt_1186df8d710c0fd7 (lead)",
+    "actualReleaseWorkOrderMessage": 1840,
+    "actualReleaseOrderArtifact": "nart_ace4966a8b519ca5@1",
+    "actualReleaseOrderReceipt": "nrr_65d7b1a1872874f6",
+    "workerAgentId": "agt_5705477a4a857d93",
+    "workerRunId": "run_9c5e9b4c94e2cbc1",
+    "contextDigest": "59f8a9a51cb7c694bc7d0b19ce662ca3a463e607fc769075aae031bb99595746"
+  },
+  "source": {
+    "integratedCommit": "22ab0005795c9a1201766159e7b910fcff8e2a03",
+    "integratedTree": "9a36fc07b69df89bcb686ce95bad60708843a2b3",
+    "acceptedAgentsCommit": "e6e927b045931210ca3702c3c0c70a2e39330b4f",
+    "acceptedQueueCommit": "a974c9870b64d0e4cb5387011d1a68515af6ce82",
+    "retainedCleanSource": "/Users/stephenspeicher/projects/tailterm/.build/releases/agents-library-22ab000",
+    "trackedClean": true,
+    "documentationCommit": "Reported on the Board because a commit cannot contain its own hash."
+  },
+  "package": {
+    "manifestPath": "dist-static/release.json",
+    "manifestSize": 14861,
+    "manifestSha256": "bd9c2ac5753ec8455f3c85ce5a94f5fe6d4955d049e57ce210ca59204dd886f3",
+    "manifestEntries": 82,
+    "servedAssets": 81,
+    "publicBytes": 80169986,
+    "productionWasmSha256": "fed7a07b5767f9c4a288791e87dbb2e4e466b48e3f45ad5c606e6d10cec7f804",
+    "moduleInventoryEntries": 305,
+    "moduleInventorySha256": "544ac403338ecbcbd74f0e357f4f99a53c8120f990330c772fc51fdd6f1272ce",
+    "stylesheet": {
+      "path": "assets/index-DJW9Wmvd.css",
+      "size": 103647,
+      "sha256": "207a3460df8db8635ac0810725120706bd661291f7341803c431d6cac127a8bf"
+    },
+    "mainScript": {
+      "path": "assets/index-C18LYdir.js",
+      "size": 887042,
+      "sha256": "1e506d49980ec2d12b6ccc0a8916b5489f33e34cfd3b46c81c004c1f46e0dfa1"
+    }
+  },
+  "backup": {
+    "path": "/mnt/deepfreeze/tailterm-hub/backups/before-agents-library-20260911T003758289138Z.sqlite",
+    "method": "SQLite online backup API from mode=ro source while hub remained online",
+    "mode": "0600",
+    "size": 17047552,
+    "sha256": "92f1445fdab9143bef79b355f7d7f630c820490a615b8b04cdd63d96389943f0",
+    "backupIntegrity": "ok",
+    "backupForeignKeyViolations": 0,
+    "liveIntegrity": "ok",
+    "liveForeignKeyViolations": 0,
+    "handlerArtifact": "nart_e3c28bdbb1a53ad7@1",
+    "handlerReceipt": "nrr_45e8223278cda3d3",
+    "policy": "Disaster recovery only; never overwrite newer work or downgrade v2 compatibility."
+  },
+  "hub": {
+    "release": "20260910-agents-library-22ab000",
+    "binary": "/mnt/deepfreeze/tailterm-hub/releases/20260910-agents-library-22ab000/tailterm-hub",
+    "platform": "linux/amd64",
+    "size": 27226274,
+    "sha256": "4c093f2936985d4031bb3a5c834ed991a233a0f0215599b07a3b8f053dac20a6",
+    "mode": "0755",
+    "state": "RUNNING",
+    "containers": 1,
+    "containerState": "running",
+    "image": "gcr.io/distroless/static-debian12:nonroot",
+    "uidGid": "950:950",
+    "listener": "100.116.238.37:18765:18765/tcp",
+    "stateMount": "/mnt/deepfreeze/tailterm-hub/state:/state:rw",
+    "tokenMount": "/mnt/deepfreeze/tailterm-hub/hub-token:/run/hub-token:ro",
+    "binaryMountReadOnly": true,
+    "profileService": {
+      "service": "tailterm-profiles",
+      "version": 2,
+      "instanceId": "profilehub_67c148b93820fd03",
+      "envelopeVersions": [1, 2],
+      "minimumWriteEnvelopeVersion": 2
+    },
+    "capabilities": {
+      "queueVersions": [1],
+      "messageAuditVersions": [1, 2],
+      "auditExportVersions": [2, 3],
+      "messageAuditPolicy": "observe"
+    },
+    "authenticatedDoctor": "passed",
+    "unauthenticatedWhoami": 403
+  },
+  "cli": {
+    "platform": "darwin/arm64",
+    "size": 6698210,
+    "sha256": "465498d97465994aaecdfb44ba9c7725b55dc5858547495ed0bcfaffc8d9346d",
+    "rollbackName": "tt-before-agents-library-22ab000",
+    "rollbackSha256": "ec8bf996bbde9761563ed67c200c65641d8769aa1f504843653b0980a671d493",
+    "installation": "Mode-0755 same-directory staging and hash verification followed by atomic rename; unique prior binary retained on each host.",
+    "hosts": [
+      {
+        "host": "Stephens-Mini",
+        "installedSha256": "465498d97465994aaecdfb44ba9c7725b55dc5858547495ed0bcfaffc8d9346d",
+        "rollbackSha256": "ec8bf996bbde9761563ed67c200c65641d8769aa1f504843653b0980a671d493",
+        "doctor": "passed",
+        "relayPid": 83457,
+        "relayPpid": 1,
+        "relayRestarted": false
+      },
+      {
+        "host": "theAir",
+        "installedSha256": "465498d97465994aaecdfb44ba9c7725b55dc5858547495ed0bcfaffc8d9346d",
+        "rollbackSha256": "ec8bf996bbde9761563ed67c200c65641d8769aa1f504843653b0980a671d493",
+        "doctor": "passed",
+        "relayPid": 912,
+        "relayPpid": 1,
+        "relayRestarted": false
+      }
+    ],
+    "providerLaunches": 0
+  },
+  "frontend": {
+    "cloudflareProject": "tailos",
+    "productionBranch": "main",
+    "deploymentId": "53780e9d-bd87-43e9-8b21-a59c62b43430",
+    "immutableOrigin": "https://53780e9d.tailos.pages.dev",
+    "customOrigin": "https://tailos.tailarr.com",
+    "miniOrigin": "http://127.0.0.1:4318",
+    "miniPreviewPid": 60799,
+    "miniPreviewPpid": 1,
+    "miniPreviewRestarted": false,
+    "miniPriorPackage": "/Users/stephenspeicher/projects/tailterm/.build/static-live-before-agents-library-a974c98-swap",
+    "miniPriorManifestSha256": "7eb67bf14d940dee93792b624a2665ce3e53d155c6171956c90fe9f3faa30170",
+    "miniPublish": "Verified clone-copy staged on the same filesystem and atomically exchanged with renameatx_np RENAME_SWAP.",
+    "airPreviewChanged": false,
+    "oldTailtermProjectChanged": false,
+    "publishCommand": "npx wrangler pages deploy dist-static --project-name tailos --branch main --commit-hash 22ab0005795c9a1201766159e7b910fcff8e2a03 --commit-dirty=false"
+  },
+  "verification": {
+    "publicAssets": {
+      "origins": [
+        "https://53780e9d.tailos.pages.dev",
+        "https://tailos.tailarr.com",
+        "http://127.0.0.1:4318"
+      ],
+      "description": "Exact release.json, canonical root and 81/81 served assets on each origin matched status, size, SHA-256, MIME contract and identity encoding; _headers excluded as hosting configuration.",
+      "path": ".build/releases/agents-library-22ab000/.build/agents-library-release/public-assets.json",
+      "size": 71353,
+      "sha256": "954527a5c3ad79253d9c8444874b821ff5c83bc8fd19fd754b744f49d2728d9f"
+    },
+    "browser": {
+      "engine": "Chromium",
+      "freshContexts": true,
+      "syntheticLocalVaultOnly": true,
+      "productionWasmStarted": true,
+      "generatedKeyRestored": true,
+      "matchingMargins": true,
+      "pageErrors": 0,
+      "screenshotSha256": "bb8bd3bbdfc605c82ba7f9a109278a1394d2631a14fa14b4af387197277fb793"
+    },
+    "servedAgentsTeamsCss": {
+      "cssSha256": "207a3460df8db8635ac0810725120706bd661291f7341803c431d6cac127a8bf",
+      "origins": 3,
+      "engines": ["chromium", "webkit"],
+      "widths": [320, 390, 680, 760, 761, 1120],
+      "result": "passed"
+    },
+    "servedQueueCss": {
+      "casesPerOrigin": 24,
+      "engines": ["chromium", "webkit"],
+      "immutableResultsSha256": "aa6b4da4f66aa4c45225fbbe3548fd6ec14306ea6bd2429b08c526bb043d67ac",
+      "customResultsSha256": "a5b0f484e12e32f86c94c141f0c0a1d60dfc235986c30e6e7d7c359c64a79c0b",
+      "miniResultsSha256": "94bbdc001304d3723caee51e6f20e953d632ad497bc6e9fb5db2021d01fd5650",
+      "result": "passed"
+    }
+  },
+  "operationalCorrections": [
+    "A post-doctor unauthenticated check first used zsh's read-only status variable; that clause stopped and was rerun with http_code, returning 403.",
+    "The initial asset MIME table omitted .mjs and then assumed Mini mapped it like Pages. The final full rerun accepts the observed existing contracts and all three origins passed.",
+    "Cloudflare Web Analytics injects a beacon into ordinary custom-domain HTML responses. Exact stored-byte verification used Accept: application/octet-stream plus Accept-Encoding: identity; normal Chromium still passed.",
+    "The deployed-browser fixture reports a hard-coded https:true even for the explicit Mini HTTP origin; no HTTPS claim is made for Mini."
+  ],
+  "knownNonpasses": [
+    "No native Safari or owner-device confirmation; WebKit is not represented as native Safari.",
+    "The broad static fixture retains obsolete Task labels and omits the required first-agent folder.",
+    "The broad hub/cmd/tt package retains the previously reported coordination-test hang; focused changed CLI tests passed.",
+    "npm reported three moderate advisories and six blocked install scripts; no dependency/policy change was authorized.",
+    "Vite retained its existing large-chunk advisory.",
+    "No owner profile/vault/task data was used as a fixture and no forced migration/provider launch occurred."
+  ],
+  "rollback": {
+    "beforeV2Write": "Prior Queue frontend, Project Queue hub and per-host CLI copies are conditional rollback points only if no v2 write or new launch intent depends on the current release.",
+    "afterV2Write": "Keep a v2-readable hub/frontend and current CLI. Use this exact compatible release or a reviewed compatible forward correction; never downgrade to a v1-only writer.",
+    "preserve": [
+      "v2 pointers and envelopes",
+      "profile history and service identity",
+      "immutable legacy migration source",
+      "newer task/profile data"
+    ],
+    "backup": "Disaster recovery only; never blindly restore over newer work."
+  },
+  "scopeExclusions": [
+    "Tailscale, DNS or network changes",
+    "relay restart or reparenting",
+    "Air webpage preview or old tailterm Pages project",
+    "live owner profile/vault/task fixtures or forced migration",
+    "agent, task, Queue, project or worker lifecycle completion/closure"
+  ]
+}
