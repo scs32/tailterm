@@ -277,11 +277,145 @@ candidate. Correction validation was targeted to the changed instruction/deliver
 surfaces; no new full-suite claim replaces the recorded initial evidence or its
 baseline dispatch nonpass.
 
+## Combined integration and release preparation #1948
+
+Lead accepted corrected source in #1945 and assigned same-worker preparation
+#1948. Handler #1955 independently read back the current-primary native Work
+order, receipt `mpr_8112a85234f83f3f`. Revision 10/scope 9, original order #1880,
+Start #1901, agent/run and context remain unchanged. This stage authorizes only
+isolated integration, build, validation, report and installation/rollback planning.
+It does not authorize publication, CLI installation, hub changes or closure.
+
+An isolated worktree was created at
+`/Users/stephenspeicher/projects/tailterm/.build/worktrees/handler-allocation-integration`,
+branch `integration/handler-allocation-prep`. A normal merge preserving both
+histories combines accepted allocation
+`f646981c594b96a11607d209a025717c267c9385` with independently accepted pulldown
+source/report `43c1da3a81e7e30c11efaa87b69f3903004cfbc2` (Bug
+`wi_85a66e159b50a309` revision 8, order #1888, acceptance #1934). Exact combined
+application/source is **`bd9a1ad18f3a45be1e8ac043cbe5189a0c863741`**.
+No conflicts or production edits were needed. All five pulldown files were
+compared byte-for-byte against accepted `43c1da3`; both allocation production
+emitters were compared against accepted `f646981`. They match. The integration
+checkout remains clean at that application commit; preparation-report changes
+are committed separately on the original allocation branch. Root `tasks-hub`
+and the pulldown worker’s checkout/package were not mutated.
+
+### Retained package and exact digests
+
+The clean combined package, source archive, Darwin arm64 CLI, raw logs, synthetic
+CLI outputs and browser fixtures/screenshots are retained at:
+
+`/Users/stephenspeicher/projects/tailterm/.build/worktrees/handler-allocation-integration/.build/retained-handler-allocation-bd9a1ad`
+
+| Artifact | Bytes | SHA-256 |
+| --- | ---: | --- |
+| `dist-static/release.json` | 14,861 | `db40f2f55299ae903151455a40d8475da16ce1d4dedc6f6eff3f20143945270d` |
+| `tt-darwin-arm64` | 6,698,210 | `8fb4b792d2945126e90794f8ce0e597ee12fa528599de349cb191d2ba3035ddb` |
+| `source-bd9a1ad.tar` | 9,809,920 | `5e506bf6659ddc06588cfd0fa62e727d6e41a67d906f8d793584335589da87d8` |
+| Rebuilt `wasm/tailserve.wasm` in integration checkout | 37,951,858 | `d61326d3bd19c5b486d9c53f36b435eef54e56a0dcab2d242fcb6b51f26c8e3a` |
+
+`npm run verify:release` passes all 82 inventory entries, including `_headers`
+configuration (81 served files). The retained copy was independently rehashed
+against the same manifest. Package lock and reviewed source bytes are unchanged.
+Machine-readable preparation/installation/rollback plan:
+[handler-allocation-preparation.json](releases/handler-allocation-preparation.json).
+It records exact paths, hashes, checks, nonpasses and the pending publication slot.
+
+Existing matching Node/Go/speech caches were reused without installing or upgrading
+dependencies. Pinned Tailscale 1.102.3 source was copied into the isolated build
+area before the normal build script overlaid this commit’s WASM sources. The
+first offline invocation failed before compilation because automatic toolchain
+verification rejected `GOSUMDB=off`. The rerun explicitly used the already-cached
+Go 1.26.6 binary with `GOTOOLCHAIN=local` and `GOPROXY=off` and passed. No checksum
+mismatch, source upgrade or host-toolchain installation occurred. Production
+`npm run build:wasm` and `npm run build:static` passed. The static build’s existing
+large-chunk advisory remains a warning, not a failed build. Pinned speech source
+and chunk hashes passed the packaging checks. Darwin arm64 CLI build used
+`CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 go build -trimpath -ldflags='-s -w'`.
+
+### Combined validation and limits
+
+- Focused handler, shell-transport, dialog and presentation command: **35/35 JS
+  tests pass** on the combined source.
+- Handler encrypted-plan browser fixture: **13 instruction contracts per engine**
+  plus persistence/recovery pass in Chromium and WebKit.
+- Accepted pulldown source fixture: both engines pass all **80 editor Escape/open
+  attempts and 100 nonmodal cycles**, draft/selection/focus and queued refresh.
+- Exact packaged CSS loaded into that same accepted source view/dialog fixture:
+  both engines again pass **80 editor attempts and 100 nonmodal cycles**. The
+  ignored preparation adapter changes only the stylesheet delivery and evidence
+  directory. It preserves production CSS bytes; this is compiled CSS with source
+  JavaScript, not claimed full production-bootstrap picker automation.
+- Existing dropdown-dialog fixture: **4/4** Bugs/Features × Chromium/WebKit pass.
+  WebKit protocol Enter still does not expose its native picker; the earlier
+  limitation remains explicit.
+- Focused Go role/audit/availability/context/retirement checks: **10 top-level tests
+  pass (58 including subtests)**. `go vet ./cmd/tt` passes. No inherited live
+  coordination identity or shared tmux socket was used.
+- The actual newly built CLI ran `brief` for lead, custom-named database handler
+  and worker against a synthetic local HTTP task/roster fixture. Exactly three
+  task GETs occurred; no allocation/lifecycle request. Role output and capacity/
+  state guidance passed, and full emitted bytes/hashes are in
+  `evidence/cli-output.json` and `evidence/brief-*.txt`. This is built-binary
+  output, not installed-host or model-execution evidence.
+- A temporary loopback server served the exact production package to fresh
+  Chromium. Production WASM started; an isolated generated key survived vault
+  lock/reopen; layout margins passed and no page errors occurred. The terminal
+  reached the Tailscale sign-in state without login. This was HTTP on loopback,
+  not deployed HTTPS, owner-profile access, authenticated tailnet/SSH testing,
+  native Safari or physical native-picker acceptance. The temporary server and
+  browser closed; no useful long-lived descendant service remains.
+
+Raw commands/logs and the two ignored preparation adapters are retained with the
+package. No full combined Go repository or full combined JavaScript-suite pass
+is claimed beyond the listed checks. Original candidate failures and their
+baseline comparisons above remain unchanged. Pulldown’s separate extra
+draft-vault fixture nonpass (obsolete v1 key lookup) remains attributed to its
+accepted report; integration does not repair or hide it.
+
+### Publication coordination and proposed rollback
+
+Coordination #1954 asked the pulldown worker for its preparation #1935 state;
+#1971 was the single follow-up after roster evidence showed it still unread.
+Lead #1974 assigned **exclusive current TailOS/Mini publication to pulldown
+release order #1970**, allowing root to advance separately to its accepted report
+`9d1d57c`. This builder continues preparation only. Before a later allocation
+release, lead must confirm pulldown’s verified release, release the publication
+slot, and record the then-current root and exact served manifests/rollback.
+The combined source includes accepted pulldown `43c1da3` already; later integration
+must also preserve any intervening accepted reports or corrections. No older
+package may silently overwrite that release.
+
+The proposed later order installs the exact combined static package to Pages
+project `tailos` / `https://tailos.tailarr.com` and the preserved Mini preview at
+`http://127.0.0.1:4318`, verifying all served hashes without restarting the
+preview. It atomically installs the matching CLI at `~/.local/bin/tt` on Mini and
+Air, retaining the exact pre-install binary and checking current bytes again at
+installation. Read-only preparation verified both current installed Agents CLI
+hashes as `465498d97465994aaecdfb44ba9c7725b55dc5858547495ed0bcfaffc8d9346d`;
+exact local rollback copies are retained with the package. Air was read through
+SSH/SCP only; neither host executable was replaced. Installed role/launch output
+must later be tested with synthetic task/roster/provider fixtures, and lead must
+explicitly deliver policy to active lead/handler/relevant workers with sequence,
+recipient/run and read/progress evidence. Frozen prompts are not rewritten.
+
+Once verified, the intervening pulldown package becomes immediate frontend
+rollback. Until then, the last accepted fallback supplied to this order is
+Agents `22ab0005795c9a1201766159e7b910fcff8e2a03`, manifest
+`bd9c2ac5753ec8455f3c85ce5a94f5fe6d4955d049e57ce210ca59204dd886f3`.
+The actual release order must fill in the immediate rollback’s exact path/hash;
+this preparation does not pretend to have verified a release still underway.
+Keep v2-readable frontend/hub and additive data intact. No hub deployment,
+database restore, relay restart, Tailscale/network/service change, CLI install,
+served-package swap, publication, live record or lifecycle mutation occurred.
+
 ## Remaining dependencies and separately bounded release proposal
 
-No deployment is authorized by #1880. Source-candidate acceptance, any required
-same-item correction, and handler revision-checked report/result storage remain
-separate from actual release acceptance and feature completion.
+Source-candidate acceptance is confirmed in #1945/#1951. Preparation #1948 is
+now built and verified as described above; it still needs independent lead review
+and handler report/plan readback. Neither #1880 nor #1948 authorizes deployment.
+Actual release acceptance and feature completion remain separate.
 
 A later recorded release order should identify the reviewed integration commit,
 builder-owned integration/files, exact TailOS static package and target host
@@ -299,8 +433,9 @@ sequence, recipient, read, Start/progress checkpoints where applicable. A
 message read alone is not acceptance or execution. Keep host version and actual
 emitted text evidence separate from tool inventory/configuration.
 
-Production remains the previously accepted Agents application
-`22ab0005795c9a1201766159e7b910fcff8e2a03`. This worker did not deploy,
+The latest completed production state supplied at original source handoff was
+Agents `22ab0005795c9a1201766159e7b910fcff8e2a03`; lead #1974 now places pulldown
+release #1970 underway in the publication slot. This worker did not deploy,
 start a long-lived service, shut down production, close a live item/task/agent or
 alter the active lead/handler policy by pretending this source candidate is
 installed. Only db-handler can confirm saved feature completion after the
