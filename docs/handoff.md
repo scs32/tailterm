@@ -1,5 +1,51 @@
 # Development handoff — September 10, 2026
 
+## September 10 pulldown recurrence — actual release verified, final acceptance pending
+
+Bug `wi_85a66e159b50a309` revision8/scope6, implementation order #1888,
+preparation #1935 and actual release #1970 is published from exact clean source
+`43c1da3a81e7e30c11efaa87b69f3903004cfbc2` (application/tests
+`b10bcd462396661ea688e7eb49a1c4d9b906bec2`). Root tasks-hub fast-forwarded only
+accepted source/report `9d1d57c553434c30d2b6095f6c239d10ef06fc76`; the actual
+report/receipt/handoff are later documentation, without rebuilding that package.
+The unrelated owner screenshot and independent handler-allocation work are preserved.
+
+Current TailOS deployment is `621eb35c-7578-4c8c-9d4a-e16eea01d196` at
+`https://621eb35c.tailos.pages.dev`, `https://tailos.tailarr.com`, and the
+byte-identical Mini package at `http://127.0.0.1:4318`. Manifest SHA-256:
+`a560d5db9ce36d0eda86732b1765b82a5db60960ccc4de96d03149f767ca54da`.
+The retained clean source/package is `.build/releases/pulldown-recurrence-43c1da3`.
+All three origins pass manifest/index/81-asset size/hash/MIME checks and fresh
+Chromium production-WASM/synthetic-vault/clipboard/three-layout checks. Lead #1980
+independently confirms249 origin checks, custom production browser and compiled
+CSS two-engine affected behavior. Normal negotiated JS Brotli caused an initial
+probe assertion nonpass; explicit identity requests pass, with no production
+configuration change or rollback. The full evidence and caveats are in
+[the report](pulldown-recurrence.md) and
+[actual receipt](releases/tailos-2026-09-10-pulldown-recurrence.json).
+
+Repeated picker Escape is intercepted before a later non-cancelable dialog cancel
+can close its containing editor. The previous Enter behavior remains. Board
+composer focus now uses a visible inset2px stroke without the separate outer frame.
+Candidate/compiled Chromium+WebKit80 editor attempts and100 nonmodal cycles retain
+drafts, selection, focus and eventual refresh; compiled Queue24/24 and focused
+source26/26 pass. Original physical pointer/native Safari/owner-device confirmation
+remains unverified. The extra work-item encrypted-draft-vault suite fails identically
+on unchanged baseline and candidate because its legacy encrypted-key lookup does
+not match v2 storage; no unrelated fixture/storage repair or broad pass is claimed.
+
+Mini activation used a verified same-filesystem atomic directory exchange,
+preserving **PID60799/PPID1**. Previous served Agents bytes remain at
+`.build/releases/pulldown-recurrence-previous-mini-1970`; compatible rollback also
+remains `.build/releases/agents-library-22ab000/dist-static`, manifest
+`bd9c2ac5753ec8455f3c85ce5a94f5fe6d4955d049e57ce210ca59204dd886f3`, deployment
+`53780e9d-bd87-43e9-8b21-a59c62b43430`. Retain v2 Agents/Teams/Queue compatibility.
+Hub and Mini/Air CLIs stay on the accepted Agents release below; no hub/CLI install,
+network/Tailscale/relay/service restart, Air preview, live fixture/data or lifecycle
+change accompanied this frontend release. Item revision8/scope6 and ACTIVE Queue
+binding remain pending lead final actual acceptance and handler saved completion.
+No Done or worker closure is claimed here.
+
 ## September 10 Agents library — actual release accepted
 
 Accepted Agents source `e6e927b045931210ca3702c3c0c70a2e39330b4f`

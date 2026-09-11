@@ -343,3 +343,122 @@ asset hashes, MIME, the process identity and production synthetic-browser checks
 on immutable/custom/Mini origins. No staging of served files, swap or publication
 has been performed under preparation #1935. Actual-release evidence, lead
 acceptance and handler saved confirmation are still required before completion.
+
+## Actual release under #1970 — verified, pending final acceptance
+
+Lead's **#1970** accepted the reviewed preparation/report and assigned this exact
+worker the exclusive TailOS/Mini publication slot. Handler **#1976** verified the
+native current-primary Work record and complete original text, receipt
+`mpr_0af9104232f5fcb5`, before mutation. Original admission #1888, Start #1903,
+item revision 8/scope 6 and this run/context remain unchanged. The complete
+machine-readable actual receipt is
+[tailos-2026-09-10-pulldown-recurrence.json](releases/tailos-2026-09-10-pulldown-recurrence.json).
+The earlier preparation plan remains intact as historical pre-publication evidence.
+
+Before publication, root was exactly 84daa9c and tracked-clean with the unrelated
+owner screenshot preserved. Custom TailOS and Mini both returned the accepted
+Agents22ab000 manifest `bd9c2ac5753ec8455f3c85ce5a94f5fe6d4955d049e57ce210ca59204dd886f3`;
+retained compatible rollback passed all 82 entries again. No intervening release
+was observed. Root `tasks-hub` was fast-forwarded only to accepted source/report
+`9d1d57c553434c30d2b6095f6c239d10ef06fc76`. No handler-allocation changes were
+integrated. The exact clean retained 43c1da3 package passed its release checker
+again and was published without rebuilding.
+
+Wrangler **4.131.0** executed the exact reviewed command above, successfully
+uploading 21 files (61 already uploaded) and the packaged `_headers`. Cloudflare
+Pages project **tailos** now serves deployment
+**`621eb35c-7578-4c8c-9d4a-e16eea01d196`** at
+**`https://621eb35c.tailos.pages.dev`** and **`https://tailos.tailarr.com`**.
+The full ID/origin/source were read back using the Pages deployment list. The
+published source is `43c1da3a81e7e30c11efaa87b69f3903004cfbc2`, manifest
+**`a560d5db9ce36d0eda86732b1765b82a5db60960ccc4de96d03149f767ca54da`**.
+The old tailterm site was not targeted. Deployment identity/package hashes were
+returned promptly to lead in #1978 for parallel read-only acceptance.
+
+### Mini activation and retained rollback
+
+Read-only process inspection confirmed PID60799/PPID1's working directory was
+`/Users/stephenspeicher/projects/tailterm`, serving its relative `dist-static`.
+The exact retained package was clone-copied to sibling
+`.dist-static-pulldown-recurrence-1970`; all 82 staged entries and the previous
+live Agents package were verified. A same-filesystem
+`renameatx_np(..., RENAME_SWAP)` atomically exchanged the stage/live directories.
+The old served directory was then retained at
+`.build/releases/pulldown-recurrence-previous-mini-1970`. Both new live and retained
+old directories passed all 82 entries afterward. No listener stop/restart occurred:
+**PID60799 / PPID1** remains the listener at **`http://127.0.0.1:4318`**.
+Swap receipt time is `2026-09-11T03:33:03.070881+00:00`.
+
+Immediate allowed rollback remains the exact v2-compatible Agents22ab000 static
+package/deployment and that preserved previous Mini directory, whose manifest is
+`bd9c2ac5753ec8455f3c85ce5a94f5fe6d4955d049e57ce210ca59204dd886f3`.
+No rollback was needed or performed. Accepted Agents hub/CLIs, v2 profile
+readability, all newer data, relay/network/Tailscale configuration, Air preview
+and service processes remain unchanged. No backup restoration or live fixture
+operation occurred.
+
+### Actual deployed verification and nonpass correction
+
+Each of immutable TailOS, custom TailOS and Mini passes **83 checks**: exact
+release manifest, canonical index and all **81 public assets**, with expected
+sizes, SHA-256 hashes and MIME types. Canonical requests explicitly use
+`Accept: */*` and `Accept-Encoding: identity`; they have no Content-Encoding.
+This is **249 successful origin checks**. Cloudflare versus Mini's existing
+`.txt`/`.mjs` MIME differences are preserved in the checker, not changed in the
+server. Precompressed `.wasm.gz` files remain `application/gzip` without an added
+encoding. `_headers` is the verified package configuration, not a fetched asset.
+
+Fresh isolated Chromium on **all three origins** passes production bundle/WASM
+startup, synthetic vault/key restoration, clipboard and three viewport layouts,
+without page errors. Public origins are HTTPS; Mini is HTTP loopback. Synthetic
+browser contexts were separate and closed afterward; owner vaults/profiles and
+live work-item data were not used. The exact served CSS/JS hashes match the
+retained package whose compiled/source affected checks already passed. No
+additional broad or unrelated test rerun was performed.
+
+The first default-request asset probe was a **nonpass**, retained in the receipt:
+ordinary `assets/browser-ssh-BI4XGVJZ.js` negotiated Brotli (`Content-Encoding: br`)
+from Cloudflare. Its decoded bytes already matched the package, but the checker
+incorrectly demanded no content encoding for every default request. Correcting
+canonical requests to explicitly ask for identity encoding produced the passing
+249 checks. Normal browser-negotiated JS compression is not package corruption;
+no production header/configuration change or rollback was made for that assertion.
+Lead was notified in #1979. This does not relax the precompressed WASM requirement.
+
+Independent lead review **#1980** reports its own passing 249 origin checks,
+fresh custom-origin Chromium production-WASM/synthetic-vault/clipboard/layout
+check, and exact packaged CSS with actual-view two-engine **80 editor attempts
+plus 100 nonmodal cycles**, preserving drafts/focus/selections. These checks
+retain lead attribution, separate from builder execution. That review requested
+the final report/receipt before final actual acceptance.
+
+The identical baseline/candidate legacy-key encrypted-draft-vault suite nonpass
+remains explicitly unresolved, despite successful separate production synthetic
+vault checks. No native Safari, physical native macOS option selection or
+owner-device pass is claimed. The demonstrated repair is repeated keyboard
+Escape cancellation plus the independent composer focus geometry; the owner's
+original exact pointer-option sequence remains unconfirmed.
+
+Actual logs/results are retained under the package checkout's
+`.build/pulldown-actual/`, including Pages log/readback, Mini swap, complete
+per-origin asset/browser results, first probe nonpass and corrected runner.
+Their exact paths, sizes and hashes are in the actual receipt. Production source
+and packaged bytes stay fixed at43c1da3; this report, actual receipt and current
+handoff are a later documentation-only commit.
+
+### Exact worker preflight and remaining acceptance
+
+The roster confirms `agt_769593e945e4452d` / `run_92705aafd2c988e3`, session
+`pulldown-recurrence`, with original item/order/context. Tmux identity is **$53**,
+creation **1789095768**, pane PID **26569**. Process inspection at
+`2026-09-11T03:35:47.819378+00:00` found only the tt/node/Codex/code-mode host and
+transient inspection processes in that tree, **no TCP listeners**. Mini60799 is
+outside the tree, PPID1. No useful long-lived service was started by this worker,
+and no worker/project closure was performed. The exact receipt is retained for
+lead to reverify before any later lifecycle action.
+
+Remaining: lead final actual-release acceptance, handler exact full report/receipt
+and attributed acceptance save/readback, then handler-owned completion tracking.
+This worker has not marked the item/Queue done and will not self-close under this
+order. All original provenance, admitted history, limitations and cleanup ownership
+remain intact.
