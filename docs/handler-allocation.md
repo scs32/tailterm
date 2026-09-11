@@ -522,8 +522,9 @@ screenshots are retained under package `actual/{immutable,custom,mini}` and
 
 These production checks complement the accepted combined preparation checks:
 focused JS35/35; handler clauses13 per Chromium/WebKit plus encrypted-v2 recovery;
-pulldown source and exact compiled-CSS fixtures80 editor attempts and100 nonmodal
-cycles per engine; existing dropdown4/4; Go10 top-level/58 subtests and vet.
+pulldown source and exact compiled-CSS fixtures total80 editor attempts and100
+nonmodal cycles across Chromium+WebKit (40/50 per engine); existing dropdown4/4;
+Go10 top-level tests,58 total including subtests, and vet.
 Compiled-CSS fixtures use accepted source interaction modules, not full compiled
 bootstrap picker automation. No native Safari, physical pointer or owner-device
 verification is claimed.

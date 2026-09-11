@@ -802,8 +802,8 @@
   "documentEvidence": [
     {
       "path": "docs/handler-allocation.md",
-      "bytes": 44258,
-      "sha256": "962d1fd81fa2461607f41f536863836ce5a81ae3b045b27c178c8ae5c8e902ee"
+      "bytes": 44318,
+      "sha256": "5b0f4f213e58aa3c8b31ea3304dc001f1dcda9d850bd71cee7824ee7bd397310"
     },
     {
       "path": "docs/handoff.md",
