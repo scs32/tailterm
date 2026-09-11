@@ -41,13 +41,16 @@ application into `tasks-hub` and published exact clean commit
 `tailos`. Deployment `d19b7090-5727-4ad5-8cf4-1754d9dcf79d`, the custom TailOS
 domain, and Mini port 4318 all match release-manifest SHA-256
 `6aa5857a4f821e1e79f991e52f042014cec17e41ed463d0704b567ca47656497` and
-all 81 public assets. Mini PID 60799 / PPID 1 was preserved by an atomic
+all 81 public assets by size, SHA-256, and applicable MIME/identity contract.
+Mini PID 60799 / PPID 1 was preserved by an atomic
 same-filesystem directory exchange. The exact prior Mini package is retained at
 `.build/releases/live-search-previous-mini-2607`.
 
 Fresh production Chromium checks on all three origins started the packaged WASM
 and created/restored only a synthetic vault key. The focused Search and scroll
-fixtures passed Chromium and WebKit before publication. Native Safari remains
+fixtures passed Chromium and WebKit before publication and the Search fixture
+was repeated after activation; the exact packaged JS/CSS contains its Search
+selectors. Native Safari remains
 untested. The pre-existing project-work-items fixture still times out after its
 covered assertions while waiting for legacy `board message #` notice text; prior
 review established identical behavior on the accepted baseline.

@@ -56,8 +56,8 @@
       "https://tailos.tailarr.com",
       "http://127.0.0.1:4318"
     ],
-    "servedAssetResult": "Each origin matched the exact manifest, canonical index, and all 81 public assets by size and SHA-256.",
-    "browserResult": "Fresh Chromium on every origin started production WASM and created/restored an isolated synthetic vault key without page errors.",
+    "servedAssetResult": "Each origin matched the exact manifest, canonical index, and all 81 public assets by size, SHA-256, and applicable MIME/identity contract; Mini retains its documented application/octet-stream type for .mjs.",
+    "browserResult": "Fresh Chromium on every origin started production WASM and created/restored an isolated synthetic vault key without page errors. Exact packaged JS/CSS contains the Search selectors, and the isolated Search fixture passed Chromium and WebKit after activation.",
     "verifiedAt": "2026-09-11T23:18:35Z"
   },
   "limitations": [

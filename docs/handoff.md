@@ -15,9 +15,12 @@ Cloudflare Pages project `tailos` production deployment
 `d19b7090-5727-4ad5-8cf4-1754d9dcf79d` is available at
 `https://d19b7090.tailos.pages.dev` and `https://tailos.tailarr.com`. Mini serves
 the byte-identical package at `http://127.0.0.1:4318` with PID60799/PPID1
-preserved. All three origins match the 81 public assets and release manifest
+preserved. All three origins match the 81 public assets by size, SHA-256 and
+their applicable MIME/identity contracts, plus release manifest
 SHA-256 `6aa5857a4f821e1e79f991e52f042014cec17e41ed463d0704b567ca47656497`;
-fresh Chromium production-WASM/synthetic-vault checks pass on each origin.
+fresh Chromium production-WASM/synthetic-vault checks pass on each origin. The
+exact packaged JS/CSS contains the Search selectors and the isolated Search
+fixture passes Chromium and WebKit against the released source.
 
 The previous Mini bytes are retained at
 `.build/releases/live-search-previous-mini-2607`; their manifest SHA-256 is
