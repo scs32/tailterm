@@ -1,0 +1,225 @@
+{
+  "version": 1,
+  "stage": "preparation_only",
+  "workItem": {
+    "taskId": "tsk_2cfcff70a0fbe967",
+    "itemId": "wi_207f20d6eefcfa09",
+    "revision": 10,
+    "scopeRevision": 9,
+    "implementationOrder": 1880,
+    "preparationOrder": 1948,
+    "handlerOrderConfirmation": 1955,
+    "sourceAcceptance": 1945,
+    "startMessage": 1901,
+    "agentId": "agt_8b6c897c46d942f1",
+    "runId": "run_3cc227dcad338504",
+    "contextDigest": "5e1c128c67912dce602881df0c60d548120d4db8e9130d681b715dff37e36855"
+  },
+  "includedPulldown": {
+    "itemId": "wi_85a66e159b50a309",
+    "revision": 8,
+    "order": 1888,
+    "acceptance": 1934,
+    "sourceCommit": "43c1da3a81e7e30c11efaa87b69f3903004cfbc2",
+    "preparationOrder": 1935,
+    "actualReleaseOrder": 1970,
+    "slotConfirmation": 1974,
+    "actualReleaseVerified": false
+  },
+  "source": {
+    "baseline": "84daa9c7ea46bf28cf407ce43d60eb4d87d05816",
+    "allocationAccepted": "f646981c594b96a11607d209a025717c267c9385",
+    "combinedCommit": "bd9a1ad18f3a45be1e8ac043cbe5189a0c863741",
+    "branch": "integration/handler-allocation-prep",
+    "worktree": "/Users/stephenspeicher/projects/tailterm/.build/worktrees/handler-allocation-integration",
+    "clean": true,
+    "reviewedProductionBytesPreserved": true,
+    "substantiveConflicts": false,
+    "rootWorktreeModified": false
+  },
+  "retained": {
+    "directory": "/Users/stephenspeicher/projects/tailterm/.build/worktrees/handler-allocation-integration/.build/retained-handler-allocation-bd9a1ad",
+    "staticPackage": "/Users/stephenspeicher/projects/tailterm/.build/worktrees/handler-allocation-integration/.build/retained-handler-allocation-bd9a1ad/dist-static",
+    "manifest": {
+      "path": "dist-static/release.json",
+      "bytes": 14861,
+      "sha256": "db40f2f55299ae903151455a40d8475da16ce1d4dedc6f6eff3f20143945270d",
+      "entries": 82,
+      "servedFiles": 81
+    },
+    "sourceArchive": {
+      "path": "source-bd9a1ad.tar",
+      "bytes": 9809920,
+      "sha256": "5e506bf6659ddc06588cfd0fa62e727d6e41a67d906f8d793584335589da87d8"
+    },
+    "cli": {
+      "path": "tt-darwin-arm64",
+      "os": "darwin",
+      "arch": "arm64",
+      "bytes": 6698210,
+      "sha256": "8fb4b792d2945126e90794f8ce0e597ee12fa528599de349cb191d2ba3035ddb"
+    },
+    "productionWasm": {
+      "path": "/Users/stephenspeicher/projects/tailterm/.build/worktrees/handler-allocation-integration/wasm/tailserve.wasm",
+      "bytes": 37951858,
+      "sha256": "d61326d3bd19c5b486d9c53f36b435eef54e56a0dcab2d242fcb6b51f26c8e3a"
+    },
+    "evidenceDirectory": "evidence",
+    "packageLockSha256": "a4175ff8886d6c2ee8443e7a928bc1f6f9500cd3b2c24b55fb967175d9eb3f98",
+    "cliRollbackCopies": {
+      "Mini": {
+        "path": "tt-agents-rollback-mini",
+        "bytes": 6698210,
+        "sha256": "465498d97465994aaecdfb44ba9c7725b55dc5858547495ed0bcfaffc8d9346d",
+        "readOnlyInstalledBinaryCapture": true
+      },
+      "Air": {
+        "path": "tt-agents-rollback-air",
+        "bytes": 6698210,
+        "sha256": "465498d97465994aaecdfb44ba9c7725b55dc5858547495ed0bcfaffc8d9346d",
+        "readOnlyInstalledBinaryCapture": true
+      }
+    }
+  },
+  "checks": {
+    "focusedJs": {
+      "passed": 35,
+      "failed": 0
+    },
+    "handlerBrowser": {
+      "engines": [
+        "chromium",
+        "webkit"
+      ],
+      "handlerContractsPerEngine": 13,
+      "encryptedPlanRecovery": true
+    },
+    "pulldownSource": {
+      "engines": [
+        "chromium",
+        "webkit"
+      ],
+      "editorAttempts": 80,
+      "nonmodalCycles": 100,
+      "passed": true
+    },
+    "pulldownCompiledCssWithSourceJs": {
+      "engines": [
+        "chromium",
+        "webkit"
+      ],
+      "editorAttempts": 80,
+      "nonmodalCycles": 100,
+      "passed": true,
+      "productionBootstrapPickerAutomation": false
+    },
+    "existingDialog": {
+      "casesPassed": 4,
+      "engines": [
+        "chromium",
+        "webkit"
+      ]
+    },
+    "goFocused": {
+      "topLevelPassed": 10,
+      "includingSubtestsPassed": 58,
+      "failed": 0
+    },
+    "goVet": true,
+    "builtCliOutput": {
+      "passed": true,
+      "roles": [
+        "lead",
+        "database_handler",
+        "worker"
+      ],
+      "syntheticTaskGets": 3,
+      "mutations": 0,
+      "installedCli": false,
+      "artifact": "evidence/cli-output.json"
+    },
+    "localProductionSmoke": {
+      "engine": "chromium",
+      "productionWasmStarted": true,
+      "syntheticKeyGeneratedAndRestored": true,
+      "pageErrors": 0,
+      "layoutMargins": true,
+      "https": false,
+      "tailnetLogin": false
+    },
+    "manifestVerified": true
+  },
+  "nonpasses": [
+    {
+      "phase": "initial_offline_wasm_build",
+      "message": "Automatic Go toolchain verification rejected GOSUMDB=off before compilation.",
+      "resolution": "Used the existing pinned Go 1.26.6 binary explicitly with GOTOOLCHAIN=local and GOPROXY=off; build passed with no dependency installs/upgrades."
+    },
+    {
+      "phase": "initial_source_candidate_expanded_go",
+      "message": "Existing dispatch sender assertion fails on candidate and exact baseline; retained in full report; no unrelated repair."
+    },
+    {
+      "phase": "pulldown_source_candidate_extra_draft_vault",
+      "message": "Existing fixture reads obsolete encrypted key; baseline nonpass attributed to pulldown report; no fix included here."
+    }
+  ],
+  "proposedInstall": {
+    "requiresNewRecordedReleaseOrder": true,
+    "publicationSlotOwner": "lead",
+    "currentExclusiveSlot": {
+      "order": 1970,
+      "worker": "pulldown-recurrence"
+    },
+    "mustRecheckBeforeRelease": [
+      "lead confirms pulldown actual release evidence and releases publication slot",
+      "then-current root commit and exact TailOS/Mini served manifests",
+      "preserve intervening accepted pulldown source/reports and v2 compatibility during approved integration",
+      "current Mini/Air CLI bytes and retained rollback copies",
+      "exact package inventory remains unchanged"
+    ],
+    "frontend": {
+      "pagesProject": "tailos",
+      "customOrigin": "https://tailos.tailarr.com",
+      "miniOrigin": "http://127.0.0.1:4318",
+      "publishCommand": "npx wrangler pages deploy dist-static --project-name tailos --branch main --commit-hash bd9a1ad18f3a45be1e8ac043cbe5189a0c863741 --commit-dirty=false",
+      "miniMethod": "Replace only served static files with the verified exact package; preserve existing preview process and validate all served hashes.",
+      "forbiddenOrigin": "https://tailterm.tailarr.com"
+    },
+    "cli": {
+      "hosts": [
+        "Stephens-Mini",
+        "Air"
+      ],
+      "path": "~/.local/bin/tt",
+      "method": "Verify current bytes, retain exact backup, stage same-directory candidate, verify hash/permissions, atomic rename; no relay restart.",
+      "expectedCurrentAgentsSha256": "465498d97465994aaecdfb44ba9c7725b55dc5858547495ed0bcfaffc8d9346d",
+      "proposedBackupName": "~/.local/bin/tt-before-handler-allocation-bd9a1ad",
+      "verifyCurrentAtInstall": true
+    },
+    "hubDeployment": false,
+    "serviceRestarts": false
+  },
+  "rollback": {
+    "frontend": "Use the accepted intervening pulldown package as immediate rollback once its release verifies. Record exact source/path/manifest in actual release order; if no intervening release, compatible fallback is accepted Agents22ab000. Never replace newer accepted files with an older package silently.",
+    "agentsFallbackCommit": "22ab0005795c9a1201766159e7b910fcff8e2a03",
+    "agentsFallbackManifest": "bd9c2ac5753ec8455f3c85ce5a94f5fe6d4955d049e57ce210ca59204dd886f3",
+    "cli": "Atomically restore the exact retained per-host pre-install binary if authorized; preserve runtime/admission compatibility.",
+    "preserveV2ReadableFrontendAndHub": true,
+    "databaseRestore": false
+  },
+  "deliveryAcceptancePlan": [
+    "Run installed Mini and Air tt brief against isolated synthetic role fixtures; capture actual output/digest and exact binary hash.",
+    "Use an isolated test-only hub and private tmux socket with a fake provider command to inspect installed launch arguments for lead/handler/worker; preserve exact identity/order/context, never use live work items as test fixtures.",
+    "Lead explicitly delivers current policy to current lead, db-handler and relevant workers; cite feature/order and record message sequence, recipient/run and read/progress evidence.",
+    "Separate receipt/read from Start/execution and acceptance; frozen saved plans and already-running prompts are not retroactively updated.",
+    "No model obedience, provider-tool availability or persisted scheduler guarantee."
+  ],
+  "limits": [
+    "Preparation is not publication, installation, completion or actual-release acceptance.",
+    "Local production-WASM smoke did not log into Tailscale or test owner profiles, real SSH, native Safari or physical native picker selection.",
+    "Compiled-CSS fixture uses accepted source view/dialog modules; no full production-bootstrap picker automation claim.",
+    "Earlier tests/nonpasses retain original builder/lead attribution; this plan does not upgrade them."
+  ],
+  "actualRelease": null
+}
