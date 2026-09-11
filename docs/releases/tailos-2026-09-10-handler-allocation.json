@@ -1,0 +1,819 @@
+{
+  "schemaVersion": 1,
+  "stage": "actual_release_verified_pending_acceptance",
+  "workItem": {
+    "taskId": "tsk_2cfcff70a0fbe967",
+    "itemId": "wi_207f20d6eefcfa09",
+    "itemRevision": 10,
+    "scopeRevision": 9,
+    "workOrderMessage": 1880,
+    "originalLeadOrder": 1877,
+    "preparationOrder": 1948,
+    "releaseOrder": 2004,
+    "releaseHandlerConfirmation": 2009,
+    "releaseOrderReceipt": "mpr_dcfdf79f085d0667",
+    "startMessage": 1901,
+    "agentId": "agt_8b6c897c46d942f1",
+    "runId": "run_3cc227dcad338504",
+    "contextDigest": "5e1c128c67912dce602881df0c60d548120d4db8e9130d681b715dff37e36855"
+  },
+  "source": {
+    "applicationCommit": "bd9a1ad18f3a45be1e8ac043cbe5189a0c863741",
+    "allocationCandidate": "f646981c594b96a11607d209a025717c267c9385",
+    "pulldownCandidate": "43c1da3a81e7e30c11efaa87b69f3903004cfbc2",
+    "preparationReportCommit": "207846c4eed6019f3b05217943b968c1301401d6",
+    "rootBefore": "47d3f5cfc60b3478a290d1c526379647225c0c97",
+    "rootIntegrated": "c9f8b4e7f11adaaf61f30474a8b9c3369c365a91",
+    "mechanicalMergesOnly": true,
+    "packageRebuilt": false,
+    "ownerScreenshotPreserved": true
+  },
+  "package": {
+    "path": "/Users/stephenspeicher/projects/tailterm/.build/worktrees/handler-allocation-integration/.build/retained-handler-allocation-bd9a1ad",
+    "manifest": {
+      "bytes": 14861,
+      "sha256": "db40f2f55299ae903151455a40d8475da16ce1d4dedc6f6eff3f20143945270d"
+    },
+    "inventoryEntries": 82,
+    "publicAssets": 81,
+    "cli": {
+      "bytes": 6698210,
+      "sha256": "8fb4b792d2945126e90794f8ce0e597ee12fa528599de349cb191d2ba3035ddb"
+    },
+    "sourceArchiveSha256": "5e506bf6659ddc06588cfd0fa62e727d6e41a67d906f8d793584335589da87d8"
+  },
+  "publication": {
+    "project": "tailos",
+    "branch": "main",
+    "command": "npx wrangler pages deploy dist-static --project-name tailos --branch main --commit-hash bd9a1ad18f3a45be1e8ac043cbe5189a0c863741 --commit-dirty=false",
+    "deploymentId": "4cd51bdc-ea7b-48c0-829c-2adb6673aec6",
+    "immutableOrigin": "https://4cd51bdc.tailos.pages.dev",
+    "customOrigin": "https://tailos.tailarr.com",
+    "miniOrigin": "http://127.0.0.1:4318",
+    "checkpointMessage": 2014
+  },
+  "preflight": {
+    "https://tailos.tailarr.com": {
+      "commit": "43c1da3a81e7e30c11efaa87b69f3903004cfbc2",
+      "manifestSha256": "a560d5db9ce36d0eda86732b1765b82a5db60960ccc4de96d03149f767ca54da"
+    },
+    "http://127.0.0.1:4318": {
+      "commit": "43c1da3a81e7e30c11efaa87b69f3903004cfbc2",
+      "manifestSha256": "a560d5db9ce36d0eda86732b1765b82a5db60960ccc4de96d03149f767ca54da"
+    },
+    ".build/releases/pulldown-recurrence-43c1da3/dist-static": {
+      "manifestSha256": "a560d5db9ce36d0eda86732b1765b82a5db60960ccc4de96d03149f767ca54da",
+      "entriesVerified": 82
+    },
+    "dist-static": {
+      "manifestSha256": "a560d5db9ce36d0eda86732b1765b82a5db60960ccc4de96d03149f767ca54da",
+      "entriesVerified": 82
+    },
+    "candidate": {
+      "source": "bd9a1ad18f3a45be1e8ac043cbe5189a0c863741",
+      "manifestSha256": "db40f2f55299ae903151455a40d8475da16ce1d4dedc6f6eff3f20143945270d",
+      "entriesVerified": 82
+    },
+    "initialNonpass": "Python urllib returned HTTP403 on public manifest; canonical curl transport succeeded without credentials or configuration changes."
+  },
+  "miniActivation": {
+    "at": "2026-09-11T03:49:32.905637+00:00",
+    "method": "verified cp -cR then same-filesystem renameatx_np RENAME_SWAP",
+    "live": "/Users/stephenspeicher/projects/tailterm/dist-static",
+    "previous": "/Users/stephenspeicher/projects/tailterm/.build/releases/handler-allocation-previous-mini-2004",
+    "newManifestSha256": "db40f2f55299ae903151455a40d8475da16ce1d4dedc6f6eff3f20143945270d",
+    "previousManifestSha256": "a560d5db9ce36d0eda86732b1765b82a5db60960ccc4de96d03149f767ca54da",
+    "pid": 60799,
+    "ppid": 1,
+    "processUnchanged": true,
+    "inventoriesVerified": 82
+  },
+  "cliInstalls": [
+    {
+      "host": "Stephens-Mini.localdomain",
+      "at": "2026-09-11T03:54:39.999808+00:00",
+      "target": "/Users/stephenspeicher/.local/bin/tt",
+      "backup": "/Users/stephenspeicher/.local/bin/tt-before-handler-allocation-bd9a1ad",
+      "oldSha256": "465498d97465994aaecdfb44ba9c7725b55dc5858547495ed0bcfaffc8d9346d",
+      "newSha256": "8fb4b792d2945126e90794f8ce0e597ee12fa528599de349cb191d2ba3035ddb",
+      "atomicRename": true
+    },
+    {
+      "host": "Stephens-MacBook-Air.local",
+      "at": "2026-09-11T03:54:43.306793+00:00",
+      "target": "/Users/stephenspeicher/.local/bin/tt",
+      "backup": "/Users/stephenspeicher/.local/bin/tt-before-handler-allocation-bd9a1ad",
+      "oldSha256": "465498d97465994aaecdfb44ba9c7725b55dc5858547495ed0bcfaffc8d9346d",
+      "newSha256": "8fb4b792d2945126e90794f8ce0e597ee12fa528599de349cb191d2ba3035ddb",
+      "atomicRename": true
+    }
+  ],
+  "installedVerification": [
+    {
+      "host": "Stephens-Mini.localdomain",
+      "installed": "/Users/stephenspeicher/.local/bin/tt",
+      "binarySha256": "8fb4b792d2945126e90794f8ce0e597ee12fa528599de349cb191d2ba3035ddb",
+      "syntheticHttpHub": true,
+      "privateTmux": "tt-alloc-6hen6ucx",
+      "briefings": {
+        "lead": {
+          "bytes": 11627,
+          "sha256": "51d08b8bab2998aa7799a927f41dc315ae193f238f6c0cc9a5dc0236d5b7bb52"
+        },
+        "records-fixture": {
+          "bytes": 11506,
+          "sha256": "bfdd011dd102a109b7d351b815069ac2890cb3ff1f26875ec0ea93a14df0cd41"
+        },
+        "builder": {
+          "bytes": 7566,
+          "sha256": "47984d244d61c96e295949d93b7b06f4eff4f54de1a4b522968cf287933c1614"
+        }
+      },
+      "launches": {
+        "lead": {
+          "promptBytes": 11670,
+          "promptSha256": "c4090614fc0acb8256e02188d14467141c6447272728146bdbc53d37d89fa071",
+          "identity": {
+            "TAILTERM_TASK": "tsk_0000000000000001",
+            "TAILTERM_AGENT": "agt_0000000000000001",
+            "TAILTERM_AGENT_NAME": "lead",
+            "TAILTERM_RUN": "run_0000000000000001",
+            "TAILTERM_WORK_ITEM_TASK": null,
+            "TAILTERM_WORK_ITEM": null,
+            "TAILTERM_WORK_ITEM_REVISION": null
+          },
+          "oneArgument": true,
+          "exactContext": false
+        },
+        "records-fixture": {
+          "promptBytes": 11549,
+          "promptSha256": "39dca93512414d4b12cefe3bd3ba6108c1e9055935f33fefbba1a5b9cdeea192",
+          "identity": {
+            "TAILTERM_TASK": "tsk_0000000000000001",
+            "TAILTERM_AGENT": "agt_0000000000000002",
+            "TAILTERM_AGENT_NAME": "records-fixture",
+            "TAILTERM_RUN": "run_0000000000000002",
+            "TAILTERM_WORK_ITEM_TASK": null,
+            "TAILTERM_WORK_ITEM": null,
+            "TAILTERM_WORK_ITEM_REVISION": null
+          },
+          "oneArgument": true,
+          "exactContext": false
+        },
+        "builder": {
+          "promptBytes": 8516,
+          "promptSha256": "94ff4c2236fade00a0a657fac15665bc15344d3141fff76717118e4d2f52947f",
+          "identity": {
+            "TAILTERM_TASK": "tsk_0000000000000001",
+            "TAILTERM_AGENT": "agt_0000000000000003",
+            "TAILTERM_AGENT_NAME": "builder",
+            "TAILTERM_RUN": "run_0000000000000003",
+            "TAILTERM_WORK_ITEM_TASK": "tsk_0000000000000001",
+            "TAILTERM_WORK_ITEM": "wi_0000000000000001",
+            "TAILTERM_WORK_ITEM_REVISION": "3"
+          },
+          "oneArgument": true,
+          "exactContext": true
+        }
+      },
+      "tmuxCleaned": true,
+      "realProvider": false,
+      "liveWorkItems": false,
+      "liveAllowanceUsed": false
+    },
+    {
+      "host": "Stephens-MacBook-Air.local",
+      "installed": "/Users/stephenspeicher/.local/bin/tt",
+      "binarySha256": "8fb4b792d2945126e90794f8ce0e597ee12fa528599de349cb191d2ba3035ddb",
+      "syntheticHttpHub": true,
+      "privateTmux": "tt-alloc-reekood8",
+      "briefings": {
+        "lead": {
+          "bytes": 11627,
+          "sha256": "51d08b8bab2998aa7799a927f41dc315ae193f238f6c0cc9a5dc0236d5b7bb52"
+        },
+        "records-fixture": {
+          "bytes": 11506,
+          "sha256": "bfdd011dd102a109b7d351b815069ac2890cb3ff1f26875ec0ea93a14df0cd41"
+        },
+        "builder": {
+          "bytes": 7566,
+          "sha256": "47984d244d61c96e295949d93b7b06f4eff4f54de1a4b522968cf287933c1614"
+        }
+      },
+      "launches": {
+        "lead": {
+          "promptBytes": 11670,
+          "promptSha256": "c4090614fc0acb8256e02188d14467141c6447272728146bdbc53d37d89fa071",
+          "identity": {
+            "TAILTERM_TASK": "tsk_0000000000000001",
+            "TAILTERM_AGENT": "agt_0000000000000001",
+            "TAILTERM_AGENT_NAME": "lead",
+            "TAILTERM_RUN": "run_0000000000000001",
+            "TAILTERM_WORK_ITEM_TASK": null,
+            "TAILTERM_WORK_ITEM": null,
+            "TAILTERM_WORK_ITEM_REVISION": null
+          },
+          "oneArgument": true,
+          "exactContext": false
+        },
+        "records-fixture": {
+          "promptBytes": 11549,
+          "promptSha256": "39dca93512414d4b12cefe3bd3ba6108c1e9055935f33fefbba1a5b9cdeea192",
+          "identity": {
+            "TAILTERM_TASK": "tsk_0000000000000001",
+            "TAILTERM_AGENT": "agt_0000000000000002",
+            "TAILTERM_AGENT_NAME": "records-fixture",
+            "TAILTERM_RUN": "run_0000000000000002",
+            "TAILTERM_WORK_ITEM_TASK": null,
+            "TAILTERM_WORK_ITEM": null,
+            "TAILTERM_WORK_ITEM_REVISION": null
+          },
+          "oneArgument": true,
+          "exactContext": false
+        },
+        "builder": {
+          "promptBytes": 8516,
+          "promptSha256": "94ff4c2236fade00a0a657fac15665bc15344d3141fff76717118e4d2f52947f",
+          "identity": {
+            "TAILTERM_TASK": "tsk_0000000000000001",
+            "TAILTERM_AGENT": "agt_0000000000000003",
+            "TAILTERM_AGENT_NAME": "builder",
+            "TAILTERM_RUN": "run_0000000000000003",
+            "TAILTERM_WORK_ITEM_TASK": "tsk_0000000000000001",
+            "TAILTERM_WORK_ITEM": "wi_0000000000000001",
+            "TAILTERM_WORK_ITEM_REVISION": "3"
+          },
+          "oneArgument": true,
+          "exactContext": true
+        }
+      },
+      "tmuxCleaned": true,
+      "realProvider": false,
+      "liveWorkItems": false,
+      "liveAllowanceUsed": false
+    }
+  ],
+  "frontendVerification": [
+    {
+      "label": "immutable",
+      "origin": "https://4cd51bdc.tailos.pages.dev",
+      "commit": "bd9a1ad18f3a45be1e8ac043cbe5189a0c863741",
+      "manifestSha256": "db40f2f55299ae903151455a40d8475da16ce1d4dedc6f6eff3f20143945270d",
+      "startedAt": "2026-09-11T03:53:37.823Z",
+      "status": "passed",
+      "canonicalIndex": true,
+      "productionBrowser": {
+        "passed": true,
+        "productionBundleAndWasm": true,
+        "syntheticVaultKeyRestored": true,
+        "clipboard": true,
+        "viewports": 3,
+        "transport": "https:",
+        "nativeSafari": false,
+        "ownerDataUsed": false
+      },
+      "finishedAt": "2026-09-11T03:53:46.032Z",
+      "assetCount": 81,
+      "fullEvidence": "actual/immutable/result.json"
+    },
+    {
+      "label": "custom",
+      "origin": "https://tailos.tailarr.com",
+      "commit": "bd9a1ad18f3a45be1e8ac043cbe5189a0c863741",
+      "manifestSha256": "db40f2f55299ae903151455a40d8475da16ce1d4dedc6f6eff3f20143945270d",
+      "startedAt": "2026-09-11T03:53:37.842Z",
+      "status": "passed",
+      "canonicalIndex": true,
+      "productionBrowser": {
+        "passed": true,
+        "productionBundleAndWasm": true,
+        "syntheticVaultKeyRestored": true,
+        "clipboard": true,
+        "viewports": 3,
+        "transport": "https:",
+        "nativeSafari": false,
+        "ownerDataUsed": false
+      },
+      "finishedAt": "2026-09-11T03:53:46.388Z",
+      "assetCount": 81,
+      "fullEvidence": "actual/custom/result.json"
+    },
+    {
+      "label": "mini",
+      "origin": "http://127.0.0.1:4318",
+      "commit": "bd9a1ad18f3a45be1e8ac043cbe5189a0c863741",
+      "manifestSha256": "db40f2f55299ae903151455a40d8475da16ce1d4dedc6f6eff3f20143945270d",
+      "startedAt": "2026-09-11T03:53:37.842Z",
+      "status": "passed",
+      "canonicalIndex": true,
+      "productionBrowser": {
+        "passed": true,
+        "productionBundleAndWasm": true,
+        "syntheticVaultKeyRestored": true,
+        "clipboard": true,
+        "viewports": 3,
+        "transport": "http:",
+        "nativeSafari": false,
+        "ownerDataUsed": false
+      },
+      "finishedAt": "2026-09-11T03:53:39.236Z",
+      "assetCount": 81,
+      "fullEvidence": "actual/mini/result.json"
+    }
+  ],
+  "independentLeadVerification": {
+    "message": 2015,
+    "originChecks": 249,
+    "freshCustomProductionBrowser": true,
+    "assetLog": "/tmp/tailterm-handler-release-assets-review.log",
+    "browserLog": "/tmp/tailterm-handler-lead-deployed.log"
+  },
+  "instructionDelivery": {
+    "installedCheckpoint": 2016,
+    "workerDelivery": 2018,
+    "workerRead": true,
+    "workerActualBrief": {
+      "bytes": 7012,
+      "sha256": "17b482b2ca8a9356fcc82fbff05666e4ce17eeb196aa2735e125d7c537f1d01f"
+    },
+    "leadActualBrief": {
+      "path": "/tmp/tailterm-lead-installed-brief-2016.txt",
+      "bytes": 11062,
+      "sha256": "53e56702eae59948a08ec3e55354bf2bc5939618b104394e5921a15772de183d"
+    },
+    "currentThreadCompletion": "This final report is the worker substantive checkpoint; saved completion still requires handler confirmation.",
+    "dispositionMessage": 2022,
+    "dispositionReceipt": "mpr_deaa41dea3a145f8",
+    "step6SatisfiedByLead": true,
+    "workerProgressMessage": 2019,
+    "lead": {
+      "agentId": "agt_1186df8d710c0fd7",
+      "runId": "run_9e0ddb28df5ae63e",
+      "actions": [
+        "explicit policy delivery",
+        "one same-order progress follow-up",
+        "independent verification",
+        "readiness disposition"
+      ]
+    },
+    "handler": {
+      "agentId": "agt_3760a4361c514a03",
+      "runId": "run_2dd77d68cb7bcb39",
+      "deliveryMessage": 2017,
+      "readThrough": 2017,
+      "followupMessage": 2020,
+      "readinessResultMessage": 2021,
+      "actualBriefBytes": 10941,
+      "actualBriefSha256": "1a71327756f9d8b893904f16b9433cc70a49371d766ddeec90e4399a89ba5107"
+    },
+    "readinessDisposition": {
+      "attribution": "Handler2021, independently verified and accepted by lead2022; no worker live database access",
+      "archiveBytes": 559523,
+      "archiveSha256": "42c79e339a68754d3238a4098c9b029d64cf9b253fc326b1428e211b2a1e3d4e",
+      "maxNewAgents": 4,
+      "allowAgentSpawn": true,
+      "parentedLifetimeIdentities": 4,
+      "openAgents": 3,
+      "result": "no launch capacity",
+      "newItemsSelected": false,
+      "nextDependency": "recorded capacity authorization and refreshed handler handoff"
+    },
+    "readSnapshots": [
+      "/tmp/tailterm-policy-roster-after-delivery.json",
+      "/tmp/tailterm-roster-2019.json"
+    ]
+  },
+  "rollback": {
+    "used": false,
+    "frontendPath": ".build/releases/pulldown-recurrence-43c1da3/dist-static",
+    "previousMiniPath": ".build/releases/handler-allocation-previous-mini-2004",
+    "frontendManifestSha256": "a560d5db9ce36d0eda86732b1765b82a5db60960ccc4de96d03149f767ca54da",
+    "deploymentId": "621eb35c-7578-4c8c-9d4a-e16eea01d196",
+    "cliBackup": "~/.local/bin/tt-before-handler-allocation-bd9a1ad",
+    "cliBackupSha256": "465498d97465994aaecdfb44ba9c7725b55dc5858547495ed0bcfaffc8d9346d",
+    "preserveV2Compatibility": true
+  },
+  "nonpasses": [
+    "Initial preparation wasm build selected uncached toolchain under GOSUMDB=off; cached Go1.26.6 offline build passed; preparation evidence retained.",
+    "Historical expanded Go dispatch test fails identically on baseline: old agent-sender expectation versus system Queue notice; unrelated test unchanged.",
+    "Pulldown extra draft-vault fixture uses obsolete v1 key; accepted baseline nonpass retained.",
+    "Prepublication urllib HTTP403; canonical curl passed with same URL and no credential/config change.",
+    "Initial installed Mini harness expected literal database_handler in delivered prose; actual durable Database handler wording correct. Assertion fixed, failed evidence retained, fresh isolated Mini/Air reruns passed.",
+    "Initial process-preflight query used session-only display target with missing pane PID; corrected list-panes query passed.",
+    "Lead2015 reports initial duplicate relative test path before browser launch; corrected runner passed."
+  ],
+  "limits": [
+    "Emitted text and installed launch argument contracts, not deterministic model obedience, persisted scheduler, per-agent authentication or filesystem isolation.",
+    "Private HTTP fixture is a synthetic protocol stub, not an additional production-hub admission validation.",
+    "Lead and handler are project roles; only fresh synthetic ordinary worker fixture is item-bound.",
+    "No real provider/model, live task/profile/vault/secret or live helper allowance was used by fixtures.",
+    "Frozen saved launch plans and already-running model contexts are not rewritten by installing strings; explicit delivery evidence is separate.",
+    "Production browser smoke uses Chromium; native Safari, physical pointer and owner-device confirmation are not claimed.",
+    "Mini browser raw log inherited https:true output label; verified origin is HTTP and receipt records actual transport http:.",
+    "No hub deployment, Air frontend preview, relay/network/Tailscale/service change or production process restart."
+  ],
+  "cleanup": {
+    "airTemporaryFixtures": {
+      "verifiedLocalEvidence": true,
+      "remoteTemporaryFixtureFilesRemoved": true,
+      "privateTmuxCleaned": true,
+      "installedAndBackupPreserved": true
+    },
+    "workerPreflight": {
+      "at": "2026-09-11T04:07:19.646200+00:00",
+      "agent": {
+        "workItem": {
+          "agentId": "agt_8b6c897c46d942f1",
+          "runId": "run_3cc227dcad338504",
+          "itemTaskId": "tsk_2cfcff70a0fbe967",
+          "itemId": "wi_207f20d6eefcfa09",
+          "itemRevision": 10,
+          "workOrderMessage": {
+            "taskId": "tsk_2cfcff70a0fbe967",
+            "seq": 1880
+          },
+          "contextThroughMessageSeq": 1893,
+          "contextDigest": "5e1c128c67912dce602881df0c60d548120d4db8e9130d681b715dff37e36855",
+          "createdAt": "2026-09-11T03:02:30.689861804Z"
+        },
+        "cleanupDone": false,
+        "runId": "run_3cc227dcad338504",
+        "lastSeenAt": "2026-09-11T04:07:00.870320069Z",
+        "online": true,
+        "id": "agt_8b6c897c46d942f1",
+        "taskId": "tsk_2cfcff70a0fbe967",
+        "name": "handler-allocation",
+        "host": "Stephens-Mini",
+        "session": "handler-allocation",
+        "runtime": "codex",
+        "cwd": "/Users/stephenspeicher/projects/tailterm/.build/worktrees/handler-allocation",
+        "parentAgentId": "agt_1186df8d710c0fd7",
+        "status": "running",
+        "title": "",
+        "createdAt": "2026-09-11T03:02:30.689861804Z",
+        "lastEventAt": "2026-09-11T04:07:00.89092983Z",
+        "unread": 0,
+        "readUpTo": 2022
+      },
+      "tmux": {
+        "id": "$52",
+        "created": "1789095750",
+        "panePid": 26335
+      },
+      "descendants": [
+        {
+          "pid": 43855,
+          "ppid": 26338,
+          "command": "/bin/zsh"
+        },
+        {
+          "pid": 43862,
+          "ppid": 43855,
+          "command": "/opt/homebrew/Cellar/python@3.14/3.14.7/Frameworks/Python.framework/Versions/3.14/Resources/Python.app/Contents/MacOS/Python"
+        },
+        {
+          "pid": 43865,
+          "ppid": 43862,
+          "command": "ps"
+        },
+        {
+          "pid": 26335,
+          "ppid": 1611,
+          "command": "/Users/stephenspeicher/.local/bin/tt"
+        },
+        {
+          "pid": 26337,
+          "ppid": 26335,
+          "command": "node"
+        },
+        {
+          "pid": 26338,
+          "ppid": 26337,
+          "command": "/opt/homebrew/lib/node_modules/@openai/codex/node_modules/@openai/codex-darwin-arm64/vendor/aarch64-apple-darwin/bin/codex"
+        },
+        {
+          "pid": 26528,
+          "ppid": 26338,
+          "command": "/opt/homebrew/lib/node_modules/@openai/codex/node_modules/@openai/codex-darwin-arm64/vendor/aarch64-apple-darwin/bin/codex-code-mode-host"
+        }
+      ],
+      "listeners": [],
+      "preview": {
+        "pid": 60799,
+        "ppid": 1,
+        "command": "node"
+      },
+      "previewOutsideTree": true
+    }
+  },
+  "completion": {
+    "leadFinalAcceptance": null,
+    "handlerSavedCompletion": null,
+    "workerClosed": false
+  },
+  "retainedEvidence": [
+    {
+      "path": "actual/air-test-cleanup.json",
+      "bytes": 150,
+      "sha256": "a20ca6feb59b47aa19c607e5b08ce0c6f8e1c69d851bf4ce1e1cec881729b566"
+    },
+    {
+      "path": "actual/cli-air/brief-builder.txt",
+      "bytes": 7566,
+      "sha256": "47984d244d61c96e295949d93b7b06f4eff4f54de1a4b522968cf287933c1614"
+    },
+    {
+      "path": "actual/cli-air/brief-lead.txt",
+      "bytes": 11627,
+      "sha256": "51d08b8bab2998aa7799a927f41dc315ae193f238f6c0cc9a5dc0236d5b7bb52"
+    },
+    {
+      "path": "actual/cli-air/brief-records-fixture.txt",
+      "bytes": 11506,
+      "sha256": "bfdd011dd102a109b7d351b815069ac2890cb3ff1f26875ec0ea93a14df0cd41"
+    },
+    {
+      "path": "actual/cli-air/launch-builder.json",
+      "bytes": 8963,
+      "sha256": "9470051213caa1f70be21397d4b77d26c48e7c625ace2b2d788c8069ebcd4c23"
+    },
+    {
+      "path": "actual/cli-air/launch-lead.json",
+      "bytes": 12016,
+      "sha256": "1551bb105b4fd4a1786c49f30f29919f0cb865eae000761eb3aa17e50da93465"
+    },
+    {
+      "path": "actual/cli-air/launch-records-fixture.json",
+      "bytes": 11905,
+      "sha256": "86fae2184e52472331ce8faf92affb5bb6d93c6429dcb8ab4a4949cea0272625"
+    },
+    {
+      "path": "actual/cli-air/requests.json",
+      "bytes": 2962,
+      "sha256": "f6c324d7f36d68dc432fe8846803427be3141e61215130e6b05ef73d258b317d"
+    },
+    {
+      "path": "actual/cli-air/result.json",
+      "bytes": 2435,
+      "sha256": "47259753fe8e5dc80c395c4b39f4c73ab93cf4c87a9ef3607205e884a1bda48e"
+    },
+    {
+      "path": "actual/cli-air/spawn-builder.log",
+      "bytes": 987,
+      "sha256": "0adc5a8b356c6cdb17c9ef166db1dd67228b83fc4776535de657cc6d1e290aff"
+    },
+    {
+      "path": "actual/cli-air/spawn-lead.log",
+      "bytes": 528,
+      "sha256": "e2e5158368af2892349e1a73a834b21bfd839f68ea15278ecf154e4183fa7ae4"
+    },
+    {
+      "path": "actual/cli-air/spawn-records-fixture.log",
+      "bytes": 592,
+      "sha256": "0ef15938a903f36592898b7956db0e461600c22493e7ff7847cde097a5ad6c4e"
+    },
+    {
+      "path": "actual/cli-air-run.log",
+      "bytes": 91,
+      "sha256": "78d2517aebf041d71f2a82edae2dfc719c6d87c42788e629fe2fe8e86a468d0a"
+    },
+    {
+      "path": "actual/cli-mini/brief-builder.txt",
+      "bytes": 7566,
+      "sha256": "47984d244d61c96e295949d93b7b06f4eff4f54de1a4b522968cf287933c1614"
+    },
+    {
+      "path": "actual/cli-mini/brief-lead.txt",
+      "bytes": 11627,
+      "sha256": "51d08b8bab2998aa7799a927f41dc315ae193f238f6c0cc9a5dc0236d5b7bb52"
+    },
+    {
+      "path": "actual/cli-mini/brief-records-fixture.txt",
+      "bytes": 11506,
+      "sha256": "bfdd011dd102a109b7d351b815069ac2890cb3ff1f26875ec0ea93a14df0cd41"
+    },
+    {
+      "path": "actual/cli-mini/launch-builder.json",
+      "bytes": 8963,
+      "sha256": "9470051213caa1f70be21397d4b77d26c48e7c625ace2b2d788c8069ebcd4c23"
+    },
+    {
+      "path": "actual/cli-mini/launch-lead.json",
+      "bytes": 12016,
+      "sha256": "1551bb105b4fd4a1786c49f30f29919f0cb865eae000761eb3aa17e50da93465"
+    },
+    {
+      "path": "actual/cli-mini/launch-records-fixture.json",
+      "bytes": 11905,
+      "sha256": "86fae2184e52472331ce8faf92affb5bb6d93c6429dcb8ab4a4949cea0272625"
+    },
+    {
+      "path": "actual/cli-mini/requests.json",
+      "bytes": 2941,
+      "sha256": "9f32d7b39b3d91274d24312c8a0f2645329ae742514ad708ead80a68a8e3d8d7"
+    },
+    {
+      "path": "actual/cli-mini/result.json",
+      "bytes": 2434,
+      "sha256": "888fc7081b5628301cd248d2dafe3cd77073a05513f610dd1e16bb345b615f8d"
+    },
+    {
+      "path": "actual/cli-mini/spawn-builder.log",
+      "bytes": 980,
+      "sha256": "895180ebf7b4f29ad6f8a54d50f345115ba81bc08162490b832890c441df9600"
+    },
+    {
+      "path": "actual/cli-mini/spawn-lead.log",
+      "bytes": 521,
+      "sha256": "fa0c2c62f9ede7bd44e7d0bf32c5b0ec885dbc23c948ec1a8cba2fd80fae0187"
+    },
+    {
+      "path": "actual/cli-mini/spawn-records-fixture.log",
+      "bytes": 585,
+      "sha256": "e7e872422695d07fba2b0e081fdcfe7f89265458de8d1455c6d51a7f2332aea9"
+    },
+    {
+      "path": "actual/cli-mini-harness-nonpass/brief-builder.txt",
+      "bytes": 7566,
+      "sha256": "47984d244d61c96e295949d93b7b06f4eff4f54de1a4b522968cf287933c1614"
+    },
+    {
+      "path": "actual/cli-mini-harness-nonpass/brief-lead.txt",
+      "bytes": 11627,
+      "sha256": "51d08b8bab2998aa7799a927f41dc315ae193f238f6c0cc9a5dc0236d5b7bb52"
+    },
+    {
+      "path": "actual/cli-mini-harness-nonpass/brief-records-fixture.txt",
+      "bytes": 11506,
+      "sha256": "bfdd011dd102a109b7d351b815069ac2890cb3ff1f26875ec0ea93a14df0cd41"
+    },
+    {
+      "path": "actual/cli-mini-harness-nonpass/launch-lead.json",
+      "bytes": 12016,
+      "sha256": "1551bb105b4fd4a1786c49f30f29919f0cb865eae000761eb3aa17e50da93465"
+    },
+    {
+      "path": "actual/cli-mini-harness-nonpass/requests.json",
+      "bytes": 1604,
+      "sha256": "2e399e8823280131fcd88bd6d7a4c9b94404eac3753638bfc9989e36d0ca7f10"
+    },
+    {
+      "path": "actual/cli-mini-harness-nonpass/result.json",
+      "bytes": 1314,
+      "sha256": "a55e2137ffbb398bf8c320b1c1c3c51450291b96d19792fb9006ccdcf3496b52"
+    },
+    {
+      "path": "actual/cli-mini-harness-nonpass/spawn-lead.log",
+      "bytes": 521,
+      "sha256": "68f7de034b3a2244d891774a20a1c8373d59c6f2d33e798769fa14fee430fdf9"
+    },
+    {
+      "path": "actual/cli-mini-harness-nonpass/spawn-records-fixture.log",
+      "bytes": 585,
+      "sha256": "b8295f787dfd15b74564b0549e1af7fa24433c178552e53195e8d84334c1944b"
+    },
+    {
+      "path": "actual/cli-mini-harness-nonpass.log",
+      "bytes": 381,
+      "sha256": "69fedd8f834a2cdd8045c05deb42b4a1babbdd3fa1a9e31878fdf5e54d5f4451"
+    },
+    {
+      "path": "actual/cli-mini-run.log",
+      "bytes": 90,
+      "sha256": "902e0dfafb83136aaa23c4bf07c4341c54387753126463e87f49e5c212726549"
+    },
+    {
+      "path": "actual/current-worker-brief.txt",
+      "bytes": 7012,
+      "sha256": "17b482b2ca8a9356fcc82fbff05666e4ce17eeb196aa2735e125d7c537f1d01f"
+    },
+    {
+      "path": "actual/custom/deployed-layout-preview.png",
+      "bytes": 88677,
+      "sha256": "bb8bd3bbdfc605c82ba7f9a109278a1394d2631a14fa14b4af387197277fb793"
+    },
+    {
+      "path": "actual/custom/production-browser.log",
+      "bytes": 168,
+      "sha256": "fe42fa378a67547e6eb44cecb3f320bc3a5b1bb076869e6d7de318d992e06992"
+    },
+    {
+      "path": "actual/custom/result.json",
+      "bytes": 21784,
+      "sha256": "320547b979113d0cb276eb5718fc6544eb02e833b8cd247af38001d057505fc2"
+    },
+    {
+      "path": "actual/delivery-disposition-2022.json",
+      "bytes": 3235,
+      "sha256": "5b33d245d94eefab769a6c6538d364bbd98c60f4b42bb817588e570d9c38f1c0"
+    },
+    {
+      "path": "actual/deployments.json",
+      "bytes": 8829,
+      "sha256": "f33a30444e8701caf690214f3dc32b34e88cff6192f4dd7e9083f756bbedbd9d"
+    },
+    {
+      "path": "actual/immutable/deployed-layout-preview.png",
+      "bytes": 88677,
+      "sha256": "bb8bd3bbdfc605c82ba7f9a109278a1394d2631a14fa14b4af387197277fb793"
+    },
+    {
+      "path": "actual/immutable/production-browser.log",
+      "bytes": 175,
+      "sha256": "2326a5ecc8ffe2d7fc8ffd0c0e8b0511c94d1df79f50a714a29cfc724d70c6ca"
+    },
+    {
+      "path": "actual/immutable/result.json",
+      "bytes": 21794,
+      "sha256": "868c65564b4ec269d45fabc1df895a453ebcd0420ba8762bb21eed4c6323cb90"
+    },
+    {
+      "path": "actual/install-air.json",
+      "bytes": 415,
+      "sha256": "0398ff88c2227e62f2d92589f6e3b526465f52154478486d35062cb560c8e350"
+    },
+    {
+      "path": "actual/install-cli.py",
+      "bytes": 1004,
+      "sha256": "9d9cf2a86abd76b01ea6e065e30c243412e6c58b08363a8de26b112a7d0f963d"
+    },
+    {
+      "path": "actual/install-mini.json",
+      "bytes": 414,
+      "sha256": "ee9a377923d06da92bde2d394dd4ae7624196ee99ee4fe1f21b8439b6d865bb3"
+    },
+    {
+      "path": "actual/installed-fixture.py",
+      "bytes": 6939,
+      "sha256": "585f2bb1c549cdb3629dff336cba76ceedfe2c65dfa12cae1b58b4665cf3695a"
+    },
+    {
+      "path": "actual/mini/deployed-layout-preview.png",
+      "bytes": 88677,
+      "sha256": "bb8bd3bbdfc605c82ba7f9a109278a1394d2631a14fa14b4af387197277fb793"
+    },
+    {
+      "path": "actual/mini/production-browser.log",
+      "bytes": 163,
+      "sha256": "5f5f358f33d985f87babd852a5c15a72c702bd8b209fa45044be89d62aa9d622"
+    },
+    {
+      "path": "actual/mini/result.json",
+      "bytes": 21847,
+      "sha256": "ace397230641282135043bbbed2affa9343b49cfe529406aae3b3a77b05c1855"
+    },
+    {
+      "path": "actual/mini-swap.json",
+      "bytes": 575,
+      "sha256": "dc4b154b8885d3f7a47bb149efb34b9e6585ac79066b8926c3ae3207f2394ac9"
+    },
+    {
+      "path": "actual/origins.json",
+      "bytes": 68967,
+      "sha256": "24dcd9a657e3e65a2baae719b38b92d17b68815280008c5217e9630ec4ed714e"
+    },
+    {
+      "path": "actual/preflight.json",
+      "bytes": 1045,
+      "sha256": "fe8b8e85e5771ddd500d4a9efba0a2781efeb29bd534d1a4e488902c0a193caa"
+    },
+    {
+      "path": "actual/verify-origins.log",
+      "bytes": 259,
+      "sha256": "445a60f82bc282a911fa3f194a01e593480dfd782021957ed89f19339e96d0ac"
+    },
+    {
+      "path": "actual/verify-origins.mjs",
+      "bytes": 3576,
+      "sha256": "3345541f00dd2befa398b2e0f829b8e2f285862a4d75e8c4756c115285baf9b9"
+    },
+    {
+      "path": "actual/worker-preflight.json",
+      "bytes": 2391,
+      "sha256": "c2ac25a580edd9321e121b9acaaf8155c9773af55a0d99f05e9b710dc8df325c"
+    },
+    {
+      "path": "actual/wrangler-deploy.log",
+      "bytes": 356,
+      "sha256": "b83328cd13d5bc275bfd2129acdd7f75e6a7e87040d7d529e9960d3867b4dad8"
+    }
+  ],
+  "documentEvidence": [
+    {
+      "path": "docs/handler-allocation.md",
+      "bytes": 44258,
+      "sha256": "962d1fd81fa2461607f41f536863836ce5a81ae3b045b27c178c8ae5c8e902ee"
+    },
+    {
+      "path": "docs/handoff.md",
+      "bytes": 93676,
+      "sha256": "905b0fb4080922713a10a9ef5aed66606a1c29549703e67db64014aefac9befd"
+    },
+    {
+      "path": "docs/releases/handler-allocation-preparation.json",
+      "bytes": 9162,
+      "sha256": "8b54f8d22da7db0057a7abcb1c6201a469355f76e17622fb8562f793b0037a8a"
+    }
+  ]
+}

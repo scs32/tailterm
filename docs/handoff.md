@@ -1,6 +1,48 @@
 # Development handoff — September 10, 2026
 
-## September 10 pulldown recurrence — actual release verified, final acceptance pending
+
+## September 10 handler allocation — actual release verified, acceptance pending
+
+Feature `wi_207f20d6eefcfa09` revision10/scope9, original order #1880,
+preparation #1948 and actual release #2004 (handler confirmation #2009), is
+published from exact frozen combined source
+`bd9a1ad18f3a45be1e8ac043cbe5189a0c863741`. It includes accepted pulldown
+`43c1da3` and corrected allocation `f646981`. Root integration reached
+`c9f8b4e7f11adaaf61f30474a8b9c3369c365a91`; later report-only commits do not
+rebuild or alter the published package. The owner screenshot is preserved.
+
+Current frontend: deployment `4cd51bdc-ea7b-48c0-829c-2adb6673aec6`,
+`https://4cd51bdc.tailos.pages.dev`, `https://tailos.tailarr.com`, and Mini
+`http://127.0.0.1:4318`. Manifest SHA-256:
+`db40f2f55299ae903151455a40d8475da16ce1d4dedc6f6eff3f20143945270d`.
+Retained package:
+`.build/worktrees/handler-allocation-integration/.build/retained-handler-allocation-bd9a1ad`.
+Worker and independent lead #2015 each verified manifest/index/81 public assets
+on all three origins; fresh production Chromium/WASM/synthetic-vault/clipboard/
+layout checks pass. Mini still runs PID60799/PPID1 after an atomic directory swap.
+
+Both Mini and Air CLIs now hash
+`8fb4b792d2945126e90794f8ce0e597ee12fa528599de349cb191d2ba3035ddb`, with exact
+previous Agents binaries retained at `~/.local/bin/tt-before-handler-allocation-bd9a1ad`.
+Each installed CLI passes three role briefings and isolated actual private-tmux
+launch captures; no live task/allowance or real provider fixture was used.
+Explicit current-thread delivery #2016–#2019 and handler readiness #2021 were
+accepted as delivery evidence by lead #2022. The actual next-launch constraint
+is exhausted four-identity lifetime allowance despite open-agent capacity. No new
+item is selected/started; a refreshed handoff and recorded capacity authorization
+are required. Source/CLI changes alone do not update active threads or install a scheduler.
+See [the full report](handler-allocation.md) and
+[actual receipt](releases/tailos-2026-09-10-handler-allocation.json) for delivery,
+nonpasses and limits. Final lead acceptance and handler saved completion remain
+pending; no worker closure is implied.
+
+Immediate frontend rollback is accepted pulldown43c1da3 below, manifest
+`a560d5db9ce36d0eda86732b1765b82a5db60960ccc4de96d03149f767ca54da`; its exact prior
+Mini directory is `.build/releases/handler-allocation-previous-mini-2004`.
+Keep v2 compatibility. The existing hub remains the accepted Agents release;
+no hub/relay/network/Tailscale/service restart or Air webpage preview change occurred.
+
+## September 10 pulldown recurrence — actual release accepted (previous frontend)
 
 Bug `wi_85a66e159b50a309` revision8/scope6, implementation order #1888,
 preparation #1935 and actual release #1970 is published from exact clean source
@@ -10,7 +52,7 @@ accepted source/report `9d1d57c553434c30d2b6095f6c239d10ef06fc76`; the actual
 report/receipt/handoff are later documentation, without rebuilding that package.
 The unrelated owner screenshot and independent handler-allocation work are preserved.
 
-Current TailOS deployment is `621eb35c-7578-4c8c-9d4a-e16eea01d196` at
+Previous TailOS deployment was `621eb35c-7578-4c8c-9d4a-e16eea01d196` at
 `https://621eb35c.tailos.pages.dev`, `https://tailos.tailarr.com`, and the
 byte-identical Mini package at `http://127.0.0.1:4318`. Manifest SHA-256:
 `a560d5db9ce36d0eda86732b1765b82a5db60960ccc4de96d03149f767ca54da`.
@@ -40,11 +82,11 @@ preserving **PID60799/PPID1**. Previous served Agents bytes remain at
 remains `.build/releases/agents-library-22ab000/dist-static`, manifest
 `bd9c2ac5753ec8455f3c85ce5a94f5fe6d4955d049e57ce210ca59204dd886f3`, deployment
 `53780e9d-bd87-43e9-8b21-a59c62b43430`. Retain v2 Agents/Teams/Queue compatibility.
-Hub and Mini/Air CLIs stay on the accepted Agents release below; no hub/CLI install,
+At that release, hub and Mini/Air CLIs stayed on the accepted Agents release below; no hub/CLI install,
 network/Tailscale/relay/service restart, Air preview, live fixture/data or lifecycle
-change accompanied this frontend release. Item revision8/scope6 and ACTIVE Queue
-binding remain pending lead final actual acceptance and handler saved completion.
-No Done or worker closure is claimed here.
+change accompanied this frontend release. Lead accepted the actual release in #2001. Handler #2006/#2007 confirmed Bug
+Done revision9 and Queue completed revision8; the pulldown worker was closed.
+Its immutable release evidence remains preserved after the allocation release.
 
 ## September 10 Agents library — actual release accepted
 
@@ -58,7 +100,7 @@ retain frozen settings and exact identity. See [the complete implementation and 
 and [release receipt](releases/tailos-2026-09-10-agents-library.json).
 
 The retained clean source, binaries and static package are at
-`.build/releases/agents-library-22ab000`. Current frontend is
+`.build/releases/agents-library-22ab000`. At that release the frontend was
 `https://53780e9d.tailos.pages.dev`, `https://tailos.tailarr.com`, and Mini
 `http://127.0.0.1:4318`. Manifest SHA-256:
 `bd9c2ac5753ec8455f3c85ce5a94f5fe6d4955d049e57ce210ca59204dd886f3`.
@@ -75,7 +117,7 @@ The existing TrueNAS hub is RUNNING from immutable release
 Lead verified its single container, existing private listener and state/token
 mounts. Profile service v2 retains instance `profilehub_67c148b93820fd03`,
 supports envelopes 1/2 and advertises minimum write envelope version 2.
-Mini and Air installed Darwin arm64 CLI SHA-256
+At that release, Mini and Air installed Darwin arm64 CLI SHA-256 was
 `465498d97465994aaecdfb44ba9c7725b55dc5858547495ed0bcfaffc8d9346d`;
 both were independently checked and retain
 `~/.local/bin/tt-before-agents-library-22ab000`. No relay was restarted.

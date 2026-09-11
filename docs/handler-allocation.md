@@ -2,8 +2,11 @@
 
 Feature `wi_207f20d6eefcfa09`, In progress revision 10/scope 9, project
 `tsk_2cfcff70a0fbe967`. Implementation order **#1880**, recording original
-lead order #1877; deliberate selection #1872. This is a source candidate,
-not deployed work or a completed feature.
+lead order #1877; deliberate selection #1872. The corrected candidate and
+combined preparation were accepted; actual release #2004 is now deployed and
+verified, pending final lead acceptance and handler saved completion. Earlier
+source/preparation sections preserve their historical checkpoint status; the
+actual-release section below records the current result.
 
 ## Provenance, admission and ownership
 
@@ -441,3 +444,212 @@ alter the active lead/handler policy by pretending this source candidate is
 installed. Only db-handler can confirm saved feature completion after the
 required lead acceptance and evidence.
 
+## Actual release — order #2004 (verification complete; final acceptance pending)
+
+This section supersedes the preparation-only deployment status above while
+preserving that historical evidence and the immutable preparation plan. Feature
+`wi_207f20d6eefcfa09` remains revision10/scope9 pending lead acceptance and handler
+save/readback. Original recorded implementation order #1880 (lead #1877), exact
+worker `agt_8b6c897c46d942f1` / `run_3cc227dcad338504`, context digest
+`5e1c128c67912dce602881df0c60d548120d4db8e9130d681b715dff37e36855`, and separate
+Start #1901 are unchanged. Handler #2009 verified native release order #2004,
+receipt `mpr_dcfdf79f085d0667`. Preparation acceptance #1985/#1986 and pulldown
+actual acceptance #2001 released the exclusive publication slot. This actual
+release is authorized separately from source/preparation work.
+
+### Exact integration and publication
+
+Root `tasks-hub` was tracked-clean at
+`47d3f5cfc60b3478a290d1c526379647225c0c97`. Two mechanical, conflict-free merges
+integrated accepted application `bd9a1ad18f3a45be1e8ac043cbe5189a0c863741` and
+preparation report `207846c4eed6019f3b05217943b968c1301401d6`, producing
+`c9f8b4e7f11adaaf61f30474a8b9c3369c365a91`. Intervening pulldown report, receipt
+and handoff were preserved. Differences from the frozen application were
+exclusively documentation. The unrelated untracked owner screenshot was preserved.
+No package rebuild, candidate edit or dependency upgrade accompanied release.
+
+The exact retained package remains at
+`.build/worktrees/handler-allocation-integration/.build/retained-handler-allocation-bd9a1ad`.
+Its `dist-static/release.json` is 14,861 bytes, SHA-256
+`db40f2f55299ae903151455a40d8475da16ce1d4dedc6f6eff3f20143945270d`, with82 inventory
+entries including `_headers` and81 public assets. Darwin arm64 CLI is6,698,210
+bytes, SHA-256 `8fb4b792d2945126e90794f8ce0e597ee12fa528599de349cb191d2ba3035ddb`.
+The source archive is9,809,920 bytes, SHA-256
+`5e506bf6659ddc06588cfd0fa62e727d6e41a67d906f8d793584335589da87d8`.
+All retained bytes were reverified before publication.
+
+Executed from the retained directory:
+
+```sh
+npx wrangler pages deploy dist-static --project-name tailos --branch main --commit-hash bd9a1ad18f3a45be1e8ac043cbe5189a0c863741 --commit-dirty=false
+```
+
+Exit0; cached Wrangler4.131.0 uploaded14 files with68 existing. Native deployment
+list readback confirms Production/main source `bd9a1ad`, deployment
+`4cd51bdc-ea7b-48c0-829c-2adb6673aec6`, immutable origin
+`https://4cd51bdc.tailos.pages.dev`. Custom origin is
+`https://tailos.tailarr.com`; Mini remains `http://127.0.0.1:4318`. Checkpoint #2014
+provided exact deployment/manifest information for independent lead verification.
+The old `tailterm` Pages project was not targeted.
+
+Before publication, custom and Mini both served accepted pulldown `43c1da3`,
+manifest `a560d5db9ce36d0eda86732b1765b82a5db60960ccc4de96d03149f767ca54da`.
+Both the live Mini directory and retained pulldown package passed all82 local
+inventory hashes. A verified clone of the new package was staged beside Mini's
+live directory, then exchanged using same-filesystem macOS `renameatx_np`
+`RENAME_SWAP`. The exact old directory is retained at
+`.build/releases/handler-allocation-previous-mini-2004`. New and old inventories
+were checked after exchange. Preview **PID60799/PPID1** stayed unchanged; no
+preview or other production service was restarted.
+
+### Served frontend and independent checks
+
+The worker independently checked all three origins with identity encoding:
+manifest bytes/hash, canonical `/` index,81 public asset sizes/SHA-256 hashes,
+applicable MIME types and absence of unexpected Content-Encoding. Raw `.wasm.gz`
+bytes retain the gzip MIME contract. All249 origin checks passed. Each origin
+also passed a fresh disposable Chromium production-bundle/WASM smoke: synthetic
+vault/key creation, clipboard copy, lock/reopen key recovery, three viewport
+layouts, Tailscale sign-in readiness without login, and no page errors.
+
+Lead #2015 independently executed249 origin checks and a fresh custom-origin
+production Chromium/WASM/vault/clipboard/layout run. Its logs are
+`/tmp/tailterm-handler-release-assets-review.log` and
+`/tmp/tailterm-handler-lead-deployed.log`; these are independent evidence, not
+worker rerun attribution. The worker's raw evidence, per-asset receipts and
+screenshots are retained under package `actual/{immutable,custom,mini}` and
+`actual/origins.json`.
+
+These production checks complement the accepted combined preparation checks:
+focused JS35/35; handler clauses13 per Chromium/WebKit plus encrypted-v2 recovery;
+pulldown source and exact compiled-CSS fixtures80 editor attempts and100 nonmodal
+cycles per engine; existing dropdown4/4; Go10 top-level/58 subtests and vet.
+Compiled-CSS fixtures use accepted source interaction modules, not full compiled
+bootstrap picker automation. No native Safari, physical pointer or owner-device
+verification is claimed.
+
+### Installed CLI and actual launch delivery
+
+Mini and Air each still had the expected Agents CLI SHA-256
+`465498d97465994aaecdfb44ba9c7725b55dc5858547495ed0bcfaffc8d9346d` immediately
+before replacement. Exact backups were retained on each host at
+`~/.local/bin/tt-before-handler-allocation-bd9a1ad`; conflicting backups would have
+stopped installation. The reviewed candidate was staged in `~/.local/bin`,
+verified executable and SHA-256, and atomically renamed to `tt`. Mini installation
+was2026-09-11T03:54:39.999808Z; Air2026-09-11T03:54:43.306793Z. Both installed
+binaries now hash `8fb4b792d2945126e90794f8ce0e597ee12fa528599de349cb191d2ba3035ddb`.
+No installed relay or running agent process was restarted.
+
+Each installed binary was exercised against a disposable loopback HTTP protocol
+stub with a private tmux socket, explicit empty tmux config, isolated relay state
+and fake Python provider. Minimal test environments did not inherit live thread,
+hub configuration or credentials. Three installed `brief` calls and three actual
+`spawn`/`wrap` executions captured lead, database-handler and ordinary worker
+arguments. Each provider received exactly one complete prompt argument. Both hosts
+produced byte-identical role briefings and launch captures. The ordinary worker
+retained exact synthetic task/item revision3/order17/run/context and item environment;
+the two project-role fixtures correctly remained unbound. Only the synthetic hub
+received registrations/events. No real model, live work item or live helper allowance
+was used. This protocol stub verifies installed command delivery, not an additional
+production-hub admission or authorization test.
+
+| Installed role fixture | Brief bytes | Brief SHA-256 |
+| --- | ---: | --- |
+| Lead | 11,627 | `51d08b8bab2998aa7799a927f41dc315ae193f238f6c0cc9a5dc0236d5b7bb52` |
+| Handler | 11,506 | `bfdd011dd102a109b7d351b815069ac2890cb3ff1f26875ec0ea93a14df0cd41` |
+| Worker | 7,566 | `47984d244d61c96e295949d93b7b06f4eff4f54de1a4b522968cf287933c1614` |
+
+Complete prompts, selected exact identity environment, synthetic request log and
+receipts are in package `actual/cli-mini` and `actual/cli-air`. Private tmux
+servers and fake providers were stopped and verified absent. Air temporary scripts,
+candidate transfer and evidence directory were removed only after exact local copy
+verification; installed CLI and rollback backup remain. No useful long-lived test
+service remains.
+
+### Active-thread delivery and follow-through
+
+Installed-policy checkpoint #2016 supplied exact role texts/digests to lead.
+Lead #2018 explicitly delivered worker policy to this exact existing worker/run,
+requiring actual installed `tt brief` and substantive final evidence instead of an
+acknowledgement. The worker read its real project-bound installed briefing:
+7,012 bytes, SHA-256 `17b482b2ca8a9356fcc82fbff05666e4ce17eeb196aa2735e125d7c537f1d01f`,
+retained in package `actual/current-worker-brief.txt`. The original work-item
+binding, Start and scope are preserved; synthetic identities are not adopted.
+Finishing this report/receipt and cleanup inventory is the required concrete
+same-item progress checkpoint.
+
+Lead also read its real installed briefing at
+`/tmp/tailterm-lead-installed-brief-2016.txt`,11,062 bytes, SHA-256
+`53e56702eae59948a08ec3e55354bf2bc5939618b104394e5921a15772de183d`, as reported in
+#2018. Handler delivery/readiness follow-through is recorded by lead #2022 below. These facts
+establish particular deliveries and actions, not deterministic model obedience.
+Startup strings do not rewrite frozen saved launch plans, automatically alter
+active model contexts, install a persisted scheduler, or establish per-agent
+technical authentication/filesystem isolation.
+
+Lead #2022 verifies concrete handler delivery and the resulting readiness action:
+recipient `agt_3760a4361c514a03` / `run_2dd77d68cb7bcb39` received #2017,
+read through #2017, and read its actual installed briefing (10,941 bytes, SHA-256
+`1a71327756f9d8b893904f16b9433cc70a49371d766ddeec90e4399a89ba5107`). Following
+one same-order progress follow-up #2020, handler returned substantive native
+readiness/capacity result #2021. Lead independently hashed the559,523-byte
+readiness archive as
+`42c79e339a68754d3238a4098c9b029d64cf9b253fc326b1428e211b2a1e3d4e` and accepted
+the concrete no-launch-capacity disposition: maxNewAgents4, spawning enabled,
+four parented lifetime identities and three open agents. Potential search,
+Random Flashes and wizard work is not selected/admitted/started. Next allocation
+requires recorded capacity authorization and refreshed handler handoff; closed
+identity reuse, clearing parent identity, allowance changes or an inferred launch
+path are not authorized. This worker consumes the attributed result/disposition
+without accessing live item/Queue records or taking over allocation.
+
+Lead's exact current recipient is `agt_1186df8d710c0fd7` /
+`run_9e0ddb28df5ae63e`. It applied the policy by delivery, one follow-up,
+independent review and the explicit readiness disposition. Worker #2019 is the
+substantive report/preflight response to #2018; this final artifact incorporates
+#2022. Read snapshots reported by lead are
+`/tmp/tailterm-policy-roster-after-delivery.json` and
+`/tmp/tailterm-roster-2019.json`. Lead accepts delivery step6 as satisfied in
+#2022, receipt `mpr_deaa41dea3a145f8`; final actual release acceptance remains
+separate. Handler readiness facts are attributed to #2021/#2022 rather than
+claimed as worker database verification. No duplicate readiness loop is needed
+before a meaningful change.
+
+### Nonpasses, rollback and remaining acceptance
+
+The initial prepublication Python urllib request received HTTP403. Canonical
+curl against the same URL passed without credentials or configuration changes.
+The first Mini installed fixture checked the internal literal `database_handler`
+inside human-readable prose; the emitter correctly says `durable Database handler`.
+Only that harness assertion changed, failed evidence was retained, and fresh
+isolated Mini/Air runs passed. Initial process preflight used a session-only display
+target without a pane PID; corrected `list-panes` yielded the exact process tree.
+Lead #2015 separately reports a duplicated relative runner path corrected before
+its successful browser run. The browser test's raw Mini log inherits an `https:true`
+label; the actual tested origin is HTTP and receipts record `http:` correctly.
+None of these harness/transport nonpasses required a product change or rollback.
+Earlier preparation/toolchain and baseline Go/pulldown fixture nonpasses remain
+explicitly preserved above and in the actual receipt. No broad full-suite pass is
+inferred from the focused evidence.
+
+Immediate frontend rollback is the accepted pulldown package
+`.build/releases/pulldown-recurrence-43c1da3/dist-static`, deployment
+`621eb35c-7578-4c8c-9d4a-e16eea01d196`, manifest
+`a560d5db9ce36d0eda86732b1765b82a5db60960ccc4de96d03149f767ca54da`, plus the exact
+previous Mini directory named above. The older Agents frontend is not the immediate
+rollback. CLI rollback uses each verified host-local backup. Retain v2-compatible
+frontend/hub and newer data; no database restoration is part of this release.
+Rollback was not used.
+
+Fresh exact-run inventory identifies worker session `$52`, created1789095750,
+pane PID26335. Its seven freshly inspected descendants had no TCP listeners; preview
+PID60799/PPID1 is outside that tree. Only this worker's test resources were cleaned.
+No hub deployment, Air frontend change, network/Tailscale/relay modification,
+production service shutdown or item/task/agent closure occurred.
+
+The new [actual release receipt](releases/tailos-2026-09-10-handler-allocation.json)
+is separate from the unchanged preparation plan. Final report/handoff edits are
+documentation only and do not alter published bytes. Lead final acceptance,
+handler revision-checked saved report/completion/Queue readback, and any subsequent
+explicit worker release remain pending. This worker does not self-close or claim
+saved feature completion from successful tests.
