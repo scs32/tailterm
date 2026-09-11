@@ -1,0 +1,143 @@
+[
+  {
+    "name": "active-and-ready-independent",
+    "situation": "Builder A owns alpha.js; ready item B owns beta.js; one normal slot is free.",
+    "handler": [
+      "While one builder runs, if capacity and a ready independent item exist",
+      "proactively present a second bounded allocation and complete handoff",
+      "without waiting for another owner prompt"
+    ],
+    "lead": [
+      "Consume and review the handler's proactive independent allocation while another builder runs"
+    ]
+  },
+  {
+    "name": "completion-with-pending-backlog",
+    "situation": "A is accepted with saved receipts; independent B remains ready.",
+    "handler": [
+      "After accepted completion and saved result/receipt readback, perform the next readiness pass"
+    ],
+    "lead": [
+      "Completion of one item is not completion of the open project",
+      "request and consume the actual Database handler's readiness pass",
+      "before yielding"
+    ]
+  },
+  {
+    "name": "no-ready-items",
+    "situation": "No bounded owner-authorized item is ready.",
+    "handler": [
+      "no-ready condition and the next meaningful checkpoint",
+      "do not invent filler or poll continuously"
+    ],
+    "lead": [
+      "state the actual dependency, conflict, capacity or no-ready condition"
+    ]
+  },
+  {
+    "name": "blocked-dependency",
+    "situation": "B requires an unresolved acceptance result from A.",
+    "handler": [
+      "verify current native revision, full history and explicit sources, dependencies",
+      "state the actual dependency"
+    ],
+    "lead": [
+      "Do not silently abandon a resolved dependency whose handoff is still unconsumed"
+    ],
+    "worker": [
+      "when a dependency resolves, consume its handoff and report resumed progress within that order"
+    ]
+  },
+  {
+    "name": "shared-file-overlap",
+    "situation": "A and proposed B both need ownership of shared.js.",
+    "handler": [
+      "existing worker and shared-file ownership",
+      "shared-file conflict",
+      "serialize only actual shared-file integration or dependency conflicts"
+    ]
+  },
+  {
+    "name": "capacity-exhausted",
+    "situation": "No open-agent slot remains; finished helpers already consumed the lifetime allowance.",
+    "handler": [
+      "ordinary-member capacity, helper lifetime allowance and open-agent slots",
+      "exhausted capacity",
+      "Never close unfinished workers or tasks to create capacity",
+      "do not treat exhausted helper allowance as exhausted normal-member capacity"
+    ],
+    "lead": ["Never close unfinished work merely because it is idle"]
+  },
+  {
+    "name": "duplicate-send-or-allocation",
+    "situation": "The same Send or allocation request is delivered twice with an uncertain response.",
+    "handler": [
+      "Reconcile duplicate sends or allocation requests against existing assignments and stable retry receipts before proposing another worker",
+      "Send or notification is review only, never automatic claim, launch, reassignment or closure"
+    ],
+    "worker": ["does not authorize, claim, resume, spawn, or start work"]
+  },
+  {
+    "name": "stale-revision-or-context",
+    "situation": "B changed after selection or has incomplete context; a partial launch retry already has frozen identity.",
+    "handler": [
+      "Stale revision or incomplete/stale context requires refreshed handler verification before allocation",
+      "complete admitted context within its size limit",
+      "preserve source provenance and frozen partial-launch retry identities",
+      "Never truncate context or silently substitute a different revision, run or order"
+    ],
+    "worker": [
+      "Preserve exact item/revision/work-order/agent/run/context digest and separate Start evidence before implementation"
+    ]
+  },
+  {
+    "name": "priority-change",
+    "situation": "Blocked B becomes high priority while lower-priority C is independent and ready.",
+    "handler": [
+      "Priority informs selection among ready items",
+      "never overrides dependencies, ownership or capacity and does not force FIFO"
+    ]
+  },
+  {
+    "name": "same-item-correction",
+    "situation": "Review requests a bounded correction to A from its still-assigned worker; B is another item.",
+    "handler": [
+      "Same-item corrections stay with their assigned worker; a new item requires a fresh normal identity and context"
+    ],
+    "lead": [
+      "Same-item corrections remain with their assigned worker; new items require fresh normal identities and complete admitted context"
+    ],
+    "worker": [
+      "Same-item corrections remain with their assigned worker",
+      "a new item requires a fresh normal identity and complete admitted context"
+    ]
+  },
+  {
+    "name": "complete-handoff-and-receipts",
+    "situation": "A proposed allocation needs exact order/context and later accepted result readback.",
+    "handler": [
+      "item ID/current revision/status, recorded work-order message, concrete owner, scope, owned files/artifacts, exclusions, acceptance checks, dependencies, fresh normal worker name/worktree and complete admitted context",
+      "separate exact Start evidence with item/revision/agent/run/context digest",
+      "saved result/receipt readback"
+    ],
+    "lead": [
+      "exact recipient/run, expected checkpoint and evidence of read, actual Start and concrete progress",
+      "send one follow-up tied to the existing order, then explicitly escalate"
+    ],
+    "worker": [
+      "Results must include verification, remaining dependencies and delivered message/receipt references",
+      "done agent status is not accepted or saved item completion"
+    ]
+  },
+  {
+    "name": "delivery-and-enforcement-limits",
+    "situation": "A host binary or browser definition changes while an earlier thread and frozen retry plan still exist.",
+    "handler": [
+      "auditable instructions, not a persisted scheduler or a guarantee of model obedience"
+    ],
+    "worker": [
+      "not automatically to already-running threads or frozen saved launch plans",
+      "distinguish the emitted prompt, host configuration and explicitly delivered current-thread messages"
+    ]
+  }
+]

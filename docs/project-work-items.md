@@ -135,6 +135,50 @@ cycles; explicit retirement remains respected. Closing a project
 includes the handler in the existing durable session-cleanup process and keeps
 the saved records.
 
+The handler also owns backlog readiness, dependencies, priority, occupancy and
+assignment preparation. At intake, accepted completion and meaningful state
+changes, it performs a readiness pass. When another builder is active and ready
+independent work fits available capacity, it proactively supplies a bounded
+allocation and complete handoff to the lead for launch review. Otherwise it
+reports the actual dependency, file conflict, exhausted capacity or no-ready
+condition and the next meaningful checkpoint. It does not invent filler or poll
+continuously. Priority helps choose ready work without overriding dependencies,
+ownership or capacity, and does not force FIFO.
+
+Before proposing work, the handler verifies current native revisions, full
+history and explicit sources, worker/file ownership, ordinary and helper capacity,
+and complete admitted context within its size limit. Normal-member capacity is
+distinct from helper lifetime allowance. Never truncate context or silently
+substitute another revision, run or order. Duplicate sends and uncertain
+allocation responses are reconciled against existing assignments and retry
+receipts. Stale or incomplete context requires fresh verification. The handoff
+names the item/revision/status, recorded order, owner, scope, files, exclusions,
+acceptance checks, dependencies, fresh normal worker/worktree and complete context.
+Send is review only. Deliberate selection, bounded order, admission and separate
+exact Start remain distinct, preserving item/agent/run/context identity and frozen
+partial-launch retries. Independent implementation may proceed concurrently;
+only real shared-file integration and dependency conflicts require serialization.
+
+The lead consumes that readiness pass after accepted closeout: finishing one item
+does not finish an open project. It deliberately chooses the next authorized
+bounded item or reports the actual constraint before yielding. Important handoffs
+retain message sequence, exact recipient/run, expected checkpoint and evidence of
+read, actual Start and concrete progress. Delivery and retrieval alone do not
+prove execution. One follow-up for missed required progress is followed by explicit
+escalation if still unresolved. Resolved dependencies must be consumed; workers
+report resumed progress within their order. Same-item corrections remain with the
+assigned worker, while new items get fresh normal identities and complete context.
+Never close unfinished work to create capacity.
+
+These are generated instruction contracts, not an automatic allocator, persisted
+scheduler, watchdog or guarantee of model obedience. The browser generates the
+handler assignment; the installed host CLI emits shared role briefings for
+launches and `tt brief`. Saved retry plans retain their original assignment text,
+and changing source or host configuration does not update an already-running
+thread. A reviewed rollout must verify actual delivered prompts and explicitly
+message active threads as needed. See [the implementation report](handler-allocation.md)
+for delivery paths, synthetic evidence and remaining release dependencies.
+
 Each implementation worker is dedicated to one bounded bug or feature. After
 the handler's recorded result and lead acceptance resolve its dependencies, the
 worker is closed through its exact run and durable cleanup receipt while the

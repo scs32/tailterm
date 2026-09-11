@@ -2,9 +2,36 @@
 import { chromium, webkit } from "@playwright/test";
 import { createServer } from "vite";
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
+
+const allocationScenarios = JSON.parse(
+  readFileSync(new URL("./handler-allocation-cases.json", import.meta.url)),
+);
 
 const server = await createServer({
   configFile: false,
+  plugins: [
+    {
+      name: "handler-vault-no-wasm",
+      enforce: "pre",
+      load(id) {
+        if (!id.endsWith("/client/wasm-runtime.js")) return null;
+        // This fixture uses WebCrypto/IndexedDB, never SSH keys or the WASM
+        // runtime. Fail if that boundary changes; no production asset is needed.
+        return [
+          "loadRuntime",
+          "createIPN",
+          "validatePrivateKey",
+          "generatePrivateKey",
+        ]
+          .map(
+            (name) =>
+              `export function ${name}() { throw new Error("WASM is outside this isolated handler fixture"); }`,
+          )
+          .join("\n");
+      },
+    },
+  ],
   server: { host: "127.0.0.1", port: 0 },
 });
 await server.listen();
@@ -98,6 +125,12 @@ try {
       assert.equal(first.plans.length, 1);
       assert.equal(first.plans[0].fields.model, "updated-model");
       assert.equal(first.plans[0].previous.fields.model, "fixture-model");
+      for (const scenario of allocationScenarios)
+        for (const clause of scenario.handler)
+          assert.ok(
+            first.plans[0].fields.prompt.includes(clause),
+            `${engine.name()} ${scenario.name}: browser assignment missing ${clause}`,
+          );
       await page.reload();
       const reloaded = await page.evaluate(async () => {
         const vault = await import("/client/local-vault.js");
@@ -130,8 +163,15 @@ try {
             const request = db
               .transaction("vault")
               .objectStore("vault")
-              .get("encrypted");
+              .get("encrypted-v2");
             request.onsuccess = () => {
+              if (!request.result) {
+                db.close();
+                reject(
+                  new Error("Expected the current v2 encrypted vault envelope"),
+                );
+                return;
+              }
               resolve(request.result);
               db.close();
             };
@@ -155,6 +195,7 @@ try {
       assert.equal(reloaded.exported, undefined);
       assert.equal(reloaded.synced, undefined);
       assert.equal(reloaded.rawContainsPlan, false);
+      assert.equal(reloaded.plan.fields.prompt, first.plans[0].fields.prompt);
       await page.reload();
       const deleted = await page.evaluate(async () => {
         const vault = await import("/client/local-vault.js");
@@ -180,7 +221,7 @@ try {
       assert.equal(deleted.missingHostPlan, true);
       assert.deepEqual(deleted.remaining, []);
       console.log(
-        `${engine.name()}: handler plans await encrypted save, survive reload/missing host, reject failed writes, stay out of exports/sync, and delete durably.`,
+        `${engine.name()}: 12 allocation instruction contracts emitted; handler plans await encrypted save, survive reload/missing host, reject failed writes, stay out of exports/sync, and delete durably.`,
       );
     } finally {
       await browser.close();

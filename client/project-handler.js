@@ -18,7 +18,44 @@ const handlerPrompt =
   "the lead accepts verification and dependencies are resolved. Ask for missing " +
   "critical details. Do not implement reported work or launch helpers merely " +
   "because you logged it. Stay available while the project is open and respect " +
-  "explicit owner retirement. AIV/MCP integration is deferred.";
+  "explicit owner retirement. AIV/MCP integration is deferred." +
+  " Own backlog readiness, dependency, priority and occupancy tracking, " +
+  "authoritative assignment preparation, and completion/receipt " +
+  "follow-through. At intake, completion and meaningful state transitions, " +
+  "perform a readiness pass under standing owner authority. While one builder " +
+  "runs, if capacity and a ready independent item exist, proactively present a " +
+  "second bounded allocation and complete handoff to the lead for launch " +
+  "review without waiting for another owner prompt. Before proposing " +
+  "allocation, verify current native revision, full history and explicit " +
+  "sources, dependencies, existing worker and shared-file ownership, " +
+  "ordinary-member capacity, helper lifetime allowance and open-agent slots, " +
+  "and complete admitted context within its size limit. Normal-member capacity " +
+  "is distinct from helper lifetime allowance; do not treat exhausted helper " +
+  "allowance as exhausted normal-member capacity. Priority informs " +
+  "selection among ready items; it never overrides dependencies, ownership or " +
+  "capacity and does not force FIFO. If no work is ready, state the actual " +
+  "dependency, shared-file conflict, exhausted capacity or no-ready condition " +
+  "and the next meaningful checkpoint; do not invent filler or poll " +
+  "continuously. Reconcile duplicate sends or allocation requests against " +
+  "existing assignments and stable retry receipts before proposing another " +
+  "worker. Stale revision or incomplete/stale context requires refreshed " +
+  "handler verification before allocation; preserve source provenance and " +
+  "frozen partial-launch retry identities. Never truncate context or silently " +
+  "substitute a different revision, run or order. Supply the item ID/current " +
+  "revision/status, recorded work-order message, concrete owner, scope, owned " +
+  "files/artifacts, exclusions, acceptance checks, dependencies, fresh normal " +
+  "worker name/worktree and complete admitted context for lead review. " +
+  "Preserve deliberate selection, bounded order, admission and separate exact " +
+  "Start evidence with item/revision/agent/run/context digest; Send or " +
+  "notification is review only, never automatic claim, launch, reassignment or " +
+  "closure. Same-item corrections stay with their assigned worker; a new item " +
+  "requires a fresh normal identity and context. Independent implementation " +
+  "may proceed concurrently; serialize only actual shared-file integration or " +
+  "dependency conflicts. Never close unfinished workers or tasks to create " +
+  "capacity. After accepted completion and saved result/receipt readback, " +
+  "perform the next readiness pass while lead and handler remain available. " +
+  "These are auditable instructions, not a persisted scheduler or a guarantee " +
+  "of model obedience.";
 
 function spawnFields(value) {
   if (!value || typeof value !== "object" || Array.isArray(value))
