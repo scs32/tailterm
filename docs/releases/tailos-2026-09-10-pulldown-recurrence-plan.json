@@ -1,0 +1,355 @@
+{
+  "schema": 1,
+  "status": "prepared_for_review_not_deployed",
+  "preparedAt": "2026-09-11T03:25:41.163051+00:00",
+  "workItem": {
+    "taskId": "tsk_2cfcff70a0fbe967",
+    "itemId": "wi_85a66e159b50a309",
+    "revision": 8,
+    "scopeRevision": 6,
+    "implementationOrderMessage": 1888,
+    "originalLeadOrderMessage": 1886,
+    "candidateAcceptanceMessage": 1934,
+    "savedCandidateAcceptanceMessage": 1938,
+    "preparationOrderMessage": 1935,
+    "handlerPreparationVerificationMessage": 1940,
+    "preparationOrderReceipt": "mpr_775431ac749ba41e",
+    "agentId": "agt_769593e945e4452d",
+    "runId": "run_92705aafd2c988e3",
+    "queueStartMessage": 1903,
+    "queueStartReceipt": "qrr_58c3af3a3e0b940d",
+    "queueEntryId": "que_bda73d2596f58590",
+    "queueCycle": 1,
+    "queueRevision": 7,
+    "admittedContextSha256": "cff23897a58e317196e04d8bc70b8acb47f917463446df480345bd411ca45de6"
+  },
+  "source": {
+    "acceptedCommit": "43c1da3a81e7e30c11efaa87b69f3903004cfbc2",
+    "applicationAndTestsCommit": "b10bcd462396661ea688e7eb49a1c4d9b906bec2",
+    "tree": "c128cd143ff89b48f7f72a58f04a804c3080f335",
+    "retainedDirectory": "/Users/stephenspeicher/projects/tailterm/.build/releases/pulldown-recurrence-43c1da3",
+    "detached": true,
+    "clean": true,
+    "rootBaseline": "84daa9c7ea46bf28cf407ce43d60eb4d87d05816",
+    "rootBranchMutated": false,
+    "rootUnrelatedUntrackedScreenshotPreserved": true,
+    "unchangedInputs": [
+      {
+        "path": "package.json",
+        "sha256": "bc1d7b21d7e83d501bac50b855733784ad2c4e68d9147fe961d40e5551240bd0",
+        "unchangedFromRootBaseline": true
+      },
+      {
+        "path": "package-lock.json",
+        "sha256": "a4175ff8886d6c2ee8443e7a928bc1f6f9500cd3b2c24b55fb967175d9eb3f98",
+        "unchangedFromRootBaseline": true
+      },
+      {
+        "path": "client/local-vault.js",
+        "sha256": "114ac4c4401c37c9e6c8461f0017b9ec15a565b1185a4fa255dc1df733f1f13e",
+        "unchangedFromRootBaseline": true
+      },
+      {
+        "path": "client/agents.js",
+        "sha256": "0262a03b551cd34f4a747c28ca964f342c70401a2112255f453aaea878030f56",
+        "unchangedFromRootBaseline": true
+      },
+      {
+        "path": "client/teams.js",
+        "sha256": "db52e59bd890de37d7683a453f554a307875661954486f6ca7ebd6c300ddd7ad",
+        "unchangedFromRootBaseline": true
+      },
+      {
+        "path": "client/queue-view.js",
+        "sha256": "71fbd80d5a5a87681ffa07ec5c9e3b75005e0a8b6948dc9ea240a0d82aa68b93",
+        "unchangedFromRootBaseline": true
+      },
+      {
+        "path": "client/queue.css",
+        "sha256": "69efe8e60bacafe342efec5e010d91018967c360d08565f74a0ba31a9e4464b1",
+        "unchangedFromRootBaseline": true
+      },
+      {
+        "path": "client/task-hub.js",
+        "sha256": "19a0cc9085cd1de995f0c05f904bcd05333515e9344500ebdffbe7df79a92c35",
+        "unchangedFromRootBaseline": true
+      },
+      {
+        "path": "wasm/upstream_js.go",
+        "sha256": "076a70104d5ecbd4dbf3e68ee729811fcca512c51cbc9ef9c268dcf6dde784c5",
+        "unchangedFromRootBaseline": true
+      },
+      {
+        "path": "wasm/ssh_js.go",
+        "sha256": "9781887ee65e3c05120f566c7b4b97eea7b8764dcce2f9387829cb2cdeedf0fc",
+        "unchangedFromRootBaseline": true
+      },
+      {
+        "path": "wasm/upload_js.go",
+        "sha256": "f0404d5fbdb11c08ecbd282fadc5be60ff29ef0461615a429a75819ca26a29f0",
+        "unchangedFromRootBaseline": true
+      },
+      {
+        "path": "wasm/sftp_js.go",
+        "sha256": "1e8d90767220bd2796c37f64f1b05c4b63317d5bd796d59285e93b8d75d02b56",
+        "unchangedFromRootBaseline": true
+      },
+      {
+        "path": "wasm/fixture_js.go",
+        "sha256": "106df3f458e81b027183d1925bc63512dbcbba6a6895776f1c0670a1cb292be1",
+        "unchangedFromRootBaseline": true
+      },
+      {
+        "path": "scripts/build-wasm.sh",
+        "sha256": "f12abb9fa667cc9e61e3a8bacd610a448858ff846b9ea767c10a64b76b827b71",
+        "unchangedFromRootBaseline": true
+      }
+    ]
+  },
+  "build": {
+    "commands": [
+      "npm ci",
+      "npm run build:wasm",
+      "npm run build:static",
+      "npm run verify:release"
+    ],
+    "allExitZero": true,
+    "node": "v26.5.1",
+    "npm": "11.17.0",
+    "hostGo": "go1.26.5 darwin/arm64",
+    "wasmGo": "go1.26.6 darwin/arm64 (automatic toolchain selected by pinned upstream go.mod)",
+    "tailscaleTag": "v1.102.3",
+    "tailscaleArchive": {
+      "path": "/Users/stephenspeicher/projects/tailterm/.build/releases/pulldown-recurrence-43c1da3/.build/tailscale.tar.gz",
+      "bytes": 5295797,
+      "sha256": "0e94d961c31ce7d33e8b7ce4ac6fdbec83ee5658784eed69eb7fce300729d717"
+    },
+    "moduleInventory": {
+      "path": "/Users/stephenspeicher/projects/tailterm/.build/releases/pulldown-recurrence-43c1da3/.build/go-modules.txt",
+      "bytes": 43655,
+      "sha256": "9a762eb01e9bace18169a092a4eb2bac84835b420d5c8ecb3fa389f0fc2d1e57",
+      "entries": 305
+    },
+    "upstreamGoMod": {
+      "path": "/Users/stephenspeicher/projects/tailterm/.build/releases/pulldown-recurrence-43c1da3/.build/tailscale-1.102.3/go.mod",
+      "bytes": 26754,
+      "sha256": "a83e830a7b4dffa80a6c2478b44758695d01c0a3e35e14b824a4e81824ca67d2"
+    },
+    "upstreamGoSum": {
+      "path": "/Users/stephenspeicher/projects/tailterm/.build/releases/pulldown-recurrence-43c1da3/.build/tailscale-1.102.3/go.sum",
+      "bytes": 179345,
+      "sha256": "b52dcc94289be95d6b2f1d3f5766b308bc1f9d99425c6f6dbb8df6bdee148816"
+    },
+    "productionWasm": {
+      "path": "/Users/stephenspeicher/projects/tailterm/.build/releases/pulldown-recurrence-43c1da3/wasm/tailserve.wasm",
+      "bytes": 37951858,
+      "sha256": "d61326d3bd19c5b486d9c53f36b435eef54e56a0dcab2d242fcb6b51f26c8e3a"
+    },
+    "packageLockSha256": "a4175ff8886d6c2ee8443e7a928bc1f6f9500cd3b2c24b55fb967175d9eb3f98",
+    "dependencyUpgrade": false,
+    "testWasmBuilt": false
+  },
+  "package": {
+    "directory": "/Users/stephenspeicher/projects/tailterm/.build/releases/pulldown-recurrence-43c1da3/dist-static",
+    "manifest": {
+      "path": "/Users/stephenspeicher/projects/tailterm/.build/releases/pulldown-recurrence-43c1da3/dist-static/release.json",
+      "bytes": 14861,
+      "sha256": "a560d5db9ce36d0eda86732b1765b82a5db60960ccc4de96d03149f767ca54da"
+    },
+    "manifestCommit": "43c1da3a81e7e30c11efaa87b69f3903004cfbc2",
+    "manifestBuiltAt": "2026-09-11T03:21:55.704Z",
+    "manifestDirty": false,
+    "manifestEntries": 82,
+    "servedAssets": 81,
+    "publicAssetBytes": 80169499,
+    "criticalAssets": {
+      "assets/index-enCwsUvz.js": {
+        "size": 887069,
+        "sha256": "b189088d305c690346c61bba74d1cad3696d9c64d13a5cc7822a4168bdd2a7f4"
+      },
+      "assets/index-enCwsUvz.js.br": {
+        "size": 227850,
+        "sha256": "0057b4a26c0d170deff13888b55a26041af32c5efadf321589702ca86b1c96a6"
+      },
+      "assets/index-enCwsUvz.js.gz": {
+        "size": 258481,
+        "sha256": "c55b95a32254b83a1655e0f3d3583b0d9949b0433b8ca1f24f8df5911bd5fcc6"
+      },
+      "assets/index-pPDH5eKA.css": {
+        "size": 103716,
+        "sha256": "f9cf645a47285b74bc63b0d97d8363f46e76dd567f1fb2b36670b19fed1a8906"
+      },
+      "assets/index-pPDH5eKA.css.br": {
+        "size": 19763,
+        "sha256": "49d2e00e144a3022bc779229bda5e66be8c582e2ed911854ba8ffb4d70346157"
+      },
+      "assets/index-pPDH5eKA.css.gz": {
+        "size": 20146,
+        "sha256": "cc474d27c253f26cd3d6b635c52a0e57cb76fa70844721cb1cc048595979eb36"
+      },
+      "assets/ort-wasm-simd-threaded.asyncify-DMmc6YqF.wasm.gz": {
+        "size": 5670552,
+        "sha256": "9eb00d1b40e9472d0bee06f84b3a351f178f61db7f1a247b5cf915bc0a8c3fc7"
+      },
+      "assets/tailserve-DiCacG8h.wasm.gz": {
+        "size": 8598265,
+        "sha256": "ac0d47cff00d0f26ab7e03faad505a8352700c84fa6a2168b8aea0550a418ae7"
+      },
+      "index.html": {
+        "size": 800,
+        "sha256": "c985753e91460d7e97495105e0156b27698c0c68aca2995716d9fc04b5bda76f"
+      },
+      "speech-runtime/ort-1.26.0-dev.20260416-b7804b056c/ort-wasm-simd-threaded.wasm": {
+        "size": 12942611,
+        "sha256": "f4f290847a4df02d0b93cdbf39b4b0e71acefbe80573e7e6b9342a7abd7b290a"
+      }
+    }
+  },
+  "validation": {
+    "retainedManifest": "82/82 entries verified, clean source and exact HEAD/package-lock",
+    "localPackageBrowser": {
+      "path": "/Users/stephenspeicher/projects/tailterm/.build/releases/pulldown-recurrence-43c1da3/.build/pulldown-preparation/package-check/result.json",
+      "bytes": 19174,
+      "sha256": "602dac6717543f0437a112820b873d5e1c09d283a1d41d62aa7c55737ed87ffb"
+    },
+    "localPackageResult": "81/81 served assets matched SHA256/size; no content encoding; JS/CSS/WASM MIME contracts; Chromium production WASM, synthetic vault/key restore, clipboard, three layouts; disposable localhost server closed",
+    "transportLimitation": "Existing deployed-browser fixture prints https:true even for explicit localhost; this run is HTTP loopback, not HTTPS or deployment evidence.",
+    "compiledStylesheet": "dist-static/assets/index-pPDH5eKA.css",
+    "compiledRecurrenceRunner": {
+      "path": "/Users/stephenspeicher/projects/tailterm/.build/releases/pulldown-recurrence-43c1da3/.build/pulldown-preparation/compiled-recurrence.mjs",
+      "bytes": 14779,
+      "sha256": "1f330e92b2470cce87c025c22c3c9e8c971cd023d8296a511d78d0081becff3c"
+    },
+    "compiledRecurrenceEvidence": {
+      "path": "/Users/stephenspeicher/projects/tailterm/.build/releases/pulldown-recurrence-43c1da3/.build/pulldown-preparation/compiled-recurrence/evidence.json",
+      "bytes": 412933,
+      "sha256": "2cae632423937f57e9e247b3559e7f89646bbf5064fa4f3a52451ac665937a8c"
+    },
+    "compiledRecurrenceResult": "Chromium/WebKit 80 editor open/Escape attempts + 100 nonmodal cycles; preserved drafts/selections/eventual refresh/visible focus; actual source view/helper imports with compiled production CSS, not extraction of the production JS bundle",
+    "queueCompiledStylesheet": "24/24 Chromium/WebKit layout scenarios",
+    "focusedSourceUnits": "26/26 dialog, refresh and Agents library tests",
+    "sourceCandidatePreviouslyAccepted": {
+      "fullJavaScript": "156/156",
+      "priorDialogBrowser": "4/4",
+      "baselinePrematureCloseAttempts": 38,
+      "baselineTotalEditorAttempts": 80
+    },
+    "queueCompiledEvidence": {
+      "path": "/Users/stephenspeicher/projects/tailterm/.build/releases/pulldown-recurrence-43c1da3/.build/queue-layout/built-results.json",
+      "bytes": 582754,
+      "sha256": "812ed240fadb641f92bc74ce0a3a813f8dd99413e1c5472814079aa0a76c8060"
+    }
+  },
+  "nonpassesAndNotices": [
+    "Existing encrypted-draft-vault suite fails identically on unchanged baseline and candidate in Chromium: legacy encrypted IndexedDB key versus encrypted-v2; undefined.includes prevents subsequent restoration assertions and WebKit execution; no fixture/storage repair.",
+    "npm ci reports 3 moderate vulnerabilities, deprecated boolean package and six allow-scripts notices; no upgrade or audit fix performed.",
+    "Vite emits existing >500 kB chunk advisory; production static build completes.",
+    "Initial candidate fixture Tab order/mobile-only control corrections remain in original report.",
+    "Native Safari, physical macOS popup option selection and owner-device confirmation remain unverified; only demonstrated repeated Escape and composer focus geometry are accepted."
+  ],
+  "rollback": {
+    "sourceCommit": "22ab0005795c9a1201766159e7b910fcff8e2a03",
+    "directory": "/Users/stephenspeicher/projects/tailterm/.build/releases/agents-library-22ab000/dist-static",
+    "manifest": {
+      "path": "/Users/stephenspeicher/projects/tailterm/.build/releases/agents-library-22ab000/dist-static/release.json",
+      "bytes": 14861,
+      "sha256": "bd9c2ac5753ec8455f3c85ce5a94f5fe6d4955d049e57ce210ca59204dd886f3"
+    },
+    "verifiedEntries": 82,
+    "method": "read-only existing verify-release.mjs passed",
+    "deployment": "53780e9d-bd87-43e9-8b21-a59c62b43430",
+    "immutableOrigin": "https://53780e9d.tailos.pages.dev",
+    "compatibility": "Retain v2 Agents/Teams vault/profile and Queue contracts. Keep accepted Agents hub/CLIs; do not roll back to v1-only packages or overwrite newer state."
+  },
+  "observedMini": {
+    "pid": 60799,
+    "ppid": 1,
+    "listener": "127.0.0.1:4318",
+    "origin": "http://127.0.0.1:4318",
+    "command": "node scripts/preview-static.mjs dist-static 127.0.0.1 4318",
+    "manifestCommit": "22ab0005795c9a1201766159e7b910fcff8e2a03",
+    "manifestSha256": "bd9c2ac5753ec8455f3c85ce5a94f5fe6d4955d049e57ce210ca59204dd886f3",
+    "servedFilesChanged": false,
+    "processChanged": false
+  },
+  "proposedRelease": {
+    "requiresSeparateRecordedOrder": true,
+    "rootIntegration": "Only after an assigned release slot and current-root check; preserve independent handler-allocation work and unrelated owner screenshot. No root branch mutation performed during preparation.",
+    "pagesProject": "tailos",
+    "customOrigin": "https://tailos.tailarr.com",
+    "deploymentId": null,
+    "immutableOrigin": null,
+    "workingDirectory": "/Users/stephenspeicher/projects/tailterm/.build/releases/pulldown-recurrence-43c1da3",
+    "command": [
+      "npx",
+      "wrangler",
+      "pages",
+      "deploy",
+      "dist-static",
+      "--project-name",
+      "tailos",
+      "--branch",
+      "main",
+      "--commit-hash",
+      "43c1da3a81e7e30c11efaa87b69f3903004cfbc2",
+      "--commit-dirty=false"
+    ],
+    "pagesBranchMeaning": "existing Pages production branch, not Git source branch change",
+    "mini": "Stage byte-identical verified package as sibling of served dist-static, verify all entries, then atomically swap directories on macOS while preserving PID60799/PPID1. Retain former served directory and compatible Agents package as rollback. Reverify listener, manifest and all assets. No swap performed.",
+    "postPublishChecks": [
+      "Exact release manifest and81 public asset hashes/sizes/MIME/no unexpected encoding on returned immutable URL, custom TailOS and Mini",
+      "Fresh isolated production WASM/synthetic vault/clipboard/layout and affected behavior checks",
+      "Full immutable release receipt/report, lead actual acceptance and handler saved confirmation before completion"
+    ],
+    "excluded": [
+      "old tailterm site",
+      "hub/CLI install",
+      "Tailscale/network",
+      "relay/service restart",
+      "live fixtures/data",
+      "worker/project closure"
+    ]
+  },
+  "logs": {
+    "npm-ci": {
+      "path": "/Users/stephenspeicher/projects/tailterm/.build/releases/pulldown-recurrence-43c1da3/.build/pulldown-preparation/npm-ci.log",
+      "bytes": 1124,
+      "sha256": "3b24027e18e9eeb35b9109f0777d8427ad491141a84a78f5d0da16bfbbe77fdd"
+    },
+    "wasm": {
+      "path": "/Users/stephenspeicher/projects/tailterm/.build/releases/pulldown-recurrence-43c1da3/.build/pulldown-preparation/wasm.log",
+      "bytes": 2230,
+      "sha256": "cbbc26f811f8b32fece909fd33275c535207f07090c24a46b031bbec8f311518"
+    },
+    "static": {
+      "path": "/Users/stephenspeicher/projects/tailterm/.build/releases/pulldown-recurrence-43c1da3/.build/pulldown-preparation/static.log",
+      "bytes": 3340,
+      "sha256": "f840bc6831f90fc64e842d96ff0605476c48575fc7276ccd054888b46860ec65"
+    },
+    "manifest": {
+      "path": "/Users/stephenspeicher/projects/tailterm/.build/releases/pulldown-recurrence-43c1da3/.build/pulldown-preparation/manifest.log",
+      "bytes": 149,
+      "sha256": "e5ba3b36f461b6e66a91a663018bf0c9212db1f44927de0775cc4cb3ef70a853"
+    },
+    "package-check": {
+      "path": "/Users/stephenspeicher/projects/tailterm/.build/releases/pulldown-recurrence-43c1da3/.build/pulldown-preparation/package-check.log",
+      "bytes": 183,
+      "sha256": "151a935d078a87352075356d8ac0a98be918e7fa8d53815dd6d1fc99d69af58d"
+    },
+    "compiled-recurrence": {
+      "path": "/Users/stephenspeicher/projects/tailterm/.build/releases/pulldown-recurrence-43c1da3/.build/pulldown-preparation/compiled-recurrence.log",
+      "bytes": 616,
+      "sha256": "a2126a0d6dbe8f1d3e01ec625b8bca2e00a110c16c4fe7fde93b97626e9759dc"
+    },
+    "units": {
+      "path": "/Users/stephenspeicher/projects/tailterm/.build/releases/pulldown-recurrence-43c1da3/.build/pulldown-preparation/units.log",
+      "bytes": 2307,
+      "sha256": "3b459428a918d5e0b3191baf5a2592451316cefb0b72147f5faf1e05ee37d168"
+    },
+    "queue": {
+      "path": "/Users/stephenspeicher/projects/tailterm/.build/releases/pulldown-recurrence-43c1da3/.build/pulldown-preparation/queue.log",
+      "bytes": 1518,
+      "sha256": "7fce4d55d2bd05245dc75d72b553b5f241ce48cb72f78e60fb8f321b9f45a1d6"
+    }
+  }
+}

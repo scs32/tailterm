@@ -205,3 +205,141 @@ package outside served dist-static and verify it. Only an authorized later relea
 may target explicit Cloudflare project `tailos` / `https://tailos.tailarr.com`
 and the existing Mini preview, with compatible rollback, exact asset evidence and
 no service restart assumptions. No deployment is authorized by this report.
+
+## Release preparation under #1935 — prepared, not deployed
+
+Lead accepted the demonstrated source scope in **#1934**; handler saved the full
+attributed acceptance in #1938 and confirmed it in #1939. Complete earlier report
+bytes were retained/read back through native revision-8-linked chunks #1930/#1931
+and confirmation #1932. The Bug remains In progress revision 8/scope 6, with
+original order #1888 and this exact run/context/ACTIVE Queue binding unchanged.
+Lead then issued bounded preparation **#1935**. Handler **#1940** verified its
+native current-primary record and full text, receipt `mpr_775431ac749ba41e`, before
+package work began. This order permits preparation only; publication, served-file
+swaps, root branch mutation and lifecycle changes remain excluded.
+
+The clean retained source/package is
+`/Users/stephenspeicher/projects/tailterm/.build/releases/pulldown-recurrence-43c1da3`.
+It is a detached checkout at accepted source
+`43c1da3a81e7e30c11efaa87b69f3903004cfbc2`, tree
+`c128cd143ff89b48f7f72a58f04a804c3080f335`, containing application/tests
+`b10bcd462396661ea688e7eb49a1c4d9b906bec2`. Root tasks-hub is still exactly
+`84daa9c7ea46bf28cf407ce43d60eb4d87d05816`, the candidate's merge base. Its
+unrelated untracked owner screenshot was preserved. Independent handler-allocation
+work was neither included nor edited. This later report/plan commit deliberately
+differs from the package's fixed accepted source; the package was not rebuilt
+from documentation changes.
+
+The complete machine-readable review plan is
+[tailos-2026-09-10-pulldown-recurrence-plan.json](releases/tailos-2026-09-10-pulldown-recurrence-plan.json).
+It contains exact source/package/toolchain inputs, build-log and evidence hashes,
+critical asset hashes, compatible rollback identity, current Mini observation,
+explicit proposed commands/targets and unfulfilled publication/acceptance steps.
+It has no actual deployment ID and is not a release receipt.
+
+### Package inputs and results
+
+`npm ci`, `npm run build:wasm`, `npm run build:static` and
+`npm run verify:release` all exited zero in the retained checkout. Node is
+v26.5.1, npm 11.17.0. The host Go command is 1.26.5; the pinned Tailscale source's
+`go.mod` selected/downloaded Go 1.26.6 automatically. The v1.102.3 upstream archive
+passed the build script's pinned SHA-256 check
+`0e94d961c31ce7d33e8b7ce4ac6fdbec83ee5658784eed69eb7fce300729d717`.
+No dependency upgrade, audit fix, build-script change or test-WASM build occurred.
+The module inventory has 305 lines, SHA-256
+`9a762eb01e9bace18169a092a4eb2bac84835b420d5c8ecb3fa389f0fc2d1e57`;
+its absolute module paths refer to this retained build. Production raw WASM
+SHA-256 is `d61326d3bd19c5b486d9c53f36b435eef54e56a0dcab2d242fcb6b51f26c8e3a`.
+Package-lock SHA-256 is
+`a4175ff8886d6c2ee8443e7a928bc1f6f9500cd3b2c24b55fb967175d9eb3f98`.
+
+The package manifest is `dist-static/release.json`, 14861 bytes, SHA-256
+**`a560d5db9ce36d0eda86732b1765b82a5db60960ccc4de96d03149f767ca54da`**.
+It records clean exact source 43c1da3 and build time
+`2026-09-11T03:21:55.704Z`. All **82 manifest entries** match; 81 are public assets
+and `_headers` is hosting configuration. Main JavaScript is
+`assets/index-enCwsUvz.js`, 887069 bytes, SHA-256
+`b189088d305c690346c61bba74d1cad3696d9c64d13a5cc7822a4168bdd2a7f4`.
+Stylesheet is `assets/index-pPDH5eKA.css`, 103716 bytes, SHA-256
+`f9cf645a47285b74bc63b0d97d8363f46e76dd567f1fb2b36670b19fed1a8906`.
+The served production transport is `assets/tailserve-DiCacG8h.wasm.gz`, 8598265
+bytes, SHA-256 `ac0d47cff00d0f26ab7e03faad505a8352700c84fa6a2168b8aea0550a418ae7`.
+
+### Isolated preparation verification
+
+- A disposable localhost server using the existing `createStaticPreviewServer`
+  served the retained package. **81/81** public assets matched SHA-256 and size;
+  responses were 200 without Content-Encoding, with the JS/CSS/WASM MIME contract.
+- Existing `tests/deployed-browser.mjs`, explicitly pointed at the disposable
+  loopback origin, passed real production bundle/WASM startup, isolated synthetic
+  vault/key restoration, clipboard and three viewport layouts without page errors.
+  It prints `https:true` even for an explicit localhost origin; this preparation
+  evidence is correctly described as **HTTP loopback**, not TLS or deployment.
+- A retained, ignored copy of the accepted recurrence runner routes its stylesheet
+  requests to the exact compiled CSS bytes and suppresses duplicate source CSS.
+  Chromium/WebKit pass **80 editor open/Escape attempts and 100 nonmodal cycles**,
+  first/second/tenth observations, focus geometry, draft/selection and latest
+  refresh. The fixture uses actual source view/helper imports plus production
+  compiled CSS; it does not extract the helper from the minified application
+  bundle. The separate production startup check above exercises that bundle.
+- `QUEUE_LAYOUT_BUILT_CSS=dist-static/assets/index-pPDH5eKA.css node tests/queue-layout-browser.mjs`
+  passes **24/24 Chromium/WebKit** cases, including boundaries, narrow viewports,
+  keyboard/selection/scrolling and zoom-equivalent layout.
+- Retained-source dialog, refresh and Agents library units pass **26/26**. The
+  full 156/156 source suite and prior 4/4 dialog browser results remain the
+  accepted candidate evidence; they were not redundantly rerun in preparation.
+- Package/lock, Agents/Teams schemas, local-vault, Queue view/styles, task-hub,
+  production WASM source seams and the build script are byte-identical to root
+  baseline outside the two explicitly changed production seams. Their hashes
+  are in the plan. No v2 Agents/Teams/Queue or hub/CLI contract change occurred.
+
+The preparation runners/logs and distinct outputs are retained under the clean
+package checkout's `.build/pulldown-preparation/`; Queue output is separately
+`.build/queue-layout/built-results.json`. Earlier worker baseline/candidate evidence
+was not overwritten. The disposable package server and all browser contexts
+closed. No long-lived descendant service was created.
+
+All earlier native Safari/physical option-selection limits and the identical
+baseline/candidate encrypted-vault fixture nonpass remain. The separate production
+synthetic-vault check passes but does not replace the failed work-item draft-vault
+suite's unexecuted assertions. Build notices: npm reports three moderate audit
+findings, deprecated `boolean` and six pending install-script approvals; Vite
+reports its >500 kB chunk advisory. These did not fail the build, and no dependency
+or host settings were changed to suppress them.
+
+### Compatible rollback and proposed release
+
+The retained rollback at
+`.build/releases/agents-library-22ab000/dist-static` was independently verified
+read-only with its existing release checker: clean source
+`22ab0005795c9a1201766159e7b910fcff8e2a03`, **82/82 entries**, manifest SHA-256
+`bd9c2ac5753ec8455f3c85ce5a94f5fe6d4955d049e57ce210ca59204dd886f3`.
+Its accepted deployment is `53780e9d-bd87-43e9-8b21-a59c62b43430`,
+`https://53780e9d.tailos.pages.dev`. Keep this v2-compatible Agents/Teams/Queue
+frontend and the accepted Agents hub/CLI versions as the rollback boundary;
+do not restore v1-only clients or overwrite later live data.
+
+Read-only observations confirm existing Mini PID **60799 / PPID 1** still listens
+on `127.0.0.1:4318` and serves that exact accepted Agents manifest. Its command is
+`node scripts/preview-static.mjs dist-static 127.0.0.1 4318`. No served file,
+process, hub/CLI install, network, Tailscale, relay or service setting changed.
+
+After a separately recorded actual-release order and assigned slot, recheck the
+current root before integrating only the accepted source/report, preserving any
+independently accepted work. The proposed command runs in the retained clean
+43c1da3 checkout:
+
+```sh
+npx wrangler pages deploy dist-static --project-name tailos --branch main --commit-hash 43c1da3a81e7e30c11efaa87b69f3903004cfbc2 --commit-dirty=false
+```
+
+The Pages branch flag selects its existing production deployment; Git tasks-hub
+is not switched to main. The target is **tailos** / `https://tailos.tailarr.com`,
+never tailterm. Record the returned immutable deployment ID/origin at that time.
+For Mini, stage the byte-identical package beside the served directory, verify
+all entries, then perform a macOS atomic directory swap while preserving the
+existing listener and retaining the old directory. Reverify all served manifest/
+asset hashes, MIME, the process identity and production synthetic-browser checks
+on immutable/custom/Mini origins. No staging of served files, swap or publication
+has been performed under preparation #1935. Actual-release evidence, lead
+acceptance and handler saved confirmation are still required before completion.
