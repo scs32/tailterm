@@ -197,7 +197,7 @@ func TestOrchestratorImplementationBoundaryAcrossLaunchAndResumeRosters(t *testi
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			task := api.Task{ID: "tsk_0000000000000001", Name: "Project", Orchestrator: "lead", AllowAgentSpawn: tc.allowSpawn, MaxNewAgents: tc.maxHelpers}
-			got := agentTaskBriefingForLaunch(task, "lead", "", tc.agents, tc.planned)
+			got := agentTaskBriefingForLaunch(task, "lead", "", "", tc.agents, tc.planned)
 			for _, required := range []string{"decisions, planning, routing work, and reviewing evidence", "shared schema/types and integration code", "not a runtime sandbox or API authorization boundary", "inventory useful long-lived services descended from its tmux session"} {
 				if !strings.Contains(got, required) {
 					t.Fatalf("missing %q", required)
@@ -223,7 +223,7 @@ func TestRetiredIdleAndExitedWorkersStillPreventTheSoleMemberException(t *testin
 		t.Run(status, func(t *testing.T) {
 			task := api.Task{Name: "Project", Orchestrator: "lead"}
 			agents := []api.Agent{{Name: "lead", Status: api.AgentRunning}, {Name: "builder", Status: status}}
-			got := agentTaskBriefing(task, "lead", "", agents)
+			got := agentTaskBriefing(task, "lead", "", "", agents)
 			if !strings.Contains(got, "You must not implement") {
 				t.Fatal(got)
 			}
@@ -234,7 +234,7 @@ func TestRetiredIdleAndExitedWorkersStillPreventTheSoleMemberException(t *testin
 func TestWorkerBriefingPreservesAssignedBuilderAndReadOnlyRoles(t *testing.T) {
 	task := api.Task{Name: "Project", Orchestrator: "lead"}
 	agents := []api.Agent{{Name: "lead", Status: api.AgentRunning}, {Name: "worker", Status: api.AgentRunning}}
-	got := agentTaskBriefing(task, "worker", "", agents)
+	got := agentTaskBriefing(task, "worker", "", "", agents)
 	for _, required := range []string{"decides, plans, routes work and reviews evidence", "builders own assigned implementation", "shared schema/types and integration code", "Preserve any assigned read-only or other non-builder role", "report any useful long-lived service descended from your tmux session"} {
 		if !strings.Contains(got, required) {
 			t.Fatalf("missing %q", required)
@@ -248,13 +248,14 @@ func TestWorkerBriefingPreservesAssignedBuilderAndReadOnlyRoles(t *testing.T) {
 // TestGeneratedBriefingStatesTtIsARealCliVerifiedBeforeUse proves the
 // owner-requested #2192 fix through the actual shared briefing assembly
 // path (agentTaskBriefing / taskBriefingForRoster), for every role and
-// orchestrator/non-orchestrator launch shape, not a one-off prompt.
+// orchestrator/non-orchestrator launch shape, not a one-off prompt. It also
+// proves the exact launch-resolved path (independent review #2300 finding
+// 5) is actually interpolated when known, not merely named in the abstract.
 func TestGeneratedBriefingStatesTtIsARealCliVerifiedBeforeUse(t *testing.T) {
 	required := []string{
 		"tt is a real local command-line executable installed on this host, not a built-in or native model tool",
 		"invoke every tt command below with your existing Bash/shell tool",
 		"command -v tt",
-		"exact launch-resolved executable path this session was started with",
 		"tt --help",
 		"tt status",
 		"ordinary CLI subcommands run through your shell tool, not native tools of their own",
@@ -275,11 +276,20 @@ func TestGeneratedBriefingStatesTtIsARealCliVerifiedBeforeUse(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got := agentTaskBriefing(tc.task, tc.agent, tc.role, []api.Agent{{Name: "lead", Status: api.AgentRunning}})
+			got := agentTaskBriefing(tc.task, tc.agent, tc.role, "", []api.Agent{{Name: "lead", Status: api.AgentRunning}})
 			for _, want := range required {
 				if !strings.Contains(got, want) {
 					t.Fatalf("case %s: missing %q in generated briefing", tc.name, want)
 				}
+			}
+			// With no known self path (e.g. a generic host-configuration
+			// display), the fallback stays honestly generic rather than
+			// asserting a path that was never actually resolved.
+			if !strings.Contains(got, "search common install locations") {
+				t.Fatalf("case %s: missing honest generic fallback when no self path is known", tc.name)
+			}
+			if strings.Contains(got, "this exact session was started with the resolved executable at") {
+				t.Fatalf("case %s: claimed an interpolated path with none supplied", tc.name)
 			}
 			// The discovery/verification preamble must come first, before
 			// any coordination instruction is interpreted.
@@ -287,6 +297,16 @@ func TestGeneratedBriefingStatesTtIsARealCliVerifiedBeforeUse(t *testing.T) {
 				t.Fatalf("case %s: preamble did not lead the briefing: %.80q", tc.name, got)
 			}
 		})
+	}
+	// When the launching process's own resolved binary path is known (the
+	// same binary a freshly spawned sibling on this host will run), it is
+	// interpolated verbatim rather than only named in the abstract.
+	withPath := agentTaskBriefing(api.Task{Name: "Project"}, "solo", "", "/opt/example/bin/tt", []api.Agent{{Name: "lead", Status: api.AgentRunning}})
+	if !strings.Contains(withPath, "this exact session was started with the resolved executable at /opt/example/bin/tt") {
+		t.Fatalf("known self path was not interpolated: %.400q", withPath)
+	}
+	if strings.Contains(withPath, "search common install locations") {
+		t.Fatalf("generic fallback leaked into a briefing with a known self path: %.400q", withPath)
 	}
 }
 

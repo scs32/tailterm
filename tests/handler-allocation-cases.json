@@ -144,15 +144,17 @@
     "name": "parented-item-bound-launch-limit",
     "situation": "A second item-bound worker (a genuine extra, on top of the item's already-running builder) is proposed via tt spawn from lead; open slots remain but that item's own extra allowance is exhausted.",
     "handler": [
-      "the first such worker bound to a given item is that item's allocated builder and consumes no extra allowance",
-      "Only a second or later parented worker bound to the same item is an extra and is checked against that item's allowance",
+      "must explicitly declare --team-role member or extra for a fresh (non-replacement) item binding",
+      "classification is never inferred from ParentAgentID or arrival order",
+      "--team-role member never consumes the extra allowance",
       "one item's extras never exhaust another item's",
       "If a genuine extra launch is blocked by an exhausted item allowance or disabled spawn setting, report the real limit and use only a separately authorized supported launch path or an owner-approved allowance change",
       "Never clear or spoof identity, reuse closed workers, or bypass a denial"
     ],
     "lead": [
-      "the first such worker bound to a given item is that item's allocated builder and consumes no extra allowance",
-      "Only a second or later parented worker bound to the same item is an extra and is checked against that item's allowance",
+      "must explicitly declare --team-role member or extra for a fresh (non-replacement) item binding",
+      "classification is never inferred from ParentAgentID or arrival order",
+      "--team-role member never consumes the extra allowance",
       "one item's extras never exhaust another item's",
       "If a genuine extra launch is blocked by an exhausted item allowance or disabled spawn setting, report the real limit and use only a separately authorized supported launch path or an owner-approved allowance change",
       "Never clear or spoof identity, reuse closed workers, or bypass a denial"

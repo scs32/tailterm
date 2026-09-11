@@ -68,7 +68,9 @@ func TestHandlerAllocationEmittedBriefingContracts(t *testing.T) {
 		}
 		got := string(data)
 		// cmdSpawn uses this same emitter before assignment/context append.
-		if got != agentTaskBriefingForLaunch(task, agent.Name, agent.Role, agents, 0) {
+		// cmdBrief resolves its own real executable path (selfPath()) for
+		// the CLI-discovery preamble, so the comparison must too.
+		if got != agentTaskBriefingForLaunch(task, agent.Name, agent.Role, selfPath(), agents, 0) {
 			t.Fatal("CLI brief and launch role emission diverged")
 		}
 		briefings[role] = got
@@ -124,7 +126,7 @@ func TestHandlerAllocationContinuationGuidanceAcrossWorkerStates(t *testing.T) {
 	} {
 		t.Run(state.name, func(t *testing.T) {
 			agents := []api.Agent{{Name: "lead", Status: api.AgentRunning, Online: true}, {Name: "builder", Status: state.status, Online: state.online}}
-			got := agentTaskBriefingForLaunch(task, "lead", "", agents, 0)
+			got := agentTaskBriefingForLaunch(task, "lead", "", "", agents, 0)
 			if !strings.Contains(got, state.required) {
 				t.Fatalf("missing state-aware instruction %q", state.required)
 			}

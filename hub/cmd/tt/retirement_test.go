@@ -42,13 +42,13 @@ func TestRetireAndResumeRemoteAgent(t *testing.T) {
 }
 func TestBriefingClosesAcceptedWorkersAndPreservesIntentionalRetirement(t *testing.T) {
 	task := api.Task{ID: "tsk_0123456789abcdef", Name: "Task", Orchestrator: "lead"}
-	lead := taskBriefing(task, "lead")
+	lead := taskBriefing(task, "lead", "")
 	for _, want := range []string{"tt close NAME", "tt retire NAME only for intentional temporary retention", "fresh session and identity for a new item", "leave yourself available for the owner"} {
 		if !strings.Contains(lead, want) {
 			t.Fatal("missing closeout policy", want)
 		}
 	}
-	worker := taskBriefing(task, "worker")
+	worker := taskBriefing(task, "worker", "")
 	for _, want := range []string{"If retired, finish quietly", "Workers must post results", "run tt close for yourself", "intentional temporary retention", "dedicated to exactly one bug or feature"} {
 		if !strings.Contains(worker, want) {
 			t.Fatal("worker closeout policy missing", want)

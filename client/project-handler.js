@@ -32,13 +32,16 @@ const handlerPrompt =
   "open-agent slots, and complete admitted context within its size limit. " +
   "Check actual launch-path eligibility as well as open-agent capacity. The " +
   "extra allowance is scoped per bug or feature, on top of that item's " +
-  "allocated team: an ordinary worker launched with tt spawn inside an " +
-  "agent session has ParentAgentID set from the invoking agent, but the " +
-  "first such worker bound to a given item is that item's allocated " +
-  "builder and consumes no extra allowance, regardless of the launch " +
-  "command's origin. Only a second or later parented worker bound to the " +
-  "same item is an extra and is checked against that item's allowance; one " +
-  "item's extras never exhaust another item's. Only closing an extra frees " +
+  "allocated team member(s): an ordinary worker launched with tt spawn " +
+  "inside an agent session has ParentAgentID set from the invoking agent, " +
+  "and must explicitly declare --team-role member or extra for a fresh " +
+  "(non-replacement) item binding -- classification is never inferred " +
+  "from ParentAgentID or arrival order. --team-role member never consumes " +
+  "the extra allowance, however many members are already bound to the " +
+  "item; only --team-role extra is checked against that item's allowance, " +
+  "and one item's extras never exhaust another item's. A replacement " +
+  "(--replaces-agent) inherits the role of the binding it replaces rather " +
+  "than declaring a fresh one. Only closing an extra frees " +
   "its slot; an exited or retired extra stays reserved. If a genuine extra " +
   "launch is blocked by an exhausted item allowance or disabled spawn " +
   "setting, report the real limit and use only a separately authorized " +

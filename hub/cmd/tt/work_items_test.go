@@ -185,17 +185,17 @@ func TestWorkItemsCLINarrativeReportQueryAndDonePin(t *testing.T) {
 func TestAgentBriefingNamesDatabaseHandlerAndItsIntakeContract(t *testing.T) {
 	task := api.Task{ID: "tsk_0000000000000001", Name: "Project", Goal: "Ship", Status: api.TaskOpen, Orchestrator: "lead"}
 	handler := api.Agent{ID: "agt_0000000000000002", Name: "database", Role: api.AgentRoleDatabaseHandler, Status: api.AgentDone}
-	worker := agentTaskBriefing(task, "worker", "", []api.Agent{handler})
+	worker := agentTaskBriefing(task, "worker", "", "", []api.Agent{handler})
 	if !strings.Contains(worker, "Database handler is database") || !strings.Contains(worker, "tt work-items") {
 		t.Fatal(worker)
 	}
-	handlerBrief := agentTaskBriefing(task, handler.Name, handler.Role, []api.Agent{handler})
+	handlerBrief := agentTaskBriefing(task, handler.Name, handler.Role, "", []api.Agent{handler})
 	for _, required := range []string{"durable Database handler", "--source-seq", "--request-id", "--body-file", "Stay done and available"} {
 		if !strings.Contains(handlerBrief, required) {
 			t.Fatalf("handler briefing missing %q", required)
 		}
 	}
-	leadBrief := agentTaskBriefing(task, "lead", "", []api.Agent{handler})
+	leadBrief := agentTaskBriefing(task, "lead", "", "", []api.Agent{handler})
 	if !strings.Contains(leadBrief, "database_handler is a continuing project role") || !strings.Contains(leadBrief, "active database_handler is the exception") {
 		t.Fatal(leadBrief)
 	}
@@ -215,8 +215,8 @@ func TestAgentWorkAuditAcrossRolesAndHandlerAvailability(t *testing.T) {
 				if state == "missing" {
 					agents = nil
 				}
-				got := agentTaskBriefing(task, name, "", agents)
-				for _, required := range []string{"durable bug or feature", "recorded bounded work order", "Intake and board/inbox/roster coordination", "work-item ID and work-order message sequence", "list/get/create/update/dispatch", "Do not use tt work-items, direct API calls, or database files yourself", "even if the handler is unavailable", "human UI access remains available", "at most 2 additional extra agents per bug or feature", "SWARM ENABLED"} {
+				got := agentTaskBriefing(task, name, "", "", agents)
+				for _, required := range []string{"durable bug or feature", "recorded bounded work order", "Intake and board/inbox/roster coordination", "work-item ID and work-order message sequence", "list/get/create/update/dispatch", "Do not use tt work-items, direct API calls, or database files yourself", "even if the handler is unavailable", "human UI access remains available", "This task allows at most 2 active extras per bug or feature", "SWARM ENABLED"} {
 					if !strings.Contains(got, required) {
 						t.Fatalf("missing %q in %s", required, got)
 					}
@@ -249,7 +249,7 @@ func TestAgentWorkAuditAcrossRolesAndHandlerAvailability(t *testing.T) {
 			})
 		}
 	}
-	got := agentTaskBriefing(task, handler.Name, handler.Role, []api.Agent{handler})
+	got := agentTaskBriefing(task, handler.Name, handler.Role, "", []api.Agent{handler})
 	for _, required := range []string{"sole agent owner", "list/get/create/update/dispatch", "--source-seq", "--request-id", "--body-file", "--revision", "Read back the committed record", "assignment/result message links", "preserve owner text", "scope changes", "required dependencies are resolved", "Stay done and available", "respect explicit owner retirement"} {
 		if !strings.Contains(got, required) {
 			t.Fatalf("handler missing %q", required)

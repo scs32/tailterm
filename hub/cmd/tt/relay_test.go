@@ -165,10 +165,10 @@ func TestSwarmWakePreservesOwnershipAndExcludesSelf(t *testing.T) {
 		}
 	}
 	task := api.Task{Name: "Swarm", Swarm: true, Orchestrator: "lead"}
-	if got := taskBriefing(task, "worker"); !strings.Contains(got, "FIRST ORDER OF BUSINESS") || !strings.Contains(got, "tt post --to lead") || !strings.Contains(got, "SWARM ENABLED") {
+	if got := taskBriefing(task, "worker", ""); !strings.Contains(got, "FIRST ORDER OF BUSINESS") || !strings.Contains(got, "tt post --to lead") || !strings.Contains(got, "SWARM ENABLED") {
 		t.Fatal(got)
 	}
-	if got := taskBriefing(task, "lead"); !strings.Contains(got, "MAIN ORCHESTRATOR") || strings.Contains(got, "tt post --to lead") {
+	if got := taskBriefing(task, "lead", ""); !strings.Contains(got, "MAIN ORCHESTRATOR") || strings.Contains(got, "tt post --to lead") {
 		t.Fatal(got)
 	}
 }
