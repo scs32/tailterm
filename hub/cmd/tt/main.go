@@ -593,6 +593,7 @@ func cmdSpawn(e env, args []string) error {
 	workOrderTask := fs.String("work-order-task", "", "project containing the recorded work-order message (default: work-item project)")
 	workOrderMessage := fs.Int64("work-order-message", 0, "recorded bounded work-order message sequence")
 	replacesAgent := fs.String("replaces-agent", "", "prior item-bound agent preserved by this new session")
+	teamRole := fs.String("team-role", "", "this item's binding classification for a fresh parented launch: member (this item's allocated team member, never charged against the extra allowance) or extra (on top of that member, checked against the task's per-item allowance); required unless --replaces-agent is set, in which case the replaced binding's classification is inherited and this flag must be omitted or match it")
 	workContextFile := fs.String("work-context-file", "", "handler-prepared item context JSON file")
 	workContextJSON := fs.String("work-context-json", "", "handler/authorized-launch-prepared item context JSON")
 	queueEntry := fs.String("queue-entry", "", "exact receiving Queue entry for cross-project admission")
@@ -658,6 +659,18 @@ func cmdSpawn(e env, args []string) error {
 		}
 		if !api.ValidID(*workItemTask, "tsk") || !api.ValidID(*workItemID, "wi") || !api.ValidID(*workOrderTask, "tsk") || (*replacesAgent != "" && !api.ValidID(*replacesAgent, "agt")) {
 			return errors.New("invalid work-item routing identity")
+		}
+		// Classification is an explicit declaration, never inferred from
+		// ParentAgentID or launch order: a fresh (non-replacement) binding
+		// admitted through an agent session (e.parent will be non-empty)
+		// must declare --team-role. A replacement inherits the prior
+		// binding's role; any --team-role given for one must match it (the
+		// hub validates the exact match) or be omitted.
+		if *replacesAgent == "" && e.agent != "" && *teamRole != api.TeamRoleMember && *teamRole != api.TeamRoleExtra {
+			return fmt.Errorf("a parented item-bound launch requires --team-role %s or %s", api.TeamRoleMember, api.TeamRoleExtra)
+		}
+		if *replacesAgent != "" && *teamRole != "" && *teamRole != api.TeamRoleMember && *teamRole != api.TeamRoleExtra {
+			return fmt.Errorf("--team-role must be %s or %s when given", api.TeamRoleMember, api.TeamRoleExtra)
 		}
 	}
 	queueFlagCount := 0
@@ -771,7 +784,8 @@ func cmdSpawn(e env, args []string) error {
 	if err != nil {
 		return err
 	}
-	briefing := agentTaskBriefingForLaunch(detail.Task, *name, *role, detail.Agents, *plannedTeamMembers)
+	launcherSelfPath := selfPath()
+	briefing := agentTaskBriefingForLaunch(detail.Task, *name, *role, launcherSelfPath, detail.Agents, *plannedTeamMembers)
 	if *permissionMode != "" {
 		briefing += "\nRequested launch permission mode: " + *permissionMode + ". Permission denials are real failures, not approvals. Do not repeat an unchanged denied action. Report a precise Permission blocked status to the orchestrator and continue independent permitted work."
 	}
@@ -811,15 +825,15 @@ func cmdSpawn(e env, args []string) error {
 		req.WorkItem = &api.AgentWorkItemRequest{
 			ItemTaskID: *workItemTask, ItemID: *workItemID, ItemRevision: *workItemRevision,
 			WorkOrderMessage: api.MessageReference{TaskID: *workOrderTask, Seq: *workOrderMessage},
-			ReplacesAgentID:  *replacesAgent,
-			ContextBundle:    append(json.RawMessage(nil), contextData...),
+			ReplacesAgentID:  *replacesAgent, TeamRole: *teamRole,
+			ContextBundle: append(json.RawMessage(nil), contextData...),
 		}
 		if queueFlagCount > 0 {
 			req.WorkItem.QueueClaim = &api.QueueAdmissionClaim{EntryID: *queueEntry, Cycle: *queueCycle, ExpectedRevision: *queueRevision, ClaimantAgentID: *queueClaimantAgent, ClaimantRunID: *queueClaimantRun}
 		}
 	}
 	opts := spawn.Options{
-		Session: session, Cwd: *cwd, Command: command, Self: selfPath(),
+		Session: session, Cwd: *cwd, Command: command, Self: launcherSelfPath,
 		Env: map[string]string{
 			"TAILTERM_PERMISSION_RUNTIME": *runtime, "TAILTERM_PERMISSION_MODE": *permissionMode, "TAILTERM_ALLOWED_TOOLS": *allowedJSON, "TAILTERM_LAUNCH_CWD": *cwd,
 			"TAILTERM_REASONING": *reasoning, "TAILTERM_APPROVAL_MODE": *approvalMode, "TAILTERM_SANDBOX_MODE": *sandboxMode,
