@@ -81,59 +81,82 @@ func validatePreparedContextBundle(req *api.AgentWorkItemRequest) error {
 	return nil
 }
 
-func validateAgentWorkItemRequest(q queryRower, ctx context.Context, targetTaskID string, req *api.AgentWorkItemRequest) (int64, error) {
+// validateAgentWorkItemRequest also resolves this binding's persisted
+// TeamRole classification (api.TeamRoleMember or api.TeamRoleExtra):
+//   - A replacement (ReplacesAgentID set) always inherits the role of the
+//     binding it replaces; it is the same continuing allocation, not a new
+//     one. A caller-supplied req.TeamRole that conflicts with the inherited
+//     role is rejected rather than silently overridden, so a caller cannot
+//     be confused about what actually happened.
+//   - A fresh (non-replacement) binding admitted through a parented launch
+//     (parentAgentID != "") must explicitly declare req.TeamRole as
+//     TeamRoleMember or TeamRoleExtra; classification is never inferred
+//     from ParentAgentID or binding/creation order.
+//   - A fresh binding admitted through a parentless (browser/manual) launch
+//     is always resolved as TeamRoleMember: it is definitionally not
+//     subject to the per-item extra allowance, so no ambiguity exists.
+func validateAgentWorkItemRequest(q queryRower, ctx context.Context, targetTaskID, parentAgentID string, req *api.AgentWorkItemRequest) (int64, string, error) {
 	if req == nil {
-		return 0, nil
+		return 0, "", nil
 	}
 	if err := validatePreparedContextBundle(req); err != nil {
-		return 0, err
+		return 0, "", err
 	}
 	if req.ItemTaskID == targetTaskID {
 		if req.QueueClaim != nil {
-			return 0, api.ErrInvalid
+			return 0, "", api.ErrInvalid
 		}
 	} else if err := validateCrossProjectQueueAdmission(q, ctx, targetTaskID, req); err != nil {
-		return 0, err
+		return 0, "", err
 	}
 	// Admission retains the current-row CAS and structured order relationship.
 	// The bundle's immutable revision/history payload is prepared by the handler
 	// or human launch flow through the accepted history interface, not rebuilt here.
 	item, err := getWorkItem(q, ctx, req.ItemTaskID, req.ItemID)
 	if err != nil {
-		return 0, err
+		return 0, "", err
 	}
 	if item.Revision != req.ItemRevision {
-		return 0, workItemConflict("work item revision changed; prepare a new context bundle before launching")
+		return 0, "", workItemConflict("work item revision changed; prepare a new context bundle before launching")
 	}
 	order, err := loadMessage(q, ctx, req.WorkOrderMessage.TaskID, req.WorkOrderMessage.Seq)
 	if err != nil {
-		return 0, err
+		return 0, "", err
 	}
 	linked := len(order.WorkItems) == 1 && order.WorkItems[0].ItemTaskID == req.ItemTaskID && order.WorkItems[0].ItemID == req.ItemID && order.WorkItems[0].Relationship == "primary"
 	if !linked {
-		return 0, workItemConflict("work-order message is not linked to the selected work item")
+		return 0, "", workItemConflict("work-order message is not linked to the selected work item")
 	}
+	resolvedTeamRole := req.TeamRole
 	if req.ReplacesAgentID != "" {
 		var priorTask, priorRun, priorRole string
 		if err := q.QueryRowContext(ctx, `SELECT task_id,run_id,role FROM agents WHERE id=?`, req.ReplacesAgentID).Scan(&priorTask, &priorRun, &priorRole); err != nil {
 			if errors.Is(err, sql.ErrNoRows) {
-				return 0, api.ErrInvalid
+				return 0, "", api.ErrInvalid
 			}
-			return 0, err
+			return 0, "", err
 		}
 		if priorTask != targetTaskID || priorRole != "" {
-			return 0, api.ErrInvalid
+			return 0, "", api.ErrInvalid
 		}
 		prior, err := loadAgentWorkItemBinding(q, ctx, req.ReplacesAgentID, priorRun)
 		if err != nil || prior == nil || prior.ItemTaskID != req.ItemTaskID || prior.ItemID != req.ItemID {
-			return 0, workItemConflict("replacement agent is not bound to the selected work item")
+			return 0, "", workItemConflict("replacement agent is not bound to the selected work item")
 		}
+		if req.TeamRole != "" && req.TeamRole != prior.TeamRole {
+			return 0, "", fmt.Errorf("%w: replacement must inherit the prior binding's team role, not declare a different one", api.ErrInvalid)
+		}
+		resolvedTeamRole = prior.TeamRole
+	} else if parentAgentID == "" {
+		resolvedTeamRole = api.TeamRoleMember
+	} else if resolvedTeamRole != api.TeamRoleMember && resolvedTeamRole != api.TeamRoleExtra {
+		return 0, "", fmt.Errorf("%w: a parented item-bound launch must declare teamRole as %q or %q", api.ErrInvalid, api.TeamRoleMember, api.TeamRoleExtra)
 	}
 	var through int64
 	if err := q.QueryRowContext(ctx, `SELECT COALESCE(MAX(seq),0) FROM messages WHERE task_id=?`, targetTaskID).Scan(&through); err != nil {
-		return 0, err
+		return 0, "", err
 	}
-	return through, nil
+	return through, resolvedTeamRole, nil
 }
 
 func validateCrossProjectQueueAdmission(q queryRower, ctx context.Context, targetTaskID string, req *api.AgentWorkItemRequest) error {
@@ -309,7 +332,7 @@ WHERE a.id=? AND a.task_id=?`, req.AgentID, messageTaskID).Scan(
 	return true, nil
 }
 
-func insertAgentWorkItemBinding(ctx context.Context, tx *sql.Tx, agent api.Agent, req *api.AgentWorkItemRequest, through int64) (*api.AgentWorkItemBinding, error) {
+func insertAgentWorkItemBinding(ctx context.Context, tx *sql.Tx, agent api.Agent, req *api.AgentWorkItemRequest, through int64, resolvedTeamRole string) (*api.AgentWorkItemBinding, error) {
 	if req == nil {
 		return nil, nil
 	}
@@ -317,7 +340,7 @@ func insertAgentWorkItemBinding(ctx context.Context, tx *sql.Tx, agent api.Agent
 	binding := &api.AgentWorkItemBinding{
 		AgentID: agent.ID, RunID: agent.RunID, ItemTaskID: req.ItemTaskID, ItemID: req.ItemID,
 		ItemRevision: req.ItemRevision, WorkOrderMessage: req.WorkOrderMessage,
-		ContextThroughMessageSeq: through, ReplacesAgentID: req.ReplacesAgentID,
+		ContextThroughMessageSeq: through, ReplacesAgentID: req.ReplacesAgentID, TeamRole: resolvedTeamRole,
 		ContextDigest: hex.EncodeToString(digestBytes[:]), CreatedAt: agent.CreatedAt,
 	}
 	var replaces any
@@ -325,10 +348,10 @@ func insertAgentWorkItemBinding(ctx context.Context, tx *sql.Tx, agent api.Agent
 		replaces = binding.ReplacesAgentID
 	}
 	_, err := tx.ExecContext(ctx, `INSERT INTO agent_work_item_bindings
-(agent_id,run_id,item_task_id,item_id,item_revision,work_order_task_id,work_order_message_seq,context_through_message_seq,replaces_agent_id,context_digest,context_json,created_at)
-VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`, binding.AgentID, binding.RunID, binding.ItemTaskID, binding.ItemID, binding.ItemRevision,
+(agent_id,run_id,item_task_id,item_id,item_revision,work_order_task_id,work_order_message_seq,context_through_message_seq,replaces_agent_id,team_role,context_digest,context_json,created_at)
+VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)`, binding.AgentID, binding.RunID, binding.ItemTaskID, binding.ItemID, binding.ItemRevision,
 		binding.WorkOrderMessage.TaskID, binding.WorkOrderMessage.Seq, binding.ContextThroughMessageSeq, replaces,
-		binding.ContextDigest, []byte(req.ContextBundle), ts(binding.CreatedAt))
+		binding.TeamRole, binding.ContextDigest, []byte(req.ContextBundle), ts(binding.CreatedAt))
 	if err != nil {
 		return nil, err
 	}
@@ -340,11 +363,11 @@ ON CONFLICT(task_id,agent_id) DO UPDATE SET up_to=MAX(up_to,excluded.up_to)`, ag
 func loadAgentWorkItemBinding(q queryRower, ctx context.Context, agentID, runID string) (*api.AgentWorkItemBinding, error) {
 	var binding api.AgentWorkItemBinding
 	var created string
-	err := q.QueryRowContext(ctx, `SELECT agent_id,run_id,item_task_id,item_id,item_revision,work_order_task_id,work_order_message_seq,context_through_message_seq,COALESCE(replaces_agent_id,''),context_digest,created_at
+	err := q.QueryRowContext(ctx, `SELECT agent_id,run_id,item_task_id,item_id,item_revision,work_order_task_id,work_order_message_seq,context_through_message_seq,COALESCE(replaces_agent_id,''),team_role,context_digest,created_at
 FROM agent_work_item_bindings WHERE agent_id=? AND run_id=?`, agentID, runID).Scan(
 		&binding.AgentID, &binding.RunID, &binding.ItemTaskID, &binding.ItemID, &binding.ItemRevision,
 		&binding.WorkOrderMessage.TaskID, &binding.WorkOrderMessage.Seq, &binding.ContextThroughMessageSeq,
-		&binding.ReplacesAgentID, &binding.ContextDigest, &created,
+		&binding.ReplacesAgentID, &binding.TeamRole, &binding.ContextDigest, &created,
 	)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil

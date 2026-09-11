@@ -361,22 +361,35 @@ func TestAgentWorkItemContextRejectsStaleMismatchedAndHelperAdmission(t *testing
 		t.Fatalf("oversized context did not fail explicitly: %v", err)
 	}
 	req.ContextBundle = completeContext
-	// Owner correction #2045/#2048: the first parented agent bound to an
-	// item is that item's allocated builder, not an "extra" — it must be
-	// admitted even at MaxNewAgents=0, since it consumes no extra
-	// allowance merely because a lead spawned it from an agent session.
-	builder, err := s.AddAgent(ctx, task.ID, api.AddAgentRequest{Name: "builder", Host: "fixture", Session: "builder", Runtime: "codex", ParentAgentID: parent.ID, WorkItem: req}, by)
-	if err != nil || builder.ParentAgentID != parent.ID {
-		t.Fatalf("item's first parented builder rejected as an extra: %+v %v", builder, err)
+	// Classification is an explicit declaration, never inferred from
+	// ParentAgentID or binding order (independent review #2300 finding 1).
+	// A parented, item-bound request with no declared TeamRole is rejected
+	// outright rather than guessed.
+	unclassified := *req
+	if _, err = s.AddAgent(ctx, task.ID, api.AddAgentRequest{Name: "unclassified", Host: "fixture", Session: "unclassified", Runtime: "codex", ParentAgentID: parent.ID, WorkItem: &unclassified}, by); !errors.Is(err, api.ErrInvalid) {
+		t.Fatalf("parented item-bound request with no declared team role should be rejected: %v", err)
 	}
-	// A second parented agent bound to the same item is a genuine extra
-	// and is checked against the item's MaxNewAgents allowance.
-	if _, err = s.AddAgent(ctx, task.ID, api.AddAgentRequest{Name: "helper", Host: "fixture", Session: "helper", Runtime: "codex", ParentAgentID: parent.ID, WorkItem: req}, by); !errors.Is(err, api.ErrAgentSpawnLimit) {
+	// Owner correction #2045/#2048: a parented agent explicitly declared as
+	// this item's regular team member (TeamRoleMember) is admitted even at
+	// MaxNewAgents=0, since it is not an "extra" -- regardless of arrival
+	// order, unlike the old binding-order heuristic.
+	memberReq := *req
+	memberReq.TeamRole = api.TeamRoleMember
+	builder, err := s.AddAgent(ctx, task.ID, api.AddAgentRequest{Name: "builder", Host: "fixture", Session: "builder", Runtime: "codex", ParentAgentID: parent.ID, WorkItem: &memberReq}, by)
+	if err != nil || builder.ParentAgentID != parent.ID || builder.WorkItem.TeamRole != api.TeamRoleMember {
+		t.Fatalf("item's declared regular team member rejected as an extra: %+v %v", builder, err)
+	}
+	// A parented agent explicitly declared as an extra (TeamRoleExtra) is
+	// checked against the item's MaxNewAgents allowance, regardless of how
+	// many regular team members are already bound to the item.
+	extraReq := *req
+	extraReq.TeamRole = api.TeamRoleExtra
+	if _, err = s.AddAgent(ctx, task.ID, api.AddAgentRequest{Name: "helper", Host: "fixture", Session: "helper", Runtime: "codex", ParentAgentID: parent.ID, WorkItem: &extraReq}, by); !errors.Is(err, api.ErrAgentSpawnLimit) {
 		t.Fatalf("item binding bypassed extra limit: %v", err)
 	}
 	base, err := s.AddAgent(ctx, task.ID, api.AddAgentRequest{Name: "base", Host: "fixture", Session: "base", Runtime: "codex", WorkItem: req}, by)
-	if err != nil || base.ParentAgentID != "" {
-		t.Fatalf("parentless admission counted as helper: %+v %v", base, err)
+	if err != nil || base.ParentAgentID != "" || base.WorkItem.TeamRole != api.TeamRoleMember {
+		t.Fatalf("parentless admission not resolved as a regular member: %+v %v", base, err)
 	}
 	agents, err := s.ListAgents(ctx, task.ID)
 	if err != nil || len(agents) != 3 {
@@ -407,9 +420,9 @@ func TestItemExtraCapacityIsIsolatedPerItem(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	bind := func(name string, item api.WorkItem, parent string) (api.Agent, error) {
+	bind := func(name string, item api.WorkItem, parent, teamRole string) (api.Agent, error) {
 		order := contextLinkedMessage(t, s, task, item, name+" order", name+"-order", nil)
-		req := &api.AgentWorkItemRequest{ItemTaskID: task.ID, ItemID: item.ID, ItemRevision: item.Revision, WorkOrderMessage: api.MessageReference{TaskID: task.ID, Seq: order.Seq}}
+		req := &api.AgentWorkItemRequest{ItemTaskID: task.ID, ItemID: item.ID, ItemRevision: item.Revision, WorkOrderMessage: api.MessageReference{TaskID: task.ID, Seq: order.Seq}, TeamRole: teamRole}
 		req.ContextBundle = syntheticPreparedContext(t, item, req.WorkOrderMessage, syntheticHistory(item, order))
 		return s.AddAgent(ctx, task.ID, api.AddAgentRequest{Name: name, Host: "fixture", Session: name, Runtime: "codex", ParentAgentID: parent, WorkItem: req}, by)
 	}
@@ -421,41 +434,42 @@ func TestItemExtraCapacityIsIsolatedPerItem(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// The first parented agent bound to each item is that item's allocated
-	// builder, not an extra: both are admitted even though MaxNewAgents=1.
-	builderA, err := bind("builder-a", itemA, lead.ID)
+	// A parented agent explicitly declared as each item's regular team
+	// member is admitted even though MaxNewAgents=1: membership, not
+	// arrival order, is what exempts it.
+	builderA, err := bind("builder-a", itemA, lead.ID, api.TeamRoleMember)
 	if err != nil {
 		t.Fatalf("item A builder rejected: %v", err)
 	}
-	if _, err = bind("builder-b", itemB, lead.ID); err != nil {
+	if _, err = bind("builder-b", itemB, lead.ID, api.TeamRoleMember); err != nil {
 		t.Fatalf("item B builder rejected: %v", err)
 	}
 	// Item A's single extra allowance is exhausted by one genuine extra...
-	extraA, err := bind("extra-a", itemA, lead.ID)
+	extraA, err := bind("extra-a", itemA, lead.ID, api.TeamRoleExtra)
 	if err != nil {
 		t.Fatalf("item A's own extra allowance rejected: %v", err)
 	}
 	// ...which must not affect item B's independent allowance.
-	if _, err = bind("extra-b", itemB, lead.ID); err != nil {
+	if _, err = bind("extra-b", itemB, lead.ID, api.TeamRoleExtra); err != nil {
 		t.Fatalf("item B extra rejected due to item A's usage: %v", err)
 	}
 	// A second extra on item A is now over its own allowance...
-	if _, err = bind("extra-a-2", itemA, lead.ID); !errors.Is(err, api.ErrAgentSpawnLimit) {
+	if _, err = bind("extra-a-2", itemA, lead.ID, api.TeamRoleExtra); !errors.Is(err, api.ErrAgentSpawnLimit) {
 		t.Fatalf("exhausted item A extra allowance: %v", err)
 	}
 	// ...and item B's allowance is independently exhausted too, proving
 	// isolation runs both ways.
-	if _, err = bind("extra-b-2", itemB, lead.ID); !errors.Is(err, api.ErrAgentSpawnLimit) {
+	if _, err = bind("extra-b-2", itemB, lead.ID, api.TeamRoleExtra); !errors.Is(err, api.ErrAgentSpawnLimit) {
 		t.Fatalf("exhausted item B extra allowance: %v", err)
 	}
 	// Closing item A's extra frees exactly one slot for item A only.
 	if _, err = s.CloseAgent(ctx, extraA.ID, by); err != nil {
 		t.Fatal(err)
 	}
-	if _, err = bind("extra-a-3", itemA, lead.ID); err != nil {
+	if _, err = bind("extra-a-3", itemA, lead.ID, api.TeamRoleExtra); err != nil {
 		t.Fatalf("closing item A's extra should free its own slot: %v", err)
 	}
-	if _, err = bind("extra-b-3", itemB, lead.ID); !errors.Is(err, api.ErrAgentSpawnLimit) {
+	if _, err = bind("extra-b-3", itemB, lead.ID, api.TeamRoleExtra); !errors.Is(err, api.ErrAgentSpawnLimit) {
 		t.Fatalf("item A's freed slot leaked into item B: %v", err)
 	}
 	// Closing the item A builder has no false refund of item A's already
@@ -463,7 +477,7 @@ func TestItemExtraCapacityIsIsolatedPerItem(t *testing.T) {
 	if _, err = s.CloseAgent(ctx, builderA.ID, by); err != nil {
 		t.Fatal(err)
 	}
-	if _, err = bind("extra-a-4", itemA, lead.ID); !errors.Is(err, api.ErrAgentSpawnLimit) {
+	if _, err = bind("extra-a-4", itemA, lead.ID, api.TeamRoleExtra); !errors.Is(err, api.ErrAgentSpawnLimit) {
 		t.Fatalf("closing the builder falsely refunded item A's extra allowance: %v", err)
 	}
 }
@@ -490,9 +504,9 @@ func TestItemExtraCapacityDescendantsAndConcurrentRace(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	bind := func(name string, item api.WorkItem, parent string) (api.Agent, error) {
+	bind := func(name string, item api.WorkItem, parent, teamRole string) (api.Agent, error) {
 		order := contextLinkedMessage(t, s, task, item, name+" order", name+"-order", nil)
-		req := &api.AgentWorkItemRequest{ItemTaskID: task.ID, ItemID: item.ID, ItemRevision: item.Revision, WorkOrderMessage: api.MessageReference{TaskID: task.ID, Seq: order.Seq}}
+		req := &api.AgentWorkItemRequest{ItemTaskID: task.ID, ItemID: item.ID, ItemRevision: item.Revision, WorkOrderMessage: api.MessageReference{TaskID: task.ID, Seq: order.Seq}, TeamRole: teamRole}
 		req.ContextBundle = syntheticPreparedContext(t, item, req.WorkOrderMessage, syntheticHistory(item, order))
 		return s.AddAgent(ctx, task.ID, api.AddAgentRequest{Name: name, Host: "fixture", Session: name, Runtime: "codex", ParentAgentID: parent, WorkItem: req}, by)
 	}
@@ -504,20 +518,20 @@ func TestItemExtraCapacityDescendantsAndConcurrentRace(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	builderA, err := bind("builder-a", itemA, lead.ID)
+	builderA, err := bind("builder-a", itemA, lead.ID, api.TeamRoleMember)
 	if err != nil {
 		t.Fatalf("item A builder rejected: %v", err)
 	}
 	// A descendant of the builder (parent is the builder, not lead), still
-	// bound to item A, is item A's first extra -- it counts against item
-	// A's allowance regardless of which agent spawned it.
-	extraA, err := bind("extra-a", itemA, builderA.ID)
+	// declared as an item-A extra, counts against item A's allowance
+	// regardless of which agent spawned it.
+	extraA, err := bind("extra-a", itemA, builderA.ID, api.TeamRoleExtra)
 	if err != nil {
 		t.Fatalf("descendant extra on item A rejected: %v", err)
 	}
-	// A grandchild of that extra, bound to a *different* item (B), must not
-	// be treated as an item-A extra merely because of its ancestry.
-	if _, err = bind("builder-b", itemB, extraA.ID); err != nil {
+	// A grandchild of that extra, declared as item B's regular member, must
+	// not be treated as an item-A extra merely because of its ancestry.
+	if _, err = bind("builder-b", itemB, extraA.ID, api.TeamRoleMember); err != nil {
 		t.Fatalf("item B's builder, descended from an item-A extra, wrongly rejected: %v", err)
 	}
 	// Item A now has one extra (extraA) against an allowance of 2: exactly
@@ -529,7 +543,7 @@ func TestItemExtraCapacityDescendantsAndConcurrentRace(t *testing.T) {
 		go func(i int) {
 			defer wg.Done()
 			name := fmt.Sprintf("race-extra-a-%d", i)
-			_, e := bind(name, itemA, lead.ID)
+			_, e := bind(name, itemA, lead.ID, api.TeamRoleExtra)
 			results <- e
 		}(i)
 	}
@@ -547,7 +561,102 @@ func TestItemExtraCapacityDescendantsAndConcurrentRace(t *testing.T) {
 		t.Fatalf("item A's remaining single extra slot allowed %d concurrent admissions", success)
 	}
 	// Item B's independent allowance is untouched by item A's race.
-	if _, err = bind("extra-b", itemB, lead.ID); err != nil {
+	if _, err = bind("extra-b", itemB, lead.ID, api.TeamRoleExtra); err != nil {
 		t.Fatalf("item B allowance affected by item A's concurrent race: %v", err)
+	}
+}
+
+// TestItemExtraCapacityReplacementInheritsTeamRole addresses independent
+// review #2300 finding 1(d): replacing an item's parented builder must not
+// be misclassified as a fresh extra consuming a slot, and a replacement's
+// TeamRole is inherited from the binding it replaces, not independently
+// (re)declared.
+func TestItemExtraCapacityReplacementInheritsTeamRole(t *testing.T) {
+	ctx := context.Background()
+	s, err := Open(filepath.Join(t.TempDir(), "replacement.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	by := api.Caller{Node: "fixture", User: "owner"}
+	zero := 0
+	task, err := s.CreateTask(ctx, api.CreateTaskRequest{Name: "Replacement", AllowAgentSpawn: true, MaxNewAgents: &zero}, by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lead, err := s.AddAgent(ctx, task.ID, api.AddAgentRequest{Name: "lead", Host: "fixture", Session: "lead", Runtime: "codex"}, by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	item, err := s.CreateWorkItem(ctx, task.ID, api.CreateWorkItemRequest{Kind: "bug", Title: "Replaced item", AgentID: lead.ID, RequestID: "replace-item"}, by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	order := contextLinkedMessage(t, s, task, item, "builder order", "replace-builder-order", nil)
+	builderReq := &api.AgentWorkItemRequest{ItemTaskID: task.ID, ItemID: item.ID, ItemRevision: item.Revision, WorkOrderMessage: api.MessageReference{TaskID: task.ID, Seq: order.Seq}, TeamRole: api.TeamRoleMember}
+	builderReq.ContextBundle = syntheticPreparedContext(t, item, builderReq.WorkOrderMessage, syntheticHistory(item, order))
+	builder, err := s.AddAgent(ctx, task.ID, api.AddAgentRequest{Name: "builder", Host: "fixture", Session: "builder", Runtime: "codex", ParentAgentID: lead.ID, WorkItem: builderReq}, by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = s.PostEvent(ctx, task.ID, api.PostEventRequest{AgentID: builder.ID, RunID: builder.RunID, Kind: api.EventExited}, by); err != nil {
+		t.Fatal(err)
+	}
+	replaceOrder := contextLinkedMessage(t, s, task, item, "replacement order", "replace-builder-2-order", nil)
+	// A conflicting explicit declaration on a replacement is rejected
+	// rather than silently overridden or silently accepted.
+	conflicting := &api.AgentWorkItemRequest{ItemTaskID: task.ID, ItemID: item.ID, ItemRevision: item.Revision, WorkOrderMessage: api.MessageReference{TaskID: task.ID, Seq: replaceOrder.Seq}, ReplacesAgentID: builder.ID, TeamRole: api.TeamRoleExtra}
+	conflicting.ContextBundle = syntheticPreparedContext(t, item, conflicting.WorkOrderMessage, syntheticHistory(item, replaceOrder))
+	if _, err = s.AddAgent(ctx, task.ID, api.AddAgentRequest{Name: "replacement-bad", Host: "fixture", Session: "replacement-bad", Runtime: "codex", ParentAgentID: lead.ID, WorkItem: conflicting}, by); !errors.Is(err, api.ErrInvalid) {
+		t.Fatalf("replacement with conflicting declared team role should be rejected: %v", err)
+	}
+	// Omitting TeamRole on a replacement inherits the prior binding's role
+	// (member here) -- admitted even at MaxNewAgents=0, since it is not a
+	// fresh extra allocation.
+	inherited := &api.AgentWorkItemRequest{ItemTaskID: task.ID, ItemID: item.ID, ItemRevision: item.Revision, WorkOrderMessage: api.MessageReference{TaskID: task.ID, Seq: replaceOrder.Seq}, ReplacesAgentID: builder.ID}
+	inherited.ContextBundle = syntheticPreparedContext(t, item, inherited.WorkOrderMessage, syntheticHistory(item, replaceOrder))
+	replacement, err := s.AddAgent(ctx, task.ID, api.AddAgentRequest{Name: "replacement", Host: "fixture", Session: "replacement", Runtime: "codex", ParentAgentID: lead.ID, WorkItem: inherited}, by)
+	if err != nil || replacement.WorkItem == nil || replacement.WorkItem.TeamRole != api.TeamRoleMember {
+		t.Fatalf("replacement should inherit member role from the binding it replaces: %+v %v", replacement, err)
+	}
+}
+
+// TestItemExtraCapacityRegularMemberIgnoresSpawnDisabled addresses
+// independent review #2300 finding 2: a genuine regular team member bound
+// to a work item must be launchable through the parented CLI path even
+// while AllowAgentSpawn is disabled for the task, since disabling it is
+// about extra-helper spawning, not ordinary team composition. Only a
+// genuine extra is blocked.
+func TestItemExtraCapacityRegularMemberIgnoresSpawnDisabled(t *testing.T) {
+	ctx := context.Background()
+	s, err := Open(filepath.Join(t.TempDir(), "spawn-disabled.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	by := api.Caller{Node: "fixture", User: "owner"}
+	task, err := s.CreateTask(ctx, api.CreateTaskRequest{Name: "Spawn disabled", AllowAgentSpawn: false}, by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lead, err := s.AddAgent(ctx, task.ID, api.AddAgentRequest{Name: "lead", Host: "fixture", Session: "lead", Runtime: "codex"}, by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	item, err := s.CreateWorkItem(ctx, task.ID, api.CreateWorkItemRequest{Kind: "bug", Title: "Disabled-spawn item", AgentID: lead.ID, RequestID: "disabled-spawn-item"}, by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bind := func(name, teamRole string) (api.Agent, error) {
+		order := contextLinkedMessage(t, s, task, item, name+" order", name+"-order", nil)
+		req := &api.AgentWorkItemRequest{ItemTaskID: task.ID, ItemID: item.ID, ItemRevision: item.Revision, WorkOrderMessage: api.MessageReference{TaskID: task.ID, Seq: order.Seq}, TeamRole: teamRole}
+		req.ContextBundle = syntheticPreparedContext(t, item, req.WorkOrderMessage, syntheticHistory(item, order))
+		return s.AddAgent(ctx, task.ID, api.AddAgentRequest{Name: name, Host: "fixture", Session: name, Runtime: "codex", ParentAgentID: lead.ID, WorkItem: req}, by)
+	}
+	if _, err = bind("builder", api.TeamRoleMember); err != nil {
+		t.Fatalf("regular team member blocked by disabled agent spawning: %v", err)
+	}
+	if _, err = bind("extra", api.TeamRoleExtra); !errors.Is(err, api.ErrAgentSpawnDisabled) {
+		t.Fatalf("genuine extra should still be blocked by disabled agent spawning: %v", err)
 	}
 }

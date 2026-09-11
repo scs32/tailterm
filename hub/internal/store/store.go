@@ -374,9 +374,11 @@ func (s *Store) AddAgent(ctx context.Context, taskID string, req api.AddAgentReq
 		if err != nil || parent.TaskID != taskID || parent.Status == api.AgentClosed || parent.Status == api.AgentExited || parent.Status == api.AgentRetired {
 			return api.Agent{}, api.ErrInvalid
 		}
-		if !t.AllowAgentSpawn {
-			return api.Agent{}, api.ErrAgentSpawnDisabled
-		}
+		// AllowAgentSpawn gates extra-helper launches and unbound parented
+		// requests (checked below, once this request's team-role
+		// classification is known); a regular team member bound to a work
+		// item (TeamRoleMember) is not an "extra" and may be admitted even
+		// while extra spawning is disabled for the task.
 	}
 	if req.WorkItem != nil {
 		if err := validatePreparedContextBundle(req.WorkItem); err != nil {
@@ -513,69 +515,28 @@ func (s *Store) AddAgent(ctx context.Context, taskID string, req api.AddAgentReq
 			return api.Agent{}, err
 		}
 	}
-	if req.ParentAgentID != "" {
-		// Extra-agent capacity is accounted per work item, on top of that
-		// item's allocated team, per owner clarification (#2045/#2048): the
-		// "extra" allowance belongs to a bug/feature, not the project as a
-		// whole, and closing an extra frees its slot. A parented agent that
-		// is the first one bound to a given item is that item's allocated
-		// builder, not an "extra" — it must not consume the item's extra
-		// allowance merely because the launch command originated in an
-		// agent session. Only the second and later parented agents bound to
-		// the same item are extras and are checked against MaxNewAgents.
-		// Closing (not merely exiting/retiring) a row releases its slot, so
-		// exited/retired extras stay reserved until an explicit close or
-		// authorized recovery — they cannot silently free or double-spend a
-		// slot for a successor. Parented agents with no work-item binding
-		// (no item to scope extras to) fall back to task-wide accounting,
-		// which still excludes closed rows.
+	if req.ParentAgentID != "" && req.WorkItem == nil {
+		// A parented agent with no work-item binding has no item to
+		// classify a builder-vs-extra membership against, and no explicit
+		// declaration is possible for it (TeamRole lives on the work-item
+		// request). This is a known, disclosed limitation of the extra
+		// allowance model, not silently resolved: such requests fall back
+		// to task-wide accounting under AllowAgentSpawn, excluding closed
+		// rows so a closed one frees its slot. It cannot benefit from
+		// per-item isolation. Prefer a work-item-bound, explicitly
+		// classified launch whenever one is possible.
+		if !t.AllowAgentSpawn {
+			return api.Agent{}, api.ErrAgentSpawnDisabled
+		}
 		var existing int
-		var err error
-		if req.WorkItem != nil {
-			err = s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM agents a
-JOIN agent_work_item_bindings b ON b.agent_id=a.id
-WHERE a.task_id=? AND a.parent_agent_id<>''
-AND b.item_task_id=? AND b.item_id=?`,
-				taskID, req.WorkItem.ItemTaskID, req.WorkItem.ItemID).Scan(&existing)
-			if err != nil {
-				return api.Agent{}, err
-			}
-			// The earliest parented agent ever bound to this item is that
-			// item's allocated builder, not an extra — a fixed designation
-			// that survives the builder later closing, so closing it can
-			// never falsely refund the item's spent extra allowance. Only
-			// the second and later parented agents bound to the item are
-			// extras; among those, only non-closed rows occupy a slot, so
-			// closing an extra frees exactly its own slot.
-			if existing > 0 {
-				var activeExtras int
-				if err = s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM (
-SELECT a.status AS status, ROW_NUMBER() OVER (ORDER BY a.created_at, a.id) AS rn
-FROM agents a JOIN agent_work_item_bindings b ON b.agent_id=a.id
-WHERE a.task_id=? AND a.parent_agent_id<>''
-AND b.item_task_id=? AND b.item_id=?
-) ranked WHERE rn > 1 AND status<>'closed'`,
-					taskID, req.WorkItem.ItemTaskID, req.WorkItem.ItemID).Scan(&activeExtras); err != nil {
-					return api.Agent{}, err
-				}
-				if activeExtras >= t.MaxNewAgents {
-					return api.Agent{}, api.ErrAgentSpawnLimit
-				}
-			}
-		} else {
-			// Parented agents with no work-item binding have no item to
-			// scope extras to; fall back to task-wide accounting, still
-			// excluding closed rows so a closed helper frees its slot.
-			err = s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM agents a
+		if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM agents a
 WHERE a.task_id=? AND a.parent_agent_id<>'' AND a.status<>'closed'
 AND NOT EXISTS (SELECT 1 FROM agent_work_item_bindings b WHERE b.agent_id=a.id)`,
-				taskID).Scan(&existing)
-			if err != nil {
-				return api.Agent{}, err
-			}
-			if existing >= t.MaxNewAgents {
-				return api.Agent{}, api.ErrAgentSpawnLimit
-			}
+			taskID).Scan(&existing); err != nil {
+			return api.Agent{}, err
+		}
+		if existing >= t.MaxNewAgents {
+			return api.Agent{}, api.ErrAgentSpawnLimit
 		}
 	}
 	now := s.now()
@@ -589,16 +550,45 @@ AND NOT EXISTS (SELECT 1 FROM agent_work_item_bindings b WHERE b.agent_id=a.id)`
 		return a, err
 	}
 	defer tx.Rollback()
-	contextThrough, err := validateAgentWorkItemRequest(tx, ctx, taskID, req.WorkItem)
+	contextThrough, resolvedTeamRole, err := validateAgentWorkItemRequest(tx, ctx, taskID, req.ParentAgentID, req.WorkItem)
 	if err != nil {
 		return a, err
+	}
+	if req.WorkItem != nil && req.ParentAgentID != "" && resolvedTeamRole == api.TeamRoleExtra && req.WorkItem.ReplacesAgentID == "" {
+		// Extra-agent capacity is accounted per work item, on top of that
+		// item's allocated team member(s), per owner clarification
+		// (#2045/#2048): the "extra" allowance belongs to a bug/feature,
+		// not the project as a whole, and closing an extra frees its slot.
+		// Classification is the explicit resolvedTeamRole above (declared
+		// by the caller, or inherited by a replacement) — never inferred
+		// from binding/creation order — so a regular team member bound to
+		// this item, however many already exist, never counts here. A
+		// replacement (ReplacesAgentID set) is exempt from this gate
+		// entirely: it continues the same already-reserved slot rather
+		// than creating a new one, so it neither needs a free slot nor
+		// consumes an extra one, and is not newly blocked by AllowAgentSpawn
+		// being disabled after the original extra was admitted.
+		// AllowAgentSpawn gates only this genuine fresh extra-helper case.
+		if !t.AllowAgentSpawn {
+			return a, api.ErrAgentSpawnDisabled
+		}
+		var activeExtras int
+		if err = tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM agents a
+JOIN agent_work_item_bindings b ON b.agent_id=a.id
+WHERE a.task_id=? AND a.status<>'closed' AND b.item_task_id=? AND b.item_id=? AND b.team_role=?`,
+			taskID, req.WorkItem.ItemTaskID, req.WorkItem.ItemID, api.TeamRoleExtra).Scan(&activeExtras); err != nil {
+			return a, err
+		}
+		if activeExtras >= t.MaxNewAgents {
+			return a, api.ErrAgentSpawnLimit
+		}
 	}
 	_, err = tx.ExecContext(ctx, `INSERT INTO agents (`+agentCols+`) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		a.ID, a.TaskID, a.Name, a.Host, a.Session, a.Runtime, a.Cwd, a.ParentAgentID, a.Role, a.Status, a.Title, ts(now), ts(now), a.RunID, "", "", "", false, "")
 	if err != nil {
 		return a, err
 	}
-	if a.WorkItem, err = insertAgentWorkItemBinding(ctx, tx, a, req.WorkItem, contextThrough); err != nil {
+	if a.WorkItem, err = insertAgentWorkItemBinding(ctx, tx, a, req.WorkItem, contextThrough, resolvedTeamRole); err != nil {
 		return a, err
 	}
 	if err = s.pinCrossProjectQueueAdmission(ctx, tx, taskID, req.WorkItem, a); err != nil {

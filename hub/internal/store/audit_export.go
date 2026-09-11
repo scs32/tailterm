@@ -55,7 +55,7 @@ var exportQueries = []exportQuery{
 	{"workItemDispatches", `SELECT d.* FROM work_item_dispatches d JOIN work_items w ON w.id=d.item_id WHERE w.task_id=? ORDER BY d.seq`, oneArg},
 	{"workItemRequests", `SELECT * FROM work_item_requests WHERE task_id=? ORDER BY operation,request_id`, oneArg},
 	{"messageWorkItemLinks", `SELECT * FROM message_work_item_links WHERE message_task_id=? ORDER BY message_seq`, oneArg},
-	{"agentWorkItemBindings", `SELECT b.agent_id,b.run_id,b.item_task_id,b.item_id,b.item_revision,b.work_order_task_id,b.work_order_message_seq,b.context_through_message_seq,b.replaces_agent_id,b.context_digest,b.created_at FROM agent_work_item_bindings b JOIN agents a ON a.id=b.agent_id WHERE a.task_id=? ORDER BY b.created_at,b.agent_id`, oneArg},
+	{"agentWorkItemBindings", `SELECT b.agent_id,b.run_id,b.item_task_id,b.item_id,b.item_revision,b.work_order_task_id,b.work_order_message_seq,b.context_through_message_seq,b.replaces_agent_id,b.team_role,b.context_digest,b.created_at FROM agent_work_item_bindings b JOIN agents a ON a.id=b.agent_id WHERE a.task_id=? ORDER BY b.created_at,b.agent_id`, oneArg},
 	{"messagePostReceipts", `SELECT receipt_id,task_id,agent_id,by_node,by_user,request_id,payload_hash,message_seq,created_at FROM message_post_requests WHERE task_id=? ORDER BY created_at,receipt_id`, oneArg},
 	{"decisionRequests", `SELECT * FROM decision_requests WHERE task_id=? ORDER BY message_seq`, oneArg},
 	{"decisionAnswers", `SELECT * FROM decision_answers WHERE task_id=? ORDER BY message_seq`, oneArg},

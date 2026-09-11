@@ -129,6 +129,7 @@ CREATE TABLE IF NOT EXISTS agent_work_item_bindings (
   work_order_message_seq INTEGER NOT NULL CHECK(work_order_message_seq > 0),
   context_through_message_seq INTEGER NOT NULL CHECK(context_through_message_seq >= 0),
   replaces_agent_id TEXT REFERENCES agents(id),
+  team_role TEXT NOT NULL DEFAULT '',
   context_digest TEXT NOT NULL,
   context_json BLOB NOT NULL,
   created_at TEXT NOT NULL,
@@ -137,6 +138,7 @@ CREATE TABLE IF NOT EXISTS agent_work_item_bindings (
   FOREIGN KEY(work_order_task_id,work_order_message_seq) REFERENCES messages(task_id,seq)
 );
 CREATE INDEX IF NOT EXISTS agent_work_item_bindings_item ON agent_work_item_bindings(item_task_id,item_id,created_at);
+CREATE INDEX IF NOT EXISTS agent_work_item_bindings_item_team_role ON agent_work_item_bindings(item_task_id,item_id,team_role,created_at);
 DROP INDEX IF EXISTS agent_work_item_bindings_replacement;
 CREATE TABLE IF NOT EXISTS message_post_requests (
   receipt_id TEXT PRIMARY KEY,
@@ -192,6 +194,18 @@ CREATE TABLE IF NOT EXISTS decision_answers (
 			if _, err := db.Exec("ALTER TABLE work_items ADD COLUMN " + c.name + " " + c.definition); err != nil {
 				return err
 			}
+		}
+	}
+	// agent_work_item_bindings predates team_role (item-extra-capacity
+	// correction); the CREATE TABLE above only supplies it for a fresh
+	// database, so an existing table needs the same targeted check.
+	var teamRoleColumn int
+	if err := db.QueryRow(`SELECT count(*) FROM pragma_table_info('agent_work_item_bindings') WHERE name='team_role'`).Scan(&teamRoleColumn); err != nil {
+		return err
+	}
+	if teamRoleColumn == 0 {
+		if _, err := db.Exec(`ALTER TABLE agent_work_item_bindings ADD COLUMN team_role TEXT NOT NULL DEFAULT ''`); err != nil {
+			return err
 		}
 	}
 	if _, err := db.Exec(`UPDATE work_items SET narrative_scope_revision=revision WHERE narrative_scope_revision=0`); err != nil {
