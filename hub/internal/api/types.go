@@ -147,6 +147,7 @@ var postableKinds = map[string]bool{
 func PostableKind(kind string) bool { return postableKinds[kind] }
 
 type Task struct {
+	LeadRevision    int64      `json:"leadRevision"`
 	CleanupPending  int        `json:"cleanupPending"`
 	Orchestrator    string     `json:"orchestrator"`
 	Swarm           bool       `json:"swarm"`

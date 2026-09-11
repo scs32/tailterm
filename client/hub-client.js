@@ -184,6 +184,8 @@ export function createHubClient({ fetchImpl, baseURL, token = "" }) {
         `/v1/tasks/${task}/queue-receipts/${encodeURIComponent(requestId)}` +
           q({ agentId }),
       ),
+    assignLead: (task, body) =>
+      request(`/v1/tasks/${task}/lead`, { method: "POST", body }),
     addAgent: (task, body) =>
       request(`/v1/tasks/${task}/agents`, { method: "POST", body }),
     listAgents: async (task) =>

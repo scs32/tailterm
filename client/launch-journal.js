@@ -123,7 +123,7 @@ export function normalizeTeamLaunchPlans(value) {
       !raw ||
       typeof raw !== "object" ||
       !/^[A-Za-z0-9_-]{1,128}$/.test(raw.id || "") ||
-      !["new-project", "add-team"].includes(raw.kind) ||
+      !["new-project", "add-team", "replace-lead"].includes(raw.kind) ||
       typeof raw.scope !== "string" ||
       !/^[a-f0-9]{64}$/.test(raw.scope) ||
       typeof raw.createdAt !== "string" ||
@@ -150,6 +150,21 @@ export function normalizeTeamLaunchPlans(value) {
         throw new Error("Project creation state does not match its task ID.");
     } else if (plan.creation !== undefined) {
       throw new Error("Only new-project retries can contain creation state.");
+    }
+    if (plan.kind === "replace-lead") {
+      const lead = plan.lead;
+      if (
+        !plan.taskId ||
+        plan.members.length !== 1 ||
+        !lead ||
+        !Number.isSafeInteger(lead.expectedRevision) ||
+        lead.expectedRevision < 0 ||
+        typeof lead.expectedName !== "string" ||
+        typeof lead.previousAgentId !== "string" ||
+        typeof lead.previousRunId !== "string" ||
+        !/^[A-Za-z0-9_-]{1,128}$/.test(lead.requestId || "")
+      )
+        throw new Error("Invalid lead replacement retry plan.");
     }
     if (plan.workContextBundle !== undefined) {
       try {

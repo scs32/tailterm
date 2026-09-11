@@ -439,6 +439,9 @@ func currentQueueOrchestrator(q queryRower, ctx context.Context, task api.Task) 
 		}
 		return api.Agent{}, workItemConflict("target project orchestrator has no open agent")
 	}
+	if err == nil {
+		err = verifyAssignedLead(q, ctx, task, agent)
+	}
 	return agent, err
 }
 

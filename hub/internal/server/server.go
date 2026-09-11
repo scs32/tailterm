@@ -38,6 +38,7 @@ func New(st *store.Store, identity Identity) *Server {
 	m.HandleFunc("GET /v1/work-items", s.listAllWorkItems)
 	m.HandleFunc("GET /v1/tasks/{id}", s.getTask)
 	m.HandleFunc("PATCH /v1/tasks/{id}", s.updateTask)
+	m.HandleFunc("POST /v1/tasks/{id}/lead", s.assignLead)
 	m.HandleFunc("DELETE /v1/tasks/{id}", s.closeTask)
 	m.HandleFunc("POST /v1/tasks/{id}/agents", s.addAgent)
 	m.HandleFunc("GET /v1/tasks/{id}/agents", s.listAgents)

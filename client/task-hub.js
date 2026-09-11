@@ -91,6 +91,7 @@ export function createTaskHub(host) {
     plan,
     teamId = "",
     creation = undefined,
+    lead = undefined,
   ) {
     const now = new Date().toISOString();
     for (const entry of plan) {
@@ -110,6 +111,7 @@ export function createTaskHub(host) {
       updatedAt: now,
       members: plan.map((entry) => ({ ...entry, state: "unstarted" })),
       ...(creation && { creation }),
+      ...(lead && { lead }),
     });
     await guardedJournalEffect(journal, null, () =>
       host.api("/team-launch-plans/validate", "POST", journal),
@@ -1750,6 +1752,7 @@ export function createTaskHub(host) {
     }
     if (
       journal &&
+      journal.kind !== "replace-lead" &&
       journal.members.every((member) => member.state === "started")
     )
       await guardedJournalEffect(journal, null, () =>
@@ -2006,6 +2009,259 @@ export function createTaskHub(host) {
     }
   }
 
+  async function replaceLead(taskId) {
+    if (!requireHub()) return;
+    try {
+      const scope = await launchScope();
+      let detail = await client.getTask(taskId);
+      if (detail.task.status !== "open")
+        throw new Error("This project is closed.");
+      if (!Number.isSafeInteger(detail.task.leadRevision))
+        throw new Error(
+          "The project hub needs the lead recovery update before replacing a lead.",
+        );
+      let journal = (host.getData().teamLaunchPlans || []).find(
+        (p) =>
+          p.kind === "replace-lead" && p.taskId === taskId && p.scope === scope,
+      );
+      const recovered = journal?.members[0];
+      if (
+        recovered?.agent &&
+        detail.task.orchestrator === recovered.fields.name
+      ) {
+        await client.assignLead(taskId, {
+          ...journal.lead,
+          agentId: recovered.agent.id,
+          runId: recovered.agent.runId,
+        });
+        await guardedJournalEffect(journal, null, () =>
+          host.api(`/team-launch-plans/${journal.id}`, "DELETE"),
+        );
+        await host.reloadData();
+        journal = null;
+      }
+      const previous = detail.agents
+        .filter(
+          (a) =>
+            a.name.toLowerCase() === detail.task.orchestrator?.toLowerCase(),
+        )
+        .at(-1);
+      const expected = journal?.lead || {
+        requestId: "lead_" + crypto.randomUUID().replaceAll("-", ""),
+        expectedRevision: detail.task.leadRevision,
+        expectedName: detail.task.orchestrator || "",
+        previousAgentId: previous?.id || "",
+        previousRunId: previous?.runId || "",
+      };
+      const eligible = detail.agents.filter(
+        (a) =>
+          !a.role &&
+          !a.workItem &&
+          a.online &&
+          ["running", "done", "needs_input"].includes(a.status) &&
+          a.name.toLowerCase() !== detail.task.orchestrator?.toLowerCase(),
+      );
+      const server =
+        (previous && matchServer(previous.host, taskServers())) ||
+        host.currentServer() ||
+        host.getServers()[0];
+      host.dialog(
+        `Replace lead · ${detail.task.name}`,
+        `<form id="replace-lead-form"><p class="fine">Current lead: ${esc(detail.task.orchestrator || "Not assigned")}${previous ? (previous.online ? " · online" : " · offline") : ""}</p><label>Replacement<select id="lead-candidate"><option value="">Start a new agent…</option>${eligible.map((a) => `<option value="${esc(a.id)}">${esc(a.name)} · ${esc(a.host)}</option>`).join("")}</select></label><p class="fine">Choose an online agent without an existing work-item assignment, or start a new one. The previous lead’s session and history stay available.</p><div id="lead-launch"><label>Server<select id="task-server">${serverOptions(server?.id)}</select></label>${agentFields(server)}</div><p id="task-error" class="fine" role="status"></p><div class="dialog-actions"><button type="button" id="lead-refresh">Refresh</button><button type="submit" id="lead-submit" class="primary">Start replacement</button></div></form>`,
+      );
+      const form = document.querySelector("#replace-lead-form");
+      const select = form.querySelector("#lead-candidate");
+      const button = form.querySelector("#lead-submit");
+      const error = form.querySelector("#task-error");
+      wireAgentFields();
+      let suffix = 2;
+      while (
+        detail.agents.some((a) => a.name.toLowerCase() === `lead-${suffix}`)
+      )
+        suffix++;
+      form.querySelector("#agent-name").value = `lead-${suffix}`;
+      form.querySelector("#agent-cwd").value = previous?.cwd || "";
+      form.querySelector("#task-server").onchange = () => {
+        const target = host
+          .getServers()
+          .find((s) => s.id === form.querySelector("#task-server").value);
+        form.querySelector("#agent-cwd").value = "";
+        form.querySelector("#agent-runtime").innerHTML = runtimeOptions(target);
+        wireAgentFields();
+      };
+      const pending = journal?.members[0];
+      if (pending) {
+        select.value = pending.fields.agentId;
+        select.disabled = true;
+        form.querySelector("#lead-launch").hidden = true;
+        const agent = detail.agents.find(
+          (a) => a.id === pending.fields.agentId,
+        );
+        if (
+          agent?.runId &&
+          pending.agent?.runId &&
+          agent.runId !== pending.agent.runId
+        )
+          throw new Error(
+            "The saved replacement run changed. Inspect the project before continuing.",
+          );
+        error.textContent = `Saved replacement: ${pending.fields.name}. ${agent?.online ? "Ready to assign." : "Refresh after it comes online. An uncertain launch is never repeated automatically."}`;
+        button.textContent =
+          pending.state === "unstarted" ? "Retry saved launch" : "Make lead";
+        button.disabled =
+          pending.state !== "unstarted" &&
+          !eligible.some((a) => a.id === pending.fields.agentId);
+        if (detail.task.orchestrator === pending.fields.name) {
+          button.disabled = true;
+          error.textContent =
+            "This replacement is already the recorded lead. Its launch history is preserved.";
+        }
+      }
+      select.onchange = () => {
+        form.querySelector("#lead-launch").hidden = !!select.value;
+        button.textContent = select.value ? "Make lead" : "Start replacement";
+      };
+      form.querySelector("#lead-refresh").onclick = () => replaceLead(taskId);
+      let assignment = null;
+      form.onsubmit = async (event) => {
+        event.preventDefault();
+        if (button.disabled) return;
+        button.disabled = true;
+        form.querySelector("#lead-refresh").disabled = true;
+        try {
+          if (scope !== (await launchScope()))
+            throw new Error(
+              "The hub or profile changed. Reopen lead recovery.",
+            );
+          const candidateId =
+            journal?.members[0].fields.agentId || select.value;
+          if (
+            candidateId &&
+            (!journal || journal.members[0].state !== "unstarted")
+          ) {
+            const current = await client.getTask(taskId);
+            const candidate = current.agents.find((a) => a.id === candidateId);
+            if (!candidate || !candidate.online)
+              throw new Error(
+                "The replacement is not online. Refresh before assigning it.",
+              );
+            if (journal) {
+              const plan = await restoreLaunchMembers(
+                journal,
+                host.getServers(),
+              );
+              await launchMembers(taskId, plan, new Set(), () => {}, journal);
+            }
+            const chosenRun =
+              journal?.members[0].agent?.runId ||
+              eligible.find((a) => a.id === candidateId)?.runId;
+            if (candidate.runId !== chosenRun)
+              throw new Error(
+                "The selected replacement run changed. Refresh before assigning it.",
+              );
+            assignment ||= {
+              ...expected,
+              agentId: candidate.id,
+              runId: chosenRun,
+            };
+            const result = await client.assignLead(taskId, assignment);
+            // The receipt may describe an earlier committed retry: refresh the
+            // authoritative project before displaying its current assignment.
+            detail = await client.getTask(taskId);
+            cache.set(taskId, detail);
+            const feed = feeds.get(taskId);
+            if (feed) {
+              feed.task = detail.task;
+              feed.agents = detail.agents;
+            }
+            if (journal) {
+              await guardedJournalEffect(journal, null, () =>
+                host.api(`/team-launch-plans/${journal.id}`, "DELETE"),
+              );
+              await host.reloadData();
+            }
+            host.closeDialog();
+            host.render();
+            host.notice(
+              `Lead assignment saved for ${result.task.orchestrator}. Current lead: ${detail.task.orchestrator}.`,
+            );
+            return;
+          }
+          const current = await client.getTask(taskId);
+          if (
+            current.task.leadRevision !== expected.expectedRevision ||
+            current.task.orchestrator !== expected.expectedName
+          )
+            throw new Error(
+              "The project lead changed. Refresh before launching a replacement.",
+            );
+          let plan;
+          if (journal)
+            plan = await restoreLaunchMembers(journal, host.getServers());
+          else {
+            const target = host
+              .getServers()
+              .find((s) => s.id === form.querySelector("#task-server").value);
+            if (!target) throw new Error("Choose a server.");
+            const fields = readAgentFields();
+            if (
+              current.agents.some(
+                (a) => a.name.toLowerCase() === fields.name.toLowerCase(),
+              )
+            )
+              throw new Error("Choose a fresh name for the replacement lead.");
+            fields.prompt =
+              "You are a replacement lead candidate. Wait for an explicit saved lead-assignment Board notification before doing project work. Then run tt brief to load your orchestrator role and ask the database handler for the current project handoff. Until assignment, do not act on the worker role in this startup briefing.\n" +
+              fields.prompt;
+            // Validate before persisting any launch intent.
+            agentSpawnCommand({ hub: client.base, task: taskId, ...fields });
+            plan = [{ server: target, fields }];
+            journal = await prepareLaunchJournal(
+              "replace-lead",
+              taskId,
+              plan,
+              "",
+              undefined,
+              expected,
+            );
+            await saveLaunchJournal(journal);
+            await host.reloadData();
+          }
+          await launchMembers(
+            taskId,
+            plan,
+            new Set(),
+            (text) => {
+              error.textContent = text;
+            },
+            journal,
+          );
+          await host.reloadData();
+          await replaceLead(taskId);
+        } catch (e) {
+          error.textContent = formatError(e);
+          // Freeze an uncertain assignment or launch. Retry uses the exact saved
+          // identity and payload; Refresh restores the encrypted launch journal.
+          if (journal || assignment) {
+            select.disabled = true;
+            form
+              .querySelectorAll(
+                "#lead-launch input, #lead-launch select, #lead-launch textarea, #lead-launch button",
+              )
+              .forEach((c) => {
+                c.disabled = true;
+              });
+          }
+        } finally {
+          button.disabled = false;
+          form.querySelector("#lead-refresh").disabled = false;
+        }
+      };
+    } catch (error) {
+      host.notice(formatError(error));
+    }
+  }
+
   function addAgent(taskId = taskOfTab(host.currentTab()?.id)) {
     if (!requireHub()) return;
     if (!taskId) {
@@ -2105,7 +2361,7 @@ export function createTaskHub(host) {
       const { task, agents } = await client.getTask(taskId);
       host.dialog(
         "Project settings",
-        `<form id="task-settings"><label>Project name<input id="task-settings-name" maxlength="120" value="${esc(task.name)}" required></label><label>Objective<textarea id="task-settings-goal" rows="3" maxlength="8192">${esc(task.goal)}</textarea></label><label>Main orchestrator<input id="task-settings-orchestrator" maxlength="64" value="${esc(task.orchestrator || "")}" placeholder="Agent name (optional)"></label><label class="check"><input id="task-settings-swarm" type="checkbox" ${task.swarm ? "checked" : ""}>Enable swarm</label><p class="fine">Every new message reaches all project agents. Existing messages keep their original delivery scope.</p><label class="check"><input id="task-settings-spawn" type="checkbox" ${task.allowAgentSpawn ? "checked" : ""}>Allow agents to add other agents</label><label>Max new agents<input id="task-settings-max-new-agents" type="number" min="0" max="32" step="1" value="${task.maxNewAgents ?? 2}" ${task.allowAgentSpawn ? "" : "disabled"}></label><p class="fine">Additional helpers across the project, including finished helpers. Agents you add manually do not count.</p><p class="fine">You can always add agents yourself. Turning this off prevents new helpers; existing agents keep running.</p><details class="dialog-details"><summary>Agents</summary><p class="fine">Close an accepted worker after its dependencies resolve. Retire only when you intentionally want to keep the same item session for follow-up.</p><div class="task-agent-lifecycle">${
+        `<form id="task-settings"><label>Project name<input id="task-settings-name" maxlength="120" value="${esc(task.name)}" required></label><label>Objective<textarea id="task-settings-goal" rows="3" maxlength="8192">${esc(task.goal)}</textarea></label><label>Main orchestrator<input id="task-settings-orchestrator" maxlength="64" value="${esc(task.orchestrator || "")}" readonly placeholder="No lead assigned"></label><button type="button" id="task-settings-replace-lead">Replace lead</button><label class="check"><input id="task-settings-swarm" type="checkbox" ${task.swarm ? "checked" : ""}>Enable swarm</label><p class="fine">Every new message reaches all project agents. Existing messages keep their original delivery scope.</p><label class="check"><input id="task-settings-spawn" type="checkbox" ${task.allowAgentSpawn ? "checked" : ""}>Allow agents to add other agents</label><label>Max new agents<input id="task-settings-max-new-agents" type="number" min="0" max="32" step="1" value="${task.maxNewAgents ?? 2}" ${task.allowAgentSpawn ? "" : "disabled"}></label><p class="fine">Additional helpers across the project, including finished helpers. Agents you add manually do not count.</p><p class="fine">You can always add agents yourself. Turning this off prevents new helpers; existing agents keep running.</p><details class="dialog-details"><summary>Agents</summary><p class="fine">Close an accepted worker after its dependencies resolve. Retire only when you intentionally want to keep the same item session for follow-up.</p><div class="task-agent-lifecycle">${
           agents
             .filter(
               (a) =>
@@ -2121,6 +2377,8 @@ export function createTaskHub(host) {
         }</div></details><p id="task-settings-error" class="fine" role="alert"></p><div class="dialog-actions"><button type="submit" class="primary">Save</button></div></form>`,
       );
       const form = document.querySelector("#task-settings");
+      form.querySelector("#task-settings-replace-lead").onclick = () =>
+        replaceLead(taskId);
       form.querySelector("#task-settings-spawn").onchange = (e) =>
         (form.querySelector("#task-settings-max-new-agents").disabled =
           !e.target.checked);
@@ -2186,9 +2444,6 @@ export function createTaskHub(host) {
             ),
             allowAgentSpawn: form.querySelector("#task-settings-spawn").checked,
             swarm: form.querySelector("#task-settings-swarm").checked,
-            orchestrator: form
-              .querySelector("#task-settings-orchestrator")
-              .value.trim(),
           });
           const info = cache.get(taskId);
           cache.set(taskId, { ...info, task });
@@ -2357,6 +2612,7 @@ export function createTaskHub(host) {
     inspectTools,
     attachTask,
     addAgent,
+    replaceLead,
     addTeam,
     board,
     commands,

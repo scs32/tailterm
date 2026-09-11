@@ -172,7 +172,7 @@ func scanTask(row interface{ Scan(...any) error }) (api.Task, error) {
 	var t api.Task
 	var created string
 	var closed sql.NullString
-	err := row.Scan(&t.ID, &t.Name, &t.Goal, &t.Status, &created, &t.CreatedBy.Node, &t.CreatedBy.User, &closed, &t.AllowAgentSpawn, &t.MaxNewAgents, &t.Swarm, &t.Orchestrator, &t.CleanupPending)
+	err := row.Scan(&t.ID, &t.Name, &t.Goal, &t.Status, &created, &t.CreatedBy.Node, &t.CreatedBy.User, &closed, &t.AllowAgentSpawn, &t.MaxNewAgents, &t.Swarm, &t.Orchestrator, &t.LeadRevision, &t.CleanupPending)
 	if err != nil {
 		return t, err
 	}
@@ -184,7 +184,7 @@ func scanTask(row interface{ Scan(...any) error }) (api.Task, error) {
 	return t, nil
 }
 
-const taskCols = `id,name,goal,status,created_at,created_node,created_user,closed_at,allow_agent_spawn,max_new_agents,swarm,orchestrator,CASE WHEN status='closed' THEN (SELECT count(*) FROM agents WHERE task_id=tasks.id AND cleanup_done=0) ELSE 0 END`
+const taskCols = `id,name,goal,status,created_at,created_node,created_user,closed_at,allow_agent_spawn,max_new_agents,swarm,orchestrator,lead_revision,CASE WHEN status='closed' THEN (SELECT count(*) FROM agents WHERE task_id=tasks.id AND cleanup_done=0) ELSE 0 END`
 
 func (s *Store) GetTask(ctx context.Context, id string) (api.Task, error) {
 	t, err := scanTask(s.db.QueryRowContext(ctx, `SELECT `+taskCols+` FROM tasks WHERE id=?`, id))
@@ -246,6 +246,9 @@ func (s *Store) UpdateTask(ctx context.Context, id string, req api.UpdateTaskReq
 		if *req.Orchestrator != "" && !api.ValidName(*req.Orchestrator) {
 			return api.Task{}, api.ErrInvalid
 		}
+		if t.Orchestrator != *req.Orchestrator {
+			t.LeadRevision++
+		}
 		t.Orchestrator = *req.Orchestrator
 	}
 	if req.Swarm != nil {
@@ -264,7 +267,7 @@ func (s *Store) UpdateTask(ctx context.Context, id string, req api.UpdateTaskReq
 	if t.ClosedAt != nil {
 		closedAt = ts(*t.ClosedAt)
 	}
-	_, err = s.db.ExecContext(ctx, `UPDATE tasks SET name=?, goal=?, status=?, closed_at=?, allow_agent_spawn=?,max_new_agents=?,swarm=?,orchestrator=? WHERE id=?`, t.Name, t.Goal, t.Status, closedAt, t.AllowAgentSpawn, t.MaxNewAgents, t.Swarm, t.Orchestrator, id)
+	_, err = s.db.ExecContext(ctx, `UPDATE tasks SET name=?, goal=?, status=?, closed_at=?, allow_agent_spawn=?,max_new_agents=?,swarm=?,orchestrator=?,lead_revision=? WHERE id=?`, t.Name, t.Goal, t.Status, closedAt, t.AllowAgentSpawn, t.MaxNewAgents, t.Swarm, t.Orchestrator, t.LeadRevision, id)
 	if err == nil {
 		_, err = s.addEvent(ctx, id, "task_updated", "", t.Name, nil, by)
 	}

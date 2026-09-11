@@ -18,6 +18,7 @@ func migrate(db *sql.DB) error {
 		{"tasks", "max_new_agents", "INTEGER NOT NULL DEFAULT 2"},
 		{"tasks", "swarm", "INTEGER NOT NULL DEFAULT 0"},
 		{"tasks", "orchestrator", "TEXT NOT NULL DEFAULT ''"},
+		{"tasks", "lead_revision", "INTEGER NOT NULL DEFAULT 0"},
 		{"messages", "broadcast", "INTEGER NOT NULL DEFAULT 0"},
 	} {
 		var n int
@@ -31,7 +32,11 @@ func migrate(db *sql.DB) error {
 		}
 	}
 
-	if _, err := db.Exec(`CREATE TABLE IF NOT EXISTS profile_meta (key TEXT PRIMARY KEY,value TEXT NOT NULL);
+	if _, err := db.Exec(`CREATE TABLE IF NOT EXISTS lead_assignments (
+ task_id TEXT NOT NULL REFERENCES tasks(id), request_id TEXT NOT NULL,
+ payload TEXT NOT NULL, result TEXT NOT NULL,
+ PRIMARY KEY(task_id,request_id));
+CREATE TABLE IF NOT EXISTS profile_meta (key TEXT PRIMARY KEY,value TEXT NOT NULL);
  CREATE TABLE IF NOT EXISTS profiles(username TEXT PRIMARY KEY,key_hash TEXT NOT NULL,revision INTEGER NOT NULL,updated_at TEXT NOT NULL,envelope BLOB NOT NULL);
  CREATE TABLE IF NOT EXISTS profile_history(username TEXT NOT NULL,revision INTEGER NOT NULL,updated_at TEXT NOT NULL,envelope BLOB NOT NULL,PRIMARY KEY(username,revision));`); err != nil {
 		return err
