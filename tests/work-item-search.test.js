@@ -70,7 +70,55 @@ test("history loader retains paged revisions and explicit linked messages", asyn
     [1, 4],
     [2, 0],
   ]);
-  assert.equal(workItemMatchesSearch(item, "old wording", history), true);
-  assert.equal(workItemMatchesSearch(item, "historical phrase", history), true);
-  assert.equal(workItemMatchesSearch(item, "second page", history), true);
+  assert.equal(workItemMatchesSearch(item, "old wording", history.text), true);
+  assert.equal(
+    workItemMatchesSearch(item, "historical phrase", history.text),
+    true,
+  );
+  assert.equal(workItemMatchesSearch(item, "second page", history.text), true);
+  assert.deepEqual(history.unavailable, []);
+});
+
+test("feature history includes all report sections and retained artifact versions", async () => {
+  const feature = { ...item, kind: "feature" };
+  const client = {
+    async listWorkItemRevisions() {
+      return { revisions: [], nextAfter: 0 };
+    },
+    async listWorkItemMessages() {
+      return { links: [], nextAfter: 0 };
+    },
+    async listNarrativeReports() {
+      return { reports: [{ reportId: "nrpt_one", version: 2 }] };
+    },
+    async getNarrativeReportVersion() {
+      return { sections: { deliveredWork: "Durable report writeup" } };
+    },
+    async listNarrativeArtifacts() {
+      return { artifacts: [{ artifactId: "nart_one" }] };
+    },
+    async listNarrativeArtifactVersions() {
+      return { versions: [{ version: 1 }, { version: 2 }] };
+    },
+    async getNarrativeArtifactVersion(_task, _item, _artifact, version) {
+      return {
+        title: `Artifact ${version}`,
+        content: `Captured body ${version}`,
+      };
+    },
+  };
+  const history = await loadWorkItemSearchHistory(client, feature);
+  assert.equal(
+    workItemMatchesSearch(feature, "report writeup", history.text),
+    true,
+  );
+  assert.equal(
+    workItemMatchesSearch(feature, "captured body 1", history.text),
+    true,
+  );
+  assert.equal(
+    workItemMatchesSearch(feature, "captured body 2", history.text),
+    true,
+  );
+  assert.deepEqual(history.unavailable, []);
 });

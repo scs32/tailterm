@@ -23,6 +23,11 @@ const client={base:'isolated://search',token:'fixture',cacheStatus:()=>({label:'
   return {revisions:id==='wi_history'?[{...items[1],revision:1,title:'Retired gamma title',description:'Archived delta description'},{...items[1]}]:[{...items[0]}],nextAfter:0};
  },
  async listWorkItemMessages(_task,id,{revision}){return {links:id==='wi_history'&&revision===1?[{message:{text:'Board epsilon evidence'}}]:[],nextAfter:0}},
+ async listNarrativeReports(){return {reports:[{reportId:'nrpt_fixture',version:1}]}},
+ async getNarrativeReportVersion(){return {sections:{deliveredWork:'Durable zeta report writeup'}}},
+ async listNarrativeArtifacts(){return {artifacts:[{artifactId:'nart_fixture'}]}},
+ async listNarrativeArtifactVersions(){return {versions:[{version:1}]}},
+ async getNarrativeArtifactVersion(){return {title:'Submitted artifact',content:'Captured eta artifact body'}},
 };
 const dialogNode=document.querySelector('#dialog');
 const closeDialog=()=>{dialogNode.close();dialogNode.replaceChildren()};
@@ -88,6 +93,22 @@ try {
           await page.locator("[data-work-item]").getAttribute("data-work-item"),
           "wi_history",
         );
+        if (kind === "feature") {
+          await search.fill("zeta report");
+          await page.waitForFunction(() =>
+            document
+              .querySelector("[data-items-search-status]")
+              .textContent.includes("2 matches"),
+          );
+          assert.equal(await page.locator("[data-work-item]").count(), 2);
+          await search.fill("eta artifact");
+          await page.waitForFunction(() =>
+            document
+              .querySelector("[data-items-search-status]")
+              .textContent.includes("2 matches"),
+          );
+          assert.equal(await page.locator("[data-work-item]").count(), 2);
+        }
         await search.fill("no such record");
         await page.waitForFunction(
           () => document.querySelectorAll("[data-work-item]").length === 0,

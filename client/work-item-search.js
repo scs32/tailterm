@@ -44,5 +44,76 @@ export async function loadWorkItemSearchHistory(client, item) {
       messageAfter = page.nextAfter;
     } while (true);
   }
-  return values.filter(Boolean).join("\n");
+  const unavailable = [];
+  if (item.kind === "feature") {
+    const pages = async (load, field) => {
+      const entries = [],
+        seen = new Set();
+      let cursor = "";
+      do {
+        const page = await load(cursor);
+        entries.push(...(page[field] || []));
+        cursor = page.nextCursor || page.cursor || "";
+        if (cursor && seen.has(cursor))
+          throw new Error("Narrative search cursor did not advance.");
+        if (cursor) seen.add(cursor);
+      } while (cursor);
+      return entries;
+    };
+    try {
+      const reports = await pages(
+        (cursor) =>
+          client.listNarrativeReports(item.taskId, item.id, {
+            cursor,
+            limit: 64,
+          }),
+        "reports",
+      );
+      for (const report of reports) {
+        const exact = await client.getNarrativeReportVersion(
+          item.taskId,
+          item.id,
+          report.reportId,
+          report.version,
+        );
+        values.push(...Object.values(exact.sections || {}));
+      }
+    } catch (error) {
+      unavailable.push(`reports: ${error.message}`);
+    }
+    try {
+      const artifacts = await pages(
+        (cursor) =>
+          client.listNarrativeArtifacts(item.taskId, item.id, {
+            cursor,
+            limit: 64,
+          }),
+        "artifacts",
+      );
+      for (const artifact of artifacts) {
+        const versions = await pages(
+          (cursor) =>
+            client.listNarrativeArtifactVersions(
+              item.taskId,
+              item.id,
+              artifact.artifactId,
+              { cursor, limit: 64 },
+            ),
+          "versions",
+        );
+        for (const version of versions) {
+          const exact = await client.getNarrativeArtifactVersion(
+            item.taskId,
+            item.id,
+            artifact.artifactId,
+            version.version,
+          );
+          values.push(exact.title, exact.content, exact.locator);
+        }
+      }
+    } catch (error) {
+      unavailable.push(`artifacts: ${error.message}`);
+    }
+  }
+  return { text: values.filter(Boolean).join("\n"), unavailable };
 }

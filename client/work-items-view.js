@@ -267,9 +267,13 @@ export function createWorkItemsView({
       while (cursor < pending.length && token === searchGeneration) {
         const item = pending[cursor++];
         try {
-          const text = await loadWorkItemSearchHistory(client(), item);
+          const result = await loadWorkItemSearchHistory(client(), item);
           if (token !== searchGeneration) return;
-          searchHistory.set(item.id, { revision: item.revision, text });
+          searchHistory.set(item.id, {
+            revision: item.revision,
+            text: result.text,
+            error: result.unavailable.join("; "),
+          });
         } catch (error) {
           if (token !== searchGeneration) return;
           searchHistory.set(item.id, {
