@@ -147,9 +147,15 @@ ownership or capacity, and does not force FIFO.
 
 Before proposing work, the handler verifies current native revisions, full
 history and explicit sources, worker/file ownership, ordinary and helper capacity,
-and complete admitted context within its size limit. Normal-member capacity is
-distinct from helper lifetime allowance. Never truncate context or silently
-substitute another revision, run or order. Duplicate sends and uncertain
+and complete admitted context within its size limit. Check the actual launch path:
+ordinary/manual additions and helper lifetime allowance are distinct, but
+`tt spawn` for an ordinary worker inside an agent session sets `ParentAgentID`
+from that invoking agent and consumes the additional-agent lifetime allowance,
+even for a fresh item-bound worker. A fresh name, item binding or open slot is
+not an exemption. Report a real launch-path limit and use only a separately
+authorized supported launch path or an owner-approved allowance change. Never
+clear/spoof identity, reuse closed workers or bypass a denial. Never truncate
+context or silently substitute another revision, run or order. Duplicate sends and uncertain
 allocation responses are reconciled against existing assignments and retry
 receipts. Stale or incomplete context requires fresh verification. The handoff
 names the item/revision/status, recorded order, owner, scope, files, exclusions,
@@ -165,7 +171,13 @@ bounded item or reports the actual constraint before yielding. Important handoff
 retain message sequence, exact recipient/run, expected checkpoint and evidence of
 read, actual Start and concrete progress. Delivery and retrieval alone do not
 prove execution. One follow-up for missed required progress is followed by explicit
-escalation if still unresolved. Resolved dependencies must be consumed; workers
+escalation if still unresolved. Follow-up depends on current roster state and
+exact run: message available running/done workers under their existing order and
+verify read/progress; do not call Resume for them. Resume only an intentionally
+retained retired same-item worker when authorized, respecting explicit owner
+retirement. Exited/offline workers require an actual dependency report and
+authorized supported exact-run launch/recovery handling without changing item
+identity or retrying unchanged Resume failures. Resolved dependencies must be consumed; workers
 report resumed progress within their order. Same-item corrections remain with the
 assigned worker, while new items get fresh normal identities and complete context.
 Never close unfinished work to create capacity.

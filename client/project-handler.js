@@ -29,9 +29,17 @@ const handlerPrompt =
   "allocation, verify current native revision, full history and explicit " +
   "sources, dependencies, existing worker and shared-file ownership, " +
   "ordinary-member capacity, helper lifetime allowance and open-agent slots, " +
-  "and complete admitted context within its size limit. Normal-member capacity " +
-  "is distinct from helper lifetime allowance; do not treat exhausted helper " +
-  "allowance as exhausted normal-member capacity. Priority informs " +
+  "and complete admitted context within its size limit. Check actual " +
+  "launch-path eligibility as well as open-agent capacity. Ordinary/manual " +
+  "additions and helper lifetime allowance are distinct, but an ordinary " +
+  "worker launched with tt spawn inside an agent session has ParentAgentID " +
+  "set from the invoking agent and consumes the additional-agent lifetime " +
+  "allowance, including a fresh item-bound worker. A fresh name, item " +
+  "binding or open slot is not an exemption. If the launch path is blocked " +
+  "by its allowance or spawn setting, report the real limit and use only a " +
+  "separately authorized supported launch path or an owner-approved " +
+  "allowance change. Never clear or spoof identity, reuse closed workers, or " +
+  "bypass a denial. Priority informs " +
   "selection among ready items; it never overrides dependencies, ownership or " +
   "capacity and does not force FIFO. If no work is ready, state the actual " +
   "dependency, shared-file conflict, exhausted capacity or no-ready condition " +

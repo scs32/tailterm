@@ -64,7 +64,7 @@
       "ordinary-member capacity, helper lifetime allowance and open-agent slots",
       "exhausted capacity",
       "Never close unfinished workers or tasks to create capacity",
-      "do not treat exhausted helper allowance as exhausted normal-member capacity"
+      "Check actual launch-path eligibility as well as open-agent capacity"
     ],
     "lead": ["Never close unfinished work merely because it is idle"]
   },
@@ -138,6 +138,50 @@
     "worker": [
       "not automatically to already-running threads or frozen saved launch plans",
       "distinguish the emitted prompt, host configuration and explicitly delivered current-thread messages"
+    ]
+  },
+  {
+    "name": "parented-item-bound-launch-limit",
+    "situation": "A fresh item-bound worker is proposed via tt spawn from lead; open slots remain but the lifetime additional-agent allowance is exhausted.",
+    "handler": [
+      "Ordinary/manual additions and helper lifetime allowance are distinct",
+      "ParentAgentID set from the invoking agent and consumes the additional-agent lifetime allowance, including a fresh item-bound worker",
+      "A fresh name, item binding or open slot is not an exemption",
+      "report the real limit and use only a separately authorized supported launch path or an owner-approved allowance change",
+      "Never clear or spoof identity, reuse closed workers, or bypass a denial"
+    ],
+    "lead": [
+      "Ordinary/manual additions and helper lifetime allowance are distinct",
+      "ParentAgentID set from the invoking agent and consumes the additional-agent lifetime allowance, including a fresh item-bound worker",
+      "A fresh name, item binding or open slot is not an exemption",
+      "report the real limit and use only a separately authorized supported launch path or an owner-approved allowance change",
+      "Never clear or spoof identity, reuse closed workers, or bypass a denial"
+    ]
+  },
+  {
+    "name": "available-running-or-done-followup",
+    "situation": "The same-item worker is running or done and online; an existing-order progress checkpoint is missed.",
+    "handler": [],
+    "lead": [
+      "For available running/done workers, deliver one follow-up tied to the existing order and verify read and concrete progress; do not call tt resume",
+      "then explicitly escalate the unresolved blocker to the owner/handler if progress remains absent"
+    ]
+  },
+  {
+    "name": "authorized-retired-same-item-followup",
+    "situation": "The existing same-item worker was intentionally retained as retired; owner retirement restrictions still apply.",
+    "handler": [],
+    "lead": [
+      "Use tt resume NAME only for an intentionally retained retired same-item worker when authorized; respect explicit owner retirement"
+    ]
+  },
+  {
+    "name": "exited-or-offline-followup-dependency",
+    "situation": "A same-item worker exited or is offline; an unchanged resume attempt cannot fix that state.",
+    "handler": [],
+    "lead": [
+      "For exited/offline workers, report the actual dependency and arrange authorized supported exact-run launch/recovery handling without changing item identity or retrying unchanged resume failures",
+      "Do not busy-poll"
     ]
   }
 ]

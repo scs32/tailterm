@@ -30,7 +30,9 @@ const source = [
 ];
 const fields = withDatabaseHandler(source)[1].fields;
 
-for (const scenario of scenarios) {
+for (const scenario of scenarios.filter(
+  (scenario) => scenario.handler.length,
+)) {
   test(`browser handler instruction contract: ${scenario.name}`, () => {
     for (const clause of scenario.handler) {
       assert.ok(

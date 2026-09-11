@@ -85,6 +85,17 @@ func TestHandlerAllocationEmittedBriefingContracts(t *testing.T) {
 	if requests != 3 {
 		t.Fatalf("expected three task GETs, got %d", requests)
 	}
+	for _, obsolete := range []string{
+		"make one explicit choice to tt resume NAME",
+		"and tt resume NAME before assigning more same-item work",
+		"do not treat exhausted helper allowance as exhausted normal-member capacity",
+	} {
+		for role, briefing := range briefings {
+			if strings.Contains(briefing, obsolete) {
+				t.Errorf("%s still emits ambiguous instruction %q", role, obsolete)
+			}
+		}
+	}
 	for _, scenario := range scenarios {
 		t.Run(scenario.Name, func(t *testing.T) {
 			for role, clauses := range map[string][]string{"handler": scenario.Handler, "lead": scenario.Lead, "worker": scenario.Worker} {
@@ -93,6 +104,32 @@ func TestHandlerAllocationEmittedBriefingContracts(t *testing.T) {
 						t.Errorf("%s: %s briefing missing %q", scenario.Situation, role, clause)
 					}
 				}
+			}
+		})
+	}
+}
+
+func TestHandlerAllocationContinuationGuidanceAcrossWorkerStates(t *testing.T) {
+	task := api.Task{ID: "tsk_0000000000000001", Name: "Synthetic continuation", Orchestrator: "lead", AllowAgentSpawn: true, MaxNewAgents: 0}
+	for _, state := range []struct {
+		name, status, required string
+		online                 bool
+	}{
+		{"running", api.AgentRunning, "For available running/done workers, deliver one follow-up", true},
+		{"done", api.AgentDone, "verify read and concrete progress; do not call tt resume", true},
+		{"retired", api.AgentRetired, "only for an intentionally retained retired same-item worker when authorized; respect explicit owner retirement", true},
+		{"exited", api.AgentExited, "authorized supported exact-run launch/recovery handling without changing item identity or retrying unchanged resume failures", false},
+		{"offline", api.AgentDone, "For exited/offline workers, report the actual dependency", false},
+		{"closed", api.AgentClosed, "Never clear or spoof identity, reuse closed workers, or bypass a denial", false},
+	} {
+		t.Run(state.name, func(t *testing.T) {
+			agents := []api.Agent{{Name: "lead", Status: api.AgentRunning, Online: true}, {Name: "builder", Status: state.status, Online: state.online}}
+			got := agentTaskBriefingForLaunch(task, "lead", "", agents, 0)
+			if !strings.Contains(got, state.required) {
+				t.Fatalf("missing state-aware instruction %q", state.required)
+			}
+			if !strings.Contains(got, "report the real limit") || !strings.Contains(got, "one follow-up tied to the existing order, then explicitly escalate") {
+				t.Fatal("lost capacity or bounded progress escalation instruction")
 			}
 		})
 	}

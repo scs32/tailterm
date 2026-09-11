@@ -44,9 +44,15 @@ ready work it reports the actual constraint and next meaningful checkpoint.
 
 Before allocation the handler verifies current native revision, complete history
 and explicit sources, dependencies, worker and file ownership, ordinary-member
-capacity, helper lifetime allowance, open slots and admitted context limits. Normal-member capacity is distinct from
-helper lifetime allowance; exhausted helper quota alone does not exhaust normal
-capacity. Context must never be truncated or replaced with another revision/run/order.
+capacity, helper lifetime allowance, open slots and admitted context limits.
+Capacity must be evaluated for the actual launch path: ordinary/manual additions
+and helper allowance are distinct, but an ordinary `tt spawn` inside an agent
+session sets the invoking agent as `ParentAgentID` and consumes the lifetime
+additional-agent allowance even with a fresh item binding. An open slot, fresh
+name or item binding is no exemption. Report a real limit and use only a separately
+authorized supported launch path or owner-approved allowance change. Clearing or
+spoofing identity, reusing closed workers and bypassing denials are prohibited.
+Context must never be truncated or replaced with another revision/run/order.
 Priority informs selection among ready items, without overriding those conditions
 or forcing FIFO. Duplicates reconcile against existing assignments and stable
 receipts. Stale revision/context requires refreshed verification. Partial retry
@@ -64,7 +70,13 @@ It deliberately selects another authorized bounded item or states the actual
 constraint before yielding. It retains important message sequence, recipient/run,
 checkpoint, read, Start and concrete progress evidence. A missed required progress
 checkpoint gets one follow-up linked to the existing order, then explicit
-escalation if still unresolved. Resolved dependencies must be consumed. Lead
+escalation if still unresolved. Current roster state and exact run determine the
+follow-up: message available running/done workers with the existing order and
+verify read/progress, without calling `tt resume`; resume only authorized,
+intentionally retained retired same-item workers while respecting explicit owner
+retirement. Exited/offline workers require a dependency report and authorized
+supported exact-run launch/recovery handling, preserving item identity and never
+retrying unchanged Resume failures. Resolved dependencies must be consumed. Lead
 continues planning/review; assigned builders implement and integrate.
 
 Workers retain their assigned builder/read-only roles. They report checkpoint
@@ -81,7 +93,7 @@ lead/handler availability remain in effect.
 | --- | --- |
 | `client/project-handler.js` | Extend only the generated handler assignment string. |
 | `hub/cmd/tt/coordination.go` | Extend existing MAIN, common work-audit/worker and handler briefing strings; no control-flow changes. |
-| `tests/handler-allocation-cases.json` | Twelve synthetic scenario requirements shared by JS/browser and Go emitter checks. |
+| `tests/handler-allocation-cases.json` | Sixteen synthetic scenario requirements shared by JS/browser and Go emitter checks; thirteen apply to handler output. |
 | `tests/handler-allocation.test.js` | Handler prompt contracts, real shell argument capture with fake tt, and preserved old/new recovery prompts. |
 | `hub/cmd/tt/handler_allocation_test.go` | Actual isolated `cmdBrief` output for lead/handler/worker and parity with launch role emitter; task-GET-only assertion. |
 | `tests/project-handler-vault-browser.mjs` | Browser-generated prompt contracts, encrypted reload checks, and focused fixture corrections described below. |
@@ -116,7 +128,7 @@ unchanged and was not investigated.
 
 ## Synthetic acceptance
 
-The shared matrix checks clauses in actual emitted text, not a simulated
+The corrected sixteen-scenario matrix checks clauses in actual emitted text, not a simulated
 decision engine. Scenario facts are synthetic requirements; they are not fed into
 a scheduler and their expected actions are not claimed as observed model output.
 
@@ -127,17 +139,26 @@ a scheduler and their expected actions are not claimed as observed model output.
 | No ready items | Actual no-ready reason and next checkpoint; no filler/poll loop. |
 | Blocked dependency / later resolution | Verify dependencies, report blocker, consume resolved handoff and report resumed progress. |
 | Shared-file overlap | Check ownership; serialize the actual conflict only. |
-| No open slots / exhausted helper allowance | Distinguish ordinary/helper/open capacity and preserve unfinished workers. |
+| No open slots / exhausted helper allowance | Check actual launch-path capacity and preserve unfinished workers. |
 | Duplicate Send/allocation or uncertain response | Reconcile assignment/retry receipts; no automatic execution or duplicate worker. |
 | Stale revision/incomplete context/partial retry | Reverify current complete context; preserve provenance and frozen identity. |
 | Priority change | Choose among ready work; no override of dependency/ownership/capacity or mandatory FIFO. |
 | Same-item correction / different new item | Keep correction with original worker; use fresh normal identity/context for the new item. |
 | Full handoff/result/receipt | Complete scope/order/context, exact Start and progress, one follow-up/escalation, saved completion evidence. |
 | New host/browser code vs existing thread | Explicit prompt/configuration/current-thread distinction and no scheduler/obedience guarantee. |
+| Agent-originated item-bound launch at exhausted allowance | Parented `tt spawn` consumes lifetime allowance; fresh identity/open slot is no exemption; require separately authorized supported path or owner-approved allowance change. |
+| Available running/done worker | Existing-order follow-up and read/progress verification, without `tt resume`. |
+| Retained retired same-item worker | Resume only when authorized; respect explicit owner retirement. |
+| Exited/offline worker | Report dependency and use authorized supported exact-run handling without changing item identity or repeating unchanged Resume failures. |
 
-Validation commands and final outcomes are recorded below. All fixtures use
+Validation commands and original/corrected outcomes are recorded below. All fixtures use
 synthetic data, disposable browser storage and test-only hub/tmux resources;
 no live tasks, profiles, keys, vaults or work-item/Queue data served as fixtures.
+
+### Original candidate validation (a1c0534)
+
+The original candidate evidence below is preserved; corrected-candidate checks
+are reported separately.
 
 - `node --test tests/handler-allocation.test.js tests/project-handler.test.js tests/tmux-command.test.js`: 25/25 pass, including twelve scenario contracts and real shell delivery to a fake `tt` that only prints arguments.
 - `npm test`: 168/168 pass.
@@ -153,8 +174,8 @@ no live tasks, profiles, keys, vaults or work-item/Queue data served as fixtures
 - `go vet ./cmd/tt`: pass.
 - `git diff --check` and focused JavaScript/JSON formatting checks: pass.
 
-The final JavaScript, browser and focused Go runs were repeated after the last
-capacity/context wording change and passed with the outcomes above. The broader
+The original candidate JavaScript, browser and focused Go runs were repeated after
+its last capacity/context wording change and passed with the outcomes above. The broader
 known-failing dispatch case was not silently removed or repaired.
 
 The Go emitter fixture calls real `cmdBrief` against a synthetic HTTP task/roster,
@@ -197,6 +218,64 @@ Go source overlay substituting exact baseline `coordination.go` from
 `84daa9c7ea46bf28cf407ce43d60eb4d87d05816`; no working file was reset.
 Thus this is a reproduced baseline mismatch, not a candidate regression claim.
 The full Go package/repository suite was not claimed or run to completion.
+
+## Same-order review corrections #1926
+
+Lead independently passed the original candidate’s focused JS and actual
+`cmdBrief` test, then requested two instruction corrections before acceptance.
+Handler #1927 saved and independently read back the full original report as
+`nart_ed8c608e7819f4d4` v1, 16,438 bytes, digest
+`2381be0a4f086319c9faf6f0059f8c30cc2ac086bcfa3900a5d25200cb1cb6be`, receipt
+`nrr_488a137c35bdf836`, from exact source
+`a1c05341ba4b5ca1b019b25103856eccea42f83e`. Original builder handoff #1922 was
+separately retained as `nart_6e30429345f990d6` v1. No completion pin, revision,
+scope or Queue state changed. The builder sent correction context to handler
+#1929 before editing; these changes remain under #1880, with no new source-file
+or runtime scope.
+
+The initial normal/helper distinction was too broad for a parented agent launch.
+Lead #1926 supplied the actual observation: a fresh item-bound launch was rejected
+HTTP 409 under #1886 and needed explicit owner #1890 to increase allowance from
+2 to 4. This report attributes that live observation to lead; the builder did not
+query the live Queue or repeat the launch. Local source inspection confirms
+`cmdSpawn` assigns the invoking agent to `ParentAgentID` for ordinary workers.
+Both handler and MAIN now require checking actual launch-path eligibility and
+preserve the real block, allowing only separately authorized supported launch
+paths or an owner-approved allowance change. No identity clearing/spoofing,
+closed-worker reuse or denial bypass is allowed.
+
+The initial MAIN text also implied unconditional Resume before follow-up. Local
+`cmdRetirement` and its existing isolated test confirm Resume accepts retired
+agents only. MAIN now distinguishes available running/done, intentionally retained
+retired, and exited/offline cases. The generic helper sentence is qualified too.
+One follow-up/escalation, exact-run handling, explicit owner retirement and
+same-item ownership remain intact. No registration, capacity, retirement or
+recovery runtime behavior changed.
+
+The shared matrix adds one actual-launch-path case and three continuation-state
+cases (sixteen total; thirteen handler cases). The Go emitter test rejects both
+obsolete unconditional Resume phrases and the old unqualified capacity phrase.
+A separate six-state emitted-guidance check covers running, done, retired,
+exited, offline and closed workers, including an exhausted allowance. It validates
+state-aware instructions, not simulated lifecycle actions or model obedience.
+
+Corrected-candidate targeted validation (same-order #1926):
+
+- `node --test tests/handler-allocation.test.js tests/project-handler.test.js tests/tmux-command.test.js`: **26/26 pass**.
+- `node tests/project-handler-vault-browser.mjs`: Chromium and WebKit each
+  pass **13 handler instruction contracts** and the encrypted-plan recovery
+  checks, with the same explicit test-only WASM boundary.
+- `go test ./cmd/tt -run 'Test(HandlerAllocation|Agent.*(Briefing|WorkAudit)|OrchestratorImplementation|RetiredIdle|WorkerBriefing|FormatWorkItemContext|BriefingCloses|RetireAndResume)' -count=1 -timeout=60s -json`:
+  **10 top-level tests pass (58 including subtests)**, zero failures, with
+  inherited live coordination environment removed. Includes actual `cmdBrief`
+  output, sixteen scenario contracts, six-state guidance and the existing
+  retirement/Resume test. No lifecycle changes were made to live workers.
+- `go vet ./cmd/tt`, focused Prettier checks and `git diff --check`: pass.
+
+The full JavaScript suite’s 168/168 result above belongs to the original
+candidate. Correction validation was targeted to the changed instruction/delivery
+surfaces; no new full-suite claim replaces the recorded initial evidence or its
+baseline dispatch nonpass.
 
 ## Remaining dependencies and separately bounded release proposal
 

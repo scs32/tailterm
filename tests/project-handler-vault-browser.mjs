@@ -221,7 +221,7 @@ try {
       assert.equal(deleted.missingHostPlan, true);
       assert.deepEqual(deleted.remaining, []);
       console.log(
-        `${engine.name()}: 12 allocation instruction contracts emitted; handler plans await encrypted save, survive reload/missing host, reject failed writes, stay out of exports/sync, and delete durably.`,
+        `${engine.name()}: ${allocationScenarios.filter((scenario) => scenario.handler.length).length} allocation instruction contracts emitted; handler plans await encrypted save, survive reload/missing host, reject failed writes, stay out of exports/sync, and delete durably.`,
       );
     } finally {
       await browser.close();
