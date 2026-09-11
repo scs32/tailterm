@@ -60,6 +60,10 @@ export function installDialogSelectInteraction(dialog) {
     keepDialogOpenForSelectCancel(event, dialog);
   };
   dialog.onkeydown = (event) => {
+    // Repeated browser close requests can emit a non-cancelable dialog cancel.
+    // Consume the picker Escape before that default action reaches the dialog.
+    if (event.key === "Escape" && keepDialogOpenForSelectCancel(event, dialog))
+      return;
     openDialogSelectOnEnter(event, dialog);
   };
 }
