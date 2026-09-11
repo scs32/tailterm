@@ -34,7 +34,7 @@ This preparation is bounded to work order #2227 and integration supplement
 `c8ef0c1a29a534939689d2bc6f45869e7092aac4` and cleanly cherry-picked accepted
 Flashes commits `f49f22d9abd509f20b06975ee52b5ad3c5a61e29` followed by
 `f0fc26fcf0a0f0a278b99fb8dd5b39205790c212`. The resulting combined candidate
-is `727d91b775aa5fea60ae6245461834d4bf2f44fb`.
+is `727d91b389149cf9f2044f8c4dd4da3f0fb607de`.
 
 The isolated candidate passed `npm test` (176 tests), the Board composer
 Chromium/WebKit fixture, the live Search Chromium/WebKit fixture, and the
