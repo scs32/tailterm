@@ -1,5 +1,9 @@
 import { createViewRefreshPresentation } from "./view-refresh-presentation.js";
 import { createWorkItemsScroll } from "./work-items-scroll.js";
+import {
+  loadWorkItemSearchHistory,
+  workItemMatchesSearch,
+} from "./work-item-search.js";
 
 const esc = (s) =>
   String(s ?? "").replace(
@@ -51,9 +55,13 @@ export function createWorkItemsView({
     items = [],
     scope = "",
     state = "",
+    query = "",
     loading = false,
     again = false,
-    narrativeGeneration = 0;
+    narrativeGeneration = 0,
+    searchGeneration = 0,
+    searchLoading = false;
+  const searchHistory = new Map();
   const presentation = createViewRefreshPresentation({
     render: () => {
       if (visible && !loading) render();
@@ -73,6 +81,7 @@ export function createWorkItemsView({
     const wasVisible = visible;
     visible = false;
     generation++;
+    searchGeneration++;
     loading = false;
     subscription?.stop();
     subscription = null;
@@ -128,7 +137,16 @@ export function createWorkItemsView({
       }
       tasks = nextTasks;
       items = next;
+      searchGeneration++;
+      for (const [id, cached] of searchHistory)
+        if (
+          !items.some(
+            (item) => item.id === id && item.revision === cached.revision,
+          )
+        )
+          searchHistory.delete(id);
       render();
+      if (query.trim()) void enrichSearchHistory();
     } catch (error) {
       if (!visible || token !== generation) return;
       itemScroll.interrupt();
@@ -155,7 +173,7 @@ export function createWorkItemsView({
       projectButton = (task) =>
         `<button type="button" data-board-task="${esc(task.id)}" data-items-scope="${esc(task.id)}" aria-pressed="${scope === task.id}" title="${esc(task.name)}"><span class="board-task-name">${esc(task.name)}</span><span class="fine">${esc(task.goal || (task.status === "closed" ? "Closed project" : "Open project"))}</span></button>`;
     if (!presentation.beforeRender(scope || "all")) return;
-    root.innerHTML = `<div class="board mode-board work-items-view"><aside class="board-rail work-items-rail" aria-label="Projects"><div class="board-rail-head"><span class="eyebrow">PROJECTS</span><button type="button" data-items-new-rail title="New ${singular.toLowerCase()}" aria-label="New ${singular.toLowerCase()}" ${!open.length || selectedProject?.status === "closed" ? "disabled" : ""}>＋</button></div><button type="button" data-board-task="all" data-items-scope="" aria-pressed="${!scope}"><span class="board-task-name">All projects</span><span class="fine">${open.length} open project${open.length === 1 ? "" : "s"}</span></button>${open.map(projectButton).join("")}${closed.length ? `<details class="board-closed work-items-closed" data-view-disclosure="closed" ${selectedProject?.status === "closed" ? "open" : ""}><summary>Closed · ${closed.length}</summary>${closed.map(projectButton).join("")}</details>` : ""}</aside><section class="board-thread work-items-main"><div class="board-head work-items-head"><div class="view-heading"><div class="work-items-heading"><span class="eyebrow">${selectedProject ? "PROJECT" : "ALL PROJECTS"}</span><h2>${plural} <span class="count-badge">${items.length}</span></h2></div><div class="work-items-controls"><label class="work-items-project-select"><span>Project</span><select data-items-project data-view-control="project"><option value="">All projects</option>${tasks.map((t) => `<option value="${esc(t.id)}" ${scope === t.id ? "selected" : ""}>${esc(t.name)}${t.status === "closed" ? " · closed" : ""}</option>`).join("")}</select></label><label class="work-items-status-select"><span>Status</span><select data-items-status data-view-control="status"><option value="">All statuses</option>${options(statuses, state)}</select></label><span class="work-items-sync fine" data-work-items-sync role="status" aria-live="polite">${esc(syncLabel)}</span><button data-items-new class="primary" ${!open.length || selectedProject?.status === "closed" ? "disabled" : ""}>＋ New ${singular.toLowerCase()}</button></div></div><p class="fine">${esc(selectedProject?.name || "All projects")}</p></div><div class="work-items-list">${items.length ? items.map((item) => `<article class="work-item" data-work-item="${esc(item.id)}"><div class="work-item-copy"><button class="work-item-title" data-item-edit="${esc(item.id)}">${esc(item.title)}</button><span class="fine">${esc(project(item.taskId)?.name || item.taskId)} · ${esc(statuses[item.status])} · ${esc(priorities[item.priority])}${item.lastDispatch ? ` · Sent to ${esc(project(item.lastDispatch.targetTaskId)?.name || item.lastDispatch.targetTaskId)}` : ""}</span></div><div class="work-item-actions">${kind === "feature" ? `<button data-item-narrative="${esc(item.id)}">History &amp; report</button>` : ""}<button data-item-history="${esc(item.id)}">History · ${item.revision}</button><button data-item-send="${esc(item.id)}" ${project(item.taskId)?.status === "closed" ? "disabled" : ""}>Send to project</button></div></article>`).join("") : `<p class="work-items-empty fine">No ${plural.toLowerCase()} match these filters.</p>`}</div></section></div>`;
+    root.innerHTML = `<div class="board mode-board work-items-view"><aside class="board-rail work-items-rail" aria-label="Projects"><div class="board-rail-head"><span class="eyebrow">PROJECTS</span><button type="button" data-items-new-rail title="New ${singular.toLowerCase()}" aria-label="New ${singular.toLowerCase()}" ${!open.length || selectedProject?.status === "closed" ? "disabled" : ""}>＋</button></div><button type="button" data-board-task="all" data-items-scope="" aria-pressed="${!scope}"><span class="board-task-name">All projects</span><span class="fine">${open.length} open project${open.length === 1 ? "" : "s"}</span></button>${open.map(projectButton).join("")}${closed.length ? `<details class="board-closed work-items-closed" data-view-disclosure="closed" ${selectedProject?.status === "closed" ? "open" : ""}><summary>Closed · ${closed.length}</summary>${closed.map(projectButton).join("")}</details>` : ""}</aside><section class="board-thread work-items-main"><div class="board-head work-items-head"><div class="view-heading"><div class="work-items-heading"><span class="eyebrow">${selectedProject ? "PROJECT" : "ALL PROJECTS"}</span><h2>${plural} <span class="count-badge"></span></h2></div><div class="work-items-controls"><label class="work-items-search"><span class="sr-only">Search ${plural.toLowerCase()}</span><input type="search" data-items-search value="${esc(query)}" placeholder="Search ${plural.toLowerCase()}" autocomplete="off"></label><label class="work-items-project-select"><span>Project</span><select data-items-project data-view-control="project"><option value="">All projects</option>${tasks.map((t) => `<option value="${esc(t.id)}" ${scope === t.id ? "selected" : ""}>${esc(t.name)}${t.status === "closed" ? " · closed" : ""}</option>`).join("")}</select></label><label class="work-items-status-select"><span>Status</span><select data-items-status data-view-control="status"><option value="">All statuses</option>${options(statuses, state)}</select></label><span class="work-items-sync fine" data-work-items-sync role="status" aria-live="polite">${esc(syncLabel)}</span><button data-items-new class="primary" ${!open.length || selectedProject?.status === "closed" ? "disabled" : ""}>＋ New ${singular.toLowerCase()}</button></div></div><p class="fine">${esc(selectedProject?.name || "All projects")}<span class="work-items-search-status" data-items-search-status role="status" aria-live="polite"></span></p></div><div class="work-items-list"></div></section></div>`;
     presentation.afterRender(scope || "all");
     root.querySelectorAll("[data-items-scope]").forEach(
       (button) =>
@@ -174,8 +192,19 @@ export function createWorkItemsView({
       state = e.target.value;
       void reload();
     };
+    root.querySelector("[data-items-search]").oninput = (event) => {
+      query = event.target.value;
+      updateSearchResults(true);
+      if (query.trim()) void enrichSearchHistory();
+    };
     root.querySelector("[data-items-new]").onclick = () => edit();
     root.querySelector("[data-items-new-rail]").onclick = () => edit();
+    updateSearchResults();
+    itemScroll.afterRender(itemScrollFrame);
+  }
+  const rowMarkup = (item) =>
+    `<article class="work-item" data-work-item="${esc(item.id)}"><div class="work-item-copy"><button class="work-item-title" data-item-edit="${esc(item.id)}">${esc(item.title)}</button><span class="fine">${esc(project(item.taskId)?.name || item.taskId)} · ${esc(statuses[item.status])} · ${esc(priorities[item.priority])}${item.lastDispatch ? ` · Sent to ${esc(project(item.lastDispatch.targetTaskId)?.name || item.lastDispatch.targetTaskId)}` : ""}</span></div><div class="work-item-actions">${kind === "feature" ? `<button data-item-narrative="${esc(item.id)}">History &amp; report</button>` : ""}<button data-item-history="${esc(item.id)}">History · ${item.revision}</button><button data-item-send="${esc(item.id)}" ${project(item.taskId)?.status === "closed" ? "disabled" : ""}>Send to project</button></div></article>`;
+  function bindRows() {
     root
       .querySelectorAll("[data-item-edit]")
       .forEach(
@@ -204,7 +233,68 @@ export function createWorkItemsView({
           (b.onclick = () =>
             dispatch(items.find((i) => i.id === b.dataset.itemSend))),
       );
-    itemScroll.afterRender(itemScrollFrame);
+  }
+  function updateSearchResults(resetScroll = false) {
+    const list = root?.querySelector(".work-items-list");
+    if (!list) return;
+    const filtered = items.filter((item) =>
+      workItemMatchesSearch(item, query, searchHistory.get(item.id)?.text),
+    );
+    root.querySelector(".count-badge").textContent = String(filtered.length);
+    const pending =
+      query.trim() && items.some((item) => !searchHistory.has(item.id));
+    const unavailable = items.filter(
+      (item) => searchHistory.get(item.id)?.error,
+    ).length;
+    root.querySelector("[data-items-search-status]").textContent = query.trim()
+      ? ` · ${pending ? "Searching current records and history…" : `${filtered.length} match${filtered.length === 1 ? "" : "es"}${unavailable ? ` · history unavailable for ${unavailable}` : ""}`}`
+      : "";
+    list.innerHTML = filtered.length
+      ? filtered.map(rowMarkup).join("")
+      : `<p class="work-items-empty fine">${pending ? `Searching ${plural.toLowerCase()} history…` : `No ${plural.toLowerCase()} match this search and the selected filters.`}</p>`;
+    bindRows();
+    if (resetScroll) root.querySelector(".work-items-main").scrollTop = 0;
+  }
+  async function enrichSearchHistory() {
+    if (searchLoading) return;
+    searchLoading = true;
+    const token = searchGeneration;
+    const pending = items.filter(
+      (item) => searchHistory.get(item.id)?.revision !== item.revision,
+    );
+    let cursor = 0;
+    const worker = async () => {
+      while (cursor < pending.length && token === searchGeneration) {
+        const item = pending[cursor++];
+        try {
+          const text = await loadWorkItemSearchHistory(client(), item);
+          if (token !== searchGeneration) return;
+          searchHistory.set(item.id, { revision: item.revision, text });
+        } catch (error) {
+          if (token !== searchGeneration) return;
+          searchHistory.set(item.id, {
+            revision: item.revision,
+            text: "",
+            error: error.message,
+          });
+        }
+        updateSearchResults();
+      }
+    };
+    try {
+      await Promise.all(
+        Array.from({ length: Math.min(4, pending.length) }, worker),
+      );
+      if (token === searchGeneration) updateSearchResults();
+    } finally {
+      searchLoading = false;
+      if (
+        query.trim() &&
+        token !== searchGeneration &&
+        items.some((item) => !searchHistory.has(item.id))
+      )
+        void enrichSearchHistory();
+    }
   }
   const memoryDrafts = new Map();
   const drafts = draftPersistence || {

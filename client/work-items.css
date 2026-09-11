@@ -23,6 +23,13 @@
 .work-items-status-select > span {
   display: none;
 }
+.work-items-search input {
+  width: min(210px, 28vw);
+  height: 28px;
+}
+.work-items-search-status {
+  color: var(--muted);
+}
 #mode-view .work-items-controls select {
   height: 28px;
   max-width: 260px;
@@ -277,6 +284,12 @@
   }
   .work-items-status-select > span {
     display: inline;
+  }
+  .work-items-search {
+    flex: 1 1 180px;
+  }
+  .work-items-search input {
+    width: 100%;
   }
   .work-item {
     align-items: start;
