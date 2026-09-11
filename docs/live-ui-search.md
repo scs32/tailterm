@@ -50,7 +50,10 @@ Fresh production Chromium checks on all three origins started the packaged WASM
 and created/restored only a synthetic vault key. The focused Search and scroll
 fixtures passed Chromium and WebKit before publication and the Search fixture
 was repeated after activation; the exact packaged JS/CSS contains its Search
-selectors. Native Safari remains
+selectors. A focused Chromium harness also asserted the exact compiled main
+bundle hash, appended only a test export for its compiled view factory, and
+verified Bugs/Features retained-history matching, clear, and query/focus/caret
+continuity with synthetic data. The deployed bundle was not modified. Native Safari remains
 untested. The pre-existing project-work-items fixture still times out after its
 covered assertions while waiting for legacy `board message #` notice text; prior
 review established identical behavior on the accepted baseline.

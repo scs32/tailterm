@@ -58,6 +58,17 @@
     ],
     "servedAssetResult": "Each origin matched the exact manifest, canonical index, and all 81 public assets by size, SHA-256, and applicable MIME/identity contract; Mini retains its documented application/octet-stream type for .mjs.",
     "browserResult": "Fresh Chromium on every origin started production WASM and created/restored an isolated synthetic vault key without page errors. Exact packaged JS/CSS contains the Search selectors, and the isolated Search fixture passed Chromium and WebKit after activation.",
+    "compiledSearch": {
+      "bundle": "assets/index-DTuTfs0r.js",
+      "bundleSha256": "9076bdbcfb9637058cac720d73b118990892dc730815d6bf4b30f341e2a8f441",
+      "engine": "Chromium",
+      "kinds": ["bug", "feature"],
+      "assertions": ["retained-history match", "clear restores both records", "query/focus/backward-caret continuity through refresh"],
+      "isolation": "The harness asserted the exact released bundle hash, appended only a test export of the already compiled Gd view factory in memory, and supplied synthetic client records. Deployed bytes were not changed or rebuilt.",
+      "artifact": ".build/releases/live-search-8a6862e/actual/compiled-search-release-check.mjs",
+      "artifactSha256": "f4eb8c7debc8a3f661f4b58dc0b252d83fea6dab989e59c08d55166619c70cf4",
+      "result": "PASS"
+    },
     "verifiedAt": "2026-09-11T23:18:35Z"
   },
   "limitations": [
