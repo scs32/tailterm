@@ -359,15 +359,109 @@ func TestAgentWorkItemContextRejectsStaleMismatchedAndHelperAdmission(t *testing
 		t.Fatalf("oversized context did not fail explicitly: %v", err)
 	}
 	req.ContextBundle = completeContext
+	// Owner correction #2045/#2048: the first parented agent bound to an
+	// item is that item's allocated builder, not an "extra" — it must be
+	// admitted even at MaxNewAgents=0, since it consumes no extra
+	// allowance merely because a lead spawned it from an agent session.
+	builder, err := s.AddAgent(ctx, task.ID, api.AddAgentRequest{Name: "builder", Host: "fixture", Session: "builder", Runtime: "codex", ParentAgentID: parent.ID, WorkItem: req}, by)
+	if err != nil || builder.ParentAgentID != parent.ID {
+		t.Fatalf("item's first parented builder rejected as an extra: %+v %v", builder, err)
+	}
+	// A second parented agent bound to the same item is a genuine extra
+	// and is checked against the item's MaxNewAgents allowance.
 	if _, err = s.AddAgent(ctx, task.ID, api.AddAgentRequest{Name: "helper", Host: "fixture", Session: "helper", Runtime: "codex", ParentAgentID: parent.ID, WorkItem: req}, by); !errors.Is(err, api.ErrAgentSpawnLimit) {
-		t.Fatalf("item binding bypassed helper limit: %v", err)
+		t.Fatalf("item binding bypassed extra limit: %v", err)
 	}
 	base, err := s.AddAgent(ctx, task.ID, api.AddAgentRequest{Name: "base", Host: "fixture", Session: "base", Runtime: "codex", WorkItem: req}, by)
 	if err != nil || base.ParentAgentID != "" {
 		t.Fatalf("parentless admission counted as helper: %+v %v", base, err)
 	}
 	agents, err := s.ListAgents(ctx, task.ID)
-	if err != nil || len(agents) != 2 {
+	if err != nil || len(agents) != 3 {
 		t.Fatalf("failed admissions left records: %+v %v", agents, err)
+	}
+}
+
+// TestItemExtraCapacityIsIsolatedPerItem proves the owner-required
+// #2045/#2048 correction end to end: each item's first parented builder is
+// admitted free of the extra allowance, a second (genuine extra) on that
+// item is capped independently of any other item's extras, and closing an
+// extra frees exactly one slot for its own item without touching another
+// item's allowance.
+func TestItemExtraCapacityIsIsolatedPerItem(t *testing.T) {
+	ctx := context.Background()
+	s, err := Open(filepath.Join(t.TempDir(), "isolation.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	by := api.Caller{Node: "fixture", User: "owner"}
+	one := 1
+	task, err := s.CreateTask(ctx, api.CreateTaskRequest{Name: "Isolation", AllowAgentSpawn: true, MaxNewAgents: &one}, by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lead, err := s.AddAgent(ctx, task.ID, api.AddAgentRequest{Name: "lead", Host: "fixture", Session: "lead", Runtime: "codex"}, by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bind := func(name string, item api.WorkItem, parent string) (api.Agent, error) {
+		order := contextLinkedMessage(t, s, task, item, name+" order", name+"-order", nil)
+		req := &api.AgentWorkItemRequest{ItemTaskID: task.ID, ItemID: item.ID, ItemRevision: item.Revision, WorkOrderMessage: api.MessageReference{TaskID: task.ID, Seq: order.Seq}}
+		req.ContextBundle = syntheticPreparedContext(t, item, req.WorkOrderMessage, syntheticHistory(item, order))
+		return s.AddAgent(ctx, task.ID, api.AddAgentRequest{Name: name, Host: "fixture", Session: name, Runtime: "codex", ParentAgentID: parent, WorkItem: req}, by)
+	}
+	itemA, err := s.CreateWorkItem(ctx, task.ID, api.CreateWorkItemRequest{Kind: "bug", Title: "Item A", AgentID: lead.ID, RequestID: "item-a"}, by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	itemB, err := s.CreateWorkItem(ctx, task.ID, api.CreateWorkItemRequest{Kind: "bug", Title: "Item B", AgentID: lead.ID, RequestID: "item-b"}, by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The first parented agent bound to each item is that item's allocated
+	// builder, not an extra: both are admitted even though MaxNewAgents=1.
+	builderA, err := bind("builder-a", itemA, lead.ID)
+	if err != nil {
+		t.Fatalf("item A builder rejected: %v", err)
+	}
+	if _, err = bind("builder-b", itemB, lead.ID); err != nil {
+		t.Fatalf("item B builder rejected: %v", err)
+	}
+	// Item A's single extra allowance is exhausted by one genuine extra...
+	extraA, err := bind("extra-a", itemA, lead.ID)
+	if err != nil {
+		t.Fatalf("item A's own extra allowance rejected: %v", err)
+	}
+	// ...which must not affect item B's independent allowance.
+	if _, err = bind("extra-b", itemB, lead.ID); err != nil {
+		t.Fatalf("item B extra rejected due to item A's usage: %v", err)
+	}
+	// A second extra on item A is now over its own allowance...
+	if _, err = bind("extra-a-2", itemA, lead.ID); !errors.Is(err, api.ErrAgentSpawnLimit) {
+		t.Fatalf("exhausted item A extra allowance: %v", err)
+	}
+	// ...and item B's allowance is independently exhausted too, proving
+	// isolation runs both ways.
+	if _, err = bind("extra-b-2", itemB, lead.ID); !errors.Is(err, api.ErrAgentSpawnLimit) {
+		t.Fatalf("exhausted item B extra allowance: %v", err)
+	}
+	// Closing item A's extra frees exactly one slot for item A only.
+	if _, err = s.CloseAgent(ctx, extraA.ID, by); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = bind("extra-a-3", itemA, lead.ID); err != nil {
+		t.Fatalf("closing item A's extra should free its own slot: %v", err)
+	}
+	if _, err = bind("extra-b-3", itemB, lead.ID); !errors.Is(err, api.ErrAgentSpawnLimit) {
+		t.Fatalf("item A's freed slot leaked into item B: %v", err)
+	}
+	// Closing the item A builder has no false refund of item A's already
+	// spent extra allowance (item A currently has one active extra again).
+	if _, err = s.CloseAgent(ctx, builderA.ID, by); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = bind("extra-a-4", itemA, lead.ID); !errors.Is(err, api.ErrAgentSpawnLimit) {
+		t.Fatalf("closing the builder falsely refunded item A's extra allowance: %v", err)
 	}
 }

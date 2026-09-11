@@ -10,6 +10,10 @@ import (
 	"testing"
 )
 
+// Unbound (no work-item) parented agents fall back to task-wide extra
+// accounting. Owner correction #2045/#2048: closing an extra frees its
+// slot; exited/retired extras stay reserved until explicitly closed or
+// recovered, so they cannot silently free or double-spend a slot.
 func TestHelperLimitIncludesDescendantsAndFinishedAgents(t *testing.T) {
 	ctx := context.Background()
 	path := filepath.Join(t.TempDir(), "hub.sqlite")
@@ -45,8 +49,17 @@ func TestHelperLimitIncludesDescendantsAndFinishedAgents(t *testing.T) {
 	if _, err = s.CloseAgent(ctx, grandchild.ID, by); err != nil {
 		t.Fatal(err)
 	}
-	if _, err = add("replacement", parent.ID); !errors.Is(err, api.ErrAgentSpawnLimit) {
-		t.Fatalf("closed helper freed lifetime allowance: %v", err)
+	// Owner rule: closing an extra frees its slot. A closed grandchild
+	// must permit exactly one fresh replacement.
+	replacement, err := add("replacement", parent.ID)
+	if err != nil {
+		t.Fatalf("closed helper should free its slot: %v", err)
+	}
+	if _, err = add("second-replacement", parent.ID); !errors.Is(err, api.ErrAgentSpawnLimit) {
+		t.Fatalf("limit after single free slot consumed: %v", err)
+	}
+	if _, err = s.CloseAgent(ctx, replacement.ID, by); err != nil {
+		t.Fatal(err)
 	}
 	if _, err = add("manual", ""); err != nil {
 		t.Fatalf("manual member used quota: %v", err)
