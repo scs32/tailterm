@@ -3273,6 +3273,11 @@ dialog .primary:hover {
   border-color: var(--accent);
 }
 
+/* Keep the composer focus indicator on its border, without a second frame. */
+#workspace #board-compose textarea:focus-visible {
+  outline-offset: -2px;
+}
+
 /* A decorated tab owns its entire outline, including the buttons inside it.
    Scope the shared hover colors to that tab so the base theme cannot overwrite it. */
 #tabs .tab[data-tab-color]:not([data-tab-color="default"]) {

@@ -192,3 +192,40 @@ test("a closed dialog or disconnected control is not refocused", () => {
     globalThis.requestAnimationFrame = previousFrame;
   }
 });
+
+test("repeated open-picker Escape is consumed before native dialog cancellation", () => {
+  const previousFrame = globalThis.requestAnimationFrame;
+  const frames = [];
+  globalThis.requestAnimationFrame = (callback) => frames.push(callback);
+  try {
+    const state = fixture();
+    installDialogSelectInteraction(state.dialog);
+    for (let cycle = 1; cycle <= 10; cycle++) {
+      state.setOpen(true);
+      state.calls.length = 0;
+      state.dialog.onkeydown({
+        ...state.event,
+        key: "Escape",
+        target: state.control,
+      });
+      // Cancelling keydown prevents the browser close request, including a
+      // later dialog cancel event whose cancelable flag can be false.
+      assert.deepEqual(state.calls, [["preventDefault"], ["blur"]]);
+      frames.shift()();
+      assert.deepEqual(state.calls.at(-1), ["focus", { preventScroll: true }]);
+    }
+    state.calls.length = 0;
+    state.dialog.onkeydown({
+      ...state.event,
+      key: "Escape",
+      target: state.control,
+    });
+    assert.deepEqual(
+      state.calls,
+      [],
+      "Escape with the picker closed keeps dialog default",
+    );
+  } finally {
+    globalThis.requestAnimationFrame = previousFrame;
+  }
+});
