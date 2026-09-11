@@ -302,6 +302,9 @@ CREATE INDEX IF NOT EXISTS agent_allocation_intents_item ON agent_allocation_int
 	// empty row is not silently grandfathered in. Store.AddAgent enforces
 	// this by requiring all four fields nonempty at consumption; no
 	// migration step here attempts to backfill or guess them.
+	if err := migrateScheduleMonitor(db); err != nil {
+		return err
+	}
 	_, err := db.Exec(`INSERT OR IGNORE INTO profile_meta(key,value) VALUES('instance',?)`, api.NewID("profilehub"))
 	return err
 }

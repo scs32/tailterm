@@ -32,6 +32,7 @@ import (
 	"tailscale.com/tsnet"
 
 	"github.com/scs32/tailterm/hub/internal/api"
+	"github.com/scs32/tailterm/hub/internal/monitor"
 	"github.com/scs32/tailterm/hub/internal/server"
 	"github.com/scs32/tailterm/hub/internal/store"
 )
@@ -41,6 +42,29 @@ func env(key, fallback string) string {
 		return v
 	}
 	return fallback
+}
+
+func scheduleMonitorConfig() (monitor.Config, error) {
+	config := monitor.DefaultConfig()
+	for _, setting := range []struct {
+		key  string
+		into *time.Duration
+	}{
+		{"TAILTERM_SCHEDULE_MONITOR_INTERVAL", &config.Interval},
+		{"TAILTERM_SCHEDULE_MONITOR_STALL_AFTER", &config.StallAfter},
+		{"TAILTERM_SCHEDULE_MONITOR_WORKER_SILENCE", &config.WorkerSilence},
+		{"TAILTERM_SCHEDULE_MONITOR_INITIAL_BACKOFF", &config.InitialBackoff},
+		{"TAILTERM_SCHEDULE_MONITOR_MAX_BACKOFF", &config.MaxBackoff},
+	} {
+		if raw := os.Getenv(setting.key); raw != "" {
+			value, err := time.ParseDuration(raw)
+			if err != nil || value <= 0 {
+				return monitor.Config{}, fmt.Errorf("%s must be a positive duration: %q", setting.key, raw)
+			}
+			*setting.into = value
+		}
+	}
+	return config, nil
 }
 
 func main() {
@@ -59,6 +83,19 @@ func main() {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	monitorConfig, err := scheduleMonitorConfig()
+	if err != nil {
+		log.Fatal(err)
+	}
+	enforcer, err := monitor.New(st, monitorConfig)
+	if err != nil {
+		log.Fatal(err)
+	}
+	enforcer.Start(ctx, func(outcome monitor.Outcome) {
+		if outcome.State != "no_work" && outcome.State != "suppressed" {
+			log.Printf("%s", outcome.Summary())
+		}
+	})
 
 	var ln net.Listener
 	var identity server.Identity
