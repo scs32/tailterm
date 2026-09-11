@@ -53,7 +53,13 @@ was repeated after activation; the exact packaged JS/CSS contains its Search
 selectors. A focused Chromium harness also asserted the exact compiled main
 bundle hash, appended only a test export for its compiled view factory, and
 verified Bugs/Features retained-history matching, clear, and query/focus/caret
-continuity with synthetic data. The deployed bundle was not modified. Native Safari remains
+continuity with synthetic data. That test validates extracted compiled code, not
+behavior inside the immutable served application. A direct deployed-origin
+synthetic probe timed out because production WASM/IPN traffic bypasses Playwright
+routing. Exact compiled-served Search behavior remains unverified under the
+narrow release waiver in handler `#2629` and lead `#2631`; no authenticated
+disposable transport infrastructure was added. The deployed bundle was not
+modified. Native Safari remains
 untested. The pre-existing project-work-items fixture still times out after its
 covered assertions while waiting for legacy `board message #` notice text; prior
 review established identical behavior on the accepted baseline.

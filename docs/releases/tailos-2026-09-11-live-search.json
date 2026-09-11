@@ -64,15 +64,16 @@
       "engine": "Chromium",
       "kinds": ["bug", "feature"],
       "assertions": ["retained-history match", "clear restores both records", "query/focus/backward-caret continuity through refresh"],
-      "isolation": "The harness asserted the exact released bundle hash, appended only a test export of the already compiled Gd view factory in memory, and supplied synthetic client records. Deployed bytes were not changed or rebuilt.",
+      "isolation": "The harness asserted the exact released bundle hash, appended only a test export of the already compiled Gd view factory in memory, and supplied synthetic client records. It validates extracted compiled code, not execution inside the immutable served application. Deployed bytes were not changed or rebuilt.",
       "artifact": ".build/releases/live-search-8a6862e/actual/compiled-search-release-check.mjs",
       "artifactSha256": "f4eb8c7debc8a3f661f4b58dc0b252d83fea6dab989e59c08d55166619c70cf4",
-      "result": "PASS"
+      "result": "EXTRACTED_COMPILED_FACTORY_PASS_NOT_COMPILED_SERVED_EXECUTION"
     },
     "verifiedAt": "2026-09-11T23:18:35Z"
   },
   "limitations": [
     "Native Safari was not tested; Playwright WebKit is the compatibility evidence.",
+    "Exact compiled-served Search behavior is unverified and narrowly waived by handler #2629 and lead #2631: production WASM/IPN hub traffic bypasses Playwright routing, and the direct deployed-origin synthetic probe timed out at whoami. No authenticated disposable transport infrastructure was added.",
     "The project-work-items browser suite retains the identical-baseline timeout waiting for legacy board message notice text after covered assertions.",
     "npm ci reported three moderate dependency audit findings; no dependency or lockfile mutation was made.",
     "No hub, CLI, relay, network, Tailscale, database, live fixture, or unrelated item was changed."

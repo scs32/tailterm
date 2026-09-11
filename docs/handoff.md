@@ -20,12 +20,16 @@ their applicable MIME/identity contracts, plus release manifest
 SHA-256 `6aa5857a4f821e1e79f991e52f042014cec17e41ed463d0704b567ca47656497`;
 fresh Chromium production-WASM/synthetic-vault checks pass on each origin. The
 exact packaged JS/CSS contains the Search selectors and the isolated Search
-fixture passes Chromium and WebKit against the released source. A separate
-Chromium harness verified the exact compiled Search view for Bugs and Features:
-it asserted bundle SHA-256 before adding a test-only export of the already
-compiled view factory, then exercised synthetic retained-history matching,
-clearing, and query/focus/backward-caret continuity through refresh. Deployed
-bytes were not changed or rebuilt.
+fixture passes Chromium and WebKit against the released source. An additional
+Chromium harness asserted the exact bundle SHA-256, then added an append-only
+test export around its compiled view factory and passed synthetic Bugs/Features
+matching, clearing, and refresh focus/caret checks. This validates the extracted
+compiled factory but is not execution inside the immutable served application.
+The direct deployed-origin synthetic probe could not intercept production
+WASM/IPN hub traffic and timed out at `whoami`; exact compiled-served Search
+behavior therefore remains explicitly unverified and was narrowly waived for
+this release by handler #2629 and lead #2631. Deployed bytes were not changed or
+rebuilt.
 
 The previous Mini bytes are retained at
 `.build/releases/live-search-previous-mini-2607`; their manifest SHA-256 is
