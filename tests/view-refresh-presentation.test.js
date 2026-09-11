@@ -308,3 +308,48 @@ test("an explicit filter commit discards a queued stale repaint", async () => {
   await tick();
   assert.equal(renders, 0);
 });
+
+test("typing holds a repaint until a short idle boundary", async () => {
+  let renders = 0;
+  const root = fakeRoot();
+  const presentation = createViewRefreshPresentation({
+    render() {
+      renders++;
+    },
+  });
+  const text = {
+    isConnected: true,
+    closest(selector) {
+      return selector.includes("textarea") ? this : null;
+    },
+  };
+  presentation.mount(root);
+  root.dispatch("input", { target: text });
+  assert.equal(presentation.beforeRender("project-a"), false);
+  await new Promise((resolve) => setTimeout(resolve, 140));
+  assert.equal(renders, 1);
+});
+
+test("composition holds a repaint until the composition finishes", async () => {
+  let renders = 0;
+  const root = fakeRoot();
+  const presentation = createViewRefreshPresentation({
+    render() {
+      renders++;
+    },
+  });
+  const text = {
+    isConnected: true,
+    closest(selector) {
+      return selector.includes("textarea") ? this : null;
+    },
+  };
+  presentation.mount(root);
+  root.dispatch("compositionstart", { target: text });
+  assert.equal(presentation.beforeRender("project-a"), false);
+  await new Promise((resolve) => setTimeout(resolve, 140));
+  assert.equal(renders, 0);
+  root.dispatch("compositionend", { target: text });
+  await new Promise((resolve) => setTimeout(resolve, 140));
+  assert.equal(renders, 1);
+});

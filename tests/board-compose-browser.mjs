@@ -737,6 +737,11 @@ try {
       );
       assert.equal(await input.inputValue(), "Held Enter sends once");
 
+      // A background refresh may be coalesced until text-entry idle. Assert the
+      // disabled guard against the settled, current composer rather than a
+      // deliberately stale fixture node.
+      await pause(150);
+
       await input.evaluate((element) => (element.disabled = true));
       const disabledDefaultAllowed = await input.evaluate((element) =>
         element.dispatchEvent(

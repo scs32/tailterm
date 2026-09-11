@@ -3274,7 +3274,8 @@ dialog .primary:hover {
 }
 
 /* Keep the composer focus indicator on its border, without a second frame. */
-#workspace #board-compose textarea:focus-visible {
+#mode-view #board-compose textarea:focus-visible {
+  outline: 2px solid var(--accent);
   outline-offset: -2px;
 }
 

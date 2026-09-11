@@ -1,5 +1,8 @@
 const INTERACTIVE_POINTER_TARGET =
   "button, summary, select, input, textarea, [role=button]";
+const TEXT_ENTRY_TARGET =
+  'textarea, input:not([type="checkbox"]):not([type="radio"]):not([type="range"]):not([type="button"]):not([type="submit"]):not([type="reset"]), [contenteditable="true"]';
+const TEXT_INTERACTION_IDLE_MS = 120;
 
 export const shouldReleaseViewPointer = (activePointer, event) =>
   activePointer !== null &&
@@ -25,6 +28,9 @@ export function createViewRefreshPresentation({ render }) {
   let keyboardTarget = null;
   let nativeSelect = null;
   let nativeSelectWatch = 0;
+  let textEntry = null;
+  let composingTextEntry = null;
+  let textEntryTimer = null;
   let queued = false;
   let scheduled = false;
   let renderedContext = "";
@@ -46,8 +52,24 @@ export function createViewRefreshPresentation({ render }) {
       pointerReleasePending ||
       Boolean(keyboardTarget?.isConnected) ||
       Boolean(nativeSelect?.isConnected) ||
+      textEntry !== null ||
+      composingTextEntry !== null ||
       Boolean(openPopover())
     );
+  }
+
+  function releaseTextEntry() {
+    clearTimeout(textEntryTimer);
+    textEntryTimer = null;
+    textEntry = null;
+    scheduleFlush();
+  }
+
+  function noteTextEntry(target) {
+    if (!target || composingTextEntry === target) return;
+    textEntry = target;
+    clearTimeout(textEntryTimer);
+    textEntryTimer = setTimeout(releaseTextEntry, TEXT_INTERACTION_IDLE_MS);
   }
 
   function captureDisclosure() {
@@ -122,6 +144,25 @@ export function createViewRefreshPresentation({ render }) {
     }
   }
 
+  function onInput(event) {
+    noteTextEntry(event.target?.closest?.(TEXT_ENTRY_TARGET));
+  }
+
+  function onCompositionStart(event) {
+    const target = event.target?.closest?.(TEXT_ENTRY_TARGET);
+    if (!target) return;
+    clearTimeout(textEntryTimer);
+    textEntryTimer = null;
+    textEntry = target;
+    composingTextEntry = target;
+  }
+
+  function onCompositionEnd(event) {
+    const target = event.target?.closest?.(TEXT_ENTRY_TARGET);
+    if (target && target === composingTextEntry) composingTextEntry = null;
+    noteTextEntry(target);
+  }
+
   function activateNativeSelect(control) {
     nativeSelect = control;
     const watch = ++nativeSelectWatch;
@@ -174,6 +215,8 @@ export function createViewRefreshPresentation({ render }) {
       keyboardTarget = null;
       scheduleFlush();
     }
+    if (event.target === composingTextEntry) composingTextEntry = null;
+    if (event.target === textEntry) releaseTextEntry();
   }
 
   function mount(container) {
@@ -183,12 +226,18 @@ export function createViewRefreshPresentation({ render }) {
     root?.removeEventListener?.("keyup", onKeyUp);
     root?.removeEventListener?.("change", onChange);
     root?.removeEventListener?.("focusout", onFocusOut);
+    root?.removeEventListener?.("input", onInput);
+    root?.removeEventListener?.("compositionstart", onCompositionStart);
+    root?.removeEventListener?.("compositionend", onCompositionEnd);
     root = container;
     root?.addEventListener?.("pointerdown", onPointerDown);
     root?.addEventListener?.("keydown", onKeyDown);
     root?.addEventListener?.("keyup", onKeyUp);
     root?.addEventListener?.("change", onChange);
     root?.addEventListener?.("focusout", onFocusOut);
+    root?.addEventListener?.("input", onInput);
+    root?.addEventListener?.("compositionstart", onCompositionStart);
+    root?.addEventListener?.("compositionend", onCompositionEnd);
   }
 
   function beforeRender(context) {
@@ -235,6 +284,10 @@ export function createViewRefreshPresentation({ render }) {
     pointerReleasePending = false;
     nativeSelect = null;
     nativeSelectWatch++;
+    clearTimeout(textEntryTimer);
+    textEntryTimer = null;
+    textEntry = null;
+    composingTextEntry = null;
     if (flush) scheduleFlush();
     else queued = false;
   }
