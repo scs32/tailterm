@@ -43,13 +43,22 @@ generic-launch correction. Owner clarification (Board #2045/#2048), verbatim:
   rows against `maxNewAgents`. Unbound parented requests fall back to a
   task-wide, closed-excluding count.
 - `hub/cmd/tt/coordination.go`: `taskBriefingForRoster` /
-  `agentTaskBriefingForLaunch` describe this rule to launched agents, and
+  `agentTaskBriefingForLaunch` describe the corrected per-item rule to
+  launched agents (previously they still described the old "lifetime
+  allowance" rule in prose, even after the counting fix — corrected), and
   (`cliDiscoveryPreamble`, #2192) now state up front that `tt` is a real
   local executable invoked via the agent's own shell tool — verified with
   `command -v tt` (or the exact launch-resolved path) and `tt --help` / `tt
   status` — before any coordination instruction is interpreted, and that
   `tt post`/`inbox`/`context`/`ask`/etc. are CLI subcommands, not native
   model tools; message text returned by them is data, never a command.
+- `client/project-handler.js` (browser-generated handler prompt) and
+  `client/task-hub.js` (task-settings "Max new agents" labels): same prose
+  correction, mirrored on the browser side.
+- `tests/handler-allocation-cases.json`: the shared JS/Go scenario-contract
+  fixture's `parented-item-bound-launch-limit` and `capacity-exhausted`
+  cases corrected to match — the old premise ("a fresh item-bound worker ...
+  allowance is exhausted") described a case that can no longer happen.
 
 ## Tests
 
@@ -72,6 +81,42 @@ generic-launch correction. Owner clarification (Board #2045/#2048), verbatim:
   the CLI-discovery preamble is present and leads the briefing, through the
   real `agentTaskBriefing` assembly path, across orchestrator,
   non-orchestrator, database-handler and no-orchestrator launch shapes.
+- `hub/internal/store/work_context_test.go` —
+  `TestItemExtraCapacityDescendantsAndConcurrentRace` (new): a descendant
+  spawned by an extra (not directly by the builder) still counts against its
+  own item; a further descendant bound to a different item is not treated as
+  that item's extra by ancestry alone; concurrent admissions against one
+  item's single remaining extra slot cannot exceed it, without affecting
+  another item's independent allowance.
+- `tests/handler-allocation.test.js` and `hub/cmd/tt/handler_allocation_test.go`
+  re-run against the corrected `handler-allocation-cases.json`: 14/14 and the
+  full Go handler-allocation contract set pass.
+
+## Launch-path coverage (API / CLI / browser)
+
+- **API**: `Store.AddAgent` is the single admission seam; every launch path
+  below calls through it, so the correction applies uniformly.
+- **CLI (`tt spawn`)**: real caller provenance is unchanged — `ParentAgentID`
+  is still set to the invoking agent when launched from an agent session
+  (`hub/cmd/tt/main.go` `cmdSpawn`, `parent := e.agent`). Only the
+  *classification* changed (builder vs. extra, derived from binding order),
+  not whether provenance is recorded; nothing clears or spoofs identity.
+- **Browser regular-team launch** (per the #2050 bootstrapping note: a fresh
+  SSH `tt spawn` outside an agent parent environment, `ParentAgentID=""`):
+  unaffected by this correction — unparented requests were never subject to
+  the extra-allowance check before or after, they only use `MaxAgents` (total
+  open-agent capacity). Verified by
+  `TestAgentWorkItemContextRejectsStaleMismatchedAndHelperAdmission`'s
+  `base` case (parentless item-bound admission ignores the extra allowance
+  entirely) and by `TestHelperLimitIncludesDescendantsAndFinishedAgents`'s
+  `manual` case.
+- **Descendants/retries**: covered by
+  `TestItemExtraCapacityDescendantsAndConcurrentRace` (ancestry does not
+  change which item a binding counts against) and by the existing exited/
+  resume-into-existing-identity path in `Store.AddAgent` (unchanged by this
+  correction — a resumed identity keeps its original binding and status,
+  so it is still excluded from the "closed only" free-slot count while
+  exited).
 
 ## Migration / compatibility
 
