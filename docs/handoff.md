@@ -1,7 +1,7 @@
 # Development handoff — September 10, 2026
 
 
-## September 11 lead recovery — live lead restored and release verified
+## September 11 lead recovery — live lead restored and release accepted
 
 Bug `wi_b28100d6cc6b7ceb`, bounded order #2448, release #2456 and urgent
 live-recovery amendment #2458 are implemented in `33284bd173ae4d268898d444951606ff5d4c7e1e`.
@@ -33,8 +33,10 @@ Retain additive lead revision/receipt data. Keep the updated frontend while any
 Do not roll back the database or resurrect the old lead identity.
 
 [Implementation](lead-replacement-ui.md) and [release receipt](releases/tailos-2026-09-11-lead-recovery.json)
-record isolated tests, actual restoration and operational evidence. Handler-saved
-final completion is pending at this documentation checkpoint.
+record isolated tests, actual restoration and operational evidence. New lead #2481
+accepted the recovery handoff; handler #2483 confirmed Bug Done revision8, receipt
+`wir_6536bb90dd2da134`. Full source/result links preserve the complete evidence
+without truncating the existing item description. Lead and handler remain active.
 
 ## September 10 handler allocation — actual release verified, acceptance pending
 

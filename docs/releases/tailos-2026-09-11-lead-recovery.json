@@ -1,6 +1,6 @@
 {
   "schemaVersion": 1,
-  "stage": "actual_release_verified_pending_handler_completion",
+  "stage": "accepted_and_handler_confirmed_done",
   "workItem": {
     "taskId": "tsk_2cfcff70a0fbe967",
     "itemId": "wi_b28100d6cc6b7ceb",
@@ -106,5 +106,14 @@
     "old tailterm site",
     "Air preview"
   ],
-  "rollbackCaveat": "Preserve additive schema, database and exact new lead assignment. Keep this frontend while replace-lead journals exist; old frontends cannot read that journal kind."
+  "rollbackCaveat": "Preserve additive schema, database and exact new lead assignment. Keep this frontend while replace-lead journals exist; old frontends cannot read that journal kind.",
+  "completion": {
+    "status": "Done",
+    "revision": 8,
+    "handlerMessage": 2483,
+    "receiptId": "wir_6536bb90dd2da134",
+    "requestId": "source-2479-lead-recovery-final-completion-1",
+    "leadAcceptanceMessage": 2481,
+    "provenance": "Complete release/live recovery evidence retained in linked Board sources; accumulated item description exceeded native8192-byte limit and was preserved rather than truncated."
+  }
 }

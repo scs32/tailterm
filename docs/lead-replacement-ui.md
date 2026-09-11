@@ -74,3 +74,7 @@ receipt #2461. Its real online run is `agt_64e8e823485a3434` /
 #2474/#2475; new lead's substantive handoff acknowledgement is #2476.
 See the [actual release receipt](releases/tailos-2026-09-11-lead-recovery.json).
 This operational live recovery is distinct from the synthetic browser tests.
+
+New lead accepted the delivered recovery in #2481. Handler #2483 verified Bug
+Done revision8, receipt `wir_6536bb90dd2da134`, with complete Board-linked evidence
+preserved. Both remain available for the open project.
