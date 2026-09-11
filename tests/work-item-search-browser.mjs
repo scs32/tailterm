@@ -17,14 +17,15 @@ const items=[
  {id:'wi_current',taskId:task.id,kind,title:'Visible alpha',description:'Current writeup needle',status:'open',priority:'normal',revision:2},
  {id:'wi_history',taskId:task.id,kind,title:'Visible beta',description:'Present text',status:'open',priority:'high',revision:2},
 ];
-const client={base:'isolated://search',token:'fixture',cacheStatus:()=>({label:'Fixture current'}),subscribe:()=>({stop(){}}),
+let notify=()=>{}, messageText='Board epsilon evidence', reportText='Durable zeta report writeup', reportFetches=0, failReport=false;
+const client={base:'isolated://search',token:'fixture',cacheStatus:()=>({label:'Fixture current'}),subscribe:(_scope,callback)=>{notify=callback;return {stop(){}}},
  async listTasks(){return [task]},async listWorkItems(){return {items:items.map(item=>({...item})),next:0}},
  async listWorkItemRevisions(_task,id){
   return {revisions:id==='wi_history'?[{...items[1],revision:1,title:'Retired gamma title',description:'Archived delta description'},{...items[1]}]:[{...items[0]}],nextAfter:0};
  },
- async listWorkItemMessages(_task,id,{revision}){return {links:id==='wi_history'&&revision===1?[{message:{text:'Board epsilon evidence'}}]:[],nextAfter:0}},
+ async listWorkItemMessages(_task,id,{revision}){return {links:id==='wi_history'&&revision===1?[{message:{text:messageText}}]:[],nextAfter:0}},
  async listNarrativeReports(){return {reports:[{reportId:'nrpt_fixture',version:1}]}},
- async getNarrativeReportVersion(){return {sections:{deliveredWork:'Durable zeta report writeup'}}},
+ async getNarrativeReportVersion(){reportFetches++;if(failReport)throw new Error('transient report failure');return {sections:{deliveredWork:reportText}}},
  async listNarrativeArtifacts(){return {artifacts:[{artifactId:'nart_fixture'}]}},
  async listNarrativeArtifactVersions(){return {versions:[{version:1}]}},
  async getNarrativeArtifactVersion(){return {title:'Submitted artifact',content:'Captured eta artifact body'}},
@@ -33,7 +34,7 @@ const dialogNode=document.querySelector('#dialog');
 const closeDialog=()=>{dialogNode.close();dialogNode.replaceChildren()};
 const dialog=(title,body)=>{dialogNode.innerHTML='<h2>'+title+'</h2>'+body;dialogNode.showModal()};
 const view=createWorkItemsView({kind,client:()=>client,dialog,closeDialog,notice(){},configure(){},openBoard(){}});
-view.mount(document.querySelector('#mode-view'));await view.show();window.qa={view};
+view.mount(document.querySelector('#mode-view'));await view.show();window.qa={view,refresh(){notify()},setMessage(text){messageText=text},setReport(text){reportText=text},setReportFailure(value){failReport=value},reportFetches(){return reportFetches}};
 </script></body></html>`;
 
 const server = await createServer({
@@ -93,6 +94,35 @@ try {
           await page.locator("[data-work-item]").getAttribute("data-work-item"),
           "wi_history",
         );
+        await search.fill("same revision message");
+        await page.evaluate(() => {
+          const input = document.querySelector("[data-items-search]");
+          input.focus();
+          input.setSelectionRange(4, 12, "forward");
+          window.qa.setMessage("Fresh same revision message");
+          window.qa.refresh();
+        });
+        await page.waitForFunction(() =>
+          document
+            .querySelector("[data-items-search-status]")
+            .textContent.includes("1 match"),
+        );
+        assert.deepEqual(
+          await search.evaluate((input) => ({
+            focused: document.activeElement === input,
+            value: input.value,
+            start: input.selectionStart,
+            end: input.selectionEnd,
+            direction: input.selectionDirection,
+          })),
+          {
+            focused: true,
+            value: "same revision message",
+            start: 4,
+            end: 12,
+            direction: "forward",
+          },
+        );
         if (kind === "feature") {
           await search.fill("zeta report");
           await page.waitForFunction(() =>
@@ -108,6 +138,47 @@ try {
               .textContent.includes("2 matches"),
           );
           assert.equal(await page.locator("[data-work-item]").count(), 2);
+          await search.fill("same revision narrative");
+          await page.evaluate(() => {
+            window.qa.setReport("Fresh same revision narrative");
+            window.qa.refresh();
+          });
+          await page.waitForFunction(() =>
+            document
+              .querySelector("[data-items-search-status]")
+              .textContent.includes("2 matches"),
+          );
+          const fetchesBeforeFailure = await page.evaluate(() =>
+            window.qa.reportFetches(),
+          );
+          await page.evaluate(() => {
+            window.qa.setReportFailure(true);
+            window.qa.refresh();
+          });
+          await page.waitForFunction(
+            (before) => window.qa.reportFetches() > before,
+            fetchesBeforeFailure,
+          );
+          await page.waitForFunction(() =>
+            document
+              .querySelector("[data-items-search-status]")
+              .textContent.includes("history unavailable"),
+          );
+          const failedFetches = await page.evaluate(() =>
+            window.qa.reportFetches(),
+          );
+          await page.evaluate(() => window.qa.setReportFailure(false));
+          await search.press("End");
+          await search.type(" ");
+          await page.waitForFunction(
+            (before) => window.qa.reportFetches() > before,
+            failedFetches,
+          );
+          await page.waitForFunction(() =>
+            !document
+              .querySelector("[data-items-search-status]")
+              .textContent.includes("history unavailable"),
+          );
         }
         await search.fill("no such record");
         await page.waitForFunction(
