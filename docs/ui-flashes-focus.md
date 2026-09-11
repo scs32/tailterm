@@ -69,9 +69,12 @@ manifest includes Pages-only `_headers`, SHA-256
 
 The immutable deployed-browser command was run against each origin and passed
 production WASM start plus isolated synthetic-vault generation/restoration.
-The served CSS focus fixture is `tests/board-compose-browser.mjs`, which loads
-`/client/style.css` and passed Chromium/WebKit with the composer no-outline,
-inset-shadow assertion; its CSS source is `client/style.css` in application
-`727d91b`. Mini was atomically swapped without restarting PID 60799/PPID 1;
+`tests/board-compose-browser.mjs` is source-Board behavior evidence only. Served
+CSS is separately verified by `.build/flashes-served-css-2712.mjs` (SHA-256
+`65899c49f51643e9cea3aa5170e827b2536778a17ee69afa0ebc26ef43a83943`): it fetched
+`https://a104e9e7.tailos.pages.dev/assets/index-DZEAKM6L.css` with identity
+encoding, verified SHA-256 `474cab38a2cc4afce83ddc107fc10cd3feb629c11e71589f4e94c5ec23d2e7d2`,
+and in Chromium and WebKit Tab-focused the synthetic composer to computed
+`outline: none` and an inset 2px accent shadow. Mini was atomically swapped without restarting PID 60799/PPID 1;
 rollback is `.build/releases/tailos-flashes-previous-mini-2685` (Search rollback
 remains app `8a6862e` / manifest `6aa5857a4f821e1e79f991e52f042014cec17e41ed463d0704b567ca47656497`).
