@@ -216,7 +216,7 @@ func TestAgentWorkAuditAcrossRolesAndHandlerAvailability(t *testing.T) {
 					agents = nil
 				}
 				got := agentTaskBriefing(task, name, "", agents)
-				for _, required := range []string{"durable bug or feature", "recorded bounded work order", "Intake and board/inbox/roster coordination", "work-item ID and work-order message sequence", "list/get/create/update/dispatch", "Do not use tt work-items, direct API calls, or database files yourself", "even if the handler is unavailable", "human UI access remains available", "at most 2 additional helper identities", "SWARM ENABLED"} {
+				for _, required := range []string{"durable bug or feature", "recorded bounded work order", "Intake and board/inbox/roster coordination", "work-item ID and work-order message sequence", "list/get/create/update/dispatch", "Do not use tt work-items, direct API calls, or database files yourself", "even if the handler is unavailable", "human UI access remains available", "at most 2 additional extra agents per bug or feature", "SWARM ENABLED"} {
 					if !strings.Contains(got, required) {
 						t.Fatalf("missing %q in %s", required, got)
 					}

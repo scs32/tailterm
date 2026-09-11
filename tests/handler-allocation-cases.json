@@ -59,9 +59,9 @@
   },
   {
     "name": "capacity-exhausted",
-    "situation": "No open-agent slot remains; finished helpers already consumed the lifetime allowance.",
+    "situation": "No open-agent slot remains; this item's extras already consumed its per-item allowance.",
     "handler": [
-      "ordinary-member capacity, helper lifetime allowance and open-agent slots",
+      "ordinary-member capacity, the target item's per-item extra allowance and open-agent slots",
       "exhausted capacity",
       "Never close unfinished workers or tasks to create capacity",
       "Check actual launch-path eligibility as well as open-agent capacity"
@@ -142,19 +142,19 @@
   },
   {
     "name": "parented-item-bound-launch-limit",
-    "situation": "A fresh item-bound worker is proposed via tt spawn from lead; open slots remain but the lifetime additional-agent allowance is exhausted.",
+    "situation": "A second item-bound worker (a genuine extra, on top of the item's already-running builder) is proposed via tt spawn from lead; open slots remain but that item's own extra allowance is exhausted.",
     "handler": [
-      "Ordinary/manual additions and helper lifetime allowance are distinct",
-      "ParentAgentID set from the invoking agent and consumes the additional-agent lifetime allowance, including a fresh item-bound worker",
-      "A fresh name, item binding or open slot is not an exemption",
-      "report the real limit and use only a separately authorized supported launch path or an owner-approved allowance change",
+      "the first such worker bound to a given item is that item's allocated builder and consumes no extra allowance",
+      "Only a second or later parented worker bound to the same item is an extra and is checked against that item's allowance",
+      "one item's extras never exhaust another item's",
+      "If a genuine extra launch is blocked by an exhausted item allowance or disabled spawn setting, report the real limit and use only a separately authorized supported launch path or an owner-approved allowance change",
       "Never clear or spoof identity, reuse closed workers, or bypass a denial"
     ],
     "lead": [
-      "Ordinary/manual additions and helper lifetime allowance are distinct",
-      "ParentAgentID set from the invoking agent and consumes the additional-agent lifetime allowance, including a fresh item-bound worker",
-      "A fresh name, item binding or open slot is not an exemption",
-      "report the real limit and use only a separately authorized supported launch path or an owner-approved allowance change",
+      "the first such worker bound to a given item is that item's allocated builder and consumes no extra allowance",
+      "Only a second or later parented worker bound to the same item is an extra and is checked against that item's allowance",
+      "one item's extras never exhaust another item's",
+      "If a genuine extra launch is blocked by an exhausted item allowance or disabled spawn setting, report the real limit and use only a separately authorized supported launch path or an owner-approved allowance change",
       "Never clear or spoof identity, reuse closed workers, or bypass a denial"
     ]
   },
