@@ -131,6 +131,23 @@ Tailscale, TrueNAS, relay, deployment, lifecycle, helper or live-data changes.
   (reading 'includes')`, call site line 129. No encrypted draft-vault two-engine
   pass is claimed. No storage code changed; discovery was routed to lead #1914
   and db-handler #1915, without expanding this repair into storage/fixture work.
+- Lead follow-up **#1916** requested baseline comparison within the same order.
+  Extracting exact `84daa9c` with `git archive` into
+  `.build/pulldown-recurrence/baseline-source` and running the unchanged command
+  with the same host dependencies/new isolated context produces the identical
+  Chromium exception. Precise failure: `JSON.stringify(envelope).includes(...)`
+  in the encrypted-at-rest result fields; `envelope` is undefined. The fixture
+  reads IndexedDB object-store `vault` key `encrypted`, whereas the unchanged
+  current vault implementation writes/reads `encrypted-v2`. Both baseline and
+  candidate fixture SHA-256 are
+  `d7ecc5bb2e8c139061f8103a8b94694ee92ebc0e92334acd1120bd05dc760417`;
+  both `client/local-vault.js` hashes are
+  `114ac4c4401c37c9e6c8461f0017b9ec15a565b1185a4fa255dc1df733f1f13e`.
+  This prevents the evaluated result from returning and the subsequent
+  reload/restoration assertions and WebKit execution. First-stage assertions ran,
+  but the full encrypted-restoration check remains unverified. It is not an
+  observed draft-loss regression. No fixture/storage repair was made. Raw
+  baseline log: `/tmp/pulldown-draft-vault-baseline.txt`.
 - Fixture development corrections: the first Tab assertion assumed recipient
   followed textarea; DOM order differs. WebKit's default Tab path also skips the
   submit button, so the final cross-engine check tabs from recipient to textarea.
