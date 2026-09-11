@@ -1,0 +1,110 @@
+{
+  "schemaVersion": 1,
+  "stage": "actual_release_verified_pending_handler_completion",
+  "workItem": {
+    "taskId": "tsk_2cfcff70a0fbe967",
+    "itemId": "wi_b28100d6cc6b7ceb",
+    "workOrderMessage": 2448,
+    "releaseOrder": 2456,
+    "liveRecoveryAmendment": 2458,
+    "sourceMessage": 2443
+  },
+  "applicationCommit": "33284bd173ae4d268898d444951606ff5d4c7e1e",
+  "manifestSha256": "463323c8f4bc424f65b73d9699cb69855357a91333a154c03ad573b383871e01",
+  "origins": [
+    "https://tailos.tailarr.com",
+    "https://e439f3fa.tailos.pages.dev",
+    "http://127.0.0.1:4318"
+  ],
+  "verification": {
+    "publicAssetsPerOrigin": 81,
+    "manifestPerOrigin": true,
+    "canonicalIndex": true,
+    "productionChromiumPerOrigin": true,
+    "isolatedRecoveryBrowsers": [
+      "Chromium",
+      "WebKit"
+    ],
+    "javascriptTests": 170,
+    "goStoreServer": "pass",
+    "goVet": "pass",
+    "leadQueueRace": "pass",
+    "browserLaunchFixture": "synthetic registration, no provider or tmux",
+    "initialNonpass": "Cloudflare /index.html is a 308 canonical redirect; verification corrected to /; all hashes pass"
+  },
+  "hub": {
+    "state": "RUNNING",
+    "release": "20260911-lead-recovery-33284bd",
+    "sha256": "dbb0abd3665238d5ffb4e4382f7b3e382345b640db0402d27be370c65583be73",
+    "integrity": "ok",
+    "foreignKeyViolations": 0,
+    "rollbackRelease": "20260910-agents-library-22ab000"
+  },
+  "backup": {
+    "path": "/mnt/deepfreeze/tailterm-hub/backups/before-lead-recovery-33284bd.sqlite",
+    "mode": "0600",
+    "bytes": 22577152,
+    "sha256": "cbd0a2f109c3f93e77e8cd70bb4d02774147005f80c11481300330cfbd7ea3a4",
+    "integrity": "ok",
+    "foreignKeyViolations": 0
+  },
+  "miniActivation": {
+    "newManifestSha256": "463323c8f4bc424f65b73d9699cb69855357a91333a154c03ad573b383871e01",
+    "previousManifestSha256": "db40f2f55299ae903151455a40d8475da16ce1d4dedc6f6eff3f20143945270d",
+    "previous": "/Users/stephenspeicher/projects/tailterm/.build/releases/lead-recovery-previous-mini-2456",
+    "method": "verified copy and renameatx_np RENAME_SWAP",
+    "preservedPid": 60799
+  },
+  "liveRecovery": {
+    "assignment": {
+      "task": {
+        "leadRevision": 1,
+        "cleanupPending": 0,
+        "orchestrator": "lead-recovery",
+        "swarm": false,
+        "maxNewAgents": 4,
+        "allowAgentSpawn": true,
+        "id": "tsk_2cfcff70a0fbe967",
+        "name": "Tailterm Development",
+        "goal": "You're responsible for Tailterm development",
+        "status": "open",
+        "createdAt": "2026-09-08T14:16:33.4951918Z",
+        "createdBy": {
+          "node": "workspace",
+          "user": "owner"
+        },
+        "closedAt": null
+      },
+      "agentId": "agt_64e8e823485a3434",
+      "runId": "run_66d063bf724968d0",
+      "messageSeq": 2461,
+      "requestId": "owner-live-lead-recovery-2458-1"
+    },
+    "name": "lead-recovery",
+    "session": "lead-recovery",
+    "host": "Stephens-Mini",
+    "model": "gpt-6-astra",
+    "reasoning": "high",
+    "approvalPolicy": "never",
+    "sandboxMode": "danger-full-access",
+    "oldAgentId": "agt_1186df8d710c0fd7",
+    "oldRunId": "run_9e0ddb28df5ae63e",
+    "oldSession": "absent; identity/history preserved",
+    "handlerVerificationMessages": [
+      2474,
+      2475
+    ],
+    "substantiveResponseMessage": 2476,
+    "queueReconciliation": "performed by db-handler; native receipts in messages2474/2475"
+  },
+  "unchanged": [
+    "host CLI binaries",
+    "relays",
+    "Tailscale/network",
+    "other workers and handler sessions",
+    "Files hidden",
+    "old tailterm site",
+    "Air preview"
+  ],
+  "rollbackCaveat": "Preserve additive schema, database and exact new lead assignment. Keep this frontend while replace-lead journals exist; old frontends cannot read that journal kind."
+}

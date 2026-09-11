@@ -56,3 +56,21 @@ journal kind. Do not restore old vaults or databases over newer user data. The
 production WASM/runtime and CLI remain unchanged. Hub deployment uses existing
 TrueNAS middleware/listener; frontend targets only TailOS and the existing Mini
 preview. Actual publication and handler acceptance are recorded separately.
+
+
+## Actual release and live recovery
+
+Released application33284bd under order #2456 to TailOS/e439f3fa and the unchanged
+Mini listener PID60799; all three origins match all 81 public assets plus manifest
+and pass fresh production Chromium/WASM/synthetic-vault checks. Cloudflare's
+`/index.html` returns308; the initial hash probe was corrected to canonical `/`.
+The hub release and consistent backup both passed integrity/FK verification.
+
+The owner's urgent amendment #2458 superseded the initial no-live-replacement
+boundary. The old tmux session was absent. One fresh `lead-recovery` was launched
+with the prior Astra/high/folder/permission settings and atomically assigned by
+receipt #2461. Its real online run is `agt_64e8e823485a3434` /
+`run_66d063bf724968d0`. Handler verified it and reconciled recipient pins in
+#2474/#2475; new lead's substantive handoff acknowledgement is #2476.
+See the [actual release receipt](releases/tailos-2026-09-11-lead-recovery.json).
+This operational live recovery is distinct from the synthetic browser tests.

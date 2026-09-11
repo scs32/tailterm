@@ -1,6 +1,41 @@
 # Development handoff — September 10, 2026
 
 
+## September 11 lead recovery — live lead restored and release verified
+
+Bug `wi_b28100d6cc6b7ceb`, bounded order #2448, release #2456 and urgent
+live-recovery amendment #2458 are implemented in `33284bd173ae4d268898d444951606ff5d4c7e1e`.
+TailOS `https://e439f3fa.tailos.pages.dev`, `https://tailos.tailarr.com`, and Mini
+`http://127.0.0.1:4318` match all 81 public assets and manifest SHA-256
+`463323c8f4bc424f65b73d9699cb69855357a91333a154c03ad573b383871e01`.
+All three pass production Chromium/WASM/synthetic-vault checks. Mini PID60799
+was preserved by an atomic directory exchange; prior bytes remain in
+`.build/releases/lead-recovery-previous-mini-2456`.
+
+The previous lead's tmux session is gone. A fresh **lead-recovery** now runs on
+Stephens-Mini: `agt_64e8e823485a3434` / `run_66d063bf724968d0`, with the original
+Astra/high/project-folder/never-approval/full-access settings. Atomic assignment
+#2461 saved project leadRevision1; handler #2474/#2475 verified the live lead and
+reconciled Queue recipient pins, preserving existing workers and contexts.
+The new lead loaded `tt brief`, obtained the handler handoff and posted its
+substantive owner acknowledgement #2476. Old lead identity/run/history remain.
+The root direct workspace session owns finishing this recovery release evidence;
+new lead owns subsequent project coordination. Other candidate branches remain
+unmerged and must be reconciled before later integration.
+
+Hub `20260911-lead-recovery-33284bd` is RUNNING, SHA-256
+`dbb0abd3665238d5ffb4e4382f7b3e382345b640db0402d27be370c65583be73`.
+Backup `/mnt/deepfreeze/tailterm-hub/backups/before-lead-recovery-33284bd.sqlite`
+is mode0600, SHA-256 `cbd0a2f109c3f93e77e8cd70bb4d02774147005f80c11481300330cfbd7ea3a4`;
+backup/live integrity and foreign keys pass. Host CLI and relays are unchanged.
+Retain additive lead revision/receipt data. Keep the updated frontend while any
+`replace-lead` launch journals exist; older frontends cannot read that kind.
+Do not roll back the database or resurrect the old lead identity.
+
+[Implementation](lead-replacement-ui.md) and [release receipt](releases/tailos-2026-09-11-lead-recovery.json)
+record isolated tests, actual restoration and operational evidence. Handler-saved
+final completion is pending at this documentation checkpoint.
+
 ## September 10 handler allocation — actual release verified, acceptance pending
 
 Feature `wi_207f20d6eefcfa09` revision10/scope9, original order #1880,
