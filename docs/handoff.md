@@ -1,14 +1,15 @@
 # Development handoff — September 10, 2026
 
-## September 10 Agents library — deployed, final closeout pending
+## September 10 Agents library — actual release accepted
 
 Accepted Agents source `e6e927b045931210ca3702c3c0c70a2e39330b4f`
 and accepted Queue layout are integrated in exact application
 `22ab0005795c9a1201766159e7b910fcff8e2a03`. Feature
-`wi_a8f6e4e08f3a1cef` remains In progress revision 2/scope 2, original
+`wi_a8f6e4e08f3a1cef` is Done revision 3/scope 2, original
 implementation order #1720, preparation #1821 and actual release #1840.
 Agents now holds reusable definitions; Teams references them, and launch retries
-retain frozen settings and exact identity. See [the implementation report](agents-library.md).
+retain frozen settings and exact identity. See [the complete implementation and release report](agents-library.md)
+and [release receipt](releases/tailos-2026-09-10-agents-library.json).
 
 The retained clean source, binaries and static package are at
 `.build/releases/agents-library-22ab000`. Current frontend is
@@ -46,8 +47,17 @@ hub as a complete rollback, delete v2 pointers/envelopes, or treat the retained
 v1 recovery snapshot as current. Use this compatible release or a reviewed
 compatible correction; retain the new CLI while launch plans can depend on
 explicit reasoning settings. Earlier packages below are historical references.
-Final complete release-report retention, lead acceptance and handler-verified
-completion remain pending. The assigned worker remains open.
+Lead accepted the complete actual release in #1860 and merged report commit
+`eb7c66199ab177bd10e8310c96881ac0e9cbbcc5`. Handler #1865 verified
+canonical full report `nrpt_41b39a8e43b2e348` v1/scope 2, digest
+`80733970102878bcdab887634410dbe96d3417c2a3f0560d6f6ce3b4112a5cbd`,
+and Done revision 3 receipt `wir_7c4007b21769771f`. Associated Queue
+`que_6e68d7ba711ec096` completed atomically at cycle 1/revision 7,
+terminal event 73, reason `source_done`, preserving the original worker binding.
+Lead verified the receipts and exact process tree, then closed only worker
+`agt_5705477a4a857d93` / `run_9c5e9b4c94e2cbc1`; the durable receipt
+reports `closed`, `cleanupDone: true`. Preview PID 60799 / PPID 1 remains
+outside that worker's process tree. Project, orchestrator and handler stay open.
 
 ## September 10 Queue layout — actual release accepted
 
