@@ -5,7 +5,9 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"path/filepath"
+	"sync"
 	"testing"
 
 	"github.com/scs32/tailterm/hub/internal/api"
@@ -463,5 +465,89 @@ func TestItemExtraCapacityIsIsolatedPerItem(t *testing.T) {
 	}
 	if _, err = bind("extra-a-4", itemA, lead.ID); !errors.Is(err, api.ErrAgentSpawnLimit) {
 		t.Fatalf("closing the builder falsely refunded item A's extra allowance: %v", err)
+	}
+}
+
+// TestItemExtraCapacityDescendantsAndConcurrentRace covers two remaining
+// #2050 acceptance cases: a descendant spawned by an extra (not directly by
+// the item's builder) still counts correctly against its own item, and a
+// grandchild bound to a different item does not interfere; and concurrent
+// admission requests for the same item's extra allowance cannot exceed it.
+func TestItemExtraCapacityDescendantsAndConcurrentRace(t *testing.T) {
+	ctx := context.Background()
+	s, err := Open(filepath.Join(t.TempDir(), "descendants.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	by := api.Caller{Node: "fixture", User: "owner"}
+	two := 2
+	task, err := s.CreateTask(ctx, api.CreateTaskRequest{Name: "Descendants", AllowAgentSpawn: true, MaxNewAgents: &two}, by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lead, err := s.AddAgent(ctx, task.ID, api.AddAgentRequest{Name: "lead", Host: "fixture", Session: "lead", Runtime: "codex"}, by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bind := func(name string, item api.WorkItem, parent string) (api.Agent, error) {
+		order := contextLinkedMessage(t, s, task, item, name+" order", name+"-order", nil)
+		req := &api.AgentWorkItemRequest{ItemTaskID: task.ID, ItemID: item.ID, ItemRevision: item.Revision, WorkOrderMessage: api.MessageReference{TaskID: task.ID, Seq: order.Seq}}
+		req.ContextBundle = syntheticPreparedContext(t, item, req.WorkOrderMessage, syntheticHistory(item, order))
+		return s.AddAgent(ctx, task.ID, api.AddAgentRequest{Name: name, Host: "fixture", Session: name, Runtime: "codex", ParentAgentID: parent, WorkItem: req}, by)
+	}
+	itemA, err := s.CreateWorkItem(ctx, task.ID, api.CreateWorkItemRequest{Kind: "bug", Title: "Item A", AgentID: lead.ID, RequestID: "desc-item-a"}, by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	itemB, err := s.CreateWorkItem(ctx, task.ID, api.CreateWorkItemRequest{Kind: "bug", Title: "Item B", AgentID: lead.ID, RequestID: "desc-item-b"}, by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	builderA, err := bind("builder-a", itemA, lead.ID)
+	if err != nil {
+		t.Fatalf("item A builder rejected: %v", err)
+	}
+	// A descendant of the builder (parent is the builder, not lead), still
+	// bound to item A, is item A's first extra -- it counts against item
+	// A's allowance regardless of which agent spawned it.
+	extraA, err := bind("extra-a", itemA, builderA.ID)
+	if err != nil {
+		t.Fatalf("descendant extra on item A rejected: %v", err)
+	}
+	// A grandchild of that extra, bound to a *different* item (B), must not
+	// be treated as an item-A extra merely because of its ancestry.
+	if _, err = bind("builder-b", itemB, extraA.ID); err != nil {
+		t.Fatalf("item B's builder, descended from an item-A extra, wrongly rejected: %v", err)
+	}
+	// Item A now has one extra (extraA) against an allowance of 2: exactly
+	// one more concurrent request for item A should succeed.
+	var wg sync.WaitGroup
+	results := make(chan error, 5)
+	for i := 0; i < 5; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			name := fmt.Sprintf("race-extra-a-%d", i)
+			_, e := bind(name, itemA, lead.ID)
+			results <- e
+		}(i)
+	}
+	wg.Wait()
+	close(results)
+	success := 0
+	for e := range results {
+		if e == nil {
+			success++
+		} else if !errors.Is(e, api.ErrAgentSpawnLimit) {
+			t.Fatal(e)
+		}
+	}
+	if success != 1 {
+		t.Fatalf("item A's remaining single extra slot allowed %d concurrent admissions", success)
+	}
+	// Item B's independent allowance is untouched by item A's race.
+	if _, err = bind("extra-b", itemB, lead.ID); err != nil {
+		t.Fatalf("item B allowance affected by item A's concurrent race: %v", err)
 	}
 }
