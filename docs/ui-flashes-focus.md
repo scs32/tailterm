@@ -45,3 +45,13 @@ therefore no static manifest/hash/entry count or `verify:release` result exists.
 No install, retry, source change, deployment, or root-worktree write was made
 to work around that environment dependency. This report-only update is separate
 from the frozen application/package candidate.
+
+Handler clarification #2678 subsequently authorized `npm ci` in this isolated
+worktree using the unchanged committed lockfile. It completed with no tracked
+`package.json` or lockfile change. The rerun then completed `build:static` and
+`verify:release`: `dist-static/release.json` has 82 entries and SHA-256
+`dba8628f67bbe9da003dfad11588566d060c22c1b67a182d30aa736d729fbd02`.
+Verification reported all 82 assets matching the report-only source commit
+`ff1381697f6079f45b970daa93c0b214e0b28f30`. This resolves only the local
+packaging evidence blocker; it does not publish or alter the frozen application
+candidate.
