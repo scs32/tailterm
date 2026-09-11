@@ -1,5 +1,34 @@
 # Development handoff — September 10, 2026
 
+## September 11 live Bugs and Features search — released, acceptance pending
+
+Feature `wi_1b3c05505232a68e` revision 3, integration-preparation order #2519
+and supplemental release order #2607 are published from exact clean application
+`8a6862e5aed5000529cc7f96d4d81f3f11eab706`. Bugs and Features now provide
+compact live search across current and retained descriptions and explicitly linked
+Board messages; Features additionally search report sections and all retained
+artifact versions. Successful hub refreshes invalidate same-revision enrichment,
+transient failures retry, stale responses are rejected, and query focus/caret
+survive view replacement.
+
+Cloudflare Pages project `tailos` production deployment
+`d19b7090-5727-4ad5-8cf4-1754d9dcf79d` is available at
+`https://d19b7090.tailos.pages.dev` and `https://tailos.tailarr.com`. Mini serves
+the byte-identical package at `http://127.0.0.1:4318` with PID60799/PPID1
+preserved. All three origins match the 81 public assets and release manifest
+SHA-256 `6aa5857a4f821e1e79f991e52f042014cec17e41ed463d0704b567ca47656497`;
+fresh Chromium production-WASM/synthetic-vault checks pass on each origin.
+
+The previous Mini bytes are retained at
+`.build/releases/live-search-previous-mini-2607`; their manifest SHA-256 is
+`463323c8f4bc424f65b73d9699cb69855357a91333a154c03ad573b383871e01`,
+matching rollback application `33284bd173ae4d268898d444951606ff5d4c7e1e`.
+No hub, CLI, relay, network, Tailscale, database, live fixture, or other frontend
+was changed. The known project-work-items browser timeout waiting for legacy
+`board message #` text remains identical to baseline, and native Safari was not
+tested. See [the release receipt](releases/tailos-2026-09-11-live-search.json).
+Lead and database-handler completion confirmation remain separate.
+
 
 ## September 11 lead recovery — live lead restored and release accepted
 

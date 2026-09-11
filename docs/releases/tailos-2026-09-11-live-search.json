@@ -1,0 +1,70 @@
+{
+  "workItem": {
+    "taskId": "tsk_2cfcff70a0fbe967",
+    "itemId": "wi_1b3c05505232a68e",
+    "revision": 3,
+    "workOrderMessage": 2519,
+    "supplementalReleaseMessage": 2607,
+    "startMessage": 2595,
+    "queue": "que_9ebc02ab3b96ac94",
+    "queueCycle": 2,
+    "queueRevision": 23,
+    "startReceipt": "qrr_52306b1cd7e41698"
+  },
+  "application": {
+    "commit": "8a6862e5aed5000529cc7f96d4d81f3f11eab706",
+    "baseline": "250d92ed55899c9adb2704e3419089e49093e402",
+    "manifestSha256": "6aa5857a4f821e1e79f991e52f042014cec17e41ed463d0704b567ca47656497",
+    "manifestEntries": 82,
+    "publicAssets": 81,
+    "manifestBytes": 14861,
+    "builtAt": "2026-09-11T23:13:17.071Z"
+  },
+  "cloudflare": {
+    "project": "tailos",
+    "branch": "main",
+    "deploymentId": "d19b7090-5727-4ad5-8cf4-1754d9dcf79d",
+    "immutableOrigin": "https://d19b7090.tailos.pages.dev",
+    "customOrigin": "https://tailos.tailarr.com",
+    "source": "8a6862e",
+    "status": "Production"
+  },
+  "mini": {
+    "origin": "http://127.0.0.1:4318",
+    "pid": 60799,
+    "ppid": 1,
+    "activation": "renameatx_np(RENAME_SWAP)",
+    "listenerRestarted": false,
+    "previousPackage": ".build/releases/live-search-previous-mini-2607"
+  },
+  "rollback": {
+    "applicationCommit": "33284bd173ae4d268898d444951606ff5d4c7e1e",
+    "manifestSha256": "463323c8f4bc424f65b73d9699cb69855357a91333a154c03ad573b383871e01"
+  },
+  "verification": {
+    "localPreparation": [
+      "work-item search unit: 3/3",
+      "Search browser: Chromium and WebKit",
+      "work-items scroll: Chromium and WebKit, Bugs and Features",
+      "npm test: 173/173",
+      "build:wasm",
+      "build:static",
+      "verify:release: 82/82 manifest entries"
+    ],
+    "servedOrigins": [
+      "https://d19b7090.tailos.pages.dev",
+      "https://tailos.tailarr.com",
+      "http://127.0.0.1:4318"
+    ],
+    "servedAssetResult": "Each origin matched the exact manifest, canonical index, and all 81 public assets by size and SHA-256.",
+    "browserResult": "Fresh Chromium on every origin started production WASM and created/restored an isolated synthetic vault key without page errors.",
+    "verifiedAt": "2026-09-11T23:18:35Z"
+  },
+  "limitations": [
+    "Native Safari was not tested; Playwright WebKit is the compatibility evidence.",
+    "The project-work-items browser suite retains the identical-baseline timeout waiting for legacy board message notice text after covered assertions.",
+    "npm ci reported three moderate dependency audit findings; no dependency or lockfile mutation was made.",
+    "No hub, CLI, relay, network, Tailscale, database, live fixture, or unrelated item was changed."
+  ],
+  "status": "released_pending_handler_completion"
+}
