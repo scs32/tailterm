@@ -2,6 +2,7 @@ package server
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -360,4 +361,77 @@ func TestTaskHelperBudgetAPI(t *testing.T) {
 	if len(agents.Agents) != 0 {
 		t.Fatalf("cross-project request registered manually: %+v", agents.Agents)
 	}
+}
+
+// TestAllocationIntentEndpoint exercises the HTTP surface (independent
+// review #2300/#2771/#2840 finding 5, as clarified by #2844/#2850/#2867/#2870):
+// a handler/lead can author a pre-admission allocation intent over the API,
+// and a fresh parented member/extra admission is authorized by it.
+func TestAllocationIntentEndpoint(t *testing.T) {
+	c := newClient(t)
+	task := c.task("Allocation intent endpoint")
+	lead := c.agent(task, "lead")
+	ctx := context.Background()
+	item, err := c.st.CreateWorkItem(ctx, task.ID, api.CreateWorkItemRequest{Kind: "bug", Title: "Endpoint item", AgentID: lead.ID, RequestID: "endpoint-item"}, c.who)
+	if err != nil {
+		t.Fatal(err)
+	}
+	order, err := c.st.PostMessage(ctx, task.ID, api.PostMessageRequest{
+		Text: "order", RequestID: "endpoint-order",
+		WorkItems: []api.MessageWorkItem{{ItemTaskID: task.ID, ItemID: item.ID, ItemRevision: item.Revision, Relationship: "primary"}},
+	}, c.who)
+	if err != nil {
+		t.Fatal(err)
+	}
+	orderRef := api.MessageReference{TaskID: task.ID, Seq: order.Seq}
+	agentID := api.NewID("agt")
+	var intent api.AllocationIntent
+	req := api.CreateAllocationIntentRequest{AgentID: agentID, ItemTaskID: task.ID, ItemID: item.ID, ItemRevision: item.Revision, WorkOrderMessage: orderRef, TeamRole: api.TeamRoleMember}
+	if code := c.do("POST", "/v1/tasks/"+task.ID+"/allocation-intents", req, &intent); code != 201 || intent.AgentID != agentID || intent.TeamRole != api.TeamRoleMember {
+		t.Fatalf("create allocation intent: %d %+v", code, intent)
+	}
+	// A second intent for the same agent identity is a conflict, not an
+	// update -- authored once, never mutated.
+	if code := c.do("POST", "/v1/tasks/"+task.ID+"/allocation-intents", req, nil); code != 409 {
+		t.Fatalf("re-authoring an intent should conflict: %d", code)
+	}
+	bundle := syntheticServerTestContext(t, item, orderRef, order)
+	var admitted api.Agent
+	addReq := api.AddAgentRequest{
+		AgentID: agentID, Name: "worker", Host: "devbox", Session: "worker", Runtime: "claude", ParentAgentID: lead.ID,
+		WorkItem: &api.AgentWorkItemRequest{ItemTaskID: task.ID, ItemID: item.ID, ItemRevision: item.Revision, WorkOrderMessage: orderRef, ContextBundle: bundle, TeamRole: api.TeamRoleMember},
+	}
+	if code := c.do("POST", "/v1/tasks/"+task.ID+"/agents", addReq, &admitted); code != 201 || admitted.WorkItem == nil || admitted.WorkItem.TeamRole != api.TeamRoleMember {
+		t.Fatalf("admission authorized by the recorded intent: %d %+v", code, admitted)
+	}
+	// Missing intent for a different fresh agent identity is rejected.
+	missing := addReq
+	missing.AgentID = api.NewID("agt")
+	missing.Name, missing.Session = "worker-2", "worker-2"
+	if code := c.do("POST", "/v1/tasks/"+task.ID+"/agents", missing, nil); code != 409 {
+		t.Fatalf("admission without a recorded intent should be rejected: %d", code)
+	}
+}
+
+func syntheticServerTestContext(t *testing.T, item api.WorkItem, order api.MessageReference, orderMessage api.Message) []byte {
+	t.Helper()
+	revision := api.WorkItemRevision{
+		ItemID: item.ID, TaskID: item.TaskID, Kind: item.Kind, Title: item.Title, Description: item.Description,
+		Status: item.Status, Priority: item.Priority, ItemSeq: item.Seq, Revision: item.Revision,
+		CreatedBy: item.CreatedBy, UpdatedBy: item.UpdatedBy, CreatedAt: item.CreatedAt, UpdatedAt: item.UpdatedAt,
+		AttributionKind: "shared_workspace_claim", ChangeKind: "created", Provenance: "native",
+	}
+	link := api.WorkItemMessageLink{Message: orderMessage, RevisionCoverage: "verified", Relationship: "primary", ItemRevision: item.Revision}
+	data, err := json.Marshal(map[string]any{
+		"version": 1, "itemTaskId": item.TaskID, "itemId": item.ID, "itemRevision": item.Revision,
+		"workOrderMessage": order,
+		"history": map[string]any{
+			"revision": revision, "revisions": []api.WorkItemRevision{revision}, "messages": []api.WorkItemMessageLink{link},
+			"coverage": api.HistoryCoverage{Complete: true, ObservedCurrentRevision: item.Revision, LatestMaterialized: item.Revision, SnapshotCount: item.Revision, ConversationLinks: "explicit_only"},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return data
 }

@@ -234,6 +234,23 @@ CREATE TABLE IF NOT EXISTS decision_answers (
 	if err := migrateQueue(db); err != nil {
 		return err
 	}
+	if _, err := db.Exec(`CREATE TABLE IF NOT EXISTS agent_allocation_intents (
+  agent_id TEXT PRIMARY KEY,
+  item_task_id TEXT NOT NULL,
+  item_id TEXT NOT NULL,
+  item_revision INTEGER NOT NULL CHECK(item_revision > 0),
+  work_order_task_id TEXT NOT NULL,
+  work_order_message_seq INTEGER NOT NULL CHECK(work_order_message_seq > 0),
+  team_role TEXT NOT NULL,
+  created_by_node TEXT NOT NULL,
+  created_by_user TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  consumed_at TEXT NOT NULL DEFAULT '',
+  consumed_by_run_id TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS agent_allocation_intents_item ON agent_allocation_intents(item_task_id,item_id,item_revision);`); err != nil {
+		return err
+	}
 	_, err := db.Exec(`INSERT OR IGNORE INTO profile_meta(key,value) VALUES('instance',?)`, api.NewID("profilehub"))
 	return err
 }

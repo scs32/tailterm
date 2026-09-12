@@ -97,8 +97,14 @@ CREATE INDEX agent_work_item_bindings_item ON agent_work_item_bindings(item_task
 	}
 	orderRef := api.MessageReference{TaskID: task.ID, Seq: order.Seq}
 	bundle := syntheticPreparedContext(t, item, orderRef, syntheticHistory(item, order))
+	agentID := api.NewID("agt")
+	if _, err = s.CreateAllocationIntent(ctx, task.ID, api.CreateAllocationIntentRequest{
+		AgentID: agentID, ItemTaskID: task.ID, ItemID: item.ID, ItemRevision: item.Revision, WorkOrderMessage: orderRef, TeamRole: api.TeamRoleMember,
+	}, by); err != nil {
+		t.Fatal(err)
+	}
 	member, err := s.AddAgent(ctx, task.ID, api.AddAgentRequest{
-		Name: "builder", Host: "fixture", Session: "builder", Runtime: "codex", ParentAgentID: lead.ID,
+		AgentID: agentID, Name: "builder", Host: "fixture", Session: "builder", Runtime: "codex", ParentAgentID: lead.ID,
 		WorkItem: &api.AgentWorkItemRequest{ItemTaskID: task.ID, ItemID: item.ID, ItemRevision: item.Revision, WorkOrderMessage: orderRef, ContextBundle: bundle, TeamRole: api.TeamRoleMember},
 	}, by)
 	if err != nil || member.WorkItem == nil || member.WorkItem.TeamRole != api.TeamRoleMember {

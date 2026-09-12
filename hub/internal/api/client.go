@@ -136,6 +136,11 @@ func (c *Client) AddAgent(ctx context.Context, task string, req AddAgentRequest)
 	return out, c.doLimitedJSON(ctx, "POST", "/v1/tasks/"+task+"/agents", req, &out, 4<<20, false)
 }
 
+func (c *Client) CreateAllocationIntent(ctx context.Context, task string, req CreateAllocationIntentRequest) (AllocationIntent, error) {
+	var out AllocationIntent
+	return out, c.do(ctx, "POST", "/v1/tasks/"+task+"/allocation-intents", req, &out)
+}
+
 func (c *Client) GetAgent(ctx context.Context, task, agent string) (Agent, error) {
 	var out Agent
 	return out, c.do(ctx, "GET", "/v1/tasks/"+task+"/agents/"+agent, nil, &out)

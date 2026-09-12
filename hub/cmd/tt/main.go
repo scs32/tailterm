@@ -47,6 +47,9 @@ Commands
   context [--json]             print this exact run's bound work-item context
   spawn --name N --run CMD [--cwd D] [--prompt P] [--runtime R] [--task ID]
                                start a sibling agent session on this host
+  allocation-intent create --agent-id ID --work-item ID --work-item-revision N
+                             --work-order-message N --team-role member|extra
+                               author a pre-admission member/extra intent
   retire [AGENT]              disable inbox wake-ups; preserve terminal and results
   resume [AGENT]              re-enable inbox wake-ups for a retired agent
   close [--json] [AGENT]       exact-run closeout on this host (default: self)
@@ -153,6 +156,8 @@ func main() {
 		err = cmdContext(e, args)
 	case "spawn":
 		err = cmdSpawn(e, args)
+	case "allocation-intent":
+		err = cmdAllocationIntent(e, args)
 	case "retire", "resume":
 		err = cmdRetirement(e, cmd, args)
 	case "cleanup":
@@ -580,6 +585,59 @@ func selfPath() string {
 		return resolved
 	}
 	return p
+}
+
+// cmdAllocationIntent authors the durable, pre-admission allocation intent
+// a fresh parented member/extra tt spawn now requires (independent review
+// #2300/#2771/#2840 finding 5, as clarified by #2844/#2850/#2867/#2870):
+// functional recorded-allocation consistency, bound to the exact
+// preallocated agent identity/item/revision/order/team role, authored by
+// the handler/lead BEFORE the worker's own tt spawn --team-role declares
+// the same classification -- not derived from execution Start/Queue state.
+func cmdAllocationIntent(e env, args []string) error {
+	if len(args) < 1 || args[0] != "create" {
+		return errors.New("usage: tt allocation-intent create --agent-id ID --work-item ID --work-item-revision N --work-order-task ID --work-order-message N --team-role member|extra")
+	}
+	fs := flag.NewFlagSet("allocation-intent create", flag.ExitOnError)
+	agentID := fs.String("agent-id", "", "preallocated agent identity this intent authorizes (required)")
+	workItemTask := fs.String("work-item-task", "", "project owning the bug or feature (default: --task)")
+	workItemID := fs.String("work-item", "", "exact work item this intent is bound to (required)")
+	workItemRevision := fs.Int64("work-item-revision", 0, "exact work-item revision (required)")
+	workOrderTask := fs.String("work-order-task", "", "project containing the work-order message (default: work-item project)")
+	workOrderMessage := fs.Int64("work-order-message", 0, "recorded work-order message sequence (required)")
+	teamRole := fs.String("team-role", "", "intended classification: member or extra (required)")
+	task := fs.String("task", e.task, "task id")
+	asJSON := fs.Bool("json", false, "print the intent record as JSON")
+	_ = fs.Parse(args[1:])
+	if !api.ValidID(*agentID, "agt") || *workItemID == "" || *workItemRevision < 1 || *workOrderMessage < 1 ||
+		(*teamRole != api.TeamRoleMember && *teamRole != api.TeamRoleExtra) {
+		return fmt.Errorf("allocation-intent create requires --agent-id, --work-item, --work-item-revision, --work-order-message and --team-role %s or %s", api.TeamRoleMember, api.TeamRoleExtra)
+	}
+	if *workItemTask == "" {
+		*workItemTask = *task
+	}
+	if *workOrderTask == "" {
+		*workOrderTask = *workItemTask
+	}
+	c, err := e.client(10 * time.Second)
+	if err != nil {
+		return err
+	}
+	ctx, cancel := ctxTimeout(10 * time.Second)
+	defer cancel()
+	in, err := c.CreateAllocationIntent(ctx, *task, api.CreateAllocationIntentRequest{
+		AgentID: *agentID, ItemTaskID: *workItemTask, ItemID: *workItemID, ItemRevision: *workItemRevision,
+		WorkOrderMessage: api.MessageReference{TaskID: *workOrderTask, Seq: *workOrderMessage}, TeamRole: *teamRole,
+	})
+	if err != nil {
+		return err
+	}
+	if *asJSON {
+		printJSON(in)
+		return nil
+	}
+	fmt.Printf("recorded allocation intent for %s: item %s@%d, team-role %s\n", in.AgentID, in.ItemID, in.ItemRevision, in.TeamRole)
+	return nil
 }
 
 func cmdSpawn(e env, args []string) error {

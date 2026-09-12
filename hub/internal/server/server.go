@@ -41,6 +41,7 @@ func New(st *store.Store, identity Identity) *Server {
 	m.HandleFunc("POST /v1/tasks/{id}/lead", s.assignLead)
 	m.HandleFunc("DELETE /v1/tasks/{id}", s.closeTask)
 	m.HandleFunc("POST /v1/tasks/{id}/agents", s.addAgent)
+	m.HandleFunc("POST /v1/tasks/{id}/allocation-intents", s.createAllocationIntent)
 	m.HandleFunc("GET /v1/tasks/{id}/agents", s.listAgents)
 	m.HandleFunc("GET /v1/tasks/{id}/agents/{aid}", s.getAgent)
 	m.HandleFunc("GET /v1/tasks/{id}/agents/{aid}/work-context", s.getAgentWorkContext)
@@ -330,6 +331,27 @@ func (s *Server) addAgent(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, 201, a)
+}
+
+func (s *Server) createAllocationIntent(w http.ResponseWriter, r *http.Request) {
+	c, ok := s.writer(w, r)
+	if !ok {
+		return
+	}
+	id, ok := taskID(w, r)
+	if !ok {
+		return
+	}
+	var req api.CreateAllocationIntentRequest
+	if !decodeLimited(w, r, &req, api.MaxAgentRegistrationBody) {
+		return
+	}
+	in, err := s.store.CreateAllocationIntent(r.Context(), id, req, c)
+	if err != nil {
+		fail(w, err)
+		return
+	}
+	writeJSON(w, 201, in)
 }
 
 func (s *Server) listAgents(w http.ResponseWriter, r *http.Request) {
