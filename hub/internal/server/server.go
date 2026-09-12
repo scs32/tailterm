@@ -42,6 +42,7 @@ func New(st *store.Store, identity Identity) *Server {
 	m.HandleFunc("DELETE /v1/tasks/{id}", s.closeTask)
 	m.HandleFunc("POST /v1/tasks/{id}/agents", s.addAgent)
 	m.HandleFunc("POST /v1/tasks/{id}/allocation-intents", s.createAllocationIntent)
+	m.HandleFunc("GET /v1/tasks/{id}/allocation-intents/{agentId}", s.getAllocationIntent)
 	m.HandleFunc("GET /v1/tasks/{id}/agents", s.listAgents)
 	m.HandleFunc("GET /v1/tasks/{id}/agents/{aid}", s.getAgent)
 	m.HandleFunc("GET /v1/tasks/{id}/agents/{aid}/work-context", s.getAgentWorkContext)
@@ -352,6 +353,27 @@ func (s *Server) createAllocationIntent(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	writeJSON(w, 201, in)
+}
+
+func (s *Server) getAllocationIntent(w http.ResponseWriter, r *http.Request) {
+	if _, ok := s.caller(w, r); !ok {
+		return
+	}
+	id, ok := taskID(w, r)
+	if !ok {
+		return
+	}
+	aid := r.PathValue("agentId")
+	if !api.ValidID(aid, "agt") {
+		writeError(w, http.StatusNotFound, "not found")
+		return
+	}
+	in, err := s.store.GetAllocationIntent(r.Context(), id, aid)
+	if err != nil {
+		fail(w, err)
+		return
+	}
+	writeJSON(w, 200, in)
 }
 
 func (s *Server) listAgents(w http.ResponseWriter, r *http.Request) {

@@ -4,7 +4,9 @@ package store
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -540,7 +542,7 @@ AND NOT EXISTS (SELECT 1 FROM agent_work_item_bindings b WHERE b.agent_id=a.id)`
 		}
 	}
 	now := s.now()
-	a := api.Agent{RunID: api.NewID("run"), ID: req.AgentID, TaskID: taskID, Name: req.Name, Host: req.Host, Session: req.Session, Runtime: req.Runtime,
+	a := api.Agent{ID: req.AgentID, TaskID: taskID, Name: req.Name, Host: req.Host, Session: req.Session, Runtime: req.Runtime,
 		Cwd: req.Cwd, ParentAgentID: req.ParentAgentID, Role: req.Role, Status: api.AgentStarting, CreatedAt: now, LastEventAt: now}
 	if a.ID == "" {
 		a.ID = api.NewID("agt")
@@ -555,30 +557,44 @@ AND NOT EXISTS (SELECT 1 FROM agent_work_item_bindings b WHERE b.agent_id=a.id)`
 		return a, err
 	}
 	freshParentedItemBound := req.WorkItem != nil && req.ParentAgentID != "" && req.WorkItem.ReplacesAgentID == ""
+	var intent *api.AllocationIntent
 	if freshParentedItemBound {
-		// Independent review #2300/#2771/#2840 finding 5, as clarified by
-		// #2844/#2850/#2867/#2870: a fresh parented member OR extra
-		// admission must be authorized by a durable, handler/lead-authored
-		// allocation intent recorded BEFORE this call, bound to the exact
-		// preallocated agent identity, item, revision, work-order message
-		// and declared team role. Self-declaration on the launch request
-		// alone is not sufficient; absence or mismatch is rejected, not
+		// Independent review #2300/#2771/#2840/#2916 finding 5: a fresh
+		// parented member OR extra admission must be authorized by a
+		// durable, handler/lead-authored allocation intent recorded BEFORE
+		// this call, bound to the exact preallocated agent identity, target
+		// task, item, revision, work-order message, prepared context,
+		// declared team role and a preallocated expected run ID that
+		// becomes this admission's actual run (not merely a generated one
+		// consumed incidentally). Self-declaration on the launch request
+		// alone is not sufficient; absence, any mismatch, or a legacy
+		// (pre-#2916) intent whose new fields are empty is rejected, not
 		// silently bypassed. A replacement is exempt: it inherits its
 		// predecessor's already-authorized classification, not a fresh one.
 		if req.AgentID == "" {
 			return a, fmt.Errorf("%w: a fresh parented member/extra admission requires a preallocated --agent-id bound to a recorded allocation intent", api.ErrConflict)
 		}
-		intent, ierr := loadAllocationIntent(tx, ctx, req.AgentID)
+		loaded, ierr := loadAllocationIntent(tx, ctx, req.AgentID)
 		if ierr != nil {
 			return a, ierr
 		}
-		if intent == nil || intent.ConsumedAt != nil {
+		if loaded == nil || loaded.ConsumedAt != nil {
 			return a, fmt.Errorf("%w: no unconsumed allocation intent recorded for this agent identity", api.ErrConflict)
 		}
-		if intent.ItemTaskID != req.WorkItem.ItemTaskID || intent.ItemID != req.WorkItem.ItemID || intent.ItemRevision != req.WorkItem.ItemRevision ||
-			intent.WorkOrderMessage != req.WorkItem.WorkOrderMessage || intent.TeamRole != resolvedTeamRole {
-			return a, fmt.Errorf("%w: recorded allocation intent does not match this admission's exact item/revision/order/team role", api.ErrConflict)
+		if loaded.TargetTaskID == "" || loaded.ContextDigest == "" || loaded.AuthorAgentID == "" || loaded.AuthorRunID == "" || loaded.ExpectedRunID == "" {
+			return a, fmt.Errorf("%w: allocation intent predates the required expected-run/context/author binding and cannot authorize admission", api.ErrConflict)
 		}
+		contextDigestBytes := sha256.Sum256(req.WorkItem.ContextBundle)
+		contextDigest := hex.EncodeToString(contextDigestBytes[:])
+		if loaded.TargetTaskID != taskID || loaded.ItemTaskID != req.WorkItem.ItemTaskID || loaded.ItemID != req.WorkItem.ItemID ||
+			loaded.ItemRevision != req.WorkItem.ItemRevision || loaded.WorkOrderMessage != req.WorkItem.WorkOrderMessage ||
+			loaded.ContextDigest != contextDigest || loaded.TeamRole != resolvedTeamRole {
+			return a, fmt.Errorf("%w: recorded allocation intent does not match this admission's exact target task/item/revision/order/context/team role", api.ErrConflict)
+		}
+		intent = loaded
+		a.RunID = intent.ExpectedRunID
+	} else {
+		a.RunID = api.NewID("run")
 	}
 	if req.WorkItem != nil && req.ParentAgentID != "" && resolvedTeamRole == api.TeamRoleExtra && req.WorkItem.ReplacesAgentID == "" {
 		// Extra-agent capacity is accounted per work item, on top of that
@@ -638,7 +654,12 @@ AND NOT EXISTS (SELECT 1 FROM agent_work_item_bindings r JOIN agents ra ON ra.id
 	if freshParentedItemBound {
 		// Consume the intent atomically in this same transaction: it
 		// authorizes exactly this one fresh admission, never a later one.
-		if _, err = tx.ExecContext(ctx, `UPDATE agent_allocation_intents SET consumed_at=?, consumed_by_run_id=? WHERE agent_id=?`, ts(now), a.RunID, req.AgentID); err != nil {
+		// Launcher identity (the actual ParentAgentID performing this
+		// spawn) is recorded separately from author identity so authorship
+		// and launch provenance remain distinguishable even when an author
+		// delegates the actual launch to a different agent.
+		if _, err = tx.ExecContext(ctx, `UPDATE agent_allocation_intents SET consumed_at=?, consumed_by_run_id=?, launcher_agent_id=?, launcher_run_id=(SELECT run_id FROM agents WHERE id=?) WHERE agent_id=?`,
+			ts(now), a.RunID, req.ParentAgentID, req.ParentAgentID, req.AgentID); err != nil {
 			return a, err
 		}
 	}

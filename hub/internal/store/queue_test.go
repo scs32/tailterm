@@ -2,6 +2,8 @@ package store
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -930,9 +932,13 @@ func TestQueueExactReplayRejectsChangedTeamRole(t *testing.T) {
 			ContextBundle: bundle, TeamRole: api.TeamRoleMember,
 		},
 	}
+	digestBytes := sha256.Sum256(bundle)
+	digest := hex.EncodeToString(digestBytes[:])
+	expectedRunID := api.NewID("run")
 	if _, err = s.CreateAllocationIntent(ctx, target.ID, api.CreateAllocationIntentRequest{
-		AgentID: workerID, ItemTaskID: source.ID, ItemID: item.ID, ItemRevision: item.Revision,
-		WorkOrderMessage: api.MessageReference{TaskID: source.ID, Seq: order.Seq}, TeamRole: api.TeamRoleMember,
+		AgentID: workerID, TargetTaskID: target.ID, ItemTaskID: source.ID, ItemID: item.ID, ItemRevision: item.Revision,
+		WorkOrderMessage: api.MessageReference{TaskID: source.ID, Seq: order.Seq}, ContextDigest: digest, TeamRole: api.TeamRoleMember,
+		AuthorAgentID: lead.ID, AuthorRunID: lead.RunID, ExpectedRunID: expectedRunID,
 	}, by); err != nil {
 		t.Fatal(err)
 	}

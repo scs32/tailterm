@@ -56,6 +56,7 @@ var exportQueries = []exportQuery{
 	{"workItemRequests", `SELECT * FROM work_item_requests WHERE task_id=? ORDER BY operation,request_id`, oneArg},
 	{"messageWorkItemLinks", `SELECT * FROM message_work_item_links WHERE message_task_id=? ORDER BY message_seq`, oneArg},
 	{"agentWorkItemBindings", `SELECT b.agent_id,b.run_id,b.item_task_id,b.item_id,b.item_revision,b.work_order_task_id,b.work_order_message_seq,b.context_through_message_seq,b.replaces_agent_id,b.team_role,b.context_digest,b.created_at FROM agent_work_item_bindings b JOIN agents a ON a.id=b.agent_id WHERE a.task_id=? ORDER BY b.created_at,b.agent_id`, oneArg},
+	{"agentAllocationIntents", `SELECT agent_id,target_task_id,item_task_id,item_id,item_revision,work_order_task_id,work_order_message_seq,team_role,context_digest,author_agent_id,author_run_id,expected_run_id,request_id,created_by_node,created_by_user,created_at,consumed_at,consumed_by_run_id,launcher_agent_id,launcher_run_id FROM agent_allocation_intents WHERE target_task_id=? ORDER BY created_at,agent_id`, oneArg},
 	{"messagePostReceipts", `SELECT receipt_id,task_id,agent_id,by_node,by_user,request_id,payload_hash,message_seq,created_at FROM message_post_requests WHERE task_id=? ORDER BY created_at,receipt_id`, oneArg},
 	{"decisionRequests", `SELECT * FROM decision_requests WHERE task_id=? ORDER BY message_seq`, oneArg},
 	{"decisionAnswers", `SELECT * FROM decision_answers WHERE task_id=? ORDER BY message_seq`, oneArg},

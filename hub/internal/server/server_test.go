@@ -3,6 +3,8 @@ package server
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -369,7 +371,10 @@ func TestTaskHelperBudgetAPI(t *testing.T) {
 // and a fresh parented member/extra admission is authorized by it.
 func TestAllocationIntentEndpoint(t *testing.T) {
 	c := newClient(t)
-	task := c.task("Allocation intent endpoint")
+	var task api.Task
+	if code := c.do("POST", "/v1/tasks", api.CreateTaskRequest{Name: "Allocation intent endpoint", Orchestrator: "lead", AllowAgentSpawn: true}, &task); code != 201 {
+		t.Fatalf("create task: %d", code)
+	}
 	lead := c.agent(task, "lead")
 	ctx := context.Background()
 	item, err := c.st.CreateWorkItem(ctx, task.ID, api.CreateWorkItemRequest{Kind: "bug", Title: "Endpoint item", AgentID: lead.ID, RequestID: "endpoint-item"}, c.who)
@@ -385,8 +390,15 @@ func TestAllocationIntentEndpoint(t *testing.T) {
 	}
 	orderRef := api.MessageReference{TaskID: task.ID, Seq: order.Seq}
 	agentID := api.NewID("agt")
+	bundle := syntheticServerTestContext(t, item, orderRef, order)
+	digestBytes := sha256.Sum256(bundle)
+	digest := hex.EncodeToString(digestBytes[:])
+	expectedRunID := api.NewID("run")
 	var intent api.AllocationIntent
-	req := api.CreateAllocationIntentRequest{AgentID: agentID, ItemTaskID: task.ID, ItemID: item.ID, ItemRevision: item.Revision, WorkOrderMessage: orderRef, TeamRole: api.TeamRoleMember}
+	req := api.CreateAllocationIntentRequest{
+		AgentID: agentID, TargetTaskID: task.ID, ItemTaskID: task.ID, ItemID: item.ID, ItemRevision: item.Revision, WorkOrderMessage: orderRef,
+		ContextDigest: digest, TeamRole: api.TeamRoleMember, AuthorAgentID: lead.ID, AuthorRunID: lead.RunID, ExpectedRunID: expectedRunID,
+	}
 	if code := c.do("POST", "/v1/tasks/"+task.ID+"/allocation-intents", req, &intent); code != 201 || intent.AgentID != agentID || intent.TeamRole != api.TeamRoleMember {
 		t.Fatalf("create allocation intent: %d %+v", code, intent)
 	}
@@ -395,14 +407,18 @@ func TestAllocationIntentEndpoint(t *testing.T) {
 	if code := c.do("POST", "/v1/tasks/"+task.ID+"/allocation-intents", req, nil); code != 409 {
 		t.Fatalf("re-authoring an intent should conflict: %d", code)
 	}
-	bundle := syntheticServerTestContext(t, item, orderRef, order)
 	var admitted api.Agent
 	addReq := api.AddAgentRequest{
 		AgentID: agentID, Name: "worker", Host: "devbox", Session: "worker", Runtime: "claude", ParentAgentID: lead.ID,
 		WorkItem: &api.AgentWorkItemRequest{ItemTaskID: task.ID, ItemID: item.ID, ItemRevision: item.Revision, WorkOrderMessage: orderRef, ContextBundle: bundle, TeamRole: api.TeamRoleMember},
 	}
-	if code := c.do("POST", "/v1/tasks/"+task.ID+"/agents", addReq, &admitted); code != 201 || admitted.WorkItem == nil || admitted.WorkItem.TeamRole != api.TeamRoleMember {
-		t.Fatalf("admission authorized by the recorded intent: %d %+v", code, admitted)
+	if code := c.do("POST", "/v1/tasks/"+task.ID+"/agents", addReq, &admitted); code != 201 || admitted.WorkItem == nil || admitted.WorkItem.TeamRole != api.TeamRoleMember || admitted.RunID != expectedRunID {
+		t.Fatalf("admission authorized by the recorded intent, using its expected run id: %d %+v", code, admitted)
+	}
+	// Durable readback via GET, even after consumption.
+	var readback api.AllocationIntent
+	if code := c.do("GET", "/v1/tasks/"+task.ID+"/allocation-intents/"+agentID, nil, &readback); code != 200 || readback.ConsumedAt == nil || readback.ConsumedByRunID != expectedRunID {
+		t.Fatalf("GET allocation intent readback: %d %+v", code, readback)
 	}
 	// Missing intent for a different fresh agent identity is rejected.
 	missing := addReq

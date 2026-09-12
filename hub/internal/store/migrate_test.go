@@ -2,7 +2,9 @@ package store
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"path/filepath"
 	"testing"
 
@@ -76,7 +78,7 @@ CREATE INDEX agent_work_item_bindings_item ON agent_work_item_bindings(item_task
 	defer s.Close()
 	ctx := context.Background()
 	by := api.Caller{Node: "fixture", User: "owner"}
-	task, err := s.CreateTask(ctx, api.CreateTaskRequest{Name: "Post-migration", AllowAgentSpawn: true}, by)
+	task, err := s.CreateTask(ctx, api.CreateTaskRequest{Name: "Post-migration", Orchestrator: "lead", AllowAgentSpawn: true}, by)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -97,9 +99,13 @@ CREATE INDEX agent_work_item_bindings_item ON agent_work_item_bindings(item_task
 	}
 	orderRef := api.MessageReference{TaskID: task.ID, Seq: order.Seq}
 	bundle := syntheticPreparedContext(t, item, orderRef, syntheticHistory(item, order))
+	digestBytes := sha256.Sum256(bundle)
+	digest := hex.EncodeToString(digestBytes[:])
 	agentID := api.NewID("agt")
+	expectedRunID := api.NewID("run")
 	if _, err = s.CreateAllocationIntent(ctx, task.ID, api.CreateAllocationIntentRequest{
-		AgentID: agentID, ItemTaskID: task.ID, ItemID: item.ID, ItemRevision: item.Revision, WorkOrderMessage: orderRef, TeamRole: api.TeamRoleMember,
+		AgentID: agentID, TargetTaskID: task.ID, ItemTaskID: task.ID, ItemID: item.ID, ItemRevision: item.Revision, WorkOrderMessage: orderRef,
+		ContextDigest: digest, TeamRole: api.TeamRoleMember, AuthorAgentID: lead.ID, AuthorRunID: lead.RunID, ExpectedRunID: expectedRunID,
 	}, by); err != nil {
 		t.Fatal(err)
 	}

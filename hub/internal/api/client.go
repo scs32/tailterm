@@ -141,6 +141,11 @@ func (c *Client) CreateAllocationIntent(ctx context.Context, task string, req Cr
 	return out, c.do(ctx, "POST", "/v1/tasks/"+task+"/allocation-intents", req, &out)
 }
 
+func (c *Client) GetAllocationIntent(ctx context.Context, task, agent string) (AllocationIntent, error) {
+	var out AllocationIntent
+	return out, c.do(ctx, "GET", "/v1/tasks/"+task+"/allocation-intents/"+agent, nil, &out)
+}
+
 func (c *Client) GetAgent(ctx context.Context, task, agent string) (Agent, error) {
 	var out Agent
 	return out, c.do(ctx, "GET", "/v1/tasks/"+task+"/agents/"+agent, nil, &out)

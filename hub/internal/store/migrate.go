@@ -242,6 +242,14 @@ CREATE TABLE IF NOT EXISTS decision_answers (
   work_order_task_id TEXT NOT NULL,
   work_order_message_seq INTEGER NOT NULL CHECK(work_order_message_seq > 0),
   team_role TEXT NOT NULL,
+  target_task_id TEXT NOT NULL DEFAULT '',
+  context_digest TEXT NOT NULL DEFAULT '',
+  author_agent_id TEXT NOT NULL DEFAULT '',
+  author_run_id TEXT NOT NULL DEFAULT '',
+  expected_run_id TEXT NOT NULL DEFAULT '',
+  request_id TEXT NOT NULL DEFAULT '',
+  launcher_agent_id TEXT NOT NULL DEFAULT '',
+  launcher_run_id TEXT NOT NULL DEFAULT '',
   created_by_node TEXT NOT NULL,
   created_by_user TEXT NOT NULL,
   created_at TEXT NOT NULL,
@@ -251,6 +259,45 @@ CREATE TABLE IF NOT EXISTS decision_answers (
 CREATE INDEX IF NOT EXISTS agent_allocation_intents_item ON agent_allocation_intents(item_task_id,item_id,item_revision);`); err != nil {
 		return err
 	}
+	// This table was itself introduced mid-correction (item-extra-capacity,
+	// review #2300/#2771/#2840 finding 5); an already-upgraded existing
+	// database can have the table without the fields added by review #2916
+	// (expected-run binding, author-run/launcher provenance, idempotent
+	// retry identity). CREATE TABLE IF NOT EXISTS is a no-op there, so
+	// these columns need the same targeted ALTER-TABLE-after-check pattern
+	// as team_role did -- and for the identical reason: an index or query
+	// referencing a column that does not exist yet would abort before ever
+	// reaching a later repair.
+	for _, c := range []struct{ name, definition string }{
+		{"target_task_id", "TEXT NOT NULL DEFAULT ''"},
+		{"context_digest", "TEXT NOT NULL DEFAULT ''"},
+		{"author_agent_id", "TEXT NOT NULL DEFAULT ''"},
+		{"author_run_id", "TEXT NOT NULL DEFAULT ''"},
+		{"expected_run_id", "TEXT NOT NULL DEFAULT ''"},
+		{"request_id", "TEXT NOT NULL DEFAULT ''"},
+		{"launcher_agent_id", "TEXT NOT NULL DEFAULT ''"},
+		{"launcher_run_id", "TEXT NOT NULL DEFAULT ''"},
+	} {
+		var n int
+		if err := db.QueryRow(`SELECT count(*) FROM pragma_table_info('agent_allocation_intents') WHERE name=?`, c.name).Scan(&n); err != nil {
+			return err
+		}
+		if n == 0 {
+			if _, err := db.Exec("ALTER TABLE agent_allocation_intents ADD COLUMN " + c.name + " " + c.definition); err != nil {
+				return err
+			}
+		}
+	}
+	if _, err := db.Exec(`CREATE UNIQUE INDEX IF NOT EXISTS agent_allocation_intents_retry ON agent_allocation_intents(target_task_id,author_agent_id,author_run_id,request_id) WHERE request_id<>''`); err != nil {
+		return err
+	}
+	// A legacy (pre-#2916) intent row has empty expected_run_id/
+	// context_digest/author_*: it was authored under the weaker contract
+	// and never bound to a preallocated run or a checked author. It must
+	// never authorize an admission under the corrected rule -- an "upgraded"
+	// empty row is not silently grandfathered in. Store.AddAgent enforces
+	// this by requiring all four fields nonempty at consumption; no
+	// migration step here attempts to backfill or guess them.
 	_, err := db.Exec(`INSERT OR IGNORE INTO profile_meta(key,value) VALUES('instance',?)`, api.NewID("profilehub"))
 	return err
 }

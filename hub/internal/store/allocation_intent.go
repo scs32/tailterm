@@ -10,19 +10,55 @@ import (
 	"github.com/scs32/tailterm/hub/internal/api"
 )
 
+func validContextDigest(s string) bool {
+	if len(s) != 64 {
+		return false
+	}
+	for _, r := range s {
+		if !((r >= '0' && r <= '9') || (r >= 'a' && r <= 'f')) {
+			return false
+		}
+	}
+	return true
+}
+
 // CreateAllocationIntent authors one durable, pre-admission member/extra
-// intent for a preallocated agent identity, bound to the exact item,
-// revision and work-order message. It is handler/lead-authored, before the
+// intent for a preallocated agent identity, bound to the exact target task,
+// item, revision, work-order message, prepared context, team role and a
+// preallocated expected run ID. It is handler/lead-authored, before the
 // agent is ever admitted -- never derived from execution Start/Queue state.
-// A second intent for the same AgentID is a conflict: an intent is authored
-// once, then consumed once by AddAgent, never mutated.
+// The author's own current agent/run identity is verified against the live
+// roster (matching run, not closed/exited, and holding database_handler
+// role or the task Orchestrator name) before the intent is accepted; a
+// stale or mismatched author run is rejected, not merely stored. A second
+// intent for the same AgentID is a conflict unless RequestID scopes an
+// exact, identical retry (see CreateAllocationIntentRequest).
 func (s *Store) CreateAllocationIntent(ctx context.Context, taskID string, req api.CreateAllocationIntentRequest, by api.Caller) (api.AllocationIntent, error) {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
-	if !api.ValidID(taskID, "tsk") || !api.ValidID(req.AgentID, "agt") || !api.ValidID(req.ItemTaskID, "tsk") ||
-		!api.ValidID(req.ItemID, "wi") || req.ItemRevision < 1 || !api.ValidID(req.WorkOrderMessage.TaskID, "tsk") ||
-		req.WorkOrderMessage.Seq < 1 || (req.TeamRole != api.TeamRoleMember && req.TeamRole != api.TeamRoleExtra) {
+	if !api.ValidID(taskID, "tsk") || !api.ValidID(req.AgentID, "agt") || req.TargetTaskID != taskID ||
+		!api.ValidID(req.ItemTaskID, "tsk") || !api.ValidID(req.ItemID, "wi") || req.ItemRevision < 1 ||
+		!api.ValidID(req.WorkOrderMessage.TaskID, "tsk") || req.WorkOrderMessage.Seq < 1 ||
+		!validContextDigest(req.ContextDigest) || (req.TeamRole != api.TeamRoleMember && req.TeamRole != api.TeamRoleExtra) ||
+		!api.ValidID(req.AuthorAgentID, "agt") || !validRunID(req.AuthorRunID) || !validRunID(req.ExpectedRunID) {
 		return api.AllocationIntent{}, api.ErrInvalid
+	}
+	if req.RequestID != "" {
+		existing, err := loadAllocationIntentByRetryKey(s.db, ctx, taskID, req.AuthorAgentID, req.AuthorRunID, req.RequestID)
+		if err != nil {
+			return api.AllocationIntent{}, err
+		}
+		if existing != nil {
+			if existing.AgentID != req.AgentID || existing.ItemTaskID != req.ItemTaskID || existing.ItemID != req.ItemID ||
+				existing.ItemRevision != req.ItemRevision || existing.WorkOrderMessage != req.WorkOrderMessage ||
+				existing.ContextDigest != req.ContextDigest || existing.TeamRole != req.TeamRole || existing.ExpectedRunID != req.ExpectedRunID {
+				return api.AllocationIntent{}, fmt.Errorf("%w: retry request-id reused with a different allocation intent payload", api.ErrConflict)
+			}
+			// Identical retry: durable readback of the exact prior outcome,
+			// including if it has since been consumed. Never a second
+			// allowance/intent.
+			return *existing, nil
+		}
 	}
 	item, err := getWorkItem(s.db, ctx, req.ItemTaskID, req.ItemID)
 	if err != nil {
@@ -39,11 +75,46 @@ func (s *Store) CreateAllocationIntent(ctx context.Context, taskID string, req a
 	if !linked {
 		return api.AllocationIntent{}, workItemConflict("work-order message is not linked to the selected work item")
 	}
+	// Author authority: a live current run of the database_handler or the
+	// task's Orchestrator on this exact target task. Functional recorded-
+	// allocation consistency (independent review #2844/#2845 framing), not
+	// a claim that this is unforgeable on a single-shared-token hub.
+	var authorTask, authorRun, authorName, authorRole, authorStatus string
+	if err := s.db.QueryRowContext(ctx, `SELECT task_id,run_id,name,role,status FROM agents WHERE id=?`, req.AuthorAgentID).Scan(&authorTask, &authorRun, &authorName, &authorRole, &authorStatus); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return api.AllocationIntent{}, fmt.Errorf("%w: unknown author agent identity", api.ErrInvalid)
+		}
+		return api.AllocationIntent{}, err
+	}
+	t, err := s.GetTask(ctx, taskID)
+	if err != nil {
+		return api.AllocationIntent{}, err
+	}
+	authorized := authorRole == api.AgentRoleDatabaseHandler || (t.Orchestrator != "" && strings.EqualFold(authorName, t.Orchestrator))
+	if authorTask != taskID || authorRun != req.AuthorRunID || authorStatus == api.AgentClosed || authorStatus == api.AgentExited || !authorized {
+		return api.AllocationIntent{}, fmt.Errorf("%w: author agent/run is not a current authorized database handler or orchestrator on this task", api.ErrConflict)
+	}
+	// ExpectedRunID must be unique: not already an agent's run, and not
+	// already recorded on another intent (consumed or not).
+	var count int
+	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM agents WHERE run_id=?`, req.ExpectedRunID).Scan(&count); err != nil {
+		return api.AllocationIntent{}, err
+	}
+	if count > 0 {
+		return api.AllocationIntent{}, fmt.Errorf("%w: expected run id is already in use", api.ErrConflict)
+	}
+	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM agent_allocation_intents WHERE expected_run_id=?`, req.ExpectedRunID).Scan(&count); err != nil {
+		return api.AllocationIntent{}, err
+	}
+	if count > 0 {
+		return api.AllocationIntent{}, fmt.Errorf("%w: expected run id is already reserved by another allocation intent", api.ErrConflict)
+	}
 	now := s.now()
 	_, err = s.db.ExecContext(ctx, `INSERT INTO agent_allocation_intents
-(agent_id,item_task_id,item_id,item_revision,work_order_task_id,work_order_message_seq,team_role,created_by_node,created_by_user,created_at,consumed_at,consumed_by_run_id)
-VALUES(?,?,?,?,?,?,?,?,?,?,'','')`,
-		req.AgentID, req.ItemTaskID, req.ItemID, req.ItemRevision, req.WorkOrderMessage.TaskID, req.WorkOrderMessage.Seq, req.TeamRole, by.Node, by.User, ts(now))
+(agent_id,item_task_id,item_id,item_revision,work_order_task_id,work_order_message_seq,team_role,target_task_id,context_digest,author_agent_id,author_run_id,expected_run_id,request_id,created_by_node,created_by_user,created_at,consumed_at,consumed_by_run_id,launcher_agent_id,launcher_run_id)
+VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'','','','')`,
+		req.AgentID, req.ItemTaskID, req.ItemID, req.ItemRevision, req.WorkOrderMessage.TaskID, req.WorkOrderMessage.Seq, req.TeamRole,
+		req.TargetTaskID, req.ContextDigest, req.AuthorAgentID, req.AuthorRunID, req.ExpectedRunID, req.RequestID, by.Node, by.User, ts(now))
 	if err != nil {
 		if isUniqueConstraintErr(err) {
 			return api.AllocationIntent{}, fmt.Errorf("%w: an allocation intent already exists for this agent identity", api.ErrConflict)
@@ -51,20 +122,22 @@ VALUES(?,?,?,?,?,?,?,?,?,?,'','')`,
 		return api.AllocationIntent{}, err
 	}
 	return api.AllocationIntent{
-		AgentID: req.AgentID, ItemTaskID: req.ItemTaskID, ItemID: req.ItemID, ItemRevision: req.ItemRevision,
-		WorkOrderMessage: req.WorkOrderMessage, TeamRole: req.TeamRole, CreatedBy: by, CreatedAt: now,
+		AgentID: req.AgentID, TargetTaskID: req.TargetTaskID, ItemTaskID: req.ItemTaskID, ItemID: req.ItemID, ItemRevision: req.ItemRevision,
+		WorkOrderMessage: req.WorkOrderMessage, ContextDigest: req.ContextDigest, TeamRole: req.TeamRole,
+		AuthorAgentID: req.AuthorAgentID, AuthorRunID: req.AuthorRunID, ExpectedRunID: req.ExpectedRunID, RequestID: req.RequestID,
+		CreatedBy: by, CreatedAt: now,
 	}, nil
 }
 
-// loadAllocationIntent reads an unconsumed intent for exactly one agent
-// identity, or nil if none exists (consumed or never authored).
-func loadAllocationIntent(q queryRower, ctx context.Context, agentID string) (*api.AllocationIntent, error) {
+const allocationIntentCols = `agent_id,item_task_id,item_id,item_revision,work_order_task_id,work_order_message_seq,team_role,target_task_id,context_digest,author_agent_id,author_run_id,expected_run_id,request_id,created_by_node,created_by_user,created_at,consumed_at,consumed_by_run_id,launcher_agent_id,launcher_run_id`
+
+func scanAllocationIntent(row interface{ Scan(...any) error }) (*api.AllocationIntent, error) {
 	var in api.AllocationIntent
 	var created, consumed string
-	err := q.QueryRowContext(ctx, `SELECT agent_id,item_task_id,item_id,item_revision,work_order_task_id,work_order_message_seq,team_role,created_by_node,created_by_user,created_at,consumed_at,consumed_by_run_id
-FROM agent_allocation_intents WHERE agent_id=?`, agentID).Scan(
+	err := row.Scan(
 		&in.AgentID, &in.ItemTaskID, &in.ItemID, &in.ItemRevision, &in.WorkOrderMessage.TaskID, &in.WorkOrderMessage.Seq,
-		&in.TeamRole, &in.CreatedBy.Node, &in.CreatedBy.User, &created, &consumed, &in.ConsumedByRunID,
+		&in.TeamRole, &in.TargetTaskID, &in.ContextDigest, &in.AuthorAgentID, &in.AuthorRunID, &in.ExpectedRunID, &in.RequestID,
+		&in.CreatedBy.Node, &in.CreatedBy.User, &created, &consumed, &in.ConsumedByRunID, &in.LauncherAgentID, &in.LauncherRunID,
 	)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
@@ -76,9 +149,36 @@ FROM agent_allocation_intents WHERE agent_id=?`, agentID).Scan(
 	if consumed != "" {
 		c := parseTS(consumed)
 		in.ConsumedAt = &c
-		return &in, nil // consumed: caller treats as unavailable for reuse
 	}
 	return &in, nil
+}
+
+// loadAllocationIntent reads an intent for exactly one agent identity
+// (consumed or not), or nil if none was ever authored.
+func loadAllocationIntent(q queryRower, ctx context.Context, agentID string) (*api.AllocationIntent, error) {
+	return scanAllocationIntent(q.QueryRowContext(ctx, `SELECT `+allocationIntentCols+` FROM agent_allocation_intents WHERE agent_id=?`, agentID))
+}
+
+func loadAllocationIntentByRetryKey(q queryRower, ctx context.Context, targetTaskID, authorAgentID, authorRunID, requestID string) (*api.AllocationIntent, error) {
+	return scanAllocationIntent(q.QueryRowContext(ctx, `SELECT `+allocationIntentCols+` FROM agent_allocation_intents WHERE target_task_id=? AND author_agent_id=? AND author_run_id=? AND request_id=?`,
+		targetTaskID, authorAgentID, authorRunID, requestID))
+}
+
+// GetAllocationIntent is a plain readback by agent identity: it never
+// consumes, authors, or mutates -- a durable receipt for an uncertain
+// CreateAllocationIntent response, available even after consumption.
+func (s *Store) GetAllocationIntent(ctx context.Context, taskID, agentID string) (api.AllocationIntent, error) {
+	if !api.ValidID(taskID, "tsk") || !api.ValidID(agentID, "agt") {
+		return api.AllocationIntent{}, api.ErrInvalid
+	}
+	in, err := loadAllocationIntent(s.db, ctx, agentID)
+	if err != nil {
+		return api.AllocationIntent{}, err
+	}
+	if in == nil || in.TargetTaskID != taskID {
+		return api.AllocationIntent{}, api.ErrNotFound
+	}
+	return *in, nil
 }
 
 func isUniqueConstraintErr(err error) bool {
