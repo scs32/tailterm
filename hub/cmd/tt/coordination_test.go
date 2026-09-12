@@ -315,6 +315,103 @@ func TestGeneratedBriefingStatesTtIsARealCliVerifiedBeforeUse(t *testing.T) {
 	}
 }
 
+// TestGeneratedBriefingDescribesFullAllocationIntentTupleAndRecovery
+// addresses independent review #3054 (lead-recovery correction on top of
+// #3003/#3010): the round-4/5 AllocationIntent contract must be proven to
+// actually reach newly generated MAIN/handler/worker briefings -- the exact
+// text agentTaskBriefing/agentTaskBriefingForLaunch produce for a freshly
+// launched or briefed session (cmdBrief, cmdSpawn) -- not merely edited in
+// the source file. This exercises the real emitted-guidance code path,
+// covering every audience (MAIN orchestrator, non-orchestrator builder, and
+// database handler, each of which gets its own copy of this policy text)
+// and every element review #3010 named: exact tuple binding (item/revision/
+// order/prepared-context-digest/intended-launcher/expected-run), create/get
+// keyed-retry recovery, and the coordinated mixed-version rollout window.
+// It deliberately does NOT claim this reaches an already-running thread's
+// prior turns or a frozen saved launch plan -- that distinction (newly
+// generated prompt vs. old-thread/frozen state) is the docstring's own
+// explicit disclosure, asserted separately below.
+func TestGeneratedBriefingDescribesFullAllocationIntentTupleAndRecovery(t *testing.T) {
+	requiredTuple := []string{
+		"identity/item/revision/order/role/prepared-context-digest/intended-launcher",
+		"preallocated expected run ID that becomes the actual admitted run",
+	}
+	requiredRecovery := []string{
+		"tt allocation-intent create",
+		"An uncertain create response can be recovered with the same --request-id (and the same frozen --expected-run-id) or read back non-destructively with tt allocation-intent get",
+	}
+	requiredRollout := []string{
+		"requires the hub to advertise a compatible allocation-intent capability version",
+		"tt spawn fails closed rather than proceeding under weaker accounting",
+		"mixed hub/CLI versions require a coordinated rollout window, not a one-sided upgrade",
+	}
+	task := api.Task{Name: "Project", Orchestrator: "lead", AllowAgentSpawn: true, MaxNewAgents: 4}
+	roster := []api.Agent{{Name: "lead", Status: api.AgentRunning}}
+	cases := []struct {
+		name  string
+		agent string
+		role  string
+	}{
+		{"orchestrator", "lead", ""},
+		{"non-orchestrator builder", "worker", ""},
+		{"database handler", "handler", api.AgentRoleDatabaseHandler},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			// This is the actual code path a fresh cmdBrief/cmdSpawn call
+			// runs to produce a NEWLY EMITTED briefing -- not a copy of the
+			// source text, the real function.
+			got := agentTaskBriefing(task, tc.agent, tc.role, "", roster)
+			for _, want := range requiredTuple {
+				if !strings.Contains(got, want) {
+					t.Fatalf("case %s: newly emitted briefing missing exact-tuple binding text %q", tc.name, want)
+				}
+			}
+			for _, want := range requiredRecovery {
+				if !strings.Contains(got, want) {
+					t.Fatalf("case %s: newly emitted briefing missing create/get keyed-retry recovery text %q", tc.name, want)
+				}
+			}
+			for _, want := range requiredRollout {
+				if !strings.Contains(got, want) {
+					t.Fatalf("case %s: newly emitted briefing missing coordinated mixed-version rollout text %q", tc.name, want)
+				}
+			}
+		})
+	}
+	// The database-handler audience gets its OWN separately-written copy of
+	// this policy (a distinct branch in agentTaskBriefingForLaunch, not
+	// merely inherited from the MAIN-orchestrator copy above) -- prove that
+	// copy independently rather than assuming the two stay in sync.
+	handlerOnly := agentTaskBriefing(task, "handler", api.AgentRoleDatabaseHandler, "", roster)
+	if !strings.Contains(handlerOnly, "binding the intended launcher agent/run and a preallocated expected run ID that becomes the actual admitted run") {
+		t.Fatal("database-handler briefing's own copy is missing the intended-launcher/expected-run binding text")
+	}
+	// Old-thread/frozen-plan distinction: the briefing explicitly disclaims
+	// that this corrected guidance reaches anything but a newly generated
+	// prompt -- review #3054 asked this distinction be preserved, not
+	// collapsed into a false claim that existing running threads are
+	// retroactively updated.
+	orchestratorBriefing := agentTaskBriefing(task, "lead", "", "", roster)
+	if !strings.Contains(orchestratorBriefing, "Changed startup instructions apply to newly generated briefings, not automatically to already-running threads or frozen saved launch plans") {
+		t.Fatal("briefing lost the newly-generated-prompt vs. old-thread/frozen-plan distinction")
+	}
+	// The top-level `tt` usage string (what `tt` with no/unknown args and
+	// `tt --help` actually print) must also describe the full create/get
+	// contract, not just the briefing prose.
+	for _, want := range []string{
+		"--work-context-file F|--work-context-json J",
+		"--launcher-agent-id ID --launcher-run-id ID",
+		"--expected-run-id ID",
+		"freeze --expected-run-id when reusing",
+		"allocation-intent get --agent-id ID",
+	} {
+		if !strings.Contains(usage, want) {
+			t.Fatalf("top-level usage text missing %q", want)
+		}
+	}
+}
+
 func TestSpawnRejectsInvalidPlannedTeamSizeBeforeContactingHub(t *testing.T) {
 	e := env{hub: "http://127.0.0.1:1", task: "tsk_0000000000000001"}
 	err := cmdSpawn(e, []string{"--name", "lead", "--run", "codex", "--planned-team-members", "33"})
