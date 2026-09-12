@@ -199,6 +199,72 @@ func TestAuditExportV3AddsFrozenQueueStreamsWithoutChangingV2Coverage(t *testing
 	}
 }
 
+// TestAuditExportAllocationIntentStreamOnlyInV3 addresses independent review
+// #3003/#3010's audit-export gap: agent_allocation_intents (and its
+// review-#2916 expected-run/launcher/author columns) postdates legacy
+// format 2. Format 2's schema must remain byte-for-byte unchanged for any
+// existing consumer; the allocationIntent stream is included only in format
+// 3, exactly like the Queue streams already proven this way above.
+func TestAuditExportAllocationIntentStreamOnlyInV3(t *testing.T) {
+	s, ctx, by := workItemStore(t)
+	now := time.Date(2026, 9, 12, 14, 0, 0, 0, time.UTC)
+	s.now = func() time.Time { return now }
+	task, lead := workItemProject(t, s, ctx, by, "intent export", "lead")
+	item := createWorkItem(t, s, ctx, by, task, "intent-export-item")
+	order := contextLinkedMessage(t, s, task, item, "intent export order", "intent-export-order", nil)
+	orderRef := api.MessageReference{TaskID: task.ID, Seq: order.Seq}
+	bundle := syntheticPreparedContext(t, item, orderRef, syntheticHistory(item, order))
+	digestBytes := sha256.Sum256(bundle)
+	digest := hex.EncodeToString(digestBytes[:])
+	if _, err := s.CreateAllocationIntent(ctx, task.ID, api.CreateAllocationIntentRequest{
+		AgentID: api.NewID("agt"), TargetTaskID: task.ID, ItemTaskID: task.ID, ItemID: item.ID, ItemRevision: item.Revision, WorkOrderMessage: orderRef,
+		ContextDigest: digest, TeamRole: api.TeamRoleExtra, AuthorAgentID: lead.ID, AuthorRunID: lead.RunID, ExpectedRunID: api.NewID("run"),
+	}, by); err != nil {
+		t.Fatal(err)
+	}
+	v2, err := s.CreateAuditExport(ctx, task.ID, api.CreateAuditExportRequest{RequestID: "intent-v2", FormatVersion: 2}, by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	v3, err := s.CreateAuditExport(ctx, task.ID, api.CreateAuditExportRequest{RequestID: "intent-v3", FormatVersion: 3}, by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	read := func(meta api.AuditExport) []byte {
+		t.Helper()
+		var content []byte
+		for offset := int64(0); ; {
+			chunk, chunkErr := s.GetAuditExportChunk(ctx, task.ID, meta.ID, offset, 31, by)
+			if chunkErr != nil {
+				t.Fatal(chunkErr)
+			}
+			content = append(content, chunk.Data...)
+			offset = chunk.NextOffset
+			if chunk.Complete {
+				return content
+			}
+		}
+	}
+	var v2Document, v3Document struct {
+		FormatVersion int                         `json:"formatVersion"`
+		Streams       map[string][]map[string]any `json:"streams"`
+	}
+	if err = json.Unmarshal(read(v2), &v2Document); err != nil {
+		t.Fatal(err)
+	}
+	if err = json.Unmarshal(read(v3), &v3Document); err != nil {
+		t.Fatal(err)
+	}
+	if v2Document.FormatVersion != 2 || v2Document.Streams["agentAllocationIntents"] != nil {
+		t.Fatalf("v2 claimed allocation-intent coverage: streams=%v", v2Document.Streams["agentAllocationIntents"])
+	}
+	if v3Document.FormatVersion != 3 || len(v3Document.Streams["agentAllocationIntents"]) != 1 ||
+		v3Document.Streams["agentAllocationIntents"][0]["team_role"] != api.TeamRoleExtra ||
+		v3Document.Streams["agentAllocationIntents"][0]["context_digest"] != digest {
+		t.Fatalf("v3 allocation-intent coverage incomplete: streams=%v", v3Document.Streams["agentAllocationIntents"])
+	}
+}
+
 func TestAuditExportContentAndProjectByteLimitsFailBeforeReceipt(t *testing.T) {
 	ctx := context.Background()
 	caller := api.Caller{Node: "n", User: "u"}

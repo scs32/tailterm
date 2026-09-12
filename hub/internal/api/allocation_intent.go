@@ -14,34 +14,41 @@ import "time"
 // admission -- so it authorizes exactly one outcome. A fresh (non-
 // replacement) parented member/extra admission for a preallocated AgentID
 // must have a matching, unconsumed intent recorded for the exact target
-// task/item/revision/order/context/team-role/expected-run tuple; admission
-// is rejected when no such intent exists or any field mismatches
-// (independent review #2300/#2771/#2840/#2916, finding 5, as clarified by
-// #2844/#2850/#2867/#2870/#2916: functional recorded-allocation
+// task/item/revision/order/context/team-role/expected-run/expected-launcher
+// tuple; admission is rejected when no such intent exists or any field
+// mismatches (independent review #2300/#2771/#2840/#2916, finding 5, as
+// clarified by #2844/#2850/#2867/#2870/#2916: functional recorded-allocation
 // consistency, not a cryptographic authority boundary against a malicious
 // shared-token holder -- that remains outside this bug's scope). A legacy
 // intent authored before #2916 (empty ExpectedRunID/ContextDigest/Author*)
 // can never satisfy the nonempty-tuple requirement below and so can never
-// authorize an admission; it is not silently grandfathered in.
+// authorize an admission; it is not silently grandfathered in. Review
+// #3003/#3010 finding 1: ExpectedLauncherAgentID/ExpectedLauncherRunID name
+// the specific agent/run authorized to actually perform the launch (the
+// admission's ParentAgentID and its live run), not merely whichever active
+// agent happens to hold the preallocated AgentID and consumes the intent --
+// that identity is checked exactly, not recorded only after the fact.
 type AllocationIntent struct {
-	AgentID          string           `json:"agentId"`
-	TargetTaskID     string           `json:"targetTaskId"`
-	ItemTaskID       string           `json:"itemTaskId"`
-	ItemID           string           `json:"itemId"`
-	ItemRevision     int64            `json:"itemRevision"`
-	WorkOrderMessage MessageReference `json:"workOrderMessage"`
-	ContextDigest    string           `json:"contextDigest"`
-	TeamRole         string           `json:"teamRole"`
-	AuthorAgentID    string           `json:"authorAgentId"`
-	AuthorRunID      string           `json:"authorRunId"`
-	ExpectedRunID    string           `json:"expectedRunId"`
-	RequestID        string           `json:"requestId,omitempty"`
-	CreatedBy        Caller           `json:"createdBy"`
-	CreatedAt        time.Time        `json:"createdAt"`
-	ConsumedAt       *time.Time       `json:"consumedAt,omitempty"`
-	ConsumedByRunID  string           `json:"consumedByRunId,omitempty"`
-	LauncherAgentID  string           `json:"launcherAgentId,omitempty"`
-	LauncherRunID    string           `json:"launcherRunId,omitempty"`
+	AgentID                 string           `json:"agentId"`
+	TargetTaskID            string           `json:"targetTaskId"`
+	ItemTaskID              string           `json:"itemTaskId"`
+	ItemID                  string           `json:"itemId"`
+	ItemRevision            int64            `json:"itemRevision"`
+	WorkOrderMessage        MessageReference `json:"workOrderMessage"`
+	ContextDigest           string           `json:"contextDigest"`
+	TeamRole                string           `json:"teamRole"`
+	AuthorAgentID           string           `json:"authorAgentId"`
+	AuthorRunID             string           `json:"authorRunId"`
+	ExpectedRunID           string           `json:"expectedRunId"`
+	ExpectedLauncherAgentID string           `json:"expectedLauncherAgentId"`
+	ExpectedLauncherRunID   string           `json:"expectedLauncherRunId"`
+	RequestID               string           `json:"requestId,omitempty"`
+	CreatedBy               Caller           `json:"createdBy"`
+	CreatedAt               time.Time        `json:"createdAt"`
+	ConsumedAt              *time.Time       `json:"consumedAt,omitempty"`
+	ConsumedByRunID         string           `json:"consumedByRunId,omitempty"`
+	LauncherAgentID         string           `json:"launcherAgentId,omitempty"`
+	LauncherRunID           string           `json:"launcherRunId,omitempty"`
 }
 
 // CreateAllocationIntentRequest authors one intent for one not-yet-admitted
@@ -60,17 +67,31 @@ type AllocationIntent struct {
 // returns the existing record (including after it has been consumed, for
 // durable readback); the identical tuple with any different field is a
 // conflict, and no second intent/allowance is ever created by a retry.
+// ExpectedLauncherAgentID/ExpectedLauncherRunID name the agent/run that is
+// authorized to actually perform the launch (ParentAgentID at admission).
+// When left empty, the author is presumed the intended launcher (a common
+// case: the same handler/lead session both authors the intent and launches
+// its holder) and defaults to AuthorAgentID/AuthorRunID at authoring time.
+// An explicit delegate is verified live on the target task (same as any
+// other launcher check) so the binding cannot name a nonexistent or
+// off-task agent. At consumption, Store.AddAgent requires the ACTUAL
+// ParentAgentID/its live run to match this expected launcher tuple exactly;
+// review #3003/#3010 finding 1: recording whichever ParentAgentID happened
+// to consume the intent after the fact is not the same as authorizing which
+// launcher was allowed to.
 type CreateAllocationIntentRequest struct {
-	AgentID          string           `json:"agentId"`
-	TargetTaskID     string           `json:"targetTaskId"`
-	ItemTaskID       string           `json:"itemTaskId"`
-	ItemID           string           `json:"itemId"`
-	ItemRevision     int64            `json:"itemRevision"`
-	WorkOrderMessage MessageReference `json:"workOrderMessage"`
-	ContextDigest    string           `json:"contextDigest"`
-	TeamRole         string           `json:"teamRole"`
-	AuthorAgentID    string           `json:"authorAgentId"`
-	AuthorRunID      string           `json:"authorRunId"`
-	ExpectedRunID    string           `json:"expectedRunId"`
-	RequestID        string           `json:"requestId,omitempty"`
+	AgentID                 string           `json:"agentId"`
+	TargetTaskID            string           `json:"targetTaskId"`
+	ItemTaskID              string           `json:"itemTaskId"`
+	ItemID                  string           `json:"itemId"`
+	ItemRevision            int64            `json:"itemRevision"`
+	WorkOrderMessage        MessageReference `json:"workOrderMessage"`
+	ContextDigest           string           `json:"contextDigest"`
+	TeamRole                string           `json:"teamRole"`
+	AuthorAgentID           string           `json:"authorAgentId"`
+	AuthorRunID             string           `json:"authorRunId"`
+	ExpectedRunID           string           `json:"expectedRunId"`
+	ExpectedLauncherAgentID string           `json:"expectedLauncherAgentId,omitempty"`
+	ExpectedLauncherRunID   string           `json:"expectedLauncherRunId,omitempty"`
+	RequestID               string           `json:"requestId,omitempty"`
 }

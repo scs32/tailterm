@@ -56,7 +56,6 @@ var exportQueries = []exportQuery{
 	{"workItemRequests", `SELECT * FROM work_item_requests WHERE task_id=? ORDER BY operation,request_id`, oneArg},
 	{"messageWorkItemLinks", `SELECT * FROM message_work_item_links WHERE message_task_id=? ORDER BY message_seq`, oneArg},
 	{"agentWorkItemBindings", `SELECT b.agent_id,b.run_id,b.item_task_id,b.item_id,b.item_revision,b.work_order_task_id,b.work_order_message_seq,b.context_through_message_seq,b.replaces_agent_id,b.team_role,b.context_digest,b.created_at FROM agent_work_item_bindings b JOIN agents a ON a.id=b.agent_id WHERE a.task_id=? ORDER BY b.created_at,b.agent_id`, oneArg},
-	{"agentAllocationIntents", `SELECT agent_id,target_task_id,item_task_id,item_id,item_revision,work_order_task_id,work_order_message_seq,team_role,context_digest,author_agent_id,author_run_id,expected_run_id,request_id,created_by_node,created_by_user,created_at,consumed_at,consumed_by_run_id,launcher_agent_id,launcher_run_id FROM agent_allocation_intents WHERE target_task_id=? ORDER BY created_at,agent_id`, oneArg},
 	{"messagePostReceipts", `SELECT receipt_id,task_id,agent_id,by_node,by_user,request_id,payload_hash,message_seq,created_at FROM message_post_requests WHERE task_id=? ORDER BY created_at,receipt_id`, oneArg},
 	{"decisionRequests", `SELECT * FROM decision_requests WHERE task_id=? ORDER BY message_seq`, oneArg},
 	{"decisionAnswers", `SELECT * FROM decision_answers WHERE task_id=? ORDER BY message_seq`, oneArg},
@@ -92,6 +91,17 @@ var queueExportQueries = []exportQuery{
 	{"queueDispatchLinks", `SELECT l.* FROM queue_dispatch_links l JOIN queue_entries e ON e.id=l.entry_id WHERE e.target_task_id=? OR e.source_task_id=? ORDER BY l.event_seq,l.dispatch_id`, twoArgs},
 	{"queueReceipts", `SELECT r.* FROM queue_requests r JOIN queue_entries e ON e.id=r.entry_id WHERE e.target_task_id=? OR e.source_task_id=? ORDER BY r.created_at,r.receipt_id`, twoArgs},
 	{"queueNotifications", `SELECT n.* FROM queue_notifications n JOIN queue_entries e ON e.id=n.entry_id WHERE e.target_task_id=? OR e.source_task_id=? ORDER BY n.event_seq,n.recipient_generation`, twoArgs},
+}
+
+// allocationIntentExportQueries is deliberately NOT part of the shared
+// exportQueries list: the agent_allocation_intents table (and its
+// expected-run/launcher/author columns) postdates legacy audit export
+// format 2 (review #2893/#2916, gap flagged by review #3003/#3010). Format
+// 2's schema must remain byte-for-byte unchanged for any existing consumer;
+// the allocation-intent stream is included only in format 3, exactly like
+// the Queue streams below.
+var allocationIntentExportQueries = []exportQuery{
+	{"agentAllocationIntents", `SELECT agent_id,target_task_id,item_task_id,item_id,item_revision,work_order_task_id,work_order_message_seq,team_role,context_digest,author_agent_id,author_run_id,expected_run_id,expected_launcher_agent_id,expected_launcher_run_id,request_id,created_by_node,created_by_user,created_at,consumed_at,consumed_by_run_id,launcher_agent_id,launcher_run_id FROM agent_allocation_intents WHERE target_task_id=? ORDER BY created_at,agent_id`, oneArg},
 }
 
 func oneArg(taskID string) []any  { return []any{taskID} }
@@ -425,7 +435,7 @@ func (s *Store) CreateAuditExport(ctx context.Context, taskID string, req api.Cr
 	}
 	queries := exportQueries
 	if req.FormatVersion == api.AuditExportFormatVersion {
-		queries = append(append([]exportQuery(nil), exportQueries...), queueExportQueries...)
+		queries = append(append(append([]exportQuery(nil), exportQueries...), allocationIntentExportQueries...), queueExportQueries...)
 	}
 	for index, q := range queries {
 		if index > 0 {

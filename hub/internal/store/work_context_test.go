@@ -111,9 +111,14 @@ func authorIntentAndBind(t *testing.T, s *Store, task api.Task, item api.WorkIte
 	digestBytes := sha256.Sum256(bundle)
 	digest := hex.EncodeToString(digestBytes[:])
 	expectedRunID := api.NewID("run")
+	launcher, err := s.GetAgent(ctx, parent)
+	if err != nil {
+		t.Fatalf("look up intended launcher %s for %s: %v", parent, name, err)
+	}
 	if _, err := s.CreateAllocationIntent(ctx, task.ID, api.CreateAllocationIntentRequest{
 		AgentID: agentID, TargetTaskID: task.ID, ItemTaskID: task.ID, ItemID: item.ID, ItemRevision: item.Revision, WorkOrderMessage: orderRef,
 		ContextDigest: digest, TeamRole: teamRole, AuthorAgentID: author.ID, AuthorRunID: author.RunID, ExpectedRunID: expectedRunID,
+		ExpectedLauncherAgentID: launcher.ID, ExpectedLauncherRunID: launcher.RunID,
 	}, by); err != nil {
 		t.Fatalf("author intent for %s: %v", name, err)
 	}
@@ -816,6 +821,140 @@ func TestItemExtraCapacityFailedReplacementRetryNeverExceedsCeilingWithReuse(t *
 	}
 }
 
+// TestItemExtraCapacityFailedReplacementRetryExactMaxOneCase is the exact
+// max=1 E->R1(close)->F(reject)->R2 acceptance case requested by review
+// #2992/#3003/#3010 (previously only proved at max=2): at a one-extra
+// ceiling, closing a failed replacement R1 reverts its predecessor E to
+// counting again (E's only successor is no longer live), so the item is
+// still at its ceiling and a genuinely new extra F is correctly rejected; a
+// further retry R2 against the same predecessor E remains admitted
+// (slot-neutral: E excluded once R2 is live, R2 counted instead).
+func TestItemExtraCapacityFailedReplacementRetryExactMaxOneCase(t *testing.T) {
+	ctx := context.Background()
+	s, err := Open(filepath.Join(t.TempDir(), "failed-retry-max1.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	by := api.Caller{Node: "fixture", User: "owner"}
+	one := 1
+	task, err := s.CreateTask(ctx, api.CreateTaskRequest{Name: "Failed retry max1", Orchestrator: "lead", AllowAgentSpawn: true, MaxNewAgents: &one}, by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lead, err := s.AddAgent(ctx, task.ID, api.AddAgentRequest{Name: "lead", Host: "fixture", Session: "lead", Runtime: "codex"}, by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	item, err := s.CreateWorkItem(ctx, task.ID, api.CreateWorkItemRequest{Kind: "bug", Title: "Failed retry max1 item", AgentID: lead.ID, RequestID: "failed-retry-max1-item"}, by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bind := func(name, replaces string) (api.Agent, error) {
+		if replaces == "" {
+			return authorIntentAndBind(t, s, task, item, name, lead.ID, lead, api.TeamRoleExtra, by)
+		}
+		order := contextLinkedMessage(t, s, task, item, name+" order", name+"-order", nil)
+		req := &api.AgentWorkItemRequest{ItemTaskID: task.ID, ItemID: item.ID, ItemRevision: item.Revision, WorkOrderMessage: api.MessageReference{TaskID: task.ID, Seq: order.Seq}, ReplacesAgentID: replaces}
+		req.ContextBundle = syntheticPreparedContext(t, item, req.WorkOrderMessage, syntheticHistory(item, order))
+		return s.AddAgent(ctx, task.ID, api.AddAgentRequest{Name: name, Host: "fixture", Session: name, Runtime: "codex", ParentAgentID: lead.ID, WorkItem: req}, by)
+	}
+	e, err := bind("e", "")
+	if err != nil {
+		t.Fatalf("E rejected: %v", err)
+	}
+	if _, err = s.PostEvent(ctx, task.ID, api.PostEventRequest{AgentID: e.ID, RunID: e.RunID, Kind: api.EventExited}, by); err != nil {
+		t.Fatal(err)
+	}
+	r1, err := bind("r1", e.ID)
+	if err != nil {
+		t.Fatalf("R1 replacement rejected: %v", err)
+	}
+	if _, err = s.CloseAgent(ctx, r1.ID, by); err != nil {
+		t.Fatal(err)
+	}
+	// E reverts to counting itself; the single slot is still occupied. F
+	// must be rejected -- there is no genuinely free slot.
+	if _, err = bind("f", ""); !errors.Is(err, api.ErrAgentSpawnLimit) {
+		t.Fatalf("F should be rejected at the exact max=1 ceiling after R1 closed: %v", err)
+	}
+	r2, err := bind("r2", e.ID)
+	if err != nil {
+		t.Fatalf("valid retry R2 should still be admitted (slot-neutral, no ceiling breach): %v", err)
+	}
+	if r2.WorkItem == nil || r2.WorkItem.TeamRole != api.TeamRoleExtra {
+		t.Fatalf("R2 lost its inherited extra role: %+v", r2)
+	}
+	// Now genuinely at ceiling again (R2 = 1 of 1).
+	if _, err = bind("g", ""); !errors.Is(err, api.ErrAgentSpawnLimit) {
+		t.Fatalf("item should be at its ceiling after R2: %v", err)
+	}
+}
+
+// TestItemExtraCapacityConcurrentDuplicateReplacementOnlyOneSucceeds
+// addresses independent review #2300/#2771/#2840 finding 1 with an actual
+// concurrency test (previously only proved by sequential code inspection):
+// two concurrent replacement attempts naming the SAME exited predecessor
+// must not both succeed -- at most one live successor may exist for a given
+// predecessor at a time.
+func TestItemExtraCapacityConcurrentDuplicateReplacementOnlyOneSucceeds(t *testing.T) {
+	ctx := context.Background()
+	s, err := Open(filepath.Join(t.TempDir(), "concurrent-duplicate-replacement.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	by := api.Caller{Node: "fixture", User: "owner"}
+	two := 2
+	task, err := s.CreateTask(ctx, api.CreateTaskRequest{Name: "Concurrent duplicate replacement", Orchestrator: "lead", AllowAgentSpawn: true, MaxNewAgents: &two}, by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lead, err := s.AddAgent(ctx, task.ID, api.AddAgentRequest{Name: "lead", Host: "fixture", Session: "lead", Runtime: "codex"}, by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	item, err := s.CreateWorkItem(ctx, task.ID, api.CreateWorkItemRequest{Kind: "bug", Title: "Concurrent duplicate replacement item", AgentID: lead.ID, RequestID: "concurrent-duplicate-replacement-item"}, by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	e, err := authorIntentAndBind(t, s, task, item, "e", lead.ID, lead, api.TeamRoleExtra, by)
+	if err != nil {
+		t.Fatalf("E rejected: %v", err)
+	}
+	if _, err = s.PostEvent(ctx, task.ID, api.PostEventRequest{AgentID: e.ID, RunID: e.RunID, Kind: api.EventExited}, by); err != nil {
+		t.Fatal(err)
+	}
+	const attempts = 8
+	var wg sync.WaitGroup
+	results := make(chan error, attempts)
+	for i := 0; i < attempts; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			name := fmt.Sprintf("r%d", i)
+			order := contextLinkedMessage(t, s, task, item, name+" order", name+"-order", nil)
+			req := &api.AgentWorkItemRequest{ItemTaskID: task.ID, ItemID: item.ID, ItemRevision: item.Revision, WorkOrderMessage: api.MessageReference{TaskID: task.ID, Seq: order.Seq}, ReplacesAgentID: e.ID}
+			req.ContextBundle = syntheticPreparedContext(t, item, req.WorkOrderMessage, syntheticHistory(item, order))
+			_, err := s.AddAgent(ctx, task.ID, api.AddAgentRequest{Name: name, Host: "fixture", Session: name, Runtime: "codex", ParentAgentID: lead.ID, WorkItem: req}, by)
+			results <- err
+		}(i)
+	}
+	wg.Wait()
+	close(results)
+	succeeded := 0
+	for err := range results {
+		if err == nil {
+			succeeded++
+		} else if !errors.Is(err, api.ErrConflict) {
+			t.Fatalf("unexpected error from a concurrent duplicate replacement attempt: %v", err)
+		}
+	}
+	if succeeded != 1 {
+		t.Fatalf("exactly one concurrent replacement of the same predecessor should succeed, got %d", succeeded)
+	}
+}
+
 // TestAllocationIntentRequiredMatchedAndConsumedOnce addresses independent
 // review #2300/#2771/#2840 finding 5, as clarified by #2844/#2850/#2867/#2870:
 // a fresh parented member/extra admission must be authorized by a durable,
@@ -974,6 +1113,66 @@ func TestAllocationIntentRequiredMatchedAndConsumedOnce(t *testing.T) {
 	changedRetry.TeamRole = api.TeamRoleExtra
 	if _, err = s.CreateAllocationIntent(ctx, task.ID, changedRetry, by); !errors.Is(err, api.ErrConflict) {
 		t.Fatalf("a retry request-id reused with a different payload should conflict: %v", err)
+	}
+
+	// Independent review #3003/#3010 finding 1: the intended launcher is
+	// part of the authorization tuple. A default (no explicit delegate)
+	// intent authorizes only the author itself as launcher -- any other
+	// active agent (even one otherwise capable of parenting a launch)
+	// holding the preallocated identity must be rejected.
+	wrongLauncherID := api.NewID("agt")
+	if _, err = s.CreateAllocationIntent(ctx, task.ID, intentReq(wrongLauncherID, api.TeamRoleMember, api.NewID("run")), by); err != nil {
+		t.Fatal(err)
+	}
+	wrongLauncherReq := addReq(wrongLauncherID)
+	wrongLauncherReq.ParentAgentID = outsider.ID
+	if _, err = s.AddAgent(ctx, task.ID, wrongLauncherReq, by); !errors.Is(err, api.ErrConflict) {
+		t.Fatalf("an actual launcher other than the intent's expected launcher should be rejected: %v", err)
+	}
+	// An explicit delegate distinct from the author is honored: the named
+	// delegate (here, outsider) -- and only that delegate -- may consume it.
+	delegateID := api.NewID("agt")
+	delegateIntent := intentReq(delegateID, api.TeamRoleMember, api.NewID("run"))
+	delegateIntent.ExpectedLauncherAgentID = outsider.ID
+	delegateIntent.ExpectedLauncherRunID = outsider.RunID
+	if _, err = s.CreateAllocationIntent(ctx, task.ID, delegateIntent, by); err != nil {
+		t.Fatalf("authoring an intent with an explicit live delegate launcher should succeed: %v", err)
+	}
+	delegateWrongLauncher := addReq(delegateID)
+	// ParentAgentID defaults to lead via addReq; that is the author, but NOT
+	// the delegated launcher this intent actually names.
+	if _, err = s.AddAgent(ctx, task.ID, delegateWrongLauncher, by); !errors.Is(err, api.ErrConflict) {
+		t.Fatalf("launching as the author when a different delegate was named should be rejected: %v", err)
+	}
+	delegateCorrectLauncher := addReq(delegateID)
+	delegateCorrectLauncher.ParentAgentID = outsider.ID
+	if _, err = s.AddAgent(ctx, task.ID, delegateCorrectLauncher, by); err != nil {
+		t.Fatalf("launching as the exact named delegate should be admitted: %v", err)
+	}
+	// Authoring an intent naming an unknown or off-task delegate is rejected
+	// at authoring time, not deferred to a confusing failure at admission.
+	unknownDelegate := intentReq(api.NewID("agt"), api.TeamRoleMember, api.NewID("run"))
+	unknownDelegate.ExpectedLauncherAgentID = api.NewID("agt")
+	unknownDelegate.ExpectedLauncherRunID = api.NewID("run")
+	if _, err = s.CreateAllocationIntent(ctx, task.ID, unknownDelegate, by); err == nil {
+		t.Fatal("authoring an intent naming an unknown delegate launcher should be rejected")
+	}
+
+	// Independent review #3003/#3010 additional gap: a retired author is a
+	// real, existing agent (unlike closed/exited), but must still be
+	// rejected -- retirement is not a live acting session.
+	retiredLead, err := s.AddAgent(ctx, task.ID, api.AddAgentRequest{AgentID: api.NewID("agt"), Name: "retired-handler", Host: "fixture", Session: "retired-handler", Runtime: "codex", Role: api.AgentRoleDatabaseHandler}, by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	retiredStatus := api.AgentRetired
+	if _, err = s.UpdateAgent(ctx, retiredLead.ID, api.UpdateAgentRequest{Status: &retiredStatus, RunID: retiredLead.RunID}, by); err != nil {
+		t.Fatal(err)
+	}
+	retiredAuthorIntent := intentReq(api.NewID("agt"), api.TeamRoleMember, api.NewID("run"))
+	retiredAuthorIntent.AuthorAgentID, retiredAuthorIntent.AuthorRunID = retiredLead.ID, retiredLead.RunID
+	if _, err = s.CreateAllocationIntent(ctx, task.ID, retiredAuthorIntent, by); !errors.Is(err, api.ErrConflict) {
+		t.Fatalf("a retired author should be rejected exactly like a closed/exited one: %v", err)
 	}
 }
 

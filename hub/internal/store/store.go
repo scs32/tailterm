@@ -581,8 +581,9 @@ AND NOT EXISTS (SELECT 1 FROM agent_work_item_bindings b WHERE b.agent_id=a.id)`
 		if loaded == nil || loaded.ConsumedAt != nil {
 			return a, fmt.Errorf("%w: no unconsumed allocation intent recorded for this agent identity", api.ErrConflict)
 		}
-		if loaded.TargetTaskID == "" || loaded.ContextDigest == "" || loaded.AuthorAgentID == "" || loaded.AuthorRunID == "" || loaded.ExpectedRunID == "" {
-			return a, fmt.Errorf("%w: allocation intent predates the required expected-run/context/author binding and cannot authorize admission", api.ErrConflict)
+		if loaded.TargetTaskID == "" || loaded.ContextDigest == "" || loaded.AuthorAgentID == "" || loaded.AuthorRunID == "" || loaded.ExpectedRunID == "" ||
+			loaded.ExpectedLauncherAgentID == "" || loaded.ExpectedLauncherRunID == "" {
+			return a, fmt.Errorf("%w: allocation intent predates the required expected-run/context/author/launcher binding and cannot authorize admission", api.ErrConflict)
 		}
 		contextDigestBytes := sha256.Sum256(req.WorkItem.ContextBundle)
 		contextDigest := hex.EncodeToString(contextDigestBytes[:])
@@ -590,6 +591,20 @@ AND NOT EXISTS (SELECT 1 FROM agent_work_item_bindings b WHERE b.agent_id=a.id)`
 			loaded.ItemRevision != req.WorkItem.ItemRevision || loaded.WorkOrderMessage != req.WorkItem.WorkOrderMessage ||
 			loaded.ContextDigest != contextDigest || loaded.TeamRole != resolvedTeamRole {
 			return a, fmt.Errorf("%w: recorded allocation intent does not match this admission's exact target task/item/revision/order/context/team role", api.ErrConflict)
+		}
+		// Independent review #3003/#3010 finding 1: the actual launcher
+		// performing this admission (ParentAgentID and its live run) must
+		// match the intent's expected launcher exactly -- not merely be
+		// recorded after the fact once it has already consumed the intent.
+		// Any other active agent on the task holding the preallocated
+		// --agent-id could otherwise consume an intent it was never
+		// authorized to launch.
+		var actualLauncherRunID string
+		if err := tx.QueryRowContext(ctx, `SELECT run_id FROM agents WHERE id=?`, req.ParentAgentID).Scan(&actualLauncherRunID); err != nil {
+			return a, err
+		}
+		if loaded.ExpectedLauncherAgentID != req.ParentAgentID || loaded.ExpectedLauncherRunID != actualLauncherRunID {
+			return a, fmt.Errorf("%w: this launcher is not the one authorized by the recorded allocation intent", api.ErrConflict)
 		}
 		intent = loaded
 		a.RunID = intent.ExpectedRunID

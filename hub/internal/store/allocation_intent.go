@@ -43,6 +43,19 @@ func (s *Store) CreateAllocationIntent(ctx context.Context, taskID string, req a
 		!api.ValidID(req.AuthorAgentID, "agt") || !validRunID(req.AuthorRunID) || !validRunID(req.ExpectedRunID) {
 		return api.AllocationIntent{}, api.ErrInvalid
 	}
+	// Independent review #3003/#3010 finding 1: the intended launcher is
+	// part of the authorization tuple, not merely whichever ParentAgentID
+	// happens to consume the intent afterward. When no explicit delegate is
+	// named, the author is presumed the intended launcher -- the common
+	// case where the same handler/lead session both authors the intent and
+	// performs the launch.
+	if req.ExpectedLauncherAgentID == "" && req.ExpectedLauncherRunID == "" {
+		req.ExpectedLauncherAgentID = req.AuthorAgentID
+		req.ExpectedLauncherRunID = req.AuthorRunID
+	}
+	if !api.ValidID(req.ExpectedLauncherAgentID, "agt") || !validRunID(req.ExpectedLauncherRunID) {
+		return api.AllocationIntent{}, api.ErrInvalid
+	}
 	if req.RequestID != "" {
 		existing, err := loadAllocationIntentByRetryKey(s.db, ctx, taskID, req.AuthorAgentID, req.AuthorRunID, req.RequestID)
 		if err != nil {
@@ -51,7 +64,8 @@ func (s *Store) CreateAllocationIntent(ctx context.Context, taskID string, req a
 		if existing != nil {
 			if existing.AgentID != req.AgentID || existing.ItemTaskID != req.ItemTaskID || existing.ItemID != req.ItemID ||
 				existing.ItemRevision != req.ItemRevision || existing.WorkOrderMessage != req.WorkOrderMessage ||
-				existing.ContextDigest != req.ContextDigest || existing.TeamRole != req.TeamRole || existing.ExpectedRunID != req.ExpectedRunID {
+				existing.ContextDigest != req.ContextDigest || existing.TeamRole != req.TeamRole || existing.ExpectedRunID != req.ExpectedRunID ||
+				existing.ExpectedLauncherAgentID != req.ExpectedLauncherAgentID || existing.ExpectedLauncherRunID != req.ExpectedLauncherRunID {
 				return api.AllocationIntent{}, fmt.Errorf("%w: retry request-id reused with a different allocation intent payload", api.ErrConflict)
 			}
 			// Identical retry: durable readback of the exact prior outcome,
@@ -91,8 +105,32 @@ func (s *Store) CreateAllocationIntent(ctx context.Context, taskID string, req a
 		return api.AllocationIntent{}, err
 	}
 	authorized := authorRole == api.AgentRoleDatabaseHandler || (t.Orchestrator != "" && strings.EqualFold(authorName, t.Orchestrator))
-	if authorTask != taskID || authorRun != req.AuthorRunID || authorStatus == api.AgentClosed || authorStatus == api.AgentExited || !authorized {
+	// Independent review #3003/#3010 additional gap: a retired author was
+	// previously accepted because only closed/exited status was checked.
+	// Retirement disables inbox wake-ups but is not a live, currently
+	// acting session either -- an authoring call from a retired identity is
+	// rejected exactly like a closed/exited one.
+	if authorTask != taskID || authorRun != req.AuthorRunID || authorStatus == api.AgentClosed || authorStatus == api.AgentExited || authorStatus == api.AgentRetired || !authorized {
 		return api.AllocationIntent{}, fmt.Errorf("%w: author agent/run is not a current authorized database handler or orchestrator on this task", api.ErrConflict)
+	}
+	// The intended launcher, when an explicit delegate distinct from the
+	// author, must itself be a live, non-closed/exited/retired agent on
+	// this exact target task -- the same liveness bar as the author,
+	// though it need not hold database_handler/Orchestrator authority
+	// itself (a lead may delegate the actual spawn to any current team
+	// member it names).
+	if req.ExpectedLauncherAgentID != req.AuthorAgentID || req.ExpectedLauncherRunID != req.AuthorRunID {
+		var launcherTask, launcherRun, launcherStatus string
+		if err := s.db.QueryRowContext(ctx, `SELECT task_id,run_id,status FROM agents WHERE id=?`, req.ExpectedLauncherAgentID).Scan(&launcherTask, &launcherRun, &launcherStatus); err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return api.AllocationIntent{}, fmt.Errorf("%w: unknown intended launcher agent identity", api.ErrInvalid)
+			}
+			return api.AllocationIntent{}, err
+		}
+		if launcherTask != taskID || launcherRun != req.ExpectedLauncherRunID ||
+			launcherStatus == api.AgentClosed || launcherStatus == api.AgentExited || launcherStatus == api.AgentRetired {
+			return api.AllocationIntent{}, fmt.Errorf("%w: intended launcher agent/run is not a current live agent on this task", api.ErrConflict)
+		}
 	}
 	// ExpectedRunID must be unique: not already an agent's run, and not
 	// already recorded on another intent (consumed or not).
@@ -111,10 +149,10 @@ func (s *Store) CreateAllocationIntent(ctx context.Context, taskID string, req a
 	}
 	now := s.now()
 	_, err = s.db.ExecContext(ctx, `INSERT INTO agent_allocation_intents
-(agent_id,item_task_id,item_id,item_revision,work_order_task_id,work_order_message_seq,team_role,target_task_id,context_digest,author_agent_id,author_run_id,expected_run_id,request_id,created_by_node,created_by_user,created_at,consumed_at,consumed_by_run_id,launcher_agent_id,launcher_run_id)
-VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'','','','')`,
+(agent_id,item_task_id,item_id,item_revision,work_order_task_id,work_order_message_seq,team_role,target_task_id,context_digest,author_agent_id,author_run_id,expected_run_id,expected_launcher_agent_id,expected_launcher_run_id,request_id,created_by_node,created_by_user,created_at,consumed_at,consumed_by_run_id,launcher_agent_id,launcher_run_id)
+VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'','','','')`,
 		req.AgentID, req.ItemTaskID, req.ItemID, req.ItemRevision, req.WorkOrderMessage.TaskID, req.WorkOrderMessage.Seq, req.TeamRole,
-		req.TargetTaskID, req.ContextDigest, req.AuthorAgentID, req.AuthorRunID, req.ExpectedRunID, req.RequestID, by.Node, by.User, ts(now))
+		req.TargetTaskID, req.ContextDigest, req.AuthorAgentID, req.AuthorRunID, req.ExpectedRunID, req.ExpectedLauncherAgentID, req.ExpectedLauncherRunID, req.RequestID, by.Node, by.User, ts(now))
 	if err != nil {
 		if isUniqueConstraintErr(err) {
 			return api.AllocationIntent{}, fmt.Errorf("%w: an allocation intent already exists for this agent identity", api.ErrConflict)
@@ -124,19 +162,21 @@ VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'','','','')`,
 	return api.AllocationIntent{
 		AgentID: req.AgentID, TargetTaskID: req.TargetTaskID, ItemTaskID: req.ItemTaskID, ItemID: req.ItemID, ItemRevision: req.ItemRevision,
 		WorkOrderMessage: req.WorkOrderMessage, ContextDigest: req.ContextDigest, TeamRole: req.TeamRole,
-		AuthorAgentID: req.AuthorAgentID, AuthorRunID: req.AuthorRunID, ExpectedRunID: req.ExpectedRunID, RequestID: req.RequestID,
+		AuthorAgentID: req.AuthorAgentID, AuthorRunID: req.AuthorRunID, ExpectedRunID: req.ExpectedRunID,
+		ExpectedLauncherAgentID: req.ExpectedLauncherAgentID, ExpectedLauncherRunID: req.ExpectedLauncherRunID, RequestID: req.RequestID,
 		CreatedBy: by, CreatedAt: now,
 	}, nil
 }
 
-const allocationIntentCols = `agent_id,item_task_id,item_id,item_revision,work_order_task_id,work_order_message_seq,team_role,target_task_id,context_digest,author_agent_id,author_run_id,expected_run_id,request_id,created_by_node,created_by_user,created_at,consumed_at,consumed_by_run_id,launcher_agent_id,launcher_run_id`
+const allocationIntentCols = `agent_id,item_task_id,item_id,item_revision,work_order_task_id,work_order_message_seq,team_role,target_task_id,context_digest,author_agent_id,author_run_id,expected_run_id,expected_launcher_agent_id,expected_launcher_run_id,request_id,created_by_node,created_by_user,created_at,consumed_at,consumed_by_run_id,launcher_agent_id,launcher_run_id`
 
 func scanAllocationIntent(row interface{ Scan(...any) error }) (*api.AllocationIntent, error) {
 	var in api.AllocationIntent
 	var created, consumed string
 	err := row.Scan(
 		&in.AgentID, &in.ItemTaskID, &in.ItemID, &in.ItemRevision, &in.WorkOrderMessage.TaskID, &in.WorkOrderMessage.Seq,
-		&in.TeamRole, &in.TargetTaskID, &in.ContextDigest, &in.AuthorAgentID, &in.AuthorRunID, &in.ExpectedRunID, &in.RequestID,
+		&in.TeamRole, &in.TargetTaskID, &in.ContextDigest, &in.AuthorAgentID, &in.AuthorRunID, &in.ExpectedRunID,
+		&in.ExpectedLauncherAgentID, &in.ExpectedLauncherRunID, &in.RequestID,
 		&in.CreatedBy.Node, &in.CreatedBy.User, &created, &consumed, &in.ConsumedByRunID, &in.LauncherAgentID, &in.LauncherRunID,
 	)
 	if errors.Is(err, sql.ErrNoRows) {
