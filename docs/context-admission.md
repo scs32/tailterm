@@ -1,3 +1,135 @@
+# Combined Capacity/context integration — prepared September 12
+
+Bug `wi_7e220de54deaef33` revision 1, original order **#3022**, preserved
+Start #3041 / `qrr_751e17bce76f70c3`; integration amendment **#3126**, context
+transport correction **#3134/#3138**. Worker/run/context binding below remains
+unchanged. The complete dependency handoff #3127 was read and verified at
+SHA-256 `ffaae7e402e6db0c04fbfc0e149ddad115c9da7777db95ffdda75cb9ed01e0ae`.
+
+Accepted Capacity base `a8e78594ec01e060c8196859e75345bc5e2c124e`
+(Bug `wi_84dafce5ad044acd` revision 1/order #2050, acceptance #3124) plus
+accepted context delta `bb12a7ad2e8cf3cb3d15475e5190433182474310` was applied
+without conflicts as `acfe537` on isolated branch `context-limit-integration-mini`.
+The final **application/source commit is
+`d64615bac01f72673c921bcfc25a541d073c2f01`**. Lead source review #3146 passed.
+This report is later documentation; it does not rebuild or change that package.
+
+## Merged boundary correction and verification
+
+The requested merged regression reproduced a real boundary mismatch: Capacity's
+CLI authored a digest of pretty-printed input, but AddAgent's RawMessage transport
+compacted it. Small and >152,973-byte whitespace/HTML/multibyte fixtures both
+failed digest parity before the correction. Under #3134/#3138, only new
+allocation-intent context handling in `hub/cmd/tt/main.go` and
+`hub/cmd/tt/work_context.go` now uses the shared bounded UTF-8/JSON reader and
+lossless `json.Compact` before hashing. Keys, numeric and escape lexemes, strings
+and full history survive; the raw frozen source/journal is not rewritten.
+
+Actual CLI intent-create → real isolated hub → AddAgent → context readback now
+passes. The fixture deliberately commits an intent and drops its HTTP reply;
+the unchanged keyed retry succeeds, including later retry after consumption.
+Readback proves the original expected run, intended/actual launcher, classification,
+context digest and bytes. A repeated admission retains its existing 409 behavior,
+and exact agent readback/roster proves there is still one worker. Existing
+raw-digest pretty intents are unchanged and fail safely rather than being
+rewritten; authoring those old tuples requires separate authorized recovery or
+fresh preparation. File and inline inputs both reject oversized contexts before
+hub contact. No Capacity policy, tuple schema, retirement, audit format or quota
+behavior was changed.
+
+Evidence on the merged source:
+
+- JavaScript **178/178**; full Go API/server/store/spawn packages pass.
+- Sanitized focused CLI **race** checks cover the new actual authoring/retry/
+  readback path, legacy-intent immutability and bounds, plus Capacity's full-tuple
+  generated guidance and supported/unsupported/incompatible capability versions.
+- Chromium and WebKit real isolated-hub tests pass the large-context committed
+  launch response loss, exact identity recovery, encrypted journal reload,
+  unchanged history on partial retry, full 23-message source and readback.
+- Mini Darwin arm64 passes actual **external synthetic executable argv** delivery
+  at 256 KiB for apostrophe-heavy and multibyte input, as well as private script
+  cleanup. This exercises the OS exec boundary, not merely a helper hash.
+- Go vet, diff checks, clean source and exact static package verification pass.
+  No unrelated full CLI suite or provider test was substituted for focused checks.
+
+Two fixture assumptions were corrected without product changes: ordinary
+AddAgent requests do not use the handler-restart `ExpectedRunID` field (Capacity's
+saved intent supplies the worker run), and duplicate same-project admission
+returns 409 rather than a success replay. An initial unsanitized CLI race run
+inherited the current agent's Codex model/reasoning settings and stopped before
+capability checks; clearing all `TAILTERM_*` fixture environment made the unchanged
+checks pass. The genuine pre-fix digest failure remains in the retained evidence.
+
+## Frozen artifacts
+
+Directory, relative to the project root:
+`.build/worktrees/context-limit-integration-mini/.build/context-limit-integration-artifacts/`.
+Its `manifest.json` lists the **44 combined changed source paths**, **21 context
+delta paths**, exact binary/static hashes and test logs. It is 11,838 bytes,
+SHA-256 `7e7fe52c33458009205ddeaa9cb9768f6d4ed765f3d61a09a4190db04e622207`.
+
+| Artifact | Bytes | SHA-256 |
+| --- | ---: | --- |
+| `tailterm-hub-linux-amd64` | 27,295,906 | `801f93172221821f1f0788698724d55b92617e4e0eade9667d457643841c58b7` |
+| `tt-darwin-arm64` | 6,731,794 | `908034fcd72a13d65d70750fa46010e4eb3f68fda89c65e1312dcb1b38dc7b91` |
+| `dist-static/release.json` | 14,861 | `c8583c9f99363432fb63f4f405a757ab201173a4380f493daa6c21ae75ba3ae9` |
+
+The retained static package verifies **82 assets** against its clean-source
+release manifest. It reuses the unchanged cached WASM and dependency/license
+inputs; speech source/part hashes are verified by the packager. No test WASM or
+provider/live fixture is part of the package.
+
+Native builds initially received the outer repository's incorrect VCS stamp
+(`8a37919`, modified=true) from the nested worktree. Those generated binaries
+were replaced before handoff. The final binaries were built from the clean,
+standalone local clone `/tmp/tailterm-context-release-d64615b`; both report exact
+`vcs.revision=d64615bac01f72673c921bcfc25a541d073c2f01` and
+`vcs.modified=false`. The rejected hashes and final metadata are retained in the
+artifact manifest/evidence. No installed executable was changed.
+
+## Coordinated rollout and rollback plan — not executed
+
+1. Obtain a separately recorded release order and saved combined acceptance.
+   Qualify the actual Air launch host with synthetic argv/CLI fixtures; **Air is
+   still unverified**. Mini qualification does not qualify Air, Linux launch
+   hosts, real provider CLIs, native Safari or owner devices.
+2. Schedule a coordinated hub + all launch-capable CLI + frontend window.
+   Fresh parented item-bound launches fail closed while a side lags; retain
+   saved plans and exact identities, and never relabel or discard them to make
+   a mixed version launch succeed. Existing sessions are not regenerated.
+3. Through the database handler, obtain a verified consistent online SQLite
+   backup before the additive Capacity migrations; preserve state, token and
+   profile identity together. No database copy or migration was performed here.
+4. Use the existing TrueNAS middleware/TCP deployment path for the exact Linux
+   hub binary, with a unique immutable release directory. Atomically install the
+   matching Darwin CLI on each qualified host, retaining exact previous binaries.
+   No Tailscale, listener or relay redesign is required or authorized by this plan.
+5. Publish the exact retained static package to Cloudflare project **tailos** /
+   **https://tailos.tailarr.com**, and atomically activate identical bytes on
+   Mini **http://127.0.0.1:4318**, preserving **PID60799/PPID1**. Do not use the
+   old-site `npm run deploy:static`; the handoff's explicit TailOS command applies.
+6. Verify deployed manifests, binaries, capability versions, additive data
+   integrity and synthetic supported-host launch behavior, then have the handler
+   save release evidence and acceptance. No live work-item test fixture is needed.
+
+Rollback must preserve all additive Capacity allocation intent/binding data and
+full context journals. Keep compatible hub/CLI enforcement while new intents or
+large journals exist; an old hub/CLI pair cannot enforce the new allocation
+contract and old frontends cannot restore larger journals. Prefer a compatible
+corrective build. A coordinated rollback requires a separately approved launch
+pause/recovery plan and exact previously inventoried binaries/assets; it must
+not silently restore weaker admission. Database backups are disaster recovery
+only and must not overwrite newer work as a routine code rollback. The existing
+Flashes frontend rollback inventory remains in `docs/handoff.md`; no new rollback
+activation happened here.
+
+Remaining dependencies: independent package review, handler saved acceptance,
+Air qualification, and an explicit root integration/release order. No root merge,
+installation, deployment, live record, network/relay/Tailscale/service or preview
+mutation occurred. The original builder evidence and historical fix follow.
+
+---
+
 # Complete immutable context admission — September 12 candidate
 
 Bug `wi_7e220de54deaef33` revision 1, bounded order **#3022**, package #3025.
