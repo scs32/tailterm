@@ -6,6 +6,7 @@ package main
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -595,9 +596,20 @@ func selfPath() string {
 // the handler/lead BEFORE the worker's own tt spawn --team-role declares
 // the same classification -- not derived from execution Start/Queue state.
 func cmdAllocationIntent(e env, args []string) error {
-	if len(args) < 1 || args[0] != "create" {
-		return errors.New("usage: tt allocation-intent create --agent-id ID --work-item ID --work-item-revision N --work-order-task ID --work-order-message N --team-role member|extra")
+	if len(args) < 1 {
+		return errors.New("usage: tt allocation-intent create|get ...")
 	}
+	switch args[0] {
+	case "create":
+		return cmdAllocationIntentCreate(e, args[1:])
+	case "get":
+		return cmdAllocationIntentGet(e, args[1:])
+	default:
+		return fmt.Errorf("unknown allocation-intent command %q", args[0])
+	}
+}
+
+func cmdAllocationIntentCreate(e env, args []string) error {
 	fs := flag.NewFlagSet("allocation-intent create", flag.ExitOnError)
 	agentID := fs.String("agent-id", "", "preallocated agent identity this intent authorizes (required)")
 	workItemTask := fs.String("work-item-task", "", "project owning the bug or feature (default: --task)")
@@ -606,18 +618,40 @@ func cmdAllocationIntent(e env, args []string) error {
 	workOrderTask := fs.String("work-order-task", "", "project containing the work-order message (default: work-item project)")
 	workOrderMessage := fs.Int64("work-order-message", 0, "recorded work-order message sequence (required)")
 	teamRole := fs.String("team-role", "", "intended classification: member or extra (required)")
+	workContextFile := fs.String("work-context-file", "", "the exact prepared context bundle the launch will use (required, one of file/json -- its sha256 becomes the bound context digest)")
+	workContextJSON := fs.String("work-context-json", "", "same as --work-context-file, inline")
+	expectedRunID := fs.String("expected-run-id", "", "preallocated run id this intent authorizes (default: freshly generated)")
+	requestID := fs.String("request-id", "", "stable retry key: an identical repeat returns the same record, even after consumption")
 	task := fs.String("task", e.task, "task id")
 	asJSON := fs.Bool("json", false, "print the intent record as JSON")
-	_ = fs.Parse(args[1:])
+	_ = fs.Parse(args)
 	if !api.ValidID(*agentID, "agt") || *workItemID == "" || *workItemRevision < 1 || *workOrderMessage < 1 ||
-		(*teamRole != api.TeamRoleMember && *teamRole != api.TeamRoleExtra) {
-		return fmt.Errorf("allocation-intent create requires --agent-id, --work-item, --work-item-revision, --work-order-message and --team-role %s or %s", api.TeamRoleMember, api.TeamRoleExtra)
+		(*teamRole != api.TeamRoleMember && *teamRole != api.TeamRoleExtra) || (*workContextFile == "") == (*workContextJSON == "") {
+		return fmt.Errorf("allocation-intent create requires --agent-id, --work-item, --work-item-revision, --work-order-message, --team-role %s or %s, and exactly one of --work-context-file/--work-context-json", api.TeamRoleMember, api.TeamRoleExtra)
+	}
+	if e.agent == "" || e.runID == "" {
+		return errors.New("allocation-intent create requires an agent session identity (author agent/run); this session has none")
 	}
 	if *workItemTask == "" {
 		*workItemTask = *task
 	}
 	if *workOrderTask == "" {
 		*workOrderTask = *workItemTask
+	}
+	contextData := []byte(*workContextJSON)
+	if *workContextFile != "" {
+		var readErr error
+		contextData, readErr = os.ReadFile(*workContextFile)
+		if readErr != nil {
+			return fmt.Errorf("read prepared work-item context: %w", readErr)
+		}
+	}
+	if !json.Valid(contextData) {
+		return errors.New("prepared work-item context is not valid JSON")
+	}
+	digest := sha256.Sum256(contextData)
+	if *expectedRunID == "" {
+		*expectedRunID = api.NewID("run")
 	}
 	c, err := e.client(10 * time.Second)
 	if err != nil {
@@ -626,8 +660,9 @@ func cmdAllocationIntent(e env, args []string) error {
 	ctx, cancel := ctxTimeout(10 * time.Second)
 	defer cancel()
 	in, err := c.CreateAllocationIntent(ctx, *task, api.CreateAllocationIntentRequest{
-		AgentID: *agentID, ItemTaskID: *workItemTask, ItemID: *workItemID, ItemRevision: *workItemRevision,
-		WorkOrderMessage: api.MessageReference{TaskID: *workOrderTask, Seq: *workOrderMessage}, TeamRole: *teamRole,
+		AgentID: *agentID, TargetTaskID: *task, ItemTaskID: *workItemTask, ItemID: *workItemID, ItemRevision: *workItemRevision,
+		WorkOrderMessage: api.MessageReference{TaskID: *workOrderTask, Seq: *workOrderMessage}, ContextDigest: hex.EncodeToString(digest[:]),
+		TeamRole: *teamRole, AuthorAgentID: e.agent, AuthorRunID: e.runID, ExpectedRunID: *expectedRunID, RequestID: *requestID,
 	})
 	if err != nil {
 		return err
@@ -636,7 +671,38 @@ func cmdAllocationIntent(e env, args []string) error {
 		printJSON(in)
 		return nil
 	}
-	fmt.Printf("recorded allocation intent for %s: item %s@%d, team-role %s\n", in.AgentID, in.ItemID, in.ItemRevision, in.TeamRole)
+	fmt.Printf("recorded allocation intent for %s: item %s@%d, team-role %s, expected-run-id %s\n", in.AgentID, in.ItemID, in.ItemRevision, in.TeamRole, in.ExpectedRunID)
+	return nil
+}
+
+func cmdAllocationIntentGet(e env, args []string) error {
+	fs := flag.NewFlagSet("allocation-intent get", flag.ExitOnError)
+	agentID := fs.String("agent-id", "", "agent identity to read back (required)")
+	task := fs.String("task", e.task, "task id")
+	asJSON := fs.Bool("json", false, "print the intent record as JSON")
+	_ = fs.Parse(args)
+	if !api.ValidID(*agentID, "agt") {
+		return errors.New("allocation-intent get requires --agent-id")
+	}
+	c, err := e.client(10 * time.Second)
+	if err != nil {
+		return err
+	}
+	ctx, cancel := ctxTimeout(10 * time.Second)
+	defer cancel()
+	in, err := c.GetAllocationIntent(ctx, *task, *agentID)
+	if err != nil {
+		return err
+	}
+	if *asJSON {
+		printJSON(in)
+		return nil
+	}
+	status := "unconsumed"
+	if in.ConsumedAt != nil {
+		status = "consumed by run " + in.ConsumedByRunID
+	}
+	fmt.Printf("allocation intent for %s: item %s@%d, team-role %s, expected-run-id %s, %s\n", in.AgentID, in.ItemID, in.ItemRevision, in.TeamRole, in.ExpectedRunID, status)
 	return nil
 }
 
@@ -841,6 +907,24 @@ func cmdSpawn(e env, args []string) error {
 	detail, err := c.GetTask(ctx, *task)
 	if err != nil {
 		return err
+	}
+	if itemFlagCount > 0 && *replacesAgent == "" && e.agent != "" {
+		// Independent review #2300/#2771/#2840/#2916, findings 3/6: a
+		// mixed-version deployment must fail closed and explicitly, not
+		// silently. Before attempting a fresh parented item-bound launch,
+		// confirm the hub actually supports the allocation-intent
+		// requirement this exact candidate's Store.AddAgent enforces. An
+		// old hub either omits the field or reports Supported=false; either
+		// way, proceeding would either 404 confusingly at admission or
+		// (on some future hub shape) silently fall back to weaker
+		// accounting -- neither is acceptable. A coordinated rollout
+		// window where the hub AND every launch CLI are upgraded together
+		// is the actual supported unit; this check only detects the
+		// mismatch honestly, it does not itself coordinate the rollout.
+		caps, capErr := c.Capabilities(ctx)
+		if capErr != nil || !caps.AllocationIntent.Supported {
+			return fmt.Errorf("hub does not support allocation-intent (required for a fresh parented item-bound launch); upgrade the hub before this CLI can launch parented item-bound work here: %v", capErr)
+		}
 	}
 	launcherSelfPath := selfPath()
 	briefing := agentTaskBriefingForLaunch(detail.Task, *name, *role, launcherSelfPath, detail.Agents, *plannedTeamMembers)

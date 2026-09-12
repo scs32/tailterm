@@ -38,7 +38,21 @@ type Capabilities struct {
 	Policy struct {
 		MessageAudit string `json:"messageAudit"`
 	} `json:"policy"`
+	AllocationIntent struct {
+		Supported bool  `json:"supported"`
+		Versions  []int `json:"versions"`
+	} `json:"allocationIntent"`
 }
+
+// AllocationIntentCapabilityVersion is advertised here so a launch CLI can
+// detect, before ever attempting a fresh parented item-bound tt spawn,
+// whether the hub it is talking to supports and requires an allocation
+// intent (independent review #2300/#2771/#2840/#2916 finding 3/6): a hub
+// that predates this capability either omits the AllocationIntent section
+// entirely or returns it with Supported=false, and a corrected CLI must
+// fail closed with an explicit, actionable error rather than proceeding as
+// if the old accounting model still applied.
+const AllocationIntentCapabilityVersion = 1
 
 func CurrentCapabilities() Capabilities {
 	var out Capabilities
@@ -54,6 +68,8 @@ func CurrentCapabilities() Capabilities {
 	out.Queue.DefaultPage = DefaultQueuePage
 	out.Queue.MaxPage = MaxQueuePage
 	out.Queue.MaxPageBytes = MaxQueuePageBytes
+	out.AllocationIntent.Supported = true
+	out.AllocationIntent.Versions = []int{AllocationIntentCapabilityVersion}
 	return out
 }
 

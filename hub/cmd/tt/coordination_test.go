@@ -1,8 +1,10 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"flag"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -10,8 +12,11 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/scs32/tailterm/hub/internal/api"
+	"github.com/scs32/tailterm/hub/internal/server"
+	"github.com/scs32/tailterm/hub/internal/store"
 )
 
 func TestWrapPreservesArguments(t *testing.T) {
@@ -315,5 +320,205 @@ func TestSpawnRejectsInvalidPlannedTeamSizeBeforeContactingHub(t *testing.T) {
 	err := cmdSpawn(e, []string{"--name", "lead", "--run", "codex", "--planned-team-members", "33"})
 	if err == nil || !strings.Contains(err.Error(), "planned team members") {
 		t.Fatal(err)
+	}
+}
+
+// syntheticSpawnContextBundle builds a minimal but genuinely valid prepared
+// context bundle matching validatePreparedContextBundle's exact shape, so
+// tests exercising the mixed-version capability gate and downstream
+// allocation-intent admission fail for the reason under test, not on an
+// unrelated shallow-JSON validation error.
+func syntheticSpawnContextBundle(t *testing.T, task, item string, orderSeq int64) string {
+	t.Helper()
+	order := api.MessageReference{TaskID: task, Seq: orderSeq}
+	revision := api.WorkItemRevision{
+		ItemID: item, TaskID: task, Kind: "bug", Title: "t", Status: "open", Priority: "normal", ItemSeq: 1, Revision: 1,
+		AttributionKind: "shared_workspace_claim", ChangeKind: "created", Provenance: "native",
+	}
+	link := api.WorkItemMessageLink{
+		ItemRevision: 1, RevisionCoverage: "verified", Relationship: "primary",
+		Message: api.Message{TaskID: task, Seq: orderSeq},
+	}
+	history := map[string]any{
+		"revision":  revision,
+		"revisions": []api.WorkItemRevision{revision},
+		"messages":  []api.WorkItemMessageLink{link},
+		"coverage": api.HistoryCoverage{
+			Complete: true, ObservedCurrentRevision: 1, LatestMaterialized: 1, SnapshotCount: 1, ConversationLinks: "explicit_only",
+		},
+	}
+	data, err := json.Marshal(map[string]any{
+		"version": 1, "itemTaskId": task, "itemId": item, "itemRevision": int64(1),
+		"workOrderMessage": order, "history": history,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(data)
+}
+
+// realSpawnWorkItemAndOrder creates an actual work item and a message
+// linked to it as the primary work order, exactly as the launch flow
+// requires -- validateAgentWorkItemRequest looks both up for real, so a
+// synthetic id/seq pair (however well-formed) 404s before ever reaching the
+// allocation-intent logic these tests target.
+func realSpawnWorkItemAndOrder(t *testing.T, c *api.Client, task string) (item string, orderSeq int64) {
+	t.Helper()
+	wi, err := c.CreateWorkItem(context.Background(), task, api.CreateWorkItemRequest{Kind: "bug", Title: "t", RequestID: api.NewID("req")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	msg, err := c.PostMessage(context.Background(), task, api.PostMessageRequest{
+		Text: "work order", RequestID: api.NewID("req"),
+		WorkItems: []api.MessageWorkItem{{ItemTaskID: task, ItemID: wi.ID, ItemRevision: wi.Revision, Relationship: "primary"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return wi.ID, msg.Seq
+}
+
+// itemBoundSpawnArgs returns the flags for a fresh parented item-bound
+// launch attempt against the given task, stopping just short of ever
+// reaching tmux/spawn -- the mixed-version capability gate (independent
+// review #2300/#2771/#2840/#2916 finding 3/6) must reject before that.
+func itemBoundSpawnArgs(t *testing.T, c *api.Client, task string) []string {
+	item, orderSeq := realSpawnWorkItemAndOrder(t, c, task)
+	return []string{
+		"--name", "worker", "--run", "codex", "--task", task,
+		"--work-item", item,
+		"--work-item-task", task,
+		"--work-item-revision", "1",
+		"--work-order-task", task,
+		"--work-order-message", fmt.Sprint(orderSeq),
+		"--work-context-json", syntheticSpawnContextBundle(t, task, item, orderSeq),
+		"--team-role", "extra",
+	}
+}
+
+// newMixedVersionSpawnFixture starts a real hub server (so GetTask and
+// everything before the capability check behaves exactly as in production)
+// but lets the caller substitute the /v1/capabilities response, simulating
+// a hub that predates the AllocationIntent capability.
+func newMixedVersionSpawnFixture(t *testing.T, capsResponder func(w http.ResponseWriter, r *http.Request) bool) (*api.Client, string) {
+	t.Helper()
+	st, err := store.Open(filepath.Join(t.TempDir(), "hub.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { st.Close() })
+	handler := server.New(st, func(r *http.Request) (api.Caller, error) { return api.Caller{Node: "fixture", User: "fixture"}, nil })
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/v1/capabilities" && capsResponder(w, r) {
+			return
+		}
+		handler.ServeHTTP(w, r)
+	}))
+	t.Cleanup(srv.Close)
+	c, err := api.NewClient(srv.URL, 5*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	task, err := c.CreateTask(context.Background(), api.CreateTaskRequest{Name: "mixed version spawn test", Orchestrator: "lead"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return c, task.ID
+}
+
+// spawnLauncherAgent registers a real running agent to act as the parent
+// (--parent/e.agent) of a fresh item-bound launch attempt, since
+// Store.AddAgent validates the parent actually exists before reaching the
+// allocation-intent checks these tests target.
+func spawnLauncherAgent(t *testing.T, c *api.Client, task string) api.Agent {
+	t.Helper()
+	a, err := c.AddAgent(context.Background(), task, api.AddAgentRequest{AgentID: api.NewID("agt"), Name: "lead", Session: "lead-session", Role: api.AgentRoleDatabaseHandler, Runtime: "generic", Host: "fixture", Cwd: "/fixture"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return a
+}
+
+// TestSpawnFailsClosedAgainstHubMissingAllocationIntentCapability covers
+// direction (a) of the required mixed-version compatibility check: a
+// corrected CLI talking to an old hub whose /v1/capabilities response omits
+// the AllocationIntent section entirely (its zero value decodes to
+// Supported=false), never a real 404 -- the old hub simply doesn't know the
+// field exists. The CLI must fail closed with an explicit, actionable error
+// rather than proceeding to admission and getting a confusing rejection (or
+// worse, silently falling back to weaker accounting).
+func TestSpawnFailsClosedAgainstHubMissingAllocationIntentCapability(t *testing.T) {
+	c, task := newMixedVersionSpawnFixture(t, func(w http.ResponseWriter, r *http.Request) bool {
+		// An old hub's /v1/capabilities response has no "allocationIntent"
+		// key at all; unmarshalling that JSON into today's Capabilities
+		// struct leaves the field at its zero value (Supported: false),
+		// which is exactly what this fake reproduces.
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"schemaVersion":1,"messageAudit":{"versions":[1,2],"maxRelated":50},"auditExport":{"versions":[2,3],"maxBytes":1,"maxChunkBytes":1,"retentionSeconds":1},"queue":{"versions":[1],"defaultPage":1,"maxPage":1,"maxPageBytes":1},"policy":{"messageAudit":"observe"}}`))
+		return true
+	})
+	launcher := spawnLauncherAgent(t, c, task)
+	e := env{hub: c.Base, task: task, agent: launcher.ID}
+	err := cmdSpawn(e, itemBoundSpawnArgs(t, c, task))
+	if err == nil || !strings.Contains(err.Error(), "does not support allocation-intent") {
+		t.Fatalf("expected explicit fail-closed allocation-intent error, got %v", err)
+	}
+}
+
+// TestSpawnFailsClosedWhenHubExplicitlyReportsAllocationIntentUnsupported
+// covers a hub new enough to advertise the field but that has it disabled or
+// mid-migration (Supported: false) -- the CLI must still fail closed rather
+// than treat "field present" as "safe to proceed".
+func TestSpawnFailsClosedWhenHubExplicitlyReportsAllocationIntentUnsupported(t *testing.T) {
+	c, task := newMixedVersionSpawnFixture(t, func(w http.ResponseWriter, r *http.Request) bool {
+		caps := api.CurrentCapabilities()
+		caps.AllocationIntent.Supported = false
+		caps.AllocationIntent.Versions = nil
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(caps)
+		return true
+	})
+	launcher := spawnLauncherAgent(t, c, task)
+	e := env{hub: c.Base, task: task, agent: launcher.ID}
+	err := cmdSpawn(e, itemBoundSpawnArgs(t, c, task))
+	if err == nil || !strings.Contains(err.Error(), "does not support allocation-intent") {
+		t.Fatalf("expected explicit fail-closed allocation-intent error, got %v", err)
+	}
+}
+
+// TestSpawnProceedsPastCapabilityGateWhenHubSupportsAllocationIntent is the
+// control: against an up-to-date hub (the real, unmodified /v1/capabilities
+// handler), the new gate must not itself block a fresh parented item-bound
+// launch -- it only blocks the mixed-version mismatch. This launch still
+// fails, but for the unrelated, expected reason (no allocation intent was
+// ever authored for this candidate), proving the capability gate passed.
+func TestSpawnProceedsPastCapabilityGateWhenHubSupportsAllocationIntent(t *testing.T) {
+	c, task := newMixedVersionSpawnFixture(t, func(w http.ResponseWriter, r *http.Request) bool { return false })
+	launcher := spawnLauncherAgent(t, c, task)
+	e := env{hub: c.Base, task: task, agent: launcher.ID}
+	err := cmdSpawn(e, itemBoundSpawnArgs(t, c, task))
+	if err == nil || strings.Contains(err.Error(), "does not support allocation-intent") || !strings.Contains(err.Error(), "allocation intent") {
+		t.Fatalf("capability gate should have passed (failing only on the missing allocation intent) against an up-to-date hub, got %v", err)
+	}
+}
+
+// TestSpawnOldStyleRequestWithoutIntentRejectedByCorrectedHub covers
+// direction (b) of the required mixed-version compatibility check: an
+// old-style request (issued as if no AllocationIntent scheme existed, i.e.
+// carrying no --agent-id/preallocated intent) reaching a corrected hub. The
+// hub-side admission path (Store.AddAgent, exercised end-to-end here through
+// the real HTTP server) must reject it with an actionable error identifying
+// the missing intent, not a generic/opaque failure.
+func TestSpawnOldStyleRequestWithoutIntentRejectedByCorrectedHub(t *testing.T) {
+	c, task := newMixedVersionSpawnFixture(t, func(w http.ResponseWriter, r *http.Request) bool { return false })
+	launcher := spawnLauncherAgent(t, c, task)
+	e := env{hub: c.Base, task: task, agent: launcher.ID}
+	args := itemBoundSpawnArgs(t, c, task)
+	// Simulate the pre-AllocationIntent CLI shape: no --agent-id was ever
+	// generated or supplied, so no allocation intent could have been
+	// authored for this candidate before the launch attempt.
+	err := cmdSpawn(e, args)
+	if err == nil || !strings.Contains(err.Error(), "allocation intent") {
+		t.Fatalf("expected an actionable missing-allocation-intent rejection from the corrected hub, got %v", err)
 	}
 }
