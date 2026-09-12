@@ -1166,7 +1166,7 @@ func TestAllocationIntentRequiredMatchedAndConsumedOnce(t *testing.T) {
 		t.Fatal(err)
 	}
 	retiredStatus := api.AgentRetired
-	if _, err = s.UpdateAgent(ctx, retiredLead.ID, api.UpdateAgentRequest{Status: &retiredStatus, RunID: retiredLead.RunID}, by); err != nil {
+	if _, err = s.UpdateAgent(ctx, retiredLead.ID, api.UpdateAgentRequest{Status: &retiredStatus}, by); err != nil {
 		t.Fatal(err)
 	}
 	retiredAuthorIntent := intentReq(api.NewID("agt"), api.TeamRoleMember, api.NewID("run"))
