@@ -497,6 +497,124 @@ implementation:
   under round 2/3 remain and were independently reconfirmed present on the
   unmodified baseline this round via `git stash`).
 
+## Round 5 (review #3003/#3010, against candidate f778e37)
+
+A fourth independent review of frozen f778e37 found seven remaining gaps in
+the round-4 `AllocationIntent` implementation, all now closed:
+
+1. **Intended launcher not bound before admission**: `CreateAllocationIntentRequest`
+   had no expected-launcher fields; `Store.AddAgent` recorded whichever
+   `ParentAgentID` happened to consume the intent, rather than checking it
+   was the one authorized to. Fixed: `ExpectedLauncherAgentID`/`ExpectedLauncherRunID`
+   are now part of the authored tuple (defaulting to the author when no
+   explicit delegate is named, and validated live/on-task at authoring time
+   when a delegate is named); `Store.AddAgent` now requires the actual
+   `ParentAgentID`/its live run to match the intent's expected launcher
+   exactly before consuming it, and a legacy intent with these fields blank
+   can never authorize an admission.
+2. **CLI retry not actually idempotent**: `tt allocation-intent create
+   --request-id K` auto-generated a fresh `--expected-run-id` on every
+   invocation when the flag was omitted, so a lost-response retry of the
+   unchanged command sent a different `ExpectedRunID` and the store's
+   retry-key lookup correctly rejected it as a payload mismatch. Fixed:
+   `--expected-run-id` is now required whenever `--request-id` is set, so
+   the caller freezes it once and an unchanged retry replays identically.
+3. **Generated guidance on the old partial contract**: `coordination.go`'s
+   emitted MAIN/handler/worker briefings and the top-level `tt` usage string
+   described an intent bound only to identity/item/revision/order/role.
+   Both are now updated to describe the full tuple (prepared-context digest,
+   preallocated expected run, intended launcher, request receipt/readback
+   via `tt allocation-intent get`, and the coordinated mixed-version rollout
+   window).
+4. **Retired authors remained authorized**: `CreateAllocationIntent` checked
+   only closed/exited author status; a retired author (a real, existing
+   agent, just not a live acting session) was still accepted. Fixed:
+   retired is now rejected exactly like closed/exited, for both the author
+   and any explicitly named delegate launcher.
+5. **Exact max=1 acceptance case and concurrency unproved**: the E->R1(close)->F(reject)->R2
+   acceptance case was previously proved only at max=2, and the "at most one
+   live successor" invariant (round 3, finding 1) was proved only by code
+   inspection, not an actual concurrency test. Both are now covered.
+6. **Capability gate ignored advertised `Versions`**: `cmdSpawn` checked only
+   `Capabilities.AllocationIntent.Supported`, so a hub reporting
+   `Supported: true` for some future incompatible revision would pass the
+   gate. Fixed: the gate now also requires `AllocationIntentCapabilityVersion`
+   (1) to appear in the advertised `Versions` list.
+7. **Legacy audit format 2 silently gained the intent stream**: `agentAllocationIntents`
+   had been added directly to the shared `exportQueries` list used by both
+   format 2 and format 3, so format 2's schema silently changed when this
+   correction landed -- exactly the kind of unannounced legacy-consumer
+   breakage format 2 exists to prevent. Fixed: moved to a new
+   `allocationIntentExportQueries` list included only for format 3 (the
+   same pattern the Queue streams already used), with both formats tested.
+
+### Where this lives (round 5 additions)
+
+- `hub/internal/api/allocation_intent.go`: `AllocationIntent` and
+  `CreateAllocationIntentRequest` gain `ExpectedLauncherAgentID`/`ExpectedLauncherRunID`.
+- `hub/internal/store/migrate.go`: `expected_launcher_agent_id`/`expected_launcher_run_id`
+  columns, added via the same fresh-table/`ALTER TABLE`-repair sequencing as
+  every other `agent_allocation_intents` column.
+- `hub/internal/store/allocation_intent.go`: defaults the expected launcher
+  to the author when omitted; validates an explicit delegate is live and
+  on-task; rejects a retired author or delegate; includes the launcher
+  fields in the retry-key payload comparison.
+- `hub/internal/store/store.go`, `Store.AddAgent`: requires the actual
+  `ParentAgentID`/its live run to equal the intent's expected launcher
+  exactly before consuming it; a legacy intent with the launcher fields
+  blank cannot authorize admission.
+- `hub/internal/store/audit_export.go`: `allocationIntentExportQueries`
+  (format-3-only), replacing the entry previously inside the shared
+  `exportQueries`; its query now also selects the new launcher columns.
+- `hub/cmd/tt/main.go`: `cmdAllocationIntentCreate` gains `--launcher-agent-id`/`--launcher-run-id`
+  and requires `--expected-run-id` whenever `--request-id` is set; `cmdSpawn`'s
+  capability gate checks `Versions` for a compatible entry, not `Supported`
+  alone; top-level usage string describes the full `allocation-intent
+  create`/`get` contract.
+- `hub/cmd/tt/coordination.go`: emitted MAIN/handler/worker guidance
+  describes the full tuple, retry/readback mechanics and the coordinated
+  rollout window.
+
+### Tests (round 5)
+
+- `hub/internal/store/work_context_test.go` --
+  `TestAllocationIntentRequiredMatchedAndConsumedOnce` (extended): a wrong
+  actual launcher is rejected even when the preallocated identity and every
+  other field match; an explicit delegate launcher distinct from the author
+  is honored (and only that delegate may consume it, not the author);
+  authoring an intent naming an unknown/off-task delegate is rejected; a
+  retired author is rejected.
+  `TestItemExtraCapacityFailedReplacementRetryExactMaxOneCase` (new): the
+  exact max=1 E->R1(close)->F(reject)->R2 case.
+  `TestItemExtraCapacityConcurrentDuplicateReplacementOnlyOneSucceeds`
+  (new): 8 concurrent replacement attempts against the same exited
+  predecessor -- exactly one succeeds, the rest conflict.
+- `hub/internal/store/audit_export_test.go` --
+  `TestAuditExportAllocationIntentStreamOnlyInV3` (new): format 2 has no
+  `agentAllocationIntents` stream at all; format 3 has it, with the
+  launcher/author/expected-run fields all present.
+- `hub/cmd/tt/coordination_test.go` (new) --
+  `TestAllocationIntentCreateRequestIDRequiresFrozenExpectedRunID`: using
+  `--request-id` without `--expected-run-id` is rejected before contacting
+  the hub. `TestAllocationIntentCreateLostResponseRetryReplaysIdentically`:
+  an actual `cmdAllocationIntentCreate` call, repeated with the identical
+  frozen `--expected-run-id`/`--request-id`, replays successfully (not a
+  conflict) and a durable `GetAllocationIntent` readback confirms exactly
+  one record.
+  `TestSpawnFailsClosedWhenAllocationIntentVersionsExcludesCompatibleVersion`
+  (new): `Supported: true` with a `Versions` list excluding 1 still fails
+  closed.
+- Full suites re-run clean after all round-5 changes: `go build/vet`,
+  `gofmt -l`, `git diff --check` clean; `go test ./internal/store/...
+  ./internal/server/... -race -count=1` clean; `go test ./cmd/tt/...` clean
+  for every test this round touched or added (the same three pre-existing,
+  unrelated baseline nonpasses named in the round-5 handoff --
+  `TestPostHumanReplyAndLiteralHelp`, `TestAskAmbiguousFailureRetainsRecoveryKey`,
+  `TestWorkItemsCLIUsesBodyFilesAndDurableReceipts` -- remain, and the known
+  long-hanging `TestAskPreservesIdentityContextAndReplayPayload` was
+  skipped, not rerun, per the handoff's explicit instruction to preserve
+  both); `npm test` 170/170.
+
 ## Not in scope here
 
 No handler implementation, quota/setting change (task `maxNewAgents`
