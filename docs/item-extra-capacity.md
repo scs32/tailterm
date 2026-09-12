@@ -1,8 +1,9 @@
 # Item extra-agent capacity
 
 Bug `wi_84dafce5ad044acd` revision1, order #2050, the scoped #2192
-generic-launch correction, and the #2300 independent-review correction round.
-Owner clarification (Board #2045/#2048), verbatim:
+generic-launch correction, and two independent-review correction rounds
+(#2300, then #2771 against the round-1 candidate 18b62c2). Owner
+clarification (Board #2045/#2048), verbatim:
 
 > UH... I'm a little confused on this one... When would a single bug or
 > feature need 32 agents. Again, the rule is that the "extra" agents are per
@@ -18,8 +19,17 @@ item was treated as its "builder" (free), and only later ones as "extras"
 auditable allocated-team model, it lets a genuine extra claim the free
 "builder" slot merely by arriving first, it charges a legitimate second
 regular member as an extra, and it ignores `--replaces-agent`, so a
-replacement of the builder was itself charged as rank>1. This document
-describes the corrected, explicit-classification design that replaced it.
+replacement of the builder was itself charged as rank>1.
+
+Round 1 (candidate 18b62c2) replaced arrival order with a persisted,
+explicit `teamRole` declaration. Independent review #2771 found that
+correct as far as it went, but caught five further defects specific to the
+new design: a migration-ordering bug that crashed on any real existing
+database, a replacement-lifecycle gap that could double-reserve or
+double-count one logical extra slot, an exact-replay path that ignored
+`teamRole` entirely, a legacy-accounting choice that silently refunded the
+owner's ceiling, and a residual singular "allocated builder" UI wording.
+This document describes the design as corrected by both rounds.
 
 ## The rule
 
@@ -42,7 +52,19 @@ describes the corrected, explicit-classification design that replaced it.
   caller-supplied `--team-role` that conflicts with the inherited role is
   rejected (not silently overridden), and a replacement of an extra is
   exempt from the allowance/`AllowAgentSpawn` check entirely, since it
-  continues an already-reserved slot rather than creating a new one.
+  continues an already-reserved slot rather than creating a new one. The
+  replaced binding must belong to a genuinely **exited** agent — replacing
+  a still-active one is rejected, since that would double-reserve one
+  logical slot as two concurrently active bindings (review #2771 finding
+  2). Once replaced, the exited original and its live replacement count as
+  exactly **one** active extra on later admissions, not two — a binding
+  superseded by another (`replaces_agent_id` points at it) is excluded from
+  the count; only the live end of a replacement chain counts.
+- An **exact replay** of a prior admission (a duplicate/retried request
+  reusing the same `AgentID`, including a cross-project Queue admission
+  retry) must declare the same `teamRole` as what was actually admitted; a
+  replay that changes it is rejected as a conflict, not silently treated as
+  the same exact prior admission (review #2771 finding 3).
 - A **parentless** (browser/manual) admission is always resolved as
   `member`: there is no ambiguity to declare, since it never consumes the
   extra allowance either way.
@@ -87,22 +109,33 @@ coordinating agents this hub already trusts), not access control.
 - `hub/internal/store/migrate.go`: additive `team_role TEXT NOT NULL
   DEFAULT ''` column on `agent_work_item_bindings` (in the `CREATE TABLE`
   for a fresh database, plus a targeted `ALTER TABLE` check for an existing
-  one), and a matching index
-  `agent_work_item_bindings_item_team_role(item_task_id,item_id,team_role,created_at)`.
+  one). The index on that column is created **only after** the column is
+  guaranteed to exist (review #2771 finding 1: creating it inside the same
+  `CREATE TABLE IF NOT EXISTS` block as the fresh-database schema crashed
+  migration on any real existing database, since `CREATE TABLE IF NOT
+  EXISTS` is a no-op there and the index reference to a nonexistent column
+  aborted before the `ALTER TABLE` repair ever ran).
 - `hub/internal/store/work_context.go`: `validateAgentWorkItemRequest` now
   also resolves and returns the binding's `teamRole` — inherited from the
   replaced binding for a replacement (rejecting a conflicting explicit
-  value), forced to `member` for a parentless request, and required to be
-  exactly `member`/`extra` otherwise; `insertAgentWorkItemBinding` persists
-  it; `loadAgentWorkItemBinding` reads it back.
+  value, and rejecting the replacement outright if the replaced agent is
+  not exited), forced to `member` for a parentless request, and required to
+  be exactly `member`/`extra` otherwise; `insertAgentWorkItemBinding`
+  persists it; `loadAgentWorkItemBinding` reads it back.
+  `exactExistingQueueAdmission`'s exact-replay comparison now also compares
+  the request's `teamRole` against the persisted binding's.
 - `hub/internal/store/store.go`, `Store.AddAgent`: the admission check no
   longer ranks bindings by arrival order at all. For a parented, work-item-
   bound, fresh (non-replacement) request resolved as `extra`, it gates on
-  `AllowAgentSpawn` and counts existing non-closed `extra`-classified
-  bindings for that exact `(itemTaskId, itemId)` against `maxNewAgents`. A
-  `member` classification, and any replacement, is admitted without that
-  gate. An unbound parented request falls back to task-wide accounting
-  (still excluding closed rows), still gated by `AllowAgentSpawn`.
+  `AllowAgentSpawn` and counts existing non-closed, non-superseded bindings
+  for that exact `(itemTaskId, itemId)` against `maxNewAgents`, where a
+  binding counts if it is explicitly `extra`-classified, **or** if it is
+  parented with `team_role=''` (an unclassified legacy row — counted
+  conservatively so it cannot silently refund the owner's ceiling; see
+  Migration below). A `member` classification, and any replacement, is
+  admitted without that gate. An unbound parented request falls back to
+  task-wide accounting (still excluding closed rows), still gated by
+  `AllowAgentSpawn`.
 - `hub/cmd/tt/main.go`, `cmdSpawn`: new `--team-role member|extra` flag,
   required for a fresh parented item-bound launch (validated client-side
   before contacting the hub, and enforced again server-side); threaded into
@@ -156,10 +189,29 @@ coordinating agents this hub already trusts), not access control.
     with a conflicting declared `teamRole` is rejected; omitting it
     inherits the prior binding's role and is admitted even at
     `maxNewAgents=0`, since it is not a fresh extra allocation.
-  - `TestItemExtraCapacityRegularMemberIgnoresSpawnDisabled` (new): a
+  - `TestItemExtraCapacityRegularMemberIgnoresSpawnDisabled`: a
     `--team-role member` launch is admitted through the parented CLI path
     even while `AllowAgentSpawn` is disabled; a genuine `extra` is still
     blocked.
+  - `TestItemExtraCapacityReplacementRequiresExitedAndDoesNotDoubleCount`
+    (new, review #2771 finding 2): replacing a still-active extra is
+    rejected; replacing a genuinely exited one is admitted and inherits its
+    role; the exited original plus its live replacement count as exactly
+    one active extra on a later admission, not two.
+  - `TestItemExtraCapacityLegacyParentedBindingCountsConservatively` (new,
+    finding 4): a parented binding with `team_role=''` (simulating a row
+    written before this correction) counts against the item's allowance; a
+    parentless one does not.
+- `hub/internal/store/migrate_test.go` —
+  `TestMigrateAddsTeamRoleToExistingBindingsTable` (new, finding 1): the
+  exact reproduction the review described — a database whose
+  `agent_work_item_bindings` table predates `team_role` migrates cleanly
+  (previously aborted), and the migrated database can then admit a real
+  team-role-classified binding.
+- `hub/internal/store/queue_test.go` —
+  `TestQueueExactReplayRejectsChangedTeamRole` (new, finding 3): an
+  unchanged exact replay of a cross-project Queue admission succeeds; the
+  same replay declaring a different `teamRole` is rejected as a conflict.
 - `hub/cmd/tt/coordination_test.go` —
   `TestGeneratedBriefingStatesTtIsARealCliVerifiedBeforeUse`: the
   CLI-discovery preamble leads the briefing, through the real
@@ -213,17 +265,44 @@ coordinating agents this hub already trusts), not access control.
 
 Additive schema change: `agent_work_item_bindings.team_role`, default `''`
 (empty). A pre-existing binding written before this correction has
-`team_role=''`. The extra-count query filters on `team_role='extra'`
-specifically, so an empty-string legacy row is **never** counted as an
-extra and never receives special "builder" treatment either — there is no
-more binding-order ranking of any kind, so the prior design's risk of a
-legacy row permanently occupying (or vacating) a privileged position is
-gone entirely. A legacy binding is simply unclassified; it is not
-retroactively reclassified, backfilled, or edited by this migration. No
-production data migration, backfill script, or reinterpretation of history
-is included or required for this to be correct going forward — a decision
-made explicitly, not left ambiguous: unclassified rows have no effect on
-current or future admission decisions either way.
+`team_role=''`; it is never retroactively reclassified, backfilled, or
+edited by this migration — no production data migration or reinterpretation
+of history is included.
+
+Round 1 excluded every such row from admission counting entirely (there is
+no more binding-order ranking of any kind, so the original design's risk of
+a legacy row permanently occupying or vacating a privileged position is
+gone). Review #2771 (finding 4) correctly identified that this went too far
+in the other direction: excluding an open legacy extra from the count
+silently refunds the owner's ceiling, letting `maxNewAgents` fresh extras
+stack on top of it. The corrected, conservative policy: a **parented**
+legacy binding (`team_role=''`, `ParentAgentID` set) counts against the
+item's allowance exactly as an `extra` would, until an authorized migration
+assigns it a real classification; a **parentless** legacy binding is
+unambiguous either way (never an extra, then or now) and does not count.
+This preserves the owner's per-item ceiling for still-open historical rows
+without guessing whether any given one was originally intended as a member
+or an extra. An authorized owner/handler decision to run an actual
+backfill (assigning explicit roles to still-open legacy rows from
+historical launch records, where recoverable) remains open and is not
+performed here.
+
+### Old/new client compatibility
+
+- **New hub, old CLI/API client**: a parented, item-bound request with no
+  `teamRole` field is rejected outright (`api.ErrInvalid`) rather than
+  silently guessing a classification. An old client cannot make a fresh
+  parented item-bound admission against a corrected hub until it is
+  updated to send `--team-role`/`teamRole`; a parentless (browser) request
+  is unaffected either way, since it never carried or needed the field.
+- **New CLI, old hub**: an old hub has no `team_role` column and ignores
+  the field entirely, reverting to whatever accounting that old hub
+  version implements. This is a hub-version compatibility boundary, not
+  something the CLI can detect or paper over from the client side.
+- **Recommended rollout order**: deploy the corrected hub (including the
+  migration) before any client that sends `--team-role` is relied upon for
+  a parented item-bound launch; a parentless (browser) launch path is
+  unaffected by rollout order in either direction.
 
 ## Not in scope here
 
