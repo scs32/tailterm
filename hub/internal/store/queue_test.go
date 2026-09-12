@@ -899,3 +899,50 @@ func TestQueueLegacySchemaHasNoPrivateContextInEntries(t *testing.T) {
 		t.Fatalf("private context column=%d %v", columns, err)
 	}
 }
+
+// TestQueueExactReplayRejectsChangedTeamRole addresses independent review
+// #2300/#2771 finding 3: an exact-existing Queue admission retry must not
+// silently succeed if it changes the declared TeamRole from what was
+// actually admitted -- a replay is a retry of the same prior admission, not
+// a fresh reclassification.
+func TestQueueExactReplayRejectsChangedTeamRole(t *testing.T) {
+	s, ctx, by := workItemStore(t)
+	source, _ := workItemProject(t, s, ctx, by, "Replay source", "sourcelead")
+	target, lead := workItemProject(t, s, ctx, by, "Replay target", "targetlead")
+	item := createWorkItem(t, s, ctx, by, source, "replay-item")
+	dispatched, err := s.DispatchWorkItem(ctx, source.ID, item.ID, api.DispatchWorkItemRequest{Revision: item.Revision, TargetTaskID: target.ID, RequestID: "replay-send-1"}, by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	entry := dispatched.Queue.Entry
+	order := queueOrder(t, s, item, "Replay order", "replay-order")
+	claim, err := s.QueueAction(ctx, target.ID, entry.ID, api.QueueActionRequest{Operation: "claim", RequestID: "replay-claim-1", ExpectedRevision: entry.Revision, Cycle: entry.Cycle, ExpectedItemRevision: item.Revision, ClaimantAgentID: lead.ID, ClaimantRunID: lead.RunID, WorkOrderMessage: &api.MessageReference{TaskID: source.ID, Seq: order.Seq}}, by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bundle := syntheticPreparedContext(t, item, api.MessageReference{TaskID: source.ID, Seq: order.Seq}, syntheticHistory(item, order))
+	workerID := api.NewID("agt")
+	memberRequest := api.AddAgentRequest{
+		AgentID: workerID, Name: "replay-worker", Host: "fixture", Session: "replay-worker", Runtime: "codex", ParentAgentID: lead.ID,
+		WorkItem: &api.AgentWorkItemRequest{
+			ItemTaskID: source.ID, ItemID: item.ID, ItemRevision: item.Revision, WorkOrderMessage: api.MessageReference{TaskID: source.ID, Seq: order.Seq},
+			QueueClaim:    &api.QueueAdmissionClaim{EntryID: entry.ID, Cycle: entry.Cycle, ExpectedRevision: claim.Entry.Revision, ClaimantAgentID: lead.ID, ClaimantRunID: lead.RunID},
+			ContextBundle: bundle, TeamRole: api.TeamRoleMember,
+		},
+	}
+	worker, err := s.AddAgent(ctx, target.ID, memberRequest, by)
+	if err != nil || worker.WorkItem == nil || worker.WorkItem.TeamRole != api.TeamRoleMember {
+		t.Fatalf("initial member admission: %+v %v", worker, err)
+	}
+	exactReplay := memberRequest
+	if _, err = s.AddAgent(ctx, target.ID, exactReplay, by); err != nil {
+		t.Fatalf("unchanged exact replay should succeed: %v", err)
+	}
+	changedRole := memberRequest
+	changedWork := *memberRequest.WorkItem
+	changedWork.TeamRole = api.TeamRoleExtra
+	changedRole.WorkItem = &changedWork
+	if _, err = s.AddAgent(ctx, target.ID, changedRole, by); !errors.Is(err, api.ErrConflict) {
+		t.Fatalf("replay declaring a different team role should be rejected, not treated as the same exact admission: %v", err)
+	}
+}
