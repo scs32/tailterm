@@ -151,6 +151,22 @@ func validateAgentWorkItemRequest(q queryRower, ctx context.Context, targetTaskI
 		if err != nil || prior == nil || prior.ItemTaskID != req.ItemTaskID || prior.ItemID != req.ItemID {
 			return 0, "", workItemConflict("replacement agent is not bound to the selected work item")
 		}
+		// Independent review #2300/#2771/#2840 finding 1: at most one LIVE
+		// (non-closed) successor may exist for a given predecessor at a
+		// time -- a second concurrent or sequential replacement naming the
+		// same predecessor while an earlier one is still active would
+		// double-reserve one logical slot as two counted leaves. A closed
+		// (failed) prior successor does not block a fresh retry; the
+		// predecessor's own reservation is what protects capacity in that
+		// case (see the "live successor" exclusion in Store.AddAgent's
+		// active-extras count).
+		var liveSuccessors int
+		if err := q.QueryRowContext(ctx, `SELECT COUNT(*) FROM agent_work_item_bindings b JOIN agents a ON a.id=b.agent_id WHERE b.replaces_agent_id=? AND a.status<>'closed'`, req.ReplacesAgentID).Scan(&liveSuccessors); err != nil {
+			return 0, "", err
+		}
+		if liveSuccessors > 0 {
+			return 0, "", fmt.Errorf("%w: predecessor already has a live replacement", api.ErrConflict)
+		}
 		if req.TeamRole != "" && req.TeamRole != prior.TeamRole {
 			return 0, "", fmt.Errorf("%w: replacement must inherit the prior binding's team role, not declare a different one", api.ErrInvalid)
 		}
@@ -269,15 +285,27 @@ func exactExistingQueueAdmission(q queryRower, ctx context.Context, targetTaskID
 	digest := hex.EncodeToString(digestBytes[:])
 	binding := existing.WorkItem
 	// A replay must not silently change classification (independent review
-	// #2300/#2771 finding 3): comparing only item/order/context let a retry
-	// swap member for extra (or vice versa) and still be treated as the
-	// exact same prior admission. work.TeamRole is the caller's request
-	// value, which for a replacement is not required to be set (it may be
-	// inherited); compare against the persisted binding's resolved role
-	// either way so an explicit mismatch or a silent one are both caught.
+	// #2300/#2771/#2840 finding 3): comparing only item/order/context let a
+	// retry swap member for extra (or vice versa), or drop the declaration
+	// entirely, and still be treated as the exact same prior admission.
+	// The original binding's ReplacesAgentID (not the retry's) says whether
+	// the ORIGINAL admission was fresh or itself a replacement: a fresh
+	// admission was explicitly declared member/extra, so its replay must
+	// supply that same explicit value -- omitting it is itself a mismatch,
+	// not a pass-through. A replacement inherited its role, so its replay
+	// may still omit TeamRole (inheriting again); an explicit but wrong
+	// value is still rejected either way.
+	roleMismatch := work.TeamRole != binding.TeamRole
+	if work.TeamRole == "" && (binding.ReplacesAgentID != "" || existing.ParentAgentID == "") {
+		// A replacement's role is inherited, not declared, so its replay may
+		// omit it. A parentless (browser/manual) binding's role is always
+		// forced to member regardless of any declaration, so it was never a
+		// real caller choice to replay either.
+		roleMismatch = false
+	}
 	if binding.ItemTaskID != work.ItemTaskID || binding.ItemID != work.ItemID || binding.ItemRevision != work.ItemRevision ||
 		binding.WorkOrderMessage != work.WorkOrderMessage || binding.ReplacesAgentID != work.ReplacesAgentID || binding.ContextDigest != digest ||
-		(work.TeamRole != "" && work.TeamRole != binding.TeamRole) {
+		roleMismatch {
 		return false, workItemConflict("Queue admission retry changed its exact item/order/context/classification binding")
 	}
 	rows, err := q.QueryContext(ctx, `SELECT snapshot FROM queue_events WHERE target_task_id=? AND entry_id=? AND cycle=? AND kind='admitted' ORDER BY seq`, targetTaskID, work.QueueClaim.EntryID, work.QueueClaim.Cycle)

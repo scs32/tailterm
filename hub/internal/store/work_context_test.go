@@ -91,6 +91,29 @@ func contextLinkedMessage(t *testing.T, s *Store, task api.Task, item api.WorkIt
 	return message
 }
 
+// authorIntentAndBind authors the durable pre-admission allocation intent a
+// fresh parented member/extra binding now requires (independent review
+// #2300/#2771/#2840 finding 5), then admits it with a preallocated agent
+// identity bound to that exact intent. It is the standard fresh (non-
+// replacement) admission path for these tests; a replacement admission
+// still uses a plain AddAgentRequest directly, since it is exempt (it
+// inherits its predecessor's already-authorized classification).
+func authorIntentAndBind(t *testing.T, s *Store, task api.Task, item api.WorkItem, name, parent, teamRole string, by api.Caller) (api.Agent, error) {
+	t.Helper()
+	ctx := context.Background()
+	order := contextLinkedMessage(t, s, task, item, name+" order", name+"-order", nil)
+	orderRef := api.MessageReference{TaskID: task.ID, Seq: order.Seq}
+	agentID := api.NewID("agt")
+	if _, err := s.CreateAllocationIntent(ctx, task.ID, api.CreateAllocationIntentRequest{
+		AgentID: agentID, ItemTaskID: task.ID, ItemID: item.ID, ItemRevision: item.Revision, WorkOrderMessage: orderRef, TeamRole: teamRole,
+	}, by); err != nil {
+		t.Fatalf("author intent for %s: %v", name, err)
+	}
+	req := &api.AgentWorkItemRequest{ItemTaskID: task.ID, ItemID: item.ID, ItemRevision: item.Revision, WorkOrderMessage: orderRef, TeamRole: teamRole}
+	req.ContextBundle = syntheticPreparedContext(t, item, orderRef, syntheticHistory(item, order))
+	return s.AddAgent(ctx, task.ID, api.AddAgentRequest{AgentID: agentID, Name: name, Host: "fixture", Session: name, Runtime: "codex", ParentAgentID: parent, WorkItem: req}, by)
+}
+
 func TestAgentWorkItemContextAdmissionRestorationAndReplacement(t *testing.T) {
 	ctx := context.Background()
 	path := filepath.Join(t.TempDir(), "context.sqlite")
@@ -373,18 +396,14 @@ func TestAgentWorkItemContextRejectsStaleMismatchedAndHelperAdmission(t *testing
 	// this item's regular team member (TeamRoleMember) is admitted even at
 	// MaxNewAgents=0, since it is not an "extra" -- regardless of arrival
 	// order, unlike the old binding-order heuristic.
-	memberReq := *req
-	memberReq.TeamRole = api.TeamRoleMember
-	builder, err := s.AddAgent(ctx, task.ID, api.AddAgentRequest{Name: "builder", Host: "fixture", Session: "builder", Runtime: "codex", ParentAgentID: parent.ID, WorkItem: &memberReq}, by)
+	builder, err := authorIntentAndBind(t, s, task, item, "builder", parent.ID, api.TeamRoleMember, by)
 	if err != nil || builder.ParentAgentID != parent.ID || builder.WorkItem.TeamRole != api.TeamRoleMember {
 		t.Fatalf("item's declared regular team member rejected as an extra: %+v %v", builder, err)
 	}
 	// A parented agent explicitly declared as an extra (TeamRoleExtra) is
 	// checked against the item's MaxNewAgents allowance, regardless of how
 	// many regular team members are already bound to the item.
-	extraReq := *req
-	extraReq.TeamRole = api.TeamRoleExtra
-	if _, err = s.AddAgent(ctx, task.ID, api.AddAgentRequest{Name: "helper", Host: "fixture", Session: "helper", Runtime: "codex", ParentAgentID: parent.ID, WorkItem: &extraReq}, by); !errors.Is(err, api.ErrAgentSpawnLimit) {
+	if _, err = authorIntentAndBind(t, s, task, item, "helper", parent.ID, api.TeamRoleExtra, by); !errors.Is(err, api.ErrAgentSpawnLimit) {
 		t.Fatalf("item binding bypassed extra limit: %v", err)
 	}
 	base, err := s.AddAgent(ctx, task.ID, api.AddAgentRequest{Name: "base", Host: "fixture", Session: "base", Runtime: "codex", WorkItem: req}, by)
@@ -421,10 +440,7 @@ func TestItemExtraCapacityIsIsolatedPerItem(t *testing.T) {
 		t.Fatal(err)
 	}
 	bind := func(name string, item api.WorkItem, parent, teamRole string) (api.Agent, error) {
-		order := contextLinkedMessage(t, s, task, item, name+" order", name+"-order", nil)
-		req := &api.AgentWorkItemRequest{ItemTaskID: task.ID, ItemID: item.ID, ItemRevision: item.Revision, WorkOrderMessage: api.MessageReference{TaskID: task.ID, Seq: order.Seq}, TeamRole: teamRole}
-		req.ContextBundle = syntheticPreparedContext(t, item, req.WorkOrderMessage, syntheticHistory(item, order))
-		return s.AddAgent(ctx, task.ID, api.AddAgentRequest{Name: name, Host: "fixture", Session: name, Runtime: "codex", ParentAgentID: parent, WorkItem: req}, by)
+		return authorIntentAndBind(t, s, task, item, name, parent, teamRole, by)
 	}
 	itemA, err := s.CreateWorkItem(ctx, task.ID, api.CreateWorkItemRequest{Kind: "bug", Title: "Item A", AgentID: lead.ID, RequestID: "item-a"}, by)
 	if err != nil {
@@ -505,10 +521,7 @@ func TestItemExtraCapacityDescendantsAndConcurrentRace(t *testing.T) {
 		t.Fatal(err)
 	}
 	bind := func(name string, item api.WorkItem, parent, teamRole string) (api.Agent, error) {
-		order := contextLinkedMessage(t, s, task, item, name+" order", name+"-order", nil)
-		req := &api.AgentWorkItemRequest{ItemTaskID: task.ID, ItemID: item.ID, ItemRevision: item.Revision, WorkOrderMessage: api.MessageReference{TaskID: task.ID, Seq: order.Seq}, TeamRole: teamRole}
-		req.ContextBundle = syntheticPreparedContext(t, item, req.WorkOrderMessage, syntheticHistory(item, order))
-		return s.AddAgent(ctx, task.ID, api.AddAgentRequest{Name: name, Host: "fixture", Session: name, Runtime: "codex", ParentAgentID: parent, WorkItem: req}, by)
+		return authorIntentAndBind(t, s, task, item, name, parent, teamRole, by)
 	}
 	itemA, err := s.CreateWorkItem(ctx, task.ID, api.CreateWorkItemRequest{Kind: "bug", Title: "Item A", AgentID: lead.ID, RequestID: "desc-item-a"}, by)
 	if err != nil {
@@ -592,10 +605,7 @@ func TestItemExtraCapacityReplacementInheritsTeamRole(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	order := contextLinkedMessage(t, s, task, item, "builder order", "replace-builder-order", nil)
-	builderReq := &api.AgentWorkItemRequest{ItemTaskID: task.ID, ItemID: item.ID, ItemRevision: item.Revision, WorkOrderMessage: api.MessageReference{TaskID: task.ID, Seq: order.Seq}, TeamRole: api.TeamRoleMember}
-	builderReq.ContextBundle = syntheticPreparedContext(t, item, builderReq.WorkOrderMessage, syntheticHistory(item, order))
-	builder, err := s.AddAgent(ctx, task.ID, api.AddAgentRequest{Name: "builder", Host: "fixture", Session: "builder", Runtime: "codex", ParentAgentID: lead.ID, WorkItem: builderReq}, by)
+	builder, err := authorIntentAndBind(t, s, task, item, "builder", lead.ID, api.TeamRoleMember, by)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -648,10 +658,7 @@ func TestItemExtraCapacityRegularMemberIgnoresSpawnDisabled(t *testing.T) {
 		t.Fatal(err)
 	}
 	bind := func(name, teamRole string) (api.Agent, error) {
-		order := contextLinkedMessage(t, s, task, item, name+" order", name+"-order", nil)
-		req := &api.AgentWorkItemRequest{ItemTaskID: task.ID, ItemID: item.ID, ItemRevision: item.Revision, WorkOrderMessage: api.MessageReference{TaskID: task.ID, Seq: order.Seq}, TeamRole: teamRole}
-		req.ContextBundle = syntheticPreparedContext(t, item, req.WorkOrderMessage, syntheticHistory(item, order))
-		return s.AddAgent(ctx, task.ID, api.AddAgentRequest{Name: name, Host: "fixture", Session: name, Runtime: "codex", ParentAgentID: lead.ID, WorkItem: req}, by)
+		return authorIntentAndBind(t, s, task, item, name, lead.ID, teamRole, by)
 	}
 	if _, err = bind("builder", api.TeamRoleMember); err != nil {
 		t.Fatalf("regular team member blocked by disabled agent spawning: %v", err)
@@ -690,11 +697,11 @@ func TestItemExtraCapacityReplacementRequiresExitedAndDoesNotDoubleCount(t *test
 		t.Fatal(err)
 	}
 	bind := func(name, replaces string) (api.Agent, error) {
+		if replaces == "" {
+			return authorIntentAndBind(t, s, task, item, name, lead.ID, api.TeamRoleExtra, by)
+		}
 		order := contextLinkedMessage(t, s, task, item, name+" order", name+"-order", nil)
 		req := &api.AgentWorkItemRequest{ItemTaskID: task.ID, ItemID: item.ID, ItemRevision: item.Revision, WorkOrderMessage: api.MessageReference{TaskID: task.ID, Seq: order.Seq}, ReplacesAgentID: replaces}
-		if replaces == "" {
-			req.TeamRole = api.TeamRoleExtra
-		}
 		req.ContextBundle = syntheticPreparedContext(t, item, req.WorkOrderMessage, syntheticHistory(item, order))
 		return s.AddAgent(ctx, task.ID, api.AddAgentRequest{Name: name, Host: "fixture", Session: name, Runtime: "codex", ParentAgentID: lead.ID, WorkItem: req}, by)
 	}
@@ -728,6 +735,161 @@ func TestItemExtraCapacityReplacementRequiresExitedAndDoesNotDoubleCount(t *test
 	}
 }
 
+// TestItemExtraCapacityFailedReplacementRetryNeverExceedsCeilingWithReuse is
+// the exact acceptance case (B) from review #2840/#2844: E exits, its
+// replacement R1 closes (a failed retry attempt), an unrelated fresh extra F
+// takes real available capacity, and a later retry R2 (still naming E) must
+// never push the item over its ceiling -- while remaining a valid retry when
+// no capacity was actually reused by anyone else.
+func TestItemExtraCapacityFailedReplacementRetryNeverExceedsCeilingWithReuse(t *testing.T) {
+	ctx := context.Background()
+	s, err := Open(filepath.Join(t.TempDir(), "failed-retry-reuse.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	by := api.Caller{Node: "fixture", User: "owner"}
+	two := 2
+	task, err := s.CreateTask(ctx, api.CreateTaskRequest{Name: "Failed retry reuse", AllowAgentSpawn: true, MaxNewAgents: &two}, by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lead, err := s.AddAgent(ctx, task.ID, api.AddAgentRequest{Name: "lead", Host: "fixture", Session: "lead", Runtime: "codex"}, by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	item, err := s.CreateWorkItem(ctx, task.ID, api.CreateWorkItemRequest{Kind: "bug", Title: "Failed retry reuse item", AgentID: lead.ID, RequestID: "failed-retry-reuse-item"}, by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bind := func(name, replaces string) (api.Agent, error) {
+		if replaces == "" {
+			return authorIntentAndBind(t, s, task, item, name, lead.ID, api.TeamRoleExtra, by)
+		}
+		order := contextLinkedMessage(t, s, task, item, name+" order", name+"-order", nil)
+		req := &api.AgentWorkItemRequest{ItemTaskID: task.ID, ItemID: item.ID, ItemRevision: item.Revision, WorkOrderMessage: api.MessageReference{TaskID: task.ID, Seq: order.Seq}, ReplacesAgentID: replaces}
+		req.ContextBundle = syntheticPreparedContext(t, item, req.WorkOrderMessage, syntheticHistory(item, order))
+		return s.AddAgent(ctx, task.ID, api.AddAgentRequest{Name: name, Host: "fixture", Session: name, Runtime: "codex", ParentAgentID: lead.ID, WorkItem: req}, by)
+	}
+	e, err := bind("e", "")
+	if err != nil {
+		t.Fatalf("E rejected: %v", err)
+	}
+	if _, err = s.PostEvent(ctx, task.ID, api.PostEventRequest{AgentID: e.ID, RunID: e.RunID, Kind: api.EventExited}, by); err != nil {
+		t.Fatal(err)
+	}
+	r1, err := bind("r1", e.ID)
+	if err != nil {
+		t.Fatalf("R1 replacement rejected: %v", err)
+	}
+	if _, err = s.CloseAgent(ctx, r1.ID, by); err != nil {
+		t.Fatal(err)
+	}
+	// E now reverts to counting itself (R1's only successor is closed);
+	// item is at 1 of 2. An unrelated fresh extra F takes the genuinely
+	// available second slot.
+	if _, err = bind("f", ""); err != nil {
+		t.Fatalf("F should take real available capacity: %v", err)
+	}
+	// Now at ceiling (E + F = 2 of 2). A retry R2 naming E must not push the
+	// item over the ceiling: E->R2 is slot-neutral (E excluded once R2 is
+	// live, R2 counted instead), so it is still admitted without exceeding 2.
+	r2, err := bind("r2", e.ID)
+	if err != nil {
+		t.Fatalf("valid retry R2 should still be admitted (slot-neutral, no ceiling breach): %v", err)
+	}
+	if r2.WorkItem == nil || r2.WorkItem.TeamRole != api.TeamRoleExtra {
+		t.Fatalf("R2 lost its inherited extra role: %+v", r2)
+	}
+	// A further genuinely NEW extra now correctly finds the item at its
+	// ceiling (R2 + F = 2 of 2).
+	if _, err = bind("g", ""); !errors.Is(err, api.ErrAgentSpawnLimit) {
+		t.Fatalf("item should be at its ceiling after R2 + F: %v", err)
+	}
+}
+
+// TestAllocationIntentRequiredMatchedAndConsumedOnce addresses independent
+// review #2300/#2771/#2840 finding 5, as clarified by #2844/#2850/#2867/#2870:
+// a fresh parented member/extra admission must be authorized by a durable,
+// pre-admission, handler/lead-authored allocation intent bound to the exact
+// preallocated agent identity, item, revision, work-order message and team
+// role -- not by the launch request's self-declaration alone. Missing or
+// mismatched intent is rejected; a matching one is consumed exactly once.
+func TestAllocationIntentRequiredMatchedAndConsumedOnce(t *testing.T) {
+	ctx := context.Background()
+	s, err := Open(filepath.Join(t.TempDir(), "allocation-intent.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	by := api.Caller{Node: "fixture", User: "owner"}
+	task, err := s.CreateTask(ctx, api.CreateTaskRequest{Name: "Allocation intent", AllowAgentSpawn: true}, by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lead, err := s.AddAgent(ctx, task.ID, api.AddAgentRequest{Name: "lead", Host: "fixture", Session: "lead", Runtime: "codex"}, by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	item, err := s.CreateWorkItem(ctx, task.ID, api.CreateWorkItemRequest{Kind: "bug", Title: "Intent item", AgentID: lead.ID, RequestID: "intent-item"}, by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	order := contextLinkedMessage(t, s, task, item, "intent order", "intent-order", nil)
+	orderRef := api.MessageReference{TaskID: task.ID, Seq: order.Seq}
+	bundle := syntheticPreparedContext(t, item, orderRef, syntheticHistory(item, order))
+	req := func(agentID string) api.AddAgentRequest {
+		return api.AddAgentRequest{
+			AgentID: agentID, Name: "worker-" + agentID, Host: "fixture", Session: "worker-" + agentID, Runtime: "codex", ParentAgentID: lead.ID,
+			WorkItem: &api.AgentWorkItemRequest{ItemTaskID: task.ID, ItemID: item.ID, ItemRevision: item.Revision, WorkOrderMessage: orderRef, ContextBundle: bundle, TeamRole: api.TeamRoleMember},
+		}
+	}
+	// No preallocated identity at all: rejected outright.
+	noAgentID := req("")
+	noAgentID.AgentID = ""
+	if _, err = s.AddAgent(ctx, task.ID, noAgentID, by); !errors.Is(err, api.ErrConflict) {
+		t.Fatalf("fresh parented admission with no --agent-id should be rejected: %v", err)
+	}
+	// A preallocated identity with no recorded intent at all: rejected.
+	missingIntentID := api.NewID("agt")
+	if _, err = s.AddAgent(ctx, task.ID, req(missingIntentID), by); !errors.Is(err, api.ErrConflict) {
+		t.Fatalf("missing allocation intent should be rejected: %v", err)
+	}
+	// A recorded intent for a DIFFERENT team role than requested: rejected.
+	mismatchID := api.NewID("agt")
+	if _, err = s.CreateAllocationIntent(ctx, task.ID, api.CreateAllocationIntentRequest{
+		AgentID: mismatchID, ItemTaskID: task.ID, ItemID: item.ID, ItemRevision: item.Revision, WorkOrderMessage: orderRef, TeamRole: api.TeamRoleExtra,
+	}, by); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = s.AddAgent(ctx, task.ID, req(mismatchID), by); !errors.Is(err, api.ErrConflict) {
+		t.Fatalf("mismatched allocation intent (extra recorded, member requested) should be rejected: %v", err)
+	}
+	// A second CreateAllocationIntent for the same agent identity is a
+	// conflict, not an update -- an intent is authored once.
+	if _, err = s.CreateAllocationIntent(ctx, task.ID, api.CreateAllocationIntentRequest{
+		AgentID: mismatchID, ItemTaskID: task.ID, ItemID: item.ID, ItemRevision: item.Revision, WorkOrderMessage: orderRef, TeamRole: api.TeamRoleMember,
+	}, by); !errors.Is(err, api.ErrConflict) {
+		t.Fatalf("re-authoring an intent for the same agent identity should conflict: %v", err)
+	}
+	// A matching intent is admitted, and the intent record is durably
+	// marked consumed by the exact resulting run in the same transaction.
+	matchID := api.NewID("agt")
+	if _, err = s.CreateAllocationIntent(ctx, task.ID, api.CreateAllocationIntentRequest{
+		AgentID: matchID, ItemTaskID: task.ID, ItemID: item.ID, ItemRevision: item.Revision, WorkOrderMessage: orderRef, TeamRole: api.TeamRoleMember,
+	}, by); err != nil {
+		t.Fatal(err)
+	}
+	admitted, err := s.AddAgent(ctx, task.ID, req(matchID), by)
+	if err != nil || admitted.WorkItem == nil || admitted.WorkItem.TeamRole != api.TeamRoleMember {
+		t.Fatalf("matching intent should admit: %+v %v", admitted, err)
+	}
+	intent, err := loadAllocationIntent(s.db, ctx, matchID)
+	if err != nil || intent == nil || intent.ConsumedAt == nil || intent.ConsumedByRunID != admitted.RunID {
+		t.Fatalf("intent should be marked consumed by the exact resulting run: %+v %v", intent, err)
+	}
+}
+
 // TestItemExtraCapacityLegacyParentedBindingCountsConservatively addresses
 // independent review #2300/#2771 finding 4: a legacy binding predating this
 // correction (team_role=”, never reclassified) must not be silently
@@ -756,10 +918,7 @@ func TestItemExtraCapacityLegacyParentedBindingCountsConservatively(t *testing.T
 	if err != nil {
 		t.Fatal(err)
 	}
-	order := contextLinkedMessage(t, s, task, item, "legacy order", "legacy-order", nil)
-	req := &api.AgentWorkItemRequest{ItemTaskID: task.ID, ItemID: item.ID, ItemRevision: item.Revision, WorkOrderMessage: api.MessageReference{TaskID: task.ID, Seq: order.Seq}, TeamRole: api.TeamRoleExtra}
-	req.ContextBundle = syntheticPreparedContext(t, item, req.WorkOrderMessage, syntheticHistory(item, order))
-	legacyExtra, err := s.AddAgent(ctx, task.ID, api.AddAgentRequest{Name: "legacy-extra", Host: "fixture", Session: "legacy-extra", Runtime: "codex", ParentAgentID: lead.ID, WorkItem: req}, by)
+	legacyExtra, err := authorIntentAndBind(t, s, task, item, "legacy-extra", lead.ID, api.TeamRoleExtra, by)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -769,10 +928,7 @@ func TestItemExtraCapacityLegacyParentedBindingCountsConservatively(t *testing.T
 	if _, err = s.db.ExecContext(ctx, `UPDATE agent_work_item_bindings SET team_role='' WHERE agent_id=?`, legacyExtra.ID); err != nil {
 		t.Fatal(err)
 	}
-	freshOrder := contextLinkedMessage(t, s, task, item, "fresh extra order", "fresh-extra-order", nil)
-	freshReq := &api.AgentWorkItemRequest{ItemTaskID: task.ID, ItemID: item.ID, ItemRevision: item.Revision, WorkOrderMessage: api.MessageReference{TaskID: task.ID, Seq: freshOrder.Seq}, TeamRole: api.TeamRoleExtra}
-	freshReq.ContextBundle = syntheticPreparedContext(t, item, freshReq.WorkOrderMessage, syntheticHistory(item, freshOrder))
-	if _, err = s.AddAgent(ctx, task.ID, api.AddAgentRequest{Name: "fresh-extra", Host: "fixture", Session: "fresh-extra", Runtime: "codex", ParentAgentID: lead.ID, WorkItem: freshReq}, by); !errors.Is(err, api.ErrAgentSpawnLimit) {
+	if _, err = authorIntentAndBind(t, s, task, item, "fresh-extra", lead.ID, api.TeamRoleExtra, by); !errors.Is(err, api.ErrAgentSpawnLimit) {
 		t.Fatalf("legacy parented binding should conservatively count against the allowance: %v", err)
 	}
 	// A parentless legacy binding was never an extra and still isn't.
@@ -786,7 +942,7 @@ func TestItemExtraCapacityLegacyParentedBindingCountsConservatively(t *testing.T
 	if _, err = s.db.ExecContext(ctx, `UPDATE agent_work_item_bindings SET team_role='' WHERE agent_id=?`, base.ID); err != nil {
 		t.Fatal(err)
 	}
-	if _, err = s.AddAgent(ctx, task.ID, api.AddAgentRequest{Name: "fresh-extra-2", Host: "fixture", Session: "fresh-extra-2", Runtime: "codex", ParentAgentID: lead.ID, WorkItem: freshReq}, by); !errors.Is(err, api.ErrAgentSpawnLimit) {
+	if _, err = authorIntentAndBind(t, s, task, item, "fresh-extra-2", lead.ID, api.TeamRoleExtra, by); !errors.Is(err, api.ErrAgentSpawnLimit) {
 		t.Fatalf("expected the same rejection (unaffected by the parentless legacy row): %v", err)
 	}
 }

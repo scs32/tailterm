@@ -554,6 +554,32 @@ AND NOT EXISTS (SELECT 1 FROM agent_work_item_bindings b WHERE b.agent_id=a.id)`
 	if err != nil {
 		return a, err
 	}
+	freshParentedItemBound := req.WorkItem != nil && req.ParentAgentID != "" && req.WorkItem.ReplacesAgentID == ""
+	if freshParentedItemBound {
+		// Independent review #2300/#2771/#2840 finding 5, as clarified by
+		// #2844/#2850/#2867/#2870: a fresh parented member OR extra
+		// admission must be authorized by a durable, handler/lead-authored
+		// allocation intent recorded BEFORE this call, bound to the exact
+		// preallocated agent identity, item, revision, work-order message
+		// and declared team role. Self-declaration on the launch request
+		// alone is not sufficient; absence or mismatch is rejected, not
+		// silently bypassed. A replacement is exempt: it inherits its
+		// predecessor's already-authorized classification, not a fresh one.
+		if req.AgentID == "" {
+			return a, fmt.Errorf("%w: a fresh parented member/extra admission requires a preallocated --agent-id bound to a recorded allocation intent", api.ErrConflict)
+		}
+		intent, ierr := loadAllocationIntent(tx, ctx, req.AgentID)
+		if ierr != nil {
+			return a, ierr
+		}
+		if intent == nil || intent.ConsumedAt != nil {
+			return a, fmt.Errorf("%w: no unconsumed allocation intent recorded for this agent identity", api.ErrConflict)
+		}
+		if intent.ItemTaskID != req.WorkItem.ItemTaskID || intent.ItemID != req.WorkItem.ItemID || intent.ItemRevision != req.WorkItem.ItemRevision ||
+			intent.WorkOrderMessage != req.WorkItem.WorkOrderMessage || intent.TeamRole != resolvedTeamRole {
+			return a, fmt.Errorf("%w: recorded allocation intent does not match this admission's exact item/revision/order/team role", api.ErrConflict)
+		}
+	}
 	if req.WorkItem != nil && req.ParentAgentID != "" && resolvedTeamRole == api.TeamRoleExtra && req.WorkItem.ReplacesAgentID == "" {
 		// Extra-agent capacity is accounted per work item, on top of that
 		// item's allocated team member(s), per owner clarification
@@ -593,7 +619,7 @@ AND NOT EXISTS (SELECT 1 FROM agent_work_item_bindings b WHERE b.agent_id=a.id)`
 JOIN agent_work_item_bindings b ON b.agent_id=a.id
 WHERE a.task_id=? AND a.status<>'closed' AND b.item_task_id=? AND b.item_id=?
 AND (b.team_role=? OR (b.team_role='' AND a.parent_agent_id<>''))
-AND NOT EXISTS (SELECT 1 FROM agent_work_item_bindings r WHERE r.replaces_agent_id=b.agent_id)`,
+AND NOT EXISTS (SELECT 1 FROM agent_work_item_bindings r JOIN agents ra ON ra.id=r.agent_id WHERE r.replaces_agent_id=b.agent_id AND ra.status<>'closed')`,
 			taskID, req.WorkItem.ItemTaskID, req.WorkItem.ItemID, api.TeamRoleExtra).Scan(&activeExtras); err != nil {
 			return a, err
 		}
@@ -608,6 +634,13 @@ AND NOT EXISTS (SELECT 1 FROM agent_work_item_bindings r WHERE r.replaces_agent_
 	}
 	if a.WorkItem, err = insertAgentWorkItemBinding(ctx, tx, a, req.WorkItem, contextThrough, resolvedTeamRole); err != nil {
 		return a, err
+	}
+	if freshParentedItemBound {
+		// Consume the intent atomically in this same transaction: it
+		// authorizes exactly this one fresh admission, never a later one.
+		if _, err = tx.ExecContext(ctx, `UPDATE agent_allocation_intents SET consumed_at=?, consumed_by_run_id=? WHERE agent_id=?`, ts(now), a.RunID, req.AgentID); err != nil {
+			return a, err
+		}
 	}
 	if err = s.pinCrossProjectQueueAdmission(ctx, tx, taskID, req.WorkItem, a); err != nil {
 		return a, err

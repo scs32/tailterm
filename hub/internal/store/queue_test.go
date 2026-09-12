@@ -930,6 +930,12 @@ func TestQueueExactReplayRejectsChangedTeamRole(t *testing.T) {
 			ContextBundle: bundle, TeamRole: api.TeamRoleMember,
 		},
 	}
+	if _, err = s.CreateAllocationIntent(ctx, target.ID, api.CreateAllocationIntentRequest{
+		AgentID: workerID, ItemTaskID: source.ID, ItemID: item.ID, ItemRevision: item.Revision,
+		WorkOrderMessage: api.MessageReference{TaskID: source.ID, Seq: order.Seq}, TeamRole: api.TeamRoleMember,
+	}, by); err != nil {
+		t.Fatal(err)
+	}
 	worker, err := s.AddAgent(ctx, target.ID, memberRequest, by)
 	if err != nil || worker.WorkItem == nil || worker.WorkItem.TeamRole != api.TeamRoleMember {
 		t.Fatalf("initial member admission: %+v %v", worker, err)
