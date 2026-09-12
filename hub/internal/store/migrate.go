@@ -138,7 +138,6 @@ CREATE TABLE IF NOT EXISTS agent_work_item_bindings (
   FOREIGN KEY(work_order_task_id,work_order_message_seq) REFERENCES messages(task_id,seq)
 );
 CREATE INDEX IF NOT EXISTS agent_work_item_bindings_item ON agent_work_item_bindings(item_task_id,item_id,created_at);
-CREATE INDEX IF NOT EXISTS agent_work_item_bindings_item_team_role ON agent_work_item_bindings(item_task_id,item_id,team_role,created_at);
 DROP INDEX IF EXISTS agent_work_item_bindings_replacement;
 CREATE TABLE IF NOT EXISTS message_post_requests (
   receipt_id TEXT PRIMARY KEY,
@@ -207,6 +206,15 @@ CREATE TABLE IF NOT EXISTS decision_answers (
 		if _, err := db.Exec(`ALTER TABLE agent_work_item_bindings ADD COLUMN team_role TEXT NOT NULL DEFAULT ''`); err != nil {
 			return err
 		}
+	}
+	// This index must not be created inside the CREATE TABLE IF NOT EXISTS
+	// block above: on an existing database (table already present without
+	// team_role, before the ALTER TABLE just above ran) an index on that
+	// column would fail with "no such column: team_role" before this
+	// migration ever reached the column repair. It is safe only here, after
+	// the column is guaranteed to exist either way.
+	if _, err := db.Exec(`CREATE INDEX IF NOT EXISTS agent_work_item_bindings_item_team_role ON agent_work_item_bindings(item_task_id,item_id,team_role,created_at)`); err != nil {
+		return err
 	}
 	if _, err := db.Exec(`UPDATE work_items SET narrative_scope_revision=revision WHERE narrative_scope_revision=0`); err != nil {
 		return err
