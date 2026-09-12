@@ -572,10 +572,28 @@ AND NOT EXISTS (SELECT 1 FROM agent_work_item_bindings b WHERE b.agent_id=a.id)`
 		if !t.AllowAgentSpawn {
 			return a, api.ErrAgentSpawnDisabled
 		}
+		// A binding that has since been superseded by a replacement (some
+		// other binding's replaces_agent_id points at it) must not be
+		// double-counted alongside its replacement: they are one logical
+		// continued slot, not two (independent review #2300/#2771 finding
+		// 2). Only the live end of any replacement chain counts.
+		//
+		// A legacy parented binding predating this correction has
+		// team_role='' -- unknown, not "member". Independent review
+		// #2300/#2771 finding 4: excluding it from this count entirely
+		// would silently refund the item's already-consumed allowance,
+		// letting maxNewAgents fresh extras stack on top of open legacy
+		// ones the owner's ceiling was meant to include. The conservative,
+		// owner-ceiling-preserving choice is to count it as an extra until
+		// an authorized migration/classification decision reclassifies it;
+		// a parentless legacy binding is unambiguous (never an extra, then
+		// or now) and is excluded exactly as before.
 		var activeExtras int
 		if err = tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM agents a
 JOIN agent_work_item_bindings b ON b.agent_id=a.id
-WHERE a.task_id=? AND a.status<>'closed' AND b.item_task_id=? AND b.item_id=? AND b.team_role=?`,
+WHERE a.task_id=? AND a.status<>'closed' AND b.item_task_id=? AND b.item_id=?
+AND (b.team_role=? OR (b.team_role='' AND a.parent_agent_id<>''))
+AND NOT EXISTS (SELECT 1 FROM agent_work_item_bindings r WHERE r.replaces_agent_id=b.agent_id)`,
 			taskID, req.WorkItem.ItemTaskID, req.WorkItem.ItemID, api.TeamRoleExtra).Scan(&activeExtras); err != nil {
 			return a, err
 		}

@@ -129,8 +129,8 @@ func validateAgentWorkItemRequest(q queryRower, ctx context.Context, targetTaskI
 	}
 	resolvedTeamRole := req.TeamRole
 	if req.ReplacesAgentID != "" {
-		var priorTask, priorRun, priorRole string
-		if err := q.QueryRowContext(ctx, `SELECT task_id,run_id,role FROM agents WHERE id=?`, req.ReplacesAgentID).Scan(&priorTask, &priorRun, &priorRole); err != nil {
+		var priorTask, priorRun, priorRole, priorStatus string
+		if err := q.QueryRowContext(ctx, `SELECT task_id,run_id,role,status FROM agents WHERE id=?`, req.ReplacesAgentID).Scan(&priorTask, &priorRun, &priorRole, &priorStatus); err != nil {
 			if errors.Is(err, sql.ErrNoRows) {
 				return 0, "", api.ErrInvalid
 			}
@@ -138,6 +138,14 @@ func validateAgentWorkItemRequest(q queryRower, ctx context.Context, targetTaskI
 		}
 		if priorTask != targetTaskID || priorRole != "" {
 			return 0, "", api.ErrInvalid
+		}
+		// Independent review #2300/#2771 finding 2: an active (non-exited)
+		// agent must not be "replaced" by a concurrently admitted session --
+		// that would double-reserve one logical slot as two counted
+		// bindings. Only a genuinely gone run may be replaced, matching the
+		// existing exited-database-handler-restart precedent in AddAgent.
+		if priorStatus != api.AgentExited {
+			return 0, "", fmt.Errorf("%w: only an exited agent's binding may be replaced", api.ErrConflict)
 		}
 		prior, err := loadAgentWorkItemBinding(q, ctx, req.ReplacesAgentID, priorRun)
 		if err != nil || prior == nil || prior.ItemTaskID != req.ItemTaskID || prior.ItemID != req.ItemID {
@@ -260,9 +268,17 @@ func exactExistingQueueAdmission(q queryRower, ctx context.Context, targetTaskID
 	digestBytes := sha256.Sum256(work.ContextBundle)
 	digest := hex.EncodeToString(digestBytes[:])
 	binding := existing.WorkItem
+	// A replay must not silently change classification (independent review
+	// #2300/#2771 finding 3): comparing only item/order/context let a retry
+	// swap member for extra (or vice versa) and still be treated as the
+	// exact same prior admission. work.TeamRole is the caller's request
+	// value, which for a replacement is not required to be set (it may be
+	// inherited); compare against the persisted binding's resolved role
+	// either way so an explicit mismatch or a silent one are both caught.
 	if binding.ItemTaskID != work.ItemTaskID || binding.ItemID != work.ItemID || binding.ItemRevision != work.ItemRevision ||
-		binding.WorkOrderMessage != work.WorkOrderMessage || binding.ReplacesAgentID != work.ReplacesAgentID || binding.ContextDigest != digest {
-		return false, workItemConflict("Queue admission retry changed its exact item/order/context binding")
+		binding.WorkOrderMessage != work.WorkOrderMessage || binding.ReplacesAgentID != work.ReplacesAgentID || binding.ContextDigest != digest ||
+		(work.TeamRole != "" && work.TeamRole != binding.TeamRole) {
+		return false, workItemConflict("Queue admission retry changed its exact item/order/context/classification binding")
 	}
 	rows, err := q.QueryContext(ctx, `SELECT snapshot FROM queue_events WHERE target_task_id=? AND entry_id=? AND cycle=? AND kind='admitted' ORDER BY seq`, targetTaskID, work.QueueClaim.EntryID, work.QueueClaim.Cycle)
 	if err != nil {

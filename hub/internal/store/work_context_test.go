@@ -660,3 +660,133 @@ func TestItemExtraCapacityRegularMemberIgnoresSpawnDisabled(t *testing.T) {
 		t.Fatalf("genuine extra should still be blocked by disabled agent spawning: %v", err)
 	}
 }
+
+// TestItemExtraCapacityReplacementRequiresExitedAndDoesNotDoubleCount
+// addresses independent review #2300/#2771 finding 2: an active (not
+// exited) extra must not be "replaced" by a concurrently admitted session
+// -- that would double-reserve one logical slot as two active bindings --
+// and once a genuinely exited extra IS replaced, the exited original and
+// its replacement must count as exactly one active extra, not two, on
+// subsequent admissions.
+func TestItemExtraCapacityReplacementRequiresExitedAndDoesNotDoubleCount(t *testing.T) {
+	ctx := context.Background()
+	s, err := Open(filepath.Join(t.TempDir(), "replacement-lifecycle.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	by := api.Caller{Node: "fixture", User: "owner"}
+	one := 1
+	task, err := s.CreateTask(ctx, api.CreateTaskRequest{Name: "Replacement lifecycle", AllowAgentSpawn: true, MaxNewAgents: &one}, by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lead, err := s.AddAgent(ctx, task.ID, api.AddAgentRequest{Name: "lead", Host: "fixture", Session: "lead", Runtime: "codex"}, by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	item, err := s.CreateWorkItem(ctx, task.ID, api.CreateWorkItemRequest{Kind: "bug", Title: "Replacement lifecycle item", AgentID: lead.ID, RequestID: "replacement-lifecycle-item"}, by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bind := func(name, replaces string) (api.Agent, error) {
+		order := contextLinkedMessage(t, s, task, item, name+" order", name+"-order", nil)
+		req := &api.AgentWorkItemRequest{ItemTaskID: task.ID, ItemID: item.ID, ItemRevision: item.Revision, WorkOrderMessage: api.MessageReference{TaskID: task.ID, Seq: order.Seq}, ReplacesAgentID: replaces}
+		if replaces == "" {
+			req.TeamRole = api.TeamRoleExtra
+		}
+		req.ContextBundle = syntheticPreparedContext(t, item, req.WorkOrderMessage, syntheticHistory(item, order))
+		return s.AddAgent(ctx, task.ID, api.AddAgentRequest{Name: name, Host: "fixture", Session: name, Runtime: "codex", ParentAgentID: lead.ID, WorkItem: req}, by)
+	}
+	extra, err := bind("extra", "")
+	if err != nil {
+		t.Fatalf("first extra rejected: %v", err)
+	}
+	// Still active (not exited): replacing it must be rejected outright,
+	// not silently admitted as a second, concurrently active binding.
+	if _, err = bind("replacement-too-early", extra.ID); !errors.Is(err, api.ErrConflict) {
+		t.Fatalf("replacing an active (non-exited) extra should be rejected: %v", err)
+	}
+	if _, err = s.PostEvent(ctx, task.ID, api.PostEventRequest{AgentID: extra.ID, RunID: extra.RunID, Kind: api.EventExited}, by); err != nil {
+		t.Fatal(err)
+	}
+	replacement, err := bind("replacement", extra.ID)
+	if err != nil {
+		t.Fatalf("replacing a genuinely exited extra should be admitted: %v", err)
+	}
+	if replacement.WorkItem == nil || replacement.WorkItem.TeamRole != api.TeamRoleExtra {
+		t.Fatalf("replacement lost its inherited extra role: %+v", replacement)
+	}
+	// The exited original and its live replacement must count as exactly
+	// one active extra: with MaxNewAgents=1 already fully spent by that one
+	// logical slot, a second fresh extra must still be rejected -- not
+	// admitted because the original and replacement double-counted down to
+	// zero, and not permanently blocked because they double-counted up to
+	// two either.
+	if _, err = bind("second-extra", ""); !errors.Is(err, api.ErrAgentSpawnLimit) {
+		t.Fatalf("exited original + replacement should count as exactly one active extra: %v", err)
+	}
+}
+
+// TestItemExtraCapacityLegacyParentedBindingCountsConservatively addresses
+// independent review #2300/#2771 finding 4: a legacy binding predating this
+// correction (team_role=”, never reclassified) must not be silently
+// excluded from the item's active-extra count -- that would let fresh
+// extras stack on top of it past the owner's intended ceiling. A parented
+// legacy binding is conservatively counted as an extra; a parentless one
+// (never ambiguous -- it was never an extra) is not.
+func TestItemExtraCapacityLegacyParentedBindingCountsConservatively(t *testing.T) {
+	ctx := context.Background()
+	s, err := Open(filepath.Join(t.TempDir(), "legacy-capacity.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	by := api.Caller{Node: "fixture", User: "owner"}
+	one := 1
+	task, err := s.CreateTask(ctx, api.CreateTaskRequest{Name: "Legacy capacity", AllowAgentSpawn: true, MaxNewAgents: &one}, by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lead, err := s.AddAgent(ctx, task.ID, api.AddAgentRequest{Name: "lead", Host: "fixture", Session: "lead", Runtime: "codex"}, by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	item, err := s.CreateWorkItem(ctx, task.ID, api.CreateWorkItemRequest{Kind: "bug", Title: "Legacy capacity item", AgentID: lead.ID, RequestID: "legacy-capacity-item"}, by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	order := contextLinkedMessage(t, s, task, item, "legacy order", "legacy-order", nil)
+	req := &api.AgentWorkItemRequest{ItemTaskID: task.ID, ItemID: item.ID, ItemRevision: item.Revision, WorkOrderMessage: api.MessageReference{TaskID: task.ID, Seq: order.Seq}, TeamRole: api.TeamRoleExtra}
+	req.ContextBundle = syntheticPreparedContext(t, item, req.WorkOrderMessage, syntheticHistory(item, order))
+	legacyExtra, err := s.AddAgent(ctx, task.ID, api.AddAgentRequest{Name: "legacy-extra", Host: "fixture", Session: "legacy-extra", Runtime: "codex", ParentAgentID: lead.ID, WorkItem: req}, by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Simulate a binding written before this correction ever ran: directly
+	// blank its persisted team_role, exactly as a real pre-migration row
+	// would read.
+	if _, err = s.db.ExecContext(ctx, `UPDATE agent_work_item_bindings SET team_role='' WHERE agent_id=?`, legacyExtra.ID); err != nil {
+		t.Fatal(err)
+	}
+	freshOrder := contextLinkedMessage(t, s, task, item, "fresh extra order", "fresh-extra-order", nil)
+	freshReq := &api.AgentWorkItemRequest{ItemTaskID: task.ID, ItemID: item.ID, ItemRevision: item.Revision, WorkOrderMessage: api.MessageReference{TaskID: task.ID, Seq: freshOrder.Seq}, TeamRole: api.TeamRoleExtra}
+	freshReq.ContextBundle = syntheticPreparedContext(t, item, freshReq.WorkOrderMessage, syntheticHistory(item, freshOrder))
+	if _, err = s.AddAgent(ctx, task.ID, api.AddAgentRequest{Name: "fresh-extra", Host: "fixture", Session: "fresh-extra", Runtime: "codex", ParentAgentID: lead.ID, WorkItem: freshReq}, by); !errors.Is(err, api.ErrAgentSpawnLimit) {
+		t.Fatalf("legacy parented binding should conservatively count against the allowance: %v", err)
+	}
+	// A parentless legacy binding was never an extra and still isn't.
+	baseOrder := contextLinkedMessage(t, s, task, item, "legacy base order", "legacy-base-order", nil)
+	baseReq := &api.AgentWorkItemRequest{ItemTaskID: task.ID, ItemID: item.ID, ItemRevision: item.Revision, WorkOrderMessage: api.MessageReference{TaskID: task.ID, Seq: baseOrder.Seq}}
+	baseReq.ContextBundle = syntheticPreparedContext(t, item, baseReq.WorkOrderMessage, syntheticHistory(item, baseOrder))
+	base, err := s.AddAgent(ctx, task.ID, api.AddAgentRequest{Name: "legacy-base", Host: "fixture", Session: "legacy-base", Runtime: "codex", WorkItem: baseReq}, by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = s.db.ExecContext(ctx, `UPDATE agent_work_item_bindings SET team_role='' WHERE agent_id=?`, base.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = s.AddAgent(ctx, task.ID, api.AddAgentRequest{Name: "fresh-extra-2", Host: "fixture", Session: "fresh-extra-2", Runtime: "codex", ParentAgentID: lead.ID, WorkItem: freshReq}, by); !errors.Is(err, api.ErrAgentSpawnLimit) {
+		t.Fatalf("expected the same rejection (unaffected by the parentless legacy row): %v", err)
+	}
+}
