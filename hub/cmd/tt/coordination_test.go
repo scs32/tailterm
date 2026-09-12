@@ -460,7 +460,7 @@ func TestSpawnFailsClosedAgainstHubMissingAllocationIntentCapability(t *testing.
 	launcher := spawnLauncherAgent(t, c, task)
 	e := env{hub: c.Base, task: task, agent: launcher.ID}
 	err := cmdSpawn(e, itemBoundSpawnArgs(t, c, task))
-	if err == nil || !strings.Contains(err.Error(), "does not support allocation-intent") {
+	if err == nil || !strings.Contains(err.Error(), "does not support a compatible allocation-intent") {
 		t.Fatalf("expected explicit fail-closed allocation-intent error, got %v", err)
 	}
 }
@@ -481,8 +481,31 @@ func TestSpawnFailsClosedWhenHubExplicitlyReportsAllocationIntentUnsupported(t *
 	launcher := spawnLauncherAgent(t, c, task)
 	e := env{hub: c.Base, task: task, agent: launcher.ID}
 	err := cmdSpawn(e, itemBoundSpawnArgs(t, c, task))
-	if err == nil || !strings.Contains(err.Error(), "does not support allocation-intent") {
+	if err == nil || !strings.Contains(err.Error(), "does not support a compatible allocation-intent") {
 		t.Fatalf("expected explicit fail-closed allocation-intent error, got %v", err)
+	}
+}
+
+// TestSpawnFailsClosedWhenAllocationIntentVersionsExcludesCompatibleVersion
+// covers review #3003/#3010's additional gap: Supported alone is not
+// sufficient. A hub could report Supported=true (perhaps for a future,
+// incompatible revision of the contract) while its advertised Versions list
+// never actually includes version 1, the only version this CLI speaks --
+// that must still fail closed, not be treated as "field present, proceed".
+func TestSpawnFailsClosedWhenAllocationIntentVersionsExcludesCompatibleVersion(t *testing.T) {
+	c, task := newMixedVersionSpawnFixture(t, func(w http.ResponseWriter, r *http.Request) bool {
+		caps := api.CurrentCapabilities()
+		caps.AllocationIntent.Supported = true
+		caps.AllocationIntent.Versions = []int{2, 3}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(caps)
+		return true
+	})
+	launcher := spawnLauncherAgent(t, c, task)
+	e := env{hub: c.Base, task: task, agent: launcher.ID}
+	err := cmdSpawn(e, itemBoundSpawnArgs(t, c, task))
+	if err == nil || !strings.Contains(err.Error(), "does not support a compatible allocation-intent") {
+		t.Fatalf("expected explicit fail-closed allocation-intent version error, got %v", err)
 	}
 }
 
@@ -497,7 +520,7 @@ func TestSpawnProceedsPastCapabilityGateWhenHubSupportsAllocationIntent(t *testi
 	launcher := spawnLauncherAgent(t, c, task)
 	e := env{hub: c.Base, task: task, agent: launcher.ID}
 	err := cmdSpawn(e, itemBoundSpawnArgs(t, c, task))
-	if err == nil || strings.Contains(err.Error(), "does not support allocation-intent") || !strings.Contains(err.Error(), "allocation intent") {
+	if err == nil || strings.Contains(err.Error(), "does not support a compatible allocation-intent") || !strings.Contains(err.Error(), "allocation intent") {
 		t.Fatalf("capability gate should have passed (failing only on the missing allocation intent) against an up-to-date hub, got %v", err)
 	}
 }
@@ -520,5 +543,61 @@ func TestSpawnOldStyleRequestWithoutIntentRejectedByCorrectedHub(t *testing.T) {
 	err := cmdSpawn(e, args)
 	if err == nil || !strings.Contains(err.Error(), "allocation intent") {
 		t.Fatalf("expected an actionable missing-allocation-intent rejection from the corrected hub, got %v", err)
+	}
+}
+
+// TestAllocationIntentCreateRequestIDRequiresFrozenExpectedRunID and
+// TestAllocationIntentCreateLostResponseRetryReplaysIdentically address
+// independent review #3003/#3010 finding 2: `tt allocation-intent create
+// --request-id K` must actually be idempotent under its documented default.
+// Auto-generating a fresh --expected-run-id on every invocation broke an
+// unchanged retry of the same command (the store's retry-key lookup found
+// the same K but then rejected the newly generated ExpectedRunID as a
+// payload mismatch).
+
+func TestAllocationIntentCreateRequestIDRequiresFrozenExpectedRunID(t *testing.T) {
+	e := env{hub: "http://127.0.0.1:1", task: "tsk_0000000000000001", agent: "agt_0000000000000001", runID: "run_0000000000000001"}
+	err := cmdAllocationIntentCreate(e, []string{
+		"--agent-id", "agt_0000000000000002", "--work-item", "wi_0000000000000001", "--work-item-revision", "1",
+		"--work-order-message", "1", "--team-role", "extra", "--work-context-json", "{}", "--request-id", "retry-key-1",
+	})
+	if err == nil || !strings.Contains(err.Error(), "--expected-run-id is required when --request-id is set") {
+		t.Fatalf("expected an explicit frozen-expected-run-id requirement error, got %v", err)
+	}
+}
+
+func TestAllocationIntentCreateLostResponseRetryReplaysIdentically(t *testing.T) {
+	c, task := newMixedVersionSpawnFixture(t, func(w http.ResponseWriter, r *http.Request) bool { return false })
+	lead := spawnLauncherAgent(t, c, task)
+	item, orderSeq := realSpawnWorkItemAndOrder(t, c, task)
+	contextFile := filepath.Join(t.TempDir(), "context.json")
+	if err := os.WriteFile(contextFile, []byte(syntheticSpawnContextBundle(t, task, item, orderSeq)), 0600); err != nil {
+		t.Fatal(err)
+	}
+	e := env{hub: c.Base, task: task, agent: lead.ID, runID: lead.RunID}
+	agentID := api.NewID("agt")
+	expectedRunID := api.NewID("run")
+	args := []string{
+		"--agent-id", agentID, "--work-item", item, "--work-item-revision", "1",
+		"--work-order-message", fmt.Sprint(orderSeq), "--team-role", "extra",
+		"--work-context-file", contextFile, "--expected-run-id", expectedRunID, "--request-id", "lost-response-1", "--json",
+	}
+	// First attempt: simulate the response being lost by only checking the
+	// call succeeded (a real lost-response scenario has the caller never
+	// see this return value at all, then retry the identical command).
+	if err := cmdAllocationIntentCreate(e, args); err != nil {
+		t.Fatalf("first create should succeed: %v", err)
+	}
+	// Unchanged retry of the identical command (same frozen
+	// --expected-run-id, same --request-id): must replay the same record,
+	// not conflict.
+	if err := cmdAllocationIntentCreate(e, args); err != nil {
+		t.Fatalf("unchanged retry of the identical create command should replay successfully, not conflict: %v", err)
+	}
+	// A durable, independent readback confirms exactly one record exists
+	// and it carries the frozen expected-run-id from both attempts.
+	got, err := c.GetAllocationIntent(context.Background(), task, agentID)
+	if err != nil || got.ExpectedRunID != expectedRunID {
+		t.Fatalf("readback should show the one frozen record: %+v %v", got, err)
 	}
 }

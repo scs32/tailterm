@@ -50,7 +50,19 @@ Commands
                                start a sibling agent session on this host
   allocation-intent create --agent-id ID --work-item ID --work-item-revision N
                              --work-order-message N --team-role member|extra
-                               author a pre-admission member/extra intent
+                             --work-context-file F|--work-context-json J
+                             [--launcher-agent-id ID --launcher-run-id ID]
+                             [--expected-run-id ID] [--request-id KEY]
+                               author a pre-admission member/extra intent bound
+                               to the exact prepared context digest, a
+                               preallocated expected run and the intended
+                               launcher (default: the authoring agent itself);
+                               freeze --expected-run-id when reusing
+                               --request-id so an uncertain retry replays the
+                               same record instead of conflicting
+  allocation-intent get --agent-id ID
+                               non-destructive readback of a recorded intent,
+                               before or after consumption
   retire [AGENT]              disable inbox wake-ups; preserve terminal and results
   resume [AGENT]              re-enable inbox wake-ups for a retired agent
   close [--json] [AGENT]       exact-run closeout on this host (default: self)
@@ -620,7 +632,9 @@ func cmdAllocationIntentCreate(e env, args []string) error {
 	teamRole := fs.String("team-role", "", "intended classification: member or extra (required)")
 	workContextFile := fs.String("work-context-file", "", "the exact prepared context bundle the launch will use (required, one of file/json -- its sha256 becomes the bound context digest)")
 	workContextJSON := fs.String("work-context-json", "", "same as --work-context-file, inline")
-	expectedRunID := fs.String("expected-run-id", "", "preallocated run id this intent authorizes (default: freshly generated)")
+	expectedRunID := fs.String("expected-run-id", "", "preallocated run id this intent authorizes (default: freshly generated; required when --request-id is set)")
+	launcherAgentID := fs.String("launcher-agent-id", "", "agent authorized to actually perform the launch (default: this authoring agent)")
+	launcherRunID := fs.String("launcher-run-id", "", "that agent's current live run (required if --launcher-agent-id is set)")
 	requestID := fs.String("request-id", "", "stable retry key: an identical repeat returns the same record, even after consumption")
 	task := fs.String("task", e.task, "task id")
 	asJSON := fs.Bool("json", false, "print the intent record as JSON")
@@ -628,6 +642,20 @@ func cmdAllocationIntentCreate(e env, args []string) error {
 	if !api.ValidID(*agentID, "agt") || *workItemID == "" || *workItemRevision < 1 || *workOrderMessage < 1 ||
 		(*teamRole != api.TeamRoleMember && *teamRole != api.TeamRoleExtra) || (*workContextFile == "") == (*workContextJSON == "") {
 		return fmt.Errorf("allocation-intent create requires --agent-id, --work-item, --work-item-revision, --work-order-message, --team-role %s or %s, and exactly one of --work-context-file/--work-context-json", api.TeamRoleMember, api.TeamRoleExtra)
+	}
+	if (*launcherAgentID == "") != (*launcherRunID == "") {
+		return errors.New("--launcher-agent-id and --launcher-run-id must be given together")
+	}
+	// Independent review #3003/#3010 finding 2: a lost-response retry of an
+	// unchanged `tt allocation-intent create --request-id K` command must
+	// replay identically. Auto-generating a fresh ExpectedRunID on every
+	// invocation broke that -- the store's retry-key lookup found the same
+	// K but then rejected the newly generated ExpectedRunID as a payload
+	// mismatch. --expected-run-id is now required whenever --request-id is
+	// used, so the caller freezes it (e.g. once, before the first attempt)
+	// and an unchanged retry sends the identical value.
+	if *requestID != "" && *expectedRunID == "" {
+		return errors.New("--expected-run-id is required when --request-id is set, so an unchanged retry sends the identical value instead of a freshly generated one")
 	}
 	if e.agent == "" || e.runID == "" {
 		return errors.New("allocation-intent create requires an agent session identity (author agent/run); this session has none")
@@ -662,7 +690,8 @@ func cmdAllocationIntentCreate(e env, args []string) error {
 	in, err := c.CreateAllocationIntent(ctx, *task, api.CreateAllocationIntentRequest{
 		AgentID: *agentID, TargetTaskID: *task, ItemTaskID: *workItemTask, ItemID: *workItemID, ItemRevision: *workItemRevision,
 		WorkOrderMessage: api.MessageReference{TaskID: *workOrderTask, Seq: *workOrderMessage}, ContextDigest: hex.EncodeToString(digest[:]),
-		TeamRole: *teamRole, AuthorAgentID: e.agent, AuthorRunID: e.runID, ExpectedRunID: *expectedRunID, RequestID: *requestID,
+		TeamRole: *teamRole, AuthorAgentID: e.agent, AuthorRunID: e.runID, ExpectedRunID: *expectedRunID,
+		ExpectedLauncherAgentID: *launcherAgentID, ExpectedLauncherRunID: *launcherRunID, RequestID: *requestID,
 	})
 	if err != nil {
 		return err
@@ -921,9 +950,22 @@ func cmdSpawn(e env, args []string) error {
 		// window where the hub AND every launch CLI are upgraded together
 		// is the actual supported unit; this check only detects the
 		// mismatch honestly, it does not itself coordinate the rollout.
+		// Independent review #3003/#3010 gap: Supported alone is not
+		// sufficient -- a hub could advertise Supported=true for some
+		// future incompatible revision of the contract while never having
+		// shipped the exact version (1) this CLI actually speaks. The
+		// advertised Versions list must contain a version this CLI
+		// understands, not merely a truthy flag.
 		caps, capErr := c.Capabilities(ctx)
-		if capErr != nil || !caps.AllocationIntent.Supported {
-			return fmt.Errorf("hub does not support allocation-intent (required for a fresh parented item-bound launch); upgrade the hub before this CLI can launch parented item-bound work here: %v", capErr)
+		compatible := false
+		for _, v := range caps.AllocationIntent.Versions {
+			if v == api.AllocationIntentCapabilityVersion {
+				compatible = true
+				break
+			}
+		}
+		if capErr != nil || !caps.AllocationIntent.Supported || !compatible {
+			return fmt.Errorf("hub does not support a compatible allocation-intent version (required for a fresh parented item-bound launch); upgrade the hub before this CLI can launch parented item-bound work here: %v", capErr)
 		}
 	}
 	launcherSelfPath := selfPath()
