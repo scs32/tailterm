@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -84,4 +85,12 @@ func readPreparedWorkContext(inline, path string) ([]byte, error) {
 		return nil, errors.New("prepared work-item context is not valid UTF-8 JSON")
 	}
 	return data, nil
+}
+
+func compactPreparedWorkContext(data []byte) ([]byte, error) {
+	var compact bytes.Buffer
+	if err := json.Compact(&compact, data); err != nil {
+		return nil, err
+	}
+	return compact.Bytes(), nil
 }

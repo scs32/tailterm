@@ -666,16 +666,15 @@ func cmdAllocationIntentCreate(e env, args []string) error {
 	if *workOrderTask == "" {
 		*workOrderTask = *workItemTask
 	}
-	contextData := []byte(*workContextJSON)
-	if *workContextFile != "" {
-		var readErr error
-		contextData, readErr = os.ReadFile(*workContextFile)
-		if readErr != nil {
-			return fmt.Errorf("read prepared work-item context: %w", readErr)
-		}
+	contextData, err := readPreparedWorkContext(*workContextJSON, *workContextFile)
+	if err != nil {
+		return err
 	}
-	if !json.Valid(contextData) {
-		return errors.New("prepared work-item context is not valid JSON")
+	// New intent digests must cover the same losslessly compacted RawMessage
+	// the AddAgent client sends. Existing intents are never rewritten.
+	contextData, err = compactPreparedWorkContext(contextData)
+	if err != nil {
+		return err
 	}
 	digest := sha256.Sum256(contextData)
 	if *expectedRunID == "" {

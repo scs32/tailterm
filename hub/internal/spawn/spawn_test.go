@@ -1,6 +1,8 @@
 package spawn
 
 import (
+	"crypto/sha256"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -81,4 +83,36 @@ func TestPrivateShellCommandCompleteContextAndCleanup(t *testing.T) {
 	if _, err := os.Stat(failed.Args[1]); !os.IsNotExist(err) {
 		t.Fatal("failed-start script retained")
 	}
+}
+
+func TestContextReleaseHostArgv(t *testing.T) {
+	self, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, character := range []string{"'", "界"} {
+		payload := strings.Repeat(character, 262144/len(character)) + strings.Repeat("x", 262144%len(character))
+		command, cleanup, err := privateShellCommand("/bin/sh", ShellQuote(self)+" -test.run=^TestContextArgvFixture$ -- "+ShellQuote(payload))
+		if err != nil {
+			t.Fatal(err)
+		}
+		command.Env = []string{"PATH=/usr/bin:/bin", "TT_SYNTHETIC_CONTEXT_ARGV=1"}
+		output, err := command.Output()
+		cleanup()
+		if err != nil {
+			t.Fatalf("actual host runtime argv does not support complete256KiB: %v", err)
+		}
+		want := fmt.Sprintf("%x", sha256.Sum256([]byte(payload)))
+		if string(output) != want {
+			t.Fatal("external synthetic runtime received changed context")
+		}
+	}
+}
+
+func TestContextArgvFixture(t *testing.T) {
+	if os.Getenv("TT_SYNTHETIC_CONTEXT_ARGV") != "1" {
+		return
+	}
+	fmt.Printf("%x", sha256.Sum256([]byte(os.Args[len(os.Args)-1])))
+	os.Exit(0)
 }

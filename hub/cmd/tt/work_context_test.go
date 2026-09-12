@@ -2,14 +2,22 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"github.com/scs32/tailterm/hub/internal/server"
+	"github.com/scs32/tailterm/hub/internal/store"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/scs32/tailterm/hub/internal/api"
 )
@@ -101,6 +109,177 @@ func TestWrapCompleteQuotedContextFileBound(t *testing.T) {
 		}
 		if _, err := os.Stat(path); !os.IsNotExist(err) {
 			t.Fatal("consumed command retained")
+		}
+	}
+}
+
+// wi_7e220de54deaef33/order3022/amendment3126: actual CLI authoring and API admission.
+func TestAllocationIntentContextTransportParity(t *testing.T) {
+	for _, size := range []int{8192, 152973} {
+		t.Run(fmt.Sprint(size), func(t *testing.T) {
+			c, task, loseReply := contextIntentFixture(t)
+			lead := spawnLauncherAgent(t, c, task)
+			item, order := realSpawnWorkItemAndOrder(t, c, task)
+			var bundle map[string]any
+			if err := json.Unmarshal([]byte(syntheticSpawnContextBundle(t, task, item, order)), &bundle); err != nil {
+				t.Fatal(err)
+			}
+			history := bundle["history"].(map[string]any)
+			messages := history["messages"].([]any)
+			for i := 0; i < size/7500+1; i++ {
+				messages = append(messages, map[string]any{"message": map[string]any{"taskId": task, "seq": order + int64(i) + 1, "text": "<>&界 " + strings.Repeat("界", 2500)}})
+			}
+			history["messages"] = messages
+			raw, err := json.MarshalIndent(bundle, "", "  ")
+			if err != nil {
+				t.Fatal(err)
+			}
+			for encoded, literal := range map[string]string{`\u003c`: "<", `\u003e`: ">", `\u0026`: "&"} {
+				raw = bytes.ReplaceAll(raw, []byte(encoded), []byte(literal))
+			}
+			if len(raw) < size {
+				t.Fatal("fixture below target")
+			}
+			path := filepath.Join(t.TempDir(), "synthetic-context.json")
+			if err = os.WriteFile(path, raw, 0600); err != nil {
+				t.Fatal(err)
+			}
+			agentID, runID := api.NewID("agt"), api.NewID("run")
+			e := env{hub: c.Base, task: task, agent: lead.ID, runID: lead.RunID}
+			args := []string{"--agent-id", agentID, "--work-item", item, "--work-item-revision", "1", "--work-order-message", fmt.Sprint(order), "--team-role", "member", "--work-context-file", path, "--expected-run-id", runID, "--request-id", "context-transport", "--json"}
+			loseReply.Store(true)
+			if err = cmdAllocationIntentCreate(e, args); err == nil {
+				t.Fatal("fixture did not lose the committed intent reply")
+			}
+			if err = cmdAllocationIntentCreate(e, args); err != nil {
+				t.Fatalf("unchanged uncertain retry failed: %v", err)
+			}
+			intent, err := c.GetAllocationIntent(context.Background(), task, agentID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var compact bytes.Buffer
+			if err = json.Compact(&compact, raw); err != nil {
+				t.Fatal(err)
+			}
+			hash := sha256.Sum256(compact.Bytes())
+			if intent.ContextDigest != hex.EncodeToString(hash[:]) {
+				t.Fatal("intent digest differs from exact bytes AddAgent will admit")
+			}
+			req := api.AddAgentRequest{AgentID: agentID, ParentAgentID: lead.ID, Name: "context-worker", Session: "context-worker", Host: "fixture", Runtime: "codex", WorkItem: &api.AgentWorkItemRequest{ItemTaskID: task, ItemID: item, ItemRevision: 1, TeamRole: api.TeamRoleMember, WorkOrderMessage: api.MessageReference{TaskID: task, Seq: order}, ContextBundle: raw}}
+			agent, err := c.AddAgent(context.Background(), task, req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			restored, err := c.GetAgentWorkItemContext(context.Background(), task, agent.ID, agent.RunID)
+			if err != nil || !bytes.Equal(restored.Bundle, compact.Bytes()) || restored.Binding.ContextDigest != intent.ContextDigest || agent.RunID != runID {
+				t.Fatalf("bound readback changed: %v", err)
+			}
+			if err = cmdAllocationIntentCreate(e, args); err != nil {
+				t.Fatalf("consumed-intent retry: %v", err)
+			}
+			_, err = c.AddAgent(context.Background(), task, req)
+			var duplicate *api.HTTPError
+			if !errors.As(err, &duplicate) || duplicate.Status != http.StatusConflict {
+				t.Fatalf("duplicate admission must reject: %v", err)
+			}
+			replay, err := c.GetAgent(context.Background(), task, agentID)
+			if err != nil || replay.ID != agent.ID || replay.RunID != agent.RunID {
+				t.Fatalf("uncertain identity readback changed: %v", err)
+			}
+			final, err := c.GetAllocationIntent(context.Background(), task, agentID)
+			if err != nil || final.ConsumedByRunID != runID || final.ExpectedLauncherAgentID != lead.ID || final.LauncherRunID != lead.RunID {
+				t.Fatalf("Capacity tuple changed: %v", err)
+			}
+			agents, err := c.ListAgents(context.Background(), task)
+			if err != nil || len(agents) != 2 {
+				t.Fatalf("duplicate identity: %v count=%d", err, len(agents))
+			}
+		})
+	}
+}
+
+func contextIntentFixture(t *testing.T) (*api.Client, string, *atomic.Bool) {
+	t.Helper()
+	st, err := store.Open(filepath.Join(t.TempDir(), "synthetic.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { st.Close() })
+	handler := server.New(st, func(*http.Request) (api.Caller, error) { return api.Caller{Node: "fixture", User: "fixture"}, nil })
+	lose := new(atomic.Bool)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/allocation-intents") && lose.Swap(false) {
+			recorded := httptest.NewRecorder()
+			handler.ServeHTTP(recorded, r)
+			if recorded.Code != http.StatusCreated {
+				t.Errorf("intent not committed before reply loss: %d", recorded.Code)
+			}
+			connection, _, err := w.(http.Hijacker).Hijack()
+			if err != nil {
+				t.Error(err)
+				return
+			}
+			connection.Close()
+			return
+		}
+		handler.ServeHTTP(w, r)
+	}))
+	t.Cleanup(srv.Close)
+	c, err := api.NewClient(srv.URL, 5*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	task, err := c.CreateTask(context.Background(), api.CreateTaskRequest{Name: "context intent parity", Orchestrator: "lead"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return c, task.ID, lose
+}
+
+func TestAllocationIntentLegacyRawDigestRemainsUnchanged(t *testing.T) {
+	c, task, _ := contextIntentFixture(t)
+	lead := spawnLauncherAgent(t, c, task)
+	item, order := realSpawnWorkItemAndOrder(t, c, task)
+	var raw bytes.Buffer
+	if err := json.Indent(&raw, []byte(syntheticSpawnContextBundle(t, task, item, order)), "", "  "); err != nil {
+		t.Fatal(err)
+	}
+	hash := sha256.Sum256(raw.Bytes())
+	agentID, runID := api.NewID("agt"), api.NewID("run")
+	before, err := c.CreateAllocationIntent(context.Background(), task, api.CreateAllocationIntentRequest{AgentID: agentID, TargetTaskID: task, ItemTaskID: task, ItemID: item, ItemRevision: 1, WorkOrderMessage: api.MessageReference{TaskID: task, Seq: order}, ContextDigest: hex.EncodeToString(hash[:]), TeamRole: api.TeamRoleMember, AuthorAgentID: lead.ID, AuthorRunID: lead.RunID, ExpectedRunID: runID, RequestID: "legacy-raw"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	e := env{hub: c.Base, task: task, agent: lead.ID, runID: lead.RunID}
+	args := []string{"--agent-id", agentID, "--work-item", item, "--work-item-revision", "1", "--work-order-message", fmt.Sprint(order), "--team-role", "member", "--work-context-json", raw.String(), "--expected-run-id", runID, "--request-id", "legacy-raw"}
+	err = cmdAllocationIntentCreate(e, args)
+	var conflict *api.HTTPError
+	if !errors.As(err, &conflict) || conflict.Status != http.StatusConflict {
+		t.Fatalf("legacy raw intent must fail without rewrite: %v", err)
+	}
+	after, err := c.GetAllocationIntent(context.Background(), task, agentID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	beforeJSON, _ := json.Marshal(before)
+	afterJSON, _ := json.Marshal(after)
+	if !bytes.Equal(beforeJSON, afterJSON) {
+		t.Fatal("legacy intent tuple was changed")
+	}
+}
+
+func TestAllocationIntentFileAndInlineByteBounds(t *testing.T) {
+	data := `{"source":"` + strings.Repeat("x", api.MaxAgentWorkItemContextBytes) + `"}`
+	path := filepath.Join(t.TempDir(), "oversized.json")
+	if err := os.WriteFile(path, []byte(data), 0600); err != nil {
+		t.Fatal(err)
+	}
+	e := env{hub: "http://127.0.0.1:1", task: "tsk_1111111111111111", agent: "agt_1111111111111111", runID: "run_1111111111111111"}
+	base := []string{"--agent-id", "agt_2222222222222222", "--work-item", "wi_1111111111111111", "--work-item-revision", "1", "--work-order-message", "1", "--team-role", "member", "--expected-run-id", "run_2222222222222222", "--request-id", "oversized"}
+	for _, input := range [][]string{{"--work-context-file", path}, {"--work-context-json", data}} {
+		if err := cmdAllocationIntentCreate(e, append(append([]string(nil), base...), input...)); !errors.Is(err, api.ErrContextLimit) {
+			t.Fatalf("bound not checked before hub: %v", err)
 		}
 	}
 }
