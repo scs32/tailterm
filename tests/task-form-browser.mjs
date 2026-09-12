@@ -1049,6 +1049,31 @@ try {
           }),
         })
       ).json();
+      // wi_7e220de54deaef33/order3022: complete synthetic history above the
+      // old 128 KiB cap, through real browser preparation/host/API admission.
+      for (let index = 0; index < 22; index++) {
+        const response = await fetch(
+          `http://127.0.0.1:${port}/v1/tasks/${target.id}/messages`,
+          {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({
+              text: `<>&界'\\ synthetic-history-${index} ` + "界".repeat(2500),
+              agentId: targetLead.id,
+              requestId: `context-growth-${name}-${index}`,
+              workItems: [
+                {
+                  itemTaskId: target.id,
+                  itemId: routedItem.id,
+                  itemRevision: routedItem.revision,
+                  relationship: "primary",
+                },
+              ],
+            }),
+          },
+        );
+        assert.equal(response.status, 201);
+      }
       const unrelatedRouteMessage = await (
         await fetch(`http://127.0.0.1:${port}/v1/tasks/${target.id}/messages`, {
           method: "POST",
@@ -1072,7 +1097,36 @@ try {
       const historyBefore = await (
         await fetch(origin + "/qa/history-requests")
       ).json();
+      await fetch(origin + "/qa/lose-launch-reply");
       await page.locator('#team-launch-form button[type="submit"]').click();
+      await page
+        .locator("#team-launch-status")
+        .filter({ hasText: "Synthetic lost launch response" })
+        .waitFor();
+      const uncertainLarge = await page.evaluate(async (taskId) => {
+        const plan = (await qa.localData()).teamLaunchPlans.find(
+          (p) => p.taskId === taskId && p.kind === "add-team",
+        );
+        return {
+          context: plan.workContextBundle,
+          identity: plan.members[0].fields.agentId,
+          state: plan.members[0].state,
+        };
+      }, target.id);
+      assert.equal(uncertainLarge.state, "uncertain");
+      assert.ok(Buffer.byteLength(uncertainLarge.context) > 152973);
+      await page.locator('#team-launch-form button[type="submit"]').click();
+      const reconciledLarge = await page.evaluate(async (taskId) => {
+        const plan = (await qa.localData()).teamLaunchPlans.find(
+          (p) => p.taskId === taskId && p.kind === "add-team",
+        );
+        return {
+          context: plan.workContextBundle,
+          identity: plan.members[0].fields.agentId,
+        };
+      }, target.id);
+      assert.equal(reconciledLarge.context, uncertainLarge.context);
+      assert.equal(reconciledLarge.identity, uncertainLarge.identity);
       await page
         .locator("#team-launch-status")
         .filter({ hasText: "is not a directory" })
@@ -1110,6 +1164,19 @@ try {
             workContextBundle: journal.workContextBundle,
           },
         };
+        if (
+          new TextEncoder().encode(journal.workContextBundle).byteLength <=
+          152973
+        )
+          throw new Error(
+            "Synthetic complete browser context did not exceed measured size",
+          );
+        if (
+          JSON.parse(journal.workContextBundle).history.messages.length !== 23
+        )
+          throw new Error(
+            "Complete synthetic source history was not preserved",
+          );
         return {
           exact: await qa.reconciledAgentProblem(taskId, entry, member, agent),
           run: await qa.reconciledAgentProblem(
@@ -1314,7 +1381,14 @@ try {
         restoredContext.bundle.history.messages.map(
           (link) => link.message.text,
         ),
-        ["Synthetic bounded browser work order"],
+        [
+          "Synthetic bounded browser work order",
+          ...Array.from(
+            { length: 22 },
+            (_, index) =>
+              `<>&界'\\ synthetic-history-${index} ` + "界".repeat(2500),
+          ),
+        ],
       );
       assert.ok(
         launchCommands

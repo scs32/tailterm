@@ -1,26 +1,26 @@
-async function contextDigest(value) {
-  // The browser hands the prepared JSON to tt as an argument. tt embeds that
-  // RawMessage in its Go JSON request; encoding/json compacts it and escapes
-  // HTML-sensitive runes before the hub hashes the admitted bytes.
-  const serialized = typeof value === "string" ? value : JSON.stringify(value);
-  const admitted = JSON.stringify(JSON.parse(serialized)).replace(
+import { compactWorkContext } from "../shared/work-context.js";
+
+async function contextDigests(value) {
+  const admitted = compactWorkContext(value);
+  // Pre-envelope-fix hosts used encoding/json's HTML-safe spelling. Retain
+  // that exact historical codec for uncertain saved launches; never rewrite
+  // the plan or the admitted binding to make a retry match.
+  const legacy = admitted.replace(
     /[<>&\u2028\u2029]/g,
     (character) =>
-      ({
-        "<": "\\u003c",
-        ">": "\\u003e",
-        "&": "\\u0026",
-        "\u2028": "\\u2028",
-        "\u2029": "\\u2029",
-      })[character],
+      "\\u" + character.charCodeAt(0).toString(16).padStart(4, "0"),
   );
-  const digest = await crypto.subtle.digest(
-    "SHA-256",
-    new TextEncoder().encode(admitted),
+  return Promise.all(
+    [admitted, legacy].map(async (text) => {
+      const digest = await crypto.subtle.digest(
+        "SHA-256",
+        new TextEncoder().encode(text),
+      );
+      return [...new Uint8Array(digest)]
+        .map((byte) => byte.toString(16).padStart(2, "0"))
+        .join("");
+    }),
   );
-  return [...new Uint8Array(digest)]
-    .map((byte) => byte.toString(16).padStart(2, "0"))
-    .join("");
 }
 
 export async function reconciledAgentProblem(taskId, entry, member, agent) {
@@ -39,7 +39,7 @@ export async function reconciledAgentProblem(taskId, entry, member, agent) {
     return agent.workItem ? "unexpected work-item binding" : "";
   const binding = agent.workItem;
   if (!binding) return "missing work-item binding";
-  const expectedDigest = await contextDigest(fields.workContextBundle);
+  const expectedDigests = await contextDigests(fields.workContextBundle);
   if (
     binding.agentId !== fields.agentId ||
     binding.runId !== agent.runId ||
@@ -49,7 +49,7 @@ export async function reconciledAgentProblem(taskId, entry, member, agent) {
     binding.workOrderMessage?.taskId !== fields.workOrderTaskId ||
     binding.workOrderMessage?.seq !== fields.workOrderMessageSeq ||
     (binding.replacesAgentId || "") !== (fields.replacesAgentId || "") ||
-    binding.contextDigest !== expectedDigest
+    !expectedDigests.includes(binding.contextDigest)
   )
     return "work-item/order/context binding";
   return "";

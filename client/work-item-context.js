@@ -1,4 +1,4 @@
-const MAX_CONTEXT_BYTES = 128 * 1024;
+import { serializedWorkContext } from "../shared/work-context.js";
 
 async function collectPages(read, field) {
   const values = [];
@@ -81,11 +81,6 @@ export async function prepareWorkItemContext(
       coverage,
     },
   };
-  if (
-    new TextEncoder().encode(JSON.stringify(bundle)).length > MAX_CONTEXT_BYTES
-  )
-    throw new Error(
-      "This item’s complete immutable history exceeds the 128 KiB session-context limit. Starting this team is currently unsupported; no context was truncated.",
-    );
+  serializedWorkContext(bundle);
   return bundle;
 }

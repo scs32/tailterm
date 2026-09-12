@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"unicode/utf8"
 
 	"github.com/scs32/tailterm/hub/internal/api"
 )
@@ -40,7 +41,7 @@ func validatePreparedContextBundle(req *api.AgentWorkItemRequest) error {
 	if len(req.ContextBundle) > maxAgentWorkItemContextBytes {
 		return api.ErrContextLimit
 	}
-	if !api.ValidID(req.ItemTaskID, "tsk") || !api.ValidID(req.ItemID, "wi") || req.ItemRevision < 1 ||
+	if !utf8.Valid(req.ContextBundle) || !api.ValidID(req.ItemTaskID, "tsk") || !api.ValidID(req.ItemID, "wi") || req.ItemRevision < 1 ||
 		!api.ValidID(req.WorkOrderMessage.TaskID, "tsk") || req.WorkOrderMessage.Seq < 1 || req.WorkOrderMessage.TaskID != req.ItemTaskID ||
 		(req.ReplacesAgentID != "" && !api.ValidID(req.ReplacesAgentID, "agt")) || len(req.ContextBundle) == 0 {
 		return api.ErrInvalid

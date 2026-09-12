@@ -39,7 +39,7 @@ func TestAgentRegistrationBodyEnvelopeAndContextBoundaries(t *testing.T) {
 			WorkOrderMessage: api.MessageReference{TaskID: task.ID, Seq: order.Seq},
 		},
 	}
-	request.WorkItem.ContextBundle = syntheticHTTPContextSized(t, item, order, api.MaxBody+1024, "x")
+	request.WorkItem.ContextBundle = syntheticHTTPContextSized(t, item, order, 152973, "x")
 	encoded, err := json.Marshal(request)
 	if err != nil {
 		t.Fatal(err)
@@ -91,7 +91,7 @@ func TestAgentRegistrationBodyEnvelopeAndContextBoundaries(t *testing.T) {
 	}
 	storedBoundary, err := client.GetAgentWorkItemContext(context.Background(), task.ID, boundaryAgent.ID, boundaryAgent.RunID)
 	boundaryDigest := sha256.Sum256(boundary.WorkItem.ContextBundle)
-	if err != nil || storedBoundary.Binding.ContextDigest != hex.EncodeToString(boundaryDigest[:]) {
+	if err != nil || !bytes.Equal(storedBoundary.Bundle, boundary.WorkItem.ContextBundle) || storedBoundary.Binding.ContextDigest != hex.EncodeToString(boundaryDigest[:]) {
 		t.Fatalf("boundary context digest changed: err=%v stored=%s want=%s", err, storedBoundary.Binding.ContextDigest, hex.EncodeToString(boundaryDigest[:]))
 	}
 
@@ -99,6 +99,7 @@ func TestAgentRegistrationBodyEnvelopeAndContextBoundaries(t *testing.T) {
 	unicodeBoundary.Name, unicodeBoundary.Session = "unicode-context", "unicode-context"
 	unicodeBoundary.WorkItem = cloneWorkItemRequest(request.WorkItem)
 	unicodeBoundary.WorkItem.ContextBundle = syntheticHTTPContextSized(t, item, order, api.MaxAgentWorkItemContextBytes, "界")
+	unicodeBoundary.WorkItem.ContextBundle = bytes.Replace(unicodeBoundary.WorkItem.ContextBundle, []byte("界界"), []byte("\u2028\u2029"), 1)
 	unicodeBody := marshalContextNoHTMLEscape(t, unicodeBoundary)
 	if len(unicodeBody) <= api.MaxAgentWorkItemContextBytes || len(unicodeBody) > api.MaxAgentRegistrationBody {
 		t.Fatalf("encoded Unicode boundary request size %d is outside (%d, %d]", len(unicodeBody), api.MaxAgentWorkItemContextBytes, api.MaxAgentRegistrationBody)
@@ -110,6 +111,26 @@ func TestAgentRegistrationBodyEnvelopeAndContextBoundaries(t *testing.T) {
 	unicodeDigest := sha256.Sum256(unicodeBoundary.WorkItem.ContextBundle)
 	if unicodeAgent.WorkItem == nil || unicodeAgent.WorkItem.ContextDigest != hex.EncodeToString(unicodeDigest[:]) {
 		t.Fatalf("Unicode boundary context digest changed: agent=%+v want=%s", unicodeAgent, hex.EncodeToString(unicodeDigest[:]))
+	}
+
+	// Direct HTTP clients may preserve whitespace in RawMessage. Readback must
+	// retain those exact admitted bytes, not just equivalent JSON values.
+	spaced := request
+	spaced.Name, spaced.Session = "spaced-context", "spaced-context"
+	spaced.WorkItem = cloneWorkItemRequest(request.WorkItem)
+	spacedRaw := bytes.Replace(spaced.WorkItem.ContextBundle, []byte(`"history":{`), []byte(`"history": { `), 1)
+	spaced.WorkItem.ContextBundle = spacedRaw
+	body := marshalContextNoHTMLEscape(t, spaced)
+	compactRaw := marshalContextNoHTMLEscape(t, json.RawMessage(spacedRaw))
+	body = bytes.Replace(body, compactRaw, spacedRaw, 1)
+	var spacedAgent api.Agent
+	if status := c.do("POST", "/v1/tasks/"+task.ID+"/agents", string(body), &spacedAgent); status != http.StatusCreated {
+		t.Fatalf("direct spaced registration = %d", status)
+	}
+	spacedContext, err := client.GetAgentWorkItemContext(context.Background(), task.ID, spacedAgent.ID, spacedAgent.RunID)
+	hash := sha256.Sum256(spacedRaw)
+	if err != nil || !bytes.Equal(spacedContext.Bundle, spacedRaw) || spacedContext.Binding.ContextDigest != hex.EncodeToString(hash[:]) {
+		t.Fatalf("direct HTTP exact bytes changed: %v", err)
 	}
 
 	overLimit := request

@@ -207,10 +207,14 @@ func Wrap(command string, onStart func(), onExit func(code int)) error {
 	if shell == "" {
 		shell = "/bin/sh"
 	}
+	cmd, cleanup, err := privateShellCommand(shell, command)
+	if err != nil {
+		return err
+	}
+	defer cleanup()
 	onStart()
-	cmd := exec.Command(shell, "-c", command)
 	cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
-	err := cmd.Run()
+	err = cmd.Run()
 	code := 0
 	var exitErr *exec.ExitError
 	if errors.As(err, &exitErr) {
@@ -234,4 +238,27 @@ func ReadJSON(b []byte) map[string]any {
 	}
 	_ = json.Unmarshal(b, &out)
 	return out
+}
+
+// Execute the complete command from a private file, not a shell -c argument.
+// The shell opens it before its first instruction removes the directory entry;
+// terminal stdin stays attached to the runtime, and failed starts also clean up.
+func privateShellCommand(shell, command string) (*exec.Cmd, func(), error) {
+	file, err := os.CreateTemp("", ".tailterm-runtime-command-*")
+	if err != nil {
+		return nil, nil, err
+	}
+	cleanup := func() { _ = os.Remove(file.Name()) }
+	if err = file.Chmod(0600); err == nil {
+		_, err = file.WriteString("/bin/rm -f " + ShellQuote(file.Name()) + "\n" + command + "\n")
+	}
+	closeErr := file.Close()
+	if err == nil {
+		err = closeErr
+	}
+	if err != nil {
+		cleanup()
+		return nil, nil, err
+	}
+	return exec.Command(shell, file.Name()), cleanup, nil
 }

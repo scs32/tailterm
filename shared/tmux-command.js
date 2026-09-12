@@ -1,3 +1,4 @@
+import { serializedWorkContext } from "./work-context.js";
 import { validateAgentPermissions } from "./agent-permissions.js";
 import { validateReasoning } from "../client/reasoning.js";
 export function validateSession(name) {
@@ -239,17 +240,7 @@ export function agentSpawnCommand({
     throw new Error("Invalid work-item session routing.");
   let workContextJSON = "";
   if (hasWorkItemRouting) {
-    workContextJSON =
-      typeof workContextBundle === "string"
-        ? workContextBundle
-        : JSON.stringify(workContextBundle);
-    try {
-      if (!workContextJSON || workContextJSON.length > 131072)
-        throw new Error();
-      JSON.parse(workContextJSON);
-    } catch {
-      throw new Error("Invalid prepared work-item context.");
-    }
+    workContextJSON = serializedWorkContext(workContextBundle);
   }
   const args = [
     "spawn",
@@ -281,8 +272,6 @@ export function agentSpawnCommand({
       workOrderTaskId,
       "--work-order-message",
       String(workOrderMessageSeq),
-      "--work-context-json",
-      workContextJSON,
     );
     if (replacesAgentId) args.push("--replaces-agent", replacesAgentId);
   }
@@ -295,14 +284,26 @@ export function agentSpawnCommand({
   if (sandboxMode) args.push("--sandbox-mode", sandboxMode);
   if (allowedTools.length)
     args.push("--allowed-tools-json", JSON.stringify(allowedTools));
-  return (
-    "/bin/sh -c " +
-    shellQuote(
-      ttResolver(
-        `printf 'The tt agent CLI is not installed on this server. Install it from the tailterm hub build and retry.\\n' >&2; exit 127`,
-      ) + `exec "$tailterm_tt" ${args.map(shellQuote).join(" ")}`,
-    )
+  const resolve = ttResolver(
+    `printf 'The tt agent CLI is not installed on this server. Install it from the tailterm hub build and retry.\\n' >&2; exit 127`,
   );
+  let invoke = `exec "$tailterm_tt" ${args.map(shellQuote).join(" ")}`;
+  if (hasWorkItemRouting) {
+    // Base64 avoids repeated shell-quote expansion of the complete history.
+    // The private file uses the existing CLI flag, including on older hosts.
+    const encoded = btoa(
+      Array.from(new TextEncoder().encode(workContextJSON), (byte) =>
+        String.fromCharCode(byte),
+      ).join(""),
+    );
+    invoke =
+      `umask 077; tailterm_context=$(/usr/bin/mktemp) || exit 1; ` +
+      `trap '/bin/rm -f "$tailterm_context"' EXIT; trap 'exit 143' HUP INT TERM; ` +
+      `printf '%s' '${encoded}' | /usr/bin/base64 -d > "$tailterm_context" || exit 1; ` +
+      `"$tailterm_tt" ${args.map(shellQuote).join(" ")} --work-context-file "$tailterm_context"; ` +
+      `tailterm_result=$?; exit "$tailterm_result"`;
+  }
+  return "/bin/sh -c " + shellQuote(resolve + invoke);
 }
 export function agentRuntimesCommand() {
   return (

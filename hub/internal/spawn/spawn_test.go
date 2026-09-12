@@ -1,6 +1,11 @@
 package spawn
 
-import "testing"
+import (
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+)
 
 func TestParseVersion(t *testing.T) {
 	for in, want := range map[string]float64{"tmux 3.5a": 3.05, "tmux 3.2": 3.02, "tmux next-3.6": 3.06, "tmux 2.9a": 2.09} {
@@ -39,5 +44,41 @@ func TestBriefingEnvironmentIsKeptOnlyWhenItIsNotEmbedded(t *testing.T) {
 	}
 	if !forwardSessionEnv("codex", "TAILTERM_WORK_ITEM", "wi_0123456789abcdef") {
 		t.Fatal("unrelated session environment was suppressed")
+	}
+}
+
+func TestPrivateShellCommandCompleteContextAndCleanup(t *testing.T) {
+	// Synthetic quote amplification exceeded shell -c ARG_MAX before the fix.
+	payload := strings.Repeat("'", 256*1024)
+	command, cleanup, err := privateShellCommand("/bin/sh", "printf '%s' "+ShellQuote(payload))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cleanup()
+	script := command.Args[1]
+	stat, err := os.Stat(script)
+	if err != nil || stat.Mode().Perm() != 0600 {
+		t.Fatalf("private permissions: %v", err)
+	}
+	if len(command.Args) != 2 || !strings.HasPrefix(filepath.Base(script), ".tailterm-runtime-command-") {
+		t.Fatal("large command remained in argv")
+	}
+	got, err := command.Output()
+	if err != nil || string(got) != payload {
+		t.Fatalf("complete context changed: %v", err)
+	}
+	if _, err := os.Stat(script); !os.IsNotExist(err) {
+		t.Fatalf("script retained: %v", err)
+	}
+	failed, cleanup, err := privateShellCommand("/absent-synthetic-shell", "exit 0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := failed.Run(); err == nil {
+		t.Fatal("missing shell succeeded")
+	}
+	cleanup()
+	if _, err := os.Stat(failed.Args[1]); !os.IsNotExist(err) {
+		t.Fatal("failed-start script retained")
 	}
 }

@@ -1,5 +1,7 @@
+import { MAX_WORK_CONTEXT_BYTES } from "../shared/work-context.js";
 export const MAX_TEAM_LAUNCH_PLANS = 8;
-export const MAX_TEAM_LAUNCH_PLAN_BYTES = 512 * 1024;
+export const MAX_TEAM_LAUNCH_PLAN_BYTES =
+  2 * MAX_WORK_CONTEXT_BYTES + 256 * 1024;
 export const MAX_TEAM_LAUNCH_PLANS_BYTES = 2 * 1024 * 1024;
 const encoder = new TextEncoder();
 const FIELD_KEYS = new Set([
@@ -135,7 +137,8 @@ export function normalizeTeamLaunchPlans(value) {
       (raw.teamId && !/^[A-Za-z0-9_-]{1,80}$/.test(raw.teamId)) ||
       (raw.workContextBundle !== undefined &&
         (typeof raw.workContextBundle !== "string" ||
-          encoder.encode(raw.workContextBundle).byteLength > 131072))
+          encoder.encode(raw.workContextBundle).byteLength >
+            MAX_WORK_CONTEXT_BYTES))
     )
       throw new Error("Invalid team launch retry plan.");
     if (ids.has(raw.id)) throw new Error("Duplicate team launch retry plan.");
@@ -214,7 +217,7 @@ export function normalizeTeamLaunchPlans(value) {
         throw new Error("Invalid team launch retry member.");
     }
     if (bytes(plan) > MAX_TEAM_LAUNCH_PLAN_BYTES)
-      throw new Error("A team launch retry plan exceeds 512 KiB.");
+      throw new Error("A team launch retry plan exceeds 768 KiB.");
     return plan;
   });
   if (bytes(plans) > MAX_TEAM_LAUNCH_PLANS_BYTES)

@@ -1,17 +1,29 @@
 package main
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
+	"io"
+	"os"
 	"time"
+	"unicode/utf8"
 
 	"github.com/scs32/tailterm/hub/internal/api"
 )
 
 func formatWorkItemContext(context api.AgentWorkItemContext) (string, error) {
-	data, err := json.Marshal(context)
+	if len(context.Bundle) > api.MaxAgentWorkItemContextBytes {
+		return "", api.ErrContextLimit
+	}
+	digest := sha256.Sum256(context.Bundle)
+	if !utf8.Valid(context.Bundle) || !json.Valid(context.Bundle) || context.Binding.ContextDigest != hex.EncodeToString(digest[:]) {
+		return "", errors.New("restored work-item context does not match its immutable digest; upgrade the hub and host together")
+	}
+	data, err := api.MarshalAgentWorkItemContext(context)
 	if err != nil {
 		return "", err
 	}
@@ -36,8 +48,12 @@ func cmdContext(e env, args []string) error {
 		return err
 	}
 	if *asJSON {
-		printJSON(workContext)
-		return nil
+		data, err := api.MarshalAgentWorkItemContext(workContext)
+		if err != nil {
+			return err
+		}
+		_, err = fmt.Fprintln(os.Stdout, string(data))
+		return err
 	}
 	formatted, err := formatWorkItemContext(workContext)
 	if err != nil {
@@ -45,4 +61,27 @@ func cmdContext(e env, args []string) error {
 	}
 	fmt.Println(formatted)
 	return nil
+}
+
+// Bound file and inline admission equally, before attempting registration.
+func readPreparedWorkContext(inline, path string) ([]byte, error) {
+	data := []byte(inline)
+	if path != "" {
+		file, err := os.Open(path)
+		if err != nil {
+			return nil, fmt.Errorf("read prepared work-item context: %w", err)
+		}
+		defer file.Close()
+		data, err = io.ReadAll(io.LimitReader(file, api.MaxAgentWorkItemContextBytes+1))
+		if err != nil {
+			return nil, err
+		}
+	}
+	if len(data) > api.MaxAgentWorkItemContextBytes {
+		return nil, api.ErrContextLimit
+	}
+	if !utf8.Valid(data) || !json.Valid(data) {
+		return nil, errors.New("prepared work-item context is not valid UTF-8 JSON")
+	}
+	return data, nil
 }

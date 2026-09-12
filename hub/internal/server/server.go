@@ -435,7 +435,14 @@ func (s *Server) getAgentWorkContext(w http.ResponseWriter, r *http.Request) {
 		fail(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, context)
+	// Preserve the admitted RawMessage bytes and digest on the context read path.
+	data, err := api.MarshalAgentWorkItemContext(context)
+	if err != nil {
+		fail(w, err)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_, _ = w.Write(data)
 }
 
 func (s *Server) updateAgent(w http.ResponseWriter, r *http.Request) {

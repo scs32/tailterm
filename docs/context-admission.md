@@ -1,3 +1,121 @@
+# Complete immutable context admission — September 12 candidate
+
+Bug `wi_7e220de54deaef33` revision 1, bounded order **#3022**, package #3025.
+Exact worker `agt_56ec514b7b5e8586` / `run_ddbb3bffb6046750`, admitted context
+through #3030, digest `e865e1ea1ffa559ebd0b525d590052c4c2f2382f97e8dcb6774b7b11bc328a4c`.
+Handler #3041 verified binding and separate Queue Start
+`qrr_751e17bce76f70c3` (entry `que_9232aa3354b8e3b9`, cycle 1/revision 3).
+Scope additions: #3049, #3053/#3055 corrected by #3061/#3064, and #3078.
+Base: `tasks-hub` `8a37919fc693033598460b287d9fa20b04f7565f`, isolated branch
+`fix/context-limit-mini`, `.build/worktrees/context-limit-mini`.
+
+## Supported bound and transport
+
+The handler measured the complete Monitor context at **152,973 bytes**, above
+131,072. Only that reported size was used here; no live diagnostic context was
+opened or copied into tests. The new bound is **262,144 UTF-8 bytes (256 KiB)**,
+the smallest power-of-two increase that admits the measured input and provides
+109,171 bytes (71.4%) of history growth. A 192 KiB bound would leave only 28.5%.
+This remains a finite admission bound; over-limit histories fail explicitly and
+are never truncated, summarized, or replaced with stale context.
+
+The complete serialized bundle is counted before preparation, journal storage,
+browser shell transport, CLI file/inline admission and store admission. Go keeps
+one API constant; JavaScript shares `shared/work-context.js`. The registration
+HTTP envelope remains derived: `6 * 262144 + 16384 = 1589248` bytes; unrelated
+requests retain 64 KiB. The per-plan journal limit is **768 KiB**: up to 512 KiB
+for the JSON-string-escaped shared context plus 256 KiB for member metadata.
+Eight-plan count and **2 MiB aggregate** remain unchanged; aggregate exhaustion
+rejects the save before launch. One shared context is retained per team.
+
+Browser launches encode the exact JSON as base64, decode into a mode-0600
+private temporary file, and use existing `--work-context-file`. Success, failure
+and ordinary termination clean up through shell traps. This avoids nested shell
+quote amplification: an exact 256 KiB apostrophe fixture previously failed with
+`E2BIG`. Host runtime commands execute from a private, self-removing script rather
+than a large shell `-c` argument, preserving terminal stdin. The existing command
+file validation bound becomes `4 * 256 KiB + 64 KiB` to cover POSIX quoting and
+briefing metadata. Failed script starts clean up too. Hard host termination can
+still leave a private temporary file; no background cleanup service is installed.
+
+Admission digests continue to cover the exact **admitted** JSON bytes. The Go
+registration encoder compacts RawMessage JSON without HTML escaping. Browser
+retry hashing performs the same lossless lexical compaction, preserving numeric
+lexemes, key order and existing escape spelling; it also recognizes the exact
+historical HTML-safe encoding for old uncertain plans. Neither accepted codec
+rewrites saved plans, bindings, agent identities or run IDs. Arbitrary changed
+content, revision, order, run or digest still fails reconciliation.
+
+Context HTTP readback and `tt context --json` now emit the stored bundle verbatim,
+including internal whitespace and HTML-sensitive characters. The host verifies
+its size, UTF-8 JSON and immutable digest before adding it to the launch prompt.
+A digest mismatch stops restoration; no alternate context is substituted.
+
+## Component versions and rollback
+
+This is a coordinated frontend/hub/host-CLI update, with no database migration,
+new context schema or rewritten launch journal. Publish/install only under a
+separate release order; this builder has **not deployed or installed** anything.
+
+| Combination | Behavior |
+| --- | --- |
+| Updated frontend, hub and host | Supports complete 256 KiB admission and exact context readback; saved identities survive uncertain retries. |
+| Old frontend with updated backend | Old preparer/journal still reject contexts above 128 KiB. Existing smaller plans remain usable. |
+| Updated frontend/CLI with old hub | Old hub rejects the larger context with its native context-limit error before admitting an identity. Older response serialization can also fail the new host's digest check for HTML-sensitive/whitespace input. Upgrade the hub first. |
+| Updated frontend/hub with old host CLI | Old host command limits and quoting/readback behavior cannot guarantee all newly supported payloads. Upgrade each launch host before enabling larger launches; a frontend update does not update hosts. |
+| Updated frontend reading an old frozen plan | Preserves its full string and member identity; recognizes current and historical exact digest encodings. Does not rebuild source history on retry. |
+| Old frontend reading a new large plan | Rejects unsupported context/plan size. Retain the updated frontend while these unresolved journals exist; do not discard them to enable rollback. |
+
+Old binaries can read retained additive data, but rolling back the hub restores
+its old admission limit; rolling back hosts reintroduces their command limits.
+Retain current components while larger launches/journals need recovery. Existing
+sessions and frozen briefings are not regenerated by this source change.
+
+Host runtime argument limits remain separate from the JSON transport contract.
+Tests ran on Darwin arm64 with observed `kern.argmax=1048576`; real provider CLIs,
+Linux launch hosts, native Safari and owner devices were not exercised. No
+universal provider/platform prompt-size guarantee is made. A release must verify
+the actual supported launch hosts, including runtime argument limits; this item
+does not change provider adapters or their input mechanisms.
+
+## Verification and remaining dependencies
+
+All records, messages, contexts, databases, browser vaults and tmux sockets in
+these checks are synthetic and isolated.
+
+- 178 JavaScript unit tests pass. Focused tests cover exact measured-size and
+  256 KiB UTF-8 boundaries, limit+1 rejection, full source preservation, shell
+  quote/HTML/backslash payloads, private file cleanup, journal escape headroom,
+  aggregate rejection, frozen uncertain identity and historical/current digests.
+- Full Go API/server/store/spawn package tests pass. HTTP checks include exact
+  byte/digest readback (including direct HTTP whitespace), unrelated 64 KiB
+  rejection, expanded envelope rejection, wrong-run rejection and duplicate
+  admission without a second identity. CLI checks cover file/inline parity,
+  malformed UTF-8/JSON, restored digest changes and bounded command files.
+- Chromium and WebKit real isolated-hub tests pass with 23 complete linked
+  messages and context above 152,973 bytes through browser preparation, encrypted
+  journal/reload, host launch and API readback. Partial retries preserve the
+  frozen full context and only amend the verified-unstarted member's folder.
+  The same large-context path loses a committed worker reply, then reconciles
+  the exact identity and unchanged full context without a second launch or
+  history rebuild.
+- Focused Go context/host race tests and Go vet pass. Vite static compilation
+  passes using a local copy of the existing ignored WASM artifact; the initial
+  clean-worktree attempt failed because that artifact was absent. No WASM rebuild,
+  static release packaging or deployed-asset verification is claimed.
+- An isolated copy of the actual base hub rejects a synthetic 152,973-byte
+  context with its native 409 and leaves only the fixture lead registered.
+  Actual base journal code rejects larger context; new journal code preserves
+  a smaller old uncertain plan byte-for-byte.
+
+Lead review, any authorized integration/release and handler saved acceptance
+remain separate dependencies. This report does not declare the item complete.
+No root checkout edit, deployment, live work-item access, preview PID60799 change,
+other worktree change, helper spawn, quota change, relay or networking operation
+was performed. The historical earlier 64 KiB envelope fix below is preserved.
+
+---
+
 # Agent registration context admission
 
 Work item `wi_649b1999c31d8fb9` revision 2, bounded work order #1240.

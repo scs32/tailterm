@@ -995,16 +995,9 @@ func cmdSpawn(e env, args []string) error {
 		Runtime: *runtime, Cwd: *cwd, ParentAgentID: parent,
 	}
 	if itemFlagCount > 0 {
-		contextData := []byte(*workContextJSON)
-		if *workContextFile != "" {
-			var readErr error
-			contextData, readErr = os.ReadFile(*workContextFile)
-			if readErr != nil {
-				return fmt.Errorf("read prepared work-item context: %w", readErr)
-			}
-		}
-		if !json.Valid(contextData) {
-			return errors.New("prepared work-item context is not valid JSON")
+		contextData, readErr := readPreparedWorkContext(*workContextJSON, *workContextFile)
+		if readErr != nil {
+			return readErr
 		}
 		req.WorkItem = &api.AgentWorkItemRequest{
 			ItemTaskID: *workItemTask, ItemID: *workItemID, ItemRevision: *workItemRevision,
@@ -1185,7 +1178,7 @@ func wrapCommand(args []string) (string, error) {
 			return "", errors.New("agent command file must be absolute")
 		}
 		info, err := os.Lstat(path)
-		if err != nil || !info.Mode().IsRegular() || info.Mode().Perm() != 0600 || info.Size() > 512*1024 {
+		if err != nil || !info.Mode().IsRegular() || info.Mode().Perm() != 0600 || info.Size() > 4*api.MaxAgentWorkItemContextBytes+64*1024 {
 			return "", errors.New("agent command file is missing, unsafe or oversized")
 		}
 		data, err := os.ReadFile(path)

@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, writeFileSync, rmSync } from "node:fs";
+import { mkdtempSync, writeFileSync, rmSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
@@ -140,9 +140,7 @@ test("agent launch forwards an explicit model as one argument and omits defaults
     for (const model of ["--help", "$(id)", "a\nb", "two words"])
       assert.throws(() => agentSpawnCommand({ ...fields, model }));
     for (const plannedTeamMembers of [-1, 1.5, 33, "2"])
-      assert.throws(() =>
-        agentSpawnCommand({ ...fields, plannedTeamMembers }),
-      );
+      assert.throws(() => agentSpawnCommand({ ...fields, plannedTeamMembers }));
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
@@ -185,11 +183,76 @@ test("agent launch forwards one bounded item context and optional replacement id
     assert.match(result.stdout, /--work-item-revision\n4\n/);
     assert.match(result.stdout, /--work-order-message\n814\n/);
     assert.match(result.stdout, /--replaces-agent\nagt_1111111111111111\n/);
-    assert.match(result.stdout, /--work-context-json\n/);
+    assert.match(result.stdout, /--work-context-file\n/);
     assert.throws(
       () => agentSpawnCommand({ ...fields, workOrderMessageSeq: 0 }),
       /routing/,
     );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("browser shell transport preserves complete UTF-8 context at 256 KiB", async () => {
+  const { agentSpawnCommand } = await import("../shared/tmux-command.js");
+  const dir = mkdtempSync(path.join(tmpdir(), "tailterm-context-boundary-"));
+  try {
+    writeFileSync(
+      path.join(dir, "tt"),
+      '#!/bin/sh\nwhile [ "$#" -gt 0 ]; do if [ "$1" = --work-context-file ]; then shift; /bin/cat "$1"; printf \'%s\\n\' "$1" >&2; exit "${CONTEXT_FAIL:-0}"; fi; shift; done\nexit 1\n',
+      { mode: 0o700 },
+    );
+    for (const fill of ["界", "'", "<", "\\\\"]) {
+      const overhead = Buffer.byteLength('{"source":""}');
+      const remaining = 262144 - overhead;
+      const context =
+        '{"source":"' +
+        fill.repeat(Math.floor(remaining / Buffer.byteLength(fill))) +
+        "x".repeat(remaining % Buffer.byteLength(fill)) +
+        '"}';
+      const fields = {
+        hub: "http://127.0.0.1:18765",
+        task: "tsk_0123456789abcdef",
+        name: "synthetic",
+        run: "codex",
+        runtime: "codex",
+        workItemTaskId: "tsk_0123456789abcdef",
+        workItemId: "wi_abcdef0123456789",
+        workItemRevision: 1,
+        workOrderTaskId: "tsk_0123456789abcdef",
+        workOrderMessageSeq: 1,
+        workContextBundle: context,
+      };
+      const result = spawnSync("/bin/sh", ["-c", agentSpawnCommand(fields)], {
+        encoding: "utf8",
+        env: { ...process.env, PATH: dir },
+        maxBuffer: 4 * 1024 * 1024,
+      });
+      assert.equal(
+        result.status,
+        0,
+        `${fill}: ${result.error || result.stderr}`,
+      );
+      assert.equal(result.stdout, context);
+      assert.equal(
+        existsSync(result.stderr.trim()),
+        false,
+        "private context file survived success",
+      );
+      const failure = spawnSync("/bin/sh", ["-c", agentSpawnCommand(fields)], {
+        encoding: "utf8",
+        env: { ...process.env, PATH: dir, CONTEXT_FAIL: "17" },
+        maxBuffer: 4 * 1024 * 1024,
+      });
+      assert.equal(failure.status, 17);
+      assert.equal(
+        existsSync(failure.stderr.trim()),
+        false,
+        "private context file survived failure",
+      );
+      fields.workContextBundle = context + " ";
+      assert.throws(() => agentSpawnCommand(fields), /256 KiB/);
+    }
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

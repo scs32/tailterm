@@ -1,6 +1,7 @@
 package api
 
 import (
+	"bytes"
 	"encoding/json"
 	"time"
 )
@@ -74,4 +75,26 @@ type AgentWorkItemContext struct {
 	Version int                  `json:"version"`
 	Binding AgentWorkItemBinding `json:"binding"`
 	Bundle  json.RawMessage      `json:"bundle"`
+}
+
+// MarshalAgentWorkItemContext preserves the admitted RawMessage verbatim. A
+// normal json.Encoder compacts it (even with EscapeHTML(false)), invalidating
+// the saved digest for valid direct HTTP requests containing JSON whitespace.
+func MarshalAgentWorkItemContext(context AgentWorkItemContext) ([]byte, error) {
+	header, err := json.Marshal(struct {
+		Version int                  `json:"version"`
+		Binding AgentWorkItemBinding `json:"binding"`
+	}{context.Version, context.Binding})
+	if err != nil {
+		return nil, err
+	}
+	if !json.Valid(context.Bundle) {
+		return nil, ErrInvalid
+	}
+	var out bytes.Buffer
+	out.Write(header[:len(header)-1])
+	out.WriteString(`,"bundle":`)
+	out.Write(context.Bundle)
+	out.WriteByte('}')
+	return out.Bytes(), nil
 }

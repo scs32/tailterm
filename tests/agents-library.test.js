@@ -256,7 +256,7 @@ test("encrypted retry journal is bounded, stores exact machine scope and preserv
   const context = JSON.stringify({
     version: 1,
     itemId: "wi_abcdef0123456789",
-    payload: "x".repeat(2048),
+    payload: "\\".repeat(131000),
   });
   const server = {
     id: "machine-demo-01",
@@ -304,6 +304,19 @@ test("encrypted retry journal is bounded, stores exact machine scope and preserv
     ],
   });
   assert.equal(stored.workContextBundle, context);
+  assert.ok(Buffer.byteLength(context) > 152973);
+  assert.ok(Buffer.byteLength(JSON.stringify(stored)) > 512 * 1024);
+  assert.ok(Buffer.byteLength(JSON.stringify(stored)) < 768 * 1024);
+  assert.throws(
+    () =>
+      normalizeTeamLaunchPlans(
+        Array.from({ length: 4 }, (_, i) => ({
+          ...stored,
+          id: `aggregate_${i}`,
+        })),
+      ),
+    /2 MiB/,
+  );
   assert.equal(JSON.stringify(stored).match(/wi_abcdef0123456789/g).length, 1);
   assert.doesNotMatch(JSON.stringify(stored), /never-copy/);
   const restored = await restoreLaunchMembers(stored, [server]);
@@ -338,12 +351,12 @@ test("encrypted retry journal is bounded, stores exact machine scope and preserv
               agentId: "agt_1111111111111111",
               run: "codex",
               cwd: "/synthetic/project",
-              prompt: "x".repeat(513 * 1024),
+              prompt: "x".repeat(769 * 1024),
             },
           },
         ],
       }),
-    /512 KiB/,
+    /768 KiB/,
   );
 });
 
@@ -428,6 +441,33 @@ test("project creation journal and agent reconciliation preserve exact identitie
     },
   };
   const entry = { fields };
+  // Current and historical Go encoders are exact, distinct retry codecs.
+  const original = fields.workContextBundle;
+  fields.workContextBundle =
+    '{ "version":1, "exact":"<>&界\\u003c", "n":9007199254740993 }';
+  for (const encoded of [
+    '{"version":1,"exact":"<>&界\\u003c","n":9007199254740993}',
+    '{"version":1,"exact":"\\u003c\\u003e\\u0026界\\u003c","n":9007199254740993}',
+  ]) {
+    const expected = Buffer.from(
+      await crypto.subtle.digest("SHA-256", new TextEncoder().encode(encoded)),
+    ).toString("hex");
+    const frozen = structuredClone(fields);
+    assert.equal(
+      await reconciledAgentProblem(fields.workItemTaskId, entry, member, {
+        ...agent,
+        workItem: { ...agent.workItem, contextDigest: expected },
+      }),
+      "",
+    );
+    assert.deepEqual(fields, frozen);
+  }
+  assert.equal(
+    await reconciledAgentProblem(fields.workItemTaskId, entry, member, agent),
+    "work-item/order/context binding",
+  );
+  fields.workContextBundle = original;
+
   assert.equal(
     await reconciledAgentProblem(fields.workItemTaskId, entry, member, agent),
     "",
