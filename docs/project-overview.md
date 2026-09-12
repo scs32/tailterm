@@ -166,15 +166,17 @@ creation attempt, including after reload, until manually verified; matching
 project fields are not proof of ownership. These behaviors prevent duplicate
 projects and agents and need to remain covered by browser checks.
 
-Complete item contexts support 256 KiB of serialized UTF-8 JSON in the context-size
-candidate (Bug `wi_7e220de54deaef33`, order #3022). Preparation, saved journal,
+Complete item contexts support 256 KiB of serialized UTF-8 JSON in the deployed
+context-size fix (Bug `wi_7e220de54deaef33`, order #3022; release #3195/#3196).
+Preparation, saved journal,
 browser transport, CLI and hub enforce the same bundle bound; nothing is
 truncated. Private context/command files avoid shell-quoting amplification, and
 exact admitted source bytes/digests survive readback and uncertain retries.
 A coordinated frontend/hub/host update is required; old frontends retain their
 128 KiB limit and cannot restore newly oversized journals. See
 [context admission](context-admission.md) for compatibility, host limits and
-candidate verification; this is not a statement of deployed versions.
+release verification. Combined application `d64615b` is active on the hub,
+Mini/Air CLIs, TailOS and Mini preview; handler saved acceptance is pending.
 
 Models can be selected for supported runtimes or entered explicitly. Installed
 runtime versions, account/model access, credentials, and host configuration remain

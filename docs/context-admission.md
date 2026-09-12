@@ -1,3 +1,106 @@
+# Combined Capacity/context release — September 12, 2026
+
+The reviewed combined application **`d64615bac01f72673c921bcfc25a541d073c2f01`**
+is deployed and verified; saved handler acceptance remains pending. Bug
+`wi_7e220de54deaef33` revision 1/order **#3022**, Start **#3041** /
+`qrr_751e17bce76f70c3`, and Capacity dependency `wi_84dafce5ad044acd` revision
+1/order **#2050** retain their original provenance. Execution order **#3195**
+was saved as **#3196** after reviewed package and actual Mini/Air qualification.
+Root `tasks-hub` was fast-forwarded from `8a37919` to report tip `7708883`.
+All shipped bytes remain the frozen application build; no rebuild from the report
+commit occurred. Later sections preserve the earlier preparation and historical
+release record rather than describing current pending work.
+
+The handler's Stage1 **#3221** gate verifies the exact original agent/run/context/
+Queue/Start binding, consistent online backup, integrity and stable profile hashes.
+The mode-0600 UID950 backup is
+`/mnt/deepfreeze/tailterm-hub/backups/before-context-limit-release-20260912T112000Z.sqlite`,
+26,210,304 bytes, SHA-256
+`a09023a679d616aa37edfaa81d824c41c74bca4ea07390e88bf0cada9dda2d06`.
+The builder did not access the database. Handler post-migration **#3227/#3228**,
+corrected artifact metadata **#3235**, confirms integrity `ok`, zero foreign-key
+violations, identical `profile_meta`/`profiles`/`profile_history` hashes and counts,
+and `allocationIntent.supported=true`, versions `[1]`. The exact 716-byte gate
+artifact SHA-256 is
+`f5fb7fe28f0d59307ef891cc56cfb950c07680cf6f6720869b144931758a2e85`.
+
+The single running TrueNAS hub now mounts
+`/mnt/deepfreeze/tailterm-hub/releases/20260912-context-capacity-d64615b/tailterm-hub`,
+27,295,906 bytes, SHA-256
+`801f93172221821f1f0788698724d55b92617e4e0eade9667d457643841c58b7`.
+Middleware changed only that executable mount; image, UID/GID950, resources,
+security, cap32, state/token mounts and private `100.116.238.37:18765` listener
+were preserved. The previous immutable `20260911-lead-recovery-33284bd` hub
+remains at SHA-256
+`dbb0abd3665238d5ffb4e4382f7b3e382345b640db0402d27be370c65583be73`.
+
+Mini and Air both atomically installed `/Users/stephenspeicher/.local/bin/tt`,
+mode0755, 6,731,794 bytes, SHA-256
+`908034fcd72a13d65d70750fa46010e4eb3f68fda89c65e1312dcb1b38dc7b91`.
+Each retains `tt-before-context-capacity-d64615b`, previous SHA-256
+`8fb4b792d2945126e90794f8ce0e597ee12fa528599de349cb191d2ba3035ddb`.
+Air's earlier command-not-found was noninteractive SSH PATH behavior: its absolute
+regular CLI file existed. No absence fallback or original fixture edit was needed.
+Actual Air is arm64/Darwin25.6.0 with `kern.argmax=1048576`. Installed-host
+qualification uses a separate one-line fixture variant selecting the installed
+absolute CLI path; the original frozen qualifier is retained unchanged.
+Private staging was removed and its absence verified on Air. Existing relays were
+not restarted; their mapped prior executable code may remain until separately
+managed. Newly executed CLI commands use the verified installed candidate.
+
+Cloudflare Pages project **tailos** production deployment
+**`f8462e21-9547-44d4-90dc-e9721d92a72a`** serves the exact package at
+<https://f8462e21.tailos.pages.dev> and <https://tailos.tailarr.com>.
+Mini serves identical bytes at <http://127.0.0.1:4318>. Release manifest SHA-256:
+`c8583c9f99363432fb63f4f405a757ab201173a4380f493daa6c21ae75ba3ae9`.
+All **81 public assets per origin** plus manifest match; all82 local inventory
+entries match. Mini used verified copy-on-write staging and atomic directory
+exchange, preserving **PID60799/PPID1**. Immediately prior Flashes bytes remain at
+`.build/releases/context-capacity-previous-mini-d64615b`, manifest
+`dba8628f67bbe9da003dfad11588566d060c22c1b67a182d30aa736d729fbd02`.
+
+Release verification passes actual external256KiB apostrophe/CJK argv, private
+script cleanup, UTF-8 boundaries, restored digest/full bytes, committed-response
+loss and unchanged intent retry/readback, legacy-intent rejection, and actual
+installed Mini/Air CLI oversized file/inline rejection before hub contact.
+Only isolated synthetic HTTP/SQLite/host fixtures were used. Fresh Chromium
+checks pass on all three origins for production WASM startup, synthetic local
+vault key restoration and layout; no signed-in live profile or provider was used.
+Pre-release merged JS178, GoAPI/server/store/spawn, focused sanitized CLI race/vet,
+and Chromium/WebKit large immutable-journal retry checks remain the source evidence.
+Native Safari, owner-device, real-provider and Linux launch-host qualification are
+not claimed. Root owner Screenshot and all other worktrees are preserved.
+Fresh-launch coordination opened **#3224** and closed **#3236** after activation
+verification; no live tasks were closed/retired and no relay/network/Tailscale
+configuration changed.
+
+The initial explicit `node_modules/.bin/wrangler` path was absent and performed
+no publication. Existing cached `npx --no-install wrangler` version4.131.1 then
+published successfully without installation or authentication retries. The handler
+corrected its post-migration artifact size from882 to716 bytes in #3235; actual
+bytes/hash and contents were verified. These tool/report corrections did not
+change the application package.
+
+Full release receipt:
+`/tmp/tailterm-context-release-3196/release-receipt.json`, 13,775 bytes,
+SHA-256 `db5f8dbd32d138082f1191d755b2641121252822f7bf300706f85a4f6feef5da`.
+It binds the source/order/Start/execution gates, exact deployment/native/static
+identities, per-host backups, stable-profile evidence, all release logs/screenshots,
+and retained command scripts. Review links include hub results **#3225/#3226**,
+post-migration gate **#3228**, lead Stage3 approval **#3230**, and verification
+announcement **#3236**. Saved revision-checked release acceptance and report
+integration remain handler/lead follow-up; this report does not declare either
+work item complete.
+
+Retained old binaries and Flashes are recovery inventory. After new allocation
+intents or >128KiB immutable plans exist, an older hub/CLI/frontend is not a complete
+compatible rollback. Prefer a compatible corrective build. Any rollback needs
+handler compatibility assessment and a separately recorded recovery decision;
+never truncate/rewrite plans, rewrite existing intent tuples or restore an old
+SQLite snapshot over newer work. Keep profile-v2 identity and write fences.
+
+---
+
 # Combined Capacity/context integration — prepared September 12
 
 Bug `wi_7e220de54deaef33` revision 1, original order **#3022**, preserved
