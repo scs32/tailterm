@@ -304,6 +304,52 @@ performed here.
   a parented item-bound launch; a parentless (browser) launch path is
   unaffected by rollout order in either direction.
 
+## Round 3 (review #2840, against candidate 07aad12)
+
+A second independent review found the round-2 explicit-classification design
+itself still had two live bugs, plus reopened finding 5 as a functional
+(not security) requirement. Corrections:
+
+- **Replacement duplicates and failed-retry double-spend (finding 1)**: a
+  second live successor could replace the same predecessor (concurrently or
+  sequentially) since nothing checked for an already-live one, and a closed
+  (failed) successor excluded its predecessor from the active-extras count
+  forever, letting an unrelated fresh extra take a phantom freed slot before
+  a further replacement retry — still capacity-exempt — over-admitted.
+  Fixed: reject a second live successor outright; only a *live* successor
+  excludes its predecessor from the count, so a closed one reverts the
+  predecessor to counting as itself, and a replacement is then inherently
+  slot-neutral (predecessor excluded, successor counted, net zero change).
+- **Omitted-role exact replay (finding 2)**: a retry of an originally
+  explicit fresh admission could omit `teamRole` and still replay as an
+  exact match. Fixed: an explicit match is required for a fresh, parented
+  original admission's replay; a replacement's or a parentless admission's
+  replay may still omit it (nothing was ever a real caller choice there).
+- **Functional recorded-allocation consistency (finding 5, reopened)**:
+  clarified (#2844/#2850, tightened again #2867/#2870) that disclosing the
+  shared-token limitation was correct but insufficient, and that an
+  *optional* field on a shared work-order link is not a durable per-agent
+  binding. Implemented `AllocationIntent`: a durable record authored via a
+  new pre-admission call (`tt allocation-intent create` / `POST
+  .../allocation-intents`), bound to an exact preallocated `--agent-id`,
+  item, revision, work-order message and team role — authored once (a
+  second intent for the same identity conflicts), consumed exactly once,
+  atomically, in the same transaction as the admission it authorizes. A
+  fresh (non-replacement) parented member or extra admission now requires a
+  matching, unconsumed intent; absence or mismatch is rejected outright. A
+  replacement remains exempt (it inherits, not declares). This is layered
+  on top of, not a replacement for, the `--team-role` declaration/inheritance
+  rules above. It remains, honestly, a consistency check between two
+  separately-authored records on a single-shared-token hub, not a
+  cryptographic guarantee that the two authors were actually different
+  parties — that limitation is unchanged and still disclosed above.
+
+New tests: `TestItemExtraCapacityReplacementRequiresExitedAndDoesNotDoubleCount`,
+`TestItemExtraCapacityFailedReplacementRetryNeverExceedsCeilingWithReuse`
+(the exact E/R1/F/R2 acceptance case from #2844),
+`TestAllocationIntentRequiredMatchedAndConsumedOnce`, and
+`TestAllocationIntentEndpoint` (the same through the real HTTP API).
+
 ## Not in scope here
 
 No handler implementation, quota/setting change (task `maxNewAgents`
