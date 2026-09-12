@@ -3,6 +3,7 @@ package monitor
 import (
 	"context"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -134,7 +135,7 @@ func TestDeliveryBackoffAndRecoveryAreDurable(t *testing.T) {
 	}
 }
 
-func TestTickSkipsNoWorkAndUnknownLead(t *testing.T) {
+func TestTickSkipsNoWork(t *testing.T) {
 	_, _, task, _, e, _ := fixture(t)
 	var outcomes []Outcome
 	e.Tick(context.Background(), func(out Outcome) { outcomes = append(outcomes, out) })
@@ -176,5 +177,202 @@ func TestTickPrunesExpiredNoticeMetadata(t *testing.T) {
 	e.Tick(context.Background(), func(Outcome) {})
 	if _, err := st.GetScheduleMonitorNotice(context.Background(), task.ID, fingerprint); err != api.ErrNotFound {
 		t.Fatalf("expired notice retained: %v", err)
+	}
+}
+
+func TestDetectRemainingStatesAndBoundaries(t *testing.T) {
+	_, _, _, _, e, now := fixture(t)
+	for _, tc := range []struct {
+		name, state, status, run, want string
+		age                            time.Duration
+		missing, unknown, reconcile    bool
+	}{
+		{name: "claimed", state: api.QueueStateClaimed, age: time.Minute, want: "claimed:"},
+		{name: "claimed-before-deadline", state: api.QueueStateClaimed, age: time.Minute - time.Nanosecond},
+		{name: "claimed-reconciliation", state: api.QueueStateClaimed, age: time.Minute, reconcile: true},
+		{name: "missing-worker", state: api.QueueStateActive, age: time.Minute, missing: true, want: "worker_missing:"},
+		{name: "stale-worker-run", state: api.QueueStateActive, age: time.Minute, run: "run_2222222222222222", want: "worker_missing:"},
+		{name: "closed-worker", state: api.QueueStateActive, status: api.AgentClosed, age: time.Minute, want: "worker_unavailable:"},
+		{name: "exited-worker", state: api.QueueStateActive, status: api.AgentExited, age: time.Minute, want: "worker_unavailable:"},
+		{name: "retired-worker", state: api.QueueStateActive, status: api.AgentRetired, age: time.Minute, want: "intentional"},
+		{name: "unknown-worker", state: api.QueueStateActive, age: time.Minute, unknown: true, want: "unknown"},
+		{name: "future-queue", state: api.QueueStateWaiting, age: -time.Second, want: "unknown"},
+		{name: "completed", state: api.QueueStateCompleted, age: time.Hour},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			entry := api.QueueEntry{ID: "que_1111111111111111", Cycle: 1, Revision: 2, State: tc.state, UpdatedAt: now.Add(-tc.age), WorkerAgentID: "agt_1111111111111111", WorkerRunID: "run_1111111111111111", Eligible: true, ReconciliationNeeded: tc.reconcile}
+			worker := api.Agent{ID: entry.WorkerAgentID, RunID: entry.WorkerRunID, Status: api.AgentRunning, LastSeenAt: *now}
+			if tc.run != "" {
+				worker.RunID = tc.run
+			}
+			if tc.status != "" {
+				worker.Status = tc.status
+			}
+			if tc.unknown {
+				worker.LastSeenAt = time.Time{}
+			}
+			agents := map[string]api.Agent{worker.ID: worker}
+			if tc.missing {
+				delete(agents, worker.ID)
+			}
+			candidate, intentional, unknown := e.detect([]api.QueueEntry{entry}, agents, *now)
+			switch tc.want {
+			case "intentional":
+				if candidate != "" || !intentional || unknown {
+					t.Fatal(candidate, intentional, unknown)
+				}
+			case "unknown":
+				if candidate != "" || intentional || !unknown {
+					t.Fatal(candidate, intentional, unknown)
+				}
+			default:
+				if intentional || unknown || (tc.want == "" && candidate != "") || (tc.want != "" && !strings.HasPrefix(candidate, tc.want)) {
+					t.Fatal(candidate, intentional, unknown)
+				}
+			}
+		})
+	}
+}
+
+func TestTickLogChangesAndUnknownLead(t *testing.T) {
+	st, _, task, lead, e, _ := fixture(t)
+	ctx := context.Background()
+	by := api.Caller{Node: "fixture", User: "owner"}
+	var outputs []Outcome
+	report := func(o Outcome) { outputs = append(outputs, o) }
+	retired := api.AgentRetired
+	if _, err := st.UpdateAgent(ctx, lead.ID, api.UpdateAgentRequest{Status: &retired}, by); err != nil {
+		t.Fatal(err)
+	}
+	e.Tick(ctx, report)
+	e.Tick(ctx, report)
+	if len(outputs) != 2 || !outputs[0].Log || outputs[1].Log || outputs[0].State != "intentional_block" {
+		t.Fatalf("unchanged block %+v", outputs)
+	}
+	name := "absent"
+	if _, err := st.UpdateTask(ctx, task.ID, api.UpdateTaskRequest{Orchestrator: &name}, by); err != nil {
+		t.Fatal(err)
+	}
+	e.Tick(ctx, report)
+	e.Tick(ctx, report)
+	if !outputs[2].Log || outputs[3].Log || outputs[2].State != "unknown" {
+		t.Fatalf("unknown logs %+v", outputs)
+	}
+	name = "lead"
+	if _, err := st.UpdateTask(ctx, task.ID, api.UpdateTaskRequest{Orchestrator: &name}, by); err != nil {
+		t.Fatal(err)
+	}
+	running := api.AgentRunning
+	if _, err := st.UpdateAgent(ctx, lead.ID, api.UpdateAgentRequest{Status: &running}, by); err != nil {
+		t.Fatal(err)
+	}
+	e.Tick(ctx, report)
+	if outputs[4].State != "no_work" || outputs[4].Log {
+		t.Fatalf("recovery %+v", outputs[4])
+	}
+	if _, err := st.UpdateAgent(ctx, lead.ID, api.UpdateAgentRequest{Status: &retired}, by); err != nil {
+		t.Fatal(err)
+	}
+	e.Tick(ctx, report)
+	if !outputs[5].Log {
+		t.Fatal("new block not logged")
+	}
+	if _, err := st.CloseTask(ctx, task.ID, by); err != nil {
+		t.Fatal(err)
+	}
+	e.Tick(ctx, report)
+	if len(e.lastOutcomes) != 0 {
+		t.Fatal("closed task log memory retained")
+	}
+}
+
+func TestScheduleLoopControlledTicksAndCancellation(t *testing.T) {
+	_, _, _, _, e, _ := fixture(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	ticks := make(chan time.Time, 2)
+	reports := make(chan Outcome, 4)
+	done := make(chan struct{})
+	go func() { defer close(done); e.run(ctx, ticks, func(o Outcome) { reports <- o }) }()
+	receive := func() {
+		t.Helper()
+		select {
+		case <-reports:
+		case <-time.After(5 * time.Second):
+			t.Fatal("scheduler did not tick")
+		}
+	}
+	receive()
+	ticks <- time.Time{}
+	receive()
+	// A ready tick cannot begin more database work after cancellation.
+	cancel()
+	ticks <- time.Time{}
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("scheduler did not stop")
+	}
+	if len(reports) != 0 {
+		t.Fatal("tick after cancellation")
+	}
+	doneReal := e.Start(ctx, func(Outcome) { t.Error("pre-cancelled Start ticked") })
+	select {
+	case <-doneReal:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Start did not stop")
+	}
+}
+
+func TestMonitorConfigAndBackoffBounds(t *testing.T) {
+	st, _, _, _, _, _ := fixture(t)
+	for _, alter := range []func(*Config){func(c *Config) { c.Interval = 0 }, func(c *Config) { c.StallAfter = -1 }, func(c *Config) { c.WorkerSilence = 0 }, func(c *Config) { c.InitialBackoff = 0 }, func(c *Config) { c.MaxBackoff = c.InitialBackoff - 1 }, func(c *Config) { c.NoticeRetention = 0 }} {
+		c := DefaultConfig()
+		alter(&c)
+		if _, err := New(st, c); err == nil {
+			t.Fatal("invalid config accepted")
+		}
+	}
+	if _, err := New(nil, DefaultConfig()); err == nil {
+		t.Fatal("nil store accepted")
+	}
+	e, _ := New(st, DefaultConfig())
+	for _, count := range []int{0, 1, 2, 5, 100} {
+		want := 5 * time.Minute
+		if count == 2 {
+			want = 10 * time.Minute
+		}
+		if count >= 5 {
+			want = time.Hour
+		}
+		if got := e.backoff(count); got != want {
+			t.Fatalf("backoff %d=%v", count, got)
+		}
+	}
+	c := DefaultConfig()
+	c.InitialBackoff = time.Duration(1 << 62)
+	c.MaxBackoff = time.Duration(1<<63 - 1)
+	e, _ = New(st, c)
+	if got := e.backoff(3); got != c.MaxBackoff {
+		t.Fatal("overflow", got)
+	}
+}
+
+func TestTickSuppressesUnchangedStoreFailure(t *testing.T) {
+	st, _, _, _, e, _ := fixture(t)
+	if err := st.Close(); err != nil {
+		t.Fatal(err)
+	}
+	var outcomes []Outcome
+	for i := 0; i < 3; i++ {
+		e.Tick(context.Background(), func(out Outcome) { outcomes = append(outcomes, out) })
+	}
+	if len(outcomes) != 3 {
+		t.Fatalf("global errors repeated per tick: %+v", outcomes)
+	}
+	for i, out := range outcomes {
+		if out.State != "unknown" || out.Log != (i == 0) {
+			t.Fatalf("global log %d %+v", i, out)
+		}
 	}
 }

@@ -901,6 +901,12 @@ func (s *Store) PostMessage(ctx context.Context, taskID string, req api.PostMess
 }
 
 func (s *Store) insertMessage(ctx context.Context, tx *sql.Tx, task api.Task, req api.PostMessageRequest, target api.Agent, by api.Caller, allowCrossProject, allowHistoricalRevision bool) (api.Message, error) {
+	return s.insertMessageWithResume(ctx, tx, task, req, target, by, allowCrossProject, allowHistoricalRevision, true)
+}
+
+// insertMessageWithResume keeps notification-only internal callers out of the
+// explicit human resumption path. This policy is not exposed on the wire.
+func (s *Store) insertMessageWithResume(ctx context.Context, tx *sql.Tx, task api.Task, req api.PostMessageRequest, target api.Agent, by api.Caller, allowCrossProject, allowHistoricalRevision, allowResume bool) (api.Message, error) {
 	taskID := task.ID
 	if err := validateMessageContext(tx, ctx, taskID, req, allowCrossProject, allowHistoricalRevision); err != nil {
 		return api.Message{}, err
@@ -941,7 +947,7 @@ func (s *Store) insertMessage(ctx context.Context, tx *sql.Tx, task api.Task, re
 	// A direct human message is an explicit request to continue an existing
 	// retired run. The heartbeat-derived Online flag prevents recreating or
 	// waking stale sessions; agent-authored and unaddressed messages do not resume.
-	if req.AgentID == "" && req.To != "" && target.Status == api.AgentRetired && target.Online {
+	if allowResume && req.AgentID == "" && req.To != "" && target.Status == api.AgentRetired && target.Online {
 		now := s.now()
 		result, err := tx.ExecContext(ctx, `UPDATE agents SET status=?,last_event_at=?,blocked_reason='',blocked_text='' WHERE id=? AND task_id=? AND status=?`,
 			api.AgentDone, ts(now), target.ID, taskID, api.AgentRetired)

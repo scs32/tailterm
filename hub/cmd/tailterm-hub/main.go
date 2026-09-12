@@ -65,6 +65,9 @@ func scheduleMonitorConfig() (monitor.Config, error) {
 			*setting.into = value
 		}
 	}
+	if config.MaxBackoff < config.InitialBackoff {
+		return monitor.Config{}, fmt.Errorf("monitor maximum backoff must be at least initial backoff")
+	}
 	return config, nil
 }
 
@@ -92,11 +95,13 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	enforcer.Start(ctx, func(outcome monitor.Outcome) {
-		if outcome.State != "no_work" && outcome.State != "suppressed" {
+	monitorDone := enforcer.Start(ctx, func(outcome monitor.Outcome) {
+		if outcome.Log {
 			log.Printf("%s", outcome.Summary())
 		}
 	})
+
+	defer func() { stop(); <-monitorDone }()
 
 	var ln net.Listener
 	var identity server.Identity

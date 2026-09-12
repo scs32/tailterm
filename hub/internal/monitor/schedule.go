@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/scs32/tailterm/hub/internal/api"
@@ -39,12 +40,15 @@ type Outcome struct {
 	State       string // notified, suppressed, no_work, intentional_block, unknown, delivery_failed
 	MessageSeq  int64
 	Err         error
+	Log         bool // true only for a changed, nonquiet Tick outcome
 }
 
 type Enforcer struct {
-	store  *store.Store
-	config Config
-	now    func() time.Time
+	store        *store.Store
+	config       Config
+	now          func() time.Time
+	tickMu       sync.Mutex
+	lastOutcomes map[string]string
 }
 
 func New(st *store.Store, config Config) (*Enforcer, error) {
@@ -54,28 +58,62 @@ func New(st *store.Store, config Config) (*Enforcer, error) {
 	return &Enforcer{store: st, config: config, now: func() time.Time { return time.Now().UTC() }}, nil
 }
 
-func (e *Enforcer) Start(ctx context.Context, report func(Outcome)) {
+// Start returns a completion signal so shutdown can wait before closing storage.
+func (e *Enforcer) Start(ctx context.Context, report func(Outcome)) <-chan struct{} {
+	done := make(chan struct{})
 	go func() {
-		e.Tick(ctx, report)
+		defer close(done)
 		ticker := time.NewTicker(e.config.Interval)
 		defer ticker.Stop()
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-ticker.C:
-				e.Tick(ctx, report)
-			}
-		}
+		e.run(ctx, ticker.C, report)
 	}()
+	return done
+}
+
+// run uses the same serial loop in production and deterministic channel tests.
+func (e *Enforcer) run(ctx context.Context, ticks <-chan time.Time, report func(Outcome)) {
+	if ctx.Err() != nil {
+		return
+	}
+	e.Tick(ctx, report)
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case _, ok := <-ticks:
+			if !ok || ctx.Err() != nil {
+				return
+			}
+			e.Tick(ctx, report)
+		}
+	}
 }
 
 // Tick is exposed for deterministic tests and controlled embedding. An
 // observation error is fail-closed: it produces an unknown outcome and sends
 // no notification.
 func (e *Enforcer) Tick(ctx context.Context, report func(Outcome)) {
+	e.tickMu.Lock()
+	defer e.tickMu.Unlock()
+	if ctx.Err() != nil {
+		return
+	}
+	next := map[string]string{}
+	sink := report
+	report = func(out Outcome) {
+		summary := out.Summary()
+		out.Log = out.State != "no_work" && out.State != "suppressed" && e.lastOutcomes[out.TaskID] != summary
+		next[out.TaskID] = summary
+		if sink != nil {
+			sink(out)
+		}
+	}
+	// Only this tick's tasks remain, bounding suppression memory by current tasks.
+	defer func() { e.lastOutcomes = next }()
+
 	if _, err := e.store.PruneScheduleMonitorNotices(ctx, e.now().UTC().Add(-e.config.NoticeRetention)); err != nil {
 		report(Outcome{State: "unknown", Err: fmt.Errorf("prune monitor notices: %w", err)})
+		return // fail closed when durable retry metadata cannot be maintained
 	}
 	tasks, err := e.store.ListTasks(ctx)
 	if err != nil {
@@ -244,60 +282,12 @@ func fingerprint(kind string, entry api.QueueEntry) string {
 }
 
 func (e *Enforcer) deliver(ctx context.Context, taskID string, lead api.Agent, fingerprint string, now time.Time, report func(Outcome)) {
-	notice, err := e.store.GetScheduleMonitorNotice(ctx, taskID, fingerprint)
-	if err != nil && err != api.ErrNotFound {
-		report(Outcome{TaskID: taskID, Fingerprint: fingerprint, State: "unknown", Err: err})
-		return
-	}
-	if err == api.ErrNotFound {
-		notice = store.ScheduleMonitorNotice{TaskID: taskID, Fingerprint: fingerprint, FirstDetectedAt: now}
-	}
-	notice.LastObservedAt = now
-	if !notice.LastAttemptAt.IsZero() && now.Sub(notice.LastAttemptAt) < e.backoff(backoffCount(notice)) {
-		if err := e.store.SaveScheduleMonitorNotice(ctx, notice); err != nil {
-			report(Outcome{TaskID: taskID, Fingerprint: fingerprint, State: "unknown", Err: err})
-			return
-		}
-		report(Outcome{TaskID: taskID, Fingerprint: fingerprint, State: "suppressed", MessageSeq: notice.MessageSeq})
-		return
-	}
-	requestID := fmt.Sprintf("schedule-monitor:%s:%d", fingerprint, notice.NotificationCount+1)
-	notice.LastAttemptAt = now
-	message, postErr := e.store.PostMessage(ctx, taskID, api.PostMessageRequest{
-		To: lead.ID, Text: fmt.Sprintf(notificationText, fingerprint), RequestID: requestID,
-	}, api.Caller{Node: "system", User: "schedule-monitor"})
-	if postErr != nil {
-		notice.FailureCount, notice.LastError = notice.FailureCount+1, postErr.Error()
-		if saveErr := e.store.SaveScheduleMonitorNotice(ctx, notice); saveErr != nil {
-			postErr = fmt.Errorf("delivery: %v; state: %w", postErr, saveErr)
-		}
-		report(Outcome{TaskID: taskID, Fingerprint: fingerprint, State: "delivery_failed", Err: postErr})
-		return
-	}
-	notice.LastNotifiedAt, notice.NotificationCount, notice.FailureCount, notice.MessageSeq, notice.LastError = now, notice.NotificationCount+1, 0, message.Seq, ""
-	if err := e.store.SaveScheduleMonitorNotice(ctx, notice); err != nil {
-		report(Outcome{TaskID: taskID, Fingerprint: fingerprint, State: "unknown", Err: err})
-		return
-	}
-	report(Outcome{TaskID: taskID, Fingerprint: fingerprint, State: "notified", MessageSeq: message.Seq})
-}
-
-func backoffCount(notice store.ScheduleMonitorNotice) int {
-	if notice.FailureCount > 0 {
-		return notice.FailureCount
-	}
-	return notice.NotificationCount
+	notice, state, err := e.store.ScheduleMonitorDelivery(ctx, taskID, lead, fingerprint, fmt.Sprintf(notificationText, fingerprint), now, e.config.InitialBackoff, e.config.MaxBackoff)
+	report(Outcome{TaskID: taskID, Fingerprint: fingerprint, State: state, MessageSeq: notice.MessageSeq, Err: err})
 }
 
 func (e *Enforcer) backoff(count int) time.Duration {
-	d := e.config.InitialBackoff
-	for i := 1; i < count && d < e.config.MaxBackoff; i++ {
-		d *= 2
-		if d > e.config.MaxBackoff {
-			return e.config.MaxBackoff
-		}
-	}
-	return d
+	return store.ScheduleMonitorBackoff(e.config.InitialBackoff, e.config.MaxBackoff, count)
 }
 
 // Summary is intentionally stable for logs and tests without exposing any
