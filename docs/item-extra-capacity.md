@@ -350,6 +350,153 @@ New tests: `TestItemExtraCapacityReplacementRequiresExitedAndDoesNotDoubleCount`
 `TestAllocationIntentRequiredMatchedAndConsumedOnce`, and
 `TestAllocationIntentEndpoint` (the same through the real HTTP API).
 
+## Round 4 (review #2893, design review #2916, against candidate c1r28)
+
+A third independent review found the round-3 `AllocationIntent` design
+(finding 5) itself still under-specified in four ways, all required before
+implementation:
+
+- **Real preallocated expected-run binding, not just transactional atomicity
+  (correction 1)**: round 3 consumed an intent atomically with admission, but
+  never pinned *which* run id the admission would produce — an intent
+  authored for one candidate could still be consumed by admitting a
+  different, unrelated run under the same `--agent-id`. `AllocationIntent`
+  now carries `ExpectedRunID`, generated at authoring time and validated
+  unique against both live agent run ids and every other intent's
+  `ExpectedRunID`; `Store.AddAgent` sets the admitted agent's actual
+  `RunID` *from* the intent's `ExpectedRunID` for a fresh parented
+  item-bound admission (`a.RunID = intent.ExpectedRunID`), rather than
+  generating a fresh one and merely checking the intent existed. The binding
+  is now a real preallocation, not an after-the-fact atomicity claim.
+- **Checked (not just stored) author authority, with launcher provenance
+  recorded (correction 2)**: round 3 recorded `AuthorAgentID`/`AuthorRunID`
+  fields but never validated who was allowed to author an intent.
+  `CreateAllocationIntent` now looks up the author agent's live task, run,
+  status and role and rejects unless the author is a current
+  `database_handler` on this exact task, or the task's recorded
+  `Orchestrator` by name — a closed/exited author, a mismatched task/run, or
+  an unauthorized role is rejected outright. Separately, consumption now
+  records the actual launcher identity (`ParentAgentID`/its live `RunID` at
+  admission time) into `LauncherAgentID`/`LauncherRunID` on the intent row,
+  so the authored-by and launched-by identities are both durable and
+  independently auditable, distinct concepts (the database_handler that
+  authors an intent for a builder to consume is not the same agent that
+  performs the launch).
+- **Idempotent retry scoped exactly, with durable post-consumption readback
+  (correction 3)**: `CreateAllocationIntent` accepts an optional
+  `RequestID`; a retry of the exact same `(TargetTaskID, AuthorAgentID,
+  AuthorRunID, RequestID)` key returns the original intent unchanged
+  (`loadAllocationIntentByRetryKey`, backed by a
+  `CREATE UNIQUE INDEX ... WHERE request_id<>''`) rather than conflicting or
+  double-authoring, but a retry with the same key and *different* payload is
+  rejected as a conflict rather than silently returning the stale record.
+  `GetAllocationIntent` (`GET
+  /v1/tasks/{id}/allocation-intents/{agentId}`, `tt allocation-intent get`)
+  provides a plain, non-mutating readback that works both before and after
+  consumption, so an uncertain caller can always confirm what was actually
+  recorded/consumed without re-authoring.
+- **Both directions of mixed-version compatibility, honestly documented
+  (correction 4)**: see the expanded "Old/new client compatibility" section
+  below. `Capabilities.AllocationIntent` (`/v1/capabilities`) is now
+  advertised by the hub; `cmdSpawn` queries it before a fresh parented
+  item-bound launch and fails closed with an explicit, actionable error if
+  the hub does not report `Supported: true` — rather than proceeding and
+  either 404ing confusingly at admission or silently falling back to weaker
+  accounting. This check only detects a version mismatch; it does not
+  coordinate a rollout by itself (see below).
+
+### Where this lives (round 4 additions)
+
+- `hub/internal/api/allocation_intent.go`: `AllocationIntent` and
+  `CreateAllocationIntentRequest` extended with `TargetTaskID`,
+  `ContextDigest`, `AuthorAgentID`, `AuthorRunID`, `ExpectedRunID`,
+  `RequestID`, `LauncherAgentID`, `LauncherRunID`.
+- `hub/internal/api/audit_export.go`: `Capabilities.AllocationIntent{Supported,
+  Versions}`; `CurrentCapabilities()` reports `Supported: true`.
+- `hub/internal/store/migrate.go`: the new `agent_allocation_intents` columns
+  above, added via `CREATE TABLE IF NOT EXISTS` (fresh database) plus a
+  targeted `ALTER TABLE` repair loop for an existing one, with the
+  idempotent-retry unique index created only after that repair — the same
+  migration-ordering discipline review #2771 required for `team_role`.
+- `hub/internal/store/allocation_intent.go`: author-authority check,
+  `ExpectedRunID`/`ContextDigest` validation, `loadAllocationIntentByRetryKey`,
+  `GetAllocationIntent`.
+- `hub/internal/store/store.go`, `Store.AddAgent`: `a.RunID` is set from the
+  intent's `ExpectedRunID` for a fresh parented item-bound admission (not
+  generated independently); the consumption `UPDATE` also records
+  `launcher_agent_id`/`launcher_run_id`.
+- `hub/internal/server/server.go`: `GET
+  /v1/tasks/{id}/allocation-intents/{agentId}` → `GetAllocationIntent`.
+- `hub/internal/api/client.go`: `Client.GetAllocationIntent`.
+- `hub/cmd/tt/main.go`: `cmdAllocationIntentCreate` auto-populates
+  `AuthorAgentID`/`AuthorRunID` from the CLI's own session identity (not a
+  spoofable flag) and computes `ContextDigest` itself from
+  `--work-context-file`/`--work-context-json`; `cmdAllocationIntentGet`
+  (`tt allocation-intent get --agent-id`) added; `cmdSpawn` queries
+  `Capabilities` before a fresh parented item-bound launch and fails closed
+  if `AllocationIntent.Supported` is false or the call errors.
+
+### Old/new client compatibility (round 4, supersedes round 3's version)
+
+- **New hub, old CLI/API client (no allocation intent authored)**: a fresh
+  parented item-bound admission with no matching, unconsumed intent is
+  rejected outright by `Store.AddAgent` with an actionable error naming the
+  missing/mismatched allocation intent. Verified end-to-end (real HTTP
+  server, real work item and order message) by
+  `TestSpawnOldStyleRequestWithoutIntentRejectedByCorrectedHub`.
+- **New CLI, old hub (no `AllocationIntent` capability)**: `cmdSpawn` fails
+  closed before ever attempting admission, with an explicit
+  "hub does not support allocation-intent" error, whether the old hub omits
+  the `allocationIntent` capabilities key entirely or a newer-but-disabled
+  hub explicitly reports `Supported: false`. Verified by
+  `TestSpawnFailsClosedAgainstHubMissingAllocationIntentCapability` and
+  `TestSpawnFailsClosedWhenHubExplicitlyReportsAllocationIntentUnsupported`;
+  the control case (`TestSpawnProceedsPastCapabilityGateWhenHubSupportsAllocationIntent`)
+  confirms the gate does not itself block a launch against an up-to-date hub.
+- **Honest framing**: there is no single-message "hub-first" ordering that
+  makes a mixed deployment transparently safe in both directions at once — a
+  corrected hub with any not-yet-upgraded CLI already rejects fresh
+  item-bound launches (by design), and an upgraded CLI against any
+  not-yet-upgraded hub now also refuses to attempt one. The actual supported
+  unit of deployment is a **coordinated rollout window**: upgrade the hub and
+  every launch-capable CLI together, expecting fresh parented item-bound
+  launches to be unavailable for the duration for whichever side lags, not
+  silently degraded to weaker accounting on either side.
+
+### Tests (round 4)
+
+- `hub/internal/store/work_context_test.go` —
+  `TestAllocationIntentRequiredMatchedAndConsumedOnce` (rewritten,
+  comprehensive): unauthorized author rejected; stale author run rejected;
+  `ExpectedRunID` reuse rejected; context-digest mismatch rejected; launcher
+  identity recorded distinctly from author identity on consumption;
+  `GetAllocationIntent` readback correct both before and after consumption;
+  idempotent retry returns the original record unchanged, a payload-mismatch
+  retry on the same key conflicts.
+  `TestAllocationIntentCrossTargetTaskRejected` (new): a data-level
+  target-task mismatch (simulated via direct SQL, since the creation API
+  path always pins it correctly) is rejected at admission.
+  `TestAllocationIntentLegacyEmptyFieldsCannotAuthorize` (new): a
+  pre-round-4-shaped intent row (missing the new required fields, simulated
+  via direct SQL insert) cannot authorize an admission.
+- `hub/internal/server/server_test.go` — `TestAllocationIntentEndpoint`
+  extended with a `GetAllocationIntent` readback assertion through the real
+  HTTP API.
+- `hub/cmd/tt/coordination_test.go` (new) —
+  `TestSpawnFailsClosedAgainstHubMissingAllocationIntentCapability`,
+  `TestSpawnFailsClosedWhenHubExplicitlyReportsAllocationIntentUnsupported`,
+  `TestSpawnProceedsPastCapabilityGateWhenHubSupportsAllocationIntent`,
+  `TestSpawnOldStyleRequestWithoutIntentRejectedByCorrectedHub`: the
+  mixed-version compatibility gate, both directions, end-to-end through a
+  real HTTP server and a real work item/order message (not a synthetic
+  shallow-JSON stand-in).
+- Full suites re-run clean after all round-4 changes: `go build/vet`,
+  `gofmt -l` clean; `go test ./internal/store/... ./internal/server/...
+  -race -count=1` clean; `go test ./cmd/tt/...` clean for every test this
+  round touched (the same pre-existing, unrelated baseline nonpasses noted
+  under round 2/3 remain and were independently reconfirmed present on the
+  unmodified baseline this round via `git stash`).
+
 ## Not in scope here
 
 No handler implementation, quota/setting change (task `maxNewAgents`
