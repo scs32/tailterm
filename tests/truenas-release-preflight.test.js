@@ -349,6 +349,74 @@ test("receipt consumer rejects incomplete host, source, executable, and mutation
   }
 });
 
+test("external handler pin rejects changed backup SHA even with recomputed evidence digest", () => {
+  const directory = workspace("external-receipt-pin");
+  createDatabase(join(directory, "source.sqlite"));
+  const plan = planFor(directory);
+  mkdirSync(plan.allowedBackupRoot);
+  const completed = runHandler(plan, directory);
+  assert.equal(completed.process.status, 0, completed.process.stderr);
+  const expectedPin = completed.result.receiptOutput.sha256;
+  assert.equal(expectedPin, sha256(completed.receiptPath));
+
+  const tamperedPath = join(directory, "tampered-recomputed.json");
+  const tamperSource = `
+import importlib.util, json, pathlib, sys
+spec = importlib.util.spec_from_file_location("preflight", sys.argv[1])
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+receipt = json.loads(pathlib.Path(sys.argv[2]).read_text())
+receipt["sha256"] = "f" * 64
+receipt["evidenceDigest"] = module._receipt_evidence_digest(receipt)
+pathlib.Path(sys.argv[3]).write_text(json.dumps(receipt, sort_keys=True, separators=(",", ":")) + "\\n")
+`;
+  const tamper = spawnSync(
+    "python3",
+    ["-c", tamperSource, worker, completed.receiptPath, tamperedPath],
+    {
+      encoding: "utf8",
+      env: { ...globalThis.process.env, PYTHONDONTWRITEBYTECODE: "1" },
+    },
+  );
+  assert.equal(tamper.status, 0, tamper.stderr);
+
+  const checkSource = `
+import importlib.util, pathlib, sys
+scripts = pathlib.Path(sys.argv[1]).parent
+sys.path.insert(0, str(scripts))
+spec = importlib.util.spec_from_file_location("deploy", sys.argv[1])
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+try:
+    module._read_receipt(pathlib.Path(sys.argv[2]), sys.argv[3])
+except module.PreflightFailure as error:
+    print(error.classification)
+    raise SystemExit(2)
+print("valid")
+`;
+  const accepted = spawnSync(
+    "python3",
+    ["-c", checkSource, deploy, completed.receiptPath, expectedPin],
+    {
+      encoding: "utf8",
+      env: { ...globalThis.process.env, PYTHONDONTWRITEBYTECODE: "1" },
+    },
+  );
+  assert.equal(accepted.status, 0, accepted.stderr);
+  assert.equal(accepted.stdout.trim(), "valid");
+  const rejected = spawnSync(
+    "python3",
+    ["-c", checkSource, deploy, tamperedPath, expectedPin],
+    {
+      encoding: "utf8",
+      env: { ...globalThis.process.env, PYTHONDONTWRITEBYTECODE: "1" },
+    },
+  );
+  assert.equal(rejected.status, 2);
+  assert.equal(rejected.stdout.trim(), "verification-failed");
+  assert.equal(existsSync(join(directory, "remote-probe-ran")), false);
+});
+
 test("route, hostname, and executable failures retain distinct classifications", () => {
   for (const fixture of [
     { name: "route", modes: { ssh: "fail" }, classification: "route-unavailable" },
@@ -421,7 +489,16 @@ test("deployment requires established route and handler receipt before any remot
   writeFileSync(receiptPath, "{}");
   const observed = spawnSync(
     "python3",
-    [deploy, plan.deployment.releaseName, "--plan", planPath, "--preflight-receipt", receiptPath],
+    [
+      deploy,
+      plan.deployment.releaseName,
+      "--plan",
+      planPath,
+      "--preflight-receipt",
+      receiptPath,
+      "--preflight-receipt-sha256",
+      "0".repeat(64),
+    ],
     { cwd: root, encoding: "utf8" },
   );
   const result = JSON.parse(observed.stdout.trim());

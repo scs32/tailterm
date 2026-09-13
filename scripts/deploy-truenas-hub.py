@@ -3,7 +3,8 @@
 
 Usage:
   scripts/deploy-truenas-hub.py RELEASE --plan PLAN.json \
-      --preflight-receipt RECEIPT.json [--update]
+      --preflight-receipt RECEIPT.json \
+      --preflight-receipt-sha256 SHA256 [--update]
 
 This lead-side command never opens, queries, or backs up SQLite. The database
 handler runs ``truenas_release_preflight.py`` first and supplies its immutable
@@ -92,17 +93,35 @@ def _emit(result: dict[str, Any]) -> None:
     print(json.dumps(result, sort_keys=True, separators=(",", ":")), flush=True)
 
 
-def _read_receipt(path: pathlib.Path) -> tuple[dict[str, Any], str]:
+def _read_receipt(path: pathlib.Path, expected_sha256: str) -> tuple[dict[str, Any], str]:
+    if re.fullmatch(r"[0-9a-f]{64}", expected_sha256) is None:
+        raise PreflightFailure(
+            "invalid-input", "preflight receipt SHA-256 must be 64 lowercase hex characters"
+        )
     try:
         data = path.read_bytes()
-        receipt = json.loads(data)
-    except (OSError, json.JSONDecodeError) as error:
+    except OSError as error:
         raise PreflightFailure(
             "verification-failed", f"cannot read preflight receipt: {error}"
         ) from error
+    actual_sha256 = hashlib.sha256(data).hexdigest()
+    if actual_sha256 != expected_sha256:
+        raise PreflightFailure(
+            "verification-failed",
+            "preflight receipt bytes do not match the handler-saved SHA-256 pin",
+            expectedReceiptSha256=expected_sha256,
+            observedReceiptSha256=actual_sha256,
+            mutationStarted=False,
+        )
+    try:
+        receipt = json.loads(data)
+    except json.JSONDecodeError as error:
+        raise PreflightFailure(
+            "verification-failed", f"cannot parse preflight receipt: {error}"
+        ) from error
     if not isinstance(receipt, dict):
         raise PreflightFailure("verification-failed", "preflight receipt is not an object")
-    return receipt, hashlib.sha256(data).hexdigest()
+    return receipt, actual_sha256
 
 
 def _remote_failure(
@@ -228,6 +247,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("release")
     parser.add_argument("--plan", required=True, type=pathlib.Path)
     parser.add_argument("--preflight-receipt", required=True, type=pathlib.Path)
+    parser.add_argument("--preflight-receipt-sha256", required=True)
     parser.add_argument("--update", action="store_true")
     arguments = parser.parse_args(argv)
 
@@ -239,7 +259,9 @@ def main(argv: list[str] | None = None) -> int:
     try:
         plan = load_plan(arguments.plan)
         deployment = _deployment_plan(plan, arguments.release)
-        raw_receipt, receipt_sha256 = _read_receipt(arguments.preflight_receipt)
+        raw_receipt, receipt_sha256 = _read_receipt(
+            arguments.preflight_receipt, arguments.preflight_receipt_sha256
+        )
         preflight = validate_receipt(plan, raw_receipt)
     except PreflightFailure as error:
         _emit(error.result(plan))

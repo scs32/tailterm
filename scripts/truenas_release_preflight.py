@@ -1073,7 +1073,7 @@ def validate_receipt(plan: Any, receipt: Any) -> dict[str, Any]:
 
 def _save_local_receipt(
     path: pathlib.Path, result: dict[str, Any], plan: dict[str, Any]
-) -> None:
+) -> str:
     data = (json.dumps(result, sort_keys=True, separators=(",", ":")) + "\n").encode()
     if path.exists():
         try:
@@ -1091,9 +1091,10 @@ def _save_local_receipt(
             raise PreflightFailure(
                 "request-conflict", "receipt output contains a different result"
             )
-        return
+        return hashlib.sha256(path.read_bytes()).hexdigest()
     path.parent.mkdir(parents=True, exist_ok=True)
     _write_exclusive(path, data)
+    return hashlib.sha256(data).hexdigest()
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -1118,7 +1119,13 @@ def main(argv: list[str] | None = None) -> int:
                 "success",
                 "already-satisfied",
             }:
-                _save_local_receipt(arguments.receipt_output, result, plan)
+                local_receipt_sha256 = _save_local_receipt(
+                    arguments.receipt_output, result, plan
+                )
+                result["receiptOutput"] = {
+                    "path": str(arguments.receipt_output),
+                    "sha256": local_receipt_sha256,
+                }
     except PreflightFailure as error:
         result = error.result(plan)
     except (OSError, json.JSONDecodeError) as error:
