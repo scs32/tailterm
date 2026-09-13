@@ -231,10 +231,20 @@ func recordEvidencePage(manifestPath, source, phase string, parameters map[strin
 		return 0, errors.New("evidence page directory must be a private directory")
 	}
 	entry := manifest.Sources[source]
-	name := fmt.Sprintf("%s-%03d-%s.json", source, len(entry.Pages)+1, hexDigest[:16])
-	path := filepath.Join(dir, name)
-	file, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
+	prefix := fmt.Sprintf("%s-%03d-%s.json-", source, len(entry.Pages)+1, hexDigest[:16])
+	file, err := os.CreateTemp(dir, prefix)
 	if err != nil {
+		return 0, err
+	}
+	path := file.Name()
+	remove := true
+	defer func() {
+		if remove {
+			_ = os.Remove(path)
+		}
+	}()
+	if err = file.Chmod(0600); err != nil {
+		_ = file.Close()
 		return 0, err
 	}
 	_, writeErr := file.Write(response.Body)
@@ -246,6 +256,11 @@ func recordEvidencePage(manifestPath, source, phase string, parameters map[strin
 	}
 	if writeErr != nil {
 		return 0, writeErr
+	}
+	remove = false
+	if d, openErr := os.Open(dir); openErr == nil {
+		_ = d.Sync()
+		_ = d.Close()
 	}
 	rel, err := filepath.Rel(filepath.Dir(manifestPath), path)
 	if err != nil {

@@ -294,3 +294,27 @@ func TestWorkItemEvidenceReaderRejectsNonHandlerRoleBeforeEvidenceRead(t *testin
 		t.Fatalf("error=%v evidenceCalls=%d", err, evidenceCalls.Load())
 	}
 }
+
+func TestWorkItemEvidenceReaderRejectsMissingRetainedPageBeforeResume(t *testing.T) {
+	var currentCalls atomic.Int32
+	e := evidenceCLIEnv(t, func(w http.ResponseWriter, req *http.Request) {
+		currentCalls.Add(1)
+		writeEvidenceJSON(w, evidenceCurrent(1, 1))
+	})
+	manifestPath := filepath.Join(t.TempDir(), "missing-page.json")
+	args := []string{"evidence", "--manifest", manifestPath, "--sources", "current", evidenceItem}
+	if _, err := captureCLIOutput(t, func() error { return cmdWorkItems(e, args) }); err != nil {
+		t.Fatal(err)
+	}
+	manifest := readEvidenceManifestForTest(t, manifestPath)
+	pagePath := filepath.Join(filepath.Dir(manifestPath), manifest.Sources["current"].Pages[0].Path)
+	if err := os.Rename(pagePath, pagePath+".held-out"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := captureCLIOutput(t, func() error { return cmdWorkItems(e, args) }); err == nil || !strings.Contains(err.Error(), "missing or not a mode 0600 regular file") {
+		t.Fatalf("missing page error=%v", err)
+	}
+	if currentCalls.Load() != 2 {
+		t.Fatalf("resume made a new evidence request after retained-page failure: calls=%d", currentCalls.Load())
+	}
+}
