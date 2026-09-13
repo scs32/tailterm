@@ -1,0 +1,14 @@
+{
+  "processes": [
+    {
+      "pid": 83457,
+      "ppid": 1,
+      "started": "Tue Sep  8 11:51:53 2026",
+      "executable": "/Users/stephenspeicher/.local/bin/tt",
+      "subcommand": "relay"
+    }
+  ],
+  "launchctlRows": [
+    "83457\t-15\tcom.tailterm.inbox-relay"
+  ]
+}

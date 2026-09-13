@@ -1,0 +1,39 @@
+{
+  "order": 4357,
+  "failureMessage": 4383,
+  "cause": "Handler attempted payload differs from approved4380; binding order changed3699to4235 and allv2evidence fields omitted. Server rejected mismatched binding before mutation.",
+  "differences": {
+    "enrollmentVersion": {
+      "approved": 2,
+      "attempted": null
+    },
+    "governingOrderMessage": {
+      "approved": {
+        "taskId": "tsk_2cfcff70a0fbe967",
+        "seq": 4235
+      },
+      "attempted": null
+    },
+    "instructionBytes": {
+      "approved": 3325,
+      "attempted": null
+    },
+    "instructionSha256": {
+      "approved": "24676fa4aecd08fd36020d09d7e60701512be9ac0eadb3b898a6bf0da88d29a6",
+      "attempted": null
+    },
+    "workOrderMessage": {
+      "approved": {
+        "taskId": "tsk_2cfcff70a0fbe967",
+        "seq": 3699
+      },
+      "attempted": {
+        "taskId": "tsk_2cfcff70a0fbe967",
+        "seq": 4235
+      }
+    }
+  },
+  "preventionOwner": "db-handler",
+  "preventionOrder": 4328,
+  "preventionAction": "Execute hash-verified reviewed file directly; compare exact serialized payload and schema version before mutation; preserve distinct binding versus governing order."
+}

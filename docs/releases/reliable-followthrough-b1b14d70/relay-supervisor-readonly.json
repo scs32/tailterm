@@ -1,0 +1,24 @@
+{
+  "target": "gui/501/com.tailterm.inbox-relay",
+  "plist": "/Users/stephenspeicher/Library/LaunchAgents/com.tailterm.inbox-relay.plist",
+  "configuration": {
+    "Label": "com.tailterm.inbox-relay",
+    "ProgramArguments": [
+      "/Users/stephenspeicher/.local/bin/tt",
+      "relay"
+    ],
+    "RunAtLoad": true,
+    "KeepAlive": true,
+    "StandardOutPath": "/Users/stephenspeicher/Library/Logs/Tailterm/inbox-relay.log",
+    "StandardErrorPath": "/Users/stephenspeicher/Library/Logs/Tailterm/inbox-relay.log"
+  },
+  "selectedRuntimeFields": [
+    "path = /Users/stephenspeicher/Library/LaunchAgents/com.tailterm.inbox-relay.plist",
+    "state = running",
+    "program = /Users/stephenspeicher/.local/bin/tt",
+    "runs = 12",
+    "pid = 83457",
+    "state = active",
+    "state = active"
+  ]
+}

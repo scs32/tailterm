@@ -1,0 +1,20 @@
+{
+  "releaseOrder": 4314,
+  "leadAcceptance": 4356,
+  "handlerConfirmation": 4363,
+  "nativeAcceptance": "nart_ac53337a4a62adbb v1",
+  "scope": "hub/Mini binary release only",
+  "materializedGates": {
+    "handler-pre-gate-materialized.txt": {
+      "bytes": 1316,
+      "sha256": "3cdc32d0f1659bde69f9eff85e65c5b485f9e532e62aa5ea9434e2bc79854264",
+      "nativeTextSHA256WithoutMaterializedNewline": "262a0b3ab0d8a6e8b61afc27252cd420df96e4fdb52e74b242e4174c5401b636"
+    },
+    "handler-post-gate-materialized.txt": {
+      "bytes": 898,
+      "sha256": "8a0d8ef12f071d2d9b476c1eeef7613ba3f3f59578a31159fa0ac61602f62417",
+      "nativeTextSHA256WithoutMaterializedNewline": "4adcd1c33c952dd08e14f5db63c8315ce9918f4410cf8422b2ef154f868add72"
+    }
+  },
+  "activationSeparateOrder": 4357
+}

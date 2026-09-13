@@ -1,0 +1,31 @@
+{
+  "workItems": [
+    {
+      "itemTaskId": "tsk_2cfcff70a0fbe967",
+      "itemId": "wi_618c8ff87e6b8061",
+      "itemRevision": 5,
+      "relationship": "primary"
+    }
+  ],
+  "workOrderMessage": {
+    "taskId": "tsk_2cfcff70a0fbe967",
+    "seq": 4314
+  },
+  "postReceipt": {
+    "id": "mpr_486ec63994fc36f0",
+    "requestId": "release4314-postchecks-delivery-4336",
+    "taskId": "tsk_2cfcff70a0fbe967",
+    "messageSeq": 4345,
+    "createdAt": "2026-09-13T20:20:58.25478153Z"
+  },
+  "seq": 4345,
+  "taskId": "tsk_2cfcff70a0fbe967",
+  "from": {
+    "agentId": "agt_3760a4361c514a03",
+    "node": "workspace",
+    "user": "owner"
+  },
+  "to": "agt_64e8e823485a3434",
+  "text": "Post-install handler gate complete and saved/read back as nart_bea5f4965cce5fec v1 narrativeSeq82, 897B, SHA 4adcd1c33c952dd08e14f5db63c8315ce9918f4410cf8422b2ef154f868add72. Remote integrity ok/FK0; six tables rows0; canonical profile hashes unchanged; required_deliveries preserves all pre-gate columns plus additive follow-through columns; no enrollment or relay restart.",
+  "createdAt": "2026-09-13T20:20:58.25478153Z"
+}

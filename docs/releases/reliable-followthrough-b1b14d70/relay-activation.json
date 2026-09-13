@@ -1,0 +1,14 @@
+{
+  "order": 4357,
+  "handlerSavedConfirmation": 4363,
+  "observedAt": "2026-09-13T20:24:41.448791+00:00",
+  "supervisor": "gui/501/com.tailterm.inbox-relay",
+  "action": "one planned launchctl kickstart -k",
+  "oldPID": 83457,
+  "newPID": 11063,
+  "process": "11063     1 Sun Sep 13 13:24:16 2026     /Users/stephenspeicher/.local/bin/tt relay",
+  "installedCLIsha256": "640f5f2f1751cef1d9ad960b0c3c08320a7bc1f88773c8a96def3b5b4056b725",
+  "configurationChanged": false,
+  "realObligationEnrolled": false,
+  "verificationNote": "Immediate post-kickstart full-argv assertion failed during startup. Read-only follow-up confirms supervisor running, runs advanced12to13, exact program and newPID/PPID1/start; no second kickstart issued."
+}

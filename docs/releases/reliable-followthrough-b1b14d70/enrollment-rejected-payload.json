@@ -1,0 +1,17 @@
+{
+  "requestId": "reader4235-v2-enrollment-4357-v1",
+  "messageSeq": 4319,
+  "kind": "assignment",
+  "agentId": "agt_ac3ad2691a275f59",
+  "runId": "run_43657fe460aec447",
+  "itemTaskId": "tsk_2cfcff70a0fbe967",
+  "itemId": "wi_618c8ff87e6b8061",
+  "itemRevision": 5,
+  "workOrderMessage": {
+    "taskId": "tsk_2cfcff70a0fbe967",
+    "seq": 4235
+  },
+  "expectedCurrentGeneration": 0,
+  "producerAgentId": "agt_3760a4361c514a03",
+  "producerRunId": "run_1a67a6c9be7c7136"
+}

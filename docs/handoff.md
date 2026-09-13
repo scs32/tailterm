@@ -1,5 +1,47 @@
 # Development handoff — September 10, 2026
 
+## September 13 directive follow-through — deployed, bounded activation accepted
+
+Feature `wi_618c8ff87e6b8061` revision5, implementation order #4053,
+release order #4314 and activation order #4357 now have a qualified hub/Mini
+release from exact source `b1b14d70cb6f96d033e4da9e1aeb650174066cbf`.
+Lead acceptance #4356 and handler confirmation #4363 cover the binary release;
+lead #4518 and handler #4538/#4559 cover only the later bounded activation.
+The TrueNAS hub is RUNNING at SHA-256
+`03314c6a2a5c56a82f2374db48f5796ca277ce2d37b54020e7868248c08605c6`.
+The Mini CLI is 6,801,362 bytes with SHA-256
+`640f5f2f1751cef1d9ad960b0c3c08320a7bc1f88773c8a96def3b5b4056b725`.
+Both advertise `operationalRecords` v1 and `reliableDelivery` v1+v2.
+
+Version2 adds explicit full-instruction obligation enrollment, visible coverage,
+persisted acknowledgment/progress deadlines, exact-thread Codex queue attempt
+leasing/reporting and bounded escalation. Existing v1 directives and migrated,
+unenrolled workers remain valid but visibly unverified. Queue acceptance,
+heartbeat, Working and inbox reads remain non-execution evidence. The installed
+Codex runtime exposes no supported active-tool/idle observer, so that observation
+remains `unknown` unless a future supported source reports it.
+
+Activation #4357 reloaded the existing relay once without changing its
+configuration, enrolled one real exact-run v2 item-worker obligation
+`dly_e6656fe3d10bc0ad`, and recorded native manual acknowledgment plus substantive
+progress. The earlier bounded attempts and escalation #4400 remain
+`transport_unconfirmed`: they do not establish that wake caused the work. No
+shared lead/handler mandatory-action coverage, unattended prevention, global
+assessment sweep, provider execution acknowledgment, reader-candidate acceptance,
+Air/frontend support or parent-Feature completion is claimed.
+
+[The original operator receipt](releases/reliable-followthrough-b1b14d70/release-receipt.json)
+retains its at-creation `acceptance: null` and pre-activation fields byte-for-byte.
+The separate [release acceptance](releases/reliable-followthrough-b1b14d70/release-acceptance.json),
+[activation receipt](releases/reliable-followthrough-b1b14d70/activation-receipt-4357.json),
+and corrected [activation acceptance](releases/reliable-followthrough-b1b14d70/activation-acceptance-4357-v2.json)
+resolve later phases without rewriting the originals. All 52 release and
+hash-linked evidence files are retained in that directory. Source synchronization
+fast-forwarded `tasks-hub` from parent `bfd45b1` and copied this evidence; it did
+not rebuild, install, deploy, reload a service or exercise live data. Mini preview
+PID60799/PPID1, four owner screenshots, `compact`, owner-modified `AGENTS.md` and
+existing services remain preserved.
+
 ## September 13 structured operational records — deployed and accepted
 
 Feature `wi_618c8ff87e6b8061` revision5, implementation order #3915 and
@@ -80,19 +122,13 @@ above. Air CLI and the deployed frontend are unchanged; the parent Feature
 remains unfinished. The detached Mini preview PID60799/PPID1, four owner
 screenshots and existing services remain preserved.
 
-### Execution follow-through candidate (not deployed)
+### Execution follow-through historical candidate
 
-The same exact worker/run continues under bounded order #4053. The candidate adds
-version-2 explicit obligation enrollment, delivery coverage, persisted 2m/10m/
-2m deadlines, bounded exact-thread Codex queue leasing/reporting, and one durable
-escalation on missing execution evidence. Enrollment pins the authored governing
-order and the server-verified full instruction bytes/SHA; unenrolled admitted
-workers and migrated v1 rows stay visibly unverified. Queue acceptance, heartbeat,
-Working, and inbox consumption remain non-progress. Production Codex observation
-is honestly `unknown` because installed `codex queue` exposes no supported
-active-tool/idle query. Crash and response-loss handling never repeats a leased
-external queue call. This is preparation/candidate work only: no hub, CLI, relay,
-frontend, task, Queue, profile, process, or network was changed.
+Order #4053's candidate phase is retained as history. Its accepted source is now
+the deployed and bounded-activation release documented at the top of this file.
+Do not reinterpret the later manual acknowledgment/progress as proof of wake
+causality or unattended prevention; escalation #4400 remains
+`transport_unconfirmed`.
 
 ## September 13 native context capacity — deployed and accepted
 

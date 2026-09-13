@@ -1,0 +1,9 @@
+{
+  "preCount": 21,
+  "liveCount": 43,
+  "addedCount": 22,
+  "expectedSourceColumnsMatch": true,
+  "preColumnsPreservedInOrder": true,
+  "source": "b1b14d70",
+  "reportingCorrection": "Handler prose pre22 is a count error; exact arrays show21pre+22added=43live."
+}

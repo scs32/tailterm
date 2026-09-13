@@ -1,0 +1,326 @@
+{
+  "version": 1,
+  "createdAt": "2026-09-13T19:59:00Z",
+  "stage": "release_preparation_only",
+  "packagePath": ".build/reliable-followthrough-b1b14d7-v3",
+  "supersedesRejectedPackages": [
+    {
+      "path": ".build/reliable-followthrough-b1b14d7",
+      "qaFindingMessageSeq": 4286,
+      "reason": "the otherwise-passing smoke retained a live observation timestamp, so an independent rerun rewrote its evidence JSON and invalidated SHA256SUMS",
+      "preserved": true
+    },
+    {
+      "path": ".build/reliable-followthrough-b1b14d7-v2",
+      "leadCorrectionMessageSeq": 4289,
+      "reason": "deterministic content still defaulted to rewriting the pinned package evidence rather than emitting every rerun into external private storage",
+      "preserved": true
+    }
+  ],
+  "rebuiltBinariesForCorrections": false,
+  "workItem": {
+    "taskId": "tsk_2cfcff70a0fbe967",
+    "itemId": "wi_618c8ff87e6b8061",
+    "itemRevision": 5,
+    "firstCoreOrderMessageSeq": 3699,
+    "implementationContinuationMessageSeq": 4053,
+    "releasePreparationOrderMessageSeq": 4249,
+    "handlerSavedContinuationMessageSeq": 4253,
+    "leadFullOrderDeliveryMessageSeq": 4257,
+    "agentId": "agt_ac3ad2691a275f59",
+    "runId": "run_43657fe460aec447",
+    "contextDigest": "3832346f3517a146c69b717a0faa629323316c0e423a5a45d947d7251b3c9354",
+    "originalQueueStartMessageSeq": 3799,
+    "originalQueueStartReceiptId": "qrr_7f80a6a31ab0717c",
+    "queueBindingChanged": false
+  },
+  "source": {
+    "candidateCommit": "b1b14d70cb6f96d033e4da9e1aeb650174066cbf",
+    "candidateTree": "6a88a8e2907b1c2cbb673f98d9865733ccb40f36",
+    "candidateParent": "bfd45b1e20d5a3a9d267c940245b7fd503197380",
+    "integratedBaseCommit": "bfd45b1e20d5a3a9d267c940245b7fd503197380",
+    "deployedOperationalRecordsAncestor": "3da7ae703ac6528e9aeb2151b03dcc4335f8e2ec",
+    "operationalRecordsAncestorVerified": true,
+    "integratedBaseAncestorVerified": true,
+    "branch": "feat/reliable-directive-core-api-mini",
+    "worktreeCleanBeforePackaging": true,
+    "independentDetachedClone": "/tmp/reliable-followthrough-build.VAtxfW/source",
+    "archive": {
+      "path": "source-b1b14d7.tar",
+      "bytes": 10803200,
+      "sha256": "ef6ec3c41a9d1cacbcb62152ea063a2ce0ec722a205f4bd3bee20b113d9a5292",
+      "gitArchiveCommit": "b1b14d70cb6f96d033e4da9e1aeb650174066cbf",
+      "gitGetTarCommitIdVerified": true,
+      "entryCount": 550,
+      "scope": "complete repository tree"
+    }
+  },
+  "build": {
+    "launcherGoVersion": "go1.26.5 darwin/arm64",
+    "toolchainRecordedByBinaries": "go1.26.6",
+    "host": "macOS 26.5.2 build 25F84 arm64",
+    "flags": "CGO_ENABLED=0 -buildvcs=true -trimpath -ldflags='-s -w -buildid='",
+    "commands": [
+      "CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -buildvcs=true -trimpath -ldflags='-s -w -buildid=' -o tailterm-hub-linux-amd64 ./cmd/tailterm-hub",
+      "CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 go build -buildvcs=true -trimpath -ldflags='-s -w -buildid=' -o tt-darwin-arm64 ./cmd/tt"
+    ],
+    "vcsRevision": "b1b14d70cb6f96d033e4da9e1aeb650174066cbf",
+    "vcsModified": false,
+    "twoBuildByteReproducible": true,
+    "metadataEvidence": {
+      "path": "go-version-m.txt",
+      "bytes": 4990,
+      "sha256": "3bb55f6f35081a79815601bb53975086ee636dbb28239b31b2317f89780e63c1"
+    }
+  },
+  "artifacts": {
+    "hub": {
+      "path": "tailterm-hub-linux-amd64",
+      "os": "linux",
+      "arch": "amd64",
+      "bytes": 27664510,
+      "sha256": "03314c6a2a5c56a82f2374db48f5796ca277ce2d37b54020e7868248c08605c6",
+      "format": "ELF 64-bit x86-64, statically linked, stripped",
+      "vcsRevision": "b1b14d70cb6f96d033e4da9e1aeb650174066cbf",
+      "vcsModified": false,
+      "reproCheckPath": "repro-check/tailterm-hub-linux-amd64",
+      "reproCheckSha256": "03314c6a2a5c56a82f2374db48f5796ca277ce2d37b54020e7868248c08605c6"
+    },
+    "miniCli": {
+      "path": "tt-darwin-arm64",
+      "os": "darwin",
+      "arch": "arm64",
+      "bytes": 6801362,
+      "sha256": "640f5f2f1751cef1d9ad960b0c3c08320a7bc1f88773c8a96def3b5b4056b725",
+      "format": "Mach-O 64-bit arm64",
+      "vcsRevision": "b1b14d70cb6f96d033e4da9e1aeb650174066cbf",
+      "vcsModified": false,
+      "reproCheckPath": "repro-check/tt-darwin-arm64",
+      "reproCheckSha256": "640f5f2f1751cef1d9ad960b0c3c08320a7bc1f88773c8a96def3b5b4056b725"
+    },
+    "rollbackHub": {
+      "path": "rollback-tailterm-hub-linux-amd64",
+      "sourcePackage": ".build/operational-records-3da7ae7/tailterm-hub-linux-amd64",
+      "bytes": 27566206,
+      "sha256": "7767d17af4060ba97dcbaa891730217beb137c5c9aeebd13e883bb6471ca876e",
+      "vcsRevision": "3da7ae703ac6528e9aeb2151b03dcc4335f8e2ec"
+    },
+    "rollbackMiniCli": {
+      "path": "rollback-tt-darwin-arm64",
+      "sourcePackage": ".build/operational-records-3da7ae7/tt-darwin-arm64",
+      "bytes": 6783826,
+      "sha256": "ec9873d6a06e623e0838e27dd8e9e6aab4fcb722c2758192e497d7c54da4f2a3",
+      "vcsRevision": "3da7ae703ac6528e9aeb2151b03dcc4335f8e2ec"
+    }
+  },
+  "capabilities": {
+    "reliableDelivery": {
+      "supported": true,
+      "versions": [1, 2],
+      "version1": "durable manual directive core",
+      "version2": "explicit immutable enrollment, coverage and bounded follow-through"
+    },
+    "operationalRecords": {
+      "supported": true,
+      "versions": [1],
+      "preservedFrom": "3da7ae703ac6528e9aeb2151b03dcc4335f8e2ec"
+    },
+    "legacyFallback": false,
+    "productionRuntimeObservation": "unknown",
+    "activeToolOrIdleObserverAvailable": false
+  },
+  "migration": {
+    "existingTablesPreserved": [
+      "required_deliveries",
+      "delivery_blocks",
+      "delivery_events",
+      "delivery_operation_receipts",
+      "operational_records",
+      "operational_record_versions"
+    ],
+    "additiveRequiredDeliveryColumns": [
+      "governing_order_task_id",
+      "governing_order_message_seq",
+      "instruction_sha256",
+      "instruction_bytes",
+      "enrollment_version",
+      "ack_deadline_seconds",
+      "progress_deadline_seconds",
+      "resume_deadline_seconds",
+      "confirmation_deadline_seconds",
+      "dispatch_report_seconds",
+      "active_tool_hard_limit_seconds",
+      "max_queue_attempts",
+      "last_substantive_progress_at",
+      "next_substantive_deadline_at",
+      "hard_deadline_at",
+      "followthrough_attempt_count",
+      "followthrough_pending_action",
+      "followthrough_pending_request_id",
+      "followthrough_pending_since",
+      "followthrough_transport_outcome",
+      "followthrough_confirmation_until",
+      "followthrough_escalation_message_seq"
+    ],
+    "method": "PRAGMA table inspection followed by ALTER TABLE ADD COLUMN only when absent",
+    "backfill": false,
+    "legacyRows": "retain enrollment_version=1 and report legacy_enrollment_unverified",
+    "databaseRestoreAuthorized": false
+  },
+  "routes": [
+    "POST /v1/tasks/{task}/required-deliveries",
+    "GET /v1/tasks/{task}/agents/{agent}/current-assignment?runId=...",
+    "GET /v1/tasks/{task}/agents/{agent}/delivery-coverage?runId=...",
+    "POST /v1/tasks/{task}/deliveries/{delivery}/follow-through/check",
+    "POST /v1/tasks/{task}/deliveries/{delivery}/follow-through/report",
+    "POST /v1/tasks/{task}/deliveries/{delivery}/{ack|progress|blocks|resume|result}",
+    "POST /v1/tasks/{task}/deliveries/{delivery}/blocks/{block}/resolutions"
+  ],
+  "policyDefaultsSeconds": {
+    "ack": 120,
+    "progress": 600,
+    "resolvedResume": 120,
+    "queueConfirmation": 120,
+    "dispatchReport": 30,
+    "activeToolHardLimit": 1800,
+    "maxQueueAttempts": 2
+  },
+  "evidence": {
+    "implementationResult": {
+      "path": "implementation-result.md",
+      "bytes": 7833,
+      "sha256": "ec9df2108f06dc3c2900ed0ed6accd01f611681caaca878e466dbcd759df34f6",
+      "nativeArtifact": "nart_6bf2ceb1049c5025",
+      "nativeArtifactVersion": 2,
+      "handlerAcceptanceMessageSeq": 4251
+    },
+    "independentCorrectedQA": {
+      "messageSeqs": [4236, 4237],
+      "result": "pass",
+      "scope": "v2 enrollment/deadline/follow-through plus lifecycle, phase, pending-lease fencing and durable stale-report invalidation",
+      "packageBytesReview": "pending after this frozen package handoff"
+    },
+    "packagedCliSmoke": {
+      "scriptPath": "reliable-followthrough-cli-smoke.py",
+      "scriptBytes": 15930,
+      "scriptSha256": "4b57b1ca8f4e4f2b8bab6546717da96e2e5fded44f648dbacc5794b5f726c5a1",
+      "resultPath": "reliable-followthrough-cli-smoke.json",
+      "resultBytes": 7916,
+      "resultSha256": "a2cd8de1c7d86daf0d29f0db3768bf75c095ca915d0a061ce96f1403ea6b4604",
+      "result": "7/7 pass; 24 isolated HTTP requests",
+      "canonicalFixture": "generated externally with --normalize-observation; only the copied observedAt field is normalized and the synthetic request still uses current UTC",
+      "normalizedVolatileFields": ["follow-through check body observation.observedAt in canonical fixture only"],
+      "defaultExternalEvidence": "retains raw per-run runtime observation timestamps",
+      "rerunOutput": "--output-dir writes to an explicit external directory; omitting it creates a new private /tmp directory; the frozen package is never the default output target",
+      "cases": [
+        "version-2 enrollment serialization",
+        "version-2 coverage serialization",
+        "version-1 enrollment on a version-1 hub",
+        "version-2 enrollment fails closed on a version-1 hub without action",
+        "unknown hub fails closed without action",
+        "follow-through accepted report response-loss retry uses identical payload and one fake runtime call",
+        "definitive stale report is converted to one durable invalidation with no fake runtime call"
+      ],
+      "actualCodexQueueInvoked": false,
+      "scope": "isolated synthetic HTTP, private temporary relay state, synthetic credentials and a fake Codex executable only"
+    },
+    "packagedOperationalRecordsRegression": {
+      "scriptPath": "operational-cli-regression-smoke.py",
+      "scriptBytes": 6466,
+      "scriptSha256": "34f63518c291fff4e95748f02a173801118aa730e29f1b886431a14f071f240a",
+      "resultPath": "operational-cli-regression-smoke.json",
+      "resultBytes": 4657,
+      "resultSha256": "571af0411b84a6b4406f0210b1b5961283b148f541a9f22ebb9d0494dabf0d6f",
+      "proposalRequest": {
+        "path": "operational-proposal.json",
+        "bytes": 66,
+        "sha256": "2911fb8bdff80c2077c2f12624f29207469f6e74f92b8e956d80ed739f7bba2a"
+      },
+      "commitRequest": {
+        "path": "operational-commit.json",
+        "bytes": 54,
+        "sha256": "6595a3daf04fb43cc162cb79e5ba5d878de36573bb2c2776c031cf39fc4cf7cb"
+      },
+      "result": "5/5 pass; 8 isolated HTTP requests",
+      "rerunOutput": "evidence and request fixtures are written only to an explicit external directory or a new private /tmp directory",
+      "cases": [
+        "packaged successor CLI propose request/output",
+        "packaged successor CLI get request/output",
+        "packaged successor CLI commit request/output",
+        "unsupported capability fails closed before action",
+        "unknown capability version fails closed before action"
+      ],
+      "scope": "preservation regression only; accepted operational-record QA #4006 covers store transition semantics"
+    },
+    "operatorPlan": {
+      "path": "operator-plan.md",
+      "bytes": 7046,
+      "sha256": "81fb1865f154d0cd219bed18775e93a134316d8c01f185777945e32000f00c71"
+    },
+    "preservedOperationalRecordsPackage": {
+      "path": ".build/operational-records-3da7ae7",
+      "manifestBytes": 8919,
+      "manifestSha256": "fba07258a1aa0db1ca5409008eeaf11aa8a9f1cd0a75fba7c74a261d361d36ea",
+      "implementationResultBytes": 4565,
+      "implementationResultSha256": "5b70c8c4421f5056964cb52ed03c9a2579fb3f124b23d4c9cc6413f540a1ce5e"
+    }
+  },
+  "qualification": {
+    "sourceArchiveCommitVerified": true,
+    "cleanIndependentClone": true,
+    "twoBuildByteReproducible": true,
+    "goVersionMExactCandidateAndUnmodified": true,
+    "darwinCliHelp": "pass",
+    "packagedCliSmoke": "7/7 canonical fixture plus raw external reruns; no package writes",
+    "packagedOperationalRecordsRegression": "5/5 pass",
+    "implementationTests": [
+      "go test ./internal/... -count=1",
+      "go test ./cmd/tailterm-hub -count=1",
+      "go test ./cmd/tt -run 'Test(Operational|Delivery|RelayFollowThrough|RelayTargets|RelayQueues|WakeEligibility|SwarmWake)' -count=1",
+      "go build ./cmd/tailterm-hub ./cmd/tt",
+      "go vet ./...",
+      "focused race tests for follow-through store transitions"
+    ],
+    "independentQA": "accepted corrected candidate per #4236/#4237 and handler #4251",
+    "frozenPackageIndependentQA": "pending",
+    "liveDataOrServiceUsed": false
+  },
+  "activation": {
+    "operatorPlanPath": "operator-plan.md",
+    "binaryInstallationIsProcessActivation": false,
+    "hubActivationRequiresSeparateOrder": true,
+    "existingRelayRequiresExplicitRelaunchToLoadNewCli": true,
+    "realObligationEnrollmentIsSeparate": true,
+    "coverageBeforeEnrollment": "uncovered_unverified or legacy_enrollment_unverified",
+    "currentInstructionRequirements": "exact current bound worker/run, admitted context, immutable full instruction bytes/SHA-256 and authorized governing order",
+    "performed": false
+  },
+  "rollback": {
+    "beforeVersion2Enrollment": "exact retained 3da7 hub and CLI may be restored under a separate order while preserving the database and additive columns",
+    "afterVersion2Enrollment": "old binaries cannot claim follow-through and may strand active obligations; freeze enrollment, inventory exact coverage and pending leases, preserve the database, and require handler-reviewed forward-fix or disposition",
+    "olderDatabaseRestore": false,
+    "performed": false
+  },
+  "limitations": [
+    "No supported production Codex active-tool or idle-prompt observer exists; runtime observation remains unknown.",
+    "The lease plus pre-dispatch recheck cannot make a later external subprocess atomic and cannot provide exactly-once external execution.",
+    "Protocol fencing cannot undo shell, file, network or provider side effects already performed from stale instructions.",
+    "Queued transport, inbox reads, heartbeats, roster labels and Queue Start remain separate from directive acknowledgment and progress.",
+    "Unenrolled workers and migrated version-1 rows remain explicitly unverified.",
+    "Result evidence does not accept or complete the work item, advance Queue, release a worker, or close an exact run.",
+    "Handler backlog consumer #3694, global watchdog, generic transport correction, UI and native-reader #4235 remain deferred."
+  ],
+  "authorization": {
+    "deployment": false,
+    "installation": false,
+    "hubOrCliActivation": false,
+    "relayRestartOrConfiguration": false,
+    "realDeliveryEnrollment": false,
+    "databaseMigrationExecuted": false,
+    "productionDatabaseRead": false,
+    "frontendChanged": false,
+    "tailscaleOrNetworkChanged": false,
+    "queueOrAgentLifecycleChanged": false,
+    "nativeReaderStarted": false
+  }
+}

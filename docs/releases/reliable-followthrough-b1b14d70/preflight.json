@@ -1,0 +1,20 @@
+{
+  "order": 4314,
+  "observedAt": "2026-09-13T20:17:46.591449+00:00",
+  "rootHead": "bfd45b1e20d5a3a9d267c940245b7fd503197380",
+  "package": "/Users/stephenspeicher/projects/tailterm/.build/worktrees/reliable-directive-core-api-mini/.build/reliable-followthrough-b1b14d7-v3",
+  "manifestSHA256": "5e60ba1af8bb368bb3e0e563f8da2f4b8f3db6e643ab02950e4b09f48f174988",
+  "verifiedChecksums": 17,
+  "currentHubSHA256": "7767d17af4060ba97dcbaa891730217beb137c5c9aeebd13e883bb6471ca876e",
+  "currentMiniSHA256": "ec9873d6a06e623e0838e27dd8e9e6aab4fcb722c2758192e497d7c54da4f2a3",
+  "preview": "60799     1 node scripts/preview-static.mjs dist-static 127.0.0.1 4318",
+  "preservedFiles": {
+    "Screenshot 2026-09-10 at 1.31.31\u202fPM.png": "52fd51f6aee8d779346eb954b148ce9045d6661cfd7f6caaf888f1312887737e",
+    "Screenshot 2026-09-10 at 9.14.39\u202fAM.png": "dbcedf3da21edc7b2bbf45f7472ecd4fa64729e5b2ca9a1a5e2b71e4e98a7c1b",
+    "Screenshot 2026-09-10 at 7.23.35\u202fAM.png": "c431345ea3b766986c1476ee095797d27f72d2d71fc456579560ece43a4294cb",
+    "Screenshot 2026-09-10 at 7.16.15\u202fAM.png": "ff2971f69f5832d9a94a5f1253e977af8919d32b0b73dceab3f32f7e34bdf40c",
+    "compact": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  },
+  "configMatchesPriorRelease": true,
+  "uniqueRemoteReleaseAbsent": true
+}

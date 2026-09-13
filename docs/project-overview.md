@@ -124,13 +124,14 @@ orchestrator. It defaults to the owning project; choosing another does not move
 the record or start a team. The receipt confirms message storage, not execution.
 
 The TrueNAS hub and Mini CLI now run exact source
-`3da7ae703ac6528e9aeb2151b03dcc4335f8e2ec` under Feature
-`wi_618c8ff87e6b8061` revision5 and release order #4074. That source retains the
-qualified manual directive core from `6d2ab09`: current-assignment lookup, CAS
-supersession, exact-run acknowledgment, progress, blocking, resolution, resume
-and result receipts keep retrieval, execution evidence and outcome acceptance
-separate. The CLI requires the versioned hub capability and never falls back to
-an inbox read or lifecycle event.
+`b1b14d70cb6f96d033e4da9e1aeb650174066cbf` under Feature
+`wi_618c8ff87e6b8061` revision5, implementation order #4053 and release order
+#4314. That source retains the qualified manual directive core and structured
+operational records, and exposes `reliableDelivery` v1+v2. Version2 adds explicit
+full-instruction obligation enrollment, visible coverage, persisted execution
+deadlines, exact-thread attempt leasing/reporting and bounded escalation. The CLI
+requires the versioned hub capability and never falls back to an inbox read or
+lifecycle event.
 
 The deployed source also exposes `operationalRecords` v1 from implementation
 order #3915. Explicit proposed/committed instruction, finding, candidate,
@@ -143,21 +144,22 @@ attestation. See [structured operational records](operational-records.md), its
 and the separate
 [handler-saved acceptance](releases/operational-records-3da7ae7/acceptance.json).
 
-Automatic continuation, complete staleness/backlog sweeps, deterministic GO,
-verified wake transport, keep-going/watchdog automation, provider hooks, UI and
-AIV remain undelivered. The handler assessment consumer #3694/#4053 is a later
-slice; Air CLI and the deployed frontend remain unchanged. The parent Feature
-is unfinished.
+Bounded activation order #4357 reloaded the existing relay without configuration
+change, enrolled one real exact-run v2 item-worker obligation and recorded manual
+acknowledgment plus substantive progress. Earlier queue attempts and escalation
+#4400 remain `transport_unconfirmed`; they do not prove that wake caused the work.
+Native queue acceptance, heartbeat, Working and inbox reads remain non-execution
+evidence. Installed Codex has no supported active-tool/idle observer, so production
+classification remains unknown unless a future supported observer supplies fresh
+evidence. The immutable [release and activation evidence](releases/reliable-followthrough-b1b14d70/release-receipt.json)
+keeps original at-creation fields separate from later acceptance.
 
-A not-yet-deployed order #4053 candidate extends that same ledger with explicit
-full-instruction obligation enrollment, visible uncovered/legacy-unverified
-coverage, persisted substantive-progress deadlines, bounded exact-thread Codex
-queue attempts and durable escalation. It treats native queue acceptance,
-heartbeat, Working and inbox reads as non-execution evidence. Installed Codex has
-no supported active-tool/idle observer, so production classification remains
-unknown unless a future supported observer supplies fresh evidence. This does
-not provide the global handler assessment consumer, a general watcher, provider
-execution acknowledgment, UI, process recovery or deployment.
+Automatic global continuation, complete staleness/backlog sweeps, deterministic
+GO, causally verified wake transport, shared lead/handler mandatory-action
+coverage, keep-going/watchdog automation, provider hooks, UI and AIV remain
+undelivered. The handler assessment consumer #3694 remains a later slice; Air CLI
+and the deployed frontend remain unchanged. Reader candidates from order #4235
+are excluded from this release. The parent Feature is unfinished.
 
 Browser-created projects launch a database handler after the orchestrator. The
 handler inherits its resolved launch settings and owns all agent work-item database

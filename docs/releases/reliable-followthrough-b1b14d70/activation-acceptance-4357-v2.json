@@ -1,0 +1,53 @@
+{
+  "itemId": "wi_618c8ff87e6b8061",
+  "itemRevision": 5,
+  "workOrder": 4357,
+  "leadAcceptanceMessage": 4518,
+  "handlerSavedConfirmation": 4559,
+  "nativeArtifact": {
+    "id": "nart_c0588a7e09c49592",
+    "version": 2,
+    "narrativeSeq": 89,
+    "bytes": 9462,
+    "sha256": "f5680ddc5c80f8e879f0e564ce0a8a91a2239f6d4f4c3d789aa8a6592cc27e42"
+  },
+  "sourceReceipt": "activation-receipt-4357.json",
+  "scope": "Relay loaded; real v2 exact-run enrollment and manual acknowledgment/progress; prior transport-unconfirmed escalation retained.",
+  "limits": [
+    "No causal claim that wake started work.",
+    "No shared-role coverage or unattended prevention acceptance.",
+    "Reader candidate/parent/prevention Bugs not accepted complete."
+  ],
+  "handlerConfirmationEvidence": {
+    "path": "activation-evidence-4357/board-4538.json",
+    "bytes": 821,
+    "sha256": "bd7717f596f00bc115dc05f5b001a725015c05aabd463456c304c42a7e1d59a7"
+  },
+  "handlerRawReadbackConfirmation": 4569,
+  "supersedesAcceptanceFile": "activation-acceptance-4357.json",
+  "reason": "Native v1 incorrectly omitted lead agent author; v2 preserves exact content and corrects author provenance.",
+  "originalAuthor": {
+    "agentId": "agt_64e8e823485a3434",
+    "node": "workspace",
+    "user": "owner"
+  },
+  "ingestedBy": {
+    "agentId": "agt_3760a4361c514a03",
+    "runId": "run_1a67a6c9be7c7136",
+    "caller": {
+      "node": "workspace",
+      "user": "owner"
+    }
+  },
+  "readbackEvidence": {
+    "path": "activation-evidence-4357/activation-acceptance-4538-readback.json",
+    "bytes": 11170,
+    "sha256": "6e7d386f170e42d3964de986ea82bdbbb5e4dcc8776d2632f4e7b7f8261f6313"
+  },
+  "saveFailureDiagnosis": {
+    "rejectedRequest": "activation-acceptance-4518-v1",
+    "reason": "Invalid captureState captured",
+    "correction": "stored-content with exact nonempty content and empty locator",
+    "sourceMessage": 4569
+  }
+}

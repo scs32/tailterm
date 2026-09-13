@@ -1,0 +1,56 @@
+{
+  "observedAt": "2026-09-13T20:19:18.284149+00:00",
+  "state": "RUNNING",
+  "containerCount": 1,
+  "hubSHA256": "03314c6a2a5c56a82f2374db48f5796ca277ce2d37b54020e7868248c08605c6",
+  "onlyBinaryMountChanged": true,
+  "capabilities": {
+    "operationalRecords": {
+      "supported": true,
+      "versions": [
+        1
+      ]
+    },
+    "schemaVersion": 1,
+    "messageAudit": {
+      "versions": [
+        1,
+        2
+      ],
+      "maxRelated": 15
+    },
+    "auditExport": {
+      "versions": [
+        2,
+        3
+      ],
+      "maxBytes": 33554432,
+      "maxChunkBytes": 262144,
+      "retentionSeconds": 604800
+    },
+    "queue": {
+      "versions": [
+        1
+      ],
+      "defaultPage": 32,
+      "maxPage": 64,
+      "maxPageBytes": 1048576
+    },
+    "policy": {
+      "messageAudit": "observe"
+    },
+    "allocationIntent": {
+      "supported": true,
+      "versions": [
+        1
+      ]
+    },
+    "reliableDelivery": {
+      "supported": true,
+      "versions": [
+        1,
+        2
+      ]
+    }
+  }
+}

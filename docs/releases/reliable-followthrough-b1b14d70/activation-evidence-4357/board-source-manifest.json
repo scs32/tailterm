@@ -1,0 +1,43 @@
+{
+  "retrievedAt": "2026-09-13T20:52:37.319227+00:00",
+  "source": "authenticated native Board message endpoint, full response bytes",
+  "taskId": "tsk_2cfcff70a0fbe967",
+  "pins": {
+    "board-4357.json": {
+      "bytes": 2796,
+      "sha256": "49a239c07d32b7ca9550b171650c326cb5e855c9d5b921b6660f53d4d7223fb0"
+    },
+    "board-4363.json": {
+      "bytes": 1233,
+      "sha256": "5920de18a754a41a01b8a909ed8f58455ae160fd9ed0aa502813df8a06974202"
+    },
+    "board-4383.json": {
+      "bytes": 1111,
+      "sha256": "6bc4a358c9fe327918167418ea71cf7f14f78042fceceeb16b4f13690002f106"
+    },
+    "board-4388.json": {
+      "bytes": 2131,
+      "sha256": "cfddad146733d513d3a23654768743cbf472ca6478b641641b62dd3fd63bebba"
+    },
+    "board-4390.json": {
+      "bytes": 1210,
+      "sha256": "c0ef0fa27603f042da571070614f47dee84026cd2fe5b508fbdb24657cda0146"
+    },
+    "board-4400.json": {
+      "bytes": 1042,
+      "sha256": "524a8ace9a4f078dc1e9bfd9d98d0e5fb7aadcd50a708701cc53c3a180e473b3"
+    },
+    "board-4415.json": {
+      "bytes": 1609,
+      "sha256": "09ffc92e6d690bf6c94aa2df497a258586b6bee35d14913e762faafc23ff7878"
+    },
+    "board-4423.json": {
+      "bytes": 1603,
+      "sha256": "2e928cdf43d05d673c81ae8d1358ceba9faaf42851957fea51d1c3c4930aa595"
+    },
+    "board-4497.json": {
+      "bytes": 1968,
+      "sha256": "e62a8a2084fcbb5e5d10bd5791440dd4dce2e1120b54f3b7c8ff14112ca939c7"
+    }
+  }
+}

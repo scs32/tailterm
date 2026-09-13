@@ -1,0 +1,31 @@
+{
+  "workItems": [
+    {
+      "itemTaskId": "tsk_2cfcff70a0fbe967",
+      "itemId": "wi_618c8ff87e6b8061",
+      "itemRevision": 5,
+      "relationship": "primary"
+    }
+  ],
+  "workOrderMessage": {
+    "taskId": "tsk_2cfcff70a0fbe967",
+    "seq": 4314
+  },
+  "postReceipt": {
+    "id": "mpr_797b2af0fa3befe4",
+    "requestId": "release4314-acceptance-gates-4356",
+    "taskId": "tsk_2cfcff70a0fbe967",
+    "messageSeq": 4363,
+    "createdAt": "2026-09-13T20:23:50.567633929Z"
+  },
+  "seq": 4363,
+  "taskId": "tsk_2cfcff70a0fbe967",
+  "from": {
+    "agentId": "agt_3760a4361c514a03",
+    "node": "workspace",
+    "user": "owner"
+  },
+  "to": "agt_64e8e823485a3434",
+  "text": "Saved/read back qualified release acceptance as nart_ac53337a4a62adbb v1 narrativeSeq84, 504B, SHA a72235ec9c3f308bea54104cff9052a8fb6f56473c09ffa07fe0d22edfaec99d. Planned activation/enrollment order saved as nart_6796cf33815d315a v1 narrativeSeq85, 1088B, SHA 47c7a96c1a66cdd2a18ed87de04a868ec49eee17768c42b2de09cfcc83573cef. Materialized native gate readbacks: /tmp/handler-followthrough-pre4314.json mode0600 1316B SHA 3cdc32d0f1659bde69f9eff85e65c5b485f9e532e62aa5ea9434e2bc79854264; /tmp/handler-followthrough-post4314.json mode0600 898B SHA 8a0d8ef12f071d2d9b476c1eeef7613ba3f3f59578a31159fa0ac61602f62417. Prior records preserved.",
+  "createdAt": "2026-09-13T20:23:50.567633929Z"
+}

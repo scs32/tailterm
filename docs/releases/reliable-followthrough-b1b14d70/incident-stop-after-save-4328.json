@@ -1,0 +1,86 @@
+{
+  "schemaVersion": 1,
+  "bugIds": [
+    "wi_0c7ab8fc3320b52b",
+    "wi_9cc74828bb3499a4"
+  ],
+  "governingOrders": [
+    4328,
+    4335
+  ],
+  "affectedOrder": 4314,
+  "recordedAt": "2026-09-13T20:21:20.060372+00:00",
+  "actors": {
+    "lead": "agt_64e8e823485a3434/run_66d063bf724968d0",
+    "handler": "agt_3760a4361c514a03/run_1a67a6c9be7c7136"
+  },
+  "lastActions": [
+    {
+      "actor": "handler",
+      "action": "saved order4316",
+      "at": "2026-09-13T20:03:59Z"
+    },
+    {
+      "actor": "handler",
+      "action": "turn complete (owner supplied runtime metadata4328)",
+      "at": "2026-09-13T20:04:01.500Z"
+    },
+    {
+      "actor": "lead",
+      "action": "turn complete (owner supplied metadata4328)",
+      "at": "2026-09-13T20:04:16.654Z"
+    }
+  ],
+  "expectedNextActions": [
+    "handler executes remote backup/preflight4314",
+    "lead prepares and carries release through gated deployment",
+    "lead dispatches independent reader4235 after accepted packaging"
+  ],
+  "observedStopReason": "Turns ended while required actions remained; no explicit recorded planned wait for handler execution. Reader remained unnecessarily deferred.",
+  "causalEvidence": [
+    {
+      "claim": "Lead treated saved-order/informational inbox replies as requiring no action, ending turns despite the earlier active release obligation; lead also retained an unnecessary reader dependency on release progression.",
+      "basis": "Lead own decision trace and outgoing4314 plus repeated quiet turns after4316; owner4318; reader starts4319/4323."
+    },
+    {
+      "claim": "Handler backup first attempted local /mnt path rather than remote execution route; failure occurred before DB open and did not establish remote filesystem outage.",
+      "basis": "Owner4328/4339 plus handler local failure4320 and successful remotegate4327."
+    }
+  ],
+  "unresolved": [
+    "Handler-specific reason for treating save as completion requires handler account; provider/model cause is not established.",
+    "Unattended recovery not demonstrated; existing relay started before new code and no realv2 obligation enrolled."
+  ],
+  "contributingConditions": [
+    "Order persistence was conflated with action execution.",
+    "Lead depended on a later inbox notification rather than tracking its mandatory next action.",
+    "No enrolledv2 obligation enforced the action deadline; accepted/newlyinstalled code alone is insufficient."
+  ],
+  "recoveryEvidence": [
+    4319,
+    4323,
+    4327,
+    4336
+  ],
+  "preventionActions": [
+    {
+      "owner": "lead-recovery",
+      "order": 4335,
+      "action": "Propagate exact recovery rule and retain causal record/assigned prevention before any further unexpected resume; dispatch independent authorized work alongside planned gates.",
+      "verification": "Authored deliveries to active roles and independently progressing reader with release execution evidence."
+    },
+    {
+      "owner": "lead-recovery with handler coordination",
+      "order": 4328,
+      "action": "Establish item-bound implementation for save-versus-execute structural state and bounded continuation/escalation regression using4053 machinery; preserve distinction from reader4235.",
+      "verification": "Exact synthetic stop-after-save/turn-complete regression plus relayloaded/enrolled/wake/progress evidence and handler acceptance."
+    },
+    {
+      "owner": "db-handler with item-bound implementation team",
+      "order": 4328,
+      "action": "Require structured target/route/source/destination and host verification before any backup destination or DBoperation.",
+      "verification": "Synthetic wronghost test proves zero mutation; actual remote evidence independently reviewed."
+    }
+  ],
+  "status": "retrospective diagnosis and assigned coordination actions; product prevention open/unverified"
+}
