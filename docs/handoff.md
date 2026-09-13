@@ -1,10 +1,12 @@
 # Development handoff — September 10, 2026
 
-## September 13 mandatory-action follow-through — combined candidate, not installed
+## September 13 mandatory-action follow-through — source integrated, not installed
 
 Bug `wi_0c7ab8fc3320b52b` revision2, implementation order #4402 and
-integration-preparation order #4808 have an isolated combined candidate based on
-exact current source `19970cea6e089a98c2e18057c62c98f0473c925b`. Accepted API
+integration-preparation order #4808 produced an accepted combined candidate based
+on exact source `19970cea6e089a98c2e18057c62c98f0473c925b`. Source integration
+order #4934 fast-forwarded candidate `996060f323b23db97e862b22c1b0296501710542`
+into `tasks-hub`. Accepted API
 commits `66f88e4` and `4f5aaca` are integrated as `0998290` and `560159a`;
 accepted documentation commits `8f49f6a`, `14dfae2` and `bd330f9` are integrated
 as `71ed011`, `040a482` and `e1530a5`. Exact combined application/source
@@ -34,40 +36,52 @@ failure is retained rather than masked and is not used as candidate acceptance.
 
 This candidate is **not installed or deployed**. It performed no live database,
 Queue, profile, TrueNAS, network, relay-reload or enrollment operation. The hub
-and Mini CLI still run the `b1b14d70` release with `reliableDelivery` v1+v2;
-mandatory-action v3 is source-only. The Bug remains open pending independent QA,
-root integration/package/release work, operational activation evidence and
-handler-saved acceptance.
+and Mini CLI now run the separately accepted `19970cea` reader/verified-host
+release documented below with `reliableDelivery` v1+v2; mandatory-action v3 is
+source-only. The Bug remains open pending a fresh immutable v3 package,
+independent QA, a separately bounded operational release and activation evidence,
+and handler-saved acceptance.
 
-## September 13 verified-host preflight — integrated source, not installed
+## September 13 verified-host preflight — deployed and accepted
 
 Bug `wi_9cc74828bb3499a4` revision1, implementation order #4410 and source
 integration order #4718 have integrated accepted API source `1246727` and docs
-`84a1b6d` into `tasks-hub`. The source now has an enforced handler-owned
-TrueNAS backup producer plus a deployment receipt consumer. The handler records
+`84a1b6d` into `tasks-hub`. Combined release order #4831 and handler-saved
+acceptance #4918 deployed that control with the native evidence reader from exact
+source `19970cea6e089a98c2e18057c62c98f0473c925b`. The source has an enforced
+handler-owned TrueNAS backup producer plus a deployment receipt consumer. The
+handler records
 the SHA-256 of the exact saved receipt bytes; deployment requires that external
 pin and validates it before parsing the receipt, probing TrueNAS or mutating the
 deployment. See [the operator contract](verified-host-preflight-contract.md) and
 [design review](verified-host-preflight-review.md).
 
-This was source integration only. It did not run the preflight, contact TrueNAS,
-open live data, build or install binaries, deploy, or reload services. The
-installed hub and Mini CLI remain the `b1b14d70` release documented below. The
-Bug remains open pending a separately bounded handler-owned live backup/receipt
-and pin, loaded-path proof, and release acceptance.
+The handler-owned preflight and pinned receipt completed before deployment. The
+TrueNAS hub is RUNNING from the read-only release mount with SHA-256
+`d55ea00ef313b855018356cdc2881378ff36d056743f0e636b8362134fdc265a`;
+the Mini CLI is 6,884,626 bytes with SHA-256
+`f9cb8b7e480c3c32ed1a8de567cb88d0373d4e1ca4d99b4e77ba37c6134a4198`.
+Handler postchecks found integrity OK, zero foreign-key violations, equal profile
+data and equal schema between the live database and backup. The immutable
+[release receipt](releases/native-reader-19970cea/release-receipt.json), its
+nested evidence and the separate [acceptance](releases/native-reader-19970cea/release-acceptance.json)
+are retained without changing the receipt's at-creation `acceptance: null`.
+No frontend, Air, relay reload or mandatory-action v3 activation was included.
+The related Bug remains open pending its independent closure QA.
 
 ## September 13 directive follow-through — deployed, bounded activation accepted
 
 Feature `wi_618c8ff87e6b8061` revision5, implementation order #4053,
-release order #4314 and activation order #4357 now have a qualified hub/Mini
+release order #4314 and activation order #4357 established a qualified hub/Mini
 release from exact source `b1b14d70cb6f96d033e4da9e1aeb650174066cbf`.
 Lead acceptance #4356 and handler confirmation #4363 cover the binary release;
 lead #4518 and handler #4538/#4559 cover only the later bounded activation.
-The TrueNAS hub is RUNNING at SHA-256
+At that release, the TrueNAS hub ran at SHA-256
 `03314c6a2a5c56a82f2374db48f5796ca277ce2d37b54020e7868248c08605c6`.
-The Mini CLI is 6,801,362 bytes with SHA-256
+The Mini CLI was 6,801,362 bytes with SHA-256
 `640f5f2f1751cef1d9ad960b0c3c08320a7bc1f88773c8a96def3b5b4056b725`.
-Both advertise `operationalRecords` v1 and `reliableDelivery` v1+v2.
+Both advertised `operationalRecords` v1 and `reliableDelivery` v1+v2. Those
+capabilities remain present in the newer `19970cea` deployment above.
 
 Version2 adds explicit full-instruction obligation enrollment, visible coverage,
 persisted acknowledgment/progress deadlines, exact-thread Codex queue attempt
@@ -98,10 +112,11 @@ not rebuild, install, deploy, reload a service or exercise live data. Mini previ
 PID60799/PPID1, four owner screenshots, `compact`, owner-modified `AGENTS.md` and
 existing services remain preserved.
 
-## September 13 complete native evidence reader — integrated source, not installed
+## September 13 complete native evidence reader — deployed and accepted
 
 Feature `wi_618c8ff87e6b8061` revision5, bounded reader order #4235, accepted
-packaging order #4729 and source integration order #4782 have integrated the
+packaging order #4729, source integration order #4782 and operational release
+order #4831 have shipped the
 five-commit reader series ending at exact source
 `aa74e23c2b16bc9173f7d2bbabecd5e47181f5d3` into `tasks-hub` on top of the
 verified-host source root `0740e978c36f982f0fbc66f3139f07e8a9518368`.
@@ -116,13 +131,16 @@ The five per-source states keep partial/error/terminal absence/verified evidence
 distinct. Aggregate completeness requires every requested family to be terminal,
 while aggregate verification requires every family to be verified. The command
 does not assess source semantics, complete an item or Queue entry, schedule work,
-or add a watcher. This integration did not build, install, deploy, contact
-TrueNAS or exercise live work-item/Queue/profile data. The hub and Mini CLI remain
-the installed `b1b14d70` release documented above. Package #4729 remains exact
-qualification evidence for `aa74e23`; its binaries are not relabeled as products
-of the later combined root. A fresh immutable package and separate operational
-release are required from that combined source. See [the native evidence reader
-contract](native-evidence-reader.md).
+or add a watcher. Package #4729 remains exact qualification evidence for
+`aa74e23`; release #4831 separately packaged and deployed combined source
+`19970cea6e089a98c2e18057c62c98f0473c925b`. Installed reader,
+operational-record and follow-through smoke scripts pass. The hub and Mini hashes,
+handler pre/post checks, immutable receipt and separate acceptance are retained
+in [the release evidence](releases/native-reader-19970cea/release-receipt.json).
+Lead acceptance #4914 and handler-saved acceptance #4918 cover this exact
+operational release. No frontend or Air release, relay reload, mandatory-action
+v3 enrollment or parent-Feature completion is claimed. See [the native evidence
+reader contract](native-evidence-reader.md).
 
 ## September 13 structured operational records — deployed and accepted
 

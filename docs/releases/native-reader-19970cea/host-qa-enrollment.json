@@ -1,0 +1,24 @@
+{
+  "requestId": "host4831-operational-qa-initial-v1",
+  "messageSeq": 4931,
+  "kind": "review",
+  "agentId": "agt_d396d64112c7ee69",
+  "runId": "run_20ca89512c4ef106",
+  "itemTaskId": "tsk_2cfcff70a0fbe967",
+  "itemId": "wi_9cc74828bb3499a4",
+  "itemRevision": 1,
+  "workOrderMessage": {
+    "taskId": "tsk_2cfcff70a0fbe967",
+    "seq": 4410
+  },
+  "governingOrderMessage": {
+    "taskId": "tsk_2cfcff70a0fbe967",
+    "seq": 4930
+  },
+  "instructionSha256": "de8ab3938ef0039eb01b7af27920633c926476dce43f7614593d7f522dd7012e",
+  "instructionBytes": 1422,
+  "enrollmentVersion": 2,
+  "expectedCurrentGeneration": 0,
+  "producerAgentId": "agt_3760a4361c514a03",
+  "producerRunId": "run_1a67a6c9be7c7136"
+}

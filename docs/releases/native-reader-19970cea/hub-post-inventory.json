@@ -1,0 +1,162 @@
+{
+  "state": "RUNNING",
+  "activeWorkloads": {
+    "containers": 1,
+    "used_ports": [
+      {
+        "container_port": 18765,
+        "protocol": "tcp",
+        "host_ports": [
+          {
+            "host_port": 18765,
+            "host_ip": "100.116.238.37"
+          }
+        ]
+      }
+    ],
+    "used_host_ips": [
+      "100.116.238.37"
+    ],
+    "container_details": [
+      {
+        "id": "3c02912904e5c9d129ec65005c962025a514d5a43494402227b8a75e22be40c1",
+        "service_name": "hub",
+        "image": "gcr.io/distroless/static-debian12:nonroot",
+        "port_config": [
+          {
+            "container_port": 18765,
+            "protocol": "tcp",
+            "host_ports": [
+              {
+                "host_port": 18765,
+                "host_ip": "100.116.238.37"
+              }
+            ]
+          }
+        ],
+        "state": "running",
+        "volume_mounts": [
+          {
+            "source": "/mnt/deepfreeze/tailterm-hub/releases/20260913-native-reader-19970cea/tailterm-hub",
+            "destination": "/opt/tailterm-hub",
+            "mode": "ro",
+            "type": "bind"
+          },
+          {
+            "source": "/mnt/deepfreeze/tailterm-hub/state",
+            "destination": "/state",
+            "mode": "rw",
+            "type": "bind"
+          },
+          {
+            "source": "/mnt/deepfreeze/tailterm-hub/hub-token",
+            "destination": "/run/hub-token",
+            "mode": "ro",
+            "type": "bind"
+          }
+        ]
+      }
+    ],
+    "volumes": [
+      {
+        "source": "/mnt/deepfreeze/tailterm-hub/hub-token",
+        "destination": "/run/hub-token",
+        "mode": "ro",
+        "type": "bind"
+      },
+      {
+        "source": "/mnt/deepfreeze/tailterm-hub/state",
+        "destination": "/state",
+        "mode": "rw",
+        "type": "bind"
+      },
+      {
+        "source": "/mnt/deepfreeze/tailterm-hub/releases/20260913-native-reader-19970cea/tailterm-hub",
+        "destination": "/opt/tailterm-hub",
+        "mode": "ro",
+        "type": "bind"
+      }
+    ],
+    "images": [
+      "gcr.io/distroless/static-debian12:nonroot"
+    ],
+    "networks": [
+      {
+        "Name": "ix-tailterm-hub_default",
+        "Id": "dd738f35ea2b0e8636169f4597622b5d956aa0e4e79d7c94eeb71d06d7bd5ec0",
+        "Labels": {
+          "com.docker.compose.config-hash": "216d04729ede8cc07967c344dc2e293c7a34f1a79179ef393b9c66066b275d49",
+          "com.docker.compose.network": "default",
+          "com.docker.compose.project": "ix-tailterm-hub",
+          "com.docker.compose.version": "2.38.1"
+        },
+        "Created": "2026-09-13T15:40:29.365279742-07:00",
+        "Scope": "local",
+        "Driver": "bridge",
+        "EnableIPv4": true,
+        "EnableIPv6": true,
+        "IPAM": {
+          "Driver": "default",
+          "Options": null,
+          "Config": [
+            {
+              "Subnet": "172.16.7.0/24",
+              "Gateway": "172.16.7.1"
+            },
+            {
+              "Subnet": "fdd0:0:0:7::/64",
+              "Gateway": "fdd0:0:0:7::1"
+            }
+          ]
+        },
+        "Internal": false,
+        "Attachable": false,
+        "Ingress": false,
+        "ConfigFrom": {
+          "Network": ""
+        },
+        "ConfigOnly": false,
+        "Containers": {},
+        "Options": {
+          "com.docker.network.enable_ipv6": "true"
+        }
+      }
+    ]
+  },
+  "config": {
+    "services": {
+      "hub": {
+        "cap_drop": [
+          "ALL"
+        ],
+        "cpus": "1.0",
+        "entrypoint": [
+          "/opt/tailterm-hub"
+        ],
+        "environment": {
+          "TAILTERM_MAX_AGENTS": "32",
+          "TAILTERM_STATE": "/state",
+          "TAILTERM_TCP_LISTEN": "0.0.0.0:18765",
+          "TAILTERM_TOKEN_FILE": "/run/hub-token"
+        },
+        "image": "gcr.io/distroless/static-debian12:nonroot",
+        "mem_limit": "512m",
+        "ports": [
+          "100.116.238.37:18765:18765"
+        ],
+        "read_only": true,
+        "restart": "unless-stopped",
+        "security_opt": [
+          "no-new-privileges:true"
+        ],
+        "user": "950:950",
+        "volumes": [
+          "/mnt/deepfreeze/tailterm-hub/releases/20260913-native-reader-19970cea/tailterm-hub:/opt/tailterm-hub:ro",
+          "/mnt/deepfreeze/tailterm-hub/state:/state",
+          "/mnt/deepfreeze/tailterm-hub/hub-token:/run/hub-token:ro"
+        ]
+      }
+    }
+  },
+  "hubSHA256": "d55ea00ef313b855018356cdc2881378ff36d056743f0e636b8362134fdc265a"
+}

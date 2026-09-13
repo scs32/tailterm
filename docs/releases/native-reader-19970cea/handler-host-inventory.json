@@ -1,0 +1,15 @@
+{
+  "order": 4831,
+  "route": "truenas",
+  "observedAt": "2026-09-13T22:32:13.083745+00:00",
+  "exitCode": 0,
+  "databaseAccess": false,
+  "mutation": false,
+  "inventory": {
+    "targetHost": "truenas",
+    "targetExecutable": "/usr/bin/python3.11",
+    "pythonVersion": "3.11.9",
+    "uid": 950,
+    "gid": 950
+  }
+}

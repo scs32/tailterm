@@ -1,0 +1,65 @@
+{
+  "order": 4831,
+  "observedAt": "2026-09-13T22:43:24.919529+00:00",
+  "exitCode": 0,
+  "methodSourceSha256": "82fd43e1edf6c9f3de89101c06b374cc1b3c0430e372676f5822740b01560d46",
+  "databaseMutation": false,
+  "evidence": {
+    "host": "truenas",
+    "executable": "/usr/bin/python3.11",
+    "mutation": false,
+    "live": {
+      "integrity": "ok",
+      "foreignKeyViolations": 0,
+      "profiles": {
+        "profile_meta": {
+          "rows": 1,
+          "bytes": 58,
+          "sha256": "fad8fb4d29ffcd9ab864735de85f682278203ff3c78ee52c4e543b7fd04b0263"
+        },
+        "profiles": {
+          "rows": 1,
+          "bytes": 303239,
+          "sha256": "6ec87960b3cf7d7dc9d779a22fda36087b446335b5339a790f3302576845b526"
+        },
+        "profile_history": {
+          "rows": 10,
+          "bytes": 2911169,
+          "sha256": "1dd3d80269e4d3262ebc513f6171d7b896448b718d90363866cd3e740046f59a"
+        }
+      },
+      "schema": {
+        "objects": 96,
+        "sha256": "f332fe40a8b70dd4839cfec505d48d821e4d2205f1c2f7ddb5e4ac634d7c4ef6"
+      }
+    },
+    "backup": {
+      "integrity": "ok",
+      "foreignKeyViolations": 0,
+      "profiles": {
+        "profile_meta": {
+          "rows": 1,
+          "bytes": 58,
+          "sha256": "fad8fb4d29ffcd9ab864735de85f682278203ff3c78ee52c4e543b7fd04b0263"
+        },
+        "profiles": {
+          "rows": 1,
+          "bytes": 303239,
+          "sha256": "6ec87960b3cf7d7dc9d779a22fda36087b446335b5339a790f3302576845b526"
+        },
+        "profile_history": {
+          "rows": 10,
+          "bytes": 2911169,
+          "sha256": "1dd3d80269e4d3262ebc513f6171d7b896448b718d90363866cd3e740046f59a"
+        }
+      },
+      "schema": {
+        "objects": 96,
+        "sha256": "f332fe40a8b70dd4839cfec505d48d821e4d2205f1c2f7ddb5e4ac634d7c4ef6"
+      }
+    },
+    "profilesEqual": true,
+    "schemaEqual": true,
+    "integrityPassed": true
+  }
+}

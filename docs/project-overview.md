@@ -123,19 +123,23 @@ Send to project saves a directed board message to the selected open project's
 orchestrator. It defaults to the owning project; choosing another does not move
 the record or start a team. The receipt confirms message storage, not execution.
 
-The `tasks-hub` source now includes the verified-host backup/release preflight
+The deployed hub/Mini source now includes the verified-host backup/release preflight
 from Bug `wi_9cc74828bb3499a4` revision1, implementation order #4410 and source
 integration order #4718 (accepted API `1246727`, docs `84a1b6d`). It requires a
 versioned explicit target/route/source/destination plan, lets only the database
 handler produce the SQLite backup receipt, and requires deployment to validate
 the separately handler-saved receipt-bytes SHA-256 before parsing, remote probe
-or mutation. This source integration did not contact TrueNAS, access live data,
-build/install binaries or deploy; operational qualification remains open. See
-[the verified-host contract](verified-host-preflight-contract.md).
+or mutation. Combined release order #4831 deployed exact source `19970cea` only
+after that handler-owned preflight; lead acceptance #4914 and handler-saved
+acceptance #4918 cover the release. See [the verified-host
+contract](verified-host-preflight-contract.md) and its immutable [release
+evidence](releases/native-reader-19970cea/release-receipt.json).
 
-An isolated proposed source candidate for Bug `wi_0c7ab8fc3320b52b` revision2,
-implementation order #4402 and integration-preparation order #4808 combines the
-accepted mandatory-action API series and operator documentation on exact base
+Root `tasks-hub` now integrates proposed mandatory-action v3 source for Bug
+`wi_0c7ab8fc3320b52b` revision2 under implementation order #4402,
+integration-preparation order #4808 and source integration order #4934. Accepted
+candidate `996060f323b23db97e862b22c1b0296501710542` combines the API series and
+operator documentation on exact base
 `19970cea6e089a98c2e18057c62c98f0473c925b`. Its exact application/source
 checkpoint is `e1530a5c61b255a2c175222f4e174cf774d588c3`; it preserves the native
 evidence reader and verified-host preflight already present in that base. The
@@ -156,11 +160,11 @@ deployment, relay reload or real v3 enrollment was touched. Independent QA,
 root integration/package/release work, activation evidence and handler-saved
 acceptance remain required; the Bug stays open.
 
-The TrueNAS hub and Mini CLI still run exact source
-`b1b14d70cb6f96d033e4da9e1aeb650174066cbf` under Feature
-`wi_618c8ff87e6b8061` revision5, implementation order #4053 and release order
-#4314. That source retains the qualified manual directive core and structured
-operational records, and exposes `reliableDelivery` v1+v2. Version2 adds explicit
+The TrueNAS hub and Mini CLI now run exact source
+`19970cea6e089a98c2e18057c62c98f0473c925b` under combined release order #4831.
+That source retains the qualified manual directive core and structured
+operational records from Feature `wi_618c8ff87e6b8061` revision5/order #4053,
+and exposes `reliableDelivery` v1+v2. Version2 adds explicit
 full-instruction obligation enrollment, visible coverage, persisted execution
 deadlines, exact-thread attempt leasing/reporting and bounded escalation. The CLI
 requires the versioned hub capability and never falls back to an inbox read or
@@ -188,14 +192,15 @@ evidence. The immutable [release and activation evidence](releases/reliable-foll
 keeps original at-creation fields separate from later acceptance.
 
 Automatic global continuation, complete staleness/backlog sweeps, deterministic
-GO, causally verified wake transport, shared lead/handler mandatory-action
-coverage, keep-going/watchdog automation, provider hooks, UI and AIV remain
-undelivered. The handler assessment consumer #3694 remains a later slice; Air CLI
-and the deployed frontend remain unchanged. Reader candidates from order #4235
-are excluded from this release. The parent Feature is unfinished.
+GO, causally verified wake transport, installed shared lead/handler
+mandatory-action v3 coverage, keep-going/watchdog automation, provider hooks, UI
+and AIV remain undelivered. The handler assessment consumer #3694 remains a later
+slice; Air CLI and the deployed frontend remain unchanged. The parent Feature is
+unfinished.
 
-Root `tasks-hub` source now includes the accepted order #4235 deterministic,
-resumable native evidence reader after source integration order #4782. The exact
+The installed exact `19970cea` hub/Mini source includes the accepted order #4235
+deterministic, resumable native evidence reader after source integration order
+#4782. The exact
 five-commit reader series ends at
 `aa74e23c2b16bc9173f7d2bbabecd5e47181f5d3` and is integrated on top of the
 verified-host source root `0740e978c36f982f0fbc66f3139f07e8a9518368`.
@@ -206,9 +211,12 @@ private bytes and hashes, detects cursor and snapshot changes, and distinguishes
 partial, terminal absence, errors and verified sources. Its manifest proves
 retrieval structure and availability, not semantic acceptance, and never mutates
 work-item or Queue state. Package #4729 remains exact qualification evidence for
-the `aa74e23` reader source only; it is not a binary package from the later
-combined root. This integration did not build, install or deploy anything, so the
-hub and Mini CLI remain the `b1b14d70` release described above. See [complete
+the `aa74e23` reader source only; combined release #4831 separately packaged and
+deployed the later `19970cea` root. Installed reader, operational-record and
+follow-through smokes pass; handler pre/post evidence records integrity OK, zero
+foreign-key violations, and equal profile data and schema. The immutable receipt
+and separate handler acceptance are retained in [the release
+evidence](releases/native-reader-19970cea/release-receipt.json). See [complete
 native work-item evidence](native-evidence-reader.md).
 
 Browser-created projects launch a database handler after the orchestrator. The

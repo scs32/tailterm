@@ -1,0 +1,14 @@
+[
+  {
+    "script": "reader-cli-smoke.py",
+    "exitCode": 0
+  },
+  {
+    "script": "operational-cli-smoke.py",
+    "exitCode": 0
+  },
+  {
+    "script": "followthrough-cli-smoke.py",
+    "exitCode": 0
+  }
+]

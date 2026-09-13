@@ -1,0 +1,13 @@
+{
+  "version": 1,
+  "createdAt": "2026-09-13T22:47:37.307940+00:00",
+  "item": "wi_618c8ff87e6b8061",
+  "revision": 5,
+  "order": 4831,
+  "releaseReceiptSha256": "202584c2c10c596a887183625ac64ee67fbaac4b504f8853881b50432a84a200",
+  "leadAcceptanceMessage": 4914,
+  "handlerSavedAcceptanceMessage": 4918,
+  "acceptedScope": "Exact19970cea hub/Mini operational release",
+  "parentFeatureComplete": false,
+  "relatedBugClosure": "awaiting independent QA under4930"
+}

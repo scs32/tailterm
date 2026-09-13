@@ -1,0 +1,108 @@
+{
+  "version": 1,
+  "createdAt": "2026-09-13T22:44:27.670971+00:00",
+  "item": "wi_618c8ff87e6b8061",
+  "revision": 5,
+  "order": 4831,
+  "relatedBug": "wi_9cc74828bb3499a4@1",
+  "source": "19970cea6e089a98c2e18057c62c98f0473c925b",
+  "tree": "911e0e2c164e98420acb2b62d007d2f0c2e40d15",
+  "release": "20260913-native-reader-19970cea",
+  "packageAcceptance": 4833,
+  "handlerBackupMessage": 4894,
+  "handlerPostcheckMessage": 4907,
+  "hub": "RUNNING; exact package SHA and read-only binary mount verified via middleware",
+  "mini": "exact package SHA and clean VCS metadata; atomic install; prior binary retained",
+  "validation": {
+    "installedIsolatedSmokeScripts": 3,
+    "integrity": "ok",
+    "foreignKeyViolations": 0,
+    "profilesEqual": true,
+    "schemaEqual": true,
+    "onlyBinaryMountChanged": true,
+    "ownerAgentsSHA256": "2edd1d7443dbfb0ed032f962f89e428ee2d610a7477f4886f8f1c6a963961ed2",
+    "previewPID": 60799,
+    "previewPPID": 1
+  },
+  "limits": [
+    "No frontend or Air release",
+    "No relay reload or unattended prevention claim",
+    "Mandatory-action4808 and successor4753 excluded",
+    "No parent Feature completion",
+    "No database restore"
+  ],
+  "operatorProbeCorrection": "First app.config parse expected nested custom_compose_config; actual middleware returns compose directly. Read-only KeyError retained in turn; corrected parse, reran verification, no service failure.",
+  "evidence": [
+    {
+      "path": "package-pins.json",
+      "bytes": 433,
+      "sha256": "0d5f99919289f326d19c8cf64784686396bee35d4794f5734ed9b60add88c1c6"
+    },
+    {
+      "path": "handler-host-inventory.json",
+      "bytes": 319,
+      "sha256": "564c289f1174ed12d233780e0f01aab15af5213c2b0b1afdb951b6df38a0498c"
+    },
+    {
+      "path": "backup-plan.json",
+      "bytes": 1250,
+      "sha256": "5dddb39262b1f4558b4993ac887dbbe9a73bc8c580e8b56af55eb514ef00f24e"
+    },
+    {
+      "path": "handler-preflight-receipt.json",
+      "bytes": 2518,
+      "sha256": "17966fa6ab94cc6f01c7770fbac37b7c316cb54f07978ec65e723b44906affab"
+    },
+    {
+      "path": "handler-receipt-provenance.json",
+      "bytes": 153,
+      "sha256": "aac353e8f4260dbbb185e4fd5e5fba35f0262f13788ef8176a6e36c1fd2453e7"
+    },
+    {
+      "path": "pre-config.json",
+      "bytes": 938,
+      "sha256": "e9cee60e600bba8e039755ac6b90a4c3c741141734fdf82edfcbbc33168b9804"
+    },
+    {
+      "path": "expected-config.json",
+      "bytes": 930,
+      "sha256": "cce229bbf1859371933f86dd2407897905d6b5024d5590b9969d95ddc07cb58b"
+    },
+    {
+      "path": "deployment-result.json",
+      "bytes": 870,
+      "sha256": "65bcb2e047f92ddeb09c97eb588019112297cb9ae7fc661183ecf581568005e1"
+    },
+    {
+      "path": "hub-post-inventory.json",
+      "bytes": 4495,
+      "sha256": "cd51c05f8ee3ef83998c584f5793b34857fe15e70896e778923837f51a3022fc"
+    },
+    {
+      "path": "mini-install.json",
+      "bytes": 927,
+      "sha256": "dee6ba5554a73dc8f291716d57a6e9d87e3ebbca4e19028de6801a6132fd22ea"
+    },
+    {
+      "path": "capabilities.json",
+      "bytes": 698,
+      "sha256": "b0d6a6f52e652c43083fa653acb373933e95a2779142b963f7502d729bb791f4"
+    },
+    {
+      "path": "installed-smoke-results.json",
+      "bytes": 207,
+      "sha256": "643e7ce2c465e7485aad2735e73301f5d2092a8dfdc1b169c23fffd23803e0bc"
+    },
+    {
+      "path": "handler-postcheck.py",
+      "bytes": 3692,
+      "sha256": "83896659693dfd81fae079029be214904475caeffa475b1970f8816fc2e41214"
+    },
+    {
+      "path": "handler-postcheck.json",
+      "bytes": 1908,
+      "sha256": "5d5d962aa571b735b7d1a63fa360be210b8f062ac7d995f143136809e3bd8303"
+    }
+  ],
+  "acceptance": null
+}

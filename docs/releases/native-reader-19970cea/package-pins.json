@@ -1,0 +1,10 @@
+{
+  "source": "19970cea6e089a98c2e18057c62c98f0473c925b",
+  "tree": "911e0e2c164e98420acb2b62d007d2f0c2e40d15",
+  "package": "/tmp/reliable-combined-package.QwHjxw/package",
+  "manifestSha256": "ccb146bf978b97ac8c36bfa61e15c38974dd19e2eee77acc90149de9a4dd3654",
+  "checksumsSha256": "68997a1144ba210b9d76a1da491d0baf7f97d66bde79987270b045d3b6dad155",
+  "qaMessage": 4825,
+  "checksumsVerified": 13,
+  "operationalAcceptance": null
+}
