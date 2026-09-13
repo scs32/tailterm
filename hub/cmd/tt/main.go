@@ -46,6 +46,8 @@ Commands
   ask --request-id KEY --file PATH [--json]  request an owner decision on the Board
   inbox [--unread] [--mark-read] [--json]
   context [--json]             print this exact run's bound work-item context
+  current-assignment [--json]  fetch the server-selected exact directive
+  delivery <command>           create/ack/progress/block/resolve/resume/result
   spawn --name N --run CMD [--cwd D] [--prompt P] [--runtime R] [--task ID]
                                start a sibling agent session on this host
   allocation-intent create --agent-id ID --work-item ID --work-item-revision N
@@ -167,6 +169,10 @@ func main() {
 		err = cmdInbox(e, args)
 	case "context":
 		err = cmdContext(e, args)
+	case "current-assignment":
+		err = cmdCurrentAssignment(e, args)
+	case "delivery":
+		err = cmdDelivery(e, args)
 	case "spawn":
 		err = cmdSpawn(e, args)
 	case "allocation-intent":

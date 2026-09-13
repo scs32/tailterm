@@ -1,5 +1,34 @@
 # Development handoff — September 10, 2026
 
+## September 13 reliable directive core candidate
+
+Feature `wi_618c8ff87e6b8061` revision5, first-core order #3699 and exact Start
+#3799 (`que_d251c3e90d220fd5` cycle2/revision16,
+`qrr_7f80a6a31ab0717c`) have an isolated backend candidate based on accepted
+application `ad89388c2ec7cbbddd43d0ded710db8139b1658c`. It adds a versioned,
+durable manual item-worker directive protocol: immutable message attachment,
+exact item/run/order/context binding, coherent current-assignment lookup, CAS
+supersession, keyed receipt recovery, and explicit ack/progress/block/
+resolution/resume/result operations. Direct manual acknowledgment requires no
+wake attempt; ordinary inbox reads, heartbeats and Queue Start remain
+non-execution evidence. Result remains separate from handler acceptance, Queue
+completion and worker closeout.
+
+The HTTP and native CLI paths fail closed when the new `reliableDelivery` v1
+capability is unavailable. Focused temporary-SQLite store, real HTTP and CLI
+round trips cover A-to-B supersession, zero-wake ack, stale run/epoch/action
+rejection, block resolution/resume epochs, exact and changed-payload retries,
+committed-response recovery after restart, retirement/closure, binding
+provenance, coherent pickup evidence and old-hub refusal. See
+[reliable directive core](reliable-directive-core.md).
+
+Do **not integrate, release, install or deploy this candidate yet**. Independent
+QA, handler-saved result acceptance and a later bounded release remain required.
+Transport/relay correction, keep-going/watchdog logic, tool/provider integration,
+UI and handler-global assessment consumer #3694 are explicitly not delivered.
+The existing detached Mini preview PID60799/PPID1 and all live services/data are
+unchanged.
+
 ## September 13 512 KiB complete-context and bounded-transport candidate
 
 Bug `wi_dd57670ee65d974c` revision3, implementation order #3622 and exact Start

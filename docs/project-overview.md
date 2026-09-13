@@ -123,6 +123,16 @@ Send to project saves a directed board message to the selected open project's
 orchestrator. It defaults to the owning project; choosing another does not move
 the record or start a team. The receipt confirms message storage, not execution.
 
+An unreleased directive-core candidate under Feature
+`wi_618c8ff87e6b8061` revision5/order #3699 adds an explicit manual execution
+ledger on top of stored messages. Its current-assignment lookup, CAS
+supersession, exact-run acknowledgment, progress, blocking, resolution, resume
+and result receipts keep retrieval, execution evidence and outcome acceptance
+separate. The CLI requires the versioned hub capability and never falls back to
+an inbox read or lifecycle event. This candidate does not yet add verified wake
+transport, keep-going/watchdog automation, provider hooks, UI, or the global
+handler assessment consumer. See [reliable directive core](reliable-directive-core.md).
+
 Browser-created projects launch a database handler after the orchestrator. The
 handler inherits its resolved launch settings and owns all agent work-item database
 reads/writes. Agents require a durable bug/feature and a bounded work order before

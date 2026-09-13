@@ -42,6 +42,10 @@ type Capabilities struct {
 		Supported bool  `json:"supported"`
 		Versions  []int `json:"versions"`
 	} `json:"allocationIntent"`
+	ReliableDelivery struct {
+		Supported bool  `json:"supported"`
+		Versions  []int `json:"versions"`
+	} `json:"reliableDelivery"`
 }
 
 // AllocationIntentCapabilityVersion is advertised here so a launch CLI can
@@ -70,6 +74,8 @@ func CurrentCapabilities() Capabilities {
 	out.Queue.MaxPageBytes = MaxQueuePageBytes
 	out.AllocationIntent.Supported = true
 	out.AllocationIntent.Versions = []int{AllocationIntentCapabilityVersion}
+	out.ReliableDelivery.Supported = true
+	out.ReliableDelivery.Versions = []int{ReliableDeliveryCapabilityVersion}
 	return out
 }
 
