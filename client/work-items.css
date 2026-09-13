@@ -20,6 +20,12 @@
   margin: 0;
   font-size: 12px;
 }
+
+/* Keep dropdown focus visible without a second frame outside its border. */
+#work-item-form select:focus-visible {
+  outline-offset: -2px;
+}
+
 .work-items-status-select > span {
   display: none;
 }
