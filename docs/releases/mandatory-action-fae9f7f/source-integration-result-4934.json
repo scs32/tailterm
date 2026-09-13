@@ -1,0 +1,90 @@
+{
+  "version": 1,
+  "kind": "source_integration_result",
+  "status": "source_integrated_uninstalled",
+  "item": {
+    "taskId": "tsk_2cfcff70a0fbe967",
+    "itemId": "wi_0c7ab8fc3320b52b",
+    "revision": 2
+  },
+  "workOrderMessage": {
+    "taskId": "tsk_2cfcff70a0fbe967",
+    "seq": 4934
+  },
+  "assignment": {
+    "agentId": "agt_fa41250fdba19095",
+    "runId": "run_cc614e1769fb9769",
+    "contextDigest": "1de74bfe7a7e4e5e24da2e3099667b4f9380d2da93eba5c37906e2361bc76649",
+    "deliveryId": "dly_d3830d6fb37709fa",
+    "generation": 2,
+    "executionEpoch": 1,
+    "assignmentReceipt": "drr_b085aef96ef53b3c",
+    "ackReceipt": "drr_c78035b02f26a8dd",
+    "progressReceipt": "drr_ad7ac2e98c55913b",
+    "resultReceipt": "drr_c9cdb4e64b5f0a13"
+  },
+  "source": {
+    "baseCommit": "19970cea6e089a98c2e18057c62c98f0473c925b",
+    "baseTree": "911e0e2c164e98420acb2b62d007d2f0c2e40d15",
+    "acceptedCandidateCommit": "996060f323b23db97e862b22c1b0296501710542",
+    "acceptedCandidateTree": "857e27f6e4cf9b77d67c6754dfffc134a6c1861b",
+    "applicationCheckpointCommit": "e1530a5c61b255a2c175222f4e174cf774d588c3",
+    "applicationCheckpointTree": "502263025aaf71b281a4af97d2912fbf626fa64b",
+    "integrationCommit": "fae9f7ff34627449f716ef6439fe1eed5ab8ead5",
+    "integrationTree": "fffad908bf310247e5da3b86d4ddd2e096772eb3",
+    "branch": "tasks-hub",
+    "conflicts": []
+  },
+  "acceptedCommitMapping": [
+    {
+      "source": "66f88e488fd82263e2b96412800e20f8fb75e3ae",
+      "integrated": "09982902a4ad63f39180c105ab0260dac1f5323c"
+    },
+    {
+      "source": "4f5aacab742369a0480a36d1147ba26788acf386",
+      "integrated": "560159a3863bd8021d213c1bce97acfc7bc27960"
+    },
+    {
+      "source": "8f49f6a82581c6ed1b00b638e577fc10b8f444a7",
+      "integrated": "71ed011269c955f26886bdd7fbffbbc7be775578"
+    },
+    {
+      "source": "14dfae2291f70b16ffd0253e963252ae9e0d1c55",
+      "integrated": "040a482a95d7f3f41e66d60c0077e45bb0e67561"
+    },
+    {
+      "source": "bd330f9c644f3444959870f36269ccb20676728c",
+      "integrated": "e1530a5c61b255a2c175222f4e174cf774d588c3"
+    }
+  ],
+  "retainedReleaseEvidence": {
+    "directory": "docs/releases/native-reader-19970cea",
+    "fileCount": 31,
+    "receiptSha256": "202584c2c10c596a887183625ac64ee67fbaac4b504f8853881b50432a84a200",
+    "receiptAcceptanceAtCreation": null,
+    "acceptanceSha256": "2b640833f26e7e1d276a7420af474badde35deae44e6e114ad9cc417157d7036",
+    "handlerSavedAcceptanceMessage": 4918,
+    "receiptEvidenceHashesVerified": 14
+  },
+  "verification": [
+    "accepted candidate is a descendant of the exact base and was fast-forwarded without conflicts",
+    "no hub source differs between accepted candidate 996060f and integration commit fae9f7f",
+    "changed Go sources have no gofmt diff",
+    "git diff checks pass",
+    "documentation link targets exist",
+    "all 14 release-receipt evidence hashes match retained files",
+    "owner AGENTS.md SHA-256 remains 2edd1d7443dbfb0ed032f962f89e428ee2d610a7477f4886f8f1c6a963961ed2",
+    "owner screenshot, compact marker and preview PID 60799 with PPID 1 remain present"
+  ],
+  "limits": [
+    "mandatory-action reliableDelivery v3 is not built, installed, deployed or activated",
+    "no live database, Queue, profile, TrueNAS, network, relay or service mutation was performed",
+    "this result does not complete the Bug"
+  ],
+  "remainingDependencies": [
+    "fresh immutable mandatory-action v3 package",
+    "independent package QA",
+    "separately bounded operational release and activation evidence",
+    "handler-saved operational acceptance"
+  ]
+}
