@@ -35,7 +35,7 @@ Commands
   brief                        print the shared task briefing
   status                       identity, hub reachability, own agent, unread count
   projects                     list projects on the hub (tasks is an alias)
-  work-items <command>         list/get/create/update/dispatch/history for bugs and features
+  work-items <command>         list/get/create/update/dispatch/history/evidence for bugs and features
   queue <command>              list/get/history/changes/action/receipt for deliberate Queue work
   agents [--json]              list agents on this task
   event <kind> [--text T]      post started|running|done|needs_input|exited|closed

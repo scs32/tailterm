@@ -190,7 +190,7 @@ func TestAgentBriefingNamesDatabaseHandlerAndItsIntakeContract(t *testing.T) {
 		t.Fatal(worker)
 	}
 	handlerBrief := agentTaskBriefing(task, handler.Name, handler.Role, "", []api.Agent{handler})
-	for _, required := range []string{"durable Database handler", "--source-seq", "--request-id", "--body-file", "Stay done and available"} {
+	for _, required := range []string{"durable Database handler", "--source-seq", "--request-id", "--body-file", "tt work-items evidence", "private --manifest", "first page/count", "Stay done and available"} {
 		if !strings.Contains(handlerBrief, required) {
 			t.Fatalf("handler briefing missing %q", required)
 		}

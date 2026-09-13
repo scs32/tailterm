@@ -171,6 +171,16 @@ undelivered. The handler assessment consumer #3694 remains a later slice; Air CL
 and the deployed frontend remain unchanged. Reader candidates from order #4235
 are excluded from this release. The parent Feature is unfinished.
 
+A separate not-yet-deployed order #4235 candidate gives the database handler a
+deterministic, resumable native evidence reader. `tt work-items evidence`
+selects the current item, revision history, all explicitly linked messages and/or
+an exact keyed update receipt; current revision/scope anchors the read. It follows
+every native page, preserves exact private bytes and hashes, detects cursor and
+snapshot changes, and distinguishes partial, terminal absence, errors and
+verified sources. Its manifest proves retrieval structure and availability, not
+semantic acceptance, and never mutates work-item or Queue state. See [complete
+native work-item evidence](native-evidence-reader.md).
+
 Browser-created projects launch a database handler after the orchestrator. The
 handler inherits its resolved launch settings and owns all agent work-item database
 reads/writes. Agents require a durable bug/feature and a bounded work order before
