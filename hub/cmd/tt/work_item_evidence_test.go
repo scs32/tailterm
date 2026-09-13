@@ -239,6 +239,29 @@ func TestWorkItemEvidenceReaderRejectsScopeChangeAtBookend(t *testing.T) {
 	}
 }
 
+func TestWorkItemEvidenceReaderDoesNotRelabelBookendDisappearanceAsAbsence(t *testing.T) {
+	var calls atomic.Int32
+	e := evidenceCLIEnv(t, func(w http.ResponseWriter, req *http.Request) {
+		if calls.Add(1) == 1 {
+			writeEvidenceJSON(w, evidenceCurrent(1, 1))
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+		writeEvidenceJSON(w, api.ErrorResponse{Error: "not found"})
+	})
+	manifestPath := filepath.Join(t.TempDir(), "disappeared.json")
+	_, err := captureCLIOutput(t, func() error {
+		return cmdWorkItems(e, []string{"evidence", "--manifest", manifestPath, "--sources", "current", evidenceItem})
+	})
+	if err == nil || !strings.Contains(err.Error(), "disappeared") {
+		t.Fatalf("error=%v", err)
+	}
+	manifest := readEvidenceManifestForTest(t, manifestPath)
+	if manifest.Complete || manifest.Sources["current"].State != evidenceStateError {
+		t.Fatalf("manifest=%+v", manifest)
+	}
+}
+
 func TestWorkItemEvidenceReaderRecordsAbsentReceiptWithoutClaimingVerification(t *testing.T) {
 	e := evidenceCLIEnv(t, func(w http.ResponseWriter, req *http.Request) {
 		base := "/v1/tasks/" + evidenceTask + "/work-items/" + evidenceItem

@@ -377,6 +377,9 @@ func (r *workItemEvidenceReader) readCurrent(ctx context.Context, final bool) er
 	}
 	page := &entry.Pages[index]
 	if response.StatusCode == http.StatusNotFound {
+		if final || r.manifest.Snapshot.ItemRevision > 0 {
+			return r.fail("current", errors.New("current item disappeared during evidence read"))
+		}
 		page.Valid = true
 		entry.State, entry.LastError = evidenceStateAbsent, ""
 		return r.persist()
@@ -448,6 +451,9 @@ func (r *workItemEvidenceReader) readRevisionPages(ctx context.Context) error {
 		}
 		page := &entry.Pages[index]
 		if response.StatusCode == http.StatusNotFound {
+			if r.manifest.Snapshot.ItemRevision > 0 {
+				return r.fail("revisions", errors.New("revision history disappeared after the current-item snapshot was anchored"))
+			}
 			page.Valid = true
 			entry.State, entry.LastError = evidenceStateAbsent, ""
 			return r.persist()
@@ -517,6 +523,9 @@ func (r *workItemEvidenceReader) readMessagePages(ctx context.Context) error {
 		}
 		page := &entry.Pages[index]
 		if response.StatusCode == http.StatusNotFound {
+			if r.manifest.Snapshot.ItemRevision > 0 {
+				return r.fail("messages", errors.New("linked-message history disappeared after the current-item snapshot was anchored"))
+			}
 			page.Valid = true
 			entry.State, entry.LastError = evidenceStateAbsent, ""
 			return r.persist()
