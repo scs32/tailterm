@@ -1,0 +1,133 @@
+{
+  "itemId": "wi_85a66e159b50a309",
+  "itemRevision": 11,
+  "workOrderMessage": 3478,
+  "directAssignmentMessage": 3514,
+  "cssSupplementMessage": 3562,
+  "handlerScopeConfirmation": 3564,
+  "releaseOrderMessage": 3577,
+  "handlerReleaseConfirmation": 3581,
+  "applicationCommit": "5cd23e098e7177d3e015c046f80d80013b306930",
+  "deploymentUrl": "https://78febf4a.tailos.pages.dev",
+  "manifestSha256": "d6936a33e59438324857559ba75f94c0a67f851a359aa0227f645973731a6f25",
+  "payloadEntries": 82,
+  "changedBehavior": "Work-item editor select focus outline overlaps the existing border; no detached focus frame.",
+  "verifiedOrigins": [
+    {
+      "origin": "https://78febf4a.tailos.pages.dev",
+      "assetManifestIndexChecks": 83,
+      "allHashesSizesAndApplicableMimes": "pass",
+      "productionWasmSyntheticVaultClipboardLayouts": "pass",
+      "source": "5cd23e098e7177d3e015c046f80d80013b306930",
+      "manifestSha256": "d6936a33e59438324857559ba75f94c0a67f851a359aa0227f645973731a6f25"
+    },
+    {
+      "origin": "https://tailos.tailarr.com",
+      "assetManifestIndexChecks": 83,
+      "allHashesSizesAndApplicableMimes": "pass",
+      "productionWasmSyntheticVaultClipboardLayouts": "pass",
+      "source": "5cd23e098e7177d3e015c046f80d80013b306930",
+      "manifestSha256": "d6936a33e59438324857559ba75f94c0a67f851a359aa0227f645973731a6f25"
+    },
+    {
+      "origin": "http://127.0.0.1:4318",
+      "assetManifestIndexChecks": 83,
+      "allHashesSizesAndApplicableMimes": "pass",
+      "productionWasmSyntheticVaultClipboardLayouts": "pass",
+      "source": "5cd23e098e7177d3e015c046f80d80013b306930",
+      "manifestSha256": "d6936a33e59438324857559ba75f94c0a67f851a359aa0227f645973731a6f25"
+    }
+  ],
+  "rollback": {
+    "path": "/Users/stephenspeicher/projects/tailterm/.build/releases/before-safari-outline-3577",
+    "source": "d64615bac01f72673c921bcfc25a541d073c2f01",
+    "manifestSha256": "c8583c9f99363432fb63f4f405a757ab201173a4380f493daa6c21ae75ba3ae9",
+    "allAssetsVerified": true
+  },
+  "miniSwap": {
+    "at": "2026-09-13T15:13:02.481102+00:00",
+    "source": "5cd23e098e7177d3e015c046f80d80013b306930",
+    "manifestSha256": "d6936a33e59438324857559ba75f94c0a67f851a359aa0227f645973731a6f25",
+    "previousDirectory": "/Users/stephenspeicher/projects/tailterm/.build/releases/previous-mini-safari-outline-3577",
+    "previewBeforeAfter": "60799     1 node scripts/preview-static.mjs dist-static 127.0.0.1 4318",
+    "atomicSwap": true
+  },
+  "rootFastForward": {
+    "before": "19d7f7a",
+    "after": "5cd23e098e7177d3e015c046f80d80013b306930",
+    "screenshot": "Screenshot 2026-09-10 at 1.31.31\u202fPM.png",
+    "screenshotSha256": "52fd51f6aee8d779346eb954b148ce9045d6661cfd7f6caaf888f1312887737e",
+    "previewBefore": "60799     1 node scripts/preview-static.mjs dist-static 127.0.0.1 4318"
+  },
+  "compiledCssVerification": "120 Chromium/WebKit pointer-focus/refresh/outside-dismiss cycles across Bugs/Features Status/Priority/Project and keyboard focus passed",
+  "remaining": "Original native Safari option-selection/popup-dismissal behavior unverified and unfixed; Bug remains Open. Computer Use permissions pending.",
+  "nonpassesResolved": [
+    "First cache verification mistakenly counted both WASM assets; corrected to exact tailserve payload before copying. Initial build therefore lacked cached WASM.",
+    "Isolated Vite cache node_modules directory initially prevented dependency symlink; retained cache separately and linked existing dependencies. Clean complete package subsequently passed.",
+    "Python public manifest request returned403; normal Node fetch returned200 with exact current manifest. No network/security configuration changed."
+  ],
+  "evidence": [
+    {
+      "file": ".build/worktrees/root-pulldown-20260913/.build/release-3577/preparation.json",
+      "size": 626,
+      "sha256": "228690a8b368c82a67e548144057d9d0d77e4152a5f79ce4e94c47b3f4034ae4"
+    },
+    {
+      "file": ".build/worktrees/root-pulldown-20260913/.build/release-3577/preparation-assets.json",
+      "size": 19348,
+      "sha256": "825ec30a7e077c423b8e7571eeb4473678e6b3269e77e954b6cbdb1cbfe5628a"
+    },
+    {
+      "file": ".build/worktrees/root-pulldown-20260913/.build/release-3577/preparation-smoke.log",
+      "size": 164,
+      "sha256": "f4abdcc6b01fc8ec3f0fa8db80c76fa9f9984bf1fa95c8b18c24cbb4f94b0bc1"
+    },
+    {
+      "file": ".build/worktrees/root-pulldown-20260913/.build/release-3577/root-ff.json",
+      "size": 327,
+      "sha256": "85a83de1dc17f60de8817bdf5d1a0cc468054148b9cb1bbc75f71fde77efd201"
+    },
+    {
+      "file": ".build/worktrees/root-pulldown-20260913/.build/release-3577/mini-swap.json",
+      "size": 427,
+      "sha256": "1e5ca878621a697374310fa27a93264dc302194ccf6e907fed4860ccffef58ea"
+    },
+    {
+      "file": ".build/worktrees/root-pulldown-20260913/.build/release-3577/pages-deploy.log",
+      "size": 355,
+      "sha256": "a7210cbbda3496cc060b3c88ecd37751f72140b9e52a6fb7ad6ac9b59c8b52d3"
+    },
+    {
+      "file": ".build/worktrees/root-pulldown-20260913/.build/release-3577/immutable-assets.json",
+      "size": 19273,
+      "sha256": "52d0a2b7bcd202aa4878e4121e8ba8cedafcd0dd18fb7daed89ef058863ff6db"
+    },
+    {
+      "file": ".build/worktrees/root-pulldown-20260913/.build/release-3577/immutable-smoke.log",
+      "size": 175,
+      "sha256": "c4b6b451cedab65b9a00f154d689bb833e9abcfdceb291d92cd35cbc25c6686c"
+    },
+    {
+      "file": ".build/worktrees/root-pulldown-20260913/.build/release-3577/tailos-assets.json",
+      "size": 19266,
+      "sha256": "274666cee73519275d354c09f7544acba3ed16c300bd9c89c88957ed9c068c96"
+    },
+    {
+      "file": ".build/worktrees/root-pulldown-20260913/.build/release-3577/tailos-smoke.log",
+      "size": 168,
+      "sha256": "fe42fa378a67547e6eb44cecb3f320bc3a5b1bb076869e6d7de318d992e06992"
+    },
+    {
+      "file": ".build/worktrees/root-pulldown-20260913/.build/release-3577/mini-assets.json",
+      "size": 19347,
+      "sha256": "ee218f40975c531fde36d085df8d7422a3bc23d15afd5287da20ba6554ac675a"
+    },
+    {
+      "file": ".build/worktrees/root-pulldown-20260913/.build/release-3577/mini-smoke.log",
+      "size": 163,
+      "sha256": "5f5f358f33d985f87babd852a5c15a72c702bd8b209fa45044be89d62aa9d622"
+    }
+  ],
+  "acceptance": "Actual release verified by direct workspace; pending independent lead and handler qualified release acceptance; no whole-item completion.",
+  "deploymentId": "78febf4a-51e6-436d-b3d3-196db836712f"
+}

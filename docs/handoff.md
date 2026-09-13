@@ -1,5 +1,30 @@
 # Development handoff — September 10, 2026
 
+## September 13 work-item dropdown outline — released, original Safari issue open
+
+Bug `wi_85a66e159b50a309` revision11, order #3478, direct assignment #3514,
+CSS supplement #3564 and release #3577 (handler #3581) is published from
+application `5cd23e098e7177d3e015c046f80d80013b306930`. The Bugs/Features editor
+dropdown focus outline now sits inside the existing border, removing the
+detached second frame while retaining a visible keyboard focus indicator.
+Original native Safari option selection/popup dismissal remains unverified;
+keep this Bug open. This release is not a claim that the original interaction
+failure is fixed.
+
+`https://78febf4a.tailos.pages.dev`, TailOS and Mini match the 82-entry manifest
+`d6936a33e59438324857559ba75f94c0a67f851a359aa0227f645973731a6f25`.
+All three passed 83 manifest/index/public-asset checks plus fresh production
+WASM/synthetic-vault/clipboard/layout smoke. Actual source and compiled CSS
+pass 120 two-engine repeated focus/refresh/dismissal cycles and keyboard focus.
+Mini atomic activation preserved PID60799/PPID1 and the owner screenshot.
+Verified prior `d64615b` bytes are retained in
+`.build/releases/before-safari-outline-3577` and
+`.build/releases/previous-mini-safari-outline-3577`, manifest
+`c8583c9f99363432fb63f4f405a757ab201173a4380f493daa6c21ae75ba3ae9`.
+Hub/CLI/relay/network/Tailscale/profile/lifecycle are unchanged.
+See [the report](pulldown-safari-outline.md) and
+[actual receipt](releases/tailos-2026-09-13-safari-outline.json).
+
 ## September 11 Random Flashes — release verified pending final acceptance
 
 Bug `wi_16377f2bff53f918` revision 1, order #2227 and release supplement
