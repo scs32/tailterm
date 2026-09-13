@@ -12,6 +12,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/scs32/tailterm/hub/internal/api"
 )
@@ -44,6 +45,13 @@ func evidenceCurrent(revision, scope int64) api.WorkItem {
 
 func evidenceCoverage(revision, snapshots, messages int64) api.HistoryCoverage {
 	return api.HistoryCoverage{Complete: true, ObservedCurrentRevision: revision, LatestMaterialized: revision, SnapshotCount: snapshots, ConversationLinks: "explicit_only", ExplicitMessageCount: messages}
+}
+
+func evidenceMessageLink(itemRevision, seq int64, text string) api.WorkItemMessageLink {
+	return api.WorkItemMessageLink{
+		ItemRevision: itemRevision, RevisionCoverage: "verified",
+		Message: api.Message{TaskID: evidenceTask, Seq: seq, Text: text, From: api.Sender{Node: "fixture", User: "owner"}, CreatedAt: time.Unix(seq, 0).UTC()},
+	}
 }
 
 func writeEvidenceJSON(w http.ResponseWriter, value any) {
@@ -89,10 +97,10 @@ func TestWorkItemEvidenceReaderTraversesNativePagesAndExactReceipt(t *testing.T)
 			after, _ := strconv.ParseInt(req.URL.Query().Get("after"), 10, 64)
 			list := api.WorkItemMessageList{Coverage: evidenceCoverage(2, 2, 2)}
 			if after == 0 {
-				list.Links = []api.WorkItemMessageLink{{ItemRevision: 1, Message: api.Message{TaskID: evidenceTask, Seq: 11, Text: "first"}}}
+				list.Links = []api.WorkItemMessageLink{evidenceMessageLink(1, 11, "first")}
 				list.NextAfter = 11
 			} else if after == 11 {
-				list.Links = []api.WorkItemMessageLink{{ItemRevision: 2, Message: api.Message{TaskID: evidenceTask, Seq: 12, Text: "second"}}}
+				list.Links = []api.WorkItemMessageLink{evidenceMessageLink(2, 12, "second")}
 			} else {
 				t.Fatalf("unexpected message cursor %d", after)
 			}
@@ -141,6 +149,15 @@ func TestWorkItemEvidenceReaderTraversesNativePagesAndExactReceipt(t *testing.T)
 			}
 		}
 	}
+	beforeReplay := len(paths)
+	if _, err = captureCLIOutput(t, func() error {
+		return cmdWorkItems(e, []string{"evidence", "--manifest", manifestPath, "--sources", "messages,current,receipt,revisions", "--receipt-request-id", "update/one", "--limit", "1", evidenceItem})
+	}); err != nil {
+		t.Fatalf("verified manifest replay: %v", err)
+	}
+	if len(paths) != beforeReplay || currentCalls.Load() != 2 {
+		t.Fatalf("verified manifest replay repeated native evidence reads: paths=%d->%d current=%d", beforeReplay, len(paths), currentCalls.Load())
+	}
 }
 
 func TestWorkItemEvidenceReaderRetainsTransientFailureAndResumes(t *testing.T) {
@@ -156,7 +173,7 @@ func TestWorkItemEvidenceReaderRetainsTransientFailureAndResumes(t *testing.T) {
 				writeEvidenceJSON(w, api.ErrorResponse{Error: "synthetic transient"})
 				return
 			}
-			writeEvidenceJSON(w, api.WorkItemMessageList{Links: []api.WorkItemMessageLink{{ItemRevision: 1, Message: api.Message{TaskID: evidenceTask, Seq: 8}}}, Coverage: evidenceCoverage(1, 1, 1)})
+			writeEvidenceJSON(w, api.WorkItemMessageList{Links: []api.WorkItemMessageLink{evidenceMessageLink(1, 8, "resumed")}, Coverage: evidenceCoverage(1, 1, 1)})
 		default:
 			t.Fatalf("unexpected path %s", req.URL.Path)
 		}
@@ -192,10 +209,10 @@ func TestWorkItemEvidenceReaderRejectsRepeatedCursor(t *testing.T) {
 		after := req.URL.Query().Get("after")
 		list := api.WorkItemMessageList{Coverage: evidenceCoverage(1, 1, 2)}
 		if after == "0" {
-			list.Links = []api.WorkItemMessageLink{{ItemRevision: 1, Message: api.Message{TaskID: evidenceTask, Seq: 10}}}
+			list.Links = []api.WorkItemMessageLink{evidenceMessageLink(1, 10, "first")}
 			list.NextAfter = 10
 		} else {
-			list.Links = []api.WorkItemMessageLink{{ItemRevision: 1, Message: api.Message{TaskID: evidenceTask, Seq: 11}}}
+			list.Links = []api.WorkItemMessageLink{evidenceMessageLink(1, 11, "second")}
 			list.NextAfter = 10
 		}
 		writeEvidenceJSON(w, list)
@@ -339,5 +356,54 @@ func TestWorkItemEvidenceReaderRejectsMissingRetainedPageBeforeResume(t *testing
 	}
 	if currentCalls.Load() != 2 {
 		t.Fatalf("resume made a new evidence request after retained-page failure: calls=%d", currentCalls.Load())
+	}
+}
+
+func TestWorkItemEvidenceReaderRejectsManifestStateWithoutRetainedPages(t *testing.T) {
+	e := evidenceCLIEnv(t, func(w http.ResponseWriter, req *http.Request) {
+		t.Fatalf("forged manifest bypass attempted native request %s", req.URL.String())
+	})
+	manifestPath := filepath.Join(t.TempDir(), "forged-state.json")
+	selection := workItemEvidenceSelection{Sources: []string{"current"}, PageLimit: api.DefaultWorkItemHistoryPage}
+	manifest := newWorkItemEvidenceManifest(evidenceTask, evidenceItem, selection, time.Now())
+	manifest.Snapshot.ItemRevision, manifest.Snapshot.ScopeRevision = 1, 1
+	manifest.Sources["current"].State = evidenceStateVerified
+	manifest.Complete, manifest.Verified = true, true
+	if err := saveWorkItemEvidenceManifest(manifestPath, &manifest); err != nil {
+		t.Fatal(err)
+	}
+	_, err := captureCLIOutput(t, func() error {
+		return cmdWorkItems(e, []string{"evidence", "--manifest", manifestPath, "--sources", "current", evidenceItem})
+	})
+	if err == nil || !strings.Contains(err.Error(), "manifest") {
+		t.Fatalf("forged verified manifest accepted: %v", err)
+	}
+}
+
+func TestWorkItemEvidenceReaderRejectsMetadataOnlyLinkedMessage(t *testing.T) {
+	e := evidenceCLIEnv(t, func(w http.ResponseWriter, req *http.Request) {
+		base := "/v1/tasks/" + evidenceTask + "/work-items/" + evidenceItem
+		switch req.URL.Path {
+		case base:
+			writeEvidenceJSON(w, evidenceCurrent(1, 1))
+		case base + "/messages":
+			writeEvidenceJSON(w, api.WorkItemMessageList{
+				Links:    []api.WorkItemMessageLink{{ItemRevision: 1, RevisionCoverage: "verified", Message: api.Message{TaskID: evidenceTask, Seq: 1}}},
+				Coverage: evidenceCoverage(1, 1, 1),
+			})
+		default:
+			t.Fatalf("unexpected path %s", req.URL.String())
+		}
+	})
+	manifestPath := filepath.Join(t.TempDir(), "metadata-only.json")
+	_, err := captureCLIOutput(t, func() error {
+		return cmdWorkItems(e, []string{"evidence", "--manifest", manifestPath, "--sources", "current,messages", evidenceItem})
+	})
+	if err == nil || !strings.Contains(err.Error(), "message") {
+		t.Fatalf("metadata-only message accepted: %v", err)
+	}
+	manifest := readEvidenceManifestForTest(t, manifestPath)
+	if manifest.Complete || manifest.Sources["messages"].State != evidenceStateError {
+		t.Fatalf("manifest=%+v", manifest)
 	}
 }

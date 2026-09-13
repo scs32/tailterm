@@ -300,6 +300,310 @@ func verifyEvidencePages(manifestPath string, manifest *workItemEvidenceManifest
 	return nil
 }
 
+func retainedEvidencePageBody(manifestPath string, page workItemEvidencePage) ([]byte, error) {
+	return os.ReadFile(filepath.Join(filepath.Dir(manifestPath), page.Path))
+}
+
+func validEvidenceState(state string) bool {
+	switch state {
+	case evidenceStateNotFetched, evidenceStatePartial, evidenceStateAbsent, evidenceStateError, evidenceStateVerified:
+		return true
+	default:
+		return false
+	}
+}
+
+func validFullMessage(link api.WorkItemMessageLink, after int64, seen map[string]bool) error {
+	message := link.Message
+	key := message.TaskID + "/" + strconv.FormatInt(message.Seq, 10)
+	if link.ItemRevision < 1 || link.RevisionCoverage == "" || !api.ValidID(message.TaskID, "tsk") || message.Seq <= after || seen[key] {
+		return errors.New("message page contains missing, duplicate, or nonadvancing source coordinates")
+	}
+	if message.From.Node == "" || message.From.User == "" || message.Text == "" || message.CreatedAt.IsZero() {
+		return errors.New("message page does not contain the full native body/from/timestamp envelope")
+	}
+	if message.From.AgentID != "" && !api.ValidID(message.From.AgentID, "agt") {
+		return errors.New("message page contains an invalid native author identity")
+	}
+	seen[key] = true
+	return nil
+}
+
+// validateRetainedEvidenceManifest derives the resumable position from the raw
+// retained pages and compares it with the manifest index. The index alone is
+// never execution evidence and cannot be edited to skip native reads.
+func validateRetainedEvidenceManifest(manifestPath string, manifest *workItemEvidenceManifest) error {
+	if !api.ValidID(manifest.TaskID, "tsk") || !api.ValidID(manifest.ItemID, "wi") {
+		return errors.New("evidence manifest has invalid item coordinates")
+	}
+	wantSources, err := parseEvidenceSources(strings.Join(manifest.Selection.Sources, ","))
+	if err != nil || !reflect.DeepEqual(wantSources, manifest.Selection.Sources) || len(manifest.Sources) != len(wantSources) {
+		return errors.New("evidence manifest has an invalid or noncanonical source selection")
+	}
+	for _, source := range wantSources {
+		entry := manifest.Sources[source]
+		if entry == nil || entry.Operation != source || !validEvidenceState(entry.State) || !reflect.DeepEqual(entry.Parameters, evidenceSourceParameters(source, manifest.Selection)) {
+			return fmt.Errorf("evidence manifest source %s does not match its frozen selection", source)
+		}
+		for _, page := range entry.Pages {
+			if page.Operation != source || page.RequestedAt.IsZero() || page.CompletedAt.IsZero() || page.CompletedAt.Before(page.RequestedAt) || page.StatusCode < 100 {
+				return fmt.Errorf("evidence manifest source %s has invalid page metadata", source)
+			}
+		}
+	}
+
+	current := manifest.Sources["current"]
+	var startItem *api.WorkItem
+	var derivedStartedAt, derivedCompletedAt time.Time
+	currentTerminal, currentError := false, false
+	for index, page := range current.Pages {
+		body, readErr := retainedEvidencePageBody(manifestPath, page)
+		if readErr != nil {
+			return readErr
+		}
+		if page.Phase != "start" && page.Phase != "end" {
+			return errors.New("evidence manifest current page has invalid phase")
+		}
+		if !reflect.DeepEqual(page.Parameters, map[string]string{"phase": page.Phase}) {
+			return errors.New("evidence manifest current page parameters changed")
+		}
+		derivedValid := false
+		switch page.StatusCode {
+		case http.StatusOK:
+			var item api.WorkItem
+			if json.Unmarshal(body, &item) == nil && item.ID == manifest.ItemID && item.TaskID == manifest.TaskID && item.Revision > 0 && item.ScopeRevision > 0 {
+				derivedValid = true
+				if page.Phase == "start" {
+					if startItem != nil || currentTerminal {
+						return errors.New("evidence manifest has an impossible current-page chain")
+					}
+					copy := item
+					startItem = &copy
+					derivedStartedAt = page.CompletedAt
+				} else if startItem == nil {
+					currentError = true
+				} else if item.Revision == startItem.Revision && item.ScopeRevision == startItem.ScopeRevision {
+					currentTerminal, currentError = true, false
+					derivedCompletedAt = page.CompletedAt
+				} else {
+					currentError = true
+				}
+				if page.Phase == "start" {
+					currentError = false
+				}
+			} else {
+				currentError = true
+			}
+		case http.StatusNotFound:
+			if page.Phase == "start" && startItem == nil && index == len(current.Pages)-1 {
+				derivedValid, currentTerminal = true, true
+			} else {
+				currentError = true
+			}
+		default:
+			currentError = true
+		}
+		if page.Valid != derivedValid {
+			return errors.New("evidence manifest current-page validity does not match retained native bytes")
+		}
+	}
+	derivedCurrentState := evidenceStateNotFetched
+	derivedCurrentCount := int64(0)
+	if startItem != nil {
+		derivedCurrentCount = 1
+		derivedCurrentState = evidenceStatePartial
+	}
+	if currentTerminal {
+		if startItem == nil {
+			derivedCurrentState = evidenceStateAbsent
+		} else {
+			derivedCurrentState = evidenceStateVerified
+		}
+	}
+	if currentError || (current.State == evidenceStateError && current.LastError != "") {
+		derivedCurrentState = evidenceStateError
+	}
+	if current.State != derivedCurrentState || current.Count != derivedCurrentCount {
+		return errors.New("evidence manifest current state/count does not derive from retained native pages")
+	}
+	if startItem == nil {
+		if manifest.Snapshot.ItemRevision != 0 || manifest.Snapshot.ScopeRevision != 0 {
+			return errors.New("evidence manifest snapshot is not backed by a retained current item")
+		}
+	} else if manifest.Snapshot.ItemRevision != startItem.Revision || manifest.Snapshot.ScopeRevision != startItem.ScopeRevision {
+		return errors.New("evidence manifest snapshot does not match retained current-item bytes")
+	}
+	if !manifest.Snapshot.StartedAt.Equal(derivedStartedAt) || !manifest.Snapshot.CompletedAt.Equal(derivedCompletedAt) {
+		return errors.New("evidence manifest snapshot timestamps do not derive from retained current pages")
+	}
+
+	for _, source := range []string{"revisions", "messages"} {
+		entry, selected := manifest.Sources[source]
+		if !selected {
+			continue
+		}
+		after, count := int64(0), int64(0)
+		var coverage *api.HistoryCoverage
+		terminal, absent, failed := false, false, false
+		for _, page := range entry.Pages {
+			pageAfter := after
+			body, readErr := retainedEvidencePageBody(manifestPath, page)
+			if readErr != nil {
+				return readErr
+			}
+			params := evidenceSourceParameters(source, manifest.Selection)
+			params["after"] = strconv.FormatInt(after, 10)
+			if !reflect.DeepEqual(page.Parameters, params) || terminal || absent {
+				return fmt.Errorf("evidence manifest %s page chain is impossible", source)
+			}
+			derivedValid, pageFailed := false, false
+			if page.StatusCode == http.StatusNotFound {
+				if startItem == nil {
+					derivedValid, absent = true, true
+				} else {
+					pageFailed = true
+				}
+			} else if page.StatusCode != http.StatusOK {
+				pageFailed = true
+			} else if source == "revisions" {
+				var list api.WorkItemRevisionList
+				if json.Unmarshal(body, &list) != nil || historyCoverageCompatible(manifest.Snapshot, list.Coverage, coverage) != nil {
+					pageFailed = true
+				} else {
+					cursor := after
+					for _, revision := range list.Revisions {
+						if revision.TaskID != manifest.TaskID || revision.ItemID != manifest.ItemID || revision.Revision <= cursor {
+							pageFailed = true
+							break
+						}
+						cursor = revision.Revision
+					}
+					if !pageFailed && list.NextAfter != 0 && (list.NextAfter <= after || list.NextAfter != cursor) {
+						pageFailed = true
+					}
+					if !pageFailed {
+						derivedValid = true
+						count += int64(len(list.Revisions))
+						copy := list.Coverage
+						coverage = &copy
+						after = list.NextAfter
+						terminal = list.NextAfter == 0
+						if terminal && (!list.Coverage.Complete || count != list.Coverage.SnapshotCount) {
+							pageFailed, derivedValid = true, false
+							count -= int64(len(list.Revisions))
+							after = pageAfter
+						}
+					}
+				}
+			} else {
+				var list api.WorkItemMessageList
+				if json.Unmarshal(body, &list) != nil || historyCoverageCompatible(manifest.Snapshot, list.Coverage, coverage) != nil {
+					pageFailed = true
+				} else {
+					cursor := after
+					seen := map[string]bool{}
+					for _, link := range list.Links {
+						if validFullMessage(link, after, seen) != nil || link.Message.Seq < cursor {
+							pageFailed = true
+							break
+						}
+						cursor = link.Message.Seq
+					}
+					if !pageFailed && list.NextAfter != 0 && (list.NextAfter <= after || list.NextAfter != cursor) {
+						pageFailed = true
+					}
+					if !pageFailed {
+						derivedValid = true
+						count += int64(len(list.Links))
+						copy := list.Coverage
+						coverage = &copy
+						after = list.NextAfter
+						terminal = list.NextAfter == 0
+						if terminal && !list.Coverage.Complete {
+							pageFailed, derivedValid = true, false
+							count -= int64(len(list.Links))
+							after = pageAfter
+						}
+					}
+				}
+			}
+			if page.Valid != derivedValid || (derivedValid && page.NextAfter != after) {
+				return fmt.Errorf("evidence manifest %s page validity/cursor does not match retained native bytes", source)
+			}
+			failed = pageFailed
+		}
+		derivedState := evidenceStateNotFetched
+		if len(entry.Pages) > 0 {
+			derivedState = evidenceStatePartial
+		}
+		if terminal {
+			derivedState = evidenceStateVerified
+		}
+		if absent {
+			derivedState = evidenceStateAbsent
+		}
+		if failed || (entry.State == evidenceStateError && entry.LastError != "") {
+			derivedState = evidenceStateError
+		}
+		if entry.State != derivedState || entry.Count != count || !reflect.DeepEqual(entry.Coverage, coverage) {
+			return fmt.Errorf("evidence manifest %s state/count/coverage does not derive from retained native pages", source)
+		}
+	}
+
+	if receipt, selected := manifest.Sources["receipt"]; selected {
+		count, terminal, absent, failed := int64(0), false, false, false
+		for _, page := range receipt.Pages {
+			body, readErr := retainedEvidencePageBody(manifestPath, page)
+			if readErr != nil {
+				return readErr
+			}
+			if !reflect.DeepEqual(page.Parameters, evidenceSourceParameters("receipt", manifest.Selection)) || terminal || absent {
+				return errors.New("evidence manifest receipt page chain or requested-agent coordinates changed")
+			}
+			derivedValid, pageFailed := false, false
+			switch page.StatusCode {
+			case http.StatusNotFound:
+				derivedValid, absent = true, true
+			case http.StatusOK:
+				var result api.WorkItemUpdateResult
+				if json.Unmarshal(body, &result) == nil && result.Receipt.TaskID == manifest.TaskID && result.Receipt.ItemID == manifest.ItemID && result.Receipt.RequestID == manifest.Selection.ReceiptRequestID && result.Receipt.ResultRevision == result.Revision.Revision && result.Revision.ItemID == manifest.ItemID && result.Revision.TaskID == manifest.TaskID && (manifest.Snapshot.ItemRevision == 0 || result.Revision.Revision <= manifest.Snapshot.ItemRevision) {
+					derivedValid, terminal, count = true, true, 1
+				} else {
+					pageFailed = true
+				}
+			default:
+				pageFailed = true
+			}
+			if page.Valid != derivedValid {
+				return errors.New("evidence manifest receipt validity does not match retained native bytes")
+			}
+			failed = pageFailed
+		}
+		derivedState := evidenceStateNotFetched
+		if len(receipt.Pages) > 0 {
+			derivedState = evidenceStatePartial
+		}
+		if terminal {
+			derivedState = evidenceStateVerified
+		}
+		if absent {
+			derivedState = evidenceStateAbsent
+		}
+		if failed || (receipt.State == evidenceStateError && receipt.LastError != "") {
+			derivedState = evidenceStateError
+		}
+		if receipt.State != derivedState || receipt.Count != count {
+			return errors.New("evidence manifest receipt state/count does not derive from retained native bytes")
+		}
+	}
+	complete, verified := manifest.Complete, manifest.Verified
+	refreshEvidenceAggregate(manifest)
+	if manifest.Complete != complete || manifest.Verified != verified {
+		return errors.New("evidence manifest aggregate state does not derive from its selected sources")
+	}
+	return nil
+}
+
 type workItemEvidenceReader struct {
 	client       *api.Client
 	manifestPath string
@@ -546,11 +850,12 @@ func (r *workItemEvidenceReader) readMessagePages(ctx context.Context) error {
 		cursor := after
 		coordinates := map[string]bool{}
 		for _, link := range list.Links {
-			key := link.Message.TaskID + "/" + strconv.FormatInt(link.Message.Seq, 10)
-			if link.Message.TaskID == "" || link.Message.Seq <= after || link.Message.Seq < cursor || coordinates[key] {
-				return r.fail("messages", errors.New("message page contains missing or nonadvancing source coordinates"))
+			if err = validFullMessage(link, after, coordinates); err != nil || link.Message.Seq < cursor {
+				if err == nil {
+					err = errors.New("message page contains nonmonotonic source coordinates")
+				}
+				return r.fail("messages", err)
 			}
-			coordinates[key] = true
 			cursor = link.Message.Seq
 		}
 		if list.NextAfter != 0 && (list.NextAfter <= after || list.NextAfter != cursor) {
@@ -731,6 +1036,9 @@ func cmdWorkItemEvidence(e env, args []string) error {
 		}
 		if err = verifyEvidencePages(manifestPath, &manifest); err != nil {
 			return err
+		}
+		if err = validateRetainedEvidenceManifest(manifestPath, &manifest); err != nil {
+			return fmt.Errorf("invalid evidence manifest: %w", err)
 		}
 	} else if !errors.Is(statErr, os.ErrNotExist) {
 		return statErr
