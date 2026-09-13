@@ -39,11 +39,13 @@ the isolated real-hub/private-tmux launch flow with a revision-3 context above
 269,315 bytes, encrypted reload, lost worker response, stable identity, exact
 readback and the partial-folder-only amendment. Mini passes the original
 699,562-byte browser-shaped shell command and the new 2,640-byte staged command.
-Actual Air SFTP plus the staged command passes exact 524,288-byte CJK context,
-mode, byte and digest verification, candidate CLI exact-bound admission, +1
-rejection and cleanup. This clears the initial Air transport finding reported in
-**#3656/#3657**: Air still rejects the old 699,205-byte one-exec shape, while the
-bounded staged shape stays below 64 KiB.
+Actual Air's SFTP protocol plus the staged shell command passes exact
+524,288-byte CJK context, mode, byte and digest verification, candidate CLI
+exact-bound admission, +1 rejection and cleanup. This clears the initial host
+transport finding reported in **#3656/#3657**: Air still rejects the old
+699,205-byte one-exec shape, while the bounded staged shape stays below 64 KiB.
+The browser WASM/SFTP semantics pass in isolated Chromium and WebKit, but a
+physical browser-to-Air run is not claimed and remains a release qualification.
 
 This remains an unreleased candidate pending independent review, handler-saved
 acceptance and the explicitly coordinated rollout. The compatibility order is

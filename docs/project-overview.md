@@ -178,13 +178,15 @@ A 512 KiB correction candidate is implemented under Bug
 `wi_dd57670ee65d974c` revision 3/order #3622 and same-item transport supplement
 #3662/#3665, but it is **not released**. Commands above 64 KiB use the existing
 authenticated browser SFTP seam for atomic private staging, then a small command
-verifies mode, length and digest before CLI admission. Mini and actual Air pass
-exact 512 KiB qualification, +1 rejection and cleanup; Chromium and WebKit pass
-the isolated retry flow. Production remains at 256 KiB pending independent
-review, handler-saved acceptance and the coordinated hub → Mini/Air CLI →
-frontend rollout. Old frontends retain their 128 KiB limit and cannot restore
-newly oversized journals. See [context admission](context-admission.md) for exact
-limits, compatibility and qualification evidence.
+verifies mode, length and digest before CLI admission. Mini and Air's actual
+SFTP/shell/CLI pass exact 512 KiB qualification, +1 rejection and cleanup;
+Chromium and WebKit pass the isolated retry flow. A physical
+browser-WASM-to-Air run remains a release gate. Production remains at 256 KiB
+pending independent review, handler-saved acceptance and the coordinated hub →
+Mini/Air CLI → frontend rollout. Old frontends retain their 128 KiB limit and
+cannot restore newly oversized journals. See
+[context admission](context-admission.md) for exact limits, compatibility and
+qualification evidence.
 
 Models can be selected for supported runtimes or entered explicitly. Installed
 runtime versions, account/model access, credentials, and host configuration remain

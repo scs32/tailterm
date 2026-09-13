@@ -21,9 +21,11 @@ external argv and private cleanup. Air rejected that old one-exec shape, so the
 same-item supplement #3662/#3665 uses the existing authenticated SFTP seam for
 commands above64KiB: 32KiB chunks, atomic mode0600 publication, an
 agent/digest-bound path, and pre-CLI mode/length/SHA-256 checks. The final Air
-command is2640 bytes. Actual Air passes exact524288-byte transfer and candidate
-CLI admission, +1 rejection, and success cleanup. Chromium and WebKit each pass
-four exact staged-write/cleanup attempts across response-loss and partial retry.
+command is below3KiB. Actual Air's SFTP protocol and shell pass exact524288-byte
+transfer and candidate CLI admission, +1 rejection, and success cleanup.
+Chromium and WebKit each pass four exact staged-write/cleanup attempts across
+response-loss and partial retry. A physical browser-WASM-to-Air run is not
+claimed and remains a release qualification.
 
 Do **not release or integrate this candidate yet**. Independent review,
 handler-saved acceptance and the coordinated hub → Mini/Air CLI → frontend
