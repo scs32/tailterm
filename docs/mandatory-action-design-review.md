@@ -72,11 +72,14 @@ API builder feedback **#4594** establishes this candidate vocabulary:
 | Operator concept | Candidate wire contract |
 | --- | --- |
 | Responsible target | `recipientKind`: `item_worker`, `project_lead`, or `database_handler`. |
-| Stable action identity | `actionKey`, unique within its item/order/recipient scope. |
+| Stable action identity | `actionKey`; current sibling uniqueness is scoped by task, item, exact run, `recipientKind`, and `actionKey`. |
 | Required behavior | `actionClass`: `execution`, `independent_dispatch`, or `database_operation`. |
 | Recovery gate | Follow-through classification `cause_required`. |
 | Incident mutation | `POST /v1/tasks/{task}/deliveries/{delivery}/recovery-incidents`. |
 | Incident content | Stop/cause evidence, contributing conditions, unresolved questions, and accountable prevention owner/order/verification criterion. |
+| Complete sibling read | Candidate `GET delivery-coverages` returns the complete per-run action set. |
+| Explicit singular read | Candidate current-assignment and delivery-coverage reads accept exact `itemId` plus `actionKey` and reject an ambiguous unselected read. |
+| CLI selector | `tt current-assignment --item WI --action-key KEY --json`. |
 
 Multiple sibling `actionKey` values may be current for the same exact shared-role
 run. Current uniqueness, coverage, lookup, mutation, receipts, and supersession
@@ -85,6 +88,11 @@ the complete set or require an explicit action selector; silently choosing one
 current sibling would let another required action disappear from the operator
 view and follow-through assessment. Each recurrence creates a fresh linked
 incident rather than rewriting or reusing the preceding incident.
+
+The candidate relay enumerates the complete set, skips siblings with a current
+planned block, and revalidates the exact item/action immediately before invoking
+transport. Those are required race protections, not evidence that transport or
+substantive execution occurred.
 
 These names describe the in-progress candidate and do not claim its tests,
 independent verification, integration, deployment, or handler acceptance.
