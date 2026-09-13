@@ -123,7 +123,17 @@ Send to project saves a directed board message to the selected open project's
 orchestrator. It defaults to the owning project; choosing another does not move
 the record or start a team. The receipt confirms message storage, not execution.
 
-The TrueNAS hub and Mini CLI now run exact source
+The `tasks-hub` source now includes the verified-host backup/release preflight
+from Bug `wi_9cc74828bb3499a4` revision1, implementation order #4410 and source
+integration order #4718 (accepted API `1246727`, docs `84a1b6d`). It requires a
+versioned explicit target/route/source/destination plan, lets only the database
+handler produce the SQLite backup receipt, and requires deployment to validate
+the separately handler-saved receipt-bytes SHA-256 before parsing, remote probe
+or mutation. This source integration did not contact TrueNAS, access live data,
+build/install binaries or deploy; operational qualification remains open. See
+[the verified-host contract](verified-host-preflight-contract.md).
+
+The TrueNAS hub and Mini CLI still run exact source
 `b1b14d70cb6f96d033e4da9e1aeb650174066cbf` under Feature
 `wi_618c8ff87e6b8061` revision5, implementation order #4053 and release order
 #4314. That source retains the qualified manual directive core and structured

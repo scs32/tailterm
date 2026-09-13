@@ -1,5 +1,22 @@
 # Development handoff — September 10, 2026
 
+## September 13 verified-host preflight — integrated source, not installed
+
+Bug `wi_9cc74828bb3499a4` revision1, implementation order #4410 and source
+integration order #4718 have integrated accepted API source `1246727` and docs
+`84a1b6d` into `tasks-hub`. The source now has an enforced handler-owned
+TrueNAS backup producer plus a deployment receipt consumer. The handler records
+the SHA-256 of the exact saved receipt bytes; deployment requires that external
+pin and validates it before parsing the receipt, probing TrueNAS or mutating the
+deployment. See [the operator contract](verified-host-preflight-contract.md) and
+[design review](verified-host-preflight-review.md).
+
+This was source integration only. It did not run the preflight, contact TrueNAS,
+open live data, build or install binaries, deploy, or reload services. The
+installed hub and Mini CLI remain the `b1b14d70` release documented below. The
+Bug remains open pending a separately bounded handler-owned live backup/receipt
+and pin, loaded-path proof, and release acceptance.
+
 ## September 13 directive follow-through — deployed, bounded activation accepted
 
 Feature `wi_618c8ff87e6b8061` revision5, implementation order #4053,
@@ -1795,14 +1812,37 @@ first; the replacement script expects an existing instance. The hub is independe
 ### TrueNAS hub updates
 
 The hub is already running. Do not redeploy it just because development moved.
-When a backend change requires an update, first take a consistent SQLite backup
-and compile the Linux amd64 binary expected by the middleware deployment script:
+When a separately authorized backend release requires an update, first compile
+the Linux amd64 binary expected by the middleware deployment script:
 
 ```sh
 cd hub
 CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags='-s -w' -o ../.build/ttbin/tailterm-hub-linux-amd64 ./cmd/tailterm-hub
 cd ..
-python3 scripts/deploy-truenas-hub.py UNIQUE_RELEASE_NAME --update
+```
+
+Next, freeze a version1 plan with the approved target host, exact established
+`truenas` SSH route, canonical source
+`/mnt/deepfreeze/tailterm-hub/state/hub.sqlite`, unique destination beneath
+`/mnt/deepfreeze/tailterm-hub/backups`, target executable, owner/checks and
+deployment linkage. The database handler alone runs the backup producer:
+
+```sh
+python3 scripts/truenas_release_preflight.py \
+  --plan PLAN.json \
+  --receipt-output RECEIPT.json
+```
+
+The handler must save and deliver both the receipt and the emitted
+`receiptOutput.sha256`. The release operator then supplies that handler-saved
+pin; do not calculate an expected pin from the receipt being consumed:
+
+```sh
+python3 scripts/deploy-truenas-hub.py UNIQUE_RELEASE_NAME \
+  --plan PLAN.json \
+  --preflight-receipt RECEIPT.json \
+  --preflight-receipt-sha256 HANDLER_SAVED_SHA256 \
+  --update
 ```
 
 Use a new release name; do not overwrite a mounted executable. The script changes
@@ -1813,9 +1853,11 @@ a read-only root filesystem and a 32-agent cap. Rollback points the app at the
 previous release path after considering migration compatibility; do not blindly
 restore an older database over new user work.
 
-Back up SQLite through its backup API (as done at handoff) or while stopped.
-Copying a live `hub.sqlite` without its WAL is not a valid backup procedure. Keep
-`profile_meta` and profile history so the sync service identity and revisions survive.
+The handler preflight uses SQLite's online backup API and retains source/backup
+integrity, foreign-key, profile, mode/owner/size/SHA and receipt-pin evidence.
+Copying a live `hub.sqlite` without its WAL is not a valid backup procedure.
+Keep `profile_meta` and profile history so the sync service identity and
+revisions survive.
 
 For a compatible hub/CLI rollout, update the hub first, then install the new CLI
 atomically on each host and restart only its per-user relay. Preserve the old
