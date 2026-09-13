@@ -65,6 +65,30 @@ generation/epoch before state-changing operations. Source message text may be
 retained, but action creation and transitions must use typed fields and explicit
 associations.
 
+### Candidate wire mapping
+
+API builder feedback **#4594** establishes this candidate vocabulary:
+
+| Operator concept | Candidate wire contract |
+| --- | --- |
+| Responsible target | `recipientKind`: `item_worker`, `project_lead`, or `database_handler`. |
+| Stable action identity | `actionKey`, unique within its item/order/recipient scope. |
+| Required behavior | `actionClass`: `execution`, `independent_dispatch`, or `database_operation`. |
+| Recovery gate | Follow-through classification `cause_required`. |
+| Incident mutation | `POST /v1/tasks/{task}/deliveries/{delivery}/recovery-incidents`. |
+| Incident content | Stop/cause evidence, contributing conditions, unresolved questions, and accountable prevention owner/order/verification criterion. |
+
+Multiple sibling `actionKey` values may be current for the same exact shared-role
+run. Current uniqueness, coverage, lookup, mutation, receipts, and supersession
+therefore need the action key as part of their identity. A read path must return
+the complete set or require an explicit action selector; silently choosing one
+current sibling would let another required action disappear from the operator
+view and follow-through assessment. Each recurrence creates a fresh linked
+incident rather than rewriting or reusing the preceding incident.
+
+These names describe the in-progress candidate and do not claim its tests,
+independent verification, integration, deployment, or handler acceptance.
+
 ## Read model for operator consumers
 
 A later UI/API adapter should be able to build one coherent snapshot containing:
