@@ -140,7 +140,8 @@ on top of `b1d3285`, including focused corrections `a952a7a`, `49d60f9`, and
 Its implementation paths are
 `scripts/truenas_release_preflight.py` and `scripts/deploy-truenas-hub.py`; its
 primary regression path is `tests/truenas-release-preflight.test.js`.
-Independent QA is commit `48ca9616b2612d8afa5db0336db91006ae3d31f9`,
+Independent QA is commit `96bcff78a4cecac8b244be57fff920b0c0d08a5f`,
+including its earlier v1 coverage commits and
 `tests/truenas_release_preflight_test.py`.
 
 Review verification:
@@ -151,9 +152,9 @@ Review verification:
   receipt rejection, external receipt-pin enforcement, distinct
   route/host/executable failures, mandatory receipt-before-deployment, and
   deployment mutation-state separation.
-- Independent QA commit `48ca961` was overlaid on API commit `1246727` in an
+- Independent QA commit `96bcff7` was overlaid on API commit `1246727` in an
   isolated temporary worktree. `python3 -m unittest
-  tests.truenas_release_preflight_test` passed 7/7 tests. The QA commit alone
+  tests.truenas_release_preflight_test` passed 10/10 tests. The QA commit alone
   intentionally lacks the API worker's script and is not claimed as a
   standalone runnable integration branch.
 - `git diff --check b1b14d70..1246727` passed.
@@ -170,11 +171,9 @@ boundary.
 This review did not deploy, contact TrueNAS, use live data, or create actual
 remote backup evidence. Qualified handler execution must still retain the exact
 remote receipt and its separately delivered byte pin, and lead/QA must
-separately record release acceptance. The API suite covers the new external-pin
-gate; independent QA commit `48ca961` predates that follow-up, so independent
-pin-specific coverage remains a release dependency. Synthetic passing checks
-establish the candidate's behavior, not permanent prevention in the loaded
-production path.
+separately record release acceptance. API and independent QA both cover the
+external-pin gate. Synthetic passing checks establish the candidate's behavior,
+not permanent prevention in the loaded production path.
 
 ### Findings routed during implementation
 
@@ -215,5 +214,5 @@ The following findings were resolved in the reviewed candidate:
 
 No design finding above is waived. Remaining dependencies are operational:
 handler-owned execution and saved remote evidence/pin, integration of the
-reviewed commits into the release candidate, independent pin-specific QA and
-release acceptance, and proof that the loaded production path uses the gate.
+reviewed commits into the release candidate, independent release acceptance,
+and proof that the loaded production path uses the gate.
