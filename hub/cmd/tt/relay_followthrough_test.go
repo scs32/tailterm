@@ -20,6 +20,69 @@ func followThroughTestDelivery(b runtimeBinding) api.RequiredDelivery {
 	return api.RequiredDelivery{ID: "dly_0000000000000001", TaskID: b.Task, AgentID: b.Agent, RunID: b.Run, ItemTaskID: b.Task, ItemID: "wi_0000000000000001", ItemRevision: 1, Generation: 2, ExecutionEpoch: 3, Current: true, EnrollmentVersion: api.ReliableFollowThroughCapabilityVersion, FollowThrough: api.DeliveryFollowThroughState{AttemptCount: 0}}
 }
 
+func TestRelayFollowThroughSkipsBlockedSiblingAndQueuesExecutableAction(t *testing.T) {
+	b := followThroughTestBinding("")
+	blocked := followThroughTestDelivery(b)
+	blocked.ID, blocked.Generation, blocked.RecipientKind, blocked.ActionKey, blocked.ActionClass = "dly_0000000000000002", 2, api.DeliveryRecipientProjectLead, "release-planned-wait", api.DeliveryActionExecution
+	blocked.EnrollmentVersion = api.ReliableMandatoryActionCapabilityVersion
+	executable := followThroughTestDelivery(b)
+	executable.ID, executable.Generation, executable.RecipientKind, executable.ActionKey, executable.ActionClass = "dly_0000000000000003", 3, api.DeliveryRecipientProjectLead, "dispatch-independent", api.DeliveryActionIndependentDispatch
+	executable.EnrollmentVersion = api.ReliableMandatoryActionCapabilityVersion
+	var checked []string
+	var queueCalls int
+	var leaseID string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.URL.Path == "/v1/capabilities":
+			json.NewEncoder(w).Encode(api.CurrentCapabilities())
+		case strings.HasSuffix(r.URL.Path, "/delivery-coverages"):
+			json.NewEncoder(w).Encode(api.DeliveryCoverageList{TaskID: b.Task, AgentID: b.Agent, RunID: b.Run, Actions: []api.DeliveryCoverage{
+				{Status: "covered", AgentStatus: api.AgentRunning, Delivery: &blocked},
+				{Status: "covered", AgentStatus: api.AgentRunning, Delivery: &executable},
+			}})
+		case strings.HasSuffix(r.URL.Path, "/follow-through/check"):
+			var check api.DeliveryFollowThroughCheckRequest
+			json.NewDecoder(r.Body).Decode(&check)
+			checked = append(checked, r.URL.Path)
+			if strings.Contains(r.URL.Path, blocked.ID) {
+				json.NewEncoder(w).Encode(api.DeliveryFollowThroughDecision{Delivery: blocked, Classification: api.DeliveryFollowThroughKnownBlock})
+				return
+			}
+			leaseID = check.RequestID
+			json.NewEncoder(w).Encode(api.DeliveryFollowThroughDecision{Delivery: executable, Classification: api.DeliveryFollowThroughOverdueUnknown, Action: api.DeliveryFollowThroughActionQueue, Attempt: 1, Execute: true})
+		case strings.HasSuffix(r.URL.Path, "/delivery-coverage"):
+			if r.URL.Query().Get("itemId") != executable.ItemID || r.URL.Query().Get("actionKey") != executable.ActionKey {
+				t.Fatalf("revalidation did not select exact executable action: %s", r.URL.RawQuery)
+			}
+			fresh := executable
+			fresh.FollowThrough.PendingAction = api.DeliveryFollowThroughActionQueue
+			fresh.FollowThrough.PendingRequestID = leaseID
+			json.NewEncoder(w).Encode(api.DeliveryCoverage{Status: "covered", AgentStatus: api.AgentRunning, Delivery: &fresh})
+		case strings.HasSuffix(r.URL.Path, "/follow-through/report"):
+			json.NewEncoder(w).Encode(api.DeliveryFollowThroughReport{})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+	b.Hub = server.URL
+	c, err := api.NewClient(server.URL, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	queued, err := relayFollowThrough(context.Background(), b, &relayProgress{}, c, time.Now().UTC(), func(_ context.Context, _ runtimeBinding, prompt string) error {
+		queueCalls++
+		if !strings.Contains(prompt, "--item "+executable.ItemID+" --action-key "+executable.ActionKey) || !strings.Contains(prompt, "cannot satisfy a sibling action") {
+			t.Fatalf("prompt omitted exact sibling responsibility: %q", prompt)
+		}
+		return nil
+	})
+	if err != nil || !queued || queueCalls != 1 || len(checked) != 2 || !strings.Contains(checked[0], blocked.ID) || !strings.Contains(checked[1], executable.ID) {
+		t.Fatalf("blocked sibling prevented independent dispatch: queued=%v queueCalls=%d checked=%v err=%v", queued, queueCalls, checked, err)
+	}
+}
+
 func TestRelayFollowThroughRevalidatesAndRetriesOnlyDurableReport(t *testing.T) {
 	var coverageCalls, checkCalls, reportCalls, queueCalls int
 	var leaseRequestID string

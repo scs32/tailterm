@@ -94,8 +94,39 @@ func TestReliableDeliveryHTTPRoundTrip(t *testing.T) {
 	if code := c.do("GET", "/v1/tasks/"+task.ID+"/agents/"+worker.ID+"/current-assignment?runId="+worker.RunID, nil, &afterStale); code != 200 || afterStale.ExecutionEpoch != 2 || afterStale.Phase != api.DeliveryAcknowledged {
 		t.Fatalf("stale result mutated resumed execution: %d %+v", code, afterStale)
 	}
+	leadDirective, err := c.st.PostMessage(ctx, task.ID, api.PostMessageRequest{Text: "Dispatch independent HTTP action", RequestID: "http-lead-action-message", WorkItems: []api.MessageWorkItem{{ItemTaskID: task.ID, ItemID: item.ID, ItemRevision: item.Revision, Relationship: "primary"}}, WorkOrderMessage: &orderRef}, c.who)
+	if err != nil {
+		t.Fatal(err)
+	}
+	leadCreate := api.CreateRequiredDeliveryRequest{RequestID: "http-lead-action-create", MessageSeq: leadDirective.Seq, Kind: api.DeliveryAssignment,
+		RecipientKind: api.DeliveryRecipientProjectLead, ActionKey: "dispatch-http-independent", ActionClass: api.DeliveryActionIndependentDispatch,
+		AgentID: lead.ID, RunID: lead.RunID, ItemTaskID: task.ID, ItemID: item.ID, ItemRevision: item.Revision, WorkOrderMessage: orderRef,
+		GoverningOrderMessage: orderRef, InstructionSHA256: fmt.Sprintf("%x", sha256.Sum256([]byte(leadDirective.Text))), InstructionBytes: int64(len([]byte(leadDirective.Text))), EnrollmentVersion: api.ReliableMandatoryActionCapabilityVersion,
+		ProducerAgentID: lead.ID, ProducerRunID: lead.RunID}
+	var leadCreated api.DeliveryMutation
+	if code := c.do("POST", "/v1/tasks/"+task.ID+"/required-deliveries", leadCreate, &leadCreated); code != 201 || leadCreated.Delivery.RecipientKind != api.DeliveryRecipientProjectLead {
+		t.Fatalf("create shared lead action: %d %+v", code, leadCreated)
+	}
+	var leadActions api.DeliveryCoverageList
+	if code := c.do("GET", "/v1/tasks/"+task.ID+"/agents/"+lead.ID+"/delivery-coverages?runId="+lead.RunID, nil, &leadActions); code != 200 || len(leadActions.Actions) != 1 || leadActions.Actions[0].Delivery == nil || leadActions.Actions[0].Delivery.ActionKey != leadCreate.ActionKey {
+		t.Fatalf("list exact lead actions: %d %+v", code, leadActions)
+	}
+	var selectedLeadAction api.RequiredDelivery
+	if code := c.do("GET", "/v1/tasks/"+task.ID+"/agents/"+lead.ID+"/current-assignment?runId="+lead.RunID+"&itemId="+item.ID+"&actionKey="+leadCreate.ActionKey, nil, &selectedLeadAction); code != 200 || selectedLeadAction.ID != leadCreated.Delivery.ID {
+		t.Fatalf("select exact lead action: %d %+v", code, selectedLeadAction)
+	}
+	incidentReq := api.DeliveryRecoveryIncidentRequest{RequestID: "http-recovery-incident", AgentID: lead.ID, RunID: lead.RunID,
+		ExpectedGeneration: leadCreated.Delivery.Generation, ExpectedEpoch: 1, CauseStatus: api.DeliveryCauseEstablished,
+		LastSubstantiveAction: "stored HTTP lead action", LastSubstantiveAt: leadCreated.Delivery.CreatedAt,
+		ExpectedNextAction: "dispatch independent HTTP action", StopReason: "synthetic unexpected turn end",
+		CausalEvidence: []string{"no ack, progress, block, or result followed storage"}, ContributingConditions: []string{"synthetic turn ended"},
+		Prevention: api.DeliveryPreventionAction{OwnerAgentID: lead.ID, OwnerRunID: lead.RunID, WorkOrderMessage: orderRef, VerificationCriterion: "next exact action is attempted once or escalated"}}
+	var incident api.DeliveryRecoveryIncidentMutation
+	if code := c.do("POST", "/v1/tasks/"+task.ID+"/deliveries/"+leadCreated.Delivery.ID+"/recovery-incidents", incidentReq, &incident); code != 201 || incident.Incident.CauseStatus != api.DeliveryCauseEstablished || incident.Receipt.Operation != "recovery_incident" {
+		t.Fatalf("record causal recovery incident: %d %+v", code, incident)
+	}
 	var caps api.Capabilities
-	if code := c.do("GET", "/v1/capabilities", nil, &caps); code != 200 || !caps.ReliableDelivery.Supported || len(caps.ReliableDelivery.Versions) != 2 || caps.ReliableDelivery.Versions[0] != api.ReliableDeliveryCapabilityVersion || caps.ReliableDelivery.Versions[1] != api.ReliableFollowThroughCapabilityVersion {
+	if code := c.do("GET", "/v1/capabilities", nil, &caps); code != 200 || !caps.ReliableDelivery.Supported || len(caps.ReliableDelivery.Versions) != 3 || caps.ReliableDelivery.Versions[0] != api.ReliableDeliveryCapabilityVersion || caps.ReliableDelivery.Versions[1] != api.ReliableFollowThroughCapabilityVersion || caps.ReliableDelivery.Versions[2] != api.ReliableMandatoryActionCapabilityVersion {
 		t.Fatalf("delivery capability: %d %+v", code, caps.ReliableDelivery)
 	}
 }

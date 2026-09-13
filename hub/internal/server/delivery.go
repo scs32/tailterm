@@ -39,7 +39,7 @@ func (s *Server) currentAssignment(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	out, err := s.store.CurrentAssignment(r.Context(), id, aid, r.URL.Query().Get("runId"))
+	out, err := s.store.CurrentAssignmentForResponsibility(r.Context(), id, aid, r.URL.Query().Get("runId"), r.URL.Query().Get("itemId"), r.URL.Query().Get("actionKey"))
 	if err != nil {
 		fail(w, err)
 		return
@@ -59,7 +59,27 @@ func (s *Server) deliveryCoverage(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	out, err := s.store.DeliveryCoverage(r.Context(), id, aid, r.URL.Query().Get("runId"))
+	out, err := s.store.DeliveryCoverageForResponsibility(r.Context(), id, aid, r.URL.Query().Get("runId"), r.URL.Query().Get("itemId"), r.URL.Query().Get("actionKey"))
+	if err != nil {
+		fail(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, out)
+}
+
+func (s *Server) deliveryCoverages(w http.ResponseWriter, r *http.Request) {
+	if _, ok := s.caller(w, r); !ok {
+		return
+	}
+	id, ok := taskID(w, r)
+	if !ok {
+		return
+	}
+	aid, ok := agentID(w, r)
+	if !ok {
+		return
+	}
+	out, err := s.store.DeliveryCoverages(r.Context(), id, aid, r.URL.Query().Get("runId"))
 	if err != nil {
 		fail(w, err)
 		return
@@ -107,6 +127,27 @@ func (s *Server) reportDeliveryFollowThrough(w http.ResponseWriter, r *http.Requ
 		return
 	}
 	writeJSON(w, http.StatusOK, out)
+}
+
+func (s *Server) recordDeliveryRecoveryIncident(w http.ResponseWriter, r *http.Request) {
+	by, ok := s.writer(w, r)
+	if !ok {
+		return
+	}
+	id, ok := taskID(w, r)
+	if !ok {
+		return
+	}
+	var req api.DeliveryRecoveryIncidentRequest
+	if !decode(w, r, &req) {
+		return
+	}
+	out, err := s.store.RecordDeliveryRecoveryIncident(r.Context(), id, r.PathValue("deliveryId"), req, by)
+	if err != nil {
+		fail(w, err)
+		return
+	}
+	writeJSON(w, http.StatusCreated, out)
 }
 
 func (s *Server) deliveryAction(w http.ResponseWriter, r *http.Request) {

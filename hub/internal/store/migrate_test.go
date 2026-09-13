@@ -136,10 +136,12 @@ func TestMigrateAddsFollowThroughColumnsWithoutInventingEnrollment(t *testing.T)
   context_digest TEXT NOT NULL, generation INTEGER NOT NULL,
   supersedes_delivery_id TEXT, current INTEGER NOT NULL DEFAULT 1,
   phase TEXT NOT NULL, execution_epoch INTEGER NOT NULL DEFAULT 1,
-  current_block_id TEXT, result_text TEXT NOT NULL DEFAULT '',
-  created_at TEXT NOT NULL, updated_at TEXT NOT NULL
-);
-INSERT INTO required_deliveries(id,task_id,message_seq,kind,agent_id,run_id,item_task_id,item_id,item_revision,work_order_task_id,work_order_message_seq,context_digest,generation,current,phase,execution_epoch,created_at,updated_at)
+	  current_block_id TEXT, result_text TEXT NOT NULL DEFAULT '',
+	  created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+	);
+	CREATE UNIQUE INDEX required_deliveries_one_current
+	  ON required_deliveries(task_id,item_task_id,item_id,agent_id,run_id) WHERE current=1;
+	INSERT INTO required_deliveries(id,task_id,message_seq,kind,agent_id,run_id,item_task_id,item_id,item_revision,work_order_task_id,work_order_message_seq,context_digest,generation,current,phase,execution_epoch,created_at,updated_at)
 VALUES('dly_0000000000000001','tsk_0000000000000001',1,'assignment','agt_0000000000000001','run_0000000000000001','tsk_0000000000000001','wi_0000000000000001',1,'tsk_0000000000000001',1,'digest',1,1,'unacknowledged',1,'2026-09-13T00:00:00Z','2026-09-13T00:00:00Z');`); err != nil {
 		t.Fatal(err)
 	}
@@ -147,11 +149,21 @@ VALUES('dly_0000000000000001','tsk_0000000000000001',1,'assignment','agt_0000000
 		t.Fatalf("v1 directive ledger migration: %v", err)
 	}
 	var version, bytes, attempts int
-	var governing, digest, deadline string
-	if err = db.QueryRow(`SELECT enrollment_version,instruction_bytes,followthrough_attempt_count,governing_order_task_id,instruction_sha256,next_substantive_deadline_at FROM required_deliveries WHERE id='dly_0000000000000001'`).Scan(&version, &bytes, &attempts, &governing, &digest, &deadline); err != nil {
+	var governing, digest, deadline, recipientKind, actionKey, actionClass string
+	if err = db.QueryRow(`SELECT enrollment_version,instruction_bytes,followthrough_attempt_count,governing_order_task_id,instruction_sha256,next_substantive_deadline_at,recipient_kind,action_key,action_class FROM required_deliveries WHERE id='dly_0000000000000001'`).Scan(&version, &bytes, &attempts, &governing, &digest, &deadline, &recipientKind, &actionKey, &actionClass); err != nil {
 		t.Fatal(err)
 	}
-	if version != 1 || bytes != 0 || attempts != 0 || governing != "" || digest != "" || deadline != "" {
-		t.Fatalf("legacy row was backfilled with invented enrollment: version=%d bytes=%d attempts=%d governing=%q digest=%q deadline=%q", version, bytes, attempts, governing, digest, deadline)
+	if version != 1 || bytes != 0 || attempts != 0 || governing != "" || digest != "" || deadline != "" || recipientKind != api.DeliveryRecipientItemWorker || actionKey != "primary" || actionClass != api.DeliveryActionExecution {
+		t.Fatalf("legacy row was backfilled with invented enrollment: version=%d bytes=%d attempts=%d governing=%q digest=%q deadline=%q recipient=%q action=%q class=%q", version, bytes, attempts, governing, digest, deadline, recipientKind, actionKey, actionClass)
+	}
+	var incidentsTable, actionIndex int
+	if err = db.QueryRow(`SELECT count(*) FROM sqlite_master WHERE type='table' AND name='delivery_recovery_incidents'`).Scan(&incidentsTable); err != nil {
+		t.Fatal(err)
+	}
+	if err = db.QueryRow(`SELECT count(*) FROM pragma_index_info('required_deliveries_one_current') WHERE name IN ('recipient_kind','action_key')`).Scan(&actionIndex); err != nil {
+		t.Fatal(err)
+	}
+	if incidentsTable != 1 || actionIndex != 2 {
+		t.Fatalf("mandatory-action migration missing incident table or action-scoped current index: table=%d indexColumns=%d", incidentsTable, actionIndex)
 	}
 }

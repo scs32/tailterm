@@ -172,7 +172,7 @@ func wakePrompt(b runtimeBinding, through int64) string {
 }
 
 func followThroughPrompt(b runtimeBinding, d api.RequiredDelivery) string {
-	return fmt.Sprintf("Reliable directive follow-through for task %s, agent %s, exact run %s, delivery %s generation %d epoch %d. Before starting another tool, run `tt current-assignment --json`, verify the current immutable governing order/instruction, then record exact `tt delivery ack|progress|block|result` evidence as applicable. A queued message, inbox read, heartbeat, or Working label is not execution evidence. If this directive was superseded or the exact binding differs, do not act on it; report the conflict. This transport attempt does not authorize TUI manipulation, process restart, replacement, closure, or unrelated work.", b.Task, b.Agent, b.Run, d.ID, d.Generation, d.ExecutionEpoch)
+	return fmt.Sprintf("Reliable directive follow-through for task %s, agent %s, exact run %s, delivery %s generation %d epoch %d, recipient responsibility %s, action %s (%s). Before starting another tool, run `tt current-assignment --item %s --action-key %s --json`, verify the current immutable governing order/instruction and exact action, then record exact `tt delivery ack|progress|block|result` evidence as applicable. A saved order, queued message, inbox read, heartbeat, Working label, turn end, or queue acceptance is not execution evidence and cannot satisfy a sibling action. If this directive was superseded or the exact binding differs, do not act on it; report the conflict. An unexpected paused action may continue only after its evidence-backed recovery incident and bounded prevention action are stored; an unknown cause requires diagnosis. This transport attempt does not authorize TUI manipulation, process restart, replacement, closure, or unrelated work.", b.Task, b.Agent, b.Run, d.ID, d.Generation, d.ExecutionEpoch, d.RecipientKind, d.ActionKey, d.ActionClass, d.ItemID, d.ActionKey)
 }
 
 func followThroughRequestID(d api.RequiredDelivery) string {
@@ -238,64 +238,79 @@ func relayFollowThrough(ctx context.Context, b runtimeBinding, p *relayProgress,
 		p.PendingFollowThroughReport = nil
 		p.PendingFollowThroughDelivery = ""
 	}
-	coverage, err := c.DeliveryCoverage(ctx, b.Task, b.Agent, b.Run)
+	coverageList, err := c.DeliveryCoverages(ctx, b.Task, b.Agent, b.Run)
+	if httpErr, ok := err.(*api.HTTPError); ok && httpErr.Status == http.StatusNotFound {
+		// A v2 hub has one item-worker obligation and no action-list route.
+		coverage, coverageErr := c.DeliveryCoverage(ctx, b.Task, b.Agent, b.Run)
+		if coverageErr != nil {
+			return false, coverageErr
+		}
+		coverageList.Actions = []api.DeliveryCoverage{coverage}
+		err = nil
+	}
 	if err != nil {
 		return false, err
 	}
-	p.FollowThroughStatus = coverage.Status
-	if coverage.Status != "covered" || coverage.Delivery == nil {
-		return false, nil
-	}
-	d := *coverage.Delivery
-	check := api.DeliveryFollowThroughCheckRequest{
-		RequestID: followThroughRequestID(d), AgentID: b.Agent, RunID: b.Run,
-		ExpectedGeneration: d.Generation, ExpectedEpoch: d.ExecutionEpoch,
-		Observation: api.DeliveryRuntimeObservation{State: api.DeliveryObservationUnknown, Source: "codex_queue_only", ObservedAt: now},
-	}
-	decision, err := c.CheckDeliveryFollowThrough(ctx, b.Task, d.ID, check)
-	if err != nil || !decision.Execute || decision.Action != api.DeliveryFollowThroughActionQueue {
-		return false, err
-	}
-	// Re-read the exact enrolled binding immediately before the external call.
-	// The hub lease and this read cannot make the later Codex subprocess atomic;
-	// a narrow check-to-dispatch window remains and is reported honestly.
-	fresh, revalidateErr := c.DeliveryCoverage(ctx, b.Task, b.Agent, b.Run)
-	if revalidateErr != nil {
-		return true, revalidateErr
-	}
-	revalidated := revalidateErr == nil && fresh.Status == "covered" && fresh.Delivery != nil &&
-		fresh.AgentStatus != api.AgentRetired && fresh.AgentStatus != api.AgentClosed && fresh.AgentStatus != api.AgentExited &&
-		fresh.Delivery.ID == d.ID && fresh.Delivery.Generation == d.Generation && fresh.Delivery.ExecutionEpoch == d.ExecutionEpoch && fresh.Delivery.Current &&
-		fresh.Delivery.Phase == d.Phase && fresh.Delivery.FollowThrough.PendingAction == api.DeliveryFollowThroughActionQueue &&
-		fresh.Delivery.FollowThrough.PendingRequestID == check.RequestID && fresh.Delivery.FollowThrough.TransportOutcome == ""
-	outcome := api.DeliveryFollowThroughOutcomeInvalidated
-	reportText := "pre-dispatch exact lifecycle, phase, or lease revalidation failed; native queue was not called"
-	var queueErr error
-	if revalidated {
-		queueErr = queue(ctx, b, followThroughPrompt(b, d))
-		if queueErr == nil {
-			outcome = api.DeliveryFollowThroughOutcomeAccepted
-			reportText = "native Codex queue accepted the exact-thread prompt; directive consumption remains unconfirmed"
-		} else {
-			outcome = api.DeliveryFollowThroughOutcomeAmbiguous
-			reportText = "native Codex queue returned an error; dispatch may or may not have occurred"
+	for _, coverage := range coverageList.Actions {
+		p.FollowThroughStatus = coverage.Status
+		if coverage.Status != "covered" || coverage.Delivery == nil {
+			continue
 		}
+		d := *coverage.Delivery
+		check := api.DeliveryFollowThroughCheckRequest{
+			RequestID: followThroughRequestID(d), AgentID: b.Agent, RunID: b.Run,
+			ExpectedGeneration: d.Generation, ExpectedEpoch: d.ExecutionEpoch,
+			Observation: api.DeliveryRuntimeObservation{State: api.DeliveryObservationUnknown, Source: "codex_queue_only", ObservedAt: now},
+		}
+		decision, checkErr := c.CheckDeliveryFollowThrough(ctx, b.Task, d.ID, check)
+		if checkErr != nil {
+			return false, checkErr
+		}
+		if !decision.Execute || decision.Action != api.DeliveryFollowThroughActionQueue {
+			continue
+		}
+		// Re-read the exact enrolled binding immediately before the external call.
+		// The hub lease and this read cannot make the later Codex subprocess atomic;
+		// a narrow check-to-dispatch window remains and is reported honestly.
+		fresh, revalidateErr := c.DeliveryCoverageForResponsibility(ctx, b.Task, b.Agent, b.Run, d.ItemID, d.ActionKey)
+		if revalidateErr != nil {
+			return true, revalidateErr
+		}
+		revalidated := fresh.Status == "covered" && fresh.Delivery != nil &&
+			fresh.AgentStatus != api.AgentRetired && fresh.AgentStatus != api.AgentClosed && fresh.AgentStatus != api.AgentExited &&
+			fresh.Delivery.ID == d.ID && fresh.Delivery.Generation == d.Generation && fresh.Delivery.ExecutionEpoch == d.ExecutionEpoch && fresh.Delivery.Current &&
+			fresh.Delivery.Phase == d.Phase && fresh.Delivery.FollowThrough.PendingAction == api.DeliveryFollowThroughActionQueue &&
+			fresh.Delivery.FollowThrough.PendingRequestID == check.RequestID && fresh.Delivery.FollowThrough.TransportOutcome == ""
+		outcome := api.DeliveryFollowThroughOutcomeInvalidated
+		reportText := "pre-dispatch exact lifecycle, phase, or lease revalidation failed; native queue was not called"
+		var queueErr error
+		if revalidated {
+			queueErr = queue(ctx, b, followThroughPrompt(b, d))
+			if queueErr == nil {
+				outcome = api.DeliveryFollowThroughOutcomeAccepted
+				reportText = "native Codex queue accepted the exact-thread prompt; directive consumption remains unconfirmed"
+			} else {
+				outcome = api.DeliveryFollowThroughOutcomeAmbiguous
+				reportText = "native Codex queue returned an error; dispatch may or may not have occurred"
+			}
+		}
+		reportHash := sha256.Sum256([]byte(check.RequestID + ":" + outcome))
+		report := api.DeliveryFollowThroughReportRequest{
+			RequestID: fmt.Sprintf("followthrough-report-%x", reportHash[:12]), AgentID: b.Agent, RunID: b.Run,
+			ExpectedGeneration: d.Generation, ExpectedEpoch: d.ExecutionEpoch, LeaseRequestID: check.RequestID,
+			Outcome: outcome, Text: reportText,
+		}
+		p.PendingFollowThroughDelivery, p.PendingFollowThroughReport = d.ID, &report
+		if _, err = c.ReportDeliveryFollowThrough(ctx, b.Task, d.ID, report); err != nil {
+			return revalidated, err
+		}
+		p.PendingFollowThroughDelivery, p.PendingFollowThroughReport = "", nil
+		if queueErr != nil {
+			return revalidated, queueErr
+		}
+		return revalidated, nil
 	}
-	reportHash := sha256.Sum256([]byte(check.RequestID + ":" + outcome))
-	report := api.DeliveryFollowThroughReportRequest{
-		RequestID: fmt.Sprintf("followthrough-report-%x", reportHash[:12]), AgentID: b.Agent, RunID: b.Run,
-		ExpectedGeneration: d.Generation, ExpectedEpoch: d.ExecutionEpoch, LeaseRequestID: check.RequestID,
-		Outcome: outcome, Text: reportText,
-	}
-	p.PendingFollowThroughDelivery, p.PendingFollowThroughReport = d.ID, &report
-	if _, err = c.ReportDeliveryFollowThrough(ctx, b.Task, d.ID, report); err != nil {
-		return revalidated, err
-	}
-	p.PendingFollowThroughDelivery, p.PendingFollowThroughReport = "", nil
-	if queueErr != nil {
-		return revalidated, queueErr
-	}
-	return revalidated, nil
+	return false, nil
 }
 func nativeQueue(ctx context.Context, b runtimeBinding, prompt string) error {
 	command := exec.CommandContext(ctx, b.Codex, "queue", "--thread", b.Thread, "--message", prompt)

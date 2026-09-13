@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/scs32/tailterm/hub/internal/api"
 	"github.com/scs32/tailterm/hub/internal/server"
@@ -129,6 +130,28 @@ func TestDeliveryCLIHTTPStoreRoundTrip(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("current CLI progress failed: %v", err)
 	}
+	current, err = st.CurrentAssignment(ctx, task.ID, worker.ID, worker.RunID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	incidentReq := api.DeliveryRecoveryIncidentRequest{RequestID: "cli-causal-incident", AgentID: lead.ID, RunID: lead.RunID,
+		ExpectedGeneration: current.Generation, ExpectedEpoch: current.ExecutionEpoch, CauseStatus: api.DeliveryCauseEstablished,
+		LastSubstantiveAction: "recorded current progress", LastSubstantiveAt: time.Now().UTC().Add(-time.Second),
+		ExpectedNextAction: "continue exact action", StopReason: "synthetic unexpected pause",
+		CausalEvidence: []string{"no later substantive event was recorded"}, ContributingConditions: []string{"synthetic turn ended"},
+		Prevention: api.DeliveryPreventionAction{OwnerAgentID: lead.ID, OwnerRunID: lead.RunID, WorkOrderMessage: orderRef, VerificationCriterion: "exact action continues or escalates durably"}}
+	incidentRaw, err := json.Marshal(incidentReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	incidentPath := filepath.Join(t.TempDir(), "incident.json")
+	if err = os.WriteFile(incidentPath, incidentRaw, 0600); err != nil {
+		t.Fatal(err)
+	}
+	out, err = captureCLIOutput(t, func() error { return cmdDelivery(leadEnv, []string{"incident", "--file", incidentPath, current.ID}) })
+	if err != nil || !strings.Contains(out, "cause=established") || !strings.Contains(out, "incident dinc_") {
+		t.Fatalf("delivery incident output=%q err=%v", out, err)
+	}
 }
 
 func TestDeliveryCLIFailsClosedOnOldHub(t *testing.T) {
@@ -181,5 +204,39 @@ func TestDeliveryCLIV2EnrollmentFailsClosedOnV1Hub(t *testing.T) {
 	err = cmdDelivery(e, []string{"create", "--file", path})
 	if err == nil || !strings.Contains(err.Error(), "version 2") || actions != 0 {
 		t.Fatalf("v2 enrollment was not fail-closed on v1 hub: err=%v actions=%d", err, actions)
+	}
+}
+
+func TestDeliveryCLIV3EnrollmentFailsClosedOnV2Hub(t *testing.T) {
+	actions := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.URL.Path == "/v1/capabilities" {
+			caps := api.CurrentCapabilities()
+			caps.ReliableDelivery.Versions = []int{api.ReliableDeliveryCapabilityVersion, api.ReliableFollowThroughCapabilityVersion}
+			_ = json.NewEncoder(w).Encode(caps)
+			return
+		}
+		actions++
+		http.Error(w, "unsafe v3 enrollment reached v2 hub", 500)
+	}))
+	defer srv.Close()
+	req := api.CreateRequiredDeliveryRequest{RequestID: "v3-old-hub", EnrollmentVersion: api.ReliableMandatoryActionCapabilityVersion}
+	raw, err := json.Marshal(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(t.TempDir(), "mandatory-action.json")
+	if err = os.WriteFile(path, raw, 0600); err != nil {
+		t.Fatal(err)
+	}
+	e := env{hub: srv.URL, task: "tsk_0000000000000001", agent: "agt_0000000000000001", runID: "run_0000000000000001"}
+	err = cmdDelivery(e, []string{"create", "--file", path})
+	if err == nil || !strings.Contains(err.Error(), "version 3") || actions != 0 {
+		t.Fatalf("v3 enrollment was not fail-closed on v2 hub: err=%v actions=%d", err, actions)
+	}
+	err = cmdCurrentAssignment(e, []string{"--item", "wi_0000000000000001", "--action-key", "shared-action"})
+	if err == nil || !strings.Contains(err.Error(), "version 3") || actions != 0 {
+		t.Fatalf("v3 action selection was not fail-closed on v2 hub: err=%v actions=%d", err, actions)
 	}
 }

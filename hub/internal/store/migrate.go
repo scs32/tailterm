@@ -325,6 +325,9 @@ CREATE INDEX IF NOT EXISTS agent_allocation_intents_item ON agent_allocation_int
 func migrateDeliveryFollowThrough(db *sql.DB) error {
 	for _, column := range []struct{ name, definition string }{
 		{"governing_order_task_id", "TEXT NOT NULL DEFAULT ''"},
+		{"recipient_kind", "TEXT NOT NULL DEFAULT 'item_worker'"},
+		{"action_key", "TEXT NOT NULL DEFAULT 'primary'"},
+		{"action_class", "TEXT NOT NULL DEFAULT 'execution'"},
 		{"governing_order_message_seq", "INTEGER NOT NULL DEFAULT 0"},
 		{"instruction_sha256", "TEXT NOT NULL DEFAULT ''"},
 		{"instruction_bytes", "INTEGER NOT NULL DEFAULT 0"},
@@ -357,5 +360,33 @@ func migrateDeliveryFollowThrough(db *sql.DB) error {
 			}
 		}
 	}
-	return nil
+	_, err := db.Exec(`DROP INDEX IF EXISTS required_deliveries_one_current;
+CREATE UNIQUE INDEX required_deliveries_one_current
+  ON required_deliveries(task_id,item_task_id,item_id,agent_id,run_id,recipient_kind,action_key) WHERE current=1;
+CREATE TABLE IF NOT EXISTS delivery_recovery_incidents (
+  id TEXT PRIMARY KEY,
+  delivery_id TEXT NOT NULL REFERENCES required_deliveries(id),
+  generation INTEGER NOT NULL,
+  execution_epoch INTEGER NOT NULL,
+  cause_status TEXT NOT NULL,
+  last_substantive_action TEXT NOT NULL,
+  last_substantive_at TEXT NOT NULL,
+  expected_next_action TEXT NOT NULL,
+  stop_reason TEXT NOT NULL,
+  causal_evidence TEXT NOT NULL,
+  contributing_conditions TEXT NOT NULL,
+  unresolved_questions TEXT NOT NULL,
+  prevention_owner_agent_id TEXT NOT NULL,
+  prevention_owner_run_id TEXT NOT NULL,
+  prevention_work_order_task_id TEXT NOT NULL,
+  prevention_work_order_message_seq INTEGER NOT NULL,
+  prevention_verification_criterion TEXT NOT NULL,
+  prior_incident_id TEXT NOT NULL DEFAULT '',
+  prior_control_failure TEXT NOT NULL DEFAULT '',
+  recorded_by_agent_id TEXT NOT NULL,
+  recorded_by_run_id TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS delivery_recovery_incidents_delivery ON delivery_recovery_incidents(delivery_id,created_at,id);`)
+	return err
 }

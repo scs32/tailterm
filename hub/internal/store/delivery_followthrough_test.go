@@ -31,6 +31,47 @@ func enrolledDirective(t *testing.T, f deliveryFixture, key string) api.Delivery
 	return out
 }
 
+func enrolledMandatoryAction(t *testing.T, f deliveryFixture, recipient api.Agent, recipientKind, actionClass, key string) api.DeliveryMutation {
+	t.Helper()
+	governing := contextLinkedMessage(t, f.s, f.task, f.item, "Governing mandatory action order", key+"-order", nil)
+	governingRef := api.MessageReference{TaskID: f.task.ID, Seq: governing.Seq}
+	text := "Execute exact mandatory action " + key
+	message := contextLinkedMessage(t, f.s, f.task, f.item, text, key+"-message", &governingRef)
+	bytes, digest := instructionEvidence(text)
+	out, err := f.s.CreateRequiredDelivery(context.Background(), f.task.ID, api.CreateRequiredDeliveryRequest{
+		RequestID: key, MessageSeq: message.Seq, Kind: api.DeliveryAssignment,
+		RecipientKind: recipientKind, ActionKey: key, ActionClass: actionClass,
+		AgentID: recipient.ID, RunID: recipient.RunID, ItemTaskID: f.item.TaskID, ItemID: f.item.ID,
+		ItemRevision: f.item.Revision, WorkOrderMessage: api.MessageReference{TaskID: f.task.ID, Seq: f.order.Seq},
+		GoverningOrderMessage: governingRef, InstructionSHA256: digest, InstructionBytes: bytes,
+		EnrollmentVersion: api.ReliableMandatoryActionCapabilityVersion,
+		ProducerAgentID:   f.lead.ID, ProducerRunID: f.lead.RunID,
+	}, f.by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return out
+}
+
+func recoveryIncidentRequest(f deliveryFixture, d api.RequiredDelivery, key, causeStatus string, lastAt time.Time) api.DeliveryRecoveryIncidentRequest {
+	request := api.DeliveryRecoveryIncidentRequest{
+		RequestID: key, AgentID: f.lead.ID, RunID: f.lead.RunID,
+		ExpectedGeneration: d.Generation, ExpectedEpoch: d.ExecutionEpoch, CauseStatus: causeStatus,
+		LastSubstantiveAction: "saved the exact mandatory action", LastSubstantiveAt: lastAt,
+		ExpectedNextAction: "execute the mandatory action", StopReason: "execution stopped after the action was saved",
+		ContributingConditions: []string{"the conversation turn ended while the action remained open"},
+		Prevention: api.DeliveryPreventionAction{OwnerAgentID: f.lead.ID, OwnerRunID: f.lead.RunID,
+			WorkOrderMessage:      api.MessageReference{TaskID: f.task.ID, Seq: f.order.Seq},
+			VerificationCriterion: "the exact action continues once or reaches a durable escalation"},
+	}
+	if causeStatus == api.DeliveryCauseEstablished {
+		request.CausalEvidence = []string{"the saved action has no later ack, progress, block, or result event"}
+	} else {
+		request.UnresolvedQuestions = []string{"why the exact run ended before executing the saved action"}
+	}
+	return request
+}
+
 func followThroughCheck(f deliveryFixture, d api.RequiredDelivery, key string, observed time.Time, state string) api.DeliveryFollowThroughCheckRequest {
 	return api.DeliveryFollowThroughCheckRequest{
 		RequestID: key, AgentID: f.worker.ID, RunID: f.worker.RunID,
@@ -79,6 +120,222 @@ func TestDeliveryCoverageRequiresExactFullInstructionEnrollment(t *testing.T) {
 	coverage, err = f.s.DeliveryCoverage(ctx, f.task.ID, f.worker.ID, f.worker.RunID)
 	if err != nil || coverage.Status != "covered" || coverage.Delivery == nil || coverage.Delivery.ID != created.Delivery.ID || coverage.Delivery.InstructionSHA256 != digest || coverage.Delivery.GoverningOrderMessage != governingRef {
 		t.Fatalf("verified enrollment coverage: %+v %v", coverage, err)
+	}
+}
+
+func TestMandatoryActionEnrollmentCoversExactSharedRoles(t *testing.T) {
+	f := newDeliveryFixture(t)
+	ctx := context.Background()
+	handler, err := f.s.AddAgent(ctx, f.task.ID, api.AddAgentRequest{AgentID: api.NewID("agt"), Name: "database", Host: "fixture", Session: "database", Runtime: "codex", Role: api.AgentRoleDatabaseHandler}, f.by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	leadAction := enrolledMandatoryAction(t, f, f.lead, api.DeliveryRecipientProjectLead, api.DeliveryActionIndependentDispatch, "dispatch-ready-independent")
+	handlerAction := enrolledMandatoryAction(t, f, handler, api.DeliveryRecipientDatabaseHandler, api.DeliveryActionDatabaseOperation, "perform-release-preflight")
+	for _, tc := range []struct {
+		agent api.Agent
+		want  api.RequiredDelivery
+	}{
+		{f.lead, leadAction.Delivery}, {handler, handlerAction.Delivery},
+	} {
+		coverage, coverageErr := f.s.DeliveryCoverage(ctx, f.task.ID, tc.agent.ID, tc.agent.RunID)
+		if coverageErr != nil || coverage.Status != "covered" || coverage.Delivery == nil || coverage.Delivery.ID != tc.want.ID || coverage.ContextDigest == "" || coverage.Delivery.ActionKey == "" {
+			t.Fatalf("shared-role coverage: %+v %v", coverage, coverageErr)
+		}
+		current, currentErr := f.s.CurrentAssignment(ctx, f.task.ID, tc.agent.ID, tc.agent.RunID)
+		if currentErr != nil || current.ID != tc.want.ID || current.RecipientKind != tc.want.RecipientKind || current.ActionClass != tc.want.ActionClass {
+			t.Fatalf("shared-role current action: %+v %v", current, currentErr)
+		}
+	}
+	if _, err = f.s.db.Exec(`UPDATE tasks SET orchestrator='replacement' WHERE id=?`, f.task.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = f.s.CurrentAssignment(ctx, f.task.ID, f.lead.ID, f.lead.RunID); !errors.Is(err, api.ErrConflict) {
+		t.Fatalf("obsolete lead role must not retain the action: %v", err)
+	}
+}
+
+func TestMandatoryActionSiblingActionsRemainIndependent(t *testing.T) {
+	f := newDeliveryFixture(t)
+	ctx := context.Background()
+	blockedAction := enrolledMandatoryAction(t, f, f.lead, api.DeliveryRecipientProjectLead, api.DeliveryActionExecution, "release-waiting-on-dependency")
+	executableAction := enrolledMandatoryAction(t, f, f.lead, api.DeliveryRecipientProjectLead, api.DeliveryActionIndependentDispatch, "dispatch-independent-work")
+	if blockedAction.Delivery.Generation == executableAction.Delivery.Generation {
+		t.Fatal("sibling actions must retain distinct durable generations")
+	}
+	if _, err := f.s.CurrentAssignment(ctx, f.task.ID, f.lead.ID, f.lead.RunID); !errors.Is(err, api.ErrConflict) {
+		t.Fatalf("ambiguous shared-role assignment must require an exact action key: %v", err)
+	}
+	if _, err := f.s.AcknowledgeDelivery(ctx, f.task.ID, blockedAction.Delivery.ID, api.DeliveryActionRequest{RequestID: "ack-blocked-sibling", AgentID: f.lead.ID, RunID: f.lead.RunID, ExpectedEpoch: 1}, f.by); err != nil {
+		t.Fatal(err)
+	}
+	blocked, err := f.s.BlockDelivery(ctx, f.task.ID, blockedAction.Delivery.ID, api.DeliveryBlockRequest{RequestID: "block-sibling", AgentID: f.lead.ID, RunID: f.lead.RunID, ExpectedEpoch: 1, ReasonClass: "dependency", Text: "planned external gate"}, f.by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = f.s.AcknowledgeDelivery(ctx, f.task.ID, executableAction.Delivery.ID, api.DeliveryActionRequest{RequestID: "ack-executable-sibling", AgentID: f.lead.ID, RunID: f.lead.RunID, ExpectedEpoch: 1}, f.by); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = f.s.ProgressDelivery(ctx, f.task.ID, executableAction.Delivery.ID, api.DeliveryActionRequest{RequestID: "progress-executable-sibling", AgentID: f.lead.ID, RunID: f.lead.RunID, ExpectedEpoch: 1, Text: "independent dispatch is executing"}, f.by); err != nil {
+		t.Fatal(err)
+	}
+	coverages, err := f.s.DeliveryCoverages(ctx, f.task.ID, f.lead.ID, f.lead.RunID)
+	if err != nil || len(coverages.Actions) != 2 {
+		t.Fatalf("two independently covered actions: %+v %v", coverages, err)
+	}
+	selected, err := f.s.CurrentAssignmentForAction(ctx, f.task.ID, f.lead.ID, f.lead.RunID, executableAction.Delivery.ActionKey)
+	if err != nil || selected.ID != executableAction.Delivery.ID || selected.Phase != api.DeliveryProgressing {
+		t.Fatalf("exact executable sibling selection: %+v %v", selected, err)
+	}
+	stillBlocked, err := f.s.CurrentAssignmentForAction(ctx, f.task.ID, f.lead.ID, f.lead.RunID, blockedAction.Delivery.ActionKey)
+	if err != nil || stillBlocked.ID != blockedAction.Delivery.ID || stillBlocked.Phase != api.DeliveryBlocked {
+		t.Fatalf("progress on sibling must not satisfy blocked action: %+v %v", stillBlocked, err)
+	}
+	resolved, err := f.s.ResolveDeliveryBlock(ctx, f.task.ID, blockedAction.Delivery.ID, blocked.Block.ID, api.DeliveryResolutionRequest{RequestID: "resolve-blocked-sibling", AgentID: f.lead.ID, RunID: f.lead.RunID, ExpectedEpoch: 1, Text: "planned dependency resolved"}, f.by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resume := api.DeliveryResumeRequest{RequestID: "resume-blocked-sibling", AgentID: f.lead.ID, RunID: f.lead.RunID, ExpectedEpoch: 1, ResolutionID: resolved.Block.ResolutionID}
+	resumed, err := f.s.ResumeDelivery(ctx, f.task.ID, blockedAction.Delivery.ID, resume, f.by)
+	if err != nil || resumed.Delivery.ExecutionEpoch != 2 {
+		t.Fatalf("only the resolved sibling resumes: %+v %v", resumed, err)
+	}
+	replayed, err := f.s.ResumeDelivery(ctx, f.task.ID, blockedAction.Delivery.ID, resume, f.by)
+	if err != nil || !replayed.Replay || replayed.Receipt.ID != resumed.Receipt.ID {
+		t.Fatalf("exact resume retry must be stable and one-time: %+v %v", replayed, err)
+	}
+	selected, err = f.s.CurrentAssignmentForAction(ctx, f.task.ID, f.lead.ID, f.lead.RunID, executableAction.Delivery.ActionKey)
+	if err != nil || selected.Phase != api.DeliveryProgressing || selected.ExecutionEpoch != 1 {
+		t.Fatalf("resuming blocked action mutated executable sibling: %+v %v", selected, err)
+	}
+}
+
+func TestMandatoryActionUnknownPauseEscalatesUntilCausalPreventionRecord(t *testing.T) {
+	f := newDeliveryFixture(t)
+	ctx := context.Background()
+	now := time.Date(2026, 9, 13, 23, 30, 0, 0, time.UTC)
+	f.s.now = func() time.Time { return now }
+	d := enrolledMandatoryAction(t, f, f.lead, api.DeliveryRecipientProjectLead, api.DeliveryActionIndependentDispatch, "causal-before-resume")
+	now = now.Add(121 * time.Second)
+	check := api.DeliveryFollowThroughCheckRequest{RequestID: "cause-required-check", AgentID: f.lead.ID, RunID: f.lead.RunID,
+		ExpectedGeneration: d.Delivery.Generation, ExpectedEpoch: d.Delivery.ExecutionEpoch,
+		Observation: api.DeliveryRuntimeObservation{State: api.DeliveryObservationUnknown, Source: "synthetic-turn-end", ObservedAt: now}}
+	escalated, err := f.s.CheckDeliveryFollowThrough(ctx, f.task.ID, d.Delivery.ID, check, f.by)
+	if err != nil || escalated.Execute || escalated.Classification != api.DeliveryFollowThroughEscalated || escalated.Event == nil || escalated.Event.Data["classification"] != api.DeliveryFollowThroughCauseRequired {
+		t.Fatalf("unknown pause must durably escalate without restart: %+v %v", escalated, err)
+	}
+	incomplete := recoveryIncidentRequest(f, d.Delivery, "incident-missing-prevention", api.DeliveryCauseEstablished, now.Add(-121*time.Second))
+	incomplete.Prevention.VerificationCriterion = ""
+	if _, err = f.s.RecordDeliveryRecoveryIncident(ctx, f.task.ID, d.Delivery.ID, incomplete, f.by); !errors.Is(err, api.ErrInvalid) {
+		t.Fatalf("incident without bounded prevention criterion must be invalid: %v", err)
+	}
+	unknown := recoveryIncidentRequest(f, d.Delivery, "incident-diagnosing", api.DeliveryCauseUnknown, now.Add(-121*time.Second))
+	diagnosing, err := f.s.RecordDeliveryRecoveryIncident(ctx, f.task.ID, d.Delivery.ID, unknown, f.by)
+	if err != nil || diagnosing.Incident.CauseStatus != api.DeliveryCauseUnknown || diagnosing.Delivery.FollowThrough.EscalationMessageSeq == 0 {
+		t.Fatalf("unknown cause remains non-resumable: %+v %v", diagnosing, err)
+	}
+	established := recoveryIncidentRequest(f, d.Delivery, "incident-established", api.DeliveryCauseEstablished, now.Add(-121*time.Second))
+	established.PriorIncidentID = diagnosing.Incident.ID
+	recorded, err := f.s.RecordDeliveryRecoveryIncident(ctx, f.task.ID, d.Delivery.ID, established, f.by)
+	if err != nil || recorded.Incident.CauseStatus != api.DeliveryCauseEstablished || recorded.Delivery.FollowThrough.EscalationMessageSeq != 0 {
+		t.Fatalf("established cause and prevention should unlock bounded continuation: %+v %v", recorded, err)
+	}
+	check.RequestID = "causal-continuation-check"
+	continued, err := f.s.CheckDeliveryFollowThrough(ctx, f.task.ID, d.Delivery.ID, check, f.by)
+	if err != nil || !continued.Execute || continued.Action != api.DeliveryFollowThroughActionQueue || continued.Attempt != 1 {
+		t.Fatalf("causal record should permit one exact continuation: %+v %v", continued, err)
+	}
+	replay, err := f.s.CheckDeliveryFollowThrough(ctx, f.task.ID, d.Delivery.ID, check, f.by)
+	if err != nil || !replay.Replay || replay.Execute {
+		t.Fatalf("continuation retry must not duplicate transport: %+v %v", replay, err)
+	}
+	now = now.Add(time.Second)
+	report := api.DeliveryFollowThroughReportRequest{RequestID: "causal-continuation-report", AgentID: f.lead.ID, RunID: f.lead.RunID,
+		ExpectedGeneration: d.Delivery.Generation, ExpectedEpoch: d.Delivery.ExecutionEpoch, LeaseRequestID: check.RequestID,
+		Outcome: api.DeliveryFollowThroughOutcomeAccepted, Text: "synthetic queue acceptance without substantive execution"}
+	if _, err = f.s.ReportDeliveryFollowThrough(ctx, f.task.ID, d.Delivery.ID, report, f.by); err != nil {
+		t.Fatal(err)
+	}
+	now = now.Add(121 * time.Second)
+	check.RequestID = "causal-recurrence-check"
+	check.Observation.ObservedAt = now
+	recurrence, err := f.s.CheckDeliveryFollowThrough(ctx, f.task.ID, d.Delivery.ID, check, f.by)
+	if err != nil || recurrence.Execute || recurrence.Classification != api.DeliveryFollowThroughEscalated || recurrence.Event == nil || recurrence.Event.Data["classification"] != api.DeliveryFollowThroughCauseRequired {
+		t.Fatalf("accepted wake without progress is a new cause-gated recurrence: %+v %v", recurrence, err)
+	}
+	secondIncident := recoveryIncidentRequest(f, d.Delivery, "incident-recurrence", api.DeliveryCauseEstablished, now.Add(-time.Second))
+	secondIncident.PriorIncidentID = recorded.Incident.ID
+	missingFailure := secondIncident
+	missingFailure.RequestID = "incident-recurrence-missing-control-failure"
+	if _, err = f.s.RecordDeliveryRecoveryIncident(ctx, f.task.ID, d.Delivery.ID, missingFailure, f.by); !errors.Is(err, api.ErrConflict) {
+		t.Fatalf("recurrence without prior-control failure explanation must conflict: %v", err)
+	}
+	secondIncident.PriorControlFailure = "the first control delivered a queue wake but did not require substantive execution evidence"
+	if _, err = f.s.RecordDeliveryRecoveryIncident(ctx, f.task.ID, d.Delivery.ID, secondIncident, f.by); err != nil {
+		t.Fatal(err)
+	}
+	check.RequestID = "causal-recurrence-continuation"
+	secondContinuation, err := f.s.CheckDeliveryFollowThrough(ctx, f.task.ID, d.Delivery.ID, check, f.by)
+	if err != nil || !secondContinuation.Execute || secondContinuation.Attempt != 2 {
+		t.Fatalf("linked recurrence record permits only the next bounded attempt: %+v %v", secondContinuation, err)
+	}
+}
+
+func TestMandatoryActionUnexpectedBlockNeedsIncidentButDependencyResumeDoesNot(t *testing.T) {
+	for _, tc := range []struct {
+		reason        string
+		needsIncident bool
+		delayResume   bool
+	}{
+		{reason: "transient", needsIncident: true},
+		{reason: "dependency", needsIncident: false},
+		{reason: "dependency", needsIncident: true, delayResume: true},
+	} {
+		name := tc.reason
+		if tc.delayResume {
+			name += "-delayed"
+		}
+		t.Run(name, func(t *testing.T) {
+			f := newDeliveryFixture(t)
+			ctx := context.Background()
+			now := time.Date(2026, 9, 14, 0, 0, 0, 0, time.UTC)
+			f.s.now = func() time.Time { return now }
+			d := enrolledMandatoryAction(t, f, f.worker, api.DeliveryRecipientItemWorker, api.DeliveryActionExecution, "block-"+tc.reason)
+			if _, err := f.s.AcknowledgeDelivery(ctx, f.task.ID, d.Delivery.ID, api.DeliveryActionRequest{RequestID: "ack-" + tc.reason, AgentID: f.worker.ID, RunID: f.worker.RunID, ExpectedEpoch: 1}, f.by); err != nil {
+				t.Fatal(err)
+			}
+			blocked, err := f.s.BlockDelivery(ctx, f.task.ID, d.Delivery.ID, api.DeliveryBlockRequest{RequestID: "block-" + tc.reason, AgentID: f.worker.ID, RunID: f.worker.RunID, ExpectedEpoch: 1, ReasonClass: tc.reason, Text: "synthetic exact blocker"}, f.by)
+			if err != nil {
+				t.Fatal(err)
+			}
+			resolved, err := f.s.ResolveDeliveryBlock(ctx, f.task.ID, d.Delivery.ID, blocked.Block.ID, api.DeliveryResolutionRequest{RequestID: "resolve-" + tc.reason, AgentID: f.lead.ID, RunID: f.lead.RunID, ExpectedEpoch: 1, Text: "synthetic resolution"}, f.by)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if tc.delayResume {
+				now = now.Add(121 * time.Second)
+			}
+			resume := api.DeliveryResumeRequest{RequestID: "resume-" + tc.reason, AgentID: f.worker.ID, RunID: f.worker.RunID, ExpectedEpoch: 1, ResolutionID: resolved.Block.ResolutionID}
+			resumed, resumeErr := f.s.ResumeDelivery(ctx, f.task.ID, d.Delivery.ID, resume, f.by)
+			if !tc.needsIncident {
+				if resumeErr != nil || resumed.Delivery.ExecutionEpoch != 2 {
+					t.Fatalf("planned dependency should resume exactly: %+v %v", resumed, resumeErr)
+				}
+				return
+			}
+			if !errors.Is(resumeErr, api.ErrConflict) {
+				t.Fatalf("unexpected stop resumed without causal record: %v", resumeErr)
+			}
+			incident := recoveryIncidentRequest(f, d.Delivery, "block-incident-"+tc.reason, api.DeliveryCauseEstablished, now)
+			if _, err = f.s.RecordDeliveryRecoveryIncident(ctx, f.task.ID, d.Delivery.ID, incident, f.by); err != nil {
+				t.Fatal(err)
+			}
+			resume.RequestID = "resume-after-incident-" + tc.reason
+			resumed, resumeErr = f.s.ResumeDelivery(ctx, f.task.ID, d.Delivery.ID, resume, f.by)
+			if resumeErr != nil || resumed.Delivery.ExecutionEpoch != 2 {
+				t.Fatalf("established incident should permit exact resume: %+v %v", resumed, resumeErr)
+			}
+		})
 	}
 }
 
