@@ -146,6 +146,28 @@ function runHandler(plan, directory, modes = {}) {
   };
 }
 
+function validateReceipt(planPath, receiptPath) {
+  const source = `
+import importlib.util, json, pathlib, sys
+spec = importlib.util.spec_from_file_location("preflight", sys.argv[1])
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+try:
+    module.validate_receipt(
+        module.load_plan(pathlib.Path(sys.argv[2])),
+        json.loads(pathlib.Path(sys.argv[3]).read_text()),
+    )
+except module.PreflightFailure as error:
+    print(error.classification)
+    raise SystemExit(2)
+print("valid")
+`;
+  return spawnSync("python3", ["-c", source, worker, planPath, receiptPath], {
+    encoding: "utf8",
+    env: { ...globalThis.process.env, PYTHONDONTWRITEBYTECODE: "1" },
+  });
+}
+
 test("wrong execution host fails before filesystem or database mutation", () => {
   const directory = workspace("wrong-host");
   const source = join(directory, "source.sqlite");
@@ -253,6 +275,32 @@ except module.PreflightFailure as error:
   assert.equal(observed.stdout.trim(), "destination-collision");
   assert.equal(readFileSync(destination, "utf8"), "competing");
   assert.equal(readFileSync(partial, "utf8"), "candidate");
+});
+
+test("receipt consumer rejects incomplete host, source, executable, and mutation evidence", () => {
+  const directory = workspace("receipt-validation");
+  createDatabase(join(directory, "source.sqlite"));
+  const plan = planFor(directory);
+  mkdirSync(plan.allowedBackupRoot);
+  const completed = runHandler(plan, directory);
+  assert.equal(completed.process.status, 0, completed.process.stderr);
+  const receipt = JSON.parse(readFileSync(completed.receiptPath, "utf8"));
+  const mutations = [
+    (value) => (value.sourceEvidence.integrity = "not ok"),
+    (value) => (value.actualHost = "another-host.invalid"),
+    (value) => (value.resolvedExecutable = "relative-python"),
+    (value) => (value.mutationStarted = false),
+    (value) => (value.size = 0),
+  ];
+  for (const [index, mutate] of mutations.entries()) {
+    const tampered = structuredClone(receipt);
+    mutate(tampered);
+    const path = join(directory, `tampered-${index}.json`);
+    writeFileSync(path, JSON.stringify(tampered));
+    const observed = validateReceipt(join(directory, "plan.json"), path);
+    assert.equal(observed.status, 2);
+    assert.equal(observed.stdout.trim(), "verification-failed");
+  }
 });
 
 test("route, hostname, and executable failures retain distinct classifications", () => {

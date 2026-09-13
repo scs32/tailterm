@@ -140,6 +140,8 @@ def validate_plan(plan: Any) -> dict[str, Any]:
     if set(route) != route_fields:
         raise PreflightFailure("invalid-input", "route fields do not match schema v1")
     route_id = _string(route.get("id"), "route.id")
+    if REQUEST_ID_RE.fullmatch(route_id) is None:
+        raise PreflightFailure("invalid-input", "route.id has unsupported characters")
     if route.get("kind") != "ssh":
         raise PreflightFailure("invalid-input", "route.kind must be ssh")
     route_host = _string(route.get("host"), "route.host")
@@ -289,13 +291,19 @@ def _profile_evidence(database: sqlite3.Connection) -> dict[str, dict[str, Any]]
                 f'SELECT {quoted} FROM "{table}" ORDER BY {order}'
             )
         ]
-        payload = json.dumps(
-            rows,
-            sort_keys=True,
-            separators=(",", ":"),
-            ensure_ascii=False,
-            allow_nan=False,
-        ).encode("utf-8")
+        try:
+            payload = json.dumps(
+                rows,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+                allow_nan=False,
+            ).encode("utf-8")
+        except (TypeError, ValueError) as error:
+            raise PreflightFailure(
+                "verification-failed",
+                f"profile table cannot be canonicalized: {table}: {error}",
+            ) from error
         evidence[table] = {
             "rows": len(rows),
             "bytes": len(payload),
@@ -952,19 +960,61 @@ def validate_receipt(plan: Any, receipt: Any) -> dict[str, Any]:
             raise PreflightFailure(
                 "verification-failed", f"handler receipt does not match plan field {field}"
             )
-    source_profiles = receipt.get("sourceEvidence", {}).get("profiles")
-    backup_profiles = receipt.get("backupEvidence", {}).get("profiles")
+    source_evidence = receipt.get("sourceEvidence", {})
+    backup_evidence = receipt.get("backupEvidence", {})
+    source_profiles = source_evidence.get("profiles")
+    backup_profiles = backup_evidence.get("profiles")
+    profile_evidence_valid = isinstance(source_profiles, dict) and all(
+        type(value.get("rows")) is int
+        and value["rows"] >= 0
+        and type(value.get("bytes")) is int
+        and value["bytes"] >= 2
+        and re.fullmatch(r"[0-9a-f]{64}", str(value.get("sha256", ""))) is not None
+        for value in source_profiles.values()
+        if isinstance(value, dict)
+    )
+    if isinstance(source_profiles, dict):
+        profile_evidence_valid = profile_evidence_valid and len(source_profiles) == sum(
+            isinstance(value, dict) for value in source_profiles.values()
+        )
+    success_state_valid = (
+        receipt.get("status") == "success"
+        and receipt.get("classification") == "success"
+        and receipt.get("replay") is False
+        and receipt.get("mutationStarted") is True
+    ) or (
+        receipt.get("status") == "already-satisfied"
+        and receipt.get("classification") == "already-satisfied"
+        and receipt.get("replay") is True
+        and receipt.get("mutationStarted") is False
+        and receipt.get("mutationPreviouslyCompleted") is True
+    )
+    resolved_executable = receipt.get("resolvedExecutable")
     if (
-        receipt.get("backupEvidence", {}).get("integrity") != "ok"
-        or receipt.get("backupEvidence", {}).get("foreignKeyViolations") != 0
+        receipt.get("phase") != "complete"
+        or not success_state_valid
+        or receipt.get("actualHost") != normalized["targetHost"]
+        or not isinstance(resolved_executable, str)
+        or not pathlib.PurePosixPath(resolved_executable).is_absolute()
+        or source_evidence.get("integrity") != "ok"
+        or source_evidence.get("foreignKeyViolations") != 0
+        or backup_evidence.get("integrity") != "ok"
+        or backup_evidence.get("foreignKeyViolations") != 0
         or source_profiles != backup_profiles
         or set(source_profiles or {}) != set(PROFILE_TABLES)
+        or not profile_evidence_valid
         or receipt.get("mode") != "0o600"
-        or not isinstance(receipt.get("uid"), int)
-        or not isinstance(receipt.get("gid"), int)
+        or type(receipt.get("uid")) is not int
+        or type(receipt.get("gid")) is not int
         or receipt.get("uid") != normalized["backupOwner"]["uid"]
         or receipt.get("gid") != normalized["backupOwner"]["gid"]
+        or type(receipt.get("size")) is not int
+        or receipt.get("size") <= 0
         or not re.fullmatch(r"[0-9a-f]{64}", str(receipt.get("sha256", "")))
+        or receipt.get("receiptPath")
+        != str(_receipt_path(pathlib.Path(normalized["backupDestination"])))
+        or not isinstance(receipt.get("completedAt"), str)
+        or not receipt.get("completedAt")
     ):
         raise PreflightFailure(
             "verification-failed", "handler receipt lacks valid backup/profile evidence"
