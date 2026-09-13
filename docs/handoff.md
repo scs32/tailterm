@@ -1,3 +1,12 @@
+# Operational-record candidate — work order #3915
+
+Root isolated candidate on `feat/operational-records-root-3915` adds explicit
+proposed/committed typed operational records. It reuses first-core delivery
+receipts/events, validates exact source/item/scope/run/generation/epoch and
+candidate/test evidence, and separates result submission from authorized
+acceptance. See [contract and limits](operational-records.md). No deployment,
+root branch integration, MCP, automatic GO or backlog sweep is claimed.
+
 # Development handoff — September 10, 2026
 
 ## September 13 reliable directive core candidate

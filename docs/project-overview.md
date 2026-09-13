@@ -1,3 +1,8 @@
+> Operational-record candidate (#3915): explicit typed proposals and committed
+> instruction/finding/candidate/verification/result/acceptance records are
+> implemented in an isolated branch. This is not a production inventory change.
+> [Contract and limits](operational-records.md).
+
 # Project overview
 
 Updated September 13, 2026. Start here for the architecture and product model;
