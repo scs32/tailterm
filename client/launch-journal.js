@@ -217,7 +217,7 @@ export function normalizeTeamLaunchPlans(value) {
         throw new Error("Invalid team launch retry member.");
     }
     if (bytes(plan) > MAX_TEAM_LAUNCH_PLAN_BYTES)
-      throw new Error("A team launch retry plan exceeds 768 KiB.");
+      throw new Error("A team launch retry plan exceeds 1.25 MiB.");
     return plan;
   });
   if (bytes(plans) > MAX_TEAM_LAUNCH_PLANS_BYTES)

@@ -1,3 +1,62 @@
+# 512 KiB complete-context and bounded-transport candidate — September 13, 2026
+
+Bug `wi_dd57670ee65d974c` revision 3, executable order **#3622**, and exact
+saved Start **#3637** (`que_3d80efd5329575c4` cycle 1/revision 9,
+`qrr_e0ac2e22b18fb420` / event 244) authorize this bounded correction. The
+builder is `agt_1a2c77ff68a8b01d` / `run_356b3eba006407fb`, context digest
+`1a96f46d9e504c63794a0d27c8e1a9d9aa5ac9b396c1524291de7d169ff7934f`.
+Work is isolated on `bug/context-bound-api-r2-mini` from accepted baseline
+`2dadf19abe84e5957f663f782195413ae217616f`; root and other worktrees remain
+unchanged.
+
+The same-item transport supplement **#3662**, delivered in **#3665**, addresses
+the narrower Air SSH-exec boundary without changing SSH or host configuration.
+When the generated command would exceed 64 KiB, the browser uses its existing
+authenticated SFTP session to publish the exact bytes through 32 KiB chunks and
+an atomic mode-0600 temporary file. The destination is bound to the agent and
+SHA-256 digest. The resulting small SSH command rejects a symlink, wrong mode,
+wrong length or wrong digest before calling `tt --work-context-file`; both the
+remote trap and browser cleanup cover success, failure and uncertain-response
+retry. Smaller contexts retain the existing private base64/file path.
+
+The candidate raises the finite complete serialized-context limit to **524,288
+UTF-8 bytes (512 KiB)**. It changes only the shared JavaScript bound and text,
+the launch-journal error for its already-derived **1.25 MiB** per-plan bound,
+the matching Go API bound and derived **3,162,112-byte** registration envelope,
+and the private CLI command-file ceiling to **2,359,296 bytes** (`4 * context +
+256 KiB`). The unresolved-journal aggregate remains 2 MiB. Context schema v1,
+exact source bytes/digests, current item/run/order bindings, retry identities,
+private-file cleanup and all unrelated limits remain unchanged.
+
+Synthetic verification passes the measured 269,315-byte case, exact 524,288
+bytes and +1 rejection with three revisions, two or more explicit messages,
+ASCII/CJK/HTML/quote/backslash content, exact journal reload/aggregate failure,
+HTTP/store readback and digest, wrong-run and duplicate rejection, committed
+allocation-intent response loss and unchanged retry, old raw-digest
+immutability, command bound/+1 and success/failure cleanup. Focused JavaScript
+passes 17/17; focused Go server/store/CLI/spawn passes. Chromium and WebKit pass
+the isolated real-hub/private-tmux launch flow with a revision-3 context above
+269,315 bytes, encrypted reload, lost worker response, stable identity, exact
+readback and the partial-folder-only amendment. Mini passes the original
+699,562-byte browser-shaped shell command and the new 2,640-byte staged command.
+Actual Air SFTP plus the staged command passes exact 524,288-byte CJK context,
+mode, byte and digest verification, candidate CLI exact-bound admission, +1
+rejection and cleanup. This clears the initial Air transport finding reported in
+**#3656/#3657**: Air still rejects the old 699,205-byte one-exec shape, while the
+bounded staged shape stays below 64 KiB.
+
+This remains an unreleased candidate pending independent review, handler-saved
+acceptance and the explicitly coordinated rollout. The compatibility order is
+hub → qualified Mini/Air CLI → frontend, with the updated frontend retained
+while oversized journals exist. Old components continue to fail closed at their
+own limits; no identity or journal may be regenerated or truncated. Stage-A
+preparation **#3671** performed no activation. Production remains on the
+deployed 256 KiB release documented below. No root integration, installation,
+deployment, live record/profile/provider fixture, relay, lifecycle or production
+service change is part of this candidate.
+
+---
+
 # Combined Capacity/context release — September 12, 2026
 
 The reviewed combined application **`d64615bac01f72673c921bcfc25a541d073c2f01`**
@@ -171,11 +230,11 @@ Its `manifest.json` lists the **44 combined changed source paths**, **21 context
 delta paths**, exact binary/static hashes and test logs. It is 11,838 bytes,
 SHA-256 `7e7fe52c33458009205ddeaa9cb9768f6d4ed765f3d61a09a4190db04e622207`.
 
-| Artifact | Bytes | SHA-256 |
-| --- | ---: | --- |
+| Artifact                   |      Bytes | SHA-256                                                            |
+| -------------------------- | ---------: | ------------------------------------------------------------------ |
 | `tailterm-hub-linux-amd64` | 27,295,906 | `801f93172221821f1f0788698724d55b92617e4e0eade9667d457643841c58b7` |
-| `tt-darwin-arm64` | 6,731,794 | `908034fcd72a13d65d70750fa46010e4eb3f68fda89c65e1312dcb1b38dc7b91` |
-| `dist-static/release.json` | 14,861 | `c8583c9f99363432fb63f4f405a757ab201173a4380f493daa6c21ae75ba3ae9` |
+| `tt-darwin-arm64`          |  6,731,794 | `908034fcd72a13d65d70750fa46010e4eb3f68fda89c65e1312dcb1b38dc7b91` |
+| `dist-static/release.json` |     14,861 | `c8583c9f99363432fb63f4f405a757ab201173a4380f493daa6c21ae75ba3ae9` |
 
 The retained static package verifies **82 assets** against its clean-source
 release manifest. It reuses the unchanged cached WASM and dependency/license
@@ -292,14 +351,14 @@ This is a coordinated frontend/hub/host-CLI update, with no database migration,
 new context schema or rewritten launch journal. Publish/install only under a
 separate release order; this builder has **not deployed or installed** anything.
 
-| Combination | Behavior |
-| --- | --- |
-| Updated frontend, hub and host | Supports complete 256 KiB admission and exact context readback; saved identities survive uncertain retries. |
-| Old frontend with updated backend | Old preparer/journal still reject contexts above 128 KiB. Existing smaller plans remain usable. |
-| Updated frontend/CLI with old hub | Old hub rejects the larger context with its native context-limit error before admitting an identity. Older response serialization can also fail the new host's digest check for HTML-sensitive/whitespace input. Upgrade the hub first. |
-| Updated frontend/hub with old host CLI | Old host command limits and quoting/readback behavior cannot guarantee all newly supported payloads. Upgrade each launch host before enabling larger launches; a frontend update does not update hosts. |
-| Updated frontend reading an old frozen plan | Preserves its full string and member identity; recognizes current and historical exact digest encodings. Does not rebuild source history on retry. |
-| Old frontend reading a new large plan | Rejects unsupported context/plan size. Retain the updated frontend while these unresolved journals exist; do not discard them to enable rollback. |
+| Combination                                 | Behavior                                                                                                                                                                                                                                |
+| ------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Updated frontend, hub and host              | Supports complete 256 KiB admission and exact context readback; saved identities survive uncertain retries.                                                                                                                             |
+| Old frontend with updated backend           | Old preparer/journal still reject contexts above 128 KiB. Existing smaller plans remain usable.                                                                                                                                         |
+| Updated frontend/CLI with old hub           | Old hub rejects the larger context with its native context-limit error before admitting an identity. Older response serialization can also fail the new host's digest check for HTML-sensitive/whitespace input. Upgrade the hub first. |
+| Updated frontend/hub with old host CLI      | Old host command limits and quoting/readback behavior cannot guarantee all newly supported payloads. Upgrade each launch host before enabling larger launches; a frontend update does not update hosts.                                 |
+| Updated frontend reading an old frozen plan | Preserves its full string and member identity; recognizes current and historical exact digest encodings. Does not rebuild source history on retry.                                                                                      |
+| Old frontend reading a new large plan       | Rejects unsupported context/plan size. Retain the updated frontend while these unresolved journals exist; do not discard them to enable rollback.                                                                                       |
 
 Old binaries can read retained additive data, but rolling back the hub restores
 its old admission limit; rolling back hosts reintroduces their command limits.

@@ -4,7 +4,7 @@ import { createServer } from "node:http";
 import { once } from "node:events";
 import { spawn, execFile } from "node:child_process";
 import { promisify } from "node:util";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { chmod, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import assert from "node:assert/strict";
@@ -58,7 +58,9 @@ let failLaunch = false,
   taskCreateRequests = 0,
   taskListGate = null,
   execs = 0,
-  historyRequests = 0;
+  historyRequests = 0,
+  sftpWrites = 0,
+  sftpRemoves = 0;
 const html = `<!doctype html><html><head><meta charset="utf-8"><link rel="stylesheet" href="/client/style.css"></head><body><div id="app"><div id="workspace"><aside></aside><main><header><div class="header-right"><button id="tailscale-login"><span class="online"></span>Connected</button></div></header><section class="terminal-shell"></section></main></div><dialog id="dialog"></dialog><div id="notice" hidden></div></div><script type="module">
 import {createTaskHub} from '/client/task-hub.js';
 import {createBoardView} from '/client/board-view.js';
@@ -72,7 +74,8 @@ const savedLocal=await localAPI('/data');
 let board, tasks, modes, teams;const baseAgent=(id,name,serverId,role)=>({id,revision:1,name,launchName:name,role,serverId,runtime:'codex',model:'gpt-5.3-codex',reasoning:'',approvalMode:'on-request',sandboxMode:'workspace-write',permissionMode:'',allowedTools:[],run:"sh -c 'sleep 300' --",cwd:'',prompt:'Inspect the exact bounded assignment.'});const initialAgentCatalog={version:2,definitions:[baseAgent('agent_team_planner','team-planner','', 'Planner'),baseAgent('agent_team_reviewer','team-reviewer','secondary','Reviewer')]};const data={hub:{url:location.origin,token:'synthetic-token'},profile:{username:'synthetic',instanceId:'profile-one'},launchProfiles:[],agentCatalog:JSON.parse(localStorage.getItem('qa-agent-catalog')||JSON.stringify(initialAgentCatalog)),teamsVersion:2,teams:JSON.parse(localStorage.getItem('qa-teams')||'[]'),teamLaunchPlans:savedLocal.teamLaunchPlans,projectHandlerPlans:[]};
 const servers=[{id:'local',name:'Test host',host:'stephens-macbook-air',username:'test',runtimes:['claude'],credentialRevision:1},{id:'secondary',name:'Second host',host:'second-fixture',username:'test',runtimes:['codex'],credentialRevision:1}];let failJournalWrite=false,commandDelay=null,journalDelay=null,lastSavedLaunchPlan=null;
 const model={groups:[],taskGroup:()=>null};
-const host={openSFTP:async server=>({done:new Promise(()=>{}),home:async()=>${JSON.stringify(root)},realpath:async p=>p,list:async p=>({path:p,entries:p===${JSON.stringify(root)}?[{name:'hub',isDir:true},{name:'ignored.txt',isDir:false}]:[]}),close(){}}),getIPN:()=>({fetch:(url,init)=>fetch(url,init)}),getData:()=>data,getServers:()=>servers,launchServerProfile:id=>structuredClone(servers.find(server=>server.id===id)),currentServer:()=>servers[0],currentTab:()=>null,getTabs:()=>[],paneGroups:()=>({model,sync(){}}),render(){},scheduleWorkspaceSave(){},bookmark(){},closeTab(){},connect:async()=>null,confirm:async()=>true,notice:t=>{document.querySelector('#notice').textContent=t},api:async(url,method,body)=>{if(url.startsWith('/team-launch-plans')){if(journalDelay){const gate=journalDelay;gate.entered();await gate.wait;if(journalDelay===gate)journalDelay=null}if(url==='/team-launch-plans'&&method==='POST'&&failJournalWrite){failJournalWrite=false;throw new Error('Synthetic encrypted journal write failure')}const result=await localAPI(url,method,body);data.teamLaunchPlans=(await localAPI('/data')).teamLaunchPlans;if(url==='/team-launch-plans'&&method==='POST')lastSavedLaunchPlan=structuredClone(body);return result}if(url==="/teams"){data.teams=[...data.teams.filter(t=>t.id!==body.id),body];localStorage.setItem('qa-teams',JSON.stringify(data.teams))}if(url.startsWith("/teams/")){data.teams=data.teams.filter(t=>t.id!==url.slice(7));localStorage.setItem('qa-teams',JSON.stringify(data.teams))}if(url==="/launch-profiles")data.launchProfiles=[...data.launchProfiles.filter(p=>p.name!==body.name),body];if(url==="/project-handler-plans"&&method==="POST")data.projectHandlerPlans=[...data.projectHandlerPlans.filter(p=>p.hub!==body.hub||p.taskId!==body.taskId),structuredClone(body)];return {sessions:[]}},reloadData:async()=>{data.teamLaunchPlans=(await localAPI('/data')).teamLaunchPlans},
+const openSFTP=async server=>({done:new Promise(()=>{}),home:async()=>${JSON.stringify(root)},realpath:async p=>p,list:async p=>({path:p,entries:p===${JSON.stringify(root)}?[{name:'hub',isDir:true},{name:'ignored.txt',isDir:false}]:[]}),write:async(remote,{size,readChunk,progress})=>{const chunks=[];for(let offset=0;offset<size;){const length=Math.min(32*1024,size-offset),chunk=await readChunk(offset,length);if(!(chunk instanceof Uint8Array)||chunk.byteLength!==length)throw new Error('invalid synthetic SFTP chunk');chunks.push(chunk);offset+=length;progress?.(offset)}const response=await fetch('/qa/sftp/write?path='+encodeURIComponent(remote),{method:'POST',body:new Blob(chunks)});if(!response.ok)throw new Error(await response.text())},remove:async remote=>{const response=await fetch('/qa/sftp/remove?path='+encodeURIComponent(remote),{method:'POST'});if(!response.ok)throw new Error(await response.text())},close(){}});
+const host={openSFTP,getIPN:()=>({fetch:(url,init)=>fetch(url,init)}),getData:()=>data,getServers:()=>servers,launchServerProfile:id=>structuredClone(servers.find(server=>server.id===id)),currentServer:()=>servers[0],currentTab:()=>null,getTabs:()=>[],paneGroups:()=>({model,sync(){}}),render(){},scheduleWorkspaceSave(){},bookmark(){},closeTab(){},connect:async()=>null,confirm:async()=>true,notice:t=>{document.querySelector('#notice').textContent=t},api:async(url,method,body)=>{if(url.startsWith('/team-launch-plans')){if(journalDelay){const gate=journalDelay;gate.entered();await gate.wait;if(journalDelay===gate)journalDelay=null}if(url==='/team-launch-plans'&&method==='POST'&&failJournalWrite){failJournalWrite=false;throw new Error('Synthetic encrypted journal write failure')}const result=await localAPI(url,method,body);data.teamLaunchPlans=(await localAPI('/data')).teamLaunchPlans;if(url==='/team-launch-plans'&&method==='POST')lastSavedLaunchPlan=structuredClone(body);return result}if(url==="/teams"){data.teams=[...data.teams.filter(t=>t.id!==body.id),body];localStorage.setItem('qa-teams',JSON.stringify(data.teams))}if(url.startsWith("/teams/")){data.teams=data.teams.filter(t=>t.id!==url.slice(7));localStorage.setItem('qa-teams',JSON.stringify(data.teams))}if(url==="/launch-profiles")data.launchProfiles=[...data.launchProfiles.filter(p=>p.name!==body.name),body];if(url==="/project-handler-plans"&&method==="POST")data.projectHandlerPlans=[...data.projectHandlerPlans.filter(p=>p.hub!==body.hub||p.taskId!==body.taskId),structuredClone(body)];return {sessions:[]}},reloadData:async()=>{data.teamLaunchPlans=(await localAPI('/data')).teamLaunchPlans},
  dialog:(title,body)=>{const d=document.querySelector('#dialog');if(d.open)d.close();d.innerHTML='<div class="dialog-head"><h2>'+title+'</h2><button id="dialog-close">×</button></div>'+body;d.querySelector('#dialog-close').onclick=()=>host.closeDialog();d.showModal()},
  closeDialog:()=>{const d=document.querySelector('#dialog');d.close();d.replaceChildren()},
  openBoard:id=>{modes.set('board');board.show(id)},
@@ -109,6 +112,44 @@ const server = createServer(async (req, res) => {
     }
     if (req.url === "/qa/lose-launch-reply") {
       loseLaunchAt = execs + 1;
+      res.end("ok");
+      return;
+    }
+    if (req.url === "/qa/sftp/operations") {
+      res.setHeader("content-type", "application/json");
+      res.end(JSON.stringify({ writes: sftpWrites, removes: sftpRemoves }));
+      return;
+    }
+    if (req.url.startsWith("/qa/sftp/write?")) {
+      const remote = new URL(req.url, "http://fixture").searchParams.get(
+        "path",
+      );
+      if (
+        !/^\/tmp\/\.tailterm-work-context-agt_[0-9a-f]{16}-[0-9a-f]{64}\.json$/.test(
+          remote || "",
+        )
+      )
+        throw new Error("invalid synthetic SFTP path");
+      const chunks = [];
+      for await (const chunk of req) chunks.push(chunk);
+      await writeFile(remote, Buffer.concat(chunks), { mode: 0o600 });
+      await chmod(remote, 0o600);
+      sftpWrites++;
+      res.end("ok");
+      return;
+    }
+    if (req.url.startsWith("/qa/sftp/remove?")) {
+      const remote = new URL(req.url, "http://fixture").searchParams.get(
+        "path",
+      );
+      if (
+        !/^\/tmp\/\.tailterm-work-context-agt_[0-9a-f]{16}-[0-9a-f]{64}\.json$/.test(
+          remote || "",
+        )
+      )
+        throw new Error("invalid synthetic SFTP cleanup path");
+      await rm(remote, { force: true });
+      sftpRemoves++;
       res.end("ok");
       return;
     }
@@ -1014,7 +1055,7 @@ try {
         await fetch("http://127.0.0.1:" + port + "/v1/tasks/" + target.id)
       ).json();
       const targetLead = targetBefore.agents.find((agent) => !agent.role);
-      const routedItem = await (
+      let routedItem = await (
         await fetch(
           `http://127.0.0.1:${port}/v1/tasks/${target.id}/work-items`,
           {
@@ -1030,6 +1071,26 @@ try {
           },
         )
       ).json();
+      for (const description of [
+        'Synthetic routed revision two with quote " and slash \\',
+        "Synthetic routed revision three with CJK 界 and HTML <>&",
+      ]) {
+        routedItem = await (
+          await fetch(
+            `http://127.0.0.1:${port}/v1/tasks/${target.id}/work-items/${routedItem.id}`,
+            {
+              method: "PATCH",
+              headers: { "content-type": "application/json" },
+              body: JSON.stringify({
+                revision: routedItem.revision,
+                description,
+                agentId: targetLead.id,
+              }),
+            },
+          )
+        ).json();
+      }
+      assert.equal(routedItem.revision, 3);
       const routedOrder = await (
         await fetch(`http://127.0.0.1:${port}/v1/tasks/${target.id}/messages`, {
           method: "POST",
@@ -1049,9 +1110,9 @@ try {
           }),
         })
       ).json();
-      // wi_7e220de54deaef33/order3022: complete synthetic history above the
-      // old 128 KiB cap, through real browser preparation/host/API admission.
-      for (let index = 0; index < 22; index++) {
+      // wi_dd57670ee65d974c@3/order3622: complete synthetic history above the
+      // measured 269315-byte context, through browser preparation/retry/host/API.
+      for (let index = 0; index < 36; index++) {
         const response = await fetch(
           `http://127.0.0.1:${port}/v1/tasks/${target.id}/messages`,
           {
@@ -1073,14 +1134,23 @@ try {
           },
         );
         assert.equal(response.status, 201);
+        // The isolated hub intentionally rate-limits one synthetic caller.
+        await new Promise((resolve) => setTimeout(resolve, 60));
       }
-      const unrelatedRouteMessage = await (
-        await fetch(`http://127.0.0.1:${port}/v1/tasks/${target.id}/messages`, {
+      const unrelatedRouteResponse = await fetch(
+        `http://127.0.0.1:${port}/v1/tasks/${target.id}/messages`,
+        {
           method: "POST",
           headers: { "content-type": "application/json" },
           body: JSON.stringify({ text: "UNRELATED BROWSER ROUTING HISTORY" }),
-        })
-      ).json();
+        },
+      );
+      const unrelatedRouteMessage = await unrelatedRouteResponse.json();
+      assert.equal(
+        unrelatedRouteResponse.status,
+        201,
+        JSON.stringify(unrelatedRouteMessage),
+      );
       await page.locator("#team-task").selectOption(target.id);
       await page
         .locator("#team-work-item")
@@ -1094,6 +1164,9 @@ try {
         .locator('[data-project-server="secondary"]')
         .fill(badRoutedFolder);
       const routedLaunchStart = execs;
+      const sftpBefore = await (
+        await fetch(origin + "/qa/sftp/operations")
+      ).json();
       const historyBefore = await (
         await fetch(origin + "/qa/history-requests")
       ).json();
@@ -1114,7 +1187,7 @@ try {
         };
       }, target.id);
       assert.equal(uncertainLarge.state, "uncertain");
-      assert.ok(Buffer.byteLength(uncertainLarge.context) > 152973);
+      assert.ok(Buffer.byteLength(uncertainLarge.context) > 269315);
       await page.locator('#team-launch-form button[type="submit"]').click();
       const reconciledLarge = await page.evaluate(async (taskId) => {
         const plan = (await qa.localData()).teamLaunchPlans.find(
@@ -1166,13 +1239,15 @@ try {
         };
         if (
           new TextEncoder().encode(journal.workContextBundle).byteLength <=
-          152973
+          269315
         )
           throw new Error(
             "Synthetic complete browser context did not exceed measured size",
           );
         if (
-          JSON.parse(journal.workContextBundle).history.messages.length !== 23
+          JSON.parse(journal.workContextBundle).history.revisions.length !==
+            3 ||
+          JSON.parse(journal.workContextBundle).history.messages.length !== 37
         )
           throw new Error(
             "Complete synthetic source history was not preserved",
@@ -1367,7 +1442,7 @@ try {
         routedAgents.every(
           (agent) =>
             !agent.parentAgentId &&
-            agent.readUpTo === unrelatedRouteMessage.seq &&
+            agent.readUpTo >= unrelatedRouteMessage.seq &&
             agent.name.endsWith("-" + routedItem.id.slice(-8)),
         ),
         JSON.stringify(routedAgents),
@@ -1384,7 +1459,7 @@ try {
         [
           "Synthetic bounded browser work order",
           ...Array.from(
-            { length: 22 },
+            { length: 36 },
             (_, index) =>
               `<>&界'\\ synthetic-history-${index} ` + "界".repeat(2500),
           ),
@@ -1392,13 +1467,27 @@ try {
       );
       assert.ok(
         launchCommands
-          .slice(-3)
+          .slice(routedLaunchStart)
           .every(
             (command) =>
+              Buffer.byteLength(command) <= 64 * 1024 &&
+              command.includes(".tailterm-work-context-") &&
+              command.includes("tailterm_hash") &&
               command.includes("--work-item") &&
               command.includes(routedItem.id) &&
               command.includes("--work-order-message"),
           ),
+      );
+      const sftpAfter = await (
+        await fetch(origin + "/qa/sftp/operations")
+      ).json();
+      assert.deepEqual(
+        {
+          writes: sftpAfter.writes - sftpBefore.writes,
+          removes: sftpAfter.removes - sftpBefore.removes,
+        },
+        { writes: 4, removes: 4 },
+        "oversized context staging was not exact and cleanup-complete",
       );
       await page.evaluate((definitionId) => {
         qa.editDefinition(definitionId, {

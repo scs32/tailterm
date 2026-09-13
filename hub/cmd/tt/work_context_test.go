@@ -46,7 +46,7 @@ func TestFormatWorkItemContextIsExplicitlyScoped(t *testing.T) {
 }
 
 func TestPreparedWorkContextByteBoundariesAndRestoredDigest(t *testing.T) {
-	for _, size := range []int{152973, api.MaxAgentWorkItemContextBytes, api.MaxAgentWorkItemContextBytes + 1} {
+	for _, size := range []int{269315, api.MaxAgentWorkItemContextBytes, api.MaxAgentWorkItemContextBytes + 1} {
 		overhead := len(`{"source":""}`)
 		count := size - overhead
 		data := []byte(`{"source":"` + strings.Repeat("界", count/3) + strings.Repeat("x", count%3) + `"}`)
@@ -90,7 +90,7 @@ func TestPreparedWorkContextByteBoundariesAndRestoredDigest(t *testing.T) {
 }
 
 func TestWrapCompleteQuotedContextFileBound(t *testing.T) {
-	const limit = 4*api.MaxAgentWorkItemContextBytes + 64*1024
+	const limit = 4*api.MaxAgentWorkItemContextBytes + 256*1024
 	for _, size := range []int{limit, limit + 1} {
 		path := filepath.Join(t.TempDir(), "synthetic-command")
 		data := strings.Repeat("'", size)
@@ -113,9 +113,9 @@ func TestWrapCompleteQuotedContextFileBound(t *testing.T) {
 	}
 }
 
-// wi_7e220de54deaef33/order3022/amendment3126: actual CLI authoring and API admission.
+// wi_dd57670ee65d974c@3/order3622: actual CLI authoring and API admission.
 func TestAllocationIntentContextTransportParity(t *testing.T) {
-	for _, size := range []int{8192, 152973} {
+	for _, size := range []int{269315, api.MaxAgentWorkItemContextBytes} {
 		t.Run(fmt.Sprint(size), func(t *testing.T) {
 			c, task, loseReply := contextIntentFixture(t)
 			lead := spawnLauncherAgent(t, c, task)
@@ -126,9 +126,7 @@ func TestAllocationIntentContextTransportParity(t *testing.T) {
 			}
 			history := bundle["history"].(map[string]any)
 			messages := history["messages"].([]any)
-			for i := 0; i < size/7500+1; i++ {
-				messages = append(messages, map[string]any{"message": map[string]any{"taskId": task, "seq": order + int64(i) + 1, "text": "<>&界 " + strings.Repeat("界", 2500)}})
-			}
+			messages = append(messages, map[string]any{"message": map[string]any{"taskId": task, "seq": order + 1, "text": "ASCII CJK 界 HTML <>& quote \" slash \\"}})
 			history["messages"] = messages
 			raw, err := json.MarshalIndent(bundle, "", "  ")
 			if err != nil {
@@ -137,8 +135,20 @@ func TestAllocationIntentContextTransportParity(t *testing.T) {
 			for encoded, literal := range map[string]string{`\u003c`: "<", `\u003e`: ">", `\u0026`: "&"} {
 				raw = bytes.ReplaceAll(raw, []byte(encoded), []byte(literal))
 			}
-			if len(raw) < size {
-				t.Fatal("fixture below target")
+			if len(raw) > size {
+				t.Fatalf("fixture overhead %d exceeds target %d", len(raw), size)
+			}
+			messages[len(messages)-1].(map[string]any)["message"].(map[string]any)["text"] =
+				messages[len(messages)-1].(map[string]any)["message"].(map[string]any)["text"].(string) + strings.Repeat("x", size-len(raw))
+			raw, err = json.MarshalIndent(bundle, "", "  ")
+			if err != nil {
+				t.Fatal(err)
+			}
+			for encoded, literal := range map[string]string{`\u003c`: "<", `\u003e`: ">", `\u0026`: "&"} {
+				raw = bytes.ReplaceAll(raw, []byte(encoded), []byte(literal))
+			}
+			if len(raw) != size {
+				t.Fatalf("fixture size = %d, want %d", len(raw), size)
 			}
 			path := filepath.Join(t.TempDir(), "synthetic-context.json")
 			if err = os.WriteFile(path, raw, 0600); err != nil {

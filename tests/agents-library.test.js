@@ -9,6 +9,7 @@ import {
 import { teamLaunches } from "../client/teams.js";
 import {
   launchPlanForStorage,
+  MAX_TEAM_LAUNCH_PLAN_BYTES,
   normalizeTeamLaunchPlans,
   restoreLaunchMembers,
   serverLaunchScope,
@@ -18,6 +19,7 @@ import {
   reconciledAgentProblem,
 } from "../client/launch-reconciliation.js";
 import { agentSpawnCommand } from "../shared/tmux-command.js";
+import { MAX_WORK_CONTEXT_BYTES } from "../shared/work-context.js";
 
 const legacyMember = (name, overrides = {}) => ({
   name,
@@ -253,10 +255,19 @@ test("reasoning and independent Codex permission intent reach actual tt argv", (
 });
 
 test("encrypted retry journal is bounded, stores exact machine scope and preserves uncertain identity", async () => {
+  const contextOverhead = Buffer.byteLength(
+    JSON.stringify({
+      version: 1,
+      itemId: "wi_abcdef0123456789",
+      payload: "",
+    }),
+  );
+  const payloadBytes = MAX_WORK_CONTEXT_BYTES - contextOverhead;
   const context = JSON.stringify({
     version: 1,
     itemId: "wi_abcdef0123456789",
-    payload: "\\".repeat(131000),
+    payload:
+      "\\".repeat(Math.floor(payloadBytes / 2)) + "x".repeat(payloadBytes % 2),
   });
   const server = {
     id: "machine-demo-01",
@@ -304,13 +315,15 @@ test("encrypted retry journal is bounded, stores exact machine scope and preserv
     ],
   });
   assert.equal(stored.workContextBundle, context);
-  assert.ok(Buffer.byteLength(context) > 152973);
-  assert.ok(Buffer.byteLength(JSON.stringify(stored)) > 512 * 1024);
-  assert.ok(Buffer.byteLength(JSON.stringify(stored)) < 768 * 1024);
+  assert.equal(Buffer.byteLength(context), MAX_WORK_CONTEXT_BYTES);
+  assert.ok(Buffer.byteLength(JSON.stringify(stored)) > 1024 * 1024);
+  assert.ok(
+    Buffer.byteLength(JSON.stringify(stored)) < MAX_TEAM_LAUNCH_PLAN_BYTES,
+  );
   assert.throws(
     () =>
       normalizeTeamLaunchPlans(
-        Array.from({ length: 4 }, (_, i) => ({
+        Array.from({ length: 2 }, (_, i) => ({
           ...stored,
           id: `aggregate_${i}`,
         })),
@@ -351,12 +364,12 @@ test("encrypted retry journal is bounded, stores exact machine scope and preserv
               agentId: "agt_1111111111111111",
               run: "codex",
               cwd: "/synthetic/project",
-              prompt: "x".repeat(769 * 1024),
+              prompt: "x".repeat(MAX_TEAM_LAUNCH_PLAN_BYTES),
             },
           },
         ],
       }),
-    /768 KiB/,
+    /1\.25 MiB/,
   );
 });
 

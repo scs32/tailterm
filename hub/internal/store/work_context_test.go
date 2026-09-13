@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 
@@ -91,6 +92,77 @@ func contextLinkedMessage(t *testing.T, s *Store, task api.Task, item api.WorkIt
 		t.Fatal(err)
 	}
 	return message
+}
+
+// wi_dd57670ee65d974c@3/order3622: exact 512 KiB complete synthetic history.
+func TestAgentWorkItemContextExactBoundaryReadback(t *testing.T) {
+	ctx := context.Background()
+	s, err := Open(filepath.Join(t.TempDir(), "context-boundary.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	by := api.Caller{Node: "fixture", User: "owner"}
+	task, err := s.CreateTask(ctx, api.CreateTaskRequest{Name: "Context boundary"}, by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lead, err := s.AddAgent(ctx, task.ID, api.AddAgentRequest{Name: "lead", Host: "fixture", Session: "lead", Runtime: "codex"}, by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	source, err := s.PostMessage(ctx, task.ID, api.PostMessageRequest{Text: "Synthetic intake with CJK 界 and escaping <>&"}, by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	item, err := s.CreateWorkItem(ctx, task.ID, api.CreateWorkItemRequest{
+		Kind: "bug", Title: "Synthetic complete context", Description: "revision one", AgentID: lead.ID,
+		SourceMessageSeq: source.Seq, RequestID: "boundary-item",
+	}, by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, description := range []string{"revision two with quote \" and slash \\", "revision three with CJK 界 and HTML <>&"} {
+		item, err = s.UpdateWorkItem(ctx, task.ID, item.ID, api.UpdateWorkItemRequest{Revision: item.Revision, Description: &description, AgentID: lead.ID}, by)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	order := contextLinkedMessage(t, s, task, item, "Recorded bounded work order", "boundary-order", nil)
+	orderRef := api.MessageReference{TaskID: task.ID, Seq: order.Seq}
+	evidence := contextLinkedMessage(t, s, task, item, "Second explicit evidence message", "boundary-evidence", &orderRef)
+	history := syntheticHistory(item, order, evidence)
+	history["padding"] = ""
+	bundle := syntheticPreparedContext(t, item, orderRef, history)
+	if len(bundle) >= maxAgentWorkItemContextBytes {
+		t.Fatalf("fixture overhead %d exceeds boundary", len(bundle))
+	}
+	history["padding"] = strings.Repeat("x", maxAgentWorkItemContextBytes-len(bundle))
+	bundle = syntheticPreparedContext(t, item, orderRef, history)
+	if len(bundle) != maxAgentWorkItemContextBytes {
+		t.Fatalf("context size = %d, want %d", len(bundle), maxAgentWorkItemContextBytes)
+	}
+	req := &api.AgentWorkItemRequest{
+		ItemTaskID: task.ID, ItemID: item.ID, ItemRevision: item.Revision,
+		WorkOrderMessage: orderRef, ContextBundle: bundle,
+	}
+	worker, err := s.AddAgent(ctx, task.ID, api.AddAgentRequest{Name: "boundary-worker", Host: "fixture", Session: "boundary-worker", Runtime: "codex", WorkItem: req}, by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stored, err := s.GetAgentWorkItemContext(ctx, task.ID, worker.ID, worker.RunID)
+	digest := sha256.Sum256(bundle)
+	if err != nil || !bytes.Equal(stored.Bundle, bundle) || stored.Binding.ContextDigest != hex.EncodeToString(digest[:]) || stored.Binding.ItemRevision != 3 || stored.Binding.WorkOrderMessage != orderRef {
+		t.Fatalf("exact boundary readback changed: %+v err=%v", stored.Binding, err)
+	}
+	if _, err = s.GetAgentWorkItemContext(ctx, task.ID, worker.ID, api.NewID("run")); !errors.Is(err, api.ErrConflict) {
+		t.Fatalf("wrong-run readback = %v", err)
+	}
+	over := *req
+	over.ContextBundle = append(append(json.RawMessage(nil), bundle...), ' ')
+	if _, err = s.AddAgent(ctx, task.ID, api.AddAgentRequest{Name: "over-boundary", Host: "fixture", Session: "over-boundary", Runtime: "codex", WorkItem: &over}, by); !errors.Is(err, api.ErrContextLimit) {
+		t.Fatalf("boundary +1 = %v", err)
+	}
 }
 
 // authorIntentAndBind authors the durable pre-admission allocation intent a

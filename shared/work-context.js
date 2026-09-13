@@ -1,6 +1,6 @@
 // Keep in sync with api.MaxAgentWorkItemContextBytes. Bounds apply to UTF-8
 // serialized JSON, including every source/revision/message; never truncate.
-export const MAX_WORK_CONTEXT_BYTES = 256 * 1024;
+export const MAX_WORK_CONTEXT_BYTES = 512 * 1024;
 const encoder = new TextEncoder();
 
 export function serializedWorkContext(value) {
@@ -10,7 +10,7 @@ export function serializedWorkContext(value) {
     encoder.encode(serialized).byteLength > MAX_WORK_CONTEXT_BYTES
   )
     throw new Error(
-      "This item’s complete immutable history exceeds the 256 KiB session-context limit. Starting this team is currently unsupported; no context was truncated.",
+      "This item’s complete immutable history exceeds the 512 KiB session-context limit. Starting this team is currently unsupported; no context was truncated.",
     );
   if (new TextDecoder().decode(encoder.encode(serialized)) !== serialized)
     throw new Error("Prepared work-item context must be valid UTF-8 JSON.");

@@ -1,7 +1,8 @@
 package server
 
 // HTTP acceptance for wi_c97ba465a6f2a3ab-routing-1/order #814 and
-// wi_649b1999c31d8fb9 r2/order #1240.
+// wi_649b1999c31d8fb9 r2/order #1240 and
+// wi_dd57670ee65d974c r3/order #3622.
 // Every task, item, message, agent and database is synthetic and isolated.
 import (
 	"bytes"
@@ -39,7 +40,7 @@ func TestAgentRegistrationBodyEnvelopeAndContextBoundaries(t *testing.T) {
 			WorkOrderMessage: api.MessageReference{TaskID: task.ID, Seq: order.Seq},
 		},
 	}
-	request.WorkItem.ContextBundle = syntheticHTTPContextSized(t, item, order, 152973, "x")
+	request.WorkItem.ContextBundle = syntheticHTTPContextSized(t, item, order, 269315, "x")
 	encoded, err := json.Marshal(request)
 	if err != nil {
 		t.Fatal(err)

@@ -1,5 +1,39 @@
 # Development handoff — September 10, 2026
 
+## September 13 512 KiB complete-context and bounded-transport candidate
+
+Bug `wi_dd57670ee65d974c` revision3, implementation order #3622 and exact Start
+#3637 (`que_3d80efd5329575c4` cycle1/revision9,
+`qrr_e0ac2e22b18fb420` / event244) have an isolated candidate from accepted
+`2dadf19`. It raises complete contexts to524288 UTF-8 bytes, the derived launch
+journal per-plan ceiling to1.25MiB while retaining the2MiB aggregate, the
+registration envelope to3162112 bytes, and the private CLI command file to
+2359296 bytes. Schema v1, exact bytes/digests, immutable bindings, stable retry
+identities, private cleanup and unrelated limits are preserved.
+
+Focused JavaScript17/17 and Go server/store/CLI/spawn pass, as do Chromium and
+WebKit isolated real-hub/private-tmux launch/reload/response-loss/partial-folder
+retry checks above the motivating269315-byte size. Exact524288/+1,
+ASCII/CJK/HTML/quote/backslash, three-revision/two-message history, journal
+aggregate, exact readback, wrong run, old digest and command-bound cases pass.
+Mini also passes a699562-byte browser-shaped command plus exact524288-byte
+external argv and private cleanup. Air rejected that old one-exec shape, so the
+same-item supplement #3662/#3665 uses the existing authenticated SFTP seam for
+commands above64KiB: 32KiB chunks, atomic mode0600 publication, an
+agent/digest-bound path, and pre-CLI mode/length/SHA-256 checks. The final Air
+command is2640 bytes. Actual Air passes exact524288-byte transfer and candidate
+CLI admission, +1 rejection, and success cleanup. Chromium and WebKit each pass
+four exact staged-write/cleanup attempts across response-loss and partial retry.
+
+Do **not release or integrate this candidate yet**. Independent review,
+handler-saved acceptance and the coordinated hub → Mini/Air CLI → frontend
+rollout remain required; Stage-A preparation #3671 performed no activation.
+Production remains the256KiB `d64615b` release. See
+[context admission](context-admission.md).
+
+No root integration, install, deployment, live task/profile/provider fixture,
+relay, lifecycle or preview PID60799 change is authorized by this candidate.
+
 ## September 13 work-item dropdown outline — released, original Safari issue open
 
 Bug `wi_85a66e159b50a309` revision11, order #3478, direct assignment #3514,
@@ -80,7 +114,6 @@ was changed. The known project-work-items browser timeout waiting for legacy
 `board message #` text remains identical to baseline, and native Safari was not
 tested. See [the release receipt](releases/tailos-2026-09-11-live-search.json).
 Lead and database-handler completion confirmation remain separate.
-
 
 ## September 11 lead recovery — live lead restored and release accepted
 

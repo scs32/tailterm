@@ -5,6 +5,7 @@ import { modelPickerHTML, wireModelPicker } from "./model-picker.js";
 import { resolveTeam, teamLaunches } from "./teams.js";
 import { withDatabaseHandler } from "./project-handler.js";
 import { prepareWorkItemContext } from "./work-item-context.js";
+import { serializedWorkContext } from "../shared/work-context.js";
 import {
   launchPlanForStorage,
   restoreLaunchMembers,
@@ -886,7 +887,7 @@ export function createTaskHub(host) {
       throw new Error(
         "Agent name: 1–64 letters, numbers, dashes or underscores.",
       );
-    const command = agentSpawnCommand({
+    const spawnFields = {
       hub: client.base,
       task: taskId,
       name: fields.name,
@@ -911,33 +912,84 @@ export function createTaskHub(host) {
       workOrderMessageSeq: fields.workOrderMessageSeq,
       replacesAgentId: fields.replacesAgentId,
       workContextBundle: fields.workContextBundle,
-    });
-    const out = await host.browserCommand(server, command, 65536);
-    let agent;
+    };
+    let command = agentSpawnCommand(spawnFields),
+      stagedContext = "",
+      sftp;
     try {
-      agent = JSON.parse(out);
-    } catch {
-      throw new Error(
-        "tt spawn returned unexpected output: " + out.slice(0, 200),
-      );
+      if (
+        fields.workContextBundle != null &&
+        new TextEncoder().encode(command).byteLength > 64 * 1024
+      ) {
+        if (!host.openSFTP)
+          throw new Error(
+            "This complete work-item context requires SFTP on the selected launch host.",
+          );
+        const serialized = serializedWorkContext(fields.workContextBundle);
+        const data = new TextEncoder().encode(serialized);
+        const digest = [
+          ...new Uint8Array(await crypto.subtle.digest("SHA-256", data)),
+        ]
+          .map((byte) => byte.toString(16).padStart(2, "0"))
+          .join("");
+        stagedContext = `/tmp/.tailterm-work-context-${fields.agentId}-${digest}.json`;
+        sftp = await host.openSFTP(server);
+        if (!sftp?.write || !sftp?.remove)
+          throw new Error(
+            "This launch host does not provide the required private file transfer.",
+          );
+        await sftp.write(stagedContext, {
+          size: data.byteLength,
+          overwrite: true,
+          readChunk: async (offset, length) =>
+            data.slice(offset, offset + length),
+        });
+        command = agentSpawnCommand({
+          ...spawnFields,
+          workContextFile: stagedContext,
+          workContextDigest: digest,
+        });
+        if (new TextEncoder().encode(command).byteLength > 64 * 1024)
+          throw new Error(
+            "The verified staged launch command exceeds the 64 KiB SSH limit.",
+          );
+      }
+      const out = await host.browserCommand(server, command, 65536);
+      let agent;
+      try {
+        agent = JSON.parse(out);
+      } catch {
+        throw new Error(
+          "tt spawn returned unexpected output: " + out.slice(0, 200),
+        );
+      }
+      if (!agent?.id) throw new Error("tt spawn did not return an agent.");
+      rememberHost(server, agent.host);
+      const candidate = handlerPlan(taskId);
+      if (
+        fields.agentRole === "database_handler" &&
+        candidate?.serverId === server.id &&
+        handlerSettingsKey(candidate.fields) === handlerSettingsKey(fields)
+      ) {
+        await host.api("/project-handler-plans", "POST", {
+          hub: client.base,
+          taskId,
+          serverId: server.id,
+          fields,
+        });
+        await host.reloadData();
+      }
+      return agent;
+    } finally {
+      if (sftp) {
+        if (stagedContext) {
+          try {
+            await sftp.remove(stagedContext);
+          } catch {}
+        }
+        sftp.close();
+      }
     }
-    if (!agent?.id) throw new Error("tt spawn did not return an agent.");
-    rememberHost(server, agent.host);
-    const candidate = handlerPlan(taskId);
-    if (
-      fields.agentRole === "database_handler" &&
-      candidate?.serverId === server.id &&
-      handlerSettingsKey(candidate.fields) === handlerSettingsKey(fields)
-    ) {
-      await host.api("/project-handler-plans", "POST", {
-        hub: client.base,
-        taskId,
-        serverId: server.id,
-        fields,
-      });
-      await host.reloadData();
-    }
-    return agent;
   }
 
   async function inspectTools(fields) {

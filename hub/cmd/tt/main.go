@@ -1177,7 +1177,7 @@ func wrapCommand(args []string) (string, error) {
 			return "", errors.New("agent command file must be absolute")
 		}
 		info, err := os.Lstat(path)
-		if err != nil || !info.Mode().IsRegular() || info.Mode().Perm() != 0600 || info.Size() > 4*api.MaxAgentWorkItemContextBytes+64*1024 {
+		if err != nil || !info.Mode().IsRegular() || info.Mode().Perm() != 0600 || info.Size() > 4*api.MaxAgentWorkItemContextBytes+256*1024 {
 			return "", errors.New("agent command file is missing, unsafe or oversized")
 		}
 		data, err := os.ReadFile(path)

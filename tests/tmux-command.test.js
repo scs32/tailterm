@@ -4,12 +4,14 @@ import { mkdtempSync, writeFileSync, rmSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
+import { createHash, randomBytes } from "node:crypto";
 import {
   tmuxCommand,
   tmuxListCommand,
   validateTmuxPath,
   tmuxRenameCommand,
 } from "../shared/tmux-command.js";
+import { MAX_WORK_CONTEXT_BYTES } from "../shared/work-context.js";
 
 test("tmux launch resolves SSH PATH and preserves real tmux failures", () => {
   const dir = mkdtempSync(path.join(tmpdir(), "tailterm-tmux-"));
@@ -193,7 +195,7 @@ test("agent launch forwards one bounded item context and optional replacement id
   }
 });
 
-test("browser shell transport preserves complete UTF-8 context at 256 KiB", async () => {
+test("browser shell transport preserves measured and 512 KiB UTF-8 contexts", async () => {
   const { agentSpawnCommand } = await import("../shared/tmux-command.js");
   const dir = mkdtempSync(path.join(tmpdir(), "tailterm-context-boundary-"));
   try {
@@ -202,58 +204,132 @@ test("browser shell transport preserves complete UTF-8 context at 256 KiB", asyn
       '#!/bin/sh\nwhile [ "$#" -gt 0 ]; do if [ "$1" = --work-context-file ]; then shift; /bin/cat "$1"; printf \'%s\\n\' "$1" >&2; exit "${CONTEXT_FAIL:-0}"; fi; shift; done\nexit 1\n',
       { mode: 0o700 },
     );
-    for (const fill of ["界", "'", "<", "\\\\"]) {
-      const overhead = Buffer.byteLength('{"source":""}');
-      const remaining = 262144 - overhead;
-      const context =
-        '{"source":"' +
-        fill.repeat(Math.floor(remaining / Buffer.byteLength(fill))) +
-        "x".repeat(remaining % Buffer.byteLength(fill)) +
-        '"}';
-      const fields = {
-        hub: "http://127.0.0.1:18765",
-        task: "tsk_0123456789abcdef",
-        name: "synthetic",
-        run: "codex",
-        runtime: "codex",
-        workItemTaskId: "tsk_0123456789abcdef",
-        workItemId: "wi_abcdef0123456789",
-        workItemRevision: 1,
-        workOrderTaskId: "tsk_0123456789abcdef",
-        workOrderMessageSeq: 1,
-        workContextBundle: context,
-      };
-      const result = spawnSync("/bin/sh", ["-c", agentSpawnCommand(fields)], {
-        encoding: "utf8",
-        env: { ...process.env, PATH: dir },
-        maxBuffer: 4 * 1024 * 1024,
-      });
-      assert.equal(
-        result.status,
-        0,
-        `${fill}: ${result.error || result.stderr}`,
-      );
-      assert.equal(result.stdout, context);
-      assert.equal(
-        existsSync(result.stderr.trim()),
-        false,
-        "private context file survived success",
-      );
-      const failure = spawnSync("/bin/sh", ["-c", agentSpawnCommand(fields)], {
-        encoding: "utf8",
-        env: { ...process.env, PATH: dir, CONTEXT_FAIL: "17" },
-        maxBuffer: 4 * 1024 * 1024,
-      });
-      assert.equal(failure.status, 17);
-      assert.equal(
-        existsSync(failure.stderr.trim()),
-        false,
-        "private context file survived failure",
-      );
-      fields.workContextBundle = context + " ";
-      assert.throws(() => agentSpawnCommand(fields), /256 KiB/);
+    for (const size of [269315, MAX_WORK_CONTEXT_BYTES]) {
+      for (const fill of ["界", "'", "<", "\\\\"]) {
+        const overhead = Buffer.byteLength('{"source":""}');
+        const remaining = size - overhead;
+        const context =
+          '{"source":"' +
+          fill.repeat(Math.floor(remaining / Buffer.byteLength(fill))) +
+          "x".repeat(remaining % Buffer.byteLength(fill)) +
+          '"}';
+        assert.equal(Buffer.byteLength(context), size);
+        const fields = {
+          hub: "http://127.0.0.1:18765",
+          task: "tsk_0123456789abcdef",
+          name: "synthetic",
+          run: "codex",
+          runtime: "codex",
+          workItemTaskId: "tsk_0123456789abcdef",
+          workItemId: "wi_abcdef0123456789",
+          workItemRevision: 1,
+          workOrderTaskId: "tsk_0123456789abcdef",
+          workOrderMessageSeq: 1,
+          workContextBundle: context,
+        };
+        const result = spawnSync("/bin/sh", ["-c", agentSpawnCommand(fields)], {
+          encoding: "utf8",
+          env: { ...process.env, PATH: dir },
+          maxBuffer: 4 * 1024 * 1024,
+        });
+        assert.equal(
+          result.status,
+          0,
+          `${size}/${fill}: ${result.error || result.stderr}`,
+        );
+        assert.equal(result.stdout, context);
+        assert.equal(
+          existsSync(result.stderr.trim()),
+          false,
+          "private context file survived success",
+        );
+        const failure = spawnSync(
+          "/bin/sh",
+          ["-c", agentSpawnCommand(fields)],
+          {
+            encoding: "utf8",
+            env: { ...process.env, PATH: dir, CONTEXT_FAIL: "17" },
+            maxBuffer: 4 * 1024 * 1024,
+          },
+        );
+        assert.equal(failure.status, 17);
+        assert.equal(
+          existsSync(failure.stderr.trim()),
+          false,
+          "private context file survived failure",
+        );
+        if (size === MAX_WORK_CONTEXT_BYTES) {
+          fields.workContextBundle = context + " ";
+          assert.throws(() => agentSpawnCommand(fields), /512 KiB/);
+        }
+      }
     }
   } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("staged 512 KiB context uses a bounded verified command and always cleans up", async () => {
+  const { agentSpawnCommand } = await import("../shared/tmux-command.js");
+  const dir = mkdtempSync(path.join(tmpdir(), "tailterm-staged-context-"));
+  const agentId = `agt_${randomBytes(8).toString("hex")}`;
+  const overhead = Buffer.byteLength('{"source":""}');
+  const context =
+    '{"source":"' +
+    "界".repeat(Math.floor((MAX_WORK_CONTEXT_BYTES - overhead) / 3)) +
+    "x".repeat((MAX_WORK_CONTEXT_BYTES - overhead) % 3) +
+    '"}';
+  const digest = createHash("sha256").update(context).digest("hex");
+  const staged = `/tmp/.tailterm-work-context-${agentId}-${digest}.json`;
+  try {
+    writeFileSync(
+      path.join(dir, "tt"),
+      '#!/bin/sh\nwhile [ "$#" -gt 0 ]; do if [ "$1" = --work-context-file ]; then shift; /bin/cat "$1"; exit 0; fi; shift; done\nexit 1\n',
+      { mode: 0o700 },
+    );
+    const fields = {
+      hub: "http://127.0.0.1:18765",
+      task: "tsk_0123456789abcdef",
+      name: "synthetic",
+      run: "codex",
+      runtime: "codex",
+      agentId,
+      workItemTaskId: "tsk_0123456789abcdef",
+      workItemId: "wi_abcdef0123456789",
+      workItemRevision: 3,
+      workOrderTaskId: "tsk_0123456789abcdef",
+      workOrderMessageSeq: 3622,
+      workContextBundle: context,
+      workContextFile: staged,
+      workContextDigest: digest,
+    };
+    writeFileSync(staged, context, { mode: 0o600 });
+    const command = agentSpawnCommand(fields);
+    assert.ok(Buffer.byteLength(command) <= 64 * 1024);
+    assert.doesNotMatch(
+      command,
+      new RegExp(Buffer.from(context.slice(0, 48)).toString("base64")),
+    );
+    const result = spawnSync("/bin/sh", ["-c", command], {
+      encoding: "utf8",
+      env: { ...process.env, PATH: `${dir}:/usr/bin:/bin` },
+      maxBuffer: 2 * 1024 * 1024,
+    });
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(result.stdout, context);
+    assert.equal(existsSync(staged), false);
+
+    writeFileSync(staged, context.slice(0, -1) + " ", { mode: 0o600 });
+    const changed = spawnSync("/bin/sh", ["-c", command], {
+      encoding: "utf8",
+      env: { ...process.env, PATH: `${dir}:/usr/bin:/bin` },
+      maxBuffer: 2 * 1024 * 1024,
+    });
+    assert.equal(changed.status, 1);
+    assert.match(changed.stderr, /digest changed/);
+    assert.equal(existsSync(staged), false);
+  } finally {
+    rmSync(staged, { force: true });
     rmSync(dir, { recursive: true, force: true });
   }
 });

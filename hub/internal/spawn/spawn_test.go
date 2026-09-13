@@ -51,7 +51,7 @@ func TestBriefingEnvironmentIsKeptOnlyWhenItIsNotEmbedded(t *testing.T) {
 
 func TestPrivateShellCommandCompleteContextAndCleanup(t *testing.T) {
 	// Synthetic quote amplification exceeded shell -c ARG_MAX before the fix.
-	payload := strings.Repeat("'", 256*1024)
+	payload := strings.Repeat("'", 512*1024)
 	command, cleanup, err := privateShellCommand("/bin/sh", "printf '%s' "+ShellQuote(payload))
 	if err != nil {
 		t.Fatal(err)
@@ -91,7 +91,7 @@ func TestContextReleaseHostArgv(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, character := range []string{"'", "界"} {
-		payload := strings.Repeat(character, 262144/len(character)) + strings.Repeat("x", 262144%len(character))
+		payload := strings.Repeat(character, 524288/len(character)) + strings.Repeat("x", 524288%len(character))
 		command, cleanup, err := privateShellCommand("/bin/sh", ShellQuote(self)+" -test.run=^TestContextArgvFixture$ -- "+ShellQuote(payload))
 		if err != nil {
 			t.Fatal(err)
@@ -100,7 +100,7 @@ func TestContextReleaseHostArgv(t *testing.T) {
 		output, err := command.Output()
 		cleanup()
 		if err != nil {
-			t.Fatalf("actual host runtime argv does not support complete256KiB: %v", err)
+			t.Fatalf("actual host runtime argv does not support complete512KiB: %v", err)
 		}
 		want := fmt.Sprintf("%x", sha256.Sum256([]byte(payload)))
 		if string(output) != want {

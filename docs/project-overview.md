@@ -1,6 +1,6 @@
 # Project overview
 
-Updated September 10, 2026. Start here for the architecture and product model;
+Updated September 13, 2026. Start here for the architecture and product model;
 use [the handoff guide](handoff.md) for the actual deployment and migration.
 
 ## Product and direction
@@ -166,17 +166,25 @@ creation attempt, including after reload, until manually verified; matching
 project fields are not proof of ownership. These behaviors prevent duplicate
 projects and agents and need to remain covered by browser checks.
 
-Complete item contexts support 256 KiB of serialized UTF-8 JSON in the deployed
-context-size fix (Bug `wi_7e220de54deaef33`, order #3022; release #3195/#3196).
-Preparation, saved journal,
-browser transport, CLI and hub enforce the same bundle bound; nothing is
-truncated. Private context/command files avoid shell-quoting amplification, and
-exact admitted source bytes/digests survive readback and uncertain retries.
-A coordinated frontend/hub/host update is required; old frontends retain their
-128 KiB limit and cannot restore newly oversized journals. See
-[context admission](context-admission.md) for compatibility, host limits and
-release verification. Combined application `d64615b` is active on the hub,
-Mini/Air CLIs, TailOS and Mini preview; handler saved acceptance is pending.
+Complete item contexts currently support 256 KiB of serialized UTF-8 JSON in
+the deployed context-size fix (Bug `wi_7e220de54deaef33`, order #3022; release
+#3195/#3196). Preparation, saved journal, browser transport, CLI and hub enforce
+the same bundle bound; nothing is truncated. Private context/command files avoid
+shell-quoting amplification, and exact admitted source bytes/digests survive
+readback and uncertain retries. Combined application `d64615b` is active on the
+hub, Mini/Air CLIs, TailOS and Mini preview; handler saved acceptance is pending.
+
+A 512 KiB correction candidate is implemented under Bug
+`wi_dd57670ee65d974c` revision 3/order #3622 and same-item transport supplement
+#3662/#3665, but it is **not released**. Commands above 64 KiB use the existing
+authenticated browser SFTP seam for atomic private staging, then a small command
+verifies mode, length and digest before CLI admission. Mini and actual Air pass
+exact 512 KiB qualification, +1 rejection and cleanup; Chromium and WebKit pass
+the isolated retry flow. Production remains at 256 KiB pending independent
+review, handler-saved acceptance and the coordinated hub → Mini/Air CLI →
+frontend rollout. Old frontends retain their 128 KiB limit and cannot restore
+newly oversized journals. See [context admission](context-admission.md) for exact
+limits, compatibility and qualification evidence.
 
 Models can be selected for supported runtimes or entered explicitly. Installed
 runtime versions, account/model access, credentials, and host configuration remain
@@ -367,7 +375,7 @@ hub currently uses one shared trusted-workspace credential.
 ## Source map
 
 | Area                                               | Main locations                                                                                                             |
-| --------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------- |
+| -------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------- |
 | Application bootstrap, static/gateway integration  | `client/main.js`                                                                                                           |
 | Task synchronization, launch dialogs, host aliases | `client/task-hub.js`                                                                                                       |
 | Task/group reconciliation and saved layouts        | `client/tasks.js`, `client/pane-groups.js`, `client/pane-layout.js`, `client/workspace-state.js`                           |
@@ -375,7 +383,7 @@ hub currently uses one shared trusted-workspace credential.
 | Bugs/Features and handler launch plans             | `client/work-items-view.js`, `client/work-items.css`, `client/project-handler.js`, `hub/internal/api/work_items.go`        |
 | Encrypted cached hub reads                         | `client/cached-hub-client.js`, `client/hub-read-cache.js`, `client/local-vault.js`                                         |
 | History pagination/export                          | `client/task-history.js`                                                                                                   |
-| Agent/team schemas, models, runtime controls      | `client/agents.js`, `client/teams.js`, `client/reasoning.js`, `client/model-picker.js`, `client/agent-controls.js`           |
+| Agent/team schemas, models, runtime controls       | `client/agents.js`, `client/teams.js`, `client/reasoning.js`, `client/model-picker.js`, `client/agent-controls.js`         |
 | Remote folder selection                            | `client/project-folder.js`                                                                                                 |
 | Hub transport and API                              | `client/hub-client.js`, `hub/internal/api/`, `hub/internal/server/`                                                        |
 | Durable state and migrations                       | `hub/internal/store/`                                                                                                      |

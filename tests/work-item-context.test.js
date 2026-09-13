@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { prepareWorkItemContext } from "../client/work-item-context.js";
+import { MAX_WORK_CONTEXT_BYTES } from "../shared/work-context.js";
 
 const source = {
   itemTaskId: "tsk_0123456789abcdef",
@@ -112,7 +113,12 @@ test("prepared context rejects inferred orders, cursor loops and oversized compl
         {
           ...base,
           listWorkItemRevisions: async () => ({
-            revisions: [{ revision: 3, description: "x".repeat(262144) }],
+            revisions: [
+              {
+                revision: 3,
+                description: "x".repeat(MAX_WORK_CONTEXT_BYTES),
+              },
+            ],
             coverage: { conversationLinks: "explicit_only" },
           }),
           listWorkItemMessages: async () => ({
@@ -126,39 +132,56 @@ test("prepared context rejects inferred orders, cursor loops and oversized compl
         },
         source,
       ),
-    /exceeds the 256 KiB session-context limit.*currently unsupported.*no context was truncated/,
+    /exceeds the 512 KiB session-context limit.*currently unsupported.*no context was truncated/,
   );
 });
 
-// wi_7e220de54deaef33@1/order3022: synthetic history only.
+// wi_dd57670ee65d974c@3/order3622: synthetic history only.
 test("complete context accepts measured size and UTF-8 boundary without source loss", async () => {
-  for (const size of [152973, 262144, 262145]) {
+  for (const size of [
+    269315,
+    MAX_WORK_CONTEXT_BYTES,
+    MAX_WORK_CONTEXT_BYTES + 1,
+  ]) {
     const revision = { revision: 3, description: "Full source retained" };
+    const revisions = [
+      { revision: 1, description: "Initial ASCII requirement" },
+      { revision: 2, description: 'CJK decision 界 and escaped <>&"\\' },
+      revision,
+    ];
     const links = [
       {
         relationship: "primary",
-        message: { ...source.workOrderMessage, text: "" },
+        message: { ...source.workOrderMessage, text: "Recorded work order" },
+      },
+      {
+        relationship: "primary",
+        message: {
+          taskId: source.itemTaskId,
+          seq: source.workOrderMessage.seq + 1,
+          text: "ASCII, CJK 界, HTML <>&, quotes \"' and slash \\",
+        },
       },
     ];
     const client = {
       getWorkItemRevision: async () => revision,
       listWorkItemRevisions: async () => ({
-        revisions: [revision],
-        coverage: { conversationLinks: "explicit_only" },
+        revisions,
+        coverage: { complete: true, conversationLinks: "explicit_only" },
       }),
       listWorkItemHistoryGaps: async () => ({ gaps: [] }),
       listWorkItemMessages: async () => ({ links }),
     };
-    const empty = await prepareWorkItemContext(client, source);
-    const remaining = size - Buffer.byteLength(JSON.stringify(empty));
-    links[0].message.text =
-      "界".repeat(Math.floor(remaining / 3)) + "x".repeat(remaining % 3);
-    if (size > 262144) {
-      await assert.rejects(prepareWorkItemContext(client, source), /256 KiB/);
+    const initial = await prepareWorkItemContext(client, source);
+    const remaining = size - Buffer.byteLength(JSON.stringify(initial));
+    assert.ok(remaining > 0, `fixture overhead exceeds ${size}`);
+    links[1].message.text += "x".repeat(remaining);
+    if (size > MAX_WORK_CONTEXT_BYTES) {
+      await assert.rejects(prepareWorkItemContext(client, source), /512 KiB/);
     } else {
       const bundle = await prepareWorkItemContext(client, source);
       assert.equal(Buffer.byteLength(JSON.stringify(bundle)), size);
-      assert.deepEqual(bundle.history.revisions, [revision]);
+      assert.deepEqual(bundle.history.revisions, revisions);
       assert.deepEqual(bundle.history.messages, links);
     }
   }

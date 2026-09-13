@@ -171,6 +171,8 @@ export function agentSpawnCommand({
   workOrderMessageSeq = 0,
   replacesAgentId = "",
   workContextBundle = null,
+  workContextFile = "",
+  workContextDigest = "",
 }) {
   if (!/^https?:\/\/[A-Za-z0-9][A-Za-z0-9.:/_-]{0,199}$/.test(hub))
     throw new Error("Invalid hub URL.");
@@ -241,6 +243,17 @@ export function agentSpawnCommand({
   let workContextJSON = "";
   if (hasWorkItemRouting) {
     workContextJSON = serializedWorkContext(workContextBundle);
+    if (
+      (workContextFile || workContextDigest) &&
+      (!agentId ||
+        !/^\/tmp\/\.tailterm-work-context-agt_[0-9a-f]{16}-[0-9a-f]{64}\.json$/.test(
+          workContextFile,
+        ) ||
+        !/^[0-9a-f]{64}$/.test(workContextDigest) ||
+        !workContextFile.includes(`-${agentId}-`) ||
+        !workContextFile.endsWith(`-${workContextDigest}.json`))
+    )
+      throw new Error("Invalid staged work-item context.");
   }
   const args = [
     "spawn",
@@ -288,7 +301,26 @@ export function agentSpawnCommand({
     `printf 'The tt agent CLI is not installed on this server. Install it from the tailterm hub build and retry.\\n' >&2; exit 127`,
   );
   let invoke = `exec "$tailterm_tt" ${args.map(shellQuote).join(" ")}`;
-  if (hasWorkItemRouting) {
+  if (hasWorkItemRouting && workContextFile) {
+    const contextBytes = new TextEncoder().encode(workContextJSON).byteLength;
+    const contextPath = shellQuote(workContextFile);
+    invoke =
+      `umask 077; tailterm_context=${contextPath}; ` +
+      `trap '/bin/rm -f "$tailterm_context"' EXIT; trap 'exit 143' HUP INT TERM; ` +
+      `if [ ! -f "$tailterm_context" ] || [ -L "$tailterm_context" ]; then printf 'Staged work-item context is missing or unsafe.\n' >&2; exit 1; fi; ` +
+      `tailterm_mode=$(/usr/bin/stat -f '%Lp' "$tailterm_context" 2>/dev/null || :); ` +
+      `if [ "$tailterm_mode" != 600 ]; then tailterm_mode=$(/usr/bin/stat -c '%a' "$tailterm_context" 2>/dev/null || :); fi; ` +
+      `if [ "$tailterm_mode" != 600 ]; then printf 'Staged work-item context permissions changed.\n' >&2; exit 1; fi; ` +
+      `tailterm_size=$(/usr/bin/wc -c < "$tailterm_context" | /usr/bin/tr -d '[:space:]') || exit 1; ` +
+      `if [ "$tailterm_size" != ${contextBytes} ]; then printf 'Staged work-item context length changed.\n' >&2; exit 1; fi; ` +
+      `tailterm_hash_bin=$(command -v shasum 2>/dev/null || command -v sha256sum 2>/dev/null || :); ` +
+      `if [ -z "$tailterm_hash_bin" ]; then printf 'A SHA-256 utility is required to verify staged work-item context.\n' >&2; exit 127; fi; ` +
+      `case "$tailterm_hash_bin" in *shasum) tailterm_hash=$($tailterm_hash_bin -a 256 "$tailterm_context") ;; *) tailterm_hash=$($tailterm_hash_bin "$tailterm_context") ;; esac; ` +
+      `tailterm_hash=\${tailterm_hash%% *}; ` +
+      `if [ "$tailterm_hash" != ${shellQuote(workContextDigest)} ]; then printf 'Staged work-item context digest changed.\n' >&2; exit 1; fi; ` +
+      `"$tailterm_tt" ${args.map(shellQuote).join(" ")} --work-context-file "$tailterm_context"; ` +
+      `tailterm_result=$?; exit "$tailterm_result"`;
+  } else if (hasWorkItemRouting) {
     // Base64 avoids repeated shell-quote expansion of the complete history.
     // The private file uses the existing CLI flag, including on older hosts.
     const encoded = btoa(
