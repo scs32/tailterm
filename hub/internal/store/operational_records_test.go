@@ -272,3 +272,34 @@ func TestOperationalConcurrentProposalCAS(t *testing.T) {
 		t.Fatalf("CAS: %d %d", ok, conflict)
 	}
 }
+
+func TestOperationalResumeRetainsInstructionWithoutOldExecutionEvidence(t *testing.T) {
+	f := opFixtureNew(t)
+	f.start(t)
+	oldCandidate := f.candidate(t)
+	ctx := context.Background()
+	blocked, err := f.s.BlockDelivery(ctx, f.task.ID, f.d.ID, api.DeliveryBlockRequest{RequestID: f.key(), AgentID: f.worker.ID, RunID: f.worker.RunID, ExpectedEpoch: 1, ReasonClass: "dependency", Text: "synthetic dependency"}, f.by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resolved, err := f.s.ResolveDeliveryBlock(ctx, f.task.ID, f.d.ID, blocked.Block.ID, api.DeliveryResolutionRequest{RequestID: f.key(), AgentID: f.lead.ID, RunID: f.lead.RunID, ExpectedEpoch: 1, Text: "resolved"}, f.by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resumed, err := f.s.ResumeDelivery(ctx, f.task.ID, f.d.ID, api.DeliveryResumeRequest{RequestID: f.key(), AgentID: f.worker.ID, RunID: f.worker.RunID, ExpectedEpoch: 1, ResolutionID: resolved.Block.ResolutionID}, f.by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.d = resumed.Delivery
+	// Fresh requests cannot reuse execution evidence from the pre-resume epoch.
+	f.reject(t, f.verificationData(t, oldCandidate, "pass"), f.worker)
+	// The still-current instruction needs neither a fake ack nor a supersession.
+	currentCandidate := f.candidate(t)
+	v := f.commit(t, f.verificationData(t, currentCandidate, "pass"), f.worker)
+	d := f.data("result")
+	d.Result = &api.OperationalResult{Candidate: opRef(currentCandidate), Verifications: []api.OperationalReference{opRef(v)}, Summary: "Resumed exact execution"}
+	r := f.commit(t, d, f.worker)
+	if r.Data.Epoch != 2 || f.instruction.Data.Epoch != 1 {
+		t.Fatal("instruction and execution epochs conflated")
+	}
+}

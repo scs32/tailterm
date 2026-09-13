@@ -59,8 +59,9 @@ At most one instruction and one result can be committed per directive epoch;
 one acceptance decision can be committed per result. A changed instruction or
 candidate after a terminal result uses a new current directive, preserving the
 old evidence. References are pinned to the same item revision, scope, directive
-generation and epoch. A superseded or resumed epoch cannot commit new records
-using an older binding. Old `get` results remain historical committed evidence;
+generation and epoch. The immutable instruction remains usable after a resume
+within the same generation; new execution evidence uses the fresh epoch. A
+superseded or resumed epoch cannot commit new records using an older binding. Old `get` results remain historical committed evidence;
 `state=committed` is not a promise of current actionability. Every new commit
 rechecks current state transactionally.
 

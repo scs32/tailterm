@@ -227,7 +227,10 @@ func operationalReference(q queryRower, ctx context.Context, parent api.Operatio
 		return r, err
 	}
 	a, b := r.Data, parent.Data
-	if r.State != "committed" || a.Kind != kind || a.ItemTaskID != b.ItemTaskID || a.ItemID != b.ItemID || a.ItemRevision != b.ItemRevision || a.ScopeRevision != b.ScopeRevision || a.DeliveryID != b.DeliveryID || a.Generation != b.Generation || a.Epoch != b.Epoch {
+	// Resume keeps the same instruction generation. Its immutable instruction
+	// can predate the fresh execution epoch; execution evidence cannot.
+	epochMatches := a.Epoch == b.Epoch || (kind == "instruction" && a.Epoch > 0 && a.Epoch < b.Epoch)
+	if r.State != "committed" || a.Kind != kind || a.ItemTaskID != b.ItemTaskID || a.ItemID != b.ItemID || a.ItemRevision != b.ItemRevision || a.ScopeRevision != b.ScopeRevision || a.DeliveryID != b.DeliveryID || a.Generation != b.Generation || !epochMatches {
 		return r, workItemConflict("referenced operational record is not committed for this exact instruction epoch")
 	}
 	return r, nil
