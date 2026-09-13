@@ -183,11 +183,11 @@ func TestMandatoryActionSiblingActionsRemainIndependent(t *testing.T) {
 	if err != nil || len(coverages.Actions) != 2 {
 		t.Fatalf("two independently covered actions: %+v %v", coverages, err)
 	}
-	selected, err := f.s.CurrentAssignmentForAction(ctx, f.task.ID, f.lead.ID, f.lead.RunID, executableAction.Delivery.ActionKey)
+	selected, err := f.s.CurrentAssignmentForResponsibility(ctx, f.task.ID, f.lead.ID, f.lead.RunID, f.item.ID, executableAction.Delivery.ActionKey)
 	if err != nil || selected.ID != executableAction.Delivery.ID || selected.Phase != api.DeliveryProgressing {
 		t.Fatalf("exact executable sibling selection: %+v %v", selected, err)
 	}
-	stillBlocked, err := f.s.CurrentAssignmentForAction(ctx, f.task.ID, f.lead.ID, f.lead.RunID, blockedAction.Delivery.ActionKey)
+	stillBlocked, err := f.s.CurrentAssignmentForResponsibility(ctx, f.task.ID, f.lead.ID, f.lead.RunID, f.item.ID, blockedAction.Delivery.ActionKey)
 	if err != nil || stillBlocked.ID != blockedAction.Delivery.ID || stillBlocked.Phase != api.DeliveryBlocked {
 		t.Fatalf("progress on sibling must not satisfy blocked action: %+v %v", stillBlocked, err)
 	}
@@ -204,9 +204,28 @@ func TestMandatoryActionSiblingActionsRemainIndependent(t *testing.T) {
 	if err != nil || !replayed.Replay || replayed.Receipt.ID != resumed.Receipt.ID {
 		t.Fatalf("exact resume retry must be stable and one-time: %+v %v", replayed, err)
 	}
-	selected, err = f.s.CurrentAssignmentForAction(ctx, f.task.ID, f.lead.ID, f.lead.RunID, executableAction.Delivery.ActionKey)
+	selected, err = f.s.CurrentAssignmentForResponsibility(ctx, f.task.ID, f.lead.ID, f.lead.RunID, f.item.ID, executableAction.Delivery.ActionKey)
 	if err != nil || selected.Phase != api.DeliveryProgressing || selected.ExecutionEpoch != 1 {
 		t.Fatalf("resuming blocked action mutated executable sibling: %+v %v", selected, err)
+	}
+}
+
+func TestMandatoryActionSelectorRequiresItemAndActionKey(t *testing.T) {
+	f := newDeliveryFixture(t)
+	ctx := context.Background()
+	action := enrolledMandatoryAction(t, f, f.lead, api.DeliveryRecipientProjectLead, api.DeliveryActionExecution, "exact-selector-pair")
+
+	if _, err := f.s.CurrentAssignmentForResponsibility(ctx, f.task.ID, f.lead.ID, f.lead.RunID, "", action.Delivery.ActionKey); !errors.Is(err, api.ErrInvalid) {
+		t.Fatalf("current assignment action key without item ID must fail closed: %v", err)
+	}
+	if _, err := f.s.DeliveryCoverageForResponsibility(ctx, f.task.ID, f.lead.ID, f.lead.RunID, "", action.Delivery.ActionKey); !errors.Is(err, api.ErrInvalid) {
+		t.Fatalf("delivery coverage action key without item ID must fail closed: %v", err)
+	}
+	if _, err := f.s.CurrentAssignmentForResponsibility(ctx, f.task.ID, f.lead.ID, f.lead.RunID, f.item.ID, ""); !errors.Is(err, api.ErrInvalid) {
+		t.Fatalf("current assignment item ID without action key must fail closed: %v", err)
+	}
+	if _, err := f.s.DeliveryCoverageForResponsibility(ctx, f.task.ID, f.lead.ID, f.lead.RunID, f.item.ID, ""); !errors.Is(err, api.ErrInvalid) {
+		t.Fatalf("delivery coverage item ID without action key must fail closed: %v", err)
 	}
 }
 

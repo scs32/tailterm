@@ -772,7 +772,7 @@ func (s *Store) CurrentAssignmentForResponsibility(ctx context.Context, taskID, 
 	if !api.ValidID(taskID, "tsk") || !api.ValidID(agentID, "agt") || !validRunID(runID) {
 		return api.RequiredDelivery{}, api.ErrInvalid
 	}
-	if (itemID != "" && actionKey == "") || (itemID != "" && !api.ValidID(itemID, "wi")) || (actionKey != "" && (strings.TrimSpace(actionKey) != actionKey || !api.ValidText(actionKey, 128))) {
+	if (itemID == "") != (actionKey == "") || (itemID != "" && !api.ValidID(itemID, "wi")) || (actionKey != "" && (strings.TrimSpace(actionKey) != actionKey || !api.ValidText(actionKey, 128))) {
 		return api.RequiredDelivery{}, api.ErrInvalid
 	}
 	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
@@ -837,7 +837,7 @@ func (s *Store) DeliveryCoverageForResponsibility(ctx context.Context, taskID, a
 	if !api.ValidID(taskID, "tsk") || !api.ValidID(agentID, "agt") || !validRunID(runID) {
 		return out, api.ErrInvalid
 	}
-	if (itemID != "" && actionKey == "") || (itemID != "" && !api.ValidID(itemID, "wi")) || (actionKey != "" && (strings.TrimSpace(actionKey) != actionKey || !api.ValidText(actionKey, 128))) {
+	if (itemID == "") != (actionKey == "") || (itemID != "" && !api.ValidID(itemID, "wi")) || (actionKey != "" && (strings.TrimSpace(actionKey) != actionKey || !api.ValidText(actionKey, 128))) {
 		return out, api.ErrInvalid
 	}
 	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})

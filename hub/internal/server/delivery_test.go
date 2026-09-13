@@ -115,6 +115,12 @@ func TestReliableDeliveryHTTPRoundTrip(t *testing.T) {
 	if code := c.do("GET", "/v1/tasks/"+task.ID+"/agents/"+lead.ID+"/current-assignment?runId="+lead.RunID+"&itemId="+item.ID+"&actionKey="+leadCreate.ActionKey, nil, &selectedLeadAction); code != 200 || selectedLeadAction.ID != leadCreated.Delivery.ID {
 		t.Fatalf("select exact lead action: %d %+v", code, selectedLeadAction)
 	}
+	if code := c.do("GET", "/v1/tasks/"+task.ID+"/agents/"+lead.ID+"/current-assignment?runId="+lead.RunID+"&actionKey="+leadCreate.ActionKey, nil, nil); code != 400 {
+		t.Fatalf("current assignment action key without item ID must fail closed: %d", code)
+	}
+	if code := c.do("GET", "/v1/tasks/"+task.ID+"/agents/"+lead.ID+"/delivery-coverage?runId="+lead.RunID+"&actionKey="+leadCreate.ActionKey, nil, nil); code != 400 {
+		t.Fatalf("delivery coverage action key without item ID must fail closed: %d", code)
+	}
 	incidentReq := api.DeliveryRecoveryIncidentRequest{RequestID: "http-recovery-incident", AgentID: lead.ID, RunID: lead.RunID,
 		ExpectedGeneration: leadCreated.Delivery.Generation, ExpectedEpoch: 1, CauseStatus: api.DeliveryCauseEstablished,
 		LastSubstantiveAction: "stored HTTP lead action", LastSubstantiveAt: leadCreated.Delivery.CreatedAt,
