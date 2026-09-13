@@ -377,6 +377,41 @@ def _identity(plan: dict[str, Any], actual_host: str, executable: pathlib.Path) 
     }
 
 
+def _receipt_evidence_digest(receipt: dict[str, Any]) -> str:
+    fields = (
+        "version",
+        "requestId",
+        "planDigest",
+        "databaseOwner",
+        "operation",
+        "checks",
+        "profileTables",
+        "targetHost",
+        "actualHost",
+        "targetExecutable",
+        "resolvedExecutable",
+        "route",
+        "sourceDatabase",
+        "backupDestination",
+        "allowedBackupRoot",
+        "backupOwner",
+        "deployment",
+        "sourceEvidence",
+        "backupEvidence",
+        "size",
+        "mode",
+        "uid",
+        "gid",
+        "sha256",
+        "receiptPath",
+        "completedAt",
+    )
+    evidence = {field: receipt.get(field) for field in fields}
+    return hashlib.sha256(
+        json.dumps(evidence, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+
+
 def _read_json(path: pathlib.Path, classification: str) -> dict[str, Any]:
     try:
         value = json.loads(path.read_text(encoding="utf-8"))
@@ -437,6 +472,13 @@ def _recover_receipt(identity: dict[str, Any]) -> dict[str, Any] | None:
         raise PreflightFailure(
             "verification-failed",
             "existing backup hash does not match its receipt",
+            backupDestination=str(destination),
+            mutationStarted=False,
+        )
+    if receipt.get("evidenceDigest") != _receipt_evidence_digest(receipt):
+        raise PreflightFailure(
+            "verification-failed",
+            "existing receipt evidence digest does not match",
             backupDestination=str(destination),
             mutationStarted=False,
         )
@@ -729,6 +771,7 @@ def execute(plan: Any) -> dict[str, Any]:
                 "completedAt": datetime.now(timezone.utc).isoformat(),
             }
         )
+        receipt["evidenceDigest"] = _receipt_evidence_digest(receipt)
         receipt_bytes = (
             json.dumps(receipt, sort_keys=True, separators=(",", ":")) + "\n"
         ).encode()
@@ -1016,6 +1059,7 @@ def validate_receipt(plan: Any, receipt: Any) -> dict[str, Any]:
         or type(receipt.get("size")) is not int
         or receipt.get("size") <= 0
         or not re.fullmatch(r"[0-9a-f]{64}", str(receipt.get("sha256", "")))
+        or receipt.get("evidenceDigest") != _receipt_evidence_digest(receipt)
         or receipt.get("receiptPath")
         != str(_receipt_path(pathlib.Path(normalized["backupDestination"])))
         or not isinstance(receipt.get("completedAt"), str)

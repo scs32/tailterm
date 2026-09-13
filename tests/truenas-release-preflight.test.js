@@ -336,6 +336,7 @@ test("receipt consumer rejects incomplete host, source, executable, and mutation
     (value) => (value.resolvedExecutable = "relative-python"),
     (value) => (value.mutationStarted = false),
     (value) => (value.size = 0),
+    (value) => (value.sha256 = "f".repeat(64)),
   ];
   for (const [index, mutate] of mutations.entries()) {
     const tampered = structuredClone(receipt);
@@ -437,6 +438,7 @@ test("deployment separates guard, transport-unknown, and started-command mutatio
       mode: "execute",
       classification: "host-mismatch",
       state: "not-started",
+      mutationState: "completed",
       started: false,
     },
     {
@@ -445,6 +447,7 @@ test("deployment separates guard, transport-unknown, and started-command mutatio
       mode: "fail",
       classification: "route-unavailable",
       state: "unknown",
+      mutationState: "unknown",
       started: undefined,
     },
     {
@@ -453,6 +456,7 @@ test("deployment separates guard, transport-unknown, and started-command mutatio
       mode: "execute",
       classification: "remote-operation-failed",
       state: "started",
+      mutationState: "started",
       started: true,
     },
   ]) {
@@ -469,6 +473,7 @@ test("deployment separates guard, transport-unknown, and started-command mutatio
     assert.equal(observed.result.mutationStarted, true);
     assert.equal(observed.result.backupMutationCompleted, true);
     assert.equal(observed.result.deploymentMutationState, fixture.state);
+    assert.equal(observed.result.mutationState, fixture.mutationState);
     assert.equal(observed.result.deploymentMutationStarted, fixture.started);
     assert.equal(observed.result.lastCompletedStage, "remote-identity");
   }

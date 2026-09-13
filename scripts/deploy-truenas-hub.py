@@ -134,6 +134,7 @@ def _remote_failure(
             "execution host changed after the verified backup receipt",
             deploymentMutationStarted=False,
             deploymentMutationState="not-started",
+            mutationState="completed",
             **common,
         )
     if completed.returncode == 79:
@@ -142,6 +143,7 @@ def _remote_failure(
             "target executable changed after the verified backup receipt",
             deploymentMutationStarted=False,
             deploymentMutationState="not-started",
+            mutationState="completed",
             **common,
         )
     if completed.returncode == 255:
@@ -151,6 +153,7 @@ def _remote_failure(
             routeExitCode=completed.returncode,
             routeDetail=detail,
             deploymentMutationState="unknown",
+            mutationState="unknown",
             **common,
         )
     return PreflightFailure(
@@ -160,6 +163,7 @@ def _remote_failure(
         remoteDetail=detail,
         deploymentMutationStarted=True,
         deploymentMutationState="started",
+        mutationState="started",
         **common,
     )
 
@@ -205,6 +209,7 @@ def _remote(
             lastCompletedStage=last_completed_stage,
             deploymentMutationStarted=False,
             deploymentMutationState="not-started",
+            mutationState="completed",
         ) from error
     if completed.returncode != 0:
         raise _remote_failure(
@@ -414,6 +419,7 @@ def main(argv: list[str] | None = None) -> int:
             "appName": APP_NAME,
             "tcpListener": TCP_LISTENER,
             "mutationStarted": True,
+            "mutationState": "completed",
         }
     )
     return 0
