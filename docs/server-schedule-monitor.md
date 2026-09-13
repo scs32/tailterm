@@ -11,8 +11,8 @@ Admission context through #3285 has digest
 (full supplied history through #3280). Design checkpoint #3303 was accepted
 by lead #3307/#3308 and saved/read back by handler #3309. The four correction
 findings are in independent review #2974/#2975, retained report
-`/tmp/server-monitor-current-review-2948.txt`. This candidate is for review;
-this document does not claim integration, deployment or saved item completion.
+`/tmp/server-monitor-current-review-2948.txt`. The correction was subsequently integrated and released as qualified Stage A
+as recorded below. Overall feature completion is not claimed.
 
 Original implementation order #2280/source #2274 used Start
 `qrr_475f5dc7e8ba3b62`, event 120. That receipt belongs only to the original
@@ -20,6 +20,86 @@ revision-2 implementation. The later `72ed7b5` correction was reported after
 its current-revision Start was rejected, followed by safety release event160.
 Handler #2530/#2550 records that execution-provenance gap. Neither the new
 builder Start nor the valid independent review retroactively repairs it.
+
+## Stage-A hub release — September 12, 2026
+
+The notification-only monitor was deployed at **2026-09-13 02:05:53 UTC**
+(September 12, 19:05 Pacific), under release order **#3411** and lead Stage1
+acceptance **#3445**. The same builder/run/context consumed handler **#3416**:
+Queue cycle1/revision32, claim `qrr_4ba29a2805fce2ef`, separate Start
+`qrr_ec092dbe43f55310`. Gate consumption and execution were delivered in
+**#3448/#3452**, with runtime verification **#3456**.
+
+Application source is `f450996d0b447c959a630c779f60d8ef30ce52df`, combining
+`2ea73fb`, `72ed7b5`, and corrected `3d9c638` on the prior Capacity/context root
+`4345d62`. Independent combined-source/package review **#3409**, saved by
+handler **#3410**, gave a qualified Stage-A PASS. Focused monitor/store/hub
+normal and race tests, Capacity/context HTTP regressions, vet and source/package
+checks passed. This release required no CLI or frontend update.
+
+The exact clean-source Linux amd64 binary is 27,357,346 bytes, SHA-256
+`4711d3c0acc4d9ce17725e1c4fea74709ee945edb694d0f4f74bea74e0e107a3`.
+Its embedded VCS revision is the application hash above, `vcs.modified=false`.
+The nine-payload manifest hash is
+`cb043a4f991a1eb246cf41a2ae71af74adaec7068456c428c5c9812ae0f56a7e`.
+The runtime mounts the immutable binary at
+`/mnt/deepfreeze/tailterm-hub/releases/20260913-monitor-stage-a-f450996/tailterm-hub`.
+TrueNAS middleware reports one running container `29327f2b`; host process
+`3655758` has the matching `/proc` executable hash. Authenticated capabilities
+returned HTTP200 and matched the pre-release allocationIntent v1, Queue and
+message-audit capabilities. A bounded middleware log read confirmed TCP startup
+with token authentication. The sampled log did not expose a monitor outcome;
+no outcome-log or end-to-end role-wake proof is inferred from it.
+
+Only the binary mount changed. Image, UID/GID950, read-only root, dropped
+capabilities, security options, CPU/memory limits, cap32, state/token mounts and
+private TCP listener remained. Root `tasks-hub` fast-forwarded to application
+source; the pre-existing owner screenshot hash and preview PID60799 remained.
+No CLI/frontend/Cloudflare/relay/Tailscale/Files or worker lifecycle changes were
+performed. No live work-item/profile test fixture was created.
+
+Handler-owned consistent online backup before release:
+`/mnt/deepfreeze/tailterm-hub/backups/before-stage1-release-3411-20260912T235805Z.sqlite`,
+27,529,216 bytes, mode0600 UID/GID950, SHA-256
+`ccdad59c89937cae206bf7aaf7966319f3f700827466b92c964ff23321646c32`.
+Handler **#3441** corrected the baseline artifact, preserving the prior erroneous
+artifact. Backup/live integrity and foreign keys passed with exact current
+profile-table hash equality. Historical hashes from #3220 are not comparable
+because its complete canonicalization record was unavailable. Current baseline
+artifact `/tmp/tailterm-stage1-profile-baseline-3433.json` is 1,435 bytes, SHA-256
+`070cca4391d80c01b6d2933fa837c097d462048735676bc647cef2a716a9593b`.
+
+Handler Stage3 **#3457** (native `nart_7d7375617a01f295` v1) confirms
+live integrity `ok`, zero foreign-key violations, both monitor tables, and exact
+profile-table counts/hashes matching the corrected Stage1 baseline. Its native
+989-byte content hashes to
+`fde25784f52eb4f266d92562da09c7359ce21e5069a53f050e4ab5c883bbd136`;
+the local export adds one final newline (990 bytes, different file hash).
+Builder consumed and verified that content. Lead #3454/#3459 reported actual
+notice #3451, as notification evidence only.
+
+Runtime release is not whole-item completion. Full staged receipts,
+preflight/runtime evidence and controlled update/rollback scripts are retained in
+`/tmp/tailterm-monitor-release-3411`. The complete `release-receipt.json` is
+14,544 bytes, SHA-256
+`fdf447be66c5cac2f5bc158c6a1f8d7a4b46ae08a308809c49c17d6a4fc95b79`.
+This documentation amendment is report-only;
+it does not require rebuilding the application binary.
+
+Compatible rollback, verified against the actual pre-release process, is the
+NO-MONITOR Capacity/context binary
+`/mnt/deepfreeze/tailterm-hub/releases/20260912-context-capacity-d64615b/tailterm-hub`,
+27,295,906 bytes, SHA-256
+`801f93172221821f1f0788698724d55b92617e4e0eade9667d457643841c58b7`.
+Rollback changes only that middleware binary mount, retaining newer database
+writes, additive monitor tables, generation allocator, messages and audit.
+No rollback or database restore was performed.
+
+Stage A is default-on across eligible open projects. It remains a Queue-age
+notification heuristic. Required-unread assignments, actual progress/checkpoints,
+exact handler wake, verified readiness/acknowledgement, escalation and
+browser-closed/relay-restart/dead-lead guarantees remain outside this release
+and incomplete. The provenance gap #2530/#2550 above remains unchanged.
 
 ## Configuration and observation
 
