@@ -1,0 +1,44 @@
+{
+  "schemaVersion": 1,
+  "itemId": "wi_618c8ff87e6b8061",
+  "itemRevision": 5,
+  "releaseOrder": 4074,
+  "sourceCandidate": "3da7ae703ac6528e9aeb2151b03dcc4335f8e2ec",
+  "leadAcceptanceMessage": 4099,
+  "savedAcceptance": {
+    "message": 4100,
+    "receipt": {
+      "id": "mpr_0f1c5b164db9fc21",
+      "requestId": "qualified-release-acceptance-4099",
+      "taskId": "tsk_2cfcff70a0fbe967",
+      "messageSeq": 4100,
+      "createdAt": "2026-09-13T18:51:18.105141574Z"
+    },
+    "itemLinks": [
+      {
+        "itemTaskId": "tsk_2cfcff70a0fbe967",
+        "itemId": "wi_618c8ff87e6b8061",
+        "itemRevision": 5,
+        "relationship": "primary"
+      }
+    ],
+    "workOrder": {
+      "taskId": "tsk_2cfcff70a0fbe967",
+      "seq": 4074
+    }
+  },
+  "operatorReceipt": {
+    "path": "release-receipt.json",
+    "bytes": 5803,
+    "sha256": "dc598352dd5caae5fe3f2f87683ef1e913a54f529124d9025a979637db272d8c"
+  },
+  "evidence": {
+    "path": "handler-acceptance-board.json",
+    "bytes": 5158,
+    "sha256": "3a4e165e786d437622ce666c98fa889a9ccc37ba5d5e11a748282193009f7867"
+  },
+  "acceptedScope": "explicit normalized typed-record hub/Mini phase only",
+  "parentFeatureComplete": false,
+  "executionFollowThrough4053Delivered": false,
+  "sourceIntegration": null
+}

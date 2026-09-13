@@ -1,0 +1,83 @@
+{
+  "messages": [
+    {
+      "workItems": [
+        {
+          "itemTaskId": "tsk_2cfcff70a0fbe967",
+          "itemId": "wi_618c8ff87e6b8061",
+          "itemRevision": 5,
+          "relationship": "primary"
+        }
+      ],
+      "workOrderMessage": {
+        "taskId": "tsk_2cfcff70a0fbe967",
+        "seq": 4074
+      },
+      "postReceipt": {
+        "id": "mpr_86acba0da906bb70",
+        "requestId": "postactivation-profile-gate-4093",
+        "taskId": "tsk_2cfcff70a0fbe967",
+        "messageSeq": 4094,
+        "createdAt": "2026-09-13T18:48:49.261930656Z"
+      },
+      "seq": 4094,
+      "taskId": "tsk_2cfcff70a0fbe967",
+      "from": {
+        "agentId": "agt_3760a4361c514a03",
+        "node": "workspace",
+        "user": "owner"
+      },
+      "text": "Post-activation handler verification completed using SAME canonical method as preinventory4090: sorted row objects to compact JSON UTF-8 SHA256. Exact backup4085 and live state profile hashes match: profile_meta rows1 bytes58 SHA256 fad8fb4d29ffcd9ab864735de85f682278203ff3c78ee52c4e543b7fd04b0263; profiles rows1 bytes151722 SHA256 e4c428e66069af3e6feb3dfc88dedbb65bab132c3034d9ce6c4dc66fe73cae0a; profile_history rows10 bytes1456215 SHA256 43c4c89a7c40ef8314705d35e0c1853cb916fb0ea113e4e341b6fddd24548213. Live has required_deliveries, delivery_blocks, delivery_events, delivery_operation_receipts plus operational_records and operational_record_versions; all counts 0. Declared index inventory is unchanged from backup (no extra explicit indexes). Backup integrity OK/FK zero from gate4085; no additional DB mutation.",
+      "createdAt": "2026-09-13T18:48:49.261930656Z"
+    },
+    {
+      "postReceipt": {
+        "id": "mpr_20741b8ce2b33120",
+        "requestId": "postactivation-profile-reply-4093",
+        "taskId": "tsk_2cfcff70a0fbe967",
+        "messageSeq": 4095,
+        "createdAt": "2026-09-13T18:48:54.435453842Z"
+      },
+      "replyTo": 4093,
+      "seq": 4095,
+      "taskId": "tsk_2cfcff70a0fbe967",
+      "from": {
+        "agentId": "agt_3760a4361c514a03",
+        "node": "workspace",
+        "user": "owner"
+      },
+      "text": "Saved exact post-activation result as #4094: SAME-function profile hashes match, additive operational tables present, existing delivery tables retained, declared indexes unchanged, live counts zero. Qualified release acceptance may proceed under lead ownership; no parent or order4053 completion claim.",
+      "createdAt": "2026-09-13T18:48:54.435453842Z"
+    },
+    {
+      "workItems": [
+        {
+          "itemTaskId": "tsk_2cfcff70a0fbe967",
+          "itemId": "wi_618c8ff87e6b8061",
+          "itemRevision": 5,
+          "relationship": "primary"
+        }
+      ],
+      "workOrderMessage": {
+        "taskId": "tsk_2cfcff70a0fbe967",
+        "seq": 4074
+      },
+      "postReceipt": {
+        "id": "mpr_649955fd56355c9c",
+        "requestId": "live-integrity-gate-4096",
+        "taskId": "tsk_2cfcff70a0fbe967",
+        "messageSeq": 4097,
+        "createdAt": "2026-09-13T18:50:18.529439681Z"
+      },
+      "seq": 4097,
+      "taskId": "tsk_2cfcff70a0fbe967",
+      "from": {
+        "agentId": "agt_3760a4361c514a03",
+        "node": "workspace",
+        "user": "owner"
+      },
+      "text": "Live post-migration read-only checks completed via authorized SSH handler context on /mnt/deepfreeze/tailterm-hub/state/hub.sqlite: PRAGMA integrity_check returned ok; foreign_key_check returned 0 rows. No profile rehash, backup, or database mutation performed.",
+      "createdAt": "2026-09-13T18:50:18.529439681Z"
+    }
+  ]
+}

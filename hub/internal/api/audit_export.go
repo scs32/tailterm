@@ -18,6 +18,10 @@ const (
 )
 
 type Capabilities struct {
+	OperationalRecords struct {
+		Supported bool  `json:"supported"`
+		Versions  []int `json:"versions"`
+	} `json:"operationalRecords"`
 	SchemaVersion int `json:"schemaVersion"`
 	MessageAudit  struct {
 		Versions   []int `json:"versions"`
@@ -74,6 +78,8 @@ func CurrentCapabilities() Capabilities {
 	out.Queue.MaxPageBytes = MaxQueuePageBytes
 	out.AllocationIntent.Supported = true
 	out.AllocationIntent.Versions = []int{AllocationIntentCapabilityVersion}
+	out.OperationalRecords.Supported = true
+	out.OperationalRecords.Versions = []int{OperationalRecordsCapabilityVersion}
 	out.ReliableDelivery.Supported = true
 	out.ReliableDelivery.Versions = []int{ReliableDeliveryCapabilityVersion}
 	return out

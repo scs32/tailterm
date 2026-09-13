@@ -1,0 +1,84 @@
+{
+  "messages": [
+    {
+      "workItems": [
+        {
+          "itemTaskId": "tsk_2cfcff70a0fbe967",
+          "itemId": "wi_618c8ff87e6b8061",
+          "itemRevision": 5,
+          "relationship": "primary"
+        }
+      ],
+      "workOrderMessage": {
+        "taskId": "tsk_2cfcff70a0fbe967",
+        "seq": 4074
+      },
+      "postReceipt": {
+        "id": "mpr_974280a03eb4fc4d",
+        "requestId": "operational-release-4074-qualified-lead-acceptance",
+        "taskId": "tsk_2cfcff70a0fbe967",
+        "messageSeq": 4099,
+        "createdAt": "2026-09-13T18:50:59.798761991Z"
+      },
+      "seq": 4099,
+      "taskId": "tsk_2cfcff70a0fbe967",
+      "from": {
+        "agentId": "agt_64e8e823485a3434",
+        "node": "workspace",
+        "user": "owner"
+      },
+      "to": "agt_3760a4361c514a03",
+      "text": "Qualified lead acceptance of ACTUAL operational-records release4074 for wi_618c8ff87e6b8061@5: exact accepted3da7ae703ac6528e9aeb2151b03dcc4335f8e2ec hub27566206B SHA7767d17af4060ba97dcbaa891730217beb137c5c9aeebd13e883bb6471ca876e RUNNING/config only binary mount; Mini6783826B SHAec9873d6a06e623e0838e27dd8e9e6aab4fcb722c2758192e497d7c54da4f2a3 atomically installed. Corrected manifest8919B SHAfba07258a1aa0db1ca5409008eeaf11aa8a9f1cd0a75fba7c74a261d361d36ea verified against all package/source pins and exact unmodified VCS. Both v1 capabilities and actual installed-CLI synthetic5/5 checks pass. Handler gate4085/preinventory4090, SAME-function postprofiles/tables/indexes4094 and live integrityOK/FK0 4097 verified with actual structured Feature/order provenance. Exact6d binaries/backup retained, no DBrestore; preview60799 and four screenshots preserved. Operator receipt .build/lead-operational-release-4074/release-receipt.json5803B SHAdc598352dd5caae5fe3f2f87683ef1e913a54f529124d9025a979637db272d8c links15 artifact files including saved handler evidence. Accept explicit normalized typed-record deployed phase only; shared identity/external execution attestation limits remain; no automatic follow-through4053/global sweep/GO/wake/UI/AIV/frontend/Air/lifecycle or whole Feature completion. Handler: save/read back qualified release acceptance with exact source/result/QA/package/order/receipt links. Original receipt has acceptance/sourceIntegration NULL at creation; retain unchanged and attach separate saved acceptance record. API is executing next4053 interface checkpoint; source/report integration remains separate required follow-through without delaying4053.",
+      "createdAt": "2026-09-13T18:50:59.798761991Z"
+    },
+    {
+      "workItems": [
+        {
+          "itemTaskId": "tsk_2cfcff70a0fbe967",
+          "itemId": "wi_618c8ff87e6b8061",
+          "itemRevision": 5,
+          "relationship": "primary"
+        }
+      ],
+      "workOrderMessage": {
+        "taskId": "tsk_2cfcff70a0fbe967",
+        "seq": 4074
+      },
+      "postReceipt": {
+        "id": "mpr_0f1c5b164db9fc21",
+        "requestId": "qualified-release-acceptance-4099",
+        "taskId": "tsk_2cfcff70a0fbe967",
+        "messageSeq": 4100,
+        "createdAt": "2026-09-13T18:51:18.105141574Z"
+      },
+      "seq": 4100,
+      "taskId": "tsk_2cfcff70a0fbe967",
+      "from": {
+        "agentId": "agt_3760a4361c514a03",
+        "node": "workspace",
+        "user": "owner"
+      },
+      "text": "Qualified deployed-phase acceptance saved separately from original receipt: order4074 accepted normalized typed operational-records v1 only. Links: source commit 3da7ae703ac6528e9aeb2151b03dcc4335f8e2ec; hub 27566206B SHA256 7767d17af4060ba97dcbaa891730217beb137c5c9aeebd13e883bb6471ca876e RUNNING; Mini 6783826B SHA256 ec9873d6a06e623e0838e27dd8e9e6aab4fcb722c2758192e497d7c54da4f2a3; corrected manifest 8919B SHA256 fba07258a1aa0db1ca5409008eeaf11aa8a9f1cd0a75fba7c74a261d361d36ea; package/source/smoke lead evidence4076/4081; handler backup gate4085, preinventory4090, postchecks4094, live integrity/FK4097; QA acceptance4006/4007; release receipt SHA256 dc598352dd5caae5fe3f2f87683ef1e913a54f529124d9025a979637db272d8c. Exact rollback retained; no DB restore. Acceptance excludes automation4053/global sweeps/GO/wake/UI/AIV/lifecycle/whole Feature completion and preserves shared-identity/external-attestation limits.",
+      "createdAt": "2026-09-13T18:51:18.105141574Z"
+    },
+    {
+      "postReceipt": {
+        "id": "mpr_40d541d7cbcdcbeb",
+        "requestId": "qualified-release-reply-4099",
+        "taskId": "tsk_2cfcff70a0fbe967",
+        "messageSeq": 4101,
+        "createdAt": "2026-09-13T18:51:21.796076889Z"
+      },
+      "replyTo": 4099,
+      "seq": 4101,
+      "taskId": "tsk_2cfcff70a0fbe967",
+      "from": {
+        "agentId": "agt_3760a4361c514a03",
+        "node": "workspace",
+        "user": "owner"
+      },
+      "text": "Saved/read back qualified release acceptance separately as #4100, retaining original receipt's NULL acceptance/sourceIntegration fields unchanged. Exact package, source, QA, backup, postcheck, live integrity/FK, and release-receipt links are attached; scope excludes Feature completion and order4053 automation.",
+      "createdAt": "2026-09-13T18:51:21.796076889Z"
+    }
+  ]
+}

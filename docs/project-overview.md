@@ -123,18 +123,31 @@ Send to project saves a directed board message to the selected open project's
 orchestrator. It defaults to the owning project; choosing another does not move
 the record or start a team. The receipt confirms message storage, not execution.
 
-The TrueNAS hub and Mini CLI now run the qualified manual directive core from
-exact source `6d2ab09` under Feature `wi_618c8ff87e6b8061` revision5,
-implementation order #3699 and release order #3951. Its explicit execution
-ledger sits on top of stored messages; current-assignment lookup, CAS
+The TrueNAS hub and Mini CLI now run exact source
+`3da7ae703ac6528e9aeb2151b03dcc4335f8e2ec` under Feature
+`wi_618c8ff87e6b8061` revision5 and release order #4074. That source retains the
+qualified manual directive core from `6d2ab09`: current-assignment lookup, CAS
 supersession, exact-run acknowledgment, progress, blocking, resolution, resume
 and result receipts keep retrieval, execution evidence and outcome acceptance
 separate. The CLI requires the versioned hub capability and never falls back to
-an inbox read or lifecycle event. This deployed manual core does not add verified wake
-transport, keep-going/watchdog automation, provider hooks, UI, or the global
-handler assessment consumer, and Air/frontend remain unchanged. See
-[reliable directive core](reliable-directive-core.md) and the
-[exact release receipt](releases/reliable-directive-core-6d2ab09/release-receipt.json).
+an inbox read or lifecycle event.
+
+The deployed source also exposes `operationalRecords` v1 from implementation
+order #3915. Explicit proposed/committed instruction, finding, candidate,
+verification, result and acceptance records are versioned and schema-checked;
+they reuse directive events and retry receipts rather than creating a second
+ledger. This path validates retained associations under the shared-workspace
+identity model, but does not provide cryptographic agent or external execution
+attestation. See [structured operational records](operational-records.md), its
+[operator receipt](releases/operational-records-3da7ae7/release-receipt.json),
+and the separate
+[handler-saved acceptance](releases/operational-records-3da7ae7/acceptance.json).
+
+Automatic continuation, complete staleness/backlog sweeps, deterministic GO,
+verified wake transport, keep-going/watchdog automation, provider hooks, UI and
+AIV remain undelivered. The handler assessment consumer #3694/#4053 is a later
+slice; Air CLI and the deployed frontend remain unchanged. The parent Feature
+is unfinished.
 
 Browser-created projects launch a database handler after the orchestrator. The
 handler inherits its resolved launch settings and owns all agent work-item database

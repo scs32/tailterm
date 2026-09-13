@@ -1,0 +1,188 @@
+{
+  "schemaVersion": 1,
+  "recordedAt": "2026-09-13T18:49:21.341054+00:00",
+  "taskId": "tsk_2cfcff70a0fbe967",
+  "itemId": "wi_618c8ff87e6b8061",
+  "itemRevision": 5,
+  "implementationOrder": 3915,
+  "qaOrder": 3969,
+  "packageOrder": 4009,
+  "releaseOrder": 4074,
+  "operator": {
+    "agentId": "agt_64e8e823485a3434",
+    "runId": "run_66d063bf724968d0"
+  },
+  "sourceCandidate": "3da7ae703ac6528e9aeb2151b03dcc4335f8e2ec",
+  "base": "6d2ab09ce50480bea47462a3e392f694cbaed5af",
+  "candidateAcceptance": [
+    4008,
+    4011
+  ],
+  "qaEvidence": [
+    4003,
+    4004,
+    4006,
+    4007
+  ],
+  "packageResult": [
+    4066,
+    4075,
+    4078,
+    4079
+  ],
+  "backupGate": {
+    "message": 4085,
+    "receipt": "mpr_ea4c3675b9a01bc0",
+    "path": "/mnt/deepfreeze/tailterm-hub/backups/before-operational-records-3da7ae7.sqlite",
+    "bytes": 31084544,
+    "sha256": "52e75e8bd274636937b1a5951d94501e223ec7d3ae540c2373a2fde14b891e85",
+    "mode": "0600",
+    "uid": 950,
+    "gid": 950,
+    "integrity": "ok",
+    "foreignKeyViolations": 0,
+    "preinventoryMessages": [
+      4090,
+      4092
+    ]
+  },
+  "activationResultMessage": 4093,
+  "hub": {
+    "path": "/mnt/deepfreeze/tailterm-hub/releases/20260913-operational-records-3da7ae7/tailterm-hub",
+    "bytes": 27566206,
+    "sha256": "7767d17af4060ba97dcbaa891730217beb137c5c9aeebd13e883bb6471ca876e",
+    "state": "RUNNING",
+    "onlyBinaryMountChanged": true
+  },
+  "miniCli": {
+    "path": "/Users/stephenspeicher/.local/bin/tt",
+    "bytes": 6783826,
+    "sha256": "ec9873d6a06e623e0838e27dd8e9e6aab4fcb722c2758192e497d7c54da4f2a3",
+    "atomicInstall": true
+  },
+  "checks": {
+    "capabilities": [
+      "operationalRecords v1",
+      "reliableDelivery v1",
+      "legacy fields retained"
+    ],
+    "installedCliSmoke": "5/5 isolated HTTP serialization/output/fail-closed checks; not store semantic retest",
+    "liveFixtureCreated": false,
+    "previewPid60799Preserved": true,
+    "ownerScreenshotsPreserved": 4,
+    "handlerPostchecks": {
+      "messages": [
+        4094,
+        4095,
+        4097
+      ],
+      "retainedProfilesIdentical": true,
+      "canonicalMethod": "sorted row objects to compact JSON UTF-8 SHA256",
+      "newOperationalTables": [
+        "operational_records",
+        "operational_record_versions"
+      ],
+      "existingDeliveryTablesRetained": true,
+      "allSixTableCounts": 0,
+      "explicitIndexesUnchanged": true,
+      "liveIntegrity": "ok",
+      "liveForeignKeyViolations": 0
+    }
+  },
+  "rollback": {
+    "hubPath": "/mnt/deepfreeze/tailterm-hub/releases/20260913-directive-core-6d2ab09/tailterm-hub",
+    "hubSha256": "9e392b83ca70805e5811a12e6681520db6116ec2907ff67e0985b0e2822b85e7",
+    "miniPath": "/Users/stephenspeicher/.local/bin/tt-before-operational-records-3da7ae7",
+    "miniSha256": "f67b7dc13c99feeacd1801c394f67d7a137529d3d5a990bfeacf4ca6ec76a6c2",
+    "databaseRestore": false,
+    "retainAllAdditiveTables": true,
+    "oldBinaryTypedSupport": false,
+    "preserve512KiBCompatibility": true
+  },
+  "releaseAcceptance": null,
+  "sourceIntegration": null,
+  "limitations": [
+    "Explicit normalized input; no prose interpreter/MCP adapter",
+    "Shared-workspace claimed identities, no cryptographic per-agent or external execution attestation",
+    "Execution follow-through4053/sweeps/GO/wake/UI/AIV not deployed",
+    "Frontend and Air unchanged",
+    "Parent Feature remains unfinished; no lifecycle closure"
+  ],
+  "evidence": [
+    {
+      "path": "package-manifest.json",
+      "bytes": 8919,
+      "sha256": "fba07258a1aa0db1ca5409008eeaf11aa8a9f1cd0a75fba7c74a261d361d36ea"
+    },
+    {
+      "path": "package-review.json",
+      "bytes": 793,
+      "sha256": "ce8e535a86271389db2137f3f52f903d27786d6a59b6c8a431c106530d5ced76"
+    },
+    {
+      "path": "preflight.json",
+      "bytes": 1298,
+      "sha256": "cb3d90b8e0d5a4771bbddb1d897a6eee647c39df65a0dbdc0d216251002d3580"
+    },
+    {
+      "path": "pre-config.json",
+      "bytes": 930,
+      "sha256": "d3197ddbd7c42a12f4889f1b3a7241759fe9847c2b9919ad435919e585a589c6"
+    },
+    {
+      "path": "post-config.json",
+      "bytes": 935,
+      "sha256": "ca1b292047f2e2f2cae1586885b2a5bf9dd0bd2934d5bcd5b8bb0f8391603a11"
+    },
+    {
+      "path": "hub-deploy.log",
+      "bytes": 1408,
+      "sha256": "4f78edced0ab16661fa608f4de2084cb16fda7d3b621230ab41993b0faf11dc7"
+    },
+    {
+      "path": "hub-post-verify.json",
+      "bytes": 2075,
+      "sha256": "9e09b989646e35527ceb303941f46ef63474589c1ed1789daaba6098f90ee7e6"
+    },
+    {
+      "path": "mini-install.json",
+      "bytes": 1340,
+      "sha256": "243f76ff7f094cfc9de2f71a012fef7544545237ac6a3850d8dd1667ca3c81fb"
+    },
+    {
+      "path": "installed-cli-smoke.py",
+      "bytes": 5925,
+      "sha256": "2e0801926d065402e96edf7d5e5885e1d36be9d7cba6377773128ba5d3e672f0"
+    },
+    {
+      "path": "installed-cli-smoke.json",
+      "bytes": 4639,
+      "sha256": "de7fe2a53c2bc0e91267ba70dff4e866a123b853e57897cb25c66ce2584fc3a7"
+    },
+    {
+      "path": "operational-proposal.json",
+      "bytes": 66,
+      "sha256": "2911fb8bdff80c2077c2f12624f29207469f6e74f92b8e956d80ed739f7bba2a"
+    },
+    {
+      "path": "operational-commit.json",
+      "bytes": 54,
+      "sha256": "6595a3daf04fb43cc162cb79e5ba5d878de36573bb2c2776c031cf39fc4cf7cb"
+    },
+    {
+      "path": "handler-backup-gate-board.json",
+      "bytes": 3004,
+      "sha256": "dd7d98cd40e2782db0483f00275e665db29b51596d5336fd7a30ae15ef087098"
+    },
+    {
+      "path": "handler-preinventory-board.json",
+      "bytes": 7953,
+      "sha256": "9de93b2a3cb5f5fcb3bc320b18c33d969d8c7f8589cf6b501b998e0980195b68"
+    },
+    {
+      "path": "handler-postchecks-board.json",
+      "bytes": 3574,
+      "sha256": "33527041da662b7fadc7da3317316027665870028ba36bfc8fda1618a7043a45"
+    }
+  ]
+}

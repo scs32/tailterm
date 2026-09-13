@@ -1,0 +1,72 @@
+{
+  "messages": [
+    {
+      "workItems": [
+        {
+          "itemTaskId": "tsk_2cfcff70a0fbe967",
+          "itemId": "wi_618c8ff87e6b8061",
+          "itemRevision": 5,
+          "relationship": "primary"
+        }
+      ],
+      "workOrderMessage": {
+        "taskId": "tsk_2cfcff70a0fbe967",
+        "seq": 4074
+      },
+      "postReceipt": {
+        "id": "mpr_ea4c3675b9a01bc0",
+        "requestId": "backup-gate-operational-records-4080",
+        "taskId": "tsk_2cfcff70a0fbe967",
+        "messageSeq": 4085,
+        "createdAt": "2026-09-13T18:45:26.046985564Z"
+      },
+      "seq": 4085,
+      "taskId": "tsk_2cfcff70a0fbe967",
+      "from": {
+        "agentId": "agt_3760a4361c514a03",
+        "node": "workspace",
+        "user": "owner"
+      },
+      "text": "Handler-owned remote backup gate completed via authorized SSH context: /mnt/deepfreeze/tailterm-hub/backups/before-operational-records-3da7ae7.sqlite; mode0600 UID/GID950:950; size31084544 bytes; SHA256 52e75e8bd274636937b1a5951d94501e223ec7d3ae540c2373a2fde14b891e85. SQLite integrity_check=ok; foreign_key_check returned no rows. No deployment/activation performed; release remains gated on subsequent live verification and lead acceptance.",
+      "createdAt": "2026-09-13T18:45:26.046985564Z"
+    },
+    {
+      "postReceipt": {
+        "id": "mpr_847c6e92131c2252",
+        "requestId": "backup-gate-reply-4080",
+        "taskId": "tsk_2cfcff70a0fbe967",
+        "messageSeq": 4086,
+        "createdAt": "2026-09-13T18:45:30.596957041Z"
+      },
+      "replyTo": 4080,
+      "seq": 4086,
+      "taskId": "tsk_2cfcff70a0fbe967",
+      "from": {
+        "agentId": "agt_3760a4361c514a03",
+        "node": "workspace",
+        "user": "owner"
+      },
+      "text": "Completed the handler-owned remote backup gate and saved native confirmation #4085: 31084544 bytes, SHA256 52e75e8bd274636937b1a5951d94501e223ec7d3ae540c2373a2fde14b891e85, mode0600 UID/GID950, integrity OK, zero FK violations. No activation performed.",
+      "createdAt": "2026-09-13T18:45:30.596957041Z"
+    },
+    {
+      "postReceipt": {
+        "id": "mpr_fc68490704986e76",
+        "requestId": "bounded-diagnosis-disposition-4084",
+        "taskId": "tsk_2cfcff70a0fbe967",
+        "messageSeq": 4087,
+        "createdAt": "2026-09-13T18:45:43.596419174Z"
+      },
+      "replyTo": 4084,
+      "seq": 4087,
+      "taskId": "tsk_2cfcff70a0fbe967",
+      "from": {
+        "agentId": "agt_3760a4361c514a03",
+        "node": "workspace",
+        "user": "owner"
+      },
+      "text": "Confirmed and preserved bounded diagnosis/recovery disposition: nart_cabb661d6288e5eb v1 and exact links 4057, 4066/4067, 4075/4076/4081, 4078/4079. Sustained packaging recovery is evidenced; provider cause remains unverified and automated prevention is not delivered. I will not close the parent Feature, retire roles, or mark order4053/deployment complete; no further operator intervention taken.",
+      "createdAt": "2026-09-13T18:45:43.596419174Z"
+    }
+  ]
+}

@@ -1,0 +1,204 @@
+{
+  "version": 1,
+  "stage": "package_preparation_only",
+  "workItem": {
+    "taskId": "tsk_2cfcff70a0fbe967",
+    "itemId": "wi_618c8ff87e6b8061",
+    "itemRevision": 5,
+    "implementationOrderMessageSeq": 3915,
+    "qaOrderMessageSeq": 3969,
+    "packageOrderMessageSeq": 4009,
+    "packageAssignmentMessageSeq": 4012,
+    "fullOrderDeliveryMessageSeq": 4020,
+    "agentId": "agt_ac3ad2691a275f59",
+    "runId": "run_43657fe460aec447",
+    "contextDigest": "3832346f3517a146c69b717a0faa629323316c0e423a5a45d947d7251b3c9354",
+    "queueStartMessageSeq": 3799,
+    "queueStartReceiptId": "qrr_7f80a6a31ab0717c"
+  },
+  "source": {
+    "baselineCommit": "6d2ab09ce50480bea47462a3e392f694cbaed5af",
+    "candidateCommit": "3da7ae703ac6528e9aeb2151b03dcc4335f8e2ec",
+    "supersededCandidate": "95106b62b40370e63458789969d9f892aaac6e15",
+    "cleanIndependentClone": "/tmp/operational-records-clone-3da7ae7.6yAx8f/source",
+    "rootWorktreeModified": false,
+    "archive": {
+      "path": "source-3da7ae7.tar",
+      "bytes": 10567680,
+      "sha256": "8d90e53f530841eb81e206f4e00b7e2166744a5f8beb7a6d114f87e6b5126413",
+      "gitArchiveCommit": "3da7ae703ac6528e9aeb2151b03dcc4335f8e2ec",
+      "entryCount": 506,
+      "scope": "complete repository tree"
+    }
+  },
+  "build": {
+    "toolchainRecordedByBinaries": "go1.26.6",
+    "host": "macOS 26.5.2 build 25F84 arm64",
+    "flags": "CGO_ENABLED=0 -buildvcs=true -trimpath -ldflags='-s -w -buildid='",
+    "vcsRevision": "3da7ae703ac6528e9aeb2151b03dcc4335f8e2ec",
+    "vcsModified": false,
+    "twoBuildByteReproducible": true,
+    "metadataEvidence": {
+      "path": "go-version-m.txt",
+      "bytes": 4866,
+      "sha256": "09914f8a5975d24bb0a06523d0bf6634a839a454cb018fd216e1c0efb8195cfd"
+    }
+  },
+  "artifacts": {
+    "hub": {
+      "path": "tailterm-hub-linux-amd64",
+      "os": "linux",
+      "arch": "amd64",
+      "bytes": 27566206,
+      "sha256": "7767d17af4060ba97dcbaa891730217beb137c5c9aeebd13e883bb6471ca876e",
+      "format": "ELF 64-bit x86-64, statically linked, stripped",
+      "vcsRevision": "3da7ae703ac6528e9aeb2151b03dcc4335f8e2ec",
+      "vcsModified": false
+    },
+    "miniCli": {
+      "path": "tt-darwin-arm64",
+      "os": "darwin",
+      "arch": "arm64",
+      "bytes": 6783826,
+      "sha256": "ec9873d6a06e623e0838e27dd8e9e6aab4fcb722c2758192e497d7c54da4f2a3",
+      "format": "Mach-O 64-bit arm64",
+      "vcsRevision": "3da7ae703ac6528e9aeb2151b03dcc4335f8e2ec",
+      "vcsModified": false
+    },
+    "rollbackHub": {
+      "path": "rollback-tailterm-hub-linux-amd64",
+      "bytes": 27476094,
+      "sha256": "9e392b83ca70805e5811a12e6681520db6116ec2907ff67e0985b0e2822b85e7",
+      "vcsRevision": "6d2ab09ce50480bea47462a3e392f694cbaed5af"
+    },
+    "rollbackMiniCli": {
+      "path": "rollback-tt-darwin-arm64",
+      "bytes": 6766066,
+      "sha256": "f67b7dc13c99feeacd1801c394f67d7a137529d3d5a990bfeacf4ca6ec76a6c2",
+      "vcsRevision": "6d2ab09ce50480bea47462a3e392f694cbaed5af"
+    }
+  },
+  "rejectedPreparationArtifacts": {
+    "reason": "The first linked-worktree build was byte-reproducible but omitted vcs.revision and vcs.modified from go version -m; it is not release eligible.",
+    "directory": "rejected-worktree-vcs",
+    "hub": {
+      "bytes": 27562110,
+      "sha256": "48451045c50ddbdf26cf50a612b0dd85a5bc23a4f40798b85b45e1cc73e705b5"
+    },
+    "miniCli": {
+      "bytes": 6783826,
+      "sha256": "7934ae40c8ee53564cc92660829ca61a7447f4c4184debcf34a5eb18de1a49e4"
+    }
+  },
+  "capabilityAndMigration": {
+    "capability": {
+      "jsonField": "operationalRecords",
+      "supported": true,
+      "versions": [1],
+      "legacyFallback": false
+    },
+    "newTables": [
+      "operational_records",
+      "operational_record_versions"
+    ],
+    "sharedExistingTables": [
+      "delivery_events",
+      "delivery_operation_receipts"
+    ],
+    "newIndexes": [],
+    "migration": "additive CREATE TABLE IF NOT EXISTS during normal store open; no existing table or column is dropped, rewritten or backfilled",
+    "routes": [
+      "POST /v1/tasks/{task}/operational-records",
+      "POST /v1/tasks/{task}/operational-records/{record}/commit",
+      "GET /v1/tasks/{task}/operational-records/{record}?version=N"
+    ],
+    "compatibility": "Old binaries omit operationalRecords and cannot claim typed support. They ignore retained additive tables; all data must remain and no database restore is authorized."
+  },
+  "evidence": {
+    "implementationResult": {
+      "path": "implementation-result.json",
+      "bytes": 4565,
+      "sha256": "5b70c8c4421f5056964cb52ed03c9a2579fb3f124b23d4c9cc6413f540a1ce5e",
+      "nativeArtifact": "nart_74f2a49f66d875bf",
+      "nativeArtifactVersion": 1,
+      "source": "operational-3915-result"
+    },
+    "independentQA": {
+      "messageSeqs": [4003, 4004, 4006, 4007],
+      "retainedMessagePath": "qa-evidence.json",
+      "retainedMessageBytes": 1372,
+      "retainedMessageSha256": "5dce22b9e36c7eaa7f7ae32f77c3933495993078fc4b7bbc08b6d415e1c84a68",
+      "planCommit": "dd655647a73dc4674bb71635375ce166b9cf4145",
+      "planPath": "operational-records-qa-plan.md",
+      "planBytes": 3059,
+      "planSha256": "f3789778de5f82264ff91bfaa995d1de0a26cb78b0aa53ad69b414904cd26cbe",
+      "result": "pass",
+      "limitation": "No distinct QA narrative artifact exists; exact Board evidence and the committed QA plan are retained."
+    },
+    "packagedCliSmoke": {
+      "scriptPath": "operational-cli-smoke.py",
+      "scriptBytes": 5912,
+      "scriptSha256": "f8ec87b410f10c1547d2d6c9a7a100030516770177fe134edba7cba3ad157042",
+      "resultPath": "operational-cli-smoke.json",
+      "resultBytes": 4639,
+      "resultSha256": "de7fe2a53c2bc0e91267ba70dff4e866a123b853e57897cb25c66ce2584fc3a7",
+      "proposalRequest": {
+        "path": "operational-proposal.json",
+        "bytes": 66,
+        "sha256": "2911fb8bdff80c2077c2f12624f29207469f6e74f92b8e956d80ed739f7bba2a"
+      },
+      "commitRequest": {
+        "path": "operational-commit.json",
+        "bytes": 54,
+        "sha256": "6595a3daf04fb43cc162cb79e5ba5d878de36573bb2c2776c031cf39fc4cf7cb"
+      },
+      "results": [
+        "packaged CLI propose request/output pass",
+        "packaged CLI get request/output pass",
+        "packaged CLI commit request/output pass",
+        "unsupported capability fails closed before action",
+        "unknown capability version fails closed before action"
+      ],
+      "scope": "isolated synthetic HTTP serialization/output/capability only; independent QA covers store semantics"
+    }
+  },
+  "qualification": {
+    "sourceArchiveCommitVerified": true,
+    "sourceFilePinsMatchImplementationArtifact": true,
+    "cleanIndependentClone": true,
+    "twoBuildByteReproducible": true,
+    "goVersionMExactCandidateAndUnmodified": true,
+    "packagedCliSmoke": "5/5 pass; 8 isolated HTTP requests",
+    "independentQA": "pass per messages 4006/4007",
+    "liveDataOrServiceUsed": false
+  },
+  "limitations": [
+    "Explicit normalized input only; no prose interpreter or MCP adapter",
+    "Shared-workspace claimed identities; no cryptographic per-agent or external test execution attestation",
+    "No scheduler, complete backlog sweep, GO/wake transport, heartbeat enforcement, UI, AIV integration or automatic work-item closure",
+    "Historical committed records are not current actionability; every new commit rechecks current state",
+    "Package preparation is not activation, deployment, release acceptance or parent Feature completion"
+  ],
+  "rolloutPlanNotExecuted": [
+    "Obtain a separate concrete release order and handler-created pre-migration backup/integrity/profile gate.",
+    "Activate the exact Linux hub artifact through existing TrueNAS middleware with only the binary mount changed; do not alter networking, Tailscale, state identity, profiles, relay or frontend.",
+    "Verify operationalRecords v1 and existing reliableDelivery v1, legacy endpoints and additive migration without creating live synthetic records.",
+    "Atomically install the exact Mini CLI only after hub verification, retaining the exact 6d2ab09 CLI rollback; qualify other hosts separately."
+  ],
+  "rollbackPlanNotExecuted": [
+    "Before any typed operational record exists, an authorized release operator may restore the exact retained 6d2ab09 binaries and verify their hashes.",
+    "After typed records exist, retain the database and additive tables; never restore an older database. Older binaries ignore the tables but cannot claim operationalRecords support.",
+    "Any activation or rollback requires a separate handler-reviewed order and receipts."
+  ],
+  "authorization": {
+    "activation": false,
+    "deployment": false,
+    "databaseMigrationExecuted": false,
+    "installedCliChanged": false,
+    "liveHubChanged": false,
+    "frontendChanged": false,
+    "airChanged": false,
+    "relayOrNetworkChanged": false,
+    "lifecycleChanged": false
+  }
+}

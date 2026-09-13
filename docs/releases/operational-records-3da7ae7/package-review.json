@@ -1,0 +1,28 @@
+{
+  "packageDirectory": "/Users/stephenspeicher/projects/tailterm/.build/worktrees/reliable-directive-core-api-mini/.build/operational-records-3da7ae7",
+  "sourceCandidate": "3da7ae703ac6528e9aeb2151b03dcc4335f8e2ec",
+  "manifestBytes": 8919,
+  "manifestSha256": "fba07258a1aa0db1ca5409008eeaf11aa8a9f1cd0a75fba7c74a261d361d36ea",
+  "releaseEligibleArtifactPins": "pass",
+  "sourceArchiveCommitAnd14SourcePins": "pass",
+  "exactUnmodifiedVCS": "pass",
+  "repeatedBinaryEquality": "pass",
+  "rejectedArtifactPinCorrection": "pass",
+  "packagedSmokeReview": "5 synthetic HTTP cases; store semantics from QA4006",
+  "candidateAcceptance": [
+    4008,
+    4011
+  ],
+  "independentQA": [
+    4003,
+    4004,
+    4006,
+    4007
+  ],
+  "packageResult": [
+    4066,
+    4075,
+    4078,
+    4079
+  ]
+}

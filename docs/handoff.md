@@ -1,10 +1,45 @@
 # Development handoff — September 10, 2026
 
-## September 13 reliable directive core — deployed and accepted
+## September 13 structured operational records — deployed and accepted
+
+Feature `wi_618c8ff87e6b8061` revision5, implementation order #3915 and
+release order #4074 now have a qualified hub/Mini deployment from exact source
+`3da7ae703ac6528e9aeb2151b03dcc4335f8e2ec`, based on accepted manual core
+`6d2ab09ce50480bea47462a3e392f694cbaed5af`. It adds versioned proposed and
+committed typed operational records, validates exact source/item/scope/run/
+generation/epoch and candidate/test evidence, reuses the directive core's
+events and retry receipts, and keeps result submission separate from authorized
+acceptance.
+
+The TrueNAS hub is RUNNING from the exact release binary (27,566,206 bytes,
+SHA-256 `7767d17af4060ba97dcbaa891730217beb137c5c9aeebd13e883bb6471ca876e`).
+The Mini CLI was installed atomically (6,783,826 bytes, SHA-256
+`ec9873d6a06e623e0838e27dd8e9e6aab4fcb722c2758192e497d7c54da4f2a3`).
+Both expose `operationalRecords` v1 while retaining `reliableDelivery` v1.
+Handler pre/post comparison found retained profiles identical, integrity OK,
+zero foreign-key violations, and the two additive operational-record tables
+empty after migration. The accepted manual-core binaries remain the rollback;
+do not restore the database because both migrations are additive.
+
+[The immutable operator receipt](releases/operational-records-3da7ae7/release-receipt.json),
+all 15 nested hash-linked evidence files, and the separate
+[handler-saved acceptance](releases/operational-records-3da7ae7/acceptance.json)
+are retained together without rewriting the receipt's at-creation null fields.
+See [the structured record contract](operational-records.md) for behavior and
+limits. This source/evidence synchronization performed no rebuild or deployment.
+
+Automatic continuation, complete staleness/backlog sweeps, deterministic GO,
+verified wake transport, UI, AIV, cryptographic/external execution attestation,
+Air CLI and frontend support remain undelivered. Consumer #3694/#4053 remains a
+separate next slice, and the parent Feature remains unfinished. The detached
+Mini preview PID60799/PPID1, four owner screenshots and existing services remain
+preserved.
+
+## September 13 reliable directive core — accepted deployment foundation
 
 Feature `wi_618c8ff87e6b8061` revision5, first-core order #3699 and exact Start
 #3799 (`que_d251c3e90d220fd5` cycle2/revision16,
-`qrr_7f80a6a31ab0717c`), plus release order #3951, now have a qualified
+`qrr_7f80a6a31ab0717c`), plus release order #3951, established a qualified
 manual-core deployment based on accepted application
 `ad89388c2ec7cbbddd43d0ded710db8139b1658c`. Exact source
 `6d2ab09ce50480bea47462a3e392f694cbaed5af` adds a versioned,
@@ -16,12 +51,12 @@ wake attempt; ordinary inbox reads, heartbeats and Queue Start remain
 non-execution evidence. Result remains separate from handler acceptance, Queue
 completion and worker closeout.
 
-The TrueNAS hub is RUNNING from that exact source (27,476,094 bytes,
+At that release, the TrueNAS hub ran that exact source (27,476,094 bytes,
 SHA-256 `9e392b83ca70805e5811a12e6681520db6116ec2907ff67e0985b0e2822b85e7`)
-with only its binary mount changed. Mini CLI is installed atomically
+with only its binary mount changed. Mini CLI was installed atomically
 (6,766,066 bytes, SHA-256
 `f67b7dc13c99feeacd1801c394f67d7a137529d3d5a990bfeacf4ca6ec76a6c2`),
-and the accepted `ad89388` CLI remains as rollback. The installed HTTP and CLI
+and the accepted `ad89388` CLI remained as rollback. The installed HTTP and CLI
 paths advertise `reliableDelivery` v1 and fail closed when it is unavailable or
 unknown. Independent QA #3938/#3940, candidate acceptance #3942/#3943,
 same-function profile/integrity checks #3961, corrected additive migration
@@ -34,13 +69,16 @@ is retained byte-for-byte; the separate
 [acceptance record](releases/reliable-directive-core-6d2ab09/acceptance.json)
 resolves its then-pending qualified acceptance without rewriting it. See
 [reliable directive core](reliable-directive-core.md) for behavior and limits.
-This source/report synchronization performed no rebuild or deployment.
+This source/report synchronization performed no rebuild or deployment. The
+later operational-record release above retains this manual-core behavior and is
+the current hub/Mini inventory; these binaries remain its rollback.
 
 Transport/relay correction, keep-going/watchdog logic, tool/provider integration,
-typed operational authority, UI and handler-global assessment consumer #3694
-remain explicitly undelivered. Air CLI and the deployed frontend are unchanged;
-the parent Feature remains unfinished. The detached Mini preview PID60799/PPID1,
-four owner screenshots and existing services remain preserved.
+UI and handler-global assessment consumer #3694 remain explicitly undelivered.
+Typed operational records are delivered only by the separate bounded release
+above. Air CLI and the deployed frontend are unchanged; the parent Feature
+remains unfinished. The detached Mini preview PID60799/PPID1, four owner
+screenshots and existing services remain preserved.
 
 ## September 13 native context capacity — deployed and accepted
 

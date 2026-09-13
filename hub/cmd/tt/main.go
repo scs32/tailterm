@@ -46,6 +46,7 @@ Commands
   ask --request-id KEY --file PATH [--json]  request an owner decision on the Board
   inbox [--unread] [--mark-read] [--json]
   context [--json]             print this exact run's bound work-item context
+  operational-record propose|commit|get  validated operational records
   current-assignment [--json]  fetch the server-selected exact directive
   delivery <command>           create/ack/progress/block/resolve/resume/result
   spawn --name N --run CMD [--cwd D] [--prompt P] [--runtime R] [--task ID]
@@ -169,6 +170,8 @@ func main() {
 		err = cmdInbox(e, args)
 	case "context":
 		err = cmdContext(e, args)
+	case "operational-record":
+		err = cmdOperationalRecord(e, args)
 	case "current-assignment":
 		err = cmdCurrentAssignment(e, args)
 	case "delivery":
