@@ -1,0 +1,82 @@
+{
+  "bytes": 27357346,
+  "sha256": "dc63470ad85b335ccd0669194456ea561a4ef6326981366a5e3be40de1c8e228",
+  "state": "RUNNING",
+  "containers": [
+    {
+      "id": "544e9aff79512dfb8c3815bb78616e06c210554910be36bc9e33dbf73cd564dc",
+      "service_name": "hub",
+      "image": "gcr.io/distroless/static-debian12:nonroot",
+      "port_config": [
+        {
+          "container_port": 18765,
+          "protocol": "tcp",
+          "host_ports": [
+            {
+              "host_port": 18765,
+              "host_ip": "100.116.238.37"
+            }
+          ]
+        }
+      ],
+      "state": "running",
+      "volume_mounts": [
+        {
+          "source": "/mnt/deepfreeze/tailterm-hub/state",
+          "destination": "/state",
+          "mode": "rw",
+          "type": "bind"
+        },
+        {
+          "source": "/mnt/deepfreeze/tailterm-hub/hub-token",
+          "destination": "/run/hub-token",
+          "mode": "ro",
+          "type": "bind"
+        },
+        {
+          "source": "/mnt/deepfreeze/tailterm-hub/releases/20260913-context-bound-ad89388/tailterm-hub",
+          "destination": "/opt/tailterm-hub",
+          "mode": "ro",
+          "type": "bind"
+        }
+      ]
+    }
+  ],
+  "onlyBinaryMountChanged": true,
+  "capabilities": {
+    "schemaVersion": 1,
+    "messageAudit": {
+      "versions": [
+        1,
+        2
+      ],
+      "maxRelated": 15
+    },
+    "auditExport": {
+      "versions": [
+        2,
+        3
+      ],
+      "maxBytes": 33554432,
+      "maxChunkBytes": 262144,
+      "retentionSeconds": 604800
+    },
+    "queue": {
+      "versions": [
+        1
+      ],
+      "defaultPage": 32,
+      "maxPage": 64,
+      "maxPageBytes": 1048576
+    },
+    "policy": {
+      "messageAudit": "observe"
+    },
+    "allocationIntent": {
+      "supported": true,
+      "versions": [
+        1
+      ]
+    }
+  }
+}

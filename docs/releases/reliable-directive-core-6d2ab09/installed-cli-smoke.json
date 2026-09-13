@@ -1,0 +1,41 @@
+{
+  "installedSha256": "f67b7dc13c99feeacd1801c394f67d7a137529d3d5a990bfeacf4ca6ec76a6c2",
+  "isolatedHTTPOnly": true,
+  "liveCredentialsUsed": false,
+  "liveHubFixtureCreated": false,
+  "results": [
+    "installed current-assignment displays fixture epoch2",
+    "documented flags-before-ID sends exact epoch2/body to isolated fixture",
+    "unsupported capability fails closed before action",
+    "unknown capability fails closed before action"
+  ],
+  "requests": [
+    {
+      "method": "GET",
+      "path": "/v1/capabilities"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/tasks/tsk_0000000000000001/agents/agt_0000000000000002/current-assignment?runId=run_0000000000000003"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/capabilities"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/tasks/tsk_0000000000000001/deliveries/dly_0000000000000004/progress",
+      "requestId": "installed-smoke-progress",
+      "expectedEpoch": 2
+    },
+    {
+      "method": "GET",
+      "path": "/v1/capabilities"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/capabilities"
+    }
+  ],
+  "limit": "This verifies the actual installed CLI serialization/output/capability gate, not a second store semantic acceptance test; QA3938 covers actual CLI-HTTP-store."
+}

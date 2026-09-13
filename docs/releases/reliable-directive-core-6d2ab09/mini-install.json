@@ -1,0 +1,54 @@
+{
+  "installedAt": "2026-09-13T17:46:32.460625+00:00",
+  "path": "/Users/stephenspeicher/.local/bin/tt",
+  "bytes": 6766066,
+  "mode": "0755",
+  "sha256": "f67b7dc13c99feeacd1801c394f67d7a137529d3d5a990bfeacf4ca6ec76a6c2",
+  "backupPath": "/Users/stephenspeicher/.local/bin/tt-before-directive-core-6d2ab09",
+  "backupSha256": "2b81d78b391f287556d8d7f8a241f27a585d3bc7cb132513c1ab982efdd6ecde",
+  "helpPass": true,
+  "capabilities": {
+    "schemaVersion": 1,
+    "messageAudit": {
+      "versions": [
+        1,
+        2
+      ],
+      "maxRelated": 15
+    },
+    "auditExport": {
+      "versions": [
+        2,
+        3
+      ],
+      "maxBytes": 33554432,
+      "maxChunkBytes": 262144,
+      "retentionSeconds": 604800
+    },
+    "queue": {
+      "versions": [
+        1
+      ],
+      "defaultPage": 32,
+      "maxPage": 64,
+      "maxPageBytes": 1048576
+    },
+    "policy": {
+      "messageAudit": "observe"
+    },
+    "allocationIntent": {
+      "supported": true,
+      "versions": [
+        1
+      ]
+    },
+    "reliableDelivery": {
+      "supported": true,
+      "versions": [
+        1
+      ]
+    }
+  },
+  "preview": "60799     1 node scripts/preview-static.mjs dist-static 127.0.0.1 4318",
+  "screenshotsPreserved": 4
+}

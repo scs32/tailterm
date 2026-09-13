@@ -1,11 +1,13 @@
 # Development handoff — September 10, 2026
 
-## September 13 reliable directive core candidate
+## September 13 reliable directive core — deployed and accepted
 
 Feature `wi_618c8ff87e6b8061` revision5, first-core order #3699 and exact Start
 #3799 (`que_d251c3e90d220fd5` cycle2/revision16,
-`qrr_7f80a6a31ab0717c`) have an isolated backend candidate based on accepted
-application `ad89388c2ec7cbbddd43d0ded710db8139b1658c`. It adds a versioned,
+`qrr_7f80a6a31ab0717c`), plus release order #3951, now have a qualified
+manual-core deployment based on accepted application
+`ad89388c2ec7cbbddd43d0ded710db8139b1658c`. Exact source
+`6d2ab09ce50480bea47462a3e392f694cbaed5af` adds a versioned,
 durable manual item-worker directive protocol: immutable message attachment,
 exact item/run/order/context binding, coherent current-assignment lookup, CAS
 supersession, keyed receipt recovery, and explicit ack/progress/block/
@@ -14,20 +16,57 @@ wake attempt; ordinary inbox reads, heartbeats and Queue Start remain
 non-execution evidence. Result remains separate from handler acceptance, Queue
 completion and worker closeout.
 
-The HTTP and native CLI paths fail closed when the new `reliableDelivery` v1
-capability is unavailable. Focused temporary-SQLite store, real HTTP and CLI
-round trips cover A-to-B supersession, zero-wake ack, stale run/epoch/action
-rejection, block resolution/resume epochs, exact and changed-payload retries,
-committed-response recovery after restart, retirement/closure, binding
-provenance, coherent pickup evidence and old-hub refusal. See
-[reliable directive core](reliable-directive-core.md).
+The TrueNAS hub is RUNNING from that exact source (27,476,094 bytes,
+SHA-256 `9e392b83ca70805e5811a12e6681520db6116ec2907ff67e0985b0e2822b85e7`)
+with only its binary mount changed. Mini CLI is installed atomically
+(6,766,066 bytes, SHA-256
+`f67b7dc13c99feeacd1801c394f67d7a137529d3d5a990bfeacf4ca6ec76a6c2`),
+and the accepted `ad89388` CLI remains as rollback. The installed HTTP and CLI
+paths advertise `reliableDelivery` v1 and fail closed when it is unavailable or
+unknown. Independent QA #3938/#3940, candidate acceptance #3942/#3943,
+same-function profile/integrity checks #3961, corrected additive migration
+evidence #3980, lead acceptance #3982 and handler-saved acceptance #3984 are
+retained. The four new delivery tables were empty at migration; integrity passed
+and foreign-key violations were zero.
 
-Do **not integrate, release, install or deploy this candidate yet**. Independent
-QA, handler-saved result acceptance and a later bounded release remain required.
+[The exact operator receipt](releases/reliable-directive-core-6d2ab09/release-receipt.json)
+is retained byte-for-byte; the separate
+[acceptance record](releases/reliable-directive-core-6d2ab09/acceptance.json)
+resolves its then-pending qualified acceptance without rewriting it. See
+[reliable directive core](reliable-directive-core.md) for behavior and limits.
+This source/report synchronization performed no rebuild or deployment.
+
 Transport/relay correction, keep-going/watchdog logic, tool/provider integration,
-UI and handler-global assessment consumer #3694 are explicitly not delivered.
-The existing detached Mini preview PID60799/PPID1 and all live services/data are
-unchanged.
+typed operational authority, UI and handler-global assessment consumer #3694
+remain explicitly undelivered. Air CLI and the deployed frontend are unchanged;
+the parent Feature remains unfinished. The detached Mini preview PID60799/PPID1,
+four owner screenshots and existing services remain preserved.
+
+## September 13 native context capacity — deployed and accepted
+
+Bug `wi_dd57670ee65d974c`, release order #3723, lead acceptance #3765 and
+handler confirmation #3779/#3780: the TrueNAS hub and Mini CLI now run exact
+`ad89388c2ec7cbbddd43d0ded710db8139b1658c` with a **512 KiB** context limit.
+The hub is RUNNING with only its binary mount changed; Mini CLI installation,
+exact/+1 boundaries, retry/readback and runtime argv checks pass. Handler #3759
+compared backup and live profiles with one canonical method: identical data,
+integrity OK and zero foreign-key violations. Earlier differing-method hashes
+were a reporting mismatch, not evidence of changed profile data.
+
+**The deployed frontend and Air CLI remain at 256 KiB.** Physical browser-WASM
+to Air qualification and frontend rollout remain outstanding; keep this Bug open.
+Root source was fast-forwarded to the accepted candidate under #3812/#3816;
+that source synchronization performed no build or deployment. New native work
+must preserve the 512 KiB source. The preview still uses PID60799/PPID1.
+After oversized admissions, retain 512 KiB compatibility; do not restore an old
+SQLite database or assume an old-limit binary is a safe rollback.
+
+[Actual operator receipt](releases/native-context-ad89388/release-receipt.json),
+[accepted phase](releases/native-context-ad89388/acceptance.json), and all seven
+size/hash-linked evidence files are retained together. The original receipt is
+unchanged; the later acceptance record resolves its then-pending acceptance and
+source-integration fields. Historical candidate/release sections below retain
+prior states and do not override this current deployment inventory.
 
 ## September 13 512 KiB complete-context and bounded-transport candidate
 

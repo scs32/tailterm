@@ -6,6 +6,13 @@ from #3578. It does not implement transport wake delivery, keep-going signals,
 the periodic watchdog, the handler backlog consumer (#3694), provider hooks, or
 UI presentation.
 
+The exact source `6d2ab09ce50480bea47462a3e392f694cbaed5af` is deployed under
+release order #3951 to the TrueNAS hub and Mini CLI. Lead #3982 and handler #3984
+accepted this qualified manual-core phase. The immutable operator receipt and a
+separate acceptance record are retained under
+[`docs/releases/reliable-directive-core-6d2ab09`](releases/reliable-directive-core-6d2ab09/).
+That acceptance does not complete the parent Feature or any deferred behavior.
+
 ## What the core records
 
 A required delivery attaches one immutable, already-stored Board message to the
@@ -119,6 +126,8 @@ starting an unwrapped side effect; later transport/tool integration must add its
 own pre-tool CAS and reconciliation evidence.
 
 The handler backlog-assessment consumer in order #3694 must reuse this ledger in
-a later bounded slice. UI, transport, relay, watchdog, deployment, root
-integration, and production rollout likewise require separate orders and
-acceptance. Tests use only temporary SQLite databases and synthetic identities.
+a later bounded slice. UI, transport, relay, watchdog, typed operational authority,
+Air CLI and frontend rollout likewise require separate orders and acceptance.
+Tests use only temporary SQLite databases and synthetic identities. The deployed
+hub/Mini release did not change the frontend, Air, relay, network, Tailscale,
+preview PID60799/PPID1, or existing profile contents.

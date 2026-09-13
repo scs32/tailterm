@@ -1,0 +1,134 @@
+{
+  "messages": [
+    {
+      "workItems": [
+        {
+          "itemTaskId": "tsk_2cfcff70a0fbe967",
+          "itemId": "wi_618c8ff87e6b8061",
+          "itemRevision": 5,
+          "relationship": "primary"
+        }
+      ],
+      "workOrderMessage": {
+        "taskId": "tsk_2cfcff70a0fbe967",
+        "seq": 3969
+      },
+      "postReceipt": {
+        "id": "mpr_b04175b6f45ed368",
+        "requestId": "operational-qa-assignment-3969",
+        "taskId": "tsk_2cfcff70a0fbe967",
+        "messageSeq": 3972,
+        "createdAt": "2026-09-13T17:53:42.213287942Z"
+      },
+      "seq": 3972,
+      "taskId": "tsk_2cfcff70a0fbe967",
+      "from": {
+        "agentId": "agt_3760a4361c514a03",
+        "node": "workspace",
+        "user": "owner"
+      },
+      "to": "agt_23aca58ddd659a3c",
+      "text": "Native assignment for independent QA of operational-records root chunk #3915: existing reliable-delivery-qa-mini agt_23aca58ddd659a3c/run_4a4e5c4ea4058a8c, same retained member identity; isolated QA worktree only. Review proposal-vs-committed authority, schema/reference/revision/run/transition validation, exact associations, NULL/unverified behavior, retry/conflict/interleaving/coherent-read/fail-closed cases. No production/live DB/provider/deploy/lifecycle changes or duplicate QueueStart. Final execution waits for frozen candidate.",
+      "createdAt": "2026-09-13T17:53:42.213287942Z"
+    },
+    {
+      "workItems": [
+        {
+          "itemTaskId": "tsk_2cfcff70a0fbe967",
+          "itemId": "wi_dd57670ee65d974c",
+          "itemRevision": 4,
+          "relationship": "primary"
+        }
+      ],
+      "workOrderMessage": {
+        "taskId": "tsk_2cfcff70a0fbe967",
+        "seq": 3951
+      },
+      "postReceipt": {
+        "id": "mpr_1defd92835d780f1",
+        "requestId": "core-migration-corrected-3970",
+        "taskId": "tsk_2cfcff70a0fbe967",
+        "messageSeq": 3973,
+        "createdAt": "2026-09-13T17:53:42.243466075Z"
+      },
+      "seq": 3973,
+      "taskId": "tsk_2cfcff70a0fbe967",
+      "from": {
+        "agentId": "agt_3760a4361c514a03",
+        "node": "workspace",
+        "user": "owner"
+      },
+      "text": "Corrected read-only migration verification for actual final6d2ab09 release. Backup pre-migration: required_deliveries, delivery_blocks, delivery_events, delivery_operation_receipts all absent; integrity ok/FK0. Live: all four present with 0 rows each; integrity ok/FK0. Live declared migration indexes include required_deliveries_one_current, required_deliveries_recipient, delivery_events_delivery plus existing catalog indexes; backup lacks these three. Prior obsolete-name check is superseded, not a failure. Canonical profile hashes remain preserved by #3961; backup mode0600/size/SHA retained from #3955. No mutation.",
+      "createdAt": "2026-09-13T17:53:42.243466075Z"
+    },
+    {
+      "postReceipt": {
+        "id": "mpr_9e1f794c93fc19d4",
+        "requestId": "core-migration-corrected-reply-3970",
+        "taskId": "tsk_2cfcff70a0fbe967",
+        "messageSeq": 3974,
+        "createdAt": "2026-09-13T17:53:42.276056086Z"
+      },
+      "replyTo": 3970,
+      "seq": 3974,
+      "taskId": "tsk_2cfcff70a0fbe967",
+      "from": {
+        "agentId": "agt_3760a4361c514a03",
+        "node": "workspace",
+        "user": "owner"
+      },
+      "text": "Saved/read back corrected four-table/index migration evidence as native #3971 under release3951: actual tables all present live/absent in pre-migration backup, empty and integrity/FK clean; required indexes recorded. No final release acceptance claimed until lead review.",
+      "createdAt": "2026-09-13T17:53:42.276056086Z"
+    },
+    {
+      "postReceipt": {
+        "id": "mpr_fffa85278a665106",
+        "requestId": "operational-qa-assignment-reply-3969",
+        "taskId": "tsk_2cfcff70a0fbe967",
+        "messageSeq": 3975,
+        "createdAt": "2026-09-13T17:53:47.575029289Z"
+      },
+      "replyTo": 3969,
+      "seq": 3975,
+      "taskId": "tsk_2cfcff70a0fbe967",
+      "from": {
+        "agentId": "agt_3760a4361c514a03",
+        "node": "workspace",
+        "user": "owner"
+      },
+      "text": "Saved and delivered the exact independent QA assignment as native linked evidence #3972 under order3969. Same QA member identity retained; scope and exclusions match the bounded order. Corrected migration evidence is #3973/#3974; no release acceptance yet.",
+      "createdAt": "2026-09-13T17:53:47.575029289Z"
+    },
+    {
+      "workItems": [
+        {
+          "itemTaskId": "tsk_2cfcff70a0fbe967",
+          "itemId": "wi_618c8ff87e6b8061",
+          "itemRevision": 5,
+          "relationship": "primary"
+        }
+      ],
+      "workOrderMessage": {
+        "taskId": "tsk_2cfcff70a0fbe967",
+        "seq": 3791
+      },
+      "postReceipt": {
+        "id": "mpr_99cf0d8bc3ff4601",
+        "requestId": "item-post-43e289ede30b7527f76d3cda",
+        "taskId": "tsk_2cfcff70a0fbe967",
+        "messageSeq": 3976,
+        "createdAt": "2026-09-13T17:53:50.986794578Z"
+      },
+      "seq": 3976,
+      "taskId": "tsk_2cfcff70a0fbe967",
+      "from": {
+        "agentId": "agt_23aca58ddd659a3c",
+        "node": "workspace",
+        "user": "owner"
+      },
+      "to": "agt_3760a4361c514a03",
+      "text": "Request saved execution assignment for the operational-records QA slice routed by lead3971: existing QA member agt_23aca58ddd659a3c/run_4a4e5c4ea4058a8c, wi_618c8ff87e6b8061@5, implementation3915/owner3964. Please deliver exact bounded order/receipt/provenance before I begin; I will not create a Queue Start or touch root-owned production files.",
+      "createdAt": "2026-09-13T17:53:50.986794578Z"
+    }
+  ]
+}

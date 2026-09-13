@@ -1,0 +1,119 @@
+{
+  "recordedAt": "2026-09-13T17:53:59.293124+00:00",
+  "taskId": "tsk_2cfcff70a0fbe967",
+  "itemId": "wi_618c8ff87e6b8061",
+  "itemRevision": 5,
+  "implementationOrder": 3699,
+  "releaseOrder": 3951,
+  "handlerGate": 3955,
+  "operator": {
+    "agentId": "agt_64e8e823485a3434",
+    "runId": "run_66d063bf724968d0"
+  },
+  "candidate": "6d2ab09ce50480bea47462a3e392f694cbaed5af",
+  "base": "ad89388c2ec7cbbddd43d0ded710db8139b1658c",
+  "activation": "hub and Mini CLI activated; actual binary/config/install evidence linked",
+  "candidateAcceptanceMessages": [
+    3942,
+    3943,
+    3944
+  ],
+  "qaMessages": [
+    3938,
+    3940,
+    3941
+  ],
+  "operatorResultMessage": 3960,
+  "profileComparisonMessage": 3961,
+  "profileComparison": "same-function backup/live retained profile hashes identical; integrity OK, FK zero, per handler",
+  "migrationVerification": {
+    "status": "technical pass; corrected item linkage pending",
+    "requestMessage": 3970,
+    "requiredTables": [
+      "required_deliveries",
+      "delivery_blocks",
+      "delivery_events",
+      "delivery_operation_receipts"
+    ],
+    "reason": "3961 checked two obsolete names; only two actual table checks reported",
+    "resultMessage": 3973,
+    "resultReceipt": "mpr_1defd92835d780f1",
+    "tablesPresentLive": 4,
+    "tablesAbsentBackup": 4,
+    "rowsEach": 0,
+    "indexes": [
+      "required_deliveries_one_current",
+      "required_deliveries_recipient",
+      "delivery_events_delivery"
+    ],
+    "integrity": "ok",
+    "foreignKeyViolations": 0,
+    "provenanceCorrectionRequest": 3979
+  },
+  "releaseAcceptance": "Lead accepts technical deployed core phase; handler-saved qualified acceptance pending corrected migration association",
+  "savedReleaseAcceptance": null,
+  "sourceIntegration": null,
+  "rollback": {
+    "hubPath": "/mnt/deepfreeze/tailterm-hub/releases/20260913-context-bound-ad89388/tailterm-hub",
+    "hubSha256": "dc63470ad85b335ccd0669194456ea561a4ef6326981366a5e3be40de1c8e228",
+    "miniPath": "/Users/stephenspeicher/.local/bin/tt-before-directive-core-6d2ab09",
+    "miniSha256": "2b81d78b391f287556d8d7f8a241f27a585d3bc7cb132513c1ab982efdd6ecde",
+    "databaseRestore": false,
+    "retainAllAdditiveTables": true,
+    "preserve512KiBCompatibility": true
+  },
+  "limits": [
+    "Manual first core only; no automatic wake, GO consumer, typed operational authority or UI",
+    "Air CLI and deployed frontend unchanged",
+    "Installed CLI smoke verifies synthetic HTTP serialization/output/capability; store semantics covered by independent QA",
+    "Parent Feature unfinished; no work-item completion or lifecycle closure",
+    "Root source/report integration outstanding"
+  ],
+  "evidence": [
+    {
+      "path": "preflight.json",
+      "bytes": 1298,
+      "sha256": "67e44da086c3ce2d98672c54c659a9ebd4cb0e29f8809f37266154458d5e1249"
+    },
+    {
+      "path": "pre-config.json",
+      "bytes": 669,
+      "sha256": "3c91fea1510e75b943ccd32048df25eefd5d19bb03d8157b26e34f6c2970f4ff"
+    },
+    {
+      "path": "post-config.json",
+      "bytes": 670,
+      "sha256": "a824064d0ccc680c5a727d9279424b6e85f4d8244c9a977fddc8f50cdd09f6e9"
+    },
+    {
+      "path": "hub-deploy.log",
+      "bytes": 1409,
+      "sha256": "5181da5d2a55f4e3e1ca078e812cf69650a9b5a24eda947e1bd863d56f4aaf2d"
+    },
+    {
+      "path": "hub-post-verify.json",
+      "bytes": 2178,
+      "sha256": "f28cf9d850a5c04f3a4b3247432e3e35b4a3004614da56991babe288219a093f"
+    },
+    {
+      "path": "mini-install.json",
+      "bytes": 1236,
+      "sha256": "4f8d4783f67c113b3b069da7e47833009fcc48bee9c95b24b2011b3da581ee6d"
+    },
+    {
+      "path": "installed-cli-smoke.py",
+      "bytes": 3889,
+      "sha256": "3a3b2eab14b79fc258edcf10322931b65f8c42ccb1628c9b5c18e7fbc0b5a67c"
+    },
+    {
+      "path": "installed-cli-smoke.json",
+      "bytes": 1277,
+      "sha256": "339f46234b0f4b6d3a800ccf3c4ce6444c4a5877f4c3a98466e46539b1595bce"
+    },
+    {
+      "path": "handler-postchecks-board.json",
+      "bytes": 5663,
+      "sha256": "0d278ca00fd66cdbe2c87c34a488bb049c6d78b39c8b765ea239752dc49beb75"
+    }
+  ]
+}

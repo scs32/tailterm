@@ -1,0 +1,8 @@
+{
+  "oldHubBytes": 27357346,
+  "oldHubSha256": "4711d3c0acc4d9ce17725e1c4fea74709ee945edb694d0f4f74bea74e0e107a3",
+  "newReleaseExists": false,
+  "tokenPresentNonempty": true,
+  "oldMiniCliSha256": "908034fcd72a13d65d70750fa46010e4eb3f68fda89c65e1312dcb1b38dc7b91",
+  "preview": "60799     1 node scripts/preview-static.mjs dist-static 127.0.0.1 4318"
+}

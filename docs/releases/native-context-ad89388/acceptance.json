@@ -1,0 +1,14 @@
+{
+  "sourceCommit": "ad89388c2ec7cbbddd43d0ded710db8139b1658c",
+  "releaseOrder": 3723,
+  "leadActualAcceptance": 3765,
+  "leadArtifactVerification": 3770,
+  "handlerSavedAcceptance": 3779,
+  "handlerConfirmation": 3780,
+  "canonicalDatabaseComparison": 3759,
+  "sourceIntegrationOrder": 3812,
+  "sourceIntegrationHandlerConfirmation": 3816,
+  "sourceFastForward": "2dadf19abe84e5957f663f782195413ae217616f -> ad89388c2ec7cbbddd43d0ded710db8139b1658c",
+  "originalOperatorReceiptSha256": "56de71683a4b3557ebcf8d525b969acbbb1bc3f9a77f6b84622a6b62a43056c8",
+  "note": "Original operator receipt and evidence retained byte-for-byte. This later record supersedes its pending-acceptance/source-integration fields only. Frontend/Air qualification remains open; no whole-item completion."
+}

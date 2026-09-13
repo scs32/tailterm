@@ -1,0 +1,92 @@
+{
+  "binary": {
+    "bytes": 27476094,
+    "sha256": "9e392b83ca70805e5811a12e6681520db6116ec2907ff67e0985b0e2822b85e7"
+  },
+  "state": "RUNNING",
+  "containers": 1,
+  "containerDetails": [
+    {
+      "id": "150535b8f421919c6a7e7fc70f295ee5628f45733bb0f1f18e3ab841c2963692",
+      "service_name": "hub",
+      "image": "gcr.io/distroless/static-debian12:nonroot",
+      "port_config": [
+        {
+          "container_port": 18765,
+          "protocol": "tcp",
+          "host_ports": [
+            {
+              "host_port": 18765,
+              "host_ip": "100.116.238.37"
+            }
+          ]
+        }
+      ],
+      "state": "running",
+      "volume_mounts": [
+        {
+          "source": "/mnt/deepfreeze/tailterm-hub/releases/20260913-directive-core-6d2ab09/tailterm-hub",
+          "destination": "/opt/tailterm-hub",
+          "mode": "ro",
+          "type": "bind"
+        },
+        {
+          "source": "/mnt/deepfreeze/tailterm-hub/state",
+          "destination": "/state",
+          "mode": "rw",
+          "type": "bind"
+        },
+        {
+          "source": "/mnt/deepfreeze/tailterm-hub/hub-token",
+          "destination": "/run/hub-token",
+          "mode": "ro",
+          "type": "bind"
+        }
+      ]
+    }
+  ],
+  "onlyBinaryMountChanged": true,
+  "capabilities": {
+    "schemaVersion": 1,
+    "messageAudit": {
+      "versions": [
+        1,
+        2
+      ],
+      "maxRelated": 15
+    },
+    "auditExport": {
+      "versions": [
+        2,
+        3
+      ],
+      "maxBytes": 33554432,
+      "maxChunkBytes": 262144,
+      "retentionSeconds": 604800
+    },
+    "queue": {
+      "versions": [
+        1
+      ],
+      "defaultPage": 32,
+      "maxPage": 64,
+      "maxPageBytes": 1048576
+    },
+    "policy": {
+      "messageAudit": "observe"
+    },
+    "allocationIntent": {
+      "supported": true,
+      "versions": [
+        1
+      ]
+    },
+    "reliableDelivery": {
+      "supported": true,
+      "versions": [
+        1
+      ]
+    }
+  },
+  "verificationCorrection": "Old installed ad89388 CLI reserialized known capability fields and omitted new reliableDelivery field; exact candidate CLI confirms v1 against running hub."
+}

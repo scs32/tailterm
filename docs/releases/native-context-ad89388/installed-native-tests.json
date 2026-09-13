@@ -1,0 +1,43 @@
+{
+  "installedCliSha256": "2b81d78b391f287556d8d7f8a241f27a585d3bc7cb132513c1ab982efdd6ecde",
+  "isolatedOnly": true,
+  "liveConfigurationLoaded": false,
+  "results": [
+    {
+      "contextBytes": 269315,
+      "outcome": "accepted local validation and reached isolated HTTP endpoint",
+      "exitCode": 1
+    },
+    {
+      "contextBytes": 524288,
+      "outcome": "accepted local validation and reached isolated HTTP endpoint",
+      "exitCode": 1
+    },
+    {
+      "contextBytes": 524289,
+      "outcome": "rejected locally before HTTP",
+      "exitCode": 1
+    },
+    {
+      "shellFileBytes": 2359296,
+      "exitCode": 0,
+      "retained": false
+    },
+    {
+      "shellFileBytes": 2359297,
+      "exitCode": 1,
+      "retained": true
+    }
+  ],
+  "syntheticRequests": [
+    {
+      "path": "/v1/tasks/tsk_0000000000000003/allocation-intents",
+      "bytes": 474
+    },
+    {
+      "path": "/v1/tasks/tsk_0000000000000003/allocation-intents",
+      "bytes": 474
+    }
+  ],
+  "fixtureCorrection": "Initial bound-but-non-listening socket timed out instead of refusing; replaced with explicit isolated HTTP503 endpoint. No product failure or live request."
+}

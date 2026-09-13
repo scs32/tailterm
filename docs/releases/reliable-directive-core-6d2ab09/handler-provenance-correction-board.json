@@ -1,0 +1,114 @@
+{
+  "messages": [
+    {
+      "workItems": [
+        {
+          "itemTaskId": "tsk_2cfcff70a0fbe967",
+          "itemId": "wi_618c8ff87e6b8061",
+          "itemRevision": 5,
+          "relationship": "primary"
+        }
+      ],
+      "workOrderMessage": {
+        "taskId": "tsk_2cfcff70a0fbe967",
+        "seq": 3951
+      },
+      "postReceipt": {
+        "id": "mpr_df97a0c4f19d44f7",
+        "requestId": "core-migration-provenance-correction-3979",
+        "taskId": "tsk_2cfcff70a0fbe967",
+        "messageSeq": 3980,
+        "createdAt": "2026-09-13T17:54:48.609975431Z"
+      },
+      "seq": 3980,
+      "taskId": "tsk_2cfcff70a0fbe967",
+      "from": {
+        "agentId": "agt_3760a4361c514a03",
+        "node": "workspace",
+        "user": "owner"
+      },
+      "text": "Provenance correction superseding #3973/#3974 associations only: actual final6d2ab09 migration result belongs to wi_618c8ff87e6b8061@5/order3951, not capacity Bug wi_dd57670ee65d974c@4. Preserve original immutable receipt #3973 and narrative #3974. Technical result unchanged/accepted: required_deliveries, delivery_blocks, delivery_events, delivery_operation_receipts present live and absent pre-migration; all empty; integrity ok/FK0; three new indexes recorded. Source receipt mpr_1defd92835d780f1. No DB rerun or mutation.",
+      "createdAt": "2026-09-13T17:54:48.609975431Z"
+    },
+    {
+      "postReceipt": {
+        "id": "mpr_62f392814d390631",
+        "requestId": "core-migration-provenance-correction-reply-3979",
+        "taskId": "tsk_2cfcff70a0fbe967",
+        "messageSeq": 3981,
+        "createdAt": "2026-09-13T17:54:48.634795412Z"
+      },
+      "replyTo": 3979,
+      "seq": 3981,
+      "taskId": "tsk_2cfcff70a0fbe967",
+      "from": {
+        "agentId": "agt_3760a4361c514a03",
+        "node": "workspace",
+        "user": "owner"
+      },
+      "text": "Saved corrected native evidence #3980 under the proper Feature wi_618c8ff87e6b8061@5/order3951. #3973/#3974 remain preserved but are superseded for item association; no DB checks rerun.",
+      "createdAt": "2026-09-13T17:54:48.634795412Z"
+    },
+    {
+      "workItems": [
+        {
+          "itemTaskId": "tsk_2cfcff70a0fbe967",
+          "itemId": "wi_618c8ff87e6b8061",
+          "itemRevision": 5,
+          "relationship": "primary"
+        }
+      ],
+      "workOrderMessage": {
+        "taskId": "tsk_2cfcff70a0fbe967",
+        "seq": 3951
+      },
+      "postReceipt": {
+        "id": "mpr_150ff8a9fa715875",
+        "requestId": "core-release-3951-qualified-lead-acceptance",
+        "taskId": "tsk_2cfcff70a0fbe967",
+        "messageSeq": 3982,
+        "createdAt": "2026-09-13T17:55:02.700691731Z"
+      },
+      "seq": 3982,
+      "taskId": "tsk_2cfcff70a0fbe967",
+      "from": {
+        "agentId": "agt_64e8e823485a3434",
+        "node": "workspace",
+        "user": "owner"
+      },
+      "to": "agt_3760a4361c514a03",
+      "text": "Qualified lead technical acceptance of ACTUAL first-core release under wi_618c8ff87e6b8061@5/order3951: exact6d2ab09 hub27476094B SHA9e392b83ca70805e5811a12e6681520db6116ec2907ff67e0985b0e2822b85e7 RUNNING, config differs only binary mount; Mini CLI6766066B SHAf67b7dc13c99feeacd1801c394f67d7a137529d3d5a990bfeacf4ca6ec76a6c2 installed atomically, oldad rollback retained. v1 reliableDelivery capability passes; actual installed CLI synthetic current-assignment epoch2/output, flags-before-ID serialization, unsupported and unknown version fail-closed checks pass. Independent final QA3938/3940 and candidate acceptance3942/3943 retained. Handler3961 confirms same-function profile equality/integrity/FK; technical3973 confirms four actual additive tables and three indexes. Preview60799 and four owner screenshots preserved. Receipt .build/lead-core-release-3951/release-receipt.json 4091B SHAdfe16c234722c641fa726c9de5664ff7a6cb92a5660b21cf1f759698019af304 links nine artifacts and explicitly marks saved acceptance/source integration pending. Handler: correct migration item association per3979, then save/read back qualified deployed-phase acceptance and return exact confirmation. Parent Feature remains unfinished; no automatic wake/GO/typed authority/UI, no Air/frontend rollout or lifecycle closure. Please reconcile core API completed-package phase versus root3915 implementation and QA3969 actual assignments in complete sweep; do not leave monitor stale-ready as proof of new execution. After saved acceptance, establish bounded source/report synchronization ownership with existing core API member, based on root f176416 and frozen6d2ab09 preserving capacity release docs; root3915 continues separately. No deployment rebuild or root operational-code takeover is part of that synchronization.",
+      "createdAt": "2026-09-13T17:55:02.700691731Z"
+    },
+    {
+      "workItems": [
+        {
+          "itemTaskId": "tsk_2cfcff70a0fbe967",
+          "itemId": "wi_618c8ff87e6b8061",
+          "itemRevision": 5,
+          "relationship": "primary"
+        }
+      ],
+      "workOrderMessage": {
+        "taskId": "tsk_2cfcff70a0fbe967",
+        "seq": 3915
+      },
+      "postReceipt": {
+        "id": "mpr_ffff3cd7309bbe5e",
+        "requestId": "operational-3915-candidate-95106b6",
+        "taskId": "tsk_2cfcff70a0fbe967",
+        "messageSeq": 3983,
+        "createdAt": "2026-09-13T17:55:20.374989061Z"
+      },
+      "seq": 3983,
+      "taskId": "tsk_2cfcff70a0fbe967",
+      "from": {
+        "node": "workspace",
+        "user": "owner"
+      },
+      "to": "agt_23aca58ddd659a3c",
+      "text": "{\"recordType\":\"candidate_handoff\",\"implementationOrder\":3915,\"qaOrder\":3969,\"workItemId\":\"wi_618c8ff87e6b8061\",\"observedRevision\":5,\"candidateCommit\":\"95106b62b40370e63458789969d9f892aaac6e15\",\"baseline\":\"6d2ab09\",\"worktree\":\".build/worktrees/operational-records-root-3915\",\"treeState\":\"clean\",\"contract\":\"docs/operational-records.md\",\"capability\":{\"name\":\"operationalRecords\",\"version\":1},\"productionSha256\":{\"hub/internal/api/operational_records.go\":\"383d02a1161a355fbcf5a1f67274997647bf5827afbfd9770de57ff78a5b9c77\",\"hub/internal/store/operational_records.go\":\"136ffdda515c99e81e6707587bb2038fdc56b54f6823359d37bed15f214343d3\",\"hub/internal/server/operational_records.go\":\"16c3732ba4ba616636788a6bd9c1d881bf8be26785cf52edea103f2c89736560\",\"hub/cmd/tt/operational_records.go\":\"0f3bfa2f24001a366b24a8212d76eee486a641181de20389793751f1038d3e40\"},\"validation\":{\"finalCandidate\":[{\"command\":\"go test ./internal/api ./internal/store ./internal/server ./cmd/tt -run 'TestOperational|TestDirective|TestReliableDelivery|TestDeliveryCLI' -count=1 -timeout=90s\",\"outcome\":\"pass\"},{\"command\":\"go vet ./...\",\"outcome\":\"pass\"},{\"command\":\"go build ./...\",\"outcome\":\"pass\"},{\"command\":\"git diff --check 6d2ab09..HEAD\",\"outcome\":\"pass\"}],\"earlier63d5ab0Base\":[\"full api/store/server packages passed\",\"focused operational/core store/server/CLI race passed\"]},\"notes\":[\"Rebased onto final core6d2ab09, preserving its CLI epoch and closed-recipient corrections\",\"Proposals have no delivery events and no execution authority; immutable versions and shared retry receipts retain them\",\"Committed typed records use existing delivery_events; typed result updates existing delivery phase atomically; acceptance remains separately authorized and does not mark item done\",\"Candidate/test artifact validation proves retained bytes and associations, not independent external test execution or cryptographic agent identity\",\"Legacy manual core stays compatible; legacy prose result is not typed verification/acceptance\"],\"acceptance\":null,\"release\":null}",
+      "createdAt": "2026-09-13T17:55:20.374989061Z"
+    }
+  ]
+}

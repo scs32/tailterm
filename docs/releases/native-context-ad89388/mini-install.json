@@ -1,0 +1,11 @@
+{
+  "installedAt": "2026-09-13T16:55:35.241542+00:00",
+  "path": "/Users/stephenspeicher/.local/bin/tt",
+  "bytes": 6731794,
+  "sha256": "2b81d78b391f287556d8d7f8a241f27a585d3bc7cb132513c1ab982efdd6ecde",
+  "mode": "0755",
+  "rollbackPath": "/Users/stephenspeicher/.local/bin/tt-before-context-bound-ad89388",
+  "rollbackSha256": "908034fcd72a13d65d70750fa46010e4eb3f68fda89c65e1312dcb1b38dc7b91",
+  "helpExit": 0,
+  "preview": "60799     1 node scripts/preview-static.mjs dist-static 127.0.0.1 4318"
+}

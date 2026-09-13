@@ -1,0 +1,70 @@
+{
+  "releaseOrder": 3951,
+  "itemId": "wi_618c8ff87e6b8061",
+  "itemRevision": 5,
+  "operatorReceipt": {
+    "path": "release-receipt.json",
+    "bytes": 4091,
+    "sha256": "dfe16c234722c641fa726c9de5664ff7a6cb92a5660b21cf1f759698019af304"
+  },
+  "leadAcceptanceMessage": 3982,
+  "migrationProvenance": {
+    "status": "pass; corrected item association verified",
+    "requestMessage": 3970,
+    "requiredTables": [
+      "required_deliveries",
+      "delivery_blocks",
+      "delivery_events",
+      "delivery_operation_receipts"
+    ],
+    "reason": "3961 checked two obsolete names; only two actual table checks reported",
+    "resultMessage": 3973,
+    "resultReceipt": "mpr_1defd92835d780f1",
+    "tablesPresentLive": 4,
+    "tablesAbsentBackup": 4,
+    "rowsEach": 0,
+    "indexes": [
+      "required_deliveries_one_current",
+      "required_deliveries_recipient",
+      "delivery_events_delivery"
+    ],
+    "integrity": "ok",
+    "foreignKeyViolations": 0,
+    "provenanceCorrectionRequest": 3979,
+    "provenanceCorrectionMessage": 3980,
+    "provenanceCorrectionReceipt": "mpr_df97a0c4f19d44f7"
+  },
+  "correctionEvidence": {
+    "path": "handler-provenance-correction-board.json",
+    "bytes": 7744,
+    "sha256": "173b28b32a67391fcd915579a20d2be8d07d34a228e9cba2111b60c31ac7cbde"
+  },
+  "savedAcceptance": {
+    "message": 3984,
+    "receipt": {
+      "id": "mpr_deef205035007706",
+      "requestId": "core-release-qualified-acceptance-3982",
+      "taskId": "tsk_2cfcff70a0fbe967",
+      "messageSeq": 3984,
+      "createdAt": "2026-09-13T17:55:30.504743221Z"
+    },
+    "itemLinks": [
+      {
+        "itemTaskId": "tsk_2cfcff70a0fbe967",
+        "itemId": "wi_618c8ff87e6b8061",
+        "itemRevision": 5,
+        "relationship": "primary"
+      }
+    ],
+    "workOrder": {
+      "taskId": "tsk_2cfcff70a0fbe967",
+      "seq": 3951
+    }
+  },
+  "sourceIntegration": null,
+  "savedAcceptanceEvidence": {
+    "path": "handler-acceptance-board.json",
+    "bytes": 4459,
+    "sha256": "b1c9db3624ecfb6fb311212b5e53c58cc3a6cf0e5272cdf89379459b5b4691f6"
+  }
+}

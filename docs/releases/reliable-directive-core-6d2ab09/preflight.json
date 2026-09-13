@@ -1,0 +1,38 @@
+{
+  "checkedAt": "2026-09-13T17:44:32.082546+00:00",
+  "hub": {
+    "oldHubBytes": 27357346,
+    "oldHubSha256": "dc63470ad85b335ccd0669194456ea561a4ef6326981366a5e3be40de1c8e228",
+    "targetAbsent": true,
+    "existingTokenFilePresent": true
+  },
+  "miniCli": {
+    "path": "/Users/stephenspeicher/.local/bin/tt",
+    "bytes": 6731794,
+    "sha256": "2b81d78b391f287556d8d7f8a241f27a585d3bc7cb132513c1ab982efdd6ecde"
+  },
+  "preview": "60799     1 node scripts/preview-static.mjs dist-static 127.0.0.1 4318",
+  "screenshots": [
+    {
+      "path": "Screenshot 2026-09-10 at 1.31.31\u202fPM.png",
+      "bytes": 779927,
+      "sha256": "52fd51f6aee8d779346eb954b148ce9045d6661cfd7f6caaf888f1312887737e"
+    },
+    {
+      "path": "Screenshot 2026-09-10 at 9.14.39\u202fAM.png",
+      "bytes": 159955,
+      "sha256": "dbcedf3da21edc7b2bbf45f7472ecd4fa64729e5b2ca9a1a5e2b71e4e98a7c1b"
+    },
+    {
+      "path": "Screenshot 2026-09-10 at 7.23.35\u202fAM.png",
+      "bytes": 66706,
+      "sha256": "c431345ea3b766986c1476ee095797d27f72d2d71fc456579560ece43a4294cb"
+    },
+    {
+      "path": "Screenshot 2026-09-10 at 7.16.15\u202fAM.png",
+      "bytes": 340747,
+      "sha256": "ff2971f69f5832d9a94a5f1253e977af8919d32b0b73dceab3f32f7e34bdf40c"
+    }
+  ],
+  "configMatchesAcceptedAd89388": true
+}

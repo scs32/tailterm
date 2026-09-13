@@ -1,0 +1,30 @@
+TrueNAS middleware deployed tailterm-hub at http://100.116.238.37:18765
+
+
+[2K[A[2K
+Status: (none)
+Total Progress: [________________________________________] 0.00%[2K[A[2K
+Status: Initial Validation completed
+Total Progress: [##########______________________________] 25.00%[2K[A[2K
+Status: Configuration updated
+Total Progress: [########################________________] 60.00%[2K[A[2K
+Status: Updating docker resources
+Total Progress: [############################____________] 70.00%[2K[A[2K
+Status: Update completed for 'tailterm-hub'
+Total Progress: [########################################] 100.00%[2K[A[2K
+[2K[A[2K
+Status: Update completed for 'tailterm-hub'
+Status: Update completed for 'tailterm-hub'
+Total Progress: [########################################] 100.00%Total Progress: [########################################] 100.00%
+
+[2K[A[2K
+Status: (none)
+Total Progress: [________________________________________] 0.00%[2K[A[2K
+Status: Starting 'tailterm-hub' app
+Total Progress: [########________________________________] 20.00%[2K[A[2K
+Status: Started 'tailterm-hub' app
+Total Progress: [########################################] 100.00%[2K[A[2K
+Status: Started 'tailterm-hub' app
+[2K[A[2K
+Total Progress: [########################################] 100.00%Status: Started 'tailterm-hub' app
+Total Progress: [########################################] 100.00%
