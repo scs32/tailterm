@@ -52,16 +52,53 @@ The control has two separately executable stages with one exact plan identity:
 
 1. The database handler runs the verified-host backup operation. Only this stage
    opens the source or backup with SQLite, creates the backup, performs
-   integrity/foreign-key/profile checks, and publishes the immutable receipt.
+   integrity/foreign-key/profile checks, publishes the immutable receipt, and
+   returns the SHA-256 of the exact saved receipt bytes.
 2. The lead/operator deployment path validates the exact handler receipt against
-   the frozen plan and re-verifies the actual execution host before any token,
-   release, upload, or middleware mutation. It does not open the source or
-   backup as a database and does not create a replacement backup.
+   the handler-saved external SHA-256 pin and frozen plan, then re-verifies the
+   actual execution host before any token, release, upload, or middleware
+   mutation. It does not open the source or backup as a database and does not
+   create a replacement backup.
 
 The deployment stage cannot run the handler stage implicitly. A command named
 "preflight only" must not hide a SQLite backup under lead/operator ownership.
 Missing, invalid, mismatched, or unverified handler evidence blocks deployment
 without mutation and is reported as a receipt-validation error.
+
+## Receipt handoff and command contract
+
+The handler invocation is:
+
+```text
+scripts/truenas_release_preflight.py --plan PLAN.json \
+  --receipt-output RECEIPT.json
+```
+
+On verified success or exact replay, the command saves the canonical receipt
+bytes and emits `receiptOutput.path` plus `receiptOutput.sha256`. The handler
+must durably record and deliver that lowercase 64-hex SHA-256 as provenance;
+the lead must not derive the expected pin from the receipt file it is about to
+trust.
+
+The deployment invocation is:
+
+```text
+scripts/deploy-truenas-hub.py RELEASE --plan PLAN.json \
+  --preflight-receipt RECEIPT.json \
+  --preflight-receipt-sha256 HANDLER_SAVED_SHA256 [--update]
+```
+
+The receipt pin is a required argument distinct from the plan. Deployment
+validates its syntax, hashes the exact receipt bytes, and compares that digest
+before JSON parsing, plan/receipt validation, remote probing, or mutation. A
+mismatch is `verification-failed`, includes expected and observed receipt
+digests, and reports `mutationStarted: false`. A successful deployment result
+retains the validated value as `preflightReceiptSha256`.
+
+The receipt's internal `evidenceDigest` detects inconsistent evidence and binds
+its canonical fields, but it is not its own provenance control because a writer
+could recompute it after changing the receipt. The separately delivered
+handler-saved receipt-bytes pin is the external trust anchor for the consumer.
 
 ## Structured request
 
@@ -122,7 +159,7 @@ The deployment receipt consumer has a separate state sequence:
 | State | Required evidence | Deployment mutation allowed? |
 | --- | --- | --- |
 | `deployment-received` | Exact plan, handler receipt, release name, and local artifact reference are available. | No |
-| `receipt-validated` | Receipt is successful and matches the full canonical plan/retry digest, expected and actual host, executable, source/destination, checks, profile evidence, mode/owner/size/SHA, and completion state. | No |
+| `receipt-validated` | Exact receipt bytes match the separately handler-saved SHA-256 pin before parsing; the parsed receipt is successful and matches the full canonical plan/retry digest, expected and actual host, executable, source/destination, checks, profile evidence, mode/owner/size/SHA, internal evidence digest, and completion state. | No |
 | `artifact-validated` | The exact local release artifact is present and readable. | No |
 | `identity-reverified` | A fresh read-only probe through the same approved route matches the receipt's host and target executable. | No |
 | `deployment-mutation-started` | State changes immediately before dispatching the first token/release/upload/middleware command. | Yes |
@@ -165,6 +202,9 @@ Every terminal result is structured and includes:
 - on success, backup path, byte size, SHA-256, mode, UID/GID, integrity result,
   foreign-key violation count, canonical profile hashes/counts, and a digest
   binding the complete immutable receipt evidence;
+- at handler handoff, the exact saved receipt path and receipt-bytes SHA-256;
+  at deployment success, the exact externally supplied pin as
+  `preflightReceiptSha256`;
 - on failure after mutation, which mutation occurred and whether cleanup or an
   operator decision remains necessary.
 
@@ -196,7 +236,7 @@ Primary error codes and operator meanings are:
 | `backup-failed` | SQLite online backup failed after the mutation boundary. Identify the verified host and whether a partial artifact exists. |
 | `integrity-failed` | The created backup failed `PRAGMA integrity_check` or foreign-key acceptance. Do not authorize activation. |
 | `verification-failed` | Required mode, owner, size, digest, or profile evidence is absent or inconsistent. Do not authorize activation. |
-| `verification-failed` during receipt consumption | The receipt is absent, unreadable, unsuccessful, mismatched, or lacks the complete host/executable/source/backup/mutation evidence. It performs no database or deployment operation. |
+| `verification-failed` during receipt consumption | The receipt is absent, unreadable, byte-pin mismatched, unsuccessful, plan-mismatched, internally inconsistent, or lacks complete host/executable/source/backup/mutation evidence. It performs no database or deployment operation. |
 | `local-artifact-unavailable` | Receipt validation succeeded, but the local release binary is absent or unreadable. No deployment mutation ran; the verified backup remains valid evidence. |
 | `remote-operation-failed` | A mutating deployment command reached the verified remote context and failed. Retain its stage and last completed stage. |
 
@@ -223,6 +263,7 @@ failure. The preferred operator summaries are:
 | Same retry ID with one changed bound field | `request-conflict` | No new backup operation; bound records and unrelated destinations remain intact |
 | Correct isolated synthetic route | Success with complete sanitized evidence | No local `/mnt` access and no unrequested deployment/network change |
 | Deployment receives a missing or changed handler receipt | Receipt-consumer `verification-failed` | No SQLite access, replacement backup, token/release staging, upload, or middleware mutation |
+| Receipt JSON is changed and its internal evidence digest is recomputed | Receipt-consumer `verification-failed` because exact bytes do not match the independently handler-saved SHA-256 pin | Rejection occurs before JSON parse, remote identity probe, SQLite access, or deployment mutation |
 | Actual handler-owned TrueNAS gate | Exact remote host/route/source/destination/executable plus backup mode/owner/size/SHA, integrity/FK, and profile evidence retained | No live fixture content, secret output, database restore, networking/Tailscale change, or activation implied by backup success |
 
 The wrong-host regression must instrument every mutating seam and assert zero

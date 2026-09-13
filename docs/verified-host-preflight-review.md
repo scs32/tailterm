@@ -85,7 +85,7 @@ each item below.
 | Operator wording | Does every rejected preflight state what is known, what is unknown, and whether mutation began without upgrading an inference into a remote outage? |
 | Retry safety | Does exact replay avoid duplicate/overwrite behavior, and does changed input under the same retry identity fail before mutation? |
 | Destination safety | Does an unproven existing destination remain untouched? |
-| Evidence hygiene | Are only sanitized identities, counts, sizes, digests, modes, and check results emitted? |
+| Evidence hygiene | Are only sanitized identities, counts, sizes, digests, modes, and check results emitted? Is the exact saved receipt-bytes digest handed off separately from the receipt? |
 | Ownership | Is SQLite backup/integrity/profile work executable only through the handler path, while deployment merely validates its exact receipt? |
 | Integration | Are backup preflight and receipt validation mandatory in their actual handler/deployment entry points rather than separate unused commands? |
 
@@ -119,18 +119,24 @@ paths/databases. It must not use live task/profile data.
 10. Deployment-order test: supply a missing, changed, or invalid receipt and spy
    on token creation, release mkdir, upload, and middleware mutation; none may
    occur.
-11. Actual remote qualification, owned by the handler: retain host/route/source/
+11. External-pin test: change receipt evidence and recompute its internal
+    evidence digest. Supply the original handler-saved receipt-bytes SHA-256 and
+    assert `verification-failed` before JSON acceptance, remote probe, or
+    mutation. A byte-exact receipt with the exact pin must pass this gate.
+12. Actual remote qualification, owned by the handler: retain host/route/source/
    destination/executable, mode 0600 and UID/GID, size/SHA-256,
-   `integrity_check`, foreign-key count, and canonical profile comparison. This
-   is release evidence, not a live test fixture or proof of deployment.
+   `integrity_check`, foreign-key count, canonical profile comparison, and the
+   exact saved receipt-bytes SHA-256 delivered to the consumer. This is release
+   evidence, not a live test fixture or proof of deployment.
 
 ## Review status
 
 Candidate review: **the isolated API/QA implementation satisfies this v1 design
 contract; live qualification and release acceptance remain open**.
 
-The reviewed API candidate is commit `41217964bd99c235b5fdb0b8fcf97e287dcbc337`
-on top of `b1d3285`, including focused corrections `a952a7a` and `49d60f9`.
+The reviewed API candidate is commit `1246727966ae1b5c9aafc2515fed529af20e5bed`
+on top of `b1d3285`, including focused corrections `a952a7a`, `49d60f9`, and
+`4121796`.
 Its implementation paths are
 `scripts/truenas_release_preflight.py` and `scripts/deploy-truenas-hub.py`; its
 primary regression path is `tests/truenas-release-preflight.test.js`.
@@ -139,17 +145,18 @@ Independent QA is commit `48ca9616b2612d8afa5db0336db91006ae3d31f9`,
 
 Review verification:
 
-- `node --test tests/truenas-release-preflight.test.js` at API commit `4121796`
-  passed 8/8 tests. It covers wrong host/no mutation, noncanonical source,
+- `node --test tests/truenas-release-preflight.test.js` at API commit `1246727`
+  passed 9/9 tests. It covers wrong host/no mutation, noncanonical source,
   correct-route backup and exact replay, publication race/no clobber, tampered
-  receipt rejection, distinct route/host/executable failures, mandatory
-  receipt-before-deployment, and deployment mutation-state separation.
-- Independent QA commit `48ca961` was overlaid on API commit `4121796` in an
+  receipt rejection, external receipt-pin enforcement, distinct
+  route/host/executable failures, mandatory receipt-before-deployment, and
+  deployment mutation-state separation.
+- Independent QA commit `48ca961` was overlaid on API commit `1246727` in an
   isolated temporary worktree. `python3 -m unittest
   tests.truenas_release_preflight_test` passed 7/7 tests. The QA commit alone
   intentionally lacks the API worker's script and is not claimed as a
   standalone runnable integration branch.
-- `git diff --check b1b14d70..4121796` passed.
+- `git diff --check b1b14d70..1246727` passed.
 
 The implementation uses the exact v1 names `version`, `requestId`,
 `targetHost`, `targetExecutable`, and `backupDestination`. It spells changed
@@ -162,9 +169,12 @@ boundary.
 
 This review did not deploy, contact TrueNAS, use live data, or create actual
 remote backup evidence. Qualified handler execution must still retain the exact
-remote receipt, and lead/QA must separately record release acceptance. Synthetic
-passing checks establish the candidate's behavior, not permanent prevention in
-the loaded production path.
+remote receipt and its separately delivered byte pin, and lead/QA must
+separately record release acceptance. The API suite covers the new external-pin
+gate; independent QA commit `48ca961` predates that follow-up, so independent
+pin-specific coverage remains a release dependency. Synthetic passing checks
+establish the candidate's behavior, not permanent prevention in the loaded
+production path.
 
 ### Findings routed during implementation
 
@@ -195,8 +205,15 @@ The following findings were resolved in the reviewed candidate:
   from unknown or actual mutation after a mutating remote command was dispatched.
   The API regression distinguishes guard `not-started`, transport `unknown`, and
   remote-command `started`, retaining the last completed stage in each case.
+- #4679 required a consumer trust anchor outside the self-described receipt.
+  `1246727` makes the handler output the exact saved receipt-bytes SHA-256,
+  requires deployment to receive it through
+  `--preflight-receipt-sha256`, validates it before parsing or remote action,
+  and retains it in deployment success. Its regression changes the receipt and
+  recomputes the internal evidence digest; the original external pin still
+  rejects the changed bytes before a remote probe.
 
 No design finding above is waived. Remaining dependencies are operational:
-handler-owned execution and saved remote evidence, integration of the reviewed
-commits into the release candidate, independent release acceptance, and proof
-that the loaded production path uses the gate.
+handler-owned execution and saved remote evidence/pin, integration of the
+reviewed commits into the release candidate, independent pin-specific QA and
+release acceptance, and proof that the loaded production path uses the gate.
