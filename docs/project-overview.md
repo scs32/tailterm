@@ -149,6 +149,16 @@ AIV remain undelivered. The handler assessment consumer #3694/#4053 is a later
 slice; Air CLI and the deployed frontend remain unchanged. The parent Feature
 is unfinished.
 
+A not-yet-deployed order #4053 candidate extends that same ledger with explicit
+full-instruction obligation enrollment, visible uncovered/legacy-unverified
+coverage, persisted substantive-progress deadlines, bounded exact-thread Codex
+queue attempts and durable escalation. It treats native queue acceptance,
+heartbeat, Working and inbox reads as non-execution evidence. Installed Codex has
+no supported active-tool/idle observer, so production classification remains
+unknown unless a future supported observer supplies fresh evidence. This does
+not provide the global handler assessment consumer, a general watcher, provider
+execution acknowledgment, UI, process recovery or deployment.
+
 Browser-created projects launch a database handler after the orchestrator. The
 handler inherits its resolved launch settings and owns all agent work-item database
 reads/writes. Agents require a durable bug/feature and a bounded work order before

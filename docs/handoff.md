@@ -80,6 +80,20 @@ above. Air CLI and the deployed frontend are unchanged; the parent Feature
 remains unfinished. The detached Mini preview PID60799/PPID1, four owner
 screenshots and existing services remain preserved.
 
+### Execution follow-through candidate (not deployed)
+
+The same exact worker/run continues under bounded order #4053. The candidate adds
+version-2 explicit obligation enrollment, delivery coverage, persisted 2m/10m/
+2m deadlines, bounded exact-thread Codex queue leasing/reporting, and one durable
+escalation on missing execution evidence. Enrollment pins the authored governing
+order and the server-verified full instruction bytes/SHA; unenrolled admitted
+workers and migrated v1 rows stay visibly unverified. Queue acceptance, heartbeat,
+Working, and inbox consumption remain non-progress. Production Codex observation
+is honestly `unknown` because installed `codex queue` exposes no supported
+active-tool/idle query. Crash and response-loss handling never repeats a leased
+external queue call. This is preparation/candidate work only: no hub, CLI, relay,
+frontend, task, Queue, profile, process, or network was changed.
+
 ## September 13 native context capacity — deployed and accepted
 
 Bug `wi_dd57670ee65d974c`, release order #3723, lead acceptance #3765 and

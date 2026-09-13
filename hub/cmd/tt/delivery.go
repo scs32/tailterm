@@ -11,6 +11,10 @@ import (
 )
 
 func requireReliableDelivery(ctx context.Context, c *api.Client) error {
+	return requireReliableDeliveryVersion(ctx, c, api.ReliableDeliveryCapabilityVersion)
+}
+
+func requireReliableDeliveryVersion(ctx context.Context, c *api.Client, required int) error {
 	caps, err := c.Capabilities(ctx)
 	if err != nil {
 		return fmt.Errorf("reliable directive core is unavailable; upgrade the hub and retry: %w", err)
@@ -19,11 +23,11 @@ func requireReliableDelivery(ctx context.Context, c *api.Client) error {
 		return errors.New("reliable directive core is unsupported by this hub; upgrade the hub before using current-assignment or delivery commands")
 	}
 	for _, version := range caps.ReliableDelivery.Versions {
-		if version == api.ReliableDeliveryCapabilityVersion {
+		if version == required {
 			return nil
 		}
 	}
-	return fmt.Errorf("reliable directive core version %d is required; upgrade the hub before retrying", api.ReliableDeliveryCapabilityVersion)
+	return fmt.Errorf("reliable directive core version %d is required; upgrade the hub before retrying", required)
 }
 
 func cmdCurrentAssignment(e env, args []string) error {
@@ -52,7 +56,7 @@ func cmdCurrentAssignment(e env, args []string) error {
 	if *asJSON {
 		printJSON(out)
 	} else {
-		fmt.Printf("delivery %s\ngeneration %d\nkind %s\nphase %s\nexecution epoch %d\nmessage %d\nitem %s@%d\norder %d\n", out.ID, out.Generation, out.Kind, out.Phase, out.ExecutionEpoch, out.MessageSeq, out.ItemID, out.ItemRevision, out.WorkOrderMessage.Seq)
+		fmt.Printf("delivery %s\ngeneration %d\nkind %s\nphase %s\nexecution epoch %d\nmessage %d\nitem %s@%d\nbinding order %d\ngoverning order %d\ninstruction bytes %d\ninstruction sha256 %s\nenrollment version %d\n", out.ID, out.Generation, out.Kind, out.Phase, out.ExecutionEpoch, out.MessageSeq, out.ItemID, out.ItemRevision, out.WorkOrderMessage.Seq, out.GoverningOrderMessage.Seq, out.InstructionBytes, out.InstructionSHA256, out.EnrollmentVersion)
 		if out.Message != nil {
 			fmt.Printf("directive (stored task data):\n%s\n", out.Message.Text)
 		}
@@ -62,7 +66,7 @@ func cmdCurrentAssignment(e env, args []string) error {
 
 func cmdDelivery(e env, args []string) error {
 	if len(args) == 0 {
-		return errors.New("usage: tt delivery create|ack|progress|block|resolve|resume|result")
+		return errors.New("usage: tt delivery create|coverage|ack|progress|block|resolve|resume|result")
 	}
 	sub := args[0]
 	fs := flag.NewFlagSet("delivery "+sub, flag.ContinueOnError)
@@ -90,6 +94,24 @@ func cmdDelivery(e env, args []string) error {
 	if err = requireReliableDelivery(ctx, c); err != nil {
 		return err
 	}
+	if sub == "coverage" {
+		if fs.NArg() != 0 || e.agent == "" || e.runID == "" {
+			return errors.New("usage: tt delivery coverage [--task ID] [--json]; exact TAILTERM_AGENT and TAILTERM_RUN are required")
+		}
+		if err = requireReliableDeliveryVersion(ctx, c, api.ReliableFollowThroughCapabilityVersion); err != nil {
+			return err
+		}
+		coverage, coverageErr := c.DeliveryCoverage(ctx, *task, e.agent, e.runID)
+		if coverageErr != nil {
+			return coverageErr
+		}
+		if *asJSON {
+			printJSON(coverage)
+		} else {
+			fmt.Printf("%s: %s\n", coverage.Status, coverage.Reason)
+		}
+		return nil
+	}
 	var out api.DeliveryMutation
 	if sub == "create" {
 		if fs.NArg() != 0 || *file == "" {
@@ -98,6 +120,11 @@ func cmdDelivery(e env, args []string) error {
 		var req api.CreateRequiredDeliveryRequest
 		if err = readAuditJSON(*file, &req); err != nil {
 			return err
+		}
+		if req.EnrollmentVersion == api.ReliableFollowThroughCapabilityVersion {
+			if err = requireReliableDeliveryVersion(ctx, c, api.ReliableFollowThroughCapabilityVersion); err != nil {
+				return err
+			}
 		}
 		if req.ProducerAgentID == "" && e.agent != "" {
 			req.ProducerAgentID, req.ProducerRunID = e.agent, e.runID
@@ -130,7 +157,7 @@ func cmdDelivery(e env, args []string) error {
 		case "result":
 			out, err = c.DeliveryAction(ctx, *task, deliveryID, "result", api.DeliveryActionRequest{RequestID: *requestID, AgentID: e.agent, RunID: e.runID, ExpectedEpoch: *epoch, Text: *text})
 		default:
-			return errors.New("usage: tt delivery create|ack|progress|block|resolve|resume|result")
+			return errors.New("usage: tt delivery create|coverage|ack|progress|block|resolve|resume|result")
 		}
 	}
 	if err != nil {

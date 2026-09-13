@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
 	"encoding/json"
 	"errors"
@@ -12,7 +13,17 @@ import (
 	"github.com/scs32/tailterm/hub/internal/api"
 )
 
-const deliveryCols = `id,task_id,message_seq,kind,agent_id,run_id,item_task_id,item_id,item_revision,work_order_task_id,work_order_message_seq,context_digest,generation,COALESCE(supersedes_delivery_id,''),current,phase,execution_epoch,COALESCE(current_block_id,''),result_text,created_at,updated_at`
+const deliveryCols = `id,task_id,message_seq,kind,agent_id,run_id,item_task_id,item_id,item_revision,work_order_task_id,work_order_message_seq,governing_order_task_id,governing_order_message_seq,instruction_sha256,instruction_bytes,enrollment_version,context_digest,generation,COALESCE(supersedes_delivery_id,''),current,phase,execution_epoch,COALESCE(current_block_id,''),result_text,ack_deadline_seconds,progress_deadline_seconds,resume_deadline_seconds,confirmation_deadline_seconds,dispatch_report_seconds,active_tool_hard_limit_seconds,max_queue_attempts,last_substantive_progress_at,next_substantive_deadline_at,hard_deadline_at,followthrough_attempt_count,followthrough_pending_action,followthrough_pending_request_id,followthrough_pending_since,followthrough_transport_outcome,followthrough_confirmation_until,followthrough_escalation_message_seq,created_at,updated_at`
+
+var defaultDeliveryFollowThroughPolicy = api.DeliveryFollowThroughPolicy{
+	AckDeadlineSeconds:          120,
+	ProgressDeadlineSeconds:     600,
+	ResumeDeadlineSeconds:       120,
+	ConfirmationDeadlineSeconds: 120,
+	DispatchReportSeconds:       30,
+	ActiveToolHardLimitSeconds:  1800,
+	MaxQueueAttempts:            2,
+}
 
 func migrateDelivery(db *sql.DB) error {
 	_, err := db.Exec(`CREATE TABLE IF NOT EXISTS required_deliveries (
@@ -27,6 +38,11 @@ func migrateDelivery(db *sql.DB) error {
   item_revision INTEGER NOT NULL,
   work_order_task_id TEXT NOT NULL,
   work_order_message_seq INTEGER NOT NULL,
+  governing_order_task_id TEXT NOT NULL DEFAULT '',
+  governing_order_message_seq INTEGER NOT NULL DEFAULT 0,
+  instruction_sha256 TEXT NOT NULL DEFAULT '',
+  instruction_bytes INTEGER NOT NULL DEFAULT 0,
+  enrollment_version INTEGER NOT NULL DEFAULT 1,
   context_digest TEXT NOT NULL,
   generation INTEGER NOT NULL,
   supersedes_delivery_id TEXT,
@@ -35,6 +51,23 @@ func migrateDelivery(db *sql.DB) error {
   execution_epoch INTEGER NOT NULL DEFAULT 1,
   current_block_id TEXT,
   result_text TEXT NOT NULL DEFAULT '',
+  ack_deadline_seconds INTEGER NOT NULL DEFAULT 120,
+  progress_deadline_seconds INTEGER NOT NULL DEFAULT 600,
+  resume_deadline_seconds INTEGER NOT NULL DEFAULT 120,
+  confirmation_deadline_seconds INTEGER NOT NULL DEFAULT 120,
+  dispatch_report_seconds INTEGER NOT NULL DEFAULT 30,
+  active_tool_hard_limit_seconds INTEGER NOT NULL DEFAULT 1800,
+  max_queue_attempts INTEGER NOT NULL DEFAULT 2,
+  last_substantive_progress_at TEXT NOT NULL DEFAULT '',
+  next_substantive_deadline_at TEXT NOT NULL DEFAULT '',
+  hard_deadline_at TEXT NOT NULL DEFAULT '',
+  followthrough_attempt_count INTEGER NOT NULL DEFAULT 0,
+  followthrough_pending_action TEXT NOT NULL DEFAULT '',
+  followthrough_pending_request_id TEXT NOT NULL DEFAULT '',
+  followthrough_pending_since TEXT NOT NULL DEFAULT '',
+  followthrough_transport_outcome TEXT NOT NULL DEFAULT '',
+  followthrough_confirmation_until TEXT NOT NULL DEFAULT '',
+  followthrough_escalation_message_seq INTEGER NOT NULL DEFAULT 0,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL,
   UNIQUE(task_id,item_task_id,item_id,agent_id,run_id,generation)
@@ -109,15 +142,45 @@ func validDeliveryKind(kind string) bool {
 func scanRequiredDelivery(row interface{ Scan(...any) error }) (api.RequiredDelivery, error) {
 	var d api.RequiredDelivery
 	var current int
-	var created, updated string
+	var created, updated, lastProgress, nextDeadline, hardDeadline, pendingSince, confirmationUntil string
 	err := row.Scan(&d.ID, &d.TaskID, &d.MessageSeq, &d.Kind, &d.AgentID, &d.RunID,
 		&d.ItemTaskID, &d.ItemID, &d.ItemRevision, &d.WorkOrderMessage.TaskID,
-		&d.WorkOrderMessage.Seq, &d.ContextDigest, &d.Generation, &d.SupersedesID,
+		&d.WorkOrderMessage.Seq, &d.GoverningOrderMessage.TaskID, &d.GoverningOrderMessage.Seq,
+		&d.InstructionSHA256, &d.InstructionBytes, &d.EnrollmentVersion, &d.ContextDigest, &d.Generation, &d.SupersedesID,
 		&current, &d.Phase, &d.ExecutionEpoch, &d.CurrentBlockID, &d.ResultText,
+		&d.FollowThrough.Policy.AckDeadlineSeconds, &d.FollowThrough.Policy.ProgressDeadlineSeconds,
+		&d.FollowThrough.Policy.ResumeDeadlineSeconds, &d.FollowThrough.Policy.ConfirmationDeadlineSeconds,
+		&d.FollowThrough.Policy.DispatchReportSeconds, &d.FollowThrough.Policy.ActiveToolHardLimitSeconds,
+		&d.FollowThrough.Policy.MaxQueueAttempts, &lastProgress, &nextDeadline, &hardDeadline,
+		&d.FollowThrough.AttemptCount, &d.FollowThrough.PendingAction, &d.FollowThrough.PendingRequestID,
+		&pendingSince, &d.FollowThrough.TransportOutcome, &confirmationUntil, &d.FollowThrough.EscalationMessageSeq,
 		&created, &updated)
 	d.Current = current != 0
 	d.CreatedAt, d.UpdatedAt = parseTS(created), parseTS(updated)
+	d.FollowThrough.LastSubstantiveProgressAt = optionalTime(lastProgress)
+	d.FollowThrough.NextDeadlineAt = optionalTime(nextDeadline)
+	d.FollowThrough.HardDeadlineAt = optionalTime(hardDeadline)
+	d.FollowThrough.PendingSince = optionalTime(pendingSince)
+	d.FollowThrough.ConfirmationUntil = optionalTime(confirmationUntil)
 	return d, err
+}
+
+func optionalTime(value string) *time.Time {
+	if value == "" {
+		return nil
+	}
+	t := parseTS(value)
+	if t.IsZero() {
+		return nil
+	}
+	return &t
+}
+
+func optionalTS(value time.Time) string {
+	if value.IsZero() {
+		return ""
+	}
+	return ts(value)
 }
 
 func getRequiredDeliveryRow(q queryRower, ctx context.Context, taskID, deliveryID string) (api.RequiredDelivery, error) {
@@ -221,6 +284,11 @@ func hasDeliveryItemLink(message api.Message, taskID, itemID string, revision in
 	return false
 }
 
+func instructionEvidence(text string) (int64, string) {
+	b := []byte(text)
+	return int64(len(b)), fmt.Sprintf("%x", sha256.Sum256(b))
+}
+
 func validateDeliveryProducer(q queryRower, ctx context.Context, taskID, agentID, runID string) error {
 	if agentID == "" && runID == "" {
 		return nil // Human UI/API actor under the existing shared-workspace credential.
@@ -305,7 +373,13 @@ func (s *Store) CreateRequiredDelivery(ctx context.Context, taskID string, req a
 		!api.ValidID(req.AgentID, "agt") || !validRunID(req.RunID) || !api.ValidID(req.ItemTaskID, "tsk") ||
 		!api.ValidID(req.ItemID, "wi") || req.ItemRevision < 1 || req.WorkOrderMessage.TaskID != req.ItemTaskID ||
 		req.WorkOrderMessage.Seq < 1 || req.ExpectedCurrentGeneration < 0 ||
-		((req.ProducerAgentID == "") != (req.ProducerRunID == "")) {
+		((req.ProducerAgentID == "") != (req.ProducerRunID == "")) ||
+		(req.EnrollmentVersion != 0 && req.EnrollmentVersion != 1 && req.EnrollmentVersion != api.ReliableFollowThroughCapabilityVersion) {
+		return out, api.ErrInvalid
+	}
+	if req.EnrollmentVersion == api.ReliableFollowThroughCapabilityVersion &&
+		(req.GoverningOrderMessage.TaskID != req.ItemTaskID || req.GoverningOrderMessage.Seq < 1 ||
+			req.InstructionBytes < 1 || len(req.InstructionSHA256) != sha256.Size*2) {
 		return out, api.ErrInvalid
 	}
 	payload := requestHash(req)
@@ -339,6 +413,30 @@ func (s *Store) CreateRequiredDelivery(ctx context.Context, taskID string, req a
 			return out, err
 		}
 		return out, workItemConflict("directive message is not immutably linked to the exact item revision")
+	}
+	enrollmentVersion := req.EnrollmentVersion
+	if enrollmentVersion == 0 {
+		enrollmentVersion = 1
+	}
+	var governingOrder api.MessageReference
+	var instructionBytes int64
+	var instructionSHA256 string
+	if enrollmentVersion == api.ReliableFollowThroughCapabilityVersion {
+		governingOrder = req.GoverningOrderMessage
+		if message.WorkOrderMessage == nil || *message.WorkOrderMessage != governingOrder {
+			return out, workItemConflict("directive message is not linked to the exact governing work order")
+		}
+		governing, governingErr := loadMessage(tx, ctx, governingOrder.TaskID, governingOrder.Seq)
+		if governingErr != nil {
+			return out, governingErr
+		}
+		if !hasDeliveryItemLink(governing, req.ItemTaskID, req.ItemID, req.ItemRevision) {
+			return out, workItemConflict("governing work order is not immutably linked to the exact item revision")
+		}
+		instructionBytes, instructionSHA256 = instructionEvidence(message.Text)
+		if instructionBytes != req.InstructionBytes || instructionSHA256 != strings.ToLower(req.InstructionSHA256) {
+			return out, workItemConflict("full directive instruction bytes or SHA256 do not match the immutable message")
+		}
 	}
 	order, err := loadMessage(tx, ctx, req.WorkOrderMessage.TaskID, req.WorkOrderMessage.Seq)
 	if err != nil || !hasDeliveryItemLink(order, req.ItemTaskID, req.ItemID, req.ItemRevision) {
@@ -385,10 +483,21 @@ func (s *Store) CreateRequiredDelivery(ctx context.Context, taskID string, req a
 	}
 	now := s.now()
 	generation := req.ExpectedCurrentGeneration + 1
+	policy := defaultDeliveryFollowThroughPolicy
+	var nextDeadline, hardDeadline time.Time
+	if enrollmentVersion == api.ReliableFollowThroughCapabilityVersion {
+		nextDeadline = now.Add(time.Duration(policy.AckDeadlineSeconds) * time.Second)
+		hardDeadline = now.Add(time.Duration(policy.ActiveToolHardLimitSeconds) * time.Second)
+	}
 	d := api.RequiredDelivery{ID: api.NewID("dly"), TaskID: taskID, MessageSeq: req.MessageSeq, Kind: req.Kind,
 		AgentID: req.AgentID, RunID: req.RunID, ItemTaskID: req.ItemTaskID, ItemID: req.ItemID, ItemRevision: req.ItemRevision,
-		WorkOrderMessage: req.WorkOrderMessage, ContextDigest: binding.ContextDigest, Generation: generation, Current: true,
-		Phase: api.DeliveryUnacknowledged, ExecutionEpoch: 1, CreatedAt: now, UpdatedAt: now}
+		WorkOrderMessage: req.WorkOrderMessage, GoverningOrderMessage: governingOrder, InstructionSHA256: instructionSHA256,
+		InstructionBytes: instructionBytes, EnrollmentVersion: enrollmentVersion, ContextDigest: binding.ContextDigest, Generation: generation, Current: true,
+		Phase: api.DeliveryUnacknowledged, ExecutionEpoch: 1, CreatedAt: now, UpdatedAt: now,
+		FollowThrough: api.DeliveryFollowThroughState{Policy: policy}}
+	if enrollmentVersion == api.ReliableFollowThroughCapabilityVersion {
+		d.FollowThrough.NextDeadlineAt, d.FollowThrough.HardDeadlineAt = &nextDeadline, &hardDeadline
+	}
 	d.Message = &message
 	if priorErr == nil {
 		d.SupersedesID = prior.ID
@@ -396,16 +505,19 @@ func (s *Store) CreateRequiredDelivery(ctx context.Context, taskID string, req a
 		if phase != api.DeliveryResult {
 			phase = api.DeliverySuperseded
 		}
-		if _, err = tx.ExecContext(ctx, `UPDATE required_deliveries SET current=0,phase=?,updated_at=? WHERE id=? AND current=1 AND generation=?`, phase, ts(now), prior.ID, prior.Generation); err != nil {
+		if _, err = tx.ExecContext(ctx, `UPDATE required_deliveries SET current=0,phase=?,next_substantive_deadline_at='',hard_deadline_at='',followthrough_pending_action='',followthrough_pending_request_id='',followthrough_pending_since='',updated_at=? WHERE id=? AND current=1 AND generation=?`, phase, ts(now), prior.ID, prior.Generation); err != nil {
 			return out, err
 		}
 		if _, err = insertDeliveryEvent(ctx, tx, prior, "superseded", req.RequestID, req.ProducerAgentID, req.ProducerRunID, map[string]any{"byDeliveryId": d.ID, "generation": generation}, by, now); err != nil {
 			return out, err
 		}
 	}
-	_, err = tx.ExecContext(ctx, `INSERT INTO required_deliveries(id,task_id,message_seq,kind,agent_id,run_id,item_task_id,item_id,item_revision,work_order_task_id,work_order_message_seq,context_digest,generation,supersedes_delivery_id,current,phase,execution_epoch,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+	_, err = tx.ExecContext(ctx, `INSERT INTO required_deliveries(id,task_id,message_seq,kind,agent_id,run_id,item_task_id,item_id,item_revision,work_order_task_id,work_order_message_seq,governing_order_task_id,governing_order_message_seq,instruction_sha256,instruction_bytes,enrollment_version,context_digest,generation,supersedes_delivery_id,current,phase,execution_epoch,ack_deadline_seconds,progress_deadline_seconds,resume_deadline_seconds,confirmation_deadline_seconds,dispatch_report_seconds,active_tool_hard_limit_seconds,max_queue_attempts,next_substantive_deadline_at,hard_deadline_at,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		d.ID, d.TaskID, d.MessageSeq, d.Kind, d.AgentID, d.RunID, d.ItemTaskID, d.ItemID, d.ItemRevision,
-		d.WorkOrderMessage.TaskID, d.WorkOrderMessage.Seq, d.ContextDigest, d.Generation, nullable(d.SupersedesID), 1, d.Phase, d.ExecutionEpoch, ts(now), ts(now))
+		d.WorkOrderMessage.TaskID, d.WorkOrderMessage.Seq, d.GoverningOrderMessage.TaskID, d.GoverningOrderMessage.Seq,
+		d.InstructionSHA256, d.InstructionBytes, d.EnrollmentVersion, d.ContextDigest, d.Generation, nullable(d.SupersedesID), 1, d.Phase, d.ExecutionEpoch,
+		policy.AckDeadlineSeconds, policy.ProgressDeadlineSeconds, policy.ResumeDeadlineSeconds, policy.ConfirmationDeadlineSeconds,
+		policy.DispatchReportSeconds, policy.ActiveToolHardLimitSeconds, policy.MaxQueueAttempts, optionalTS(nextDeadline), optionalTS(hardDeadline), ts(now), ts(now))
 	if err != nil {
 		return out, err
 	}
@@ -477,6 +589,78 @@ func (s *Store) CurrentAssignment(ctx context.Context, taskID, agentID, runID st
 	return d, nil
 }
 
+// DeliveryCoverage exposes whether an exact admitted item-worker run has a
+// current, fully evidenced v2 obligation. It never derives authority from
+// Board prose, read cursors, Queue state, heartbeats, or roster labels.
+func (s *Store) DeliveryCoverage(ctx context.Context, taskID, agentID, runID string) (api.DeliveryCoverage, error) {
+	var out api.DeliveryCoverage
+	if !api.ValidID(taskID, "tsk") || !api.ValidID(agentID, "agt") || !validRunID(runID) {
+		return out, api.ErrInvalid
+	}
+	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		return out, err
+	}
+	defer tx.Rollback()
+	var agentTask, currentRun, agentStatus string
+	if err = tx.QueryRowContext(ctx, `SELECT task_id,run_id,status FROM agents WHERE id=?`, agentID).Scan(&agentTask, &currentRun, &agentStatus); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return out, api.ErrNotFound
+		}
+		return out, err
+	}
+	if agentTask != taskID || currentRun != runID {
+		return out, workItemConflict("stale run; refresh exact delivery coverage")
+	}
+	out.TaskID, out.AgentID, out.RunID = taskID, agentID, runID
+	out.AgentStatus = agentStatus
+	binding, err := loadAgentWorkItemBinding(tx, ctx, agentID, runID)
+	if err != nil {
+		return out, err
+	}
+	if binding == nil {
+		out.Status = api.DeliveryFollowThroughUncovered
+		out.Reason = "the exact run has no admitted item binding; no obligation is inferred"
+		return out, tx.Commit()
+	}
+	out.ItemTaskID, out.ItemID, out.ItemRevision = binding.ItemTaskID, binding.ItemID, binding.ItemRevision
+	out.BindingWorkOrderMessage, out.ContextDigest = binding.WorkOrderMessage, binding.ContextDigest
+	item, err := getWorkItem(tx, ctx, binding.ItemTaskID, binding.ItemID)
+	if err != nil {
+		return out, err
+	}
+	out.CurrentItemRevision = item.Revision
+	if item.Revision != binding.ItemRevision || item.Status == "done" || item.Status == "dismissed" {
+		out.Status = api.DeliveryFollowThroughUncovered
+		out.Reason = "the admitted binding is not at the current actionable item revision; no follow-through action is authorized"
+		return out, tx.Commit()
+	}
+	d, err := currentRequiredDelivery(tx, ctx, taskID, binding.ItemTaskID, binding.ItemID, agentID, runID)
+	if errors.Is(err, api.ErrNotFound) {
+		out.Status = api.DeliveryFollowThroughUncovered
+		out.Reason = "the exact bound worker has no committed current obligation; enrollment is required"
+		return out, tx.Commit()
+	}
+	if err != nil {
+		return out, err
+	}
+	out.Delivery = &d
+	if agentStatus == api.AgentRetired {
+		out.Status = api.DeliveryFollowThroughRetired
+		out.Reason = "the exact run is intentionally retired and cannot receive automatic follow-through"
+	} else if agentStatus == api.AgentClosed || agentStatus == api.AgentExited {
+		out.Status = api.DeliveryFollowThroughClosed
+		out.Reason = "the exact run is terminal and cannot receive automatic follow-through"
+	} else if d.EnrollmentVersion != api.ReliableFollowThroughCapabilityVersion || d.GoverningOrderMessage.Seq < 1 || d.InstructionSHA256 == "" || d.InstructionBytes < 1 {
+		out.Status = api.DeliveryFollowThroughLegacyEnrollment
+		out.Reason = "the current directive predates full immutable governing-order enrollment and is not follow-through authority"
+	} else {
+		out.Status = "covered"
+		out.Reason = "the exact current directive has verified v2 governing-order and full-instruction evidence"
+	}
+	return out, tx.Commit()
+}
+
 func validateDeliveryBinding(q queryRower, ctx context.Context, d api.RequiredDelivery) error {
 	binding, err := loadAgentWorkItemBinding(q, ctx, d.AgentID, d.RunID)
 	if err != nil {
@@ -516,6 +700,13 @@ func (s *Store) mutateWorkerDelivery(ctx context.Context, taskID, deliveryID, op
 	}
 	if err = validateDeliveryBinding(tx, ctx, d); err != nil {
 		return out, err
+	}
+	item, itemErr := getWorkItem(tx, ctx, d.ItemTaskID, d.ItemID)
+	if itemErr != nil {
+		return out, itemErr
+	}
+	if item.Revision != d.ItemRevision || item.Status == "done" || item.Status == "dismissed" {
+		return out, workItemConflict("item revision or lifecycle changed; follow-through action is not authorized")
 	}
 	if d.AgentID != agentID || d.RunID != runID || !d.Current || d.Phase == api.DeliverySuperseded {
 		current, _ := currentRequiredDeliveryRow(tx, ctx, taskID, d.ItemTaskID, d.ItemID, d.AgentID, d.RunID)
@@ -564,7 +755,9 @@ func (s *Store) AcknowledgeDelivery(ctx context.Context, taskID, deliveryID stri
 		if req.ExpectedEpoch != d.ExecutionEpoch || d.Phase != api.DeliveryUnacknowledged {
 			return "", nil, nil, workItemConflict("stale epoch or invalid directive transition to acknowledged from " + d.Phase)
 		}
-		_, err := tx.ExecContext(ctx, `UPDATE required_deliveries SET phase=?,updated_at=? WHERE id=?`, api.DeliveryAcknowledged, ts(now), d.ID)
+		next := now.Add(time.Duration(d.FollowThrough.Policy.ProgressDeadlineSeconds) * time.Second)
+		hard := now.Add(time.Duration(d.FollowThrough.Policy.ActiveToolHardLimitSeconds) * time.Second)
+		_, err := tx.ExecContext(ctx, `UPDATE required_deliveries SET phase=?,next_substantive_deadline_at=?,hard_deadline_at=?,followthrough_attempt_count=0,followthrough_pending_action='',followthrough_pending_request_id='',followthrough_pending_since='',followthrough_transport_outcome='',followthrough_confirmation_until='',followthrough_escalation_message_seq=0,updated_at=? WHERE id=?`, api.DeliveryAcknowledged, ts(next), ts(hard), ts(now), d.ID)
 		return "acknowledged", map[string]any{"executionEpoch": d.ExecutionEpoch}, nil, err
 	})
 }
@@ -577,7 +770,9 @@ func (s *Store) ProgressDelivery(ctx context.Context, taskID, deliveryID string,
 		if req.ExpectedEpoch != d.ExecutionEpoch || (d.Phase != api.DeliveryAcknowledged && d.Phase != api.DeliveryProgressing) {
 			return "", nil, nil, workItemConflict("stale epoch or invalid directive progress transition from " + d.Phase)
 		}
-		_, err := tx.ExecContext(ctx, `UPDATE required_deliveries SET phase=?,updated_at=? WHERE id=?`, api.DeliveryProgressing, ts(now), d.ID)
+		next := now.Add(time.Duration(d.FollowThrough.Policy.ProgressDeadlineSeconds) * time.Second)
+		hard := now.Add(time.Duration(d.FollowThrough.Policy.ActiveToolHardLimitSeconds) * time.Second)
+		_, err := tx.ExecContext(ctx, `UPDATE required_deliveries SET phase=?,last_substantive_progress_at=?,next_substantive_deadline_at=?,hard_deadline_at=?,followthrough_attempt_count=0,followthrough_pending_action='',followthrough_pending_request_id='',followthrough_pending_since='',followthrough_transport_outcome='',followthrough_confirmation_until='',followthrough_escalation_message_seq=0,updated_at=? WHERE id=?`, api.DeliveryProgressing, ts(now), ts(next), ts(hard), ts(now), d.ID)
 		return "progress", map[string]any{"text": req.Text, "executionEpoch": d.ExecutionEpoch}, nil, err
 	})
 }
@@ -594,7 +789,7 @@ func (s *Store) BlockDelivery(ctx context.Context, taskID, deliveryID string, re
 		if _, err := tx.ExecContext(ctx, `INSERT INTO delivery_blocks(id,delivery_id,execution_epoch,reason_class,text,created_at) VALUES(?,?,?,?,?,?)`, b.ID, b.DeliveryID, b.ExecutionEpoch, b.ReasonClass, b.Text, ts(now)); err != nil {
 			return "", nil, nil, err
 		}
-		_, err := tx.ExecContext(ctx, `UPDATE required_deliveries SET phase=?,current_block_id=?,updated_at=? WHERE id=?`, api.DeliveryBlocked, b.ID, ts(now), d.ID)
+		_, err := tx.ExecContext(ctx, `UPDATE required_deliveries SET phase=?,current_block_id=?,last_substantive_progress_at=?,next_substantive_deadline_at='',hard_deadline_at='',followthrough_attempt_count=0,followthrough_pending_action='',followthrough_pending_request_id='',followthrough_pending_since='',followthrough_transport_outcome='',followthrough_confirmation_until='',followthrough_escalation_message_seq=0,updated_at=? WHERE id=?`, api.DeliveryBlocked, b.ID, ts(now), ts(now), d.ID)
 		return "blocked", map[string]any{"blockId": b.ID, "reasonClass": b.ReasonClass, "executionEpoch": b.ExecutionEpoch}, b, err
 	})
 }
@@ -615,7 +810,7 @@ func (s *Store) ResultDelivery(ctx context.Context, taskID, deliveryID string, r
 		if req.ExpectedEpoch != d.ExecutionEpoch || (d.Phase != api.DeliveryAcknowledged && d.Phase != api.DeliveryProgressing) {
 			return "", nil, nil, workItemConflict("stale epoch or invalid directive result transition from " + d.Phase)
 		}
-		_, err := tx.ExecContext(ctx, `UPDATE required_deliveries SET phase=?,result_text=?,updated_at=? WHERE id=?`, api.DeliveryResult, req.Text, ts(now), d.ID)
+		_, err := tx.ExecContext(ctx, `UPDATE required_deliveries SET phase=?,result_text=?,last_substantive_progress_at=?,next_substantive_deadline_at='',hard_deadline_at='',followthrough_pending_action='',followthrough_pending_request_id='',followthrough_pending_since='',followthrough_transport_outcome='',followthrough_confirmation_until='',updated_at=? WHERE id=?`, api.DeliveryResult, req.Text, ts(now), ts(now), d.ID)
 		return "result", map[string]any{"text": req.Text, "executionEpoch": d.ExecutionEpoch}, nil, err
 	})
 }
@@ -666,6 +861,11 @@ func (s *Store) ResolveDeliveryBlock(ctx context.Context, taskID, deliveryID, bl
 	b.Resolved, b.ResolutionID, b.ResolutionText = true, api.NewID("drsl"), req.Text
 	b.ResolvedAt = &now
 	if _, err = tx.ExecContext(ctx, `UPDATE delivery_blocks SET resolved=1,resolution_id=?,resolution_text=?,resolved_at=? WHERE id=? AND resolved=0`, b.ResolutionID, b.ResolutionText, ts(now), b.ID); err != nil {
+		return out, err
+	}
+	next := now.Add(time.Duration(d.FollowThrough.Policy.ResumeDeadlineSeconds) * time.Second)
+	hard := now.Add(time.Duration(d.FollowThrough.Policy.ActiveToolHardLimitSeconds) * time.Second)
+	if _, err = tx.ExecContext(ctx, `UPDATE required_deliveries SET next_substantive_deadline_at=?,hard_deadline_at=?,followthrough_attempt_count=0,followthrough_pending_action='',followthrough_pending_request_id='',followthrough_pending_since='',followthrough_transport_outcome='',followthrough_confirmation_until='',followthrough_escalation_message_seq=0,updated_at=? WHERE id=?`, ts(next), ts(hard), ts(now), d.ID); err != nil {
 		return out, err
 	}
 	out.Delivery, out.Block = d, &b
@@ -723,7 +923,424 @@ func (s *Store) ResumeDelivery(ctx context.Context, taskID, deliveryID string, r
 			return "", nil, nil, workItemConflict("current block has not been resolved with the supplied resolution")
 		}
 		newEpoch := d.ExecutionEpoch + 1
-		_, err = tx.ExecContext(ctx, `UPDATE required_deliveries SET phase=?,execution_epoch=?,current_block_id=NULL,updated_at=? WHERE id=?`, api.DeliveryAcknowledged, newEpoch, ts(now), d.ID)
+		next := now.Add(time.Duration(d.FollowThrough.Policy.ProgressDeadlineSeconds) * time.Second)
+		hard := now.Add(time.Duration(d.FollowThrough.Policy.ActiveToolHardLimitSeconds) * time.Second)
+		_, err = tx.ExecContext(ctx, `UPDATE required_deliveries SET phase=?,execution_epoch=?,current_block_id=NULL,next_substantive_deadline_at=?,hard_deadline_at=?,followthrough_attempt_count=0,followthrough_pending_action='',followthrough_pending_request_id='',followthrough_pending_since='',followthrough_transport_outcome='',followthrough_confirmation_until='',followthrough_escalation_message_seq=0,updated_at=? WHERE id=?`, api.DeliveryAcknowledged, newEpoch, ts(next), ts(hard), ts(now), d.ID)
 		return "resumed", map[string]any{"blockId": b.ID, "resolutionId": b.ResolutionID, "executionEpoch": newEpoch}, &b, err
 	})
+}
+
+func validRuntimeObservation(observation api.DeliveryRuntimeObservation, now time.Time) bool {
+	if observation.State != api.DeliveryObservationUnknown && observation.State != api.DeliveryObservationActiveTool && observation.State != api.DeliveryObservationIdlePrompt {
+		return false
+	}
+	if strings.TrimSpace(observation.Source) == "" || !api.ValidText(observation.Source, 256) || observation.ObservedAt.IsZero() {
+		return false
+	}
+	if observation.ObservedAt.After(now.Add(time.Minute)) || now.Sub(observation.ObservedAt) > 2*time.Minute {
+		return false
+	}
+	return observation.ActivityID == "" || api.ValidText(observation.ActivityID, 256)
+}
+
+func findFollowThroughReplay(q queryRower, ctx context.Context, taskID, operation, deliveryID, agentID, runID, requestID, payload string, by api.Caller, out any) (bool, error) {
+	var priorSubject, priorHash string
+	var raw []byte
+	err := q.QueryRowContext(ctx, `SELECT subject_id,payload_hash,response_json FROM delivery_operation_receipts WHERE task_id=? AND operation=? AND actor_agent_id=? AND actor_run_id=? AND by_node=? AND by_user=? AND request_id=?`,
+		taskID, operation, agentID, runID, by.Node, by.User, requestID).Scan(&priorSubject, &priorHash, &raw)
+	if err == nil {
+		if priorSubject != deliveryID || priorHash != payload {
+			return false, workItemConflict("request ID was already used with different follow-through data")
+		}
+		return true, json.Unmarshal(raw, out)
+	}
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	return false, err
+}
+
+func insertFollowThroughReceipt(ctx context.Context, tx *sql.Tx, taskID, operation, deliveryID, agentID, runID, requestID, payload string, by api.Caller, createdAt time.Time, receipt *api.DeliveryReceipt, out any) error {
+	*receipt = api.DeliveryReceipt{ID: api.NewID("drr"), RequestID: requestID, Operation: operation, CreatedAt: createdAt}
+	raw, err := json.Marshal(out)
+	if err != nil {
+		return err
+	}
+	_, err = tx.ExecContext(ctx, `INSERT INTO delivery_operation_receipts(receipt_id,task_id,operation,subject_id,actor_agent_id,actor_run_id,by_node,by_user,request_id,payload_hash,response_json,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`,
+		receipt.ID, taskID, operation, deliveryID, agentID, runID, by.Node, by.User, requestID, payload, raw, ts(createdAt))
+	return err
+}
+
+func initializeDeliveryDeadline(ctx context.Context, tx *sql.Tx, d api.RequiredDelivery, now time.Time) (api.RequiredDelivery, error) {
+	if d.EnrollmentVersion != api.ReliableFollowThroughCapabilityVersion || d.FollowThrough.NextDeadlineAt != nil || d.Phase == api.DeliveryResult || d.Phase == api.DeliverySuperseded {
+		return d, nil
+	}
+	base := d.UpdatedAt
+	duration := time.Duration(d.FollowThrough.Policy.ProgressDeadlineSeconds) * time.Second
+	switch d.Phase {
+	case api.DeliveryUnacknowledged:
+		base = d.CreatedAt
+		duration = time.Duration(d.FollowThrough.Policy.AckDeadlineSeconds) * time.Second
+	case api.DeliveryBlocked:
+		if d.CurrentBlock == nil || !d.CurrentBlock.Resolved || d.CurrentBlock.ResolvedAt == nil {
+			return d, nil
+		}
+		base = *d.CurrentBlock.ResolvedAt
+		duration = time.Duration(d.FollowThrough.Policy.ResumeDeadlineSeconds) * time.Second
+	}
+	next := base.Add(duration)
+	hard := base.Add(time.Duration(d.FollowThrough.Policy.ActiveToolHardLimitSeconds) * time.Second)
+	if _, err := tx.ExecContext(ctx, `UPDATE required_deliveries SET next_substantive_deadline_at=?,hard_deadline_at=? WHERE id=? AND current=1`, ts(next), ts(hard), d.ID); err != nil {
+		return d, err
+	}
+	d.FollowThrough.NextDeadlineAt, d.FollowThrough.HardDeadlineAt = &next, &hard
+	return d, nil
+}
+
+func deliveryFollowThroughClassification(d api.RequiredDelivery, status string, observation api.DeliveryRuntimeObservation, now time.Time) (string, string, bool) {
+	if d.EnrollmentVersion != api.ReliableFollowThroughCapabilityVersion {
+		return api.DeliveryFollowThroughLegacyEnrollment, "the directive lacks full immutable v2 enrollment evidence", false
+	}
+	if status == api.AgentRetired {
+		return api.DeliveryFollowThroughRetired, "retired runs are intentionally retained and are never auto-resumed", false
+	}
+	if status == api.AgentClosed || status == api.AgentExited || !d.Current || d.Phase == api.DeliverySuperseded {
+		return api.DeliveryFollowThroughClosed, "terminal or superseded work has no executable follow-through", false
+	}
+	if d.Phase == api.DeliveryResult {
+		return api.DeliveryFollowThroughIdleNoObligation, "the directive has a result; item acceptance remains separate", false
+	}
+	if d.Phase == api.DeliveryBlocked {
+		if d.CurrentBlock == nil || !d.CurrentBlock.Resolved {
+			return api.DeliveryFollowThroughKnownBlock, "the current exact epoch has an unresolved durable block", false
+		}
+		if d.FollowThrough.NextDeadlineAt != nil && now.Before(*d.FollowThrough.NextDeadlineAt) {
+			return api.DeliveryFollowThroughResolvedAwaitingResume, "the resolved block is within its worker-resume deadline", false
+		}
+	}
+	if d.FollowThrough.EscalationMessageSeq > 0 {
+		return api.DeliveryFollowThroughEscalated, "the unresolved incident was already escalated", false
+	}
+	if d.FollowThrough.PendingRequestID != "" {
+		if d.FollowThrough.TransportOutcome == "" {
+			if d.FollowThrough.PendingSince != nil && now.Before(d.FollowThrough.PendingSince.Add(time.Duration(d.FollowThrough.Policy.DispatchReportSeconds)*time.Second)) {
+				return api.DeliveryFollowThroughTransportUnconfirmed, "a leased exact-thread action is awaiting its durable transport report", false
+			}
+			return api.DeliveryFollowThroughDispatchAmbiguous, "the leased exact-thread action has no durable outcome and will not be repeated", true
+		}
+		if d.FollowThrough.TransportOutcome == api.DeliveryFollowThroughOutcomeAccepted && d.FollowThrough.ConfirmationUntil != nil && now.Before(*d.FollowThrough.ConfirmationUntil) {
+			return api.DeliveryFollowThroughTransportUnconfirmed, "native queue acceptance is awaiting exact directive ack or substantive progress", false
+		}
+		if d.FollowThrough.TransportOutcome == api.DeliveryFollowThroughOutcomeFailed || d.FollowThrough.TransportOutcome == api.DeliveryFollowThroughOutcomeAmbiguous {
+			return api.DeliveryFollowThroughDispatchAmbiguous, "the transport outcome is failed or ambiguous and will not be retried automatically", true
+		}
+	}
+	if d.FollowThrough.NextDeadlineAt != nil && now.Before(*d.FollowThrough.NextDeadlineAt) {
+		switch d.Phase {
+		case api.DeliveryUnacknowledged:
+			return api.DeliveryFollowThroughAwaitingAck, "the current directive is within its exact-run acknowledgment deadline", false
+		case api.DeliveryProgressing:
+			return api.DeliveryFollowThroughRecentProgress, "substantive progress is within its declared deadline", false
+		case api.DeliveryBlocked:
+			return api.DeliveryFollowThroughResolvedAwaitingResume, "the resolved block is within its worker-resume deadline", false
+		default:
+			return api.DeliveryFollowThroughAwaitingProgress, "acknowledged execution is within its substantive-progress deadline", false
+		}
+	}
+	if observation.State == api.DeliveryObservationActiveTool && d.FollowThrough.HardDeadlineAt != nil && now.Before(*d.FollowThrough.HardDeadlineAt) {
+		return api.DeliveryFollowThroughActiveTool, "a supported observer reports an active tool; silence alone does not interrupt it", false
+	}
+	if observation.State == api.DeliveryObservationActiveTool {
+		return api.DeliveryFollowThroughActiveTool, "the active-tool hard limit elapsed; escalate without interrupting the tool", true
+	}
+	if d.FollowThrough.AttemptCount >= d.FollowThrough.Policy.MaxQueueAttempts {
+		return api.DeliveryFollowThroughTransportUnconfirmed, "bounded exact-thread attempts produced no ack or substantive progress", true
+	}
+	if observation.State == api.DeliveryObservationIdlePrompt {
+		return api.DeliveryFollowThroughOverdueIdlePrompt, "the exact current directive is overdue and the runtime prompt is observably idle", true
+	}
+	return api.DeliveryFollowThroughOverdueUnknown, "the exact current directive is overdue and runtime execution evidence is unknown", true
+}
+
+func (s *Store) escalateDeliveryFollowThrough(ctx context.Context, tx *sql.Tx, d api.RequiredDelivery, classification, requestID string, observation api.DeliveryRuntimeObservation, by api.Caller, now time.Time) (api.Message, api.DeliveryEvent, error) {
+	task, err := scanTask(tx.QueryRowContext(ctx, `SELECT `+taskCols+` FROM tasks WHERE id=?`, d.TaskID))
+	if err != nil {
+		return api.Message{}, api.DeliveryEvent{}, err
+	}
+	var target api.Agent
+	var count int
+	rows, err := tx.QueryContext(ctx, `SELECT `+agentCols+` FROM agents WHERE task_id=? AND name=? AND role=''`, d.TaskID, task.Orchestrator)
+	if err != nil {
+		return api.Message{}, api.DeliveryEvent{}, err
+	}
+	for rows.Next() {
+		target, err = scanAgent(rows)
+		if err != nil {
+			rows.Close()
+			return api.Message{}, api.DeliveryEvent{}, err
+		}
+		count++
+	}
+	if err = rows.Err(); err != nil {
+		rows.Close()
+		return api.Message{}, api.DeliveryEvent{}, err
+	}
+	rows.Close()
+	if count != 1 || target.Status == api.AgentRetired || target.Status == api.AgentClosed || target.Status == api.AgentExited {
+		return api.Message{}, api.DeliveryEvent{}, workItemConflict("no unique actionable current orchestrator is available for follow-through escalation")
+	}
+	text := fmt.Sprintf("Reliable follow-through escalation: delivery %s generation %d epoch %d for item %s@%d and worker %s/%s remains unresolved (%s). Runtime observation=%s source=%s; heartbeat, Working, inbox reads and queue acceptance are not substantive progress. Review the exact current assignment before any recovery action.", d.ID, d.Generation, d.ExecutionEpoch, d.ItemID, d.ItemRevision, d.AgentID, d.RunID, classification, observation.State, observation.Source)
+	escalationSeed := fmt.Sprintf("%s:%d:%d:%v:%s:%d", d.ID, d.Generation, d.ExecutionEpoch, d.FollowThrough.NextDeadlineAt, d.FollowThrough.PendingRequestID, d.FollowThrough.AttemptCount)
+	messageRequestID := fmt.Sprintf("delivery-escalation-%x", sha256.Sum256([]byte(escalationSeed)))
+	req := api.PostMessageRequest{To: target.ID, Text: text, RequestID: messageRequestID,
+		WorkItems:        []api.MessageWorkItem{{ItemTaskID: d.ItemTaskID, ItemID: d.ItemID, ItemRevision: d.ItemRevision, Relationship: "primary"}},
+		WorkOrderMessage: &d.WorkOrderMessage}
+	message, err := s.insertMessageWithResume(ctx, tx, task, req, target, api.Caller{Node: "system", User: "delivery-follow-through"}, false, false, false)
+	if err != nil {
+		return api.Message{}, api.DeliveryEvent{}, err
+	}
+	if err = insertMessagePostReceipt(ctx, tx, &message, req.RequestID, requestHash(req), api.Caller{Node: "system", User: "delivery-follow-through"}); err != nil {
+		return api.Message{}, api.DeliveryEvent{}, err
+	}
+	event, err := insertDeliveryEvent(ctx, tx, d, "followthrough_escalated", requestID, d.AgentID, d.RunID, map[string]any{"classification": classification, "messageSeq": message.Seq, "generation": d.Generation, "executionEpoch": d.ExecutionEpoch}, by, now)
+	return message, event, err
+}
+
+// CheckDeliveryFollowThrough classifies one exact current directive and, only
+// when due, transactionally owns either one queue lease or one escalation.
+// Ordinary heartbeat/read/roster state is deliberately absent from the input.
+func (s *Store) CheckDeliveryFollowThrough(ctx context.Context, taskID, deliveryID string, req api.DeliveryFollowThroughCheckRequest, by api.Caller) (api.DeliveryFollowThroughDecision, error) {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	var out api.DeliveryFollowThroughDecision
+	now := s.now()
+	if !api.ValidID(taskID, "tsk") || !validDeliveryID(deliveryID, "dly") || !validRequestID(req.RequestID) || !api.ValidID(req.AgentID, "agt") || !validRunID(req.RunID) || req.ExpectedGeneration < 1 || req.ExpectedEpoch < 1 || !validRuntimeObservation(req.Observation, now) {
+		return out, api.ErrInvalid
+	}
+	payload := requestHash(req)
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return out, err
+	}
+	defer tx.Rollback()
+	if replay, replayErr := findFollowThroughReplay(tx, ctx, taskID, "followthrough_check", deliveryID, req.AgentID, req.RunID, req.RequestID, payload, by, &out); replayErr != nil {
+		return out, replayErr
+	} else if replay {
+		out.Replay, out.Execute = true, false
+		return out, nil
+	}
+	d, err := getRequiredDeliveryRow(tx, ctx, taskID, deliveryID)
+	if err != nil {
+		return out, err
+	}
+	if err = validateDeliveryBinding(tx, ctx, d); err != nil {
+		return out, err
+	}
+	item, err := getWorkItem(tx, ctx, d.ItemTaskID, d.ItemID)
+	if err != nil {
+		return out, err
+	}
+	if item.Revision != d.ItemRevision || item.Status == "done" || item.Status == "dismissed" {
+		return out, workItemConflict("item revision or lifecycle changed; follow-through action is not authorized")
+	}
+	if d.AgentID != req.AgentID || d.RunID != req.RunID || d.Generation != req.ExpectedGeneration || d.ExecutionEpoch != req.ExpectedEpoch || !d.Current {
+		return out, workItemConflict("stale run, generation, epoch, or superseded delivery")
+	}
+	var currentRun, status string
+	if err = tx.QueryRowContext(ctx, `SELECT run_id,status FROM agents WHERE id=? AND task_id=?`, req.AgentID, taskID).Scan(&currentRun, &status); err != nil {
+		return out, err
+	}
+	if currentRun != req.RunID {
+		return out, workItemConflict("stale run; refresh the exact current assignment")
+	}
+	d, err = hydrateRequiredDelivery(tx, ctx, d)
+	if err != nil {
+		return out, err
+	}
+	d, err = initializeDeliveryDeadline(ctx, tx, d, now)
+	if err != nil {
+		return out, err
+	}
+	classification, reason, due := deliveryFollowThroughClassification(d, status, req.Observation, now)
+	out.Delivery, out.Classification, out.Reason, out.Action = d, classification, reason, api.DeliveryFollowThroughActionNone
+	if !due || status == api.AgentRetired || status == api.AgentClosed || status == api.AgentExited || d.Phase == api.DeliveryResult || d.Phase == api.DeliverySuperseded {
+		if err = tx.Commit(); err != nil {
+			return out, err
+		}
+		return out, nil
+	}
+	mustEscalate := classification == api.DeliveryFollowThroughActiveTool || classification == api.DeliveryFollowThroughDispatchAmbiguous || d.FollowThrough.AttemptCount >= d.FollowThrough.Policy.MaxQueueAttempts
+	if mustEscalate {
+		message, event, escalationErr := s.escalateDeliveryFollowThrough(ctx, tx, d, classification, req.RequestID, req.Observation, by, now)
+		if escalationErr != nil {
+			return out, escalationErr
+		}
+		if _, err = tx.ExecContext(ctx, `UPDATE required_deliveries SET followthrough_escalation_message_seq=?,next_substantive_deadline_at='',followthrough_pending_action='',followthrough_pending_request_id='',followthrough_pending_since='',updated_at=? WHERE id=?`, message.Seq, ts(now), d.ID); err != nil {
+			return out, err
+		}
+		out.Classification, out.Reason, out.EscalationMessageSeq, out.Event = api.DeliveryFollowThroughEscalated, reason, message.Seq, &event
+		out.Delivery.FollowThrough.EscalationMessageSeq = message.Seq
+		out.Delivery.FollowThrough.NextDeadlineAt = nil
+		var receipt api.DeliveryReceipt
+		out.Receipt = &receipt
+		if err = insertFollowThroughReceipt(ctx, tx, taskID, "followthrough_check", deliveryID, req.AgentID, req.RunID, req.RequestID, payload, by, now, &receipt, &out); err != nil {
+			return out, err
+		}
+		if err = tx.Commit(); err != nil {
+			return out, err
+		}
+		s.notify(taskID)
+		return out, nil
+	}
+	attempt := d.FollowThrough.AttemptCount + 1
+	event, err := insertDeliveryEvent(ctx, tx, d, "followthrough_queue_leased", req.RequestID, req.AgentID, req.RunID, map[string]any{"attempt": attempt, "classification": classification, "generation": d.Generation, "executionEpoch": d.ExecutionEpoch, "observation": req.Observation.State}, by, now)
+	if err != nil {
+		return out, err
+	}
+	if _, err = tx.ExecContext(ctx, `UPDATE required_deliveries SET followthrough_attempt_count=?,followthrough_pending_action=?,followthrough_pending_request_id=?,followthrough_pending_since=?,followthrough_transport_outcome='',followthrough_confirmation_until='',updated_at=? WHERE id=?`, attempt, api.DeliveryFollowThroughActionQueue, req.RequestID, ts(now), ts(now), d.ID); err != nil {
+		return out, err
+	}
+	out.Action, out.Attempt, out.Execute, out.Event = api.DeliveryFollowThroughActionQueue, attempt, true, &event
+	out.Delivery.FollowThrough.AttemptCount = attempt
+	out.Delivery.FollowThrough.PendingAction = out.Action
+	out.Delivery.FollowThrough.PendingRequestID = req.RequestID
+	out.Delivery.FollowThrough.PendingSince = &now
+	var receipt api.DeliveryReceipt
+	out.Receipt = &receipt
+	if err = insertFollowThroughReceipt(ctx, tx, taskID, "followthrough_check", deliveryID, req.AgentID, req.RunID, req.RequestID, payload, by, now, &receipt, &out); err != nil {
+		return out, err
+	}
+	if err = tx.Commit(); err != nil {
+		return out, err
+	}
+	s.notify(taskID)
+	return out, nil
+}
+
+func validFollowThroughOutcome(outcome string) bool {
+	return outcome == api.DeliveryFollowThroughOutcomeAccepted || outcome == api.DeliveryFollowThroughOutcomeFailed || outcome == api.DeliveryFollowThroughOutcomeAmbiguous || outcome == api.DeliveryFollowThroughOutcomeInvalidated
+}
+
+func hasFollowThroughLease(q queryRower, ctx context.Context, deliveryID, requestID string, generation, epoch int64) (bool, error) {
+	events, err := loadDeliveryEvents(q, ctx, deliveryID)
+	if err != nil {
+		return false, err
+	}
+	for _, event := range events {
+		if event.Kind != "followthrough_queue_leased" || event.RequestID != requestID {
+			continue
+		}
+		gotGeneration, generationOK := event.Data["generation"].(float64)
+		gotEpoch, epochOK := event.Data["executionEpoch"].(float64)
+		if generationOK && epochOK && int64(gotGeneration) == generation && int64(gotEpoch) == epoch {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+func (s *Store) ReportDeliveryFollowThrough(ctx context.Context, taskID, deliveryID string, req api.DeliveryFollowThroughReportRequest, by api.Caller) (api.DeliveryFollowThroughReport, error) {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	var out api.DeliveryFollowThroughReport
+	if !api.ValidID(taskID, "tsk") || !validDeliveryID(deliveryID, "dly") || !validRequestID(req.RequestID) || !validRequestID(req.LeaseRequestID) || !api.ValidID(req.AgentID, "agt") || !validRunID(req.RunID) || req.ExpectedGeneration < 1 || req.ExpectedEpoch < 1 || !validFollowThroughOutcome(req.Outcome) || !api.ValidText(req.Text, api.MaxTextLen) {
+		return out, api.ErrInvalid
+	}
+	payload := requestHash(req)
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return out, err
+	}
+	defer tx.Rollback()
+	if replay, replayErr := findFollowThroughReplay(tx, ctx, taskID, "followthrough_report", deliveryID, req.AgentID, req.RunID, req.RequestID, payload, by, &out); replayErr != nil {
+		return out, replayErr
+	} else if replay {
+		out.Replay = true
+		return out, nil
+	}
+	d, err := getRequiredDeliveryRow(tx, ctx, taskID, deliveryID)
+	if err != nil {
+		return out, err
+	}
+	if err = validateDeliveryBinding(tx, ctx, d); err != nil {
+		return out, err
+	}
+	if d.AgentID != req.AgentID || d.RunID != req.RunID || d.Generation != req.ExpectedGeneration {
+		return out, workItemConflict("stale or already-reported follow-through lease")
+	}
+	var currentRun, status string
+	if err = tx.QueryRowContext(ctx, `SELECT run_id,status FROM agents WHERE id=? AND task_id=?`, req.AgentID, taskID).Scan(&currentRun, &status); err != nil {
+		return out, err
+	}
+	activeLease := d.Current && d.ExecutionEpoch == req.ExpectedEpoch && d.FollowThrough.PendingAction == api.DeliveryFollowThroughActionQueue && d.FollowThrough.PendingRequestID == req.LeaseRequestID && d.FollowThrough.TransportOutcome == ""
+	if req.Outcome == api.DeliveryFollowThroughOutcomeInvalidated {
+		recorded, leaseErr := hasFollowThroughLease(tx, ctx, deliveryID, req.LeaseRequestID, req.ExpectedGeneration, req.ExpectedEpoch)
+		if leaseErr != nil {
+			return out, leaseErr
+		}
+		item, itemErr := getWorkItem(tx, ctx, d.ItemTaskID, d.ItemID)
+		if itemErr != nil {
+			return out, itemErr
+		}
+		invalidated := !activeLease || currentRun != req.RunID || status == api.AgentRetired || status == api.AgentClosed || status == api.AgentExited || !d.Current || d.ExecutionEpoch != req.ExpectedEpoch || item.Revision != d.ItemRevision || item.Status == "done" || item.Status == "dismissed"
+		if !recorded || !invalidated {
+			return out, workItemConflict("follow-through lease is not durably invalidated")
+		}
+		now := s.now()
+		if activeLease {
+			if _, err = tx.ExecContext(ctx, `UPDATE required_deliveries SET followthrough_pending_action='',followthrough_pending_request_id='',followthrough_pending_since='',followthrough_transport_outcome=?,followthrough_confirmation_until='',updated_at=? WHERE id=?`, req.Outcome, ts(now), d.ID); err != nil {
+				return out, err
+			}
+		}
+		event, eventErr := insertDeliveryEvent(ctx, tx, d, "followthrough_queue_invalidated", req.RequestID, req.AgentID, req.RunID, map[string]any{"leaseRequestId": req.LeaseRequestID, "generation": req.ExpectedGeneration, "executionEpoch": req.ExpectedEpoch, "text": req.Text}, by, now)
+		if eventErr != nil {
+			return out, eventErr
+		}
+		d, err = getRequiredDeliveryRow(tx, ctx, taskID, deliveryID)
+		if err != nil {
+			return out, err
+		}
+		out.Delivery, out.Event = d, event
+		if err = insertFollowThroughReceipt(ctx, tx, taskID, "followthrough_report", deliveryID, req.AgentID, req.RunID, req.RequestID, payload, by, now, &out.Receipt, &out); err != nil {
+			return out, err
+		}
+		if err = tx.Commit(); err != nil {
+			return out, err
+		}
+		s.notify(taskID)
+		return out, nil
+	}
+	if !activeLease {
+		return out, workItemConflict("stale or already-reported follow-through lease")
+	}
+	if currentRun != req.RunID || status == api.AgentRetired || status == api.AgentClosed || status == api.AgentExited {
+		return out, workItemConflict("agent lifecycle no longer permits a follow-through report")
+	}
+	now := s.now()
+	next := now
+	confirmation := ""
+	if req.Outcome == api.DeliveryFollowThroughOutcomeAccepted {
+		next = now.Add(time.Duration(d.FollowThrough.Policy.ConfirmationDeadlineSeconds) * time.Second)
+		confirmation = ts(next)
+	}
+	if _, err = tx.ExecContext(ctx, `UPDATE required_deliveries SET followthrough_transport_outcome=?,followthrough_confirmation_until=?,next_substantive_deadline_at=?,updated_at=? WHERE id=?`, req.Outcome, confirmation, ts(next), ts(now), d.ID); err != nil {
+		return out, err
+	}
+	event, err := insertDeliveryEvent(ctx, tx, d, "followthrough_queue_"+req.Outcome, req.RequestID, req.AgentID, req.RunID, map[string]any{"leaseRequestId": req.LeaseRequestID, "attempt": d.FollowThrough.AttemptCount, "outcome": req.Outcome, "text": req.Text}, by, now)
+	if err != nil {
+		return out, err
+	}
+	d, err = getRequiredDeliveryRow(tx, ctx, taskID, deliveryID)
+	if err != nil {
+		return out, err
+	}
+	out.Delivery, out.Event = d, event
+	if err = insertFollowThroughReceipt(ctx, tx, taskID, "followthrough_report", deliveryID, req.AgentID, req.RunID, req.RequestID, payload, by, now, &out.Receipt, &out); err != nil {
+		return out, err
+	}
+	if err = tx.Commit(); err != nil {
+		return out, err
+	}
+	s.notify(taskID)
+	return out, nil
 }

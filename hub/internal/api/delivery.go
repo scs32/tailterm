@@ -6,7 +6,10 @@ import (
 	"time"
 )
 
-const ReliableDeliveryCapabilityVersion = 1
+const (
+	ReliableDeliveryCapabilityVersion      = 1
+	ReliableFollowThroughCapabilityVersion = 2
+)
 
 const (
 	DeliveryAssignment = "assignment"
@@ -19,32 +22,90 @@ const (
 	DeliveryBlocked        = "blocked"
 	DeliveryResult         = "result"
 	DeliverySuperseded     = "superseded"
+
+	DeliveryObservationUnknown    = "unknown"
+	DeliveryObservationActiveTool = "active_tool"
+	DeliveryObservationIdlePrompt = "idle_prompt"
+
+	DeliveryFollowThroughAwaitingAck            = "awaiting_ack"
+	DeliveryFollowThroughAwaitingProgress       = "awaiting_progress"
+	DeliveryFollowThroughRecentProgress         = "recent_progress"
+	DeliveryFollowThroughActiveTool             = "active_tool"
+	DeliveryFollowThroughKnownBlock             = "known_block"
+	DeliveryFollowThroughResolvedAwaitingResume = "resolved_awaiting_resume"
+	DeliveryFollowThroughTransportUnconfirmed   = "transport_unconfirmed"
+	DeliveryFollowThroughOverdueUnknown         = "overdue_unknown"
+	DeliveryFollowThroughOverdueIdlePrompt      = "overdue_idle_prompt"
+	DeliveryFollowThroughDispatchAmbiguous      = "dispatch_ambiguous"
+	DeliveryFollowThroughEscalated              = "escalated"
+	DeliveryFollowThroughIdleNoObligation       = "idle_no_obligation"
+	DeliveryFollowThroughRetired                = "retired"
+	DeliveryFollowThroughClosed                 = "closed"
+	DeliveryFollowThroughUncovered              = "uncovered_unverified"
+	DeliveryFollowThroughLegacyEnrollment       = "legacy_enrollment_unverified"
+
+	DeliveryFollowThroughActionNone  = "none"
+	DeliveryFollowThroughActionQueue = "queue_current_assignment"
+
+	DeliveryFollowThroughOutcomeAccepted    = "accepted"
+	DeliveryFollowThroughOutcomeFailed      = "failed"
+	DeliveryFollowThroughOutcomeAmbiguous   = "ambiguous"
+	DeliveryFollowThroughOutcomeInvalidated = "invalidated"
 )
 
+type DeliveryFollowThroughPolicy struct {
+	AckDeadlineSeconds          int64 `json:"ackDeadlineSeconds"`
+	ProgressDeadlineSeconds     int64 `json:"progressDeadlineSeconds"`
+	ResumeDeadlineSeconds       int64 `json:"resumeDeadlineSeconds"`
+	ConfirmationDeadlineSeconds int64 `json:"confirmationDeadlineSeconds"`
+	DispatchReportSeconds       int64 `json:"dispatchReportSeconds"`
+	ActiveToolHardLimitSeconds  int64 `json:"activeToolHardLimitSeconds"`
+	MaxQueueAttempts            int   `json:"maxQueueAttempts"`
+}
+
+type DeliveryFollowThroughState struct {
+	Policy                    DeliveryFollowThroughPolicy `json:"policy"`
+	LastSubstantiveProgressAt *time.Time                  `json:"lastSubstantiveProgressAt,omitempty"`
+	NextDeadlineAt            *time.Time                  `json:"nextDeadlineAt,omitempty"`
+	HardDeadlineAt            *time.Time                  `json:"hardDeadlineAt,omitempty"`
+	AttemptCount              int                         `json:"attemptCount"`
+	PendingAction             string                      `json:"pendingAction,omitempty"`
+	PendingRequestID          string                      `json:"pendingRequestId,omitempty"`
+	PendingSince              *time.Time                  `json:"pendingSince,omitempty"`
+	TransportOutcome          string                      `json:"transportOutcome,omitempty"`
+	ConfirmationUntil         *time.Time                  `json:"confirmationUntil,omitempty"`
+	EscalationMessageSeq      int64                       `json:"escalationMessageSeq,omitempty"`
+}
+
 type RequiredDelivery struct {
-	ID               string           `json:"id"`
-	TaskID           string           `json:"taskId"`
-	MessageSeq       int64            `json:"messageSeq"`
-	Kind             string           `json:"kind"`
-	AgentID          string           `json:"agentId"`
-	RunID            string           `json:"runId"`
-	ItemTaskID       string           `json:"itemTaskId"`
-	ItemID           string           `json:"itemId"`
-	ItemRevision     int64            `json:"itemRevision"`
-	WorkOrderMessage MessageReference `json:"workOrderMessage"`
-	ContextDigest    string           `json:"contextDigest"`
-	Generation       int64            `json:"generation"`
-	SupersedesID     string           `json:"supersedesDeliveryId,omitempty"`
-	Current          bool             `json:"current"`
-	Phase            string           `json:"phase"`
-	ExecutionEpoch   int64            `json:"executionEpoch"`
-	CurrentBlockID   string           `json:"currentBlockId,omitempty"`
-	CurrentBlock     *DeliveryBlock   `json:"currentBlock,omitempty"`
-	ResultText       string           `json:"resultText,omitempty"`
-	Message          *Message         `json:"message,omitempty"`
-	Events           []DeliveryEvent  `json:"events,omitempty"`
-	CreatedAt        time.Time        `json:"createdAt"`
-	UpdatedAt        time.Time        `json:"updatedAt"`
+	ID                    string                     `json:"id"`
+	TaskID                string                     `json:"taskId"`
+	MessageSeq            int64                      `json:"messageSeq"`
+	Kind                  string                     `json:"kind"`
+	AgentID               string                     `json:"agentId"`
+	RunID                 string                     `json:"runId"`
+	ItemTaskID            string                     `json:"itemTaskId"`
+	ItemID                string                     `json:"itemId"`
+	ItemRevision          int64                      `json:"itemRevision"`
+	WorkOrderMessage      MessageReference           `json:"workOrderMessage"`
+	GoverningOrderMessage MessageReference           `json:"governingOrderMessage"`
+	InstructionSHA256     string                     `json:"instructionSha256"`
+	InstructionBytes      int64                      `json:"instructionBytes"`
+	EnrollmentVersion     int                        `json:"enrollmentVersion"`
+	ContextDigest         string                     `json:"contextDigest"`
+	Generation            int64                      `json:"generation"`
+	SupersedesID          string                     `json:"supersedesDeliveryId,omitempty"`
+	Current               bool                       `json:"current"`
+	Phase                 string                     `json:"phase"`
+	ExecutionEpoch        int64                      `json:"executionEpoch"`
+	CurrentBlockID        string                     `json:"currentBlockId,omitempty"`
+	CurrentBlock          *DeliveryBlock             `json:"currentBlock,omitempty"`
+	ResultText            string                     `json:"resultText,omitempty"`
+	Message               *Message                   `json:"message,omitempty"`
+	Events                []DeliveryEvent            `json:"events,omitempty"`
+	FollowThrough         DeliveryFollowThroughState `json:"followThrough"`
+	CreatedAt             time.Time                  `json:"createdAt"`
+	UpdatedAt             time.Time                  `json:"updatedAt"`
 }
 
 type DeliveryEvent struct {
@@ -99,10 +160,30 @@ type CreateRequiredDeliveryRequest struct {
 	ItemID                    string           `json:"itemId"`
 	ItemRevision              int64            `json:"itemRevision"`
 	WorkOrderMessage          MessageReference `json:"workOrderMessage"`
+	GoverningOrderMessage     MessageReference `json:"governingOrderMessage"`
+	InstructionSHA256         string           `json:"instructionSha256"`
+	InstructionBytes          int64            `json:"instructionBytes"`
+	EnrollmentVersion         int              `json:"enrollmentVersion"`
 	ExpectedCurrentGeneration int64            `json:"expectedCurrentGeneration"`
 	ExpectedCurrentDeliveryID string           `json:"expectedCurrentDeliveryId,omitempty"`
 	ProducerAgentID           string           `json:"producerAgentId,omitempty"`
 	ProducerRunID             string           `json:"producerRunId,omitempty"`
+}
+
+type DeliveryCoverage struct {
+	TaskID                  string            `json:"taskId"`
+	AgentID                 string            `json:"agentId"`
+	RunID                   string            `json:"runId"`
+	ItemTaskID              string            `json:"itemTaskId"`
+	ItemID                  string            `json:"itemId"`
+	ItemRevision            int64             `json:"itemRevision"`
+	CurrentItemRevision     int64             `json:"currentItemRevision"`
+	BindingWorkOrderMessage MessageReference  `json:"bindingWorkOrderMessage"`
+	ContextDigest           string            `json:"contextDigest"`
+	AgentStatus             string            `json:"agentStatus"`
+	Status                  string            `json:"status"`
+	Reason                  string            `json:"reason"`
+	Delivery                *RequiredDelivery `json:"delivery,omitempty"`
 }
 
 type DeliveryActionRequest struct {
@@ -138,6 +219,53 @@ type DeliveryResumeRequest struct {
 	ResolutionID  string `json:"resolutionId"`
 }
 
+type DeliveryRuntimeObservation struct {
+	State      string    `json:"state"`
+	Source     string    `json:"source"`
+	ActivityID string    `json:"activityId,omitempty"`
+	ObservedAt time.Time `json:"observedAt"`
+}
+
+type DeliveryFollowThroughCheckRequest struct {
+	RequestID          string                     `json:"requestId"`
+	AgentID            string                     `json:"agentId"`
+	RunID              string                     `json:"runId"`
+	ExpectedGeneration int64                      `json:"expectedGeneration"`
+	ExpectedEpoch      int64                      `json:"expectedEpoch"`
+	Observation        DeliveryRuntimeObservation `json:"observation"`
+}
+
+type DeliveryFollowThroughDecision struct {
+	Delivery             RequiredDelivery `json:"delivery"`
+	Classification       string           `json:"classification"`
+	Reason               string           `json:"reason"`
+	Action               string           `json:"action"`
+	Attempt              int              `json:"attempt,omitempty"`
+	Execute              bool             `json:"execute"`
+	EscalationMessageSeq int64            `json:"escalationMessageSeq,omitempty"`
+	Event                *DeliveryEvent   `json:"event,omitempty"`
+	Receipt              *DeliveryReceipt `json:"receipt,omitempty"`
+	Replay               bool             `json:"replay"`
+}
+
+type DeliveryFollowThroughReportRequest struct {
+	RequestID          string `json:"requestId"`
+	AgentID            string `json:"agentId"`
+	RunID              string `json:"runId"`
+	ExpectedGeneration int64  `json:"expectedGeneration"`
+	ExpectedEpoch      int64  `json:"expectedEpoch"`
+	LeaseRequestID     string `json:"leaseRequestId"`
+	Outcome            string `json:"outcome"`
+	Text               string `json:"text,omitempty"`
+}
+
+type DeliveryFollowThroughReport struct {
+	Delivery RequiredDelivery `json:"delivery"`
+	Event    DeliveryEvent    `json:"event"`
+	Receipt  DeliveryReceipt  `json:"receipt"`
+	Replay   bool             `json:"replay"`
+}
+
 func (c *Client) CreateRequiredDelivery(ctx context.Context, task string, req CreateRequiredDeliveryRequest) (DeliveryMutation, error) {
 	var out DeliveryMutation
 	err := c.do(ctx, "POST", "/v1/tasks/"+url.PathEscape(task)+"/required-deliveries", req, &out)
@@ -152,6 +280,14 @@ func (c *Client) CurrentAssignment(ctx context.Context, task, agent, runID strin
 	return out, err
 }
 
+func (c *Client) DeliveryCoverage(ctx context.Context, task, agent, runID string) (DeliveryCoverage, error) {
+	var out DeliveryCoverage
+	q := url.Values{}
+	q.Set("runId", runID)
+	err := c.do(ctx, "GET", "/v1/tasks/"+url.PathEscape(task)+"/agents/"+url.PathEscape(agent)+"/delivery-coverage?"+q.Encode(), nil, &out)
+	return out, err
+}
+
 func (c *Client) DeliveryAction(ctx context.Context, task, delivery, operation string, req any) (DeliveryMutation, error) {
 	var out DeliveryMutation
 	path := "/v1/tasks/" + url.PathEscape(task) + "/deliveries/" + url.PathEscape(delivery) + "/" + url.PathEscape(operation)
@@ -162,6 +298,20 @@ func (c *Client) DeliveryAction(ctx context.Context, task, delivery, operation s
 func (c *Client) ResolveDeliveryBlock(ctx context.Context, task, delivery, block string, req DeliveryResolutionRequest) (DeliveryMutation, error) {
 	var out DeliveryMutation
 	path := "/v1/tasks/" + url.PathEscape(task) + "/deliveries/" + url.PathEscape(delivery) + "/blocks/" + url.PathEscape(block) + "/resolutions"
+	err := c.do(ctx, "POST", path, req, &out)
+	return out, err
+}
+
+func (c *Client) CheckDeliveryFollowThrough(ctx context.Context, task, delivery string, req DeliveryFollowThroughCheckRequest) (DeliveryFollowThroughDecision, error) {
+	var out DeliveryFollowThroughDecision
+	path := "/v1/tasks/" + url.PathEscape(task) + "/deliveries/" + url.PathEscape(delivery) + "/follow-through/check"
+	err := c.do(ctx, "POST", path, req, &out)
+	return out, err
+}
+
+func (c *Client) ReportDeliveryFollowThrough(ctx context.Context, task, delivery string, req DeliveryFollowThroughReportRequest) (DeliveryFollowThroughReport, error) {
+	var out DeliveryFollowThroughReport
+	path := "/v1/tasks/" + url.PathEscape(task) + "/deliveries/" + url.PathEscape(delivery) + "/follow-through/report"
 	err := c.do(ctx, "POST", path, req, &out)
 	return out, err
 }

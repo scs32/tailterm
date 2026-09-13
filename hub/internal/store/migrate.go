@@ -311,6 +311,51 @@ CREATE INDEX IF NOT EXISTS agent_allocation_intents_item ON agent_allocation_int
 	if err := migrateOperationalRecords(db); err != nil {
 		return err
 	}
+	if err := migrateDeliveryFollowThrough(db); err != nil {
+		return err
+	}
 	_, err := db.Exec(`INSERT OR IGNORE INTO profile_meta(key,value) VALUES('instance',?)`, api.NewID("profilehub"))
 	return err
+}
+
+// migrateDeliveryFollowThrough upgrades existing directive ledgers. New
+// databases receive these columns from migrateDelivery; this additive path is
+// deliberately explicit so v1 rows remain readable and unverified rather than
+// being backfilled with invented governing-order evidence.
+func migrateDeliveryFollowThrough(db *sql.DB) error {
+	for _, column := range []struct{ name, definition string }{
+		{"governing_order_task_id", "TEXT NOT NULL DEFAULT ''"},
+		{"governing_order_message_seq", "INTEGER NOT NULL DEFAULT 0"},
+		{"instruction_sha256", "TEXT NOT NULL DEFAULT ''"},
+		{"instruction_bytes", "INTEGER NOT NULL DEFAULT 0"},
+		{"enrollment_version", "INTEGER NOT NULL DEFAULT 1"},
+		{"ack_deadline_seconds", "INTEGER NOT NULL DEFAULT 120"},
+		{"progress_deadline_seconds", "INTEGER NOT NULL DEFAULT 600"},
+		{"resume_deadline_seconds", "INTEGER NOT NULL DEFAULT 120"},
+		{"confirmation_deadline_seconds", "INTEGER NOT NULL DEFAULT 120"},
+		{"dispatch_report_seconds", "INTEGER NOT NULL DEFAULT 30"},
+		{"active_tool_hard_limit_seconds", "INTEGER NOT NULL DEFAULT 1800"},
+		{"max_queue_attempts", "INTEGER NOT NULL DEFAULT 2"},
+		{"last_substantive_progress_at", "TEXT NOT NULL DEFAULT ''"},
+		{"next_substantive_deadline_at", "TEXT NOT NULL DEFAULT ''"},
+		{"hard_deadline_at", "TEXT NOT NULL DEFAULT ''"},
+		{"followthrough_attempt_count", "INTEGER NOT NULL DEFAULT 0"},
+		{"followthrough_pending_action", "TEXT NOT NULL DEFAULT ''"},
+		{"followthrough_pending_request_id", "TEXT NOT NULL DEFAULT ''"},
+		{"followthrough_pending_since", "TEXT NOT NULL DEFAULT ''"},
+		{"followthrough_transport_outcome", "TEXT NOT NULL DEFAULT ''"},
+		{"followthrough_confirmation_until", "TEXT NOT NULL DEFAULT ''"},
+		{"followthrough_escalation_message_seq", "INTEGER NOT NULL DEFAULT 0"},
+	} {
+		var count int
+		if err := db.QueryRow(`SELECT count(*) FROM pragma_table_info('required_deliveries') WHERE name=?`, column.name).Scan(&count); err != nil {
+			return err
+		}
+		if count == 0 {
+			if _, err := db.Exec("ALTER TABLE required_deliveries ADD COLUMN " + column.name + " " + column.definition); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }

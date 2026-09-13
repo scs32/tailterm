@@ -2,7 +2,10 @@ package server
 
 import (
 	"context"
+	"crypto/sha256"
+	"fmt"
 	"testing"
+	"time"
 
 	"github.com/scs32/tailterm/hub/internal/api"
 )
@@ -34,7 +37,9 @@ func TestReliableDeliveryHTTPRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	create := api.CreateRequiredDeliveryRequest{RequestID: "http-delivery-create", MessageSeq: directive.Seq, Kind: api.DeliveryAssignment, AgentID: worker.ID, RunID: worker.RunID, ItemTaskID: task.ID, ItemID: item.ID, ItemRevision: item.Revision, WorkOrderMessage: orderRef, ProducerAgentID: lead.ID, ProducerRunID: lead.RunID}
+	instructionBytes := int64(len([]byte(directive.Text)))
+	instructionSHA := fmt.Sprintf("%x", sha256.Sum256([]byte(directive.Text)))
+	create := api.CreateRequiredDeliveryRequest{RequestID: "http-delivery-create", MessageSeq: directive.Seq, Kind: api.DeliveryAssignment, AgentID: worker.ID, RunID: worker.RunID, ItemTaskID: task.ID, ItemID: item.ID, ItemRevision: item.Revision, WorkOrderMessage: orderRef, GoverningOrderMessage: orderRef, InstructionSHA256: instructionSHA, InstructionBytes: instructionBytes, EnrollmentVersion: api.ReliableFollowThroughCapabilityVersion, ProducerAgentID: lead.ID, ProducerRunID: lead.RunID}
 	var created api.DeliveryMutation
 	if code := c.do("POST", "/v1/tasks/"+task.ID+"/required-deliveries", create, &created); code != 201 || created.Delivery.ContextDigest == "" {
 		t.Fatalf("create delivery: %d %+v", code, created)
@@ -43,10 +48,19 @@ func TestReliableDeliveryHTTPRoundTrip(t *testing.T) {
 	if code := c.do("GET", "/v1/tasks/"+task.ID+"/agents/"+worker.ID+"/current-assignment?runId="+worker.RunID, nil, &current); code != 200 || current.ID != created.Delivery.ID {
 		t.Fatalf("current assignment: %d %+v", code, current)
 	}
+	var coverage api.DeliveryCoverage
+	if code := c.do("GET", "/v1/tasks/"+task.ID+"/agents/"+worker.ID+"/delivery-coverage?runId="+worker.RunID, nil, &coverage); code != 200 || coverage.Status != "covered" || coverage.Delivery == nil {
+		t.Fatalf("delivery coverage: %d %+v", code, coverage)
+	}
 	ack := api.DeliveryActionRequest{RequestID: "http-delivery-ack", AgentID: worker.ID, RunID: worker.RunID, ExpectedEpoch: 1}
 	var acknowledged api.DeliveryMutation
 	if code := c.do("POST", "/v1/tasks/"+task.ID+"/deliveries/"+created.Delivery.ID+"/ack", ack, &acknowledged); code != 200 || acknowledged.Delivery.Phase != api.DeliveryAcknowledged {
 		t.Fatalf("ack delivery: %d %+v", code, acknowledged)
+	}
+	check := api.DeliveryFollowThroughCheckRequest{RequestID: "http-followthrough-check", AgentID: worker.ID, RunID: worker.RunID, ExpectedGeneration: 1, ExpectedEpoch: 1, Observation: api.DeliveryRuntimeObservation{State: api.DeliveryObservationUnknown, Source: "http-test", ObservedAt: time.Now().UTC()}}
+	var decision api.DeliveryFollowThroughDecision
+	if code := c.do("POST", "/v1/tasks/"+task.ID+"/deliveries/"+created.Delivery.ID+"/follow-through/check", check, &decision); code != 200 || decision.Classification != api.DeliveryFollowThroughAwaitingProgress || decision.Execute {
+		t.Fatalf("follow-through check: %d %+v", code, decision)
 	}
 	var replay api.DeliveryMutation
 	if code := c.do("POST", "/v1/tasks/"+task.ID+"/deliveries/"+created.Delivery.ID+"/ack", ack, &replay); code != 200 || !replay.Replay || replay.Receipt.ID != acknowledged.Receipt.ID {
@@ -81,7 +95,7 @@ func TestReliableDeliveryHTTPRoundTrip(t *testing.T) {
 		t.Fatalf("stale result mutated resumed execution: %d %+v", code, afterStale)
 	}
 	var caps api.Capabilities
-	if code := c.do("GET", "/v1/capabilities", nil, &caps); code != 200 || !caps.ReliableDelivery.Supported || len(caps.ReliableDelivery.Versions) != 1 || caps.ReliableDelivery.Versions[0] != api.ReliableDeliveryCapabilityVersion {
+	if code := c.do("GET", "/v1/capabilities", nil, &caps); code != 200 || !caps.ReliableDelivery.Supported || len(caps.ReliableDelivery.Versions) != 2 || caps.ReliableDelivery.Versions[0] != api.ReliableDeliveryCapabilityVersion || caps.ReliableDelivery.Versions[1] != api.ReliableFollowThroughCapabilityVersion {
 		t.Fatalf("delivery capability: %d %+v", code, caps.ReliableDelivery)
 	}
 }

@@ -48,7 +48,7 @@ Commands
   context [--json]             print this exact run's bound work-item context
   operational-record propose|commit|get  validated operational records
   current-assignment [--json]  fetch the server-selected exact directive
-  delivery <command>           create/ack/progress/block/resolve/resume/result
+  delivery <command>           create/coverage/ack/progress/block/resolve/resume/result
   spawn --name N --run CMD [--cwd D] [--prompt P] [--runtime R] [--task ID]
                                start a sibling agent session on this host
   allocation-intent create --agent-id ID --work-item ID --work-item-revision N

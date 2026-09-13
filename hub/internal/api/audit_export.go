@@ -81,7 +81,7 @@ func CurrentCapabilities() Capabilities {
 	out.OperationalRecords.Supported = true
 	out.OperationalRecords.Versions = []int{OperationalRecordsCapabilityVersion}
 	out.ReliableDelivery.Supported = true
-	out.ReliableDelivery.Versions = []int{ReliableDeliveryCapabilityVersion}
+	out.ReliableDelivery.Versions = []int{ReliableDeliveryCapabilityVersion, ReliableFollowThroughCapabilityVersion}
 	return out
 }
 

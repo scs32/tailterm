@@ -117,3 +117,41 @@ CREATE INDEX agent_work_item_bindings_item ON agent_work_item_bindings(item_task
 		t.Fatalf("team-role-classified admission failed on a migrated legacy database: %+v %v", member, err)
 	}
 }
+
+func TestMigrateAddsFollowThroughColumnsWithoutInventingEnrollment(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "delivery-v1.sqlite")
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if _, err = db.Exec(schema); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = db.Exec(`CREATE TABLE required_deliveries (
+  id TEXT PRIMARY KEY, task_id TEXT NOT NULL, message_seq INTEGER NOT NULL,
+  kind TEXT NOT NULL, agent_id TEXT NOT NULL, run_id TEXT NOT NULL,
+  item_task_id TEXT NOT NULL, item_id TEXT NOT NULL, item_revision INTEGER NOT NULL,
+  work_order_task_id TEXT NOT NULL, work_order_message_seq INTEGER NOT NULL,
+  context_digest TEXT NOT NULL, generation INTEGER NOT NULL,
+  supersedes_delivery_id TEXT, current INTEGER NOT NULL DEFAULT 1,
+  phase TEXT NOT NULL, execution_epoch INTEGER NOT NULL DEFAULT 1,
+  current_block_id TEXT, result_text TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+);
+INSERT INTO required_deliveries(id,task_id,message_seq,kind,agent_id,run_id,item_task_id,item_id,item_revision,work_order_task_id,work_order_message_seq,context_digest,generation,current,phase,execution_epoch,created_at,updated_at)
+VALUES('dly_0000000000000001','tsk_0000000000000001',1,'assignment','agt_0000000000000001','run_0000000000000001','tsk_0000000000000001','wi_0000000000000001',1,'tsk_0000000000000001',1,'digest',1,1,'unacknowledged',1,'2026-09-13T00:00:00Z','2026-09-13T00:00:00Z');`); err != nil {
+		t.Fatal(err)
+	}
+	if err = migrate(db); err != nil {
+		t.Fatalf("v1 directive ledger migration: %v", err)
+	}
+	var version, bytes, attempts int
+	var governing, digest, deadline string
+	if err = db.QueryRow(`SELECT enrollment_version,instruction_bytes,followthrough_attempt_count,governing_order_task_id,instruction_sha256,next_substantive_deadline_at FROM required_deliveries WHERE id='dly_0000000000000001'`).Scan(&version, &bytes, &attempts, &governing, &digest, &deadline); err != nil {
+		t.Fatal(err)
+	}
+	if version != 1 || bytes != 0 || attempts != 0 || governing != "" || digest != "" || deadline != "" {
+		t.Fatalf("legacy row was backfilled with invented enrollment: version=%d bytes=%d attempts=%d governing=%q digest=%q deadline=%q", version, bytes, attempts, governing, digest, deadline)
+	}
+}

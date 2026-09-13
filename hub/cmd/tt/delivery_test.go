@@ -2,9 +2,12 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -52,7 +55,8 @@ func TestDeliveryCLIHTTPStoreRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	created, err := st.CreateRequiredDelivery(ctx, task.ID, api.CreateRequiredDeliveryRequest{RequestID: "cli-delivery-create", MessageSeq: directive.Seq, Kind: api.DeliveryAssignment, AgentID: worker.ID, RunID: worker.RunID, ItemTaskID: item.TaskID, ItemID: item.ID, ItemRevision: item.Revision, WorkOrderMessage: orderRef, ProducerAgentID: lead.ID, ProducerRunID: lead.RunID}, by)
+	instructionSHA := fmt.Sprintf("%x", sha256.Sum256([]byte(directive.Text)))
+	created, err := st.CreateRequiredDelivery(ctx, task.ID, api.CreateRequiredDeliveryRequest{RequestID: "cli-delivery-create", MessageSeq: directive.Seq, Kind: api.DeliveryAssignment, AgentID: worker.ID, RunID: worker.RunID, ItemTaskID: item.TaskID, ItemID: item.ID, ItemRevision: item.Revision, WorkOrderMessage: orderRef, GoverningOrderMessage: orderRef, InstructionSHA256: instructionSHA, InstructionBytes: int64(len([]byte(directive.Text))), EnrollmentVersion: api.ReliableFollowThroughCapabilityVersion, ProducerAgentID: lead.ID, ProducerRunID: lead.RunID}, by)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -62,6 +66,10 @@ func TestDeliveryCLIHTTPStoreRoundTrip(t *testing.T) {
 	out, err := captureCLIOutput(t, func() error { return cmdCurrentAssignment(e, nil) })
 	if err != nil || !strings.Contains(out, created.Delivery.ID) || !strings.Contains(out, "phase unacknowledged") || !strings.Contains(out, "execution epoch 1") || !strings.Contains(out, directive.Text) {
 		t.Fatalf("current assignment output=%q err=%v", out, err)
+	}
+	out, err = captureCLIOutput(t, func() error { return cmdDelivery(e, []string{"coverage"}) })
+	if err != nil || !strings.Contains(out, "covered:") {
+		t.Fatalf("delivery coverage output=%q err=%v", out, err)
 	}
 	out, err = captureCLIOutput(t, func() error {
 		return cmdDelivery(e, []string{"ack", "--request-id", "cli-direct-ack", "--expected-epoch", "1", created.Delivery.ID})
@@ -143,5 +151,35 @@ func TestDeliveryCLIFailsClosedOnOldHub(t *testing.T) {
 	err = cmdCurrentAssignment(e, nil)
 	if err == nil || !strings.Contains(err.Error(), "unsupported") || actions != 0 {
 		t.Fatalf("old hub current-assignment was not fail-closed: err=%v actions=%d", err, actions)
+	}
+}
+
+func TestDeliveryCLIV2EnrollmentFailsClosedOnV1Hub(t *testing.T) {
+	actions := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.URL.Path == "/v1/capabilities" {
+			caps := api.CurrentCapabilities()
+			caps.ReliableDelivery.Versions = []int{api.ReliableDeliveryCapabilityVersion}
+			_ = json.NewEncoder(w).Encode(caps)
+			return
+		}
+		actions++
+		http.Error(w, "unsafe v2 enrollment reached v1 hub", 500)
+	}))
+	defer srv.Close()
+	req := api.CreateRequiredDeliveryRequest{RequestID: "v2-old-hub", EnrollmentVersion: api.ReliableFollowThroughCapabilityVersion}
+	raw, err := json.Marshal(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(t.TempDir(), "enrollment.json")
+	if err = os.WriteFile(path, raw, 0600); err != nil {
+		t.Fatal(err)
+	}
+	e := env{hub: srv.URL, task: "tsk_0000000000000001", agent: "agt_0000000000000001", runID: "run_0000000000000001"}
+	err = cmdDelivery(e, []string{"create", "--file", path})
+	if err == nil || !strings.Contains(err.Error(), "version 2") || actions != 0 {
+		t.Fatalf("v2 enrollment was not fail-closed on v1 hub: err=%v actions=%d", err, actions)
 	}
 }
