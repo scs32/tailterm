@@ -1,0 +1,87 @@
+{
+  "kind": "actual-native-stage-a-release",
+  "recordedAt": "2026-09-13T16:59:38.893378+00:00",
+  "itemId": "wi_dd57670ee65d974c",
+  "itemRevisionAtOrder": 4,
+  "implementationOrder": 3622,
+  "transportSupplement": 3665,
+  "releaseOrder": 3723,
+  "releaseOrderCorrection": 3729,
+  "review": 3714,
+  "handlerReviewSave": 3718,
+  "handlerPreDatabaseEvidence": 3743,
+  "handlerCanonicalPostComparison": 3759,
+  "sourceCommit": "ad89388c2ec7cbbddd43d0ded710db8139b1658c",
+  "hubSha256": "dc63470ad85b335ccd0669194456ea561a4ef6326981366a5e3be40de1c8e228",
+  "miniCliSha256": "2b81d78b391f287556d8d7f8a241f27a585d3bc7cb132513c1ab982efdd6ecde",
+  "hubRelease": "20260913-context-bound-ad89388",
+  "activationPerformed": true,
+  "operatorVerification": "pass",
+  "handlerDatabaseComparison": "backup/live identical under same canonical method; integrity and FK pass per3759",
+  "installedQualification": "measured269315/exact524288 locally accepted to isolated endpoint;524289 rejected before HTTP; private shell exact2359296 consumed and removed/+1 rejected",
+  "independentSourceQualification": "four targeted Go packages PASS including actual Mini external synthetic runtime argv at512KiB",
+  "configChange": "hub binary mount only; full structural equality otherwise",
+  "miniPreviewPid": 60799,
+  "airCliChanged": false,
+  "frontendChanged": false,
+  "relayChanged": false,
+  "tailscaleOrNetworkChanged": false,
+  "rootSourceIntegrated": false,
+  "itemCompletionClaim": false,
+  "physicalBrowserToAir": "unverified; outside Stage A",
+  "rollback": {
+    "oldHubSha256": "4711d3c0acc4d9ce17725e1c4fea74709ee945edb694d0f4f74bea74e0e107a3",
+    "oldMiniCliSha256": "908034fcd72a13d65d70750fa46010e4eb3f68fda89c65e1312dcb1b38dc7b91",
+    "miniBackup": "/Users/stephenspeicher/.local/bin/tt-before-context-bound-ad89388",
+    "databaseRestoreAllowed": false,
+    "afterOversizedAdmission": "retain512 compatibility; old-limit rollback can strand retries"
+  },
+  "corrections": [
+    "Mistyped source review reference3715 corrected3717: actual PASS3714.",
+    "Tar digest mistyped3723 corrected3729.",
+    "Initial non-listening local socket timed out; installed qualifier uses isolated HTTP endpoint.",
+    "Profile mismatch3749 was differing hash methods; same-operation backup/live3759 is identical."
+  ],
+  "files": [
+    {
+      "path": "pre-config.json",
+      "bytes": 670,
+      "sha256": "7e1e0c1a9b304f482c034f6c50c28770f1a245654b3e0307e5cad1b1fa65d2c0"
+    },
+    {
+      "path": "post-config.json",
+      "bytes": 668,
+      "sha256": "34433b4548c2fffe9da0b688870f0234757177fc9775c3b5cd7ec10ca62fd571"
+    },
+    {
+      "path": "preflight.json",
+      "bytes": 354,
+      "sha256": "18ac47b30e71ce9aad725aae681156ba2b1f996cd8299c39915a2f040d83c693"
+    },
+    {
+      "path": "hub-deploy.log",
+      "bytes": 1408,
+      "sha256": "fffe3523fc7554820abbba2df5105f6fc41c5b547a0beb5e89543660d5db2bec"
+    },
+    {
+      "path": "hub-post-verify.json",
+      "bytes": 1847,
+      "sha256": "39eff1999b644e4a7b6f81d085fca65fe4c1c6abe2163c97ee861058c6494367"
+    },
+    {
+      "path": "mini-install.json",
+      "bytes": 503,
+      "sha256": "a53b9e3a7b3b5d56f529588677fcd02977aa140e24737484cd57604febcb86b4"
+    },
+    {
+      "path": "installed-native-tests.json",
+      "bytes": 1164,
+      "sha256": "9dccb98c7641643338189a797ba493009f59fac165533c895cd1a0a7309f6576"
+    }
+  ],
+  "remaining": [
+    "lead actual-release acceptance and handler saved confirmation",
+    "current complete core context/admission/Start through handler and lead",
+    "separate physical browser/Air qualification and frontend rollout"
+  ]
+}

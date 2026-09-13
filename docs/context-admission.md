@@ -1,3 +1,31 @@
+## September 13 native context capacity — deployed and accepted
+
+Bug `wi_dd57670ee65d974c`, release order #3723, lead acceptance #3765 and
+handler confirmation #3779/#3780: the TrueNAS hub and Mini CLI now run exact
+`ad89388c2ec7cbbddd43d0ded710db8139b1658c` with a **512 KiB** context limit.
+The hub is RUNNING with only its binary mount changed; Mini CLI installation,
+exact/+1 boundaries, retry/readback and runtime argv checks pass. Handler #3759
+compared backup and live profiles with one canonical method: identical data,
+integrity OK and zero foreign-key violations. Earlier differing-method hashes
+were a reporting mismatch, not evidence of changed profile data.
+
+**The deployed frontend and Air CLI remain at 256 KiB.** Physical browser-WASM
+to Air qualification and frontend rollout remain outstanding; keep this Bug open.
+Root source was fast-forwarded to the accepted candidate under #3812/#3816;
+that source synchronization performed no build or deployment. New native work
+must preserve the 512 KiB source. The preview still uses PID60799/PPID1.
+After oversized admissions, retain 512 KiB compatibility; do not restore an old
+SQLite database or assume an old-limit binary is a safe rollback.
+
+[Actual operator receipt](releases/native-context-ad89388/release-receipt.json),
+[accepted phase](releases/native-context-ad89388/acceptance.json), and all seven
+size/hash-linked evidence files are retained together. The original receipt is
+unchanged; the later acceptance record resolves its then-pending acceptance and
+source-integration fields. Historical candidate/release sections below retain
+prior states and do not override this current deployment inventory.
+
+---
+
 # 512 KiB complete-context and bounded-transport candidate — September 13, 2026
 
 Bug `wi_dd57670ee65d974c` revision 3, executable order **#3622**, and exact

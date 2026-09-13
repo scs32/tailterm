@@ -166,25 +166,23 @@ creation attempt, including after reload, until manually verified; matching
 project fields are not proof of ownership. These behaviors prevent duplicate
 projects and agents and need to remain covered by browser checks.
 
-Complete item contexts currently support 256 KiB of serialized UTF-8 JSON in
-the deployed context-size fix (Bug `wi_7e220de54deaef33`, order #3022; release
-#3195/#3196). Preparation, saved journal, browser transport, CLI and hub enforce
-the same bundle bound; nothing is truncated. Private context/command files avoid
-shell-quoting amplification, and exact admitted source bytes/digests survive
-readback and uncertain retries. Combined application `d64615b` is active on the
-hub, Mini/Air CLIs, TailOS and Mini preview; handler saved acceptance is pending.
+The deployed TrueNAS hub and Mini CLI support complete item contexts up to
+512 KiB of serialized UTF-8 JSON at source `ad89388`. Bug
+`wi_dd57670ee65d974c`, release #3723, lead acceptance #3765 and handler
+confirmation #3779/#3780 record this native phase. Exact source bytes/digests,
+immutable run bindings, private-file cleanup and uncertain retries are preserved;
+nothing is truncated. The current deployed frontend and Air CLI still enforce
+256 KiB. Their smaller requests remain compatible with the updated hub.
 
-A 512 KiB correction candidate is implemented under Bug
-`wi_dd57670ee65d974c` revision 3/order #3622 and same-item transport supplement
-#3662/#3665, but it is **not released**. Commands above 64 KiB use the existing
-authenticated browser SFTP seam for atomic private staging, then a small command
-verifies mode, length and digest before CLI admission. Mini and Air's actual
-SFTP/shell/CLI pass exact 512 KiB qualification, +1 rejection and cleanup;
-Chromium and WebKit pass the isolated retry flow. A physical
-browser-WASM-to-Air run remains a release gate. Production remains at 256 KiB
-pending independent review, handler-saved acceptance and the coordinated hub →
-Mini/Air CLI → frontend rollout. Old frontends retain their 128 KiB limit and
-cannot restore newly oversized journals. See
+Root source includes the reviewed browser transport correction: commands above
+64 KiB use existing authenticated SFTP for atomic private staging, followed by
+a small command that verifies mode, length and digest before CLI admission.
+Actual Air SFTP/shell/candidate-CLI checks and isolated Chromium/WebKit retry
+checks pass. Physical browser-WASM-to-Air qualification and the frontend/Air
+rollout remain outstanding. Source integration #3812/#3834 is not a frontend
+deployment, and the overall Bug remains open. After oversized native admissions,
+retain compatible 512 KiB components rather than rolling back to old limits or
+restoring an older database. See
 [context admission](context-admission.md) for exact limits, compatibility and
 qualification evidence.
 
