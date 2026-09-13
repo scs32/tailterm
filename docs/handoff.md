@@ -1,5 +1,44 @@
 # Development handoff — September 10, 2026
 
+## September 13 mandatory-action follow-through — combined candidate, not installed
+
+Bug `wi_0c7ab8fc3320b52b` revision2, implementation order #4402 and
+integration-preparation order #4808 have an isolated combined candidate based on
+exact current source `19970cea6e089a98c2e18057c62c98f0473c925b`. Accepted API
+commits `66f88e4` and `4f5aaca` are integrated as `0998290` and `560159a`;
+accepted documentation commits `8f49f6a`, `14dfae2` and `bd330f9` are integrated
+as `71ed011`, `040a482` and `e1530a5`. Exact combined application/source
+checkpoint `e1530a5c61b255a2c175222f4e174cf774d588c3` preserves the previously
+integrated native evidence reader and verified-host preflight. All cherry-picks
+were clean; no source conflict resolution was needed.
+
+The candidate extends reliable delivery capability v3 to shared project-lead and
+database-handler mandatory actions. Each sibling action has an immutable
+`recipientKind` and `actionKey`; singular coverage/assignment lookups require the
+exact item/action selector, while plural coverage returns every current sibling.
+Saved order, inbox read, heartbeat, queue acceptance and turn completion remain
+non-execution evidence. Unexpected idle requires a persisted causal incident
+before resume; a missing cause blocks with `cause_required`. Planned dependency
+waits remain distinct, and the relay enumerates siblings, skips planned-blocked
+actions and revalidates the exact item/action immediately before attempting a
+wake. See [the operator contract](mandatory-action-operator-contract.md) and
+[design review](mandatory-action-design-review.md).
+
+Focused store/server/API tests, focused CLI reader/delivery/relay tests, their
+race-enabled selection, `go test -run '^$' ./...`, `go vet ./...`, formatting
+inspection and all 188 npm tests pass. The unfiltered `go test ./... -count=1`
+is not a pass: existing broad `cmd/tt` tests reported model/reasoning expectation
+failures and then blocked in `httptest.Server.Close` on an active loopback TCP
+connection; it was interrupted after 192.746 seconds. This known broad-baseline
+failure is retained rather than masked and is not used as candidate acceptance.
+
+This candidate is **not installed or deployed**. It performed no live database,
+Queue, profile, TrueNAS, network, relay-reload or enrollment operation. The hub
+and Mini CLI still run the `b1b14d70` release with `reliableDelivery` v1+v2;
+mandatory-action v3 is source-only. The Bug remains open pending independent QA,
+root integration/package/release work, operational activation evidence and
+handler-saved acceptance.
+
 ## September 13 verified-host preflight — integrated source, not installed
 
 Bug `wi_9cc74828bb3499a4` revision1, implementation order #4410 and source

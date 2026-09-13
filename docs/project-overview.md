@@ -133,6 +133,29 @@ or mutation. This source integration did not contact TrueNAS, access live data,
 build/install binaries or deploy; operational qualification remains open. See
 [the verified-host contract](verified-host-preflight-contract.md).
 
+An isolated proposed source candidate for Bug `wi_0c7ab8fc3320b52b` revision2,
+implementation order #4402 and integration-preparation order #4808 combines the
+accepted mandatory-action API series and operator documentation on exact base
+`19970cea6e089a98c2e18057c62c98f0473c925b`. Its exact application/source
+checkpoint is `e1530a5c61b255a2c175222f4e174cf774d588c3`; it preserves the native
+evidence reader and verified-host preflight already present in that base. The
+v3 contract enrolls shared lead/handler responsibilities as keyed sibling
+actions, requires exact item/action selectors for singular lookup, keeps
+planned dependency waits distinct, and blocks an unexpected-idle resume until
+its causal incident is recorded. Queue/read/heartbeat/turn-end evidence cannot
+satisfy substantive action. See [the mandatory-action operator
+contract](mandatory-action-operator-contract.md) and [design
+review](mandatory-action-design-review.md).
+
+This is source-only and **not installed**. Focused store/server/API and CLI
+reader/delivery/relay suites, selected race checks, compile/vet/formatting checks
+and all 188 npm tests pass. The unfiltered Go suite retains a known broad
+`cmd/tt` baseline nonpass and loopback `httptest.Server.Close` hang; it is not
+represented as acceptance. No live data, Queue/profile state, TrueNAS/network,
+deployment, relay reload or real v3 enrollment was touched. Independent QA,
+root integration/package/release work, activation evidence and handler-saved
+acceptance remain required; the Bug stays open.
+
 The TrueNAS hub and Mini CLI still run exact source
 `b1b14d70cb6f96d033e4da9e1aeb650174066cbf` under Feature
 `wi_618c8ff87e6b8061` revision5, implementation order #4053 and release order
