@@ -500,7 +500,11 @@ def execute(plan: Any) -> dict[str, Any]:
             targetExecutable=str(expected_executable),
             mutationStarted=False,
         ) from error
-    if resolved_executable != required_executable or not required_executable.is_file():
+    if (
+        required_executable != expected_executable
+        or resolved_executable != required_executable
+        or not required_executable.is_file()
+    ):
         raise PreflightFailure(
             "executable-mismatch",
             "running executable does not match targetExecutable",
@@ -996,6 +1000,7 @@ def validate_receipt(plan: Any, receipt: Any) -> dict[str, Any]:
         or receipt.get("actualHost") != normalized["targetHost"]
         or not isinstance(resolved_executable, str)
         or not pathlib.PurePosixPath(resolved_executable).is_absolute()
+        or resolved_executable != normalized["targetExecutable"]
         or source_evidence.get("integrity") != "ok"
         or source_evidence.get("foreignKeyViolations") != 0
         or backup_evidence.get("integrity") != "ok"

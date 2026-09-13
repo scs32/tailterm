@@ -168,6 +168,51 @@ print("valid")
   });
 }
 
+function deploymentFailure(plan, directory, actualHost, mode = "execute") {
+  const planPath = join(directory, "deployment-plan.json");
+  writeFileSync(planPath, JSON.stringify(plan));
+  const bin = fakeSsh(directory);
+  const source = `
+import importlib.util, json, pathlib, sys
+scripts = pathlib.Path(sys.argv[1]).parent
+sys.path.insert(0, str(scripts))
+spec = importlib.util.spec_from_file_location("deploy", sys.argv[1])
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+plan = json.loads(pathlib.Path(sys.argv[2]).read_text())
+preflight = {"backupDestination": plan["backupDestination"], "sha256": "a" * 64}
+try:
+    module._remote(
+        plan,
+        sys.argv[3],
+        "exit 7",
+        stage="token",
+        last_completed_stage="remote-identity",
+        preflight=preflight,
+    )
+except module.PreflightFailure as error:
+    print(json.dumps(error.result(plan), sort_keys=True))
+    raise SystemExit(2)
+`;
+  const observed = spawnSync(
+    "python3",
+    ["-c", source, deploy, planPath, actualHost],
+    {
+      encoding: "utf8",
+      env: {
+        ...globalThis.process.env,
+        PATH: `${bin}:${globalThis.process.env.PATH}`,
+        FAKE_SSH_MODE: mode,
+        PYTHONDONTWRITEBYTECODE: "1",
+      },
+    },
+  );
+  return {
+    process: observed,
+    result: JSON.parse(observed.stdout.trim()),
+  };
+}
+
 test("wrong execution host fails before filesystem or database mutation", () => {
   const directory = workspace("wrong-host");
   const source = join(directory, "source.sqlite");
@@ -382,4 +427,49 @@ test("deployment requires established route and handler receipt before any remot
   assert.equal(observed.status, 2);
   assert.equal(result.classification, "invalid-input");
   assert.match(result.message, /established truenas SSH route/);
+});
+
+test("deployment separates guard, transport-unknown, and started-command mutation states", () => {
+  for (const fixture of [
+    {
+      name: "guard",
+      actualHost: "different-host.invalid",
+      mode: "execute",
+      classification: "host-mismatch",
+      state: "not-started",
+      started: false,
+    },
+    {
+      name: "transport",
+      actualHost: hostname(),
+      mode: "fail",
+      classification: "route-unavailable",
+      state: "unknown",
+      started: undefined,
+    },
+    {
+      name: "command",
+      actualHost: hostname(),
+      mode: "execute",
+      classification: "remote-operation-failed",
+      state: "started",
+      started: true,
+    },
+  ]) {
+    const directory = workspace(`deployment-${fixture.name}`);
+    const plan = planFor(directory);
+    const observed = deploymentFailure(
+      plan,
+      directory,
+      fixture.actualHost,
+      fixture.mode,
+    );
+    assert.equal(observed.process.status, 2, observed.process.stderr);
+    assert.equal(observed.result.classification, fixture.classification);
+    assert.equal(observed.result.mutationStarted, true);
+    assert.equal(observed.result.backupMutationCompleted, true);
+    assert.equal(observed.result.deploymentMutationState, fixture.state);
+    assert.equal(observed.result.deploymentMutationStarted, fixture.started);
+    assert.equal(observed.result.lastCompletedStage, "remote-identity");
+  }
 });

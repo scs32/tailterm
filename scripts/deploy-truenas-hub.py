@@ -110,7 +110,7 @@ def _remote_failure(
     plan: dict[str, Any],
     actual_host: str,
     stage: str,
-    mutation_started: bool,
+    last_completed_stage: str,
     preflight: dict[str, Any],
 ) -> PreflightFailure:
     detail_lines = completed.stderr.decode("utf-8", "replace").strip().splitlines()
@@ -121,21 +121,27 @@ def _remote_failure(
         "targetHost": plan["targetHost"],
         "verifiedHost": actual_host,
         "route": plan["route"],
-        "mutationStarted": mutation_started,
+        "mutationStarted": True,
         "backupAlreadyVerified": True,
+        "backupMutationCompleted": True,
         "backupDestination": preflight["backupDestination"],
         "backupSha256": preflight["sha256"],
+        "lastCompletedStage": last_completed_stage,
     }
     if completed.returncode == 78:
         return PreflightFailure(
             "host-mismatch",
             "execution host changed after the verified backup receipt",
+            deploymentMutationStarted=False,
+            deploymentMutationState="not-started",
             **common,
         )
     if completed.returncode == 79:
         return PreflightFailure(
             "executable-mismatch",
             "target executable changed after the verified backup receipt",
+            deploymentMutationStarted=False,
+            deploymentMutationState="not-started",
             **common,
         )
     if completed.returncode == 255:
@@ -144,6 +150,7 @@ def _remote_failure(
             "declared SSH route failed during deployment",
             routeExitCode=completed.returncode,
             routeDetail=detail,
+            deploymentMutationState="unknown",
             **common,
         )
     return PreflightFailure(
@@ -151,6 +158,8 @@ def _remote_failure(
         "verified remote host rejected a deployment operation",
         remoteExitCode=completed.returncode,
         remoteDetail=detail,
+        deploymentMutationStarted=True,
+        deploymentMutationState="started",
         **common,
     )
 
@@ -161,7 +170,7 @@ def _remote(
     command: str,
     *,
     stage: str,
-    mutation_started: bool,
+    last_completed_stage: str,
     preflight: dict[str, Any],
     data: bytes | None = None,
 ) -> bytes:
@@ -188,10 +197,14 @@ def _remote(
             phase="deployment",
             stage=stage,
             route=plan["route"],
-            mutationStarted=mutation_started,
+            mutationStarted=True,
             backupAlreadyVerified=True,
+            backupMutationCompleted=True,
             backupDestination=preflight["backupDestination"],
             backupSha256=preflight["sha256"],
+            lastCompletedStage=last_completed_stage,
+            deploymentMutationStarted=False,
+            deploymentMutationState="not-started",
         ) from error
     if completed.returncode != 0:
         raise _remote_failure(
@@ -199,7 +212,7 @@ def _remote(
             plan,
             actual_host,
             stage,
-            mutation_started,
+            last_completed_stage,
             preflight,
         )
     return completed.stdout
@@ -281,7 +294,7 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 2
 
-    mutation_started = False
+    last_completed_stage = "remote-identity"
     stage = "token"
     try:
         token_path = shlex.quote(deployment["tokenPath"])
@@ -290,11 +303,11 @@ def main(argv: list[str] | None = None) -> int:
             actual_host,
             f"umask 077; test -s {token_path} || cat > {token_path}",
             stage=stage,
-            mutation_started=True,
+            last_completed_stage=last_completed_stage,
             preflight=preflight,
             data=(secrets.token_urlsafe(48) + "\n").encode(),
         )
-        mutation_started = True
+        last_completed_stage = stage
 
         stage = "release-directory"
         binary_destination = deployment["binaryDestination"]
@@ -306,9 +319,10 @@ def main(argv: list[str] | None = None) -> int:
             actual_host,
             f"mkdir -p {release_directory}",
             stage=stage,
-            mutation_started=mutation_started,
+            last_completed_stage=last_completed_stage,
             preflight=preflight,
         )
+        last_completed_stage = stage
 
         stage = "binary-upload"
         quoted_binary = shlex.quote(binary_destination)
@@ -317,10 +331,11 @@ def main(argv: list[str] | None = None) -> int:
             actual_host,
             f"cat > {quoted_binary} && chmod 755 {quoted_binary}",
             stage=stage,
-            mutation_started=mutation_started,
+            last_completed_stage=last_completed_stage,
             preflight=preflight,
             data=binary_bytes,
         )
+        last_completed_stage = stage
 
         compose = {
             "services": {
@@ -362,18 +377,20 @@ def main(argv: list[str] | None = None) -> int:
             actual_host,
             middleware_command + shlex.quote(json.dumps(request)),
             stage=stage,
-            mutation_started=mutation_started,
+            last_completed_stage=last_completed_stage,
             preflight=preflight,
         )
+        last_completed_stage = stage
         stage = "middleware-start"
         _remote(
             plan,
             actual_host,
             "midclt call -j app.start tailterm-hub",
             stage=stage,
-            mutation_started=mutation_started,
+            last_completed_stage=last_completed_stage,
             preflight=preflight,
         )
+        last_completed_stage = stage
     except PreflightFailure as error:
         _emit(error.result(plan))
         return 2
