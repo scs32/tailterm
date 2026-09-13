@@ -171,14 +171,21 @@ undelivered. The handler assessment consumer #3694 remains a later slice; Air CL
 and the deployed frontend remain unchanged. Reader candidates from order #4235
 are excluded from this release. The parent Feature is unfinished.
 
-A separate not-yet-deployed order #4235 candidate gives the database handler a
-deterministic, resumable native evidence reader. `tt work-items evidence`
-selects the current item, revision history, all explicitly linked messages and/or
-an exact keyed update receipt; current revision/scope anchors the read. It follows
-every native page, preserves exact private bytes and hashes, detects cursor and
-snapshot changes, and distinguishes partial, terminal absence, errors and
-verified sources. Its manifest proves retrieval structure and availability, not
-semantic acceptance, and never mutates work-item or Queue state. See [complete
+Root `tasks-hub` source now includes the accepted order #4235 deterministic,
+resumable native evidence reader after source integration order #4782. The exact
+five-commit reader series ends at
+`aa74e23c2b16bc9173f7d2bbabecd5e47181f5d3` and is integrated on top of the
+verified-host source root `0740e978c36f982f0fbc66f3139f07e8a9518368`.
+`tt work-items evidence` selects the current item, revision history, all
+explicitly linked messages and/or an exact keyed update receipt; current
+revision/scope anchors the read. It follows every native page, preserves exact
+private bytes and hashes, detects cursor and snapshot changes, and distinguishes
+partial, terminal absence, errors and verified sources. Its manifest proves
+retrieval structure and availability, not semantic acceptance, and never mutates
+work-item or Queue state. Package #4729 remains exact qualification evidence for
+the `aa74e23` reader source only; it is not a binary package from the later
+combined root. This integration did not build, install or deploy anything, so the
+hub and Mini CLI remain the `b1b14d70` release described above. See [complete
 native work-item evidence](native-evidence-reader.md).
 
 Browser-created projects launch a database handler after the orchestrator. The

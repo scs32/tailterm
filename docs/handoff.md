@@ -59,22 +59,30 @@ not rebuild, install, deploy, reload a service or exercise live data. Mini previ
 PID60799/PPID1, four owner screenshots, `compact`, owner-modified `AGENTS.md` and
 existing services remain preserved.
 
-## September 13 complete native evidence reader — candidate only
+## September 13 complete native evidence reader — integrated source, not installed
 
-Feature `wi_618c8ff87e6b8061` revision5, bounded order #4235 and handler save
-#4245 have an isolated read-only candidate based on accepted `b1b14d7`. It adds
-a database-handler-only `tt work-items evidence` collector with explicit current,
-revision, full linked-message and keyed update-receipt source selection. Native
-pages are followed to terminal metadata and retained byte-for-byte with private
-size/hash manifests; exact retries resume after the last valid cursor. A
-current-item revision/scope bookend and per-page coverage checks reject changed
-or mixed observations.
+Feature `wi_618c8ff87e6b8061` revision5, bounded reader order #4235, accepted
+packaging order #4729 and source integration order #4782 have integrated the
+five-commit reader series ending at exact source
+`aa74e23c2b16bc9173f7d2bbabecd5e47181f5d3` into `tasks-hub` on top of the
+verified-host source root `0740e978c36f982f0fbc66f3139f07e8a9518368`.
+The combined source adds a database-handler-only `tt work-items evidence`
+collector with explicit current, revision, full linked-message and keyed
+update-receipt source selection. Native pages are followed to terminal metadata
+and retained byte-for-byte with private size/hash manifests; exact retries resume
+after the last valid cursor. A current-item revision/scope bookend and per-page
+coverage checks reject changed or mixed observations.
 
 The five per-source states keep partial/error/terminal absence/verified evidence
 distinct. Aggregate completeness requires every requested family to be terminal,
 while aggregate verification requires every family to be verified. The command
 does not assess source semantics, complete an item or Queue entry, schedule work,
-or add a watcher. It is not deployed. See [the native evidence reader
+or add a watcher. This integration did not build, install, deploy, contact
+TrueNAS or exercise live work-item/Queue/profile data. The hub and Mini CLI remain
+the installed `b1b14d70` release documented above. Package #4729 remains exact
+qualification evidence for `aa74e23`; its binaries are not relabeled as products
+of the later combined root. A fresh immutable package and separate operational
+release are required from that combined source. See [the native evidence reader
 contract](native-evidence-reader.md).
 
 ## September 13 structured operational records — deployed and accepted
