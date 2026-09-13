@@ -407,3 +407,61 @@ func TestWorkItemEvidenceReaderRejectsMetadataOnlyLinkedMessage(t *testing.T) {
 		t.Fatalf("manifest=%+v", manifest)
 	}
 }
+
+func TestWorkItemEvidenceReaderRejectsUnexplainedForeignTaskAndFutureRevision(t *testing.T) {
+	for name, link := range map[string]api.WorkItemMessageLink{
+		"foreign-without-dispatch": evidenceMessageLink(1, 1, "foreign"),
+		"future-revision":          evidenceMessageLink(2, 1, "future"),
+	} {
+		t.Run(name, func(t *testing.T) {
+			if name == "foreign-without-dispatch" {
+				link.Message.TaskID = "tsk_0000000000000009"
+			}
+			e := evidenceCLIEnv(t, func(w http.ResponseWriter, req *http.Request) {
+				base := "/v1/tasks/" + evidenceTask + "/work-items/" + evidenceItem
+				switch req.URL.Path {
+				case base:
+					writeEvidenceJSON(w, evidenceCurrent(1, 1))
+				case base + "/messages":
+					writeEvidenceJSON(w, api.WorkItemMessageList{Links: []api.WorkItemMessageLink{link}, Coverage: evidenceCoverage(1, 1, 1)})
+				default:
+					t.Fatalf("unexpected path %s", req.URL.String())
+				}
+			})
+			_, err := captureCLIOutput(t, func() error {
+				return cmdWorkItems(e, []string{"evidence", "--manifest", filepath.Join(t.TempDir(), "coordinates.json"), "--sources", "current,messages", evidenceItem})
+			})
+			if err == nil || !strings.Contains(err.Error(), "message") {
+				t.Fatalf("mismatched linked-message coordinates accepted: %v", err)
+			}
+		})
+	}
+}
+
+func TestWorkItemEvidenceReaderPreservesPrimaryCrossProjectDispatchMessage(t *testing.T) {
+	link := evidenceMessageLink(1, 1, "validated dispatch")
+	link.Message.TaskID = "tsk_0000000000000009"
+	link.Relationship = "primary"
+	link.Message.WorkItems = []api.MessageWorkItem{{ItemTaskID: evidenceTask, ItemID: evidenceItem, ItemRevision: 1, Relationship: "primary"}}
+	e := evidenceCLIEnv(t, func(w http.ResponseWriter, req *http.Request) {
+		base := "/v1/tasks/" + evidenceTask + "/work-items/" + evidenceItem
+		switch req.URL.Path {
+		case base:
+			writeEvidenceJSON(w, evidenceCurrent(1, 1))
+		case base + "/messages":
+			writeEvidenceJSON(w, api.WorkItemMessageList{Links: []api.WorkItemMessageLink{link}, Coverage: evidenceCoverage(1, 1, 1)})
+		default:
+			t.Fatalf("unexpected path %s", req.URL.String())
+		}
+	})
+	manifestPath := filepath.Join(t.TempDir(), "cross-project.json")
+	if _, err := captureCLIOutput(t, func() error {
+		return cmdWorkItems(e, []string{"evidence", "--manifest", manifestPath, "--sources", "current,messages", evidenceItem})
+	}); err != nil {
+		t.Fatal(err)
+	}
+	manifest := readEvidenceManifestForTest(t, manifestPath)
+	if !manifest.Complete || !manifest.Verified || manifest.Sources["messages"].Count != 1 {
+		t.Fatalf("manifest=%+v", manifest)
+	}
+}

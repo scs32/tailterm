@@ -313,11 +313,32 @@ func validEvidenceState(state string) bool {
 	}
 }
 
-func validFullMessage(link api.WorkItemMessageLink, after int64, seen map[string]bool) error {
+func validFullMessage(link api.WorkItemMessageLink, itemTaskID, itemID string, itemRevision, selectedRevision, after int64, seen map[string]bool) error {
 	message := link.Message
 	key := message.TaskID + "/" + strconv.FormatInt(message.Seq, 10)
-	if link.ItemRevision < 1 || link.RevisionCoverage == "" || !api.ValidID(message.TaskID, "tsk") || message.Seq <= after || seen[key] {
+	if link.ItemRevision < 1 || link.ItemRevision > itemRevision || (selectedRevision > 0 && link.ItemRevision != selectedRevision) || !api.ValidID(message.TaskID, "tsk") || message.Seq <= after || seen[key] {
 		return errors.New("message page contains missing, duplicate, or nonadvancing source coordinates")
+	}
+	if link.RevisionCoverage != "verified" && link.RevisionCoverage != "checkpoint" && link.RevisionCoverage != "gap" {
+		return errors.New("message page contains an unknown native revision-coverage state")
+	}
+	if link.Relationship != "" && link.Relationship != "primary" && link.Relationship != "related" {
+		return errors.New("message page contains an unknown native item relationship")
+	}
+	// Validated cross-project dispatch is intentionally part of work-item
+	// history. Its original Board task differs, so the full message envelope must
+	// retain the exact primary work-item association that caused the native link.
+	if message.TaskID != itemTaskID {
+		associated := false
+		for _, item := range message.WorkItems {
+			if item.ItemTaskID == itemTaskID && item.ItemID == itemID && item.ItemRevision == link.ItemRevision && item.Relationship == "primary" {
+				associated = true
+				break
+			}
+		}
+		if link.Source || link.Relationship != "primary" || !associated {
+			return errors.New("message page contains a foreign-task message without exact primary dispatch provenance")
+		}
 	}
 	if message.From.Node == "" || message.From.User == "" || message.Text == "" || message.CreatedAt.IsZero() {
 		return errors.New("message page does not contain the full native body/from/timestamp envelope")
@@ -503,7 +524,7 @@ func validateRetainedEvidenceManifest(manifestPath string, manifest *workItemEvi
 					cursor := after
 					seen := map[string]bool{}
 					for _, link := range list.Links {
-						if validFullMessage(link, after, seen) != nil || link.Message.Seq < cursor {
+						if validFullMessage(link, manifest.TaskID, manifest.ItemID, manifest.Snapshot.ItemRevision, manifest.Selection.MessageRevision, after, seen) != nil || link.Message.Seq < cursor {
 							pageFailed = true
 							break
 						}
@@ -850,7 +871,7 @@ func (r *workItemEvidenceReader) readMessagePages(ctx context.Context) error {
 		cursor := after
 		coordinates := map[string]bool{}
 		for _, link := range list.Links {
-			if err = validFullMessage(link, after, coordinates); err != nil || link.Message.Seq < cursor {
+			if err = validFullMessage(link, r.manifest.TaskID, r.manifest.ItemID, r.manifest.Snapshot.ItemRevision, r.manifest.Selection.MessageRevision, after, coordinates); err != nil || link.Message.Seq < cursor {
 				if err == nil {
 					err = errors.New("message page contains nonmonotonic source coordinates")
 				}
