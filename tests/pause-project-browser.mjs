@@ -29,6 +29,7 @@ let capability={projectPause:{supported:true,versions:[1]}};
 let pause=null;
 let cleanupRound=0;
 let lostResumeResponse=true;
+let failedLeadConfirmation=false;
 let failedWorkerLaunch=false;
 let resumeRequest=null;
 const requests=[];
@@ -92,10 +93,14 @@ const host={
      if(!member) throw Error('Synthetic spawn has no uncertain frozen member');
      const fields=member.fields;
      if(fields.name==='worker'&&!failedWorkerLaunch){failedWorkerLaunch=true;throw Object.assign(Error('Synthetic worker launch failed before admission'),{verifiedUnstarted:true})}
-     const fresh={id:fields.agentId,runId:fields.expectedRunId||('run_'+String(agents.length+1).repeat(16).slice(0,16)),taskId:taskA.id,name:fields.name,host:'synthetic-host',session:'resume-'+fields.name,runtime:fields.runtime,cwd:fields.cwd,parentAgentId:'',role:fields.agentRole||'',status:'running',online:true,cleanupDone:false};
-     agents.push(fresh);
+     let fresh=agents.find(agent=>agent.id===fields.agentId);
+     if(!fresh){
+       fresh={id:fields.agentId,runId:fields.expectedRunId||('run_'+String(agents.length+1).repeat(16).slice(0,16)),taskId:taskA.id,name:fields.name,host:'synthetic-host',session:'resume-'+fields.name,runtime:fields.runtime,cwd:fields.cwd,parentAgentId:'',role:fields.agentRole||'',status:'running',online:true,cleanupDone:false};
+       agents.push(fresh);
+     }
      if(fields.agentId===journal.resume.orchestratorAgentId){
        if(fields.expectedRunId!==journal.resume.orchestratorRunId||fields.resumeReceiptId!=='ppr_5555555555555555')throw Error('Fresh orchestrator admission binding changed');
+       if(!failedLeadConfirmation){failedLeadConfirmation=true;throw Error('Synthetic lead registered before tmux confirmation')}
        taskA.pauseState='active';taskA.orchestrator=fields.name;
        pause={...pause,state:'active',resumeAdmission:{...pause.resumeAdmission,pending:false}};
      }
@@ -335,6 +340,30 @@ try {
       await page.waitForFunction(() =>
         document
           .querySelector("#project-resume-status")
+          ?.textContent.includes("registered before tmux confirmation"),
+      );
+      assert.equal(
+        await page.evaluate(() => window.fixture.taskA.pauseState),
+        "resuming",
+        "agent registration cleared the barrier before tmux confirmation",
+      );
+      assert.equal(
+        await page.evaluate(
+          () =>
+            window.fixture.agents.filter(
+              (agent) =>
+                agent.taskId === window.fixture.taskA.id &&
+                agent.status === "running",
+            ).length,
+        ),
+        1,
+        "the synthetic unconfirmed lead registration was not retained exactly",
+      );
+
+      await page.getByTestId("resume-project-confirm").click();
+      await page.waitForFunction(() =>
+        document
+          .querySelector("#project-resume-status")
           ?.textContent.includes("worker launch failed"),
       );
       assert.equal(
@@ -372,7 +401,12 @@ try {
       );
       assert.match(spawnCommands[0], /--resume-receipt-id/);
       assert.match(spawnCommands[0], /--expected-lifecycle-generation/);
-      assert.doesNotMatch(spawnCommands[1], /--resume-receipt-id/);
+      assert.equal(
+        spawnCommands[0],
+        spawnCommands[1],
+        "unconfirmed lead retry changed the exact frozen host command",
+      );
+      assert.doesNotMatch(spawnCommands[2], /--resume-receipt-id/);
 
       await page.getByTestId("resume-project-confirm").click();
       await page.waitForFunction(

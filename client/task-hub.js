@@ -1749,19 +1749,31 @@ export function createTaskHub(host) {
       );
       const exact = detail.agents.find((agent) => agent.id === fields.agentId);
       if (member && ["uncertain", "started"].includes(member.state)) {
-        if (!exact)
+        const pendingResumeOrchestrator =
+          journal.kind === "resume-project" &&
+          member.state === "uncertain" &&
+          detail.task.pauseState === "resuming" &&
+          fields.agentId === journal.resume.orchestratorAgentId;
+        if (!exact && !pendingResumeOrchestrator)
           throw new Error(
             `The saved ${member.state} identity for ${fields.name} is not present. Reconcile the exact agent and run before continuing.`,
           );
-        const problem = journal
-          ? await guardedJournalEffect(journal, entry, () =>
-              reconciledAgentProblem(taskId, entry, member, exact),
-            )
-          : await reconciledAgentProblem(taskId, entry, member, exact);
-        if (problem)
-          throw new Error(
-            `The saved identity for ${fields.name} has a ${problem} mismatch. Inspect the project before continuing.`,
-          );
+        if (exact) {
+          const problem = journal
+            ? await guardedJournalEffect(journal, entry, () =>
+                reconciledAgentProblem(taskId, entry, member, exact),
+              )
+            : await reconciledAgentProblem(taskId, entry, member, exact);
+          if (problem)
+            throw new Error(
+              `The saved identity for ${fields.name} has a ${problem} mismatch. Inspect the project before continuing.`,
+            );
+        }
+        // Registering the planned fresh lead does not open the project. The
+        // host-side tt spawn must verify the exact tmux ownership and consume
+        // /resume/confirm. Re-run that same frozen command while the barrier
+        // remains resuming, even if AddAgent already saved the identity.
+        if (pendingResumeOrchestrator) continue;
         if (member.state === "uncertain") {
           member.state = "started";
           member.agent = {
