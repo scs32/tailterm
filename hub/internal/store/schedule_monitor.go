@@ -192,7 +192,7 @@ func (s *Store) ScheduleMonitorDelivery(ctx context.Context, taskID string, lead
 	}
 	var target api.Agent
 	var deliveryErr error
-	if task.Status != api.TaskOpen {
+	if task.Status != api.TaskOpen || task.PauseState != api.ProjectPauseActive {
 		deliveryErr = api.ErrClosed
 	} else {
 		target, err = scanAgent(tx.QueryRowContext(ctx, `SELECT `+agentCols+` FROM agents WHERE id=?`, lead.ID))

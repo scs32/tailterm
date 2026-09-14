@@ -121,7 +121,7 @@ func (e *Enforcer) Tick(ctx context.Context, report func(Outcome)) {
 		return
 	}
 	for _, task := range tasks {
-		if task.Status != api.TaskOpen {
+		if task.Status != api.TaskOpen || task.PauseState != api.ProjectPauseActive {
 			continue
 		}
 		e.tickTask(ctx, task, report)

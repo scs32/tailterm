@@ -48,6 +48,9 @@ func (s *Store) AssignLead(ctx context.Context, taskID string, req api.AssignLea
 	if task.Status != api.TaskOpen {
 		return result, api.ErrClosed
 	}
+	if task.PauseState != api.ProjectPauseActive {
+		return result, fmt.Errorf("%w: project lead changes are blocked while the project is paused", api.ErrConflict)
+	}
 	if task.LeadRevision != req.ExpectedRevision || task.Orchestrator != req.ExpectedName {
 		return result, fmt.Errorf("%w: project lead changed; reload before choosing again", api.ErrConflict)
 	}

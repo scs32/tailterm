@@ -29,26 +29,28 @@ import "time"
 // agent happens to hold the preallocated AgentID and consumes the intent --
 // that identity is checked exactly, not recorded only after the fact.
 type AllocationIntent struct {
-	AgentID                 string           `json:"agentId"`
-	TargetTaskID            string           `json:"targetTaskId"`
-	ItemTaskID              string           `json:"itemTaskId"`
-	ItemID                  string           `json:"itemId"`
-	ItemRevision            int64            `json:"itemRevision"`
-	WorkOrderMessage        MessageReference `json:"workOrderMessage"`
-	ContextDigest           string           `json:"contextDigest"`
-	TeamRole                string           `json:"teamRole"`
-	AuthorAgentID           string           `json:"authorAgentId"`
-	AuthorRunID             string           `json:"authorRunId"`
-	ExpectedRunID           string           `json:"expectedRunId"`
-	ExpectedLauncherAgentID string           `json:"expectedLauncherAgentId"`
-	ExpectedLauncherRunID   string           `json:"expectedLauncherRunId"`
-	RequestID               string           `json:"requestId,omitempty"`
-	CreatedBy               Caller           `json:"createdBy"`
-	CreatedAt               time.Time        `json:"createdAt"`
-	ConsumedAt              *time.Time       `json:"consumedAt,omitempty"`
-	ConsumedByRunID         string           `json:"consumedByRunId,omitempty"`
-	LauncherAgentID         string           `json:"launcherAgentId,omitempty"`
-	LauncherRunID           string           `json:"launcherRunId,omitempty"`
+	AgentID                    string           `json:"agentId"`
+	TargetTaskID               string           `json:"targetTaskId"`
+	ItemTaskID                 string           `json:"itemTaskId"`
+	ItemID                     string           `json:"itemId"`
+	ItemRevision               int64            `json:"itemRevision"`
+	WorkOrderMessage           MessageReference `json:"workOrderMessage"`
+	ContextDigest              string           `json:"contextDigest"`
+	TeamRole                   string           `json:"teamRole"`
+	AuthorAgentID              string           `json:"authorAgentId"`
+	AuthorRunID                string           `json:"authorRunId"`
+	ExpectedRunID              string           `json:"expectedRunId"`
+	ExpectedLauncherAgentID    string           `json:"expectedLauncherAgentId"`
+	ExpectedLauncherRunID      string           `json:"expectedLauncherRunId"`
+	RequestID                  string           `json:"requestId,omitempty"`
+	CreatedBy                  Caller           `json:"createdBy"`
+	CreatedAt                  time.Time        `json:"createdAt"`
+	ConsumedAt                 *time.Time       `json:"consumedAt,omitempty"`
+	ConsumedByRunID            string           `json:"consumedByRunId,omitempty"`
+	LauncherAgentID            string           `json:"launcherAgentId,omitempty"`
+	LauncherRunID              string           `json:"launcherRunId,omitempty"`
+	InvalidatedAt              *time.Time       `json:"invalidatedAt,omitempty"`
+	InvalidatedPauseGeneration int64            `json:"invalidatedPauseGeneration,omitempty"`
 }
 
 // CreateAllocationIntentRequest authors one intent for one not-yet-admitted

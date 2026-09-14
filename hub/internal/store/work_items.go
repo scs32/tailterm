@@ -704,6 +704,9 @@ func (s *Store) DispatchWorkItem(ctx context.Context, taskID, itemID string, req
 	if sourceTask.Status != api.TaskOpen || targetTask.Status != api.TaskOpen {
 		return api.WorkItemDispatchResult{}, api.ErrClosed
 	}
+	if sourceTask.PauseState != api.ProjectPauseActive || targetTask.PauseState != api.ProjectPauseActive {
+		return api.WorkItemDispatchResult{}, workItemConflict("Queue dispatch is blocked while either project is paused")
+	}
 	if err = validateWorkItemAgent(tx, ctx, taskID, req.AgentID); err != nil {
 		return api.WorkItemDispatchResult{}, err
 	}

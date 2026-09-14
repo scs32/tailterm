@@ -129,6 +129,31 @@ func (c *Client) CloseTask(ctx context.Context, id string) (Task, error) {
 	return out, c.do(ctx, "DELETE", "/v1/tasks/"+id, nil, &out)
 }
 
+func (c *Client) PauseProject(ctx context.Context, id string, req PauseProjectRequest) (ProjectPauseStatus, error) {
+	var out ProjectPauseStatus
+	return out, c.do(ctx, "POST", "/v1/tasks/"+id+"/pause", req, &out)
+}
+
+func (c *Client) GetProjectPause(ctx context.Context, id string) (ProjectPauseStatus, error) {
+	var out ProjectPauseStatus
+	return out, c.do(ctx, "GET", "/v1/tasks/"+id+"/pause", nil, &out)
+}
+
+func (c *Client) ResumeProject(ctx context.Context, id string, req ResumeProjectRequest) (ProjectPauseStatus, error) {
+	var out ProjectPauseStatus
+	return out, c.do(ctx, "POST", "/v1/tasks/"+id+"/resume", req, &out)
+}
+
+func (c *Client) ConfirmProjectResume(ctx context.Context, id string, req ConfirmProjectResumeRequest) (ProjectPauseStatus, error) {
+	var out ProjectPauseStatus
+	return out, c.do(ctx, "POST", "/v1/tasks/"+id+"/resume/confirm", req, &out)
+}
+
+func (c *Client) ResolvePauseHandoff(ctx context.Context, id string, req ResolvePauseHandoffRequest) (ProjectPauseStatus, error) {
+	var out ProjectPauseStatus
+	return out, c.do(ctx, "POST", "/v1/tasks/"+id+"/pause/handoff", req, &out)
+}
+
 func (c *Client) AddAgent(ctx context.Context, task string, req AddAgentRequest) (Agent, error) {
 	var out Agent
 	// Preserve the prepared context's byte bound instead of expanding raw JSON

@@ -600,8 +600,8 @@ func (s *Store) CreateRequiredDelivery(ctx context.Context, taskID string, req a
 	if err = validateDeliveryProducer(tx, ctx, taskID, req.ProducerAgentID, req.ProducerRunID); err != nil {
 		return out, err
 	}
-	var taskStatus string
-	if err = tx.QueryRowContext(ctx, `SELECT status FROM tasks WHERE id=?`, taskID).Scan(&taskStatus); err != nil {
+	var taskStatus, pauseState string
+	if err = tx.QueryRowContext(ctx, `SELECT status,pause_state FROM tasks WHERE id=?`, taskID).Scan(&taskStatus, &pauseState); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return out, api.ErrNotFound
 		}
@@ -609,6 +609,9 @@ func (s *Store) CreateRequiredDelivery(ctx context.Context, taskID string, req a
 	}
 	if taskStatus != api.TaskOpen {
 		return out, api.ErrClosed
+	}
+	if pauseState != api.ProjectPauseActive {
+		return out, workItemConflict("project is paused; directive creation is blocked")
 	}
 	message, err := loadMessage(tx, ctx, taskID, req.MessageSeq)
 	if err != nil || !hasDeliveryItemLink(message, req.ItemTaskID, req.ItemID, req.ItemRevision) {
@@ -1000,6 +1003,13 @@ func (s *Store) mutateWorkerDelivery(ctx context.Context, taskID, deliveryID, op
 	d, err := getRequiredDeliveryRow(tx, ctx, taskID, deliveryID)
 	if err != nil {
 		return out, err
+	}
+	var pauseState string
+	if err = tx.QueryRowContext(ctx, `SELECT pause_state FROM tasks WHERE id=?`, taskID).Scan(&pauseState); err != nil {
+		return out, err
+	}
+	if pauseState != api.ProjectPauseActive {
+		return out, workItemConflict("project is paused; delivery follow-through is blocked")
 	}
 	if err = validateDeliveryBinding(tx, ctx, d); err != nil {
 		return out, err
@@ -1593,6 +1603,13 @@ func (s *Store) CheckDeliveryFollowThrough(ctx context.Context, taskID, delivery
 	if err != nil {
 		return out, err
 	}
+	var pauseState string
+	if err = tx.QueryRowContext(ctx, `SELECT pause_state FROM tasks WHERE id=?`, taskID).Scan(&pauseState); err != nil {
+		return out, err
+	}
+	if pauseState != api.ProjectPauseActive {
+		return out, workItemConflict("project is paused; delivery follow-through is blocked")
+	}
 	if err = validateDeliveryBinding(tx, ctx, d); err != nil {
 		return out, err
 	}
@@ -1721,6 +1738,13 @@ func (s *Store) ReportDeliveryFollowThrough(ctx context.Context, taskID, deliver
 	d, err := getRequiredDeliveryRow(tx, ctx, taskID, deliveryID)
 	if err != nil {
 		return out, err
+	}
+	var pauseState string
+	if err = tx.QueryRowContext(ctx, `SELECT pause_state FROM tasks WHERE id=?`, taskID).Scan(&pauseState); err != nil {
+		return out, err
+	}
+	if pauseState != api.ProjectPauseActive && req.Outcome != api.DeliveryFollowThroughOutcomeInvalidated {
+		return out, workItemConflict("project is paused; delivery follow-through is blocked")
 	}
 	if err = validateDeliveryBinding(tx, ctx, d); err != nil {
 		return out, err

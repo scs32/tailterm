@@ -101,11 +101,31 @@ var queueExportQueries = []exportQuery{
 // the allocation-intent stream is included only in format 3, exactly like
 // the Queue streams below.
 var allocationIntentExportQueries = []exportQuery{
-	{"agentAllocationIntents", `SELECT agent_id,target_task_id,item_task_id,item_id,item_revision,work_order_task_id,work_order_message_seq,team_role,context_digest,author_agent_id,author_run_id,expected_run_id,expected_launcher_agent_id,expected_launcher_run_id,request_id,created_by_node,created_by_user,created_at,consumed_at,consumed_by_run_id,launcher_agent_id,launcher_run_id FROM agent_allocation_intents WHERE target_task_id=? ORDER BY created_at,agent_id`, oneArg},
+	{"agentAllocationIntents", `SELECT agent_id,target_task_id,item_task_id,item_id,item_revision,work_order_task_id,work_order_message_seq,team_role,context_digest,author_agent_id,author_run_id,expected_run_id,expected_launcher_agent_id,expected_launcher_run_id,request_id,created_by_node,created_by_user,created_at,consumed_at,consumed_by_run_id,launcher_agent_id,launcher_run_id,invalidated_at,invalidated_pause_generation FROM agent_allocation_intents WHERE target_task_id=? ORDER BY created_at,agent_id`, oneArg},
 }
 
-func oneArg(taskID string) []any  { return []any{taskID} }
-func twoArgs(taskID string) []any { return []any{taskID, taskID} }
+var projectPauseExportQueries = []exportQuery{
+	{"projectPauseTaskState", `SELECT id,pause_state,lifecycle_generation,pause_generation,paused_at FROM tasks WHERE id=?`, oneArg},
+	{"projectPauseCycles", `SELECT * FROM project_pause_cycles WHERE task_id=? ORDER BY pause_generation`, oneArg},
+	{"projectPauseTargets", `SELECT pt.* FROM project_pause_targets pt JOIN project_pause_cycles pc ON pc.id=pt.cycle_id WHERE pc.task_id=? ORDER BY pc.pause_generation,pt.agent_id,pt.run_id`, oneArg},
+	{"projectPauseReceipts", `SELECT * FROM project_pause_receipts WHERE task_id=? ORDER BY created_at,id`, oneArg},
+}
+
+// Phase-successor streams are format-3-only. Format 2 remains byte-for-byte
+// compatible, while v2 operational acceptance exports its immutable record,
+// obligation, accountable-lead transfer provenance, and exact delivery events.
+var phaseSuccessorExportQueries = []exportQuery{
+	{"operationalRecords", `SELECT * FROM operational_records WHERE task_id=? ORDER BY id`, oneArg},
+	{"operationalRecordVersions", `SELECT v.* FROM operational_record_versions v JOIN operational_records r ON r.id=v.record_id WHERE r.task_id=? ORDER BY v.record_id,v.version`, oneArg},
+	{"phaseSuccessorObligations", `SELECT * FROM phase_successor_obligations WHERE task_id=? ORDER BY created_at,id`, oneArg},
+	{"phaseSuccessorLeadTransfers", `SELECT t.* FROM phase_successor_lead_transfers t JOIN phase_successor_obligations o ON o.id=t.obligation_id WHERE o.task_id=? ORDER BY t.obligation_id,t.sequence`, oneArg},
+	{"phaseSuccessorDeliveries", `SELECT d.* FROM required_deliveries d WHERE d.id IN (SELECT lead_delivery_id FROM phase_successor_obligations WHERE task_id=? UNION SELECT successor_delivery_id FROM phase_successor_obligations WHERE task_id=? AND successor_delivery_id<>'' UNION SELECT t.from_delivery_id FROM phase_successor_lead_transfers t JOIN phase_successor_obligations o ON o.id=t.obligation_id WHERE o.task_id=? UNION SELECT t.to_delivery_id FROM phase_successor_lead_transfers t JOIN phase_successor_obligations o ON o.id=t.obligation_id WHERE o.task_id=?) ORDER BY d.created_at,d.id`, fourArgs},
+	{"phaseSuccessorDeliveryEvents", `SELECT e.* FROM delivery_events e WHERE e.delivery_id IN (SELECT lead_delivery_id FROM phase_successor_obligations WHERE task_id=? UNION SELECT successor_delivery_id FROM phase_successor_obligations WHERE task_id=? AND successor_delivery_id<>'' UNION SELECT t.from_delivery_id FROM phase_successor_lead_transfers t JOIN phase_successor_obligations o ON o.id=t.obligation_id WHERE o.task_id=? UNION SELECT t.to_delivery_id FROM phase_successor_lead_transfers t JOIN phase_successor_obligations o ON o.id=t.obligation_id WHERE o.task_id=?) ORDER BY e.created_at,e.id`, fourArgs},
+}
+
+func oneArg(taskID string) []any   { return []any{taskID} }
+func twoArgs(taskID string) []any  { return []any{taskID, taskID} }
+func fourArgs(taskID string) []any { return []any{taskID, taskID, taskID, taskID} }
 
 type auditExportWriter struct {
 	ctx    context.Context
@@ -435,7 +455,7 @@ func (s *Store) CreateAuditExport(ctx context.Context, taskID string, req api.Cr
 	}
 	queries := exportQueries
 	if req.FormatVersion == api.AuditExportFormatVersion {
-		queries = append(append(append([]exportQuery(nil), exportQueries...), allocationIntentExportQueries...), queueExportQueries...)
+		queries = append(append(append(append(append([]exportQuery(nil), exportQueries...), allocationIntentExportQueries...), projectPauseExportQueries...), queueExportQueries...), phaseSuccessorExportQueries...)
 	}
 	for index, q := range queries {
 		if index > 0 {

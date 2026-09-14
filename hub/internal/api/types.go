@@ -91,6 +91,16 @@ const (
 	TaskClosed = "closed"
 )
 
+// Project pause states are deliberately separate from Task.Status. A paused
+// project remains open and readable; only team admission and automatic work
+// delivery are fenced.
+const (
+	ProjectPauseActive         = "active"
+	ProjectPauseCleanupPending = "cleanup_pending"
+	ProjectPausePaused         = "paused"
+	ProjectPauseResuming       = "resuming"
+)
+
 // Agent statuses.
 const (
 	AgentStarting   = "starting"
@@ -104,19 +114,23 @@ const (
 
 // Event kinds.
 const (
-	EventTaskCreated = "task_created"
-	EventTaskClosed  = "task_closed"
-	EventAgentAdded  = "agent_added"
-	EventStarted     = "started"
-	EventRunning     = "running"
-	EventDone        = "done"
-	EventRetired     = "retired"
-	EventResumed     = "resumed"
-	EventNeedsInput  = "needs_input"
-	EventClosed      = "closed"
-	EventMessage     = "message"
-	EventExited      = "exited"
-	EventHeartbeat   = "heartbeat"
+	EventTaskCreated         = "task_created"
+	EventTaskClosed          = "task_closed"
+	EventTaskPauseRequested  = "task_pause_requested"
+	EventTaskPaused          = "task_paused"
+	EventTaskResumeRequested = "task_resume_requested"
+	EventTaskResumed         = "task_resumed"
+	EventAgentAdded          = "agent_added"
+	EventStarted             = "started"
+	EventRunning             = "running"
+	EventDone                = "done"
+	EventRetired             = "retired"
+	EventResumed             = "resumed"
+	EventNeedsInput          = "needs_input"
+	EventClosed              = "closed"
+	EventMessage             = "message"
+	EventExited              = "exited"
+	EventHeartbeat           = "heartbeat"
 )
 
 // LifecycleStatus maps an event kind to the agent status it implies, or "".
@@ -147,19 +161,25 @@ var postableKinds = map[string]bool{
 func PostableKind(kind string) bool { return postableKinds[kind] }
 
 type Task struct {
-	LeadRevision    int64      `json:"leadRevision"`
-	CleanupPending  int        `json:"cleanupPending"`
-	Orchestrator    string     `json:"orchestrator"`
-	Swarm           bool       `json:"swarm"`
-	MaxNewAgents    int        `json:"maxNewAgents"`
-	AllowAgentSpawn bool       `json:"allowAgentSpawn"`
-	ID              string     `json:"id"`
-	Name            string     `json:"name"`
-	Goal            string     `json:"goal"`
-	Status          string     `json:"status"`
-	CreatedAt       time.Time  `json:"createdAt"`
-	CreatedBy       Caller     `json:"createdBy"`
-	ClosedAt        *time.Time `json:"closedAt"`
+	PauseState          string     `json:"pauseState"`
+	LifecycleGeneration int64      `json:"lifecycleGeneration"`
+	PauseGeneration     int64      `json:"pauseGeneration"`
+	PauseCleanupPending int        `json:"pauseCleanupPending"`
+	PauseHandoffPending int        `json:"pauseHandoffPending"`
+	PausedAt            *time.Time `json:"pausedAt"`
+	LeadRevision        int64      `json:"leadRevision"`
+	CleanupPending      int        `json:"cleanupPending"`
+	Orchestrator        string     `json:"orchestrator"`
+	Swarm               bool       `json:"swarm"`
+	MaxNewAgents        int        `json:"maxNewAgents"`
+	AllowAgentSpawn     bool       `json:"allowAgentSpawn"`
+	ID                  string     `json:"id"`
+	Name                string     `json:"name"`
+	Goal                string     `json:"goal"`
+	Status              string     `json:"status"`
+	CreatedAt           time.Time  `json:"createdAt"`
+	CreatedBy           Caller     `json:"createdBy"`
+	ClosedAt            *time.Time `json:"closedAt"`
 }
 
 type Agent struct {
@@ -244,16 +264,18 @@ type UpdateTaskRequest struct {
 }
 
 type AddAgentRequest struct {
-	WorkItem      *AgentWorkItemRequest `json:"workItem,omitempty"`
-	ExpectedRunID string                `json:"expectedRunId,omitempty"`
-	Role          string                `json:"role,omitempty"`
-	AgentID       string                `json:"agentId"`
-	Name          string                `json:"name"`
-	Host          string                `json:"host"`
-	Session       string                `json:"session"`
-	Runtime       string                `json:"runtime"`
-	Cwd           string                `json:"cwd"`
-	ParentAgentID string                `json:"parentAgentId"`
+	WorkItem                    *AgentWorkItemRequest `json:"workItem,omitempty"`
+	ExpectedRunID               string                `json:"expectedRunId,omitempty"`
+	ExpectedLifecycleGeneration int64                 `json:"expectedLifecycleGeneration,omitempty"`
+	ResumeReceiptID             string                `json:"resumeReceiptId,omitempty"`
+	Role                        string                `json:"role,omitempty"`
+	AgentID                     string                `json:"agentId"`
+	Name                        string                `json:"name"`
+	Host                        string                `json:"host"`
+	Session                     string                `json:"session"`
+	Runtime                     string                `json:"runtime"`
+	Cwd                         string                `json:"cwd"`
+	ParentAgentID               string                `json:"parentAgentId"`
 }
 
 type UpdateAgentRequest struct {

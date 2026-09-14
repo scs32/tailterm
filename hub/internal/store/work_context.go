@@ -203,17 +203,17 @@ func validateCrossProjectQueueAdmission(q queryRower, ctx context.Context, targe
 		entry.WorkerAgentID != "" || entry.WorkerRunID != "" || entry.ContextDigest != "" {
 		return workItemConflict("cross-project admission does not match the exact current Queue claim")
 	}
-	var targetStatus, sourceStatus, itemStatus string
-	if err = q.QueryRowContext(ctx, `SELECT status FROM tasks WHERE id=?`, targetTaskID).Scan(&targetStatus); err != nil {
+	var targetStatus, targetPauseState, sourceStatus, sourcePauseState, itemStatus string
+	if err = q.QueryRowContext(ctx, `SELECT status,pause_state FROM tasks WHERE id=?`, targetTaskID).Scan(&targetStatus, &targetPauseState); err != nil {
 		return err
 	}
-	if err = q.QueryRowContext(ctx, `SELECT status FROM tasks WHERE id=?`, req.ItemTaskID).Scan(&sourceStatus); err != nil {
+	if err = q.QueryRowContext(ctx, `SELECT status,pause_state FROM tasks WHERE id=?`, req.ItemTaskID).Scan(&sourceStatus, &sourcePauseState); err != nil {
 		return err
 	}
 	if err = q.QueryRowContext(ctx, `SELECT status FROM work_items WHERE task_id=? AND id=? AND revision=?`, req.ItemTaskID, req.ItemID, req.ItemRevision).Scan(&itemStatus); err != nil {
 		return err
 	}
-	if targetStatus != api.TaskOpen || sourceStatus != api.TaskOpen || itemStatus == "done" || itemStatus == "dismissed" {
+	if targetStatus != api.TaskOpen || sourceStatus != api.TaskOpen || targetPauseState != api.ProjectPauseActive || sourcePauseState != api.ProjectPauseActive || itemStatus == "done" || itemStatus == "dismissed" {
 		return workItemConflict("cross-project Queue claim is no longer eligible for admission")
 	}
 	if err = validateQueueWorkOrder(ctx, q, entry, &req.WorkOrderMessage, req.ItemRevision); err != nil {

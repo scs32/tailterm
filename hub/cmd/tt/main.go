@@ -35,6 +35,7 @@ Commands
   brief                        print the shared task briefing
   status                       identity, hub reachability, own agent, unread count
   projects                     list projects on the hub (tasks is an alias)
+  project-pause <get|pause|handoff|resume>  explicit project team lifecycle
   work-items <command>         list/get/create/update/dispatch/history/evidence for bugs and features
   queue <command>              list/get/history/changes/action/receipt for deliberate Queue work
   agents [--json]              list agents on this task
@@ -50,6 +51,7 @@ Commands
   current-assignment [--item ID --action-key KEY] [--json]  fetch one exact directive
   delivery <command>           create/coverage/incident/ack/progress/block/resolve/resume/result
   spawn --name N --run CMD [--cwd D] [--prompt P] [--runtime R] [--task ID]
+        [--expected-lifecycle-generation N] [--resume-receipt-id ID]
                                start a sibling agent session on this host
   allocation-intent create --agent-id ID --work-item ID --work-item-revision N
                              --work-order-message N --team-role member|extra
@@ -148,6 +150,8 @@ func main() {
 		err = cmdStatus(e)
 	case "tasks", "projects":
 		err = cmdTasks(e, args)
+	case "project-pause":
+		err = cmdProjectPause(e, args)
 	case "work-items":
 		err = cmdWorkItems(e, args)
 	case "queue":
@@ -747,7 +751,9 @@ func cmdSpawn(e env, args []string) error {
 	fs := flag.NewFlagSet("spawn", flag.ExitOnError)
 	name := fs.String("name", "", "agent name (required)")
 	agentID := fs.String("agent-id", "", "stable preallocated agent identity for launch/retry")
-	expectedRunID := fs.String("expected-run-id", "", "exited database_handler run to restart")
+	expectedRunID := fs.String("expected-run-id", "", "exact preallocated resume run or exited database_handler run to restart")
+	expectedLifecycleGeneration := fs.Int64("expected-lifecycle-generation", 0, "exact project lifecycle generation required for admission")
+	resumeReceiptID := fs.String("resume-receipt-id", "", "durable project Resume receipt authorizing the exact fresh orchestrator")
 	workItemTask := fs.String("work-item-task", "", "project owning the bound bug or feature (default: --task)")
 	workItemID := fs.String("work-item", "", "single bug or feature bound to this new session")
 	workItemRevision := fs.Int64("work-item-revision", 0, "exact work-item revision to restore")
@@ -793,8 +799,11 @@ func cmdSpawn(e env, args []string) error {
 	if *agentID != "" && !api.ValidID(*agentID, "agt") {
 		return errors.New("invalid --agent-id")
 	}
-	if *role == "" && *expectedRunID != "" {
+	if *role == "" && *expectedRunID != "" && *resumeReceiptID == "" {
 		return errors.New("--expected-run-id is reserved for database_handler launches")
+	}
+	if *expectedLifecycleGeneration < 0 {
+		return errors.New("--expected-lifecycle-generation must be non-negative")
 	}
 	if *plannedTeamMembers < 0 || *plannedTeamMembers > 32 {
 		return errors.New("planned team members must be from 1 to 32 when set")
@@ -833,6 +842,9 @@ func cmdSpawn(e env, args []string) error {
 		if *replacesAgent != "" && *teamRole != "" && *teamRole != api.TeamRoleMember && *teamRole != api.TeamRoleExtra {
 			return fmt.Errorf("--team-role must be %s or %s when given", api.TeamRoleMember, api.TeamRoleExtra)
 		}
+	}
+	if *resumeReceiptID != "" && (*role != "" || itemFlagCount != 0 || !projectPauseReceiptIDPattern.MatchString(*resumeReceiptID) || !api.ValidID(*agentID, "agt") || !runIDPattern.MatchString(*expectedRunID) || *expectedLifecycleGeneration <= 0) {
+		return errors.New("--resume-receipt-id requires an ordinary unbound fresh orchestrator with exact --agent-id, --expected-run-id and positive --expected-lifecycle-generation")
 	}
 	queueFlagCount := 0
 	for _, set := range []bool{*queueEntry != "", *queueCycle != 0, *queueRevision != 0, *queueClaimantAgent != "", *queueClaimantRun != ""} {
@@ -998,7 +1010,8 @@ func cmdSpawn(e env, args []string) error {
 		parent = ""
 	}
 	req := api.AddAgentRequest{
-		ExpectedRunID: *expectedRunID, Role: *role, AgentID: *agentID,
+		ExpectedRunID: *expectedRunID, ExpectedLifecycleGeneration: *expectedLifecycleGeneration,
+		ResumeReceiptID: *resumeReceiptID, Role: *role, AgentID: *agentID,
 		Name: *name, Host: spawn.Host(), Session: session,
 		Runtime: *runtime, Cwd: *cwd, ParentAgentID: parent,
 	}
@@ -1055,15 +1068,52 @@ func cmdSpawn(e env, args []string) error {
 			opts.Env["TAILTERM_WORK_ITEM"] = agent.WorkItem.ItemID
 			opts.Env["TAILTERM_WORK_ITEM_REVISION"] = fmt.Sprint(agent.WorkItem.ItemRevision)
 		}
+		// An uncertain exact Resume retry must reuse the session identity saved
+		// by the first admission instead of generating a second tmux session.
+		if *resumeReceiptID != "" {
+			session = agent.Session
+			opts.Session = session
+		}
 		opts.Env[spawn.EnvAgent], opts.Env[spawn.EnvAgentName], opts.Env[spawn.EnvSession], opts.Env["TAILTERM_RUN"] = agent.ID, agent.Name, session, agent.RunID
 		delete(opts.Env, "TAILTERM_HANDLER_COMMAND")
 		delete(opts.Env, "TAILTERM_HANDLER_PROMPT")
 		// The briefing is already the runtime's quoted command argument. Keeping
 		// a second copy in tmux's environment can exceed tmux's command limit.
 		delete(opts.Env, "TAILTERM_BRIEFING")
-		if err = spawn.Create(opts); err != nil {
-			_, _ = c.CloseAgent(ctx, *task, agent.ID, agent.RunID)
-			return err
+		var existingSession *ownedSession
+		if *resumeReceiptID != "" {
+			existingSession, err = handlerOwned(ctx, *hub, *task, agent.ID, agent.RunID, agent.Session, nil)
+			if err != nil {
+				return fmt.Errorf("verify resumed orchestrator session: %w", err)
+			}
+		}
+		if existingSession == nil {
+			if err = spawn.Create(opts); err != nil {
+				if *resumeReceiptID == "" {
+					_, _ = c.CloseAgent(ctx, *task, agent.ID, agent.RunID)
+				}
+				return err
+			}
+		}
+		if *resumeReceiptID != "" {
+			verifiedSession, verifyErr := handlerOwned(ctx, *hub, *task, agent.ID, agent.RunID, agent.Session, nil)
+			if verifyErr != nil {
+				return fmt.Errorf("verify resumed orchestrator session after launch: %w", verifyErr)
+			}
+			if verifiedSession == nil {
+				return errors.New("resumed orchestrator session is not present with the saved exact run identity")
+			}
+			confirm := api.ConfirmProjectResumeRequest{Version: api.ProjectPauseCapabilityVersion,
+				RequestID:                   "project-resume-confirm-" + strings.TrimPrefix(*resumeReceiptID, "ppr_"),
+				ExpectedLifecycleGeneration: *expectedLifecycleGeneration, ResumeReceiptID: *resumeReceiptID,
+				AgentID: agent.ID, RunID: agent.RunID}
+			status, confirmErr := c.ConfirmProjectResume(ctx, *task, confirm)
+			if confirmErr != nil {
+				return fmt.Errorf("confirm resumed orchestrator session: %w", confirmErr)
+			}
+			if status.State != api.ProjectPauseActive {
+				return errors.New("resume confirmation did not clear the project admission barrier")
+			}
 		}
 	}
 	// The relay also adopts already-running sessions.

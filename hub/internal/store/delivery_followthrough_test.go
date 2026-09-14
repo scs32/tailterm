@@ -387,6 +387,67 @@ func TestFollowThroughHeartbeatAndReadDoNotPreventOverdueLease(t *testing.T) {
 	}
 }
 
+func TestProjectPauseBlocksNewFollowThroughAndAllowsLeaseInvalidation(t *testing.T) {
+	f := newDeliveryFixture(t)
+	ctx := context.Background()
+	now := time.Date(2026, 9, 14, 10, 0, 0, 0, time.UTC)
+	f.s.now = func() time.Time { return now }
+	d := enrolledDirective(t, f, "pause-followthrough")
+	now = now.Add(121 * time.Second)
+	check := followThroughCheck(f, d.Delivery, "pause-followthrough-lease", now, api.DeliveryObservationUnknown)
+	lease, err := f.s.CheckDeliveryFollowThrough(ctx, f.task.ID, d.Delivery.ID, check, f.by)
+	if err != nil || !lease.Execute || lease.Action != api.DeliveryFollowThroughActionQueue {
+		t.Fatalf("pre-pause lease: %+v err=%v", lease, err)
+	}
+	pause := api.PauseProjectRequest{Version: 1, RequestID: "pause-with-followthrough-lease", ExpectedLifecycleGeneration: 0,
+		Targets: []api.ProjectPauseTargetRequest{
+			{AgentID: f.lead.ID, RunID: f.lead.RunID, ServiceDisposition: api.PauseServiceNone},
+			{AgentID: f.worker.ID, RunID: f.worker.RunID, ServiceDisposition: api.PauseServiceNone},
+		}}
+	if _, err = f.s.PauseProject(ctx, f.task.ID, pause, f.by); err != nil {
+		t.Fatal(err)
+	}
+	check.RequestID = "pause-followthrough-blocked"
+	if _, err = f.s.CheckDeliveryFollowThrough(ctx, f.task.ID, d.Delivery.ID, check, f.by); !errors.Is(err, api.ErrConflict) {
+		t.Fatalf("paused follow-through check = %v", err)
+	}
+	report := api.DeliveryFollowThroughReportRequest{
+		RequestID: "pause-followthrough-invalidate", LeaseRequestID: "pause-followthrough-lease",
+		AgentID: f.worker.ID, RunID: f.worker.RunID, ExpectedGeneration: d.Delivery.Generation,
+		ExpectedEpoch: d.Delivery.ExecutionEpoch, Outcome: api.DeliveryFollowThroughOutcomeInvalidated,
+		Text: "project pause invalidated the saved exact-run wake lease",
+	}
+	invalidated, err := f.s.ReportDeliveryFollowThrough(ctx, f.task.ID, d.Delivery.ID, report, f.by)
+	if err != nil || invalidated.Event.Kind != "followthrough_queue_invalidated" {
+		t.Fatalf("paused lease invalidation: %+v err=%v", invalidated, err)
+	}
+	report.RequestID = "pause-followthrough-accepted"
+	report.Outcome = api.DeliveryFollowThroughOutcomeAccepted
+	if _, err = f.s.ReportDeliveryFollowThrough(ctx, f.task.ID, d.Delivery.ID, report, f.by); !errors.Is(err, api.ErrConflict) {
+		t.Fatalf("paused accepted follow-through report = %v", err)
+	}
+}
+
+func TestProjectPauseBlocksRequiredDeliveryCreation(t *testing.T) {
+	f := newDeliveryFixture(t)
+	ctx := context.Background()
+	message := contextLinkedMessage(t, f.s, f.task, f.item, "Directive saved before project pause", "pause-delivery-message", &api.MessageReference{TaskID: f.task.ID, Seq: f.order.Seq})
+	pause := api.PauseProjectRequest{Version: 1, RequestID: "pause-before-delivery-create", ExpectedLifecycleGeneration: 0,
+		Targets: []api.ProjectPauseTargetRequest{
+			{AgentID: f.lead.ID, RunID: f.lead.RunID, ServiceDisposition: api.PauseServiceNone},
+			{AgentID: f.worker.ID, RunID: f.worker.RunID, ServiceDisposition: api.PauseServiceNone},
+		}}
+	if _, err := f.s.PauseProject(ctx, f.task.ID, pause, f.by); err != nil {
+		t.Fatal(err)
+	}
+	request := api.CreateRequiredDeliveryRequest{RequestID: "delivery-create-while-paused", MessageSeq: message.Seq, Kind: api.DeliveryAssignment,
+		AgentID: f.worker.ID, RunID: f.worker.RunID, ItemTaskID: f.item.TaskID, ItemID: f.item.ID, ItemRevision: f.item.Revision,
+		WorkOrderMessage: api.MessageReference{TaskID: f.task.ID, Seq: f.order.Seq}}
+	if _, err := f.s.CreateRequiredDelivery(ctx, f.task.ID, request, f.by); !errors.Is(err, api.ErrConflict) {
+		t.Fatalf("required delivery created while paused = %v", err)
+	}
+}
+
 func TestFollowThroughUnreportedLeaseExpiresOnceAcrossRestart(t *testing.T) {
 	f := newDeliveryFixture(t)
 	ctx := context.Background()

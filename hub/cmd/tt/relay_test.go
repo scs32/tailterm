@@ -134,6 +134,44 @@ func TestRelayQueuesResumedRunAndRejectsStaleBinding(t *testing.T) {
 	}
 }
 
+func TestRelayDoesNotWakeAcrossProjectPauseBarrier(t *testing.T) {
+	b := runtimeBinding{Hub: "http://hub", Task: "tsk_0000000000000001", Agent: "agt_0000000000000001", Run: "run_0000000000000001", Thread: "00000000-0000-4000-8000-000000000001", Codex: "/usr/local/bin/codex"}
+	state := api.ProjectPauseCleanupPending
+	a := api.Agent{ID: b.Agent, RunID: b.Run, Status: api.AgentDone, Online: true, Unread: 1}
+	messages := []api.Message{{Seq: 22, To: b.Agent, From: api.Sender{}, Text: "Owner follow-up while project is paused"}}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/pause"):
+			json.NewEncoder(w).Encode(api.ProjectPauseStatus{Version: 1, TaskID: b.Task, State: state, LifecycleGeneration: 1, PauseGeneration: 1})
+		case strings.Contains(r.URL.Path, "/messages"):
+			json.NewEncoder(w).Encode(api.MessageList{Messages: messages})
+		default:
+			json.NewEncoder(w).Encode(a)
+		}
+	}))
+	defer server.Close()
+	b.Hub = server.URL
+	c, err := api.NewClient(server.URL, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	queued := 0
+	queue := func(context.Context, runtimeBinding, string) error { queued++; return nil }
+	progress := relayProgress{}
+	if err = relayOne(context.Background(), b, &progress, c, time.Now(), queue); err != nil || queued != 0 || progress.Through != 0 {
+		t.Fatalf("cleanup-pending project woke: queued=%d progress=%+v err=%v", queued, progress, err)
+	}
+	state = api.ProjectPausePaused
+	if err = relayOne(context.Background(), b, &progress, c, time.Now().Add(time.Minute), queue); err != nil || queued != 0 {
+		t.Fatalf("fully paused project woke: queued=%d err=%v", queued, err)
+	}
+	state = api.ProjectPauseActive
+	if err = relayOne(context.Background(), b, &progress, c, time.Now().Add(2*time.Minute), queue); err != nil || queued != 1 || progress.Through != 22 {
+		t.Fatalf("explicitly resumed project did not wake normally: queued=%d progress=%+v err=%v", queued, progress, err)
+	}
+}
+
 func TestWakeEligibility(t *testing.T) {
 	for _, tc := range []struct {
 		from, to string

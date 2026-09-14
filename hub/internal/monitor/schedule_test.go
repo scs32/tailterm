@@ -144,6 +144,20 @@ func TestTickSkipsNoWork(t *testing.T) {
 	}
 }
 
+func TestTickSkipsPersistedProjectPauseBarrier(t *testing.T) {
+	st, _, task, lead, e, _ := fixture(t)
+	pause := api.PauseProjectRequest{Version: 1, RequestID: "monitor-pause-gate", ExpectedLifecycleGeneration: 0,
+		Targets: []api.ProjectPauseTargetRequest{{AgentID: lead.ID, RunID: lead.RunID, ServiceDisposition: api.PauseServiceNone}}}
+	if _, err := st.PauseProject(context.Background(), task.ID, pause, api.Caller{Node: "fixture", User: "owner"}); err != nil {
+		t.Fatal(err)
+	}
+	var outcomes []Outcome
+	e.Tick(context.Background(), func(out Outcome) { outcomes = append(outcomes, out) })
+	if len(outcomes) != 0 {
+		t.Fatalf("paused project reached schedule evaluation: %+v", outcomes)
+	}
+}
+
 func TestDeliveryFailureIsRecordedWithoutLifecycleMutation(t *testing.T) {
 	st, _, task, lead, e, now := fixture(t)
 	if _, err := st.CloseTask(context.Background(), task.ID, api.Caller{Node: "fixture", User: "owner"}); err != nil {

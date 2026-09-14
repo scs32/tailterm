@@ -158,7 +158,7 @@ func (s *Store) CreateTask(ctx context.Context, req api.CreateTaskRequest, by ap
 	if req.Orchestrator != "" && !api.ValidName(req.Orchestrator) {
 		return api.Task{}, api.ErrInvalid
 	}
-	t := api.Task{Orchestrator: req.Orchestrator, Swarm: req.Swarm, MaxNewAgents: maxNewAgents, AllowAgentSpawn: req.AllowAgentSpawn, ID: api.NewID("tsk"), Name: req.Name, Goal: req.Goal, Status: api.TaskOpen, CreatedAt: s.now(), CreatedBy: by}
+	t := api.Task{PauseState: api.ProjectPauseActive, Orchestrator: req.Orchestrator, Swarm: req.Swarm, MaxNewAgents: maxNewAgents, AllowAgentSpawn: req.AllowAgentSpawn, ID: api.NewID("tsk"), Name: req.Name, Goal: req.Goal, Status: api.TaskOpen, CreatedAt: s.now(), CreatedBy: by}
 	_, err := s.db.ExecContext(ctx, `INSERT INTO tasks (id,name,goal,status,created_at,created_node,created_user,allow_agent_spawn,max_new_agents,swarm,orchestrator) VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
 		t.ID, t.Name, t.Goal, t.Status, ts(t.CreatedAt), by.Node, by.User, t.AllowAgentSpawn, t.MaxNewAgents, t.Swarm, t.Orchestrator)
 	if err != nil {
@@ -172,9 +172,9 @@ func (s *Store) CreateTask(ctx context.Context, req api.CreateTaskRequest, by ap
 
 func scanTask(row interface{ Scan(...any) error }) (api.Task, error) {
 	var t api.Task
-	var created string
+	var created, paused string
 	var closed sql.NullString
-	err := row.Scan(&t.ID, &t.Name, &t.Goal, &t.Status, &created, &t.CreatedBy.Node, &t.CreatedBy.User, &closed, &t.AllowAgentSpawn, &t.MaxNewAgents, &t.Swarm, &t.Orchestrator, &t.LeadRevision, &t.CleanupPending)
+	err := row.Scan(&t.ID, &t.Name, &t.Goal, &t.Status, &created, &t.CreatedBy.Node, &t.CreatedBy.User, &closed, &t.AllowAgentSpawn, &t.MaxNewAgents, &t.Swarm, &t.Orchestrator, &t.LeadRevision, &t.CleanupPending, &t.PauseState, &t.LifecycleGeneration, &t.PauseGeneration, &t.PauseCleanupPending, &t.PauseHandoffPending, &paused)
 	if err != nil {
 		return t, err
 	}
@@ -183,10 +183,19 @@ func scanTask(row interface{ Scan(...any) error }) (api.Task, error) {
 		c := parseTS(closed.String)
 		t.ClosedAt = &c
 	}
+	if paused != "" {
+		p := parseTS(paused)
+		t.PausedAt = &p
+	}
 	return t, nil
 }
 
-const taskCols = `id,name,goal,status,created_at,created_node,created_user,closed_at,allow_agent_spawn,max_new_agents,swarm,orchestrator,lead_revision,CASE WHEN status='closed' THEN (SELECT count(*) FROM agents WHERE task_id=tasks.id AND cleanup_done=0) ELSE 0 END`
+const taskCols = `tasks.id,tasks.name,tasks.goal,tasks.status,tasks.created_at,tasks.created_node,tasks.created_user,tasks.closed_at,tasks.allow_agent_spawn,tasks.max_new_agents,tasks.swarm,tasks.orchestrator,tasks.lead_revision,
+CASE WHEN tasks.status='closed' THEN (SELECT count(*) FROM agents WHERE task_id=tasks.id AND cleanup_done=0) ELSE 0 END,
+tasks.pause_state,tasks.lifecycle_generation,tasks.pause_generation,
+CASE WHEN tasks.pause_state<>'active' THEN (SELECT count(*) FROM project_pause_targets pt JOIN project_pause_cycles pc ON pc.id=pt.cycle_id JOIN agents pa ON pa.id=pt.agent_id AND pa.run_id=pt.run_id WHERE pc.task_id=tasks.id AND pc.pause_generation=tasks.pause_generation AND pa.cleanup_done=0) ELSE 0 END,
+CASE WHEN tasks.pause_state<>'active' THEN (SELECT count(*) FROM project_pause_targets pt JOIN project_pause_cycles pc ON pc.id=pt.cycle_id WHERE pc.task_id=tasks.id AND pc.pause_generation=tasks.pause_generation AND (pt.service_verified=0 OR pt.service_disposition='unresolved')) ELSE 0 END,
+tasks.paused_at`
 
 func (s *Store) GetTask(ctx context.Context, id string) (api.Task, error) {
 	t, err := scanTask(s.db.QueryRowContext(ctx, `SELECT `+taskCols+` FROM tasks WHERE id=?`, id))
@@ -245,6 +254,9 @@ func (s *Store) UpdateTask(ctx context.Context, id string, req api.UpdateTaskReq
 		}
 	}
 	if req.Orchestrator != nil {
+		if t.PauseState != api.ProjectPauseActive {
+			return t, fmt.Errorf("%w: project lead changes are blocked while the project is paused", api.ErrConflict)
+		}
 		if *req.Orchestrator != "" && !api.ValidName(*req.Orchestrator) {
 			return api.Task{}, api.ErrInvalid
 		}
@@ -356,6 +368,36 @@ func (s *Store) AddAgent(ctx context.Context, taskID string, req api.AddAgentReq
 	if t.Status != api.TaskOpen {
 		return api.Agent{}, api.ErrClosed
 	}
+	if t.PauseState == api.ProjectPauseActive && req.ResumeReceiptID != "" {
+		var plan pendingResumeAdmission
+		var admittedAt, state string
+		err = s.db.QueryRowContext(ctx, `SELECT id,resume_receipt_id,resume_agent_id,resume_run_id,resume_name,selected_team_id,resume_admitted_at,state FROM project_pause_cycles WHERE task_id=? AND pause_generation=? AND resume_receipt_id=?`, taskID, t.PauseGeneration, req.ResumeReceiptID).Scan(
+			&plan.CycleID, &plan.ReceiptID, &plan.AgentID, &plan.RunID, &plan.Name, &plan.SelectedTeam, &admittedAt, &state)
+		if err != nil || state != "resumed" || admittedAt == "" || req.AgentID != plan.AgentID || req.ExpectedRunID != plan.RunID || req.Name != plan.Name || req.ParentAgentID != "" || req.Role != "" || req.WorkItem != nil || req.ExpectedLifecycleGeneration != t.LifecycleGeneration {
+			return api.Agent{}, fmt.Errorf("%w: resume admission replay does not match the consumed exact lead run", api.ErrConflict)
+		}
+		existing, getErr := s.GetAgent(ctx, req.AgentID)
+		if getErr != nil || existing.TaskID != taskID || existing.RunID != req.ExpectedRunID || existing.Name != req.Name {
+			return api.Agent{}, fmt.Errorf("%w: resumed orchestrator run is not the saved exact admission", api.ErrConflict)
+		}
+		return existing, nil
+	}
+	var resumeAdmission *pendingResumeAdmission
+	if t.PauseState == api.ProjectPauseResuming {
+		plan, planErr := loadPendingResumeAdmission(ctx, s.db, taskID, t.PauseGeneration)
+		if planErr != nil {
+			return api.Agent{}, planErr
+		}
+		if req.ResumeReceiptID == "" || req.ResumeReceiptID != plan.ReceiptID || req.AgentID != plan.AgentID || req.ExpectedRunID != plan.RunID || req.Name != plan.Name || req.ParentAgentID != "" || req.Role != "" || req.WorkItem != nil {
+			return api.Agent{}, fmt.Errorf("%w: only the exact planned fresh orchestrator may enter a resuming project", api.ErrConflict)
+		}
+		resumeAdmission = &plan
+	} else if t.PauseState != api.ProjectPauseActive {
+		return api.Agent{}, fmt.Errorf("%w: project is paused", api.ErrConflict)
+	}
+	if t.LifecycleGeneration != req.ExpectedLifecycleGeneration {
+		return api.Agent{}, fmt.Errorf("%w: project lifecycle generation changed; refresh before admission", api.ErrConflict)
+	}
 	if req.Role != "" && req.Role != api.AgentRoleDatabaseHandler {
 		return api.Agent{}, api.ErrInvalid
 	}
@@ -368,7 +410,7 @@ func (s *Store) AddAgent(ctx context.Context, taskID string, req api.AddAgentReq
 	if req.Role == api.AgentRoleDatabaseHandler && !api.ValidID(req.AgentID, "agt") {
 		return api.Agent{}, api.ErrInvalid
 	}
-	if req.ExpectedRunID != "" && (req.Role != api.AgentRoleDatabaseHandler || !api.ValidID(req.AgentID, "agt") || !validRunID(req.ExpectedRunID)) {
+	if req.ExpectedRunID != "" && ((resumeAdmission == nil && req.Role != api.AgentRoleDatabaseHandler) || !api.ValidID(req.AgentID, "agt") || !validRunID(req.ExpectedRunID)) {
 		return api.Agent{}, api.ErrInvalid
 	}
 	if req.ParentAgentID != "" {
@@ -558,7 +600,9 @@ AND NOT EXISTS (SELECT 1 FROM agent_work_item_bindings b WHERE b.agent_id=a.id)`
 	}
 	freshParentedItemBound := req.WorkItem != nil && req.ParentAgentID != "" && req.WorkItem.ReplacesAgentID == ""
 	var intent *api.AllocationIntent
-	if freshParentedItemBound {
+	if resumeAdmission != nil {
+		a.RunID = resumeAdmission.RunID
+	} else if freshParentedItemBound {
 		// Independent review #2300/#2771/#2840/#2916 finding 5: a fresh
 		// parented member OR extra admission must be authorized by a
 		// durable, handler/lead-authored allocation intent recorded BEFORE
@@ -578,7 +622,7 @@ AND NOT EXISTS (SELECT 1 FROM agent_work_item_bindings b WHERE b.agent_id=a.id)`
 		if ierr != nil {
 			return a, ierr
 		}
-		if loaded == nil || loaded.ConsumedAt != nil {
+		if loaded == nil || loaded.ConsumedAt != nil || loaded.InvalidatedAt != nil {
 			return a, fmt.Errorf("%w: no unconsumed allocation intent recorded for this agent identity", api.ErrConflict)
 		}
 		if loaded.TargetTaskID == "" || loaded.ContextDigest == "" || loaded.AuthorAgentID == "" || loaded.AuthorRunID == "" || loaded.ExpectedRunID == "" ||
@@ -775,6 +819,9 @@ func (s *Store) UpdateAgent(ctx context.Context, id string, req api.UpdateAgentR
 		if task.Status != api.TaskOpen {
 			return a, api.ErrClosed
 		}
+		if task.PauseState != api.ProjectPauseActive && *req.Status != api.AgentClosed && *req.Status != api.AgentExited {
+			return a, fmt.Errorf("%w: agent lifecycle reactivation is blocked while the project is paused", api.ErrConflict)
+		}
 		switch *req.Status {
 		case api.AgentRunning, api.AgentDone, api.AgentNeedsInput, api.AgentClosed, api.AgentExited, api.AgentRetired:
 		default:
@@ -947,7 +994,7 @@ func (s *Store) insertMessageWithResume(ctx context.Context, tx *sql.Tx, task ap
 	// A direct human message is an explicit request to continue an existing
 	// retired run. The heartbeat-derived Online flag prevents recreating or
 	// waking stale sessions; agent-authored and unaddressed messages do not resume.
-	if allowResume && req.AgentID == "" && req.To != "" && target.Status == api.AgentRetired && target.Online {
+	if allowResume && task.PauseState == api.ProjectPauseActive && req.AgentID == "" && req.To != "" && target.Status == api.AgentRetired && target.Online {
 		now := s.now()
 		result, err := tx.ExecContext(ctx, `UPDATE agents SET status=?,last_event_at=?,blocked_reason='',blocked_text='' WHERE id=? AND task_id=? AND status=?`,
 			api.AgentDone, ts(now), target.ID, taskID, api.AgentRetired)

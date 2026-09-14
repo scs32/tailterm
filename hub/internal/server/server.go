@@ -40,6 +40,11 @@ func New(st *store.Store, identity Identity) *Server {
 	m.HandleFunc("PATCH /v1/tasks/{id}", s.updateTask)
 	m.HandleFunc("POST /v1/tasks/{id}/lead", s.assignLead)
 	m.HandleFunc("DELETE /v1/tasks/{id}", s.closeTask)
+	m.HandleFunc("GET /v1/tasks/{id}/pause", s.getProjectPause)
+	m.HandleFunc("POST /v1/tasks/{id}/pause", s.pauseProject)
+	m.HandleFunc("POST /v1/tasks/{id}/pause/handoff", s.resolvePauseHandoff)
+	m.HandleFunc("POST /v1/tasks/{id}/resume", s.resumeProject)
+	m.HandleFunc("POST /v1/tasks/{id}/resume/confirm", s.confirmProjectResume)
 	m.HandleFunc("POST /v1/tasks/{id}/agents", s.addAgent)
 	m.HandleFunc("POST /v1/tasks/{id}/allocation-intents", s.createAllocationIntent)
 	m.HandleFunc("GET /v1/tasks/{id}/allocation-intents/{agentId}", s.getAllocationIntent)
@@ -323,6 +328,106 @@ func (s *Server) closeTask(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, 200, t)
+}
+
+func (s *Server) getProjectPause(w http.ResponseWriter, r *http.Request) {
+	if _, ok := s.caller(w, r); !ok {
+		return
+	}
+	id, ok := taskID(w, r)
+	if !ok {
+		return
+	}
+	status, err := s.store.ProjectPauseStatus(r.Context(), id)
+	if err != nil {
+		fail(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, status)
+}
+
+func (s *Server) pauseProject(w http.ResponseWriter, r *http.Request) {
+	caller, ok := s.writer(w, r)
+	if !ok {
+		return
+	}
+	id, ok := taskID(w, r)
+	if !ok {
+		return
+	}
+	var req api.PauseProjectRequest
+	if !decode(w, r, &req) {
+		return
+	}
+	status, err := s.store.PauseProject(r.Context(), id, req, caller)
+	if err != nil {
+		fail(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, status)
+}
+
+func (s *Server) resolvePauseHandoff(w http.ResponseWriter, r *http.Request) {
+	caller, ok := s.writer(w, r)
+	if !ok {
+		return
+	}
+	id, ok := taskID(w, r)
+	if !ok {
+		return
+	}
+	var req api.ResolvePauseHandoffRequest
+	if !decode(w, r, &req) {
+		return
+	}
+	status, err := s.store.ResolvePauseHandoff(r.Context(), id, req, caller)
+	if err != nil {
+		fail(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, status)
+}
+
+func (s *Server) resumeProject(w http.ResponseWriter, r *http.Request) {
+	caller, ok := s.writer(w, r)
+	if !ok {
+		return
+	}
+	id, ok := taskID(w, r)
+	if !ok {
+		return
+	}
+	var req api.ResumeProjectRequest
+	if !decode(w, r, &req) {
+		return
+	}
+	status, err := s.store.ResumeProject(r.Context(), id, req, caller)
+	if err != nil {
+		fail(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, status)
+}
+
+func (s *Server) confirmProjectResume(w http.ResponseWriter, r *http.Request) {
+	caller, ok := s.writer(w, r)
+	if !ok {
+		return
+	}
+	id, ok := taskID(w, r)
+	if !ok {
+		return
+	}
+	var req api.ConfirmProjectResumeRequest
+	if !decode(w, r, &req) {
+		return
+	}
+	status, err := s.store.ConfirmProjectResume(r.Context(), id, req, caller)
+	if err != nil {
+		fail(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, status)
 }
 
 func (s *Server) addAgent(w http.ResponseWriter, r *http.Request) {

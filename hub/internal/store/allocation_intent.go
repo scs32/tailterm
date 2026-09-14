@@ -74,6 +74,16 @@ func (s *Store) CreateAllocationIntent(ctx context.Context, taskID string, req a
 			return *existing, nil
 		}
 	}
+	t, err := s.GetTask(ctx, taskID)
+	if err != nil {
+		return api.AllocationIntent{}, err
+	}
+	if t.Status != api.TaskOpen {
+		return api.AllocationIntent{}, api.ErrClosed
+	}
+	if t.PauseState != api.ProjectPauseActive {
+		return api.AllocationIntent{}, workItemConflict("project is paused; allocation intent authoring is blocked")
+	}
 	item, err := getWorkItem(s.db, ctx, req.ItemTaskID, req.ItemID)
 	if err != nil {
 		return api.AllocationIntent{}, err
@@ -98,10 +108,6 @@ func (s *Store) CreateAllocationIntent(ctx context.Context, taskID string, req a
 		if errors.Is(err, sql.ErrNoRows) {
 			return api.AllocationIntent{}, fmt.Errorf("%w: unknown author agent identity", api.ErrInvalid)
 		}
-		return api.AllocationIntent{}, err
-	}
-	t, err := s.GetTask(ctx, taskID)
-	if err != nil {
 		return api.AllocationIntent{}, err
 	}
 	authorized := authorRole == api.AgentRoleDatabaseHandler || (t.Orchestrator != "" && strings.EqualFold(authorName, t.Orchestrator))
@@ -168,16 +174,16 @@ VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'','','','')`,
 	}, nil
 }
 
-const allocationIntentCols = `agent_id,item_task_id,item_id,item_revision,work_order_task_id,work_order_message_seq,team_role,target_task_id,context_digest,author_agent_id,author_run_id,expected_run_id,expected_launcher_agent_id,expected_launcher_run_id,request_id,created_by_node,created_by_user,created_at,consumed_at,consumed_by_run_id,launcher_agent_id,launcher_run_id`
+const allocationIntentCols = `agent_id,item_task_id,item_id,item_revision,work_order_task_id,work_order_message_seq,team_role,target_task_id,context_digest,author_agent_id,author_run_id,expected_run_id,expected_launcher_agent_id,expected_launcher_run_id,request_id,created_by_node,created_by_user,created_at,consumed_at,consumed_by_run_id,launcher_agent_id,launcher_run_id,invalidated_at,invalidated_pause_generation`
 
 func scanAllocationIntent(row interface{ Scan(...any) error }) (*api.AllocationIntent, error) {
 	var in api.AllocationIntent
-	var created, consumed string
+	var created, consumed, invalidated string
 	err := row.Scan(
 		&in.AgentID, &in.ItemTaskID, &in.ItemID, &in.ItemRevision, &in.WorkOrderMessage.TaskID, &in.WorkOrderMessage.Seq,
 		&in.TeamRole, &in.TargetTaskID, &in.ContextDigest, &in.AuthorAgentID, &in.AuthorRunID, &in.ExpectedRunID,
 		&in.ExpectedLauncherAgentID, &in.ExpectedLauncherRunID, &in.RequestID,
-		&in.CreatedBy.Node, &in.CreatedBy.User, &created, &consumed, &in.ConsumedByRunID, &in.LauncherAgentID, &in.LauncherRunID,
+		&in.CreatedBy.Node, &in.CreatedBy.User, &created, &consumed, &in.ConsumedByRunID, &in.LauncherAgentID, &in.LauncherRunID, &invalidated, &in.InvalidatedPauseGeneration,
 	)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
@@ -189,6 +195,10 @@ func scanAllocationIntent(row interface{ Scan(...any) error }) (*api.AllocationI
 	if consumed != "" {
 		c := parseTS(consumed)
 		in.ConsumedAt = &c
+	}
+	if invalidated != "" {
+		value := parseTS(invalidated)
+		in.InvalidatedAt = &value
 	}
 	return &in, nil
 }

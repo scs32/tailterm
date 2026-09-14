@@ -346,6 +346,15 @@ func (s *Store) createQueueNotificationGeneration(ctx context.Context, tx *sql.T
 	n := api.QueueNotification{ID: api.NewID("qnt"), EventSeq: event.Seq, EntryID: event.EntryID, Cycle: event.Cycle,
 		Kind: api.QueueNoticeChanged, CausalAuthor: causal, RecipientAgentID: recipientAgentID,
 		RecipientRunID: recipientRunID, RecipientGeneration: generation, Status: "pending", CreatedAt: now}
+	var pauseState string
+	if err := tx.QueryRowContext(ctx, `SELECT pause_state FROM tasks WHERE id=?`, entry.TargetTaskID).Scan(&pauseState); err != nil {
+		return nil, err
+	}
+	if pauseState != api.ProjectPauseActive {
+		n.Status, n.UnavailableReason = "unavailable", "project is paused; notification delivery is blocked"
+		existingMessageSeq = 0
+		recipientAgentID = ""
+	}
 	if existingMessageSeq > 0 {
 		result, updateErr := tx.ExecContext(ctx, `UPDATE messages SET from_agent='',from_run_id='',from_node='system',from_user='queue',system_notice_kind=?,system_notice_id=? WHERE task_id=? AND seq=? AND to_agent=?`, api.QueueNoticeChanged, n.ID, entry.TargetTaskID, existingMessageSeq, n.RecipientAgentID)
 		if updateErr != nil {
@@ -359,7 +368,7 @@ func (s *Store) createQueueNotificationGeneration(ctx context.Context, tx *sql.T
 			return nil, errors.New("queue notice provenance message missing")
 		}
 		n.MessageSeq, n.Status = existingMessageSeq, "stored"
-	} else {
+	} else if n.Status == "pending" {
 		var recipient api.Agent
 		var err error
 		if n.RecipientAgentID != "" {
@@ -691,16 +700,23 @@ func (s *Store) QueueAction(ctx context.Context, targetTaskID, entryID string, r
 	if targetTask.Status != api.TaskOpen {
 		return api.QueueActionResult{}, api.ErrClosed
 	}
+	schedulingOperation := req.Operation == "adopt" || req.Operation == "claim" || req.Operation == "start" || req.Operation == "transfer" || req.Operation == "reconcile_recipient" || req.Operation == "requeue"
+	if schedulingOperation && targetTask.PauseState != api.ProjectPauseActive {
+		return api.QueueActionResult{}, workItemConflict("target project is paused; Queue scheduling is blocked")
+	}
 	item, err := getWorkItem(tx, ctx, entry.SourceTaskID, entry.ItemID)
 	if err != nil {
 		return api.QueueActionResult{}, err
 	}
-	var sourceTaskStatus string
-	if err = tx.QueryRowContext(ctx, `SELECT status FROM tasks WHERE id=?`, entry.SourceTaskID).Scan(&sourceTaskStatus); err != nil {
+	var sourceTaskStatus, sourcePauseState string
+	if err = tx.QueryRowContext(ctx, `SELECT status,pause_state FROM tasks WHERE id=?`, entry.SourceTaskID).Scan(&sourceTaskStatus, &sourcePauseState); err != nil {
 		return api.QueueActionResult{}, err
 	}
 	if sourceTaskStatus != api.TaskOpen && req.Operation != "reconcile_recipient" {
 		return api.QueueActionResult{}, api.ErrClosed
+	}
+	if schedulingOperation && sourcePauseState != api.ProjectPauseActive {
+		return api.QueueActionResult{}, workItemConflict("source project is paused; Queue scheduling is blocked")
 	}
 	now := s.now()
 	kind, reason := req.Operation, req.Reason

@@ -206,12 +206,30 @@ func isHTTPConflict(err error) bool {
 	return errors.As(err, &httpErr) && httpErr.Status == http.StatusConflict
 }
 
+func relayProjectActive(ctx context.Context, c *api.Client, b runtimeBinding) (bool, error) {
+	status, err := c.GetProjectPause(ctx, b.Task)
+	if httpErr, ok := err.(*api.HTTPError); ok && httpErr.Status == http.StatusNotFound {
+		// A pre-capability hub has no persisted pause barrier.
+		return true, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	// Empty is tolerated only for legacy/fake clients that predate the additive
+	// state field; a capable hub always returns one of the named states.
+	return status.State == "" || status.State == api.ProjectPauseActive, nil
+}
+
 func relayFollowThrough(ctx context.Context, b runtimeBinding, p *relayProgress, c *api.Client, now time.Time, queue func(context.Context, runtimeBinding, string) error) (bool, error) {
 	if !validBinding(b) {
 		return false, errors.New("invalid runtime binding")
 	}
 	if p.Run != b.Run || p.Thread != b.Thread {
 		*p = relayProgress{Run: b.Run, Thread: b.Thread}
+	}
+	active, err := relayProjectActive(ctx, c, b)
+	if err != nil || !active {
+		return false, err
 	}
 	if p.FollowThroughCheckedAt.IsZero() || now.Sub(p.FollowThroughCheckedAt) >= time.Minute {
 		caps, err := c.Capabilities(ctx)
@@ -285,11 +303,17 @@ func relayFollowThrough(ctx context.Context, b runtimeBinding, p *relayProgress,
 		reportText := "pre-dispatch exact lifecycle, phase, or lease revalidation failed; native queue was not called"
 		var queueErr error
 		if revalidated {
-			queueErr = queue(ctx, b, followThroughPrompt(b, d))
-			if queueErr == nil {
+			active, queueErr = relayProjectActive(ctx, c, b)
+			if queueErr == nil && !active {
+				revalidated = false
+				reportText = "project pause barrier became active before native queue; dispatch was invalidated"
+			} else if queueErr == nil {
+				queueErr = queue(ctx, b, followThroughPrompt(b, d))
+			}
+			if revalidated && queueErr == nil {
 				outcome = api.DeliveryFollowThroughOutcomeAccepted
 				reportText = "native Codex queue accepted the exact-thread prompt; directive consumption remains unconfirmed"
-			} else {
+			} else if revalidated {
 				outcome = api.DeliveryFollowThroughOutcomeAmbiguous
 				reportText = "native Codex queue returned an error; dispatch may or may not have occurred"
 			}
@@ -336,6 +360,10 @@ func relayOne(ctx context.Context, b runtimeBinding, p *relayProgress, c *api.Cl
 	if p.Run != b.Run || p.Thread != b.Thread {
 		*p = relayProgress{Run: b.Run, Thread: b.Thread}
 	}
+	active, err := relayProjectActive(ctx, c, b)
+	if err != nil || !active {
+		return err
+	}
 	a, err := c.GetAgent(ctx, b.Task, b.Agent)
 	if err != nil {
 		return err
@@ -364,6 +392,20 @@ func relayOne(ctx context.Context, b runtimeBinding, p *relayProgress, c *api.Cl
 	}
 	p.LastAttempt = now
 	p.Wakes++ // Bound attempts too, including ambiguous runtime failures.
+	active, err = relayProjectActive(ctx, c, b)
+	if err != nil {
+		return err
+	}
+	if !active {
+		return nil
+	}
+	a, err = c.GetAgent(ctx, b.Task, b.Agent)
+	if err != nil {
+		return err
+	}
+	if a.RunID != b.Run || a.Status == api.AgentClosed || a.Status == api.AgentExited || a.Status == api.AgentRetired || !a.Online {
+		return nil
+	}
 	if err := queue(ctx, b, wakePrompt(b, through)); err != nil {
 		return err
 	}

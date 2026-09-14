@@ -18,6 +18,10 @@ const (
 )
 
 type Capabilities struct {
+	ProjectPause struct {
+		Supported bool  `json:"supported"`
+		Versions  []int `json:"versions"`
+	} `json:"projectPause"`
 	OperationalRecords struct {
 		Supported bool  `json:"supported"`
 		Versions  []int `json:"versions"`
@@ -65,6 +69,8 @@ const AllocationIntentCapabilityVersion = 1
 func CurrentCapabilities() Capabilities {
 	var out Capabilities
 	out.SchemaVersion = 1
+	out.ProjectPause.Supported = true
+	out.ProjectPause.Versions = []int{ProjectPauseCapabilityVersion}
 	out.MessageAudit.Versions = []int{1, 2}
 	out.MessageAudit.MaxRelated = MaxMessageAuditRelated
 	out.AuditExport.Versions = []int{AuditExportLegacyVersion, AuditExportFormatVersion}

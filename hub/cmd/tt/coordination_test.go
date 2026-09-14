@@ -403,6 +403,8 @@ func TestGeneratedBriefingDescribesFullAllocationIntentTupleAndRecovery(t *testi
 		"--work-context-file F|--work-context-json J",
 		"--launcher-agent-id ID --launcher-run-id ID",
 		"--expected-run-id ID",
+		"--expected-lifecycle-generation N",
+		"--resume-receipt-id ID",
 		"freeze --expected-run-id when reusing",
 		"allocation-intent get --agent-id ID",
 	} {

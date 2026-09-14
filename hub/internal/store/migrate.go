@@ -19,6 +19,10 @@ func migrate(db *sql.DB) error {
 		{"tasks", "swarm", "INTEGER NOT NULL DEFAULT 0"},
 		{"tasks", "orchestrator", "TEXT NOT NULL DEFAULT ''"},
 		{"tasks", "lead_revision", "INTEGER NOT NULL DEFAULT 0"},
+		{"tasks", "pause_state", "TEXT NOT NULL DEFAULT 'active'"},
+		{"tasks", "lifecycle_generation", "INTEGER NOT NULL DEFAULT 0"},
+		{"tasks", "pause_generation", "INTEGER NOT NULL DEFAULT 0"},
+		{"tasks", "paused_at", "TEXT NOT NULL DEFAULT ''"},
 		{"messages", "broadcast", "INTEGER NOT NULL DEFAULT 0"},
 	} {
 		var n int
@@ -178,6 +182,76 @@ CREATE TABLE IF NOT EXISTS decision_answers (
 );`); err != nil {
 		return err
 	}
+	if _, err := db.Exec(`CREATE TABLE IF NOT EXISTS project_pause_cycles (
+  id TEXT PRIMARY KEY,
+  task_id TEXT NOT NULL REFERENCES tasks(id),
+  pause_generation INTEGER NOT NULL CHECK(pause_generation > 0),
+  lifecycle_generation INTEGER NOT NULL CHECK(lifecycle_generation > 0),
+  state TEXT NOT NULL,
+  retained_handoff_digest TEXT NOT NULL,
+  previous_team_id TEXT NOT NULL DEFAULT '',
+  previous_orchestrator TEXT NOT NULL DEFAULT '',
+  selected_team_id TEXT NOT NULL DEFAULT '',
+  resume_agent_id TEXT NOT NULL DEFAULT '',
+  resume_run_id TEXT NOT NULL DEFAULT '',
+  resume_name TEXT NOT NULL DEFAULT '',
+  resume_receipt_id TEXT NOT NULL DEFAULT '',
+  resume_admitted_at TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL,
+  resumed_at TEXT NOT NULL DEFAULT '',
+  UNIQUE(task_id,pause_generation)
+);
+CREATE TABLE IF NOT EXISTS project_pause_targets (
+  cycle_id TEXT NOT NULL REFERENCES project_pause_cycles(id),
+  agent_id TEXT NOT NULL REFERENCES agents(id),
+  run_id TEXT NOT NULL,
+  snapshot_json BLOB NOT NULL,
+  requested_service_disposition TEXT NOT NULL DEFAULT 'unresolved',
+  service_disposition TEXT NOT NULL,
+  handoff_note TEXT NOT NULL DEFAULT '',
+  service_verified INTEGER NOT NULL DEFAULT 0,
+  service_evidence_id TEXT NOT NULL DEFAULT '',
+  service_evidence_version INTEGER NOT NULL DEFAULT 0,
+  handoff_updated_at TEXT NOT NULL DEFAULT '',
+  PRIMARY KEY(cycle_id,agent_id,run_id)
+);
+CREATE INDEX IF NOT EXISTS project_pause_targets_agent_run ON project_pause_targets(agent_id,run_id);
+CREATE TABLE IF NOT EXISTS project_pause_receipts (
+  id TEXT PRIMARY KEY,
+  task_id TEXT NOT NULL REFERENCES tasks(id),
+  operation TEXT NOT NULL,
+  request_id TEXT NOT NULL,
+  payload_hash TEXT NOT NULL,
+  cycle_id TEXT NOT NULL REFERENCES project_pause_cycles(id),
+  created_at TEXT NOT NULL,
+  UNIQUE(task_id,operation,request_id)
+);`); err != nil {
+		return err
+	}
+	for _, c := range []struct{ table, name, definition string }{
+		{"project_pause_cycles", "previous_team_id", "TEXT NOT NULL DEFAULT ''"},
+		{"project_pause_cycles", "previous_orchestrator", "TEXT NOT NULL DEFAULT ''"},
+		{"project_pause_cycles", "selected_team_id", "TEXT NOT NULL DEFAULT ''"},
+		{"project_pause_cycles", "resume_agent_id", "TEXT NOT NULL DEFAULT ''"},
+		{"project_pause_cycles", "resume_run_id", "TEXT NOT NULL DEFAULT ''"},
+		{"project_pause_cycles", "resume_name", "TEXT NOT NULL DEFAULT ''"},
+		{"project_pause_cycles", "resume_receipt_id", "TEXT NOT NULL DEFAULT ''"},
+		{"project_pause_cycles", "resume_admitted_at", "TEXT NOT NULL DEFAULT ''"},
+		{"project_pause_targets", "requested_service_disposition", "TEXT NOT NULL DEFAULT 'unresolved'"},
+		{"project_pause_targets", "service_verified", "INTEGER NOT NULL DEFAULT 0"},
+		{"project_pause_targets", "service_evidence_id", "TEXT NOT NULL DEFAULT ''"},
+		{"project_pause_targets", "service_evidence_version", "INTEGER NOT NULL DEFAULT 0"},
+	} {
+		var n int
+		if err := db.QueryRow(`SELECT count(*) FROM pragma_table_info(?) WHERE name=?`, c.table, c.name).Scan(&n); err != nil {
+			return err
+		}
+		if n == 0 {
+			if _, err := db.Exec("ALTER TABLE " + c.table + " ADD COLUMN " + c.name + " " + c.definition); err != nil {
+				return err
+			}
+		}
+	}
 	for _, c := range []struct{ name, definition string }{
 		{"narrative_scope_revision", "INTEGER NOT NULL DEFAULT 0"},
 		{"completion_report_id", "TEXT NOT NULL DEFAULT ''"},
@@ -281,6 +355,8 @@ CREATE INDEX IF NOT EXISTS agent_allocation_intents_item ON agent_allocation_int
 		{"request_id", "TEXT NOT NULL DEFAULT ''"},
 		{"launcher_agent_id", "TEXT NOT NULL DEFAULT ''"},
 		{"launcher_run_id", "TEXT NOT NULL DEFAULT ''"},
+		{"invalidated_at", "TEXT NOT NULL DEFAULT ''"},
+		{"invalidated_pause_generation", "INTEGER NOT NULL DEFAULT 0"},
 	} {
 		var n int
 		if err := db.QueryRow(`SELECT count(*) FROM pragma_table_info('agent_allocation_intents') WHERE name=?`, c.name).Scan(&n); err != nil {
