@@ -5444,6 +5444,68 @@ body:is(
 #mode-view .tasks-detail .board-head .view-actions {
   min-height: 28px;
 }
+#mode-view .project-pause-state {
+  max-width: 78ch;
+}
+.pause-targets {
+  display: grid;
+  gap: 8px;
+  min-width: 0;
+  margin: 10px 0 0;
+  padding: 10px;
+  border: 1px solid var(--line);
+}
+.pause-targets legend {
+  padding: 0 5px;
+  color: var(--muted);
+  font-size: 10px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+.pause-target {
+  display: grid;
+  grid-template-columns: minmax(140px, 0.8fr) minmax(160px, 1fr) minmax(
+      180px,
+      1.2fr
+    );
+  gap: 8px;
+  align-items: end;
+  min-width: 0;
+  padding-top: 8px;
+  border-top: 1px solid var(--line);
+}
+.pause-target:first-of-type {
+  padding-top: 0;
+  border-top: 0;
+}
+.pause-target > div {
+  align-self: center;
+  min-width: 0;
+}
+.pause-target > div > * {
+  display: block;
+  overflow-wrap: anywhere;
+}
+.pause-target .pause-evidence,
+.pause-evidence {
+  display: grid;
+  grid-template-columns: minmax(160px, 1fr) 84px;
+  gap: 8px;
+  align-self: end;
+}
+.pause-target .pause-evidence[hidden],
+.pause-evidence[hidden] {
+  display: none;
+}
+@media (max-width: 760px) {
+  .pause-target {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .pause-target .pause-evidence,
+  .pause-evidence {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
 #mode-view .teams-detail .team-list {
   border-top: 0;
 }

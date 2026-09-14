@@ -76,6 +76,13 @@ export function createHubClient({ fetchImpl, baseURL, token = "" }) {
     updateTask: (id, body) =>
       request(`/v1/tasks/${id}`, { method: "PATCH", body }),
     closeTask: (id) => request(`/v1/tasks/${id}`, { method: "DELETE" }),
+    getTaskPause: (id) => request(`/v1/tasks/${id}/pause`),
+    pauseTask: (id, body) =>
+      request(`/v1/tasks/${id}/pause`, { method: "POST", body }),
+    resolvePauseHandoff: (id, body) =>
+      request(`/v1/tasks/${id}/pause/handoff`, { method: "POST", body }),
+    resumeTask: (id, body) =>
+      request(`/v1/tasks/${id}/resume`, { method: "POST", body }),
     listWorkItems: (params = {}) => request("/v1/work-items" + q(params)),
     getWorkItem: (task, id) => request(`/v1/tasks/${task}/work-items/${id}`),
     createWorkItem: (task, body) =>

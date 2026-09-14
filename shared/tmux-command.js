@@ -163,6 +163,8 @@ export function agentSpawnCommand({
   agentRole = "",
   agentId = "",
   expectedRunId = "",
+  expectedLifecycleGeneration = 0,
+  resumeReceiptId = "",
   plannedTeamMembers = 0,
   workItemTaskId = "",
   workItemId = "",
@@ -212,6 +214,20 @@ export function agentSpawnCommand({
     throw new Error("Invalid agent identity.");
   if (expectedRunId && !/^run_[0-9a-f]{16}$/.test(expectedRunId))
     throw new Error("Invalid run identity.");
+  if (
+    !Number.isSafeInteger(expectedLifecycleGeneration) ||
+    expectedLifecycleGeneration < 0
+  )
+    throw new Error("Invalid project lifecycle generation.");
+  if (resumeReceiptId && !/^ppr_[0-9a-f]{16}$/.test(resumeReceiptId))
+    throw new Error("Invalid project resume receipt.");
+  if (
+    resumeReceiptId &&
+    (!agentId || !expectedRunId || expectedLifecycleGeneration < 1)
+  )
+    throw new Error(
+      "A project resume receipt requires an exact agent, run and lifecycle generation.",
+    );
   if (
     plannedTeamMembers !== 0 &&
     (!Number.isInteger(plannedTeamMembers) ||
@@ -271,6 +287,12 @@ export function agentSpawnCommand({
   if (agentRole) args.push("--role", agentRole);
   if (agentId) args.push("--agent-id", agentId);
   if (expectedRunId) args.push("--expected-run-id", expectedRunId);
+  if (expectedLifecycleGeneration)
+    args.push(
+      "--expected-lifecycle-generation",
+      String(expectedLifecycleGeneration),
+    );
+  if (resumeReceiptId) args.push("--resume-receipt-id", resumeReceiptId);
   if (plannedTeamMembers)
     args.push("--planned-team-members", String(plannedTeamMembers));
   if (hasWorkItemRouting) {

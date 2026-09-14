@@ -138,11 +138,32 @@ test("agent launch forwards an explicit model as one argument and omits defaults
       launch({ plannedTeamMembers: 4 }).stdout,
       /--planned-team-members\n4\n/,
     );
+    assert.match(
+      launch({ expectedLifecycleGeneration: 7 }).stdout,
+      /--expected-lifecycle-generation\n7\n/,
+    );
+    const resume = launch({
+      agentId: "agt_1111111111111111",
+      expectedRunId: "run_1111111111111111",
+      expectedLifecycleGeneration: 7,
+      resumeReceiptId: "ppr_1111111111111111",
+    });
+    assert.match(resume.stdout, /--resume-receipt-id\nppr_1111111111111111\n/);
+    assert.throws(() =>
+      agentSpawnCommand({
+        ...fields,
+        resumeReceiptId: "ppr_1111111111111111",
+      }),
+    );
     assert.doesNotMatch(launch({}).stdout, /--model/);
     for (const model of ["--help", "$(id)", "a\nb", "two words"])
       assert.throws(() => agentSpawnCommand({ ...fields, model }));
     for (const plannedTeamMembers of [-1, 1.5, 33, "2"])
       assert.throws(() => agentSpawnCommand({ ...fields, plannedTeamMembers }));
+    for (const expectedLifecycleGeneration of [-1, 1.5, "2"])
+      assert.throws(() =>
+        agentSpawnCommand({ ...fields, expectedLifecycleGeneration }),
+      );
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

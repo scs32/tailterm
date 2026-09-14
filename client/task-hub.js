@@ -22,6 +22,14 @@ import { createHubClient, normalizeHubURL } from "./hub-client.js";
 import { createCachedHubClient } from "./cached-hub-client.js";
 import { normalizeTaskId, AGENT_NAME_RE } from "./task-ref.js";
 import {
+  assertPauseEvidence,
+  assertPauseSnapshot,
+  assertProjectLifecycle,
+  assertResumeEvidence,
+  assertResumeSnapshot,
+  supportsProjectPauseV1,
+} from "./project-pause.js";
+import {
   reconcileTask,
   taskBinding,
   taskRollup,
@@ -93,6 +101,7 @@ export function createTaskHub(host) {
     teamId = "",
     creation = undefined,
     lead = undefined,
+    resume = undefined,
   ) {
     const now = new Date().toISOString();
     for (const entry of plan) {
@@ -113,6 +122,7 @@ export function createTaskHub(host) {
       members: plan.map((entry) => ({ ...entry, state: "unstarted" })),
       ...(creation && { creation }),
       ...(lead && { lead }),
+      ...(resume && { resume }),
     });
     await guardedJournalEffect(journal, null, () =>
       host.api("/team-launch-plans/validate", "POST", journal),
@@ -556,6 +566,42 @@ export function createTaskHub(host) {
     tasksList = await client.listTasks();
     return tasksList;
   }
+  async function requireProjectPauseV1() {
+    const capabilities = await client.capabilities();
+    if (!supportsProjectPauseV1(capabilities))
+      throw new Error(
+        "Pause and Resume require projectPause capability version 1 on this hub.",
+      );
+    return capabilities.projectPause;
+  }
+  function previousTeamID(detail) {
+    const currentNames = detail.agents
+      .filter(
+        (agent) =>
+          agent.role !== "database_handler" &&
+          agent.runId &&
+          (!["closed", "exited"].includes(agent.status) || !agent.cleanupDone),
+      )
+      .map((agent) => agent.name.toLowerCase())
+      .sort();
+    const matches = (host.getData().teams || []).filter((saved) => {
+      try {
+        const team = resolveTeam(saved, host.getData().agentCatalog);
+        return (
+          team.orchestrator.toLowerCase() ===
+            detail.task.orchestrator?.toLowerCase() &&
+          team.members
+            .map((member) => member.name.toLowerCase())
+            .sort()
+            .every((name, index) => name === currentNames[index]) &&
+          team.members.length === currentNames.length
+        );
+      } catch {
+        return false;
+      }
+    });
+    return matches.length === 1 ? matches[0].id : "";
+  }
   function formatError(error) {
     return error?.message || String(error);
   }
@@ -904,6 +950,8 @@ export function createTaskHub(host) {
       agentRole: fields.agentRole,
       agentId: fields.agentId,
       expectedRunId: fields.expectedRunId,
+      expectedLifecycleGeneration: fields.expectedLifecycleGeneration,
+      resumeReceiptId: fields.resumeReceiptId,
       plannedTeamMembers: fields.plannedTeamMembers,
       workItemTaskId: fields.workItemTaskId,
       workItemId: fields.workItemId,
@@ -2562,6 +2610,601 @@ export function createTaskHub(host) {
     return list;
   }
 
+  async function pauseTask(taskId, changed = () => {}) {
+    if (!requireHub()) return;
+    try {
+      await requireProjectPauseV1();
+      const detail = await client.getTask(taskId);
+      assertProjectLifecycle(detail.task, "active");
+      const targets = detail.agents.filter(
+        (agent) =>
+          agent.runId &&
+          (!["closed", "exited"].includes(agent.status) || !agent.cleanupDone),
+      );
+      const requestId = "pause_" + crypto.randomUUID().replaceAll("-", "");
+      host.dialog(
+        `Pause project · ${detail.task.name}`,
+        `<form id="project-pause-form" data-testid="pause-project-confirmation"><p class="fine">Pause keeps this project, Board history, Bugs, Features, unfinished work and evidence. It dismisses every current exact-run team member, including the lead and database handler. The project cannot wake, schedule or admit agents until an explicit Resume.</p><p class="fine">Service handling is verified against saved exact-run ownership evidence. An unverified or unresolved handoff keeps the project in cleanup pending.</p><fieldset class="pause-targets"><legend>Exact team and service handoff</legend>${
+          targets.length
+            ? targets
+                .map(
+                  (agent) =>
+                    `<div class="pause-target" data-pause-target="${esc(agent.id)}"><div><strong>${esc(agent.name)}</strong><span class="fine">${esc(agent.role === "database_handler" ? "Database handler" : agent.name.toLowerCase() === detail.task.orchestrator?.toLowerCase() ? "Lead" : "Team member")} · ${esc(agent.runId)}</span></div><label>Service handling<select data-pause-disposition="${esc(agent.id)}" aria-label="Service handling for ${esc(agent.name)}" required><option value="">Choose…</option><option value="none">No service to preserve</option><option value="transferred">Transferred to another owner</option><option value="detached">Detached and reverified</option><option value="unresolved">Unresolved · keep pause pending</option></select></label><label>Handoff note<input data-pause-note="${esc(agent.id)}" maxlength="512" placeholder="Required unless no service exists"></label><div class="pause-evidence" data-pause-evidence-fields="${esc(agent.id)}" hidden><label>Operational record<input data-pause-evidence-id="${esc(agent.id)}" placeholder="opr_…" autocomplete="off" spellcheck="false"></label><label>Version<input data-pause-evidence-version="${esc(agent.id)}" type="number" min="1" step="1"></label></div></div>`,
+                )
+                .join("")
+            : '<p class="fine">No unsettled exact agent runs are attached to this project.</p>'
+        }</fieldset><p id="project-pause-status" class="fine" role="status" aria-live="polite"></p><div class="dialog-actions"><button type="submit" class="danger" data-testid="pause-project-confirm">Pause project</button></div></form>`,
+      );
+      const form = document.querySelector("#project-pause-form"),
+        button = form.querySelector('button[type="submit"]'),
+        status = form.querySelector("#project-pause-status");
+      let frozenRequest = null;
+      form.querySelectorAll("[data-pause-disposition]").forEach((select) => {
+        select.onchange = () => {
+          const fields = form.querySelector(
+            `[data-pause-evidence-fields="${select.dataset.pauseDisposition}"]`,
+          );
+          fields.hidden = !["transferred", "detached"].includes(select.value);
+        };
+      });
+      form.onsubmit = async (event) => {
+        event.preventDefault();
+        if (button.disabled) return;
+        status.textContent = "";
+        try {
+          if (!frozenRequest) {
+            const dispositions = targets.map((agent) => {
+              const serviceDisposition = form.querySelector(
+                `[data-pause-disposition="${agent.id}"]`,
+              )?.value;
+              const handoffNote = form
+                .querySelector(`[data-pause-note="${agent.id}"]`)
+                ?.value.trim();
+              if (!serviceDisposition)
+                throw new Error(
+                  `Choose service handling for ${agent.name} before pausing.`,
+                );
+              if (serviceDisposition !== "none" && !handoffNote)
+                throw new Error(
+                  `Add a handoff note for ${agent.name}, or choose No service to preserve.`,
+                );
+              const evidenceId = form
+                .querySelector(`[data-pause-evidence-id="${agent.id}"]`)
+                ?.value.trim();
+              const evidenceVersion = Number(
+                form.querySelector(
+                  `[data-pause-evidence-version="${agent.id}"]`,
+                )?.value,
+              );
+              if (
+                ["transferred", "detached"].includes(serviceDisposition) &&
+                (!/^opr_[a-f0-9]{16}$/.test(evidenceId || "") ||
+                  !Number.isSafeInteger(evidenceVersion) ||
+                  evidenceVersion < 1)
+              )
+                throw new Error(
+                  `Enter the committed operational record and version for ${agent.name}.`,
+                );
+              return {
+                agentId: agent.id,
+                runId: agent.runId,
+                serviceDisposition,
+                handoffNote: handoffNote || "",
+                ...(["transferred", "detached"].includes(
+                  serviceDisposition,
+                ) && {
+                  serviceEvidence: {
+                    id: evidenceId,
+                    version: evidenceVersion,
+                  },
+                }),
+              };
+            });
+            frozenRequest = {
+              version: 1,
+              requestId,
+              expectedLifecycleGeneration: detail.task.lifecycleGeneration,
+              ...(previousTeamID(detail) && {
+                previousTeamId: previousTeamID(detail),
+              }),
+              targets: dispositions,
+            };
+            form
+              .querySelectorAll("select,input")
+              .forEach((control) => (control.disabled = true));
+          }
+          button.disabled = true;
+          status.textContent =
+            "Saving the pause barrier and exact team snapshot…";
+          const result = assertPauseEvidence(
+            await client.pauseTask(taskId, frozenRequest),
+            frozenRequest.expectedLifecycleGeneration,
+          );
+          host.closeDialog();
+          let cleaned = { task: { ...detail.task, ...result }, errors: [] };
+          try {
+            cleaned = await cleanupPauseTask(taskId);
+          } catch (error) {
+            cleaned.errors = [formatError(error)];
+          }
+          host.notice(
+            cleaned.task.pauseState === "paused"
+              ? `Project ${detail.task.name} is paused. Project history and unfinished work are preserved.`
+              : `Project ${detail.task.name} pause saved · ${cleaned.task.pauseCleanupPending ?? result.cleanupPending} exact-run cleanup${(cleaned.task.pauseCleanupPending ?? result.cleanupPending) === 1 ? "" : "s"} pending.${cleaned.errors.length ? " " + cleaned.errors[0] : ""}`,
+          );
+          await changed();
+        } catch (error) {
+          status.textContent = formatError(error);
+          status.setAttribute("role", "alert");
+          if (frozenRequest) button.textContent = "Retry exact pause request";
+          button.disabled =
+            Number.isInteger(error?.status) &&
+            error.status >= 400 &&
+            error.status < 500;
+        }
+      };
+      form.querySelector("select, button")?.focus();
+    } catch (error) {
+      host.notice("Pause unavailable: " + formatError(error));
+    }
+  }
+
+  async function resolvePauseHandoff(taskId, changed = () => {}) {
+    if (!requireHub()) return;
+    try {
+      await requireProjectPauseV1();
+      const [detail, rawPause] = await Promise.all([
+        client.getTask(taskId),
+        client.getTaskPause(taskId),
+      ]);
+      if (detail.task.pauseState !== "cleanup_pending")
+        throw new Error("Project service handoff is not pending.");
+      const pause = assertPauseSnapshot(rawPause, detail.task);
+      const targets = pause.targets.filter(
+        (target) =>
+          !target.serviceVerified || target.serviceDisposition === "unresolved",
+      );
+      if (!targets.length)
+        throw new Error("No unresolved service handoff remains.");
+      host.dialog(
+        `Resolve service handoff · ${detail.task.name}`,
+        `<form id="project-pause-handoff-form" data-testid="pause-handoff-form"><p class="fine">A project becomes fully paused only after the hub verifies each exact run’s service handling. Transferred or detached services require a committed operational record from that same run; browser text alone is not evidence.</p><label>Exact run<select id="pause-handoff-target">${targets.map((target) => `<option value="${esc(target.agentId)}">${esc(target.name)} · ${esc(target.runId)}</option>`).join("")}</select></label><label>Resolution<select id="pause-handoff-disposition" required><option value="none">No service · exact cleanup confirmed</option><option value="transferred">Transferred to another owner</option><option value="detached">Detached and reverified</option></select></label><label>Handoff note<input id="pause-handoff-note" maxlength="512" placeholder="Exact committed result summary"></label><div id="pause-handoff-evidence" class="pause-evidence" hidden><label>Operational record<input id="pause-handoff-evidence-id" placeholder="opr_…" autocomplete="off" spellcheck="false"></label><label>Version<input id="pause-handoff-evidence-version" type="number" min="1" step="1"></label></div><p id="pause-handoff-status" class="fine" role="status" aria-live="polite"></p><div class="dialog-actions"><button type="submit" class="primary" data-testid="pause-handoff-save">Save verified handoff</button></div></form>`,
+      );
+      const form = document.querySelector("#project-pause-handoff-form"),
+        targetSelect = form.querySelector("#pause-handoff-target"),
+        disposition = form.querySelector("#pause-handoff-disposition"),
+        evidence = form.querySelector("#pause-handoff-evidence"),
+        button = form.querySelector('button[type="submit"]'),
+        status = form.querySelector("#pause-handoff-status");
+      const renderEvidence = () => {
+        evidence.hidden = !["transferred", "detached"].includes(
+          disposition.value,
+        );
+      };
+      disposition.onchange = renderEvidence;
+      renderEvidence();
+      let frozenRequest = null;
+      form.onsubmit = async (event) => {
+        event.preventDefault();
+        if (button.disabled) return;
+        status.textContent = "";
+        try {
+          if (!frozenRequest) {
+            const target = targets.find(
+              (candidate) => candidate.agentId === targetSelect.value,
+            );
+            if (!target)
+              throw new Error("Choose an exact pause target to resolve.");
+            const serviceDisposition = disposition.value;
+            const handoffNote = form
+              .querySelector("#pause-handoff-note")
+              .value.trim();
+            if (serviceDisposition === "none" && !target.cleanupDone)
+              throw new Error(
+                "Exact-run cleanup is not confirmed. Retry cleanup before recording no service.",
+              );
+            let serviceEvidence;
+            if (["transferred", "detached"].includes(serviceDisposition)) {
+              const id = form
+                .querySelector("#pause-handoff-evidence-id")
+                .value.trim();
+              const version = Number(
+                form.querySelector("#pause-handoff-evidence-version").value,
+              );
+              if (
+                !handoffNote ||
+                !/^opr_[a-f0-9]{16}$/.test(id) ||
+                !Number.isSafeInteger(version) ||
+                version < 1
+              )
+                throw new Error(
+                  "Enter the exact committed operational record, version and matching result summary.",
+                );
+              serviceEvidence = { id, version };
+            }
+            frozenRequest = {
+              version: 1,
+              requestId:
+                "pause_handoff_" + crypto.randomUUID().replaceAll("-", ""),
+              pauseGeneration: pause.pauseGeneration,
+              agentId: target.agentId,
+              runId: target.runId,
+              serviceDisposition,
+              handoffNote,
+              ...(serviceEvidence && { serviceEvidence }),
+            };
+            form
+              .querySelectorAll("select,input")
+              .forEach((control) => (control.disabled = true));
+          }
+          button.disabled = true;
+          status.textContent = "Verifying the exact-run service evidence…";
+          const result = assertPauseSnapshot(
+            await client.resolvePauseHandoff(taskId, frozenRequest),
+            detail.task,
+          );
+          if (
+            result.receipt?.operation !== "handoff" ||
+            result.receipt.requestId !== frozenRequest.requestId ||
+            !result.targets.some(
+              (target) =>
+                target.agentId === frozenRequest.agentId &&
+                target.runId === frozenRequest.runId &&
+                target.serviceVerified === true &&
+                target.serviceDisposition === frozenRequest.serviceDisposition,
+            )
+          )
+            throw new Error(
+              "The hub did not return a matching exact-run handoff receipt.",
+            );
+          host.closeDialog();
+          host.notice(
+            result.state === "paused"
+              ? `Project ${detail.task.name} is fully paused.`
+              : `Verified service handoff saved · ${result.handoffPending} remaining.`,
+          );
+          await changed();
+        } catch (error) {
+          status.textContent = formatError(error);
+          status.setAttribute("role", "alert");
+          if (frozenRequest) button.textContent = "Retry exact handoff request";
+          button.disabled =
+            Number.isInteger(error?.status) &&
+            error.status >= 400 &&
+            error.status < 500;
+        }
+      };
+      targetSelect.focus();
+    } catch (error) {
+      host.notice("Handoff unavailable: " + formatError(error));
+    }
+  }
+
+  async function resumeTask(taskId, changed = () => {}) {
+    if (!requireHub()) return;
+    try {
+      await requireProjectPauseV1();
+      const [detail, rawPause] = await Promise.all([
+        client.getTask(taskId),
+        client.getTaskPause(taskId),
+      ]);
+      const teams = host.getData().teams || [];
+      if (!teams.length)
+        throw new Error("Save a team before resuming this project.");
+      if (!["paused", "resuming", "active"].includes(detail.task.pauseState))
+        throw new Error("The project is not ready for Resume.");
+      if (detail.task.pauseState === "paused") {
+        assertProjectLifecycle(detail.task, "paused");
+        assertPauseSnapshot(rawPause, detail.task);
+      }
+      const mainServer = host.currentServer() || host.getServers()[0];
+      const priorTeam = rawPause.previousTeam?.teamId || "";
+      const suggested = teams.some((team) => team.id === priorTeam)
+        ? priorTeam
+        : "";
+      host.dialog(
+        `Resume project · ${detail.task.name}`,
+        `<form id="project-resume-form" data-testid="resume-project-form"><p class="fine">Resume keeps the retained project handoff and prior run history, then starts fresh identities. The previous team is only a suggested default; choose any saved team before continuing.</p><label>Team<select id="resume-team" data-testid="resume-team">${teams.map((team) => `<option value="${esc(team.id)}" ${team.id === suggested ? "selected" : ""}>${esc(team.name)} · ${team.members.length} agents${team.id === suggested ? " · Previous team (suggested)" : ""}</option>`).join("")}</select></label><label id="resume-main-machine" hidden>Main machine<select id="resume-main-server">${serverOptions(mainServer?.id)}</select><span class="fine">Used by team members without an assigned machine.</span></label><div id="resume-project-folders"></div><p class="fine">A fresh database handler is included. Old identities stay closed and are never resurrected.</p><p id="project-resume-status" class="fine" role="status" aria-live="polite"></p><div class="dialog-actions"><button type="submit" class="primary" data-testid="resume-project-confirm">Resume with fresh team</button></div></form>`,
+      );
+      const form = document.querySelector("#project-resume-form"),
+        teamSelect = form.querySelector("#resume-team"),
+        mainSelect = form.querySelector("#resume-main-server"),
+        mainWrap = form.querySelector("#resume-main-machine"),
+        button = form.querySelector('button[type="submit"]'),
+        status = form.querySelector("#project-resume-status");
+      let team = null,
+        plan = null,
+        journal = null,
+        pause = rawPause;
+      const progress = new Set();
+      const projects = teamProjectFolders(
+        form.querySelector("#resume-project-folders"),
+        () => team,
+        () => mainSelect.value,
+      );
+      const persistResumeConfirmation = async (receiptId, generation) => {
+        const confirmed = structuredClone(journal);
+        confirmed.resume.state = "confirmed";
+        confirmed.resume.resumeReceiptId = receiptId;
+        confirmed.resume.confirmedLifecycleGeneration = generation;
+        for (const member of confirmed.members) {
+          member.fields.expectedLifecycleGeneration = generation;
+          if (member.fields.agentId === confirmed.resume.orchestratorAgentId)
+            member.fields.resumeReceiptId = receiptId;
+        }
+        await saveLaunchJournal(confirmed);
+        journal = confirmed;
+        plan = await restoreLaunchMembers(journal, host.getServers());
+      };
+      const selectTeam = () => {
+        try {
+          const saved = teams.find(
+            (candidate) => candidate.id === teamSelect.value,
+          );
+          if (!saved) throw new Error("Choose a saved team.");
+          team = resolveTeam(saved, host.getData().agentCatalog);
+          mainWrap.hidden = !team.members.some((member) => !member.serverId);
+          projects.render();
+          status.textContent =
+            team.id === suggested
+              ? "Previous team suggested. Confirm or choose a different saved team."
+              : "This team will launch with fresh identities.";
+          button.disabled = false;
+        } catch (error) {
+          team = null;
+          status.textContent = formatError(error);
+          button.disabled = true;
+        }
+      };
+      teamSelect.onchange = selectTeam;
+      mainSelect.onchange = projects.render;
+      selectTeam();
+      const scope = await launchScope();
+      const savedJournal = (host.getData().teamLaunchPlans || []).find(
+        (candidate) =>
+          candidate.kind === "resume-project" &&
+          candidate.taskId === taskId &&
+          candidate.scope === scope,
+      );
+      if (!savedJournal && detail.task.pauseState !== "paused") {
+        host.closeDialog();
+        throw new Error(
+          "The project has a resume admission but its encrypted launch plan is unavailable. Restore the original browser vault before continuing.",
+        );
+      }
+      if (savedJournal) {
+        journal = structuredClone(savedJournal);
+        await assertLaunchScope(journal);
+        const savedTeam = teams.find(
+          (candidate) => candidate.id === journal.teamId,
+        );
+        if (!savedTeam)
+          throw new Error(
+            "The saved resume team is unavailable. Restore it before continuing.",
+          );
+        team = resolveTeam(savedTeam, host.getData().agentCatalog);
+        teamSelect.value = team.id;
+        teamSelect.disabled = true;
+        mainSelect.disabled = true;
+        plan = await restoreLaunchMembers(journal, host.getServers());
+        pause = assertResumeSnapshot(rawPause, journal.resume, detail.task);
+        if (
+          journal.resume.state !== "confirmed" &&
+          ["resuming", "active"].includes(pause.state)
+        ) {
+          await persistResumeConfirmation(
+            pause.resumeAdmission.receiptId,
+            pause.lifecycleGeneration,
+          );
+        }
+        for (const member of journal.members)
+          if (member.state === "started") progress.add(member.fields.name);
+        projects.renderRetry(plan, journal);
+        status.textContent =
+          pause.state === "paused"
+            ? "Recovered the frozen resume request. Retry sends its exact request ID before any launch."
+            : pause.state === "resuming"
+              ? "Recovered the exact saved resume admission. The fresh orchestrator has not been admitted yet."
+              : "Recovered a partial fresh-team launch. Started identities stay fixed; only remaining members are retried.";
+        button.textContent =
+          journal.resume.state === "confirmed"
+            ? "Retry remaining agents"
+            : "Retry exact Resume";
+      }
+      const freeze = () => {
+        teamSelect.disabled = true;
+        mainSelect.disabled = true;
+        form
+          .querySelectorAll(
+            "#resume-project-folders input, #resume-project-folders button",
+          )
+          .forEach((control) => (control.disabled = true));
+      };
+      const confirmResume = async () => {
+        if (journal.resume.state === "confirmed") return;
+        journal.resume.state = "uncertain";
+        await saveLaunchJournal(journal);
+        let result;
+        try {
+          result = assertResumeEvidence(
+            await client.resumeTask(taskId, {
+              version: 1,
+              requestId: journal.resume.requestId,
+              expectedPauseGeneration: journal.resume.expectedPauseGeneration,
+              expectedLifecycleGeneration:
+                journal.resume.expectedLifecycleGeneration,
+              retainedHandoffDigest: journal.resume.retainedHandoffDigest,
+              selectedTeamId: journal.resume.selectedTeamId,
+              orchestrator: {
+                agentId: journal.resume.orchestratorAgentId,
+                runId: journal.resume.orchestratorRunId,
+                name: journal.resume.orchestratorName,
+              },
+            }),
+            journal.resume,
+          );
+        } catch (error) {
+          if (
+            Number.isInteger(error?.status) &&
+            error.status >= 400 &&
+            error.status < 500
+          ) {
+            await guardedJournalEffect(journal, null, () =>
+              host.api(`/team-launch-plans/${journal.id}`, "DELETE"),
+            );
+            journal = null;
+            await host.reloadData();
+            host.closeDialog();
+            await changed();
+            host.notice(
+              "Resume was rejected before admission. Refresh the retained project state before trying again.",
+            );
+          }
+          throw error;
+        }
+        await persistResumeConfirmation(
+          result.receipt.id,
+          result.lifecycleGeneration,
+        );
+      };
+      form.onsubmit = async (event) => {
+        event.preventDefault();
+        if (button.disabled) return;
+        button.disabled = true;
+        try {
+          if (plan && journal)
+            plan = await amendUnstartedFolders(
+              plan,
+              journal,
+              projects.readRetry(),
+            );
+          if (!plan) {
+            if (!team) throw new Error("Choose a saved team.");
+            plan = withDatabaseHandler(
+              teamLaunches(
+                teams.find((candidate) => candidate.id === team.id),
+                host.getServers(),
+                mainSelect.value,
+                projects.read(),
+                null,
+                host.getData().agentCatalog,
+              ),
+            );
+            const nextLifecycleGeneration = pause.lifecycleGeneration + 1;
+            for (const entry of plan)
+              entry.fields.expectedLifecycleGeneration =
+                nextLifecycleGeneration;
+            const orchestrator = plan.find(
+              (entry) => entry.fields.name === team.orchestrator,
+            );
+            if (!orchestrator || orchestrator.fields.agentRole)
+              throw new Error(
+                "The selected team does not contain its saved orchestrator.",
+              );
+            orchestrator.fields.agentId =
+              "agt_" + crypto.randomUUID().replaceAll("-", "").slice(0, 16);
+            orchestrator.fields.expectedRunId =
+              "run_" + crypto.randomUUID().replaceAll("-", "").slice(0, 16);
+            journal = await prepareLaunchJournal(
+              "resume-project",
+              taskId,
+              plan,
+              team.id,
+              undefined,
+              undefined,
+              {
+                state: "prepared",
+                requestId: "resume_" + crypto.randomUUID().replaceAll("-", ""),
+                expectedPauseGeneration: pause.pauseGeneration,
+                expectedLifecycleGeneration: pause.lifecycleGeneration,
+                retainedHandoffDigest: pause.retainedHandoffDigest,
+                selectedTeamId: team.id,
+                orchestratorAgentId: orchestrator.fields.agentId,
+                orchestratorRunId: orchestrator.fields.expectedRunId,
+                orchestratorName: orchestrator.fields.name,
+              },
+            );
+            await saveLaunchJournal(journal);
+            await host.reloadData();
+            freeze();
+          }
+          status.textContent =
+            journal.resume.state === "confirmed"
+              ? "Launching the remaining fresh identities…"
+              : "Saving the exact fresh orchestrator admission…";
+          await confirmResume();
+          await launchMembers(
+            taskId,
+            plan,
+            progress,
+            (text) => (status.textContent = text),
+            journal,
+          );
+          await host.reloadData();
+          sync();
+          host.closeDialog();
+          host.notice(
+            `Project ${detail.task.name} resumed with fresh team ${team.name}. Prior identities and history remain preserved.`,
+          );
+          await changed();
+        } catch (error) {
+          status.textContent = formatError(error);
+          status.setAttribute("role", "alert");
+          if (journal) {
+            freeze();
+            button.textContent =
+              journal.resume.state === "confirmed"
+                ? "Retry remaining agents"
+                : "Retry exact Resume";
+            if (
+              plan?.some((entry) =>
+                journal.members.some(
+                  (member) =>
+                    member.fields.agentId === entry.fields.agentId &&
+                    member.state === "unstarted",
+                ),
+              )
+            )
+              projects.renderRetry(plan, journal);
+          }
+        } finally {
+          button.disabled = false;
+        }
+      };
+      teamSelect.focus();
+    } catch (error) {
+      host.notice("Resume unavailable: " + formatError(error));
+    }
+  }
+
+  async function cleanupPauseTask(taskId) {
+    await requireProjectPauseV1();
+    const [detail, rawPause] = await Promise.all([
+      client.getTask(taskId),
+      client.getTaskPause(taskId),
+    ]);
+    if (!["cleanup_pending", "paused"].includes(detail.task.pauseState))
+      throw new Error("Project pause cleanup is not pending.");
+    const pause = assertPauseSnapshot(rawPause, detail.task);
+    const byID = new Map(detail.agents.map((agent) => [agent.id, agent]));
+    const pending = [];
+    for (const target of pause.targets) {
+      const agent = byID.get(target.agentId);
+      if (!agent || agent.runId !== target.runId)
+        throw new Error(
+          "A saved pause target no longer matches its exact run. No cleanup was attempted.",
+        );
+      if (!target.cleanupDone) pending.push(agent);
+    }
+    const errors = [];
+    if (pending.length) {
+      const cleanup = await cleanupAgents(taskId, pending);
+      errors.push(...cleanup.errors);
+    }
+    const updated = await client.getTask(taskId);
+    return { task: updated.task, errors };
+  }
+
   async function cleanupAgents(taskId, pending) {
     if (pending.some((a) => !matchServer(a.host, taskServers())))
       await resolveAgentHosts();
@@ -2626,6 +3269,10 @@ export function createTaskHub(host) {
 
   return {
     setupHandler,
+    pauseTask,
+    resolvePauseHandoff,
+    resumeTask,
+    cleanupPauseTask,
     closeTask,
     cleanupAgent,
     cleanupTask,
@@ -2659,6 +3306,10 @@ export function createTaskHub(host) {
     rollup,
     taskOfTab,
     bound: () => [...bound],
+    hasPendingResume: (taskId) =>
+      (host.getData().teamLaunchPlans || []).some(
+        (plan) => plan.kind === "resume-project" && plan.taskId === taskId,
+      ),
     configure,
     newTask,
     inspectTools,

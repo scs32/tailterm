@@ -389,6 +389,100 @@ test("launch guard rejects profile or endpoint changes across delayed effects", 
   await assert.rejects(result, /launch scope changed/);
 });
 
+test("resume launch journals preserve the exact lifecycle and fresh orchestrator", async () => {
+  const server = {
+    id: "resume-machine",
+    host: "resume.invalid",
+    port: 22,
+    username: "synthetic",
+    mode: "ssh",
+    credentialRevision: 1,
+  };
+  const stored = launchPlanForStorage({
+    id: "resume_launch",
+    kind: "resume-project",
+    scope: "b".repeat(64),
+    taskId: "tsk_0123456789abcdef",
+    teamId: "previous-team",
+    createdAt: new Date(0).toISOString(),
+    updatedAt: new Date(0).toISOString(),
+    resume: {
+      state: "prepared",
+      requestId: "resume_request_1",
+      expectedPauseGeneration: 3,
+      expectedLifecycleGeneration: 8,
+      retainedHandoffDigest: "c".repeat(64),
+      selectedTeamId: "previous-team",
+      orchestratorAgentId: "agt_1111111111111111",
+      orchestratorRunId: "run_1111111111111111",
+      orchestratorName: "fresh-lead",
+    },
+    members: [
+      {
+        server,
+        serverScope: await serverLaunchScope(server),
+        state: "unstarted",
+        fields: {
+          name: "fresh-lead",
+          agentId: "agt_1111111111111111",
+          expectedRunId: "run_1111111111111111",
+          run: "codex",
+          cwd: "/synthetic/resume",
+          expectedLifecycleGeneration: 9,
+        },
+      },
+      {
+        server,
+        serverScope: await serverLaunchScope(server),
+        state: "unstarted",
+        fields: {
+          name: "db-handler",
+          agentRole: "database_handler",
+          agentId: "agt_2222222222222222",
+          run: "codex",
+          cwd: "/synthetic/resume",
+          expectedLifecycleGeneration: 9,
+        },
+      },
+    ],
+  });
+  assert.equal(stored.kind, "resume-project");
+  assert.equal(stored.resume.expectedLifecycleGeneration, 8);
+  assert.equal(stored.resume.orchestratorAgentId, "agt_1111111111111111");
+  assert.equal(stored.resume.orchestratorRunId, "run_1111111111111111");
+  assert.equal(stored.members[0].fields.expectedLifecycleGeneration, 9);
+  assert.throws(
+    () =>
+      normalizeTeamLaunchPlans([
+        {
+          ...stored,
+          resume: { ...stored.resume, retainedHandoffDigest: "missing" },
+        },
+      ]),
+    /Invalid project resume retry state/,
+  );
+  assert.throws(
+    () =>
+      normalizeTeamLaunchPlans([
+        {
+          ...stored,
+          members: stored.members.map((member, index) =>
+            index
+              ? member
+              : {
+                  ...member,
+                  fields: {
+                    ...member.fields,
+                    expectedRunId: "run_3333333333333333",
+                  },
+                },
+          ),
+        },
+      ]),
+    /bind one exact fresh orchestrator/,
+  );
+});
+
 test("project creation journal and agent reconciliation preserve exact identities", async () => {
   const creation = {
     state: "uncertain",

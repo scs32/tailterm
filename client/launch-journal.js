@@ -23,6 +23,8 @@ const FIELD_KEYS = new Set([
   "agentRole",
   "agentId",
   "expectedRunId",
+  "expectedLifecycleGeneration",
+  "resumeReceiptId",
   "plannedTeamMembers",
   "workItemTaskId",
   "workItemId",
@@ -113,6 +115,52 @@ function normalizeCreation(value) {
   };
 }
 
+function normalizeResume(value) {
+  if (
+    !value ||
+    typeof value !== "object" ||
+    Array.isArray(value) ||
+    !["prepared", "uncertain", "confirmed"].includes(value.state) ||
+    !/^[A-Za-z0-9_-]{1,128}$/.test(value.requestId || "") ||
+    !Number.isSafeInteger(value.expectedPauseGeneration) ||
+    value.expectedPauseGeneration < 1 ||
+    !Number.isSafeInteger(value.expectedLifecycleGeneration) ||
+    value.expectedLifecycleGeneration < 1 ||
+    !/^[a-f0-9]{64}$/.test(value.retainedHandoffDigest || "") ||
+    !/^[A-Za-z0-9_-]{1,80}$/.test(value.selectedTeamId || "") ||
+    !/^agt_[a-f0-9]{16}$/.test(value.orchestratorAgentId || "") ||
+    !/^run_[a-f0-9]{16}$/.test(value.orchestratorRunId || "") ||
+    !/^[A-Za-z0-9_-]{1,64}$/.test(value.orchestratorName || "") ||
+    (value.resumeReceiptId !== undefined &&
+      !/^ppr_[a-f0-9]{16}$/.test(value.resumeReceiptId)) ||
+    (value.confirmedLifecycleGeneration !== undefined &&
+      (!Number.isSafeInteger(value.confirmedLifecycleGeneration) ||
+        value.confirmedLifecycleGeneration <=
+          value.expectedLifecycleGeneration)) ||
+    (value.state === "confirmed") !==
+      (value.resumeReceiptId !== undefined &&
+        value.confirmedLifecycleGeneration !== undefined)
+  )
+    throw new Error("Invalid project resume retry state.");
+  return {
+    state: value.state,
+    requestId: value.requestId,
+    expectedPauseGeneration: value.expectedPauseGeneration,
+    expectedLifecycleGeneration: value.expectedLifecycleGeneration,
+    retainedHandoffDigest: value.retainedHandoffDigest,
+    selectedTeamId: value.selectedTeamId,
+    orchestratorAgentId: value.orchestratorAgentId,
+    orchestratorRunId: value.orchestratorRunId,
+    orchestratorName: value.orchestratorName,
+    ...(value.resumeReceiptId !== undefined && {
+      resumeReceiptId: value.resumeReceiptId,
+    }),
+    ...(value.confirmedLifecycleGeneration !== undefined && {
+      confirmedLifecycleGeneration: value.confirmedLifecycleGeneration,
+    }),
+  };
+}
+
 export function normalizeTeamLaunchPlans(value) {
   if (value === undefined) return [];
   if (!Array.isArray(value) || value.length > MAX_TEAM_LAUNCH_PLANS)
@@ -125,7 +173,9 @@ export function normalizeTeamLaunchPlans(value) {
       !raw ||
       typeof raw !== "object" ||
       !/^[A-Za-z0-9_-]{1,128}$/.test(raw.id || "") ||
-      !["new-project", "add-team", "replace-lead"].includes(raw.kind) ||
+      !["new-project", "add-team", "replace-lead", "resume-project"].includes(
+        raw.kind,
+      ) ||
       typeof raw.scope !== "string" ||
       !/^[a-f0-9]{64}$/.test(raw.scope) ||
       typeof raw.createdAt !== "string" ||
@@ -153,6 +203,13 @@ export function normalizeTeamLaunchPlans(value) {
         throw new Error("Project creation state does not match its task ID.");
     } else if (plan.creation !== undefined) {
       throw new Error("Only new-project retries can contain creation state.");
+    }
+    if (plan.kind === "resume-project") {
+      if (!plan.taskId || !plan.teamId)
+        throw new Error("A resume retry plan needs a project and team.");
+      plan.resume = normalizeResume(plan.resume);
+    } else if (plan.resume !== undefined) {
+      throw new Error("Only resume-project retries can contain resume state.");
     }
     if (plan.kind === "replace-lead") {
       const lead = plan.lead;
@@ -189,6 +246,10 @@ export function normalizeTeamLaunchPlans(value) {
         Object.keys(member.fields).some((key) => !FIELD_KEYS.has(key)) ||
         !/^[A-Za-z0-9_-]{1,64}$/.test(member.fields.name || "") ||
         !/^agt_[a-f0-9]{16}$/.test(member.fields.agentId || "") ||
+        (member.fields.expectedRunId !== undefined &&
+          !/^run_[a-f0-9]{16}$/.test(member.fields.expectedRunId)) ||
+        (member.fields.resumeReceiptId !== undefined &&
+          !/^ppr_[a-f0-9]{16}$/.test(member.fields.resumeReceiptId)) ||
         typeof member.fields.run !== "string" ||
         !member.fields.run ||
         member.fields.run.length > 1024 ||
@@ -200,6 +261,9 @@ export function normalizeTeamLaunchPlans(value) {
         (member.fields.agentDefinitionRevision !== undefined &&
           (!Number.isSafeInteger(member.fields.agentDefinitionRevision) ||
             member.fields.agentDefinitionRevision < 1)) ||
+        (member.fields.expectedLifecycleGeneration !== undefined &&
+          (!Number.isSafeInteger(member.fields.expectedLifecycleGeneration) ||
+            member.fields.expectedLifecycleGeneration < 1)) ||
         (member.fields.workItemId &&
           (!/^tsk_[a-f0-9]{16}$/.test(member.fields.workItemTaskId || "") ||
             !/^wi_[a-f0-9]{16}$/.test(member.fields.workItemId) ||
@@ -215,6 +279,36 @@ export function normalizeTeamLaunchPlans(value) {
             member.agent.id !== member.fields.agentId))
       )
         throw new Error("Invalid team launch retry member.");
+    }
+    if (plan.kind === "resume-project") {
+      const orchestrators = plan.members.filter(
+        (member) =>
+          member.fields.agentId === plan.resume.orchestratorAgentId &&
+          member.fields.name === plan.resume.orchestratorName &&
+          member.fields.expectedRunId === plan.resume.orchestratorRunId &&
+          !member.fields.agentRole,
+      );
+      const handlers = plan.members.filter(
+        (member) => member.fields.agentRole === "database_handler",
+      );
+      const confirmed = plan.resume.state === "confirmed";
+      if (
+        orchestrators.length !== 1 ||
+        handlers.length !== 1 ||
+        plan.members.some(
+          (member) =>
+            member.fields.expectedLifecycleGeneration !==
+              plan.resume.expectedLifecycleGeneration + 1 ||
+            (member === orchestrators[0]
+              ? confirmed
+                ? member.fields.resumeReceiptId !== plan.resume.resumeReceiptId
+                : member.fields.resumeReceiptId !== undefined
+              : member.fields.resumeReceiptId !== undefined),
+        )
+      )
+        throw new Error(
+          "A project resume retry plan must bind one exact fresh orchestrator and database handler.",
+        );
     }
     if (bytes(plan) > MAX_TEAM_LAUNCH_PLAN_BYTES)
       throw new Error("A team launch retry plan exceeds 1.25 MiB.");
