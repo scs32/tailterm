@@ -297,6 +297,34 @@ function legacyPermission(member) {
   return result;
 }
 
+function migrateUnsupportedAppReasoning(agentCatalog) {
+  if (
+    !agentCatalog ||
+    typeof agentCatalog !== "object" ||
+    Array.isArray(agentCatalog) ||
+    !Array.isArray(agentCatalog.definitions)
+  )
+    return agentCatalog;
+  let changed = false;
+  const definitions = agentCatalog.definitions.map((definition) => {
+    if (
+      !definition ||
+      typeof definition !== "object" ||
+      Array.isArray(definition) ||
+      definition.runtime === "codex" ||
+      typeof definition.reasoning !== "string" ||
+      !definition.reasoning.trim()
+    )
+      return definition;
+    // Older saved Teams allowed an explicit setting for apps that do not
+    // support it. It can never be launched, so preserve the definition while
+    // migrating that one setting back to the only valid value: Inherit.
+    changed = true;
+    return { ...definition, reasoning: "" };
+  });
+  return changed ? { ...agentCatalog, definitions } : agentCatalog;
+}
+
 export function migrateAgentData(raw) {
   if (!raw || typeof raw !== "object" || Array.isArray(raw))
     throw new Error("Invalid vault contents.");
@@ -306,7 +334,9 @@ export function migrateAgentData(raw) {
   ) {
     if (raw.teamsVersion !== TEAMS_SCHEMA_VERSION)
       throw new Error("Unsupported Teams schema version.");
-    const agentCatalog = normalizeAgentCatalog(raw.agentCatalog);
+    const agentCatalog = normalizeAgentCatalog(
+      migrateUnsupportedAppReasoning(raw.agentCatalog),
+    );
     if (!Array.isArray(raw.teams) || raw.teams.length > MAX_TEAMS)
       throw new Error(`At most ${MAX_TEAMS} teams.`);
     const ids = new Set();

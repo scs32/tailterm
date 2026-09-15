@@ -630,6 +630,12 @@ export async function localAPI(url, method = "GET", body = {}) {
         const opened = await openVault(envelope, body.password);
         const migrated = migrateAgentData(opened.data);
         const restored = { ...opened.data, ...migrated };
+        const agentDataChanged =
+          JSON.stringify({
+            agentCatalog: opened.data.agentCatalog,
+            teamsVersion: opened.data.teamsVersion,
+            teams: opened.data.teams,
+          }) !== JSON.stringify(migrated);
         validateData(restored);
         if (
           opened.data.profile?.username &&
@@ -639,7 +645,7 @@ export async function localAPI(url, method = "GET", body = {}) {
           throw new Error(
             "This browser has a different local profile. Use its username or Forget this device first.",
           );
-        if (stored.version === 1)
+        if (stored.version === 1 || agentDataChanged)
           await writeV2(
             await sealVault(restored, opened.key, opened.salt),
             envelope,

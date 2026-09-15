@@ -72,6 +72,26 @@ test("raw catalog migration is lossless, separate per legacy member, atomic and 
   assert.equal(resolved[1].run, "codex --search");
   assert.match(resolved[1].prompt, /context/);
   assert.deepEqual(migrateAgentData(first), first);
+  const unsupportedReasoning = structuredClone(first);
+  unsupportedReasoning.agentCatalog.definitions[0] = {
+    ...unsupportedReasoning.agentCatalog.definitions[0],
+    runtime: "claude",
+    run: "claude",
+    reasoning: "high",
+    approvalMode: "",
+    sandboxMode: "",
+  };
+  const repairedReasoning = migrateAgentData(unsupportedReasoning);
+  assert.equal(repairedReasoning.agentCatalog.definitions[0].reasoning, "");
+  assert.equal(
+    repairedReasoning.agentCatalog.definitions[0].runtime,
+    "claude",
+  );
+  assert.equal(repairedReasoning.agentCatalog.definitions[0].run, "claude");
+  assert.equal(
+    unsupportedReasoning.agentCatalog.definitions[0].reasoning,
+    "high",
+  );
   assert.deepEqual(
     migrateAgentData({
       teams: [],
