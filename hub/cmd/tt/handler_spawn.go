@@ -32,8 +32,12 @@ type handlerAttempt struct {
 	Session     *ownedSession `json:"session,omitempty"`
 }
 
-func handlerAttemptPath(hub, task string) string {
-	key := sha256.Sum256([]byte(hub + "\x00" + task + "\x00database_handler"))
+// Handler attempts are owned by an exact fresh handler identity. A project Pause
+// deliberately closes the old handler and Resume allocates a new one; a journal
+// from that closed predecessor must remain as evidence without blocking the new
+// handler's admission.
+func handlerAttemptPath(hub, task, agent string) string {
+	key := sha256.Sum256([]byte(hub + "\x00" + task + "\x00database_handler\x00" + agent))
 	return filepath.Join(relayDir(), fmt.Sprintf("handler-%x.json", key))
 }
 
@@ -126,7 +130,7 @@ func ensureHandler(ctx context.Context, c *api.Client, taskID string, req api.Ad
 		return empty, errors.New("invalid handler hub URL")
 	}
 	hub := strings.TrimRight(c.Base, "/")
-	path := handlerAttemptPath(hub, taskID)
+	path := handlerAttemptPath(hub, taskID, req.AgentID)
 	unlock, err := handlerLock(ctx, path)
 	if err != nil {
 		return empty, err

@@ -2,8 +2,10 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -101,7 +103,7 @@ func handlerTestTmux(t *testing.T, args ...string) {
 }
 func handlerJournal(t *testing.T, f *handlerFixture) handlerAttempt {
 	t.Helper()
-	data, err := os.ReadFile(handlerAttemptPath(f.c.Base, f.task))
+	data, err := os.ReadFile(handlerAttemptPath(f.c.Base, f.task, f.req.AgentID))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -151,7 +153,7 @@ func TestHandlerConcurrentRetryAndRenamedSession(t *testing.T) {
 		t.Fatal(a, err)
 	}
 	f.executions(t, 1)
-	path := handlerAttemptPath(f.c.Base, f.task)
+	path := handlerAttemptPath(f.c.Base, f.task, f.req.AgentID)
 	data, _ := os.ReadFile(path)
 	stat, _ := os.Stat(path)
 	if strings.Contains(string(data), "synthetic") || strings.Contains(string(data), "briefing") || stat.Mode().Perm() != 0600 {
@@ -201,6 +203,42 @@ func TestHandlerLostRegistrationResponseAndExplicitRestart(t *testing.T) {
 	f.executions(t, 2)
 }
 
+func TestHandlerFreshIdentityDoesNotReuseLegacyRoleJournal(t *testing.T) {
+	f := newHandlerFixture(t)
+	oldAgent := api.NewID("agt")
+	legacyKey := sha256.Sum256([]byte(f.c.Base + "\x00" + f.task + "\x00database_handler"))
+	legacyPath := filepath.Join(relayDir(), fmt.Sprintf("handler-%x.json", legacyKey))
+	legacy := handlerAttempt{
+		Version: 1,
+		Hub:     f.c.Base,
+		Task:    f.task,
+		Agent:   oldAgent,
+		Run:     api.NewID("run"),
+		Phase:   "created",
+	}
+	if err := saveHandlerAttempt(legacyPath, legacy); err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.ReadFile(legacyPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = f.launch(); err != nil {
+		t.Fatal(err)
+	}
+	f.executions(t, 1)
+	after, err := os.ReadFile(legacyPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(after) != string(before) {
+		t.Fatal("legacy predecessor journal was changed")
+	}
+	if _, err = os.Stat(handlerAttemptPath(f.c.Base, f.task, f.req.AgentID)); err != nil {
+		t.Fatal("fresh handler journal was not created", err)
+	}
+}
+
 func TestHandlerAmbiguousAttemptDoesNotReplay(t *testing.T) {
 	f := newHandlerFixture(t)
 	a, err := f.launch()
@@ -212,7 +250,7 @@ func TestHandlerAmbiguousAttemptDoesNotReplay(t *testing.T) {
 	j := handlerJournal(t, f)
 	j.Phase = "creating"
 	j.Session = nil
-	if err = saveHandlerAttempt(handlerAttemptPath(f.c.Base, f.task), j); err != nil {
+	if err = saveHandlerAttempt(handlerAttemptPath(f.c.Base, f.task, f.req.AgentID), j); err != nil {
 		t.Fatal(err)
 	}
 	if _, err = f.launch(); err == nil || !strings.Contains(err.Error(), "ambiguous") {
@@ -253,7 +291,7 @@ func TestHandlerRejectsReusedNameAndRun(t *testing.T) {
 
 func TestHandlerLockCancellationAndPayload(t *testing.T) {
 	t.Setenv("TAILTERM_RELAY_STATE", t.TempDir())
-	path := handlerAttemptPath("http://fixture.invalid", "tsk_0000000000000000")
+	path := handlerAttemptPath("http://fixture.invalid", "tsk_0000000000000000", "agt_0000000000000000")
 	unlock, err := handlerLock(context.Background(), path)
 	if err != nil {
 		t.Fatal(err)
