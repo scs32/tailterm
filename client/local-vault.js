@@ -8,6 +8,7 @@ import {
   normalizeReferencedTeam,
 } from "./agents.js";
 import {
+  migrateUnsupportedUnstartedLaunchReasoning,
   MAX_TEAM_LAUNCH_PLANS,
   normalizeTeamLaunchPlans,
 } from "./launch-journal.js";
@@ -629,13 +630,27 @@ export async function localAPI(url, method = "GET", body = {}) {
       if (envelope) {
         const opened = await openVault(envelope, body.password);
         const migrated = migrateAgentData(opened.data);
-        const restored = { ...opened.data, ...migrated };
+        const hasLaunchPlans = Object.hasOwn(opened.data, "teamLaunchPlans");
+        const launchPlans = hasLaunchPlans
+          ? migrateUnsupportedUnstartedLaunchReasoning(
+              opened.data.teamLaunchPlans,
+            )
+          : undefined;
+        const restored = {
+          ...opened.data,
+          ...migrated,
+          ...(hasLaunchPlans && { teamLaunchPlans: launchPlans }),
+        };
         const agentDataChanged =
           JSON.stringify({
             agentCatalog: opened.data.agentCatalog,
             teamsVersion: opened.data.teamsVersion,
             teams: opened.data.teams,
           }) !== JSON.stringify(migrated);
+        const launchPlansChanged =
+          hasLaunchPlans &&
+          JSON.stringify(opened.data.teamLaunchPlans) !==
+            JSON.stringify(launchPlans);
         validateData(restored);
         if (
           opened.data.profile?.username &&
@@ -645,7 +660,7 @@ export async function localAPI(url, method = "GET", body = {}) {
           throw new Error(
             "This browser has a different local profile. Use its username or Forget this device first.",
           );
-        if (stored.version === 1 || agentDataChanged)
+        if (stored.version === 1 || agentDataChanged || launchPlansChanged)
           await writeV2(
             await sealVault(restored, opened.key, opened.salt),
             envelope,

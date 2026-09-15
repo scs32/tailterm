@@ -10,6 +10,7 @@ import { teamLaunches } from "../client/teams.js";
 import {
   launchPlanForStorage,
   MAX_TEAM_LAUNCH_PLAN_BYTES,
+  migrateUnsupportedUnstartedLaunchReasoning,
   normalizeTeamLaunchPlans,
   restoreLaunchMembers,
   serverLaunchScope,
@@ -471,6 +472,34 @@ test("resume launch journals preserve the exact lifecycle and fresh orchestrator
   assert.equal(stored.resume.orchestratorAgentId, "agt_1111111111111111");
   assert.equal(stored.resume.orchestratorRunId, "run_1111111111111111");
   assert.equal(stored.members[0].fields.expectedLifecycleGeneration, 9);
+  const legacyReasoning = structuredClone(stored);
+  legacyReasoning.members.push({
+    ...legacyReasoning.members[1],
+    fields: {
+      ...legacyReasoning.members[1].fields,
+      name: "unstarted-claude",
+      agentId: "agt_3333333333333333",
+      agentRole: undefined,
+      runtime: "claude",
+      run: "claude",
+      reasoning: "high",
+    },
+  });
+  legacyReasoning.members[1].fields = {
+    ...legacyReasoning.members[1].fields,
+    runtime: "claude",
+    run: "claude",
+    reasoning: "high",
+  };
+  legacyReasoning.members[1].state = "uncertain";
+  const repairedLaunchReasoning =
+    migrateUnsupportedUnstartedLaunchReasoning([legacyReasoning])[0];
+  assert.equal(repairedLaunchReasoning.members[2].fields.reasoning, "");
+  assert.equal(repairedLaunchReasoning.members[1].fields.reasoning, "high");
+  assert.equal(
+    repairedLaunchReasoning.members[1].fields.agentId,
+    legacyReasoning.members[1].fields.agentId,
+  );
   assert.throws(
     () =>
       normalizeTeamLaunchPlans([
