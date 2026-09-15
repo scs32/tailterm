@@ -864,6 +864,9 @@ func cmdSpawn(e env, args []string) error {
 	if *runtime == "" {
 		*runtime = strings.Fields(*run)[0]
 	}
+	if err := requireNativeClaudeCommand(*run, *runtime); err != nil {
+		return err
+	}
 	if itemFlagCount > 0 && *runtime == "generic" {
 		return errors.New("item context restoration requires a supported agent runtime")
 	}
@@ -1003,7 +1006,14 @@ func cmdSpawn(e env, args []string) error {
 		briefing += "\nAssignment: " + *prompt
 	}
 	if *runtime != "generic" {
-		command = baseCommand + " " + spawn.ShellQuote(briefing)
+		if *role == api.AgentRoleDatabaseHandler {
+			command, err = freshRuntimeCommand(baseCommand, *runtime, *agentID, briefing)
+			if err != nil {
+				return err
+			}
+		} else {
+			command = baseCommand + " " + spawn.ShellQuote(briefing)
+		}
 	}
 	parent := e.agent
 	if *role == api.AgentRoleDatabaseHandler {
@@ -1062,11 +1072,17 @@ func cmdSpawn(e env, args []string) error {
 				return contextErr
 			}
 			briefing += contextBriefing
-			opts.Command = baseCommand + " " + spawn.ShellQuote(briefing)
 			opts.Env["TAILTERM_BRIEFING"] = briefing
 			opts.Env["TAILTERM_WORK_ITEM_TASK"] = agent.WorkItem.ItemTaskID
 			opts.Env["TAILTERM_WORK_ITEM"] = agent.WorkItem.ItemID
 			opts.Env["TAILTERM_WORK_ITEM_REVISION"] = fmt.Sprint(agent.WorkItem.ItemRevision)
+		}
+		if *runtime != "generic" {
+			opts.Command, err = freshRuntimeCommand(baseCommand, *runtime, agent.ID, briefing)
+			if err != nil {
+				_, _ = c.CloseAgent(ctx, *task, agent.ID, agent.RunID)
+				return err
+			}
 		}
 		// An uncertain exact Resume retry must reuse the session identity saved
 		// by the first admission instead of generating a second tmux session.
