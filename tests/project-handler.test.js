@@ -28,7 +28,7 @@ const stored = () => ({
   },
 });
 
-test("handler launches second with inherited settings and its own command/assignment", () => {
+test("handler launches second as a wake-capable Codex role with its own command/assignment", () => {
   const input = [
     ...plan(),
     { server: { id: "other" }, fields: { ...lead, name: "worker" } },
@@ -41,10 +41,16 @@ test("handler launches second with inherited settings and its own command/assign
   );
   const handler = result[1];
   assert.equal(handler.server, server);
-  for (const key of ["runtime", "model", "cwd", "permissionMode"])
-    assert.equal(handler.fields[key], lead[key]);
-  assert.equal(handler.fields.agentRole, "database_handler");
+  assert.equal(handler.fields.cwd, lead.cwd);
+  assert.equal(handler.fields.runtime, "codex");
   assert.equal(handler.fields.run, "codex");
+  assert.equal(handler.fields.model, "");
+  assert.equal(handler.fields.reasoning, "");
+  assert.equal(handler.fields.permissionMode, "");
+  assert.equal(handler.fields.approvalMode, "");
+  assert.equal(handler.fields.sandboxMode, "");
+  assert.deepEqual(handler.fields.allowedTools, []);
+  assert.equal(handler.fields.agentRole, "database_handler");
   assert.ok(!handler.fields.prompt.includes(lead.prompt));
   result[0].fields.allowedTools.push("mutated copy");
   handler.fields.allowedTools.push("mutated handler");
@@ -77,7 +83,7 @@ test("handler names avoid case-insensitive collisions and capacity includes hand
   );
 });
 
-test("generic commands stay explicit; compatible permission/tool selections are copied", () => {
+test("handler does not inherit generic or Claude launch settings", () => {
   const generic = {
     ...lead,
     runtime: "generic",
@@ -85,7 +91,9 @@ test("generic commands stay explicit; compatible permission/tool selections are 
     model: "",
     permissionMode: "",
   };
-  assert.equal(withDatabaseHandler(plan(generic))[1].fields.run, generic.run);
+  const genericHandler = withDatabaseHandler(plan(generic))[1].fields;
+  assert.equal(genericHandler.runtime, "codex");
+  assert.equal(genericHandler.run, "codex");
   const claude = {
     ...lead,
     runtime: "claude",
@@ -94,9 +102,11 @@ test("generic commands stay explicit; compatible permission/tool selections are 
     allowedTools: ["Bash(tt *)"],
   };
   const handler = withDatabaseHandler(plan(claude))[1].fields;
-  assert.equal(handler.run, "claude");
-  assert.deepEqual(handler.allowedTools, claude.allowedTools);
-  assert.notEqual(handler.allowedTools, claude.allowedTools);
+  assert.equal(handler.runtime, "codex");
+  assert.equal(handler.run, "codex");
+  assert.equal(handler.model, "");
+  assert.equal(handler.permissionMode, "");
+  assert.deepEqual(handler.allowedTools, []);
 });
 
 test("saved plans retain recovery identity, omit unknown/credential fields and preserve missing hosts", () => {

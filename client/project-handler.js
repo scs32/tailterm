@@ -4,7 +4,6 @@ import { AGENT_ID_RE, AGENT_NAME_RE, TASK_ID_RE } from "./task-ref.js";
 
 export const DATABASE_HANDLER_ROLE = "database_handler";
 export const MAX_HANDLER_PLANS = 200;
-const standardRuntimes = new Set(["codex", "claude", "gemini", "aider"]);
 const handlerPrompt =
   "You are this project's database handler, the sole agent owner of all work-item " +
   "database reads/writes (list/get/create/update/dispatch). All agent work must " +
@@ -199,9 +198,18 @@ export function withDatabaseHandler(plan) {
   const fields = spawnFields({
     ...first.fields,
     name,
-    run: standardRuntimes.has(first.fields.runtime)
-      ? first.fields.runtime
-      : first.fields.run,
+    // The handler must remain reachable after its initial intake. The host
+    // relay can resume exact Codex threads for directed inbox work, whereas a
+    // completed Claude session has no supported wake path. Do not inherit the
+    // first member's runtime or Claude-only controls here.
+    runtime: "codex",
+    run: "codex",
+    model: "",
+    reasoning: "",
+    permissionMode: "",
+    approvalMode: "",
+    sandboxMode: "",
+    allowedTools: [],
     prompt: handlerPrompt,
     agentId: undefined,
     expectedRunId: undefined,
