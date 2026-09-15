@@ -420,7 +420,12 @@ try {
         window.fixture.agents.splice(window.fixture.agents.indexOf(existing), 1);
         member.state = "uncertain";
         delete member.agent;
-        return { id: member.fields.agentId };
+        const worker = journal.members.find(
+          (candidate) => candidate.fields.name === "worker",
+        );
+        worker.state = "uncertain";
+        delete worker.agent;
+        return { id: member.fields.agentId, workerId: worker.fields.agentId };
       });
       await page.evaluate(() => {
         for (let index = 0; index < 33; index++)
@@ -468,6 +473,17 @@ try {
           .at(-1),
       );
       assert.match(workerCommand, /--planned-team-members[\s\S]*2/);
+      const workerCommands = await page.evaluate(
+        (workerID) =>
+          window.fixture.commands.filter((command) => command.includes(workerID)),
+        missingHandler.workerId,
+      );
+      assert.equal(workerCommands.length, 2);
+      assert.equal(
+        workerCommands[0],
+        workerCommands[1],
+        "missing worker retry changed its frozen command",
+      );
       const identities = await page.evaluate(() => ({
         old: window.fixture.agents.slice(0, 3).map((agent) => agent.id),
         fresh: window.fixture.agents

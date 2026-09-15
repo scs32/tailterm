@@ -1769,11 +1769,27 @@ export function createTaskHub(host) {
           fields.agentRole === "database_handler" &&
           journal.resume.state === "confirmed" &&
           detail.task.pauseState === "active";
-        if (!exact && !pendingResumeOrchestrator && !retryMissingResumeHandler)
+        // An exact preallocated worker that is still absent after a confirmed
+        // Resume can be retried with its frozen identity. Unlike a replacement,
+        // this neither invents an ID nor changes a command; the authoritative
+        // read proves that the prior local attempt did not admit the identity.
+        const retryMissingResumeMember =
+          journal.kind === "resume-project" &&
+          member.state === "uncertain" &&
+          !fields.agentRole &&
+          fields.agentId !== journal.resume.orchestratorAgentId &&
+          journal.resume.state === "confirmed" &&
+          detail.task.pauseState === "active";
+        if (
+          !exact &&
+          !pendingResumeOrchestrator &&
+          !retryMissingResumeHandler &&
+          !retryMissingResumeMember
+        )
           throw new Error(
             `The saved ${member.state} identity for ${fields.name} is not present. Reconcile the exact agent and run before continuing.`,
           );
-        if (retryMissingResumeHandler) {
+        if (retryMissingResumeHandler || retryMissingResumeMember) {
           member.state = "unstarted";
           reconciled = true;
         } else if (exact) {
@@ -1841,6 +1857,14 @@ export function createTaskHub(host) {
       report(
         `Starting ${fields.name} on ${server.name} (${i + 1}/${plan.length})…`,
       );
+      const launchFields =
+        fields.agentRole === "database_handler"
+          ? fields
+          : { ...fields, plannedTeamMembers };
+      // Do all local argument validation before recording an uncertain host
+      // attempt. Browser-side validation failures never reach tt and must not
+      // poison a later exact-identity retry.
+      agentSpawnCommand({ hub: client.base, task: taskId, ...launchFields });
       if (journalMember) {
         journalMember.state = "uncertain";
         await saveLaunchJournal(journal);
@@ -1851,9 +1875,7 @@ export function createTaskHub(host) {
           spawn(
             taskId,
             server,
-            fields.agentRole === "database_handler"
-              ? fields
-              : { ...fields, plannedTeamMembers },
+            launchFields,
           );
         agent = journal
           ? await guardedJournalEffect(journal, entry, effect)
