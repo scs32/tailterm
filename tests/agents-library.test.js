@@ -485,20 +485,14 @@ test("resume launch journals preserve the exact lifecycle and fresh orchestrator
       reasoning: "high",
     },
   });
-  legacyReasoning.members[1].fields = {
-    ...legacyReasoning.members[1].fields,
-    runtime: "claude",
-    run: "claude",
-    reasoning: "high",
-  };
-  legacyReasoning.members[1].state = "uncertain";
+  legacyReasoning.members[2].state = "uncertain";
   const repairedLaunchReasoning =
     migrateUnsupportedUnstartedLaunchReasoning([legacyReasoning])[0];
   assert.equal(repairedLaunchReasoning.members[2].fields.reasoning, "");
-  assert.equal(repairedLaunchReasoning.members[1].fields.reasoning, "high");
+  assert.equal(repairedLaunchReasoning.members[2].state, "unstarted");
   assert.equal(
-    repairedLaunchReasoning.members[1].fields.agentId,
-    legacyReasoning.members[1].fields.agentId,
+    repairedLaunchReasoning.members[2].fields.agentId,
+    legacyReasoning.members[2].fields.agentId,
   );
   assert.throws(
     () =>

@@ -320,17 +320,21 @@ export function normalizeTeamLaunchPlans(value) {
 }
 
 // A launch that has reached uncertain may have been admitted even if its
-// response was lost, so its frozen command must never be changed. Older
-// persisted journals could however contain an explicit reasoning setting for
-// an app that cannot accept one. Such an unstarted entry has not been sent to
-// the host and can safely be migrated to the app's only valid setting.
+// response was lost, so its frozen command must never be changed. The one
+// exception is a non-handler Resume member with unsupported app reasoning:
+// command construction rejects it in the browser before any host command can
+// be issued. Older persisted journals may retain that false-uncertain state.
 export function migrateUnsupportedUnstartedLaunchReasoning(value) {
   const plans = normalizeTeamLaunchPlans(value);
   let changed = false;
   const migrated = plans.map((plan) => {
     const members = plan.members.map((member) => {
+      const rejectedBeforeHost =
+        plan.kind === "resume-project" &&
+        member.state === "uncertain" &&
+        !member.fields.agentRole;
       if (
-        member.state !== "unstarted" ||
+        (member.state !== "unstarted" && !rejectedBeforeHost) ||
         member.fields.runtime === "codex" ||
         typeof member.fields.reasoning !== "string" ||
         !member.fields.reasoning.trim()
@@ -339,6 +343,7 @@ export function migrateUnsupportedUnstartedLaunchReasoning(value) {
       changed = true;
       return {
         ...member,
+        ...(rejectedBeforeHost && { state: "unstarted" }),
         fields: { ...member.fields, reasoning: "" },
       };
     });
