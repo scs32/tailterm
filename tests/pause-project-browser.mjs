@@ -422,6 +422,20 @@ try {
         delete member.agent;
         return { id: member.fields.agentId };
       });
+      await page.evaluate(() => {
+        for (let index = 0; index < 33; index++)
+          window.fixture.agents.push({
+            id: `agt_${(index + 100).toString(16).padStart(16, "0")}`,
+            runId: `run_${(index + 100).toString(16).padStart(16, "0")}`,
+            taskId: window.fixture.taskA.id,
+            name: `historical-${index}`,
+            runtime: "codex",
+            cwd: "/synthetic/a",
+            status: "closed",
+            online: false,
+            cleanupDone: true,
+          });
+      });
 
       await page.getByTestId("resume-project-confirm").click();
       await page.waitForFunction(
@@ -448,6 +462,12 @@ try {
         handlerCommands[1],
         "missing handler retry changed its frozen command",
       );
+      const workerCommand = await page.evaluate(() =>
+        window.fixture.commands
+          .filter((command) => command.includes("'worker'"))
+          .at(-1),
+      );
+      assert.match(workerCommand, /--planned-team-members[\s\S]*2/);
       const identities = await page.evaluate(() => ({
         old: window.fixture.agents.slice(0, 3).map((agent) => agent.id),
         fresh: window.fixture.agents

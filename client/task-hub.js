@@ -1734,7 +1734,11 @@ export function createTaskHub(host) {
       : await client.getTask(taskId);
     const plannedNames = new Set([
       ...detail.agents
-        .filter((agent) => agent.role !== "database_handler")
+        .filter(
+          (agent) =>
+            agent.role !== "database_handler" &&
+            !["closed", "exited"].includes(agent.status),
+        )
         .map((agent) => agent.name.toLowerCase()),
       ...plan
         .filter(({ fields }) => fields.agentRole !== "database_handler")
