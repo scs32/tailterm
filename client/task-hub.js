@@ -1754,11 +1754,25 @@ export function createTaskHub(host) {
           member.state === "uncertain" &&
           detail.task.pauseState === "resuming" &&
           fields.agentId === journal.resume.orchestratorAgentId;
-        if (!exact && !pendingResumeOrchestrator)
+        // A handler is launched after the fresh lead has admitted the Resume
+        // barrier. If its host command failed before registration, the exact
+        // identity is absent from the authoritative task read. Preserve that
+        // identity and retry its unchanged command; do not treat it as a
+        // started agent or invent a replacement identity.
+        const retryMissingResumeHandler =
+          journal.kind === "resume-project" &&
+          member.state === "uncertain" &&
+          fields.agentRole === "database_handler" &&
+          journal.resume.state === "confirmed" &&
+          detail.task.pauseState === "active";
+        if (!exact && !pendingResumeOrchestrator && !retryMissingResumeHandler)
           throw new Error(
             `The saved ${member.state} identity for ${fields.name} is not present. Reconcile the exact agent and run before continuing.`,
           );
-        if (exact) {
+        if (retryMissingResumeHandler) {
+          member.state = "unstarted";
+          reconciled = true;
+        } else if (exact) {
           const problem = journal
             ? await guardedJournalEffect(journal, entry, () =>
                 reconciledAgentProblem(taskId, entry, member, exact),
@@ -1774,6 +1788,7 @@ export function createTaskHub(host) {
         // /resume/confirm. Re-run that same frozen command while the barrier
         // remains resuming, even if AddAgent already saved the identity.
         if (pendingResumeOrchestrator) continue;
+        if (member.state === "unstarted") continue;
         if (member.state === "uncertain") {
           member.state = "started";
           member.agent = {

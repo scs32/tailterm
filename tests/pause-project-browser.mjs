@@ -408,6 +408,21 @@ try {
       );
       assert.doesNotMatch(spawnCommands[2], /--resume-receipt-id/);
 
+      const missingHandler = await page.evaluate(() => {
+        const journal = window.fixture.data.teamLaunchPlans[0];
+        const member = journal.members.find(
+          (candidate) =>
+            candidate.fields.agentRole === "database_handler",
+        );
+        const existing = window.fixture.agents.find(
+          (agent) => agent.id === member.fields.agentId,
+        );
+        window.fixture.agents.splice(window.fixture.agents.indexOf(existing), 1);
+        member.state = "uncertain";
+        delete member.agent;
+        return { id: member.fields.agentId };
+      });
+
       await page.getByTestId("resume-project-confirm").click();
       await page.waitForFunction(
         () => window.fixture.data.teamLaunchPlans.length === 0,
@@ -419,6 +434,19 @@ try {
               agent.taskId === window.fixture.taskA.id &&
               agent.status === "running",
           ).length === 3,
+      );
+      const handlerCommands = await page.evaluate(
+        (handlerID) =>
+          window.fixture.commands.filter((command) =>
+            command.includes(handlerID),
+          ),
+        missingHandler.id,
+      );
+      assert.equal(handlerCommands.length, 2);
+      assert.equal(
+        handlerCommands[0],
+        handlerCommands[1],
+        "missing handler retry changed its frozen command",
       );
       const identities = await page.evaluate(() => ({
         old: window.fixture.agents.slice(0, 3).map((agent) => agent.id),
