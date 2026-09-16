@@ -220,21 +220,28 @@ export function createWorkItemsView({
     `<article class="work-item" data-work-item="${esc(item.id)}"><div class="work-item-copy"><button class="work-item-title" data-item-edit="${esc(item.id)}">${esc(item.title)}</button><span class="fine">${esc(project(item.taskId)?.name || item.taskId)} · ${esc(statuses[item.status])} · ${esc(priorities[item.priority])}${item.lastDispatch ? ` · Sent to ${esc(project(item.lastDispatch.targetTaskId)?.name || item.lastDispatch.targetTaskId)}` : ""}</span></div><div class="work-item-actions">${kind === "feature" ? `<button data-item-narrative="${esc(item.id)}">History &amp; report</button>` : ""}<button data-item-history="${esc(item.id)}">History · ${item.revision}</button><button data-item-message="${esc(item.id)}" ${project(item.taskId)?.status !== "open" || !["open", "blocked", "in_progress"].includes(item.status) ? "disabled" : ""}>Message</button><button data-item-send="${esc(item.id)}" ${project(item.taskId)?.status === "closed" ? "disabled" : ""}>Send to project</button></div></article>`;
   function bindRows() {
     root.querySelectorAll("[data-item-message]").forEach((button) => {
+      // Refresh may replace items while a held gesture keeps this row visible.
+      // Freeze the rendered context; current data is only an eligibility guard.
+      const rendered = items.find(
+        (entry) => entry.id === button.dataset.itemMessage,
+      );
+      const context = rendered && {
+        id: rendered.id,
+        taskId: rendered.taskId,
+        revision: rendered.revision,
+        title: rendered.title,
+      };
       button.onclick = () => {
         const item = items.find(
-          (entry) => entry.id === button.dataset.itemMessage,
+          (entry) =>
+            entry.id === context?.id && entry.taskId === context.taskId,
         );
         if (
           item &&
           project(item.taskId)?.status === "open" &&
           ["open", "blocked", "in_progress"].includes(item.status)
         )
-          openBoard(item.taskId, {
-            id: item.id,
-            taskId: item.taskId,
-            revision: item.revision,
-            title: item.title,
-          });
+          openBoard(context.taskId, { ...context });
       };
     });
     root

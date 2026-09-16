@@ -81,14 +81,14 @@ const intentPersistence={
   async remove(scope,id){const key='intents:'+scope;const rows=JSON.parse(sessionStorage.getItem(key)||'[]');sessionStorage.setItem(key,JSON.stringify(rows.filter(row=>row.id!==id)))},
 };
 // Prove Board uses authoritative existing request reads rather than cached item methods.
-const boardClient={...client,listWorkItems:()=>{throw new Error('saved item list must not supply eligibility')},getWorkItem:()=>{throw new Error('saved item revision must not supply validation')}};
+let boardClient={...client,listWorkItems:()=>{throw new Error('saved item list must not supply eligibility')},getWorkItem:()=>{throw new Error('saved item revision must not supply validation')}};
 const board=createBoardView({client:()=>boardClient,getTabs:()=>[],activate:noop,notice,addAgent:noop,
   settings:noop,revealAgent:noop,attachTask:noop,newTask:noop,configure:noop,intentPersistence});
 board.mount(document.querySelector('#mode-view'));
 await board.show(task);
 const itemsRoot=document.querySelector('#mode-view');
 let itemView;
-window.qa={board, async showItems(kind,project){
+window.qa={board, replaceClient(){boardClient={...boardClient}}, reloadItems(){return itemView.show()}, async showItems(kind,project){
   board.hide(); itemView?.hide(); document.body.dataset.mode=kind==='bug'?'bugs':'features';
   itemView=createWorkItemsView({kind,client:()=>client,notice,dialog:noop,closeDialog:noop,configure:noop,
     openBoard:async(id,item)=>{itemView.hide();document.body.dataset.mode='board';await board.show(id,item)}});
@@ -304,7 +304,9 @@ try {
       }
       async function draftValue() {
         return page.evaluate(
-          () => qa.drafts().find((x) => x.id.startsWith("draft:"))?.values,
+          () =>
+            qa.drafts().find((x) => x.id === `draft:${qa.board.selected()}`)
+              ?.values,
         );
       }
       async function openItem(kind, item) {
@@ -315,7 +317,7 @@ try {
         await page.setViewportSize({ width: 390, height: 740 });
         await page.locator("#notice").evaluate((el) => (el.textContent = ""));
         await page.screenshot({
-          path: `/tmp/item-message-8108-${name}-${kind}-narrow.png`,
+          path: `/tmp/item-message-correction-${name}-${kind}-narrow.png`,
         });
         assert.equal(
           await page.evaluate(
@@ -345,6 +347,259 @@ try {
           item.id,
         );
       }
+      async function showBoard(project) {
+        if (await input.count()) await input.blur();
+        await page.evaluate((id) => qa.board.show(id), project.task.id);
+        await page.waitForFunction(
+          (name) =>
+            document.querySelector(".board-thread h2")?.textContent === name,
+          project.task.name,
+        );
+      }
+      // R2 correction8192/release8201: no old project UI may survive as a
+      // successful direct navigation after task/messages reads fail.
+      for (const sameTask of [false, true]) {
+        for (const failedRead of ["task", "messages"]) {
+          const target = sameTask ? fixture : other;
+          await showBoard(target);
+          await input.fill("Target unsent draft");
+          if (!sameTask) {
+            await showBoard(fixture);
+            await input.fill("A unsent draft");
+          }
+          const pattern = `**/v1/tasks/${target.task.id}${failedRead === "messages" ? "/messages?*" : ""}`;
+          await page.route(pattern, (route) =>
+            route.fulfill({
+              status: 503,
+              contentType: "application/json",
+              body: JSON.stringify({
+                error: "Synthetic direct load unavailable",
+              }),
+            }),
+          );
+          await page.evaluate(
+            (id) => qa.showItems("feature", id),
+            target.task.id,
+          );
+          await page
+            .locator(`[data-item-message="${target.primary.id}"]`)
+            .click();
+          await page.locator("#board-retry").waitFor();
+          assert.match(
+            await page.locator("#mode-view").textContent(),
+            /Hub unavailable/,
+          );
+          assert.equal(
+            await page
+              .locator(
+                "#board-compose, #board-messages, .board-item-compose, #board-to",
+              )
+              .count(),
+            0,
+          );
+          await page.unroute(pattern);
+          await page.locator("#board-retry").click();
+          await input.waitFor();
+          await page.waitForFunction(
+            (id) =>
+              document
+                .querySelector(".board-item-compose")
+                ?.textContent.includes(id),
+            target.primary.id,
+          );
+          assert.equal(
+            await page.locator(".board-thread h2").textContent(),
+            target.task.name,
+          );
+          assert.equal(await input.inputValue(), "Target unsent draft");
+          const recipients = await page
+            .locator("#board-to option")
+            .evaluateAll((nodes) => nodes.map((n) => n.value));
+          assert.ok(recipients.includes(target.agent.id));
+          if (!sameTask) assert.ok(!recipients.includes(fixture.agent.id));
+          assert.ok(await page.locator("#board-messages").textContent());
+          console.log(
+            JSON.stringify({
+              engine: name,
+              failedRead,
+              sameTask,
+              failureUI: true,
+              retryContext: target.primary.id,
+              draftRetained: true,
+            }),
+          );
+          if (!sameTask) {
+            await showBoard(fixture);
+            assert.equal(await input.inputValue(), "A unsent draft");
+          }
+        }
+      }
+      // A pending old navigation cannot apply context after a new epoch/client.
+      for (const replacement of ["epoch", "client"]) {
+        await showBoard(fixture);
+        await input.fill(`Retained ${replacement}`);
+        const pattern = `**/v1/tasks/${other.task.id}`;
+        let release, started;
+        const gate = new Promise((resolve) => (release = resolve));
+        const entered = new Promise((resolve) => (started = resolve));
+        await page.route(pattern, async (route) => {
+          started();
+          await gate;
+          await route.continue();
+        });
+        await page.evaluate(
+          ({ id, item }) => {
+            window.pendingNavigation = qa.board.show(id, item);
+          },
+          { id: other.task.id, item: other.primary },
+        );
+        await entered;
+        if (replacement === "client")
+          await page.evaluate(() => qa.replaceClient());
+        else await showBoard(fixture);
+        release();
+        await page.evaluate(() => window.pendingNavigation);
+        await page.unroute(pattern);
+        assert.equal(
+          await page.locator(".board-thread h2").textContent(),
+          fixture.task.name,
+        );
+        assert.equal(await input.inputValue(), `Retained ${replacement}`);
+        assert.ok(
+          !(await page.locator("#mode-view").textContent()).includes(
+            other.primary.id,
+          ),
+        );
+        console.log(
+          JSON.stringify({
+            engine: name,
+            replacement,
+            supersededContextIgnored: true,
+          }),
+        );
+        await showBoard(fixture);
+      }
+      // End R2's independent draft setup before the original compose matrix.
+      await page.evaluate(() => sessionStorage.clear());
+      await page.goto(`${origin}/?task=${fixture.task.id}`);
+      await input.waitFor();
+      // R1 correction8184/release8187: refresh behind a held row must not
+      // silently adopt its unseen revision or title (12 engine/kind/gesture cases).
+      for (const [kind, initial] of [
+        ["feature", active],
+        ["bug", bug],
+      ]) {
+        let current = initial;
+        for (const gesture of ["touch-hold", "pointer", "keyboard-space"]) {
+          await page.evaluate(({ kind, id }) => qa.showItems(kind, id), {
+            kind,
+            id: fixture.task.id,
+          });
+          const button = page.locator(`[data-item-message="${current.id}"]`);
+          await button.evaluate((el) => (window.visibleButton = el));
+          if (gesture === "touch-hold")
+            await page.locator(".work-items-main").dispatchEvent("touchstart");
+          if (gesture === "pointer") {
+            await button.hover();
+            await page.mouse.down();
+          }
+          if (gesture === "keyboard-space") {
+            await button.focus();
+            await page.keyboard.down("Space");
+          }
+          const displayed = current;
+          current = await update(current, {
+            title: `Refreshed ${kind} ${gesture}`,
+          });
+          await page.evaluate(() => qa.reloadItems());
+          assert.equal(
+            await button.evaluate((el) => el === window.visibleButton),
+            true,
+          );
+          assert.equal(
+            await page
+              .locator(`[data-item-history="${current.id}"]`)
+              .textContent(),
+            `History · ${displayed.revision}`,
+          );
+          assert.equal(
+            await page
+              .locator(`[data-item-edit="${current.id}"]`)
+              .textContent(),
+            displayed.title,
+          );
+          if (gesture === "touch-hold")
+            await button.evaluate((el) => el.click());
+          if (gesture === "pointer") await page.mouse.up();
+          if (gesture === "keyboard-space") await page.keyboard.up("Space");
+          await input.waitFor();
+          await page.waitForFunction(
+            (id) =>
+              document
+                .querySelector(".board-item-compose")
+                ?.textContent.includes(id),
+            current.id,
+          );
+          const selected = await draftValue();
+          assert.equal(selected.primaryRevision, String(displayed.revision));
+          assert.equal(selected.itemTitle, displayed.title);
+          assert.equal(selected.primaryTask, displayed.taskId);
+          assert.equal(selected.primaryItem, displayed.id);
+          const text = `Held ${kind} ${gesture}`;
+          await input.fill(text);
+          const beforeAttempt = attempts.length;
+          const beforeCount = (await messages(fixture)).length;
+          await send.click();
+          await idle();
+          assert.match(await page.locator("#notice").textContent(), /stale/);
+          assert.equal(attempts.length, beforeAttempt);
+          assert.equal((await messages(fixture)).length, beforeCount);
+          assert.equal(await input.inputValue(), text);
+          assert.equal(
+            (await draftValue()).primaryRevision,
+            String(displayed.revision),
+          );
+          console.log(
+            JSON.stringify({
+              engine: name,
+              kind,
+              gesture,
+              displayedRevision: displayed.revision,
+              loadedRevision: current.revision,
+              stalePosts: 0,
+            }),
+          );
+        }
+        // A held, formerly eligible action must also respect current status.
+        for (const status of kind === "bug"
+          ? ["done", "dismissed"]
+          : ["dismissed"]) {
+          await page.evaluate(({ kind, id }) => qa.showItems(kind, id), {
+            kind,
+            id: fixture.task.id,
+          });
+          const button = page.locator(`[data-item-message="${current.id}"]`);
+          assert.equal(await button.isEnabled(), true);
+          await page.locator(".work-items-main").dispatchEvent("touchstart");
+          current = await update(current, { status });
+          await page.evaluate(() => qa.reloadItems());
+          await button.evaluate((el) => el.click());
+          assert.equal(await page.locator(".work-items-view").count(), 1);
+          assert.equal(await input.count(), 0);
+          current = await update(current, {
+            status: kind === "bug" ? "blocked" : "in_progress",
+          });
+        }
+        if (kind === "feature") active = current;
+        else bug = current;
+      }
+      await page.evaluate(async (id) => {
+        await qa.showItems("feature", id);
+      }, fixture.task.id);
+      await page.locator(`[data-item-message="${active.id}"]`).click();
+      await input.waitFor();
+      // Start the existing empty-selection checks with an ordinary draft.
+      await selectAuditKind(page, "");
       await page.locator("#board-message-item-mode").click();
       const opts = await page
         .locator("#board-message-item option")
@@ -422,6 +677,29 @@ try {
         "blocked bug",
       );
       await idle();
+      await openItem("feature", active);
+      await input.fill("Direct current feature");
+      await send.click();
+      await waitFor(
+        async () =>
+          (await messages(fixture)).some(
+            (x) => x.text === "Direct current feature",
+          ),
+        "direct feature message",
+      );
+      await idle();
+      const directFeature = (await messages(fixture)).find(
+        (x) => x.text === "Direct current feature",
+      );
+      assert.deepEqual(directFeature.workItems, [
+        {
+          itemTaskId: active.taskId,
+          itemId: active.id,
+          itemRevision: active.revision,
+          relationship: "primary",
+        },
+      ]);
+      assert.equal(directFeature.workOrderMessage, undefined);
       await openItem("feature", active);
       await input.fill("Stale text retained");
       active = await update(active, { title: "Changed feature title" });
@@ -537,7 +815,7 @@ try {
       await page.setViewportSize({ width: 390, height: 740 });
       await page.locator("#notice").evaluate((el) => (el.textContent = ""));
       await page.screenshot({
-        path: `/tmp/item-message-8108-${name}-narrow.png`,
+        path: `/tmp/item-message-correction-${name}-narrow.png`,
       });
       assert.equal(
         await page.evaluate(

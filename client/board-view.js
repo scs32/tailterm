@@ -657,15 +657,20 @@ export function createBoardView({
       root.querySelector("#board-configure").onclick = configure;
       return;
     }
-    await reload(token);
-    if (!visible || token !== epoch) return;
+    const actionClient = client();
+    const requestedContext = itemContext && { ...itemContext };
+    const loaded = await reload(token, () => {
+      if (sameClient(actionClient)) void show(taskId, requestedContext);
+    });
+    // A failed or superseded load must not apply direct context to old detail.
+    if (!loaded || !currentAction(loaded.id, token, actionClient)) return;
     if (
       itemContext &&
       itemContext.taskId === selected &&
+      detail?.task.id === selected &&
       detail?.task.status === "open"
     ) {
       interruptMessageScroll();
-      const actionClient = client();
       const value = {
         ...draft(selected, actionClient),
         auditKind: "item",
@@ -693,7 +698,7 @@ export function createBoardView({
       onError: () => {},
     });
   }
-  async function reload(token = epoch) {
+  async function reload(token = epoch, retry = () => show()) {
     if (!visible) return;
     if (pendingTokens.has(token)) {
       reloadAgainTokens.add(token);
@@ -745,6 +750,8 @@ export function createBoardView({
         : [null, [], { value: [] }];
       if (!currentAction(id, token, actionClient)) return;
       const loadedDetail = result[0];
+      if (id && loadedDetail?.task.id !== id)
+        throw new Error("Loaded project does not match the selected project.");
       const loadedMessages = result[1];
       let loadedAudits = {};
       if (loadedCapabilities?.messageAudit?.versions?.includes(2)) {
@@ -816,11 +823,14 @@ export function createBoardView({
       }
       decisionsTask = id;
       render();
+      return { id };
     } catch (e) {
       if (visible && token === epoch && sameClient(actionClient)) {
+        saveDraft();
+        interruptMessageScroll();
         presentation.interrupt();
         root.innerHTML = `<div class="mode-empty"><h2>Hub unavailable</h2><p>${esc(e.message)}</p><button id="board-retry">Retry connection</button></div>`;
-        root.querySelector("#board-retry").onclick = () => show();
+        root.querySelector("#board-retry").onclick = retry;
       }
     } finally {
       pendingTokens.delete(token);
