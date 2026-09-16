@@ -626,9 +626,9 @@ function mount() {
       closeDialog,
       notice,
       configure: () => taskHub.configure(),
-      openBoard: (id) => {
+      openBoard: (id, itemContext) => {
         modes.set("board");
-        boardView.show(id);
+        boardView.show(id, itemContext);
       },
       draftPersistence: localVault.workItemDraftPersistence(),
     };

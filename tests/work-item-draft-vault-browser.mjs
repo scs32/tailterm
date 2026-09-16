@@ -72,7 +72,17 @@ try {
           state: "uncertain",
           requestId: "PRIVATE_BOARD_KEY",
           operation: "post",
-          payload: { text: "PRIVATE_BOARD_TEXT", auditKind: "intake" },
+          payload: {
+            text: "PRIVATE_BOARD_TEXT",
+            workItems: [
+              {
+                itemTaskId: "tsk_aaaaaaaaaaaaaaaa",
+                itemId: "wi_bbbbbbbbbbbbbbbb",
+                itemRevision: 7,
+                relationship: "primary",
+              },
+            ],
+          },
           updatedAt: new Date().toISOString(),
         });
         for (let index = 0; index < 31; index++)
@@ -81,7 +91,14 @@ try {
             id: `draft:${index}`,
             state: "draft",
             requestId: `board-${index}`,
-            values: { text: `draft ${index}` },
+            values: {
+              text: `draft ${index}`,
+              auditKind: "item",
+              primaryTask: "tsk_aaaaaaaaaaaaaaaa",
+              primaryItem: "wi_bbbbbbbbbbbbbbbb",
+              primaryRevision: "7",
+              itemDirect: true,
+            },
             updatedAt: new Date(Date.now() + index + 1).toISOString(),
           });
         let fullError = "";
@@ -148,7 +165,7 @@ try {
               request = database
                 .transaction("vault")
                 .objectStore("vault")
-                .get("encrypted");
+                .get("encrypted-v2");
             request.onerror = () => reject(request.error);
             request.onsuccess = () => {
               resolve(request.result);
@@ -192,9 +209,13 @@ try {
           password,
           username: "profile-a",
         });
-        const recoveredIntentCount = (
-          await vault.boardIntentPersistence().list(intentScope)
-        ).length;
+        const unlockedRecords = await vault
+          .boardIntentPersistence()
+          .list(intentScope);
+        const recoveredIntentCount = unlockedRecords.length;
+        const unlockedItem = unlockedRecords.find(
+          (entry) => entry.id === "draft:0",
+        ).values;
         return {
           found,
           removed,
@@ -214,6 +235,7 @@ try {
           wrongPasswordError,
           wrongProfileError,
           recoveredIntentCount,
+          unlockedItem,
         };
       }, password);
       assert.equal(reloaded.found?.requestId, "PRIVATE_RETRY_KEY");
@@ -223,7 +245,28 @@ try {
       assert.equal(reloaded.profileHasDrafts, false);
       assert.equal(reloaded.encryptedAtRest, true);
       assert.equal(reloaded.boardIntents.length, 32);
+      const itemDraft = reloaded.boardIntents.find(
+        (entry) => entry.id === "draft:0",
+      );
+      assert.equal(itemDraft.values.auditKind, "item");
+      assert.equal(itemDraft.values.primaryItem, "wi_bbbbbbbbbbbbbbbb");
+      assert.equal(itemDraft.values.primaryRevision, "7");
+      assert.equal(itemDraft.values.itemDirect, true);
+      assert.deepEqual(
+        reloaded.boardIntents.find((entry) => entry.state === "uncertain")
+          .payload.workItems,
+        [
+          {
+            itemTaskId: "tsk_aaaaaaaaaaaaaaaa",
+            itemId: "wi_bbbbbbbbbbbbbbbb",
+            itemRevision: 7,
+            relationship: "primary",
+          },
+        ],
+      );
       assert.equal(reloaded.boardRemoved, false);
+      assert.equal(reloaded.unlockedItem.primaryRevision, "7");
+      assert.equal(reloaded.unlockedItem.primaryItem, "wi_bbbbbbbbbbbbbbbb");
       assert.equal(reloaded.backupHasBoardIntents, false);
       assert.equal(reloaded.profileHasBoardIntents, false);
       assert.equal(reloaded.boardEncryptedAtRest, true);

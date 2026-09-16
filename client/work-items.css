@@ -303,6 +303,7 @@
   }
   .work-item-actions {
     width: 100%;
+    flex-wrap: wrap;
   }
   .work-item-history-layout {
     grid-template-columns: 1fr;

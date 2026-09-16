@@ -5760,3 +5760,27 @@ body:is(
     align-self: flex-end;
   }
 }
+
+/* Item-message context stays separate from the agent recipient. */
+#mode-view .board-item-compose {
+  grid-column: 1 / -1;
+  min-width: 0;
+}
+#mode-view .board-item-compose label {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 11px;
+}
+#mode-view .board-item-compose select {
+  flex: 1;
+  width: 0;
+  min-width: 0;
+  height: 28px;
+  padding: 3px 7px;
+  font-size: 11px;
+}
+#mode-view .board-item-compose p {
+  margin: 4px 0 0;
+  overflow-wrap: anywhere;
+}

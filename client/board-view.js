@@ -51,6 +51,8 @@ const emptyDraft = () => ({
   primaryTask: "",
   primaryItem: "",
   primaryRevision: "",
+  itemTitle: "",
+  itemDirect: false,
   related: "",
   orderTask: "",
   orderSeq: "",
@@ -176,6 +178,8 @@ export function createBoardView({
     capabilities = undefined,
     capabilitiesClient = null,
     audits = {},
+    composeItems = [],
+    composeItemsError = "",
     subscription = null;
   let messageScrollActive = false,
     messageTouchActive = false,
@@ -410,6 +414,12 @@ export function createBoardView({
       return false;
     }
     drafts.set(key, { ...emptyDraft(), to: drafts.get(key)?.to || "" });
+    if (visible && renderedTask === taskId && renderedClient === actionClient) {
+      const input = root.querySelector("#board-text");
+      if (input) input.value = "";
+      const kind = root.querySelector("#board-audit-kind");
+      if (kind) kind.value = "";
+    }
     return true;
   }
   function messageBody(value) {
@@ -420,6 +430,17 @@ export function createBoardView({
     };
     if (value.auditKind === "intake") {
       body.auditKind = "intake";
+    } else if (value.auditKind === "item") {
+      if (!value.primaryItem)
+        throw new Error(
+          "Choose a bug or feature before sending an item message.",
+        );
+      body.workItems = [
+        parseItemReference(
+          `${value.primaryTask}/${value.primaryItem}@${value.primaryRevision}`,
+          "primary",
+        ),
+      ];
     } else if (value.auditKind === "work") {
       const primary = parseItemReference(
         `${value.primaryTask}/${value.primaryItem}@${value.primaryRevision}`,
@@ -538,11 +559,22 @@ export function createBoardView({
       ...(drafts.get(key) || emptyDraft()),
       text: root.querySelector("#board-text").value,
       to: root.querySelector("#board-to").value,
-      auditKind: root.querySelector("#board-audit-kind")?.value || "",
-      primaryTask: root.querySelector("#board-primary-task")?.value || "",
-      primaryItem: root.querySelector("#board-primary-item")?.value || "",
+      auditKind:
+        root.querySelector("#board-audit-kind")?.value ??
+        drafts.get(key)?.auditKind ??
+        "",
+      primaryTask:
+        root.querySelector("#board-primary-task")?.value ??
+        drafts.get(key)?.primaryTask ??
+        "",
+      primaryItem:
+        root.querySelector("#board-primary-item")?.value ??
+        drafts.get(key)?.primaryItem ??
+        "",
       primaryRevision:
-        root.querySelector("#board-primary-revision")?.value || "",
+        root.querySelector("#board-primary-revision")?.value ??
+        drafts.get(key)?.primaryRevision ??
+        "",
       related: root.querySelector("#board-related")?.value || "",
       orderTask: root.querySelector("#board-order-task")?.value || "",
       orderSeq: root.querySelector("#board-order-seq")?.value || "",
@@ -605,7 +637,8 @@ export function createBoardView({
     interruptMessageScroll();
     presentation.interrupt({ capture: wasVisible });
   }
-  async function show(taskId) {
+  async function show(taskId, itemContext) {
+    saveDraft();
     visible = true;
     if (taskId && taskId !== selected) {
       interruptMessageScroll();
@@ -626,6 +659,34 @@ export function createBoardView({
     }
     await reload(token);
     if (!visible || token !== epoch) return;
+    if (
+      itemContext &&
+      itemContext.taskId === selected &&
+      detail?.task.status === "open"
+    ) {
+      interruptMessageScroll();
+      const actionClient = client();
+      const value = {
+        ...draft(selected, actionClient),
+        auditKind: "item",
+        primaryTask: itemContext.taskId,
+        primaryItem: itemContext.id,
+        primaryRevision: String(itemContext.revision),
+        itemTitle: itemContext.title,
+        itemDirect: true,
+        related: "",
+        orderTask: "",
+        orderSeq: "",
+      };
+      drafts.set(draftKey(selected, actionClient), value);
+      presentation.interrupt();
+      render(false);
+      root.querySelector("#board-text")?.focus({ preventScroll: true });
+      await persistDraft(taskId, value, actionClient).catch((error) =>
+        notice("Draft not saved: " + error.message),
+      );
+      if (!currentAction(taskId, token, actionClient)) return;
+    }
     subscription?.stop();
     subscription = client().subscribe("", () => reload(epoch), {
       after: 0,
@@ -703,7 +764,43 @@ export function createBoardView({
           );
         }
       }
+      let loadedItems = [],
+        itemsError = "";
+      if (id && actionClient.listWorkItems) {
+        try {
+          let after = 0;
+          do {
+            // Eligibility must come from the hub, not a saved read-cache snapshot.
+            const page = actionClient.request
+              ? await actionClient.request(
+                  `/v1/work-items?${new URLSearchParams({ taskId: id, status: "in_progress", after, limit: 200 })}`,
+                  { timeoutMs: 15000 },
+                )
+              : await actionClient.listWorkItems({
+                  taskId: id,
+                  status: "in_progress",
+                  after,
+                  limit: 200,
+                });
+            if (!currentAction(id, token, actionClient)) return;
+            loadedItems.push(
+              ...page.items.filter(
+                (item) => item.taskId === id && item.status === "in_progress",
+              ),
+            );
+            if (!page.next) break;
+            if (page.next <= after)
+              throw new Error("Item list did not advance.");
+            after = page.next;
+          } while (true);
+        } catch (error) {
+          itemsError = error.message;
+          loadedItems = [];
+        }
+      }
       if (!currentAction(id, token, actionClient)) return;
+      composeItems = loadedItems;
+      composeItemsError = itemsError;
       capabilities = loadedCapabilities;
       capabilitiesClient = actionClient;
       detail = loadedDetail;
@@ -859,8 +956,19 @@ export function createBoardView({
       )
       .join("");
     const auditComposer = auditSupported
-      ? `<details class="board-audit-compose" ${d.auditKind ? "open" : ""}><summary>Audit context · ${esc(d.auditKind || "ordinary")}</summary><label>Classification<select id="board-audit-kind"><option value="" ${!d.auditKind ? "selected" : ""}>Ordinary / unclassified</option><option value="work" ${d.auditKind === "work" ? "selected" : ""}>Work</option><option value="intake" ${d.auditKind === "intake" ? "selected" : ""}>Intake</option></select></label>${d.auditKind === "work" ? `<div class="audit-fields"><label>Primary project<input id="board-primary-task" value="${esc(d.primaryTask || selected)}" placeholder="tsk_…"></label><label>Primary item<input id="board-primary-item" value="${esc(d.primaryItem)}" placeholder="wi_…"></label><label>Revision<input id="board-primary-revision" type="number" min="1" value="${esc(d.primaryRevision)}"></label><label>Order project<input id="board-order-task" value="${esc(d.orderTask || selected)}" placeholder="tsk_…"></label><label>Order message<input id="board-order-seq" type="number" min="1" value="${esc(d.orderSeq)}"></label></div><label>Related exact items<textarea id="board-related" rows="2" placeholder="One TASK/ITEM@REVISION per line">${esc(d.related)}</textarea></label>` : ""}<p class="fine">Typed context is submitted exactly as shown. Replies only propose context; sending is the deliberate choice.</p></details>`
+      ? `<details class="board-audit-compose" ${d.auditKind && d.auditKind !== "item" ? "open" : ""}><summary>Audit context · ${esc(d.auditKind || "ordinary")}</summary><label>Classification<select id="board-audit-kind"><option value="" ${!d.auditKind ? "selected" : ""}>Ordinary / unclassified</option><option value="item" ${d.auditKind === "item" ? "selected" : ""}>Item message</option><option value="work" ${d.auditKind === "work" ? "selected" : ""}>Work</option><option value="intake" ${d.auditKind === "intake" ? "selected" : ""}>Intake</option></select></label>${d.auditKind === "work" ? `<div class="audit-fields"><label>Primary project<input id="board-primary-task" value="${esc(d.primaryTask || selected)}" placeholder="tsk_…"></label><label>Primary item<input id="board-primary-item" value="${esc(d.primaryItem)}" placeholder="wi_…"></label><label>Revision<input id="board-primary-revision" type="number" min="1" value="${esc(d.primaryRevision)}"></label><label>Order project<input id="board-order-task" value="${esc(d.orderTask || selected)}" placeholder="tsk_…"></label><label>Order message<input id="board-order-seq" type="number" min="1" value="${esc(d.orderSeq)}"></label></div><label>Related exact items<textarea id="board-related" rows="2" placeholder="One TASK/ITEM@REVISION per line">${esc(d.related)}</textarea></label>` : ""}<p class="fine">Typed context is submitted exactly as shown. Replies only propose context; sending is the deliberate choice.</p></details>`
       : "";
+    const selectedItem = composeItems.find(
+      (item) =>
+        item.id === d.primaryItem &&
+        String(item.revision) === String(d.primaryRevision),
+    );
+    const itemComposer =
+      auditSupported || d.auditKind === "item"
+        ? d.auditKind === "item"
+          ? `<div class="board-item-compose"><label>Bug or feature<select id="board-message-item" data-view-control="message-item"><option value="">${d.primaryItem ? "Choose another in-progress item…" : "Choose an in-progress item…"}</option>${composeItems.map((item) => `<option value="${esc(item.id)}@${item.revision}" ${selectedItem?.id === item.id ? "selected" : ""}>${esc(item.kind === "bug" ? "Bug" : "Feature")} · ${esc(item.title)} · r${item.revision}</option>`).join("")}</select></label><p class="fine" role="status">${esc(d.primaryItem ? `${d.itemTitle || d.primaryItem} · ${d.primaryTask}/${d.primaryItem}@${d.primaryRevision}${!selectedItem ? (d.itemDirect ? " · Selected from item page; checked when sending." : " · Selection changed or is no longer in progress. Choose the current item explicitly.") : ""}` : "Select a bug or feature for this message.")}${composeItemsError ? ` · ${esc(composeItemsError)}` : ""}</p></div>`
+          : '<div class="board-item-compose"><button type="button" id="board-message-item-mode">Message about a bug or feature</button></div>'
+        : "";
     const headActions = `${exportSupported ? '<button id="board-audit-export">Export audit</button>' : '<button id="board-download">Legacy JSON · non-snapshot</button>'}${archived ? `<span class="fine">Closed · ${esc(new Date(detail.task.closedAt).toLocaleDateString())}</span>${exportSupported ? '<button id="board-download">Legacy JSON · non-snapshot</button>' : ""}` : '<button id="board-attach">Terminals</button><button id="board-settings" title="Project settings">Settings</button>'}`;
     renderedTask = selected;
     renderedClient = client();
@@ -890,7 +998,7 @@ export function createBoardView({
                   )
                   .join(
                     "",
-                  )}</select></label><textarea ${sending.has(selected) ? "disabled" : ""} id="board-text" rows="2" maxlength="8192" placeholder="Write a message…" aria-label="Message">${esc(d.text)}</textarea><button class="primary" type="submit" ${sending.has(selected) ? "disabled" : ""}>${sending.has(selected) ? "Sending…" : "Send"}</button>${auditComposer}<p class="compose-note fine">${detail.task.swarm ? "Swarm: everyone receives each message. To names the agent responsible for acting." : "Messages wait until agents check their inbox."}</p></form>`
+                  )}</select></label><textarea ${sending.has(selected) ? "disabled" : ""} id="board-text" rows="2" maxlength="8192" placeholder="Write a message…" aria-label="Message">${esc(d.text)}</textarea><button class="primary" type="submit" ${sending.has(selected) ? "disabled" : ""}>${sending.has(selected) ? "Sending…" : "Send"}</button>${itemComposer}${auditComposer}<p class="compose-note fine">${detail.task.swarm ? "Swarm: everyone receives each message. To names the agent responsible for acting." : "Messages wait until agents check their inbox."}</p></form>`
           }`
         : ""
     }</section></div>`;
@@ -938,8 +1046,10 @@ export function createBoardView({
           const related = links.filter(
             (link) => link.relationship === "related",
           );
+          const previous = draft();
           drafts.set(draftKey(selected, client()), {
-            ...draft(),
+            ...previous,
+            itemDirect: false,
             replyTo: m.seq,
             to: m.from.agentId || "",
             auditKind:
@@ -959,6 +1069,22 @@ export function createBoardView({
             orderTask: original?.workOrderMessage?.taskId || "",
             orderSeq: original?.workOrderMessage?.seq || "",
           });
+          if (previous.auditKind === "item") {
+            Object.assign(draft(), {
+              auditKind: "item",
+              primaryTask: previous.primaryTask,
+              primaryItem: previous.primaryItem,
+              primaryRevision: previous.primaryRevision,
+              itemTitle: previous.itemTitle,
+              itemDirect: previous.itemDirect,
+              related: "",
+              orderTask: "",
+              orderSeq: "",
+            });
+          }
+          void persistDraft(selected, draft(), client()).catch((error) =>
+            notice("Draft not saved: " + error.message),
+          );
           interruptMessageScroll();
           presentation.interrupt();
           root.querySelector("#board-to").value = m.from.agentId || "";
@@ -1765,6 +1891,41 @@ export function createBoardView({
         try {
           const message = beginMessage(id, body, actionClient);
           await persistDraft(id, body, actionClient);
+          const exactRetry = (
+            uncertain.get(uncertainKey(id, actionClient)) || []
+          ).some(
+            (entry) =>
+              entry.operation === "post" &&
+              JSON.stringify(entry.payload) === JSON.stringify(message),
+          );
+          if (body.auditKind === "item" && !exactRetry) {
+            if (!capabilities?.messageAudit?.versions?.includes(2))
+              throw new Error(
+                "Item messaging requires an available audit-capable hub.",
+              );
+            if (body.primaryTask !== id)
+              throw new Error("The selected item belongs to another project.");
+            const current = actionClient.request
+              ? await actionClient.request(
+                  `/v1/tasks/${id}/work-items/${body.primaryItem}`,
+                  { timeoutMs: 15000 },
+                )
+              : await actionClient.getWorkItem(id, body.primaryItem);
+            if (current.revision !== Number(body.primaryRevision))
+              throw new Error(
+                `Selected revision ${body.primaryRevision} is stale; current revision is ${current.revision}. Choose the current item explicitly. Your text is retained.`,
+              );
+            if (
+              !(
+                body.itemDirect
+                  ? ["open", "blocked", "in_progress"]
+                  : ["in_progress"]
+              ).includes(current.status)
+            )
+              throw new Error(
+                "The selected item is no longer eligible. Your text is retained.",
+              );
+          }
           await retainUncertain(
             id,
             "post",
@@ -1813,11 +1974,71 @@ export function createBoardView({
           if (button.isConnected) button.disabled = false;
         }
       };
+      const itemMode = form.querySelector("#board-message-item-mode");
+      if (itemMode)
+        itemMode.onclick = () => {
+          saveDraft();
+          Object.assign(draft(), {
+            auditKind: "item",
+            primaryTask: selected,
+            primaryItem: "",
+            primaryRevision: "",
+            itemTitle: "",
+            itemDirect: false,
+          });
+          void persistDraft(selected, draft()).catch((error) =>
+            notice("Draft not saved: " + error.message),
+          );
+          interruptMessageScroll();
+          presentation.interrupt();
+          render(false);
+          root
+            .querySelector("#board-message-item")
+            ?.focus({ preventScroll: true });
+        };
+      const itemPicker = form.querySelector("#board-message-item");
+      if (itemPicker)
+        itemPicker.onchange = () => {
+          saveDraft();
+          const item = composeItems.find(
+            (entry) => `${entry.id}@${entry.revision}` === itemPicker.value,
+          );
+          Object.assign(draft(), {
+            primaryTask: selected,
+            primaryItem: item?.id || "",
+            primaryRevision: item ? String(item.revision) : "",
+            itemTitle: item?.title || "",
+            itemDirect: false,
+          });
+          void persistDraft(selected, draft()).catch((error) =>
+            notice("Draft not saved: " + error.message),
+          );
+          interruptMessageScroll();
+          presentation.interrupt();
+          render(false);
+          root
+            .querySelector("#board-message-item")
+            ?.focus({ preventScroll: true });
+        };
       const auditKind = form.querySelector?.("#board-audit-kind");
       if (auditKind)
         auditKind.onchange = () => {
           saveDraft();
-          render();
+          if (auditKind.value === "item") {
+            Object.assign(draft(), {
+              primaryTask: selected,
+              primaryItem: "",
+              primaryRevision: "",
+              itemTitle: "",
+              itemDirect: false,
+            });
+            void persistDraft(selected, draft()).catch((error) =>
+              notice("Draft not saved: " + error.message),
+            );
+          }
+          interruptMessageScroll();
+          presentation.interrupt();
+          render(false);
         };
       form
         .querySelectorAll?.(
