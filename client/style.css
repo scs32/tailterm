@@ -5784,3 +5784,45 @@ body:is(
   margin: 4px 0 0;
   overflow-wrap: anywhere;
 }
+
+/* Compact project roster controls; composer and generic focus rules stay separate. */
+#mode-view .project-team-heading {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 6px;
+}
+#mode-view .project-team-heading h3 {
+  margin: 0;
+}
+#mode-view .project-team-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 28px;
+  padding: 3px 7px;
+}
+#mode-view .project-team-toggle:hover {
+  background: transparent;
+  border-color: var(--muted);
+}
+#mode-view .project-team-toggle:focus-visible {
+  outline: 2px solid currentColor;
+  outline-offset: 2px;
+}
+#mode-view .project-team-chevron {
+  display: inline-block;
+  font-size: 18px;
+  line-height: 1;
+}
+#mode-view .project-team-toggle[aria-expanded="true"] .project-team-chevron {
+  transform: rotate(90deg);
+}
+#mode-view [data-team-roster][hidden],
+#mode-view [data-team-roster]:empty {
+  display: none;
+}
+#mode-view .project-team-attention .board-agent {
+  border-color: var(--muted);
+}

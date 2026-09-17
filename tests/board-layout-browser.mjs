@@ -33,6 +33,7 @@ async function transport(url,init){
  else if(!state.online)throw Error('Synthetic hub offline');
  if(p.endsWith('/events')){if(u.searchParams.get('wait'))await new Promise(r=>setTimeout(r,150));return response({events:[],next:0})}
  if(method==='GET'&&state.held)await new Promise(r=>state.waiting.push(r));
+ if(p==='/v1/capabilities')return response({});
  if(p==='/v1/tasks')return response({tasks});
  if(p==='/v1/work-items')return response({items:items.filter(x=>(!u.searchParams.get('taskId')||x.taskId===u.searchParams.get('taskId'))&&(!u.searchParams.get('status')||x.status===u.searchParams.get('status'))&&x.kind===u.searchParams.get('kind')),next:0});
  const match=p.match(/^\\/v1\\/tasks\\/([^/]+)(.*)$/);if(!match)throw Error('Unexpected synthetic route '+p);
@@ -275,7 +276,7 @@ async function actions(page) {
   for (const mode of viewNames) {
     await show(page, mode);
     await expect(page.locator("#mode-view > div > aside")).toBeVisible();
-    if (mode !== "teams") await expect(page.locator("#mode-view [role=status]").first()).toContainText("Saved data");
+    if (mode !== "teams") await expect(page.locator("#mode-view [role=status]").first()).toContainText("Offline · showing cached data");
   }
 }
 

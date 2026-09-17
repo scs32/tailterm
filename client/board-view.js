@@ -12,6 +12,12 @@ import {
   shouldReleaseViewPointer,
 } from "./view-refresh-presentation.js";
 // The hub owns messages; view changes only affect presentation and drafts.
+const cacheFeedback = (label = "") =>
+  label === "Saved data" || label === "Saved data · refreshing"
+    ? ""
+    : label === "Saved data · offline"
+      ? "Offline · showing cached data"
+      : label;
 const esc = (s) =>
   String(s ?? "").replace(
     /[&<>"']/g,
@@ -187,6 +193,38 @@ export function createBoardView({
     renderHeldForMessageScroll = false,
     ignoredScrollElement = null,
     ignoredScrollTop = 0;
+  // View-local choices never write to the hub or vault. A changed client or
+  // project lifecycle starts a fresh disclosure epoch.
+  let teamClient = null;
+  const teamChoices = new Map();
+  function teamExpanded(task, count) {
+    if (teamClient !== client()) {
+      teamClient = client();
+      teamChoices.clear();
+    }
+    const epoch = JSON.stringify([
+      task.createdAt,
+      task.lifecycleGeneration,
+      task.pauseGeneration,
+    ]);
+    let choice = teamChoices.get(task.id);
+    if (!choice || choice.epoch !== epoch) {
+      choice = { epoch, expanded: null };
+      teamChoices.set(task.id, choice);
+    }
+    return choice.expanded ?? count <= 4;
+  }
+  function bindTeamDisclosure(taskId) {
+    const button = root.querySelector("[data-team-toggle]");
+    if (!button) return;
+    button.onclick = () => {
+      const expanded = button.getAttribute("aria-expanded") !== "true";
+      teamChoices.get(taskId).expanded = expanded;
+      button.setAttribute("aria-expanded", String(expanded));
+      button.setAttribute("aria-label", expanded ? "Hide team" : "Show team");
+      root.querySelector("[data-team-roster]").hidden = !expanded;
+    };
+  }
   const sending = new Set();
   const decisionSending = new Set();
   const decisionErrors = new Map();
@@ -650,6 +688,10 @@ export function createBoardView({
     const token = ++epoch;
     subscription?.stop();
     subscription = null;
+    if (teamClient !== client()) {
+      teamClient = client();
+      teamChoices.clear();
+    }
     if (!client()) {
       presentation.interrupt();
       root.innerHTML =
@@ -979,6 +1021,9 @@ export function createBoardView({
           ? `<div class="board-item-compose"><label>Bug or feature<select id="board-message-item" data-view-control="message-item"><option value="">${d.primaryItem ? "Choose another in-progress item…" : "Choose an in-progress item…"}</option>${composeItems.map((item) => `<option value="${esc(item.id)}@${item.revision}" ${selectedItem?.id === item.id ? "selected" : ""}>${esc(item.kind === "bug" ? "Bug" : "Feature")} · ${esc(item.title)} · r${item.revision}</option>`).join("")}</select></label><p class="fine" role="status">${esc(d.primaryItem ? `${d.itemTitle || d.primaryItem} · ${d.primaryTask}/${d.primaryItem}@${d.primaryRevision}${!selectedItem ? (d.itemDirect ? " · Selected from item page; checked when sending." : " · Selection changed or is no longer in progress. Choose the current item explicitly.") : ""}` : "Select a bug or feature for this message.")}${composeItemsError ? ` · ${esc(composeItemsError)}` : ""}</p></div>`
           : '<div class="board-item-compose"><button type="button" id="board-message-item-mode">Message about a bug or feature</button></div>'
         : "";
+    const roster = agents.filter((a) => archived || a.status !== "closed");
+    const rosterAgent = (a) =>
+      `<button class="board-agent" ${archived ? "disabled" : `data-board-agent="${esc(a.id)}"`} title="${esc(a.blockedText || a.host + " · " + a.session)}"><span class="status-dot ${a.status === "running" ? "online" : a.status === "needs_input" ? "attention" : ""}"></span>${esc(a.name)}<span class="fine">${esc(status(a))}</span></button>`;
     const headActions = `${exportSupported ? '<button id="board-audit-export">Export audit</button>' : '<button id="board-download">Legacy JSON · non-snapshot</button>'}${archived ? `<span class="fine">Closed · ${esc(new Date(detail.task.closedAt).toLocaleDateString())}</span>${exportSupported ? '<button id="board-download">Legacy JSON · non-snapshot</button>' : ""}` : '<button id="board-attach">Terminals</button><button id="board-settings" title="Project settings">Settings</button>'}`;
     renderedTask = selected;
     renderedClient = client();
@@ -989,15 +1034,19 @@ export function createBoardView({
         "",
       )}${closedTasks.length ? `<details class="board-closed" data-view-disclosure="closed" ${archived ? "open" : ""}><summary>Closed projects · ${closedTasks.length}</summary>${closedTasks.map(taskButton).join("")}</details>` : ""}</aside><section class="board-thread">${
       detail
-        ? `<div class="board-head"><div class="view-heading"><div><span class="eyebrow">BOARD</span><h2>${esc(detail.task.name)}</h2></div><div class="view-actions">${headActions}</div></div><p class="fine">${esc(detail.task.goal)}</p><span class="fine hub-sync-status" role="status">${esc(client()?.cacheStatus?.().label || "")}</span><div class="board-agents-row">${agents
-            .filter((a) => archived || a.status !== "closed")
-            .map(
-              (a) =>
-                `<button class="board-agent" ${archived ? "disabled" : `data-board-agent="${esc(a.id)}"`} title="${esc(a.blockedText || a.host + " · " + a.session)}"><span class="status-dot ${a.status === "running" ? "online" : a.status === "needs_input" ? "attention" : ""}"></span>${esc(a.name)}<span class="fine">${esc(status(a))}</span></button>`,
-            )
+        ? `<div class="board-head"><div class="view-heading"><div><span class="eyebrow">BOARD</span><h2>${esc(detail.task.name)}</h2></div><div class="view-actions">${headActions}</div></div><p class="fine">${esc(detail.task.goal)}</p>${cacheFeedback(client()?.cacheStatus?.().label) ? `<span class="fine hub-sync-status" role="status">${esc(cacheFeedback(client()?.cacheStatus?.().label))}</span>` : ""}<div class="project-team-heading">${roster.length ? `<button type="button" class="project-team-toggle" data-team-toggle data-view-control="team" aria-label="${teamExpanded(detail.task, roster.length) ? "Hide team" : "Show team"}" aria-expanded="${teamExpanded(detail.task, roster.length)}" aria-controls="board-team-roster"><span class="project-team-chevron" aria-hidden="true">›</span><span>Team · ${roster.length}</span></button>` : ""}${archived ? "" : '<button id="board-add-agent">＋ Agent</button>'}</div>${
+            roster.some((a) => a.status === "needs_input")
+              ? `<div class="board-agents-row project-team-attention" aria-label="Needs you">${roster
+                  .filter((a) => a.status === "needs_input")
+                  .map(rosterAgent)
+                  .join("")}</div>`
+              : ""
+          }<div id="board-team-roster" class="board-agents-row" data-team-roster ${teamExpanded(detail.task, roster.length) ? "" : "hidden"}>${roster
+            .filter((a) => a.status !== "needs_input")
+            .map(rosterAgent)
             .join(
               "",
-            )}${archived ? "" : '<button id="board-add-agent">＋ Agent</button>'}</div></div>${renderDecisionPanel({ records: decisions, taskId: selected, archived, name, drafts: decisionDrafts, sending: decisionSending, errors: decisionErrors, revealedAnswers, historyOpen: decisionPresentation.get(selected)?.historyOpen, loadError: decisionLoadError })}${recoveryMarkup}<div id="board-messages" class="board-messages">${messages.length === 200 && !completeConversations.has(selected) ? `<p class="fine">Latest 200 messages.${archived ? ' <button id="board-full-history">Show full conversation</button>' : " Full history remains on the hub."}</p>` : ""}${messageMarkup}</div>${
+            )}</div></div>${renderDecisionPanel({ records: decisions, taskId: selected, archived, name, drafts: decisionDrafts, sending: decisionSending, errors: decisionErrors, revealedAnswers, historyOpen: decisionPresentation.get(selected)?.historyOpen, loadError: decisionLoadError })}${recoveryMarkup}<div id="board-messages" class="board-messages">${messages.length === 200 && !completeConversations.has(selected) ? `<p class="fine">Latest 200 messages.${archived ? ' <button id="board-full-history">Show full conversation</button>' : " Full history remains on the hub."}</p>` : ""}${messageMarkup}</div>${
             archived
               ? ""
               : `<form id="board-compose">${d.replyTo ? `<div class="compose-reply">Replying to #${d.replyTo}<button type="button" id="board-cancel-reply">Cancel reply</button></div>` : ""}<label class="compose-recipient">To<select ${sending.has(selected) ? "disabled" : ""} id="board-to" data-view-control="recipient" aria-label="Recipient"><option value="">Everyone</option>${agents
@@ -1008,11 +1057,12 @@ export function createBoardView({
                   )
                   .join(
                     "",
-                  )}</select></label><textarea ${sending.has(selected) ? "disabled" : ""} id="board-text" rows="2" maxlength="8192" placeholder="Write a message…" aria-label="Message">${esc(d.text)}</textarea><button class="primary" type="submit" ${sending.has(selected) ? "disabled" : ""}>${sending.has(selected) ? "Sending…" : "Send"}</button>${itemComposer}${auditComposer}<p class="compose-note fine">${detail.task.swarm ? "Swarm: everyone receives each message. To names the agent responsible for acting." : "Messages wait until agents check their inbox."}</p></form>`
+                  )}</select></label><textarea ${sending.has(selected) ? "disabled" : ""} id="board-text" rows="2" maxlength="8192" placeholder="Write a message…" aria-label="Message">${esc(d.text)}</textarea><button class="primary" type="submit" ${sending.has(selected) ? "disabled" : ""}>${sending.has(selected) ? "Sending…" : "Send"}</button>${itemComposer}${auditComposer}</form>`
           }`
         : ""
     }</section></div>`;
     presentation.afterRender(selected);
+    bindTeamDisclosure(selected);
     root.querySelector("#board-new-task").onclick = () => newTask();
     root.querySelectorAll("[data-board-task]").forEach(
       (b) =>

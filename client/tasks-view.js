@@ -4,6 +4,12 @@ import { taskRollup } from "./tasks.js";
 import { pauseStateLabel, projectPauseState } from "./project-pause.js";
 import { createViewRefreshPresentation } from "./view-refresh-presentation.js";
 
+const cacheFeedback = (label = "") =>
+  label === "Saved data" || label === "Saved data · refreshing"
+    ? ""
+    : label === "Saved data · offline"
+      ? "Offline · showing cached data"
+      : label;
 const esc = (s) =>
   String(s ?? "").replace(
     /[&<>"']/g,
@@ -41,6 +47,38 @@ export function createTasksView({
     hiddenTaskIds = new Set();
   let capabilities = null;
   let clock = null;
+  // View-local choices never write to the hub or vault. A changed client or
+  // project lifecycle starts a fresh disclosure epoch.
+  let teamClient = null;
+  const teamChoices = new Map();
+  function teamExpanded(task, count) {
+    if (teamClient !== client()) {
+      teamClient = client();
+      teamChoices.clear();
+    }
+    const epoch = JSON.stringify([
+      task.createdAt,
+      task.lifecycleGeneration,
+      task.pauseGeneration,
+    ]);
+    let choice = teamChoices.get(task.id);
+    if (!choice || choice.epoch !== epoch) {
+      choice = { epoch, expanded: null };
+      teamChoices.set(task.id, choice);
+    }
+    return choice.expanded ?? count <= 4;
+  }
+  function bindTeamDisclosure(taskId) {
+    const button = root.querySelector("[data-team-toggle]");
+    if (!button) return;
+    button.onclick = () => {
+      const expanded = button.getAttribute("aria-expanded") !== "true";
+      teamChoices.get(taskId).expanded = expanded;
+      button.setAttribute("aria-expanded", String(expanded));
+      button.setAttribute("aria-label", expanded ? "Hide team" : "Show team");
+      root.querySelector("[data-team-roster]").hidden = !expanded;
+    };
+  }
   const presentation = createViewRefreshPresentation({
     render: () => {
       if (visible && !loading) render();
@@ -59,6 +97,10 @@ export function createTasksView({
     clock = setInterval(() => {
       if (visible && hasData) render();
     }, 30000);
+    if (teamClient !== client()) {
+      teamClient = client();
+      teamChoices.clear();
+    }
     if (!client()) {
       presentation.interrupt();
       root.innerHTML = `<div class="mode-empty"><span class="eyebrow">PROJECTS</span><h2>Connect a project hub.</h2><button id="tasks-configure" class="primary">Configure project hub</button></div>`;
@@ -189,7 +231,7 @@ export function createTasksView({
       const { task, agents } = entry;
       const resumePending = taskHub.hasPendingResume?.(task.id) === true;
       if (task.status !== "open")
-        return `<div class="board-head"><div class="view-heading"><div><span class="eyebrow">PROJECT</span><h2>${esc(task.name)}</h2></div><div class="view-actions"><span class="fine hub-sync-status" role="status">${esc(client()?.cacheStatus?.().label || "")}</span><button data-task-board="${esc(task.id)}">View history</button>${task.cleanupPending ? `<button data-task-cleanup="${esc(task.id)}">Retry cleanup</button>` : ""}</div></div><p class="fine">Closed · ${task.cleanupPending ? `${task.cleanupPending} session${task.cleanupPending === 1 ? "" : "s"} pending cleanup` : "Sessions closed"}</p></div><article class="task-card task-detail-card" data-task-card="${esc(task.id)}"><header><h3>${esc(task.name)}</h3></header>${task.goal ? `<p class="task-goal">${esc(task.goal)}</p>` : ""}</article>`;
+        return `<div class="board-head"><div class="view-heading"><div><span class="eyebrow">PROJECT</span><h2>${esc(task.name)}</h2></div><div class="view-actions">${cacheFeedback(client()?.cacheStatus?.().label) ? `<span class="fine hub-sync-status" role="status">${esc(cacheFeedback(client()?.cacheStatus?.().label))}</span>` : ""}<button data-task-board="${esc(task.id)}">View history</button>${task.cleanupPending ? `<button data-task-cleanup="${esc(task.id)}">Retry cleanup</button>` : ""}</div></div><p class="fine">Closed · ${task.cleanupPending ? `${task.cleanupPending} session${task.cleanupPending === 1 ? "" : "s"} pending cleanup` : "Sessions closed"}</p></div><article class="task-card task-detail-card" data-task-card="${esc(task.id)}"><header><h3>${esc(task.name)}</h3></header>${task.goal ? `<p class="task-goal">${esc(task.goal)}</p>` : ""}</article>`;
       const pauseState = lifecycleState(task);
       if (
         ["cleanup_pending", "paused", "resuming", "unknown"].includes(
@@ -205,11 +247,11 @@ export function createTasksView({
               : pauseState === "resuming"
                 ? "Resume pending · the exact fresh orchestrator admission is saved. Automatic wake and scheduling remain blocked until that new run is admitted."
                 : "Pause status unavailable · lifecycle actions are blocked because this hub did not return complete projectPause v1 state.";
-        return `<div class="board-head"><div class="view-heading"><div><span class="eyebrow">PROJECT</span><h2>${esc(task.name)}</h2></div><div class="view-actions"><span class="fine hub-sync-status" role="status">${esc(client()?.cacheStatus?.().label || "")}</span><button data-task-board="${esc(task.id)}">Open board →</button>${pauseState === "cleanup_pending" ? `<button data-task-pause-handoff="${esc(task.id)}" data-testid="resolve-pause-handoff">Resolve service handoff…</button><button data-task-pause-cleanup="${esc(task.id)}" data-testid="pause-cleanup-pending">Retry exact cleanup</button>` : ""}${pauseState === "paused" || pauseState === "resuming" ? `<button data-task-resume="${esc(task.id)}" class="primary" data-testid="${pauseState === "resuming" ? "continue-project-resume" : "resume-project"}">${pauseState === "resuming" ? "Continue resume…" : "Resume…"}</button>` : ""}</div></div><p class="fine project-pause-state" role="status" data-testid="${pauseState === "paused" ? "project-paused" : pauseState === "cleanup_pending" ? "project-pause-cleanup-pending" : pauseState === "resuming" ? "project-resuming" : "project-pause-unknown"}">${esc(stateText)}</p></div><article class="task-card task-detail-card" data-task-card="${esc(task.id)}"><header><h3>Project retained</h3><span class="fine">Lifecycle generation ${Number.isSafeInteger(task.lifecycleGeneration) ? task.lifecycleGeneration : "unknown"}</span></header>${task.goal ? `<p class="task-goal">${esc(task.goal)}</p>` : ""}<footer class="task-actions"><span class="fine">${pauseState === "resuming" ? "Fresh team admission pending" : "Team dismissed · unfinished items unchanged"}</span>${openWorkItems ? `<button data-project-bugs="${esc(task.id)}">Bugs</button><button data-project-features="${esc(task.id)}">Features</button>` : ""}<div class="task-more"><button type="button" data-task-more="${esc(task.id)}" aria-expanded="false" aria-controls="task-menu-${esc(task.id)}">More</button><div id="task-menu-${esc(task.id)}" class="task-menu" popover="auto" aria-label="More project actions"><button data-task-close="${esc(task.id)}" class="danger">Close project</button></div></div></footer></article>`;
+        return `<div class="board-head"><div class="view-heading"><div><span class="eyebrow">PROJECT</span><h2>${esc(task.name)}</h2></div><div class="view-actions">${cacheFeedback(client()?.cacheStatus?.().label) ? `<span class="fine hub-sync-status" role="status">${esc(cacheFeedback(client()?.cacheStatus?.().label))}</span>` : ""}<button data-task-board="${esc(task.id)}">Open board →</button>${pauseState === "cleanup_pending" ? `<button data-task-pause-handoff="${esc(task.id)}" data-testid="resolve-pause-handoff">Resolve service handoff…</button><button data-task-pause-cleanup="${esc(task.id)}" data-testid="pause-cleanup-pending">Retry exact cleanup</button>` : ""}${pauseState === "paused" || pauseState === "resuming" ? `<button data-task-resume="${esc(task.id)}" class="primary" data-testid="${pauseState === "resuming" ? "continue-project-resume" : "resume-project"}">${pauseState === "resuming" ? "Continue resume…" : "Resume…"}</button>` : ""}</div></div><p class="fine project-pause-state" role="status" data-testid="${pauseState === "paused" ? "project-paused" : pauseState === "cleanup_pending" ? "project-pause-cleanup-pending" : pauseState === "resuming" ? "project-resuming" : "project-pause-unknown"}">${esc(stateText)}</p></div><article class="task-card task-detail-card" data-task-card="${esc(task.id)}"><header><h3>Project retained</h3><span class="fine">Lifecycle generation ${Number.isSafeInteger(task.lifecycleGeneration) ? task.lifecycleGeneration : "unknown"}</span></header>${task.goal ? `<p class="task-goal">${esc(task.goal)}</p>` : ""}<footer class="task-actions"><span class="fine">${pauseState === "resuming" ? "Fresh team admission pending" : "Team dismissed · unfinished items unchanged"}</span>${openWorkItems ? `<button data-project-bugs="${esc(task.id)}">Bugs</button><button data-project-features="${esc(task.id)}">Features</button>` : ""}<div class="task-more"><button type="button" data-task-more="${esc(task.id)}" aria-expanded="false" aria-controls="task-menu-${esc(task.id)}">More</button><div id="task-menu-${esc(task.id)}" class="task-menu" popover="auto" aria-label="More project actions"><button data-task-close="${esc(task.id)}" class="danger">Close project</button></div></div></footer></article>`;
       }
       const needs = agents.filter((a) => a.status === "needs_input");
       const handler = agents.find((a) => a.role === "database_handler");
-      return `<div class="board-head"><div class="view-heading"><div><span class="eyebrow">PROJECT</span><h2>${esc(task.name)}</h2></div><div class="view-actions"><span class="fine hub-sync-status" role="status">${esc(client()?.cacheStatus?.().label || "")}</span>${resumePending ? `<button data-task-resume="${esc(task.id)}" class="primary" data-testid="continue-project-resume">Continue resume…</button>` : ""}</div></div><p class="fine">${esc(task.goal || taskRollup(agents))}</p></div>${needs.length ? `<section class="needs-you"><div class="view-heading"><h3>Needs you</h3><span class="count-badge">${needs.length}</span></div>${needs.map((agent) => `<button class="attention-row" data-task-agent="${esc(agent.id)}"><strong>${esc(agent.name)}</strong><span>${esc(agent.host)}</span><span>Open →</span></button>`).join("")}</section>` : ""}<article class="task-card task-detail-card" data-task-card="${esc(task.id)}"><header><h3>Agents · ${esc(task.name)}</h3><span class="fine">${esc(taskRollup(agents))}</span></header><div class="task-agents">${agents
+      return `<div class="board-head"><div class="view-heading"><div><span class="eyebrow">PROJECT</span><h2>${esc(task.name)}</h2></div><div class="view-actions">${cacheFeedback(client()?.cacheStatus?.().label) ? `<span class="fine hub-sync-status" role="status">${esc(cacheFeedback(client()?.cacheStatus?.().label))}</span>` : ""}${resumePending ? `<button data-task-resume="${esc(task.id)}" class="primary" data-testid="continue-project-resume">Continue resume…</button>` : ""}</div></div><p class="fine">${esc(task.goal || taskRollup(agents))}</p></div>${needs.length ? `<section class="needs-you"><div class="view-heading"><h3>Needs you</h3><span class="count-badge">${needs.length}</span></div>${needs.map((agent) => `<button class="attention-row" data-task-agent="${esc(agent.id)}"><strong>${esc(agent.name)}</strong><span>${esc(agent.host)}</span><span>Open →</span></button>`).join("")}</section>` : ""}<article class="task-card task-detail-card" data-task-card="${esc(task.id)}"><header class="project-team-heading"><h3>Team</h3>${agents.some((a) => a.status !== "closed") ? `<button type="button" class="project-team-toggle" data-team-toggle data-view-control="team" aria-label="${teamExpanded(task, agents.filter((a) => a.status !== "closed").length) ? "Hide team" : "Show team"}" aria-expanded="${teamExpanded(task, agents.filter((a) => a.status !== "closed").length)}" aria-controls="project-team-roster"><span class="project-team-chevron" aria-hidden="true">›</span><span>${agents.filter((a) => a.status !== "closed").length}</span></button>` : ""}<span class="fine">${esc(taskRollup(agents))}</span></header><div id="project-team-roster" class="task-agents" data-team-roster ${teamExpanded(task, agents.filter((a) => a.status !== "closed").length) ? "" : "hidden"}>${agents
         .filter((a) => a.status !== "closed")
         .map(
           (a) =>
@@ -221,6 +263,7 @@ export function createTasksView({
     };
     root.innerHTML = `<div class="board mode-board tasks-view"><aside class="board-rail"><div class="board-rail-head"><span class="eyebrow">PROJECTS</span><button id="tasks-new" title="New project" aria-label="New project">＋</button></div>${open.map(projectButton).join("")}${closed.length ? `<details class="board-closed tasks-closed" data-view-disclosure="closed" ${current?.task.status !== "open" ? "open" : ""}><summary>Closed · ${closed.length}</summary>${closed.map(projectButton).join("")}</details>` : ""}</aside><section class="board-thread tasks-detail">${detail(current)}</section></div>`;
     presentation.afterRender(selected);
+    bindTeamDisclosure(selected);
     root.querySelectorAll("[data-task-select]").forEach(
       (button) =>
         (button.onclick = () => {
