@@ -4,8 +4,8 @@ import { readFileSync } from "node:fs";
 import { TEAM_EXAMPLES, exampleTeam } from "../client/team-examples.js";
 import { normalizeTeam, teamLaunches } from "../client/teams.js";
 import { MODEL_OPTIONS } from "../client/model-picker.js";
-test("nine complete examples are portable, launchable, bounded and independently editable", () => {
-  assert.equal(TEAM_EXAMPLES.length, 9);
+test("ten complete examples are portable, launchable, bounded and independently editable", () => {
+  assert.equal(TEAM_EXAMPLES.length, 10);
   for (const e of TEAM_EXAMPLES) {
     const team = normalizeTeam(exampleTeam(e.id));
     assert.ok(team.members.length >= 1 && team.members.length <= 5);

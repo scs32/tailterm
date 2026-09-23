@@ -45,7 +45,7 @@ Commands
   capabilities [--json]       show supported audit contracts and policy mode
   audit-export <command>       create/download an immutable project audit export
   ask --request-id KEY --file PATH [--json]  request an owner decision on the Board
-  inbox [--unread] [--mark-read] [--json]
+  inbox [--unread] [--mark-read] [--wait 9m] [--json]
   context [--json]             print this exact run's bound work-item context
   operational-record propose|commit|get  validated operational records
   current-assignment [--item ID --action-key KEY] [--json]  fetch one exact directive
@@ -518,7 +518,14 @@ func cmdInbox(e env, args []string) error {
 	mark := fs.Bool("mark-read", false, "advance the read cursor past the shown messages")
 	asJSON := fs.Bool("json", false, "JSON output")
 	limit := fs.Int("limit", 50, "maximum messages")
+	wait := fs.Duration("wait", 0, "with --unread, block up to this long (max 9m) until an unread message arrives")
 	_ = fs.Parse(args)
+	if *wait > 0 && (!*unread || e.agent == "") {
+		return errors.New("--wait requires --unread and an agent identity")
+	}
+	if *wait > maxInboxWait {
+		*wait = maxInboxWait
+	}
 	task, err := e.requireTask()
 	if err != nil {
 		return err
@@ -526,6 +533,21 @@ func cmdInbox(e env, args []string) error {
 	c, err := e.client(10 * time.Second)
 	if err != nil {
 		return err
+	}
+	if *wait > 0 {
+		// Park cheaply: runtimes without relay wake-up (Claude) run this as one
+		// shell command instead of ending their turn and never seeing new work.
+		deadline := time.Now().Add(*wait)
+		for {
+			n, err := unreadCount(c, task, e.agent)
+			if err != nil {
+				return err
+			}
+			if n > 0 || !time.Now().Add(inboxPollInterval).Before(deadline) {
+				break
+			}
+			time.Sleep(inboxPollInterval)
+		}
 	}
 	ctx, cancel := ctxTimeout(10 * time.Second)
 	defer cancel()
@@ -571,6 +593,31 @@ func cmdInbox(e env, args []string) error {
 		return c.MarkRead(ctx, task, api.MarkReadRequest{AgentID: e.agent, UpTo: msgs[len(msgs)-1].Seq})
 	}
 	return nil
+}
+
+// maxInboxWait stays under Claude Code's 10-minute shell command limit.
+const maxInboxWait = 9 * time.Minute
+
+var inboxPollInterval = 5 * time.Second
+
+func unreadCount(c *api.Client, task, agent string) (int, error) {
+	ctx, cancel := ctxTimeout(10 * time.Second)
+	defer cancel()
+	after, err := readCursor(ctx, c, task, agent)
+	if err != nil {
+		return 0, err
+	}
+	msgs, err := c.ListMessages(ctx, task, after, agent, 50)
+	if err != nil {
+		return 0, err
+	}
+	n := 0
+	for _, m := range msgs {
+		if m.From.AgentID != agent {
+			n++
+		}
+	}
+	return n, nil
 }
 
 func readCursor(ctx context.Context, c *api.Client, task, agent string) (int64, error) {
