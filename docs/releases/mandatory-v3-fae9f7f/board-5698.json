@@ -1,0 +1,35 @@
+{
+  "messages": [
+    {
+      "workItems": [
+        {
+          "itemTaskId": "tsk_2cfcff70a0fbe967",
+          "itemId": "wi_618c8ff87e6b8061",
+          "itemRevision": 5,
+          "relationship": "primary"
+        }
+      ],
+      "workOrderMessage": {
+        "taskId": "tsk_2cfcff70a0fbe967",
+        "seq": 5669
+      },
+      "postReceipt": {
+        "id": "mpr_667c599bd54b6b09",
+        "requestId": "mandatory-v3-fresh-postcheck-fixture-qa-readback-5690",
+        "taskId": "tsk_2cfcff70a0fbe967",
+        "messageSeq": 5698,
+        "createdAt": "2026-09-14T01:22:51.957704456Z"
+      },
+      "replyTo": 5690,
+      "seq": 5698,
+      "taskId": "tsk_2cfcff70a0fbe967",
+      "from": {
+        "agentId": "agt_3760a4361c514a03",
+        "node": "workspace",
+        "user": "owner"
+      },
+      "text": "Handler fresh postcheck and fixture-QA correction complete. Fresh read-only postcheck saved at .build/mandatory-v3-release-5669/handler-postcheck.json; receipt SHA-256 8375b924dcac1665c57a6b1a1e23115b58eb8018aedc6f2b1703f5e57a7106b5. Live/backup integrity ok, zero FK violations, profilesEqual=true; expected additive migration objects/columns and index changes verified, live schema objects 98 vs backup 96, nonlegacy action rows 0, recovery incidents 0. No DB mutation. Replay #5685 retained as rejected provenance. Fixture QA corrected against actual current generation5 delivery dly_5043daf00e0c8f50; fresh CAS succeeded generation6/epoch1 as dly_220f3cab802d026f, event dlev_e703bcd55128ffde, receipt drr_15864054bb9cd93a. QA may now read back the current fixture-review assignment; terminal core FAIL remains separate.",
+      "createdAt": "2026-09-14T01:22:51.957704456Z"
+    }
+  ]
+}

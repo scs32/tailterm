@@ -1,0 +1,42 @@
+{
+  "version": 1,
+  "requestId": "mandatory-v3-fae9f7f-release5669-backup-v1",
+  "databaseOwner": "db-handler",
+  "operation": "sqlite-online-backup",
+  "checks": [
+    "source-integrity",
+    "source-foreign-keys",
+    "backup-integrity",
+    "backup-foreign-keys",
+    "profile-snapshots"
+  ],
+  "profileTables": [
+    "profile_meta",
+    "profiles",
+    "profile_history"
+  ],
+  "route": {
+    "id": "truenas-ssh",
+    "kind": "ssh",
+    "host": "truenas",
+    "batchMode": true,
+    "connectTimeoutSeconds": 10
+  },
+  "targetHost": "truenas",
+  "targetExecutable": "/usr/bin/python3.11",
+  "sourceDatabase": "/mnt/deepfreeze/tailterm-hub/state/hub.sqlite",
+  "backupDestination": "/mnt/deepfreeze/tailterm-hub/backups/before-mandatory-v3-fae9f7f-5669.sqlite",
+  "allowedBackupRoot": "/mnt/deepfreeze/tailterm-hub/backups",
+  "backupOwner": {
+    "uid": 950,
+    "gid": 950
+  },
+  "deployment": {
+    "releaseName": "20260913-mandatory-v3-fae9f7f",
+    "binaryDestination": "/mnt/deepfreeze/tailterm-hub/releases/20260913-mandatory-v3-fae9f7f/tailterm-hub",
+    "stateDirectory": "/mnt/deepfreeze/tailterm-hub/state",
+    "tokenPath": "/mnt/deepfreeze/tailterm-hub/hub-token",
+    "appName": "tailterm-hub",
+    "tcpListener": "100.116.238.37:18765"
+  }
+}

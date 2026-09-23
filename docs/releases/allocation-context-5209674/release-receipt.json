@@ -1,0 +1,164 @@
+{
+  "version": 1,
+  "createdAt": "2026-09-14T04:52:19.856227+00:00",
+  "workItem": "wi_5209b017e66bbf20",
+  "itemRevision": 1,
+  "implementationOrder": 5969,
+  "releaseOrder": 6142,
+  "ownerOrder": 6118,
+  "source": {
+    "workItem": "wi_5209b017e66bbf20",
+    "itemRevision": 1,
+    "sourceOrder": 5969,
+    "releaseOrder": 6142,
+    "sourceAcceptanceMessages": [
+      6149,
+      6151
+    ],
+    "commit": "5209674b61ce5f91d826e34908adf375379c4fe6",
+    "tree": "5064fd0b9abb73c5fe8bbc8eccaca925689e9f76",
+    "sourcePath": "/var/folders/p8/3rs14vyj49qcyw14jy7dddcr0000gn/T/allocation-context6142-e4k7y13a/source",
+    "createdAt": "2026-09-14T04:43:06.445028+00:00",
+    "compiler": "go1.26.6",
+    "flags": [
+      "-trimpath",
+      "-buildvcs=true",
+      "-ldflags=-s -w -buildid="
+    ],
+    "environment": {
+      "CGO_ENABLED": "0",
+      "GOOS": "darwin",
+      "GOARCH": "arm64"
+    },
+    "binary": {
+      "path": "tt",
+      "bytes": 6919410,
+      "sha256": "979ba2216c2167cf7500cbfc60dffd4d9e33a2413707a1f8b582c8c12238f4c2"
+    },
+    "reproducible": true,
+    "qualification": "builder reproducible clean source build and 14 synthetic external CLI checks PASS; independent package QA pending"
+  },
+  "installation": {
+    "workItem": "wi_5209b017e66bbf20",
+    "itemRevision": 1,
+    "workOrderMessage": 6142,
+    "installedAt": "2026-09-14T04:49:58.396326+00:00",
+    "path": "/Users/stephenspeicher/.local/bin/tt",
+    "binarySha256": "979ba2216c2167cf7500cbfc60dffd4d9e33a2413707a1f8b582c8c12238f4c2",
+    "rollbackPath": "/Users/stephenspeicher/.local/bin/tt-before-allocation-context5209674-6142",
+    "rollbackSha256": "2c23f9975462afb0bb587d7e213ae6272cae6062e6cf9a09bfba451133b1b378",
+    "mode": "0o755",
+    "source": "5209674b61ce5f91d826e34908adf375379c4fe6",
+    "scope": "Mini CLI only",
+    "independentInstalledQAPending": true
+  },
+  "sourceAcceptance": {
+    "lead": 6150,
+    "handler": [
+      6149,
+      6151
+    ]
+  },
+  "packageAcceptance": {
+    "lead": 6225,
+    "handler": 6229
+  },
+  "installedVerification": {
+    "operator": "14 synthetic loopback checks PASS",
+    "independent": "pending",
+    "delivery": "dly_3cdb7ab4437ca8af",
+    "generation": 3,
+    "executionEpoch": 1
+  },
+  "acceptance": null,
+  "limits": [
+    "Mini CLI only; hub remains accepted5793de1",
+    "No frontend, Air, relay, network, Tailscale, schema or live allocation changes",
+    "Digest-only allocation API does not validate context bytes",
+    "Parent typed-provenance Bug remains Open",
+    "Initial nested-worktree build failed VCS provenance check; retained outside package and never installed",
+    "Source QA independent logs retained in native thread; package and installed phases retain separate local evidence"
+  ],
+  "evidence": [
+    {
+      "path": "evidence/package/manifest.json",
+      "bytes": 938,
+      "sha256": "db7df6fc388a458a8b829e1675ee3e1501ffcd8e1b92ac74e1ce9fc9adbab81f"
+    },
+    {
+      "path": "evidence/package/SHA256SUMS",
+      "bytes": 473,
+      "sha256": "631f44ae596cf7e2f343106c3be4e595d59a523823a08cb392df26efc8c9ef90"
+    },
+    {
+      "path": "evidence/package/build-info.txt",
+      "bytes": 471,
+      "sha256": "741feb970891b04615df726301de846b8dee14f7c86cec2860e1402565fb25cf"
+    },
+    {
+      "path": "evidence/package/package-smoke.py",
+      "bytes": 4372,
+      "sha256": "d7bd75648d011cae4e916c53ba4d3d9afa41614323800e060ffb29d6073bb49f"
+    },
+    {
+      "path": "evidence/package/package-smoke.json",
+      "bytes": 2441,
+      "sha256": "d004b16ad7b1e72c585cf61043432e0b8fdf86c3c62dc6b7e3939403aab342df"
+    },
+    {
+      "path": "evidence/package-acceptance.json",
+      "bytes": 438,
+      "sha256": "51d0e75f1c5178e5acd91ac4f5a61fb2f46de9bdbf5a3d96a7932ae83335348f"
+    },
+    {
+      "path": "evidence/package-qa-6198/qa-manifest.md",
+      "bytes": 1639,
+      "sha256": "d496b073aee720d698cf39ca95ea8c2437e713b7ce7666610d7197ba367ff3b9"
+    },
+    {
+      "path": "evidence/package-qa-6198/package-smoke-independent.json",
+      "bytes": 2441,
+      "sha256": "d004b16ad7b1e72c585cf61043432e0b8fdf86c3c62dc6b7e3939403aab342df"
+    },
+    {
+      "path": "evidence/package-qa-6198/package-smoke-independent.log",
+      "bytes": 2441,
+      "sha256": "d004b16ad7b1e72c585cf61043432e0b8fdf86c3c62dc6b7e3939403aab342df"
+    },
+    {
+      "path": "evidence/installation-receipt.json",
+      "bytes": 606,
+      "sha256": "3487d8c9c33f026186907974692c82d1fa54cf986cee470f86df0ae5541e5744"
+    },
+    {
+      "path": "evidence/installed-build-info.txt",
+      "bytes": 417,
+      "sha256": "6d25ee80d76a57ac830c65e740c395b7c789b80f74e8115f7d27c79f704d9d8d"
+    },
+    {
+      "path": "evidence/installed-smoke.json",
+      "bytes": 2387,
+      "sha256": "98d4f7a9051804d97b4f57c2c9525636fde35f85f72345bd2cdb5a926a677c32"
+    },
+    {
+      "path": "evidence/installed-smoke.log",
+      "bytes": 2387,
+      "sha256": "98d4f7a9051804d97b4f57c2c9525636fde35f85f72345bd2cdb5a926a677c32"
+    },
+    {
+      "path": "evidence/preinstall-observation.json",
+      "bytes": 482,
+      "sha256": "502663577df4791b10b971cfe771ad6e4cb455984c7de36108c020cccc484554"
+    },
+    {
+      "path": "evidence/work-order.json",
+      "bytes": 3519,
+      "sha256": "8a5ddee5a11517ec871be54d1c1c5ebf89496ef3421bacea264cb29084768d31"
+    },
+    {
+      "path": "evidence/source-acceptance-submission.json",
+      "bytes": 1912,
+      "sha256": "257ebc462a3523158b954be135cedb449a293e10cf6645541571b0346a5554ae"
+    }
+  ]
+}

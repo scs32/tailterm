@@ -1,0 +1,31 @@
+{
+  "workItems": [
+    {
+      "itemTaskId": "tsk_2cfcff70a0fbe967",
+      "itemId": "wi_618c8ff87e6b8061",
+      "itemRevision": 5,
+      "relationship": "primary"
+    }
+  ],
+  "workOrderMessage": {
+    "taskId": "tsk_2cfcff70a0fbe967",
+    "seq": 5835
+  },
+  "postReceipt": {
+    "id": "mpr_0129232c19bbb437",
+    "requestId": "successor-installed-qa-handler-result-5873",
+    "taskId": "tsk_2cfcff70a0fbe967",
+    "messageSeq": 5876,
+    "createdAt": "2026-09-14T02:49:32.395833791Z"
+  },
+  "seq": 5876,
+  "taskId": "tsk_2cfcff70a0fbe967",
+  "from": {
+    "agentId": "agt_23aca58ddd659a3c",
+    "node": "workspace",
+    "user": "owner"
+  },
+  "to": "agt_3760a4361c514a03",
+  "text": "Installed QA PASS recorded on dly_3365304f5a46add0 g7/e1; result request successor-installed-qa-result-5873. Installed Mini/package hash, VCS, preflight/postcheck, capability versions and five copied synthetic smokes verified. Evidence /tmp/successor-installed-qa.BXyi1S. No live DB/Queue/provider, activation, or Feature completion claim. Please save/read back bounded installed-QA evidence; release acceptance remains separate.",
+  "createdAt": "2026-09-14T02:49:32.395833791Z"
+}

@@ -1,0 +1,20 @@
+{
+  "item": "wi_618c8ff87e6b8061",
+  "revision": 5,
+  "order": 5669,
+  "handlerOrder": 5668,
+  "owner": 5667,
+  "package": "/tmp/mandatory-v3-package-successor2.xR3pGU/package",
+  "source": "fae9f7ff34627449f716ef6439fe1eed5ab8ead5",
+  "pins": {
+    "manifest.json": "d11d8fb5711da6b1e4ddda591b2f3599fe7bf642b1aebd4c2f26c58cfe39fd54",
+    "checksums.txt": "ecb63437a07d6d312e141039f749ac2915ba49ecb7637608c364d4f428d0760e",
+    "tailterm-hub-linux-amd64": "85e23f2fca5024200d8d1410936fac44f7e31a52a9ef210f84a8e05de60adff3",
+    "tt-darwin-arm64": "7a63670a9210c7f5208cb500845e53d2f9fd42cc4f33d175c3221cf5d9d060c1",
+    "deploy-truenas-hub.py": "25b9e87a6a1c05793c734083902ca5a017999edfaebda745478021811f455afc",
+    "truenas_release_preflight.py": "82fd43e1edf6c9f3de89101c06b374cc1b3c0430e372676f5822740b01560d46"
+  },
+  "checksumsVerified": true,
+  "planSHA256": "833035cc9691940534a728c5dedc707e26550497edb484fef536263372606493",
+  "deploymentScriptsCopiedUnchanged": true
+}

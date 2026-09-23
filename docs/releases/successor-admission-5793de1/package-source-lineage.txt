@@ -1,0 +1,11 @@
+95063137dca83154d2299cbaa9bfeb27ef237e6f acf04089fb4e5c992ab63d3309c2ec70bca50790 2026-09-13T16:19:40-07:00 fix: retain accepted phase successor obligations
+5caebb10111a9561c1aabed8e658df583d7a2e7d 144fd6855e032ccffba59bed25882252758c990e 2026-09-13T16:21:26-07:00 fix: clear superseded successor on dependency
+a18b8d390cc7309ae02bf02ab04b2afa5aee614f 545a6456121979cafca0a7d41dc9d9d32f2e31fa 2026-09-13T16:25:28-07:00 fix: map missing successor dependency owner
+297e9275ab1dbe80ec010a6261ebd5a71b5857d7 879ee9aad59caa9d8706b134f59fe5afbb498775 2026-09-13T16:31:16-07:00 fix: fence successor evidence by execution epoch
+5fca221644e298883e9cfbdd13dbfe66c55ace54 8a246126490b072d1d104cac72ba46a32a044546 2026-09-13T17:04:38-07:00 fix successor predecessor self-link
+df91e7e572cb4e636394d048c9f4a607e3424eaf 31b897e2b5b9d532797660203de347cb1a2dc405 2026-09-13T16:00:41-07:00 docs: define accepted phase successor contract
+b19ae2e2d85cd4095312961c8e78d189e38295bd 21ce97e021eee60540ab290ef16fed5173103792 2026-09-13T16:30:15-07:00 docs: align phase successor operator contract
+001e5cf0dbf01341de36834bbb0c4b2c46830741 a6306812eb19b02fa89d4e3b60c95a1d3397fb8e 2026-09-13T17:15:28-07:00 docs: clarify predecessor exclusion in successor contract
+2df5b28e398b2f4f0b16388d8945dc45b5583d6e fd51c005c860a56b09f964d1a6f768963a2bd6fc 2026-09-13T16:23:08-07:00 fix(hub): preserve admission across no-op item updates
+190583824f2fa0eded11a59a43744139e77185c0 8e74dc453eb2d60d2ea0bf6787d6901028c0120d 2026-09-13T16:21:43-07:00 docs: define admission-safe no-op update contract
+5793de112e1b4c0a08d55fba17a7736e0bf2e0bf 43b026c59c40dcc2eb3dae75b397340007ff3225 2026-09-13T17:57:44-07:00 test: verify no-op updates preserve accepted phase continuation

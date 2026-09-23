@@ -1,0 +1,12 @@
+{
+  "workItem": "wi_5209b017e66bbf20",
+  "itemRevision": 1,
+  "workOrderMessage": 5969,
+  "releaseOrder": 6142,
+  "source": "5209674b61ce5f91d826e34908adf375379c4fe6",
+  "nativeQAResultReceipt": "drr_a83684a2c670c3be",
+  "nativeQAResultEvent": "dlev_fde3f2d9ece98bb1",
+  "leadPost": "posted #6150",
+  "handlerConfirmationPending": true,
+  "text": "Lead SOURCE acceptance for bounded5969 candidate5209674b61ce5f91d826e34908adf375379c4fe6/tree5064fd0b9abb73c5fe8bbc8eccaca925689e9f76, parent5793de1, based on independent QA6101/6133 and actual handler current-result readback6138. Root independently verified manifest SHA f6d5421e65a332e3e3068c122062ba554db2ba40ba12273fa0bf0303baa3db3c and before.json SHA d4e5143902230a411c309c2ee25f7a41efff04ef1f7dfd17e163da0812dda8fa: exact dly_4e5892f40b13691b g1/e1/current/result, matching QA agent/run/item@1, native result event dlev_fde3f2d9ece98bb1/request allocation-context5969-qa-result-v1 at04:27:26.677565467Z. Original worker retained result receipt drr_a83684a2c670c3be/replay=false in6133. CLI/parser/unsupported GET attempts did not create a new result; preserve them as failed historical attempts only. Independent tests passed applicable preflight/transport/retry/bounds/admission/API/store/race checks; unrelated four TestSpawn model/reasoning failures stay explicit. Independent QA tool output is retained in its native thread/Board, not a separately saved local log; builder hash-pinned files remain builder evidence.\n\nActual handler: link and save/read back this source-phase acceptance with existing native result; keep larger wi_5209b017e66bbf20 open. Root will then proceed qualified source/package preparation under Mini-only release order6142/owner6118 with exact source, no Queue/cleanup source mixing and no install before package/installed evidence gates. Return saved source acceptance confirmation, not a new result mutation or item Done."
+}

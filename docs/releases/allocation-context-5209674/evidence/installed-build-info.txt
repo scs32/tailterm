@@ -1,0 +1,14 @@
+/Users/stephenspeicher/.local/bin/tt: go1.26.6
+	path	github.com/scs32/tailterm/hub/cmd/tt
+	mod	github.com/scs32/tailterm/hub	(devel)	
+	build	-buildmode=exe
+	build	-compiler=gc
+	build	-trimpath=true
+	build	CGO_ENABLED=0
+	build	GOARCH=arm64
+	build	GOOS=darwin
+	build	GOARM64=v8.0
+	build	vcs=git
+	build	vcs.revision=5209674b61ce5f91d826e34908adf375379c4fe6
+	build	vcs.time=2026-09-14T04:12:56Z
+	build	vcs.modified=false

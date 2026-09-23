@@ -1,0 +1,47 @@
+{
+  "version": 1,
+  "workItem": "wi_5209b017e66bbf20",
+  "itemRevision": 1,
+  "sourceOrder": 5969,
+  "releaseOrder": 6142,
+  "leadAcceptanceMessage": 6248,
+  "handlerAcceptanceMessage": 6254,
+  "status": "accepted_cli_only",
+  "savedAt": "2026-09-14T04:55:00.898482+00:00",
+  "releaseReceipt": {
+    "path": "release-receipt.json",
+    "sha256": "01df02144acf0095d212b25a0c116f893b2a1ea01fef0a93f2c27f442e8eb736"
+  },
+  "source": "5209674b61ce5f91d826e34908adf375379c4fe6",
+  "tree": "5064fd0b9abb73c5fe8bbc8eccaca925689e9f76",
+  "installedSha256": "979ba2216c2167cf7500cbfc60dffd4d9e33a2413707a1f8b582c8c12238f4c2",
+  "qa": {
+    "delivery": "dly_3cdb7ab4437ca8af",
+    "generation": 3,
+    "executionEpoch": 1,
+    "resultReceipt": "drr_0efc20a8f8d6079b",
+    "resultEvent": "dlev_405d1757eec6d898",
+    "requestId": "allocation-context6142-installed-qa-result-v1",
+    "correctionMessage": 6243,
+    "handlerCorrectionMessage": 6247,
+    "evidence": [
+      {
+        "path": "evidence/installed-qa-6234/qa-manifest.md",
+        "bytes": 1739,
+        "sha256": "706c53e3c48e778b9bf722847dfb7c5e7f27ce16f514d72ac8a4b6f3ea3c370b"
+      },
+      {
+        "path": "evidence/installed-qa-6234/installed-smoke-independent.json",
+        "bytes": 2387,
+        "sha256": "98d4f7a9051804d97b4f57c2c9525636fde35f85f72345bd2cdb5a926a677c32"
+      },
+      {
+        "path": "evidence/installed-qa-6234/installed-smoke-independent.log",
+        "bytes": 2387,
+        "sha256": "98d4f7a9051804d97b4f57c2c9525636fde35f85f72345bd2cdb5a926a677c32"
+      }
+    ]
+  },
+  "scope": "Mini CLI prepared-context preflight/transport only; hub stays5793de1; parentBugOpen",
+  "rootSourceIntegration": "Qualified standalone source checkout, no root tasks-hub merge or product-source edit in this release."
+}

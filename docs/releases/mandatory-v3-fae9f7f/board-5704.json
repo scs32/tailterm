@@ -1,0 +1,35 @@
+{
+  "messages": [
+    {
+      "workItems": [
+        {
+          "itemTaskId": "tsk_2cfcff70a0fbe967",
+          "itemId": "wi_618c8ff87e6b8061",
+          "itemRevision": 5,
+          "relationship": "primary"
+        }
+      ],
+      "workOrderMessage": {
+        "taskId": "tsk_2cfcff70a0fbe967",
+        "seq": 5669
+      },
+      "postReceipt": {
+        "id": "mpr_de0ce54922a2f457",
+        "requestId": "mandatory-v3-handler-acceptance-5702",
+        "taskId": "tsk_2cfcff70a0fbe967",
+        "messageSeq": 5704,
+        "createdAt": "2026-09-14T01:24:25.849874194Z"
+      },
+      "replyTo": 5702,
+      "seq": 5704,
+      "taskId": "tsk_2cfcff70a0fbe967",
+      "from": {
+        "agentId": "agt_3760a4361c514a03",
+        "node": "workspace",
+        "user": "owner"
+      },
+      "text": "Handler acceptance readback for wi_618c8ff87e6b8061@5/order5669: independent QA PASS #5702/#5703 is accepted for this bounded operational release scope. Exact delivery dly_721c753c4bccbea3 g3/e1, frozen package pins, preflight plan SHA 833035cc9691940534a728c5dedc707e26550497edb484fef536263372606493, receipt-bytes SHA 7e0c55b93e177cbb8282cec4a448bc207a5fbbe74997d8c688e07d8d04a7668f, deployment inputs #5683, and fresh handler postcheck #5698 are retained. Handler postcheck confirms live/backup integrity OK, FK0, profilesEqual=true, and expected additive v3 schema/index migration. Acceptance is limited to installed package/release evidence; synthetic smokes do not prove unattended activation. Feature remains open and no parent completion or lifecycle claim is made.",
+      "createdAt": "2026-09-14T01:24:25.849874194Z"
+    }
+  ]
+}

@@ -1,0 +1,4 @@
+82fd43e1edf6c9f3de89101c06b374cc1b3c0430e372676f5822740b01560d46  scripts/truenas_release_preflight.py
+25b9e87a6a1c05793c734083902ca5a017999edfaebda745478021811f455afc  scripts/deploy-truenas-hub.py
+82fd43e1edf6c9f3de89101c06b374cc1b3c0430e372676f5822740b01560d46  /tmp/successor-admission-package.XYEusu/package/truenas_release_preflight.py
+25b9e87a6a1c05793c734083902ca5a017999edfaebda745478021811f455afc  /tmp/successor-admission-package.XYEusu/package/deploy-truenas-hub.py

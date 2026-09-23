@@ -1,0 +1,280 @@
+{
+  "version": 1,
+  "createdAt": "2026-09-14T01:24:37.171479+00:00",
+  "item": "wi_618c8ff87e6b8061",
+  "revision": 5,
+  "order": 5669,
+  "handlerOrder": 5668,
+  "ownerRequest": 5667,
+  "source": "fae9f7ff34627449f716ef6439fe1eed5ab8ead5",
+  "tree": "fffad908bf310247e5da3b86d4ddd2e096772eb3",
+  "release": "20260913-mandatory-v3-fae9f7f",
+  "package": "/tmp/mandatory-v3-package-successor2.xR3pGU/package",
+  "packageAcceptance": [
+    5361,
+    5364
+  ],
+  "handlerBackupMessage": 5671,
+  "handlerFreshPostcheckMessage": 5698,
+  "hub": {
+    "state": "RUNNING",
+    "sha256": "85e23f2fca5024200d8d1410936fac44f7e31a52a9ef210f84a8e05de60adff3",
+    "readOnlyMountVerified": true,
+    "onlyBinaryMountChanged": true
+  },
+  "mini": {
+    "sha256": "7a63670a9210c7f5208cb500845e53d2f9fd42cc4f33d175c3221cf5d9d060c1",
+    "bytes": 6901826,
+    "sourceMetadataClean": true,
+    "atomicInstall": true,
+    "retainedRollback": "/Users/stephenspeicher/.local/bin/tt-before-mandatory-v3-fae9f7f-5669"
+  },
+  "validation": {
+    "reliableDeliveryVersions": [
+      1,
+      2,
+      3
+    ],
+    "operationalRecordsVersions": [
+      1
+    ],
+    "installedSyntheticSmokesPassed": 4,
+    "integrity": "ok",
+    "foreignKeyViolations": 0,
+    "profilesEqual": true,
+    "expectedMigrationObjects": true,
+    "expectedMigrationColumns": true,
+    "nonLegacyActionRowsAtPostcheck": 0,
+    "recoveryIncidentRowsAtPostcheck": 0,
+    "preservedRootHead": "563a567778567b6137af85223a26346b2c24aab9",
+    "ownerAgentsSHA256": "2edd1d7443dbfb0ed032f962f89e428ee2d610a7477f4886f8f1c6a963961ed2",
+    "previewPID": 60799,
+    "previewPPID": 1
+  },
+  "rollback": {
+    "hubBinary": "/mnt/deepfreeze/tailterm-hub/releases/20260913-native-reader-19970cea/tailterm-hub",
+    "hubSHA256": "d55ea00ef313b855018356cdc2881378ff36d056743f0e636b8362134fdc265a",
+    "miniSHA256": "f9cb8b7e480c3c32ed1a8de567cb88d0373d4e1ca4d99b4e77ba37c6134a4198",
+    "databaseBackup": "/mnt/deepfreeze/tailterm-hub/backups/before-mandatory-v3-fae9f7f-5669.sqlite",
+    "limits": "Keep additive database; old semantic downgrade is unproven after v3 sibling/recovery writes. Never restore backup over intervening writes."
+  },
+  "provenanceCorrections": [
+    "QA enrollment first rejected binding-order mismatch5675; handler reconciled exact binding3791/governing5669 and enrolled5684.",
+    "Backup replay5685 retained; distinct fresh profile/schema postcheck5698 supplies post-install evidence."
+  ],
+  "limits": [
+    "No package rebuild or inclusion of unaccepted cleanup/successor/admission source.",
+    "No frontend, Air, relay reload, network or Tailscale changes.",
+    "No live fixtures, real v3 activation or unattended-prevention claim.",
+    "No parent Feature completion or agent/task closure."
+  ],
+  "independentQA": {
+    "delivery": "dly_721c753c4bccbea3",
+    "generation": 3,
+    "executionEpoch": 1,
+    "statusAtCreation": "pending final result; separate receipt required"
+  },
+  "evidence": [
+    {
+      "path": "package-pins.json",
+      "bytes": 978,
+      "sha256": "9376410c5a25095458dde17741f2c8676c0513f68a548336141fb285984345e4"
+    },
+    {
+      "path": "backup-plan.json",
+      "bytes": 1259,
+      "sha256": "833035cc9691940534a728c5dedc707e26550497edb484fef536263372606493"
+    },
+    {
+      "path": "handler-preflight-receipt.json",
+      "bytes": 2530,
+      "sha256": "7e0c55b93e177cbb8282cec4a448bc207a5fbbe74997d8c688e07d8d04a7668f"
+    },
+    {
+      "path": "handler-receipt-provenance.json",
+      "bytes": 134,
+      "sha256": "7296ed43fb0b0a106dc6472582d526546e7a31432de6c04a862c018631ad4a5f"
+    },
+    {
+      "path": "pre-config.json",
+      "bytes": 930,
+      "sha256": "50dd61f327c3d55cdc33e70c33fae708a43c1013e75d8141deb1a6528a1a8adb"
+    },
+    {
+      "path": "expected-config.json",
+      "bytes": 928,
+      "sha256": "49b0bb10594350be50330211ca55a498a20f9ffb4d7bf17ffe00f21d2f6ed411"
+    },
+    {
+      "path": "hub-precheck.json",
+      "bytes": 1154,
+      "sha256": "dba51687ae51ba22d8af497a3defe08dda96619e2963bc949d8d293b296e2edb"
+    },
+    {
+      "path": "deployment-result.json",
+      "bytes": 881,
+      "sha256": "35adcf56d6f7e6273851085ba696e03d7a42981bfee168eeda9309b4719637e5"
+    },
+    {
+      "path": "hub-post-inventory.json",
+      "bytes": 1168,
+      "sha256": "d07f9c5fb999bcd0d393126041b8f360f5519b686d8e404c0e2ea5e0013e701a"
+    },
+    {
+      "path": "hub-active-workload.json",
+      "bytes": 1332,
+      "sha256": "f0938fad43168e0fd568c6775d3a403ced704856cc5462850924305bb0c1cc72"
+    },
+    {
+      "path": "mini-install.json",
+      "bytes": 950,
+      "sha256": "146a39a02f5c5b85fdaef55f2e59d43cc34cff6ba4ac62142d35bdc9fb53d926"
+    },
+    {
+      "path": "capabilities.json",
+      "bytes": 707,
+      "sha256": "71b230a9ff58c0ac6a68684dc20213b26e76883d66cd2b66b4a12e87e5977d58"
+    },
+    {
+      "path": "installed-smoke-results.json",
+      "bytes": 629,
+      "sha256": "7ab16fcef45fbc57d2ea0a9342e33d4aba7cbf9a81bde3d426a495dd63d902da"
+    },
+    {
+      "path": "handler-postcheck.py",
+      "bytes": 5528,
+      "sha256": "282f2303ea7a75a4a7bbdd1349deb893af2c009d515c35b6b748a5d527e8f2db"
+    },
+    {
+      "path": "handler-postcheck.json",
+      "bytes": 14248,
+      "sha256": "8375b924dcac1665c57a6b1a1e23115b58eb8018aedc6f2b1703f5e57a7106b5"
+    },
+    {
+      "path": "handler-postcheck-provenance.json",
+      "bytes": 128,
+      "sha256": "139ff43aea89c5c9b494df46d3143b1dda17f090075496ba6a5bf0f4e4ac3bdb"
+    },
+    {
+      "path": "preservation-check.json",
+      "bytes": 216,
+      "sha256": "bf1ddc2ec91e2630e956dfdf620f482ebd7c1d0d6bda9f032468780062ce9935"
+    },
+    {
+      "path": "run-installed-smokes.py",
+      "bytes": 1468,
+      "sha256": "5cb18336168ede32ee63b77d93cb953bcb1485ec2779b93b8c84b7645aa3b4ef"
+    },
+    {
+      "path": "installed-smokes/followthrough/reliable-followthrough-cli-smoke.json",
+      "bytes": 8362,
+      "sha256": "d0a6e5ea6a34ad7796ddc8f711b31411c7a942c5b3e11619549874487c0d4871"
+    },
+    {
+      "path": "installed-smokes/followthrough-cli-smoke.py",
+      "bytes": 16009,
+      "sha256": "d9975249ad880e7ba8f7c912c7e0a67472cd0a93c4cef36cdb86256cd0fbc27a"
+    },
+    {
+      "path": "installed-smokes/followthrough-cli-smoke.py.stderr",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "installed-smokes/followthrough-cli-smoke.py.stdout",
+      "bytes": 224,
+      "sha256": "d5a336c825d671f0859f283428063f578a6c4431286375d2fcb3ae087a55caf6"
+    },
+    {
+      "path": "installed-smokes/mandatory-v3/enrollment-0.json",
+      "bytes": 625,
+      "sha256": "c9e15acf7384271a75d33cf106de1447cb0ca74408d8671715d726c365f81c8f"
+    },
+    {
+      "path": "installed-smokes/mandatory-v3/enrollment-1.json",
+      "bytes": 640,
+      "sha256": "6e9e3e1bf54b4cb55e981828cb0770e63f08d9316cb3881f7020466687728324"
+    },
+    {
+      "path": "installed-smokes/mandatory-v3/enrollment-2.json",
+      "bytes": 639,
+      "sha256": "e7da5ea7a1767918c93e8190a6f19c950510792c2873af10b44b1160a33d261a"
+    },
+    {
+      "path": "installed-smokes/mandatory-v3/incident.json",
+      "bytes": 655,
+      "sha256": "1591af42d8536dd1b854f627a3a242da976b8f235759a909abde8585aa736c35"
+    },
+    {
+      "path": "installed-smokes/mandatory-v3/mandatory-v3-cli-smoke.json",
+      "bytes": 10082,
+      "sha256": "958cc2d8854b6d1c42dd5660becdd44b6b794dc97f04c0eeb75dcf765b63a178"
+    },
+    {
+      "path": "installed-smokes/mandatory-v3-cli-smoke.py",
+      "bytes": 15480,
+      "sha256": "439d4e88501633982cfa4ad9c237bd4567ce769ee6d482c3fb441c9260ec3536"
+    },
+    {
+      "path": "installed-smokes/mandatory-v3-cli-smoke.py.stderr",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "installed-smokes/mandatory-v3-cli-smoke.py.stdout",
+      "bytes": 202,
+      "sha256": "da9d0bdb659c9d1685f9c69f2b837f235c716a7d2cfcf4e5787a5e0ca33c9b6a"
+    },
+    {
+      "path": "installed-smokes/operational/operational-cli-regression-smoke.json",
+      "bytes": 4657,
+      "sha256": "f10b0b19ea2f6f9a6da4a504cd4b637f80943715a10827bd58a7eff009696803"
+    },
+    {
+      "path": "installed-smokes/operational/operational-commit.json",
+      "bytes": 54,
+      "sha256": "6595a3daf04fb43cc162cb79e5ba5d878de36573bb2c2776c031cf39fc4cf7cb"
+    },
+    {
+      "path": "installed-smokes/operational/operational-proposal.json",
+      "bytes": 66,
+      "sha256": "2911fb8bdff80c2077c2f12624f29207469f6e74f92b8e956d80ed739f7bba2a"
+    },
+    {
+      "path": "installed-smokes/operational-cli-smoke.py",
+      "bytes": 6466,
+      "sha256": "598ef7be014648417da9ccf5f3112fcb5eb931e11b06aa42e1b745443effbda5"
+    },
+    {
+      "path": "installed-smokes/operational-cli-smoke.py.stderr",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "installed-smokes/operational-cli-smoke.py.stdout",
+      "bytes": 329,
+      "sha256": "802caa7a354bce90988e38ec9fe1c5bc558ea7b109179f8f5649ee464a7d4714"
+    },
+    {
+      "path": "installed-smokes/reader-cli-smoke.py",
+      "bytes": 6445,
+      "sha256": "0d8d5e6e4ad13286a75b643b0fc17821213c1a4a286ab5927758c0ec0cea6b74"
+    },
+    {
+      "path": "installed-smokes/reader-cli-smoke.py.stderr",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "installed-smokes/reader-cli-smoke.py.stdout",
+      "bytes": 424,
+      "sha256": "7720058ba70e983ea8b3775fdd257313e603b54a9aeb87667bd5b34f0e90ee4d"
+    },
+    {
+      "path": "installed-smokes/reader-result.json",
+      "bytes": 513,
+      "sha256": "41b9ae4b5a51f78de1b14187a2e936c90a57d65c31a0110ed288804ea9841292"
+    }
+  ],
+  "acceptance": null
+}

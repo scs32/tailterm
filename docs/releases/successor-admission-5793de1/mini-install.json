@@ -1,0 +1,12 @@
+{
+  "order": 5835,
+  "installedAt": "2026-09-14T02:37:48.196570+00:00",
+  "installedPath": "/Users/stephenspeicher/.local/bin/tt",
+  "bytes": 6919234,
+  "sha256": "2c23f9975462afb0bb587d7e213ae6272cae6062e6cf9a09bfba451133b1b378",
+  "priorBackup": "/Users/stephenspeicher/.local/bin/tt-before-successor-admission-5793de1-5834",
+  "priorSha256": "7a63670a9210c7f5208cb500845e53d2f9fd42cc4f33d175c3221cf5d9d060c1",
+  "atomicReplacement": true,
+  "vcsRevision": "5793de112e1b4c0a08d55fba17a7736e0bf2e0bf",
+  "vcsModified": false
+}

@@ -1,0 +1,359 @@
+{
+  "version": 1,
+  "result": "pass",
+  "candidateCli": {
+    "bytes": 6901826,
+    "sha256": "7a63670a9210c7f5208cb500845e53d2f9fd42cc4f33d175c3221cf5d9d060c1"
+  },
+  "capabilityVersion": 3,
+  "isolatedLoopbackHTTPOnly": true,
+  "syntheticIdentitiesOnly": true,
+  "liveDatabaseHubTmuxOrRuntimeUsed": false,
+  "cases": [
+    {
+      "case": "item_worker_independent_responsibility",
+      "passed": true
+    },
+    {
+      "case": "project_lead_independent_responsibility",
+      "passed": true
+    },
+    {
+      "case": "database_handler_independent_responsibility",
+      "passed": true
+    },
+    {
+      "case": "paired_selector_required_before_http",
+      "passed": true
+    },
+    {
+      "case": "dependency_block_resolution_resume_serialization",
+      "passed": true
+    },
+    {
+      "case": "required_cause_incident_serialization",
+      "passed": true
+    },
+    {
+      "case": "v3_enrollment_old_hub",
+      "passed": true,
+      "unsafeRequestSent": false
+    },
+    {
+      "case": "v3_selector_old_hub",
+      "passed": true,
+      "unsafeRequestSent": false
+    }
+  ],
+  "capturedRequests": [
+    {
+      "method": "GET",
+      "path": "/v1/capabilities"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/capabilities"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/tasks/tsk_0000000000000001/required-deliveries",
+      "body": {
+        "requestId": "smoke-v3-enroll-0",
+        "messageSeq": 41,
+        "kind": "assignment",
+        "recipientKind": "item_worker",
+        "actionKey": "execute",
+        "actionClass": "execution",
+        "agentId": "agt_0000000000000002",
+        "runId": "run_0000000000000003",
+        "itemTaskId": "tsk_0000000000000001",
+        "itemId": "wi_0000000000000011",
+        "itemRevision": 5,
+        "workOrderMessage": {
+          "taskId": "tsk_0000000000000001",
+          "seq": 39
+        },
+        "governingOrderMessage": {
+          "taskId": "tsk_0000000000000001",
+          "seq": 40
+        },
+        "instructionSha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "instructionBytes": 31,
+        "enrollmentVersion": 3,
+        "expectedCurrentGeneration": 0,
+        "producerAgentId": "agt_0000000000000004",
+        "producerRunId": "run_0000000000000005"
+      }
+    },
+    {
+      "method": "GET",
+      "path": "/v1/capabilities"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/capabilities"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/tasks/tsk_0000000000000001/agents/agt_0000000000000002/current-assignment?actionKey=execute&itemId=wi_0000000000000011&runId=run_0000000000000003"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/capabilities"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/capabilities"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/capabilities"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/tasks/tsk_0000000000000001/agents/agt_0000000000000002/delivery-coverage?actionKey=execute&itemId=wi_0000000000000011&runId=run_0000000000000003"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/capabilities"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/capabilities"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/tasks/tsk_0000000000000001/required-deliveries",
+      "body": {
+        "requestId": "smoke-v3-enroll-1",
+        "messageSeq": 41,
+        "kind": "assignment",
+        "recipientKind": "project_lead",
+        "actionKey": "coordinate",
+        "actionClass": "independent_dispatch",
+        "agentId": "agt_0000000000000002",
+        "runId": "run_0000000000000003",
+        "itemTaskId": "tsk_0000000000000001",
+        "itemId": "wi_0000000000000012",
+        "itemRevision": 5,
+        "workOrderMessage": {
+          "taskId": "tsk_0000000000000001",
+          "seq": 39
+        },
+        "governingOrderMessage": {
+          "taskId": "tsk_0000000000000001",
+          "seq": 40
+        },
+        "instructionSha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "instructionBytes": 31,
+        "enrollmentVersion": 3,
+        "expectedCurrentGeneration": 0,
+        "producerAgentId": "agt_0000000000000004",
+        "producerRunId": "run_0000000000000005"
+      }
+    },
+    {
+      "method": "GET",
+      "path": "/v1/capabilities"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/capabilities"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/tasks/tsk_0000000000000001/agents/agt_0000000000000002/current-assignment?actionKey=coordinate&itemId=wi_0000000000000012&runId=run_0000000000000003"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/capabilities"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/capabilities"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/capabilities"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/tasks/tsk_0000000000000001/agents/agt_0000000000000002/delivery-coverage?actionKey=coordinate&itemId=wi_0000000000000012&runId=run_0000000000000003"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/capabilities"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/capabilities"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/tasks/tsk_0000000000000001/required-deliveries",
+      "body": {
+        "requestId": "smoke-v3-enroll-2",
+        "messageSeq": 41,
+        "kind": "assignment",
+        "recipientKind": "database_handler",
+        "actionKey": "persist",
+        "actionClass": "database_operation",
+        "agentId": "agt_0000000000000002",
+        "runId": "run_0000000000000003",
+        "itemTaskId": "tsk_0000000000000001",
+        "itemId": "wi_0000000000000013",
+        "itemRevision": 5,
+        "workOrderMessage": {
+          "taskId": "tsk_0000000000000001",
+          "seq": 39
+        },
+        "governingOrderMessage": {
+          "taskId": "tsk_0000000000000001",
+          "seq": 40
+        },
+        "instructionSha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "instructionBytes": 31,
+        "enrollmentVersion": 3,
+        "expectedCurrentGeneration": 0,
+        "producerAgentId": "agt_0000000000000004",
+        "producerRunId": "run_0000000000000005"
+      }
+    },
+    {
+      "method": "GET",
+      "path": "/v1/capabilities"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/capabilities"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/tasks/tsk_0000000000000001/agents/agt_0000000000000002/current-assignment?actionKey=persist&itemId=wi_0000000000000013&runId=run_0000000000000003"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/capabilities"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/capabilities"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/capabilities"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/tasks/tsk_0000000000000001/agents/agt_0000000000000002/delivery-coverage?actionKey=persist&itemId=wi_0000000000000013&runId=run_0000000000000003"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/capabilities"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/tasks/tsk_0000000000000001/deliveries/dly_0000000000000020/blocks",
+      "body": {
+        "requestId": "smoke-block",
+        "agentId": "agt_0000000000000002",
+        "runId": "run_0000000000000003",
+        "expectedEpoch": 1,
+        "reasonClass": "dependency",
+        "text": "synthetic dependency"
+      }
+    },
+    {
+      "method": "GET",
+      "path": "/v1/capabilities"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/tasks/tsk_0000000000000001/deliveries/dly_0000000000000020/blocks/dlb_0000000000000023/resolutions",
+      "body": {
+        "requestId": "smoke-resolve",
+        "agentId": "agt_0000000000000004",
+        "runId": "run_0000000000000005",
+        "expectedEpoch": 1,
+        "text": "dependency satisfied"
+      }
+    },
+    {
+      "method": "GET",
+      "path": "/v1/capabilities"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/tasks/tsk_0000000000000001/deliveries/dly_0000000000000020/resume",
+      "body": {
+        "requestId": "smoke-resume",
+        "agentId": "agt_0000000000000002",
+        "runId": "run_0000000000000003",
+        "expectedEpoch": 1,
+        "resolutionId": "dlr_0000000000000024"
+      }
+    },
+    {
+      "method": "GET",
+      "path": "/v1/capabilities"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/capabilities"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/tasks/tsk_0000000000000001/deliveries/dly_0000000000000020/recovery-incidents",
+      "body": {
+        "requestId": "smoke-required-cause",
+        "agentId": "agt_0000000000000004",
+        "runId": "run_0000000000000005",
+        "expectedGeneration": 1,
+        "expectedEpoch": 1,
+        "causeStatus": "unknown",
+        "lastSubstantiveAction": "synthetic checkpoint",
+        "lastSubstantiveAt": "2026-09-13T00:00:00Z",
+        "expectedNextAction": "synthetic next step",
+        "stopReason": "synthetic unexplained stop",
+        "causalEvidence": [
+          "synthetic evidence"
+        ],
+        "contributingConditions": [
+          "synthetic condition"
+        ],
+        "unresolvedQuestions": [
+          "synthetic question"
+        ],
+        "prevention": {
+          "ownerAgentId": "agt_0000000000000004",
+          "ownerRunId": "run_0000000000000005",
+          "workOrderMessage": {
+            "taskId": "tsk_0000000000000001",
+            "seq": 39
+          },
+          "verificationCriterion": "synthetic prevention verification"
+        }
+      }
+    },
+    {
+      "method": "GET",
+      "path": "/v1/capabilities"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/capabilities"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/capabilities"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/capabilities"
+    }
+  ],
+  "limits": [
+    "This packaged-binary smoke proves CLI capability gating and exact HTTP selector/action serialization.",
+    "Store/server state, CAS, replay, recovery-cause validation, migration and lifecycle semantics are covered by focused Go tests and independent QA."
+  ]
+}

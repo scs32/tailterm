@@ -1,0 +1,109 @@
+{
+  "workItem": "wi_5209b017e66bbf20",
+  "releaseOrder": 6142,
+  "binaryPath": "/Users/stephenspeicher/.local/bin/tt",
+  "binarySha256": "979ba2216c2167cf7500cbfc60dffd4d9e33a2413707a1f8b582c8c12238f4c2",
+  "syntheticOnly": true,
+  "tests": [
+    {
+      "name": "valid",
+      "transport": "file",
+      "exitCode": 0,
+      "allocationRequests": 1,
+      "passed": true
+    },
+    {
+      "name": "valid",
+      "transport": "inline",
+      "exitCode": 0,
+      "allocationRequests": 1,
+      "passed": true
+    },
+    {
+      "name": "lost-response",
+      "transport": "file",
+      "exitCode": 1,
+      "allocationRequests": 1,
+      "passed": true
+    },
+    {
+      "name": "retry",
+      "transport": "file",
+      "exitCode": 0,
+      "allocationRequests": 1,
+      "passed": true
+    },
+    {
+      "name": "board-only",
+      "transport": "file",
+      "exitCode": 1,
+      "allocationRequests": 0,
+      "passed": true
+    },
+    {
+      "name": "board-only",
+      "transport": "inline",
+      "exitCode": 1,
+      "allocationRequests": 0,
+      "passed": true
+    },
+    {
+      "name": "null",
+      "transport": "file",
+      "exitCode": 1,
+      "allocationRequests": 0,
+      "passed": true
+    },
+    {
+      "name": "null",
+      "transport": "inline",
+      "exitCode": 1,
+      "allocationRequests": 0,
+      "passed": true
+    },
+    {
+      "name": "mismatch",
+      "transport": "file",
+      "exitCode": 1,
+      "allocationRequests": 0,
+      "passed": true
+    },
+    {
+      "name": "mismatch",
+      "transport": "inline",
+      "exitCode": 1,
+      "allocationRequests": 0,
+      "passed": true
+    },
+    {
+      "name": "missing-history",
+      "transport": "file",
+      "exitCode": 1,
+      "allocationRequests": 0,
+      "passed": true
+    },
+    {
+      "name": "missing-history",
+      "transport": "inline",
+      "exitCode": 1,
+      "allocationRequests": 0,
+      "passed": true
+    },
+    {
+      "name": "malformed",
+      "transport": "file",
+      "exitCode": 1,
+      "allocationRequests": 0,
+      "passed": true
+    },
+    {
+      "name": "malformed",
+      "transport": "inline",
+      "exitCode": 1,
+      "allocationRequests": 0,
+      "passed": true
+    }
+  ],
+  "passed": true,
+  "limits": "Loopback transport test verifies request equality after a dropped response; store replay semantics remain covered by independent source QA."
+}

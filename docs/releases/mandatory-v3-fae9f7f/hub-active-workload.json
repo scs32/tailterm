@@ -1,0 +1,56 @@
+{
+  "state": "RUNNING",
+  "containers": 1,
+  "containerDetails": [
+    {
+      "id": "30eaeef3be162fad1a19e5c03cfcd1eb53b8d3ea49a6580cfce629742a05700f",
+      "service_name": "hub",
+      "image": "gcr.io/distroless/static-debian12:nonroot",
+      "port_config": [
+        {
+          "container_port": 18765,
+          "protocol": "tcp",
+          "host_ports": [
+            {
+              "host_port": 18765,
+              "host_ip": "100.116.238.37"
+            }
+          ]
+        }
+      ],
+      "state": "running",
+      "volume_mounts": [
+        {
+          "source": "/mnt/deepfreeze/tailterm-hub/hub-token",
+          "destination": "/run/hub-token",
+          "mode": "ro",
+          "type": "bind"
+        },
+        {
+          "source": "/mnt/deepfreeze/tailterm-hub/releases/20260913-mandatory-v3-fae9f7f/tailterm-hub",
+          "destination": "/opt/tailterm-hub",
+          "mode": "ro",
+          "type": "bind"
+        },
+        {
+          "source": "/mnt/deepfreeze/tailterm-hub/state",
+          "destination": "/state",
+          "mode": "rw",
+          "type": "bind"
+        }
+      ]
+    }
+  ],
+  "ports": [
+    {
+      "container_port": 18765,
+      "protocol": "tcp",
+      "host_ports": [
+        {
+          "host_port": 18765,
+          "host_ip": "100.116.238.37"
+        }
+      ]
+    }
+  ]
+}

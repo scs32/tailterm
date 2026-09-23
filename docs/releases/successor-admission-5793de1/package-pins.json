@@ -1,0 +1,106 @@
+{
+  "manifestSha256": "0d0f5bd985adee2be099dd3ae839786c34d0883b82a57881b08d4afc6de6346d",
+  "checksumsSha256": "fd1f253c703a67d6303c3b4a636b12e7123c12358a983863b9737e70059d6684",
+  "files": [
+    {
+      "path": "build-environment.txt",
+      "bytes": 460,
+      "sha256": "5af45361e2b928e28aa3b07192588c2709cc31d122c2b643c434aa72378689aa"
+    },
+    {
+      "path": "deploy-truenas-hub.py",
+      "bytes": 15808,
+      "sha256": "25b9e87a6a1c05793c734083902ca5a017999edfaebda745478021811f455afc"
+    },
+    {
+      "path": "followthrough-cli-smoke.py",
+      "bytes": 16009,
+      "sha256": "71235d59adf9f3fcb3374ab62ce14e01b994f58b19c1086521b1f435ebfed5e7"
+    },
+    {
+      "path": "go-version-m.txt",
+      "bytes": 4892,
+      "sha256": "77de55a01fdd4e941c4bc7e9ca92d234c349219669269f2dab117ae7e382cd39"
+    },
+    {
+      "path": "mandatory-v3-cli-smoke.py",
+      "bytes": 15480,
+      "sha256": "e41ee35c64f7e68ebca8ea0ec15c9a0f53dbb8ac76b15ec3cd96f2db23e78d4a"
+    },
+    {
+      "path": "migration-delta.patch",
+      "bytes": 5049,
+      "sha256": "adb1489566d0e76763b66d08409e5f6a5e58175ac191d6109f3902f4f8698b1c"
+    },
+    {
+      "path": "operational-cli-smoke.py",
+      "bytes": 6466,
+      "sha256": "f0e3ad79bf1d30a6e26786298d66a322f00d38e62ce51bcdac7cc92edaaa8b60"
+    },
+    {
+      "path": "package-report.md",
+      "bytes": 9170,
+      "sha256": "bb1766efc3ce8426e230797f0121a4238f9356639002324682379d1557fd01e8"
+    },
+    {
+      "path": "phase-successor-cli-smoke.py",
+      "bytes": 6970,
+      "sha256": "5f062c366e9e50328e4cbbfc9121c7748c1fea1dcf7faba2100840ee84724546"
+    },
+    {
+      "path": "reader-cli-smoke.py",
+      "bytes": 6445,
+      "sha256": "d46963e16a63090a7b8bcea70eead1c9f196f15452ed855d835b229c392a962a"
+    },
+    {
+      "path": "source-5793de1.tar",
+      "bytes": 11550720,
+      "sha256": "28b6db51774ed56af5da2959647108031406dc526bcb8c972c5a09cf51c44ba0"
+    },
+    {
+      "path": "source-changes.txt",
+      "bytes": 835,
+      "sha256": "5576342098374f9c45afe218e6be9cb711d517e99a189f6d0676b136b75bacc6"
+    },
+    {
+      "path": "source-file-sha256.txt",
+      "bytes": 2179,
+      "sha256": "e3e3a495805a6c2636c4c30cb33cb5777973e6b473a5f50a9017fdb4577dc9ac"
+    },
+    {
+      "path": "source-lineage.txt",
+      "bytes": 1732,
+      "sha256": "d2d45ecfd135eda1449943e06b09f3057b838fc3995c90655326865cdc1156e6"
+    },
+    {
+      "path": "tailterm-hub-linux-amd64",
+      "bytes": 27873406,
+      "sha256": "1d9e97679b24428a9784430e3c96d908debc3bac71c869ac1e7f4b73a232d232"
+    },
+    {
+      "path": "truenas_release_preflight.py",
+      "bytes": 43646,
+      "sha256": "82fd43e1edf6c9f3de89101c06b374cc1b3c0430e372676f5822740b01560d46"
+    },
+    {
+      "path": "tt-darwin-arm64",
+      "bytes": 6919234,
+      "sha256": "2c23f9975462afb0bb587d7e213ae6272cae6062e6cf9a09bfba451133b1b378"
+    },
+    {
+      "path": "upstream-admission-integration-manifest.json",
+      "bytes": 5138,
+      "sha256": "b48a5b04b39064cebfc47758b980979ae747888bacc51cd7ce246f66e10f7bca"
+    },
+    {
+      "path": "upstream-phase-successor-integration-manifest.json",
+      "bytes": 6543,
+      "sha256": "e6a0905e275f18488e4c4191d3b6323201653ddb737b14530066db78baa98970"
+    },
+    {
+      "path": "verified-host-script-pins.txt",
+      "bytes": 478,
+      "sha256": "e27cede42db50bf254c4c7483776adf56978cbb2bdf676b4c309cffa655abcb4"
+    }
+  ]
+}

@@ -1,0 +1,13 @@
+{
+  "workItem": "wi_5209b017e66bbf20",
+  "itemRevision": 1,
+  "workOrderMessage": 6142,
+  "handlerSaved": true,
+  "handlerConfirmationMessage": 6229,
+  "leadAcceptanceMessage": 6225,
+  "binarySha256": "979ba2216c2167cf7500cbfc60dffd4d9e33a2413707a1f8b582c8c12238f4c2",
+  "qaResultReceipt": "drr_39baafa48144f409",
+  "qaResultEvent": "dlev_78411e756b6ff562",
+  "qaDelivery": "dly_05aa08a2e04aea9d",
+  "qaManifestCorrectionMessage": 6220
+}

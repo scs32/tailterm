@@ -1,0 +1,11 @@
+{
+  "observedAt": "2026-09-14T01:17:40.907305+00:00",
+  "installedPath": "/Users/stephenspeicher/.local/bin/tt",
+  "bytes": 6901826,
+  "sha256": "7a63670a9210c7f5208cb500845e53d2f9fd42cc4f33d175c3221cf5d9d060c1",
+  "backup": "/Users/stephenspeicher/.local/bin/tt-before-mandatory-v3-fae9f7f-5669",
+  "backupSHA256": "f9cb8b7e480c3c32ed1a8de567cb88d0373d4e1ca4d99b4e77ba37c6134a4198",
+  "metadata": "/Users/stephenspeicher/.local/bin/tt: go1.26.6\n\tpath\tgithub.com/scs32/tailterm/hub/cmd/tt\n\tmod\tgithub.com/scs32/tailterm/hub\t(devel)\t\n\tbuild\t-buildmode=exe\n\tbuild\t-compiler=gc\n\tbuild\t-trimpath=true\n\tbuild\tCGO_ENABLED=0\n\tbuild\tGOARCH=arm64\n\tbuild\tGOOS=darwin\n\tbuild\tGOARM64=v8.0\n\tbuild\tvcs=git\n\tbuild\tvcs.revision=fae9f7ff34627449f716ef6439fe1eed5ab8ead5\n\tbuild\tvcs.time=2026-09-13T22:53:23Z\n\tbuild\tvcs.modified=false\n",
+  "method": "exclusive same-directory staging, fsync, atomic replace",
+  "order": 5669
+}

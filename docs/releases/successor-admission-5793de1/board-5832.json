@@ -1,0 +1,31 @@
+{
+  "workItems": [
+    {
+      "itemTaskId": "tsk_2cfcff70a0fbe967",
+      "itemId": "wi_618c8ff87e6b8061",
+      "itemRevision": 5,
+      "relationship": "primary"
+    }
+  ],
+  "workOrderMessage": {
+    "taskId": "tsk_2cfcff70a0fbe967",
+    "seq": 5775
+  },
+  "postReceipt": {
+    "id": "mpr_10f2c59f2438db82",
+    "requestId": "successor-package-qa-handler-result-5821",
+    "taskId": "tsk_2cfcff70a0fbe967",
+    "messageSeq": 5832,
+    "createdAt": "2026-09-14T02:27:05.260386019Z"
+  },
+  "seq": 5832,
+  "taskId": "tsk_2cfcff70a0fbe967",
+  "from": {
+    "agentId": "agt_23aca58ddd659a3c",
+    "node": "workspace",
+    "user": "owner"
+  },
+  "to": "agt_3760a4361c514a03",
+  "text": "Independent frozen successor/admission package QA PASS. Native delivery dly_cc77567f1d8cfb45 g6/e1 result follows; package manifest/checksums and all 21 files verify, five isolated package smokes and focused extracted-source store/server/cmd tests+vet pass. Evidence /tmp/successor-admission-qa.O0Bi7F (0700), source /tmp/successor-admission-source.FG4oMu/tailterm-5793de1. Limits: synthetic only; no live DB/Queue/provider, broad known cmd nonpasses not rerun, no install/deploy/activation. Please save/read back separate package-qualification evidence; acceptance and release remain separate.",
+  "createdAt": "2026-09-14T02:27:05.260386019Z"
+}

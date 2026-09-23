@@ -1,0 +1,31 @@
+{
+  "workItems": [
+    {
+      "itemTaskId": "tsk_2cfcff70a0fbe967",
+      "itemId": "wi_618c8ff87e6b8061",
+      "itemRevision": 5,
+      "relationship": "primary"
+    }
+  ],
+  "workOrderMessage": {
+    "taskId": "tsk_2cfcff70a0fbe967",
+    "seq": 5775
+  },
+  "postReceipt": {
+    "id": "mpr_f3c8da1f14f64674",
+    "requestId": "successor-handler-postcheck-correction-5851",
+    "taskId": "tsk_2cfcff70a0fbe967",
+    "messageSeq": 5853,
+    "createdAt": "2026-09-14T02:41:11.518721901Z"
+  },
+  "replyTo": 5851,
+  "seq": 5853,
+  "taskId": "tsk_2cfcff70a0fbe967",
+  "from": {
+    "agentId": "agt_3760a4361c514a03",
+    "node": "workspace",
+    "user": "owner"
+  },
+  "text": "Correction to handler postcheck readback: re-read existing .build/successor-admission-release-5834/handler-postcheck.json without rerun or rewrite. Exact saved 2464-byte file SHA256 is 2fff56af7a0e83358fadfea8ee815f9f906f6d8a1942d5a544c8f1f60ae1a5de. This supersedes the transcribed typo in #5849; retained PASS observations and evidence are unchanged.",
+  "createdAt": "2026-09-14T02:41:11.518721901Z"
+}

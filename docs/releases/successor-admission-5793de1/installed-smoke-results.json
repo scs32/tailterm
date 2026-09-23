@@ -1,0 +1,27 @@
+[
+  {
+    "script": "mandatory-v3-cli-smoke.py",
+    "exitCode": 0,
+    "scriptSHA256": "e41ee35c64f7e68ebca8ea0ec15c9a0f53dbb8ac76b15ec3cd96f2db23e78d4a"
+  },
+  {
+    "script": "reader-cli-smoke.py",
+    "exitCode": 0,
+    "scriptSHA256": "d46963e16a63090a7b8bcea70eead1c9f196f15452ed855d835b229c392a962a"
+  },
+  {
+    "script": "operational-cli-smoke.py",
+    "exitCode": 0,
+    "scriptSHA256": "f0e3ad79bf1d30a6e26786298d66a322f00d38e62ce51bcdac7cc92edaaa8b60"
+  },
+  {
+    "script": "followthrough-cli-smoke.py",
+    "exitCode": 0,
+    "scriptSHA256": "71235d59adf9f3fcb3374ab62ce14e01b994f58b19c1086521b1f435ebfed5e7"
+  },
+  {
+    "script": "phase-successor-cli-smoke.py",
+    "exitCode": 0,
+    "scriptSHA256": "5f062c366e9e50328e4cbbfc9121c7748c1fea1dcf7faba2100840ee84724546"
+  }
+]

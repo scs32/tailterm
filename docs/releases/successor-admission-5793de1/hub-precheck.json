@@ -1,0 +1,166 @@
+{
+  "host": "truenas",
+  "executable": "/usr/bin/python3.11",
+  "state": "RUNNING",
+  "config": {
+    "services": {
+      "hub": {
+        "cap_drop": [
+          "ALL"
+        ],
+        "cpus": "1.0",
+        "entrypoint": [
+          "/opt/tailterm-hub"
+        ],
+        "environment": {
+          "TAILTERM_MAX_AGENTS": "32",
+          "TAILTERM_STATE": "/state",
+          "TAILTERM_TCP_LISTEN": "0.0.0.0:18765",
+          "TAILTERM_TOKEN_FILE": "/run/hub-token"
+        },
+        "image": "gcr.io/distroless/static-debian12:nonroot",
+        "mem_limit": "512m",
+        "ports": [
+          "100.116.238.37:18765:18765"
+        ],
+        "read_only": true,
+        "restart": "unless-stopped",
+        "security_opt": [
+          "no-new-privileges:true"
+        ],
+        "user": "950:950",
+        "volumes": [
+          "/mnt/deepfreeze/tailterm-hub/releases/20260913-mandatory-v3-fae9f7f/tailterm-hub:/opt/tailterm-hub:ro",
+          "/mnt/deepfreeze/tailterm-hub/state:/state",
+          "/mnt/deepfreeze/tailterm-hub/hub-token:/run/hub-token:ro"
+        ]
+      }
+    }
+  },
+  "oldBinarySha256": "85e23f2fca5024200d8d1410936fac44f7e31a52a9ef210f84a8e05de60adff3",
+  "oldBinaryBytes": 27738238,
+  "releaseDestinationAbsent": true,
+  "activeWorkloads": {
+    "containers": 1,
+    "used_ports": [
+      {
+        "container_port": 18765,
+        "protocol": "tcp",
+        "host_ports": [
+          {
+            "host_port": 18765,
+            "host_ip": "100.116.238.37"
+          }
+        ]
+      }
+    ],
+    "used_host_ips": [
+      "100.116.238.37"
+    ],
+    "container_details": [
+      {
+        "id": "30eaeef3be162fad1a19e5c03cfcd1eb53b8d3ea49a6580cfce629742a05700f",
+        "service_name": "hub",
+        "image": "gcr.io/distroless/static-debian12:nonroot",
+        "port_config": [
+          {
+            "container_port": 18765,
+            "protocol": "tcp",
+            "host_ports": [
+              {
+                "host_port": 18765,
+                "host_ip": "100.116.238.37"
+              }
+            ]
+          }
+        ],
+        "state": "running",
+        "volume_mounts": [
+          {
+            "source": "/mnt/deepfreeze/tailterm-hub/hub-token",
+            "destination": "/run/hub-token",
+            "mode": "ro",
+            "type": "bind"
+          },
+          {
+            "source": "/mnt/deepfreeze/tailterm-hub/releases/20260913-mandatory-v3-fae9f7f/tailterm-hub",
+            "destination": "/opt/tailterm-hub",
+            "mode": "ro",
+            "type": "bind"
+          },
+          {
+            "source": "/mnt/deepfreeze/tailterm-hub/state",
+            "destination": "/state",
+            "mode": "rw",
+            "type": "bind"
+          }
+        ]
+      }
+    ],
+    "volumes": [
+      {
+        "source": "/mnt/deepfreeze/tailterm-hub/hub-token",
+        "destination": "/run/hub-token",
+        "mode": "ro",
+        "type": "bind"
+      },
+      {
+        "source": "/mnt/deepfreeze/tailterm-hub/state",
+        "destination": "/state",
+        "mode": "rw",
+        "type": "bind"
+      },
+      {
+        "source": "/mnt/deepfreeze/tailterm-hub/releases/20260913-mandatory-v3-fae9f7f/tailterm-hub",
+        "destination": "/opt/tailterm-hub",
+        "mode": "ro",
+        "type": "bind"
+      }
+    ],
+    "images": [
+      "gcr.io/distroless/static-debian12:nonroot"
+    ],
+    "networks": [
+      {
+        "Name": "ix-tailterm-hub_default",
+        "Id": "99079ed7b6a5e480089f33f730fada7801a11ea06e50252fd9633ea59e5b7f23",
+        "Labels": {
+          "com.docker.compose.config-hash": "216d04729ede8cc07967c344dc2e293c7a34f1a79179ef393b9c66066b275d49",
+          "com.docker.compose.network": "default",
+          "com.docker.compose.project": "ix-tailterm-hub",
+          "com.docker.compose.version": "2.38.1"
+        },
+        "Created": "2026-09-13T18:16:42.710434695-07:00",
+        "Scope": "local",
+        "Driver": "bridge",
+        "EnableIPv4": true,
+        "EnableIPv6": true,
+        "IPAM": {
+          "Driver": "default",
+          "Options": null,
+          "Config": [
+            {
+              "Subnet": "172.16.7.0/24",
+              "Gateway": "172.16.7.1"
+            },
+            {
+              "Subnet": "fdd0:0:0:7::/64",
+              "Gateway": "fdd0:0:0:7::1"
+            }
+          ]
+        },
+        "Internal": false,
+        "Attachable": false,
+        "Ingress": false,
+        "ConfigFrom": {
+          "Network": ""
+        },
+        "ConfigOnly": false,
+        "Containers": {},
+        "Options": {
+          "com.docker.network.enable_ipv6": "true"
+        }
+      }
+    ]
+  }
+}

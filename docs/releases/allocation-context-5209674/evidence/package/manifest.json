@@ -1,0 +1,32 @@
+{
+  "workItem": "wi_5209b017e66bbf20",
+  "itemRevision": 1,
+  "sourceOrder": 5969,
+  "releaseOrder": 6142,
+  "sourceAcceptanceMessages": [
+    6149,
+    6151
+  ],
+  "commit": "5209674b61ce5f91d826e34908adf375379c4fe6",
+  "tree": "5064fd0b9abb73c5fe8bbc8eccaca925689e9f76",
+  "sourcePath": "/var/folders/p8/3rs14vyj49qcyw14jy7dddcr0000gn/T/allocation-context6142-e4k7y13a/source",
+  "createdAt": "2026-09-14T04:43:06.445028+00:00",
+  "compiler": "go1.26.6",
+  "flags": [
+    "-trimpath",
+    "-buildvcs=true",
+    "-ldflags=-s -w -buildid="
+  ],
+  "environment": {
+    "CGO_ENABLED": "0",
+    "GOOS": "darwin",
+    "GOARCH": "arm64"
+  },
+  "binary": {
+    "path": "tt",
+    "bytes": 6919410,
+    "sha256": "979ba2216c2167cf7500cbfc60dffd4d9e33a2413707a1f8b582c8c12238f4c2"
+  },
+  "reproducible": true,
+  "qualification": "builder reproducible clean source build and 14 synthetic external CLI checks PASS; independent package QA pending"
+}

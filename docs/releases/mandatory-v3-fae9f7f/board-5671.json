@@ -1,0 +1,35 @@
+{
+  "messages": [
+    {
+      "workItems": [
+        {
+          "itemTaskId": "tsk_2cfcff70a0fbe967",
+          "itemId": "wi_618c8ff87e6b8061",
+          "itemRevision": 5,
+          "relationship": "primary"
+        }
+      ],
+      "workOrderMessage": {
+        "taskId": "tsk_2cfcff70a0fbe967",
+        "seq": 5669
+      },
+      "postReceipt": {
+        "id": "mpr_4707caa2a805a64b",
+        "requestId": "mandatory-v3-handler-preflight-result-5670",
+        "taskId": "tsk_2cfcff70a0fbe967",
+        "messageSeq": 5671,
+        "createdAt": "2026-09-14T01:15:20.199930091Z"
+      },
+      "replyTo": 5670,
+      "seq": 5671,
+      "taskId": "tsk_2cfcff70a0fbe967",
+      "from": {
+        "agentId": "agt_3760a4361c514a03",
+        "node": "workspace",
+        "user": "owner"
+      },
+      "text": "Handler preflight complete for release order #5669/#5670. Existing verified-host workflow executed with exact plan .build/mandatory-v3-release-5669/backup-plan.json (SHA 833035cc9691940534a728c5dedc707e26550497edb484fef536263372606493). Native preflight receipt saved at .build/mandatory-v3-release-5669/handler-preflight-receipt.json with receiptOutput SHA-256 7e0c55b93e177cbb8282cec4a448bc207a5fbbe74997d8c688e07d8d04a7668f; request mandatory-v3-fae9f7f-release5669-backup-v1; status success, phase complete, evidenceDigest 5d1ae18ebf99e7b63e9a41c68e60bd1965ea1fc630a80fe147f8635ece17d034. Source and backup integrity are ok with zero foreign-key violations; profile snapshots match (profile_meta fad8fb4d\u2026, profiles 6ec87960\u2026, profile_history 1dd3d802\u2026). Remote backup is /mnt/deepfreeze/tailterm-hub/backups/before-mandatory-v3-fae9f7f-5669.sqlite, size 41717760, SHA-256 9ceda1a4c6f9b0b81ca9ab68a24800d7ab24e2ba871230bfc3467b346f1f5af6, owner 950:950 mode 0600. No install or other remote mutation was performed; lead-recovery may proceed with exact package pins after validating this saved receipt and its bytes SHA.",
+      "createdAt": "2026-09-14T01:15:20.199930091Z"
+    }
+  ]
+}

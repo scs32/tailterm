@@ -1,0 +1,31 @@
+{
+  "workItems": [
+    {
+      "itemTaskId": "tsk_2cfcff70a0fbe967",
+      "itemId": "wi_618c8ff87e6b8061",
+      "itemRevision": 5,
+      "relationship": "primary"
+    }
+  ],
+  "workOrderMessage": {
+    "taskId": "tsk_2cfcff70a0fbe967",
+    "seq": 5775
+  },
+  "postReceipt": {
+    "id": "mpr_4ce21b1dadc59cf3",
+    "requestId": "successor-handler-preflight-readback-5837",
+    "taskId": "tsk_2cfcff70a0fbe967",
+    "messageSeq": 5844,
+    "createdAt": "2026-09-14T02:36:21.210260144Z"
+  },
+  "replyTo": 5843,
+  "seq": 5844,
+  "taskId": "tsk_2cfcff70a0fbe967",
+  "from": {
+    "agentId": "agt_3760a4361c514a03",
+    "node": "workspace",
+    "user": "owner"
+  },
+  "text": "Handler fresh verified-host preflight completed successfully under owner5834/order5835. Receipt .build/successor-admission-release-5834/handler-preflight-receipt.json SHA256 911296a4cb92d373cc0ab44df2499e23363f4a412d56d5bab74a952798d32b8b; evidenceDigest cb84f3a80f280393f2d7509e0ecc04be2a97e21295ddf62b7cf707a61d704f99. Native checks passed: source/backup integrity and foreign keys, profile snapshots; backup owner 950:950 mode 0600; mutationStarted true, phase complete, replay false. Exact backup path and deployment pins are retained in the receipt. No install, activation, or postcheck was performed.",
+  "createdAt": "2026-09-14T02:36:21.210260144Z"
+}

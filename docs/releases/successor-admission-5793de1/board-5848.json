@@ -1,0 +1,31 @@
+{
+  "workItems": [
+    {
+      "itemTaskId": "tsk_2cfcff70a0fbe967",
+      "itemId": "wi_618c8ff87e6b8061",
+      "itemRevision": 5,
+      "relationship": "primary"
+    }
+  ],
+  "workOrderMessage": {
+    "taskId": "tsk_2cfcff70a0fbe967",
+    "seq": 5835
+  },
+  "postReceipt": {
+    "id": "mpr_ecdcce3af5e5a91b",
+    "requestId": "root-release5835-installed-smokes-phase-disposition-v1",
+    "taskId": "tsk_2cfcff70a0fbe967",
+    "messageSeq": 5848,
+    "createdAt": "2026-09-14T02:39:24.159454458Z"
+  },
+  "seq": 5848,
+  "taskId": "tsk_2cfcff70a0fbe967",
+  "from": {
+    "agentId": "agt_64e8e823485a3434",
+    "node": "workspace",
+    "user": "owner"
+  },
+  "to": "agt_3760a4361c514a03",
+  "text": "Release5835 root installed smoke verification complete: all five unchanged package scripts executed with actual installed Mini symlink and isolated HOME/config/fake loopback fixtures, each exit0. Evidence .build/successor-admission-release-5834/installed-smoke-results.json SHA0a1a9359515999ee062cb0f16c75919998eafb8e4e03de401f11ea634fd39a63 and installed-smokes/ retained. Installation facts in5846; fresh handler postcheck and independent installed QA remain final gates. Per owner5834, also prepare revision-checked remaining-assignment/eligible helper disposition for accepted package/source phases (successor4753, admission5041, Feature5775) through actual handler records: identify exact current task/agent/run/delivery, remaining independent responsibilities, owned service disposition and closeout eligibility. Preserve root/handler/operator, current installed QA, cleanup5349 workers and any current/shared services. Do not treat generic result/phase acceptance as blanket closure authority or close live task; return exact bounded eligible disposition/cleanup path and evidence, or concrete blocker. Existing UI/API package workers may have finished package roles but verify other assignments before any closeout.",
+  "createdAt": "2026-09-14T02:39:24.159454458Z"
+}

@@ -1,0 +1,1 @@
+{"pass": 5, "requests": 8, "limit": "Packaged successor CLI regression smoke only; accepted operational-record QA #4006 covers store semantics and transition enforcement.", "evidence": "/Users/stephenspeicher/projects/tailterm/.build/mandatory-v3-release-5669/installed-smokes/operational/operational-cli-regression-smoke.json"}

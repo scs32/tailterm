@@ -1,0 +1,72 @@
+{
+  "version": 1,
+  "createdAt": "2026-09-14T01:26:41.190841+00:00",
+  "item": "wi_618c8ff87e6b8061",
+  "revision": 5,
+  "workOrder": 5669,
+  "receipt": "release-receipt.json",
+  "receiptSHA256": "f78bed835eb0124ced015efff91864749d5654755b8913ab4ca02e69655dc1fb",
+  "leadAcceptanceMessage": 5707,
+  "handlerSavedAcceptanceMessage": 5704,
+  "ownerFinalDispositionMessage": 5708,
+  "status": "accepted",
+  "scope": "Exact mandatory-v3 fae9f7f package installed on TrueNAS hub and Mini; bounded operational release only.",
+  "independentQA": {
+    "messages": [
+      5701,
+      5703
+    ],
+    "delivery": "dly_721c753c4bccbea3",
+    "generation": 3,
+    "executionEpoch": 1,
+    "resultReceipt": "drr_7f1a0d93f7dfe82e",
+    "scope": "Independent frozen package/installed Mini/hash/VCS and four isolated installed CLI smoke suites; hub deployment through retained operator evidence.",
+    "provenanceCorrection": "QA result cited backup replay5685 for database evidence. Final acceptance instead uses fresh handler postcheck5698, independently byte-pin verified by root. This does not invalidate executed installed smokes; a narrow QA provenance addendum may follow without rerunning smokes or delaying this owner-accepted release."
+  },
+  "freshHandlerPostcheck": {
+    "message": 5698,
+    "path": "handler-postcheck.json",
+    "sha256": "8375b924dcac1665c57a6b1a1e23115b58eb8018aedc6f2b1703f5e57a7106b5",
+    "integrity": "ok",
+    "foreignKeyViolations": 0,
+    "profilesEqual": true,
+    "expectedMigrationObjects": true,
+    "expectedMigrationColumns": true
+  },
+  "receiptGraphVerified": true,
+  "parentStatus": "open",
+  "activationClaim": false,
+  "cleanupShipped": false,
+  "boardEvidence": [
+    {
+      "seq": 5671,
+      "path": "board-5671.json",
+      "sha256": "1b3c1c6fee510c77e8273ed9f93fdebdad1a058bf8edcfbb0fdb4688e38b9b18"
+    },
+    {
+      "seq": 5698,
+      "path": "board-5698.json",
+      "sha256": "c38e0dd45ddf5a1d40ba6a2c5dac6933da839772d38003f5dc090033b769e09d"
+    },
+    {
+      "seq": 5701,
+      "path": "board-5701.json",
+      "sha256": "380c7260a775e826c6e6ab3734288077454667f2e094950537debaf60331bc07"
+    },
+    {
+      "seq": 5704,
+      "path": "board-5704.json",
+      "sha256": "431af43e86153a1977942a5f00cba6d579027713ebb92e9bd80de26616cc885e"
+    },
+    {
+      "seq": 5707,
+      "path": "board-5707.json",
+      "sha256": "e347e1277376449f61117b85fa30728e62e7e142891617fdc42afce3d82160f2"
+    },
+    {
+      "seq": 5708,
+      "path": "board-5708.json",
+      "sha256": "e8a2e52a96cc0c2973610f616e955765a8f55fc43e7d1b364d9799da062d3981"
+    }
+  ]
+}

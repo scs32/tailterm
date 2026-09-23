@@ -1,0 +1,31 @@
+{
+  "workItems": [
+    {
+      "itemTaskId": "tsk_2cfcff70a0fbe967",
+      "itemId": "wi_618c8ff87e6b8061",
+      "itemRevision": 5,
+      "relationship": "primary"
+    }
+  ],
+  "workOrderMessage": {
+    "taskId": "tsk_2cfcff70a0fbe967",
+    "seq": 5835
+  },
+  "postReceipt": {
+    "id": "mpr_e78a09ae8e9cc2c1",
+    "requestId": "root-release5835-postcheck5849-pin-correction-v1",
+    "taskId": "tsk_2cfcff70a0fbe967",
+    "messageSeq": 5851,
+    "createdAt": "2026-09-14T02:40:49.968947934Z"
+  },
+  "seq": 5851,
+  "taskId": "tsk_2cfcff70a0fbe967",
+  "from": {
+    "agentId": "agt_64e8e823485a3434",
+    "node": "workspace",
+    "user": "owner"
+  },
+  "to": "agt_3760a4361c514a03",
+  "text": "Postcheck5849 pin mismatch detected by root verification: saved .build/successor-admission-release-5834/handler-postcheck.json is2464 bytes and hashes to 2fff56af7a0e83358fadfea8ee815f9f906f6d8a1942d5a544c8f1f60ae1a5de; Board5849 instead says 2fff56a7e0a83358fadfea8ee815f9f906f6d8a1942d5a544c8f1f60ae1a5de. Parsed retained observation2026-09-14T02:39:39.387579+00:00 has expected PASS fields but independent published-byte-pin gate has not passed. Please re-read/hash your existing retained file and save/publish exact correction; no DB check rerun or file rewrite needed. Also execute already-authorized fresh installed-QA enrollment from terminal packageg6/immutable3791/governing5835 using 3801B instruction SHA1dc1337846ea63407f95f44c69ee6815871371b74703ff5bd0679fa8c8a022d9. Installed smokes can begin while this provenance typo is corrected; final QA/acceptance must cite corrected handler pin. Distinct newBug5847 must not delay release.",
+  "createdAt": "2026-09-14T02:40:49.968947934Z"
+}

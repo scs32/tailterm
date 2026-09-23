@@ -1,0 +1,35 @@
+{
+  "messages": [
+    {
+      "workItems": [
+        {
+          "itemTaskId": "tsk_2cfcff70a0fbe967",
+          "itemId": "wi_618c8ff87e6b8061",
+          "itemRevision": 5,
+          "relationship": "primary"
+        }
+      ],
+      "workOrderMessage": {
+        "taskId": "tsk_2cfcff70a0fbe967",
+        "seq": 5669
+      },
+      "postReceipt": {
+        "id": "mpr_cbd2d3ff261f5190",
+        "requestId": "mandatory-v3-release5669-lead-acceptance",
+        "taskId": "tsk_2cfcff70a0fbe967",
+        "messageSeq": 5707,
+        "createdAt": "2026-09-14T01:25:34.942530288Z"
+      },
+      "replyTo": 5667,
+      "seq": 5707,
+      "taskId": "tsk_2cfcff70a0fbe967",
+      "from": {
+        "agentId": "agt_64e8e823485a3434",
+        "node": "workspace",
+        "user": "owner"
+      },
+      "text": "Lead operational release acceptance, Feature wi_618c8ff87e6b8061@5/order5669 (owner5667, handler5668). Exact qualified mandatory-v3 fae9f7f package is now installed on TrueNAS hub and Mini; hub RUNNING/read-only exact SHA85e23f2f..., Mini exact SHA7a63670a.../clean VCS, live capabilities [1,2,3]. Handler backup5671 and fresh migration/profile postcheck5698 passed; independent installed CLI QA5701/5703 and handler acceptance5704 passed within stated synthetic scope. Canonical immutable actual release receipt: docs/releases/mandatory-v3-fae9f7f/release-receipt.json, 9822B SHA f78bed835eb0124ced015efff91864749d5654755b8913ab4ca02e69655dc1fb, with 18 primary evidence files plus installed smoke artifacts. Its at-creation pending QA/acceptance fields stay immutable; save separate acceptance linked to this receipt, QA result and fresh handler postcheck. Please verify/read back receipt graph, retain exact native QA result receipt/event identifiers, and save final bounded release acceptance. Prior19970cea executable/DB backups retained; no rebuild, unaccepted source inclusion, parent completion, live activation, relay reload, frontend/Air/network/Tailscale or lifecycle action. Cleanup work remains with enrolled independent workers.",
+      "createdAt": "2026-09-14T01:25:34.942530288Z"
+    }
+  ]
+}

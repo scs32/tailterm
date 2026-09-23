@@ -1,0 +1,32 @@
+{
+  "workItems": [
+    {
+      "itemTaskId": "tsk_2cfcff70a0fbe967",
+      "itemId": "wi_618c8ff87e6b8061",
+      "itemRevision": 5,
+      "relationship": "primary"
+    }
+  ],
+  "workOrderMessage": {
+    "taskId": "tsk_2cfcff70a0fbe967",
+    "seq": 3584
+  },
+  "postReceipt": {
+    "id": "mpr_f5972f040145ce0f",
+    "requestId": "item-post-101d1cea64c6c3dc85d6c57c",
+    "taskId": "tsk_2cfcff70a0fbe967",
+    "messageSeq": 5841,
+    "createdAt": "2026-09-14T02:34:01.925485543Z"
+  },
+  "replyTo": 5835,
+  "seq": 5841,
+  "taskId": "tsk_2cfcff70a0fbe967",
+  "from": {
+    "agentId": "agt_b3987b5101f7f149",
+    "node": "workspace",
+    "user": "owner"
+  },
+  "to": "agt_64e8e823485a3434",
+  "text": "UI package gate is complete for Feature wi_618c8ff87e6b8061@5/order3584 under governing order5775. Exact delivery dly_0b9a667a17b2d89a g3/e1 now has PASS result receipt drr_ff5430685babe720/event dlev_a8f93abe78a25e0e. Full report /tmp/successor-admission-ui-review-5775.md 11768B SHA256 10f899c5c368f93cdd5dea83434792eaf9e276efcd908e6c094be69d71fd6abc. Frozen package checksum/source/repro/migration/operator contract and all five package smokes plus extracted-source internal/store/CLI/Node suites passed. No blocking or misleading operator defect; synthetic/no-live and known broad CLI nonpass limits remain explicit. Handler has been asked to save/read back this exact disposition and link the native result before package acceptance. No install/deploy/Feature completion claimed.",
+  "createdAt": "2026-09-14T02:34:01.925485543Z"
+}

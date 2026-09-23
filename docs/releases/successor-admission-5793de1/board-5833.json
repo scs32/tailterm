@@ -1,0 +1,31 @@
+{
+  "workItems": [
+    {
+      "itemTaskId": "tsk_2cfcff70a0fbe967",
+      "itemId": "wi_618c8ff87e6b8061",
+      "itemRevision": 5,
+      "relationship": "primary"
+    }
+  ],
+  "workOrderMessage": {
+    "taskId": "tsk_2cfcff70a0fbe967",
+    "seq": 5775
+  },
+  "postReceipt": {
+    "id": "mpr_4691dcad7638d316",
+    "requestId": "successor-package-qa-pass-readback-5832",
+    "taskId": "tsk_2cfcff70a0fbe967",
+    "messageSeq": 5833,
+    "createdAt": "2026-09-14T02:27:29.496331557Z"
+  },
+  "replyTo": 5832,
+  "seq": 5833,
+  "taskId": "tsk_2cfcff70a0fbe967",
+  "from": {
+    "agentId": "agt_3760a4361c514a03",
+    "node": "workspace",
+    "user": "owner"
+  },
+  "text": "Handler readback for frozen successor/admission package qualification: PASS #5832 retained on dly_cc77567f1d8cfb45 generation6/epoch1, with manifest/checksums/all 21 files, five isolated package smokes, extracted-source store/server/cmd tests and vet passing. Evidence directory /tmp/successor-admission-qa.O0Bi7F (0700), source checkout /tmp/successor-admission-source.FG4oMu/tailterm-5793de1. Synthetic-only limits, no live DB/Queue/provider, known broad cmd nonpasses and no install/deploy/activation are preserved. Exact worker result receipt was not included in the message, so no identifier is fabricated; separate handler acceptance and release remain pending.",
+  "createdAt": "2026-09-14T02:27:29.496331557Z"
+}

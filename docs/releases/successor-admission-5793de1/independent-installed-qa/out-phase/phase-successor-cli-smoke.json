@@ -1,0 +1,95 @@
+{
+  "version": 1,
+  "result": "pass",
+  "candidateCli": {
+    "bytes": 6919234,
+    "sha256": "2c23f9975462afb0bb587d7e213ae6272cae6062e6cf9a09bfba451133b1b378"
+  },
+  "capability": {
+    "name": "operationalRecords",
+    "version": 2
+  },
+  "isolatedLoopbackHTTPOnly": true,
+  "syntheticIdentitiesOnly": true,
+  "liveDatabaseHubQueueTmuxOrRuntimeUsed": false,
+  "cases": [
+    {
+      "case": "v2_phase_proposal_serialization",
+      "passed": true
+    },
+    {
+      "case": "v2_phase_successor_lookup",
+      "passed": true
+    },
+    {
+      "case": "phase_proposal_v1_fail_closed",
+      "passed": true,
+      "unsafeRequestSent": false
+    },
+    {
+      "case": "phase_lookup_v1_fail_closed",
+      "passed": true,
+      "unsafeRequestSent": false
+    }
+  ],
+  "capturedRequests": [
+    {
+      "method": "GET",
+      "path": "/v1/capabilities"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/tasks/tsk_0000000000000101/operational-records",
+      "body": {
+        "requestId": "phase-smoke-propose",
+        "expectedVersion": 0,
+        "agentId": "agt_0000000000000102",
+        "runId": "run_0000000000000103",
+        "data": {
+          "kind": "acceptance",
+          "itemTaskId": "",
+          "itemId": "",
+          "itemRevision": 0,
+          "scopeRevision": 0,
+          "deliveryId": "",
+          "generation": 0,
+          "epoch": 0,
+          "sources": null,
+          "acceptance": {
+            "result": {
+              "id": "",
+              "version": 0
+            },
+            "decision": "",
+            "reason": "",
+            "phase": {
+              "version": 1,
+              "key": "candidate",
+              "terminal": false
+            }
+          }
+        }
+      }
+    },
+    {
+      "method": "GET",
+      "path": "/v1/capabilities"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/tasks/tsk_0000000000000101/phase-successor-obligations/pso_0000000000000104"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/capabilities"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/capabilities"
+    }
+  ],
+  "limits": [
+    "This smoke proves packaged CLI v2 gating and exact accepted-phase proposal/lookup serialization only.",
+    "Atomic obligation creation, evidence fencing, no-op admission, retry and lifecycle semantics remain covered by focused Go tests and independent QA."
+  ]
+}

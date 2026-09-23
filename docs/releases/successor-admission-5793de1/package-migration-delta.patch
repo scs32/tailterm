@@ -1,0 +1,107 @@
+diff --git a/hub/internal/store/operational_records.go b/hub/internal/store/operational_records.go
+index 657dcf8..903c75c 100644
+--- a/hub/internal/store/operational_records.go
++++ b/hub/internal/store/operational_records.go
+@@ -20,11 +20,62 @@ func migrateOperationalRecords(db *sql.DB) error {
+ 	_, err := db.Exec(`CREATE TABLE IF NOT EXISTS operational_records (
+  id TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks(id), version INTEGER NOT NULL,
+  state TEXT NOT NULL, authority_key TEXT UNIQUE);
+  CREATE TABLE IF NOT EXISTS operational_record_versions (
+  record_id TEXT NOT NULL REFERENCES operational_records(id), version INTEGER NOT NULL,
+- data BLOB NOT NULL, PRIMARY KEY(record_id,version));`)
++ data BLOB NOT NULL, PRIMARY KEY(record_id,version));
++ CREATE TABLE IF NOT EXISTS phase_successor_obligations (
++ id TEXT PRIMARY KEY,
++ task_id TEXT NOT NULL REFERENCES tasks(id),
++ version INTEGER NOT NULL,
++ state TEXT NOT NULL,
++ item_task_id TEXT NOT NULL,
++ item_id TEXT NOT NULL,
++ item_revision INTEGER NOT NULL,
++ scope_revision INTEGER NOT NULL,
++ phase_key TEXT NOT NULL,
++ candidate_record_id TEXT NOT NULL REFERENCES operational_records(id),
++ candidate_record_version INTEGER NOT NULL,
++ candidate_commit TEXT NOT NULL,
++ candidate_digest TEXT NOT NULL,
++ acceptance_record_id TEXT NOT NULL REFERENCES operational_records(id),
++ acceptance_record_version INTEGER NOT NULL,
++ predecessor_delivery_id TEXT NOT NULL REFERENCES required_deliveries(id),
++ predecessor_work_order_task_id TEXT NOT NULL,
++ predecessor_work_order_message_seq INTEGER NOT NULL,
++ lead_agent_id TEXT NOT NULL REFERENCES agents(id),
++ lead_run_id TEXT NOT NULL,
++ lead_delivery_id TEXT NOT NULL UNIQUE REFERENCES required_deliveries(id),
++ successor_delivery_id TEXT NOT NULL DEFAULT '',
++ successor_work_order_task_id TEXT NOT NULL DEFAULT '',
++ successor_work_order_message_seq INTEGER NOT NULL DEFAULT 0,
++ successor_agent_id TEXT NOT NULL DEFAULT '',
++ successor_run_id TEXT NOT NULL DEFAULT '',
++ dependency_owner_agent_id TEXT NOT NULL DEFAULT '',
++ dependency_owner_run_id TEXT NOT NULL DEFAULT '',
++ dependency_resume_condition TEXT NOT NULL DEFAULT '',
++ created_at TEXT NOT NULL,
++ updated_at TEXT NOT NULL,
++ UNIQUE(task_id,acceptance_record_id,acceptance_record_version)
++ );
++ CREATE INDEX IF NOT EXISTS phase_successor_obligations_lead
++ ON phase_successor_obligations(task_id,lead_agent_id,lead_run_id,state);
++ CREATE INDEX IF NOT EXISTS phase_successor_obligations_successor
++ ON phase_successor_obligations(task_id,successor_delivery_id);
++ CREATE TABLE IF NOT EXISTS phase_successor_lead_transfers (
++ obligation_id TEXT NOT NULL REFERENCES phase_successor_obligations(id),
++ sequence INTEGER NOT NULL,
++ from_agent_id TEXT NOT NULL,
++ from_run_id TEXT NOT NULL,
++ from_delivery_id TEXT NOT NULL REFERENCES required_deliveries(id),
++ to_agent_id TEXT NOT NULL,
++ to_run_id TEXT NOT NULL,
++ to_delivery_id TEXT NOT NULL REFERENCES required_deliveries(id),
++ request_id TEXT NOT NULL,
++ created_at TEXT NOT NULL,
++ PRIMARY KEY(obligation_id,sequence)
++ );`)
+ 	return err
+ }
+ func operationalKind(k string) bool {
+ 	switch k {
+ 	case "instruction", "finding", "candidate", "verification", "result", "acceptance":
+@@ -412,10 +463,13 @@ func validateOperationalContent(q queryRower, ctx context.Context, r api.Operati
+ 	case "acceptance":
+ 		p := d.Acceptance
+ 		if p == nil || !operationalText(p.Reason) || (p.Decision != "accepted" && p.Decision != "rejected") {
+ 			return "", api.ErrInvalid
+ 		}
++		if p.Phase != nil && (p.Phase.Version != 1 || strings.TrimSpace(p.Phase.Key) != p.Phase.Key || !api.ValidText(p.Phase.Key, 128)) {
++			return "", api.ErrInvalid
++		}
+ 		result, err := operationalReference(q, ctx, r, p.Result, "result")
+ 		if err != nil {
+ 			return "", err
+ 		}
+ 		if p.Decision == "accepted" {
+@@ -542,10 +596,24 @@ func (s *Store) CommitOperationalRecord(ctx context.Context, task, id string, re
+ 	r.CreatedAt = s.now()
+ 	out.Record = r
+ 	if _, err = tx.ExecContext(ctx, `UPDATE operational_records SET version=?,state='committed',authority_key=? WHERE id=?`, r.Version, nullable(authorityKey), id); err != nil {
+ 		return out, err
+ 	}
++	if d.Kind == "acceptance" && d.Acceptance.Phase != nil && d.Acceptance.Decision == "accepted" && !d.Acceptance.Phase.Terminal {
++		result, referenceErr := operationalReference(tx, ctx, r, d.Acceptance.Result, "result")
++		if referenceErr != nil {
++			return out, referenceErr
++		}
++		candidate, referenceErr := operationalReference(tx, ctx, result, result.Data.Result.Candidate, "candidate")
++		if referenceErr != nil {
++			return out, referenceErr
++		}
++		out.SuccessorObligation, err = s.createPhaseSuccessorObligation(ctx, tx, r, candidate, delivery, by, req.RequestID)
++		if err != nil {
++			return out, err
++		}
++	}
+ 	if d.Kind == "result" {
+ 		if _, err = tx.ExecContext(ctx, `UPDATE required_deliveries SET phase=?,result_text=?,updated_at=? WHERE id=?`, api.DeliveryResult, d.Result.Summary, ts(r.CreatedAt), delivery.ID); err != nil {
+ 			return out, err
+ 		}
+ 	}

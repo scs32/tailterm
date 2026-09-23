@@ -1,0 +1,155 @@
+{
+  "version": 1,
+  "stage": "phase_successor_admission_package_preparation_only",
+  "createdAt": "2026-09-14T02:18:00Z",
+  "work": {
+    "taskId": "tsk_2cfcff70a0fbe967",
+    "itemId": "wi_618c8ff87e6b8061",
+    "itemRevision": 5,
+    "immutableWorkOrderMessageSeq": 3699,
+    "governingOrderMessageSeq": 5775,
+    "instructionMessageSeq": 5785,
+    "instructionSha256": "31e69e4c4f558bff832ab288679b2e8e867ef41b87a557f1ab390bccdb05fbab",
+    "instructionBytes": 4675,
+    "deliveryId": "dly_f233954c4607d46d",
+    "deliveryGeneration": 5,
+    "executionEpoch": 1,
+    "agentId": "agt_ac3ad2691a275f59",
+    "runId": "run_43657fe460aec447",
+    "contextDigest": "3832346f3517a146c69b717a0faa629323316c0e423a5a45d947d7251b3c9354",
+    "directAckReceiptId": "drr_50cf7b9e42902d17",
+    "firstProgressReceiptId": "drr_4e906358522b594d",
+    "validationProgressReceiptId": "drr_adfd2a555447853a"
+  },
+  "authorization": {
+    "packageCreation": true,
+    "qualification": true,
+    "installation": false,
+    "deployment": false,
+    "activation": false,
+    "rootIntegration": false,
+    "liveFixtures": false,
+    "hostBackupOrRestore": false,
+    "networkOrTailscaleChanges": false,
+    "featureCompletion": false
+  },
+  "source": {
+    "commit": "5793de112e1b4c0a08d55fba17a7736e0bf2e0bf",
+    "tree": "43b026c59c40dcc2eb3dae75b397340007ff3225",
+    "checkout": "clean_detached_private_clone",
+    "installedAcceptedBaseline": "fae9f7ff34627449f716ef6439fe1eed5ab8ead5",
+    "baselineReleaseOrderMessageSeq": 5669,
+    "baselineIsAncestor": true,
+    "changedPathCount": 21,
+    "interveningCommitCount": 11,
+    "archiveEntryCount": 660,
+    "historicalRollbackCommitOnly": "19970cea",
+    "historicalRollbackIsCurrentBaseline": false
+  },
+  "upstreamAcceptedInputs": [
+    {
+      "itemId": "wi_82b4346d30ddf3f5",
+      "itemRevision": 1,
+      "workOrderMessageSeq": 4753,
+      "integrationMessageSeq": 5592,
+      "acceptanceMessageSeq": 5594,
+      "manifest": "upstream-phase-successor-integration-manifest.json",
+      "bytes": 6543,
+      "sha256": "e6a0905e275f18488e4c4191d3b6323201653ddb737b14530066db78baa98970"
+    },
+    {
+      "itemId": "wi_9c8d5eadb13c75fa",
+      "itemRevision": 1,
+      "workOrderMessageSeq": 5041,
+      "integrationMessageSeq": 5624,
+      "qaMessageSeq": 5654,
+      "handlerAcceptanceMessageSeq": 5655,
+      "leadAcceptanceMessageSeq": 5777,
+      "manifest": "upstream-admission-integration-manifest.json",
+      "bytes": 5138,
+      "sha256": "b48a5b04b39064cebfc47758b980979ae747888bacc51cd7ce246f66e10f7bca"
+    }
+  ],
+  "build": {
+    "goVersion": "go1.26.6",
+    "cgoEnabled": "0",
+    "trimpath": true,
+    "buildVcs": true,
+    "ldflags": "-s -w -buildid=",
+    "vcsRevision": "5793de112e1b4c0a08d55fba17a7736e0bf2e0bf",
+    "vcsModified": false,
+    "linuxAmd64RepeatedByteIdentical": true,
+    "darwinArm64RepeatedByteIdentical": true,
+    "sourceArchiveRepeatedByteIdentical": true
+  },
+  "packageFiles": [
+    {"path":"build-environment.txt","bytes":460,"sha256":"5af45361e2b928e28aa3b07192588c2709cc31d122c2b643c434aa72378689aa"},
+    {"path":"deploy-truenas-hub.py","bytes":15808,"sha256":"25b9e87a6a1c05793c734083902ca5a017999edfaebda745478021811f455afc"},
+    {"path":"followthrough-cli-smoke.py","bytes":16009,"sha256":"71235d59adf9f3fcb3374ab62ce14e01b994f58b19c1086521b1f435ebfed5e7"},
+    {"path":"go-version-m.txt","bytes":4892,"sha256":"77de55a01fdd4e941c4bc7e9ca92d234c349219669269f2dab117ae7e382cd39"},
+    {"path":"mandatory-v3-cli-smoke.py","bytes":15480,"sha256":"e41ee35c64f7e68ebca8ea0ec15c9a0f53dbb8ac76b15ec3cd96f2db23e78d4a"},
+    {"path":"migration-delta.patch","bytes":5049,"sha256":"adb1489566d0e76763b66d08409e5f6a5e58175ac191d6109f3902f4f8698b1c"},
+    {"path":"operational-cli-smoke.py","bytes":6466,"sha256":"f0e3ad79bf1d30a6e26786298d66a322f00d38e62ce51bcdac7cc92edaaa8b60"},
+    {"path":"package-report.md","bytes":9170,"sha256":"bb1766efc3ce8426e230797f0121a4238f9356639002324682379d1557fd01e8"},
+    {"path":"phase-successor-cli-smoke.py","bytes":6970,"sha256":"5f062c366e9e50328e4cbbfc9121c7748c1fea1dcf7faba2100840ee84724546"},
+    {"path":"reader-cli-smoke.py","bytes":6445,"sha256":"d46963e16a63090a7b8bcea70eead1c9f196f15452ed855d835b229c392a962a"},
+    {"path":"source-5793de1.tar","bytes":11550720,"sha256":"28b6db51774ed56af5da2959647108031406dc526bcb8c972c5a09cf51c44ba0"},
+    {"path":"source-changes.txt","bytes":835,"sha256":"5576342098374f9c45afe218e6be9cb711d517e99a189f6d0676b136b75bacc6"},
+    {"path":"source-file-sha256.txt","bytes":2179,"sha256":"e3e3a495805a6c2636c4c30cb33cb5777973e6b473a5f50a9017fdb4577dc9ac"},
+    {"path":"source-lineage.txt","bytes":1732,"sha256":"d2d45ecfd135eda1449943e06b09f3057b838fc3995c90655326865cdc1156e6"},
+    {"path":"tailterm-hub-linux-amd64","bytes":27873406,"sha256":"1d9e97679b24428a9784430e3c96d908debc3bac71c869ac1e7f4b73a232d232"},
+    {"path":"truenas_release_preflight.py","bytes":43646,"sha256":"82fd43e1edf6c9f3de89101c06b374cc1b3c0430e372676f5822740b01560d46"},
+    {"path":"tt-darwin-arm64","bytes":6919234,"sha256":"2c23f9975462afb0bb587d7e213ae6272cae6062e6cf9a09bfba451133b1b378"},
+    {"path":"upstream-admission-integration-manifest.json","bytes":5138,"sha256":"b48a5b04b39064cebfc47758b980979ae747888bacc51cd7ce246f66e10f7bca"},
+    {"path":"upstream-phase-successor-integration-manifest.json","bytes":6543,"sha256":"e6a0905e275f18488e4c4191d3b6323201653ddb737b14530066db78baa98970"},
+    {"path":"verified-host-script-pins.txt","bytes":478,"sha256":"e27cede42db50bf254c4c7483776adf56978cbb2bdf676b4c309cffa655abcb4"}
+  ],
+  "qualification": {
+    "isolated": true,
+    "usedLiveTaskProfileWorkItemOrQueueData": false,
+    "checks": [
+      {"name":"go_test_internal","result":"pass","log":"logs/go-test-internal.log","bytes":347,"sha256":"5aff24e6ff9c222a2df419d0db7032f2c1d6e99c53ba88843d161a127fad6eba"},
+      {"name":"go_test_cli_focused","result":"pass","topLevelTests":28,"log":"logs/go-test-cli-focused.log","bytes":5990,"sha256":"9a9aa00969574b912622bccbdeceda063339273d9207a2081717ec47b16b69ca"},
+      {"name":"go_test_store_focused","result":"pass","topLevelTests":24,"log":"logs/go-test-store-focused.log","bytes":4850,"sha256":"157a76cc3768afa371ac5fd1823c9f0364aa466f68f7743795637d867fda4f90"},
+      {"name":"go_test_server_focused","result":"pass","topLevelTests":7,"log":"logs/go-test-server-focused.log","bytes":917,"sha256":"b59e9a207fa5d0ede3dea702f38ede22f7f03d6706a1b5f00765b12b89d08a6a"},
+      {"name":"go_test_race_selected","result":"pass","log":"logs/go-test-race-focused.log","bytes":165,"sha256":"0b50a0b16051a867120313ad8992e21f9639972df250f46946a6442abcbcd4f5"},
+      {"name":"go_vet","result":"pass","log":"logs/go-vet.log","bytes":0,"sha256":"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"},
+      {"name":"gofmt_changed_go","result":"pass","log":"logs/gofmt-check.log","bytes":0,"sha256":"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"},
+      {"name":"git_diff_check","result":"pass"},
+      {"name":"truenas_release_preflight_node","result":"pass","tests":9,"log":"logs/truenas-release-preflight-node.log","bytes":967,"sha256":"7b23d6a227932f7951b4d2594cd61300e21125179939027c0997e3f8d606dd22"},
+      {"name":"python_compile","result":"pass","log":"logs/python-compile.log","bytes":0,"sha256":"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"},
+      {"name":"archive_changed_source_pins","result":"pass","pinsPassed":21,"pinsTotal":21,"log":"logs/archive-pin-verification.log","bytes":877,"sha256":"cc93509bb5fec6f5b2485624ddc1f4fe9e6696c48203d227326b74f02cbe2af7"}
+    ],
+    "smokes": [
+      {"name":"mandatory_v3","result":"pass","cases":8,"httpRequests":43,"evidence":"evidence/mandatory-v3/mandatory-v3-cli-smoke.json","bytes":10082,"sha256":"067ba9cc86acfcafff5ebffa68efce7fbc228956ad742a9c7c09e72b3f63f305"},
+      {"name":"followthrough","result":"pass","cases":7,"httpRequests":27,"actualRuntimeQueueUsed":false,"evidence":"evidence/followthrough/reliable-followthrough-cli-smoke.json","bytes":8362,"sha256":"7dc9195865271cfc6e9a9fa6895263070e6e403985b261e7bf00a05ad3e25599"},
+      {"name":"operational_record","result":"pass","cases":5,"httpRequests":9,"evidence":"evidence/operational/operational-cli-regression-smoke.json","bytes":4781,"sha256":"28d98027d6e727242c136d7e99383ef08b3a0637cd40cdfa7116d1afbe115ced"},
+      {"name":"native_evidence_reader","result":"pass","cases":5,"getOnly":true,"evidence":"evidence/reader/result.json","bytes":513,"sha256":"41b9ae4b5a51f78de1b14187a2e936c90a57d65c31a0110ed288804ea9841292"},
+      {"name":"phase_successor_serialization","result":"pass","cases":4,"httpRequests":6,"evidence":"evidence/phase-successor/phase-successor-cli-smoke.json","bytes":2360,"sha256":"e8f0ce98e8015222130dcc00c9994cea5bb9c01ff527f56086e0000c140c2a1a"}
+    ],
+    "knownUnclaimedCoverage": [
+      "The broad cmd/tt model/decision-mock expectation failures and loopback server-close hang were not rerun or masked.",
+      "No unfiltered broad cmd/tt suite pass is claimed.",
+      "CLI smokes prove capability gating and HTTP serialization, not live runtime/provider continuation or exactly-once external execution.",
+      "Independent review of this exact frozen candidate remains required."
+    ]
+  },
+  "migration": {
+    "operationalRecordsCapabilityVersions": [1, 2],
+    "additiveTables": ["phase_successor_obligations", "phase_successor_lead_transfers"],
+    "profilesOrLegacyRowsTouchedByPackaging": false,
+    "admissionNoOpAddsSchema": false,
+    "rollback": {
+      "fae9f7fBinaryReasonableBeforeV2StateReliance": true,
+      "semanticDowngradeCompatibleAfterV2Writes": false,
+      "restoreOldDatabaseOverNewerWrites": false,
+      "hostBackupPreflightRestoreOwner": "database_handler"
+    }
+  },
+  "nextGates": {
+    "uiReviewRequired": {"agentId":"agt_b3987b5101f7f149","runId":"run_359f07871e71e412"},
+    "independentQaRequired": {"agentId":"agt_23aca58ddd659a3c","runId":"run_4a4e5c4ea4058a8c"},
+    "handlerSaveAndReadbackRequired": true,
+    "laterBoundedOperationalReleaseRequired": true
+  }
+}

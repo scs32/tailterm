@@ -1,0 +1,31 @@
+{
+  "workItems": [
+    {
+      "itemTaskId": "tsk_2cfcff70a0fbe967",
+      "itemId": "wi_618c8ff87e6b8061",
+      "itemRevision": 5,
+      "relationship": "primary"
+    }
+  ],
+  "workOrderMessage": {
+    "taskId": "tsk_2cfcff70a0fbe967",
+    "seq": 5775
+  },
+  "postReceipt": {
+    "id": "mpr_558086348d7bdf5f",
+    "requestId": "root-successor-admission-release5834-order-v1",
+    "taskId": "tsk_2cfcff70a0fbe967",
+    "messageSeq": 5835,
+    "createdAt": "2026-09-14T02:32:58.557062541Z"
+  },
+  "replyTo": 5834,
+  "seq": 5835,
+  "taskId": "tsk_2cfcff70a0fbe967",
+  "from": {
+    "agentId": "agt_64e8e823485a3434",
+    "node": "workspace",
+    "user": "owner"
+  },
+  "text": "Bounded operational release under owner5834 and Feature wi_618c8ff87e6b8061@5, following package5775. Prepared distinct release 20260913-successor-admission-5793de1, evidence .build/successor-admission-release-5834, backup-plan SHA256 29a6229ea70d929c75ebf37b8f6463e480c89eed3c35c9b3ce45a579ebc319c6. Frozen /tmp/successor-admission-package.XYEusu/package source5793de112e1b4c0a08d55fba17a7736e0bf2e0bf/tree43b026c59c40dcc2eb3dae75b397340007ff3225; manifest0d0f5bd985adee2be099dd3ae839786c34d0883b82a57881b08d4afc6de6346d, checksumsfd1f253c703a67d6303c3b4a636b12e7123c12358a983863b9737e70059d6684; hub1d9e97679b24428a9784430e3c96d908debc3bac71c869ac1e7f4b73a232d232, Mini2c23f9975462afb0bb587d7e213ae6272cae6062e6cf9a09bfba451133b1b378. Root copied unchanged verified-host scripts and exact hub into separate operator staging; no rebuild/frozen or shipped5669 change.\n\nHandler owns all records/database work: first obtain existing QA5832 native result receipt/event from retained output/direct readback without rerun and save final existing UI disposition, then exact package acceptance. Preserve actual immutable QA3791/UI3584 bindings and current generation history. Package acceptance gates installation. Root reviews saved disposition and operates install. After accepted package and saved bounded release, handler runs fresh verified-host preflight using .build/successor-admission-release-5834/operator/scripts/truenas_release_preflight.py --plan .build/successor-admission-release-5834/backup-plan.json --receipt-output .build/successor-admission-release-5834/handler-preflight-receipt.json; script SHA82fd43e1edf6c9f3de89101c06b374cc1b3c0430e372676f5822740b01560d46. Publish independent exact receipt-byte SHA on Board plus actual integrity/FK/profile/backup evidence. Route ssh BatchMode truenas, verified hostname truenas, /usr/bin/python3.11, live DB /mnt/deepfreeze/tailterm-hub/state/hub.sqlite; unique backup /mnt/deepfreeze/tailterm-hub/backups/before-successor-admission-5793de1-5834.sqlite,950:950/0600. No DB operation by root.\n\nRoot verifies current fae9f7f baseline/config/hash and receipt external pin, then unchanged deploy script SHA25b9e87a6a1c05793c734083902ca5a017999edfaebda745478021811f455afc with --update installs only new read-only binary mount through existing TrueNAS middleware/listener100.116.238.37:18765. Root atomically installs exact Mini with retained fae9f7f rollback binary. Verify active hub mount/hash/RUNNING, Mini hash/VCS, capabilities operationalRecords[1,2] and reliableDelivery[1,2,3], and run installed five isolated smokes. Existing QA receives fresh exact native installed-review instruction after package result is retained; no new team. Handler executes fresh live-versus-backup readonly integrity/FK/profile/schema postcheck, distinct from replayed backup receipt; expected delta is two phase-successor tables and their indexes, no admission schema. Root retains exact receipt/pins and handler-saved final release acceptance, then routes bounded phase assignment disposition/eligible closeout through handler with exact eligibility/service protection. No blanket task closure.\n\nNo owner GO remains outstanding. Existingfae9f7f rollback binaries/database preserved; do not restore old backup over intervening writes or assert semantic downgrade after v2 state. No frontend/Air/relay reload, Tailscale/network change, cleanup5349 dependency or cleanup release, provider fixture/default tmux/shared service retirement. Parent Feature completion and real unattended activation remain separate. Concrete blockers currently: exact package QA native result link, UI disposition and saved package acceptance; prepare independently while those finish.",
+  "createdAt": "2026-09-14T02:32:58.557062541Z"
+}

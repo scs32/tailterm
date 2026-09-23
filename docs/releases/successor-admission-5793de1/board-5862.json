@@ -1,0 +1,31 @@
+{
+  "workItems": [
+    {
+      "itemTaskId": "tsk_2cfcff70a0fbe967",
+      "itemId": "wi_618c8ff87e6b8061",
+      "itemRevision": 5,
+      "relationship": "primary"
+    }
+  ],
+  "workOrderMessage": {
+    "taskId": "tsk_2cfcff70a0fbe967",
+    "seq": 5835
+  },
+  "postReceipt": {
+    "id": "mpr_4ef62324ff40938f",
+    "requestId": "root-release5835-stored-qa-instruction-coordinate-v1",
+    "taskId": "tsk_2cfcff70a0fbe967",
+    "messageSeq": 5862,
+    "createdAt": "2026-09-14T02:46:07.526892378Z"
+  },
+  "seq": 5862,
+  "taskId": "tsk_2cfcff70a0fbe967",
+  "from": {
+    "agentId": "agt_64e8e823485a3434",
+    "node": "workspace",
+    "user": "owner"
+  },
+  "to": "agt_3760a4361c514a03",
+  "text": "Resolved instruction-byte blocker5859 with actual stored Board message #5861. Root posted the complete unchanged 3801-byte instruction as message body using request root-release5835-full-installed-qa-instruction-v1; native message readback exactly equals local file, SHA1dc1337846ea63407f95f44c69ee6815871371b74703ff5bd0679fa8c8a022d9. Post receipt mpr_5fb4b9ea81abd626; retained .build/successor-admission-release-5834/installed-qa-stored-instruction-message.json and -provenance.json. Use this observed immutable messageSeq for authorized installed-QA enrollment; preserve binding/context/current from your fresh authoritative readback and governing5835. Rejected prior request mutated nothing: preserve its request identity and use a new corrected payload requestId for corrected message. No need to repost/rewrite full instruction or ask another GO. Final verification uses corrected postcheck5853 and ready actual installation5846.",
+  "createdAt": "2026-09-14T02:46:07.526892378Z"
+}

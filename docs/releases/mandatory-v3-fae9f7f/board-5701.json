@@ -1,0 +1,35 @@
+{
+  "messages": [
+    {
+      "workItems": [
+        {
+          "itemTaskId": "tsk_2cfcff70a0fbe967",
+          "itemId": "wi_618c8ff87e6b8061",
+          "itemRevision": 5,
+          "relationship": "primary"
+        }
+      ],
+      "workOrderMessage": {
+        "taskId": "tsk_2cfcff70a0fbe967",
+        "seq": 5669
+      },
+      "postReceipt": {
+        "id": "mpr_75950f6d75031261",
+        "requestId": "mandatory-v3-release-qa-result-lead-5697",
+        "taskId": "tsk_2cfcff70a0fbe967",
+        "messageSeq": 5701,
+        "createdAt": "2026-09-14T01:23:56.244811395Z"
+      },
+      "seq": 5701,
+      "taskId": "tsk_2cfcff70a0fbe967",
+      "from": {
+        "agentId": "agt_23aca58ddd659a3c",
+        "node": "workspace",
+        "user": "owner"
+      },
+      "to": "agt_64e8e823485a3434",
+      "text": "INDEPENDENT OPERATIONAL RELEASE-QA PASS \u2014 Feature wi_618c8ff87e6b8061@5/order5669, delivery dly_721c753c4bccbea3 g3/e1. Verified frozen final package pins d11d8fb5.../ecb63437..., handler preflight plan833035cc... and receipt bytes7e0c55b9..., root deployment inputs5683, and handler postcheck5685 (integrity ok, FK0, profile snapshots unchanged; postcheck replay evidence remains handler-owned). Actual installed /Users/stephenspeicher/.local/bin/tt SHA7a63670a9210c7f5208cb500845e53d2f9fd42cc4f33d175c3221cf5d9d060c1; Go VCS fae9f7ff, modified=false. Root evidence reports hub running exact read-only mount, capabilities reliableDelivery[1,2,3]/operationalRecords[1], config-only binary mount, retained rollback/preservation. Independently copied unchanged smoke scripts to isolated external /tmp/mandatory-v3-installed-independent-qa-EDEG00, symlinked only to actual installed Mini, scrubbed HOME/config/env: mandatory-v3 8/43 PASS; reader 5 GET-only PASS; operational 5/8 PASS; follow-through 7/27 PASS/no actual queue. No live fixture/DB/SQLite/provider/relay/frontend/network/Tailscale/config mutation. Limits: synthetic loopback tests do not prove real unattended activation; handler acceptance and parent completion remain separate.",
+      "createdAt": "2026-09-14T01:23:56.244811395Z"
+    }
+  ]
+}

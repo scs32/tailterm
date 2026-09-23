@@ -1,0 +1,40 @@
+{
+  "host": "truenas",
+  "config": {
+    "services": {
+      "hub": {
+        "cap_drop": [
+          "ALL"
+        ],
+        "cpus": "1.0",
+        "entrypoint": [
+          "/opt/tailterm-hub"
+        ],
+        "environment": {
+          "TAILTERM_MAX_AGENTS": "32",
+          "TAILTERM_STATE": "/state",
+          "TAILTERM_TCP_LISTEN": "0.0.0.0:18765",
+          "TAILTERM_TOKEN_FILE": "/run/hub-token"
+        },
+        "image": "gcr.io/distroless/static-debian12:nonroot",
+        "mem_limit": "512m",
+        "ports": [
+          "100.116.238.37:18765:18765"
+        ],
+        "read_only": true,
+        "restart": "unless-stopped",
+        "security_opt": [
+          "no-new-privileges:true"
+        ],
+        "user": "950:950",
+        "volumes": [
+          "/mnt/deepfreeze/tailterm-hub/releases/20260913-native-reader-19970cea/tailterm-hub:/opt/tailterm-hub:ro",
+          "/mnt/deepfreeze/tailterm-hub/state:/state",
+          "/mnt/deepfreeze/tailterm-hub/hub-token:/run/hub-token:ro"
+        ]
+      }
+    }
+  },
+  "oldSHA256": "d55ea00ef313b855018356cdc2881378ff36d056743f0e636b8362134fdc265a",
+  "releaseDestinationAbsent": true
+}

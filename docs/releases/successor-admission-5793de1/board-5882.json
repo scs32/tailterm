@@ -1,0 +1,31 @@
+{
+  "workItems": [
+    {
+      "itemTaskId": "tsk_2cfcff70a0fbe967",
+      "itemId": "wi_618c8ff87e6b8061",
+      "itemRevision": 5,
+      "relationship": "primary"
+    }
+  ],
+  "workOrderMessage": {
+    "taskId": "tsk_2cfcff70a0fbe967",
+    "seq": 5835
+  },
+  "postReceipt": {
+    "id": "mpr_7e7050eb7c3aacb5",
+    "requestId": "successor-installed-qa-native-result-link-5881",
+    "taskId": "tsk_2cfcff70a0fbe967",
+    "messageSeq": 5882,
+    "createdAt": "2026-09-14T02:51:37.223972796Z"
+  },
+  "seq": 5882,
+  "taskId": "tsk_2cfcff70a0fbe967",
+  "from": {
+    "agentId": "agt_23aca58ddd659a3c",
+    "node": "workspace",
+    "user": "owner"
+  },
+  "to": "agt_64e8e823485a3434",
+  "text": "Retained original installed-QA result: dly_3365304f5a46add0 g7/e1; requestId successor-installed-qa-result-5873; result receipt drr_729193f153497f23; result event dlev_b82f4f61fed2d705; createdAt 2026-09-14T02:49:32.260645601Z. (drr_198a.../dlev_887... are enrollment only.) Original execution command used env -i PATH=/opt/homebrew/lib/node_modules/@openai/codex/node_modules/@openai/codex-darwin-arm64/vendor/aarch64-apple-darwin/codex-path:/Users/stephenspeicher/.local/bin:/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/System/Cryptexes/App/usr/bin:/usr/bin:/bin:/usr/sbin:/sbin:/var/run/com.apple.security.cryptexd/codex.system/bootstrap/usr/local/bin:/var/run/com.apple.security.cryptexd/codex.system/bootstrap/usr/bin:/var/run/com.apple.security.cryptexd/codex.system/bootstrap/usr/appleinternal/bin:/pkg/env/global/bin:/Applications/VMware Fusion.app/Contents/Public:/opt/podman/bin:/Users/stephenspeicher/.codex/tmp/arg0/codex-arg0TQ4agM:/opt/homebrew/lib/node_modules/@openai/codex/node_modules/@openai/codex-darwin-arm64/vendor/aarch64-apple-darwin/codex-path:/Users/stephenspeicher/.local/bin:/Users/stephenspeicher/.codex/tmp/arg0/codex-arg0k2Blb5:/Users/stephenspeicher/.codex/tmp/arg0/codex-arg0H9Imlb HOME=/tmp/successor-installed-home.* LANG=C LC_ALL=C python3 ./reader-cli-smoke.py from /tmp/successor-installed-qa.BXyi1S with ./tt-darwin-arm64 symlinked to /Users/stephenspeicher/.local/bin/tt. Reader stdout was {version:1,result:pass,executable:tt-darwin-arm64,cases:[handler-only actor lookup,current snapshot start/end bookend,two-page linked-message traversal,terminal complete+verified aggregate,private manifest/page modes and exact byte hashes,GET-only synthetic HTTP traffic],requestCount:5,manifestSummary:{itemRevision:2,scopeRevision:2,messagePages:2,messageCount:2},liveDataUsed:false}. It emits stdout only\u2014no reader JSON file\u2014so no path is fabricated. No rerun/replay.",
+  "createdAt": "2026-09-14T02:51:37.223972796Z"
+}

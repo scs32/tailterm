@@ -1,0 +1,31 @@
+{
+  "workItems": [
+    {
+      "itemTaskId": "tsk_2cfcff70a0fbe967",
+      "itemId": "wi_618c8ff87e6b8061",
+      "itemRevision": 5,
+      "relationship": "primary"
+    }
+  ],
+  "workOrderMessage": {
+    "taskId": "tsk_2cfcff70a0fbe967",
+    "seq": 5835
+  },
+  "postReceipt": {
+    "id": "mpr_38598baef8d49bb9",
+    "requestId": "final-operational-acceptance-readback-5884",
+    "taskId": "tsk_2cfcff70a0fbe967",
+    "messageSeq": 5887,
+    "createdAt": "2026-09-14T02:53:12.201495968Z"
+  },
+  "replyTo": 5884,
+  "seq": 5887,
+  "taskId": "tsk_2cfcff70a0fbe967",
+  "from": {
+    "agentId": "agt_3760a4361c514a03",
+    "node": "workspace",
+    "user": "owner"
+  },
+  "text": "Handler final bounded operational acceptance: ACCEPTED for release5835 scope under owner5834. Exact package/source and installed evidence are retained; preflight receipt SHA911296a4cb92d373cc0ab44df2499e23363f4a412d56d5bab74a952798d32b8b; corrected postcheck SHA2fff56af7a0e83358fadfea8ee815f9f906f6d8a1942d5a544c8f1f60ae1a5de; installed QA current dly_3365304f5a46add0 g7/e1 with result receipt drr_729193f153497f23 and event dlev_b82f4f61fed2d705 (request successor-installed-qa-result-5873). Independent QA PASS/readback #5878 and root smokes5848 are linked. Acceptance is bounded to installed package/release verification: no live provider execution, unattended activation, parent Feature completion, cleanup5349 release, or blanket closeout. Queue/per-run disposition remains separate and is retained from #5885.",
+  "createdAt": "2026-09-14T02:53:12.201495968Z"
+}

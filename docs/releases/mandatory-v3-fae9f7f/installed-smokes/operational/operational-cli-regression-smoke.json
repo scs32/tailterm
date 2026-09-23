@@ -1,0 +1,181 @@
+{
+  "candidateCli": {
+    "bytes": 6901826,
+    "sha256": "7a63670a9210c7f5208cb500845e53d2f9fd42cc4f33d175c3221cf5d9d060c1"
+  },
+  "isolatedHTTPOnly": true,
+  "syntheticCredentialsOnly": true,
+  "liveDatabaseOrHubUsed": false,
+  "results": [
+    {
+      "operation": "propose",
+      "stdout": {
+        "record": {
+          "id": "opr_0000000000000004",
+          "taskId": "tsk_0000000000000001",
+          "version": 1,
+          "state": "proposed",
+          "data": {
+            "kind": "instruction",
+            "itemTaskId": "",
+            "itemId": "",
+            "itemRevision": 0,
+            "scopeRevision": 0,
+            "deliveryId": "",
+            "generation": 0,
+            "epoch": 0,
+            "sources": null
+          },
+          "sources": [],
+          "actorAgentId": "agt_0000000000000002",
+          "actorRunId": "run_0000000000000003",
+          "by": {
+            "node": "synthetic",
+            "user": "owner"
+          },
+          "createdAt": "2026-09-13T00:00:00Z"
+        },
+        "receipt": {
+          "id": "drcp_0000000000000005",
+          "requestId": "",
+          "operation": "",
+          "createdAt": "0001-01-01T00:00:00Z"
+        },
+        "replay": false
+      }
+    },
+    {
+      "operation": "get",
+      "stdout": {
+        "id": "opr_0000000000000004",
+        "taskId": "tsk_0000000000000001",
+        "version": 1,
+        "state": "proposed",
+        "data": {
+          "kind": "instruction",
+          "itemTaskId": "",
+          "itemId": "",
+          "itemRevision": 0,
+          "scopeRevision": 0,
+          "deliveryId": "",
+          "generation": 0,
+          "epoch": 0,
+          "sources": null
+        },
+        "sources": [],
+        "actorAgentId": "agt_0000000000000002",
+        "actorRunId": "run_0000000000000003",
+        "by": {
+          "node": "synthetic",
+          "user": "owner"
+        },
+        "createdAt": "2026-09-13T00:00:00Z"
+      }
+    },
+    {
+      "operation": "commit",
+      "stdout": {
+        "record": {
+          "id": "opr_0000000000000004",
+          "taskId": "tsk_0000000000000001",
+          "version": 1,
+          "state": "committed",
+          "data": {
+            "kind": "instruction",
+            "itemTaskId": "",
+            "itemId": "",
+            "itemRevision": 0,
+            "scopeRevision": 0,
+            "deliveryId": "",
+            "generation": 0,
+            "epoch": 0,
+            "sources": null
+          },
+          "sources": [],
+          "actorAgentId": "agt_0000000000000002",
+          "actorRunId": "run_0000000000000003",
+          "by": {
+            "node": "synthetic",
+            "user": "owner"
+          },
+          "createdAt": "2026-09-13T00:00:00Z"
+        },
+        "receipt": {
+          "id": "drcp_0000000000000006",
+          "requestId": "",
+          "operation": "",
+          "createdAt": "0001-01-01T00:00:00Z"
+        },
+        "replay": false
+      }
+    },
+    {
+      "operation": "unsupported",
+      "exitCode": 1,
+      "actionRequestSent": false
+    },
+    {
+      "operation": "unknown",
+      "exitCode": 1,
+      "actionRequestSent": false
+    }
+  ],
+  "requests": [
+    {
+      "method": "GET",
+      "path": "/v1/capabilities"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/tasks/tsk_0000000000000001/operational-records",
+      "body": {
+        "requestId": "package-propose",
+        "expectedVersion": 0,
+        "agentId": "agt_0000000000000002",
+        "runId": "run_0000000000000003",
+        "data": {
+          "kind": "instruction",
+          "itemTaskId": "",
+          "itemId": "",
+          "itemRevision": 0,
+          "scopeRevision": 0,
+          "deliveryId": "",
+          "generation": 0,
+          "epoch": 0,
+          "sources": null
+        }
+      }
+    },
+    {
+      "method": "GET",
+      "path": "/v1/capabilities"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/tasks/tsk_0000000000000001/operational-records/opr_0000000000000004"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/capabilities"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/tasks/tsk_0000000000000001/operational-records/opr_0000000000000004/commit",
+      "body": {
+        "requestId": "package-commit",
+        "expectedVersion": 1,
+        "agentId": "agt_0000000000000002",
+        "runId": "run_0000000000000003"
+      }
+    },
+    {
+      "method": "GET",
+      "path": "/v1/capabilities"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/capabilities"
+    }
+  ],
+  "limit": "Packaged successor CLI regression smoke only; accepted operational-record QA #4006 covers store semantics and transition enforcement."
+}

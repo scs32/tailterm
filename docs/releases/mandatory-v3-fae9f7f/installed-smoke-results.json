@@ -1,0 +1,22 @@
+[
+  {
+    "script": "mandatory-v3-cli-smoke.py",
+    "exitCode": 0,
+    "scriptSHA256": "439d4e88501633982cfa4ad9c237bd4567ce769ee6d482c3fb441c9260ec3536"
+  },
+  {
+    "script": "reader-cli-smoke.py",
+    "exitCode": 0,
+    "scriptSHA256": "0d8d5e6e4ad13286a75b643b0fc17821213c1a4a286ab5927758c0ec0cea6b74"
+  },
+  {
+    "script": "operational-cli-smoke.py",
+    "exitCode": 0,
+    "scriptSHA256": "598ef7be014648417da9ccf5f3112fcb5eb931e11b06aa42e1b745443effbda5"
+  },
+  {
+    "script": "followthrough-cli-smoke.py",
+    "exitCode": 0,
+    "scriptSHA256": "d9975249ad880e7ba8f7c912c7e0a67472cd0a93c4cef36cdb86256cd0fbc27a"
+  }
+]

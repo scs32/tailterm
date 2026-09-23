@@ -1,0 +1,264 @@
+{
+  "version": 1,
+  "candidateCli": {
+    "bytes": 6919234,
+    "sha256": "2c23f9975462afb0bb587d7e213ae6272cae6062e6cf9a09bfba451133b1b378"
+  },
+  "isolatedHTTPOnly": true,
+  "syntheticCredentialsOnly": true,
+  "fakeCodexExecutableOnly": true,
+  "actualCodexQueueInvoked": false,
+  "liveDatabaseOrHubUsed": false,
+  "results": [
+    {
+      "operation": "v2_enrollment",
+      "passed": true
+    },
+    {
+      "operation": "v2_coverage",
+      "passed": true
+    },
+    {
+      "operation": "v1_enrollment_on_v1_hub",
+      "passed": true
+    },
+    {
+      "operation": "v2_enrollment_on_v1_hub",
+      "passed": true,
+      "actionRequestSent": false
+    },
+    {
+      "operation": "unknown_hub_fail_closed",
+      "passed": true,
+      "actionRequestSent": false
+    },
+    {
+      "operation": "followthrough_response_loss_replay",
+      "passed": true,
+      "fakeCodexCalls": 1,
+      "stableReportReplay": true
+    },
+    {
+      "operation": "followthrough_stale_report_invalidation",
+      "passed": true,
+      "fakeCodexCalls": 0
+    }
+  ],
+  "capturedRequests": [
+    {
+      "method": "GET",
+      "path": "/v1/capabilities"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/capabilities"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/tasks/tsk_0000000000000001/required-deliveries",
+      "body": {
+        "requestId": "smoke-enroll-v2",
+        "messageSeq": 41,
+        "kind": "assignment",
+        "agentId": "agt_0000000000000002",
+        "runId": "run_0000000000000003",
+        "itemTaskId": "tsk_0000000000000001",
+        "itemId": "wi_0000000000000008",
+        "itemRevision": 5,
+        "workOrderMessage": {
+          "taskId": "tsk_0000000000000001",
+          "seq": 39
+        },
+        "governingOrderMessage": {
+          "taskId": "tsk_0000000000000001",
+          "seq": 40
+        },
+        "instructionSha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "instructionBytes": 31,
+        "enrollmentVersion": 2,
+        "expectedCurrentGeneration": 0,
+        "producerAgentId": "agt_0000000000000004",
+        "producerRunId": "run_0000000000000005"
+      }
+    },
+    {
+      "method": "GET",
+      "path": "/v1/capabilities"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/capabilities"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/tasks/tsk_0000000000000001/agents/agt_0000000000000002/delivery-coverage?runId=run_0000000000000003"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/capabilities"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/tasks/tsk_0000000000000001/required-deliveries",
+      "body": {
+        "requestId": "smoke-enroll-v1",
+        "messageSeq": 41,
+        "kind": "assignment",
+        "agentId": "agt_0000000000000002",
+        "runId": "run_0000000000000003",
+        "itemTaskId": "tsk_0000000000000001",
+        "itemId": "wi_0000000000000008",
+        "itemRevision": 5,
+        "workOrderMessage": {
+          "taskId": "tsk_0000000000000001",
+          "seq": 39
+        },
+        "governingOrderMessage": {
+          "taskId": "tsk_0000000000000001",
+          "seq": 40
+        },
+        "instructionSha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "instructionBytes": 31,
+        "enrollmentVersion": 1,
+        "expectedCurrentGeneration": 0,
+        "producerAgentId": "agt_0000000000000004",
+        "producerRunId": "run_0000000000000005"
+      }
+    },
+    {
+      "method": "GET",
+      "path": "/v1/capabilities"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/capabilities"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/capabilities"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/capabilities"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/tasks/tsk_0000000000000001/agents/agt_0000000000000002/delivery-coverages?runId=run_0000000000000003"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/tasks/tsk_0000000000000001/agents/agt_0000000000000002/delivery-coverage?runId=run_0000000000000003"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/tasks/tsk_0000000000000001/deliveries/dly_0000000000000006/follow-through/check",
+      "body": {
+        "requestId": "followthrough-check-59e5b088f772f2e325e715f0",
+        "agentId": "agt_0000000000000002",
+        "runId": "run_0000000000000003",
+        "expectedGeneration": 2,
+        "expectedEpoch": 3,
+        "observation": {
+          "state": "unknown",
+          "source": "codex_queue_only",
+          "observedAt": "2026-09-14T02:38:25.460136Z"
+        }
+      }
+    },
+    {
+      "method": "GET",
+      "path": "/v1/tasks/tsk_0000000000000001/agents/agt_0000000000000002/delivery-coverage?itemId=wi_0000000000000008&runId=run_0000000000000003"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/tasks/tsk_0000000000000001/deliveries/dly_0000000000000006/follow-through/report",
+      "body": {
+        "requestId": "followthrough-report-43292bf17750fdfa32a0574f",
+        "agentId": "agt_0000000000000002",
+        "runId": "run_0000000000000003",
+        "expectedGeneration": 2,
+        "expectedEpoch": 3,
+        "leaseRequestId": "followthrough-check-59e5b088f772f2e325e715f0",
+        "outcome": "accepted",
+        "text": "native Codex queue accepted the exact-thread prompt; directive consumption remains unconfirmed"
+      }
+    },
+    {
+      "method": "POST",
+      "path": "/v1/tasks/tsk_0000000000000001/deliveries/dly_0000000000000006/follow-through/report",
+      "body": {
+        "requestId": "followthrough-report-43292bf17750fdfa32a0574f",
+        "agentId": "agt_0000000000000002",
+        "runId": "run_0000000000000003",
+        "expectedGeneration": 2,
+        "expectedEpoch": 3,
+        "leaseRequestId": "followthrough-check-59e5b088f772f2e325e715f0",
+        "outcome": "accepted",
+        "text": "native Codex queue accepted the exact-thread prompt; directive consumption remains unconfirmed"
+      }
+    },
+    {
+      "method": "GET",
+      "path": "/v1/tasks/tsk_0000000000000001/agents/agt_0000000000000002/delivery-coverages?runId=run_0000000000000003"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/tasks/tsk_0000000000000001/agents/agt_0000000000000002/delivery-coverage?runId=run_0000000000000003"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/tasks/tsk_0000000000000001/agents/agt_0000000000000002"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/capabilities"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/tasks/tsk_0000000000000001/deliveries/dly_0000000000000006/follow-through/report",
+      "body": {
+        "requestId": "stale-report",
+        "agentId": "agt_0000000000000002",
+        "runId": "run_0000000000000003",
+        "expectedGeneration": 2,
+        "expectedEpoch": 3,
+        "leaseRequestId": "stale-lease",
+        "outcome": "accepted",
+        "text": "synthetic old report"
+      }
+    },
+    {
+      "method": "POST",
+      "path": "/v1/tasks/tsk_0000000000000001/deliveries/dly_0000000000000006/follow-through/report",
+      "body": {
+        "requestId": "followthrough-invalidate-450915d714a59b98b681132c",
+        "agentId": "agt_0000000000000002",
+        "runId": "run_0000000000000003",
+        "expectedGeneration": 2,
+        "expectedEpoch": 3,
+        "leaseRequestId": "stale-lease",
+        "outcome": "invalidated",
+        "text": "a definitive hub conflict shows that the exact lease was invalidated; no old external action will be retried"
+      }
+    },
+    {
+      "method": "GET",
+      "path": "/v1/tasks/tsk_0000000000000001/agents/agt_0000000000000002/delivery-coverages?runId=run_0000000000000003"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/tasks/tsk_0000000000000001/agents/agt_0000000000000002/delivery-coverage?runId=run_0000000000000003"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/tasks/tsk_0000000000000001/agents/agt_0000000000000002"
+    }
+  ],
+  "rawRuntimeObservationsRetained": true,
+  "normalizedVolatileFields": [],
+  "limits": [
+    "Packaged CLI smoke proves capability gating and HTTP serialization only.",
+    "Store/server state-machine, race, migration and lifecycle semantics are covered by the accepted focused Go suites and independent QA #4236/#4237.",
+    "The fake Codex executable only verifies exact relay subprocess dispatch and never contacts a runtime provider."
+  ]
+}

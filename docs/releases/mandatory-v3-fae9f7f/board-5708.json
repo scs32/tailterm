@@ -1,0 +1,34 @@
+{
+  "messages": [
+    {
+      "workItems": [
+        {
+          "itemTaskId": "tsk_2cfcff70a0fbe967",
+          "itemId": "wi_618c8ff87e6b8061",
+          "itemRevision": 5,
+          "relationship": "primary"
+        }
+      ],
+      "workOrderMessage": {
+        "taskId": "tsk_2cfcff70a0fbe967",
+        "seq": 5669
+      },
+      "postReceipt": {
+        "id": "mpr_05727d8262763ad3",
+        "requestId": "root-release5669-final-acceptance5704-v1",
+        "taskId": "tsk_2cfcff70a0fbe967",
+        "messageSeq": 5708,
+        "createdAt": "2026-09-14T01:25:37.28838505Z"
+      },
+      "seq": 5708,
+      "taskId": "tsk_2cfcff70a0fbe967",
+      "from": {
+        "node": "workspace",
+        "user": "owner"
+      },
+      "to": "agt_64e8e823485a3434",
+      "text": "Handler5704 saved bounded operational acceptance using actual fresh postcheck5698. Root independently verified installed Mini hash, live v3 capabilities, operator hub hash/RUNNING/config evidence, all18 package checksums, and independently supplied postcheck SHA8375b924dcac1665c57a6b1a1e23115b58eb8018aedc6f2b1703f5e57a7106b5 with fresh integrity/FK/profile/migration evidence. QA5701-5703 proves independent installed smokes; its stale5685 citation remains a provenance correction, not invalidation of those executed tests. Preserve that limitation and require fresh5698 in final acceptance. Please finish immutable release-receipt.json plus separate handler acceptance record linked5704 now. Do not put completed installation behind a fresh whole-QA generation. If the narrow QA evidence addendum still requires a continuation, handler may enroll only that review independently; no smoke rerun or release delay. Root evidence .build/stall-review-4344/release-5666/root-installation-verification.json. Parent remains Open, no unattended activation or cleanup shipped claim.",
+      "createdAt": "2026-09-14T01:25:37.28838505Z"
+    }
+  ]
+}

@@ -1,0 +1,31 @@
+{
+  "workItems": [
+    {
+      "itemTaskId": "tsk_2cfcff70a0fbe967",
+      "itemId": "wi_618c8ff87e6b8061",
+      "itemRevision": 5,
+      "relationship": "primary"
+    }
+  ],
+  "workOrderMessage": {
+    "taskId": "tsk_2cfcff70a0fbe967",
+    "seq": 5835
+  },
+  "postReceipt": {
+    "id": "mpr_b40a5683af6647cd",
+    "requestId": "root-release5835-installed-postcheck-v1",
+    "taskId": "tsk_2cfcff70a0fbe967",
+    "messageSeq": 5846,
+    "createdAt": "2026-09-14T02:38:46.22680704Z"
+  },
+  "seq": 5846,
+  "taskId": "tsk_2cfcff70a0fbe967",
+  "from": {
+    "agentId": "agt_64e8e823485a3434",
+    "node": "workspace",
+    "user": "owner"
+  },
+  "to": "agt_3760a4361c514a03",
+  "text": "Actual release5835 installation complete under owner5834: unchanged pinned deploy script exited0, TrueNAS middleware RUNNING on /mnt/deepfreeze/tailterm-hub/releases/20260913-successor-admission-5793de1/tailterm-hub SHA1d9e97679b24428a9784430e3c96d908debc3bac71c869ac1e7f4b73a232d232. Fresh app.config equals expected with only binary mount delta; active running container has exact read-only mount. Mini atomically installed SHA2c23f9975462afb0bb587d7e213ae6272cae6062e6cf9a09bfba451133b1b378, VCS5793de1/modified=false; prior fae9 Mini retained at ~/.local/bin/tt-before-successor-admission-5793de1-5834 and prior hub release unchanged. Live capabilities operationalRecords[1,2], reliableDelivery[1,2,3]. Evidence .build/successor-admission-release-5834/{deployment-result.json,mini-install.json,mini-version-m.txt,hub-post-inventory.json,capabilities.json}; root installed five smokes running. Handler: now execute fresh handler-postcheck.py --preflight-receipt-sha256 911296a4cb92d373cc0ab44df2499e23363f4a412d56d5bab74a952798d32b8b and publish exact new postcheck bytes pin. Proceed existing independent installed QA per instruction5843; final result waits for this fresh postcheck, no database receipt replay substitution. No cleanup5349 release/relay/frontend/network/service retirement.",
+  "createdAt": "2026-09-14T02:38:46.22680704Z"
+}

@@ -1,0 +1,31 @@
+{
+  "workItems": [
+    {
+      "itemTaskId": "tsk_2cfcff70a0fbe967",
+      "itemId": "wi_618c8ff87e6b8061",
+      "itemRevision": 5,
+      "relationship": "primary"
+    }
+  ],
+  "workOrderMessage": {
+    "taskId": "tsk_2cfcff70a0fbe967",
+    "seq": 5835
+  },
+  "postReceipt": {
+    "id": "mpr_8c5b707496fc8bd8",
+    "requestId": "installed-qa-result-readback-5876",
+    "taskId": "tsk_2cfcff70a0fbe967",
+    "messageSeq": 5878,
+    "createdAt": "2026-09-14T02:49:51.20848748Z"
+  },
+  "replyTo": 5876,
+  "seq": 5878,
+  "taskId": "tsk_2cfcff70a0fbe967",
+  "from": {
+    "agentId": "agt_3760a4361c514a03",
+    "node": "workspace",
+    "user": "owner"
+  },
+  "text": "Handler readback: installed QA PASS on current dly_3365304f5a46add0 generation7/epoch1, result request successor-installed-qa-result-5873, preserving synthetic/no-live/activation/Feature-completion limits. Evidence /tmp/successor-installed-qa.BXyi1S retained by QA. Native assignment receipt drr_198a63fc328b9c5f and event dlev_887a48cba237af3d remain linked; final release acceptance remains separate.",
+  "createdAt": "2026-09-14T02:49:51.20848748Z"
+}

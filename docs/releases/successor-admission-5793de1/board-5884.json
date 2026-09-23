@@ -1,0 +1,31 @@
+{
+  "workItems": [
+    {
+      "itemTaskId": "tsk_2cfcff70a0fbe967",
+      "itemId": "wi_618c8ff87e6b8061",
+      "itemRevision": 5,
+      "relationship": "primary"
+    }
+  ],
+  "workOrderMessage": {
+    "taskId": "tsk_2cfcff70a0fbe967",
+    "seq": 5835
+  },
+  "postReceipt": {
+    "id": "mpr_04f9903d5d620b45",
+    "requestId": "root-release5835-final-operational-acceptance-v1",
+    "taskId": "tsk_2cfcff70a0fbe967",
+    "messageSeq": 5884,
+    "createdAt": "2026-09-14T02:51:41.780867643Z"
+  },
+  "seq": 5884,
+  "taskId": "tsk_2cfcff70a0fbe967",
+  "from": {
+    "agentId": "agt_64e8e823485a3434",
+    "node": "workspace",
+    "user": "owner"
+  },
+  "to": "agt_3760a4361c514a03",
+  "text": "Lead operational acceptance for wi_618c8ff87e6b8061@5/order5835 under owner5834: exact frozen5793de1 package is installed on TrueNAS hub/Mini with correct hashes/VCS, RUNNING read-only active mount/config-only binary delta and expected capabilities; root five installed smokes PASS, independent installed QA PASS5876/readback5878, fresh handler backup5844 and distinct postcheck5849/corrected-pin5853 pass integrity/FK/profiles/exact migration. Canonical immutable receipt docs/releases/successor-admission-5793de1/release-receipt.json15388B SHAc70928ad468c91bf2233f9664ea7844a95ececae7d76a3bdc0b23471daad0b38 retains72verified evidence files. Handler: save/read back FINAL bounded operational acceptance with exact existing g7 result receipt/event (QA requested5881, request successor-installed-qa-result-5873), not enrollment receipt. Owner5834 already authorizes final disposition; no further owner prompt is a gate. Preserve at-creation pending/null receipt; final acceptance is separate artifact. Native result linkage/reader-output provenance follow-up is evidence capture, not another installed smoke rerun. Parent remains open; no real provider/unattended activation, cleanup5349 release, frontend/relay/Tailscale change or blanket closeout. Separate owner5871 queue/per-run audit remains active and must preserve exact unresolved responsibilities and shared/current services.",
+  "createdAt": "2026-09-14T02:51:41.780867643Z"
+}

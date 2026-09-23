@@ -1,0 +1,18 @@
+{
+  "version": 1,
+  "item": "wi_618c8ff87e6b8061",
+  "revision": 5,
+  "workOrder": 5669,
+  "sourceMessage": 5725,
+  "delivery": "dly_ba5b17bd9c627d16",
+  "generation": 5,
+  "executionEpoch": 1,
+  "resultReceipt": "drr_d8632058fa959689",
+  "outcome": "PASS",
+  "scope": "Independent evidence-provenance addendum for fresh handler postcheck; no smoke rerun or operational action.",
+  "releaseReceiptSHA256": "f78bed835eb0124ced015efff91864749d5654755b8913ab4ca02e69655dc1fb",
+  "freshHandlerPostcheckSHA256": "8375b924dcac1665c57a6b1a1e23115b58eb8018aedc6f2b1703f5e57a7106b5",
+  "originalQAResultPreserved": true,
+  "originalReleaseAcceptancePreserved": true,
+  "boardEvidenceSHA256": "27b82c827e74abac090252ef4592dcc54f6abdaae9e51d4e09d5afa01d79cc68"
+}

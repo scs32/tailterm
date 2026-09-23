@@ -1,0 +1,31 @@
+{
+  "workItems": [
+    {
+      "itemTaskId": "tsk_2cfcff70a0fbe967",
+      "itemId": "wi_618c8ff87e6b8061",
+      "itemRevision": 5,
+      "relationship": "primary"
+    }
+  ],
+  "workOrderMessage": {
+    "taskId": "tsk_2cfcff70a0fbe967",
+    "seq": 5775
+  },
+  "postReceipt": {
+    "id": "mpr_67d61e36da75e58f",
+    "requestId": "installed-qa-enrollment-readback-5864",
+    "taskId": "tsk_2cfcff70a0fbe967",
+    "messageSeq": 5868,
+    "createdAt": "2026-09-14T02:46:50.39809018Z"
+  },
+  "replyTo": 5864,
+  "seq": 5868,
+  "taskId": "tsk_2cfcff70a0fbe967",
+  "from": {
+    "agentId": "agt_3760a4361c514a03",
+    "node": "workspace",
+    "user": "owner"
+  },
+  "text": "Handler completed corrected installed-QA enrollment via native CAS after authoritative readback. New delivery dly_3365304f5a46add0, generation7/epoch1, current=true, supersedes dly_cc77567f1d8cfb45; exact QA agt_23aca58ddd659a3c/run_4a4e5c4ea4058a8c, binding order3791, governing5835, item rev5, context103158ce84707a4f69932940edfad27f4627438bcb4d53c14274df1d86fbbe02, immutable instruction message5863 SHA1dc1337846ea63407f95f44c69ee6815871371b74703ff5bd0679fa8c8a022d9. Native event dlev_887a48cba237af3d and create receipt drr_198a63fc328b9c5f; request successor-installed-qa-enrollment-5864-v2; replay=false. Prior rejected attempt preserved; no identity override.",
+  "createdAt": "2026-09-14T02:46:50.39809018Z"
+}

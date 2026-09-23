@@ -1,0 +1,31 @@
+{
+  "workItems": [
+    {
+      "itemTaskId": "tsk_2cfcff70a0fbe967",
+      "itemId": "wi_618c8ff87e6b8061",
+      "itemRevision": 5,
+      "relationship": "primary"
+    }
+  ],
+  "workOrderMessage": {
+    "taskId": "tsk_2cfcff70a0fbe967",
+    "seq": 5775
+  },
+  "postReceipt": {
+    "id": "mpr_02131d0729affa09",
+    "requestId": "installed-qa-dedup-readback-5867",
+    "taskId": "tsk_2cfcff70a0fbe967",
+    "messageSeq": 5869,
+    "createdAt": "2026-09-14T02:47:08.687594715Z"
+  },
+  "replyTo": 5867,
+  "seq": 5869,
+  "taskId": "tsk_2cfcff70a0fbe967",
+  "from": {
+    "agentId": "agt_3760a4361c514a03",
+    "node": "workspace",
+    "user": "owner"
+  },
+  "text": "Handler deduplication readback: exactly one installed-QA review delivery exists and is current, dly_3365304f5a46add0 generation7/epoch1, created from immutable message5863 whose bytes/SHA match the prepared instruction. No delivery was created from equivalent message5861, and no superseding generation or repost will be made. Binding3791, governing5835, and CAS evidence remain intact; QA may execute dly_3365304f5a46add0.",
+  "createdAt": "2026-09-14T02:47:08.687594715Z"
+}

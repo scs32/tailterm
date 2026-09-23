@@ -1,0 +1,12 @@
+[
+  "/opt/homebrew/opt/python@3.14/bin/python3.14",
+  "/Users/stephenspeicher/projects/tailterm/.build/successor-admission-release-5834/operator/scripts/deploy-truenas-hub.py",
+  "20260913-successor-admission-5793de1",
+  "--plan",
+  "/Users/stephenspeicher/projects/tailterm/.build/successor-admission-release-5834/backup-plan.json",
+  "--preflight-receipt",
+  "/Users/stephenspeicher/projects/tailterm/.build/successor-admission-release-5834/handler-preflight-receipt.json",
+  "--preflight-receipt-sha256",
+  "911296a4cb92d373cc0ab44df2499e23363f4a412d56d5bab74a952798d32b8b",
+  "--update"
+]

@@ -1,0 +1,21 @@
+{
+  "version": 1,
+  "result": "pass",
+  "executable": "tt-darwin-arm64",
+  "cases": [
+    "handler-only actor lookup",
+    "current snapshot start/end bookend",
+    "two-page linked-message traversal",
+    "terminal complete+verified aggregate",
+    "private manifest/page modes and exact byte hashes",
+    "GET-only synthetic HTTP traffic"
+  ],
+  "requestCount": 5,
+  "manifestSummary": {
+    "itemRevision": 2,
+    "scopeRevision": 2,
+    "messagePages": 2,
+    "messageCount": 2
+  },
+  "liveDataUsed": false
+}

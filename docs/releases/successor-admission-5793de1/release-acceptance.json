@@ -1,0 +1,154 @@
+{
+  "version": 1,
+  "createdAt": "2026-09-14T02:54:43.128385+00:00",
+  "item": "wi_618c8ff87e6b8061",
+  "revision": 5,
+  "workOrder": 5835,
+  "ownerAuthorizationMessage": 5834,
+  "receipt": "release-receipt.json",
+  "receiptSHA256": "c70928ad468c91bf2233f9664ea7844a95ececae7d76a3bdc0b23471daad0b38",
+  "leadAcceptanceMessage": 5884,
+  "handlerSavedAcceptanceMessage": 5887,
+  "status": "accepted",
+  "scope": "Exact successor/admission 5793de1 package installed on TrueNAS hub and Mini; bounded operational release only.",
+  "independentQA": {
+    "messages": [
+      5876,
+      5878,
+      5882
+    ],
+    "delivery": "dly_3365304f5a46add0",
+    "generation": 7,
+    "executionEpoch": 1,
+    "resultRequestId": "successor-installed-qa-result-5873",
+    "resultReceipt": "drr_729193f153497f23",
+    "resultEvent": "dlev_b82f4f61fed2d705",
+    "status": "pass",
+    "installedSyntheticSmokes": 5,
+    "scope": "Installed Mini hash/VCS and five unchanged package synthetic CLI smokes; hub/preflight/postcheck through retained operator/handler evidence.",
+    "readerEvidence": "Original stdout retained by QA Board5882; this invocation emitted no reader JSON file. No rerun, replay or invented path.",
+    "evidence": [
+      {
+        "path": "independent-installed-qa/out-followthrough/reliable-followthrough-cli-smoke.json",
+        "bytes": 8362,
+        "sha256": "7baf675f55146e95624affa675277093b602ba3aeb4aedde10fc667a3e8ed81a"
+      },
+      {
+        "path": "independent-installed-qa/out-mandatory/enrollment-0.json",
+        "bytes": 625,
+        "sha256": "c9e15acf7384271a75d33cf106de1447cb0ca74408d8671715d726c365f81c8f"
+      },
+      {
+        "path": "independent-installed-qa/out-mandatory/enrollment-1.json",
+        "bytes": 640,
+        "sha256": "6e9e3e1bf54b4cb55e981828cb0770e63f08d9316cb3881f7020466687728324"
+      },
+      {
+        "path": "independent-installed-qa/out-mandatory/enrollment-2.json",
+        "bytes": 639,
+        "sha256": "e7da5ea7a1767918c93e8190a6f19c950510792c2873af10b44b1160a33d261a"
+      },
+      {
+        "path": "independent-installed-qa/out-mandatory/incident.json",
+        "bytes": 655,
+        "sha256": "1591af42d8536dd1b854f627a3a242da976b8f235759a909abde8585aa736c35"
+      },
+      {
+        "path": "independent-installed-qa/out-mandatory/mandatory-v3-cli-smoke.json",
+        "bytes": 10082,
+        "sha256": "067ba9cc86acfcafff5ebffa68efce7fbc228956ad742a9c7c09e72b3f63f305"
+      },
+      {
+        "path": "independent-installed-qa/out-operational/operational-cli-regression-smoke.json",
+        "bytes": 4781,
+        "sha256": "28d98027d6e727242c136d7e99383ef08b3a0637cd40cdfa7116d1afbe115ced"
+      },
+      {
+        "path": "independent-installed-qa/out-operational/operational-commit.json",
+        "bytes": 54,
+        "sha256": "6595a3daf04fb43cc162cb79e5ba5d878de36573bb2c2776c031cf39fc4cf7cb"
+      },
+      {
+        "path": "independent-installed-qa/out-operational/operational-proposal.json",
+        "bytes": 66,
+        "sha256": "2911fb8bdff80c2077c2f12624f29207469f6e74f92b8e956d80ed739f7bba2a"
+      },
+      {
+        "path": "independent-installed-qa/out-phase/phase-proposal.json",
+        "bytes": 137,
+        "sha256": "b880610a118683262f92c7376cb6d2155b86b20a479e55e2ea7cb7ec3a7c63cf"
+      },
+      {
+        "path": "independent-installed-qa/out-phase/phase-successor-cli-smoke.json",
+        "bytes": 2360,
+        "sha256": "e8f0ce98e8015222130dcc00c9994cea5bb9c01ff527f56086e0000c140c2a1a"
+      }
+    ]
+  },
+  "freshHandlerPostcheck": {
+    "message": 5849,
+    "correctedPinMessage": 5853,
+    "path": "handler-postcheck.json",
+    "sha256": "2fff56af7a0e83358fadfea8ee815f9f906f6d8a1942d5a544c8f1f60ae1a5de",
+    "integrity": "ok",
+    "foreignKeyViolations": 0,
+    "profilesEqual": true,
+    "expectedMigrationObjects": true
+  },
+  "receiptGraphVerified": true,
+  "parentStatus": "open",
+  "activationClaim": false,
+  "cleanupShipped": false,
+  "boardEvidence": [
+    {
+      "seq": 5853,
+      "path": "board-5853.json",
+      "sha256": "6b3b4dc42b5309b20b1561596303a2666ea1844c57675188050cb31bc9c694d6"
+    },
+    {
+      "seq": 5861,
+      "path": "board-5861.json",
+      "sha256": "b2981db8e71444634d67d2dc456071250cc25ac8caef707a70f617d36cc68873"
+    },
+    {
+      "seq": 5862,
+      "path": "board-5862.json",
+      "sha256": "016b85373427c4a16c8953051d75b16052825735925497b6507ef297342bc662"
+    },
+    {
+      "seq": 5868,
+      "path": "board-5868.json",
+      "sha256": "6033808cbaddc36d21e984acc94b5cc02da3a9e9ee7274d817ec98ffdd50986d"
+    },
+    {
+      "seq": 5869,
+      "path": "board-5869.json",
+      "sha256": "da41ab93549988e8353a86458c57fe2e7d314433fd0499f4c8f34539856f6c4c"
+    },
+    {
+      "seq": 5876,
+      "path": "board-5876.json",
+      "sha256": "bb02bb4f6a594148643b031599385655954f189825b73826a7ea4b3fc0ca366d"
+    },
+    {
+      "seq": 5878,
+      "path": "board-5878.json",
+      "sha256": "2d3af6b7d36f024cfe44110a2b5ee8b54bf83fccce2a27e914ce3ee17c1d2230"
+    },
+    {
+      "seq": 5882,
+      "path": "board-5882.json",
+      "sha256": "37adfad304b7a736f8df47574ddbb25979bd1b63297a435fc3e0cc82f2c80d56"
+    },
+    {
+      "seq": 5884,
+      "path": "board-5884.json",
+      "sha256": "b2756bf1425bc15066ddbe0e39b551a54f8ef06c19c95e8bf78ef9764fcc4396"
+    },
+    {
+      "seq": 5887,
+      "path": "board-5887.json",
+      "sha256": "48d73f09fa359fbcab00637176fd77e7138a080ece6f1c1a36137f12292834fa"
+    }
+  ]
+}

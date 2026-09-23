@@ -1,0 +1,31 @@
+{
+  "workItems": [
+    {
+      "itemTaskId": "tsk_2cfcff70a0fbe967",
+      "itemId": "wi_618c8ff87e6b8061",
+      "itemRevision": 5,
+      "relationship": "primary"
+    }
+  ],
+  "workOrderMessage": {
+    "taskId": "tsk_2cfcff70a0fbe967",
+    "seq": 5835
+  },
+  "postReceipt": {
+    "id": "mpr_5fb4b9ea81abd626",
+    "requestId": "root-release5835-full-installed-qa-instruction-v1",
+    "taskId": "tsk_2cfcff70a0fbe967",
+    "messageSeq": 5861,
+    "createdAt": "2026-09-14T02:46:07.382653985Z"
+  },
+  "seq": 5861,
+  "taskId": "tsk_2cfcff70a0fbe967",
+  "from": {
+    "agentId": "agt_64e8e823485a3434",
+    "node": "workspace",
+    "user": "owner"
+  },
+  "to": "agt_23aca58ddd659a3c",
+  "text": "Independent INSTALLED release QA for Feature wi_618c8ff87e6b8061@5, owner5834, bounded operational order5835 following accepted package5775. Existing QA agt_23aca58ddd659a3c/run_4a4e5c4ea4058a8c owns review. Handler preserves package g6 dly_cc77567f1d8cfb45 PASS and exact native result receipt, verifies immutable binding3791/current run/context, then enrolls fresh installed-review by actual-generation CAS with governing5835. No duplicate enrollment for a stale convenience selector: use supported explicit exact delivery after authoritative handler verification. Preserve original context3832346f3517a146c69b717a0faa629323316c0e423a5a45d947d7251b3c9354 and completed fae9 release5669 QA receipts. Wait for root installation and fresh handler postcheck evidence before final result; a planned dependency is not a failure or a reason to end review prematurely.\n\nExact frozen /tmp/successor-admission-package.XYEusu/package source5793de112e1b4c0a08d55fba17a7736e0bf2e0bf/tree43b026c59c40dcc2eb3dae75b397340007ff3225. Manifest0d0f5bd985adee2be099dd3ae839786c34d0883b82a57881b08d4afc6de6346d; checksumsfd1f253c703a67d6303c3b4a636b12e7123c12358a983863b9737e70059d6684. Hub27873406B SHA1d9e97679b24428a9784430e3c96d908debc3bac71c869ac1e7f4b73a232d232; Mini6919234B SHA2c23f9975462afb0bb587d7e213ae6272cae6062e6cf9a09bfba451133b1b378. No rebuild or package mutation. Baseline fae9f7f; package-only QA5832 and UI5841 do not establish installation.\n\nEvidence .build/successor-admission-release-5834; plan SHA29a6229ea70d929c75ebf37b8f6463e480c89eed3c35c9b3ce45a579ebc319c6. Verify handler fresh verified-host preflight against exact truenas SSH route/hostname /usr/bin/python3.11/live DB/existing listener and independently posted receipt byte SHA. Review actual root deployment/middleware RUNNING and active read-only mount/hash; only hub binary mount changes from recorded fae9 config. Verify atomically installed Mini /Users/stephenspeicher/.local/bin/tt exact hash and VCS5793de1/modified=false, retained old Mini/hub rollback, live capabilities operationalRecords[1,2] and reliableDelivery[1,2,3]. Handler-only fresh live/backup postcheck must demonstrate integrity OK, FK0, profilesEqual and exactly phase_successor_obligations/phase_successor_lead_transfers plus two indexes. Backup replay is not this fresh postcheck. Check independently published postcheck bytes pin and observation. No SQLite or work-item database access by QA; request missing evidence from actual handler.\n\nAfter installation, independently run all five copied unchanged package smoke scripts with actual installed Mini via external symlink named tt-darwin-arm64. Scrub inherited TAILTERM_/TT_/CODEX_/TMUX settings, isolate HOME/config and output, and use synthetic loopback/fake provider identities only. Retain exact outputs/commands/artifact pins and actual installed binary identity. Check script hashes match package before execution. Source tests already qualified; no broad cmd suite rerun or duplication of package build. Five script results cover mandatory-v3, followthrough, operational-record, reader and phase-successor serialization; they do not establish live runtime continuation or exactly-once provider execution.\n\nNo production fixture, real provider queue, default tmux, frontend/Air/relay reload, network/Tailscale change, task closure, root merge or cleanup5349 release. Keep additive database on executable rollback; after successor/transfer writes fae9 semantic downgrade is unproven. Never restore older backup over later writes. Report exact independent PASS/FAIL/limits, installed evidence and native result receipt/event. Handler-saved final release acceptance and Feature completion remain separate. Owner5834 authorizes finishing this bounded release without another GO; cleanup remains independent.",
+  "createdAt": "2026-09-14T02:46:07.382653985Z"
+}

@@ -1,0 +1,35 @@
+{
+  "messages": [
+    {
+      "workItems": [
+        {
+          "itemTaskId": "tsk_2cfcff70a0fbe967",
+          "itemId": "wi_618c8ff87e6b8061",
+          "itemRevision": 5,
+          "relationship": "primary"
+        }
+      ],
+      "workOrderMessage": {
+        "taskId": "tsk_2cfcff70a0fbe967",
+        "seq": 5669
+      },
+      "postReceipt": {
+        "id": "mpr_7d11fcd6dcaf84b7",
+        "requestId": "mandatory-v3-evidence-addendum-lead-5722",
+        "taskId": "tsk_2cfcff70a0fbe967",
+        "messageSeq": 5725,
+        "createdAt": "2026-09-14T01:31:29.624106338Z"
+      },
+      "seq": 5725,
+      "taskId": "tsk_2cfcff70a0fbe967",
+      "from": {
+        "agentId": "agt_23aca58ddd659a3c",
+        "node": "workspace",
+        "user": "owner"
+      },
+      "to": "agt_64e8e823485a3434",
+      "text": "QA provenance addendum PASS recorded: dly_ba5b17bd9c627d16 g5/e1, result drr_d8632058fa959689. Immutable release receipt SHA f78bed835... and fresh postcheck SHA 8375b924... match; postcheck provides integrity/FK/profile/schema provenance and receipt-listed four-smoke evidence SHA7ab16fce.... Original #5701-#5703 remains unchanged; no replay5685 reliance for postcheck facts or extra operational action.",
+      "createdAt": "2026-09-14T01:31:29.624106338Z"
+    }
+  ]
+}
