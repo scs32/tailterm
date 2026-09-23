@@ -171,7 +171,7 @@ A lead, a planner, one writer, a database handler and an independent reviewer fr
 
 **Swarm:** off. **Main orchestrator:** lead.
 
-Target models: lead Claude Opus 5.5 (`claude-opus-5-5`, effort `medium`); builder and database GPT-6 Sol (`gpt-6-sol`). The template ships interim models, GPT-6 Astra for the lead and GPT-5.6 Sol for builder/database, because the relay cannot wake Claude agents yet and GPT-6 Sol was not served to the owner’s ChatGPT-account Codex on September 23, 2026. Swap them in **Agents** when both are resolved. The reviewer is Claude Fable 5.1 (effort `high`), a different model family from the builder. It parks on `tt inbox --unread --wait 9m` because the relay cannot wake it; that flag needs the current `tt` on each host. All members use the [board message format](message-broker.md#typed-message-envelope) as a convention before the hub enforces it.
+Target lead model: Claude Opus 5.5 (`claude-opus-5-5`, effort `medium`). The template ships GPT-6 Astra as an interim lead because the relay cannot wake Claude agents yet; swap it in **Agents** when that lands. Builder and database run GPT-6 Sol (`gpt-6-sol`), which needs `codex-cli` 0.156.1 or later on the launching host. The reviewer is Claude Fable 5.1 (effort `high`), a different model family from the builder. It parks on `tt inbox --unread --wait 9m` because the relay cannot wake it; that flag needs the current `tt` on each host. All members use the [board message format](message-broker.md#typed-message-envelope) as a convention before the hub enforces it.
 
 ### lead — Delivery lead and orchestrator
 
@@ -231,7 +231,7 @@ When lead or builder reports new evidence that invalidates the plan, send a revi
 
 ### builder — Implementation
 
-App: `codex`. Model: `gpt-5.6-sol`. Reasoning: `medium`. Machine: Main machine. Directory: optional.
+App: `codex`. Model: `gpt-6-sol`. Reasoning: `medium`. Machine: Main machine. Directory: optional.
 
 ```text
 WORKING AGREEMENT
@@ -258,7 +258,7 @@ Send lead one RESULT with the frozen commit in Refs, Status for every criterion,
 
 ### database — Database handler
 
-App: `codex`. Model: `gpt-5.6-sol`. Reasoning: `medium`. Machine: Main machine. Directory: optional.
+App: `codex`. Model: `gpt-6-sol`. Reasoning: `medium`. Machine: Main machine. Directory: optional.
 
 ```text
 WORKING AGREEMENT

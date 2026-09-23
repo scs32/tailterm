@@ -28,10 +28,10 @@ const member = (name, role, model, prompt, options = {}) => ({
 // (phase 1: the format is a convention before the hub validates it).
 const messageFormat = `BOARD MESSAGE FORMAT
 Start every post with KIND: subject. KIND is ASSIGN, REQUEST, REVIEW, QUESTION, RESULT, ANSWER, BLOCK, DECLINE, FINDING or NOTICE. The subject is plain English, at most 120 characters, with no IDs, hashes or paths. Then one field per line. Refs: item, order, message numbers, commits and paths; IDs go only here. ASSIGN, REQUEST and REVIEW add Objective, Owns, Acceptance (a1: …; a2: …) and Due. RESULT adds Status per criterion (a1 pass, a2 fail) and Evidence (e1: command → outcome; e2: commit). QUESTION asks exactly one question. BLOCK adds Reason, Needs and Resume-when. Keep posts under about 2 KB; put longer material in a file and cite its path in Refs. Never split content across posts. Do not post acknowledgements: answer an ASSIGN, REQUEST or REVIEW with its RESULT, a BLOCK, a DECLINE with a reason, or one QUESTION.`;
-// Target models for the Planned delivery team: lead Claude Opus 5.5 (medium) and
-// builder/database GPT-6 Sol. Until the lead can be woken automatically
-// (docs/message-broker.md) and GPT-6 Sol reaches the owner's Codex account,
-// the template ships the interim models below; swap them in Agents when ready.
+// Planned delivery targets a Claude Opus 5.5 (medium) lead. Until the lead can
+// be woken automatically (docs/message-broker.md) it ships with Astra; swap it
+// in Agents when ready. GPT-6 Sol requires codex-cli 0.156.1 or later.
+const sol6 = "gpt-6-sol";
 const sol = "gpt-5.6-sol",
   astra = "gpt-6-astra",
   terra = "gpt-5.6-terra";
@@ -74,7 +74,7 @@ When lead or builder reports new evidence that invalidates the plan, send a revi
       member(
         "builder",
         "Implementation",
-        sol,
+        sol6,
         `You are the only writer of production, test and schema code for your assigned item. Implement exactly the ASSIGN you receive from lead: its owned files and its acceptance criteria. If the plan is wrong or incomplete, send lead a BLOCK or one QUESTION with the evidence instead of silently widening scope.
 
 Reproduce the current behavior first, then make the smallest coherent change. Run the checks that prove each criterion, exercising the real path that failed rather than a mock-only substitute. Review your own diff for accidental edits and misleading claims. Commit to an isolated branch or worktree and freeze that commit for review.
@@ -85,7 +85,7 @@ Send lead one RESULT with the frozen commit in Refs, Status for every criterion,
       member(
         "database",
         "Database handler",
-        sol,
+        sol6,
         `You own native Tailterm records for this project: work items, revisions, orders, operational records, saved acceptance and release receipts. Use tt work-items, tt operational-record and related commands with request IDs; read every mutation back before reporting it. You do not implement, review or decide acceptance.
 
 Act on REQUESTs from lead: create or update the item, record the order that governs the builder's ASSIGN, save review outcomes and the lead's release disposition, and save completion only after the lead's acceptance. If a record conflicts with the request, send lead a BLOCK with the conflicting revision rather than retrying blindly.
