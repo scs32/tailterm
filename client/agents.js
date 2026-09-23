@@ -1,5 +1,5 @@
 import { AGENT_NAME_RE } from "./task-ref.js";
-import { validateReasoning } from "./reasoning.js";
+import { reasoningOptions, validateReasoning } from "./reasoning.js";
 import { agentSpawnCommand } from "../shared/tmux-command.js";
 
 export const AGENT_CATALOG_VERSION = 2;
@@ -312,6 +312,9 @@ function migrateUnsupportedAppReasoning(agentCatalog) {
       typeof definition !== "object" ||
       Array.isArray(definition) ||
       definition.runtime === "codex" ||
+      reasoningOptions(definition.runtime, definition.model || "").includes(
+        definition.reasoning,
+      ) ||
       typeof definition.reasoning !== "string" ||
       !definition.reasoning.trim()
     )

@@ -1,4 +1,5 @@
 import { MAX_WORK_CONTEXT_BYTES } from "../shared/work-context.js";
+import { reasoningOptions } from "./reasoning.js";
 export const MAX_TEAM_LAUNCH_PLANS = 8;
 export const MAX_TEAM_LAUNCH_PLAN_BYTES =
   2 * MAX_WORK_CONTEXT_BYTES + 256 * 1024;
@@ -336,6 +337,10 @@ export function migrateUnsupportedUnstartedLaunchReasoning(value) {
       if (
         (member.state !== "unstarted" && !rejectedBeforeHost) ||
         member.fields.runtime === "codex" ||
+        reasoningOptions(
+          member.fields.runtime,
+          member.fields.model || "",
+        ).includes(member.fields.reasoning) ||
         typeof member.fields.reasoning !== "string" ||
         !member.fields.reasoning.trim()
       )

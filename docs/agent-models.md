@@ -14,6 +14,11 @@ Sources checked September 7, 2026:
   such as Astra → `gpt-6-astra`.
 - [Claude Code model configuration](https://code.claude.com/docs/en/model-config):
   `opus`, `sonnet`, `haiku`, and `opusplan` aliases follow the server's configuration.
+  Exact IDs `claude-opus-5-5`, `claude-fable-5-1` and `claude-sonnet-5` were added
+  September 23, 2026 so explicit effort can be set (see [agents library](agents-library.md)).
+- GPT-6 Sol (`gpt-6-sol`) and Luna (`gpt-6-luna`) were added September 23, 2026 from the
+  [Codex models page](https://learn.chatgpt.com/docs/models); not yet served to the
+  owner's ChatGPT-account Codex 0.154.0 at that time.
 - [Gemini CLI model selection](https://geminicli.com/docs/cli/model/): explicit
   Gemini 3 preview and Gemini 2.5 Pro/Flash IDs.
 

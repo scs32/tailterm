@@ -4,6 +4,8 @@ export const MODEL_OPTIONS = {
   codex: [
     ["gpt-5.3-codex", "GPT-5.3 Codex"],
     ["gpt-6-astra", "Astra (GPT-6)"],
+    ["gpt-6-sol", "Sol (GPT-6)"],
+    ["gpt-6-luna", "Luna (GPT-6)"],
     ["gpt-5.6-sol", "Sol (GPT-5.6)"],
     ["gpt-5.6-terra", "Terra (GPT-5.6)"],
     ["gpt-5.6-luna", "Luna (GPT-5.6)"],
@@ -12,6 +14,9 @@ export const MODEL_OPTIONS = {
     ["gpt-5.3-codex-spark", "Codex Spark"],
   ],
   claude: [
+    ["claude-opus-5-5", "Opus 5.5"],
+    ["claude-fable-5-1", "Fable 5.1"],
+    ["claude-sonnet-5", "Sonnet 5"],
     ["opus", "Opus"],
     ["sonnet", "Sonnet"],
     ["haiku", "Haiku"],

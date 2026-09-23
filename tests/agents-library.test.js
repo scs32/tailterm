@@ -257,7 +257,7 @@ test("reasoning and independent Codex permission intent reach actual tt argv", (
         reasoning: "high",
         cwd: "/synthetic/project",
       }),
-    /not supported/,
+    /documented model/,
   );
   assert.throws(
     () =>
@@ -272,6 +272,68 @@ test("reasoning and independent Codex permission intent reach actual tt argv", (
         cwd: "/synthetic/project",
       }),
     /native codex command/,
+  );
+});
+
+test("Claude effort reaches tt argv only for exact verified models", () => {
+  const base = {
+    hub: "http://127.0.0.1:18765",
+    task: "tsk_0123456789abcdef",
+    name: "lead",
+    runtime: "claude",
+    run: "claude",
+    cwd: "/synthetic/project",
+  };
+  assert.match(
+    agentSpawnCommand({ ...base, model: "claude-opus-5-5", reasoning: "medium" }),
+    /--reasoning/,
+  );
+  assert.throws(
+    () => agentSpawnCommand({ ...base, model: "opus", reasoning: "medium" }),
+    /verified Claude/,
+  );
+  assert.throws(
+    () =>
+      agentSpawnCommand({
+        ...base,
+        run: "claude --verbose",
+        model: "claude-fable-5-1",
+        reasoning: "high",
+      }),
+    /native claude command/,
+  );
+  assert.match(
+    agentSpawnCommand({
+      ...base,
+      runtime: "codex",
+      run: "codex",
+      model: "gpt-6-sol",
+      reasoning: "medium",
+    }),
+    /--reasoning/,
+  );
+  const supported = migrateAgentData({
+    teams: [
+      {
+        id: "team_lead",
+        name: "Lead",
+        orchestrator: "lead",
+        members: [
+          legacyMember("lead", {
+            runtime: "claude",
+            run: "claude",
+            model: "claude-opus-5-5",
+            reasoning: "medium",
+            approvalMode: "",
+            sandboxMode: "",
+          }),
+        ],
+      },
+    ],
+  });
+  assert.equal(
+    migrateAgentData(supported).agentCatalog.definitions[0].reasoning,
+    "medium",
   );
 });
 
