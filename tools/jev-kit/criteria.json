@@ -1,0 +1,87 @@
+{
+  "_note": "Consumed by run_jev.py. State uses keyed objects (spec.R1, never spec[0]) to avoid the positional-index pitfall.",
+  "state": {
+    "spec": {
+      "R1": "Never wake the sender for its own message (compare sender agent ID with the agent's ID).",
+      "R2": "A closed agent is never woken, whatever else is true about it (closed outranks busy).",
+      "R3": "Skip if the agent's LastWokenSeq is greater than OR EQUAL to the message seq.",
+      "R4": "Swarm messages reach everyone. A directed message reaches only the named recipient. A board-wide non-swarm message reaches only the orchestrator.",
+      "R5": "Agent-sent acknowledgements never wake anyone. Human-sent messages may wake even if they are acks.",
+      "R6": "A paused project defers agent-sent messages. Human-sent messages still wake.",
+      "R7": "A retired agent resumes only for a message directed to it by name when ResumeRetiredOnDirect is on; otherwise it is skipped. Swarm broadcasts do not resume retired agents.",
+      "R8": "A busy active agent is deferred.",
+      "R9": "At most MaxWakes wakes per agent in the trailing Window; when limited, RetryAt = OLDEST in-window wake time + Window. Human messages bypass the limit.",
+      "precedence": "Rules apply in order R1..R9; the first matching rule decides."
+    },
+    "code": "<contents of reference.go or v_X.go>"
+  },
+  "questions": {
+    "r1": {
+      "type": "noul",
+      "q": "`code` correctly implements `spec.R1`."
+    },
+    "r2": {
+      "type": "noul",
+      "q": "`code` correctly implements `spec.R2`, including when the agent is also busy."
+    },
+    "r3": {
+      "type": "noul",
+      "q": "`code` correctly implements `spec.R3`, including the equal case."
+    },
+    "r4": {
+      "type": "noul",
+      "q": "`code` correctly implements `spec.R4` for all three message kinds."
+    },
+    "r5": {
+      "type": "noul",
+      "q": "`code` correctly implements `spec.R5`."
+    },
+    "r6": {
+      "type": "noul",
+      "q": "`code` correctly implements `spec.R6`."
+    },
+    "r7": {
+      "type": "noul",
+      "q": "`code` correctly implements `spec.R7`."
+    },
+    "r8": {
+      "type": "noul",
+      "q": "`code` correctly implements `spec.R8`."
+    },
+    "r9": {
+      "type": "noul",
+      "q": "`code` correctly implements `spec.R9`, including how RetryAt is computed."
+    },
+    "order": {
+      "type": "noul",
+      "q": "`code` evaluates the rules in the order required by `spec.precedence`."
+    },
+    "violated": {
+      "type": "choice",
+      "q": "Which single rule in `spec` does `code` violate?",
+      "options": [
+        "R1",
+        "R2",
+        "R3",
+        "R4",
+        "R5",
+        "R6",
+        "R7",
+        "R8",
+        "R9",
+        "none"
+      ]
+    },
+    "overall": {
+      "type": "score",
+      "q": "How correct is `code` against the whole `spec`?",
+      "rubric": [
+        "several rules broken",
+        "one rule clearly broken",
+        "one subtle edge-case bug",
+        "correct but unclear",
+        "fully correct"
+      ]
+    }
+  }
+}

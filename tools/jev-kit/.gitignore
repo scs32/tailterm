@@ -1,0 +1,6 @@
+.venv/
+__pycache__/
+results-*.json
+board-results-*.json
+board-real-*.json
+board-export*.json
