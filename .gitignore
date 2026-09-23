@@ -23,3 +23,5 @@ wasm/*.wasm
 
 __pycache__/
 dist-static-before-*/
+/compact
+/Screenshot *.png
