@@ -1,0 +1,11 @@
+{
+  "run": "run_66d063bf724968d0",
+  "thread": "01a0925a-59a0-7063-9c03-d04588d56aa3",
+  "queuedThrough": 7316,
+  "lastAttempt": "2026-09-15T01:30:22.58629Z",
+  "window": "2026-09-15T01:28:37.35833Z",
+  "wakes": 1,
+  "followThroughCheckedAt": "2026-09-15T15:22:22.113589Z",
+  "followThroughSupported": true,
+  "followThroughStatus": "covered"
+}

@@ -3,6 +3,25 @@
 Updated September 13, 2026. Start here for the architecture and product model;
 use [the handoff guide](handoff.md) for the actual deployment and migration.
 
+Current Mini CLI deployment is accepted source
+`5209674b61ce5f91d826e34908adf375379c4fe6`, Bug `wi_5209b017e66bbf20`
+revision1/source order #5969/Mini release #6142. It validates prepared work-item
+contexts before allocation-intent mutation. Independent package and installed
+QA passed 14 synthetic CLI checks each; handler final acceptance #6254 is retained
+in the [release acceptance](releases/allocation-context-5209674/release-acceptance.json).
+The broader Bug remains open; digest-only API validation is not included.
+
+The hub remains at the accepted successor/admission package
+`5793de112e1b4c0a08d55fba17a7736e0bf2e0bf`, Feature
+`wi_618c8ff87e6b8061` revision5, owner #5834 and operational order #5835.
+It adds operationalRecords v2 while preserving reliableDelivery v1/v2/v3.
+Independent installed QA and handler database checks are retained in the
+[hub release acceptance](releases/successor-admission-5793de1/release-acceptance.json).
+The CLI-only update changed no hub, frontend, Air, relay or networking service.
+Neither release claims live provider continuation, unattended activation,
+cleanup-obligation delivery or parent Feature completion. Older notes below
+remain historical; the handoff's latest release entry is authoritative.
+
 ## Product and direction
 
 Tailterm is a browser terminal workspace that makes multiple Tailscale-connected

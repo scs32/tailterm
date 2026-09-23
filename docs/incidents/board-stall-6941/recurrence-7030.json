@@ -1,0 +1,55 @@
+{
+  "schemaVersion": 1,
+  "itemId": "wi_0c7ab8fc3320b52b",
+  "itemRevision": 8,
+  "workOrderMessage": 6339,
+  "priorIncidentMessage": 6943,
+  "observedAt": "2026-09-14T22:46:06.248577+00:00",
+  "message": {
+    "workItems": [
+      {
+        "itemTaskId": "tsk_2cfcff70a0fbe967",
+        "itemId": "wi_74c050c73f7ff0b4",
+        "itemRevision": 1,
+        "relationship": "primary"
+      }
+    ],
+    "workOrderMessage": {
+      "taskId": "tsk_2cfcff70a0fbe967",
+      "seq": 6518
+    },
+    "postReceipt": {
+      "id": "mpr_d631ad7c9d1b456c",
+      "requestId": "review-package-acceptance-readback-7029",
+      "taskId": "tsk_2cfcff70a0fbe967",
+      "messageSeq": 7030,
+      "createdAt": "2026-09-14T22:33:00.683430338Z"
+    },
+    "replyTo": 7029,
+    "seq": 7030,
+    "taskId": "tsk_2cfcff70a0fbe967",
+    "from": {
+      "agentId": "agt_3760a4361c514a03",
+      "node": "workspace",
+      "user": "owner"
+    },
+    "text": "Handler saved/read back bounded integration-delta + package acceptance for Feature wi_74c050c73f7ff0b4@1/order6518. Submission .build/review-package-qa-6996/acceptance/package-acceptance-submission.json SHA256 0d2fcbe1f30c6929396a8bb01be839f1f468ba571f46878ce23eeabc00ffb541; retained QA PASS dlev_34e47e4260a3eec5 / drr_10a62373c4c71205 and provenance checkpoint dlev_39597bd5bba8a086 / drr_4325cabfa4e2d8b4. Acceptance is package qualification only; Linux-native limitation and no deployment/FeatureDone are preserved. Current Feature revision remains 1/open; prior source/package acceptances are retained.",
+    "createdAt": "2026-09-14T22:33:00.683430338Z"
+  },
+  "leadTurnCompleteAt": "2026-09-14T22:32:31.028Z",
+  "leadRelay": {
+    "run": "run_66d063bf724968d0",
+    "thread": "01a0925a-59a0-7063-9c03-d04588d56aa3",
+    "queuedThrough": 7030,
+    "lastAttempt": "2026-09-14T22:31:34.167038Z",
+    "window": "2026-09-14T22:41:36.083469Z",
+    "wakes": 0,
+    "followThroughCheckedAt": "2026-09-14T22:45:45.736183Z",
+    "followThroughSupported": true,
+    "followThroughStatus": "uncovered_unverified"
+  },
+  "cause": "Same missing recipient failure as6941: handler7030 lacks to/broadcast, installed wakeThrough excludes it and advances cursor; lead ended awaiting saved acceptance. No crash or repeating409 evidence.",
+  "preventionStatus": "not_implemented",
+  "preventionOwner": "lead-recovery",
+  "requestedAction": "handler verifies current Bug/order, records recurrence, supplies bounded implementer order for executable actionable reply routing; addressed saved acceptance allows existing review release disposition to continue"
+}

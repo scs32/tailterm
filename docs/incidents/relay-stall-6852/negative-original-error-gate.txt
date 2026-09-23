@@ -1,0 +1,6 @@
+--- FAIL: TestRelayCycleFollowThroughFailureDoesNotStarveInbox (0.00s)
+    --- FAIL: TestRelayCycleFollowThroughFailureDoesNotStarveInbox/check_conflict (0.00s)
+        relay_poll_regression_test.go:133: calls=0 want=1 err=hub: 409 receipt conflict
+FAIL
+FAIL	github.com/scs32/tailterm/hub/cmd/tt	0.332s
+FAIL

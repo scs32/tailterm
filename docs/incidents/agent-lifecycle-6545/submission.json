@@ -1,0 +1,48 @@
+{
+  "kind": "lifecycle_audit_result",
+  "itemId": "wi_87e95365b37bf342",
+  "itemRevision": 1,
+  "workOrderMessage": 6545,
+  "guardrailOrder": 6557,
+  "status": "audit_complete_with_explicit_qualification_limits",
+  "files": [
+    {
+      "path": "/Users/stephenspeicher/projects/tailterm/docs/incidents/agent-lifecycle-6545/report.md",
+      "bytes": 7259,
+      "sha256": "3ffda057b1a2977e41aafdc567e8bd8de65b91663aee02d1c0df9d085eb1c972"
+    },
+    {
+      "path": "/Users/stephenspeicher/projects/tailterm/docs/incidents/agent-lifecycle-6545/report.json",
+      "bytes": 52712,
+      "sha256": "13aa7c66b3f0b5233daace2c02c68f522fb750ce4ee743f7dea844b5ee15dfe1"
+    },
+    {
+      "path": "/Users/stephenspeicher/projects/tailterm/docs/incidents/agent-lifecycle-6545/evidence/handler-manifest-original.json",
+      "bytes": 510413,
+      "sha256": "2c069d6f02ff12783f2d2fa10f2d4838f870291a12bf2458b309744f37d71557"
+    },
+    {
+      "path": "/Users/stephenspeicher/projects/tailterm/docs/incidents/agent-lifecycle-6545/evidence/host-snapshot.json",
+      "bytes": 47201,
+      "sha256": "df56b127746e68dbe505c426da6c43c5925c542bd602128c53347f34bcbccf24"
+    }
+  ],
+  "nativeObservation": "2026-09-14T17:41:32Z",
+  "counts": {
+    "roster": 83,
+    "closed": 65,
+    "nonclosed": 18,
+    "boundHelpers": 15,
+    "helperResultOnly": 10,
+    "helperNoCurrentObligation": 2,
+    "helperReportedProgress": 3,
+    "sharedOrLegacyLead": 3
+  },
+  "verification": "All 26 native response hashes verified; HTTP200; roster identity bookends stable; mechanically checked counts and per-row classification. No lifecycle mutations.",
+  "findings": [
+    "Installed acceptance-to-closeout producer gap; ten result-only helpers retained.",
+    "Two legacy helper obligation gaps and original lead roster/session discrepancy require exact reconciliation.",
+    "Current typed phase contradicts stale running label/historical notices; handler correction6554 preserves truthful evidence."
+  ],
+  "nextAction": "Actual handler: verify files and attach full structured report plus causal limits and guardrail/test matrix to existing Bug and related successor/typed-provenance work. Preserve current item revision unless actual scope change requires it. Lead-recovery owns exact per-member retained/release disposition under6557. Return saved readback/linked result coordinates. This is audit acceptance only, NOT cleanup eligibility, product implementation, installed prevention or BugDone."
+}

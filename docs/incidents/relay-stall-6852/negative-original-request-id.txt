@@ -1,0 +1,5 @@
+--- FAIL: TestRelayRepeatedObservationPreservesRequestIdentity (0.00s)
+    relay_poll_regression_test.go:60: hub: 409 request ID was already used with different follow-through data
+FAIL
+FAIL	github.com/scs32/tailterm/hub/cmd/tt	0.405s
+FAIL

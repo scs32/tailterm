@@ -1,0 +1,70 @@
+{
+  "schemaVersion": 1,
+  "audit": {
+    "itemId": "wi_87e95365b37bf342",
+    "revision": 1,
+    "workOrderMessage": 6545
+  },
+  "release": {
+    "itemId": "wi_87f38179eb1b5bd9",
+    "revision": 2,
+    "originalOrder": 6450,
+    "operationalOrder": 6934
+  },
+  "observedAt": "2026-09-14T21:46:28.729058+00:00",
+  "facts": [
+    {
+      "kind": "lead_turn_complete",
+      "at": "2026-09-14T21:32:46.304Z",
+      "thread": "01a0925a-59a0-7063-9c03-d04588d56aa3",
+      "waitingFor": "verified handler backup receipt"
+    },
+    {
+      "kind": "handler_preflight_success",
+      "messageSeq": 6941,
+      "at": "2026-09-14T21:33:13.72491177Z",
+      "replyTo": 6940,
+      "recipient": null
+    },
+    {
+      "kind": "board_gap",
+      "throughObservedAt": "2026-09-14T21:45:26.263347Z",
+      "lastMessageSeq": 6941
+    }
+  ],
+  "cause": {
+    "supported": "Handler result has replyTo but no explicit recipient; lead ended waiting and no subsequent turn appears in exact local log. Shared lead follow-through previously uncovered_unverified.",
+    "notEstablished": [
+      "No provider crash proven",
+      "Fresh native mandatory action coverage pending handler",
+      "Whether reply routing implementation should have inferred recipient requires source inspection under bounded order"
+    ]
+  },
+  "preventionRequired": {
+    "owner": "lead-recovery with db-handler for native enrollment/provenance",
+    "existingBug": "wi_0c7ab8fc3320b52b",
+    "acceptanceCriteria": [
+      "Require a resolved exact next-action recipient for actionable results; reject or explicitly classify non-actionable broadcasts.",
+      "Persist result and next responsible action atomically, retaining exact item/order/run/retry identities.",
+      "Regression: handler reply with no explicit to cannot strand waiting lead; missing coverage is visible and blocks a claim of protected execution."
+    ],
+    "status": "requested_not_implemented"
+  },
+  "recovery": {
+    "status": "not_yet_resumed",
+    "condition": "handler saves cause/prevention ownership and exact current action, then addressed release continuation preserves gates and backup retry identity"
+  },
+  "sourceCorroboration": {
+    "sourceCommit": "4f8aa43ed53c6c03e353073f08913e90127925a5",
+    "path": "hub/cmd/tt/relay.go",
+    "function": "wakeThrough",
+    "line": 164,
+    "finding": "Agent-authored message with no to and no broadcast is ineligible; replyTo is not used. Through cursor still advances over the message.",
+    "observedLeadState": {
+      "queuedThrough": 6941,
+      "lastAttempt": "2026-09-14T21:28:50.383486Z",
+      "followThroughCheckedAt": "2026-09-14T21:46:20.207686Z",
+      "followThroughStatus": "uncovered_unverified"
+    }
+  }
+}

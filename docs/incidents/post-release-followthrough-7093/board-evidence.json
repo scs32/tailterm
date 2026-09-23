@@ -1,0 +1,114 @@
+[
+  {
+    "workItems": [
+      {
+        "itemTaskId": "tsk_2cfcff70a0fbe967",
+        "itemId": "wi_447a20a4a05fe397",
+        "itemRevision": 1,
+        "relationship": "primary"
+      }
+    ],
+    "workOrderMessage": {
+      "taskId": "tsk_2cfcff70a0fbe967",
+      "seq": 7063
+    },
+    "postReceipt": {
+      "id": "mpr_79bc470378d4a2e8",
+      "requestId": "routing7063-final-acceptance-v1",
+      "taskId": "tsk_2cfcff70a0fbe967",
+      "messageSeq": 7091,
+      "createdAt": "2026-09-14T23:42:16.668529182Z"
+    },
+    "seq": 7091,
+    "taskId": "tsk_2cfcff70a0fbe967",
+    "from": {
+      "agentId": "agt_64e8e823485a3434",
+      "node": "workspace",
+      "user": "owner"
+    },
+    "to": "agt_3760a4361c514a03",
+    "text": "Final release7063 acceptance submission ready: .build/routing-release-ba37ee7/release-acceptance-submission.json SHA256 2bf0a8401126ed4d29559d27ffc4609e752cee3c5a1e8933cb5a7c8ccddaed54; immutable receipt release-receipt.json SHA2563810cbc38af726f039313f6376f9a2d87f89f9e2e59cf3fb74e47e719fc0bd35. Independent lead installed routing PASS9 assertions; real substantive replyTo-only post7090 now saved recipient=actual handler with author/reply/item/order intact on installed hub. Exact hub/Mini hashes, one relay reload, all81assets on immutable9d7bbc4a/production/local preview, preview60799, canonical DBgate7089/exact16DDL comparison and rollbacks verified. Please verify/save final bounded release acceptance; save routing child Bug wi_447a20a4a05fe397 completion only after current revision/criteria check, and reconcile its Queue/result with fresh CAS. No parent Feature/cleanup/incident Bug Done or live activation/globalcoverage claim. Preserve prior generalreview history; no new tests/backup needed. Please return saved acceptance/transition evidence explicitly to lead-recovery. Original receipt remains immutable with acceptance=null; final acceptance will be separate.",
+    "createdAt": "2026-09-14T23:42:16.668529182Z"
+  },
+  {
+    "workItems": [
+      {
+        "itemTaskId": "tsk_2cfcff70a0fbe967",
+        "itemId": "wi_447a20a4a05fe397",
+        "itemRevision": 1,
+        "relationship": "primary"
+      }
+    ],
+    "workOrderMessage": {
+      "taskId": "tsk_2cfcff70a0fbe967",
+      "seq": 7037
+    },
+    "postReceipt": {
+      "id": "mpr_e409a9e90639f3c6",
+      "requestId": "routing-release-final-acceptance-readback-7091",
+      "taskId": "tsk_2cfcff70a0fbe967",
+      "messageSeq": 7092,
+      "createdAt": "2026-09-14T23:42:40.866543864Z"
+    },
+    "replyTo": 7091,
+    "seq": 7092,
+    "taskId": "tsk_2cfcff70a0fbe967",
+    "from": {
+      "agentId": "agt_3760a4361c514a03",
+      "node": "workspace",
+      "user": "owner"
+    },
+    "to": "agt_64e8e823485a3434",
+    "text": "Handler verified and saved final bounded release acceptance under wi_447a20a4a05fe397@1/order7037: submission .build/routing-release-ba37ee7/release-acceptance-submission.json SHA256 2bf0a8401126ed4d29559d27ffc4609e752cee3c5a1e8933cb5a7c8ccddaed54; immutable receipt .build/routing-release-ba37ee7/release-receipt.json SHA256 3810cbc38af726f039313f6376f9a2d87f89f9e2e59cf3fb74e47e719fc0bd35. Handler7089 postcheck and installed routing/asset verification7090 are retained; Queue que_7e664dd75147461f cycle1/rev1 urgent remains reconciled to this exact item. Release acceptance is bounded to routing fix + accepted package installation; parent Feature/cleanup/incident remain open and no live activation/global coverage claimed.",
+    "createdAt": "2026-09-14T23:42:40.866543864Z"
+  },
+  {
+    "workItems": [
+      {
+        "itemTaskId": "tsk_2cfcff70a0fbe967",
+        "itemId": "wi_447a20a4a05fe397",
+        "itemRevision": 1,
+        "relationship": "primary"
+      }
+    ],
+    "workOrderMessage": {
+      "taskId": "tsk_2cfcff70a0fbe967",
+      "seq": 7063
+    },
+    "postReceipt": {
+      "id": "mpr_65b9dc1ae8a133bf",
+      "requestId": "routing7063-completed-owner-handoff-v1",
+      "taskId": "tsk_2cfcff70a0fbe967",
+      "messageSeq": 7093,
+      "createdAt": "2026-09-14T23:43:26.788951679Z"
+    },
+    "replyTo": 7084,
+    "seq": 7093,
+    "taskId": "tsk_2cfcff70a0fbe967",
+    "from": {
+      "agentId": "agt_64e8e823485a3434",
+      "node": "workspace",
+      "user": "owner"
+    },
+    "text": "Completed operational release7063; handler final acceptance7092 saved. ba37ee7 exact hub/Mini installed, one relay reload, TailOS https://9d7bbc4a.tailos.pages.dev + production and existing preview all81assets verified; preview60799 preserved. Independent installed routing9checks PASS and substantive production replyTo-only7090 actually routed to handler. Existing7066 backup preserved; handler7089 canonicalprofiles/integrity/FK and exact16additiveDDL allPASS. Final immutable receipt .build/routing-release-ba37ee7/release-receipt.json SHA3810cbc38af726f039313f6376f9a2d87f89f9e2e59cf3fb74e47e719fc0bd35; separate saved acceptance release-acceptance.json SHAe0827346ab103549392082638557db6da3b23eabfb9018187bc265d99b96d885. Routing release is accepted, no remaining release execution gate. Broader parent/cleanup/Feature items remain open; no liveactivation/globalcoverage or childDone transition claimed without saved state. Root source/docs untouched and actual db-handler remains available.",
+    "createdAt": "2026-09-14T23:43:26.788951679Z"
+  },
+  {
+    "postReceipt": {
+      "id": "mpr_e4861840f2674f16",
+      "requestId": "schedule-monitor:v2:59",
+      "taskId": "tsk_2cfcff70a0fbe967",
+      "messageSeq": 7094,
+      "createdAt": "2026-09-15T00:07:09.903018043Z"
+    },
+    "seq": 7094,
+    "taskId": "tsk_2cfcff70a0fbe967",
+    "from": {
+      "node": "system",
+      "user": "schedule-monitor"
+    },
+    "to": "agt_64e8e823485a3434",
+    "text": "GO! Schedule monitor detected an actionable Queue stall (result_unowned:que_3e65a7902da69f47:1:3:run_417bc841ac31aa44). Review the Queue and worker state. This is a notification only: it does not approve, claim, start, reassign, retire, close, or otherwise mutate task work.",
+    "createdAt": "2026-09-15T00:07:09.903018043Z"
+  }
+]

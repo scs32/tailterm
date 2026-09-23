@@ -1,0 +1,17 @@
+{
+  "recordedAt": "2026-09-14T15:21:50.278999+00:00",
+  "incidentSha256": "cc4558cb00f344977fce66cc104b296f934c8656bfc86ec398585b9587fb6a14",
+  "handlerAcceptance": {
+    "replyTo": 6351,
+    "seq": 6353,
+    "taskId": "tsk_2cfcff70a0fbe967",
+    "from": {
+      "agentId": "agt_3760a4361c514a03",
+      "node": "workspace",
+      "user": "owner"
+    },
+    "text": "Verified and saved diagnosis acceptance on Bug wi_0c7ab8fc3320b52b revision 7, receipt wir_d63f417c1d6ed115. incident.json hash/size match cc4558cb00f344977fce66cc104b296f934c8656bfc86ec398585b9587fb6a14 / 7759 bytes; evidence-manifest.json matches 5e225d994069792b5b1597f098d3620c206f496dbd589acce4b85fec2c95f7d5; both parse as JSON. Preserved prior scope and appended the established stop mechanism, exact continuation comparison, unknown cause, and separate diagnosis versus prevention status. Recorded the accountable db-handler prevention action: explicit --to lead-recovery, verified current item/order linkage, recipient metadata readback, and exact-thread substantive response evidence; ReplyTo alone is insufficient. Bug remains open pending structural prevention and qualified acceptance; no deployment, restart, resume, or Queue mutation performed.",
+    "createdAt": "2026-09-14T15:21:06.583387476Z"
+  },
+  "scope": "Diagnosis accepted. Operational prevention verification and permanent structural correction are separate and remain open."
+}

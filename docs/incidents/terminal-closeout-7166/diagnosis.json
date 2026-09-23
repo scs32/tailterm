@@ -1,0 +1,83 @@
+{
+  "schemaVersion": 1,
+  "item": {
+    "id": "wi_3043122c24f547e2",
+    "revision": 2
+  },
+  "workOrder": 7166,
+  "handoff": 7168,
+  "status": "diagnosis_complete_design_proposed_not_implemented",
+  "sourceCommit": "ba37ee7abb902ef549e7928cc15cd158745f28de",
+  "trigger": {
+    "message": 7160,
+    "item": "wi_178fe85b0fc5f9c3",
+    "beforeRevision": 1,
+    "afterRevision": 2,
+    "afterStatus": "done",
+    "receipt": "wir_35e6bfd9c90f6992"
+  },
+  "preserve": {
+    "predecessor": {
+      "id": "dly_e991eca3287cbb07",
+      "generation": 3,
+      "epoch": 1
+    },
+    "automaticLead": {
+      "id": "dly_1a67e779383f3cf2",
+      "generation": 1,
+      "epoch": 1
+    },
+    "explicitReleaseLead": {
+      "id": "dly_a9cdcffdbb5c6d83",
+      "generation": 2,
+      "epoch": 1
+    },
+    "leadAgent": "agt_64e8e823485a3434",
+    "leadRun": "run_66d063bf724968d0"
+  },
+  "establishedCause": "The two work-item update paths allow Done without checking unfinished required actions. That increments the revision and enters a terminal lifecycle. Operational commit and follow-through subsequently reject the old revision or terminal lifecycle; generic result cannot bypass the required typed disposition. These individually enforced constraints have incompatible transition ordering.",
+  "evidence": [
+    {
+      "file": "hub/internal/store/work_items.go",
+      "lines": [
+        349,
+        559
+      ],
+      "finding": "Existing Done guard is Feature narrative validation only; neither update path gates pending lead actions."
+    },
+    {
+      "file": "hub/internal/store/operational_records.go",
+      "lines": [
+        767
+      ],
+      "finding": "Typed operational commit rejects terminal status and revision mismatch."
+    },
+    {
+      "file": "hub/internal/store/delivery.go",
+      "lines": [
+        1029,
+        1282
+      ],
+      "finding": "Worker transitions reject terminal/revision mismatch; ResultDelivery rejects unresolved typed lead disposition."
+    },
+    {
+      "file": "hub/internal/store/lead_disposition.go",
+      "lines": [
+        256,
+        291
+      ],
+      "finding": "Accepted typed disposition normally resolves the automatic lead delivery in the same transaction."
+    },
+    {
+      "artifact": ".build/reader-package-after-7096/lead-qualification/typed-closeout-block-attempt.json",
+      "finding": "Actual 409; no blocked-state receipt was committed."
+    }
+  ],
+  "unknowns": [
+    "Handler must supply exact persisted obligation version/state and typed records/acceptance chain; this source diagnosis does not assert those records exist.",
+    "Whether other terminal items have stranded actions requires handler-owned inventory; no live database reads were performed by root."
+  ],
+  "nextOwner": "external root after handler records implementation scope",
+  "independentQAOwner": "lead-recovery",
+  "databaseOwner": "db-handler"
+}

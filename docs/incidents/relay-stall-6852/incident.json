@@ -1,0 +1,44 @@
+{
+  "schemaVersion": 1,
+  "ownerSource": 6852,
+  "diagnosisOrder": 6849,
+  "intake": 6857,
+  "observedAt": "2026-09-14T20:44:39.198931+00:00",
+  "agentId": "agt_a8b511b4f63a1f3a",
+  "runId": "run_d7737c1bef611d97",
+  "threadId": "01a0a124-7464-7482-9ad4-c2c971bec7cf",
+  "correctlyAddressedMessage": 6851,
+  "lastConsumedMessage": 6847,
+  "lastQaTurnComplete": "2026-09-14T19:48:01.236Z",
+  "relayProgress": {
+    "path": "/Users/stephenspeicher/.local/state/tailterm/relay/c482a9d80f4ce38e17a17d5258eb83962896e7990acfcb96e7595958a73fb65a-agt_a8b511b4f63a1f3a.progress.json",
+    "sha256": "a3b5b901af926308b6f87293678c6ab07bf6e93dda473297a70725c3b9e23eed",
+    "value": {
+      "run": "run_d7737c1bef611d97",
+      "thread": "01a0a124-7464-7482-9ad4-c2c971bec7cf",
+      "queuedThrough": 6847,
+      "lastAttempt": "2026-09-14T19:47:45.424327Z",
+      "window": "2026-09-14T19:47:45.424327Z",
+      "wakes": 1,
+      "followThroughCheckedAt": "2026-09-14T20:44:27.514165Z",
+      "followThroughSupported": true,
+      "followThroughStatus": "covered",
+      "error": "hub: 409 conflict: request ID was already used with different follow-through data"
+    }
+  },
+  "causalSource": [
+    "relay.go followThroughRequestID omits observation timestamp but relayFollowThrough creates a fresh now each call",
+    "delivery.go CheckDeliveryFollowThrough hashes full request; findFollowThroughReplay rejects same request ID with differing data",
+    "cmdRelay suppresses ordinary relayOne after any followthrough error"
+  ],
+  "prevention": {
+    "owner": "root",
+    "workOrderSource": 6857,
+    "verification": "immutable retry payload; fresh observation identity; lost response no duplicate queue; followthrough409 cannot starve addressed inbox"
+  },
+  "unknowns": [
+    "Exact first occurrence time of collision; log snapshot proves current repeating failure."
+  ],
+  "recoveryStatus": "not_yet_resumed",
+  "permanentFixStatus": "intake_pending"
+}

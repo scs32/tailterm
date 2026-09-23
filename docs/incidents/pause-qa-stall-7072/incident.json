@@ -1,0 +1,51 @@
+{
+  "schemaVersion": 1,
+  "observedAt": "2026-09-14T23:33:41.344299+00:00",
+  "parentBug": "wi_0c7ab8fc3320b52b",
+  "parentOrder": 6339,
+  "affectedItem": "wi_87f38179eb1b5bd9",
+  "affectedOrder": 6450,
+  "blockedReleaseOrder": 7063,
+  "qa": {
+    "agentId": "agt_8cc49e988273c7b1",
+    "runId": "run_139878a66a81e728",
+    "deliveryId": "dly_45ce30cd8d59d562",
+    "generation": 5,
+    "epoch": 1
+  },
+  "causes": [
+    {
+      "fact": "QA stated mandatory probes unattempted before submitting partial result",
+      "sourceMessage": 7069
+    },
+    {
+      "fact": "Handler asserted stored-only phase while QA subsequent exact current response reports result",
+      "handlerMessages": [
+        7070,
+        7072
+      ],
+      "qaLocalObservedAt": "2026-09-14T23:12:20.635Z"
+    },
+    {
+      "fact": "QA instructed to ack result; rejected409 and ended without Board blocker",
+      "qaTurnEndedAt": "2026-09-14T23:12:23.175Z"
+    }
+  ],
+  "unknowns": [
+    "Fresh handler raw event/result receipt chain still requested",
+    "No evidence provider crash"
+  ],
+  "preventionRequired": [
+    "Report native phase from actual raw response with timestamp and exact identity; never reuse stored event as current phase.",
+    "Required unattempted check remains incomplete, not successful result; failed transition must produce addressed actionable escalation.",
+    "Keep deterministic executable missing-check harness with retained outputs so another authorized operator can finish without reconstructing prose."
+  ],
+  "nextAction": {
+    "requestMessages": [
+      7075,
+      7076
+    ],
+    "owner": "root for bounded independent missing-check execution after handler-saved scope; lead for release",
+    "restartPerformed": false
+  }
+}

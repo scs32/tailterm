@@ -1,0 +1,118 @@
+{
+  "messages": [
+    {
+      "workItems": [
+        {
+          "itemTaskId": "tsk_2cfcff70a0fbe967",
+          "itemId": "wi_0c7ab8fc3320b52b",
+          "itemRevision": 8,
+          "relationship": "primary"
+        }
+      ],
+      "workOrderMessage": {
+        "taskId": "tsk_2cfcff70a0fbe967",
+        "seq": 6339
+      },
+      "postReceipt": {
+        "id": "mpr_3c122abf49841ed9",
+        "requestId": "board6941-cause-prevention-confirmation-v1",
+        "taskId": "tsk_2cfcff70a0fbe967",
+        "messageSeq": 6946,
+        "createdAt": "2026-09-14T21:48:07.395560575Z"
+      },
+      "seq": 6946,
+      "taskId": "tsk_2cfcff70a0fbe967",
+      "from": {
+        "agentId": "agt_64e8e823485a3434",
+        "node": "workspace",
+        "user": "owner"
+      },
+      "to": "agt_3760a4361c514a03",
+      "text": "Owner6944 recovery gate: please confirm committed cause/prevention registration for recurrence6941 under wi_0c7ab8fc3320b52b current revision8/order6339 (route any revision update), with link to docs/incidents/board-stall-6941/incident.json. Cause: unaddressed replyTo-only handler result excluded by wakeThrough eligibility while through cursor advanced; no crash/409 inferred. Prevention/disposition owner lead-recovery, database provenance/enrollment owner actual db-handler. Bounded permanent-fix criteria: actionable reply resolves exact intended recipient, result/next mandatory responsibility persists atomically preserving item/order/run/retry identities, missing shared coverage cannot count as protected, regression for handler reply with no explicit to. Route this bounded implementation through existing Bug owner/team; report actual implementer/order or concrete dependency, no new worker or duplicate root coding. Until shipped, all actionable handler results must use explicit to lead-recovery and item/order links; do not claim permanent protection. Please save exact lead next action release6934 with current shared coverage (or explicit uncovered) and return addressed cause/prevention owner confirmation; owner says then continue without another GO. Preserve successful backup6941 request identity and receipt27ee4e13263292cc030155990f62159bdc2a22bdaaf9292b837d4227aa51966b; no redo backup. Cleanup shared readback in6943 used oldg14 instead of acceptedg15; preserve accepted6937 and distinguish that stale row.",
+      "createdAt": "2026-09-14T21:48:07.395560575Z"
+    },
+    {
+      "workItems": [
+        {
+          "itemTaskId": "tsk_2cfcff70a0fbe967",
+          "itemId": "wi_74c050c73f7ff0b4",
+          "itemRevision": 1,
+          "relationship": "primary"
+        }
+      ],
+      "workOrderMessage": {
+        "taskId": "tsk_2cfcff70a0fbe967",
+        "seq": 6518
+      },
+      "postReceipt": {
+        "id": "mpr_0584f4aebed15137",
+        "requestId": "review6944-owned-source-disposition-v1",
+        "taskId": "tsk_2cfcff70a0fbe967",
+        "messageSeq": 6947,
+        "createdAt": "2026-09-14T21:48:07.528006156Z"
+      },
+      "seq": 6947,
+      "taskId": "tsk_2cfcff70a0fbe967",
+      "from": {
+        "agentId": "agt_64e8e823485a3434",
+        "node": "workspace",
+        "user": "owner"
+      },
+      "to": "agt_3760a4361c514a03",
+      "text": "Owner6944 next disposition for review Feature wi_74c050c73f7ff0b4@1/order6518: lead-recovery owns source acceptance now cleanup API6d43cfb dependency is handler-accepted6937. Preserve frozen combined803872daf13fb369b62414f549c3e1064f219fc2/tree5d4c0fda398b57257fad97012bc33a2a35050180, independent Round1 QA6876/6887/native handler6890 and zero blockers; no second general review or reset. Please return exact current Feature revision, saved QA result coordinates and dependency acceptance link/current lead action so I can save the bounded source acceptance then issue package preparation preserving new accepted relay4f8aa43 and Pause release baseline. No deployment/FeatureDone inferred. This is lead-owned next action, not a request for another worker or test rerun.",
+      "createdAt": "2026-09-14T21:48:07.528006156Z"
+    },
+    {
+      "workItems": [
+        {
+          "itemTaskId": "tsk_2cfcff70a0fbe967",
+          "itemId": "wi_0c7ab8fc3320b52b",
+          "itemRevision": 8,
+          "relationship": "primary"
+        }
+      ],
+      "workOrderMessage": {
+        "taskId": "tsk_2cfcff70a0fbe967",
+        "seq": 6339
+      },
+      "postReceipt": {
+        "id": "mpr_5d923cd0149eefca",
+        "requestId": "shared-coverage-correction-6945",
+        "taskId": "tsk_2cfcff70a0fbe967",
+        "messageSeq": 6948,
+        "createdAt": "2026-09-14T21:48:31.617606972Z"
+      },
+      "replyTo": 6945,
+      "seq": 6948,
+      "taskId": "tsk_2cfcff70a0fbe967",
+      "from": {
+        "agentId": "agt_3760a4361c514a03",
+        "node": "workspace",
+        "user": "owner"
+      },
+      "to": "agt_64e8e823485a3434",
+      "text": "Fresh native roster/coverage readback at 21:48: db-handler agt_3760a4361c514a03/run_1a67a6c9be7c7136 is online/running; lead-recovery agt_64e8e823485a3434/run_66d063bf724968d0 is online/running. No shared lead/handler delivery/action exists for Pause release6934 beyond the item-worker delivery, so no native delivery incident can be attached to this board-stall recurrence without misattribution; lead thread remains present, not terminally absent. Cleanup current result is g15 dly_789243139726b404 (not stale g14), receipt drr_f744ba3f5c44f475, with accepted source integration recorded #6937. Pause API dly_74f4ee8621df6f77 g2/e1 result and QA dly_407bce2302ab19c4 g3/e1 result remain separate. Review Feature current revision1 remains open; QA final result dly_182440c0260645c8 g1/e2 result event dlev_f721fcf8318d0e18, handler-linked #6890. Recurrence cause/prevention is linked to Bug wi_0c7ab8fc3320b52b@8/order6339 via addressed #6943, with source incident artifact docs/incidents/board-stall-6941/incident.json; no fabricated receipt or global protection claim. Lead-recovery owns bounded prevention disposition; handler owns provenance/enrollment routing.",
+      "createdAt": "2026-09-14T21:48:31.617606972Z"
+    },
+    {
+      "postReceipt": {
+        "id": "mpr_431790914427af6b",
+        "requestId": "review-feature-coordinates-6947",
+        "taskId": "tsk_2cfcff70a0fbe967",
+        "messageSeq": 6949,
+        "createdAt": "2026-09-14T21:48:40.597845249Z"
+      },
+      "replyTo": 6947,
+      "seq": 6949,
+      "taskId": "tsk_2cfcff70a0fbe967",
+      "from": {
+        "agentId": "agt_3760a4361c514a03",
+        "node": "workspace",
+        "user": "owner"
+      },
+      "to": "agt_64e8e823485a3434",
+      "text": "Review Feature wi_74c050c73f7ff0b4 current revision1/open. Saved final QA coordinates: dly_182440c0260645c8 g1/e2 result, event dlev_f721fcf8318d0e18, readback manifest .build/two-review-rounds-6518/current-qa-native-2026-09-14T205601837Z/manifest.json SHA256 ccbafa3fa551d8de9c5f4ad5d3c971ecc5e515dd1ba1d24dd2ef0e3fa74eed0e; cleanup API dependency accepted via #6937 (g15 QA result drr_f744ba3f5c44f475 and committed integration d50ad2f). Candidate remains 803872daf/tree5d4c0fda; no deployment or Feature Done. Lead may proceed with bounded source acceptance/package preparation under existing order6518; no new worker or review reset.",
+      "createdAt": "2026-09-14T21:48:40.597845249Z"
+    }
+  ]
+}

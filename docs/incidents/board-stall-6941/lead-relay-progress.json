@@ -1,0 +1,14 @@
+{
+  "observedAt": "2026-09-14T21:46:28.728781+00:00",
+  "state": {
+    "run": "run_66d063bf724968d0",
+    "thread": "01a0925a-59a0-7063-9c03-d04588d56aa3",
+    "queuedThrough": 6941,
+    "lastAttempt": "2026-09-14T21:28:50.383486Z",
+    "window": "2026-09-14T21:41:31.203311Z",
+    "wakes": 0,
+    "followThroughCheckedAt": "2026-09-14T21:46:20.207686Z",
+    "followThroughSupported": true,
+    "followThroughStatus": "uncovered_unverified"
+  }
+}

@@ -1,0 +1,17 @@
+{
+  "createdAt": "2026-09-14T15:18:39.220527+00:00",
+  "files": {
+    "board-evidence.json": {
+      "bytes": 16210,
+      "sha256": "6f830763d488edf6d00aa5da9fd34daeebcdf6f5eb65af847cdbcd19cc1e81e2"
+    },
+    "runtime-evidence.json": {
+      "bytes": 902,
+      "sha256": "3e7c503bbdf93a8526c90fe96c929bb0f1e1e286c4c53614bcdfea354ee872d0"
+    },
+    "session-events.json": {
+      "bytes": 5359,
+      "sha256": "c179a66633d3074c7a7dfe21d1dc75c7e7bbb3e17bd806ad5a9be03afc9a2923"
+    }
+  }
+}

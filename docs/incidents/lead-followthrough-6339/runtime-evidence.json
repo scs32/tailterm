@@ -1,0 +1,23 @@
+{
+  "observedAt": "2026-09-14T15:18:39.220527+00:00",
+  "binding": {
+    "task": "tsk_2cfcff70a0fbe967",
+    "agent": "agt_64e8e823485a3434",
+    "run": "run_66d063bf724968d0",
+    "thread": "01a0925a-59a0-7063-9c03-d04588d56aa3",
+    "codex": "/opt/homebrew/bin/codex"
+  },
+  "relayProgress": {
+    "run": "run_66d063bf724968d0",
+    "thread": "01a0925a-59a0-7063-9c03-d04588d56aa3",
+    "queuedThrough": 6347,
+    "lastAttempt": "2026-09-14T15:16:46.972744Z",
+    "window": "2026-09-14T15:13:30.750869Z",
+    "wakes": 4,
+    "followThroughCheckedAt": "2026-09-14T15:18:23.012006Z",
+    "followThroughSupported": true,
+    "followThroughStatus": "uncovered_unverified"
+  },
+  "tmux": "lead-recovery $71 1789161789 %121 97494 0 tt",
+  "terminalObservation": "Narrow pane displayed rate-limit model-choice text; concurrent native tool execution means blocking/overnight causality is not established."
+}

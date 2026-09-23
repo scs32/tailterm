@@ -1,0 +1,56 @@
+{
+  "itemId": "wi_427b310fa9b8e886",
+  "itemRevision": 1,
+  "workOrderMessage": 6860,
+  "commit": "4f8aa43ed53c6c03e353073f08913e90127925a5",
+  "tree": "bcc6d2bb9217cca30c10bc3b88b4f9e2acd8979d",
+  "base": "5209674b61ce5f91d826e34908adf375379c4fe6",
+  "worktree": "/Users/stephenspeicher/projects/tailterm/.build/worktrees/relay-followthrough-427",
+  "checks": [
+    {
+      "command": "go test ./cmd/tt -run selected relay tests -count=1",
+      "result": "PASS 0.403s"
+    },
+    {
+      "command": "go test -race ./cmd/tt -run '^TestRelay' -count=1",
+      "result": "PASS 1.451s"
+    },
+    {
+      "command": "go vet ./cmd/tt",
+      "result": "PASS"
+    },
+    {
+      "command": "git diff --check",
+      "result": "PASS"
+    }
+  ],
+  "negativeControls": "Each original defect restored separately; new tests fail as expected; candidate restored and race suite passes. Not full old checkout.",
+  "limits": [
+    "Source correction, not installed or independently QA-accepted.",
+    "No server/schema changes; current relay process still old until qualified reload.",
+    "Broad tests not rerun.",
+    "One race invocation from repository root failed before tests because go.mod is in hub; rerun in hub passed."
+  ],
+  "artifacts": [
+    {
+      "path": "/Users/stephenspeicher/projects/tailterm/docs/incidents/relay-stall-6852/negative-original-error-gate.txt",
+      "bytes": 308,
+      "sha256": "c05766696b46106fbe7ad82343830f0217d133cb17494d3daf1d8271be734c23"
+    },
+    {
+      "path": "/Users/stephenspeicher/projects/tailterm/docs/incidents/relay-stall-6852/incident.json",
+      "bytes": 1944,
+      "sha256": "8d82066d24499ba63ca3bbaa81385cd5cc69167577558912d78140bd1457cd79"
+    },
+    {
+      "path": "/Users/stephenspeicher/projects/tailterm/docs/incidents/relay-stall-6852/negative-original-request-id.txt",
+      "bytes": 240,
+      "sha256": "4014533c3d43e43f91f174231037c76de36c66aec13c6247b19ed83154656237"
+    },
+    {
+      "path": "/Users/stephenspeicher/projects/tailterm/docs/incidents/relay-stall-6852/qa-relay-progress.json",
+      "bytes": 442,
+      "sha256": "a3b5b901af926308b6f87293678c6ab07bf6e93dda473297a70725c3b9e23eed"
+    }
+  ]
+}

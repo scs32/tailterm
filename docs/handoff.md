@@ -1,5 +1,83 @@
 # Development handoff — September 10, 2026
 
+## September 13 allocation-context CLI preflight — Mini deployed and accepted
+
+Bug `wi_5209b017e66bbf20` revision1, source order #5969 and Mini-only release
+order #6142 installed exact source `5209674b61ce5f91d826e34908adf375379c4fe6`.
+The CLI rejects malformed or mismatched prepared contexts before reserving
+allocation identities. Mini `~/.local/bin/tt` is 6,919,410 bytes with SHA-256
+`979ba2216c2167cf7500cbfc60dffd4d9e33a2413707a1f8b582c8c12238f4c2`.
+Its prior accepted binary remains at
+`~/.local/bin/tt-before-allocation-context5209674-6142` for rollback.
+
+Clean standalone source builds were byte-identical. Independent package and
+installed QA each passed 14 synthetic loopback CLI checks; lead #6248 and actual
+handler #6254 saved final acceptance. The [immutable release receipt](releases/allocation-context-5209674/release-receipt.json)
+and [separate acceptance](releases/allocation-context-5209674/release-acceptance.json)
+retain provenance, rollback, tests and corrected QA artifact hashes.
+
+The hub remains at accepted `5793de1`; frontend, Air, relay, networking and
+services were unchanged. Digest-only API context validation and broader Bug
+completion are not claimed. The Bug stays open. This release used a qualified
+standalone source checkout; it did not merge product source into the modified
+root worktree. Earlier entries describe historical Mini deployments.
+
+## September 13 successor and admission controls — deployed and accepted
+
+Feature `wi_618c8ff87e6b8061` revision5, owner #5834 and bounded operational
+order #5835 installed the unchanged qualified package at
+`5793de112e1b4c0a08d55fba17a7736e0bf2e0bf` on the TrueNAS hub and Mini.
+The hub is RUNNING with the exact read-only binary mount; Mini was replaced
+atomically and both prior `fae9f7f` binaries remain available for rollback.
+Live capabilities expose operationalRecords v1/v2 and reliableDelivery v1/v2/v3.
+
+The package combines accepted phase-successor and admission no-op controls.
+Handler backup #5844 and fresh postcheck #5849 establish integrity OK, zero
+foreign-key violations, matching profiles and exactly two additive tables plus
+two indexes. The postcheck's published hash was corrected in #5853 without a
+rerun or file change. Independent installed QA passed all five synthetic CLI
+smokes; its exact result is retained in #5882. Lead #5884 and handler-saved final
+acceptance #5887 complete this bounded operational release under owner #5834.
+The [immutable release receipt](releases/successor-admission-5793de1/release-receipt.json)
+and [separate acceptance](releases/successor-admission-5793de1/release-acceptance.json)
+retain hashes, native result coordinates, verification and rollback evidence.
+
+The parent Feature remains open. This release does not establish live provider
+continuation or unattended activation and contains no cleanup-obligation or
+fixture successor, frontend, Air, relay reload or network/Tailscale change.
+Keep the additive database on executable rollback; after v2 successor/transfer
+writes, old-binary semantic downgrade is unproven. Never restore an older
+backup over intervening writes. Queue and exact helper closeout remain separate
+handler-owned reconciliation work. Earlier sections below are historical;
+this entry is the current hub/Mini deployment.
+
+## September 13 mandatory-action v3 — deployed and accepted
+
+Feature `wi_618c8ff87e6b8061` revision5, owner request #5667 and operational
+release order #5669 installed the qualified, unchanged `fae9f7ff34627449f716ef6439fe1eed5ab8ead5`
+package on the TrueNAS hub and Mini. The hub is RUNNING with the exact read-only
+binary mount; Mini was installed atomically with its prior binary retained.
+Live capabilities expose reliableDelivery v1/v2/v3 and operationalRecords v1.
+The frontend, Air, existing relay process/configuration and Tailscale were not changed.
+
+Handler backup #5671 and fresh post-install check #5698 establish integrity OK,
+zero foreign-key violations, matching profiles and the expected additive v3
+schema/index changes. Independent installed CLI QA #5701/#5703 passed all four
+synthetic smoke suites. Its old backup-replay citation #5685 is preserved as a
+provenance limitation; final acceptance uses fresh #5698. Lead #5707,
+handler-saved acceptance #5704 and owner final disposition #5708 cover this
+bounded release. The immutable [release receipt](releases/mandatory-v3-fae9f7f/release-receipt.json)
+and separate [acceptance](releases/mandatory-v3-fae9f7f/release-acceptance.json)
+retain exact hashes, rollback locations and evidence.
+
+No real unattended activation or cleanup-obligation implementation is claimed;
+the parent Feature remains open. Keep the additive database on executable
+rollback; after v3 sibling/recovery writes, old-binary semantic downgrade is
+unproven. Never restore the backup over intervening live writes.
+
+Earlier source-only and `19970cea` installation sections below are historical
+predecessor evidence; this entry is the current hub/Mini deployment.
+
 ## September 13 mandatory-action follow-through — source integrated, not installed
 
 Bug `wi_0c7ab8fc3320b52b` revision2, implementation order #4402 and

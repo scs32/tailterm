@@ -1,0 +1,1730 @@
+{
+  "schemaVersion": 1,
+  "itemId": "wi_87e95365b37bf342",
+  "itemRevision": 1,
+  "workOrderMessage": 6545,
+  "observedAt": "2026-09-14T17:39:33.945743+00:00",
+  "scope": "local default tmux socket only; not remote hosts or other sockets",
+  "sessions": [
+    {
+      "sessionName": "Codex_AIV",
+      "sessionId": "$14",
+      "paneId": "%64",
+      "panePid": 99301,
+      "currentCommand": "node",
+      "paneDead": false,
+      "sessionCreatedAt": "2026-09-05T21:58:51+00:00"
+    },
+    {
+      "sessionName": "Codex_Tailarr",
+      "sessionId": "$15",
+      "paneId": "%65",
+      "panePid": 9319,
+      "currentCommand": "node",
+      "paneDead": false,
+      "sessionCreatedAt": "2026-09-05T22:20:37+00:00"
+    },
+    {
+      "sessionName": "Tailarr",
+      "sessionId": "$4",
+      "paneId": "%54",
+      "panePid": 90964,
+      "currentCommand": "2.1.263",
+      "paneDead": false,
+      "sessionCreatedAt": "2026-09-05T15:15:09+00:00"
+    },
+    {
+      "sessionName": "Tailarr_Codex",
+      "sessionId": "$13",
+      "paneId": "%63",
+      "panePid": 97653,
+      "currentCommand": "node",
+      "paneDead": false,
+      "sessionCreatedAt": "2026-09-05T20:31:04+00:00"
+    },
+    {
+      "sessionName": "allocation-context-qa-mini",
+      "sessionId": "$104",
+      "paneId": "%154",
+      "panePid": 52071,
+      "currentCommand": "tt",
+      "paneDead": false,
+      "sessionCreatedAt": "2026-09-14T04:21:55+00:00"
+    },
+    {
+      "sessionName": "cleanup-obligation-api-mini",
+      "sessionId": "$98",
+      "paneId": "%148",
+      "panePid": 55235,
+      "currentCommand": "tt",
+      "paneDead": false,
+      "sessionCreatedAt": "2026-09-13T23:31:35+00:00"
+    },
+    {
+      "sessionName": "cleanup-obligation-qa-mini",
+      "sessionId": "$100",
+      "paneId": "%150",
+      "panePid": 55293,
+      "currentCommand": "tt",
+      "paneDead": false,
+      "sessionCreatedAt": "2026-09-13T23:31:36+00:00"
+    },
+    {
+      "sessionName": "cleanup-obligation-ui-mini",
+      "sessionId": "$99",
+      "paneId": "%149",
+      "panePid": 55246,
+      "currentCommand": "tt",
+      "paneDead": false,
+      "sessionCreatedAt": "2026-09-13T23:31:36+00:00"
+    },
+    {
+      "sessionName": "codex",
+      "sessionId": "$0",
+      "paneId": "%0",
+      "panePid": 1612,
+      "currentCommand": "node",
+      "paneDead": false,
+      "sessionCreatedAt": "2026-08-23T02:47:12+00:00"
+    },
+    {
+      "sessionName": "codex-1",
+      "sessionId": "$1",
+      "paneId": "%1",
+      "panePid": 1907,
+      "currentCommand": "node",
+      "paneDead": false,
+      "sessionCreatedAt": "2026-08-23T02:52:04+00:00"
+    },
+    {
+      "sessionName": "codex_tailarr_edge",
+      "sessionId": "$16",
+      "paneId": "%66",
+      "panePid": 29237,
+      "currentCommand": "node",
+      "paneDead": false,
+      "sessionCreatedAt": "2026-09-06T15:04:20+00:00"
+    },
+    {
+      "sessionName": "l3",
+      "sessionId": "$105",
+      "paneId": "%155",
+      "panePid": 62558,
+      "currentCommand": "node",
+      "paneDead": false,
+      "sessionCreatedAt": "2026-09-14T15:08:36+00:00"
+    },
+    {
+      "sessionName": "lead-recovery",
+      "sessionId": "$71",
+      "paneId": "%121",
+      "panePid": 97494,
+      "currentCommand": "tt",
+      "paneDead": false,
+      "sessionCreatedAt": "2026-09-11T21:23:09+00:00"
+    },
+    {
+      "sessionName": "lead_replacement",
+      "sessionId": "$70",
+      "paneId": "%120",
+      "panePid": 91326,
+      "currentCommand": "node",
+      "paneDead": false,
+      "sessionCreatedAt": "2026-09-11T21:00:34+00:00"
+    },
+    {
+      "sessionName": "pause-project-api-v2-mini",
+      "sessionId": "$109",
+      "paneId": "%159",
+      "panePid": 93552,
+      "currentCommand": "tt",
+      "paneDead": false,
+      "sessionCreatedAt": "2026-09-14T16:27:55+00:00"
+    },
+    {
+      "sessionName": "pause-project-qa-v2-mini",
+      "sessionId": "$111",
+      "paneId": "%161",
+      "panePid": 93644,
+      "currentCommand": "tt",
+      "paneDead": false,
+      "sessionCreatedAt": "2026-09-14T16:27:55+00:00"
+    },
+    {
+      "sessionName": "pause-project-ui-v2-mini",
+      "sessionId": "$110",
+      "paneId": "%160",
+      "panePid": 93565,
+      "currentCommand": "tt",
+      "paneDead": false,
+      "sessionCreatedAt": "2026-09-14T16:27:55+00:00"
+    },
+    {
+      "sessionName": "queue-phase-api-mini",
+      "sessionId": "$101",
+      "paneId": "%151",
+      "panePid": 46055,
+      "currentCommand": "tt",
+      "paneDead": false,
+      "sessionCreatedAt": "2026-09-14T04:11:32+00:00"
+    },
+    {
+      "sessionName": "queue-phase-qa-mini",
+      "sessionId": "$103",
+      "paneId": "%153",
+      "panePid": 46458,
+      "currentCommand": "tt",
+      "paneDead": false,
+      "sessionCreatedAt": "2026-09-14T04:11:57+00:00"
+    },
+    {
+      "sessionName": "queue-phase-ui-mini",
+      "sessionId": "$102",
+      "paneId": "%152",
+      "panePid": 46446,
+      "currentCommand": "tt",
+      "paneDead": false,
+      "sessionCreatedAt": "2026-09-14T04:11:57+00:00"
+    },
+    {
+      "sessionName": "reader-filter-api-mini",
+      "sessionId": "$95",
+      "paneId": "%145",
+      "panePid": 34137,
+      "currentCommand": "tt",
+      "paneDead": false,
+      "sessionCreatedAt": "2026-09-13T23:12:58+00:00"
+    },
+    {
+      "sessionName": "reader-filter-qa-mini",
+      "sessionId": "$97",
+      "paneId": "%147",
+      "panePid": 34203,
+      "currentCommand": "tt",
+      "paneDead": false,
+      "sessionCreatedAt": "2026-09-13T23:12:58+00:00"
+    },
+    {
+      "sessionName": "reader-filter-ui-mini",
+      "sessionId": "$96",
+      "paneId": "%146",
+      "panePid": 34149,
+      "currentCommand": "tt",
+      "paneDead": false,
+      "sessionCreatedAt": "2026-09-13T23:12:58+00:00"
+    },
+    {
+      "sessionName": "server-monitor-current-review-mini",
+      "sessionId": "$74",
+      "paneId": "%124",
+      "panePid": 99433,
+      "currentCommand": "tt",
+      "paneDead": false,
+      "sessionCreatedAt": "2026-09-12T14:53:57+00:00"
+    },
+    {
+      "sessionName": "server-monitor-r5-fix-mini",
+      "sessionId": "$76",
+      "paneId": "%126",
+      "panePid": 34703,
+      "currentCommand": "tt",
+      "paneDead": false,
+      "sessionCreatedAt": "2026-09-12T23:03:16+00:00"
+    },
+    {
+      "sessionName": "tt-handler-3760a4361c514a03",
+      "sessionId": "$54",
+      "paneId": "%104",
+      "panePid": 6943,
+      "currentCommand": "tt",
+      "paneDead": false,
+      "sessionCreatedAt": "2026-09-11T14:48:23+00:00"
+    }
+  ],
+  "processes": [
+    {
+      "pid": 22463,
+      "ppid": 91640,
+      "state": "Ss",
+      "elapsed": "00:00",
+      "cpuTime": "0:00.05",
+      "executable": "/opt/homebrew/Cellar/python@3.14/3.14.7/Frameworks/Python.framework/Versions/3.14/Resources/Python.app/Contents/MacOS/Python"
+    },
+    {
+      "pid": 22465,
+      "ppid": 22463,
+      "state": "R",
+      "elapsed": "00:00",
+      "cpuTime": "0:00.00",
+      "executable": "ps"
+    },
+    {
+      "pid": 30631,
+      "ppid": 29266,
+      "state": "Ss",
+      "elapsed": "08-02:01:47",
+      "cpuTime": "1:33.53",
+      "executable": "/opt/homebrew/Cellar/python@3.14/3.14.7/Frameworks/Python.framework/Versions/3.14/Resources/Python.app/Contents/MacOS/Python"
+    },
+    {
+      "pid": 46055,
+      "ppid": 1611,
+      "state": "Ss+",
+      "elapsed": "13:28:01",
+      "cpuTime": "0:02.03",
+      "executable": "/Users/stephenspeicher/.local/bin/tt"
+    },
+    {
+      "pid": 46057,
+      "ppid": 46055,
+      "state": "S+",
+      "elapsed": "13:28:01",
+      "cpuTime": "0:00.01",
+      "executable": "/bin/zsh"
+    },
+    {
+      "pid": 46059,
+      "ppid": 46057,
+      "state": "S+",
+      "elapsed": "13:28:01",
+      "cpuTime": "0:00.03",
+      "executable": "node"
+    },
+    {
+      "pid": 46060,
+      "ppid": 46059,
+      "state": "S+",
+      "elapsed": "13:28:01",
+      "cpuTime": "2:48.76",
+      "executable": "/opt/homebrew/lib/node_modules/@openai/codex/node_modules/@openai/codex-darwin-arm64/vendor/aarch64-apple-darwin/bin/codex"
+    },
+    {
+      "pid": 46106,
+      "ppid": 46060,
+      "state": "S",
+      "elapsed": "13:28:01",
+      "cpuTime": "0:00.09",
+      "executable": "/Applications/ChatGPT.app/Contents/Resources/cua_node/bin/node_repl"
+    },
+    {
+      "pid": 46107,
+      "ppid": 46060,
+      "state": "S",
+      "elapsed": "13:28:01",
+      "cpuTime": "0:00.05",
+      "executable": "/Applications/ChatGPT.app/Contents/Resources/cua_node/bin/node"
+    },
+    {
+      "pid": 46199,
+      "ppid": 46107,
+      "state": "S",
+      "elapsed": "13:28:01",
+      "cpuTime": "0:00.08",
+      "executable": "/Applications/ChatGPT.app/Contents/Resources/cua_node/bin/node_repl"
+    },
+    {
+      "pid": 46240,
+      "ppid": 46060,
+      "state": "S",
+      "elapsed": "13:27:54",
+      "cpuTime": "0:01.32",
+      "executable": "/opt/homebrew/lib/node_modules/@openai/codex/node_modules/@openai/codex-darwin-arm64/vendor/aarch64-apple-darwin/bin/codex-code-mode-host"
+    },
+    {
+      "pid": 46446,
+      "ppid": 1611,
+      "state": "Ss+",
+      "elapsed": "13:27:36",
+      "cpuTime": "0:02.05",
+      "executable": "/Users/stephenspeicher/.local/bin/tt"
+    },
+    {
+      "pid": 46451,
+      "ppid": 46446,
+      "state": "S+",
+      "elapsed": "13:27:36",
+      "cpuTime": "0:00.01",
+      "executable": "/bin/zsh"
+    },
+    {
+      "pid": 46453,
+      "ppid": 46451,
+      "state": "S+",
+      "elapsed": "13:27:36",
+      "cpuTime": "0:00.03",
+      "executable": "node"
+    },
+    {
+      "pid": 46454,
+      "ppid": 46453,
+      "state": "S+",
+      "elapsed": "13:27:36",
+      "cpuTime": "2:40.86",
+      "executable": "/opt/homebrew/lib/node_modules/@openai/codex/node_modules/@openai/codex-darwin-arm64/vendor/aarch64-apple-darwin/bin/codex"
+    },
+    {
+      "pid": 46508,
+      "ppid": 46454,
+      "state": "S",
+      "elapsed": "13:27:35",
+      "cpuTime": "0:00.03",
+      "executable": "/Applications/ChatGPT.app/Contents/Resources/cua_node/bin/node"
+    },
+    {
+      "pid": 46509,
+      "ppid": 46454,
+      "state": "S",
+      "elapsed": "13:27:35",
+      "cpuTime": "0:00.08",
+      "executable": "/Applications/ChatGPT.app/Contents/Resources/cua_node/bin/node_repl"
+    },
+    {
+      "pid": 46531,
+      "ppid": 46508,
+      "state": "S",
+      "elapsed": "13:27:35",
+      "cpuTime": "0:00.08",
+      "executable": "/Applications/ChatGPT.app/Contents/Resources/cua_node/bin/node_repl"
+    },
+    {
+      "pid": 46801,
+      "ppid": 46454,
+      "state": "S",
+      "elapsed": "13:27:28",
+      "cpuTime": "0:01.24",
+      "executable": "/opt/homebrew/lib/node_modules/@openai/codex/node_modules/@openai/codex-darwin-arm64/vendor/aarch64-apple-darwin/bin/codex-code-mode-host"
+    },
+    {
+      "pid": 46458,
+      "ppid": 1611,
+      "state": "Ss+",
+      "elapsed": "13:27:36",
+      "cpuTime": "0:02.00",
+      "executable": "/Users/stephenspeicher/.local/bin/tt"
+    },
+    {
+      "pid": 46499,
+      "ppid": 46458,
+      "state": "S+",
+      "elapsed": "13:27:35",
+      "cpuTime": "0:00.01",
+      "executable": "/bin/zsh"
+    },
+    {
+      "pid": 46504,
+      "ppid": 46499,
+      "state": "S+",
+      "elapsed": "13:27:35",
+      "cpuTime": "0:00.03",
+      "executable": "node"
+    },
+    {
+      "pid": 46511,
+      "ppid": 46504,
+      "state": "S+",
+      "elapsed": "13:27:35",
+      "cpuTime": "2:02.66",
+      "executable": "/opt/homebrew/lib/node_modules/@openai/codex/node_modules/@openai/codex-darwin-arm64/vendor/aarch64-apple-darwin/bin/codex"
+    },
+    {
+      "pid": 46666,
+      "ppid": 46511,
+      "state": "S",
+      "elapsed": "13:27:35",
+      "cpuTime": "0:00.04",
+      "executable": "/Applications/ChatGPT.app/Contents/Resources/cua_node/bin/node"
+    },
+    {
+      "pid": 46667,
+      "ppid": 46511,
+      "state": "S",
+      "elapsed": "13:27:35",
+      "cpuTime": "0:00.09",
+      "executable": "/Applications/ChatGPT.app/Contents/Resources/cua_node/bin/node_repl"
+    },
+    {
+      "pid": 46672,
+      "ppid": 46666,
+      "state": "S",
+      "elapsed": "13:27:35",
+      "cpuTime": "0:00.09",
+      "executable": "/Applications/ChatGPT.app/Contents/Resources/cua_node/bin/node_repl"
+    },
+    {
+      "pid": 46798,
+      "ppid": 46511,
+      "state": "S",
+      "elapsed": "13:27:29",
+      "cpuTime": "0:00.64",
+      "executable": "/opt/homebrew/lib/node_modules/@openai/codex/node_modules/@openai/codex-darwin-arm64/vendor/aarch64-apple-darwin/bin/codex-code-mode-host"
+    },
+    {
+      "pid": 1612,
+      "ppid": 1611,
+      "state": "Ss",
+      "elapsed": "22-14:52:21",
+      "cpuTime": "0:00.05",
+      "executable": "-zsh"
+    },
+    {
+      "pid": 53775,
+      "ppid": 1612,
+      "state": "S+",
+      "elapsed": "22-02:11:30",
+      "cpuTime": "0:00.06",
+      "executable": "node"
+    },
+    {
+      "pid": 53776,
+      "ppid": 53775,
+      "state": "S+",
+      "elapsed": "22-02:11:30",
+      "cpuTime": "15:41.73",
+      "executable": "/opt/homebrew/lib/node_modules/@openai/codex/node_modules/@openai/codex-darwin-arm64/vendor/aarch64-apple-darwin/bin/codex"
+    },
+    {
+      "pid": 90008,
+      "ppid": 53776,
+      "state": "S",
+      "elapsed": "21-03:14:55",
+      "cpuTime": "0:02.10",
+      "executable": "/opt/homebrew/lib/node_modules/@openai/codex/node_modules/@openai/codex-darwin-arm64/vendor/aarch64-apple-darwin/bin/codex-code-mode-host"
+    },
+    {
+      "pid": 52071,
+      "ppid": 1611,
+      "state": "Ss+",
+      "elapsed": "13:17:38",
+      "cpuTime": "0:01.95",
+      "executable": "/Users/stephenspeicher/.local/bin/tt"
+    },
+    {
+      "pid": 52074,
+      "ppid": 52071,
+      "state": "S+",
+      "elapsed": "13:17:38",
+      "cpuTime": "0:00.01",
+      "executable": "/bin/zsh"
+    },
+    {
+      "pid": 52076,
+      "ppid": 52074,
+      "state": "S+",
+      "elapsed": "13:17:38",
+      "cpuTime": "0:00.03",
+      "executable": "node"
+    },
+    {
+      "pid": 52077,
+      "ppid": 52076,
+      "state": "S+",
+      "elapsed": "13:17:38",
+      "cpuTime": "1:46.03",
+      "executable": "/opt/homebrew/lib/node_modules/@openai/codex/node_modules/@openai/codex-darwin-arm64/vendor/aarch64-apple-darwin/bin/codex"
+    },
+    {
+      "pid": 52136,
+      "ppid": 52077,
+      "state": "S",
+      "elapsed": "13:17:38",
+      "cpuTime": "0:00.07",
+      "executable": "/Applications/ChatGPT.app/Contents/Resources/cua_node/bin/node_repl"
+    },
+    {
+      "pid": 52137,
+      "ppid": 52077,
+      "state": "S",
+      "elapsed": "13:17:38",
+      "cpuTime": "0:00.03",
+      "executable": "/Applications/ChatGPT.app/Contents/Resources/cua_node/bin/node"
+    },
+    {
+      "pid": 52144,
+      "ppid": 52137,
+      "state": "S",
+      "elapsed": "13:17:38",
+      "cpuTime": "0:00.07",
+      "executable": "/Applications/ChatGPT.app/Contents/Resources/cua_node/bin/node_repl"
+    },
+    {
+      "pid": 52302,
+      "ppid": 52077,
+      "state": "S",
+      "elapsed": "13:17:31",
+      "cpuTime": "0:00.27",
+      "executable": "/opt/homebrew/lib/node_modules/@openai/codex/node_modules/@openai/codex-darwin-arm64/vendor/aarch64-apple-darwin/bin/codex-code-mode-host"
+    },
+    {
+      "pid": 1907,
+      "ppid": 1611,
+      "state": "Ss",
+      "elapsed": "22-14:47:29",
+      "cpuTime": "0:00.10",
+      "executable": "-zsh"
+    },
+    {
+      "pid": 11894,
+      "ppid": 1907,
+      "state": "S+",
+      "elapsed": "08-17:33:31",
+      "cpuTime": "0:00.06",
+      "executable": "node"
+    },
+    {
+      "pid": 11895,
+      "ppid": 11894,
+      "state": "S+",
+      "elapsed": "08-17:33:31",
+      "cpuTime": "4:31.25",
+      "executable": "/opt/homebrew/lib/node_modules/@openai/codex/node_modules/@openai/codex-darwin-arm64/vendor/aarch64-apple-darwin/bin/codex"
+    },
+    {
+      "pid": 11946,
+      "ppid": 11895,
+      "state": "S",
+      "elapsed": "08-17:32:48",
+      "cpuTime": "0:00.24",
+      "executable": "/opt/homebrew/lib/node_modules/@openai/codex/node_modules/@openai/codex-darwin-arm64/vendor/aarch64-apple-darwin/bin/codex-code-mode-host"
+    },
+    {
+      "pid": 6943,
+      "ppid": 1611,
+      "state": "Ss+",
+      "elapsed": "03-02:51:10",
+      "cpuTime": "0:11.50",
+      "executable": "/Users/stephenspeicher/.local/bin/tt"
+    },
+    {
+      "pid": 6946,
+      "ppid": 6943,
+      "state": "S+",
+      "elapsed": "03-02:51:10",
+      "cpuTime": "0:00.05",
+      "executable": "node"
+    },
+    {
+      "pid": 6947,
+      "ppid": 6946,
+      "state": "S+",
+      "elapsed": "03-02:51:10",
+      "cpuTime": "19:18.42",
+      "executable": "/opt/homebrew/lib/node_modules/@openai/codex/node_modules/@openai/codex-darwin-arm64/vendor/aarch64-apple-darwin/bin/codex"
+    },
+    {
+      "pid": 7134,
+      "ppid": 6947,
+      "state": "S",
+      "elapsed": "03-02:51:03",
+      "cpuTime": "0:21.96",
+      "executable": "/opt/homebrew/lib/node_modules/@openai/codex/node_modules/@openai/codex-darwin-arm64/vendor/aarch64-apple-darwin/bin/codex-code-mode-host"
+    },
+    {
+      "pid": 66254,
+      "ppid": 90964,
+      "state": "S+",
+      "elapsed": "07-01:34:01",
+      "cpuTime": "120:30.40",
+      "executable": "claude"
+    },
+    {
+      "pid": 90964,
+      "ppid": 1611,
+      "state": "Ss",
+      "elapsed": "09-02:24:24",
+      "cpuTime": "0:00.07",
+      "executable": "-zsh"
+    },
+    {
+      "pid": 18271,
+      "ppid": 53776,
+      "state": "Ss+",
+      "elapsed": "20-20:49:01",
+      "cpuTime": "0:00.02",
+      "executable": "pbcopy"
+    },
+    {
+      "pid": 55235,
+      "ppid": 1611,
+      "state": "Ss+",
+      "elapsed": "18:07:58",
+      "cpuTime": "0:02.70",
+      "executable": "/Users/stephenspeicher/.local/bin/tt"
+    },
+    {
+      "pid": 55239,
+      "ppid": 55235,
+      "state": "S+",
+      "elapsed": "18:07:58",
+      "cpuTime": "0:00.01",
+      "executable": "/bin/zsh"
+    },
+    {
+      "pid": 55241,
+      "ppid": 55239,
+      "state": "S+",
+      "elapsed": "18:07:58",
+      "cpuTime": "0:00.03",
+      "executable": "node"
+    },
+    {
+      "pid": 55242,
+      "ppid": 55241,
+      "state": "S+",
+      "elapsed": "18:07:58",
+      "cpuTime": "4:15.20",
+      "executable": "/opt/homebrew/lib/node_modules/@openai/codex/node_modules/@openai/codex-darwin-arm64/vendor/aarch64-apple-darwin/bin/codex"
+    },
+    {
+      "pid": 55303,
+      "ppid": 55242,
+      "state": "S",
+      "elapsed": "18:07:57",
+      "cpuTime": "0:00.13",
+      "executable": "/Applications/ChatGPT.app/Contents/Resources/cua_node/bin/node_repl"
+    },
+    {
+      "pid": 55304,
+      "ppid": 55242,
+      "state": "S",
+      "elapsed": "18:07:57",
+      "cpuTime": "0:00.06",
+      "executable": "/Applications/ChatGPT.app/Contents/Resources/cua_node/bin/node"
+    },
+    {
+      "pid": 55466,
+      "ppid": 55304,
+      "state": "S",
+      "elapsed": "18:07:57",
+      "cpuTime": "0:00.12",
+      "executable": "/Applications/ChatGPT.app/Contents/Resources/cua_node/bin/node_repl"
+    },
+    {
+      "pid": 55798,
+      "ppid": 55242,
+      "state": "S",
+      "elapsed": "18:07:50",
+      "cpuTime": "0:02.61",
+      "executable": "/opt/homebrew/lib/node_modules/@openai/codex/node_modules/@openai/codex-darwin-arm64/vendor/aarch64-apple-darwin/bin/codex-code-mode-host"
+    },
+    {
+      "pid": 55246,
+      "ppid": 1611,
+      "state": "Ss+",
+      "elapsed": "18:07:57",
+      "cpuTime": "0:02.56",
+      "executable": "/Users/stephenspeicher/.local/bin/tt"
+    },
+    {
+      "pid": 55250,
+      "ppid": 55246,
+      "state": "S+",
+      "elapsed": "18:07:57",
+      "cpuTime": "0:00.01",
+      "executable": "/bin/zsh"
+    },
+    {
+      "pid": 55252,
+      "ppid": 55250,
+      "state": "S+",
+      "elapsed": "18:07:57",
+      "cpuTime": "0:00.64",
+      "executable": "node"
+    },
+    {
+      "pid": 55253,
+      "ppid": 55252,
+      "state": "S+",
+      "elapsed": "18:07:57",
+      "cpuTime": "2:50.21",
+      "executable": "/opt/homebrew/lib/node_modules/@openai/codex/node_modules/@openai/codex-darwin-arm64/vendor/aarch64-apple-darwin/bin/codex"
+    },
+    {
+      "pid": 55413,
+      "ppid": 55253,
+      "state": "S",
+      "elapsed": "18:07:57",
+      "cpuTime": "0:00.12",
+      "executable": "/Applications/ChatGPT.app/Contents/Resources/cua_node/bin/node_repl"
+    },
+    {
+      "pid": 55414,
+      "ppid": 55253,
+      "state": "S",
+      "elapsed": "18:07:57",
+      "cpuTime": "0:00.05",
+      "executable": "/Applications/ChatGPT.app/Contents/Resources/cua_node/bin/node"
+    },
+    {
+      "pid": 55467,
+      "ppid": 55414,
+      "state": "S",
+      "elapsed": "18:07:57",
+      "cpuTime": "0:00.11",
+      "executable": "/Applications/ChatGPT.app/Contents/Resources/cua_node/bin/node_repl"
+    },
+    {
+      "pid": 55783,
+      "ppid": 55253,
+      "state": "S",
+      "elapsed": "18:07:52",
+      "cpuTime": "0:01.06",
+      "executable": "/opt/homebrew/lib/node_modules/@openai/codex/node_modules/@openai/codex-darwin-arm64/vendor/aarch64-apple-darwin/bin/codex-code-mode-host"
+    },
+    {
+      "pid": 55293,
+      "ppid": 1611,
+      "state": "Ss+",
+      "elapsed": "18:07:57",
+      "cpuTime": "0:02.62",
+      "executable": "/Users/stephenspeicher/.local/bin/tt"
+    },
+    {
+      "pid": 55305,
+      "ppid": 55293,
+      "state": "S+",
+      "elapsed": "18:07:57",
+      "cpuTime": "0:00.01",
+      "executable": "/bin/zsh"
+    },
+    {
+      "pid": 55307,
+      "ppid": 55305,
+      "state": "S+",
+      "elapsed": "18:07:57",
+      "cpuTime": "0:00.05",
+      "executable": "node"
+    },
+    {
+      "pid": 55363,
+      "ppid": 55307,
+      "state": "S+",
+      "elapsed": "18:07:57",
+      "cpuTime": "2:47.92",
+      "executable": "/opt/homebrew/lib/node_modules/@openai/codex/node_modules/@openai/codex-darwin-arm64/vendor/aarch64-apple-darwin/bin/codex"
+    },
+    {
+      "pid": 55583,
+      "ppid": 55363,
+      "state": "S",
+      "elapsed": "18:07:57",
+      "cpuTime": "0:00.05",
+      "executable": "/Applications/ChatGPT.app/Contents/Resources/cua_node/bin/node"
+    },
+    {
+      "pid": 55584,
+      "ppid": 55363,
+      "state": "S",
+      "elapsed": "18:07:57",
+      "cpuTime": "0:00.13",
+      "executable": "/Applications/ChatGPT.app/Contents/Resources/cua_node/bin/node_repl"
+    },
+    {
+      "pid": 55606,
+      "ppid": 55583,
+      "state": "S",
+      "elapsed": "18:07:57",
+      "cpuTime": "0:00.12",
+      "executable": "/Applications/ChatGPT.app/Contents/Resources/cua_node/bin/node_repl"
+    },
+    {
+      "pid": 55789,
+      "ppid": 55363,
+      "state": "S",
+      "elapsed": "18:07:51",
+      "cpuTime": "0:00.90",
+      "executable": "/opt/homebrew/lib/node_modules/@openai/codex/node_modules/@openai/codex-darwin-arm64/vendor/aarch64-apple-darwin/bin/codex-code-mode-host"
+    },
+    {
+      "pid": 93552,
+      "ppid": 1611,
+      "state": "Ss+",
+      "elapsed": "01:11:38",
+      "cpuTime": "0:00.14",
+      "executable": "/Users/stephenspeicher/.local/bin/tt"
+    },
+    {
+      "pid": 93558,
+      "ppid": 93552,
+      "state": "S+",
+      "elapsed": "01:11:38",
+      "cpuTime": "0:00.01",
+      "executable": "/bin/zsh"
+    },
+    {
+      "pid": 93560,
+      "ppid": 93558,
+      "state": "S+",
+      "elapsed": "01:11:38",
+      "cpuTime": "0:00.03",
+      "executable": "node"
+    },
+    {
+      "pid": 93561,
+      "ppid": 93560,
+      "state": "S+",
+      "elapsed": "01:11:38",
+      "cpuTime": "0:21.04",
+      "executable": "/opt/homebrew/lib/node_modules/@openai/codex/node_modules/@openai/codex-darwin-arm64/vendor/aarch64-apple-darwin/bin/codex"
+    },
+    {
+      "pid": 93624,
+      "ppid": 93561,
+      "state": "S",
+      "elapsed": "01:11:38",
+      "cpuTime": "0:00.07",
+      "executable": "/Applications/ChatGPT.app/Contents/Resources/cua_node/bin/node_repl"
+    },
+    {
+      "pid": 93625,
+      "ppid": 93561,
+      "state": "S",
+      "elapsed": "01:11:38",
+      "cpuTime": "0:00.03",
+      "executable": "/Applications/ChatGPT.app/Contents/Resources/cua_node/bin/node"
+    },
+    {
+      "pid": 93641,
+      "ppid": 93625,
+      "state": "S",
+      "elapsed": "01:11:38",
+      "cpuTime": "0:00.07",
+      "executable": "/Applications/ChatGPT.app/Contents/Resources/cua_node/bin/node_repl"
+    },
+    {
+      "pid": 94043,
+      "ppid": 93561,
+      "state": "S",
+      "elapsed": "01:11:31",
+      "cpuTime": "0:00.28",
+      "executable": "/opt/homebrew/lib/node_modules/@openai/codex/node_modules/@openai/codex-darwin-arm64/vendor/aarch64-apple-darwin/bin/codex-code-mode-host"
+    },
+    {
+      "pid": 93565,
+      "ppid": 1611,
+      "state": "Ss+",
+      "elapsed": "01:11:38",
+      "cpuTime": "0:00.13",
+      "executable": "/Users/stephenspeicher/.local/bin/tt"
+    },
+    {
+      "pid": 93571,
+      "ppid": 93565,
+      "state": "S+",
+      "elapsed": "01:11:38",
+      "cpuTime": "0:00.01",
+      "executable": "/bin/zsh"
+    },
+    {
+      "pid": 93573,
+      "ppid": 93571,
+      "state": "S+",
+      "elapsed": "01:11:38",
+      "cpuTime": "0:00.03",
+      "executable": "node"
+    },
+    {
+      "pid": 93615,
+      "ppid": 93573,
+      "state": "S+",
+      "elapsed": "01:11:38",
+      "cpuTime": "0:20.56",
+      "executable": "/opt/homebrew/lib/node_modules/@openai/codex/node_modules/@openai/codex-darwin-arm64/vendor/aarch64-apple-darwin/bin/codex"
+    },
+    {
+      "pid": 93780,
+      "ppid": 93615,
+      "state": "S",
+      "elapsed": "01:11:38",
+      "cpuTime": "0:00.03",
+      "executable": "/Applications/ChatGPT.app/Contents/Resources/cua_node/bin/node"
+    },
+    {
+      "pid": 93781,
+      "ppid": 93615,
+      "state": "S",
+      "elapsed": "01:11:38",
+      "cpuTime": "0:00.07",
+      "executable": "/Applications/ChatGPT.app/Contents/Resources/cua_node/bin/node_repl"
+    },
+    {
+      "pid": 93788,
+      "ppid": 93780,
+      "state": "S",
+      "elapsed": "01:11:38",
+      "cpuTime": "0:00.08",
+      "executable": "/Applications/ChatGPT.app/Contents/Resources/cua_node/bin/node_repl"
+    },
+    {
+      "pid": 94064,
+      "ppid": 93615,
+      "state": "S",
+      "elapsed": "01:11:28",
+      "cpuTime": "0:00.21",
+      "executable": "/opt/homebrew/lib/node_modules/@openai/codex/node_modules/@openai/codex-darwin-arm64/vendor/aarch64-apple-darwin/bin/codex-code-mode-host"
+    },
+    {
+      "pid": 93644,
+      "ppid": 1611,
+      "state": "Ss+",
+      "elapsed": "01:11:38",
+      "cpuTime": "0:00.12",
+      "executable": "/Users/stephenspeicher/.local/bin/tt"
+    },
+    {
+      "pid": 93718,
+      "ppid": 93644,
+      "state": "S+",
+      "elapsed": "01:11:38",
+      "cpuTime": "0:00.01",
+      "executable": "/bin/zsh"
+    },
+    {
+      "pid": 93729,
+      "ppid": 93718,
+      "state": "S+",
+      "elapsed": "01:11:38",
+      "cpuTime": "0:00.03",
+      "executable": "node"
+    },
+    {
+      "pid": 93764,
+      "ppid": 93729,
+      "state": "S+",
+      "elapsed": "01:11:38",
+      "cpuTime": "0:17.80",
+      "executable": "/opt/homebrew/lib/node_modules/@openai/codex/node_modules/@openai/codex-darwin-arm64/vendor/aarch64-apple-darwin/bin/codex"
+    },
+    {
+      "pid": 93918,
+      "ppid": 93764,
+      "state": "S",
+      "elapsed": "01:11:38",
+      "cpuTime": "0:00.09",
+      "executable": "/Applications/ChatGPT.app/Contents/Resources/cua_node/bin/node_repl"
+    },
+    {
+      "pid": 93919,
+      "ppid": 93764,
+      "state": "S",
+      "elapsed": "01:11:38",
+      "cpuTime": "0:00.03",
+      "executable": "/Applications/ChatGPT.app/Contents/Resources/cua_node/bin/node"
+    },
+    {
+      "pid": 93926,
+      "ppid": 93919,
+      "state": "S",
+      "elapsed": "01:11:38",
+      "cpuTime": "0:00.07",
+      "executable": "/Applications/ChatGPT.app/Contents/Resources/cua_node/bin/node_repl"
+    },
+    {
+      "pid": 94038,
+      "ppid": 93764,
+      "state": "S",
+      "elapsed": "01:11:32",
+      "cpuTime": "0:00.19",
+      "executable": "/opt/homebrew/lib/node_modules/@openai/codex/node_modules/@openai/codex-darwin-arm64/vendor/aarch64-apple-darwin/bin/codex-code-mode-host"
+    },
+    {
+      "pid": 46941,
+      "ppid": 97653,
+      "state": "S+",
+      "elapsed": "07-16:59:10",
+      "cpuTime": "0:00.07",
+      "executable": "node"
+    },
+    {
+      "pid": 46942,
+      "ppid": 46941,
+      "state": "S+",
+      "elapsed": "07-16:59:10",
+      "cpuTime": "3:40.97",
+      "executable": "/opt/homebrew/lib/node_modules/@openai/codex/node_modules/@openai/codex-darwin-arm64/vendor/aarch64-apple-darwin/bin/codex"
+    },
+    {
+      "pid": 97653,
+      "ppid": 1611,
+      "state": "Ss",
+      "elapsed": "08-21:08:29",
+      "cpuTime": "0:00.05",
+      "executable": "-zsh"
+    },
+    {
+      "pid": 99301,
+      "ppid": 1611,
+      "state": "Ss",
+      "elapsed": "08-19:40:42",
+      "cpuTime": "0:00.05",
+      "executable": "-zsh"
+    },
+    {
+      "pid": 99348,
+      "ppid": 99301,
+      "state": "S+",
+      "elapsed": "08-19:40:19",
+      "cpuTime": "0:00.07",
+      "executable": "node"
+    },
+    {
+      "pid": 99349,
+      "ppid": 99348,
+      "state": "S+",
+      "elapsed": "08-19:40:19",
+      "cpuTime": "4:04.11",
+      "executable": "/opt/homebrew/lib/node_modules/@openai/codex/node_modules/@openai/codex-darwin-arm64/vendor/aarch64-apple-darwin/bin/codex"
+    },
+    {
+      "pid": 99496,
+      "ppid": 99349,
+      "state": "S",
+      "elapsed": "08-19:39:28",
+      "cpuTime": "0:00.17",
+      "executable": "/opt/homebrew/lib/node_modules/@openai/codex/node_modules/@openai/codex-darwin-arm64/vendor/aarch64-apple-darwin/bin/codex-code-mode-host"
+    },
+    {
+      "pid": 9319,
+      "ppid": 1611,
+      "state": "Ss",
+      "elapsed": "08-19:18:56",
+      "cpuTime": "0:00.04",
+      "executable": "-zsh"
+    },
+    {
+      "pid": 9340,
+      "ppid": 9319,
+      "state": "S+",
+      "elapsed": "08-19:18:48",
+      "cpuTime": "0:00.06",
+      "executable": "node"
+    },
+    {
+      "pid": 9341,
+      "ppid": 9340,
+      "state": "S+",
+      "elapsed": "08-19:18:48",
+      "cpuTime": "3:59.26",
+      "executable": "/opt/homebrew/lib/node_modules/@openai/codex/node_modules/@openai/codex-darwin-arm64/vendor/aarch64-apple-darwin/bin/codex"
+    },
+    {
+      "pid": 9596,
+      "ppid": 9341,
+      "state": "S",
+      "elapsed": "08-19:10:15",
+      "cpuTime": "0:00.08",
+      "executable": "/opt/homebrew/lib/node_modules/@openai/codex/node_modules/@openai/codex-darwin-arm64/vendor/aarch64-apple-darwin/bin/codex-code-mode-host"
+    },
+    {
+      "pid": 29237,
+      "ppid": 1611,
+      "state": "Ss",
+      "elapsed": "08-02:35:13",
+      "cpuTime": "0:00.05",
+      "executable": "-zsh"
+    },
+    {
+      "pid": 29264,
+      "ppid": 29237,
+      "state": "S+",
+      "elapsed": "08-02:34:56",
+      "cpuTime": "0:00.07",
+      "executable": "node"
+    },
+    {
+      "pid": 29266,
+      "ppid": 29264,
+      "state": "S+",
+      "elapsed": "08-02:34:56",
+      "cpuTime": "4:51.52",
+      "executable": "/opt/homebrew/lib/node_modules/@openai/codex/node_modules/@openai/codex-darwin-arm64/vendor/aarch64-apple-darwin/bin/codex"
+    },
+    {
+      "pid": 29318,
+      "ppid": 29266,
+      "state": "S",
+      "elapsed": "08-02:33:53",
+      "cpuTime": "0:00.55",
+      "executable": "/opt/homebrew/lib/node_modules/@openai/codex/node_modules/@openai/codex-darwin-arm64/vendor/aarch64-apple-darwin/bin/codex-code-mode-host"
+    },
+    {
+      "pid": 99433,
+      "ppid": 1611,
+      "state": "Ss+",
+      "elapsed": "02-02:45:36",
+      "cpuTime": "0:07.82",
+      "executable": "/Users/stephenspeicher/.local/bin/tt"
+    },
+    {
+      "pid": 99435,
+      "ppid": 99433,
+      "state": "S+",
+      "elapsed": "02-02:45:36",
+      "cpuTime": "0:00.03",
+      "executable": "node"
+    },
+    {
+      "pid": 99436,
+      "ppid": 99435,
+      "state": "S+",
+      "elapsed": "02-02:45:36",
+      "cpuTime": "4:15.50",
+      "executable": "/opt/homebrew/lib/node_modules/@openai/codex/node_modules/@openai/codex-darwin-arm64/vendor/aarch64-apple-darwin/bin/codex"
+    },
+    {
+      "pid": 99485,
+      "ppid": 99436,
+      "state": "S",
+      "elapsed": "02-02:45:35",
+      "cpuTime": "0:00.13",
+      "executable": "/Applications/ChatGPT.app/Contents/Resources/cua_node/bin/node_repl"
+    },
+    {
+      "pid": 99486,
+      "ppid": 99436,
+      "state": "S",
+      "elapsed": "02-02:45:35",
+      "cpuTime": "0:00.04",
+      "executable": "/Applications/ChatGPT.app/Contents/Resources/cua_node/bin/node"
+    },
+    {
+      "pid": 99507,
+      "ppid": 99486,
+      "state": "S",
+      "elapsed": "02-02:45:35",
+      "cpuTime": "0:00.13",
+      "executable": "/Applications/ChatGPT.app/Contents/Resources/cua_node/bin/node_repl"
+    },
+    {
+      "pid": 99661,
+      "ppid": 99436,
+      "state": "S",
+      "elapsed": "02-02:45:28",
+      "cpuTime": "0:00.32",
+      "executable": "/opt/homebrew/lib/node_modules/@openai/codex/node_modules/@openai/codex-darwin-arm64/vendor/aarch64-apple-darwin/bin/codex-code-mode-host"
+    },
+    {
+      "pid": 34703,
+      "ppid": 1611,
+      "state": "Ss+",
+      "elapsed": "01-18:36:17",
+      "cpuTime": "0:06.62",
+      "executable": "/Users/stephenspeicher/.local/bin/tt"
+    },
+    {
+      "pid": 34706,
+      "ppid": 34703,
+      "state": "S+",
+      "elapsed": "01-18:36:17",
+      "cpuTime": "0:00.01",
+      "executable": "/bin/zsh"
+    },
+    {
+      "pid": 34708,
+      "ppid": 34706,
+      "state": "S+",
+      "elapsed": "01-18:36:17",
+      "cpuTime": "0:00.03",
+      "executable": "node"
+    },
+    {
+      "pid": 34711,
+      "ppid": 34708,
+      "state": "S+",
+      "elapsed": "01-18:36:17",
+      "cpuTime": "4:22.47",
+      "executable": "/opt/homebrew/lib/node_modules/@openai/codex/node_modules/@openai/codex-darwin-arm64/vendor/aarch64-apple-darwin/bin/codex"
+    },
+    {
+      "pid": 34784,
+      "ppid": 34711,
+      "state": "S",
+      "elapsed": "01-18:36:16",
+      "cpuTime": "0:00.05",
+      "executable": "/Applications/ChatGPT.app/Contents/Resources/cua_node/bin/node"
+    },
+    {
+      "pid": 34785,
+      "ppid": 34711,
+      "state": "S",
+      "elapsed": "01-18:36:16",
+      "cpuTime": "0:00.12",
+      "executable": "/Applications/ChatGPT.app/Contents/Resources/cua_node/bin/node_repl"
+    },
+    {
+      "pid": 34858,
+      "ppid": 34784,
+      "state": "S",
+      "elapsed": "01-18:36:16",
+      "cpuTime": "0:00.11",
+      "executable": "/Applications/ChatGPT.app/Contents/Resources/cua_node/bin/node_repl"
+    },
+    {
+      "pid": 34888,
+      "ppid": 34711,
+      "state": "S",
+      "elapsed": "01-18:36:10",
+      "cpuTime": "0:00.77",
+      "executable": "/opt/homebrew/lib/node_modules/@openai/codex/node_modules/@openai/codex-darwin-arm64/vendor/aarch64-apple-darwin/bin/codex-code-mode-host"
+    },
+    {
+      "pid": 9933,
+      "ppid": 91640,
+      "state": "S",
+      "elapsed": "21:17:34",
+      "cpuTime": "0:00.06",
+      "executable": "/Applications/ChatGPT.app/Contents/Resources/cua_node/bin/node"
+    },
+    {
+      "pid": 9934,
+      "ppid": 91640,
+      "state": "S",
+      "elapsed": "21:17:34",
+      "cpuTime": "0:00.09",
+      "executable": "/Applications/ChatGPT.app/Contents/Resources/cua_node/bin/node_repl"
+    },
+    {
+      "pid": 9957,
+      "ppid": 9933,
+      "state": "S",
+      "elapsed": "21:17:34",
+      "cpuTime": "0:00.07",
+      "executable": "/Applications/ChatGPT.app/Contents/Resources/cua_node/bin/node_repl"
+    },
+    {
+      "pid": 43705,
+      "ppid": 91640,
+      "state": "S",
+      "elapsed": "01-18:10:08",
+      "cpuTime": "0:00.10",
+      "executable": "/Applications/ChatGPT.app/Contents/Resources/cua_node/bin/node_repl"
+    },
+    {
+      "pid": 43706,
+      "ppid": 91640,
+      "state": "S",
+      "elapsed": "01-18:10:08",
+      "cpuTime": "0:00.03",
+      "executable": "/Applications/ChatGPT.app/Contents/Resources/cua_node/bin/node"
+    },
+    {
+      "pid": 43772,
+      "ppid": 43706,
+      "state": "S",
+      "elapsed": "01-18:10:08",
+      "cpuTime": "0:00.10",
+      "executable": "/Applications/ChatGPT.app/Contents/Resources/cua_node/bin/node_repl"
+    },
+    {
+      "pid": 57657,
+      "ppid": 91713,
+      "state": "S",
+      "elapsed": "01-02:56:35",
+      "cpuTime": "0:00.21",
+      "executable": "/Applications/ChatGPT.app/Contents/Resources/cua_node/bin/node"
+    },
+    {
+      "pid": 57658,
+      "ppid": 91713,
+      "state": "S",
+      "elapsed": "01-02:56:35",
+      "cpuTime": "0:17.32",
+      "executable": "/Applications/ChatGPT.app/Contents/Resources/cua_node/bin/node"
+    },
+    {
+      "pid": 57659,
+      "ppid": 91713,
+      "state": "S",
+      "elapsed": "01-02:56:35",
+      "cpuTime": "0:11.19",
+      "executable": "/Applications/ChatGPT.app/Contents/Resources/codex"
+    },
+    {
+      "pid": 91326,
+      "ppid": 1611,
+      "state": "Ss",
+      "elapsed": "02-20:38:59",
+      "cpuTime": "0:00.05",
+      "executable": "-zsh"
+    },
+    {
+      "pid": 91639,
+      "ppid": 91326,
+      "state": "S+",
+      "elapsed": "02-20:38:22",
+      "cpuTime": "0:00.07",
+      "executable": "node"
+    },
+    {
+      "pid": 91640,
+      "ppid": 91639,
+      "state": "S+",
+      "elapsed": "02-20:38:22",
+      "cpuTime": "23:14.37",
+      "executable": "/opt/homebrew/lib/node_modules/@openai/codex/node_modules/@openai/codex-darwin-arm64/vendor/aarch64-apple-darwin/bin/codex"
+    },
+    {
+      "pid": 91705,
+      "ppid": 91640,
+      "state": "S",
+      "elapsed": "02-20:38:20",
+      "cpuTime": "0:00.19",
+      "executable": "/Applications/ChatGPT.app/Contents/Resources/cua_node/bin/node_repl"
+    },
+    {
+      "pid": 91706,
+      "ppid": 91640,
+      "state": "S",
+      "elapsed": "02-20:38:20",
+      "cpuTime": "0:00.05",
+      "executable": "/Applications/ChatGPT.app/Contents/Resources/cua_node/bin/node"
+    },
+    {
+      "pid": 91713,
+      "ppid": 91706,
+      "state": "S",
+      "elapsed": "02-20:38:20",
+      "cpuTime": "0:00.44",
+      "executable": "/Applications/ChatGPT.app/Contents/Resources/cua_node/bin/node_repl"
+    },
+    {
+      "pid": 91971,
+      "ppid": 91640,
+      "state": "S",
+      "elapsed": "02-20:37:21",
+      "cpuTime": "0:05.42",
+      "executable": "/opt/homebrew/lib/node_modules/@openai/codex/node_modules/@openai/codex-darwin-arm64/vendor/aarch64-apple-darwin/bin/codex-code-mode-host"
+    },
+    {
+      "pid": 3423,
+      "ppid": 97578,
+      "state": "S",
+      "elapsed": "02-20:01:16",
+      "cpuTime": "0:00.22",
+      "executable": "/Applications/ChatGPT.app/Contents/Resources/cua_node/bin/node"
+    },
+    {
+      "pid": 3424,
+      "ppid": 97578,
+      "state": "S",
+      "elapsed": "02-20:01:16",
+      "cpuTime": "0:55.57",
+      "executable": "/Applications/ChatGPT.app/Contents/Resources/cua_node/bin/node"
+    },
+    {
+      "pid": 3425,
+      "ppid": 97578,
+      "state": "S",
+      "elapsed": "02-20:01:16",
+      "cpuTime": "0:31.22",
+      "executable": "/Applications/ChatGPT.app/Contents/Resources/codex"
+    },
+    {
+      "pid": 97494,
+      "ppid": 1611,
+      "state": "Ss+",
+      "elapsed": "02-20:16:24",
+      "cpuTime": "0:10.51",
+      "executable": "/Users/stephenspeicher/.local/bin/tt"
+    },
+    {
+      "pid": 97496,
+      "ppid": 97494,
+      "state": "S+",
+      "elapsed": "02-20:16:24",
+      "cpuTime": "0:00.03",
+      "executable": "node"
+    },
+    {
+      "pid": 97497,
+      "ppid": 97496,
+      "state": "S+",
+      "elapsed": "02-20:16:24",
+      "cpuTime": "18:56.82",
+      "executable": "/opt/homebrew/lib/node_modules/@openai/codex/node_modules/@openai/codex-darwin-arm64/vendor/aarch64-apple-darwin/bin/codex"
+    },
+    {
+      "pid": 97564,
+      "ppid": 97497,
+      "state": "S",
+      "elapsed": "02-20:16:24",
+      "cpuTime": "0:00.03",
+      "executable": "/Applications/ChatGPT.app/Contents/Resources/cua_node/bin/node"
+    },
+    {
+      "pid": 97566,
+      "ppid": 97497,
+      "state": "S",
+      "elapsed": "02-20:16:24",
+      "cpuTime": "0:00.56",
+      "executable": "/Applications/ChatGPT.app/Contents/Resources/cua_node/bin/node_repl"
+    },
+    {
+      "pid": 97578,
+      "ppid": 97564,
+      "state": "S",
+      "elapsed": "02-20:16:24",
+      "cpuTime": "0:01.11",
+      "executable": "/Applications/ChatGPT.app/Contents/Resources/cua_node/bin/node_repl"
+    },
+    {
+      "pid": 97680,
+      "ppid": 97497,
+      "state": "S",
+      "elapsed": "02-20:16:19",
+      "cpuTime": "0:15.59",
+      "executable": "/opt/homebrew/lib/node_modules/@openai/codex/node_modules/@openai/codex-darwin-arm64/vendor/aarch64-apple-darwin/bin/codex-code-mode-host"
+    },
+    {
+      "pid": 62558,
+      "ppid": 1611,
+      "state": "Ss",
+      "elapsed": "02:30:57",
+      "cpuTime": "0:00.06",
+      "executable": "-zsh"
+    },
+    {
+      "pid": 62734,
+      "ppid": 62558,
+      "state": "S+",
+      "elapsed": "02:30:26",
+      "cpuTime": "0:00.06",
+      "executable": "node"
+    },
+    {
+      "pid": 62735,
+      "ppid": 62734,
+      "state": "S+",
+      "elapsed": "02:30:26",
+      "cpuTime": "1:20.75",
+      "executable": "/opt/homebrew/lib/node_modules/@openai/codex/node_modules/@openai/codex-darwin-arm64/vendor/aarch64-apple-darwin/bin/codex"
+    },
+    {
+      "pid": 62791,
+      "ppid": 62735,
+      "state": "S",
+      "elapsed": "02:30:26",
+      "cpuTime": "0:00.08",
+      "executable": "/Applications/ChatGPT.app/Contents/Resources/cua_node/bin/node_repl"
+    },
+    {
+      "pid": 62792,
+      "ppid": 62735,
+      "state": "S",
+      "elapsed": "02:30:26",
+      "cpuTime": "0:00.05",
+      "executable": "/Applications/ChatGPT.app/Contents/Resources/cua_node/bin/node"
+    },
+    {
+      "pid": 62799,
+      "ppid": 62792,
+      "state": "S",
+      "elapsed": "02:30:26",
+      "cpuTime": "0:00.07",
+      "executable": "/Applications/ChatGPT.app/Contents/Resources/cua_node/bin/node_repl"
+    },
+    {
+      "pid": 63700,
+      "ppid": 62735,
+      "state": "S",
+      "elapsed": "02:27:31",
+      "cpuTime": "0:00.40",
+      "executable": "/opt/homebrew/lib/node_modules/@openai/codex/node_modules/@openai/codex-darwin-arm64/vendor/aarch64-apple-darwin/bin/codex-code-mode-host"
+    },
+    {
+      "pid": 34137,
+      "ppid": 1611,
+      "state": "Ss+",
+      "elapsed": "18:26:35",
+      "cpuTime": "0:02.65",
+      "executable": "/Users/stephenspeicher/.local/bin/tt"
+    },
+    {
+      "pid": 34142,
+      "ppid": 34137,
+      "state": "S+",
+      "elapsed": "18:26:35",
+      "cpuTime": "0:00.01",
+      "executable": "/bin/zsh"
+    },
+    {
+      "pid": 34144,
+      "ppid": 34142,
+      "state": "S+",
+      "elapsed": "18:26:35",
+      "cpuTime": "0:00.03",
+      "executable": "node"
+    },
+    {
+      "pid": 34145,
+      "ppid": 34144,
+      "state": "S+",
+      "elapsed": "18:26:35",
+      "cpuTime": "2:29.19",
+      "executable": "/opt/homebrew/lib/node_modules/@openai/codex/node_modules/@openai/codex-darwin-arm64/vendor/aarch64-apple-darwin/bin/codex"
+    },
+    {
+      "pid": 34207,
+      "ppid": 34145,
+      "state": "S",
+      "elapsed": "18:26:34",
+      "cpuTime": "0:00.11",
+      "executable": "/Applications/ChatGPT.app/Contents/Resources/cua_node/bin/node_repl"
+    },
+    {
+      "pid": 34208,
+      "ppid": 34145,
+      "state": "S",
+      "elapsed": "18:26:34",
+      "cpuTime": "0:00.04",
+      "executable": "/Applications/ChatGPT.app/Contents/Resources/cua_node/bin/node"
+    },
+    {
+      "pid": 34229,
+      "ppid": 34208,
+      "state": "S",
+      "elapsed": "18:26:34",
+      "cpuTime": "0:00.10",
+      "executable": "/Applications/ChatGPT.app/Contents/Resources/cua_node/bin/node_repl"
+    },
+    {
+      "pid": 34699,
+      "ppid": 34145,
+      "state": "S",
+      "elapsed": "18:26:27",
+      "cpuTime": "0:00.64",
+      "executable": "/opt/homebrew/lib/node_modules/@openai/codex/node_modules/@openai/codex-darwin-arm64/vendor/aarch64-apple-darwin/bin/codex-code-mode-host"
+    },
+    {
+      "pid": 34149,
+      "ppid": 1611,
+      "state": "Ss+",
+      "elapsed": "18:26:35",
+      "cpuTime": "0:02.59",
+      "executable": "/Users/stephenspeicher/.local/bin/tt"
+    },
+    {
+      "pid": 34153,
+      "ppid": 34149,
+      "state": "S+",
+      "elapsed": "18:26:35",
+      "cpuTime": "0:00.00",
+      "executable": "/bin/zsh"
+    },
+    {
+      "pid": 34155,
+      "ppid": 34153,
+      "state": "S+",
+      "elapsed": "18:26:35",
+      "cpuTime": "0:00.03",
+      "executable": "node"
+    },
+    {
+      "pid": 34156,
+      "ppid": 34155,
+      "state": "S+",
+      "elapsed": "18:26:35",
+      "cpuTime": "2:17.96",
+      "executable": "/opt/homebrew/lib/node_modules/@openai/codex/node_modules/@openai/codex-darwin-arm64/vendor/aarch64-apple-darwin/bin/codex"
+    },
+    {
+      "pid": 34367,
+      "ppid": 34156,
+      "state": "S",
+      "elapsed": "18:26:34",
+      "cpuTime": "0:00.03",
+      "executable": "/Applications/ChatGPT.app/Contents/Resources/cua_node/bin/node"
+    },
+    {
+      "pid": 34368,
+      "ppid": 34156,
+      "state": "S",
+      "elapsed": "18:26:34",
+      "cpuTime": "0:00.10",
+      "executable": "/Applications/ChatGPT.app/Contents/Resources/cua_node/bin/node_repl"
+    },
+    {
+      "pid": 34374,
+      "ppid": 34367,
+      "state": "S",
+      "elapsed": "18:26:34",
+      "cpuTime": "0:00.09",
+      "executable": "/Applications/ChatGPT.app/Contents/Resources/cua_node/bin/node_repl"
+    },
+    {
+      "pid": 34736,
+      "ppid": 34156,
+      "state": "S",
+      "elapsed": "18:26:26",
+      "cpuTime": "0:00.36",
+      "executable": "/opt/homebrew/lib/node_modules/@openai/codex/node_modules/@openai/codex-darwin-arm64/vendor/aarch64-apple-darwin/bin/codex-code-mode-host"
+    },
+    {
+      "pid": 34203,
+      "ppid": 1611,
+      "state": "Ss+",
+      "elapsed": "18:26:35",
+      "cpuTime": "0:02.58",
+      "executable": "/Users/stephenspeicher/.local/bin/tt"
+    },
+    {
+      "pid": 34302,
+      "ppid": 34203,
+      "state": "S+",
+      "elapsed": "18:26:34",
+      "cpuTime": "0:00.01",
+      "executable": "/bin/zsh"
+    },
+    {
+      "pid": 34305,
+      "ppid": 34302,
+      "state": "S+",
+      "elapsed": "18:26:34",
+      "cpuTime": "0:00.04",
+      "executable": "node"
+    },
+    {
+      "pid": 34342,
+      "ppid": 34305,
+      "state": "S+",
+      "elapsed": "18:26:34",
+      "cpuTime": "2:20.93",
+      "executable": "/opt/homebrew/lib/node_modules/@openai/codex/node_modules/@openai/codex-darwin-arm64/vendor/aarch64-apple-darwin/bin/codex"
+    },
+    {
+      "pid": 34503,
+      "ppid": 34342,
+      "state": "S",
+      "elapsed": "18:26:34",
+      "cpuTime": "0:00.04",
+      "executable": "/Applications/ChatGPT.app/Contents/Resources/cua_node/bin/node"
+    },
+    {
+      "pid": 34504,
+      "ppid": 34342,
+      "state": "S",
+      "elapsed": "18:26:34",
+      "cpuTime": "0:00.10",
+      "executable": "/Applications/ChatGPT.app/Contents/Resources/cua_node/bin/node_repl"
+    },
+    {
+      "pid": 34514,
+      "ppid": 34503,
+      "state": "S",
+      "elapsed": "18:26:34",
+      "cpuTime": "0:00.09",
+      "executable": "/Applications/ChatGPT.app/Contents/Resources/cua_node/bin/node_repl"
+    },
+    {
+      "pid": 34656,
+      "ppid": 34342,
+      "state": "S",
+      "elapsed": "18:26:29",
+      "cpuTime": "0:00.33",
+      "executable": "/opt/homebrew/lib/node_modules/@openai/codex/node_modules/@openai/codex-darwin-arm64/vendor/aarch64-apple-darwin/bin/codex-code-mode-host"
+    }
+  ],
+  "limitations": [
+    "Process existence and CPU time do not establish current assigned work.",
+    "Names are not authoritative task membership; native handler join required."
+  ]
+}

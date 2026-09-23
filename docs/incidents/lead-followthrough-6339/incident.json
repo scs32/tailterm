@@ -1,0 +1,90 @@
+{
+  "schemaVersion": 1,
+  "incidentId": "lead-followthrough-6339",
+  "taskId": "tsk_2cfcff70a0fbe967",
+  "bugId": "wi_0c7ab8fc3320b52b",
+  "handlerConfirmedRevision": 6,
+  "ownerIntake": 6336,
+  "workOrderMessage": 6339,
+  "scopeAmendments": [6338, 6341, 6345, 6348],
+  "diagnosisOwner": "Direct workspace Codex session; distinct from lead-recovery and db-handler",
+  "priorIncident": "../../releases/reliable-followthrough-b1b14d70/incident-stop-after-save-4328.json",
+  "priorOrders": [4328, 4335],
+  "relatedHistoricalRecoveryBug": "wi_b28100d6cc6b7ceb",
+  "affectedAgent": {
+    "name": "lead-recovery",
+    "agentId": "agt_64e8e823485a3434",
+    "runId": "run_66d063bf724968d0",
+    "threadId": "01a0925a-59a0-7063-9c03-d04588d56aa3",
+    "host": "Stephens-Mini",
+    "tmuxSessionId": "$71",
+    "tmuxCreated": 1789161789,
+    "wrapperPid": 97494,
+    "codexPid": 97497
+  },
+  "lastSubstantiveAction": {
+    "message": 6334,
+    "at": "2026-09-14T05:41:10.888554705Z",
+    "action": "Requested a fresh handler review of reader work and source acceptance under existing Queue audit orders 4344/5871."
+  },
+  "turnCompletedAt": "2026-09-14T05:41:19.936Z",
+  "expectedNextAction": {
+    "action": "Assess the handler response and route the correct bounded next phase or explicit dependency.",
+    "trigger": "Handler reply #6335 saved 2026-09-14T05:43:08.719669486Z.",
+    "observedDelay": "Approximately 9 hours 31 minutes until the next native task start."
+  },
+  "stopReason": "The lead completed its turn while waiting for a handler response. The handler saved that response without a recipient in a non-swarm project, so it was readable but did not qualify for an ordinary inbox wake. No independent covered follow-through action caused continuation.",
+  "causalEvidence": [
+    "Native exact-thread trace records normal task_complete at 05:41:19.936Z and no next task_started until 15:14:30.524Z.",
+    "Native Board #6335 is agent-authored, has no to field and no broadcast flag; project swarm=false. Initial lead cursor remained 6333 despite a current heartbeat.",
+    "hub/cmd/tt/relay.go:159 wakeThrough excludes unaddressed non-broadcast agent messages; relayOne advances transport progress without queuing when no message is eligible. Existing TestWakeEligibility explicitly covers this exclusion. These source tests were inspected, not rerun.",
+    "Exact-run relay progress observed during diagnosis reports followThroughSupported=true and followThroughStatus=uncovered_unverified. This is current observation, not a historical coverage snapshot.",
+    "Directed system Queue #6337 was saved at 15:14:24.336790265Z after handler incident intake changed the item. The native queued notification names through-message 6337; the same thread starts at 15:14:30.524Z and executes inbox at 15:14:39.371Z, then substantive corrections #6343/#6344 at 15:15:28Z."
+  ],
+  "contributingConditions": [
+    "Handler used replyTo without to; a reply relationship does not itself route a wake.",
+    "Heartbeat kept the roster showing running/online while the provider had completed its turn.",
+    "Previously deployed follow-through code did not establish coverage for this shared lead responsibility.",
+    "The handler response also conflated two work items, requiring substantive correction when the lead eventually read it."
+  ],
+  "recurrenceControlFailure": "The prior incident assigned tracking and continuation controls, but deployment alone did not demonstrate shared-role coverage. Current exact-run state remains uncovered_unverified, while this handler reply omitted the address required by ordinary delivery. The prior instruction did not prevent the routing omission or provide independent execution follow-through.",
+  "immediateRecovery": {
+    "state": "Existing lead execution observed; no replacement necessary for this occurrence.",
+    "mechanism": "An incidental directed Queue notification caused a new turn in the same retained session during diagnosis.",
+    "limitation": "The notification occurred before the causal/prevention record was finished. This was not a deliberate gated recovery and must not be represented as compliance with, or proof of, the prevention control.",
+    "directWorkspaceActions": "No restart, resume, key injection, model change, relay reload, lead assignment, or session closure."
+  },
+  "preventionAction": {
+    "owner": "Actual db-handler, agt_3760a4361c514a03/run_1a67a6c9be7c7136",
+    "boundedOrder": "6339 with evidence and prevention amendment 6345/6348; handler operational acceptance pending",
+    "action": "For outstanding requested lead actions, save a substantive reply explicitly addressed to the exact responsible lead, with current item/order links; read back recipient and linkage before claiming delivery. Preserve the original unaddressed reply and link any correction rather than rewriting it.",
+    "verificationCriterion": "Handler saves an addressed substantive correction or result for an existing authorized lead action; native readback confirms recipient/item/order, and exact-thread evidence confirms the lead consumes it and performs the required action. Storage and wake acceptance alone are insufficient.",
+    "status": "Assigned proposal retained by handler #6348; execution and acceptance pending."
+  },
+  "permanentCorrection": {
+    "status": "Open; not implemented or accepted by this diagnosis.",
+    "requiredWork": "Item-bound enforcement and independently verified shared-action coverage must detect missing execution even when a reply is unaddressed or a turn ends. Handler must assign a bounded implementation/activation order before that work proceeds.",
+    "verification": "Isolated regression for unaddressed reply, normal turn completion and missing action coverage, followed by exact live enrollment/continuation/substantive execution and handler-saved acceptance."
+  },
+  "historicalOriginalLead": {
+    "agentId": "agt_1186df8d710c0fd7",
+    "runId": "run_9e0ddb28df5ae63e",
+    "threadId": "01a08160-f5c9-7153-96d4-d52aa1785f84",
+    "lastHeartbeatAt": "2026-09-11T17:28:35.305081643Z",
+    "lastRecordedToolAt": "2026-09-11T17:28:47.780Z",
+    "lastRecordedEventAt": "2026-09-11T17:28:57.213Z",
+    "lastAction": "Verified worker correction activity and read the inbox after dispatching same-item Starts.",
+    "expectedNextAction": "Continue coordination/review of existing Search and flashing/focus work.",
+    "observedState": "Original tmux session lead is absent; native trace ends without a retained completion or terminal error explaining termination.",
+    "cause": "Unknown. No evidence establishes crash, resource exhaustion, kill actor or shared cause with the current replacement stall.",
+    "recovery": "Historical fresh lead assignment was already accepted under Bug wi_b28100d6cc6b7ceb; original identity must not be resurrected."
+  },
+  "unresolvedQuestions": [
+    "Original lead termination cause requires separate retained host/runtime evidence; this diagnosis does not invent one.",
+    "A narrow terminal capture displayed a rate-limit/model-choice reminder during current execution. Its effect is unknown; concurrent native tools disprove claiming it caused the whole overnight delay.",
+    "The relay text log has no per-line timestamps and no successful-wake audit for the overnight interval. Current source and exact native notification establish the routing mechanism, but do not provide every historical poll or executable-memory hash.",
+    "Full project backlog reconciliation is separate from establishing that the replacement lead is executing again."
+  ],
+  "evidenceManifest": "evidence-manifest.json",
+  "acceptance": "Pending actual handler saved confirmation; parent Bug and permanent prevention remain open."
+}

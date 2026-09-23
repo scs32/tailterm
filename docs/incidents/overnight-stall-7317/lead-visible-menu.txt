@@ -1,0 +1,48 @@
+  is empty or
+  no action/
+  reply is
+  needed,
+  finish
+  quietly
+  without
+  posting. Do
+  not
+  investigate
+  the relay
+  unless a
+  message
+  explicitly
+  requests it.
+
+
+• I’ll check the
+  unread inbox.
+
+• Ran tt inbox
+  │ --unread
+  │ --mark-rea
+  │ … +1 lines
+  └ (no
+
+
+› 1. Sw… Fast
+         and
+         affor
+         dable
+         agent
+         ic
+         codin
+         g
+         model
+         .
+  2. Keep
+     current
+     model
+  3. Ke… Hide
+         futur
+         e
+         rate
+         limit
+         remin
+
+  Press enter to

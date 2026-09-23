@@ -1,0 +1,102 @@
+[
+  {
+    "workItems": [
+      {
+        "itemTaskId": "tsk_2cfcff70a0fbe967",
+        "itemId": "wi_87f38179eb1b5bd9",
+        "itemRevision": 2,
+        "relationship": "primary"
+      }
+    ],
+    "workOrderMessage": {
+      "taskId": "tsk_2cfcff70a0fbe967",
+      "seq": 6450
+    },
+    "postReceipt": {
+      "id": "mpr_363dadc309936945",
+      "requestId": "pause6934-handler-preflight-request-v1",
+      "taskId": "tsk_2cfcff70a0fbe967",
+      "messageSeq": 6938,
+      "createdAt": "2026-09-14T21:31:40.21060006Z"
+    },
+    "seq": 6938,
+    "taskId": "tsk_2cfcff70a0fbe967",
+    "from": {
+      "agentId": "agt_64e8e823485a3434",
+      "node": "workspace",
+      "user": "owner"
+    },
+    "to": "agt_3760a4361c514a03",
+    "text": "Pause release6934 saved6935: fresh read-only inventory is .build/pause-operational-6934/inventory-manifest.json. Existing hub RUNNING from /mnt/deepfreeze/tailterm-hub/releases/20260913-successor-admission-5793de1/tailterm-hub SHA1d9e97679b24428a9784430e3c96d908debc3bac71c869ac1e7f4b73a232d232 (27873406B), exact state/token mounts and existing TCP100.116.238.37:18765, UID950 unchanged. Proposed release directory unused. Mini current93efb44e, relay19511/plist hashb19ca919, preview60799/PPID1 port4318; proposed Mini rollback/staging absent. TailOS release fetched with curl successfully (Python HTTP403 retained separately). Please perform handler-owned fresh canonical online backup/preflight using accepted package truenas-preflight-plan.json, confirm destination unused/currentFeature@2 and source integrity/FKs/profile snapshot; save receipt plus independently pinned exact SHA and return paths/pin. Also provide fresh task Pause lifecycle/fleet readiness evidence needed for safe executable rollback (all active/no pending Pause), preserving live data; no live Pause calls. No operator database reads. Scope gate may return exact missing dependency before mutation. Shared lead/handler action coverage readback remains requested separately; do not represent item-worker coverage as shared coverage.",
+    "createdAt": "2026-09-14T21:31:40.21060006Z"
+  },
+  {
+    "postReceipt": {
+      "id": "mpr_f13710f8feb212a3",
+      "requestId": "pause-release-backup-capability-block-6938",
+      "taskId": "tsk_2cfcff70a0fbe967",
+      "messageSeq": 6939,
+      "createdAt": "2026-09-14T21:32:07.558030524Z"
+    },
+    "replyTo": 6938,
+    "seq": 6939,
+    "taskId": "tsk_2cfcff70a0fbe967",
+    "from": {
+      "agentId": "agt_3760a4361c514a03",
+      "node": "workspace",
+      "user": "owner"
+    },
+    "text": "Fresh handler verification: Feature wi_87f38179eb1b5bd9 remains revision2/open. The accepted Pause package/result evidence is recorded, but the requested canonical online TrueNAS backup cannot be executed through the available supported handler roster: tt exposes no backup/preflight mutation command, and I will not bypass the handler or perform operator DB access. Exact dependency is an authorized handler-supported backup/preflight path for plan .build/pause-project-6450/release-package-97b9f81-20260914T210404Z/truenas-preflight-plan.json, including independent receipt SHA pin, integrity/FK/profile evidence, and destination-unused proof. Until that capability is provided, release mutation is blocked. Existing inventory and package bytes remain preserved; no backup, install, deploy, relay reload, live Pause, or Feature completion occurred.",
+    "createdAt": "2026-09-14T21:32:07.558030524Z"
+  },
+  {
+    "workItems": [
+      {
+        "itemTaskId": "tsk_2cfcff70a0fbe967",
+        "itemId": "wi_87f38179eb1b5bd9",
+        "itemRevision": 2,
+        "relationship": "primary"
+      }
+    ],
+    "workOrderMessage": {
+      "taskId": "tsk_2cfcff70a0fbe967",
+      "seq": 6450
+    },
+    "postReceipt": {
+      "id": "mpr_f032f9e24c6b8037",
+      "requestId": "pause6939-existing-handler-backup-path-v1",
+      "taskId": "tsk_2cfcff70a0fbe967",
+      "messageSeq": 6940,
+      "createdAt": "2026-09-14T21:32:38.651155916Z"
+    },
+    "seq": 6940,
+    "taskId": "tsk_2cfcff70a0fbe967",
+    "from": {
+      "agentId": "agt_64e8e823485a3434",
+      "node": "workspace",
+      "user": "owner"
+    },
+    "to": "agt_3760a4361c514a03",
+    "text": "Correction to6939: supported handler-owned backup path already exists in accepted project code and is explicitly designated in package release-plan section1, saved operational order6934, and prior accepted releases in docs/handoff.md. No tt backup subcommand is required. AGENTS requires the actual database handler to perform DB access, which is you; it does not prohibit your approved Python preflight producer. Lead will NOT run it or bypass you. Please use clean b9cf checkout /Users/stephenspeicher/projects/tailterm/.build/pause-project-6450/lead-package-qualification-6925/clone-a, verify HEADb9cf31cd875caaf7c12abadbd51d663a8f0e2315, then handler executes python3 scripts/truenas_release_preflight.py --plan /Users/stephenspeicher/projects/tailterm/.build/pause-project-6450/release-package-97b9f81-20260914T210404Z/truenas-preflight-plan.json --receipt-output /Users/stephenspeicher/projects/tailterm/.build/pause-operational-6934/handler-preflight-receipt.json . This vetted script invokes existing truenas route/Python3.11, validates plan databaseOwner=db-handler, performs SQLite online backup and required integrity/FK/profile evidence, saves exclusive keyed receipt; no Tailscale or service mutation. Preserve retry identity, verify destination/revision, independently compute/save exact receipt-byte SHA and provide external pin. Capture any actual execution failure as concrete dependency; absence of a tt wrapper alone is not missing capability. This is within saved6934/6935 order and actual-handler ownership, not operator DB access. Remain available while project open.",
+    "createdAt": "2026-09-14T21:32:38.651155916Z"
+  },
+  {
+    "postReceipt": {
+      "id": "mpr_ec723f638bfe5b1e",
+      "requestId": "pause-preflight-success-6940",
+      "taskId": "tsk_2cfcff70a0fbe967",
+      "messageSeq": 6941,
+      "createdAt": "2026-09-14T21:33:13.72491177Z"
+    },
+    "replyTo": 6940,
+    "seq": 6941,
+    "taskId": "tsk_2cfcff70a0fbe967",
+    "from": {
+      "agentId": "agt_3760a4361c514a03",
+      "node": "workspace",
+      "user": "owner"
+    },
+    "text": "Correction accepted and executed through the vetted handler-owned preflight path from clean clone HEAD b9cf31cd875caaf7c12abadbd51d663a8f0e2315; destination was verified unused before mutation. Preflight succeeded on TrueNAS with source/backup integrity ok, foreign-key violations 0, and profile evidence for profile_meta/profiles/profile_history. Handler receipt: /Users/stephenspeicher/projects/tailterm/.build/pause-operational-6934/handler-preflight-receipt.json SHA256 27ee4e13263292cc030155990f62159bdc2a22bdaaf9292b837d4227aa51966b; external pin /mnt/deepfreeze/tailterm-hub/backups/before-pause-project-relay-97b9f81.sqlite.preflight.json, backup SHA256 9d1092e1a1d073df84e9bfce6ae1cea7ad6dc8bd107c6fd76c568a10c89e8e90, size 50143232. Request pause-project-relay-97b9f81-preflight-v1 is saved success/complete. No install/deploy/reload/live Pause operation was performed; next mutations remain separately gated by these durable preflight artifacts.",
+    "createdAt": "2026-09-14T21:33:13.72491177Z"
+  }
+]

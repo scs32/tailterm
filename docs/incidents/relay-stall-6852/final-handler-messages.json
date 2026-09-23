@@ -1,0 +1,103 @@
+{
+  "messages": [
+    {
+      "workItems": [
+        {
+          "itemTaskId": "tsk_2cfcff70a0fbe967",
+          "itemId": "wi_427b310fa9b8e886",
+          "itemRevision": 1,
+          "relationship": "primary"
+        }
+      ],
+      "workOrderMessage": {
+        "taskId": "tsk_2cfcff70a0fbe967",
+        "seq": 6873
+      },
+      "postReceipt": {
+        "id": "mpr_b04138d49f8f873f",
+        "requestId": "relay-final-acceptance-readback-6894",
+        "taskId": "tsk_2cfcff70a0fbe967",
+        "messageSeq": 6896,
+        "createdAt": "2026-09-14T20:59:13.662816009Z"
+      },
+      "replyTo": 6894,
+      "seq": 6896,
+      "taskId": "tsk_2cfcff70a0fbe967",
+      "from": {
+        "agentId": "agt_3760a4361c514a03",
+        "node": "workspace",
+        "user": "owner"
+      },
+      "text": "Fresh post-install readbacks confirm QA dly_182440c0260645c8 g1/e2 phase=result and Pause package dly_74f4ee8621df6f77 g2/e1 progressing, with identities unchanged. QA manifest .build/two-review-rounds-6518/current-qa-native-2026-09-14T205854755Z/manifest.json SHA256 4876ec4e948dffa1721057c6d9390348ec7fcc02c8f6cd792aae88fa2e676965; Pause manifest .build/pause-project-6450/current-native-2026-09-14T205854823Z/manifest.json SHA256 6fdf7a8b0772f6485d233b188e02b03b862862a0a4b677ebb8079ad38a9a98f3. Installed acceptance artifact .build/relay-427-qualification/installed-acceptance-submission.json SHA256 d25977f2771688432cd0f5801b3019062a562fce983784bc5a5d120ffcbabe23 records five packaged scenarios, exact installed93efb44e/rollback979ba221, one existing relay reload PID19511, and ordinary delivery reaching QA/Pause without the prior409. Dedicated narrow Bug wi_427b310fa9b8e886 criteria are satisfied; parent wi_0c7ab8fc3320b52b atomic incident-rearm prevention remains open and separate.",
+      "createdAt": "2026-09-14T20:59:13.662816009Z"
+    },
+    {
+      "workItems": [
+        {
+          "itemTaskId": "tsk_2cfcff70a0fbe967",
+          "itemId": "wi_427b310fa9b8e886",
+          "itemRevision": 1,
+          "relationship": "primary"
+        }
+      ],
+      "workOrderMessage": {
+        "taskId": "tsk_2cfcff70a0fbe967",
+        "seq": 6860
+      },
+      "postReceipt": {
+        "id": "mpr_639dfae1e5e6137d",
+        "requestId": "relay427-root-installed-disposition-v1",
+        "taskId": "tsk_2cfcff70a0fbe967",
+        "messageSeq": 6897,
+        "createdAt": "2026-09-14T20:59:15.369909436Z"
+      },
+      "seq": 6897,
+      "taskId": "tsk_2cfcff70a0fbe967",
+      "from": {
+        "node": "workspace",
+        "user": "owner"
+      },
+      "to": "agt_3760a4361c514a03",
+      "text": "Root source owner accepts the narrow installed correction on evidence6885/6892/6893/6894: immutable4f8aa43 candidate; independent five-scenario source/package and installed checks; exact installed93efb44e/rollback979ba221; one existingrelay reload, unchanged config/identities; actual recovery native epoch2 and independent QA test/result6878/6890. Incident README docs/incidents/relay-stall-6852/README.md now preserves cause, negative controls, recovery and installed proof with closure explicitly pending. Please save final installed acceptance and, after matching current narrow Bug427 criteria, mark it Done with committed receipt/readback; if a criterion remains, name it precisely rather than leave an implicit wait. Parent atomic rearm, broader lifecycle work and Pause/review releases remain open under their own scopes. No additional generic review/rerun or service operation requested.",
+      "createdAt": "2026-09-14T20:59:15.369909436Z"
+    },
+    {
+      "postReceipt": {
+        "id": "mpr_d0147914c2f552a7",
+        "requestId": "relay-bug-done-confirm-6894",
+        "taskId": "tsk_2cfcff70a0fbe967",
+        "messageSeq": 6898,
+        "createdAt": "2026-09-14T20:59:23.076185432Z"
+      },
+      "replyTo": 6894,
+      "seq": 6898,
+      "taskId": "tsk_2cfcff70a0fbe967",
+      "from": {
+        "agentId": "agt_3760a4361c514a03",
+        "node": "workspace",
+        "user": "owner"
+      },
+      "text": "Saved final post-install acceptance/readback (#6896) and updated the dedicated narrow Bug wi_427b310fa9b8e886 from revision1 to done at revision2. Handler receipt wir_3519aab52fa55221 confirms request relay-bug-done-6894. Parent wi_0c7ab8fc3320b52b remains open for the separate atomic incident-rearm prevention scope; no parent completion or release claim.",
+      "createdAt": "2026-09-14T20:59:23.076185432Z"
+    },
+    {
+      "postReceipt": {
+        "id": "mpr_a7cd084e7e2314a7",
+        "requestId": "relay-bug-final-confirm-6897",
+        "taskId": "tsk_2cfcff70a0fbe967",
+        "messageSeq": 6899,
+        "createdAt": "2026-09-14T20:59:35.432219875Z"
+      },
+      "replyTo": 6897,
+      "seq": 6899,
+      "taskId": "tsk_2cfcff70a0fbe967",
+      "from": {
+        "agentId": "agt_3760a4361c514a03",
+        "node": "workspace",
+        "user": "owner"
+      },
+      "text": "Final installed acceptance is saved and read back in #6896; the narrow Bug wi_427b310fa9b8e886 is already Done at revision2 with committed receipt wir_3519aab52fa55221, confirmed in #6898. All listed criteria are satisfied; no residual criterion remains for Bug427. Parent atomic rearm/lifecycle/Pause/review scopes remain open and separate; no rerun or service operation performed.",
+      "createdAt": "2026-09-14T20:59:35.432219875Z"
+    }
+  ]
+}

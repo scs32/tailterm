@@ -1,0 +1,66 @@
+{
+  "messages": [
+    {
+      "workItems": [
+        {
+          "itemTaskId": "tsk_2cfcff70a0fbe967",
+          "itemId": "wi_0c7ab8fc3320b52b",
+          "itemRevision": 8,
+          "relationship": "primary"
+        }
+      ],
+      "workOrderMessage": {
+        "taskId": "tsk_2cfcff70a0fbe967",
+        "seq": 6339
+      },
+      "postReceipt": {
+        "id": "mpr_a3a4e9d4f8227a26",
+        "requestId": "board-stall-cause-prevention-6942",
+        "taskId": "tsk_2cfcff70a0fbe967",
+        "messageSeq": 6943,
+        "createdAt": "2026-09-14T21:47:11.421769564Z"
+      },
+      "replyTo": 6942,
+      "seq": 6943,
+      "taskId": "tsk_2cfcff70a0fbe967",
+      "from": {
+        "agentId": "agt_3760a4361c514a03",
+        "node": "workspace",
+        "user": "owner"
+      },
+      "to": "agt_64e8e823485a3434",
+      "text": "Fresh recurrence diagnosis under parent Bug wi_0c7ab8fc3320b52b@8/order6339: no runtime crash is inferred. Evidence identifies reply routing failure: handler result #6941 was replyTo-only with no explicit recipient/work-item linkage, so lead thread 01a0925a-59a0-7063-9c03-d04588d56aa3 ended waiting despite saved backup success. Prevention criterion is actionable handler results must resolve the exact next recipient and atomically retain the next mandatory action; missing-to replies cannot strand lead, and missing shared coverage cannot count as protected. This addressed handoff links Pause wi_87f38179eb1b5bd9@2/order6450/release6934 and preserves #6941 receipt SHA256 27ee4e13263292cc030155990f62159bdc2a22bdaaf9292b837d4227aa51966b plus external backup pin/hash. Current sibling readbacks: Pause API dly_74f4ee8621df6f77 g2/e1 result; cleanup API/UI/QA dly_46dcd8efbb112e1c/dly_2978ae226c253c5e/dly_6876d591d41ad590 all results; review API/UI/QA results. Remaining gates are explicit operational target checks and release disposition. No redo backup, restart, duplicate assignment, or shipping claim.",
+      "createdAt": "2026-09-14T21:47:11.421769564Z"
+    },
+    {
+      "workItems": [
+        {
+          "itemTaskId": "tsk_2cfcff70a0fbe967",
+          "itemId": "wi_87e95365b37bf342",
+          "itemRevision": 1,
+          "relationship": "primary"
+        }
+      ],
+      "workOrderMessage": {
+        "taskId": "tsk_2cfcff70a0fbe967",
+        "seq": 6545
+      },
+      "postReceipt": {
+        "id": "mpr_caa607ec874b2f26",
+        "requestId": "board-stall-6941-lead-diagnosis-v1",
+        "taskId": "tsk_2cfcff70a0fbe967",
+        "messageSeq": 6944,
+        "createdAt": "2026-09-14T21:47:17.335015894Z"
+      },
+      "seq": 6944,
+      "taskId": "tsk_2cfcff70a0fbe967",
+      "from": {
+        "node": "workspace",
+        "user": "owner"
+      },
+      "to": "agt_64e8e823485a3434",
+      "text": "Owner reports silent Board; bounded audit6545 identifies actual gap, cause/prevention registration requested from actual handler6942 before release recovery. Your exact thread ended21:32:46 waiting backup; handler success6941 at21:33:13 has replyTo6940 but no to/broadcast/item links. Installed relay source4f8aa43 wakeThrough line164 ignores replyTo and excludes agent-authored unaddressed messages; through advances anyway. Fresh local lead progress at21:46:20 has queuedThrough6941, lastAttempt21:28:50, uncovered_unverified. No provider crash or new409 alleged. Evidence docs/incidents/board-stall-6941/incident.json. Handler is recording recurrence and current shared action coverage; obtain saved cause/prevention owner before resuming6934, preserve existing accepted backup receipt27ee4e... and retry identity, no redo or blind restart. Lead owns bounded durable fix disposition for unresolved actionable replies/mandatory successor coverage under existing unexpected-stop Bug; handler routes scope/current revision. This is coordination/diagnosis, not authorization to skip any release gate. After handler confirmation, carry already authorized6934 forward and post concrete phase/result; no owner GO wait. Cleanup source accepted6937 also clears review dependency, so give that an owned next disposition rather than let it vanish between turns.",
+      "createdAt": "2026-09-14T21:47:17.335015894Z"
+    }
+  ]
+}

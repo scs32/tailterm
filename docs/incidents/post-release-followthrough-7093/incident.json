@@ -1,0 +1,56 @@
+{
+  "schemaVersion": 1,
+  "itemId": "wi_0c7ab8fc3320b52b",
+  "itemRevision": 8,
+  "originalOrder": 6339,
+  "boundedOrder": 7095,
+  "observedAt": "2026-09-15T00:19:22.756594+00:00",
+  "facts": [
+    {
+      "releaseAccepted": 7092,
+      "releaseCompleted": 7093,
+      "leadTurnEndedAt": "2026-09-14T23:44:01.450Z"
+    },
+    {
+      "monitorMessage": 7094,
+      "leadReadAt": "2026-09-15T00:07:29.861Z",
+      "leadTurnEndedAt": "2026-09-15T00:07:35.415Z",
+      "nextActionRecorded": false
+    }
+  ],
+  "cause": "Alert arrived and was read, but next disposition was not performed; shared lead/handler coverage was uncovered_unverified. Narrow routing fix is installed and no missing-message failure is shown.",
+  "unknowns": [
+    "No provider failure inferred",
+    "Fresh exact shared action/native coverage requested via handler before enrollment"
+  ],
+  "prevention": {
+    "owner": "root prepares existing v3 shared-action enrollment; actual handler commits; lead owns closeout and next dispatch",
+    "mechanism": "Bounded native mandatory actions for shared lead/handler under installed v3 deadlines, without another watcher",
+    "status": "bounded_shared_actions_committed",
+    "leadDelivery": "dly_98fd83643f89b03a",
+    "leadReceipt": "drr_a6918adbfe49e06d",
+    "handlerDelivery": "dly_4ac979cfa4dad635",
+    "handlerResultReceipt": "drr_1c069a16c11ddcfb",
+    "savedConfirmationMessage": 7113
+  },
+  "existingAcceptedRelease": 7063,
+  "nextWork": {
+    "itemId": "wi_178fe85b0fc5f9c3",
+    "order": 7109,
+    "deliveryId": "dly_e991eca3287cbb07",
+    "generation": 3,
+    "epoch": 1,
+    "receipt": "drr_e4f7b0aa3e68a98f",
+    "status": "assigned_checkpoint_not_yet_verified"
+  },
+  "routingCloseout": {
+    "itemId": "wi_447a20a4a05fe397",
+    "revision": 2,
+    "status": "done",
+    "itemReceipt": "wir_2e3de0b9836a9e25",
+    "queueId": "que_7e664dd75147461f",
+    "queueRevision": 2,
+    "queueState": "completed",
+    "handlerConfirmation": 7102
+  }
+}

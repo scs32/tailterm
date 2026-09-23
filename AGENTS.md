@@ -5,6 +5,22 @@ The current work is on `tasks-hub`, not `main`.
 
 Persistent owner instructions:
 
+- Recovery prime directive (Bug `wi_0c7ab8fc3320b52b`, owner amendment and
+  instruction-maintenance order #4335, original order #4328): never simply
+  restart unexpectedly paused work. Before resuming, establish an evidence-backed
+  explanation of why execution stopped and retain a structured incident linked
+  to its bug: item/order/agent/run, last substantive action and timestamps,
+  expected next action, stop reason, causal evidence, contributing conditions,
+  and unresolved questions. An unknown cause requires diagnosis, not invented
+  certainty. Record a concrete prevention action with an accountable owner,
+  bounded work order and verification criterion before resuming. A "keep going"
+  message, another watcher, or an unassigned ticket does not satisfy this rule.
+  Distinguish immediate recovery from permanent correction and demonstrated
+  prevention; keep prevention work open until verification and handler-saved
+  acceptance. Link recurrences to the prior incident and explain why its control
+  failed. Planned waits and owner-requested pauses retain their known reason and
+  resume condition; investigate unexpected delay beyond that condition. Keep
+  unrelated authorized work moving.
 - All implementation, investigation, validation and deployment must originate
   from a durable bug or feature and a bounded work order. Intake and coordination
   may establish that record first. Cite its ID and work-order message in handoffs,
