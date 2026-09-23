@@ -41,13 +41,17 @@ and the comparison plan below includes human interventions and regressions.
 sequential change, and **Feature delivery** only when UI and API work can be
 partitioned. These recommendations are design judgments, not measured rankings.
 
-Astra is assigned to uncertain synthesis and coordination, Sol to substantial
-implementation or evidence gathering, and Terra to bounded independent checks.
+All templates use the GPT-6 family (owner decision, September 23, 2026). Astra
+is assigned to uncertain synthesis and coordination, and Sol to implementation,
+evidence gathering, review and QA. Luna runs swarm workers' focused, high-volume
+assignments. GPT-6 has no mid-size model, so the former Terra roles moved up to
+Sol, except swarm workers, which moved to Luna. GPT-6 Sol and Luna need `codex-cli`
+0.156.1 or later on the launching host.
 The model names and IDs follow the [documented Codex catalog](https://learn.chatgpt.com/docs/models)
 and the installed CLI's visible catalog. Account availability can differ. Model
 roles reflect capability positioning, not a benchmark of these exact teams.
-You can change each model, app and prompt before saving. Reasoning effort uses
-the agent app's existing configuration; it is not set by these templates.
+You can change each model, app and prompt before saving. Only **Planned delivery**
+sets explicit reasoning effort; the others inherit the agent app's configuration.
 
 The defaults use Codex because Tailterm currently has an exact-thread Codex inbox
 relay for resuming idle participants. Mixing providers can be useful, but changing
@@ -133,7 +137,7 @@ other runtimes. Prompts discourage acknowledgement loops, redundant findings and
 taking over assignments addressed to someone else.
 
 The **Coordinated swarm** example starts with one Astra orchestrator and four
-Terra workers. Templates support up to 32 members, so one orchestrator plus ten
+Luna workers. Templates support up to 32 members, so one orchestrator plus ten
 workers can be saved, but this is an experiment to measure, not a claimed optimum.
 The active-agent cap and Max new agents allowance remain separate. A larger
 roster increases the number of recipients for each message and can add substantial
@@ -324,7 +328,7 @@ One capable agent for a bounded change, without coordination overhead.
 
 ### builder — Implementation and verification
 
-App: `codex`. Model: `gpt-5.6-sol`. Machine: Main machine. Directory: optional.
+App: `codex`. Model: `gpt-6-sol`. Machine: Main machine. Directory: optional.
 
 ```text
 WORKING AGREEMENT
@@ -362,7 +366,7 @@ A single writer plus an independent reviewer. A practical default for most codin
 
 ### builder — Implementation lead
 
-App: `codex`. Model: `gpt-5.6-sol`. Machine: Main machine. Directory: optional.
+App: `codex`. Model: `gpt-6-sol`. Machine: Main machine. Directory: optional.
 
 ```text
 WORKING AGREEMENT
@@ -386,7 +390,7 @@ Before finishing, read the inbox, confirm the reviewed artifact matches your fin
 
 ### reviewer — Independent correctness review
 
-App: `codex`. Model: `gpt-5.6-terra`. Machine: Main machine. Directory: optional.
+App: `codex`. Model: `gpt-6-sol`. Machine: Main machine. Directory: optional.
 
 ```text
 WORKING AGREEMENT
@@ -446,7 +450,7 @@ Close with qa's evidence and any unresolved findings. Do not announce completion
 
 ### ui — Client implementation
 
-App: `codex`. Model: `gpt-5.6-sol`. Machine: Main machine. Directory: optional.
+App: `codex`. Model: `gpt-6-sol`. Machine: Main machine. Directory: optional.
 
 ```text
 WORKING AGREEMENT
@@ -470,7 +474,7 @@ Exercise keyboard and pointer interactions, relevant viewport sizes, and the bro
 
 ### api — Service and data implementation
 
-App: `codex`. Model: `gpt-5.6-sol`. Machine: Main machine. Directory: optional.
+App: `codex`. Model: `gpt-6-sol`. Machine: Main machine. Directory: optional.
 
 ```text
 WORKING AGREEMENT
@@ -494,7 +498,7 @@ Verify the happy path and the most important failure or concurrency case through
 
 ### qa — Independent acceptance testing
 
-App: `codex`. Model: `gpt-5.6-terra`. Machine: Main machine. Directory: optional.
+App: `codex`. Model: `gpt-6-sol`. Machine: Main machine. Directory: optional.
 
 ```text
 WORKING AGREEMENT
@@ -554,7 +558,7 @@ Send the precise patch and claimed mechanism to both teammates. Have reproducer 
 
 ### reproducer — Failure reproduction
 
-App: `codex`. Model: `gpt-5.6-terra`. Machine: Main machine. Directory: optional.
+App: `codex`. Model: `gpt-6-sol`. Machine: Main machine. Directory: optional.
 
 ```text
 WORKING AGREEMENT
@@ -578,7 +582,7 @@ After the patch, rerun the original scenario and a nearby negative case, includi
 
 ### analyst — Causal analysis and repair implementation
 
-App: `codex`. Model: `gpt-5.6-sol`. Machine: Main machine. Directory: optional.
+App: `codex`. Model: `gpt-6-sol`. Machine: Main machine. Directory: optional.
 
 ```text
 WORKING AGREEMENT
@@ -638,7 +642,7 @@ Review the rendered result after implementation, including a narrow viewport. Di
 
 ### implementer — UI implementation lead
 
-App: `codex`. Model: `gpt-5.6-sol`. Machine: Main machine. Directory: optional.
+App: `codex`. Model: `gpt-6-sol`. Machine: Main machine. Directory: optional.
 
 ```text
 WORKING AGREEMENT
@@ -662,7 +666,7 @@ Send verifier exact scenarios and the artifact to test, then correct reproducibl
 
 ### verifier — Browser and accessibility checks
 
-App: `codex`. Model: `gpt-5.6-terra`. Machine: Main machine. Directory: optional.
+App: `codex`. Model: `gpt-6-sol`. Machine: Main machine. Directory: optional.
 
 ```text
 WORKING AGREEMENT
@@ -722,7 +726,7 @@ Keep investigation within the authorized system and use isolated, non-destructiv
 
 ### identity — Identity and state review
 
-App: `codex`. Model: `gpt-5.6-sol`. Machine: Main machine. Directory: optional.
+App: `codex`. Model: `gpt-6-sol`. Machine: Main machine. Directory: optional.
 
 ```text
 WORKING AGREEMENT
@@ -746,7 +750,7 @@ Send lead each confirmed finding with exact location, attacker preconditions, ob
 
 ### surfaces — Input and output boundary review
 
-App: `codex`. Model: `gpt-5.6-sol`. Machine: Main machine. Directory: optional.
+App: `codex`. Model: `gpt-6-sol`. Machine: Main machine. Directory: optional.
 
 ```text
 WORKING AGREEMENT
@@ -806,7 +810,7 @@ Coordinate the operator and verifier through the change, keeping the owner infor
 
 ### operator — Deployment and migration operator
 
-App: `codex`. Model: `gpt-5.6-sol`. Machine: Main machine. Directory: optional.
+App: `codex`. Model: `gpt-6-sol`. Machine: Main machine. Directory: optional.
 
 ```text
 WORKING AGREEMENT
@@ -830,7 +834,7 @@ Send verifier the deployed artifact, endpoints, expected behavior and relevant b
 
 ### verifier — Readiness and recovery verification
 
-App: `codex`. Model: `gpt-5.6-terra`. Machine: Main machine. Directory: optional.
+App: `codex`. Model: `gpt-6-sol`. Machine: Main machine. Directory: optional.
 
 ```text
 WORKING AGREEMENT
@@ -890,7 +894,7 @@ Ask critic to challenge the provisional conclusion before finalizing it. Resolve
 
 ### researcher — Primary-source evidence
 
-App: `codex`. Model: `gpt-5.6-sol`. Machine: Main machine. Directory: optional.
+App: `codex`. Model: `gpt-6-sol`. Machine: Main machine. Directory: optional.
 
 ```text
 WORKING AGREEMENT
@@ -914,7 +918,7 @@ Send lead the strongest evidence early and flag gaps that could change the resul
 
 ### critic — Counterarguments and source checking
 
-App: `codex`. Model: `gpt-5.6-terra`. Machine: Main machine. Directory: optional.
+App: `codex`. Model: `gpt-6-sol`. Machine: Main machine. Directory: optional.
 
 ```text
 WORKING AGREEMENT
@@ -938,7 +942,7 @@ Send lead a short set of material objections, each with evidence, impact and a r
 
 ## Coordinated swarm
 
-An Astra orchestrator and four Terra workers sharing one broadcast conversation.
+An Astra orchestrator and four Luna workers sharing one broadcast conversation.
 
 **Use for:** Exploration or implementation with genuinely separable assignments. Start with four workers; add more only when useful work remains.
 
@@ -969,12 +973,12 @@ You are the main orchestrator. Introduce yourself and the objective on the board
 
 Break the actual objective into independently verifiable lanes. For each assignment name exactly one owner, its files or read-only scope, inputs, dependencies, expected artifact and acceptance checks. Direct --to messages still broadcast in this swarm, so name the owner in the text too. Require workers to announce a conflict before editing shared files. Prefer read-only parallel investigation until write ownership is settled. Assign shared schema/types and final integration to a named builder; retain final decisions and evidence review, not implementation or integration.
 
-Evaluate evidence from each lane, reconcile conflicting results, and request one focused cross-check from a worker who did not author the artifact. Do not create group votes, routine status chatter, or acknowledgement chains. Summarize a change of plan once. Four Terra workers are the starting allocation, not a requirement to keep all four busy. Add workers only for additional independent assignments when the owner permits spawning and the task allowance allows it; never create ten workers merely to fill a roster. Stop when the requested acceptance checks pass and give the owner the integrated result and concrete limitations.
+Evaluate evidence from each lane, reconcile conflicting results, and request one focused cross-check from a worker who did not author the artifact. Do not create group votes, routine status chatter, or acknowledgement chains. Summarize a change of plan once. Four Luna workers are the starting allocation, not a requirement to keep all four busy. Add workers only for additional independent assignments when the owner permits spawning and the task allowance allows it; never create ten workers merely to fill a roster. Stop when the requested acceptance checks pass and give the owner the integrated result and concrete limitations.
 ```
 
 ### worker1 — Swarm worker 1
 
-App: `codex`. Model: `gpt-5.6-terra`. Machine: Main machine. Directory: optional.
+App: `codex`. Model: `gpt-6-luna`. Machine: Main machine. Directory: optional.
 
 ```text
 WORKING AGREEMENT
@@ -998,7 +1002,7 @@ Share new evidence that changes another member's work: a reproduced failure, an 
 
 ### worker2 — Swarm worker 2
 
-App: `codex`. Model: `gpt-5.6-terra`. Machine: Main machine. Directory: optional.
+App: `codex`. Model: `gpt-6-luna`. Machine: Main machine. Directory: optional.
 
 ```text
 WORKING AGREEMENT
@@ -1022,7 +1026,7 @@ Share new evidence that changes another member's work: a reproduced failure, an 
 
 ### worker3 — Swarm worker 3
 
-App: `codex`. Model: `gpt-5.6-terra`. Machine: Main machine. Directory: optional.
+App: `codex`. Model: `gpt-6-luna`. Machine: Main machine. Directory: optional.
 
 ```text
 WORKING AGREEMENT
@@ -1046,7 +1050,7 @@ Share new evidence that changes another member's work: a reproduced failure, an 
 
 ### worker4 — Swarm worker 4
 
-App: `codex`. Model: `gpt-5.6-terra`. Machine: Main machine. Directory: optional.
+App: `codex`. Model: `gpt-6-luna`. Machine: Main machine. Directory: optional.
 
 ```text
 WORKING AGREEMENT
