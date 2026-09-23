@@ -290,7 +290,7 @@ Kept as they are: work items, Queue (scheduling and claims), operational records
 
 ## Migration
 
-1. **Envelope in shadow.** `tt send` and the hub validator ship. Agents may use either
+1. **Envelope in shadow** ([work order](broker-phase-1.md)). `tt send` and the hub validator ship. Agents may use either
    form, and the hub logs validator + Jev verdicts for free-text agent posts without
    rejecting. Prompts and templates switch to `tt send`. Exit criterion: a week of
    traffic where at least 90% of agent posts are valid envelopes.
