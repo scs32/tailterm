@@ -141,7 +141,21 @@ func main() {
 		if readErr != nil {
 			log.Fatalf("read hub token: %v", readErr)
 		}
-		identity, err = server.TokenIdentity(strings.TrimSpace(string(token)), api.Caller{Node: "workspace", User: "owner"})
+		tokens := map[string]api.Caller{strings.TrimSpace(string(token)): {Node: "workspace", User: "owner"}}
+		// Broker phase 2b: the Discord bridge gets its own, route-limited token.
+		if bridgeFile := os.Getenv("TAILTERM_BRIDGE_TOKEN_FILE"); bridgeFile != "" {
+			bridgeToken, bridgeErr := os.ReadFile(bridgeFile)
+			if bridgeErr != nil {
+				log.Fatalf("read bridge token: %v", bridgeErr)
+			}
+			bridge := strings.TrimSpace(string(bridgeToken))
+			if _, dup := tokens[bridge]; dup {
+				log.Fatal("the bridge token must differ from the hub token")
+			}
+			tokens[bridge] = api.Caller{Node: api.BridgeNode, User: "owner"}
+			log.Printf("discord bridge token enabled")
+		}
+		identity, err = server.TokenIdentities(tokens)
 		if err != nil {
 			log.Fatal(err)
 		}

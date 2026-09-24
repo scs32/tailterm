@@ -220,7 +220,12 @@ func (s *Store) BrokerEscalate(ctx context.Context, o BrokerObligation, level in
 		if level == 2 {
 			subject = fmt.Sprintf("Owner attention: %s is overdue on %s", who, obligationNoun(o.SourceKind))
 		}
-		if err := s.postBrokerNotice(ctx, tx, task, lead, subject, "Overdue obligation needs attention", text, obligationRefs(o)); err != nil {
+		refs := obligationRefs(o)
+		refs["escalation"] = "lead"
+		if level == 2 {
+			refs["escalation"] = "owner"
+		}
+		if err := s.postBrokerNotice(ctx, tx, task, lead, subject, "Overdue obligation needs attention", text, refs); err != nil {
 			return err
 		}
 		_, err := tx.ExecContext(ctx, `UPDATE obligations SET escalation=?,escalated_at=? WHERE id=?`, level, ts(now), o.ID)
@@ -274,7 +279,7 @@ func (s *Store) BrokerProjectStall(ctx context.Context, taskID string, lastChang
 		}
 		text := fmt.Sprintf("Overdue work has already gone to the owner and nothing has changed for %s. %d obligation(s) are overdue: %s. Run `tt obligations --overdue` for the full list.",
 			api.ObligationProjectStallQuiet, len(overdue), strings.Join(lines, "; "))
-		if err := s.postBrokerNotice(ctx, tx, task, api.Agent{}, "Project stalled: overdue work and no progress", "Project stalled: overdue work and no progress", text, map[string]string{"overdue": fmt.Sprint(len(overdue))}); err != nil {
+		if err := s.postBrokerNotice(ctx, tx, task, api.Agent{}, "Project stalled: overdue work and no progress", "Project stalled: overdue work and no progress", text, map[string]string{"overdue": fmt.Sprint(len(overdue)), "escalation": "stall"}); err != nil {
 			return err
 		}
 		_, err := tx.ExecContext(ctx, `UPDATE project_stalls SET notified_at=? WHERE task_id=?`, ts(now), taskID)

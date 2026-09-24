@@ -107,3 +107,21 @@ type WakeJobReport struct {
 	Status     string `json:"status"` // accepted, failed, ambiguous
 	Detail     string `json:"detail,omitempty"`
 }
+
+// ObligationNudgeResult is the owner's immediate re-wake of an obligation's
+// recipient, outside the broker's retry schedule (broker phase 2b).
+type ObligationNudgeResult struct {
+	Obligation Obligation `json:"obligation"`
+	WakeJobID  string     `json:"wakeJobId"`
+}
+
+// ObligationNudgeInterval is the minimum time between owner nudges of one obligation.
+const ObligationNudgeInterval = 2 * time.Minute
+
+// ErrNudgeTooSoon means the obligation was nudged by the owner less than
+// ObligationNudgeInterval ago; RetryAfter says when it may be nudged again.
+type ErrNudgeTooSoon struct{ RetryAfter time.Duration }
+
+func (e *ErrNudgeTooSoon) Error() string {
+	return "this obligation was nudged recently; try again in " + e.RetryAfter.Round(time.Second).String()
+}

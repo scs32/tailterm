@@ -229,6 +229,7 @@ type Message struct {
 	To               string              `json:"to,omitempty"`
 	Text             string              `json:"text"`
 	Envelope         *Envelope           `json:"envelope,omitempty"`
+	Source           *MessageSource      `json:"source,omitempty"`
 	CreatedAt        time.Time           `json:"createdAt"`
 }
 
@@ -295,6 +296,9 @@ type PostMessageRequest struct {
 	Text             string            `json:"text"`
 	To               string            `json:"to"`
 	AgentID          string            `json:"agentId"`
+	// Source records where a bridged human message came from. Only the
+	// Discord bridge credential may set it (broker phase 2b).
+	Source *MessageSource `json:"source,omitempty"`
 }
 
 type MarkReadRequest struct {

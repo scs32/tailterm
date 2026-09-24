@@ -878,6 +878,10 @@ func (s *Store) PostMessage(ctx context.Context, taskID string, req api.PostMess
 	if !api.ValidID(taskID, "tsk") || validateMessageRequestShape(req) != nil {
 		return api.Message{}, api.ErrInvalid
 	}
+	// A bridged message is always a human's, never an agent's.
+	if req.Source != nil && (req.AgentID != "" || req.RunID != "" || !api.ValidMessageSource(*req.Source)) {
+		return api.Message{}, api.ErrInvalid
+	}
 	payload := ""
 	if req.RequestID != "" {
 		payload = requestHash(req)
@@ -942,6 +946,9 @@ func (s *Store) PostMessage(ctx context.Context, taskID string, req api.PostMess
 	}
 	m, err := s.insertMessage(ctx, tx, t, req, target, by, false, false)
 	if err != nil {
+		return m, err
+	}
+	if err = insertMessageSource(ctx, tx, &m, req.Source); err != nil {
 		return m, err
 	}
 	// Broker phase 2a: only posts through this public endpoint create or settle

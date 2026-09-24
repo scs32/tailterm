@@ -64,6 +64,7 @@ func New(st *store.Store, identity Identity) *Server {
 	m.HandleFunc("POST /v1/tasks/{id}/messages/{seq}/ack", s.obligationAction("ack"))
 	m.HandleFunc("POST /v1/tasks/{id}/messages/{seq}/progress", s.obligationAction("progress"))
 	m.HandleFunc("POST /v1/tasks/{id}/obligations/{oid}/reassign", s.reassignObligation)
+	m.HandleFunc("POST /v1/tasks/{id}/obligations/{oid}/nudge", s.nudgeObligation)
 	m.HandleFunc("POST /v1/tasks/{id}/agents/{aid}/wake-jobs/lease", s.leaseWakeJob)
 	m.HandleFunc("POST /v1/tasks/{id}/wake-jobs/{jid}/report", s.reportWakeJob)
 	m.HandleFunc("GET /v1/tasks/{id}/messages/receipts/{requestID}", s.getMessagePostReceipt)
@@ -130,6 +131,15 @@ func New(st *store.Store, identity Identity) *Server {
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "no-store")
 	w.Header().Set("X-Content-Type-Options", "nosniff")
+	// The Discord bridge credential reaches only its allowlisted routes.
+	if r.Header.Get("Authorization") == "" {
+		// Tailnet identity: no bearer token, so never the bridge.
+	} else if c, err := s.identity(r); err == nil && c.Node == api.BridgeNode {
+		if _, pattern := s.mux.Handler(r); !api.BridgeRoutes[pattern] {
+			writeError(w, http.StatusForbidden, "the bridge credential cannot use this route")
+			return
+		}
+	}
 	s.mux.ServeHTTP(w, r)
 }
 
@@ -623,6 +633,12 @@ func (s *Server) postMessage(w http.ResponseWriter, r *http.Request) {
 	if !decode(w, r, &req) {
 		return
 	}
+	// Only the bridge records a Discord source, and the bridge only ever
+	// speaks for the owner, never as an agent.
+	if (req.Source != nil) != (c.Node == api.BridgeNode) || (c.Node == api.BridgeNode && (req.AgentID != "" || req.RunID != "")) {
+		writeError(w, http.StatusBadRequest, "a message source is required from the bridge and allowed only from the bridge")
+		return
+	}
 	m, err := s.store.PostMessage(r.Context(), id, req, c)
 	if err != nil {
 		fail(w, err)
@@ -776,12 +792,40 @@ func (s *Server) reassignObligation(w http.ResponseWriter, r *http.Request) {
 	if !decode(w, r, &req) {
 		return
 	}
+	if c.Node == api.BridgeNode && (req.ActorAgentID != "" || req.ActorRunID != "") {
+		writeError(w, http.StatusBadRequest, "the bridge reassigns as the owner, never as an agent")
+		return
+	}
 	m, err := s.store.ReassignObligation(r.Context(), id, r.PathValue("oid"), req, c)
 	if err != nil {
 		fail(w, err)
 		return
 	}
 	writeJSON(w, 201, m)
+}
+
+// nudgeObligation is the owner's immediate re-wake (broker phase 2b).
+func (s *Server) nudgeObligation(w http.ResponseWriter, r *http.Request) {
+	c, ok := s.writer(w, r)
+	if !ok {
+		return
+	}
+	id, ok := taskID(w, r)
+	if !ok {
+		return
+	}
+	result, err := s.store.NudgeObligation(r.Context(), id, r.PathValue("oid"), c)
+	var tooSoon *api.ErrNudgeTooSoon
+	if errors.As(err, &tooSoon) {
+		w.Header().Set("Retry-After", strconv.Itoa(int(tooSoon.RetryAfter.Seconds())+1))
+		writeJSON(w, http.StatusTooManyRequests, api.ErrorResponse{Error: tooSoon.Error(), Code: "nudge-too-soon"})
+		return
+	}
+	if err != nil {
+		fail(w, err)
+		return
+	}
+	writeJSON(w, http.StatusCreated, result)
 }
 
 // listMessageChecks pages broker phase-1 shadow checks (docs/broker-phase-1.md).

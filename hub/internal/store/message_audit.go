@@ -15,13 +15,15 @@ COALESCE(l.work_order_task_id,''),COALESCE(l.work_order_message_seq,0),
 COALESCE(r.receipt_id,''),COALESCE(r.request_id,''),COALESCE(r.task_id,''),COALESCE(r.message_seq,0),COALESCE(r.created_at,''),
 COALESCE(dr.question,''),COALESCE(dr.options,''),COALESCE(dr.recommended_option_id,''),COALESCE(dr.recommendation_reason,''),
 COALESCE(da.request_seq,0),COALESCE(da.option_id,''),COALESCE(da.text,''),
-COALESCE(m.system_notice_kind,''),COALESCE(m.system_notice_id,''),m.envelope`
+COALESCE(m.system_notice_kind,''),COALESCE(m.system_notice_id,''),m.envelope,
+COALESCE(ms.kind,''),COALESCE(ms.source_id,''),COALESCE(ms.user_id,'')`
 
 const messageSelectJoins = `
 LEFT JOIN message_work_item_links l ON l.message_seq=m.seq
 LEFT JOIN message_post_requests r ON r.message_seq=m.seq
 LEFT JOIN decision_requests dr ON dr.message_seq=m.seq
-LEFT JOIN decision_answers da ON da.message_seq=m.seq`
+LEFT JOIN decision_answers da ON da.message_seq=m.seq
+LEFT JOIN message_sources ms ON ms.message_seq=m.seq`
 
 type rowScanner interface {
 	Scan(...any) error
@@ -36,6 +38,7 @@ func scanMessage(row rowScanner) (api.Message, error) {
 	var decisionOptions string
 	var decisionAnswer api.DecisionAnswer
 	var systemNoticeKind, systemNoticeID, envelope string
+	var source api.MessageSource
 	var itemRevision, orderSeq int64
 	err := row.Scan(
 		&message.Seq, &message.TaskID,
@@ -47,6 +50,7 @@ func scanMessage(row rowScanner) (api.Message, error) {
 		&decisionRequest.Question, &decisionOptions, &decisionRequest.RecommendedOptionID, &decisionRequest.RecommendationReason,
 		&decisionAnswer.RequestSeq, &decisionAnswer.OptionID, &decisionAnswer.Text,
 		&systemNoticeKind, &systemNoticeID, &envelope,
+		&source.Kind, &source.ID, &source.UserID,
 	)
 	if err != nil {
 		return message, err
@@ -78,6 +82,9 @@ func scanMessage(row rowScanner) (api.Message, error) {
 	}
 	if systemNoticeKind != "" {
 		message.SystemNotice = &api.SystemNotice{Kind: systemNoticeKind, ID: systemNoticeID}
+	}
+	if source.Kind != "" {
+		message.Source = &source
 	}
 	if envelope != "" {
 		message.Envelope = &api.Envelope{}
