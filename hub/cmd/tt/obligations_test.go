@@ -337,3 +337,53 @@ func TestAckResumesABlockLater(t *testing.T) {
 		t.Fatalf("a later ack did not resume the block: %+v", o)
 	}
 }
+
+// Production incident on the Mini (phase 2a relay): leasing for every binding
+// every pass saturated the write limiter. The relay must not lease for paused
+// projects or stale/offline runs, and must space checks per binding.
+func TestRelayLeasesOnlyForLiveBindingsAndSpacesChecks(t *testing.T) {
+	var leases int
+	st, err := store.Open(filepath.Join(t.TempDir(), "hub.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { st.Close() })
+	by := api.Caller{Node: "cli-test", User: "owner"}
+	ctx := context.Background()
+	task, _ := st.CreateTask(ctx, api.CreateTaskRequest{Name: "P", Orchestrator: "lead"}, by)
+	agent, _ := st.AddAgent(ctx, task.ID, api.AddAgentRequest{Name: "worker", Host: "h", Session: "w", Runtime: "codex"}, by)
+	inner := server.New(st, func(*http.Request) (api.Caller, error) { return by, nil })
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/wake-jobs/lease") {
+			leases++
+		}
+		inner.ServeHTTP(w, r)
+	}))
+	t.Cleanup(srv.Close)
+	c, _ := api.NewClient(srv.URL, 0)
+	b := runtimeBinding{Hub: srv.URL, Task: task.ID, Agent: agent.ID, Run: agent.RunID, Thread: "00000000-0000-0000-0000-000000000000", Codex: "codex"}
+	queue := func(context.Context, runtimeBinding, string) error { return nil }
+	now := time.Now()
+
+	// Offline (no heartbeat): no lease request at all.
+	if _, err := relayWakeJob(ctx, b, &relayProgress{}, c, now, queue); err != nil || leases != 0 {
+		t.Fatalf("offline binding leased: err %v leases %d", err, leases)
+	}
+	// A stale run: no lease request.
+	stale := b
+	stale.Run = "run_0000000000000000"
+	if _, err := st.PostEvent(ctx, task.ID, api.PostEventRequest{Kind: api.EventHeartbeat, AgentID: agent.ID, RunID: agent.RunID}, by); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := relayWakeJob(ctx, stale, &relayProgress{}, c, now, queue); err != nil || leases != 0 {
+		t.Fatalf("stale binding leased: err %v leases %d", err, leases)
+	}
+	// A live binding leases once, then not again within the check spacing.
+	p := &relayProgress{}
+	if _, err := relayWakeJob(ctx, b, p, c, now, queue); err != nil || leases != 1 {
+		t.Fatalf("live binding: err %v leases %d", err, leases)
+	}
+	if _, err := relayWakeJob(ctx, b, p, c, now.Add(3*time.Second), queue); err != nil || leases != 1 {
+		t.Fatalf("lease check was not spaced: leases %d", leases)
+	}
+}

@@ -48,6 +48,7 @@ type relayProgress struct {
 	Error                        string                                  `json:"error,omitempty"`
 	BrokerWakes                  bool                                    `json:"brokerWakes,omitempty"`
 	LastBrokerWake               time.Time                               `json:"lastBrokerWake,omitempty"`
+	NextBrokerCheck              time.Time                               `json:"nextBrokerCheck,omitempty"`
 }
 
 func relayDir() string {
@@ -356,8 +357,21 @@ var brokerCoveredKind = map[string]bool{
 }
 
 func relayWakeJob(ctx context.Context, b runtimeBinding, p *relayProgress, c *api.Client, now time.Time, queue func(context.Context, runtimeBinding, string) error) (bool, error) {
-	// Space broker wakes so the follow-through and inbox paths always get turns.
-	if now.Sub(p.LastBrokerWake) < 15*time.Second {
+	// Space broker wakes so the follow-through and inbox paths always get turns,
+	// and check each binding for due wakes at most every 10 seconds: a lease is
+	// a write, and a host can hold many bindings.
+	if now.Sub(p.LastBrokerWake) < 15*time.Second || now.Before(p.NextBrokerCheck) {
+		return false, nil
+	}
+	p.NextBrokerCheck = now.Add(10 * time.Second)
+	// Only live bindings lease: an active project and this exact run, online and
+	// not retired. These are the same reads the inbox path makes.
+	if active, err := relayProjectActive(ctx, c, b); err != nil || !active {
+		return false, err
+	}
+	if a, err := c.GetAgent(ctx, b.Task, b.Agent); err != nil {
+		return false, err
+	} else if a.RunID != b.Run || a.Status == api.AgentClosed || a.Status == api.AgentExited || a.Status == api.AgentRetired || !a.Online {
 		return false, nil
 	}
 	job, err := c.LeaseWakeJob(ctx, b.Task, b.Agent, b.Run)
@@ -368,6 +382,10 @@ func relayWakeJob(ctx context.Context, b runtimeBinding, p *relayProgress, c *ap
 	}
 	if errors.As(err, &httpErr) && httpErr.Status == http.StatusConflict {
 		return false, nil // this binding's run is no longer current
+	}
+	if errors.As(err, &httpErr) && httpErr.Status == http.StatusTooManyRequests {
+		p.NextBrokerCheck = now.Add(time.Minute) // back off; never compete with agents' writes
+		return false, nil
 	}
 	if err != nil {
 		return false, err

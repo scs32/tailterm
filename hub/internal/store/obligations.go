@@ -532,6 +532,15 @@ func reassignedEnvelope(original api.Message, toName string, seq int64) *api.Env
 // run. Other due wakes for the same agent are merged into it, because the
 // prompt lists everything the agent owes. An expired lease can be taken again.
 func (s *Store) LeaseWakeJob(ctx context.Context, taskID, agentID, runID string, now time.Time) (*api.WakeJob, error) {
+	// Most checks find nothing due; answer those without taking the write lock.
+	var due int
+	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM wake_jobs WHERE task_id=? AND agent_id=? AND ((state=? AND due_at<=?) OR (state=? AND lease_expires_at<?))`,
+		taskID, agentID, wakePending, ts(now), wakeLeased, ts(now)).Scan(&due); err != nil {
+		return nil, err
+	}
+	if due == 0 {
+		return nil, nil
+	}
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
 	tx, err := s.db.BeginTx(ctx, nil)
