@@ -9,6 +9,8 @@ Owns: see "Ownership"
 Acceptance: c1–c16 below
 ```
 
+Hub record: Feature `wi_6329a9f143468664`, owner intake #8960, work-order message #8961.
+
 Status: not started. Written September 24, 2026 after phases 1, 2a and 2b were released,
 and after the first shadow-week item ran through a Planned delivery team.
 
