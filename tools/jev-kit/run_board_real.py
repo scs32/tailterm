@@ -12,11 +12,12 @@ from typesafe_sdk import Choice, Noul, TypeSafeClient
 from run_jev import load_key
 
 HERE = pathlib.Path(__file__).parent
-# Same scanner as hub/internal/jev Redact: standalone tokens, then each
-# "key: value" credential value up to its closing quote, a newline, a comma,
-# a closing brace or the next credential key.
-TOKEN = re.compile(r"sk-[A-Za-z0-9_-]{16,}|gh[pousr]_[A-Za-z0-9]{20,}|tskey-[A-Za-z0-9-]{10,}|(?i:bearer)\s+[A-Za-z0-9._~+/=-]{16,}")
-CRED_KEY = re.compile(r"""(?i)["']?\b(?:token|secret|password|passwd|api[_-]?key|access[_-]?key|client[_-]?secret)\b["']?\s*[:=]\s*""")
+# Same scanner as hub/internal/jev Redact; hub/internal/jev/testdata/redact_corpus.json
+# holds the shared expected outputs (check with check_redact.py). ASCII
+# matching keeps \b and \s identical to Go's regexp.
+TOKEN = re.compile(r"sk-[A-Za-z0-9_-]{16,}|gh[pousr]_[A-Za-z0-9]{20,}|tskey-[A-Za-z0-9-]{10,}", re.ASCII)
+BEARER = re.compile(r"(?i:bearer)\s+([A-Za-z0-9._~+/=-]{8,})", re.ASCII)
+CRED_KEY = re.compile(r"""(?i)["']?\b(?:token|secret|password|passwd|api[_-]?key|access[_-]?key|client[_-]?secret|authorization)\b["']?\s*[:=]\s*""", re.ASCII)
 
 
 def _value_end(s, i, limit):
@@ -28,22 +29,26 @@ def _value_end(s, i, limit):
                 continue
             if s[j] == q:
                 return j + 1
-            if s[j] == "\n":
-                return j
             j += 1
         return len(s)
     j = i
-    while j < len(s) and j < limit and s[j] not in "\n,}":
+    while j < len(s) and j < limit and s[j] != "\n":
         j += 1
     return j
 
 
+def _bearer(m):
+    tok = m.group(1)
+    return "[REDACTED]" if len(tok) >= 16 or any(c in "0123456789._~+/=-" for c in tok) else m.group(0)
+
+
 def redact(s):
     s = TOKEN.sub("[REDACTED]", s)
+    s = BEARER.sub(_bearer, s)
     keys = [(m.start(), m.end()) for m in CRED_KEY.finditer(s)]
     out, last = [], 0
     for n, (start, end) in enumerate(keys):
-        if start < last:
+        if end <= last:
             continue
         limit = keys[n + 1][0] if n + 1 < len(keys) else len(s)
         out.append(s[last:end] + "[REDACTED]")

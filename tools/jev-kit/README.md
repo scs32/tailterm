@@ -42,6 +42,7 @@ python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 .venv/bin/python run_jev.py --models        # check the key works
 .venv/bin/python run_jev.py [--model jev-preview] [--runs 3]
 .venv/bin/python run_board.py [--dry-run]   # two-layer board guardrail on board_samples.json
+.venv/bin/python check_redact.py            # redact() matches the hub's Go scanner (shared corpus)
 ```
 
 Only use the official `typesafe-sdk` package; `typesafe-ai` and `jev` on PyPI are third-party.

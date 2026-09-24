@@ -28,16 +28,27 @@ const (
 
 // Secret-looking strings are replaced before any text leaves the hub.
 // Standalone tokens are matched directly. For "key: value" credentials a small
-// scanner redacts each value up to its closing quote, a newline, a comma, a
-// closing brace or the next credential key, so adjacent credentials are each
-// redacted. tools/jev-kit/run_board_real.py mirrors this.
+// scanner redacts each value: a quoted value up to its closing quote (across
+// lines; to the end if unterminated), an unquoted value up to the end of the
+// line or the next credential key. It errs toward redacting too much.
+// tools/jev-kit/run_board_real.py mirrors this; testdata/redact_corpus.json
+// holds the shared expected outputs.
 var (
-	tokenPattern  = regexp.MustCompile(`sk-[A-Za-z0-9_-]{16,}|gh[pousr]_[A-Za-z0-9]{20,}|tskey-[A-Za-z0-9-]{10,}|(?i:bearer)\s+[A-Za-z0-9._~+/=-]{16,}`)
-	credentialKey = regexp.MustCompile(`(?i)["']?\b(?:token|secret|password|passwd|api[_-]?key|access[_-]?key|client[_-]?secret)\b["']?\s*[:=]\s*`)
+	tokenPattern  = regexp.MustCompile(`sk-[A-Za-z0-9_-]{16,}|gh[pousr]_[A-Za-z0-9]{20,}|tskey-[A-Za-z0-9-]{10,}`)
+	bearerPattern = regexp.MustCompile(`(?i:bearer)\s+([A-Za-z0-9._~+/=-]{8,})`)
+	credentialKey = regexp.MustCompile(`(?i)["']?\b(?:token|secret|password|passwd|api[_-]?key|access[_-]?key|client[_-]?secret|authorization)\b["']?\s*[:=]\s*`)
 )
 
 func Redact(s string) string {
 	s = tokenPattern.ReplaceAllString(s, "[REDACTED]")
+	s = bearerPattern.ReplaceAllStringFunc(s, func(m string) string {
+		// "bearer authentication" is prose; a token has digits or symbols, or length.
+		tok := bearerPattern.FindStringSubmatch(m)[1]
+		if len(tok) >= 16 || strings.ContainsAny(tok, "0123456789._~+/=-") {
+			return "[REDACTED]"
+		}
+		return m
+	})
 	keys := credentialKey.FindAllStringIndex(s, -1)
 	if len(keys) == 0 {
 		return s
@@ -45,9 +56,11 @@ func Redact(s string) string {
 	var b strings.Builder
 	last := 0
 	for i, k := range keys {
-		if k[0] < last {
-			continue // inside a value already redacted
+		if k[1] <= last {
+			continue // entirely inside a value already redacted
 		}
+		// A key's optional opening quote can overlap the previous value's
+		// closing quote, so write from the end of that value, not the key start.
 		limit := len(s)
 		if i+1 < len(keys) {
 			limit = keys[i+1][0]
@@ -65,19 +78,16 @@ func credentialValueEnd(s string, i, limit int) int {
 	if i < len(s) && (s[i] == '"' || s[i] == '\'') {
 		q := s[i]
 		for j := i + 1; j < len(s); j++ {
-			switch s[j] {
-			case '\\':
+			if s[j] == '\\' {
 				j++
-			case q:
+			} else if s[j] == q {
 				return j + 1
-			case '\n':
-				return j
 			}
 		}
 		return len(s)
 	}
 	for j := i; j < len(s); j++ {
-		if j >= limit || s[j] == '\n' || s[j] == ',' || s[j] == '}' {
+		if j >= limit || s[j] == '\n' {
 			return j
 		}
 	}

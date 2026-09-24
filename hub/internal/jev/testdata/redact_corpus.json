@@ -1,0 +1,106 @@
+[
+ {
+  "in": "password=firstsecret123 api_key=\"secondsecret456\"",
+  "out": "password=[REDACTED]api_key=[REDACTED]"
+ },
+ {
+  "in": "password=\"firstsecret123\"api_key=\"secondsecret456\"",
+  "out": "password=[REDACTED]api_key=[REDACTED]"
+ },
+ {
+  "in": "{\"user\":\"x\",\"password\":\"s3cr3t value\",\"token\":\"t0k3nvalue\"}",
+  "out": "{\"user\":\"x\",\"password\":[REDACTED],\"token\":[REDACTED]}"
+ },
+ {
+  "in": "password: a b c, token: d e f",
+  "out": "password: [REDACTED]token: [REDACTED]"
+ },
+ {
+  "in": "\"password\":\"pa\\\"ss secret\" then keep",
+  "out": "\"password\":[REDACTED] then keep"
+ },
+ {
+  "in": "api_key: 'two words syntheticsecret123'",
+  "out": "api_key: [REDACTED]"
+ },
+ {
+  "in": "{\"password\":\"my token: inner9secret\"} keep",
+  "out": "{\"password\":[REDACTED]} keep"
+ },
+ {
+  "in": "password=\"firstsecret123\nsecondsecret456\" keep",
+  "out": "password=[REDACTED] keep"
+ },
+ {
+  "in": "password=\"unterminated secret",
+  "out": "password=[REDACTED]"
+ },
+ {
+  "in": "password=firstsecret123;secondsecret456",
+  "out": "password=[REDACTED]"
+ },
+ {
+  "in": "password=firstsecret123,secondsecret456",
+  "out": "password=[REDACTED]"
+ },
+ {
+  "in": "password=firstsecret123}secondsecret456",
+  "out": "password=[REDACTED]"
+ },
+ {
+  "in": "{password:long secret phrase here}",
+  "out": "{password:[REDACTED]"
+ },
+ {
+  "in": "export API_KEY=abcdefgh1234\nkeep this line",
+  "out": "export API_KEY=[REDACTED]\nkeep this line"
+ },
+ {
+  "in": "password: short\nkeep this line",
+  "out": "password: [REDACTED]\nkeep this line"
+ },
+ {
+  "in": "Authorization: Bearer abcdef123456",
+  "out": "Authorization: [REDACTED]"
+ },
+ {
+  "in": "Authorization: Bearer abcdef123456 api_key=x9secret",
+  "out": "Authorization: [REDACTED]api_key=[REDACTED]"
+ },
+ {
+  "in": "curl -H \"Bearer abcdef123456\" host",
+  "out": "curl -H \"[REDACTED]\" host"
+ },
+ {
+  "in": "use sk-abcdefghijklmnopqrstuvwxyz0123 now",
+  "out": "use [REDACTED] now"
+ },
+ {
+  "in": "ghp_abcdefghijklmnopqrstuvwxyz0123456789 ok",
+  "out": "[REDACTED] ok"
+ },
+ {
+  "in": "tskey-auth-abcdefghij12 ok",
+  "out": "[REDACTED] ok"
+ },
+ {
+  "in": "épassword=firstsecret123",
+  "out": "épassword=[REDACTED]"
+ },
+ {
+  "in": "the token budget is 64k",
+  "out": "the token budget is 64k"
+ },
+ {
+  "in": "TOKEN_BUDGET=5 is fine",
+  "out": "TOKEN_BUDGET=5 is fine"
+ },
+ {
+  "in": "password rotation policy applies",
+  "out": "password rotation policy applies"
+ },
+ {
+  "in": "we use bearer authentication here",
+  "out": "we use bearer authentication here"
+ }
+]

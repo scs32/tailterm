@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -324,6 +325,24 @@ func TestRedactAdversarialCases(t *testing.T) {
 	for _, prose := range []string{"the token budget is 64k", "password rotation policy applies", "TOKEN_BUDGET=5 is fine"} {
 		if got := Redact(prose); got != prose {
 			t.Errorf("over-redacted %q -> %q", prose, got)
+		}
+	}
+}
+
+// testdata/redact_corpus.json is shared with tools/jev-kit/check_redact.py, so
+// the Go scanner and the kit's Python mirror must produce identical output.
+func TestRedactCorpus(t *testing.T) {
+	raw, err := os.ReadFile("testdata/redact_corpus.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var corpus []struct{ In, Out string }
+	if err := json.Unmarshal(raw, &corpus); err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range corpus {
+		if got := Redact(c.In); got != c.Out {
+			t.Errorf("Redact(%q)\n got %q\nwant %q", c.In, got, c.Out)
 		}
 	}
 }
