@@ -104,6 +104,10 @@ Out of scope:
   - B: templates use BLOCK for waits;
   - C: Add team leaves the lead on the base name.
 - Launch-path gaps: a CLI-created project has no database handler.
+- **Item revision binding** (found September 24 on bug A): recording a wider file scope moved
+  the bug from revision 1 to 4. That froze every admitted worker at revision 1, and a
+  fresh builder and reviewer had to be launched. This needs a supported way to refresh a
+  worker's binding in place, which is a separate order on work-item admission.
 
 ## Design notes
 
