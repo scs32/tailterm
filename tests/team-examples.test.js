@@ -84,6 +84,29 @@ test("Planned delivery members post typed messages with tt send", () => {
   }
 });
 
+test("typed team prompts use notices for waits and self-blocks for dependencies", () => {
+  let typedPrompts = 0;
+  for (const team of TEAM_EXAMPLES)
+    for (const member of exampleTeam(team.id).members) {
+      if (!member.prompt.includes("BOARD MESSAGE FORMAT")) continue;
+      typedPrompts++;
+      assert.match(member.prompt, /Use NOTICE to tell someone to wait or share status/, `${team.id}/${member.name}`);
+      assert.match(member.prompt, /Use BLOCK only when you yourself are blocked; address it to whoever can unblock you, state what you need, and give the condition for resuming/, `${team.id}/${member.name}`);
+    }
+  assert.equal(typedPrompts, 5);
+});
+
+test("team prompts leave overdue escalation to the broker after one teammate nudge", () => {
+  for (const team of TEAM_EXAMPLES)
+    for (const member of exampleTeam(team.id).members)
+      assert.doesNotMatch(member.prompt, /(?:send|post|escalate).*to the owner with a BLOCK/i, `${team.id}/${member.name}`);
+
+  const lead = exampleTeam("planned").members.find((member) => member.name === "lead").prompt;
+  assert.match(lead, /without a reply for 30 minutes, send that teammate one nudge/);
+  assert.match(lead, /broker escalates overdue work itself/);
+  assert.match(lead, /do not send a message to escalate a teammate's stall to the owner/);
+});
+
 test("documented team prompts exactly include every generated template", () => {
   const documentation = readFileSync(
     new URL("../docs/team-examples.md", import.meta.url),
