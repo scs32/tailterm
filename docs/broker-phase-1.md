@@ -240,6 +240,11 @@ Deployment follows existing release practice. The owner approves each step.
    convention-valid for the week. Record any Jev noul whose rate of flags at or
    above 0.5 surprises the owner. That data sets phase-4 gate thresholds.
 
+**Merging to `main`:** squash the merge (owner decision, September 24, 2026).
+`29cc559` accidentally committed the 38 MB `hub/tailterm-hub` build output.
+`704a1d6` untracked and ignored it, but it stays in `tasks-hub` history, and a
+squash keeps it out of `main` without rewriting the public branch.
+
 ## Risks
 
 - **Envelope drift between `tt` and hub:** both import the same `api` package, and
