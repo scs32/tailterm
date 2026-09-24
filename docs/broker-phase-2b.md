@@ -12,7 +12,8 @@ Acceptance: d1–d16 below
 
 Hub record: Feature `wi_5a203621825434d1`, owner intake #8796, work-order message #8799.
 
-Status: built on tasks-hub, in review (not deployed). Written September 24, 2026 after the owner registered the bot.
+Status: released September 24, 2026 (hub and bridge at `d6d5155`, see
+[release evidence](releases/broker-phase2b-d6d5155/README.md)). Written September 24, 2026 after the owner registered the bot.
 It builds on phase 2a, which is released: obligations, timers, lead and owner
 escalation notices and the project-stall notice exist on the board today. Phase 2b
 delivers them to Discord and adds the first unstall controls. The rest of the
@@ -26,11 +27,14 @@ Done September 24, 2026:
   on, and the Presence and Server Members intents off.
 - **Server.** The bot is installed in the owner's private "Tailterm" server with the `bot`
   and `applications.commands` scopes.
-- **Permissions (`326417599568`).** View Channels, Send Messages, Send Messages in Threads,
-  Create Public Threads, Manage Threads, Read Message History, Embed Links, Add Reactions
-  and Manage Channels. It does not have Administrator or Manage Roles.
+- **Permissions (`2252126231284816`).** View Channels, Send Messages, Send Messages in Threads,
+  Create Public Threads, Manage Threads, Read Message History, Embed Links, Add Reactions,
+  Manage Channels and Pin Messages (added after the first live run, since pinning the status
+  card needs it). It does not have Administrator or Manage Roles.
 - **Token.** It is at `/mnt/deepfreeze/tailterm-hub/discord-token`, owned 950:950, mode 0400,
-  and no release mounts it yet. The Mini also has a copy at `~/.config/discord/token`.
+  mounted read-only into the bridge. The Mini also has a copy at `~/.config/discord/token`.
+  Only one process may connect with it at a time: every Gateway session receives every
+  interaction, so a second bridge races the first.
 - **Guild and owner IDs.** The owner holds them, and deployment configuration carries them.
   They stay out of this public repository.
 
