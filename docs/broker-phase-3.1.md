@@ -9,8 +9,9 @@ Owns: see "Ownership"
 Acceptance: k1–k11 below
 ```
 
-Status: not started. Written September 24, 2026, after the shadow week showed agents doing
-assigned work without ever acknowledging it.
+Status: built (`fc36cf0`), round-one fixes applied, in round-two review. Written
+September 24, 2026, after the shadow week showed agents doing assigned work without ever
+acknowledging it.
 
 Build: implemented directly in the owner's Claude Code session (an owner-approved exception;
 the gate changes how agents may post, so a team building it would work under the rules it is
@@ -97,6 +98,41 @@ Out of scope:
   promptly never sees the gate. An agent that ignores its assignment sees it on its next post.
 - **Old clients.** An old `tt` gets the `409` with its human-readable message, which is enough
   to act on.
+
+## As built
+
+- **Gate:** one hub query in the write transaction, with no row limit, so the refusal names
+  every gating message. Writes that replay a stored request are checked for replay before the
+  gate, so a retry after `tt ack` or of an already-committed write is never refused.
+- **Gated writes:** board posts, decision requests (`tt ask`), and work-item create, update,
+  update records and dispatch.
+- **Replies:**
+  - Any reply from the recipient's current run, typed or free text, acknowledges the
+    replied-to obligation in the same transaction and resets its nudges and escalation, as
+    `tt ack` does.
+  - The gate lets a reply through only when it answers one of the gating messages. A reply
+    to other work, while older work is unacknowledged, is refused with the list; acknowledge
+    first.
+  - A reply that names a stale run is refused. A reply with no run passes the gate but
+    acknowledges nothing.
+- **Turn end:** the stop hook blocks on unacknowledged work every time, including a continued
+  turn (`stop_hook_active`), since `tt ack` always clears it. Unread directed free text blocks
+  only once. A blocked stop does not report the agent done.
+- **Codex (k8):**
+  - codex-cli 0.156.1 reads Stop hooks from `$CODEX_HOME/hooks.json` and honours the
+    Claude-compatible `{"decision":"block","reason":...}`. It sends `stop_hook_active` on the
+    continued turn.
+  - It runs only hooks it trusts. Session-level hook config (`-c`) and a `bypass_hook_trust`
+    setting are ignored; only the `--dangerously-bypass-hook-trust` flag works.
+  - `tt hooks codex --install` merges the Stop hook into `hooks.json`. From then on, spawned
+    agents whose executable is `codex` get the bypass flag.
+  - The bypass trusts every hook in that file, and other Codex sessions on the host either
+    prompt for trust or skip the hook. `tt hook stop` does nothing outside a Tailterm
+    session. The live check runs a plain `codex exec` after installing.
+- **Metrics:** acknowledgement latency is measured from delivery (or from creation, for work
+  acknowledged straight from the queue). An even sample takes the mean of the middle two.
+- **Tests:** the `tt` suite drops inherited `TAILTERM_*` variables, so it gives the same
+  result when a Tailterm agent runs it.
 
 ## Ownership
 

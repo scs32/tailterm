@@ -60,7 +60,7 @@ func TestAckGateExemptionsAndImplicitAck(t *testing.T) {
 	f.s.now = func() time.Time { return start }
 	assign := f.assignTo(t, f.builder)
 	f.s.now = func() time.Time { return start.Add(10 * time.Minute) }
-	// People are never gated; a notice to the builder is delivery-only and never gates.
+	// People are never gated.
 	if _, err := f.post(t, api.PostMessageRequest{To: f.builder.ID, Text: "owner: how is it going"}); err != nil {
 		t.Fatalf("an owner post was gated: %v", err)
 	}
@@ -98,5 +98,60 @@ func TestAckGateIsPerRecipient(t *testing.T) {
 	var unacked *api.UnacknowledgedError
 	if _, err := f.s.CreateWorkItem(f.ctx, f.task.ID, api.CreateWorkItemRequest{Kind: "bug", Title: "Recorded after its own assignment", AgentID: f.handler.ID, RequestID: "wi-handler-2"}, f.by); !errors.As(err, &unacked) {
 		t.Fatalf("the handler's own unacknowledged work did not gate it: %v", err)
+	}
+}
+
+// Round-one R1-C1: the gate sees every unacknowledged obligation, so the
+// refusal names all of them and a reply to any one is let through.
+func TestAckGateSeesEveryObligation(t *testing.T) {
+	f := newPhase3Fixture(t)
+	start := time.Now().UTC()
+	f.s.now = func() time.Time { return start }
+	var seqs []int64
+	for i := 0; i < 11; i++ {
+		seqs = append(seqs, f.assignTo(t, f.builder).Seq)
+	}
+	f.s.now = func() time.Time { return start.Add(api.ObligationAckGrace + time.Second) }
+	var unacked *api.UnacknowledgedError
+	if _, err := f.post(t, notice(f.builder, "reporting early")); !errors.As(err, &unacked) || len(unacked.Items) != len(seqs) {
+		t.Fatalf("the refusal did not name all %d obligations: %v", len(seqs), err)
+	}
+	last := seqs[len(seqs)-1]
+	reply := api.PostMessageRequest{AgentID: f.builder.ID, RunID: f.builder.RunID, To: f.lead.ID, ReplyTo: last, Envelope: &api.Envelope{Kind: api.EnvelopeKindQuestion, To: "lead-1", Subject: "Which fixture should I use here", Body: api.EnvelopeBody{Question: "Static or live?"}}}
+	if _, err := f.post(t, reply); err != nil {
+		t.Fatalf("a reply to the eleventh obligation was refused: %v", err)
+	}
+	if o := f.obligationFor(t, last); o.State != api.ObligationAcknowledged {
+		t.Fatalf("the reply did not acknowledge the eleventh: %+v", o)
+	}
+}
+
+// Round-one B2 and the k2 delivery-only clause: a decision request is gated
+// like any board post (a stored one still replays), and delivery-only notices
+// never gate.
+func TestAckGateDecisionsAndDeliveryOnly(t *testing.T) {
+	f := newPhase3Fixture(t)
+	start := time.Now().UTC()
+	f.s.now = func() time.Time { return start }
+	early, err := f.s.CreateDecision(f.ctx, f.task.ID, decisionRequest(f.builder, "ask-early"), f.by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.post(t, api.PostMessageRequest{AgentID: f.lead.ID, RunID: f.lead.RunID, To: f.builder.ID, Envelope: &api.Envelope{Kind: api.EnvelopeKindNotice, To: f.builder.Name, Subject: "The fixture moved to tests/y.mjs", Body: api.EnvelopeBody{Text: "fyi"}}}); err != nil {
+		t.Fatal(err)
+	}
+	f.s.now = func() time.Time { return start.Add(10 * time.Minute) }
+	if _, err := f.post(t, notice(f.builder, "a delivery-only notice does not gate")); err != nil {
+		t.Fatalf("a delivery-only notice gated the builder: %v", err)
+	}
+	f.s.now = func() time.Time { return start.Add(10 * time.Minute) }
+	f.assignTo(t, f.builder)
+	f.s.now = func() time.Time { return start.Add(20 * time.Minute) }
+	var unacked *api.UnacknowledgedError
+	if _, err := f.s.CreateDecision(f.ctx, f.task.ID, decisionRequest(f.builder, "ask-gated"), f.by); !errors.As(err, &unacked) {
+		t.Fatalf("a decision request bypassed the gate: %v", err)
+	}
+	if replay, err := f.s.CreateDecision(f.ctx, f.task.ID, decisionRequest(f.builder, "ask-early"), f.by); err != nil || replay.Seq != early.Seq {
+		t.Fatalf("a stored decision request did not replay: %+v %v", replay, err)
 	}
 }

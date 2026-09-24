@@ -61,8 +61,14 @@ func TestObligationCommandsAndStopHook(t *testing.T) {
 	if out := hook(`{}`); !strings.Contains(out, `"block"`) || !strings.Contains(out, "unacknowledged") {
 		t.Fatalf("stop hook did not block on an unacknowledged obligation: %q", out)
 	}
-	if out := hook(`{"stop_hook_active":true}`); strings.Contains(out, "block") {
-		t.Fatalf("stop hook ignored stop_hook_active: %q", out)
+	// Round-one R1-C2: a continued turn (Codex and Claude send
+	// stop_hook_active) still cannot end with the work unacknowledged, and a
+	// blocked stop does not report the agent done.
+	if out := hook(`{"stop_hook_active":true}`); !strings.Contains(out, `"block"`) || !strings.Contains(out, "unacknowledged") {
+		t.Fatalf("continued stop ended the turn with unacknowledged work: %q", out)
+	}
+	if got, err := c.GetAgent(ctx, task.ID, e.agent); err != nil || got.Status == api.AgentDone {
+		t.Fatalf("blocked stop reported the agent done: %+v %v", got, err)
 	}
 	listed, err := captureCLIOutput(t, func() error { return cmdObligations(e, nil) })
 	if err != nil || !strings.Contains(listed, "Record the order for the builder") || !strings.Contains(listed, "delivered") {
@@ -88,6 +94,10 @@ func TestObligationCommandsAndStopHook(t *testing.T) {
 	}
 	if out := hook(`{}`); !strings.Contains(out, "addressed to you") {
 		t.Fatalf("directed free text did not block: %q", out)
+	}
+	// Unread free text blocks once; the continued turn may end.
+	if out := hook(`{"stop_hook_active":true}`); strings.Contains(out, "block") {
+		t.Fatalf("continued stop blocked on free text again: %q", out)
 	}
 	if out, err := captureCLIOutput(t, func() error {
 		return cmdObligationAction(e, "progress", []string{itoa(assign.Seq), "--text", "halfway"})

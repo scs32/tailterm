@@ -209,4 +209,11 @@ func TestSwarmWakePreservesOwnershipAndExcludesSelf(t *testing.T) {
 	if got := taskBriefing(task, "lead", ""); !strings.Contains(got, "MAIN ORCHESTRATOR") || strings.Contains(got, "tt post --to lead") {
 		t.Fatal(got)
 	}
+	// Phase 3.1 round one (B1): the briefing teaches tt ack and never says
+	// not to acknowledge.
+	for _, name := range []string{"worker", "lead"} {
+		if got := strings.ToLower(taskBriefing(task, name, "")); !strings.Contains(got, "tt ack seq") || strings.Contains(got, "not acknowledge") {
+			t.Fatalf("%s briefing: %s", name, got)
+		}
+	}
 }

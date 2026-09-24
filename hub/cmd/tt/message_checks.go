@@ -213,10 +213,12 @@ func topCounts(m map[string]int) []string {
 }
 
 // summarizeAcks reports how long agents take to acknowledge work (broker
-// phase 3.1): median and worst latency, and work still unacknowledged.
+// phase 3.1): median and worst latency from delivery to acknowledgement, and
+// work still unacknowledged.
 func summarizeAcks(list []api.Obligation, names map[string]string, cutoff, now time.Time) string {
 	var latencies []time.Duration
 	var worst api.Obligation
+	var worstD time.Duration
 	gating := 0
 	for _, o := range list {
 		if o.Needs == api.ObligationNeedsDelivery || o.CreatedAt.Before(cutoff) {
@@ -228,9 +230,9 @@ func summarizeAcks(list []api.Obligation, names map[string]string, cutoff, now t
 		if o.AckedAt == nil {
 			continue
 		}
-		d := o.AckedAt.Sub(o.CreatedAt)
-		if len(latencies) == 0 || d > worst.AckedAt.Sub(worst.CreatedAt) {
-			worst = o
+		d := ackLatency(o)
+		if len(latencies) == 0 || d > worstD {
+			worst, worstD = o, d
 		}
 		latencies = append(latencies, d)
 	}
@@ -241,11 +243,24 @@ func summarizeAcks(list []api.Obligation, names map[string]string, cutoff, now t
 	if len(latencies) > 0 {
 		sort.Slice(latencies, func(i, j int) bool { return latencies[i] < latencies[j] })
 		median := latencies[len(latencies)/2]
-		out = fmt.Sprintf("Acknowledgement: %d acknowledged, median %s, worst %s (#%d by %s)\n", len(latencies),
-			median.Round(time.Second), worst.AckedAt.Sub(worst.CreatedAt).Round(time.Second), worst.MessageSeq, or(names[worst.AgentID], worst.AgentID))
+		if len(latencies)%2 == 0 {
+			median = (latencies[len(latencies)/2-1] + median) / 2
+		}
+		out = fmt.Sprintf("Acknowledgement (from delivery): %d acknowledged, median %s, worst %s (#%d by %s)\n", len(latencies),
+			median.Round(time.Second), worstD.Round(time.Second), worst.MessageSeq, or(names[worst.AgentID], worst.AgentID))
 	}
 	if gating > 0 {
 		out += fmt.Sprintf("Unacknowledged past the %s grace: %d (their recipients' posts are refused)\n", api.ObligationAckGrace, gating)
 	}
 	return out
+}
+
+// ackLatency is the time from delivery to acknowledgement. Work acknowledged
+// straight from the queue counts from creation; it was never delivered first.
+func ackLatency(o api.Obligation) time.Duration {
+	from := o.CreatedAt
+	if o.DeliveredAt != nil && !o.DeliveredAt.After(*o.AckedAt) {
+		from = *o.DeliveredAt
+	}
+	return o.AckedAt.Sub(from)
 }

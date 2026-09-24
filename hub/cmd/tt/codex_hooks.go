@@ -26,17 +26,41 @@ func codexHome() string {
 	return filepath.Join(home, ".codex")
 }
 
-// codexStopHookInstalled reports whether hooks.json has the Tailterm Stop hook.
+// codexStopHookInstalled reports whether hooks.json has a Stop hook whose
+// command is a tt binary running `hook stop`.
 func codexStopHookInstalled() bool {
 	b, err := os.ReadFile(filepath.Join(codexHome(), "hooks.json"))
-	return err == nil && strings.Contains(string(b), adapters.CodexStopMarker)
+	if err != nil {
+		return false
+	}
+	var doc struct {
+		Hooks struct {
+			Stop []struct {
+				Hooks []struct {
+					Command string `json:"command"`
+				} `json:"hooks"`
+			} `json:"Stop"`
+		} `json:"hooks"`
+	}
+	if json.Unmarshal(b, &doc) != nil {
+		return false
+	}
+	for _, entry := range doc.Hooks.Stop {
+		for _, h := range entry.Hooks {
+			if fields := strings.Fields(h.Command); len(fields) == 3 && filepath.Base(fields[0]) == "tt" && fields[1]+" "+fields[2] == adapters.CodexStopMarker {
+				return true
+			}
+		}
+	}
+	return false
 }
 
-// codexHookCommand adds the trust bypass to a native Codex agent command, but
-// only when the Tailterm Stop hook is installed: the bypass then covers a
-// hook Tailterm put there.
+// codexHookCommand adds the trust bypass to a Codex agent command whose
+// executable is codex (by name or path), but only when the Tailterm Stop hook
+// is installed: the bypass then covers a hook Tailterm put there.
 func codexHookCommand(command, runtime, run string) string {
-	if runtime != "codex" || strings.TrimSpace(run) != "codex" || !codexStopHookInstalled() {
+	fields := strings.Fields(run)
+	if runtime != "codex" || len(fields) == 0 || filepath.Base(fields[0]) != "codex" || !codexStopHookInstalled() {
 		return command
 	}
 	return command + " " + spawn.ShellQuote("--dangerously-bypass-hook-trust")

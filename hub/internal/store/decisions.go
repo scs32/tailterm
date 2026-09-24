@@ -139,6 +139,11 @@ func (s *Store) CreateDecision(ctx context.Context, taskID string, req api.Creat
 	if replay, found, err := replayMessageRequest(tx, ctx, taskID, req.RequestID, req.AgentID, payload, by); found || err != nil {
 		return replay, err
 	}
+	// Broker phase 3.1 (round one B2): a decision request is an agent board
+	// post, so unacknowledged work gates it too.
+	if err := ackGate(ctx, tx, req.AgentID, "", 0, s.now()); err != nil {
+		return api.Message{}, err
+	}
 	task, err := decisionTask(tx, ctx, taskID)
 	if err != nil {
 		return api.Message{}, err

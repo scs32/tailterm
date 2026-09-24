@@ -20,9 +20,9 @@ func ackGate(ctx context.Context, q queryRower, agentID, runID string, replyTo i
 	if agentID == "" {
 		return nil // people and the hub are never gated
 	}
-	rows, err := q.QueryContext(ctx, `SELECT o.message_seq,o.subject,COALESCE(a.name,''),m.from_node,m.from_agent FROM obligations o
+	rows, err := q.QueryContext(ctx, `SELECT o.message_seq,o.subject,COALESCE(a.name,''),m.from_node,m.from_user FROM obligations o
 JOIN messages m ON m.seq=o.message_seq LEFT JOIN agents a ON a.id=m.from_agent
-WHERE o.agent_id=? AND o.state IN (?,?) AND o.needs IN (?,?) AND o.created_at<=? ORDER BY o.message_seq LIMIT 10`,
+WHERE o.agent_id=? AND o.state IN (?,?) AND o.needs IN (?,?) AND o.created_at<=? ORDER BY o.message_seq`,
 		agentID, api.ObligationQueued, api.ObligationDelivered, api.ObligationNeedsOutcome, api.ObligationNeedsAnswer, ts(now.Add(-api.ObligationAckGrace)))
 	if err != nil {
 		return err
@@ -31,8 +31,8 @@ WHERE o.agent_id=? AND o.state IN (?,?) AND o.needs IN (?,?) AND o.created_at<=?
 	var items []api.UnacknowledgedItem
 	for rows.Next() {
 		var it api.UnacknowledgedItem
-		var name, node, fromAgent string
-		if err := rows.Scan(&it.Seq, &it.Subject, &name, &node, &fromAgent); err != nil {
+		var name, node, user string
+		if err := rows.Scan(&it.Seq, &it.Subject, &name, &node, &user); err != nil {
 			return err
 		}
 		switch {
@@ -40,6 +40,8 @@ WHERE o.agent_id=? AND o.state IN (?,?) AND o.needs IN (?,?) AND o.created_at<=?
 			it.From = name
 		case node == api.BrokerNode:
 			it.From = "the broker"
+		case user != "" && user != "owner":
+			it.From = user
 		default:
 			it.From = "the owner"
 		}
@@ -78,9 +80,10 @@ func acknowledgeByReply(ctx context.Context, tx *sql.Tx, m api.Message, req api.
 		return nil // a stale run's reply acknowledges nothing
 	}
 	now := ts(m.CreatedAt)
-	if _, err := tx.ExecContext(ctx, `UPDATE obligations SET state=?,acked_at=?,delivered_at=CASE WHEN delivered_at='' THEN ? ELSE delivered_at END,changed_at=?
+	// The same reset as tt ack: activity clears nudges and escalation.
+	if _, err := tx.ExecContext(ctx, `UPDATE obligations SET state=?,acked_at=?,delivered_at=CASE WHEN delivered_at='' THEN ? ELSE delivered_at END,last_progress_at=?,reason='',escalation=0,escalated_at='',nudges=0,nudged_at='',changed_at=?
 WHERE task_id=? AND message_seq=? AND agent_id=? AND state IN (?,?) AND needs<>?`,
-		api.ObligationAcknowledged, now, now, now, m.TaskID, req.ReplyTo, req.AgentID, api.ObligationQueued, api.ObligationDelivered, api.ObligationNeedsDelivery); err != nil {
+		api.ObligationAcknowledged, now, now, now, now, m.TaskID, req.ReplyTo, req.AgentID, api.ObligationQueued, api.ObligationDelivered, api.ObligationNeedsDelivery); err != nil {
 		return err
 	}
 	_, err := tx.ExecContext(ctx, `UPDATE obligations SET state=?,outcome=?,acked_at=?,delivered_at=CASE WHEN delivered_at='' THEN ? ELSE delivered_at END,closed_at=?,changed_at=?

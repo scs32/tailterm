@@ -96,3 +96,13 @@ test("documented team prompts exactly include every generated template", () => {
         `missing exact ${team.id}/${member.name} prompt`,
       );
 });
+
+// Broker phase 3.1 round one (B1): every member is taught tt ack first, and
+// no prompt tells an agent not to acknowledge.
+test("every member prompt teaches tt ack and none says not to acknowledge", () => {
+  for (const team of TEAM_EXAMPLES)
+    for (const member of team.members) {
+      assert.match(member.prompt, /run tt ack SEQ before you start/, `${team.id}/${member.name}`);
+      assert.doesNotMatch(member.prompt, /do not acknowledge|acknowledge acknowledgements/i, `${team.id}/${member.name}`);
+    }
+});

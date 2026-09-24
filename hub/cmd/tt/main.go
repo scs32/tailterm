@@ -1408,19 +1408,24 @@ func cmdHook(e env, args []string) error {
 			fmt.Printf("[tailterm] %d unread task message(s): run `tt inbox --unread --mark-read`.\n", n)
 		}
 	case "stop":
-		quiet(api.EventDone, "")
-		active, _ := input["stop_hook_active"].(bool)
-		if active {
-			break
-		}
 		// Broker phase 2a: block turn end on unacknowledged obligations only;
-		// overdue outcomes escalate instead of holding the turn open.
+		// overdue outcomes escalate instead of holding the turn open. Phase
+		// 3.1: this holds on a continued turn too (stop_hook_active), since
+		// `tt ack` always clears it; otherwise the second stop would end the
+		// turn with the work still unacknowledged.
+		active, _ := input["stop_hook_active"].(bool)
 		if n, seqs := unackedObligations(e); n > 0 {
 			printJSON(map[string]any{"decision": "block", "reason": fmt.Sprintf("You have %d unacknowledged tailterm obligation(s): %s. Run `tt obligations`, acknowledge with `tt ack SEQ`, then act and reply with `tt send --reply-to SEQ`.", n, seqs)})
-		} else if n := unreadDirectedFreeText(e); n > 0 {
-			// Only directed free text blocks; board-wide chatter never traps an agent.
-			printJSON(map[string]any{"decision": "block", "reason": fmt.Sprintf("You have %d unread tailterm message(s) addressed to you. Run `tt inbox --unread --mark-read`, act on them, and reply if needed.", n)})
+			break
 		}
+		if !active {
+			if n := unreadDirectedFreeText(e); n > 0 {
+				// Only directed free text blocks; board-wide chatter never traps an agent.
+				printJSON(map[string]any{"decision": "block", "reason": fmt.Sprintf("You have %d unread tailterm message(s) addressed to you. Run `tt inbox --unread --mark-read`, act on them, and reply if needed.", n)})
+				break
+			}
+		}
+		quiet(api.EventDone, "")
 	case "notification":
 		kind, _ := input["notification_type"].(string)
 		msg, _ := input["message"].(string)

@@ -226,10 +226,6 @@ func (s *Store) CreateWorkItem(ctx context.Context, taskID string, req api.Creat
 		return api.WorkItem{}, err
 	}
 	defer tx.Rollback()
-	// Broker phase 3.1: an agent holding unacknowledged work is refused.
-	if err := ackGate(ctx, tx, req.AgentID, "", 0, s.now()); err != nil {
-		return api.WorkItem{}, err
-	}
 	task, err := scanTask(tx.QueryRowContext(ctx, `SELECT `+taskCols+` FROM tasks WHERE id=?`, taskID))
 	if errors.Is(err, sql.ErrNoRows) {
 		return api.WorkItem{}, api.ErrNotFound
@@ -250,6 +246,11 @@ func (s *Store) CreateWorkItem(ctx context.Context, taskID string, req api.Creat
 		return item, err
 	}
 	if err != sql.ErrNoRows {
+		return api.WorkItem{}, err
+	}
+	// Broker phase 3.1: an agent holding unacknowledged work is refused; a
+	// retried request that already committed replays above.
+	if err := ackGate(ctx, tx, req.AgentID, "", 0, s.now()); err != nil {
 		return api.WorkItem{}, err
 	}
 	if task.Status != api.TaskOpen {
@@ -507,10 +508,6 @@ func (s *Store) CreateWorkItemUpdate(ctx context.Context, taskID, itemID string,
 		return api.WorkItemUpdateResult{}, false, err
 	}
 	defer tx.Rollback()
-	// Broker phase 3.1: an agent holding unacknowledged work is refused.
-	if err := ackGate(ctx, tx, req.AgentID, req.RunID, 0, s.now()); err != nil {
-		return api.WorkItemUpdateResult{}, false, err
-	}
 	receipt, priorHash, receiptErr := findAnyWorkItemUpdateReceipt(tx, ctx, taskID, req.RequestID, req.AgentID, by)
 	if receiptErr == nil {
 		if priorHash != payload {
@@ -521,6 +518,10 @@ func (s *Store) CreateWorkItemUpdate(ctx context.Context, taskID, itemID string,
 	}
 	if !errors.Is(receiptErr, api.ErrNotFound) {
 		return api.WorkItemUpdateResult{}, false, receiptErr
+	}
+	// Broker phase 3.1: gated after the replay, like PostMessage.
+	if err := ackGate(ctx, tx, req.AgentID, req.RunID, 0, s.now()); err != nil {
+		return api.WorkItemUpdateResult{}, false, err
 	}
 	task, err := scanTask(tx.QueryRowContext(ctx, `SELECT `+taskCols+` FROM tasks WHERE id=?`, taskID))
 	if errors.Is(err, sql.ErrNoRows) {
@@ -674,10 +675,6 @@ func (s *Store) DispatchWorkItem(ctx context.Context, taskID, itemID string, req
 		return api.WorkItemDispatchResult{}, err
 	}
 	defer tx.Rollback()
-	// Broker phase 3.1: an agent holding unacknowledged work is refused.
-	if err := ackGate(ctx, tx, req.AgentID, "", 0, s.now()); err != nil {
-		return api.WorkItemDispatchResult{}, err
-	}
 	item, err := getWorkItem(tx, ctx, taskID, itemID)
 	if err != nil {
 		return api.WorkItemDispatchResult{}, err
@@ -701,6 +698,10 @@ func (s *Store) DispatchWorkItem(ctx context.Context, taskID, itemID string, req
 		return api.WorkItemDispatchResult{Item: item, Dispatch: dispatch, Queue: &queueReceipt}, nil
 	}
 	if err != sql.ErrNoRows {
+		return api.WorkItemDispatchResult{}, err
+	}
+	// Broker phase 3.1: gated after the replay, like PostMessage.
+	if err := ackGate(ctx, tx, req.AgentID, "", 0, s.now()); err != nil {
 		return api.WorkItemDispatchResult{}, err
 	}
 	if item.Revision != req.Revision {
