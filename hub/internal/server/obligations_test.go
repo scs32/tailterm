@@ -135,7 +135,7 @@ func TestTypedRepliesCloseObligations(t *testing.T) {
 	// The lead replying does not close the builder's obligation.
 	f.post(t, api.PostMessageRequest{AgentID: f.lead.ID, To: f.builder.ID, ReplyTo: assign.Seq, Envelope: &api.Envelope{Kind: "notice", To: "builder", Subject: "Adding context to the assignment", Body: api.EnvelopeBody{Text: "x"}}})
 	reply := func(seq int64, e *api.Envelope) {
-		f.post(t, api.PostMessageRequest{AgentID: f.builder.ID, To: f.lead.ID, ReplyTo: seq, Envelope: e})
+		f.post(t, api.PostMessageRequest{AgentID: f.builder.ID, RunID: f.builder.RunID, To: f.lead.ID, ReplyTo: seq, Envelope: e})
 	}
 	reply(assign.Seq, &api.Envelope{Kind: "result", To: "lead", Subject: "Empty recipient check passes its tests", Body: api.EnvelopeBody{Outcome: "done", Status: map[string]string{"a1": "pass"}},
 		Evidence: map[string]api.Evidence{"e1": {Type: "command", Value: "go test", Outcome: "ok"}}})
@@ -445,3 +445,28 @@ func TestObligationActionRetriesAreReceipted(t *testing.T) {
 }
 
 func ptr[T any](v T) *T { return &v }
+
+// Round-two focused fix B13/B14: a result cannot settle a question, and a reply
+// without the sender's run settles nothing.
+func TestSettlementNeedsFittingKindAndRun(t *testing.T) {
+	f := newOblFixture(t)
+	q := f.post(t, api.PostMessageRequest{AgentID: f.lead.ID, To: f.builder.ID, Envelope: &api.Envelope{Kind: "question", To: "builder", Subject: "Which status code should we use", Body: api.EnvelopeBody{Question: "422?"}}})
+	a := f.post(t, api.PostMessageRequest{AgentID: f.lead.ID, To: f.builder.ID, Envelope: assignFrom(f.lead, "builder")})
+	result := func(seq int64, run string) {
+		f.post(t, api.PostMessageRequest{AgentID: f.builder.ID, RunID: run, To: f.lead.ID, ReplyTo: seq, Envelope: &api.Envelope{Kind: "result", To: "lead", Subject: "Result for the earlier message here",
+			Body: api.EnvelopeBody{Outcome: "done", Status: map[string]string{"a1": "pass"}}, Evidence: map[string]api.Evidence{"e1": {Type: "command", Value: "go test", Outcome: "ok"}}}})
+	}
+	result(q.Seq, f.builder.RunID)
+	result(a.Seq, "")
+	for _, o := range f.list(t, store.ObligationFilter{AgentID: f.builder.ID}, time.Now()) {
+		if o.State == api.ObligationClosed {
+			t.Fatalf("settled without a fitting kind or run: %+v", o)
+		}
+	}
+	result(a.Seq, f.builder.RunID)
+	for _, o := range f.list(t, store.ObligationFilter{AgentID: f.builder.ID}, time.Now()) {
+		if o.MessageSeq == a.Seq && o.Outcome != api.OutcomeResult {
+			t.Fatalf("current run's result did not settle the assignment: %+v", o)
+		}
+	}
+}

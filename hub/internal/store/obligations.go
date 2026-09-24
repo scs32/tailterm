@@ -170,19 +170,19 @@ func (s *Store) applyReplyOutcome(ctx context.Context, tx *sql.Tx, m api.Message
 	if req.ReplyTo <= 0 || req.AgentID == "" || req.Envelope == nil {
 		return nil
 	}
-	if req.RunID != "" {
-		var current string
-		if err := tx.QueryRowContext(ctx, `SELECT run_id FROM agents WHERE id=?`, req.AgentID).Scan(&current); err != nil {
-			return err
-		}
-		if current != req.RunID {
-			return nil // a stale run's reply is kept on the board but changes no obligation
-		}
+	// Only the sender's current run settles; a reply that names no run (an
+	// older client or a raw call) or a stale run is kept but settles nothing.
+	var current string
+	if err := tx.QueryRowContext(ctx, `SELECT run_id FROM agents WHERE id=?`, req.AgentID).Scan(&current); err != nil {
+		return err
+	}
+	if req.RunID == "" || current != req.RunID {
+		return nil
 	}
 	now := ts(m.CreatedAt)
 	// Which obligations each reply kind can settle; delivery-only ones settle on delivery.
 	fits := map[string]string{
-		api.EnvelopeKindResult:  `needs IN ('ack_outcome','answer')`,
+		api.EnvelopeKindResult:  `needs='ack_outcome'`,
 		api.EnvelopeKindDecline: `needs IN ('ack_outcome','answer')`,
 		api.EnvelopeKindAnswer:  `(needs='answer' OR source_kind='human')`,
 		api.EnvelopeKindBlock:   `needs IN ('ack_outcome','answer')`,

@@ -229,7 +229,10 @@ func (s *Store) BrokerEscalate(ctx context.Context, o BrokerObligation, level in
 }
 
 // maxStallLines keeps the stall notice under the envelope body limit.
-const maxStallLines = 10
+const (
+	maxStallLines     = 10
+	stallListingBytes = 2500
+)
 
 // BrokerProjectStall raises one board notice per stall. lastChange is the
 // latest recipient-driven change (never the broker's own escalations), so
@@ -241,7 +244,8 @@ func (s *Store) BrokerProjectStall(ctx context.Context, taskID string, lastChang
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return false, err
 	}
-	rearm := errors.Is(err, sql.ErrNoRows) || observed != ts(lastChange)
+	// Re-arm only when activity moves forward, never when it appears to move back.
+	rearm := errors.Is(err, sql.ErrNoRows) || lastChange.After(parseTS(observed))
 	due := len(overdue) > 0 && now.Sub(quietFrom) >= api.ObligationProjectStallQuiet && (rearm || notifiedAt == "")
 	if !rearm && !due {
 		return false, nil
@@ -256,13 +260,17 @@ func (s *Store) BrokerProjectStall(ctx context.Context, taskID string, lastChang
 		if !due || task.PauseState != api.ProjectPauseActive {
 			return nil
 		}
+		// Bound the listing by bytes so the body always fits its limit.
 		var lines []string
+		size := 0
 		for i, o := range overdue {
-			if i == maxStallLines {
-				lines = append(lines, fmt.Sprintf("and %d more", len(overdue)-maxStallLines))
+			line := fmt.Sprintf("#%d %s → %s (%s)", o.MessageSeq, truncateRunes(o.Subject, 80), o.AgentName, ObligationOverdue(o.Obligation, now))
+			if i == maxStallLines || size+len(line) > stallListingBytes {
+				lines = append(lines, fmt.Sprintf("and %d more", len(overdue)-i))
 				break
 			}
-			lines = append(lines, fmt.Sprintf("#%d %s → %s (%s)", o.MessageSeq, truncateRunes(o.Subject, 80), o.AgentName, ObligationOverdue(o.Obligation, now)))
+			lines = append(lines, line)
+			size += len(line) + 2
 		}
 		text := fmt.Sprintf("Overdue work has already gone to the owner and nothing has changed for %s. %d obligation(s) are overdue: %s. Run `tt obligations --overdue` for the full list.",
 			api.ObligationProjectStallQuiet, len(overdue), strings.Join(lines, "; "))

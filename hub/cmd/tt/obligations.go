@@ -1,6 +1,7 @@
 package main
 
 import (
+	"crypto/sha256"
 	"errors"
 	"flag"
 	"fmt"
@@ -110,7 +111,8 @@ func cmdObligationAction(e env, action string, args []string) error {
 	}
 	ctx, cancel := ctxTimeout(10 * time.Second)
 	defer cancel()
-	o, err := c.ObligationAction(ctx, task, seq, action, api.ObligationActionRequest{AgentID: e.agent, RunID: e.runID, Text: *text})
+	req := api.ObligationActionRequest{AgentID: e.agent, RunID: e.runID, Text: *text, RequestID: obligationRequestID(e.runID, action, seq, *text, time.Now())}
+	o, err := c.ObligationAction(ctx, task, seq, action, req)
 	if err != nil {
 		return err
 	}
@@ -180,6 +182,8 @@ func unackedObligations(e env) (int, string) {
 	return len(seqs), strings.Join(seqs, ", ")
 }
 
+var unreadPageSize = 200
+
 // unreadDirectedFreeText counts unread free-text messages another agent sent
 // directly to this one. Typed messages and directed owner posts are covered by
 // obligations instead, so acknowledging one never leaves an agent stuck on it.
@@ -194,15 +198,30 @@ func unreadDirectedFreeText(e env) int {
 	if err != nil {
 		return 0
 	}
-	msgs, err := c.ListMessages(ctx, e.task, after, e.agent, 200)
-	if err != nil {
-		return 0
-	}
 	n := 0
-	for _, m := range msgs {
-		if m.To == e.agent && m.From.AgentID != "" && m.From.AgentID != e.agent && m.Envelope == nil {
-			n++
+	for page := 0; page < 25; page++ { // at most 25 pages
+		msgs, err := c.ListMessages(ctx, e.task, after, e.agent, unreadPageSize)
+		if err != nil || len(msgs) == 0 {
+			return n
 		}
+		for _, m := range msgs {
+			if m.To == e.agent && m.From.AgentID != "" && m.From.AgentID != e.agent && m.Envelope == nil {
+				n++
+			}
+		}
+		after = msgs[len(msgs)-1].Seq
 	}
 	return n
+}
+
+// obligationRequestID makes CLI obligation actions retry-safe. An ack is
+// stable per run and message; progress is stable within a minute, so a retry
+// dedupes but progress reported later still counts.
+func obligationRequestID(run, action string, seq int64, text string, now time.Time) string {
+	scope := ""
+	if action == "progress" {
+		scope = now.UTC().Truncate(time.Minute).Format(time.RFC3339)
+	}
+	digest := sha256.Sum256([]byte(run + "\x00" + action + "\x00" + strconv.FormatInt(seq, 10) + "\x00" + text + "\x00" + scope))
+	return fmt.Sprintf("%s-%x", action, digest[:12])
 }

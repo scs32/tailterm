@@ -77,8 +77,9 @@ func (b *Broker) Tick(ctx context.Context, now time.Time) ([]Step, error) {
 			t = &taskState{}
 			tasks[o.TaskID] = t
 		}
-		// Only recipient-driven changes count as activity for stall detection.
-		if o.ChangedAt.After(t.lastChange) {
+		// Only recipient-driven changes to real work count as activity; delivery
+		// of the broker's own notices does not.
+		if o.Needs != api.ObligationNeedsDelivery && o.ChangedAt.After(t.lastChange) {
 			t.lastChange = o.ChangedAt
 		}
 		unacked := o.State == api.ObligationQueued || o.State == api.ObligationDelivered

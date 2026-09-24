@@ -313,3 +313,50 @@ func TestRetiredRecipientEscalatesWithoutWakes(t *testing.T) {
 }
 
 func ptr[T any](v T) *T { return &v }
+
+// Round-two focused fix B2/N2: delivering the broker's own notice is not
+// activity and never repeats the stall notice.
+func TestStallDoesNotRepeatWhenNoticesAreDelivered(t *testing.T) {
+	f := newFixture(t)
+	o := f.assign(t, "")
+	c := o.CreatedAt
+	for _, at := range []time.Duration{time.Minute, 3 * time.Minute, 7 * time.Minute, 10*time.Minute + time.Second, 25*time.Minute + time.Second} {
+		f.tick(t, o, c.Add(at))
+	}
+	want(t, "+40m2s", f.tick(t, o, c.Add(40*time.Minute+2*time.Second)), "project-stalled")
+	if err := f.st.MarkObligationsDelivered(f.ctx, f.task.ID, f.lead.ID, f.lead.RunID, c.Add(45*time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	want(t, "+45m1s after the lead read its notices", f.tick(t, o, c.Add(45*time.Minute+time.Second)))
+	want(t, "+80m", f.tick(t, o, c.Add(80*time.Minute)))
+}
+
+// Round-two focused fix B3: the stall listing is bounded by bytes, not lines.
+func TestStallNoticeFitsWithMultibyteSubjects(t *testing.T) {
+	f := newFixture(t)
+	subject := strings.Repeat("🚀", 117) + " ok"
+	var first api.Obligation
+	for i := 0; i < 12; i++ {
+		if _, err := f.st.PostMessage(f.ctx, f.task.ID, api.PostMessageRequest{AgentID: f.lead.ID, To: f.builder.ID, Envelope: &api.Envelope{
+			Kind: "assign", To: "builder", Subject: subject, Body: api.EnvelopeBody{Objective: "x", Owns: []string{"f"}, Acceptance: map[string]string{"a1": "y"}}}}, f.by); err != nil {
+			t.Fatal(err)
+		}
+		if i == 0 {
+			obls, _ := f.st.ListObligations(f.ctx, f.task.ID, store.ObligationFilter{}, time.Now())
+			first = obls[0]
+		}
+	}
+	c := first.CreatedAt
+	for _, at := range []time.Duration{10*time.Minute + 5*time.Second, 10*time.Minute + 6*time.Second, 25*time.Minute + 10*time.Second, 40*time.Minute + 20*time.Second} {
+		if _, err := (&Broker{Store: f.st}).Tick(f.ctx, c.Add(at)); err != nil {
+			t.Fatalf("tick at %s: %v", at, err)
+		}
+	}
+	msgs, _ := f.st.ListMessages(f.ctx, f.task.ID, 0, "", 500)
+	for _, m := range msgs {
+		if m.Envelope != nil && m.Envelope.Subject == "Project stalled: overdue work and no progress" {
+			return
+		}
+	}
+	t.Fatal("stall notice with multibyte subjects was not posted")
+}

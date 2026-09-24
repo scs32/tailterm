@@ -348,6 +348,13 @@ func relayFollowThrough(ctx context.Context, b runtimeBinding, p *relayProgress,
 // Codex answered. The hub owns job identity and leasing, so there is no
 // relay-derived request ID that could collide and starve a recipient. It
 // returns handled=false when nothing is due or the hub predates wake jobs.
+// brokerCoveredKind lists the envelope kinds that create a recipient obligation
+// (and so a broker wake job) when addressed to an agent.
+var brokerCoveredKind = map[string]bool{
+	api.EnvelopeKindAssign: true, api.EnvelopeKindRequest: true, api.EnvelopeKindReview: true, api.EnvelopeKindBlock: true,
+	api.EnvelopeKindQuestion: true, api.EnvelopeKindNotice: true, api.EnvelopeKindFinding: true,
+}
+
 func relayWakeJob(ctx context.Context, b runtimeBinding, p *relayProgress, c *api.Client, now time.Time, queue func(context.Context, runtimeBinding, string) error) (bool, error) {
 	// Space broker wakes so the follow-through and inbox paths always get turns.
 	if now.Sub(p.LastBrokerWake) < 15*time.Second {
@@ -377,13 +384,12 @@ func relayWakeJob(ctx context.Context, b runtimeBinding, p *relayProgress, c *ap
 			report.Status = "ambiguous"
 		}
 	}
-	if err := c.ReportWakeJob(ctx, b.Task, job.ID, report); err != nil {
-		return true, err
-	}
+	reportErr := c.ReportWakeJob(ctx, b.Task, job.ID, report)
 	if report.Status != "accepted" {
-		return true, fmt.Errorf("broker wake %s: %s", report.Status, report.Detail)
+		// Nothing reached the runtime: let the other relay paths run this pass.
+		return false, fmt.Errorf("broker wake %s: %s", report.Status, report.Detail)
 	}
-	return true, nil
+	return true, reportErr
 }
 
 func nativeQueue(ctx context.Context, b runtimeBinding, prompt string) error {
@@ -435,17 +441,21 @@ func relayOne(ctx context.Context, b runtimeBinding, p *relayProgress, c *api.Cl
 	if err != nil {
 		return err
 	}
+	// Progress covers the whole page, even messages the broker wakes for.
+	through, _ := wakeThrough(msgs, b.Agent)
+	eligibleMsgs := msgs
 	if p.BrokerWakes {
-		// Obligating messages to this agent are woken by broker wake jobs.
-		kept := msgs[:0]
+		// Only typed kinds that create an obligation for this agent are woken
+		// by broker wake jobs; replies, free text, decision answers, lead
+		// notices and dispatches still wake through the inbox.
+		eligibleMsgs = nil
 		for _, m := range msgs {
-			if !(m.To == b.Agent && (m.Envelope != nil || m.From.AgentID == "")) {
-				kept = append(kept, m)
+			if !(m.To == b.Agent && m.Envelope != nil && brokerCoveredKind[m.Envelope.Kind]) {
+				eligibleMsgs = append(eligibleMsgs, m)
 			}
 		}
-		msgs = kept
 	}
-	through, eligible := wakeThrough(msgs, b.Agent)
+	_, eligible := wakeThrough(eligibleMsgs, b.Agent)
 	if !eligible {
 		p.Through = max(p.Through, through)
 		return nil
