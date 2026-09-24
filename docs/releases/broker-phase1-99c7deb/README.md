@@ -46,5 +46,7 @@ handler-owned backup preflight on the owner's instruction. The plan's
 - **Rollback:** point the app back at `releases/20260914-routing-review-ba37ee7` (the previous
   running release). The older binary ignores the new column and table. Do not restore the backup
   over newer work.
-- **Deferred:** a real wake of a registered agent thread through the relay on Codex 0.156.1,
-  and the TailOS rebuild.
+- **TailOS:** deployed from clean `950b5ec` (82 assets verified against `release.json`) to the
+  `tailos` Pages project. `https://tailos.tailarr.com/release.json` and the Mini's local preview on
+  port 4318 both report `950b5ec`.
+- **Deferred:** a real wake of a registered agent thread through the relay on Codex 0.156.1.
