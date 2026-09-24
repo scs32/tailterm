@@ -3,7 +3,9 @@ package broker
 import (
 	"context"
 	"errors"
+	"fmt"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -257,6 +259,105 @@ func TestScopedAgentNamesSurviveBrokerSubjects(t *testing.T) {
 			t.Fatalf("new obligation changed incorrectly: %v %+v", err, moved)
 		}
 	})
+}
+
+func TestRepeatedReassignmentNamesCurrentTarget(t *testing.T) {
+	for _, finalName := range []string{"reviewer-41b1c632", "reviewer"} {
+		t.Run(finalName, func(t *testing.T) {
+			f := newFixture(t)
+			clock := time.Date(2026, 9, 24, 12, 0, 0, 0, time.UTC)
+			f.st.SetClockForTest(func() time.Time { return clock })
+			first := f.assign(t, "")
+			intermediate, err := f.st.AddAgent(f.ctx, f.task.ID, api.AddAgentRequest{Name: "builder-41b1c632", Host: "h", Session: "intermediate", Runtime: "codex"}, f.by)
+			if err != nil {
+				t.Fatal(err)
+			}
+			m1, err := f.st.ReassignObligation(f.ctx, f.task.ID, first.ID, api.ObligationReassignRequest{ToAgentID: intermediate.ID}, f.by)
+			if err != nil {
+				t.Fatal(err)
+			}
+			middle, err := f.st.ListObligations(f.ctx, f.task.ID, store.ObligationFilter{AgentID: intermediate.ID}, clock)
+			if err != nil || len(middle) != 1 {
+				t.Fatalf("first move: %v %+v", err, middle)
+			}
+			final, err := f.st.AddAgent(f.ctx, f.task.ID, api.AddAgentRequest{Name: finalName, Host: "h", Session: "final", Runtime: "codex"}, f.by)
+			if err != nil {
+				t.Fatal(err)
+			}
+			m2, err := f.st.ReassignObligation(f.ctx, f.task.ID, middle[0].ID, api.ObligationReassignRequest{ToAgentID: final.ID}, f.by)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if m2.To != final.ID || m2.Envelope == nil || m2.Envelope.To != final.Name || !strings.Contains(m2.Envelope.Subject, finalName) || strings.Contains(m2.Envelope.Subject, intermediate.Name) {
+				t.Fatalf("second subject or routing: %+v", m2)
+			}
+			if m2.Envelope.Refs["reassignedFrom"] != fmt.Sprint(m1.Seq) || !reflect.DeepEqual(m2.Envelope.Body, m1.Envelope.Body) {
+				t.Fatalf("source history or body changed: first %+v second %+v", m1.Envelope, m2.Envelope)
+			}
+			prior, err := f.st.ListObligations(f.ctx, f.task.ID, store.ObligationFilter{AgentID: intermediate.ID}, clock)
+			if err != nil || len(prior) != 1 || prior[0].Outcome != api.OutcomeSuperseded {
+				t.Fatalf("intermediate state: %v %+v", err, prior)
+			}
+			current, err := f.st.ListObligations(f.ctx, f.task.ID, store.ObligationFilter{AgentID: final.ID}, clock)
+			if err != nil || len(current) != 1 || current[0].MessageSeq != m2.Seq || current[0].Needs != api.ObligationNeedsOutcome {
+				t.Fatalf("final state: %v %+v", err, current)
+			}
+		})
+	}
+}
+
+func TestReassignmentTruncationKeepsValidSubject(t *testing.T) {
+	f := newFixture(t)
+	target, err := f.st.AddAgent(f.ctx, f.task.ID, api.AddAgentRequest{Name: "builder-41b1c632", Host: "h", Session: "target", Runtime: "codex"}, f.by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The original token is valid; cutting inside it would create abc_123456.
+	subject := strings.Repeat("w", 76) + " abc_123456xyz and more words"
+	if _, err := f.st.PostMessage(f.ctx, f.task.ID, api.PostMessageRequest{AgentID: f.lead.ID, To: f.builder.ID, Envelope: &api.Envelope{
+		Kind: "assign", To: f.builder.Name, Subject: subject,
+		Body: api.EnvelopeBody{Objective: "x", Owns: []string{"main.go"}, Acceptance: map[string]string{"a1": "y"}}}}, f.by); err != nil {
+		t.Fatalf("original subject: %v", err)
+	}
+	old, err := f.st.ListObligations(f.ctx, f.task.ID, store.ObligationFilter{AgentID: f.builder.ID}, time.Now())
+	if err != nil || len(old) != 1 {
+		t.Fatalf("original obligation: %v %+v", err, old)
+	}
+	m, err := f.st.ReassignObligation(f.ctx, f.task.ID, old[0].ID, api.ObligationReassignRequest{ToAgentID: target.ID}, f.by)
+	if err != nil {
+		t.Fatalf("reassignment: %v", err)
+	}
+	if m.Envelope == nil || !strings.Contains(m.Envelope.Subject, target.Name) || len([]rune(m.Envelope.Subject)) > 120 {
+		t.Fatalf("bounded subject lost target: %+v", m.Envelope)
+	}
+	if err := api.NormalizeBrokerPost(&api.PostMessageRequest{Envelope: m.Envelope}, target.Name); err != nil {
+		t.Fatalf("shortened subject invalid: %v", err)
+	}
+}
+
+func TestReassignmentKeepsBrokerOriginHistory(t *testing.T) {
+	f := newFixtureWithBuilder(t, "builder-41b1c632")
+	clock := time.Date(2026, 9, 24, 12, 0, 0, 0, time.UTC)
+	f.st.SetClockForTest(func() time.Time { return clock })
+	o := f.assign(t, "")
+	for _, at := range []time.Duration{time.Minute, 3 * time.Minute, 7 * time.Minute, 10*time.Minute + time.Second} {
+		f.tick(t, o, clock.Add(at))
+	}
+	leadNotices, err := f.st.ListObligations(f.ctx, f.task.ID, store.ObligationFilter{AgentID: f.lead.ID}, clock)
+	if err != nil || len(leadNotices) != 1 {
+		t.Fatalf("lead notice obligation: %v %+v", err, leadNotices)
+	}
+	target, err := f.st.AddAgent(f.ctx, f.task.ID, api.AddAgentRequest{Name: "reviewer-41b1c632", Host: "h", Session: "reviewer", Runtime: "codex"}, f.by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m, err := f.st.ReassignObligation(f.ctx, f.task.ID, leadNotices[0].ID, api.ObligationReassignRequest{ToAgentID: target.ID}, f.by)
+	if err != nil {
+		t.Fatalf("broker-origin reassignment: %v", err)
+	}
+	if m.Envelope == nil || !strings.Contains(m.Envelope.Subject, target.Name) || m.Envelope.Refs["reassignedFrom"] != fmt.Sprint(leadNotices[0].MessageSeq) || m.Envelope.Refs["escalation"] != "lead" {
+		t.Fatalf("broker-origin history lost: %+v", m)
+	}
 }
 
 // b6: silence nudges twice at 30-minute spacing, then escalates; a missed due

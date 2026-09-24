@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"regexp"
 	"strings"
 	"time"
 
@@ -565,7 +566,21 @@ func reassignedEnvelope(original api.Message, toName string, seq int64) *api.Env
 			e.Refs[k] = v
 		}
 		e.Refs["reassignedFrom"] = fmt.Sprint(seq)
-		e.Subject = reassignedSubject(toName, e.Subject)
+		subject := e.Subject
+		if original.From.Node == api.BrokerNode {
+			// A prior reassignment already has a recipient prefix. Keep its
+			// original topic rather than carrying the old recipient forward.
+			if original.Envelope.Refs["reassignedFrom"] != "" && strings.HasPrefix(subject, "Reassigned to ") {
+				if i := strings.Index(subject, ": "); i >= 0 {
+					subject = subject[i+2:]
+				}
+			}
+			// Broker-origin subjects may legitimately name a former scoped
+			// agent. Its full name stays in the stored source message/body;
+			// the new subject names the current recipient.
+			subject = reassignedScopedName.ReplaceAllString(subject, "agent")
+		}
+		e.Subject = reassignedSubject(toName, subject)
 		return &e
 	}
 	ask := truncateRunes(strings.Join(strings.Fields(original.Text), " "), 1500)
@@ -573,14 +588,27 @@ func reassignedEnvelope(original api.Message, toName string, seq int64) *api.Env
 		Refs: map[string]string{"reassignedFrom": fmt.Sprint(seq)}, Body: api.EnvelopeBody{Ask: ask}}
 }
 
+var reassignedScopedName = regexp.MustCompile(`(?i)\b[a-z][a-z0-9_-]*-[0-9a-f]{7,}\b`)
+
 func reassignedSubject(toName, original string) string {
 	prefix := "Reassigned to " + toName + ": "
 	remaining := 120 - len([]rune(prefix))
 	runes := []rune(original)
+	tail := original
 	if len(runes) > remaining {
-		return prefix + string(runes[:remaining-1]) + "…"
+		cut := string(runes[:remaining-1])
+		if i := strings.LastIndexByte(cut, ' '); i > 0 {
+			tail = strings.TrimSpace(cut[:i]) + "…"
+		} else {
+			tail = "open obligation"
+		}
 	}
-	return prefix + original
+	subject := prefix + tail
+	probe := api.PostMessageRequest{Envelope: &api.Envelope{Kind: api.EnvelopeKindNotice, Subject: subject, Body: api.EnvelopeBody{Text: "reassigned"}}}
+	if err := api.NormalizeBrokerPost(&probe, toName); err != nil {
+		return prefix + "open obligation"
+	}
+	return subject
 }
 
 // LeaseWakeJob hands the host relay the next due wake for an agent's current
