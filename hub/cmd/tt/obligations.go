@@ -214,14 +214,11 @@ func unreadDirectedFreeText(e env) int {
 	return n
 }
 
-// obligationRequestID makes CLI obligation actions retry-safe. An ack is
-// stable per run and message; progress is stable within a minute, so a retry
-// dedupes but progress reported later still counts.
+// obligationRequestID makes CLI obligation actions retry-safe within a minute:
+// a re-run after a lost response dedupes, while a later ack (resuming a block)
+// or later progress acts again.
 func obligationRequestID(run, action string, seq int64, text string, now time.Time) string {
-	scope := ""
-	if action == "progress" {
-		scope = now.UTC().Truncate(time.Minute).Format(time.RFC3339)
-	}
+	scope := now.UTC().Truncate(time.Minute).Format(time.RFC3339)
 	digest := sha256.Sum256([]byte(run + "\x00" + action + "\x00" + strconv.FormatInt(seq, 10) + "\x00" + text + "\x00" + scope))
 	return fmt.Sprintf("%s-%x", action, digest[:12])
 }

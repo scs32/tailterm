@@ -296,11 +296,44 @@ func TestStopHookFallbackReadsAllUnreadPages(t *testing.T) {
 func TestObligationRequestIDs(t *testing.T) {
 	now := time.Date(2026, 9, 24, 10, 0, 5, 0, time.UTC)
 	ack1 := obligationRequestID("run_1", "ack", 12, "", now)
-	if ack1 == "" || ack1 != obligationRequestID("run_1", "ack", 12, "", now.Add(time.Hour)) {
-		t.Fatal("ack request IDs must be stable for the same run and message")
+	if ack1 == "" || ack1 != obligationRequestID("run_1", "ack", 12, "", now.Add(30*time.Second)) {
+		t.Fatal("an ack retried within the minute must reuse its request ID")
+	}
+	// Focused verification R1: a later ack (resuming a block) must act again.
+	if ack1 == obligationRequestID("run_1", "ack", 12, "", now.Add(2*time.Minute)) {
+		t.Fatal("a later ack reused the earlier request ID and could never resume a block")
 	}
 	p1 := obligationRequestID("run_1", "progress", 12, "halfway", now)
 	if p1 != obligationRequestID("run_1", "progress", 12, "halfway", now.Add(30*time.Second)) || p1 == obligationRequestID("run_1", "progress", 12, "halfway", now.Add(2*time.Minute)) {
 		t.Fatal("progress request IDs must dedupe within a minute and differ across minutes")
+	}
+}
+
+// Focused verification R1 end to end: ack, block, then a later tt ack resumes.
+func TestAckResumesABlockLater(t *testing.T) {
+	e, c, task, lead := cliWorkItemFixture(t)
+	ctx := context.Background()
+	self, _ := c.GetAgent(ctx, task.ID, e.agent)
+	e.runID = self.RunID
+	m, err := c.PostMessage(ctx, task.ID, api.PostMessageRequest{AgentID: lead.ID, To: e.agent, Envelope: &api.Envelope{Kind: "request", To: e.agentName, Subject: "Save the governing order record", Body: api.EnvelopeBody{Ask: "x"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ack := func(at time.Time) api.Obligation {
+		t.Helper()
+		o, err := c.ObligationAction(ctx, task.ID, m.Seq, "ack", api.ObligationActionRequest{AgentID: e.agent, RunID: e.runID, RequestID: obligationRequestID(e.runID, "ack", m.Seq, "", at)})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return o
+	}
+	start := time.Now()
+	ack(start)
+	if _, err := c.PostMessage(ctx, task.ID, api.PostMessageRequest{AgentID: e.agent, RunID: e.runID, To: lead.ID, ReplyTo: m.Seq, Envelope: &api.Envelope{Kind: "block", To: "lead", Subject: "Waiting on the order number",
+		Body: api.EnvelopeBody{Reason: "no order yet", Needs: "lead", ResumeWhen: "order posted"}}}); err != nil {
+		t.Fatal(err)
+	}
+	if o := ack(start.Add(3 * time.Minute)); o.State != api.ObligationAcknowledged {
+		t.Fatalf("a later ack did not resume the block: %+v", o)
 	}
 }
