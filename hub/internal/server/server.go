@@ -160,6 +160,7 @@ func writeError(w http.ResponseWriter, status int, msg string) {
 }
 
 func fail(w http.ResponseWriter, err error) {
+	var envelopeErr *api.EnvelopeError
 	switch {
 	case errors.Is(err, api.ErrNotFound):
 		writeError(w, http.StatusNotFound, "not found")
@@ -171,6 +172,8 @@ func fail(w http.ResponseWriter, err error) {
 		writeError(w, http.StatusConflict, err.Error())
 	case errors.Is(err, store.ErrDecisionAnswerForbidden):
 		writeError(w, http.StatusForbidden, "only a human can answer a decision request")
+	case errors.As(err, &envelopeErr):
+		writeJSON(w, http.StatusBadRequest, api.ErrorResponse{Error: "invalid envelope", Code: "invalid-envelope", Problems: envelopeErr.Problems})
 	case errors.Is(err, api.ErrInvalid):
 		writeError(w, http.StatusBadRequest, "invalid request")
 	case errors.Is(err, api.ErrConflict):

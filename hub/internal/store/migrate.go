@@ -24,6 +24,7 @@ func migrate(db *sql.DB) error {
 		{"tasks", "pause_generation", "INTEGER NOT NULL DEFAULT 0"},
 		{"tasks", "paused_at", "TEXT NOT NULL DEFAULT ''"},
 		{"messages", "broadcast", "INTEGER NOT NULL DEFAULT 0"},
+		{"messages", "envelope", "TEXT NOT NULL DEFAULT ''"},
 	} {
 		var n int
 		if err := db.QueryRow(`SELECT count(*) FROM pragma_table_info(?) WHERE name=?`, c.table, c.name).Scan(&n); err != nil {

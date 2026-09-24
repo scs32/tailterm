@@ -15,7 +15,7 @@ COALESCE(l.work_order_task_id,''),COALESCE(l.work_order_message_seq,0),
 COALESCE(r.receipt_id,''),COALESCE(r.request_id,''),COALESCE(r.task_id,''),COALESCE(r.message_seq,0),COALESCE(r.created_at,''),
 COALESCE(dr.question,''),COALESCE(dr.options,''),COALESCE(dr.recommended_option_id,''),COALESCE(dr.recommendation_reason,''),
 COALESCE(da.request_seq,0),COALESCE(da.option_id,''),COALESCE(da.text,''),
-COALESCE(m.system_notice_kind,''),COALESCE(m.system_notice_id,'')`
+COALESCE(m.system_notice_kind,''),COALESCE(m.system_notice_id,''),m.envelope`
 
 const messageSelectJoins = `
 LEFT JOIN message_work_item_links l ON l.message_seq=m.seq
@@ -35,7 +35,7 @@ func scanMessage(row rowScanner) (api.Message, error) {
 	var decisionRequest api.DecisionRequest
 	var decisionOptions string
 	var decisionAnswer api.DecisionAnswer
-	var systemNoticeKind, systemNoticeID string
+	var systemNoticeKind, systemNoticeID, envelope string
 	var itemRevision, orderSeq int64
 	err := row.Scan(
 		&message.Seq, &message.TaskID,
@@ -46,7 +46,7 @@ func scanMessage(row rowScanner) (api.Message, error) {
 		&receipt.ID, &receipt.RequestID, &receipt.TaskID, &receipt.MessageSeq, &receiptCreated,
 		&decisionRequest.Question, &decisionOptions, &decisionRequest.RecommendedOptionID, &decisionRequest.RecommendationReason,
 		&decisionAnswer.RequestSeq, &decisionAnswer.OptionID, &decisionAnswer.Text,
-		&systemNoticeKind, &systemNoticeID,
+		&systemNoticeKind, &systemNoticeID, &envelope,
 	)
 	if err != nil {
 		return message, err
@@ -78,6 +78,12 @@ func scanMessage(row rowScanner) (api.Message, error) {
 	}
 	if systemNoticeKind != "" {
 		message.SystemNotice = &api.SystemNotice{Kind: systemNoticeKind, ID: systemNoticeID}
+	}
+	if envelope != "" {
+		message.Envelope = &api.Envelope{}
+		if err := json.Unmarshal([]byte(envelope), message.Envelope); err != nil {
+			return message, err
+		}
 	}
 	return message, nil
 }

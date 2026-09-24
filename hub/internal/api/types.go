@@ -228,6 +228,7 @@ type Message struct {
 	From             Sender              `json:"from"`
 	To               string              `json:"to,omitempty"`
 	Text             string              `json:"text"`
+	Envelope         *Envelope           `json:"envelope,omitempty"`
 	CreatedAt        time.Time           `json:"createdAt"`
 }
 
@@ -284,6 +285,7 @@ type UpdateAgentRequest struct {
 }
 
 type PostMessageRequest struct {
+	Envelope         *Envelope         `json:"envelope,omitempty"`
 	WorkItems        []MessageWorkItem `json:"workItems,omitempty"`
 	WorkOrderMessage *MessageReference `json:"workOrderMessage,omitempty"`
 	AuditKind        string            `json:"auditKind,omitempty"`
@@ -331,8 +333,9 @@ type EventList struct {
 }
 
 type ErrorResponse struct {
-	Error string `json:"error"`
-	Code  string `json:"code,omitempty"`
+	Error    string    `json:"error"`
+	Code     string    `json:"code,omitempty"`
+	Problems []Problem `json:"problems,omitempty"`
 }
 
 // Sentinel errors shared by store and server.

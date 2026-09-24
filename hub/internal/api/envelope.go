@@ -60,6 +60,38 @@ type Problem struct {
 
 func (p Problem) String() string { return p.Field + ": " + p.Reason }
 
+// EnvelopeError reports an invalid typed message. It matches ErrInvalid.
+type EnvelopeError struct {
+	Problems []Problem
+}
+
+func (e *EnvelopeError) Error() string {
+	parts := make([]string, len(e.Problems))
+	for i, p := range e.Problems {
+		parts[i] = p.String()
+	}
+	return "invalid envelope: " + strings.Join(parts, "; ")
+}
+
+func (e *EnvelopeError) Is(target error) bool { return target == ErrInvalid }
+
+// NormalizeEnvelopePost validates a typed post and fills its display text.
+// Text must be empty or exactly the rendered text, so the two never disagree.
+func NormalizeEnvelopePost(req *PostMessageRequest) error {
+	if req.Envelope == nil {
+		return nil
+	}
+	if problems := ValidateEnvelope(*req.Envelope); problems != nil {
+		return &EnvelopeError{Problems: problems}
+	}
+	rendered := RenderText(*req.Envelope)
+	if req.Text != "" && req.Text != rendered {
+		return &EnvelopeError{Problems: []Problem{{Field: "text", Reason: "must be empty or equal the envelope's rendered text"}}}
+	}
+	req.Text = rendered
+	return nil
+}
+
 const (
 	EnvelopeKindAssign   = "assign"
 	EnvelopeKindRequest  = "request"

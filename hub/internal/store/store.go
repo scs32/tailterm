@@ -868,6 +868,9 @@ func (s *Store) setAgentStatus(ctx context.Context, id, status string, by api.Ca
 // Messages
 
 func (s *Store) PostMessage(ctx context.Context, taskID string, req api.PostMessageRequest, by api.Caller) (api.Message, error) {
+	if err := api.NormalizeEnvelopePost(&req); err != nil {
+		return api.Message{}, err
+	}
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
 	if !api.ValidID(taskID, "tsk") || validateMessageRequestShape(req) != nil {
@@ -955,18 +958,30 @@ func (s *Store) insertMessage(ctx context.Context, tx *sql.Tx, task api.Task, re
 // explicit human resumption path. This policy is not exposed on the wire.
 func (s *Store) insertMessageWithResume(ctx context.Context, tx *sql.Tx, task api.Task, req api.PostMessageRequest, target api.Agent, by api.Caller, allowCrossProject, allowHistoricalRevision, allowResume bool) (api.Message, error) {
 	taskID := task.ID
+	// Every insert path enforces the envelope, not only PostMessage.
+	if err := api.NormalizeEnvelopePost(&req); err != nil {
+		return api.Message{}, err
+	}
 	if err := validateMessageContext(tx, ctx, taskID, req, allowCrossProject, allowHistoricalRevision); err != nil {
 		return api.Message{}, err
 	}
-	m := api.Message{Broadcast: task.Swarm, ReplyTo: req.ReplyTo, TaskID: taskID, From: api.Sender{AgentID: req.AgentID, Node: by.Node, User: by.User}, To: req.To, Text: req.Text, CreatedAt: s.now()}
+	m := api.Message{Broadcast: task.Swarm, ReplyTo: req.ReplyTo, TaskID: taskID, From: api.Sender{AgentID: req.AgentID, Node: by.Node, User: by.User}, To: req.To, Text: req.Text, Envelope: req.Envelope, CreatedAt: s.now()}
+	envelope := ""
+	if req.Envelope != nil {
+		raw, err := json.Marshal(req.Envelope)
+		if err != nil {
+			return m, err
+		}
+		envelope = string(raw)
+	}
 	fromRun := ""
 	if req.AgentID != "" {
 		if err := tx.QueryRowContext(ctx, `SELECT run_id FROM agents WHERE id=?`, req.AgentID).Scan(&fromRun); err != nil {
 			return m, err
 		}
 	}
-	res, err := tx.ExecContext(ctx, `INSERT INTO messages (task_id,from_agent,from_node,from_user,to_agent,text,created_at,reply_to,broadcast,from_run_id) VALUES (?,?,?,?,?,?,?,?,?,?)`,
-		taskID, req.AgentID, by.Node, by.User, req.To, req.Text, ts(m.CreatedAt), req.ReplyTo, m.Broadcast, fromRun)
+	res, err := tx.ExecContext(ctx, `INSERT INTO messages (task_id,from_agent,from_node,from_user,to_agent,text,created_at,reply_to,broadcast,from_run_id,envelope) VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
+		taskID, req.AgentID, by.Node, by.User, req.To, req.Text, ts(m.CreatedAt), req.ReplyTo, m.Broadcast, fromRun, envelope)
 	if err != nil {
 		return m, err
 	}

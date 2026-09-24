@@ -30,8 +30,9 @@ func NewClient(base string, timeout time.Duration) (*Client, error) {
 }
 
 type HTTPError struct {
-	Status int
-	Msg    string
+	Status   int
+	Msg      string
+	Problems []Problem
 }
 
 func (e *HTTPError) Error() string { return fmt.Sprintf("hub: %d %s", e.Status, e.Msg) }
@@ -96,7 +97,7 @@ func (c *Client) doLimitedJSON(ctx context.Context, method, path string, body, o
 		if e.Error == "" {
 			e.Error = strings.TrimSpace(string(data))
 		}
-		return &HTTPError{Status: res.StatusCode, Msg: e.Error}
+		return &HTTPError{Status: res.StatusCode, Msg: e.Error, Problems: e.Problems}
 	}
 	if out != nil && len(data) > 0 {
 		return json.Unmarshal(data, out)
