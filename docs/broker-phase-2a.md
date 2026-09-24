@@ -9,7 +9,10 @@ Owns: see "Ownership"
 Acceptance: b1–b14 below
 ```
 
-Status: work order, not started. Written September 24, 2026 from
+Hub record: Feature `wi_07c6b8b7201ae27c`, owner intake #8771, work-order message #8772.
+
+Status: released September 24, 2026 (hub and Mini `tt` at `5610db7`, see
+[release evidence](releases/broker-phase2a-5610db7/README.md)). Written September 24, 2026 from
 [the broker design](message-broker.md#obligations-and-the-broker-state-machine).
 It builds on phase 1, which is deployed: typed messages and `tt send`
 exist. Phase 2b, the Discord bridge on TrueNAS, is a separate order and
