@@ -155,14 +155,19 @@ func TestSendRecipientComesFromFlagOrFile(t *testing.T) {
 	if err != nil || len(msgs) != 1 || msgs[0].To != lead.ID || msgs[0].Envelope.To != "lead" {
 		t.Fatalf("file recipient not routed: %v %+v", err, msgs)
 	}
-	for _, args := range [][]string{
-		{"--file", file, "--to", "database"},
-		{"--kind", "notice", "--to", "role:lead", "--subject", "Integration window closes today", "--text", "x"},
-	} {
-		var coded *exitError
-		if err := cmdSend(e, args); !errors.As(err, &coded) || coded.code != 2 {
-			t.Errorf("%v: err %v, want exit 2", args, err)
-		}
+	var coded *exitError
+	if err := cmdSend(e, []string{"--file", file, "--to", "database"}); !errors.As(err, &coded) || coded.code != 2 {
+		t.Errorf("conflicting recipients: err %v, want exit 2", err)
+	}
+	// Broker phase 3: a role recipient is resolved by the hub to the current lead.
+	if _, err := captureCLIOutput(t, func() error {
+		return cmdSend(e, []string{"--kind", "notice", "--to", "role:lead", "--subject", "Integration window closes today", "--text", "x"})
+	}); err != nil {
+		t.Fatalf("role recipient: %v", err)
+	}
+	msgs, err = c.ListMessages(context.Background(), task.ID, 0, "", 50)
+	if err != nil || len(msgs) != 2 || msgs[1].To != lead.ID || msgs[1].Envelope.To != "role:lead" {
+		t.Fatalf("role:lead not resolved to the lead: %v %+v", err, msgs)
 	}
 }
 

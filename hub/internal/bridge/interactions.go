@@ -120,6 +120,14 @@ func (b *Bridge) act(ctx context.Context, taskID string, in discord.Interaction)
 			return b.say(ctx, taskID, in, option("text"), option("agent"))
 		case "reassign":
 			return b.reassignCommand(ctx, taskID, option("obligation"), option("agent"))
+		case "extend":
+			return b.extend(ctx, taskID, option("obligation"), option("for"), option("reason"), in.ID)
+		case "answer":
+			return b.answer(ctx, taskID, option("obligation"), option("text"), in.ID)
+		case "cancel":
+			return b.cancel(ctx, taskID, option("obligation"), option("reason"), in.ID)
+		case "resume":
+			return b.resume(ctx, taskID, option("agent"), in.ID)
 		}
 		return ephemeral("Unknown command.")
 	}
@@ -129,6 +137,8 @@ func (b *Bridge) act(ctx context.Context, taskID string, in discord.Interaction)
 		return b.stalledReply(ctx, taskID)
 	case strings.HasPrefix(id, "nudge:"):
 		return b.nudge(ctx, taskID, strings.TrimPrefix(id, "nudge:"), in.ID)
+	case strings.HasPrefix(id, "extend30:"):
+		return b.extend(ctx, taskID, strings.TrimPrefix(id, "extend30:"), "30m", "extended from Discord", in.ID)
 	case strings.HasPrefix(id, "reassign:"):
 		return b.reassignMenu(ctx, taskID, strings.TrimPrefix(id, "reassign:"))
 	case strings.HasPrefix(id, "reassignto:") && len(in.Data.Values) == 1:
@@ -184,6 +194,7 @@ func (b *Bridge) stalledReply(ctx context.Context, taskID string) reply {
 		if i < maxButtonsListed {
 			rows = append(rows, discord.Component{Type: discord.ComponentActionRow, Components: []discord.Component{
 				{Type: discord.ComponentButton, Style: discord.ButtonPrimary, Label: fmt.Sprintf("Nudge #%d", o.MessageSeq), CustomID: "nudge:" + o.ID},
+				{Type: discord.ComponentButton, Style: discord.ButtonSecondary, Label: "Extend 30m", CustomID: "extend30:" + o.ID},
 				{Type: discord.ComponentButton, Style: discord.ButtonSecondary, Label: fmt.Sprintf("Reassign #%d…", o.MessageSeq), CustomID: "reassign:" + o.ID},
 			}})
 		}
@@ -378,4 +389,100 @@ func (b *Bridge) say(ctx context.Context, taskID string, in discord.Interaction,
 		return ephemeral("⛔ Tailterm refused this message: %s. Nothing was posted.", hubMessage(err))
 	}
 	return reply{Public: true, Content: truncate(fmt.Sprintf("**owner** → **%s**\n%s", clean(to), text), contentLimit-40) + "\n" + marker(m.Seq, 1, 1, "")}
+}
+
+// ---- Broker phase 3 owner controls ----
+
+// ownerOutcome turns a hub conflict into "already handled" and any other
+// error into a readable reply.
+func ownerOutcome(err error) (reply, bool) {
+	if err == nil {
+		return reply{}, false
+	}
+	var h *api.HTTPError
+	if errors.As(err, &h) && h.Status == http.StatusConflict {
+		return ephemeral("✔️ Already handled: %s.", h.Msg), true
+	}
+	return ephemeral("⚠️ %s.", hubMessage(err)), true
+}
+
+func (b *Bridge) extend(ctx context.Context, taskID, ref, duration, reason, interactionID string) reply {
+	o, err := b.obligation(ctx, taskID, ref)
+	if err != nil {
+		if errors.Is(err, errAmbiguous) {
+			return ephemeral("⚠️ %s.", err.Error())
+		}
+		return ephemeral("✔️ Already handled: that obligation is closed or was moved.")
+	}
+	d, err := time.ParseDuration(strings.TrimSpace(duration))
+	if err != nil || d < time.Minute || d > 7*24*time.Hour {
+		return ephemeral("⚠️ Give a duration from 1m to 168h, such as 30m or 2h.")
+	}
+	out, err := b.cfg.Hub.ExtendObligation(ctx, taskID, o.ID, api.ObligationExtendRequest{For: d.String(), Reason: reason, RequestID: "discord-interaction-" + interactionID})
+	if r, done := ownerOutcome(err); done {
+		return r
+	}
+	return ephemeral("⏱️ Extended #%d until %s. Escalation restarts from there.", o.MessageSeq, out.Obligation.DueAt.UTC().Format("15:04 UTC"))
+}
+
+func (b *Bridge) answer(ctx context.Context, taskID, ref, text, interactionID string) reply {
+	o, err := b.obligation(ctx, taskID, ref)
+	if err != nil {
+		if errors.Is(err, errAmbiguous) {
+			return ephemeral("⚠️ %s.", err.Error())
+		}
+		return ephemeral("✔️ Already handled: that obligation is closed or was moved.")
+	}
+	if strings.TrimSpace(text) == "" {
+		return ephemeral("Say what the answer is.")
+	}
+	out, err := b.cfg.Hub.AnswerObligation(ctx, taskID, o.ID, api.ObligationAnswerRequest{Text: text, RequestID: "discord-interaction-" + interactionID})
+	if r, done := ownerOutcome(err); done {
+		return r
+	}
+	seq := int64(0)
+	if out.Message != nil {
+		seq = out.Message.Seq
+	}
+	return reply{Public: true, Content: truncate(fmt.Sprintf("**owner** answered #%d on the recipient's behalf:\n%s", o.MessageSeq, text), contentLimit-40) + "\n" + marker(seq, 1, 1, "")}
+}
+
+func (b *Bridge) cancel(ctx context.Context, taskID, ref, reason, interactionID string) reply {
+	o, err := b.obligation(ctx, taskID, ref)
+	if err != nil {
+		if errors.Is(err, errAmbiguous) {
+			return ephemeral("⚠️ %s.", err.Error())
+		}
+		return ephemeral("✔️ Already handled: that obligation is closed or was moved.")
+	}
+	if strings.TrimSpace(reason) == "" {
+		return ephemeral("Give a reason; the agent is told why.")
+	}
+	if _, err := b.cfg.Hub.CancelObligation(ctx, taskID, o.ID, api.ObligationCancelRequest{Reason: reason, RequestID: "discord-interaction-" + interactionID}); err != nil {
+		r, _ := ownerOutcome(err)
+		return r
+	}
+	return ephemeral("🛑 Cancelled #%d (%s); the recipient was told.", o.MessageSeq, truncate(clean(o.Subject), 80))
+}
+
+func (b *Bridge) resume(ctx context.Context, taskID, agentName, interactionID string) reply {
+	detail, err := b.cfg.Hub.GetTask(ctx, taskID)
+	if err != nil {
+		return ephemeral("⚠️ %s.", hubMessage(err))
+	}
+	var agent api.Agent
+	for _, a := range detail.Agents {
+		if strings.EqualFold(a.Name, agentName) || strings.EqualFold(strings.SplitN(a.Name, "-", 2)[0], agentName) && a.Status == api.AgentRetired {
+			agent = a
+			break
+		}
+	}
+	if agent.ID == "" {
+		return ephemeral("⚠️ No agent is named %q.", agentName)
+	}
+	if _, err := b.cfg.Hub.ResumeRetiredAgent(ctx, taskID, agent.ID, api.AgentResumeRequest{RequestID: "discord-interaction-" + interactionID}); err != nil {
+		r, _ := ownerOutcome(err)
+		return r
+	}
+	return ephemeral("▶️ Resumed %s: automatic wake-ups are on again.", clean(agent.Name))
 }

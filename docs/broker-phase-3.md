@@ -11,7 +11,7 @@ Acceptance: c1–c16 below
 
 Hub record: Feature `wi_6329a9f143468664`, owner intake #8960, work-order message #8961.
 
-Status: not started. Written September 24, 2026 after phases 1, 2a and 2b were released,
+Status: built on tasks-hub, in review (not deployed). Written September 24, 2026 after phases 1, 2a and 2b were released,
 and after the first shadow-week item ran through a Planned delivery team.
 
 ## What changed from the design
@@ -64,9 +64,14 @@ In scope:
    relay becomes the broker wake adapter plus the inbox wake for non-obligating directed
    messages. Also fix phase-2a follow-up R2: a directed owner message that created an
    obligation is woken once, by the broker, never also by the inbox path.
-4. **Re-anchor operational records.** Committing an operational record references an open
-   obligation (`obl_`) held by the committing agent's current run, instead of a delivery.
-   Nothing is migrated, since there are no records.
+4. **Retire operational-record writes along with deliveries** (changed while building). The
+   original plan re-anchored them on obligations. But their data carries a delivery ID,
+   generation and epoch, and every record kind is gated on a delivery phase, so re-anchoring
+   would mean redesigning a feature with no records in production. Propose and commit now answer
+   410; reads stay available. Knock-on effect: the pause dialog's `transferred` and `detached`
+   service dispositions need an operational `result` record as evidence, so they are unavailable
+   until that evidence is based on the target run's typed result message instead (a follow-up).
+   No pause has ever used them.
 5. **Resolve role recipients.**
    - `role:lead` resolves to the project orchestrator's current agent, and
      `role:database_handler` to the project's current handler. Resolution happens at post time,
@@ -81,12 +86,16 @@ In scope:
    - **answer** lets the owner close a question or block on the recipient's behalf. It posts a
      `human` answer that settles the obligation.
    - **cancel** closes an obligation with outcome `cancelled` and a reason.
-   - **resume** and **pause/unpause** use the existing agent-resume and project-pause APIs.
-   - Discord commands: `/extend`, `/answer`, `/cancel`, `/resume`, `/pause`, `/unpause`. The
-     bridge's route allowlist grows to exactly these routes.
-7. **Make the schedule monitor's notices typed.** Its Queue-stall notices become hub-authored
-   `notice` envelopes with `refs.queue`, sent from the broker node, so the bridge renders them as
-   "broker" and never as "owner". Whether to fold Queue stalls into broker timers is decided in phase 4.
+   - **resume** re-enables a retired agent through a narrow owner route
+     (`POST …/agents/{aid}/resume`), rather than giving the bridge general agent edits.
+   - Discord commands: `/extend`, `/answer`, `/cancel` and `/resume`, plus an **Extend 30m**
+     button on owner escalations and `/stalled` rows. The bridge's route allowlist grows to
+     exactly these routes. **`/pause` and `/unpause` were dropped** (changed while building): a
+     project pause takes an explicit list of every live run to stop, and resuming needs a freshly
+     launched lead that a host must spawn. Discord cannot drive either, so both stay in TailOS.
+7. **Make the schedule monitor's notices typed.** Its Queue-stall notices become `notice`
+   envelopes with `refs.queue`. They keep their `system/schedule-monitor` provenance, and the
+   bridge renders any `system/*` sender by name instead of as "owner". Whether to fold Queue stalls into broker timers is decided in phase 4.
 8. **Shadow-week fixes not already filed as bugs:**
    - A BLOCK that is not a reply notifies its recipient; it obliges only when sent to the
      project lead or the owner. A worker told to "wait" by a BLOCK is therefore not escalated.
@@ -141,13 +150,13 @@ Out of scope:
 | c2 | On a copy of the production database, the close-out migration closes exactly the 9 open deliveries and the 5 lead-disposition rows. Each gets a `retired-phase3` event. Running it again changes nothing, and each affected project gets one board notice listing the referenced work items. |
 | c3 | The relay has no follow-through path; `tt relay --status` shows broker wakes and inbox wakes only. The existing broker and inbox relay tests pass. |
 | c4 | (R2) A directed owner message wakes a Codex recipient exactly once, through its obligation's wake job. A directed result or answer, which creates no obligation, still wakes it through the inbox path. |
-| c5 | Committing an operational record requires an open obligation held by the committing run. A stale run or a closed obligation conflicts with no side effects. |
+| c5 | Proposing or committing an operational record answers 410 (HTTP), and `tt operational-record propose/commit` refuses without calling the hub. Reads still work, and no template tells an agent to use them. |
 | c6 | `to: role:lead` creates an obligation for the current orchestrator agent, and `role:database_handler` for the current handler. An unresolvable role is refused with a message naming the role. `tt send --to role:lead` works. |
 | c7 | Replacing the lead reassigns the outgoing lead's open `role:lead` obligations to the new lead in one transaction, with superseded history. Obligations addressed to the old lead by name are untouched. |
 | c8 | extend moves `due_at` and records the owner and reason. A retry with the same request ID returns the original result, and extending a closed obligation conflicts. |
 | c9 | answer posts a `human` answer that closes a question or a block obligation with outcome `answered`, and the recipient's next wake sees it. cancel closes any open obligation with outcome `cancelled` and a reason. Both are idempotent by request ID. |
-| c10 | The bridge's `/extend`, `/answer`, `/cancel`, `/resume`, `/pause` and `/unpause` work through hub calls with request IDs. They pass the same owner, guild and channel checks, and stale-state checks, as the phase-2b commands. The bridge token reaches exactly the added routes. |
-| c11 | A schedule-monitor Queue-stall notice is a typed `notice` from the broker node with `refs.queue`. The bridge shows it as "broker", and the existing monitor tests pass. |
+| c10 | The bridge's `/extend`, `/answer`, `/cancel` and `/resume`, and its Extend 30m button, work through hub calls with request IDs. They pass the same owner, guild and channel checks, and stale-state checks, as the phase-2b commands. The bridge token reaches exactly the added routes. |
+| c11 | A schedule-monitor Queue-stall notice is a typed `notice` with `refs.queue`. The bridge names `system/*` senders by name, never "owner", and the existing monitor tests pass. |
 | c12 | A BLOCK sent (not as a reply) to a worker notifies it without an ack obligation. A BLOCK to the project lead or to the owner obliges as before, and a BLOCK reply still pauses the obligation it replies to. |
 | c13 | Nothing in the hub, `tt`, the client or the templates tells an agent to use `tt delivery` or `tt current-assignment`. Capabilities no longer advertise reliable delivery v2 and v3. |
 | c14 | Migrations are additive apart from the close-out rows, and the phase-2b hub (`d6d5155`) still starts on the migrated database (rollback). |

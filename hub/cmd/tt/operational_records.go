@@ -31,6 +31,9 @@ func cmdOperationalRecord(e env, args []string) error {
 		return errors.New("usage: tt operational-record propose|commit|get")
 	}
 	op := args[0]
+	if op == "propose" || op == "commit" {
+		return errRetiredWriter
+	}
 	fs := flag.NewFlagSet("operational-record "+op, flag.ContinueOnError)
 	task := fs.String("task", e.task, "project id")
 	file := fs.String("file", "", "typed JSON request file (- for stdin)")

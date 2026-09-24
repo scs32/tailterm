@@ -282,6 +282,29 @@ func (c *Client) ListMessages(ctx context.Context, task string, after int64, to 
 	return out.Messages, c.do(ctx, "GET", "/v1/tasks/"+task+"/messages?"+q.Encode(), nil, &out)
 }
 
+func (c *Client) ownerAction(ctx context.Context, path string, req any) (OwnerActionResult, error) {
+	var out OwnerActionResult
+	return out, c.do(ctx, "POST", path, req, &out)
+}
+
+// ExtendObligation, AnswerObligation and CancelObligation are the owner's
+// phase-3 controls; ResumeRetiredAgent re-enables a retired agent's wake-ups.
+func (c *Client) ExtendObligation(ctx context.Context, task, obligation string, req ObligationExtendRequest) (OwnerActionResult, error) {
+	return c.ownerAction(ctx, "/v1/tasks/"+task+"/obligations/"+obligation+"/extend", req)
+}
+
+func (c *Client) AnswerObligation(ctx context.Context, task, obligation string, req ObligationAnswerRequest) (OwnerActionResult, error) {
+	return c.ownerAction(ctx, "/v1/tasks/"+task+"/obligations/"+obligation+"/answer", req)
+}
+
+func (c *Client) CancelObligation(ctx context.Context, task, obligation string, req ObligationCancelRequest) (OwnerActionResult, error) {
+	return c.ownerAction(ctx, "/v1/tasks/"+task+"/obligations/"+obligation+"/cancel", req)
+}
+
+func (c *Client) ResumeRetiredAgent(ctx context.Context, task, agent string, req AgentResumeRequest) (OwnerActionResult, error) {
+	return c.ownerAction(ctx, "/v1/tasks/"+task+"/agents/"+agent+"/resume", req)
+}
+
 // LatestMessages returns a task's newest messages, newest first.
 func (c *Client) LatestMessages(ctx context.Context, task string, limit int) ([]Message, error) {
 	q := url.Values{}

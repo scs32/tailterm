@@ -119,6 +119,19 @@ var Commands = []discord.Command{
 	{Name: "reassign", Description: "Move an open obligation to another agent", Options: []discord.CommandOption{
 		{Type: discord.OptionString, Name: "obligation", Description: "A message number or an obligation ID", Required: true},
 		{Type: discord.OptionString, Name: "agent", Description: "The agent to give it to", Required: true}}},
+	// Broker phase 3.
+	{Name: "extend", Description: "Give an open obligation more time", Options: []discord.CommandOption{
+		{Type: discord.OptionString, Name: "obligation", Description: "A message number or an obligation ID", Required: true},
+		{Type: discord.OptionString, Name: "for", Description: "How long from now, such as 30m or 2h", Required: true},
+		{Type: discord.OptionString, Name: "reason", Description: "Why (shown on the board)"}}},
+	{Name: "answer", Description: "Answer a question or resolve a block on the recipient's behalf", Options: []discord.CommandOption{
+		{Type: discord.OptionString, Name: "obligation", Description: "A message number or an obligation ID", Required: true},
+		{Type: discord.OptionString, Name: "text", Description: "The answer", Required: true}}},
+	{Name: "cancel", Description: "Cancel an open obligation", Options: []discord.CommandOption{
+		{Type: discord.OptionString, Name: "obligation", Description: "A message number or an obligation ID", Required: true},
+		{Type: discord.OptionString, Name: "reason", Description: "Why (the agent is told)", Required: true}}},
+	{Name: "resume", Description: "Re-enable wake-ups for a retired agent", Options: []discord.CommandOption{
+		{Type: discord.OptionString, Name: "agent", Description: "The agent's name", Required: true}}},
 }
 
 // Run starts every loop and blocks until ctx ends or the Gateway fails for

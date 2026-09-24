@@ -14,6 +14,9 @@ func migrate(db *sql.DB) error {
 	if err := migrateBridge(db); err != nil {
 		return err
 	}
+	if err := migratePhase3(db); err != nil {
+		return err
+	}
 	for _, c := range []struct{ table, name, definition string }{
 		{"agents", "role", "TEXT NOT NULL DEFAULT ''"},
 		{"agents", "cleanup_done", "INTEGER NOT NULL DEFAULT 0"},

@@ -88,7 +88,13 @@ func Open(path string) (*Store, error) {
 		db.Close()
 		return nil, err
 	}
-	return &Store{MaxAgents: api.MaxAgentsPerTask, db: db, waiters: map[string]chan struct{}{}, now: func() time.Time { return time.Now().UTC() }}, nil
+	s := &Store{MaxAgents: api.MaxAgentsPerTask, db: db, waiters: map[string]chan struct{}{}, now: func() time.Time { return time.Now().UTC() }}
+	// Broker phase 3: close the legacy follow-through once, with provenance.
+	if err := s.retireLegacyFollowThrough(context.Background()); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("retire legacy follow-through: %w", err)
+	}
+	return s, nil
 }
 
 func (s *Store) Close() error { return s.db.Close() }
@@ -283,8 +289,35 @@ func (s *Store) UpdateTask(ctx context.Context, id string, req api.UpdateTaskReq
 	if t.ClosedAt != nil {
 		closedAt = ts(*t.ClosedAt)
 	}
-	_, err = s.db.ExecContext(ctx, `UPDATE tasks SET name=?, goal=?, status=?, closed_at=?, allow_agent_spawn=?,max_new_agents=?,swarm=?,orchestrator=?,lead_revision=? WHERE id=?`, t.Name, t.Goal, t.Status, closedAt, t.AllowAgentSpawn, t.MaxNewAgents, t.Swarm, t.Orchestrator, t.LeadRevision, id)
-	if err == nil {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return t, err
+	}
+	defer tx.Rollback()
+	var previousLead api.Agent
+	if req.Orchestrator != nil {
+		var oldName string
+		if err = tx.QueryRowContext(ctx, `SELECT orchestrator FROM tasks WHERE id=?`, id).Scan(&oldName); err != nil {
+			return t, err
+		}
+		if previousLead, err = leadAgent(ctx, tx, id, oldName); err != nil {
+			return t, err
+		}
+	}
+	if _, err = tx.ExecContext(ctx, `UPDATE tasks SET name=?, goal=?, status=?, closed_at=?, allow_agent_spawn=?,max_new_agents=?,swarm=?,orchestrator=?,lead_revision=? WHERE id=?`, t.Name, t.Goal, t.Status, closedAt, t.AllowAgentSpawn, t.MaxNewAgents, t.Swarm, t.Orchestrator, t.LeadRevision, id); err != nil {
+		return t, err
+	}
+	// Broker phase 3: work sent to role:lead follows the lead.
+	if req.Orchestrator != nil && previousLead.ID != "" {
+		newLead, leadErr := leadAgent(ctx, tx, id, t.Orchestrator)
+		if leadErr != nil {
+			return t, leadErr
+		}
+		if err = s.handOffRoleObligations(ctx, tx, t, previousLead, newLead); err != nil {
+			return t, err
+		}
+	}
+	if err = tx.Commit(); err == nil {
 		_, err = s.addEvent(ctx, id, "task_updated", "", t.Name, nil, by)
 	}
 	return t, err
@@ -920,6 +953,17 @@ func (s *Store) PostMessage(ctx context.Context, taskID string, req api.PostMess
 	}
 	if req.Text == "" || !api.ValidText(req.Text, api.MaxTextLen) || req.ReplyTo < 0 {
 		return api.Message{}, api.ErrInvalid
+	}
+	// Broker phase 3: a role recipient resolves to whoever holds the role now.
+	if role := messageRole(req); role != "" {
+		holder, err := resolveRole(ctx, tx, t, role)
+		if err != nil {
+			return api.Message{}, err
+		}
+		if req.To != "" && req.To != holder.ID {
+			return api.Message{}, fmt.Errorf("%w: to names %s, but role:%s is held by %s", api.ErrConflict, req.To, role, holder.Name)
+		}
+		req.To = holder.ID
 	}
 	var target api.Agent
 	for _, id := range []string{req.To, req.AgentID} {

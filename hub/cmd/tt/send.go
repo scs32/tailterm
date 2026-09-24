@@ -124,9 +124,6 @@ func cmdSend(e env, args []string) error {
 	case *to != "":
 		env.To = *to
 	}
-	if strings.HasPrefix(env.To, "role:") {
-		return &exitError{2, fmt.Errorf("role recipients such as %q are resolved in broker phase 2; name an agent", env.To)}
-	}
 	if problems := api.ValidateEnvelope(env); problems != nil {
 		return &exitError{2, problemsError(problems)}
 	}
@@ -141,7 +138,9 @@ func cmdSend(e env, args []string) error {
 	ctx, cancel := ctxTimeout(10 * time.Second)
 	defer cancel()
 	target := ""
-	if env.To != "" {
+	// A role recipient (role:lead, role:database_handler) is resolved by the
+	// hub to whoever holds the role when the message is posted.
+	if env.To != "" && !strings.HasPrefix(env.To, "role:") {
 		if target, err = resolveAgent(ctx, c, *task, env.To); err != nil {
 			return err
 		}

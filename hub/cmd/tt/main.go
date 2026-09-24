@@ -52,9 +52,10 @@ Commands
   reassign OBLIGATION_ID --to AGENT [--reason T]  move an open obligation (lead or owner)
   inbox [--unread] [--mark-read] [--wait 9m] [--json]
   context [--json]             print this exact run's bound work-item context
-  operational-record propose|commit|get  validated operational records
-  current-assignment [--item ID --action-key KEY] [--json]  fetch one exact directive
-  delivery <command>           create/coverage/incident/ack/progress/block/resolve/resume/result
+  owner extend|answer|cancel OBLIGATION_ID ...  the owner's controls over an obligation
+  operational-record get       read a legacy operational record (writes retired in phase 3)
+  current-assignment [--item ID --action-key KEY] [--json]  read a legacy directive
+  delivery <command>           legacy directives: reads and closing actions (create retired)
   spawn --name N --run CMD [--cwd D] [--prompt P] [--runtime R] [--task ID]
         [--expected-lifecycle-generation N] [--resume-receipt-id ID]
                                start a sibling agent session on this host
@@ -208,6 +209,8 @@ func main() {
 		err = cmdCurrentAssignment(e, args)
 	case "delivery":
 		err = cmdDelivery(e, args)
+	case "owner":
+		err = cmdOwner(e, args)
 	case "spawn":
 		err = cmdSpawn(e, args)
 	case "allocation-intent":

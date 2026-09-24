@@ -84,10 +84,10 @@ func CurrentCapabilities() Capabilities {
 	out.Queue.MaxPageBytes = MaxQueuePageBytes
 	out.AllocationIntent.Supported = true
 	out.AllocationIntent.Versions = []int{AllocationIntentCapabilityVersion}
-	out.OperationalRecords.Supported = true
-	out.OperationalRecords.Versions = []int{OperationalRecordsCapabilityVersion}
-	out.ReliableDelivery.Supported = true
-	out.ReliableDelivery.Versions = []int{ReliableDeliveryCapabilityVersion, ReliableFollowThroughCapabilityVersion, ReliableMandatoryActionCapabilityVersion}
+	// Broker phase 3 retired the legacy directive writers and operational
+	// records; their history stays readable, but no client should use them.
+	out.OperationalRecords.Supported = false
+	out.ReliableDelivery.Supported = false
 	return out
 }
 

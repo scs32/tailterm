@@ -55,6 +55,8 @@ func (r roster) sender(m api.Message) string {
 		return r.name(m.From.AgentID)
 	case m.From.Node == api.BridgeNode:
 		return "owner (Discord)"
+	case m.From.Node == "system" && m.From.User != "":
+		return m.From.User // hub services such as schedule-monitor or queue
 	}
 	return "owner"
 }
@@ -157,6 +159,7 @@ func (b *Bridge) renderEscalation(task api.Task, m api.Message) outboxPayload {
 	if oid := env.Refs["obligation"]; oid != "" && env.Refs["escalation"] == "owner" {
 		buttons = append(buttons,
 			discord.Component{Type: discord.ComponentButton, Style: discord.ButtonPrimary, Label: "Nudge", CustomID: "nudge:" + oid},
+			discord.Component{Type: discord.ComponentButton, Style: discord.ButtonSecondary, Label: "Extend 30m", CustomID: "extend30:" + oid},
 			discord.Component{Type: discord.ComponentButton, Style: discord.ButtonSecondary, Label: "Reassign…", CustomID: "reassign:" + oid},
 		)
 	} else {

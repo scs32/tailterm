@@ -109,7 +109,7 @@ func TestDeliveryBackoffAndRecoveryAreDurable(t *testing.T) {
 		t.Fatalf("retry delivery: %+v", outcomes[2])
 	}
 	messages, err := st.ListMessages(context.Background(), task.ID, 0, lead.ID, 10)
-	if err != nil || len(messages) != 2 || messages[0].Text[:3] != "GO!" || messages[0].To != lead.ID {
+	if err != nil || len(messages) != 2 || messages[0].Envelope == nil || messages[0].Envelope.Kind != api.EnvelopeKindNotice || messages[0].Envelope.Body.Text[:3] != "GO!" || messages[0].To != lead.ID {
 		t.Fatalf("directed messages=%+v err=%v", messages, err)
 	}
 	if got, err := st.GetAgent(context.Background(), lead.ID); err != nil || got.Status != api.AgentStarting {

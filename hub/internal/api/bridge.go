@@ -37,4 +37,8 @@ var BridgeRoutes = map[string]bool{
 	"GET /v1/tasks/{id}/obligations":                   true,
 	"POST /v1/tasks/{id}/obligations/{oid}/reassign":   true,
 	"POST /v1/tasks/{id}/obligations/{oid}/nudge":      true,
+	"POST /v1/tasks/{id}/obligations/{oid}/extend":     true,
+	"POST /v1/tasks/{id}/obligations/{oid}/answer":     true,
+	"POST /v1/tasks/{id}/obligations/{oid}/cancel":     true,
+	"POST /v1/tasks/{id}/agents/{aid}/resume":          true,
 }

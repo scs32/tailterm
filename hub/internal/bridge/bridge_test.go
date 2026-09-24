@@ -370,7 +370,7 @@ func TestEscalationsReachTheOwner(t *testing.T) {
 	for _, c := range own.Components[0].Components {
 		labels = append(labels, c.Label)
 	}
-	if strings.Join(labels, ",") != "Nudge,Reassign…,Open in TailOS" || !strings.HasPrefix(own.Components[0].Components[0].CustomID, "nudge:obl_") {
+	if strings.Join(labels, ",") != "Nudge,Extend 30m,Reassign…,Open in TailOS" || !strings.HasPrefix(own.Components[0].Components[0].CustomID, "nudge:obl_") {
 		t.Fatalf("controls = %v %+v", labels, own.Components)
 	}
 }

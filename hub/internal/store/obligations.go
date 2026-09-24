@@ -133,6 +133,18 @@ func (s *Store) createObligations(ctx context.Context, tx *sql.Tx, m api.Message
 	if needs == "" {
 		return nil
 	}
+	// Broker phase 3: a BLOCK that is not a reply obliges only the project
+	// lead (who can unblock); sent to anyone else it is news, not work. This
+	// stops "wait for X" BLOCKs to workers from escalating to the owner.
+	if req.Envelope != nil && req.Envelope.Kind == api.EnvelopeKindBlock && req.ReplyTo == 0 {
+		var orchestrator, recipient string
+		if err := tx.QueryRowContext(ctx, `SELECT t.orchestrator,COALESCE(a.name,'') FROM tasks t LEFT JOIN agents a ON a.id=? WHERE t.id=?`, req.To, m.TaskID).Scan(&orchestrator, &recipient); err != nil {
+			return err
+		}
+		if orchestrator == "" || !strings.EqualFold(orchestrator, recipient) {
+			needs = api.ObligationNeedsDelivery
+		}
+	}
 	kind, subject := obligationSubject(req)
 	created := m.CreatedAt
 	ackDue := created.Add(api.ObligationAckDeadline)
@@ -150,8 +162,8 @@ func (s *Store) createObligations(ctx context.Context, tx *sql.Tx, m api.Message
 	}
 	id := newObligationID("obl")
 	// wakes starts at 1: the wake job queued below with the message.
-	if _, err := tx.ExecContext(ctx, `INSERT INTO obligations (id,task_id,message_seq,agent_id,subject,source_kind,needs,state,created_at,ack_due_at,due_at,changed_at,wakes) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,1)`,
-		id, m.TaskID, m.Seq, req.To, subject, kind, needs, api.ObligationQueued, ts(created), ts(ackDue), ts(due), ts(created)); err != nil {
+	if _, err := tx.ExecContext(ctx, `INSERT INTO obligations (id,task_id,message_seq,agent_id,subject,source_kind,needs,state,created_at,ack_due_at,due_at,changed_at,wakes,via_role) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,1,?)`,
+		id, m.TaskID, m.Seq, req.To, subject, kind, needs, api.ObligationQueued, ts(created), ts(ackDue), ts(due), ts(created), messageRole(req)); err != nil {
 		return err
 	}
 	return insertWakeJob(ctx, tx, m.TaskID, id, req.To, created, created)
@@ -479,7 +491,22 @@ func (s *Store) ReassignObligation(ctx context.Context, taskID, obligationID str
 	if err != nil || target.Status == api.AgentClosed {
 		return api.Message{}, api.ErrInvalid
 	}
-	original, err := loadMessage(tx, ctx, taskID, old.MessageSeq)
+	m, err := s.reissueObligation(ctx, tx, task, old, target, actor, req.Reason)
+	if err != nil {
+		return m, err
+	}
+	if err := tx.Commit(); err != nil {
+		return m, err
+	}
+	s.notify(taskID)
+	return m, nil
+}
+
+// reissueObligation supersedes an open obligation and re-sends its message to
+// target in the caller's transaction, keeping how it was addressed (a role
+// obligation stays a role obligation).
+func (s *Store) reissueObligation(ctx context.Context, tx *sql.Tx, task api.Task, old api.Obligation, target api.Agent, actor, why string) (api.Message, error) {
+	original, err := loadMessage(tx, ctx, task.ID, old.MessageSeq)
 	if err != nil {
 		return api.Message{}, err
 	}
@@ -487,8 +514,8 @@ func (s *Store) ReassignObligation(ctx context.Context, taskID, obligationID str
 	env.Refs["reassignedBy"] = strings.ReplaceAll(actor, " ", "-")
 	now := s.now()
 	reason := "reassigned by " + actor
-	if req.Reason != "" {
-		reason += ": " + req.Reason
+	if why != "" {
+		reason += ": " + why
 	}
 	if _, err := tx.ExecContext(ctx, `UPDATE obligations SET state=?,outcome=?,reason=?,closed_at=?,changed_at=? WHERE id=?`,
 		api.ObligationClosed, api.OutcomeSuperseded, reason, ts(now), ts(now), old.ID); err != nil {
@@ -502,11 +529,8 @@ func (s *Store) ReassignObligation(ctx context.Context, taskID, obligationID str
 	if err := s.createObligations(ctx, tx, m, reissue, false); err != nil {
 		return m, err
 	}
-	if err := tx.Commit(); err != nil {
-		return m, err
-	}
-	s.notify(taskID)
-	return m, nil
+	_, err = tx.ExecContext(ctx, `UPDATE obligations SET via_role=(SELECT via_role FROM obligations WHERE id=?) WHERE message_seq=? AND agent_id=?`, old.ID, m.Seq, target.ID)
+	return m, err
 }
 
 func reassignedEnvelope(original api.Message, toName string, seq int64) *api.Envelope {

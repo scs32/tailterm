@@ -239,7 +239,14 @@ func (s *Store) ScheduleMonitorDelivery(ctx context.Context, taskID string, lead
 		if _, err = tx.ExecContext(ctx, `SAVEPOINT monitor_message`); err != nil {
 			return notice, "unknown", err
 		}
-		req := api.PostMessageRequest{To: target.ID, Text: text, RequestID: notice.PendingRequestID}
+		// Broker phase 3: a typed notice, so readers (the Discord bridge,
+		// Jev, the stop hook) see a hub notice, never an owner message.
+		req := api.PostMessageRequest{To: target.ID, RequestID: notice.PendingRequestID, Envelope: &api.Envelope{
+			Kind: api.EnvelopeKindNotice, To: target.Name, Subject: "Queue stall needs the lead's attention",
+			Refs: map[string]string{"queue": "stall"}, Body: api.EnvelopeBody{Text: text}}}
+		if err := api.NormalizeEnvelopePost(&req); err != nil {
+			return notice, "unknown", err
+		}
 		by := api.Caller{Node: "system", User: "schedule-monitor"}
 		message, postErr := s.insertMessageWithResume(ctx, tx, task, req, target, by, false, false, false)
 		if postErr == nil {

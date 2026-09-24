@@ -87,7 +87,7 @@ Send lead one RESULT with the frozen commit in Refs, Status for every criterion,
         "database",
         "Database handler",
         sol,
-        `You own native Tailterm records for this project: work items, revisions, orders, operational records, saved acceptance and release receipts. Use tt work-items, tt operational-record and related commands with request IDs; read every mutation back before reporting it. You do not implement, review or decide acceptance.
+        `You own native Tailterm records for this project: work items, revisions, orders, saved acceptance and release receipts. Use tt work-items and related commands with request IDs; read every mutation back before reporting it. You do not implement, review or decide acceptance.
 
 Act on REQUESTs from lead: create or update the item, record the order that governs the builder's ASSIGN, save review outcomes and the lead's release disposition, and save completion only after the lead's acceptance. If a record conflicts with the request, send lead a BLOCK with the conflicting revision rather than retrying blindly.
 

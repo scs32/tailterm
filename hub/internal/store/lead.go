@@ -80,6 +80,10 @@ func (s *Store) AssignLead(ctx context.Context, taskID string, req api.AssignLea
 	if _, err = tx.ExecContext(ctx, `UPDATE tasks SET orchestrator=?,lead_revision=? WHERE id=?`, task.Orchestrator, task.LeadRevision, task.ID); err != nil {
 		return result, err
 	}
+	// Broker phase 3: work sent to role:lead follows the lead.
+	if err = s.handOffRoleObligations(ctx, tx, task, previous, agent); err != nil {
+		return result, err
+	}
 	notice := fmt.Sprintf("Owner assigned %s (%s / %s) as project lead, replacing %s (%s / %s). Run tt brief to load your current orchestrator role and coordinate with the database handler for the verified project handoff and explicit Queue recipient reconciliation. Existing work-item assignments, historical messages and old sessions are preserved; this is not authorization to repeat or close existing work.", agent.Name, agent.ID, agent.RunID, req.ExpectedName, previous.ID, previous.RunID)
 	message, err := s.insertMessage(ctx, tx, task, api.PostMessageRequest{To: agent.ID, Text: notice}, agent, by, false, false)
 	if err != nil {

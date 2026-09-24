@@ -1,0 +1,54 @@
+package server
+
+import (
+	"net/http"
+	"testing"
+
+	"github.com/scs32/tailterm/hub/internal/api"
+)
+
+// Broker phase 3 (docs/broker-phase-3.md).
+
+// c1: legacy writers answer 410 Gone; c10: the bridge reaches the new owner
+// routes and still nothing else.
+func TestPhase3Routes(t *testing.T) {
+	h := newTokenHub(t)
+	task, builder, o := h.project()
+	base := "/v1/tasks/" + task.ID
+	for _, path := range []string{
+		base + "/required-deliveries",
+		base + "/deliveries/dly_0000000000000000/follow-through/check",
+		base + "/deliveries/dly_0000000000000000/follow-through/report",
+		base + "/operational-records",
+		base + "/operational-records/opr_0000000000000000/commit",
+	} {
+		var e api.ErrorResponse
+		if code, _ := h.do(ownerToken, "POST", path, map[string]any{}, &e); code != http.StatusGone || e.Code != "retired" {
+			t.Errorf("POST %s = %d %+v, want 410 retired", path, code, e)
+		}
+	}
+	var caps api.Capabilities
+	h.do(ownerToken, "GET", "/v1/capabilities", nil, &caps)
+	if caps.ReliableDelivery.Supported || caps.OperationalRecords.Supported {
+		t.Errorf("capabilities still advertise retired writers: %+v %+v", caps.ReliableDelivery, caps.OperationalRecords)
+	}
+	var out api.OwnerActionResult
+	if code, _ := h.do(bridgeToken, "POST", base+"/obligations/"+o.ID+"/extend", api.ObligationExtendRequest{For: "30m", RequestID: "discord-interaction-1"}, &out); code != http.StatusCreated || out.Obligation == nil {
+		t.Fatalf("bridge extend = %d %+v", code, out)
+	}
+	if code, _ := h.do(bridgeToken, "POST", base+"/obligations/"+o.ID+"/extend", api.ObligationExtendRequest{For: "30m", RequestID: "discord-interaction-1"}, &out); code != http.StatusOK || !out.Replay {
+		t.Fatalf("a retried extend = %d %+v", code, out)
+	}
+	if code, _ := h.do(bridgeToken, "POST", base+"/obligations/"+o.ID+"/cancel", api.ObligationCancelRequest{Reason: "not needed", RequestID: "discord-interaction-2"}, &out); code != http.StatusCreated {
+		t.Fatalf("bridge cancel = %d", code)
+	}
+	if code, _ := h.do(bridgeToken, "POST", base+"/obligations/"+o.ID+"/answer", api.ObligationAnswerRequest{Text: "x", RequestID: "discord-interaction-3"}, nil); code != http.StatusConflict {
+		t.Fatalf("answering a closed obligation = %d, want 409", code)
+	}
+	if code, _ := h.do(bridgeToken, "POST", base+"/agents/"+builder.ID+"/resume", api.AgentResumeRequest{RequestID: "discord-interaction-4"}, nil); code != http.StatusConflict {
+		t.Fatalf("resuming an active agent = %d, want 409", code)
+	}
+	if code, _ := h.do(bridgeToken, "PATCH", base+"/agents/"+builder.ID, map[string]any{"status": "retired"}, nil); code != http.StatusForbidden {
+		t.Fatalf("the bridge edited an agent directly: %d", code)
+	}
+}
