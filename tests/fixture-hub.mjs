@@ -43,12 +43,13 @@ export function createFixtureHub({
     ).length,
   });
   const api = {
-    createTask(name, goal = "", allowAgentSpawn = false) {
+    createTask(name, goal = "", allowAgentSpawn = false, orchestrator = "") {
       const t = {
         id: id("tsk"),
         name,
         goal,
         allowAgentSpawn,
+        orchestrator,
         status: "open",
         createdAt: now(),
         createdBy: { node, user },
@@ -67,10 +68,13 @@ export function createFixtureHub({
         runtime = "claude",
         cwd = "",
         parentAgentId = "",
+        agentId = "",
+        runId = "",
+        role = "",
       },
     ) {
       const a = {
-        id: id("agt"),
+        id: agentId || id("agt"),
         taskId,
         name,
         host,
@@ -78,6 +82,8 @@ export function createFixtureHub({
         runtime,
         cwd,
         parentAgentId,
+        runId: runId || id("run"),
+        role,
         status: "starting",
         title: "",
         createdAt: now(),
@@ -168,7 +174,12 @@ export function createFixtureHub({
           return json(400, { error: "invalid request" });
         return json(
           201,
-          api.createTask(body.name, body.goal || "", !!body.allowAgentSpawn),
+          api.createTask(
+            body.name,
+            body.goal || "",
+            !!body.allowAgentSpawn,
+            body.orchestrator || "",
+          ),
         );
       }
       return json(200, { tasks: api.tasks() });

@@ -37,27 +37,37 @@ export async function exerciseTasks(page, hub, origin) {
     ),
   );
   // Configure the hub through the dialog, including the connection probe.
-  await palette("Task hub: configure");
+  await palette("Project hub: configure");
   await page.locator("#hub-url").fill(origin + "/fixture-hub");
   await page.locator("#hub-test").click();
   await page.getByText("Hub sees this browser as fixture-browser").waitFor();
+  assert.ok(
+    hub.api.requests.some((request) => request.startsWith("GET /v1/whoami")),
+    "configuration probes the isolated hub",
+  );
   await page.locator("#hub-save").click();
-  await page.getByText("Task hub saved.").waitFor();
+  await page.getByText("Project hub saved.").waitFor();
 
   // Create a task with its first agent from the current tab.
   const before = await panes();
-  await palette("Task: new…");
+  await palette("Project: new…");
   await page.locator("#task-name").fill("demo");
   await page.locator("#task-goal").fill("prove the mirror");
-  await page.locator("#task-with-agent").check();
+  assert.equal(await page.locator("#task-with-agent").isChecked(), true);
+  assert.equal(await page.locator("#task-with-agent").isDisabled(), true);
   await page.locator("#task-allow-spawn").check();
   await page.locator("#agent-name").fill("planner");
+  await page.locator("#agent-cwd").fill("/tmp/fixture-project");
   await page.locator("#task-create").click();
   await waitFor(
     async () =>
-      /planner is starting/.test(await page.locator("#notice").innerText()) ||
-      (await page.locator("#task-error").count()) === 0,
-    "task creation (" +
+      (await page.locator("#dialog").isHidden()) &&
+      hub.api.tasks().some((t) => t.name === "demo") &&
+      hub.api
+        .agents()
+        .filter((a) => a.name === "planner" || a.role === "database_handler")
+        .length === 2,
+    "project creation (" +
       (await page
         .locator("#task-error")
         .innerText()
@@ -66,19 +76,26 @@ export async function exerciseTasks(page, hub, origin) {
   );
   const task = hub.api.tasks().find((t) => t.name === "demo");
   assert.ok(task, "task created on the hub");
+  assert.equal(task.orchestrator, "planner");
   const planner = hub.api.agents().find((a) => a.name === "planner");
   assert.ok(planner, "tt spawn registered the agent through the SSH fixture");
+  assert.equal(planner.role, "", "planner is the orchestrator");
+  assert.match(planner.runId, /^run_[0-9a-f]{16}$/);
+  const handler = hub.api.agents().find((a) => a.role === "database_handler");
+  assert.ok(handler, "a database handler launched with the orchestrator");
+  assert.match(handler.runId, /^run_[0-9a-f]{16}$/);
+  assert.notEqual(handler.id, planner.id);
   await page.locator(".mode-switch [data-mode=terminals]").click();
   await page.locator("#tabs .task-tab button[role=tab]").click();
-  await waitFor(async () => (await panes()) === 1, "planner pane");
+  await waitFor(async () => (await panes()) === 2, "planner and handler panes");
   assert.equal(await page.locator("#tabs .tab.task-tab").count(), 1);
   assert.equal(
     await page.locator("#tabs .task-tab .tab-name").innerText(),
     "demo",
   );
   await waitFor(
-    async () => /Task demo: 1 agent/.test(await taskTitle()),
-    "task rollup in the tab tooltip",
+    async () => /Project demo: 2 agents/.test(await taskTitle()),
+    "project rollup in the tab tooltip",
   );
 
   // An agent the hub reports later joins the same tab.
@@ -86,7 +103,8 @@ export async function exerciseTasks(page, hub, origin) {
     name: "tester",
     session: "tester",
   });
-  await waitFor(async () => (await panes()) === 2, "tester pane");
+  hub.api.event(task.id, "started", tester.id);
+  await waitFor(async () => (await panes()) === 3, "tester pane");
   assert.equal(await page.locator("#tabs .tab.task-tab").count(), 1);
   assert.equal(
     await page.locator("#tabs .task-tab .tab-name").innerText(),
@@ -104,7 +122,7 @@ export async function exerciseTasks(page, hub, origin) {
   assert.match(await taskTitle(), /1 done/);
 
   // Board mode: post as the human, then receive an agent message live.
-  await palette("Task demo: board");
+  await palette("Project demo: board");
   await waitFor(
     async () =>
       (await page
@@ -128,7 +146,7 @@ export async function exerciseTasks(page, hub, origin) {
   await page
     .locator(".board-text", { hasText: "planner reporting in" })
     .waitFor();
-  assert.equal(await page.locator(".board-agents-row .board-agent").count(), 2);
+  assert.equal(await page.locator(".board-agents-row .board-agent").count(), 3);
   await page.screenshot({ path: ".build/board-preview.png" });
   // Terminals survive the mode switch: their buffers still hold the prompt.
   assert.ok(
@@ -137,10 +155,10 @@ export async function exerciseTasks(page, hub, origin) {
   // Tasks mode lists the task with its agents and rollup.
   await page.locator(".mode-switch [data-mode=tasks]").click();
   await page.locator(".task-card", { hasText: "demo" }).waitFor();
-  assert.equal(await page.locator(".task-card .board-agent").count(), 2);
+  assert.equal(await page.locator(".task-card .board-agent").count(), 3);
   assert.match(
     await page.locator(".task-card header .fine").innerText(),
-    /2 agents/,
+    /3 agents/,
   );
   await page.screenshot({ path: ".build/tasks-preview.png" });
   // Keyboard shortcut returns to Terminals with the panes intact.
@@ -150,11 +168,11 @@ export async function exerciseTasks(page, hub, origin) {
       (await page.locator(".terminal-shell").getAttribute("hidden")) === null,
     "terminals mode",
   );
-  assert.equal(await panes(), 2);
+  assert.equal(await panes(), 3);
 
   // Closing an agent removes its pane; closing the task removes the rest.
   hub.api.event(task.id, "closed", tester.id);
-  await waitFor(async () => (await panes()) === 1, "tester pane closed");
+  await waitFor(async () => (await panes()) === 2, "tester pane closed");
   hub.api.closeTask(task.id);
   await waitFor(
     async () => (await page.locator("#tabs .tab.task-tab").count()) === 0,

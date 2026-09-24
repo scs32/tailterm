@@ -145,8 +145,12 @@ const ssh = new ssh2.Server(
               session: arg("--name"),
               runtime: arg("--runtime") || "claude",
               cwd: arg("--cwd") || "",
+              agentId: arg("--agent-id") || "",
+              runId: arg("--expected-run-id") || "",
+              role: arg("--role") || "",
             });
             sessions.add(agent.session);
+            fixtureHub.api.event(task.id, "started", agent.id);
             accepted.write(JSON.stringify(agent) + "\n");
             accepted.exit(0);
             accepted.end();
@@ -761,13 +765,14 @@ try {
         const r = indexedDB.open("tailserve", 1);
         r.onsuccess = () => {
           const tx = r.result.transaction("vault");
-          const q = tx.objectStore("vault").get("encrypted");
+          const q = tx.objectStore("vault").get("encrypted-v2");
           q.onsuccess = () => resolve(q.result);
           q.onerror = reject;
         };
       }),
   );
-  assert.equal(record.format, "tailserve-vault");
+  assert.equal(record.version, 2);
+  assert.equal(typeof record.ciphertext, "string");
   assert.doesNotMatch(
     JSON.stringify(record),
     /static-ssh-password|PRIVATE KEY|fixture-node/,
