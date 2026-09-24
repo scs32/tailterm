@@ -9,7 +9,7 @@ Owns: see "Ownership"
 Acceptance: k1–k11 below
 ```
 
-Status: built (`fc36cf0`), round-one fixes applied, in round-two review. Written
+Status: released as `fdc9b6e` ([release record](releases/broker-phase3.1-fdc9b6e/README.md)). Written
 September 24, 2026, after the shadow week showed agents doing assigned work without ever
 acknowledging it.
 
