@@ -196,12 +196,23 @@ def validate_plan(plan: Any) -> dict[str, Any]:
         "appName",
         "tcpListener",
     }
-    if set(deployment) != deployment_fields:
+    # Optional: a Jev (TypeSafe) API key file mounted read-only into the hub.
+    optional_fields = {"typesafeKeyPath"}
+    if not deployment_fields <= set(deployment) <= deployment_fields | optional_fields:
         raise PreflightFailure("invalid-input", "deployment fields do not match schema v1")
     normalized_deployment = {
         field: _string(deployment.get(field), f"deployment.{field}")
-        for field in sorted(deployment_fields)
+        for field in sorted(set(deployment))
     }
+    key_path = normalized_deployment.get("typesafeKeyPath")
+    if key_path is not None and (
+        not key_path.startswith("/mnt/deepfreeze/tailterm-hub/")
+        or ".." in pathlib.PurePosixPath(key_path).parts
+        or any(c.isspace() for c in key_path)
+    ):
+        raise PreflightFailure(
+            "invalid-input", "deployment.typesafeKeyPath must be a plain path under /mnt/deepfreeze/tailterm-hub/"
+        )
 
     normalized = dict(plan)
     normalized.update(

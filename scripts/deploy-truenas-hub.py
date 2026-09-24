@@ -83,6 +83,8 @@ def _deployment_plan(plan: dict[str, Any], release: str) -> dict[str, str]:
         "appName": APP_NAME,
         "tcpListener": TCP_LISTENER,
     }
+    if "typesafeKeyPath" in deployment:
+        expected["typesafeKeyPath"] = f"{BASE}/typesafe-key"
     for field, value in expected.items():
         if deployment.get(field) != value:
             raise PreflightFailure("invalid-input", f"deployment.{field} must be {value}")
@@ -242,6 +244,42 @@ def _remote(
     return completed.stdout
 
 
+
+def hub_compose(deployment: dict[str, Any], binary_destination: str) -> dict[str, Any]:
+    """The tailterm-hub app definition; an optional Jev key is mounted read-only."""
+    environment = {
+        "TAILTERM_TCP_LISTEN": "0.0.0.0:18765",
+        "TAILTERM_STATE": "/state",
+        "TAILTERM_TOKEN_FILE": "/run/hub-token",
+        "TAILTERM_MAX_AGENTS": "32",
+    }
+    volumes = [
+        f"{binary_destination}:/opt/tailterm-hub:ro",
+        f"{deployment['stateDirectory']}:/state",
+        f"{deployment['tokenPath']}:/run/hub-token:ro",
+    ]
+    if deployment.get("typesafeKeyPath"):
+        environment["TAILTERM_TYPESAFE_KEY_FILE"] = "/run/typesafe-key"
+        volumes.append(f"{deployment['typesafeKeyPath']}:/run/typesafe-key:ro")
+    return {
+        "services": {
+            "hub": {
+                "image": "gcr.io/distroless/static-debian12:nonroot",
+                "user": "950:950",
+                "restart": "unless-stopped",
+                "entrypoint": ["/opt/tailterm-hub"],
+                "read_only": True,
+                "cap_drop": ["ALL"],
+                "security_opt": ["no-new-privileges:true"],
+                "ports": [f"{deployment['tcpListener']}:18765"],
+                "environment": environment,
+                "volumes": volumes,
+                "mem_limit": "512m",
+                "cpus": "1.0",
+            }
+        }
+    }
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("release")
@@ -364,33 +402,21 @@ def main(argv: list[str] | None = None) -> int:
         )
         last_completed_stage = stage
 
-        compose = {
-            "services": {
-                "hub": {
-                    "image": "gcr.io/distroless/static-debian12:nonroot",
-                    "user": "950:950",
-                    "restart": "unless-stopped",
-                    "entrypoint": ["/opt/tailterm-hub"],
-                    "read_only": True,
-                    "cap_drop": ["ALL"],
-                    "security_opt": ["no-new-privileges:true"],
-                    "ports": [f"{deployment['tcpListener']}:18765"],
-                    "environment": {
-                        "TAILTERM_TCP_LISTEN": "0.0.0.0:18765",
-                        "TAILTERM_STATE": "/state",
-                        "TAILTERM_TOKEN_FILE": "/run/hub-token",
-                        "TAILTERM_MAX_AGENTS": "32",
-                    },
-                    "volumes": [
-                        f"{binary_destination}:/opt/tailterm-hub:ro",
-                        f"{deployment['stateDirectory']}:/state",
-                        f"{deployment['tokenPath']}:/run/hub-token:ro",
-                    ],
-                    "mem_limit": "512m",
-                    "cpus": "1.0",
-                }
-            }
-        }
+        if deployment.get("typesafeKeyPath"):
+            # A missing key file would fail the bind mount and stop the hub.
+            stage = "typesafe-key-check"
+            key = shlex.quote(deployment["typesafeKeyPath"])
+            _remote(
+                plan,
+                actual_host,
+                f"test -s {key} && test \"$(stat -c %u {key})\" = 950",
+                stage=stage,
+                last_completed_stage=last_completed_stage,
+                preflight=preflight,
+            )
+            last_completed_stage = stage
+
+        compose = hub_compose(deployment, binary_destination)
         request: dict[str, Any] = {"custom_compose_config": compose}
         if arguments.update:
             middleware_command = "midclt call -j app.update tailterm-hub "

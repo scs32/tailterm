@@ -555,3 +555,45 @@ test("deployment separates guard, transport-unknown, and started-command mutatio
     assert.equal(observed.result.lastCompletedStage, "remote-identity");
   }
 });
+
+test("an optional Jev key is validated and mounted read-only", () => {
+  const directory = workspace("typesafe-key");
+  const withKey = planFor(directory, {});
+  withKey.deployment.typesafeKeyPath = "/mnt/deepfreeze/tailterm-hub/typesafe-key";
+  const probe = (plan) =>
+    spawnSync(
+      "python3",
+      [
+        "-c",
+        [
+          "import json, sys, importlib.util as u",
+          "sys.path.insert(0, 'scripts')",
+          "def load(name, path):",
+          "    spec = u.spec_from_file_location(name, path); m = u.module_from_spec(spec); spec.loader.exec_module(m); return m",
+          "pre = load('pre', 'scripts/truenas_release_preflight.py')",
+          "dep = load('dep', 'scripts/deploy-truenas-hub.py')",
+          "plan = json.loads(sys.stdin.read())",
+          "try:",
+          "    n = pre.validate_plan(plan)",
+          "except pre.PreflightFailure as e:",
+          "    print(json.dumps({'error': e.message})); sys.exit(0)",
+          "print(json.dumps(dep.hub_compose(n['deployment'], n['deployment']['binaryDestination'])))",
+        ].join("\n"),
+      ],
+      { cwd: root, input: JSON.stringify(plan), encoding: "utf8" },
+    );
+  const compose = JSON.parse(probe(withKey).stdout).services.hub;
+  assert.equal(compose.environment.TAILTERM_TYPESAFE_KEY_FILE, "/run/typesafe-key");
+  assert.ok(compose.volumes.includes("/mnt/deepfreeze/tailterm-hub/typesafe-key:/run/typesafe-key:ro"));
+  const without = JSON.parse(probe(planFor(directory, {})).stdout).services.hub;
+  assert.equal(without.environment.TAILTERM_TYPESAFE_KEY_FILE, undefined);
+  assert.equal(without.volumes.length, 3);
+  for (const bad of ["/etc/passwd", "/mnt/deepfreeze/tailterm-hub/../x", "/mnt/deepfreeze/tailterm-hub/a b"]) {
+    const plan = planFor(directory, {});
+    plan.deployment.typesafeKeyPath = bad;
+    assert.match(JSON.parse(probe(plan).stdout).error, /typesafeKeyPath/);
+  }
+  const extra = planFor(directory, {});
+  extra.deployment.somethingElse = "x";
+  assert.match(JSON.parse(probe(extra).stdout).error, /schema v1/);
+});
