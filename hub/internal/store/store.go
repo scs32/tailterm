@@ -930,6 +930,10 @@ func (s *Store) PostMessage(ctx context.Context, taskID string, req api.PostMess
 			target = a
 		}
 	}
+	// A typed message's stated recipient must be the one it is routed to.
+	if e := req.Envelope; e != nil && e.To != "" && !strings.HasPrefix(e.To, "role:") && (req.To == "" || (target.ID != e.To && target.Name != e.To)) {
+		return api.Message{}, &api.EnvelopeError{Problems: []api.Problem{{Field: "to", Reason: "must name the agent the message is addressed to"}}}
+	}
 	if req.ReplyTo > 0 {
 		var replyTask string
 		if err := tx.QueryRowContext(ctx, `SELECT task_id FROM messages WHERE seq=?`, req.ReplyTo).Scan(&replyTask); err != nil || replyTask != taskID {

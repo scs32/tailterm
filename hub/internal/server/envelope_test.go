@@ -150,3 +150,26 @@ func TestMessageChecksClassifyEveryPost(t *testing.T) {
 		}
 	}
 }
+
+// Round-one blocker R2, hub side: the stated recipient must match the routing.
+func TestTypedRecipientMustMatchRouting(t *testing.T) {
+	c := newClient(t)
+	task := c.task("recipients")
+	lead := c.agent(task, "lead")
+	builder := c.agent(task, "builder")
+	path := "/v1/tasks/" + task.ID + "/messages"
+	for _, req := range []api.PostMessageRequest{
+		{AgentID: builder.ID, To: builder.ID, Envelope: testEnvelope()}, // envelope says lead
+		{AgentID: builder.ID, Envelope: testEnvelope()},                 // unaddressed
+	} {
+		var rejected api.ErrorResponse
+		if code := c.do("POST", path, req, &rejected); code != http.StatusBadRequest || len(rejected.Problems) != 1 || rejected.Problems[0].Field != "to" {
+			t.Errorf("to=%q: %d %+v", req.To, code, rejected)
+		}
+	}
+	byID := testEnvelope()
+	byID.To = lead.ID
+	if code := c.do("POST", path, api.PostMessageRequest{AgentID: builder.ID, To: lead.ID, Envelope: byID}, nil); code != 201 {
+		t.Fatalf("recipient by id: %d", code)
+	}
+}

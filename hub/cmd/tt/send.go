@@ -30,6 +30,7 @@ func cmdSend(e env, args []string) error {
 	task := fs.String("task", e.task, "task id")
 	to := fs.String("to", "", "recipient agent name or id")
 	reply := fs.Int64("reply-to", 0, "message sequence being answered")
+	links := registerLinkFlags(fs)
 	requestID := fs.String("request-id", "", "stable retry identity; when omitted it is derived from the message, so an identical resend returns the original")
 	var env api.Envelope
 	fs.StringVar(&env.Kind, "kind", "", "message kind")
@@ -65,7 +66,8 @@ func cmdSend(e env, args []string) error {
 		var extra []string
 		fs.Visit(func(f *flag.Flag) {
 			switch f.Name {
-			case "file", "task", "to", "reply-to", "request-id":
+			case "file", "task", "to", "reply-to", "request-id",
+				"work-item-task", "work-item", "work-item-revision", "work-order-task", "work-order-message", "related":
 			default:
 				extra = append(extra, "--"+f.Name)
 			}
@@ -105,20 +107,25 @@ func cmdSend(e env, args []string) error {
 			return &exitError{2, err}
 		}
 		for _, raw := range evidence {
-			parsed := api.ParseEvidence(raw)
-			if len(parsed) != 1 {
+			key, item, ok := api.ParseEvidenceEntry(raw)
+			if !ok {
 				return &exitError{2, fmt.Errorf(`--evidence %q must look like "e1: command -> outcome"`, raw)}
 			}
 			if env.Evidence == nil {
 				env.Evidence = map[string]api.Evidence{}
 			}
-			for k, v := range parsed {
-				env.Evidence[k] = v
-			}
+			env.Evidence[key] = item
 		}
 	}
-	if *to != "" && env.To == "" {
+	// One recipient: --to and the envelope's to must agree, and routing uses it.
+	switch {
+	case *to != "" && env.To != "" && *to != env.To:
+		return &exitError{2, fmt.Errorf("--to %q conflicts with the message's to %q", *to, env.To)}
+	case *to != "":
 		env.To = *to
+	}
+	if strings.HasPrefix(env.To, "role:") {
+		return &exitError{2, fmt.Errorf("role recipients such as %q are resolved in broker phase 2; name an agent", env.To)}
 	}
 	if problems := api.ValidateEnvelope(env); problems != nil {
 		return &exitError{2, problemsError(problems)}
@@ -134,8 +141,8 @@ func cmdSend(e env, args []string) error {
 	ctx, cancel := ctxTimeout(10 * time.Second)
 	defer cancel()
 	target := ""
-	if *to != "" {
-		if target, err = resolveAgent(ctx, c, *task, *to); err != nil {
+	if env.To != "" {
+		if target, err = resolveAgent(ctx, c, *task, env.To); err != nil {
 			return err
 		}
 	}
@@ -144,7 +151,11 @@ func cmdSend(e env, args []string) error {
 		digest := sha256.Sum256([]byte(e.runID + "\x00" + target + "\x00" + fmt.Sprint(*reply) + "\x00" + string(raw)))
 		*requestID = fmt.Sprintf("send-%x", digest[:12])
 	}
-	m, err := c.PostMessage(ctx, *task, api.PostMessageRequest{Envelope: &env, To: target, AgentID: e.agent, ReplyTo: *reply, RequestID: *requestID})
+	req := api.PostMessageRequest{Envelope: &env, To: target, AgentID: e.agent, ReplyTo: *reply}
+	if err := links.apply(ctx, c, e, *task, target, *reply, api.RenderText(env), *requestID, false, &req); err != nil {
+		return err
+	}
+	m, err := c.PostMessage(ctx, *task, req)
 	var httpErr *api.HTTPError
 	if errors.As(err, &httpErr) && len(httpErr.Problems) > 0 {
 		return &exitError{2, problemsError(httpErr.Problems)}

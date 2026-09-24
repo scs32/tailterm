@@ -12,8 +12,9 @@ from typesafe_sdk import Choice, Noul, TypeSafeClient
 from run_jev import load_key
 
 HERE = pathlib.Path(__file__).parent
-SECRET = re.compile(r"(sk-[A-Za-z0-9_-]{16,}|ghp_[A-Za-z0-9]{20,}|tskey-[A-Za-z0-9-]{10,}|Bearer\s+[A-Za-z0-9._-]{16,}"
-                    r"|(?i:token|secret|password|api[_-]?key)\s*[:=]\s*\S{8,})")
+# Same pattern as hub/internal/jev (quoted and structured credentials included).
+SECRET = re.compile(r"""(sk-[A-Za-z0-9_-]{16,}|gh[pousr]_[A-Za-z0-9]{20,}|tskey-[A-Za-z0-9-]{10,}|(?i:bearer)\s+[A-Za-z0-9._~+/=-]{16,}"""
+                    r"""|(?i:["']?\b(?:token|secret|password|passwd|api[_-]?key|access[_-]?key|client[_-]?secret)\b["']?\s*[:=]\s*["']?)[^\s"',;}]{8,})""")
 
 KINDS = {
     "assignment": "Gives someone work to do or an order to carry out.",

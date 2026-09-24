@@ -28,8 +28,8 @@ const (
 
 // Secret-looking strings are replaced before any text leaves the hub. Same
 // pattern as tools/jev-kit/run_board_real.py.
-var secretPattern = regexp.MustCompile(`(sk-[A-Za-z0-9_-]{16,}|ghp_[A-Za-z0-9]{20,}|tskey-[A-Za-z0-9-]{10,}|Bearer\s+[A-Za-z0-9._-]{16,}` +
-	`|(?i:token|secret|password|api[_-]?key)\s*[:=]\s*\S{8,})`)
+var secretPattern = regexp.MustCompile(`(sk-[A-Za-z0-9_-]{16,}|gh[pousr]_[A-Za-z0-9]{20,}|tskey-[A-Za-z0-9-]{10,}|(?i:bearer)\s+[A-Za-z0-9._~+/=-]{16,}` +
+	`|(?i:["']?\b(?:token|secret|password|passwd|api[_-]?key|access[_-]?key|client[_-]?secret)\b["']?\s*[:=]\s*["']?)[^\s"',;}]{8,})`)
 
 func Redact(s string) string { return secretPattern.ReplaceAllString(s, "[REDACTED]") }
 

@@ -188,3 +188,87 @@ func TestParseTextConventionClassification(t *testing.T) {
 		t.Fatalf("comma inside one criterion split: %v", acceptance.Body.Acceptance)
 	}
 }
+
+// Round-one blockers R3, R5, R6, R7 (Codex review of 118a602..53a4e1e).
+func TestSortedKeysIsATotalOrder(t *testing.T) {
+	keys := []string{"a1", "a01", "a2", "a10", "a1b", "b1", "a"}
+	m := map[string]string{}
+	for _, k := range keys {
+		m[k] = k
+	}
+	first := sortedKeys(m)
+	for i := 0; i < 200; i++ {
+		if got := sortedKeys(m); !reflect.DeepEqual(got, first) {
+			t.Fatalf("unstable order: %v vs %v", got, first)
+		}
+	}
+	for _, a := range keys {
+		for _, b := range keys {
+			if a != b && naturalLess(a, b) == naturalLess(b, a) {
+				t.Errorf("not antisymmetric: %s %s", a, b)
+			}
+			for _, c := range keys {
+				if naturalLess(a, b) && naturalLess(b, c) && !naturalLess(a, c) {
+					t.Errorf("not transitive: %s < %s < %s", a, b, c)
+				}
+			}
+		}
+	}
+	e := Envelope{Kind: "assign", Subject: "Keys that compare equal numerically", Body: EnvelopeBody{Objective: "x", Owns: []string{"f"},
+		Acceptance: map[string]string{"a1": "one", "a01": "zero one"}}}
+	want := RenderText(e)
+	for i := 0; i < 200; i++ {
+		req := PostMessageRequest{Envelope: &e}
+		if err := NormalizeEnvelopePost(&req); err != nil || req.Text != want {
+			t.Fatalf("render diverged: %v %q", err, req.Text)
+		}
+		if err := NormalizeEnvelopePost(&req); err != nil {
+			t.Fatalf("second normalize rejected its own rendering: %v", err)
+		}
+	}
+}
+
+func TestSemicolonsInsideValuesSurviveRoundTrip(t *testing.T) {
+	e := Envelope{Kind: "result", Subject: "Both verification commands pass", Body: EnvelopeBody{Outcome: "done", Status: map[string]string{"a1": "pass"}},
+		Evidence: map[string]Evidence{"e1": {Type: "command", Value: "go test ./...; ./verify.sh", Outcome: "ok; no warnings"}}}
+	parsed, _ := ParseTextConvention(RenderText(e))
+	if !reflect.DeepEqual(parsed.Evidence, e.Evidence) {
+		t.Fatalf("evidence lost: %+v", parsed.Evidence)
+	}
+	a := Envelope{Kind: "assign", Subject: "Criteria that contain semicolons", Body: EnvelopeBody{Objective: "x", Owns: []string{"f"},
+		Acceptance: map[string]string{"a1": "exits 2; prints an error", "a2": "tests pass"}}}
+	parsed, _ = ParseTextConvention(RenderText(a))
+	if !reflect.DeepEqual(parsed.Body.Acceptance, a.Body.Acceptance) {
+		t.Fatalf("acceptance lost: %+v", parsed.Body.Acceptance)
+	}
+	key, item, ok := ParseEvidenceEntry("e1 (command): go test ./...; ./verify.sh -> ok")
+	if !ok || key != "e1" || item != (Evidence{Type: "command", Value: "go test ./...; ./verify.sh", Outcome: "ok"}) {
+		t.Fatalf("single entry %s %+v %v", key, item, ok)
+	}
+}
+
+func TestSubjectRulesCatchPathsAndHashVariants(t *testing.T) {
+	base := Envelope{Kind: "notice", Body: EnvelopeBody{Text: "x"}}
+	for _, bad := range []string{"Write reports to /tmp", "Write reports to (/tmp/report.json) today", "Released candidate 43C1DA3 today",
+		"Saved the order for WI_74C050C73F7FF0B4"} {
+		e := base
+		e.Subject = bad
+		if !hasProblem(ValidateEnvelope(e), "subject") {
+			t.Errorf("subject %q accepted", bad)
+		}
+	}
+	for _, ok := range []string{"Handled 1500000 requests without errors", "Board and/or Teams share one layout", "Fixed the deadbeef cache path check"} {
+		e := base
+		e.Subject = ok
+		if ps := ValidateEnvelope(e); ps != nil {
+			t.Errorf("subject %q rejected: %v", ok, ps)
+		}
+	}
+}
+
+func TestQuestionWithURLIsOneQuestion(t *testing.T) {
+	q := Envelope{Kind: "question", Subject: "Escaping rule for search links", Body: EnvelopeBody{Question: "Does /search?q=one need escaping?"}}
+	if ps := ValidateEnvelope(q); ps != nil {
+		t.Fatalf("rejected: %v", ps)
+	}
+}

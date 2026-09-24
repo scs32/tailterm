@@ -211,3 +211,42 @@ func TestScorerRedactsSecrets(t *testing.T) {
 		t.Fatalf("secret reached Jev: %s", sent)
 	}
 }
+
+// Round-one blocker R4: quoted and structured credentials are redacted too.
+func TestRedactQuotedCredentials(t *testing.T) {
+	for _, text := range []string{
+		`{"password":"syntheticsecret123"}`,
+		`password = "syntheticsecret123"`,
+		`api_key: 'syntheticsecret123'`,
+		`"client_secret": "syntheticsecret123",`,
+		`Authorization: Bearer syntheticsecret123abc`,
+		`TOKEN=syntheticsecret123`,
+	} {
+		if got := Redact(text); strings.Contains(got, "syntheticsecret123") {
+			t.Errorf("leaked: %q -> %q", text, got)
+		}
+	}
+	if got := Redact("the token budget is 64k and passwords are rotated"); got != "the token budget is 64k and passwords are rotated" {
+		t.Errorf("over-redacted prose: %q", got)
+	}
+}
+
+func TestTypedBodySecretsNeverReachJev(t *testing.T) {
+	f := newFixture(t, filepath.Join(t.TempDir(), "hub.sqlite"))
+	f.st.EnableJevScoring()
+	srv, bodies := fakeJev(t, nil)
+	m, err := f.st.PostMessage(context.Background(), f.task.ID, api.PostMessageRequest{AgentID: f.agent.ID, Envelope: &api.Envelope{
+		Kind: "notice", Subject: "Deployment settings for the hub",
+		Body: api.EnvelopeBody{Text: `use {"password":"syntheticsecret123"} from the vault`}}}, f.by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := scorer(f, srv.URL).Start(ctx)
+	waitForStatus(t, f, m.Seq, api.JevStatusScored)
+	cancel()
+	<-done
+	if strings.Contains(bodies(), "syntheticsecret123") {
+		t.Fatalf("secret reached Jev: %s", bodies())
+	}
+}

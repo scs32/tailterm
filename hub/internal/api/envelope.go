@@ -116,12 +116,14 @@ var EnvelopeKinds = []string{
 }
 
 var (
-	namedKey     = regexp.MustCompile(`^[a-z][a-z0-9]{0,15}$`)
-	refKey       = regexp.MustCompile(`^[A-Za-z][A-Za-z0-9_-]{0,31}$`)
-	subjectID    = regexp.MustCompile(`\b[a-z]{2,5}_[0-9a-f]{6,}\b`)
-	subjectHex   = regexp.MustCompile(`\b[0-9a-f]{7,}\b`)
-	subjectDigit = regexp.MustCompile(`[0-9]`)
-	subjectPath  = regexp.MustCompile(`(^|\s)(/|~/)[^\s]*/`)
+	namedKey      = regexp.MustCompile(`^[a-z][a-z0-9]{0,15}$`)
+	refKey        = regexp.MustCompile(`^[A-Za-z][A-Za-z0-9_-]{0,31}$`)
+	subjectID     = regexp.MustCompile(`(?i)\b[a-z]{2,5}_[0-9a-f]{6,}\b`)
+	subjectHex    = regexp.MustCompile(`(?i)\b[0-9a-f]{7,}\b`)
+	subjectDigit  = regexp.MustCompile(`[0-9]`)
+	subjectLetter = regexp.MustCompile(`(?i)[a-f]`)
+	subjectPath   = regexp.MustCompile(`(^|[\s(\[{"'<])(/|~/)[A-Za-z0-9._~-]`)
+	questionMark  = regexp.MustCompile(`\?(\s|$)`)
 )
 
 var (
@@ -171,7 +173,8 @@ func ValidateEnvelope(e Envelope) []Problem {
 		add("subject", "must not contain record IDs; put them in refs")
 	}
 	for _, h := range subjectHex.FindAllString(subject, -1) {
-		if subjectDigit.MatchString(h) {
+		// A hash mixes digits and letters; plain numbers and words are prose.
+		if subjectDigit.MatchString(h) && subjectLetter.MatchString(h) {
 			add("subject", "must not contain hashes; put them in refs")
 			break
 		}
@@ -248,7 +251,7 @@ func ValidateEnvelope(e Envelope) []Problem {
 		requiredMap("body.acceptance", b.Acceptance)
 	case EnvelopeKindQuestion:
 		required("body.question", b.Question)
-		if strings.Count(b.Question, "?") > 1 {
+		if len(questionMark.FindAllString(b.Question, -1)) > 1 {
 			add("body.question", "must ask exactly one question")
 		}
 	case EnvelopeKindResult:
@@ -389,7 +392,7 @@ func ParseTextConvention(text string) (e Envelope, matched bool) {
 		case "question":
 			b.Question, last = value, &b.Question
 		case "options":
-			b.Options = parseNamed(splitSemicolons(value))
+			b.Options = parseNamed(splitEntries(value, colonEntry))
 		case "outcome":
 			b.Outcome = strings.ToLower(value)
 		case "answer":
@@ -407,7 +410,7 @@ func ParseTextConvention(text string) (e Envelope, matched bool) {
 		case "text":
 			b.Text, last = value, &b.Text
 		case "acceptance":
-			b.Acceptance = parseNamed(splitSemicolons(value))
+			b.Acceptance = parseNamed(splitEntries(value, colonEntry))
 		case "status":
 			b.Status = parseNamed(splitList(value))
 			for k, v := range b.Status {
@@ -453,27 +456,58 @@ func ParseEvidence(value string) map[string]Evidence { return parseEvidence(valu
 
 func parseEvidence(value string) map[string]Evidence {
 	out := map[string]Evidence{}
-	for _, part := range splitSemicolons(value) {
-		m := namedPair.FindStringSubmatch(part)
-		if m == nil {
-			continue
+	for _, part := range splitEntries(value, colonEntry) {
+		if key, item, ok := ParseEvidenceEntry(part); ok {
+			out[key] = item
 		}
-		item := Evidence{Type: m[2], Value: strings.TrimSpace(m[3])}
-		for _, arrow := range []string{"→", "->"} {
-			if v, o, ok := strings.Cut(item.Value, arrow); ok {
-				item.Value, item.Outcome = strings.TrimSpace(v), strings.TrimSpace(o)
-				if item.Type == "" {
-					item.Type = "command"
-				}
-				break
-			}
-		}
-		if item.Type == "" {
-			item.Type = inferEvidenceType(item.Value)
-		}
-		out[m[1]] = item
 	}
 	return out
+}
+
+// ParseEvidenceEntry reads exactly one "e1 (type): value -> outcome" entry,
+// keeping any semicolons inside the value.
+func ParseEvidenceEntry(part string) (string, Evidence, bool) {
+	m := namedPair.FindStringSubmatch(strings.TrimSpace(part))
+	if m == nil {
+		return "", Evidence{}, false
+	}
+	item := Evidence{Type: m[2], Value: strings.TrimSpace(m[3])}
+	for _, arrow := range []string{"→", "->"} {
+		if v, o, ok := strings.Cut(item.Value, arrow); ok {
+			item.Value, item.Outcome = strings.TrimSpace(v), strings.TrimSpace(o)
+			if item.Type == "" {
+				item.Type = "command"
+			}
+			break
+		}
+	}
+	if item.Type == "" {
+		item.Type = inferEvidenceType(item.Value)
+	}
+	return m[1], item, true
+}
+
+// colonEntry matches the start of a rendered "key (type): value" entry.
+var colonEntry = regexp.MustCompile(`^\s*[a-z][a-z0-9]{0,15}\s*(\([a-z]+\))?\s*:`)
+
+// splitEntries splits on semicolons but rejoins fragments that do not start a
+// new entry, so a semicolon inside a value is preserved.
+func splitEntries(value string, start *regexp.Regexp) []string {
+	var out []string
+	for _, frag := range strings.Split(value, ";") {
+		if len(out) > 0 && !start.MatchString(frag) {
+			out[len(out)-1] += ";" + frag
+			continue
+		}
+		out = append(out, frag)
+	}
+	var trimmed []string
+	for _, p := range out {
+		if p = strings.TrimSpace(p); p != "" {
+			trimmed = append(trimmed, p)
+		}
+	}
+	return trimmed
 }
 
 func inferEvidenceType(v string) string {
@@ -539,13 +573,18 @@ func sortedKeys[V any](m map[string]V) []string {
 	return keys
 }
 
+// naturalLess is a total order: by prefix, then trailing number, then the
+// whole string, so a2 < a10 and a01 and a1 still have a fixed order.
 func naturalLess(a, b string) bool {
 	pa, na := splitTrailingNumber(a)
 	pb, nb := splitTrailingNumber(b)
-	if pa != pb || na < 0 || nb < 0 {
-		return a < b
+	if pa != pb {
+		return pa < pb
 	}
-	return na < nb
+	if na != nb {
+		return na < nb
+	}
+	return a < b
 }
 
 func splitTrailingNumber(s string) (string, int) {

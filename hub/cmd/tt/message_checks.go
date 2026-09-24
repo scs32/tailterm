@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"flag"
 	"fmt"
 	"sort"
@@ -17,7 +18,10 @@ func cmdMessageChecks(e env, args []string) error {
 	summary := fs.Bool("summary", false, "print adoption and Jev totals instead of one line per post")
 	asJSON := fs.Bool("json", false, "JSON output")
 	if err := fs.Parse(args); err != nil {
-		return err
+		if errors.Is(err, flag.ErrHelp) {
+			return nil
+		}
+		return &exitError{2, err}
 	}
 	task, err := e.requireTask()
 	if err != nil {

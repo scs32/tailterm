@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"net/http"
 	"net/http/httptest"
@@ -98,5 +99,75 @@ func TestMessageChecksSummary(t *testing.T) {
 		if !strings.Contains(out, want) {
 			t.Errorf("summary missing %q:\n%s", want, out)
 		}
+	}
+}
+
+// Round-one blocker R1: a bound sender's typed message carries its item link,
+// exactly like tt post, so bound recipients see it.
+func TestBoundAgentSendCarriesItsRecordedItem(t *testing.T) {
+	var posted api.PostMessageRequest
+	binding := &api.AgentWorkItemBinding{
+		ItemTaskID: "tsk_0000000000000001", ItemID: "wi_0000000000000002", ItemRevision: 3,
+		WorkOrderMessage: api.MessageReference{TaskID: "tsk_0000000000000001", Seq: 814},
+	}
+	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == "GET" && strings.Contains(r.URL.Path, "/agents/"):
+			_ = json.NewEncoder(w).Encode(api.Agent{ID: "agt_0000000000000001", WorkItem: binding})
+		case r.Method == "POST" && strings.HasSuffix(r.URL.Path, "/messages"):
+			if err := json.NewDecoder(r.Body).Decode(&posted); err != nil {
+				t.Error(err)
+			}
+			_ = json.NewEncoder(w).Encode(api.Message{Seq: 1})
+		default:
+			http.Error(w, "unexpected route", 500)
+		}
+	}))
+	defer s.Close()
+	t.Setenv("TAILTERM_WORK_ITEM", binding.ItemID)
+	e := env{hub: s.URL, task: binding.ItemTaskID, agent: "agt_0000000000000001", runID: "run_0000000000000003"}
+	if err := cmdSend(e, []string{"--kind", "notice", "--subject", "Build finished on the isolated worktree", "--text", "ready"}); err != nil {
+		t.Fatal(err)
+	}
+	if posted.Envelope == nil || posted.RequestID == "" || posted.AuditKind != api.MessageAuditWork || len(posted.WorkItems) != 1 ||
+		posted.WorkItems[0].ItemID != binding.ItemID || posted.WorkOrderMessage == nil || *posted.WorkOrderMessage != binding.WorkOrderMessage {
+		t.Fatalf("bound send lost durable context: %+v", posted)
+	}
+}
+
+// Round-one blocker R2: one recipient, taken from --to or the file, never both disagreeing.
+func TestSendRecipientComesFromFlagOrFile(t *testing.T) {
+	e, c, task, lead := cliWorkItemFixture(t)
+	file := filepath.Join(t.TempDir(), "msg.json")
+	if err := os.WriteFile(file, []byte(`{"kind":"notice","to":"lead","subject":"Integration window closes today","body":{"text":"rebase first"}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := captureCLIOutput(t, func() error { return cmdSend(e, []string{"--file", file}) }); err != nil {
+		t.Fatal(err)
+	}
+	msgs, err := c.ListMessages(context.Background(), task.ID, 0, "", 50)
+	if err != nil || len(msgs) != 1 || msgs[0].To != lead.ID || msgs[0].Envelope.To != "lead" {
+		t.Fatalf("file recipient not routed: %v %+v", err, msgs)
+	}
+	for _, args := range [][]string{
+		{"--file", file, "--to", "database"},
+		{"--kind", "notice", "--to", "role:lead", "--subject", "Integration window closes today", "--text", "x"},
+	} {
+		var coded *exitError
+		if err := cmdSend(e, args); !errors.As(err, &coded) || coded.code != 2 {
+			t.Errorf("%v: err %v, want exit 2", args, err)
+		}
+	}
+}
+
+// Round-one blocker R8: help succeeds without contacting the hub.
+func TestMessageChecksHelpSucceeds(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Errorf("hub contacted: %s", r.URL.Path)
+	}))
+	defer srv.Close()
+	if err := cmdMessageChecks(env{hub: srv.URL, task: "tsk_0000000000000001"}, []string{"--help"}); err != nil {
+		t.Fatalf("help returned %v", err)
 	}
 }
