@@ -250,3 +250,19 @@ func TestTypedBodySecretsNeverReachJev(t *testing.T) {
 		t.Fatalf("secret reached Jev: %s", bodies())
 	}
 }
+
+func TestScorerZeroValuesUseDefaults(t *testing.T) {
+	f := newFixture(t, filepath.Join(t.TempDir(), "hub.sqlite"))
+	f.st.EnableJevScoring()
+	srv, _ := fakeJev(t, nil)
+	m := f.post(t, "hey lead, defaults check")
+	s := &Scorer{Client: &Client{URL: srv.URL, Key: "test-key", Model: "jev-latest", HTTP: &http.Client{}}, Checks: f.st}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := s.Start(ctx)
+	waitForStatus(t, f, m.Seq, api.JevStatusScored)
+	cancel()
+	<-done
+	if s.Concurrency != 4 || s.Interval != 2*time.Second || s.Timeout != 3*time.Second {
+		t.Fatalf("defaults %+v", s)
+	}
+}

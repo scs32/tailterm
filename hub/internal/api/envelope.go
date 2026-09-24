@@ -118,11 +118,14 @@ var EnvelopeKinds = []string{
 var (
 	namedKey      = regexp.MustCompile(`^[a-z][a-z0-9]{0,15}$`)
 	refKey        = regexp.MustCompile(`^[A-Za-z][A-Za-z0-9_-]{0,31}$`)
-	subjectID     = regexp.MustCompile(`(?i)\b[a-z]{2,5}_[0-9a-f]{6,}\b`)
+	subjectID     = regexp.MustCompile(`(?i)\b[a-z]{2,5}_([0-9a-f]{6,})\b`)
 	subjectHex    = regexp.MustCompile(`(?i)\b[0-9a-f]{7,}\b`)
 	subjectDigit  = regexp.MustCompile(`[0-9]`)
 	subjectLetter = regexp.MustCompile(`(?i)[a-f]`)
-	subjectPath   = regexp.MustCompile(`(^|[\s(\[{"'<])(/|~/)[A-Za-z0-9._~-]`)
+	// Filesystem paths only: home-relative, well-known roots, or a nested path
+	// ending in a file extension. API routes such as /v1/tasks stay allowed.
+	subjectPath   = regexp.MustCompile(`(?:^|[\s(\[{"'<])(?:~/\S*|/(?:tmp|Users|home|mnt|var|private|opt|etc|srv|root|usr|Volumes)(?:/\S*)?(?:$|[\s)\]}"'>.,;:])|/\S+/\S*\.[A-Za-z0-9]{1,5}\b)`)
+	recipientName = regexp.MustCompile(`^(?:role:[a-z][a-z0-9_-]{0,31}|[A-Za-z0-9][A-Za-z0-9_-]{0,63})$`)
 	questionMark  = regexp.MustCompile(`\?(\s|$)`)
 )
 
@@ -169,8 +172,11 @@ func ValidateEnvelope(e Envelope) []Problem {
 	if strings.ContainsAny(e.Subject, "\r\n") {
 		add("subject", "must be one line")
 	}
-	if subjectID.MatchString(subject) {
-		add("subject", "must not contain record IDs; put them in refs")
+	for _, m := range subjectID.FindAllStringSubmatch(subject, -1) {
+		if subjectDigit.MatchString(m[1]) { // set_facade is a word, wi_74c050c7 is an ID
+			add("subject", "must not contain record IDs; put them in refs")
+			break
+		}
 	}
 	for _, h := range subjectHex.FindAllString(subject, -1) {
 		// A hash mixes digits and letters; plain numbers and words are prose.
@@ -182,6 +188,15 @@ func ValidateEnvelope(e Envelope) []Problem {
 	if subjectPath.MatchString(subject) {
 		add("subject", "must not contain paths; put them in refs")
 	}
+
+	if e.To != "" && !recipientName.MatchString(e.To) {
+		add("to", "must be an agent name or id, or role:<role>")
+	}
+	forEachText(e, func(field, value string) {
+		if !ValidText(value, MaxTextLen) {
+			add(field, "must not contain control characters")
+		}
+	})
 
 	for _, k := range sortedKeys(e.Refs) {
 		if !refKey.MatchString(k) {
@@ -287,8 +302,44 @@ func ValidateEnvelope(e Envelope) []Problem {
 	}
 	if whole, err := json.Marshal(e); err == nil && len(whole) > MaxEnvelopeBytes {
 		add("envelope", "must be at most %d bytes", MaxEnvelopeBytes)
+	} else if len(RenderText(e)) > MaxTextLen {
+		add("envelope", "renders to more than %d bytes", MaxTextLen)
 	}
 	return out
+}
+
+// forEachText visits every free-text value with its field path.
+func forEachText(e Envelope, fn func(field, value string)) {
+	fn("subject", e.Subject)
+	fn("to", e.To)
+	fn("due", e.Due)
+	for _, k := range sortedKeys(e.Refs) {
+		fn("refs."+k, e.Refs[k])
+	}
+	b := e.Body
+	for _, f := range []struct{ name, value string }{
+		{"objective", b.Objective}, {"ask", b.Ask}, {"candidate", b.Candidate}, {"scope", b.Scope},
+		{"question", b.Question}, {"outcome", b.Outcome}, {"answer", b.Answer}, {"reason", b.Reason},
+		{"needs", b.Needs}, {"resumeWhen", b.ResumeWhen}, {"severity", b.Severity}, {"summary", b.Summary}, {"text", b.Text},
+	} {
+		fn("body."+f.name, f.value)
+	}
+	for i, v := range b.Owns {
+		fn(fmt.Sprintf("body.owns.%d", i), v)
+	}
+	for name, m := range map[string]map[string]string{"acceptance": b.Acceptance, "status": b.Status, "options": b.Options} {
+		for _, k := range sortedKeys(m) {
+			fn("body."+name+"."+k, m[k])
+		}
+	}
+	for _, k := range sortedKeys(e.Evidence) {
+		fn("evidence."+k+".type", e.Evidence[k].Type)
+		fn("evidence."+k+".value", e.Evidence[k].Value)
+		fn("evidence."+k+".outcome", e.Evidence[k].Outcome)
+	}
+	for i, a := range e.Attachments {
+		fn(fmt.Sprintf("attachments.%d", i), a)
+	}
 }
 
 // RenderText is the deterministic plain-text form stored as the message text,
@@ -339,7 +390,7 @@ func RenderText(e Envelope) string {
 var (
 	conventionHead  = regexp.MustCompile(`^([A-Z]+):\s*(.*)$`)
 	conventionField = regexp.MustCompile(`^([A-Za-z][A-Za-z-]*):\s*(.*)$`)
-	namedPair       = regexp.MustCompile(`^([a-z][a-z0-9]{0,15})\s*(?:\(([a-z]+)\))?\s*[: ]\s*(.*)$`)
+	namedPair       = regexp.MustCompile(`^([a-z][a-z0-9]{0,15})\s*(?:\(([a-z]+)\))?\s*[:= ]\s*(.*)$`)
 	hexToken        = regexp.MustCompile(`^[0-9a-f]{7,40}$`)
 )
 

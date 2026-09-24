@@ -25,3 +25,5 @@ __pycache__/
 dist-static-before-*/
 /compact
 /Screenshot *.png
+/hub/tailterm-hub
+/hub/tt

@@ -174,6 +174,16 @@ func (s *Scorer) scoreOne(ctx context.Context, p store.PendingJevCheck) bool {
 // Start runs until ctx is cancelled and closes the returned channel on exit.
 // Rows still pending at shutdown are picked up on the next start.
 func (s *Scorer) Start(ctx context.Context) <-chan struct{} {
+	// Zero values would never score (LIMIT 0) or busy-poll the database.
+	if s.Concurrency <= 0 {
+		s.Concurrency = 4
+	}
+	if s.Timeout <= 0 {
+		s.Timeout = 3 * time.Second
+	}
+	if s.Interval <= 0 {
+		s.Interval = 2 * time.Second
+	}
 	done := make(chan struct{})
 	go func() {
 		defer close(done)

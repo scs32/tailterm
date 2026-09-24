@@ -173,3 +173,62 @@ func TestTypedRecipientMustMatchRouting(t *testing.T) {
 		t.Fatalf("recipient by id: %d", code)
 	}
 }
+
+// Round-one blocker b1/R1 end to end: a typed message between two agents bound
+// to the same item reaches the recipient's filtered inbox when it carries the
+// item link tt send now adds, and is hidden without it.
+func TestTypedMessageReachesBoundRecipient(t *testing.T) {
+	c := newClient(t)
+	ctx := context.Background()
+	var task api.Task
+	if code := c.do("POST", "/v1/tasks", api.CreateTaskRequest{Name: "Bound typed", Orchestrator: "lead"}, &task); code != 201 {
+		t.Fatalf("create task: %d", code)
+	}
+	lead := c.agent(task, "lead")
+	item, err := c.st.CreateWorkItem(ctx, task.ID, api.CreateWorkItemRequest{Kind: "feature", Title: "Typed fixture", AgentID: lead.ID, RequestID: "typed-item"}, c.who)
+	if err != nil {
+		t.Fatal(err)
+	}
+	link := []api.MessageWorkItem{{ItemTaskID: task.ID, ItemID: item.ID, ItemRevision: item.Revision, Relationship: "primary"}}
+	order, err := c.st.PostMessage(ctx, task.ID, api.PostMessageRequest{Text: "Typed order", RequestID: "typed-order", WorkItems: link}, c.who)
+	if err != nil {
+		t.Fatal(err)
+	}
+	orderRef := api.MessageReference{TaskID: task.ID, Seq: order.Seq}
+	bind := func(name, role string) api.Agent {
+		t.Helper()
+		var a api.Agent
+		req := api.AddAgentRequest{AgentID: api.NewID("agt"), Name: name, Host: "fixture", Session: name, Runtime: "codex",
+			WorkItem: &api.AgentWorkItemRequest{ItemTaskID: task.ID, ItemID: item.ID, ItemRevision: item.Revision, WorkOrderMessage: orderRef,
+				ContextBundle: syntheticServerTestContext(t, item, orderRef, order), TeamRole: role}}
+		if code := c.do("POST", "/v1/tasks/"+task.ID+"/agents", req, &a); code != 201 {
+			t.Fatalf("bind %s: %d", name, code)
+		}
+		return a
+	}
+	builder := bind("builder", "")
+	reviewer := bind("reviewer", api.TeamRoleMember)
+
+	env := testEnvelope()
+	env.To = "reviewer"
+	unlinked, err := c.st.PostMessage(ctx, task.ID, api.PostMessageRequest{AgentID: builder.ID, To: reviewer.ID, Envelope: env}, c.who)
+	if err != nil {
+		t.Fatal(err)
+	}
+	linked, err := c.st.PostMessage(ctx, task.ID, api.PostMessageRequest{AgentID: builder.ID, To: reviewer.ID, Envelope: env,
+		RequestID: "typed-linked", AuditKind: api.MessageAuditWork, WorkItems: link, WorkOrderMessage: &orderRef}, c.who)
+	if err != nil {
+		t.Fatal(err)
+	}
+	inbox, err := c.st.ListMessages(ctx, task.ID, order.Seq, reviewer.ID, 50)
+	if err != nil {
+		t.Fatal(err)
+	}
+	seen := map[int64]bool{}
+	for _, m := range inbox {
+		seen[m.Seq] = true
+	}
+	if !seen[linked.Seq] || seen[unlinked.Seq] {
+		t.Fatalf("bound inbox: linked %v (want true), unlinked %v (want false)", seen[linked.Seq], seen[unlinked.Seq])
+	}
+}

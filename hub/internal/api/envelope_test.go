@@ -1,6 +1,7 @@
 package api
 
 import (
+	"fmt"
 	"reflect"
 	"strings"
 	"testing"
@@ -270,5 +271,69 @@ func TestQuestionWithURLIsOneQuestion(t *testing.T) {
 	q := Envelope{Kind: "question", Subject: "Escaping rule for search links", Body: EnvelopeBody{Question: "Does /search?q=one need escaping?"}}
 	if ps := ValidateEnvelope(q); ps != nil {
 		t.Fatalf("rejected: %v", ps)
+	}
+}
+
+// Round-one Fable blockers b4, b5 and follow-ups on subject false positives
+// and the template's a1=pass fallback syntax.
+func TestControlCharactersNameTheirField(t *testing.T) {
+	e := validEnvelopes()[EnvelopeKindNotice]
+	e.Body.Text = "bad \x01 char"
+	if !hasProblem(ValidateEnvelope(e), "body.text") {
+		t.Errorf("control char in body accepted: %v", ValidateEnvelope(e))
+	}
+	r := validEnvelopes()[EnvelopeKindResult]
+	r.Evidence = map[string]Evidence{"e1": {Type: "command", Value: "go\x7ftest"}}
+	if !hasProblem(ValidateEnvelope(r), "evidence.e1.value") {
+		t.Errorf("control char in evidence accepted: %v", ValidateEnvelope(r))
+	}
+	long := validEnvelopes()[EnvelopeKindAssign]
+	long.Body.Acceptance = map[string]string{}
+	for i := 1; i <= 40; i++ {
+		long.Body.Acceptance[fmt.Sprintf("a%d", i)] = strings.Repeat("x", 200)
+	}
+	long.Body.Objective = "x"
+	if ps := ValidateEnvelope(long); !hasProblem(ps, "body") && !hasProblem(ps, "envelope") {
+		t.Errorf("oversized rendering accepted")
+	}
+}
+
+func TestRecipientIsValidated(t *testing.T) {
+	for _, bad := range []string{"  ", "role:", "lead\nbuilder", "two words", "role:Lead Dev"} {
+		e := validEnvelopes()[EnvelopeKindNotice]
+		e.To = bad
+		if !hasProblem(ValidateEnvelope(e), "to") {
+			t.Errorf("to %q accepted", bad)
+		}
+	}
+	for _, ok := range []string{"lead", "builder-2", "agt_0000000000000001", "role:reviewer", "role:db_handler"} {
+		e := validEnvelopes()[EnvelopeKindNotice]
+		e.To = ok
+		if ps := ValidateEnvelope(e); ps != nil {
+			t.Errorf("to %q rejected: %v", ok, ps)
+		}
+	}
+}
+
+func TestSubjectAllowsRoutesAndHexWords(t *testing.T) {
+	for _, ok := range []string{"Add GET /v1/tasks/{id}/message-checks endpoint", "Deploy /state volume on the hub",
+		"Rename the set_facade helper", "Backfill 10000000 rows overnight"} {
+		e := Envelope{Kind: "notice", Subject: ok, Body: EnvelopeBody{Text: "x"}}
+		if ps := ValidateEnvelope(e); ps != nil {
+			t.Errorf("subject %q rejected: %v", ok, ps)
+		}
+	}
+	for _, bad := range []string{"Wrote /srv/app/config.yaml today", "Report is in /home/me/out today", "Saved the order for wi_74c050c73f7ff0b4"} {
+		e := Envelope{Kind: "notice", Subject: bad, Body: EnvelopeBody{Text: "x"}}
+		if !hasProblem(ValidateEnvelope(e), "subject") {
+			t.Errorf("subject %q accepted", bad)
+		}
+	}
+}
+
+func TestConventionAcceptsFlagStyleStatus(t *testing.T) {
+	e, _ := ParseTextConvention("RESULT: Tests pass for the recipient check\nOutcome: done\nStatus: a1=pass, a2=fail\nEvidence: e1: go test -> ok")
+	if e.Body.Status["a1"] != "pass" || e.Body.Status["a2"] != "fail" || ValidateEnvelope(e) != nil {
+		t.Fatalf("flag-style status: %+v %v", e.Body.Status, ValidateEnvelope(e))
 	}
 }
