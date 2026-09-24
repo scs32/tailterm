@@ -473,4 +473,3 @@ func (s *Store) PostSystemTextForTest(ctx context.Context, taskID, to, text stri
 	}
 	return tx.Commit()
 }
-
