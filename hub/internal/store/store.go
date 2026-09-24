@@ -998,6 +998,12 @@ func (s *Store) insertMessageWithResume(ctx context.Context, tx *sql.Tx, task ap
 	if err = s.insertMessageCheck(ctx, tx, m, req); err != nil {
 		return m, err
 	}
+	if err = s.createObligations(ctx, tx, m, req, by); err != nil {
+		return m, err
+	}
+	if err = s.applyReplyOutcome(ctx, tx, m, req); err != nil {
+		return m, err
+	}
 	preview := req.Text
 	if len(preview) > 200 {
 		preview = preview[:200]

@@ -8,6 +8,9 @@ func migrate(db *sql.DB) error {
 	if _, err := db.Exec(messageChecksSchema); err != nil {
 		return err
 	}
+	if _, err := db.Exec(obligationsSchema); err != nil {
+		return err
+	}
 	for _, c := range []struct{ table, name, definition string }{
 		{"agents", "role", "TEXT NOT NULL DEFAULT ''"},
 		{"agents", "cleanup_done", "INTEGER NOT NULL DEFAULT 0"},
