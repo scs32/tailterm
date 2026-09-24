@@ -85,6 +85,15 @@ def _deployment_plan(plan: dict[str, Any], release: str) -> dict[str, str]:
     }
     if "typesafeKeyPath" in deployment:
         expected["typesafeKeyPath"] = f"{BASE}/typesafe-key"
+    if "discordTokenPath" in deployment:
+        expected.update(
+            discordTokenPath=f"{BASE}/discord-token",
+            bridgeTokenPath=f"{BASE}/bridge-token",
+            bridgeBinaryDestination=f"{BASE}/releases/{release}/tailterm-discord",
+            bridgeStateDirectory=f"{BASE}/bridge-state",
+        )
+        for field in ("discordGuildId", "discordApplicationId", "discordOwnerIds", "tailosUrl"):
+            expected[field] = deployment[field]
     for field, value in expected.items():
         if deployment.get(field) != value:
             raise PreflightFailure("invalid-input", f"deployment.{field} must be {value}")
@@ -261,8 +270,43 @@ def hub_compose(deployment: dict[str, Any], binary_destination: str) -> dict[str
     if deployment.get("typesafeKeyPath"):
         environment["TAILTERM_TYPESAFE_KEY_FILE"] = "/run/typesafe-key"
         volumes.append(f"{deployment['typesafeKeyPath']}:/run/typesafe-key:ro")
+    services: dict[str, Any] = {}
+    if deployment.get("discordTokenPath"):
+        # Broker phase 2b: the hub accepts the route-limited bridge token, and
+        # the bridge reaches the hub on the app network, never the tailnet.
+        environment["TAILTERM_BRIDGE_TOKEN_FILE"] = "/run/bridge-token"
+        volumes.append(f"{deployment['bridgeTokenPath']}:/run/bridge-token:ro")
+        services["discord-bridge"] = {
+            "image": "gcr.io/distroless/static-debian12:nonroot",
+            "user": "950:950",
+            "restart": "unless-stopped",
+            "entrypoint": ["/opt/tailterm-discord"],
+            "read_only": True,
+            "cap_drop": ["ALL"],
+            "security_opt": ["no-new-privileges:true"],
+            "depends_on": ["hub"],
+            "environment": {
+                "TAILTERM_HUB_URL": "http://hub:18765",
+                "TAILTERM_BRIDGE_TOKEN_FILE": "/run/bridge-token",
+                "TAILTERM_BRIDGE_STATE": "/state",
+                "DISCORD_TOKEN_FILE": "/run/discord-token",
+                "DISCORD_GUILD_ID": deployment["discordGuildId"],
+                "DISCORD_APPLICATION_ID": deployment["discordApplicationId"],
+                "DISCORD_OWNER_IDS": deployment["discordOwnerIds"],
+                "TAILOS_URL": deployment["tailosUrl"],
+            },
+            "volumes": [
+                f"{deployment['bridgeBinaryDestination']}:/opt/tailterm-discord:ro",
+                f"{deployment['bridgeStateDirectory']}:/state",
+                f"{deployment['bridgeTokenPath']}:/run/bridge-token:ro",
+                f"{deployment['discordTokenPath']}:/run/discord-token:ro",
+            ],
+            "mem_limit": "256m",
+            "cpus": "0.5",
+        }
     return {
         "services": {
+            **services,
             "hub": {
                 "image": "gcr.io/distroless/static-debian12:nonroot",
                 "user": "950:950",
@@ -402,6 +446,61 @@ def main(argv: list[str] | None = None) -> int:
         )
         last_completed_stage = stage
 
+        if deployment.get("discordTokenPath"):
+            bridge_binary = ROOT / ".build" / "ttbin" / "tailterm-discord-linux-amd64"
+            try:
+                bridge_bytes = bridge_binary.read_bytes()
+            except OSError as error:
+                raise PreflightFailure(
+                    "local-artifact-unavailable",
+                    f"cannot read the local bridge artifact: {error}",
+                    phase="deployment",
+                    stage="bridge-artifact",
+                    mutationStarted=True,
+                    lastCompletedStage=last_completed_stage,
+                    backupAlreadyVerified=True,
+                    backupDestination=preflight["backupDestination"],
+                    backupSha256=preflight["sha256"],
+                ) from error
+            stage = "bridge-token"
+            bridge_token = shlex.quote(deployment["bridgeTokenPath"])
+            _remote(
+                plan,
+                actual_host,
+                f"umask 077; test -s {bridge_token} || cat > {bridge_token}",
+                stage=stage,
+                last_completed_stage=last_completed_stage,
+                preflight=preflight,
+                data=(secrets.token_urlsafe(48) + "\n").encode(),
+            )
+            last_completed_stage = stage
+            stage = "bridge-binary-upload"
+            quoted_bridge = shlex.quote(deployment["bridgeBinaryDestination"])
+            _remote(
+                plan,
+                actual_host,
+                f"cat > {quoted_bridge} && chmod 755 {quoted_bridge}",
+                stage=stage,
+                last_completed_stage=last_completed_stage,
+                preflight=preflight,
+                data=bridge_bytes,
+            )
+            last_completed_stage = stage
+            stage = "bridge-state-and-token-check"
+            state_dir = shlex.quote(deployment["bridgeStateDirectory"])
+            discord_token = shlex.quote(deployment["discordTokenPath"])
+            _remote(
+                plan,
+                actual_host,
+                f"mkdir -p {state_dir} && chmod 700 {state_dir} && test \"$(stat -c %u {state_dir})\" = 950"
+                f" && test -s {discord_token} && test \"$(stat -c %u {discord_token})\" = 950"
+                f" && test \"$(stat -c %u {bridge_token})\" = 950",
+                stage=stage,
+                last_completed_stage=last_completed_stage,
+                preflight=preflight,
+            )
+            last_completed_stage = stage
+
         if deployment.get("typesafeKeyPath"):
             # A missing key file would fail the bind mount and stop the hub.
             stage = "typesafe-key-check"
@@ -464,6 +563,7 @@ def main(argv: list[str] | None = None) -> int:
             "backupSha256": preflight["sha256"],
             "preflightReceiptSha256": receipt_sha256,
             "binaryDestination": deployment["binaryDestination"],
+            "bridgeBinaryDestination": deployment.get("bridgeBinaryDestination"),
             "appName": APP_NAME,
             "tcpListener": TCP_LISTENER,
             "mutationStarted": True,

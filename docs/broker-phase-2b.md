@@ -12,7 +12,7 @@ Acceptance: d1–d16 below
 
 Hub record: Feature `wi_5a203621825434d1`, owner intake #8796, work-order message #8799.
 
-Status: not started. Written September 24, 2026 after the owner registered the bot.
+Status: built on tasks-hub, in review (not deployed). Written September 24, 2026 after the owner registered the bot.
 It builds on phase 2a, which is released: obligations, timers, lead and owner
 escalation notices and the project-stall notice exist on the board today. Phase 2b
 delivers them to Discord and adds the first unstall controls. The rest of the
@@ -67,7 +67,7 @@ In scope:
    wake outside the retry schedule. It's rate-limited to one per obligation per 2 minutes
    and recorded with provenance.
 5. **Hub: escalation level in refs.** Escalation notices carry `refs.escalation` = `lead` or
-   `owner`, so the bridge doesn't parse subjects.
+   `owner`, and the project-stall notice carries `stall`, so the bridge doesn't parse subjects.
 6. **Channel per project.** Each open project gets a text channel in a configured active
    category, and each closed project's channel moves to an archive category. The project ID
    lives in the channel topic as a marker, which is how an ambiguous create is reconciled
@@ -149,10 +149,10 @@ Out of scope:
 
 | # | Criterion (observable) |
 | --- | --- |
-| d1 | The bridge token can read projects, messages, agents and obligations, post human messages, reassign and nudge. Any other route returns 403. A wrong token returns 401. The owner token keeps working unchanged. |
+| d1 | The bridge token can read projects, messages, agents and obligations, post human messages, reassign and nudge. Any other route returns 403. A wrong or missing token is refused (403, as today). The owner token keeps working unchanged. |
 | d2 | A human post with a Discord source stores the source. Repeating it with the same request ID returns the original message and creates no duplicate message or obligation. |
 | d3 | An owner nudge on an open obligation creates one immediate wake job. A second nudge within 2 minutes is refused with a retry-after and no job. A nudge on a closed obligation conflicts with no side effects. |
-| d4 | Lead and owner escalation notices carry `refs.escalation`. Existing phase-2a escalation tests pass unchanged. |
+| d4 | Lead, owner and stall escalation notices carry `refs.escalation`. Existing phase-2a escalation tests pass unchanged. |
 | d5 | Against the fake Discord: a new open project gets exactly one channel in the active category, even when the create response is lost and retried. The topic carries the project marker. No send ever omits `allowed_mentions`. |
 | d6 | Typed and free-text board messages mirror in order as compact lines with embeds and TailOS links. A 5,000-character Unicode message arrives as ordered parts with code fences intact. |
 | d7 | Routine notices and wake traffic change only the status card. Card edits are coalesced to at most one per channel per 30 seconds under a burst of 50 messages. |

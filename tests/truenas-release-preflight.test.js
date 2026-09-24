@@ -597,3 +597,70 @@ test("an optional Jev key is validated and mounted read-only", () => {
   extra.deployment.somethingElse = "x";
   assert.match(JSON.parse(probe(extra).stdout).error, /schema v1/);
 });
+
+test("the optional Discord bridge is validated all-or-none and runs beside the hub", () => {
+  const directory = workspace("discord-bridge");
+  const base = "/mnt/deepfreeze/tailterm-hub";
+  const bridge = {
+    discordTokenPath: `${base}/discord-token`,
+    bridgeTokenPath: `${base}/bridge-token`,
+    bridgeBinaryDestination: `${base}/releases/r1/tailterm-discord`,
+    bridgeStateDirectory: `${base}/bridge-state`,
+    discordGuildId: "1552733164781437080",
+    discordApplicationId: "1552735643925356666",
+    discordOwnerIds: "709503984238592120",
+    tailosUrl: "https://tailos.tailarr.com",
+  };
+  const probe = (plan) =>
+    spawnSync(
+      "python3",
+      [
+        "-c",
+        [
+          "import json, sys, importlib.util as u",
+          "sys.path.insert(0, 'scripts')",
+          "def load(name, path):",
+          "    spec = u.spec_from_file_location(name, path); m = u.module_from_spec(spec); spec.loader.exec_module(m); return m",
+          "pre = load('pre', 'scripts/truenas_release_preflight.py')",
+          "dep = load('dep', 'scripts/deploy-truenas-hub.py')",
+          "plan = json.loads(sys.stdin.read())",
+          "try:",
+          "    n = pre.validate_plan(plan)",
+          "except pre.PreflightFailure as e:",
+          "    print(json.dumps({'error': e.message})); sys.exit(0)",
+          "print(json.dumps(dep.hub_compose(n['deployment'], n['deployment']['binaryDestination'])))",
+        ].join("\n"),
+      ],
+      { cwd: root, input: JSON.stringify(plan), encoding: "utf8" },
+    );
+  const withBridge = planFor(directory, {});
+  Object.assign(withBridge.deployment, bridge);
+  const services = JSON.parse(probe(withBridge).stdout).services;
+  assert.equal(services.hub.environment.TAILTERM_BRIDGE_TOKEN_FILE, "/run/bridge-token");
+  assert.ok(services.hub.volumes.includes(`${base}/bridge-token:/run/bridge-token:ro`));
+  const b = services["discord-bridge"];
+  assert.equal(b.environment.TAILTERM_HUB_URL, "http://hub:18765");
+  assert.equal(b.environment.DISCORD_GUILD_ID, bridge.discordGuildId);
+  assert.equal(b.read_only, true);
+  assert.deepEqual(b.cap_drop, ["ALL"]);
+  assert.equal(b.ports, undefined, "the bridge publishes no ports");
+  assert.ok(b.volumes.includes(`${base}/discord-token:/run/discord-token:ro`));
+  assert.ok(b.volumes.includes(`${base}/releases/r1/tailterm-discord:/opt/tailterm-discord:ro`));
+  const without = JSON.parse(probe(planFor(directory, {})).stdout).services;
+  assert.equal(without["discord-bridge"], undefined);
+  assert.equal(without.hub.environment.TAILTERM_BRIDGE_TOKEN_FILE, undefined);
+  const partial = planFor(directory, {});
+  partial.deployment.discordTokenPath = bridge.discordTokenPath;
+  assert.match(JSON.parse(probe(partial).stdout).error, /given together/);
+  for (const [field, bad] of [
+    ["discordTokenPath", "/etc/discord-token"],
+    ["bridgeStateDirectory", `${base}/../state`],
+    ["discordGuildId", "12ab"],
+    ["discordOwnerIds", "1,2,x"],
+    ["tailosUrl", "http://tailos.tailarr.com"],
+  ]) {
+    const plan = planFor(directory, {});
+    Object.assign(plan.deployment, bridge, { [field]: bad });
+    assert.match(JSON.parse(probe(plan).stdout).error, new RegExp(field));
+  }
+});

@@ -198,21 +198,49 @@ def validate_plan(plan: Any) -> dict[str, Any]:
     }
     # Optional: a Jev (TypeSafe) API key file mounted read-only into the hub.
     optional_fields = {"typesafeKeyPath"}
-    if not deployment_fields <= set(deployment) <= deployment_fields | optional_fields:
+    # Optional, all or none: the Discord bridge (broker phase 2b).
+    bridge_fields = {
+        "discordTokenPath",
+        "bridgeTokenPath",
+        "bridgeBinaryDestination",
+        "bridgeStateDirectory",
+        "discordGuildId",
+        "discordApplicationId",
+        "discordOwnerIds",
+        "tailosUrl",
+    }
+    if not deployment_fields <= set(deployment) <= deployment_fields | optional_fields | bridge_fields:
         raise PreflightFailure("invalid-input", "deployment fields do not match schema v1")
+    if bridge_fields & set(deployment) and not bridge_fields <= set(deployment):
+        raise PreflightFailure(
+            "invalid-input", "deployment Discord bridge fields must be given together: " + ", ".join(sorted(bridge_fields))
+        )
     normalized_deployment = {
         field: _string(deployment.get(field), f"deployment.{field}")
         for field in sorted(set(deployment))
     }
-    key_path = normalized_deployment.get("typesafeKeyPath")
-    if key_path is not None and (
-        not key_path.startswith("/mnt/deepfreeze/tailterm-hub/")
-        or ".." in pathlib.PurePosixPath(key_path).parts
-        or any(c.isspace() for c in key_path)
-    ):
+    for field in ("typesafeKeyPath", "discordTokenPath", "bridgeTokenPath", "bridgeBinaryDestination", "bridgeStateDirectory"):
+        path = normalized_deployment.get(field)
+        if path is not None and (
+            not path.startswith("/mnt/deepfreeze/tailterm-hub/")
+            or ".." in pathlib.PurePosixPath(path).parts
+            or any(c.isspace() for c in path)
+        ):
+            raise PreflightFailure(
+                "invalid-input", f"deployment.{field} must be a plain path under /mnt/deepfreeze/tailterm-hub/"
+            )
+    for field in ("discordGuildId", "discordApplicationId"):
+        value = normalized_deployment.get(field)
+        if value is not None and re.fullmatch(r"[0-9]{1,20}", value) is None:
+            raise PreflightFailure("invalid-input", f"deployment.{field} must be a Discord ID")
+    owners = normalized_deployment.get("discordOwnerIds")
+    if owners is not None and re.fullmatch(r"[0-9]{1,20}(,[0-9]{1,20}){0,4}", owners) is None:
         raise PreflightFailure(
-            "invalid-input", "deployment.typesafeKeyPath must be a plain path under /mnt/deepfreeze/tailterm-hub/"
+            "invalid-input", "deployment.discordOwnerIds must be one to five comma-separated Discord IDs"
         )
+    tailos = normalized_deployment.get("tailosUrl")
+    if tailos is not None and re.fullmatch(r"https://[A-Za-z0-9.-]+(:[0-9]{1,5})?/?", tailos) is None:
+        raise PreflightFailure("invalid-input", "deployment.tailosUrl must be an https origin")
 
     normalized = dict(plan)
     normalized.update(
