@@ -15,8 +15,8 @@ Status: released September 24, 2026 (hub and Mini `tt` at `5610db7`, see
 [release evidence](releases/broker-phase2a-5610db7/README.md)). Written September 24, 2026 from
 [the broker design](message-broker.md#obligations-and-the-broker-state-machine).
 It builds on phase 1, which is deployed: typed messages and `tt send`
-exist. Phase 2b, the Discord bridge on TrueNAS, is a separate order and
-needs owner setup first (bot registration, test guild, user IDs, token).
+exist. Phase 2b, the Discord bridge on TrueNAS, is a separate
+[order](broker-phase-2b.md).
 
 ## Why
 

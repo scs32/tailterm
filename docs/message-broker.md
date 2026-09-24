@@ -340,8 +340,8 @@ Kept as they are: work items, Queue (scheduling and claims), operational records
 1. **Codex turn-end.** Check whether the installed Codex hooks can block turn
    completion. If they can't, Codex relies on timers and re-wake only.
 2. **Timer defaults** above are starting values. Tune them from phase-2 shadow data.
-3. **Discord setup.** Registering the bot, the test guild, the owner's Discord user
-   IDs, and provisioning the bot token and bridge-scoped hub credential on TrueNAS
-   are owner setup steps.
+3. **Discord setup.** Done September 24, 2026: bot registered, installed in the
+   owner's server and its token staged on TrueNAS. The bridge-scoped hub credential
+   is part of [phase 2b](broker-phase-2b.md).
 4. **Discord layout.** One channel per project (proposed) versus threads if many
    projects are expected. See the 50-channels-per-category limit in the platform findings.
