@@ -57,6 +57,19 @@ const STATUS_DOT = {
   done: "done",
 };
 
+export function addTeamOrchestrator(task, agents, plan) {
+  if (
+    task.orchestrator &&
+    agents.some(
+      (agent) => agent.name === task.orchestrator && agent.status !== "closed",
+    )
+  )
+    return null;
+  const lead = plan[0]?.fields.name;
+  if (!lead) throw new Error("The prepared team has no lead to assign.");
+  return lead;
+}
+
 export function createTaskHub(host) {
   // host: {getIPN, getData, api, getTabs, getServers, currentTab, currentServer,
   //   connect, closeTab, activate, paneGroups, dialog, closeDialog, notice,
@@ -2092,8 +2105,12 @@ export function createTaskHub(host) {
             );
             const policy = {};
             if (team.swarm) policy.swarm = true;
-            if (!existingTask.task.orchestrator)
-              policy.orchestrator = team.orchestrator || team.members[0].name;
+            const orchestrator = addTeamOrchestrator(
+              existingTask.task,
+              existingTask.agents,
+              plan,
+            );
+            if (orchestrator) policy.orchestrator = orchestrator;
             if (Object.keys(policy).length)
               await guardedJournalEffect(launchJournal, null, () =>
                 client.updateTask(id, policy),

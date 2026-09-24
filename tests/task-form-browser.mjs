@@ -1430,6 +1430,11 @@ try {
         4,
         "existing project keeps its orchestrator and handler when a team joins",
       );
+      assert.equal(
+        attached.task.orchestrator,
+        targetBefore.task.orchestrator,
+        "Add team must retain a current project lead",
+      );
       const routedAgents = attached.agents.filter(
         (agent) => agent.workItem?.itemId === routedItem.id,
       );
@@ -1500,6 +1505,79 @@ try {
           cwd: "",
         });
       }, frozenRetry.definitionId);
+      const staleTaskResponse = await fetch(
+        `http://127.0.0.1:${port}/v1/tasks/${target.id}`,
+        {
+          method: "PATCH",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ orchestrator: "missing-lead" }),
+        },
+      );
+      assert.equal(staleTaskResponse.status, 200);
+      const nextItemResponse = await fetch(
+        `http://127.0.0.1:${port}/v1/tasks/${target.id}/work-items`,
+        {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            kind: "bug",
+            title: "Synthetic stale lead item " + name,
+            description: "Check the exact scoped lead after Add team.",
+            agentId: targetLead.id,
+            requestId: "browser-stale-lead-item-" + name,
+          }),
+        },
+      );
+      assert.equal(nextItemResponse.status, 201);
+      const nextItem = await nextItemResponse.json();
+      const nextOrderResponse = await fetch(
+        `http://127.0.0.1:${port}/v1/tasks/${target.id}/messages`,
+        {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            text: "Synthetic stale lead work order",
+            agentId: targetLead.id,
+            requestId: "browser-stale-lead-order-" + name,
+            workItems: [
+              {
+                itemTaskId: target.id,
+                itemId: nextItem.id,
+                itemRevision: nextItem.revision,
+                relationship: "primary",
+              },
+            ],
+          }),
+        },
+      );
+      assert.equal(nextOrderResponse.status, 201);
+      const nextOrder = await nextOrderResponse.json();
+      await page.evaluate(() => qa.modes.set("teams"));
+      await page.locator("[data-add-team]").click();
+      await page.locator("#team-task").selectOption(target.id);
+      await page.locator("#team-work-item").selectOption(nextItem.id);
+      await page.locator("#team-work-order").fill(String(nextOrder.seq));
+      await page.locator("#team-main-server").selectOption("local");
+      await page.locator('[data-project-server="local"]').fill(root);
+      await page.locator('[data-project-server="secondary"]').fill(root);
+      await page.locator('#team-launch-form button[type="submit"]').click();
+      await page
+        .locator("#dialog")
+        .waitFor({ state: "hidden", timeout: 10000 });
+      const nextDetail = await (
+        await fetch(`http://127.0.0.1:${port}/v1/tasks/${target.id}`)
+      ).json();
+      const nextLead = nextDetail.agents.find(
+        (agent) =>
+          agent.workItem?.itemId === nextItem.id &&
+          agent.name.startsWith("team-planner-"),
+      );
+      assert.ok(nextLead, "the item-scoped lead was not launched");
+      assert.equal(
+        nextDetail.task.orchestrator,
+        nextLead.name,
+        "Add team must select the exact launched lead when the old name is stale",
+      );
       await page.evaluate(() => qa.modes.set("teams"));
       await page.locator("[data-edit-team]").click();
       await page.setViewportSize({ width: 390, height: 650 });
