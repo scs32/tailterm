@@ -256,10 +256,11 @@ func summarizeAcks(list []api.Obligation, names map[string]string, cutoff, now t
 }
 
 // ackLatency is the time from delivery to acknowledgement. Work acknowledged
-// straight from the queue counts from creation; it was never delivered first.
+// straight from the queue counts from creation: acknowledging it (by tt ack
+// or a reply) stamps delivered_at with the same instant as acked_at.
 func ackLatency(o api.Obligation) time.Duration {
 	from := o.CreatedAt
-	if o.DeliveredAt != nil && !o.DeliveredAt.After(*o.AckedAt) {
+	if o.DeliveredAt != nil && o.DeliveredAt.Before(*o.AckedAt) {
 		from = *o.DeliveredAt
 	}
 	return o.AckedAt.Sub(from)

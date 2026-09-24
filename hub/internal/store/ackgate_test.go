@@ -155,3 +155,32 @@ func TestAckGateDecisionsAndDeliveryOnly(t *testing.T) {
 		t.Fatalf("a stored decision request did not replay: %+v %v", replay, err)
 	}
 }
+
+// Round-two R2-C3-Q, the store half of the latency contract: work
+// acknowledged straight from the queue, by tt ack or by a reply, gets the
+// same delivered_at and acked_at, which the summary reads as never
+// delivered and counts from creation.
+func TestQueueFirstAckStampsDeliveryAtAck(t *testing.T) {
+	f := newPhase3Fixture(t)
+	start := time.Now().UTC().Truncate(time.Second)
+	f.s.now = func() time.Time { return start }
+	byAck, byReply := f.assignTo(t, f.builder), f.assignTo(t, f.builder)
+	for _, seq := range []int64{byAck.Seq, byReply.Seq} {
+		if o := f.obligationFor(t, seq); o.State != api.ObligationQueued {
+			t.Fatalf("#%d is not queued: %+v", seq, o)
+		}
+	}
+	f.s.now = func() time.Time { return start.Add(9 * time.Minute) }
+	if _, err := f.s.ObligationAction(f.ctx, f.task.ID, byAck.Seq, "ack", api.ObligationActionRequest{AgentID: f.builder.ID, RunID: f.builder.RunID}, f.s.now()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.post(t, api.PostMessageRequest{AgentID: f.builder.ID, RunID: f.builder.RunID, To: f.lead.ID, ReplyTo: byReply.Seq, Envelope: &api.Envelope{Kind: api.EnvelopeKindQuestion, To: "lead-1", Subject: "Which fixture should I use here", Body: api.EnvelopeBody{Question: "Static or live?"}}}); err != nil {
+		t.Fatal(err)
+	}
+	for _, seq := range []int64{byAck.Seq, byReply.Seq} {
+		o := f.obligationFor(t, seq)
+		if o.AckedAt == nil || o.DeliveredAt == nil || !o.DeliveredAt.Equal(*o.AckedAt) || o.AckedAt.Sub(o.CreatedAt) != 9*time.Minute {
+			t.Fatalf("#%d: created %v delivered %v acked %v", seq, o.CreatedAt, o.DeliveredAt, o.AckedAt)
+		}
+	}
+}

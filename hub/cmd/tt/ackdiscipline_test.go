@@ -95,4 +95,14 @@ func TestSummarizeAcksFromDelivery(t *testing.T) {
 			t.Errorf("summary missing %q:\n%s", want, out)
 		}
 	}
+	// Round-two R2-C3-Q: #5 was acknowledged straight from the queue after
+	// nine minutes; the store stamps delivered_at with the ack time, and the
+	// latency counts from creation.
+	list = append(list, acked(5, 9*time.Minute, 0))
+	out = summarizeAcks(list, map[string]string{"agt_b": "builder"}, time.Time{}, now)
+	for _, want := range []string{"5 acknowledged", "median 5m0s", "worst 9m0s (#5 by builder)"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("summary missing %q:\n%s", want, out)
+		}
+	}
 }
