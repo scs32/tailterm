@@ -171,3 +171,18 @@ func TestMessageChecksHelpSucceeds(t *testing.T) {
 		t.Fatalf("help returned %v", err)
 	}
 }
+
+// Round-two focused fix (Fable note 1): one entry per --evidence flag.
+func TestSendRejectsTwoEvidenceEntriesInOneFlag(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Errorf("hub contacted: %s", r.URL.Path)
+	}))
+	defer srv.Close()
+	e := env{hub: srv.URL, task: "tsk_0000000000000001", agent: "agt_0000000000000001"}
+	err := cmdSend(e, []string{"--kind", "result", "--subject", "Both checks pass on the branch", "--outcome", "done",
+		"--status", "a1=pass", "--evidence", "e1: go test; e2: go vet -> ok"})
+	var coded *exitError
+	if !errors.As(err, &coded) || coded.code != 2 {
+		t.Fatalf("err %v, want exit 2", err)
+	}
+}

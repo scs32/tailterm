@@ -125,7 +125,7 @@ var (
 	// Filesystem paths only: home-relative, well-known roots, or a nested path
 	// ending in a file extension. API routes such as /v1/tasks stay allowed.
 	subjectPath   = regexp.MustCompile(`(?:^|[\s(\[{"'<])(?:~/\S*|/(?:tmp|Users|home|mnt|var|private|opt|etc|srv|root|usr|Volumes)(?:/\S*)?(?:$|[\s)\]}"'>.,;:])|/\S+/\S*\.[A-Za-z0-9]{1,5}\b)`)
-	recipientName = regexp.MustCompile(`^(?:role:[a-z][a-z0-9_-]{0,31}|[A-Za-z0-9][A-Za-z0-9_-]{0,63})$`)
+	recipientName = regexp.MustCompile(`^(?:role:[a-z][a-z0-9_-]{0,31}|[A-Za-z0-9_-]{1,64})$`) // agent names follow ValidName
 	questionMark  = regexp.MustCompile(`\?(\s|$)`)
 )
 
@@ -327,9 +327,12 @@ func forEachText(e Envelope, fn func(field, value string)) {
 	for i, v := range b.Owns {
 		fn(fmt.Sprintf("body.owns.%d", i), v)
 	}
-	for name, m := range map[string]map[string]string{"acceptance": b.Acceptance, "status": b.Status, "options": b.Options} {
-		for _, k := range sortedKeys(m) {
-			fn("body."+name+"."+k, m[k])
+	for _, named := range []struct {
+		name string
+		m    map[string]string
+	}{{"acceptance", b.Acceptance}, {"status", b.Status}, {"options", b.Options}} {
+		for _, k := range sortedKeys(named.m) {
+			fn("body."+named.name+"."+k, named.m[k])
 		}
 	}
 	for _, k := range sortedKeys(e.Evidence) {
@@ -375,9 +378,9 @@ func RenderText(e Envelope) string {
 	var ev []string
 	for _, k := range sortedKeys(e.Evidence) {
 		item := e.Evidence[k]
-		s := k + " (" + item.Type + "): " + oneLine(item.Value)
+		s := k + " (" + item.Type + "): " + escapeEntry(oneLine(item.Value))
 		if item.Outcome != "" {
-			s += " → " + oneLine(item.Outcome)
+			s += " → " + escapeEntry(oneLine(item.Outcome))
 		}
 		ev = append(ev, s)
 	}
@@ -443,7 +446,7 @@ func ParseTextConvention(text string) (e Envelope, matched bool) {
 		case "question":
 			b.Question, last = value, &b.Question
 		case "options":
-			b.Options = parseNamed(splitEntries(value, colonEntry))
+			b.Options = parseNamed(splitEscaped(value))
 		case "outcome":
 			b.Outcome = strings.ToLower(value)
 		case "answer":
@@ -461,7 +464,7 @@ func ParseTextConvention(text string) (e Envelope, matched bool) {
 		case "text":
 			b.Text, last = value, &b.Text
 		case "acceptance":
-			b.Acceptance = parseNamed(splitEntries(value, colonEntry))
+			b.Acceptance = parseNamed(splitEscaped(value))
 		case "status":
 			b.Status = parseNamed(splitList(value))
 			for k, v := range b.Status {
@@ -507,7 +510,7 @@ func ParseEvidence(value string) map[string]Evidence { return parseEvidence(valu
 
 func parseEvidence(value string) map[string]Evidence {
 	out := map[string]Evidence{}
-	for _, part := range splitEntries(value, colonEntry) {
+	for _, part := range splitEscaped(value) {
 		if key, item, ok := ParseEvidenceEntry(part); ok {
 			out[key] = item
 		}
@@ -538,27 +541,36 @@ func ParseEvidenceEntry(part string) (string, Evidence, bool) {
 	return m[1], item, true
 }
 
-// colonEntry matches the start of a rendered "key (type): value" entry.
-var colonEntry = regexp.MustCompile(`^\s*[a-z][a-z0-9]{0,15}\s*(\([a-z]+\))?\s*:`)
+// Rendered entry lists separate entries with "; ". A semicolon or backslash
+// inside a value is escaped (\; and \\), so parsing splits only between
+// entries and the round trip is exact. Hand-written text splits on every ";".
+func escapeEntry(v string) string {
+	return strings.NewReplacer(`\`, `\\`, ";", `\;`).Replace(v)
+}
 
-// splitEntries splits on semicolons but rejoins fragments that do not start a
-// new entry, so a semicolon inside a value is preserved.
-func splitEntries(value string, start *regexp.Regexp) []string {
+// splitEscaped splits on unescaped semicolons and unescapes each part.
+func splitEscaped(value string) []string {
 	var out []string
-	for _, frag := range strings.Split(value, ";") {
-		if len(out) > 0 && !start.MatchString(frag) {
-			out[len(out)-1] += ";" + frag
-			continue
+	var cur strings.Builder
+	flush := func() {
+		if p := strings.TrimSpace(cur.String()); p != "" {
+			out = append(out, p)
 		}
-		out = append(out, frag)
+		cur.Reset()
 	}
-	var trimmed []string
-	for _, p := range out {
-		if p = strings.TrimSpace(p); p != "" {
-			trimmed = append(trimmed, p)
+	for i := 0; i < len(value); i++ {
+		switch c := value[i]; {
+		case c == '\\' && i+1 < len(value) && (value[i+1] == ';' || value[i+1] == '\\'):
+			cur.WriteByte(value[i+1])
+			i++
+		case c == ';':
+			flush()
+		default:
+			cur.WriteByte(c)
 		}
 	}
-	return trimmed
+	flush()
+	return out
 }
 
 func inferEvidenceType(v string) string {
@@ -577,20 +589,10 @@ func inferEvidenceType(v string) string {
 // splitList splits on semicolons, or on commas when no semicolon is present.
 func splitList(value string) []string {
 	if strings.Contains(value, ";") {
-		return splitSemicolons(value)
+		return splitEscaped(value)
 	}
 	var out []string
 	for _, p := range strings.Split(value, ",") {
-		if p = strings.TrimSpace(p); p != "" {
-			out = append(out, p)
-		}
-	}
-	return out
-}
-
-func splitSemicolons(value string) []string {
-	var out []string
-	for _, p := range strings.Split(value, ";") {
 		if p = strings.TrimSpace(p); p != "" {
 			out = append(out, p)
 		}
@@ -605,7 +607,7 @@ func oneLine(s string) string {
 func joinPairs(m map[string]string, sep string) string {
 	var parts []string
 	for _, k := range sortedKeys(m) {
-		parts = append(parts, k+sep+oneLine(m[k]))
+		parts = append(parts, k+sep+escapeEntry(oneLine(m[k])))
 	}
 	return strings.Join(parts, "; ")
 }

@@ -337,3 +337,49 @@ func TestConventionAcceptsFlagStyleStatus(t *testing.T) {
 		t.Fatalf("flag-style status: %+v %v", e.Body.Status, ValidateEnvelope(e))
 	}
 }
+
+// Round-two focused fix (Codex P2-P5).
+func TestEscapedSemicolonsRoundTripExactly(t *testing.T) {
+	e := Envelope{Kind: "assign", Subject: "Criteria with prose that looks like keys", Body: EnvelopeBody{Objective: "x", Owns: []string{"f"},
+		Acceptance: map[string]string{"a1": "exits 2; note: stderr is empty", "a2": `path C:\tmp\; ok`}},
+		Refs: map[string]string{"cmd": "make a; make b"}}
+	parsed, _ := ParseTextConvention(RenderText(e))
+	if !reflect.DeepEqual(parsed.Body.Acceptance, e.Body.Acceptance) || !reflect.DeepEqual(parsed.Refs, e.Refs) {
+		t.Fatalf("round trip changed values: %+v %+v", parsed.Body.Acceptance, parsed.Refs)
+	}
+}
+
+func TestHandWrittenEntriesSplitOnSemicolons(t *testing.T) {
+	for _, line := range []string{"Acceptance: a1 exits 2; a2 prints an error", "Acceptance: a1=exits 2; a2=prints an error", "Acceptance: a1: exits 2; a2: prints an error"} {
+		e, _ := ParseTextConvention("ASSIGN: Reject the empty recipient\nObjective: fail fast\nOwns: a.go\n" + line)
+		if !reflect.DeepEqual(e.Body.Acceptance, map[string]string{"a1": "exits 2", "a2": "prints an error"}) {
+			t.Errorf("%q parsed as %v", line, e.Body.Acceptance)
+		}
+	}
+}
+
+func TestRecipientMatchesAgentNameRule(t *testing.T) {
+	for _, name := range []string{"_builder", "-reviewer", "a_b-c"} {
+		if !ValidName(name) {
+			t.Fatalf("fixture %q is not a valid agent name", name)
+		}
+		e := validEnvelopes()[EnvelopeKindNotice]
+		e.To = name
+		if ps := ValidateEnvelope(e); ps != nil {
+			t.Errorf("to %q rejected: %v", name, ps)
+		}
+	}
+}
+
+func TestProblemOrderIsDeterministic(t *testing.T) {
+	e := validEnvelopes()[EnvelopeKindNotice]
+	e.Body.Acceptance = map[string]string{"a1": "bad \x01"}
+	e.Body.Options = map[string]string{"o1": "bad \x01"}
+	e.Body.Status = map[string]string{"a1": "pass\x01"}
+	first := problemFields(ValidateEnvelope(e))
+	for i := 0; i < 300; i++ {
+		if got := problemFields(ValidateEnvelope(e)); !reflect.DeepEqual(got, first) {
+			t.Fatalf("order changed: %v vs %v", got, first)
+		}
+	}
+}

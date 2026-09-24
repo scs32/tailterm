@@ -266,3 +266,20 @@ func TestScorerZeroValuesUseDefaults(t *testing.T) {
 		t.Fatalf("defaults %+v", s)
 	}
 }
+
+// Round-two focused fix (Codex P1): quoted values are redacted whole.
+func TestRedactWholeQuotedValues(t *testing.T) {
+	for _, text := range []string{
+		`{"password":"abc;syntheticsecret123"}`,
+		`{"password":"long secret phrase here"}`,
+		`password=syntheticsecret123;remainingsecret456`,
+		`api_key: 'two words syntheticsecret123'`,
+	} {
+		got := Redact(text)
+		for _, leaked := range []string{"syntheticsecret123", "remainingsecret456", "long secret", "phrase here"} {
+			if strings.Contains(got, leaked) {
+				t.Errorf("%q -> %q leaks %q", text, got, leaked)
+			}
+		}
+	}
+}

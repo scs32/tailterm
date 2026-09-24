@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"regexp"
 	"strings"
 	"time"
 
@@ -107,6 +108,9 @@ func cmdSend(e env, args []string) error {
 			return &exitError{2, err}
 		}
 		for _, raw := range evidence {
+			if secondEvidenceEntry.MatchString(raw) {
+				return &exitError{2, fmt.Errorf("--evidence %q holds more than one entry; repeat --evidence once per entry", raw)}
+			}
 			key, item, ok := api.ParseEvidenceEntry(raw)
 			if !ok {
 				return &exitError{2, fmt.Errorf(`--evidence %q must look like "e1: command -> outcome"`, raw)}
@@ -166,6 +170,9 @@ func cmdSend(e env, args []string) error {
 	fmt.Printf("posted #%d\n", m.Seq)
 	return nil
 }
+
+// secondEvidenceEntry spots "; e2: ..." inside one --evidence value.
+var secondEvidenceEntry = regexp.MustCompile(`;\s*[a-z]+[0-9]+\s*(\([a-z]+\))?\s*:`)
 
 func pairs(flagName string, values []string, sep string) (map[string]string, error) {
 	if len(values) == 0 {
