@@ -102,6 +102,47 @@ func TestEnvelopeSubjectRules(t *testing.T) {
 	}
 }
 
+func TestBrokerSubjectNameExceptionIsExactAndInternal(t *testing.T) {
+	base := validEnvelopes()[EnvelopeKindNotice]
+	for _, hash := range []string{"abc1234", strings.Repeat("a", 20) + strings.Repeat("1", 20)} {
+		e := base
+		e.Subject = "Escalation for " + hash
+		if !hasProblem(ValidateEnvelope(e), "subject") {
+			t.Fatalf("public validator accepted %q", e.Subject)
+		}
+		if err := NormalizeEnvelopePost(&PostMessageRequest{Envelope: &e}); err == nil {
+			t.Fatalf("public normalization accepted %q", e.Subject)
+		}
+	}
+	name := "builder-41b1c632"
+	good := base
+	good.Subject = "Owner attention: " + name + " is overdue on an assignment"
+	if err := NormalizeBrokerPost(&PostMessageRequest{Envelope: &good}, name); err != nil {
+		t.Fatalf("trusted exact name rejected: %v", err)
+	}
+	for _, subject := range []string{
+		"Owner attention: " + name + " and abc1234 are overdue",
+		"Owner attention: " + name + " and " + strings.Repeat("a", 20) + strings.Repeat("1", 20) + " are overdue",
+		"Owner attention: " + name + " wrote to /tmp/report.json",
+		"Owner attention: " + name + strings.Repeat("x", 120),
+	} {
+		e := base
+		e.Subject = subject
+		if err := NormalizeBrokerPost(&PostMessageRequest{Envelope: &e}, name); err == nil {
+			t.Fatalf("broker normalization accepted unrelated invalid subject %q", subject)
+		}
+	}
+	record := base
+	record.Subject = "Owner attention: wi_74c050c73f7ff0b4 is overdue"
+	if err := NormalizeBrokerPost(&PostMessageRequest{Envelope: &record}, "wi_74c050c73f7ff0b4"); err == nil {
+		t.Fatal("broker normalization accepted a record ID as an agent name")
+	}
+	record.Subject = "Owner attention: wi_74c050c73f7ff0b4-41b1c632 is overdue"
+	if err := NormalizeBrokerPost(&PostMessageRequest{Envelope: &record}, "wi_74c050c73f7ff0b4-41b1c632"); err == nil {
+		t.Fatal("broker normalization hid a record ID in an agent name")
+	}
+}
+
 func TestEnvelopeLimitsAndKeys(t *testing.T) {
 	e := validEnvelopes()[EnvelopeKindAssign]
 	e.Body.Acceptance = map[string]string{"A1": "upper", "a2": " "}

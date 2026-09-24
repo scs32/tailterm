@@ -151,18 +151,18 @@ func obligationNoun(kind string) string {
 	return "a request"
 }
 
-// postBrokerNotice inserts a hub-authored notice. When the subject names an
-// agent that the envelope rules reject, it falls back to a generic subject.
-func (s *Store) postBrokerNotice(ctx context.Context, tx *sql.Tx, task api.Task, to api.Agent, subject, fallback, text string, refs map[string]string) error {
+// postBrokerNotice inserts a hub-authored notice, allowing only the trusted
+// agent name in its subject to pass the public hash rule.
+func (s *Store) postBrokerNotice(ctx context.Context, tx *sql.Tx, task api.Task, to api.Agent, agentName, subject, fallback, text string, refs map[string]string) error {
 	env := &api.Envelope{Kind: api.EnvelopeKindNotice, Subject: subject, Refs: refs, Body: api.EnvelopeBody{Text: text}}
 	if to.ID != "" {
 		env.To = to.Name
 	}
-	if api.ValidateEnvelope(*env) != nil {
+	if err := api.NormalizeBrokerPost(&api.PostMessageRequest{Envelope: env}, agentName); err != nil {
 		env.Subject = fallback
 	}
 	req := api.PostMessageRequest{Envelope: env, To: to.ID}
-	m, err := s.insertMessageWithResume(ctx, tx, task, req, to, BrokerCaller, false, false, false)
+	m, err := s.insertBrokerMessage(ctx, tx, task, req, to, agentName)
 	if err != nil {
 		return err
 	}
@@ -182,7 +182,7 @@ func (s *Store) BrokerNudge(ctx context.Context, o BrokerObligation, now time.Ti
 		}
 		text := fmt.Sprintf("Message #%d (%s) has had no recorded progress for %s. Record progress with `tt progress %d --text ...`, "+
 			"or reply with `tt send --reply-to %d` (result, answer, decline, or block with what you need).", o.MessageSeq, o.Subject, api.ObligationSilenceNudge, o.MessageSeq, o.MessageSeq)
-		if err := s.postBrokerNotice(ctx, tx, task, to, "Reminder: no progress recorded on "+obligationNoun(o.SourceKind), "Reminder: no progress recorded on an open obligation", text, obligationRefs(o)); err != nil {
+		if err := s.postBrokerNotice(ctx, tx, task, to, to.Name, "Reminder: "+to.Name+" has no progress on "+obligationNoun(o.SourceKind), "Reminder: no progress recorded on an open obligation", text, obligationRefs(o)); err != nil {
 			return err
 		}
 		if err := insertWakeJob(ctx, tx, o.TaskID, o.ID, o.AgentID, now, now); err != nil {
@@ -225,7 +225,7 @@ func (s *Store) BrokerEscalate(ctx context.Context, o BrokerObligation, level in
 		if level == 2 {
 			refs["escalation"] = "owner"
 		}
-		if err := s.postBrokerNotice(ctx, tx, task, lead, subject, "Overdue obligation needs attention", text, refs); err != nil {
+		if err := s.postBrokerNotice(ctx, tx, task, lead, who, subject, "Overdue obligation needs attention", text, refs); err != nil {
 			return err
 		}
 		_, err := tx.ExecContext(ctx, `UPDATE obligations SET escalation=?,escalated_at=? WHERE id=?`, level, ts(now), o.ID)
@@ -279,7 +279,7 @@ func (s *Store) BrokerProjectStall(ctx context.Context, taskID string, lastChang
 		}
 		text := fmt.Sprintf("Overdue work has already gone to the owner and nothing has changed for %s. %d obligation(s) are overdue: %s. Run `tt obligations --overdue` for the full list.",
 			api.ObligationProjectStallQuiet, len(overdue), strings.Join(lines, "; "))
-		if err := s.postBrokerNotice(ctx, tx, task, api.Agent{}, "Project stalled: overdue work and no progress", "Project stalled: overdue work and no progress", text, map[string]string{"overdue": fmt.Sprint(len(overdue)), "escalation": "stall"}); err != nil {
+		if err := s.postBrokerNotice(ctx, tx, task, api.Agent{}, "", "Project stalled: overdue work and no progress", "Project stalled: overdue work and no progress", text, map[string]string{"overdue": fmt.Sprint(len(overdue)), "escalation": "stall"}); err != nil {
 			return err
 		}
 		_, err := tx.ExecContext(ctx, `UPDATE project_stalls SET notified_at=? WHERE task_id=?`, ts(now), taskID)

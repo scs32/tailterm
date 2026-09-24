@@ -1023,9 +1023,23 @@ func (s *Store) insertMessage(ctx context.Context, tx *sql.Tx, task api.Task, re
 // insertMessageWithResume keeps notification-only internal callers out of the
 // explicit human resumption path. This policy is not exposed on the wire.
 func (s *Store) insertMessageWithResume(ctx context.Context, tx *sql.Tx, task api.Task, req api.PostMessageRequest, target api.Agent, by api.Caller, allowCrossProject, allowHistoricalRevision, allowResume bool) (api.Message, error) {
+	return s.insertMessageNormalized(ctx, tx, task, req, target, by, allowCrossProject, allowHistoricalRevision, allowResume, api.NormalizeEnvelopePost)
+}
+
+// insertBrokerMessage is limited to broker-authored notices and reassignments.
+// The trusted name is read from the agent row by its caller, not from the wire.
+func (s *Store) insertBrokerMessage(ctx context.Context, tx *sql.Tx, task api.Task, req api.PostMessageRequest, target api.Agent, agentName string) (api.Message, error) {
+	// Historical item revisions are allowed: a reissue or linked notice copies
+	// the links of a message written when the item was at an older revision.
+	return s.insertMessageNormalized(ctx, tx, task, req, target, BrokerCaller, false, true, false, func(req *api.PostMessageRequest) error {
+		return api.NormalizeBrokerPost(req, agentName)
+	})
+}
+
+func (s *Store) insertMessageNormalized(ctx context.Context, tx *sql.Tx, task api.Task, req api.PostMessageRequest, target api.Agent, by api.Caller, allowCrossProject, allowHistoricalRevision, allowResume bool, normalize func(*api.PostMessageRequest) error) (api.Message, error) {
 	taskID := task.ID
 	// Every insert path enforces the envelope, not only PostMessage.
-	if err := api.NormalizeEnvelopePost(&req); err != nil {
+	if err := normalize(&req); err != nil {
 		return api.Message{}, err
 	}
 	if err := validateMessageContext(tx, ctx, taskID, req, allowCrossProject, allowHistoricalRevision); err != nil {

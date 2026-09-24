@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"net/http"
+	"strings"
 	"testing"
 
 	"github.com/scs32/tailterm/hub/internal/api"
@@ -13,6 +14,26 @@ func testEnvelope() *api.Envelope {
 		Refs:     map[string]string{"commit": "abc1234"},
 		Body:     api.EnvelopeBody{Outcome: "done", Status: map[string]string{"a1": "pass"}},
 		Evidence: map[string]api.Evidence{"e1": {Type: "command", Value: "go test ./cmd/tt", Outcome: "ok"}}}
+}
+
+func TestPublicMessageSubjectsStillRejectHashes(t *testing.T) {
+	c := newClient(t)
+	task := c.task("strict subjects")
+	agent := c.agent(task, "builder-41b1c632")
+	path := "/v1/tasks/" + task.ID + "/messages"
+	for _, subject := range []string{
+		"Escalation for builder-41b1c632",
+		"Released candidate abc1234 today",
+		"Released candidate " + strings.Repeat("a", 20) + strings.Repeat("1", 20) + " today",
+	} {
+		for _, agentID := range []string{"", agent.ID} {
+			e := &api.Envelope{Kind: api.EnvelopeKindNotice, Subject: subject, Body: api.EnvelopeBody{Text: "check"}}
+			var rejected api.ErrorResponse
+			if code := c.do("POST", path, api.PostMessageRequest{AgentID: agentID, Envelope: e}, &rejected); code != http.StatusBadRequest || rejected.Code != "invalid-envelope" {
+				t.Fatalf("agent %q subject %q: status %d response %+v", agentID, subject, code, rejected)
+			}
+		}
+	}
 }
 
 // Broker phase 1, criteria a3–a5 and a7 (docs/broker-phase-1.md).

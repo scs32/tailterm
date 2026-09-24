@@ -173,7 +173,7 @@ func TestTypedRepliesCloseObligations(t *testing.T) {
 // b7: reassignment supersedes and re-issues atomically, keeping history.
 func TestReassignmentSupersedesAndReissues(t *testing.T) {
 	f := newOblFixture(t)
-	reviewer := f.c.agent(f.task, "reviewer")
+	reviewer := f.c.agent(f.task, "reviewer-41b1c632")
 	assign := f.post(t, api.PostMessageRequest{AgentID: f.lead.ID, To: f.builder.ID, Envelope: assignFrom(f.lead, "builder")})
 	old := f.list(t, store.ObligationFilter{AgentID: f.builder.ID}, time.Now())[0]
 	m, err := f.c.st.ReassignObligation(f.ctx, f.task.ID, old.ID, api.ObligationReassignRequest{ToAgentID: reviewer.ID, Reason: "builder is offline"}, f.c.who)
@@ -182,6 +182,9 @@ func TestReassignmentSupersedesAndReissues(t *testing.T) {
 	}
 	if m.To != reviewer.ID || m.Envelope == nil || m.Envelope.Refs["reassignedFrom"] == "" || m.From.Node != api.BrokerNode {
 		t.Fatalf("reissued %+v", m)
+	}
+	if !strings.Contains(m.Envelope.Subject, reviewer.Name) || !strings.Contains(m.Text, reviewer.Name) || m.Envelope.To != reviewer.Name {
+		t.Fatalf("reassignment lost scoped recipient: %+v", m)
 	}
 	superseded := f.list(t, store.ObligationFilter{AgentID: f.builder.ID}, time.Now())[0]
 	moved := f.list(t, store.ObligationFilter{AgentID: reviewer.ID}, time.Now())

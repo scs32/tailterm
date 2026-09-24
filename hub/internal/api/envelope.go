@@ -78,10 +78,28 @@ func (e *EnvelopeError) Is(target error) bool { return target == ErrInvalid }
 // NormalizeEnvelopePost validates a typed post and fills its display text.
 // Text must be empty or exactly the rendered text, so the two never disagree.
 func NormalizeEnvelopePost(req *PostMessageRequest) error {
+	return normalizeEnvelopePost(req, ValidateEnvelope)
+}
+
+// NormalizeBrokerPost is for hub-created broker messages only. The agent name
+// comes from the store's agent record, never from a posted envelope. All rules
+// still apply to the subject after that exact name is replaced for validation.
+func NormalizeBrokerPost(req *PostMessageRequest, agentName string) error {
+	return normalizeEnvelopePost(req, func(e Envelope) []Problem {
+		if brokerAgentSuffix.MatchString(agentName) {
+			i := strings.LastIndexByte(agentName, '-')
+			masked := agentName[:i+1] + strings.Repeat("x", len(agentName)-i-1)
+			e.Subject = strings.ReplaceAll(e.Subject, agentName, masked)
+		}
+		return ValidateEnvelope(e)
+	})
+}
+
+func normalizeEnvelopePost(req *PostMessageRequest, validate func(Envelope) []Problem) error {
 	if req.Envelope == nil {
 		return nil
 	}
-	if problems := ValidateEnvelope(*req.Envelope); problems != nil {
+	if problems := validate(*req.Envelope); problems != nil {
 		return &EnvelopeError{Problems: problems}
 	}
 	// refs.repliesTo is the envelope form of a reply; it must agree with ReplyTo.
@@ -124,12 +142,13 @@ var EnvelopeKinds = []string{
 }
 
 var (
-	namedKey      = regexp.MustCompile(`^[a-z][a-z0-9]{0,15}$`)
-	refKey        = regexp.MustCompile(`^[A-Za-z][A-Za-z0-9_-]{0,31}$`)
-	subjectID     = regexp.MustCompile(`(?i)\b[a-z]{2,5}_([0-9a-f]{6,})\b`)
-	subjectHex    = regexp.MustCompile(`(?i)\b[0-9a-f]{7,}\b`)
-	subjectDigit  = regexp.MustCompile(`[0-9]`)
-	subjectLetter = regexp.MustCompile(`(?i)[a-f]`)
+	namedKey          = regexp.MustCompile(`^[a-z][a-z0-9]{0,15}$`)
+	refKey            = regexp.MustCompile(`^[A-Za-z][A-Za-z0-9_-]{0,31}$`)
+	subjectID         = regexp.MustCompile(`(?i)\b[a-z]{2,5}_([0-9a-f]{6,})\b`)
+	subjectHex        = regexp.MustCompile(`(?i)\b[0-9a-f]{7,}\b`)
+	brokerAgentSuffix = regexp.MustCompile(`(?i)^[a-z][a-z0-9_-]*-[0-9a-f]{7,}$`)
+	subjectDigit      = regexp.MustCompile(`[0-9]`)
+	subjectLetter     = regexp.MustCompile(`(?i)[a-f]`)
 	// Filesystem paths only: home-relative, well-known roots, or a nested path
 	// ending in a file extension. API routes such as /v1/tasks stay allowed.
 	subjectPath   = regexp.MustCompile(`(?:^|[\s(\[{"'<])(?:~/\S*|/(?:tmp|Users|home|mnt|var|private|opt|etc|srv|root|usr|Volumes)(?:/\S*)?(?:$|[\s)\]}"'>.,;:])|/\S+/\S*\.[A-Za-z0-9]{1,5}\b)`)

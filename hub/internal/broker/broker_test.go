@@ -22,6 +22,10 @@ type fixture struct {
 }
 
 func newFixture(t *testing.T) *fixture {
+	return newFixtureWithBuilder(t, "builder")
+}
+
+func newFixtureWithBuilder(t *testing.T, builderName string) *fixture {
 	f := &fixture{path: filepath.Join(t.TempDir(), "hub.sqlite"), by: api.Caller{Node: "test", User: "owner"}, ctx: context.Background()}
 	f.open(t)
 	var err error
@@ -35,7 +39,7 @@ func newFixture(t *testing.T) *fixture {
 		}
 		return a
 	}
-	f.lead, f.builder = add("lead"), add("builder")
+	f.lead, f.builder = add("lead"), add(builderName)
 	return f
 }
 
@@ -57,7 +61,7 @@ func (f *fixture) restart(t *testing.T) {
 func (f *fixture) assign(t *testing.T, due string) api.Obligation {
 	t.Helper()
 	m, err := f.st.PostMessage(f.ctx, f.task.ID, api.PostMessageRequest{AgentID: f.lead.ID, To: f.builder.ID, Envelope: &api.Envelope{
-		Kind: "assign", To: "builder", Subject: "Reject the empty recipient in tt post", Due: due,
+		Kind: "assign", To: f.builder.Name, Subject: "Reject the empty recipient in tt post", Due: due,
 		Body: api.EnvelopeBody{Objective: "fail fast", Owns: []string{"main.go"}, Acceptance: map[string]string{"a1": "exits 2"}}}}, f.by)
 	if err != nil {
 		t.Fatal(err)
@@ -158,6 +162,101 @@ func TestUnacknowledgedAssignmentEscalatesOnce(t *testing.T) {
 	}
 	want(t, "+90m", f.tick(t, o, c.Add(90*time.Minute)))
 	want(t, "+101m1s", f.tick(t, o, c.Add(101*time.Minute+time.Second)), "nudge")
+}
+
+func TestScopedAgentNamesSurviveBrokerSubjects(t *testing.T) {
+	const scoped = "builder-41b1c632"
+	for _, tc := range []struct {
+		name  string
+		step  time.Duration
+		owner bool
+	}{
+		{"lead escalation", 10*time.Minute + time.Second, false},
+		{"owner escalation", 25*time.Minute + time.Second, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFixtureWithBuilder(t, scoped)
+			clock := time.Date(2026, 9, 24, 12, 0, 0, 0, time.UTC)
+			f.st.SetClockForTest(func() time.Time { return clock })
+			o := f.assign(t, "")
+			for _, at := range []time.Duration{time.Minute, 3 * time.Minute, 7 * time.Minute, 10*time.Minute + time.Second} {
+				f.tick(t, o, clock.Add(at))
+			}
+			if tc.owner {
+				f.tick(t, o, clock.Add(tc.step))
+			}
+			wantTo := f.lead.ID
+			if tc.owner {
+				wantTo = ""
+			}
+			msgs, err := f.st.ListMessages(f.ctx, f.task.ID, 0, "", 100)
+			if err != nil {
+				t.Fatal(err)
+			}
+			found := false
+			for _, m := range msgs {
+				if m.From.Node == api.BrokerNode && m.To == wantTo && m.Envelope != nil && m.Envelope.Refs["escalation"] != "" {
+					found = true
+					if !strings.Contains(m.Envelope.Subject, scoped) || !strings.Contains(m.Text, scoped) {
+						t.Fatalf("subject/text lost scoped name: %q / %q", m.Envelope.Subject, m.Text)
+					}
+				}
+			}
+			if !found {
+				t.Fatal("escalation notice missing")
+			}
+		})
+	}
+
+	t.Run("nudge", func(t *testing.T) {
+		f := newFixtureWithBuilder(t, scoped)
+		clock := time.Date(2026, 9, 24, 12, 0, 0, 0, time.UTC)
+		f.st.SetClockForTest(func() time.Time { return clock })
+		o := f.assign(t, "")
+		if _, err := f.st.ObligationAction(f.ctx, f.task.ID, o.MessageSeq, "ack", api.ObligationActionRequest{AgentID: f.builder.ID, RunID: f.builder.RunID}, clock.Add(time.Minute)); err != nil {
+			t.Fatal(err)
+		}
+		f.tick(t, o, clock.Add(32*time.Minute))
+		msgs, err := f.st.ListMessages(f.ctx, f.task.ID, 0, "", 100)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, m := range msgs {
+			if m.From.Node == api.BrokerNode && m.To == f.builder.ID {
+				if m.Envelope == nil || !strings.Contains(m.Envelope.Subject, scoped) || !strings.Contains(m.Text, scoped) {
+					t.Fatalf("nudge lost scoped name: %+v", m)
+				}
+				return
+			}
+		}
+		t.Fatal("nudge notice missing")
+	})
+
+	t.Run("reassignment", func(t *testing.T) {
+		f := newFixture(t)
+		clock := time.Date(2026, 9, 24, 12, 0, 0, 0, time.UTC)
+		f.st.SetClockForTest(func() time.Time { return clock })
+		old := f.assign(t, "")
+		target, err := f.st.AddAgent(f.ctx, f.task.ID, api.AddAgentRequest{Name: scoped, Host: "h", Session: scoped, Runtime: "codex"}, f.by)
+		if err != nil {
+			t.Fatal(err)
+		}
+		m, err := f.st.ReassignObligation(f.ctx, f.task.ID, old.ID, api.ObligationReassignRequest{ToAgentID: target.ID}, f.by)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if m.To != target.ID || m.Envelope == nil || !strings.Contains(m.Envelope.Subject, scoped) || !strings.Contains(m.Text, scoped) {
+			t.Fatalf("reassignment lost scoped name or routing: %+v", m)
+		}
+		prior, err := f.st.ListObligations(f.ctx, f.task.ID, store.ObligationFilter{AgentID: f.builder.ID}, clock)
+		if err != nil || len(prior) != 1 || prior[0].Outcome != api.OutcomeSuperseded {
+			t.Fatalf("original obligation changed incorrectly: %v %+v", err, prior)
+		}
+		moved, err := f.st.ListObligations(f.ctx, f.task.ID, store.ObligationFilter{AgentID: target.ID}, clock)
+		if err != nil || len(moved) != 1 || moved[0].MessageSeq != m.Seq || moved[0].Needs != api.ObligationNeedsOutcome {
+			t.Fatalf("new obligation changed incorrectly: %v %+v", err, moved)
+		}
+	})
 }
 
 // b6: silence nudges twice at 30-minute spacing, then escalates; a missed due

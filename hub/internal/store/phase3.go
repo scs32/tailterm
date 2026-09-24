@@ -192,7 +192,7 @@ func (s *Store) retireLegacyFollowThrough(ctx context.Context) error {
 		if len(shown) > 0 {
 			text += fmt.Sprintf(" Work items they referenced, to re-dispatch when this project resumes: %s%s.", strings.Join(shown, ", "), more)
 		}
-		if err := s.postBrokerNotice(ctx, tx, task, api.Agent{}, "Legacy directives were retired for this project", "Legacy directives were retired for this project", text, map[string]string{"migration": RetiredPhase3}); err != nil {
+		if err := s.postBrokerNotice(ctx, tx, task, api.Agent{}, "", "Legacy directives were retired for this project", "Legacy directives were retired for this project", text, map[string]string{"migration": RetiredPhase3}); err != nil {
 			return err
 		}
 	}
@@ -422,7 +422,7 @@ func (s *Store) ExtendObligation(ctx context.Context, taskID, obligationID strin
 		if req.Reason != "" {
 			text += " Reason: " + req.Reason
 		}
-		if err := s.postBrokerNotice(ctx, tx, task, api.Agent{}, "The owner extended an obligation", "The owner extended an obligation", text, map[string]string{"obligation": o.ID, "message": fmt.Sprint(o.MessageSeq)}); err != nil {
+		if err := s.postBrokerNotice(ctx, tx, task, api.Agent{}, "", "The owner extended an obligation", "The owner extended an obligation", text, map[string]string{"obligation": o.ID, "message": fmt.Sprint(o.MessageSeq)}); err != nil {
 			return api.OwnerActionResult{}, err
 		}
 		o, err = scanObligation(tx.QueryRowContext(ctx, `SELECT `+obligationCols+` FROM obligations WHERE id=?`, o.ID))
@@ -595,7 +595,7 @@ func (s *Store) postLinkedBrokerNotice(ctx context.Context, tx *sql.Tx, task api
 	if len(source.WorkItems) > 0 {
 		req.RequestID = requestID
 	}
-	m, err := s.insertMessageWithResume(ctx, tx, task, req, to, BrokerCaller, false, true, false)
+	m, err := s.insertBrokerMessage(ctx, tx, task, req, to, to.Name)
 	if err != nil {
 		return err
 	}

@@ -543,7 +543,7 @@ func (s *Store) reissueObligation(ctx context.Context, tx *sql.Tx, task api.Task
 	if len(authored.WorkItems) > 0 {
 		reissue.RequestID = "reissue-" + old.ID
 	}
-	m, err := s.insertMessageWithResume(ctx, tx, task, reissue, target, BrokerCaller, false, true, false)
+	m, err := s.insertBrokerMessage(ctx, tx, task, reissue, target, target.Name)
 	if err != nil {
 		return m, err
 	}
@@ -565,14 +565,22 @@ func reassignedEnvelope(original api.Message, toName string, seq int64) *api.Env
 			e.Refs[k] = v
 		}
 		e.Refs["reassignedFrom"] = fmt.Sprint(seq)
-		if len(e.Subject) <= 108 {
-			e.Subject = "Reassigned: " + e.Subject
-		}
+		e.Subject = reassignedSubject(toName, e.Subject)
 		return &e
 	}
 	ask := truncateRunes(strings.Join(strings.Fields(original.Text), " "), 1500)
-	return &api.Envelope{Kind: api.EnvelopeKindRequest, To: toName, Subject: "Reassigned request from the owner",
+	return &api.Envelope{Kind: api.EnvelopeKindRequest, To: toName, Subject: reassignedSubject(toName, "request from the owner"),
 		Refs: map[string]string{"reassignedFrom": fmt.Sprint(seq)}, Body: api.EnvelopeBody{Ask: ask}}
+}
+
+func reassignedSubject(toName, original string) string {
+	prefix := "Reassigned to " + toName + ": "
+	remaining := 120 - len([]rune(prefix))
+	runes := []rune(original)
+	if len(runes) > remaining {
+		return prefix + string(runes[:remaining-1]) + "…"
+	}
+	return prefix + original
 }
 
 // LeaseWakeJob hands the host relay the next due wake for an agent's current
