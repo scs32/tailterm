@@ -207,6 +207,37 @@ func (c *Client) PostMessage(ctx context.Context, task string, req PostMessageRe
 	return out, c.do(ctx, "POST", "/v1/tasks/"+task+"/messages", req, &out)
 }
 
+// ListObligations lists a task's obligations. Passing the caller's own agent
+// and current run marks that run's queued obligations delivered.
+func (c *Client) ListObligations(ctx context.Context, task, agent, run string, open, overdue bool) ([]Obligation, error) {
+	q := url.Values{}
+	if agent != "" {
+		q.Set("agentId", agent)
+	}
+	if run != "" {
+		q.Set("runId", run)
+	}
+	if open {
+		q.Set("open", "1")
+	}
+	if overdue {
+		q.Set("overdue", "1")
+	}
+	var out ObligationList
+	return out.Obligations, c.do(ctx, "GET", "/v1/tasks/"+task+"/obligations?"+q.Encode(), nil, &out)
+}
+
+// ObligationAction is "ack" or "progress" on the obligation message seq created.
+func (c *Client) ObligationAction(ctx context.Context, task string, seq int64, action string, req ObligationActionRequest) (Obligation, error) {
+	var out Obligation
+	return out, c.do(ctx, "POST", fmt.Sprintf("/v1/tasks/%s/messages/%d/%s", task, seq, action), req, &out)
+}
+
+func (c *Client) ReassignObligation(ctx context.Context, task, obligation string, req ObligationReassignRequest) (Message, error) {
+	var out Message
+	return out, c.do(ctx, "POST", "/v1/tasks/"+task+"/obligations/"+obligation+"/reassign", req, &out)
+}
+
 func (c *Client) ListMessageChecks(ctx context.Context, task string, after int64, limit int) ([]MessageCheck, error) {
 	q := url.Values{}
 	q.Set("after", strconv.FormatInt(after, 10))

@@ -47,6 +47,9 @@ Commands
   ask --request-id KEY --file PATH [--json]  request an owner decision on the Board
   send --kind K --subject S [fields] | --file F   post a typed board message
   message-checks [--since 24h] [--summary] [--json]  typed-message adoption and Jev scores
+  obligations [--overdue] [--all] [--json]  what you owe, and what is overdue in the project
+  ack SEQ | progress SEQ [--text T]  acknowledge or record progress on an obligation
+  reassign OBLIGATION_ID --to AGENT [--reason T]  move an open obligation (lead or owner)
   inbox [--unread] [--mark-read] [--wait 9m] [--json]
   context [--json]             print this exact run's bound work-item context
   operational-record propose|commit|get  validated operational records
@@ -191,6 +194,12 @@ func main() {
 		err = cmdSend(e, args)
 	case "message-checks":
 		err = cmdMessageChecks(e, args)
+	case "obligations":
+		err = cmdObligations(e, args)
+	case "ack", "progress":
+		err = cmdObligationAction(e, cmd, args)
+	case "reassign":
+		err = cmdReassign(e, args)
 	case "context":
 		err = cmdContext(e, args)
 	case "operational-record":
@@ -1390,7 +1399,14 @@ func cmdHook(e env, args []string) error {
 	case "stop":
 		quiet(api.EventDone, "")
 		active, _ := input["stop_hook_active"].(bool)
-		if n := unread(); n > 0 && !active {
+		if active {
+			break
+		}
+		// Broker phase 2a: block turn end on unacknowledged obligations only;
+		// overdue outcomes escalate instead of holding the turn open.
+		if n, seqs := unackedObligations(e); n > 0 {
+			printJSON(map[string]any{"decision": "block", "reason": fmt.Sprintf("You have %d unacknowledged tailterm obligation(s): %s. Run `tt obligations`, acknowledge with `tt ack SEQ`, then act and reply with `tt send --reply-to SEQ`.", n, seqs)})
+		} else if n := unread(); n > 0 {
 			printJSON(map[string]any{"decision": "block", "reason": fmt.Sprintf("You have %d unread tailterm task message(s). Run `tt inbox --unread --mark-read`, act on them, and reply with `tt post` if needed.", n)})
 		}
 	case "notification":

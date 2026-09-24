@@ -60,6 +60,10 @@ func New(st *store.Store, identity Identity) *Server {
 	m.HandleFunc("POST /v1/tasks/{id}/messages", s.postMessage)
 	m.HandleFunc("GET /v1/tasks/{id}/messages", s.listMessages)
 	m.HandleFunc("GET /v1/tasks/{id}/message-checks", s.listMessageChecks)
+	m.HandleFunc("GET /v1/tasks/{id}/obligations", s.listObligations)
+	m.HandleFunc("POST /v1/tasks/{id}/messages/{seq}/ack", s.obligationAction("ack"))
+	m.HandleFunc("POST /v1/tasks/{id}/messages/{seq}/progress", s.obligationAction("progress"))
+	m.HandleFunc("POST /v1/tasks/{id}/obligations/{oid}/reassign", s.reassignObligation)
 	m.HandleFunc("GET /v1/tasks/{id}/messages/receipts/{requestID}", s.getMessagePostReceipt)
 	m.HandleFunc("GET /v1/tasks/{id}/message-audit/messages/{seq}", s.getMessageAudit)
 	m.HandleFunc("GET /v1/tasks/{id}/message-audit/messages/{seq}/history", s.listMessageAuditHistory)
@@ -651,6 +655,86 @@ func queryInt(r *http.Request, key string, fallback int64) int64 {
 		}
 	}
 	return fallback
+}
+
+// listObligations lists a task's obligations (docs/broker-phase-2a.md). When the
+// caller names an agent and its current run, listing counts as delivery to
+// that run (never as acknowledgement).
+func (s *Server) listObligations(w http.ResponseWriter, r *http.Request) {
+	if _, ok := s.caller(w, r); !ok {
+		return
+	}
+	id, ok := taskID(w, r)
+	if !ok {
+		return
+	}
+	if _, err := s.store.GetTask(r.Context(), id); err != nil {
+		fail(w, err)
+		return
+	}
+	q := r.URL.Query()
+	now := time.Now().UTC()
+	agent, run := q.Get("agentId"), q.Get("runId")
+	if agent != "" && run != "" {
+		if err := s.store.MarkObligationsDelivered(r.Context(), id, agent, run, now); err != nil {
+			fail(w, err)
+			return
+		}
+	}
+	list, err := s.store.ListObligations(r.Context(), id, store.ObligationFilter{AgentID: agent, OpenOnly: q.Get("open") == "1", Overdue: q.Get("overdue") == "1"}, now)
+	if err != nil {
+		fail(w, err)
+		return
+	}
+	writeJSON(w, 200, api.ObligationList{Obligations: list})
+}
+
+func (s *Server) obligationAction(action string) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if _, ok := s.writer(w, r); !ok {
+			return
+		}
+		id, ok := taskID(w, r)
+		if !ok {
+			return
+		}
+		seq, err := strconv.ParseInt(r.PathValue("seq"), 10, 64)
+		if err != nil || seq < 1 {
+			writeError(w, http.StatusBadRequest, "invalid message sequence")
+			return
+		}
+		var req api.ObligationActionRequest
+		if !decode(w, r, &req) {
+			return
+		}
+		o, err := s.store.ObligationAction(r.Context(), id, seq, action, req, time.Now().UTC())
+		if err != nil {
+			fail(w, err)
+			return
+		}
+		writeJSON(w, 200, o)
+	}
+}
+
+func (s *Server) reassignObligation(w http.ResponseWriter, r *http.Request) {
+	c, ok := s.writer(w, r)
+	if !ok {
+		return
+	}
+	id, ok := taskID(w, r)
+	if !ok {
+		return
+	}
+	var req api.ObligationReassignRequest
+	if !decode(w, r, &req) {
+		return
+	}
+	m, err := s.store.ReassignObligation(r.Context(), id, r.PathValue("oid"), req, c)
+	if err != nil {
+		fail(w, err)
+		return
+	}
+	writeJSON(w, 201, m)
 }
 
 // listMessageChecks pages broker phase-1 shadow checks (docs/broker-phase-1.md).
