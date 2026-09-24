@@ -1,6 +1,10 @@
 package api
 
-import "time"
+import (
+	"fmt"
+	"strings"
+	"time"
+)
 
 // Obligations (broker phase 2a, docs/broker-phase-2a.md): a typed message or a
 // directed human message obliges its recipient until a typed outcome closes it.
@@ -130,4 +134,34 @@ type ErrNudgeTooSoon struct{ RetryAfter time.Duration }
 
 func (e *ErrNudgeTooSoon) Error() string {
 	return "this obligation was nudged recently; try again in " + e.RetryAfter.Round(time.Second).String()
+}
+
+// ObligationAckGrace is how long a new obligation may go unacknowledged
+// before its recipient's other writes are refused (broker phase 3.1).
+const ObligationAckGrace = 2 * time.Minute
+
+// UnacknowledgedItem is one piece of work that blocks its recipient's writes.
+type UnacknowledgedItem struct {
+	Seq     int64  `json:"seq"`
+	From    string `json:"from"`
+	Subject string `json:"subject"`
+}
+
+// UnacknowledgedError refuses a write from an agent that holds work it has
+// not acknowledged. It names every item and the exact fix.
+type UnacknowledgedError struct {
+	Items []UnacknowledgedItem
+}
+
+func (e *UnacknowledgedError) Error() string {
+	var b strings.Builder
+	b.WriteString("you have unacknowledged work, so this write was refused: ")
+	for i, it := range e.Items {
+		if i > 0 {
+			b.WriteString("; ")
+		}
+		fmt.Fprintf(&b, "#%d from %s (%s)", it.Seq, it.From, it.Subject)
+	}
+	fmt.Fprintf(&b, ". Run `tt ack %d` (for each), or reply to it with `tt send --reply-to %d`, then retry.", e.Items[0].Seq, e.Items[0].Seq)
+	return b.String()
 }

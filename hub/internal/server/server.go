@@ -182,7 +182,10 @@ func writeError(w http.ResponseWriter, status int, msg string) {
 
 func fail(w http.ResponseWriter, err error) {
 	var envelopeErr *api.EnvelopeError
+	var unacked *api.UnacknowledgedError
 	switch {
+	case errors.As(err, &unacked):
+		writeJSON(w, http.StatusConflict, api.ErrorResponse{Error: unacked.Error(), Code: "unacknowledged"})
 	case errors.Is(err, api.ErrNotFound):
 		writeError(w, http.StatusNotFound, "not found")
 	case errors.Is(err, api.ErrAgentSpawnLimit):

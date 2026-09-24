@@ -61,6 +61,9 @@ func cmdObligations(e env, args []string) error {
 		if o.Overdue != "" {
 			line += " [overdue: " + o.Overdue + "]"
 		}
+		if gatesPosts(o, time.Now()) {
+			line += " [unacknowledged: blocks posts until `tt ack " + strconv.FormatInt(o.MessageSeq, 10) + "` or a reply]"
+		}
 		if o.State != api.ObligationClosed && o.Needs != api.ObligationNeedsDelivery {
 			line += " (due " + o.DueAt.Local().Format("15:04") + ")"
 		}
@@ -221,4 +224,11 @@ func obligationRequestID(run, action string, seq int64, text string, now time.Ti
 	scope := now.UTC().Truncate(time.Minute).Format(time.RFC3339)
 	digest := sha256.Sum256([]byte(run + "\x00" + action + "\x00" + strconv.FormatInt(seq, 10) + "\x00" + text + "\x00" + scope))
 	return fmt.Sprintf("%s-%x", action, digest[:12])
+}
+
+// gatesPosts mirrors the hub's acknowledgement gate (broker phase 3.1): the
+// recipient's other writes are refused while this is true.
+func gatesPosts(o api.Obligation, now time.Time) bool {
+	return (o.State == api.ObligationQueued || o.State == api.ObligationDelivered) &&
+		o.Needs != api.ObligationNeedsDelivery && now.Sub(o.CreatedAt) >= api.ObligationAckGrace
 }

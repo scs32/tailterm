@@ -1,0 +1,102 @@
+package store
+
+import (
+	"errors"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/scs32/tailterm/hub/internal/api"
+)
+
+// Broker phase 3.1 acknowledgement discipline (docs/broker-phase-3.1.md).
+
+func (f phase3Fixture) assignTo(t *testing.T, to api.Agent) api.Message {
+	t.Helper()
+	m, err := f.post(t, api.PostMessageRequest{AgentID: f.lead.ID, RunID: f.lead.RunID, To: to.ID, Envelope: &api.Envelope{Kind: api.EnvelopeKindAssign, To: to.Name, Subject: "Fix the stale smoke test",
+		Body: api.EnvelopeBody{Objective: "fix it", Owns: []string{"tests/x.mjs"}, Acceptance: map[string]string{"a1": "passes"}}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return m
+}
+
+func notice(from api.Agent, text string) api.PostMessageRequest {
+	return api.PostMessageRequest{AgentID: from.ID, RunID: from.RunID, Envelope: &api.Envelope{Kind: api.EnvelopeKindNotice, Subject: "Status of the smoke test work", Body: api.EnvelopeBody{Text: text}}}
+}
+
+// k1, k2, k5: past the grace, other writes are refused with the exact fix;
+// inside it, or after tt ack, they succeed.
+func TestAckGateRefusesUntilAcknowledged(t *testing.T) {
+	f := newPhase3Fixture(t)
+	start := time.Now().UTC()
+	f.s.now = func() time.Time { return start }
+	assign := f.assignTo(t, f.builder)
+	if _, err := f.post(t, notice(f.builder, "working on it")); err != nil {
+		t.Fatalf("inside the grace a post was refused: %v", err)
+	}
+	f.s.now = func() time.Time { return start.Add(api.ObligationAckGrace + time.Second) }
+	_, err := f.post(t, notice(f.builder, "still working"))
+	var unacked *api.UnacknowledgedError
+	if !errors.As(err, &unacked) || unacked.Items[0].Seq != assign.Seq || unacked.Items[0].From != "lead-1" || !strings.Contains(err.Error(), "tt ack") {
+		t.Fatalf("past the grace: %v", err)
+	}
+	if _, err := f.s.CreateWorkItem(f.ctx, f.task.ID, api.CreateWorkItemRequest{Kind: "bug", Title: "A new bug from the builder", AgentID: f.builder.ID, RequestID: "wi-gated"}, f.by); !errors.As(err, &unacked) {
+		t.Fatalf("a work-item create was not gated: %v", err)
+	}
+	if _, err := f.s.ObligationAction(f.ctx, f.task.ID, assign.Seq, "ack", api.ObligationActionRequest{AgentID: f.builder.ID, RunID: f.builder.RunID}, f.s.now()); err != nil {
+		t.Fatalf("tt ack was refused: %v", err)
+	}
+	if _, err := f.post(t, notice(f.builder, "acknowledged, now reporting")); err != nil {
+		t.Fatalf("after tt ack the post was refused: %v", err)
+	}
+}
+
+// k3, k4: replies are the way out and acknowledge; a stale run's reply does
+// neither; people, the hub and delivery-only notices are never gated.
+func TestAckGateExemptionsAndImplicitAck(t *testing.T) {
+	f := newPhase3Fixture(t)
+	start := time.Now().UTC()
+	f.s.now = func() time.Time { return start }
+	assign := f.assignTo(t, f.builder)
+	f.s.now = func() time.Time { return start.Add(10 * time.Minute) }
+	// People are never gated; a notice to the builder is delivery-only and never gates.
+	if _, err := f.post(t, api.PostMessageRequest{To: f.builder.ID, Text: "owner: how is it going"}); err != nil {
+		t.Fatalf("an owner post was gated: %v", err)
+	}
+	stale := api.PostMessageRequest{AgentID: f.builder.ID, RunID: "run_0000000000000000", To: f.lead.ID, ReplyTo: assign.Seq, Envelope: &api.Envelope{Kind: api.EnvelopeKindQuestion, To: "lead-1", Subject: "Which fixture should I use here", Body: api.EnvelopeBody{Question: "Static or live?"}}}
+	var unacked *api.UnacknowledgedError
+	if _, err := f.post(t, stale); !errors.As(err, &unacked) {
+		t.Fatalf("a stale run's reply bypassed the gate: %v", err)
+	}
+	reply := stale
+	reply.RunID = f.builder.RunID
+	if _, err := f.post(t, reply); err != nil {
+		t.Fatalf("a reply to the gating work was refused: %v", err)
+	}
+	if o := f.obligationFor(t, assign.Seq); o.State != api.ObligationAcknowledged || o.AckedAt == nil {
+		t.Fatalf("the reply did not acknowledge: %+v", o)
+	}
+	if _, err := f.post(t, notice(f.builder, "now free to report")); err != nil {
+		t.Fatalf("after the reply the builder is still gated: %v", err)
+	}
+}
+
+// k6: the database handler is gated only by work addressed to it.
+func TestAckGateIsPerRecipient(t *testing.T) {
+	f := newPhase3Fixture(t)
+	start := time.Now().UTC()
+	f.s.now = func() time.Time { return start }
+	f.assignTo(t, f.builder) // the builder's unacknowledged work
+	f.s.now = func() time.Time { return start.Add(10 * time.Minute) }
+	if _, err := f.s.CreateWorkItem(f.ctx, f.task.ID, api.CreateWorkItemRequest{Kind: "bug", Title: "Recorded by the handler", AgentID: f.handler.ID, RequestID: "wi-handler"}, f.by); err != nil {
+		t.Fatalf("the handler was gated by the builder's work: %v", err)
+	}
+	f.s.now = func() time.Time { return start.Add(10 * time.Minute) }
+	f.assignTo(t, f.handler)
+	f.s.now = func() time.Time { return start.Add(20 * time.Minute) }
+	var unacked *api.UnacknowledgedError
+	if _, err := f.s.CreateWorkItem(f.ctx, f.task.ID, api.CreateWorkItemRequest{Kind: "bug", Title: "Recorded after its own assignment", AgentID: f.handler.ID, RequestID: "wi-handler-2"}, f.by); !errors.As(err, &unacked) {
+		t.Fatalf("the handler's own unacknowledged work did not gate it: %v", err)
+	}
+}

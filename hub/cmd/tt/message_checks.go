@@ -69,6 +69,13 @@ func cmdMessageChecks(e env, args []string) error {
 	}
 	if *summary {
 		fmt.Print(summarizeChecks(checks, names))
+		if obligations, err := c.ListObligations(ctx, task, "", "", false, false); err == nil {
+			cutoff := time.Time{}
+			if *since > 0 {
+				cutoff = time.Now().Add(-*since)
+			}
+			fmt.Print(summarizeAcks(obligations, names, cutoff, time.Now()))
+		}
 		return nil
 	}
 	for _, check := range checks {
@@ -203,4 +210,42 @@ func topCounts(m map[string]int) []string {
 		return keys[i] < keys[j]
 	})
 	return keys
+}
+
+// summarizeAcks reports how long agents take to acknowledge work (broker
+// phase 3.1): median and worst latency, and work still unacknowledged.
+func summarizeAcks(list []api.Obligation, names map[string]string, cutoff, now time.Time) string {
+	var latencies []time.Duration
+	var worst api.Obligation
+	gating := 0
+	for _, o := range list {
+		if o.Needs == api.ObligationNeedsDelivery || o.CreatedAt.Before(cutoff) {
+			continue
+		}
+		if gatesPosts(o, now) {
+			gating++
+		}
+		if o.AckedAt == nil {
+			continue
+		}
+		d := o.AckedAt.Sub(o.CreatedAt)
+		if len(latencies) == 0 || d > worst.AckedAt.Sub(worst.CreatedAt) {
+			worst = o
+		}
+		latencies = append(latencies, d)
+	}
+	if len(latencies) == 0 && gating == 0 {
+		return "Acknowledgement: no acknowledged work in this window\n"
+	}
+	out := ""
+	if len(latencies) > 0 {
+		sort.Slice(latencies, func(i, j int) bool { return latencies[i] < latencies[j] })
+		median := latencies[len(latencies)/2]
+		out = fmt.Sprintf("Acknowledgement: %d acknowledged, median %s, worst %s (#%d by %s)\n", len(latencies),
+			median.Round(time.Second), worst.AckedAt.Sub(worst.CreatedAt).Round(time.Second), worst.MessageSeq, or(names[worst.AgentID], worst.AgentID))
+	}
+	if gating > 0 {
+		out += fmt.Sprintf("Unacknowledged past the %s grace: %d (their recipients' posts are refused)\n", api.ObligationAckGrace, gating)
+	}
+	return out
 }

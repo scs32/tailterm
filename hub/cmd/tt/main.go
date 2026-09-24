@@ -950,6 +950,7 @@ func cmdSpawn(e env, args []string) error {
 	if err != nil {
 		return err
 	}
+	baseCommand = codexHookCommand(baseCommand, *runtime, *run)
 	if *permissionMode == "workspace-auto" || *sandboxMode == "workspace-write" {
 		if err := os.MkdirAll(relayDir(), 0700); err != nil {
 			return err
@@ -1329,8 +1330,12 @@ func tmuxVersionString() string {
 func cmdHooks(args []string) error {
 	fs := flag.NewFlagSet("hooks", flag.ExitOnError)
 	path := fs.String("path", "tt", "path to the tt binary in the hook commands")
-	_ = fs.Parse(args)
+	install := fs.Bool("install", false, "codex: merge the Tailterm Stop hook into ~/.codex/hooks.json")
 	kind := "claude"
+	if len(args) > 0 && !strings.HasPrefix(args[0], "-") {
+		kind, args = args[0], args[1:]
+	}
+	_ = fs.Parse(args)
 	if fs.NArg() > 0 {
 		kind = fs.Arg(0)
 	}
@@ -1338,6 +1343,9 @@ func cmdHooks(args []string) error {
 	case "claude":
 		fmt.Print(adapters.ClaudeHooks(*path))
 	case "codex":
+		if *install {
+			return installCodexStopHook(*path)
+		}
 		fmt.Print(adapters.CodexConfig(*path))
 	case "generic":
 		fmt.Print(adapters.Generic(*path))

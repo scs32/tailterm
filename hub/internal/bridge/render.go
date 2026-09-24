@@ -303,12 +303,16 @@ func reopenFence(open string) string {
 func renderCard(task api.Task, agents []api.Agent, obligations []api.Obligation) (discord.MessageSend, string) {
 	open := map[string]int{}
 	overdue := map[string]int{}
+	unacked := map[string]int{}
 	var late []api.Obligation
 	for _, o := range obligations {
 		if o.State == api.ObligationClosed {
 			continue
 		}
 		open[o.AgentID]++
+		if (o.State == api.ObligationQueued || o.State == api.ObligationDelivered) && o.Needs != api.ObligationNeedsDelivery {
+			unacked[o.AgentID]++
+		}
 		if o.Overdue != "" {
 			overdue[o.AgentID]++
 			late = append(late, o)
@@ -331,6 +335,9 @@ func renderCard(task api.Task, agents []api.Agent, obligations []api.Obligation)
 			line += fmt.Sprintf(" · %d open", n)
 			if d := overdue[a.ID]; d > 0 {
 				line += fmt.Sprintf(" (%d overdue)", d)
+			}
+			if u := unacked[a.ID]; u > 0 {
+				line += fmt.Sprintf(" · %d unacknowledged", u)
 			}
 		}
 		lines = append(lines, line)

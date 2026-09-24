@@ -951,6 +951,10 @@ func (s *Store) PostMessage(ctx context.Context, taskID string, req api.PostMess
 	if t.Status != api.TaskOpen {
 		return api.Message{}, api.ErrClosed
 	}
+	// Broker phase 3.1: an agent holding unacknowledged work may only reply to it.
+	if err := ackGate(ctx, tx, req.AgentID, req.RunID, req.ReplyTo, s.now()); err != nil {
+		return api.Message{}, err
+	}
 	if req.Text == "" || !api.ValidText(req.Text, api.MaxTextLen) || req.ReplyTo < 0 {
 		return api.Message{}, api.ErrInvalid
 	}
@@ -999,6 +1003,11 @@ func (s *Store) PostMessage(ctx context.Context, taskID string, req api.PostMess
 	// obligations. System notices, decisions, dispatches and lead notices use
 	// other insert paths and never oblige anyone.
 	if err = s.createObligations(ctx, tx, m, req, req.AgentID == "" && by.Node != api.BrokerNode); err != nil {
+		return m, err
+	}
+	// A reply from the recipient's current run acknowledges what it answers,
+	// before the reply's own outcome (result, decline, block) applies.
+	if err = acknowledgeByReply(ctx, tx, m, req); err != nil {
 		return m, err
 	}
 	if err = s.applyReplyOutcome(ctx, tx, m, req); err != nil {

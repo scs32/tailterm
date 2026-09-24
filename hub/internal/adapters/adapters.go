@@ -21,9 +21,25 @@ func ClaudeHooks(tt string) string {
 	return string(b) + "\n"
 }
 
-// CodexConfig returns the ~/.codex/config.toml lines wiring Codex notify.
+// CodexConfig returns the ~/.codex/config.toml lines wiring Codex notify,
+// and the hooks.json that blocks a Tailterm agent's turn from ending while
+// it holds unacknowledged work (broker phase 3.1).
 func CodexConfig(tt string) string {
-	return fmt.Sprintf("# Add to ~/.codex/config.toml\nnotify = [%q, \"hook\", \"codex\"]\n", tt)
+	return fmt.Sprintf("# Add to ~/.codex/config.toml\nnotify = [%q, \"hook\", \"codex\"]\n\n# ~/.codex/hooks.json (install with: tt hooks codex --install)\n%s", tt, CodexHooksJSON(tt))
+}
+
+// CodexStopMarker identifies the Tailterm Stop hook in hooks.json.
+const CodexStopMarker = "hook stop"
+
+// CodexStopHook is the Stop hook entry Tailterm adds to Codex's hooks.json.
+// Outside a Tailterm agent session, tt hook stop does nothing.
+func CodexStopHook(tt string) map[string]any {
+	return map[string]any{"hooks": []any{map[string]any{"type": "command", "command": tt + " " + CodexStopMarker}}}
+}
+
+func CodexHooksJSON(tt string) string {
+	b, _ := json.MarshalIndent(map[string]any{"hooks": map[string]any{"Stop": []any{CodexStopHook(tt)}}}, "", "  ")
+	return string(b) + "\n"
 }
 
 // Generic explains the runtime-agnostic path.

@@ -2,7 +2,9 @@ package server
 
 import (
 	"net/http"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/scs32/tailterm/hub/internal/api"
 )
@@ -54,5 +56,19 @@ func TestPhase3Routes(t *testing.T) {
 	}
 	if code, _ := h.do(bridgeToken, "PATCH", base+"/agents/"+builder.ID, map[string]any{"status": "retired"}, nil); code != http.StatusForbidden {
 		t.Fatalf("the bridge edited an agent directly: %d", code)
+	}
+}
+
+// Phase 3.1 k1: the refusal reaches clients as 409 unacknowledged with the fix.
+func TestAckGateOverHTTP(t *testing.T) {
+	h := newTokenHub(t)
+	task, builder, _ := h.project()
+	lead := h.agentNamed(task, "lead")
+	later := time.Now().UTC().Add(time.Hour)
+	h.st.SetClockForTest(func() time.Time { return later })
+	var e api.ErrorResponse
+	code, _ := h.do(ownerToken, "POST", "/v1/tasks/"+task.ID+"/messages", api.PostMessageRequest{AgentID: builder.ID, RunID: builder.RunID, To: lead.ID, Text: "status: still working"}, &e)
+	if code != http.StatusConflict || e.Code != "unacknowledged" || !strings.Contains(e.Error, "tt ack") {
+		t.Fatalf("gated post = %d %+v", code, e)
 	}
 }

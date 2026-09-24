@@ -226,6 +226,10 @@ func (s *Store) CreateWorkItem(ctx context.Context, taskID string, req api.Creat
 		return api.WorkItem{}, err
 	}
 	defer tx.Rollback()
+	// Broker phase 3.1: an agent holding unacknowledged work is refused.
+	if err := ackGate(ctx, tx, req.AgentID, "", 0, s.now()); err != nil {
+		return api.WorkItem{}, err
+	}
 	task, err := scanTask(tx.QueryRowContext(ctx, `SELECT `+taskCols+` FROM tasks WHERE id=?`, taskID))
 	if errors.Is(err, sql.ErrNoRows) {
 		return api.WorkItem{}, api.ErrNotFound
@@ -309,6 +313,10 @@ func (s *Store) UpdateWorkItem(ctx context.Context, taskID, itemID string, req a
 		return api.WorkItem{}, err
 	}
 	defer tx.Rollback()
+	// Broker phase 3.1: an agent holding unacknowledged work is refused.
+	if err := ackGate(ctx, tx, req.AgentID, "", 0, s.now()); err != nil {
+		return api.WorkItem{}, err
+	}
 	task, err := scanTask(tx.QueryRowContext(ctx, `SELECT `+taskCols+` FROM tasks WHERE id=?`, taskID))
 	if errors.Is(err, sql.ErrNoRows) {
 		return api.WorkItem{}, api.ErrNotFound
@@ -499,6 +507,10 @@ func (s *Store) CreateWorkItemUpdate(ctx context.Context, taskID, itemID string,
 		return api.WorkItemUpdateResult{}, false, err
 	}
 	defer tx.Rollback()
+	// Broker phase 3.1: an agent holding unacknowledged work is refused.
+	if err := ackGate(ctx, tx, req.AgentID, req.RunID, 0, s.now()); err != nil {
+		return api.WorkItemUpdateResult{}, false, err
+	}
 	receipt, priorHash, receiptErr := findAnyWorkItemUpdateReceipt(tx, ctx, taskID, req.RequestID, req.AgentID, by)
 	if receiptErr == nil {
 		if priorHash != payload {
@@ -662,6 +674,10 @@ func (s *Store) DispatchWorkItem(ctx context.Context, taskID, itemID string, req
 		return api.WorkItemDispatchResult{}, err
 	}
 	defer tx.Rollback()
+	// Broker phase 3.1: an agent holding unacknowledged work is refused.
+	if err := ackGate(ctx, tx, req.AgentID, "", 0, s.now()); err != nil {
+		return api.WorkItemDispatchResult{}, err
+	}
 	item, err := getWorkItem(tx, ctx, taskID, itemID)
 	if err != nil {
 		return api.WorkItemDispatchResult{}, err
