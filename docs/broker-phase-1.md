@@ -10,7 +10,12 @@ Acceptance: a1–a12 below
 Due: before broker phase 2 starts
 ```
 
-Status: work order, not started. Written September 23, 2026 from
+Hub record: Feature `wi_de84224a37cbef70`, owner intake #8766, work-order message
+#8767. It is recorded after the fact under the owner-directed exception in
+`AGENTS.md`. Implementation: `5ee29b6..53a4e1e` on `tasks-hub`, built outside the
+harness in a Claude Code session on September 24, 2026.
+
+Status: implemented; round-one review in progress; not deployed. Written September 23, 2026 from
 [the broker design](message-broker.md#migration). Owner decisions from that
 design apply: typed-only for agents in the end, humans keep free text, and Jev
 may only flag, never accept or route.

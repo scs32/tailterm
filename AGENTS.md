@@ -25,6 +25,16 @@ Persistent owner instructions:
   from a durable bug or feature and a bounded work order. Intake and coordination
   may establish that record first. Cite its ID and work-order message in handoffs,
   results and release evidence; route scope changes through the database handler.
+- Owner-directed work outside the harness (owner decision 2026-09-24): when the
+  owner explicitly directs a single session, such as Claude Code, to build or
+  review work outside the multi-agent harness, a committed work-order document
+  in `docs/` may serve as the bounded work order. Record it in the hub as soon as
+  practical: an owner-authored intake, a bug or feature citing it, and a
+  work-order message naming the document. With no database handler running, that
+  session may make those writes with the owner's credentials on the owner's
+  explicit instruction. Do not dispatch it to an orchestrator, and state "no agent
+  action is required" so recorded work is never started twice. Example: broker
+  phase 1, `wi_de84224a37cbef70`, intake #8766, order #8767.
 - All agent work-item database reads/writes (including list/get/create/update/
   dispatch) go through the project's actual database handler roster name. Do not
   bypass it with CLI/API/database access if unavailable; arrange authorized
