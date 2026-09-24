@@ -240,6 +240,20 @@ Deployment follows existing release practice. The owner approves each step.
    convention-valid for the week. Record any Jev noul whose rate of flags at or
    above 0.5 surprises the owner. That data sets phase-4 gate thresholds.
 
+**Mini install, September 24, 2026:**
+- **Codex:** the npm global `@openai/codex` is 0.156.1, which serves `gpt-6-sol` and `gpt-6-luna`.
+- **`tt`:** built from clean `56b00ad` (`CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 go build -trimpath -ldflags='-s -w'`).
+  It is 7,053,890 bytes with SHA-256 `782f32a4e9e502349def87eee0cf2368cbc911bec2d288b5ad228e48af9b2332`.
+  It was installed atomically as `~/.local/bin/tt`. The previous binary (SHA-256 `43bda683071b63a7…`) is retained as
+  `~/.local/bin/tt-before-broker-phase1-56b00ad` for rollback.
+- **Checks:** `tt doctor` reaches the hub. The existing relay (pid 90969) was not restarted; its code is unchanged,
+  and each wake runs the installed Codex.
+- **Relay compatibility:** on a throwaway session, `codex queue --thread … --message …` exited 0 and printed
+  "Queued message …", which is the acceptance string `nativeQueue` requires.
+- **Pending:** a wake of a real registered agent thread needs a running team.
+- **Old hub:** `tt send` also sends the rendered text, so it works against the current (pre-phase-1) hub as a
+  plain post. `tt message-checks` needs the phase-1 hub.
+
 **Merging to `main`:** squash the merge (owner decision, September 24, 2026).
 `29cc559` accidentally committed the 38 MB `hub/tailterm-hub` build output.
 `704a1d6` untracked and ignored it, but it stays in `tasks-hub` history, and a
