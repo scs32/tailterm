@@ -151,7 +151,9 @@ func cmdSend(e env, args []string) error {
 		digest := sha256.Sum256([]byte(e.runID + "\x00" + target + "\x00" + fmt.Sprint(*reply) + "\x00" + string(raw)))
 		*requestID = fmt.Sprintf("send-%x", digest[:12])
 	}
-	req := api.PostMessageRequest{Envelope: &env, To: target, AgentID: e.agent, ReplyTo: *reply}
+	// Send the rendered text too: hubs that predate envelopes ignore the
+	// envelope and store the text; newer hubs require the two to match.
+	req := api.PostMessageRequest{Envelope: &env, Text: api.RenderText(env), To: target, AgentID: e.agent, ReplyTo: *reply}
 	if err := links.apply(ctx, c, e, *task, target, *reply, api.RenderText(env), *requestID, false, &req); err != nil {
 		return err
 	}

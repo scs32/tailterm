@@ -134,6 +134,11 @@ func TestBoundAgentSendCarriesItsRecordedItem(t *testing.T) {
 		posted.WorkItems[0].ItemID != binding.ItemID || posted.WorkOrderMessage == nil || *posted.WorkOrderMessage != binding.WorkOrderMessage {
 		t.Fatalf("bound send lost durable context: %+v", posted)
 	}
+	// The rendered text is sent too, so a hub that predates envelopes still
+	// accepts the post as plain text; newer hubs verify it matches.
+	if posted.Text != api.RenderText(*posted.Envelope) {
+		t.Fatalf("text not rendered client-side: %q", posted.Text)
+	}
 }
 
 // Round-one blocker R2: one recipient, taken from --to or the file, never both disagreeing.
