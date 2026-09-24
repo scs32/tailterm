@@ -367,12 +367,7 @@ func (b *Bridge) provision(ctx context.Context, t api.Task, remapping bool) erro
 			}
 		}
 	}
-	if err := b.cfg.State.SetChannel(ctx, t.ID, channelID, start); err != nil {
-		return err
-	}
-	// Owner messages older than the channel cannot exist, so the channel's
-	// own ID is a safe starting point for backfill.
-	return b.cfg.State.SetIngestAfter(ctx, t.ID, channelID)
+	return b.cfg.State.SetChannel(ctx, t.ID, channelID, start)
 }
 
 // archive moves a closed project's channel to the archive category. Writes

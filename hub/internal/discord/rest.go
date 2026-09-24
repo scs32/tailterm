@@ -361,12 +361,6 @@ func (c *Client) ChannelMessages(ctx context.Context, channel, after string, lim
 	return out, nil
 }
 
-// RecentMessages lists the newest messages in a channel, newest first.
-func (c *Client) RecentMessages(ctx context.Context, channel string, limit int) ([]Message, error) {
-	var out []Message
-	return out, c.do(ctx, "GET", "/channels/"+channel+"/messages?limit="+strconv.Itoa(limit), nil, &out)
-}
-
 // React adds a unicode emoji reaction.
 func (c *Client) React(ctx context.Context, channel, message, emoji string) error {
 	return c.do(ctx, "PUT", "/channels/"+channel+"/messages/"+message+"/reactions/"+url.PathEscape(emoji)+"/@me", nil, nil)

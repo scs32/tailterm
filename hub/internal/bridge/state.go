@@ -181,10 +181,13 @@ func (s *State) MappingByChannel(ctx context.Context, channelID string) (Mapping
 }
 
 // SetChannel records a project's channel, starting its mirror after the
-// given hub sequence. An existing mapping keeps its cursors.
+// given hub sequence. An existing mapping keeps its mirror cursor. The
+// ingest cursor starts at the channel's own ID (no owner message can be
+// older than the channel), in the same statement, so no crash can leave a
+// channel that backfill never reads.
 func (s *State) SetChannel(ctx context.Context, taskID, channelID string, mirrorAfter int64) error {
-	_, err := s.db.ExecContext(ctx, `INSERT INTO channels (task_id,channel_id,mirror_after) VALUES (?,?,?)
-ON CONFLICT(task_id) DO UPDATE SET channel_id=excluded.channel_id`, taskID, channelID, mirrorAfter)
+	_, err := s.db.ExecContext(ctx, `INSERT INTO channels (task_id,channel_id,mirror_after,ingest_after) VALUES (?,?,?,?)
+ON CONFLICT(task_id) DO UPDATE SET channel_id=excluded.channel_id,ingest_after=excluded.ingest_after`, taskID, channelID, mirrorAfter, channelID)
 	return err
 }
 
