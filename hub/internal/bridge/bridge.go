@@ -217,8 +217,8 @@ func (b *Bridge) eventLoop(ctx context.Context) {
 			switch d.Type {
 			case "MESSAGE_CREATE":
 				var m discord.Message
-				if json.Unmarshal(d.Data, &m) == nil {
-					b.handleMessage(ctx, m)
+				if json.Unmarshal(d.Data, &m) == nil && b.handleMessage(ctx, m) != nil {
+					b.needBackfill.Store(true) // backfill will read it again
 				}
 			case "READY", "RESUMED":
 				b.backfill(ctx)
@@ -581,7 +581,10 @@ func (b *Bridge) findOwn(ctx context.Context, channelID, mk string, since time.T
 			return "", nil
 		}
 	}
-	return "", fmt.Errorf("marker %q not found within %d pages", mk, maxReconcilePages)
+	// So much traffic followed that the send would have been found by now if
+	// it had landed: treat it as absent rather than blocking forever.
+	b.logf("discord bridge: marker %q not found in %d pages; treating it as not sent", mk, maxReconcilePages)
+	return "", nil
 }
 
 // maxReconcilePages bounds a reconciliation search (100 messages a page).
@@ -711,20 +714,23 @@ var errNoChannel = errors.New("no channel")
 // handleMessage takes an owner's message in a project channel to the board.
 // It never moves the ingest cursor: only backfill does, reading every
 // message in order, so a gap can never be skipped by a newer live message.
-func (b *Bridge) handleMessage(ctx context.Context, msg discord.Message) {
+// It returns an error only when an owner message could not be recorded, so
+// backfill stops there and reads it again next time.
+func (b *Bridge) handleMessage(ctx context.Context, msg discord.Message) error {
 	m, ok := b.ownerMessage(ctx, msg)
 	if !ok {
-		return
+		return nil
 	}
 	raw, _ := json.Marshal(msg)
 	claimed, err := b.cfg.State.ClaimInbound(ctx, msg.ID, "message", m.TaskID, string(raw), time.Now().Add(time.Minute))
 	if err != nil {
 		b.logf("discord bridge: record message %s: %v", msg.ID, err)
-		return
+		return err
 	}
 	if claimed {
 		b.postInbound(ctx, m, msg, 0)
 	}
+	return nil
 }
 
 // ownerMessage returns the project of an owner's message in a mapped channel
@@ -913,25 +919,31 @@ func (b *Bridge) backfill(ctx context.Context) {
 			continue
 		}
 		after := m.IngestAfter
+	pages:
 		for {
 			msgs, err := b.cfg.Discord.ChannelMessages(ctx, m.ChannelID, after, 100)
 			if err != nil {
 				b.logf("discord bridge: backfill %s: %v", m.TaskID, err)
 				break
 			}
+			stopped := false
 			for _, msg := range msgs {
 				if msg.GuildID == "" {
 					msg.GuildID = b.cfg.GuildID
 				}
-				b.handleMessage(ctx, msg)
+				// The cursor never passes a message that was not recorded.
+				if b.handleMessage(ctx, msg) != nil {
+					stopped = true
+					break
+				}
 				after = msg.ID
 			}
 			if err := b.cfg.State.SetIngestAfter(ctx, m.TaskID, after); err != nil {
 				b.logf("discord bridge: ingest cursor %s: %v", m.TaskID, err)
 				break
 			}
-			if len(msgs) < 100 || ctx.Err() != nil {
-				break
+			if stopped || len(msgs) < 100 || ctx.Err() != nil {
+				break pages
 			}
 		}
 	}

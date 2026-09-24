@@ -115,7 +115,7 @@ func (b *Bridge) act(ctx context.Context, taskID string, in discord.Interaction)
 		case "stalled":
 			return b.stalledReply(ctx, taskID)
 		case "nudge":
-			return b.nudgeTarget(ctx, taskID, option("target"))
+			return b.nudgeTarget(ctx, taskID, option("target"), in.ID)
 		case "say":
 			return b.say(ctx, taskID, in, option("text"), option("agent"))
 		case "reassign":
@@ -128,7 +128,7 @@ func (b *Bridge) act(ctx context.Context, taskID string, in discord.Interaction)
 	case id == "stalled":
 		return b.stalledReply(ctx, taskID)
 	case strings.HasPrefix(id, "nudge:"):
-		return b.nudge(ctx, taskID, strings.TrimPrefix(id, "nudge:"))
+		return b.nudge(ctx, taskID, strings.TrimPrefix(id, "nudge:"), in.ID)
 	case strings.HasPrefix(id, "reassign:"):
 		return b.reassignMenu(ctx, taskID, strings.TrimPrefix(id, "reassign:"))
 	case strings.HasPrefix(id, "reassignto:") && len(in.Data.Values) == 1:
@@ -241,13 +241,13 @@ func agentByName(agents []api.Agent, name string) (api.Agent, error) {
 	return api.Agent{}, fmt.Errorf("no running agent is named %q", name)
 }
 
-func (b *Bridge) nudgeTarget(ctx context.Context, taskID, target string) reply {
+func (b *Bridge) nudgeTarget(ctx context.Context, taskID, target, interactionID string) reply {
 	if target == "" {
 		return ephemeral("Name an agent, a message number or an obligation ID.")
 	}
 	o, err := b.obligation(ctx, taskID, target)
 	if err == nil {
-		return b.nudge(ctx, taskID, o.ID)
+		return b.nudge(ctx, taskID, o.ID, interactionID)
 	}
 	if errors.Is(err, errAmbiguous) {
 		return ephemeral("⚠️ %s.", err.Error())
@@ -273,17 +273,19 @@ func (b *Bridge) nudgeTarget(ctx context.Context, taskID, target string) reply {
 	if oldest == nil {
 		return ephemeral("%s has no open obligations to nudge.", clean(agent.Name))
 	}
-	return b.nudge(ctx, taskID, oldest.ID)
+	return b.nudge(ctx, taskID, oldest.ID, interactionID)
 }
 
 // nudge re-wakes an obligation's recipient. A closed obligation, for example
 // from a stale button, is reported as already handled and changes nothing.
-func (b *Bridge) nudge(ctx context.Context, taskID, obligationID string) reply {
+// The interaction ID names the nudge, so replaying an interaction after a
+// crash returns the original nudge instead of waking the agent again.
+func (b *Bridge) nudge(ctx context.Context, taskID, obligationID, interactionID string) reply {
 	o, err := b.obligation(ctx, taskID, obligationID)
 	if err != nil {
 		return ephemeral("✔️ Already handled: that obligation is closed or was moved.")
 	}
-	if _, err := b.cfg.Hub.NudgeObligation(ctx, taskID, o.ID); err != nil {
+	if _, err := b.cfg.Hub.NudgeObligation(ctx, taskID, o.ID, "discord-interaction-"+interactionID); err != nil {
 		var h *api.HTTPError
 		if errors.As(err, &h) && h.Status == http.StatusConflict {
 			return ephemeral("✔️ Already handled: %s.", h.Msg)

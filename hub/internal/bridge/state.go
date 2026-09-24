@@ -100,6 +100,10 @@ func OpenState(path string) (*State, error) {
 		db.Close()
 		return nil, err
 	}
+	if err := addColumns(db); err != nil {
+		db.Close()
+		return nil, err
+	}
 	return &State{db: db, now: func() time.Time { return time.Now().UTC() }}, nil
 }
 
@@ -196,8 +200,10 @@ func (s *State) SetArchived(ctx context.Context, taskID string) error {
 	return err
 }
 
+// SetCard records the card; the create attempt is settled, so a later
+// replacement starts its own search window.
 func (s *State) SetCard(ctx context.Context, taskID, messageID, hash string) error {
-	_, err := s.db.ExecContext(ctx, `UPDATE channels SET card_message_id=?,card_hash=?,card_edited_at=? WHERE task_id=?`, messageID, hash, ts(s.now()), taskID)
+	_, err := s.db.ExecContext(ctx, `UPDATE channels SET card_message_id=?,card_hash=?,card_edited_at=?,card_attempt_at='' WHERE task_id=?`, messageID, hash, ts(s.now()), taskID)
 	return err
 }
 
@@ -436,4 +442,25 @@ func (s *State) Get(ctx context.Context, key string) (string, error) {
 func (s *State) Set(ctx context.Context, key, value string) error {
 	_, err := s.db.ExecContext(ctx, `INSERT INTO kv (key,value) VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value`, key, value)
 	return err
+}
+
+// addColumns brings a state database from an older build up to date.
+func addColumns(db *sql.DB) error {
+	for _, c := range []struct{ table, name, definition string }{
+		{"channels", "card_attempt_at", "TEXT NOT NULL DEFAULT ''"},
+		{"channels", "card_pinned", "INTEGER NOT NULL DEFAULT 0"},
+		{"channels", "card_pin_at", "TEXT NOT NULL DEFAULT ''"},
+		{"outbox", "first_attempt_at", "TEXT NOT NULL DEFAULT ''"},
+	} {
+		var n int
+		if err := db.QueryRow(`SELECT count(*) FROM pragma_table_info(?) WHERE name=?`, c.table, c.name).Scan(&n); err != nil {
+			return err
+		}
+		if n == 0 {
+			if _, err := db.Exec("ALTER TABLE " + c.table + " ADD COLUMN " + c.name + " " + c.definition); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }

@@ -11,7 +11,7 @@ func migrate(db *sql.DB) error {
 	if _, err := db.Exec(obligationsSchema); err != nil {
 		return err
 	}
-	if _, err := db.Exec(bridgeSchema); err != nil {
+	if err := migrateBridge(db); err != nil {
 		return err
 	}
 	for _, c := range []struct{ table, name, definition string }{

@@ -255,9 +255,10 @@ func (c *Client) ReassignObligation(ctx context.Context, task, obligation string
 }
 
 // NudgeObligation queues an immediate wake of an open obligation's recipient.
-func (c *Client) NudgeObligation(ctx context.Context, task, obligation string) (ObligationNudgeResult, error) {
+// A repeated requestID returns the original nudge instead of nudging again.
+func (c *Client) NudgeObligation(ctx context.Context, task, obligation, requestID string) (ObligationNudgeResult, error) {
 	var out ObligationNudgeResult
-	return out, c.do(ctx, "POST", "/v1/tasks/"+task+"/obligations/"+obligation+"/nudge", nil, &out)
+	return out, c.do(ctx, "POST", "/v1/tasks/"+task+"/obligations/"+obligation+"/nudge", ObligationNudgeRequest{RequestID: requestID}, &out)
 }
 
 func (c *Client) ListMessageChecks(ctx context.Context, task string, after int64, limit int) ([]MessageCheck, error) {

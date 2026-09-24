@@ -814,7 +814,11 @@ func (s *Server) nudgeObligation(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	result, err := s.store.NudgeObligation(r.Context(), id, r.PathValue("oid"), c)
+	var req api.ObligationNudgeRequest
+	if r.ContentLength != 0 && !decode(w, r, &req) {
+		return
+	}
+	result, err := s.store.NudgeObligation(r.Context(), id, r.PathValue("oid"), req.RequestID, c)
 	var tooSoon *api.ErrNudgeTooSoon
 	if errors.As(err, &tooSoon) {
 		w.Header().Set("Retry-After", strconv.Itoa(int(tooSoon.RetryAfter.Seconds())+1))

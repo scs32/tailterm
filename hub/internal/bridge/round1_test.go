@@ -356,3 +356,118 @@ func TestFailedPinIsRetried(t *testing.T) {
 		t.Fatalf("the card was not pinned on retry: %+v", m)
 	}
 }
+
+// Round two (focused fix): R1–R4.
+
+// R1: a message whose intake could not be recorded stops the backfill
+// cursor, and is picked up once intake works again.
+func TestBackfillStopsAtAnUnrecordedMessage(t *testing.T) {
+	h := newHarness(t)
+	blocked := h.fake.userMessage(h.channel, ownerID, "could not be recorded at first", "")
+	h.fake.userMessage(h.channel, ownerID, "after the failure", "")
+	if _, err := h.state.db.ExecContext(h.ctx, `CREATE TRIGGER refuse BEFORE INSERT ON inbound WHEN NEW.source_id='`+blocked.ID+`' BEGIN SELECT RAISE(ABORT, 'disk full'); END`); err != nil {
+		t.Fatal(err)
+	}
+	h.b.backfill(h.ctx)
+	m, _ := h.state.Mapping(h.ctx, h.task.ID)
+	if !snowflakeAfter(blocked.ID, m.IngestAfter) {
+		t.Fatalf("the cursor %s moved past the unrecorded message %s", m.IngestAfter, blocked.ID)
+	}
+	if _, err := h.state.db.ExecContext(h.ctx, `DROP TRIGGER refuse`); err != nil {
+		t.Fatal(err)
+	}
+	h.b.backfill(h.ctx)
+	texts := map[string]int{}
+	for _, bm := range h.boardMessages() {
+		texts[bm.Text]++
+	}
+	if texts["could not be recorded at first"] != 1 || texts["after the failure"] != 1 {
+		t.Fatalf("board = %v", texts)
+	}
+}
+
+// R2: a nudge interaction replayed after a crash is not a second nudge.
+func TestReplayedNudgeIsNotRepeated(t *testing.T) {
+	h := newHarness(t)
+	assign := h.post(typed(h.lead, h.builder, api.EnvelopeKindAssign, "Fix the stale smoke test"))
+	click := discord.Interaction{ID: "930000000000000001", Type: discord.InteractionComponent, Token: "tok-nudge"}
+	obligations, _ := h.b.cfg.Hub.ListObligations(h.ctx, h.task.ID, "", "", true, false)
+	for _, o := range obligations {
+		if o.MessageSeq == assign.Seq {
+			click.Data = discord.InteractionData{CustomID: "nudge:" + o.ID}
+		}
+	}
+	if got := editContent(h.interact(click)); !strings.Contains(got, "Nudged") {
+		t.Fatalf("nudge = %q", got)
+	}
+	// The bridge died before recording that it finished; recovery replays it.
+	if _, err := h.state.db.ExecContext(h.ctx, `UPDATE inbound SET state='pending',next_at=? WHERE source_id=?`, ts(time.Now().Add(-time.Second)), "interaction:"+click.ID); err != nil {
+		t.Fatal(err)
+	}
+	h.b.retryInbound1(h.ctx)
+	if got := editContent(h.fake.lastEdit("tok-nudge")); !strings.Contains(got, "Nudged") {
+		t.Fatalf("replayed nudge = %q; the hub should return the original nudge", got)
+	}
+	// A different click inside the cooldown is refused, proving the replay
+	// did not create a nudge of its own that reset nothing.
+	fresh := click
+	fresh.ID, fresh.Token = "930000000000000002", "tok-nudge-2"
+	if got := editContent(h.interact(fresh)); !strings.Contains(got, "nudged recently") {
+		t.Fatalf("a new nudge inside the cooldown = %q", got)
+	}
+}
+
+// R3: a state database from the first bridge build opens and works.
+func TestStateFromTheFirstBuildMigrates(t *testing.T) {
+	path := t.TempDir() + "/bridge.sqlite"
+	s, err := OpenState(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, drop := range []string{"channels DROP COLUMN card_attempt_at", "channels DROP COLUMN card_pinned", "channels DROP COLUMN card_pin_at", "outbox DROP COLUMN first_attempt_at"} {
+		if _, err := s.db.Exec("ALTER TABLE " + drop); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := s.db.Exec(`INSERT INTO channels (task_id,channel_id) VALUES ('tsk_1','1')`); err != nil {
+		t.Fatal(err)
+	}
+	s.Close()
+	s, err = OpenState(path)
+	if err != nil {
+		t.Fatalf("reopening a first-build database: %v", err)
+	}
+	defer s.Close()
+	if m, err := s.Mapping(context.Background(), "tsk_1"); err != nil || m.ChannelID != "1" {
+		t.Fatalf("mapping after migration = %+v %v", m, err)
+	}
+	if _, err := s.PendingHeads(context.Background()); err != nil {
+		t.Fatalf("outbox after migration: %v", err)
+	}
+}
+
+// R4: a deleted card is replaced; a settled create leaves no stale window.
+func TestDeletedCardIsReplaced(t *testing.T) {
+	h := newHarness(t)
+	m, _ := h.state.Mapping(h.ctx, h.task.ID)
+	if m.CardMessageID == "" || !m.CardAttemptAt.IsZero() {
+		t.Fatalf("after creating the card: %+v (the attempt time should be cleared)", m)
+	}
+	h.fake.mu.Lock()
+	msgs := h.fake.messages[h.channel]
+	for i, fm := range msgs {
+		if fm.ID == m.CardMessageID {
+			h.fake.messages[h.channel] = append(msgs[:i:i], msgs[i+1:]...)
+		}
+	}
+	h.fake.mu.Unlock()
+	h.post(api.PostMessageRequest{To: h.builder.ID, Text: "changes the card"})
+	h.b.cfg.CardInterval = 0
+	if err := h.b.refreshCard(h.ctx, m); err != nil {
+		t.Fatal(err)
+	}
+	after, _ := h.state.Mapping(h.ctx, h.task.ID)
+	if after.CardMessageID == "" || after.CardMessageID == m.CardMessageID || h.fake.find(h.channel, after.CardMessageID) == nil {
+		t.Fatalf("the deleted card was not replaced: %+v", after)
+	}
+}

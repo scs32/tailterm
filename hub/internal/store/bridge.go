@@ -26,9 +26,29 @@ CREATE TABLE IF NOT EXISTS obligation_nudges (
   wake_job_id TEXT NOT NULL,
   by_node TEXT NOT NULL,
   by_user TEXT NOT NULL,
-  created_at TEXT NOT NULL
+  created_at TEXT NOT NULL,
+  request_id TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS obligation_nudges_obligation ON obligation_nudges(obligation_id, created_at);`
+
+// migrateBridge creates the phase-2b tables and adds columns a newer build
+// needs to tables an older build created.
+func migrateBridge(db *sql.DB) error {
+	if _, err := db.Exec(bridgeSchema); err != nil {
+		return err
+	}
+	var n int
+	if err := db.QueryRow(`SELECT count(*) FROM pragma_table_info('obligation_nudges') WHERE name='request_id'`).Scan(&n); err != nil {
+		return err
+	}
+	if n == 0 {
+		if _, err := db.Exec(`ALTER TABLE obligation_nudges ADD COLUMN request_id TEXT NOT NULL DEFAULT ''`); err != nil {
+			return err
+		}
+	}
+	_, err := db.Exec(`CREATE UNIQUE INDEX IF NOT EXISTS obligation_nudges_request ON obligation_nudges(obligation_id, request_id) WHERE request_id<>''`)
+	return err
+}
 
 func insertMessageSource(ctx context.Context, tx *sql.Tx, m *api.Message, src *api.MessageSource) error {
 	if src == nil {
@@ -47,7 +67,12 @@ func insertMessageSource(ctx context.Context, tx *sql.Tx, m *api.Message, src *a
 // outside the broker's retry schedule. Only the owner may nudge, at most once
 // per obligation per api.ObligationNudgeInterval. The nudge is recorded with
 // who asked; it does not acknowledge or change the obligation.
-func (s *Store) NudgeObligation(ctx context.Context, taskID, obligationID string, by api.Caller) (api.ObligationNudgeResult, error) {
+// A repeated request ID returns the original nudge, so a caller that lost
+// the reply (or a bridge resuming after a crash) never wakes twice.
+func (s *Store) NudgeObligation(ctx context.Context, taskID, obligationID, requestID string, by api.Caller) (api.ObligationNudgeResult, error) {
+	if requestID != "" && !validRequestID(requestID) {
+		return api.ObligationNudgeResult{}, api.ErrInvalid
+	}
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
 	tx, err := s.db.BeginTx(ctx, nil)
@@ -61,6 +86,17 @@ func (s *Store) NudgeObligation(ctx context.Context, taskID, obligationID string
 	}
 	if err != nil {
 		return api.ObligationNudgeResult{}, err
+	}
+	if requestID != "" {
+		var jobID string
+		err := tx.QueryRowContext(ctx, `SELECT wake_job_id FROM obligation_nudges WHERE obligation_id=? AND request_id=?`, o.ID, requestID).Scan(&jobID)
+		if err == nil {
+			o.Overdue = ObligationOverdue(o, s.now())
+			return api.ObligationNudgeResult{Obligation: o, WakeJobID: jobID}, nil
+		}
+		if !errors.Is(err, sql.ErrNoRows) {
+			return api.ObligationNudgeResult{}, err
+		}
 	}
 	task, err := scanTask(tx.QueryRowContext(ctx, `SELECT `+taskCols+` FROM tasks WHERE id=?`, taskID))
 	if err != nil {
@@ -94,8 +130,8 @@ func (s *Store) NudgeObligation(ctx context.Context, taskID, obligationID string
 		jobID, taskID, o.ID, o.AgentID, ts(now), wakePending, ts(now)); err != nil {
 		return api.ObligationNudgeResult{}, err
 	}
-	if _, err := tx.ExecContext(ctx, `INSERT INTO obligation_nudges (id,task_id,obligation_id,wake_job_id,by_node,by_user,created_at) VALUES (?,?,?,?,?,?,?)`,
-		newObligationID("nudge"), taskID, o.ID, jobID, by.Node, by.User, ts(now)); err != nil {
+	if _, err := tx.ExecContext(ctx, `INSERT INTO obligation_nudges (id,task_id,obligation_id,wake_job_id,by_node,by_user,created_at,request_id) VALUES (?,?,?,?,?,?,?,?)`,
+		newObligationID("nudge"), taskID, o.ID, jobID, by.Node, by.User, ts(now), requestID); err != nil {
 		return api.ObligationNudgeResult{}, err
 	}
 	if err := tx.Commit(); err != nil {

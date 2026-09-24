@@ -108,6 +108,12 @@ type WakeJobReport struct {
 	Detail     string `json:"detail,omitempty"`
 }
 
+// ObligationNudgeRequest optionally names the nudge so a retry is not a
+// second nudge.
+type ObligationNudgeRequest struct {
+	RequestID string `json:"requestId,omitempty"`
+}
+
 // ObligationNudgeResult is the owner's immediate re-wake of an obligation's
 // recipient, outside the broker's retry schedule (broker phase 2b).
 type ObligationNudgeResult struct {
