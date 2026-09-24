@@ -294,13 +294,24 @@ func (s *Store) handOffRoleObligations(ctx context.Context, tx *sql.Tx, task api
 	return nil
 }
 
-// leadAgent is the current agent named by the task's orchestrator, if any.
+// leadAgent is the live agent named by the task's orchestrator, if any:
+// the same rule as resolveRole, so role work is never handed to an exited
+// or closed agent.
 func leadAgent(ctx context.Context, tx *sql.Tx, taskID, name string) (api.Agent, error) {
+	return namedAgent(ctx, tx, taskID, name, api.AgentClosed, api.AgentExited)
+}
+
+// outgoingLead is the agent that may still hold role:lead obligations: an
+// exited lead keeps them until the broker closes them, so it is included.
+func outgoingLead(ctx context.Context, tx *sql.Tx, taskID, name string) (api.Agent, error) {
+	return namedAgent(ctx, tx, taskID, name, api.AgentClosed, api.AgentClosed)
+}
+
+func namedAgent(ctx context.Context, tx *sql.Tx, taskID, name, notA, notB string) (api.Agent, error) {
 	if name == "" {
 		return api.Agent{}, nil
 	}
-	// Same rule as resolveRole: an exited or closed agent never holds the role.
-	a, err := scanAgent(tx.QueryRowContext(ctx, `SELECT `+agentCols+` FROM agents WHERE task_id=? AND name=? COLLATE NOCASE AND status NOT IN (?,?) ORDER BY created_at DESC LIMIT 1`, taskID, name, api.AgentClosed, api.AgentExited))
+	a, err := scanAgent(tx.QueryRowContext(ctx, `SELECT `+agentCols+` FROM agents WHERE task_id=? AND name=? COLLATE NOCASE AND status NOT IN (?,?) ORDER BY created_at DESC LIMIT 1`, taskID, name, notA, notB))
 	if errors.Is(err, sql.ErrNoRows) {
 		return api.Agent{}, nil
 	}
@@ -494,7 +505,7 @@ func (s *Store) CancelObligation(ctx context.Context, taskID, obligationID strin
 			recipient = api.Agent{} // tell the board instead
 		}
 		text := fmt.Sprintf("The owner cancelled message #%d (%s). Stop work on it. Reason: %s", o.MessageSeq, o.Subject, reason)
-		source, err := loadMessage(tx, ctx, taskID, o.MessageSeq)
+		source, err := originalMessage(ctx, tx, taskID, o.MessageSeq)
 		if err != nil {
 			return api.OwnerActionResult{}, err
 		}

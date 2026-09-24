@@ -217,11 +217,11 @@ func obligedSeqs(ctx context.Context, c *api.Client, b runtimeBinding, msgs []ap
 	}
 	// Only obligations for this page's messages: bounded, however long the
 	// agent's history grows.
-	from := msgs[0].Seq
+	from, to := msgs[0].Seq, msgs[0].Seq
 	for _, m := range msgs {
-		from = min(from, m.Seq)
+		from, to = min(from, m.Seq), max(to, m.Seq)
 	}
-	list, err := c.ListObligationsFrom(ctx, b.Task, b.Agent, from)
+	list, err := c.ListObligationsFrom(ctx, b.Task, b.Agent, from, to)
 	if err != nil {
 		return nil, err
 	}

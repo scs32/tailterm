@@ -300,7 +300,7 @@ func (s *Store) UpdateTask(ctx context.Context, id string, req api.UpdateTaskReq
 		if err = tx.QueryRowContext(ctx, `SELECT orchestrator FROM tasks WHERE id=?`, id).Scan(&oldName); err != nil {
 			return t, err
 		}
-		if previousLead, err = leadAgent(ctx, tx, id, oldName); err != nil {
+		if previousLead, err = outgoingLead(ctx, tx, id, oldName); err != nil {
 			return t, err
 		}
 	}

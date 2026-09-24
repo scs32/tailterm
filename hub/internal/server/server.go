@@ -703,7 +703,7 @@ func (s *Server) listObligations(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	list, err := s.store.ListObligations(r.Context(), id, store.ObligationFilter{AgentID: agent, OpenOnly: q.Get("open") == "1", Overdue: q.Get("overdue") == "1", FromSeq: queryInt(r, "fromSeq", 0)}, now)
+	list, err := s.store.ListObligations(r.Context(), id, store.ObligationFilter{AgentID: agent, OpenOnly: q.Get("open") == "1", Overdue: q.Get("overdue") == "1", FromSeq: queryInt(r, "fromSeq", 0), ToSeq: queryInt(r, "toSeq", 0)}, now)
 	if err != nil {
 		fail(w, err)
 		return

@@ -282,6 +282,7 @@ type ObligationFilter struct {
 	OpenOnly bool
 	Overdue  bool
 	FromSeq  int64 // only obligations for messages from this seq onward
+	ToSeq    int64 // and up to this seq
 }
 
 func (s *Store) ListObligations(ctx context.Context, taskID string, f ObligationFilter, now time.Time) ([]api.Obligation, error) {
@@ -298,6 +299,10 @@ func (s *Store) ListObligations(ctx context.Context, taskID string, f Obligation
 	if f.FromSeq > 0 {
 		q += ` AND message_seq>=?`
 		args = append(args, f.FromSeq)
+	}
+	if f.ToSeq > 0 {
+		q += ` AND message_seq<=?`
+		args = append(args, f.ToSeq)
 	}
 	rows, err := s.db.QueryContext(ctx, q+` ORDER BY message_seq`, args...)
 	if err != nil {
@@ -528,8 +533,17 @@ func (s *Store) reissueObligation(ctx context.Context, tx *sql.Tx, task api.Task
 		api.ObligationClosed, api.OutcomeSuperseded, reason, ts(now), ts(now), old.ID); err != nil {
 		return api.Message{}, err
 	}
-	reissue := api.PostMessageRequest{Envelope: env, To: target.ID}
-	m, err := s.insertMessageWithResume(ctx, tx, task, reissue, target, BrokerCaller, false, false, false)
+	// The reissue keeps the original message's item links, so an item-bound
+	// recipient sees it and later answers or cancellations can find them.
+	authored, err := originalMessage(ctx, tx, task.ID, old.MessageSeq)
+	if err != nil {
+		return api.Message{}, err
+	}
+	reissue := api.PostMessageRequest{Envelope: env, To: target.ID, WorkItems: authored.WorkItems, WorkOrderMessage: authored.WorkOrderMessage}
+	if len(authored.WorkItems) > 0 {
+		reissue.RequestID = "reissue-" + old.ID
+	}
+	m, err := s.insertMessageWithResume(ctx, tx, task, reissue, target, BrokerCaller, false, true, false)
 	if err != nil {
 		return m, err
 	}

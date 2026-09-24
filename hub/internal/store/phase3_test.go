@@ -493,4 +493,80 @@ func TestListObligationsFromSeq(t *testing.T) {
 	if err != nil || len(got) != 2 || got[0].MessageSeq != seqs[1] {
 		t.Fatalf("from #%d: %+v %v", seqs[1], got, err)
 	}
+	got, err = f.s.ListObligations(f.ctx, f.task.ID, ObligationFilter{AgentID: f.builder.ID, FromSeq: seqs[0], ToSeq: seqs[1]}, time.Now())
+	if err != nil || len(got) != 2 || got[1].MessageSeq != seqs[1] {
+		t.Fatalf("#%d..#%d: %+v %v", seqs[0], seqs[1], got, err)
+	}
+}
+
+// Round two F2: work reassigned to an item-bound worker, and its
+// cancellation, keep the item links, so the worker's inbox shows both.
+func TestReassignedAndCancelledWorkStaysVisibleToABoundWorker(t *testing.T) {
+	f := newDeliveryFixture(t)
+	ctx := context.Background()
+	orderRef := &api.MessageReference{TaskID: f.task.ID, Seq: f.order.Seq}
+	ask, err := f.s.PostMessage(ctx, f.task.ID, api.PostMessageRequest{To: f.lead.ID, RequestID: "linked-ask", Text: "Please rebase the fixture branch",
+		WorkItems:        []api.MessageWorkItem{{ItemTaskID: f.item.TaskID, ItemID: f.item.ID, ItemRevision: f.item.Revision, Relationship: "primary"}},
+		WorkOrderMessage: orderRef}, f.by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	open, _ := f.s.ListObligations(ctx, f.task.ID, ObligationFilter{AgentID: f.lead.ID, OpenOnly: true}, f.s.now())
+	var oid string
+	for _, o := range open {
+		if o.MessageSeq == ask.Seq {
+			oid = o.ID
+		}
+	}
+	reissued, err := f.s.ReassignObligation(ctx, f.task.ID, oid, api.ObligationReassignRequest{ToAgentID: f.worker.ID, Reason: "worker owns it"}, f.by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	moved, _ := f.s.ListObligations(ctx, f.task.ID, ObligationFilter{AgentID: f.worker.ID, OpenOnly: true}, f.s.now())
+	var movedID string
+	for _, o := range moved {
+		if o.MessageSeq == reissued.Seq {
+			movedID = o.ID
+		}
+	}
+	cancelled, err := f.s.CancelObligation(ctx, f.task.ID, movedID, api.ObligationCancelRequest{Reason: "no longer needed", RequestID: "cancel-linked"}, f.by)
+	if err != nil || cancelled.Obligation.Outcome != api.OutcomeCancelled {
+		t.Fatalf("cancel = %+v %v", cancelled, err)
+	}
+	inbox, err := f.s.ListMessages(ctx, f.task.ID, 0, f.worker.ID, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sawReissue, sawCancel := false, false
+	for _, m := range inbox {
+		sawReissue = sawReissue || m.Seq == reissued.Seq
+		sawCancel = sawCancel || (m.To == f.worker.ID && strings.Contains(m.Text, "cancelled"))
+	}
+	if !sawReissue || !sawCancel {
+		t.Fatalf("bound worker inbox: reissue %v, cancellation %v", sawReissue, sawCancel)
+	}
+}
+
+// Round two R1: an exited outgoing lead's role work still moves.
+func TestExitedOutgoingLeadHandsOff(t *testing.T) {
+	f := newPhase3Fixture(t)
+	m, err := f.post(t, request(f.builder, "role:lead", "Review the fixture plan please"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	exited := api.AgentExited
+	if _, err := f.s.UpdateAgent(f.ctx, f.lead.ID, api.UpdateAgentRequest{Status: &exited}, f.by); err != nil {
+		t.Fatal(err)
+	}
+	name := "lead-2"
+	if _, err := f.s.UpdateTask(f.ctx, f.task.ID, api.UpdateTaskRequest{Orchestrator: &name}, f.by); err != nil {
+		t.Fatal(err)
+	}
+	if o := f.obligationFor(t, m.Seq); o.State != api.ObligationClosed || o.Outcome != api.OutcomeSuperseded {
+		t.Fatalf("the exited lead kept its role work: %+v", o)
+	}
+	moved, _ := f.s.ListObligations(f.ctx, f.task.ID, ObligationFilter{AgentID: f.lead2.ID, OpenOnly: true}, time.Now())
+	if len(moved) != 1 {
+		t.Fatalf("the new lead holds %d obligations", len(moved))
+	}
 }

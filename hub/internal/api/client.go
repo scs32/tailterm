@@ -228,11 +228,12 @@ func (c *Client) ListObligations(ctx context.Context, task, agent, run string, o
 }
 
 // ListObligationsFrom lists an agent's obligations (any state) for messages
-// from seq onward, without marking anything delivered.
-func (c *Client) ListObligationsFrom(ctx context.Context, task, agent string, fromSeq int64) ([]Obligation, error) {
+// fromSeq..toSeq, without marking anything delivered.
+func (c *Client) ListObligationsFrom(ctx context.Context, task, agent string, fromSeq, toSeq int64) ([]Obligation, error) {
 	q := url.Values{}
 	q.Set("agentId", agent)
 	q.Set("fromSeq", strconv.FormatInt(fromSeq, 10))
+	q.Set("toSeq", strconv.FormatInt(toSeq, 10))
 	var out ObligationList
 	return out.Obligations, c.do(ctx, "GET", "/v1/tasks/"+task+"/obligations?"+q.Encode(), nil, &out)
 }
