@@ -3,6 +3,8 @@ package server
 import (
 	"context"
 	"errors"
+	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -197,3 +199,66 @@ func TestOverdueFlags(t *testing.T) {
 		t.Fatalf("ack overdue: %+v", o)
 	}
 }
+
+// b8: the hub leases wakes; merged, stale and duplicate reports can never
+// starve a recipient (the relay-stall-6852 failure class).
+func TestWakeJobLeasing(t *testing.T) {
+	f := newOblFixture(t)
+	first := f.post(t, api.PostMessageRequest{AgentID: f.lead.ID, To: f.builder.ID, Envelope: assignFrom(f.lead, "builder")})
+	f.post(t, api.PostMessageRequest{AgentID: f.lead.ID, To: f.builder.ID, Envelope: &api.Envelope{Kind: "question", To: "builder", Subject: "Which status code should we use", Body: api.EnvelopeBody{Question: "422?"}}})
+	now := time.Now().UTC().Add(time.Second)
+	job, err := f.c.st.LeaseWakeJob(f.ctx, f.task.ID, f.builder.ID, f.builder.RunID, now)
+	if err != nil || job == nil || job.MessageSeq != first.Seq || !containsAll(job.Prompt, "#"+itoa(first.Seq), "tt ack") {
+		t.Fatalf("lease: %v %+v", err, job)
+	}
+	// Both due wakes were merged into one; nothing else is due.
+	if again, err := f.c.st.LeaseWakeJob(f.ctx, f.task.ID, f.builder.ID, f.builder.RunID, now); err != nil || again != nil {
+		t.Fatalf("second lease: %v %+v", err, again)
+	}
+	// Another run cannot lease the builder's wakes.
+	if _, err := f.c.st.LeaseWakeJob(f.ctx, f.task.ID, f.builder.ID, "run_0000000000000000", now); !errors.Is(err, api.ErrConflict) {
+		t.Fatalf("stale run lease: %v", err)
+	}
+	report := api.WakeJobReport{LeaseToken: job.LeaseToken, Status: "accepted"}
+	if err := f.c.st.ReportWakeJob(f.ctx, f.task.ID, job.ID, report, now); err != nil {
+		t.Fatal(err)
+	}
+	for _, o := range f.list(t, store.ObligationFilter{AgentID: f.builder.ID}, now) {
+		if o.State != api.ObligationDelivered || o.AckedAt != nil {
+			t.Fatalf("accepted wake must deliver, not acknowledge: %+v", o)
+		}
+	}
+	// A duplicate or late report conflicts but blocks nothing.
+	if err := f.c.st.ReportWakeJob(f.ctx, f.task.ID, job.ID, report, now); !errors.Is(err, api.ErrConflict) {
+		t.Fatalf("duplicate report: %v", err)
+	}
+	later := f.post(t, api.PostMessageRequest{AgentID: f.lead.ID, To: f.builder.ID, Envelope: &api.Envelope{Kind: "request", To: "builder", Subject: "Please rebase onto the release root", Body: api.EnvelopeBody{Ask: "rebase"}}})
+	next, err := f.c.st.LeaseWakeJob(f.ctx, f.task.ID, f.builder.ID, f.builder.RunID, time.Now().UTC().Add(2*time.Second))
+	if err != nil || next == nil || next.MessageSeq != later.Seq {
+		t.Fatalf("next wake after a conflicting report: %v %+v", err, next)
+	}
+	// An expired lease is leased again, with the lapse recorded.
+	retaken, err := f.c.st.LeaseWakeJob(f.ctx, f.task.ID, f.builder.ID, f.builder.RunID, time.Now().UTC().Add(10*time.Minute))
+	if err != nil || retaken == nil || retaken.ID != next.ID || retaken.LeaseToken == next.LeaseToken {
+		t.Fatalf("expired lease: %v %+v", err, retaken)
+	}
+	if err := f.c.st.ReportWakeJob(f.ctx, f.task.ID, next.ID, api.WakeJobReport{LeaseToken: next.LeaseToken, Status: "accepted"}, now); !errors.Is(err, api.ErrConflict) {
+		t.Fatalf("report under the lapsed token: %v", err)
+	}
+	// Closed obligations cancel their pending wakes.
+	f.post(t, api.PostMessageRequest{AgentID: f.builder.ID, To: f.lead.ID, ReplyTo: later.Seq, Envelope: &api.Envelope{Kind: "decline", To: "lead", Subject: "Declining the rebase for now", Body: api.EnvelopeBody{Reason: "window closed"}}})
+	if err := f.c.st.ReportWakeJob(f.ctx, f.task.ID, retaken.ID, api.WakeJobReport{LeaseToken: retaken.LeaseToken, Status: "failed", Detail: "codex exited"}, now); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func containsAll(s string, parts ...string) bool {
+	for _, p := range parts {
+		if !strings.Contains(s, p) {
+			return false
+		}
+	}
+	return true
+}
+
+func itoa(n int64) string { return strconv.FormatInt(n, 10) }

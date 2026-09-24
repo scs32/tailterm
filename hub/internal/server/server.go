@@ -64,6 +64,8 @@ func New(st *store.Store, identity Identity) *Server {
 	m.HandleFunc("POST /v1/tasks/{id}/messages/{seq}/ack", s.obligationAction("ack"))
 	m.HandleFunc("POST /v1/tasks/{id}/messages/{seq}/progress", s.obligationAction("progress"))
 	m.HandleFunc("POST /v1/tasks/{id}/obligations/{oid}/reassign", s.reassignObligation)
+	m.HandleFunc("POST /v1/tasks/{id}/agents/{aid}/wake-jobs/lease", s.leaseWakeJob)
+	m.HandleFunc("POST /v1/tasks/{id}/wake-jobs/{jid}/report", s.reportWakeJob)
 	m.HandleFunc("GET /v1/tasks/{id}/messages/receipts/{requestID}", s.getMessagePostReceipt)
 	m.HandleFunc("GET /v1/tasks/{id}/message-audit/messages/{seq}", s.getMessageAudit)
 	m.HandleFunc("GET /v1/tasks/{id}/message-audit/messages/{seq}/history", s.listMessageAuditHistory)
@@ -714,6 +716,51 @@ func (s *Server) obligationAction(action string) http.HandlerFunc {
 		}
 		writeJSON(w, 200, o)
 	}
+}
+
+// leaseWakeJob gives the host relay the next broker wake for an agent's run;
+// 204 means nothing is due.
+func (s *Server) leaseWakeJob(w http.ResponseWriter, r *http.Request) {
+	if _, ok := s.writer(w, r); !ok {
+		return
+	}
+	id, ok := taskID(w, r)
+	if !ok {
+		return
+	}
+	var req api.ObligationActionRequest
+	if !decode(w, r, &req) {
+		return
+	}
+	job, err := s.store.LeaseWakeJob(r.Context(), id, r.PathValue("aid"), req.RunID, time.Now().UTC())
+	if err != nil {
+		fail(w, err)
+		return
+	}
+	if job == nil {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	writeJSON(w, 200, job)
+}
+
+func (s *Server) reportWakeJob(w http.ResponseWriter, r *http.Request) {
+	if _, ok := s.writer(w, r); !ok {
+		return
+	}
+	id, ok := taskID(w, r)
+	if !ok {
+		return
+	}
+	var req api.WakeJobReport
+	if !decode(w, r, &req) {
+		return
+	}
+	if err := s.store.ReportWakeJob(r.Context(), id, r.PathValue("jid"), req, time.Now().UTC()); err != nil {
+		fail(w, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
 }
 
 func (s *Server) reassignObligation(w http.ResponseWriter, r *http.Request) {

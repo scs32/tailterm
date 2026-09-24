@@ -336,6 +336,36 @@ func relayFollowThrough(ctx context.Context, b runtimeBinding, p *relayProgress,
 	}
 	return false, nil
 }
+
+// relayWakeJob delivers one broker wake job (broker phase 2a) and reports how
+// Codex answered. The hub owns job identity and leasing, so there is no
+// relay-derived request ID that could collide and starve a recipient. It
+// returns handled=false when nothing is due or the hub predates wake jobs.
+func relayWakeJob(ctx context.Context, b runtimeBinding, c *api.Client, queue func(context.Context, runtimeBinding, string) error) (bool, error) {
+	job, err := c.LeaseWakeJob(ctx, b.Task, b.Agent, b.Run)
+	var httpErr *api.HTTPError
+	if errors.As(err, &httpErr) && (httpErr.Status == http.StatusNotFound || httpErr.Status == http.StatusConflict || httpErr.Status == http.StatusMethodNotAllowed) {
+		return false, nil // older hub, or this binding's run is no longer current
+	}
+	if err != nil || job == nil {
+		return false, err
+	}
+	report := api.WakeJobReport{LeaseToken: job.LeaseToken, Status: "accepted"}
+	if qerr := queue(ctx, b, job.Prompt); qerr != nil {
+		report.Status, report.Detail = "failed", qerr.Error()
+		if strings.Contains(qerr.Error(), "did not confirm") {
+			report.Status = "ambiguous"
+		}
+	}
+	if err := c.ReportWakeJob(ctx, b.Task, job.ID, report); err != nil {
+		return true, err
+	}
+	if report.Status != "accepted" {
+		return true, fmt.Errorf("broker wake %s: %s", report.Status, report.Detail)
+	}
+	return true, nil
+}
+
 func nativeQueue(ctx context.Context, b runtimeBinding, prompt string) error {
 	command := exec.CommandContext(ctx, b.Codex, "queue", "--thread", b.Thread, "--message", prompt)
 	command.Env = os.Environ()
@@ -465,7 +495,10 @@ func cmdRelay(args []string) error {
 				ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 				now := time.Now().UTC()
 				var queued bool
-				queued, err = relayFollowThrough(ctx, b, &progress, c, now, nativeQueue)
+				queued, err = relayWakeJob(ctx, b, c, nativeQueue)
+				if err == nil && !queued {
+					queued, err = relayFollowThrough(ctx, b, &progress, c, now, nativeQueue)
+				}
 				if err == nil && !queued {
 					err = relayOne(ctx, b, &progress, c, now, nativeQueue)
 				}

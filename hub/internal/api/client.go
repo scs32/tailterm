@@ -233,6 +233,22 @@ func (c *Client) ObligationAction(ctx context.Context, task string, seq int64, a
 	return out, c.do(ctx, "POST", fmt.Sprintf("/v1/tasks/%s/messages/%d/%s", task, seq, action), req, &out)
 }
 
+// LeaseWakeJob returns the next due broker wake for an agent run, or nil.
+func (c *Client) LeaseWakeJob(ctx context.Context, task, agent, run string) (*WakeJob, error) {
+	var out WakeJob
+	if err := c.do(ctx, "POST", "/v1/tasks/"+task+"/agents/"+agent+"/wake-jobs/lease", ObligationActionRequest{AgentID: agent, RunID: run}, &out); err != nil {
+		return nil, err
+	}
+	if out.ID == "" {
+		return nil, nil
+	}
+	return &out, nil
+}
+
+func (c *Client) ReportWakeJob(ctx context.Context, task, job string, report WakeJobReport) error {
+	return c.do(ctx, "POST", "/v1/tasks/"+task+"/wake-jobs/"+job+"/report", report, nil)
+}
+
 func (c *Client) ReassignObligation(ctx context.Context, task, obligation string, req ObligationReassignRequest) (Message, error) {
 	var out Message
 	return out, c.do(ctx, "POST", "/v1/tasks/"+task+"/obligations/"+obligation+"/reassign", req, &out)

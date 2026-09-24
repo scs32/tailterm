@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"os"
 	"strconv"
 	"strings"
@@ -82,3 +83,49 @@ func TestObligationCommandsAndStopHook(t *testing.T) {
 }
 
 func itoa(n int64) string { return strconv.FormatInt(n, 10) }
+
+// b8 through the relay: a broker wake is leased, queued through the runtime
+// and reported; a failed queue is reported and the obligation stays undelivered.
+func TestRelayDeliversBrokerWakeJobs(t *testing.T) {
+	e, c, task, lead := cliWorkItemFixture(t)
+	ctx := context.Background()
+	self, err := c.GetAgent(ctx, task.ID, e.agent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b := runtimeBinding{Hub: e.hub, Task: task.ID, Agent: e.agent, Run: self.RunID, Thread: "00000000-0000-0000-0000-000000000000", Codex: "codex"}
+	m, err := c.PostMessage(ctx, task.ID, api.PostMessageRequest{AgentID: lead.ID, To: e.agent, Envelope: &api.Envelope{
+		Kind: "request", To: e.agentName, Subject: "Save the governing order record", Body: api.EnvelopeBody{Ask: "save it"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var prompts []string
+	failing := func(context.Context, runtimeBinding, string) error {
+		return errors.New("Codex queue failed: exit status 1")
+	}
+	if handled, err := relayWakeJob(ctx, b, c, failing); !handled || err == nil || !strings.Contains(err.Error(), "failed") {
+		t.Fatalf("failed wake: handled %v err %v", handled, err)
+	}
+	list, _ := c.ListObligations(ctx, task.ID, "", "", true, false)
+	if len(list) != 1 || list[0].State != api.ObligationQueued {
+		t.Fatalf("a failed wake must not deliver: %+v", list)
+	}
+	// Nothing further is due until the broker schedules the next wake.
+	ok := func(_ context.Context, _ runtimeBinding, p string) error { prompts = append(prompts, p); return nil }
+	if handled, err := relayWakeJob(ctx, b, c, ok); handled || err != nil {
+		t.Fatalf("no wake should be due: handled %v err %v", handled, err)
+	}
+	if _, err := c.PostMessage(ctx, task.ID, api.PostMessageRequest{AgentID: lead.ID, To: e.agent, Envelope: &api.Envelope{
+		Kind: "notice", To: e.agentName, Subject: "Integration window closes today", Body: api.EnvelopeBody{Text: "rebase"}}}); err != nil {
+		t.Fatal(err)
+	}
+	if handled, err := relayWakeJob(ctx, b, c, ok); !handled || err != nil || len(prompts) != 1 || !strings.Contains(prompts[0], "#"+itoa(m.Seq)) {
+		t.Fatalf("accepted wake: handled %v err %v prompts %q", handled, err, prompts)
+	}
+	list, _ = c.ListObligations(ctx, task.ID, "", "", false, false)
+	for _, o := range list {
+		if (o.Needs == api.ObligationNeedsDelivery && o.State != api.ObligationClosed) || (o.Needs != api.ObligationNeedsDelivery && o.State != api.ObligationDelivered) {
+			t.Fatalf("after accepted wake: %+v", o)
+		}
+	}
+}
