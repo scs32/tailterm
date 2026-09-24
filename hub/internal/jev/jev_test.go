@@ -283,3 +283,15 @@ func TestRedactWholeQuotedValues(t *testing.T) {
 		}
 	}
 }
+
+func TestRedactUnquotedValuesWithSpaces(t *testing.T) {
+	for _, text := range []string{`{password:long secret phrase here}`, "password: long secret phrase here\nnext line", `api_key = long secret phrase here`} {
+		got := Redact(text)
+		if strings.Contains(got, "secret phrase") || strings.Contains(got, "long secret") {
+			t.Errorf("%q -> %q", text, got)
+		}
+	}
+	if got := Redact("password: short\nkeep this line"); !strings.Contains(got, "keep this line") {
+		t.Errorf("redaction crossed a line: %q", got)
+	}
+}

@@ -383,3 +383,18 @@ func TestProblemOrderIsDeterministic(t *testing.T) {
 		}
 	}
 }
+
+// Focused verification follow-up: escaping must round-trip without a semicolon too.
+func TestBackslashValuesRoundTripWithoutSemicolons(t *testing.T) {
+	e := Envelope{Kind: "result", Subject: "Windows path checks pass on the runner", Refs: map[string]string{"path": `C:\tmp`},
+		Body:     EnvelopeBody{Outcome: "done", Status: map[string]string{"a1": "pass"}},
+		Evidence: map[string]Evidence{"e1": {Type: "file", Value: `C:\tmp\out.txt`}}}
+	parsed, _ := ParseTextConvention(RenderText(e))
+	if parsed.Refs["path"] != `C:\tmp` || parsed.Evidence["e1"].Value != `C:\tmp\out.txt` {
+		t.Fatalf("backslashes changed: %q %q", parsed.Refs["path"], parsed.Evidence["e1"].Value)
+	}
+	o, _ := ParseTextConvention("ASSIGN: Reject the empty recipient\nObjective: x\nOwns: C:\\\\src\\\\a.go, b.go\nAcceptance: a1: y")
+	if !reflect.DeepEqual(o.Body.Owns, []string{`C:\\src\\a.go`, "b.go"}) {
+		t.Fatalf("owns changed: %q", o.Body.Owns)
+	}
+}

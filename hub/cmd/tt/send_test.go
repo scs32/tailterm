@@ -185,4 +185,9 @@ func TestSendRejectsTwoEvidenceEntriesInOneFlag(t *testing.T) {
 	if !errors.As(err, &coded) || coded.code != 2 {
 		t.Fatalf("err %v, want exit 2", err)
 	}
+	err = cmdSend(e, []string{"--kind", "result", "--subject", "Both checks pass on the branch", "--outcome", "done",
+		"--status", "a1=pass", "--evidence", "e1: go test; vet (command): go vet -> ok"})
+	if !errors.As(err, &coded) || coded.code != 2 {
+		t.Fatalf("letter-only key: err %v, want exit 2", err)
+	}
 }

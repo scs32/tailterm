@@ -172,7 +172,7 @@ func cmdSend(e env, args []string) error {
 }
 
 // secondEvidenceEntry spots "; e2: ..." inside one --evidence value.
-var secondEvidenceEntry = regexp.MustCompile(`;\s*[a-z]+[0-9]+\s*(\([a-z]+\))?\s*:`)
+var secondEvidenceEntry = regexp.MustCompile(`;\s*[a-z][a-z0-9]{0,15}\s*(\([a-z]+\))?\s*:`)
 
 func pairs(flagName string, values []string, sep string) (map[string]string, error) {
 	if len(values) == 0 {

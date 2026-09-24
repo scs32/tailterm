@@ -466,7 +466,7 @@ func ParseTextConvention(text string) (e Envelope, matched bool) {
 		case "acceptance":
 			b.Acceptance = parseNamed(splitEscaped(value))
 		case "status":
-			b.Status = parseNamed(splitList(value))
+			b.Status = parseNamed(splitEntryList(value))
 			for k, v := range b.Status {
 				b.Status[k] = strings.ToLower(v)
 			}
@@ -483,7 +483,7 @@ func ParseTextConvention(text string) (e Envelope, matched bool) {
 
 func parseRefs(value string) map[string]string {
 	out := map[string]string{}
-	for _, part := range splitList(value) {
+	for _, part := range splitEntryList(value) {
 		if k, v, ok := strings.Cut(part, "="); ok && refKey.MatchString(strings.TrimSpace(k)) {
 			out[strings.TrimSpace(k)] = strings.TrimSpace(v)
 		} else if k, v, ok := strings.Cut(part, " "); ok && refKey.MatchString(k) {
@@ -548,6 +548,19 @@ func escapeEntry(v string) string {
 	return strings.NewReplacer(`\`, `\\`, ";", `\;`).Replace(v)
 }
 
+// splitEntryList reads refs and status, which render escaped and "; "-joined but
+// are often hand-written with commas. Both forms are unescaped.
+func splitEntryList(value string) []string {
+	if strings.Contains(value, ";") {
+		return splitEscaped(value)
+	}
+	var out []string
+	for _, p := range strings.Split(value, ",") {
+		out = append(out, splitEscaped(p)...)
+	}
+	return out
+}
+
 // splitEscaped splits on unescaped semicolons and unescapes each part.
 func splitEscaped(value string) []string {
 	var out []string
@@ -589,7 +602,13 @@ func inferEvidenceType(v string) string {
 // splitList splits on semicolons, or on commas when no semicolon is present.
 func splitList(value string) []string {
 	if strings.Contains(value, ";") {
-		return splitEscaped(value)
+		var out []string
+		for _, p := range strings.Split(value, ";") {
+			if p = strings.TrimSpace(p); p != "" {
+				out = append(out, p)
+			}
+		}
+		return out
 	}
 	var out []string
 	for _, p := range strings.Split(value, ",") {
