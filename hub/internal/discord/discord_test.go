@@ -2,10 +2,13 @@ package discord
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -77,8 +80,8 @@ func TestRoutes(t *testing.T) {
 		"/channels/1/messages":                        {Template: "POST channels/{id}/messages", Major: "1"},
 		"/channels/1/messages/99":                     {Template: "POST channels/{id}/messages/{id}", Major: "1"},
 		"/guilds/5/channels":                          {Template: "POST guilds/{id}/channels", Major: "5"},
-		"/interactions/77/secret-token/callback":      {Template: "POST interactions/{id}/{token}/callback", Exempt: true},
-		"/webhooks/7/secret-token/messages/@original": {Template: "POST webhooks/{id}/{token}/messages/@original", Major: "7", Exempt: true},
+		"/interactions/77/secret-token/callback":      {Template: "POST interactions/{id}/{token}/callback", Major: tokenKey("secret-token"), Exempt: true},
+		"/webhooks/7/secret-token/messages/@original": {Template: "POST webhooks/{id}/{token}/messages/@original", Major: tokenKey("secret-token"), Exempt: true},
 	} {
 		if got := routeOf("POST", path); got != want {
 			t.Errorf("routeOf(%s) = %+v, want %+v", path, got, want)
@@ -278,5 +281,36 @@ func TestGatewayFatalClose(t *testing.T) {
 	gw := &Gateway{Token: "t", URL: func(context.Context) (string, error) { return url, nil }, Log: t.Logf}
 	if err := gw.Run(ctx); !errors.Is(err, ErrFatalClose) {
 		t.Fatalf("Run = %v, want ErrFatalClose", err)
+	}
+}
+
+func tokenKey(token string) string {
+	sum := sha256.Sum256([]byte(token))
+	return hex.EncodeToString(sum[:8])
+}
+
+// Production incident 2026-09-24: Discord reports each interaction's single
+// reply as an exhausted bucket; that must not delay the next interaction.
+func TestOneInteractionsLimitDoesNotDelayTheNext(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-RateLimit-Bucket", "interaction-callback")
+		w.Header().Set("X-RateLimit-Remaining", "0")
+		w.Header().Set("X-RateLimit-Reset-After", "30")
+		w.WriteHeader(204)
+	}))
+	defer srv.Close()
+	c := &Client{Token: "t", Base: srv.URL, HTTP: srv.Client(), MaxWait: 50 * time.Millisecond}
+	for i, token := range []string{"first-token", "second-token", "third-token"} {
+		if err := c.RespondInteraction(context.Background(), strconv.Itoa(100+i), token, InteractionResponse{Type: ResponseDeferredMessage}); err != nil {
+			t.Fatalf("interaction %d waited on another interaction's limit: %v", i+1, err)
+		}
+		if err := c.EditInteractionResponse(context.Background(), "7", token, MessageEdit{}); err != nil {
+			t.Fatalf("edit %d waited on another interaction's limit: %v", i+1, err)
+		}
+	}
+	for k := range c.blocked {
+		if strings.Contains(k, "token") {
+			t.Fatalf("a raw token became a map key: %s", k)
+		}
 	}
 }

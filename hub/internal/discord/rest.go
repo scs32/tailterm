@@ -3,6 +3,8 @@ package discord
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -109,6 +111,7 @@ type route struct {
 
 func routeOf(method, path string) route {
 	parts := strings.Split(strings.Trim(path, "/"), "/")
+	orig := append([]string(nil), parts...)
 	r := route{Exempt: len(parts) > 0 && (parts[0] == "interactions" || parts[0] == "webhooks")}
 	for i := 1; i < len(parts); i++ {
 		prev := parts[i-1]
@@ -125,6 +128,14 @@ func routeOf(method, path string) route {
 		}
 	}
 	r.Template = method + " " + strings.Join(parts, "/")
+	// Each interaction has its own reply limit (one initial response, then
+	// edits by token). Scope its buckets by that interaction so one click's
+	// exhausted limit never delays the next click past Discord's 3 seconds.
+	// The token itself is hashed so it never becomes a map key.
+	if r.Exempt && len(orig) >= 3 {
+		sum := sha256.Sum256([]byte(orig[2]))
+		r.Major = hex.EncodeToString(sum[:8])
+	}
 	return r
 }
 
@@ -276,6 +287,11 @@ func (c *Client) do(ctx context.Context, method, path string, body, out any) err
 // record learns a route's shared bucket and blocks the bucket while it
 // reports no remaining requests.
 func (c *Client) record(r route, res *http.Response) {
+	// Interaction replies are one-shot per interaction; their "remaining 0"
+	// describes an interaction that is finished, so only a 429 blocks them.
+	if r.Exempt {
+		return
+	}
 	if bucket := res.Header.Get("X-RateLimit-Bucket"); bucket != "" {
 		c.mu.Lock()
 		c.buckets[r.Template] = bucket
