@@ -17,7 +17,7 @@ HERE = pathlib.Path(__file__).parent
 # matching keeps \b and \s identical to Go's regexp.
 TOKEN = re.compile(r"sk-[A-Za-z0-9_-]{16,}|gh[pousr]_[A-Za-z0-9]{20,}|tskey-[A-Za-z0-9-]{10,}", re.ASCII)
 BEARER = re.compile(r"(?i:bearer)\s+([A-Za-z0-9._~+/=-]{8,})", re.ASCII)
-CRED_KEY = re.compile(r"""(?i)["']?\b(?:token|secret|password|passwd|api[_-]?key|access[_-]?key|client[_-]?secret|authorization)\b["']?\s*[:=]\s*""", re.ASCII)
+CRED_KEY = re.compile(r"""(?i)["']?\b[A-Za-z0-9_-]*?(?:token|secret|password|passwd|api[_-]?key|access[_-]?key|client[_-]?secret|authorization)\b["']?\s*[:=]\s*""", re.ASCII)
 
 
 def _value_end(s, i, limit):

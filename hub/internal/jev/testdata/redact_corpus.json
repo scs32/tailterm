@@ -102,5 +102,57 @@
  {
   "in": "we use bearer authentication here",
   "out": "we use bearer authentication here"
+ },
+ {
+  "in": "DB_PASSWORD=hunter2secret",
+  "out": "DB_PASSWORD=[REDACTED]"
+ },
+ {
+  "in": "POSTGRES_PASSWORD: hunter2secret",
+  "out": "POSTGRES_PASSWORD: [REDACTED]"
+ },
+ {
+  "in": "export AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMIK7MDENG",
+  "out": "export AWS_SECRET_ACCESS_KEY=[REDACTED]"
+ },
+ {
+  "in": "GITHUB_TOKEN=abc123realsecretvalue",
+  "out": "GITHUB_TOKEN=[REDACTED]"
+ },
+ {
+  "in": "SLACK_TOKEN=synthetic-slack-value-0123456789",
+  "out": "SLACK_TOKEN=[REDACTED]"
+ },
+ {
+  "in": "access_token=abc123realsecretvalue",
+  "out": "access_token=[REDACTED]"
+ },
+ {
+  "in": "refresh_token: abc123realsecretvalue",
+  "out": "refresh_token: [REDACTED]"
+ },
+ {
+  "in": "{\"accessToken\":\"abc123realsecretvalue\",\"user\":\"x\"}",
+  "out": "{\"accessToken\":[REDACTED],\"user\":\"x\"}"
+ },
+ {
+  "in": "client-secret=abc123realsecretvalue",
+  "out": "client-secret=[REDACTED]"
+ },
+ {
+  "in": "total_tokens: 214039",
+  "out": "total_tokens: 214039"
+ },
+ {
+  "in": "max_tokens=5 and input_tokens: 12",
+  "out": "max_tokens=5 and input_tokens: 12"
+ },
+ {
+  "in": "tokenizer: fast",
+  "out": "tokenizer: fast"
+ },
+ {
+  "in": "secretary: Alice",
+  "out": "secretary: Alice"
  }
 ]

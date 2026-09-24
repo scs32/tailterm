@@ -36,7 +36,9 @@ const (
 var (
 	tokenPattern  = regexp.MustCompile(`sk-[A-Za-z0-9_-]{16,}|gh[pousr]_[A-Za-z0-9]{20,}|tskey-[A-Za-z0-9-]{10,}`)
 	bearerPattern = regexp.MustCompile(`(?i:bearer)\s+([A-Za-z0-9._~+/=-]{8,})`)
-	credentialKey = regexp.MustCompile(`(?i)["']?\b(?:token|secret|password|passwd|api[_-]?key|access[_-]?key|client[_-]?secret|authorization)\b["']?\s*[:=]\s*`)
+	// A key may carry any prefix (DB_PASSWORD, GITHUB_TOKEN, accessToken) but
+	// must end on the keyword, so TOKEN_BUDGET and max_tokens stay prose.
+	credentialKey = regexp.MustCompile(`(?i)["']?\b[A-Za-z0-9_-]*?(?:token|secret|password|passwd|api[_-]?key|access[_-]?key|client[_-]?secret|authorization)\b["']?\s*[:=]\s*`)
 )
 
 func Redact(s string) string {
