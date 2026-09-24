@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -23,12 +24,13 @@ import (
 const Global = "*"
 
 type Store struct {
-	writeMu   sync.Mutex
-	MaxAgents int
-	db        *sql.DB
-	mu        sync.Mutex
-	waiters   map[string]chan struct{}
-	now       func() time.Time
+	writeMu    sync.Mutex
+	jevEnabled atomic.Bool
+	MaxAgents  int
+	db         *sql.DB
+	mu         sync.Mutex
+	waiters    map[string]chan struct{}
+	now        func() time.Time
 }
 
 const schema = `
@@ -987,6 +989,9 @@ func (s *Store) insertMessageWithResume(ctx context.Context, tx *sql.Tx, task ap
 	}
 	m.Seq, _ = res.LastInsertId()
 	if err = insertMessageContext(ctx, tx, &m, req, allowCrossProject); err != nil {
+		return m, err
+	}
+	if err = s.insertMessageCheck(ctx, tx, m, req); err != nil {
 		return m, err
 	}
 	preview := req.Text

@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"net/http"
 	"testing"
 
@@ -9,8 +10,8 @@ import (
 
 func testEnvelope() *api.Envelope {
 	return &api.Envelope{Kind: "result", To: "lead", Subject: "Empty recipient fix passes its checks",
-		Refs: map[string]string{"commit": "abc1234"},
-		Body: api.EnvelopeBody{Outcome: "done", Status: map[string]string{"a1": "pass"}},
+		Refs:     map[string]string{"commit": "abc1234"},
+		Body:     api.EnvelopeBody{Outcome: "done", Status: map[string]string{"a1": "pass"}},
 		Evidence: map[string]api.Evidence{"e1": {Type: "command", Value: "go test ./cmd/tt", Outcome: "ok"}}}
 }
 
@@ -87,5 +88,65 @@ func TestTypedMessagesStoreEnvelopeAndRenderedText(t *testing.T) {
 	var plain api.Message
 	if code := c.do("POST", path, api.PostMessageRequest{AgentID: builder.ID, Text: "hey can someone look at the relay"}, &plain); code != 201 || plain.Envelope != nil {
 		t.Fatalf("free text: %d %+v", code, plain)
+	}
+}
+
+// Criterion a6: every post gets exactly one check row with the right form.
+func TestMessageChecksClassifyEveryPost(t *testing.T) {
+	c := newClient(t)
+	task := c.task("checks")
+	lead := c.agent(task, "lead")
+	builder := c.agent(task, "builder")
+	path := "/v1/tasks/" + task.ID + "/messages"
+	post := func(req api.PostMessageRequest) api.Message {
+		t.Helper()
+		var m api.Message
+		if code := c.do("POST", path, req, &m); code != 201 {
+			t.Fatalf("post %+v: %d", req, code)
+		}
+		return m
+	}
+	typed := post(api.PostMessageRequest{AgentID: builder.ID, To: lead.ID, RequestID: "typed-1", Envelope: testEnvelope()})
+	post(api.PostMessageRequest{AgentID: builder.ID, To: lead.ID, RequestID: "typed-1", Envelope: testEnvelope()}) // retry
+	convention := post(api.PostMessageRequest{AgentID: builder.ID, Text: "QUESTION: Which status code for rejected posts\nQuestion: Should rejected posts return 422?"})
+	invalid := post(api.PostMessageRequest{AgentID: builder.ID, Text: "RESULT: Released 43c1da3\nOutcome: done"})
+	free := post(api.PostMessageRequest{AgentID: builder.ID, Text: "SAVED activation release under exact lead8726"})
+	human := post(api.PostMessageRequest{Text: "please look at the relay"})
+
+	c.st.EnableJevScoring()
+	pending := post(api.PostMessageRequest{AgentID: builder.ID, Text: "hey lead, done"})
+
+	checks, err := c.st.ListMessageChecks(context.Background(), task.ID, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := map[int64][2]string{
+		typed.Seq:      {api.CheckFormTyped, api.JevStatusDisabled},
+		convention.Seq: {api.CheckFormTextConvention, api.JevStatusDisabled},
+		invalid.Seq:    {api.CheckFormTextConventionInvalid, api.JevStatusDisabled},
+		free.Seq:       {api.CheckFormFreeText, api.JevStatusDisabled},
+		human.Seq:      {api.CheckFormHuman, api.JevStatusSkipped},
+		pending.Seq:    {api.CheckFormFreeText, api.JevStatusPending},
+	}
+	if len(checks) != len(want) {
+		t.Fatalf("got %d check rows, want %d: %+v", len(checks), len(want), checks)
+	}
+	for _, check := range checks {
+		w := want[check.Seq]
+		if check.Form != w[0] || check.JevStatus != w[1] {
+			t.Errorf("seq %d: form %s jev %s, want %v", check.Seq, check.Form, check.JevStatus, w)
+		}
+		if check.Seq == invalid.Seq {
+			fields := map[string]bool{}
+			for _, p := range check.Problems {
+				fields[p.Field] = true
+			}
+			if !fields["subject"] || !fields["body.status"] || !fields["evidence"] {
+				t.Errorf("invalid convention problems %+v", check.Problems)
+			}
+		}
+		if check.Seq == human.Seq && check.AgentID != "" || check.Seq == typed.Seq && check.AgentID != builder.ID {
+			t.Errorf("seq %d agent %q", check.Seq, check.AgentID)
+		}
 	}
 }
