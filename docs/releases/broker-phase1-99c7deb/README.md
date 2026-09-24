@@ -21,6 +21,17 @@ handler-owned backup preflight on the owner's instruction. The plan's
 - **Mini CLI:** `tt` from `56b00ad`, recorded in the [work order](../../broker-phase-1.md).
   The phase-1 CLI surface is unchanged since then; `99c7deb` only touched hub redaction and docs.
 
+## Source provenance
+- **The rewritten commit:** the deployed binary embeds `vcs.revision=99c7deb`. Before the first push,
+  GitHub push protection rejected a synthetic Slack-style token in the redaction test corpus, so that
+  unpushed commit was amended to `e0641c9`.
+- **What changed:** `git diff 99c7deb e0641c9` is one line of `hub/internal/jev/testdata/redact_corpus.json`,
+  which is not compiled into the binary. `99c7deb` itself is not on GitHub.
+- **Same code:** with the VCS stamp excluded (`-buildvcs=false`), builds of `99c7deb` and `e0641c9` are
+  byte-identical (SHA-256 `b971c8c1cfc076fc0d188fca32a1147ba809adb90207b63b635d34581b865a2c`).
+  The running hub is therefore exactly the code in `e0641c9`. Only its embedded revision label
+  differs.
+
 ## Verification after deploy
 - `tt doctor` reaches the hub.
 - Project `Tailterm Development` is readable (paused), and board messages through #8767 are intact.
