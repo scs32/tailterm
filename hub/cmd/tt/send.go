@@ -153,7 +153,7 @@ func cmdSend(e env, args []string) error {
 	}
 	// Send the rendered text too: hubs that predate envelopes ignore the
 	// envelope and store the text; newer hubs require the two to match.
-	req := api.PostMessageRequest{Envelope: &env, Text: api.RenderText(env), To: target, AgentID: e.agent, ReplyTo: *reply}
+	req := api.PostMessageRequest{Envelope: &env, Text: api.RenderText(env), To: target, AgentID: e.agent, RunID: e.runID, ReplyTo: *reply}
 	if err := links.apply(ctx, c, e, *task, target, *reply, api.RenderText(env), *requestID, false, &req); err != nil {
 		return err
 	}

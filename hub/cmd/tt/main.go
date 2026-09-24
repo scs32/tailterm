@@ -460,7 +460,7 @@ func cmdPost(e env, args []string) error {
 	if err != nil {
 		return fmt.Errorf("%w; --to accepts agents only. To reply to a human, use tt post --reply-to SEQ \"message\" without --to (shared board reply)", err)
 	}
-	req := api.PostMessageRequest{Text: text, To: target, AgentID: e.agent, ReplyTo: *reply}
+	req := api.PostMessageRequest{Text: text, To: target, AgentID: e.agent, RunID: e.runID, ReplyTo: *reply}
 	if err := links.apply(ctx, c, e, *task, target, *reply, text, *requestID, *intake, &req); err != nil {
 		return err
 	}
@@ -1406,8 +1406,9 @@ func cmdHook(e env, args []string) error {
 		// overdue outcomes escalate instead of holding the turn open.
 		if n, seqs := unackedObligations(e); n > 0 {
 			printJSON(map[string]any{"decision": "block", "reason": fmt.Sprintf("You have %d unacknowledged tailterm obligation(s): %s. Run `tt obligations`, acknowledge with `tt ack SEQ`, then act and reply with `tt send --reply-to SEQ`.", n, seqs)})
-		} else if n := unread(); n > 0 {
-			printJSON(map[string]any{"decision": "block", "reason": fmt.Sprintf("You have %d unread tailterm task message(s). Run `tt inbox --unread --mark-read`, act on them, and reply with `tt post` if needed.", n)})
+		} else if n := unreadDirectedFreeText(e); n > 0 {
+			// Only directed free text blocks; board-wide chatter never traps an agent.
+			printJSON(map[string]any{"decision": "block", "reason": fmt.Sprintf("You have %d unread tailterm message(s) addressed to you. Run `tt inbox --unread --mark-read`, act on them, and reply if needed.", n)})
 		}
 	case "notification":
 		kind, _ := input["notification_type"].(string)

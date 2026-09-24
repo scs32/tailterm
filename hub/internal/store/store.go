@@ -944,6 +944,15 @@ func (s *Store) PostMessage(ctx context.Context, taskID string, req api.PostMess
 	if err != nil {
 		return m, err
 	}
+	// Broker phase 2a: only posts through this public endpoint create or settle
+	// obligations. System notices, decisions, dispatches and lead notices use
+	// other insert paths and never oblige anyone.
+	if err = s.createObligations(ctx, tx, m, req, req.AgentID == "" && by.Node != api.BrokerNode); err != nil {
+		return m, err
+	}
+	if err = s.applyReplyOutcome(ctx, tx, m, req); err != nil {
+		return m, err
+	}
 	if req.RequestID != "" {
 		if err = insertMessagePostReceipt(ctx, tx, &m, req.RequestID, payload, by); err != nil {
 			return m, err
@@ -998,12 +1007,7 @@ func (s *Store) insertMessageWithResume(ctx context.Context, tx *sql.Tx, task ap
 	if err = s.insertMessageCheck(ctx, tx, m, req); err != nil {
 		return m, err
 	}
-	if err = s.createObligations(ctx, tx, m, req, by); err != nil {
-		return m, err
-	}
-	if err = s.applyReplyOutcome(ctx, tx, m, req); err != nil {
-		return m, err
-	}
+
 	preview := req.Text
 	if len(preview) > 200 {
 		preview = preview[:200]

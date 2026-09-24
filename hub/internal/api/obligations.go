@@ -75,14 +75,19 @@ type ObligationList struct {
 // ObligationActionRequest acknowledges, records progress on, or resumes an
 // obligation. Only the recipient agent's current run may act.
 type ObligationActionRequest struct {
-	AgentID string `json:"agentId"`
-	RunID   string `json:"runId"`
-	Text    string `json:"text,omitempty"`
+	AgentID   string `json:"agentId"`
+	RunID     string `json:"runId"`
+	Text      string `json:"text,omitempty"`
+	RequestID string `json:"requestId,omitempty"` // a retry returns the original result
 }
 
+// ObligationReassignRequest moves an open obligation. Without an actor it is
+// the owner acting; an actor must be the project lead's current run.
 type ObligationReassignRequest struct {
-	ToAgentID string `json:"toAgentId"`
-	Reason    string `json:"reason"`
+	ToAgentID    string `json:"toAgentId"`
+	Reason       string `json:"reason"`
+	ActorAgentID string `json:"actorAgentId,omitempty"`
+	ActorRunID   string `json:"actorRunId,omitempty"`
 }
 
 // WakeJob is one broker-requested wake of an agent's runtime, leased by the

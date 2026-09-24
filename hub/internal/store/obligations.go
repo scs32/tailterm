@@ -46,11 +46,14 @@ CREATE TABLE IF NOT EXISTS obligations (
 );
 CREATE INDEX IF NOT EXISTS obligations_task_state ON obligations(task_id, state);
 CREATE INDEX IF NOT EXISTS obligations_agent_state ON obligations(agent_id, state);
+CREATE INDEX IF NOT EXISTS obligations_state ON obligations(state);
 CREATE TABLE IF NOT EXISTS wake_jobs (
   id TEXT PRIMARY KEY,
   task_id TEXT NOT NULL,
   obligation_id TEXT NOT NULL REFERENCES obligations(id),
   agent_id TEXT NOT NULL,
+  run_id TEXT NOT NULL DEFAULT '',
+  covered_through INTEGER NOT NULL DEFAULT 0,
   due_at TEXT NOT NULL,
   state TEXT NOT NULL,
   lease_token TEXT NOT NULL DEFAULT '',
@@ -60,6 +63,15 @@ CREATE TABLE IF NOT EXISTS wake_jobs (
   reported_at TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS wake_jobs_agent ON wake_jobs(agent_id, state, due_at);
+CREATE TABLE IF NOT EXISTS obligation_receipts (
+  task_id TEXT NOT NULL,
+  agent_id TEXT NOT NULL,
+  request_id TEXT NOT NULL,
+  fingerprint TEXT NOT NULL,
+  obligation_id TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  PRIMARY KEY (task_id, agent_id, request_id)
+);
 CREATE TABLE IF NOT EXISTS project_stalls (
   task_id TEXT PRIMARY KEY,
   observed_change TEXT NOT NULL,
@@ -85,7 +97,9 @@ func newObligationID(prefix string) string {
 }
 
 // obligationNeeds maps a message to what it obliges its recipient to do.
-func obligationNeeds(req api.PostMessageRequest, by api.Caller) string {
+// human is true only for a person's post through the public message endpoint;
+// system notices, decision answers, dispatches and lead notices never oblige.
+func obligationNeeds(req api.PostMessageRequest, human bool) string {
 	if e := req.Envelope; e != nil {
 		switch e.Kind {
 		case api.EnvelopeKindAssign, api.EnvelopeKindRequest, api.EnvelopeKindReview, api.EnvelopeKindBlock:
@@ -97,7 +111,7 @@ func obligationNeeds(req api.PostMessageRequest, by api.Caller) string {
 		}
 		return ""
 	}
-	if req.AgentID == "" && by.Node != api.BrokerNode {
+	if human && req.AgentID == "" {
 		return api.ObligationNeedsOutcome // a directed human message
 	}
 	return ""
@@ -107,19 +121,15 @@ func obligationSubject(req api.PostMessageRequest) (kind, subject string) {
 	if req.Envelope != nil {
 		return req.Envelope.Kind, req.Envelope.Subject
 	}
-	text := strings.Join(strings.Fields(req.Text), " ")
-	if len(text) > 100 {
-		text = text[:100] + "…"
-	}
-	return "human", text
+	return "human", truncateRunes(strings.Join(strings.Fields(req.Text), " "), 100)
 }
 
 // createObligations runs inside the message transaction.
-func (s *Store) createObligations(ctx context.Context, tx *sql.Tx, m api.Message, req api.PostMessageRequest, by api.Caller) error {
+func (s *Store) createObligations(ctx context.Context, tx *sql.Tx, m api.Message, req api.PostMessageRequest, human bool) error {
 	if req.To == "" || req.To == req.AgentID {
 		return nil // board-wide posts and self-addressed posts oblige no one
 	}
-	needs := obligationNeeds(req, by)
+	needs := obligationNeeds(req, human)
 	if needs == "" {
 		return nil
 	}
@@ -153,25 +163,52 @@ func insertWakeJob(ctx context.Context, tx *sql.Tx, taskID, obligationID, agentI
 	return err
 }
 
-// applyReplyOutcome lets a typed reply from the recipient close or pause the
-// obligation its reply-to message created. It runs in the reply's transaction.
+// applyReplyOutcome lets a typed reply from the recipient's current run close
+// or pause the obligation its reply-to message created, when the reply kind
+// fits what the obligation needs. It runs in the reply's transaction.
 func (s *Store) applyReplyOutcome(ctx context.Context, tx *sql.Tx, m api.Message, req api.PostMessageRequest) error {
 	if req.ReplyTo <= 0 || req.AgentID == "" || req.Envelope == nil {
 		return nil
 	}
+	if req.RunID != "" {
+		var current string
+		if err := tx.QueryRowContext(ctx, `SELECT run_id FROM agents WHERE id=?`, req.AgentID).Scan(&current); err != nil {
+			return err
+		}
+		if current != req.RunID {
+			return nil // a stale run's reply is kept on the board but changes no obligation
+		}
+	}
 	now := ts(m.CreatedAt)
+	// Which obligations each reply kind can settle; delivery-only ones settle on delivery.
+	fits := map[string]string{
+		api.EnvelopeKindResult:  `needs IN ('ack_outcome','answer')`,
+		api.EnvelopeKindDecline: `needs IN ('ack_outcome','answer')`,
+		api.EnvelopeKindAnswer:  `(needs='answer' OR source_kind='human')`,
+		api.EnvelopeKindBlock:   `needs IN ('ack_outcome','answer')`,
+	}[req.Envelope.Kind]
+	if fits == "" {
+		return nil
+	}
 	switch req.Envelope.Kind {
-	case api.EnvelopeKindResult, api.EnvelopeKindAnswer, api.EnvelopeKindDecline:
-		outcome := map[string]string{api.EnvelopeKindResult: api.OutcomeResult, api.EnvelopeKindAnswer: api.OutcomeAnswered, api.EnvelopeKindDecline: api.OutcomeDeclined}[req.Envelope.Kind]
-		_, err := tx.ExecContext(ctx, `UPDATE obligations SET state=?,outcome=?,outcome_seq=?,reason=?,closed_at=?,changed_at=? WHERE message_seq=? AND agent_id=? AND state<>?`,
-			api.ObligationClosed, outcome, m.Seq, req.Envelope.Body.Reason, now, now, req.ReplyTo, req.AgentID, api.ObligationClosed)
-		return err
 	case api.EnvelopeKindBlock:
-		_, err := tx.ExecContext(ctx, `UPDATE obligations SET state=?,reason=?,changed_at=? WHERE message_seq=? AND agent_id=? AND state<>?`,
+		_, err := tx.ExecContext(ctx, `UPDATE obligations SET state=?,reason=?,changed_at=? WHERE message_seq=? AND agent_id=? AND state<>? AND `+fits,
 			api.ObligationBlocked, req.Envelope.Body.Reason, now, req.ReplyTo, req.AgentID, api.ObligationClosed)
 		return err
+	default:
+		outcome := map[string]string{api.EnvelopeKindResult: api.OutcomeResult, api.EnvelopeKindAnswer: api.OutcomeAnswered, api.EnvelopeKindDecline: api.OutcomeDeclined}[req.Envelope.Kind]
+		_, err := tx.ExecContext(ctx, `UPDATE obligations SET state=?,outcome=?,outcome_seq=?,reason=?,closed_at=?,changed_at=? WHERE message_seq=? AND agent_id=? AND state<>? AND `+fits,
+			api.ObligationClosed, outcome, m.Seq, req.Envelope.Body.Reason, now, now, req.ReplyTo, req.AgentID, api.ObligationClosed)
+		return err
 	}
-	return nil
+}
+
+func truncateRunes(s string, n int) string {
+	r := []rune(s)
+	if len(r) <= n {
+		return s
+	}
+	return string(r[:n]) + "…"
 }
 
 const obligationCols = `id,task_id,message_seq,agent_id,subject,source_kind,needs,state,outcome,outcome_seq,reason,created_at,ack_due_at,due_at,delivered_at,acked_at,last_progress_at,closed_at,escalation,nudges`
@@ -197,17 +234,22 @@ func scanObligation(row rowScanner) (api.Obligation, error) {
 	return o, nil
 }
 
-// ObligationOverdue says which deadline an open obligation has missed, if any.
+// ObligationOverdue says which deadline an open obligation has missed, if any:
+// "ack" (not acknowledged in time), "outcome" (past its due time), or
+// "silence" (acknowledged but no recorded progress). A missed due time wins
+// over silence so an explicit deadline is never hidden behind reminders.
 func ObligationOverdue(o api.Obligation, now time.Time) string {
 	if o.State == api.ObligationClosed || o.Needs == api.ObligationNeedsDelivery {
 		return ""
 	}
-	switch o.State {
-	case api.ObligationQueued, api.ObligationDelivered:
-		if now.After(o.AckDueAt) {
-			return "ack"
-		}
-	case api.ObligationAcknowledged, api.ObligationWorking:
+	unacked := o.State == api.ObligationQueued || o.State == api.ObligationDelivered
+	if unacked && now.After(o.AckDueAt) {
+		return "ack"
+	}
+	if now.After(o.DueAt) {
+		return "outcome"
+	}
+	if o.State == api.ObligationAcknowledged || o.State == api.ObligationWorking {
 		last := o.CreatedAt
 		if o.AckedAt != nil {
 			last = *o.AckedAt
@@ -218,9 +260,6 @@ func ObligationOverdue(o api.Obligation, now time.Time) string {
 		if now.Sub(last) > api.ObligationSilenceNudge {
 			return "silence"
 		}
-	}
-	if now.After(o.DueAt) {
-		return "outcome"
 	}
 	return ""
 }
@@ -286,9 +325,19 @@ func (s *Store) markDelivered(ctx context.Context, db execer, where string, args
 		append([]any{api.ObligationClosed, api.OutcomeDelivered, t, t, t}, append(args, api.ObligationQueued, api.ObligationNeedsDelivery)...)...); err != nil {
 		return err
 	}
-	_, err := db.ExecContext(ctx, `UPDATE obligations SET state=?,delivered_at=?,changed_at=? WHERE `+where+` AND state=?`,
-		append([]any{api.ObligationDelivered, t, t}, append(args, api.ObligationQueued)...)...)
+	// The ack deadline runs from delivery, never earlier than first set.
+	ackDue := ts(now.Add(api.ObligationAckDeadline))
+	_, err := db.ExecContext(ctx, `UPDATE obligations SET state=?,delivered_at=?,changed_at=?,ack_due_at=CASE WHEN ack_due_at<? THEN ? ELSE ack_due_at END WHERE `+where+` AND state=?`,
+		append([]any{api.ObligationDelivered, t, t, ackDue, ackDue}, append(args, api.ObligationQueued)...)...)
 	return err
+}
+
+// SetClockForTest replaces the store clock (tests in other packages only).
+func (s *Store) SetClockForTest(now func() time.Time) { s.now = now }
+
+// agentOnlineAt mirrors the heartbeat rule behind api.Agent.Online at a given time.
+func agentOnlineAt(a api.Agent, now time.Time) bool {
+	return !a.LastSeenAt.IsZero() && now.Sub(a.LastSeenAt) < 90*time.Second && a.Status != api.AgentExited && a.Status != api.AgentClosed
 }
 
 func (s *Store) requireCurrentRun(ctx context.Context, db execer, taskID, agentID, runID string) error {
@@ -318,6 +367,23 @@ func (s *Store) ObligationAction(ctx context.Context, taskID string, messageSeq 
 	if err := s.requireCurrentRun(ctx, tx, taskID, req.AgentID, req.RunID); err != nil {
 		return api.Obligation{}, err
 	}
+	// A retried request returns what it did the first time, so a lost response
+	// can never resume a later block or invent progress.
+	fingerprint := fmt.Sprintf("%s|%d|%s", action, messageSeq, req.Text)
+	if req.RequestID != "" {
+		var prior, oblID string
+		err := tx.QueryRowContext(ctx, `SELECT fingerprint,obligation_id FROM obligation_receipts WHERE task_id=? AND agent_id=? AND request_id=?`, taskID, req.AgentID, req.RequestID).Scan(&prior, &oblID)
+		if err == nil {
+			if prior != fingerprint {
+				return api.Obligation{}, fmt.Errorf("%w: request ID was already used for a different obligation action", api.ErrConflict)
+			}
+			tx.Rollback()
+			return s.getObligation(ctx, oblID, now)
+		}
+		if !errors.Is(err, sql.ErrNoRows) {
+			return api.Obligation{}, err
+		}
+	}
 	o, err := scanObligation(tx.QueryRowContext(ctx, `SELECT `+obligationCols+` FROM obligations WHERE task_id=? AND message_seq=? AND agent_id=?`, taskID, messageSeq, req.AgentID))
 	if errors.Is(err, sql.ErrNoRows) {
 		return o, api.ErrNotFound
@@ -336,20 +402,27 @@ func (s *Store) ObligationAction(ctx context.Context, taskID string, messageSeq 
 		} else if o.State == api.ObligationAcknowledged || o.State == api.ObligationWorking {
 			// Already acknowledged: acknowledging again changes nothing.
 		} else {
-			// ack also resumes a blocked obligation.
-			_, err = tx.ExecContext(ctx, `UPDATE obligations SET state=?,acked_at=CASE WHEN acked_at='' THEN ? ELSE acked_at END,delivered_at=CASE WHEN delivered_at='' THEN ? ELSE delivered_at END,last_progress_at=?,reason='',changed_at=? WHERE id=?`,
+			// ack also resumes a blocked obligation. Activity clears any
+			// escalation, so a later miss starts again with the lead.
+			_, err = tx.ExecContext(ctx, `UPDATE obligations SET state=?,acked_at=CASE WHEN acked_at='' THEN ? ELSE acked_at END,delivered_at=CASE WHEN delivered_at='' THEN ? ELSE delivered_at END,last_progress_at=?,reason='',escalation=0,escalated_at='',nudges=0,nudged_at='',changed_at=? WHERE id=?`,
 				api.ObligationAcknowledged, t, t, t, t, o.ID)
 		}
 	case "progress":
 		if o.Needs == api.ObligationNeedsDelivery || o.State == api.ObligationQueued || o.State == api.ObligationDelivered || o.State == api.ObligationBlocked {
 			return o, fmt.Errorf("%w: acknowledge the obligation before recording progress", api.ErrConflict)
 		}
-		_, err = tx.ExecContext(ctx, `UPDATE obligations SET state=?,last_progress_at=?,nudges=0,changed_at=? WHERE id=?`, api.ObligationWorking, t, t, o.ID)
+		_, err = tx.ExecContext(ctx, `UPDATE obligations SET state=?,last_progress_at=?,nudges=0,nudged_at='',escalation=0,escalated_at='',changed_at=? WHERE id=?`, api.ObligationWorking, t, t, o.ID)
 	default:
 		return o, api.ErrInvalid
 	}
 	if err != nil {
 		return o, err
+	}
+	if req.RequestID != "" {
+		if _, err := tx.ExecContext(ctx, `INSERT INTO obligation_receipts (task_id,agent_id,request_id,fingerprint,obligation_id,created_at) VALUES (?,?,?,?,?,?)`,
+			taskID, req.AgentID, req.RequestID, fingerprint, o.ID, t); err != nil {
+			return o, err
+		}
 	}
 	if err := tx.Commit(); err != nil {
 		return o, err
@@ -393,6 +466,15 @@ func (s *Store) ReassignObligation(ctx context.Context, taskID, obligationID str
 	if err != nil {
 		return api.Message{}, err
 	}
+	// Only the owner, or the project lead's current run, may move work.
+	actor := "owner"
+	if req.ActorAgentID != "" {
+		lead, err := scanAgent(tx.QueryRowContext(ctx, `SELECT `+agentCols+` FROM agents WHERE id=? AND task_id=?`, req.ActorAgentID, taskID))
+		if err != nil || lead.RunID != req.ActorRunID || req.ActorRunID == "" || lead.Name != task.Orchestrator || lead.Status == api.AgentClosed {
+			return api.Message{}, fmt.Errorf("%w: only the owner or the project lead's current run can reassign an obligation", api.ErrConflict)
+		}
+		actor = "lead " + lead.Name
+	}
 	target, err := scanAgent(tx.QueryRowContext(ctx, `SELECT `+agentCols+` FROM agents WHERE id=? AND task_id=?`, req.ToAgentID, taskID))
 	if err != nil || target.Status == api.AgentClosed {
 		return api.Message{}, api.ErrInvalid
@@ -402,13 +484,22 @@ func (s *Store) ReassignObligation(ctx context.Context, taskID, obligationID str
 		return api.Message{}, err
 	}
 	env := reassignedEnvelope(original, target.Name, old.MessageSeq)
+	env.Refs["reassignedBy"] = strings.ReplaceAll(actor, " ", "-")
 	now := s.now()
+	reason := "reassigned by " + actor
+	if req.Reason != "" {
+		reason += ": " + req.Reason
+	}
 	if _, err := tx.ExecContext(ctx, `UPDATE obligations SET state=?,outcome=?,reason=?,closed_at=?,changed_at=? WHERE id=?`,
-		api.ObligationClosed, api.OutcomeSuperseded, req.Reason, ts(now), ts(now), old.ID); err != nil {
+		api.ObligationClosed, api.OutcomeSuperseded, reason, ts(now), ts(now), old.ID); err != nil {
 		return api.Message{}, err
 	}
-	m, err := s.insertMessageWithResume(ctx, tx, task, api.PostMessageRequest{Envelope: env, To: target.ID}, target, BrokerCaller, false, false, false)
+	reissue := api.PostMessageRequest{Envelope: env, To: target.ID}
+	m, err := s.insertMessageWithResume(ctx, tx, task, reissue, target, BrokerCaller, false, false, false)
 	if err != nil {
+		return m, err
+	}
+	if err := s.createObligations(ctx, tx, m, reissue, false); err != nil {
 		return m, err
 	}
 	if err := tx.Commit(); err != nil {
@@ -432,10 +523,7 @@ func reassignedEnvelope(original api.Message, toName string, seq int64) *api.Env
 		}
 		return &e
 	}
-	ask := strings.Join(strings.Fields(original.Text), " ")
-	if len(ask) > 1500 {
-		ask = ask[:1500] + "…"
-	}
+	ask := truncateRunes(strings.Join(strings.Fields(original.Text), " "), 1500)
 	return &api.Envelope{Kind: api.EnvelopeKindRequest, To: toName, Subject: "Reassigned request from the owner",
 		Refs: map[string]string{"reassignedFrom": fmt.Sprint(seq)}, Body: api.EnvelopeBody{Ask: ask}}
 }
@@ -453,6 +541,14 @@ func (s *Store) LeaseWakeJob(ctx context.Context, taskID, agentID, runID string,
 	defer tx.Rollback()
 	if err := s.requireCurrentRun(ctx, tx, taskID, agentID, runID); err != nil {
 		return nil, err
+	}
+	// Like the inbox relay, never wake a retired, exited or offline session.
+	agent, err := scanAgent(tx.QueryRowContext(ctx, `SELECT `+agentCols+` FROM agents WHERE id=?`, agentID))
+	if err != nil {
+		return nil, err
+	}
+	if agent.Status == api.AgentRetired || agent.Status == api.AgentExited || !agentOnlineAt(agent, now) {
+		return nil, nil
 	}
 	var pause, status string
 	if err := tx.QueryRowContext(ctx, `SELECT pause_state,status FROM tasks WHERE id=?`, taskID).Scan(&pause, &status); err != nil {
@@ -484,11 +580,21 @@ WHERE w.task_id=? AND w.agent_id=? AND ((w.state=? AND w.due_at<=?) OR (w.state=
 	if leasedBefore == wakeLeased {
 		detail = "previous lease expired without a report"
 	}
-	if _, err := tx.ExecContext(ctx, `UPDATE wake_jobs SET state=?,lease_token=?,lease_expires_at=?,detail=? WHERE id=?`, wakeLeased, job.LeaseToken, ts(now.Add(wakeLease)), detail, job.ID); err != nil {
+	// The prompt covers every open obligation up to now; an accepted report
+	// delivers exactly those, never ones created after the prompt was built.
+	var covered int64
+	if err := tx.QueryRowContext(ctx, `SELECT COALESCE(MAX(message_seq),0) FROM obligations WHERE task_id=? AND agent_id=? AND state<>?`, taskID, agentID, api.ObligationClosed).Scan(&covered); err != nil {
 		return nil, err
 	}
-	if _, err := tx.ExecContext(ctx, `UPDATE wake_jobs SET state='coalesced',reported_at=?,detail=? WHERE agent_id=? AND task_id=? AND state=? AND due_at<=? AND id<>?`,
-		t, "merged into "+job.ID, agentID, taskID, wakePending, t, job.ID); err != nil {
+	expires := ts(now.Add(wakeLease))
+	if _, err := tx.ExecContext(ctx, `UPDATE wake_jobs SET state=?,lease_token=?,lease_expires_at=?,run_id=?,covered_through=?,detail=? WHERE id=?`,
+		wakeLeased, job.LeaseToken, expires, runID, covered, detail, job.ID); err != nil {
+		return nil, err
+	}
+	// Other due wakes wait behind this one; they are retired only when it is
+	// accepted, so a lost or failed wake leaves them to run.
+	if _, err := tx.ExecContext(ctx, `UPDATE wake_jobs SET due_at=?,detail=? WHERE agent_id=? AND task_id=? AND state=? AND due_at<=? AND id<>?`,
+		expires, "deferred behind "+job.ID, agentID, taskID, wakePending, t, job.ID); err != nil {
 		return nil, err
 	}
 	rows, err := tx.QueryContext(ctx, `SELECT message_seq,source_kind,subject FROM obligations WHERE task_id=? AND agent_id=? AND state<>? ORDER BY message_seq LIMIT 5`, taskID, agentID, api.ObligationClosed)
@@ -530,16 +636,24 @@ func (s *Store) ReportWakeJob(ctx context.Context, taskID, jobID string, r api.W
 		return err
 	}
 	defer tx.Rollback()
-	var agentID, state, token string
-	err = tx.QueryRowContext(ctx, `SELECT agent_id,state,lease_token FROM wake_jobs WHERE id=? AND task_id=?`, jobID, taskID).Scan(&agentID, &state, &token)
+	var agentID, state, token, runID, expires string
+	var covered int64
+	err = tx.QueryRowContext(ctx, `SELECT agent_id,state,lease_token,run_id,lease_expires_at,covered_through FROM wake_jobs WHERE id=? AND task_id=?`, jobID, taskID).Scan(&agentID, &state, &token, &runID, &expires, &covered)
 	if errors.Is(err, sql.ErrNoRows) {
 		return api.ErrNotFound
 	}
 	if err != nil {
 		return err
 	}
-	if state != wakeLeased || r.LeaseToken == "" || r.LeaseToken != token {
+	if state != wakeLeased || r.LeaseToken == "" || r.LeaseToken != token || now.After(parseTS(expires)) {
 		return fmt.Errorf("%w: wake job is not leased under this token", api.ErrConflict)
+	}
+	var currentRun string
+	if err := tx.QueryRowContext(ctx, `SELECT run_id FROM agents WHERE id=?`, agentID).Scan(&currentRun); err != nil {
+		return err
+	}
+	if currentRun != runID {
+		return fmt.Errorf("%w: the leasing run is no longer current", api.ErrConflict)
 	}
 	detail := r.Detail
 	if len(detail) > 500 {
@@ -549,7 +663,12 @@ func (s *Store) ReportWakeJob(ctx context.Context, taskID, jobID string, r api.W
 		return err
 	}
 	if r.Status == wakeAccepted {
-		if err := s.markDelivered(ctx, tx, `task_id=? AND agent_id=?`, []any{taskID, agentID}, now); err != nil {
+		if err := s.markDelivered(ctx, tx, `task_id=? AND agent_id=? AND message_seq<=?`, []any{taskID, agentID, covered}, now); err != nil {
+			return err
+		}
+		// Wakes deferred behind this one are now covered.
+		if _, err := tx.ExecContext(ctx, `UPDATE wake_jobs SET state='covered',reported_at=?,detail=? WHERE agent_id=? AND task_id=? AND state=? AND obligation_id IN (SELECT id FROM obligations WHERE agent_id=? AND message_seq<=?)`,
+			ts(now), "covered by "+jobID, agentID, taskID, wakePending, agentID, covered); err != nil {
 			return err
 		}
 	}

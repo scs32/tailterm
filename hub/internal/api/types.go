@@ -286,6 +286,7 @@ type UpdateAgentRequest struct {
 
 type PostMessageRequest struct {
 	Envelope         *Envelope         `json:"envelope,omitempty"`
+	RunID            string            `json:"runId,omitempty"` // sender's run; a stale run cannot settle obligations
 	WorkItems        []MessageWorkItem `json:"workItems,omitempty"`
 	WorkOrderMessage *MessageReference `json:"workOrderMessage,omitempty"`
 	AuditKind        string            `json:"auditKind,omitempty"`

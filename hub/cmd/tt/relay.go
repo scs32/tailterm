@@ -46,6 +46,8 @@ type relayProgress struct {
 	PendingFollowThroughReport   *api.DeliveryFollowThroughReportRequest `json:"pendingFollowThroughReport,omitempty"`
 	PendingFollowThroughDelivery string                                  `json:"pendingFollowThroughDelivery,omitempty"`
 	Error                        string                                  `json:"error,omitempty"`
+	BrokerWakes                  bool                                    `json:"brokerWakes,omitempty"`
+	LastBrokerWake               time.Time                               `json:"lastBrokerWake,omitempty"`
 }
 
 func relayDir() string {
@@ -160,6 +162,11 @@ func wakeThrough(messages []api.Message, agent string) (through int64, eligible 
 	for _, m := range messages {
 		if m.Seq > through {
 			through = m.Seq
+		}
+		// Hub-authored broker notices are delivered by broker wake jobs, never by
+		// waking the whole roster as if they were human announcements.
+		if m.From.Node == api.BrokerNode {
+			continue
 		}
 		if m.From.AgentID != agent && (m.Broadcast || m.To == agent || (m.To == "" && m.From.AgentID == "")) {
 			eligible = true
@@ -341,15 +348,28 @@ func relayFollowThrough(ctx context.Context, b runtimeBinding, p *relayProgress,
 // Codex answered. The hub owns job identity and leasing, so there is no
 // relay-derived request ID that could collide and starve a recipient. It
 // returns handled=false when nothing is due or the hub predates wake jobs.
-func relayWakeJob(ctx context.Context, b runtimeBinding, c *api.Client, queue func(context.Context, runtimeBinding, string) error) (bool, error) {
+func relayWakeJob(ctx context.Context, b runtimeBinding, p *relayProgress, c *api.Client, now time.Time, queue func(context.Context, runtimeBinding, string) error) (bool, error) {
+	// Space broker wakes so the follow-through and inbox paths always get turns.
+	if now.Sub(p.LastBrokerWake) < 15*time.Second {
+		return false, nil
+	}
 	job, err := c.LeaseWakeJob(ctx, b.Task, b.Agent, b.Run)
 	var httpErr *api.HTTPError
-	if errors.As(err, &httpErr) && (httpErr.Status == http.StatusNotFound || httpErr.Status == http.StatusConflict || httpErr.Status == http.StatusMethodNotAllowed) {
-		return false, nil // older hub, or this binding's run is no longer current
+	if errors.As(err, &httpErr) && (httpErr.Status == http.StatusNotFound || httpErr.Status == http.StatusMethodNotAllowed) {
+		p.BrokerWakes = false // older hub
+		return false, nil
 	}
-	if err != nil || job == nil {
+	if errors.As(err, &httpErr) && httpErr.Status == http.StatusConflict {
+		return false, nil // this binding's run is no longer current
+	}
+	if err != nil {
 		return false, err
 	}
+	p.BrokerWakes = true
+	if job == nil {
+		return false, nil
+	}
+	p.LastBrokerWake = now
 	report := api.WakeJobReport{LeaseToken: job.LeaseToken, Status: "accepted"}
 	if qerr := queue(ctx, b, job.Prompt); qerr != nil {
 		report.Status, report.Detail = "failed", qerr.Error()
@@ -414,6 +434,16 @@ func relayOne(ctx context.Context, b runtimeBinding, p *relayProgress, c *api.Cl
 	msgs, err := c.ListMessages(ctx, b.Task, max(a.ReadUpTo, p.Through), b.Agent, 200)
 	if err != nil {
 		return err
+	}
+	if p.BrokerWakes {
+		// Obligating messages to this agent are woken by broker wake jobs.
+		kept := msgs[:0]
+		for _, m := range msgs {
+			if !(m.To == b.Agent && (m.Envelope != nil || m.From.AgentID == "")) {
+				kept = append(kept, m)
+			}
+		}
+		msgs = kept
 	}
 	through, eligible := wakeThrough(msgs, b.Agent)
 	if !eligible {
@@ -494,13 +524,16 @@ func cmdRelay(args []string) error {
 			if err == nil {
 				ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 				now := time.Now().UTC()
-				var queued bool
-				queued, err = relayWakeJob(ctx, b, c, nativeQueue)
-				if err == nil && !queued {
-					queued, err = relayFollowThrough(ctx, b, &progress, c, now, nativeQueue)
+				// A broker-path error never suppresses the existing paths.
+				queued, brokerErr := relayWakeJob(ctx, b, &progress, c, now, nativeQueue)
+				if brokerErr != nil {
+					fmt.Fprintf(os.Stderr, "[tt relay] %s broker wake: %v\n", b.Agent, brokerErr)
 				}
-				if err == nil && !queued {
-					err = relayOne(ctx, b, &progress, c, now, nativeQueue)
+				if !queued {
+					queued, err = relayFollowThrough(ctx, b, &progress, c, now, nativeQueue)
+					if err == nil && !queued {
+						err = relayOne(ctx, b, &progress, c, now, nativeQueue)
+					}
 				}
 				cancel()
 			}

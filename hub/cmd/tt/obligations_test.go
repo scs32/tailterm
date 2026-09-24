@@ -7,6 +7,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/scs32/tailterm/hub/internal/api"
 )
@@ -65,9 +66,23 @@ func TestObligationCommandsAndStopHook(t *testing.T) {
 	if out, err := captureCLIOutput(t, func() error { return cmdObligationAction(e, "ack", []string{"#" + itoa(assign.Seq)}) }); err != nil || !strings.Contains(out, "acknowledged") {
 		t.Fatalf("tt ack: %q %v", out, err)
 	}
-	// Acknowledged work, even when later overdue, does not hold the turn open.
-	if out := hook(`{}`); strings.Contains(out, "unacknowledged") {
+	// Acknowledged work does not hold the turn open, even though the inbox
+	// cursor has not moved past it (round-one F12).
+	if out := hook(`{}`); strings.Contains(out, "block") {
 		t.Fatalf("stop hook blocked on acknowledged work: %q", out)
+	}
+	// Board-wide chatter never blocks; directed free text from an agent does.
+	if _, err := c.PostMessage(ctx, task.ID, api.PostMessageRequest{AgentID: lead.ID, Text: "board-wide status note"}); err != nil {
+		t.Fatal(err)
+	}
+	if out := hook(`{}`); strings.Contains(out, "block") {
+		t.Fatalf("board-wide message blocked the turn: %q", out)
+	}
+	if _, err := c.PostMessage(ctx, task.ID, api.PostMessageRequest{AgentID: lead.ID, To: e.agent, Text: "quick question for you"}); err != nil {
+		t.Fatal(err)
+	}
+	if out := hook(`{}`); !strings.Contains(out, "addressed to you") {
+		t.Fatalf("directed free text did not block: %q", out)
 	}
 	if out, err := captureCLIOutput(t, func() error {
 		return cmdObligationAction(e, "progress", []string{itoa(assign.Seq), "--text", "halfway"})
@@ -94,6 +109,9 @@ func TestRelayDeliversBrokerWakeJobs(t *testing.T) {
 		t.Fatal(err)
 	}
 	b := runtimeBinding{Hub: e.hub, Task: task.ID, Agent: e.agent, Run: self.RunID, Thread: "00000000-0000-0000-0000-000000000000", Codex: "codex"}
+	if _, err := c.PostEvent(ctx, task.ID, api.PostEventRequest{Kind: api.EventHeartbeat, AgentID: e.agent, RunID: self.RunID}); err != nil {
+		t.Fatal(err)
+	}
 	m, err := c.PostMessage(ctx, task.ID, api.PostMessageRequest{AgentID: lead.ID, To: e.agent, Envelope: &api.Envelope{
 		Kind: "request", To: e.agentName, Subject: "Save the governing order record", Body: api.EnvelopeBody{Ask: "save it"}}})
 	if err != nil {
@@ -103,7 +121,7 @@ func TestRelayDeliversBrokerWakeJobs(t *testing.T) {
 	failing := func(context.Context, runtimeBinding, string) error {
 		return errors.New("Codex queue failed: exit status 1")
 	}
-	if handled, err := relayWakeJob(ctx, b, c, failing); !handled || err == nil || !strings.Contains(err.Error(), "failed") {
+	if handled, err := relayWakeJob(ctx, b, &relayProgress{}, c, time.Now(), failing); !handled || err == nil || !strings.Contains(err.Error(), "failed") {
 		t.Fatalf("failed wake: handled %v err %v", handled, err)
 	}
 	list, _ := c.ListObligations(ctx, task.ID, "", "", true, false)
@@ -112,14 +130,14 @@ func TestRelayDeliversBrokerWakeJobs(t *testing.T) {
 	}
 	// Nothing further is due until the broker schedules the next wake.
 	ok := func(_ context.Context, _ runtimeBinding, p string) error { prompts = append(prompts, p); return nil }
-	if handled, err := relayWakeJob(ctx, b, c, ok); handled || err != nil {
+	if handled, err := relayWakeJob(ctx, b, &relayProgress{}, c, time.Now(), ok); handled || err != nil {
 		t.Fatalf("no wake should be due: handled %v err %v", handled, err)
 	}
 	if _, err := c.PostMessage(ctx, task.ID, api.PostMessageRequest{AgentID: lead.ID, To: e.agent, Envelope: &api.Envelope{
 		Kind: "notice", To: e.agentName, Subject: "Integration window closes today", Body: api.EnvelopeBody{Text: "rebase"}}}); err != nil {
 		t.Fatal(err)
 	}
-	if handled, err := relayWakeJob(ctx, b, c, ok); !handled || err != nil || len(prompts) != 1 || !strings.Contains(prompts[0], "#"+itoa(m.Seq)) {
+	if handled, err := relayWakeJob(ctx, b, &relayProgress{}, c, time.Now(), ok); !handled || err != nil || len(prompts) != 1 || !strings.Contains(prompts[0], "#"+itoa(m.Seq)) {
 		t.Fatalf("accepted wake: handled %v err %v prompts %q", handled, err, prompts)
 	}
 	list, _ = c.ListObligations(ctx, task.ID, "", "", false, false)
@@ -127,5 +145,23 @@ func TestRelayDeliversBrokerWakeJobs(t *testing.T) {
 		if (o.Needs == api.ObligationNeedsDelivery && o.State != api.ObligationClosed) || (o.Needs != api.ObligationNeedsDelivery && o.State != api.ObligationDelivered) {
 			t.Fatalf("after accepted wake: %+v", o)
 		}
+	}
+}
+
+// Round one F14/f9: broker notices never trigger roster-wide inbox wakes, and
+// broker wakes are spaced so the other relay paths keep their turns.
+func TestRelayBrokerFairness(t *testing.T) {
+	broker := api.Message{Seq: 5, From: api.Sender{Node: api.BrokerNode, User: "broker"}, To: "", Text: "Project stalled"}
+	human := api.Message{Seq: 6, From: api.Sender{User: "owner"}, To: "", Text: "owner announcement"}
+	if _, eligible := wakeThrough([]api.Message{broker}, "self"); eligible {
+		t.Fatal("a board-wide broker notice woke the roster")
+	}
+	if _, eligible := wakeThrough([]api.Message{human}, "self"); !eligible {
+		t.Fatal("owner announcements must still wake")
+	}
+	p := &relayProgress{LastBrokerWake: time.Now()}
+	called := false
+	if handled, err := relayWakeJob(context.Background(), runtimeBinding{}, p, nil, time.Now().Add(5*time.Second), func(context.Context, runtimeBinding, string) error { called = true; return nil }); handled || err != nil || called {
+		t.Fatalf("broker wake inside the spacing window: handled %v err %v called %v", handled, err, called)
 	}
 }

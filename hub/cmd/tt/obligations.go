@@ -149,7 +149,9 @@ func cmdReassign(e env, args []string) error {
 	if err != nil {
 		return err
 	}
-	m, err := c.ReassignObligation(ctx, task, fs.Arg(0), api.ObligationReassignRequest{ToAgentID: target, Reason: *reason})
+	// From an agent session this acts as that agent (only the lead may);
+	// without one it is the owner.
+	m, err := c.ReassignObligation(ctx, task, fs.Arg(0), api.ObligationReassignRequest{ToAgentID: target, Reason: *reason, ActorAgentID: e.agent, ActorRunID: e.runID})
 	if err != nil {
 		return err
 	}
@@ -176,4 +178,31 @@ func unackedObligations(e env) (int, string) {
 		}
 	}
 	return len(seqs), strings.Join(seqs, ", ")
+}
+
+// unreadDirectedFreeText counts unread free-text messages another agent sent
+// directly to this one. Typed messages and directed owner posts are covered by
+// obligations instead, so acknowledging one never leaves an agent stuck on it.
+func unreadDirectedFreeText(e env) int {
+	c, err := e.client(2 * time.Second)
+	if err != nil {
+		return 0
+	}
+	ctx, cancel := ctxTimeout(2 * time.Second)
+	defer cancel()
+	after, err := readCursor(ctx, c, e.task, e.agent)
+	if err != nil {
+		return 0
+	}
+	msgs, err := c.ListMessages(ctx, e.task, after, e.agent, 200)
+	if err != nil {
+		return 0
+	}
+	n := 0
+	for _, m := range msgs {
+		if m.To == e.agent && m.From.AgentID != "" && m.From.AgentID != e.agent && m.Envelope == nil {
+			n++
+		}
+	}
+	return n
 }

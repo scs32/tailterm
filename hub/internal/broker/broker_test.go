@@ -2,7 +2,9 @@ package broker
 
 import (
 	"context"
+	"errors"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -120,9 +122,10 @@ func want(t *testing.T, at string, got []string, expected ...string) {
 	}
 }
 
-// b5 and b10: wakes at 1/3/7 min, lead at 10 min, owner 15 min later, one
-// project-stall notice (only once the lead has been escalated and 15 quiet
-// minutes have passed since), each exactly once, across a restart.
+// b5 and b10: wakes at 1/3/7 min, lead at 10 min, owner 15 min later, and
+// one project-stall notice 15 quiet minutes after the owner escalation. Each
+// fires exactly once, across restarts, and the stall never repeats without
+// recipient activity (the broker's own escalations are not activity).
 func TestUnacknowledgedAssignmentEscalatesOnce(t *testing.T) {
 	f := newFixture(t)
 	o := f.assign(t, "")
@@ -140,19 +143,21 @@ func TestUnacknowledgedAssignmentEscalatesOnce(t *testing.T) {
 	}
 	f.restart(t)
 	want(t, "+20m", f.tick(t, o, c.Add(20*time.Minute)))
-	want(t, "+25m1s", f.tick(t, o, c.Add(25*time.Minute+time.Second)), "escalate-owner", "project-stalled")
+	want(t, "+25m1s", f.tick(t, o, c.Add(25*time.Minute+time.Second)), "escalate-owner")
 	want(t, "+40m", f.tick(t, o, c.Add(40*time.Minute)))
+	want(t, "+40m2s", f.tick(t, o, c.Add(40*time.Minute+2*time.Second)), "project-stalled")
+	want(t, "+41m", f.tick(t, o, c.Add(41*time.Minute)))
+	want(t, "+70m no repeat", f.tick(t, o, c.Add(70*time.Minute)))
 	if lead, owner := f.brokerNotices(t); lead != 1 || owner != 1 {
 		t.Fatalf("after owner escalation: lead %d owner %d", lead, owner)
 	}
-	// Recipient activity re-arms the stall notice; it fires again only after a
-	// new quiet period with overdue work.
-	if _, err := f.st.ObligationAction(f.ctx, f.task.ID, o.MessageSeq, "ack", api.ObligationActionRequest{AgentID: f.builder.ID, RunID: f.builder.RunID}, c.Add(41*time.Minute)); err != nil {
+	// Recipient activity clears the escalation; a later miss starts with a
+	// reminder again, not a stall notice.
+	if _, err := f.st.ObligationAction(f.ctx, f.task.ID, o.MessageSeq, "ack", api.ObligationActionRequest{AgentID: f.builder.ID, RunID: f.builder.RunID}, c.Add(71*time.Minute)); err != nil {
 		t.Fatal(err)
 	}
-	want(t, "+50m", f.tick(t, o, c.Add(50*time.Minute)))
-	want(t, "+71m1s", f.tick(t, o, c.Add(71*time.Minute+time.Second)), "nudge", "project-stalled")
-	want(t, "+75m", f.tick(t, o, c.Add(75*time.Minute)))
+	want(t, "+90m", f.tick(t, o, c.Add(90*time.Minute)))
+	want(t, "+101m1s", f.tick(t, o, c.Add(101*time.Minute+time.Second)), "nudge")
 }
 
 // b6: silence nudges twice at 30-minute spacing, then escalates; a missed due
@@ -195,3 +200,116 @@ func TestClosedRecipientClosesObligation(t *testing.T) {
 		t.Fatalf("%+v", obls[0])
 	}
 }
+
+// Round one f4/F9: silence waits a full window after the last reminder, and a
+// missed explicit due time escalates even while reminders are still running.
+func TestSilenceWindowAndDueTime(t *testing.T) {
+	f := newFixture(t)
+	o := f.assign(t, "")
+	ackAt := o.CreatedAt.Add(time.Minute)
+	if _, err := f.st.ObligationAction(f.ctx, f.task.ID, o.MessageSeq, "ack", api.ObligationActionRequest{AgentID: f.builder.ID, RunID: f.builder.RunID}, ackAt); err != nil {
+		t.Fatal(err)
+	}
+	want(t, "+31m", f.tick(t, o, ackAt.Add(31*time.Minute)), "nudge")
+	want(t, "+62m", f.tick(t, o, ackAt.Add(62*time.Minute)), "nudge")
+	want(t, "+62m30s", f.tick(t, o, ackAt.Add(62*time.Minute+30*time.Second)))
+
+	g := newFixture(t)
+	q := g.assign(t, "45m")
+	if _, err := g.st.ObligationAction(g.ctx, g.task.ID, q.MessageSeq, "ack", api.ObligationActionRequest{AgentID: g.builder.ID, RunID: g.builder.RunID}, q.CreatedAt.Add(time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	want(t, "due +32m", g.tick(t, q, q.CreatedAt.Add(32*time.Minute)), "nudge")
+	want(t, "due +46m", g.tick(t, q, q.CreatedAt.Add(46*time.Minute)), "escalate-lead")
+}
+
+// Round one f5: activity clears escalation, so a later miss reaches the lead
+// first rather than jumping to the owner.
+func TestEscalationResetsAfterActivity(t *testing.T) {
+	f := newFixture(t)
+	o := f.assign(t, "")
+	c := o.CreatedAt
+	// A cold start past the wake times sends one catch-up wake; the escalation
+	// follows on the next 30-second pass.
+	want(t, "+10m1s", f.tick(t, o, c.Add(10*time.Minute+time.Second)), "wake")
+	want(t, "+10m2s", f.tick(t, o, c.Add(10*time.Minute+2*time.Second)), "escalate-lead")
+	act := func(action string, at time.Duration) {
+		if _, err := f.st.ObligationAction(f.ctx, f.task.ID, o.MessageSeq, action, api.ObligationActionRequest{AgentID: f.builder.ID, RunID: f.builder.RunID}, c.Add(at)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	act("ack", 12*time.Minute)
+	for m := 30; m <= 110; m += 20 {
+		act("progress", time.Duration(m)*time.Minute)
+	}
+	want(t, "+2h1s", f.tick(t, o, c.Add(2*time.Hour+time.Second)), "escalate-lead")
+}
+
+// Round one f3: the stall notice posts even when many obligations are overdue.
+func TestStallNoticeFitsTheBodyLimit(t *testing.T) {
+	f := newFixture(t)
+	var first api.Obligation
+	for i := 0; i < 45; i++ {
+		m, err := f.st.PostMessage(f.ctx, f.task.ID, api.PostMessageRequest{AgentID: f.lead.ID, To: f.builder.ID, Envelope: &api.Envelope{
+			Kind: "assign", To: "builder", Subject: "Long subject for a stall listing entry that keeps going to make the notice body large",
+			Body: api.EnvelopeBody{Objective: "x", Owns: []string{"f"}, Acceptance: map[string]string{"a1": "y"}}}}, f.by)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if i == 0 {
+			obls, _ := f.st.ListObligations(f.ctx, f.task.ID, store.ObligationFilter{}, time.Now())
+			first = obls[0]
+			_ = m
+		}
+	}
+	c := first.CreatedAt
+	for _, at := range []time.Duration{10*time.Minute + 5*time.Second, 10*time.Minute + 6*time.Second, 25*time.Minute + 10*time.Second, 40*time.Minute + 20*time.Second} {
+		if _, err := (&Broker{Store: f.st}).Tick(f.ctx, c.Add(at)); err != nil {
+			t.Fatalf("tick at %s: %v", at, err)
+		}
+	}
+	msgs, _ := f.st.ListMessages(f.ctx, f.task.ID, 0, "", 500)
+	found := false
+	for _, m := range msgs {
+		if m.Envelope != nil && m.Envelope.Subject == "Project stalled: overdue work and no progress" {
+			found = strings.Contains(m.Envelope.Body.Text, "and 35 more")
+		}
+	}
+	if !found {
+		t.Fatal("stall notice with a capped listing was not posted")
+	}
+}
+
+// Round one F6/f10: a broker action on a stale snapshot is skipped.
+func TestStaleSnapshotIsSkipped(t *testing.T) {
+	f := newFixture(t)
+	o := f.assign(t, "")
+	snapshot, err := f.st.BrokerOpenObligations(f.ctx)
+	if err != nil || len(snapshot) != 1 {
+		t.Fatalf("snapshot %v %d", err, len(snapshot))
+	}
+	if _, err := f.st.ObligationAction(f.ctx, f.task.ID, o.MessageSeq, "ack", api.ObligationActionRequest{AgentID: f.builder.ID, RunID: f.builder.RunID}, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.st.BrokerEscalate(f.ctx, snapshot[0], 1, "not acknowledged", o.CreatedAt.Add(11*time.Minute)); !errors.Is(err, store.ErrBrokerStale) {
+		t.Fatalf("stale escalation: %v", err)
+	}
+	if lead, owner := f.brokerNotices(t); lead != 0 || owner != 0 {
+		t.Fatalf("stale action posted notices: lead %d owner %d", lead, owner)
+	}
+}
+
+// Round one F2/f8: a retired recipient is not woken, but its overdue work
+// still escalates so the lead can reassign it.
+func TestRetiredRecipientEscalatesWithoutWakes(t *testing.T) {
+	f := newFixture(t)
+	o := f.assign(t, "")
+	if _, err := f.st.UpdateAgent(f.ctx, f.builder.ID, api.UpdateAgentRequest{Status: ptr(api.AgentRetired)}, f.by); err != nil {
+		t.Fatal(err)
+	}
+	c := o.CreatedAt
+	want(t, "retired +1m", f.tick(t, o, c.Add(time.Minute)))
+	want(t, "retired +10m1s", f.tick(t, o, c.Add(10*time.Minute+time.Second)), "escalate-lead")
+}
+
+func ptr[T any](v T) *T { return &v }

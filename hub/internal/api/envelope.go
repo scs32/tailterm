@@ -84,6 +84,14 @@ func NormalizeEnvelopePost(req *PostMessageRequest) error {
 	if problems := ValidateEnvelope(*req.Envelope); problems != nil {
 		return &EnvelopeError{Problems: problems}
 	}
+	// refs.repliesTo is the envelope form of a reply; it must agree with ReplyTo.
+	if raw, ok := req.Envelope.Refs["repliesTo"]; ok {
+		seq, err := strconv.ParseInt(strings.TrimPrefix(strings.TrimSpace(raw), "#"), 10, 64)
+		if err != nil || seq < 1 || (req.ReplyTo != 0 && req.ReplyTo != seq) {
+			return &EnvelopeError{Problems: []Problem{{Field: "refs.repliesTo", Reason: "must be a message number matching the reply-to message"}}}
+		}
+		req.ReplyTo = seq
+	}
 	rendered := RenderText(*req.Envelope)
 	if req.Text != "" && req.Text != rendered {
 		return &EnvelopeError{Problems: []Problem{{Field: "text", Reason: "must be empty or equal the envelope's rendered text"}}}

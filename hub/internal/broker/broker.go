@@ -7,6 +7,7 @@ package broker
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
@@ -45,30 +46,30 @@ func (b *Broker) Tick(ctx context.Context, now time.Time) ([]Step, error) {
 		return nil, err
 	}
 	var steps []Step
-	record := func(o store.BrokerObligation, action string, err error) error {
-		if err != nil {
-			return fmt.Errorf("%s obligation %s: %w", action, o.ID, err)
+	var firstErr error
+	act := func(o store.BrokerObligation, action string, err error) {
+		switch {
+		case errors.Is(err, store.ErrBrokerStale):
+			// Changed since read; decided afresh next tick.
+		case err != nil:
+			if firstErr == nil {
+				firstErr = fmt.Errorf("%s obligation %s: %w", action, o.ID, err)
+			}
+		default:
+			steps = append(steps, Step{TaskID: o.TaskID, ObligationID: o.ID, MessageSeq: o.MessageSeq, Action: action})
 		}
-		steps = append(steps, Step{TaskID: o.TaskID, ObligationID: o.ID, MessageSeq: o.MessageSeq, Action: action})
-		return nil
 	}
 	type taskState struct {
-		lastChange time.Time
-		overdue    []store.BrokerObligation
+		lastChange, quietFrom time.Time
+		ownerLevel            []store.BrokerObligation
 	}
 	tasks := map[string]*taskState{}
-	var firstErr error
-	keep := func(err error) {
-		if err != nil && firstErr == nil {
-			firstErr = err
-		}
-	}
 	for _, o := range open {
 		if o.TaskPaused {
 			continue // owner-paused projects are neither woken nor escalated
 		}
 		if o.AgentStatus == api.AgentClosed || o.AgentStatus == api.AgentExited || o.AgentStatus == "" {
-			keep(record(o, "recipient-gone", b.Store.BrokerCloseRecipientGone(ctx, o, now)))
+			act(o, "recipient-gone", b.Store.BrokerCloseRecipientGone(ctx, o, now))
 			continue
 		}
 		t := tasks[o.TaskID]
@@ -76,40 +77,48 @@ func (b *Broker) Tick(ctx context.Context, now time.Time) ([]Step, error) {
 			t = &taskState{}
 			tasks[o.TaskID] = t
 		}
+		// Only recipient-driven changes count as activity for stall detection.
 		if o.ChangedAt.After(t.lastChange) {
 			t.lastChange = o.ChangedAt
 		}
-		if o.State == api.ObligationQueued || o.State == api.ObligationDelivered {
-			if o.Wakes < wakesDue(o, now) {
-				keep(record(o, "wake", b.Store.BrokerWake(ctx, o, now)))
-			}
+		unacked := o.State == api.ObligationQueued || o.State == api.ObligationDelivered
+		if due := wakesDue(o, now); unacked && o.AgentStatus != api.AgentRetired && o.Wakes < due {
+			act(o, "wake", b.Store.BrokerWake(ctx, o, due, now))
+			continue // one step per obligation per tick
 		}
 		overdue := store.ObligationOverdue(o.Obligation, now)
 		if overdue == "" {
 			continue
 		}
-		// A project counts as stalled only after its overdue work has already
-		// gone to the lead, so the owner never hears before the lead does.
-		if o.Escalation >= 1 {
-			t.overdue = append(t.overdue, o)
-			if o.EscalatedAt.After(t.lastChange) {
-				t.lastChange = o.EscalatedAt
+		if o.Escalation >= 2 {
+			t.ownerLevel = append(t.ownerLevel, o)
+			if o.EscalatedAt.After(t.quietFrom) {
+				t.quietFrom = o.EscalatedAt
 			}
 		}
 		switch {
 		case overdue == "silence" && o.Nudges < api.ObligationMaxNudges:
 			if o.NudgedAt.IsZero() || now.Sub(o.NudgedAt) >= api.ObligationSilenceNudge {
-				keep(record(o, "nudge", b.Store.BrokerNudge(ctx, o, now)))
+				act(o, "nudge", b.Store.BrokerNudge(ctx, o, now))
 			}
 		case o.Escalation == 0:
-			keep(record(o, "escalate-lead", b.Store.BrokerEscalate(ctx, o, 1, overdueReason(overdue), now)))
+			// After the last reminder, silence gets a full window before the lead hears.
+			if overdue != "silence" || now.Sub(o.NudgedAt) >= api.ObligationSilenceNudge {
+				act(o, "escalate-lead", b.Store.BrokerEscalate(ctx, o, 1, overdueReason(overdue), now))
+			}
 		case o.Escalation == 1 && now.Sub(o.EscalatedAt) >= api.ObligationOwnerAfterLead:
-			keep(record(o, "escalate-owner", b.Store.BrokerEscalate(ctx, o, 2, overdueReason(overdue)+"; the lead escalation went unanswered", now)))
+			act(o, "escalate-owner", b.Store.BrokerEscalate(ctx, o, 2, overdueReason(overdue)+"; the lead escalation went unanswered", now))
 		}
 	}
 	for taskID, t := range tasks {
-		notified, err := b.Store.BrokerProjectStall(ctx, taskID, t.lastChange, t.overdue, now)
-		keep(err)
+		quietFrom := t.quietFrom
+		if t.lastChange.After(quietFrom) {
+			quietFrom = t.lastChange
+		}
+		notified, err := b.Store.BrokerProjectStall(ctx, taskID, t.lastChange, quietFrom, t.ownerLevel, now)
+		if err != nil && firstErr == nil {
+			firstErr = err
+		}
 		if notified {
 			steps = append(steps, Step{TaskID: taskID, Action: "project-stalled"})
 		}
