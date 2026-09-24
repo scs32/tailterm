@@ -32,6 +32,7 @@ import (
 	"tailscale.com/tsnet"
 
 	"github.com/scs32/tailterm/hub/internal/api"
+	"github.com/scs32/tailterm/hub/internal/jev"
 	"github.com/scs32/tailterm/hub/internal/monitor"
 	"github.com/scs32/tailterm/hub/internal/server"
 	"github.com/scs32/tailterm/hub/internal/store"
@@ -102,6 +103,30 @@ func main() {
 	})
 
 	defer func() { stop(); <-monitorDone }()
+
+	// Jev scoring is log-only and optional: without a key file, agent posts
+	// are recorded as jev disabled and nothing leaves the hub.
+	if keyFile := os.Getenv("TAILTERM_TYPESAFE_KEY_FILE"); keyFile != "" {
+		key, keyErr := os.ReadFile(keyFile)
+		if keyErr != nil || strings.TrimSpace(string(key)) == "" {
+			log.Printf("jev scoring disabled: cannot read TAILTERM_TYPESAFE_KEY_FILE: %v", keyErr)
+		} else {
+			st.EnableJevScoring()
+			scorer := &jev.Scorer{
+				Client: &jev.Client{
+					URL:   env("TAILTERM_TYPESAFE_URL", jev.DefaultURL),
+					Key:   strings.TrimSpace(string(key)),
+					Model: env("TAILTERM_TYPESAFE_MODEL", jev.DefaultModel),
+					HTTP:  &http.Client{},
+				},
+				Checks: st, Concurrency: 4, Timeout: 3 * time.Second, Interval: 2 * time.Second,
+				Log: log.Printf,
+			}
+			scorerDone := scorer.Start(ctx)
+			defer func() { stop(); <-scorerDone }()
+			log.Printf("jev scoring enabled (log-only)")
+		}
+	}
 
 	var ln net.Listener
 	var identity server.Identity
