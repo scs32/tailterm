@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/scs32/tailterm/hub/internal/api"
@@ -51,7 +52,16 @@ type Bridge struct {
 	categories map[string]string // name → category ID
 	botID      string
 	events     chan discord.Dispatch
+	runCtx     context.Context // interactions run under it, so shutdown waits for them
+	inflight   sync.WaitGroup
+	// needBackfill is set when a Gateway event could not be queued; the event
+	// loop then backfills without waiting for its periodic pass.
+	needBackfill atomic.Bool
 }
+
+// BackfillInterval is how often every channel is read for owner messages the
+// Gateway did not deliver; the ingest cursor makes it cheap when caught up.
+const BackfillInterval = time.Minute
 
 func New(cfg Config) (*Bridge, error) {
 	if cfg.Hub == nil || cfg.Discord == nil || cfg.State == nil || cfg.GuildID == "" || cfg.AppID == "" || len(cfg.Owners) == 0 {
@@ -78,7 +88,7 @@ func New(cfg Config) (*Bridge, error) {
 	if cfg.Log == nil {
 		cfg.Log = func(string, ...any) {}
 	}
-	b := &Bridge{cfg: cfg, owners: map[string]bool{}, wake: make(chan struct{}, 1), categories: map[string]string{}, events: make(chan discord.Dispatch, 256)}
+	b := &Bridge{cfg: cfg, owners: map[string]bool{}, wake: make(chan struct{}, 1), categories: map[string]string{}, events: make(chan discord.Dispatch, 256), runCtx: context.Background()}
 	for _, id := range cfg.Owners {
 		if !b.owners[id] {
 			b.owners[id] = true
@@ -111,8 +121,13 @@ var Commands = []discord.Command{
 		{Type: discord.OptionString, Name: "agent", Description: "The agent to give it to", Required: true}}},
 }
 
-// Run starts every loop and blocks until ctx ends.
-func (b *Bridge) Run(ctx context.Context) error {
+// Run starts every loop and blocks until ctx ends or the Gateway fails for
+// good (a fatal close such as disallowed intents), in which case every loop
+// stops and the error is returned so the process exits and is restarted.
+func (b *Bridge) Run(parent context.Context) error {
+	ctx, cancel := context.WithCancel(parent)
+	defer cancel()
+	b.runCtx = ctx
 	me, err := b.cfg.Discord.CurrentUser(ctx)
 	if err != nil {
 		return fmt.Errorf("discord identity: %w", err)
@@ -120,7 +135,7 @@ func (b *Bridge) Run(ctx context.Context) error {
 	b.mu.Lock()
 	b.botID = me.ID
 	b.mu.Unlock()
-	if err := b.cfg.Discord.SetGuildCommands(ctx, b.cfg.AppID, b.cfg.GuildID, Commands); err != nil {
+	if err := b.registerCommands(ctx); err != nil {
 		return fmt.Errorf("register commands: %w", err)
 	}
 	var wg sync.WaitGroup
@@ -139,11 +154,27 @@ func (b *Bridge) Run(ctx context.Context) error {
 	} else {
 		<-ctx.Done()
 	}
+	cancel()
 	wg.Wait()
-	if errors.Is(gatewayErr, discord.ErrFatalClose) {
+	b.inflight.Wait()
+	if gatewayErr != nil && parent.Err() == nil {
 		return gatewayErr
 	}
-	return ctx.Err()
+	return parent.Err()
+}
+
+// registerCommands replaces the guild's commands only when they changed,
+// so restarts do not spend Discord's daily command-update budget.
+func (b *Bridge) registerCommands(ctx context.Context) error {
+	raw, _ := json.Marshal(Commands)
+	want := b.cfg.AppID + "|" + b.cfg.GuildID + "|" + string(raw)
+	if have, err := b.cfg.State.Get(ctx, "commands"); err == nil && have == want {
+		return nil
+	}
+	if err := b.cfg.Discord.SetGuildCommands(ctx, b.cfg.AppID, b.cfg.GuildID, Commands); err != nil {
+		return err
+	}
+	return b.cfg.State.Set(ctx, "commands", want)
 }
 
 // Dispatch receives Gateway events. Interactions are answered at once, each
@@ -154,22 +185,34 @@ func (b *Bridge) Dispatch(d discord.Dispatch) {
 	case "INTERACTION_CREATE":
 		var in discord.Interaction
 		if json.Unmarshal(d.Data, &in) == nil {
-			go b.handleInteraction(context.Background(), in)
+			b.inflight.Add(1)
+			go func() {
+				defer b.inflight.Done()
+				b.handleInteraction(b.runCtx, in)
+			}()
 		}
 	case "MESSAGE_CREATE", "READY", "RESUMED":
 		select {
 		case b.events <- d:
 		default:
+			b.needBackfill.Store(true)
 			b.logf("discord bridge: event queue full; %s will be recovered by backfill", d.Type)
 		}
 	}
 }
 
 func (b *Bridge) eventLoop(ctx context.Context) {
+	ticker := time.NewTicker(BackfillInterval)
+	defer ticker.Stop()
 	for {
+		if b.needBackfill.Swap(false) {
+			b.backfill(ctx)
+		}
 		select {
 		case <-ctx.Done():
 			return
+		case <-ticker.C:
+			b.backfill(ctx)
 		case d := <-b.events:
 			switch d.Type {
 			case "MESSAGE_CREATE":
@@ -312,12 +355,16 @@ func (b *Bridge) provision(ctx context.Context, t api.Task, remapping bool) erro
 	}
 	start := int64(0)
 	if !remapping {
-		detail, err := b.cfg.Hub.GetTask(ctx, t.ID)
+		// The newest few board messages, newest first. (TaskDetail.LatestSeq
+		// counts events, a different sequence, so it cannot place the cursor.)
+		recent, err := b.cfg.Hub.LatestMessages(ctx, t.ID, int(b.cfg.InitialHistory))
 		if err != nil {
 			return err
 		}
-		if start = detail.LatestSeq - b.cfg.InitialHistory; start < 0 {
-			start = 0
+		for _, m := range recent {
+			if start == 0 || m.Seq-1 < start {
+				start = m.Seq - 1
+			}
 		}
 	}
 	if err := b.cfg.State.SetChannel(ctx, t.ID, channelID, start); err != nil {
@@ -329,8 +376,13 @@ func (b *Bridge) provision(ctx context.Context, t api.Task, remapping bool) erro
 }
 
 // archive moves a closed project's channel to the archive category. Writes
-// there are refused by the bridge itself (the bot has no Manage Roles).
+// there are refused by the bridge itself (the bot has no Manage Roles). The
+// board's last messages are mirrored first; if that fails nothing is marked
+// and the next reconcile tries again.
 func (b *Bridge) archive(ctx context.Context, t api.Task, m Mapping) error {
+	if err := b.mirror(ctx, m); err != nil {
+		return fmt.Errorf("final mirror: %w", err)
+	}
 	channels, err := b.cfg.Discord.GuildChannels(ctx, b.cfg.GuildID)
 	if err != nil {
 		return err
@@ -344,10 +396,6 @@ func (b *Bridge) archive(ctx context.Context, t api.Task, m Mapping) error {
 			return b.cfg.State.SetArchived(ctx, t.ID)
 		}
 		return err
-	}
-	// The mirror runs one last time so the closing messages arrive.
-	if err := b.mirror(ctx, m); err != nil {
-		b.logf("discord bridge: final mirror %s: %v", t.ID, err)
 	}
 	mk := marker(0, 1, 1, "archived")
 	if err := b.cfg.State.Enqueue(ctx, t.ID, 0, []OutboxRow{{Key: "archived:" + t.ID, TaskID: t.ID, Kind: kindNotice,
@@ -425,8 +473,12 @@ func (b *Bridge) mirror(ctx context.Context, m Mapping) error {
 }
 
 // refreshCard edits the pinned status card when the project changed, at
-// most once per CardInterval, and creates and pins it when missing.
+// most once per CardInterval, and creates and pins it when missing. A card
+// that could not be pinned is pinned again at most every PinRetry.
 func (b *Bridge) refreshCard(ctx context.Context, m Mapping) error {
+	if m.CardMessageID != "" && !m.CardPinned && time.Since(m.CardPinAt) >= PinRetry {
+		b.pinCard(ctx, m.TaskID, m.ChannelID, m.CardMessageID)
+	}
 	detail, err := b.cfg.Hub.GetTask(ctx, m.TaskID)
 	if err != nil {
 		return err
@@ -443,8 +495,9 @@ func (b *Bridge) refreshCard(ctx context.Context, m Mapping) error {
 		return nil
 	}
 	send.AllowedMentions = discord.AllowedMentions{Parse: []string{}}
+	edit := discord.MessageEdit{Content: &send.Content, Embeds: &send.Embeds, AllowedMentions: &send.AllowedMentions}
 	if m.CardMessageID != "" {
-		_, err := b.cfg.Discord.EditMessage(ctx, m.ChannelID, m.CardMessageID, discord.MessageEdit{Content: &send.Content, Embeds: &send.Embeds, AllowedMentions: &send.AllowedMentions})
+		_, err := b.cfg.Discord.EditMessage(ctx, m.ChannelID, m.CardMessageID, edit)
 		if err == nil {
 			return b.cfg.State.SetCard(ctx, m.TaskID, m.CardMessageID, hash)
 		}
@@ -452,24 +505,44 @@ func (b *Bridge) refreshCard(ctx context.Context, m Mapping) error {
 			return b.channelError(ctx, m.TaskID, err)
 		}
 	}
-	// Reuse a card an earlier, uncertain create already posted.
-	cardID, err := b.findOwn(ctx, m.ChannelID, cardMarker)
-	if err != nil {
-		return b.channelError(ctx, m.TaskID, err)
+	// A create whose reply was lost left a card behind: find it first.
+	cardID := ""
+	if !m.CardAttemptAt.IsZero() {
+		if cardID, err = b.findOwn(ctx, m.ChannelID, cardMarker, m.CardAttemptAt); err != nil {
+			return b.channelError(ctx, m.TaskID, err)
+		}
 	}
 	if cardID == "" {
+		if err := b.cfg.State.SetCardAttempt(ctx, m.TaskID); err != nil {
+			return err
+		}
 		msg, err := b.cfg.Discord.CreateMessage(ctx, m.ChannelID, send)
 		if err != nil {
 			return b.channelError(ctx, m.TaskID, err)
 		}
 		cardID = msg.ID
-	} else if _, err := b.cfg.Discord.EditMessage(ctx, m.ChannelID, cardID, discord.MessageEdit{Content: &send.Content, Embeds: &send.Embeds, AllowedMentions: &send.AllowedMentions}); err != nil {
+	} else if _, err := b.cfg.Discord.EditMessage(ctx, m.ChannelID, cardID, edit); err != nil {
 		return b.channelError(ctx, m.TaskID, err)
 	}
-	if err := b.cfg.Discord.PinMessage(ctx, m.ChannelID, cardID); err != nil {
-		b.logf("discord bridge: pin status card in %s: %v", m.TaskID, err)
+	if err := b.cfg.State.SetCard(ctx, m.TaskID, cardID, hash); err != nil {
+		return err
 	}
-	return b.cfg.State.SetCard(ctx, m.TaskID, cardID, hash)
+	b.pinCard(ctx, m.TaskID, m.ChannelID, cardID)
+	return nil
+}
+
+// PinRetry spaces out pin attempts, for example while the bot lacks the
+// Pin Messages permission.
+const PinRetry = 10 * time.Minute
+
+func (b *Bridge) pinCard(ctx context.Context, taskID, channelID, cardID string) {
+	err := b.cfg.Discord.PinMessage(ctx, channelID, cardID)
+	if err != nil {
+		b.logf("discord bridge: pin status card in %s: %v", taskID, err)
+	}
+	if err := b.cfg.State.SetCardPinned(ctx, taskID, err == nil); err != nil {
+		b.logf("discord bridge: record pin for %s: %v", taskID, err)
+	}
 }
 
 // channelError forgets a channel Discord says no longer exists, so the next
@@ -484,21 +557,46 @@ func (b *Bridge) channelError(ctx context.Context, taskID string, err error) err
 	return err
 }
 
-// findOwn looks for the bot's own recent message containing a marker line.
-func (b *Bridge) findOwn(ctx context.Context, channelID, mk string) (string, error) {
-	recent, err := b.cfg.Discord.RecentMessages(ctx, channelID, 100)
-	if err != nil {
-		return "", err
-	}
+// findOwn looks for the bot's own message carrying a marker line, among
+// messages sent since shortly before `since` (the first attempt). It reads
+// forward from that point, so an old send is found however many messages
+// followed it. An error means "unknown", never "absent".
+func (b *Bridge) findOwn(ctx context.Context, channelID, mk string, since time.Time) (string, error) {
+	after := snowflakeAt(since.Add(-2 * time.Minute))
 	b.mu.Lock()
 	bot := b.botID
 	b.mu.Unlock()
-	for _, msg := range recent {
-		if msg.Author.ID == bot && hasLine(msg.Content, mk) {
-			return msg.ID, nil
+	for page := 0; page < maxReconcilePages; page++ {
+		msgs, err := b.cfg.Discord.ChannelMessages(ctx, channelID, after, 100)
+		if err != nil {
+			return "", err
+		}
+		for _, msg := range msgs {
+			if msg.Author.ID == bot && hasLine(msg.Content, mk) {
+				return msg.ID, nil
+			}
+			after = msg.ID
+		}
+		if len(msgs) < 100 {
+			return "", nil
 		}
 	}
-	return "", nil
+	return "", fmt.Errorf("marker %q not found within %d pages", mk, maxReconcilePages)
+}
+
+// maxReconcilePages bounds a reconciliation search (100 messages a page).
+const maxReconcilePages = 50
+
+// discordEpoch is the first second of 2015, the zero point of snowflakes.
+const discordEpoch = 1420070400000
+
+// snowflakeAt is the smallest Discord ID that could have been created at t.
+func snowflakeAt(t time.Time) string {
+	ms := t.UnixMilli() - discordEpoch
+	if ms < 0 {
+		ms = 0
+	}
+	return strconv.FormatInt(ms<<22, 10)
 }
 
 func hasLine(content, line string) bool {
@@ -526,49 +624,64 @@ func (b *Bridge) outboxLoop(ctx context.Context) {
 	}
 }
 
-// drainOutbox sends due rows in order. A row that fails transiently holds
-// back later rows for the same project, so a channel never shows messages
-// out of order.
+// drainOutbox sends due rows in order within each project. Only the head
+// of each project's queue is considered, so a failing project holds back its
+// own later sends and nobody else's.
 func (b *Bridge) drainOutbox(ctx context.Context) error {
-	rows, err := b.cfg.State.PendingOutbox(ctx, 200)
-	if err != nil {
-		return err
-	}
-	held := map[string]bool{}
-	now := time.Now()
-	for _, row := range rows {
-		if held[row.TaskID] {
-			continue
+	for sent := 0; sent < 500; {
+		heads, err := b.cfg.State.PendingHeads(ctx)
+		if err != nil {
+			return err
 		}
-		if row.NextAt.After(now) {
-			held[row.TaskID] = true
-			continue
-		}
-		if err := b.send(ctx, row); err != nil {
-			held[row.TaskID] = true
+		progress := false
+		now := time.Now()
+		for _, row := range heads {
+			if row.NextAt.After(now) {
+				continue
+			}
+			if b.send(ctx, row) == nil {
+				progress = true
+				sent++
+			}
 			if ctx.Err() != nil {
 				return ctx.Err()
 			}
+		}
+		if !progress {
+			return nil
 		}
 	}
 	return nil
 }
 
+// send delivers one row. It returns nil only when the row is settled (sent,
+// or dropped as permanently undeliverable); any other outcome holds the
+// project's queue and schedules a retry.
 func (b *Bridge) send(ctx context.Context, row OutboxRow) error {
 	m, err := b.cfg.State.Mapping(ctx, row.TaskID)
 	if err != nil || m.ChannelID == "" {
-		// No channel yet (or it is being re-provisioned): try again later.
-		return b.cfg.State.MarkRetry(ctx, row.ID, time.Now().Add(5*time.Second), "no channel")
+		// No channel yet (or it is being re-provisioned): wait for it.
+		_ = b.cfg.State.MarkRetry(ctx, row.ID, time.Now().Add(5*time.Second), "no channel")
+		return errNoChannel
 	}
 	var p outboxPayload
 	if err := json.Unmarshal([]byte(row.Payload), &p); err != nil {
 		return b.cfg.State.MarkFailed(ctx, row.ID, "bad payload: "+err.Error())
 	}
-	// A retried row may already have landed: look for its marker first.
+	// A row tried before may already be in Discord (its reply lost, or the
+	// bridge killed before recording it): find it by marker before sending.
 	if row.Attempts > 0 && p.Marker != "" {
-		if id, err := b.findOwn(ctx, m.ChannelID, p.Marker); err == nil && id != "" {
+		id, err := b.findOwn(ctx, m.ChannelID, p.Marker, row.FirstAttemptAt)
+		if err != nil {
+			_ = b.cfg.State.MarkRetry(ctx, row.ID, time.Now().Add(30*time.Second), "reconcile: "+err.Error())
+			return b.channelError(ctx, row.TaskID, err)
+		}
+		if id != "" {
 			return b.cfg.State.MarkSent(ctx, row, id)
 		}
+	}
+	if row, err = b.cfg.State.MarkAttempt(ctx, row.ID); err != nil {
+		return err
 	}
 	send := p.Message
 	send.AllowedMentions = discord.AllowedMentions{Parse: []string{}, Users: p.MentionUser}
@@ -579,50 +692,53 @@ func (b *Bridge) send(ctx context.Context, row OutboxRow) error {
 		return b.cfg.State.MarkSent(ctx, row, msg.ID)
 	}
 	if discord.IsCode(err, discord.CodeUnknownChannel) {
-		_ = b.channelError(ctx, row.TaskID, err)
 		_ = b.cfg.State.MarkRetry(ctx, row.ID, time.Now().Add(5*time.Second), err.Error())
-		return err
+		return b.channelError(ctx, row.TaskID, err)
 	}
 	if discord.Permanent(err) {
 		b.logf("discord bridge: dropping %s: %v", row.Key, err)
-		_ = b.cfg.State.MarkFailed(ctx, row.ID, err.Error())
-		return nil
+		return b.cfg.State.MarkFailed(ctx, row.ID, err.Error())
 	}
 	backoff := time.Duration(1<<min(row.Attempts, 6)) * time.Second
 	_ = b.cfg.State.MarkRetry(ctx, row.ID, time.Now().Add(backoff), err.Error())
 	return err
 }
 
+var errNoChannel = errors.New("no channel")
+
 // ---- Discord → hub ----
 
 // handleMessage takes an owner's message in a project channel to the board.
+// It never moves the ingest cursor: only backfill does, reading every
+// message in order, so a gap can never be skipped by a newer live message.
 func (b *Bridge) handleMessage(ctx context.Context, msg discord.Message) {
-	if msg.GuildID != "" && msg.GuildID != b.cfg.GuildID {
-		return
-	}
-	if msg.Author.Bot || msg.WebhookID != "" || (msg.Type != 0 && msg.Type != 19) {
-		return
-	}
-	m, err := b.cfg.State.MappingByChannel(ctx, msg.ChannelID)
-	if err != nil {
-		return
-	}
-	if !b.owners[msg.Author.ID] {
+	m, ok := b.ownerMessage(ctx, msg)
+	if !ok {
 		return
 	}
 	raw, _ := json.Marshal(msg)
-	claimed, err := b.cfg.State.ClaimInbound(ctx, msg.ID, "message", m.TaskID, string(raw))
+	claimed, err := b.cfg.State.ClaimInbound(ctx, msg.ID, "message", m.TaskID, string(raw), time.Now().Add(time.Minute))
 	if err != nil {
 		b.logf("discord bridge: record message %s: %v", msg.ID, err)
 		return
 	}
-	if err := b.cfg.State.SetIngestAfter(ctx, m.TaskID, msg.ID); err != nil {
-		b.logf("discord bridge: ingest cursor: %v", err)
+	if claimed {
+		b.postInbound(ctx, m, msg, 0)
 	}
-	if !claimed {
-		return
+}
+
+// ownerMessage returns the project of an owner's message in a mapped channel
+// of the configured guild; anything else (other guilds, bots, webhooks, the
+// bridge itself, strangers, system messages) is ignored.
+func (b *Bridge) ownerMessage(ctx context.Context, msg discord.Message) (Mapping, bool) {
+	if msg.GuildID != "" && msg.GuildID != b.cfg.GuildID {
+		return Mapping{}, false
 	}
-	b.postInbound(ctx, m, msg, 0)
+	if msg.Author.Bot || msg.WebhookID != "" || (msg.Type != 0 && msg.Type != 19) || !b.owners[msg.Author.ID] {
+		return Mapping{}, false
+	}
+	m, err := b.cfg.State.MappingByChannel(ctx, msg.ChannelID)
+	return m, err == nil
 }
 
 func (b *Bridge) reply(ctx context.Context, msg discord.Message, text string) {
@@ -634,6 +750,59 @@ func (b *Bridge) reply(ctx context.Context, msg discord.Message, text string) {
 	if err != nil {
 		b.logf("discord bridge: reply to %s: %v", msg.ID, err)
 	}
+}
+
+// markerSeq reads the board message number from a bridge message's marker
+// line ("-# #8812 · part 2/3").
+func markerSeq(content string) (int64, bool) {
+	lines := strings.Split(content, "\n")
+	for i := len(lines) - 1; i >= 0; i-- {
+		rest, ok := strings.CutPrefix(lines[i], "-# #")
+		if !ok {
+			continue
+		}
+		num, _, _ := strings.Cut(rest, " ")
+		seq, err := strconv.ParseInt(num, 10, 64)
+		return seq, err == nil && seq > 0
+	}
+	return 0, false
+}
+
+// replyTarget finds the board message (and its agent) a Discord reply
+// points at: from the record of what was sent, or, when that record was
+// lost, from the marker line of the bot's own message. Owners cannot forge
+// a target: only messages the bot itself wrote are read.
+func (b *Bridge) replyTarget(ctx context.Context, m Mapping, msg discord.Message) (seq int64, agent string, err error) {
+	ref := msg.MessageReference
+	if ref == nil || ref.MessageID == "" {
+		return 0, "", nil
+	}
+	mirrored, ok, err := b.cfg.State.MirroredMessage(ctx, ref.MessageID)
+	if err != nil {
+		return 0, "", err
+	}
+	if ok {
+		if mirrored.TaskID != m.TaskID {
+			return 0, "", nil
+		}
+		return mirrored.Seq, mirrored.AgentID, nil
+	}
+	target := msg.ReferencedMessage
+	b.mu.Lock()
+	bot := b.botID
+	b.mu.Unlock()
+	if target == nil || target.Author.ID != bot {
+		return 0, "", nil
+	}
+	seq, ok = markerSeq(target.Content)
+	if !ok {
+		return 0, "", nil
+	}
+	agent, found, err := b.cfg.State.OutboxAgent(ctx, m.TaskID, seq)
+	if err != nil || !found {
+		return 0, "", err // not a board message of this project
+	}
+	return seq, agent, nil
 }
 
 func (b *Bridge) postInbound(ctx context.Context, m Mapping, msg discord.Message, attempts int) {
@@ -650,17 +819,13 @@ func (b *Bridge) postInbound(ctx context.Context, m Mapping, msg discord.Message
 	}
 	req := api.PostMessageRequest{Text: text, RequestID: "discord-msg-" + msg.ID,
 		Source: &api.MessageSource{Kind: api.SourceDiscord, ID: msg.ID, UserID: msg.Author.ID}}
-	if ref := msg.MessageReference; ref != nil && ref.MessageID != "" {
-		mirrored, ok, err := b.cfg.State.MirroredMessage(ctx, ref.MessageID)
-		if err != nil {
-			b.retryInbound(ctx, msg.ID, attempts, err)
-			return
-		}
-		if ok && mirrored.TaskID == m.TaskID {
-			req.ReplyTo = mirrored.Seq
-			req.To = mirrored.AgentID // replying to an agent's message addresses that agent
-		}
+	seq, agent, err := b.replyTarget(ctx, m, msg)
+	if err != nil {
+		b.retryInbound(ctx, msg.ID, attempts, err)
+		return
 	}
+	// Replying to an agent's message addresses that agent.
+	req.ReplyTo, req.To = seq, agent
 	posted, err := b.cfg.Hub.PostMessage(ctx, m.TaskID, req)
 	if err != nil {
 		var h *api.HTTPError
@@ -684,8 +849,12 @@ func (b *Bridge) retryInbound(ctx context.Context, id string, attempts int, err 
 	_ = b.cfg.State.RetryInbound(ctx, id, time.Now().Add(backoff), err.Error())
 }
 
-// inboundRetryLoop re-posts owner messages the hub did not take yet; the
-// request ID makes a repeat that already succeeded return the original.
+// InteractionLifetime is how long Discord accepts replies to an interaction.
+const InteractionLifetime = 15 * time.Minute
+
+// inboundRetryLoop finishes owner messages the hub did not take yet and
+// interactions interrupted by a crash. Every action is idempotent: posts by
+// request ID, reassignments and nudges by the hub's own state checks.
 func (b *Bridge) inboundRetryLoop(ctx context.Context) {
 	ticker := time.NewTicker(2 * time.Second)
 	defer ticker.Stop()
@@ -695,27 +864,44 @@ func (b *Bridge) inboundRetryLoop(ctx context.Context) {
 			return
 		case <-ticker.C:
 		}
-		pending, err := b.cfg.State.PendingInbound(ctx, time.Now().UTC())
+		b.retryInbound1(ctx)
+	}
+}
+
+func (b *Bridge) retryInbound1(ctx context.Context) {
+	pending, err := b.cfg.State.PendingInbound(ctx, time.Now().UTC())
+	if err != nil {
+		b.logf("discord bridge: pending inbound: %v", err)
+		return
+	}
+	for _, in := range pending {
+		m, err := b.cfg.State.Mapping(ctx, in.TaskID)
 		if err != nil {
-			b.logf("discord bridge: pending inbound: %v", err)
 			continue
 		}
-		for _, in := range pending {
+		switch in.Kind {
+		case "message":
 			var msg discord.Message
 			if json.Unmarshal([]byte(in.Payload), &msg) != nil {
 				_ = b.cfg.State.FinishInbound(ctx, in.SourceID, "rejected: unreadable")
 				continue
 			}
-			m, err := b.cfg.State.Mapping(ctx, in.TaskID)
-			if err != nil {
+			b.postInbound(ctx, m, msg, in.Attempts+1)
+		case "interaction":
+			var it discord.Interaction
+			if json.Unmarshal([]byte(in.Payload), &it) != nil || time.Since(in.CreatedAt) > InteractionLifetime-time.Minute {
+				_ = b.cfg.State.FinishInbound(ctx, in.SourceID, "expired before it could be finished")
 				continue
 			}
-			b.postInbound(ctx, m, msg, in.Attempts+1)
+			_ = b.cfg.State.RetryInbound(ctx, in.SourceID, time.Now().Add(3*time.Minute), "resuming")
+			b.runInteraction(ctx, m, it, true)
 		}
 	}
 }
 
-// backfill ingests owner messages sent while the Gateway was disconnected.
+// backfill ingests owner messages the Gateway did not deliver: it reads each
+// channel forward from its cursor and advances the cursor past every
+// message, whoever wrote it, so it stays close to the head of the channel.
 func (b *Bridge) backfill(ctx context.Context) {
 	mappings, err := b.cfg.State.Mappings(ctx)
 	if err != nil {
@@ -727,7 +913,7 @@ func (b *Bridge) backfill(ctx context.Context) {
 			continue
 		}
 		after := m.IngestAfter
-		for page := 0; page < 20; page++ {
+		for {
 			msgs, err := b.cfg.Discord.ChannelMessages(ctx, m.ChannelID, after, 100)
 			if err != nil {
 				b.logf("discord bridge: backfill %s: %v", m.TaskID, err)
@@ -740,7 +926,11 @@ func (b *Bridge) backfill(ctx context.Context) {
 				b.handleMessage(ctx, msg)
 				after = msg.ID
 			}
-			if len(msgs) < 100 {
+			if err := b.cfg.State.SetIngestAfter(ctx, m.TaskID, after); err != nil {
+				b.logf("discord bridge: ingest cursor %s: %v", m.TaskID, err)
+				break
+			}
+			if len(msgs) < 100 || ctx.Err() != nil {
 				break
 			}
 		}

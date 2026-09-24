@@ -29,7 +29,8 @@ type Client struct {
 	MaxWait time.Duration
 
 	mu          sync.Mutex
-	blocked     map[string]time.Time // bucket key → blocked until
+	blocked     map[string]time.Time // block key → blocked until
+	buckets     map[string]string    // route template → Discord bucket
 	globalUntil time.Time
 	now         func() time.Time
 	sleep       func(context.Context, time.Duration) error
@@ -76,6 +77,7 @@ func (c *Client) init() {
 	defer c.mu.Unlock()
 	if c.blocked == nil {
 		c.blocked = map[string]time.Time{}
+		c.buckets = map[string]string{}
 	}
 	if c.now == nil {
 		c.now = time.Now
@@ -94,17 +96,47 @@ func (c *Client) init() {
 	}
 }
 
-// bucketKey approximates Discord's buckets: method and route, keeping the
-// major parameter (channel, guild or webhook ID) and folding minor IDs.
-func bucketKey(method, path string) string {
+// route describes a request for rate limiting. Template is the method and
+// path with every ID and token folded; Major is the channel, guild or
+// webhook ID Discord scopes buckets by. Interaction replies (interaction
+// callbacks and the webhook edits that follow them) are exempt from the
+// bot's global limit, and their tokens never become map keys.
+type route struct {
+	Template string
+	Major    string
+	Exempt   bool
+}
+
+func routeOf(method, path string) route {
 	parts := strings.Split(strings.Trim(path, "/"), "/")
+	r := route{Exempt: len(parts) > 0 && (parts[0] == "interactions" || parts[0] == "webhooks")}
 	for i := 1; i < len(parts); i++ {
-		major := parts[i-1] == "channels" || parts[i-1] == "guilds" || parts[i-1] == "webhooks"
-		if !major && isID(parts[i]) {
+		prev := parts[i-1]
+		switch {
+		case (prev == "channels" || prev == "guilds" || prev == "webhooks") && isID(parts[i]):
+			if r.Major == "" {
+				r.Major = parts[i]
+			}
 			parts[i] = "{id}"
+		case isID(parts[i]):
+			parts[i] = "{id}"
+		case i >= 2 && (parts[i-2] == "interactions" || parts[i-2] == "webhooks"):
+			parts[i] = "{token}"
 		}
 	}
-	return method + " " + strings.Join(parts, "/")
+	r.Template = method + " " + strings.Join(parts, "/")
+	return r
+}
+
+// redactPath removes interaction tokens, which are credentials, from a path.
+func redactPath(path string) string {
+	parts := strings.Split(strings.SplitN(path, "?", 2)[0], "/")
+	for i := 2; i < len(parts); i++ {
+		if parts[i-2] == "interactions" || parts[i-2] == "webhooks" {
+			parts[i] = "{token}"
+		}
+	}
+	return strings.Join(parts, "/")
 }
 
 func isID(s string) bool {
@@ -119,11 +151,23 @@ func isID(s string) bool {
 	return true
 }
 
-func (c *Client) wait(ctx context.Context, key string, deadline time.Time) error {
+// blockKey is the key a route waits on: Discord's shared bucket when a
+// response has named one, else the route template, scoped by major ID.
+func (c *Client) blockKey(r route) string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if bucket := c.buckets[r.Template]; bucket != "" {
+		return bucket + "|" + r.Major
+	}
+	return r.Template + "|" + r.Major
+}
+
+func (c *Client) wait(ctx context.Context, r route, deadline time.Time) error {
 	for {
+		key := c.blockKey(r)
 		c.mu.Lock()
 		until := c.blocked[key]
-		if c.globalUntil.After(until) {
+		if !r.Exempt && c.globalUntil.After(until) {
 			until = c.globalUntil
 		}
 		now := c.now()
@@ -150,7 +194,7 @@ func (c *Client) do(ctx context.Context, method, path string, body, out any) err
 	if maxWait == 0 {
 		maxWait = 2 * time.Minute
 	}
-	key := bucketKey(method, strings.SplitN(path, "?", 2)[0])
+	r := routeOf(method, strings.SplitN(path, "?", 2)[0])
 	deadline := c.now().Add(maxWait)
 	var payload []byte
 	if body != nil {
@@ -160,12 +204,12 @@ func (c *Client) do(ctx context.Context, method, path string, body, out any) err
 		}
 	}
 	for {
-		if err := c.wait(ctx, key, deadline); err != nil {
+		if err := c.wait(ctx, r, deadline); err != nil {
 			return err
 		}
 		req, err := http.NewRequestWithContext(ctx, method, base+path, bytes.NewReader(payload))
 		if err != nil {
-			return err
+			return fmt.Errorf("discord %s %s: bad request", method, redactPath(path))
 		}
 		req.Header.Set("Authorization", "Bot "+c.Token)
 		req.Header.Set("User-Agent", "DiscordBot (https://github.com/scs32/tailterm, 1)")
@@ -178,14 +222,19 @@ func (c *Client) do(ctx context.Context, method, path string, body, out any) err
 		}
 		res, err := httpClient.Do(req)
 		if err != nil {
-			return err
+			// A *url.Error carries the full URL, and interaction URLs hold tokens.
+			var urlErr *url.Error
+			if errors.As(err, &urlErr) {
+				err = urlErr.Err
+			}
+			return fmt.Errorf("discord %s %s: %w", method, redactPath(path), err)
 		}
 		data, readErr := io.ReadAll(io.LimitReader(res.Body, 8<<20))
 		res.Body.Close()
 		if readErr != nil {
-			return readErr
+			return fmt.Errorf("discord %s %s: %w", method, redactPath(path), readErr)
 		}
-		c.record(key, res)
+		c.record(r, res)
 		if res.StatusCode == http.StatusTooManyRequests {
 			var limit struct {
 				RetryAfter float64 `json:"retry_after"`
@@ -196,8 +245,9 @@ func (c *Client) do(ctx context.Context, method, path string, body, out any) err
 				limit.RetryAfter = 1
 			}
 			until := c.now().Add(time.Duration(limit.RetryAfter*float64(time.Second)) + 50*time.Millisecond)
+			key := c.blockKey(r)
 			c.mu.Lock()
-			if limit.Global || res.Header.Get("X-RateLimit-Global") == "true" {
+			if (limit.Global || res.Header.Get("X-RateLimit-Global") == "true") && !r.Exempt {
 				c.globalUntil = until
 			} else {
 				c.blocked[key] = until
@@ -223,8 +273,14 @@ func (c *Client) do(ctx context.Context, method, path string, body, out any) err
 	}
 }
 
-// record blocks a bucket that reports no remaining requests until it resets.
-func (c *Client) record(key string, res *http.Response) {
+// record learns a route's shared bucket and blocks the bucket while it
+// reports no remaining requests.
+func (c *Client) record(r route, res *http.Response) {
+	if bucket := res.Header.Get("X-RateLimit-Bucket"); bucket != "" {
+		c.mu.Lock()
+		c.buckets[r.Template] = bucket
+		c.mu.Unlock()
+	}
 	remaining := res.Header.Get("X-RateLimit-Remaining")
 	resetAfter := res.Header.Get("X-RateLimit-Reset-After")
 	if remaining != "0" || resetAfter == "" {
@@ -234,8 +290,16 @@ func (c *Client) record(key string, res *http.Response) {
 	if err != nil || seconds <= 0 {
 		return
 	}
+	key := c.blockKey(r)
 	c.mu.Lock()
-	c.blocked[key] = c.now().Add(time.Duration(seconds * float64(time.Second)))
+	now := c.now()
+	c.blocked[key] = now.Add(time.Duration(seconds * float64(time.Second)))
+	// Forget buckets that reset long ago so the map stays small.
+	for k, until := range c.blocked {
+		if now.Sub(until) > time.Hour {
+			delete(c.blocked, k)
+		}
+	}
 	c.mu.Unlock()
 }
 

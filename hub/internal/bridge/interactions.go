@@ -2,6 +2,7 @@ package bridge
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -32,41 +33,54 @@ func ephemeral(format string, args ...any) reply {
 func (b *Bridge) handleInteraction(ctx context.Context, in discord.Interaction) {
 	ctx, cancel := context.WithTimeout(ctx, 2*time.Minute)
 	defer cancel()
-	respond := func(r reply) {
-		data := &discord.InteractionResponseData{Content: r.Content, Embeds: r.Embeds, Components: r.Components, AllowedMentions: &discord.AllowedMentions{Parse: []string{}}}
-		if !r.Public {
-			data.Flags = discord.FlagEphemeral
-		}
-		if err := b.cfg.Discord.RespondInteraction(ctx, in.ID, in.Token, discord.InteractionResponse{Type: discord.ResponseMessage, Data: data}); err != nil {
-			b.logf("discord bridge: answer interaction %s: %v", in.ID, err)
-		}
-	}
 	if in.GuildID != b.cfg.GuildID || !b.owners[in.UserID()] {
-		respond(ephemeral("⛔ Only the project owner can use Tailterm controls here."))
+		b.respondNow(ctx, in, ephemeral("⛔ Only the project owner can use Tailterm controls here."))
 		return
 	}
 	m, err := b.cfg.State.MappingByChannel(ctx, in.ChannelID)
 	if err != nil {
-		respond(ephemeral("This channel isn't linked to a Tailterm project."))
+		b.respondNow(ctx, in, ephemeral("This channel isn't linked to a Tailterm project."))
 		return
 	}
-	claimed, err := b.cfg.State.ClaimInbound(ctx, "interaction:"+in.ID, "interaction", m.TaskID, "")
+	// The claim keeps the whole interaction, so a crash before it finishes
+	// is resumed by the retry loop while Discord still accepts the reply.
+	raw, _ := json.Marshal(in)
+	claimed, err := b.cfg.State.ClaimInbound(ctx, "interaction:"+in.ID, "interaction", m.TaskID, string(raw), time.Now().Add(3*time.Minute))
 	if err != nil || !claimed {
-		return // a redelivery of an interaction already answered
+		return // a redelivery of an interaction already taken on
 	}
+	b.runInteraction(ctx, m, in, false)
+}
+
+func (b *Bridge) respondNow(ctx context.Context, in discord.Interaction, r reply) {
+	data := &discord.InteractionResponseData{Content: r.Content, Embeds: r.Embeds, Components: r.Components, AllowedMentions: &discord.AllowedMentions{Parse: []string{}}}
+	if !r.Public {
+		data.Flags = discord.FlagEphemeral
+	}
+	if err := b.cfg.Discord.RespondInteraction(ctx, in.ID, in.Token, discord.InteractionResponse{Type: discord.ResponseMessage, Data: data}); err != nil {
+		b.logf("discord bridge: answer interaction %s: %v", in.ID, err)
+	}
+}
+
+// runInteraction defers, acts and edits the deferred reply. A resumed run
+// tolerates the defer having already happened before the crash.
+func (b *Bridge) runInteraction(ctx context.Context, m Mapping, in discord.Interaction, resumed bool) {
+	source := "interaction:" + in.ID
 	if m.Archived {
-		respond(ephemeral("⛔ This project is closed. Nothing was changed."))
-		_ = b.cfg.State.FinishInbound(ctx, "interaction:"+in.ID, "rejected: project closed")
+		if !resumed {
+			b.respondNow(ctx, in, ephemeral("⛔ This project is closed. Nothing was changed."))
+		}
+		_ = b.cfg.State.FinishInbound(ctx, source, "rejected: project closed")
 		return
 	}
-	public := in.Type == discord.InteractionCommand && in.Data.Name == "say"
 	flags := discord.FlagEphemeral
-	if public {
+	if in.Type == discord.InteractionCommand && in.Data.Name == "say" {
 		flags = 0
 	}
 	// Defer first: hub calls can take longer than Discord's 3-second limit.
-	if err := b.cfg.Discord.RespondInteraction(ctx, in.ID, in.Token, discord.InteractionResponse{Type: discord.ResponseDeferredMessage, Data: &discord.InteractionResponseData{Flags: flags}}); err != nil {
+	if err := b.cfg.Discord.RespondInteraction(ctx, in.ID, in.Token, discord.InteractionResponse{Type: discord.ResponseDeferredMessage, Data: &discord.InteractionResponseData{Flags: flags}}); err != nil && !resumed {
 		b.logf("discord bridge: defer interaction %s: %v", in.ID, err)
+		_ = b.cfg.State.FinishInbound(ctx, source, "not answered: "+err.Error())
 		return
 	}
 	r := b.act(ctx, m.TaskID, in)
@@ -82,7 +96,7 @@ func (b *Bridge) handleInteraction(ctx context.Context, in discord.Interaction) 
 	if err := b.cfg.Discord.EditInteractionResponse(ctx, b.cfg.AppID, in.Token, edit); err != nil {
 		b.logf("discord bridge: reply to interaction %s: %v", in.ID, err)
 	}
-	_ = b.cfg.State.FinishInbound(ctx, "interaction:"+in.ID, truncate(r.Content, 200))
+	_ = b.cfg.State.FinishInbound(ctx, source, truncate(r.Content, 200))
 }
 
 func (b *Bridge) act(ctx context.Context, taskID string, in discord.Interaction) reply {
@@ -197,8 +211,10 @@ func (b *Bridge) obligation(ctx context.Context, taskID, ref string) (api.Obliga
 	case 1:
 		return found[0], nil
 	}
-	return api.Obligation{}, fmt.Errorf("message #%s has %d open obligations; use an obligation ID from /stalled", ref, len(found))
+	return api.Obligation{}, fmt.Errorf("%w: message #%s has %d open obligations; use /stalled and its buttons", errAmbiguous, ref, len(found))
 }
+
+var errAmbiguous = errors.New("ambiguous")
 
 // agentByName matches a full name, or an item-scoped name's base
 // ("builder" for "builder-41b1c632") when that is unambiguous.
@@ -229,8 +245,12 @@ func (b *Bridge) nudgeTarget(ctx context.Context, taskID, target string) reply {
 	if target == "" {
 		return ephemeral("Name an agent, a message number or an obligation ID.")
 	}
-	if o, err := b.obligation(ctx, taskID, target); err == nil {
+	o, err := b.obligation(ctx, taskID, target)
+	if err == nil {
 		return b.nudge(ctx, taskID, o.ID)
+	}
+	if errors.Is(err, errAmbiguous) {
+		return ephemeral("⚠️ %s.", err.Error())
 	}
 	detail, err := b.cfg.Hub.GetTask(ctx, taskID)
 	if err != nil {

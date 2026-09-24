@@ -79,8 +79,10 @@ type Message struct {
 	WebhookID        string            `json:"webhook_id,omitempty"`
 	Type             int               `json:"type"`
 	MessageReference *MessageReference `json:"message_reference,omitempty"`
-	Attachments      []json.RawMessage `json:"attachments,omitempty"`
-	Pinned           bool              `json:"pinned,omitempty"`
+	// ReferencedMessage is the message a reply points at, when it still exists.
+	ReferencedMessage *Message          `json:"referenced_message,omitempty"`
+	Attachments       []json.RawMessage `json:"attachments,omitempty"`
+	Pinned            bool              `json:"pinned,omitempty"`
 }
 
 type EmbedField struct {

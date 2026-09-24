@@ -32,7 +32,20 @@ type Gateway struct {
 
 	sessionID string
 	resumeURL string
+	seqMu     sync.Mutex // seq is read by the heartbeat goroutine
 	seq       int64
+}
+
+func (g *Gateway) getSeq() int64 {
+	g.seqMu.Lock()
+	defer g.seqMu.Unlock()
+	return g.seq
+}
+
+func (g *Gateway) setSeq(n int64) {
+	g.seqMu.Lock()
+	g.seq = n
+	g.seqMu.Unlock()
 }
 
 // ErrFatalClose is a close code that retrying cannot fix (bad token or
@@ -144,7 +157,7 @@ func (g *Gateway) connect(ctx context.Context) error {
 		return fmt.Errorf("bad hello: %s", hello.D)
 	}
 	if g.sessionID != "" {
-		err = send(6, map[string]any{"token": g.Token, "session_id": g.sessionID, "seq": g.seq})
+		err = send(6, map[string]any{"token": g.Token, "session_id": g.sessionID, "seq": g.getSeq()})
 	} else {
 		err = send(2, map[string]any{
 			"token":      g.Token,
@@ -160,9 +173,9 @@ func (g *Gateway) connect(ctx context.Context) error {
 	acked := true
 	heartbeat := func() error {
 		mu.Lock()
-		seq := g.seq
 		acked = false
 		mu.Unlock()
+		seq := g.getSeq()
 		if seq == 0 {
 			return send(1, nil)
 		}
@@ -207,11 +220,9 @@ func (g *Gateway) connect(ctx context.Context) error {
 		}
 		switch f.Op {
 		case 0:
-			mu.Lock()
 			if f.S != nil {
-				g.seq = *f.S
+				g.setSeq(*f.S)
 			}
-			mu.Unlock()
 			if f.T == "READY" {
 				var ready struct {
 					SessionID        string `json:"session_id"`
@@ -234,7 +245,8 @@ func (g *Gateway) connect(ctx context.Context) error {
 			var resumable bool
 			_ = json.Unmarshal(f.D, &resumable)
 			if !resumable {
-				g.sessionID, g.resumeURL, g.seq = "", "", 0
+				g.sessionID, g.resumeURL = "", ""
+				g.setSeq(0)
 			}
 			conn.Close(4000, "invalid session")
 			return errors.New("invalid session")

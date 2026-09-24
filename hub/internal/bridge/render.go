@@ -212,61 +212,87 @@ func truncate(s string, max int) string {
 }
 
 // chunk splits text into parts of at most max runes, preferring line
-// breaks, and keeps code fences balanced: a fence left open at a split is
-// closed there and reopened, with its language, at the start of the next part.
+// breaks, and keeps code fences balanced: a fence open at a split is closed
+// there and reopened at the start of the next part. The reopened fence keeps
+// only a short language tag, so every part has room for new text and the
+// loop always makes progress.
 func chunk(text string, max int) []string {
 	if text == "" {
 		return []string{""}
 	}
+	budget := max - 4 // room for the closing "\n```"
 	var parts []string
 	var cur strings.Builder
-	curLen := 0
-	fence := "" // the opening fence line while inside a code block
+	n := 0      // runes in cur
+	fence := "" // the reopen line while inside a code block
+	header := 0 // runes of cur that are only the reopened fence
 	flush := func() {
-		s := cur.String()
+		body := strings.TrimRight(cur.String(), "\n")
 		if fence != "" {
-			s += "\n```"
+			body += "\n```"
 		}
-		parts = append(parts, strings.TrimRight(s, "\n"))
+		parts = append(parts, body)
 		cur.Reset()
-		curLen = 0
+		n, header = 0, 0
 		if fence != "" {
 			cur.WriteString(fence + "\n")
-			curLen = utf8.RuneCountInString(fence) + 1
+			n = utf8.RuneCountInString(fence) + 1
+			header = n
 		}
 	}
 	for _, line := range strings.SplitAfter(text, "\n") {
-		for utf8.RuneCountInString(line) > max-8 {
-			// A single overlong line: hard-split it by runes.
-			runes := []rune(line)
-			room := max - 8 - curLen
-			if room <= 0 {
-				flush()
+		trimmed := strings.TrimSpace(line)
+		isFence := strings.HasPrefix(trimmed, "```")
+		opens, closes := isFence && fence == "", isFence && fence != ""
+		// An opening fence takes effect once its line is written, so a split
+		// before the line never closes a fence this part did not open.
+		written := false
+		rest := []rune(line)
+		for len(rest) > 0 {
+			room := budget - n
+			if len(rest) <= room {
+				cur.WriteString(string(rest))
+				n += len(rest)
+				written = true
+				break
+			}
+			if n > header && !written {
+				flush() // keep the line whole in the next part if it fits there
 				continue
 			}
-			cur.WriteString(string(runes[:room]))
-			line = string(runes[room:])
-			flush()
-		}
-		n := utf8.RuneCountInString(line)
-		if curLen+n > max-8 && curLen > 0 {
-			flush()
-		}
-		cur.WriteString(line)
-		curLen += n
-		if trimmed := strings.TrimSpace(line); strings.HasPrefix(trimmed, "```") {
-			if fence == "" {
-				fence = trimmed
-			} else {
-				fence = ""
+			if room < 1 {
+				room = 1
 			}
+			if opens && !written {
+				fence = reopenFence(trimmed)
+			}
+			cur.WriteString(string(rest[:room])) // an overlong line: hard split
+			n += room
+			rest = rest[room:]
+			written = true
+			flush()
+		}
+		if opens && fence == "" {
+			fence = reopenFence(trimmed)
+		}
+		if closes {
+			fence = ""
 		}
 	}
-	if cur.Len() > 0 {
-		fence = ""
+	if n > header {
+		fence = "" // an unterminated fence in the original stays unterminated
 		parts = append(parts, strings.TrimRight(cur.String(), "\n"))
 	}
 	return parts
+}
+
+// reopenFence keeps a fence's language tag only when it is short and plain.
+func reopenFence(open string) string {
+	lang := strings.TrimPrefix(open, "```")
+	if lang == "" || len(lang) > 20 || strings.ContainsAny(lang, " \t`") {
+		return "```"
+	}
+	return open
 }
 
 // card is a project's pinned status: roster, open obligations per agent and

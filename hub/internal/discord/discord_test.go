@@ -47,8 +47,9 @@ func TestRESTWaitsOutRateLimits(t *testing.T) {
 		t.Errorf("did not wait for retry_after and the exhausted bucket (%s)", time.Since(start))
 	}
 	c.MaxWait = 10 * time.Millisecond
+	key := c.blockKey(routeOf("POST", "/channels/10/messages"))
 	c.mu.Lock()
-	c.blocked[bucketKey("POST", "/channels/10/messages")] = time.Now().Add(time.Hour)
+	c.blocked[key] = time.Now().Add(time.Hour)
 	c.mu.Unlock()
 	if _, err := c.CreateMessage(context.Background(), "10", MessageSend{}); !errors.Is(err, ErrRateLimited) {
 		t.Fatalf("a long block should give up with ErrRateLimited, got %v", err)
@@ -71,16 +72,77 @@ func TestRESTErrors(t *testing.T) {
 	}
 }
 
-func TestBucketKeys(t *testing.T) {
-	for path, want := range map[string]string{
-		"/channels/1/messages":               "POST channels/1/messages",
-		"/channels/1/messages/99":            "POST channels/1/messages/{id}",
-		"/guilds/5/channels":                 "POST guilds/5/channels",
-		"/webhooks/7/tok/messages/@original": "POST webhooks/7/tok/messages/@original",
+func TestRoutes(t *testing.T) {
+	for path, want := range map[string]route{
+		"/channels/1/messages":                        {Template: "POST channels/{id}/messages", Major: "1"},
+		"/channels/1/messages/99":                     {Template: "POST channels/{id}/messages/{id}", Major: "1"},
+		"/guilds/5/channels":                          {Template: "POST guilds/{id}/channels", Major: "5"},
+		"/interactions/77/secret-token/callback":      {Template: "POST interactions/{id}/{token}/callback", Exempt: true},
+		"/webhooks/7/secret-token/messages/@original": {Template: "POST webhooks/{id}/{token}/messages/@original", Major: "7", Exempt: true},
 	} {
-		if got := bucketKey("POST", path); got != want {
-			t.Errorf("bucketKey(%s) = %s, want %s", path, got, want)
+		if got := routeOf("POST", path); got != want {
+			t.Errorf("routeOf(%s) = %+v, want %+v", path, got, want)
 		}
+	}
+	if got := redactPath("/webhooks/7/secret-token/messages/@original"); strings.Contains(got, "secret") {
+		t.Errorf("redactPath kept the token: %s", got)
+	}
+}
+
+// C12: routes Discord reports as one bucket wait on each other.
+func TestSharedBucketsAreRespected(t *testing.T) {
+	var calls atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		w.Header().Set("X-RateLimit-Bucket", "shared-abc")
+		w.Header().Set("X-RateLimit-Remaining", "0")
+		w.Header().Set("X-RateLimit-Reset-After", "30")
+		_, _ = w.Write([]byte(`{"id":"1"}`))
+	}))
+	defer srv.Close()
+	c := &Client{Token: "t", Base: srv.URL, HTTP: srv.Client(), MaxWait: 50 * time.Millisecond}
+	if _, err := c.CreateMessage(context.Background(), "10", MessageSend{}); err != nil {
+		t.Fatal(err)
+	}
+	// Another route in the same bucket and channel must now wait for the reset.
+	if _, err := c.EditMessage(context.Background(), "10", "5", MessageEdit{}); err != nil {
+		// The edit route has not been seen yet, so it only learns the bucket from its own reply.
+		t.Fatal(err)
+	}
+	if _, err := c.CreateMessage(context.Background(), "10", MessageSend{}); !errors.Is(err, ErrRateLimited) {
+		t.Fatalf("a send in an exhausted shared bucket = %v, want ErrRateLimited", err)
+	}
+	if _, err := c.EditMessage(context.Background(), "10", "6", MessageEdit{}); !errors.Is(err, ErrRateLimited) {
+		t.Fatalf("an edit in the exhausted shared bucket = %v, want ErrRateLimited", err)
+	}
+	// A different channel is a different major parameter.
+	if _, err := c.CreateMessage(context.Background(), "11", MessageSend{}); err != nil {
+		t.Fatalf("another channel was blocked: %v", err)
+	}
+	if calls.Load() != 3 {
+		t.Fatalf("%d requests reached Discord, want 3", calls.Load())
+	}
+}
+
+// C11 and C10: interaction replies ignore the global limit, and transport
+// errors never carry their tokens.
+func TestInteractionRepliesAreExemptAndRedacted(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(204) }))
+	c := &Client{Token: "t", Base: srv.URL, HTTP: srv.Client(), MaxWait: 50 * time.Millisecond}
+	c.init()
+	c.mu.Lock()
+	c.globalUntil = time.Now().Add(time.Hour)
+	c.mu.Unlock()
+	if err := c.RespondInteraction(context.Background(), "77", "secret-token", InteractionResponse{Type: ResponseDeferredMessage}); err != nil {
+		t.Fatalf("an interaction reply waited on the global limit: %v", err)
+	}
+	if _, err := c.CreateMessage(context.Background(), "10", MessageSend{}); !errors.Is(err, ErrRateLimited) {
+		t.Fatalf("an ordinary send ignored the global limit: %v", err)
+	}
+	srv.Close() // now every request fails in transport
+	err := c.EditInteractionResponse(context.Background(), "7", "secret-token", MessageEdit{})
+	if err == nil || strings.Contains(err.Error(), "secret-token") {
+		t.Fatalf("transport error = %v; it must not contain the token", err)
 	}
 }
 

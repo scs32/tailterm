@@ -281,6 +281,15 @@ func (c *Client) ListMessages(ctx context.Context, task string, after int64, to 
 	return out.Messages, c.do(ctx, "GET", "/v1/tasks/"+task+"/messages?"+q.Encode(), nil, &out)
 }
 
+// LatestMessages returns a task's newest messages, newest first.
+func (c *Client) LatestMessages(ctx context.Context, task string, limit int) ([]Message, error) {
+	q := url.Values{}
+	q.Set("latest", "1")
+	q.Set("limit", strconv.Itoa(limit))
+	var out MessageList
+	return out.Messages, c.do(ctx, "GET", "/v1/tasks/"+task+"/messages?"+q.Encode(), nil, &out)
+}
+
 func (c *Client) MarkRead(ctx context.Context, task string, req MarkReadRequest) error {
 	return c.do(ctx, "POST", "/v1/tasks/"+task+"/messages/read", req, nil)
 }

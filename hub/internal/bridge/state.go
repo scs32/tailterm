@@ -25,6 +25,9 @@ CREATE TABLE IF NOT EXISTS channels (
   card_message_id TEXT NOT NULL DEFAULT '',
   card_hash TEXT NOT NULL DEFAULT '',
   card_edited_at TEXT NOT NULL DEFAULT '',
+  card_attempt_at TEXT NOT NULL DEFAULT '',
+  card_pinned INTEGER NOT NULL DEFAULT 0,
+  card_pin_at TEXT NOT NULL DEFAULT '',
   ingest_after TEXT NOT NULL DEFAULT ''
 );
 CREATE UNIQUE INDEX IF NOT EXISTS channels_channel ON channels(channel_id) WHERE channel_id<>'';
@@ -38,6 +41,7 @@ CREATE TABLE IF NOT EXISTS outbox (
   payload TEXT NOT NULL,
   state TEXT NOT NULL DEFAULT 'pending',
   attempts INTEGER NOT NULL DEFAULT 0,
+  first_attempt_at TEXT NOT NULL DEFAULT '',
   next_at TEXT NOT NULL,
   discord_id TEXT NOT NULL DEFAULT '',
   last_error TEXT NOT NULL DEFAULT '',
@@ -60,6 +64,10 @@ CREATE TABLE IF NOT EXISTS inbound (
   attempts INTEGER NOT NULL DEFAULT 0,
   next_at TEXT NOT NULL DEFAULT '',
   created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS kv (
+  key TEXT PRIMARY KEY,
+  value TEXT NOT NULL
 );`
 
 // Outbox and inbound states.
@@ -113,16 +121,19 @@ type Mapping struct {
 	CardMessageID string
 	CardHash      string
 	CardEditedAt  time.Time
+	CardAttemptAt time.Time
+	CardPinned    bool
+	CardPinAt     time.Time
 	IngestAfter   string
 }
 
-const mappingCols = `task_id,channel_id,archived,mirror_after,card_message_id,card_hash,card_edited_at,ingest_after`
+const mappingCols = `task_id,channel_id,archived,mirror_after,card_message_id,card_hash,card_edited_at,card_attempt_at,card_pinned,card_pin_at,ingest_after`
 
 func scanMapping(row interface{ Scan(...any) error }) (Mapping, error) {
 	var m Mapping
-	var edited string
-	err := row.Scan(&m.TaskID, &m.ChannelID, &m.Archived, &m.MirrorAfter, &m.CardMessageID, &m.CardHash, &edited, &m.IngestAfter)
-	m.CardEditedAt = parseTS(edited)
+	var edited, attempted, pinAt string
+	err := row.Scan(&m.TaskID, &m.ChannelID, &m.Archived, &m.MirrorAfter, &m.CardMessageID, &m.CardHash, &edited, &attempted, &m.CardPinned, &pinAt, &m.IngestAfter)
+	m.CardEditedAt, m.CardAttemptAt, m.CardPinAt = parseTS(edited), parseTS(attempted), parseTS(pinAt)
 	return m, err
 }
 
@@ -176,7 +187,7 @@ ON CONFLICT(task_id) DO UPDATE SET channel_id=excluded.channel_id`, taskID, chan
 // ForgetChannel clears a channel Discord no longer has, so the project is
 // provisioned again; the mirror cursor and pending sends are kept.
 func (s *State) ForgetChannel(ctx context.Context, taskID string) error {
-	_, err := s.db.ExecContext(ctx, `UPDATE channels SET channel_id='',card_message_id='',card_hash='' WHERE task_id=?`, taskID)
+	_, err := s.db.ExecContext(ctx, `UPDATE channels SET channel_id='',card_message_id='',card_hash='',card_attempt_at='',card_pinned=0,card_pin_at='' WHERE task_id=?`, taskID)
 	return err
 }
 
@@ -187,6 +198,18 @@ func (s *State) SetArchived(ctx context.Context, taskID string) error {
 
 func (s *State) SetCard(ctx context.Context, taskID, messageID, hash string) error {
 	_, err := s.db.ExecContext(ctx, `UPDATE channels SET card_message_id=?,card_hash=?,card_edited_at=? WHERE task_id=?`, messageID, hash, ts(s.now()), taskID)
+	return err
+}
+
+// SetCardAttempt records, before a card is created, when the attempt began,
+// so a create whose reply was lost is found instead of duplicated.
+func (s *State) SetCardAttempt(ctx context.Context, taskID string) error {
+	_, err := s.db.ExecContext(ctx, `UPDATE channels SET card_attempt_at=? WHERE task_id=? AND card_attempt_at=''`, ts(s.now()), taskID)
+	return err
+}
+
+func (s *State) SetCardPinned(ctx context.Context, taskID string, pinned bool) error {
+	_, err := s.db.ExecContext(ctx, `UPDATE channels SET card_pinned=?,card_pin_at=? WHERE task_id=?`, pinned, ts(s.now()), taskID)
 	return err
 }
 
@@ -211,15 +234,18 @@ type OutboxRow struct {
 	NextAt    time.Time
 	DiscordID string
 	LastError string
+	// FirstAttemptAt is when a send was first tried; any row with an attempt
+	// may already be in Discord and is looked for before it is sent again.
+	FirstAttemptAt time.Time
 }
 
-const outboxCols = `id,key,task_id,seq,agent_id,kind,payload,state,attempts,next_at,discord_id,last_error`
+const outboxCols = `id,key,task_id,seq,agent_id,kind,payload,state,attempts,next_at,discord_id,last_error,first_attempt_at`
 
 func scanOutbox(row interface{ Scan(...any) error }) (OutboxRow, error) {
 	var o OutboxRow
-	var next string
-	err := row.Scan(&o.ID, &o.Key, &o.TaskID, &o.Seq, &o.AgentID, &o.Kind, &o.Payload, &o.State, &o.Attempts, &next, &o.DiscordID, &o.LastError)
-	o.NextAt = parseTS(next)
+	var next, first string
+	err := row.Scan(&o.ID, &o.Key, &o.TaskID, &o.Seq, &o.AgentID, &o.Kind, &o.Payload, &o.State, &o.Attempts, &next, &o.DiscordID, &o.LastError, &first)
+	o.NextAt, o.FirstAttemptAt = parseTS(next), parseTS(first)
 	return o, err
 }
 
@@ -247,9 +273,19 @@ func (s *State) Enqueue(ctx context.Context, taskID string, mirrorAfter int64, r
 	return tx.Commit()
 }
 
-// PendingOutbox lists sends that are due, in creation order.
+// PendingHeads lists each project's oldest pending send. Sends within a
+// project go strictly in order; projects never wait on each other.
+func (s *State) PendingHeads(ctx context.Context) ([]OutboxRow, error) {
+	return s.queryOutbox(ctx, `SELECT `+outboxCols+` FROM outbox WHERE id IN (SELECT MIN(id) FROM outbox WHERE state=? GROUP BY task_id) ORDER BY id`, statePending)
+}
+
+// PendingOutbox lists pending sends in creation order (tests and tools).
 func (s *State) PendingOutbox(ctx context.Context, limit int) ([]OutboxRow, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT `+outboxCols+` FROM outbox WHERE state=? ORDER BY id LIMIT ?`, statePending, limit)
+	return s.queryOutbox(ctx, `SELECT `+outboxCols+` FROM outbox WHERE state=? ORDER BY id LIMIT ?`, statePending, limit)
+}
+
+func (s *State) queryOutbox(ctx context.Context, q string, args ...any) ([]OutboxRow, error) {
+	rows, err := s.db.QueryContext(ctx, q, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -263,6 +299,26 @@ func (s *State) PendingOutbox(ctx context.Context, limit int) ([]OutboxRow, erro
 		out = append(out, o)
 	}
 	return out, rows.Err()
+}
+
+// MarkAttempt durably records a send attempt before the network call, so a
+// crash after Discord accepts it leaves evidence that it may have landed.
+func (s *State) MarkAttempt(ctx context.Context, id int64) (OutboxRow, error) {
+	now := ts(s.now())
+	if _, err := s.db.ExecContext(ctx, `UPDATE outbox SET attempts=attempts+1,first_attempt_at=CASE WHEN first_attempt_at='' THEN ? ELSE first_attempt_at END WHERE id=?`, now, id); err != nil {
+		return OutboxRow{}, err
+	}
+	return scanOutbox(s.db.QueryRowContext(ctx, `SELECT `+outboxCols+` FROM outbox WHERE id=?`, id))
+}
+
+// OutboxAgent is the agent whose board message produced a send.
+func (s *State) OutboxAgent(ctx context.Context, taskID string, seq int64) (string, bool, error) {
+	var agent string
+	err := s.db.QueryRowContext(ctx, `SELECT agent_id FROM outbox WHERE task_id=? AND seq=? ORDER BY id LIMIT 1`, taskID, seq).Scan(&agent)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", false, nil
+	}
+	return agent, err == nil, err
 }
 
 // MarkSent records Discord's acceptance and, for mirrored board messages,
@@ -286,7 +342,7 @@ func (s *State) MarkSent(ctx context.Context, o OutboxRow, discordID string) err
 
 // MarkRetry schedules another attempt; the same nonce and marker are reused.
 func (s *State) MarkRetry(ctx context.Context, id int64, next time.Time, reason string) error {
-	_, err := s.db.ExecContext(ctx, `UPDATE outbox SET attempts=attempts+1,next_at=?,last_error=? WHERE id=?`, ts(next), reason, id)
+	_, err := s.db.ExecContext(ctx, `UPDATE outbox SET next_at=?,last_error=? WHERE id=?`, ts(next), reason, id)
 	return err
 }
 
@@ -313,21 +369,23 @@ func (s *State) MirroredMessage(ctx context.Context, discordID string) (Mirrored
 
 // Inbound is one Discord message or interaction the bridge has taken on.
 type Inbound struct {
-	SourceID string
-	Kind     string
-	TaskID   string
-	State    string
-	Result   string
-	Payload  string
-	Attempts int
+	SourceID  string
+	Kind      string
+	TaskID    string
+	State     string
+	Result    string
+	Payload   string
+	Attempts  int
+	CreatedAt time.Time
 }
 
 // ClaimInbound records a Discord message or interaction the first time it
 // is seen. It returns false for a redelivery, which must do nothing.
-func (s *State) ClaimInbound(ctx context.Context, sourceID, kind, taskID, payload string) (bool, error) {
+// The row is due for recovery at recoverAt, in case this attempt is lost.
+func (s *State) ClaimInbound(ctx context.Context, sourceID, kind, taskID, payload string, recoverAt time.Time) (bool, error) {
 	now := ts(s.now())
 	res, err := s.db.ExecContext(ctx, `INSERT INTO inbound (source_id,kind,task_id,state,payload,next_at,created_at) VALUES (?,?,?,?,?,?,?) ON CONFLICT(source_id) DO NOTHING`,
-		sourceID, kind, taskID, statePending, payload, now, now)
+		sourceID, kind, taskID, statePending, payload, ts(recoverAt), now)
 	if err != nil {
 		return false, err
 	}
@@ -345,9 +403,10 @@ func (s *State) RetryInbound(ctx context.Context, sourceID string, next time.Tim
 	return err
 }
 
-// PendingInbound lists owner messages whose hub post has not succeeded yet.
+// PendingInbound lists owner messages and interactions whose handling has
+// not finished and is due for another try.
 func (s *State) PendingInbound(ctx context.Context, now time.Time) ([]Inbound, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT source_id,kind,task_id,state,result,payload,attempts FROM inbound WHERE state=? AND kind='message' AND next_at<=? ORDER BY created_at`, statePending, ts(now))
+	rows, err := s.db.QueryContext(ctx, `SELECT source_id,kind,task_id,state,result,payload,attempts,created_at FROM inbound WHERE state=? AND next_at<=? ORDER BY created_at`, statePending, ts(now))
 	if err != nil {
 		return nil, err
 	}
@@ -355,10 +414,26 @@ func (s *State) PendingInbound(ctx context.Context, now time.Time) ([]Inbound, e
 	var out []Inbound
 	for rows.Next() {
 		var in Inbound
-		if err := rows.Scan(&in.SourceID, &in.Kind, &in.TaskID, &in.State, &in.Result, &in.Payload, &in.Attempts); err != nil {
+		var created string
+		if err := rows.Scan(&in.SourceID, &in.Kind, &in.TaskID, &in.State, &in.Result, &in.Payload, &in.Attempts, &created); err != nil {
 			return nil, err
 		}
+		in.CreatedAt = parseTS(created)
 		out = append(out, in)
 	}
 	return out, rows.Err()
+}
+
+func (s *State) Get(ctx context.Context, key string) (string, error) {
+	var v string
+	err := s.db.QueryRowContext(ctx, `SELECT value FROM kv WHERE key=?`, key).Scan(&v)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", nil
+	}
+	return v, err
+}
+
+func (s *State) Set(ctx context.Context, key, value string) error {
+	_, err := s.db.ExecContext(ctx, `INSERT INTO kv (key,value) VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value`, key, value)
+	return err
 }

@@ -10,6 +10,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/scs32/tailterm/hub/internal/discord"
 )
@@ -38,6 +39,7 @@ type fakeDiscord struct {
 	loseCreateMessage int // create the message, then answer 500
 	rateLimitMessages int // answer 429 with a short retry_after
 	failMessages      int // answer 500 without creating
+	failPins          int // answer 403 missing permissions
 }
 
 type fakeMessage struct {
@@ -64,16 +66,22 @@ type recordedRequest struct {
 }
 
 func newFakeDiscord(t *testing.T) *fakeDiscord {
-	f := &fakeDiscord{t: t, nextID: 1552750000000000000, channels: map[string]*discord.Channel{}, messages: map[string][]*fakeMessage{}, nonces: map[string]string{}, pins: map[string]bool{}}
+	f := &fakeDiscord{t: t, channels: map[string]*discord.Channel{}, messages: map[string][]*fakeMessage{}, nonces: map[string]string{}, pins: map[string]bool{}}
 	f.botID = f.id()
 	f.srv = httptest.NewServer(http.HandlerFunc(f.serve))
 	t.Cleanup(f.srv.Close)
 	return f
 }
 
+// id issues snowflakes from the real clock, like Discord, so time-based
+// searches (findOwn) see fake messages where real ones would be.
 func (f *fakeDiscord) id() string {
-	f.nextID++
-	return strconv.FormatInt(f.nextID, 10)
+	now, _ := strconv.ParseInt(snowflakeAt(time.Now()), 10, 64)
+	if now <= f.nextID {
+		now = f.nextID + 1
+	}
+	f.nextID = now
+	return strconv.FormatInt(now, 10)
 }
 
 func (f *fakeDiscord) client() *discord.Client {
@@ -137,6 +145,11 @@ func (f *fakeDiscord) serve(w http.ResponseWriter, r *http.Request) {
 	case len(parts) >= 3 && parts[0] == "channels" && parts[2] == "messages":
 		f.serveMessages(w, r, parts, raw, body)
 	case r.Method == "PUT" && len(parts) == 4 && parts[0] == "channels" && parts[2] == "pins":
+		if f.failPins > 0 {
+			f.failPins--
+			writeJSON(w, 403, map[string]any{"code": discord.CodeMissingPermissions, "message": "Missing Permissions"})
+			return
+		}
 		f.pins[parts[3]] = true
 		w.WriteHeader(204)
 	case r.Method == "POST" && len(parts) == 4 && parts[0] == "interactions" && parts[3] == "callback":
@@ -261,6 +274,10 @@ func (f *fakeDiscord) userMessage(channel, author, content string, ref string) d
 	if ref != "" {
 		m.MessageReference = &discord.MessageReference{MessageID: ref}
 		m.Type = 19
+		if target := f.find(channel, ref); target != nil {
+			copied := target.Message
+			m.ReferencedMessage = &copied
+		}
 	}
 	f.messages[channel] = append(f.messages[channel], m)
 	return m.Message
@@ -338,4 +355,19 @@ func (f *fakeDiscord) sentWithoutAllowedMentions() []string {
 		}
 	}
 	return bad
+}
+
+// botSend posts as the bot directly, as if an earlier bridge run had sent it.
+func (f *fakeDiscord) botSend(channel, content string) string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	m := &fakeMessage{Message: discord.Message{ID: f.id(), ChannelID: channel, Author: discord.User{ID: f.botID, Bot: true}, Content: content}}
+	f.messages[channel] = append(f.messages[channel], m)
+	return m.ID
+}
+
+func (f *fakeDiscord) clearNonces() {
+	f.mu.Lock()
+	f.nonces = map[string]string{}
+	f.mu.Unlock()
 }
