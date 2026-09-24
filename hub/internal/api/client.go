@@ -227,6 +227,16 @@ func (c *Client) ListObligations(ctx context.Context, task, agent, run string, o
 	return out.Obligations, c.do(ctx, "GET", "/v1/tasks/"+task+"/obligations?"+q.Encode(), nil, &out)
 }
 
+// ListObligationsFrom lists an agent's obligations (any state) for messages
+// from seq onward, without marking anything delivered.
+func (c *Client) ListObligationsFrom(ctx context.Context, task, agent string, fromSeq int64) ([]Obligation, error) {
+	q := url.Values{}
+	q.Set("agentId", agent)
+	q.Set("fromSeq", strconv.FormatInt(fromSeq, 10))
+	var out ObligationList
+	return out.Obligations, c.do(ctx, "GET", "/v1/tasks/"+task+"/obligations?"+q.Encode(), nil, &out)
+}
+
 // ObligationAction is "ack" or "progress" on the obligation message seq created.
 func (c *Client) ObligationAction(ctx context.Context, task string, seq int64, action string, req ObligationActionRequest) (Obligation, error) {
 	var out Obligation

@@ -98,9 +98,9 @@ func New(st *store.Store, identity Identity) *Server {
 	m.HandleFunc("GET /v1/tasks/{id}/operational-records/{recordId}", s.getOperationalRecord)
 	m.HandleFunc("POST /v1/tasks/{id}/deliveries/{deliveryId}/follow-through/check", retiredWriter)
 	m.HandleFunc("POST /v1/tasks/{id}/deliveries/{deliveryId}/follow-through/report", retiredWriter)
-	m.HandleFunc("POST /v1/tasks/{id}/deliveries/{deliveryId}/recovery-incidents", s.recordDeliveryRecoveryIncident)
-	m.HandleFunc("POST /v1/tasks/{id}/deliveries/{deliveryId}/{operation}", s.deliveryAction)
-	m.HandleFunc("POST /v1/tasks/{id}/deliveries/{deliveryId}/blocks/{blockId}/resolutions", s.resolveDeliveryBlock)
+	m.HandleFunc("POST /v1/tasks/{id}/deliveries/{deliveryId}/recovery-incidents", retiredWriter)
+	m.HandleFunc("POST /v1/tasks/{id}/deliveries/{deliveryId}/{operation}", retiredWriter)
+	m.HandleFunc("POST /v1/tasks/{id}/deliveries/{deliveryId}/blocks/{blockId}/resolutions", retiredWriter)
 	m.HandleFunc("POST /v1/tasks/{id}/events", s.postEvent)
 	m.HandleFunc("GET /v1/tasks/{id}/events", s.taskEvents)
 	m.HandleFunc("GET /v1/tasks/{id}/work-items", s.listTaskWorkItems)
@@ -703,7 +703,7 @@ func (s *Server) listObligations(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	list, err := s.store.ListObligations(r.Context(), id, store.ObligationFilter{AgentID: agent, OpenOnly: q.Get("open") == "1", Overdue: q.Get("overdue") == "1"}, now)
+	list, err := s.store.ListObligations(r.Context(), id, store.ObligationFilter{AgentID: agent, OpenOnly: q.Get("open") == "1", Overdue: q.Get("overdue") == "1", FromSeq: queryInt(r, "fromSeq", 0)}, now)
 	if err != nil {
 		fail(w, err)
 		return

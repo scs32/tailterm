@@ -218,7 +218,7 @@ func (b *Bridge) obligation(ctx context.Context, taskID, ref string) (api.Obliga
 	}
 	switch len(found) {
 	case 0:
-		return api.Obligation{}, fmt.Errorf("no open obligation matches %q", ref)
+		return api.Obligation{}, fmt.Errorf("%w: no open obligation matches %q", errNotOpen, ref)
 	case 1:
 		return found[0], nil
 	}
@@ -226,6 +226,21 @@ func (b *Bridge) obligation(ctx context.Context, taskID, ref string) (api.Obliga
 }
 
 var errAmbiguous = errors.New("ambiguous")
+
+// errNotOpen means the lookup worked and nothing open matched; any other
+// error is a failure to ask, never proof that the work was handled.
+var errNotOpen = errors.New("not open")
+
+// lookupReply turns a failed obligation lookup into the right answer.
+func lookupReply(err error) reply {
+	switch {
+	case errors.Is(err, errAmbiguous):
+		return ephemeral("⚠️ %s.", err.Error())
+	case errors.Is(err, errNotOpen):
+		return ephemeral("✔️ Already handled: that obligation is closed or was moved.")
+	}
+	return ephemeral("⚠️ %s.", hubMessage(err))
+}
 
 // agentByName matches a full name, or an item-scoped name's base
 // ("builder" for "builder-41b1c632") when that is unambiguous.
@@ -294,7 +309,7 @@ func (b *Bridge) nudgeTarget(ctx context.Context, taskID, target, interactionID 
 func (b *Bridge) nudge(ctx context.Context, taskID, obligationID, interactionID string) reply {
 	o, err := b.obligation(ctx, taskID, obligationID)
 	if err != nil {
-		return ephemeral("✔️ Already handled: that obligation is closed or was moved.")
+		return lookupReply(err)
 	}
 	if _, err := b.cfg.Hub.NudgeObligation(ctx, taskID, o.ID, "discord-interaction-"+interactionID); err != nil {
 		var h *api.HTTPError
@@ -309,7 +324,7 @@ func (b *Bridge) nudge(ctx context.Context, taskID, obligationID, interactionID 
 func (b *Bridge) reassignMenu(ctx context.Context, taskID, obligationID string) reply {
 	o, err := b.obligation(ctx, taskID, obligationID)
 	if err != nil {
-		return ephemeral("✔️ Already handled: that obligation is closed or was moved.")
+		return lookupReply(err)
 	}
 	detail, err := b.cfg.Hub.GetTask(ctx, taskID)
 	if err != nil {
@@ -352,7 +367,7 @@ func (b *Bridge) reassignCommand(ctx context.Context, taskID, ref, agentName str
 func (b *Bridge) reassign(ctx context.Context, taskID, obligationID, agentID string) reply {
 	o, err := b.obligation(ctx, taskID, obligationID)
 	if err != nil {
-		return ephemeral("✔️ Already handled: that obligation is closed or was moved.")
+		return lookupReply(err)
 	}
 	m, err := b.cfg.Hub.ReassignObligation(ctx, taskID, o.ID, api.ObligationReassignRequest{ToAgentID: agentID, Reason: "reassigned from Discord"})
 	if err != nil {
@@ -400,7 +415,7 @@ func ownerOutcome(err error) (reply, bool) {
 		return reply{}, false
 	}
 	var h *api.HTTPError
-	if errors.As(err, &h) && h.Status == http.StatusConflict {
+	if errors.As(err, &h) && h.Status == http.StatusConflict && strings.Contains(h.Msg, "already closed") {
 		return ephemeral("✔️ Already handled: %s.", h.Msg), true
 	}
 	return ephemeral("⚠️ %s.", hubMessage(err)), true
@@ -409,10 +424,7 @@ func ownerOutcome(err error) (reply, bool) {
 func (b *Bridge) extend(ctx context.Context, taskID, ref, duration, reason, interactionID string) reply {
 	o, err := b.obligation(ctx, taskID, ref)
 	if err != nil {
-		if errors.Is(err, errAmbiguous) {
-			return ephemeral("⚠️ %s.", err.Error())
-		}
-		return ephemeral("✔️ Already handled: that obligation is closed or was moved.")
+		return lookupReply(err)
 	}
 	d, err := time.ParseDuration(strings.TrimSpace(duration))
 	if err != nil || d < time.Minute || d > 7*24*time.Hour {
@@ -428,10 +440,7 @@ func (b *Bridge) extend(ctx context.Context, taskID, ref, duration, reason, inte
 func (b *Bridge) answer(ctx context.Context, taskID, ref, text, interactionID string) reply {
 	o, err := b.obligation(ctx, taskID, ref)
 	if err != nil {
-		if errors.Is(err, errAmbiguous) {
-			return ephemeral("⚠️ %s.", err.Error())
-		}
-		return ephemeral("✔️ Already handled: that obligation is closed or was moved.")
+		return lookupReply(err)
 	}
 	if strings.TrimSpace(text) == "" {
 		return ephemeral("Say what the answer is.")
@@ -450,10 +459,7 @@ func (b *Bridge) answer(ctx context.Context, taskID, ref, text, interactionID st
 func (b *Bridge) cancel(ctx context.Context, taskID, ref, reason, interactionID string) reply {
 	o, err := b.obligation(ctx, taskID, ref)
 	if err != nil {
-		if errors.Is(err, errAmbiguous) {
-			return ephemeral("⚠️ %s.", err.Error())
-		}
-		return ephemeral("✔️ Already handled: that obligation is closed or was moved.")
+		return lookupReply(err)
 	}
 	if strings.TrimSpace(reason) == "" {
 		return ephemeral("Give a reason; the agent is told why.")
@@ -470,15 +476,9 @@ func (b *Bridge) resume(ctx context.Context, taskID, agentName, interactionID st
 	if err != nil {
 		return ephemeral("⚠️ %s.", hubMessage(err))
 	}
-	var agent api.Agent
-	for _, a := range detail.Agents {
-		if strings.EqualFold(a.Name, agentName) || strings.EqualFold(strings.SplitN(a.Name, "-", 2)[0], agentName) && a.Status == api.AgentRetired {
-			agent = a
-			break
-		}
-	}
-	if agent.ID == "" {
-		return ephemeral("⚠️ No agent is named %q.", agentName)
+	agent, err := agentByName(detail.Agents, agentName)
+	if err != nil {
+		return ephemeral("⚠️ %s.", err.Error())
 	}
 	if _, err := b.cfg.Hub.ResumeRetiredAgent(ctx, taskID, agent.ID, api.AgentResumeRequest{RequestID: "discord-interaction-" + interactionID}); err != nil {
 		r, _ := ownerOutcome(err)

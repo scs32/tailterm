@@ -21,7 +21,7 @@ func TestDeliveryCLIFailsClosedOnOldHub(t *testing.T) {
 	}))
 	defer srv.Close()
 	e := env{hub: srv.URL, task: "tsk_0000000000000001", agent: "agt_0000000000000001", runID: "run_0000000000000001"}
-	err := cmdDelivery(e, []string{"ack", "--request-id", "old-hub-ack", "dly_0000000000000001"})
+	err := cmdDelivery(e, []string{"coverage"})
 	if err == nil || !strings.Contains(err.Error(), "unsupported") || actions != 0 {
 		t.Fatalf("old hub fallback was not fail-closed: err=%v actions=%d", err, actions)
 	}

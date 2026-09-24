@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -81,7 +82,6 @@ func (s *Store) retireLegacyFollowThrough(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	type ref struct{ task, id string }
 	var open []ref
 	for rows.Next() {
 		var r ref
@@ -121,21 +121,56 @@ func (s *Store) retireLegacyFollowThrough(ctx context.Context) error {
 	if err := tx.QueryRowContext(ctx, `SELECT count(*) FROM sqlite_master WHERE type='table' AND name='lead_disposition_obligations'`).Scan(&ldo); err != nil {
 		return err
 	}
-	retiredLDO := int64(0)
+	// Lead-disposition rows: each is listed by ID in the migration record,
+	// and its project is told, even if it had no open delivery.
+	ldoByTask := map[string][]string{}
 	if ldo > 0 {
-		res, err := tx.ExecContext(ctx, `UPDATE lead_disposition_obligations SET state=?,updated_at=? WHERE state NOT IN ('closed','completed',?)`, RetiredPhase3, ts(now), RetiredPhase3)
+		rows, err := tx.QueryContext(ctx, `SELECT id,task_id,item_id FROM lead_disposition_obligations WHERE state NOT IN ('closed','completed',?) ORDER BY id`, RetiredPhase3)
 		if err != nil {
 			return err
 		}
-		retiredLDO, _ = res.RowsAffected()
+		type row struct{ id, task, item string }
+		var pending []row
+		for rows.Next() {
+			var r row
+			var item sql.NullString
+			if err := rows.Scan(&r.id, &r.task, &item); err != nil {
+				rows.Close()
+				return err
+			}
+			r.item = item.String
+			pending = append(pending, r)
+		}
+		rows.Close()
+		for _, r := range pending {
+			if _, err := tx.ExecContext(ctx, `UPDATE lead_disposition_obligations SET state=?,updated_at=? WHERE id=?`, RetiredPhase3, ts(now), r.id); err != nil {
+				return err
+			}
+			ldoByTask[r.task] = append(ldoByTask[r.task], r.id)
+			if r.item != "" {
+				if items[r.task] == nil {
+					items[r.task] = map[string]bool{}
+				}
+				items[r.task][r.item] = true
+			}
+		}
 	}
 	tasks := make([]string, 0, len(items))
 	for t := range items {
 		tasks = append(tasks, t)
 	}
+	for t := range ldoByTask {
+		if items[t] == nil {
+			tasks = append(tasks, t)
+		}
+	}
 	sort.Strings(tasks)
+	detailItems := map[string][]string{}
 	for _, taskID := range tasks {
 		task, err := scanTask(tx.QueryRowContext(ctx, `SELECT `+taskCols+` FROM tasks WHERE id=?`, taskID))
+		if errors.Is(err, sql.ErrNoRows) {
+			continue // a row pointing at a missing project: recorded in detail only
+		}
 		if err != nil {
 			return err
 		}
@@ -144,12 +179,24 @@ func (s *Store) retireLegacyFollowThrough(ctx context.Context) error {
 			ids = append(ids, id)
 		}
 		sort.Strings(ids)
-		text := fmt.Sprintf("Broker phase 3 retired the legacy directive follow-through. Open directives in this project were closed with provenance; each records its recipient's status. Work items they referenced, to re-dispatch when this project resumes: %s.", strings.Join(ids, ", "))
+		detailItems[taskID] = ids
+		// Bounded, so a project with many items can never exceed the envelope
+		// body limit and stop the hub from starting; the full list is kept in
+		// the broker_migrations record.
+		shown := ids
+		more := ""
+		if len(shown) > maxRetiredItemsListed {
+			shown, more = shown[:maxRetiredItemsListed], fmt.Sprintf(" and %d more (the full list is in the hub's broker_migrations record)", len(ids)-maxRetiredItemsListed)
+		}
+		text := fmt.Sprintf("Broker phase 3 retired the legacy directive follow-through in this project: %d open directive(s) and %d pending lead disposition(s) were closed with provenance.", countDeliveries(open, taskID), len(ldoByTask[taskID]))
+		if len(shown) > 0 {
+			text += fmt.Sprintf(" Work items they referenced, to re-dispatch when this project resumes: %s%s.", strings.Join(shown, ", "), more)
+		}
 		if err := s.postBrokerNotice(ctx, tx, task, api.Agent{}, "Legacy directives were retired for this project", "Legacy directives were retired for this project", text, map[string]string{"migration": RetiredPhase3}); err != nil {
 			return err
 		}
 	}
-	detail, _ := json.Marshal(map[string]any{"deliveries": len(open), "leadDispositions": retiredLDO, "projects": tasks})
+	detail, _ := json.Marshal(map[string]any{"deliveries": deliveryIDs(open), "leadDispositions": ldoByTask, "items": detailItems})
 	if _, err := tx.ExecContext(ctx, `INSERT INTO broker_migrations (name,applied_at,detail) VALUES (?,?,?)`, RetiredPhase3, ts(now), string(detail)); err != nil {
 		return err
 	}
@@ -160,6 +207,29 @@ func (s *Store) retireLegacyFollowThrough(ctx context.Context) error {
 		s.notify(t)
 	}
 	return nil
+}
+
+// maxRetiredItemsListed bounds the work items named in one close-out notice.
+const maxRetiredItemsListed = 40
+
+type ref struct{ task, id string }
+
+func countDeliveries(open []ref, taskID string) int {
+	n := 0
+	for _, r := range open {
+		if r.task == taskID {
+			n++
+		}
+	}
+	return n
+}
+
+func deliveryIDs(open []ref) []string {
+	out := make([]string, 0, len(open))
+	for _, r := range open {
+		out = append(out, r.id)
+	}
+	return out
 }
 
 // ---- Role recipients ----
@@ -217,7 +287,7 @@ func (s *Store) handOffRoleObligations(ctx context.Context, tx *sql.Tx, task api
 	}
 	rows.Close()
 	for _, o := range open {
-		if _, err := s.reissueObligation(ctx, tx, task, o, newLead, "lead change", "role:lead moved to "+newLead.Name); err != nil {
+		if _, err := s.reissueObligation(ctx, tx, task, o, newLead, "lead change", "role:lead moved to "+newLead.Name, true); err != nil {
 			return err
 		}
 	}
@@ -229,7 +299,8 @@ func leadAgent(ctx context.Context, tx *sql.Tx, taskID, name string) (api.Agent,
 	if name == "" {
 		return api.Agent{}, nil
 	}
-	a, err := scanAgent(tx.QueryRowContext(ctx, `SELECT `+agentCols+` FROM agents WHERE task_id=? AND name=? COLLATE NOCASE AND status<>? ORDER BY created_at DESC LIMIT 1`, taskID, name, api.AgentClosed))
+	// Same rule as resolveRole: an exited or closed agent never holds the role.
+	a, err := scanAgent(tx.QueryRowContext(ctx, `SELECT `+agentCols+` FROM agents WHERE task_id=? AND name=? COLLATE NOCASE AND status NOT IN (?,?) ORDER BY created_at DESC LIMIT 1`, taskID, name, api.AgentClosed, api.AgentExited))
 	if errors.Is(err, sql.ErrNoRows) {
 		return api.Agent{}, nil
 	}
@@ -331,7 +402,9 @@ func (s *Store) ExtendObligation(ctx context.Context, taskID, obligationID strin
 		if o.AckedAt == nil {
 			ackDue = until
 		}
-		if _, err := tx.ExecContext(ctx, `UPDATE obligations SET due_at=?,ack_due_at=?,escalation=0,escalated_at='',nudges=0,nudged_at='',changed_at=? WHERE id=?`, ts(until), ts(ackDue), ts(now), o.ID); err != nil {
+		// last_progress_at restarts the silence timer too, so an extension is
+		// never followed by an immediate "no progress" nudge.
+		if _, err := tx.ExecContext(ctx, `UPDATE obligations SET due_at=?,ack_due_at=?,escalation=0,escalated_at='',nudges=0,nudged_at='',last_progress_at=CASE WHEN acked_at<>'' THEN ? ELSE last_progress_at END,changed_at=? WHERE id=?`, ts(until), ts(ackDue), ts(now), ts(now), o.ID); err != nil {
 			return api.OwnerActionResult{}, err
 		}
 		text := fmt.Sprintf("The owner extended message #%d (%s) until %s.", o.MessageSeq, o.Subject, until.UTC().Format("Jan 2 15:04 UTC"))
@@ -362,7 +435,7 @@ func (s *Store) AnswerObligation(ctx context.Context, taskID, obligationID strin
 		if o.Needs != api.ObligationNeedsAnswer && o.SourceKind != api.EnvelopeKindBlock {
 			return api.OwnerActionResult{}, fmt.Errorf("%w: only a question or a block can be answered; cancel or reassign this one", api.ErrConflict)
 		}
-		source, err := loadMessage(tx, ctx, taskID, o.MessageSeq)
+		source, err := originalMessage(ctx, tx, taskID, o.MessageSeq)
 		if err != nil {
 			return api.OwnerActionResult{}, err
 		}
@@ -372,7 +445,10 @@ func (s *Store) AnswerObligation(ctx context.Context, taskID, obligationID strin
 		}
 		env := &api.Envelope{Kind: api.EnvelopeKindAnswer, Subject: subject, Body: api.EnvelopeBody{Answer: text},
 			Refs: map[string]string{"obligation": o.ID, "answeredFor": o.AgentID}}
-		reply := api.PostMessageRequest{Envelope: env, ReplyTo: o.MessageSeq}
+		// The answer keeps the question's item links, so an item-bound asker
+		// sees it in its inbox (as decision answers do).
+		reply := api.PostMessageRequest{Envelope: env, ReplyTo: o.MessageSeq, RequestID: "owner-answer-" + o.ID,
+			WorkItems: source.WorkItems, WorkOrderMessage: source.WorkOrderMessage}
 		var asker api.Agent
 		if source.From.AgentID != "" {
 			if a, err := scanAgent(tx.QueryRowContext(ctx, `SELECT `+agentCols+` FROM agents WHERE id=?`, source.From.AgentID)); err == nil && a.Status != api.AgentClosed {
@@ -384,7 +460,7 @@ func (s *Store) AnswerObligation(ctx context.Context, taskID, obligationID strin
 			return api.OwnerActionResult{}, err
 		}
 		// An answer obliges nobody; it wakes the asker like any directed reply.
-		m, err := s.insertMessageWithResume(ctx, tx, task, reply, asker, by, false, false, false)
+		m, err := s.insertMessageWithResume(ctx, tx, task, reply, asker, by, false, true, false)
 		if err != nil {
 			return api.OwnerActionResult{}, err
 		}
@@ -418,7 +494,11 @@ func (s *Store) CancelObligation(ctx context.Context, taskID, obligationID strin
 			recipient = api.Agent{} // tell the board instead
 		}
 		text := fmt.Sprintf("The owner cancelled message #%d (%s). Stop work on it. Reason: %s", o.MessageSeq, o.Subject, reason)
-		if err := s.postBrokerNotice(ctx, tx, task, recipient, "The owner cancelled an obligation", "The owner cancelled an obligation", text, map[string]string{"obligation": o.ID, "message": fmt.Sprint(o.MessageSeq)}); err != nil {
+		source, err := loadMessage(tx, ctx, taskID, o.MessageSeq)
+		if err != nil {
+			return api.OwnerActionResult{}, err
+		}
+		if err := s.postLinkedBrokerNotice(ctx, tx, task, recipient, "The owner cancelled an obligation", text, map[string]string{"obligation": o.ID, "message": fmt.Sprint(o.MessageSeq)}, source, "owner-cancel-"+o.ID); err != nil {
 			return api.OwnerActionResult{}, err
 		}
 		o, err = scanObligation(tx.QueryRowContext(ctx, `SELECT `+obligationCols+` FROM obligations WHERE id=?`, o.ID))
@@ -439,7 +519,7 @@ func (s *Store) ResumeAgent(ctx context.Context, taskID, agentID string, req api
 		if a.Status != api.AgentRetired {
 			return api.OwnerActionResult{}, fmt.Errorf("%w: only a retired agent can be resumed; %s is %s", api.ErrConflict, a.Name, a.Status)
 		}
-		if _, err := tx.ExecContext(ctx, `UPDATE agents SET status=?,last_event_at=? WHERE id=? AND status=?`, api.AgentDone, ts(now), a.ID, api.AgentRetired); err != nil {
+		if _, err := tx.ExecContext(ctx, `UPDATE agents SET status=?,last_event_at=?,blocked_reason='',blocked_text='' WHERE id=? AND status=?`, api.AgentDone, ts(now), a.ID, api.AgentRetired); err != nil {
 			return api.OwnerActionResult{}, err
 		}
 		if _, err := s.insertEvent(ctx, tx, taskID, api.EventResumed, a.ID, "", nil, by); err != nil {
@@ -472,4 +552,41 @@ func (s *Store) PostSystemTextForTest(ctx context.Context, taskID, to, text stri
 		return err
 	}
 	return tx.Commit()
+}
+
+// originalMessage follows refs.reassignedFrom back to the message someone
+// actually wrote, so an answer reaches the original asker even after the
+// obligation was reissued by a reassignment or a lead hand-off.
+func originalMessage(ctx context.Context, tx *sql.Tx, taskID string, seq int64) (api.Message, error) {
+	m, err := loadMessage(tx, ctx, taskID, seq)
+	for hops := 0; err == nil && hops < 16 && m.From.AgentID == "" && m.Envelope != nil; hops++ {
+		prev, parseErr := strconv.ParseInt(m.Envelope.Refs["reassignedFrom"], 10, 64)
+		if parseErr != nil || prev <= 0 || prev == m.Seq {
+			break
+		}
+		var older api.Message
+		if older, err = loadMessage(tx, ctx, taskID, prev); err != nil {
+			return m, err
+		}
+		m = older
+	}
+	return m, err
+}
+
+// postLinkedBrokerNotice is postBrokerNotice keeping a source message's
+// item links, so an item-bound recipient's inbox shows it.
+func (s *Store) postLinkedBrokerNotice(ctx context.Context, tx *sql.Tx, task api.Task, to api.Agent, subject, text string, refs map[string]string, source api.Message, requestID string) error {
+	env := &api.Envelope{Kind: api.EnvelopeKindNotice, Subject: subject, Refs: refs, Body: api.EnvelopeBody{Text: text}}
+	if to.ID != "" {
+		env.To = to.Name
+	}
+	req := api.PostMessageRequest{Envelope: env, To: to.ID, WorkItems: source.WorkItems, WorkOrderMessage: source.WorkOrderMessage}
+	if len(source.WorkItems) > 0 {
+		req.RequestID = requestID
+	}
+	m, err := s.insertMessageWithResume(ctx, tx, task, req, to, BrokerCaller, false, true, false)
+	if err != nil {
+		return err
+	}
+	return s.createObligations(ctx, tx, m, req, false)
 }

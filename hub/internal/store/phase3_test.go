@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"errors"
+	"fmt"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -19,10 +20,10 @@ func TestRetireLegacyFollowThrough(t *testing.T) {
 	f := newDeliveryFixture(t)
 	ctx := context.Background()
 	open := f.directive(t, "Assignment that never finished", "retire-open", api.DeliveryAssignment, 0, "")
-	if _, err := f.s.db.Exec(`CREATE TABLE IF NOT EXISTS lead_disposition_obligations (id TEXT PRIMARY KEY, task_id TEXT NOT NULL, state TEXT NOT NULL, updated_at TEXT NOT NULL)`); err != nil {
+	if _, err := f.s.db.Exec(`CREATE TABLE IF NOT EXISTS lead_disposition_obligations (id TEXT PRIMARY KEY, task_id TEXT NOT NULL, state TEXT NOT NULL, item_id TEXT NOT NULL DEFAULT '', updated_at TEXT NOT NULL)`); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := f.s.db.Exec(`INSERT INTO lead_disposition_obligations VALUES ('ldo_1',?,'pending','')`, f.task.ID); err != nil {
+	if _, err := f.s.db.Exec(`INSERT INTO lead_disposition_obligations (id,task_id,state,updated_at) VALUES ('ldo_1',?,'pending','')`, f.task.ID); err != nil {
 		t.Fatal(err)
 	}
 	// Pretend this database predates phase 3.
@@ -287,5 +288,209 @@ func TestOwnerActions(t *testing.T) {
 	resumed, err := f.s.ResumeAgent(f.ctx, f.task.ID, f.builder.ID, api.AgentResumeRequest{RequestID: "res-1"}, f.by)
 	if err != nil || resumed.Agent.Status != api.AgentDone {
 		t.Fatalf("resume = %+v %v", resumed, err)
+	}
+}
+
+// Round one b2: the Queue-stall notice gets a delivery-only obligation, so
+// the broker wakes the lead.
+func TestQueueStallNoticeWakesTheLead(t *testing.T) {
+	f := newPhase3Fixture(t)
+	notice, state, err := f.s.ScheduleMonitorDelivery(f.ctx, f.task.ID, f.lead, "waiting:que_1111111111111111:1:1:", "GO! test stall", time.Now().UTC(), time.Minute, time.Hour)
+	if err != nil || state != "notified" {
+		t.Fatalf("delivery = %+v %s %v", notice, state, err)
+	}
+	o := f.obligationFor(t, notice.MessageSeq)
+	if o.AgentID != f.lead.ID || o.Needs != api.ObligationNeedsDelivery {
+		t.Fatalf("stall notice obligation = %+v", o)
+	}
+	var jobs int
+	_ = f.s.db.QueryRow(`SELECT count(*) FROM wake_jobs WHERE obligation_id=?`, o.ID).Scan(&jobs)
+	if jobs != 1 {
+		t.Fatalf("%d wake jobs for the stall notice, want 1", jobs)
+	}
+}
+
+// Round one b3: extending restarts the silence timer.
+func TestExtendRestartsSilence(t *testing.T) {
+	f := newPhase3Fixture(t)
+	start := time.Now().UTC()
+	f.s.now = func() time.Time { return start }
+	ask := request(f.lead, "builder", "Run the smoke suite please")
+	ask.To = f.builder.ID
+	m, err := f.post(t, ask)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.s.ObligationAction(f.ctx, f.task.ID, m.Seq, "ack", api.ObligationActionRequest{AgentID: f.builder.ID, RunID: f.builder.RunID}, start); err != nil {
+		t.Fatal(err)
+	}
+	later := start.Add(2 * time.Hour)
+	f.s.now = func() time.Time { return later }
+	o := f.obligationFor(t, m.Seq)
+	if ObligationOverdue(o, later) == "" {
+		t.Fatal("the fixture should be overdue before the extension")
+	}
+	out, err := f.s.ExtendObligation(f.ctx, f.task.ID, o.ID, api.ObligationExtendRequest{For: "30m", RequestID: "ext-silence"}, f.by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := ObligationOverdue(*out.Obligation, later.Add(time.Minute)); got != "" {
+		t.Fatalf("a minute after extending, the obligation is overdue (%s)", got)
+	}
+}
+
+// Round one b4: role work is never handed to an exited agent.
+func TestNoHandOffToAnExitedLead(t *testing.T) {
+	f := newPhase3Fixture(t)
+	m, err := f.post(t, request(f.builder, "role:lead", "Review the fixture plan please"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	exited := api.AgentExited
+	if _, err := f.s.UpdateAgent(f.ctx, f.lead2.ID, api.UpdateAgentRequest{Status: &exited}, f.by); err != nil {
+		t.Fatal(err)
+	}
+	name := "lead-2"
+	if _, err := f.s.UpdateTask(f.ctx, f.task.ID, api.UpdateTaskRequest{Orchestrator: &name}, f.by); err != nil {
+		t.Fatal(err)
+	}
+	if o := f.obligationFor(t, m.Seq); o.State == api.ObligationClosed || o.AgentID != f.lead.ID {
+		t.Fatalf("role work moved to an exited agent: %+v", o)
+	}
+}
+
+// Round one f3: the lead's typed answer settles a BLOCK sent to it.
+func TestLeadAnswerSettlesABlock(t *testing.T) {
+	f := newPhase3Fixture(t)
+	block, err := f.post(t, api.PostMessageRequest{AgentID: f.builder.ID, RunID: f.builder.RunID, To: f.lead.ID, Envelope: &api.Envelope{Kind: api.EnvelopeKindBlock, To: "lead-1", Subject: "Blocked on the fixture choice",
+		Body: api.EnvelopeBody{Reason: "two fixtures", Needs: "a choice", ResumeWhen: "the lead picks one"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.post(t, api.PostMessageRequest{AgentID: f.lead.ID, RunID: f.lead.RunID, To: f.builder.ID, ReplyTo: block.Seq, Envelope: &api.Envelope{Kind: api.EnvelopeKindAnswer, To: "builder", Subject: "Use the static fixture for now",
+		Body: api.EnvelopeBody{Answer: "static"}}}); err != nil {
+		t.Fatal(err)
+	}
+	if o := f.obligationFor(t, block.Seq); o.State != api.ObligationClosed || o.Outcome != api.OutcomeAnswered {
+		t.Fatalf("the lead's answer did not settle the block: %+v", o)
+	}
+}
+
+// Round one F1, F10: many referenced items never block startup, and a
+// project with only lead-disposition rows is told too.
+func TestRetireCloseOutIsBoundedAndCoversLeadDispositions(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "hub.sqlite")
+	s, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	by := api.Caller{Node: "workspace", User: "owner"}
+	task, _ := s.CreateTask(ctx, api.CreateTaskRequest{Name: "Only dispositions"}, by)
+	if _, err := s.db.Exec(`CREATE TABLE lead_disposition_obligations (id TEXT PRIMARY KEY, task_id TEXT NOT NULL, state TEXT NOT NULL, item_id TEXT NOT NULL DEFAULT '', updated_at TEXT NOT NULL)`); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 45; i++ {
+		if _, err := s.db.Exec(`INSERT INTO lead_disposition_obligations VALUES (?,?,'pending',?,'')`, fmt.Sprintf("ldo_%02d", i), task.ID, fmt.Sprintf("wi_%016x", i)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := s.db.Exec(`DELETE FROM broker_migrations`); err != nil {
+		t.Fatal(err)
+	}
+	s.Close()
+	if s, err = Open(path); err != nil {
+		t.Fatalf("the close-out stopped the hub from starting: %v", err)
+	}
+	defer s.Close()
+	msgs, _ := s.ListMessages(ctx, task.ID, 0, "", 0)
+	var notice string
+	for _, m := range msgs {
+		if m.Envelope != nil && m.Envelope.Refs["migration"] == RetiredPhase3 {
+			notice = m.Text
+		}
+	}
+	if !strings.Contains(notice, "45 pending lead disposition") || !strings.Contains(notice, "and 5 more") {
+		t.Fatalf("notice = %q", notice)
+	}
+	var detail string
+	_ = s.db.QueryRow(`SELECT detail FROM broker_migrations WHERE name=?`, RetiredPhase3).Scan(&detail)
+	if !strings.Contains(detail, "ldo_44") || !strings.Contains(detail, fmt.Sprintf("wi_%016x", 44)) {
+		t.Fatalf("the migration record does not list every row and item: %s", detail)
+	}
+}
+
+// Round one F2: the owner's answer reaches an item-bound asker's inbox.
+func TestOwnerAnswerReachesAnItemBoundAsker(t *testing.T) {
+	f := newDeliveryFixture(t)
+	ctx := context.Background()
+	orderRef := &api.MessageReference{TaskID: f.task.ID, Seq: f.order.Seq}
+	q, err := f.s.PostMessage(ctx, f.task.ID, api.PostMessageRequest{AgentID: f.worker.ID, RunID: f.worker.RunID, To: f.lead.ID, RequestID: "bound-question",
+		WorkItems:        []api.MessageWorkItem{{ItemTaskID: f.item.TaskID, ItemID: f.item.ID, ItemRevision: f.item.Revision, Relationship: "primary"}},
+		WorkOrderMessage: orderRef,
+		Envelope:         &api.Envelope{Kind: api.EnvelopeKindQuestion, To: "lead", Subject: "Which fixture should the test use", Body: api.EnvelopeBody{Question: "Static or live?"}}}, f.by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	all, _ := f.s.ListObligations(ctx, f.task.ID, ObligationFilter{AgentID: f.lead.ID, OpenOnly: true}, f.s.now())
+	var oid string
+	for _, o := range all {
+		if o.MessageSeq == q.Seq {
+			oid = o.ID
+		}
+	}
+	out, err := f.s.AnswerObligation(ctx, f.task.ID, oid, api.ObligationAnswerRequest{Text: "Static.", RequestID: "answer-bound"}, f.by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	inbox, err := f.s.ListMessages(ctx, f.task.ID, 0, f.worker.ID, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, m := range inbox {
+		if m.Seq == out.Message.Seq {
+			return
+		}
+	}
+	t.Fatal("the item-bound asker cannot see the owner's answer")
+}
+
+// Round one F4: after a lead hand-off, the answer still reaches the asker.
+func TestOwnerAnswerAfterHandOffReachesTheAsker(t *testing.T) {
+	f := newPhase3Fixture(t)
+	q, err := f.post(t, api.PostMessageRequest{AgentID: f.builder.ID, RunID: f.builder.RunID, Envelope: &api.Envelope{Kind: api.EnvelopeKindQuestion, To: "role:lead", Subject: "Which fixture should the test use", Body: api.EnvelopeBody{Question: "Static or live?"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	name := "lead-2"
+	if _, err := f.s.UpdateTask(f.ctx, f.task.ID, api.UpdateTaskRequest{Orchestrator: &name}, f.by); err != nil {
+		t.Fatal(err)
+	}
+	open, _ := f.s.ListObligations(f.ctx, f.task.ID, ObligationFilter{AgentID: f.lead2.ID, OpenOnly: true}, time.Now())
+	if len(open) != 1 {
+		t.Fatalf("the new lead holds %d obligations", len(open))
+	}
+	out, err := f.s.AnswerObligation(f.ctx, f.task.ID, open[0].ID, api.ObligationAnswerRequest{Text: "Static.", RequestID: "answer-handoff"}, f.by)
+	if err != nil || out.Message.To != f.builder.ID || out.Message.ReplyTo != open[0].MessageSeq {
+		t.Fatalf("answer after hand-off = %+v %v (question was #%d)", out.Message, err, q.Seq)
+	}
+}
+
+// Round one F8: obligations can be listed from a message number onward.
+func TestListObligationsFromSeq(t *testing.T) {
+	f := newPhase3Fixture(t)
+	var seqs []int64
+	for i := 0; i < 3; i++ {
+		ask := request(f.lead, "builder", "Run the smoke suite please")
+		ask.To = f.builder.ID
+		m, err := f.post(t, ask)
+		if err != nil {
+			t.Fatal(err)
+		}
+		seqs = append(seqs, m.Seq)
+	}
+	got, err := f.s.ListObligations(f.ctx, f.task.ID, ObligationFilter{AgentID: f.builder.ID, FromSeq: seqs[1]}, time.Now())
+	if err != nil || len(got) != 2 || got[0].MessageSeq != seqs[1] {
+		t.Fatalf("from #%d: %+v %v", seqs[1], got, err)
 	}
 }

@@ -21,6 +21,9 @@ func TestPhase3Routes(t *testing.T) {
 		base + "/deliveries/dly_0000000000000000/follow-through/report",
 		base + "/operational-records",
 		base + "/operational-records/opr_0000000000000000/commit",
+		base + "/deliveries/dly_0000000000000000/ack",
+		base + "/deliveries/dly_0000000000000000/recovery-incidents",
+		base + "/deliveries/dly_0000000000000000/blocks/blk_0000000000000000/resolutions",
 	} {
 		var e api.ErrorResponse
 		if code, _ := h.do(ownerToken, "POST", path, map[string]any{}, &e); code != http.StatusGone || e.Code != "retired" {
@@ -29,8 +32,9 @@ func TestPhase3Routes(t *testing.T) {
 	}
 	var caps api.Capabilities
 	h.do(ownerToken, "GET", "/v1/capabilities", nil, &caps)
-	if caps.ReliableDelivery.Supported || caps.OperationalRecords.Supported {
-		t.Errorf("capabilities still advertise retired writers: %+v %+v", caps.ReliableDelivery, caps.OperationalRecords)
+	// Reads stay advertised (old and new tt keep reading); writes are retired.
+	if !caps.ReliableDelivery.Supported || !caps.ReliableDelivery.WritesRetired || !caps.OperationalRecords.Supported || !caps.OperationalRecords.WritesRetired {
+		t.Errorf("capabilities = %+v %+v, want reads supported and writes retired", caps.ReliableDelivery, caps.OperationalRecords)
 	}
 	var out api.OwnerActionResult
 	if code, _ := h.do(bridgeToken, "POST", base+"/obligations/"+o.ID+"/extend", api.ObligationExtendRequest{For: "30m", RequestID: "discord-interaction-1"}, &out); code != http.StatusCreated || out.Obligation == nil {

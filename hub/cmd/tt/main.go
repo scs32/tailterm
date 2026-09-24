@@ -55,7 +55,7 @@ Commands
   owner extend|answer|cancel OBLIGATION_ID ...  the owner's controls over an obligation
   operational-record get       read a legacy operational record (writes retired in phase 3)
   current-assignment [--item ID --action-key KEY] [--json]  read a legacy directive
-  delivery <command>           legacy directives: reads and closing actions (create retired)
+  delivery coverage [--json]   read legacy directive coverage (writes retired in phase 3)
   spawn --name N --run CMD [--cwd D] [--prompt P] [--runtime R] [--task ID]
         [--expected-lifecycle-generation N] [--resume-receipt-id ID]
                                start a sibling agent session on this host

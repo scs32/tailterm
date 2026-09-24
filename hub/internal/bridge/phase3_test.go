@@ -74,3 +74,26 @@ func TestSystemSendersRenderByName(t *testing.T) {
 		t.Fatalf("sender = %q", got)
 	}
 }
+
+// Round one F9, F11: an ambiguous /resume is refused, and a hub outage is
+// never reported as "already handled".
+func TestResumeAmbiguityAndOutages(t *testing.T) {
+	h := newHarness(t)
+	other := h.agent("builder-99999999")
+	retired := api.AgentRetired
+	for _, a := range []api.Agent{h.builder, other} {
+		if _, err := h.st.UpdateAgent(h.ctx, a.ID, api.UpdateAgentRequest{Status: &retired}, owner); err != nil {
+			t.Fatal(err)
+		}
+	}
+	got := editContent(h.interact(discord.Interaction{ID: "950000000000000001", Type: discord.InteractionCommand, Data: discord.InteractionData{Name: "resume", Options: []discord.InteractionOption{stringOption("agent", "builder")}}}))
+	if !strings.Contains(got, "matches 2 agents") {
+		t.Fatalf("/resume with two builders = %q", got)
+	}
+	h.hubDown.Store(true)
+	got = editContent(h.interact(discord.Interaction{ID: "950000000000000002", Type: discord.InteractionCommand, Data: discord.InteractionData{Name: "cancel", Options: []discord.InteractionOption{stringOption("obligation", "1"), stringOption("reason", "x")}}}))
+	h.hubDown.Store(false)
+	if strings.Contains(got, "Already handled") {
+		t.Fatalf("a hub outage was reported as handled: %q", got)
+	}
+}

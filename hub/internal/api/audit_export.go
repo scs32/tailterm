@@ -25,6 +25,9 @@ type Capabilities struct {
 	OperationalRecords struct {
 		Supported bool  `json:"supported"`
 		Versions  []int `json:"versions"`
+		// WritesRetired: broker phase 3 retired proposing and committing;
+		// records stay readable.
+		WritesRetired bool `json:"writesRetired,omitempty"`
 	} `json:"operationalRecords"`
 	SchemaVersion int `json:"schemaVersion"`
 	MessageAudit  struct {
@@ -53,6 +56,9 @@ type Capabilities struct {
 	ReliableDelivery struct {
 		Supported bool  `json:"supported"`
 		Versions  []int `json:"versions"`
+		// WritesRetired: broker phase 3 retired every directive write;
+		// current-assignment, coverage and history stay readable.
+		WritesRetired bool `json:"writesRetired,omitempty"`
 	} `json:"reliableDelivery"`
 }
 
@@ -84,10 +90,14 @@ func CurrentCapabilities() Capabilities {
 	out.Queue.MaxPageBytes = MaxQueuePageBytes
 	out.AllocationIntent.Supported = true
 	out.AllocationIntent.Versions = []int{AllocationIntentCapabilityVersion}
-	// Broker phase 3 retired the legacy directive writers and operational
-	// records; their history stays readable, but no client should use them.
-	out.OperationalRecords.Supported = false
-	out.ReliableDelivery.Supported = false
+	// Broker phase 3 retired the legacy directive and operational-record
+	// writers; the versions stay advertised so their reads keep working.
+	out.OperationalRecords.Supported = true
+	out.OperationalRecords.Versions = []int{OperationalRecordsCapabilityVersion}
+	out.OperationalRecords.WritesRetired = true
+	out.ReliableDelivery.Supported = true
+	out.ReliableDelivery.Versions = []int{ReliableDeliveryCapabilityVersion, ReliableFollowThroughCapabilityVersion, ReliableMandatoryActionCapabilityVersion}
+	out.ReliableDelivery.WritesRetired = true
 	return out
 }
 

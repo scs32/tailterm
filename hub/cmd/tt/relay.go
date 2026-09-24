@@ -215,7 +215,13 @@ func obligedSeqs(ctx context.Context, c *api.Client, b runtimeBinding, msgs []ap
 	if !candidates {
 		return nil, nil
 	}
-	list, err := c.ListObligations(ctx, b.Task, b.Agent, "", false, false)
+	// Only obligations for this page's messages: bounded, however long the
+	// agent's history grows.
+	from := msgs[0].Seq
+	for _, m := range msgs {
+		from = min(from, m.Seq)
+	}
+	list, err := c.ListObligationsFrom(ctx, b.Task, b.Agent, from)
 	if err != nil {
 		return nil, err
 	}
@@ -261,6 +267,11 @@ func relayWakeJob(ctx context.Context, b runtimeBinding, p *relayProgress, c *ap
 	}
 	if err != nil {
 		return false, err
+	}
+	// Bind the progress record to this run first, so relayOne never mistakes
+	// it for another run's and resets BrokerWakes (which would double-wake).
+	if p.Run != b.Run || p.Thread != b.Thread {
+		*p = relayProgress{Run: b.Run, Thread: b.Thread, NextBrokerCheck: p.NextBrokerCheck, LastBrokerWake: p.LastBrokerWake}
 	}
 	p.BrokerWakes = true
 	if job == nil {

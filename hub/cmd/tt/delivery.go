@@ -76,8 +76,8 @@ func cmdDelivery(e env, args []string) error {
 		return errors.New("usage: tt delivery create|coverage|incident|ack|progress|block|resolve|resume|result")
 	}
 	sub := args[0]
-	if sub == "create" {
-		return errRetiredWriter
+	if sub != "coverage" {
+		return errRetiredWriter // broker phase 3: only the coverage read remains
 	}
 	fs := flag.NewFlagSet("delivery "+sub, flag.ContinueOnError)
 	task := fs.String("task", e.task, "project id")

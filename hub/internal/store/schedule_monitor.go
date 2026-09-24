@@ -252,6 +252,11 @@ func (s *Store) ScheduleMonitorDelivery(ctx context.Context, taskID string, lead
 		if postErr == nil {
 			postErr = insertMessagePostReceipt(ctx, tx, &message, req.RequestID, requestHash(req), by)
 		}
+		if postErr == nil {
+			// A delivery-only obligation, so the broker's wake job reaches the
+			// lead (the relay leaves typed notices to the broker).
+			postErr = s.createObligations(ctx, tx, message, req, false)
+		}
 		if postErr != nil {
 			if _, err = tx.ExecContext(ctx, `ROLLBACK TO monitor_message`); err != nil {
 				return notice, "unknown", err

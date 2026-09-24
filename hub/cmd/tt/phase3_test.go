@@ -25,6 +25,7 @@ func TestRetiredWritersRefuseLocally(t *testing.T) {
 	e := env{hub: srv.URL, task: "tsk_0000000000000001"}
 	for name, run := range map[string]func() error{
 		"delivery create":            func() error { return cmdDelivery(e, []string{"create", "--file", "x.json"}) },
+		"delivery ack":               func() error { return cmdDelivery(e, []string{"ack", "dly_0000000000000000"}) },
 		"operational-record propose": func() error { return cmdOperationalRecord(e, []string{"propose", "--file", "x.json"}) },
 		"operational-record commit":  func() error { return cmdOperationalRecord(e, []string{"commit", "opr_0000000000000000"}) },
 	} {
@@ -80,5 +81,74 @@ func TestRelayWakesDirectedOwnerMessagesOnce(t *testing.T) {
 	}
 	if !inbox() {
 		t.Fatal("a directed owner notice without an obligation no longer wakes the agent")
+	}
+}
+
+// b1 (round one): the legacy reads still reach a phase-3 hub.
+func TestLegacyReadsStillWork(t *testing.T) {
+	st, err := store.Open(filepath.Join(t.TempDir(), "hub.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { st.Close() })
+	by := api.Caller{Node: "workspace", User: "owner"}
+	ctx := context.Background()
+	task, _ := st.CreateTask(ctx, api.CreateTaskRequest{Name: "P", Orchestrator: "lead"}, by)
+	worker, _ := st.AddAgent(ctx, task.ID, api.AddAgentRequest{Name: "worker", Host: "h", Session: "worker", Runtime: "codex"}, by)
+	hub := server.New(st, func(*http.Request) (api.Caller, error) { return by, nil })
+	reached := map[string]bool{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		reached[r.URL.Path] = true
+		hub.ServeHTTP(w, r)
+	}))
+	t.Cleanup(srv.Close)
+	e := env{hub: srv.URL, task: task.ID, agent: worker.ID, runID: worker.RunID}
+	_ = cmdCurrentAssignment(e, nil)
+	_ = cmdDelivery(e, []string{"coverage"})
+	_ = cmdOperationalRecord(env{hub: srv.URL, task: task.ID}, []string{"get", "opr_0000000000000000"})
+	for _, path := range []string{
+		"/v1/tasks/" + task.ID + "/agents/" + worker.ID + "/current-assignment",
+		"/v1/tasks/" + task.ID + "/agents/" + worker.ID + "/delivery-coverage",
+		"/v1/tasks/" + task.ID + "/operational-records/opr_0000000000000000",
+	} {
+		if !reached[path] {
+			t.Errorf("the read never reached the hub: %s (reached %v)", path, reached)
+		}
+	}
+}
+
+// Round one F7: a fresh binding's first broker wake does not let the inbox
+// path wake the same message again.
+func TestFreshBindingDoesNotDoubleWake(t *testing.T) {
+	st, err := store.Open(filepath.Join(t.TempDir(), "hub.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { st.Close() })
+	by := api.Caller{Node: "workspace", User: "owner"}
+	ctx := context.Background()
+	task, _ := st.CreateTask(ctx, api.CreateTaskRequest{Name: "P", Orchestrator: "lead"}, by)
+	worker, _ := st.AddAgent(ctx, task.ID, api.AddAgentRequest{Name: "worker", Host: "h", Session: "worker", Runtime: "codex"}, by)
+	srv := httptest.NewServer(server.New(st, func(*http.Request) (api.Caller, error) { return by, nil }))
+	t.Cleanup(srv.Close)
+	c, _ := api.NewClient(srv.URL, 0)
+	if _, err := st.PostEvent(ctx, task.ID, api.PostEventRequest{Kind: api.EventHeartbeat, AgentID: worker.ID, RunID: worker.RunID}, by); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.PostMessage(ctx, task.ID, api.PostMessageRequest{To: worker.ID, Text: "owner: please rebase"}, by); err != nil {
+		t.Fatal(err)
+	}
+	b := runtimeBinding{Hub: srv.URL, Task: task.ID, Agent: worker.ID, Run: worker.RunID, Thread: "00000000-0000-0000-0000-000000000000", Codex: "/bin/codex"}
+	p := &relayProgress{} // a brand-new progress record, as after install
+	wakes := 0
+	queue := func(context.Context, runtimeBinding, string) error { wakes++; return nil }
+	if _, err := relayWakeJob(ctx, b, p, c, time.Now(), queue); err != nil {
+		t.Fatal(err)
+	}
+	if err := relayOne(ctx, b, p, c, time.Now(), queue); err != nil {
+		t.Fatal(err)
+	}
+	if wakes != 1 {
+		t.Fatalf("%d wakes for one owner message, want 1", wakes)
 	}
 }

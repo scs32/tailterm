@@ -136,7 +136,7 @@ func (s *Store) createObligations(ctx context.Context, tx *sql.Tx, m api.Message
 	// Broker phase 3: a BLOCK that is not a reply obliges only the project
 	// lead (who can unblock); sent to anyone else it is news, not work. This
 	// stops "wait for X" BLOCKs to workers from escalating to the owner.
-	if req.Envelope != nil && req.Envelope.Kind == api.EnvelopeKindBlock && req.ReplyTo == 0 {
+	if req.Envelope != nil && req.Envelope.Kind == api.EnvelopeKindBlock && req.ReplyTo == 0 && req.Envelope.Refs["reassignedFrom"] == "" {
 		var orchestrator, recipient string
 		if err := tx.QueryRowContext(ctx, `SELECT t.orchestrator,COALESCE(a.name,'') FROM tasks t LEFT JOIN agents a ON a.id=? WHERE t.id=?`, req.To, m.TaskID).Scan(&orchestrator, &recipient); err != nil {
 			return err
@@ -196,7 +196,7 @@ func (s *Store) applyReplyOutcome(ctx context.Context, tx *sql.Tx, m api.Message
 	fits := map[string]string{
 		api.EnvelopeKindResult:  `needs='ack_outcome'`,
 		api.EnvelopeKindDecline: `needs IN ('ack_outcome','answer')`,
-		api.EnvelopeKindAnswer:  `(needs='answer' OR source_kind='human')`,
+		api.EnvelopeKindAnswer:  `(needs='answer' OR source_kind IN ('human','block'))`,
 		api.EnvelopeKindBlock:   `needs IN ('ack_outcome','answer')`,
 	}[req.Envelope.Kind]
 	if fits == "" {
@@ -281,6 +281,7 @@ type ObligationFilter struct {
 	AgentID  string
 	OpenOnly bool
 	Overdue  bool
+	FromSeq  int64 // only obligations for messages from this seq onward
 }
 
 func (s *Store) ListObligations(ctx context.Context, taskID string, f ObligationFilter, now time.Time) ([]api.Obligation, error) {
@@ -293,6 +294,10 @@ func (s *Store) ListObligations(ctx context.Context, taskID string, f Obligation
 	if f.OpenOnly || f.Overdue {
 		q += ` AND state<>?`
 		args = append(args, api.ObligationClosed)
+	}
+	if f.FromSeq > 0 {
+		q += ` AND message_seq>=?`
+		args = append(args, f.FromSeq)
 	}
 	rows, err := s.db.QueryContext(ctx, q+` ORDER BY message_seq`, args...)
 	if err != nil {
@@ -491,7 +496,7 @@ func (s *Store) ReassignObligation(ctx context.Context, taskID, obligationID str
 	if err != nil || target.Status == api.AgentClosed {
 		return api.Message{}, api.ErrInvalid
 	}
-	m, err := s.reissueObligation(ctx, tx, task, old, target, actor, req.Reason)
+	m, err := s.reissueObligation(ctx, tx, task, old, target, actor, req.Reason, false)
 	if err != nil {
 		return m, err
 	}
@@ -505,7 +510,9 @@ func (s *Store) ReassignObligation(ctx context.Context, taskID, obligationID str
 // reissueObligation supersedes an open obligation and re-sends its message to
 // target in the caller's transaction, keeping how it was addressed (a role
 // obligation stays a role obligation).
-func (s *Store) reissueObligation(ctx context.Context, tx *sql.Tx, task api.Task, old api.Obligation, target api.Agent, actor, why string) (api.Message, error) {
+// keepRole is true only for a lead hand-off: work reassigned to someone who
+// does not hold the role is no longer role work.
+func (s *Store) reissueObligation(ctx context.Context, tx *sql.Tx, task api.Task, old api.Obligation, target api.Agent, actor, why string, keepRole bool) (api.Message, error) {
 	original, err := loadMessage(tx, ctx, task.ID, old.MessageSeq)
 	if err != nil {
 		return api.Message{}, err
@@ -529,7 +536,9 @@ func (s *Store) reissueObligation(ctx context.Context, tx *sql.Tx, task api.Task
 	if err := s.createObligations(ctx, tx, m, reissue, false); err != nil {
 		return m, err
 	}
-	_, err = tx.ExecContext(ctx, `UPDATE obligations SET via_role=(SELECT via_role FROM obligations WHERE id=?) WHERE message_seq=? AND agent_id=?`, old.ID, m.Seq, target.ID)
+	if keepRole {
+		_, err = tx.ExecContext(ctx, `UPDATE obligations SET via_role=(SELECT via_role FROM obligations WHERE id=?) WHERE message_seq=? AND agent_id=?`, old.ID, m.Seq, target.ID)
+	}
 	return m, err
 }
 

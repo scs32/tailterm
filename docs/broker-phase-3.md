@@ -53,7 +53,9 @@ In scope:
    follow-through check and report routes return `410 Gone`, with a message that names
    `tt send` and obligations. `tt delivery create` says the same without calling the hub.
    Reads stay available: current-assignment, coverage, and delivery history in audit exports.
-   Capabilities stop advertising reliable delivery v2 and v3.
+   Capabilities keep advertising the versions, so old and new `tt` keep reading, and add
+   `writesRetired: true`. Every remaining delivery write (ack, progress, block, resume,
+   result, incident, resolve) also answers 410, since no delivery is left open.
 2. **Close out the stale deliveries.** A one-time, idempotent migration closes every
    `current=1` delivery that is not in `result`. It records its own terminal state with a
    delivery event naming the phase-3 retirement and the recipient's status. It also closes the
@@ -158,7 +160,7 @@ Out of scope:
 | c10 | The bridge's `/extend`, `/answer`, `/cancel` and `/resume`, and its Extend 30m button, work through hub calls with request IDs. They pass the same owner, guild and channel checks, and stale-state checks, as the phase-2b commands. The bridge token reaches exactly the added routes. |
 | c11 | A schedule-monitor Queue-stall notice is a typed `notice` with `refs.queue`. The bridge names `system/*` senders by name, never "owner", and the existing monitor tests pass. |
 | c12 | A BLOCK sent (not as a reply) to a worker notifies it without an ack obligation. A BLOCK to the project lead or to the owner obliges as before, and a BLOCK reply still pauses the obligation it replies to. |
-| c13 | Nothing in the hub, `tt`, the client or the templates tells an agent to use `tt delivery` or `tt current-assignment`. Capabilities no longer advertise reliable delivery v2 and v3. |
+| c13 | Nothing in the hub, `tt`, the client or the templates tells an agent to use `tt delivery` or `tt current-assignment`. Capabilities mark reliable delivery and operational records `writesRetired`. |
 | c14 | Migrations are additive apart from the close-out rows, and the phase-2b hub (`d6d5155`) still starts on the migrated database (rollback). |
 | c15 | `go vet ./...`, `go test ./...` and `npm test` pass, apart from known pre-existing failures. The legacy tests are either removed together with the code they cover, or kept where they cover read paths that remain. |
 | c16 | Live check on production: a disposable project exercises `role:lead`, owner extend, answer and cancel from Discord, and a BLOCK-as-wait that does not escalate. The project is then closed. |
