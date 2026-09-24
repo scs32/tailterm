@@ -298,10 +298,11 @@ Kept as they are: work items, Queue (scheduling and claims), operational records
    notify only (UI + Discord), while the directive core stays authoritative.
    Discord bridge v1 (mirror, status card, escalations, `/status`, `/stalled`,
    `/nudge`, `/say`) ships here. That lets the owner unstall immediately.
-3. **Cutover.** Directive/delivery endpoints become compatibility shims over
-   obligations, and in-flight directives migrate one-to-one with their epochs and
-   receipts. The relay becomes a wake adapter. Obligation-aware stop hook.
-   The remaining unstall commands follow.
+3. **Cutover** ([work order](broker-phase-3.md)). Revised September 24, 2026: nothing
+   creates deliveries automatically and no live directive remains, so the legacy writers are
+   retired (410) rather than shimmed, and the stale rows are closed with provenance. The relay
+   becomes a wake adapter only. Role recipients resolve. The remaining unstall commands follow.
+   (The obligation-aware stop hook shipped in phase 2a.)
 4. **Enforce.** The hub rejects free-text agent posts. The Jev post gate moves from
    log-only to reject. Legacy endpoints and the schedule monitor are removed after
    one release with no shim traffic.
