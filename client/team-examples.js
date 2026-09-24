@@ -24,10 +24,10 @@ const member = (name, role, model, prompt, options = {}) => ({
     "\n\nYOUR ROLE\n" +
     prompt,
 });
-// Board message format for teams written against docs/message-broker.md
-// (phase 1: the format is a convention before the hub validates it).
+// Board message format for teams written against docs/message-broker.md.
+// Phase 1: tt send validates typed posts; free text is still accepted.
 const messageFormat = `BOARD MESSAGE FORMAT
-Start every post with KIND: subject. KIND is ASSIGN, REQUEST, REVIEW, QUESTION, RESULT, ANSWER, BLOCK, DECLINE, FINDING or NOTICE. The subject is plain English, at most 120 characters, with no IDs, hashes or paths. Then one field per line. Refs: item, order, message numbers, commits and paths; IDs go only here. ASSIGN, REQUEST and REVIEW add Objective, Owns, Acceptance (a1: …; a2: …) and Due. RESULT adds Status per criterion (a1 pass, a2 fail) and Evidence (e1: command → outcome; e2: commit). QUESTION asks exactly one question. BLOCK adds Reason, Needs and Resume-when. Keep posts under about 2 KB; put longer material in a file and cite its path in Refs. Never split content across posts. Do not post acknowledgements: answer an ASSIGN, REQUEST or REVIEW with its RESULT, a BLOCK, a DECLINE with a reason, or one QUESTION.`;
+Post with tt send, which checks the message before it reaches the board. Example: tt send --kind result --to lead --subject "Tests pass for the empty recipient check" --outcome done --status a1=pass --evidence "e1: go test ./cmd/tt -> ok" --ref commit=abc1234. Run tt send --help for every field. KIND is assign, request, review, question, result, answer, block, decline, finding or notice. The subject is plain English, at most 120 characters, with no IDs, hashes or paths; IDs go only in --ref. assign needs --objective, --owns and --acceptance a1=…; review needs --candidate, --scope and --acceptance; result needs --outcome, --status per criterion and --evidence; question asks exactly one --question; block needs --reason, --needs and --resume-when. Keep messages under about 2 KB; put longer material in a file and cite its path with --ref or --attachment. Never split content across posts. Do not post acknowledgements: answer an assign, request or review with its result, a block, a decline with a reason, or one question. If this host's tt has no send command, post the same fields as text with tt post: first line KIND: subject, then one Field: value line each.`;
 // Planned delivery targets a Claude Opus 5.5 (medium) lead. Until the lead can
 // be woken automatically (docs/message-broker.md) it ships with Astra; swap it
 // in Agents when ready. GPT-6 Sol and Luna require codex-cli 0.156.1 or later.

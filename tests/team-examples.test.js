@@ -76,6 +76,14 @@ test("example orchestrators route implementation to builders without erasing wor
   );
 });
 
+test("Planned delivery members post typed messages with tt send", () => {
+  for (const member of exampleTeam("planned").members) {
+    assert.match(member.prompt, /Post with tt send/);
+    assert.match(member.prompt, /has no send command, post the same fields as text/);
+    assert.ok(Buffer.byteLength(member.prompt) < 8192);
+  }
+});
+
 test("documented team prompts exactly include every generated template", () => {
   const documentation = readFileSync(
     new URL("../docs/team-examples.md", import.meta.url),
