@@ -207,6 +207,14 @@ func (c *Client) PostMessage(ctx context.Context, task string, req PostMessageRe
 	return out, c.do(ctx, "POST", "/v1/tasks/"+task+"/messages", req, &out)
 }
 
+func (c *Client) ListMessageChecks(ctx context.Context, task string, after int64, limit int) ([]MessageCheck, error) {
+	q := url.Values{}
+	q.Set("after", strconv.FormatInt(after, 10))
+	q.Set("limit", strconv.Itoa(limit))
+	var out MessageCheckList
+	return out.Checks, c.do(ctx, "GET", "/v1/tasks/"+task+"/message-checks?"+q.Encode(), nil, &out)
+}
+
 func (c *Client) ListMessages(ctx context.Context, task string, after int64, to string, limit int) ([]Message, error) {
 	q := url.Values{}
 	q.Set("after", strconv.FormatInt(after, 10))

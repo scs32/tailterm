@@ -59,6 +59,7 @@ func New(st *store.Store, identity Identity) *Server {
 	m.HandleFunc("POST /v1/tasks/{id}/agents/{aid}/cleanup", s.agentCleanup)
 	m.HandleFunc("POST /v1/tasks/{id}/messages", s.postMessage)
 	m.HandleFunc("GET /v1/tasks/{id}/messages", s.listMessages)
+	m.HandleFunc("GET /v1/tasks/{id}/message-checks", s.listMessageChecks)
 	m.HandleFunc("GET /v1/tasks/{id}/messages/receipts/{requestID}", s.getMessagePostReceipt)
 	m.HandleFunc("GET /v1/tasks/{id}/message-audit/messages/{seq}", s.getMessageAudit)
 	m.HandleFunc("GET /v1/tasks/{id}/message-audit/messages/{seq}/history", s.listMessageAuditHistory)
@@ -650,6 +651,27 @@ func queryInt(r *http.Request, key string, fallback int64) int64 {
 		}
 	}
 	return fallback
+}
+
+// listMessageChecks pages broker phase-1 shadow checks (docs/broker-phase-1.md).
+func (s *Server) listMessageChecks(w http.ResponseWriter, r *http.Request) {
+	if _, ok := s.caller(w, r); !ok {
+		return
+	}
+	id, ok := taskID(w, r)
+	if !ok {
+		return
+	}
+	if _, err := s.store.GetTask(r.Context(), id); err != nil {
+		fail(w, err)
+		return
+	}
+	checks, err := s.store.ListMessageChecks(r.Context(), id, queryInt(r, "after", 0), int(queryInt(r, "limit", 500)))
+	if err != nil {
+		fail(w, err)
+		return
+	}
+	writeJSON(w, 200, api.MessageCheckList{Checks: checks})
 }
 
 func (s *Server) listMessages(w http.ResponseWriter, r *http.Request) {

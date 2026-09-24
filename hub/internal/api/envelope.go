@@ -448,6 +448,9 @@ func parseNamed(parts []string) map[string]string {
 	return out
 }
 
+// ParseEvidence reads "e1: value -> outcome; e2 (commit): abc1234" entries.
+func ParseEvidence(value string) map[string]Evidence { return parseEvidence(value) }
+
 func parseEvidence(value string) map[string]Evidence {
 	out := map[string]Evidence{}
 	for _, part := range splitSemicolons(value) {

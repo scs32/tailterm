@@ -45,6 +45,8 @@ Commands
   capabilities [--json]       show supported audit contracts and policy mode
   audit-export <command>       create/download an immutable project audit export
   ask --request-id KEY --file PATH [--json]  request an owner decision on the Board
+  send --kind K --subject S [fields] | --file F   post a typed board message
+  message-checks [--since 24h] [--summary] [--json]  typed-message adoption and Jev scores
   inbox [--unread] [--mark-read] [--wait 9m] [--json]
   context [--json]             print this exact run's bound work-item context
   operational-record propose|commit|get  validated operational records
@@ -120,8 +122,21 @@ func (e env) requireTask() (string, error) {
 
 func die(err error) {
 	fmt.Fprintln(os.Stderr, "tt:", err)
+	var coded *exitError
+	if errors.As(err, &coded) {
+		os.Exit(coded.code)
+	}
 	os.Exit(1)
 }
+
+// exitError carries a specific process exit code, such as 2 for invalid input.
+type exitError struct {
+	code int
+	err  error
+}
+
+func (e *exitError) Error() string { return e.err.Error() }
+func (e *exitError) Unwrap() error { return e.err }
 
 func main() {
 	// SSH exec and tmux often start without the interactive shell's PATH.
@@ -172,6 +187,10 @@ func main() {
 		err = cmdAsk(e, args)
 	case "inbox":
 		err = cmdInbox(e, args)
+	case "send":
+		err = cmdSend(e, args)
+	case "message-checks":
+		err = cmdMessageChecks(e, args)
 	case "context":
 		err = cmdContext(e, args)
 	case "operational-record":
