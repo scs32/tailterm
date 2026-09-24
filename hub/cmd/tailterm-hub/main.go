@@ -32,6 +32,7 @@ import (
 	"tailscale.com/tsnet"
 
 	"github.com/scs32/tailterm/hub/internal/api"
+	"github.com/scs32/tailterm/hub/internal/broker"
 	"github.com/scs32/tailterm/hub/internal/jev"
 	"github.com/scs32/tailterm/hub/internal/monitor"
 	"github.com/scs32/tailterm/hub/internal/server"
@@ -103,6 +104,11 @@ func main() {
 	})
 
 	defer func() { stop(); <-monitorDone }()
+
+	// Broker phase 2a: re-wake, nudge and escalate open obligations.
+	obligationBroker := &broker.Broker{Store: st, Interval: 30 * time.Second, Log: log.Printf}
+	brokerDone := obligationBroker.Start(ctx)
+	defer func() { stop(); <-brokerDone }()
 
 	// Jev scoring is log-only and optional: without a key file, agent posts
 	// are recorded as jev disabled and nothing leaves the hub.

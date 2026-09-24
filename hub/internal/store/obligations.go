@@ -139,7 +139,8 @@ func (s *Store) createObligations(ctx context.Context, tx *sql.Tx, m api.Message
 		}
 	}
 	id := newObligationID("obl")
-	if _, err := tx.ExecContext(ctx, `INSERT INTO obligations (id,task_id,message_seq,agent_id,subject,source_kind,needs,state,created_at,ack_due_at,due_at,changed_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`,
+	// wakes starts at 1: the wake job queued below with the message.
+	if _, err := tx.ExecContext(ctx, `INSERT INTO obligations (id,task_id,message_seq,agent_id,subject,source_kind,needs,state,created_at,ack_due_at,due_at,changed_at,wakes) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,1)`,
 		id, m.TaskID, m.Seq, req.To, subject, kind, needs, api.ObligationQueued, ts(created), ts(ackDue), ts(due), ts(created)); err != nil {
 		return err
 	}
