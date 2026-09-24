@@ -11,7 +11,8 @@ Acceptance: c1–c16 below
 
 Hub record: Feature `wi_6329a9f143468664`, owner intake #8960, work-order message #8961.
 
-Status: built on tasks-hub, in review (not deployed). Written September 24, 2026 after phases 1, 2a and 2b were released,
+Status: released September 24, 2026 (hub, bridge and Mini `tt` at `59c0f08`, see
+[release evidence](releases/broker-phase3-59c0f08/README.md)). Written September 24, 2026 after phases 1, 2a and 2b were released,
 and after the first shadow-week item ran through a Planned delivery team.
 
 ## What changed from the design
