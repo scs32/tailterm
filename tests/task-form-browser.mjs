@@ -55,6 +55,7 @@ let failLaunch = false,
   loseLaunchAt = 0,
   loseTaskCreateReply = false,
   dropTaskCreateBeforeCommit = false,
+  failPolicyPatchOnce = false,
   taskCreateRequests = 0,
   taskListGate = null,
   execs = 0,
@@ -107,6 +108,11 @@ const server = createServer(async (req, res) => {
     }
     if (req.url === "/qa/drop-task-create-before-commit") {
       dropTaskCreateBeforeCommit = true;
+      res.end("ok");
+      return;
+    }
+    if (req.url === "/qa/fail-next-policy-patch") {
+      failPolicyPatchOnce = true;
       res.end("ok");
       return;
     }
@@ -163,6 +169,16 @@ const server = createServer(async (req, res) => {
         historyRequests++;
       const chunks = [];
       for await (const b of req) chunks.push(b);
+      if (
+        failPolicyPatchOnce &&
+        req.method === "PATCH" &&
+        /^\/v1\/tasks\/tsk_[0-9a-f]{16}$/.test(req.url)
+      ) {
+        failPolicyPatchOnce = false;
+        res.writeHead(503, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: "Synthetic policy PATCH failure" }));
+        return;
+      }
       if (req.method === "GET" && req.url === "/v1/tasks" && taskListGate) {
         const gate = taskListGate;
         gate.entered = true;
@@ -1560,6 +1576,29 @@ try {
       await page.locator("#team-main-server").selectOption("local");
       await page.locator('[data-project-server="local"]').fill(root);
       await page.locator('[data-project-server="secondary"]').fill(root);
+      await fetch(origin + "/qa/fail-next-policy-patch");
+      const retryLaunchStart = execs;
+      await page.locator('#team-launch-form button[type="submit"]').click();
+      await page
+        .locator("#team-launch-status")
+        .filter({ hasText: "Synthetic policy PATCH failure" })
+        .waitFor();
+      assert.equal(execs, retryLaunchStart, "failed policy must stop launches");
+      const frozenPolicyMembers = await page.evaluate(async (taskId) => {
+        const journal = (await qa.localData()).teamLaunchPlans.find(
+          (entry) => entry.kind === "add-team" && entry.taskId === taskId,
+        );
+        return journal.members.map(({ fields }) => ({
+          agentId: fields.agentId,
+          name: fields.name,
+        }));
+      }, target.id);
+      assert.equal(frozenPolicyMembers.length, 2);
+      await page.reload();
+      await page.waitForFunction(() => !!window.qa);
+      await page.evaluate(() => qa.modes.set("teams"));
+      await page.locator("[data-add-team]").click();
+      await page.locator("#team-task").selectOption(target.id);
       await page.locator('#team-launch-form button[type="submit"]').click();
       await page
         .locator("#dialog")
@@ -1567,6 +1606,21 @@ try {
       const nextDetail = await (
         await fetch(`http://127.0.0.1:${port}/v1/tasks/${target.id}`)
       ).json();
+      assert.equal(
+        execs - retryLaunchStart,
+        2,
+        "retry must launch each frozen member once",
+      );
+      assert.deepEqual(
+        nextDetail.agents
+          .filter((agent) => agent.workItem?.itemId === nextItem.id)
+          .map(({ id, name }) => ({ id, name }))
+          .sort((a, b) => a.name.localeCompare(b.name)),
+        frozenPolicyMembers
+          .map(({ agentId: id, name }) => ({ id, name }))
+          .sort((a, b) => a.name.localeCompare(b.name)),
+        "retry must retain frozen agent IDs and names",
+      );
       const nextLead = nextDetail.agents.find(
         (agent) =>
           agent.workItem?.itemId === nextItem.id &&

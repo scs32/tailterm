@@ -2098,25 +2098,25 @@ export function createTaskHub(host) {
               )
               .forEach((el) => (el.disabled = true));
             projects.setEditable([]);
-            const existingTask = await guardedJournalEffect(
-              launchJournal,
-              null,
-              () => client.getTask(id),
-            );
-            const policy = {};
-            if (team.swarm) policy.swarm = true;
-            const orchestrator = addTeamOrchestrator(
-              existingTask.task,
-              existingTask.agents,
-              plan,
-            );
-            if (orchestrator) policy.orchestrator = orchestrator;
-            if (Object.keys(policy).length)
-              await guardedJournalEffect(launchJournal, null, () =>
-                client.updateTask(id, policy),
-              );
-            bound.add(id);
           }
+          const existingTask = await guardedJournalEffect(
+            launchJournal,
+            null,
+            () => client.getTask(id),
+          );
+          const policy = {};
+          if (team.swarm) policy.swarm = true;
+          const orchestrator = addTeamOrchestrator(
+            existingTask.task,
+            existingTask.agents,
+            plan,
+          );
+          if (orchestrator) policy.orchestrator = orchestrator;
+          if (Object.keys(policy).length)
+            await guardedJournalEffect(launchJournal, null, () =>
+              client.updateTask(id, policy),
+            );
+          bound.add(id);
           await launchMembers(
             id,
             plan,
