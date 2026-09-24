@@ -295,3 +295,35 @@ func TestRedactUnquotedValuesWithSpaces(t *testing.T) {
 		t.Errorf("redaction crossed a line: %q", got)
 	}
 }
+
+// Focused verification of 2d066b8: redaction is a scanner, so adjacent and
+// nested credentials are each redacted and nothing past a value is lost.
+func TestRedactAdversarialCases(t *testing.T) {
+	secrets := []string{"firstsecret123", "secondsecret456", "s3cr3t value", "t0k3nvalue", "d e f", "pa\\\"ss secret", "abcdefgh1234", "inner9secret"}
+	cases := map[string]string{
+		`password=firstsecret123 api_key="secondsecret456"`:           "",
+		`{"user":"x","password":"s3cr3t value","token":"t0k3nvalue"}`: `"user":"x"`,
+		`password: a b c, token: d e f`:                               "",
+		`"password":"pa\"ss secret" then keep`:                        "then keep",
+		"export API_KEY=abcdefgh1234\nkeep this line":                 "keep this line",
+		`{"password":"my token: inner9secret"} keep`:                  "keep",
+		`password=firstsecret123;secondsecret456`:                     "",
+		`Authorization: Bearer secondsecret456abcdef`:                 "Authorization",
+	}
+	for text, keep := range cases {
+		got := Redact(text)
+		for _, s := range secrets {
+			if strings.Contains(got, s) {
+				t.Errorf("%q -> %q leaks %q", text, got, s)
+			}
+		}
+		if keep != "" && !strings.Contains(got, keep) {
+			t.Errorf("%q -> %q lost %q", text, got, keep)
+		}
+	}
+	for _, prose := range []string{"the token budget is 64k", "password rotation policy applies", "TOKEN_BUDGET=5 is fine"} {
+		if got := Redact(prose); got != prose {
+			t.Errorf("over-redacted %q -> %q", prose, got)
+		}
+	}
+}

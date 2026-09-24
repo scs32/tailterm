@@ -26,12 +26,63 @@ const (
 	DefaultModel = "jev-latest"
 )
 
-// Secret-looking strings are replaced before any text leaves the hub. Same
-// pattern as tools/jev-kit/run_board_real.py.
-var secretPattern = regexp.MustCompile(`(sk-[A-Za-z0-9_-]{16,}|gh[pousr]_[A-Za-z0-9]{20,}|tskey-[A-Za-z0-9-]{10,}|(?i:bearer)\s+[A-Za-z0-9._~+/=-]{16,}` +
-	`|(?i:["']?\b(?:token|secret|password|passwd|api[_-]?key|access[_-]?key|client[_-]?secret)\b["']?\s*[:=]\s*)(?:"[^"\n]*"|'[^'\n]*'|[^\s"',}][^\n"',}]*))`)
+// Secret-looking strings are replaced before any text leaves the hub.
+// Standalone tokens are matched directly. For "key: value" credentials a small
+// scanner redacts each value up to its closing quote, a newline, a comma, a
+// closing brace or the next credential key, so adjacent credentials are each
+// redacted. tools/jev-kit/run_board_real.py mirrors this.
+var (
+	tokenPattern  = regexp.MustCompile(`sk-[A-Za-z0-9_-]{16,}|gh[pousr]_[A-Za-z0-9]{20,}|tskey-[A-Za-z0-9-]{10,}|(?i:bearer)\s+[A-Za-z0-9._~+/=-]{16,}`)
+	credentialKey = regexp.MustCompile(`(?i)["']?\b(?:token|secret|password|passwd|api[_-]?key|access[_-]?key|client[_-]?secret)\b["']?\s*[:=]\s*`)
+)
 
-func Redact(s string) string { return secretPattern.ReplaceAllString(s, "[REDACTED]") }
+func Redact(s string) string {
+	s = tokenPattern.ReplaceAllString(s, "[REDACTED]")
+	keys := credentialKey.FindAllStringIndex(s, -1)
+	if len(keys) == 0 {
+		return s
+	}
+	var b strings.Builder
+	last := 0
+	for i, k := range keys {
+		if k[0] < last {
+			continue // inside a value already redacted
+		}
+		limit := len(s)
+		if i+1 < len(keys) {
+			limit = keys[i+1][0]
+		}
+		b.WriteString(s[last:k[1]])
+		b.WriteString("[REDACTED]")
+		last = credentialValueEnd(s, k[1], limit)
+	}
+	b.WriteString(s[last:])
+	return b.String()
+}
+
+// credentialValueEnd returns where the value starting at i ends.
+func credentialValueEnd(s string, i, limit int) int {
+	if i < len(s) && (s[i] == '"' || s[i] == '\'') {
+		q := s[i]
+		for j := i + 1; j < len(s); j++ {
+			switch s[j] {
+			case '\\':
+				j++
+			case q:
+				return j + 1
+			case '\n':
+				return j
+			}
+		}
+		return len(s)
+	}
+	for j := i; j < len(s); j++ {
+		if j >= limit || s[j] == '\n' || s[j] == ',' || s[j] == '}' {
+			return j
+		}
+	}
+	return len(s)
+}
 
 type question struct {
 	Type         string            `json:"type"`

@@ -172,22 +172,25 @@ func TestMessageChecksHelpSucceeds(t *testing.T) {
 	}
 }
 
-// Round-two focused fix (Fable note 1): one entry per --evidence flag.
-func TestSendRejectsTwoEvidenceEntriesInOneFlag(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		t.Errorf("hub contacted: %s", r.URL.Path)
-	}))
-	defer srv.Close()
-	e := env{hub: srv.URL, task: "tsk_0000000000000001", agent: "agt_0000000000000001"}
-	err := cmdSend(e, []string{"--kind", "result", "--subject", "Both checks pass on the branch", "--outcome", "done",
-		"--status", "a1=pass", "--evidence", "e1: go test; e2: go vet -> ok"})
-	var coded *exitError
-	if !errors.As(err, &coded) || coded.code != 2 {
-		t.Fatalf("err %v, want exit 2", err)
+// The two-entries-in-one---evidence guard (a non-blocking follow-up) was
+// removed: every heuristic version misjudged quoted commands. The flag is
+// always one entry, and escaping keeps it exact on the board.
+func TestSendKeepsSemicolonsInsideOneEvidenceEntry(t *testing.T) {
+	e, c, task, _ := cliWorkItemFixture(t)
+	if err := cmdSend(e, []string{"--kind", "result", "--subject", "Quoted command output is stable", "--outcome", "done",
+		"--status", "a1=pass", "--evidence", "e1 (command): printf 'ok; note: stable' -> ok"}); err != nil {
+		t.Fatal(err)
 	}
-	err = cmdSend(e, []string{"--kind", "result", "--subject", "Both checks pass on the branch", "--outcome", "done",
-		"--status", "a1=pass", "--evidence", "e1: go test; vet (command): go vet -> ok"})
-	if !errors.As(err, &coded) || coded.code != 2 {
-		t.Fatalf("letter-only key: err %v, want exit 2", err)
+	msgs, err := c.ListMessages(context.Background(), task.ID, 0, "", 50)
+	if err != nil || len(msgs) != 1 {
+		t.Fatalf("messages %v %d", err, len(msgs))
+	}
+	want := api.Evidence{Type: "command", Value: "printf 'ok; note: stable'", Outcome: "ok"}
+	if got := msgs[0].Envelope.Evidence["e1"]; got != want {
+		t.Fatalf("evidence %+v", got)
+	}
+	parsed, _ := api.ParseTextConvention(msgs[0].Text)
+	if parsed.Evidence["e1"] != want {
+		t.Fatalf("rendered text re-parses as %+v", parsed.Evidence)
 	}
 }

@@ -12,9 +12,44 @@ from typesafe_sdk import Choice, Noul, TypeSafeClient
 from run_jev import load_key
 
 HERE = pathlib.Path(__file__).parent
-# Same pattern as hub/internal/jev (quoted and structured credentials included).
-SECRET = re.compile(r"""(sk-[A-Za-z0-9_-]{16,}|gh[pousr]_[A-Za-z0-9]{20,}|tskey-[A-Za-z0-9-]{10,}|(?i:bearer)\s+[A-Za-z0-9._~+/=-]{16,}"""
-                    r"""|(?i:["']?\b(?:token|secret|password|passwd|api[_-]?key|access[_-]?key|client[_-]?secret)\b["']?\s*[:=]\s*)(?:"[^"\n]*"|'[^'\n]*'|[^\s"',}][^\n"',}]*))""")
+# Same scanner as hub/internal/jev Redact: standalone tokens, then each
+# "key: value" credential value up to its closing quote, a newline, a comma,
+# a closing brace or the next credential key.
+TOKEN = re.compile(r"sk-[A-Za-z0-9_-]{16,}|gh[pousr]_[A-Za-z0-9]{20,}|tskey-[A-Za-z0-9-]{10,}|(?i:bearer)\s+[A-Za-z0-9._~+/=-]{16,}")
+CRED_KEY = re.compile(r"""(?i)["']?\b(?:token|secret|password|passwd|api[_-]?key|access[_-]?key|client[_-]?secret)\b["']?\s*[:=]\s*""")
+
+
+def _value_end(s, i, limit):
+    if i < len(s) and s[i] in "\"'":
+        q, j = s[i], i + 1
+        while j < len(s):
+            if s[j] == "\\":
+                j += 2
+                continue
+            if s[j] == q:
+                return j + 1
+            if s[j] == "\n":
+                return j
+            j += 1
+        return len(s)
+    j = i
+    while j < len(s) and j < limit and s[j] not in "\n,}":
+        j += 1
+    return j
+
+
+def redact(s):
+    s = TOKEN.sub("[REDACTED]", s)
+    keys = [(m.start(), m.end()) for m in CRED_KEY.finditer(s)]
+    out, last = [], 0
+    for n, (start, end) in enumerate(keys):
+        if start < last:
+            continue
+        limit = keys[n + 1][0] if n + 1 < len(keys) else len(s)
+        out.append(s[last:end] + "[REDACTED]")
+        last = _value_end(s, end, limit)
+    out.append(s[last:])
+    return "".join(out)
 
 KINDS = {
     "assignment": "Gives someone work to do or an order to carry out.",
@@ -80,7 +115,7 @@ def main():
     client = TypeSafeClient(api_key=load_key())
 
     def judge(m):
-        text = SECRET.sub("[REDACTED]", m["text"])
+        text = redact(m["text"])
         t0 = time.perf_counter()
         r = client.system_one({"post": {"text": text}}, QUESTIONS, model=a.model)
         n = {k: round(v.noul, 3) for k, v in r.nouls.items()}
