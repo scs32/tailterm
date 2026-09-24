@@ -144,7 +144,7 @@ func (s *Store) retireLegacyFollowThrough(ctx context.Context) error {
 			ids = append(ids, id)
 		}
 		sort.Strings(ids)
-		text := fmt.Sprintf("Broker phase 3 retired the legacy directive follow-through. Open directives in this project were closed with provenance (their recipients had already closed). Work items they referenced, to re-dispatch when this project resumes: %s.", strings.Join(ids, ", "))
+		text := fmt.Sprintf("Broker phase 3 retired the legacy directive follow-through. Open directives in this project were closed with provenance; each records its recipient's status. Work items they referenced, to re-dispatch when this project resumes: %s.", strings.Join(ids, ", "))
 		if err := s.postBrokerNotice(ctx, tx, task, api.Agent{}, "Legacy directives were retired for this project", "Legacy directives were retired for this project", text, map[string]string{"migration": RetiredPhase3}); err != nil {
 			return err
 		}
@@ -473,3 +473,4 @@ func (s *Store) PostSystemTextForTest(ctx context.Context, taskID, to, text stri
 	}
 	return tx.Commit()
 }
+
