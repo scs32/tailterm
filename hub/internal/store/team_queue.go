@@ -328,6 +328,9 @@ func (s *Store) ListTeamQueue(ctx context.Context, task string) (api.TeamQueueLi
 	}
 	activeCount := 0
 	for i, entry := range out.Entries {
+		if err := s.loadTeamActivities(ctx, &out.Entries[i]); err != nil {
+			return out, err
+		}
 		if entry.State == "launching" || entry.State == "running" || (entry.State == "failed" && entry.ReleasedAt == "") {
 			activeCount++
 		}
@@ -398,6 +401,11 @@ func (s *Store) TeamQueuesByHost(ctx context.Context, host string) (api.TeamQueu
 	}
 	if err := rows.Close(); err != nil {
 		return out, err
+	}
+	for i := range out.Entries {
+		if err := s.loadTeamActivities(ctx, &out.Entries[i]); err != nil {
+			return out, err
+		}
 	}
 	out.HostPolicy, err = readTeamHostPolicy(ctx, s.db, host)
 	if err != nil {

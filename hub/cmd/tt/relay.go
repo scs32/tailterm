@@ -18,6 +18,8 @@ import (
 	"strings"
 	"syscall"
 	"time"
+
+	"github.com/scs32/tailterm/hub/internal/spawn"
 )
 
 var runIDPattern = regexp.MustCompile(`^run_[0-9a-f]{16}$`)
@@ -25,13 +27,17 @@ var runIDPattern = regexp.MustCompile(`^run_[0-9a-f]{16}$`)
 var threadIDPattern = regexp.MustCompile(`^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$`)
 
 type runtimeBinding struct {
-	Hub       string `json:"hub"`
-	Task      string `json:"task"`
-	Agent     string `json:"agent"`
-	Run       string `json:"run"`
-	Thread    string `json:"thread"`
-	Codex     string `json:"codex"`
-	CodexHome string `json:"codexHome,omitempty"`
+	Hub       string    `json:"hub"`
+	Task      string    `json:"task"`
+	Agent     string    `json:"agent"`
+	Run       string    `json:"run"`
+	Thread    string    `json:"thread"`
+	Codex     string    `json:"codex"`
+	CodexHome string    `json:"codexHome,omitempty"`
+	Runtime   string    `json:"runtime,omitempty"`
+	Session   string    `json:"session,omitempty"`
+	Cwd       string    `json:"cwd,omitempty"`
+	CreatedAt time.Time `json:"createdAt,omitempty"`
 }
 type relayProgress struct {
 	Run             string    `json:"run"`
@@ -86,7 +92,11 @@ func writePrivateJSON(path string, v any) error {
 	return os.Rename(f.Name(), path)
 }
 func validBinding(b runtimeBinding) bool {
-	return api.ValidID(b.Task, "tsk") && api.ValidID(b.Agent, "agt") && runIDPattern.MatchString(b.Run) && threadIDPattern.MatchString(b.Thread) && b.Hub != "" && filepath.IsAbs(b.Codex)
+	base := api.ValidID(b.Task, "tsk") && api.ValidID(b.Agent, "agt") && runIDPattern.MatchString(b.Run) && threadIDPattern.MatchString(b.Thread) && b.Hub != ""
+	if b.Runtime == "claude" {
+		return base && b.Session != "" && filepath.IsAbs(b.Cwd)
+	}
+	return base && filepath.IsAbs(b.Codex)
 }
 func bindRuntime(e env, thread string) error {
 	codex, err := exec.LookPath("codex")
@@ -97,7 +107,7 @@ func bindRuntime(e env, thread string) error {
 	if err != nil {
 		return err
 	}
-	b := runtimeBinding{Hub: e.hub, Task: e.task, Agent: e.agent, Run: e.runID, Thread: thread, Codex: codex, CodexHome: os.Getenv("CODEX_HOME")}
+	b := runtimeBinding{Hub: e.hub, Task: e.task, Agent: e.agent, Run: e.runID, Thread: thread, Codex: codex, CodexHome: os.Getenv("CODEX_HOME"), Runtime: "codex", Session: os.Getenv(spawn.EnvSession)}
 	if !validBinding(b) {
 		return errors.New("a task agent, run, and exact Codex thread UUID are required")
 	}
@@ -114,10 +124,12 @@ func bindRuntime(e env, thread string) error {
 	if a.RunID != b.Run || a.Runtime != "codex" || a.Status == api.AgentClosed || a.Status == api.AgentExited || a.Status == api.AgentRetired {
 		return errors.New("binding does not match an open Codex agent run")
 	}
+	b.Cwd, b.Session = a.Cwd, a.Session
+	b.CreatedAt = time.Now().UTC()
 	path := filepath.Join(relayDir(), bindingKey(b)+".binding.json")
 	data, _ := os.ReadFile(path)
 	var old runtimeBinding
-	if json.Unmarshal(data, &old) == nil && old == b {
+	if json.Unmarshal(data, &old) == nil && old.Hub == b.Hub && old.Task == b.Task && old.Agent == b.Agent && old.Run == b.Run && old.Thread == b.Thread && old.Codex == b.Codex && old.CodexHome == b.CodexHome && old.Runtime == b.Runtime && old.Cwd == b.Cwd && old.Session == b.Session && !old.CreatedAt.IsZero() {
 		return nil
 	}
 	return writePrivateJSON(path, b)
@@ -147,12 +159,24 @@ func autoBindRuntime(e env, command string) {
 	b := runtimeBinding{Hub: e.hub, Agent: e.agent}
 	data, _ := os.ReadFile(filepath.Join(relayDir(), bindingKey(b)+".binding.json"))
 	var old runtimeBinding
-	if json.Unmarshal(data, &old) == nil && old.Thread == thread && old.Run == e.runID && old.Task == e.task {
+	if json.Unmarshal(data, &old) == nil && old.Thread == thread && old.Run == e.runID && old.Task == e.task && old.Cwd != "" && old.Session != "" {
 		return
 	}
 	if err := bindRuntime(e, thread); err != nil {
 		fmt.Fprintln(os.Stderr, "[tt] Automatic inbox wake-up could not bind:", err)
 	}
+}
+
+func bindClaudeRuntime(hub, task string, a api.Agent) error {
+	id, err := claudeSessionID(a.ID)
+	if err != nil {
+		return err
+	}
+	b := runtimeBinding{Hub: hub, Task: task, Agent: a.ID, Run: a.RunID, Thread: id, Runtime: "claude", Session: a.Session, Cwd: a.Cwd, CreatedAt: time.Now().UTC()}
+	if !validBinding(b) {
+		return errors.New("invalid Claude activity binding")
+	}
+	return writePrivateJSON(filepath.Join(relayDir(), bindingKey(b)+".binding.json"), b)
 }
 func wakeThrough(messages []api.Message, agent string) (through int64, eligible bool) {
 	for _, m := range messages {
@@ -474,14 +498,24 @@ func cmdRelay(args []string) error {
 				ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 				now := time.Now().UTC()
 				// A broker-path error never suppresses the existing paths.
-				queued, brokerErr := relayWakeJob(ctx, b, &progress, c, now, nativeQueue)
+				queued, brokerErr := false, error(nil)
+				if b.Runtime != "claude" {
+					queued, brokerErr = relayWakeJob(ctx, b, &progress, c, now, nativeQueue)
+				}
 				if brokerErr != nil {
 					fmt.Fprintf(os.Stderr, "[tt relay] %s broker wake: %v\n", b.Agent, brokerErr)
 				}
-				if !queued {
+				if !queued && b.Runtime != "claude" {
 					err = relayOne(ctx, b, &progress, c, now, nativeQueue)
 				}
 				cancel()
+				// Host observation runs after delivery, using the same host budget.
+				// A slow or drifting transcript never delays a broker or inbox turn.
+				activityCtx, stopActivity := context.WithTimeout(context.Background(), 5*time.Second)
+				if activityErr := relayActivityTick(activityCtx, b, c, now, activityProbeNative); activityErr != nil {
+					fmt.Fprintf(os.Stderr, "[tt relay] %s activity: %v\n", b.Agent, activityErr)
+				}
+				stopActivity()
 			}
 			if err != nil {
 				if progress.Error != err.Error() {

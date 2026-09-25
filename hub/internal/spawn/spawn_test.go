@@ -9,6 +9,24 @@ import (
 	"testing"
 )
 
+func TestProbeSessionDistinguishesAbsenceFromProbeFailure(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "fake-tmux")
+	if err := os.WriteFile(path, []byte("#!/bin/sh\nprintf '%s\\n' \"$TT_PROBE_MESSAGE\" >&2\nexit 1\n"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	previous := Tmux
+	Tmux = path
+	defer func() { Tmux = previous }()
+	t.Setenv("TT_PROBE_MESSAGE", "can't find session: synthetic")
+	if alive, err := ProbeSession("synthetic"); err != nil || alive {
+		t.Fatalf("absent session alive=%v err=%v", alive, err)
+	}
+	t.Setenv("TT_PROBE_MESSAGE", "permission denied")
+	if alive, err := ProbeSession("synthetic"); err == nil || alive {
+		t.Fatalf("failed probe alive=%v err=%v", alive, err)
+	}
+}
+
 func TestParseVersion(t *testing.T) {
 	for in, want := range map[string]float64{"tmux 3.5a": 3.05, "tmux 3.2": 3.02, "tmux next-3.6": 3.06, "tmux 2.9a": 2.09} {
 		got, err := ParseVersion(in)

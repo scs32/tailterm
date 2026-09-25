@@ -417,6 +417,9 @@ CREATE INDEX IF NOT EXISTS agent_allocation_intents_item ON agent_allocation_int
 	if err := migrateDeliveryFollowThrough(db); err != nil {
 		return err
 	}
+	if err := migrateActivity(db); err != nil {
+		return err
+	}
 	// Parallel delivery leases one continuing handler run per active item. The
 	// legacy singleton index is deliberately removed only after all other
 	// additive migrations have succeeded.

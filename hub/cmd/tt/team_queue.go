@@ -95,6 +95,14 @@ func cmdTeamQueue(e env, args []string) error {
 				state += " (released)"
 			}
 			fmt.Printf("%d %s %s %s order=#%d revision=%d repository=%s owns=%s blocked-by=%s reason=%s handler=%s/%s lease=%d\n", q.Position, state, q.ID, q.ItemID, q.OrderMessageSeq, q.Revision, q.Repository, owns, strings.Join(q.BlockedBy, ","), q.BlockReason, q.HandlerID, q.HandlerRunID, q.HandlerLeaseGeneration)
+			fmt.Printf("  team last-transition tokens=%d\n", q.Tokens.Total)
+			for _, member := range q.Activities {
+				state := "unknown"
+				if member.Activity != nil {
+					state = member.Activity.State
+				}
+				fmt.Printf("  %s activity=%s\n", member.Name, state)
+			}
 			if q.Integration != nil {
 				fmt.Printf("  Ready to integrate: base=%s worktree=%s branch=%s commit=%s evidence=%s\n", q.Integration.BaseCommit, q.Integration.Worktree, q.Integration.Branch, q.Integration.Commit, q.Integration.Evidence)
 			} else if q.Acceptance != nil {

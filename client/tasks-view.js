@@ -4,6 +4,7 @@ import { taskRollup } from "./tasks.js";
 import { pauseStateLabel, projectPauseState } from "./project-pause.js";
 import { createViewRefreshPresentation } from "./view-refresh-presentation.js";
 import { renderTeamDelivery } from "./team-delivery-view.js";
+import { activityDetail, activityLabel } from "./activity-format.js";
 
 const cacheFeedback = (label = "") =>
   label === "Saved data" || label === "Saved data · refreshing"
@@ -284,7 +285,7 @@ export function createTasksView({
         .filter((a) => a.status !== "closed")
         .map(
           (a) =>
-            `<button class="board-agent" data-task-agent="${esc(a.id)}" title="${esc(a.blockedText || a.host + " · " + a.session)}"><span class="status-dot ${STATUS_DOT[a.status] || ""}"></span><span>${esc(a.name)}${a.role === "database_handler" ? " · Database handler" : ""}</span><span class="fine">${esc(agentState(a))} · ${esc(a.host)}</span></button>`,
+            `<button class="board-agent" data-task-agent="${esc(a.id)}" title="${esc((a.blockedText || a.host + " · " + a.session) + " · " + activityDetail(a.activity))}"><span class="status-dot ${STATUS_DOT[a.status] || ""}"></span><span>${esc(a.name)}${a.role === "database_handler" ? " · Database handler" : ""}</span><span class="fine">${esc(agentState(a))} · ${esc(activityLabel(a.activity))} · ${esc(a.host)}</span></button>`,
         )
         .join(
           "",

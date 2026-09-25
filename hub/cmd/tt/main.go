@@ -354,7 +354,14 @@ func cmdAgents(e env, args []string) error {
 		if a.Role != "" {
 			role = " role=" + a.Role
 		}
-		fmt.Printf("%s %s  %-12s %-12s %s@%s%s unread=%d\n", self, a.ID, a.Status, a.Name, a.Session, a.Host, role, a.Unread)
+		activity := "unknown"
+		if a.Activity != nil {
+			activity = a.Activity.State
+		}
+		fmt.Printf("%s %s  %-12s %-12s %s@%s%s activity=%s unread=%d\n", self, a.ID, a.Status, a.Name, a.Session, a.Host, role, activity, a.Unread)
+		if a.Activity != nil {
+			fmt.Printf("  last-transition tokens=%d observed=%s pending=%s since=%s\n", a.Activity.Tokens.Total, a.Activity.ObservedAt.Format(time.RFC3339), a.Activity.PendingTool, a.Activity.PendingSince.Format(time.RFC3339))
+		}
 	}
 	return nil
 }
@@ -1166,6 +1173,11 @@ func cmdSpawn(e env, args []string) error {
 			if status.State != api.ProjectPauseActive {
 				return errors.New("resume confirmation did not clear the project admission barrier")
 			}
+		}
+	}
+	if agent.Runtime == "claude" {
+		if err := bindClaudeRuntime(*hub, *task, agent); err != nil {
+			fmt.Fprintln(os.Stderr, "[tt] Claude activity binding will retry:", err)
 		}
 	}
 	// The relay also adopts already-running sessions.

@@ -912,6 +912,9 @@ func (s *Store) GetAgent(ctx context.Context, id string) (api.Agent, error) {
 	if err = s.loadAgentWorkItem(ctx, &a); err != nil {
 		return a, err
 	}
+	if err = s.loadActivity(ctx, &a); err != nil {
+		return a, err
+	}
 	err = s.db.QueryRowContext(ctx, `SELECT revision FROM item_team_leads WHERE task_id=? AND agent_id=? AND run_id=? AND state<>'closed'`, a.TaskID, a.ID, a.RunID).Scan(&a.ItemLeadRevision)
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return a, err
@@ -942,6 +945,9 @@ func (s *Store) ListAgents(ctx context.Context, taskID string) ([]api.Agent, err
 		return nil, err
 	}
 	for i := range out {
+		if err = s.loadActivity(ctx, &out[i]); err != nil {
+			return nil, err
+		}
 		if err = s.loadAgentWorkItem(ctx, &out[i]); err != nil {
 			return nil, err
 		}

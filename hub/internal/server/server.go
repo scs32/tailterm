@@ -51,6 +51,7 @@ func New(st *store.Store, identity Identity) *Server {
 	m.HandleFunc("GET /v1/tasks/{id}/allocation-intents/{agentId}", s.getAllocationIntent)
 	m.HandleFunc("GET /v1/tasks/{id}/agents", s.listAgents)
 	m.HandleFunc("GET /v1/tasks/{id}/agents/{aid}", s.getAgent)
+	m.HandleFunc("POST /v1/tasks/{id}/agents/{aid}/activity", s.reportAgentActivity)
 	m.HandleFunc("GET /v1/tasks/{id}/agents/{aid}/work-context", s.getAgentWorkContext)
 	m.HandleFunc("GET /v1/tasks/{id}/agents/{aid}/current-assignment", s.currentAssignment)
 	m.HandleFunc("GET /v1/tasks/{id}/agents/{aid}/delivery-coverage", s.deliveryCoverage)

@@ -68,6 +68,24 @@ func HasSession(name string) bool {
 	return tmux("has-session", "-t", "="+name).Run() == nil
 }
 
+// ProbeSession distinguishes a confirmed missing session from a tmux probe
+// failure. Activity monitoring must not turn a permission or socket error into
+// a crash report.
+func ProbeSession(name string) (bool, error) {
+	if name == "" {
+		return false, errors.New("tmux session name is missing")
+	}
+	out, err := tmux("has-session", "-t", "="+name).CombinedOutput()
+	if err == nil {
+		return true, nil
+	}
+	message := strings.ToLower(string(out))
+	if strings.Contains(message, "can't find session") || strings.Contains(message, "no server running") || (strings.Contains(message, "failed to connect to server") && strings.Contains(message, "no such file or directory")) {
+		return false, nil
+	}
+	return false, fmt.Errorf("tmux session probe: %w", err)
+}
+
 // UniqueSession returns name, or name with a short suffix when taken.
 func UniqueSession(name string) string {
 	if !HasSession(name) {

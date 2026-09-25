@@ -183,6 +183,7 @@ type Task struct {
 }
 
 type Agent struct {
+	Activity         *AgentActivity        `json:"activity,omitempty"`
 	ItemLead         bool                  `json:"itemLead,omitempty"`
 	ItemLeadRevision int64                 `json:"itemLeadRevision,omitempty"`
 	WorkItem         *AgentWorkItemBinding `json:"workItem,omitempty"`
