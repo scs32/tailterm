@@ -250,6 +250,34 @@ func TestWorkerBriefingPreservesAssignedBuilderAndReadOnlyRoles(t *testing.T) {
 	}
 }
 
+func TestOrchestratorBriefingDelegatesOverdueEscalationToBroker(t *testing.T) {
+	for _, allowSpawn := range []bool{false, true} {
+		name := "non-swarm"
+		if allowSpawn {
+			name = "swarm"
+		}
+		t.Run(name, func(t *testing.T) {
+			task := api.Task{Name: "Project", Orchestrator: "lead", AllowAgentSpawn: allowSpawn}
+			got := agentTaskBriefingForLaunch(task, "lead", "", "", nil, 0)
+			for _, required := range []string{
+				"For a missed required progress checkpoint, send one follow-up tied to the existing order",
+				"the broker escalates overdue work itself",
+				"Do not send a separate message to the owner or handler to escalate a teammate's stall",
+				"If your own work is blocked, report the concrete blocker",
+				"tt event needs_input",
+				"tt ack SEQ",
+			} {
+				if !strings.Contains(got, required) {
+					t.Errorf("emitted orchestrator briefing missing %q", required)
+				}
+			}
+			if strings.Contains(got, "explicitly escalate the unresolved blocker to the owner/handler") {
+				t.Error("emitted orchestrator briefing still instructs manual escalation of absent progress")
+			}
+		})
+	}
+}
+
 // TestGeneratedBriefingStatesTtIsARealCliVerifiedBeforeUse proves the
 // owner-requested #2192 fix through the actual shared briefing assembly
 // path (agentTaskBriefing / taskBriefingForRoster), for every role and

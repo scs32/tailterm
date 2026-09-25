@@ -122,7 +122,7 @@
     ],
     "lead": [
       "exact recipient/run, expected checkpoint and evidence of read, actual Start and concrete progress",
-      "send one follow-up tied to the existing order, then explicitly escalate"
+      "send one follow-up tied to the existing order; the broker escalates overdue work itself"
     ],
     "worker": [
       "Results must include verification, remaining dependencies and delivered message/receipt references",
@@ -166,7 +166,7 @@
     "handler": [],
     "lead": [
       "For available running/done workers, deliver one follow-up tied to the existing order and verify read and concrete progress; do not call tt resume",
-      "then explicitly escalate the unresolved blocker to the owner/handler if progress remains absent"
+      "the broker escalates overdue work itself if progress remains absent"
     ]
   },
   {

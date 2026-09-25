@@ -130,8 +130,8 @@ func TestHandlerAllocationContinuationGuidanceAcrossWorkerStates(t *testing.T) {
 			if !strings.Contains(got, state.required) {
 				t.Fatalf("missing state-aware instruction %q", state.required)
 			}
-			if !strings.Contains(got, "report the real limit") || !strings.Contains(got, "one follow-up tied to the existing order, then explicitly escalate") {
-				t.Fatal("lost capacity or bounded progress escalation instruction")
+			if !strings.Contains(got, "report the real limit") || !strings.Contains(got, "one follow-up tied to the existing order; the broker escalates overdue work itself") {
+				t.Fatal("lost capacity or broker-owned overdue escalation instruction")
 			}
 		})
 	}
