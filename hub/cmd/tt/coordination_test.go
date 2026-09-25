@@ -251,14 +251,17 @@ func TestWorkerBriefingPreservesAssignedBuilderAndReadOnlyRoles(t *testing.T) {
 }
 
 func TestOrchestratorBriefingDelegatesOverdueEscalationToBroker(t *testing.T) {
-	for _, allowSpawn := range []bool{false, true} {
+	for _, swarm := range []bool{false, true} {
 		name := "non-swarm"
-		if allowSpawn {
+		if swarm {
 			name = "swarm"
 		}
 		t.Run(name, func(t *testing.T) {
-			task := api.Task{Name: "Project", Orchestrator: "lead", AllowAgentSpawn: allowSpawn}
+			task := api.Task{Name: "Project", Orchestrator: "lead", Swarm: swarm}
 			got := agentTaskBriefingForLaunch(task, "lead", "", "", nil, 0)
+			if strings.Contains(got, "SWARM ENABLED") != swarm {
+				t.Errorf("emitted orchestrator briefing swarm marker presence = %t, want %t", strings.Contains(got, "SWARM ENABLED"), swarm)
+			}
 			for _, required := range []string{
 				"For a missed required progress checkpoint, send one follow-up tied to the existing order",
 				"the broker escalates overdue work itself",
