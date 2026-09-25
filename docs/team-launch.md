@@ -1,5 +1,26 @@
 # Local Planned delivery team launch
 
+## Project team queue
+
+On the launch host, the owner can save a sequence of recorded item orders:
+
+```sh
+tt team queue add --task tsk_... --item wi_... --order 123 --template planned
+tt team queue list --task tsk_...
+tt team queue reorder --task tsk_... --entry tqe_... --before tqe_...
+tt team queue remove --task tsk_... --entry tqe_...
+```
+
+The hub stores queue state and retry receipts. The existing supervised Mini
+relay checks that state on each tick, including when no Codex thread is bound.
+It waits for an active project, one available database handler, and no live
+lead. It records a launch reservation and frozen plan before effects.
+Uncertain member spawns are reconciled by exact identity and owned session;
+unresolved attempts fail the entry and require owner action. Terminal items
+advance only after the exact team close and host cleanup receipts. A failed
+entry stops that project queue and posts one durable owner escalation. Pausing
+the project stops launch ticks. The deliberate agent Queue is separate.
+
 `tt team launch --item wi_… --order N [--template planned] [--dry-run]`
 starts the four non-database members of the Planned delivery template for an
 existing project. `TAILTERM_HUB` and `TAILTERM_TASK` select the hub and project;

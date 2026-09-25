@@ -268,6 +268,34 @@ func (s *Store) UpdateTask(ctx context.Context, id string, req api.UpdateTaskReq
 		if *req.Orchestrator != "" && !api.ValidName(*req.Orchestrator) {
 			return api.Task{}, api.ErrInvalid
 		}
+		if *req.Orchestrator != "" && *req.Orchestrator != t.Orchestrator {
+			var token string
+			var entryID string
+			var generation int64
+			err := s.db.QueryRowContext(ctx, `SELECT token,pause_generation,entry_id FROM team_launch_reservations WHERE task_id=?`, id).Scan(&token, &generation, &entryID)
+			if err != nil && !errors.Is(err, sql.ErrNoRows) {
+				return t, err
+			}
+			if err == nil && (token != req.TeamLaunchToken || generation != t.PauseGeneration) {
+				return t, fmt.Errorf("%w: project team launch is reserved by another actor", api.ErrConflict)
+			}
+			if err == nil && entryID != "" {
+				var frozen string
+				if err := s.db.QueryRowContext(ctx, `SELECT launch_json FROM team_queue_entries WHERE task_id=? AND id=? AND state='launching'`, id, entryID).Scan(&frozen); err != nil {
+					return t, fmt.Errorf("%w: queue launch plan is not frozen", api.ErrConflict)
+				}
+				var plan struct {
+					Members []struct {
+						Fields struct {
+							Name string `json:"name"`
+						} `json:"fields"`
+					} `json:"members"`
+				}
+				if json.Unmarshal([]byte(frozen), &plan) != nil || len(plan.Members) == 0 || plan.Members[0].Fields.Name != *req.Orchestrator {
+					return t, fmt.Errorf("%w: queued lead differs from frozen plan", api.ErrConflict)
+				}
+			}
+		}
 		if t.Orchestrator != *req.Orchestrator {
 			t.LeadRevision++
 		}
@@ -445,9 +473,10 @@ func (s *Store) AddAgent(ctx context.Context, taskID string, req api.AddAgentReq
 	if req.Role == api.AgentRoleDatabaseHandler && !api.ValidID(req.AgentID, "agt") {
 		return api.Agent{}, api.ErrInvalid
 	}
-	if req.ExpectedRunID != "" && ((resumeAdmission == nil && req.Role != api.AgentRoleDatabaseHandler) || !api.ValidID(req.AgentID, "agt") || !validRunID(req.ExpectedRunID)) {
+	if req.ExpectedRunID != "" && (!api.ValidID(req.AgentID, "agt") || !validRunID(req.ExpectedRunID)) {
 		return api.Agent{}, api.ErrInvalid
 	}
+	queuePreallocated := false
 	if req.ParentAgentID != "" {
 		parent, err := s.GetAgent(ctx, req.ParentAgentID)
 		if err != nil || parent.TaskID != taskID || parent.Status == api.AgentClosed || parent.Status == api.AgentExited || parent.Status == api.AgentRetired {
@@ -463,6 +492,48 @@ func (s *Store) AddAgent(ctx context.Context, taskID string, req api.AddAgentReq
 		if err := validatePreparedContextBundle(req.WorkItem); err != nil {
 			return api.Agent{}, err
 		}
+		var reservedItem string
+		var reservedEntry string
+		var generation int64
+		err := s.db.QueryRowContext(ctx, `SELECT item_id,pause_generation,entry_id FROM team_launch_reservations WHERE task_id=?`, taskID).Scan(&reservedItem, &generation, &reservedEntry)
+		if err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return api.Agent{}, err
+		}
+		if err == nil && (reservedItem != req.WorkItem.ItemID || generation != t.PauseGeneration) {
+			return api.Agent{}, fmt.Errorf("%w: agent admission conflicts with reserved team", api.ErrConflict)
+		}
+		if req.ExpectedRunID != "" && req.Role == "" && resumeAdmission == nil && req.ParentAgentID == "" && reservedEntry != "" {
+			var frozen string
+			if err := s.db.QueryRowContext(ctx, `SELECT launch_json FROM team_queue_entries WHERE task_id=? AND id=? AND state='launching'`, taskID, reservedEntry).Scan(&frozen); err != nil {
+				return api.Agent{}, fmt.Errorf("%w: queue launch plan is not frozen", api.ErrConflict)
+			}
+			var plan struct {
+				Members []struct {
+					Fields struct {
+						AgentID string `json:"agentId"`
+						Name    string `json:"name"`
+						Cwd     string `json:"cwd"`
+					} `json:"fields"`
+					State string `json:"state"`
+					RunID string `json:"runId"`
+				} `json:"members"`
+			}
+			if json.Unmarshal([]byte(frozen), &plan) != nil {
+				return api.Agent{}, api.ErrConflict
+			}
+			for _, member := range plan.Members {
+				if member.Fields.AgentID == req.AgentID && member.Fields.Name == req.Name && member.Fields.Cwd == req.Cwd && member.State == "uncertain" && member.RunID == req.ExpectedRunID {
+					queuePreallocated = true
+					break
+				}
+			}
+			if !queuePreallocated {
+				return api.Agent{}, fmt.Errorf("%w: exact queued member attempt is missing", api.ErrConflict)
+			}
+		}
+	}
+	if req.ExpectedRunID != "" && req.Role != api.AgentRoleDatabaseHandler && resumeAdmission == nil && !queuePreallocated {
+		return api.Agent{}, api.ErrInvalid
 	}
 	if req.AgentID != "" {
 		if !api.ValidID(req.AgentID, "agt") {
@@ -687,6 +758,15 @@ AND NOT EXISTS (SELECT 1 FROM agent_work_item_bindings b WHERE b.agent_id=a.id)`
 		}
 		intent = loaded
 		a.RunID = intent.ExpectedRunID
+	} else if queuePreallocated {
+		var reused int
+		if err := tx.QueryRowContext(ctx, `SELECT count(*) FROM agents WHERE run_id=?`, req.ExpectedRunID).Scan(&reused); err != nil {
+			return a, err
+		}
+		if reused != 0 {
+			return a, fmt.Errorf("%w: preallocated team run is already present", api.ErrConflict)
+		}
+		a.RunID = req.ExpectedRunID
 	} else {
 		a.RunID = api.NewID("run")
 	}

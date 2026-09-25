@@ -1,5 +1,10 @@
 # Team examples: research, choices and full prompts
 
+The Planned delivery lead can close a terminal item with `tt close --team`.
+For an item started by `tt team queue`, the supervised launch-host runner can
+perform the same gated close, confirm cleanup receipts, and start the next
+queued item. The lead should finish its results and obligations before closure.
+
 Ten editable examples are available under **Teams → Examples**. These are
 informed starting points, not empirically proven optimal teams for this workload.
 Their role prompts and model allocations are original design choices. No live
@@ -203,7 +208,7 @@ Start by sending planner a REQUEST for a plan of the owner's objective. When the
 
 When builder sends a RESULT with a frozen commit, check it against each criterion, then send reviewer a REVIEW naming that commit, the scope and the criteria. Follow the two-review-round policy: round one produces one consolidated blocker list, and round two checks only those fixes and regressions. After round two, choose exactly one disposition: release, one focused fix with verification, an explicit scope reduction mapped to criteria, or a release block with owner, next action and resume condition. There is no third general review.
 
-Reviewer runs on a runtime that the relay cannot wake. Always send it directed messages; it waits on its inbox. If any teammate leaves an ASSIGN, REQUEST or REVIEW without a reply for 30 minutes, send that teammate one nudge. The broker escalates overdue work itself; do not send a message to escalate a teammate's stall to the owner. Close workers only after acceptance. Once the handler confirms a terminal item and all team obligations are closed, run tt close --team for the item team.
+Reviewer runs on a runtime that the relay cannot wake. Always send it directed messages; it waits on its inbox. If any teammate leaves an ASSIGN, REQUEST or REVIEW without a reply for 30 minutes, send that teammate one nudge. The broker escalates overdue work itself; do not send a message to escalate a teammate's stall to the owner. Close workers only after acceptance. Once the handler confirms a terminal item and all team obligations are closed, run tt close --team for the item team. When this item came from tt team queue, the supervised host runner may close it after the same gates and cleanup receipts, then advance the queue.
 ```
 
 ### planner — Planning and acceptance criteria

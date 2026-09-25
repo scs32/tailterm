@@ -90,6 +90,8 @@ Commands
   new-project --name N [--goal G] create a project (new-task is an alias)
   team launch --item ID --order SEQ [--template planned] [--dry-run]
                                launch an item-bound Planned delivery team locally
+  team queue add|list|remove|reorder
+                               manage a project's durable delivery queue
 `
 
 type env struct {
@@ -776,7 +778,7 @@ func cmdSpawn(e env, args []string) error {
 	fs := flag.NewFlagSet("spawn", flag.ExitOnError)
 	name := fs.String("name", "", "agent name (required)")
 	agentID := fs.String("agent-id", "", "stable preallocated agent identity for launch/retry")
-	expectedRunID := fs.String("expected-run-id", "", "exact preallocated resume run or exited database_handler run to restart")
+	expectedRunID := fs.String("expected-run-id", "", "exact preallocated resume, database handler, or reserved team queue run")
 	expectedLifecycleGeneration := fs.Int64("expected-lifecycle-generation", 0, "exact project lifecycle generation required for admission")
 	resumeReceiptID := fs.String("resume-receipt-id", "", "durable project Resume receipt authorizing the exact fresh orchestrator")
 	workItemTask := fs.String("work-item-task", "", "project owning the bound bug or feature (default: --task)")
@@ -824,8 +826,8 @@ func cmdSpawn(e env, args []string) error {
 	if *agentID != "" && !api.ValidID(*agentID, "agt") {
 		return errors.New("invalid --agent-id")
 	}
-	if *role == "" && *expectedRunID != "" && *resumeReceiptID == "" {
-		return errors.New("--expected-run-id is reserved for database_handler launches")
+	if *role == "" && *expectedRunID != "" && *resumeReceiptID == "" && (*workItemID == "" || *agentID == "" || e.agent != "") {
+		return errors.New("--expected-run-id requires a reserved owner-side item team launch with --agent-id")
 	}
 	if *expectedLifecycleGeneration < 0 {
 		return errors.New("--expected-lifecycle-generation must be non-negative")

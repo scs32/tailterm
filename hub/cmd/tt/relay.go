@@ -415,6 +415,11 @@ func cmdRelay(args []string) error {
 		if !*status {
 			relayCleanup()
 			inspectStartupPrompts()
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+			if err := relayTeamQueueTick(ctx); err != nil {
+				fmt.Fprintf(os.Stderr, "[tt relay] team queue: %v\n", err)
+			}
+			cancel()
 		}
 		paths, _ := filepath.Glob(filepath.Join(dir, "*.binding.json"))
 		for _, path := range paths {

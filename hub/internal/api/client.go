@@ -125,6 +125,16 @@ func (c *Client) GetTask(ctx context.Context, id string) (TaskDetail, error) {
 	return out, c.do(ctx, "GET", "/v1/tasks/"+id, nil, &out)
 }
 
+func (c *Client) UpdateTask(ctx context.Context, id string, req UpdateTaskRequest) (Task, error) {
+	var out Task
+	return out, c.do(ctx, "PATCH", "/v1/tasks/"+id, req, &out)
+}
+
+func (c *Client) GetTeamCloseReceipt(ctx context.Context, task, requestID string) (TeamCloseResult, error) {
+	var out TeamCloseResult
+	return out, c.do(ctx, "GET", "/v1/tasks/"+task+"/team-close/receipts/"+url.PathEscape(requestID), nil, &out)
+}
+
 func (c *Client) CloseTask(ctx context.Context, id string) (Task, error) {
 	var out Task
 	return out, c.do(ctx, "DELETE", "/v1/tasks/"+id, nil, &out)

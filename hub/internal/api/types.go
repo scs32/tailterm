@@ -256,6 +256,7 @@ type CreateTaskRequest struct {
 }
 
 type UpdateTaskRequest struct {
+	TeamLaunchToken string  `json:"teamLaunchToken,omitempty"`
 	Orchestrator    *string `json:"orchestrator"`
 	Swarm           *bool   `json:"swarm"`
 	MaxNewAgents    *int    `json:"maxNewAgents"`

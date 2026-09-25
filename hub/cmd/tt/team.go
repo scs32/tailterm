@@ -63,8 +63,11 @@ type teamLaunchJournal struct {
 }
 
 func cmdTeam(e env, args []string) error {
+	if len(args) > 0 && args[0] == "queue" {
+		return cmdTeamQueue(e, args[1:])
+	}
 	if len(args) == 0 || args[0] != "launch" {
-		return errors.New("usage: tt team launch --item ID --order SEQ [--template planned] [--dry-run]")
+		return errors.New("usage: tt team launch --item ID --order SEQ [--template planned] [--dry-run] | tt team queue add|list|remove|reorder")
 	}
 	if len(args) == 2 && (args[1] == "--help" || args[1] == "-h") {
 		fmt.Println("usage: tt team launch --item ID --order SEQ [--template planned] [--dry-run] [--task ID] [--hub URL] [--cwd DIR]")
@@ -172,6 +175,10 @@ func cmdTeam(e env, args []string) error {
 	if e.agent != "" {
 		return errors.New("team launch from an agent session needs handler-authored allocation intents; run this command from the owner's unbound CLI session")
 	}
+	reservation := fmt.Sprintf("manual-%s-%s-%d", *task, *item, *order)
+	if _, err := c.TeamQueueAction(ctx, *task, api.TeamQueueRequest{RequestID: reservation, Operation: "manual", ItemID: *item, OrderMessageSeq: *order, PauseGeneration: detail.Task.PauseGeneration}); err != nil {
+		return fmt.Errorf("reserve project team launch: %w", err)
+	}
 	path, err := teamJournalPath(*hub, *task, *item, *order)
 	if err != nil {
 		return err
@@ -223,8 +230,8 @@ func cmdTeam(e env, args []string) error {
 	}
 	lead := journal.Members[0].Fields.Name
 	if detail.Task.Orchestrator != lead {
-		var updated api.Task
-		if err := teamplan.Run(ctx, map[string]any{"action": "set-orchestrator", "hub": *hub, "token": e.token, "task": *task, "orchestrator": lead}, &updated); err != nil {
+		updated, err := c.UpdateTask(ctx, *task, api.UpdateTaskRequest{Orchestrator: &lead, TeamLaunchToken: reservation})
+		if err != nil {
 			return err
 		}
 		if updated.Orchestrator != lead {

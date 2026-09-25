@@ -508,7 +508,11 @@ func (b *Bridge) refreshCard(ctx context.Context, m Mapping) error {
 	if err != nil {
 		return err
 	}
-	send, hash := renderCard(detail.Task, detail.Agents, obligations)
+	queue, err := b.cfg.Hub.ListTeamQueue(ctx, m.TaskID)
+	if err != nil {
+		return err
+	}
+	send, hash := renderCardWithQueue(detail.Task, detail.Agents, obligations, queue)
 	if hash == m.CardHash && m.CardMessageID != "" {
 		return nil
 	}

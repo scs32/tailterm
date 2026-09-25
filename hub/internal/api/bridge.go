@@ -31,6 +31,7 @@ var BridgeRoutes = map[string]bool{
 	"GET /v1/tasks":                                    true,
 	"GET /v1/tasks/{id}":                               true,
 	"GET /v1/tasks/{id}/agents":                        true,
+	"GET /v1/tasks/{id}/team-queue":                    true,
 	"GET /v1/tasks/{id}/messages":                      true,
 	"POST /v1/tasks/{id}/messages":                     true,
 	"GET /v1/tasks/{id}/messages/receipts/{requestID}": true,

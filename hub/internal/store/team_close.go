@@ -174,9 +174,31 @@ func (s *Store) CloseItemTeam(ctx context.Context, taskID string, req api.TeamCl
 	if _, err := tx.ExecContext(ctx, `INSERT INTO team_close_receipts(task_id,request_id,payload_hash,result_json,created_at) VALUES (?,?,?,?,?)`, taskID, req.RequestID, hash, string(resultJSON), now); err != nil {
 		return zero, err
 	}
+	// Queue reservations stay until the runner confirms cleanup receipts.
+	// A manual launch reservation is released by the exact team close.
+	if _, err := tx.ExecContext(ctx, `DELETE FROM team_launch_reservations WHERE task_id=? AND entry_id='' AND item_id=?`, taskID, req.ItemID); err != nil {
+		return zero, err
+	}
 	if err := tx.Commit(); err != nil {
 		return zero, err
 	}
 	s.notify(taskID)
 	return result, nil
+}
+
+func (s *Store) GetTeamCloseReceipt(ctx context.Context, taskID, requestID string) (api.TeamCloseResult, error) {
+	var out api.TeamCloseResult
+	if !api.ValidID(taskID, "tsk") || !validRequestID(requestID) {
+		return out, api.ErrInvalid
+	}
+	var encoded string
+	err := s.db.QueryRowContext(ctx, `SELECT result_json FROM team_close_receipts WHERE task_id=? AND request_id=?`, taskID, requestID).Scan(&encoded)
+	if errors.Is(err, sql.ErrNoRows) {
+		return out, api.ErrNotFound
+	}
+	if err != nil {
+		return out, err
+	}
+	err = json.Unmarshal([]byte(encoded), &out)
+	return out, err
 }

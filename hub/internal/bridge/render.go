@@ -301,6 +301,10 @@ func reopenFence(open string) string {
 // card is a project's pinned status: roster, open obligations per agent and
 // the overdue ones. Its hash ignores time, so it only changes on real change.
 func renderCard(task api.Task, agents []api.Agent, obligations []api.Obligation) (discord.MessageSend, string) {
+	return renderCardWithQueue(task, agents, obligations, api.TeamQueueList{})
+}
+
+func renderCardWithQueue(task api.Task, agents []api.Agent, obligations []api.Obligation, queue api.TeamQueueList) (discord.MessageSend, string) {
 	open := map[string]int{}
 	overdue := map[string]int{}
 	unacked := map[string]int{}
@@ -376,6 +380,21 @@ func renderCard(task api.Task, agents []api.Agent, obligations []api.Obligation)
 			lines = append(lines, fmt.Sprintf("#%d %s → %s", o.MessageSeq, truncate(clean(o.Subject), 60), clean(names.name(o.AgentID))))
 		}
 		embed.Fields = append(embed.Fields, discord.EmbedField{Name: fmt.Sprintf("Recent withdrawn (%d)", len(withdrawn)), Value: truncate(strings.Join(lines, "\n"), 1000)})
+	}
+	if len(queue.Entries) > 0 {
+		var qlines []string
+		for i, q := range queue.Entries {
+			if i == 8 {
+				qlines = append(qlines, fmt.Sprintf("and %d more", len(queue.Entries)-i))
+				break
+			}
+			label := fmt.Sprintf("%d. %s · %s", q.Position, clean(q.ItemID), q.State)
+			if q.State == "running" {
+				label = "**" + label + "**"
+			}
+			qlines = append(qlines, label)
+		}
+		embed.Fields = append(embed.Fields, discord.EmbedField{Name: "Team queue", Value: truncate(strings.Join(qlines, "\n"), 1000)})
 	}
 	raw, _ := json.Marshal(embed)
 	sum := sha256.Sum256(raw)

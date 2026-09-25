@@ -20,6 +20,7 @@ import (
 )
 
 type teamFixture struct {
+	st                   *store.Store
 	e                    env
 	c                    *api.Client
 	task                 api.Task
@@ -41,6 +42,7 @@ func newTeamFixture(t *testing.T, withHandler bool) teamFixture {
 	t.Cleanup(func() { st.Close() })
 	by := api.Caller{Node: "team-fixture", User: "owner"}
 	f := teamFixture{dropFirstMemberReply: &atomic.Bool{}}
+	f.st = st
 	handler := server.New(st, func(*http.Request) (api.Caller, error) { return by, nil })
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == "POST" && strings.HasSuffix(r.URL.Path, "/agents") && f.dropFirstMemberReply.CompareAndSwap(true, false) {
