@@ -178,7 +178,7 @@ func cmdTeam(e env, args []string) error {
 		return errors.New("team launch from an agent session needs handler-authored allocation intents; run this command from the owner's unbound CLI session")
 	}
 	reservation := fmt.Sprintf("manual-%s-%s-%d", *task, *item, *order)
-	if _, err := c.TeamQueueAction(ctx, *task, api.TeamQueueRequest{RequestID: reservation, Operation: "manual", ItemID: *item, OrderMessageSeq: *order, PauseGeneration: detail.Task.PauseGeneration}); err != nil {
+	if _, err := c.TeamQueueAction(ctx, *task, api.TeamQueueRequest{RequestID: reservation, Operation: "manual", ItemID: *item, OrderMessageSeq: *order, PauseGeneration: detail.Task.PauseGeneration, Host: spawn.Host()}); err != nil {
 		return fmt.Errorf("reserve project team launch: %w", err)
 	}
 	path, err := teamJournalPath(*hub, *task, *item, *order)

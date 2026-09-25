@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"strings"
 
 	"github.com/scs32/tailterm/hub/internal/api"
@@ -99,24 +100,37 @@ func queueGitCommit(cwd string) (string, error) {
 	return strings.TrimSpace(string(output)), nil
 }
 
-func queueIntegrationSnapshot(ctx context.Context, q api.TeamQueueEntry, item api.WorkItem, closeReq api.TeamCloseRequest) (*api.TeamIntegrationReady, error) {
-	if item.Status != "done" || q.Repository == "" || q.BaseCommit == "" {
-		return nil, errors.New("accepted item lacks a frozen repository and base")
+func queueIntegrationSnapshot(ctx context.Context, q api.TeamQueueEntry, item api.WorkItem, _ api.TeamCloseRequest) (*api.TeamIntegrationReady, error) {
+	accepted := q.Acceptance
+	if item.Status != "done" || accepted == nil || q.Repository == "" || q.BaseCommit == "" || accepted.Repository != q.Repository || accepted.BaseCommit != q.BaseCommit || accepted.ItemRevision != item.Revision || !reflect.DeepEqual(accepted.CompletionReport, item.CompletionReport) {
+		return nil, errors.New("accepted item lacks an exact saved handler acceptance receipt")
 	}
 	git := func(args ...string) (string, error) {
-		argv := append([]string{"-C", q.Cwd}, args...)
+		argv := append([]string{"-C", accepted.Worktree}, args...)
 		output, err := exec.CommandContext(ctx, "git", argv...).Output()
 		if err != nil {
 			return "", err
 		}
 		return strings.TrimSpace(string(output)), nil
 	}
+	root, err := git("rev-parse", "--show-toplevel")
+	if err != nil {
+		return nil, err
+	}
+	realRoot, err := filepath.EvalSymlinks(root)
+	if err != nil {
+		return nil, err
+	}
+	realAccepted, err := filepath.EvalSymlinks(accepted.Worktree)
+	if err != nil || realRoot != realAccepted {
+		return nil, errors.New("accepted worktree is not its canonical Git root")
+	}
 	common, err := git("rev-parse", "--git-common-dir")
 	if err != nil {
 		return nil, err
 	}
 	if !filepath.IsAbs(common) {
-		common = filepath.Join(q.Cwd, common)
+		common = filepath.Join(accepted.Worktree, common)
 	}
 	common, err = filepath.EvalSymlinks(common)
 	if err != nil {
@@ -133,6 +147,9 @@ func queueIntegrationSnapshot(ctx context.Context, q api.TeamQueueEntry, item ap
 	if err != nil {
 		return nil, err
 	}
+	if branch != accepted.Branch || commit != accepted.Commit {
+		return nil, errors.New("accepted worktree moved from the saved branch and commit")
+	}
 	status, err := git("status", "--porcelain")
 	if err != nil {
 		return nil, err
@@ -143,9 +160,5 @@ func queueIntegrationSnapshot(ctx context.Context, q api.TeamQueueEntry, item ap
 	if _, err := git("merge-base", "--is-ancestor", q.BaseCommit, commit); err != nil {
 		return nil, errors.New("accepted commit is not descended from frozen base")
 	}
-	evidence := fmt.Sprintf("item=%s@%d;close=%s", item.ID, item.Revision, closeReq.RequestID)
-	if item.CompletionReport != nil {
-		evidence += fmt.Sprintf(";report=%s@%d:%s", item.CompletionReport.ReportID, item.CompletionReport.Version, item.CompletionReport.Digest)
-	}
-	return &api.TeamIntegrationReady{Repository: q.Repository, BaseCommit: q.BaseCommit, Branch: branch, Commit: commit, Evidence: evidence}, nil
+	return &api.TeamIntegrationReady{Repository: accepted.Repository, BaseCommit: accepted.BaseCommit, Worktree: accepted.Worktree, Branch: accepted.Branch, Commit: accepted.Commit, Evidence: accepted.Evidence}, nil
 }

@@ -200,10 +200,15 @@ func (s *Store) ScheduleMonitorDelivery(ctx context.Context, taskID string, lead
 			return notice, "unknown", err
 		}
 		var matches int
-		if err = tx.QueryRowContext(ctx, `SELECT count(*) FROM agents WHERE task_id=? AND name=? AND role=''`, taskID, task.Orchestrator).Scan(&matches); err != nil {
+		if err = tx.QueryRowContext(ctx, `SELECT count(*) FROM item_team_leads WHERE task_id=? AND agent_id=? AND run_id=? AND state='running'`, taskID, lead.ID, lead.RunID).Scan(&matches); err != nil {
 			return notice, "unknown", err
 		}
-		if matches != 1 || target.TaskID != taskID || target.Name != task.Orchestrator || target.Role != "" || target.RunID != lead.RunID {
+		var limit int
+		if err = tx.QueryRowContext(ctx, `SELECT COALESCE((SELECT concurrency_limit FROM team_queue_settings WHERE task_id=?),1)`, taskID).Scan(&limit); err != nil {
+			return notice, "unknown", err
+		}
+		legacyLead := limit == 1 && task.Orchestrator != "" && target.Name == task.Orchestrator
+		if (matches != 1 && !legacyLead) || target.TaskID != taskID || target.Role != "" || target.RunID != lead.RunID {
 			return finish("unknown", fmt.Errorf("orchestrator identity changed before delivery"))
 		}
 		switch target.Status {

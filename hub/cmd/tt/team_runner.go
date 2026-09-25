@@ -28,6 +28,7 @@ type teamRunner struct {
 	owned       func(context.Context, env, api.Agent) error
 	cleanup     func(context.Context, env, string, string) error
 	integration func(context.Context, api.TeamQueueEntry, api.WorkItem, api.TeamCloseRequest) (*api.TeamIntegrationReady, error)
+	census      func(context.Context, *api.Client, string, string, string, int64, *api.TeamHostUsage) error
 	roundRobin  bool
 }
 
@@ -91,7 +92,10 @@ func productionTeamRunner() teamRunner {
 			return nil
 		},
 		integration: queueIntegrationSnapshot,
-		roundRobin:  true,
+		census: func(ctx context.Context, c *api.Client, task, host, domain string, version int64, prior *api.TeamHostUsage) error {
+			return saveHostRelayCensus(ctx, c, task, host, domain, version, prior, time.Now())
+		},
+		roundRobin: true,
 	}
 }
 
@@ -99,6 +103,18 @@ func (r teamRunner) tick(ctx context.Context, e env, c *api.Client, host string)
 	list, err := c.TeamQueueByHost(ctx, host)
 	if err != nil {
 		return err
+	}
+	if list.HostPolicy != nil && len(list.Entries) > 0 && r.census != nil {
+		domain, domainErr := canonicalLimiterDomain(c.Base)
+		if domainErr != nil || domain != list.HostPolicy.LimiterDomain {
+			return errors.New("host policy limiter domain differs from relay hub")
+		}
+		// A stale policy blocks new effects in the store, while exact close and
+		// cleanup still advance under the last configured relay budget.
+		_ = activeRelayBudget.configure(list.HostPolicy, time.Now())
+		if err := r.census(ctx, c, list.Entries[0].TaskID, host, list.HostPolicy.LimiterDomain, list.HostPolicy.Version, list.HostUsage); err != nil {
+			return err
+		}
 	}
 	seen := map[string]bool{}
 	projects := make([]string, 0)
@@ -511,6 +527,9 @@ func (r teamRunner) finish(ctx context.Context, e env, c *api.Client, q api.Team
 	}
 	var integration *api.TeamIntegrationReady
 	if item.Status == "done" && q.Repository != "" {
+		if q.Acceptance == nil {
+			return nil // The assigned handler has not saved exact Git acceptance yet.
+		}
 		if r.integration == nil {
 			return r.fail(ctx, c, q, errors.New("integration snapshot provider is unavailable"))
 		}
@@ -533,5 +552,6 @@ func relayTeamQueueTick(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	attachRelayBudget(c, activeRelayBudget)
 	return productionTeamRunner().tick(ctx, e, c, spawn.Host())
 }

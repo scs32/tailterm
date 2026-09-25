@@ -29,7 +29,7 @@ func validTeamQueueEntryID(id string) bool {
 
 func cmdTeamQueue(e env, args []string) error {
 	if len(args) == 0 {
-		return errors.New("usage: tt team queue add|list|policy|limit|replace-lead|remove|reorder|release|abandon")
+		return errors.New("usage: tt team queue add|list|policy|limit|accept|replace-lead|remove|reorder|release|abandon")
 	}
 	sub := args[0]
 	fs := flag.NewFlagSet("team queue "+sub, flag.ContinueOnError)
@@ -40,6 +40,10 @@ func cmdTeamQueue(e env, args []string) error {
 	template := fs.String("template", "planned", "team template")
 	entry := fs.String("entry", "", "queue entry ID")
 	leadAgent := fs.String("lead-agent", "", "exact replacement item team member ID")
+	worktree := fs.String("worktree", "", "accepted builder worktree root")
+	branch := fs.String("branch", "", "accepted branch")
+	commit := fs.String("commit", "", "accepted commit SHA")
+	acceptanceEvidence := fs.String("evidence", "", "handler-saved terminal acceptance evidence reference")
 	before := fs.String("before", "", "place before this queued entry; omit to move to end")
 	cwd := fs.String("cwd", "", "absolute project folder for launch host")
 	var ownership ownershipFlags
@@ -49,6 +53,10 @@ func cmdTeamQueue(e env, args []string) error {
 	policyExpires := fs.String("expires", "", "host policy expiry in RFC3339")
 	policySessions := fs.Int("sessions", 0, "host session budget")
 	policyPolling := fs.Int("polling", 0, "host polling budget")
+	policyBindings := fs.Int("bindings", 0, "maximum host relay bindings")
+	policyRate := fs.Int("requests-per-minute", 0, "host relay request-rate budget")
+	policyBurst := fs.Int("burst", 0, "host relay burst budget")
+	policyHeadroom := fs.Int("headroom-percent", 0, "reserved host limiter headroom percent")
 	jsonOut := fs.Bool("json", false, "print JSON")
 	if err := fs.Parse(args[1:]); err != nil {
 		return err
@@ -88,26 +96,44 @@ func cmdTeamQueue(e env, args []string) error {
 			}
 			fmt.Printf("%d %s %s %s order=#%d revision=%d repository=%s owns=%s blocked-by=%s reason=%s handler=%s/%s lease=%d\n", q.Position, state, q.ID, q.ItemID, q.OrderMessageSeq, q.Revision, q.Repository, owns, strings.Join(q.BlockedBy, ","), q.BlockReason, q.HandlerID, q.HandlerRunID, q.HandlerLeaseGeneration)
 			if q.Integration != nil {
-				fmt.Printf("  Ready to integrate: base=%s branch=%s commit=%s evidence=%s\n", q.Integration.BaseCommit, q.Integration.Branch, q.Integration.Commit, q.Integration.Evidence)
+				fmt.Printf("  Ready to integrate: base=%s worktree=%s branch=%s commit=%s evidence=%s\n", q.Integration.BaseCommit, q.Integration.Worktree, q.Integration.Branch, q.Integration.Commit, q.Integration.Evidence)
+			} else if q.Acceptance != nil {
+				fmt.Printf("  Accepted for integration: worktree=%s branch=%s commit=%s; waiting for exact cleanup\n", q.Acceptance.Worktree, q.Acceptance.Branch, q.Acceptance.Commit)
 			}
 		}
 		return nil
 	}
-	if e.agent != "" {
+	if e.agent != "" && sub != "accept" {
 		return errors.New("owner-side team queue changes require an unbound CLI session")
 	}
 	req := api.TeamQueueRequest{RequestID: api.NewID("tqr"), Operation: sub}
 	switch sub {
 	case "policy":
-		if *policyVersion < 1 || *policyExpires == "" || *policySessions < 1 || *policyPolling < 1 {
-			return errors.New("usage: tt team queue policy --policy-version N --expires RFC3339 --sessions N --polling N")
+		if *policyVersion < 1 || *policyExpires == "" || *policySessions < 1 || *policyPolling < 1 || *policyBindings < 1 || *policyRate < 1 || *policyBurst < 1 || *policyHeadroom < 1 || *policyHeadroom >= 100 {
+			return errors.New("usage: tt team queue policy --policy-version N --expires RFC3339 --sessions N --polling N --bindings N --requests-per-minute N --burst N --headroom-percent N")
 		}
 		req.Operation, req.Host, req.HostPolicyVersion, req.HostPolicyExpires, req.HostMaxSessions, req.HostMaxPolling = "set_host_policy", spawn.Host(), *policyVersion, *policyExpires, *policySessions, *policyPolling
+		req.LimiterDomain, err = canonicalLimiterDomain(e.hub)
+		if err != nil {
+			return err
+		}
+		req.HostMaxRelayBindings, req.HostMaxRequestsPerMinute, req.HostMaxBurst, req.HostHeadroomPercent = *policyBindings, *policyRate, *policyBurst, *policyHeadroom
 	case "limit":
 		if *limit < 1 || *limit > 2 {
 			return errors.New("usage: tt team queue limit --limit 1|2")
 		}
 		req.Operation, req.ConcurrencyLimit, req.Host = "set_limit", *limit, spawn.Host()
+		if *limit > 1 {
+			list, listErr := c.TeamQueueByHost(ctx, req.Host)
+			if listErr != nil {
+				return listErr
+			}
+			if list.HostPolicy != nil {
+				if err := saveHostRelayCensus(ctx, c, *task, req.Host, list.HostPolicy.LimiterDomain, list.HostPolicy.Version, list.HostUsage, time.Now()); err != nil {
+					return err
+				}
+			}
+		}
 	case "add":
 		if !api.ValidID(*item, "wi") || *order < 1 || *template != "planned" {
 			return errors.New("usage: tt team queue add --item wi_ID --order SEQ [--template planned]")
@@ -137,7 +163,7 @@ func cmdTeamQueue(e env, args []string) error {
 				return err
 			}
 		}
-	case "remove", "reorder", "release", "replace-lead":
+	case "remove", "reorder", "release", "replace-lead", "accept":
 		if !validTeamQueueEntryID(*entry) {
 			return errors.New("remove/reorder/release/replace-lead requires --entry tqe_ID")
 		}
@@ -146,6 +172,35 @@ func cmdTeamQueue(e env, args []string) error {
 			return err
 		}
 		req.EntryID, req.ExpectedRevision, req.BeforeID = q.ID, q.Revision, *before
+		if sub == "accept" {
+			if e.agent == "" || e.runID == "" || e.agent != q.HandlerID || e.runID != q.HandlerRunID || *worktree == "" || *branch == "" || *commit == "" || *acceptanceEvidence == "" {
+				return errors.New("accept requires the exact assigned handler and --worktree, --branch, --commit and --evidence")
+			}
+			realWorktree, err := filepath.EvalSymlinks(*worktree)
+			if err != nil || !filepath.IsAbs(realWorktree) {
+				return errors.New("accepted worktree must be an existing absolute path")
+			}
+			repository, err := queueRepositoryScope(realWorktree, nil)
+			if err != nil || repository != q.Repository {
+				return errors.New("accepted worktree is outside the frozen repository")
+			}
+			item, err := c.GetWorkItem(ctx, *task, q.ItemID)
+			if err != nil {
+				return err
+			}
+			if item.Status != "done" {
+				return errors.New("handler acceptance requires the saved done item")
+			}
+			req.Operation, req.RequestID = "accept", "queue-accept-"+q.ID
+			req.HandlerAgentID, req.HandlerRunID = e.agent, e.runID
+			req.Acceptance = &api.TeamIntegrationAcceptance{Repository: q.Repository, BaseCommit: q.BaseCommit, Worktree: realWorktree, Branch: *branch, Commit: *commit, ItemRevision: item.Revision, CompletionReport: item.CompletionReport, Evidence: *acceptanceEvidence}
+			if q.Acceptance == nil {
+				ready, err := queueIntegrationSnapshot(ctx, api.TeamQueueEntry{Repository: q.Repository, BaseCommit: q.BaseCommit, Acceptance: req.Acceptance}, item, api.TeamCloseRequest{})
+				if err != nil || ready.Commit != *commit {
+					return fmt.Errorf("accepted Git tuple failed worktree verification: %v", err)
+				}
+			}
+		}
 		if sub == "replace-lead" {
 			if !api.ValidID(*leadAgent, "agt") {
 				return errors.New("replace-lead requires --lead-agent agt_ID")

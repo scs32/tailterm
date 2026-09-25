@@ -1539,7 +1539,26 @@ func (s *Store) escalateDeliveryFollowThrough(ctx context.Context, tx *sql.Tx, d
 	}
 	var target api.Agent
 	var count int
-	rows, err := tx.QueryContext(ctx, `SELECT `+agentCols+` FROM agents WHERE task_id=? AND name=? AND role=''`, d.TaskID, task.Orchestrator)
+	var scopedRows int
+	if err := tx.QueryRowContext(ctx, `SELECT count(*) FROM item_team_leads WHERE task_id=? AND item_id=?`, d.ItemTaskID, d.ItemID).Scan(&scopedRows); err != nil {
+		return api.Message{}, api.DeliveryEvent{}, err
+	}
+	if scopedRows == 0 {
+		var limit int
+		if err := tx.QueryRowContext(ctx, `SELECT COALESCE((SELECT concurrency_limit FROM team_queue_settings WHERE task_id=?),1)`, d.TaskID).Scan(&limit); err != nil {
+			return api.Message{}, api.DeliveryEvent{}, err
+		}
+		if limit > 1 {
+			return api.Message{}, api.DeliveryEvent{}, workItemConflict("exact item lead is unavailable for follow-through escalation")
+		}
+	}
+	query := `SELECT ` + agentCols + ` FROM agents WHERE task_id=? AND name=? AND role=''`
+	args := []any{d.TaskID, task.Orchestrator}
+	if scopedRows != 0 {
+		query = `SELECT ` + agentCols + ` FROM agents WHERE task_id=? AND role='' AND EXISTS (SELECT 1 FROM item_team_leads l WHERE l.task_id=? AND l.item_id=? AND l.agent_id=agents.id AND l.run_id=agents.run_id AND l.state='running')`
+		args = []any{d.TaskID, d.ItemTaskID, d.ItemID}
+	}
+	rows, err := tx.QueryContext(ctx, query, args...)
 	if err != nil {
 		return api.Message{}, api.DeliveryEvent{}, err
 	}

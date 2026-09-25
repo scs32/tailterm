@@ -44,10 +44,11 @@ On the launch host, the owner can save a sequence of recorded item orders:
 ```sh
 tt team queue add --task tsk_... --item wi_... --order 123 --template planned
 tt team queue add --task tsk_... --item wi_... --order 124 --cwd /absolute/worktree --owns client --owns hub/internal/store
-tt team queue policy --task tsk_... --policy-version 1 --expires 2026-09-26T00:00:00Z --sessions 20 --polling 2
+tt team queue policy --task tsk_... --policy-version 1 --expires RFC3339 --sessions N --polling N --bindings N --requests-per-minute N --burst N --headroom-percent N
 tt team queue limit --task tsk_... --limit 2
 tt team queue list --task tsk_...
 tt team queue replace-lead --task tsk_... --entry tqe_... --lead-agent agt_...
+tt team queue accept --task tsk_... --entry tqe_... --worktree /absolute/builder/worktree --branch feature/name --commit FULL_SHA --evidence 'handler-saved acceptance receipt'
 tt team queue reorder --task tsk_... --entry tqe_... --before tqe_...
 tt team queue remove --task tsk_... --entry tqe_...
 tt team queue release --task tsk_... --entry tqe_...
@@ -55,10 +56,24 @@ tt team queue abandon --task tsk_... --item wi_... --order 123
 ```
 
 The default project limit is one. The owner may set two only under a fresh,
-versioned host policy whose session and polling budgets cover all projects on
-that host. A stale or missing policy stops new parallel launch effects; it does
+versioned owner policy whose session, project polling, relay binding, request
+rate, burst and headroom caps cover the host's hub limiter domain. The CLI
+derives the domain from the configured hub origin. No safe production values
+are inferred. The host CLI inventories every local relay binding file before
+raising a limit, and the relay refreshes this census before parallel queue
+effects. An unreadable binding, another unbudgeted domain, missing or stale
+census, or incomplete policy stops new parallel launch effects; it does
 not kill running teams. The relay rotates the first polled project and backs
-off after a hub 429; unrelated inbox delivery continues. The initial ceiling
+off after a hub 429; unrelated inbox delivery continues. A shared transport
+bucket charges actual queue and binding HTTP requests, with reserved shares
+for each path so a queue burst cannot starve inbox checks. Admission projects
+80 requests per minute and six burst tokens per binding, plus 20 requests per
+minute for the host queue scan and up to six effects per polled project. This
+bounded worst-case estimate must fit both the total cap and its reserved
+queue/binding shares (one quarter and three quarters); the transport bucket
+enforces actual rate and burst. Reservations include every uncleaned agent run,
+uncertain and pending members, extras and manual launches (four slots before
+a manual plan is known). The initial ceiling
 is two. The owner provisions
 additional database handlers as ordinary continuing handler agents; the runner
 never starts or resumes them. Each running item leases a distinct exact
@@ -88,9 +103,15 @@ continue; ownership blocked by the failed entry waits for an explicit verified
 release. Pausing the project stops launch ticks. The deliberate agent Queue is
 separate.
 
-An accepted parallel item becomes **Ready to integrate** only after its exact
-team close and cleanup receipts. The saved repository, base, branch, commit
-and acceptance evidence appear in the queue and Projects Delivery panel. The
+After the database handler saves terminal acceptance, that exact assigned
+handler records the accepted builder worktree, branch, full SHA and saved
+acceptance evidence with `team queue accept`. Its retry key is stable and pins
+the exact item revision and completion report. The runner waits for this
+receipt and exact team close and cleanup receipts. It verifies that the
+accepted worktree still has the saved branch, commit, repository, base ancestry
+and a clean tree; a later HEAD cannot replace the accepted SHA. Then the item
+becomes **Ready to integrate**. The saved tuple and evidence appear in the
+queue and Projects Delivery panel. The
 owner performs any merge, push or deployment separately. Dismissed items have
 no integration record.
 

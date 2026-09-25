@@ -6,9 +6,9 @@ import { createServer } from "vite";
 const html = `<!doctype html><html><head><link rel="stylesheet" href="/client/style.css"><link rel="stylesheet" href="/client/work-items.css"></head><body><main id="delivery"></main><script type="module">
 import {renderTeamDelivery} from '/client/team-delivery-view.js';
 const queue={concurrencyLimit:2,entries:[
- {itemId:'wi_aaaaaaaaaaaaaaaa',state:'running',ownership:['src/a'],handlerId:'agt_handler_a'},
+ {itemId:'wi_aaaaaaaaaaaaaaaa',state:'running',ownership:['src/a'],handlerId:'agt_handler_a',acceptance:{branch:'feature/a',commit:'c'.repeat(40)}},
  {itemId:'wi_bbbbbbbbbbbbbbbb',state:'queued',ownership:['src/a/child'],blockedBy:['tqe_aaaaaaaaaaaaaaaa'],blockReason:'ownership overlap'},
- {itemId:'wi_cccccccccccccccc',state:'finished',ownership:['src/c'],handlerId:'agt_handler_c',integration:{repository:'/fixture/git',baseCommit:'a'.repeat(40),branch:'feature/c',commit:'b'.repeat(40),evidence:'item=C;close=receipt'}}
+ {itemId:'wi_cccccccccccccccc',state:'finished',ownership:['src/c'],handlerId:'agt_handler_c',integration:{repository:'/fixture/git',baseCommit:'a'.repeat(40),worktree:'/fixture/builder-c',branch:'feature/c',commit:'b'.repeat(40),evidence:'item=C;close=receipt'}}
 ]};
 const agents=[{id:'agt_lead_a',name:'Lead A',itemLead:true,workItem:{itemId:'wi_aaaaaaaaaaaaaaaa'}},{id:'agt_handler_a',name:'Handler A'},{id:'agt_handler_c',name:'Handler C'}];
 document.querySelector('#delivery').innerHTML=renderTeamDelivery(queue,agents);
@@ -43,7 +43,9 @@ try {
       assert.match(await page.locator('[data-testid="team-delivery-panel"]').innerText(), /Limit 2/);
       assert.match(await page.locator('[data-testid="team-delivery-entry"]').nth(1).innerText(), /Waiting for tqe_aaaaaaaaaaaaaaaa/);
       assert.match(await page.locator('[data-testid="team-delivery-entry"]').nth(0).innerText(), /Lead Lead A · Handler Handler A/);
+      assert.match(await page.locator('[data-testid="team-delivery-entry"]').nth(0).innerText(), /Accepted feature\/a @ c{40} · waiting for team cleanup/);
       assert.match(await page.locator('[data-testid="team-ready-to-integrate"]').innerText(), /feature\/c @ b{40}/);
+      assert.match(await page.locator('[data-testid="team-ready-to-integrate"]').innerText(), /\/fixture\/builder-c/);
       assert.equal(await page.locator('[data-testid="team-delivery-panel"] button').count(), 0);
       await page.evaluate(() => {
         fixture.queue.entries[2].state = "running";

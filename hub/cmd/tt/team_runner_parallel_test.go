@@ -48,7 +48,10 @@ func TestTeamRunnerParallelSkipsConflictAndFinishesOtherSlot(t *testing.T) {
 		items = append(items, item)
 		orders = append(orders, message.Seq)
 	}
-	if _, err := f.c.TeamQueueAction(ctx, f.task.ID, api.TeamQueueRequest{RequestID: "parallel-policy", Operation: "set_host_policy", Host: "fixture", HostPolicyVersion: 1, HostPolicyExpires: time.Now().Add(time.Hour).Format(time.RFC3339), HostMaxSessions: 20, HostMaxPolling: 2}); err != nil {
+	if _, err := f.c.TeamQueueAction(ctx, f.task.ID, api.TeamQueueRequest{RequestID: "parallel-policy", Operation: "set_host_policy", Host: "fixture", HostPolicyVersion: 1, HostPolicyExpires: time.Now().Add(time.Hour).Format(time.RFC3339), HostMaxSessions: 20, HostMaxPolling: 2, LimiterDomain: "https://fixture.invalid", HostMaxRelayBindings: 100, HostMaxRequestsPerMinute: 100000, HostMaxBurst: 10000, HostHeadroomPercent: 20}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.c.TeamQueueAction(ctx, f.task.ID, api.TeamQueueRequest{RequestID: "parallel-usage", Operation: "observe_host", Host: "fixture", HostUsage: &api.TeamHostUsage{Host: "fixture", LimiterDomain: "https://fixture.invalid", PolicyVersion: 1, ObservedAt: time.Now().UTC().Format(time.RFC3339Nano), RelayBindings: 1, Complete: true, SourceDigest: strings.Repeat("a", 64)}}); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := f.c.TeamQueueAction(ctx, f.task.ID, api.TeamQueueRequest{RequestID: "parallel-limit", Operation: "set_limit", Host: "fixture", ConcurrencyLimit: 2}); err != nil {
@@ -111,8 +114,9 @@ func TestTeamRunnerParallelSkipsConflictAndFinishesOtherSlot(t *testing.T) {
 			_, err = f.c.ReportCleanup(ctx, task, id, api.CleanupRequest{RunID: agent.RunID})
 			return err
 		},
-		integration: func(_ context.Context, q api.TeamQueueEntry, _ api.WorkItem, closeReq api.TeamCloseRequest) (*api.TeamIntegrationReady, error) {
-			return &api.TeamIntegrationReady{Repository: q.Repository, BaseCommit: q.BaseCommit, Branch: "feature/item-c", Commit: strings.Repeat("b", 40), Evidence: "close=" + closeReq.RequestID}, nil
+		integration: func(_ context.Context, q api.TeamQueueEntry, _ api.WorkItem, _ api.TeamCloseRequest) (*api.TeamIntegrationReady, error) {
+			a := q.Acceptance
+			return &api.TeamIntegrationReady{Repository: a.Repository, BaseCommit: a.BaseCommit, Worktree: a.Worktree, Branch: a.Branch, Commit: a.Commit, Evidence: a.Evidence}, nil
 		},
 	}
 	time.Sleep(2 * time.Second) // isolated test hub's write bucket refills
@@ -196,6 +200,27 @@ func TestTeamRunnerParallelSkipsConflictAndFinishesOtherSlot(t *testing.T) {
 	}
 	if _, _, err := f.st.CreateWorkItemUpdate(ctx, f.task.ID, current.ID, api.CreateWorkItemUpdate{ExpectedRevision: current.Revision, RequestID: "parallel-c-done", Status: &terminal, CompletionReport: &api.NarrativeReportPin{ReportID: report.ReportID, Version: report.Version, Digest: report.Digest, ScopeRevision: report.ScopeRevision}}, by); err != nil {
 		t.Fatal(err)
+	}
+	current, err = f.c.GetWorkItem(ctx, f.task.ID, current.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c, err = f.c.GetTeamQueueEntry(ctx, f.task.ID, entries[2].ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	acceptReq := api.TeamQueueRequest{RequestID: "parallel-c-accept", Operation: "accept", EntryID: c.ID, ExpectedRevision: c.Revision, HandlerAgentID: c.HandlerID, HandlerRunID: c.HandlerRunID, Acceptance: &api.TeamIntegrationAcceptance{Repository: c.Repository, BaseCommit: c.BaseCommit, Worktree: c.Cwd, Branch: "feature/item-c", Commit: strings.Repeat("b", 40), ItemRevision: current.Revision, CompletionReport: current.CompletionReport, Evidence: "saved fixture acceptance"}}
+	accepted, err := f.c.TeamQueueAction(ctx, f.task.ID, acceptReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	acceptReq.ExpectedRevision = accepted.Revision // Lost-response replay uses the same request identity.
+	if replay, err := f.c.TeamQueueAction(ctx, f.task.ID, acceptReq); err != nil || replay.Acceptance == nil || replay.Acceptance.AcceptedAt != accepted.Acceptance.AcceptedAt {
+		t.Fatalf("acceptance receipt replay %+v %v", replay, err)
+	}
+	acceptReq.Acceptance.Commit = strings.Repeat("c", 40)
+	if _, err := f.c.TeamQueueAction(ctx, f.task.ID, acceptReq); err == nil {
+		t.Fatal("conflicting accepted SHA reused the receipt identity")
 	}
 	if err := runner.tick(ctx, f.e, f.c, "fixture"); err != nil {
 		t.Fatal(err)

@@ -470,6 +470,7 @@ func cmdRelay(args []string) error {
 			e.loadConfig()
 			c, err := e.client(15 * time.Second)
 			if err == nil {
+				attachRelayBudget(c, activeRelayBudget)
 				ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 				now := time.Now().UTC()
 				// A broker-path error never suppresses the existing paths.

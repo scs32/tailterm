@@ -8,6 +8,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"path/filepath"
+	"reflect"
 	"strings"
 	"time"
 
@@ -15,7 +17,28 @@ import (
 )
 
 func migrateTeamQueue(db *sql.DB) error {
-	_, err := db.Exec(`CREATE TABLE IF NOT EXISTS team_queue_entries (
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	var oldTable, pendingTable int
+	if err := tx.QueryRow(`SELECT count(*) FROM sqlite_master WHERE type='table' AND name='team_launch_reservations'`).Scan(&oldTable); err != nil {
+		return err
+	}
+	if err := tx.QueryRow(`SELECT count(*) FROM sqlite_master WHERE type='table' AND name='team_launch_reservations_v2'`).Scan(&pendingTable); err != nil {
+		return err
+	}
+	if pendingTable != 0 {
+		if oldTable == 0 {
+			if _, err := tx.Exec(`ALTER TABLE team_launch_reservations_v2 RENAME TO team_launch_reservations`); err != nil {
+				return err
+			}
+		} else if _, err := tx.Exec(`DROP TABLE team_launch_reservations_v2`); err != nil {
+			return err
+		}
+	}
+	_, err = tx.Exec(`CREATE TABLE IF NOT EXISTS team_queue_entries (
  id TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks(id), item_id TEXT NOT NULL REFERENCES work_items(id),
  item_revision INTEGER NOT NULL, order_seq INTEGER NOT NULL, template TEXT NOT NULL,
  position INTEGER NOT NULL, state TEXT NOT NULL CHECK(state IN ('queued','launching','running','finished','failed')),
@@ -31,11 +54,11 @@ func migrateTeamQueue(db *sql.DB) error {
 		return err
 	}
 	var n int
-	if err := db.QueryRow(`SELECT count(*) FROM pragma_table_info('team_queue_entries') WHERE name='released_at'`).Scan(&n); err != nil {
+	if err := tx.QueryRow(`SELECT count(*) FROM pragma_table_info('team_queue_entries') WHERE name='released_at'`).Scan(&n); err != nil {
 		return err
 	}
 	if n == 0 {
-		_, err = db.Exec(`ALTER TABLE team_queue_entries ADD COLUMN released_at TEXT NOT NULL DEFAULT ''`)
+		_, err = tx.Exec(`ALTER TABLE team_queue_entries ADD COLUMN released_at TEXT NOT NULL DEFAULT ''`)
 	}
 	if err != nil {
 		return err
@@ -48,27 +71,55 @@ func migrateTeamQueue(db *sql.DB) error {
 		{"handler_lease_generation", "INTEGER NOT NULL DEFAULT 0"},
 		{"base_commit", "TEXT NOT NULL DEFAULT ''"},
 		{"integration_json", "TEXT NOT NULL DEFAULT ''"},
+		{"acceptance_json", "TEXT NOT NULL DEFAULT ''"},
 	} {
 		var count int
-		if err := db.QueryRow(`SELECT count(*) FROM pragma_table_info('team_queue_entries') WHERE name=?`, column.name).Scan(&count); err != nil {
+		if err := tx.QueryRow(`SELECT count(*) FROM pragma_table_info('team_queue_entries') WHERE name=?`, column.name).Scan(&count); err != nil {
 			return err
 		}
 		if count == 0 {
-			if _, err := db.Exec("ALTER TABLE team_queue_entries ADD COLUMN " + column.name + " " + column.definition); err != nil {
+			if _, err := tx.Exec("ALTER TABLE team_queue_entries ADD COLUMN " + column.name + " " + column.definition); err != nil {
 				return err
 			}
 		}
 	}
-	_, err = db.Exec(`CREATE TABLE IF NOT EXISTS team_queue_settings(task_id TEXT PRIMARY KEY REFERENCES tasks(id), concurrency_limit INTEGER NOT NULL DEFAULT 1 CHECK(concurrency_limit BETWEEN 1 AND 2));
+	_, err = tx.Exec(`CREATE TABLE IF NOT EXISTS team_queue_settings(task_id TEXT PRIMARY KEY REFERENCES tasks(id), concurrency_limit INTEGER NOT NULL DEFAULT 1 CHECK(concurrency_limit BETWEEN 1 AND 2));
 		CREATE TABLE IF NOT EXISTS team_host_policies(host TEXT PRIMARY KEY,version INTEGER NOT NULL,expires_at TEXT NOT NULL,max_sessions INTEGER NOT NULL,max_polling INTEGER NOT NULL);
+		CREATE TABLE IF NOT EXISTS team_host_usage(host TEXT PRIMARY KEY,limiter_domain TEXT NOT NULL,policy_version INTEGER NOT NULL DEFAULT 0,observed_at TEXT NOT NULL,relay_bindings INTEGER NOT NULL,complete INTEGER NOT NULL,source_digest TEXT NOT NULL);
 		CREATE TABLE IF NOT EXISTS item_team_leads(task_id TEXT NOT NULL,item_id TEXT NOT NULL,agent_id TEXT NOT NULL,run_id TEXT NOT NULL,revision INTEGER NOT NULL DEFAULT 1,state TEXT NOT NULL CHECK(state IN ('launching','running','closed')),PRIMARY KEY(task_id,item_id));
 		DROP INDEX IF EXISTS team_queue_active;
 		CREATE INDEX IF NOT EXISTS team_queue_active ON team_queue_entries(task_id,state) WHERE state IN ('launching','running');`)
 	if err != nil {
 		return err
 	}
+	for _, column := range []struct{ name, definition string }{
+		{"limiter_domain", "TEXT NOT NULL DEFAULT ''"},
+		{"max_relay_bindings", "INTEGER NOT NULL DEFAULT 0"},
+		{"max_requests_per_minute", "INTEGER NOT NULL DEFAULT 0"},
+		{"max_burst", "INTEGER NOT NULL DEFAULT 0"},
+		{"headroom_percent", "INTEGER NOT NULL DEFAULT 0"},
+	} {
+		var count int
+		if err := tx.QueryRow(`SELECT count(*) FROM pragma_table_info('team_host_policies') WHERE name=?`, column.name).Scan(&count); err != nil {
+			return err
+		}
+		if count == 0 {
+			if _, err := tx.Exec("ALTER TABLE team_host_policies ADD COLUMN " + column.name + " " + column.definition); err != nil {
+				return err
+			}
+		}
+	}
+	var usageVersion int
+	if err := tx.QueryRow(`SELECT count(*) FROM pragma_table_info('team_host_usage') WHERE name='policy_version'`).Scan(&usageVersion); err != nil {
+		return err
+	}
+	if usageVersion == 0 {
+		if _, err := tx.Exec(`ALTER TABLE team_host_usage ADD COLUMN policy_version INTEGER NOT NULL DEFAULT 0`); err != nil {
+			return err
+		}
+	}
 	var entryPK int
-	rows, err := db.Query(`PRAGMA table_info('team_launch_reservations')`)
+	rows, err := tx.Query(`PRAGMA table_info('team_launch_reservations')`)
 	if err != nil {
 		return err
 	}
@@ -90,7 +141,7 @@ func migrateTeamQueue(db *sql.DB) error {
 		return err
 	}
 	if entryPK == 0 {
-		_, err = db.Exec(`CREATE TABLE team_launch_reservations_v2(task_id TEXT NOT NULL REFERENCES tasks(id),entry_id TEXT NOT NULL DEFAULT '',item_id TEXT NOT NULL,token TEXT NOT NULL,pause_generation INTEGER NOT NULL,state TEXT NOT NULL CHECK(state IN ('reserved','launching','running')),created_at TEXT NOT NULL,PRIMARY KEY(task_id,entry_id));
+		_, err = tx.Exec(`CREATE TABLE team_launch_reservations_v2(task_id TEXT NOT NULL REFERENCES tasks(id),entry_id TEXT NOT NULL DEFAULT '',item_id TEXT NOT NULL,token TEXT NOT NULL,pause_generation INTEGER NOT NULL,state TEXT NOT NULL CHECK(state IN ('reserved','launching','running')),created_at TEXT NOT NULL,PRIMARY KEY(task_id,entry_id));
 			INSERT INTO team_launch_reservations_v2 SELECT task_id,entry_id,item_id,token,pause_generation,state,created_at FROM team_launch_reservations;
 			DROP TABLE team_launch_reservations;
 			ALTER TABLE team_launch_reservations_v2 RENAME TO team_launch_reservations;`)
@@ -98,7 +149,16 @@ func migrateTeamQueue(db *sql.DB) error {
 			return err
 		}
 	}
-	return nil
+	var hostColumn int
+	if err := tx.QueryRow(`SELECT count(*) FROM pragma_table_info('team_launch_reservations') WHERE name='host'`).Scan(&hostColumn); err != nil {
+		return err
+	}
+	if hostColumn == 0 {
+		if _, err := tx.Exec(`ALTER TABLE team_launch_reservations ADD COLUMN host TEXT NOT NULL DEFAULT ''`); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
 }
 
 func validTeamQueueID(id string) bool {
@@ -203,13 +263,13 @@ func recordedTeamOrder(ctx context.Context, tx *sql.Tx, task, item string, revis
 	return nil
 }
 
-const teamQueueCols = `id,task_id,item_id,item_revision,order_seq,template,position,state,revision,host,cwd,pause_generation,launch_json,close_json,failure,escalation_seq,released_at,repository,ownership_json,handler_id,handler_run_id,handler_lease_generation,base_commit,integration_json`
+const teamQueueCols = `id,task_id,item_id,item_revision,order_seq,template,position,state,revision,host,cwd,pause_generation,launch_json,close_json,failure,escalation_seq,released_at,repository,ownership_json,handler_id,handler_run_id,handler_lease_generation,base_commit,acceptance_json,integration_json`
 
 func scanTeamQueue(row interface{ Scan(...any) error }) (api.TeamQueueEntry, error) {
 	var e api.TeamQueueEntry
 	var launch, close []byte
-	var ownership, integration string
-	err := row.Scan(&e.ID, &e.TaskID, &e.ItemID, &e.ItemRevision, &e.OrderMessageSeq, &e.Template, &e.Position, &e.State, &e.Revision, &e.Host, &e.Cwd, &e.PauseGeneration, &launch, &close, &e.Failure, &e.EscalationSeq, &e.ReleasedAt, &e.Repository, &ownership, &e.HandlerID, &e.HandlerRunID, &e.HandlerLeaseGeneration, &e.BaseCommit, &integration)
+	var ownership, acceptance, integration string
+	err := row.Scan(&e.ID, &e.TaskID, &e.ItemID, &e.ItemRevision, &e.OrderMessageSeq, &e.Template, &e.Position, &e.State, &e.Revision, &e.Host, &e.Cwd, &e.PauseGeneration, &launch, &close, &e.Failure, &e.EscalationSeq, &e.ReleasedAt, &e.Repository, &ownership, &e.HandlerID, &e.HandlerRunID, &e.HandlerLeaseGeneration, &e.BaseCommit, &acceptance, &integration)
 	if err != nil {
 		return e, err
 	}
@@ -224,6 +284,12 @@ func scanTeamQueue(row interface{ Scan(...any) error }) (api.TeamQueueEntry, err
 	}
 	if e.Ownership == nil {
 		e.Ownership = []string{}
+	}
+	if acceptance != "" {
+		e.Acceptance = new(api.TeamIntegrationAcceptance)
+		if err := json.Unmarshal([]byte(acceptance), e.Acceptance); err != nil {
+			return e, err
+		}
 	}
 	if integration != "" {
 		e.Integration = new(api.TeamIntegrationReady)
@@ -293,7 +359,7 @@ func (s *Store) ListTeamQueue(ctx context.Context, task string) (api.TeamQueueLi
 			if other.State != "launching" && other.State != "running" && !(other.State == "failed" && other.ReleasedAt == "") {
 				continue
 			}
-			if queueEntryConflicts(out.Entries[i], other) {
+			if queueEntryConflicts(out.Entries[i], other) || (out.Entries[i].Cwd != "" && out.Entries[i].Cwd == other.Cwd) {
 				out.Entries[i].BlockedBy = append(out.Entries[i].BlockedBy, other.ID)
 			}
 		}
@@ -318,7 +384,18 @@ func (s *Store) TeamQueuesByHost(ctx context.Context, host string) (api.TeamQueu
 		}
 		out.Entries = append(out.Entries, e)
 	}
-	return out, rows.Err()
+	if err := rows.Err(); err != nil {
+		return out, err
+	}
+	if err := rows.Close(); err != nil {
+		return out, err
+	}
+	out.HostPolicy, err = readTeamHostPolicy(ctx, s.db, host)
+	if err != nil {
+		return out, err
+	}
+	out.HostUsage, err = readTeamHostUsage(ctx, s.db, host)
+	return out, err
 }
 
 func (s *Store) GetTeamQueueEntry(ctx context.Context, task, id string) (api.TeamQueueEntry, error) {
@@ -340,7 +417,7 @@ func (s *Store) TeamQueueAction(ctx context.Context, task string, req api.TeamQu
 		return zero, api.ErrInvalid
 	}
 	identity := req
-	if identity.Operation == "release" {
+	if identity.Operation == "release" || identity.Operation == "accept" {
 		// A lost response is replayable after the release increments revision.
 		identity.ExpectedRevision = 0
 	}
@@ -400,7 +477,7 @@ func (s *Store) TeamQueueAction(ctx context.Context, task string, req api.TeamQu
 	var e api.TeamQueueEntry
 	switch req.Operation {
 	case "set_host_policy":
-		if req.Host == "" || req.HostPolicyVersion < 1 || req.HostMaxSessions < 1 || req.HostMaxPolling < 1 {
+		if req.Host == "" || !validLimiterDomain(req.LimiterDomain) || len(req.LimiterDomain) > 255 || req.HostPolicyVersion < 1 || req.HostMaxSessions < 1 || req.HostMaxPolling < 1 || req.HostMaxRelayBindings < 1 || req.HostMaxRequestsPerMinute < 1 || req.HostMaxBurst < 1 || req.HostHeadroomPercent < 1 || req.HostHeadroomPercent >= 100 || req.HostMaxRequestsPerMinute > 1000000 || req.HostMaxBurst > 100000 {
 			return zero, api.ErrInvalid
 		}
 		expires, parseErr := time.Parse(time.RFC3339, req.HostPolicyExpires)
@@ -415,10 +492,40 @@ func (s *Store) TeamQueueAction(ctx context.Context, task string, req api.TeamQu
 		if previous >= req.HostPolicyVersion {
 			return zero, fmt.Errorf("%w: host policy version must increase", api.ErrConflict)
 		}
-		if _, err := tx.ExecContext(ctx, `INSERT INTO team_host_policies(host,version,expires_at,max_sessions,max_polling) VALUES(?,?,?,?,?) ON CONFLICT(host) DO UPDATE SET version=excluded.version,expires_at=excluded.expires_at,max_sessions=excluded.max_sessions,max_polling=excluded.max_polling`, req.Host, req.HostPolicyVersion, req.HostPolicyExpires, req.HostMaxSessions, req.HostMaxPolling); err != nil {
+		if _, err := tx.ExecContext(ctx, `INSERT INTO team_host_policies(host,version,expires_at,max_sessions,max_polling,limiter_domain,max_relay_bindings,max_requests_per_minute,max_burst,headroom_percent) VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(host) DO UPDATE SET version=excluded.version,expires_at=excluded.expires_at,max_sessions=excluded.max_sessions,max_polling=excluded.max_polling,limiter_domain=excluded.limiter_domain,max_relay_bindings=excluded.max_relay_bindings,max_requests_per_minute=excluded.max_requests_per_minute,max_burst=excluded.max_burst,headroom_percent=excluded.headroom_percent`, req.Host, req.HostPolicyVersion, req.HostPolicyExpires, req.HostMaxSessions, req.HostMaxPolling, req.LimiterDomain, req.HostMaxRelayBindings, req.HostMaxRequestsPerMinute, req.HostMaxBurst, req.HostHeadroomPercent); err != nil {
 			return zero, err
 		}
 		e = api.TeamQueueEntry{TaskID: task, Host: req.Host, State: "host_policy", Revision: req.HostPolicyVersion}
+	case "observe_host":
+		u := req.HostUsage
+		if req.Host == "" || u == nil || u.Host != req.Host || !validLimiterDomain(u.LimiterDomain) || u.PolicyVersion < 1 || u.RelayBindings < 0 || !validContextDigest(u.SourceDigest) {
+			return zero, api.ErrInvalid
+		}
+		observed, parseErr := time.Parse(time.RFC3339Nano, u.ObservedAt)
+		if parseErr != nil || observed.After(s.now().Add(5*time.Second)) || s.now().Sub(observed) > 30*time.Second {
+			return zero, fmt.Errorf("%w: host usage observation is stale", api.ErrConflict)
+		}
+		policy, err := readTeamHostPolicy(ctx, tx, req.Host)
+		if err != nil {
+			return zero, err
+		}
+		if policy == nil || policy.LimiterDomain != u.LimiterDomain || policy.Version != u.PolicyVersion {
+			return zero, fmt.Errorf("%w: host usage limiter domain differs from policy", api.ErrConflict)
+		}
+		previous, err := readTeamHostUsage(ctx, tx, req.Host)
+		if err != nil {
+			return zero, err
+		}
+		if previous != nil && previous.PolicyVersion == u.PolicyVersion {
+			previousAt, parseErr := time.Parse(time.RFC3339Nano, previous.ObservedAt)
+			if parseErr != nil || !observed.After(previousAt) && (observed.Before(previousAt) || previous.SourceDigest != u.SourceDigest || previous.Complete != u.Complete || previous.RelayBindings != u.RelayBindings) {
+				return zero, fmt.Errorf("%w: host usage observation regressed", api.ErrConflict)
+			}
+		}
+		if _, err := tx.ExecContext(ctx, `INSERT INTO team_host_usage(host,limiter_domain,policy_version,observed_at,relay_bindings,complete,source_digest) VALUES(?,?,?,?,?,?,?) ON CONFLICT(host) DO UPDATE SET limiter_domain=excluded.limiter_domain,policy_version=excluded.policy_version,observed_at=excluded.observed_at,relay_bindings=excluded.relay_bindings,complete=excluded.complete,source_digest=excluded.source_digest`, u.Host, u.LimiterDomain, u.PolicyVersion, u.ObservedAt, u.RelayBindings, u.Complete, u.SourceDigest); err != nil {
+			return zero, err
+		}
+		e = api.TeamQueueEntry{TaskID: task, Host: req.Host, State: "host_usage"}
 	case "set_limit":
 		if req.ConcurrencyLimit < 1 || req.ConcurrencyLimit > 2 {
 			return zero, api.ErrInvalid
@@ -503,6 +610,17 @@ func (s *Store) TeamQueueAction(ctx context.Context, task string, req api.TeamQu
 		if !api.ValidID(req.ItemID, "wi") || req.OrderMessageSeq < 1 || req.PauseGeneration != t.PauseGeneration || t.Orchestrator != "" || t.CleanupPending != 0 || t.PauseState != api.ProjectPauseActive {
 			return zero, api.ErrConflict
 		}
+		if req.Host != "" {
+			policy, err := readTeamHostPolicy(ctx, tx, req.Host)
+			if err != nil {
+				return zero, err
+			}
+			if policy != nil {
+				if err := checkTeamHostCapacity(ctx, tx, req.Host, s.now(), 1); err != nil {
+					return zero, err
+				}
+			}
+		}
 		var activeReservations int
 		if err := tx.QueryRowContext(ctx, `SELECT count(*) FROM team_launch_reservations WHERE task_id=?`, task).Scan(&activeReservations); err != nil {
 			return zero, err
@@ -533,7 +651,7 @@ func (s *Store) TeamQueueAction(ctx context.Context, task string, req api.TeamQu
 		if err := requireConfirmedTeamOrder(ctx, tx, task, req.ItemID, item.Revision, req.OrderMessageSeq); err != nil {
 			return zero, err
 		}
-		_, err = tx.ExecContext(ctx, `INSERT INTO team_launch_reservations(task_id,entry_id,item_id,token,pause_generation,state,created_at) VALUES(?,?,?,?,?,?,?)`, task, "", req.ItemID, req.RequestID, t.PauseGeneration, "reserved", now)
+		_, err = tx.ExecContext(ctx, `INSERT INTO team_launch_reservations(task_id,entry_id,item_id,token,pause_generation,state,created_at,host) VALUES(?,?,?,?,?,?,?,?)`, task, "", req.ItemID, req.RequestID, t.PauseGeneration, "reserved", now, req.Host)
 		if err != nil {
 			return zero, fmt.Errorf("%w: another team launch is reserved", api.ErrConflict)
 		}
@@ -587,7 +705,7 @@ func (s *Store) TeamQueueAction(ctx context.Context, task string, req api.TeamQu
 		if err != nil {
 			return zero, fmt.Errorf("%w: duplicate item or queue entry: %v", api.ErrConflict, err)
 		}
-	case "remove", "reorder", "claim", "freeze", "attempt", "started", "running", "replace_lead", "close", "close_refresh", "finish", "fail", "release":
+	case "remove", "reorder", "claim", "freeze", "attempt", "started", "running", "replace_lead", "close", "close_refresh", "accept", "finish", "fail", "release":
 		if !validTeamQueueID(req.EntryID) {
 			return zero, api.ErrInvalid
 		}
@@ -957,6 +1075,15 @@ func (s *Store) TeamQueueAction(ctx context.Context, task string, req api.TeamQu
 			if err := s.handOffRoleObligations(ctx, tx, t, previous, candidate); err != nil {
 				return zero, err
 			}
+			if strings.EqualFold(t.Orchestrator, previous.Name) {
+				result, err := tx.ExecContext(ctx, `UPDATE tasks SET orchestrator=?,lead_revision=lead_revision+1 WHERE id=? AND orchestrator=? AND lead_revision=?`, candidate.Name, task, t.Orchestrator, t.LeadRevision)
+				if err != nil {
+					return zero, err
+				}
+				if count, _ := result.RowsAffected(); count != 1 {
+					return zero, fmt.Errorf("%w: serial project lead changed", api.ErrConflict)
+				}
+			}
 		case "close":
 			if e.State != "running" || len(e.CloseJSON) != 0 || !json.Valid(req.CloseJSON) || len(req.CloseJSON) == 0 {
 				return zero, api.ErrConflict
@@ -978,6 +1105,24 @@ func (s *Store) TeamQueueAction(ctx context.Context, task string, req api.TeamQu
 				return zero, fmt.Errorf("%w: exact team close already has a receipt", api.ErrConflict)
 			}
 			e.CloseJSON = nil
+		case "accept":
+			if e.State != "running" || e.Acceptance != nil || e.Repository == "" || req.Acceptance == nil || req.HandlerAgentID != e.HandlerID || req.HandlerRunID != e.HandlerRunID {
+				return zero, fmt.Errorf("%w: exact active handler and unaccepted team are required", api.ErrConflict)
+			}
+			var handlerRole, handlerStatus, handlerRun string
+			if err := tx.QueryRowContext(ctx, `SELECT role,status,run_id FROM agents WHERE task_id=? AND id=?`, task, req.HandlerAgentID).Scan(&handlerRole, &handlerStatus, &handlerRun); err != nil || handlerRole != api.AgentRoleDatabaseHandler || handlerRun != req.HandlerRunID || handlerStatus == api.AgentClosed || handlerStatus == api.AgentExited || handlerStatus == api.AgentRetired {
+				return zero, fmt.Errorf("%w: assigned handler run is unavailable", api.ErrConflict)
+			}
+			item, err := getWorkItem(tx, ctx, task, e.ItemID)
+			if err != nil {
+				return zero, err
+			}
+			candidate := *req.Acceptance
+			if item.Status != "done" || candidate.ItemRevision != item.Revision || !reflect.DeepEqual(candidate.CompletionReport, item.CompletionReport) || candidate.Repository != e.Repository || candidate.BaseCommit != e.BaseCommit || !filepath.IsAbs(candidate.Worktree) || filepath.Clean(candidate.Worktree) != candidate.Worktree || strings.ContainsRune(candidate.Worktree, '\x00') || !validGitCommit(candidate.Commit) || candidate.Branch == "" || len(candidate.Branch) > 200 || strings.ContainsAny(candidate.Branch, "\x00\n\r") || strings.TrimSpace(candidate.Evidence) == "" || candidate.AcceptedAt != "" {
+				return zero, api.ErrInvalid
+			}
+			candidate.AcceptedAt = now
+			e.Acceptance = &candidate
 		case "finish":
 			if e.State != "running" || len(e.CloseJSON) == 0 {
 				return zero, api.ErrConflict
@@ -1028,16 +1173,12 @@ func (s *Store) TeamQueueAction(ctx context.Context, task string, req api.TeamQu
 			if item.Status != "done" && item.Status != "dismissed" {
 				return zero, fmt.Errorf("%w: item is not terminal", api.ErrConflict)
 			}
-			var limit int
-			if err := tx.QueryRowContext(ctx, `SELECT COALESCE((SELECT concurrency_limit FROM team_queue_settings WHERE task_id=?),1)`, task).Scan(&limit); err != nil {
-				return zero, err
-			}
-			if item.Status == "done" && limit > 1 && req.Integration == nil {
-				return zero, fmt.Errorf("%w: accepted branch metadata is required", api.ErrConflict)
+			if item.Status == "done" && e.Repository != "" && (req.Integration == nil || e.Acceptance == nil) {
+				return zero, fmt.Errorf("%w: exact handler acceptance receipt is required", api.ErrConflict)
 			}
 			if req.Integration != nil {
 				candidate := *req.Integration
-				if item.Status != "done" || e.Repository == "" || candidate.Repository != e.Repository || candidate.BaseCommit != e.BaseCommit || !validGitCommit(candidate.Commit) || candidate.Branch == "" || len(candidate.Branch) > 200 || strings.ContainsAny(candidate.Branch, "\x00\n\r") || candidate.Evidence == "" {
+				if item.Status != "done" || e.Repository == "" || e.Acceptance == nil || e.Acceptance.ItemRevision != item.Revision || !reflect.DeepEqual(e.Acceptance.CompletionReport, item.CompletionReport) || candidate.Repository != e.Acceptance.Repository || candidate.BaseCommit != e.Acceptance.BaseCommit || candidate.Worktree != e.Acceptance.Worktree || candidate.Branch != e.Acceptance.Branch || candidate.Commit != e.Acceptance.Commit || candidate.Evidence != e.Acceptance.Evidence {
 					return zero, api.ErrInvalid
 				}
 				candidate.ReadyAt = now
@@ -1067,12 +1208,17 @@ func (s *Store) TeamQueueAction(ctx context.Context, task string, req api.TeamQu
 		}
 		if req.Operation != "remove" && req.Operation != "reorder" {
 			e.Revision++
+			acceptanceJSON := ""
+			if e.Acceptance != nil {
+				data, _ := json.Marshal(e.Acceptance)
+				acceptanceJSON = string(data)
+			}
 			integrationJSON := ""
 			if e.Integration != nil {
 				data, _ := json.Marshal(e.Integration)
 				integrationJSON = string(data)
 			}
-			_, err = tx.ExecContext(ctx, `UPDATE team_queue_entries SET state=?,revision=?,pause_generation=?,launch_json=?,close_json=?,failure=?,escalation_seq=?,released_at=?,handler_id=?,handler_run_id=?,handler_lease_generation=?,integration_json=?,updated_at=? WHERE id=?`, e.State, e.Revision, e.PauseGeneration, string(e.LaunchJSON), string(e.CloseJSON), e.Failure, e.EscalationSeq, e.ReleasedAt, e.HandlerID, e.HandlerRunID, e.HandlerLeaseGeneration, integrationJSON, now, e.ID)
+			_, err = tx.ExecContext(ctx, `UPDATE team_queue_entries SET state=?,revision=?,pause_generation=?,launch_json=?,close_json=?,failure=?,escalation_seq=?,released_at=?,handler_id=?,handler_run_id=?,handler_lease_generation=?,acceptance_json=?,integration_json=?,updated_at=? WHERE id=?`, e.State, e.Revision, e.PauseGeneration, string(e.LaunchJSON), string(e.CloseJSON), e.Failure, e.EscalationSeq, e.ReleasedAt, e.HandlerID, e.HandlerRunID, e.HandlerLeaseGeneration, acceptanceJSON, integrationJSON, now, e.ID)
 			if err != nil {
 				return zero, err
 			}

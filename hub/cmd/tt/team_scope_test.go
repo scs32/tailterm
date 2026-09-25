@@ -70,9 +70,19 @@ func TestParallelQueueWorktreeScopeAndIntegrationSnapshot(t *testing.T) {
 	gitFixtureCommand(t, worktree, "add", ".")
 	gitFixtureCommand(t, worktree, "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "commit", "-q", "-m", "item C")
 	commit := gitFixtureCommand(t, worktree, "rev-parse", "HEAD")
+	entry.Cwd = repo // Launch may have used the main checkout, not the builder worktree.
+	entry.Acceptance = &api.TeamIntegrationAcceptance{Repository: commonC, BaseCommit: base, Worktree: worktree, Branch: "feature/item-c", Commit: commit, ItemRevision: item.Revision, Evidence: "handler-saved completion receipt"}
 	ready, err := queueIntegrationSnapshot(context.Background(), entry, item, closeReq)
-	if err != nil || ready.Repository != commonC || ready.BaseCommit != base || ready.Branch != "feature/item-c" || ready.Commit != commit || !strings.Contains(ready.Evidence, "exact-close-receipt") {
+	if err != nil || ready.Repository != commonC || ready.BaseCommit != base || ready.Worktree != worktree || ready.Branch != "feature/item-c" || ready.Commit != commit || ready.Evidence != "handler-saved completion receipt" {
 		t.Fatalf("integration snapshot %+v %v", ready, err)
+	}
+	if err := os.WriteFile(filepath.Join(worktree, "src", "c.txt"), []byte("advanced\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	gitFixtureCommand(t, worktree, "add", ".")
+	gitFixtureCommand(t, worktree, "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "commit", "-q", "-m", "advance after acceptance")
+	if _, err := queueIntegrationSnapshot(context.Background(), entry, item, closeReq); err == nil {
+		t.Fatal("finish substituted advanced HEAD for accepted SHA")
 	}
 	item.Status = "dismissed"
 	if _, err := queueIntegrationSnapshot(context.Background(), entry, item, closeReq); err == nil {

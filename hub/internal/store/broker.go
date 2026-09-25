@@ -198,7 +198,32 @@ func (s *Store) BrokerNudge(ctx context.Context, o BrokerObligation, now time.Ti
 func (s *Store) BrokerEscalate(ctx context.Context, o BrokerObligation, level int, reason string, now time.Time) error {
 	return s.brokerAct(ctx, o, func(tx *sql.Tx, task api.Task) error {
 		var lead api.Agent
-		if level == 1 && task.Orchestrator != "" {
+		var linkedItem string
+		if err := tx.QueryRowContext(ctx, `SELECT item_id FROM message_work_item_links WHERE message_task_id=? AND message_seq=? AND item_task_id=? AND relationship='primary' ORDER BY item_id LIMIT 1`, o.TaskID, o.MessageSeq, o.TaskID).Scan(&linkedItem); err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return err
+		}
+		if linkedItem == "" {
+			if err := tx.QueryRowContext(ctx, `SELECT item_id FROM agent_work_item_bindings WHERE agent_id=? AND item_task_id=? ORDER BY created_at DESC LIMIT 1`, o.AgentID, o.TaskID).Scan(&linkedItem); err != nil && !errors.Is(err, sql.ErrNoRows) {
+				return err
+			}
+		}
+		var scopedRows, limit int
+		if linkedItem != "" {
+			if err := tx.QueryRowContext(ctx, `SELECT count(*) FROM item_team_leads WHERE task_id=? AND item_id=?`, o.TaskID, linkedItem).Scan(&scopedRows); err != nil {
+				return err
+			}
+		}
+		if err := tx.QueryRowContext(ctx, `SELECT COALESCE((SELECT concurrency_limit FROM team_queue_settings WHERE task_id=?),1)`, o.TaskID).Scan(&limit); err != nil {
+			return err
+		}
+		if level == 1 && linkedItem != "" && scopedRows != 0 {
+			l, err := scanAgent(tx.QueryRowContext(ctx, `SELECT `+agentCols+` FROM agents WHERE task_id=? AND status NOT IN ('closed','exited','retired') AND EXISTS (SELECT 1 FROM item_team_leads l WHERE l.task_id=? AND l.item_id=? AND l.state='running' AND l.agent_id=agents.id AND l.run_id=agents.run_id)`, o.TaskID, o.TaskID, linkedItem))
+			if err == nil && l.ID != o.AgentID {
+				lead = l
+			} else if err != nil && !errors.Is(err, sql.ErrNoRows) {
+				return err
+			}
+		} else if level == 1 && task.Orchestrator != "" && (linkedItem == "" || limit == 1) {
 			l, err := scanAgent(tx.QueryRowContext(ctx, `SELECT `+agentCols+` FROM agents WHERE task_id=? AND name=? AND status<>? ORDER BY created_at DESC LIMIT 1`, o.TaskID, task.Orchestrator, api.AgentClosed))
 			if err == nil && l.ID != o.AgentID {
 				lead = l

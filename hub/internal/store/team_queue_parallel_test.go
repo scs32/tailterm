@@ -5,12 +5,24 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/scs32/tailterm/hub/internal/api"
 )
+
+func syntheticHostUsage(t *testing.T, s *Store, taskID, host string) {
+	t.Helper()
+	policy, err := readTeamHostPolicy(context.Background(), s.db, host)
+	if err != nil || policy == nil {
+		t.Fatalf("synthetic policy missing: %v", err)
+	}
+	if _, err := s.TeamQueueAction(context.Background(), taskID, api.TeamQueueRequest{RequestID: api.NewID("tqr"), Operation: "observe_host", Host: host, HostUsage: &api.TeamHostUsage{Host: host, LimiterDomain: "https://fixture.invalid", PolicyVersion: policy.Version, ObservedAt: s.now().UTC().Format(time.RFC3339Nano), RelayBindings: 1, Complete: true, SourceDigest: strings.Repeat("a", 64)}}); err != nil {
+		t.Fatal(err)
+	}
+}
 
 func TestParallelQueueSkipsConflictAndLeasesDistinctHandlers(t *testing.T) {
 	s, task, items, orders := queueFixture(t)
@@ -46,9 +58,10 @@ func TestParallelQueueSkipsConflictAndLeasesDistinctHandlers(t *testing.T) {
 	if _, err := claim(2, "serial-c"); err == nil {
 		t.Fatal("default limit 1 admitted concurrent team")
 	}
-	if _, err := s.TeamQueueAction(ctx, task.ID, api.TeamQueueRequest{RequestID: "policy", Operation: "set_host_policy", Host: "mini", HostPolicyVersion: 1, HostPolicyExpires: s.now().Add(time.Hour).Format(time.RFC3339), HostMaxSessions: 100, HostMaxPolling: 10}); err != nil {
+	if _, err := s.TeamQueueAction(ctx, task.ID, api.TeamQueueRequest{RequestID: "policy", Operation: "set_host_policy", Host: "mini", HostPolicyVersion: 1, HostPolicyExpires: s.now().Add(time.Hour).Format(time.RFC3339), HostMaxSessions: 100, HostMaxPolling: 10, LimiterDomain: "https://fixture.invalid", HostMaxRelayBindings: 100, HostMaxRequestsPerMinute: 100000, HostMaxBurst: 10000, HostHeadroomPercent: 20}); err != nil {
 		t.Fatal(err)
 	}
+	syntheticHostUsage(t, s, task.ID, "mini")
 	if _, err := s.TeamQueueAction(ctx, task.ID, api.TeamQueueRequest{RequestID: "limit-two", Operation: "set_limit", Host: "mini", ConcurrencyLimit: 2}); err != nil {
 		t.Fatal(err)
 	}
@@ -117,6 +130,82 @@ func TestParallelQueueSkipsConflictAndLeasesDistinctHandlers(t *testing.T) {
 	}
 }
 
+func TestParallelQueueListShowsSharedWorktreeBlocker(t *testing.T) {
+	s, task, items, orders := queueFixture(t)
+	ctx := context.Background()
+	if _, err := s.TeamQueueAction(ctx, task.ID, api.TeamQueueRequest{RequestID: "shared-cwd-policy", Operation: "set_host_policy", Host: "mini", HostPolicyVersion: 1, HostPolicyExpires: s.now().Add(time.Hour).Format(time.RFC3339), HostMaxSessions: 100, HostMaxPolling: 10, LimiterDomain: "https://fixture.invalid", HostMaxRelayBindings: 100, HostMaxRequestsPerMinute: 100000, HostMaxBurst: 10000, HostHeadroomPercent: 20}); err != nil {
+		t.Fatal(err)
+	}
+	syntheticHostUsage(t, s, task.ID, "mini")
+	if _, err := s.TeamQueueAction(ctx, task.ID, api.TeamQueueRequest{RequestID: "shared-cwd-limit", Operation: "set_limit", Host: "mini", ConcurrencyLimit: 2}); err != nil {
+		t.Fatal(err)
+	}
+	var entries []api.TeamQueueEntry
+	for i, own := range []string{"src/a", "src/b"} {
+		entry, err := s.TeamQueueAction(ctx, task.ID, api.TeamQueueRequest{RequestID: fmt.Sprintf("shared-cwd-add-%d", i), Operation: "add", ItemID: items[i].ID, OrderMessageSeq: orders[i].Seq, Host: "mini", Cwd: "/same-worktree", Repository: "repo", BaseCommit: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", Ownership: []string{own}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		entries = append(entries, entry)
+	}
+	active, err := s.TeamQueueAction(ctx, task.ID, api.TeamQueueRequest{RequestID: "shared-cwd-claim", Operation: "claim", EntryID: entries[0].ID, ExpectedRevision: entries[0].Revision, Host: "mini"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	list, err := s.ListTeamQueue(ctx, task.ID)
+	if err != nil || len(list.Entries) != 2 || len(list.Entries[1].BlockedBy) != 1 || list.Entries[1].BlockedBy[0] != active.ID {
+		t.Fatalf("shared worktree blocker missing: %+v %v", list, err)
+	}
+}
+
+func TestSerialQueueReplacementUpdatesProjectLeadSlot(t *testing.T) {
+	s, task, items, orders := queueFixture(t)
+	ctx := context.Background()
+	by := api.Caller{Node: "fixture", User: "owner"}
+	first, err := s.AddAgent(ctx, task.ID, api.AddAgentRequest{Name: "old-item-lead", AgentID: api.NewID("agt"), Host: "mini", Session: "old-lead"}, by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	replacement, err := s.AddAgent(ctx, task.ID, api.AddAgentRequest{Name: "new-item-lead", AgentID: api.NewID("agt"), Host: "mini", Session: "new-lead"}, by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	q, err := s.TeamQueueAction(ctx, task.ID, api.TeamQueueRequest{RequestID: "serial-replace-add", Operation: "add", ItemID: items[0].ID, OrderMessageSeq: orders[0].Seq, Host: "mini", Cwd: "/first"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	q, err = s.TeamQueueAction(ctx, task.ID, api.TeamQueueRequest{RequestID: "serial-replace-claim", Operation: "claim", EntryID: q.ID, ExpectedRevision: q.Revision, Host: "mini"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, agent := range []api.Agent{first, replacement} {
+		if _, err := s.db.Exec(`INSERT INTO agent_work_item_bindings(agent_id,run_id,item_task_id,item_id,item_revision,work_order_task_id,work_order_message_seq,context_through_message_seq,team_role,context_digest,context_json,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`, agent.ID, agent.RunID, task.ID, items[0].ID, items[0].Revision, task.ID, orders[0].Seq, orders[0].Seq, api.TeamRoleMember, "fixture-digest", `{"version":1}`, ts(s.now())); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := s.db.Exec(`UPDATE agents SET status='running',last_seen_at=? WHERE id IN (?,?)`, ts(s.now()), first.ID, replacement.ID); err != nil {
+		t.Fatal(err)
+	}
+	plan, _ := json.Marshal(map[string]any{"task": task.ID, "item": items[0].ID, "revision": items[0].Revision, "order": orders[0].Seq, "context": map[string]any{"version": 1}, "members": []any{map[string]any{"state": "unstarted", "runId": first.RunID, "fields": map[string]any{"agentId": first.ID, "name": first.Name, "cwd": "/first"}}}})
+	for _, step := range []api.TeamQueueRequest{{RequestID: "serial-replace-freeze", Operation: "freeze", LaunchJSON: plan}, {RequestID: "serial-replace-attempt", Operation: "attempt"}, {RequestID: "serial-replace-started", Operation: "started", MemberRunID: first.RunID}, {RequestID: "serial-replace-running", Operation: "running"}} {
+		step.EntryID, step.ExpectedRevision = q.ID, q.Revision
+		q, err = s.TeamQueueAction(ctx, task.ID, step)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := s.db.Exec(`UPDATE tasks SET orchestrator=?,lead_revision=1 WHERE id=?`, first.Name, task.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.TeamQueueAction(ctx, task.ID, api.TeamQueueRequest{RequestID: "serial-replace-lead", Operation: "replace_lead", EntryID: q.ID, ExpectedRevision: q.Revision, LeadAgentID: replacement.ID, LeadRunID: replacement.RunID, ExpectedLeadRevision: 1}); err != nil {
+		t.Fatal(err)
+	}
+	updated, err := s.GetTask(ctx, task.ID)
+	if err != nil || updated.Orchestrator != replacement.Name || updated.LeadRevision != 2 {
+		t.Fatalf("serial project lead slot stranded after replacement: %+v %v", updated, err)
+	}
+}
+
 func TestParallelHandlerPoolReopens(t *testing.T) {
 	s, task, _, _ := queueFixture(t)
 	ctx := context.Background()
@@ -161,6 +250,13 @@ func TestParallelQueueMigratesLegacySingletonReservations(t *testing.T) {
 		CREATE UNIQUE INDEX agents_database_handler ON agents(task_id) WHERE role='database_handler' AND status<>'closed';`); err != nil {
 		t.Fatal(err)
 	}
+	if _, err := s.db.Exec(`INSERT INTO team_launch_reservations(task_id,entry_id,item_id,token,pause_generation,state,created_at) VALUES(?,?,?,?,?,'reserved',?);`, task.ID, "", "wi_aaaaaaaaaaaaaaaa", "legacy-reservation", 0, ts(s.now())); err != nil {
+		t.Fatal(err)
+	}
+	// Simulate the old non-transactional rebuild crashing after CREATE.
+	if _, err := s.db.Exec(`CREATE TABLE team_launch_reservations_v2(task_id TEXT NOT NULL,entry_id TEXT NOT NULL DEFAULT '',item_id TEXT NOT NULL,token TEXT NOT NULL,pause_generation INTEGER NOT NULL,state TEXT NOT NULL,created_at TEXT NOT NULL,PRIMARY KEY(task_id,entry_id))`); err != nil {
+		t.Fatal(err)
+	}
 	var seq int
 	var name, path string
 	if err := s.db.QueryRow(`PRAGMA database_list`).Scan(&seq, &name, &path); err != nil {
@@ -174,6 +270,14 @@ func TestParallelQueueMigratesLegacySingletonReservations(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer reopened.Close()
+	var preserved string
+	if err := reopened.db.QueryRow(`SELECT token FROM team_launch_reservations WHERE task_id=? AND entry_id=''`, task.ID).Scan(&preserved); err != nil || preserved != "legacy-reservation" {
+		t.Fatalf("migration lost legacy reservation: token=%q err=%v", preserved, err)
+	}
+	var leftover int
+	if err := reopened.db.QueryRow(`SELECT count(*) FROM sqlite_master WHERE name='team_launch_reservations_v2'`).Scan(&leftover); err != nil || leftover != 0 {
+		t.Fatalf("migration retained stale v2 table: count=%d err=%v", leftover, err)
+	}
 	if _, err := reopened.AddAgent(ctx, task.ID, api.AddAgentRequest{Name: "aux-after-migration", Role: api.AgentRoleDatabaseHandler, AgentID: api.NewID("agt"), Host: "mini", Session: "aux"}, api.Caller{Node: "fixture", User: "owner"}); err != nil {
 		t.Fatalf("legacy singleton index remained: %v", err)
 	}
@@ -203,6 +307,33 @@ func TestParallelQueueMigratesLegacySingletonReservations(t *testing.T) {
 	}
 }
 
+func TestParallelQueueRecoversCrashAfterLegacyDrop(t *testing.T) {
+	s, task, _, _ := queueFixture(t)
+	if _, err := s.db.Exec(`INSERT INTO team_launch_reservations(task_id,entry_id,item_id,token,pause_generation,state,created_at) VALUES(?,?,?,?,?,'reserved',?)`, task.ID, "", "wi_aaaaaaaaaaaaaaaa", "recover-token", 0, ts(s.now())); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.db.Exec(`ALTER TABLE team_launch_reservations RENAME TO team_launch_reservations_v2`); err != nil {
+		t.Fatal(err)
+	}
+	var seq int
+	var name, path string
+	if err := s.db.QueryRow(`PRAGMA database_list`).Scan(&seq, &name, &path); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	var token string
+	if err := reopened.db.QueryRow(`SELECT token FROM team_launch_reservations WHERE task_id=? AND entry_id=''`, task.ID).Scan(&token); err != nil || token != "recover-token" {
+		t.Fatalf("post-drop crash lost reservation: %q %v", token, err)
+	}
+}
+
 func TestParallelLimitRequiresFreshHostBudgetBeforeEffects(t *testing.T) {
 	s, task, items, orders := queueFixture(t)
 	ctx := context.Background()
@@ -217,7 +348,7 @@ func TestParallelLimitRequiresFreshHostBudgetBeforeEffects(t *testing.T) {
 		t.Fatal("over ceiling admitted")
 	}
 	policy := func(key string, version int64, sessions, polling int, expiry time.Time) error {
-		_, err := s.TeamQueueAction(ctx, task.ID, api.TeamQueueRequest{RequestID: key, Operation: "set_host_policy", Host: "mini", HostPolicyVersion: version, HostPolicyExpires: expiry.Format(time.RFC3339), HostMaxSessions: sessions, HostMaxPolling: polling})
+		_, err := s.TeamQueueAction(ctx, task.ID, api.TeamQueueRequest{RequestID: key, Operation: "set_host_policy", Host: "mini", HostPolicyVersion: version, HostPolicyExpires: expiry.Format(time.RFC3339), HostMaxSessions: sessions, HostMaxPolling: polling, LimiterDomain: "https://fixture.invalid", HostMaxRelayBindings: 100, HostMaxRequestsPerMinute: 100000, HostMaxBurst: 10000, HostHeadroomPercent: 20})
 		return err
 	}
 	if err := policy("stale", 1, 20, 1, s.now().Add(-time.Minute)); err == nil {
@@ -226,12 +357,17 @@ func TestParallelLimitRequiresFreshHostBudgetBeforeEffects(t *testing.T) {
 	if err := policy("small", 1, 4, 1, s.now().Add(time.Hour)); err != nil {
 		t.Fatal(err)
 	}
+	if err := limit("missing-census", 2); err == nil {
+		t.Fatal("host policy without binding census admitted parallel teams")
+	}
+	syntheticHostUsage(t, s, task.ID, "mini")
 	if err := limit("too-small", 2); err == nil {
 		t.Fatal("session budget crossed")
 	}
 	if err := policy("enough", 2, 20, 1, s.now().Add(time.Hour)); err != nil {
 		t.Fatal(err)
 	}
+	syntheticHostUsage(t, s, task.ID, "mini")
 	legacy, err := s.TeamQueueAction(ctx, task.ID, api.TeamQueueRequest{RequestID: "legacy-unscoped", Operation: "add", ItemID: items[0].ID, OrderMessageSeq: orders[0].Seq, Host: "mini", Cwd: "/legacy"})
 	if err != nil {
 		t.Fatal(err)
@@ -261,6 +397,7 @@ func TestParallelLimitRequiresFreshHostBudgetBeforeEffects(t *testing.T) {
 	if err := policy("two-polling-projects", 3, 20, 2, s.now().Add(time.Hour)); err != nil {
 		t.Fatal(err)
 	}
+	syntheticHostUsage(t, s, task.ID, "mini")
 	for i := 1; i < 16; i++ {
 		if _, err := s.AddAgent(ctx, other.ID, api.AddAgentRequest{Name: fmt.Sprintf("other-%d", i), Host: "mini", Session: fmt.Sprintf("other-%d", i)}, api.Caller{Node: "fixture", User: "owner"}); err != nil {
 			t.Fatal(err)
@@ -275,14 +412,83 @@ func TestParallelLimitRequiresFreshHostBudgetBeforeEffects(t *testing.T) {
 	}
 }
 
+func TestParallelHostBudgetRejectsIncompleteStaleRateAndBurstEvidence(t *testing.T) {
+	s, task, _, _ := queueFixture(t)
+	ctx := context.Background()
+	now := s.now()
+	s.now = func() time.Time { return now }
+	policy := func(key string, version int64, rate, burst int) {
+		t.Helper()
+		if _, err := s.TeamQueueAction(ctx, task.ID, api.TeamQueueRequest{RequestID: key, Operation: "set_host_policy", Host: "mini", HostPolicyVersion: version, HostPolicyExpires: now.Add(time.Hour).Format(time.RFC3339), HostMaxSessions: 100, HostMaxPolling: 10, LimiterDomain: "https://fixture.invalid", HostMaxRelayBindings: 100, HostMaxRequestsPerMinute: rate, HostMaxBurst: burst, HostHeadroomPercent: 20}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	limit := func(key string) error {
+		_, err := s.TeamQueueAction(ctx, task.ID, api.TeamQueueRequest{RequestID: key, Operation: "set_limit", Host: "mini", ConcurrencyLimit: 2})
+		return err
+	}
+	policy("budget-rate-low", 1, 100, 1000)
+	syntheticHostUsage(t, s, task.ID, "mini")
+	if err := limit("rate-deny"); err == nil {
+		t.Fatal("request-rate demand crossed owner policy")
+	}
+	policy("budget-headroom", 2, 600, 10000)
+	syntheticHostUsage(t, s, task.ID, "mini")
+	if err := limit("headroom-deny"); err == nil {
+		t.Fatal("reserved request-rate headroom was ignored")
+	}
+	policy("budget-burst-low", 3, 100000, 5)
+	syntheticHostUsage(t, s, task.ID, "mini")
+	if err := limit("burst-deny"); err == nil {
+		t.Fatal("burst demand crossed owner policy")
+	}
+	policy("budget-enough", 4, 100000, 10000)
+	if err := limit("old-policy-census-deny"); err == nil {
+		t.Fatal("census from prior policy revision was reused")
+	}
+	if _, err := s.TeamQueueAction(ctx, task.ID, api.TeamQueueRequest{RequestID: "incomplete-usage", Operation: "observe_host", Host: "mini", HostUsage: &api.TeamHostUsage{Host: "mini", LimiterDomain: "https://fixture.invalid", PolicyVersion: 4, ObservedAt: now.Format(time.RFC3339Nano), RelayBindings: 1, Complete: false, SourceDigest: strings.Repeat("b", 64)}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := limit("incomplete-deny"); err == nil {
+		t.Fatal("incomplete relay inventory admitted parallel teams")
+	}
+	now = now.Add(time.Nanosecond)
+	syntheticHostUsage(t, s, task.ID, "mini")
+	now = now.Add(31 * time.Second)
+	if err := limit("stale-deny"); err == nil {
+		t.Fatal("stale relay inventory admitted parallel teams")
+	}
+	syntheticHostUsage(t, s, task.ID, "mini")
+	if err := limit("fresh-admit"); err != nil {
+		t.Fatalf("fresh complete budget refused: %v", err)
+	}
+}
+
+func TestParallelHostBudgetCountsManualLaunchReservation(t *testing.T) {
+	s, task, items, orders := queueFixture(t)
+	ctx := context.Background()
+	if _, err := s.TeamQueueAction(ctx, task.ID, api.TeamQueueRequest{RequestID: "manual-budget-policy", Operation: "set_host_policy", Host: "mini", HostPolicyVersion: 1, HostPolicyExpires: s.now().Add(time.Hour).Format(time.RFC3339), HostMaxSessions: 8, HostMaxPolling: 10, LimiterDomain: "https://fixture.invalid", HostMaxRelayBindings: 100, HostMaxRequestsPerMinute: 100000, HostMaxBurst: 10000, HostHeadroomPercent: 20}); err != nil {
+		t.Fatal(err)
+	}
+	syntheticHostUsage(t, s, task.ID, "mini")
+	token := fmt.Sprintf("manual-%s-%s-%d", task.ID, items[0].ID, orders[0].Seq)
+	if _, err := s.TeamQueueAction(ctx, task.ID, api.TeamQueueRequest{RequestID: token, Operation: "manual", ItemID: items[0].ID, OrderMessageSeq: orders[0].Seq, PauseGeneration: 0, Host: "mini"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.TeamQueueAction(ctx, task.ID, api.TeamQueueRequest{RequestID: "manual-budget-deny", Operation: "set_limit", Host: "mini", ConcurrencyLimit: 2}); err == nil {
+		t.Fatal("manual reservation omitted from host budget")
+	}
+}
+
 func TestParallelPolicyExpiryStopsFrozenMemberAttempt(t *testing.T) {
 	s, task, items, orders := queueFixture(t)
 	ctx := context.Background()
 	now := s.now()
 	s.now = func() time.Time { return now }
-	if _, err := s.TeamQueueAction(ctx, task.ID, api.TeamQueueRequest{RequestID: "short-policy", Operation: "set_host_policy", Host: "mini", HostPolicyVersion: 1, HostPolicyExpires: now.Add(time.Hour).Format(time.RFC3339), HostMaxSessions: 20, HostMaxPolling: 2}); err != nil {
+	if _, err := s.TeamQueueAction(ctx, task.ID, api.TeamQueueRequest{RequestID: "short-policy", Operation: "set_host_policy", Host: "mini", HostPolicyVersion: 1, HostPolicyExpires: now.Add(time.Hour).Format(time.RFC3339), HostMaxSessions: 20, HostMaxPolling: 2, LimiterDomain: "https://fixture.invalid", HostMaxRelayBindings: 100, HostMaxRequestsPerMinute: 100000, HostMaxBurst: 10000, HostHeadroomPercent: 20}); err != nil {
 		t.Fatal(err)
 	}
+	syntheticHostUsage(t, s, task.ID, "mini")
 	if _, err := s.TeamQueueAction(ctx, task.ID, api.TeamQueueRequest{RequestID: "parallel-limit", Operation: "set_limit", Host: "mini", ConcurrencyLimit: 2}); err != nil {
 		t.Fatal(err)
 	}
