@@ -57,7 +57,13 @@ export function createCachedHubClient({
   let previousStatus = "";
   function notify(changed = false) {
     if (disposed) return;
-    const label = status().label;
+    // These two routine cache states are intentionally absent from every
+    // view. Their transitions must not make subscribers reload visible DOM.
+    const current = status().label;
+    const label =
+      current === "Saved data" || current === "Saved data · refreshing"
+        ? ""
+        : current;
     if (!changed && label === previousStatus) return;
     previousStatus = label;
     if (notification !== null) return;
@@ -488,7 +494,7 @@ export function createCachedHubClient({
         for (const path of paths)
           if (now() - touched.get(path) < refreshMs * 2)
             work.push(refresh(path));
-      notify(true);
+      notify();
       return Promise.allSettled(work);
     },
     subscribe(task, onEvents, options = {}) {

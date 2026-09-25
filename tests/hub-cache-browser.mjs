@@ -33,9 +33,6 @@ async function transport(url,init){
     sessionStorage.setItem('synthetic-write-attempts',state.writes);
     return response({error:'Synthetic write rejected: hub unavailable'},503);
   }
-  // Capability metadata is not cached; let the views reach their cached
-  // content reads while the fixture holds content responses below.
-  if(path.pathname==='/v1/capabilities')return response({});
   if(path.pathname.endsWith('/events')){
     await new Promise(resolve=>setTimeout(resolve,100));
     if(!state.online)throw Error('Synthetic hub offline');
@@ -45,6 +42,9 @@ async function transport(url,init){
   if(!state.online)throw Error('Synthetic hub offline');
   if(state.held)await new Promise(resolve=>state.waiting.push(resolve));
   state.responses++;
+  // Capability metadata remains authoritative and obeys the same synthetic
+  // held/offline transport gates and counters as other reads.
+  if(path.pathname==='/v1/capabilities')return response({});
   if(path.pathname==='/v1/tasks')return response({tasks:[project()]});
   if(path.pathname==='/v1/tasks/'+taskId)return response({task:project(),agents:[agent()]});
   if(path.pathname.endsWith('/decisions'))return response({decisions:[],nextAfter:0});
@@ -145,6 +145,30 @@ try {
       ? route.continue() : route.abort());
     try {
       await open(page);
+      await page.evaluate(() => {
+        qa.state.held = true;
+        window.capabilityPending = qa.live.capabilities();
+      });
+      await page.waitForFunction(() => qa.state.waiting.length > 0);
+      assert.deepEqual(
+        await page.evaluate(() => ({ reads: qa.state.reads, responses: qa.state.responses })),
+        { reads: 1, responses: 0 },
+        `${name}: held capabilities must count as a pending read`,
+      );
+      await page.evaluate(() => qa.release());
+      await page.evaluate(() => window.capabilityPending);
+      assert.equal(await page.evaluate(() => qa.state.responses), 1);
+      assert.equal(await page.evaluate(async () => {
+        qa.state.online = false;
+        try { await qa.live.capabilities(); return false; }
+        catch (error) { return /Synthetic hub offline/.test(error.message); }
+        finally { qa.state.online = true; }
+      }), true, `${name}: capabilities must fail offline`);
+      assert.deepEqual(
+        await page.evaluate(() => ({ reads: qa.state.reads, responses: qa.state.responses })),
+        { reads: 2, responses: 1 },
+        `${name}: offline capabilities count as a read without a response`,
+      );
       await warm(page);
       console.log(`${name}: warmed actual Board/Projects/Bugs/Features through live client reads`);
 

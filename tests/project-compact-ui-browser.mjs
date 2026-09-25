@@ -148,6 +148,20 @@ try {
               await expect(page.locator(".hub-sync-status")).toHaveCount(0);
               await expect(page.locator(".compose-note")).toHaveCount(0);
               if (!count) continue;
+              await page.evaluate(() => {
+                window.savedViewHeading = document.querySelector(".board-head");
+                window.savedTeamToggle = document.querySelector("[data-team-toggle]");
+              });
+              await page.evaluate(() => qa.client.refreshConnection());
+              assert.equal(
+                await page.evaluate(
+                  () =>
+                    window.savedViewHeading === document.querySelector(".board-head") &&
+                    window.savedTeamToggle === document.querySelector("[data-team-toggle]"),
+                ),
+                true,
+                "unchanged saved-data refresh retains visible DOM",
+              );
               await page.evaluate(() => (qa.state.held = true));
               await expect(toggle).toHaveAttribute(
                 "aria-expanded",
@@ -184,6 +198,13 @@ try {
                 await toggle.evaluate((e) => getComputedStyle(e).outlineStyle),
                 "none",
               );
+              // Hold a real cache refresh while the native Space keydown and
+              // keyup activate the focused control.
+              await page.evaluate(() => {
+                window.pendingTeamRefresh = qa.client.refreshConnection();
+              });
+              await page.waitForFunction(() => qa.state.waiting.length > 0);
+              await toggle.focus();
               await page.keyboard.press("Space");
               await expect(toggle).toHaveAttribute(
                 "aria-expanded",
@@ -259,6 +280,7 @@ try {
                 "disclosure has no mutations/navigation",
               );
               await page.evaluate(() => qa.release());
+              await page.evaluate(() => window.pendingTeamRefresh);
               // Polling preserves the explicit choice and keyboard focus.
               await toggle.focus();
               await page.evaluate(() => qa.client.invalidate());

@@ -154,7 +154,7 @@ export async function exerciseTasks(page, hub, origin) {
   );
   // Tasks mode lists the task with its agents and rollup.
   await page.locator(".mode-switch [data-mode=tasks]").click();
-  await page.locator(".task-card", { hasText: "demo" }).waitFor();
+  await page.locator(".board-head h2", { hasText: "demo" }).waitFor();
   assert.equal(await page.locator(".task-card .board-agent").count(), 3);
   assert.match(
     await page.locator(".task-card header .fine").innerText(),

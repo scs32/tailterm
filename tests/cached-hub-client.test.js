@@ -78,6 +78,36 @@ test("saved views return before a slow refresh and update when it finishes", asy
   }
 });
 
+test("routine saved-status transitions do not notify views, but data and errors do", async () => {
+  const f = fixture();
+  const view = f.make({
+    ...f.live,
+    subscribe: () => ({ stop() {}, cursor: 0 }),
+  });
+  const settle = () => new Promise((resolve) => setTimeout(resolve, 10));
+  try {
+    await view.listTasks();
+    await settle();
+    let notifications = 0;
+    view.subscribe("", () => notifications++);
+    await view.refreshConnection();
+    await settle();
+    assert.equal(notifications, 0, "unchanged save and refresh labels are quiet");
+
+    f.response({ tasks: [{ id: "one", name: "Updated project" }] });
+    await view.refreshConnection();
+    await settle();
+    assert.equal(notifications, 1, "changed content still notifies views");
+
+    f.offline();
+    await view.refreshConnection();
+    await settle();
+    assert.equal(notifications, 2, "visible offline status still notifies views");
+  } finally {
+    view.dispose();
+  }
+});
+
 test("reload can read saved data offline while the authoritative client cannot", async () => {
   const f = fixture(),
     first = f.make();
