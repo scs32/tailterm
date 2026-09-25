@@ -97,8 +97,11 @@ test("Planned delivery teaches live gate priority without changing inbox order",
   const lead = team.members.find((member) => member.name === "lead").prompt;
   const handler = team.members.find((member) => member.name === "database").prompt;
   assert.match(lead, /typed REQUEST.*RESULT --reply-to/s);
-  assert.match(lead, /--work-item ID --work-item-revision N --work-order-message SEQ/);
-  assert.match(team.members.find((member) => member.name === "builder").prompt, /--work-item ID --work-item-revision N --work-order-message SEQ/);
+  for (const role of ["lead", "planner", "builder", "reviewer"]) {
+    const prompt = team.members.find((member) => member.name === role).prompt;
+    assert.match(prompt, /--work-item ID --work-item-revision N --work-order-message SEQ/, role);
+    assert.match(prompt, /--ref alone does not (create )?(the native item )?link/, role);
+  }
   assert.match(handler, /Before each new queued-item record, run tt obligations/);
   assert.match(handler, /recheck before the next queued record/i);
   assert.match(handler, /Inbox sequence is unchanged/);
