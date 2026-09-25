@@ -104,6 +104,91 @@ func TestTeamRunnerBookkeepingLaunchesFourFakeMembersOnce(t *testing.T) {
 	}
 }
 
+func TestTeamRunnerReportsUnconfirmedQueuedScopeAndRetriesAfterIntake(t *testing.T) {
+	f := newTeamFixture(t, true)
+	ctx := context.Background()
+	q, err := f.c.TeamQueueAction(ctx, f.task.ID, api.TeamQueueRequest{RequestID: "pre-upgrade-queue", Operation: "add", ItemID: f.item.ID, OrderMessageSeq: f.order, Host: "fixture", Cwd: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// This isolated database models an entry queued before confirmations were
+	// introduced. The handler can confirm its unchanged revision in place.
+	db, err := sql.Open("sqlite", f.dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if _, err := db.Exec(`DELETE FROM work_order_scope_confirmations WHERE task_id=? AND item_id=?`, f.task.ID, f.item.ID); err != nil {
+		t.Fatal(err)
+	}
+	spawns := 0
+	runner := teamRunner{
+		plan: func(_ context.Context, in map[string]any, out *teamLaunchResolved) error {
+			out.ItemRouting.WorkContextBundle = teamCloseCLIContext(t, f.item, api.Message{TaskID: f.task.ID, Seq: f.order, Text: "bounded fixture order"})
+			for _, role := range []string{"lead", "planner", "builder", "reviewer"} {
+				out.Plan = append(out.Plan, teamLaunchEntry{Fields: teamLaunchFields{Name: role + "-scope", Role: role, Runtime: "codex", Run: "codex", Cwd: in["cwd"].(string), Prompt: "fixture"}})
+			}
+			return nil
+		},
+		spawn: func(_ env, args []string) error {
+			spawns++
+			flags := map[string]string{}
+			for i := 0; i+1 < len(args); i += 2 {
+				flags[args[i]] = args[i+1]
+			}
+			data, err := os.ReadFile(flags["--work-context-file"])
+			if err != nil {
+				return err
+			}
+			rev, err := strconv.ParseInt(flags["--work-item-revision"], 10, 64)
+			if err != nil {
+				return err
+			}
+			seq, err := strconv.ParseInt(flags["--work-order-message"], 10, 64)
+			if err != nil {
+				return err
+			}
+			_, err = f.c.AddAgent(ctx, f.task.ID, api.AddAgentRequest{AgentID: flags["--agent-id"], ExpectedRunID: flags["--expected-run-id"], Name: flags["--name"], Host: "fixture", Session: flags["--name"], Runtime: "codex", Cwd: flags["--cwd"], WorkItem: &api.AgentWorkItemRequest{ItemTaskID: f.task.ID, ItemID: f.item.ID, ItemRevision: rev, WorkOrderMessage: api.MessageReference{TaskID: f.task.ID, Seq: seq}, ContextBundle: data}})
+			return err
+		},
+		owned: func(context.Context, env, api.Agent) error { return nil },
+	}
+	if err := runner.tick(ctx, f.e, f.c, "fixture"); err == nil || !strings.Contains(err.Error(), "scope is not confirmed for this exact item revision and order") {
+		t.Fatalf("missing actionable scope refusal: %v", err)
+	}
+	before, err := f.c.GetTeamQueueEntry(ctx, f.task.ID, q.ID)
+	if err != nil || before.State != "queued" || before.Revision != q.Revision || spawns != 0 {
+		t.Fatalf("refusal consumed queue or spawned: %+v, spawns=%d, err=%v", before, spawns, err)
+	}
+	if _, err := f.c.ConfirmWorkOrderScope(ctx, f.task.ID, f.item.ID, api.ConfirmWorkOrderScopeRequest{RequestID: "post-upgrade-intake", AgentID: f.handler.ID, RunID: f.handler.RunID, ExpectedRevision: f.item.Revision, ScopeRevision: f.item.ScopeRevision, OrderMessageSeq: f.order, Complete: true}); err != nil {
+		t.Fatal(err)
+	}
+	if err := runner.tick(ctx, f.e, f.c, "fixture"); err != nil {
+		t.Fatal(err)
+	}
+	after, err := f.c.GetTeamQueueEntry(ctx, f.task.ID, q.ID)
+	if err != nil || after.State != "running" || after.ItemRevision != q.ItemRevision || after.OrderMessageSeq != q.OrderMessageSeq || spawns != 4 {
+		t.Fatalf("reconfirmed queue did not launch once: %+v, spawns=%d, err=%v", after, spawns, err)
+	}
+}
+
+func TestTeamRunnerClaimRaceKeepsSilentRetry(t *testing.T) {
+	f := newTeamFixture(t, true)
+	ctx := context.Background()
+	q, err := f.c.TeamQueueAction(ctx, f.task.ID, api.TeamQueueRequest{RequestID: "race-queue", Operation: "add", ItemID: f.item.ID, OrderMessageSeq: f.order, Host: "fixture", Cwd: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.c.TeamQueueAction(ctx, f.task.ID, api.TeamQueueRequest{RequestID: "other-runner-claim", Operation: "claim", EntryID: q.ID, ExpectedRevision: q.Revision, Host: "fixture"}); err != nil {
+		t.Fatal(err)
+	}
+	spawns := 0
+	runner := teamRunner{spawn: func(env, []string) error { spawns++; return nil }}
+	if err := runner.advance(ctx, f.e, f.c, q, "fixture"); err != nil || spawns != 0 {
+		t.Fatalf("claim race should retry silently without spawning: err=%v spawns=%d", err, spawns)
+	}
+}
+
 func TestTeamRunnerTwoItemsWithFakeSpawnsAndCleanup(t *testing.T) {
 	f := newTeamFixture(t, true)
 	ctx := context.Background()

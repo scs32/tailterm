@@ -146,11 +146,13 @@ func (r teamRunner) advance(ctx context.Context, e env, c *api.Client, q api.Tea
 		q, err = c.TeamQueueAction(ctx, q.TaskID, api.TeamQueueRequest{RequestID: "queue-claim-" + q.ID, Operation: "claim", EntryID: q.ID, ExpectedRevision: q.Revision, Host: host, PauseGeneration: detail.Task.PauseGeneration})
 		if err != nil {
 			var response *api.HTTPError
-			if errors.As(err, &response) && response.Status == 409 {
+			if errors.As(err, &response) && response.Status == 409 && claimRaceConflict(response.Msg) {
+				// A competing runner or manual launch can make this queued
+				// snapshot obsolete. Other conflicts need to reach the operator.
 				return nil
 			}
 			return err
-		} // another runner/manual launch won; retry the next tick
+		}
 	}
 	if q.State == "launching" {
 		return r.launch(ctx, e, c, q, host)
@@ -159,6 +161,20 @@ func (r teamRunner) advance(ctx context.Context, e env, c *api.Client, q api.Tea
 		return r.finish(ctx, e, c, q, host)
 	}
 	return nil
+}
+
+func claimRaceConflict(message string) bool {
+	for _, cause := range []string{
+		"entry revision changed",
+		"project is not launchable",
+		"not queue head",
+		"launch is reserved",
+	} {
+		if strings.HasSuffix(message, cause) {
+			return true
+		}
+	}
+	return false
 }
 
 func (r teamRunner) fail(ctx context.Context, c *api.Client, q api.TeamQueueEntry, cause error) error {
