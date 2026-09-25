@@ -31,14 +31,31 @@ func teamClosePendingPath(e env, task string) string {
 }
 
 func closeTeamSnapshot(task api.Task, agents []api.Agent, actorAgent, actorRun string) (api.TeamCloseRequest, error) {
-	var lead api.Agent
+	var lead, exited api.Agent
 	for _, a := range agents {
-		if strings.EqualFold(a.Name, task.Orchestrator) && a.Status != api.AgentClosed && a.Status != api.AgentExited {
+		if !strings.EqualFold(a.Name, task.Orchestrator) || a.Status == api.AgentClosed {
+			continue
+		}
+		if a.Status == api.AgentExited {
+			if actorAgent != "" {
+				continue
+			}
+			if exited.ID != "" {
+				return api.TeamCloseRequest{}, errors.New("multiple exited agents match the project orchestrator")
+			}
+			exited = a
+		} else {
 			if lead.ID != "" {
 				return api.TeamCloseRequest{}, errors.New("multiple current agents match the project orchestrator")
 			}
 			lead = a
 		}
+	}
+	if lead.ID == "" {
+		lead = exited
+	}
+	if lead.ID == "" && actorAgent != "" {
+		return api.TeamCloseRequest{}, errors.New("the item lead has exited; only the owner can close this team")
 	}
 	if lead.ID == "" || lead.WorkItem == nil || lead.WorkItem.ItemTaskID != task.ID {
 		return api.TeamCloseRequest{}, errors.New("the current project orchestrator has no item binding")

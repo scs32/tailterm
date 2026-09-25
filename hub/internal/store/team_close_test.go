@@ -144,6 +144,126 @@ func TestCloseItemTeamTerminalAndReplay(t *testing.T) {
 	}
 }
 
+func TestCloseItemTeamOwnerCanCloseExitedBoundLead(t *testing.T) {
+	s, task, item, lead, worker, _, req := teamCloseFixture(t)
+	ctx := context.Background()
+	by := api.Caller{Node: "fixture", User: "owner"}
+	exited := api.AgentExited
+	if _, err := s.UpdateAgent(ctx, lead.ID, api.UpdateAgentRequest{Status: &exited}, by); err != nil {
+		t.Fatal(err)
+	}
+	for i := range req.Members {
+		if req.Members[i].AgentID == lead.ID {
+			req.Members[i].Status = exited
+		}
+	}
+	if _, err := s.CloseItemTeam(ctx, task.ID, req, by); !errors.Is(err, api.ErrConflict) {
+		t.Fatalf("exited actor accepted: %v", err)
+	}
+	req.ActorAgentID, req.ActorRunID = "", ""
+	if _, err := s.CloseItemTeam(ctx, task.ID, req, by); !errors.Is(err, api.ErrConflict) {
+		t.Fatalf("nonterminal owner close accepted: %v", err)
+	}
+	teamCloseTerminal(t, s, task, item, "dismissed")
+	stale := req
+	stale.RequestID = "stale-exited"
+	stale.Members = append([]api.TeamCloseMember(nil), req.Members...)
+	stale.Members[0].RunID = api.NewID("run")
+	if _, err := s.CloseItemTeam(ctx, task.ID, stale, by); !errors.Is(err, api.ErrConflict) {
+		t.Fatalf("stale owner snapshot accepted: %v", err)
+	}
+	current, _ := s.GetTask(ctx, task.ID)
+	if current.Orchestrator != task.Orchestrator {
+		t.Fatal("refusal cleared orchestrator")
+	}
+	result, err := s.CloseItemTeam(ctx, task.ID, req, by)
+	if err != nil || result.LeadAgentID != lead.ID || len(result.Members) != 2 || result.Members[0].AgentID != worker.ID || result.Members[1].AgentID != lead.ID {
+		t.Fatalf("owner close %+v: %v", result, err)
+	}
+	closed, _ := s.GetAgent(ctx, lead.ID)
+	if closed.Status != api.AgentClosed {
+		t.Fatalf("exited lead remained %s", closed.Status)
+	}
+}
+
+func TestCloseItemTeamClosesHeldDeliveryNoticesAtomically(t *testing.T) {
+	for _, sender := range []string{"owner cancellation", "agent notice"} {
+		t.Run(sender, func(t *testing.T) {
+			s, task, item, lead, worker, other, req := teamCloseFixture(t)
+			ctx := context.Background()
+			by := api.Caller{Node: "fixture", User: "owner"}
+			teamCloseTerminal(t, s, task, item, "dismissed")
+			var noticeSeq int64
+			if sender == "owner cancellation" {
+				m, err := s.PostMessage(ctx, task.ID, api.PostMessageRequest{To: worker.ID, AgentID: lead.ID, RunID: lead.RunID,
+					Envelope: &api.Envelope{Kind: api.EnvelopeKindRequest, To: worker.Name, Subject: "Check fixture", Body: api.EnvelopeBody{Ask: "Check the fixture."}}}, by)
+				if err != nil {
+					t.Fatal(err)
+				}
+				var obligationID string
+				if err := s.db.QueryRowContext(ctx, `SELECT id FROM obligations WHERE message_seq=?`, m.Seq).Scan(&obligationID); err != nil {
+					t.Fatal(err)
+				}
+				if _, err := s.CancelObligation(ctx, task.ID, obligationID, api.ObligationCancelRequest{RequestID: "cancel-fixture", Reason: "fixture complete"}, by); err != nil {
+					t.Fatal(err)
+				}
+				if err := s.db.QueryRowContext(ctx, `SELECT max(message_seq) FROM obligations WHERE agent_id=? AND needs=? AND state<>?`, worker.ID, api.ObligationNeedsDelivery, api.ObligationClosed).Scan(&noticeSeq); err != nil {
+					t.Fatal(err)
+				}
+			} else {
+				m, err := s.PostMessage(ctx, task.ID, api.PostMessageRequest{To: worker.ID, AgentID: lead.ID, RunID: lead.RunID,
+					Envelope: &api.Envelope{Kind: api.EnvelopeKindNotice, To: worker.Name, Subject: "Fixture notice", Body: api.EnvelopeBody{Text: "Fixture complete."}}}, by)
+				if err != nil {
+					t.Fatal(err)
+				}
+				noticeSeq = m.Seq
+			}
+			var state, needs string
+			if err := s.db.QueryRowContext(ctx, `SELECT state,needs FROM obligations WHERE message_seq=?`, noticeSeq).Scan(&state, &needs); err != nil || state == api.ObligationClosed || needs != api.ObligationNeedsDelivery {
+				t.Fatalf("notice setup %s %s: %v", state, needs, err)
+			}
+			outsideNotice, err := s.PostMessage(ctx, task.ID, api.PostMessageRequest{To: other.ID, AgentID: worker.ID, RunID: worker.RunID,
+				Envelope: &api.Envelope{Kind: api.EnvelopeKindNotice, To: other.Name, Subject: "External fixture notice", Body: api.EnvelopeBody{Text: "External fixture remains."}}}, by)
+			if err != nil {
+				t.Fatal(err)
+			}
+			// A delivery notice cannot be consumed by a refusal.
+			request, err := s.PostMessage(ctx, task.ID, api.PostMessageRequest{To: worker.ID, AgentID: lead.ID, RunID: lead.RunID,
+				Envelope: &api.Envelope{Kind: api.EnvelopeKindRequest, To: worker.Name, Subject: "Substantive fixture", Body: api.EnvelopeBody{Ask: "Review the fixture."}}}, by)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := s.CloseItemTeam(ctx, task.ID, req, by); !errors.Is(err, api.ErrConflict) || !strings.Contains(err.Error(), "#") {
+				t.Fatalf("substantive request did not block: %v", err)
+			}
+			if err := s.db.QueryRowContext(ctx, `SELECT state FROM obligations WHERE message_seq=?`, noticeSeq).Scan(&state); err != nil || state == api.ObligationClosed {
+				t.Fatalf("refusal mutated notice %s: %v", state, err)
+			}
+			if _, err := s.db.ExecContext(ctx, `UPDATE obligations SET state='closed',outcome='cancelled' WHERE message_seq=?`, request.Seq); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := s.CloseItemTeam(ctx, task.ID, req, by); err != nil {
+				t.Fatalf("delivery notice blocked close: %v", err)
+			}
+			var outcome string
+			if err := s.db.QueryRowContext(ctx, `SELECT state,outcome FROM obligations WHERE message_seq=?`, noticeSeq).Scan(&state, &outcome); err != nil || state != api.ObligationClosed || outcome != api.OutcomeRecipientGone {
+				t.Fatalf("notice final %s/%s: %v", state, outcome, err)
+			}
+			if err := s.db.QueryRowContext(ctx, `SELECT state FROM obligations WHERE message_seq=?`, outsideNotice.Seq).Scan(&state); err != nil || state == api.ObligationClosed {
+				t.Fatalf("outsider delivery obligation changed: %s %v", state, err)
+			}
+			var dangling int
+			if err := s.db.QueryRowContext(ctx, `SELECT count(*) FROM obligations WHERE agent_id IN (?,?) AND needs=? AND state<>?`, lead.ID, worker.ID, api.ObligationNeedsDelivery, api.ObligationClosed).Scan(&dangling); err != nil || dangling != 0 {
+				t.Fatalf("dangling delivery obligations %d: %v", dangling, err)
+			}
+			unchanged, _ := s.GetAgent(ctx, other.ID)
+			if unchanged.Status != other.Status {
+				t.Fatal("outsider changed")
+			}
+		})
+	}
+}
+
 func TestCloseItemTeamRefusesOpenHeldAndSentObligations(t *testing.T) {
 	s, task, item, lead, worker, _, req := teamCloseFixture(t)
 	ctx := context.Background()

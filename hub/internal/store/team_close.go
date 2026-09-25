@@ -78,7 +78,7 @@ func (s *Store) CloseItemTeam(ctx context.Context, taskID string, req api.TeamCl
 			actual = append(actual, api.TeamCloseMember{AgentID: a.ID, RunID: a.RunID, Host: a.Host, Status: a.Status})
 		}
 	}
-	if lead.ID == "" || lead.Role == api.AgentRoleDatabaseHandler || lead.Status == api.AgentClosed || lead.Status == api.AgentExited ||
+	if lead.ID == "" || lead.Role == api.AgentRoleDatabaseHandler || lead.Status == api.AgentClosed || (lead.Status == api.AgentExited && req.ActorAgentID != "") ||
 		!strings.EqualFold(lead.Name, task.Orchestrator) || lead.RunID != req.LeadRunID || lead.WorkItem == nil || lead.WorkItem.ItemTaskID != taskID || lead.WorkItem.ItemID != req.ItemID || lead.WorkItem.ItemRevision != req.ItemRevision {
 		return zero, fmt.Errorf("%w: selected lead is not the current item-scoped orchestrator", api.ErrConflict)
 	}
@@ -89,12 +89,13 @@ func (s *Store) CloseItemTeam(ctx context.Context, taskID string, req api.TeamCl
 	if !slices.Equal(actual, req.Members) {
 		return zero, fmt.Errorf("%w: item team snapshot changed; refresh before team close", api.ErrConflict)
 	}
-	// A team member can hold an obligation or have sent one to another agent.
-	// Both directions must be resolved before the lead leaves.
+	// Substantive work held or sent by a member must be resolved before close.
+	// Delivery-only obligations held by members are closed with the recipients
+	// in the same transaction below, regardless of who sent the notice.
 	{
 		team := `SELECT b.agent_id FROM agent_work_item_bindings b JOIN agents a ON a.id=b.agent_id AND a.run_id=b.run_id WHERE b.item_task_id=? AND b.item_id=? AND a.role<>?`
-		rows, err := s.db.QueryContext(ctx, `SELECT o.message_seq,o.state,o.agent_id,m.from_agent FROM obligations o JOIN messages m ON m.seq=o.message_seq WHERE o.task_id=? AND o.state<>? AND (o.agent_id IN (`+team+`) OR m.from_agent IN (`+team+`)) ORDER BY o.message_seq`,
-			taskID, api.ObligationClosed, taskID, req.ItemID, api.AgentRoleDatabaseHandler, taskID, req.ItemID, api.AgentRoleDatabaseHandler)
+		rows, err := s.db.QueryContext(ctx, `SELECT o.message_seq,o.state,o.agent_id,m.from_agent FROM obligations o JOIN messages m ON m.seq=o.message_seq WHERE o.task_id=? AND o.state<>? AND o.needs<>? AND (o.agent_id IN (`+team+`) OR m.from_agent IN (`+team+`)) ORDER BY o.message_seq`,
+			taskID, api.ObligationClosed, api.ObligationNeedsDelivery, taskID, req.ItemID, api.AgentRoleDatabaseHandler, taskID, req.ItemID, api.AgentRoleDatabaseHandler)
 		if err != nil {
 			return zero, err
 		}
@@ -139,6 +140,11 @@ func (s *Store) CloseItemTeam(ctx context.Context, taskID string, req api.TeamCl
 	defer tx.Rollback()
 	now := ts(s.now())
 	for _, m := range result.Members {
+		if _, err := tx.ExecContext(ctx, `UPDATE obligations SET state=?,outcome=?,reason=?,closed_at=?,changed_at=? WHERE task_id=? AND agent_id=? AND needs=? AND state<>?`,
+			api.ObligationClosed, api.OutcomeRecipientGone, "recipient agent is closed", now, now,
+			taskID, m.AgentID, api.ObligationNeedsDelivery, api.ObligationClosed); err != nil {
+			return zero, err
+		}
 		if m.Status == api.AgentClosed {
 			continue
 		}

@@ -35,8 +35,15 @@ func teamCloseCLIContext(t *testing.T, item api.WorkItem, order api.Message) []b
 }
 
 func TestOwnerTeamCloseUsesRealFixtureHubWithoutAgentEnvironment(t *testing.T) {
-	for _, terminal := range []string{"done", "dismissed"} {
-		t.Run(terminal, func(t *testing.T) {
+	for _, tc := range []struct {
+		terminal string
+		exited   bool
+	}{{"done", false}, {"dismissed", false}, {"done", true}, {"dismissed", true}} {
+		name := tc.terminal
+		if tc.exited {
+			name += "-exited-lead"
+		}
+		t.Run(name, func(t *testing.T) {
 			t.Setenv("TAILTERM_RELAY_STATE", t.TempDir())
 			st, err := store.Open(filepath.Join(t.TempDir(), "hub.sqlite"))
 			if err != nil {
@@ -88,7 +95,29 @@ func TestOwnerTeamCloseUsesRealFixtureHubWithoutAgentEnvironment(t *testing.T) {
 			}
 			lead := add("lead")
 			worker := add("worker")
-			status := terminal
+			request, err := c.PostMessage(ctx, task.ID, api.PostMessageRequest{To: worker.ID, AgentID: lead.ID, RunID: lead.RunID,
+				Envelope: &api.Envelope{Kind: api.EnvelopeKindRequest, To: worker.Name, Subject: "Fixture request", Body: api.EnvelopeBody{Ask: "Check the fixture."}}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			obligations, err := c.ListObligationsFrom(ctx, task.ID, worker.ID, request.Seq, request.Seq)
+			if err != nil || len(obligations) != 1 {
+				t.Fatalf("fixture obligation %+v: %v", obligations, err)
+			}
+			if _, err := c.CancelObligation(ctx, task.ID, obligations[0].ID, api.ObligationCancelRequest{RequestID: "fixture-cancel", Reason: "fixture complete"}); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := c.PostMessage(ctx, task.ID, api.PostMessageRequest{To: worker.ID, AgentID: lead.ID, RunID: lead.RunID,
+				Envelope: &api.Envelope{Kind: api.EnvelopeKindNotice, To: worker.Name, Subject: "Fixture notice", Body: api.EnvelopeBody{Text: "Fixture complete."}}}); err != nil {
+				t.Fatal(err)
+			}
+			if tc.exited {
+				exited := api.AgentExited
+				if _, err := c.UpdateAgent(ctx, task.ID, lead.ID, api.UpdateAgentRequest{Status: &exited}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			status := tc.terminal
 			if status == "done" {
 				report, _, err := st.PutNarrativeReport(ctx, task.ID, item.ID, api.PutNarrativeReportRequest{RequestID: "close-report", ScopeRevision: item.ScopeRevision,
 					Sections:   api.NarrativeReportSections{RequestedOutcome: "Close the item team.", DeliveredWork: "The synthetic delivery is complete.", Verification: "Isolated CLI and hub fixture.", Limitations: "Fixture only.", RemainingWork: "No remaining fixture work."},
@@ -103,6 +132,12 @@ func TestOwnerTeamCloseUsesRealFixtureHubWithoutAgentEnvironment(t *testing.T) {
 				t.Fatal(err)
 			}
 			e := env{hub: srv.URL}
+			if tc.exited {
+				actor := env{hub: srv.URL, task: task.ID, agent: lead.ID, runID: lead.RunID}
+				if err := cmdClose(actor, []string{"--team"}); err == nil || !strings.Contains(err.Error(), "only the owner") {
+					t.Fatalf("exited actor accepted: %v", err)
+				}
+			}
 			if err := cmdClose(e, []string{"--team"}); err == nil || !strings.Contains(err.Error(), "owner must supply --task") {
 				t.Fatalf("missing selector %v", err)
 			}
@@ -123,6 +158,18 @@ func TestOwnerTeamCloseUsesRealFixtureHubWithoutAgentEnvironment(t *testing.T) {
 				a, err := c.GetAgent(ctx, task.ID, id)
 				if err != nil || a.Status != api.AgentClosed || a.CleanupDone {
 					t.Fatalf("remote cleanup %+v %v", a, err)
+				}
+			}
+			finalObligations, err := c.ListObligationsFrom(ctx, task.ID, worker.ID, request.Seq, 0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(finalObligations) < 3 {
+				t.Fatalf("missing owner and agent notices after close: %+v", finalObligations)
+			}
+			for _, obligation := range finalObligations {
+				if obligation.Needs == api.ObligationNeedsDelivery && (obligation.State != api.ObligationClosed || obligation.Outcome != api.OutcomeRecipientGone) {
+					t.Fatalf("delivery obligation survived close: %+v", obligation)
 				}
 			}
 		})
