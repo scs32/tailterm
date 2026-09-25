@@ -3,6 +3,7 @@
 import { taskRollup } from "./tasks.js";
 import { pauseStateLabel, projectPauseState } from "./project-pause.js";
 import { createViewRefreshPresentation } from "./view-refresh-presentation.js";
+import { renderTeamDelivery } from "./team-delivery-view.js";
 
 const cacheFeedback = (label = "") =>
   label === "Saved data" || label === "Saved data · refreshing"
@@ -52,6 +53,16 @@ export function createTasksView({
   // project lifecycle starts a fresh disclosure epoch.
   let teamClient = null;
   const teamChoices = new Map();
+  const deliveries = new Map();
+  async function loadDelivery(taskId, actionClient = client()) {
+    if (!taskId || !actionClient?.listTeamDelivery) return;
+    try {
+      const queue = await actionClient.listTeamDelivery(taskId);
+      if (!visible || client() !== actionClient) return;
+      deliveries.set(taskId, queue);
+      if (selected === taskId) render();
+    } catch { deliveries.delete(taskId); }
+  }
   function teamExpanded(task, count) {
     if (teamClient !== client()) {
       teamClient = client();
@@ -174,6 +185,7 @@ export function createTasksView({
       // Keep known controls on a routine reload, but wait on a new client.
       if (capabilitiesClient !== actionClient) capabilities = null;
       render();
+      void loadDelivery(selected, actionClient);
       const nextCapabilities = await actionClient
         .capabilities()
         .catch(() => null);
@@ -276,7 +288,7 @@ export function createTasksView({
         )
         .join(
           "",
-        )}</div><footer class="task-actions"><span class="fine">${resumePending ? "Fresh-team launch incomplete" : task.allowAgentSpawn ? "Helpers allowed" : "Helpers off"}</span><button data-task-board="${esc(task.id)}">Open board →</button><button data-task-add="${esc(task.id)}" ${resumePending ? "disabled" : ""}>＋ Add agent</button><button data-task-lead="${esc(task.id)}" ${resumePending ? "disabled" : ""}>Replace lead</button>${!resumePending && (!handler || handler.status === "exited" || (!handler.online && !["retired", "closed"].includes(handler.status))) ? `<button data-handler-setup="${esc(task.id)}">${handler ? (handler.status === "exited" ? "Restart" : "Check") : "Set up"} database handler</button>` : ""}${openWorkItems ? `<button data-project-bugs="${esc(task.id)}">Bugs</button><button data-project-features="${esc(task.id)}">Features</button>` : ""}<div class="task-more"><button type="button" data-task-more="${esc(task.id)}" aria-expanded="false" aria-controls="task-menu-${esc(task.id)}">More</button><div id="task-menu-${esc(task.id)}" class="task-menu" popover="auto" aria-label="More project actions"><button data-task-attach="${esc(task.id)}">Open terminals</button><button data-task-settings="${esc(task.id)}">Settings</button><button data-task-pause="${esc(task.id)}" data-testid="pause-project" ${pauseState === "active" && !resumePending ? "" : `disabled aria-disabled="true" title="${resumePending ? "Finish the saved Resume first" : "Update the hub to projectPause v1"}"`}>Pause project…</button>${pauseState === "legacy" ? '<span class="fine" data-testid="pause-project-legacy">Pause unavailable · hub update required</span>' : ""}<button data-task-close="${esc(task.id)}" class="danger">Close project</button></div></div></footer></article>`;
+        )}</div><footer class="task-actions"><span class="fine">${resumePending ? "Fresh-team launch incomplete" : task.allowAgentSpawn ? "Helpers allowed" : "Helpers off"}</span><button data-task-board="${esc(task.id)}">Open board →</button><button data-task-add="${esc(task.id)}" ${resumePending ? "disabled" : ""}>＋ Add agent</button><button data-task-lead="${esc(task.id)}" ${resumePending ? "disabled" : ""}>Replace lead</button>${!resumePending && (!handler || handler.status === "exited" || (!handler.online && !["retired", "closed"].includes(handler.status))) ? `<button data-handler-setup="${esc(task.id)}">${handler ? (handler.status === "exited" ? "Restart" : "Check") : "Set up"} database handler</button>` : ""}${openWorkItems ? `<button data-project-bugs="${esc(task.id)}">Bugs</button><button data-project-features="${esc(task.id)}">Features</button>` : ""}<div class="task-more"><button type="button" data-task-more="${esc(task.id)}" aria-expanded="false" aria-controls="task-menu-${esc(task.id)}">More</button><div id="task-menu-${esc(task.id)}" class="task-menu" popover="auto" aria-label="More project actions"><button data-task-attach="${esc(task.id)}">Open terminals</button><button data-task-settings="${esc(task.id)}">Settings</button><button data-task-pause="${esc(task.id)}" data-testid="pause-project" ${pauseState === "active" && !resumePending ? "" : `disabled aria-disabled="true" title="${resumePending ? "Finish the saved Resume first" : "Update the hub to projectPause v1"}"`}>Pause project…</button>${pauseState === "legacy" ? '<span class="fine" data-testid="pause-project-legacy">Pause unavailable · hub update required</span>' : ""}<button data-task-close="${esc(task.id)}" class="danger">Close project</button></div></div></footer></article>${renderTeamDelivery(deliveries.get(task.id), agents)}`;
     };
     root.innerHTML = `<div class="board mode-board tasks-view"><aside class="board-rail"><div class="board-rail-head"><span class="eyebrow">PROJECTS</span><button id="tasks-new" title="New project" aria-label="New project">＋</button></div>${open.map(projectButton).join("")}${closed.length ? `<details class="board-closed tasks-closed" data-view-disclosure="closed" ${current?.task.status !== "open" ? "open" : ""}><summary>Closed · ${closed.length}</summary>${closed.map(projectButton).join("")}</details>` : ""}</aside><section class="board-thread tasks-detail">${detail(current)}</section></div>`;
     presentation.afterRender(selected);
@@ -286,6 +298,7 @@ export function createTasksView({
         (button.onclick = () => {
           selected = button.dataset.taskSelect;
           render();
+          void loadDelivery(selected);
         }),
     );
     root.querySelectorAll("[data-task-more]").forEach((button) => {

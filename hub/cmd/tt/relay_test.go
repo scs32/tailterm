@@ -17,6 +17,28 @@ import (
 	"time"
 )
 
+func TestTeamQueuePollBackoffKeepsRateLimitSpacing(t *testing.T) {
+	now := time.Date(2026, time.September, 25, 20, 0, 0, 0, time.UTC)
+	var backoff teamQueuePollBackoff
+	rateLimited := &api.HTTPError{Status: http.StatusTooManyRequests, Msg: "synthetic 429"}
+	backoff.observe(now, rateLimited)
+	if backoff.ready(now.Add(5*time.Second)) || !backoff.ready(now.Add(6*time.Second)) {
+		t.Fatalf("first 429 spacing: %+v", backoff)
+	}
+	backoff.observe(now.Add(6*time.Second), rateLimited)
+	if backoff.ready(now.Add(17*time.Second)) || !backoff.ready(now.Add(18*time.Second)) {
+		t.Fatalf("second 429 spacing: %+v", backoff)
+	}
+	backoff.observe(now.Add(18*time.Second), errors.New("other transient failure"))
+	if backoff.delay != 12*time.Second {
+		t.Fatalf("unrelated error erased 429 spacing: %+v", backoff)
+	}
+	backoff.observe(now.Add(18*time.Second), nil)
+	if !backoff.ready(now.Add(18*time.Second)) || backoff.delay != 0 {
+		t.Fatalf("successful poll did not reset spacing: %+v", backoff)
+	}
+}
+
 func captureRelayOutput(t *testing.T, stderr bool, run func() error) (string, error) {
 	t.Helper()
 	r, w, err := os.Pipe()

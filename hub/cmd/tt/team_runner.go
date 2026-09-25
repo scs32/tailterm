@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -22,10 +23,22 @@ import (
 // journal: a local file may hold the frozen context only during one spawn call.
 // Dependencies are injectable so tests never start a real runtime or tmux.
 type teamRunner struct {
-	plan    func(context.Context, map[string]any, *teamLaunchResolved) error
-	spawn   func(env, []string) error
-	owned   func(context.Context, env, api.Agent) error
-	cleanup func(context.Context, env, string, string) error
+	plan        func(context.Context, map[string]any, *teamLaunchResolved) error
+	spawn       func(env, []string) error
+	owned       func(context.Context, env, api.Agent) error
+	cleanup     func(context.Context, env, string, string) error
+	integration func(context.Context, api.TeamQueueEntry, api.WorkItem, api.TeamCloseRequest) (*api.TeamIntegrationReady, error)
+	roundRobin  bool
+}
+
+var teamQueueProjectCursor atomic.Uint64
+
+func rotateQueueProjects(projects []string, start int) []string {
+	if len(projects) < 2 {
+		return projects
+	}
+	start %= len(projects)
+	return append(append([]string(nil), projects[start:]...), projects[:start]...)
 }
 
 // The runner and the owner's release command share this host lock. A dead
@@ -77,6 +90,8 @@ func productionTeamRunner() teamRunner {
 			}
 			return nil
 		},
+		integration: queueIntegrationSnapshot,
+		roundRobin:  true,
 	}
 }
 
@@ -86,32 +101,40 @@ func (r teamRunner) tick(ctx context.Context, e env, c *api.Client, host string)
 		return err
 	}
 	seen := map[string]bool{}
-	var projectErrors []error
+	projects := make([]string, 0)
 	for _, entry := range list.Entries {
-		if seen[entry.TaskID] {
-			continue
+		if !seen[entry.TaskID] {
+			seen[entry.TaskID] = true
+			projects = append(projects, entry.TaskID)
 		}
-		seen[entry.TaskID] = true
-		// A failed entry freezes its project even when it is not returned by
-		// the host query. The first entry in position order is authoritative.
-		queue, err := c.ListTeamQueue(ctx, entry.TaskID)
+	}
+	if r.roundRobin && len(projects) > 1 {
+		start := int((teamQueueProjectCursor.Add(1) - 1) % uint64(len(projects)))
+		projects = rotateQueueProjects(projects, start)
+	}
+	var projectErrors []error
+	for _, taskID := range projects {
+		queue, err := c.ListTeamQueue(ctx, taskID)
 		if err != nil {
-			projectErrors = append(projectErrors, fmt.Errorf("team queue project %s: %w", entry.TaskID, err))
+			projectErrors = append(projectErrors, fmt.Errorf("team queue project %s: %w", taskID, err))
 			continue
 		}
-		var first *api.TeamQueueEntry
-		for i := range queue.Entries {
-			q := &queue.Entries[i]
-			if q.State != "finished" && !(q.State == "failed" && q.ReleasedAt != "") {
-				first = q
+		for _, q := range queue.Entries {
+			if q.Host != host {
+				continue
+			}
+			if q.State == "failed" && q.ReleasedAt == "" && queue.ConcurrencyLimit == 1 {
 				break
 			}
-		}
-		if first == nil || first.State == "failed" || first.ID != entry.ID {
-			continue
-		}
-		if err := r.advance(ctx, e, c, *first, host); err != nil {
-			projectErrors = append(projectErrors, fmt.Errorf("team queue %s: %w", first.ID, err))
+			if q.State != "queued" && q.State != "launching" && q.State != "running" {
+				continue
+			}
+			if err := r.advance(ctx, e, c, q, host); err != nil {
+				projectErrors = append(projectErrors, fmt.Errorf("team queue %s: %w", q.ID, err))
+			}
+			if queue.ConcurrencyLimit == 1 {
+				break
+			}
 		}
 	}
 	return errors.Join(projectErrors...)
@@ -126,7 +149,11 @@ func (r teamRunner) advance(ctx context.Context, e env, c *api.Client, q api.Tea
 		return nil
 	}
 	if q.State == "queued" {
-		if detail.Task.Orchestrator != "" {
+		queue, err := c.ListTeamQueue(ctx, q.TaskID)
+		if err != nil {
+			return err
+		}
+		if queue.ConcurrencyLimit == 1 && detail.Task.Orchestrator != "" {
 			return nil
 		}
 		item, err := c.GetWorkItem(ctx, q.TaskID, q.ItemID)
@@ -135,15 +162,6 @@ func (r teamRunner) advance(ctx context.Context, e env, c *api.Client, q api.Tea
 		}
 		if item.Revision != q.ItemRevision || item.Status == "done" || item.Status == "dismissed" {
 			return r.fail(ctx, c, q, errors.New("queued item changed before launch"))
-		}
-		handlers := 0
-		for _, a := range detail.Agents {
-			if a.Role == api.AgentRoleDatabaseHandler && a.Status != api.AgentClosed && a.Status != api.AgentExited && a.Status != api.AgentRetired && a.Online {
-				handlers++
-			}
-		}
-		if handlers != 1 {
-			return nil
 		}
 		q, err = c.TeamQueueAction(ctx, q.TaskID, api.TeamQueueRequest{RequestID: "queue-claim-" + q.ID, Operation: "claim", EntryID: q.ID, ExpectedRevision: q.Revision, Host: host, PauseGeneration: detail.Task.PauseGeneration})
 		if err != nil {
@@ -171,6 +189,9 @@ func claimRaceConflict(message string) bool {
 		"project is not launchable",
 		"not queue head",
 		"launch is reserved",
+		"all team slots are reserved",
+		"no available database handler lease",
+		"manual launch is reserved",
 	} {
 		if strings.HasSuffix(message, cause) {
 			return true
@@ -217,6 +238,11 @@ func (r teamRunner) launch(ctx context.Context, e env, c *api.Client, q api.Team
 	if q.Host != host {
 		return nil
 	}
+	queueState, err := c.ListTeamQueue(ctx, q.TaskID)
+	if err != nil {
+		return err
+	}
+	parallel := queueState.ConcurrencyLimit > 1
 	var journal teamLaunchJournal
 	if len(q.LaunchJSON) == 0 {
 		item, err := c.GetWorkItem(ctx, q.TaskID, q.ItemID)
@@ -229,14 +255,11 @@ func (r teamRunner) launch(ctx context.Context, e env, c *api.Client, q api.Team
 		var handler *api.Agent
 		for i := range detail.Agents {
 			a := &detail.Agents[i]
-			if a.Role == api.AgentRoleDatabaseHandler && a.Online && a.Status != api.AgentRetired && a.Status != api.AgentClosed && a.Status != api.AgentExited {
-				if handler != nil {
-					return nil
-				}
+			if a.ID == q.HandlerID && a.RunID == q.HandlerRunID && a.Role == api.AgentRoleDatabaseHandler && a.Online && a.Status != api.AgentRetired && a.Status != api.AgentClosed && a.Status != api.AgentExited {
 				handler = a
 			}
 		}
-		if handler == nil || detail.Task.Orchestrator != "" {
+		if handler == nil {
 			return nil
 		}
 		var resolved teamLaunchResolved
@@ -247,7 +270,7 @@ func (r teamRunner) launch(ctx context.Context, e env, c *api.Client, q api.Team
 		if len(resolved.Plan) == 0 || !json.Valid(resolved.ItemRouting.WorkContextBundle) {
 			return r.fail(ctx, c, q, errors.New("team plan is incomplete"))
 		}
-		journal = teamLaunchJournal{Version: 1, Hub: e.hub, Task: q.TaskID, Item: q.ItemID, Revision: q.ItemRevision, Order: q.OrderMessageSeq, HandlerID: handler.ID, Context: resolved.ItemRouting.WorkContextBundle}
+		journal = teamLaunchJournal{Version: 1, Hub: e.hub, Task: q.TaskID, Item: q.ItemID, Revision: q.ItemRevision, Order: q.OrderMessageSeq, HandlerID: handler.ID, HandlerRunID: handler.RunID, HandlerLeaseGeneration: q.HandlerLeaseGeneration, Context: resolved.ItemRouting.WorkContextBundle}
 		for _, member := range resolved.Plan {
 			f := member.Fields
 			f.AgentID = api.NewID("agt")
@@ -261,14 +284,11 @@ func (r teamRunner) launch(ctx context.Context, e env, c *api.Client, q api.Team
 	} else if err := json.Unmarshal(q.LaunchJSON, &journal); err != nil {
 		return r.fail(ctx, c, q, err)
 	}
-	if len(journal.Members) == 0 || journal.Task != q.TaskID || journal.Item != q.ItemID || journal.Revision != q.ItemRevision || journal.Order != q.OrderMessageSeq {
+	if len(journal.Members) == 0 || journal.Task != q.TaskID || journal.Item != q.ItemID || journal.Revision != q.ItemRevision || journal.Order != q.OrderMessageSeq || ((parallel || journal.HandlerID != "") && (journal.HandlerID != q.HandlerID || journal.HandlerRunID != q.HandlerRunID || journal.HandlerLeaseGeneration != q.HandlerLeaseGeneration)) {
 		return r.fail(ctx, c, q, errors.New("frozen team identity conflicts with queue entry"))
 	}
 	lead := journal.Members[0].Fields.Name
-	if detail.Task.Orchestrator != lead {
-		if detail.Task.Orchestrator != "" {
-			return r.fail(ctx, c, q, errors.New("another orchestrator took this project"))
-		}
+	if !parallel && detail.Task.Orchestrator == "" {
 		if _, err := c.UpdateTask(ctx, q.TaskID, api.UpdateTaskRequest{Orchestrator: &lead, TeamLaunchToken: "queue-claim-" + q.ID}); err != nil {
 			return r.fail(ctx, c, q, err)
 		}
@@ -287,14 +307,14 @@ func (r teamRunner) launch(ctx context.Context, e env, c *api.Client, q api.Team
 		}
 		available := false
 		for _, a := range fresh.Agents {
-			if a.ID == journal.HandlerID && a.Role == api.AgentRoleDatabaseHandler && a.Online && a.Status != api.AgentRetired && a.Status != api.AgentClosed && a.Status != api.AgentExited {
+			if a.ID == journal.HandlerID && a.RunID == q.HandlerRunID && a.Role == api.AgentRoleDatabaseHandler && a.Online && a.Status != api.AgentRetired && a.Status != api.AgentClosed && a.Status != api.AgentExited {
 				available = true
 			}
 		}
 		if !available {
 			return nil
 		}
-		if fresh.Task.Orchestrator != lead {
+		if !parallel && fresh.Task.Orchestrator != lead {
 			return r.fail(ctx, c, q, errors.New("lead changed during frozen launch"))
 		}
 		current, err := c.GetWorkItem(ctx, q.TaskID, q.ItemID)
@@ -340,7 +360,7 @@ func (r teamRunner) launch(ctx context.Context, e env, c *api.Client, q api.Team
 		contextFile.Close()
 		f := member.Fields
 		allowed, _ := json.Marshal(f.AllowedTools)
-		args := []string{"--name", f.Name, "--run", f.Run, "--runtime", f.Runtime, "--model", f.Model, "--reasoning", f.Reasoning, "--cwd", f.Cwd, "--prompt", f.Prompt, "--agent-id", f.AgentID, "--expected-run-id", member.RunID, "--task", q.TaskID, "--hub", e.hub, "--work-item", q.ItemID, "--work-item-revision", strconv.FormatInt(q.ItemRevision, 10), "--work-order-message", strconv.FormatInt(q.OrderMessageSeq, 10), "--work-context-file", contextFile.Name(), "--planned-team-members", strconv.Itoa(len(journal.Members)), "--allowed-tools-json", string(allowed)}
+		args := []string{"--name", f.Name, "--run", f.Run, "--runtime", f.Runtime, "--model", f.Model, "--reasoning", f.Reasoning, "--cwd", f.Cwd, "--prompt", f.Prompt, "--agent-id", f.AgentID, "--expected-run-id", member.RunID, "--task", q.TaskID, "--hub", e.hub, "--work-item", q.ItemID, "--work-item-revision", strconv.FormatInt(q.ItemRevision, 10), "--work-order-message", strconv.FormatInt(q.OrderMessageSeq, 10), "--work-context-file", contextFile.Name(), "--planned-team-members", strconv.Itoa(len(journal.Members)), "--team-lead-name", lead, "--team-handler-id", q.HandlerID, "--allowed-tools-json", string(allowed)}
 		if f.PermissionMode != "" {
 			args = append(args, "--permission-mode", f.PermissionMode)
 		}
@@ -382,7 +402,17 @@ func (r teamRunner) finish(ctx context.Context, e env, c *api.Client, q api.Team
 		if err != nil {
 			return err
 		}
-		if detail.Task.Orchestrator == "" {
+		itemLeadLive := false
+		legacyLeadLive := false
+		for _, a := range detail.Agents {
+			if a.ItemLead && a.WorkItem != nil && a.WorkItem.ItemID == q.ItemID && a.Status != api.AgentClosed {
+				itemLeadLive = true
+			}
+			if a.WorkItem != nil && a.WorkItem.ItemID == q.ItemID && strings.EqualFold(a.Name, detail.Task.Orchestrator) && a.Status != api.AgentClosed {
+				legacyLeadLive = true
+			}
+		}
+		if !itemLeadLive && !legacyLeadLive {
 			var journal teamLaunchJournal
 			if json.Unmarshal(q.LaunchJSON, &journal) != nil || len(journal.Members) == 0 || journal.Members[0].RunID == "" {
 				return r.fail(ctx, c, q, errors.New("closed lead has no frozen exact run"))
@@ -411,7 +441,7 @@ func (r teamRunner) finish(ctx context.Context, e env, c *api.Client, q api.Team
 				return r.fail(ctx, c, q, errors.New("closed lead has no exact team close receipt"))
 			}
 		} else {
-			closeReq, err = closeTeamSnapshot(detail.Task, detail.Agents, "", "")
+			closeReq, err = closeTeamSnapshotForItem(detail.Task, detail.Agents, "", "", q.ItemID)
 			if err != nil {
 				return r.fail(ctx, c, q, fmt.Errorf("close gate: %w", err))
 			}
@@ -479,7 +509,17 @@ func (r teamRunner) finish(ctx context.Context, e env, c *api.Client, q api.Team
 			return nil
 		}
 	}
-	_, err = c.TeamQueueAction(ctx, q.TaskID, api.TeamQueueRequest{RequestID: "queue-finish-" + q.ID, Operation: "finish", EntryID: q.ID, ExpectedRevision: q.Revision})
+	var integration *api.TeamIntegrationReady
+	if item.Status == "done" && q.Repository != "" {
+		if r.integration == nil {
+			return r.fail(ctx, c, q, errors.New("integration snapshot provider is unavailable"))
+		}
+		integration, err = r.integration(ctx, q, item, closeReq)
+		if err != nil {
+			return r.fail(ctx, c, q, fmt.Errorf("integration snapshot: %w", err))
+		}
+	}
+	_, err = c.TeamQueueAction(ctx, q.TaskID, api.TeamQueueRequest{RequestID: "queue-finish-" + q.ID, Operation: "finish", EntryID: q.ID, ExpectedRevision: q.Revision, Integration: integration})
 	return err
 }
 

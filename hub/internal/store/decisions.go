@@ -158,6 +158,9 @@ func (s *Store) CreateDecision(ctx context.Context, taskID string, req api.Creat
 	if author.Status == api.AgentClosed || author.Status == api.AgentExited {
 		return api.Message{}, api.ErrConflict
 	}
+	if err := ensureLeadItemLinks(ctx, tx, taskID, author.ID, author.RunID, req.WorkItems, ""); err != nil {
+		return api.Message{}, err
+	}
 	message, err := s.insertMessage(ctx, tx, task, messageReq, api.Agent{}, by, false, false)
 	if err != nil {
 		return message, err

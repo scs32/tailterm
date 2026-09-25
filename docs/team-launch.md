@@ -43,22 +43,56 @@ On the launch host, the owner can save a sequence of recorded item orders:
 
 ```sh
 tt team queue add --task tsk_... --item wi_... --order 123 --template planned
+tt team queue add --task tsk_... --item wi_... --order 124 --cwd /absolute/worktree --owns client --owns hub/internal/store
+tt team queue policy --task tsk_... --policy-version 1 --expires 2026-09-26T00:00:00Z --sessions 20 --polling 2
+tt team queue limit --task tsk_... --limit 2
 tt team queue list --task tsk_...
+tt team queue replace-lead --task tsk_... --entry tqe_... --lead-agent agt_...
 tt team queue reorder --task tsk_... --entry tqe_... --before tqe_...
 tt team queue remove --task tsk_... --entry tqe_...
 tt team queue release --task tsk_... --entry tqe_...
 tt team queue abandon --task tsk_... --item wi_... --order 123
 ```
 
-The hub stores queue state and retry receipts. The existing supervised Mini
-relay checks that state on each tick, including when no Codex thread is bound.
-It waits for an active project, one available database handler, and no live
-lead. It records a launch reservation and frozen plan before effects.
+The default project limit is one. The owner may set two only under a fresh,
+versioned host policy whose session and polling budgets cover all projects on
+that host. A stale or missing policy stops new parallel launch effects; it does
+not kill running teams. The relay rotates the first polled project and backs
+off after a hub 429; unrelated inbox delivery continues. The initial ceiling
+is two. The owner provisions
+additional database handlers as ordinary continuing handler agents; the runner
+never starts or resumes them. Each running item leases a distinct exact
+handler ID and run. A retired or offline handler is unavailable for a new
+lease. Existing one-at-a-time projects retain their primary handler.
+
+Use one canonical worktree per parallel item. `--owns` accepts repository
+relative files and directories; an ancestor directory overlaps its descendants,
+while sibling directories do not. Missing ownership conflicts with every item.
+The queue command rejects traversal, absolute or dot segments, symlink paths,
+and case aliases. It records the shared repository identity and starting commit
+across worktrees. `list` and the Projects Delivery panel show ownership,
+blockers, item lead, handler, and limit. When two slots are available, the
+runner takes queued items in order and skips one blocked by active ownership
+before trying the next. It keeps distinct worktree and handler leases.
+
+The hub stores queue state and retry receipts. The supervised Mini relay checks
+the queue on each tick, including when no Codex thread is bound. It records a
+launch reservation and frozen plan before effects. Each queued lead is scoped
+to its own item. The owner can transfer that lead to a live exact member of
+the same item with `replace-lead`; the other item lead remains untouched.
 Uncertain member spawns are reconciled by exact identity and owned session;
 unresolved attempts fail the entry and require owner action. Terminal items
 advance only after the exact team close and host cleanup receipts. A failed
-entry stops that project queue and posts one durable owner escalation. Pausing
-the project stops launch ticks. The deliberate agent Queue is separate.
+entry keeps its slot and posts one durable owner escalation. Unrelated teams
+continue; ownership blocked by the failed entry waits for an explicit verified
+release. Pausing the project stops launch ticks. The deliberate agent Queue is
+separate.
+
+An accepted parallel item becomes **Ready to integrate** only after its exact
+team close and cleanup receipts. The saved repository, base, branch, commit
+and acceptance evidence appear in the queue and Projects Delivery panel. The
+owner performs any merge, push or deployment separately. Dismissed items have
+no integration record.
 
 After inspecting a failed entry, use `release --entry` to clear its reservation
 and let the next queued item run. The failed entry and escalation remain in

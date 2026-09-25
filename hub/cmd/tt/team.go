@@ -51,15 +51,17 @@ type teamLaunchMember struct {
 	RunID  string           `json:"runId,omitempty"`
 }
 type teamLaunchJournal struct {
-	Version   int                `json:"version"`
-	Hub       string             `json:"hub"`
-	Task      string             `json:"task"`
-	Item      string             `json:"item"`
-	Revision  int64              `json:"revision"`
-	Order     int64              `json:"order"`
-	HandlerID string             `json:"handlerId"`
-	Context   json.RawMessage    `json:"context"`
-	Members   []teamLaunchMember `json:"members"`
+	Version                int                `json:"version"`
+	Hub                    string             `json:"hub"`
+	Task                   string             `json:"task"`
+	Item                   string             `json:"item"`
+	Revision               int64              `json:"revision"`
+	Order                  int64              `json:"order"`
+	HandlerID              string             `json:"handlerId"`
+	HandlerRunID           string             `json:"handlerRunId,omitempty"`
+	HandlerLeaseGeneration int64              `json:"handlerLeaseGeneration,omitempty"`
+	Context                json.RawMessage    `json:"context"`
+	Members                []teamLaunchMember `json:"members"`
 }
 
 func cmdTeam(e env, args []string) error {
@@ -299,7 +301,7 @@ func cmdTeam(e env, args []string) error {
 			"--reasoning", f.Reasoning, "--cwd", f.Cwd, "--prompt", f.Prompt, "--agent-id", f.AgentID,
 			"--task", *task, "--hub", *hub, "--work-item", *item, "--work-item-revision", strconv.FormatInt(journal.Revision, 10),
 			"--work-order-message", strconv.FormatInt(*order, 10), "--work-context-file", contextFile,
-			"--planned-team-members", strconv.Itoa(len(journal.Members)), "--allowed-tools-json", string(allowed)}
+			"--planned-team-members", strconv.Itoa(len(journal.Members)), "--team-lead-name", lead, "--allowed-tools-json", string(allowed)}
 		if f.PermissionMode != "" {
 			spawnArgs = append(spawnArgs, "--permission-mode", f.PermissionMode)
 		}

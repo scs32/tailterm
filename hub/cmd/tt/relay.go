@@ -389,6 +389,28 @@ func relayOne(ctx context.Context, b runtimeBinding, p *relayProgress, c *api.Cl
 	p.Error = ""
 	return nil
 }
+
+type teamQueuePollBackoff struct {
+	next  time.Time
+	delay time.Duration
+}
+
+func (b *teamQueuePollBackoff) ready(now time.Time) bool { return !now.Before(b.next) }
+
+func (b *teamQueuePollBackoff) observe(now time.Time, err error) {
+	var response *api.HTTPError
+	if errors.As(err, &response) && response.Status == http.StatusTooManyRequests {
+		if b.delay == 0 {
+			b.delay = 6 * time.Second
+		} else {
+			b.delay = min(2*b.delay, time.Minute)
+		}
+		b.next = now.Add(b.delay)
+	} else if err == nil {
+		b.delay, b.next = 0, time.Time{}
+	}
+}
+
 func cmdRelay(args []string) error {
 	fs := flag.NewFlagSet("relay", flag.ContinueOnError)
 	once := fs.Bool("once", false, "check registered sessions once")
@@ -411,13 +433,18 @@ func cmdRelay(args []string) error {
 		}
 		defer syscall.Flock(int(lock.Fd()), syscall.LOCK_UN)
 	}
+	var queueBackoff teamQueuePollBackoff
 	for {
 		if !*status {
 			relayCleanup()
 			inspectStartupPrompts()
 			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
-			if err := relayTeamQueueTick(ctx); err != nil {
-				fmt.Fprintf(os.Stderr, "[tt relay] team queue: %v\n", err)
+			if queueBackoff.ready(time.Now()) {
+				queueErr := relayTeamQueueTick(ctx)
+				queueBackoff.observe(time.Now(), queueErr)
+				if queueErr != nil {
+					fmt.Fprintf(os.Stderr, "[tt relay] team queue: %v\n", queueErr)
+				}
 			}
 			cancel()
 		}

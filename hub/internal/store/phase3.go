@@ -235,8 +235,34 @@ func deliveryIDs(open []ref) []string {
 // ---- Role recipients ----
 
 // resolveRole finds the agent a role recipient means right now.
-func resolveRole(ctx context.Context, tx *sql.Tx, task api.Task, role string) (api.Agent, error) {
+func resolveRole(ctx context.Context, tx *sql.Tx, task api.Task, role, itemID string) (api.Agent, error) {
 	var row *sql.Row
+	if itemID != "" && (role == api.RoleLead || role == api.RoleDatabaseHandler) {
+		var id, run string
+		var err error
+		if role == api.RoleLead {
+			err = tx.QueryRowContext(ctx, `SELECT agent_id,run_id FROM item_team_leads WHERE task_id=? AND item_id=? AND state<>'closed'`, task.ID, itemID).Scan(&id, &run)
+		} else {
+			err = tx.QueryRowContext(ctx, `SELECT handler_id,handler_run_id FROM team_queue_entries WHERE task_id=? AND item_id=? AND (state IN ('launching','running') OR (state='failed' AND released_at=''))`, task.ID, itemID).Scan(&id, &run)
+		}
+		if err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return api.Agent{}, err
+		}
+		if err == nil && id != "" {
+			a, err := scanAgent(tx.QueryRowContext(ctx, `SELECT `+agentCols+` FROM agents WHERE task_id=? AND id=? AND run_id=?`, task.ID, id, run))
+			if err != nil || !a.Online || a.Status == api.AgentRetired {
+				return api.Agent{}, fmt.Errorf("%w: exact item role run is unavailable", api.ErrConflict)
+			}
+			return a, nil
+		}
+	}
+	var parallel int
+	if err := tx.QueryRowContext(ctx, `SELECT COALESCE((SELECT concurrency_limit FROM team_queue_settings WHERE task_id=?),1)`, task.ID).Scan(&parallel); err != nil {
+		return api.Agent{}, err
+	}
+	if parallel > 1 {
+		return api.Agent{}, fmt.Errorf("%w: role:%s needs an exact item link in parallel mode", api.ErrConflict, role)
+	}
 	switch role {
 	case api.RoleLead:
 		if task.Orchestrator == "" {

@@ -74,9 +74,7 @@ CREATE TABLE IF NOT EXISTS profile_meta (key TEXT PRIMARY KEY,value TEXT NOT NUL
  CREATE TABLE IF NOT EXISTS profile_history(username TEXT NOT NULL,revision INTEGER NOT NULL,updated_at TEXT NOT NULL,envelope BLOB NOT NULL,PRIMARY KEY(username,revision));`); err != nil {
 		return err
 	}
-	if _, err := db.Exec(`CREATE UNIQUE INDEX IF NOT EXISTS agents_database_handler
-ON agents(task_id) WHERE role='database_handler' AND status<>'closed';
-CREATE TABLE IF NOT EXISTS work_items (
+	if _, err := db.Exec(`CREATE TABLE IF NOT EXISTS work_items (
   seq INTEGER PRIMARY KEY AUTOINCREMENT,
   id TEXT NOT NULL UNIQUE,
   task_id TEXT NOT NULL REFERENCES tasks(id),
@@ -417,6 +415,12 @@ CREATE INDEX IF NOT EXISTS agent_allocation_intents_item ON agent_allocation_int
 		return err
 	}
 	if err := migrateDeliveryFollowThrough(db); err != nil {
+		return err
+	}
+	// Parallel delivery leases one continuing handler run per active item. The
+	// legacy singleton index is deliberately removed only after all other
+	// additive migrations have succeeded.
+	if _, err := db.Exec(`DROP INDEX IF EXISTS agents_database_handler`); err != nil {
 		return err
 	}
 	_, err := db.Exec(`INSERT OR IGNORE INTO profile_meta(key,value) VALUES('instance',?)`, api.NewID("profilehub"))

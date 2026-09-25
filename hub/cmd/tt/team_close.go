@@ -25,12 +25,32 @@ func flagPresent(args []string, name string) bool {
 	return false
 }
 
-func teamClosePendingPath(e env, task string) string {
-	h := sha256.Sum256([]byte(e.hub + "\x00" + task))
+func teamClosePendingPath(e env, task, item string) string {
+	h := sha256.Sum256([]byte(e.hub + "\x00" + task + "\x00" + item + "\x00" + e.agent + "\x00" + e.runID))
 	return filepath.Join(relayDir(), "team-close-"+hex.EncodeToString(h[:12])+".json")
 }
 
 func closeTeamSnapshot(task api.Task, agents []api.Agent, actorAgent, actorRun string) (api.TeamCloseRequest, error) {
+	return closeTeamSnapshotForItem(task, agents, actorAgent, actorRun, "")
+}
+
+func closeTeamSnapshotForItem(task api.Task, agents []api.Agent, actorAgent, actorRun, itemID string) (api.TeamCloseRequest, error) {
+	var scoped api.Agent
+	for _, a := range agents {
+		if !a.ItemLead || a.WorkItem == nil || a.Status == api.AgentClosed || (itemID != "" && a.WorkItem.ItemID != itemID) || (actorAgent != "" && (a.ID != actorAgent || a.RunID != actorRun)) {
+			continue
+		}
+		if scoped.ID != "" {
+			return api.TeamCloseRequest{}, errors.New("several item leads match; specify the exact item")
+		}
+		scoped = a
+	}
+	if scoped.ID != "" {
+		if scoped.Status == api.AgentExited && actorAgent != "" {
+			return api.TeamCloseRequest{}, errors.New("the item lead has exited; only the owner can close this team")
+		}
+		return closeTeamSnapshotWithLead(task, agents, actorAgent, actorRun, scoped, scoped.ItemLeadRevision)
+	}
 	var lead, exited api.Agent
 	for _, a := range agents {
 		if !strings.EqualFold(a.Name, task.Orchestrator) || a.Status == api.AgentClosed {
@@ -60,11 +80,18 @@ func closeTeamSnapshot(task api.Task, agents []api.Agent, actorAgent, actorRun s
 	if lead.ID == "" || lead.WorkItem == nil || lead.WorkItem.ItemTaskID != task.ID {
 		return api.TeamCloseRequest{}, errors.New("the current project orchestrator has no item binding")
 	}
+	if itemID != "" && lead.WorkItem.ItemID != itemID {
+		return api.TeamCloseRequest{}, errors.New("no current lead for the selected item")
+	}
+	return closeTeamSnapshotWithLead(task, agents, actorAgent, actorRun, lead, task.LeadRevision)
+}
+
+func closeTeamSnapshotWithLead(task api.Task, agents []api.Agent, actorAgent, actorRun string, lead api.Agent, revision int64) (api.TeamCloseRequest, error) {
 	if actorAgent != "" && (actorAgent != lead.ID || actorRun != lead.RunID) {
 		return api.TeamCloseRequest{}, errors.New("only the exact item lead may run tt close --team")
 	}
 	req := api.TeamCloseRequest{RequestID: "team-close-" + task.ID + "-" + lead.RunID, ActorAgentID: actorAgent, ActorRunID: actorRun,
-		LeadAgentID: lead.ID, LeadRunID: lead.RunID, LeadRevision: task.LeadRevision,
+		LeadAgentID: lead.ID, LeadRunID: lead.RunID, LeadRevision: revision,
 		ItemID: lead.WorkItem.ItemID, ItemRevision: lead.WorkItem.ItemRevision}
 	for _, a := range agents {
 		if a.Role == api.AgentRoleDatabaseHandler || a.WorkItem == nil || a.WorkItem.ItemTaskID != task.ID || a.WorkItem.ItemID != req.ItemID || (a.Status == api.AgentClosed && a.CleanupDone) {
@@ -76,9 +103,12 @@ func closeTeamSnapshot(task api.Task, agents []api.Agent, actorAgent, actorRun s
 	return req, nil
 }
 
-func cmdCloseTeam(e env, taskID string, jsonOut bool) error {
+func cmdCloseTeam(e env, taskID, itemID string, jsonOut bool) error {
 	if !api.ValidID(taskID, "tsk") || (e.agent != "" && e.task != taskID) {
 		return errors.New("invalid or mismatched team close project")
+	}
+	if itemID != "" && !api.ValidID(itemID, "wi") {
+		return errors.New("invalid team close item")
 	}
 	c, err := e.client(15 * time.Second)
 	if err != nil {
@@ -90,9 +120,27 @@ func cmdCloseTeam(e env, taskID string, jsonOut bool) error {
 	if err != nil {
 		return err
 	}
-	pending := teamClosePendingPath(e, taskID)
+	if e.agent != "" {
+		for _, a := range detail.Agents {
+			if a.ID == e.agent && a.WorkItem != nil {
+				if itemID != "" && itemID != a.WorkItem.ItemID {
+					return errors.New("actor cannot close another item's team")
+				}
+				itemID = a.WorkItem.ItemID
+				break
+			}
+		}
+	}
+	pending := teamClosePendingPath(e, taskID, itemID)
 	var req api.TeamCloseRequest
-	if detail.Task.Orchestrator == "" {
+	hasItemLead := false
+	for _, a := range detail.Agents {
+		if a.ItemLead && a.WorkItem != nil && a.WorkItem.ItemID == itemID && a.Status != api.AgentClosed {
+			hasItemLead = true
+			break
+		}
+	}
+	if detail.Task.Orchestrator == "" && !hasItemLead {
 		data, readErr := os.ReadFile(pending)
 		if readErr != nil {
 			return errors.New("project has no current orchestrator or saved team close retry")
@@ -104,7 +152,7 @@ func cmdCloseTeam(e env, taskID string, jsonOut bool) error {
 			return errors.New("saved team close retry belongs to a different exact actor run")
 		}
 	} else {
-		req, err = closeTeamSnapshot(detail.Task, detail.Agents, e.agent, e.runID)
+		req, err = closeTeamSnapshotForItem(detail.Task, detail.Agents, e.agent, e.runID, itemID)
 		if err != nil {
 			return err
 		}

@@ -51,7 +51,13 @@ func (s *Store) CloseItemTeam(ctx context.Context, taskID string, req api.TeamCl
 	if err != nil {
 		return zero, err
 	}
-	if task.Status != api.TaskOpen || task.PauseState != api.ProjectPauseActive || task.Orchestrator == "" || task.LeadRevision != req.LeadRevision {
+	var scopedAgent, scopedRun, scopedState string
+	var scopedRevision int64
+	lookupErr := s.db.QueryRowContext(ctx, `SELECT agent_id,run_id,revision,state FROM item_team_leads WHERE task_id=? AND item_id=?`, taskID, req.ItemID).Scan(&scopedAgent, &scopedRun, &scopedRevision, &scopedState)
+	if lookupErr != nil && !errors.Is(lookupErr, sql.ErrNoRows) {
+		return zero, lookupErr
+	}
+	if task.Status != api.TaskOpen || task.PauseState != api.ProjectPauseActive || (lookupErr == nil && (scopedAgent != req.LeadAgentID || scopedRun != req.LeadRunID || scopedRevision != req.LeadRevision || scopedState == "closed")) || (errors.Is(lookupErr, sql.ErrNoRows) && (task.Orchestrator == "" || task.LeadRevision != req.LeadRevision)) {
 		return zero, &api.TeamCloseWaitError{Code: "team-close-snapshot", Text: "project or lead changed; refresh before team close"}
 	}
 	item, err := s.GetWorkItem(ctx, taskID, req.ItemID)
@@ -79,7 +85,7 @@ func (s *Store) CloseItemTeam(ctx context.Context, taskID string, req api.TeamCl
 		}
 	}
 	if lead.ID == "" || lead.Role == api.AgentRoleDatabaseHandler || lead.Status == api.AgentClosed || (lead.Status == api.AgentExited && req.ActorAgentID != "") ||
-		!strings.EqualFold(lead.Name, task.Orchestrator) || lead.RunID != req.LeadRunID || lead.WorkItem == nil || lead.WorkItem.ItemTaskID != taskID || lead.WorkItem.ItemID != req.ItemID || lead.WorkItem.ItemRevision != req.ItemRevision {
+		(lookupErr == nil && (lead.ID != scopedAgent || lead.RunID != scopedRun) || lookupErr != nil && !strings.EqualFold(lead.Name, task.Orchestrator)) || lead.RunID != req.LeadRunID || lead.WorkItem == nil || lead.WorkItem.ItemTaskID != taskID || lead.WorkItem.ItemID != req.ItemID || lead.WorkItem.ItemRevision != req.ItemRevision {
 		return zero, &api.TeamCloseWaitError{Code: "team-close-snapshot", Text: "selected lead is not the current item-scoped orchestrator"}
 	}
 	if req.ActorAgentID != "" && (req.ActorAgentID != lead.ID || req.ActorRunID != lead.RunID) {
@@ -160,13 +166,25 @@ func (s *Store) CloseItemTeam(ctx context.Context, taskID string, req api.TeamCl
 			return zero, err
 		}
 	}
-	r, err := tx.ExecContext(ctx, `UPDATE tasks SET orchestrator='',lead_revision=lead_revision+1 WHERE id=? AND orchestrator=? AND lead_revision=? AND status=?`, taskID, task.Orchestrator, task.LeadRevision, api.TaskOpen)
-	if err != nil {
-		return zero, err
+	if lookupErr == nil {
+		r, err := tx.ExecContext(ctx, `UPDATE item_team_leads SET state='closed',revision=revision+1 WHERE task_id=? AND item_id=? AND agent_id=? AND run_id=? AND revision=? AND state<>'closed'`, taskID, req.ItemID, scopedAgent, scopedRun, scopedRevision)
+		if err != nil {
+			return zero, err
+		}
+		n, _ := r.RowsAffected()
+		if n != 1 {
+			return zero, &api.TeamCloseWaitError{Code: "team-close-snapshot", Text: "item lead changed during close"}
+		}
 	}
-	n, err := r.RowsAffected()
-	if err != nil || n != 1 {
-		return zero, &api.TeamCloseWaitError{Code: "team-close-snapshot", Text: "lead changed during close"}
+	if strings.EqualFold(task.Orchestrator, lead.Name) {
+		r, err := tx.ExecContext(ctx, `UPDATE tasks SET orchestrator='',lead_revision=lead_revision+1 WHERE id=? AND orchestrator=? AND lead_revision=? AND status=?`, taskID, task.Orchestrator, task.LeadRevision, api.TaskOpen)
+		if err != nil {
+			return zero, err
+		}
+		n, _ := r.RowsAffected()
+		if n != 1 {
+			return zero, &api.TeamCloseWaitError{Code: "team-close-snapshot", Text: "project lead changed during close"}
+		}
 	}
 	if _, err := tx.ExecContext(ctx, `INSERT INTO events (task_id,kind,agent_id,text,data,by_node,by_user,created_at) VALUES (?,?,?,?,?,?,?,?)`, taskID, "task_updated", "", task.Name, "", by.Node, by.User, now); err != nil {
 		return zero, err

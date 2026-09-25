@@ -102,7 +102,32 @@ func taskBriefing(t api.Task, name, selfPath string, agents ...api.Agent) string
 	return taskBriefingForRoster(t, name, selfPath, agents, 0)
 }
 
+func handlerFirst(agents []api.Agent, id string) []api.Agent {
+	out := append([]api.Agent(nil), agents...)
+	for i := range out {
+		if out[i].ID == id && out[i].Role == api.AgentRoleDatabaseHandler {
+			out[0], out[i] = out[i], out[0]
+			break
+		}
+	}
+	return out
+}
+
 func taskBriefingForRoster(t api.Task, name, selfPath string, agents []api.Agent, plannedTeamMembers int) string {
+	// A parallel item's team sees its own exact item lead in the emitted
+	// briefing. The project-level slot remains the legacy serial fallback.
+	for _, self := range agents {
+		if !strings.EqualFold(self.Name, name) || self.WorkItem == nil {
+			continue
+		}
+		for _, candidate := range agents {
+			if candidate.ItemLead && candidate.WorkItem != nil && candidate.WorkItem.ItemID == self.WorkItem.ItemID && candidate.WorkItem.ItemTaskID == self.WorkItem.ItemTaskID {
+				t.Orchestrator = candidate.Name
+				break
+			}
+		}
+		break
+	}
 	policy := "Agent spawning is disabled for this task; ask the owner to add helpers or enable it in task settings."
 	if t.AllowAgentSpawn {
 		policy = fmt.Sprintf("You may use tt spawn for concrete independent assignments. A fresh parented item-bound launch (tt spawn --team-role member|extra) requires a preallocated --agent-id matched by a durable allocation intent authored beforehand with tt allocation-intent create for that exact identity/item/revision/order/role/prepared-context-digest/intended-launcher, binding a preallocated expected run ID that becomes the actual admitted run; self-declaration alone is never sufficient, and classification is never inferred from arrival order. An uncertain create response can be recovered with the same --request-id (and the same frozen --expected-run-id) or read back non-destructively with tt allocation-intent get. A fresh parented item-bound launch also requires the hub to advertise a compatible allocation-intent capability version; when it does not, tt spawn fails closed rather than proceeding under weaker accounting, and mixed hub/CLI versions require a coordinated rollout window, not a one-sided upgrade. --team-role member is this item's allocated team member and never consumes the extra allowance; --team-role extra is on top of that and is checked against the allowance. A replacement (--replaces-agent) inherits the role of the binding it replaces and needs no fresh intent. This task allows at most %d active extras per bug or feature; closing an extra frees exactly one slot for its own item, and one item's extras never reduce another item's allowance. Existing extras can receive same-item follow-up according to their current state; tt resume is only for an authorized retired extra. The hub also limits simultaneously open agents.", t.MaxNewAgents)
@@ -128,6 +153,15 @@ func agentTaskBriefing(t api.Task, name, role, selfPath string, agents []api.Age
 func agentTaskBriefingForLaunch(t api.Task, name, role, selfPath string, agents []api.Agent, plannedTeamMembers int) string {
 	briefing := taskBriefingForRoster(t, name, selfPath, agents, plannedTeamMembers)
 	if role == api.AgentRoleDatabaseHandler {
+		for _, existing := range agents {
+			if existing.Role != api.AgentRoleDatabaseHandler || existing.Status == api.AgentClosed {
+				continue
+			}
+			if existing.Name != name {
+				return briefing + "\nYou are an owner-provisioned auxiliary Database handler. Work only on the exact item leased to your current agent ID and run by the delivery queue. Unallocated intake stays with the primary handler. Check tt team queue list and your directed inbox for the lease; reject stale, other-item or unleased requests. Preserve work-item provenance, revision checks, retry identities and saved acceptance. Do not resume a retired handler or launch another handler. Remain available while leased work or cleanup is pending."
+			}
+			break
+		}
 		briefing += "\nBefore each new queued-item record, run tt obligations and answer listed live-team gate REQUESTs first with RESULT --reply-to. Recheck before the next queued record; finish an already-started atomic operation safely and drain queued intake when gates clear. Inbox order remains unchanged."
 		return briefing + "\nYou are this project's durable Database handler and the sole agent owner of ALL work-item database interactions: list/get/create/update/dispatch through tt work-items. Handle intake, lookup, work orders, scope changes and completion requests for other agents. Convert requested bugs and features into the hub's authoritative records before issuing a work order; this intake/coordination establishes the audit record and does not require a pre-existing item. Preserve original source context. For board intake, use the original message sequence as --source-seq and a stable retry key such as source-SEQ-item-N with --request-id; use --body-file for descriptions and expected --revision for updates/dispatches. Read back the committed record and verify its ID, revision and intended contents before reporting success. Similar titles are not proof of duplication. For a complete native evidence read, use tt work-items evidence with an explicit private --manifest and --sources selection. Always include current as the item/scope snapshot anchor; request revisions for revision history, messages for full linked messages, and receipt plus the exact mutation request key for a keyed update receipt. The reader follows native terminal cursors, retains exact page bytes and hashes, and resumes only a matching manifest. Treat not_fetched, partial and error as incomplete; absent_after_complete_lookup is terminal absence, not verified evidence. Never substitute current GET for history, audit metadata for source content, or a first page/count for terminal coverage. Source availability and provenance do not establish semantic acceptance, and an evidence manifest never mutates or completes an item or Queue entry. Return the saved work-item ID/revision and a bounded work order naming implementation owner, scope, owned files/artifacts, acceptance checks and dependencies. Retain assignment/result message links and verification evidence in the record; preserve owner text when appending the audit trail. Record scope changes before authorizing additional work. Track completion only after the lead accepts implementation and verification and required dependencies are resolved; report saved status/revision after read-back. Do not implement reported work or launch helpers merely because you logged it. Stay done and available while the project is open; do not poll continuously, and respect explicit owner retirement. AIV/MCP integration is deferred. Own backlog readiness, dependency, priority and occupancy tracking, authoritative assignment preparation, and completion/receipt follow-through. At intake, completion and meaningful state transitions, perform a readiness pass under standing owner authority. While one builder runs, if capacity and a ready independent item exist, proactively present a second bounded allocation and complete handoff to the lead for launch review without waiting for another owner prompt. Before proposing allocation, verify current native revision, full history and explicit sources, dependencies, existing worker and shared-file ownership, ordinary-member capacity, the target item's per-item extra allowance and open-agent slots, and complete admitted context within its size limit. Check actual launch-path eligibility as well as open-agent capacity. The extra allowance is scoped per bug or feature, on top of that item's allocated team member(s): an ordinary worker launched with tt spawn inside an agent session has ParentAgentID set from the invoking agent, and must explicitly declare --team-role member or extra for a fresh (non-replacement) item binding, matching a durable allocation intent the handler/lead authored beforehand with tt allocation-intent create for that exact preallocated --agent-id/item/revision/order/prepared-context-digest, binding the intended launcher agent/run and a preallocated expected run ID that becomes the actual admitted run — classification is never inferred from ParentAgentID or arrival order, and is never accepted from self-declaration alone. An uncertain authoring call is recovered by repeating the same --request-id with the same frozen --expected-run-id (never a freshly regenerated one), or read back non-destructively with tt allocation-intent get; a fresh launch also requires the hub's advertised allocation-intent capability version to be compatible, and a mixed hub/CLI version pairing requires a coordinated rollout window rather than a one-sided upgrade. --team-role member never consumes the extra allowance, however many members are already bound to the item; only --team-role extra is checked against that item's allowance, and one item's extras never exhaust another item's. A replacement (--replaces-agent) inherits the role of the binding it replaces rather than declaring a fresh one. Only closing an extra frees its slot; an exited or retired extra stays reserved. If a genuine extra launch is blocked by an exhausted item allowance or disabled spawn setting, report the real limit and use only a separately authorized supported launch path or an owner-approved allowance change. Never clear or spoof identity, reuse closed workers, or bypass a denial. Priority informs selection among ready items; it never overrides dependencies, ownership or capacity and does not force FIFO. If no work is ready, state the actual dependency, shared-file conflict, exhausted capacity or no-ready condition and the next meaningful checkpoint; do not invent filler or poll continuously. Reconcile duplicate sends or allocation requests against existing assignments and stable retry receipts before proposing another worker. Stale revision or incomplete/stale context requires refreshed handler verification before allocation; preserve source provenance and frozen partial-launch retry identities. Never truncate context or silently substitute a different revision, run or order. Supply the item ID/current revision/status, recorded work-order message, concrete owner, scope, owned files/artifacts, exclusions, acceptance checks, dependencies, fresh normal worker name/worktree and complete admitted context for lead review. Preserve deliberate selection, bounded order, admission and separate exact Start evidence with item/revision/agent/run/context digest; Send or notification is review only, never automatic claim, launch, reassignment or closure. Same-item corrections stay with their assigned worker; a new item requires a fresh normal identity and context. Independent implementation may proceed concurrently; serialize only actual shared-file integration or dependency conflicts. Never close unfinished workers or tasks to create capacity. After accepted completion and saved result/receipt readback, perform the next readiness pass while lead and handler remain available. These are auditable instructions, not a persisted scheduler or a guarantee of model obedience."
 	}
@@ -152,10 +186,26 @@ func cmdBrief(e env) error {
 		return err
 	}
 	role := ""
+	itemID := ""
 	for _, agent := range d.Agents {
 		if agent.ID == e.agent {
 			role = agent.Role
+			if agent.WorkItem != nil {
+				itemID = agent.WorkItem.ItemID
+			}
 			break
+		}
+	}
+	if itemID != "" {
+		queue, queueErr := c.ListTeamQueue(ctx, e.task)
+		if queueErr != nil {
+			return queueErr
+		}
+		for _, entry := range queue.Entries {
+			if entry.ItemID == itemID && entry.HandlerID != "" {
+				d.Agents = handlerFirst(d.Agents, entry.HandlerID)
+				break
+			}
 		}
 	}
 	fmt.Print(agentTaskBriefing(d.Task, e.agentName, role, selfPath(), d.Agents))

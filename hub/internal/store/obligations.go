@@ -543,14 +543,59 @@ func (s *Store) ReassignObligation(ctx context.Context, taskID, obligationID str
 	actor := "owner"
 	if req.ActorAgentID != "" {
 		lead, err := scanAgent(tx.QueryRowContext(ctx, `SELECT `+agentCols+` FROM agents WHERE id=? AND task_id=?`, req.ActorAgentID, taskID))
-		if err != nil || lead.RunID != req.ActorRunID || req.ActorRunID == "" || lead.Name != task.Orchestrator || lead.Status == api.AgentClosed {
+		if err != nil || lead.RunID != req.ActorRunID || req.ActorRunID == "" || lead.Status == api.AgentClosed {
 			return api.Message{}, fmt.Errorf("%w: only the owner or the project lead's current run can reassign an obligation", api.ErrConflict)
+		}
+		item, err := scopedLeadItem(ctx, tx, taskID, lead.ID, lead.RunID)
+		if err != nil {
+			return api.Message{}, err
+		}
+		if item == "" {
+			var limit, bound int
+			if err := tx.QueryRowContext(ctx, `SELECT COALESCE((SELECT concurrency_limit FROM team_queue_settings WHERE task_id=?),1)`, taskID).Scan(&limit); err != nil {
+				return api.Message{}, err
+			}
+			if limit > 1 {
+				if err := tx.QueryRowContext(ctx, `SELECT count(*) FROM agent_work_item_bindings WHERE agent_id=? AND run_id=? AND item_task_id=?`, lead.ID, lead.RunID, taskID).Scan(&bound); err != nil {
+					return api.Message{}, err
+				}
+				if bound != 0 {
+					return api.Message{}, fmt.Errorf("%w: only the current item lead may reassign team work", api.ErrConflict)
+				}
+			}
+			if lead.Name != task.Orchestrator {
+				return api.Message{}, fmt.Errorf("%w: actor is not the project lead", api.ErrConflict)
+			}
+		} else {
+			var linked int
+			if err := tx.QueryRowContext(ctx, `SELECT count(*) FROM message_work_item_links WHERE message_task_id=? AND message_seq=? AND item_task_id=? AND item_id=?`, taskID, old.MessageSeq, taskID, item).Scan(&linked); err != nil {
+				return api.Message{}, err
+			}
+			if linked == 0 {
+				return api.Message{}, fmt.Errorf("%w: item lead cannot reassign another item's obligation", api.ErrConflict)
+			}
 		}
 		actor = "lead " + lead.Name
 	}
 	target, err := scanAgent(tx.QueryRowContext(ctx, `SELECT `+agentCols+` FROM agents WHERE id=? AND task_id=?`, req.ToAgentID, taskID))
 	if err != nil || target.Status == api.AgentClosed {
 		return api.Message{}, api.ErrInvalid
+	}
+	if req.ActorAgentID != "" {
+		item, err := scopedLeadItem(ctx, tx, taskID, req.ActorAgentID, req.ActorRunID)
+		if err != nil {
+			return api.Message{}, err
+		}
+		if item != "" {
+			var targetItem string
+			err = tx.QueryRowContext(ctx, `SELECT item_id FROM agent_work_item_bindings WHERE agent_id=? AND item_task_id=? ORDER BY created_at DESC LIMIT 1`, target.ID, taskID).Scan(&targetItem)
+			if err != nil && err != sql.ErrNoRows {
+				return api.Message{}, err
+			}
+			if targetItem != item {
+				return api.Message{}, fmt.Errorf("%w: item lead cannot move work to another item", api.ErrConflict)
+			}
+		}
 	}
 	m, err := s.reissueObligation(ctx, tx, task, old, target, actor, req.Reason, false)
 	if err != nil {

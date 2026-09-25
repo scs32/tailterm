@@ -366,6 +366,26 @@ func (s *Store) UpdateTask(ctx context.Context, id string, req api.UpdateTaskReq
 		if leadErr != nil {
 			return t, leadErr
 		}
+		if newLead.ID != "" && newLead.ID != previousLead.ID {
+			var itemID, state string
+			var revision int64
+			mappingErr := tx.QueryRowContext(ctx, `SELECT item_id,revision,state FROM item_team_leads WHERE task_id=? AND agent_id=? AND run_id=? AND state<>'closed'`, id, previousLead.ID, previousLead.RunID).Scan(&itemID, &revision, &state)
+			if mappingErr != nil && !errors.Is(mappingErr, sql.ErrNoRows) {
+				return t, mappingErr
+			}
+			if mappingErr == nil {
+				var bound int
+				if err := tx.QueryRowContext(ctx, `SELECT count(*) FROM agent_work_item_bindings WHERE agent_id=? AND run_id=? AND item_task_id=? AND item_id=?`, newLead.ID, newLead.RunID, id, itemID).Scan(&bound); err != nil {
+					return t, err
+				}
+				if bound != 1 || state != "running" || !newLead.Online || newLead.Status == api.AgentRetired {
+					return t, fmt.Errorf("%w: replacement lead is not a live member of the same item", api.ErrConflict)
+				}
+				if _, err := tx.ExecContext(ctx, `UPDATE item_team_leads SET agent_id=?,run_id=?,revision=revision+1 WHERE task_id=? AND item_id=? AND agent_id=? AND run_id=? AND revision=?`, newLead.ID, newLead.RunID, id, itemID, previousLead.ID, previousLead.RunID, revision); err != nil {
+					return t, err
+				}
+			}
+		}
 		if err = s.handOffRoleObligations(ctx, tx, t, previousLead, newLead); err != nil {
 			return t, err
 		}
@@ -520,9 +540,18 @@ func (s *Store) AddAgent(ctx context.Context, taskID string, req api.AddAgentReq
 		var reservedItem string
 		var reservedEntry string
 		var generation int64
-		err := s.db.QueryRowContext(ctx, `SELECT item_id,pause_generation,entry_id FROM team_launch_reservations WHERE task_id=?`, taskID).Scan(&reservedItem, &generation, &reservedEntry)
+		err := s.db.QueryRowContext(ctx, `SELECT item_id,pause_generation,entry_id FROM team_launch_reservations WHERE task_id=? AND item_id=?`, taskID, req.WorkItem.ItemID).Scan(&reservedItem, &generation, &reservedEntry)
 		if err != nil && !errors.Is(err, sql.ErrNoRows) {
 			return api.Agent{}, err
+		}
+		if errors.Is(err, sql.ErrNoRows) {
+			var otherReservations int
+			if err := s.db.QueryRowContext(ctx, `SELECT count(*) FROM team_launch_reservations WHERE task_id=?`, taskID).Scan(&otherReservations); err != nil {
+				return api.Agent{}, err
+			}
+			if otherReservations != 0 {
+				return api.Agent{}, fmt.Errorf("%w: item has no matching reserved team", api.ErrConflict)
+			}
 		}
 		if err == nil && (reservedItem != req.WorkItem.ItemID || generation != t.PauseGeneration) {
 			return api.Agent{}, fmt.Errorf("%w: agent admission conflicts with reserved team", api.ErrConflict)
@@ -679,16 +708,6 @@ func (s *Store) AddAgent(ctx context.Context, taskID string, req api.AddAgentReq
 	}
 	if err != sql.ErrNoRows {
 		return api.Agent{}, err
-	}
-	if req.Role == api.AgentRoleDatabaseHandler {
-		var existingID string
-		err = s.db.QueryRowContext(ctx, `SELECT id FROM agents WHERE task_id=? AND role=? AND status<>'closed' LIMIT 1`, taskID, api.AgentRoleDatabaseHandler).Scan(&existingID)
-		if err == nil {
-			return api.Agent{}, fmt.Errorf("%w: project already has a database handler", api.ErrConflict)
-		}
-		if err != sql.ErrNoRows {
-			return api.Agent{}, err
-		}
 	}
 	if req.ParentAgentID != "" && req.WorkItem == nil {
 		// A parented agent with no work-item binding has no item to
@@ -893,6 +912,11 @@ func (s *Store) GetAgent(ctx context.Context, id string) (api.Agent, error) {
 	if err = s.loadAgentWorkItem(ctx, &a); err != nil {
 		return a, err
 	}
+	err = s.db.QueryRowContext(ctx, `SELECT revision FROM item_team_leads WHERE task_id=? AND agent_id=? AND run_id=? AND state<>'closed'`, a.TaskID, a.ID, a.RunID).Scan(&a.ItemLeadRevision)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return a, err
+	}
+	a.ItemLead = err == nil
 	if a.ReadUpTo, err = s.ReadCursor(ctx, a.TaskID, a.ID); err != nil {
 		return a, err
 	}
@@ -921,6 +945,11 @@ func (s *Store) ListAgents(ctx context.Context, taskID string) ([]api.Agent, err
 		if err = s.loadAgentWorkItem(ctx, &out[i]); err != nil {
 			return nil, err
 		}
+		err = s.db.QueryRowContext(ctx, `SELECT revision FROM item_team_leads WHERE task_id=? AND agent_id=? AND run_id=? AND state<>'closed'`, taskID, out[i].ID, out[i].RunID).Scan(&out[i].ItemLeadRevision)
+		if err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return nil, err
+		}
+		out[i].ItemLead = err == nil
 		if out[i].ReadUpTo, err = s.ReadCursor(ctx, taskID, out[i].ID); err != nil {
 			return nil, err
 		}
@@ -1060,12 +1089,21 @@ func (s *Store) PostMessage(ctx context.Context, taskID string, req api.PostMess
 	if err := ackGate(ctx, tx, req.AgentID, req.RunID, req.ReplyTo, s.now()); err != nil {
 		return api.Message{}, err
 	}
+	if req.AgentID != "" && req.Envelope != nil && req.Envelope.Kind == api.EnvelopeKindAssign {
+		if err := ensureLeadItemLinks(ctx, tx, taskID, req.AgentID, req.RunID, req.WorkItems, req.To); err != nil {
+			return api.Message{}, err
+		}
+	}
 	if req.Text == "" || !api.ValidText(req.Text, api.MaxTextLen) || req.ReplyTo < 0 {
 		return api.Message{}, api.ErrInvalid
 	}
 	// Broker phase 3: a role recipient resolves to whoever holds the role now.
 	if role := messageRole(req); role != "" {
-		holder, err := resolveRole(ctx, tx, t, role)
+		itemID := ""
+		if len(req.WorkItems) == 1 && req.WorkItems[0].ItemTaskID == taskID {
+			itemID = req.WorkItems[0].ItemID
+		}
+		holder, err := resolveRole(ctx, tx, t, role, itemID)
 		if err != nil {
 			return api.Message{}, err
 		}

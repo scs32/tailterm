@@ -338,7 +338,7 @@ func TestWorkItemWritesRollbackWithoutPartialReceipts(t *testing.T) {
 	})
 }
 
-func TestDatabaseHandlerRoleIsUniqueAndRestartCASPreservesIdentity(t *testing.T) {
+func TestDatabaseHandlerPoolAndRestartCASPreservesIdentity(t *testing.T) {
 	s, ctx, by := workItemStore(t)
 	project, _ := workItemProject(t, s, ctx, by, "Handlers", "")
 	id := api.NewID("agt")
@@ -359,15 +359,16 @@ func TestDatabaseHandlerRoleIsUniqueAndRestartCASPreservesIdentity(t *testing.T)
 	if _, err = s.AddAgent(ctx, project.ID, changed, by); !errors.Is(err, api.ErrConflict) {
 		t.Fatalf("changed handler replay = %v", err)
 	}
-	if _, err = s.AddAgent(ctx, project.ID, api.AddAgentRequest{AgentID: api.NewID("agt"), Name: "database2", Host: "host", Session: "database2", Runtime: "codex", Role: api.AgentRoleDatabaseHandler}, by); !errors.Is(err, api.ErrConflict) {
-		t.Fatalf("second handler = %v", err)
+	second, err := s.AddAgent(ctx, project.ID, api.AddAgentRequest{AgentID: api.NewID("agt"), Name: "database2", Host: "host", Session: "database2", Runtime: "codex", Role: api.AgentRoleDatabaseHandler}, by)
+	if err != nil || second.ID == handler.ID {
+		t.Fatalf("second handler = %+v %v", second, err)
 	}
 	retired := api.AgentRetired
 	if _, err = s.UpdateAgent(ctx, handler.ID, api.UpdateAgentRequest{Status: &retired}, by); err != nil {
 		t.Fatal(err)
 	}
 	if _, err = s.AddAgent(ctx, project.ID, api.AddAgentRequest{AgentID: api.NewID("agt"), Name: "database2", Host: "host", Session: "database2", Runtime: "codex", Role: api.AgentRoleDatabaseHandler}, by); !errors.Is(err, api.ErrConflict) {
-		t.Fatalf("retired handler uniqueness = %v", err)
+		t.Fatalf("duplicate handler name = %v", err)
 	}
 	if _, err = s.PostEvent(ctx, project.ID, api.PostEventRequest{AgentID: handler.ID, RunID: handler.RunID, Kind: api.EventExited}, by); err != nil {
 		t.Fatal(err)
@@ -394,7 +395,7 @@ func TestDatabaseHandlerRoleIsUniqueAndRestartCASPreservesIdentity(t *testing.T)
 	if _, err = s.CloseAgent(ctx, restarted.ID, by); err != nil {
 		t.Fatal(err)
 	}
-	replacement, err := s.AddAgent(ctx, project.ID, api.AddAgentRequest{AgentID: api.NewID("agt"), Name: "database2", Host: "host", Session: "database2", Runtime: "codex", Role: api.AgentRoleDatabaseHandler}, by)
+	replacement, err := s.AddAgent(ctx, project.ID, api.AddAgentRequest{AgentID: api.NewID("agt"), Name: "database3", Host: "host", Session: "database3", Runtime: "codex", Role: api.AgentRoleDatabaseHandler}, by)
 	if err != nil || replacement.ID == handler.ID {
 		t.Fatalf("closed handler replacement: %+v %v", replacement, err)
 	}

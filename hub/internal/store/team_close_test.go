@@ -83,6 +83,53 @@ func teamCloseTerminal(t *testing.T, s *Store, task api.Task, item api.WorkItem,
 	return updated
 }
 
+func TestParallelItemClosePreservesOtherLead(t *testing.T) {
+	s, task, item, lead, _, _, req := teamCloseFixture(t)
+	ctx := context.Background()
+	by := api.Caller{Node: "fixture", User: "owner"}
+	other, err := s.CreateWorkItem(ctx, task.ID, api.CreateWorkItemRequest{Kind: "feature", Title: "Other team", Priority: "normal", RequestID: "other-item"}, by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	order := contextLinkedMessage(t, s, task, other, "other bounded order", "other-order", nil)
+	ref := api.MessageReference{TaskID: task.ID, Seq: order.Seq}
+	bundle := syntheticPreparedContext(t, other, ref, syntheticHistory(other, order))
+	leadB, err := s.AddAgent(ctx, task.ID, api.AddAgentRequest{Name: "lead-b", Host: "fixture", Session: "lead-b", Runtime: "codex", WorkItem: &api.AgentWorkItemRequest{ItemTaskID: task.ID, ItemID: other.ID, ItemRevision: other.Revision, WorkOrderMessage: ref, ContextBundle: bundle}}, by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range []struct{ item, agent, run string }{{item.ID, lead.ID, lead.RunID}, {other.ID, leadB.ID, leadB.RunID}} {
+		if _, err := s.db.Exec(`INSERT INTO item_team_leads(task_id,item_id,agent_id,run_id,state) VALUES(?,?,?,?,'running')`, task.ID, entry.item, entry.agent, entry.run); err != nil {
+			t.Fatal(err)
+		}
+	}
+	foreignLink := []api.MessageWorkItem{{ItemTaskID: task.ID, ItemID: other.ID, ItemRevision: other.Revision, Relationship: "primary"}}
+	if _, err := s.PostMessage(ctx, task.ID, api.PostMessageRequest{AgentID: lead.ID, RunID: lead.RunID, To: leadB.ID, RequestID: "A-assigns-B", WorkItems: foreignLink, WorkOrderMessage: &ref, Envelope: &api.Envelope{Kind: api.EnvelopeKindAssign, To: leadB.Name, Subject: "Build the other item", Body: api.EnvelopeBody{Objective: "Build B", Owns: []string{"src/b"}, Acceptance: map[string]string{"a1": "passes"}}}}, by); !errors.Is(err, api.ErrConflict) {
+		t.Fatalf("A assigned B: %v", err)
+	}
+	foreignDecision := decisionRequest(lead, "A-decides-B")
+	foreignDecision.WorkItems = foreignLink
+	if _, err := s.CreateDecision(ctx, task.ID, foreignDecision, by); !errors.Is(err, api.ErrConflict) {
+		t.Fatalf("A requested B decision: %v", err)
+	}
+	teamCloseTerminal(t, s, task, item, "dismissed")
+	req.LeadRevision = 1
+	if _, err := s.CloseItemTeam(ctx, task.ID, req, by); err != nil {
+		t.Fatal(err)
+	}
+	after, err := s.GetAgent(ctx, leadB.ID)
+	if err != nil || after.Status == api.AgentClosed || !after.ItemLead {
+		t.Fatalf("B changed after closing A: %+v %v", after, err)
+	}
+	if _, err := s.db.Exec(`UPDATE work_items SET status='dismissed' WHERE id=?`, other.ID); err != nil {
+		t.Fatal(err)
+	}
+	foreign := api.TeamCloseRequest{RequestID: "A-closes-B", ActorAgentID: lead.ID, ActorRunID: lead.RunID, LeadAgentID: lead.ID, LeadRunID: lead.RunID, LeadRevision: 1, ItemID: other.ID, ItemRevision: other.Revision, Members: []api.TeamCloseMember{{AgentID: leadB.ID, RunID: leadB.RunID, Host: leadB.Host, Status: leadB.Status}}}
+	if _, err := s.CloseItemTeam(ctx, task.ID, foreign, by); err == nil {
+		t.Fatal("A closed B")
+	}
+}
+
 func TestCloseItemTeamTerminalAndReplay(t *testing.T) {
 	for _, status := range []string{"done", "dismissed"} {
 		t.Run(status, func(t *testing.T) {

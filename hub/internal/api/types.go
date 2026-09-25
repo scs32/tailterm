@@ -183,29 +183,31 @@ type Task struct {
 }
 
 type Agent struct {
-	WorkItem      *AgentWorkItemBinding `json:"workItem,omitempty"`
-	Role          string                `json:"role,omitempty"`
-	CleanupDone   bool                  `json:"cleanupDone"`
-	CleanupError  string                `json:"cleanupError,omitempty"`
-	BlockedReason string                `json:"blockedReason,omitempty"`
-	BlockedText   string                `json:"blockedText,omitempty"`
-	RunID         string                `json:"runId"`
-	LastSeenAt    time.Time             `json:"lastSeenAt"`
-	Online        bool                  `json:"online"`
-	ID            string                `json:"id"`
-	TaskID        string                `json:"taskId"`
-	Name          string                `json:"name"`
-	Host          string                `json:"host"`
-	Session       string                `json:"session"`
-	Runtime       string                `json:"runtime"`
-	Cwd           string                `json:"cwd"`
-	ParentAgentID string                `json:"parentAgentId,omitempty"`
-	Status        string                `json:"status"`
-	Title         string                `json:"title"`
-	CreatedAt     time.Time             `json:"createdAt"`
-	LastEventAt   time.Time             `json:"lastEventAt"`
-	Unread        int                   `json:"unread"`
-	ReadUpTo      int64                 `json:"readUpTo"`
+	ItemLead         bool                  `json:"itemLead,omitempty"`
+	ItemLeadRevision int64                 `json:"itemLeadRevision,omitempty"`
+	WorkItem         *AgentWorkItemBinding `json:"workItem,omitempty"`
+	Role             string                `json:"role,omitempty"`
+	CleanupDone      bool                  `json:"cleanupDone"`
+	CleanupError     string                `json:"cleanupError,omitempty"`
+	BlockedReason    string                `json:"blockedReason,omitempty"`
+	BlockedText      string                `json:"blockedText,omitempty"`
+	RunID            string                `json:"runId"`
+	LastSeenAt       time.Time             `json:"lastSeenAt"`
+	Online           bool                  `json:"online"`
+	ID               string                `json:"id"`
+	TaskID           string                `json:"taskId"`
+	Name             string                `json:"name"`
+	Host             string                `json:"host"`
+	Session          string                `json:"session"`
+	Runtime          string                `json:"runtime"`
+	Cwd              string                `json:"cwd"`
+	ParentAgentID    string                `json:"parentAgentId,omitempty"`
+	Status           string                `json:"status"`
+	Title            string                `json:"title"`
+	CreatedAt        time.Time             `json:"createdAt"`
+	LastEventAt      time.Time             `json:"lastEventAt"`
+	Unread           int                   `json:"unread"`
+	ReadUpTo         int64                 `json:"readUpTo"`
 }
 
 type Sender struct {

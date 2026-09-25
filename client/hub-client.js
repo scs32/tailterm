@@ -174,6 +174,7 @@ export function createHubClient({ fetchImpl, baseURL, token = "" }) {
       }),
     listQueue: (task, params = {}) =>
       request(`/v1/tasks/${task}/queue` + q(params)),
+    listTeamDelivery: (task) => request(`/v1/tasks/${task}/team-queue`),
     getQueueEntry: (task, entry) =>
       request(`/v1/tasks/${task}/queue/${encodeURIComponent(entry)}`),
     listQueueHistory: (task, entry, params = {}) =>

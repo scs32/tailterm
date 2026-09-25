@@ -797,6 +797,8 @@ func cmdSpawn(e env, args []string) error {
 	queueClaimantRun := fs.String("queue-claimant-run", "", "exact current orchestrator claimant run")
 	role := fs.String("role", "", "project role (database_handler)")
 	plannedTeamMembers := fs.Int("planned-team-members", 0, "planned non-database team members for this launch (1-32)")
+	teamLeadName := fs.String("team-lead-name", "", "frozen item-team lead for this launch briefing")
+	teamHandlerID := fs.String("team-handler-id", "", "exact leased item-team handler for this launch briefing")
 	run := fs.String("run", "", "command to run in the agent window (required)")
 	cwd := fs.String("cwd", "", "working directory")
 	prompt := fs.String("prompt", "", "appended to the command as a quoted argument")
@@ -1020,6 +1022,12 @@ func cmdSpawn(e env, args []string) error {
 		}
 	}
 	launcherSelfPath := selfPath()
+	if *teamLeadName != "" && *workItemID != "" {
+		detail.Task.Orchestrator = *teamLeadName
+	}
+	if *teamHandlerID != "" && *workItemID != "" {
+		detail.Agents = handlerFirst(detail.Agents, *teamHandlerID)
+	}
 	briefing := agentTaskBriefingForLaunch(detail.Task, *name, *role, launcherSelfPath, detail.Agents, *plannedTeamMembers)
 	if *permissionMode != "" {
 		briefing += "\nRequested launch permission mode: " + *permissionMode + ". Permission denials are real failures, not approvals. Do not repeat an unchanged denied action. Report a precise Permission blocked status to the orchestrator and continue independent permitted work."
@@ -1177,12 +1185,13 @@ func cmdClose(e env, args []string) error {
 	task := fs.String("task", e.task, "task id")
 	jsonOut := fs.Bool("json", false, "JSON result")
 	team := fs.Bool("team", false, "close the terminal item's team and lead")
+	item := fs.String("item", "", "exact item to close when several teams share a project")
 	_ = fs.Parse(args)
 	if *team {
 		if fs.NArg() != 0 || *task == "" || (e.agent == "" && !flagPresent(args, "task")) {
 			return errors.New("usage: tt close --team [--task ID] (owner must supply --task)")
 		}
-		return cmdCloseTeam(e, *task, *jsonOut)
+		return cmdCloseTeam(e, *task, *item, *jsonOut)
 	}
 	ref := e.agent
 	if fs.NArg() > 0 {
@@ -1214,6 +1223,9 @@ func cmdClose(e env, args []string) error {
 	}
 	if detail.Task.Status == api.TaskOpen && detail.Task.Orchestrator != "" && strings.EqualFold(a.Name, detail.Task.Orchestrator) {
 		return errors.New("the project orchestrator remains available while the project is open")
+	}
+	if detail.Task.Status == api.TaskOpen && a.ItemLead {
+		return errors.New("the item lead remains available until its exact team close")
 	}
 	if a.Host != spawn.Host() {
 		return fmt.Errorf("agent %s runs on %s; tt close only controls sessions on this host", a.Name, a.Host)

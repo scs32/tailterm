@@ -336,3 +336,6 @@
     margin-left: auto;
   }
 }
+.team-delivery-rows { display: grid; gap: 0.5rem; }
+.team-delivery-row { display: grid; gap: 0.15rem; min-width: 0; overflow-wrap: anywhere; padding: 0.5rem 0; border-top: 1px solid var(--border, #333); }
+.team-delivery-row:first-child { border-top: 0; }

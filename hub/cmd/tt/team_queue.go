@@ -29,7 +29,7 @@ func validTeamQueueEntryID(id string) bool {
 
 func cmdTeamQueue(e env, args []string) error {
 	if len(args) == 0 {
-		return errors.New("usage: tt team queue add|list|remove|reorder|release|abandon")
+		return errors.New("usage: tt team queue add|list|policy|limit|replace-lead|remove|reorder|release|abandon")
 	}
 	sub := args[0]
 	fs := flag.NewFlagSet("team queue "+sub, flag.ContinueOnError)
@@ -39,8 +39,16 @@ func cmdTeamQueue(e env, args []string) error {
 	order := fs.Int64("order", 0, "recorded work-order message sequence")
 	template := fs.String("template", "planned", "team template")
 	entry := fs.String("entry", "", "queue entry ID")
+	leadAgent := fs.String("lead-agent", "", "exact replacement item team member ID")
 	before := fs.String("before", "", "place before this queued entry; omit to move to end")
 	cwd := fs.String("cwd", "", "absolute project folder for launch host")
+	var ownership ownershipFlags
+	fs.Var(&ownership, "owns", "repository-relative owned file or directory (repeatable)")
+	limit := fs.Int("limit", 0, "project concurrency limit (1 or 2)")
+	policyVersion := fs.Int64("policy-version", 0, "owner host policy version")
+	policyExpires := fs.String("expires", "", "host policy expiry in RFC3339")
+	policySessions := fs.Int("sessions", 0, "host session budget")
+	policyPolling := fs.Int("polling", 0, "host polling budget")
 	jsonOut := fs.Bool("json", false, "print JSON")
 	if err := fs.Parse(args[1:]); err != nil {
 		return err
@@ -68,12 +76,20 @@ func cmdTeamQueue(e env, args []string) error {
 			fmt.Println("(empty team queue)")
 			return nil
 		}
+		fmt.Printf("concurrency limit=%d\n", list.ConcurrencyLimit)
 		for _, q := range list.Entries {
 			state := q.State
+			owns := strings.Join(q.Ownership, ",")
+			if owns == "" {
+				owns = "unscoped (conflicts with all)"
+			}
 			if q.State == "failed" && q.ReleasedAt != "" {
 				state += " (released)"
 			}
-			fmt.Printf("%d %s %s %s order=#%d revision=%d\n", q.Position, state, q.ID, q.ItemID, q.OrderMessageSeq, q.Revision)
+			fmt.Printf("%d %s %s %s order=#%d revision=%d repository=%s owns=%s blocked-by=%s reason=%s handler=%s/%s lease=%d\n", q.Position, state, q.ID, q.ItemID, q.OrderMessageSeq, q.Revision, q.Repository, owns, strings.Join(q.BlockedBy, ","), q.BlockReason, q.HandlerID, q.HandlerRunID, q.HandlerLeaseGeneration)
+			if q.Integration != nil {
+				fmt.Printf("  Ready to integrate: base=%s branch=%s commit=%s evidence=%s\n", q.Integration.BaseCommit, q.Integration.Branch, q.Integration.Commit, q.Integration.Evidence)
+			}
 		}
 		return nil
 	}
@@ -82,6 +98,16 @@ func cmdTeamQueue(e env, args []string) error {
 	}
 	req := api.TeamQueueRequest{RequestID: api.NewID("tqr"), Operation: sub}
 	switch sub {
+	case "policy":
+		if *policyVersion < 1 || *policyExpires == "" || *policySessions < 1 || *policyPolling < 1 {
+			return errors.New("usage: tt team queue policy --policy-version N --expires RFC3339 --sessions N --polling N")
+		}
+		req.Operation, req.Host, req.HostPolicyVersion, req.HostPolicyExpires, req.HostMaxSessions, req.HostMaxPolling = "set_host_policy", spawn.Host(), *policyVersion, *policyExpires, *policySessions, *policyPolling
+	case "limit":
+		if *limit < 1 || *limit > 2 {
+			return errors.New("usage: tt team queue limit --limit 1|2")
+		}
+		req.Operation, req.ConcurrencyLimit, req.Host = "set_limit", *limit, spawn.Host()
 	case "add":
 		if !api.ValidID(*item, "wi") || *order < 1 || *template != "planned" {
 			return errors.New("usage: tt team queue add --item wi_ID --order SEQ [--template planned]")
@@ -100,16 +126,49 @@ func cmdTeamQueue(e env, args []string) error {
 		if statErr != nil || !info.IsDir() {
 			return fmt.Errorf("project cwd is not a directory: %s", *cwd)
 		}
-		req.ItemID, req.OrderMessageSeq, req.Template, req.Host, req.Cwd = *item, *order, *template, spawn.Host(), *cwd
-	case "remove", "reorder", "release":
+		repository, scopeErr := queueRepositoryScope(*cwd, ownership)
+		if scopeErr != nil {
+			return scopeErr
+		}
+		req.ItemID, req.OrderMessageSeq, req.Template, req.Host, req.Cwd, req.Repository, req.Ownership = *item, *order, *template, spawn.Host(), *cwd, repository, ownership
+		if repository != "" {
+			req.BaseCommit, err = queueGitCommit(*cwd)
+			if err != nil {
+				return err
+			}
+		}
+	case "remove", "reorder", "release", "replace-lead":
 		if !validTeamQueueEntryID(*entry) {
-			return errors.New("remove/reorder/release requires --entry tqe_ID")
+			return errors.New("remove/reorder/release/replace-lead requires --entry tqe_ID")
 		}
 		q, err := c.GetTeamQueueEntry(ctx, *task, *entry)
 		if err != nil {
 			return err
 		}
 		req.EntryID, req.ExpectedRevision, req.BeforeID = q.ID, q.Revision, *before
+		if sub == "replace-lead" {
+			if !api.ValidID(*leadAgent, "agt") {
+				return errors.New("replace-lead requires --lead-agent agt_ID")
+			}
+			candidate, err := c.GetAgent(ctx, *task, *leadAgent)
+			if err != nil {
+				return err
+			}
+			detail, err := c.GetTask(ctx, *task)
+			if err != nil {
+				return err
+			}
+			for _, a := range detail.Agents {
+				if a.ItemLead && a.WorkItem != nil && a.WorkItem.ItemID == q.ItemID {
+					req.ExpectedLeadRevision = a.ItemLeadRevision
+					break
+				}
+			}
+			if req.ExpectedLeadRevision == 0 || candidate.WorkItem == nil || candidate.WorkItem.ItemID != q.ItemID {
+				return errors.New("exact current and replacement leads of this item are required")
+			}
+			req.Operation, req.LeadAgentID, req.LeadRunID = "replace_lead", candidate.ID, candidate.RunID
+		}
 		if sub == "release" {
 			req.RequestID = "queue-release-" + q.ID
 			var journal teamLaunchJournal
@@ -235,7 +294,7 @@ func cmdTeamQueue(e env, args []string) error {
 		req.ReservationToken = fmt.Sprintf("manual-%s-%s-%d", *task, *item, *order)
 		req.RequestID = fmt.Sprintf("manual-release-%s-%s-%d", *task, *item, *order)
 	default:
-		return errors.New("usage: tt team queue add|list|remove|reorder|release|abandon")
+		return errors.New("usage: tt team queue add|list|policy|limit|replace-lead|remove|reorder|release|abandon")
 	}
 	result, err := c.TeamQueueAction(ctx, *task, req)
 	if err != nil {
@@ -244,7 +303,11 @@ func cmdTeamQueue(e env, args []string) error {
 	if *jsonOut {
 		printJSON(result)
 	} else {
-		fmt.Printf("%s %s %s at %d\n", sub, result.ID, result.ItemID, result.Position)
+		if sub == "limit" {
+			fmt.Printf("concurrency limit=%d\n", result.Revision)
+		} else {
+			fmt.Printf("%s %s %s at %d\n", sub, result.ID, result.ItemID, result.Position)
+		}
 	}
 	return nil
 }

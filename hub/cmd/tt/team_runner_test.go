@@ -795,6 +795,17 @@ func TestTeamRunnerSameItemLeadReplacementKeepsReservation(t *testing.T) {
 		t.Fatalf("launch %+v %v", q, err)
 	}
 	replacement := "correction-lead-1"
+	detailBefore, err := f.c.GetTask(ctx, f.task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, agent := range detailBefore.Agents {
+		if agent.Name == replacement {
+			if _, err := f.c.PostEvent(ctx, f.task.ID, api.PostEventRequest{AgentID: agent.ID, RunID: agent.RunID, Kind: api.EventRunning}); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
 	if _, err := f.st.UpdateTask(ctx, f.task.ID, api.UpdateTaskRequest{Orchestrator: &replacement}, api.Caller{Node: "fixture", User: "owner"}); err != nil {
 		t.Fatalf("same-item replacement %v", err)
 	}
