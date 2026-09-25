@@ -92,6 +92,13 @@ test("Planned delivery members post typed messages with tt send", () => {
   }
 });
 
+test("Planned delivery lead has exact terminal team closeout", () => {
+  const lead = exampleTeam("planned").members.find((member) => member.name === "lead").prompt;
+  assert.match(lead, /handler confirms a terminal item and all team obligations are closed, run tt close --team/);
+  assert.match(lead, /item workers before the lead, clears the project orchestrator and preserves the database handler/);
+  assert.match(lead, /owner may use tt close --team --task ID/);
+});
+
 test("typed team prompts use notices for waits and self-blocks for dependencies", () => {
   let typedPrompts = 0;
   for (const team of TEAM_EXAMPLES)

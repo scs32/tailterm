@@ -202,6 +202,11 @@ func (c *Client) CloseAgent(ctx context.Context, task, agent, runID string) (Age
 	return out, c.do(ctx, "DELETE", "/v1/tasks/"+task+"/agents/"+agent+"?"+q.Encode(), nil, &out)
 }
 
+func (c *Client) CloseItemTeam(ctx context.Context, task string, req TeamCloseRequest) (TeamCloseResult, error) {
+	var out TeamCloseResult
+	return out, c.do(ctx, "POST", "/v1/tasks/"+task+"/team-close", req, &out)
+}
+
 func (c *Client) PostMessage(ctx context.Context, task string, req PostMessageRequest) (Message, error) {
 	var out Message
 	return out, c.do(ctx, "POST", "/v1/tasks/"+task+"/messages", req, &out)

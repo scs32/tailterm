@@ -11,6 +11,16 @@ func migrate(db *sql.DB) error {
 	if _, err := db.Exec(obligationsSchema); err != nil {
 		return err
 	}
+	if _, err := db.Exec(`CREATE TABLE IF NOT EXISTS team_close_receipts (
+		task_id TEXT NOT NULL REFERENCES tasks(id),
+		request_id TEXT NOT NULL,
+		payload_hash TEXT NOT NULL,
+		result_json TEXT NOT NULL,
+		created_at TEXT NOT NULL,
+		PRIMARY KEY(task_id,request_id)
+	)`); err != nil {
+		return err
+	}
 	if err := migrateBridge(db); err != nil {
 		return err
 	}

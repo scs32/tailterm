@@ -78,6 +78,7 @@ Commands
   retire [AGENT]              disable inbox wake-ups; preserve terminal and results
   resume [AGENT]              re-enable inbox wake-ups for a retired agent
   close [--json] [AGENT]       exact-run closeout on this host (default: self)
+  close --team [--task ID]    close a terminal item's team, then clear its lead
   cleanup --task ID [--json]   retry exact cleanup for closed local agents
   watch                        deprecated; inbox delivery never types into panes
   wrap -- CMD                  run CMD, reporting started/exited to the hub
@@ -1173,7 +1174,14 @@ func cmdClose(e env, args []string) error {
 	fs := flag.NewFlagSet("close", flag.ExitOnError)
 	task := fs.String("task", e.task, "task id")
 	jsonOut := fs.Bool("json", false, "JSON result")
+	team := fs.Bool("team", false, "close the terminal item's team and lead")
 	_ = fs.Parse(args)
+	if *team {
+		if fs.NArg() != 0 || *task == "" || (e.agent == "" && !flagPresent(args, "task")) {
+			return errors.New("usage: tt close --team [--task ID] (owner must supply --task)")
+		}
+		return cmdCloseTeam(e, *task, *jsonOut)
+	}
 	ref := e.agent
 	if fs.NArg() > 0 {
 		ref = fs.Arg(0)
