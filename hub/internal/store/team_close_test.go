@@ -186,6 +186,34 @@ func TestCloseItemTeamOwnerCanCloseExitedBoundLead(t *testing.T) {
 	}
 }
 
+func TestCloseItemTeamIgnoresWithdrawnRequest(t *testing.T) {
+	s, task, item, lead, worker, _, req := teamCloseFixture(t)
+	ctx := context.Background()
+	by := api.Caller{Node: "fixture", User: "owner"}
+	message, err := s.PostMessage(ctx, task.ID, api.PostMessageRequest{To: worker.ID, AgentID: lead.ID, RunID: lead.RunID,
+		Envelope: &api.Envelope{Kind: api.EnvelopeKindRequest, To: worker.Name, Subject: "Check fixture", Body: api.EnvelopeBody{Ask: "Check the fixture."}}}, by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var obligationID string
+	if err := s.db.QueryRowContext(ctx, `SELECT id FROM obligations WHERE message_seq=?`, message.Seq).Scan(&obligationID); err != nil {
+		t.Fatal(err)
+	}
+	teamCloseTerminal(t, s, task, item, "dismissed")
+	if _, err := s.CloseItemTeam(ctx, task.ID, req, by); !errors.Is(err, api.ErrConflict) {
+		t.Fatalf("open request did not block close: %v", err)
+	}
+	withdrawn, err := s.WithdrawObligation(ctx, task.ID, obligationID, api.ObligationWithdrawRequest{
+		AgentID: lead.ID, RunID: lead.RunID, Reason: "No longer needed", RequestID: "withdraw-close-fixture",
+	})
+	if err != nil || withdrawn.State != api.ObligationClosed || withdrawn.Outcome != api.OutcomeWithdrawn {
+		t.Fatalf("withdrawal %+v: %v", withdrawn, err)
+	}
+	if _, err := s.CloseItemTeam(ctx, task.ID, req, by); err != nil {
+		t.Fatalf("withdrawn request blocked team close: %v", err)
+	}
+}
+
 func TestCloseItemTeamClosesHeldDeliveryNoticesAtomically(t *testing.T) {
 	for _, sender := range []string{"owner cancellation", "agent notice"} {
 		t.Run(sender, func(t *testing.T) {

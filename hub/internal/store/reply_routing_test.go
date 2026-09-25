@@ -6,9 +6,35 @@ import (
 	"path/filepath"
 	"strconv"
 	"testing"
+	"time"
 
 	"github.com/scs32/tailterm/hub/internal/api"
 )
+
+func TestUnaddressedReplyToLiveAuthorAcknowledgesThroughGate(t *testing.T) {
+	f := newPhase3Fixture(t)
+	start := time.Now().UTC().Truncate(time.Second)
+	f.s.now = func() time.Time { return start }
+	assign := f.assignTo(t, f.builder)
+	f.s.now = func() time.Time { return start.Add(api.ObligationAckGrace + time.Second) }
+	stale := api.PostMessageRequest{AgentID: f.builder.ID, RunID: "run_0000000000000000", ReplyTo: assign.Seq, Text: "Fixture done"}
+	var unacked *api.UnacknowledgedError
+	if _, err := f.post(t, stale); !errors.As(err, &unacked) {
+		t.Fatalf("stale run bypassed acknowledgement gate: %v", err)
+	}
+	reply := stale
+	reply.RunID = f.builder.RunID
+	message, err := f.post(t, reply)
+	if err != nil || message.To != f.lead.ID || message.ReplyTo != assign.Seq {
+		t.Fatalf("unaddressed reply was not routed to live author: %+v %v", message, err)
+	}
+	if o := f.obligationFor(t, assign.Seq); o.State != api.ObligationAcknowledged || o.AckedAt == nil {
+		t.Fatalf("routed reply did not acknowledge assignment: %+v", o)
+	}
+	if _, err := f.post(t, notice(f.builder, "acknowledged through reply")); err != nil {
+		t.Fatalf("routed reply did not release gate: %v", err)
+	}
+}
 
 func TestReplyRouting(t *testing.T) {
 	f := newPhase3Fixture(t)
