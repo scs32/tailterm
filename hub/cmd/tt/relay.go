@@ -460,6 +460,8 @@ func cmdRelay(args []string) error {
 					fmt.Fprintf(os.Stderr, "[tt relay] %s: %v\n", b.Agent, err)
 				}
 				progress.Error = err.Error()
+			} else {
+				progress.Error = ""
 			}
 			if err := writePrivateJSON(progressPath, progress); err != nil {
 				fmt.Fprintln(os.Stderr, "[tt relay] save progress:", err)

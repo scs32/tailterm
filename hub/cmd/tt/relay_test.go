@@ -5,13 +5,221 @@ import (
 	"encoding/json"
 	"errors"
 	"github.com/scs32/tailterm/hub/internal/api"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
+
+func captureRelayOutput(t *testing.T, stderr bool, run func() error) (string, error) {
+	t.Helper()
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+	var original *os.File
+	if stderr {
+		original, os.Stderr = os.Stderr, w
+		defer func() { os.Stderr = original }()
+	} else {
+		original, os.Stdout = os.Stdout, w
+		defer func() { os.Stdout = original }()
+	}
+	runErr := run()
+	if stderr {
+		os.Stderr = original
+	} else {
+		os.Stdout = original
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	data, err := io.ReadAll(r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(data), runErr
+}
+
+func TestRelayClearsRecoveredErrorAndLogsSameFailureAgain(t *testing.T) {
+	// Keep the command's cleanup and queue tick away from the live hub, relay
+	// state, config and tmux socket. No queue is due in this fixture.
+	stateDir := t.TempDir()
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("TAILTERM_RELAY_STATE", stateDir)
+	t.Setenv("TT_TMUX_SOCKET", "relay-recovery-test-"+strconv.FormatInt(time.Now().UnixNano(), 10))
+	queuePath := filepath.Join(stateDir, "fake-codex")
+	if err := os.WriteFile(queuePath, []byte("#!/bin/sh\nprintf 'Queued message\\n'\n"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("TAILTERM_TOKEN", "")
+	t.Setenv("TAILTERM_TASK", "")
+	t.Setenv("TAILTERM_AGENT", "")
+	t.Setenv("TAILTERM_RUN", "")
+	var down atomic.Bool
+	down.Store(true)
+	b := runtimeBinding{Task: "tsk_0000000000000001", Agent: "agt_0000000000000001", Run: "run_0000000000000001", Thread: "00000000-0000-4000-8000-000000000001", Codex: queuePath}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if down.Load() {
+			http.Error(w, "temporary outage", http.StatusServiceUnavailable)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.URL.Path == "/v1/team-queues":
+			_, _ = w.Write([]byte(`{"entries":[]}`))
+		case strings.HasSuffix(r.URL.Path, "/pause"):
+			_ = json.NewEncoder(w).Encode(api.ProjectPauseStatus{State: api.ProjectPauseActive})
+		case strings.HasSuffix(r.URL.Path, "/wake-jobs/lease"):
+			http.NotFound(w, r)
+		case strings.Contains(r.URL.Path, "/agents/"):
+			_ = json.NewEncoder(w).Encode(api.Agent{ID: b.Agent, RunID: b.Run, Status: api.AgentDone, Online: true, Unread: 0})
+		default:
+			t.Errorf("unexpected test hub request: %s %s", r.Method, r.URL.Path)
+			http.Error(w, "unexpected", http.StatusInternalServerError)
+		}
+	}))
+	defer server.Close()
+	b.Hub = server.URL
+	t.Setenv("TAILTERM_HUB", server.URL)
+	bindingPath := filepath.Join(stateDir, bindingKey(b)+".binding.json")
+	progressPath := filepath.Join(stateDir, bindingKey(b)+".progress.json")
+	if err := writePrivateJSON(bindingPath, b); err != nil {
+		t.Fatal(err)
+	}
+	var bindingLogs string
+	for _, phase := range []struct {
+		name string
+		down bool
+	}{
+		{"first failure", true}, {"repeat failure", true}, {"recovery", false}, {"same failure after recovery", true},
+	} {
+		down.Store(phase.down)
+		out, err := captureRelayOutput(t, true, func() error { return cmdRelay([]string{"--once"}) })
+		if err != nil {
+			t.Fatalf("%s: %v", phase.name, err)
+		}
+		for _, line := range strings.Split(out, "\n") {
+			if strings.HasPrefix(line, "[tt relay] "+b.Agent+": ") {
+				bindingLogs += line + "\n"
+			}
+		}
+		data, err := os.ReadFile(progressPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var progress relayProgress
+		if err := json.Unmarshal(data, &progress); err != nil {
+			t.Fatal(err)
+		}
+		if phase.down && !strings.Contains(progress.Error, "temporary outage") {
+			t.Fatalf("%s: saved error = %q", phase.name, progress.Error)
+		}
+		if !phase.down && progress.Error != "" {
+			t.Fatalf("%s: saved error = %q, want empty", phase.name, progress.Error)
+		}
+		status, err := captureRelayOutput(t, false, func() error { return cmdRelay([]string{"--status"}) })
+		if err != nil || strings.Contains(status, "temporary outage") != phase.down || !strings.Contains(status, b.Agent) {
+			t.Fatalf("status after %s: %q, err=%v", phase.name, status, err)
+		}
+	}
+	if got := strings.Count(bindingLogs, "[tt relay] "+b.Agent+": "); got != 2 {
+		t.Fatalf("binding error log entries = %d, want 2: %s", got, bindingLogs)
+	}
+}
+
+func TestRelayClearsErrorOnOtherSuccessfulPaths(t *testing.T) {
+	for _, path := range []string{"paused", "inactive", "broker wake"} {
+		t.Run(path, func(t *testing.T) {
+			stateDir := t.TempDir()
+			t.Setenv("HOME", t.TempDir())
+			t.Setenv("TAILTERM_RELAY_STATE", stateDir)
+			t.Setenv("TT_TMUX_SOCKET", "relay-success-test-"+strconv.FormatInt(time.Now().UnixNano(), 10))
+			t.Setenv("TAILTERM_TOKEN", "")
+			t.Setenv("TAILTERM_TASK", "")
+			t.Setenv("TAILTERM_AGENT", "")
+			t.Setenv("TAILTERM_RUN", "")
+			queueLog := filepath.Join(stateDir, "queue.log")
+			t.Setenv("TT_FAKE_QUEUE_LOG", queueLog)
+			queuePath := filepath.Join(stateDir, "fake-codex")
+			if err := os.WriteFile(queuePath, []byte("#!/bin/sh\nprintf 'queued\\n' >> \"$TT_FAKE_QUEUE_LOG\"\nprintf 'Queued message\\n'\n"), 0700); err != nil {
+				t.Fatal(err)
+			}
+			b := runtimeBinding{Task: "tsk_0000000000000001", Agent: "agt_0000000000000001", Run: "run_0000000000000001", Thread: "00000000-0000-4000-8000-000000000001", Codex: queuePath}
+			var reports atomic.Int32
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				switch {
+				case r.URL.Path == "/v1/team-queues":
+					_, _ = w.Write([]byte(`{"entries":[]}`))
+				case strings.HasSuffix(r.URL.Path, "/pause"):
+					state := api.ProjectPauseActive
+					if path == "paused" {
+						state = api.ProjectPausePaused
+					}
+					_ = json.NewEncoder(w).Encode(api.ProjectPauseStatus{State: state})
+				case strings.HasSuffix(r.URL.Path, "/wake-jobs/lease") && path == "broker wake":
+					_ = json.NewEncoder(w).Encode(api.WakeJob{ID: "wake_1", LeaseToken: "test-lease", AgentID: b.Agent, RunID: b.Run, Prompt: "test broker prompt"})
+				case strings.HasSuffix(r.URL.Path, "/wake-jobs/lease"):
+					http.NotFound(w, r)
+				case strings.HasSuffix(r.URL.Path, "/wake-jobs/wake_1/report") && path == "broker wake":
+					var report api.WakeJobReport
+					if err := json.NewDecoder(r.Body).Decode(&report); err != nil || report.Status != "accepted" || report.LeaseToken != "test-lease" {
+						t.Errorf("broker report = %+v, err=%v", report, err)
+					}
+					reports.Add(1)
+					_, _ = w.Write([]byte(`{}`))
+				case strings.Contains(r.URL.Path, "/agents/") && path != "paused":
+					_ = json.NewEncoder(w).Encode(api.Agent{ID: b.Agent, RunID: b.Run, Status: api.AgentDone, Online: path != "inactive", Unread: 0})
+				default:
+					t.Errorf("unexpected test hub request: %s %s", r.Method, r.URL.Path)
+					http.Error(w, "unexpected", http.StatusInternalServerError)
+				}
+			}))
+			defer server.Close()
+			b.Hub = server.URL
+			t.Setenv("TAILTERM_HUB", server.URL)
+			progressPath := filepath.Join(stateDir, bindingKey(b)+".progress.json")
+			if err := writePrivateJSON(filepath.Join(stateDir, bindingKey(b)+".binding.json"), b); err != nil {
+				t.Fatal(err)
+			}
+			if err := writePrivateJSON(progressPath, relayProgress{Run: b.Run, Thread: b.Thread, Error: "previous outage"}); err != nil {
+				t.Fatal(err)
+			}
+			stderr, err := captureRelayOutput(t, true, func() error { return cmdRelay([]string{"--once"}) })
+			if err != nil || strings.Contains(stderr, "[tt relay] "+b.Agent+": ") {
+				t.Fatalf("%s pass: stderr=%q err=%v", path, stderr, err)
+			}
+			data, err := os.ReadFile(progressPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var progress relayProgress
+			if err := json.Unmarshal(data, &progress); err != nil || progress.Error != "" {
+				t.Fatalf("%s saved progress: %+v err=%v", path, progress, err)
+			}
+			status, err := captureRelayOutput(t, false, func() error { return cmdRelay([]string{"--status"}) })
+			if err != nil || strings.Contains(status, "previous outage") || !strings.Contains(status, b.Agent) {
+				t.Fatalf("%s status: %q err=%v", path, status, err)
+			}
+			queueData, err := os.ReadFile(queueLog)
+			if path == "broker wake" {
+				if err != nil || string(queueData) != "queued\n" || reports.Load() != 1 || !progress.BrokerWakes {
+					t.Fatalf("broker path: queue=%q err=%v reports=%d progress=%+v", queueData, err, reports.Load(), progress)
+				}
+			} else if !os.IsNotExist(err) || reports.Load() != 0 {
+				t.Fatalf("%s unexpectedly queued: %q err=%v reports=%d", path, queueData, err, reports.Load())
+			}
+		})
+	}
+}
 
 func TestRelayTargetsUnreadOnceAndPreservesReadReceipts(t *testing.T) {
 	b := runtimeBinding{Hub: "http://hub", Task: "tsk_0000000000000001", Agent: "agt_0000000000000001", Run: "run_0000000000000001", Thread: "00000000-0000-4000-8000-000000000001", Codex: "/usr/local/bin/codex"}
