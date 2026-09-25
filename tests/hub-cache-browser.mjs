@@ -33,6 +33,9 @@ async function transport(url,init){
     sessionStorage.setItem('synthetic-write-attempts',state.writes);
     return response({error:'Synthetic write rejected: hub unavailable'},503);
   }
+  // Capability metadata is not cached; let the views reach their cached
+  // content reads while the fixture holds content responses below.
+  if(path.pathname==='/v1/capabilities')return response({});
   if(path.pathname.endsWith('/events')){
     await new Promise(resolve=>setTimeout(resolve,100));
     if(!state.online)throw Error('Synthetic hub offline');
@@ -108,7 +111,7 @@ const origin = `http://127.0.0.1:${server.httpServer.address().port}/hub-cache-t
 const modes = ["board", "projects", "bugs", "features"];
 const content = {
   board: "#board-messages",
-  projects: "[data-task-card]",
+  projects: ".tasks-detail .board-head .view-heading h2",
   bugs: "[data-work-item]",
   features: "[data-work-item]",
 };
@@ -152,7 +155,7 @@ try {
         await show(page, mode, 1);
         await page.waitForFunction(() => qa.state.waiting.length > 0);
         assert.equal(await page.evaluate(() => qa.state.responses), 0, `${name} ${mode}: response arrived before cache assertion`);
-        await expect(page.locator("#mode-view [role=status]")).toContainText("Saved data");
+        await expect(page.locator("#mode-view .hub-sync-status, #mode-view .work-items-sync")).toHaveCount(0);
         await page.screenshot({ path: `.build/hub-cache-${mode}-held-${name}.png` });
         await page.evaluate(() => qa.release());
         await expect(page.locator(content[mode])).toContainText(marker(mode, 2));
@@ -167,7 +170,7 @@ try {
       await open(page, "offline");
       for (const mode of modes) {
         await show(page, mode, 1);
-        await expect(page.locator("#mode-view [role=status]")).toContainText("Saved data · offline");
+        await expect(page.locator("#mode-view .hub-sync-status, #mode-view .work-items-sync")).toHaveText("Offline · showing cached data");
       }
       assert.equal(await page.evaluate(() => qa.state.responses), 0);
       assert.match(await page.evaluate(async () => {

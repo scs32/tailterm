@@ -33,7 +33,9 @@ async function transport(url,init){
  const u=new URL(url),p=u.pathname,method=init.method||'GET',body=init.body?JSON.parse(init.body):{};
  if(method!=='GET'){state.writes++;if(!state.online||state.failWrites)return response({error:'Synthetic write rejected'},503)}
  else if(!state.online)throw Error('Synthetic hub offline');
- if(p.endsWith('/events')){if(u.searchParams.get('wait'))await new Promise(r=>setTimeout(r,150));return response({events:[],next:0})}
+ // The suite triggers refresh explicitly; keep the synthetic long poll from
+ // racing native keydown/keyup on a button during unrelated assertions.
+ if(p.endsWith('/events')){if(u.searchParams.get('wait'))await new Promise(r=>setTimeout(r,30000));return response({events:[],next:0})}
  if(method==='GET'&&state.held)await new Promise(r=>state.waiting.push(r));
  if(p==='/v1/capabilities')return response(state.pauseSupported?{projectPause:{supported:true,versions:[1]}}:{});
  if(p==='/v1/tasks')return response({tasks});
@@ -58,7 +60,9 @@ async function transport(url,init){
 await vault.localAPI('/unlock','POST',{password:'Synthetic board layout QA passphrase'});
 if(scenario!=='empty')for(let i=0;i<2;i++)await vault.localAPI('/teams','POST',{name:scenario==='long'?long.slice(0,70)+' team '+(i+1):['Alpha team','Beta team'][i],orchestrator:'fixture-lead',members:[{name:'fixture-lead',runtime:'codex',role:'Coordinator',prompt:'Synthetic instructions'}]});
 const live=createHubClient({baseURL:'http://synthetic-layout.invalid',token:'synthetic-only',fetchImpl:transport});
-let client=createCachedHubClient({client:live,cache:createHubReadCache(vault.hubReadCachePersistence()),online:()=>state.online,refreshMs:300});
+// Explicit invalidations below exercise refresh continuity without a timed
+// poll replacing a control between the keyboard press and its native click.
+let client=createCachedHubClient({client:live,cache:createHubReadCache(vault.hubReadCachePersistence()),online:()=>state.online,refreshMs:60000});
 const notice=t=>{state.notices.push(t);const el=document.querySelector('#notice');el.textContent=t;el.hidden=false};
 const record=(action,id)=>{state.calls.push({action,id})};
 const dialog=(title,body)=>{const d=document.querySelector('#dialog');if(d.open)d.close();d.innerHTML='<div class="dialog-head"><h2>'+title+'</h2><button id="dialog-close" type="button">×</button></div>'+body;d.querySelector('#dialog-close').onclick=closeDialog;d.showModal()};
@@ -75,7 +79,7 @@ views={
 };
 modes=setupModes({header:document.querySelector('main > header'),main:document.querySelector('main'),onChange:(mode,container)=>{Object.values(views).forEach(v=>v.hide());container.replaceChildren();if(views[mode]){views[mode].mount(container);window.rendered=views[mode].show()}}});
 window.qa={state,views,modes,tasks,items,ids,vault,get client(){return client},
- replaceClient(){client.dispose();client=createCachedHubClient({client:live,cache:createHubReadCache(vault.hubReadCachePersistence()),online:()=>state.online,refreshMs:300})},
+ replaceClient(){client.dispose();client=createCachedHubClient({client:live,cache:createHubReadCache(vault.hubReadCachePersistence()),online:()=>state.online,refreshMs:60000})},
  async show(mode){modes.set(mode);await window.rendered},
  async offline(value=true){state.online=!value;await client.refreshConnection()},
  release(){state.held=false;state.waiting.splice(0).forEach(r=>r())}
@@ -86,7 +90,7 @@ const server = await createServer({
   configFile: false,
   cacheDir: ".build/project-compact-ui/vite-cache",
   root: process.cwd(),
-  server: { host: "127.0.0.1", port: 0 },
+  server: { host: "127.0.0.1", port: 0, hmr: false },
   logLevel: "error",
   plugins: [
     {
@@ -135,11 +139,16 @@ try {
               if (mode === "board")
                 await page.locator("[data-board-task]").first().click();
               else await page.locator("[data-task-select]").first().click();
+              await page.waitForFunction(
+                () => qa.client.cacheStatus().label === "Saved data",
+              );
+              await page.waitForTimeout(200);
               const toggle = page.locator("[data-team-toggle]");
               await expect(toggle).toHaveCount(count ? 1 : 0);
               await expect(page.locator(".hub-sync-status")).toHaveCount(0);
               await expect(page.locator(".compose-note")).toHaveCount(0);
               if (!count) continue;
+              await page.evaluate(() => (qa.state.held = true));
               await expect(toggle).toHaveAttribute(
                 "aria-expanded",
                 String(count <= 4),
@@ -249,6 +258,7 @@ try {
                 calls,
                 "disclosure has no mutations/navigation",
               );
+              await page.evaluate(() => qa.release());
               // Polling preserves the explicit choice and keyboard focus.
               await toggle.focus();
               await page.evaluate(() => qa.client.invalidate());
@@ -312,6 +322,9 @@ try {
               await page.locator("#board-text").fill("Synthetic pending send");
               await page.evaluate(() => (qa.state.holdPost = true));
               await page.locator("#board-compose button[type=submit]").click();
+              // Force the same view refresh that a live poll can trigger while
+              // the fixture post remains pending.
+              await page.evaluate(() => qa.client.invalidate());
               await expect(page.locator("#board-text")).toBeDisabled();
               const pendingWrites = await page.evaluate(() => qa.state.writes);
               await page.locator("[data-team-toggle]").click();
