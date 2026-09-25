@@ -52,7 +52,8 @@ async function transport(url,init){
     const after=Number(path.searchParams.get('after')||0);
     return response({messages:Array.from({length:state.version},(_,i)=>message(i+1)).filter(m=>m.seq>after)});
   }
-  if(path.pathname==='/v1/work-items')return response({items:[workItem(path.searchParams.get('kind'))],next:0});
+  if(path.pathname==='/v1/work-items')return response({items:[path.searchParams.get('status')==='in_progress'
+    ? {...workItem('bug'),status:'in_progress'} : workItem(path.searchParams.get('kind'))],next:0});
   throw Error('Unexpected synthetic read: '+path.pathname);
 }
 await vault.localAPI('/unlock','POST',{password,username:'synthetic-alpha'});
@@ -82,6 +83,7 @@ configure();
 window.qa={state,vault,taskId,password,
   get client(){return client},get live(){return live},
   async show(mode){if(current)views[current].hide();root.replaceChildren();current=mode;views[mode].mount(root);await views[mode].show()},
+  showBoardItem(){return views.board.show(taskId,{taskId,id:'bug-fixture',revision:state.version,title:'Synthetic bug v'+state.version})},
   release(){state.held=false;state.waiting.splice(0).forEach(resolve=>resolve())},
   async connection(online){state.online=online;await client.refreshConnection()},
   configure,
@@ -173,6 +175,19 @@ try {
       );
       await warm(page);
       console.log(`${name}: warmed actual Board/Projects/Bugs/Features through live client reads`);
+
+      // A routine Board reload may wait for fresh item eligibility without
+      // discarding the known item picker and the current draft selection.
+      await page.evaluate(() => qa.show('board'));
+      await page.evaluate(() => qa.showBoardItem());
+      await expect(page.locator('#board-message-item')).toContainText('Synthetic bug v1');
+      await page.evaluate(() => { qa.state.held=true; window.itemReload=qa.showBoardItem(); });
+      await page.waitForFunction(() => qa.state.waiting.length > 0);
+      await expect(page.locator('#board-message-item')).toContainText('Synthetic bug v1');
+      await page.evaluate(() => qa.release());
+      await page.evaluate(() => window.itemReload);
+      await expect(page.locator('#board-message-item')).toContainText('Synthetic bug v1');
+      console.log(`${name}: same-client Board reload retains item picker while eligibility refresh is held`);
 
       // Each mode starts after a real reload and vault unlock, with every hub
       // read held. Cached content must arrive while zero responses have arrived.
