@@ -4705,6 +4705,18 @@ html:fullscreen {
   gap: 12px;
   margin-bottom: 6px;
 }
+@media (min-width: 1000px) and (max-width: 1100px) {
+  #mode-view .feature-head .work-items-heading h2,
+  #mode-view .feature-head .work-items-controls {
+    white-space: nowrap;
+  }
+  #mode-view .feature-head .work-items-controls {
+    flex-wrap: nowrap;
+  }
+  #mode-view .feature-head .work-items-search input {
+    width: 150px;
+  }
+}
 #mode-view .board-head h2 {
   margin: 0;
   overflow-wrap: anywhere;

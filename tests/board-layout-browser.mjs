@@ -128,9 +128,12 @@ async function geometry(page, mode) {
     const headingControls=headingRow?.querySelector('.work-items-controls');
     const controls=[...main.querySelectorAll('button,select')].filter(el=>{const r=el.getBoundingClientRect();return r.height>0&&!el.closest('[popover]')&&r.y>=0&&r.y<innerHeight});
     const toolbar=[...main.querySelectorAll('.view-actions > button,.work-items-controls > button,.work-items-controls select,.task-actions > button')].filter(el=>el.getBoundingClientRect().height>0);
+    const itemHeader = headingRow?.closest('.work-items-head');
+    const itemPart = selector => { const el=itemHeader?.querySelector(selector);return el && el.getBoundingClientRect().height>0 ? rect(el) : null; };
     return {view:rect(view),outer:rect(outer),rail:rect(rail),main:rect(main),railStyle:style(rail),mainStyle:style(main),
       button:button?{rect:rect(button),style:style(button),text:button.textContent}:null,
       heading:heading?{rect:rect(heading),style:style(heading),rowStyle:style(headingRow),rowRect:rect(headingRow),controlsRect:headingControls?rect(headingControls):null}:null,
+      itemParts:itemHeader?{count:itemPart('.count-badge'),search:itemPart('[data-items-search]'),status:itemPart('[data-items-status]'),newButton:itemPart('[data-items-new]')}:null,
       controls:controls.map(el=>({text:el.textContent.trim().slice(0,40),rect:rect(el),style:style(el)})),
       toolbar:toolbar.map(el=>({text:el.textContent.trim().slice(0,40),rect:rect(el),style:style(el)})),
       pageWidth:document.documentElement.scrollWidth,viewportWidth:innerWidth};
@@ -166,21 +169,32 @@ function compare(actual, board, width, label, scenario) {
     for (const property of ["paddingTop", "paddingBottom", "alignItems"])
       check(label, () => assert.equal(actual.heading.rowStyle[property], board.heading.rowStyle[property], `heading row ${property}`));
     check(label, () => near(actual.heading.rect.x, board.heading.rect.x, "heading origin x"));
-    // Unequal wrapped titles/actions legitimately change vertical centering.
     // Compare the actual origin for comparable single-line desktop headings.
     if (width > 760 && scenario === "populated") {
+      check(label, () => near(actual.heading.rect.y, board.heading.rect.y, "heading origin y"));
       if (width === 1024 && label.endsWith("-features")) {
-        const heading = actual.heading.rect, row = actual.heading.rowRect, controls = actual.heading.controlsRect;
-        check(label, () => assert.ok(heading.height > board.heading.rect.height + 1, "Features heading wraps at 1024px"));
-        check(label, () => near((heading.y + heading.bottom) / 2, (row.y + row.bottom) / 2, "wrapped heading centered in row"));
-        check(label, () => assert.ok(heading.x >= row.x - 1 && heading.y >= row.y - 1 && heading.right <= row.right + 1 && heading.bottom <= row.bottom + 1, "wrapped heading contained in row"));
-        check(label, () => assert.ok(controls && (heading.right <= controls.x + 1 || controls.right <= heading.x + 1 || heading.bottom <= controls.y + 1 || controls.bottom <= heading.y + 1), "wrapped heading overlaps controls"));
-      } else check(label, () => near(actual.heading.rect.y, board.heading.rect.y, "heading origin y"));
+        const heading = actual.heading.rect, row = actual.heading.rowRect;
+        check(label, () => near(heading.height, board.heading.rect.height, "single-line Features heading height"));
+        for (const [name, part] of Object.entries(actual.itemParts || {})) {
+          check(label, () => assert.ok(part, `${name} missing from Features header`));
+          if (part) check(label, () => assert.ok(part.y >= row.y - 1 && part.bottom <= row.bottom + 1, `${name} wraps outside Features header row`));
+        }
+      }
     }
   }
   for (const control of actual.controls)
     check(label, () => assert.ok(control.rect.x >= actual.view.x - 1 && control.rect.right <= actual.view.right + 1,
       `control clipped horizontally: ${control.text}`));
+  if (label.endsWith('-features') && actual.itemParts) {
+    const parts = Object.entries({heading:actual.heading?.rect,search:actual.itemParts.search,
+      status:actual.itemParts.status,newButton:actual.itemParts.newButton}).filter(([,rect])=>rect);
+    for (let i=0;i<parts.length;i++) for(let j=i+1;j<parts.length;j++) {
+      const [leftName,left]=parts[i], [rightName,right]=parts[j];
+      check(label, () => assert.ok(left.right <= right.x + 1 || right.right <= left.x + 1 ||
+        left.bottom <= right.y + 1 || right.bottom <= left.y + 1,
+        `${leftName} overlaps ${rightName}`));
+    }
+  }
   if (board.toolbar.length) for (const control of actual.toolbar) {
     check(label, () => near(control.rect.height, board.toolbar[0].rect.height, `control height: ${control.text}`));
     check(label, () => assert.equal(control.style.fontFamily, board.toolbar[0].style.fontFamily, `control font: ${control.text}`));
