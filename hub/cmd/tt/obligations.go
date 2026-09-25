@@ -70,6 +70,21 @@ func cmdObligations(e env, args []string) error {
 		if o.Outcome != "" {
 			line += " outcome=" + o.Outcome
 		}
+		if o.HandlerRequest {
+			switch {
+			case o.State != api.ObligationClosed:
+				line += fmt.Sprintf(" [handler request pending %s", (time.Duration(o.PendingAgeMillis) * time.Millisecond).String())
+				if o.HandlerPriority {
+					line += ", live gate"
+				}
+				if o.State == api.ObligationBlocked {
+					line += ", blocked"
+				}
+				line += "]"
+			case o.Outcome == api.OutcomeResult || o.Outcome == api.OutcomeDeclined:
+				line += fmt.Sprintf(" [handler response #%d→#%d %s]", o.MessageSeq, o.OutcomeSeq, (time.Duration(o.ResponseMillis) * time.Millisecond).String())
+			}
+		}
 		fmt.Println(line)
 	}
 	if len(list) == 0 {

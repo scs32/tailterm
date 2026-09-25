@@ -51,6 +51,8 @@ test("handler launches second as a wake-capable Codex role with its own command/
   assert.equal(handler.fields.sandboxMode, "");
   assert.deepEqual(handler.fields.allowedTools, []);
   assert.equal(handler.fields.agentRole, "database_handler");
+  assert.match(handler.fields.prompt, /Before each new queued-item record, run tt obligations/);
+  assert.match(handler.fields.prompt, /RESULT --reply-to/);
   assert.ok(!handler.fields.prompt.includes(lead.prompt));
   result[0].fields.allowedTools.push("mutated copy");
   handler.fields.allowedTools.push("mutated handler");

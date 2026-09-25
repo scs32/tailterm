@@ -92,6 +92,16 @@ test("Planned delivery members post typed messages with tt send", () => {
   }
 });
 
+test("Planned delivery teaches live gate priority without changing inbox order", () => {
+  const team = exampleTeam("planned");
+  const lead = team.members.find((member) => member.name === "lead").prompt;
+  const handler = team.members.find((member) => member.name === "database").prompt;
+  assert.match(lead, /typed REQUEST.*RESULT --reply-to/s);
+  assert.match(handler, /Before each new queued-item record, run tt obligations/);
+  assert.match(handler, /recheck before the next queued record/i);
+  assert.match(handler, /Inbox sequence is unchanged/);
+});
+
 test("Planned delivery lead has exact terminal team closeout", () => {
   const lead = exampleTeam("planned").members.find((member) => member.name === "lead").prompt;
   assert.match(lead, /handler confirms a terminal item and all team obligations are closed, run tt close --team/);

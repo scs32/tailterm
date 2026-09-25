@@ -59,27 +59,31 @@ const (
 var ObligationWakeOffsets = []time.Duration{time.Minute, 3 * time.Minute, 7 * time.Minute}
 
 type Obligation struct {
-	ID             string     `json:"id"`
-	TaskID         string     `json:"taskId"`
-	MessageSeq     int64      `json:"messageSeq"`
-	Subject        string     `json:"subject,omitempty"`
-	SourceKind     string     `json:"sourceKind"`
-	Needs          string     `json:"needs"`
-	AgentID        string     `json:"agentId"`
-	State          string     `json:"state"`
-	Outcome        string     `json:"outcome,omitempty"`
-	OutcomeSeq     int64      `json:"outcomeSeq,omitempty"`
-	Reason         string     `json:"reason,omitempty"`
-	CreatedAt      time.Time  `json:"createdAt"`
-	AckDueAt       time.Time  `json:"ackDueAt"`
-	DueAt          time.Time  `json:"dueAt"`
-	DeliveredAt    *time.Time `json:"deliveredAt,omitempty"`
-	AckedAt        *time.Time `json:"ackedAt,omitempty"`
-	LastProgressAt *time.Time `json:"lastProgressAt,omitempty"`
-	ClosedAt       *time.Time `json:"closedAt,omitempty"`
-	Escalation     int        `json:"escalation"` // 0 none, 1 lead, 2 owner
-	Nudges         int        `json:"nudges"`
-	Overdue        string     `json:"overdue,omitempty"` // ack, silence, outcome
+	ID               string     `json:"id"`
+	TaskID           string     `json:"taskId"`
+	MessageSeq       int64      `json:"messageSeq"`
+	Subject          string     `json:"subject,omitempty"`
+	SourceKind       string     `json:"sourceKind"`
+	Needs            string     `json:"needs"`
+	AgentID          string     `json:"agentId"`
+	State            string     `json:"state"`
+	Outcome          string     `json:"outcome,omitempty"`
+	OutcomeSeq       int64      `json:"outcomeSeq,omitempty"`
+	Reason           string     `json:"reason,omitempty"`
+	CreatedAt        time.Time  `json:"createdAt"`
+	AckDueAt         time.Time  `json:"ackDueAt"`
+	DueAt            time.Time  `json:"dueAt"`
+	DeliveredAt      *time.Time `json:"deliveredAt,omitempty"`
+	AckedAt          *time.Time `json:"ackedAt,omitempty"`
+	LastProgressAt   *time.Time `json:"lastProgressAt,omitempty"`
+	ClosedAt         *time.Time `json:"closedAt,omitempty"`
+	Escalation       int        `json:"escalation"` // 0 none, 1 lead, 2 owner
+	Nudges           int        `json:"nudges"`
+	Overdue          string     `json:"overdue,omitempty"`         // ack, silence, outcome
+	HandlerRequest   bool       `json:"handlerRequest,omitempty"`  // exact-bound request to the database handler
+	HandlerPriority  bool       `json:"handlerPriority,omitempty"` // currently live team and open request
+	PendingAgeMillis int64      `json:"pendingAgeMillis,omitempty"`
+	ResponseMillis   int64      `json:"responseMillis,omitempty"` // creation to result or decline
 }
 
 type ObligationList struct {

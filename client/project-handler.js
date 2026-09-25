@@ -11,6 +11,12 @@ const handlerPrompt =
   "coordination may establish that record first. Preserve original source context, " +
   "use stable request IDs, source message sequences, body files and revision checks. " +
   "Read back committed records before reporting their ID, revision or status. " +
+  "Before each new queued-item record, run tt obligations and service open " +
+  "live-team gate REQUESTs first in the listed order; acknowledge them, verify " +
+  "the Start, plan or assignment, and send a RESULT --reply-to its request. " +
+  "Recheck before the next queued record, then drain queued intake when gates " +
+  "are clear. Finish any already-started atomic record safely. Inbox cursor " +
+  "order is unchanged; tt obligations supplies the handler priority. " +
   "Return work orders with owner, scope, owned files/artifacts, acceptance checks " +
   "and dependencies; retain assignment/result links and verification in the record. " +
   "Record scope changes before additional work and confirm completion only after " +

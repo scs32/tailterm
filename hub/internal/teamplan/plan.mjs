@@ -57,6 +57,8 @@ const TEAM_EXAMPLES = [
 
 Start by sending planner a REQUEST for a plan of the owner's objective. When the plan arrives, check that every acceptance criterion is observable and that file ownership is explicit, then send builder one ASSIGN carrying the plan's objective, owned files and criteria a1…aN unchanged. Ask the database handler to record the item and order; do not narrate record bookkeeping on the board yourself.
 
+For each live team's Start, plan or assignment gate, send the database handler a typed REQUEST with the exact item, order, agent and run. Wait for its RESULT --reply-to before using that gate as verified. A queued item's intake may wait while the handler answers live-team gates.
+
 When builder sends a RESULT with a frozen commit, check it against each criterion, then send reviewer a REVIEW naming that commit, the scope and the criteria. Follow the two-review-round policy: round one produces one consolidated blocker list, and round two checks only those fixes and regressions. After round two, choose exactly one disposition: release, one focused fix with verification, an explicit scope reduction mapped to criteria, or a release block with owner, next action and resume condition. There is no third general review.
 
 Reviewer runs on a runtime that the relay cannot wake. Always send it directed messages; it waits on its inbox. If any teammate leaves an ASSIGN, REQUEST or REVIEW without a reply for 30 minutes, send that teammate one nudge. The broker escalates overdue work itself; do not send a message to escalate a teammate's stall to the owner. Close workers only after acceptance. Once the handler confirms a terminal item and all team obligations are closed, run tt close --team for the item team. When this item came from tt team queue, the supervised host runner may close it after the same gates and cleanup receipts, then advance the queue.`,
@@ -91,6 +93,8 @@ Send lead one RESULT with the frozen commit in Refs, Status for every criterion,
         `You own native Tailterm records for this project: work items, revisions, orders, saved acceptance and release receipts. Use tt work-items and related commands with request IDs; read every mutation back before reporting it. You do not implement, review or decide acceptance.
 
 Act on REQUESTs from lead: create or update the item, record the order that governs the builder's ASSIGN, save review outcomes and the lead's release disposition, and save completion only after the lead's acceptance. If a record conflicts with the request, send lead a BLOCK with the conflicting revision rather than retrying blindly.
+
+Before each new queued-item record, run tt obligations. Acknowledge and answer listed live-team gate REQUESTs first with RESULT --reply-to, then recheck before the next queued record. Finish an already-started atomic record safely; drain queued intake when live gates are clear. Inbox sequence is unchanged.
 
 Reply with one RESULT per request. The subject says what was saved in plain English, for example "Saved review round one with three blockers". IDs, revisions, receipts and hashes go only in Refs. Do not post routine read-backs, receipt chains or record narration to the board. If a record is large, write it to a file and cite the path. Stay available while the project is open; the broker design will absorb much of this bookkeeping later.`,
         { reasoning: "medium", format: true },

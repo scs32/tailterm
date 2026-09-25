@@ -75,6 +75,7 @@ func cmdMessageChecks(e env, args []string) error {
 				cutoff = time.Now().Add(-*since)
 			}
 			fmt.Print(summarizeAcks(obligations, names, cutoff, time.Now()))
+			fmt.Print(summarizeHandlerResponses(obligations, cutoff, time.Now()))
 		}
 		return nil
 	}
@@ -93,6 +94,73 @@ func cmdMessageChecks(e env, args []string) error {
 		fmt.Println("(no checks)")
 	}
 	return nil
+}
+
+// summarizeHandlerResponses uses immutable request creation and typed outcome
+// timestamps. Delivery, acknowledgement and agent lifecycle do not affect it.
+func summarizeHandlerResponses(list []api.Obligation, cutoff, now time.Time) string {
+	var completed []time.Duration
+	var worst, oldest api.Obligation
+	var worstDuration, oldestAge time.Duration
+	var pending, blocked, declined, cancelled, withdrawn int
+	for _, o := range list {
+		if !o.HandlerRequest || o.CreatedAt.Before(cutoff) {
+			continue
+		}
+		switch o.Outcome {
+		case api.OutcomeCancelled:
+			cancelled++
+			continue
+		case api.OutcomeWithdrawn:
+			withdrawn++
+			continue
+		}
+		if o.State != api.ObligationClosed {
+			pending++
+			if o.State == api.ObligationBlocked {
+				blocked++
+			}
+			age := now.Sub(o.CreatedAt)
+			if age > oldestAge {
+				oldest, oldestAge = o, age
+			}
+			continue
+		}
+		if o.Outcome != api.OutcomeResult && o.Outcome != api.OutcomeDeclined {
+			continue
+		}
+		if o.Outcome == api.OutcomeDeclined {
+			declined++
+		}
+		if o.ClosedAt == nil {
+			continue
+		}
+		d := o.ClosedAt.Sub(o.CreatedAt)
+		if d < 0 {
+			d = 0
+		}
+		completed = append(completed, d)
+		if d > worstDuration {
+			worst, worstDuration = o, d
+		}
+	}
+	out := fmt.Sprintf("Handler requests: %d pending (%d blocked), oldest %s", pending, blocked, oldestAge)
+	if pending > 0 {
+		out += fmt.Sprintf(" (#%d)", oldest.MessageSeq)
+	}
+	out += "\n"
+	if len(completed) > 0 {
+		sort.Slice(completed, func(i, j int) bool { return completed[i] < completed[j] })
+		median := completed[len(completed)/2]
+		if len(completed)%2 == 0 {
+			median = (completed[len(completed)/2-1] + median) / 2
+		}
+		out += fmt.Sprintf("Handler responses: %d result/decline (%d declined), median %s, max %s (#%d→#%d)\n", len(completed), declined, median, worstDuration, worst.MessageSeq, worst.OutcomeSeq)
+	} else {
+		out += "Handler responses: no result/decline in this window\n"
+	}
+	out += fmt.Sprintf("Handler requests cancelled: %d, withdrawn: %d\n", cancelled, withdrawn)
+	return out
 }
 
 // Nouls where a high score is a concern, and nouls where a low score is.
