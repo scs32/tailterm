@@ -62,8 +62,11 @@ func TestOwnerCommandsReachTestHub(t *testing.T) {
 			if got.ID != obligation.ID || got.State != tc.wantState || got.Outcome != tc.wantOutcome {
 				t.Fatalf("persisted obligation: %+v", got)
 			}
-			if tc.name == "extend" && !got.DueAt.After(time.Now().Add(25*time.Minute)) {
-				t.Fatalf("extension did not persist: %s", got.DueAt)
+			if tc.name == "extend" {
+				now := time.Now()
+				if got.DueAt.Equal(obligation.DueAt) || !got.DueAt.After(now.Add(25*time.Minute)) || !got.DueAt.Before(now.Add(35*time.Minute)) {
+					t.Fatalf("extension due_at = %s, original = %s, now = %s", got.DueAt, obligation.DueAt, now)
+				}
 			}
 		})
 	}
