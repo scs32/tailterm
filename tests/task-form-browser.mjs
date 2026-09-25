@@ -412,19 +412,25 @@ try {
         beforeMore,
         "More must not reflow the task row",
       );
-      const menuSize = await card.locator(".task-menu").evaluate((el) => ({
-        height: el.getBoundingClientRect().height,
-        rows: [...el.children].map((b) => b.getBoundingClientRect().height),
-      }));
-      assert.equal(menuSize.height, 98, JSON.stringify(menuSize));
-      assert.deepEqual(menuSize.rows, [28, 28, 28]);
+      const menuMetrics = () =>
+        card.locator(".task-menu").evaluate((el) => ({
+          height: el.getBoundingClientRect().height,
+          rows: [...el.children].map((b) => b.getBoundingClientRect().height),
+          labels: [...el.children].map((b) => b.textContent.trim()),
+        }));
+      const expectedMenu = {
+        height: 128,
+        rows: [28, 28, 28, 28],
+        labels: ["Open terminals", "Settings", "Pause project…", "Close project"],
+      };
+      assert.deepEqual(await menuMetrics(), expectedMenu);
       await page.screenshot({ path: ".build/task-menu-" + name + ".png" });
       await page.keyboard.press("Escape");
       assert.equal(await card.locator(".task-menu:popover-open").count(), 0);
       await card.locator("[data-task-more]").click();
-      assert.equal(
-        (await card.locator(".task-menu").boundingBox()).height,
-        98,
+      assert.deepEqual(
+        await menuMetrics(),
+        expectedMenu,
         "Reopened menus must stay compact",
       );
       await card.locator("[data-task-settings]").click();
@@ -931,16 +937,16 @@ try {
       );
       assert.equal(detail.task.swarm, true);
       assert.equal(detail.task.orchestrator, "team-planner");
-      assert.match(launchCommands.at(-3), /--approval-mode/);
-      assert.match(launchCommands.at(-3), /--sandbox-mode/);
-      assert.doesNotMatch(
-        launchCommands.at(-3),
-        /--reasoning/,
-        "synthetic custom wrappers must inherit reasoning",
-      );
       const plannerLaunch = launchCommands
         .slice(launchStart)
         .find((command) => command.includes("team-planner"));
+      assert.match(plannerLaunch, /--approval-mode/);
+      assert.match(plannerLaunch, /--sandbox-mode/);
+      assert.doesNotMatch(
+        plannerLaunch,
+        /--reasoning/,
+        "synthetic custom wrappers must inherit reasoning",
+      );
       assert.match(
         plannerLaunch,
         /--planned-team-members.*2/,
