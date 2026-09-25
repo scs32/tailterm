@@ -44,26 +44,42 @@ type TeamQueueList struct {
 }
 
 type TeamQueueRequest struct {
-	RequestID        string          `json:"requestId"`
-	Operation        string          `json:"operation"`
-	ItemID           string          `json:"itemId,omitempty"`
-	OrderMessageSeq  int64           `json:"orderMessageSeq,omitempty"`
-	Template         string          `json:"template,omitempty"`
-	EntryID          string          `json:"entryId,omitempty"`
-	BeforeID         string          `json:"beforeId,omitempty"`
-	ExpectedRevision int64           `json:"expectedRevision,omitempty"`
-	Host             string          `json:"host,omitempty"`
-	Cwd              string          `json:"cwd,omitempty"`
-	PauseGeneration  int64           `json:"pauseGeneration,omitempty"`
-	LaunchJSON       json.RawMessage `json:"launch,omitempty"`
-	CloseJSON        json.RawMessage `json:"close,omitempty"`
-	CloseRequestID   string          `json:"closeRequestId,omitempty"`
-	ReservationToken string          `json:"reservationToken,omitempty"`
-	ManualJournal    json.RawMessage `json:"manualJournal,omitempty"`
-	SessionsChecked  bool            `json:"sessionsChecked,omitempty"`
-	Failure          string          `json:"failure,omitempty"`
-	MemberIndex      int             `json:"memberIndex,omitempty"`
-	MemberRunID      string          `json:"memberRunId,omitempty"`
+	RequestID        string                 `json:"requestId"`
+	Operation        string                 `json:"operation"`
+	ItemID           string                 `json:"itemId,omitempty"`
+	OrderMessageSeq  int64                  `json:"orderMessageSeq,omitempty"`
+	Template         string                 `json:"template,omitempty"`
+	EntryID          string                 `json:"entryId,omitempty"`
+	BeforeID         string                 `json:"beforeId,omitempty"`
+	ExpectedRevision int64                  `json:"expectedRevision,omitempty"`
+	Host             string                 `json:"host,omitempty"`
+	Cwd              string                 `json:"cwd,omitempty"`
+	PauseGeneration  int64                  `json:"pauseGeneration,omitempty"`
+	LaunchJSON       json.RawMessage        `json:"launch,omitempty"`
+	CloseJSON        json.RawMessage        `json:"close,omitempty"`
+	CloseRequestID   string                 `json:"closeRequestId,omitempty"`
+	ReservationToken string                 `json:"reservationToken,omitempty"`
+	ManualJournal    json.RawMessage        `json:"manualJournal,omitempty"`
+	SessionsChecked  bool                   `json:"sessionsChecked,omitempty"`
+	ReleaseProof     *TeamQueueReleaseProof `json:"releaseProof,omitempty"`
+	Failure          string                 `json:"failure,omitempty"`
+	MemberIndex      int                    `json:"memberIndex,omitempty"`
+	MemberRunID      string                 `json:"memberRunId,omitempty"`
+}
+
+type TeamQueueReleaseProof struct {
+	TaskID       string                   `json:"taskId"`
+	EntryID      string                   `json:"entryId"`
+	ItemID       string                   `json:"itemId"`
+	Host         string                   `json:"host"`
+	LaunchDigest string                   `json:"launchDigest"`
+	Members      []TeamQueueReleaseMember `json:"members"`
+}
+
+type TeamQueueReleaseMember struct {
+	AgentID string `json:"agentId"`
+	RunID   string `json:"runId"`
+	Name    string `json:"name"`
 }
 
 func (c *Client) ListTeamQueue(ctx context.Context, task string) (TeamQueueList, error) {

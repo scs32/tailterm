@@ -271,18 +271,24 @@ func (s *Store) UpdateTask(ctx context.Context, id string, req api.UpdateTaskReq
 		if *req.Orchestrator != "" && *req.Orchestrator != t.Orchestrator {
 			var token string
 			var entryID string
+			var reservedItem, reservationState string
 			var generation int64
-			err := s.db.QueryRowContext(ctx, `SELECT token,pause_generation,entry_id FROM team_launch_reservations WHERE task_id=?`, id).Scan(&token, &generation, &entryID)
+			err := s.db.QueryRowContext(ctx, `SELECT token,pause_generation,entry_id,item_id,state FROM team_launch_reservations WHERE task_id=?`, id).Scan(&token, &generation, &entryID, &reservedItem, &reservationState)
 			if err != nil && !errors.Is(err, sql.ErrNoRows) {
 				return t, err
 			}
 			allowSameItemLead := false
-			if err == nil && entryID != "" && generation == t.PauseGeneration && req.TeamLaunchToken == "" {
-				var itemID, state string
-				if scanErr := s.db.QueryRowContext(ctx, `SELECT item_id,state FROM team_queue_entries WHERE task_id=? AND id=?`, id, entryID).Scan(&itemID, &state); scanErr != nil {
-					return t, scanErr
+			if err == nil && generation == t.PauseGeneration && req.TeamLaunchToken == "" {
+				itemID := reservedItem
+				eligible := entryID == "" && reservationState == "launching"
+				if entryID != "" {
+					var state string
+					if scanErr := s.db.QueryRowContext(ctx, `SELECT item_id,state FROM team_queue_entries WHERE task_id=? AND id=?`, id, entryID).Scan(&itemID, &state); scanErr != nil {
+						return t, scanErr
+					}
+					eligible = state == "running"
 				}
-				if state == "running" {
+				if eligible {
 					var bound int
 					if scanErr := s.db.QueryRowContext(ctx, `SELECT count(*) FROM agents a JOIN agent_work_item_bindings b ON b.agent_id=a.id AND b.run_id=a.run_id WHERE a.task_id=? AND a.name=? COLLATE NOCASE AND a.status NOT IN ('closed','exited','retired') AND b.item_task_id=? AND b.item_id=?`, id, *req.Orchestrator, id, itemID).Scan(&bound); scanErr != nil {
 						return t, scanErr

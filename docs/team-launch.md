@@ -25,9 +25,12 @@ the project stops launch ticks. The deliberate agent Queue is separate.
 
 After inspecting a failed entry, use `release --entry` to clear its reservation
 and let the next queued item run. The failed entry and escalation remain in
-the list with a release timestamp. Release is refused while its team is live,
-cleanup is pending, or an attempted spawn has no exact closed run and cleanup
-receipt. Resolve those conditions first; release never restarts the failed item.
+the list with a release timestamp. Release is refused while its team is live
+or cleanup is pending. For an attempted spawn with no hub registration, run
+`release` on the saved launch host: it locks out a concurrent launch, checks
+that no matching owned session remains, and sends the exact frozen agent and
+run identities for a final hub recheck. If it cannot verify absence, release
+refuses. Release never restarts the failed item.
 If a manual launch stops, `abandon --item --order` releases its exact reservation
 with a retry receipt. After lead selection, first clear the lead and resolve
 every member through the saved journal: registered runs need close and cleanup

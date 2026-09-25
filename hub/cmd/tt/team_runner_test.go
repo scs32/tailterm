@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -10,6 +11,7 @@ import (
 	"testing"
 
 	"github.com/scs32/tailterm/hub/internal/api"
+	"github.com/scs32/tailterm/hub/internal/spawn"
 )
 
 func TestTeamRunnerTwoItemsWithFakeSpawnsAndCleanup(t *testing.T) {
@@ -434,10 +436,37 @@ func TestTeamRunnerWaitsForCloseObligationAndRefreshesSnapshot(t *testing.T) {
 				t.Fatal(err)
 			}
 			q, err = f.c.GetTeamQueueEntry(ctx, f.task.ID, q.ID)
-			if err != nil || q.State != "running" || len(q.CloseJSON) != 0 || q.EscalationSeq != 0 {
+			if err != nil || q.State != "running" || (len(q.CloseJSON) == 0) != changedSnapshot || q.EscalationSeq != 0 {
 				t.Fatalf("waiting queue %+v %v", q, err)
 			}
 			if !changedSnapshot {
+				waitingRevision := q.Revision
+				waitingClose := string(q.CloseJSON)
+				db, err := sql.Open("sqlite", f.dbPath)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer db.Close()
+				var receiptsBefore int
+				if err := db.QueryRow(`SELECT count(*) FROM team_queue_requests WHERE task_id=?`, f.task.ID).Scan(&receiptsBefore); err != nil {
+					t.Fatal(err)
+				}
+				for i := 0; i < 12; i++ {
+					if err := r.tick(ctx, f.e, f.c, "fixture"); err != nil {
+						t.Fatal(err)
+					}
+					q, err = f.c.GetTeamQueueEntry(ctx, f.task.ID, q.ID)
+					if err != nil || q.Revision != waitingRevision || string(q.CloseJSON) != waitingClose || q.EscalationSeq != 0 {
+						t.Fatalf("waiting tick %d changed frozen receipt %+v %v", i, q, err)
+					}
+				}
+				var receiptsAfter int
+				if err := db.QueryRow(`SELECT count(*) FROM team_queue_requests WHERE task_id=?`, f.task.ID).Scan(&receiptsAfter); err != nil {
+					t.Fatal(err)
+				}
+				if receiptsAfter != receiptsBefore {
+					t.Fatalf("waiting gate wrote %d extra queue receipts", receiptsAfter-receiptsBefore)
+				}
 				if _, err := f.c.CancelObligation(ctx, f.task.ID, obligationID, api.ObligationCancelRequest{Reason: "fixture resolved", RequestID: "cancel"}); err != nil {
 					t.Fatal(err)
 				}
@@ -500,5 +529,72 @@ func TestTeamRunnerSameItemLeadReplacementKeepsReservation(t *testing.T) {
 	q, err = f.c.GetTeamQueueEntry(ctx, f.task.ID, q.ID)
 	if err != nil || q.State != "finished" {
 		t.Fatalf("finished after replacement %+v %v", q, err)
+	}
+}
+
+func TestTeamRunnerUnregisteredCrashReleaseRequiresSynchronizedHostProof(t *testing.T) {
+	f := newTeamFixture(t, true)
+	ctx := context.Background()
+	host := spawn.Host()
+	q, err := f.c.TeamQueueAction(ctx, f.task.ID, api.TeamQueueRequest{RequestID: "add", Operation: "add", ItemID: f.item.ID, OrderMessageSeq: f.order, Host: host, Cwd: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := queueCorrectionRunner(t, f, 1)
+	spawns := 0
+	r.spawn = func(env, []string) error { spawns++; panic("test crash before registration") }
+	func() {
+		defer func() {
+			if recover() == nil {
+				t.Error("crash did not occur")
+			}
+		}()
+		_ = r.tick(ctx, f.e, f.c, host)
+	}()
+	if err := r.tick(ctx, f.e, f.c, host); err == nil {
+		t.Fatal("uncertain effect did not fail closed")
+	}
+	q, err = f.c.GetTeamQueueEntry(ctx, f.task.ID, q.ID)
+	if err != nil || q.State != "failed" || spawns != 1 {
+		t.Fatalf("failed exact attempt %+v spawns=%d err=%v", q, spawns, err)
+	}
+	var frozen teamLaunchJournal
+	if err := json.Unmarshal(q.LaunchJSON, &frozen); err != nil || len(frozen.Members) != 1 {
+		t.Fatalf("frozen uncertain attempt %+v %v", frozen, err)
+	}
+	empty := ""
+	if _, err := f.c.UpdateTask(ctx, f.task.ID, api.UpdateTaskRequest{Orchestrator: &empty}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.c.TeamQueueAction(ctx, f.task.ID, api.TeamQueueRequest{RequestID: "no-proof", Operation: "release", EntryID: q.ID, ExpectedRevision: q.Revision}); err == nil {
+		t.Fatal("missing proof released uncertain spawn")
+	}
+	lock, err := queueLaunchLock(f.e.hub, f.task.ID, q.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := captureCLIOutput(t, func() error { return cmdTeamQueue(f.e, []string{"release", "--entry", q.ID}) }); err == nil {
+		t.Fatal("active host launch lock allowed release")
+	}
+	unlockQueueLaunch(lock)
+	name := frozen.Members[0].Fields.Name
+	if _, err := startupTmux(ctx, "new-session", "-d", "-s", name); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := captureCLIOutput(t, func() error { return cmdTeamQueue(f.e, []string{"release", "--entry", q.ID}) }); err == nil {
+		t.Fatal("name-conflicting local session allowed release")
+	}
+	if _, err := startupTmux(ctx, "kill-session", "-t", name); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := captureCLIOutput(t, func() error { return cmdTeamQueue(f.e, []string{"release", "--entry", q.ID}) }); err != nil {
+		t.Fatalf("verified absent session release: %v", err)
+	}
+	if _, err := captureCLIOutput(t, func() error { return cmdTeamQueue(f.e, []string{"release", "--entry", q.ID}) }); err != nil {
+		t.Fatalf("release receipt retry: %v", err)
+	}
+	q, err = f.c.GetTeamQueueEntry(ctx, f.task.ID, q.ID)
+	if err != nil || q.ReleasedAt == "" || q.State != "failed" || spawns != 1 {
+		t.Fatalf("released history %+v spawns=%d err=%v", q, spawns, err)
 	}
 }

@@ -2,6 +2,8 @@ package store
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"path/filepath"
@@ -307,6 +309,28 @@ func TestTeamQueueReleaseRejectsUncertainRunAndUnsafeProject(t *testing.T) {
 	if _, err := s.TeamQueueAction(ctx, task.ID, api.TeamQueueRequest{RequestID: "release-uncertain", Operation: "release", EntryID: q.ID, ExpectedRevision: q.Revision}); err == nil {
 		t.Fatal("unresolved uncertain spawn released")
 	}
+	var frozen struct {
+		Members []struct {
+			Fields struct {
+				AgentID string `json:"agentId"`
+				Name    string `json:"name"`
+			} `json:"fields"`
+			RunID string `json:"runId"`
+		} `json:"members"`
+	}
+	if err := json.Unmarshal(q.LaunchJSON, &frozen); err != nil {
+		t.Fatal(err)
+	}
+	digest := sha256.Sum256(q.LaunchJSON)
+	proof := &api.TeamQueueReleaseProof{TaskID: task.ID, EntryID: q.ID, ItemID: items[0].ID, Host: "mini", LaunchDigest: hex.EncodeToString(digest[:]), Members: []api.TeamQueueReleaseMember{{AgentID: frozen.Members[0].Fields.AgentID, RunID: api.NewID("run"), Name: frozen.Members[0].Fields.Name}}}
+	if _, err := s.TeamQueueAction(ctx, task.ID, api.TeamQueueRequest{RequestID: "wrong-run-proof", Operation: "release", EntryID: q.ID, ExpectedRevision: q.Revision, Host: "mini", SessionsChecked: true, ReleaseProof: proof}); err == nil {
+		t.Fatal("wrong saved run proof released")
+	}
+	proof.Members[0].RunID = frozen.Members[0].RunID
+	proof.LaunchDigest = "wrong"
+	if _, err := s.TeamQueueAction(ctx, task.ID, api.TeamQueueRequest{RequestID: "wrong-digest-proof", Operation: "release", EntryID: q.ID, ExpectedRevision: q.Revision, Host: "mini", SessionsChecked: true, ReleaseProof: proof}); err == nil {
+		t.Fatal("stale frozen plan proof released")
+	}
 	if _, err := s.db.Exec(`UPDATE tasks SET orchestrator='someone' WHERE id=?`, task.ID); err != nil {
 		t.Fatal(err)
 	}
@@ -408,5 +432,46 @@ func TestTeamQueueReleaseWaitsForRegisteredRunCleanup(t *testing.T) {
 	}
 	if _, err := s.TeamQueueAction(ctx, task.ID, release); err != nil {
 		t.Fatalf("cleaned run release: %v", err)
+	}
+}
+
+func TestManualReservationSameItemLeadReplacementKeepsSafety(t *testing.T) {
+	s, task, items, orders := queueFixture(t)
+	ctx := context.Background()
+	by := api.Caller{Node: "fixture", User: "owner"}
+	add := func(name string, i int) api.Agent {
+		ref := api.MessageReference{TaskID: task.ID, Seq: orders[i].Seq}
+		bundle := syntheticPreparedContext(t, items[i], ref, syntheticHistory(items[i], orders[i]))
+		a, err := s.AddAgent(ctx, task.ID, api.AddAgentRequest{Name: name, Host: "mini", Session: name, Runtime: "codex", WorkItem: &api.AgentWorkItemRequest{ItemTaskID: task.ID, ItemID: items[i].ID, ItemRevision: items[i].Revision, WorkOrderMessage: ref, ContextBundle: bundle}}, by)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return a
+	}
+	wrong := add("wrong-item", 1)
+	token := fmt.Sprintf("manual-%s-%s-%d", task.ID, items[0].ID, orders[0].Seq)
+	if _, err := s.TeamQueueAction(ctx, task.ID, api.TeamQueueRequest{RequestID: token, Operation: "manual", ItemID: items[0].ID, OrderMessageSeq: orders[0].Seq, PauseGeneration: 0}); err != nil {
+		t.Fatal(err)
+	}
+	lead := "manual-lead"
+	if _, err := s.UpdateTask(ctx, task.ID, api.UpdateTaskRequest{Orchestrator: &lead, TeamLaunchToken: token}, by); err != nil {
+		t.Fatal(err)
+	}
+	add(lead, 0)
+	second := add("manual-replacement", 0)
+	if _, err := s.UpdateTask(ctx, task.ID, api.UpdateTaskRequest{Orchestrator: &second.Name}, by); err != nil {
+		t.Fatalf("same-item manual replacement: %v", err)
+	}
+	if _, err := s.UpdateTask(ctx, task.ID, api.UpdateTaskRequest{Orchestrator: &wrong.Name}, by); err == nil {
+		t.Fatal("wrong-item manual replacement accepted")
+	}
+	if _, err := s.TeamQueueAction(ctx, task.ID, api.TeamQueueRequest{RequestID: "second-manual", Operation: "manual", ItemID: items[1].ID, OrderMessageSeq: orders[1].Seq, PauseGeneration: 0}); err == nil {
+		t.Fatal("duplicate manual launch accepted")
+	}
+	if _, err := s.db.Exec(`UPDATE tasks SET pause_generation=pause_generation+1 WHERE id=?`, task.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.UpdateTask(ctx, task.ID, api.UpdateTaskRequest{Orchestrator: &lead}, by); err == nil {
+		t.Fatal("stale pause-generation replacement accepted")
 	}
 }

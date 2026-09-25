@@ -1,7 +1,9 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -110,6 +112,64 @@ func cmdTeamQueue(e env, args []string) error {
 		req.EntryID, req.ExpectedRevision, req.BeforeID = q.ID, q.Revision, *before
 		if sub == "release" {
 			req.RequestID = "queue-release-" + q.ID
+			var journal teamLaunchJournal
+			if len(q.LaunchJSON) > 0 && json.Unmarshal(q.LaunchJSON, &journal) != nil {
+				return errors.New("failed queue launch journal is invalid")
+			}
+			uncertain := false
+			for _, m := range journal.Members {
+				if m.State == "uncertain" {
+					uncertain = true
+				}
+			}
+			if uncertain {
+				if q.Host != spawn.Host() {
+					return errors.New("uncertain queue release must run on the saved launch host")
+				}
+				lock, lockErr := queueLaunchLock(*hub, *task, q.ID)
+				if lockErr != nil {
+					return lockErr
+				}
+				defer unlockQueueLaunch(lock)
+				fresh, fetchErr := c.GetTeamQueueEntry(ctx, *task, q.ID)
+				if fetchErr != nil {
+					return fetchErr
+				}
+				if fresh.Revision != q.Revision || fresh.State != q.State || !bytes.Equal(fresh.LaunchJSON, q.LaunchJSON) {
+					return errors.New("queue entry changed while acquiring the host launch lock")
+				}
+				sessions, sessionErr := localSessions(ctx)
+				if sessionErr != nil {
+					return sessionErr
+				}
+				proof := &api.TeamQueueReleaseProof{TaskID: *task, EntryID: q.ID, ItemID: q.ItemID, Host: q.Host}
+				digest := sha256.Sum256(q.LaunchJSON)
+				proof.LaunchDigest = hex.EncodeToString(digest[:])
+				for _, member := range journal.Members {
+					if member.State != "uncertain" {
+						continue
+					}
+					for _, session := range sessions {
+						if (session.Hub == *hub && session.Task == *task && session.Agent == member.Fields.AgentID) || session.Name == member.Fields.Name {
+							return fmt.Errorf("uncertain member %s still has an owned or name-conflicting session", member.Fields.AgentID)
+						}
+					}
+					_, agentErr := c.GetAgent(ctx, *task, member.Fields.AgentID)
+					if agentErr == nil {
+						continue
+					}
+					var response *api.HTTPError
+					if !errors.As(agentErr, &response) || response.Status != 404 {
+						return agentErr
+					}
+					proof.Members = append(proof.Members, api.TeamQueueReleaseMember{AgentID: member.Fields.AgentID, RunID: member.RunID, Name: member.Fields.Name})
+				}
+				if len(proof.Members) > 0 {
+					req.ReleaseProof = proof
+					req.SessionsChecked = true
+					req.Host = q.Host
+				}
+			}
 		}
 	case "abandon":
 		if !api.ValidID(*item, "wi") || *order < 1 {

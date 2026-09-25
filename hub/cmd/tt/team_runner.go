@@ -7,7 +7,10 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strconv"
+	"strings"
+	"syscall"
 	"time"
 
 	"github.com/scs32/tailterm/hub/internal/api"
@@ -23,6 +26,29 @@ type teamRunner struct {
 	spawn   func(env, []string) error
 	owned   func(context.Context, env, api.Agent) error
 	cleanup func(context.Context, env, string, string) error
+}
+
+// The runner and the owner's release command share this host lock. A dead
+// process releases the flock; all durable decisions remain on the hub.
+func queueLaunchLock(hub, task, entry string) (*os.File, error) {
+	if err := os.MkdirAll(relayDir(), 0700); err != nil {
+		return nil, err
+	}
+	sum := sha256.Sum256([]byte(strings.TrimRight(hub, "/") + "\x00" + task + "\x00" + entry))
+	file, err := os.OpenFile(filepath.Join(relayDir(), fmt.Sprintf("queue-launch-%x.lock", sum[:12])), os.O_CREATE|os.O_RDWR, 0600)
+	if err != nil {
+		return nil, err
+	}
+	if err := syscall.Flock(int(file.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		file.Close()
+		return nil, fmt.Errorf("queue launch is active on this host: %w", err)
+	}
+	return file, nil
+}
+
+func unlockQueueLaunch(file *os.File) {
+	_ = syscall.Flock(int(file.Fd()), syscall.LOCK_UN)
+	_ = file.Close()
 }
 
 func productionTeamRunner() teamRunner {
@@ -158,6 +184,11 @@ func (r teamRunner) verifyMember(ctx context.Context, e env, c *api.Client, q ap
 }
 
 func (r teamRunner) launch(ctx context.Context, e env, c *api.Client, q api.TeamQueueEntry, host string) error {
+	lock, lockErr := queueLaunchLock(e.hub, q.TaskID, q.ID)
+	if lockErr != nil {
+		return lockErr
+	}
+	defer unlockQueueLaunch(lock)
 	detail, err := c.GetTask(ctx, q.TaskID)
 	if err != nil {
 		return err
@@ -394,7 +425,12 @@ func (r teamRunner) finish(ctx context.Context, e env, c *api.Client, q api.Team
 		result, err = c.CloseItemTeam(ctx, q.TaskID, closeReq)
 		if err != nil {
 			var response *api.HTTPError
-			if errors.As(err, &response) && response.Status == 409 && (response.Code == "team-close-obligations" || response.Code == "team-close-snapshot") {
+			if errors.As(err, &response) && response.Status == 409 && response.Code == "team-close-obligations" {
+				// Nothing in the frozen team snapshot changed. Keep its exact
+				// request identity and wait without another hub write.
+				return nil
+			}
+			if errors.As(err, &response) && response.Status == 409 && response.Code == "team-close-snapshot" {
 				_, refreshErr := c.TeamQueueAction(ctx, q.TaskID, api.TeamQueueRequest{RequestID: fmt.Sprintf("queue-close-refresh-%s-%d", q.ID, q.Revision), Operation: "close_refresh", EntryID: q.ID, ExpectedRevision: q.Revision, CloseRequestID: closeReq.RequestID})
 				return refreshErr
 			}

@@ -50,12 +50,14 @@ func validTeamQueueID(id string) bool {
 
 // Releasing a reservation is an explicit owner action. Every known run of the
 // item must have a durable close and cleanup receipt. An attempted spawn with
-// no exact registration stays unresolved and cannot be released by guessing.
-func queueReleaseSafe(ctx context.Context, tx *sql.Tx, task, item string, launch json.RawMessage) error {
+// no registration needs exact frozen identity and synchronized host absence
+// proof; the hub rechecks that the agent is still absent in this transaction.
+func queueReleaseSafe(ctx context.Context, tx *sql.Tx, task, item, entry, host string, launch json.RawMessage, proof *api.TeamQueueReleaseProof) error {
 	var plan struct {
 		Members []struct {
 			Fields struct {
 				AgentID string `json:"agentId"`
+				Name    string `json:"name"`
 			} `json:"fields"`
 			State string `json:"state"`
 			RunID string `json:"runId"`
@@ -64,6 +66,19 @@ func queueReleaseSafe(ctx context.Context, tx *sql.Tx, task, item string, launch
 	if len(launch) != 0 && json.Unmarshal(launch, &plan) != nil {
 		return api.ErrConflict
 	}
+	unresolved := map[string]api.TeamQueueReleaseMember{}
+	if proof != nil {
+		digest := sha256.Sum256(launch)
+		if entry == "" || proof.TaskID != task || proof.EntryID != entry || proof.ItemID != item || proof.Host != host || proof.LaunchDigest != hex.EncodeToString(digest[:]) {
+			return fmt.Errorf("%w: queue release proof identity differs from frozen launch", api.ErrConflict)
+		}
+		for _, p := range proof.Members {
+			if !api.ValidID(p.AgentID, "agt") || !validRunID(p.RunID) || p.Name == "" || unresolved[p.AgentID].AgentID != "" {
+				return api.ErrInvalid
+			}
+			unresolved[p.AgentID] = p
+		}
+	}
 	for _, m := range plan.Members {
 		if m.State == "unstarted" {
 			continue
@@ -71,12 +86,23 @@ func queueReleaseSafe(ctx context.Context, tx *sql.Tx, task, item string, launch
 		if m.State != "started" && m.State != "uncertain" {
 			return api.ErrConflict
 		}
-		var status string
+		var actualRun, status string
 		var cleanup bool
-		err := tx.QueryRowContext(ctx, `SELECT status,cleanup_done FROM agents WHERE task_id=? AND id=? AND run_id=?`, task, m.Fields.AgentID, m.RunID).Scan(&status, &cleanup)
-		if err != nil || status != api.AgentClosed || !cleanup {
+		err := tx.QueryRowContext(ctx, `SELECT run_id,status,cleanup_done FROM agents WHERE task_id=? AND id=?`, task, m.Fields.AgentID).Scan(&actualRun, &status, &cleanup)
+		if errors.Is(err, sql.ErrNoRows) && m.State == "uncertain" {
+			p, ok := unresolved[m.Fields.AgentID]
+			if !ok || p.RunID != m.RunID || p.Name != m.Fields.Name {
+				return fmt.Errorf("%w: uncertain spawn lacks exact synchronized host absence proof", api.ErrConflict)
+			}
+			delete(unresolved, m.Fields.AgentID)
+			continue
+		}
+		if err != nil || actualRun != m.RunID || status != api.AgentClosed || !cleanup {
 			return fmt.Errorf("%w: attempted spawn lacks exact close and cleanup receipts", api.ErrConflict)
 		}
+	}
+	if len(unresolved) != 0 {
+		return fmt.Errorf("%w: release proof names an unexpected attempted run", api.ErrConflict)
 	}
 	rows, err := tx.QueryContext(ctx, `SELECT a.status,a.cleanup_done FROM agent_work_item_bindings b JOIN agents a ON a.id=b.agent_id AND a.run_id=b.run_id WHERE b.item_task_id=? AND b.item_id=?`, task, item)
 	if err != nil {
@@ -287,7 +313,7 @@ func (s *Store) TeamQueueAction(ctx context.Context, task string, req api.TeamQu
 				}
 			}
 		}
-		if err := queueReleaseSafe(ctx, tx, task, req.ItemID, nil); err != nil {
+		if err := queueReleaseSafe(ctx, tx, task, req.ItemID, "", "", nil, nil); err != nil {
 			return zero, err
 		}
 		if _, err = tx.ExecContext(ctx, `DELETE FROM team_launch_reservations WHERE task_id=? AND item_id=? AND token=? AND entry_id=''`, task, req.ItemID, token); err != nil {
@@ -370,7 +396,10 @@ func (s *Store) TeamQueueAction(ctx context.Context, task string, req api.TeamQu
 			if e.State != "failed" || e.ReleasedAt != "" || t.Orchestrator != "" || t.CleanupPending != 0 {
 				return zero, api.ErrConflict
 			}
-			if err := queueReleaseSafe(ctx, tx, task, e.ItemID, e.LaunchJSON); err != nil {
+			if req.ReleaseProof != nil && (!req.SessionsChecked || req.Host != e.Host) {
+				return zero, fmt.Errorf("%w: saved launch host proof is required", api.ErrConflict)
+			}
+			if err := queueReleaseSafe(ctx, tx, task, e.ItemID, e.ID, e.Host, e.LaunchJSON, req.ReleaseProof); err != nil {
 				return zero, err
 			}
 			var reservedEntry string

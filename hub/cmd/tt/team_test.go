@@ -21,6 +21,7 @@ import (
 
 type teamFixture struct {
 	st                   *store.Store
+	dbPath               string
 	e                    env
 	c                    *api.Client
 	task                 api.Task
@@ -35,13 +36,14 @@ func newTeamFixture(t *testing.T, withHandler bool) teamFixture {
 	t.Setenv("HOME", t.TempDir())
 	t.Setenv("TAILTERM_RELAY_STATE", t.TempDir())
 	t.Setenv("TT_TMUX_SOCKET", "tt-team-"+strings.TrimPrefix(api.NewID("agt"), "agt_"))
-	st, err := store.Open(filepath.Join(t.TempDir(), "hub.sqlite"))
+	dbPath := filepath.Join(t.TempDir(), "hub.sqlite")
+	st, err := store.Open(dbPath)
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { st.Close() })
 	by := api.Caller{Node: "team-fixture", User: "owner"}
-	f := teamFixture{dropFirstMemberReply: &atomic.Bool{}}
+	f := teamFixture{dropFirstMemberReply: &atomic.Bool{}, dbPath: dbPath}
 	f.st = st
 	handler := server.New(st, func(*http.Request) (api.Caller, error) { return by, nil })
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
