@@ -33,6 +33,24 @@ type teamRunner struct {
 }
 
 var teamQueueProjectCursor atomic.Uint64
+var teamHostBudgetLastLog atomic.Int64
+
+func reportTeamHostBudget(err error, now time.Time) {
+	if err == nil {
+		return
+	}
+	stamp := now.Unix()
+	for {
+		prior := teamHostBudgetLastLog.Load()
+		if stamp-prior < 60 {
+			return
+		}
+		if teamHostBudgetLastLog.CompareAndSwap(prior, stamp) {
+			fmt.Fprintf(os.Stderr, "[tt relay] parallel queue held: %v\n", err)
+			return
+		}
+	}
+}
 
 func rotateQueueProjects(projects []string, start int) []string {
 	if len(projects) < 2 {
@@ -104,16 +122,15 @@ func (r teamRunner) tick(ctx context.Context, e env, c *api.Client, host string)
 	if err != nil {
 		return err
 	}
+	var hostBudgetErr error
 	if list.HostPolicy != nil && len(list.Entries) > 0 && r.census != nil {
 		domain, domainErr := canonicalLimiterDomain(c.Base)
 		if domainErr != nil || domain != list.HostPolicy.LimiterDomain {
-			return errors.New("host policy limiter domain differs from relay hub")
-		}
-		// A stale policy blocks new effects in the store, while exact close and
-		// cleanup still advance under the last configured relay budget.
-		_ = activeRelayBudget.configure(list.HostPolicy, time.Now())
-		if err := r.census(ctx, c, list.Entries[0].TaskID, host, list.HostPolicy.LimiterDomain, list.HostPolicy.Version, list.HostUsage); err != nil {
-			return err
+			hostBudgetErr = errors.New("host policy limiter domain differs from relay hub")
+		} else if err := activeRelayBudget.configure(list.HostPolicy, time.Now()); err != nil {
+			hostBudgetErr = err
+		} else if err := r.census(ctx, c, list.Entries[0].TaskID, host, list.HostPolicy.LimiterDomain, list.HostPolicy.Version, list.HostUsage); err != nil {
+			hostBudgetErr = fmt.Errorf("host relay binding census: %w", err)
 		}
 	}
 	seen := map[string]bool{}
@@ -139,6 +156,12 @@ func (r teamRunner) tick(ctx context.Context, e env, c *api.Client, host string)
 			if q.Host != host {
 				continue
 			}
+			// An unsafe host observation cannot start or continue a parallel
+			// launch. Serial teams and already-running parallel teams still
+			// advance through their own close and cleanup paths.
+			if queue.ConcurrencyLimit > 1 && (hostBudgetErr != nil || list.HostPolicy == nil) && (q.State == "queued" || q.State == "launching") {
+				continue
+			}
 			if q.State == "failed" && q.ReleasedAt == "" && queue.ConcurrencyLimit == 1 {
 				break
 			}
@@ -152,6 +175,12 @@ func (r teamRunner) tick(ctx context.Context, e env, c *api.Client, host string)
 				break
 			}
 		}
+	}
+	if r.roundRobin {
+		// A host census fault is local to new parallel launch effects. Returning
+		// it would activate the relay's global queue backoff and delay serial
+		// projects even though their own progress was safe.
+		reportTeamHostBudget(hostBudgetErr, time.Now())
 	}
 	return errors.Join(projectErrors...)
 }

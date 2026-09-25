@@ -327,9 +327,18 @@ func (s *Store) ListTeamQueue(ctx context.Context, task string) (api.TeamQueueLi
 		return out, err
 	}
 	activeCount := 0
-	for _, entry := range out.Entries {
+	for i, entry := range out.Entries {
 		if entry.State == "launching" || entry.State == "running" || (entry.State == "failed" && entry.ReleasedAt == "") {
 			activeCount++
+		}
+		if entry.State == "running" && entry.Repository != "" && entry.Acceptance == nil {
+			var status string
+			if err := s.db.QueryRowContext(ctx, `SELECT status FROM work_items WHERE task_id=? AND id=?`, task, entry.ItemID).Scan(&status); err != nil {
+				return out, err
+			}
+			if status == "done" {
+				out.Entries[i].BlockReason = "Waiting for handler acceptance"
+			}
 		}
 	}
 	var capacityTx *sql.Tx

@@ -49,9 +49,12 @@ try {
       assert.equal(await page.locator('[data-testid="team-delivery-panel"] button').count(), 0);
       await page.evaluate(() => {
         fixture.queue.entries[2].state = "running";
+        fixture.queue.entries[2].integration = null;
+        fixture.queue.entries[2].blockReason = "Waiting for handler acceptance";
         fixture.rerender();
       });
       assert.equal(await page.locator('[data-testid="team-ready-to-integrate"]').count(), 0);
+      assert.match(await page.locator('[data-testid="team-delivery-entry"]').nth(2).innerText(), /Waiting for handler acceptance/);
       assert.deepEqual(errors, []);
       await context.close();
       console.log(`${engine.name()}: delivery ownership, blocker, item roles and gated integration receipt rendered`);

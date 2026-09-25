@@ -111,6 +111,20 @@ func TestHandlerAllocationEmittedBriefingContracts(t *testing.T) {
 	}
 }
 
+func TestHandlerQueueAcceptanceInstructionsReachPrimaryAndAuxiliary(t *testing.T) {
+	task := api.Task{ID: "tsk_0000000000000001", Name: "Queued delivery", Status: api.TaskOpen}
+	primary := api.Agent{ID: "agt_0000000000000001", Name: "db-handler", Role: api.AgentRoleDatabaseHandler, Status: api.AgentRunning}
+	auxiliary := api.Agent{ID: "agt_0000000000000002", Name: "aux-handler", Role: api.AgentRoleDatabaseHandler, Status: api.AgentRunning}
+	for _, handler := range []api.Agent{primary, auxiliary} {
+		briefing := agentTaskBriefingForLaunch(task, handler.Name, handler.Role, "tt", []api.Agent{primary, auxiliary}, 0)
+		for _, required := range []string{"After saving terminal acceptance", "tt team queue accept", "--entry", "--worktree", "--branch", "--commit", "--evidence", "exact leased handler", "Ready to integrate"} {
+			if !strings.Contains(briefing, required) {
+				t.Errorf("%s missing %q", handler.Name, required)
+			}
+		}
+	}
+}
+
 func TestHandlerAllocationContinuationGuidanceAcrossWorkerStates(t *testing.T) {
 	task := api.Task{ID: "tsk_0000000000000001", Name: "Synthetic continuation", Orchestrator: "lead", AllowAgentSpawn: true, MaxNewAgents: 0}
 	for _, state := range []struct {

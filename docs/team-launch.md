@@ -115,6 +115,14 @@ queue and Projects Delivery panel. The
 owner performs any merge, push or deployment separately. Dismissed items have
 no integration record.
 
+Both primary and auxiliary handler briefings include the exact queue acceptance
+step. A done repository-backed entry without its receipt remains running and
+the queue list and Delivery panel say **Waiting for handler acceptance**. If
+the host census or limiter domain fails, the runner reports that error and
+holds new parallel launch effects while serial projects and already-running
+teams continue their safe close and cleanup paths. The host's capacity checks
+still refuse new parallel work until current matching evidence is available.
+
 After inspecting a failed entry, use `release --entry` to clear its reservation
 and let the next queued item run. The failed entry and escalation remain in
 the list with a release timestamp. Release is refused while its team is live

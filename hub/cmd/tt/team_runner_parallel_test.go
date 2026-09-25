@@ -13,6 +13,89 @@ import (
 	"github.com/scs32/tailterm/hub/internal/api"
 )
 
+func TestParallelRunnerHostEvidenceFailureKeepsSerialProjectMoving(t *testing.T) {
+	for _, failure := range []string{"census", "domain"} {
+		t.Run(failure, func(t *testing.T) {
+			f := newTeamFixture(t, true)
+			ctx := context.Background()
+			parallelTask, err := f.c.CreateTask(ctx, api.CreateTaskRequest{Name: "parallel peer"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			handler, err := f.c.AddAgent(ctx, parallelTask.ID, api.AddAgentRequest{AgentID: api.NewID("agt"), Name: "peer-handler", Role: api.AgentRoleDatabaseHandler, Host: "fixture", Session: "peer-handler", Runtime: "codex"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := f.c.PostEvent(ctx, parallelTask.ID, api.PostEventRequest{AgentID: handler.ID, RunID: handler.RunID, Kind: api.EventRunning}); err != nil {
+				t.Fatal(err)
+			}
+			item, err := f.c.CreateWorkItem(ctx, parallelTask.ID, api.CreateWorkItemRequest{Kind: "feature", Title: "peer delivery", RequestID: "peer-item"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			order, err := f.c.PostMessage(ctx, parallelTask.ID, api.PostMessageRequest{Text: "bounded peer order", RequestID: "peer-order", WorkItems: []api.MessageWorkItem{{ItemTaskID: parallelTask.ID, ItemID: item.ID, ItemRevision: item.Revision, Relationship: "primary"}}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := f.c.ConfirmWorkOrderScope(ctx, parallelTask.ID, item.ID, api.ConfirmWorkOrderScopeRequest{RequestID: "peer-scope", AgentID: handler.ID, RunID: handler.RunID, ExpectedRevision: item.Revision, ScopeRevision: item.ScopeRevision, OrderMessageSeq: order.Seq, Complete: true}); err != nil {
+				t.Fatal(err)
+			}
+			domain, err := canonicalLimiterDomain(f.c.Base)
+			if err != nil {
+				t.Fatal(err)
+			}
+			policy := api.TeamQueueRequest{RequestID: "peer-policy", Operation: "set_host_policy", Host: "fixture", HostPolicyVersion: 1, HostPolicyExpires: time.Now().Add(time.Hour).Format(time.RFC3339), HostMaxSessions: 100, HostMaxPolling: 10, LimiterDomain: domain, HostMaxRelayBindings: 100, HostMaxRequestsPerMinute: 100000, HostMaxBurst: 10000, HostHeadroomPercent: 20}
+			if _, err := f.c.TeamQueueAction(ctx, parallelTask.ID, policy); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := f.c.TeamQueueAction(ctx, parallelTask.ID, api.TeamQueueRequest{RequestID: "peer-usage", Operation: "observe_host", Host: "fixture", HostUsage: &api.TeamHostUsage{Host: "fixture", LimiterDomain: domain, PolicyVersion: 1, ObservedAt: time.Now().UTC().Format(time.RFC3339Nano), RelayBindings: 2, Complete: true, SourceDigest: strings.Repeat("a", 64)}}); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := f.c.TeamQueueAction(ctx, parallelTask.ID, api.TeamQueueRequest{RequestID: "peer-limit", Operation: "set_limit", Host: "fixture", ConcurrencyLimit: 2}); err != nil {
+				t.Fatal(err)
+			}
+			serial, err := f.c.TeamQueueAction(ctx, f.task.ID, api.TeamQueueRequest{RequestID: "serial-add", Operation: "add", ItemID: f.item.ID, OrderMessageSeq: f.order, Host: "fixture", Cwd: t.TempDir()})
+			if err != nil {
+				t.Fatal(err)
+			}
+			parallel, err := f.c.TeamQueueAction(ctx, parallelTask.ID, api.TeamQueueRequest{RequestID: "peer-add", Operation: "add", ItemID: item.ID, OrderMessageSeq: order.Seq, Host: "fixture", Cwd: t.TempDir(), Repository: "fixture-repo", BaseCommit: strings.Repeat("a", 40), Ownership: []string{"src/peer"}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			runner := queueCorrectionRunner(t, f, 1)
+			if failure == "census" {
+				runner.census = func(ctx context.Context, c *api.Client, task, host, domain string, version int64, _ *api.TeamHostUsage) error {
+					_, err := c.TeamQueueAction(ctx, task, api.TeamQueueRequest{RequestID: "future-census", Operation: "observe_host", Host: host, HostUsage: &api.TeamHostUsage{Host: host, LimiterDomain: domain, PolicyVersion: version, ObservedAt: time.Now().UTC().Add(7 * time.Second).Format(time.RFC3339Nano), RelayBindings: 2, Complete: true, SourceDigest: strings.Repeat("b", 64)}})
+					if err == nil {
+						t.Fatal("test hub accepted a clock-skewed census")
+					}
+					return err
+				}
+			} else {
+				policy.RequestID, policy.HostPolicyVersion, policy.LimiterDomain = "peer-policy-mismatch", 2, "https://other.invalid"
+				if _, err := f.c.TeamQueueAction(ctx, parallelTask.ID, policy); err != nil {
+					t.Fatal(err)
+				}
+				runner.census = func(context.Context, *api.Client, string, string, string, int64, *api.TeamHostUsage) error {
+					t.Fatal("mismatched domain reached census")
+					return nil
+				}
+			}
+			if err := runner.tick(ctx, f.e, f.c, "fixture"); err != nil {
+				t.Fatalf("host evidence failure reached global queue backoff: %v", err)
+			}
+			serial, err = f.c.GetTeamQueueEntry(ctx, f.task.ID, serial.ID)
+			if err != nil || serial.State != "running" {
+				t.Fatalf("unrelated serial project did not advance: %+v %v", serial, err)
+			}
+			parallel, err = f.c.GetTeamQueueEntry(ctx, parallelTask.ID, parallel.ID)
+			if err != nil || parallel.State != "queued" {
+				t.Fatalf("unsafe parallel launch advanced: %+v %v", parallel, err)
+			}
+		})
+	}
+}
+
 func TestParallelRunnerRotatesProjectPollingOrder(t *testing.T) {
 	projects := []string{"first", "second", "third"}
 	if got := rotateQueueProjects(projects, 1); !reflect.DeepEqual(got, []string{"second", "third", "first"}) {
@@ -205,6 +288,26 @@ func TestTeamRunnerParallelSkipsConflictAndFinishesOtherSlot(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if err := runner.tick(ctx, f.e, f.c, "fixture"); err != nil {
+		t.Fatal(err)
+	}
+	waiting, err := f.c.ListTeamQueue(ctx, f.task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var waitingEntry api.TeamQueueEntry
+	for _, entry := range waiting.Entries {
+		if entry.ID == entries[2].ID {
+			waitingEntry = entry
+		}
+	}
+	if waitingEntry.State != "running" || waitingEntry.BlockReason != "Waiting for handler acceptance" {
+		t.Fatalf("missing acceptance did not visibly hold the slot: %+v", waitingEntry)
+	}
+	queueOutput, err := captureCLIOutput(t, func() error { return cmdTeamQueue(f.e, []string{"list"}) })
+	if err != nil || !strings.Contains(queueOutput, "Waiting for handler acceptance") {
+		t.Fatalf("CLI did not show acceptance wait: %q %v", queueOutput, err)
+	}
 	c, err = f.c.GetTeamQueueEntry(ctx, f.task.ID, entries[2].ID)
 	if err != nil {
 		t.Fatal(err)
@@ -222,8 +325,14 @@ func TestTeamRunnerParallelSkipsConflictAndFinishesOtherSlot(t *testing.T) {
 	if _, err := f.c.TeamQueueAction(ctx, f.task.ID, acceptReq); err == nil {
 		t.Fatal("conflicting accepted SHA reused the receipt identity")
 	}
+	// A policy/domain mismatch must not stop an already-running item's
+	// owner-gated close and integration path.
+	runner.census = func(context.Context, *api.Client, string, string, string, int64, *api.TeamHostUsage) error {
+		t.Fatal("mismatched limiter domain reached census")
+		return nil
+	}
 	if err := runner.tick(ctx, f.e, f.c, "fixture"); err != nil {
-		t.Fatal(err)
+		t.Fatalf("domain mismatch reached global queue backoff: %v", err)
 	}
 	c, err = f.c.GetTeamQueueEntry(ctx, f.task.ID, entries[2].ID)
 	if err != nil || c.State != "finished" || c.Integration == nil || c.Integration.Branch != "feature/item-c" || c.Integration.Commit != strings.Repeat("b", 40) {
