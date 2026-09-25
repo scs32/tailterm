@@ -8,8 +8,10 @@ import (
 )
 
 // handlerRequest is derived from the immutable sender run and native primary
-// item link. It remains true after a team closes, so response history survives
-// closeout. live is deliberately recomputed for scheduling only.
+// item link. A post may cite a newer item revision than the frozen admission
+// binding; item identity and sender run must still match. It remains true after
+// a team closes, so response history survives closeout. live is deliberately
+// recomputed for scheduling only.
 type handlerRequest struct{ live bool }
 
 type handlerPriorityQuerier interface {
@@ -29,7 +31,7 @@ JOIN messages m ON m.task_id=o.task_id AND m.seq=o.message_seq
 JOIN agent_work_item_bindings source ON source.agent_id=m.from_agent AND source.run_id=m.from_run_id
 JOIN message_work_item_links link ON link.message_task_id=m.task_id AND link.message_seq=m.seq
  AND link.relationship='primary' AND link.item_task_id=source.item_task_id
- AND link.item_id=source.item_id AND link.item_revision=source.item_revision
+ AND link.item_id=source.item_id AND link.item_revision>=source.item_revision
 WHERE o.task_id=? AND o.source_kind=? AND o.needs=?`
 	args := []any{api.AgentRunning, api.AgentDone, api.AgentNeedsInput, api.AgentRoleDatabaseHandler,
 		api.AgentRoleDatabaseHandler, taskID, api.EnvelopeKindRequest, api.ObligationNeedsOutcome}

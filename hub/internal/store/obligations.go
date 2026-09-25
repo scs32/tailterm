@@ -357,11 +357,11 @@ func (s *Store) ListObligations(ctx context.Context, taskID string, f Obligation
 		if request, ok := requests[out[i].MessageSeq]; ok {
 			out[i].HandlerRequest = true
 			out[i].HandlerPriority = out[i].State != api.ObligationClosed && request.live
-			if out[i].State != api.ObligationClosed {
-				out[i].PendingAgeMillis = max(0, now.Sub(out[i].CreatedAt).Milliseconds())
-			} else if out[i].ClosedAt != nil && (out[i].Outcome == api.OutcomeResult || out[i].Outcome == api.OutcomeDeclined) {
-				out[i].ResponseMillis = max(0, out[i].ClosedAt.Sub(out[i].CreatedAt).Milliseconds())
-			}
+		}
+		if out[i].State != api.ObligationClosed {
+			out[i].PendingAgeMillis = max(0, now.Sub(out[i].CreatedAt).Milliseconds())
+		} else if out[i].ClosedAt != nil && (out[i].Outcome == api.OutcomeResult || out[i].Outcome == api.OutcomeDeclined) {
+			out[i].ResponseMillis = max(0, out[i].ClosedAt.Sub(out[i].CreatedAt).Milliseconds())
 		}
 	}
 	if f.AgentID != "" {

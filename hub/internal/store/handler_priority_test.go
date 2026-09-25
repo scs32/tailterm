@@ -71,14 +71,27 @@ func (f *handlerPriorityFixture) request(t *testing.T, from api.Agent, linked bo
 }
 
 func (f *handlerPriorityFixture) requestFor(t *testing.T, from api.Agent, linked bool, item api.WorkItem, order api.Message) api.Message {
+	return f.requestForKey(t, from, linked, item, order, api.NewID("req"))
+}
+
+func (f *handlerPriorityFixture) requestForKey(t *testing.T, from api.Agent, linked bool, item api.WorkItem, order api.Message, key string) api.Message {
 	t.Helper()
-	req := api.PostMessageRequest{AgentID: from.ID, RunID: from.RunID, To: f.handler.ID, RequestID: api.NewID("req"),
+	req := api.PostMessageRequest{AgentID: from.ID, RunID: from.RunID, To: f.handler.ID, RequestID: key,
 		Envelope: &api.Envelope{Kind: api.EnvelopeKindRequest, To: f.handler.Name, Subject: "Verify the exact Start", Body: api.EnvelopeBody{Ask: "Check the bound run"}}}
 	if linked {
 		req.WorkItems = []api.MessageWorkItem{{ItemTaskID: item.TaskID, ItemID: item.ID, ItemRevision: item.Revision, Relationship: "primary"}}
 		req.WorkOrderMessage = &api.MessageReference{TaskID: f.task.ID, Seq: order.Seq}
 	}
 	m, err := f.s.PostMessage(f.ctx, f.task.ID, req, f.by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return m
+}
+
+func (f *handlerPriorityFixture) humanIntake(t *testing.T, key string) api.Message {
+	t.Helper()
+	m, err := f.s.PostMessage(f.ctx, f.task.ID, api.PostMessageRequest{To: f.handler.ID, Text: "Owner intake: record a queued-only item", RequestID: key}, f.by)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -99,7 +112,7 @@ func (f *handlerPriorityFixture) result(t *testing.T, source api.Message, at tim
 func TestHandlerPriorityLiveGateBeforeQueuedRecords(t *testing.T) {
 	f := newHandlerPriorityFixture(t)
 	// Source order reproduces the reported problem: queued records first.
-	queued := f.requestFor(t, f.queued, true, f.queuedItem, f.queuedOrder)
+	queued := f.humanIntake(t, "queued-human-intake")
 	if _, err := f.s.db.ExecContext(f.ctx, `UPDATE agents SET status=? WHERE id=?`, api.AgentRetired, f.queued.ID); err != nil {
 		t.Fatal(err)
 	}
@@ -108,7 +121,7 @@ func TestHandlerPriorityLiveGateBeforeQueuedRecords(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(got) != 2 || got[0].MessageSeq != live.Seq || !got[0].HandlerPriority || got[1].MessageSeq != queued.Seq || got[1].HandlerPriority || !got[1].HandlerRequest {
+	if len(got) != 2 || got[0].MessageSeq != live.Seq || !got[0].HandlerPriority || got[1].MessageSeq != queued.Seq || got[1].HandlerPriority || got[1].HandlerRequest || got[1].SourceKind != "human" {
 		t.Fatalf("priority order: %+v", got)
 	}
 	if got[0].PendingAgeMillis != 60000 {
@@ -117,7 +130,7 @@ func TestHandlerPriorityLiveGateBeforeQueuedRecords(t *testing.T) {
 	// A late live request must appear in the first five wake entries even when
 	// more than fifty earlier queued records exist.
 	for i := 0; i < 55; i++ {
-		f.request(t, f.lead, false)
+		f.humanIntake(t, "older-human-intake-"+strconv.Itoa(i))
 	}
 	f.s.now = func() time.Time { return f.now.Add(time.Second) }
 	late := f.request(t, f.builder, true)
@@ -143,6 +156,14 @@ func TestHandlerPriorityLiveGateBeforeQueuedRecords(t *testing.T) {
 	}
 	if all[0].MessageSeq != queued.Seq || all[0].HandlerPriority {
 		t.Fatalf("queued work did not drain after gate results: %+v", all[:2])
+	}
+	queuedResult := f.result(t, queued, f.now.Add(32*time.Second))
+	completed, err := f.s.ListObligations(f.ctx, f.task.ID, ObligationFilter{AgentID: f.handler.ID, FromSeq: queued.Seq, ToSeq: queued.Seq}, f.now.Add(33*time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(completed) != 1 || completed[0].State != api.ObligationClosed || completed[0].OutcomeSeq != queuedResult.Seq || completed[0].ResponseMillis != 32000 {
+		t.Fatalf("queued intake did not receive a result: %+v", completed)
 	}
 	for _, o := range all {
 		if o.MessageSeq == live.Seq && (o.OutcomeSeq != firstResult.Seq || o.ResponseMillis != 30000) {
@@ -235,14 +256,75 @@ func TestHandlerPriorityRequiresExactBoundSourceAndKeepsInboxOrder(t *testing.T)
 	}
 }
 
+// Admission pins revision N while subsequent native gate messages cite the
+// current revision N+1. The item and exact sender run still identify the team.
+func TestHandlerPriorityNewerMessageRevisionKeepsGateFirst(t *testing.T) {
+	f := newHandlerPriorityFixture(t)
+	queued := f.humanIntake(t, "revision-repro-human-intake")
+	gate := f.request(t, f.planner, true)
+	if _, err := f.s.db.ExecContext(f.ctx, `UPDATE message_work_item_links SET item_revision=item_revision+1 WHERE message_seq=?`, gate.Seq); err != nil {
+		t.Fatal(err)
+	}
+	rows, err := f.s.ListObligations(f.ctx, f.task.ID, ObligationFilter{AgentID: f.handler.ID, OpenOnly: true}, f.now.Add(time.Minute))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 2 || rows[0].MessageSeq != gate.Seq || !rows[0].HandlerRequest || !rows[0].HandlerPriority || rows[1].MessageSeq != queued.Seq {
+		t.Fatalf("revision N+1 gate lost priority: %+v", rows)
+	}
+}
+
+func TestHandlerPriorityRetryAndRetirementKeepResponseIdentity(t *testing.T) {
+	f := newHandlerPriorityFixture(t)
+	key := "same-handler-gate-request"
+	gate := f.requestForKey(t, f.planner, true, f.item, f.order, key)
+	if replay := f.requestForKey(t, f.planner, true, f.item, f.order, key); replay.Seq != gate.Seq {
+		t.Fatalf("retry created message #%d, want #%d", replay.Seq, gate.Seq)
+	}
+	result := f.result(t, gate, f.now.Add(30*time.Second))
+	if replay := f.requestForKey(t, f.planner, true, f.item, f.order, key); replay.Seq != gate.Seq {
+		t.Fatalf("post-outcome retry created message #%d", replay.Seq)
+	}
+	open := f.request(t, f.builder, true)
+	check := func(wantPriority bool) {
+		rows, err := f.s.ListObligations(f.ctx, f.task.ID, ObligationFilter{AgentID: f.handler.ID}, f.now.Add(time.Minute))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(rows) != 2 {
+			t.Fatalf("retry changed obligation count: %+v", rows)
+		}
+		for _, o := range rows {
+			if o.MessageSeq == gate.Seq && (!o.HandlerRequest || o.OutcomeSeq != result.Seq || o.ResponseMillis != 30000) {
+				t.Fatalf("response identity changed: %+v", o)
+			}
+			if o.MessageSeq == open.Seq && (!o.HandlerRequest || o.HandlerPriority != wantPriority) {
+				t.Fatalf("open priority changed: %+v", o)
+			}
+		}
+	}
+	check(true)
+	if _, err := f.s.db.ExecContext(f.ctx, `UPDATE agents SET status=? WHERE id=?`, api.AgentRetired, f.planner.ID); err != nil {
+		t.Fatal(err)
+	}
+	check(true) // other admitted members remain live
+	if _, err := f.s.db.ExecContext(f.ctx, `UPDATE agents SET status=? WHERE id IN (?,?,?)`, api.AgentRetired, f.lead.ID, f.builder.ID, f.handler.ID); err != nil {
+		t.Fatal(err)
+	}
+	check(false) // no live team remains; historical request and duration survive
+}
+
 func TestHandlerPriorityReplayRechecksBetweenQueuedWrites(t *testing.T) {
 	f := newHandlerPriorityFixture(t)
 	first := f.request(t, f.lead, true)
-	queued := f.requestFor(t, f.queued, true, f.queuedItem, f.queuedOrder)
+	queued := f.humanIntake(t, "replay-human-intake-0")
+	queued2 := f.humanIntake(t, "replay-human-intake-1")
 	if _, err := f.s.db.ExecContext(f.ctx, `UPDATE agents SET status=? WHERE id=?`, api.AgentRetired, f.queued.ID); err != nil {
 		t.Fatal(err)
 	}
 	sources := map[int64]api.Message{first.Seq: first}
+	intakes := []api.Message{queued, queued2}
+	results := make([]api.Message, 0, 2)
 	var trace []string
 	for i := 0; i < 2; i++ {
 		for {
@@ -260,6 +342,7 @@ func TestHandlerPriorityReplayRechecksBetweenQueuedWrites(t *testing.T) {
 			t.Fatal(err)
 		}
 		trace = append(trace, "queued")
+		results = append(results, f.result(t, intakes[i], f.now.Add(time.Duration(i+1)*time.Second)))
 		if i == 0 {
 			late := f.request(t, f.builder, true)
 			sources[late.Seq] = late
@@ -272,8 +355,26 @@ func TestHandlerPriorityReplayRechecksBetweenQueuedWrites(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(rows) != 1 || rows[0].MessageSeq != queued.Seq || rows[0].HandlerPriority {
-		t.Fatalf("queued-only request did not remain after gate drain: %+v", rows)
+	if len(rows) != 0 {
+		t.Fatalf("queued human intakes did not drain after gate results: %+v", rows)
+	}
+	all, err := f.s.ListObligations(f.ctx, f.task.ID, ObligationFilter{AgentID: f.handler.ID}, f.now.Add(3*time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i, intake := range intakes {
+		found := false
+		for _, o := range all {
+			if o.MessageSeq == intake.Seq {
+				found = true
+				if o.OutcomeSeq != results[i].Seq || o.ResponseMillis != int64(i+1)*1000 || o.SourceKind != "human" {
+					t.Fatalf("queued intake outcome: %+v", o)
+				}
+			}
+		}
+		if !found {
+			t.Fatalf("queued intake #%d missing", intake.Seq)
+		}
 	}
 }
 

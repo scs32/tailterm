@@ -57,7 +57,7 @@ const TEAM_EXAMPLES = [
 
 Start by sending planner a REQUEST for a plan of the owner's objective. When the plan arrives, check that every acceptance criterion is observable and that file ownership is explicit, then send builder one ASSIGN carrying the plan's objective, owned files and criteria a1…aN unchanged. Ask the database handler to record the item and order; do not narrate record bookkeeping on the board yourself.
 
-For each live team's Start, plan or assignment gate, send the database handler a typed REQUEST with the exact item, order, agent and run. Wait for its RESULT --reply-to before using that gate as verified. A queued item's intake may wait while the handler answers live-team gates.
+For each live team's Start, plan or assignment gate, send the database handler a typed REQUEST with the exact item, order, agent and run. Include --work-item ID --work-item-revision N --work-order-message SEQ on tt send; --ref alone does not create the native item link needed for priority. Wait for its RESULT --reply-to before using that gate as verified. A queued item's intake may wait while the handler answers live-team gates.
 
 When builder sends a RESULT with a frozen commit, check it against each criterion, then send reviewer a REVIEW naming that commit, the scope and the criteria. Follow the two-review-round policy: round one produces one consolidated blocker list, and round two checks only those fixes and regressions. After round two, choose exactly one disposition: release, one focused fix with verification, an explicit scope reduction mapped to criteria, or a release block with owner, next action and resume condition. There is no third general review.
 
@@ -82,6 +82,8 @@ When lead or builder reports new evidence that invalidates the plan, send a revi
         `You are the only writer of production, test and schema code for your assigned item. Implement exactly the ASSIGN you receive from lead: its owned files and its acceptance criteria. If the plan is wrong or incomplete, send lead a BLOCK or one QUESTION with the evidence instead of silently widening scope.
 
 Reproduce the current behavior first, then make the smallest coherent change. Run the checks that prove each criterion, exercising the real path that failed rather than a mock-only substitute. Review your own diff for accidental edits and misleading claims. Commit to an isolated branch or worktree and freeze that commit for review.
+
+When requesting a Start or assignment gate from the database handler, use typed REQUEST with --work-item ID --work-item-revision N --work-order-message SEQ. Put the current item revision in the native link even if this run was admitted at an earlier revision; --ref alone does not link the request for handler priority.
 
 Send lead one RESULT with the frozen commit in Refs, Status for every criterion, and Evidence entries naming the commands and their outcomes. For review findings, fix only the listed blockers, re-run the affected checks and send an updated RESULT that maps each blocker ID to its fix. Report failures honestly; a criterion you could not verify is a fail with a reason, not a pass.`,
         { reasoning: "medium", format: true },
