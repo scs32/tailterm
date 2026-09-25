@@ -749,6 +749,7 @@ export function createBoardView({
     reloadAgainTokens.delete(token);
     pendingTokens.add(token);
     const actionClient = client();
+    let paintedCachedDetail = false;
     try {
       const list = await actionClient.listTasks();
       if (!visible || token !== epoch || !sameClient(actionClient)) return;
@@ -761,20 +762,6 @@ export function createBoardView({
       await restoreIntents(id, actionClient).catch((error) =>
         notice("Saved Board intents unavailable: " + error.message),
       );
-      if (!currentAction(id, token, actionClient)) return;
-      let loadedCapabilities =
-        capabilitiesClient === actionClient ? capabilities : undefined;
-      if (loadedCapabilities === undefined) {
-        if (!actionClient.capabilities) loadedCapabilities = null;
-        else {
-          try {
-            loadedCapabilities = await actionClient.capabilities();
-          } catch (error) {
-            if (error.status === 404) loadedCapabilities = null;
-            else throw error;
-          }
-        }
-      }
       if (!currentAction(id, token, actionClient)) return;
       if (tasks.find((t) => t.id === id)?.status === "open")
         completeConversations.delete(id);
@@ -795,6 +782,36 @@ export function createBoardView({
       if (id && loadedDetail?.task.id !== id)
         throw new Error("Loaded project does not match the selected project.");
       const loadedMessages = result[1];
+      // Cached reads can paint the conversation immediately. Authoritative
+      // capability and item eligibility checks may still be pending; leave
+      // their controls unavailable until those checks complete.
+      detail = loadedDetail;
+      messages = loadedMessages;
+      audits = {};
+      composeItems = [];
+      composeItemsError = "";
+      capabilities = null;
+      capabilitiesClient = actionClient;
+      const decisionResult = result[2];
+      if (decisionResult.error) {
+        if (decisionsTask !== id) decisions = [];
+        decisionLoadError = decisionResult.error.message;
+      } else {
+        decisions = decisionResult.value;
+        decisionLoadError = "";
+      }
+      decisionsTask = id;
+      render();
+      paintedCachedDetail = true;
+      let loadedCapabilities = null;
+      if (actionClient.capabilities) {
+        try {
+          loadedCapabilities = await actionClient.capabilities();
+        } catch (error) {
+          if (error.status !== 404) throw error;
+        }
+      }
+      if (!currentAction(id, token, actionClient)) return;
       let loadedAudits = {};
       if (loadedCapabilities?.messageAudit?.versions?.includes(2)) {
         if (actionClient.loadMessageAudits)
@@ -852,22 +869,16 @@ export function createBoardView({
       composeItemsError = itemsError;
       capabilities = loadedCapabilities;
       capabilitiesClient = actionClient;
-      detail = loadedDetail;
-      messages = loadedMessages;
       audits = loadedAudits;
-      const decisionResult = result[2];
-      if (decisionResult.error) {
-        if (decisionsTask !== id) decisions = [];
-        decisionLoadError = decisionResult.error.message;
-      } else {
-        decisions = decisionResult.value;
-        decisionLoadError = "";
-      }
-      decisionsTask = id;
       render();
       return { id };
     } catch (e) {
-      if (visible && token === epoch && sameClient(actionClient)) {
+      if (
+        !paintedCachedDetail &&
+        visible &&
+        token === epoch &&
+        sameClient(actionClient)
+      ) {
         saveDraft();
         interruptMessageScroll();
         presentation.interrupt();

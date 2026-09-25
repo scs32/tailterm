@@ -21,7 +21,7 @@ import {createTeamsView} from '/client/teams-view.js';
 const params=new URLSearchParams(location.search), password='synthetic cache QA passphrase';
 const state={online:params.get('network')!=='offline',held:params.get('network')==='held',version:Number(params.get('version')||1),reads:0,responses:0,writes:Number(sessionStorage.getItem('synthetic-write-attempts')||0),waiting:[],notices:[]};
 const taskId='tsk_1111111111111111';
-const project=()=>({id:taskId,name:'Synthetic project v'+state.version,goal:'Synthetic goal v'+state.version,status:'open',orchestrator:'fixture-lead',createdAt:'2026-09-08T12:00:00Z'});
+const project=()=>({id:taskId,name:'Synthetic project v'+state.version,goal:'Synthetic goal v'+state.version,status:'open',pauseState:'active',lifecycleGeneration:1,orchestrator:'fixture-lead',createdAt:'2026-09-08T12:00:00Z'});
 const agent=()=>({id:'agt_1111111111111111',name:'fixture-lead',status:'running',host:'fixture.invalid',session:'synthetic-only',runtime:'codex',readUpTo:0});
 const message=(version)=>({seq:version,from:{user:'fixture'},text:'Synthetic board message v'+version,createdAt:'2026-09-08T12:00:00Z'});
 const workItem=(kind)=>({id:kind==='bug'?'bug-fixture':'feature-fixture',taskId,kind,title:'Synthetic '+kind+' v'+state.version,description:'Synthetic description',status:'open',priority:'normal',revision:state.version});
@@ -44,7 +44,7 @@ async function transport(url,init){
   state.responses++;
   // Capability metadata remains authoritative and obeys the same synthetic
   // held/offline transport gates and counters as other reads.
-  if(path.pathname==='/v1/capabilities')return response({});
+  if(path.pathname==='/v1/capabilities')return response(state.version===2?{projectPause:{supported:true,versions:[1]}}:{});
   if(path.pathname==='/v1/tasks')return response({tasks:[project()]});
   if(path.pathname==='/v1/tasks/'+taskId)return response({task:project(),agents:[agent()]});
   if(path.pathname.endsWith('/decisions'))return response({decisions:[],nextAfter:0});
@@ -56,6 +56,8 @@ async function transport(url,init){
   throw Error('Unexpected synthetic read: '+path.pathname);
 }
 await vault.localAPI('/unlock','POST',{password,username:'synthetic-alpha'});
+if(!vault.localData().agentCatalog.definitions.length)
+  await vault.localAPI('/agents','POST',{name:'Synthetic offline agent',launchName:'offline-lead',runtime:'codex',run:'codex',prompt:'Synthetic fixture only.'});
 let live,client,views,current;
 const root=document.querySelector('#mode-view');
 const notice=text=>{state.notices.push(text);document.querySelector('#notice').textContent=text};
@@ -179,10 +181,14 @@ try {
         await show(page, mode, 1);
         await page.waitForFunction(() => qa.state.waiting.length > 0);
         assert.equal(await page.evaluate(() => qa.state.responses), 0, `${name} ${mode}: response arrived before cache assertion`);
+        if (mode === "projects")
+          await expect(page.locator("[data-task-pause]")).toBeDisabled();
         await expect(page.locator("#mode-view .hub-sync-status, #mode-view .work-items-sync")).toHaveCount(0);
         await page.screenshot({ path: `.build/hub-cache-${mode}-held-${name}.png` });
         await page.evaluate(() => qa.release());
         await expect(page.locator(content[mode])).toContainText(marker(mode, 2));
+        if (mode === "projects")
+          await expect(page.locator("[data-task-pause]")).toBeEnabled();
         console.log(`${name}: ${mode} renders saved v1 before held response, then refreshes to v2`);
         // Restore the shared encrypted snapshot through real view reads for the
         // next mode. This does not reach into or seed cache implementation state.
@@ -250,17 +256,17 @@ try {
       await page.evaluate(async () => { await qa.connection(false); await qa.show("teams"); });
       await page.locator("#teams-new").click();
       await page.locator("#team-name").fill("Synthetic offline team");
-      await page.locator("[data-field=name]").fill("offline-lead");
+      await page.locator("[data-field=alias]").fill("offline-lead");
       await page.locator("#team-form button[type=submit]").click();
-      await expect(page.locator("[data-team]")).toContainText("Synthetic offline team");
+      await expect(page.locator("[data-team-select]")).toContainText("Synthetic offline team");
       assert.equal(await page.evaluate(() => qa.state.writes), writes, "Local Teams wrote to the hub");
       await open(page, "offline");
       await page.evaluate(() => qa.show("teams"));
-      await expect(page.locator("[data-team]")).toContainText("Synthetic offline team");
+      await expect(page.locator("[data-team-select]")).toContainText("Synthetic offline team");
       await page.locator("[data-edit-team]").click();
       await page.locator("#team-name").fill("Synthetic offline team edited");
       await page.locator("#team-form button[type=submit]").click();
-      await expect(page.locator("[data-team]")).toContainText("Synthetic offline team edited");
+      await expect(page.locator("[data-team-select]")).toContainText("Synthetic offline team edited");
       await page.evaluate(() => qa.connection(true));
       await page.waitForTimeout(750);
       assert.equal(await page.evaluate(() => qa.state.writes), writes, "Reload/unlock replayed a rejected write");

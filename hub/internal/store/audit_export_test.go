@@ -199,6 +199,45 @@ func TestAuditExportV3AddsFrozenQueueStreamsWithoutChangingV2Coverage(t *testing
 	}
 }
 
+func TestAuditExportV3KeepsOptionalLegacySuccessorHistory(t *testing.T) {
+	s, ctx, by := workItemStore(t)
+	task, _ := workItemProject(t, s, ctx, by, "legacy successor export", "lead")
+	if _, err := s.db.ExecContext(ctx, `CREATE TABLE phase_successor_obligations (id TEXT PRIMARY KEY, task_id TEXT, created_at TEXT, lead_delivery_id TEXT, successor_delivery_id TEXT);
+CREATE TABLE phase_successor_lead_transfers (obligation_id TEXT, sequence INTEGER, from_delivery_id TEXT, to_delivery_id TEXT);
+INSERT INTO phase_successor_obligations VALUES ('obligation-1', '`+task.ID+`', '2026-09-10T00:00:00Z', '', '');
+INSERT INTO phase_successor_lead_transfers VALUES ('obligation-1', 1, '', '');`); err != nil {
+		t.Fatal(err)
+	}
+	meta, err := s.CreateAuditExport(ctx, task.ID, api.CreateAuditExportRequest{RequestID: "legacy-successor", FormatVersion: 3}, by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	chunk, err := s.GetAuditExportChunk(ctx, task.ID, meta.ID, 0, api.MaxAuditExportChunkBytes, by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var document struct {
+		Streams map[string][]json.RawMessage `json:"streams"`
+	}
+	if err := json.Unmarshal(chunk.Data, &document); err != nil {
+		t.Fatal(err)
+	}
+	if len(document.Streams["phaseSuccessorObligations"]) != 1 || len(document.Streams["phaseSuccessorLeadTransfers"]) != 1 || document.Streams["phaseSuccessorDeliveries"] == nil || document.Streams["phaseSuccessorDeliveryEvents"] == nil || document.Streams["operationalRecords"] == nil {
+		t.Fatalf("legacy successor streams lost: %+v", document.Streams)
+	}
+}
+
+func TestAuditExportV3RejectsIncompleteLegacySuccessorSchema(t *testing.T) {
+	s, ctx, by := workItemStore(t)
+	task, _ := workItemProject(t, s, ctx, by, "broken legacy successor export", "lead")
+	if _, err := s.db.ExecContext(ctx, `CREATE TABLE phase_successor_obligations (id TEXT PRIMARY KEY, task_id TEXT)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.CreateAuditExport(ctx, task.ID, api.CreateAuditExportRequest{RequestID: "broken-legacy-successor", FormatVersion: 3}, by); err == nil || !strings.Contains(err.Error(), "incomplete legacy phase-successor schema") {
+		t.Fatalf("partial legacy schema silently exported: %v", err)
+	}
+}
+
 // TestAuditExportAllocationIntentStreamOnlyInV3 addresses independent review
 // #3003/#3010's audit-export gap: agent_allocation_intents (and its
 // review-#2916 expected-run/launcher/author columns) postdates legacy

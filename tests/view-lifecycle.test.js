@@ -12,7 +12,12 @@ const root = () => ({
   nodes: new Map(),
   querySelector(q) {
     if (!this.nodes.has(q))
-      this.nodes.set(q, { value: "", classList: { add() {}, remove() {} } });
+      this.nodes.set(q, {
+        value: "",
+        classList: { add() {}, remove() {} },
+        querySelector: () => null,
+        querySelectorAll: () => [],
+      });
     return this.nodes.get(q);
   },
   querySelectorAll() {
@@ -140,6 +145,31 @@ test("Board handles a second show while the first request is pending", async () 
   assert.doesNotMatch(el.innerHTML, /Bring a team together/);
   first.resolve([]);
   await old;
+  assert.equal(subscriptions, 1);
+  view.hide();
+});
+test("Projects switches clients while a cached load is pending", async () => {
+  const first = deferred();
+  let subscriptions = 0;
+  const oldClient = { listTasks: () => first.promise };
+  const newClient = {
+    listTasks: async () => [],
+    capabilities: async () => ({}),
+    subscribe() {
+      subscriptions++;
+      return { stop() {} };
+    },
+  };
+  let current = oldClient;
+  const view = createTasksView({ client: () => current });
+  const el = root();
+  view.mount(el);
+  const old = view.show();
+  current = newClient;
+  first.resolve([]);
+  await old;
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.match(el.innerHTML, /No projects yet/);
   assert.equal(subscriptions, 1);
   view.hide();
 });

@@ -123,8 +123,12 @@ func TestWorkItemsCLIUsesBodyFilesAndDurableReceipts(t *testing.T) {
 		t.Fatalf("dispatch = %q %v", dispatchOut, err)
 	}
 	messages, err := c.ListMessages(context.Background(), task.ID, 0, lead.ID, 10)
-	if err != nil || len(messages) != 1 || messages[0].From.AgentID != e.agent || messages[0].To != lead.ID || !strings.Contains(messages[0].Text, "revision 2") {
+	if err != nil || len(messages) != 1 || messages[0].From.Node != "system" || messages[0].From.User != "queue" || messages[0].To != lead.ID || messages[0].SystemNotice == nil || messages[0].SystemNotice.Kind == "" || !strings.Contains(messages[0].Text, "revision 2") || !strings.Contains(messages[0].Text, "Queued for deliberate review") {
 		t.Fatalf("dispatch message: %+v %v", messages, err)
+	}
+	replay, err := c.DispatchWorkItem(context.Background(), task.ID, itemID, api.DispatchWorkItemRequest{Revision: 2, TargetTaskID: task.ID, AgentID: e.agent, RequestID: "cli-dispatch-1"})
+	if err != nil || replay.Queue == nil || !replay.Queue.Replay || replay.Queue.Notification == nil || replay.Queue.Notification.CausalAuthor.Node != "cli-test" || replay.Queue.Notification.CausalAuthor.User != "owner" || replay.Queue.Notification.RecipientAgentID != lead.ID || replay.Queue.Notification.MessageSeq != messages[0].Seq || replay.Dispatch.MessageSeq != messages[0].Seq || replay.Queue.Notification.ID != messages[0].SystemNotice.ID {
+		t.Fatalf("dispatch replay/provenance: %+v %v", replay, err)
 	}
 }
 

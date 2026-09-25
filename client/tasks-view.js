@@ -136,23 +136,29 @@ export function createTasksView({
     }
     reloadAgain = false;
     const token = ++generation;
+    const actionClient = client();
+    const current = () =>
+      visible && token === generation && client() === actionClient;
+    const abandon = () => {
+      if (token !== generation) return;
+      loading = false;
+      if (visible && client() !== actionClient) {
+        subscription?.stop();
+        subscription = null;
+        void show();
+      }
+    };
     loading = true;
     try {
-      const [tasks, nextCapabilities] = await Promise.all([
-        client().listTasks(),
-        client()
-          .capabilities()
-          .catch(() => null),
-      ]);
-      capabilities = nextCapabilities;
+      const tasks = await actionClient.listTasks();
       const next = await Promise.all(
         tasks.map((t) =>
           t.status === "open" || t.cleanupPending > 0
-            ? client().getTask(t.id)
+            ? actionClient.getTask(t.id)
             : Promise.resolve({ task: t, agents: [] }),
         ),
       );
-      if (!visible || token !== generation) return;
+      if (!current()) return abandon();
       const added = !hasData
         ? [...next]
             .reverse()
@@ -163,8 +169,17 @@ export function createTasksView({
       details = next;
       if (added) selected = added.task.id;
       hasData = true;
+      // Saved task reads may paint while live capability discovery is held.
+      // Keep capability-gated controls unavailable until that check finishes.
+      capabilities = null;
+      render();
+      const nextCapabilities = await actionClient
+        .capabilities()
+        .catch(() => null);
+      if (!current()) return abandon();
+      capabilities = nextCapabilities;
     } catch (error) {
-      if (!visible || token !== generation) return;
+      if (!current()) return abandon();
       hasData = false;
       presentation.interrupt();
       root.innerHTML = `<div class="mode-empty"><span class="eyebrow">PROJECTS</span><h2>Hub unavailable.</h2><p class="launcher-intro">${esc(error.message)}</p><button id="tasks-retry">Retry</button></div>`;
@@ -172,7 +187,7 @@ export function createTasksView({
       loading = false;
       return;
     }
-    if (!visible || token !== generation) return;
+    if (!current()) return abandon();
     loading = false;
     render();
     if (reloadAgain) {

@@ -123,6 +123,21 @@ var phaseSuccessorExportQueries = []exportQuery{
 	{"phaseSuccessorDeliveryEvents", `SELECT e.* FROM delivery_events e WHERE e.delivery_id IN (SELECT lead_delivery_id FROM phase_successor_obligations WHERE task_id=? UNION SELECT successor_delivery_id FROM phase_successor_obligations WHERE task_id=? AND successor_delivery_id<>'' UNION SELECT t.from_delivery_id FROM phase_successor_lead_transfers t JOIN phase_successor_obligations o ON o.id=t.obligation_id WHERE o.task_id=? UNION SELECT t.to_delivery_id FROM phase_successor_lead_transfers t JOIN phase_successor_obligations o ON o.id=t.obligation_id WHERE o.task_id=?) ORDER BY e.created_at,e.id`, fourArgs},
 }
 
+// Older databases can retain the side-branch successor tables. They were not
+// part of the current schema, so export their history only when the pair exists.
+// A partial pair is a broken schema, not an optional absence.
+func hasLegacyPhaseSuccessorTables(ctx context.Context, tx *sql.Tx) (bool, error) {
+	var count int
+	err := tx.QueryRowContext(ctx, `SELECT count(*) FROM sqlite_master WHERE type='table' AND name IN ('phase_successor_obligations','phase_successor_lead_transfers')`).Scan(&count)
+	if err != nil {
+		return false, err
+	}
+	if count == 1 {
+		return false, fmt.Errorf("incomplete legacy phase-successor schema")
+	}
+	return count == 2, nil
+}
+
 func oneArg(taskID string) []any   { return []any{taskID} }
 func twoArgs(taskID string) []any  { return []any{taskID, taskID} }
 func fourArgs(taskID string) []any { return []any{taskID, taskID, taskID, taskID} }
@@ -455,7 +470,15 @@ func (s *Store) CreateAuditExport(ctx context.Context, taskID string, req api.Cr
 	}
 	queries := exportQueries
 	if req.FormatVersion == api.AuditExportFormatVersion {
-		queries = append(append(append(append(append([]exportQuery(nil), exportQueries...), allocationIntentExportQueries...), projectPauseExportQueries...), queueExportQueries...), phaseSuccessorExportQueries...)
+		queries = append(append(append(append([]exportQuery(nil), exportQueries...), allocationIntentExportQueries...), projectPauseExportQueries...), queueExportQueries...)
+		queries = append(queries, phaseSuccessorExportQueries[:2]...)
+		legacyPresent, err := hasLegacyPhaseSuccessorTables(ctx, tx)
+		if err != nil {
+			return api.AuditExport{}, err
+		}
+		if legacyPresent {
+			queries = append(queries, phaseSuccessorExportQueries[2:]...)
+		}
 	}
 	for index, q := range queries {
 		if index > 0 {
