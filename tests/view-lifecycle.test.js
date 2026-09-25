@@ -214,17 +214,25 @@ test("Board keeps known controls and audits during a same-client refresh", async
 test("Board reports a failure after its cached conversation paints", async () => {
   const task = { id: "tsk_1111111111111111", name: "Project", status: "open" };
   const notices = [];
+  let failCapabilities = true,
+    refresh,
+    subscriptions = 0;
   const client = {
     listTasks: async () => [task],
     getTask: async () => ({ task, agents: [] }),
     listMessages: async () => [],
     listDecisions: async () => ({ decisions: [], nextAfter: 0 }),
     capabilities: async () => {
+      if (!failCapabilities) return { auditExport: { versions: [2] } };
       const error = new Error("capabilities failed");
       error.status = 500;
       throw error;
     },
-    subscribe: () => ({ stop() {} }),
+    subscribe(_path, callback) {
+      subscriptions++;
+      refresh = callback;
+      return { stop() {} };
+    },
   };
   const view = createBoardView({
     client: () => client,
@@ -239,6 +247,10 @@ test("Board reports a failure after its cached conversation paints", async () =>
       /Board refresh unavailable: capabilities failed/.test(text),
     ),
   );
+  assert.equal(subscriptions, 1);
+  failCapabilities = false;
+  await refresh();
+  assert.match(el.innerHTML, /board-audit-export/);
   view.hide();
 });
 test("Projects switches clients while a cached load is pending", async () => {

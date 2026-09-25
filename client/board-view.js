@@ -707,6 +707,7 @@ export function createBoardView({
     // A failed or superseded load must not apply direct context to old detail.
     if (!loaded || !currentAction(loaded.id, token, actionClient)) return;
     if (
+      !loaded.degraded &&
       itemContext &&
       itemContext.taskId === selected &&
       detail?.task.id === selected &&
@@ -879,6 +880,10 @@ export function createBoardView({
       if (visible && token === epoch && sameClient(actionClient)) {
         if (paintedCachedDetail) {
           notice("Board refresh unavailable: " + e.message);
+          // The cached conversation can still receive a later live update.
+          // Let the first show establish its subscription without applying
+          // direct item context from this incomplete load.
+          return { id: selected, degraded: true };
         } else {
           saveDraft();
           interruptMessageScroll();
