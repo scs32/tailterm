@@ -86,6 +86,7 @@ func (r teamRunner) tick(ctx context.Context, e env, c *api.Client, host string)
 		return err
 	}
 	seen := map[string]bool{}
+	var projectErrors []error
 	for _, entry := range list.Entries {
 		if seen[entry.TaskID] {
 			continue
@@ -95,7 +96,8 @@ func (r teamRunner) tick(ctx context.Context, e env, c *api.Client, host string)
 		// the host query. The first entry in position order is authoritative.
 		queue, err := c.ListTeamQueue(ctx, entry.TaskID)
 		if err != nil {
-			return err
+			projectErrors = append(projectErrors, fmt.Errorf("team queue project %s: %w", entry.TaskID, err))
+			continue
 		}
 		var first *api.TeamQueueEntry
 		for i := range queue.Entries {
@@ -109,10 +111,10 @@ func (r teamRunner) tick(ctx context.Context, e env, c *api.Client, host string)
 			continue
 		}
 		if err := r.advance(ctx, e, c, *first, host); err != nil {
-			return fmt.Errorf("team queue %s: %w", first.ID, err)
+			projectErrors = append(projectErrors, fmt.Errorf("team queue %s: %w", first.ID, err))
 		}
 	}
-	return nil
+	return errors.Join(projectErrors...)
 }
 
 func (r teamRunner) advance(ctx context.Context, e env, c *api.Client, q api.TeamQueueEntry, host string) error {

@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/scs32/tailterm/hub/internal/api"
 	"github.com/scs32/tailterm/hub/internal/spawn"
@@ -186,6 +187,126 @@ func TestTeamRunnerClaimRaceKeepsSilentRetry(t *testing.T) {
 	runner := teamRunner{spawn: func(env, []string) error { spawns++; return nil }}
 	if err := runner.advance(ctx, f.e, f.c, q, "fixture"); err != nil || spawns != 0 {
 		t.Fatalf("claim race should retry silently without spawning: err=%v spawns=%d", err, spawns)
+	}
+}
+
+func TestTeamRunnerScopeRefusalDoesNotStopOtherProjects(t *testing.T) {
+	f := newTeamFixture(t, true)
+	ctx := context.Background()
+	otherTask, err := f.c.CreateTask(ctx, api.CreateTaskRequest{Name: "other queue on same host"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	otherHandler, err := f.c.AddAgent(ctx, otherTask.ID, api.AddAgentRequest{AgentID: api.NewID("agt"), Name: "other-db-handler", Role: api.AgentRoleDatabaseHandler, Host: "fixture", Session: "other-handler", Runtime: "codex"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.c.PostEvent(ctx, otherTask.ID, api.PostEventRequest{AgentID: otherHandler.ID, RunID: otherHandler.RunID, Kind: api.EventRunning}); err != nil {
+		t.Fatal(err)
+	}
+	otherItem, err := f.c.CreateWorkItem(ctx, otherTask.ID, api.CreateWorkItemRequest{Kind: "feature", Title: "other fixture feature", RequestID: "other-queue-item"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	otherOrder, err := f.c.PostMessage(ctx, otherTask.ID, api.PostMessageRequest{Text: "other bounded order", RequestID: "other-queue-order", WorkItems: []api.MessageWorkItem{{ItemTaskID: otherTask.ID, ItemID: otherItem.ID, ItemRevision: otherItem.Revision, Relationship: "primary"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.c.ConfirmWorkOrderScope(ctx, otherTask.ID, otherItem.ID, api.ConfirmWorkOrderScopeRequest{RequestID: "other-queue-scope", AgentID: otherHandler.ID, RunID: otherHandler.RunID, ExpectedRevision: otherItem.Revision, ScopeRevision: otherItem.ScopeRevision, OrderMessageSeq: otherOrder.Seq, Complete: true}); err != nil {
+		t.Fatal(err)
+	}
+	type project struct {
+		task    api.Task
+		item    api.WorkItem
+		order   api.Message
+		handler api.Agent
+		queue   api.TeamQueueEntry
+	}
+	projects := []project{
+		{task: f.task, item: f.item, order: api.Message{TaskID: f.task.ID, Seq: f.order, Text: "bounded fixture order"}, handler: f.handler},
+		{task: otherTask, item: otherItem, order: otherOrder, handler: otherHandler},
+	}
+	for i := range projects {
+		p := &projects[i]
+		p.queue, err = f.c.TeamQueueAction(ctx, p.task.ID, api.TeamQueueRequest{RequestID: "two-project-queue-" + p.item.ID, Operation: "add", ItemID: p.item.ID, OrderMessageSeq: p.order.Seq, Host: "fixture", Cwd: t.TempDir()})
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Host enumeration is ordered by task ID. Make its first project the
+	// unconfirmed one so this test detects an early return from tick.
+	if projects[1].task.ID < projects[0].task.ID {
+		projects[0], projects[1] = projects[1], projects[0]
+	}
+	first, second := projects[0], projects[1]
+	db, err := sql.Open("sqlite", f.dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if _, err := db.Exec(`DELETE FROM work_order_scope_confirmations WHERE task_id=? AND item_id=?`, first.task.ID, first.item.ID); err != nil {
+		t.Fatal(err)
+	}
+	byTask := map[string]project{first.task.ID: first, second.task.ID: second}
+	spawns := map[string]int{}
+	runner := teamRunner{
+		plan: func(_ context.Context, in map[string]any, out *teamLaunchResolved) error {
+			p := byTask[in["task"].(string)]
+			out.ItemRouting.WorkContextBundle = teamCloseCLIContext(t, p.item, p.order)
+			for _, role := range []string{"lead", "planner", "builder", "reviewer"} {
+				out.Plan = append(out.Plan, teamLaunchEntry{Fields: teamLaunchFields{Name: role + "-" + p.item.ID[3:11], Role: role, Runtime: "codex", Run: "codex", Cwd: in["cwd"].(string), Prompt: "fixture"}})
+			}
+			return nil
+		},
+		spawn: func(_ env, args []string) error {
+			flags := map[string]string{}
+			for i := 0; i+1 < len(args); i += 2 {
+				flags[args[i]] = args[i+1]
+			}
+			taskID := flags["--task"]
+			p := byTask[taskID]
+			spawns[taskID]++
+			data, err := os.ReadFile(flags["--work-context-file"])
+			if err != nil {
+				return err
+			}
+			rev, err := strconv.ParseInt(flags["--work-item-revision"], 10, 64)
+			if err != nil {
+				return err
+			}
+			seq, err := strconv.ParseInt(flags["--work-order-message"], 10, 64)
+			if err != nil {
+				return err
+			}
+			_, err = f.c.AddAgent(ctx, taskID, api.AddAgentRequest{AgentID: flags["--agent-id"], ExpectedRunID: flags["--expected-run-id"], Name: flags["--name"], Host: "fixture", Session: flags["--name"], Runtime: "codex", Cwd: flags["--cwd"], WorkItem: &api.AgentWorkItemRequest{ItemTaskID: taskID, ItemID: p.item.ID, ItemRevision: rev, WorkOrderMessage: api.MessageReference{TaskID: taskID, Seq: seq}, ContextBundle: data}})
+			return err
+		},
+		owned: func(context.Context, env, api.Agent) error { return nil },
+	}
+	err = runner.tick(ctx, f.e, f.c, "fixture")
+	if err == nil || !strings.Contains(err.Error(), first.queue.ID) || !strings.Contains(err.Error(), "scope is not confirmed for this exact item revision and order") {
+		t.Fatalf("first project scope error was lost: %v", err)
+	}
+	firstEntry, err := f.c.GetTeamQueueEntry(ctx, first.task.ID, first.queue.ID)
+	if err != nil || firstEntry.State != "queued" || firstEntry.Revision != first.queue.Revision || spawns[first.task.ID] != 0 {
+		t.Fatalf("first project changed on refusal: %+v, spawns=%d, err=%v", firstEntry, spawns[first.task.ID], err)
+	}
+	secondEntry, err := f.c.GetTeamQueueEntry(ctx, second.task.ID, second.queue.ID)
+	if err != nil || secondEntry.State != "running" || secondEntry.ItemRevision != second.item.Revision || spawns[second.task.ID] != 4 {
+		t.Fatalf("second project did not launch in same tick: %+v, spawns=%d, err=%v", secondEntry, spawns[second.task.ID], err)
+	}
+	if _, err := f.c.ConfirmWorkOrderScope(ctx, first.task.ID, first.item.ID, api.ConfirmWorkOrderScopeRequest{RequestID: "two-project-reconfirm", AgentID: first.handler.ID, RunID: first.handler.RunID, ExpectedRevision: first.item.Revision, ScopeRevision: first.item.ScopeRevision, OrderMessageSeq: first.order.Seq, Complete: true}); err != nil {
+		t.Fatal(err)
+	}
+	// Both projects use the same synthetic caller. Refill the test server's
+	// write bucket before the second four-member launch.
+	time.Sleep(2 * time.Second)
+	if err := runner.tick(ctx, f.e, f.c, "fixture"); err != nil {
+		t.Fatal(err)
+	}
+	firstEntry, err = f.c.GetTeamQueueEntry(ctx, first.task.ID, first.queue.ID)
+	if err != nil || firstEntry.State != "running" || firstEntry.ItemRevision != first.item.Revision || spawns[first.task.ID] != 4 || spawns[second.task.ID] != 4 {
+		t.Fatalf("reconfirmed project did not launch exactly once: %+v, spawns=%v, err=%v", firstEntry, spawns, err)
 	}
 }
 
