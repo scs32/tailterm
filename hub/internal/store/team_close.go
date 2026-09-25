@@ -52,7 +52,7 @@ func (s *Store) CloseItemTeam(ctx context.Context, taskID string, req api.TeamCl
 		return zero, err
 	}
 	if task.Status != api.TaskOpen || task.PauseState != api.ProjectPauseActive || task.Orchestrator == "" || task.LeadRevision != req.LeadRevision {
-		return zero, fmt.Errorf("%w: project or lead changed; refresh before team close", api.ErrConflict)
+		return zero, &api.TeamCloseWaitError{Code: "team-close-snapshot", Text: "project or lead changed; refresh before team close"}
 	}
 	item, err := s.GetWorkItem(ctx, taskID, req.ItemID)
 	if err != nil {
@@ -80,14 +80,14 @@ func (s *Store) CloseItemTeam(ctx context.Context, taskID string, req api.TeamCl
 	}
 	if lead.ID == "" || lead.Role == api.AgentRoleDatabaseHandler || lead.Status == api.AgentClosed || (lead.Status == api.AgentExited && req.ActorAgentID != "") ||
 		!strings.EqualFold(lead.Name, task.Orchestrator) || lead.RunID != req.LeadRunID || lead.WorkItem == nil || lead.WorkItem.ItemTaskID != taskID || lead.WorkItem.ItemID != req.ItemID || lead.WorkItem.ItemRevision != req.ItemRevision {
-		return zero, fmt.Errorf("%w: selected lead is not the current item-scoped orchestrator", api.ErrConflict)
+		return zero, &api.TeamCloseWaitError{Code: "team-close-snapshot", Text: "selected lead is not the current item-scoped orchestrator"}
 	}
 	if req.ActorAgentID != "" && (req.ActorAgentID != lead.ID || req.ActorRunID != lead.RunID) {
 		return zero, fmt.Errorf("%w: only the current item lead or an owner without agent identity may close the team", api.ErrConflict)
 	}
 	slices.SortFunc(actual, func(a, b api.TeamCloseMember) int { return strings.Compare(a.AgentID, b.AgentID) })
 	if !slices.Equal(actual, req.Members) {
-		return zero, fmt.Errorf("%w: item team snapshot changed; refresh before team close", api.ErrConflict)
+		return zero, &api.TeamCloseWaitError{Code: "team-close-snapshot", Text: "item team snapshot changed; refresh before team close"}
 	}
 	// Substantive work held or sent by a member must be resolved before close.
 	// Delivery-only obligations held by members are closed with the recipients
@@ -115,7 +115,7 @@ func (s *Store) CloseItemTeam(ctx context.Context, taskID string, req api.TeamCl
 			return zero, err
 		}
 		if len(open) > 0 {
-			return zero, fmt.Errorf("%w: open team obligations: %s", api.ErrConflict, strings.Join(open, "; "))
+			return zero, &api.TeamCloseWaitError{Code: "team-close-obligations", Text: "open team obligations: " + strings.Join(open, "; ")}
 		}
 	}
 	result := api.TeamCloseResult{TaskID: taskID, ItemID: item.ID, LeadAgentID: lead.ID}
@@ -154,7 +154,7 @@ func (s *Store) CloseItemTeam(ctx context.Context, taskID string, req api.TeamCl
 		}
 		n, err := r.RowsAffected()
 		if err != nil || n != 1 {
-			return zero, fmt.Errorf("%w: team member changed during close", api.ErrConflict)
+			return zero, &api.TeamCloseWaitError{Code: "team-close-snapshot", Text: "team member changed during close"}
 		}
 		if _, err := tx.ExecContext(ctx, `INSERT INTO events (task_id,kind,agent_id,text,data,by_node,by_user,created_at) VALUES (?,?,?,?,?,?,?,?)`, taskID, api.EventClosed, m.AgentID, "", "", by.Node, by.User, now); err != nil {
 			return zero, err
@@ -166,7 +166,7 @@ func (s *Store) CloseItemTeam(ctx context.Context, taskID string, req api.TeamCl
 	}
 	n, err := r.RowsAffected()
 	if err != nil || n != 1 {
-		return zero, fmt.Errorf("%w: lead changed during close", api.ErrConflict)
+		return zero, &api.TeamCloseWaitError{Code: "team-close-snapshot", Text: "lead changed during close"}
 	}
 	if _, err := tx.ExecContext(ctx, `INSERT INTO events (task_id,kind,agent_id,text,data,by_node,by_user,created_at) VALUES (?,?,?,?,?,?,?,?)`, taskID, "task_updated", "", task.Name, "", by.Node, by.User, now); err != nil {
 		return zero, err

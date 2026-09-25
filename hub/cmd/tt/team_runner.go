@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -73,7 +74,7 @@ func (r teamRunner) tick(ctx context.Context, e env, c *api.Client, host string)
 		var first *api.TeamQueueEntry
 		for i := range queue.Entries {
 			q := &queue.Entries[i]
-			if q.State != "finished" {
+			if q.State != "finished" && !(q.State == "failed" && q.ReleasedAt != "") {
 				first = q
 				break
 			}
@@ -337,21 +338,47 @@ func (r teamRunner) finish(ctx context.Context, e env, c *api.Client, q api.Team
 			if json.Unmarshal(q.LaunchJSON, &journal) != nil || len(journal.Members) == 0 || journal.Members[0].RunID == "" {
 				return r.fail(ctx, c, q, errors.New("closed lead has no frozen exact run"))
 			}
-			closeReq = api.TeamCloseRequest{RequestID: "team-close-" + q.TaskID + "-" + journal.Members[0].RunID, ItemID: q.ItemID, ItemRevision: q.ItemRevision}
-			if _, err := c.GetTeamCloseReceipt(ctx, q.TaskID, closeReq.RequestID); err != nil {
-				return r.fail(ctx, c, q, fmt.Errorf("closed lead has no exact team close receipt: %w", err))
+			// The owner may have handed the lead to another member of this item.
+			// Locate the exact saved receipt by its lead run, including the
+			// replacement, instead of assuming the originally spawned lead.
+			for _, a := range detail.Agents {
+				if a.WorkItem == nil || a.WorkItem.ItemID != q.ItemID || a.WorkItem.ItemTaskID != q.TaskID {
+					continue
+				}
+				candidate := api.TeamCloseRequest{RequestID: "team-close-" + q.TaskID + "-" + a.RunID, ItemID: q.ItemID, ItemRevision: q.ItemRevision}
+				result, lookupErr := c.GetTeamCloseReceipt(ctx, q.TaskID, candidate.RequestID)
+				if lookupErr == nil && result.TaskID == q.TaskID && result.ItemID == q.ItemID && result.LeadAgentID == a.ID {
+					closeReq = candidate
+					break
+				}
+				if lookupErr != nil {
+					var response *api.HTTPError
+					if !errors.As(lookupErr, &response) || response.Status != 404 {
+						return lookupErr
+					}
+				}
+			}
+			if closeReq.RequestID == "" {
+				return r.fail(ctx, c, q, errors.New("closed lead has no exact team close receipt"))
 			}
 		} else {
 			closeReq, err = closeTeamSnapshot(detail.Task, detail.Agents, "", "")
 			if err != nil {
 				return r.fail(ctx, c, q, fmt.Errorf("close gate: %w", err))
 			}
+			// The close request identity is frozen with its exact team snapshot.
+			// A definite refusal can refresh the snapshot without reusing a key
+			// that might already identify a different receipt.
+			closeReq.RequestID = ""
+			identity, _ := json.Marshal(closeReq)
+			sum := sha256.Sum256(identity)
+			closeReq.RequestID = fmt.Sprintf("queue-close-%s-%x", q.ID, sum[:12])
 		}
 		if closeReq.ItemID != q.ItemID {
 			return r.fail(ctx, c, q, errors.New("close snapshot selected another item"))
 		}
 		data, _ := json.Marshal(closeReq)
-		q, err = c.TeamQueueAction(ctx, q.TaskID, api.TeamQueueRequest{RequestID: "queue-close-freeze-" + q.ID, Operation: "close", EntryID: q.ID, ExpectedRevision: q.Revision, CloseJSON: data})
+		q, err = c.TeamQueueAction(ctx, q.TaskID, api.TeamQueueRequest{RequestID: fmt.Sprintf("queue-close-freeze-%s-%d", q.ID, q.Revision), Operation: "close", EntryID: q.ID, ExpectedRevision: q.Revision, CloseJSON: data})
 		if err != nil {
 			return err
 		}
@@ -366,6 +393,11 @@ func (r teamRunner) finish(ctx context.Context, e env, c *api.Client, q api.Team
 		}
 		result, err = c.CloseItemTeam(ctx, q.TaskID, closeReq)
 		if err != nil {
+			var response *api.HTTPError
+			if errors.As(err, &response) && response.Status == 409 && (response.Code == "team-close-obligations" || response.Code == "team-close-snapshot") {
+				_, refreshErr := c.TeamQueueAction(ctx, q.TaskID, api.TeamQueueRequest{RequestID: fmt.Sprintf("queue-close-refresh-%s-%d", q.ID, q.Revision), Operation: "close_refresh", EntryID: q.ID, ExpectedRevision: q.Revision, CloseRequestID: closeReq.RequestID})
+				return refreshErr
+			}
 			return r.fail(ctx, c, q, fmt.Errorf("team close: %w", err))
 		}
 	}

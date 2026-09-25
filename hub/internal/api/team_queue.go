@@ -7,6 +7,16 @@ import (
 	"strconv"
 )
 
+// TeamCloseWaitError is a definite close refusal. A queue runner may refresh
+// its snapshot and wait; transport errors must retain the exact prior request.
+type TeamCloseWaitError struct {
+	Code string
+	Text string
+}
+
+func (e *TeamCloseWaitError) Error() string { return e.Text }
+func (e *TeamCloseWaitError) Unwrap() error { return ErrConflict }
+
 // TeamQueueEntry is the hub-owned delivery queue. It is unrelated to the
 // deliberate, agent-claimed Queue API.
 type TeamQueueEntry struct {
@@ -26,6 +36,7 @@ type TeamQueueEntry struct {
 	CloseJSON       json.RawMessage `json:"close,omitempty"`
 	Failure         string          `json:"failure,omitempty"`
 	EscalationSeq   int64           `json:"escalationSeq,omitempty"`
+	ReleasedAt      string          `json:"releasedAt,omitempty"`
 }
 
 type TeamQueueList struct {
@@ -46,6 +57,10 @@ type TeamQueueRequest struct {
 	PauseGeneration  int64           `json:"pauseGeneration,omitempty"`
 	LaunchJSON       json.RawMessage `json:"launch,omitempty"`
 	CloseJSON        json.RawMessage `json:"close,omitempty"`
+	CloseRequestID   string          `json:"closeRequestId,omitempty"`
+	ReservationToken string          `json:"reservationToken,omitempty"`
+	ManualJournal    json.RawMessage `json:"manualJournal,omitempty"`
+	SessionsChecked  bool            `json:"sessionsChecked,omitempty"`
 	Failure          string          `json:"failure,omitempty"`
 	MemberIndex      int             `json:"memberIndex,omitempty"`
 	MemberRunID      string          `json:"memberRunId,omitempty"`

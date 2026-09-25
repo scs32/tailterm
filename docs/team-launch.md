@@ -9,6 +9,8 @@ tt team queue add --task tsk_... --item wi_... --order 123 --template planned
 tt team queue list --task tsk_...
 tt team queue reorder --task tsk_... --entry tqe_... --before tqe_...
 tt team queue remove --task tsk_... --entry tqe_...
+tt team queue release --task tsk_... --entry tqe_...
+tt team queue abandon --task tsk_... --item wi_... --order 123
 ```
 
 The hub stores queue state and retry receipts. The existing supervised Mini
@@ -20,6 +22,21 @@ unresolved attempts fail the entry and require owner action. Terminal items
 advance only after the exact team close and host cleanup receipts. A failed
 entry stops that project queue and posts one durable owner escalation. Pausing
 the project stops launch ticks. The deliberate agent Queue is separate.
+
+After inspecting a failed entry, use `release --entry` to clear its reservation
+and let the next queued item run. The failed entry and escalation remain in
+the list with a release timestamp. Release is refused while its team is live,
+cleanup is pending, or an attempted spawn has no exact closed run and cleanup
+receipt. Resolve those conditions first; release never restarts the failed item.
+If a manual launch stops, `abandon --item --order` releases its exact reservation
+with a retry receipt. After lead selection, first clear the lead and resolve
+every member through the saved journal: registered runs need close and cleanup
+receipts, and an uncertain unregistered attempt needs a verified absence of
+its local session. `abandon` locks the journal, checks local sessions, and sends
+the exact member identities to the hub. It refuses a live team or pending
+cleanup. Both commands are owner-side operations.
+An abandoned manual attempt cannot replay its old launch identity; queue the
+still-active item with `team queue add` if it needs a fresh team.
 
 `tt team launch --item wi_… --order N [--template planned] [--dry-run]`
 starts the four non-database members of the Planned delivery template for an

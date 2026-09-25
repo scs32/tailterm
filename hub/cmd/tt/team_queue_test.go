@@ -60,3 +60,48 @@ func TestTeamQueueCLIAddAndListAgainstTestHub(t *testing.T) {
 		t.Fatalf("CLI remove %+v %v", q, err)
 	}
 }
+
+func TestTeamQueueCLIReleaseAndAbandonAgainstTestHub(t *testing.T) {
+	f := newTeamFixture(t, true)
+	ctx := context.Background()
+	q, err := f.c.TeamQueueAction(ctx, f.task.ID, api.TeamQueueRequest{RequestID: "add", Operation: "add", ItemID: f.item.ID, OrderMessageSeq: f.order, Host: "fixture", Cwd: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	q, err = f.c.TeamQueueAction(ctx, f.task.ID, api.TeamQueueRequest{RequestID: "fail", Operation: "fail", EntryID: q.ID, ExpectedRevision: q.Revision, Failure: "fixture failure"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := captureCLIOutput(t, func() error { return cmdTeamQueue(f.e, []string{"release", "--entry", q.ID}) }); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := captureCLIOutput(t, func() error { return cmdTeamQueue(f.e, []string{"release", "--entry", q.ID}) }); err != nil {
+		t.Fatalf("release receipt retry: %v", err)
+	}
+	list, err := captureCLIOutput(t, func() error { return cmdTeamQueue(f.e, []string{"list"}) })
+	if err != nil || !strings.Contains(list, "failed (released)") {
+		t.Fatalf("released list %q %v", list, err)
+	}
+	second, err := f.c.CreateWorkItem(ctx, f.task.ID, api.CreateWorkItemRequest{Kind: "feature", Title: "manual item", RequestID: "manual-item"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	order, err := f.c.PostMessage(ctx, f.task.ID, api.PostMessageRequest{Text: "manual order", RequestID: "manual-order", WorkItems: []api.MessageWorkItem{{ItemTaskID: f.task.ID, ItemID: second.ID, ItemRevision: second.Revision, Relationship: "primary"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	token := fmt.Sprintf("manual-%s-%s-%d", f.task.ID, second.ID, order.Seq)
+	if _, err := f.c.TeamQueueAction(ctx, f.task.ID, api.TeamQueueRequest{RequestID: token, Operation: "manual", ItemID: second.ID, OrderMessageSeq: order.Seq, PauseGeneration: 0}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := captureCLIOutput(t, func() error {
+		return cmdTeamQueue(f.e, []string{"abandon", "--item", second.ID, "--order", fmt.Sprint(order.Seq)})
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := captureCLIOutput(t, func() error {
+		return cmdTeamQueue(f.e, []string{"abandon", "--item", second.ID, "--order", fmt.Sprint(order.Seq)})
+	}); err != nil {
+		t.Fatalf("abandon receipt retry: %v", err)
+	}
+}

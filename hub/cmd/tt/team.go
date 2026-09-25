@@ -67,7 +67,7 @@ func cmdTeam(e env, args []string) error {
 		return cmdTeamQueue(e, args[1:])
 	}
 	if len(args) == 0 || args[0] != "launch" {
-		return errors.New("usage: tt team launch --item ID --order SEQ [--template planned] [--dry-run] | tt team queue add|list|remove|reorder")
+		return errors.New("usage: tt team launch --item ID --order SEQ [--template planned] [--dry-run] | tt team queue add|list|remove|reorder|release|abandon")
 	}
 	if len(args) == 2 && (args[1] == "--help" || args[1] == "-h") {
 		fmt.Println("usage: tt team launch --item ID --order SEQ [--template planned] [--dry-run] [--task ID] [--hub URL] [--cwd DIR]")

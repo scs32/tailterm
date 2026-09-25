@@ -3,12 +3,14 @@ package main
 import (
 	"context"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/scs32/tailterm/hub/internal/api"
@@ -25,7 +27,7 @@ func validTeamQueueEntryID(id string) bool {
 
 func cmdTeamQueue(e env, args []string) error {
 	if len(args) == 0 {
-		return errors.New("usage: tt team queue add|list|remove|reorder")
+		return errors.New("usage: tt team queue add|list|remove|reorder|release|abandon")
 	}
 	sub := args[0]
 	fs := flag.NewFlagSet("team queue "+sub, flag.ContinueOnError)
@@ -65,7 +67,11 @@ func cmdTeamQueue(e env, args []string) error {
 			return nil
 		}
 		for _, q := range list.Entries {
-			fmt.Printf("%d %s %s %s order=#%d revision=%d\n", q.Position, q.State, q.ID, q.ItemID, q.OrderMessageSeq, q.Revision)
+			state := q.State
+			if q.State == "failed" && q.ReleasedAt != "" {
+				state += " (released)"
+			}
+			fmt.Printf("%d %s %s %s order=#%d revision=%d\n", q.Position, state, q.ID, q.ItemID, q.OrderMessageSeq, q.Revision)
 		}
 		return nil
 	}
@@ -93,17 +99,83 @@ func cmdTeamQueue(e env, args []string) error {
 			return fmt.Errorf("project cwd is not a directory: %s", *cwd)
 		}
 		req.ItemID, req.OrderMessageSeq, req.Template, req.Host, req.Cwd = *item, *order, *template, spawn.Host(), *cwd
-	case "remove", "reorder":
+	case "remove", "reorder", "release":
 		if !validTeamQueueEntryID(*entry) {
-			return errors.New("remove/reorder requires --entry tqe_ID")
+			return errors.New("remove/reorder/release requires --entry tqe_ID")
 		}
 		q, err := c.GetTeamQueueEntry(ctx, *task, *entry)
 		if err != nil {
 			return err
 		}
 		req.EntryID, req.ExpectedRevision, req.BeforeID = q.ID, q.Revision, *before
+		if sub == "release" {
+			req.RequestID = "queue-release-" + q.ID
+		}
+	case "abandon":
+		if !api.ValidID(*item, "wi") || *order < 1 {
+			return errors.New("abandon requires --item wi_ID --order SEQ")
+		}
+		path, pathErr := teamJournalPath(*hub, *task, *item, *order)
+		if pathErr != nil {
+			return pathErr
+		}
+		lock, lockErr := os.OpenFile(path+".lock", os.O_CREATE|os.O_RDWR, 0600)
+		if lockErr == nil {
+			defer lock.Close()
+			lockErr = syscall.Flock(int(lock.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
+			if lockErr == nil {
+				defer syscall.Flock(int(lock.Fd()), syscall.LOCK_UN)
+			}
+		} else if errors.Is(lockErr, os.ErrNotExist) {
+			// Before the first journal there is no local launch effect.
+			lockErr = nil
+		}
+		if lockErr != nil {
+			return fmt.Errorf("manual launch may still be running: %w", lockErr)
+		}
+		journal, readErr := loadTeamJournal(path)
+		if readErr != nil && !errors.Is(readErr, os.ErrNotExist) {
+			return readErr
+		}
+		if readErr == nil {
+			if journal.Hub != *hub || journal.Task != *task || journal.Item != *item || journal.Order != *order {
+				return errors.New("manual journal identity differs from reservation")
+			}
+			sessions, sessionErr := localSessions(ctx)
+			if sessionErr != nil {
+				return sessionErr
+			}
+			proof := struct {
+				Task    string `json:"task"`
+				Item    string `json:"item"`
+				Order   int64  `json:"order"`
+				Members []struct {
+					AgentID string `json:"agentId"`
+					State   string `json:"state"`
+					RunID   string `json:"runId"`
+				} `json:"members"`
+			}{Task: *task, Item: *item, Order: *order}
+			for _, member := range journal.Members {
+				for _, session := range sessions {
+					if (session.Hub == *hub && session.Task == *task && session.Agent == member.Fields.AgentID) || session.Name == member.Fields.Name {
+						return fmt.Errorf("manual member %s still has an owned or name-conflicting session", member.Fields.AgentID)
+					}
+				}
+				proof.Members = append(proof.Members, struct {
+					AgentID string `json:"agentId"`
+					State   string `json:"state"`
+					RunID   string `json:"runId"`
+				}{member.Fields.AgentID, member.State, member.RunID})
+			}
+			req.ManualJournal, _ = json.Marshal(proof)
+			req.SessionsChecked = true
+		}
+		req.Operation = "manual_release"
+		req.ItemID, req.OrderMessageSeq = *item, *order
+		req.ReservationToken = fmt.Sprintf("manual-%s-%s-%d", *task, *item, *order)
+		req.RequestID = fmt.Sprintf("manual-release-%s-%s-%d", *task, *item, *order)
 	default:
-		return errors.New("usage: tt team queue add|list|remove|reorder")
+		return errors.New("usage: tt team queue add|list|remove|reorder|release|abandon")
 	}
 	result, err := c.TeamQueueAction(ctx, *task, req)
 	if err != nil {

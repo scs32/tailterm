@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"path/filepath"
 	"sync"
 	"testing"
@@ -232,5 +233,180 @@ func TestTeamQueueClaimAttemptFailureIsFrozen(t *testing.T) {
 	}
 	if notices != 1 {
 		t.Fatalf("owner notices=%d", notices)
+	}
+}
+
+func TestTeamQueueFailedReleaseKeepsHistoryAndAllowsNextClaim(t *testing.T) {
+	s, task, items, orders := queueFixture(t)
+	ctx := context.Background()
+	first, err := s.TeamQueueAction(ctx, task.ID, api.TeamQueueRequest{RequestID: "add-one", Operation: "add", ItemID: items[0].ID, OrderMessageSeq: orders[0].Seq, Host: "mini", Cwd: "/tmp"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := s.TeamQueueAction(ctx, task.ID, api.TeamQueueRequest{RequestID: "add-two", Operation: "add", ItemID: items[1].ID, OrderMessageSeq: orders[1].Seq, Host: "mini", Cwd: "/tmp"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, err = s.TeamQueueAction(ctx, task.ID, api.TeamQueueRequest{RequestID: "claim-one", Operation: "claim", EntryID: first.ID, ExpectedRevision: first.Revision, Host: "mini"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, err = s.TeamQueueAction(ctx, task.ID, api.TeamQueueRequest{RequestID: "fail-one", Operation: "fail", EntryID: first.ID, ExpectedRevision: first.Revision, Failure: "planned fixture failure"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.TeamQueueAction(ctx, task.ID, api.TeamQueueRequest{RequestID: "early-claim", Operation: "claim", EntryID: second.ID, ExpectedRevision: second.Revision, Host: "mini"}); err == nil {
+		t.Fatal("unreleased failure allowed claim")
+	}
+	release := api.TeamQueueRequest{RequestID: "release-one", Operation: "release", EntryID: first.ID, ExpectedRevision: first.Revision}
+	first, err = s.TeamQueueAction(ctx, task.ID, release)
+	if err != nil || first.ReleasedAt == "" || first.State != "failed" {
+		t.Fatalf("release %+v %v", first, err)
+	}
+	if again, err := s.TeamQueueAction(ctx, task.ID, release); err != nil || again.ReleasedAt != first.ReleasedAt {
+		t.Fatalf("release receipt %+v %v", again, err)
+	}
+	release.ExpectedRevision = first.Revision
+	if again, err := s.TeamQueueAction(ctx, task.ID, release); err != nil || again.ReleasedAt != first.ReleasedAt {
+		t.Fatalf("release after response loss %+v %v", again, err)
+	}
+	second, err = s.TeamQueueAction(ctx, task.ID, api.TeamQueueRequest{RequestID: "claim-two", Operation: "claim", EntryID: second.ID, ExpectedRevision: second.Revision, Host: "mini"})
+	if err != nil || second.State != "launching" {
+		t.Fatalf("next claim %+v %v", second, err)
+	}
+	stored, err := s.GetTeamQueueEntry(ctx, task.ID, first.ID)
+	if err != nil || stored.State != "failed" || stored.EscalationSeq == 0 || stored.ReleasedAt == "" {
+		t.Fatalf("history %+v %v", stored, err)
+	}
+}
+
+func TestTeamQueueReleaseRejectsUncertainRunAndUnsafeProject(t *testing.T) {
+	s, task, items, orders := queueFixture(t)
+	ctx := context.Background()
+	q, err := s.TeamQueueAction(ctx, task.ID, api.TeamQueueRequest{RequestID: "add", Operation: "add", ItemID: items[0].ID, OrderMessageSeq: orders[0].Seq, Host: "mini", Cwd: "/tmp"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	q, err = s.TeamQueueAction(ctx, task.ID, api.TeamQueueRequest{RequestID: "claim", Operation: "claim", EntryID: q.ID, ExpectedRevision: q.Revision, Host: "mini"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan, _ := json.Marshal(map[string]any{"task": task.ID, "item": items[0].ID, "revision": items[0].Revision, "order": orders[0].Seq, "context": map[string]any{"version": 1}, "members": []any{map[string]any{"state": "unstarted", "runId": api.NewID("run"), "fields": map[string]any{"agentId": api.NewID("agt"), "name": "lead", "cwd": "/tmp"}}}})
+	q, err = s.TeamQueueAction(ctx, task.ID, api.TeamQueueRequest{RequestID: "freeze", Operation: "freeze", EntryID: q.ID, ExpectedRevision: q.Revision, LaunchJSON: plan})
+	if err != nil {
+		t.Fatal(err)
+	}
+	q, err = s.TeamQueueAction(ctx, task.ID, api.TeamQueueRequest{RequestID: "attempt", Operation: "attempt", EntryID: q.ID, ExpectedRevision: q.Revision})
+	if err != nil {
+		t.Fatal(err)
+	}
+	q, err = s.TeamQueueAction(ctx, task.ID, api.TeamQueueRequest{RequestID: "fail", Operation: "fail", EntryID: q.ID, ExpectedRevision: q.Revision, Failure: "uncertain spawn"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.TeamQueueAction(ctx, task.ID, api.TeamQueueRequest{RequestID: "release-uncertain", Operation: "release", EntryID: q.ID, ExpectedRevision: q.Revision}); err == nil {
+		t.Fatal("unresolved uncertain spawn released")
+	}
+	if _, err := s.db.Exec(`UPDATE tasks SET orchestrator='someone' WHERE id=?`, task.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.TeamQueueAction(ctx, task.ID, api.TeamQueueRequest{RequestID: "release-live", Operation: "release", EntryID: q.ID, ExpectedRevision: q.Revision}); err == nil {
+		t.Fatal("live lead released")
+	}
+}
+
+func TestTeamQueueAbandonManualReservationHasExactReceipt(t *testing.T) {
+	s, task, items, orders := queueFixture(t)
+	ctx := context.Background()
+	token := "manual-" + task.ID + "-" + items[0].ID + "-" + fmt.Sprint(orders[0].Seq)
+	_, err := s.TeamQueueAction(ctx, task.ID, api.TeamQueueRequest{RequestID: token, Operation: "manual", ItemID: items[0].ID, OrderMessageSeq: orders[0].Seq, PauseGeneration: 0})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.TeamQueueAction(ctx, task.ID, api.TeamQueueRequest{RequestID: "wrong-token", Operation: "manual_release", ItemID: items[0].ID, OrderMessageSeq: orders[0].Seq, ReservationToken: "manual-wrong"}); err == nil {
+		t.Fatal("wrong token released")
+	}
+	release := api.TeamQueueRequest{RequestID: "manual-release", Operation: "manual_release", ItemID: items[0].ID, OrderMessageSeq: orders[0].Seq, ReservationToken: token}
+	got, err := s.TeamQueueAction(ctx, task.ID, release)
+	if err != nil || got.ReleasedAt == "" {
+		t.Fatalf("manual release %+v %v", got, err)
+	}
+	if again, err := s.TeamQueueAction(ctx, task.ID, release); err != nil || again.ReleasedAt != got.ReleasedAt {
+		t.Fatalf("manual receipt %+v %v", again, err)
+	}
+	if _, err := s.TeamQueueAction(ctx, task.ID, api.TeamQueueRequest{RequestID: token, Operation: "manual", ItemID: items[0].ID, OrderMessageSeq: orders[0].Seq, PauseGeneration: 0}); err == nil {
+		t.Fatal("released reservation replayed as an active launch")
+	}
+	_, err = s.TeamQueueAction(ctx, task.ID, api.TeamQueueRequest{RequestID: "manual-next", Operation: "manual", ItemID: items[1].ID, OrderMessageSeq: orders[1].Seq, PauseGeneration: 0})
+	if err != nil {
+		t.Fatalf("manual next %v", err)
+	}
+}
+
+func TestTeamQueueManualPostLeadReleaseNeedsExactResolvedProof(t *testing.T) {
+	s, task, items, orders := queueFixture(t)
+	ctx := context.Background()
+	by := api.Caller{Node: "fixture", User: "owner"}
+	token := fmt.Sprintf("manual-%s-%s-%d", task.ID, items[0].ID, orders[0].Seq)
+	if _, err := s.TeamQueueAction(ctx, task.ID, api.TeamQueueRequest{RequestID: token, Operation: "manual", ItemID: items[0].ID, OrderMessageSeq: orders[0].Seq, PauseGeneration: 0}); err != nil {
+		t.Fatal(err)
+	}
+	lead := "manual-lead"
+	if _, err := s.UpdateTask(ctx, task.ID, api.UpdateTaskRequest{Orchestrator: &lead, TeamLaunchToken: token}, by); err != nil {
+		t.Fatal(err)
+	}
+	empty := ""
+	if _, err := s.UpdateTask(ctx, task.ID, api.UpdateTaskRequest{Orchestrator: &empty}, by); err != nil {
+		t.Fatal(err)
+	}
+	release := api.TeamQueueRequest{RequestID: "resolved-manual", Operation: "manual_release", ItemID: items[0].ID, OrderMessageSeq: orders[0].Seq, ReservationToken: token}
+	if _, err := s.TeamQueueAction(ctx, task.ID, release); err == nil {
+		t.Fatal("post-lead manual reservation released without proof")
+	}
+	proof, _ := json.Marshal(map[string]any{"task": task.ID, "item": items[0].ID, "order": orders[0].Seq, "members": []any{map[string]any{"agentId": api.NewID("agt"), "state": "uncertain", "runId": ""}}})
+	release.ManualJournal = proof
+	release.SessionsChecked = true
+	if _, err := s.TeamQueueAction(ctx, task.ID, release); err != nil {
+		t.Fatalf("verified absence release: %v", err)
+	}
+}
+
+func TestTeamQueueReleaseWaitsForRegisteredRunCleanup(t *testing.T) {
+	s, task, items, orders := queueFixture(t)
+	ctx := context.Background()
+	by := api.Caller{Node: "fixture", User: "owner"}
+	q, err := s.TeamQueueAction(ctx, task.ID, api.TeamQueueRequest{RequestID: "add", Operation: "add", ItemID: items[0].ID, OrderMessageSeq: orders[0].Seq, Host: "mini", Cwd: "/tmp"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	q, err = s.TeamQueueAction(ctx, task.ID, api.TeamQueueRequest{RequestID: "claim", Operation: "claim", EntryID: q.ID, ExpectedRevision: q.Revision, Host: "mini"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ref := api.MessageReference{TaskID: task.ID, Seq: orders[0].Seq}
+	bundle := syntheticPreparedContext(t, items[0], ref, syntheticHistory(items[0], orders[0]))
+	a, err := s.AddAgent(ctx, task.ID, api.AddAgentRequest{Name: "partial-member", Host: "mini", Session: "partial-member", Runtime: "codex", WorkItem: &api.AgentWorkItemRequest{ItemTaskID: task.ID, ItemID: items[0].ID, ItemRevision: items[0].Revision, WorkOrderMessage: ref, ContextBundle: bundle}}, by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	q, err = s.TeamQueueAction(ctx, task.ID, api.TeamQueueRequest{RequestID: "fail", Operation: "fail", EntryID: q.ID, ExpectedRevision: q.Revision, Failure: "partial launch"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	release := api.TeamQueueRequest{RequestID: "release", Operation: "release", EntryID: q.ID, ExpectedRevision: q.Revision}
+	if _, err := s.TeamQueueAction(ctx, task.ID, release); err == nil {
+		t.Fatal("live run released")
+	}
+	if _, err := s.CloseAgent(ctx, a.ID, by); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.TeamQueueAction(ctx, task.ID, release); err == nil {
+		t.Fatal("uncleaned run released")
+	}
+	if _, err := s.ReportCleanup(ctx, a.ID, api.CleanupRequest{RunID: a.RunID}, by); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.TeamQueueAction(ctx, task.ID, release); err != nil {
+		t.Fatalf("cleaned run release: %v", err)
 	}
 }

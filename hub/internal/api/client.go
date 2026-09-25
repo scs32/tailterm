@@ -32,6 +32,7 @@ func NewClient(base string, timeout time.Duration) (*Client, error) {
 type HTTPError struct {
 	Status   int
 	Msg      string
+	Code     string
 	Problems []Problem
 }
 
@@ -97,7 +98,7 @@ func (c *Client) doLimitedJSON(ctx context.Context, method, path string, body, o
 		if e.Error == "" {
 			e.Error = strings.TrimSpace(string(data))
 		}
-		return &HTTPError{Status: res.StatusCode, Msg: e.Error, Problems: e.Problems}
+		return &HTTPError{Status: res.StatusCode, Msg: e.Error, Code: e.Code, Problems: e.Problems}
 	}
 	if out != nil && len(data) > 0 {
 		return json.Unmarshal(data, out)

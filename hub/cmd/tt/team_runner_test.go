@@ -317,3 +317,188 @@ func TestTeamRunnerStaleQueuedItemFailsBeforeSpawn(t *testing.T) {
 		t.Fatalf("stale entry %+v %v", q, err)
 	}
 }
+
+// queueCorrectionRunner exercises the actual hub API with fake runtime effects.
+func queueCorrectionRunner(t *testing.T, f teamFixture, members int) teamRunner {
+	t.Helper()
+	ctx := context.Background()
+	return teamRunner{
+		plan: func(ctx context.Context, in map[string]any, out *teamLaunchResolved) error {
+			messages, err := f.c.ListMessages(ctx, f.task.ID, 0, "", 100)
+			if err != nil {
+				return err
+			}
+			var order api.Message
+			for _, m := range messages {
+				if m.Seq == f.order {
+					order = m
+				}
+			}
+			out.ItemRouting.WorkContextBundle = teamCloseCLIContext(t, f.item, order)
+			for i := 0; i < members; i++ {
+				out.Plan = append(out.Plan, teamLaunchEntry{Fields: teamLaunchFields{Name: fmt.Sprintf("correction-lead-%d", i), Role: "lead", Runtime: "codex", Run: "codex", Cwd: in["cwd"].(string), Prompt: "fixture"}})
+			}
+			return nil
+		},
+		spawn: func(e env, args []string) error {
+			flags := map[string]string{}
+			for i := 0; i+1 < len(args); i += 2 {
+				flags[args[i]] = args[i+1]
+			}
+			data, err := os.ReadFile(flags["--work-context-file"])
+			if err != nil {
+				return err
+			}
+			rev, _ := strconv.ParseInt(flags["--work-item-revision"], 10, 64)
+			order, _ := strconv.ParseInt(flags["--work-order-message"], 10, 64)
+			_, err = f.c.AddAgent(ctx, flags["--task"], api.AddAgentRequest{AgentID: flags["--agent-id"], ExpectedRunID: flags["--expected-run-id"], Name: flags["--name"], Host: "fixture", Session: flags["--name"], Runtime: "codex", Cwd: flags["--cwd"], WorkItem: &api.AgentWorkItemRequest{ItemTaskID: flags["--task"], ItemID: flags["--work-item"], ItemRevision: rev, WorkOrderMessage: api.MessageReference{TaskID: flags["--task"], Seq: order}, ContextBundle: data}})
+			return err
+		},
+		owned: func(context.Context, env, api.Agent) error { return nil },
+		cleanup: func(ctx context.Context, e env, task, id string) error {
+			a, err := f.c.GetAgent(ctx, task, id)
+			if err != nil {
+				return err
+			}
+			_, err = f.c.ReportCleanup(ctx, task, id, api.CleanupRequest{RunID: a.RunID})
+			return err
+		},
+	}
+}
+
+func TestTeamRunnerWaitsForCloseObligationAndRefreshesSnapshot(t *testing.T) {
+	for _, changedSnapshot := range []bool{false, true} {
+		name := "open-obligation"
+		if changedSnapshot {
+			name = "changed-snapshot"
+		}
+		t.Run(name, func(t *testing.T) {
+			f := newTeamFixture(t, true)
+			ctx := context.Background()
+			q, err := f.c.TeamQueueAction(ctx, f.task.ID, api.TeamQueueRequest{RequestID: "add", Operation: "add", ItemID: f.item.ID, OrderMessageSeq: f.order, Host: "fixture", Cwd: t.TempDir()})
+			if err != nil {
+				t.Fatal(err)
+			}
+			r := queueCorrectionRunner(t, f, 1)
+			if err := r.tick(ctx, f.e, f.c, "fixture"); err != nil {
+				t.Fatal(err)
+			}
+			detail, err := f.c.GetTask(ctx, f.task.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var lead api.Agent
+			for _, a := range detail.Agents {
+				if a.Name == "correction-lead-0" {
+					lead = a
+				}
+			}
+			if lead.ID == "" {
+				t.Fatal("lead missing")
+			}
+			terminal := "dismissed"
+			if _, err := f.st.UpdateWorkItem(ctx, f.task.ID, f.item.ID, api.UpdateWorkItemRequest{Revision: f.item.Revision, Status: &terminal}, api.Caller{Node: "fixture", User: "owner"}); err != nil {
+				t.Fatal(err)
+			}
+			var obligationID string
+			if changedSnapshot {
+				req, err := closeTeamSnapshot(detail.Task, detail.Agents, "", "")
+				if err != nil {
+					t.Fatal(err)
+				}
+				req.RequestID = "queue-close-stale-snapshot"
+				data, _ := json.Marshal(req)
+				q, err = f.c.GetTeamQueueEntry(ctx, f.task.ID, q.ID)
+				if err != nil {
+					t.Fatal(err)
+				}
+				q, err = f.c.TeamQueueAction(ctx, f.task.ID, api.TeamQueueRequest{RequestID: "freeze-stale", Operation: "close", EntryID: q.ID, ExpectedRevision: q.Revision, CloseJSON: data})
+				if err != nil {
+					t.Fatal(err)
+				}
+				if _, err := f.c.PostEvent(ctx, f.task.ID, api.PostEventRequest{AgentID: lead.ID, RunID: lead.RunID, Kind: api.EventExited}); err != nil {
+					t.Fatal(err)
+				}
+			} else {
+				msg, err := f.c.PostMessage(ctx, f.task.ID, api.PostMessageRequest{Text: "confirm delivery", To: lead.ID, RequestID: "owner-request"})
+				if err != nil {
+					t.Fatal(err)
+				}
+				obligations, err := f.c.ListObligationsFrom(ctx, f.task.ID, lead.ID, msg.Seq, msg.Seq)
+				if err != nil || len(obligations) != 1 {
+					t.Fatalf("obligation %+v %v", obligations, err)
+				}
+				obligationID = obligations[0].ID
+			}
+			if err := r.tick(ctx, f.e, f.c, "fixture"); err != nil {
+				t.Fatal(err)
+			}
+			q, err = f.c.GetTeamQueueEntry(ctx, f.task.ID, q.ID)
+			if err != nil || q.State != "running" || len(q.CloseJSON) != 0 || q.EscalationSeq != 0 {
+				t.Fatalf("waiting queue %+v %v", q, err)
+			}
+			if !changedSnapshot {
+				if _, err := f.c.CancelObligation(ctx, f.task.ID, obligationID, api.ObligationCancelRequest{Reason: "fixture resolved", RequestID: "cancel"}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := r.tick(ctx, f.e, f.c, "fixture"); err != nil {
+				t.Fatal(err)
+			}
+			q, err = f.c.GetTeamQueueEntry(ctx, f.task.ID, q.ID)
+			if err != nil || q.State != "finished" {
+				t.Fatalf("finished queue %+v %v", q, err)
+			}
+		})
+	}
+}
+
+func TestTeamRunnerSameItemLeadReplacementKeepsReservation(t *testing.T) {
+	f := newTeamFixture(t, true)
+	ctx := context.Background()
+	q, err := f.c.TeamQueueAction(ctx, f.task.ID, api.TeamQueueRequest{RequestID: "add", Operation: "add", ItemID: f.item.ID, OrderMessageSeq: f.order, Host: "fixture", Cwd: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := queueCorrectionRunner(t, f, 2)
+	if err := r.tick(ctx, f.e, f.c, "fixture"); err != nil {
+		t.Fatal(err)
+	}
+	q, err = f.c.GetTeamQueueEntry(ctx, f.task.ID, q.ID)
+	if err != nil || q.State != "running" {
+		t.Fatalf("launch %+v %v", q, err)
+	}
+	replacement := "correction-lead-1"
+	if _, err := f.st.UpdateTask(ctx, f.task.ID, api.UpdateTaskRequest{Orchestrator: &replacement}, api.Caller{Node: "fixture", User: "owner"}); err != nil {
+		t.Fatalf("same-item replacement %v", err)
+	}
+	if _, err := f.c.TeamQueueAction(ctx, f.task.ID, api.TeamQueueRequest{RequestID: "manual-race", Operation: "manual", ItemID: f.item.ID, OrderMessageSeq: f.order}); err == nil {
+		t.Fatal("manual launch crossed running reservation")
+	}
+	other := "unbound-outside-lead"
+	if _, err := f.st.UpdateTask(ctx, f.task.ID, api.UpdateTaskRequest{Orchestrator: &other}, api.Caller{Node: "fixture", User: "owner"}); err == nil {
+		t.Fatal("unbound lead crossed reservation")
+	}
+	terminal := "dismissed"
+	if _, err := f.st.UpdateWorkItem(ctx, f.task.ID, f.item.ID, api.UpdateWorkItemRequest{Revision: f.item.Revision, Status: &terminal}, api.Caller{Node: "fixture", User: "owner"}); err != nil {
+		t.Fatal(err)
+	}
+	detail, err := f.c.GetTask(ctx, f.task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	closeReq, err := closeTeamSnapshot(detail.Task, detail.Agents, "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.c.CloseItemTeam(ctx, f.task.ID, closeReq); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.tick(ctx, f.e, f.c, "fixture"); err != nil {
+		t.Fatal(err)
+	}
+	q, err = f.c.GetTeamQueueEntry(ctx, f.task.ID, q.ID)
+	if err != nil || q.State != "finished" {
+		t.Fatalf("finished after replacement %+v %v", q, err)
+	}
+}

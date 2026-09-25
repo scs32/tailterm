@@ -27,6 +27,16 @@ func migrateTeamQueue(db *sql.DB) error {
  CREATE TABLE IF NOT EXISTS team_queue_requests(task_id TEXT NOT NULL,request_id TEXT NOT NULL,payload_hash TEXT NOT NULL,result_json BLOB NOT NULL,PRIMARY KEY(task_id,request_id));
  CREATE TABLE IF NOT EXISTS team_launch_reservations(task_id TEXT PRIMARY KEY REFERENCES tasks(id),entry_id TEXT NOT NULL DEFAULT '',item_id TEXT NOT NULL, token TEXT NOT NULL,
  pause_generation INTEGER NOT NULL, state TEXT NOT NULL CHECK(state IN ('reserved','launching','running')), created_at TEXT NOT NULL);`)
+	if err != nil {
+		return err
+	}
+	var n int
+	if err := db.QueryRow(`SELECT count(*) FROM pragma_table_info('team_queue_entries') WHERE name='released_at'`).Scan(&n); err != nil {
+		return err
+	}
+	if n == 0 {
+		_, err = db.Exec(`ALTER TABLE team_queue_entries ADD COLUMN released_at TEXT NOT NULL DEFAULT ''`)
+	}
 	return err
 }
 
@@ -36,6 +46,54 @@ func validTeamQueueID(id string) bool {
 	}
 	_, err := hex.DecodeString(id[4:])
 	return err == nil
+}
+
+// Releasing a reservation is an explicit owner action. Every known run of the
+// item must have a durable close and cleanup receipt. An attempted spawn with
+// no exact registration stays unresolved and cannot be released by guessing.
+func queueReleaseSafe(ctx context.Context, tx *sql.Tx, task, item string, launch json.RawMessage) error {
+	var plan struct {
+		Members []struct {
+			Fields struct {
+				AgentID string `json:"agentId"`
+			} `json:"fields"`
+			State string `json:"state"`
+			RunID string `json:"runId"`
+		} `json:"members"`
+	}
+	if len(launch) != 0 && json.Unmarshal(launch, &plan) != nil {
+		return api.ErrConflict
+	}
+	for _, m := range plan.Members {
+		if m.State == "unstarted" {
+			continue
+		}
+		if m.State != "started" && m.State != "uncertain" {
+			return api.ErrConflict
+		}
+		var status string
+		var cleanup bool
+		err := tx.QueryRowContext(ctx, `SELECT status,cleanup_done FROM agents WHERE task_id=? AND id=? AND run_id=?`, task, m.Fields.AgentID, m.RunID).Scan(&status, &cleanup)
+		if err != nil || status != api.AgentClosed || !cleanup {
+			return fmt.Errorf("%w: attempted spawn lacks exact close and cleanup receipts", api.ErrConflict)
+		}
+	}
+	rows, err := tx.QueryContext(ctx, `SELECT a.status,a.cleanup_done FROM agent_work_item_bindings b JOIN agents a ON a.id=b.agent_id AND a.run_id=b.run_id WHERE b.item_task_id=? AND b.item_id=?`, task, item)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var status string
+		var cleanup bool
+		if err := rows.Scan(&status, &cleanup); err != nil {
+			return err
+		}
+		if status != api.AgentClosed || !cleanup {
+			return fmt.Errorf("%w: item team still has live or uncleaned runs", api.ErrConflict)
+		}
+	}
+	return rows.Err()
 }
 
 func recordedTeamOrder(ctx context.Context, tx *sql.Tx, task, item string, revision, seq int64) error {
@@ -50,12 +108,12 @@ func recordedTeamOrder(ctx context.Context, tx *sql.Tx, task, item string, revis
 	return nil
 }
 
-const teamQueueCols = `id,task_id,item_id,item_revision,order_seq,template,position,state,revision,host,cwd,pause_generation,launch_json,close_json,failure,escalation_seq`
+const teamQueueCols = `id,task_id,item_id,item_revision,order_seq,template,position,state,revision,host,cwd,pause_generation,launch_json,close_json,failure,escalation_seq,released_at`
 
 func scanTeamQueue(row interface{ Scan(...any) error }) (api.TeamQueueEntry, error) {
 	var e api.TeamQueueEntry
 	var launch, close []byte
-	err := row.Scan(&e.ID, &e.TaskID, &e.ItemID, &e.ItemRevision, &e.OrderMessageSeq, &e.Template, &e.Position, &e.State, &e.Revision, &e.Host, &e.Cwd, &e.PauseGeneration, &launch, &close, &e.Failure, &e.EscalationSeq)
+	err := row.Scan(&e.ID, &e.TaskID, &e.ItemID, &e.ItemRevision, &e.OrderMessageSeq, &e.Template, &e.Position, &e.State, &e.Revision, &e.Host, &e.Cwd, &e.PauseGeneration, &launch, &close, &e.Failure, &e.EscalationSeq, &e.ReleasedAt)
 	if err != nil {
 		return e, err
 	}
@@ -126,7 +184,12 @@ func (s *Store) TeamQueueAction(ctx context.Context, task string, req api.TeamQu
 	if !api.ValidID(task, "tsk") || !validRequestID(req.RequestID) {
 		return zero, api.ErrInvalid
 	}
-	b, _ := json.Marshal(req)
+	identity := req
+	if identity.Operation == "release" {
+		// A lost response is replayable after the release increments revision.
+		identity.ExpectedRevision = 0
+	}
+	b, _ := json.Marshal(identity)
 	h := sha256.Sum256(b)
 	hash := hex.EncodeToString(h[:])
 	s.writeMu.Lock()
@@ -137,6 +200,12 @@ func (s *Store) TeamQueueAction(ctx context.Context, task string, req api.TeamQu
 	if err == nil {
 		if oldHash != hash {
 			return zero, fmt.Errorf("%w: team queue retry differs", api.ErrConflict)
+		}
+		if req.Operation == "manual" || req.Operation == "claim" {
+			var reservedToken string
+			if lookupErr := s.db.QueryRowContext(ctx, `SELECT token FROM team_launch_reservations WHERE task_id=?`, task).Scan(&reservedToken); lookupErr != nil || reservedToken != req.RequestID {
+				return zero, fmt.Errorf("%w: launch reservation has since been released", api.ErrConflict)
+			}
 		}
 		var e api.TeamQueueEntry
 		err = json.Unmarshal(old, &e)
@@ -175,6 +244,56 @@ func (s *Store) TeamQueueAction(ctx context.Context, task string, req api.TeamQu
 	now := ts(s.now())
 	var e api.TeamQueueEntry
 	switch req.Operation {
+	case "manual_release":
+		if !api.ValidID(req.ItemID, "wi") || req.OrderMessageSeq < 1 || req.ReservationToken != fmt.Sprintf("manual-%s-%s-%d", task, req.ItemID, req.OrderMessageSeq) || t.Orchestrator != "" || t.CleanupPending != 0 {
+			return zero, api.ErrConflict
+		}
+		var reservedItem, reservedEntry, token, state string
+		err := tx.QueryRowContext(ctx, `SELECT item_id,entry_id,token,state FROM team_launch_reservations WHERE task_id=?`, task).Scan(&reservedItem, &reservedEntry, &token, &state)
+		if err != nil || reservedItem != req.ItemID || reservedEntry != "" || token != req.ReservationToken || (state != "reserved" && state != "launching") {
+			return zero, fmt.Errorf("%w: exact manual reservation is missing", api.ErrConflict)
+		}
+		if state == "launching" {
+			var proof struct {
+				Task    string `json:"task"`
+				Item    string `json:"item"`
+				Order   int64  `json:"order"`
+				Members []struct {
+					AgentID string `json:"agentId"`
+					State   string `json:"state"`
+					RunID   string `json:"runId"`
+				} `json:"members"`
+			}
+			if !req.SessionsChecked || json.Unmarshal(req.ManualJournal, &proof) != nil || proof.Task != task || proof.Item != req.ItemID || proof.Order != req.OrderMessageSeq || len(proof.Members) == 0 {
+				return zero, fmt.Errorf("%w: exact manual journal and host session proof are required", api.ErrConflict)
+			}
+			seen := map[string]bool{}
+			for _, m := range proof.Members {
+				if !api.ValidID(m.AgentID, "agt") || seen[m.AgentID] || (m.State != "unstarted" && m.State != "uncertain" && m.State != "started") {
+					return zero, api.ErrInvalid
+				}
+				seen[m.AgentID] = true
+				if m.State == "unstarted" {
+					continue
+				}
+				var run, status string
+				var clean bool
+				err := tx.QueryRowContext(ctx, `SELECT run_id,status,cleanup_done FROM agents WHERE task_id=? AND id=?`, task, m.AgentID).Scan(&run, &status, &clean)
+				if errors.Is(err, sql.ErrNoRows) && m.State == "uncertain" && m.RunID == "" {
+					continue
+				}
+				if err != nil || m.RunID != run || status != api.AgentClosed || !clean {
+					return zero, fmt.Errorf("%w: manual attempted run lacks exact close and cleanup", api.ErrConflict)
+				}
+			}
+		}
+		if err := queueReleaseSafe(ctx, tx, task, req.ItemID, nil); err != nil {
+			return zero, err
+		}
+		if _, err = tx.ExecContext(ctx, `DELETE FROM team_launch_reservations WHERE task_id=? AND item_id=? AND token=? AND entry_id=''`, task, req.ItemID, token); err != nil {
+			return zero, err
+		}
+		e = api.TeamQueueEntry{TaskID: task, ItemID: req.ItemID, OrderMessageSeq: req.OrderMessageSeq, State: "released", ReleasedAt: now}
 	case "manual":
 		if !api.ValidID(req.ItemID, "wi") || req.OrderMessageSeq < 1 || req.PauseGeneration != t.PauseGeneration || t.Orchestrator != "" || t.CleanupPending != 0 || t.PauseState != api.ProjectPauseActive {
 			return zero, api.ErrConflict
@@ -183,6 +302,11 @@ func (s *Store) TeamQueueAction(ctx context.Context, task string, req api.TeamQu
 		_ = tx.QueryRowContext(ctx, `SELECT count(*) FROM team_queue_entries WHERE task_id=? AND item_id=?`, task, req.ItemID).Scan(&queued)
 		if queued > 0 {
 			return zero, fmt.Errorf("%w: item is already in team queue", api.ErrConflict)
+		}
+		var blocked int
+		_ = tx.QueryRowContext(ctx, `SELECT count(*) FROM team_queue_entries WHERE task_id=? AND state='failed' AND released_at=''`, task).Scan(&blocked)
+		if blocked > 0 {
+			return zero, fmt.Errorf("%w: unresolved failed queue entry", api.ErrConflict)
 		}
 		item, err := getWorkItem(tx, ctx, task, req.ItemID)
 		if err != nil {
@@ -227,7 +351,7 @@ func (s *Store) TeamQueueAction(ctx context.Context, task string, req api.TeamQu
 		if err != nil {
 			return zero, fmt.Errorf("%w: duplicate item or queue entry: %v", api.ErrConflict, err)
 		}
-	case "remove", "reorder", "claim", "freeze", "attempt", "started", "running", "close", "finish", "fail":
+	case "remove", "reorder", "claim", "freeze", "attempt", "started", "running", "close", "close_refresh", "finish", "fail", "release":
 		if !validTeamQueueID(req.EntryID) {
 			return zero, api.ErrInvalid
 		}
@@ -242,6 +366,27 @@ func (s *Store) TeamQueueAction(ctx context.Context, task string, req api.TeamQu
 			return zero, fmt.Errorf("%w: entry revision changed", api.ErrConflict)
 		}
 		switch req.Operation {
+		case "release":
+			if e.State != "failed" || e.ReleasedAt != "" || t.Orchestrator != "" || t.CleanupPending != 0 {
+				return zero, api.ErrConflict
+			}
+			if err := queueReleaseSafe(ctx, tx, task, e.ItemID, e.LaunchJSON); err != nil {
+				return zero, err
+			}
+			var reservedEntry string
+			err := tx.QueryRowContext(ctx, `SELECT entry_id FROM team_launch_reservations WHERE task_id=?`, task).Scan(&reservedEntry)
+			if err != nil && !errors.Is(err, sql.ErrNoRows) {
+				return zero, err
+			}
+			if err == nil && reservedEntry != e.ID {
+				return zero, fmt.Errorf("%w: another team holds the reservation", api.ErrConflict)
+			}
+			if err == nil {
+				if _, err = tx.ExecContext(ctx, `DELETE FROM team_launch_reservations WHERE task_id=? AND entry_id=? AND item_id=?`, task, e.ID, e.ItemID); err != nil {
+					return zero, err
+				}
+			}
+			e.ReleasedAt = now
 		case "remove":
 			if e.State != "queued" {
 				return zero, fmt.Errorf("%w: only queued entries can be removed", api.ErrConflict)
@@ -308,6 +453,11 @@ func (s *Store) TeamQueueAction(ctx context.Context, task string, req api.TeamQu
 		case "claim":
 			if e.State != "queued" || t.PauseState != api.ProjectPauseActive || t.Orchestrator != "" || t.CleanupPending != 0 || req.Host != e.Host || req.PauseGeneration != t.PauseGeneration {
 				return zero, fmt.Errorf("%w: project is not launchable", api.ErrConflict)
+			}
+			var blocked int
+			_ = tx.QueryRowContext(ctx, `SELECT count(*) FROM team_queue_entries WHERE task_id=? AND state='failed' AND released_at=''`, task).Scan(&blocked)
+			if blocked > 0 {
+				return zero, fmt.Errorf("%w: unresolved failed queue entry", api.ErrConflict)
 			}
 			var head string
 			err = tx.QueryRowContext(ctx, `SELECT id FROM team_queue_entries WHERE task_id=? AND state='queued' ORDER BY position LIMIT 1`, task).Scan(&head)
@@ -419,6 +569,22 @@ func (s *Store) TeamQueueAction(ctx context.Context, task string, req api.TeamQu
 				return zero, api.ErrConflict
 			}
 			e.CloseJSON = req.CloseJSON
+		case "close_refresh":
+			if e.State != "running" || len(e.CloseJSON) == 0 {
+				return zero, api.ErrConflict
+			}
+			var previous api.TeamCloseRequest
+			if json.Unmarshal(e.CloseJSON, &previous) != nil || previous.RequestID != req.CloseRequestID {
+				return zero, api.ErrConflict
+			}
+			var receipt int
+			if err := tx.QueryRowContext(ctx, `SELECT count(*) FROM team_close_receipts WHERE task_id=? AND request_id=?`, task, previous.RequestID).Scan(&receipt); err != nil {
+				return zero, err
+			}
+			if receipt != 0 {
+				return zero, fmt.Errorf("%w: exact team close already has a receipt", api.ErrConflict)
+			}
+			e.CloseJSON = nil
 		case "finish":
 			if e.State != "running" || len(e.CloseJSON) == 0 {
 				return zero, api.ErrConflict
@@ -481,7 +647,7 @@ func (s *Store) TeamQueueAction(ctx context.Context, task string, req api.TeamQu
 		}
 		if req.Operation != "remove" && req.Operation != "reorder" {
 			e.Revision++
-			_, err = tx.ExecContext(ctx, `UPDATE team_queue_entries SET state=?,revision=?,pause_generation=?,launch_json=?,close_json=?,failure=?,escalation_seq=?,updated_at=? WHERE id=?`, e.State, e.Revision, e.PauseGeneration, string(e.LaunchJSON), string(e.CloseJSON), e.Failure, e.EscalationSeq, now, e.ID)
+			_, err = tx.ExecContext(ctx, `UPDATE team_queue_entries SET state=?,revision=?,pause_generation=?,launch_json=?,close_json=?,failure=?,escalation_seq=?,released_at=?,updated_at=? WHERE id=?`, e.State, e.Revision, e.PauseGeneration, string(e.LaunchJSON), string(e.CloseJSON), e.Failure, e.EscalationSeq, e.ReleasedAt, now, e.ID)
 			if err != nil {
 				return zero, err
 			}

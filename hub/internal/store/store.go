@@ -276,10 +276,24 @@ func (s *Store) UpdateTask(ctx context.Context, id string, req api.UpdateTaskReq
 			if err != nil && !errors.Is(err, sql.ErrNoRows) {
 				return t, err
 			}
-			if err == nil && (token != req.TeamLaunchToken || generation != t.PauseGeneration) {
+			allowSameItemLead := false
+			if err == nil && entryID != "" && generation == t.PauseGeneration && req.TeamLaunchToken == "" {
+				var itemID, state string
+				if scanErr := s.db.QueryRowContext(ctx, `SELECT item_id,state FROM team_queue_entries WHERE task_id=? AND id=?`, id, entryID).Scan(&itemID, &state); scanErr != nil {
+					return t, scanErr
+				}
+				if state == "running" {
+					var bound int
+					if scanErr := s.db.QueryRowContext(ctx, `SELECT count(*) FROM agents a JOIN agent_work_item_bindings b ON b.agent_id=a.id AND b.run_id=a.run_id WHERE a.task_id=? AND a.name=? COLLATE NOCASE AND a.status NOT IN ('closed','exited','retired') AND b.item_task_id=? AND b.item_id=?`, id, *req.Orchestrator, id, itemID).Scan(&bound); scanErr != nil {
+						return t, scanErr
+					}
+					allowSameItemLead = bound == 1
+				}
+			}
+			if err == nil && !allowSameItemLead && (token != req.TeamLaunchToken || generation != t.PauseGeneration) {
 				return t, fmt.Errorf("%w: project team launch is reserved by another actor", api.ErrConflict)
 			}
-			if err == nil && entryID != "" {
+			if err == nil && entryID != "" && !allowSameItemLead {
 				var frozen string
 				if err := s.db.QueryRowContext(ctx, `SELECT launch_json FROM team_queue_entries WHERE task_id=? AND id=? AND state='launching'`, id, entryID).Scan(&frozen); err != nil {
 					return t, fmt.Errorf("%w: queue launch plan is not frozen", api.ErrConflict)
@@ -334,6 +348,11 @@ func (s *Store) UpdateTask(ctx context.Context, id string, req api.UpdateTaskReq
 	}
 	if _, err = tx.ExecContext(ctx, `UPDATE tasks SET name=?, goal=?, status=?, closed_at=?, allow_agent_spawn=?,max_new_agents=?,swarm=?,orchestrator=?,lead_revision=? WHERE id=?`, t.Name, t.Goal, t.Status, closedAt, t.AllowAgentSpawn, t.MaxNewAgents, t.Swarm, t.Orchestrator, t.LeadRevision, id); err != nil {
 		return t, err
+	}
+	if req.Orchestrator != nil && *req.Orchestrator != "" && req.TeamLaunchToken != "" {
+		if _, err = tx.ExecContext(ctx, `UPDATE team_launch_reservations SET state='launching' WHERE task_id=? AND token=? AND entry_id=''`, id, req.TeamLaunchToken); err != nil {
+			return t, err
+		}
 	}
 	// Broker phase 3: work sent to role:lead follows the lead.
 	if req.Orchestrator != nil && previousLead.ID != "" {
