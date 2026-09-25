@@ -782,16 +782,19 @@ export function createBoardView({
       if (id && loadedDetail?.task.id !== id)
         throw new Error("Loaded project does not match the selected project.");
       const loadedMessages = result[1];
-      // Cached reads can paint the conversation immediately. Authoritative
-      // capability and item eligibility checks may still be pending; leave
-      // their controls unavailable until those checks complete.
+      // Cached reads can paint the conversation immediately. Keep known
+      // controls on a routine reload; a new client waits for capabilities,
+      // while a new task waits for item eligibility checks.
+      const sameLoadedTask =
+        capabilitiesClient === actionClient && detail?.task.id === id;
       detail = loadedDetail;
       messages = loadedMessages;
-      audits = {};
-      composeItems = [];
-      composeItemsError = "";
-      capabilities = null;
-      capabilitiesClient = actionClient;
+      if (!sameLoadedTask) {
+        audits = {};
+        composeItems = [];
+        composeItemsError = "";
+      }
+      if (capabilitiesClient !== actionClient) capabilities = null;
       const decisionResult = result[2];
       if (decisionResult.error) {
         if (decisionsTask !== id) decisions = [];
@@ -803,8 +806,8 @@ export function createBoardView({
       decisionsTask = id;
       render();
       paintedCachedDetail = true;
-      let loadedCapabilities = null;
-      if (actionClient.capabilities) {
+      let loadedCapabilities = capabilities;
+      if (capabilitiesClient !== actionClient && actionClient.capabilities) {
         try {
           loadedCapabilities = await actionClient.capabilities();
         } catch (error) {
@@ -873,17 +876,16 @@ export function createBoardView({
       render();
       return { id };
     } catch (e) {
-      if (
-        !paintedCachedDetail &&
-        visible &&
-        token === epoch &&
-        sameClient(actionClient)
-      ) {
-        saveDraft();
-        interruptMessageScroll();
-        presentation.interrupt();
-        root.innerHTML = `<div class="mode-empty"><h2>Hub unavailable</h2><p>${esc(e.message)}</p><button id="board-retry">Retry connection</button></div>`;
-        root.querySelector("#board-retry").onclick = retry;
+      if (visible && token === epoch && sameClient(actionClient)) {
+        if (paintedCachedDetail) {
+          notice("Board refresh unavailable: " + e.message);
+        } else {
+          saveDraft();
+          interruptMessageScroll();
+          presentation.interrupt();
+          root.innerHTML = `<div class="mode-empty"><h2>Hub unavailable</h2><p>${esc(e.message)}</p><button id="board-retry">Retry connection</button></div>`;
+          root.querySelector("#board-retry").onclick = retry;
+        }
       }
     } finally {
       pendingTokens.delete(token);

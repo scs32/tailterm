@@ -46,6 +46,7 @@ export function createTasksView({
     selected = "",
     hiddenTaskIds = new Set();
   let capabilities = null;
+  let capabilitiesClient = null;
   let clock = null;
   // View-local choices never write to the hub or vault. A changed client or
   // project lifecycle starts a fresh disclosure epoch.
@@ -170,14 +171,15 @@ export function createTasksView({
       if (added) selected = added.task.id;
       hasData = true;
       // Saved task reads may paint while live capability discovery is held.
-      // Keep capability-gated controls unavailable until that check finishes.
-      capabilities = null;
+      // Keep known controls on a routine reload, but wait on a new client.
+      if (capabilitiesClient !== actionClient) capabilities = null;
       render();
       const nextCapabilities = await actionClient
         .capabilities()
         .catch(() => null);
       if (!current()) return abandon();
       capabilities = nextCapabilities;
+      capabilitiesClient = actionClient;
     } catch (error) {
       if (!current()) return abandon();
       hasData = false;
