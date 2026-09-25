@@ -87,12 +87,45 @@ func newTeamFixture(t *testing.T, withHandler bool) teamFixture {
 		t.Fatal(err)
 	}
 	f.order = message.Seq
+	if withHandler {
+		if _, err := c.ConfirmWorkOrderScope(ctx, task.ID, f.item.ID, api.ConfirmWorkOrderScopeRequest{RequestID: "team-scope", AgentID: f.handler.ID, RunID: f.handler.RunID, ExpectedRevision: f.item.Revision, ScopeRevision: f.item.ScopeRevision, OrderMessageSeq: f.order, Complete: true}); err != nil {
+			t.Fatal(err)
+		}
+	}
 	return f
 }
 
 func (f teamFixture) args(extra ...string) []string {
 	a := []string{"launch", "--item", f.item.ID, "--order", fmt.Sprint(f.order)}
 	return append(a, extra...)
+}
+
+func (f teamFixture) confirmOrder(t *testing.T, item api.WorkItem, order int64) {
+	t.Helper()
+	_, err := f.c.ConfirmWorkOrderScope(context.Background(), f.task.ID, item.ID, api.ConfirmWorkOrderScopeRequest{RequestID: "fixture-scope-" + item.ID, AgentID: f.handler.ID, RunID: f.handler.RunID, ExpectedRevision: item.Revision, ScopeRevision: item.ScopeRevision, OrderMessageSeq: order, Complete: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+func (f *teamFixture) restartHub(t *testing.T) {
+	t.Helper()
+	if err := f.st.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := store.Open(f.dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { reopened.Close() })
+	f.st = reopened
+	srv := httptest.NewServer(server.New(reopened, func(*http.Request) (api.Caller, error) { return api.Caller{Node: "team-fixture", User: "owner"}, nil }))
+	t.Cleanup(srv.Close)
+	f.c, err = api.NewClient(srv.URL, 10*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.e.hub = srv.URL
 }
 
 func TestTeamLaunchDryRunPrintsFullPlanAndChangesNothing(t *testing.T) {

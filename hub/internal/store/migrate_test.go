@@ -98,6 +98,10 @@ CREATE INDEX agent_work_item_bindings_item ON agent_work_item_bindings(item_task
 		t.Fatal(err)
 	}
 	orderRef := api.MessageReference{TaskID: task.ID, Seq: order.Seq}
+	if _, err := s.db.Exec(`INSERT INTO work_order_scope_confirmations(task_id,item_id,item_revision,scope_revision,order_seq,request_id,payload_hash,agent_id,run_id,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)`,
+		task.ID, item.ID, item.Revision, item.ScopeRevision, order.Seq, api.NewID("req"), "fixture", "fixture", "fixture", ts(s.now())); err != nil {
+		t.Fatal(err)
+	}
 	bundle := syntheticPreparedContext(t, item, orderRef, syntheticHistory(item, order))
 	digestBytes := sha256.Sum256(bundle)
 	digest := hex.EncodeToString(digestBytes[:])

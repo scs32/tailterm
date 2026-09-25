@@ -14,6 +14,96 @@ import (
 	"github.com/scs32/tailterm/hub/internal/spawn"
 )
 
+func TestTeamRunnerBookkeepingLaunchesFourFakeMembersOnce(t *testing.T) {
+	f := newTeamFixture(t, true)
+	ctx := context.Background()
+	q, err := f.c.TeamQueueAction(ctx, f.task.ID, api.TeamQueueRequest{RequestID: "scope-queue", Operation: "add", ItemID: f.item.ID, OrderMessageSeq: f.order, Host: "fixture", Cwd: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, kind := range []string{"order", "sequencing_note", "decision"} {
+		msg, err := f.c.PostMessage(ctx, f.task.ID, api.PostMessageRequest{Text: kind, RequestID: "scope-source-" + kind, WorkItems: []api.MessageWorkItem{{ItemTaskID: f.task.ID, ItemID: f.item.ID, ItemRevision: f.item.Revision, Relationship: "primary"}}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		req := api.WorkOrderBookkeepingRequest{RequestID: "scope-save-" + kind, AgentID: f.handler.ID, RunID: f.handler.RunID, ExpectedRevision: f.item.Revision, OrderMessageSeq: f.order, SourceMessageSeq: msg.Seq, Kind: kind, QueueEntryID: q.ID}
+		first, err := f.c.SaveWorkOrderBookkeeping(ctx, f.task.ID, f.item.ID, req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		second, err := f.c.SaveWorkOrderBookkeeping(ctx, f.task.ID, f.item.ID, req)
+		if err != nil || second.ID != first.ID {
+			t.Fatalf("bookkeeping retry %+v %v", second, err)
+		}
+	}
+	if current, err := f.c.GetTeamQueueEntry(ctx, f.task.ID, q.ID); err != nil || current.Revision != q.Revision || current.ItemRevision != q.ItemRevision || current.State != "queued" || current.OrderMessageSeq != q.OrderMessageSeq {
+		t.Fatalf("bookkeeping changed queued entry %+v %v", current, err)
+	}
+	f.restartHub(t)
+	if replay, err := f.c.GetWorkOrderBookkeepingReceipt(ctx, f.task.ID, f.item.ID, "scope-save-decision"); err != nil || replay.QueueEntryID != q.ID || replay.ItemRevision != f.item.Revision {
+		t.Fatalf("restart lost bookkeeping receipt %+v %v", replay, err)
+	}
+	messages, err := f.c.ListMessages(ctx, f.task.ID, 0, "", 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var order api.Message
+	for _, msg := range messages {
+		if msg.Seq == f.order {
+			order = msg
+		}
+	}
+	if order.Seq == 0 {
+		t.Fatal("order missing")
+	}
+	spawns := 0
+	runner := teamRunner{
+		plan: func(_ context.Context, in map[string]any, out *teamLaunchResolved) error {
+			out.ItemRouting.WorkContextBundle = teamCloseCLIContext(t, f.item, order)
+			for _, role := range []string{"lead", "planner", "builder", "reviewer"} {
+				out.Plan = append(out.Plan, teamLaunchEntry{Fields: teamLaunchFields{Name: role + "-scope", Role: role, Runtime: "codex", Run: "codex", Cwd: in["cwd"].(string), Prompt: "fixture"}})
+			}
+			return nil
+		},
+		spawn: func(_ env, args []string) error {
+			spawns++
+			flags := map[string]string{}
+			for i := 0; i+1 < len(args); i += 2 {
+				flags[args[i]] = args[i+1]
+			}
+			data, err := os.ReadFile(flags["--work-context-file"])
+			if err != nil {
+				return err
+			}
+			rev, err := strconv.ParseInt(flags["--work-item-revision"], 10, 64)
+			if err != nil {
+				return err
+			}
+			seq, err := strconv.ParseInt(flags["--work-order-message"], 10, 64)
+			if err != nil {
+				return err
+			}
+			_, err = f.c.AddAgent(ctx, f.task.ID, api.AddAgentRequest{AgentID: flags["--agent-id"], ExpectedRunID: flags["--expected-run-id"], Name: flags["--name"], Host: "fixture", Session: flags["--name"], Runtime: "codex", Cwd: flags["--cwd"], WorkItem: &api.AgentWorkItemRequest{ItemTaskID: f.task.ID, ItemID: f.item.ID, ItemRevision: rev, WorkOrderMessage: api.MessageReference{TaskID: f.task.ID, Seq: seq}, ContextBundle: data}})
+			return err
+		},
+		owned: func(context.Context, env, api.Agent) error { return nil },
+	}
+	if err := runner.tick(ctx, f.e, f.c, "fixture"); err != nil {
+		t.Fatal(err)
+	}
+	if spawns != 4 {
+		t.Fatalf("fake spawns=%d, want four", spawns)
+	}
+	current, err := f.c.GetTeamQueueEntry(ctx, f.task.ID, q.ID)
+	if err != nil || current.State != "running" || current.ItemRevision != f.item.Revision || current.OrderMessageSeq != f.order {
+		t.Fatalf("launched queue %+v %v", current, err)
+	}
+	item, err := f.c.GetWorkItem(ctx, f.task.ID, f.item.ID)
+	if err != nil || item.Revision != f.item.Revision || item.ScopeRevision != f.item.ScopeRevision {
+		t.Fatalf("launch changed scope %+v %v", item, err)
+	}
+}
+
 func TestTeamRunnerTwoItemsWithFakeSpawnsAndCleanup(t *testing.T) {
 	f := newTeamFixture(t, true)
 	ctx := context.Background()
@@ -26,6 +116,7 @@ func TestTeamRunnerTwoItemsWithFakeSpawnsAndCleanup(t *testing.T) {
 		t.Fatal(err)
 	}
 	items := []api.WorkItem{f.item, second}
+	f.confirmOrder(t, second, secondOrder.Seq)
 	orders := []int64{f.order, secondOrder.Seq}
 	var queue []api.TeamQueueEntry
 	for i, item := range items {

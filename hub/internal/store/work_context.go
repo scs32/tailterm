@@ -128,6 +128,9 @@ func validateAgentWorkItemRequest(q queryRower, ctx context.Context, targetTaskI
 	if !linked {
 		return 0, "", workItemConflict("work-order message is not linked to the selected work item")
 	}
+	if err := requireConfirmedTeamOrder(ctx, q, req.ItemTaskID, req.ItemID, req.ItemRevision, req.WorkOrderMessage.Seq); err != nil {
+		return 0, "", err
+	}
 	resolvedTeamRole := req.TeamRole
 	if req.ReplacesAgentID != "" {
 		var priorTask, priorRun, priorRole, priorStatus string

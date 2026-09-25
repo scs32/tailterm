@@ -120,6 +120,7 @@ func TestAllocationIntentContextTransportParity(t *testing.T) {
 			c, task, loseReply := contextIntentFixture(t)
 			lead := spawnLauncherAgent(t, c, task)
 			item, order := realSpawnWorkItemAndOrder(t, c, task)
+			confirmCLIFixtureOrder(t, c, task, item, order, lead)
 			var bundle map[string]any
 			if err := json.Unmarshal([]byte(syntheticSpawnContextBundle(t, task, item, order)), &bundle); err != nil {
 				t.Fatal(err)

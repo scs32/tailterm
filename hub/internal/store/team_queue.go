@@ -344,6 +344,9 @@ func (s *Store) TeamQueueAction(ctx context.Context, task string, req api.TeamQu
 		if err := recordedTeamOrder(ctx, tx, task, req.ItemID, item.Revision, req.OrderMessageSeq); err != nil {
 			return zero, err
 		}
+		if err := requireConfirmedTeamOrder(ctx, tx, task, req.ItemID, item.Revision, req.OrderMessageSeq); err != nil {
+			return zero, err
+		}
 		_, err = tx.ExecContext(ctx, `INSERT INTO team_launch_reservations(task_id,entry_id,item_id,token,pause_generation,state,created_at) VALUES(?,?,?,?,?,?,?)`, task, "", req.ItemID, req.RequestID, t.PauseGeneration, "reserved", now)
 		if err != nil {
 			return zero, fmt.Errorf("%w: another team launch is reserved", api.ErrConflict)
@@ -368,6 +371,9 @@ func (s *Store) TeamQueueAction(ctx context.Context, task string, req api.TeamQu
 			return zero, fmt.Errorf("%w: item already has a live team", api.ErrConflict)
 		}
 		if err := recordedTeamOrder(ctx, tx, task, req.ItemID, item.Revision, req.OrderMessageSeq); err != nil {
+			return zero, err
+		}
+		if err := requireConfirmedTeamOrder(ctx, tx, task, req.ItemID, item.Revision, req.OrderMessageSeq); err != nil {
 			return zero, err
 		}
 		var maxPos int64
@@ -483,6 +489,9 @@ func (s *Store) TeamQueueAction(ctx context.Context, task string, req api.TeamQu
 			if e.State != "queued" || t.PauseState != api.ProjectPauseActive || t.Orchestrator != "" || t.CleanupPending != 0 || req.Host != e.Host || req.PauseGeneration != t.PauseGeneration {
 				return zero, fmt.Errorf("%w: project is not launchable", api.ErrConflict)
 			}
+			if err := requireConfirmedTeamOrder(ctx, tx, task, e.ItemID, e.ItemRevision, e.OrderMessageSeq); err != nil {
+				return zero, err
+			}
 			var blocked int
 			_ = tx.QueryRowContext(ctx, `SELECT count(*) FROM team_queue_entries WHERE task_id=? AND state='failed' AND released_at=''`, task).Scan(&blocked)
 			if blocked > 0 {
@@ -506,6 +515,9 @@ func (s *Store) TeamQueueAction(ctx context.Context, task string, req api.TeamQu
 		case "freeze":
 			if e.State != "launching" || len(e.LaunchJSON) != 0 || !json.Valid(req.LaunchJSON) || len(req.LaunchJSON) == 0 {
 				return zero, api.ErrConflict
+			}
+			if err := requireCurrentConfirmedTeamOrder(ctx, tx, task, e.ItemID, e.ItemRevision, e.OrderMessageSeq); err != nil {
+				return zero, err
 			}
 			var plan struct {
 				Task     string          `json:"task"`
@@ -553,6 +565,9 @@ func (s *Store) TeamQueueAction(ctx context.Context, task string, req api.TeamQu
 				return zero, api.ErrConflict
 			}
 			if req.Operation == "attempt" {
+				if err := requireCurrentConfirmedTeamOrder(ctx, tx, task, e.ItemID, e.ItemRevision, e.OrderMessageSeq); err != nil {
+					return zero, err
+				}
 				run, _ := member["runId"].(string)
 				if member["state"] != "unstarted" || !validRunID(run) {
 					return zero, api.ErrConflict

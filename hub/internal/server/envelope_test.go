@@ -215,6 +215,7 @@ func TestTypedMessageReachesBoundRecipient(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	confirmHTTPContextOrder(t, c, task, item, order)
 	orderRef := api.MessageReference{TaskID: task.ID, Seq: order.Seq}
 	bind := func(name, role string) api.Agent {
 		t.Helper()

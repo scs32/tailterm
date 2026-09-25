@@ -8,6 +8,9 @@ func migrate(db *sql.DB) error {
 	if err := migrateTeamQueue(db); err != nil {
 		return err
 	}
+	if err := migrateWorkOrderScope(db); err != nil {
+		return err
+	}
 	if _, err := db.Exec(messageChecksSchema); err != nil {
 		return err
 	}

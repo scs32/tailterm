@@ -17,6 +17,39 @@ async function collectPages(read, field) {
   throw new Error("The work-item history exceeded the page limit.");
 }
 
+export async function assertCurrentWorkOrderScope(
+  client,
+  { itemTaskId, itemId, itemRevision, workOrderMessage },
+  knownCurrent = null,
+) {
+  const current = knownCurrent || await client.getWorkItem(itemTaskId, itemId);
+  if (current?.revision !== itemRevision)
+    throw new Error("The work item changed; refresh its scope and order before launch.");
+  let confirmation;
+  try {
+    confirmation = await client.getWorkOrderScopeConfirmation(
+      itemTaskId,
+      itemId,
+      itemRevision,
+      workOrderMessage.seq,
+    );
+  } catch (error) {
+    throw new Error(
+      `Scope is not confirmed for this item revision and order. Ask the database handler to complete intake before launch. ${error.message}`,
+    );
+  }
+  if (
+    confirmation?.taskId !== itemTaskId ||
+    confirmation?.itemId !== itemId ||
+    confirmation?.itemRevision !== itemRevision ||
+    confirmation?.orderMessageSeq !== workOrderMessage.seq ||
+    confirmation?.scopeRevision !== current.scopeRevision
+  )
+    throw new Error(
+      "Scope confirmation is stale or belongs to another item; ask the database handler to confirm this revision and order.",
+    );
+}
+
 // Build the immutable bundle used at admission from the accepted history
 // interface. No prose, reply chain, recipient or timestamp inference is used.
 export async function prepareWorkItemContext(
@@ -33,7 +66,8 @@ export async function prepareWorkItemContext(
     workOrderMessage.seq < 1
   )
     throw new Error("Choose an exact item revision and recorded work order.");
-  const [revision, revisionPages, gapPages, messagePages] = await Promise.all([
+  const [current, revision, revisionPages, gapPages, messagePages] = await Promise.all([
+    client.getWorkItem(itemTaskId, itemId),
     client.getWorkItemRevision(itemTaskId, itemId, itemRevision),
     collectPages(
       (after) =>
@@ -54,6 +88,8 @@ export async function prepareWorkItemContext(
       "links",
     ),
   ]);
+  if (current?.revision !== itemRevision)
+    throw new Error("The work item changed; refresh its scope and order before launch.");
   const coverage = revisionPages.coverage || messagePages.coverage;
   if (coverage?.conversationLinks !== "explicit_only")
     throw new Error("The hub did not provide explicit-only context coverage.");
@@ -67,6 +103,11 @@ export async function prepareWorkItemContext(
     throw new Error(
       "The recorded work-order message is not explicitly linked to this item.",
     );
+  await assertCurrentWorkOrderScope(
+    client,
+    { itemTaskId, itemId, itemRevision, workOrderMessage },
+    current,
+  );
   const bundle = {
     version: 1,
     itemTaskId,

@@ -27,6 +27,7 @@ func TestTeamCloseHTTPGatesAndReplay(t *testing.T) {
 			if code := c.do("POST", "/v1/tasks/"+task.ID+"/messages", auditLinked(item, "team-close-order"), &order); code != 201 {
 				t.Fatalf("order %d", code)
 			}
+			handler := confirmHTTPContextOrder(t, c, task, item, order)
 			add := func(name, role string) api.Agent {
 				var a api.Agent
 				req := api.AddAgentRequest{Name: name, Role: role, Host: "fixture", Session: name, Runtime: "codex",
@@ -41,10 +42,6 @@ func TestTeamCloseHTTPGatesAndReplay(t *testing.T) {
 			worker := add("worker", "")
 			var other api.Agent
 			if code := c.do("POST", "/v1/tasks/"+task.ID+"/agents", api.AddAgentRequest{Name: "outside", Host: "fixture", Session: "outside"}, &other); code != 201 {
-				t.Fatal(code)
-			}
-			var handler api.Agent
-			if code := c.do("POST", "/v1/tasks/"+task.ID+"/agents", api.AddAgentRequest{Name: "database", AgentID: api.NewID("agt"), Role: api.AgentRoleDatabaseHandler, Host: "fixture", Session: "database"}, &handler); code != 201 {
 				t.Fatal(code)
 			}
 			req := api.TeamCloseRequest{RequestID: "http-close-" + terminal, ActorAgentID: lead.ID, ActorRunID: lead.RunID,

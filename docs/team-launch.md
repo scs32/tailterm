@@ -1,5 +1,42 @@
 # Local Planned delivery team launch
 
+## File scope before admission
+
+During intake, the database handler reads the owner-filed item and bounded
+order. If the item already states the ordered acceptance and owned files, the
+handler confirms that exact item revision, scope revision and order:
+
+```sh
+tt work-items scope confirm --project tsk_... --revision 2 --scope-revision 2 --order 123 --request-id intake-123 --complete wi_...
+tt work-items scope get --project tsk_... --revision 2 --order 123 wi_...
+```
+
+The handler runs these commands from its own agent session. The `--complete`
+flag is its explicit semantic assertion; the hub checks the handler's exact
+run and the immutable order link. If the owner filing is incomplete, the
+handler records the missing scope through the ordinary work-item update path
+and confirms the new revision. No extra owner confirmation is needed for a
+complete filing. Queue add, manual launch, TailOS planning and final agent
+registration refuse missing or stale confirmation before admitting a team.
+An actual scope edit advances the item revision and needs a new confirmation.
+
+For an order, sequencing note or decision that changes no item field, the
+handler saves a separate receipt. This leaves item and queue revisions, the
+selected order, prepared contexts and Start evidence intact:
+
+```sh
+tt work-items scope save --project tsk_... --revision 2 --order 123 --source 124 --kind sequencing_note --queue-entry tqe_... --request-id note-124 wi_...
+tt work-items scope receipt --project tsk_... --request-id note-124 wi_...
+```
+
+For an admitted team, pass `--admissions-file` containing a JSON array of the
+exact current `{agentId,runId,contextDigest}` bindings. A queued item has no
+admitted bindings and needs no file. Retrying an unchanged request ID returns
+the same receipt, including after a lost response or hub restart. A changed
+payload or mismatched source, queue, run or digest is refused. A decision that
+changes acceptance or owned files uses the ordinary revision checked update;
+the bookkeeping path cannot edit item fields.
+
 ## Project team queue
 
 On the launch host, the owner can save a sequence of recorded item orders:

@@ -5,7 +5,10 @@ import { modelPickerHTML, wireModelPicker } from "./model-picker.js";
 import { resolveTeam, teamLaunches } from "./teams.js";
 import { teamLaunchPlan } from "./team-launch-plan.js";
 import { withDatabaseHandler } from "./project-handler.js";
-import { prepareWorkItemContext } from "./work-item-context.js";
+import {
+  assertCurrentWorkOrderScope,
+  prepareWorkItemContext,
+} from "./work-item-context.js";
 import { serializedWorkContext } from "../shared/work-context.js";
 import {
   launchPlanForStorage,
@@ -1879,6 +1882,16 @@ export function createTaskHub(host) {
       // attempt. Browser-side validation failures never reach tt and must not
       // poison a later exact-identity retry.
       agentSpawnCommand({ hub: client.base, task: taskId, ...launchFields });
+      if (journal?.kind === "add-team")
+        await assertCurrentWorkOrderScope(client, {
+          itemTaskId: fields.workItemTaskId,
+          itemId: fields.workItemId,
+          itemRevision: fields.workItemRevision,
+          workOrderMessage: {
+            taskId: fields.workOrderTaskId,
+            seq: fields.workOrderMessageSeq,
+          },
+        });
       if (journalMember) {
         journalMember.state = "uncertain";
         await saveLaunchJournal(journal);
@@ -2112,6 +2125,15 @@ export function createTaskHub(host) {
               .forEach((el) => (el.disabled = true));
             projects.setEditable([]);
           }
+          await assertCurrentWorkOrderScope(client, {
+            itemTaskId: routing.workItemTaskId,
+            itemId: routing.workItemId,
+            itemRevision: routing.workItemRevision,
+            workOrderMessage: {
+              taskId: routing.workOrderTaskId,
+              seq: routing.workOrderMessageSeq,
+            },
+          });
           const policy = {};
           if (team.swarm) policy.swarm = true;
           const orchestrator = addTeamOrchestrator(

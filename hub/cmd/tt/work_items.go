@@ -58,7 +58,7 @@ func bodyFile(path string) (string, error) {
 
 func cmdWorkItems(e env, args []string) error {
 	if len(args) == 0 {
-		return errors.New("usage: tt work-items <list|get|create|update|receipt|dispatch|revisions|messages|evidence|narrative>")
+		return errors.New("usage: tt work-items <list|get|create|update|receipt|dispatch|revisions|messages|scope|evidence|narrative>")
 	}
 	switch args[0] {
 	case "list":
@@ -77,6 +77,8 @@ func cmdWorkItems(e env, args []string) error {
 		return cmdWorkItemRevisions(e, args[1:])
 	case "messages":
 		return cmdWorkItemMessages(e, args[1:])
+	case "scope":
+		return cmdWorkOrderScope(e, args[1:])
 	case "evidence":
 		return cmdWorkItemEvidence(e, args[1:])
 	case "narrative":

@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { prepareWorkItemContext } from "../client/work-item-context.js";
+import { assertCurrentWorkOrderScope, prepareWorkItemContext } from "../client/work-item-context.js";
 import { MAX_WORK_CONTEXT_BYTES } from "../shared/work-context.js";
 
 const source = {
@@ -20,9 +20,13 @@ test("prepared model context consumes every accepted history page and only expli
     conversationLinks: "explicit_only",
   };
   const client = {
+    getWorkItem: async (...args) => {
+      calls.push(["current", ...args]);
+      return { revision: 3, scopeRevision: 1 };
+    },
     getWorkItemRevision: async (...args) => {
       calls.push(["exact", ...args]);
-      return { itemId: source.itemId, revision: 3, description: "Current" };
+      return { itemId: source.itemId, revision: 3, scopeRevision: 1, description: "Current" };
     },
     listWorkItemRevisions: async (_task, _item, { after }) => ({
       revisions:
@@ -53,6 +57,7 @@ test("prepared model context consumes every accepted history page and only expli
       ],
       coverage,
     }),
+    getWorkOrderScopeConfirmation: async () => ({ taskId: source.itemTaskId, itemId: source.itemId, itemRevision: 3, scopeRevision: 1, orderMessageSeq: 814 }),
   };
   const bundle = await prepareWorkItemContext(client, source);
   assert.equal(bundle.history.revisions.length, 2);
@@ -63,13 +68,49 @@ test("prepared model context consumes every accepted history page and only expli
   );
   assert.equal(JSON.stringify(bundle).includes("UNRELATED"), false);
   assert.deepEqual(calls, [
+    ["current", source.itemTaskId, source.itemId],
     ["exact", source.itemTaskId, source.itemId, source.itemRevision],
   ]);
 });
 
+test("launch preparation refuses missing and wrong-item scope confirmations", async () => {
+  const client = {
+    getWorkItem: async () => ({ revision: 3, scopeRevision: 1 }),
+    getWorkItemRevision: async () => ({ revision: 3, scopeRevision: 1 }),
+    listWorkItemRevisions: async () => ({ revisions: [{ revision: 3 }], coverage: { conversationLinks: "explicit_only" } }),
+    listWorkItemHistoryGaps: async () => ({ gaps: [] }),
+    listWorkItemMessages: async () => ({ links: [{ relationship: "primary", message: { taskId: source.itemTaskId, seq: 814 } }] }),
+    getWorkOrderScopeConfirmation: async () => { throw new Error("not found"); },
+  };
+  await assert.rejects(prepareWorkItemContext(client, source), /complete intake before launch/);
+  client.getWorkOrderScopeConfirmation = async () => ({ taskId: source.itemTaskId, itemId: "wi_1111111111111111", itemRevision: 3, scopeRevision: 1, orderMessageSeq: 814 });
+  await assert.rejects(prepareWorkItemContext(client, source), /another item/);
+  client.getWorkItem = async () => ({ revision: 4, scopeRevision: 2 });
+  await assert.rejects(prepareWorkItemContext(client, source), /work item changed/);
+});
+
+test("frozen retry recheck refuses changed scope before its next launch", async () => {
+  let current = { revision: 3, scopeRevision: 1 };
+  let confirmation = { taskId: source.itemTaskId, itemId: source.itemId, itemRevision: 3, scopeRevision: 1, orderMessageSeq: 814 };
+  const client = {
+    getWorkItem: async () => current,
+    getWorkOrderScopeConfirmation: async () => confirmation,
+  };
+  await assertCurrentWorkOrderScope(client, source);
+  current = { revision: 4, scopeRevision: 2 };
+  await assert.rejects(assertCurrentWorkOrderScope(client, source), /work item changed/);
+  current = { revision: 3, scopeRevision: 2 };
+  await assert.rejects(assertCurrentWorkOrderScope(client, source), /confirmation is stale/);
+  current = { revision: 3, scopeRevision: 1 };
+  confirmation = { ...confirmation, orderMessageSeq: 999 };
+  await assert.rejects(assertCurrentWorkOrderScope(client, source), /another item/);
+});
+
 test("prepared context rejects inferred orders, cursor loops and oversized complete history", async () => {
   const base = {
-    getWorkItemRevision: async () => ({ revision: 3 }),
+    getWorkItem: async () => ({ revision: 3, scopeRevision: 1 }),
+    getWorkItemRevision: async () => ({ revision: 3, scopeRevision: 1 }),
+    getWorkOrderScopeConfirmation: async () => ({ taskId: source.itemTaskId, itemId: source.itemId, itemRevision: 3, scopeRevision: 1, orderMessageSeq: 814 }),
     listWorkItemRevisions: async () => ({
       revisions: [],
       coverage: { conversationLinks: "explicit_only" },
@@ -143,7 +184,7 @@ test("complete context accepts measured size and UTF-8 boundary without source l
     MAX_WORK_CONTEXT_BYTES,
     MAX_WORK_CONTEXT_BYTES + 1,
   ]) {
-    const revision = { revision: 3, description: "Full source retained" };
+    const revision = { revision: 3, scopeRevision: 1, description: "Full source retained" };
     const revisions = [
       { revision: 1, description: "Initial ASCII requirement" },
       { revision: 2, description: 'CJK decision 界 and escaped <>&"\\' },
@@ -164,6 +205,7 @@ test("complete context accepts measured size and UTF-8 boundary without source l
       },
     ];
     const client = {
+      getWorkItem: async () => ({ revision: 3, scopeRevision: 1 }),
       getWorkItemRevision: async () => revision,
       listWorkItemRevisions: async () => ({
         revisions,
@@ -171,6 +213,7 @@ test("complete context accepts measured size and UTF-8 boundary without source l
       }),
       listWorkItemHistoryGaps: async () => ({ gaps: [] }),
       listWorkItemMessages: async () => ({ links }),
+      getWorkOrderScopeConfirmation: async () => ({ taskId: source.itemTaskId, itemId: source.itemId, itemRevision: 3, scopeRevision: 1, orderMessageSeq: 814 }),
     };
     const initial = await prepareWorkItemContext(client, source);
     const remaining = size - Buffer.byteLength(JSON.stringify(initial));

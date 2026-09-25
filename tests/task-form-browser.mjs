@@ -1132,6 +1132,46 @@ try {
           }),
         })
       ).json();
+      let scopeHandler = targetBefore.agents.find(
+        (agent) => agent.role === "database_handler" && agent.status !== "closed",
+      );
+      if (!scopeHandler) {
+        const response = await fetch(
+          `http://127.0.0.1:${port}/v1/tasks/${target.id}/agents`,
+          {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({
+              name: "browser-scope-handler",
+              session: "browser-scope-handler",
+              role: "database_handler",
+              runtime: "generic",
+              host: "fixture",
+              cwd: root,
+            }),
+          },
+        );
+        if (response.status !== 201)
+          throw new Error(`Browser handler fixture: ${response.status} ${await response.text()}`);
+        scopeHandler = await response.json();
+      }
+      const scopeResponse = await fetch(
+        `http://127.0.0.1:${port}/v1/tasks/${target.id}/work-items/${routedItem.id}/order-scope/confirm`,
+        {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            requestId: `browser-scope-${name}`,
+            agentId: scopeHandler.id,
+            runId: scopeHandler.runId,
+            expectedRevision: routedItem.revision,
+            scopeRevision: routedItem.scopeRevision,
+            orderMessageSeq: routedOrder.seq,
+            complete: true,
+          }),
+        },
+      );
+      assert.equal(scopeResponse.status, 201, await scopeResponse.text());
       // wi_dd57670ee65d974c@3/order3622: complete synthetic history above the
       // measured 269315-byte context, through browser preparation/retry/host/API.
       for (let index = 0; index < 36; index++) {
@@ -1574,6 +1614,23 @@ try {
       );
       assert.equal(nextOrderResponse.status, 201);
       const nextOrder = await nextOrderResponse.json();
+      const nextScopeResponse = await fetch(
+        `http://127.0.0.1:${port}/v1/tasks/${target.id}/work-items/${nextItem.id}/order-scope/confirm`,
+        {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            requestId: `browser-next-scope-${name}`,
+            agentId: scopeHandler.id,
+            runId: scopeHandler.runId,
+            expectedRevision: nextItem.revision,
+            scopeRevision: nextItem.scopeRevision,
+            orderMessageSeq: nextOrder.seq,
+            complete: true,
+          }),
+        },
+      );
+      assert.equal(nextScopeResponse.status, 201, await nextScopeResponse.text());
       await page.evaluate(() => qa.modes.set("teams"));
       await page.locator("[data-add-team]").click();
       await page.locator("#team-task").selectOption(target.id);
@@ -1734,6 +1791,104 @@ s.commit()
       assert.ok(history.events.some((e) => e.kind === "task_closed"));
       assert.equal(history.messages[0].text, "Archived message 1");
       await page.screenshot({ path: `.build/task-history-${name}.png` });
+
+      const staleItemResponse = await fetch(
+        `http://127.0.0.1:${port}/v1/tasks/${target.id}/work-items`,
+        {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            kind: "bug",
+            title: `Frozen retry scope ${name}`,
+            description: "Recorded launch scope",
+            agentId: targetLead.id,
+            requestId: `browser-frozen-scope-item-${name}`,
+          }),
+        },
+      );
+      assert.equal(staleItemResponse.status, 201);
+      const staleItem = await staleItemResponse.json();
+      const staleOrderResponse = await fetch(
+        `http://127.0.0.1:${port}/v1/tasks/${target.id}/messages`,
+        {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            text: "Frozen retry bounded order",
+            agentId: targetLead.id,
+            requestId: `browser-frozen-scope-order-${name}`,
+            workItems: [{
+              itemTaskId: target.id,
+              itemId: staleItem.id,
+              itemRevision: staleItem.revision,
+              relationship: "primary",
+            }],
+          }),
+        },
+      );
+      assert.equal(staleOrderResponse.status, 201);
+      const staleOrder = await staleOrderResponse.json();
+      const staleScopeResponse = await fetch(
+        `http://127.0.0.1:${port}/v1/tasks/${target.id}/work-items/${staleItem.id}/order-scope/confirm`,
+        {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            requestId: `browser-frozen-scope-confirm-${name}`,
+            agentId: scopeHandler.id,
+            runId: scopeHandler.runId,
+            expectedRevision: staleItem.revision,
+            scopeRevision: staleItem.scopeRevision,
+            orderMessageSeq: staleOrder.seq,
+            complete: true,
+          }),
+        },
+      );
+      assert.equal(staleScopeResponse.status, 201, await staleScopeResponse.text());
+      await page.evaluate(() => qa.modes.set("teams"));
+      await page.locator("[data-add-team]").click();
+      await page.locator("#team-task").selectOption(target.id);
+      await page.locator("#team-work-item").selectOption(staleItem.id);
+      await page.locator("#team-work-order").fill(String(staleOrder.seq));
+      await page.locator("#team-main-server").selectOption("local");
+      await page.locator('[data-project-server="local"]').fill(root);
+      await page.locator('[data-project-server="secondary"]').fill(root);
+      await fetch(origin + "/qa/lose-launch-reply");
+      await page.locator('#team-launch-form button[type="submit"]').click();
+      await page.locator("#team-launch-status")
+        .filter({ hasText: "Synthetic lost launch response" }).waitFor();
+      const staleJournalBefore = await page.evaluate(async (taskId) => {
+        const journal = (await qa.localData()).teamLaunchPlans.find(
+          (entry) => entry.kind === "add-team" && entry.taskId === taskId,
+        );
+        return journal.members.map(({ fields, state }) => ({ id: fields.agentId, state }));
+      }, target.id);
+      const staleExecs = execs;
+      const editStaleResponse = await fetch(
+        `http://127.0.0.1:${port}/v1/tasks/${target.id}/work-items/${staleItem.id}`,
+        {
+          method: "PATCH",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            revision: staleItem.revision,
+            description: "Actual scope changed after frozen launch",
+            agentId: targetLead.id,
+          }),
+        },
+      );
+      assert.equal(editStaleResponse.status, 200, await editStaleResponse.text());
+      await page.locator('#team-launch-form button[type="submit"]').click();
+      await page.locator("#team-launch-status")
+        .filter({ hasText: "work item changed" }).waitFor();
+      assert.equal(execs, staleExecs, "stale frozen retry reached another host spawn");
+      const staleJournalAfter = await page.evaluate(async (taskId) => {
+        const journal = (await qa.localData()).teamLaunchPlans.find(
+          (entry) => entry.kind === "add-team" && entry.taskId === taskId,
+        );
+        return journal.members.map(({ fields, state }) => ({ id: fields.agentId, state }));
+      }, target.id);
+      assert.deepEqual(staleJournalAfter, staleJournalBefore);
+      await page.locator("#dialog-close").click();
 
       const delayedScopeCheck = async (suffix, mutate, expected) => {
         await page.evaluate(() => qa.hub.newTask(undefined, qa.data.teams[0]));

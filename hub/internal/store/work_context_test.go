@@ -91,6 +91,15 @@ func contextLinkedMessage(t *testing.T, s *Store, task api.Task, item api.WorkIt
 	if err != nil {
 		t.Fatal(err)
 	}
+	if order == nil {
+		// Legacy context fixtures begin with an owner-filed order. The new
+		// admission gate is tested through its public handler path separately.
+		_, err = s.db.Exec(`INSERT INTO work_order_scope_confirmations(task_id,item_id,item_revision,scope_revision,order_seq,request_id,payload_hash,agent_id,run_id,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)`,
+			task.ID, item.ID, item.Revision, item.ScopeRevision, message.Seq, api.NewID("req"), "fixture", "fixture", "fixture", ts(s.now()))
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
 	return message
 }
 
@@ -277,6 +286,11 @@ func TestAgentWorkItemContextAdmissionRestorationAndReplacement(t *testing.T) {
 	item, err = s.GetWorkItem(ctx, task.ID, item.ID)
 	if err != nil || item.Revision != launchRevision+1 {
 		t.Fatalf("advanced item: %+v %v", item, err)
+	}
+	_, err = s.db.Exec(`INSERT INTO work_order_scope_confirmations(task_id,item_id,item_revision,scope_revision,order_seq,request_id,payload_hash,agent_id,run_id,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)`,
+		task.ID, item.ID, item.Revision, item.ScopeRevision, order.Seq, api.NewID("req"), "fixture", "fixture", "fixture", ts(s.now()))
+	if err != nil {
+		t.Fatal(err)
 	}
 	staleUnbound := api.PostMessageRequest{
 		Text: "Unbound stale revision claim", AgentID: legacy.ID, RequestID: "context-unbound-stale",

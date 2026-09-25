@@ -103,6 +103,8 @@ export function createHubClient({ fetchImpl, baseURL, token = "" }) {
       request(`/v1/tasks/${task}/work-items/${id}/revisions` + q(params)),
     getWorkItemRevision: (task, id, revision) =>
       request(`/v1/tasks/${task}/work-items/${id}/revisions/${revision}`),
+    getWorkOrderScopeConfirmation: (task, id, revision, order) =>
+      request(`/v1/tasks/${task}/work-items/${id}/order-scope` + q({ revision, order })),
     listWorkItemHistoryGaps: (task, id, params = {}) =>
       request(`/v1/tasks/${task}/work-items/${id}/history-gaps` + q(params)),
     listWorkItemMessages: (task, id, params = {}) =>

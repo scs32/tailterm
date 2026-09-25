@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -656,7 +657,14 @@ func TestSpawnProceedsPastCapabilityGateWhenHubSupportsAllocationIntent(t *testi
 	c, task := newMixedVersionSpawnFixture(t, func(w http.ResponseWriter, r *http.Request) bool { return false })
 	launcher := spawnLauncherAgent(t, c, task)
 	e := env{hub: c.Base, task: task, agent: launcher.ID}
-	err := cmdSpawn(e, itemBoundSpawnArgs(t, c, task))
+	args := itemBoundSpawnArgs(t, c, task)
+	item, order := args[7], args[15]
+	seq, err := strconv.ParseInt(order, 10, 64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	confirmCLIFixtureOrder(t, c, task, item, seq, launcher)
+	err = cmdSpawn(e, args)
 	if err == nil || strings.Contains(err.Error(), "does not support a compatible allocation-intent") || !strings.Contains(err.Error(), "allocation intent") {
 		t.Fatalf("capability gate should have passed (failing only on the missing allocation intent) against an up-to-date hub, got %v", err)
 	}
@@ -674,10 +682,15 @@ func TestSpawnOldStyleRequestWithoutIntentRejectedByCorrectedHub(t *testing.T) {
 	launcher := spawnLauncherAgent(t, c, task)
 	e := env{hub: c.Base, task: task, agent: launcher.ID}
 	args := itemBoundSpawnArgs(t, c, task)
+	seq, err := strconv.ParseInt(args[15], 10, 64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	confirmCLIFixtureOrder(t, c, task, args[7], seq, launcher)
 	// Simulate the pre-AllocationIntent CLI shape: no --agent-id was ever
 	// generated or supplied, so no allocation intent could have been
 	// authored for this candidate before the launch attempt.
-	err := cmdSpawn(e, args)
+	err = cmdSpawn(e, args)
 	if err == nil || !strings.Contains(err.Error(), "allocation intent") {
 		t.Fatalf("expected an actionable missing-allocation-intent rejection from the corrected hub, got %v", err)
 	}

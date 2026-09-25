@@ -389,6 +389,7 @@ func TestAllocationIntentEndpoint(t *testing.T) {
 		t.Fatal(err)
 	}
 	orderRef := api.MessageReference{TaskID: task.ID, Seq: order.Seq}
+	confirmHTTPContextOrder(t, c, task, item, order)
 	agentID := api.NewID("agt")
 	bundle := syntheticServerTestContext(t, item, orderRef, order)
 	digestBytes := sha256.Sum256(bundle)

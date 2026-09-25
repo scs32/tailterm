@@ -24,6 +24,11 @@ func queueOrder(t *testing.T, s *Store, item api.WorkItem, text, key string) api
 	if err != nil {
 		t.Fatal(err)
 	}
+	_, err = s.db.Exec(`INSERT INTO work_order_scope_confirmations(task_id,item_id,item_revision,scope_revision,order_seq,request_id,payload_hash,agent_id,run_id,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)`,
+		item.TaskID, item.ID, item.Revision, item.ScopeRevision, message.Seq, api.NewID("req"), "fixture", "fixture", "fixture", ts(s.now()))
+	if err != nil {
+		t.Fatal(err)
+	}
 	return message
 }
 

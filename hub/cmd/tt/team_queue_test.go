@@ -34,6 +34,7 @@ func TestTeamQueueCLIAddAndListAgainstTestHub(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	f.confirmOrder(t, second, order.Seq)
 	if _, err := captureCLIOutput(t, func() error {
 		return cmdTeamQueue(f.e, []string{"add", "--item", second.ID, "--order", fmt.Sprint(order.Seq), "--cwd", t.TempDir()})
 	}); err != nil {
@@ -90,6 +91,7 @@ func TestTeamQueueCLIReleaseAndAbandonAgainstTestHub(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	f.confirmOrder(t, second, order.Seq)
 	token := fmt.Sprintf("manual-%s-%s-%d", f.task.ID, second.ID, order.Seq)
 	if _, err := f.c.TeamQueueAction(ctx, f.task.ID, api.TeamQueueRequest{RequestID: token, Operation: "manual", ItemID: second.ID, OrderMessageSeq: order.Seq, PauseGeneration: 0}); err != nil {
 		t.Fatal(err)

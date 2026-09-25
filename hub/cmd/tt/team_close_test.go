@@ -86,6 +86,11 @@ func TestOwnerTeamCloseUsesRealFixtureHubWithoutAgentEnvironment(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
+			handlerAgent, err := c.AddAgent(ctx, task.ID, api.AddAgentRequest{AgentID: api.NewID("agt"), Name: "db-handler", Session: "db-handler", Role: api.AgentRoleDatabaseHandler, Runtime: "generic", Host: "fixture", Cwd: "/fixture"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			confirmCLIFixtureOrder(t, c, task.ID, item.ID, order.Seq, handlerAgent)
 			add := func(name string) api.Agent {
 				a, err := c.AddAgent(ctx, task.ID, api.AddAgentRequest{Name: name, Host: "remote-fixture", Session: name, Runtime: "codex", WorkItem: &api.AgentWorkItemRequest{ItemTaskID: task.ID, ItemID: item.ID, ItemRevision: item.Revision, WorkOrderMessage: api.MessageReference{TaskID: task.ID, Seq: order.Seq}, ContextBundle: teamCloseCLIContext(t, item, order)}})
 				if err != nil {

@@ -260,6 +260,28 @@ async function assertControlsInModeViewport(page, label) {
   }
 }
 
+async function checkScopePreflight(page, name) {
+  // TailOS's real context preflight reads the isolated hub confirmation.
+  // A linked order alone must not prepare an admission bundle.
+  const scopeTask = await api("POST", "/v1/tasks", { name: `${name} scope launch fixture` });
+  const scopeHandler = await api("POST", `/v1/tasks/${scopeTask.id}/agents`, { agentId: name === "chromium" ? "agt_3333333333333333" : "agt_4444444444444444", name: "scope-handler", role: "database_handler", host: "fixture", session: `scope-${name}`, runtime: "codex", cwd: root });
+  const scopeItem = await api("POST", `/v1/tasks/${scopeTask.id}/work-items`, { kind: "bug", title: "Filed launch scope", description: "Owner acceptance and owned files", requestId: `${name}-scope-item` });
+  const scopeOrder = await api("POST", `/v1/tasks/${scopeTask.id}/messages`, { text: "Owner bounded launch order", requestId: `${name}-scope-order`, workItems: [{ itemTaskId: scopeTask.id, itemId: scopeItem.id, itemRevision: scopeItem.revision, relationship: "primary" }] });
+  const scopeInput = { itemTaskId: scopeTask.id, itemId: scopeItem.id, itemRevision: scopeItem.revision, workOrderMessage: { taskId: scopeTask.id, seq: scopeOrder.seq } };
+  const beforeScope = await page.evaluate(async (input) => {
+    const { prepareWorkItemContext } = await import("/client/work-item-context.js");
+    try { await prepareWorkItemContext(qa.client, input); return "accepted"; }
+    catch (error) { return error.message; }
+  }, scopeInput);
+  assert.match(beforeScope, /complete intake before launch/, "TailOS prepared an unconfirmed order");
+  await api("POST", `/v1/tasks/${scopeTask.id}/work-items/${scopeItem.id}/order-scope/confirm`, { requestId: `${name}-scope-confirm`, agentId: scopeHandler.id, runId: scopeHandler.runId, expectedRevision: scopeItem.revision, scopeRevision: scopeItem.scopeRevision, orderMessageSeq: scopeOrder.seq, complete: true });
+  const prepared = await page.evaluate(async (input) => {
+    const { prepareWorkItemContext } = await import("/client/work-item-context.js");
+    return prepareWorkItemContext(qa.client, input);
+  }, scopeInput);
+  assert.equal(prepared.itemRevision, scopeItem.revision, "TailOS lost the confirmed revision");
+}
+
 try {
   for (const [name, engine] of [["chromium", chromium], ["webkit", webkit]]) {
     const { source, target, other, missing, exited, legacy, legacyHandlerID } = await fixture(name);
@@ -275,6 +297,12 @@ try {
         throw new Error(`fixture did not initialize: ${errors.join(" | ") || error.message}`);
       }
       assert.equal(await page.locator('[data-mode="tasks"]').textContent(), "Projects");
+      if (process.argv.includes("--scope-only")) {
+        await checkScopePreflight(page, name);
+        assert.deepEqual(errors, [], `${name} page errors`);
+        console.log(`${name}: isolated TailOS scope preflight passed.`);
+        continue;
+      }
       await page.locator('[data-mode="bugs"]').click();
       await page.locator('[data-items-new]').waitFor();
       assert.ok(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), "Bugs header overflows a narrow viewport");
@@ -548,6 +576,7 @@ try {
       assert.equal(commands.at(-1), commands.at(-2), "same-dialog handler retry changed its launch identity");
       assert.match(commands.at(-1), new RegExp(legacyHandlerID));
       assert.equal(await page.evaluate(() => qa.data.projectHandlerPlans[0].previous), undefined, "successful handler start did not clear recovered previous settings");
+      await checkScopePreflight(page, name);
       assert.deepEqual(errors, [], `${name} page errors`);
       console.log(`${name}: work-item encrypted reload replay, retained/discarded drafts, 65-link pagination, selection-race safety, CRUD, dispatch, and closed reads passed.`);
     } finally {

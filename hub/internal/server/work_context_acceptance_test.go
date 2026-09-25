@@ -28,6 +28,7 @@ func TestAgentRegistrationBodyEnvelopeAndContextBoundaries(t *testing.T) {
 	orderRequest.AgentID = lead.ID
 	orderRequest.Text = "Recorded bounded synthetic order"
 	auditMust(c, http.StatusCreated, "POST", auditPostPath(task.ID), orderRequest, &order)
+	confirmHTTPContextOrder(t, c, task, item, order)
 
 	client, err := api.NewClient(c.srv.URL, 5*time.Second)
 	if err != nil {
@@ -171,6 +172,7 @@ func TestAgentWorkItemContextHTTPAcceptanceAndLegacyCompatibility(t *testing.T) 
 	orderRequest.AgentID = lead.ID
 	orderRequest.Text = "Recorded bounded synthetic order"
 	auditMust(c, http.StatusCreated, "POST", auditPostPath(task.ID), orderRequest, &order)
+	confirmHTTPContextOrder(t, c, task, item, order)
 	var unrelated api.Message
 	auditMust(c, http.StatusCreated, "POST", auditPostPath(task.ID), api.PostMessageRequest{Text: "UNRELATED HTTP HISTORY"}, &unrelated)
 
@@ -202,6 +204,14 @@ func TestAgentWorkItemContextHTTPAcceptanceAndLegacyCompatibility(t *testing.T) 
 	if legacy.WorkItem != nil {
 		t.Fatalf("legacy admission acquired context: %+v", legacy)
 	}
+}
+
+func confirmHTTPContextOrder(t *testing.T, c *client, task api.Task, item api.WorkItem, order api.Message) api.Agent {
+	t.Helper()
+	var handler api.Agent
+	auditMust(c, http.StatusCreated, "POST", "/v1/tasks/"+task.ID+"/agents", api.AddAgentRequest{AgentID: api.NewID("agt"), Name: "context-handler", Role: api.AgentRoleDatabaseHandler, Host: "fixture", Session: "context-handler", Runtime: "codex", Cwd: "/tmp"}, &handler)
+	auditMust(c, http.StatusCreated, "POST", "/v1/tasks/"+task.ID+"/work-items/"+item.ID+"/order-scope/confirm", api.ConfirmWorkOrderScopeRequest{RequestID: "context-intake", AgentID: handler.ID, RunID: handler.RunID, ExpectedRevision: item.Revision, ScopeRevision: item.ScopeRevision, OrderMessageSeq: order.Seq, Complete: true}, nil)
+	return handler
 }
 
 func syntheticHTTPContext(t *testing.T, item api.WorkItem, order api.Message) []byte {
