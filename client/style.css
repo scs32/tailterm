@@ -4706,12 +4706,8 @@ html:fullscreen {
   margin-bottom: 6px;
 }
 @media (min-width: 1000px) and (max-width: 1100px) {
-  #mode-view .feature-head .work-items-heading h2,
-  #mode-view .feature-head .work-items-controls {
+  #mode-view .feature-head .work-items-heading h2 {
     white-space: nowrap;
-  }
-  #mode-view .feature-head .work-items-controls {
-    flex-wrap: nowrap;
   }
   #mode-view .feature-head .work-items-search input {
     width: 150px;

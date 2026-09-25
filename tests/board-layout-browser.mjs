@@ -102,7 +102,7 @@ const selectors = {
   board: "[data-board-task]", tasks: "[data-task-select]", teams: "[data-team-select]",
   bugs: "[data-items-scope]", features: "[data-items-scope]",
 };
-const results = [], failures = [], skips = [];
+const results = [], offlineResults = [], failures = [], skips = [];
 function check(label, operation) {
   try { operation(); }
   catch (error) { failures.push(`${label}: ${error.message}`); console.error(failures.at(-1)); }
@@ -133,7 +133,7 @@ async function geometry(page, mode) {
     return {view:rect(view),outer:rect(outer),rail:rect(rail),main:rect(main),railStyle:style(rail),mainStyle:style(main),
       button:button?{rect:rect(button),style:style(button),text:button.textContent}:null,
       heading:heading?{rect:rect(heading),style:style(heading),rowStyle:style(headingRow),rowRect:rect(headingRow),controlsRect:headingControls?rect(headingControls):null}:null,
-      itemParts:itemHeader?{count:itemPart('.count-badge'),search:itemPart('[data-items-search]'),status:itemPart('[data-items-status]'),newButton:itemPart('[data-items-new]')}:null,
+      itemParts:itemHeader?{count:itemPart('.count-badge'),search:itemPart('[data-items-search]'),status:itemPart('[data-items-status]'),sync:itemPart('[data-work-items-sync]'),newButton:itemPart('[data-items-new]')}:null,
       controls:controls.map(el=>({text:el.textContent.trim().slice(0,40),rect:rect(el),style:style(el)})),
       toolbar:toolbar.map(el=>({text:el.textContent.trim().slice(0,40),rect:rect(el),style:style(el)})),
       pageWidth:document.documentElement.scrollWidth,viewportWidth:innerWidth};
@@ -175,7 +175,8 @@ function compare(actual, board, width, label, scenario) {
       if (width === 1024 && label.endsWith("-features")) {
         const heading = actual.heading.rect, row = actual.heading.rowRect;
         check(label, () => near(heading.height, board.heading.rect.height, "single-line Features heading height"));
-        for (const [name, part] of Object.entries(actual.itemParts || {})) {
+        for (const name of ['count','search','status','newButton']) {
+          const part = actual.itemParts?.[name];
           check(label, () => assert.ok(part, `${name} missing from Features header`));
           if (part) check(label, () => assert.ok(part.y >= row.y - 1 && part.bottom <= row.bottom + 1, `${name} wraps outside Features header row`));
         }
@@ -350,11 +351,38 @@ try {
           await page.screenshot({path:'.build/board-layout-'+prefix+'-failure.png'}).catch(()=>{});
         } finally {await context.close()}
       }
+      for (const width of [1000, 1024, 1050, 1051, 1100]) {
+        const context = await browser.newContext({ viewport: {width,height:900} });
+        const page = await context.newPage(), errors=[];
+        page.on("pageerror",error=>errors.push(error.message));
+        await context.route("**/*",route=>new URL(route.request().url()).origin===origin?route.continue():route.abort());
+        const label=`${engine.name()}-${width}-offline-features`;
+        try {
+          await page.goto(`${origin}/board-layout-test?scenario=populated`);
+          await page.waitForFunction(()=>!!window.qa);
+          for (const mode of viewNames) await show(page,mode);
+          await page.evaluate(() => qa.offline());
+          await show(page,"features");
+          await expect(page.locator(".feature-head [data-work-items-sync]")).toContainText("Offline · showing cached data");
+          const measured=await geometry(page,"features"), parts=measured.itemParts;
+          check(label, () => assert.ok(measured.heading.controlsRect.right <= measured.main.right + 1, "offline controls overflow section"));
+          check(label, () => assert.ok(parts.newButton.right <= measured.main.right + 1, "offline New feature button clips"));
+          check(label, () => assert.ok(parts.status.width >= 90, "offline status select collapsed to arrow"));
+          check(label, () => assert.ok(measured.pageWidth <= width, "offline page overflows viewport"));
+          assert.deepEqual(errors,[],`${label}: browser errors`);
+          const screenshot=`board-layout-${label}.png`;
+          await page.screenshot({path:'.build/'+screenshot});
+          offlineResults.push({engine:engine.name(),width,screenshot,geometry:measured});
+          console.log(`${label}: control bounds and status width checked`);
+        } catch(error){
+          failures.push(`${label}: ${error.stack||error.message}`);console.error(failures.at(-1));
+        } finally {await context.close()}
+      }
     } finally {await browser.close()}
   }
 } finally {
   await server.close();
-  await writeFile('.build/board-layout-results.json',JSON.stringify({results,failures,skips},null,2));
+  await writeFile('.build/board-layout-results.json',JSON.stringify({results,offlineResults,failures,skips},null,2));
   await writeFile('.build/board-layout-report.html','<!doctype html><meta charset="utf-8"><title>Board layout comparison</title><style>body{font:14px system-ui;background:#151916;color:#ddd}section{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:8px}img{width:100%}h2{grid-column:1/-1}figure{margin:0}figcaption{padding:5px}</style>'+[...new Set(results.map(r=>r.engine+' '+r.width+' '+r.scenario))].map(group=>'<section><h2>'+group+'</h2>'+results.filter(r=>r.engine+' '+r.width+' '+r.scenario===group).map(r=>'<figure><figcaption>'+r.mode+'</figcaption><a href="'+r.screenshot+'"><img src="'+r.screenshot+'"></a></figure>').join('')+'</section>').join(''));
 }
 if(failures.length)throw Error(`Board layout acceptance: ${failures.length} failures; see .build/board-layout-results.json`);
