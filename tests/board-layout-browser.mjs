@@ -124,11 +124,13 @@ async function geometry(page, mode) {
     const style = el => {const s=getComputedStyle(el);return Object.fromEntries(['fontFamily','fontSize','lineHeight','fontWeight','minHeight','alignItems','borderRightWidth','borderBottomWidth','borderColor','borderRadius','backgroundColor','color','paddingLeft','paddingTop','paddingRight','paddingBottom','gap','display','flexDirection'].map(k=>[k,s[k]]))};
     const button=[...rail.querySelectorAll(selector)].find(el=>el.getBoundingClientRect().height>0);
     const heading=main?.querySelector('h2');
+    const headingRow=heading?.closest('.view-heading')||heading?.parentElement;
+    const headingControls=headingRow?.querySelector('.work-items-controls');
     const controls=[...main.querySelectorAll('button,select')].filter(el=>{const r=el.getBoundingClientRect();return r.height>0&&!el.closest('[popover]')&&r.y>=0&&r.y<innerHeight});
     const toolbar=[...main.querySelectorAll('.view-actions > button,.work-items-controls > button,.work-items-controls select,.task-actions > button')].filter(el=>el.getBoundingClientRect().height>0);
     return {view:rect(view),outer:rect(outer),rail:rect(rail),main:rect(main),railStyle:style(rail),mainStyle:style(main),
       button:button?{rect:rect(button),style:style(button),text:button.textContent}:null,
-      heading:heading?{rect:rect(heading),style:style(heading),rowStyle:style(heading.closest('.view-heading')||heading.parentElement)}:null,
+      heading:heading?{rect:rect(heading),style:style(heading),rowStyle:style(headingRow),rowRect:rect(headingRow),controlsRect:headingControls?rect(headingControls):null}:null,
       controls:controls.map(el=>({text:el.textContent.trim().slice(0,40),rect:rect(el),style:style(el)})),
       toolbar:toolbar.map(el=>({text:el.textContent.trim().slice(0,40),rect:rect(el),style:style(el)})),
       pageWidth:document.documentElement.scrollWidth,viewportWidth:innerWidth};
@@ -167,11 +169,12 @@ function compare(actual, board, width, label, scenario) {
     // Unequal wrapped titles/actions legitimately change vertical centering.
     // Compare the actual origin for comparable single-line desktop headings.
     if (width > 760 && scenario === "populated") {
-      if (["bugs", "features"].includes(label.split("-").at(-1))) {
-        // wi_2e5375ae99db3d26 revision 2: the missing sr-only rule exposes
-        // the search label and shifts these headings. Keep the exact check
-        // for every other mode while that separate product defect stays open.
-        skips.push(`${label}: heading origin y (wi_2e5375ae99db3d26: missing sr-only rule)`);
+      if (width === 1024 && label.endsWith("-features")) {
+        const heading = actual.heading.rect, row = actual.heading.rowRect, controls = actual.heading.controlsRect;
+        check(label, () => assert.ok(heading.height > board.heading.rect.height + 1, "Features heading wraps at 1024px"));
+        check(label, () => near((heading.y + heading.bottom) / 2, (row.y + row.bottom) / 2, "wrapped heading centered in row"));
+        check(label, () => assert.ok(heading.x >= row.x - 1 && heading.y >= row.y - 1 && heading.right <= row.right + 1 && heading.bottom <= row.bottom + 1, "wrapped heading contained in row"));
+        check(label, () => assert.ok(controls && (heading.right <= controls.x + 1 || controls.right <= heading.x + 1 || heading.bottom <= controls.y + 1 || controls.bottom <= heading.y + 1), "wrapped heading overlaps controls"));
       } else check(label, () => near(actual.heading.rect.y, board.heading.rect.y, "heading origin y"));
     }
   }
