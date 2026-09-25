@@ -480,6 +480,19 @@ func (b *Bridge) mirror(ctx context.Context, m Mapping) error {
 	}
 }
 
+// cardObligations keeps the historical closed-row fetch bounded.
+func (b *Bridge) cardObligations(ctx context.Context, taskID string) ([]api.Obligation, error) {
+	open, err := b.cfg.Hub.ListObligations(ctx, taskID, "", "", true, false)
+	if err != nil {
+		return nil, err
+	}
+	recent, err := b.cfg.Hub.ListRecentWithdrawn(ctx, taskID)
+	if err != nil {
+		return nil, err
+	}
+	return append(open, recent...), nil
+}
+
 // refreshCard edits the pinned status card when the project changed, at
 // most once per CardInterval, and creates and pins it when missing. A card
 // that could not be pinned is pinned again at most every PinRetry.
@@ -491,7 +504,7 @@ func (b *Bridge) refreshCard(ctx context.Context, m Mapping) error {
 	if err != nil {
 		return err
 	}
-	obligations, err := b.cfg.Hub.ListObligations(ctx, m.TaskID, "", "", false, false)
+	obligations, err := b.cardObligations(ctx, m.TaskID)
 	if err != nil {
 		return err
 	}

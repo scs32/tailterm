@@ -25,7 +25,7 @@ func TestCardShowsWithdrawnWithoutCountingItOpen(t *testing.T) {
 	if !strings.Contains(e.Description, "1 open") || !strings.Contains(e.Description, "1 unacknowledged") || !strings.Contains(e.Description, "1 overdue") {
 		t.Fatalf("open count changed: %+v", e)
 	}
-	if len(e.Fields) != 2 || e.Fields[1].Name != "Withdrawn (1)" || !strings.Contains(e.Fields[1].Value, "#10") {
+	if len(e.Fields) != 2 || e.Fields[1].Name != "Recent withdrawn (1)" || !strings.Contains(e.Fields[1].Value, "#10") {
 		t.Fatalf("withdrawn not visible: %+v", e.Fields)
 	}
 }
@@ -46,7 +46,7 @@ func TestPinnedAndSlashCardsShowWithdrawnFromHub(t *testing.T) {
 	check := func(label string, embeds []string) {
 		t.Helper()
 		joined := strings.Join(embeds, "\n")
-		if !strings.Contains(joined, "Withdrawn (1)") || !strings.Contains(joined, "#"+strconv.FormatInt(m.Seq, 10)) || strings.Contains(joined, "1 unacknowledged") || strings.Contains(joined, "1 overdue") {
+		if !strings.Contains(joined, "Recent withdrawn (1)") || !strings.Contains(joined, "#"+strconv.FormatInt(m.Seq, 10)) || strings.Contains(joined, "1 unacknowledged") || strings.Contains(joined, "1 overdue") {
 			t.Fatalf("%s: %s", label, joined)
 		}
 	}

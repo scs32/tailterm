@@ -375,7 +375,7 @@ func renderCard(task api.Task, agents []api.Agent, obligations []api.Obligation)
 			}
 			lines = append(lines, fmt.Sprintf("#%d %s → %s", o.MessageSeq, truncate(clean(o.Subject), 60), clean(names.name(o.AgentID))))
 		}
-		embed.Fields = append(embed.Fields, discord.EmbedField{Name: fmt.Sprintf("Withdrawn (%d)", len(withdrawn)), Value: truncate(strings.Join(lines, "\n"), 1000)})
+		embed.Fields = append(embed.Fields, discord.EmbedField{Name: fmt.Sprintf("Recent withdrawn (%d)", len(withdrawn)), Value: truncate(strings.Join(lines, "\n"), 1000)})
 	}
 	raw, _ := json.Marshal(embed)
 	sum := sha256.Sum256(raw)

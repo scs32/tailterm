@@ -21,7 +21,9 @@ func TestWithdrawRollbackFixture(t *testing.T) {
 		t.Skip("set a synthetic rollback database path")
 	}
 	clean := filepath.Clean(path)
-	if !strings.HasPrefix(clean, filepath.Clean(os.TempDir())+string(os.PathSeparator)) {
+	if !strings.HasPrefix(clean, filepath.Clean(os.TempDir())+string(os.PathSeparator)) &&
+		!strings.HasPrefix(clean, "/tmp/tailterm-withdraw-rollback-") &&
+		!strings.HasPrefix(clean, "/private/tmp/tailterm-withdraw-rollback-") {
 		t.Fatal("rollback fixture must use a temporary path")
 	}
 	if _, err := os.Stat(clean); !errors.Is(err, os.ErrNotExist) {
@@ -241,5 +243,55 @@ func TestWithdrawRollsBackFailedNoticeAndConcurrentRetry(t *testing.T) {
 	}
 	if notices != 1 {
 		t.Fatalf("got %d notice obligations after concurrent retry", notices)
+	}
+}
+
+func TestWithdrawFollowsMultiHopReissueToOriginalSender(t *testing.T) {
+	f := newPhase3Fixture(t)
+	m, err := f.post(t, withdrawSource(api.EnvelopeKindRequest, f.builder, f.handler))
+	if err != nil {
+		t.Fatal(err)
+	}
+	first := f.obligationFor(t, m.Seq)
+	secondMessage, err := f.s.ReassignObligation(f.ctx, f.task.ID, first.ID, api.ObligationReassignRequest{
+		ToAgentID: f.lead2.ID, ActorAgentID: f.lead.ID, ActorRunID: f.lead.RunID, Reason: "better recipient",
+	}, f.by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second := f.obligationFor(t, secondMessage.Seq)
+	thirdMessage, err := f.s.ReassignObligation(f.ctx, f.task.ID, second.ID, api.ObligationReassignRequest{
+		ToAgentID: f.handler.ID, ActorAgentID: f.lead.ID, ActorRunID: f.lead.RunID, Reason: "final recipient",
+	}, f.by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	third := f.obligationFor(t, thirdMessage.Seq)
+	for _, bad := range []api.ObligationWithdrawRequest{
+		{AgentID: f.lead.ID, RunID: f.lead.RunID, Reason: "I reassigned it"},
+		{AgentID: f.builder.ID, RunID: "run_0000000000000000", Reason: "stale"},
+		{AgentID: f.builder.ID, Reason: "missing run"},
+	} {
+		if _, err := f.s.WithdrawObligation(f.ctx, f.task.ID, third.ID, bad); err == nil {
+			t.Fatalf("non-author or stale sender withdrew reissued request: %+v", bad)
+		}
+	}
+	got, err := f.s.WithdrawObligation(f.ctx, f.task.ID, third.ID, api.ObligationWithdrawRequest{AgentID: f.builder.ID, RunID: f.builder.RunID, Reason: "reissued request is superseded"})
+	if err != nil || got.Outcome != api.OutcomeWithdrawn {
+		t.Fatalf("original author could not withdraw third hop: %+v %v", got, err)
+	}
+	if f.obligationFor(t, m.Seq).Outcome != api.OutcomeSuperseded || f.obligationFor(t, secondMessage.Seq).Outcome != api.OutcomeSuperseded {
+		t.Fatal("withdrawal changed the prior superseded hops")
+	}
+}
+
+func TestRecentWithdrawnQueryUsesBoundedIndex(t *testing.T) {
+	f := newPhase3Fixture(t)
+	var id, parent, aux int
+	var detail string
+	err := f.s.db.QueryRow(`EXPLAIN QUERY PLAN SELECT `+obligationCols+` FROM obligations WHERE task_id=? AND outcome=? AND state=? ORDER BY message_seq DESC LIMIT 5`,
+		f.task.ID, api.OutcomeWithdrawn, api.ObligationClosed).Scan(&id, &parent, &aux, &detail)
+	if err != nil || !strings.Contains(detail, "obligations_task_outcome_seq") {
+		t.Fatalf("recent query plan: %q %v", detail, err)
 	}
 }

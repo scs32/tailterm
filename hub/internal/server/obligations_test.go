@@ -62,6 +62,50 @@ func assignFrom(lead api.Agent, to string) *api.Envelope {
 		Body: api.EnvelopeBody{Objective: "fail fast", Owns: []string{"hub/cmd/tt/main.go"}, Acceptance: map[string]string{"a1": "exits 2"}}}
 }
 
+func TestRecentWithdrawnQueryIsBoundedAcrossClosedHistory(t *testing.T) {
+	f := newOblFixture(t)
+	var withdrawn []int64
+	for i := 0; i < 30; i++ {
+		m := f.post(t, api.PostMessageRequest{AgentID: f.lead.ID, RunID: f.lead.RunID, To: f.builder.ID,
+			Envelope: &api.Envelope{Kind: api.EnvelopeKindRequest, To: f.builder.Name, Subject: "Review old item", Body: api.EnvelopeBody{Ask: "Please review"}}})
+		rows := f.list(t, store.ObligationFilter{FromSeq: m.Seq, ToSeq: m.Seq}, time.Now())
+		if len(rows) != 1 {
+			t.Fatalf("source %d: %+v", i, rows)
+		}
+		if i < 12 {
+			if _, err := f.c.st.WithdrawObligation(f.ctx, f.task.ID, rows[0].ID, api.ObligationWithdrawRequest{AgentID: f.lead.ID, RunID: f.lead.RunID, Reason: "superseded"}); err != nil {
+				t.Fatal(err)
+			}
+			withdrawn = append(withdrawn, m.Seq)
+		} else {
+			if _, err := f.c.st.CancelObligation(f.ctx, f.task.ID, rows[0].ID, api.ObligationCancelRequest{Reason: "owner cancelled", RequestID: "closed-history-" + strconv.Itoa(i)}, f.c.who); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	if err := f.c.st.MarkObligationsDelivered(f.ctx, f.task.ID, f.builder.ID, f.builder.RunID, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	open := f.post(t, api.PostMessageRequest{AgentID: f.lead.ID, RunID: f.lead.RunID, To: f.builder.ID, Envelope: assignFrom(f.lead, f.builder.Name)})
+	var recent api.ObligationList
+	path := "/v1/tasks/" + f.task.ID + "/obligations?recentWithdrawn=1"
+	if code := f.c.do("GET", path, nil, &recent); code != 200 || len(recent.Obligations) != 5 {
+		t.Fatalf("bounded query: %d %+v", code, recent)
+	}
+	for i, o := range recent.Obligations {
+		if o.MessageSeq != withdrawn[len(withdrawn)-1-i] || o.Outcome != api.OutcomeWithdrawn {
+			t.Fatalf("recent[%d]: %+v", i, o)
+		}
+	}
+	var openRows api.ObligationList
+	if code := f.c.do("GET", "/v1/tasks/"+f.task.ID+"/obligations?open=1", nil, &openRows); code != 200 || len(openRows.Obligations) != 1 || openRows.Obligations[0].MessageSeq != open.Seq {
+		t.Fatalf("open query changed: %d %+v", code, openRows)
+	}
+	if code := f.c.do("GET", path+"&open=1", nil, &recent); code != 400 {
+		t.Fatalf("mixed bounded/unbounded filters accepted: %d", code)
+	}
+}
+
 // b1: obligations are created with the message, once, only for obligating kinds.
 func TestObligationsCreatedWithTheirMessage(t *testing.T) {
 	f := newOblFixture(t)

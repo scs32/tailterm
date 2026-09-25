@@ -48,6 +48,7 @@ CREATE TABLE IF NOT EXISTS obligations (
 CREATE INDEX IF NOT EXISTS obligations_task_state ON obligations(task_id, state);
 CREATE INDEX IF NOT EXISTS obligations_agent_state ON obligations(agent_id, state);
 CREATE INDEX IF NOT EXISTS obligations_state ON obligations(state);
+CREATE INDEX IF NOT EXISTS obligations_task_outcome_seq ON obligations(task_id,outcome,message_seq DESC);
 CREATE TABLE IF NOT EXISTS wake_jobs (
   id TEXT PRIMARY KEY,
   task_id TEXT NOT NULL,
@@ -279,16 +280,37 @@ func ObligationOverdue(o api.Obligation, now time.Time) string {
 
 // ObligationFilter selects obligations for listing.
 type ObligationFilter struct {
-	AgentID  string
-	OpenOnly bool
-	Overdue  bool
-	FromSeq  int64 // only obligations for messages from this seq onward
-	ToSeq    int64 // and up to this seq
+	AgentID         string
+	OpenOnly        bool
+	Overdue         bool
+	RecentWithdrawn bool  // at most five latest withdrawn rows for status cards
+	FromSeq         int64 // only obligations for messages from this seq onward
+	ToSeq           int64 // and up to this seq
 }
 
 func (s *Store) ListObligations(ctx context.Context, taskID string, f ObligationFilter, now time.Time) ([]api.Obligation, error) {
 	q := `SELECT ` + obligationCols + ` FROM obligations WHERE task_id=?`
 	args := []any{taskID}
+	if f.RecentWithdrawn {
+		// An indexed, bounded query avoids loading the task's closed history on
+		// every Discord card refresh. The displayed count is a recent count.
+		q += ` AND outcome=? AND state=? ORDER BY message_seq DESC LIMIT 5`
+		args = append(args, api.OutcomeWithdrawn, api.ObligationClosed)
+		rows, err := s.db.QueryContext(ctx, q, args...)
+		if err != nil {
+			return nil, err
+		}
+		defer rows.Close()
+		out := []api.Obligation{}
+		for rows.Next() {
+			o, err := scanObligation(rows)
+			if err != nil {
+				return nil, err
+			}
+			out = append(out, o)
+		}
+		return out, rows.Err()
+	}
 	if f.AgentID != "" {
 		q += ` AND agent_id=?`
 		args = append(args, f.AgentID)

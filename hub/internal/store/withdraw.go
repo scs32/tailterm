@@ -42,8 +42,12 @@ func (s *Store) WithdrawObligation(ctx context.Context, taskID, obligationID str
 	if err != nil {
 		return o, err
 	}
+	source, err := originalMessage(ctx, tx, taskID, o.MessageSeq)
+	if err != nil {
+		return o, err
+	}
 	var sourceAgent, sourceRun string
-	err = tx.QueryRowContext(ctx, `SELECT from_agent,from_run_id FROM messages WHERE seq=? AND task_id=?`, o.MessageSeq, taskID).Scan(&sourceAgent, &sourceRun)
+	err = tx.QueryRowContext(ctx, `SELECT from_agent,from_run_id FROM messages WHERE seq=? AND task_id=?`, source.Seq, taskID).Scan(&sourceAgent, &sourceRun)
 	if err != nil {
 		return o, err
 	}
@@ -74,10 +78,6 @@ func (s *Store) WithdrawObligation(ctx context.Context, taskID, obligationID str
 		return o, fmt.Errorf("%w: obligation is already closed (%s)", api.ErrConflict, o.Outcome)
 	}
 	task, err := scanTask(tx.QueryRowContext(ctx, `SELECT `+taskCols+` FROM tasks WHERE id=?`, taskID))
-	if err != nil {
-		return o, err
-	}
-	source, err := loadMessage(tx, ctx, taskID, o.MessageSeq)
 	if err != nil {
 		return o, err
 	}

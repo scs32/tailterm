@@ -700,6 +700,19 @@ func (s *Server) listObligations(w http.ResponseWriter, r *http.Request) {
 	}
 	q := r.URL.Query()
 	now := time.Now().UTC()
+	if q.Get("recentWithdrawn") == "1" {
+		if q.Get("agentId") != "" || q.Get("runId") != "" || q.Get("open") != "" || q.Get("overdue") != "" || q.Get("fromSeq") != "" || q.Get("toSeq") != "" {
+			writeError(w, http.StatusBadRequest, "recentWithdrawn cannot be combined with other obligation filters")
+			return
+		}
+		list, err := s.store.ListObligations(r.Context(), id, store.ObligationFilter{RecentWithdrawn: true}, now)
+		if err != nil {
+			fail(w, err)
+			return
+		}
+		writeJSON(w, 200, api.ObligationList{Obligations: list})
+		return
+	}
 	agent, run := q.Get("agentId"), q.Get("runId")
 	if agent != "" && run != "" {
 		if err := s.store.MarkObligationsDelivered(r.Context(), id, agent, run, now); err != nil {

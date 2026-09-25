@@ -227,6 +227,12 @@ func (c *Client) ListObligations(ctx context.Context, task, agent, run string, o
 	return out.Obligations, c.do(ctx, "GET", "/v1/tasks/"+task+"/obligations?"+q.Encode(), nil, &out)
 }
 
+// ListRecentWithdrawn returns at most the five newest closed withdrawals.
+func (c *Client) ListRecentWithdrawn(ctx context.Context, task string) ([]Obligation, error) {
+	var out ObligationList
+	return out.Obligations, c.do(ctx, "GET", "/v1/tasks/"+task+"/obligations?recentWithdrawn=1", nil, &out)
+}
+
 // ListObligationsFrom lists an agent's obligations (any state) for messages
 // fromSeq..toSeq, without marking anything delivered.
 func (c *Client) ListObligationsFrom(ctx context.Context, task, agent string, fromSeq, toSeq int64) ([]Obligation, error) {
