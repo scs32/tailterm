@@ -7,9 +7,11 @@
     "dev": "node server/index.js",
     "build": "vite build",
     "start": "NODE_ENV=production node server/index.js",
-    "test": "node --test tests/*.test.js",
+    "test": "node scripts/build-team-plan.mjs --check && node --test tests/*.test.js",
     "test:browser": "node tests/browser.mjs",
     "build:wasm": "./scripts/build-wasm.sh",
+    "build:team-plan": "node scripts/build-team-plan.mjs",
+    "check:team-plan": "node scripts/build-team-plan.mjs --check",
     "build:static": "vite build --mode static && node scripts/package-static.mjs",
     "deploy:static": "node scripts/deploy-static.mjs",
     "verify:release": "node scripts/verify-release.mjs",
@@ -19,11 +21,11 @@
     "test:links": "node tests/terminal-links-browser.mjs",
     "test:context-menu": "node tests/terminal-context-menu-browser.mjs",
     "test:tmux-menu": "node tests/tmux-menu-browser.mjs",
-    "build:hub": "cd hub && CGO_ENABLED=0 go build -trimpath -ldflags='-s -w' -o ../.build/ttbin/ ./cmd/...",
+    "build:hub": "npm run check:team-plan && cd hub && CGO_ENABLED=0 go build -trimpath -ldflags='-s -w' -o ../.build/ttbin/ ./cmd/...",
     "test:hub": "cd hub && go vet ./... && go test ./...",
     "container:up": "./scripts/container-dev.sh up",
     "container:down": "./scripts/container-dev.sh down",
-    "build:tt": "mkdir -p .build/tt && cd hub && for t in linux/arm64 linux/amd64 darwin/arm64; do os=${t%/*}; arch=${t#*/}; CGO_ENABLED=0 GOOS=$os GOARCH=$arch go build -trimpath -ldflags=\"-s -w\" -o ../.build/tt/tt-$os-$arch ./cmd/tt; done"
+    "build:tt": "npm run check:team-plan && mkdir -p .build/tt && cd hub && for t in linux/arm64 linux/amd64 darwin/arm64; do os=${t%/*}; arch=${t#*/}; CGO_ENABLED=0 GOOS=$os GOARCH=$arch go build -trimpath -ldflags=\"-s -w\" -o ../.build/tt/tt-$os-$arch ./cmd/tt; done"
   },
   "dependencies": {
     "@fontsource/fira-code": "^5.3.0",

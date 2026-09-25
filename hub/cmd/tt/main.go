@@ -87,6 +87,8 @@ Commands
   hook <session-start|prompt|stop|notification|codex>
                                handlers invoked by agent runtimes
   new-project --name N [--goal G] create a project (new-task is an alias)
+  team launch --item ID --order SEQ [--template planned] [--dry-run]
+                               launch an item-bound Planned delivery team locally
 `
 
 type env struct {
@@ -155,7 +157,9 @@ func main() {
 	}
 	cmd, args := os.Args[1], os.Args[2:]
 	e := readEnv()
-	autoBindRuntime(e, cmd)
+	if cmd != "team" { // A read-only team dry run must not bind this thread.
+		autoBindRuntime(e, cmd)
+	}
 	var err error
 	switch cmd {
 	case "relay":
@@ -216,6 +220,8 @@ func main() {
 		err = cmdOwner(e, args)
 	case "spawn":
 		err = cmdSpawn(e, args)
+	case "team":
+		err = cmdTeam(e, args)
 	case "allocation-intent":
 		err = cmdAllocationIntent(e, args)
 	case "retire", "resume":

@@ -1,6 +1,8 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { addTeamOrchestrator } from "../client/task-hub.js";
+import { exampleTeam } from "../client/team-examples.js";
+import { teamLaunchPlan } from "../client/team-launch-plan.js";
 
 const plan = [{ fields: { name: "team-lead-41b1c632" } }];
 
@@ -43,5 +45,40 @@ test("Add team refuses a prepared team without a lead", () => {
   assert.throws(
     () => addTeamOrchestrator({ orchestrator: "lead" }, [], []),
     /prepared team has no lead/,
+  );
+});
+
+test("Add team can pass the shared Planned delivery plan to its lead selector", () => {
+  const item = "wi_3333333333333333";
+  const resolved = teamLaunchPlan({
+    team: exampleTeam("planned"),
+    servers: [{ id: "local", name: "fixture" }],
+    mainServerId: "local",
+    projectFolders: { local: "/tmp/fixture" },
+    itemRouting: {
+      workItemTaskId: "tsk_1111111111111111",
+      workItemId: item,
+      workItemRevision: 1,
+      workOrderTaskId: "tsk_1111111111111111",
+      workOrderMessageSeq: 7,
+      workContextBundle: { version: 1 },
+    },
+    handler: { role: "database_handler", status: "running" },
+  });
+  assert.equal(
+    addTeamOrchestrator(
+      { orchestrator: "prior" },
+      [{ name: "prior", status: "running" }],
+      resolved,
+    ),
+    null,
+  );
+  assert.equal(
+    addTeamOrchestrator(
+      { orchestrator: "prior" },
+      [{ name: "prior", status: "closed" }],
+      resolved,
+    ),
+    "lead-33333333",
   );
 });

@@ -3,6 +3,7 @@ import { agentControlsHTML, wireAgentControls } from "./agent-controls.js";
 import { agentToolsCommand } from "../shared/tmux-command.js";
 import { modelPickerHTML, wireModelPicker } from "./model-picker.js";
 import { resolveTeam, teamLaunches } from "./teams.js";
+import { teamLaunchPlan } from "./team-launch-plan.js";
 import { withDatabaseHandler } from "./project-handler.js";
 import { prepareWorkItemContext } from "./work-item-context.js";
 import { serializedWorkContext } from "../shared/work-context.js";
@@ -2044,6 +2045,11 @@ export function createTaskHub(host) {
               launchJournal,
               projects.readRetry(),
             );
+          const existingTask = launchJournal
+            ? await guardedJournalEffect(launchJournal, null, () =>
+                client.getTask(id),
+              )
+            : await client.getTask(id);
           if (!plan) {
             const item = items.find(
               (candidate) => candidate.id === itemSelector.value,
@@ -2075,14 +2081,21 @@ export function createTaskHub(host) {
                 seq: workOrderMessageSeq,
               },
             });
-            plan = teamLaunches(
-              referencedTeam,
-              host.getServers(),
-              form.querySelector("#team-main-server")?.value || mainServer?.id,
-              projects.read(),
-              routing,
-              host.getData().agentCatalog,
-            );
+            plan = teamLaunchPlan({
+              team: referencedTeam,
+              servers: host.getServers(),
+              mainServerId:
+                form.querySelector("#team-main-server")?.value ||
+                mainServer?.id,
+              projectFolders: projects.read(),
+              itemRouting: routing,
+              catalog: host.getData().agentCatalog,
+              handler: existingTask.agents.find(
+                (agent) =>
+                  agent.role === "database_handler" &&
+                  !["closed", "exited"].includes(agent.status),
+              ),
+            });
             launchJournal = await prepareLaunchJournal(
               "add-team",
               id,
@@ -2099,11 +2112,6 @@ export function createTaskHub(host) {
               .forEach((el) => (el.disabled = true));
             projects.setEditable([]);
           }
-          const existingTask = await guardedJournalEffect(
-            launchJournal,
-            null,
-            () => client.getTask(id),
-          );
           const policy = {};
           if (team.swarm) policy.swarm = true;
           const orchestrator = addTeamOrchestrator(
