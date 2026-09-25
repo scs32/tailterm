@@ -969,6 +969,18 @@ func (s *Store) PostMessage(ctx context.Context, taskID string, req api.PostMess
 		}
 		req.To = holder.ID
 	}
+	if req.ReplyTo > 0 {
+		var replyTask, replyAuthor string
+		if err := tx.QueryRowContext(ctx, `SELECT task_id,from_agent FROM messages WHERE seq=?`, req.ReplyTo).Scan(&replyTask, &replyAuthor); err != nil || replyTask != taskID {
+			return api.Message{}, api.ErrInvalid
+		}
+		// Store the inferred recipient so Board, inbox and obligations agree.
+		// A person's reply, self-reply, or explicitly addressed reply retains
+		// the recipient supplied by its author.
+		if req.AgentID != "" && req.To == "" && (req.Envelope == nil || req.Envelope.To == "") && replyAuthor != "" && replyAuthor != req.AgentID {
+			req.To = replyAuthor
+		}
+	}
 	var target api.Agent
 	for _, id := range []string{req.To, req.AgentID} {
 		if id == "" {
@@ -985,12 +997,6 @@ func (s *Store) PostMessage(ctx context.Context, taskID string, req api.PostMess
 	// A typed message's stated recipient must be the one it is routed to.
 	if e := req.Envelope; e != nil && e.To != "" && !strings.HasPrefix(e.To, "role:") && (req.To == "" || (target.ID != e.To && target.Name != e.To)) {
 		return api.Message{}, &api.EnvelopeError{Problems: []api.Problem{{Field: "to", Reason: "must name the agent the message is addressed to"}}}
-	}
-	if req.ReplyTo > 0 {
-		var replyTask string
-		if err := tx.QueryRowContext(ctx, `SELECT task_id FROM messages WHERE seq=?`, req.ReplyTo).Scan(&replyTask); err != nil || replyTask != taskID {
-			return api.Message{}, api.ErrInvalid
-		}
 	}
 	m, err := s.insertMessage(ctx, tx, t, req, target, by, false, false)
 	if err != nil {
