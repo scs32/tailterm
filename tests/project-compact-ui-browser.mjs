@@ -343,14 +343,28 @@ try {
               await page.locator("[data-board-task]").first().click();
               await page.locator("#board-text").fill("Synthetic pending send");
               await page.evaluate(() => (qa.state.holdPost = true));
+              await page.evaluate(() => {
+                window.pendingCompose = document.querySelector("#board-compose");
+                window.pendingText = document.querySelector("#board-text");
+                window.pendingMessages = document.querySelector("#board-messages");
+              });
               await page.locator("#board-compose button[type=submit]").click();
-              // Force the same view refresh that a live poll can trigger while
-              // the fixture post remains pending.
-              await page.evaluate(() => qa.client.invalidate());
               await expect(page.locator("#board-text")).toBeDisabled();
+              await expect(page.locator("#board-to")).toBeDisabled();
+              await expect(page.locator("#board-compose button[type=submit]")).toBeDisabled();
+              await page.waitForFunction(() => !!qa.state.releasePost);
               const pendingWrites = await page.evaluate(() => qa.state.writes);
               await page.locator("[data-team-toggle]").click();
               await page.locator("[data-team-toggle]").click();
+              assert.equal(
+                await page.evaluate(() =>
+                  window.pendingCompose === document.querySelector("#board-compose") &&
+                  window.pendingText === document.querySelector("#board-text") &&
+                  window.pendingMessages === document.querySelector("#board-messages"),
+                ),
+                true,
+                "held send retains the visible compose and messages DOM",
+              );
               await expect(page.locator("#board-text")).toHaveValue(
                 "Synthetic pending send",
               );
@@ -364,7 +378,25 @@ try {
                 qa.state.releasePost();
               });
               await expect(page.locator("#board-text")).toBeEnabled();
+              await expect(page.locator("#board-to")).toBeEnabled();
+              await expect(page.locator("#board-compose button[type=submit]")).toBeEnabled();
               await expect(page.locator("#board-text")).toHaveValue("");
+              await page.locator("#board-text").fill("Synthetic failed send");
+              await page.locator("#board-text").evaluate((el) => el.setSelectionRange(5, 9));
+              await page.evaluate(() => (qa.state.failWrites = true));
+              await page.keyboard.press("Enter");
+              await expect(page.locator("#notice")).toContainText("Post failed:");
+              await expect(page.locator("#board-text")).toBeEnabled();
+              await expect(page.locator("#board-to")).toBeEnabled();
+              await expect(page.locator("#board-compose button[type=submit]")).toBeEnabled();
+              await expect(page.locator("#board-text")).toHaveValue("Synthetic failed send");
+              await expect(page.locator("#board-text")).toBeFocused();
+              assert.deepEqual(
+                await page.locator("#board-text").evaluate((el) => [el.selectionStart, el.selectionEnd]),
+                [5, 9],
+                "failed send restores the draft caret",
+              );
+              await page.evaluate(() => (qa.state.failWrites = false));
               // Closed Board preserves all retained agents; no active lifecycle actions.
               await page.evaluate(() => qa.show("board"));
               await page.locator(".board-closed summary").click();

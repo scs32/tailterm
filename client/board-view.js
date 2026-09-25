@@ -884,6 +884,9 @@ export function createBoardView({
   function render(captureDraft = true) {
     if (!visible) return;
     if (renderedTask !== selected) interruptMessageScroll();
+    // A send owns the visible compose controls until it settles. Defer a
+    // background refresh so it cannot replace the disabled form mid-request.
+    if (sending.has(selected) && renderedTask === selected) return;
     if (
       messageScrollActive &&
       renderedTask === selected &&
@@ -1946,7 +1949,10 @@ export function createBoardView({
             : null;
         let failed = false;
         sending.add(id);
+        const recipient = form.querySelector("#board-to");
         const button = form.querySelector("[type=submit]");
+        submittedInput.disabled = true;
+        recipient.disabled = true;
         button.disabled = true;
         try {
           const message = beginMessage(id, body, actionClient);
@@ -2031,6 +2037,8 @@ export function createBoardView({
             restoredInput?.focus();
             restoredInput?.setSelectionRange(...submittedSelection);
           }
+          if (submittedInput.isConnected) submittedInput.disabled = false;
+          if (recipient.isConnected) recipient.disabled = false;
           if (button.isConnected) button.disabled = false;
         }
       };
