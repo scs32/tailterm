@@ -5,6 +5,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"regexp"
 	"time"
 
 	"github.com/scs32/tailterm/hub/internal/api"
@@ -12,6 +13,8 @@ import (
 
 // errRetiredWriter answers legacy commands that broker phase 3 retired.
 var errRetiredWriter = &exitError{2, errors.New("retired in broker phase 3: legacy directives and operational records no longer accept writes. Send typed messages with tt send; the hub tracks them as obligations (tt obligations, tt ack, tt progress)")}
+
+var obligationIDRE = regexp.MustCompile(`^obl_[0-9a-f]{16}$`)
 
 // cmdOwner is the owner's control over obligations (broker phase 3):
 // extend a deadline, answer on the recipient's behalf, or cancel.
@@ -33,7 +36,7 @@ func cmdOwner(e env, args []string) error {
 	if err := fs.Parse(args[2:]); err != nil {
 		return err
 	}
-	if *task == "" || !api.ValidID(obligation, "obl") {
+	if *task == "" || !obligationIDRE.MatchString(obligation) {
 		return usage
 	}
 	if *requestID == "" {
