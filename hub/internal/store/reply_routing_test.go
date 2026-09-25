@@ -205,3 +205,61 @@ func TestReplyRoutingSwarmStillBroadcasts(t *testing.T) {
 		t.Fatalf("peer did not receive broadcast: %+v %v", peerInbox, err)
 	}
 }
+
+func TestReplyRoutingClosedAndExitedAuthorsStayBoardWide(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		status string
+	}{
+		{"closed", api.AgentClosed},
+		{"exited", api.AgentExited},
+		{"done", api.AgentDone},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newPhase3Fixture(t)
+			parent, err := f.post(t, api.PostMessageRequest{AgentID: f.lead.ID, RunID: f.lead.RunID, Text: "Old lead request"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			switch tc.status {
+			case api.AgentClosed:
+				_, err = f.s.CloseAgent(f.ctx, f.lead.ID, f.by)
+			case api.AgentExited:
+				_, err = f.s.PostEvent(f.ctx, f.task.ID, api.PostEventRequest{AgentID: f.lead.ID, RunID: f.lead.RunID, Kind: api.EventExited}, f.by)
+			case api.AgentDone:
+				_, err = f.s.PostEvent(f.ctx, f.task.ID, api.PostEventRequest{AgentID: f.lead.ID, RunID: f.lead.RunID, Kind: api.EventDone}, f.by)
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			reply, err := f.post(t, api.PostMessageRequest{AgentID: f.handler.ID, RunID: f.handler.RunID, ReplyTo: parent.Seq, Text: "Late result"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			wantTo := ""
+			if tc.status == api.AgentDone {
+				wantTo = f.lead.ID
+			}
+			if reply.To != wantTo || reply.ReplyTo != parent.Seq {
+				t.Fatalf("reply to %s author: %+v", tc.status, reply)
+			}
+			peerInbox, err := f.s.ListMessages(f.ctx, f.task.ID, parent.Seq, f.builder.ID, 10)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if tc.status == api.AgentDone {
+				if len(peerInbox) != 0 {
+					t.Fatalf("done author's directed reply reached peer: %+v", peerInbox)
+				}
+			} else if len(peerInbox) != 1 || peerInbox[0].Seq != reply.Seq || peerInbox[0].To != "" {
+				t.Fatalf("live peer lost board-wide reply to %s author: %+v", tc.status, peerInbox)
+			}
+			// An explicit destination is never overridden, even if the
+			// replied-to author has already left the project.
+			explicit, err := f.post(t, api.PostMessageRequest{AgentID: f.handler.ID, RunID: f.handler.RunID, To: f.builder.ID, ReplyTo: parent.Seq, Text: "Directed follow-up"})
+			if err != nil || explicit.To != f.builder.ID {
+				t.Fatalf("explicit recipient after %s author: %+v %v", tc.status, explicit, err)
+			}
+		})
+	}
+}

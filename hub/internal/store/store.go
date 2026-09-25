@@ -970,14 +970,14 @@ func (s *Store) PostMessage(ctx context.Context, taskID string, req api.PostMess
 		req.To = holder.ID
 	}
 	if req.ReplyTo > 0 {
-		var replyTask, replyAuthor string
-		if err := tx.QueryRowContext(ctx, `SELECT task_id,from_agent FROM messages WHERE seq=?`, req.ReplyTo).Scan(&replyTask, &replyAuthor); err != nil || replyTask != taskID {
+		var replyTask, replyAuthor, replyAuthorStatus string
+		if err := tx.QueryRowContext(ctx, `SELECT m.task_id,m.from_agent,COALESCE(a.status,'') FROM messages m LEFT JOIN agents a ON a.id=m.from_agent WHERE m.seq=?`, req.ReplyTo).Scan(&replyTask, &replyAuthor, &replyAuthorStatus); err != nil || replyTask != taskID {
 			return api.Message{}, api.ErrInvalid
 		}
 		// Store the inferred recipient so Board, inbox and obligations agree.
-		// A person's reply, self-reply, or explicitly addressed reply retains
-		// the recipient supplied by its author.
-		if req.AgentID != "" && req.To == "" && (req.Envelope == nil || req.Envelope.To == "") && replyAuthor != "" && replyAuthor != req.AgentID {
+		// Closed/exited authors no longer have a live inbox, so their replies
+		// remain board-wide. Explicit, person and self replies retain their To.
+		if req.AgentID != "" && req.To == "" && (req.Envelope == nil || req.Envelope.To == "") && replyAuthor != "" && replyAuthor != req.AgentID && replyAuthorStatus != api.AgentClosed && replyAuthorStatus != api.AgentExited {
 			req.To = replyAuthor
 		}
 	}
