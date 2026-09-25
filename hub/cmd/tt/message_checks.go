@@ -220,9 +220,13 @@ func summarizeAcks(list []api.Obligation, names map[string]string, cutoff, now t
 	var worst api.Obligation
 	var worstD time.Duration
 	gating := 0
+	withdrawn := 0
 	for _, o := range list {
 		if o.Needs == api.ObligationNeedsDelivery || o.CreatedAt.Before(cutoff) {
 			continue
+		}
+		if o.Outcome == api.OutcomeWithdrawn {
+			withdrawn++
 		}
 		if gatesPosts(o, now) {
 			gating++
@@ -237,7 +241,7 @@ func summarizeAcks(list []api.Obligation, names map[string]string, cutoff, now t
 		latencies = append(latencies, d)
 	}
 	if len(latencies) == 0 && gating == 0 {
-		return "Acknowledgement: no acknowledged work in this window\n"
+		return fmt.Sprintf("Acknowledgement: no acknowledged work in this window\nWithdrawn: %d\n", withdrawn)
 	}
 	out := ""
 	if len(latencies) > 0 {
@@ -252,6 +256,7 @@ func summarizeAcks(list []api.Obligation, names map[string]string, cutoff, now t
 	if gating > 0 {
 		out += fmt.Sprintf("Unacknowledged past the %s grace: %d (their recipients' posts are refused)\n", api.ObligationAckGrace, gating)
 	}
+	out += fmt.Sprintf("Withdrawn: %d\n", withdrawn)
 	return out
 }
 

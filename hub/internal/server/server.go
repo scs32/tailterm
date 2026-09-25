@@ -68,6 +68,7 @@ func New(st *store.Store, identity Identity) *Server {
 	m.HandleFunc("POST /v1/tasks/{id}/obligations/{oid}/extend", s.extendObligation)
 	m.HandleFunc("POST /v1/tasks/{id}/obligations/{oid}/answer", s.answerObligation)
 	m.HandleFunc("POST /v1/tasks/{id}/obligations/{oid}/cancel", s.cancelObligation)
+	m.HandleFunc("POST /v1/tasks/{id}/obligations/{oid}/withdraw", s.withdrawObligation)
 	m.HandleFunc("POST /v1/tasks/{id}/agents/{aid}/resume", s.resumeAgent)
 	m.HandleFunc("POST /v1/tasks/{id}/agents/{aid}/wake-jobs/lease", s.leaseWakeJob)
 	m.HandleFunc("POST /v1/tasks/{id}/wake-jobs/{jid}/report", s.reportWakeJob)

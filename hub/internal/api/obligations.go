@@ -1,10 +1,19 @@
 package api
 
 import (
+	"encoding/hex"
 	"fmt"
 	"strings"
 	"time"
 )
+
+func ValidObligationID(id string) bool {
+	if !strings.HasPrefix(id, "obl_") || len(id) != 20 {
+		return false
+	}
+	_, err := hex.DecodeString(id[4:])
+	return err == nil
+}
 
 // Obligations (broker phase 2a, docs/broker-phase-2a.md): a typed message or a
 // directed human message obliges its recipient until a typed outcome closes it.
@@ -27,6 +36,7 @@ const (
 	OutcomeDelivered     = "delivered"
 	OutcomeSuperseded    = "superseded"
 	OutcomeCancelled     = "cancelled"
+	OutcomeWithdrawn     = "withdrawn"
 	OutcomeRecipientGone = "recipient_gone"
 
 	// BrokerNode marks hub-authored messages (escalations and reassignments).
@@ -83,6 +93,15 @@ type ObligationActionRequest struct {
 	RunID     string `json:"runId"`
 	Text      string `json:"text,omitempty"`
 	RequestID string `json:"requestId,omitempty"` // a retry returns the original result
+}
+
+// ObligationWithdrawRequest is sent by the original message author's current
+// run. A stable request ID makes a lost HTTP response safe to retry.
+type ObligationWithdrawRequest struct {
+	AgentID   string `json:"agentId"`
+	RunID     string `json:"runId"`
+	Reason    string `json:"reason"`
+	RequestID string `json:"requestId,omitempty"`
 }
 
 // ObligationReassignRequest moves an open obligation. Without an actor it is

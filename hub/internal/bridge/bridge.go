@@ -491,7 +491,7 @@ func (b *Bridge) refreshCard(ctx context.Context, m Mapping) error {
 	if err != nil {
 		return err
 	}
-	obligations, err := b.cfg.Hub.ListObligations(ctx, m.TaskID, "", "", true, false)
+	obligations, err := b.cfg.Hub.ListObligations(ctx, m.TaskID, "", "", false, false)
 	if err != nil {
 		return err
 	}

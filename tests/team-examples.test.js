@@ -25,6 +25,14 @@ test("ten complete examples are portable, launchable, bounded and independently 
   }
 });
 
+test("lead and worker prompts teach withdrawal of superseded requests", () => {
+  const team = exampleTeam("planned");
+  for (const name of ["lead", "builder"]) {
+    const prompt = team.members.find((member) => member.name === name).prompt;
+    assert.match(prompt, /supersede your own open request.*tt withdraw SEQ --reason TEXT/);
+  }
+});
+
 test("example orchestrators route implementation to builders without erasing worker roles", () => {
   const solo = exampleTeam("solo");
   assert.match(

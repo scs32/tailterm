@@ -305,8 +305,12 @@ func renderCard(task api.Task, agents []api.Agent, obligations []api.Obligation)
 	overdue := map[string]int{}
 	unacked := map[string]int{}
 	var late []api.Obligation
+	var withdrawn []api.Obligation
 	for _, o := range obligations {
 		if o.State == api.ObligationClosed {
+			if o.Outcome == api.OutcomeWithdrawn {
+				withdrawn = append(withdrawn, o)
+			}
 			continue
 		}
 		open[o.AgentID]++
@@ -361,6 +365,17 @@ func renderCard(task api.Task, agents []api.Agent, obligations []api.Obligation)
 		}
 		embed.Fields = []discord.EmbedField{{Name: fmt.Sprintf("Overdue (%d)", len(late)), Value: truncate(strings.Join(ls, "\n"), 1000)}}
 		embed.Color = 0xE67E22
+	}
+	if len(withdrawn) > 0 {
+		sort.Slice(withdrawn, func(i, j int) bool { return withdrawn[i].MessageSeq > withdrawn[j].MessageSeq })
+		var lines []string
+		for i, o := range withdrawn {
+			if i == 5 {
+				break
+			}
+			lines = append(lines, fmt.Sprintf("#%d %s → %s", o.MessageSeq, truncate(clean(o.Subject), 60), clean(names.name(o.AgentID))))
+		}
+		embed.Fields = append(embed.Fields, discord.EmbedField{Name: fmt.Sprintf("Withdrawn (%d)", len(withdrawn)), Value: truncate(strings.Join(lines, "\n"), 1000)})
 	}
 	raw, _ := json.Marshal(embed)
 	sum := sha256.Sum256(raw)

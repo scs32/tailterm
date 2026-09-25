@@ -48,6 +48,7 @@ Commands
   send --kind K --subject S [fields] | --file F   post a typed board message
   message-checks [--since 24h] [--summary] [--json]  typed-message adoption and Jev scores
   obligations [--overdue] [--all] [--json]  what you owe, and what is overdue in the project
+  withdraw SEQ --reason T | --obligation ID --reason T  withdraw your own open request
   ack SEQ | progress SEQ [--text T]  acknowledge or record progress on an obligation
   reassign OBLIGATION_ID --to AGENT [--reason T]  move an open obligation (lead or owner)
   inbox [--unread] [--mark-read] [--wait 9m] [--json]
@@ -199,6 +200,8 @@ func main() {
 		err = cmdObligations(e, args)
 	case "ack", "progress":
 		err = cmdObligationAction(e, cmd, args)
+	case "withdraw":
+		err = cmdWithdraw(e, args)
 	case "reassign":
 		err = cmdReassign(e, args)
 	case "context":

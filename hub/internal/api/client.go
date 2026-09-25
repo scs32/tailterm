@@ -244,6 +244,11 @@ func (c *Client) ObligationAction(ctx context.Context, task string, seq int64, a
 	return out, c.do(ctx, "POST", fmt.Sprintf("/v1/tasks/%s/messages/%d/%s", task, seq, action), req, &out)
 }
 
+func (c *Client) WithdrawObligation(ctx context.Context, task, obligation string, req ObligationWithdrawRequest) (Obligation, error) {
+	var out Obligation
+	return out, c.do(ctx, "POST", "/v1/tasks/"+task+"/obligations/"+obligation+"/withdraw", req, &out)
+}
+
 // LeaseWakeJob returns the next due broker wake for an agent run, or nil.
 func (c *Client) LeaseWakeJob(ctx context.Context, task, agent, run string) (*WakeJob, error) {
 	var out WakeJob

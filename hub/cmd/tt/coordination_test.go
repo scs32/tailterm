@@ -19,6 +19,13 @@ import (
 	"github.com/scs32/tailterm/hub/internal/store"
 )
 
+func TestBriefingTeachesSenderWithdrawal(t *testing.T) {
+	brief := taskBriefing(api.Task{Name: "Synthetic", Orchestrator: "lead"}, "worker", "")
+	if !strings.Contains(brief, "tt withdraw SEQ --reason TEXT") || !strings.Contains(brief, "delivery-only notice") {
+		t.Fatal("worker briefing does not teach withdrawal of superseded requests")
+	}
+}
+
 func TestWrapPreservesArguments(t *testing.T) {
 	text := "two words; $(printf injected) `printf injected` 'quoted'"
 	command, err := wrapCommand([]string{"--", "printf", "%s", text})

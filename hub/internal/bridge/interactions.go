@@ -160,7 +160,7 @@ func (b *Bridge) statusReply(ctx context.Context, taskID string) reply {
 	if err != nil {
 		return ephemeral("⚠️ %s.", hubMessage(err))
 	}
-	obligations, err := b.cfg.Hub.ListObligations(ctx, taskID, "", "", true, false)
+	obligations, err := b.cfg.Hub.ListObligations(ctx, taskID, "", "", false, false)
 	if err != nil {
 		return ephemeral("⚠️ %s.", hubMessage(err))
 	}
