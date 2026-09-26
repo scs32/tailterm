@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"syscall"
+	"time"
 
 	"github.com/scs32/tailterm/hub/internal/api"
 )
@@ -304,4 +305,19 @@ func relayArchiveCount(dir string) int {
 		count++
 	}
 	return count
+}
+
+// A new binding is examined immediately, including the first --once migration.
+// Keep the next probe in exact-run progress so loop passes and relay restarts
+// add at most one retirement read per minute. Existing delivery revalidation
+// remains independent and fresh. Failures also consume the probe interval.
+func probeRelayRetirement(ctx context.Context, dir, path string, b runtimeBinding, p *relayProgress, c *api.Client, now time.Time) (bool, error) {
+	if p.Run != b.Run || p.Thread != b.Thread {
+		*p = relayProgress{Run: b.Run, Thread: b.Thread}
+	}
+	if now.Before(p.NextRetirementCheck) {
+		return false, nil
+	}
+	p.NextRetirementCheck = now.Add(time.Minute)
+	return retireRelayBinding(ctx, dir, path, b, c)
 }

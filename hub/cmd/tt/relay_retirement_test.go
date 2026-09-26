@@ -10,8 +10,10 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -385,5 +387,177 @@ func TestRelayRetirementPreservesUnmatchedProgress(t *testing.T) {
 	got, _ := os.ReadFile(pp)
 	if !bytes.Equal(got, data) {
 		t.Fatal("unmatched progress lost")
+	}
+}
+
+// Reviewer experiment: count hub requests made by one --once pass for live
+// (running, matching-run) bindings. Run at base and candidate and compare.
+func TestRelayRetirementLiveBindingRequestCounts(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "relay")
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("TAILTERM_RELAY_STATE", dir)
+	t.Setenv("TT_TMUX_SOCKET", "review-counts-"+strconv.FormatInt(time.Now().UnixNano(), 10))
+	for _, k := range []string{"TAILTERM_TASK", "TAILTERM_AGENT", "TAILTERM_RUN", "TAILTERM_TOKEN"} {
+		t.Setenv(k, "")
+	}
+	codex := runtimeBinding{Task: "tsk_0000000000000001", Agent: "agt_0000000000000001", Run: "run_0000000000000001", Thread: "00000000-0000-4000-8000-000000000001", Codex: "/nonexistent", Runtime: "codex"}
+	claude := runtimeBinding{Task: "tsk_0000000000000001", Agent: "agt_0000000000000002", Run: "run_0000000000000002", Thread: "00000000-0000-4000-8000-000000000002", Runtime: "claude", Session: "review-claude"}
+	var mu sync.Mutex
+	counts := map[string]int{}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		key := r.Method + " " + r.URL.Path
+		key = strings.ReplaceAll(key, codex.Agent, "<codex>")
+		key = strings.ReplaceAll(key, claude.Agent, "<claude>")
+		mu.Lock()
+		counts[key]++
+		mu.Unlock()
+		switch {
+		case r.URL.Path == "/v1/team-queues":
+			w.Write([]byte(`{"entries":[]}`))
+		case strings.HasSuffix(r.URL.Path, "/wake-jobs/lease"):
+			http.NotFound(w, r)
+		case strings.Contains(r.URL.Path, "/agents/"+codex.Agent):
+			json.NewEncoder(w).Encode(api.Agent{ID: codex.Agent, TaskID: codex.Task, RunID: codex.Run, Status: api.AgentRunning, Online: true, Runtime: "codex"})
+		case strings.Contains(r.URL.Path, "/agents/"+claude.Agent):
+			json.NewEncoder(w).Encode(api.Agent{ID: claude.Agent, TaskID: claude.Task, RunID: claude.Run, Status: api.AgentRunning, Online: true, Runtime: "claude", Session: claude.Session})
+		case strings.HasSuffix(r.URL.Path, "/pause"):
+			json.NewEncoder(w).Encode(api.ProjectPauseStatus{State: api.ProjectPauseActive})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+	codex.Hub, claude.Hub = server.URL, server.URL
+	t.Setenv("TAILTERM_HUB", server.URL)
+	for _, b := range []runtimeBinding{codex, claude} {
+		if err := writePrivateJSON(filepath.Join(dir, bindingKey(b)+".binding.json"), b); err != nil {
+			t.Fatal(err)
+		}
+	}
+	_, _ = captureRelayOutput(t, true, func() error { return cmdRelay([]string{"--once"}) })
+	var keys []string
+	total := 0
+	for k, n := range counts {
+		keys = append(keys, k)
+		total += n
+	}
+	sort.Strings(keys)
+	for _, k := range keys {
+		t.Logf("%-70s %d", k, counts[k])
+	}
+	t.Logf("TOTAL requests in one --once pass: %d", total)
+	if total != 10 {
+		t.Errorf("first unexamined pass=%d, want base8 plus one initial probe per binding", total)
+	}
+	// Reset delivery/activity cadence to the same first-pass conditions, keeping
+	// only the saved probe deadline: the repeated --once must add no agent reads.
+	for _, b := range []runtimeBinding{codex, claude} {
+		pp := filepath.Join(dir, bindingKey(b)+".progress.json")
+		data, err := os.ReadFile(pp)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var saved relayProgress
+		if err = json.Unmarshal(data, &saved); err != nil {
+			t.Fatal(err)
+		}
+		if saved.NextRetirementCheck.IsZero() {
+			t.Fatal("probe schedule not persisted")
+		}
+		p := relayProgress{Run: b.Run, Thread: b.Thread, NextRetirementCheck: saved.NextRetirementCheck}
+		if err = writePrivateJSON(pp, p); err != nil {
+			t.Fatal(err)
+		}
+		if err = os.Remove(filepath.Join(dir, bindingKey(b)+".activity.json")); err != nil && !os.IsNotExist(err) {
+			t.Fatal(err)
+		}
+	}
+	mu.Lock()
+	counts = map[string]int{}
+	mu.Unlock()
+	if err := cmdRelay([]string{"--once"}); err != nil {
+		t.Fatal(err)
+	}
+	mu.Lock()
+	total = 0
+	for _, n := range counts {
+		total += n
+	}
+	mu.Unlock()
+	t.Logf("TOTAL requests with saved probe schedule: %d", total)
+	if total != 8 {
+		t.Errorf("examined live pass=%d, want base8", total)
+	}
+	if _, err := os.Stat(filepath.Join(dir, bindingKey(codex)+".binding.json")); err != nil {
+		t.Fatalf("live codex binding missing: %v", err)
+	}
+}
+
+func TestRelayRetirementProbeBudgetSurvivesProgressReloads(t *testing.T) {
+	for _, status := range []int{200, 429, 503} {
+		t.Run(strconv.Itoa(status), func(t *testing.T) {
+			dir, path, b, _, _ := retirementFixture(t)
+			var reads atomic.Int32
+			var servedRun atomic.Value
+			servedRun.Store(b.Run)
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				reads.Add(1)
+				if status != 200 {
+					http.Error(w, "unavailable", status)
+					return
+				}
+				json.NewEncoder(w).Encode(api.Agent{ID: b.Agent, TaskID: b.Task, RunID: servedRun.Load().(string), Status: api.AgentRunning})
+			}))
+			defer server.Close()
+			c, _ := api.NewClient(server.URL, time.Second)
+			pp := filepath.Join(dir, bindingKey(b)+".progress.json")
+			now := time.Date(2026, 9, 26, 18, 0, 0, 0, time.UTC)
+			for i := 0; i < 20; i++ {
+				// Reload for every pass, exercising the same persisted state as restarts.
+				var p relayProgress
+				data, err := os.ReadFile(pp)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err = json.Unmarshal(data, &p); err != nil {
+					t.Fatal(err)
+				}
+				retired, err := probeRelayRetirement(context.Background(), dir, path, b, &p, c, now.Add(time.Duration(i)*3*time.Second))
+				if retired {
+					t.Fatal("live binding retired")
+				}
+				if i == 0 && status != 200 && err == nil {
+					t.Fatal("hub error hidden")
+				}
+				if err = saveRelayProgress(dir, pp, b, p); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if reads.Load() != 1 {
+				t.Fatalf("added reads during first minute=%d want1", reads.Load())
+			}
+			data, _ := os.ReadFile(pp)
+			var p relayProgress
+			json.Unmarshal(data, &p)
+			probeRelayRetirement(context.Background(), dir, path, b, &p, c, now.Add(time.Minute))
+			if reads.Load() != 2 {
+				t.Fatalf("next-minute reads=%d want2", reads.Load())
+			}
+			// A successor gets its own immediate identity check, regardless of the
+			// previous run's deadline; the old schedule cannot suppress migration.
+			successor := b
+			successor.Run = "run_0000000000000002"
+			servedRun.Store(successor.Run)
+			if err := writeRelayBinding(successor); err != nil {
+				t.Fatal(err)
+			}
+			retired, err := probeRelayRetirement(context.Background(), dir, path, successor, &p, c, now.Add(time.Minute+time.Second))
+			if retired || (status == 200 && err != nil) {
+				t.Fatalf("live successor retired=%v err=%v", retired, err)
+			}
+			if reads.Load() != 3 {
+				t.Fatalf("new run not immediately probed: %d", reads.Load())
+			}
+		})
 	}
 }

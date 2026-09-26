@@ -40,16 +40,17 @@ type runtimeBinding struct {
 	CreatedAt time.Time `json:"createdAt,omitempty"`
 }
 type relayProgress struct {
-	Run             string    `json:"run"`
-	Thread          string    `json:"thread"`
-	Through         int64     `json:"queuedThrough"`
-	LastAttempt     time.Time `json:"lastAttempt"`
-	Window          time.Time `json:"window"`
-	Wakes           int       `json:"wakes"`
-	Error           string    `json:"error,omitempty"`
-	BrokerWakes     bool      `json:"brokerWakes,omitempty"`
-	LastBrokerWake  time.Time `json:"lastBrokerWake,omitempty"`
-	NextBrokerCheck time.Time `json:"nextBrokerCheck,omitempty"`
+	Run                 string    `json:"run"`
+	Thread              string    `json:"thread"`
+	Through             int64     `json:"queuedThrough"`
+	LastAttempt         time.Time `json:"lastAttempt"`
+	Window              time.Time `json:"window"`
+	Wakes               int       `json:"wakes"`
+	Error               string    `json:"error,omitempty"`
+	BrokerWakes         bool      `json:"brokerWakes,omitempty"`
+	LastBrokerWake      time.Time `json:"lastBrokerWake,omitempty"`
+	NextBrokerCheck     time.Time `json:"nextBrokerCheck,omitempty"`
+	NextRetirementCheck time.Time `json:"nextRetirementCheck,omitempty"`
 }
 
 func relayDir() string {
@@ -555,7 +556,7 @@ func cmdRelay(args []string) error {
 			if err == nil {
 				attachRelayBudget(c, activeRelayBudget)
 				ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
-				retired, retirementErr := retireRelayBinding(ctx, dir, path, b, c)
+				retired, retirementErr := probeRelayRetirement(ctx, dir, path, b, &progress, c, time.Now().UTC())
 				if retirementErr != nil {
 					fmt.Fprintf(os.Stderr, "[tt relay] %s retirement: %v\n", b.Agent, retirementErr)
 				}
