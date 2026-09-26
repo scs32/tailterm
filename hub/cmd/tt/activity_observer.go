@@ -51,6 +51,7 @@ type activityCursor struct {
 	LastDiscovery     time.Time                      `json:"lastDiscovery,omitempty"`
 	FileID            uint64                         `json:"fileId"`
 	Offset            int64                          `json:"offset"`
+	Ready             bool                           `json:"ready,omitempty"`
 	Partial           string                         `json:"partial,omitempty"`
 	Skipping          bool                           `json:"skipping,omitempty"`
 	LastEventAt       time.Time                      `json:"lastEventAt"`
@@ -151,6 +152,7 @@ func readActivityAppend(path string, c *activityCursor, parse func([]byte, *acti
 	if err != nil {
 		return err
 	}
+	c.Ready = false
 	id := fileIdentity(info)
 	if c.Path != path || c.FileID != id || info.Size() < c.Offset {
 		c.Path, c.FileID, c.Offset, c.Partial, c.Skipping = path, id, 0, "", false
@@ -169,6 +171,9 @@ func readActivityAppend(path string, c *activityCursor, parse func([]byte, *acti
 	if remaining < 0 {
 		return errors.New("negative transcript offset")
 	}
+	// Readiness is relative to this pass's observed EOF. An incomplete final
+	// record (including an oversized one being skipped) delays publication.
+	defer func() { c.Ready = c.Offset == info.Size() && c.Partial == "" && !c.Skipping }()
 	reader := bufio.NewReaderSize(io.LimitReader(f, remaining), 64<<10)
 	for {
 		line, readErr := reader.ReadBytes('\n')

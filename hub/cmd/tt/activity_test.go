@@ -483,3 +483,196 @@ func TestActivityWorktreeProbeIsReadOnlyAndSharedPerPass(t *testing.T) {
 		}
 	}
 }
+
+func TestActivityLargeTranscriptFirstReport(t *testing.T) {
+	for _, runtime := range []string{"codex", "claude"} {
+		t.Run(runtime, func(t *testing.T) {
+			home := t.TempDir()
+			t.Setenv("HOME", home)
+			t.Setenv("CODEX_HOME", home)
+			t.Setenv("TAILTERM_RELAY_STATE", filepath.Join(home, "state"))
+			thread := "12345678-1234-1234-1234-123456789abc"
+			dir := filepath.Join(home, ".codex", "sessions", "2026", "09", "25")
+			name := "rollout-test-" + thread + ".jsonl"
+			if runtime == "claude" {
+				dir = filepath.Join(home, ".claude", "projects", "synthetic")
+				name = thread + ".jsonl"
+			}
+			if err := os.MkdirAll(dir, 0700); err != nil {
+				t.Fatal(err)
+			}
+			path := filepath.Join(dir, name)
+			var data strings.Builder
+			if runtime == "codex" {
+				data.WriteString(`{"type":"task_started","timestamp":"2026-09-25T20:00:00Z"}` + "\n")
+			}
+			for i := 0; i < 150; i++ {
+				if runtime == "codex" {
+					fmt.Fprintf(&data, "{\"type\":\"event_msg\",\"timestamp\":\"2026-09-25T20:00:00Z\",\"padding\":%q,\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"input_tokens\":%d,\"output_tokens\":%d,\"total_tokens\":%d}}}}\n", strings.Repeat("x", 64<<10), i+1, i+1, 2*(i+1))
+				} else {
+					fmt.Fprintf(&data, "{\"type\":\"assistant\",\"timestamp\":\"2026-09-25T20:00:00Z\",\"padding\":%q,\"message\":{\"id\":\"m%d\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n", strings.Repeat("x", 64<<10), i)
+				}
+			}
+			final := `{"type":"task_started","timestamp":"2026-09-25T20:01:00Z"}` + "\n"
+			if runtime == "claude" {
+				final = `{"type":"assistant","timestamp":"2026-09-25T20:01:00Z","message":{"id":"last"}}` + "\n"
+			}
+			data.WriteString(strings.TrimSuffix(final, "\n"))
+			if data.Len() <= 2*maxActivityPass {
+				t.Fatal("fixture too small")
+			}
+			if err := os.WriteFile(path, []byte(data.String()), 0600); err != nil {
+				t.Fatal(err)
+			}
+			var reports []api.ActivityReport
+			hub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Method == "GET" {
+					json.NewEncoder(w).Encode(api.Agent{RunID: "run_0123456789abcdef", Status: api.AgentRunning})
+					return
+				}
+				var report api.ActivityReport
+				if err := json.NewDecoder(r.Body).Decode(&report); err != nil {
+					t.Error(err)
+				}
+				reports = append(reports, report)
+				json.NewEncoder(w).Encode(report.Activity)
+			}))
+			defer hub.Close()
+			client, _ := api.NewClient(hub.URL, time.Second)
+			b := runtimeBinding{Hub: hub.URL, Task: "tsk_0123456789abcdef", Agent: "agt_0123456789abcdef", Run: "run_0123456789abcdef", Thread: thread, Runtime: runtime}
+			now := time.Date(2026, 9, 25, 20, 1, 0, 0, time.UTC)
+			probe := func(runtimeBinding, api.Agent) (bool, bool, error) { return true, true, nil }
+			for pass := 0; pass < 3; pass++ {
+				if err := relayActivityTick(context.Background(), b, client, now.Add(time.Duration(pass)*16*time.Second), probe); err != nil {
+					t.Fatal(err)
+				}
+				var c activityCursor
+				saved, err := os.ReadFile(filepath.Join(relayDir(), bindingKey(b)+".activity.json"))
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err = json.Unmarshal(saved, &c); err != nil {
+					t.Fatal(err)
+				}
+				if c.Offset > int64((pass+1)*maxActivityPass) {
+					t.Fatal("pass budget exceeded")
+				}
+				if len(reports) != 0 || c.Transition != 0 || c.LastState != "" {
+					t.Fatalf("stale bootstrap post on pass %d: reports=%d transition=%d", pass, len(reports), c.Transition)
+				}
+			}
+			// Each tick reloads its persisted cursor: restart during catch-up and
+			// at a partial final record must retain totals and bootstrap state.
+			f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0600)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err = f.WriteString("\n"); err != nil {
+				t.Fatal(err)
+			}
+			f.Close()
+			if err := relayActivityTick(context.Background(), b, client, now.Add(48*time.Second), probe); err != nil {
+				t.Fatal(err)
+			}
+			if len(reports) != 1 || !reports[0].Activity.LastEventAt.Equal(now) || reports[0].Activity.Tokens != (api.TokenTotals{Input: 150, Output: 150, Total: 300}) || reports[0].Activity.State != "working" {
+				t.Fatalf("first report not current: %+v", reports)
+			}
+			// Rotation reboots readiness without changing the saved transition
+			// until the replacement transcript's final complete turn is reached.
+			if err := os.Rename(path, path+".old"); err != nil {
+				t.Fatal(err)
+			}
+			end := `{"type":"task_complete","timestamp":"2026-09-25T20:02:00Z"}` + "\n"
+			if runtime == "claude" {
+				end = `{"type":"assistant","timestamp":"2026-09-25T20:02:00Z","message":{"id":"last","stop_reason":"end_turn"}}` + "\n"
+			}
+			replacement := strings.TrimSuffix(data.String(), strings.TrimSuffix(final, "\n")) + end
+			if err := os.WriteFile(path, []byte(replacement), 0600); err != nil {
+				t.Fatal(err)
+			}
+			for pass := 0; pass < 3; pass++ {
+				if err := relayActivityTick(context.Background(), b, client, now.Add(time.Duration(pass+4)*16*time.Second), probe); err != nil {
+					t.Fatal(err)
+				}
+				if pass < 2 && len(reports) != 1 {
+					t.Fatal("rotation published during catch-up")
+				}
+			}
+			if len(reports) != 2 || reports[1].Activity.State != "idle" || !reports[1].Activity.LastEventAt.Equal(now.Add(time.Minute)) || reports[1].Activity.Tokens != (api.TokenTotals{Input: 150, Output: 150, Total: 300}) {
+				t.Fatalf("rotation report: %+v", reports)
+			}
+
+		})
+	}
+}
+
+func TestActivityReaderReadinessResetsAtObservedEnd(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "synthetic.jsonl")
+	// More than two passes, including an oversized skipped record at the end.
+	initial := `{"type":"task_started","timestamp":"2026-09-25T20:00:00Z"}` + "\n"
+	content := initial + strings.Repeat("x", 2*maxActivityPass+10)
+	if err := os.WriteFile(path, []byte(content), 0600); err != nil {
+		t.Fatal(err)
+	}
+	var c activityCursor
+	for pass := 0; pass < 3; pass++ {
+		offset := c.Offset
+		if err := readActivityAppend(path, &c, parseCodexActivity); err != nil {
+			t.Fatal(err)
+		}
+		if c.Ready || c.Offset-offset > maxActivityPass {
+			t.Fatalf("premature readiness or budget: pass%d %+v", pass, c)
+		}
+		data, err := json.Marshal(c)
+		if err != nil {
+			t.Fatal(err)
+		}
+		c = activityCursor{}
+		if err = json.Unmarshal(data, &c); err != nil {
+			t.Fatal(err)
+		}
+	}
+	appendLine := func(line string) {
+		t.Helper()
+		f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0600)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer f.Close()
+		if _, err = f.WriteString(line); err != nil {
+			t.Fatal(err)
+		}
+	}
+	appendLine("\n" + `{"type":"task_complete","timestamp":"2026-09-25T20:01:00Z"}` + "\n")
+	if err := readActivityAppend(path, &c, parseCodexActivity); err != nil || !c.Ready || !c.TurnComplete {
+		t.Fatalf("completed skip %+v %v", c, err)
+	}
+	appendLine(initial + strings.Repeat("x", maxActivityPass+10))
+	if err := readActivityAppend(path, &c, parseCodexActivity); err != nil || c.Ready {
+		t.Fatalf("append readiness %+v %v", c, err)
+	}
+	// Truncation clears pending skip and readiness, then replays complete records.
+	if err := os.WriteFile(path, []byte(initial), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := readActivityAppend(path, &c, parseCodexActivity); err != nil || !c.Ready || c.TurnComplete || c.Skipping {
+		t.Fatalf("truncate %+v %v", c, err)
+	}
+	if err := os.Rename(path, path+".old"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte(initial+strings.Repeat("x", maxActivityPass+10)), 0600); err != nil {
+		t.Fatal(err)
+	}
+	oldID := c.FileID
+	if err := readActivityAppend(path, &c, parseCodexActivity); err != nil || c.Ready || c.FileID == oldID || c.Offset != maxActivityPass {
+		t.Fatalf("rotation %+v %v", c, err)
+	}
+	other := path + ".new"
+	if err := os.WriteFile(other, []byte(initial), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := readActivityAppend(other, &c, parseCodexActivity); err != nil || !c.Ready || c.Path != other || c.Skipping {
+		t.Fatalf("path reset %+v %v", c, err)
+	}
+}

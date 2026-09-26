@@ -40,7 +40,7 @@ func cachedActivityWorktree(ctx context.Context, cwd string) (string, error) {
 }
 
 func activityProbeNative(b runtimeBinding, a api.Agent) (bool, bool, error) {
-	return probeExactRuntimeProcess(b, a, spawn.ProbeSession, nativeRuntimeSessionProbe, nativeRuntimePIDProbe)
+	return probeRuntimeWithDiscovery(b, a, spawn.ProbeSession, nativeRuntimeSessionProbe, nativeRuntimePIDProbe, nativeRuntimeDiscovery)
 }
 
 func activityWorktree(cwd string) (string, error) {
@@ -257,6 +257,12 @@ func relayActivityTick(ctx context.Context, b runtimeBinding, client *api.Client
 		}
 		if err := readActivityAppend(transcript, &c, parse); err != nil {
 			c.Unknown = true
+			c.Ready = false
+		}
+		if !c.Ready {
+			// Catch up across bounded passes without freezing a stale first snapshot.
+			// Pending reports above keep their original replay identity.
+			return save()
 		}
 	}
 	if signature, err := cachedActivityWorktree(ctx, b.Cwd); err == nil && signature != "" {

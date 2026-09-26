@@ -1,10 +1,13 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -121,14 +124,14 @@ func TestRuntimeIdentityAndProbeUncertaintyNeverCrash(t *testing.T) {
 func TestWrapperRecordsExactProcessAndExit(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("TAILTERM_RELAY_STATE", filepath.Join(home, "state"))
-	t.Setenv(spawn.EnvSession, "fake-session")
+	t.Setenv(spawn.EnvSession, "tt-handler-0123456789abcdef")
 	t.Setenv("TT_TMUX_SOCKET", "synthetic-activity-process")
 	ps := filepath.Join(home, "ps")
 	if err := os.WriteFile(ps, []byte("#!/bin/sh\nprintf 'synthetic-start\\n'\n"), 0700); err != nil {
 		t.Fatal(err)
 	}
 	tmux := filepath.Join(home, "tmux")
-	line := `["$1","123","fake-session","https://synthetic.invalid","tsk_0123456789abcdef","agt_0123456789abcdef","run_0123456789abcdef"]`
+	line := `["$1","123","tt-handler-0123456789abcdef","https://synthetic.invalid","tsk_0123456789abcdef","agt_0123456789abcdef","run_0123456789abcdef"]`
 	if err := os.WriteFile(tmux, []byte("#!/bin/sh\nprintf '%s\\n' '"+line+"'\n"), 0700); err != nil {
 		t.Fatal(err)
 	}
@@ -141,7 +144,7 @@ func TestWrapperRecordsExactProcessAndExit(t *testing.T) {
 		t.Fatal(err)
 	}
 	var receipt runtimeProcessReceipt
-	if err = json.Unmarshal(data, &receipt); err != nil || receipt.PID != 4321 || receipt.Started != "synthetic-start" || receipt.Session != "fake-session" || receipt.Socket != "synthetic-activity-process" || receipt.SessionID != "$1" || receipt.SessionCreated != "123" {
+	if err = json.Unmarshal(data, &receipt); err != nil || receipt.PID != 4321 || receipt.Started != "synthetic-start" || receipt.Session != "tt-handler-0123456789abcdef" || receipt.Socket != "synthetic-activity-process" || receipt.SessionID != "$1" || receipt.SessionCreated != "123" {
 		t.Fatalf("start receipt: %+v %v", receipt, err)
 	}
 	if err := nativeRuntimeSessionProbe(receipt); err != nil {
@@ -159,5 +162,221 @@ func TestWrapperRecordsExactProcessAndExit(t *testing.T) {
 	}
 	if err = json.Unmarshal(data, &receipt); err != nil || receipt.ExitedAt.IsZero() {
 		t.Fatalf("exit receipt: %+v %v", receipt, err)
+	}
+}
+
+// The fake commands expose precisely the columns used by production discovery.
+func TestActivityHandlerRuntimeAdoption(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("TAILTERM_RELAY_STATE", filepath.Join(home, "state"))
+	t.Setenv("TT_TMUX_SOCKET", "test-handler")
+	t.Setenv("PATH", home+":"+os.Getenv("PATH"))
+	b := runtimeBinding{Hub: "https://synthetic.invalid", Task: "tsk_0123456789abcdef", Agent: "agt_0123456789abcdef", Run: "run_0123456789abcdef", Session: "tt-handler-0123456789abcdef", Runtime: "codex"}
+	a := api.Agent{TaskID: b.Task, ID: b.Agent, RunID: b.Run, Session: b.Session, Runtime: b.Runtime, Status: api.AgentRunning}
+	pane := `["$1","123","tt-handler-0123456789abcdef","https://synthetic.invalid","tsk_0123456789abcdef","agt_0123456789abcdef","run_0123456789abcdef","100"]`
+	processes := "100 1 Fri Sep 25 20:00:00 2026 /bin/zsh\n101 100 Fri Sep 25 20:00:01 2026 /bin/tt\n102 101 Fri Sep 25 20:00:02 2026 /bin/codex\n"
+	write := func(name, body string) {
+		t.Helper()
+		if err := os.WriteFile(filepath.Join(home, name), []byte("#!/bin/sh\ncat <<'DATA'\n"+body+"\nDATA\n"), 0700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write("tmux", pane)
+	write("ps", processes)
+	receipt, err := nativeRuntimeDiscovery(context.Background(), b, a)
+	if err != nil || receipt.PID != 102 || receipt.PanePID != 100 || receipt.Socket != "test-handler" {
+		t.Fatalf("handler discovery %+v %v", receipt, err)
+	}
+	tmux := func(string) (bool, error) { return true, nil }
+	session := func(r runtimeProcessReceipt) error {
+		if r.SessionID != "$1" {
+			return errors.New("session")
+		}
+		return nil
+	}
+	alive := true
+	pid := func(p int, s string) (bool, error) {
+		if p != 102 || s != "Fri Sep 25 20:00:02 2026" {
+			t.Fatalf("unexpected process %d %q", p, s)
+		}
+		return alive, nil
+	}
+	path := runtimeProcessPath(b.Hub, b.Agent, b.Run)
+	if _, _, err := probeExactRuntimeProcess(b, a, tmux, session, pid); err == nil {
+		t.Fatal("baseline missing receipt must be unknown")
+	}
+	for _, mode := range []string{"adopted", "fresh"} {
+		if mode == "fresh" {
+			if err := writePrivateJSON(path, receipt); err != nil {
+				t.Fatal(err)
+			}
+		}
+		tm, pr, err := probeRuntimeWithDiscovery(b, a, tmux, session, pid, nativeRuntimeDiscovery)
+		if err != nil || !tm || !pr {
+			t.Fatalf("%s handler probe %v %v %v", mode, tm, pr, err)
+		}
+		info, err := os.Stat(path)
+		if err != nil || info.Mode().Perm() != 0600 {
+			t.Fatalf("private adopted receipt: %v %v", info, err)
+		}
+		now := time.Date(2026, 9, 25, 20, 0, 5, 0, time.UTC)
+		c := activityCursor{SeenTurn: true, LastEventAt: now}
+		if got := activityState(&c, a, 0, tm, pr, err, now, activityDefaults()); got.State != "working" {
+			t.Fatal(got)
+		}
+		c.TurnComplete = true
+		if got := activityState(&c, a, 0, tm, pr, err, now, activityDefaults()); got.State != "idle" {
+			t.Fatal(got)
+		}
+		c.TurnComplete = false
+		c.Pending = map[string]pendingActivityCall{"x": {Name: "exec_command", Since: now.Add(-11 * time.Minute)}}
+		if got := activityState(&c, a, 0, tm, pr, err, now, activityDefaults()); got.State != "hung_tool" {
+			t.Fatal(got)
+		}
+	}
+	alive = false
+	tm, pr, err := probeRuntimeWithDiscovery(b, a, tmux, session, pid, func(context.Context, runtimeBinding, api.Agent) (runtimeProcessReceipt, error) {
+		t.Fatal("saved receipt rediscovered")
+		return receipt, nil
+	})
+	now := time.Date(2026, 9, 25, 20, 0, 5, 0, time.UTC)
+	c := activityCursor{SeenTurn: true, LastEventAt: now}
+	first := activityState(&c, a, 0, tm, pr, err, now, activityDefaults())
+	second := activityState(&c, a, 0, tm, pr, err, now.Add(16*time.Second), activityDefaults())
+	if first.State != "unknown" || second.State != "crashed" {
+		t.Fatalf("handler crash %v %v", first, second)
+	}
+}
+
+func TestActivityRuntimeDiscoveryRejections(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("TAILTERM_RELAY_STATE", filepath.Join(home, "state"))
+	t.Setenv("TT_TMUX_SOCKET", "fake")
+	t.Setenv("PATH", home+":"+os.Getenv("PATH"))
+	b := runtimeBinding{Hub: "https://synthetic.invalid", Task: "tsk_0123456789abcdef", Agent: "agt_0123456789abcdef", Run: "run_0123456789abcdef", Session: "tt-handler-0123456789abcdef", Runtime: "codex"}
+	a := api.Agent{TaskID: b.Task, ID: b.Agent, RunID: b.Run, Session: b.Session, Runtime: b.Runtime}
+	pane := `["$1","123","tt-handler-0123456789abcdef","https://synthetic.invalid","tsk_0123456789abcdef","agt_0123456789abcdef","run_0123456789abcdef","100"]`
+	base := "100 1 Fri Sep 25 20:00:00 2026 /bin/zsh\n101 100 Fri Sep 25 20:00:01 2026 /bin/codex\n"
+	write := func(name, body string) {
+		t.Helper()
+		if err := os.WriteFile(filepath.Join(home, name), []byte("#!/bin/sh\ncat <<'DATA'\n"+body+"\nDATA\n"), 0700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	deep := "100 1 Fri Sep 25 20:00:00 2026 zsh\n"
+	for i := 101; i < 140; i++ {
+		deep += fmt.Sprintf("%d %d Fri Sep 25 20:00:01 2026 tt\n", i, i-1)
+	}
+	deep += "140 139 Fri Sep 25 20:00:02 2026 codex\n"
+	for _, tc := range []struct{ name, pane, ps string }{
+		{"ambiguous panes", pane + "\n" + pane, base},
+		{"wrong run", strings.Replace(pane, b.Run, "run_fedcba9876543210", 1), base},
+		{"wrong hub", strings.Replace(pane, b.Hub, "https://other.invalid", 1), base},
+		{"wrong session", strings.Replace(pane, b.Session, "reused", 1), base},
+		{"no pane", pane, "101 1 Fri Sep 25 20:00:01 2026 codex"},
+		{"shell only", pane, "100 1 Fri Sep 25 20:00:00 2026 zsh"},
+		{"ambiguous runtimes", pane, base + "102 100 Fri Sep 25 20:00:02 2026 codex\n"},
+		{"reused parent", pane, strings.Replace(base, "20:00:00", "20:00:05", 1)},
+		{"reused session creation", strings.Replace(pane, `"123"`, `"9999999999"`, 1), base},
+		{"depth budget", pane, deep},
+		{"output budget", pane, strings.Repeat(base, 10000)},
+		{"malformed process", pane, "invalid"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			write("tmux", tc.pane)
+			write("ps", tc.ps)
+			if _, err := nativeRuntimeDiscovery(context.Background(), b, a); err == nil {
+				t.Fatal("unsafe discovery accepted")
+			}
+			if _, err := os.Stat(runtimeProcessPath(b.Hub, b.Agent, b.Run)); !errors.Is(err, os.ErrNotExist) {
+				t.Fatal("rejection wrote receipt")
+			}
+		})
+	}
+	if err := os.WriteFile(filepath.Join(home, "tmux"), []byte("#!/bin/sh\nexit 1\n"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := nativeRuntimeDiscovery(context.Background(), b, a); err == nil {
+		t.Fatal("denial accepted")
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := nativeRuntimeDiscovery(ctx, b, a); err == nil {
+		t.Fatal("exhausted time budget accepted")
+	}
+}
+
+func TestActivityAdoptionNeverReplacesUncertainReceipts(t *testing.T) {
+	t.Setenv("TAILTERM_RELAY_STATE", t.TempDir())
+	t.Setenv("TT_TMUX_SOCKET", "")
+	b := runtimeBinding{Hub: "https://synthetic.invalid", Task: "tsk_0123456789abcdef", Agent: "agt_0123456789abcdef", Run: "run_0123456789abcdef", Session: "tt-handler-0123456789abcdef"}
+	a := api.Agent{TaskID: b.Task, ID: b.Agent, RunID: b.Run, Session: b.Session}
+	receipt := runtimeProcessReceipt{Hub: b.Hub, Task: b.Task, Agent: b.Agent, Run: b.Run, Session: b.Session, SessionID: "$1", SessionCreated: "123", PID: 101, Started: "synthetic"}
+	path := runtimeProcessPath(b.Hub, b.Agent, b.Run)
+	tmux := func(string) (bool, error) { return true, nil }
+	session := func(runtimeProcessReceipt) error { return nil }
+	pid := func(int, string) (bool, error) { return true, nil }
+	forbidden := func(context.Context, runtimeBinding, api.Agent) (runtimeProcessReceipt, error) {
+		t.Fatal("existing uncertain receipt entered adoption")
+		return receipt, nil
+	}
+	for _, mode := range []string{"malformed", "mismatched", "exited"} {
+		r := receipt
+		switch mode {
+		case "malformed":
+			if err := os.WriteFile(path, []byte("{invalid"), 0600); err != nil {
+				t.Fatal(err)
+			}
+		case "mismatched":
+			r.Run = "run_fedcba9876543210"
+			writePrivateJSON(path, r)
+		case "exited":
+			r.ExitedAt = time.Now()
+			writePrivateJSON(path, r)
+		}
+		before, _ := os.ReadFile(path)
+		probeRuntimeWithDiscovery(b, a, tmux, session, pid, forbidden)
+		after, _ := os.ReadFile(path)
+		if string(before) != string(after) {
+			t.Fatal("changed existing receipt")
+		}
+	}
+	os.Remove(path)
+	calls := 0
+	changing := func(context.Context, runtimeBinding, api.Agent) (runtimeProcessReceipt, error) {
+		calls++
+		r := receipt
+		if calls == 2 {
+			r.SessionCreated = "124"
+		}
+		return r, nil
+	}
+	if _, _, err := probeRuntimeWithDiscovery(b, a, tmux, session, pid, changing); err == nil {
+		t.Fatal("discovery race accepted")
+	}
+	if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+		t.Fatal("race wrote receipt")
+	}
+	calls = 0
+	wrapperRace := func(context.Context, runtimeBinding, api.Agent) (runtimeProcessReceipt, error) {
+		calls++
+		if calls == 2 {
+			r := receipt
+			r.ExitedAt = time.Now()
+			if err := writePrivateJSON(path, r); err != nil {
+				t.Fatal(err)
+			}
+		}
+		return receipt, nil
+	}
+	if _, _, err := probeRuntimeWithDiscovery(b, a, tmux, session, pid, wrapperRace); err == nil {
+		t.Fatal("concurrent wrapper receipt overwritten")
+	}
+	var saved runtimeProcessReceipt
+	data, _ := os.ReadFile(path)
+	json.Unmarshal(data, &saved)
+	if saved.ExitedAt.IsZero() {
+		t.Fatal("lost wrapper exit receipt")
 	}
 }
