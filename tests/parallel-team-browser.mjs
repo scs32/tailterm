@@ -2,6 +2,18 @@
 import assert from "node:assert/strict";
 import { chromium, webkit } from "@playwright/test";
 import { createServer } from "vite";
+import { execFileSync } from "node:child_process";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+const nativeDir = mkdtempSync(join(tmpdir(), "review-convergence-browser-"));
+let native;
+try {
+  const output = join(nativeDir, "native.json");
+  execFileSync("go", ["test", "./cmd/tt", "-run", "^TestReviewConvergenceNativeCLISummaryAndProjection$", "-count=1"], {cwd:join(process.cwd(),"hub"), env:{...process.env,REVIEW_CONVERGENCE_FIXTURE_OUTPUT:output}, stdio:"pipe"});
+  native = JSON.parse(readFileSync(output,"utf8"));
+} finally { rmSync(nativeDir,{recursive:true,force:true}); }
+
 
 const html = `<!doctype html><html><head><link rel="stylesheet" href="/client/style.css"><link rel="stylesheet" href="/client/work-items.css"></head><body><main id="delivery"></main><script type="module">
 import {renderTeamDelivery} from '/client/team-delivery-view.js';
@@ -10,6 +22,7 @@ const queue={concurrencyLimit:2,entries:[
  {itemId:'wi_bbbbbbbbbbbbbbbb',state:'queued',ownership:['src/a/child'],blockedBy:['tqe_aaaaaaaaaaaaaaaa'],blockReason:'ownership overlap'},
  {itemId:'wi_cccccccccccccccc',state:'finished',ownership:['src/c'],handlerId:'agt_handler_c',integration:{repository:'/fixture/git',baseCommit:'a'.repeat(40),worktree:'/fixture/builder-c',branch:'feature/c',commit:'b'.repeat(40),evidence:'item=C;close=receipt'}}
 ]};
+queue.entries.push(...${JSON.stringify(native.queue.entries).replaceAll("<", "\\u003c")});
 const agents=[{id:'agt_lead_a',name:'Lead A',itemLead:true,workItem:{itemId:'wi_aaaaaaaaaaaaaaaa'}},{id:'agt_handler_a',name:'Handler A'},{id:'agt_handler_c',name:'Handler C'}];
 document.querySelector('#delivery').innerHTML=renderTeamDelivery(queue,agents);
 window.fixture={queue,agents,rerender(){document.querySelector('#delivery').innerHTML=renderTeamDelivery(queue,agents)}};
@@ -39,7 +52,7 @@ try {
       page.on("pageerror", (error) => errors.push(error.message));
       await page.goto(origin + "/parallel-delivery-test");
       await page.locator('[data-testid="team-delivery-entry"]').first().waitFor();
-      assert.equal(await page.locator('[data-testid="team-delivery-entry"]').count(), 3);
+      assert.equal(await page.locator('[data-testid="team-delivery-entry"]').count(), 5);
       assert.match(await page.locator('[data-testid="team-delivery-panel"]').innerText(), /Limit 2/);
       assert.match(await page.locator('[data-testid="team-delivery-entry"]').nth(1).innerText(), /Waiting for tqe_aaaaaaaaaaaaaaaa/);
       assert.match(await page.locator('[data-testid="team-delivery-entry"]').nth(0).innerText(), /Lead Lead A · Handler Handler A/);
@@ -55,6 +68,17 @@ try {
       });
       assert.equal(await page.locator('[data-testid="team-ready-to-integrate"]').count(), 0);
       assert.match(await page.locator('[data-testid="team-delivery-entry"]').nth(2).innerText(), /Waiting for handler acceptance/);
+      for (const width of [390,1280]) {
+        await page.setViewportSize({width,height:800});
+        await page.reload();
+        await page.locator('[data-testid="review-convergence-summary"]').first().waitFor();
+        assert.match(await page.locator('[data-testid="team-delivery-entry"]').nth(3).innerText(),/Reviews 2\/2 · Follow-ups 1/);
+        assert.match(await page.locator('[data-testid="team-delivery-entry"]').nth(4).innerText(),/Reviews unknown · Follow-ups unknown/);
+        assert.match(native.summary,/reviews: 2\/2; follow-ups: 1/);
+        assert.equal(await page.locator('#delivery script:not([type="module"])').count(),0);
+        assert.match(await page.locator('[data-testid="team-delivery-entry"]').nth(3).innerText(),/<script>fixture escape<\/script>/);
+        assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth),true,`overflow at ${width}`);
+      }
       assert.deepEqual(errors, []);
       await context.close();
       console.log(`${engine.name()}: delivery ownership, blocker, item roles and gated integration receipt rendered`);

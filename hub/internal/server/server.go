@@ -67,6 +67,7 @@ func New(st *store.Store, identity Identity) *Server {
 	m.HandleFunc("POST /v1/tasks/{id}/messages", s.postMessage)
 	m.HandleFunc("GET /v1/tasks/{id}/messages", s.listMessages)
 	m.HandleFunc("GET /v1/tasks/{id}/message-checks", s.listMessageChecks)
+	m.HandleFunc("GET /v1/tasks/{id}/review-convergence", s.listReviewConvergence)
 	m.HandleFunc("GET /v1/tasks/{id}/obligations", s.listObligations)
 	m.HandleFunc("POST /v1/tasks/{id}/messages/{seq}/ack", s.obligationAction("ack"))
 	m.HandleFunc("POST /v1/tasks/{id}/messages/{seq}/progress", s.obligationAction("progress"))

@@ -69,6 +69,13 @@ func cmdMessageChecks(e env, args []string) error {
 	}
 	if *summary {
 		fmt.Print(summarizeChecks(checks, names))
+		reviews, err := c.ListReviewConvergence(ctx, task)
+		if err != nil {
+			fmt.Printf("Review history unavailable (unknown): %v\n", err)
+		}
+		if err == nil {
+			fmt.Print(summarizeReviews(reviews))
+		}
 		if obligations, err := c.ListObligations(ctx, task, "", "", false, false); err == nil {
 			cutoff := time.Time{}
 			if *since > 0 {
@@ -337,4 +344,16 @@ func ackLatency(o api.Obligation) time.Duration {
 		from = *o.DeliveredAt
 	}
 	return o.AckedAt.Sub(from)
+}
+
+func summarizeReviews(list []api.ReviewConvergence) string {
+	var out strings.Builder
+	for _, item := range list {
+		if item.History == "unknown" {
+			fmt.Fprintf(&out, "%s reviews: unknown; follow-ups: unknown\n", item.ItemID)
+		} else {
+			fmt.Fprintf(&out, "%s reviews: %d/2; follow-ups: %d\n", item.ItemID, len(item.Rounds), len(item.FollowUps))
+		}
+	}
+	return out.String()
 }

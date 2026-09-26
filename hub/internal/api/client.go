@@ -383,3 +383,9 @@ func (c *Client) ReportCleanup(ctx context.Context, task, agent string, req Clea
 	var out Agent
 	return out, c.do(ctx, "POST", "/v1/tasks/"+task+"/agents/"+agent+"/cleanup", req, &out)
 }
+
+func (c *Client) ListReviewConvergence(ctx context.Context, task string) ([]ReviewConvergence, error) {
+	var out []ReviewConvergence
+	err := c.do(ctx, "GET", "/v1/tasks/"+task+"/review-convergence", nil, &out)
+	return out, err
+}

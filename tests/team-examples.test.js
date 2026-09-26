@@ -159,3 +159,14 @@ test("every member prompt teaches tt ack and none says not to acknowledge", () =
       assert.doesNotMatch(member.prompt, /do not acknowledge|acknowledge acknowledgements/i, `${team.id}/${member.name}`);
     }
 });
+
+test("Planned delivery freezes criteria and never resets the review cap", () => {
+  const planned = TEAM_EXAMPLES.find((example) => example.id === "planned");
+  const instructions = JSON.stringify(planned);
+  assert.match(instructions, /a1…aN unchanged/);
+  assert.match(instructions, /Never reset its lifetime count/);
+  assert.match(instructions, /mode general/);
+  assert.match(instructions, /New non-regression findings become linked follow-ups/);
+  assert.match(instructions, /held for triage/);
+  assert.match(instructions, /tt send --review-file/);
+});

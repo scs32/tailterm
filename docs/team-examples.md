@@ -174,7 +174,7 @@ A lead, a planner, one writer, a database handler and an independent reviewer fr
 
 **Use for:** The default for real features and bugs: plan first, one writer, bounded review, recorded acceptance.
 
-**Workflow:** Planner writes acceptance criteria → lead assigns builder → reviewer gives at most two review rounds → lead decides release → database handler records it.
+**Workflow:** Planner freezes numbered acceptance criteria → lead assigns builder → reviewer gives at most two review rounds → lead decides release → database handler records it.
 
 **Example task objective:** In <repository>, deliver <change>. Acceptance: <observable results>. Constraints: <invariants>.
 
@@ -208,7 +208,7 @@ Start by sending planner a REQUEST for a plan of the owner's objective. When the
 
 For each live team's Start, plan or assignment gate, send the database handler a typed REQUEST with the exact item, order, agent and run. Include --work-item ID --work-item-revision N --work-order-message SEQ on tt send; --ref alone does not create the native item link needed for priority. Wait for its RESULT --reply-to before using that gate as verified. A queued item's intake may wait while the handler answers live-team gates.
 
-When builder sends a RESULT with a frozen commit, check it against each criterion, then send reviewer a REVIEW naming that commit, the scope and the criteria. Follow the two-review-round policy: round one produces one consolidated blocker list, and round two checks only those fixes and regressions. After round two, choose exactly one disposition: release, one focused fix with verification, an explicit scope reduction mapped to criteria, or a release block with owner, next action and resume condition. There is no third general review.
+When builder sends a RESULT with a frozen commit, check it against each criterion, then send reviewer a REVIEW naming that commit, the scope and the criteria. Follow the two-review-round policy: round one produces one consolidated blocker list, and round two checks only those fixes and regressions. After round two, choose exactly one disposition: release, one focused fix with verification, an explicit scope reduction mapped to criteria, or a release block with owner, next action and resume condition. There is no third general review for this item, including after scope revisions. Never reset its lifetime count. Use typed review metadata (tt send --review-file PATH) for general review results, focused REQUEST/RESULT verification and disposition NOTICE. After round two choose accept, owner-decision or follow-ups; accept requires passing frozen criteria and resolved blockers. Focused verification records the exact candidate, fix and blocker IDs by the original reviewer or a verifier bound to a linked verification item. Follow-ups are automatically filed and held for triage.
 
 Reviewer runs on a runtime that the relay cannot wake. Always send it directed messages; it waits on its inbox. If any teammate leaves an ASSIGN, REQUEST or REVIEW without a reply for 30 minutes, send that teammate one nudge. The broker escalates overdue work itself; do not send a message to escalate a teammate's stall to the owner. Close workers only after acceptance. Once the handler confirms a terminal item and all team obligations are closed, run tt close --team for the item team. When this item came from tt team queue, the supervised host runner may close it after the same gates and cleanup receipts, then advance the queue.
 ```
@@ -326,7 +326,9 @@ Review only a frozen commit named in a REVIEW from lead, against its stated scop
 
 For a review RESULT about the assigned item, include --work-item ID --work-item-revision N --work-order-message SEQ on tt send. Use the current item revision; --ref alone does not create the native item link used for handler priority.
 
-Round one: send one RESULT with a consolidated blocker list. Give each blocker an ID (b1, b2…), the violated criterion or reproducible defect, the location, a triggering example, a severity and how to verify the fix. Put preferences under a separate follow-ups field; they never block. Round two: check only the listed fixes and any regressions they caused, and do not add new preferences; a newly found real defect is still reported. If nothing blocks, say what you checked and what you could not verify.
+Use tt send --review-file PATH (or review metadata in --file) with mode general and the exact candidate. Body Status covers all frozen a1…aN. Each blocker must name a failed criterion, or a demonstrated regression with distinct baseline/candidate, and command+output or file+line evidence. Findings without those blocking grounds go into findings and are automatically filed as linked bugs/features held for triage.
+
+Round one: send one RESULT with a consolidated blocker list. Give each blocker an ID (b1, b2…), the violated criterion or reproducible defect, the location, a triggering example, a severity and how to verify the fix. Put preferences under a separate follow-ups field; they never block. Round two: check only round-one blocker IDs and demonstrated regressions. Retain unresolved blockers and put resolved IDs in blockerIds. New non-regression findings become linked follow-ups, never blockers. There is no third general review or scope-reset loophole; exact focused REQUEST/RESULT verification after round two names only the recorded fix, candidate and unresolved blocker IDs. If nothing blocks, say what you checked and what you could not verify.
 ```
 
 ## Focused solo
@@ -1096,3 +1098,11 @@ launch. The task briefing asks Codex members to inspect their tool registry and
 distinguish host information from a thread-specific report during introductions.
 See [agent permissions and tools](agent-permissions.md) for modes, tool rules and
 visible permission/login/tool blockers.
+
+Planned delivery freezes contiguous numbered criteria a1..aN on the item-linked
+assignment. Review results carry [review metadata](message-broker.md#review-convergence),
+with failed-criterion or demonstrated-regression evidence for blockers. Two
+general reviews are the absolute lifetime cap per item, including scope changes.
+Round two verifies existing blockers and regressions; other findings are filed
+as linked follow-ups held for triage. Changed candidates after round two require
+recorded exact focused verification before lead acceptance.

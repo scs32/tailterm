@@ -1154,6 +1154,9 @@ func (s *Store) PostMessage(ctx context.Context, taskID string, req api.PostMess
 	if err = insertMessageSource(ctx, tx, &m, req.Source); err != nil {
 		return m, err
 	}
+	if err = s.applyReviewConvergence(ctx, tx, m, req, target, by); err != nil {
+		return m, err
+	}
 	// Broker phase 2a: only posts through this public endpoint create or settle
 	// obligations. System notices, decisions, dispatches and lead notices use
 	// other insert paths and never oblige anyone.

@@ -26,6 +26,7 @@ func cmdSend(e env, args []string) error {
 		fmt.Fprintln(fs.Output(), "           --outcome done --status a1=pass --evidence \"e1: go test ./cmd/tt -> ok\" --ref commit=abc1234")
 		fs.PrintDefaults()
 	}
+	reviewFile := fs.String("review-file", "", "structured review metadata JSON file (or use review in --file envelope)")
 	file := fs.String("file", "", "JSON envelope file, or - for stdin")
 	task := fs.String("task", e.task, "task id")
 	to := fs.String("to", "", "recipient agent name or id")
@@ -115,6 +116,18 @@ func cmdSend(e env, args []string) error {
 				env.Evidence = map[string]api.Evidence{}
 			}
 			env.Evidence[key] = item
+		}
+	}
+	if *reviewFile != "" {
+		raw, err := os.ReadFile(*reviewFile)
+		if err != nil {
+			return err
+		}
+		env.Review = new(api.ReviewMetadata)
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.DisallowUnknownFields()
+		if err = dec.Decode(env.Review); err != nil {
+			return err
 		}
 	}
 	// One recipient: --to and the envelope's to must agree, and routing uses it.

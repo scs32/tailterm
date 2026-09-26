@@ -335,6 +335,15 @@ func (s *Store) UpdateWorkItem(ctx context.Context, taskID, itemID string, req a
 	if item.Revision != req.Revision {
 		return api.WorkItem{}, workItemConflict("work item revision changed; refresh it before updating")
 	}
+	if req.Status != nil && *req.Status == "done" {
+		gateItem := item
+		if req.Title != nil || req.Description != nil {
+			gateItem.ScopeRevision++
+		}
+		if err = reviewCompletion(ctx, tx, gateItem, ""); err != nil {
+			return api.WorkItem{}, err
+		}
+	}
 	transitioningDone := item.Kind == "feature" && item.Status != "done" && req.Status != nil && *req.Status == "done"
 	if transitioningDone {
 		if req.Title != nil || req.Description != nil {
@@ -539,6 +548,15 @@ func (s *Store) CreateWorkItemUpdate(ctx context.Context, taskID, itemID string,
 	}
 	if item.Revision != req.ExpectedRevision {
 		return api.WorkItemUpdateResult{}, false, workItemConflict("work item revision changed; refresh it before updating")
+	}
+	if req.Status != nil && *req.Status == "done" {
+		gateItem := item
+		if req.Title != nil || req.Description != nil {
+			gateItem.ScopeRevision++
+		}
+		if err = reviewCompletion(ctx, tx, gateItem, ""); err != nil {
+			return api.WorkItemUpdateResult{}, false, err
+		}
 	}
 	transitioningDone := item.Kind == "feature" && item.Status != "done" && req.Status != nil && *req.Status == "done"
 	if transitioningDone {

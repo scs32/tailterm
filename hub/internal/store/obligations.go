@@ -643,6 +643,9 @@ func (s *Store) reissueObligation(ctx context.Context, tx *sql.Tx, task api.Task
 	if err != nil {
 		return m, err
 	}
+	if err := s.reassignReview(ctx, tx, authored, m, target); err != nil {
+		return m, err
+	}
 	if err := s.createObligations(ctx, tx, m, reissue, false); err != nil {
 		return m, err
 	}

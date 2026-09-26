@@ -439,3 +439,21 @@ func TestBackslashValuesRoundTripWithoutSemicolons(t *testing.T) {
 		t.Fatalf("owns changed: %q", o.Body.Owns)
 	}
 }
+
+func TestReviewConvergenceMetadataKindAndRendering(t *testing.T) {
+	e := Envelope{Kind: "notice", Subject: "Exact review disposition saved", Body: EnvelopeBody{Text: "Saved"}, Review: &ReviewMetadata{Mode: "disposition", Disposition: "accept", Candidate: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}
+	if p := ValidateEnvelope(e); len(p) != 0 {
+		t.Fatal(p)
+	}
+	if !strings.Contains(RenderText(e), "Review metadata:") {
+		t.Fatal(RenderText(e))
+	}
+	e.Review.Mode = "focused"
+	if len(ValidateEnvelope(e)) == 0 {
+		t.Fatal("focused NOTICE accepted")
+	}
+	e.Review.Mode = "unknown"
+	if len(ValidateEnvelope(e)) == 0 {
+		t.Fatal("unknown review mode accepted")
+	}
+}

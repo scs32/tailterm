@@ -346,3 +346,47 @@ Kept as they are: work items, Queue (scheduling and claims), operational records
    is part of [phase 2b](broker-phase-2b.md).
 4. **Discord layout.** One channel per project (proposed) versus threads if many
    projects are expected. See the 50-channels-per-category limit in the platform findings.
+
+## Review convergence
+
+Source feature `wi_3d6a4e3d1bf99a08`, order #11569, assignment #11656.
+The first item-linked ASSIGN freezes contiguous a1..aN for that scope. Linked
+REVIEW messages reserve at most two lifetime rounds, serially, with the exact
+40/64-character candidate commit, target agent/run and identical acceptance map.
+A review RESULT replies to that request, includes every criterion in Status and
+structured `review` metadata. `tt send --review-file metadata.json` supports the
+same metadata; `--file` can contain it directly. Example:
+
+```json
+{"mode":"general","candidate":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+ "blockers":[{"id":"b1","criterion":"a1","title":"Retry loses state",
+ "command":"go test ./internal/store -run Retry","output":"FAIL: lost state"}],
+ "findings":[{"id":"f1","kind":"feature","title":"Explain retry state",
+ "file":"client/view.js","line":12}]}
+```
+
+Blockers require a failed frozen criterion or an evidenced regression. Regression
+metadata includes `regression:true`, distinct exact `baseline` and `candidate`,
+and command+output or file+line. Findings are automatically filed once as native
+linked work items and held for triage. Round two retains prior blocker IDs or
+resolves them explicitly in `blockerIds`; only evidenced new regressions block.
+New non-regression blockers are converted to follow-ups.
+
+After two completed rounds, a focused REQUEST has `mode:"focused"`, exact
+`candidate`, `fix`, and unresolved `blockerIds`. Its RESULT repeats that metadata,
+replies to the request, supplies evidence, and reports pass/fail for exactly those
+blocker IDs in Status. The original exact reviewer run is eligible; another
+verifier must be bound to `verificationItemId`, which is also a native related
+item link on the lead's request. Focused verification never allocates a round.
+
+A lead NOTICE records `mode:"disposition"`, exact `candidate` and `disposition`
+of `accept`, `owner-decision` or `follow-ups`. Completion and team acceptance
+require recorded acceptance, passing criteria and resolved blockers. A changed
+candidate requires passing exact focused verification. Receipt replay precedes
+all enforcement; refusals roll back the message, obligations, follow-ups and
+ledger atomically. Reassignment preserves a round's original request and changes
+its active request/reviewer run; it never refunds a round.
+
+`GET /v1/tasks/{id}/review-convergence`, `tt message-checks --summary`, and the
+Projects Delivery projection expose lifetime rounds and linked follow-ups.
+Unrecorded legacy history is explicitly unknown, never inferred zero.

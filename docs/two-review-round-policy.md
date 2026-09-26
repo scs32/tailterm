@@ -5,8 +5,8 @@ revision 1; owner intake #6516, bounded implementation order #6518,
 database-handler saved confirmation #6519. Related execution Feature:
 `wi_618c8ff87e6b8061`.
 
-Status: requirements recorded; enforcement implementation and deployment are
-not yet verified. This document is an operating policy and implementation
+Review-convergence source work: wi_3d6a4e3d1bf99a08, order #11569, assignment #11656.
+Status: transactional source enforcement under validation; installation and saved acceptance remain separate. This document is an operating policy and implementation
 contract, not evidence that the server already enforces it.
 
 The owner's proposal was “you get 2 code reviews to get it right because we're
@@ -32,8 +32,8 @@ reproducible defects remain release gates.
    There is no third general review or additional approval tour. Focused
    verification references specific blocker IDs and the changed candidate.
 5. Retries, correction commits, new candidate hashes, restarts and reassignment
-   preserve the review count. A new cycle requires an explicit material scope
-   disposition with provenance. Existing qualified releases keep moving;
+   preserve the review count. Scope revisions preserve the same lifetime two-round cap; no new cycle
+   or owner override resets the counter (owner decisions #11650/#11651). Existing qualified releases keep moving;
    historical reviews without adequate evidence remain unknown.
 
 The lead owns delivery and release disposition. The database handler owns native
@@ -61,3 +61,11 @@ Acceptance requires tests proving:
 
 Record implementation, independent verification, installation and acceptance
 separately. Keep the Feature open until the handler saves verified completion.
+
+Typed transitions use `tt send --review-file PATH`, or `review` in an envelope
+file. See [the message contract](message-broker.md#review-convergence).
+Criteria are frozen as contiguous a1..aN at the first linked ASSIGN per scope.
+A revision-checked title/description update permits a new scope snapshot, but
+never another general review beyond two. Follow-ups are native open work items
+with source-message provenance and a parent relationship in the review ledger;
+they remain outside the delivery queue pending deliberate triage.

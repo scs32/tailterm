@@ -328,6 +328,11 @@ func (s *Store) ListTeamQueue(ctx context.Context, task string) (api.TeamQueueLi
 	}
 	activeCount := 0
 	for i, entry := range out.Entries {
+		summary, summaryErr := reviewState(ctx, s.db, out.Entries[i].TaskID, out.Entries[i].ItemID)
+		if summaryErr != nil {
+			return out, summaryErr
+		}
+		out.Entries[i].Reviews = &summary
 		if err := s.loadTeamActivities(ctx, &out.Entries[i]); err != nil {
 			return out, err
 		}
@@ -403,6 +408,11 @@ func (s *Store) TeamQueuesByHost(ctx context.Context, host string) (api.TeamQueu
 		return out, err
 	}
 	for i := range out.Entries {
+		summary, summaryErr := reviewState(ctx, s.db, out.Entries[i].TaskID, out.Entries[i].ItemID)
+		if summaryErr != nil {
+			return out, summaryErr
+		}
+		out.Entries[i].Reviews = &summary
 		if err := s.loadTeamActivities(ctx, &out.Entries[i]); err != nil {
 			return out, err
 		}
@@ -422,6 +432,15 @@ func (s *Store) GetTeamQueueEntry(ctx context.Context, task, id string) (api.Tea
 	e, err := scanTeamQueue(s.db.QueryRowContext(ctx, `SELECT `+teamQueueCols+` FROM team_queue_entries WHERE task_id=? AND id=?`, task, id))
 	if errors.Is(err, sql.ErrNoRows) {
 		return e, api.ErrNotFound
+	}
+	if err == nil {
+		summary, summaryErr := reviewState(ctx, s.db, task, e.ItemID)
+		if summaryErr != nil {
+			return e, summaryErr
+		}
+		if summary.History == "recorded" {
+			e.Reviews = &summary
+		}
 	}
 	return e, err
 }
@@ -1135,6 +1154,9 @@ func (s *Store) TeamQueueAction(ctx context.Context, task string, req api.TeamQu
 				return zero, err
 			}
 			candidate := *req.Acceptance
+			if err = reviewCompletion(ctx, tx, item, candidate.Commit); err != nil {
+				return zero, err
+			}
 			if item.Status != "done" || candidate.ItemRevision != item.Revision || !reflect.DeepEqual(candidate.CompletionReport, item.CompletionReport) || candidate.Repository != e.Repository || candidate.BaseCommit != e.BaseCommit || !filepath.IsAbs(candidate.Worktree) || filepath.Clean(candidate.Worktree) != candidate.Worktree || strings.ContainsRune(candidate.Worktree, '\x00') || !validGitCommit(candidate.Commit) || candidate.Branch == "" || len(candidate.Branch) > 200 || strings.ContainsAny(candidate.Branch, "\x00\n\r") || strings.TrimSpace(candidate.Evidence) == "" || candidate.AcceptedAt != "" {
 				return zero, api.ErrInvalid
 			}

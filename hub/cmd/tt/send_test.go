@@ -204,3 +204,28 @@ func TestSendKeepsSemicolonsInsideOneEvidenceEntry(t *testing.T) {
 		t.Fatalf("rendered text re-parses as %+v", parsed.Evidence)
 	}
 }
+
+func TestReviewConvergenceSendMetadataFile(t *testing.T) {
+	e, c, task, _ := cliWorkItemFixture(t)
+	// Disposition without a native item link is refused at the real endpoint.
+	path := filepath.Join(t.TempDir(), "review.json")
+	if err := os.WriteFile(path, []byte(`{"mode":"disposition","candidate":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","disposition":"accept"}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	_, err := captureCLIOutput(t, func() error {
+		return cmdSend(e, []string{"--kind", "notice", "--subject", "Record exact review fixture disposition", "--text", "Accept", "--review-file", path})
+	})
+	if err == nil || !strings.Contains(err.Error(), "native primary item link") {
+		t.Fatal(err)
+	}
+	messages, err := c.ListMessages(context.Background(), task.ID, 0, "", 100)
+	if err != nil || len(messages) != 0 {
+		t.Fatal("rejected CLI wrote a message", messages, err)
+	}
+	if err = os.WriteFile(path, []byte(`{"mode":"invalid"}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err = cmdSend(e, []string{"--kind", "notice", "--subject", "Invalid review fixture transition", "--text", "Invalid", "--review-file", path}); err == nil || !strings.Contains(err.Error(), "review.mode") {
+		t.Fatal(err)
+	}
+}

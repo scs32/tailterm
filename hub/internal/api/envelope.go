@@ -14,6 +14,7 @@ import (
 // Envelope is a typed board message (docs/message-broker.md). Phase 1 stores
 // and validates it; nothing yet derives obligations from it.
 type Envelope struct {
+	Review      *ReviewMetadata     `json:"review,omitempty"`
 	Kind        string              `json:"kind"`
 	To          string              `json:"to,omitempty"`
 	Subject     string              `json:"subject"`
@@ -167,6 +168,15 @@ var (
 // in a stable order; nil means the envelope is valid.
 func ValidateEnvelope(e Envelope) []Problem {
 	var out []Problem
+	if e.Review != nil {
+		r := e.Review
+		if r.Mode != "general" && r.Mode != "focused" && r.Mode != "disposition" {
+			out = append(out, Problem{Field: "review.mode", Reason: "must be general, focused or disposition"})
+		}
+		if r.Mode == "general" && e.Kind != "review" && e.Kind != "result" || r.Mode == "focused" && e.Kind != "request" && e.Kind != "result" || r.Mode == "disposition" && e.Kind != "notice" {
+			out = append(out, Problem{Field: "review.mode", Reason: "does not match message kind"})
+		}
+	}
 	add := func(field, format string, args ...any) {
 		out = append(out, Problem{Field: field, Reason: fmt.Sprintf(format, args...)})
 	}
@@ -401,6 +411,10 @@ func RenderText(e Envelope) string {
 	line("Summary", body.Summary)
 	line("Text", body.Text)
 	line("Acceptance", joinPairs(body.Acceptance, ": "))
+	if e.Review != nil {
+		raw, _ := json.Marshal(e.Review)
+		line("Review metadata", string(raw))
+	}
 	line("Status", joinPairs(body.Status, " "))
 	var ev []string
 	for _, k := range sortedKeys(e.Evidence) {

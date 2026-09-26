@@ -5,6 +5,9 @@ import "github.com/scs32/tailterm/hub/internal/api"
 
 // Additive migrations preserve existing task history and encrypted tailnet state.
 func migrate(db *sql.DB) error {
+	if _, err := db.Exec(reviewConvergenceSchema); err != nil {
+		return err
+	}
 	if err := migrateTeamQueue(db); err != nil {
 		return err
 	}
