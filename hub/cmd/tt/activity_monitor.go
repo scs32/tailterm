@@ -273,8 +273,19 @@ func relayActivityTick(ctx context.Context, b runtimeBinding, client *api.Client
 		}
 		// Runtime health does not depend on transcript readability. Preserve the
 		// two-probe rule using a health-only cursor: no stale timestamps or totals
-		// escape while bootstrap, a partial tail, or a read failure blocks parsing.
+		// escape during bootstrap; established verified values remain independent
+		// of partially accumulated parsing during subsequent health failures.
 		health := activityCursor{Unknown: true, MissingSince: c.MissingSince}
+		if v := c.Verified; v != nil {
+			// On an open/read failure, still prove the file identity before retaining
+			// its old verified fields. A replacement/truncation must bootstrap anew.
+			info, err := os.Stat(transcript)
+			if err == nil && v.Path == transcript && v.FileID == fileIdentity(info) && info.Size() >= c.Offset && info.Size() >= v.Offset {
+				health.LastEventAt, health.Tokens = v.LastEventAt, v.Tokens
+			} else {
+				c.Verified = nil
+			}
+		}
 		state = activityState(&health, a, 0, tmuxAlive, processAlive, probeErr, now, activityDefaults())
 		c.MissingSince = health.MissingSince
 		if transcriptReadErr != nil && state.Reason == "unrecognized transcript format" {
@@ -295,6 +306,9 @@ func relayActivityTick(ctx context.Context, b runtimeBinding, client *api.Client
 				return listErr
 			}
 			open = len(obligations)
+		}
+		if transcript != "" && c.Ready && c.SeenTurn && !c.Unknown && c.TokensVerified {
+			c.Verified = &verifiedActivitySnapshot{Path: c.Path, FileID: c.FileID, Offset: c.Offset, LastEventAt: c.LastEventAt, Tokens: c.Tokens}
 		}
 		state = activityState(&c, a, open, tmuxAlive, processAlive, probeErr, now, activityDefaults())
 	}

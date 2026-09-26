@@ -44,6 +44,17 @@ type completedActivityCall struct {
 	Worktree    string    `json:"worktree"`
 	PlannedWait bool      `json:"plannedWait,omitempty"`
 }
+
+// A separately frozen snapshot prevents a later partial backlog from replacing
+// the last values verified at a complete observed EOF.
+type verifiedActivitySnapshot struct {
+	Path        string          `json:"path"`
+	FileID      uint64          `json:"fileId"`
+	Offset      int64           `json:"offset"`
+	LastEventAt time.Time       `json:"lastEventAt"`
+	Tokens      api.TokenTotals `json:"tokens"`
+}
+
 type activityCursor struct {
 	Run               string                         `json:"run"`
 	Thread            string                         `json:"thread"`
@@ -52,6 +63,8 @@ type activityCursor struct {
 	FileID            uint64                         `json:"fileId"`
 	Offset            int64                          `json:"offset"`
 	Ready             bool                           `json:"ready,omitempty"`
+	Verified          *verifiedActivitySnapshot      `json:"verified,omitempty"`
+	TokensVerified    bool                           `json:"tokensVerified,omitempty"`
 	Partial           string                         `json:"partial,omitempty"`
 	Skipping          bool                           `json:"skipping,omitempty"`
 	LastEventAt       time.Time                      `json:"lastEventAt"`
@@ -156,6 +169,11 @@ func readActivityAppend(path string, c *activityCursor, parse func([]byte, *acti
 	id := fileIdentity(info)
 	if c.Path != path || c.FileID != id || info.Size() < c.Offset {
 		c.Path, c.FileID, c.Offset, c.Partial, c.Skipping = path, id, 0, "", false
+		c.Verified = nil
+		// Preserve existing cumulative parser semantics, but do not certify retained
+		// totals as belonging to a replacement file. Codex's explicit cumulative
+		// usage can establish provenance again; retained Claude usage cannot.
+		c.TokensVerified = c.Tokens == (api.TokenTotals{}) && len(c.ClaudeUsage) == 0
 		c.Pending = map[string]pendingActivityCall{}
 		c.Completed = nil
 		c.SeenTurn, c.TurnComplete = false, false
@@ -322,6 +340,7 @@ func parseCodexActivity(line []byte, c *activityCursor) error {
 			c.SeenTurn, c.TurnComplete = true, true
 		case "token_count":
 			u := p.Info.Total
+			c.TokensVerified = true
 			c.Tokens = api.TokenTotals{Input: activityInt(u, "input_tokens"), Cached: activityInt(u, "cached_input_tokens"), CacheWrite: activityInt(u, "cache_write_tokens"), Output: activityInt(u, "output_tokens"), Reasoning: activityInt(u, "reasoning_output_tokens"), Total: activityInt(u, "total_tokens")}
 			if c.Tokens.Total == 0 {
 				c.Tokens.Total = c.Tokens.Input + c.Tokens.Output

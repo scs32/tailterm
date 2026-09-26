@@ -755,3 +755,146 @@ func TestActivityIncompleteOrUnreadableTranscriptReportsHealth(t *testing.T) {
 		})
 	}
 }
+
+func TestActivityHealthRetainsOnlyVerifiedSnapshot(t *testing.T) {
+	for _, mode := range []string{"partial", "read-error", "appended-backlog", "rotation", "truncation", "new-path", "rotation-complete-without-usage"} {
+		t.Run(mode, func(t *testing.T) {
+			home := t.TempDir()
+			t.Setenv("HOME", home)
+			t.Setenv("CODEX_HOME", home)
+			t.Setenv("TAILTERM_RELAY_STATE", filepath.Join(home, "state"))
+			thread := "12345678-1234-1234-1234-123456789abc"
+			dir := filepath.Join(home, ".codex", "sessions", "2026", "09", "25")
+			if err := os.MkdirAll(dir, 0700); err != nil {
+				t.Fatal(err)
+			}
+			path := filepath.Join(dir, "rollout-test-"+thread+".jsonl")
+			initial := `{"type":"task_started","timestamp":"2026-09-25T20:00:00Z"}` + "\n" + `{"type":"event_msg","timestamp":"2026-09-25T20:00:10Z","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":100,"output_tokens":200,"total_tokens":300}}}}` + "\n"
+			if err := os.WriteFile(path, []byte(initial), 0600); err != nil {
+				t.Fatal(err)
+			}
+			var reports []api.ActivityReport
+			hub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Method == "GET" {
+					json.NewEncoder(w).Encode(api.Agent{RunID: "run_0123456789abcdef", Status: api.AgentRunning})
+					return
+				}
+				var report api.ActivityReport
+				if err := json.NewDecoder(r.Body).Decode(&report); err != nil {
+					t.Error(err)
+				}
+				reports = append(reports, report)
+				json.NewEncoder(w).Encode(report.Activity)
+			}))
+			defer hub.Close()
+			client, _ := api.NewClient(hub.URL, time.Second)
+			b := runtimeBinding{Hub: hub.URL, Task: "tsk_0123456789abcdef", Agent: "agt_0123456789abcdef", Run: "run_0123456789abcdef", Thread: thread, Runtime: "codex"}
+			now := time.Date(2026, 9, 25, 20, 1, 0, 0, time.UTC)
+			if err := os.Chtimes(path, now, now); err != nil {
+				t.Fatal(err)
+			}
+			alive := true
+			probeError := false
+			probe := func(runtimeBinding, api.Agent) (bool, bool, error) {
+				if probeError {
+					return true, true, fmt.Errorf("synthetic probe failure")
+				}
+				return true, alive, nil
+			}
+			tick := func(pass int) {
+				t.Helper()
+				if err := relayActivityTick(context.Background(), b, client, now.Add(time.Duration(pass)*16*time.Second), probe); err != nil {
+					t.Fatal(err)
+				}
+			}
+			tick(0)
+			totals := api.TokenTotals{Input: 100, Output: 200, Total: 300}
+			stamp := now.Add(-50 * time.Second)
+			if len(reports) != 1 || reports[0].Activity.Tokens != totals || !reports[0].Activity.LastEventAt.Equal(stamp) {
+				t.Fatalf("establish accurate report: %+v", reports)
+			}
+			if mode == "rotation-complete-without-usage" {
+				if err := os.Rename(path, path+".old"); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(path, []byte(`{"type":"task_started","timestamp":"2026-09-25T20:00:20Z"}`+"\n"), 0600); err != nil {
+					t.Fatal(err)
+				}
+				tick(1) // Complete EOF alone must not certify old retained usage as new.
+				f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0600)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if _, err = f.WriteString(`{"type":"event_msg"`); err != nil {
+					t.Fatal(err)
+				}
+				f.Close()
+			} else if mode == "read-error" {
+				if err := os.Chmod(path, 0000); err != nil {
+					t.Fatal(err)
+				}
+				// Ensure this exercises a real open failure instead of silently passing as root.
+				if f, err := os.Open(path); err == nil {
+					f.Close()
+					t.Skip("host privilege bypasses mode0000; deterministic fresh-read-error case covers reporting")
+				}
+				defer os.Chmod(path, 0600)
+			} else {
+				tail := `{"type":"event_msg","timestamp":"2026-09-25T20:00:30Z","payload":{"type":"tok`
+				if mode != "partial" {
+					tail = `{"type":"event_msg","timestamp":"2026-09-25T20:00:20Z","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":999,"output_tokens":999,"total_tokens":1998}}}}` + "\n" + strings.Repeat("x", 3*maxActivityPass)
+				}
+				if mode == "rotation" {
+					if err := os.Rename(path, path+".old"); err != nil {
+						t.Fatal(err)
+					}
+					if err := os.WriteFile(path, []byte(tail), 0600); err != nil {
+						t.Fatal(err)
+					}
+				} else if mode == "truncation" {
+					if err := os.WriteFile(path, []byte(tail[:40]), 0600); err != nil {
+						t.Fatal(err)
+					}
+				} else if mode == "new-path" {
+					path = filepath.Join(dir, "rollout-new-"+thread+".jsonl")
+					if err := os.WriteFile(path, []byte(tail), 0600); err != nil {
+						t.Fatal(err)
+					}
+					if err := os.Chtimes(path, now.Add(time.Hour), now.Add(time.Hour)); err != nil {
+						t.Fatal(err)
+					}
+				} else {
+					f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0600)
+					if err != nil {
+						t.Fatal(err)
+					}
+					if _, err = f.WriteString(tail); err != nil {
+						t.Fatal(err)
+					}
+					f.Close()
+				}
+			}
+			// An uncertain probe yields unknown first. Then a confirmed dead process
+			// yields crashed only after two exact probes. Every tick reloads saved state.
+			probeError = true
+			tick(4)
+			probeError = false
+			alive = false
+			tick(5)
+			tick(6)
+			if len(reports) != 3 || reports[1].Activity.State != "unknown" || reports[2].Activity.State != "crashed" {
+				t.Fatalf("health transitions: %+v", reports)
+			}
+			retain := mode == "partial" || mode == "read-error" || mode == "appended-backlog"
+			for _, r := range reports[1:] {
+				if retain {
+					if r.Activity.Tokens != totals || !r.Activity.LastEventAt.Equal(stamp) {
+						t.Fatalf("verified snapshot lost/replaced by partial data: %+v", r)
+					}
+				} else if r.Activity.Tokens != (api.TokenTotals{}) || !r.Activity.LastEventAt.IsZero() {
+					t.Fatalf("reset retained old/unverified snapshot: %+v", r)
+				}
+			}
+		})
+	}
+}
