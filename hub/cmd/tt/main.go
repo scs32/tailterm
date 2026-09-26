@@ -36,7 +36,7 @@ Commands
   status                       identity, hub reachability, own agent, unread count
   projects                     list projects on the hub (tasks is an alias)
   project-pause <get|pause|handoff|resume>  explicit project team lifecycle
-  verification <plan|receipt|history>  handler-owned native verification records
+  verification <plan|receipt|history|enrollment>  handler-owned native verification records
   work-items <command>         list/get/create/update/dispatch/history/evidence for bugs and features
   queue <command>              list/get/history/changes/action/receipt for deliberate Queue work
   agents [--json]              list agents on this task

@@ -96,6 +96,13 @@ func validateVerificationPlan(ctx context.Context, tx *sql.Tx, item api.WorkItem
 	if p.ItemID != item.ID || p.ItemTaskID != item.TaskID || p.Version != 1 || !validRequestID(p.OperationKey) || p.ItemRevision != item.Revision || p.ScopeRevision != item.ScopeRevision || !validGitCommit(p.Commit) || !validGitCommit(p.BaseCommit) || strings.TrimSpace(p.Repository) == "" || !validContextDigest(p.MatrixDigest) || len(p.Checks) == 0 || len(p.Owned) == 0 || verificationDigest(p.Checks) != p.ChecksDigest {
 		return verificationConflict("invalid current plan or check digest")
 	}
+	var approver, node, text string
+	if p.ApprovedMatrixDigest != p.MatrixDigest || p.MatrixApprovalMessageSeq <= 0 {
+		return verificationConflict("independently owner-approved matrix required")
+	}
+	if err := tx.QueryRowContext(ctx, `SELECT from_agent,from_node,text FROM messages WHERE task_id=? AND seq=?`, item.TaskID, p.MatrixApprovalMessageSeq).Scan(&approver, &node, &text); err != nil || approver != "" || node == "system" || strings.TrimSpace(text) != "verification-matrix-approval:"+p.MatrixDigest {
+		return verificationConflict("owner matrix approval source does not bind exact digest")
+	}
 	if err := requireConfirmedTeamOrder(ctx, tx, item.TaskID, item.ID, item.Revision, p.OrderMessageSeq); err != nil {
 		return err
 	}
@@ -268,6 +275,13 @@ func (s *Store) SaveVerification(ctx context.Context, task, itemID string, req a
 	return record, nil
 }
 func verificationReady(ctx context.Context, tx *sql.Tx, item api.WorkItem, candidate string) error {
+	required, err := verificationRequired(ctx, tx, item.TaskID, item.ID)
+	if err != nil {
+		return err
+	}
+	if !required {
+		return nil
+	}
 	records, err := verificationRecords(ctx, tx, item.TaskID, item.ID)
 	if err != nil {
 		return err
@@ -290,4 +304,62 @@ func verificationReady(ctx context.Context, tx *sql.Tx, item api.WorkItem, candi
 		}
 	}
 	return validateVerificationReceipt(*p, *r)
+}
+
+const verificationEnrollmentSchema = `CREATE TABLE IF NOT EXISTS verification_enrollments (
+ task_id TEXT NOT NULL,item_id TEXT NOT NULL,agent_id TEXT NOT NULL,run_id TEXT NOT NULL,
+ required INTEGER NOT NULL CHECK(required IN (0,1)),provenance TEXT NOT NULL,created_at TEXT NOT NULL,
+ PRIMARY KEY(task_id,item_id,agent_id,run_id),FOREIGN KEY(task_id,item_id) REFERENCES work_items(task_id,id));
+CREATE TRIGGER IF NOT EXISTS verification_enrollment_no_update BEFORE UPDATE ON verification_enrollments BEGIN SELECT RAISE(ABORT,'verification enrollment is immutable'); END;
+CREATE TRIGGER IF NOT EXISTS verification_enrollment_no_delete BEFORE DELETE ON verification_enrollments BEGIN SELECT RAISE(ABORT,'verification enrollment is immutable'); END;`
+
+func migrateVerificationEnrollment(db *sql.DB) error {
+	var exists int
+	if err := db.QueryRow(`SELECT count(*) FROM sqlite_master WHERE type='table' AND name='verification_enrollments'`).Scan(&exists); err != nil {
+		return err
+	}
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err = tx.Exec(verificationEnrollmentSchema); err != nil {
+		return err
+	}
+	if exists == 0 {
+		if _, err = tx.Exec(`INSERT OR IGNORE INTO verification_enrollments SELECT b.item_task_id,b.item_id,b.agent_id,b.run_id,0,'legacy-pre-rollout',b.created_at FROM agent_work_item_bindings b JOIN work_items w ON w.task_id=b.item_task_id AND w.id=b.item_id`); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+func verificationRequired(ctx context.Context, q queryRower, task, item string) (bool, error) {
+	var count int
+	err := q.QueryRowContext(ctx, `SELECT count(*) FROM verification_enrollments WHERE task_id=? AND item_id=? AND required=1`, task, item).Scan(&count)
+	return count > 0, err
+}
+func (s *Store) VerificationEnrollment(ctx context.Context, task, item, agent, run string) ([]api.VerificationEnrollment, error) {
+	if err := requireScopeHandler(s.db, ctx, task, agent, run); err != nil {
+		return nil, err
+	}
+	rows, err := s.db.QueryContext(ctx, `SELECT agent_id,run_id,required,provenance,created_at FROM verification_enrollments WHERE task_id=? AND item_id=? ORDER BY created_at,agent_id,run_id`, task, item)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []api.VerificationEnrollment{}
+	for rows.Next() {
+		var entry api.VerificationEnrollment
+		if err = rows.Scan(&entry.AgentID, &entry.RunID, &entry.Required, &entry.Provenance, &entry.CreatedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, entry)
+	}
+	if err = rows.Err(); err != nil {
+		return nil, err
+	}
+	if len(out) == 0 {
+		out = append(out, api.VerificationEnrollment{Provenance: "legacy-no-team-admission"})
+	}
+	return out, nil
 }

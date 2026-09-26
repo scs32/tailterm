@@ -1159,7 +1159,11 @@ func (s *Store) TeamQueueAction(ctx context.Context, task string, req api.TeamQu
 				return zero, loadErr
 			}
 			verificationPlan, _ := currentVerification(records)
-			if verificationPlan == nil || verificationPlan.Repository != candidate.Repository || verificationPlan.BaseCommit != candidate.BaseCommit {
+			required, enrollmentErr := verificationRequired(ctx, tx, task, item.ID)
+			if enrollmentErr != nil {
+				return zero, enrollmentErr
+			}
+			if required && (verificationPlan == nil || verificationPlan.Repository != candidate.Repository || verificationPlan.BaseCommit != candidate.BaseCommit) {
 				return zero, verificationConflict("acceptance repository/base mismatch")
 			}
 			if err = reviewCompletion(ctx, tx, item, candidate.Commit); err != nil {

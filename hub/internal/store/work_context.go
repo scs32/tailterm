@@ -403,6 +403,11 @@ VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)`, binding.AgentID, binding.RunID, binding.Item
 	if err != nil {
 		return nil, err
 	}
+	// Immutable, mandatory enrollment is recorded in the same admission transaction.
+	// No request field can select legacy behavior or opt an admitted team out.
+	if _, err = tx.ExecContext(ctx, `INSERT INTO verification_enrollments VALUES(?,?,?,?,1,'mandatory-new-admission',?)`, binding.ItemTaskID, binding.ItemID, binding.AgentID, binding.RunID, ts(binding.CreatedAt)); err != nil {
+		return nil, err
+	}
 	_, err = tx.ExecContext(ctx, `INSERT INTO read_cursors(task_id,agent_id,up_to) VALUES(?,?,?)
 ON CONFLICT(task_id,agent_id) DO UPDATE SET up_to=MAX(up_to,excluded.up_to)`, agent.TaskID, agent.ID, through)
 	return binding, err

@@ -1,6 +1,7 @@
 package store
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -34,6 +35,12 @@ func verificationFixture(t *testing.T) (*convergenceFixture, api.Agent, api.Veri
 	}
 	checks := []api.VerificationCheck{{ID: "fixture-check", Argv: []string{"node", "fixture.js"}, Cwd: ".", Environment: map[string]string{}}}
 	p := api.VerificationPlan{ItemID: f.item.ID, ItemTaskID: f.task.ID, AssignmentOwnershipDigest: verificationDigest([]string{"fixture"}), Version: 1, OperationKey: "fixture-verification", Repository: "fixture", BaseCommit: candidateB, Commit: candidateA, ItemRevision: 1, ScopeRevision: 1, OrderMessageSeq: order, AssignmentSeq: order, BuilderAgentID: f.reviewer.ID, BuilderRunID: f.reviewer.RunID, VerifierAgentID: v.ID, VerifierRunID: v.RunID, MatrixDigest: strings.Repeat("a", 64), ChecksDigest: verificationDigest(checks), Owned: []string{"fixture"}, Changed: []string{}, Checks: checks}
+	approval, err := f.s.PostMessage(f.ctx, f.task.ID, api.PostMessageRequest{Text: "verification-matrix-approval:" + p.MatrixDigest}, f.by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p.ApprovedMatrixDigest = p.MatrixDigest
+	p.MatrixApprovalMessageSeq = approval.Seq
 	return f, h, p
 }
 func passingVerification(p api.VerificationPlan) api.VerificationReceipt {
@@ -186,6 +193,12 @@ func TestVerificationCompletionPathsAndInvalidation(t *testing.T) {
 	changed.Commit = candidateB
 	changed.MatrixDigest = strings.Repeat("c", 64)
 	changed.ItemRevision = f.item.Revision
+	approval, err := f.s.PostMessage(f.ctx, f.task.ID, api.PostMessageRequest{Text: "verification-matrix-approval:" + changed.MatrixDigest}, f.by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	changed.ApprovedMatrixDigest = changed.MatrixDigest
+	changed.MatrixApprovalMessageSeq = approval.Seq
 	// Scope confirmation is revision-pinned for the new plan.
 	if _, err = f.s.ConfirmWorkOrderScope(f.ctx, f.task.ID, f.item.ID, api.ConfirmWorkOrderScopeRequest{RequestID: "new-intake", AgentID: h.ID, RunID: h.RunID, ExpectedRevision: f.item.Revision, ScopeRevision: 1, OrderMessageSeq: p.OrderMessageSeq, Complete: true}); err != nil {
 		t.Fatal(err)
@@ -204,51 +217,89 @@ func TestVerificationCompletionPathsAndInvalidation(t *testing.T) {
 	}
 }
 func TestVerificationMigrationRehearsal(t *testing.T) {
-	f, h, p := verificationFixture(t)
-	saveFixtureVerification(t, f, h, p, 0)
-	f.s.Close()
 	root, err := filepath.Abs("../../..")
 	if err != nil {
 		t.Fatal(err)
 	}
+	base := os.Getenv("VERIFICATION_BASE_COMMIT")
+	if base == "" {
+		// Ordinary unit invocation rehearses against its exact checked-out commit;
+		// matrix invocation always supplies the approved plan's actual base SHA.
+		cmd := exec.Command("git", "rev-parse", "HEAD")
+		cmd.Dir = root
+		b, e := cmd.Output()
+		if e != nil {
+			t.Fatalf("exact rehearsal base required: %v", e)
+		}
+		base = strings.TrimSpace(string(b))
+	}
+	if !validGitCommit(base) {
+		t.Fatal("invalid rehearsal base")
+	}
 	temp := t.TempDir()
-	archive := exec.Command("git", "archive", "7ab5100eb6c117fd08b4bb971b093eb2d429eefd", "hub")
+	path := filepath.Join(temp, "fixture.sqlite")
+	archive := exec.Command("git", "archive", base, "hub")
 	archive.Dir = root
 	b, err := archive.Output()
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("plan base unavailable %s: %v", base, err)
 	}
 	tar := exec.Command("tar", "-x", "-C", temp)
-	tar.Stdin = strings.NewReader(string(b))
-	if out, err := tar.CombinedOutput(); err != nil {
-		t.Fatalf("extract %s: %v", out, err)
+	tar.Stdin = bytes.NewReader(b)
+	if out, e := tar.CombinedOutput(); e != nil {
+		t.Fatalf("extract %s: %v", out, e)
 	}
 	helper := filepath.Join(temp, "hub", "fixture-reopen.go")
-	if err = os.WriteFile(helper, []byte(`package main
-import("os";"github.com/scs32/tailterm/hub/internal/store")
-func main(){s,e:=store.Open(os.Args[1]);if e!=nil{panic(e)};if e=s.Close();e!=nil{panic(e)}}`), 0600); err != nil {
+	program := `package main
+import("os";"context";"database/sql";"time";"github.com/scs32/tailterm/hub/internal/store";"github.com/scs32/tailterm/hub/internal/api")
+func main(){s,e:=store.Open(os.Args[1]);if e!=nil{panic(e)}
+if os.Args[2]=="seed" {ctx:=context.Background();by:=api.Caller{Node:"fixture",User:"owner"};task,e:=s.CreateTask(ctx,api.CreateTaskRequest{Name:"base-created migration fixture"},by);if e!=nil{panic(e)};item,e:=s.CreateWorkItem(ctx,task.ID,api.CreateWorkItemRequest{Kind:"bug",Title:"base-created item",RequestID:"base-seed"},by);if e!=nil{panic(e)};a,e:=s.AddAgent(ctx,task.ID,api.AddAgentRequest{Name:"legacy",Host:"fixture",Session:"fixture"},by);if e!=nil{panic(e)};m,e:=s.PostMessage(ctx,task.ID,api.PostMessageRequest{Text:"base fixture order"},by);if e!=nil{panic(e)};q,e:=sql.Open("sqlite",os.Args[1]);if e!=nil{panic(e)};_,e=q.Exec("INSERT INTO agent_work_item_bindings(agent_id,run_id,item_task_id,item_id,item_revision,work_order_task_id,work_order_message_seq,context_through_message_seq,context_digest,context_json,created_at) VALUES(?,?,?,?,1,?,?,0,'fixture','{}',?)",a.ID,a.RunID,task.ID,item.ID,task.ID,m.Seq,time.Now().UTC().Format(time.RFC3339Nano));if e!=nil{panic(e)};q.Close()};if e=s.Close();e!=nil{panic(e)}}`
+	if err = os.WriteFile(helper, []byte(program), 0600); err != nil {
 		t.Fatal(err)
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
-	defer cancel()
-	cmd := exec.CommandContext(ctx, "go", "run", helper, f.path)
-	cmd.Dir = filepath.Join(temp, "hub")
-	if out, err := cmd.CombinedOutput(); err != nil {
-		t.Fatalf("previous binary %s: %v", out, err)
+	runBase := func(mode string) {
+		t.Helper()
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+		defer cancel()
+		cmd := exec.CommandContext(ctx, "go", "run", helper, path, mode)
+		cmd.Dir = filepath.Join(temp, "hub")
+		if out, e := cmd.CombinedOutput(); e != nil {
+			t.Fatalf("base %s %s: %v", mode, out, e)
+		}
 	}
-	f.s, err = Open(f.path)
+	t.Logf("plan base %s: create fixture database with base binary", base)
+	runBase("seed")
+	t.Log("open base-created fixture with candidate")
+	current, err := Open(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	history, err := f.s.VerificationHistory(f.ctx, f.task.ID, f.item.ID, h.ID, h.RunID)
-	if err != nil || len(history) != 2 {
-		t.Fatal(history, err)
+	var task, item string
+	if err = current.db.QueryRow(`SELECT task_id,id FROM work_items WHERE title='base-created item'`).Scan(&task, &item); err != nil {
+		t.Fatal("base-created item missing", err)
+	}
+	// Add candidate-only fixture evidence and prove the previous binary preserves it.
+	if _, err = current.db.Exec(`INSERT INTO verification_records VALUES(?,?,1,'fixture','migration-fixture','fixture','{"fixture":"candidate"}')`, task, item); err != nil {
+		t.Fatal(err)
+	}
+	current.Close()
+	t.Log("reopen migrated fixture with base binary")
+	runBase("reopen")
+	t.Log("reopen fixture with candidate and check evidence/integrity/foreign keys")
+	current, err = Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer current.Close()
+	var count int
+	if err = current.db.QueryRow(`SELECT count(*) FROM verification_records WHERE task_id=? AND item_id=?`, task, item).Scan(&count); err != nil || count != 1 {
+		t.Fatal("candidate evidence lost", count, err)
 	}
 	var integrity string
-	if err = f.s.db.QueryRow(`PRAGMA integrity_check`).Scan(&integrity); err != nil || integrity != "ok" {
+	if err = current.db.QueryRow(`PRAGMA integrity_check`).Scan(&integrity); err != nil || integrity != "ok" {
 		t.Fatal(integrity, err)
 	}
-	rows, err := f.s.db.Query(`PRAGMA foreign_key_check`)
+	rows, err := current.db.Query(`PRAGMA foreign_key_check`)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -357,6 +408,10 @@ func TestVerificationDistinctReviewerCannotProduceReceipt(t *testing.T) {
 func TestVerificationConcurrentNewPlansAndRollback(t *testing.T) {
 	f, h, p := verificationFixture(t)
 	saveFixtureVerification(t, f, h, p, 0)
+	approval, err := f.s.PostMessage(f.ctx, f.task.ID, api.PostMessageRequest{Text: "verification-matrix-approval:" + strings.Repeat("c", 64)}, f.by)
+	if err != nil {
+		t.Fatal(err)
+	}
 	var wg sync.WaitGroup
 	results := make(chan error, 2)
 	for _, key := range []string{"matrix-a", "matrix-b"} {
@@ -366,6 +421,8 @@ func TestVerificationConcurrentNewPlansAndRollback(t *testing.T) {
 			newPlan := p
 			newPlan.OperationKey = key
 			newPlan.MatrixDigest = strings.Repeat("c", 64)
+			newPlan.ApprovedMatrixDigest = newPlan.MatrixDigest
+			newPlan.MatrixApprovalMessageSeq = approval.Seq
 			_, err := f.s.SaveVerification(f.ctx, f.task.ID, f.item.ID, api.VerificationRequest{RequestID: key, AgentID: h.ID, RunID: h.RunID, ExpectedGeneration: 2, Plan: &newPlan})
 			results <- err
 		}(key)
@@ -394,4 +451,45 @@ func TestVerificationConcurrentNewPlansAndRollback(t *testing.T) {
 		t.Fatal("matrix change carried receipt", err)
 	}
 	tx.Rollback()
+}
+
+func TestVerificationRejectsUnapprovedCandidateMatrix(t *testing.T) {
+	f, h, p := verificationFixture(t)
+	p.MatrixDigest = strings.Repeat("c", 64)
+	p.ApprovedMatrixDigest = p.MatrixDigest
+	if _, err := f.s.SaveVerification(f.ctx, f.task.ID, f.item.ID, api.VerificationRequest{RequestID: "weakened", AgentID: h.ID, RunID: h.RunID, Plan: &p}); !errors.Is(err, api.ErrConflict) {
+		t.Fatal("candidate self-approved matrix", err)
+	}
+	source, err := f.s.PostMessage(f.ctx, f.task.ID, api.PostMessageRequest{AgentID: p.VerifierAgentID, RunID: p.VerifierRunID, Text: "verification-matrix-approval:" + p.MatrixDigest}, f.by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p.MatrixApprovalMessageSeq = source.Seq
+	if _, err = f.s.SaveVerification(f.ctx, f.task.ID, f.item.ID, api.VerificationRequest{RequestID: "agent-approved", AgentID: h.ID, RunID: h.RunID, Plan: &p}); !errors.Is(err, api.ErrConflict) {
+		t.Fatal("agent masqueraded as owner approval", err)
+	}
+	rejection, err := f.s.PostMessage(f.ctx, f.task.ID, api.PostMessageRequest{Text: "Rejected: verification-matrix-approval:" + p.MatrixDigest}, f.by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p.MatrixApprovalMessageSeq = rejection.Seq
+	if _, err = f.s.SaveVerification(f.ctx, f.task.ID, f.item.ID, api.VerificationRequest{RequestID: "quoted-owner-token", AgentID: h.ID, RunID: h.RunID, Plan: &p}); !errors.Is(err, api.ErrConflict) {
+		t.Fatal("owner quote mistaken for approval", err)
+	}
+
+}
+func TestVerificationLegacyCompletionPreserved(t *testing.T) {
+	f := newConvergenceFixture(t)
+	request := f.review(t, candidateA)
+	if _, err := f.post(f.resultEnv(candidateA, map[string]string{"a1": "pass", "a2": "pass"}, api.ReviewMetadata{Mode: "general"}), "", request.Seq, f.reviewer); err != nil {
+		t.Fatal(err)
+	}
+	accept := api.Envelope{Kind: "notice", Subject: "Accept legacy fixture candidate", Body: api.EnvelopeBody{Text: "legacy review"}, Review: &api.ReviewMetadata{Mode: "disposition", Disposition: "accept", Candidate: candidateA}}
+	if _, err := f.post(accept, "", 0, api.Agent{}); err != nil {
+		t.Fatal("legacy accept", err)
+	}
+	done := "done"
+	if _, err := f.s.UpdateWorkItem(f.ctx, f.task.ID, f.item.ID, api.UpdateWorkItemRequest{Revision: 1, Status: &done}, f.by); err != nil {
+		t.Fatal("legacy completion", err)
+	}
 }

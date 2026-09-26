@@ -171,3 +171,47 @@ VALUES('dly_0000000000000001','tsk_0000000000000001',1,'assignment','agt_0000000
 		t.Fatalf("mandatory-action migration missing incident table or action-scoped current index: table=%d indexColumns=%d", incidentsTable, actionIndex)
 	}
 }
+
+func TestVerificationEnrollmentRolloutPreservesLegacyAndCannotOptNewAdmissionsOut(t *testing.T) {
+	f, h, p := verificationFixture(t)
+	// Isolated fixture represents the pre-rollout schema with an existing binding.
+	if _, err := f.s.db.Exec(`DROP TABLE verification_enrollments`); err != nil {
+		t.Fatal(err)
+	}
+	if err := migrateVerificationEnrollment(f.s.db); err != nil {
+		t.Fatal(err)
+	}
+	entries, err := f.s.VerificationEnrollment(f.ctx, f.task.ID, f.item.ID, h.ID, h.RunID)
+	if err != nil || len(entries) != 1 || entries[0].Required || entries[0].Provenance != "legacy-pre-rollout" {
+		t.Fatal(entries, err)
+	}
+	if err = migrateVerificationEnrollment(f.s.db); err != nil {
+		t.Fatal(err)
+	}
+	bundle := preparedContextFromAcceptedHistory(t, f.s, f.item, api.MessageReference{TaskID: f.task.ID, Seq: p.OrderMessageSeq})
+	a, err := f.s.AddAgent(f.ctx, f.task.ID, api.AddAgentRequest{Name: "new-admission", Host: "fixture", Session: "new-admission", WorkItem: &api.AgentWorkItemRequest{ItemTaskID: f.task.ID, ItemID: f.item.ID, ItemRevision: 1, WorkOrderMessage: api.MessageReference{TaskID: f.task.ID, Seq: p.OrderMessageSeq}, ContextBundle: bundle, TeamRole: api.TeamRoleMember}}, f.by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	required, err := verificationRequired(f.ctx, f.s.db, f.task.ID, f.item.ID)
+	if err != nil || !required {
+		t.Fatal("new team escaped enrollment", required, err)
+	}
+	if _, err = f.s.db.Exec(`UPDATE verification_enrollments SET required=0 WHERE agent_id=?`, a.ID); err == nil {
+		t.Fatal("opt-out mutation allowed")
+	}
+	if _, err = f.s.db.Exec(`DELETE FROM verification_enrollments WHERE agent_id=?`, a.ID); err == nil {
+		t.Fatal("enrollment deletion allowed")
+	}
+	if err = migrateVerificationEnrollment(f.s.db); err != nil {
+		t.Fatal(err)
+	}
+	required, err = verificationRequired(f.ctx, f.s.db, f.task.ID, f.item.ID)
+	if err != nil || !required {
+		t.Fatal("restart downgraded enrollment", required, err)
+	}
+	entries, err = f.s.VerificationEnrollment(f.ctx, f.task.ID, f.item.ID, h.ID, h.RunID)
+	if err != nil || len(entries) != 2 {
+		t.Fatal(entries, err)
+	}
+}

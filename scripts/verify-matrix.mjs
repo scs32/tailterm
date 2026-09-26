@@ -5,6 +5,7 @@ import {
   mkdirSync,
   existsSync,
   readdirSync,
+  statSync,
 } from "node:fs";
 import { resolve, relative, join, isAbsolute } from "node:path";
 import { tmpdir } from "node:os";
@@ -45,7 +46,7 @@ export function diffPaths(cwd, base, commit) {
   }
   return paths;
 }
-export function selectChecks(matrix, owned, changed) {
+export function selectChecks(matrix, owned, changed, candidatePackages) {
   if (matrix.version !== 1 || !owned.length)
     throw new Error("Versioned matrix and ownership required");
   const paths = [...new Set([...owned, ...changed])].sort(),
@@ -86,7 +87,13 @@ export function selectChecks(matrix, owned, changed) {
       ...new Set(
         paths
           .filter((p) => p.startsWith("hub/") && p.endsWith(".go"))
-          .map((p) => "./" + p.slice(4, p.lastIndexOf("/"))),
+          .map((p) => "./" + p.slice(4, p.lastIndexOf("/")))
+          .filter((p) =>
+            candidatePackages
+              ? candidatePackages.has(p)
+              : existsSync(join(process.cwd(), "hub", p)) &&
+                statSync(join(process.cwd(), "hub", p)).isDirectory(),
+          ),
       ),
     ].sort();
     add(
@@ -105,6 +112,7 @@ export function selectChecks(matrix, owned, changed) {
         "-run",
         "TestVerificationMigrationRehearsal",
         "-count=1",
+        "-v",
       ],
       "hub",
     );
@@ -136,9 +144,35 @@ export function makePlan(context, cwd) {
     throw new Error("Exact base/candidate SHA required");
   const raw = readFileSync(join(cwd, "verification/matrix.json"), "utf8"),
     matrix = JSON.parse(raw);
+  if (
+    !/^[a-f0-9]{64}$/.test(context.approvedMatrixDigest || "") ||
+    context.approvedMatrixDigest !== digest(raw) ||
+    !(context.matrixApprovalMessageSeq > 0)
+  )
+    throw new Error(
+      "Independent owner-approved matrix digest and source required",
+    );
   assertInventory(matrix, cwd);
   const changed = diffPaths(cwd, context.baseCommit, context.commit);
-  const checks = selectChecks(matrix, context.owned, changed);
+  const candidatePackages = new Set(
+    execFileSync(
+      "git",
+      ["ls-tree", "-r", "--name-only", context.commit, "hub"],
+      { cwd, encoding: "utf8" },
+    )
+      .split("\n")
+      .filter((p) => p.endsWith(".go"))
+      .map((p) => "./" + p.slice(4, p.lastIndexOf("/"))),
+  );
+  const checks = selectChecks(
+    matrix,
+    context.owned,
+    changed,
+    candidatePackages,
+  );
+  for (const check of checks)
+    if (check.argv[0] === "go")
+      check.environment.VERIFICATION_BASE_COMMIT = context.baseCommit;
   return {
     ...context,
     version: 1,

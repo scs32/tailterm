@@ -4,6 +4,9 @@ Feature `wi_f23f767415ef9b30`, owner order #11571, assignment #11766,
 prospective Start #11775. Owner decisions #11753–11755 approve the full local
 matrix, a separate fifth verifier and native evidence with AIV unsubmitted.
 Documentation supplement #11790 and fixture supplement #11806 retain scope.
+Round-one correction #11865, exact Start #11877/release #11881 and owner decision
+#11866 add the immutable post-rollout enrollment boundary. Corrected ownership
+#11887 is the 47-path manifest; initial 13385477 is diagnostic only.
 
 The builder freezes a commit. The handler independently freezes a version 1
 plan before the verifier runs it. Plan selection uses the union of the saved
@@ -31,8 +34,13 @@ Existing dual-engine entrypoints run both engines in one check. Narrow-layout
 assertions remain in the full parent suites. Selected browser checks build and verify the local static package first.
 Hub paths require vet, the full Go
 suite and race checks on touched Go packages (all packages for directory ownership).
-Migration paths additionally require fixture reopening with the pinned previous
-implementation and integrity/foreign-key checks. WASM changes build the test asset.
+Every `hub/internal/store/` path selects migration rehearsal, covering schema SQL
+outside migrate.go. Every Go check receives `VERIFICATION_BASE_COMMIT` from the
+plan. Rehearsal creates the fixture database with that exact base implementation,
+opens it with the candidate, reopens the base, reopens the candidate and checks
+retained evidence plus integrity/foreign keys. The required check never uses an
+item-specific hard-coded base. A direct unit invocation defaults to its checkout
+HEAD; matrix execution always supplies the governing base. WASM changes build the test asset.
 
 The normalized ownership manifest is handler-approved scope evidence, linked to
 the raw assignment and its canonical ownership digest. The runner never parses
@@ -46,7 +54,14 @@ repository or attest command execution.
 Create a plan input containing `itemTaskId`, `itemId`, `version`, `operationKey`, canonical `repository`,
 exact `baseCommit` and `commit`, `itemRevision`, `scopeRevision`, `orderMessageSeq`,
 `assignmentSeq`, `assignmentOwnershipDigest`, exact builder and verifier agent/run
-IDs and `owned` (concrete paths). Canonical digests use recursively sorted JSON
+IDs and `owned` (concrete paths), `approvedMatrixDigest` and
+`matrixApprovalMessageSeq`. Approval must be a separate owner-authored Board
+message whose entire trimmed text is `verification-matrix-approval:SHA256`.
+The runner refuses candidate matrix bytes differing from that approved digest;
+the native plan save verifies the owner source and token. A worker-authored token
+or a candidate's replacement digest cannot authorize a weaker matrix. A new
+matrix requires a new explicit owner approval. This is declared shared-workspace
+provenance, under the same trust boundary as other owner messages. Canonical digests use recursively sorted JSON
 keys, UTF-8 bytes and SHA-256; matrixDigest hashes the exact matrix file bytes.
 
 ```sh
@@ -82,11 +97,19 @@ from the root checkout only under the order's provenance allowance, and rebuild
 when WASM source changes. Tests use disposable hubs, fake spawns and private tmux.
 
 One transaction-level gate guards typed lead acceptance, PATCH done, keyed done
-and queue acceptance. Both bugs and features require a current passing receipt;
+and queue acceptance. Bugs and features with a post-rollout team admission require a current passing
+receipt. Enrollment is recorded atomically with the exact agent/run admission;
+there is no request flag to opt out. Immutable SQL triggers refuse marker updates
+or deletion. Rollout preserves pre-existing binding markers as
+`legacy-pre-rollout`; unadmitted legacy work reports `legacy-no-team-admission`.
+A new team on an existing item adds mandatory enrollment and cannot inherit a
+legacy exemption. `tt verification enrollment --item ITEM` exposes that provenance
+through the handler-only native endpoint. Legacy completion retains the previous
+review/narrative requirements;
 features also retain the existing complete narrative-report gate. Queue acceptance
 also checks receipt repository/base against its accepted integration context.
-Legacy unknown review history cannot bypass the receipt requirement. Existing
-saved historical completion remains readable. This changes future completion;
+Enrolled unknown review history cannot bypass the receipt requirement. Existing
+saved historical completion remains readable. This changes completion after new admission;
 it does not certify historical records or deploy a hub/CLI.
 
 ## AIV mapping boundary
@@ -106,3 +129,9 @@ item admission, saved order/assignment/scope, independence from builder/reviewer
 and approved check coverage. It cannot prove a producer actually executed a
 command merely from submitted JSON. The owner-run bootstrap exception #11796
 applies to this item's acceptance evidence only; future teams use the fifth member.
+
+Race selection inspects Go package directories in the exact candidate Git tree.
+Deleted and renamed-away paths remain in coverage selection, but are excluded
+from command targets; existing moved destinations are selected. If no touched
+package survives, the race check falls back to `./...`. Tests execute the real Go
+race command after a complete package move and deletion.

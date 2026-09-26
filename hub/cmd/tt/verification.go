@@ -16,7 +16,7 @@ import (
 
 func cmdVerification(e env, args []string) error {
 	if len(args) == 0 {
-		return errors.New("usage: tt verification plan|receipt|history --item ID [--file PATH --request-id KEY --generation N]")
+		return errors.New("usage: tt verification plan|receipt|history|enrollment --item ID [--file PATH --request-id KEY --generation N]")
 	}
 	fs := flag.NewFlagSet("verification "+args[0], flag.ContinueOnError)
 	item := fs.String("item", "", "exact work item")
@@ -35,6 +35,14 @@ func cmdVerification(e env, args []string) error {
 	}
 	ctx, cancel := ctxTimeout(20 * time.Second)
 	defer cancel()
+	if args[0] == "enrollment" {
+		out, err := c.VerificationEnrollment(ctx, e.task, *item, e.agent, e.runID)
+		if err != nil {
+			return err
+		}
+		printJSON(out)
+		return nil
+	}
 	if args[0] == "history" {
 		out, err := c.VerificationHistory(ctx, e.task, *item, e.agent, e.runID)
 		if err != nil {

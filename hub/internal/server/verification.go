@@ -32,3 +32,15 @@ func (s *Server) verificationHistory(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSON(w, http.StatusOK, out)
 }
+
+func (s *Server) verificationEnrollment(w http.ResponseWriter, r *http.Request) {
+	if _, ok := s.caller(w, r); !ok {
+		return
+	}
+	out, err := s.store.VerificationEnrollment(r.Context(), r.PathValue("id"), r.PathValue("wid"), r.URL.Query().Get("agent"), r.URL.Query().Get("run"))
+	if err != nil {
+		fail(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, out)
+}

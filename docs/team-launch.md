@@ -184,3 +184,12 @@ candidate needs a handler-approved full matrix plan and independent receipt befo
 lead acceptance, handler completion and queue integration acceptance. See
 [objective verification](objective-verification.md). These template changes apply
 to new briefings; they do not rewrite running threads or saved launch plans.
+
+Owner decision #11866 places mandatory verification at new item-team admission.
+The admission transaction saves an immutable exact agent/run enrollment marker;
+no launch option disables it. Rollout retains existing bindings with explicit
+legacy provenance. A new team on an existing item becomes mandatory; frozen
+pre-rollout teams keep their completion path. The handler can inspect provenance
+with `tt verification enrollment --item ITEM`. Before saving a matrix plan, it
+requires the separate owner-authored token-only approval described in
+[objective verification](objective-verification.md).

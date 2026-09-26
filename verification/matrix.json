@@ -245,10 +245,7 @@
       "groups": ["go"]
     },
     {
-      "prefixes": [
-        "hub/internal/store/migrate.go",
-        "hub/internal/store/verification.go"
-      ],
+      "prefixes": ["hub/internal/store/"],
       "groups": ["migration"]
     },
     {

@@ -13,6 +13,8 @@ type VerificationCheck struct {
 	Environment map[string]string `json:"environment"`
 }
 type VerificationPlan struct {
+	ApprovedMatrixDigest      string              `json:"approvedMatrixDigest"`
+	MatrixApprovalMessageSeq  int64               `json:"matrixApprovalMessageSeq"`
 	ItemID                    string              `json:"itemId"`
 	ItemTaskID                string              `json:"itemTaskId"`
 	AssignmentOwnershipDigest string              `json:"assignmentOwnershipDigest"`
@@ -107,5 +109,19 @@ func (c *Client) SaveVerification(ctx context.Context, task, item string, req Ve
 func (c *Client) VerificationHistory(ctx context.Context, task, item, agent, run string) ([]VerificationRecord, error) {
 	var out []VerificationRecord
 	err := c.do(ctx, http.MethodGet, "/v1/tasks/"+task+"/work-items/"+item+"/verification?agent="+url.QueryEscape(agent)+"&run="+url.QueryEscape(run), nil, &out)
+	return out, err
+}
+
+type VerificationEnrollment struct {
+	AgentID    string `json:"agentId,omitempty"`
+	RunID      string `json:"runId,omitempty"`
+	Required   bool   `json:"required"`
+	Provenance string `json:"provenance"`
+	CreatedAt  string `json:"createdAt,omitempty"`
+}
+
+func (c *Client) VerificationEnrollment(ctx context.Context, task, item, agent, run string) ([]VerificationEnrollment, error) {
+	var out []VerificationEnrollment
+	err := c.do(ctx, http.MethodGet, "/v1/tasks/"+task+"/work-items/"+item+"/verification/enrollment?agent="+url.QueryEscape(agent)+"&run="+url.QueryEscape(run), nil, &out)
 	return out, err
 }

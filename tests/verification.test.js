@@ -7,11 +7,22 @@ import { execFileSync } from "node:child_process";
 import {
   selectChecks,
   diffPaths,
-  makePlan,
+  makePlan as rawMakePlan,
   runPlan,
   digest,
   assertInventory,
 } from "../scripts/verify-matrix.mjs";
+const makePlan = (context, cwd) =>
+  rawMakePlan(
+    {
+      approvedMatrixDigest: digest(
+        readFileSync(join(cwd, "verification/matrix.json"), "utf8"),
+      ),
+      matrixApprovalMessageSeq: 1,
+      ...context,
+    },
+    cwd,
+  );
 const matrix = JSON.parse(
   readFileSync(new URL("../verification/matrix.json", import.meta.url)),
 );
@@ -161,4 +172,105 @@ test("browser run refuses missing prerequisite assets before commands execute", 
     () => runPlan(plan, f.cwd, output),
     /Missing prerequisite: node_modules/,
   );
+});
+
+test("candidate matrix weakening cannot replace the independently approved digest", (t) => {
+  const f = fixture(t);
+  const approved = digest(
+    readFileSync(join(f.cwd, "verification/matrix.json"), "utf8"),
+  );
+  writeFileSync(
+    join(f.cwd, "verification/matrix.json"),
+    JSON.stringify({
+      version: 1,
+      browserSuites: [],
+      excludedBrowserSuites: [],
+      rules: [{ prefixes: ["docs/"], groups: [] }],
+    }),
+  );
+  assert.throws(
+    () =>
+      makePlan(
+        {
+          baseCommit: f.base,
+          commit: f.commit,
+          owned: ["docs/"],
+          approvedMatrixDigest: approved,
+          matrixApprovalMessageSeq: 1,
+        },
+        f.cwd,
+      ),
+    /approved matrix/,
+  );
+});
+test("every store schema path selects plan-base rehearsal", () => {
+  const checks = selectChecks(
+    matrix,
+    ["hub/internal/store/review_convergence.go"],
+    [],
+  );
+  assert(checks.some((c) => c.id === "migration-rehearsal"));
+});
+test("removed Go package is excluded from candidate race targets", () => {
+  const checks = selectChecks(
+    matrix,
+    ["hub/internal/deleted-fixture/removed.go"],
+    [],
+    new Set(),
+  );
+  assert.deepEqual(checks.find((c) => c.id === "go-race").argv, [
+    "go",
+    "test",
+    "-race",
+    "./...",
+  ]);
+});
+
+test("actual renamed and deleted Go packages run race only in candidate packages", (t) => {
+  const f = fixture(t);
+  const m = {
+    version: 1,
+    browserSuites: [],
+    excludedBrowserSuites: [],
+    rules: [
+      { prefixes: ["hub/"], groups: ["go"] },
+      { prefixes: ["docs/"], groups: ["unit"] },
+    ],
+  };
+  writeFileSync(join(f.cwd, "verification/matrix.json"), JSON.stringify(m));
+  mkdirSync(join(f.cwd, "hub/old"), { recursive: true });
+  mkdirSync(join(f.cwd, "hub/survivor"), { recursive: true });
+  writeFileSync(join(f.cwd, "hub/go.mod"), "module fixture\n\ngo 1.24.0\n");
+  writeFileSync(join(f.cwd, "hub/old/fixture.go"), "package moved\n");
+  writeFileSync(join(f.cwd, "hub/survivor/fixture.go"), "package survivor\n");
+  f.git("add", ".");
+  f.git("commit", "-qm", "base packages");
+  const base = f.git("rev-parse", "HEAD");
+  f.git("mv", "hub/old", "hub/new");
+  f.git("commit", "-qm", "move package");
+  let commit = f.git("rev-parse", "HEAD");
+  let plan = makePlan(
+    { baseCommit: base, commit, owned: ["hub/old/fixture.go"] },
+    f.cwd,
+  );
+  let race = plan.checks.find((c) => c.id === "go-race");
+  assert.deepEqual(race.argv, ["go", "test", "-race", "./new"]);
+  assert.equal(race.environment.VERIFICATION_BASE_COMMIT, base);
+  execFileSync(race.argv[0], race.argv.slice(1), {
+    cwd: join(f.cwd, "hub"),
+    stdio: "pipe",
+  });
+  f.git("rm", "-r", "hub/new");
+  f.git("commit", "-qm", "delete package");
+  commit = f.git("rev-parse", "HEAD");
+  plan = makePlan(
+    { baseCommit: base, commit, owned: ["hub/old/fixture.go"] },
+    f.cwd,
+  );
+  race = plan.checks.find((c) => c.id === "go-race");
+  assert.deepEqual(race.argv, ["go", "test", "-race", "./..."]);
+  execFileSync(race.argv[0], race.argv.slice(1), {
+    cwd: join(f.cwd, "hub"),
+    stdio: "pipe",
+  });
 });
