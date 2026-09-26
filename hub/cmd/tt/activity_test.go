@@ -14,7 +14,6 @@ import (
 	"time"
 
 	"github.com/scs32/tailterm/hub/internal/api"
-	"github.com/scs32/tailterm/hub/internal/spawn"
 )
 
 func TestActivityTranscriptMappingAndIncrementalReads(t *testing.T) {
@@ -257,7 +256,7 @@ func TestActivityTickPostsOnlyTransitionsAndRetriesLostReply(t *testing.T) {
 	defer hub.Close()
 	client, _ := api.NewClient(hub.URL, 5*time.Second)
 	b := runtimeBinding{Hub: hub.URL, Task: "tsk_0123456789abcdef", Agent: "agt_0123456789abcdef", Run: "run_0123456789abcdef", Thread: thread, Runtime: "codex", Codex: filepath.Join(home, "codex")}
-	probe := func(api.Agent) (bool, bool, error) { return true, true, nil }
+	probe := func(runtimeBinding, api.Agent) (bool, bool, error) { return true, true, nil }
 	if err := relayActivityTick(context.Background(), b, client, now, probe); err == nil {
 		t.Fatal("expected lost reply")
 	}
@@ -380,7 +379,7 @@ func TestActivityConflictDoesNotStarveObservation(t *testing.T) {
 	client, _ := api.NewClient(hub.URL, time.Second)
 	b := runtimeBinding{Hub: hub.URL, Task: "tsk_0123456789abcdef", Agent: "agt_0123456789abcdef", Run: "run_0123456789abcdef", Thread: "12345678-1234-1234-1234-123456789abc", Runtime: "codex", CreatedAt: now}
 	for i := 0; i < 20; i++ {
-		if err := relayActivityTick(context.Background(), b, client, now.Add(time.Duration(i)*16*time.Second), func(api.Agent) (bool, bool, error) { return true, true, nil }); err != nil {
+		if err := relayActivityTick(context.Background(), b, client, now.Add(time.Duration(i)*16*time.Second), func(runtimeBinding, api.Agent) (bool, bool, error) { return true, true, nil }); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -419,24 +418,6 @@ func TestActivityManyStaleBindingsSkipTranscriptAndFutureReads(t *testing.T) {
 	}
 	if gets != 40 {
 		t.Fatalf("stale rechecks=%d", gets)
-	}
-}
-
-func TestActivityNativeProbeIgnoresHeartbeatGap(t *testing.T) {
-	fake := filepath.Join(t.TempDir(), "tmux")
-	if err := os.WriteFile(fake, []byte("#!/bin/sh\nexit 0\n"), 0700); err != nil {
-		t.Fatal(err)
-	}
-	old := spawn.Tmux
-	spawn.Tmux = fake
-	defer func() { spawn.Tmux = old }()
-	tmux, process, err := activityProbeNative(api.Agent{Session: "fake", Online: false})
-	if err == nil || !tmux || process {
-		t.Fatalf("heartbeat gap was not uncertain: %v %v %v", tmux, process, err)
-	}
-	c := activityCursor{SeenTurn: true, MissingSince: time.Now().Add(-time.Minute)}
-	if got := activityState(&c, api.Agent{Status: api.AgentRunning}, 0, tmux, process, err, time.Now(), activityDefaults()); got.State != "unknown" || !c.MissingSince.IsZero() {
-		t.Fatalf("uncertain probe retained crash evidence: %+v %+v", got, c)
 	}
 }
 

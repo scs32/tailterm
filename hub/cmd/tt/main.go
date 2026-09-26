@@ -1092,6 +1092,9 @@ func cmdSpawn(e env, args []string) error {
 			"TAILTERM_HANDLER_COMMAND": baseCommand, "TAILTERM_HANDLER_PROMPT": *prompt, "TAILTERM_BRIEFING": briefing,
 		},
 	}
+	if socket := os.Getenv("TT_TMUX_SOCKET"); socket != "" {
+		opts.Env["TT_TMUX_SOCKET"] = socket
+	}
 	var agent api.Agent
 	if *role == api.AgentRoleDatabaseHandler {
 		agent, err = ensureHandler(ctx, c, *task, req, opts)
@@ -1284,7 +1287,8 @@ func cmdWrap(e env, args []string) error {
 		}
 	}
 	stopped := make(chan struct{})
-	return spawn.Wrap(command, func() {
+	return spawn.Wrap(command, func(pid int) {
+		recordRuntimeProcess(e, pid)
 		report(api.EventStarted, "Process started")
 		go func() {
 			ticker := time.NewTicker(30 * time.Second)
@@ -1298,7 +1302,11 @@ func cmdWrap(e env, args []string) error {
 				}
 			}
 		}()
-	}, func(code int) { close(stopped); report(api.EventExited, fmt.Sprintf("Process exited (%d)", code)) })
+	}, func(code int) {
+		close(stopped)
+		recordRuntimeExit(e)
+		report(api.EventExited, fmt.Sprintf("Process exited (%d)", code))
+	})
 }
 
 func wrapCommand(args []string) (string, error) {

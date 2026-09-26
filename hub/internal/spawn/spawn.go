@@ -220,7 +220,7 @@ func Runtimes() []string {
 
 // Wrap runs a shell command, reporting start and exit through the callbacks,
 // then keeps the pane alive with an interactive shell so the session persists.
-func Wrap(command string, onStart func(), onExit func(code int)) error {
+func Wrap(command string, onStart func(pid int), onExit func(code int)) error {
 	shell := os.Getenv("SHELL")
 	if shell == "" {
 		shell = "/bin/sh"
@@ -230,9 +230,13 @@ func Wrap(command string, onStart func(), onExit func(code int)) error {
 		return err
 	}
 	defer cleanup()
-	onStart()
 	cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
-	err = cmd.Run()
+	err = cmd.Start()
+	if err != nil {
+		return err
+	}
+	onStart(cmd.Process.Pid)
+	err = cmd.Wait()
 	code := 0
 	var exitErr *exec.ExitError
 	if errors.As(err, &exitErr) {

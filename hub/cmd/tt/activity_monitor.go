@@ -18,7 +18,7 @@ import (
 	"github.com/scs32/tailterm/hub/internal/spawn"
 )
 
-type activityProbe func(api.Agent) (tmuxAlive, processAlive bool, err error)
+type activityProbe func(runtimeBinding, api.Agent) (tmuxAlive, processAlive bool, err error)
 
 type activityWorktreeContextKey struct{}
 type activityWorktreeResult struct {
@@ -39,21 +39,8 @@ func cachedActivityWorktree(ctx context.Context, cwd string) (string, error) {
 	return activityWorktree(cwd)
 }
 
-func activityProbeNative(a api.Agent) (bool, bool, error) {
-	if a.Session == "" {
-		return false, false, errors.New("agent has no tmux session")
-	}
-	tmuxAlive, err := spawn.ProbeSession(a.Session)
-	if err != nil {
-		return false, false, err
-	}
-	// A missing hub heartbeat does not establish local process absence. When
-	// tmux is still present, the runtime status is uncertain until the wrapper
-	// reports exit or the heartbeat returns.
-	if tmuxAlive && !a.Online {
-		return true, false, errors.New("runtime liveness unconfirmed")
-	}
-	return tmuxAlive, tmuxAlive, nil
+func activityProbeNative(b runtimeBinding, a api.Agent) (bool, bool, error) {
+	return probeExactRuntimeProcess(b, a, spawn.ProbeSession, nativeRuntimeSessionProbe, nativeRuntimePIDProbe)
 }
 
 func activityWorktree(cwd string) (string, error) {
@@ -287,7 +274,7 @@ func relayActivityTick(ctx context.Context, b runtimeBinding, client *api.Client
 		}
 		open = len(obligations)
 	}
-	tmuxAlive, processAlive, probeErr := probe(a)
+	tmuxAlive, processAlive, probeErr := probe(b, a)
 	state := activityState(&c, a, open, tmuxAlive, processAlive, probeErr, now, activityDefaults())
 	if state.State == c.LastState || state.State == c.RejectedState {
 		return save()

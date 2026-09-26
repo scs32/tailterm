@@ -111,7 +111,6 @@ func TestActivityAlertRoutingAndTeamIsolation(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	transition(member, "alert-hung", "hung_tool")
 	var leadAlerts, otherAlerts, ownerAlerts int
 	count := func() {
 		t.Helper()
@@ -124,6 +123,12 @@ func TestActivityAlertRoutingAndTeamIsolation(t *testing.T) {
 			}
 		}
 	}
+	transition(member, "uncertain-process", "unknown")
+	count()
+	if leadAlerts != 0 || otherAlerts != 0 || ownerAlerts != 0 {
+		t.Fatalf("uncertain process alerted lead=%d other=%d owner=%d", leadAlerts, otherAlerts, ownerAlerts)
+	}
+	transition(member, "alert-hung", "hung_tool")
 	count()
 	if leadAlerts != 1 || otherAlerts != 0 || ownerAlerts != 0 {
 		t.Fatalf("hung routing lead=%d other=%d owner=%d", leadAlerts, otherAlerts, ownerAlerts)
