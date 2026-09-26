@@ -457,3 +457,15 @@ func TestReviewConvergenceMetadataKindAndRendering(t *testing.T) {
 		t.Fatal("unknown review mode accepted")
 	}
 }
+
+func TestReviewConvergenceReconciliationEnvelope(t *testing.T) {
+	e := Envelope{Kind: "notice", Subject: "Reconcile exact legacy review history", Body: EnvelopeBody{Text: "Preserve source rounds"}, Review: &ReviewMetadata{Mode: "reconcile", LegacyRequests: []int64{17, 21}, Fix: "Source-linked round adoption"}, Evidence: map[string]Evidence{"e1": {Type: "record", Value: "Native legacy request records"}}}
+	if p := ValidateEnvelope(e); len(p) != 0 {
+		t.Fatal(p)
+	}
+	e.Kind = "request"
+	e.Body.Ask = "Reconcile"
+	if p := ValidateEnvelope(e); len(p) == 0 {
+		t.Fatal("reconcile requires NOTICE")
+	}
+}

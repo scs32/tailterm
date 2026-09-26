@@ -170,10 +170,10 @@ func ValidateEnvelope(e Envelope) []Problem {
 	var out []Problem
 	if e.Review != nil {
 		r := e.Review
-		if r.Mode != "general" && r.Mode != "focused" && r.Mode != "disposition" {
-			out = append(out, Problem{Field: "review.mode", Reason: "must be general, focused or disposition"})
+		if r.Mode != "general" && r.Mode != "focused" && r.Mode != "disposition" && r.Mode != "reconcile" {
+			out = append(out, Problem{Field: "review.mode", Reason: "must be general, focused, disposition or reconcile"})
 		}
-		if r.Mode == "general" && e.Kind != "review" && e.Kind != "result" || r.Mode == "focused" && e.Kind != "request" && e.Kind != "result" || r.Mode == "disposition" && e.Kind != "notice" {
+		if r.Mode == "general" && e.Kind != "review" && e.Kind != "result" || r.Mode == "focused" && e.Kind != "request" && e.Kind != "result" || (r.Mode == "disposition" || r.Mode == "reconcile") && e.Kind != "notice" {
 			out = append(out, Problem{Field: "review.mode", Reason: "does not match message kind"})
 		}
 	}

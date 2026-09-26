@@ -539,3 +539,215 @@ func TestReviewConvergenceLegacyReviewHistoryNeverBecomesZero(t *testing.T) {
 		t.Fatal("unknown managed history accepted", err)
 	}
 }
+
+func acceptCorrectionFixture(t *testing.T, f *convergenceFixture, candidate string) {
+	t.Helper()
+	meta := api.ReviewMetadata{Mode: "disposition", Disposition: "accept", Candidate: candidate}
+	if _, err := f.post(api.Envelope{Kind: "notice", Subject: "Accept corrected fixture candidate", Review: &meta, Body: api.EnvelopeBody{Text: "Accept verified candidate"}}, "", 0, api.Agent{}); err != nil {
+		t.Fatal(err)
+	}
+	done := "done"
+	if _, err := f.s.UpdateWorkItem(f.ctx, f.task.ID, f.item.ID, api.UpdateWorkItemRequest{Revision: f.item.Revision, Status: &done}, f.by); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestReviewConvergenceCorrectionFrozenScopeDuringOpenRound(t *testing.T) {
+	f := newConvergenceFixture(t)
+	r := f.review(t, candidateA)
+	desc := "Description clarified while exact candidate is under review"
+	var err error
+	f.item, err = f.s.UpdateWorkItem(f.ctx, f.task.ID, f.item.ID, api.UpdateWorkItemRequest{Revision: f.item.Revision, Description: &desc}, f.by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// RESULT completes against its requested snapshot before a new ASSIGN exists.
+	if _, err = f.post(f.resultEnv(candidateA, passConvergence, api.ReviewMetadata{Mode: "general"}), "", r.Seq, f.reviewer); err != nil {
+		t.Fatal(err)
+	}
+	assign, err := f.post(api.Envelope{Kind: "assign", Subject: "Rebind identical corrected fixture scope", Body: api.EnvelopeBody{Objective: "Fixture", Owns: []string{"fixture"}, Acceptance: map[string]string{"a1": "works", "a2": "retries"}}}, "", 0, api.Agent{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	st := f.state(t)
+	if len(st.Rounds) != 1 || st.Rounds[0].ScopeRevision != 1 || st.Rounds[0].Criteria["a2"] != "retries" || st.Scopes[1].AssignmentSeq != assign.Seq {
+		t.Fatal("frozen provenance/count lost", st)
+	}
+	acceptCorrectionFixture(t, f, candidateA)
+}
+
+func TestReviewConvergenceCorrectionDroppedBlockerCriterion(t *testing.T) {
+	f := newConvergenceFixture(t)
+	r := f.review(t, candidateA)
+	b := api.ReviewFinding{ID: "b1", Criterion: "a2", Title: "Retry drops receipt", File: "fixture.go", Line: 7}
+	if _, err := f.post(f.resultEnv(candidateA, map[string]string{"a1": "pass", "a2": "fail"}, api.ReviewMetadata{Mode: "general", Blockers: []api.ReviewFinding{b}}), "", r.Seq, f.reviewer); err != nil {
+		t.Fatal(err)
+	}
+	desc := "Owner removes retries from bounded scope"
+	var err error
+	f.item, err = f.s.UpdateWorkItem(f.ctx, f.task.ID, f.item.ID, api.UpdateWorkItemRequest{Revision: f.item.Revision, Description: &desc}, f.by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = f.post(api.Envelope{Kind: "assign", Subject: "Assign explicitly reduced fixture scope", Body: api.EnvelopeBody{Objective: "Fixture", Owns: []string{"fixture"}, Acceptance: map[string]string{"a1": "works"}}}, "", 0, api.Agent{}); err != nil {
+		t.Fatal(err)
+	}
+	r2, err := f.post(api.Envelope{Kind: "review", Subject: "Review explicitly reduced fixture scope", Body: api.EnvelopeBody{Candidate: candidateB, Scope: "Reduced scope", Acceptance: map[string]string{"a1": "works"}}}, f.reviewer.ID, 0, api.Agent{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	meta := api.ReviewMetadata{Mode: "general", BlockerIDs: []string{"b1"}}
+	if _, err = f.post(f.resultEnv(candidateB, map[string]string{"a1": "pass"}, meta), "", r2.Seq, f.reviewer); !errors.Is(err, api.ErrConflict) {
+		t.Fatal("silent removal", err)
+	}
+	meta.Fix = "Scope revision 2 and its ASSIGN explicitly remove retries; b1 is out of scope, not passed"
+	if _, err = f.post(f.resultEnv(candidateB, map[string]string{"a1": "pass"}, meta), "", r2.Seq, f.reviewer); err != nil {
+		t.Fatal(err)
+	}
+	st := f.state(t)
+	if len(st.Rounds) != 2 || len(outstanding(st)) != 0 || st.Rounds[1].Verdicts["a2"] != "" || st.Focused[0].Fix == "" || len(st.Focused[0].ScopeResolvedIDs) != 1 {
+		t.Fatal("scope resolution provenance", st)
+	}
+	acceptCorrectionFixture(t, f, candidateB)
+}
+
+func TestReviewConvergenceCorrectionDemotedCriterionExactVerification(t *testing.T) {
+	for _, asBlocker := range []bool{true, false} {
+		t.Run(fmt.Sprintf("blocker=%v", asBlocker), func(t *testing.T) {
+			f := newConvergenceFixture(t)
+			r := f.review(t, candidateA)
+			if _, err := f.post(f.resultEnv(candidateA, passConvergence, api.ReviewMetadata{Mode: "general"}), "", r.Seq, f.reviewer); err != nil {
+				t.Fatal(err)
+			}
+			r2 := f.review(t, candidateB)
+			b := api.ReviewFinding{ID: "b2", Criterion: "a2", Title: "Retry drops receipt", Command: "fixture retry", Output: "FAIL missing receipt"}
+			meta := api.ReviewMetadata{Mode: "general"}
+			if asBlocker {
+				meta.Blockers = []api.ReviewFinding{b}
+			} else {
+				meta.Findings = []api.ReviewFinding{b}
+			}
+			if !asBlocker {
+				if _, err := f.post(f.resultEnv(candidateB, passConvergence, meta), "", r2.Seq, f.reviewer); !errors.Is(err, api.ErrConflict) {
+					t.Fatal("false passing criterion accepted", err)
+				}
+			}
+			if _, err := f.post(f.resultEnv(candidateB, map[string]string{"a1": "pass", "a2": "fail"}, meta), "", r2.Seq, f.reviewer); err != nil {
+				t.Fatal(err)
+			}
+			st := f.state(t)
+			if len(st.Rounds[1].Blockers) != 0 || len(st.FollowUps) != 1 || len(outstanding(st)) != 1 {
+				t.Fatal("demotion semantics", st)
+			}
+			focus := api.ReviewMetadata{Mode: "focused", Candidate: candidateC, Fix: "Restore receipt on retry", BlockerIDs: []string{"b2"}}
+			fm, err := f.post(api.Envelope{Kind: "request", Subject: "Verify exactly the demoted receipt failure", Review: &focus, Body: api.EnvelopeBody{Ask: "Verify exact receipt fix"}}, f.reviewer.ID, 0, api.Agent{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err = f.post(f.resultEnv(candidateC, map[string]string{"b2": "pass"}, focus), "", fm.Seq, f.reviewer); err != nil {
+				t.Fatal(err)
+			}
+			st = f.state(t)
+			if st.Rounds[1].Verdicts["a2"] != "fail" || len(st.Rounds) != 2 || !st.Focused[0].Passed {
+				t.Fatal("history rewritten", st)
+			}
+			acceptCorrectionFixture(t, f, candidateC)
+		})
+	}
+}
+
+func TestReviewConvergenceCorrectionLegacyReconciliation(t *testing.T) {
+	for _, count := range []int{1, 2, 3} {
+		t.Run(fmt.Sprintf("requests=%d", count), func(t *testing.T) {
+			f := newConvergenceFixture(t)
+			if _, err := f.s.db.Exec(`DELETE FROM review_convergence WHERE task_id=? AND item_id=?`, f.task.ID, f.item.ID); err != nil {
+				t.Fatal(err)
+			}
+			ids := []int64{}
+			for i := 0; i < count; i++ {
+				env := api.Envelope{Kind: "review", Subject: "Legacy native fixture review request", Body: api.EnvelopeBody{Candidate: candidateA, Scope: "Fixture", Acceptance: map[string]string{"a1": "works", "a2": "retries"}}}
+				req := f.req(env, f.reviewer.ID, 0, api.Agent{})
+				task, _ := f.s.GetTask(f.ctx, f.task.ID)
+				tx, err := f.s.db.BeginTx(f.ctx, nil)
+				if err != nil {
+					t.Fatal(err)
+				}
+				m, err := f.s.insertMessage(f.ctx, tx, task, req, f.reviewer, f.by, false, false)
+				if err != nil {
+					tx.Rollback()
+					t.Fatal(err)
+				}
+				if err = tx.Commit(); err != nil {
+					t.Fatal(err)
+				}
+				ids = append(ids, m.Seq)
+			}
+			if _, err := f.post(api.Envelope{Kind: "assign", Subject: "Assign correction of legacy fixture", Body: api.EnvelopeBody{Objective: "Fixture", Owns: []string{"fixture"}, Acceptance: map[string]string{"a1": "works", "a2": "retries"}}}, "", 0, api.Agent{}); err != nil {
+				t.Fatal(err)
+			}
+			if f.state(t).History != "unknown" {
+				t.Fatal("guessed zero")
+			}
+			meta := api.ReviewMetadata{Mode: "reconcile", LegacyRequests: ids, Fix: "Enumerate native legacy requests; retain all lifetime slots and reattest original frozen candidates"}
+			env := api.Envelope{Kind: "notice", Subject: "Reconcile source backed legacy review rounds", Review: &meta, Body: api.EnvelopeBody{Text: "Preserve exact source history"}, Evidence: map[string]api.Evidence{"e1": {Type: "record", Value: fmt.Sprintf("Native source requests %v", ids)}}}
+			if count > 1 {
+				bad := env
+				badMeta := meta
+				badMeta.LegacyRequests = ids[:1]
+				bad.Review = &badMeta
+				if _, err := f.post(bad, "", 0, api.Agent{}); !errors.Is(err, api.ErrConflict) {
+					t.Fatal("count reset accepted", err)
+				}
+			}
+			reconcileReq := f.req(env, "", 0, api.Agent{})
+			reconciliation, err := f.s.PostMessage(f.ctx, f.task.ID, reconcileReq, f.by)
+			if count > 2 {
+				if !errors.Is(err, api.ErrConflict) || f.state(t).History != "unknown" {
+					t.Fatal("legacy cap override", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			again, replayErr := f.s.PostMessage(f.ctx, f.task.ID, reconcileReq, f.by)
+			if replayErr != nil || again.Seq != reconciliation.Seq {
+				t.Fatal("reconciliation replay", replayErr)
+			}
+			st := f.state(t)
+			if len(st.Rounds) != count || st.Reconciliations[0].MessageSeq != reconciliation.Seq || st.Rounds[0].ReconciliationSeq != reconciliation.Seq {
+				t.Fatal("source/count lost", st)
+			}
+			if count == 2 {
+				if _, err := f.post(f.resultEnv(candidateA, passConvergence, api.ReviewMetadata{Mode: "general"}), "", ids[1], f.reviewer); !errors.Is(err, api.ErrConflict) {
+					t.Fatal("skipped first result", err)
+				}
+			}
+			for _, id := range ids {
+				if _, err := f.post(f.resultEnv(candidateA, passConvergence, api.ReviewMetadata{Mode: "general"}), "", id, f.reviewer); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if count == 1 {
+				r2 := f.review(t, candidateA)
+				if _, err := f.post(f.resultEnv(candidateA, passConvergence, api.ReviewMetadata{Mode: "general"}), "", r2.Seq, f.reviewer); err != nil {
+					t.Fatal(err)
+				}
+			}
+			// Restart retains imported counts, sources, and exact current reviewer identity.
+			f.s.Close()
+			f.s, err = Open(f.path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(f.state(t).Rounds) != 2 {
+				t.Fatal("restart count")
+			}
+			env2 := api.Envelope{Kind: "review", Subject: "Try forbidden third legacy review", Body: api.EnvelopeBody{Candidate: candidateA, Scope: "Fixture", Acceptance: passConvergence}}
+			if _, err = f.post(env2, f.reviewer.ID, 0, api.Agent{}); !errors.Is(err, api.ErrConflict) {
+				t.Fatal("third admitted", err)
+			}
+			acceptCorrectionFixture(t, f, candidateA)
+		})
+	}
+}

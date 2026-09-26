@@ -69,3 +69,36 @@ A revision-checked title/description update permits a new scope snapshot, but
 never another general review beyond two. Follow-ups are native open work items
 with source-message provenance and a parent relationship in the review ledger;
 they remain outside the delivery queue pending deliberate triage.
+
+### Scope and legacy reconciliation
+
+An open general RESULT uses the request's frozen criteria, candidate and exact
+reviewer run, even if the item description changes meanwhile. The lead must
+ASSIGN the current revision before acceptance. If those criteria are identical,
+the existing verdicts remain usable without consuming another round. Round two
+may explicitly resolve a blocker whose criterion was removed or changed by a
+revision-checked scope edit: name it in `blockerIds`, put the scope-change reason
+in `fix`, and attach evidence. This records a scope resolution, not a passing
+verdict for a removed criterion. Retaining or silently dropping it does not
+permit acceptance.
+
+A round-two criterion failure stays failed when its finding is demoted into a
+held-for-triage follow-up. Its finding ID can be named by the existing exact
+focused REQUEST/RESULT path. Acceptance needs that verified fix on the exact
+candidate; the general verdict history is never rewritten. Encoding a criterion
+failure under `findings` also requires a failed verdict. Improvements unrelated
+to failed criteria should omit `criterion`.
+
+For native typed reviews predating enforcement, the lead or owner can post a
+NOTICE with review metadata `mode: "reconcile"`, `legacyRequests: [SEQ, ...]`, a
+source-backed explanation in `fix`, and Evidence. The hub requires every linked
+native REVIEW sequence in chronological order and reserves all those lifetime
+slots. It copies each immutable source candidate and criteria, and binds its
+original reviewer to the current available run; it records the reconciliation
+NOTICE and author/run alongside the source requests. Unknown legacy verdicts are
+not inferred: each imported request needs a structured RESULT reattesting that
+same frozen candidate and criteria, in round order. This completes an existing
+round, rather than allocating a fresh general REVIEW. Ordinary acceptance and
+Done checks then apply. Replays retain the same ledger. A subset, missing exact
+source fields, unavailable original reviewer, or more than two historical
+requests is refused, with unknown history retained; there is no cap override.

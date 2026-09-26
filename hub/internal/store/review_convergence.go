@@ -172,6 +172,25 @@ func outstanding(state api.ReviewConvergence) map[string]api.ReviewFinding {
 			}
 		}
 	}
+	// Demotion changes filing, not the failed criterion's verification requirement.
+	if len(state.Rounds) > 0 {
+		last := state.Rounds[len(state.Rounds)-1]
+		findings := last.Findings
+		// Compatibility with the first ledger version, where findings were only
+		// stored in the follow-up projection.
+		if len(findings) == 0 {
+			for _, f := range state.FollowUps {
+				if f.MessageSeq == last.ResultSeq {
+					findings = append(findings, f.Finding)
+				}
+			}
+		}
+		for _, f := range findings {
+			if f.Criterion != "" && last.Verdicts[f.Criterion] != "pass" {
+				out[f.ID] = f
+			}
+		}
+	}
 	for _, f := range state.Focused {
 		if f.Passed {
 			for _, id := range f.BlockerIDs {
@@ -196,16 +215,28 @@ func reviewReady(state api.ReviewConvergence, scope int64, candidate string) err
 		return reviewConflict("no completed general review")
 	}
 	last := state.Rounds[len(state.Rounds)-1]
-	if last.ResultSeq == 0 || last.ScopeRevision != scope {
+	if last.ResultSeq == 0 || !reflect.DeepEqual(roundCriteria(&state, last), sc.Criteria) {
 		return reviewConflict("latest general review is incomplete or stale")
 	}
 	verdicts := map[string]string{}
 	for k, v := range last.Verdicts {
 		verdicts[k] = v
 	}
+	fixable := outstandingWithoutFocused(state)
 	for _, f := range state.Focused {
 		if f.Passed && f.Candidate == candidate {
 			for _, id := range f.BlockerIDs {
+				if scopeResolved(f, id) {
+					continue
+				}
+				if b, ok := fixable[id]; ok && b.Criterion != "" {
+					verdicts[b.Criterion] = "pass"
+				}
+			}
+			for _, id := range f.BlockerIDs {
+				if scopeResolved(f, id) {
+					continue
+				}
 				for _, r := range state.Rounds {
 					for _, b := range r.Blockers {
 						if b.ID == id && b.Criterion != "" {
@@ -221,7 +252,14 @@ func reviewReady(state api.ReviewConvergence, scope int64, candidate string) err
 			return reviewConflict("criterion " + key + " has not passed")
 		}
 	}
-	if len(outstanding(state)) != 0 {
+	candidateState := state
+	candidateState.Focused = nil
+	for _, f := range state.Focused {
+		if f.Candidate == candidate || (len(state.Rounds) == 2 && f.RequestSeq == state.Rounds[1].RequestSeq && f.ResultSeq == state.Rounds[1].ResultSeq) {
+			candidateState.Focused = append(candidateState.Focused, f)
+		}
+	}
+	if len(outstanding(candidateState)) != 0 {
 		return reviewConflict("unresolved blockers")
 	}
 	if candidate != last.Candidate {
@@ -372,7 +410,7 @@ func (s *Store) applyReviewConvergence(ctx context.Context, tx *sql.Tx, m api.Me
 		if meta != nil && (meta.Mode != "general" || (meta.Candidate != "" && meta.Candidate != e.Body.Candidate)) {
 			return reviewConflict("REVIEW is always a general review")
 		}
-		state.Rounds = append(state.Rounds, api.ReviewRound{Number: len(state.Rounds) + 1, ScopeRevision: item.ScopeRevision, RequestSeq: m.Seq, Candidate: e.Body.Candidate, ReviewerID: target.ID, ReviewerRun: target.RunID, StartedAt: ts(s.now())})
+		state.Rounds = append(state.Rounds, api.ReviewRound{Number: len(state.Rounds) + 1, ScopeRevision: item.ScopeRevision, Criteria: sc.Criteria, RequestSeq: m.Seq, Candidate: e.Body.Candidate, ReviewerID: target.ID, ReviewerRun: target.RunID, StartedAt: ts(s.now())})
 		state.Disposition = nil
 		return saveReviewState(ctx, tx, m.TaskID, state)
 	}
@@ -390,6 +428,9 @@ func (s *Store) applyReviewConvergence(ctx context.Context, tx *sql.Tx, m api.Me
 			}
 		}
 		return nil
+	}
+	if meta.Mode == "reconcile" {
+		return s.reconcileLegacyReviews(ctx, tx, m, req, item, &state)
 	}
 	if meta.Mode == "disposition" {
 		if e.Kind != "notice" {
@@ -419,10 +460,10 @@ func (s *Store) applyReviewConvergence(ctx context.Context, tx *sql.Tx, m api.Me
 		return saveReviewState(ctx, tx, m.TaskID, state)
 	}
 	sc := scopeFor(&state, item.ScopeRevision)
-	if sc == nil {
-		return reviewConflict("current scope is not assigned")
-	}
 	if meta.Mode == "focused" {
+		if sc == nil {
+			return reviewConflict("current scope is not assigned")
+		}
 		if len(state.Rounds) != 2 || state.Rounds[1].ResultSeq == 0 {
 			return reviewConflict("focused path requires two completed general reviews")
 		}
@@ -513,8 +554,15 @@ func (s *Store) applyReviewConvergence(ctx context.Context, tx *sql.Tx, m api.Me
 			round = &state.Rounds[i]
 		}
 	}
-	if round == nil || round.ResultSeq != 0 || round.ReviewerID != req.AgentID || round.ReviewerRun != req.RunID || round.Candidate != meta.Candidate || round.ScopeRevision != item.ScopeRevision {
+	if round == nil || round.ResultSeq != 0 || round.ReviewerID != req.AgentID || round.ReviewerRun != req.RunID || round.Candidate != meta.Candidate {
 		return reviewConflict("review result identity, scope or candidate mismatch")
+	}
+	sc = &api.ReviewScope{ScopeRevision: round.ScopeRevision, Criteria: roundCriteria(&state, *round)}
+	if len(sc.Criteria) == 0 {
+		return reviewConflict("round frozen criteria are missing")
+	}
+	if round.Number == 2 && state.Rounds[0].ResultSeq == 0 {
+		return reviewConflict("first general review must complete before second result")
 	}
 	if err = completeVerdicts(sc.Criteria, e.Body.Status); err != nil {
 		return err
@@ -529,14 +577,18 @@ func (s *Store) applyReviewConvergence(ctx context.Context, tx *sql.Tx, m api.Me
 	blockers := []api.ReviewFinding{}
 	findings := append([]api.ReviewFinding{}, meta.Findings...)
 	for _, b := range meta.Blockers {
-		if err = evidenceFinding(b, meta.Candidate, sc.Criteria, true); err != nil {
+		allowedCriteria := sc.Criteria
+		old, known := prior[b.ID]
+		if known && sc.Criteria[b.Criterion] == "" {
+			allowedCriteria = roundCriteria(&state, state.Rounds[0])
+		}
+		if err = evidenceFinding(b, meta.Candidate, allowedCriteria, true); err != nil {
 			return err
 		}
-		if b.Criterion != "" && e.Body.Status[b.Criterion] != "fail" {
+		if b.Criterion != "" && sc.Criteria[b.Criterion] != "" && e.Body.Status[b.Criterion] != "fail" {
 			return reviewConflict("blocker criterion must have failed verdict")
 		}
 		if round.Number == 2 {
-			old, known := prior[b.ID]
 			if known && (old.Criterion != b.Criterion || old.Regression != b.Regression) {
 				return reviewConflict("stable blocker ID changed meaning")
 			}
@@ -551,6 +603,7 @@ func (s *Store) applyReviewConvergence(ctx context.Context, tx *sql.Tx, m api.Me
 		seen[b.ID] = true
 		blockers = append(blockers, b)
 	}
+	scopeResolvedIDs := []string{}
 	// Round two must explicitly resolve or retain EVERY prior blocker, including regressions.
 	if round.Number == 2 {
 		resolved := map[string]bool{}
@@ -567,12 +620,20 @@ func (s *Store) applyReviewConvergence(ctx context.Context, tx *sql.Tx, m api.Me
 		}
 		for id := range resolved {
 			old := prior[id]
-			if old.Criterion != "" && e.Body.Status[old.Criterion] != "pass" {
+			if old.Criterion != "" && sc.Criteria[old.Criterion] != roundCriteria(&state, state.Rounds[0])[old.Criterion] {
+				if strings.TrimSpace(meta.Fix) == "" || len(e.Evidence) == 0 {
+					return reviewConflict("removed criterion resolution needs scope-change reason and evidence")
+				}
+				scopeResolvedIDs = append(scopeResolvedIDs, id)
+			} else if old.Criterion != "" && e.Body.Status[old.Criterion] != "pass" {
 				return reviewConflict("resolved blocker criterion must pass")
 			}
 		}
 	}
 	for _, f := range findings {
+		if f.Criterion != "" && e.Body.Status[f.Criterion] != "fail" {
+			return reviewConflict("criterion finding must retain failed verdict; use exact focused verification")
+		}
 		if err = evidenceFinding(f, meta.Candidate, sc.Criteria, false); err != nil {
 			return err
 		}
@@ -597,13 +658,15 @@ func (s *Store) applyReviewConvergence(ctx context.Context, tx *sql.Tx, m api.Me
 			state.FollowUps = append(state.FollowUps, follow)
 		}
 	}
+	sort.Strings(scopeResolvedIDs)
 	round.ResultSeq = m.Seq
 	round.CompletedAt = ts(s.now())
 	round.Verdicts = e.Body.Status
 	round.Blockers = blockers
+	round.Findings = findings
 	// Explicit resolutions are durable even for regression blockers.
 	if round.Number == 2 && len(meta.BlockerIDs) > 0 {
-		state.Focused = append(state.Focused, api.FocusedReview{RequestSeq: round.RequestSeq, ResultSeq: m.Seq, Candidate: round.Candidate, Fix: "round two blocker verification", BlockerIDs: meta.BlockerIDs, ReviewerID: req.AgentID, ReviewerRun: req.RunID, Passed: true})
+		state.Focused = append(state.Focused, api.FocusedReview{RequestSeq: round.RequestSeq, ResultSeq: m.Seq, Candidate: round.Candidate, Fix: "round two blocker verification: " + meta.Fix, BlockerIDs: meta.BlockerIDs, ScopeResolvedIDs: scopeResolvedIDs, ReviewerID: req.AgentID, ReviewerRun: req.RunID, Passed: true})
 	}
 	return saveReviewState(ctx, tx, m.TaskID, state)
 }
@@ -691,4 +754,89 @@ func (s *Store) reassignReview(ctx context.Context, tx *sql.Tx, original api.Mes
 		}
 	}
 	return nil
+}
+
+func outstandingWithoutFocused(state api.ReviewConvergence) map[string]api.ReviewFinding {
+	state.Focused = nil
+	return outstanding(state)
+}
+
+// roundCriteria preserves the exact requested snapshot, even when the item has
+// been edited or historical scope revision numbers were never recorded.
+func roundCriteria(state *api.ReviewConvergence, r api.ReviewRound) map[string]string {
+	if len(r.Criteria) > 0 {
+		return r.Criteria
+	}
+	if sc := scopeFor(state, r.ScopeRevision); sc != nil {
+		return sc.Criteria
+	}
+	return nil
+}
+
+// Reconciliation reserves ALL immutable legacy typed requests, in source order.
+// Legacy verdicts are not guessed: the exact current reviewer reattests each
+// original candidate against its original criteria using the ordinary RESULT.
+func (s *Store) reconcileLegacyReviews(ctx context.Context, tx *sql.Tx, m api.Message, req api.PostMessageRequest, item api.WorkItem, state *api.ReviewConvergence) error {
+	meta := req.Envelope.Review
+	if err := reviewLead(ctx, tx, m.TaskID, item.ID, req.AgentID, req.RunID); err != nil {
+		return err
+	}
+	if state.History != "unknown" || len(state.Rounds) != 0 || scopeFor(state, item.ScopeRevision) == nil {
+		return reviewConflict("reconciliation requires assigned unknown legacy history")
+	}
+	if strings.TrimSpace(meta.Fix) == "" || len(req.Envelope.Evidence) == 0 {
+		return reviewConflict("legacy reconciliation needs source evidence and reason")
+	}
+	rows, err := tx.QueryContext(ctx, `SELECT DISTINCT m.seq FROM messages m JOIN message_work_item_links l ON l.message_seq=m.seq WHERE m.task_id=? AND l.item_task_id=? AND l.item_id=? AND m.seq<? AND json_valid(m.envelope) AND json_extract(m.envelope,'$.kind')='review' ORDER BY m.seq`, m.TaskID, item.TaskID, item.ID, m.Seq)
+	if err != nil {
+		return err
+	}
+	ids := []int64{}
+	for rows.Next() {
+		var id int64
+		if err = rows.Scan(&id); err != nil {
+			rows.Close()
+			return err
+		}
+		ids = append(ids, id)
+	}
+	err = rows.Err()
+	rows.Close()
+	if err != nil {
+		return err
+	}
+	if len(ids) == 0 || !reflect.DeepEqual(ids, meta.LegacyRequests) {
+		return reviewConflict("reconciliation must enumerate every native legacy review request in source order")
+	}
+	if len(ids) > 2 {
+		return reviewConflict("legacy lifetime count exceeds cap; no override or fresh rounds permitted")
+	}
+	for _, id := range ids {
+		source, err := loadMessage(tx, ctx, m.TaskID, id)
+		if err != nil {
+			return err
+		}
+		env := source.Envelope
+		if env == nil || !numberedCriteria(env.Body.Acceptance) || !validGitCommit(env.Body.Candidate) || source.To == "" {
+			return reviewConflict("legacy source lacks exact candidate, frozen criteria or reviewer; retain unknown history")
+		}
+		reviewer, err := scanAgent(tx.QueryRowContext(ctx, `SELECT `+agentCols+` FROM agents WHERE id=? AND task_id=?`, source.To, m.TaskID))
+		if err != nil || reviewer.RunID == "" || reviewer.Status == api.AgentClosed || reviewer.Status == api.AgentExited || reviewer.Status == api.AgentRetired {
+			return reviewConflict("legacy reattestation needs the original reviewer's current available run")
+		}
+		state.Rounds = append(state.Rounds, api.ReviewRound{Number: len(state.Rounds) + 1, RequestSeq: id, Candidate: env.Body.Candidate, Criteria: env.Body.Acceptance, ReviewerID: reviewer.ID, ReviewerRun: reviewer.RunID, StartedAt: ts(source.CreatedAt), ReconciliationSeq: m.Seq})
+	}
+	state.History = "recorded"
+	state.Reconciliations = append(state.Reconciliations, api.ReviewReconciliation{MessageSeq: m.Seq, Reason: meta.Fix, Requests: ids, AgentID: req.AgentID, RunID: req.RunID})
+	state.Disposition = nil
+	return saveReviewState(ctx, tx, m.TaskID, *state)
+}
+
+func scopeResolved(f api.FocusedReview, id string) bool {
+	for _, resolved := range f.ScopeResolvedIDs {
+		if resolved == id {
+			return true
+		}
+	}
+	return false
 }

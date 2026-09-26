@@ -4,6 +4,7 @@ package api
 // General reviews use REVIEW/RESULT; focused verification uses REQUEST/RESULT;
 // the lead records a disposition on a NOTICE. Unstructured history is unknown.
 type ReviewMetadata struct {
+	LegacyRequests     []int64         `json:"legacyRequests,omitempty"`
 	Mode               string          `json:"mode"`
 	Candidate          string          `json:"candidate,omitempty"`
 	Blockers           []ReviewFinding `json:"blockers,omitempty"`
@@ -37,18 +38,21 @@ type ReviewScope struct {
 }
 
 type ReviewRound struct {
-	ActiveRequestSeq int64             `json:"activeRequestSeq,omitempty"`
-	Number           int               `json:"number"`
-	ScopeRevision    int64             `json:"scopeRevision"`
-	RequestSeq       int64             `json:"requestSeq"`
-	ResultSeq        int64             `json:"resultSeq,omitempty"`
-	Candidate        string            `json:"candidate"`
-	ReviewerID       string            `json:"reviewerId"`
-	ReviewerRun      string            `json:"reviewerRun"`
-	StartedAt        string            `json:"startedAt"`
-	CompletedAt      string            `json:"completedAt,omitempty"`
-	Verdicts         map[string]string `json:"verdicts,omitempty"`
-	Blockers         []ReviewFinding   `json:"blockers,omitempty"`
+	Findings          []ReviewFinding   `json:"findings,omitempty"`
+	Criteria          map[string]string `json:"criteria,omitempty"`
+	ReconciliationSeq int64             `json:"reconciliationSeq,omitempty"`
+	ActiveRequestSeq  int64             `json:"activeRequestSeq,omitempty"`
+	Number            int               `json:"number"`
+	ScopeRevision     int64             `json:"scopeRevision"`
+	RequestSeq        int64             `json:"requestSeq"`
+	ResultSeq         int64             `json:"resultSeq,omitempty"`
+	Candidate         string            `json:"candidate"`
+	ReviewerID        string            `json:"reviewerId"`
+	ReviewerRun       string            `json:"reviewerRun"`
+	StartedAt         string            `json:"startedAt"`
+	CompletedAt       string            `json:"completedAt,omitempty"`
+	Verdicts          map[string]string `json:"verdicts,omitempty"`
+	Blockers          []ReviewFinding   `json:"blockers,omitempty"`
 }
 
 type ReviewFollowUp struct {
@@ -58,6 +62,7 @@ type ReviewFollowUp struct {
 }
 
 type FocusedReview struct {
+	ScopeResolvedIDs   []string `json:"scopeResolvedIds,omitempty"`
 	ActiveRequestSeq   int64    `json:"activeRequestSeq,omitempty"`
 	RequestSeq         int64    `json:"requestSeq"`
 	ResultSeq          int64    `json:"resultSeq,omitempty"`
@@ -78,13 +83,22 @@ type ReviewDisposition struct {
 	RunID      string `json:"runId"`
 }
 
+type ReviewReconciliation struct {
+	MessageSeq int64   `json:"messageSeq"`
+	Reason     string  `json:"reason"`
+	Requests   []int64 `json:"requests"`
+	AgentID    string  `json:"agentId"`
+	RunID      string  `json:"runId"`
+}
+
 type ReviewConvergence struct {
-	Dispositions []ReviewDisposition `json:"dispositions,omitempty"`
-	ItemID       string              `json:"itemId"`
-	History      string              `json:"history"` // recorded or unknown; never inferred zero
-	Scopes       []ReviewScope       `json:"scopes"`
-	Rounds       []ReviewRound       `json:"rounds"`
-	FollowUps    []ReviewFollowUp    `json:"followUps"`
-	Focused      []FocusedReview     `json:"focused"`
-	Disposition  *ReviewDisposition  `json:"disposition,omitempty"`
+	Reconciliations []ReviewReconciliation `json:"reconciliations,omitempty"`
+	Dispositions    []ReviewDisposition    `json:"dispositions,omitempty"`
+	ItemID          string                 `json:"itemId"`
+	History         string                 `json:"history"` // recorded or unknown; never inferred zero
+	Scopes          []ReviewScope          `json:"scopes"`
+	Rounds          []ReviewRound          `json:"rounds"`
+	FollowUps       []ReviewFollowUp       `json:"followUps"`
+	Focused         []FocusedReview        `json:"focused"`
+	Disposition     *ReviewDisposition     `json:"disposition,omitempty"`
 }
