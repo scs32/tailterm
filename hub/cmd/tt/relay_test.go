@@ -198,7 +198,7 @@ func TestRelayClearsErrorOnOtherSuccessfulPaths(t *testing.T) {
 					}
 					reports.Add(1)
 					_, _ = w.Write([]byte(`{}`))
-				case strings.Contains(r.URL.Path, "/agents/") && path != "paused":
+				case strings.Contains(r.URL.Path, "/agents/"):
 					_ = json.NewEncoder(w).Encode(api.Agent{ID: b.Agent, RunID: b.Run, Status: api.AgentDone, Online: path != "inactive", Unread: 0})
 				default:
 					t.Errorf("unexpected test hub request: %s %s", r.Method, r.URL.Path)
@@ -240,6 +240,61 @@ func TestRelayClearsErrorOnOtherSuccessfulPaths(t *testing.T) {
 				t.Fatalf("%s unexpectedly queued: %q err=%v reports=%d", path, queueData, err, reports.Load())
 			}
 		})
+	}
+}
+
+func TestRelayActivityFailureLeavesQueueAndInboxDeliveryWorking(t *testing.T) {
+	stateDir := t.TempDir()
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("TAILTERM_RELAY_STATE", stateDir)
+	t.Setenv("TT_TMUX_SOCKET", "relay-activity-isolation-"+strconv.FormatInt(time.Now().UnixNano(), 10))
+	t.Setenv("TAILTERM_TOKEN", "")
+	t.Setenv("TAILTERM_TASK", "")
+	t.Setenv("TAILTERM_AGENT", "")
+	t.Setenv("TAILTERM_RUN", "")
+	queueLog := filepath.Join(stateDir, "queue.log")
+	t.Setenv("TT_FAKE_QUEUE_LOG", queueLog)
+	queuePath := filepath.Join(stateDir, "fake-codex")
+	if err := os.WriteFile(queuePath, []byte("#!/bin/sh\nprintf 'queued\\n' >> \"$TT_FAKE_QUEUE_LOG\"\nprintf 'Queued message\\n'\n"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	b := runtimeBinding{Task: "tsk_0000000000000001", Agent: "agt_0000000000000001", Run: "run_0000000000000001", Thread: "00000000-0000-4000-8000-000000000001", Codex: queuePath, CreatedAt: time.Now().UTC()}
+	var teamTicks, agentReads atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.URL.Path == "/v1/team-queues":
+			teamTicks.Add(1)
+			_, _ = w.Write([]byte(`{"entries":[]}`))
+		case strings.HasSuffix(r.URL.Path, "/pause"):
+			_ = json.NewEncoder(w).Encode(api.ProjectPauseStatus{State: api.ProjectPauseActive})
+		case strings.HasSuffix(r.URL.Path, "/wake-jobs/lease"):
+			http.NotFound(w, r)
+		case strings.HasSuffix(r.URL.Path, "/messages"):
+			_ = json.NewEncoder(w).Encode(api.MessageList{Messages: []api.Message{{Seq: 1, To: b.Agent, From: api.Sender{Node: "fixture", User: "owner"}, Text: "synthetic"}}})
+		case strings.Contains(r.URL.Path, "/agents/"):
+			if agentReads.Add(1) > 3 {
+				http.Error(w, "synthetic observer failure", http.StatusServiceUnavailable)
+				return
+			}
+			_ = json.NewEncoder(w).Encode(api.Agent{ID: b.Agent, RunID: b.Run, Status: api.AgentRunning, Online: true, Unread: 1})
+		default:
+			t.Errorf("unexpected test hub request %s %s", r.Method, r.URL.Path)
+			http.Error(w, "unexpected", http.StatusInternalServerError)
+		}
+	}))
+	defer server.Close()
+	b.Hub = server.URL
+	t.Setenv("TAILTERM_HUB", server.URL)
+	if err := writePrivateJSON(filepath.Join(stateDir, bindingKey(b)+".binding.json"), b); err != nil {
+		t.Fatal(err)
+	}
+	stderr, err := captureRelayOutput(t, true, func() error { return cmdRelay([]string{"--once"}) })
+	if err != nil || !strings.Contains(stderr, "activity:") || teamTicks.Load() != 1 || agentReads.Load() < 4 {
+		t.Fatalf("relay isolation: ticks=%d reads=%d stderr=%q err=%v", teamTicks.Load(), agentReads.Load(), stderr, err)
+	}
+	if data, err := os.ReadFile(queueLog); err != nil || !strings.Contains(string(data), "queued") {
+		t.Fatalf("inbox delivery lost: %q %v stderr=%q", data, err, stderr)
 	}
 }
 

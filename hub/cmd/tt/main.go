@@ -1177,7 +1177,7 @@ func cmdSpawn(e env, args []string) error {
 	}
 	if agent.Runtime == "claude" {
 		if err := bindClaudeRuntime(*hub, *task, agent); err != nil {
-			fmt.Fprintln(os.Stderr, "[tt] Claude activity binding will retry:", err)
+			fmt.Fprintln(os.Stderr, "[tt] Claude activity binding pending; host relay will retry exact local session:", err)
 		}
 	}
 	// The relay also adopts already-running sessions.

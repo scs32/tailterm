@@ -38,18 +38,21 @@ type pendingActivityCall struct {
 	WaitUntil time.Time `json:"waitUntil,omitempty"`
 }
 type completedActivityCall struct {
-	Signature string    `json:"signature"`
-	At        time.Time `json:"at"`
-	Tokens    int64     `json:"tokens"`
-	Worktree  string    `json:"worktree"`
+	Signature   string    `json:"signature"`
+	At          time.Time `json:"at"`
+	Tokens      int64     `json:"tokens"`
+	Worktree    string    `json:"worktree"`
+	PlannedWait bool      `json:"plannedWait,omitempty"`
 }
 type activityCursor struct {
 	Run               string                         `json:"run"`
 	Thread            string                         `json:"thread"`
 	Path              string                         `json:"path"`
+	LastDiscovery     time.Time                      `json:"lastDiscovery,omitempty"`
 	FileID            uint64                         `json:"fileId"`
 	Offset            int64                          `json:"offset"`
 	Partial           string                         `json:"partial,omitempty"`
+	Skipping          bool                           `json:"skipping,omitempty"`
 	LastEventAt       time.Time                      `json:"lastEventAt"`
 	TurnComplete      bool                           `json:"turnComplete"`
 	SeenTurn          bool                           `json:"seenTurn"`
@@ -67,6 +70,8 @@ type activityCursor struct {
 	Transition        int64                          `json:"transition,omitempty"`
 	PendingReport     *api.ActivityReport            `json:"pendingReport,omitempty"`
 	LastReportAttempt time.Time                      `json:"lastReportAttempt,omitempty"`
+	RejectedState     string                         `json:"rejectedState,omitempty"`
+	Ineligible        bool                           `json:"ineligible,omitempty"`
 }
 
 type activityThresholds struct {
@@ -148,9 +153,10 @@ func readActivityAppend(path string, c *activityCursor, parse func([]byte, *acti
 	}
 	id := fileIdentity(info)
 	if c.Path != path || c.FileID != id || info.Size() < c.Offset {
-		c.Path, c.FileID, c.Offset, c.Partial = path, id, 0, ""
+		c.Path, c.FileID, c.Offset, c.Partial, c.Skipping = path, id, 0, "", false
 		c.Pending = map[string]pendingActivityCall{}
 		c.Completed = nil
+		c.SeenTurn, c.TurnComplete = false, false
 		if c.ClaudeUsage == nil {
 			c.ClaudeUsage = map[string]api.TokenTotals{}
 		}
@@ -167,15 +173,40 @@ func readActivityAppend(path string, c *activityCursor, parse func([]byte, *acti
 	for {
 		line, readErr := reader.ReadBytes('\n')
 		c.Offset += int64(len(line))
+		if c.Skipping {
+			if len(line) > 0 && line[len(line)-1] == '\n' {
+				c.Skipping = false
+			}
+			if readErr == io.EOF {
+				return nil
+			}
+			if readErr != nil {
+				return readErr
+			}
+			continue
+		}
 		if len(c.Partial)+len(line) > maxActivityLine {
-			c.Unknown = true
+			if !c.SeenTurn {
+				c.Unknown = true
+			}
 			c.Partial = ""
-			return errors.New("oversized activity record")
+			c.Skipping = len(line) == 0 || line[len(line)-1] != '\n'
+			if readErr == io.EOF {
+				return nil
+			}
+			if readErr != nil {
+				return readErr
+			}
+			continue
 		}
 		c.Partial += string(line)
 		if len(line) > 0 && line[len(line)-1] == '\n' {
 			if err := parse([]byte(strings.TrimSpace(c.Partial)), c); err != nil {
-				c.Unknown = true
+				if !c.SeenTurn {
+					c.Unknown = true
+				}
+			} else if c.SeenTurn {
+				c.Unknown = false
 			}
 			c.Partial = ""
 		}
@@ -233,7 +264,7 @@ func explicitWait(args json.RawMessage, now time.Time) time.Time {
 		return time.Time{}
 	}
 	var maxMS int64
-	for _, name := range []string{"yield_time_ms", "timeout_ms", "duration_ms"} {
+	for _, name := range []string{"yield_time_ms", "timeout_ms", "duration_ms", "timeout"} {
 		if n := activityInt(args, name); n > maxMS {
 			maxMS = n
 		}
@@ -250,7 +281,7 @@ func finishActivityCall(c *activityCursor, id string, now time.Time) {
 		return
 	}
 	delete(c.Pending, id)
-	c.Completed = append(c.Completed, completedActivityCall{call.Signature, now, c.Tokens.Total, c.Worktree})
+	c.Completed = append(c.Completed, completedActivityCall{Signature: call.Signature, At: now, Tokens: c.Tokens.Total, Worktree: c.Worktree, PlannedWait: call.WaitUntil.Sub(call.Since) >= time.Minute || now.Sub(call.Since) >= time.Minute})
 	if len(c.Completed) > 32 {
 		c.Completed = c.Completed[len(c.Completed)-32:]
 	}
@@ -271,6 +302,7 @@ func parseCodexActivity(line []byte, c *activityCursor) error {
 		Name      string          `json:"name"`
 		CallID    string          `json:"call_id"`
 		Arguments json.RawMessage `json:"arguments"`
+		Input     json.RawMessage `json:"input"`
 		Info      struct {
 			Total json.RawMessage `json:"total_token_usage"`
 		} `json:"info"`
@@ -278,7 +310,12 @@ func parseCodexActivity(line []byte, c *activityCursor) error {
 	_ = json.Unmarshal(rec.Payload, &p)
 	switch rec.Type {
 	case "event_msg":
-		if p.Type == "token_count" {
+		switch p.Type {
+		case "task_started":
+			c.SeenTurn, c.TurnComplete = true, false
+		case "task_complete":
+			c.SeenTurn, c.TurnComplete = true, true
+		case "token_count":
 			u := p.Info.Total
 			c.Tokens = api.TokenTotals{Input: activityInt(u, "input_tokens"), Cached: activityInt(u, "cached_input_tokens"), CacheWrite: activityInt(u, "cache_write_tokens"), Output: activityInt(u, "output_tokens"), Reasoning: activityInt(u, "reasoning_output_tokens"), Total: activityInt(u, "total_tokens")}
 			if c.Tokens.Total == 0 {
@@ -294,7 +331,11 @@ func parseCodexActivity(line []byte, c *activityCursor) error {
 			if c.Pending == nil {
 				c.Pending = map[string]pendingActivityCall{}
 			}
-			c.Pending[p.CallID] = pendingActivityCall{Name: safeActivityToolName(p.Name), Since: now, Signature: activitySignature(p.Name, p.Arguments), WaitUntil: explicitWait(p.Arguments, now)}
+			args := p.Arguments
+			if p.Type == "custom_tool_call" {
+				args = p.Input
+			}
+			c.Pending[p.CallID] = pendingActivityCall{Name: safeActivityToolName(p.Name), Since: now, Signature: activitySignature(p.Name, args), WaitUntil: explicitWait(args, now)}
 		case "function_call_output", "custom_tool_call_output":
 			finishActivityCall(c, p.CallID, now)
 		}

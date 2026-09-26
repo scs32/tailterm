@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -19,6 +20,25 @@ import (
 
 type activityProbe func(api.Agent) (tmuxAlive, processAlive bool, err error)
 
+type activityWorktreeContextKey struct{}
+type activityWorktreeResult struct {
+	signature string
+	err       error
+}
+type activityWorktreeCache map[string]activityWorktreeResult
+
+func cachedActivityWorktree(ctx context.Context, cwd string) (string, error) {
+	if cache, ok := ctx.Value(activityWorktreeContextKey{}).(activityWorktreeCache); ok {
+		if result, found := cache[cwd]; found {
+			return result.signature, result.err
+		}
+		signature, err := activityWorktree(cwd)
+		cache[cwd] = activityWorktreeResult{signature, err}
+		return signature, err
+	}
+	return activityWorktree(cwd)
+}
+
 func activityProbeNative(a api.Agent) (bool, bool, error) {
 	if a.Session == "" {
 		return false, false, errors.New("agent has no tmux session")
@@ -27,23 +47,26 @@ func activityProbeNative(a api.Agent) (bool, bool, error) {
 	if err != nil {
 		return false, false, err
 	}
-	// tt wrap sends a heartbeat every 30 seconds while its runtime child is
-	// alive. The hub's 90-second online window is the process probe; tmux
-	// presence alone would mistake the wrapper's post-exit shell for a runtime.
-	return tmuxAlive, tmuxAlive && a.Online, nil
+	// A missing hub heartbeat does not establish local process absence. When
+	// tmux is still present, the runtime status is uncertain until the wrapper
+	// reports exit or the heartbeat returns.
+	if tmuxAlive && !a.Online {
+		return true, false, errors.New("runtime liveness unconfirmed")
+	}
+	return tmuxAlive, tmuxAlive, nil
 }
 
 func activityWorktree(cwd string) (string, error) {
 	if cwd == "" || !filepath.IsAbs(cwd) {
 		return "", nil
 	}
-	out, err := exec.Command("git", "-C", cwd, "status", "--porcelain=v1", "--untracked-files=normal").Output()
+	out, err := exec.Command("git", "--no-optional-locks", "-C", cwd, "status", "--porcelain=v1", "--untracked-files=normal").Output()
 	if err != nil {
 		return "", err
 	}
 	h := sha256.New()
 	h.Write(out)
-	if head, headErr := exec.Command("git", "-C", cwd, "rev-parse", "HEAD").Output(); headErr == nil {
+	if head, headErr := exec.Command("git", "--no-optional-locks", "-C", cwd, "rev-parse", "HEAD").Output(); headErr == nil {
 		h.Write(head)
 	}
 	// File metadata catches edits to an already modified file without retaining
@@ -73,6 +96,7 @@ func oldestPending(c *activityCursor) pendingActivityCall {
 func activityState(c *activityCursor, a api.Agent, openObligations int, tmuxAlive, processAlive bool, probeErr error, now time.Time, threshold activityThresholds) api.AgentActivity {
 	result := api.AgentActivity{State: "unknown", ObservedAt: now, LastEventAt: c.LastEventAt, Tokens: c.Tokens}
 	if probeErr != nil {
+		c.MissingSince = time.Time{}
 		result.Reason = "process probe unavailable"
 		return result
 	}
@@ -121,8 +145,8 @@ func activityState(c *activityCursor, a api.Agent, openObligations int, tmuxAliv
 		if c.Worktree != "" && len(c.Completed) >= threshold.LoopCalls {
 			recent := c.Completed[len(c.Completed)-threshold.LoopCalls:]
 			loop := now.Sub(recent[0].At) >= threshold.Loop && recent[len(recent)-1].Tokens > recent[0].Tokens
-			for _, call := range recent[1:] {
-				if call.Signature != recent[0].Signature || call.Worktree != recent[0].Worktree {
+			for _, call := range recent {
+				if call.PlannedWait || call.Signature != recent[0].Signature || call.Worktree != recent[0].Worktree {
 					loop = false
 					break
 				}
@@ -167,6 +191,9 @@ func relayActivityTick(ctx context.Context, b runtimeBinding, client *api.Client
 		c = activityCursor{Run: b.Run, Thread: b.Thread}
 	}
 	save := func() error { return writePrivateJSON(path, c) }
+	if c.Ineligible {
+		return nil
+	}
 	if c.PendingReport != nil {
 		if !c.LastReportAttempt.IsZero() && now.Sub(c.LastReportAttempt) < 15*time.Second {
 			return nil
@@ -176,20 +203,51 @@ func relayActivityTick(ctx context.Context, b runtimeBinding, client *api.Client
 			return err
 		}
 		if _, err := client.ReportActivity(ctx, b.Task, b.Agent, *c.PendingReport); err != nil {
-			return err
-		}
-		c.LastState = c.PendingReport.Activity.State
-		c.PendingReport = nil
-		if err := save(); err != nil {
-			return err
+			var httpErr *api.HTTPError
+			if !errors.As(err, &httpErr) || httpErr.Status != http.StatusConflict {
+				return err
+			}
+			c.RejectedState = c.PendingReport.Activity.State
+			c.PendingReport = nil
+			if err := save(); err != nil {
+				return err
+			}
+		} else {
+			c.LastState = c.PendingReport.Activity.State
+			c.PendingReport = nil
+			if err := save(); err != nil {
+				return err
+			}
 		}
 	}
 	if !c.LastCheck.IsZero() && now.Sub(c.LastCheck) < 15*time.Second {
 		return nil
 	}
 	c.LastCheck = now
-	transcript, err := activityTranscript(b)
+	a, err := client.GetAgent(ctx, b.Task, b.Agent)
 	if err != nil {
+		_ = save()
+		return err
+	}
+	if a.RunID != b.Run || a.Status == api.AgentClosed || a.Status == api.AgentExited {
+		c.Ineligible = true
+		return save()
+	}
+	if a.Status == api.AgentRetired {
+		return save()
+	}
+	transcript := c.Path
+	var transcriptErr error
+	if transcript != "" {
+		if _, statErr := os.Stat(transcript); statErr != nil {
+			transcript = ""
+		}
+	}
+	if transcript == "" || now.Sub(c.LastDiscovery) >= time.Minute {
+		transcript, transcriptErr = activityTranscript(b)
+		c.LastDiscovery = now
+	}
+	if transcriptErr != nil {
 		c.Unknown = true
 	}
 	if transcript == "" && b.CreatedAt.IsZero() && !c.SeenTurn {
@@ -214,19 +272,11 @@ func relayActivityTick(ctx context.Context, b runtimeBinding, client *api.Client
 			c.Unknown = true
 		}
 	}
-	if signature, err := activityWorktree(b.Cwd); err == nil && signature != "" {
+	if signature, err := cachedActivityWorktree(ctx, b.Cwd); err == nil && signature != "" {
 		if c.Worktree != "" && c.Worktree != signature {
 			c.WorktreeChangedAt = now
 		}
 		c.Worktree = signature
-	}
-	a, err := client.GetAgent(ctx, b.Task, b.Agent)
-	if err != nil {
-		_ = save()
-		return err
-	}
-	if a.RunID != b.Run || a.Status == api.AgentClosed || a.Status == api.AgentExited || a.Status == api.AgentRetired {
-		return save()
 	}
 	open := 0
 	if c.TurnComplete {
@@ -239,9 +289,10 @@ func relayActivityTick(ctx context.Context, b runtimeBinding, client *api.Client
 	}
 	tmuxAlive, processAlive, probeErr := probe(a)
 	state := activityState(&c, a, open, tmuxAlive, processAlive, probeErr, now, activityDefaults())
-	if state.State == c.LastState {
+	if state.State == c.LastState || state.State == c.RejectedState {
 		return save()
 	}
+	c.RejectedState = ""
 	c.Transition++
 	c.PendingReport = &api.ActivityReport{RequestID: activityRequestID(b, c.Transition), RunID: b.Run, Activity: state}
 	c.LastReportAttempt = now
@@ -249,7 +300,13 @@ func relayActivityTick(ctx context.Context, b runtimeBinding, client *api.Client
 		return err
 	}
 	if _, err := client.ReportActivity(ctx, b.Task, b.Agent, *c.PendingReport); err != nil {
-		return err
+		var httpErr *api.HTTPError
+		if !errors.As(err, &httpErr) || httpErr.Status != http.StatusConflict {
+			return err
+		}
+		c.RejectedState = state.State
+		c.PendingReport = nil
+		return save()
 	}
 	c.LastState = state.State
 	c.PendingReport = nil

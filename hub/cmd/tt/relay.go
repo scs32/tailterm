@@ -94,7 +94,7 @@ func writePrivateJSON(path string, v any) error {
 func validBinding(b runtimeBinding) bool {
 	base := api.ValidID(b.Task, "tsk") && api.ValidID(b.Agent, "agt") && runIDPattern.MatchString(b.Run) && threadIDPattern.MatchString(b.Thread) && b.Hub != ""
 	if b.Runtime == "claude" {
-		return base && b.Session != "" && filepath.IsAbs(b.Cwd)
+		return base && b.Session != "" && (b.Cwd == "" || filepath.IsAbs(b.Cwd))
 	}
 	return base && filepath.IsAbs(b.Codex)
 }
@@ -172,11 +172,42 @@ func bindClaudeRuntime(hub, task string, a api.Agent) error {
 	if err != nil {
 		return err
 	}
-	b := runtimeBinding{Hub: hub, Task: task, Agent: a.ID, Run: a.RunID, Thread: id, Runtime: "claude", Session: a.Session, Cwd: a.Cwd, CreatedAt: time.Now().UTC()}
+	cwd := a.Cwd
+	if cwd != "" && !filepath.IsAbs(cwd) {
+		// A relative path is relative to the launcher, not necessarily to the
+		// relay. Omit its worktree probe rather than fingerprinting the wrong tree.
+		cwd = ""
+	}
+	b := runtimeBinding{Hub: hub, Task: task, Agent: a.ID, Run: a.RunID, Thread: id, Runtime: "claude", Session: a.Session, Cwd: cwd, CreatedAt: time.Now().UTC()}
 	if !validBinding(b) {
 		return errors.New("invalid Claude activity binding")
 	}
 	return writePrivateJSON(filepath.Join(relayDir(), bindingKey(b)+".binding.json"), b)
+}
+
+// retryClaudeBinding adopts only a locally verified session with the exact
+// hub agent/run identity. It cannot accidentally attach a recycled name.
+func retryClaudeBinding(ctx context.Context, s ownedSession, client *api.Client) error {
+	if !s.valid() {
+		return errors.New("invalid local session identity")
+	}
+	a, err := client.GetAgent(ctx, s.Task, s.Agent)
+	if err != nil {
+		return err
+	}
+	if a.RunID != s.Run || a.Session != s.Name || a.Runtime != "claude" || a.Status == api.AgentClosed || a.Status == api.AgentExited || a.Status == api.AgentRetired {
+		return errors.New("local session does not match an open Claude run")
+	}
+	return bindClaudeRuntime(s.Hub, s.Task, a)
+}
+
+func runActivitySafely(tick func() error) (err error) {
+	defer func() {
+		if recover() != nil {
+			err = errors.New("activity observer panic")
+		}
+	}()
+	return tick()
 }
 func wakeThrough(messages []api.Message, agent string) (through int64, eligible bool) {
 	for _, m := range messages {
@@ -458,6 +489,8 @@ func cmdRelay(args []string) error {
 		defer syscall.Flock(int(lock.Fd()), syscall.LOCK_UN)
 	}
 	var queueBackoff teamQueuePollBackoff
+	var lastClaudeRetry time.Time
+	var claudeRetryCursor int
 	for {
 		if !*status {
 			relayCleanup()
@@ -471,8 +504,35 @@ func cmdRelay(args []string) error {
 				}
 			}
 			cancel()
+			if time.Since(lastClaudeRetry) >= 15*time.Second {
+				lastClaudeRetry = time.Now()
+				retryCtx, stopRetry := context.WithTimeout(context.Background(), 3*time.Second)
+				if sessions, sessionErr := localSessions(retryCtx); sessionErr == nil && len(sessions) > 0 {
+					for scanned := 0; scanned < len(sessions); scanned++ {
+						s := sessions[(claudeRetryCursor+scanned)%len(sessions)]
+						if !s.valid() {
+							continue
+						}
+						bindingPath := filepath.Join(dir, bindingKey(runtimeBinding{Hub: s.Hub, Agent: s.Agent})+".binding.json")
+						if data, readErr := os.ReadFile(bindingPath); readErr == nil {
+							var current runtimeBinding
+							if json.Unmarshal(data, &current) == nil && current.Run == s.Run && current.Session == s.Name && validBinding(current) {
+								continue
+							}
+						}
+						claudeRetryCursor = (claudeRetryCursor + scanned + 1) % len(sessions)
+						if c, clientErr := api.NewClient(s.Hub, 3*time.Second); clientErr == nil {
+							attachRelayBudget(c, activeRelayBudget)
+							_ = retryClaudeBinding(retryCtx, s, c)
+						}
+						break
+					}
+				}
+				stopRetry()
+			}
 		}
 		paths, _ := filepath.Glob(filepath.Join(dir, "*.binding.json"))
+		worktreeCache := activityWorktreeCache{}
 		for _, path := range paths {
 			data, err := os.ReadFile(path)
 			if err != nil {
@@ -511,8 +571,8 @@ func cmdRelay(args []string) error {
 				cancel()
 				// Host observation runs after delivery, using the same host budget.
 				// A slow or drifting transcript never delays a broker or inbox turn.
-				activityCtx, stopActivity := context.WithTimeout(context.Background(), 5*time.Second)
-				if activityErr := relayActivityTick(activityCtx, b, c, now, activityProbeNative); activityErr != nil {
+				activityCtx, stopActivity := context.WithTimeout(context.WithValue(context.Background(), activityWorktreeContextKey{}, worktreeCache), 5*time.Second)
+				if activityErr := runActivitySafely(func() error { return relayActivityTick(activityCtx, b, c, now, activityProbeNative) }); activityErr != nil {
 					fmt.Fprintf(os.Stderr, "[tt relay] %s activity: %v\n", b.Agent, activityErr)
 				}
 				stopActivity()
