@@ -246,6 +246,7 @@ func relayActivityTick(ctx context.Context, b runtimeBinding, client *api.Client
 		c.Unknown = true
 		c.MissingTranscript = true
 	}
+	var transcriptReadErr error
 	if transcript != "" {
 		if c.MissingTranscript {
 			c.Unknown = false
@@ -255,33 +256,48 @@ func relayActivityTick(ctx context.Context, b runtimeBinding, client *api.Client
 		if b.Runtime == "claude" {
 			parse = parseClaudeActivity
 		}
-		if err := readActivityAppend(transcript, &c, parse); err != nil {
+		transcriptReadErr = readActivityAppend(transcript, &c, parse)
+		if transcriptReadErr != nil {
 			c.Unknown = true
 			c.Ready = false
 		}
-		if !c.Ready {
-			// Catch up across bounded passes without freezing a stale first snapshot.
-			// Pending reports above keep their original replay identity.
-			return save()
-		}
-	}
-	if signature, err := cachedActivityWorktree(ctx, b.Cwd); err == nil && signature != "" {
-		if c.Worktree != "" && c.Worktree != signature {
-			c.WorktreeChangedAt = now
-		}
-		c.Worktree = signature
-	}
-	open := 0
-	if c.TurnComplete {
-		obligations, listErr := client.ListObligations(ctx, b.Task, b.Agent, "", true, false)
-		if listErr != nil {
-			_ = save()
-			return listErr
-		}
-		open = len(obligations)
 	}
 	tmuxAlive, processAlive, probeErr := probe(b, a)
-	state := activityState(&c, a, open, tmuxAlive, processAlive, probeErr, now, activityDefaults())
+	var state api.AgentActivity
+	if transcript != "" && !c.Ready {
+		if transcriptReadErr == nil && probeErr == nil && tmuxAlive && processAlive {
+			// A healthy writer may still finish its tail. Continue bounded catch-up
+			// without publishing partial transcript data, but reset crash continuity.
+			c.MissingSince = time.Time{}
+			return save()
+		}
+		// Runtime health does not depend on transcript readability. Preserve the
+		// two-probe rule using a health-only cursor: no stale timestamps or totals
+		// escape while bootstrap, a partial tail, or a read failure blocks parsing.
+		health := activityCursor{Unknown: true, MissingSince: c.MissingSince}
+		state = activityState(&health, a, 0, tmuxAlive, processAlive, probeErr, now, activityDefaults())
+		c.MissingSince = health.MissingSince
+		if transcriptReadErr != nil && state.Reason == "unrecognized transcript format" {
+			state.Reason = "transcript read unavailable"
+		}
+	} else {
+		if signature, err := cachedActivityWorktree(ctx, b.Cwd); err == nil && signature != "" {
+			if c.Worktree != "" && c.Worktree != signature {
+				c.WorktreeChangedAt = now
+			}
+			c.Worktree = signature
+		}
+		open := 0
+		if c.TurnComplete {
+			obligations, listErr := client.ListObligations(ctx, b.Task, b.Agent, "", true, false)
+			if listErr != nil {
+				_ = save()
+				return listErr
+			}
+			open = len(obligations)
+		}
+		state = activityState(&c, a, open, tmuxAlive, processAlive, probeErr, now, activityDefaults())
+	}
 	if state.State == c.LastState || state.State == c.RejectedState {
 		return save()
 	}

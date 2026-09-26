@@ -676,3 +676,82 @@ func TestActivityReaderReadinessResetsAtObservedEnd(t *testing.T) {
 		t.Fatalf("path reset %+v %v", c, err)
 	}
 }
+
+func TestActivityIncompleteOrUnreadableTranscriptReportsHealth(t *testing.T) {
+	for _, mode := range []string{"partial-dead", "unreadable-dead", "unreadable-alive", "partial-probe-error", "partial-dead-alive-dead"} {
+		t.Run(mode, func(t *testing.T) {
+			home := t.TempDir()
+			t.Setenv("HOME", home)
+			t.Setenv("CODEX_HOME", home)
+			t.Setenv("TAILTERM_RELAY_STATE", filepath.Join(home, "state"))
+			thread := "12345678-1234-1234-1234-123456789abc"
+			dir := filepath.Join(home, ".codex", "sessions", "2026", "09", "25")
+			if err := os.MkdirAll(dir, 0700); err != nil {
+				t.Fatal(err)
+			}
+			path := filepath.Join(dir, "rollout-test-"+thread+".jsonl")
+			data := `{"type":"task_started","timestamp":"2026-09-25T20:00:00Z"}` + "\n" + `{"type":"event_msg","timestamp":"2026-09-25T20:00:30Z","payload":{"type":"tok`
+			if strings.HasPrefix(mode, "unreadable") {
+				// A directory stats/discovers like a transcript but deterministically fails
+				// ReadBytes with EISDIR, even when tests run as root.
+				if err := os.Mkdir(path, 0700); err != nil {
+					t.Fatal(err)
+				}
+			} else if err := os.WriteFile(path, []byte(data), 0600); err != nil {
+				t.Fatal(err)
+			}
+			var reports []api.ActivityReport
+			hub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Method == "GET" {
+					json.NewEncoder(w).Encode(api.Agent{RunID: "run_0123456789abcdef", Status: api.AgentRunning})
+					return
+				}
+				var report api.ActivityReport
+				if err := json.NewDecoder(r.Body).Decode(&report); err != nil {
+					t.Error(err)
+				}
+				reports = append(reports, report)
+				json.NewEncoder(w).Encode(report.Activity)
+			}))
+			defer hub.Close()
+			client, _ := api.NewClient(hub.URL, time.Second)
+			b := runtimeBinding{Hub: hub.URL, Task: "tsk_0123456789abcdef", Agent: "agt_0123456789abcdef", Run: "run_0123456789abcdef", Thread: thread, Runtime: "codex"}
+			now := time.Date(2026, 9, 25, 20, 1, 0, 0, time.UTC)
+			probes := 0
+			probe := func(runtimeBinding, api.Agent) (bool, bool, error) {
+				probes++
+				if mode == "partial-probe-error" {
+					return true, false, fmt.Errorf("synthetic permission")
+				}
+				return true, mode == "unreadable-alive" || (mode == "partial-dead-alive-dead" && probes == 2), nil
+			}
+			for pass := 0; pass < 4; pass++ {
+				if err := relayActivityTick(context.Background(), b, client, now.Add(time.Duration(pass)*16*time.Second), probe); err != nil {
+					t.Fatal(err)
+				}
+			}
+			want := "crashed"
+			if mode == "unreadable-alive" || mode == "partial-probe-error" {
+				want = "unknown"
+			}
+			if probes != 4 || len(reports) == 0 || reports[len(reports)-1].Activity.State != want {
+				t.Fatalf("suppressed health: probes=%d reports=%+v", probes, reports)
+			}
+			if reports[0].Activity.State != "unknown" {
+				t.Fatal("two-probe rule lost")
+			}
+			crashAt := now.Add(16 * time.Second)
+			if mode == "partial-dead-alive-dead" {
+				crashAt = now.Add(48 * time.Second)
+			}
+			if want == "crashed" && (len(reports) != 2 || reports[1].Activity.ObservedAt != crashAt) {
+				t.Fatalf("crash timing: %+v", reports)
+			}
+			for _, r := range reports {
+				if !r.Activity.LastEventAt.IsZero() || r.Activity.Tokens != (api.TokenTotals{}) {
+					t.Fatalf("incomplete transcript data published: %+v", r)
+				}
+			}
+		})
+	}
+}
