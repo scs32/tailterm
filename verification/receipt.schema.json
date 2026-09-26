@@ -75,7 +75,10 @@
       "type": "array",
       "items": {
         "type": "object",
-        "required": ["path", "sha256"],
+        "required": [
+          "path",
+          "sha256"
+        ],
         "properties": {
           "path": {
             "type": "string"
@@ -147,6 +150,17 @@
           "logDigest": {
             "type": "string",
             "pattern": "^[a-f0-9]{64}$"
+          },
+          "failureReason": {
+            "type": "string",
+            "enum": [
+              "timeout",
+              "port-conflict",
+              "port-inspection",
+              "spawn",
+              "exit",
+              "output-limit"
+            ]
           }
         },
         "additionalProperties": false
@@ -154,7 +168,9 @@
     },
     "aiv": {
       "type": "object",
-      "required": ["state"],
+      "required": [
+        "state"
+      ],
       "properties": {
         "state": {
           "const": "unsubmitted"

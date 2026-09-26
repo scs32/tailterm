@@ -63,8 +63,18 @@ export function selectChecks(matrix, owned, changed, candidatePackages) {
     for (const r of matches) for (const g of r.groups) groups.add(g);
   }
   const checks = [];
-  const add = (id, argv, cwd = ".", environment = {}) =>
-    checks.push({ id, argv, cwd, environment });
+  const add = (id, argv, cwd = ".", environment = {}) => {
+    const timeout =
+      matrix.checkTimeoutMs?.[id] ?? matrix.defaultTimeoutMs ?? 600000;
+    if (!Number.isSafeInteger(timeout) || timeout <= 0 || timeout > 1800000)
+      throw new Error("Invalid matrix check timeout: " + id);
+    checks.push({
+      id,
+      argv,
+      cwd,
+      environment: { ...environment, VERIFICATION_TIMEOUT_MS: String(timeout) },
+    });
+  };
   if (groups.has("unit")) add("npm-unit", ["npm", "test"]);
   if (groups.has("browser")) {
     add("00-static-build", ["npm", "run", "build:static"]);
@@ -73,11 +83,19 @@ export function selectChecks(matrix, owned, changed, candidatePackages) {
   if (groups.has("browser"))
     for (const s of matrix.browserSuites) {
       if (s.mode === "both")
-        add(s.file, ["node", s.file], ".", { TEST_BROWSER: "both" });
+        add(s.file, ["node", s.file], ".", {
+          TEST_BROWSER: "both",
+          ...(s.requiredPorts?.length
+            ? { VERIFICATION_REQUIRED_PORTS: s.requiredPorts.join(",") }
+            : {}),
+        });
       else
         for (const engine of ["chromium", "webkit"])
           add(s.file + ":" + engine, ["node", s.file], ".", {
             TEST_BROWSER: engine,
+            ...(s.requiredPorts?.length
+              ? { VERIFICATION_REQUIRED_PORTS: s.requiredPorts.join(",") }
+              : {}),
           });
     }
   if (groups.has("go")) {
@@ -192,6 +210,164 @@ export function checkClean(cwd, commit) {
   )
     throw new Error("Clean detached worktree required");
 }
+// Port and timeout policy is included in the approved command environment,
+// and failure reasons are retained in the receipt and its hashed logs.
+export function occupiedPorts(check) {
+  const raw = check.environment.VERIFICATION_REQUIRED_PORTS;
+  if (!raw) return [];
+  const ports = raw.split(",").map(Number);
+  if (ports.some((p) => !Number.isInteger(p) || p < 1 || p > 65535))
+    throw new Error("Invalid required port list");
+  return ports.flatMap((port) => {
+    const probe = spawnSync(
+      "lsof",
+      ["-nP", "-iTCP:" + port, "-sTCP:LISTEN", "-Fp"],
+      { encoding: "utf8", timeout: 5000 },
+    );
+    if (probe.error)
+      throw new Error(
+        "Port owner inspection unavailable: " + probe.error.message,
+      );
+    if (probe.status === 1 && !probe.stdout && !probe.stderr) return [];
+    if (probe.status !== 0)
+      throw new Error("Port owner inspection failed: " + probe.stderr);
+    const pids = [...probe.stdout.matchAll(/^p(\d+)$/gm)].map((m) =>
+      Number(m[1]),
+    );
+    if (!pids.length)
+      throw new Error("Occupied port " + port + " has unavailable PID");
+    return [{ port, pids: [...new Set(pids)] }];
+  });
+}
+async function checkController() {
+  const { spawn } = await import("node:child_process");
+  const argv = JSON.parse(process.argv[1]),
+    timeout = Number(process.argv[2]);
+  const child = spawn(argv[0], argv.slice(1), {
+    detached: true,
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  let stdout = [],
+    stderr = [],
+    size = 0,
+    reason = "",
+    closed = false,
+    forced = false,
+    code = -1,
+    signal = "",
+    timer,
+    killTimer;
+  const signalGroup = (kind) => {
+    if (!child.pid) return;
+    try {
+      process.kill(-child.pid, kind);
+    } catch (error) {
+      if (error.code !== "ESRCH")
+        stderr.push(Buffer.from("\nGroup signal: " + error.message));
+    }
+  };
+  let finished = false;
+  const finish = () => {
+    if (finished || !closed || (reason && !forced)) return;
+    finished = true;
+    clearTimeout(timer);
+    clearTimeout(killTimer);
+    process.stdout.write(
+      JSON.stringify({
+        status:
+          reason === "timeout" ? 124 : reason === "output-limit" ? 125 : code,
+        stdout: Buffer.concat(stdout).toString(),
+        stderr: Buffer.concat(stderr).toString(),
+        failureReason: reason || (code !== 0 ? "exit" : ""),
+        signal,
+      }),
+    );
+  };
+  const stop = (why) => {
+    if (reason) return;
+    reason = why;
+    clearTimeout(timer);
+    signalGroup("SIGTERM");
+    killTimer = setTimeout(() => {
+      signalGroup("SIGKILL");
+      forced = true;
+      finish();
+    }, 250);
+  };
+  const capture = (dest) => (data) => {
+    size += data.length;
+    if (size > 128 * 1024 * 1024) {
+      stop("output-limit");
+      return;
+    }
+    dest.push(data);
+  };
+  child.stdout.on("data", capture(stdout));
+  child.stderr.on("data", capture(stderr));
+  child.on("error", (error) => {
+    stderr.push(Buffer.from(error.message));
+    reason = "spawn";
+    forced = true;
+    closed = true;
+    finish();
+  });
+  child.on("close", (status, whichSignal) => {
+    code = status ?? -1;
+    signal = whichSignal || "";
+    closed = true;
+    finish();
+  });
+  timer = setTimeout(() => stop("timeout"), timeout);
+}
+export function runCheck(check, cwd, environment) {
+  const timeout = Number(check.environment.VERIFICATION_TIMEOUT_MS);
+  if (!Number.isSafeInteger(timeout) || timeout <= 0 || timeout > 1800000)
+    throw new Error("Invalid approved check timeout");
+  if (process.platform === "win32")
+    throw new Error("POSIX process groups required for verification");
+  try {
+    const holders = occupiedPorts(check);
+    if (holders.length)
+      return {
+        status: -1,
+        stdout: "",
+        stderr: holders
+          .map(
+            (h) =>
+              "Required port " +
+              h.port +
+              " occupied by PID " +
+              h.pids.join(","),
+          )
+          .join("\n"),
+        failureReason: "port-conflict",
+      };
+  } catch (error) {
+    return {
+      status: -1,
+      stdout: "",
+      stderr: error.message,
+      failureReason: "port-inspection",
+    };
+  }
+  const raw = execFileSync(
+    process.execPath,
+    [
+      "--input-type=module",
+      "-e",
+      "(" + checkController.toString() + ")()",
+      JSON.stringify(check.argv),
+      String(timeout),
+    ],
+    {
+      cwd,
+      env: { ...environment, ...check.environment },
+      encoding: "utf8",
+      maxBuffer: 512 * 1024 * 1024,
+    },
+  );
+  return JSON.parse(raw);
+}
 export function runPlan(plan, cwd, output) {
   checkClean(cwd, plan.commit);
   const expected = makePlan(plan, cwd);
@@ -242,16 +418,14 @@ export function runPlan(plan, cwd, output) {
   for (const check of plan.checks) {
     const startedAt = new Date().toISOString(),
       start = performance.now();
-    const run = spawnSync(check.argv[0], check.argv.slice(1), {
-      cwd: resolve(cwd, check.cwd),
-      env: { ...environment, ...check.environment },
-      encoding: "utf8",
-      maxBuffer: 128 * 1024 * 1024,
-    });
+    const run = runCheck(check, resolve(cwd, check.cwd), environment);
     const log =
       (run.stdout || "") +
       (run.stderr || "") +
-      (run.error ? "\n" + run.error.message : "");
+      (run.failureReason
+        ? "\nverification failureReason: " + run.failureReason + "\n"
+        : "") +
+      (run.signal ? "verification signal: " + run.signal + "\n" : "");
     const logURI = join(output, digest(check.id) + ".log");
     writeFileSync(logURI, log, { mode: 0o600 });
     results.push({
@@ -260,6 +434,7 @@ export function runPlan(plan, cwd, output) {
       endedAt: new Date().toISOString(),
       durationMs: Math.round(performance.now() - start),
       exitCode: run.status ?? -1,
+      ...(run.failureReason ? { failureReason: run.failureReason } : {}),
       logURI,
       logDigest: digest(log),
     });

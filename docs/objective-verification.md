@@ -90,7 +90,18 @@ vaults and tmux identity, and assigns a disposable HOME/TMPDIR. Commands run wit
 argv arrays and repository-relative cwd. The receipt retains the absolute worktree,
 allowlisted environment, prerequisite digests, command start/end/duration, exit,
 external log path and exact SHA-256. It runs every selected check and retains
-failures. No timeout or known-baseline failure is a passing waiver. Required assets
+failures. The approved matrix records a default ten-minute per-check timeout,
+with explicit overrides (race: fifteen minutes; unit/build/release: two minutes).
+Each planned check carries `VERIFICATION_TIMEOUT_MS` in its recorded environment.
+A timeout sends SIGTERM, then SIGKILL after 250 ms, only to that check's newly
+spawned POSIX process group; its receipt records exit 124 and
+`failureReason: timeout`, and preserves the failed log and digest. A timeout or
+known-baseline failure is never a passing waiver. Browser checks requiring a fixed
+port carry `VERIFICATION_REQUIRED_PORTS`; the runner refuses an occupied port
+before spawning, recording the port and listener PID. It never terminates an
+existing listener. Port inspection failure also refuses the check. These checks
+are guardrails against pre-existing occupancy, not a reservation against a race
+with another launcher. Required assets
 include dependencies, installed Chromium/WebKit engines, test WASM, speech-fixture
 WAV, Go module-license inventory and production WASM; copy the asset
 from the root checkout only under the order's provenance allowance, and rebuild

@@ -11,7 +11,8 @@
     },
     {
       "file": "tests/appearance-switching-browser.mjs",
-      "mode": "both"
+      "mode": "both",
+      "requiredPorts": [4319]
     },
     {
       "file": "tests/board-audit-async-browser.mjs",
@@ -43,7 +44,8 @@
     },
     {
       "file": "tests/browser.mjs",
-      "mode": "selected"
+      "mode": "selected",
+      "requiredPorts": [14318]
     },
     {
       "file": "tests/colored-history-browser.mjs",
@@ -268,5 +270,12 @@
       ],
       "groups": ["unit"]
     }
-  ]
+  ],
+  "defaultTimeoutMs": 600000,
+  "checkTimeoutMs": {
+    "go-race": 900000,
+    "npm-unit": 120000,
+    "00-static-build": 120000,
+    "01-static-release-verify": 120000
+  }
 }

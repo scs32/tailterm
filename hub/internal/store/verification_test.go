@@ -129,7 +129,7 @@ func TestVerificationRejectsInvalidReceiptAndIdentities(t *testing.T) {
 	if _, err := f.s.SaveVerification(f.ctx, f.task.ID, f.item.ID, api.VerificationRequest{RequestID: "plan", AgentID: h.ID, RunID: h.RunID, Plan: &p}); err != nil {
 		t.Fatal(err)
 	}
-	cases := []func(*api.VerificationReceipt){func(r *api.VerificationReceipt) { r.Checks = nil }, func(r *api.VerificationReceipt) { r.Checks = append(r.Checks, r.Checks[0]) }, func(r *api.VerificationReceipt) { r.Checks[0].ExitCode = 1 }, func(r *api.VerificationReceipt) { r.CleanAfter = false }, func(r *api.VerificationReceipt) { r.Commit = candidateC }, func(r *api.VerificationReceipt) { r.VerifierRunID = api.NewID("run") }, func(r *api.VerificationReceipt) { r.Checks[0].Argv = []string{"true"} }, func(r *api.VerificationReceipt) { r.AIV.State = "submitted" }}
+	cases := []func(*api.VerificationReceipt){func(r *api.VerificationReceipt) { r.Checks = nil }, func(r *api.VerificationReceipt) { r.Checks = append(r.Checks, r.Checks[0]) }, func(r *api.VerificationReceipt) { r.Checks[0].ExitCode = 1 }, func(r *api.VerificationReceipt) { r.Checks[0].ExitCode = 124; r.Checks[0].FailureReason = "timeout" }, func(r *api.VerificationReceipt) { r.CleanAfter = false }, func(r *api.VerificationReceipt) { r.Commit = candidateC }, func(r *api.VerificationReceipt) { r.VerifierRunID = api.NewID("run") }, func(r *api.VerificationReceipt) { r.Checks[0].Argv = []string{"true"} }, func(r *api.VerificationReceipt) { r.AIV.State = "submitted" }}
 	for i, mutate := range cases {
 		r := passingVerification(p)
 		mutate(&r)

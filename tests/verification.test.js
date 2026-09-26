@@ -4,6 +4,8 @@ import { mkdtempSync, mkdirSync, writeFileSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { execFileSync } from "node:child_process";
+import { createServer } from "node:net";
+import { once } from "node:events";
 import {
   selectChecks,
   diffPaths,
@@ -11,6 +13,8 @@ import {
   runPlan,
   digest,
   assertInventory,
+  runCheck,
+  occupiedPorts,
 } from "../scripts/verify-matrix.mjs";
 const makePlan = (context, cwd) =>
   rawMakePlan(
@@ -273,4 +277,146 @@ test("actual renamed and deleted Go packages run race only in candidate packages
     cwd: join(f.cwd, "hub"),
     stdio: "pipe",
   });
+});
+
+test("approved matrix records default, per-check timeout and required fixed ports", () => {
+  const checks = selectChecks(
+    matrix,
+    ["client/app.js", "hub/internal/store/migrate.go"],
+    [],
+  );
+  assert.equal(
+    checks.find((c) => c.id === "go-race").environment.VERIFICATION_TIMEOUT_MS,
+    "900000",
+  );
+  assert.equal(
+    checks.find((c) => c.id === "npm-unit").environment.VERIFICATION_TIMEOUT_MS,
+    "120000",
+  );
+  assert.equal(
+    checks.find((c) => c.id === "tests/browser.mjs:chromium").environment
+      .VERIFICATION_REQUIRED_PORTS,
+    "14318",
+  );
+  assert.equal(
+    checks.find((c) => c.id === "tests/appearance-switching-browser.mjs")
+      .environment.VERIFICATION_REQUIRED_PORTS,
+    "4319",
+  );
+  assert.throws(
+    () =>
+      selectChecks(
+        { ...matrix, defaultTimeoutMs: 0, checkTimeoutMs: {} },
+        ["docs/readme.md"],
+        [],
+      ),
+    /timeout/,
+  );
+  assert.throws(
+    () =>
+      selectChecks(
+        { ...matrix, checkTimeoutMs: { "npm-unit": 0 } },
+        ["docs/readme.md"],
+        [],
+      ),
+    /timeout/,
+  );
+});
+
+test("occupied required port reports its PID and never starts or kills a listener", async (t) => {
+  const listener = createServer();
+  listener.listen(0, "127.0.0.1");
+  await once(listener, "listening");
+  try {
+    const port = listener.address().port;
+    const check = {
+      id: "fixture-browser",
+      argv: [process.execPath, "-e", 'console.log("SHOULD_NOT_START")'],
+      cwd: ".",
+      environment: {
+        VERIFICATION_TIMEOUT_MS: "1000",
+        VERIFICATION_REQUIRED_PORTS: String(port),
+      },
+    };
+    const holders = occupiedPorts(check);
+    assert(
+      holders.some((h) => h.port === port && h.pids.includes(process.pid)),
+    );
+    const result = runCheck(check, process.cwd(), { PATH: process.env.PATH });
+    assert.equal(result.status, -1);
+    assert.equal(result.failureReason, "port-conflict");
+    assert.match(
+      result.stderr,
+      new RegExp("Required port " + port + " occupied by PID.*" + process.pid),
+    );
+    assert(!result.stdout.includes("SHOULD_NOT_START"));
+    assert(listener.listening);
+    assert(
+      occupiedPorts(check).some((h) => h.pids.includes(process.pid)),
+      "pre-existing fixture listener remains alive",
+    );
+  } finally {
+    await new Promise((resolve) => listener.close(resolve));
+  }
+});
+
+test("matrix timeout kills its own process group descendants and retains failed receipt evidence", (t) => {
+  const f = fixture(t),
+    external = mkdtempSync(join(tmpdir(), "verification-timeout-logs-")),
+    info = join(external, "descendant.json");
+  const childCode = `const net=require('node:net'),fs=require('node:fs');process.on('SIGTERM',()=>{});const server=net.createServer();server.listen(0,'127.0.0.1',()=>fs.writeFileSync(${JSON.stringify(info)},JSON.stringify({pid:process.pid,parent:process.ppid,port:server.address().port})));setInterval(()=>{},1000);`;
+  const parentCode = `import {spawn} from 'node:child_process';process.on('SIGTERM',()=>{});spawn(process.execPath,['-e',${JSON.stringify(childCode)}],{stdio:'ignore'});setInterval(()=>{},1000);`;
+  writeFileSync(join(f.cwd, "timeout-fixture.mjs"), parentCode);
+  writeFileSync(
+    join(f.cwd, "package.json"),
+    JSON.stringify({ scripts: { test: "node timeout-fixture.mjs" } }),
+  );
+  const m = JSON.parse(readFileSync(join(f.cwd, "verification/matrix.json")));
+  m.defaultTimeoutMs = 1500;
+  writeFileSync(join(f.cwd, "verification/matrix.json"), JSON.stringify(m));
+  f.git("add", ".");
+  f.git("commit", "-qm", "timeout fixture");
+  const commit = f.git("rev-parse", "HEAD");
+  const plan = makePlan(
+    {
+      baseCommit: commit,
+      commit,
+      owned: ["docs/"],
+      verifierAgentId: "fixture",
+      verifierRunId: "fixture",
+    },
+    f.cwd,
+  );
+  const started = Date.now();
+  const receipt = runPlan(plan, f.cwd, external);
+  assert(Date.now() - started < 10000, "timeout completes promptly");
+  assert.equal(receipt.checks[0].exitCode, 124);
+  assert.equal(receipt.checks[0].failureReason, "timeout");
+  const log = readFileSync(receipt.checks[0].logURI, "utf8");
+  assert.match(log, /verification failureReason: timeout/);
+  assert.equal(receipt.checks[0].logDigest, digest(log));
+  assert.equal(receipt.checks[0].environment.VERIFICATION_TIMEOUT_MS, "1500");
+  const descendant = JSON.parse(readFileSync(info, "utf8"));
+  assert.deepEqual(
+    occupiedPorts({
+      environment: { VERIFICATION_REQUIRED_PORTS: String(descendant.port) },
+    }),
+    [],
+    "descendant listener ended despite ignored SIGTERM",
+  );
+  let state = "";
+  try {
+    state = execFileSync("ps", ["-p", String(descendant.pid), "-o", "stat="], {
+      encoding: "utf8",
+    }).trim();
+  } catch {}
+  assert(
+    !state || state.startsWith("Z"),
+    "descendant is exited rather than a surviving service",
+  );
+  const saved = JSON.parse(readFileSync(join(external, "receipt.json")));
+  assert.equal(saved.checks[0].exitCode, 124);
+  assert.equal(saved.checks[0].failureReason, "timeout");
+  const schema = JSON.parse(readFileSync(new URL("../verification/receipt.schema.json", import.meta.url)));
+  assert(schema.properties.checks.items.properties.failureReason.enum.includes(saved.checks[0].failureReason));
 });

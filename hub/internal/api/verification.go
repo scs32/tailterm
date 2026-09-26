@@ -39,12 +39,13 @@ type VerificationPlan struct {
 }
 type VerificationResult struct {
 	VerificationCheck
-	StartedAt  string `json:"startedAt"`
-	EndedAt    string `json:"endedAt"`
-	DurationMs int64  `json:"durationMs"`
-	ExitCode   int    `json:"exitCode"`
-	LogURI     string `json:"logURI"`
-	LogDigest  string `json:"logDigest"`
+	StartedAt     string `json:"startedAt"`
+	EndedAt       string `json:"endedAt"`
+	DurationMs    int64  `json:"durationMs"`
+	ExitCode      int    `json:"exitCode"`
+	FailureReason string `json:"failureReason,omitempty"`
+	LogURI        string `json:"logURI"`
+	LogDigest     string `json:"logDigest"`
 }
 type VerificationPrerequisite struct {
 	Path   string `json:"path"`
