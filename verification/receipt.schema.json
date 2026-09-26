@@ -1,0 +1,188 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Tailterm native verification receipt v1",
+  "type": "object",
+  "required": [
+    "operationKey",
+    "repository",
+    "baseCommit",
+    "commit",
+    "verifierAgentId",
+    "verifierRunId",
+    "planDigest",
+    "matrixDigest",
+    "checksDigest",
+    "version",
+    "detached",
+    "cleanBefore",
+    "cleanAfter",
+    "environment",
+    "prerequisites",
+    "checks",
+    "aiv",
+    "worktree"
+  ],
+  "properties": {
+    "operationKey": {
+      "type": "string"
+    },
+    "repository": {
+      "type": "string"
+    },
+    "baseCommit": {
+      "type": "string"
+    },
+    "commit": {
+      "type": "string"
+    },
+    "verifierAgentId": {
+      "type": "string"
+    },
+    "verifierRunId": {
+      "type": "string"
+    },
+    "planDigest": {
+      "type": "string",
+      "pattern": "^[a-f0-9]{64}$"
+    },
+    "matrixDigest": {
+      "type": "string",
+      "pattern": "^[a-f0-9]{64}$"
+    },
+    "checksDigest": {
+      "type": "string",
+      "pattern": "^[a-f0-9]{64}$"
+    },
+    "version": {
+      "const": 1
+    },
+    "detached": {
+      "const": true
+    },
+    "cleanBefore": {
+      "const": true
+    },
+    "cleanAfter": {
+      "const": true
+    },
+    "environment": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "string"
+      }
+    },
+    "prerequisites": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["path", "sha256"],
+        "properties": {
+          "path": {
+            "type": "string"
+          },
+          "sha256": {
+            "type": "string",
+            "pattern": "^[a-f0-9]{64}$"
+          }
+        },
+        "additionalProperties": false
+      }
+    },
+    "checks": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": [
+          "id",
+          "argv",
+          "cwd",
+          "environment",
+          "startedAt",
+          "endedAt",
+          "durationMs",
+          "exitCode",
+          "logURI",
+          "logDigest"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "minLength": 1
+          },
+          "argv": {
+            "type": "array",
+            "minItems": 1,
+            "items": {
+              "type": "string"
+            }
+          },
+          "cwd": {
+            "type": "string"
+          },
+          "environment": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "string"
+            }
+          },
+          "startedAt": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "endedAt": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "durationMs": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "exitCode": {
+            "type": "integer"
+          },
+          "logURI": {
+            "type": "string"
+          },
+          "logDigest": {
+            "type": "string",
+            "pattern": "^[a-f0-9]{64}$"
+          }
+        },
+        "additionalProperties": false
+      }
+    },
+    "aiv": {
+      "type": "object",
+      "required": ["state"],
+      "properties": {
+        "state": {
+          "const": "unsubmitted"
+        },
+        "service": {
+          "type": "string"
+        },
+        "repository": {
+          "type": "string"
+        },
+        "snapshot": {
+          "type": "string"
+        },
+        "extractor": {
+          "type": "string"
+        },
+        "run": {
+          "type": "string"
+        },
+        "audit": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    },
+    "worktree": {
+      "type": "string"
+    }
+  },
+  "additionalProperties": false
+}

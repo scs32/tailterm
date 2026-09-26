@@ -12,7 +12,11 @@ import {
   exerciseWorkspaceActions,
   exerciseForgetDevice,
 } from "./workspace-actions-browser.mjs";
-import { chromium } from "@playwright/test";
+import { chromium, webkit } from "@playwright/test";
+const engine = process.env.TEST_BROWSER || "chromium";
+if (!["chromium", "webkit"].includes(engine))
+  throw new Error("Unknown TEST_BROWSER");
+const selectedBrowser = engine === "webkit" ? webkit : chromium;
 import assert from "node:assert/strict";
 import { createServer } from "node:http";
 import { connect as tcpConnect } from "node:net";
@@ -287,7 +291,7 @@ const wait = async (fn) => {
   throw new Error("Condition timed out.");
 };
 try {
-  browser = await chromium.launch({
+  browser = await selectedBrowser.launch({
     args: [
       "--use-fake-device-for-media-stream",
       "--use-fake-ui-for-media-stream",
@@ -295,9 +299,51 @@ try {
   });
   const context = await browser.newContext({
     viewport: { width: 1440, height: 1100 },
-    permissions: ["clipboard-read", "clipboard-write"],
+    permissions:
+      engine === "chromium" ? ["clipboard-read", "clipboard-write"] : [],
   });
   await useDomRenderer(context);
+  // WebKit does not implement Chromium's fake-microphone flags. Supply a
+  // deterministic real MediaStream from a local oscillator in this fixture.
+  if (engine === "webkit")
+    await context.addInitScript(() => {
+      // Grant fixture clipboard API reads on each document, including reloads.
+      // Native writes/keyboard paste stay real; Safari's permission UI is excluded.
+      if (navigator.clipboard) {
+        const clipboard = navigator.clipboard;
+        const write = clipboard.writeText.bind(clipboard);
+        Object.getPrototypeOf(clipboard).writeText = async (text) => {
+          await write(text);
+          globalThis.__fixtureClipboard = text;
+        };
+        Object.getPrototypeOf(clipboard).readText = async () =>
+          globalThis.__fixtureClipboard || "";
+      }
+      Object.getPrototypeOf(navigator.mediaDevices).getUserMedia = async () => {
+        const audio =
+          globalThis.__fixtureAudio ||
+          (globalThis.__fixtureAudio = new AudioContext());
+        await audio.resume();
+        const tone = audio.createOscillator();
+        const output = audio.createMediaStreamDestination();
+        tone.frequency.value = 440;
+        tone.connect(output);
+        tone.start();
+        for (const track of output.stream.getTracks()) {
+          const stop = track.stop.bind(track);
+          let stopped = false;
+          track.stop = () => {
+            if (!stopped) {
+              stopped = true;
+              stop();
+              tone.stop();
+            }
+          };
+        }
+        return output.stream;
+      };
+    });
+
   await context.addInitScript(
     (url) => {
       globalThis.__tailserveTestSocketURL = url;
@@ -482,7 +528,18 @@ try {
         .textContent.includes("Connected"),
     );
   }
-  await exercisePaneGroups(page, () => input);
+  // Safari uses Option+Tab for keyboard traversal through every control when
+  // macOS Full Keyboard Access is off. Exercise the same helper assertions
+  // with that native key, without changing the host's accessibility settings.
+  const press = page.keyboard.press.bind(page.keyboard);
+  if (engine === "webkit")
+    page.keyboard.press = (key, options) =>
+      press(key === "Tab" ? "Alt+Tab" : key, options);
+  try {
+    await exercisePaneGroups(page, () => input);
+  } finally {
+    page.keyboard.press = press;
+  }
   while ((await page.locator("[data-close]").count()) > 1) {
     await page.locator("#tabs .tab").last().hover();
     await page.locator("[data-close]").last().click();
@@ -617,7 +674,36 @@ try {
   );
   await exerciseWorkspaceControls(page);
   await exercisePopupReview(page);
-  await exerciseVoiceDictation(page, () => input);
+  await page.bringToFront();
+  // Safari reserves Escape to exit fullscreen before dispatching dialog cancel.
+  // Run the cancellation fixture outside fullscreen; fullscreen is exercised
+  // separately above and all voice-helper cleanup assertions remain unchanged.
+  if (
+    engine === "webkit" &&
+    (await page.evaluate(() => !!document.fullscreenElement))
+  )
+    await page.locator("#fullscreen").click();
+  try {
+    await exerciseVoiceDictation(page, () => input);
+  } catch (error) {
+    console.error(
+      "Dictation fixture state:",
+      await page.evaluate(() => ({
+        visibility: document.visibilityState,
+        audio: globalThis.__fixtureAudio?.state,
+        requests: globalThis.__speechRequests,
+        tracks: globalThis.__speechTracks?.map((t) => ({
+          state: t.readyState,
+          muted: t.muted,
+        })),
+        status: document.querySelector("#voice-status")?.textContent,
+        levels: [...document.querySelectorAll(".voice-wave span")].map((el) =>
+          el.style.getPropertyValue("--level"),
+        ),
+      })),
+    );
+    throw error;
+  }
   await exerciseImageUpload(page, uploadedFiles, () => input, uploadControl);
   await page.locator("#connection-diagnostics").click();
   await page.getByText("SSH connection", { exact: true }).count();

@@ -15,6 +15,7 @@ import (
 	"github.com/scs32/tailterm/hub/internal/api"
 	"github.com/scs32/tailterm/hub/internal/server"
 	"github.com/scs32/tailterm/hub/internal/store"
+	"github.com/scs32/tailterm/hub/internal/testverification"
 )
 
 func cliWorkItemFixture(t *testing.T) (env, *api.Client, api.Task, api.Agent) {
@@ -171,6 +172,9 @@ func TestWorkItemsCLINarrativeReportQueryAndDonePin(t *testing.T) {
 	overview, err := captureCLIOutput(t, func() error { return cmdWorkItems(e, []string{"narrative", "overview", item.ID}) })
 	if err != nil || !strings.Contains(overview, report.ReportID) || !strings.Contains(overview, "not-ingested") {
 		t.Fatalf("overview=%q %v", overview, err)
+	}
+	if err := testverification.Prepare(c, task.ID, item); err != nil {
+		t.Fatal(err)
 	}
 	doneOut, err := captureCLIOutput(t, func() error {
 		return cmdWorkItems(e, []string{"update", "--revision", "1", "--request-id", "cli-done-1", "--status", "done", "--report-id", report.ReportID, "--report-version", "1", "--report-digest", report.Digest, "--report-scope-revision", "1", item.ID})

@@ -383,6 +383,7 @@ func TestWorkItemHistoryReconciliationContainsMalformedItems(t *testing.T) {
 			if err != nil || checkpoint.Provenance != "current_row_checkpoint" {
 				t.Fatalf("checkpoint=%+v err=%v", checkpoint, err)
 			}
+			seedPassingVerification(t, s, good, candidateA)
 			status := "done"
 			if _, err := s.UpdateWorkItem(ctx, project.ID, good.ID, api.UpdateWorkItemRequest{Revision: 1, Status: &status}, by); err != nil {
 				t.Fatalf("unrelated item disabled: %v", err)

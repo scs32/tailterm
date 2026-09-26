@@ -325,6 +325,7 @@ func TestReviewConvergenceExactFocusedAcceptance(t *testing.T) {
 	if _, err = f.post(f.resultEnv(candidateC, map[string]string{"b1": "pass"}, meta), "", fm.Seq, f.reviewer); err != nil {
 		t.Fatal(err)
 	}
+	seedPassingVerification(t, f.s, f.item, candidateC)
 	if err = accept(candidateC); err != nil {
 		t.Fatal(err)
 	}
@@ -542,6 +543,7 @@ func TestReviewConvergenceLegacyReviewHistoryNeverBecomesZero(t *testing.T) {
 
 func acceptCorrectionFixture(t *testing.T, f *convergenceFixture, candidate string) {
 	t.Helper()
+	seedPassingVerification(t, f.s, f.item, candidate)
 	meta := api.ReviewMetadata{Mode: "disposition", Disposition: "accept", Candidate: candidate}
 	if _, err := f.post(api.Envelope{Kind: "notice", Subject: "Accept corrected fixture candidate", Review: &meta, Body: api.EnvelopeBody{Text: "Accept verified candidate"}}, "", 0, api.Agent{}); err != nil {
 		t.Fatal(err)

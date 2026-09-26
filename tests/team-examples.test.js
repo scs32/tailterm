@@ -8,7 +8,7 @@ test("ten complete examples are portable, launchable, bounded and independently 
   assert.equal(TEAM_EXAMPLES.length, 10);
   for (const e of TEAM_EXAMPLES) {
     const team = normalizeTeam(exampleTeam(e.id));
-    assert.ok(team.members.length >= 1 && team.members.length <= 5);
+    assert.ok(team.members.length >= 1 && team.members.length <= 6);
     assert.ok(e.fit && e.goal && e.workflow);
     for (const m of team.members) {
       assert.equal(m.serverId, "");
@@ -123,7 +123,7 @@ test("typed team prompts use notices for waits and self-blocks for dependencies"
       assert.match(member.prompt, /Use NOTICE to tell someone to wait or share status/, `${team.id}/${member.name}`);
       assert.match(member.prompt, /Use BLOCK only when you yourself are blocked; address it to whoever can unblock you, state what you need, and give the condition for resuming/, `${team.id}/${member.name}`);
     }
-  assert.equal(typedPrompts, 5);
+  assert.equal(typedPrompts, 6);
 });
 
 test("team prompts leave overdue escalation to the broker after one teammate nudge", () => {

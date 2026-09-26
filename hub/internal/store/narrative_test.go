@@ -108,6 +108,7 @@ func TestNarrativeArtifactsLinksCoverageReportsRetriesAndCompletion(t *testing.T
 	if err != nil || exact.Sections.DeliveredWork != report.Sections.DeliveredWork || exact.Digest != report.Digest {
 		t.Fatalf("exact report mismatch: %v", err)
 	}
+	seedPassingVerification(t, s, item, candidateA)
 	done := "done"
 	if _, err = s.UpdateWorkItem(ctx, project.ID, item.ID, api.UpdateWorkItemRequest{Revision: item.Revision, Status: &done}, by); !errors.Is(err, api.ErrNarrativeReportRequired) {
 		t.Fatalf("legacy done without report=%v", err)
@@ -222,6 +223,7 @@ func TestNarrativeFrozenPaginationConcurrencyAndStaleScope(t *testing.T) {
 	if err != nil || updated.ScopeRevision != item.ScopeRevision+1 {
 		t.Fatalf("scope update=%+v %v", updated, err)
 	}
+	seedPassingVerification(t, s, updated, candidateA)
 	done := "done"
 	_, _, err = s.CreateWorkItemUpdate(ctx, project.ID, item.ID, api.CreateWorkItemUpdate{ExpectedRevision: updated.Revision, Status: &done, RequestID: "stale-done", CompletionReport: &api.NarrativeReportPin{ReportID: report.ReportID, Version: 1, Digest: report.Digest, ScopeRevision: report.ScopeRevision}}, by)
 	if !errors.Is(err, api.ErrNarrativeReportStale) {

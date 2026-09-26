@@ -63,6 +63,7 @@ func teamCloseTerminal(t *testing.T, s *Store, task api.Task, item api.WorkItem,
 	ctx := context.Background()
 	by := api.Caller{Node: "fixture", User: "owner"}
 	if status == "done" {
+		seedPassingVerification(t, s, item, candidateA)
 		report, _, err := s.PutNarrativeReport(ctx, task.ID, item.ID, completeReportRequest(item, "close-report", 5), by)
 		if err != nil {
 			t.Fatal(err)
@@ -343,6 +344,7 @@ func TestCloseItemTeamRefusesOpenHeldAndSentObligations(t *testing.T) {
 	s, task, item, lead, worker, _, req := teamCloseFixture(t)
 	ctx := context.Background()
 	by := api.Caller{Node: "fixture", User: "owner"}
+	seedPassingVerification(t, s, item, candidateA)
 	status := "done"
 	teamCloseTerminal(t, s, task, item, status)
 	for _, state := range []string{api.ObligationQueued, api.ObligationDelivered, api.ObligationAcknowledged, api.ObligationWorking, api.ObligationBlocked} {

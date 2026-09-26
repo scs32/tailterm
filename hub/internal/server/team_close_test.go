@@ -53,6 +53,7 @@ func TestTeamCloseHTTPGatesAndReplay(t *testing.T) {
 				t.Fatalf("nonterminal %d", code)
 			}
 			if terminal == "done" {
+				prepareHTTPVerification(t, c, task.ID, item)
 				report, _, err := c.st.PutNarrativeReport(t.Context(), task.ID, item.ID, api.PutNarrativeReportRequest{RequestID: "report", ScopeRevision: item.ScopeRevision, Sections: api.NarrativeReportSections{RequestedOutcome: "Close the item team.", DeliveredWork: "Synthetic implementation.", Verification: "Fixture verification.", Limitations: "Fixture only.", RemainingWork: "None."}, References: []api.NarrativeReference{{Kind: "work-item-revision", TaskID: task.ID, ItemID: item.ID, Revision: item.Revision, Label: "scope"}}}, c.who)
 				if err != nil {
 					t.Fatal(err)

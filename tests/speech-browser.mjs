@@ -1,4 +1,8 @@
-import { chromium } from "@playwright/test";
+import { chromium, webkit } from "@playwright/test";
+const engine = process.env.TEST_BROWSER || "chromium";
+if (!["chromium", "webkit"].includes(engine))
+  throw new Error("Unknown TEST_BROWSER");
+const selectedBrowser = engine === "webkit" ? webkit : chromium;
 import { createServer } from "node:http";
 import { readFile, readdir } from "node:fs/promises";
 import { once } from "node:events";
@@ -33,7 +37,7 @@ const server = createServer(async (req, res) => {
 });
 server.listen(0, "127.0.0.1");
 await once(server, "listening");
-const browser = await chromium.launch({
+const browser = await selectedBrowser.launch({
   args: [
     "--use-fake-device-for-media-stream",
     "--use-fake-ui-for-media-stream",
@@ -41,6 +45,35 @@ const browser = await chromium.launch({
 });
 try {
   const page = await browser.newPage();
+  // WebKit does not implement Chromium's fake-microphone flags. Supply a
+  // deterministic real MediaStream from a local oscillator in this fixture.
+  if (engine === "webkit")
+    await page.addInitScript(() => {
+      Object.getPrototypeOf(navigator.mediaDevices).getUserMedia = async () => {
+        const audio =
+          globalThis.__fixtureAudio ||
+          (globalThis.__fixtureAudio = new AudioContext());
+        await audio.resume();
+        const tone = audio.createOscillator();
+        const output = audio.createMediaStreamDestination();
+        tone.frequency.value = 440;
+        tone.connect(output);
+        tone.start();
+        for (const track of output.stream.getTracks()) {
+          const stop = track.stop.bind(track);
+          let stopped = false;
+          track.stop = () => {
+            if (!stopped) {
+              stopped = true;
+              stop();
+              tone.stop();
+            }
+          };
+        }
+        return output.stream;
+      };
+    });
+
   const bad = [];
   const site = process.argv[2] || `http://127.0.0.1:${server.address().port}/`;
   page.context().on("request", (r) => {
@@ -134,6 +167,7 @@ try {
   const count = await page.evaluate(async (recorder) => {
     const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
     const context = new AudioContext();
+    await context.resume();
     await context.audioWorklet.addModule("/assets/" + recorder);
     const node = new AudioWorkletNode(context, "tailterm-dictation-recorder");
     const source = context.createMediaStreamSource(stream);

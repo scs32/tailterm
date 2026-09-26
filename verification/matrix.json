@@ -1,0 +1,275 @@
+{
+  "version": 1,
+  "browserSuites": [
+    {
+      "file": "tests/activity-browser.mjs",
+      "mode": "both"
+    },
+    {
+      "file": "tests/appearance-browser.mjs",
+      "mode": "both"
+    },
+    {
+      "file": "tests/appearance-switching-browser.mjs",
+      "mode": "both"
+    },
+    {
+      "file": "tests/board-audit-async-browser.mjs",
+      "mode": "both"
+    },
+    {
+      "file": "tests/board-audit-old-hub-browser.mjs",
+      "mode": "both"
+    },
+    {
+      "file": "tests/board-compose-browser.mjs",
+      "mode": "both"
+    },
+    {
+      "file": "tests/board-decisions-browser.mjs",
+      "mode": "both"
+    },
+    {
+      "file": "tests/board-intent-cleanup-browser.mjs",
+      "mode": "both"
+    },
+    {
+      "file": "tests/board-layout-browser.mjs",
+      "mode": "both"
+    },
+    {
+      "file": "tests/board-scroll-browser.mjs",
+      "mode": "both"
+    },
+    {
+      "file": "tests/browser.mjs",
+      "mode": "selected"
+    },
+    {
+      "file": "tests/colored-history-browser.mjs",
+      "mode": "both"
+    },
+    {
+      "file": "tests/dictation-safety-browser.mjs",
+      "mode": "selected"
+    },
+    {
+      "file": "tests/dropdown-continuity-browser.mjs",
+      "mode": "both"
+    },
+    {
+      "file": "tests/dropdown-dialog-browser.mjs",
+      "mode": "both"
+    },
+    {
+      "file": "tests/forget-race-browser.mjs",
+      "mode": "both"
+    },
+    {
+      "file": "tests/hub-cache-browser.mjs",
+      "mode": "both"
+    },
+    {
+      "file": "tests/hub-read-cache-vault-browser.mjs",
+      "mode": "both"
+    },
+    {
+      "file": "tests/inactivity-browser.mjs",
+      "mode": "both"
+    },
+    {
+      "file": "tests/item-message-compose-browser.mjs",
+      "mode": "both"
+    },
+    {
+      "file": "tests/lead-replacement-browser.mjs",
+      "mode": "both"
+    },
+    {
+      "file": "tests/narrative-history-browser.mjs",
+      "mode": "both"
+    },
+    {
+      "file": "tests/pane-option-drag-browser.mjs",
+      "mode": "both"
+    },
+    {
+      "file": "tests/parallel-team-browser.mjs",
+      "mode": "both"
+    },
+    {
+      "file": "tests/pause-project-browser.mjs",
+      "mode": "both"
+    },
+    {
+      "file": "tests/popup-prompts-browser.mjs",
+      "mode": "selected"
+    },
+    {
+      "file": "tests/profile-sync-browser.mjs",
+      "mode": "both"
+    },
+    {
+      "file": "tests/project-compact-ui-browser.mjs",
+      "mode": "both"
+    },
+    {
+      "file": "tests/project-folder-browser.mjs",
+      "mode": "both"
+    },
+    {
+      "file": "tests/project-handler-vault-browser.mjs",
+      "mode": "both"
+    },
+    {
+      "file": "tests/project-layout-browser.mjs",
+      "mode": "both"
+    },
+    {
+      "file": "tests/project-queue-browser.mjs",
+      "mode": "both"
+    },
+    {
+      "file": "tests/project-queue-review-browser.mjs",
+      "mode": "both"
+    },
+    {
+      "file": "tests/project-queue-vault-browser.mjs",
+      "mode": "both"
+    },
+    {
+      "file": "tests/project-work-items-browser.mjs",
+      "mode": "both"
+    },
+    {
+      "file": "tests/pulldown-recurrence-browser.mjs",
+      "mode": "both"
+    },
+    {
+      "file": "tests/queue-layout-browser.mjs",
+      "mode": "both"
+    },
+    {
+      "file": "tests/renderer-browser.mjs",
+      "mode": "both"
+    },
+    {
+      "file": "tests/speech-browser.mjs",
+      "mode": "selected"
+    },
+    {
+      "file": "tests/static-browser.mjs",
+      "mode": "selected"
+    },
+    {
+      "file": "tests/static-cache-browser.mjs",
+      "mode": "both"
+    },
+    {
+      "file": "tests/tailscale-login-browser.mjs",
+      "mode": "both"
+    },
+    {
+      "file": "tests/task-form-browser.mjs",
+      "mode": "both"
+    },
+    {
+      "file": "tests/task-layout-browser.mjs",
+      "mode": "both"
+    },
+    {
+      "file": "tests/teams-vault-browser.mjs",
+      "mode": "both"
+    },
+    {
+      "file": "tests/terminal-context-menu-browser.mjs",
+      "mode": "both"
+    },
+    {
+      "file": "tests/terminal-links-browser.mjs",
+      "mode": "selected"
+    },
+    {
+      "file": "tests/tmux-menu-browser.mjs",
+      "mode": "both"
+    },
+    {
+      "file": "tests/tooltip-rendering.mjs",
+      "mode": "selected"
+    },
+    {
+      "file": "tests/vault-migration-browser.mjs",
+      "mode": "both"
+    },
+    {
+      "file": "tests/work-item-dispatch-browser.mjs",
+      "mode": "both"
+    },
+    {
+      "file": "tests/work-item-draft-vault-browser.mjs",
+      "mode": "both"
+    },
+    {
+      "file": "tests/work-item-history-width-browser.mjs",
+      "mode": "both"
+    },
+    {
+      "file": "tests/work-item-search-browser.mjs",
+      "mode": "both"
+    },
+    {
+      "file": "tests/work-items-scroll-browser.mjs",
+      "mode": "both"
+    }
+  ],
+  "excludedBrowserSuites": [
+    "tests/deployed-browser.mjs",
+    "tests/deployed-reset.mjs"
+  ],
+  "rules": [
+    {
+      "prefixes": [
+        "client/",
+        "tests/",
+        "server/",
+        "package.json",
+        "package-lock.json",
+        "vite.config.js",
+        "scripts/",
+        "verification/"
+      ],
+      "groups": ["unit", "browser"]
+    },
+    {
+      "prefixes": ["hub/"],
+      "groups": ["go"]
+    },
+    {
+      "prefixes": [
+        "hub/internal/store/migrate.go",
+        "hub/internal/store/verification.go"
+      ],
+      "groups": ["migration"]
+    },
+    {
+      "prefixes": ["wasm/"],
+      "groups": ["wasm", "unit", "browser"]
+    },
+    {
+      "prefixes": [
+        "docs/",
+        "AGENTS.md",
+        "README.md",
+        ".gitignore",
+        "LICENSE",
+        "Dockerfile",
+        ".github/",
+        ".prettierignore",
+        ".prettierrc",
+        "index.html",
+        "public/"
+      ],
+      "groups": ["unit"]
+    }
+  ]
+}

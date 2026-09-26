@@ -75,7 +75,7 @@ func checkTeamHostCapacity(ctx context.Context, tx *sql.Tx, host string, now tim
 			return err
 		}
 		if frozen == "" {
-			pendingSlots += 4
+			pendingSlots += 5
 			continue
 		}
 		var plan struct {
@@ -103,8 +103,8 @@ func checkTeamHostCapacity(ctx context.Context, tx *sql.Tx, host string, now tim
 		UNION SELECT task_id FROM team_queue_entries WHERE host=? AND state IN ('queued','launching','running'))`, host, host).Scan(&polls); err != nil {
 		return err
 	}
-	projectedSessions := agents + pendingSlots + 4*additionalReservations
-	projectedBindings := max(usage.RelayBindings, agents) + pendingSlots + 4*additionalReservations
+	projectedSessions := agents + pendingSlots + 5*additionalReservations
+	projectedBindings := max(usage.RelayBindings, agents) + pendingSlots + 5*additionalReservations
 	// relayOne reads project and agent every three seconds; the broker path
 	// adds up to three reads/writes per ten-second check; message pages and
 	// queue effects add bounded slack. These are admission costs, while the

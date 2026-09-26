@@ -247,7 +247,7 @@ func TestTeamLaunchStartsFourMembersOnPrivateTmux(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(detail.Agents) != 5 || detail.Task.Orchestrator != "lead-"+f.item.ID[len(f.item.ID)-8:] {
+	if len(detail.Agents) != 6 || detail.Task.Orchestrator != "lead-"+f.item.ID[len(f.item.ID)-8:] {
 		t.Fatalf("launch state: %+v %s", detail.Task, out)
 	}
 	for _, a := range detail.Agents {
@@ -282,7 +282,7 @@ func TestTeamLaunchStartsFourMembersOnPrivateTmux(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if strings.Count(out, "(reconciled)") != 4 {
+	if strings.Count(out, "(reconciled)") != 5 {
 		t.Fatal(out)
 	}
 }

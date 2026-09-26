@@ -41,6 +41,7 @@ func TestNarrativeHTTPFullReportArtifactAndCompletionGate(t *testing.T) {
 	if code := c.do("POST", path+"/reports", reportReq, &report); code != 201 || len(report.Sections.DeliveredWork) <= 8192 {
 		t.Fatalf("report=%d len=%d %+v", code, len(report.Sections.DeliveredWork), report)
 	}
+	prepareHTTPVerification(t, c, task.ID, item)
 	status := "done"
 	var completionError api.ErrorResponse
 	if code := c.do("PATCH", "/v1/tasks/"+task.ID+"/work-items/"+item.ID, api.UpdateWorkItemRequest{Revision: 1, Status: &status}, &completionError); code != 409 || completionError.Code != "report-required" {

@@ -271,6 +271,13 @@ func reviewCompletion(ctx context.Context, tx *sql.Tx, item api.WorkItem, candid
 	if err != nil {
 		return err
 	}
+	accepted := candidate
+	if accepted == "" && state.Disposition != nil {
+		accepted = state.Disposition.Candidate
+	}
+	if err = verificationReady(ctx, tx, item, accepted); err != nil {
+		return err
+	}
 	if state.History == "unknown" {
 		if len(state.Scopes) > 0 {
 			return reviewConflict("legacy review history is unknown")
@@ -442,6 +449,9 @@ func (s *Store) applyReviewConvergence(ctx context.Context, tx *sql.Tx, m api.Me
 			return reviewConflict("disposition already recorded")
 		}
 		if meta.Disposition == "accept" {
+			if err = verificationReady(ctx, tx, item, meta.Candidate); err != nil {
+				return err
+			}
 			if err = reviewReady(state, item.ScopeRevision, meta.Candidate); err != nil {
 				return err
 			}
