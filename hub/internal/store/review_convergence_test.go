@@ -751,3 +751,149 @@ func TestReviewConvergenceCorrectionLegacyReconciliation(t *testing.T) {
 		})
 	}
 }
+
+func TestReviewConvergenceFocusedLegacyReplacementPreservesSources(t *testing.T) {
+	f := newConvergenceFixture(t)
+	if _, err := f.s.db.Exec(`DELETE FROM review_convergence WHERE task_id=? AND item_id=?`, f.task.ID, f.item.ID); err != nil {
+		t.Fatal(err)
+	}
+	sources := []int64{}
+	for i := 0; i < 2; i++ {
+		env := api.Envelope{Kind: "review", Subject: "Legacy review from the now closed team", Body: api.EnvelopeBody{Candidate: candidateA, Scope: "Fixture", Acceptance: map[string]string{"a1": "works", "a2": "retries"}}}
+		req := f.req(env, f.reviewer.ID, 0, api.Agent{})
+		task, _ := f.s.GetTask(f.ctx, f.task.ID)
+		tx, err := f.s.db.BeginTx(f.ctx, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		m, err := f.s.insertMessage(f.ctx, tx, task, req, f.reviewer, f.by, false, false)
+		if err != nil {
+			tx.Rollback()
+			t.Fatal(err)
+		}
+		if err = tx.Commit(); err != nil {
+			t.Fatal(err)
+		}
+		sources = append(sources, m.Seq)
+	}
+	if _, err := f.s.db.Exec(`UPDATE agents SET status=? WHERE id=?`, api.AgentClosed, f.reviewer.ID); err != nil {
+		t.Fatal(err)
+	}
+	fresh, err := f.s.AddAgent(f.ctx, f.task.ID, api.AddAgentRequest{Name: "reviewer-fresh", Host: "fixture", Session: "reviewer-fresh"}, f.by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = f.post(api.Envelope{Kind: "assign", Subject: "Fresh team assignment preserves legacy criteria", Body: api.EnvelopeBody{Objective: "Fixture", Owns: []string{"fixture"}, Acceptance: map[string]string{"a1": "works", "a2": "retries"}}}, "", 0, api.Agent{}); err != nil {
+		t.Fatal(err)
+	}
+	meta := api.ReviewMetadata{Mode: "reconcile", LegacyRequests: sources, Fix: "Original team closed; explicitly bind fresh exact reviewer while retaining both source slots"}
+	env := api.Envelope{Kind: "notice", Subject: "Reconcile legacy requests with the fresh reviewer", Review: &meta, Body: api.EnvelopeBody{Text: "Preserve legacy source identity"}, Evidence: map[string]api.Evidence{"e1": {Type: "record", Value: "Both native legacy source REVIEW requests"}}}
+	if _, err = f.post(env, "", 0, api.Agent{}); !errors.Is(err, api.ErrConflict) {
+		t.Fatal("missing replacement accepted", err)
+	}
+	for _, seq := range sources {
+		meta.LegacyReviewers = append(meta.LegacyReviewers, api.LegacyReviewerBinding{RequestSeq: seq, ReviewerID: fresh.ID, ReviewerRun: fresh.RunID})
+	}
+	staleMeta := meta
+	staleMeta.LegacyReviewers = append([]api.LegacyReviewerBinding{}, meta.LegacyReviewers...)
+	staleMeta.LegacyReviewers[0].ReviewerRun = "run_bbbbbbbbbbbbbbbb"
+	bad := env
+	bad.Review = &staleMeta
+	if _, err = f.post(bad, "", 0, api.Agent{}); !errors.Is(err, api.ErrConflict) {
+		t.Fatal("stale replacement accepted", err)
+	}
+	reset := meta
+	reset.LegacyRequests = sources[:1]
+	bad.Review = &reset
+	if _, err = f.post(bad, "", 0, api.Agent{}); !errors.Is(err, api.ErrConflict) {
+		t.Fatal("count reset accepted", err)
+	}
+	env.Review = &meta
+	notice, err := f.post(env, "", 0, api.Agent{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	st := f.state(t)
+	if len(st.Rounds) != 2 || len(st.Reconciliations[0].Reviewers) != 2 || st.Reconciliations[0].MessageSeq != notice.Seq {
+		t.Fatal("reconciliation provenance", st)
+	}
+	for i, r := range st.Rounds {
+		if r.RequestSeq != sources[i] || r.SourceReviewerID != f.reviewer.ID || r.ReviewerID != fresh.ID || r.ReviewerRun != fresh.RunID || r.Candidate != candidateA {
+			t.Fatal("original source lost", r)
+		}
+	}
+	wrong := fresh
+	wrong.RunID = "run_cccccccccccccccc"
+	if _, err = f.post(f.resultEnv(candidateA, passConvergence, api.ReviewMetadata{Mode: "general"}), "", sources[0], wrong); !errors.Is(err, api.ErrConflict) {
+		t.Fatal("stale result accepted", err)
+	}
+	if _, err = f.post(f.resultEnv(candidateA, passConvergence, api.ReviewMetadata{Mode: "general"}), "", sources[0], f.reviewer); !errors.Is(err, api.ErrConflict) {
+		t.Fatal("closed source result accepted", err)
+	}
+	for _, seq := range sources {
+		if _, err = f.post(f.resultEnv(candidateA, passConvergence, api.ReviewMetadata{Mode: "general"}), "", seq, fresh); err != nil {
+			t.Fatal(err)
+		}
+	}
+	env = api.Envelope{Kind: "review", Subject: "Refuse a third review after replacement", Body: api.EnvelopeBody{Candidate: candidateA, Scope: "Fixture", Acceptance: map[string]string{"a1": "works", "a2": "retries"}}}
+	if _, err = f.post(env, fresh.ID, 0, api.Agent{}); !errors.Is(err, api.ErrConflict) {
+		t.Fatal("replacement reset count", err)
+	}
+	acceptCorrectionFixture(t, f, candidateA)
+}
+
+func TestReviewConvergenceFocusedSequentialFinalCandidateReverification(t *testing.T) {
+	f := newConvergenceFixture(t)
+	r1 := f.review(t, candidateA)
+	b1 := api.ReviewFinding{ID: "b1", Regression: true, Baseline: candidateC, Candidate: candidateA, Title: "Regression one", File: "fixture.go", Line: 1}
+	b2 := api.ReviewFinding{ID: "b2", Regression: true, Baseline: candidateC, Candidate: candidateA, Title: "Regression two", File: "fixture.go", Line: 2}
+	if _, err := f.post(f.resultEnv(candidateA, passConvergence, api.ReviewMetadata{Mode: "general", Blockers: []api.ReviewFinding{b1, b2}}), "", r1.Seq, f.reviewer); err != nil {
+		t.Fatal(err)
+	}
+	r2 := f.review(t, candidateB)
+	b1.Candidate = candidateB
+	b2.Candidate = candidateB
+	if _, err := f.post(f.resultEnv(candidateB, passConvergence, api.ReviewMetadata{Mode: "general", Blockers: []api.ReviewFinding{b1, b2}}), "", r2.Seq, f.reviewer); err != nil {
+		t.Fatal(err)
+	}
+	const d = "dddddddddddddddddddddddddddddddddddddddd"
+	const e = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+	verify := func(candidate, id, fix string) {
+		t.Helper()
+		meta := api.ReviewMetadata{Mode: "focused", Candidate: candidate, Fix: fix, BlockerIDs: []string{id}}
+		request, err := f.post(api.Envelope{Kind: "request", Subject: "Verify exactly this regression fix", Review: &meta, Body: api.EnvelopeBody{Ask: "Verify exact fix on named candidate"}}, f.reviewer.ID, 0, api.Agent{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		stale := f.reviewer
+		stale.RunID = "run_dddddddddddddddd"
+		if _, err = f.post(f.resultEnv(candidate, map[string]string{id: "pass"}, meta), "", request.Seq, stale); !errors.Is(err, api.ErrConflict) {
+			t.Fatal("wrong verifier run", err)
+		}
+		if _, err = f.post(f.resultEnv(candidate, map[string]string{id: "pass"}, meta), "", request.Seq, f.reviewer); err != nil {
+			t.Fatal(err)
+		}
+	}
+	verify(d, "b1", "Fix regression one")
+	verify(e, "b2", "Fix regression two")
+	accept := func(candidate string) error {
+		meta := api.ReviewMetadata{Mode: "disposition", Disposition: "accept", Candidate: candidate}
+		_, err := f.post(api.Envelope{Kind: "notice", Subject: "Accept exact focused verification candidate", Review: &meta, Body: api.EnvelopeBody{Text: "Accept"}}, "", 0, api.Agent{})
+		return err
+	}
+	if err := accept(e); !errors.Is(err, api.ErrConflict) {
+		t.Fatal("earlier b1 verification silently carried forward", err)
+	}
+	verify(e, "b1", "Reverify regression one on final candidate after second fix")
+	if err := accept(d); !errors.Is(err, api.ErrConflict) {
+		t.Fatal("stale candidate accepted", err)
+	}
+	if err := accept(candidateC); !errors.Is(err, api.ErrConflict) {
+		t.Fatal("unrelated candidate accepted", err)
+	}
+	st := f.state(t)
+	if len(st.Rounds) != 2 || len(st.Focused) != 3 || len(outstandingOnCandidate(st, e)) != 0 {
+		t.Fatal("focused count/evidence", st)
+	}
+	acceptCorrectionFixture(t, f, e)
+}

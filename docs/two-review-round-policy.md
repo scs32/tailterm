@@ -94,11 +94,29 @@ NOTICE with review metadata `mode: "reconcile"`, `legacyRequests: [SEQ, ...]`, a
 source-backed explanation in `fix`, and Evidence. The hub requires every linked
 native REVIEW sequence in chronological order and reserves all those lifetime
 slots. It copies each immutable source candidate and criteria, and binds its
-original reviewer to the current available run; it records the reconciliation
+original reviewer to the current available run by default; it records the reconciliation
 NOTICE and author/run alongside the source requests. Unknown legacy verdicts are
 not inferred: each imported request needs a structured RESULT reattesting that
 same frozen candidate and criteria, in round order. This completes an existing
 round, rather than allocating a fresh general REVIEW. Ordinary acceptance and
 Done checks then apply. Replays retain the same ledger. A subset, missing exact
-source fields, unavailable original reviewer, or more than two historical
+source fields, unavailable reviewer without an explicit replacement, or more than two historical
 requests is refused, with unknown history retained; there is no cap override.
+
+When the original reviewer is unavailable, the reconciliation NOTICE may explicitly
+provide `legacyReviewers: [{requestSeq: SEQ, reviewerId: ID, reviewerRun: RUN}, ...]`.
+Every binding must name a distinct imported request and an available current exact
+run on the same project. The ledger retains the original source recipient in
+`sourceReviewerId` and the native request, while recording the replacement binding
+and reconciliation author/run. The replacement reattests the same frozen candidate
+and criteria on that existing request. Closure or replacement never resets the
+round count. An unavailable original reviewer without an explicit binding remains
+a refusal.
+
+Sequential focused fixes on different commits require exact verification on the
+final accepted candidate. A blocker passed on an earlier commit may be named again
+in a focused REQUEST on the final commit. Request eligibility and acceptance share
+the same candidate-specific unresolved-finding projection. Earlier evidence is
+retained, but does not silently clear failures on an unrelated commit. After all
+required fixes are verified on the final candidate, acceptance and Done can
+proceed without a third general review.

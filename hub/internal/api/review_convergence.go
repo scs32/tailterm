@@ -4,15 +4,16 @@ package api
 // General reviews use REVIEW/RESULT; focused verification uses REQUEST/RESULT;
 // the lead records a disposition on a NOTICE. Unstructured history is unknown.
 type ReviewMetadata struct {
-	LegacyRequests     []int64         `json:"legacyRequests,omitempty"`
-	Mode               string          `json:"mode"`
-	Candidate          string          `json:"candidate,omitempty"`
-	Blockers           []ReviewFinding `json:"blockers,omitempty"`
-	Findings           []ReviewFinding `json:"findings,omitempty"`
-	BlockerIDs         []string        `json:"blockerIds,omitempty"`
-	Fix                string          `json:"fix,omitempty"`
-	VerificationItemID string          `json:"verificationItemId,omitempty"`
-	Disposition        string          `json:"disposition,omitempty"`
+	LegacyReviewers    []LegacyReviewerBinding `json:"legacyReviewers,omitempty"`
+	LegacyRequests     []int64                 `json:"legacyRequests,omitempty"`
+	Mode               string                  `json:"mode"`
+	Candidate          string                  `json:"candidate,omitempty"`
+	Blockers           []ReviewFinding         `json:"blockers,omitempty"`
+	Findings           []ReviewFinding         `json:"findings,omitempty"`
+	BlockerIDs         []string                `json:"blockerIds,omitempty"`
+	Fix                string                  `json:"fix,omitempty"`
+	VerificationItemID string                  `json:"verificationItemId,omitempty"`
+	Disposition        string                  `json:"disposition,omitempty"`
 }
 
 type ReviewFinding struct {
@@ -37,7 +38,14 @@ type ReviewScope struct {
 	Criteria      map[string]string `json:"criteria"`
 }
 
+type LegacyReviewerBinding struct {
+	RequestSeq  int64  `json:"requestSeq"`
+	ReviewerID  string `json:"reviewerId"`
+	ReviewerRun string `json:"reviewerRun"`
+}
+
 type ReviewRound struct {
+	SourceReviewerID  string            `json:"sourceReviewerId,omitempty"`
 	Findings          []ReviewFinding   `json:"findings,omitempty"`
 	Criteria          map[string]string `json:"criteria,omitempty"`
 	ReconciliationSeq int64             `json:"reconciliationSeq,omitempty"`
@@ -84,11 +92,12 @@ type ReviewDisposition struct {
 }
 
 type ReviewReconciliation struct {
-	MessageSeq int64   `json:"messageSeq"`
-	Reason     string  `json:"reason"`
-	Requests   []int64 `json:"requests"`
-	AgentID    string  `json:"agentId"`
-	RunID      string  `json:"runId"`
+	Reviewers  []LegacyReviewerBinding `json:"reviewers,omitempty"`
+	MessageSeq int64                   `json:"messageSeq"`
+	Reason     string                  `json:"reason"`
+	Requests   []int64                 `json:"requests"`
+	AgentID    string                  `json:"agentId"`
+	RunID      string                  `json:"runId"`
 }
 
 type ReviewConvergence struct {

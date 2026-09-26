@@ -252,15 +252,8 @@ func reviewReady(state api.ReviewConvergence, scope int64, candidate string) err
 			return reviewConflict("criterion " + key + " has not passed")
 		}
 	}
-	candidateState := state
-	candidateState.Focused = nil
-	for _, f := range state.Focused {
-		if f.Candidate == candidate || (len(state.Rounds) == 2 && f.RequestSeq == state.Rounds[1].RequestSeq && f.ResultSeq == state.Rounds[1].ResultSeq) {
-			candidateState.Focused = append(candidateState.Focused, f)
-		}
-	}
-	if len(outstanding(candidateState)) != 0 {
-		return reviewConflict("unresolved blockers")
+	if len(outstandingOnCandidate(state, candidate)) != 0 {
+		return reviewConflict("unresolved blockers on accepted candidate")
 	}
 	if candidate != last.Candidate {
 		if len(state.Focused) == 0 {
@@ -501,7 +494,7 @@ func (s *Store) applyReviewConvergence(ctx context.Context, tx *sql.Tx, m api.Me
 			if !eligible {
 				return reviewConflict("verifier must be original exact reviewer or bound to linked verification item")
 			}
-			open := outstanding(state)
+			open := outstandingOnCandidate(state, meta.Candidate)
 			seen := map[string]bool{}
 			for _, id := range meta.BlockerIDs {
 				if _, ok := open[id]; !ok || seen[id] {
@@ -774,7 +767,7 @@ func roundCriteria(state *api.ReviewConvergence, r api.ReviewRound) map[string]s
 }
 
 // Reconciliation reserves ALL immutable legacy typed requests, in source order.
-// Legacy verdicts are not guessed: the exact current reviewer reattests each
+// Legacy verdicts are not guessed: the explicitly bound exact reviewer reattests each
 // original candidate against its original criteria using the ordinary RESULT.
 func (s *Store) reconcileLegacyReviews(ctx context.Context, tx *sql.Tx, m api.Message, req api.PostMessageRequest, item api.WorkItem, state *api.ReviewConvergence) error {
 	meta := req.Envelope.Review
@@ -811,6 +804,20 @@ func (s *Store) reconcileLegacyReviews(ctx context.Context, tx *sql.Tx, m api.Me
 	if len(ids) > 2 {
 		return reviewConflict("legacy lifetime count exceeds cap; no override or fresh rounds permitted")
 	}
+	bindings := map[int64]api.LegacyReviewerBinding{}
+	for _, b := range meta.LegacyReviewers {
+		known := false
+		for _, id := range ids {
+			if id == b.RequestSeq {
+				known = true
+			}
+		}
+		if !known || bindings[b.RequestSeq].RequestSeq != 0 || b.ReviewerID == "" || b.ReviewerRun == "" {
+			return reviewConflict("replacement reviewer binding must name distinct legacy source and exact run")
+		}
+		bindings[b.RequestSeq] = b
+	}
+	actualBindings := []api.LegacyReviewerBinding{}
 	for _, id := range ids {
 		source, err := loadMessage(tx, ctx, m.TaskID, id)
 		if err != nil {
@@ -820,14 +827,23 @@ func (s *Store) reconcileLegacyReviews(ctx context.Context, tx *sql.Tx, m api.Me
 		if env == nil || !numberedCriteria(env.Body.Acceptance) || !validGitCommit(env.Body.Candidate) || source.To == "" {
 			return reviewConflict("legacy source lacks exact candidate, frozen criteria or reviewer; retain unknown history")
 		}
-		reviewer, err := scanAgent(tx.QueryRowContext(ctx, `SELECT `+agentCols+` FROM agents WHERE id=? AND task_id=?`, source.To, m.TaskID))
-		if err != nil || reviewer.RunID == "" || reviewer.Status == api.AgentClosed || reviewer.Status == api.AgentExited || reviewer.Status == api.AgentRetired {
-			return reviewConflict("legacy reattestation needs the original reviewer's current available run")
+		reviewerID := source.To
+		binding, explicit := bindings[id]
+		if explicit {
+			reviewerID = binding.ReviewerID
 		}
-		state.Rounds = append(state.Rounds, api.ReviewRound{Number: len(state.Rounds) + 1, RequestSeq: id, Candidate: env.Body.Candidate, Criteria: env.Body.Acceptance, ReviewerID: reviewer.ID, ReviewerRun: reviewer.RunID, StartedAt: ts(source.CreatedAt), ReconciliationSeq: m.Seq})
+		reviewer, err := scanAgent(tx.QueryRowContext(ctx, `SELECT `+agentCols+` FROM agents WHERE id=? AND task_id=?`, reviewerID, m.TaskID))
+		if err != nil || reviewer.RunID == "" || reviewer.Status == api.AgentClosed || reviewer.Status == api.AgentExited || reviewer.Status == api.AgentRetired {
+			return reviewConflict("legacy reattestation needs explicit available replacement or original reviewer")
+		}
+		if explicit && binding.ReviewerRun != reviewer.RunID {
+			return reviewConflict("replacement reviewer run is stale")
+		}
+		actualBindings = append(actualBindings, api.LegacyReviewerBinding{RequestSeq: id, ReviewerID: reviewer.ID, ReviewerRun: reviewer.RunID})
+		state.Rounds = append(state.Rounds, api.ReviewRound{Number: len(state.Rounds) + 1, RequestSeq: id, SourceReviewerID: source.To, Candidate: env.Body.Candidate, Criteria: env.Body.Acceptance, ReviewerID: reviewer.ID, ReviewerRun: reviewer.RunID, StartedAt: ts(source.CreatedAt), ReconciliationSeq: m.Seq})
 	}
 	state.History = "recorded"
-	state.Reconciliations = append(state.Reconciliations, api.ReviewReconciliation{MessageSeq: m.Seq, Reason: meta.Fix, Requests: ids, AgentID: req.AgentID, RunID: req.RunID})
+	state.Reconciliations = append(state.Reconciliations, api.ReviewReconciliation{MessageSeq: m.Seq, Reason: meta.Fix, Requests: ids, Reviewers: actualBindings, AgentID: req.AgentID, RunID: req.RunID})
 	state.Disposition = nil
 	return saveReviewState(ctx, tx, m.TaskID, *state)
 }
@@ -839,4 +855,18 @@ func scopeResolved(f api.FocusedReview, id string) bool {
 		}
 	}
 	return false
+}
+
+// Both focused request eligibility and acceptance use the same exact-candidate
+// projection. Earlier passes are retained but may be reverified on a final
+// candidate; they never silently clear a failure on an unrelated commit.
+func outstandingOnCandidate(state api.ReviewConvergence, candidate string) map[string]api.ReviewFinding {
+	filtered := state
+	filtered.Focused = nil
+	for _, f := range state.Focused {
+		if f.Candidate == candidate || (len(state.Rounds) == 2 && f.RequestSeq == state.Rounds[1].RequestSeq && f.ResultSeq == state.Rounds[1].ResultSeq) {
+			filtered.Focused = append(filtered.Focused, f)
+		}
+	}
+	return outstanding(filtered)
 }
