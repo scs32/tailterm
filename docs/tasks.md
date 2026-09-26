@@ -43,6 +43,11 @@ member's briefing. A failed partial launch retains progress; retry starts only
 remaining members. An already-registered name requires inspection instead of
 silently launching a duplicate. Teams travel with encrypted profile sync.
 
+`tt team launch` starts local Planned delivery members for a recorded item/order
+using the existing database handler; see [local team launch](team-launch.md).
+`tt team queue` manages recorded item orders for the supervised launch-host
+runner; see [project team queue](team-launch.md).
+
 Every terminal tab is a group, including a single session. Drag a group to a
 **tab edge** to reorder it. Task groups cannot be merged into any other group.
 To add an ordinary session to a task group, drag its **pane header** onto that
@@ -72,6 +77,9 @@ sends a targeted reply to an agent. To reply to a human such as `owner`, use
 board. Human usernames are not agent recipients. Without either flag, a message
 is a team announcement. `tt post --help` displays usage; use `tt post -- '--help'`
 only if you actually want to post that literal text.
+
+`tt withdraw SEQ --reason TEXT` withdraws your own superseded open request so it
+stops obliging its recipient; see [team examples](team-examples.md).
 
 Codex agents resume automatically for directed messages and human board
 announcements when the host inbox relay is running. The first `tt` command
@@ -116,6 +124,9 @@ First hand off or detach and reverify useful long-lived services descended from
 the worker's tmux session so exact cleanup does not remove required infrastructure.
 Use retirement only for intentional temporary retention of the same item context.
 The project orchestrator and active database handler remain available.
+
+`tt close --team` closes a terminal item team after its obligations resolve,
+workers before lead, preserving the database handler; see [team examples](team-examples.md).
 
 Closing a task records it closed, removes mirrored panes, and requests termination
 of its agent tmux sessions, including retired agents. Cleanup runs through browser

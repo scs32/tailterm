@@ -41,6 +41,11 @@ the encrypted browser vault. No secret is embedded in the static website.
 Create a task with an objective, select an agent host and runtime, and launch.
 Save reusable agents, roles, models and launch settings as Teams. A team of one replaces an old launch profile. Choose an explicit project folder at launch.
 
+`tt team launch` starts local Planned delivery members for a recorded item/order
+using the existing database handler; see [local team launch](../docs/team-launch.md).
+`tt team queue` manages recorded item orders for the supervised launch-host
+runner; see [project team queue](../docs/team-launch.md).
+
 ```sh
 tt doctor
 tt new-task --name example --goal 'Review the API changes'
@@ -88,11 +93,17 @@ durable owner or detach and reverify it; remaining tmux descendants terminate
 with the worker. Retirement alone preserves the session for intentional temporary retention. See
 [cleanup and history](../docs/task-cleanup.md).
 
+`tt close --team` closes a terminal item team after its obligations resolve,
+workers before lead, preserving the database handler; see [team examples](../docs/team-examples.md).
+
 Replies reference the original message sequence. Read receipts mean retrieval,
 not completion or acceptance. The Board previews the latest 200 messages. Closed tasks can load the full
 conversation and export retained messages, metadata and activity events as JSON. Spawn requests are local to the CLI host; Tailterm
 launches remote agents through SSH. No distributed scheduler or automatic git
 workspace/merge management is provided.
+
+`tt withdraw SEQ --reason TEXT` withdraws your own superseded open request so it
+stops obliging its recipient; see [team examples](../docs/team-examples.md).
 
 ## Build, checks and deployment
 
