@@ -1643,7 +1643,6 @@ export function createTaskHub(host) {
           cwd: fields.cwd,
           run: fields.run,
           model: fields.model,
-          reasoning: fields.reasoning,
           prompt: fields.prompt,
         }))
           if (value !== undefined)

@@ -226,6 +226,30 @@ async function item(taskID, id) {
 async function allItems(kind = "bug") {
   return (await api("GET", `/v1/work-items?kind=${kind}`)).items;
 }
+// Arm the response before submit so each notice is tied to this dispatch,
+// including the cross-project send after an earlier success notice is visible.
+async function submitDispatch(page, sourceTaskID, itemID, targetTask) {
+  const responsePromise = page.waitForResponse((response) =>
+    response.url() === `${origin}/v1/tasks/${sourceTaskID}/work-items/${itemID}/dispatch` &&
+    response.request().method() === "POST" &&
+    response.request().postDataJSON()?.targetTaskId === targetTask.id,
+  );
+  await page.locator('#work-item-dispatch button[type=submit]').click();
+  const response = await responsePromise;
+  assert.equal(response.status(), 201, "dispatch did not store a receipt");
+  const result = await response.json();
+  assert.equal(result.dispatch.targetTaskId, targetTask.id);
+  assert.equal(result.queue.entry.targetTaskId, targetTask.id);
+  assert.equal(result.queue.entry.sourceTaskId, sourceTaskID);
+  assert.equal(result.queue.entry.itemId, itemID);
+  assert.ok(Number.isInteger(result.queue.entry.cycle) && result.queue.entry.cycle > 0);
+  assert.ok(Number.isInteger(result.dispatch.messageSeq) && result.dispatch.messageSeq > 0);
+  await page.locator('#dialog').waitFor({ state: "hidden" });
+  const expectedNotice = `Bug enqueued for ${targetTask.name} · Queue cycle ${result.queue.entry.cycle} · notice #${result.dispatch.messageSeq}.`;
+  await page.waitForFunction((expected) =>
+    document.querySelector('#notice')?.textContent === expected, expectedNotice);
+  assert.equal(await page.locator('#notice').textContent(), expectedNotice);
+}
 async function assertRowInModeViewport(page, label) {
   const geometry = await page.evaluate(() => {
     const viewport = document.querySelector("#mode-view")?.getBoundingClientRect();
@@ -473,15 +497,11 @@ try {
       await page.locator('[data-items-project]').selectOption(source.task.id);
       await page.locator(`[data-item-send="${createdID}"]`).click();
       assert.equal(await page.locator('#work-item-target').inputValue(), source.task.id, "dispatch did not default to the owning project");
-      await page.locator('#work-item-dispatch button[type=submit]').click();
-      await page.locator('#dialog').waitFor({ state: "hidden" });
-      await page.locator('#notice').filter({ hasText: "board message #" }).waitFor();
+      await submitDispatch(page, source.task.id, createdID, source.task);
       assert.equal((await item(source.task.id, createdID)).lastDispatch.targetTaskId, source.task.id);
       await page.locator(`[data-item-send="${createdID}"]`).click();
       await page.locator('#work-item-target').selectOption(target.task.id);
-      await page.locator('#work-item-dispatch button[type=submit]').click();
-      await page.locator('#dialog').waitFor({ state: "hidden" });
-      await page.locator('#notice').filter({ hasText: "board message #" }).waitFor();
+      await submitDispatch(page, source.task.id, createdID, target.task);
       const cross = await item(source.task.id, createdID);
       assert.equal(cross.taskId, source.task.id, "cross-project dispatch moved item ownership");
       assert.equal(cross.lastDispatch.targetTaskId, target.task.id);
