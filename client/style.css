@@ -5835,3 +5835,19 @@ body:is(
 #mode-view .project-team-attention .board-agent {
   border-color: var(--muted);
 }
+@media (max-width: 760px) {
+  #mode-view .tasks-view [data-team-roster] .board-agent {
+    max-width: 100%;
+    flex-wrap: wrap;
+    white-space: normal;
+  }
+  #mode-view .tasks-view [data-team-roster] .board-agent > span:not(.status-dot) {
+    min-width: 0;
+    overflow-wrap: anywhere;
+    flex: 1;
+  }
+  #mode-view .tasks-view [data-team-roster] .board-agent > span.fine {
+    flex-basis: 100%;
+    margin-left: 0;
+  }
+}

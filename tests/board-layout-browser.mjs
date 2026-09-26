@@ -4,6 +4,7 @@ import { chromium, webkit, expect } from "@playwright/test";
 import { createServer } from "vite";
 import { mkdir, writeFile } from "node:fs/promises";
 import assert from "node:assert/strict";
+import { activityLabel } from "../client/activity-format.js";
 
 const html = `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <link rel="stylesheet" href="/client/style.css"><link rel="stylesheet" href="/client/work-items.css">
@@ -23,7 +24,7 @@ const long='A very long synthetic project label with enough words to exercise tr
 const ids=['tsk_1111111111111111','tsk_2222222222222222','tsk_3333333333333333'];
 const state={online:true,failWrites:false,calls:[],notices:[],writes:0,held:false,waiting:[]};
 const tasks=scenario==='empty'?[]:ids.map((id,i)=>({id,name:scenario==='long'?long+' '+(i+1):['Alpha project','Beta project','Closed project'][i],goal:'Synthetic goal '+(i+1),status:i===2?'closed':'open',cleanupPending:i===2?1:0,closedAt:i===2?'2026-09-08T12:00:00Z':undefined,orchestrator:'fixture-lead',createdAt:'2026-09-08T11:00:00Z'}));
-const agents=id=>[{id:'agt_'+id.slice(4),name:'fixture-lead',role:'orchestrator',status:tasks.find(t=>t.id===id)?.status==='closed'?'closed':'running',host:'fixture.invalid',session:'synthetic-session',runtime:'codex',readUpTo:0}];
+const agents=id=>state.roster||[{id:'agt_'+id.slice(4),name:'fixture-lead',role:'orchestrator',status:tasks.find(t=>t.id===id)?.status==='closed'?'closed':'running',host:'fixture.invalid',session:'synthetic-session',runtime:'codex',readUpTo:0}];
 const items=tasks.flatMap(task=>['bug','feature'].map(kind=>({id:kind+'-'+task.id,taskId:task.id,kind,title:scenario==='long'?long+' '+kind:task.name+' '+kind,description:'Synthetic description',priority:'normal',status:'open',revision:1})));
 const messages=new Map(ids.map(id=>[id,[{seq:1,from:{user:'fixture'},text:'Synthetic message for '+id,createdAt:'2026-09-08T12:00:00Z'}]]));
 const response=(body,status=200)=>new Response(JSON.stringify(body),{status,headers:{'Content-Type':'application/json'}});
@@ -102,7 +103,7 @@ const selectors = {
   board: "[data-board-task]", tasks: "[data-task-select]", teams: "[data-team-select]",
   bugs: "[data-items-scope]", features: "[data-items-scope]",
 };
-const results = [], offlineResults = [], failures = [], skips = [];
+const results = [], offlineResults = [], rosterResults = [], failures = [], skips = [];
 function check(label, operation) {
   try { operation(); }
   catch (error) { failures.push(`${label}: ${error.message}`); console.error(failures.at(-1)); }
@@ -351,6 +352,61 @@ try {
           await page.screenshot({path:'.build/board-layout-'+prefix+'-failure.png'}).catch(()=>{});
         } finally {await context.close()}
       }
+      // Exercise the actual expanded Projects roster, including absent activity
+      // and every typed state. Long unbroken labels catch bounded controls whose
+      // text still paints outside them.
+      {
+        const context = await browser.newContext({ viewport: {width:390,height:900} });
+        const page = await context.newPage();
+        const label = `${engine.name()}-390-expanded-activity-roster`;
+        await context.route("**/*",route=>new URL(route.request().url()).origin===origin?route.continue():route.abort());
+        try {
+          await page.goto(`${origin}/board-layout-test?scenario=populated`);
+          await page.waitForFunction(()=>!!window.qa);
+          const states = [null, 'working', 'hung_tool', 'finished_silent', 'crashed', 'looping', 'idle', 'unknown'];
+          const roster = states.map((state, i) => ({
+            id:`agt_roster_${i}`, name:`fixture-agent-${'longname'.repeat(8)}-${i}`,
+            host:`${'longhost'.repeat(8)}.fixture.invalid`, session:'synthetic-session',
+            status:'running', runtime:'codex',
+            ...(state ? {activity:{state,pendingTool:'Synthetic pending tool',tokens:{total:1234}}} : {}),
+          }));
+          await page.evaluate(roster => {qa.state.roster=roster;qa.client.invalidate()}, roster);
+          await show(page,'tasks');
+          await expect(page.locator('[data-team-toggle]')).toHaveAttribute('aria-expanded','false');
+          await page.locator('[data-team-toggle]').click();
+          await expect(page.locator('[data-team-toggle]')).toHaveAttribute('aria-expanded','true');
+          const buttons = page.locator('[data-team-roster] .board-agent');
+          await expect(buttons).toHaveCount(roster.length);
+          for (const [i, agent] of roster.entries()) {
+            await expect(buttons.nth(i)).toContainText(activityLabel(agent.activity));
+            await expect(buttons.nth(i)).toHaveAttribute('title', new RegExp(activityLabel(agent.activity)));
+            if (agent.activity) {
+              await expect(buttons.nth(i)).toHaveAttribute('title', /Synthetic pending tool/);
+              await expect(buttons.nth(i)).toHaveAttribute('title', /Last transition snapshot: 1,234 tokens/);
+            }
+          }
+          const bounds = await buttons.evaluateAll(buttons => buttons.map(button => {
+            const rect = el => {const r=el.getBoundingClientRect();return {x:r.x,right:r.right,width:r.width,height:r.height}};
+            const walker=document.createTreeWalker(button,NodeFilter.SHOW_TEXT), text=[];
+            while(walker.nextNode()) {
+              const range=document.createRange();range.selectNodeContents(walker.currentNode);
+              text.push(...Array.from(range.getClientRects(),r=>({x:r.x,right:r.right})));
+            }
+            return {button:rect(button),roster:rect(button.closest('[data-team-roster]')),text,
+              dot:rect(button.querySelector('.status-dot')),title:button.title};
+          }));
+          for (const row of bounds) {
+            assert.ok(row.button.x >= row.roster.x-1 && row.button.right <= row.roster.right+1, 'roster control clipped');
+            assert.ok(row.dot.width >= 6 && row.dot.height >= 6, 'status dot collapsed');
+            for (const text of row.text) assert.ok(text.x >= row.button.x-1 && text.right <= row.button.right+1, 'roster text clipped');
+          }
+          const screenshot=`board-layout-${label}.png`;
+          await page.screenshot({path:'.build/'+screenshot,fullPage:true});
+          rosterResults.push({engine:engine.name(),width:390,screenshot,bounds});
+          console.log(`${label}: all states, full titles and text bounds pass`);
+        } catch(error) {failures.push(`${label}: ${error.stack||error.message}`);console.error(failures.at(-1))}
+        finally {await context.close()}
+      }
       for (const width of [1000, 1024, 1050, 1051, 1100]) {
         const context = await browser.newContext({ viewport: {width,height:900} });
         const page = await context.newPage(), errors=[];
@@ -382,7 +438,7 @@ try {
   }
 } finally {
   await server.close();
-  await writeFile('.build/board-layout-results.json',JSON.stringify({results,offlineResults,failures,skips},null,2));
+  await writeFile('.build/board-layout-results.json',JSON.stringify({results,offlineResults,rosterResults,failures,skips},null,2));
   await writeFile('.build/board-layout-report.html','<!doctype html><meta charset="utf-8"><title>Board layout comparison</title><style>body{font:14px system-ui;background:#151916;color:#ddd}section{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:8px}img{width:100%}h2{grid-column:1/-1}figure{margin:0}figcaption{padding:5px}</style>'+[...new Set(results.map(r=>r.engine+' '+r.width+' '+r.scenario))].map(group=>'<section><h2>'+group+'</h2>'+results.filter(r=>r.engine+' '+r.width+' '+r.scenario===group).map(r=>'<figure><figcaption>'+r.mode+'</figcaption><a href="'+r.screenshot+'"><img src="'+r.screenshot+'"></a></figure>').join('')+'</section>').join(''));
 }
 if(failures.length)throw Error(`Board layout acceptance: ${failures.length} failures; see .build/board-layout-results.json`);
