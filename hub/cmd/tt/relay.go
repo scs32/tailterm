@@ -126,13 +126,7 @@ func bindRuntime(e env, thread string) error {
 	}
 	b.Cwd, b.Session = a.Cwd, a.Session
 	b.CreatedAt = time.Now().UTC()
-	path := filepath.Join(relayDir(), bindingKey(b)+".binding.json")
-	data, _ := os.ReadFile(path)
-	var old runtimeBinding
-	if json.Unmarshal(data, &old) == nil && old.Hub == b.Hub && old.Task == b.Task && old.Agent == b.Agent && old.Run == b.Run && old.Thread == b.Thread && old.Codex == b.Codex && old.CodexHome == b.CodexHome && old.Runtime == b.Runtime && old.Cwd == b.Cwd && old.Session == b.Session && !old.CreatedAt.IsZero() {
-		return nil
-	}
-	return writePrivateJSON(path, b)
+	return writeRelayBinding(b)
 }
 func cmdBind(e env, args []string) error {
 	fs := flag.NewFlagSet("bind", flag.ContinueOnError)
@@ -182,7 +176,7 @@ func bindClaudeRuntime(hub, task string, a api.Agent) error {
 	if !validBinding(b) {
 		return errors.New("invalid Claude activity binding")
 	}
-	return writePrivateJSON(filepath.Join(relayDir(), bindingKey(b)+".binding.json"), b)
+	return writeRelayBinding(b)
 }
 
 // retryClaudeBinding adopts only a locally verified session with the exact
@@ -531,6 +525,11 @@ func cmdRelay(args []string) error {
 				stopRetry()
 			}
 		}
+		if !*status {
+			if err := recoverRelayRetirements(dir); err != nil {
+				fmt.Fprintln(os.Stderr, "[tt relay] recover retirement:", err)
+			}
+		}
 		paths, _ := filepath.Glob(filepath.Join(dir, "*.binding.json"))
 		worktreeCache := activityWorktreeCache{}
 		for _, path := range paths {
@@ -556,26 +555,39 @@ func cmdRelay(args []string) error {
 			if err == nil {
 				attachRelayBudget(c, activeRelayBudget)
 				ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
-				now := time.Now().UTC()
-				// A broker-path error never suppresses the existing paths.
-				queued, brokerErr := false, error(nil)
-				if b.Runtime != "claude" {
-					queued, brokerErr = relayWakeJob(ctx, b, &progress, c, now, nativeQueue)
+				retired, retirementErr := retireRelayBinding(ctx, dir, path, b, c)
+				if retirementErr != nil {
+					fmt.Fprintf(os.Stderr, "[tt relay] %s retirement: %v\n", b.Agent, retirementErr)
 				}
-				if brokerErr != nil {
-					fmt.Fprintf(os.Stderr, "[tt relay] %s broker wake: %v\n", b.Agent, brokerErr)
+				if retired {
+					cancel()
+					continue
 				}
-				if !queued && b.Runtime != "claude" {
-					err = relayOne(ctx, b, &progress, c, now, nativeQueue)
+				if retirementErr != nil {
+					err = retirementErr
+					cancel()
+				} else {
+					now := time.Now().UTC()
+					// A broker-path error never suppresses the existing paths.
+					queued, brokerErr := false, error(nil)
+					if b.Runtime != "claude" {
+						queued, brokerErr = relayWakeJob(ctx, b, &progress, c, now, nativeQueue)
+					}
+					if brokerErr != nil {
+						fmt.Fprintf(os.Stderr, "[tt relay] %s broker wake: %v\n", b.Agent, brokerErr)
+					}
+					if !queued && b.Runtime != "claude" {
+						err = relayOne(ctx, b, &progress, c, now, nativeQueue)
+					}
+					cancel()
+					// Host observation runs after delivery, using the same host budget.
+					// A slow or drifting transcript never delays a broker or inbox turn.
+					activityCtx, stopActivity := context.WithTimeout(context.WithValue(context.Background(), activityWorktreeContextKey{}, worktreeCache), 5*time.Second)
+					if activityErr := runActivitySafely(func() error { return relayActivityTick(activityCtx, b, c, now, activityProbeNative) }); activityErr != nil {
+						fmt.Fprintf(os.Stderr, "[tt relay] %s activity: %v\n", b.Agent, activityErr)
+					}
+					stopActivity()
 				}
-				cancel()
-				// Host observation runs after delivery, using the same host budget.
-				// A slow or drifting transcript never delays a broker or inbox turn.
-				activityCtx, stopActivity := context.WithTimeout(context.WithValue(context.Background(), activityWorktreeContextKey{}, worktreeCache), 5*time.Second)
-				if activityErr := runActivitySafely(func() error { return relayActivityTick(activityCtx, b, c, now, activityProbeNative) }); activityErr != nil {
-					fmt.Fprintf(os.Stderr, "[tt relay] %s activity: %v\n", b.Agent, activityErr)
-				}
-				stopActivity()
 			}
 			if err != nil {
 				if progress.Error != err.Error() {
@@ -585,9 +597,12 @@ func cmdRelay(args []string) error {
 			} else {
 				progress.Error = ""
 			}
-			if err := writePrivateJSON(progressPath, progress); err != nil {
+			if err := saveRelayProgress(dir, progressPath, b, progress); err != nil {
 				fmt.Fprintln(os.Stderr, "[tt relay] save progress:", err)
 			}
+		}
+		if *status {
+			fmt.Printf("archived bindings=%d\n", relayArchiveCount(dir))
 		}
 		if *once || *status {
 			return nil

@@ -273,7 +273,8 @@ func TestRelayActivityFailureLeavesQueueAndInboxDeliveryWorking(t *testing.T) {
 		case strings.HasSuffix(r.URL.Path, "/messages"):
 			_ = json.NewEncoder(w).Encode(api.MessageList{Messages: []api.Message{{Seq: 1, To: b.Agent, From: api.Sender{Node: "fixture", User: "owner"}, Text: "synthetic"}}})
 		case strings.Contains(r.URL.Path, "/agents/"):
-			if agentReads.Add(1) > 3 {
+			// Retirement adds one identity read before the three delivery reads.
+			if agentReads.Add(1) > 4 {
 				http.Error(w, "synthetic observer failure", http.StatusServiceUnavailable)
 				return
 			}
@@ -290,7 +291,7 @@ func TestRelayActivityFailureLeavesQueueAndInboxDeliveryWorking(t *testing.T) {
 		t.Fatal(err)
 	}
 	stderr, err := captureRelayOutput(t, true, func() error { return cmdRelay([]string{"--once"}) })
-	if err != nil || !strings.Contains(stderr, "activity:") || teamTicks.Load() != 1 || agentReads.Load() < 4 {
+	if err != nil || !strings.Contains(stderr, "activity:") || teamTicks.Load() != 1 || agentReads.Load() < 5 {
 		t.Fatalf("relay isolation: ticks=%d reads=%d stderr=%q err=%v", teamTicks.Load(), agentReads.Load(), stderr, err)
 	}
 	if data, err := os.ReadFile(queueLog); err != nil || !strings.Contains(string(data), "queued") {
