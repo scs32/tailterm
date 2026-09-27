@@ -1183,17 +1183,27 @@ func (s *Store) TeamQueueAction(ctx context.Context, task string, req api.TeamQu
 			if enrollmentErr != nil {
 				return zero, enrollmentErr
 			}
-			if required && (verificationPlan == nil || verificationPlan.Repository != candidate.Repository || verificationPlan.BaseCommit != candidate.BaseCommit) {
+			// A verified team is accepted on its verified base, which is the
+			// tasks-hub tip at launch rather than the queue-time base. Its plan
+			// may name the canonical repository or the exact candidate worktree,
+			// which tt has already resolved to this entry's repository.
+			if required && (verificationPlan == nil || (verificationPlan.Repository != candidate.Repository && verificationPlan.Repository != candidate.Worktree) || (candidate.BaseCommit != e.BaseCommit && candidate.BaseCommit != verificationPlan.BaseCommit)) {
 				return zero, verificationConflict("acceptance repository/base mismatch")
+			}
+			base := e.BaseCommit
+			if required {
+				base = verificationPlan.BaseCommit
+				candidate.BaseCommit = base
 			}
 			if err = reviewCompletion(ctx, tx, item, candidate.Commit); err != nil {
 				return zero, err
 			}
-			if item.Status != "done" || candidate.ItemRevision != item.Revision || !reflect.DeepEqual(candidate.CompletionReport, item.CompletionReport) || candidate.Repository != e.Repository || candidate.BaseCommit != e.BaseCommit || !filepath.IsAbs(candidate.Worktree) || filepath.Clean(candidate.Worktree) != candidate.Worktree || strings.ContainsRune(candidate.Worktree, '\x00') || !validGitCommit(candidate.Commit) || candidate.Branch == "" || len(candidate.Branch) > 200 || strings.ContainsAny(candidate.Branch, "\x00\n\r") || strings.TrimSpace(candidate.Evidence) == "" || candidate.AcceptedAt != "" {
+			if item.Status != "done" || candidate.ItemRevision != item.Revision || !reflect.DeepEqual(candidate.CompletionReport, item.CompletionReport) || candidate.Repository != e.Repository || candidate.BaseCommit != base || !filepath.IsAbs(candidate.Worktree) || filepath.Clean(candidate.Worktree) != candidate.Worktree || strings.ContainsRune(candidate.Worktree, '\x00') || !validGitCommit(candidate.Commit) || candidate.Branch == "" || len(candidate.Branch) > 200 || strings.ContainsAny(candidate.Branch, "\x00\n\r") || strings.TrimSpace(candidate.Evidence) == "" || candidate.AcceptedAt != "" {
 				return zero, api.ErrInvalid
 			}
 			candidate.AcceptedAt = now
 			e.Acceptance = &candidate
+			e.BaseCommit = base
 		case "finish":
 			if e.State != "running" || len(e.CloseJSON) == 0 {
 				return zero, api.ErrConflict
@@ -1289,7 +1299,7 @@ func (s *Store) TeamQueueAction(ctx context.Context, task string, req api.TeamQu
 				data, _ := json.Marshal(e.Integration)
 				integrationJSON = string(data)
 			}
-			_, err = tx.ExecContext(ctx, `UPDATE team_queue_entries SET state=?,revision=?,pause_generation=?,launch_json=?,close_json=?,failure=?,escalation_seq=?,released_at=?,handler_id=?,handler_run_id=?,handler_lease_generation=?,acceptance_json=?,integration_json=?,updated_at=? WHERE id=?`, e.State, e.Revision, e.PauseGeneration, string(e.LaunchJSON), string(e.CloseJSON), e.Failure, e.EscalationSeq, e.ReleasedAt, e.HandlerID, e.HandlerRunID, e.HandlerLeaseGeneration, acceptanceJSON, integrationJSON, now, e.ID)
+			_, err = tx.ExecContext(ctx, `UPDATE team_queue_entries SET state=?,revision=?,pause_generation=?,launch_json=?,close_json=?,failure=?,escalation_seq=?,released_at=?,handler_id=?,handler_run_id=?,handler_lease_generation=?,acceptance_json=?,integration_json=?,base_commit=?,updated_at=? WHERE id=?`, e.State, e.Revision, e.PauseGeneration, string(e.LaunchJSON), string(e.CloseJSON), e.Failure, e.EscalationSeq, e.ReleasedAt, e.HandlerID, e.HandlerRunID, e.HandlerLeaseGeneration, acceptanceJSON, integrationJSON, e.BaseCommit, now, e.ID)
 			if err != nil {
 				return zero, err
 			}

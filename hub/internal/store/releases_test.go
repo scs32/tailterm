@@ -434,3 +434,69 @@ func TestReleaseCorrectionHandlerRefusesResolvedHeldJobWithoutAmbiguousTakeover(
 		t.Fatal(count, err)
 	}
 }
+
+// A verified team launches on the tasks-hub tip at launch, which is newer than
+// the base recorded when the item was queued, and its plan names the builder
+// worktree. Queue acceptance must still bind the verified base and repository.
+func TestQueueAcceptanceUsesVerifiedBaseAndWorktree(t *testing.T) {
+	s, err := Open(filepath.Join(t.TempDir(), "hub.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { s.Close() })
+	ctx := context.Background()
+	by := api.Caller{Node: "fixture", User: "owner"}
+	task, err := s.CreateTask(ctx, api.CreateTaskRequest{Name: "verified acceptance"}, by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h, err := s.AddAgent(ctx, task.ID, api.AddAgentRequest{AgentID: api.NewID("agt"), Name: "handler", Host: "fixture", Session: "handler", Role: api.AgentRoleDatabaseHandler}, by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	item, err := s.CreateWorkItem(ctx, task.ID, api.CreateWorkItemRequest{Kind: "feature", Title: "verified item", RequestID: "item"}, by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const repository, worktree = "/fixture/repo/.git", "/fixture/worktrees/builder"
+	seedPassingVerificationAt(t, s, item, candidateB, worktree)
+	now := ts(time.Now())
+	if _, err = s.db.Exec(`UPDATE work_items SET status='done' WHERE id=?`, item.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = s.db.Exec(`INSERT INTO verification_enrollments(task_id,item_id,agent_id,run_id,required,provenance,created_at) VALUES(?,?,?,?,1,'fixture',?)`, task.ID, item.ID, api.NewID("agt"), api.NewID("run"), now); err != nil {
+		t.Fatal(err)
+	}
+	entry := api.NewID("tqe")
+	if _, err = s.db.Exec(`INSERT INTO team_queue_entries(id,task_id,item_id,item_revision,order_seq,template,position,state,revision,created_at,updated_at,repository,base_commit,handler_id,handler_run_id) VALUES(?,?,?,?,1,'planned',1,'running',1,?,?,?,?,?,?)`, entry, task.ID, item.ID, item.Revision, now, now, repository, candidateC, h.ID, h.RunID); err != nil {
+		t.Fatal(err)
+	}
+	accept := func(key, planRepository, base string) (api.TeamQueueEntry, error) {
+		current, err := s.GetTeamQueueEntry(ctx, task.ID, entry)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return s.TeamQueueAction(ctx, task.ID, api.TeamQueueRequest{RequestID: key, Operation: "accept", EntryID: entry, ExpectedRevision: current.Revision, HandlerAgentID: h.ID, HandlerRunID: h.RunID,
+			Acceptance: &api.TeamIntegrationAcceptance{Repository: repository, BaseCommit: base, Worktree: planRepository, Branch: "feature/fixture", Commit: candidateB, ItemRevision: item.Revision, Evidence: "handler terminal save"}})
+	}
+	if _, err = accept("other-worktree", "/fixture/worktrees/other", candidateC); !errors.Is(err, api.ErrConflict) {
+		t.Fatal("a plan for a different worktree was accepted", err)
+	}
+	if _, err = accept("wrong-base", worktree, strings.Repeat("d", 40)); !errors.Is(err, api.ErrConflict) {
+		t.Fatal("an unrelated base was accepted", err)
+	}
+	got, err := accept("queued-base", worktree, candidateC)
+	if err != nil {
+		t.Fatal("verified acceptance", err)
+	}
+	if got.BaseCommit != candidateA || got.Acceptance == nil || got.Acceptance.BaseCommit != candidateA || got.Acceptance.Repository != repository {
+		t.Fatalf("acceptance did not bind the verified base: %+v", got)
+	}
+	if got.Release == nil || got.Release.BaseCommit != candidateA || got.Release.Commit != candidateB {
+		t.Fatalf("release job not bound to the verified candidate: %+v", got.Release)
+	}
+	reread, err := s.GetTeamQueueEntry(ctx, task.ID, entry)
+	if err != nil || reread.BaseCommit != candidateA {
+		t.Fatal("verified base not persisted", reread.BaseCommit, err)
+	}
+}

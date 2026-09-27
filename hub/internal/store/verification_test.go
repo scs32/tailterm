@@ -317,6 +317,10 @@ if os.Args[2]=="seed" {ctx:=context.Background();by:=api.Caller{Node:"fixture",U
 // exercised through public operations by TestVerification* above.
 func seedPassingVerification(t *testing.T, s *Store, item api.WorkItem, candidate string) {
 	t.Helper()
+	seedPassingVerificationAt(t, s, item, candidate, "fixture")
+}
+func seedPassingVerificationAt(t *testing.T, s *Store, item api.WorkItem, candidate, repository string) {
+	t.Helper()
 	ctx := context.Background()
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -339,7 +343,7 @@ func seedPassingVerification(t *testing.T, s *Store, item api.WorkItem, candidat
 		sc = scopeFor(&state, item.ScopeRevision)
 	}
 	checks := []api.VerificationCheck{{ID: "synthetic-fixture", Argv: []string{"fixture"}, Cwd: ".", Environment: map[string]string{}}}
-	p := api.VerificationPlan{ItemID: item.ID, ItemTaskID: item.TaskID, AssignmentOwnershipDigest: verificationDigest([]string{"fixture"}), Version: 1, OperationKey: api.NewID("req"), Repository: "fixture", Commit: candidate, BaseCommit: candidateA, ItemRevision: item.Revision, ScopeRevision: item.ScopeRevision, AssignmentSeq: sc.AssignmentSeq, MatrixDigest: strings.Repeat("a", 64), ChecksDigest: verificationDigest(checks), VerifierAgentID: api.NewID("agt"), VerifierRunID: api.NewID("run"), Checks: checks}
+	p := api.VerificationPlan{ItemID: item.ID, ItemTaskID: item.TaskID, AssignmentOwnershipDigest: verificationDigest([]string{"fixture"}), Version: 1, OperationKey: api.NewID("req"), Repository: repository, Commit: candidate, BaseCommit: candidateA, ItemRevision: item.Revision, ScopeRevision: item.ScopeRevision, AssignmentSeq: sc.AssignmentSeq, MatrixDigest: strings.Repeat("a", 64), ChecksDigest: verificationDigest(checks), VerifierAgentID: api.NewID("agt"), VerifierRunID: api.NewID("run"), Checks: checks}
 	r := passingVerification(p)
 	var n int64
 	if err = tx.QueryRow(`SELECT count(*) FROM verification_records WHERE task_id=? AND item_id=?`, item.TaskID, item.ID).Scan(&n); err != nil {

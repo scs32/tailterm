@@ -87,7 +87,7 @@ func releaseCandidate(ctx context.Context, tx *sql.Tx, task, entry string) (api.
 		return e, p, r, err
 	}
 	plan, receipt := currentVerification(records)
-	if plan == nil || receipt == nil || plan.Commit != e.Acceptance.Commit || plan.Repository != e.Acceptance.Repository || plan.BaseCommit != e.Acceptance.BaseCommit || plan.ScopeRevision != item.ScopeRevision || e.Acceptance.ItemRevision != item.Revision || item.Status != "done" {
+	if plan == nil || receipt == nil || plan.Commit != e.Acceptance.Commit || (plan.Repository != e.Acceptance.Repository && plan.Repository != e.Acceptance.Worktree) || plan.BaseCommit != e.Acceptance.BaseCommit || plan.ScopeRevision != item.ScopeRevision || e.Acceptance.ItemRevision != item.Revision || item.Status != "done" {
 		return e, p, r, releaseConflict("exact accepted SHA and current verification required")
 	}
 	if err = verificationEligible(*plan, *receipt); err != nil {
