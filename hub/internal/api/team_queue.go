@@ -20,6 +20,7 @@ func (e *TeamCloseWaitError) Unwrap() error { return ErrConflict }
 // TeamQueueEntry is the hub-owned delivery queue. It is unrelated to the
 // deliberate, agent-claimed Queue API.
 type TeamQueueEntry struct {
+	Release                *ReleaseJob                `json:"release,omitempty"`
 	Verification           *VerificationSummary       `json:"verification,omitempty"`
 	Reviews                *ReviewConvergence         `json:"reviews,omitempty"`
 	Activities             []TeamAgentActivity        `json:"activities,omitempty"`

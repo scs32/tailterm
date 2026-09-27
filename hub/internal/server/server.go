@@ -60,6 +60,8 @@ func New(st *store.Store, identity Identity) *Server {
 	m.HandleFunc("DELETE /v1/tasks/{id}/agents/{aid}", s.closeAgent)
 	m.HandleFunc("POST /v1/tasks/{id}/team-close", s.closeItemTeam)
 	m.HandleFunc("GET /v1/tasks/{id}/team-close/receipts/{requestID}", s.getTeamCloseReceipt)
+	m.HandleFunc("GET /v1/tasks/{id}/releases", s.listReleases)
+	m.HandleFunc("POST /v1/tasks/{id}/releases/actions", s.releaseAction)
 	m.HandleFunc("GET /v1/tasks/{id}/team-queue", s.listTeamQueue)
 	m.HandleFunc("GET /v1/tasks/{id}/team-queue/{entry}", s.getTeamQueueEntry)
 	m.HandleFunc("POST /v1/tasks/{id}/team-queue/actions", s.teamQueueAction)

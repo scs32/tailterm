@@ -94,6 +94,19 @@ def _deployment_plan(plan: dict[str, Any], release: str) -> dict[str, str]:
         )
         for field in ("discordGuildId", "discordApplicationId", "discordOwnerIds", "tailosUrl"):
             expected[field] = deployment[field]
+    targets = deployment.get("targets", ["hub", "bridge"])
+    if (not isinstance(targets, list) or not targets or
+            len(targets) != len(set(targets)) or any(t not in ("hub", "bridge") for t in targets)):
+        raise PreflightFailure("invalid-input", "invalid release targets")
+    if "targets" in deployment:
+        expected["targets"] = targets
+    for target, field, binary in (("hub", "binaryDestination", "tailterm-hub"),
+                                   ("bridge", "bridgeBinaryDestination", "tailterm-discord")):
+        if target not in targets and field in expected:
+            retained = deployment.get(field, "")
+            if not re.fullmatch(re.escape(BASE) + r"/releases/[A-Za-z0-9._-]+/" + binary, retained):
+                raise PreflightFailure("invalid-input", "unchanged target requires retained immutable mount")
+            expected[field] = retained
     for field, value in expected.items():
         if deployment.get(field) != value:
             raise PreflightFailure("invalid-input", f"deployment.{field} must be {value}")
@@ -351,7 +364,7 @@ def main(argv: list[str] | None = None) -> int:
 
     binary = ROOT / ".build" / "ttbin" / "tailterm-hub-linux-amd64"
     try:
-        binary_bytes = binary.read_bytes()
+        binary_bytes = binary.read_bytes() if "hub" in deployment.get("targets", ["hub", "bridge"]) else b""
     except OSError as error:
         _emit(
             PreflightFailure(
@@ -433,20 +446,21 @@ def main(argv: list[str] | None = None) -> int:
         )
         last_completed_stage = stage
 
-        stage = "binary-upload"
-        quoted_binary = shlex.quote(binary_destination)
-        _remote(
-            plan,
-            actual_host,
-            f"cat > {quoted_binary} && chmod 755 {quoted_binary}",
-            stage=stage,
-            last_completed_stage=last_completed_stage,
-            preflight=preflight,
-            data=binary_bytes,
-        )
-        last_completed_stage = stage
+        if "hub" in deployment.get("targets", ["hub", "bridge"]):
+            stage = "binary-upload"
+            quoted_binary = shlex.quote(binary_destination)
+            _remote(
+                plan,
+                actual_host,
+                f"cat > {quoted_binary} && chmod 755 {quoted_binary}",
+                stage=stage,
+                last_completed_stage=last_completed_stage,
+                preflight=preflight,
+                data=binary_bytes,
+            )
+            last_completed_stage = stage
 
-        if deployment.get("discordTokenPath"):
+        if deployment.get("discordTokenPath") and "bridge" in deployment.get("targets", ["hub", "bridge"]):
             bridge_binary = ROOT / ".build" / "ttbin" / "tailterm-discord-linux-amd64"
             try:
                 bridge_bytes = bridge_binary.read_bytes()

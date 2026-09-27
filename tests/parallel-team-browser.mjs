@@ -26,6 +26,7 @@ const queue={concurrencyLimit:2,entries:[
  {itemId:'wi_cccccccccccccccc',state:'finished',ownership:['src/c'],handlerId:'agt_handler_c',integration:{repository:'/fixture/git',baseCommit:'a'.repeat(40),worktree:'/fixture/builder-c',branch:'feature/c',commit:'b'.repeat(40),evidence:'item=C;close=receipt'}}
 ]};
 queue.entries.push(...${JSON.stringify(native.queue.entries).replaceAll("<", "\\u003c")});
+queue.entries[0].release={id:'rel_fixture',state:'released',verificationDigest:'f'.repeat(64),integratedCommit:'c'.repeat(40),receipt:{targets:[{target:'tailos',outcome:'released',release:'fixture-release',deployment:'fixture-deployment'}]}};
 queue.entries[0].verification=${JSON.stringify(verification).replaceAll("<", "\\u003c")};
 const agents=[{id:'agt_lead_a',name:'Lead A',itemLead:true,workItem:{itemId:'wi_aaaaaaaaaaaaaaaa'}},{id:'agt_handler_a',name:'Handler A'},{id:'agt_handler_c',name:'Handler C'}];
 document.querySelector('#delivery').innerHTML=renderTeamDelivery(queue,agents);
@@ -64,6 +65,8 @@ try {
       assert.match(await page.locator('[data-testid="team-ready-to-integrate"]').innerText(), /feature\/c @ b{40}/);
       assert.match(await page.locator('[data-testid="team-ready-to-integrate"]').innerText(), /\/fixture\/builder-c/);
       assert.equal(await page.locator('[data-testid="team-delivery-panel"] button').count(), 0);
+      assert.match(await page.locator('[data-testid="release-summary"]').innerText(),/Accepted → verified → merged → released/);
+      assert.match(await page.locator('[data-testid="release-summary"]').innerText(),/fixture-deployment/);
       await page.evaluate(() => {
         fixture.queue.entries[2].state = "running";
         fixture.queue.entries[2].integration = null;

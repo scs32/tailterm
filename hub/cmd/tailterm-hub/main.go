@@ -74,6 +74,18 @@ func scheduleMonitorConfig() (monitor.Config, error) {
 }
 
 func main() {
+	// Rehearsal opens only the explicitly supplied backup copy and starts no
+	// listener, broker, relay or Tailscale node.
+	if len(os.Args) == 3 && os.Args[1] == "--migrate-only" {
+		st, err := store.Open(os.Args[2])
+		if err != nil {
+			log.Fatal("migration rehearsal failed")
+		}
+		if err = st.Close(); err != nil {
+			log.Fatal("migration close failed")
+		}
+		return
+	}
 	stateDir := env("TAILTERM_STATE", "/state")
 	if err := os.MkdirAll(stateDir, 0o700); err != nil {
 		log.Fatalf("state dir: %v", err)

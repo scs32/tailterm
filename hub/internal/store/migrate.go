@@ -5,6 +5,9 @@ import "github.com/scs32/tailterm/hub/internal/api"
 
 // Additive migrations preserve existing task history and encrypted tailnet state.
 func migrate(db *sql.DB) error {
+	if _, err := db.Exec(releasesSchema); err != nil {
+		return err
+	}
 	if _, err := db.Exec(verificationSchema); err != nil {
 		return err
 	}
@@ -430,6 +433,9 @@ CREATE INDEX IF NOT EXISTS agent_allocation_intents_item ON agent_allocation_int
 	// legacy singleton index is deliberately removed only after all other
 	// additive migrations have succeeded.
 	if _, err := db.Exec(`DROP INDEX IF EXISTS agents_database_handler`); err != nil {
+		return err
+	}
+	if _, err := db.Exec(`CREATE UNIQUE INDEX IF NOT EXISTS agents_deployment_agent ON agents(task_id) WHERE role='deployment_agent' AND status<>'closed'`); err != nil {
 		return err
 	}
 	if err := migrateVerificationEnrollment(db); err != nil {

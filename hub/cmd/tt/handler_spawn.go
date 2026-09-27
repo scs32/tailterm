@@ -119,7 +119,7 @@ func handlerOwned(ctx context.Context, hub, task, agent, run, name string, recei
 
 func ensureHandler(ctx context.Context, c *api.Client, taskID string, req api.AddAgentRequest, opts spawn.Options) (api.Agent, error) {
 	var empty api.Agent
-	if c == nil || !api.ValidID(taskID, "tsk") || !api.ValidID(req.AgentID, "agt") || req.Role != "database_handler" || (req.ExpectedRunID != "" && !runIDPattern.MatchString(req.ExpectedRunID)) {
+	if c == nil || !api.ValidID(taskID, "tsk") || !api.ValidID(req.AgentID, "agt") || (req.Role != api.AgentRoleDatabaseHandler && req.Role != api.AgentRoleDeployment) || (req.ExpectedRunID != "" && !runIDPattern.MatchString(req.ExpectedRunID)) {
 		return empty, errors.New("handler launch requires a project, stable agent identity and database_handler role")
 	}
 	if !api.ValidName(req.Name) || req.Host == "" || req.Runtime == "" || opts.Cwd != req.Cwd || opts.Self == "" || strings.TrimSpace(opts.Command) == "" || req.ParentAgentID != "" {
@@ -149,6 +149,9 @@ func ensureHandler(ctx context.Context, c *api.Client, taskID string, req api.Ad
 		}
 	}
 	req.Session = "tt-handler-" + strings.TrimPrefix(req.AgentID, "agt_")
+	if req.Role == api.AgentRoleDeployment {
+		req.Session = "tt-deployer-" + strings.TrimPrefix(req.AgentID, "agt_")
+	}
 	payload := handlerPayload(req, opts)
 	current, getErr := c.GetAgent(ctx, taskID, req.AgentID)
 	found := getErr == nil
