@@ -96,7 +96,7 @@ def _deployment_plan(plan: dict[str, Any], release: str) -> dict[str, str]:
             expected[field] = deployment[field]
     targets = deployment.get("targets", ["hub", "bridge"])
     if (not isinstance(targets, list) or not targets or
-            len(targets) != len(set(targets)) or any(t not in ("hub", "bridge") for t in targets)):
+            any(not isinstance(t, str) or t not in ("hub", "bridge") for t in targets) or len(targets) != len(set(targets))):
         raise PreflightFailure("invalid-input", "invalid release targets")
     if "targets" in deployment:
         expected["targets"] = targets
