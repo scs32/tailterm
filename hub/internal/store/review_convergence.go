@@ -277,11 +277,14 @@ func reviewCompletion(ctx context.Context, tx *sql.Tx, item api.WorkItem, candid
 		}
 		return nil
 	}
-	if state.Disposition == nil || state.Disposition.Kind != "accept" {
+	if state.Disposition == nil || (state.Disposition.Kind != "accept" && state.Disposition.Kind != "owner-accept") {
 		return reviewConflict("saved lead acceptance required")
 	}
 	if candidate != "" && candidate != state.Disposition.Candidate {
 		return reviewConflict("acceptance candidate mismatch")
+	}
+	if state.Disposition.Kind == "owner-accept" {
+		return nil // the owner explicitly accepted this exact candidate
 	}
 	return reviewReady(state, item.ScopeRevision, state.Disposition.Candidate)
 }
@@ -429,16 +432,26 @@ func (s *Store) applyReviewConvergence(ctx context.Context, tx *sql.Tx, m api.Me
 		if e.Kind != "notice" {
 			return reviewConflict("disposition requires NOTICE")
 		}
-		if err = reviewLead(ctx, tx, m.TaskID, item.ID, req.AgentID, req.RunID); err != nil {
+		// owner-accept is the owner's own resolution of an owner-decision
+		// disposition: it binds one exact candidate and never comes from an agent.
+		ownerAccept := meta.Disposition == "owner-accept"
+		if ownerAccept {
+			if req.AgentID != "" || req.RunID != "" {
+				return reviewConflict("owner-accept requires an owner-authored notice")
+			}
+		} else if err = reviewLead(ctx, tx, m.TaskID, item.ID, req.AgentID, req.RunID); err != nil {
 			return err
 		}
-		if meta.Disposition != "accept" && meta.Disposition != "owner-decision" && meta.Disposition != "follow-ups" {
+		if meta.Disposition != "accept" && meta.Disposition != "owner-decision" && meta.Disposition != "follow-ups" && !ownerAccept {
 			return reviewConflict("unknown disposition")
 		}
 		if len(state.Rounds) == 0 || state.Rounds[len(state.Rounds)-1].ResultSeq == 0 {
 			return reviewConflict("completed review required for disposition")
 		}
-		if state.Disposition != nil {
+		if ownerAccept && (state.Disposition == nil || state.Disposition.Kind != "owner-decision") {
+			return reviewConflict("owner-accept resolves an owner-decision disposition")
+		}
+		if state.Disposition != nil && !ownerAccept {
 			return reviewConflict("disposition already recorded")
 		}
 		if meta.Disposition == "accept" {

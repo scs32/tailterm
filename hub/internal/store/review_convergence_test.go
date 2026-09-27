@@ -897,3 +897,62 @@ func TestReviewConvergenceFocusedSequentialFinalCandidateReverification(t *testi
 	}
 	acceptCorrectionFixture(t, f, e)
 }
+
+func TestReviewConvergenceOwnerAcceptResolvesOwnerDecision(t *testing.T) {
+	f := newConvergenceFixture(t)
+	partial := map[string]string{"a1": "pass", "a2": "partial"}
+	for _, candidate := range []string{candidateA, candidateB} {
+		r := f.review(t, candidate)
+		if _, err := f.post(f.resultEnv(candidate, partial, api.ReviewMetadata{Mode: "general"}), "", r.Seq, f.reviewer); err != nil {
+			t.Fatal(err)
+		}
+	}
+	disposition := func(kind, candidate string, from api.Agent) error {
+		_, err := f.post(api.Envelope{Kind: "notice", Subject: "Record the review disposition", Review: &api.ReviewMetadata{Mode: "disposition", Disposition: kind, Candidate: candidate}, Body: api.EnvelopeBody{Text: kind}}, "", 0, from)
+		return err
+	}
+	if err := disposition("owner-accept", candidateB, api.Agent{}); !errors.Is(err, api.ErrConflict) {
+		t.Fatal("owner-accept without an owner-decision", err)
+	}
+	if err := disposition("accept", candidateB, api.Agent{}); !errors.Is(err, api.ErrConflict) {
+		t.Fatal("partial criterion allowed ordinary acceptance", err)
+	}
+	if err := disposition("owner-decision", candidateB, api.Agent{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := disposition("accept", candidateB, api.Agent{}); !errors.Is(err, api.ErrConflict) {
+		t.Fatal("second ordinary disposition", err)
+	}
+	if err := disposition("owner-accept", candidateB, f.reviewer); !errors.Is(err, api.ErrConflict) {
+		t.Fatal("agent-authored owner-accept", err)
+	}
+	tx, err := f.s.db.BeginTx(f.ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = reviewCompletion(f.ctx, tx, f.item, candidateB); !errors.Is(err, api.ErrConflict) {
+		t.Fatal("owner-decision alone completed", err)
+	}
+	tx.Rollback()
+	if err = disposition("owner-accept", candidateB, api.Agent{}); err != nil {
+		t.Fatal(err)
+	}
+	if err = disposition("owner-accept", candidateB, api.Agent{}); !errors.Is(err, api.ErrConflict) {
+		t.Fatal("repeated owner-accept", err)
+	}
+	state := f.state(t)
+	if len(state.Dispositions) != 2 || state.Dispositions[0].Kind != "owner-decision" || state.Disposition.Kind != "owner-accept" || len(state.Rounds) != 2 {
+		t.Fatal("history not preserved", state.Dispositions, len(state.Rounds))
+	}
+	tx, err = f.s.db.BeginTx(f.ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback()
+	if err = reviewCompletion(f.ctx, tx, f.item, candidateA); !errors.Is(err, api.ErrConflict) {
+		t.Fatal("owner-accept completed a different commit", err)
+	}
+	if err = reviewCompletion(f.ctx, tx, f.item, candidateB); err != nil {
+		t.Fatal("owner-accepted exact commit", err)
+	}
+}
