@@ -25,7 +25,7 @@ func TestUsageHTTPExactRequestReplayPricesAndFilters(t *testing.T) {
 		t.Fatal(err)
 	}
 	at := time.Date(2026, 9, 27, 10, 0, 0, 0, time.UTC)
-	turn := api.UsageTurn{ID: "synthetic-one", Revision: 1, Runtime: "claude", Session: "synthetic", Model: "fixture-model", At: at, Tokens: map[string]int64{"input": 3, "cached": 2, "cacheWrite": 1, "output": 4}, Raw: map[string]int64{"input_tokens": 3, "cache_read_input_tokens": 2, "cache_creation_input_tokens": 1, "output_tokens": 4}, SourceDigest: strings.Repeat("a", 64), Complete: true}
+	turn := api.UsageTurn{ID: "synthetic-one", Revision: 1, Runtime: "claude", Session: "synthetic", Model: "fixture-model", At: at, Tokens: map[string]int64{"input": 3, "cached": 2, "cacheWrite": 1, "output": 3, "reasoning": 1}, Raw: map[string]int64{"input_tokens": 3, "cache_read_input_tokens": 2, "cache_creation_input_tokens": 1, "output_tokens": 4, "output_tokens_details.thinking_tokens": 1}, SourceDigest: strings.Repeat("a", 64), Complete: true}
 	b := api.UsageBatch{Version: 1, RequestID: "http-usage", RunID: a.RunID, Session: "synthetic", StartedAt: at, Turns: []api.UsageTurn{turn}}
 	r, err := c.ReportUsage(ctx, task.ID, a.ID, b)
 	if err != nil || r.Turns != 1 {
@@ -61,7 +61,7 @@ func TestUsageHTTPExactRequestReplayPricesAndFilters(t *testing.T) {
 		t.Fatal("CAS status", err)
 	}
 	b.Turns[0].Tokens["output"] = 5
-	b.Turns[0].Raw["output_tokens"] = 5
+	b.Turns[0].Raw["output_tokens"] = 6
 	if _, err = c.ReportUsage(ctx, task.ID, a.ID, b); !errors.As(err, &httpErr) || httpErr.Status != 409 {
 		t.Fatal("changed batch accepted", err)
 	}

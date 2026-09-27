@@ -4,6 +4,7 @@ import {
   formatUsageCost,
   usageSummary,
   sortUsageItems,
+  sortUsagePhases,
   usageClasses,
 } from "./usage-format.js";
 
@@ -55,7 +56,7 @@ export function createUsageView({ client, notice = () => {} }) {
     const groups = (label, rows = []) =>
       `<details data-usage-group="${esc(label)}" ${s.expanded.has(label) ? "open" : ""}><summary>${esc(label)}</summary><table class="usage-breakdown"><tbody>${rows.map((g) => `<tr><td>${esc(g.label)}</td><td>${esc(usageSummary(g.summary))}<br>${esc(formatUsageCost(g.summary))}</td></tr>`).join("")}</tbody></table></details>`;
     const item = (row) =>
-      `<details class="usage-item" data-usage-item="${esc(row.itemId || "overhead")}" ${s.expanded.has(row.itemId || "overhead") ? "open" : ""}><summary>${esc(row.title)} · ${esc(formatUsageCost(row.summary))}</summary><p>${esc(usageSummary(row.summary))}</p>${groups("Phases · " + (row.itemId || "overhead"), row.phases)}${groups("Roles · " + (row.itemId || "overhead"), row.roles)}${groups("Models · " + (row.itemId || "overhead"), row.models)}${groups("Phase and role · " + (row.itemId || "overhead"), row.phaseRoles)}</details>`;
+      `<details class="usage-item" data-usage-item="${esc(row.itemId || "overhead")}" ${s.expanded.has(row.itemId || "overhead") ? "open" : ""}><summary>${esc(row.title)} · ${esc(formatUsageCost(row.summary))}</summary><p>${esc(usageSummary(row.summary))}</p>${groups("Phases · " + (row.itemId || "overhead"), sortUsagePhases(row.phases))}${groups("Roles · " + (row.itemId || "overhead"), row.roles)}${groups("Models · " + (row.itemId || "overhead"), row.models)}${groups("Phase and role · " + (row.itemId || "overhead"), row.phaseRoles)}</details>`;
     const coverage = [
       ...new Set(
         (s.report?.coverage || [])

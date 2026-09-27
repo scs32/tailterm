@@ -93,7 +93,10 @@ func usageUpdate(old, t api.UsageTurn) bool {
 			return false
 		}
 	}
-	if old.Complete && (!t.Complete || !reflect.DeepEqual(old.Handled, t.Handled) || old.Gap != t.Gap) {
+	_, oldNormalizationGap := api.NormalizeUsageTokens(old.Runtime, old.Raw)
+	_, newNormalizationGap := api.NormalizeUsageTokens(t.Runtime, t.Raw)
+	gapResolved := old.Gap == oldNormalizationGap && t.Gap == newNormalizationGap
+	if old.Complete && (!t.Complete || !reflect.DeepEqual(old.Handled, t.Handled) || (old.Gap != t.Gap && !gapResolved)) {
 		return false
 	}
 	return !reflect.DeepEqual(old.Tokens, t.Tokens) || !reflect.DeepEqual(old.Raw, t.Raw) || !reflect.DeepEqual(old.Handled, t.Handled) || old.Complete != t.Complete || old.Gap != t.Gap

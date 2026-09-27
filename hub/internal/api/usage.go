@@ -165,10 +165,11 @@ func (c *Client) SetUsagePrices(ctx context.Context, task string, req UsagePrice
 func NormalizeUsageTokens(runtime string, raw map[string]int64) (map[string]int64, string) {
 	out := map[string]int64{}
 	gap := ""
-	names := map[string]string{"input": "input_tokens", "cached": "cached_input_tokens", "cacheWrite": "cache_write_tokens", "output": "output_tokens", "reasoning": "reasoning_output_tokens"}
+	names := map[string]string{"input": "input_tokens", "cached": "cached_input_tokens", "cacheWrite": "cache_write_input_tokens", "output": "output_tokens", "reasoning": "reasoning_output_tokens"}
 	if runtime == "claude" {
 		names["cached"] = "cache_read_input_tokens"
 		names["cacheWrite"] = "cache_creation_input_tokens"
+		names["reasoning"] = "output_tokens_details.thinking_tokens"
 	}
 	for class, name := range names {
 		if n, ok := raw[name]; ok {
@@ -184,12 +185,19 @@ func NormalizeUsageTokens(runtime string, raw map[string]int64) (map[string]int6
 			} else if cached > input {
 				delete(out, "input")
 				gap = "cached exceeds inclusive input"
+			} else if write, known := out["cacheWrite"]; known && write > 0 {
+				// The local format reports this class but does not establish its
+				// overlap with input. Preserve raw quantities; do not guess a split.
+				delete(out, "input")
+				gap = "nonzero cache-write overlap with input unavailable"
 			} else {
 				out["input"] = input - cached
 			}
 		}
-		// Codex documents reasoning as a subset of generated output in its local
-		// token event shape. Preserve inclusive output in Raw; charge disjoint output.
+	}
+	if runtime == "codex" || runtime == "claude" {
+		// Both runtime formats report thinking/reasoning inside generated output.
+		// Preserve inclusive output in Raw; charge disjoint output.
 		if output, ok := out["output"]; ok {
 			reasoning, rok := out["reasoning"]
 			if !rok {

@@ -7,6 +7,7 @@ import (
 	"errors"
 	"sort"
 	"strconv"
+	"strings"
 
 	"github.com/scs32/tailterm/hub/internal/api"
 )
@@ -18,6 +19,20 @@ type usageRunProvenance struct {
 	RoleSource string                    `json:"roleSource"`
 }
 
+func normalizeUsageRole(role string) string {
+	switch strings.TrimSpace(role) {
+	case "Planning and acceptance criteria":
+		return "planner"
+	case "Implementation":
+		return "builder"
+	case "Independent code review":
+		return "reviewer"
+	case "Independent matrix verification":
+		return "verifier"
+	default:
+		return role
+	}
+}
 func stringID(n int64) string { return strconv.FormatInt(n, 10) }
 func freezeUsageRole(ctx context.Context, tx *sql.Tx, p *usageRunProvenance) error {
 	a := p.Agent
@@ -65,7 +80,7 @@ func freezeUsageRole(ctx context.Context, tx *sql.Tx, p *usageRunProvenance) err
 		}
 		for _, m := range plan.Members {
 			if m.Fields.AgentID == a.ID && m.RunID == a.RunID && m.Fields.Role != "" {
-				p.Role, p.RoleSource = m.Fields.Role, "frozen team slot"
+				p.Role, p.RoleSource = normalizeUsageRole(m.Fields.Role), "frozen team slot role: "+m.Fields.Role
 				return nil
 			}
 		}
@@ -86,8 +101,7 @@ func resolveUsage(ctx context.Context, tx *sql.Tx, task, agent, run string, t ap
 		}
 		seen[key] = true
 		if depth > 8 {
-			invalid = true
-			return nil
+			return nil // Bound ancestry without discarding the head's valid links.
 		}
 		m, err := loadMessage(tx, ctx, ref.TaskID, ref.Seq)
 		if errors.Is(err, api.ErrNotFound) {
@@ -173,7 +187,7 @@ func resolveUsage(ctx context.Context, tx *sql.Tx, task, agent, run string, t ap
 		}
 	}
 	persistent := p.Role == "database_handler" || p.Role == "project_lead" || p.Role == "deployment_agent"
-	if len(items) == 0 && !persistent && !invalid && p.Binding != nil {
+	if len(items) == 0 && !persistent && p.Binding != nil {
 		b := p.Binding
 		items[b.ItemTaskID+"/"+b.ItemID] = api.UsageAttribution{TaskID: b.ItemTaskID, ItemID: b.ItemID, Reason: "exact admitted binding " + b.ContextDigest}
 		if err := visit(b.WorkOrderMessage, 0); err != nil {
@@ -181,8 +195,7 @@ func resolveUsage(ctx context.Context, tx *sql.Tx, task, agent, run string, t ap
 		}
 	}
 	if invalid {
-		items = map[string]api.UsageAttribution{}
-		out.PhaseReason = "conflicting or unresolved handled references"
+		out.PhaseReason = "some handled evidence was unresolved; valid links retained"
 	}
 	if len(items) == 0 {
 		reason := "unattributable persistent or unbound request"

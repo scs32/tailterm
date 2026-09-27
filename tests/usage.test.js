@@ -5,6 +5,7 @@ import {
   formatQuantity,
   formatUsageCost,
   sortUsageItems,
+  sortUsagePhases,
   usageSummary,
 } from "../client/usage-format.js";
 test("exact fractional comparison and unknown presentation", () => {
@@ -51,5 +52,32 @@ test("unknown cost never sorts as free; currencies remain distinct", () => {
       item("Partial", "10", false),
     ]).map((x) => x.title),
     ["High", "Low", "Partial", "Unknown"],
+  );
+});
+
+test("top phases use exact estimated costs or measured tokens with stable ties", () => {
+  const phase = (key, cost, tokens) => ({
+    key,
+    label: key,
+    summary: {
+      pricedSubtotal: cost === null ? {} : { USD: cost },
+      tokens: { input: tokens },
+    },
+  });
+  assert.deepEqual(
+    sortUsagePhases([
+      phase("A low", "1", "99"),
+      phase("Z high", "2", "1"),
+      phase("Unpriced", null, "100"),
+    ]).map((p) => p.key),
+    ["Z high", "A low", "Unpriced"],
+  );
+  assert.deepEqual(
+    sortUsagePhases([
+      phase("A low", null, "1"),
+      phase("Z high", null, "9007199254740993"),
+      phase("B low", null, "1"),
+    ]).map((p) => p.key),
+    ["Z high", "A low", "B low"],
   );
 });

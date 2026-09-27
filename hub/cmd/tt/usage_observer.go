@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/scs32/tailterm/hub/internal/api"
@@ -35,6 +36,7 @@ type usageCursor struct {
 	Pending           *api.UsageBatch          `json:"pending,omitempty"`
 	Uploaded          map[string]int64         `json:"uploaded,omitempty"`
 	Finished          map[string]bool          `json:"finished,omitempty"`
+	RejectedCoverage  string                   `json:"rejectedCoverage,omitempty"`
 	Frozen            bool                     `json:"frozen"`
 }
 
@@ -57,7 +59,7 @@ func loadUsageCursor(b runtimeBinding) (*usageCursor, error) {
 		}
 	}
 	if u.Binding.Run == "" {
-		u = usageCursor{Binding: b, StartedAt: time.Now().UTC(), Coverage: "partial: measurement began on a live session", Turns: map[string]api.UsageTurn{}, Dirty: map[string]bool{}}
+		u = usageCursor{Binding: b, StartedAt: time.Now().UTC(), Coverage: "partial: awaiting first reconciled request", Turns: map[string]api.UsageTurn{}, Dirty: map[string]bool{}}
 	}
 	if u.Uploaded == nil {
 		u.Uploaded = map[string]int64{}
@@ -73,9 +75,19 @@ func usageFields(raw json.RawMessage) map[string]int64 {
 	_ = json.Unmarshal(raw, &fields)
 	out := map[string]int64{}
 	for k, v := range fields {
+		if strings.TrimSpace(string(v)) == "null" {
+			continue
+		}
 		var n int64
 		if json.Unmarshal(v, &n) == nil && n >= 0 {
 			out[k] = n
+		}
+	}
+	var details map[string]json.RawMessage
+	if json.Unmarshal(fields["output_tokens_details"], &details) == nil {
+		var thinking int64
+		if strings.TrimSpace(string(details["thinking_tokens"])) != "null" && json.Unmarshal(details["thinking_tokens"], &thinking) == nil && thinking >= 0 {
+			out["output_tokens_details.thinking_tokens"] = thinking
 		}
 	}
 	return out
@@ -133,6 +145,9 @@ func (u *usageCursor) put(id string, at time.Time, model string, raw map[string]
 
 		t.Revision = u.nextRevision(id)
 		t.SourceDigest = digest
+	}
+	if u.Coverage == "partial: awaiting first reconciled request" && !u.Start.IsZero() && !strings.HasPrefix(u.Activation, "unbounded-") && !strings.HasPrefix(u.Activation, "claude-") {
+		u.Coverage = "measured from first reconciled request"
 	}
 	u.Turns[id] = t
 	u.Dirty[id] = true
@@ -340,7 +355,7 @@ func freezeUsageBatch(u *usageCursor) error {
 			break
 		}
 	}
-	if len(batch.Turns) == 0 && u.Enrolled && u.UploadedCoverage == u.Coverage {
+	if len(batch.Turns) == 0 && ((u.Enrolled && u.UploadedCoverage == u.Coverage) || u.RejectedCoverage == u.Coverage) {
 		return saveUsageCursor(u)
 	}
 	raw, _ := json.Marshal(batch)
@@ -370,6 +385,35 @@ func uploadUsage(ctx context.Context, u *usageCursor, c *api.Client) error {
 	}
 	receipt, err := c.ReportUsage(ctx, u.Binding.Task, u.Binding.Agent, *u.Pending)
 	if err != nil {
+		var rejected *api.HTTPError
+		if errors.As(err, &rejected) && (rejected.Status == 400 || rejected.Status == 404 || rejected.Status == 409) {
+			// Persist the immutable rejected batch before advancing. Never label
+			// it uploaded or discard the only numeric/provenance evidence.
+			coverage := fmt.Sprintf("partial: upload rejected %d; batch quarantined locally", rejected.Status)
+			quarantine := struct {
+				Binding  runtimeBinding `json:"binding"`
+				Batch    api.UsageBatch `json:"batch"`
+				Status   int            `json:"status"`
+				Coverage string         `json:"coverage"`
+				At       time.Time      `json:"at"`
+			}{u.Binding, *u.Pending, rejected.Status, coverage, time.Now().UTC()}
+			path := usageStatePath(u.Binding) + ".rejected-" + u.Pending.RequestID + ".json"
+			if saveErr := writePrivateJSON(path, quarantine); saveErr != nil {
+				return errors.Join(err, saveErr)
+			}
+			for _, turn := range u.Pending.Turns {
+				delete(u.Dirty, turn.ID)
+				delete(u.Turns, turn.ID)
+				delete(u.Uploaded, turn.ID)
+				u.Finished[turn.ID] = true
+			}
+			u.Pending = nil
+			u.Coverage = coverage
+			u.RejectedCoverage = coverage
+			if saveErr := saveUsageCursor(u); saveErr != nil {
+				return errors.Join(err, saveErr)
+			}
+		}
 		return err
 	}
 	if receipt.RequestID != u.Pending.RequestID || receipt.Turns != len(u.Pending.Turns) {
@@ -396,26 +440,77 @@ func uploadUsage(ctx context.Context, u *usageCursor, c *api.Client) error {
 // Frozen outboxes are retried without loading agents or scanning transcripts.
 // The caller's budgeted Client accounts for every upload; no agent turn is added.
 func flushFrozenUsage(ctx context.Context, dir string, clientFor func(runtimeBinding) (*api.Client, error)) error {
-	paths, _ := filepath.Glob(filepath.Join(dir, "*.usage-state.json"))
+	paths, err := filepath.Glob(filepath.Join(dir, "*.usage-state.json"))
+	if err != nil {
+		return err
+	}
+	// Rotate from the last attempted path, so transient failures and a small host
+	// budget cannot repeatedly consume the slot ahead of later frozen runs.
+	marker := filepath.Join(dir, "usage-flush-position.json")
+	var last string
+	if raw, e := os.ReadFile(marker); e == nil {
+		_ = json.Unmarshal(raw, &last)
+	}
+	split := sort.SearchStrings(paths, last)
+	if split < len(paths) && paths[split] == last {
+		split++
+	}
+	paths = append(paths[split:], paths[:split]...)
+	var failures []error
+	attempted := 0
 	for _, path := range paths {
-		var u usageCursor
-		raw, err := os.ReadFile(path)
-		if err != nil {
-			return err
+		if ctx.Err() != nil {
+			failures = append(failures, ctx.Err())
+			break
 		}
-		if json.Unmarshal(raw, &u) != nil || !u.Frozen || (len(u.Dirty) == 0 && u.Pending == nil && u.Coverage == u.UploadedCoverage) {
+		var u usageCursor
+		raw, e := os.ReadFile(path)
+		if e != nil {
+			failures = append(failures, e)
 			continue
 		}
-		c, err := clientFor(u.Binding)
-		if err != nil {
-			return err
+		if e = json.Unmarshal(raw, &u); e != nil {
+			failures = append(failures, e)
+			continue
 		}
-		if err = uploadUsage(ctx, &u, c); err != nil {
-			return err
+		if !u.Frozen {
+			continue
 		}
-		return nil
+		drained := func() bool {
+			return len(u.Dirty) == 0 && u.Pending == nil && (u.Coverage == u.UploadedCoverage || u.Coverage == u.RejectedCoverage)
+		}
+		if drained() {
+			if e = os.Remove(path); e != nil && !os.IsNotExist(e) {
+				failures = append(failures, e)
+			}
+			continue
+		}
+		if !u.LastUploadAttempt.IsZero() && time.Since(u.LastUploadAttempt) < 15*time.Second {
+			continue
+		}
+		if attempted >= 4 {
+			break
+		}
+		if e = writePrivateJSON(marker, path); e != nil {
+			failures = append(failures, e)
+			break
+		}
+		attempted++
+		c, e := clientFor(u.Binding)
+		if e != nil {
+			failures = append(failures, e)
+			continue
+		}
+		if e = uploadUsage(ctx, &u, c); e != nil {
+			failures = append(failures, e)
+		}
+		if drained() {
+			if e = os.Remove(path); e != nil && !os.IsNotExist(e) {
+				failures = append(failures, e)
+			}
+		}
 	}
-	return nil
+	return errors.Join(failures...)
 }
 func freezeRetiredUsage(b runtimeBinding) error {
 	if _, err := os.Stat(usageStatePath(b)); os.IsNotExist(err) {

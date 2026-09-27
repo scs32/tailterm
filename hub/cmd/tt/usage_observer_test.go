@@ -40,7 +40,7 @@ func codexUsageEvent(at string, last, total map[string]int64) string {
 func TestUsageCodexRequestsHistoricalModelsSubsetAndResets(t *testing.T) {
 	u := newSyntheticUsage(t, "codex")
 	start := `{"timestamp":"2026-09-27T10:00:00Z","type":"event_msg","payload":{"type":"task_started","turn_id":"activation"}}`
-	one := map[string]int64{"input_tokens": 100, "cached_input_tokens": 80, "cache_write_tokens": 0, "output_tokens": 10, "reasoning_output_tokens": 4, "total_tokens": 110}
+	one := map[string]int64{"input_tokens": 100, "cached_input_tokens": 80, "cache_write_input_tokens": 0, "output_tokens": 10, "reasoning_output_tokens": 4, "total_tokens": 110}
 	parseUsageLines(t, u, start, `{"timestamp":"2026-09-27T10:00:00Z","type":"turn_context","payload":{"model":"model-one"}}`, codexUsageEvent("2026-09-27T10:00:01Z", one, one), codexUsageEvent("2026-09-27T10:00:02Z", one, one))
 	if len(u.Turns) != 1 {
 		t.Fatal("duplicate snapshot", u)
@@ -84,16 +84,16 @@ func TestUsageCodexRequestsHistoricalModelsSubsetAndResets(t *testing.T) {
 }
 func TestUsageClaudeStreamingOneRequestAndClassAvailability(t *testing.T) {
 	u := newSyntheticUsage(t, "claude")
-	parseUsageLines(t, u, `{"type":"user","timestamp":"2026-09-27T10:00:00Z","message":{"content":"synthetic"}}`, `{"type":"assistant","timestamp":"2026-09-27T10:00:01Z","message":{"id":"msg-one","model":"model-one","usage":{"input_tokens":3,"cache_read_input_tokens":80,"cache_creation_input_tokens":12,"output_tokens":1}}}`, `{"type":"assistant","timestamp":"2026-09-27T10:00:02Z","message":{"id":"msg-one","model":"model-one","usage":{"input_tokens":3,"cache_read_input_tokens":80,"cache_creation_input_tokens":12,"output_tokens":7}}}`, `{"type":"assistant","timestamp":"2026-09-27T10:00:03Z","message":{"id":"msg-one","model":"model-one","stop_reason":"end_turn","usage":{"input_tokens":3,"cache_read_input_tokens":80,"cache_creation_input_tokens":12,"output_tokens":7}}}`)
+	parseUsageLines(t, u, `{"type":"user","timestamp":"2026-09-27T10:00:00Z","message":{"content":"synthetic"}}`, `{"type":"assistant","timestamp":"2026-09-27T10:00:01Z","message":{"id":"msg-one","model":"model-one","usage":{"input_tokens":3,"cache_read_input_tokens":80,"cache_creation_input_tokens":12,"output_tokens":1,"output_tokens_details":{"thinking_tokens":0}}}}`, `{"type":"assistant","timestamp":"2026-09-27T10:00:02Z","message":{"id":"msg-one","model":"model-one","usage":{"input_tokens":3,"cache_read_input_tokens":80,"cache_creation_input_tokens":12,"output_tokens":7,"output_tokens_details":{"thinking_tokens":2}}}}`, `{"type":"assistant","timestamp":"2026-09-27T10:00:03Z","message":{"id":"msg-one","model":"model-one","stop_reason":"end_turn","usage":{"input_tokens":3,"cache_read_input_tokens":80,"cache_creation_input_tokens":12,"output_tokens":7,"output_tokens_details":{"thinking_tokens":2}}}}`)
 	if len(u.Turns) != 1 {
 		t.Fatal(len(u.Turns))
 	}
 	x := u.Turns["claude-msg-one"]
-	if x.Revision != 1 || x.Tokens["input"] != 3 || x.Tokens["cached"] != 80 || x.Tokens["cacheWrite"] != 12 || x.Tokens["output"] != 7 || !x.Complete {
+	if x.Revision != 1 || x.Tokens["input"] != 3 || x.Tokens["cached"] != 80 || x.Tokens["cacheWrite"] != 12 || x.Tokens["output"] != 5 || !x.Complete {
 		t.Fatal(x)
 	}
-	if _, ok := x.Tokens["reasoning"]; ok {
-		t.Fatal("unsupported reasoning inferred", x)
+	if x.Tokens["reasoning"] != 2 || len(x.Tokens) != 5 {
+		t.Fatal("real-shaped thinking classes unavailable", x)
 	}
 }
 func TestUsageOpeningRequestGetsHandledActivationAndNextDoesNotInherit(t *testing.T) {
@@ -123,7 +123,7 @@ func TestUsageOpeningRequestGetsHandledActivationAndNextDoesNotInherit(t *testin
 }
 func TestUsageOutboxLostReplyRestartAndArchivedNoPolls(t *testing.T) {
 	u := newSyntheticUsage(t, "claude")
-	parseUsageLines(t, u, `{"type":"assistant","timestamp":"2026-09-27T10:00:01Z","message":{"id":"one","model":"m","stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":2}}}`)
+	parseUsageLines(t, u, `{"type":"assistant","timestamp":"2026-09-27T10:00:01Z","message":{"id":"one","model":"m","stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":2,"output_tokens_details":{"thinking_tokens":0}}}}`)
 	if err := freezeUsageBatch(u); err != nil {
 		t.Fatal(err)
 	}
@@ -176,7 +176,7 @@ func TestUsageOutboxLostReplyRestartAndArchivedNoPolls(t *testing.T) {
 func TestUsageBoundedAppendPartialAndNoTranscriptText(t *testing.T) {
 	u := newSyntheticUsage(t, "claude")
 	path := filepath.Join(t.TempDir(), "synthetic.jsonl")
-	line := `{"type":"assistant","timestamp":"2026-09-27T10:00:01Z","message":{"id":"one","model":"m","content":[{"type":"text","text":"PRIVATE_SYNTHETIC_TEXT"}],"usage":{"input_tokens":1,"output_tokens":2}}}`
+	line := `{"type":"assistant","timestamp":"2026-09-27T10:00:01Z","message":{"id":"one","model":"m","content":[{"type":"text","text":"PRIVATE_SYNTHETIC_TEXT"}],"usage":{"input_tokens":1,"output_tokens":2,"output_tokens_details":{"thinking_tokens":0}}}}`
 	if err := os.WriteFile(path, []byte(line), 0600); err != nil {
 		t.Fatal(err)
 	}
@@ -210,11 +210,11 @@ func TestUsageBoundedAppendPartialAndNoTranscriptText(t *testing.T) {
 
 func TestUsageLateClaudeOutputUsesNextProjectionNotAnotherRequest(t *testing.T) {
 	u := newSyntheticUsage(t, "claude")
-	parseUsageLines(t, u, `{"type":"assistant","timestamp":"2026-09-27T10:00:01Z","message":{"id":"late","model":"m","stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":2}}}`)
+	parseUsageLines(t, u, `{"type":"assistant","timestamp":"2026-09-27T10:00:01Z","message":{"id":"late","model":"m","stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":2,"output_tokens_details":{"thinking_tokens":0}}}}`)
 	first := u.Turns["claude-late"]
 	u.Uploaded[first.ID] = 1
 	delete(u.Dirty, first.ID)
-	parseUsageLines(t, u, `{"type":"assistant","timestamp":"2026-09-27T10:00:02Z","message":{"id":"late","model":"m","stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":8}}}`)
+	parseUsageLines(t, u, `{"type":"assistant","timestamp":"2026-09-27T10:00:02Z","message":{"id":"late","model":"m","stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":8,"output_tokens_details":{"thinking_tokens":0}}}}`)
 	next := u.Turns[first.ID]
 	if len(u.Turns) != 1 || next.Revision != 2 || next.Tokens["output"] != 8 || !next.At.Equal(first.At) || !next.Complete {
 		t.Fatal(next)
@@ -355,5 +355,227 @@ func TestUsageHandledRetentionGapIsExplicit(t *testing.T) {
 		if len(turn.Handled) != 64 {
 			t.Fatal(turn)
 		}
+	}
+}
+
+func TestUsageFrozenRejectedHeadDoesNotStarveAndQuarantines(t *testing.T) {
+	for _, status := range []int{400, 404, 409} {
+		t.Run(fmt.Sprint(status), func(t *testing.T) {
+			u := newSyntheticUsage(t, "claude")
+			vBinding := u.Binding
+			vBinding.Agent = "agt_2222222222222222"
+			vBinding.Run = "run_2222222222222222"
+			v, err := loadUsageCursor(vBinding)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, cursor := range []*usageCursor{u, v} {
+				parseUsageLines(t, cursor, `{"type":"assistant","timestamp":"2026-09-27T10:00:01Z","message":{"id":"frozen","model":"m","stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":2,"output_tokens_details":{"thinking_tokens":0}}}}`)
+				cursor.Frozen = true
+				if err = freezeUsageBatch(cursor); err != nil {
+					t.Fatal(err)
+				}
+			}
+			calls := []string{}
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				calls = append(calls, r.URL.Path)
+				if strings.Contains(r.URL.Path, u.Binding.Agent) {
+					w.WriteHeader(status)
+					return
+				}
+				var b api.UsageBatch
+				if err := json.NewDecoder(r.Body).Decode(&b); err != nil {
+					t.Error(err)
+				}
+				json.NewEncoder(w).Encode(api.UsageReceipt{RequestID: b.RequestID, Turns: len(b.Turns)})
+			}))
+			defer srv.Close()
+			c, _ := api.NewClient(srv.URL, time.Second)
+			if err = flushFrozenUsage(context.Background(), relayDir(), func(runtimeBinding) (*api.Client, error) { return c, nil }); err == nil {
+				t.Fatal("rejection claimed success")
+			}
+			if len(calls) != 2 || !strings.Contains(calls[1], v.Binding.Agent) {
+				t.Fatal("head starved next run", calls)
+			}
+			paths, _ := filepath.Glob(usageStatePath(u.Binding) + ".rejected-*.json")
+			if len(paths) != 1 {
+				t.Fatal(paths)
+			}
+			var evidence struct {
+				Status   int
+				Coverage string
+				Batch    api.UsageBatch
+			}
+			raw, _ := os.ReadFile(paths[0])
+			if json.Unmarshal(raw, &evidence) != nil || evidence.Status != status || !strings.Contains(evidence.Coverage, "partial: upload rejected") || len(evidence.Batch.Turns) != 1 {
+				t.Fatal(string(raw))
+			}
+			for _, cursor := range []*usageCursor{u, v} {
+				if _, err = os.Stat(usageStatePath(cursor.Binding)); !os.IsNotExist(err) {
+					t.Fatal("drained frozen cursor retained", err)
+				}
+			}
+			if err = flushFrozenUsage(context.Background(), relayDir(), func(runtimeBinding) (*api.Client, error) { return c, nil }); err != nil || len(calls) != 2 {
+				t.Fatal("drained run polled", calls, err)
+			}
+		})
+	}
+}
+func TestUsageFrozenThrottleDoesNotStarve(t *testing.T) {
+	u := newSyntheticUsage(t, "claude")
+	binding := u.Binding
+	binding.Agent = "agt_2222222222222222"
+	binding.Run = "run_2222222222222222"
+	v, err := loadUsageCursor(binding)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, cursor := range []*usageCursor{u, v} {
+		cursor.Frozen = true
+		if err = freezeUsageBatch(cursor); err != nil {
+			t.Fatal(err)
+		}
+	}
+	u.LastUploadAttempt = time.Now().UTC()
+	if err = saveUsageCursor(u); err != nil {
+		t.Fatal(err)
+	}
+	calls := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		if strings.Contains(r.URL.Path, u.Binding.Agent) {
+			t.Error("throttled run uploaded")
+		}
+		var b api.UsageBatch
+		json.NewDecoder(r.Body).Decode(&b)
+		json.NewEncoder(w).Encode(api.UsageReceipt{RequestID: b.RequestID, Turns: len(b.Turns)})
+	}))
+	defer srv.Close()
+	c, _ := api.NewClient(srv.URL, time.Second)
+	if err = flushFrozenUsage(context.Background(), relayDir(), func(runtimeBinding) (*api.Client, error) { return c, nil }); err != nil || calls != 1 {
+		t.Fatal(calls, err)
+	}
+}
+
+func TestUsageRealShapedBothRuntimesProduceCompletePricedReports(t *testing.T) {
+	t.Setenv("TAILTERM_RELAY_STATE", t.TempDir())
+	ctx := context.Background()
+	st, err := store.Open(filepath.Join(t.TempDir(), "report.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	by := api.Caller{Node: "fixture", User: "owner"}
+	task, err := st.CreateTask(ctx, api.CreateTaskRequest{Name: "Real shaped synthetic report"}, by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := httptest.NewServer(server.New(st, server.StaticIdentity(by)))
+	defer srv.Close()
+	client, _ := api.NewClient(srv.URL, time.Second)
+	at := time.Date(2026, 9, 27, 10, 0, 0, 0, time.UTC)
+	prices := []api.UsagePrice{}
+	for _, runtime := range []string{"codex", "claude"} {
+		agent, err := st.AddAgent(ctx, task.ID, api.AddAgentRequest{AgentID: api.NewID("agt"), Name: "handler-" + runtime, Host: "fixture", Session: "synthetic", Runtime: runtime, Role: api.AgentRoleDatabaseHandler}, by)
+		if err != nil {
+			t.Fatal(err)
+		}
+		title := "Z Codex"
+		if runtime == "claude" {
+			title = "A Claude"
+		}
+		item, err := st.CreateWorkItem(ctx, task.ID, api.CreateWorkItemRequest{Kind: "feature", Title: title, RequestID: "item-" + runtime}, by)
+		if err != nil {
+			t.Fatal(err)
+		}
+		message, err := st.PostMessage(ctx, task.ID, api.PostMessageRequest{To: agent.ID, RequestID: "priced-order-" + runtime, WorkItems: []api.MessageWorkItem{{ItemTaskID: task.ID, ItemID: item.ID, ItemRevision: 1, Relationship: "primary"}}, Envelope: &api.Envelope{Kind: "request", To: agent.ID, Subject: "Handle synthetic report", Body: api.EnvelopeBody{Ask: "Record fixture"}}}, by)
+		if err != nil {
+			t.Fatal(err)
+		}
+		b := runtimeBinding{Hub: srv.URL, Task: task.ID, Agent: agent.ID, Run: agent.RunID, Thread: "synthetic-" + runtime, Runtime: runtime}
+		u, err := loadUsageCursor(b)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err = writePrivateJSON(usageContextPath(env{agent: b.Agent, runID: b.Run}), []api.UsageEvidence{{TaskID: task.ID, Seq: message.Seq, Operation: "ack", At: at.Add(time.Second)}}); err != nil {
+			t.Fatal(err)
+		}
+		if runtime == "codex" {
+			raw := map[string]int64{"input_tokens": 100, "cached_input_tokens": 80, "cache_write_input_tokens": 0, "output_tokens": 10, "reasoning_output_tokens": 4, "total_tokens": 110}
+			parseUsageLines(t, u, `{"type":"event_msg","timestamp":"2026-09-27T10:00:00Z","payload":{"type":"task_started"}}`, `{"type":"turn_context","timestamp":"2026-09-27T10:00:00Z","payload":{"model":"real-shaped-codex"}}`, codexUsageEvent("2026-09-27T10:00:01Z", raw, raw), `{"type":"event_msg","timestamp":"2026-09-27T10:00:02Z","payload":{"type":"task_complete"}}`)
+		} else {
+			parseUsageLines(t, u, `{"type":"user","timestamp":"2026-09-27T10:00:00Z","message":{"content":"synthetic"}}`, `{"type":"assistant","timestamp":"2026-09-27T10:00:02Z","message":{"id":"priced","model":"real-shaped-claude","stop_reason":"end_turn","usage":{"input_tokens":3,"cache_read_input_tokens":80,"cache_creation_input_tokens":12,"output_tokens":7,"output_tokens_details":{"thinking_tokens":2}}}}`)
+		}
+		if strings.HasPrefix(u.Coverage, "partial") {
+			t.Fatal("fresh request coverage", runtime, u.Coverage)
+		}
+		if err = uploadUsage(ctx, u, client); err != nil {
+			t.Fatal(err)
+		}
+		prices = append(prices, api.UsagePrice{Runtime: runtime, Model: "real-shaped-" + runtime, Currency: "USD", EffectiveAt: at, Rates: map[string]string{"input": "1", "cached": "1", "cacheWrite": "1", "output": "1", "reasoning": "1"}})
+	}
+	if _, err = client.SetUsagePrices(ctx, task.ID, api.UsagePriceRequest{ExpectedRevision: 0, RequestID: "complete-prices", Rows: prices}); err != nil {
+		t.Fatal(err)
+	}
+	report, err := client.Usage(ctx, task.ID, api.UsageQuery{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.Summary.State != "measured" || !report.Summary.CostComplete || report.Summary.PricedSubtotal["USD"] != "53/250000" {
+		t.Fatal(report)
+	}
+	for _, item := range report.Items {
+		if item.Summary.State != "measured" || !item.Summary.CostComplete || len(item.Summary.Tokens) != 5 {
+			t.Fatal(item)
+		}
+	}
+	if path := os.Getenv("USAGE_REPORT_FIXTURE"); path != "" {
+		raw, _ := json.Marshal(report)
+		if err = os.WriteFile(path, raw, 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func TestUsageNullClassesStayUnavailable(t *testing.T) {
+	raw := usageFields(json.RawMessage(`{"input_tokens":null,"output_tokens":7,"output_tokens_details":{"thinking_tokens":null}}`))
+	if _, ok := raw["input_tokens"]; ok {
+		t.Fatal(raw)
+	}
+	if _, ok := raw["output_tokens_details.thinking_tokens"]; ok {
+		t.Fatal(raw)
+	}
+	tokens, gap := normalizeUsage("claude", raw)
+	if _, ok := tokens["output"]; ok || gap == "" {
+		t.Fatal(tokens, gap)
+	}
+}
+func TestUsageLiveRejectedBatchQuarantinesAndNextRequestContinues(t *testing.T) {
+	u := newSyntheticUsage(t, "claude")
+	parseUsageLines(t, u, `{"type":"assistant","timestamp":"2026-09-27T10:00:01Z","message":{"id":"rejected","model":"m","stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":2,"output_tokens_details":{"thinking_tokens":0}}}}`)
+	calls := 0
+	var accepted api.UsageBatch
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		if calls == 1 {
+			w.WriteHeader(409)
+			return
+		}
+		json.NewDecoder(r.Body).Decode(&accepted)
+		json.NewEncoder(w).Encode(api.UsageReceipt{RequestID: accepted.RequestID, Turns: len(accepted.Turns)})
+	}))
+	defer srv.Close()
+	c, _ := api.NewClient(srv.URL, time.Second)
+	if err := uploadUsage(context.Background(), u, c); err == nil || u.Pending != nil || !strings.Contains(u.Coverage, "upload rejected 409") {
+		t.Fatal(u, err)
+	}
+	restarted, err := loadUsageCursor(u.Binding)
+	if err != nil || !strings.Contains(restarted.Coverage, "upload rejected 409") {
+		t.Fatal(restarted, err)
+	}
+	parseUsageLines(t, restarted, `{"type":"assistant","timestamp":"2026-09-27T10:00:02Z","message":{"id":"next","model":"m","stop_reason":"end_turn","usage":{"input_tokens":2,"output_tokens":3,"output_tokens_details":{"thinking_tokens":0}}}}`)
+	restarted.LastUploadAttempt = time.Time{}
+	if err = uploadUsage(context.Background(), restarted, c); err != nil || len(accepted.Turns) != 1 || accepted.Turns[0].ID != "claude-next" || !strings.Contains(accepted.Coverage, "upload rejected 409") {
+		t.Fatal(accepted, err)
 	}
 }

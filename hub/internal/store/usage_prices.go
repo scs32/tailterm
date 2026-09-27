@@ -9,7 +9,6 @@ import (
 	"regexp"
 	"sort"
 	"strconv"
-	"strings"
 	"time"
 
 	"github.com/scs32/tailterm/hub/internal/api"
@@ -153,6 +152,7 @@ func (a *usageAccumulator) add(key string, t api.UsageTurn, d int64, prices api.
 	}
 	if !t.Complete || t.Gap != "" || len(t.Tokens) < len(api.UsageClasses) {
 		a.summary.State = "partial"
+		a.full = false
 	}
 	price := usagePriceFor(t, prices)
 	if price == nil {
@@ -298,7 +298,6 @@ func (s *Store) Usage(ctx context.Context, task string, q api.UsageQuery) (api.U
 		return out, err
 	}
 	out.PriceRevision = prices.Revision
-	runCoverage := map[string]string{}
 	coverageRows, err := tx.QueryContext(ctx, `SELECT agent_id,run_id,started_at,coverage FROM usage_runs WHERE task_id=?`, task)
 	if err != nil {
 		return out, err
@@ -310,7 +309,6 @@ func (s *Store) Usage(ctx context.Context, task string, q api.UsageQuery) (api.U
 			return out, err
 		}
 		out.Coverage = append(out.Coverage, c)
-		runCoverage[c.AgentID+"/"+c.RunID] = c.State
 	}
 	err = coverageRows.Err()
 	coverageRows.Close()
@@ -353,10 +351,6 @@ func (s *Store) Usage(ctx context.Context, task string, q api.UsageQuery) (api.U
 			break
 		}
 		t := p.Turn
-		if strings.HasPrefix(runCoverage[p.AgentID+"/"+p.RunID], "partial") {
-			p.Turn.Gap = runCoverage[p.AgentID+"/"+p.RunID]
-			t = p.Turn
-		}
 		if (!q.From.IsZero() && t.At.Before(q.From)) || (!q.To.IsZero() && !t.At.Before(q.To)) {
 			continue
 		}

@@ -46,7 +46,7 @@ func usageFixture(t *testing.T) (*Store, api.Task, api.Agent, []api.WorkItem, []
 	return s, task, a, items, messages
 }
 func syntheticUsageTurn(id string) api.UsageTurn {
-	return api.UsageTurn{ID: id, Revision: 1, Runtime: "codex", Session: "synthetic-session", Model: "synthetic-model", At: time.Date(2026, 9, 27, 10, 0, 0, 0, time.UTC), Tokens: map[string]int64{"input": 21, "cached": 80, "cacheWrite": 3, "output": 7, "reasoning": 2}, Raw: map[string]int64{"input_tokens": 101, "cached_input_tokens": 80, "cache_write_tokens": 3, "output_tokens": 9, "reasoning_output_tokens": 2}, SourceDigest: strings.Repeat("a", 64), Activation: "activation-one", Complete: true}
+	return api.UsageTurn{ID: id, Revision: 1, Runtime: "codex", Session: "synthetic-session", Model: "synthetic-model", At: time.Date(2026, 9, 27, 10, 0, 0, 0, time.UTC), Tokens: map[string]int64{"input": 21, "cached": 80, "cacheWrite": 0, "output": 7, "reasoning": 2}, Raw: map[string]int64{"input_tokens": 101, "cached_input_tokens": 80, "cache_write_input_tokens": 0, "output_tokens": 9, "reasoning_output_tokens": 2}, SourceDigest: strings.Repeat("a", 64), Activation: "activation-one", Complete: true}
 }
 func usageBatch(a api.Agent, key string, turns ...api.UsageTurn) api.UsageBatch {
 	return api.UsageBatch{Version: 1, RequestID: key, RunID: a.RunID, Session: "synthetic-session", StartedAt: time.Date(2026, 9, 27, 9, 0, 0, 0, time.UTC), Coverage: "synthetic complete", Turns: turns}
@@ -135,7 +135,7 @@ func TestUsagePricesExactDatesUnknownAndRevisionCAS(t *testing.T) {
 		t.Fatal("prices replay", err)
 	}
 	report, _ = s.Usage(ctx, task.ID, api.UsageQuery{})
-	if report.Summary.PricedSubtotal["USD"] != "127/1000000" || !report.Summary.CostComplete {
+	if report.Summary.PricedSubtotal["USD"] != "59/500000" || !report.Summary.CostComplete {
 		t.Fatal("exact cost", report.Summary)
 	}
 	later := syntheticUsageTurn("later")
@@ -303,5 +303,88 @@ func TestUsageExactPhasesReviewRoundsAndWeightedContext(t *testing.T) {
 	}
 	if len(phaseItem.PhaseRoles) != 7 || phaseItem.Roles[0].Key != "builder" || report.Summary.Tokens["input"] != "147" {
 		t.Fatal("phase/role conservation", report)
+	}
+}
+
+func TestUsagePlannedDescriptiveRolesSelectPhases(t *testing.T) {
+	for _, spec := range []struct{ role, phase, slug string }{{"Planning and acceptance criteria", "intake and planning", "planner"}, {"Independent matrix verification", "verification", "verifier"}} {
+		t.Run(spec.slug, func(t *testing.T) {
+			s, task, a, items, messages := usageFixture(t)
+			ctx := context.Background()
+			if _, err := s.db.Exec(`UPDATE agents SET role='' WHERE id=?`, a.ID); err != nil {
+				t.Fatal(err)
+			}
+			plan, _ := json.Marshal(map[string]any{"members": []any{map[string]any{"fields": map[string]any{"agentId": a.ID, "name": spec.slug + "-fixture", "role": spec.role}, "runId": a.RunID}}})
+			if _, err := s.db.Exec(`INSERT INTO team_queue_entries(id,task_id,item_id,item_revision,order_seq,template,position,state,revision,host,cwd,pause_generation,launch_json,created_at,updated_at) VALUES(?,?,?,1,1,'planned',1,'running',1,'fixture','/tmp',0,?,?,?)`, api.NewID("tqe"), task.ID, items[0].ID, string(plan), ts(s.now()), ts(s.now())); err != nil {
+				t.Fatal(err)
+			}
+			turn := syntheticUsageTurn("planned-" + spec.slug)
+			turn.At = messages[0].CreatedAt.Add(time.Second)
+			turn.Handled = []api.UsageEvidence{{TaskID: task.ID, Seq: messages[0].Seq, Operation: "ack", At: turn.At}}
+			if _, err := s.ReportUsage(ctx, task.ID, a.ID, usageBatch(a, "planned-"+spec.slug, turn)); err != nil {
+				t.Fatal(err)
+			}
+			report, err := s.Usage(ctx, task.ID, api.UsageQuery{Item: items[0].ID})
+			if err != nil || len(report.Items) != 1 || report.Items[0].Phases[0].Key != spec.phase || report.Items[0].Roles[0].Key != spec.slug {
+				t.Fatal(report, err)
+			}
+		})
+	}
+}
+func TestUsageBoundedAncestorsAndBadEntryKeepValidItems(t *testing.T) {
+	s, task, a, items, _ := usageFixture(t)
+	ctx := context.Background()
+	by := api.Caller{Node: "fixture", User: "owner"}
+	var head api.Message
+	for i := 0; i < 11; i++ {
+		req := api.PostMessageRequest{To: a.ID, ReplyTo: head.Seq, RequestID: fmt.Sprintf("ancestor-%d", i), Text: "Synthetic ancestor"}
+		if i == 10 {
+			req.WorkItems = []api.MessageWorkItem{{ItemTaskID: task.ID, ItemID: items[0].ID, ItemRevision: items[0].Revision, Relationship: "primary"}}
+		}
+		var err error
+		head, err = s.PostMessage(ctx, task.ID, req, by)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	turn := syntheticUsageTurn("bounded")
+	turn.Handled = []api.UsageEvidence{{TaskID: task.ID, Seq: head.Seq, Operation: "ack", At: turn.At}, {TaskID: task.ID, Seq: 999999, Operation: "ack", At: turn.At}}
+	if _, err := s.ReportUsage(ctx, task.ID, a.ID, usageBatch(a, "bounded", turn)); err != nil {
+		t.Fatal(err)
+	}
+	report, err := s.Usage(ctx, task.ID, api.UsageQuery{Item: items[0].ID})
+	if err != nil || report.Summary.Requests != 1 || report.Summary.Tokens["input"] != "21" {
+		t.Fatal("valid head lost to overhead", report, err)
+	}
+}
+func TestUsageReassignedObligationAndBindingFallbackSurviveBadAck(t *testing.T) {
+	s, task, old, items, messages := usageFixture(t)
+	ctx := context.Background()
+	by := api.Caller{Node: "fixture", User: "owner"}
+	target, err := s.AddAgent(ctx, task.ID, api.AddAgentRequest{Name: "correction-builder", Host: "fixture", Session: "fixture", Runtime: "codex"}, by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = s.db.Exec(`INSERT INTO agent_work_item_bindings(agent_id,run_id,item_task_id,item_id,item_revision,work_order_task_id,work_order_message_seq,context_through_message_seq,context_digest,context_json,created_at) VALUES(?,?,?,?,1,?,?,0,'synthetic-binding','{}',?)`, target.ID, target.RunID, task.ID, items[0].ID, task.ID, messages[0].Seq, ts(s.now())); err != nil {
+		t.Fatal(err)
+	}
+	var obligation string
+	if err = s.db.QueryRow(`SELECT id FROM obligations WHERE message_seq=? AND agent_id=?`, messages[0].Seq, old.ID).Scan(&obligation); err != nil {
+		t.Fatal(err)
+	}
+	moved, err := s.ReassignObligation(ctx, task.ID, obligation, api.ObligationReassignRequest{ToAgentID: target.ID, Reason: "Synthetic handoff"}, by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i, seq := range []int64{moved.Seq, messages[0].Seq} {
+		turn := syntheticUsageTurn(fmt.Sprintf("reassigned-%d", i))
+		turn.Handled = []api.UsageEvidence{{TaskID: task.ID, Seq: seq, Operation: "ack", At: turn.At}}
+		if _, err = s.ReportUsage(ctx, task.ID, target.ID, usageBatch(target, fmt.Sprintf("reassigned-%d", i), turn)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	report, err := s.Usage(ctx, task.ID, api.UsageQuery{Item: items[0].ID})
+	if err != nil || report.Summary.Requests != 2 || report.Summary.Tokens["input"] != "42" {
+		t.Fatal("reassignment or exact binding discarded", report, err)
 	}
 }

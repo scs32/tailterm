@@ -81,3 +81,35 @@ export function usageSummary(summary = {}) {
     : "unavailable";
   return `${summary.state === "partial" ? "Partial coverage · " : ""}${summary.requests || 0} requests · ${formatQuantity(summary.allocatedTurns)} allocated turns · average context ${formatQuantity(summary.averageContext)} · cached input ${cached}${tokens ? " · " + tokens : ""}`;
 }
+
+// Rank top phases using exact estimated cost where comparable. Keep currencies
+// distinct; unpriced phases use the sum of reported disjoint token classes.
+export function sortUsagePhases(phases = []) {
+  const total = (summary) =>
+    usageClasses.reduce(
+      (sum, k) => {
+        const r = rational(summary.tokens?.[k]);
+        if (!r) return sum;
+        return [sum[0] * r[1] + r[0] * sum[1], sum[1] * r[1]];
+      },
+      [0n, 1n],
+    );
+  return [...phases].sort((a, b) => {
+    const ac = Object.keys(a.summary.pricedSubtotal || {}).sort(),
+      bc = Object.keys(b.summary.pricedSubtotal || {}).sort();
+    if (!!ac.length !== !!bc.length) return ac.length ? -1 : 1;
+    if (ac.length === 1 && bc.length === 1) {
+      if (ac[0] !== bc[0]) return ac[0].localeCompare(bc[0]);
+      const cost = compareRational(
+        b.summary.pricedSubtotal[bc[0]],
+        a.summary.pricedSubtotal[ac[0]],
+      );
+      if (cost) return cost;
+    }
+    const x = total(a.summary),
+      y = total(b.summary),
+      d = y[0] * x[1] - x[0] * y[1];
+    if (d !== 0n) return d > 0n ? 1 : -1;
+    return String(a.key || a.label).localeCompare(String(b.key || b.label));
+  });
+}
