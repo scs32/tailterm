@@ -67,3 +67,10 @@ func (s *Server) resumeAgent(w http.ResponseWriter, r *http.Request) {
 		return s.store.ResumeAgent(r.Context(), id, r.PathValue("aid"), req, c)
 	})
 }
+
+func (s *Server) delegateOwnerObligation(w http.ResponseWriter, r *http.Request) {
+	var req api.OwnerDelegationRequest
+	s.ownerRoute(w, r, &req, func(c api.Caller, id string) (api.OwnerActionResult, error) {
+		return s.store.DelegateOwnerObligation(r.Context(), id, r.PathValue("oid"), req, c)
+	})
+}

@@ -75,6 +75,7 @@ func New(st *store.Store, identity Identity) *Server {
 	m.HandleFunc("POST /v1/tasks/{id}/obligations/{oid}/nudge", s.nudgeObligation)
 	m.HandleFunc("POST /v1/tasks/{id}/obligations/{oid}/extend", s.extendObligation)
 	m.HandleFunc("POST /v1/tasks/{id}/obligations/{oid}/answer", s.answerObligation)
+	m.HandleFunc("POST /v1/tasks/{id}/obligations/{oid}/delegate", s.delegateOwnerObligation)
 	m.HandleFunc("POST /v1/tasks/{id}/obligations/{oid}/cancel", s.cancelObligation)
 	m.HandleFunc("POST /v1/tasks/{id}/obligations/{oid}/withdraw", s.withdrawObligation)
 	m.HandleFunc("POST /v1/tasks/{id}/agents/{aid}/resume", s.resumeAgent)
@@ -729,13 +730,16 @@ func (s *Server) listObligations(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	agent, run := q.Get("agentId"), q.Get("runId")
+	if q.Get("owner") == "1" {
+		agent, run = "", ""
+	}
 	if agent != "" && run != "" {
 		if err := s.store.MarkObligationsDelivered(r.Context(), id, agent, run, now); err != nil {
 			fail(w, err)
 			return
 		}
 	}
-	list, err := s.store.ListObligations(r.Context(), id, store.ObligationFilter{AgentID: agent, OpenOnly: q.Get("open") == "1", Overdue: q.Get("overdue") == "1", FromSeq: queryInt(r, "fromSeq", 0), ToSeq: queryInt(r, "toSeq", 0)}, now)
+	list, err := s.store.ListObligations(r.Context(), id, store.ObligationFilter{OwnerOnly: q.Get("owner") == "1", AgentID: agent, OpenOnly: q.Get("open") == "1", Overdue: q.Get("overdue") == "1", FromSeq: queryInt(r, "fromSeq", 0), ToSeq: queryInt(r, "toSeq", 0)}, now)
 	if err != nil {
 		fail(w, err)
 		return

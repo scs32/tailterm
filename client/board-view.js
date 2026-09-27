@@ -1,3 +1,7 @@
+import {
+  renderOwnerRequests,
+  startOwnerAgeClock,
+} from "./owner-obligations.js";
 import { readProjectAuditExport, readTaskHistory } from "./task-history.js";
 import { downloadBlob } from "./terminal-extras.js";
 import {
@@ -226,6 +230,13 @@ export function createBoardView({
     };
   }
   const sending = new Set();
+  let ownerRequests = [],
+    ownerRequestError = "",
+    stopOwnerClock;
+  const ownerSending = new Set(),
+    ownerErrors = new Map(),
+    ownerAnswerDrafts = new Map(),
+    ownerAnswerKeys = new Map();
   const decisionSending = new Set();
   const decisionErrors = new Map();
   const revealedAnswers = new Set();
@@ -664,6 +675,7 @@ export function createBoardView({
     presentation.mount(container);
   }
   function hide() {
+    stopOwnerClock?.();
     const wasVisible = visible;
     saveDraft();
     saveDecisionDrafts();
@@ -678,6 +690,8 @@ export function createBoardView({
   async function show(taskId, itemContext) {
     saveDraft();
     visible = true;
+    stopOwnerClock?.();
+    stopOwnerClock = startOwnerAgeClock(root);
     if (taskId && taskId !== selected) {
       interruptMessageScroll();
       saveDraft();
@@ -772,12 +786,18 @@ export function createBoardView({
             completeConversations.has(id)
               ? Promise.resolve(completeConversations.get(id))
               : actionClient.listMessages(id, { limit: 200, latest: 1 }),
+            (
+              actionClient.listOwnerObligations?.(id) || Promise.resolve([])
+            ).then(
+              (value) => ({ value }),
+              (error) => ({ error }),
+            ),
             readAllDecisions(actionClient, id).then(
               (value) => ({ value }),
               (error) => ({ error }),
             ),
           ])
-        : [null, [], { value: [] }];
+        : [null, [], { value: [] }, { value: [] }];
       if (!currentAction(id, token, actionClient)) return;
       const loadedDetail = result[0];
       if (id && loadedDetail?.task.id !== id)
@@ -796,7 +816,9 @@ export function createBoardView({
         composeItemsError = "";
       }
       if (capabilitiesClient !== actionClient) capabilities = null;
-      const decisionResult = result[2];
+      ownerRequests = result[2].value || [];
+      ownerRequestError = result[2].error?.message || "";
+      const decisionResult = result[3];
       if (decisionResult.error) {
         if (decisionsTask !== id) decisions = [];
         decisionLoadError = decisionResult.error.message;
@@ -1067,7 +1089,7 @@ export function createBoardView({
             .map(rosterAgent)
             .join(
               "",
-            )}</div></div>${renderDecisionPanel({ records: decisions, taskId: selected, archived, name, drafts: decisionDrafts, sending: decisionSending, errors: decisionErrors, revealedAnswers, historyOpen: decisionPresentation.get(selected)?.historyOpen, loadError: decisionLoadError })}${recoveryMarkup}<div id="board-messages" class="board-messages">${messages.length === 200 && !completeConversations.has(selected) ? `<p class="fine">Latest 200 messages.${archived ? ' <button id="board-full-history">Show full conversation</button>' : " Full history remains on the hub."}</p>` : ""}${messageMarkup}</div>${
+            )}</div></div>${renderDecisionPanel({ records: decisions, taskId: selected, archived, name, drafts: decisionDrafts, sending: decisionSending, errors: decisionErrors, revealedAnswers, historyOpen: decisionPresentation.get(selected)?.historyOpen, loadError: decisionLoadError })}${renderOwnerRequests(ownerRequests, { archived, error: ownerRequestError, sending: ownerSending, errors: ownerErrors })}${recoveryMarkup}<div id="board-messages" class="board-messages">${messages.length === 200 && !completeConversations.has(selected) ? `<p class="fine">Latest 200 messages.${archived ? ' <button id="board-full-history">Show full conversation</button>' : " Full history remains on the hub."}</p>` : ""}${messageMarkup}</div>${
             archived
               ? ""
               : `<form id="board-compose">${d.replyTo ? `<div class="compose-reply">Replying to #${d.replyTo}<button type="button" id="board-cancel-reply">Cancel reply</button></div>` : ""}<label class="compose-recipient">To<select ${sending.has(selected) ? "disabled" : ""} id="board-to" data-view-control="recipient" aria-label="Recipient"><option value="">Everyone</option>${agents
@@ -1082,6 +1104,49 @@ export function createBoardView({
           }`
         : ""
     }</section></div>`;
+    const ownerTask = selected,
+      ownerClient = client();
+    const submitOwner = async (id, approve, text) => {
+      if (ownerSending.has(id)) return;
+      const key = `${ownerTask}/${id}/${approve}/${text}`;
+      if (!ownerAnswerKeys.has(key))
+        ownerAnswerKeys.set(key, crypto.randomUUID());
+      ownerSending.add(id);
+      ownerErrors.delete(id);
+      try {
+        await ownerClient.answerOwnerObligation(ownerTask, id, {
+          text,
+          approve,
+          requestId: ownerAnswerKeys.get(key),
+        });
+        ownerAnswerDrafts.delete(`${ownerTask}/${id}`);
+        if (visible && selected === ownerTask && client() === ownerClient)
+          await reload(epoch);
+      } catch (error) {
+        ownerErrors.set(id, error.message);
+      } finally {
+        ownerSending.delete(id);
+        if (visible && selected === ownerTask && client() === ownerClient)
+          render();
+      }
+    };
+    root.querySelectorAll("[data-owner-answer]").forEach((form) => {
+      const id = form.dataset.ownerAnswer,
+        draftKey = `${ownerTask}/${id}`;
+      form.elements.answer.value = ownerAnswerDrafts.get(draftKey) || "";
+      form.elements.answer.oninput = () =>
+        ownerAnswerDrafts.set(draftKey, form.elements.answer.value);
+      form.onsubmit = (event) => {
+        event.preventDefault();
+        void submitOwner(id, false, form.elements.answer.value);
+      };
+    });
+    root.querySelectorAll("[data-owner-approve]").forEach(
+      (button) =>
+        (button.onclick = () => {
+          void submitOwner(button.dataset.ownerApprove, true, "");
+        }),
+    );
     presentation.afterRender(selected);
     bindTeamDisclosure(selected);
     root.querySelector("#board-new-task").onclick = () => newTask();

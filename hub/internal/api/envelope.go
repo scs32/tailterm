@@ -14,15 +14,16 @@ import (
 // Envelope is a typed board message (docs/message-broker.md). Phase 1 stores
 // and validates it; nothing yet derives obligations from it.
 type Envelope struct {
-	Review      *ReviewMetadata     `json:"review,omitempty"`
-	Kind        string              `json:"kind"`
-	To          string              `json:"to,omitempty"`
-	Subject     string              `json:"subject"`
-	Refs        map[string]string   `json:"refs,omitempty"`
-	Body        EnvelopeBody        `json:"body"`
-	Evidence    map[string]Evidence `json:"evidence,omitempty"`
-	Attachments []string            `json:"attachments,omitempty"`
-	Due         string              `json:"due,omitempty"`
+	Review         *ReviewMetadata     `json:"review,omitempty"`
+	Kind           string              `json:"kind"`
+	To             string              `json:"to,omitempty"`
+	Subject        string              `json:"subject"`
+	Refs           map[string]string   `json:"refs,omitempty"`
+	Body           EnvelopeBody        `json:"body"`
+	Evidence       map[string]Evidence `json:"evidence,omitempty"`
+	Attachments    []string            `json:"attachments,omitempty"`
+	ExpectedAnswer string              `json:"expectedAnswer,omitempty"`
+	Due            string              `json:"due,omitempty"`
 }
 
 // EnvelopeBody holds the named fields of every kind. Maps use short named keys
@@ -281,6 +282,9 @@ func ValidateEnvelope(e Envelope) []Problem {
 			add(fmt.Sprintf("body.owns.%d", i), "must not be empty")
 		}
 	}
+	if e.ExpectedAnswer != "" && (e.Kind != EnvelopeKindRequest || !ValidText(e.ExpectedAnswer, 2000)) {
+		out = append(out, Problem{Field: "expectedAnswer", Reason: "requires a request and at most 2000 bytes"})
+	}
 	if e.Due != "" {
 		if d, err := time.ParseDuration(e.Due); err != nil || d <= 0 || d > MaxEnvelopeDue {
 			add("due", "must be a positive duration up to 168h, such as 45m or 2h")
@@ -350,6 +354,7 @@ func forEachText(e Envelope, fn func(field, value string)) {
 	fn("subject", e.Subject)
 	fn("to", e.To)
 	fn("due", e.Due)
+	fn("expectedAnswer", e.ExpectedAnswer)
 	for _, k := range sortedKeys(e.Refs) {
 		fn("refs."+k, e.Refs[k])
 	}
@@ -428,6 +433,9 @@ func RenderText(e Envelope) string {
 	line("Evidence", strings.Join(ev, "; "))
 	line("Attachments", strings.Join(e.Attachments, ", "))
 	line("Due", e.Due)
+	if e.ExpectedAnswer != "" {
+		b.WriteString("\nExpected answer:\n" + e.ExpectedAnswer)
+	}
 	return b.String()
 }
 

@@ -58,7 +58,13 @@ const (
 // ObligationWakeOffsets are the re-wake times after creation while unacknowledged.
 var ObligationWakeOffsets = []time.Duration{time.Minute, 3 * time.Minute, 7 * time.Minute}
 
+const ObligationRecipientOwner = "owner"
+const ObligationRecipientAgent = "agent"
+const ObligationOwnerDefaultDue = 30 * time.Minute
+
 type Obligation struct {
+	RecipientKind    string     `json:"recipientKind"`
+	Request          *Message   `json:"request,omitempty"`
 	ID               string     `json:"id"`
 	TaskID           string     `json:"taskId"`
 	MessageSeq       int64      `json:"messageSeq"`

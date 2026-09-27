@@ -409,6 +409,8 @@ export function createCachedHubClient({
     // would strand this client on the legacy path after a hub upgrade, while
     // serving stale success offline could expose controls the hub cannot honor.
     capabilities: () => client.capabilities(),
+    listOwnerObligations: async (task, params = {}) => (await read(`/v1/tasks/${task}/obligations` + query({owner:1,open:1,...params}))).obligations,
+    answerOwnerObligation: async (task,id,body) => { const result = await client.answerOwnerObligation(task,id,body); invalidate(); return result; },
     listTasks: async () => (await read("/v1/tasks")).tasks,
     getTask: (id) => read(`/v1/tasks/${id}`),
     listAgents: async (id) => (await read(`/v1/tasks/${id}/agents`)).agents,

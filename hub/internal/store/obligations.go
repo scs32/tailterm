@@ -129,6 +129,9 @@ func obligationSubject(req api.PostMessageRequest) (kind, subject string) {
 
 // createObligations runs inside the message transaction.
 func (s *Store) createObligations(ctx context.Context, tx *sql.Tx, m api.Message, req api.PostMessageRequest, human bool) error {
+	if isOwnerRequest(req) {
+		return s.createOwnerObligation(ctx, tx, m, req)
+	}
 	if req.To == "" || req.To == req.AgentID {
 		return nil // board-wide posts and self-addressed posts oblige no one
 	}
@@ -226,13 +229,13 @@ func truncateRunes(s string, n int) string {
 	return string(r[:n]) + "…"
 }
 
-const obligationCols = `id,task_id,message_seq,agent_id,subject,source_kind,needs,state,outcome,outcome_seq,reason,created_at,ack_due_at,due_at,delivered_at,acked_at,last_progress_at,closed_at,escalation,nudges`
+const obligationCols = `id,task_id,message_seq,agent_id,subject,source_kind,needs,state,outcome,outcome_seq,reason,created_at,ack_due_at,due_at,delivered_at,acked_at,last_progress_at,closed_at,escalation,nudges,recipient_kind`
 
 func scanObligation(row rowScanner) (api.Obligation, error) {
 	var o api.Obligation
 	var created, ackDue, due, delivered, acked, progress, closed string
 	err := row.Scan(&o.ID, &o.TaskID, &o.MessageSeq, &o.AgentID, &o.Subject, &o.SourceKind, &o.Needs, &o.State, &o.Outcome, &o.OutcomeSeq, &o.Reason,
-		&created, &ackDue, &due, &delivered, &acked, &progress, &closed, &o.Escalation, &o.Nudges)
+		&created, &ackDue, &due, &delivered, &acked, &progress, &closed, &o.Escalation, &o.Nudges, &o.RecipientKind)
 	if err != nil {
 		return o, err
 	}
@@ -255,6 +258,12 @@ func scanObligation(row rowScanner) (api.Obligation, error) {
 // over silence so an explicit deadline is never hidden behind reminders.
 func ObligationOverdue(o api.Obligation, now time.Time) string {
 	if o.State == api.ObligationClosed || o.Needs == api.ObligationNeedsDelivery {
+		return ""
+	}
+	if o.RecipientKind == api.ObligationRecipientOwner {
+		if !now.Before(o.DueAt) {
+			return "outcome"
+		}
 		return ""
 	}
 	unacked := o.State == api.ObligationQueued || o.State == api.ObligationDelivered
@@ -281,6 +290,7 @@ func ObligationOverdue(o api.Obligation, now time.Time) string {
 
 // ObligationFilter selects obligations for listing.
 type ObligationFilter struct {
+	OwnerOnly       bool
 	AgentID         string
 	OpenOnly        bool
 	Overdue         bool
@@ -311,6 +321,9 @@ func (s *Store) ListObligations(ctx context.Context, taskID string, f Obligation
 			out = append(out, o)
 		}
 		return out, rows.Err()
+	}
+	if f.OwnerOnly {
+		q += ` AND recipient_kind='owner'`
 	}
 	if f.AgentID != "" {
 		q += ` AND agent_id=?`
@@ -348,6 +361,15 @@ func (s *Store) ListObligations(ctx context.Context, taskID string, f Obligation
 	rows.Close()
 	if err != nil {
 		return nil, err
+	}
+	for i := range out {
+		if out[i].RecipientKind == api.ObligationRecipientOwner {
+			m, err := loadMessage(s.db, ctx, taskID, out[i].MessageSeq)
+			if err != nil {
+				return nil, err
+			}
+			out[i].Request = &m
+		}
 	}
 	requests, err := handlerRequests(ctx, s.db, taskID, f.AgentID)
 	if err != nil {
@@ -531,6 +553,9 @@ func (s *Store) ReassignObligation(ctx context.Context, taskID, obligationID str
 	}
 	if err != nil {
 		return api.Message{}, err
+	}
+	if old.RecipientKind == api.ObligationRecipientOwner {
+		return api.Message{}, fmt.Errorf("%w: owner requests remain with the owner; answer, extend, cancel or withdraw", api.ErrConflict)
 	}
 	if old.State == api.ObligationClosed || req.ToAgentID == old.AgentID {
 		return api.Message{}, fmt.Errorf("%w: only an open obligation can move to a different agent", api.ErrConflict)

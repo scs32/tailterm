@@ -1130,6 +1130,54 @@ func (s *Store) PostMessage(ctx context.Context, taskID string, req api.PostMess
 			req.To = replyAuthor
 		}
 	}
+	if req.Envelope != nil && req.Envelope.To == "owner" && req.To != "" && req.To != "owner" {
+		return api.Message{}, api.ErrInvalid
+	}
+	if req.To == "owner" {
+		if req.AgentID == "" || req.Envelope == nil || req.Envelope.Kind != api.EnvelopeKindRequest {
+			return api.Message{}, api.ErrInvalid
+		}
+		req.To = ""
+	}
+	if isOwnerRequest(req) && len(req.WorkItems) == 0 {
+		binding, err := loadAgentWorkItemBinding(tx, ctx, req.AgentID, req.RunID)
+		if err != nil {
+			return api.Message{}, err
+		}
+		if binding != nil && binding.ItemTaskID == taskID {
+			req.WorkItems = []api.MessageWorkItem{{ItemTaskID: binding.ItemTaskID, ItemID: binding.ItemID, ItemRevision: binding.ItemRevision, Relationship: "primary"}}
+			req.WorkOrderMessage = &binding.WorkOrderMessage
+			if req.RequestID == "" {
+				req.RequestID = newObligationID("ownerrequest")
+				payload = requestHash(req)
+			}
+		}
+	}
+	ownerReply := false
+	if req.AgentID == "" && req.ReplyTo > 0 && by.Node != api.BrokerNode && (req.Envelope == nil || req.Envelope.Kind == api.EnvelopeKindAnswer) {
+		var n int
+		if err := tx.QueryRowContext(ctx, `SELECT count(*) FROM obligations WHERE task_id=? AND message_seq=? AND recipient_kind='owner' AND state<>'closed'`, taskID, req.ReplyTo).Scan(&n); err != nil {
+			return api.Message{}, err
+		}
+		if n > 0 {
+			ownerReply = true
+			source, err := originalMessage(ctx, tx, taskID, req.ReplyTo)
+			if err != nil {
+				return api.Message{}, err
+			}
+			req.WorkItems, req.WorkOrderMessage = source.WorkItems, source.WorkOrderMessage
+			if req.RequestID == "" {
+				req.RequestID = newObligationID("ownerreply")
+				payload = requestHash(req)
+			}
+			if req.To == "" && source.From.AgentID != "" {
+				var status string
+				if err := tx.QueryRowContext(ctx, `SELECT status FROM agents WHERE id=?`, source.From.AgentID).Scan(&status); err == nil && status != api.AgentClosed && status != api.AgentExited {
+					req.To = source.From.AgentID
+				}
+			}
+		}
+	}
 	var target api.Agent
 	for _, id := range []string{req.To, req.AgentID} {
 		if id == "" {
@@ -1144,10 +1192,10 @@ func (s *Store) PostMessage(ctx context.Context, taskID string, req api.PostMess
 		}
 	}
 	// A typed message's stated recipient must be the one it is routed to.
-	if e := req.Envelope; e != nil && e.To != "" && !strings.HasPrefix(e.To, "role:") && (req.To == "" || (target.ID != e.To && target.Name != e.To)) {
+	if e := req.Envelope; e != nil && e.To != "" && e.To != "owner" && !strings.HasPrefix(e.To, "role:") && (req.To == "" || (target.ID != e.To && target.Name != e.To)) {
 		return api.Message{}, &api.EnvelopeError{Problems: []api.Problem{{Field: "to", Reason: "must name the agent the message is addressed to"}}}
 	}
-	m, err := s.insertMessage(ctx, tx, t, req, target, by, false, false)
+	m, err := s.insertMessageWithResume(ctx, tx, t, req, target, by, false, ownerReply, !ownerReply)
 	if err != nil {
 		return m, err
 	}
@@ -1160,12 +1208,17 @@ func (s *Store) PostMessage(ctx context.Context, taskID string, req api.PostMess
 	// Broker phase 2a: only posts through this public endpoint create or settle
 	// obligations. System notices, decisions, dispatches and lead notices use
 	// other insert paths and never oblige anyone.
-	if err = s.createObligations(ctx, tx, m, req, req.AgentID == "" && by.Node != api.BrokerNode); err != nil {
-		return m, err
+	if !ownerReply {
+		if err = s.createObligations(ctx, tx, m, req, req.AgentID == "" && by.Node != api.BrokerNode); err != nil {
+			return m, err
+		}
 	}
 	// A reply from the recipient's current run acknowledges what it answers,
 	// before the reply's own outcome (result, decline, block) applies.
 	if err = acknowledgeByReply(ctx, tx, m, req); err != nil {
+		return m, err
+	}
+	if err = s.applyOwnerReply(ctx, tx, &m, req, by); err != nil {
 		return m, err
 	}
 	if err = s.applyReplyOutcome(ctx, tx, m, req); err != nil {

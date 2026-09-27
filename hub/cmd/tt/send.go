@@ -36,6 +36,7 @@ func cmdSend(e env, args []string) error {
 	var env api.Envelope
 	fs.StringVar(&env.Kind, "kind", "", "message kind")
 	fs.StringVar(&env.Subject, "subject", "", "plain-English subject, 10-120 characters, no IDs")
+	fs.StringVar(&env.ExpectedAnswer, "expected-answer", "", "exact owner approval text")
 	fs.StringVar(&env.Due, "due", "", "duration such as 45m or 2h")
 	b := &env.Body
 	for name, target := range map[string]*string{
@@ -153,7 +154,10 @@ func cmdSend(e env, args []string) error {
 	target := ""
 	// A role recipient (role:lead, role:database_handler) is resolved by the
 	// hub to whoever holds the role when the message is posted.
-	if env.To != "" && !strings.HasPrefix(env.To, "role:") {
+	if env.To == "owner" {
+		target = "owner"
+	}
+	if env.To != "" && env.To != "owner" && !strings.HasPrefix(env.To, "role:") {
 		if target, err = resolveAgent(ctx, c, *task, env.To); err != nil {
 			return err
 		}

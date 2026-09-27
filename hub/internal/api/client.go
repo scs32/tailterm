@@ -249,6 +249,16 @@ func (c *Client) ListRecentWithdrawn(ctx context.Context, task string) ([]Obliga
 	return out.Obligations, c.do(ctx, "GET", "/v1/tasks/"+task+"/obligations?recentWithdrawn=1", nil, &out)
 }
 
+func (c *Client) ListOwnerObligations(ctx context.Context, task string, open bool) ([]Obligation, error) {
+	q := url.Values{"owner": {"1"}}
+	if open {
+		q.Set("open", "1")
+	}
+	var out ObligationList
+	err := c.do(ctx, "GET", "/v1/tasks/"+task+"/obligations?"+q.Encode(), nil, &out)
+	return out.Obligations, err
+}
+
 // ListObligationsFrom lists an agent's obligations (any state) for messages
 // fromSeq..toSeq, without marking anything delivered.
 func (c *Client) ListObligationsFrom(ctx context.Context, task, agent string, fromSeq, toSeq int64) ([]Obligation, error) {
@@ -388,4 +398,8 @@ func (c *Client) ListReviewConvergence(ctx context.Context, task string) ([]Revi
 	var out []ReviewConvergence
 	err := c.do(ctx, "GET", "/v1/tasks/"+task+"/review-convergence", nil, &out)
 	return out, err
+}
+
+func (c *Client) DelegateOwnerObligation(ctx context.Context, task, obligation string, req OwnerDelegationRequest) (OwnerActionResult, error) {
+	return c.ownerAction(ctx, "/v1/tasks/"+task+"/obligations/"+obligation+"/delegate", req)
 }

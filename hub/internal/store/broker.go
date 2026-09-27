@@ -29,7 +29,7 @@ type BrokerObligation struct {
 func (s *Store) BrokerOpenObligations(ctx context.Context) ([]BrokerObligation, error) {
 	rows, err := s.db.QueryContext(ctx, `SELECT o.id,o.task_id,o.message_seq,o.agent_id,o.subject,o.source_kind,o.needs,o.state,o.outcome,o.outcome_seq,o.reason,
 o.created_at,o.ack_due_at,o.due_at,o.delivered_at,o.acked_at,o.last_progress_at,o.closed_at,o.escalation,o.nudges,
-o.wakes,o.escalated_at,o.nudged_at,o.changed_at,COALESCE(a.name,''),COALESCE(a.status,''),t.orchestrator,t.pause_state
+o.wakes,o.escalated_at,o.nudged_at,o.changed_at,COALESCE(a.name,''),COALESCE(a.status,''),t.orchestrator,t.pause_state,o.recipient_kind
 FROM obligations o JOIN tasks t ON t.id=o.task_id LEFT JOIN agents a ON a.id=o.agent_id
 WHERE o.state<>? AND t.status=? ORDER BY o.task_id,o.message_seq`, api.ObligationClosed, api.TaskOpen)
 	if err != nil {
@@ -42,7 +42,7 @@ WHERE o.state<>? AND t.status=? ORDER BY o.task_id,o.message_seq`, api.Obligatio
 		var created, ackDue, due, delivered, acked, progress, closed, escalated, nudged, changed, pause string
 		if err := rows.Scan(&b.ID, &b.TaskID, &b.MessageSeq, &b.AgentID, &b.Subject, &b.SourceKind, &b.Needs, &b.State, &b.Outcome, &b.OutcomeSeq, &b.Reason,
 			&created, &ackDue, &due, &delivered, &acked, &progress, &closed, &b.Escalation, &b.Nudges,
-			&b.Wakes, &escalated, &nudged, &changed, &b.AgentName, &b.AgentStatus, &b.Orchestrator, &pause); err != nil {
+			&b.Wakes, &escalated, &nudged, &changed, &b.AgentName, &b.AgentStatus, &b.Orchestrator, &pause, &b.RecipientKind); err != nil {
 			return nil, err
 		}
 		b.CreatedAt, b.AckDueAt, b.DueAt = parseTS(created), parseTS(ackDue), parseTS(due)

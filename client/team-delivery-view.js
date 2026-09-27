@@ -1,8 +1,9 @@
+import { ownerWaitSummary } from "./owner-obligations.js";
 import { activityLabel, tokenSnapshot } from "./activity-format.js";
 // Read-only project delivery panel. Integration is deliberately owner gated.
 const esc = (value) => String(value ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]);
 
-export function renderTeamDelivery(queue, agents = []) {
+export function renderTeamDelivery(queue, agents = [], ownerRequests = [], taskId = "") {
   if (!queue || !Array.isArray(queue.entries) || queue.entries.length === 0) return "";
   const byId = new Map(agents.map((agent) => [agent.id, agent]));
   const rows = queue.entries.map((entry) => {
@@ -17,7 +18,7 @@ export function renderTeamDelivery(queue, agents = []) {
     const reviewText = review?.history === "recorded" ? `Reviews ${review.rounds.length}/2 · Follow-ups ${review.followUps.length}${review.disposition ? ` · ${review.disposition.kind}` : ""}` : "Reviews unknown · Follow-ups unknown";
     const followUps = review?.followUps?.length ? `<span class="fine" style="overflow-wrap:anywhere">${review.followUps.map((f) => `${esc(f.itemId)}: ${esc(f.finding.title)}`).join(" · ")}</span>` : "";
     const activity = entry.activities?.map((member) => `${member.name}: ${activityLabel(member.activity)}`).join(" · ") || "";
-    return `<div class="team-delivery-row" data-testid="team-delivery-entry"><strong>${esc(entry.itemId)}</strong><span class="fine">${esc(entry.state)}${blocked ? ` · ${esc(blocked)}` : ""}</span><span class="fine">Owns ${esc(owns)}</span>${lead || handler ? `<span class="fine">${lead ? `Lead ${esc(lead)}` : ""}${lead && handler ? " · " : ""}${handler ? `Handler ${esc(handler)}` : ""}</span>` : ""}${activity ? `<span class="fine">${esc(activity)}</span>` : ""}<span class="fine">${esc(tokenSnapshot(entry.tokens))}</span><span class="fine" data-testid="review-convergence-summary">${esc(reviewText)}</span>${followUps}${ready}</div>`;
+    return `<div class="team-delivery-row" data-testid="team-delivery-entry"><strong>${esc(entry.itemId)}</strong><span class="fine">${esc(entry.state)}${blocked ? ` · ${esc(blocked)}` : ""}</span><span class="fine">Owns ${esc(owns)}</span>${lead || handler ? `<span class="fine">${lead ? `Lead ${esc(lead)}` : ""}${lead && handler ? " · " : ""}${handler ? `Handler ${esc(handler)}` : ""}</span>` : ""}${activity ? `<span class="fine">${esc(activity)}</span>` : ""}<span class="fine">${esc(tokenSnapshot(entry.tokens))}</span><span class="fine" data-testid="review-convergence-summary">${esc(reviewText)}</span>${ownerWaitSummary(ownerRequests, taskId || entry.taskId, entry.itemId)}${followUps}${ready}</div>`;
   }).join("");
   return `<article class="task-card task-detail-card team-delivery-panel" data-testid="team-delivery-panel"><header><h3>Delivery</h3><span class="fine">Limit ${esc(queue.concurrencyLimit ?? 1)}</span></header><div class="team-delivery-rows">${rows}</div></article>`;
 }

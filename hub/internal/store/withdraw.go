@@ -81,9 +81,12 @@ func (s *Store) WithdrawObligation(ctx context.Context, taskID, obligationID str
 	if err != nil {
 		return o, err
 	}
-	to, err := scanAgent(tx.QueryRowContext(ctx, `SELECT `+agentCols+` FROM agents WHERE id=? AND task_id=?`, o.AgentID, taskID))
-	if err != nil {
-		return o, err
+	var to api.Agent
+	if o.RecipientKind != api.ObligationRecipientOwner {
+		to, err = scanAgent(tx.QueryRowContext(ctx, `SELECT `+agentCols+` FROM agents WHERE id=? AND task_id=?`, o.AgentID, taskID))
+		if err != nil {
+			return o, err
+		}
 	}
 	now := ts(s.now())
 	if _, err = tx.ExecContext(ctx, `UPDATE obligations SET state=?,outcome=?,reason=?,closed_at=?,changed_at=? WHERE id=? AND state<>?`, api.ObligationClosed, api.OutcomeWithdrawn, reason, now, now, o.ID, api.ObligationClosed); err != nil {
