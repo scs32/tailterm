@@ -1,3 +1,4 @@
+import { startOwnerAgeClock } from "./owner-obligations.js";
 // Projects mode: start and manage tasks. Lists open and closed projects with their
 // agents, and offers attach, board, add agent, and close actions.
 import { taskRollup } from "./tasks.js";
@@ -54,20 +55,56 @@ export function createTasksView({
   // project lifecycle starts a fresh disclosure epoch.
   let teamClient = null;
   const teamChoices = new Map();
-  const deliveries = new Map();
+  const deliveries = new Map(),
+    ownerRequests = new Map();
+  let stopOwnerClock;
+  let deliveryGeneration = 0,
+    deliveryTask = null;
   async function loadDelivery(taskId, actionClient = client()) {
-    if (!taskId || !actionClient?.listTeamDelivery) return;
+    const token = generation;
+    const requestGeneration = ++deliveryGeneration;
+    const current = () =>
+      visible &&
+      generation === token &&
+      deliveryGeneration === requestGeneration &&
+      selected === taskId &&
+      client() === actionClient;
+    if (!taskId) return;
+    if (deliveryTask !== taskId) {
+      ownerRequests.clear();
+      deliveryTask = taskId;
+    }
+    const update = () => {
+      if (current()) render();
+    };
+    // Keep delivery independent of optional owner requests, including hangs.
+    void (async () => {
+      try {
+        const queue = await actionClient.listTeamDelivery?.(taskId);
+        if (!current()) return;
+        deliveries.set(taskId, queue);
+      } catch {
+        if (!current()) return;
+        deliveries.delete(taskId);
+      }
+      update();
+    })();
     try {
-      const queue = await actionClient.listTeamDelivery(taskId);
-      if (!visible || client() !== actionClient) return;
-      deliveries.set(taskId, queue);
-      if (selected === taskId) render();
-    } catch { deliveries.delete(taskId); }
+      const requests = await actionClient.listOwnerObligations?.(taskId);
+      if (!current()) return;
+      ownerRequests.set(taskId, requests || []);
+    } catch {
+      if (!current()) return;
+      ownerRequests.delete(taskId);
+    }
+    update();
   }
   function teamExpanded(task, count) {
     if (teamClient !== client()) {
       teamClient = client();
       teamChoices.clear();
+      deliveries.clear();
+      ownerRequests.clear();
     }
     const epoch = JSON.stringify([
       task.createdAt,
@@ -104,6 +141,8 @@ export function createTasksView({
   async function show() {
     if (!root) return;
     visible = true;
+    stopOwnerClock?.();
+    stopOwnerClock = startOwnerAgeClock(root);
     hasData = false;
     const token = generation + 1;
     clearInterval(clock);
@@ -113,6 +152,8 @@ export function createTasksView({
     if (teamClient !== client()) {
       teamClient = client();
       teamChoices.clear();
+      deliveries.clear();
+      ownerRequests.clear();
     }
     if (!client()) {
       presentation.interrupt();
@@ -131,6 +172,7 @@ export function createTasksView({
       );
   }
   function hide() {
+    stopOwnerClock?.();
     const wasVisible = visible;
     visible = false;
     hiddenTaskIds = new Set(details.map((d) => d.task.id));
@@ -289,7 +331,7 @@ export function createTasksView({
         )
         .join(
           "",
-        )}</div><footer class="task-actions"><span class="fine">${resumePending ? "Fresh-team launch incomplete" : task.allowAgentSpawn ? "Helpers allowed" : "Helpers off"}</span><button data-task-board="${esc(task.id)}">Open board →</button><button data-task-add="${esc(task.id)}" ${resumePending ? "disabled" : ""}>＋ Add agent</button><button data-task-lead="${esc(task.id)}" ${resumePending ? "disabled" : ""}>Replace lead</button>${!resumePending && (!handler || handler.status === "exited" || (!handler.online && !["retired", "closed"].includes(handler.status))) ? `<button data-handler-setup="${esc(task.id)}">${handler ? (handler.status === "exited" ? "Restart" : "Check") : "Set up"} database handler</button>` : ""}${openWorkItems ? `<button data-project-bugs="${esc(task.id)}">Bugs</button><button data-project-features="${esc(task.id)}">Features</button>` : ""}<div class="task-more"><button type="button" data-task-more="${esc(task.id)}" aria-expanded="false" aria-controls="task-menu-${esc(task.id)}">More</button><div id="task-menu-${esc(task.id)}" class="task-menu" popover="auto" aria-label="More project actions"><button data-task-attach="${esc(task.id)}">Open terminals</button><button data-task-settings="${esc(task.id)}">Settings</button><button data-task-pause="${esc(task.id)}" data-testid="pause-project" ${pauseState === "active" && !resumePending ? "" : `disabled aria-disabled="true" title="${resumePending ? "Finish the saved Resume first" : "Update the hub to projectPause v1"}"`}>Pause project…</button>${pauseState === "legacy" ? '<span class="fine" data-testid="pause-project-legacy">Pause unavailable · hub update required</span>' : ""}<button data-task-close="${esc(task.id)}" class="danger">Close project</button></div></div></footer></article>${renderTeamDelivery(deliveries.get(task.id), agents)}`;
+        )}</div><footer class="task-actions"><span class="fine">${resumePending ? "Fresh-team launch incomplete" : task.allowAgentSpawn ? "Helpers allowed" : "Helpers off"}</span><button data-task-board="${esc(task.id)}">Open board →</button><button data-task-add="${esc(task.id)}" ${resumePending ? "disabled" : ""}>＋ Add agent</button><button data-task-lead="${esc(task.id)}" ${resumePending ? "disabled" : ""}>Replace lead</button>${!resumePending && (!handler || handler.status === "exited" || (!handler.online && !["retired", "closed"].includes(handler.status))) ? `<button data-handler-setup="${esc(task.id)}">${handler ? (handler.status === "exited" ? "Restart" : "Check") : "Set up"} database handler</button>` : ""}${openWorkItems ? `<button data-project-bugs="${esc(task.id)}">Bugs</button><button data-project-features="${esc(task.id)}">Features</button>` : ""}<div class="task-more"><button type="button" data-task-more="${esc(task.id)}" aria-expanded="false" aria-controls="task-menu-${esc(task.id)}">More</button><div id="task-menu-${esc(task.id)}" class="task-menu" popover="auto" aria-label="More project actions"><button data-task-attach="${esc(task.id)}">Open terminals</button><button data-task-settings="${esc(task.id)}">Settings</button><button data-task-pause="${esc(task.id)}" data-testid="pause-project" ${pauseState === "active" && !resumePending ? "" : `disabled aria-disabled="true" title="${resumePending ? "Finish the saved Resume first" : "Update the hub to projectPause v1"}"`}>Pause project…</button>${pauseState === "legacy" ? '<span class="fine" data-testid="pause-project-legacy">Pause unavailable · hub update required</span>' : ""}<button data-task-close="${esc(task.id)}" class="danger">Close project</button></div></div></footer></article>${renderTeamDelivery(deliveries.get(task.id), agents, ownerRequests.get(task.id), task.id)}`;
     };
     root.innerHTML = `<div class="board mode-board tasks-view"><aside class="board-rail"><div class="board-rail-head"><span class="eyebrow">PROJECTS</span><button id="tasks-new" title="New project" aria-label="New project">＋</button></div>${open.map(projectButton).join("")}${closed.length ? `<details class="board-closed tasks-closed" data-view-disclosure="closed" ${current?.task.status !== "open" ? "open" : ""}><summary>Closed · ${closed.length}</summary>${closed.map(projectButton).join("")}</details>` : ""}</aside><section class="board-thread tasks-detail">${detail(current)}</section></div>`;
     presentation.afterRender(selected);

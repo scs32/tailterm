@@ -68,6 +68,12 @@ func (b *Broker) Tick(ctx context.Context, now time.Time) ([]Step, error) {
 		if o.TaskPaused {
 			continue // owner-paused projects are neither woken nor escalated
 		}
+		if o.RecipientKind == api.ObligationRecipientOwner {
+			if o.Escalation == 0 && !now.Before(o.DueAt) {
+				act(o, "escalate-owner", b.Store.BrokerEscalateOwnerRequest(ctx, o, now))
+			}
+			continue
+		}
 		if o.AgentStatus == api.AgentClosed || o.AgentStatus == api.AgentExited || o.AgentStatus == "" {
 			act(o, "recipient-gone", b.Store.BrokerCloseRecipientGone(ctx, o, now))
 			continue

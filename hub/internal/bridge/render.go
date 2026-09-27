@@ -115,6 +115,19 @@ func (b *Bridge) renderMessage(task api.Task, r roster, m api.Message) []OutboxR
 			return nil // bookkeeping: shown on the status card, not as a line
 		}
 	}
+	if env != nil && env.Kind == api.EnvelopeKindRequest && m.From.AgentID != "" && (env.To == "owner" || (env.To == "" && m.To == "")) {
+		parts := chunk(m.Text, embedBudget)
+		rows := []OutboxRow{}
+		for i, text := range parts {
+			mk := marker(m.Seq, i+1, len(parts), "owner-request")
+			send := discord.MessageSend{Content: "**Request to owner** · " + mk, Embeds: []discord.Embed{{Description: text, Color: kindColors[env.Kind], URL: b.tailosLink(m)}}}
+			if i == len(parts)-1 && env.ExpectedAnswer != "" {
+				send.Components = []discord.Component{{Type: discord.ComponentActionRow, Components: []discord.Component{{Type: discord.ComponentButton, Style: discord.ButtonPrimary, Label: "Approve", CustomID: fmt.Sprintf("approve-owner:%d", m.Seq)}}}}
+			}
+			rows = append(rows, row("owner-request", kindLine, i+1, outboxPayload{Message: send, Marker: mk}))
+		}
+		return rows
+	}
 	header := fmt.Sprintf("**%s** → **%s**", clean(r.sender(m)), clean(r.recipient(m)))
 	if m.ReplyTo > 0 {
 		header += fmt.Sprintf(" · re #%d", m.ReplyTo)
@@ -156,7 +169,9 @@ func (b *Bridge) renderEscalation(task api.Task, m api.Message) outboxPayload {
 	text := truncate(env.Body.Text, 1400)
 	content := fmt.Sprintf("%s ⚠️ **%s**\n%s\n%s", strings.Join(mentions, " "), clean(env.Subject), text, mk)
 	var buttons []discord.Component
-	if oid := env.Refs["obligation"]; oid != "" && env.Refs["escalation"] == "owner" {
+	if oid := env.Refs["obligation"]; oid != "" && env.Refs["recipientKind"] == "owner" {
+		buttons = append(buttons, discord.Component{Type: discord.ComponentButton, Style: discord.ButtonSecondary, Label: "Extend 30m", CustomID: "extend30:" + oid})
+	} else if oid := env.Refs["obligation"]; oid != "" && env.Refs["escalation"] == "owner" {
 		buttons = append(buttons,
 			discord.Component{Type: discord.ComponentButton, Style: discord.ButtonPrimary, Label: "Nudge", CustomID: "nudge:" + oid},
 			discord.Component{Type: discord.ComponentButton, Style: discord.ButtonSecondary, Label: "Extend 30m", CustomID: "extend30:" + oid},
@@ -331,6 +346,9 @@ func renderCardWithQueue(task api.Task, agents []api.Agent, obligations []api.Ob
 		names[a.ID] = a
 	}
 	var lines []string
+	if n := open[""]; n > 0 {
+		lines = append(lines, fmt.Sprintf("**Owner** · %d requests waiting (%d overdue)", n, overdue[""]))
+	}
 	for _, a := range agents {
 		if a.Status == api.AgentClosed {
 			continue

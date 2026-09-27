@@ -133,6 +133,22 @@ func (b *Bridge) act(ctx context.Context, taskID string, in discord.Interaction)
 	}
 	id := in.Data.CustomID
 	switch {
+	case strings.HasPrefix(id, "approve-owner:"):
+		o, err := b.obligation(ctx, taskID, strings.TrimPrefix(id, "approve-owner:"))
+		if err != nil {
+			return lookupReply(err)
+		}
+		if o.RecipientKind != api.ObligationRecipientOwner {
+			return ephemeral("That request is not addressed to the owner.")
+		}
+		out, err := b.cfg.Hub.AnswerObligation(ctx, taskID, o.ID, api.ObligationAnswerRequest{Approve: true, RequestID: "discord-interaction-" + in.ID, Source: &api.MessageSource{Kind: api.SourceDiscord, ID: in.ID, UserID: in.UserID()}})
+		if r, done := ownerOutcome(err); done {
+			return r
+		}
+		if out.Message == nil {
+			return ephemeral("No approval saved.")
+		}
+		return ephemeral("Approved with the exact requested text; answer #%d saved.", out.Message.Seq)
 	case id == "stalled":
 		return b.stalledReply(ctx, taskID)
 	case strings.HasPrefix(id, "nudge:"):

@@ -20,6 +20,7 @@ import (
 func cmdObligations(e env, args []string) error {
 	fs := flag.NewFlagSet("obligations", flag.ContinueOnError)
 	overdue := fs.Bool("overdue", false, "every overdue obligation in the project")
+	owner := fs.Bool("owner", false, "requests waiting on the owner; listing has no delivery effects")
 	all := fs.Bool("all", false, "include closed obligations")
 	asJSON := fs.Bool("json", false, "JSON output")
 	if err := fs.Parse(args); err != nil {
@@ -42,7 +43,12 @@ func cmdObligations(e env, args []string) error {
 	if *overdue {
 		agent, run = "", ""
 	}
-	list, err := c.ListObligations(ctx, task, agent, run, !*all, *overdue)
+	var list []api.Obligation
+	if *owner {
+		list, err = c.ListOwnerObligations(ctx, task, !*all)
+	} else {
+		list, err = c.ListObligations(ctx, task, agent, run, !*all, *overdue)
+	}
 	if err != nil {
 		return err
 	}
@@ -57,6 +63,9 @@ func cmdObligations(e env, args []string) error {
 		}
 	}
 	for _, o := range list {
+		if o.RecipientKind == api.ObligationRecipientOwner {
+			names[o.AgentID] = "owner"
+		}
 		line := fmt.Sprintf("#%d %s %s → %s: %s", o.MessageSeq, o.SourceKind, o.State, or(names[o.AgentID], o.AgentID), o.Subject)
 		if o.Overdue != "" {
 			line += " [overdue: " + o.Overdue + "]"
@@ -89,7 +98,7 @@ func cmdObligations(e env, args []string) error {
 	}
 	if len(list) == 0 {
 		fmt.Println("(no obligations)")
-	} else if !*overdue {
+	} else if !*overdue && !*owner {
 		fmt.Println("Acknowledge with `tt ack SEQ`, record progress with `tt progress SEQ --text ...`, and finish with `tt send --reply-to SEQ` (result, answer, decline, or block).")
 	}
 	return nil
@@ -244,6 +253,6 @@ func obligationRequestID(run, action string, seq int64, text string, now time.Ti
 // gatesPosts mirrors the hub's acknowledgement gate (broker phase 3.1): the
 // recipient's other writes are refused while this is true.
 func gatesPosts(o api.Obligation, now time.Time) bool {
-	return (o.State == api.ObligationQueued || o.State == api.ObligationDelivered) &&
+	return o.RecipientKind != api.ObligationRecipientOwner && (o.State == api.ObligationQueued || o.State == api.ObligationDelivered) &&
 		o.Needs != api.ObligationNeedsDelivery && now.Sub(o.CreatedAt) >= api.ObligationAckGrace
 }

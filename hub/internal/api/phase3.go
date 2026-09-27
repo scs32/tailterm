@@ -17,11 +17,25 @@ type ObligationExtendRequest struct {
 	RequestID string `json:"requestId"`
 }
 
-// ObligationAnswerRequest lets the owner answer a question, or resolve a
-// block, on the recipient's behalf.
+// OwnerDelegationRequest records an explicit owner grant for one request.
+type OwnerDelegationRequest struct {
+	Session          string `json:"session"`
+	AgentID          string `json:"agentId,omitempty"`
+	RunID            string `json:"runId,omitempty"`
+	AuthorizationRef string `json:"authorizationRef"`
+	RequestID        string `json:"requestId"`
+}
+
+// ObligationAnswerRequest lets the owner or a granted session answer a request,
+// question or block on the recipient's behalf.
 type ObligationAnswerRequest struct {
-	Text      string `json:"text"`
-	RequestID string `json:"requestId"`
+	DelegateSession string         `json:"delegateSession,omitempty"`
+	AgentID         string         `json:"agentId,omitempty"`
+	RunID           string         `json:"runId,omitempty"`
+	Approve         bool           `json:"approve,omitempty"`
+	Source          *MessageSource `json:"source,omitempty"`
+	Text            string         `json:"text"`
+	RequestID       string         `json:"requestId"`
 }
 
 // ObligationCancelRequest closes an open obligation as cancelled.
@@ -38,9 +52,10 @@ type AgentResumeRequest struct {
 // OwnerActionResult is what an owner action changed. A retry with the same
 // request ID returns the original result.
 type OwnerActionResult struct {
-	Action     string      `json:"action"`
-	Obligation *Obligation `json:"obligation,omitempty"`
-	Message    *Message    `json:"message,omitempty"`
-	Agent      *Agent      `json:"agent,omitempty"`
-	Replay     bool        `json:"replay,omitempty"`
+	DelegationID string      `json:"delegationId,omitempty"`
+	Action       string      `json:"action"`
+	Obligation   *Obligation `json:"obligation,omitempty"`
+	Message      *Message    `json:"message,omitempty"`
+	Agent        *Agent      `json:"agent,omitempty"`
+	Replay       bool        `json:"replay,omitempty"`
 }

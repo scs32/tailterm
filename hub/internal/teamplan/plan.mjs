@@ -1671,6 +1671,8 @@ function createHubClient({ fetchImpl, baseURL, token = "" }) {
       ),
     listMessages: async (task, params = {}) =>
       (await request(`/v1/tasks/${task}/messages` + q(params))).messages,
+    listOwnerObligations: async (task, params = {}) => (await request(`/v1/tasks/${task}/obligations` + q({owner:1,open:1,...params}))).obligations,
+    answerOwnerObligation: (task, id, body) => request(`/v1/tasks/${task}/obligations/${id}/answer`, {method:"POST",body}),
     listDecisions: (task, params = {}) =>
       request(`/v1/tasks/${task}/decisions` + q(params)),
     answerDecision: (task, seq, body) =>

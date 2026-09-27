@@ -51,7 +51,7 @@ func migratePhase3(db *sql.DB) error {
 			return err
 		}
 	}
-	return nil
+	return migrateOwnerObligations(db)
 }
 
 // ---- Legacy close-out ----
@@ -441,7 +441,7 @@ func (s *Store) ExtendObligation(ctx context.Context, taskID, obligationID strin
 		}
 		// last_progress_at restarts the silence timer too, so an extension is
 		// never followed by an immediate "no progress" nudge.
-		if _, err := tx.ExecContext(ctx, `UPDATE obligations SET due_at=?,ack_due_at=?,escalation=0,escalated_at='',nudges=0,nudged_at='',last_progress_at=CASE WHEN acked_at<>'' THEN ? ELSE last_progress_at END,changed_at=? WHERE id=?`, ts(until), ts(ackDue), ts(now), ts(now), o.ID); err != nil {
+		if _, err := tx.ExecContext(ctx, `UPDATE obligations SET due_at=?,ack_due_at=?,escalation=CASE WHEN recipient_kind='owner' THEN escalation ELSE 0 END,escalated_at=CASE WHEN recipient_kind='owner' THEN escalated_at ELSE '' END,nudges=0,nudged_at='',last_progress_at=CASE WHEN acked_at<>'' THEN ? ELSE last_progress_at END,changed_at=? WHERE id=?`, ts(until), ts(ackDue), ts(now), ts(now), o.ID); err != nil {
 			return api.OwnerActionResult{}, err
 		}
 		text := fmt.Sprintf("The owner extended message #%d (%s) until %s.", o.MessageSeq, o.Subject, until.UTC().Format("Jan 2 15:04 UTC"))
@@ -460,8 +460,8 @@ func (s *Store) ExtendObligation(ctx context.Context, taskID, obligationID strin
 // the recipient's behalf: the answer goes to whoever asked (or is blocked),
 // and the recipient's obligation closes as answered.
 func (s *Store) AnswerObligation(ctx context.Context, taskID, obligationID string, req api.ObligationAnswerRequest, by api.Caller) (api.OwnerActionResult, error) {
-	text := strings.TrimSpace(req.Text)
-	if text == "" || !api.ValidText(text, 4000) {
+	text := req.Text
+	if (!req.Approve && strings.TrimSpace(text) == "") || !api.ValidText(text, 4000) || (req.Source != nil && !api.ValidMessageSource(*req.Source)) {
 		return api.OwnerActionResult{}, api.ErrInvalid
 	}
 	return s.ownerAction(ctx, taskID, "answer", obligationID, req.RequestID, req, by, func(tx *sql.Tx, task api.Task, now time.Time) (api.OwnerActionResult, error) {
@@ -476,12 +476,34 @@ func (s *Store) AnswerObligation(ctx context.Context, taskID, obligationID strin
 		if err != nil {
 			return api.OwnerActionResult{}, err
 		}
+		grant, err := s.verifyOwnerDelegate(ctx, tx, taskID, o.ID, req)
+		if err != nil {
+			return api.OwnerActionResult{}, err
+		}
+		if req.Approve {
+			if o.RecipientKind != api.ObligationRecipientOwner || source.Envelope == nil || source.Envelope.ExpectedAnswer == "" {
+				return api.OwnerActionResult{}, api.ErrInvalid
+			}
+			text = source.Envelope.ExpectedAnswer
+		}
+		reason := "answered by the owner"
+		if grant != "" {
+			reason = "answered by delegated session " + req.DelegateSession + " on behalf of the owner (" + grant + ")"
+		}
 		subject := "The owner answered this question"
 		if o.SourceKind == api.EnvelopeKindBlock {
 			subject = "The owner resolved this block"
 		}
 		env := &api.Envelope{Kind: api.EnvelopeKindAnswer, Subject: subject, Body: api.EnvelopeBody{Answer: text},
 			Refs: map[string]string{"obligation": o.ID, "answeredFor": o.AgentID}}
+		if o.RecipientKind == api.ObligationRecipientOwner {
+			env.Refs["answeredFor"] = "owner"
+		}
+		if grant != "" {
+			env.Refs["delegateSession"] = req.DelegateSession
+			env.Refs["delegation"] = grant
+			env.Refs["onBehalfOf"] = "owner"
+		}
 		// The answer keeps the question's item links, so an item-bound asker
 		// sees it in its inbox (as decision answers do).
 		reply := api.PostMessageRequest{Envelope: env, ReplyTo: o.MessageSeq, RequestID: "owner-answer-" + o.ID,
@@ -501,8 +523,11 @@ func (s *Store) AnswerObligation(ctx context.Context, taskID, obligationID strin
 		if err != nil {
 			return api.OwnerActionResult{}, err
 		}
+		if err := insertMessageSource(ctx, tx, &m, req.Source); err != nil {
+			return api.OwnerActionResult{}, err
+		}
 		if _, err := tx.ExecContext(ctx, `UPDATE obligations SET state=?,outcome=?,outcome_seq=?,reason=?,closed_at=?,changed_at=? WHERE id=?`,
-			api.ObligationClosed, api.OutcomeAnswered, m.Seq, "answered by the owner", ts(now), ts(now), o.ID); err != nil {
+			api.ObligationClosed, api.OutcomeAnswered, m.Seq, reason, ts(now), ts(now), o.ID); err != nil {
 			return api.OwnerActionResult{}, err
 		}
 		o, err = scanObligation(tx.QueryRowContext(ctx, `SELECT `+obligationCols+` FROM obligations WHERE id=?`, o.ID))

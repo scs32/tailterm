@@ -1,3 +1,4 @@
+import { ownerWaitSummary, startOwnerAgeClock } from "./owner-obligations.js";
 const esc = (value) =>
   String(value ?? "").replace(
     /[&<>"']/g,
@@ -45,6 +46,8 @@ export function createQueueView({
     persistenceScope = "",
     loading = false,
     reloadAgain = false;
+  let ownerRequests = [],
+    stopOwnerClock;
   const errors = new Map(),
     intents = new Map(),
     memory = new Map();
@@ -64,6 +67,7 @@ export function createQueueView({
     root = container;
   }
   function hide() {
+    stopOwnerClock?.();
     visible = false;
     generation++;
     subscription?.stop();
@@ -89,6 +93,8 @@ export function createQueueView({
   async function show(taskId) {
     if (taskId !== undefined) scope = taskId || scope;
     visible = true;
+    stopOwnerClock?.();
+    stopOwnerClock = startOwnerAgeClock(root);
     await reload();
   }
   async function reload() {
@@ -158,6 +164,12 @@ export function createQueueView({
         } while (cursor);
       }
       if (!stillCurrent()) return;
+      const nextOwnerRequests =
+        nextScope && connected.listOwnerObligations
+          ? await connected.listOwnerObligations(nextScope)
+          : [];
+      if (!stillCurrent()) return;
+      ownerRequests = nextOwnerRequests;
       capability = nextCapability;
       tasks = nextTasks;
       scope = nextScope;
@@ -221,7 +233,7 @@ export function createQueueView({
             .map(railButton)
             .join("")}</details>`
         : ""
-    }</aside><section class="board-thread queue-main"><div class="board-head"><div class="view-heading"><div><span class="eyebrow">${esc(currentTask?.name || "QUEUE")}</span><h2>Queue <span class="count-badge">${entries.length}</span></h2></div><label class="queue-history-toggle"><input type="checkbox" data-queue-terminal ${includeTerminal ? "checked" : ""}><span>Terminal history</span></label></div><p class="fine">Priority is advisory. Send, read, priority and Pull never start an agent.</p></div>${capability ? `<div class="queue-layout"><div class="queue-list" aria-label="Queue entries">${entries.length ? entries.map((entry) => `<button type="button" class="queue-row" data-queue-entry="${esc(entry.id)}" aria-pressed="${entry.id === selected}"><span><strong>${esc(entry.item.title)}</strong><small>${esc(projectName(entry.sourceTaskId))} · ${esc(entry.item.kind)} ${esc(entry.itemId)}@${entry.offeredItemRevision}</small></span><span><strong>${esc(stateLabels[entry.state] || entry.state)}</strong><small>${esc(priorities[entry.queuePriority] || entry.queuePriority)}</small></span></button>`).join("") : '<p class="fine queue-empty">No entries match this project and history view.</p>'}</div><article class="queue-detail">${selectedEntry ? detail(selectedEntry) : ""}</article></div>` : `<div class="queue-unsupported"><p role="status">This hub does not advertise Queue v1. Queue actions are disabled; existing Send remains explicitly legacy.</p></div>`}</section></div>`;
+    }</aside><section class="board-thread queue-main"><div class="board-head"><div class="view-heading"><div><span class="eyebrow">${esc(currentTask?.name || "QUEUE")}</span><h2>Queue <span class="count-badge">${entries.length}</span></h2></div><label class="queue-history-toggle"><input type="checkbox" data-queue-terminal ${includeTerminal ? "checked" : ""}><span>Terminal history</span></label></div><p class="fine">Priority is advisory. Send, read, priority and Pull never start an agent.</p></div>${capability ? `<div class="queue-layout"><div class="queue-list" aria-label="Queue entries">${entries.length ? entries.map((entry) => `<button type="button" class="queue-row" data-queue-entry="${esc(entry.id)}" aria-pressed="${entry.id === selected}"><span><strong>${esc(entry.item.title)}</strong><small>${esc(projectName(entry.sourceTaskId))} · ${esc(entry.item.kind)} ${esc(entry.itemId)}@${entry.offeredItemRevision}</small></span><span><strong>${esc(stateLabels[entry.state] || entry.state)}</strong><small>${esc(priorities[entry.queuePriority] || entry.queuePriority)}</small>${ownerWaitSummary(ownerRequests, scope, entry.itemId)}</span></button>`).join("") : '<p class="fine queue-empty">No entries match this project and history view.</p>'}</div><article class="queue-detail">${selectedEntry ? detail(selectedEntry) : ""}</article></div>` : `<div class="queue-unsupported"><p role="status">This hub does not advertise Queue v1. Queue actions are disabled; existing Send remains explicitly legacy.</p></div>`}</section></div>`;
     root.querySelectorAll("[data-queue-task]").forEach(
       (button) =>
         (button.onclick = () => {
@@ -282,7 +294,7 @@ export function createQueueView({
       entryError =
         errors.get(entry.id) ||
         entryIntents.map((intent) => errors.get(intent.id)).find(Boolean);
-    return `<header><span class="eyebrow">${esc(stateLabels[entry.state] || entry.state)} · CYCLE ${entry.cycle}</span><h3>${esc(entry.item.title)}</h3><p class="fine">${esc(entry.sourceTaskId)} / ${esc(entry.itemId)} · offered r${entry.offeredItemRevision} · current r${entry.currentItemRevision}</p></header>${markerList.length ? `<div class="queue-markers">${markerList.map((marker) => `<span>${esc(marker)}</span>`).join("")}</div>` : ""}<p>${esc(entry.item.description || "No description.")}</p><dl class="queue-facts"><div><dt>Source status</dt><dd>${esc(entry.item.status)}</dd></div><div><dt>Queue revision</dt><dd>${entry.revision}</dd></div><div><dt>Claimant</dt><dd>${esc(entry.claimantAgentId || "Not claimed")}</dd></div><div><dt>Worker run</dt><dd>${esc(entry.workerRunId || "Not started")}</dd></div></dl><div class="queue-actions"><label>Queue priority<select data-queue-priority ${["completed", "cancelled"].includes(entry.state) ? "disabled" : ""}>${Object.entries(
+    return `<header><span class="eyebrow">${esc(stateLabels[entry.state] || entry.state)} · CYCLE ${entry.cycle}</span><h3>${esc(entry.item.title)}</h3><p class="fine">${esc(entry.sourceTaskId)} / ${esc(entry.itemId)} · offered r${entry.offeredItemRevision} · current r${entry.currentItemRevision}</p></header>${markerList.length ? `<div class="queue-markers">${markerList.map((marker) => `<span>${esc(marker)}</span>`).join("")}</div>` : ""}${ownerWaitSummary(ownerRequests, scope, entry.itemId)}<p>${esc(entry.item.description || "No description.")}</p><dl class="queue-facts"><div><dt>Source status</dt><dd>${esc(entry.item.status)}</dd></div><div><dt>Queue revision</dt><dd>${entry.revision}</dd></div><div><dt>Claimant</dt><dd>${esc(entry.claimantAgentId || "Not claimed")}</dd></div><div><dt>Worker run</dt><dd>${esc(entry.workerRunId || "Not started")}</dd></div></dl><div class="queue-actions"><label>Queue priority<select data-queue-priority ${["completed", "cancelled"].includes(entry.state) ? "disabled" : ""}>${Object.entries(
       priorities,
     )
       .map(
