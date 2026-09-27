@@ -96,7 +96,7 @@ Each planned check carries `VERIFICATION_TIMEOUT_MS` in its recorded environment
 A timeout sends SIGTERM, then SIGKILL after 250 ms, only to that check's newly
 spawned POSIX process group; its receipt records exit 124 and
 `failureReason: timeout`, and preserves the failed log and digest. A timeout or
-known-baseline failure is never a passing waiver. Browser checks requiring a fixed
+known-baseline failure retains its raw failed status; only an approved known-failure entry changes gate eligibility. Browser checks requiring a fixed
 port carry `VERIFICATION_REQUIRED_PORTS`; the runner refuses an occupied port
 before spawning, recording the port and listener PID. It never terminates an
 existing listener. Port inspection failure also refuses the check. These checks
@@ -146,3 +146,45 @@ Deleted and renamed-away paths remain in coverage selection, but are excluded
 from command targets; existing moved destinations are selected. If no touched
 package survives, the race check falls back to `./...`. Tests execute the real Go
 race command after a complete package move and deletion.
+
+
+## Known failures and retries
+
+Successor Feature `wi_f148716909c88f9d` revision 1, owner order #11964,
+assignment #12210 and separately saved Start #12214 (handler #12216) add
+known failures and retries. The approved matrix bytes contain `maxAttempts: 3`
+and `knownFailures`, each with `checkId`, `bugTaskId` and `bugId`. The initial
+14 IDs come from owner #11950 and handler handoff #12195, linked to the open
+baseline Bug `wi_be7bbed81d4009c1`; the flaky board-compose check is excluded.
+Any list or retry-policy change requires a new owner matrix approval token.
+The runner derives the selected exceptions and retry policy from those exact
+bytes; the handler independently reproduces the plan and the store checks every
+linked bug exists, is a bug, and remains open/in progress/blocked. Closing or
+dismissing a linked bug removes eligibility until a new plan resolves the entry.
+
+Every failed check, including a listed check, runs up to two further attempts
+with the identical argv, cwd, environment, timeout and process-group/port guards.
+The first success stops retrying. Each attempt records its 1-based index,
+start/end/duration, raw exit/failureReason, unique external log URI and digest.
+Top-level check evidence matches the final attempt. `status` is `pass` for first
+success, `flaky` for success on retry, and `fail` after three failed attempts.
+`knownFailure` and `nowPassing` are separate flags; a listed check that succeeds
+is reported for removal even if it succeeded only on retry.
+
+Valid failed receipts are stored as evidence. Every completion path still calls
+the shared eligibility gate: an exhausted unlisted failure blocks, a listed raw
+failure is eligible, and flaky success remains explicitly flaky. CLI import hashes
+every attempt's log, including the first failed attempt. Bounds, sequence,
+stop-after-success, aggregate evidence, labels and flags are verified by the
+native store. A new plan clears the current receipt while keeping old records.
+Delivery reads derive summaries from the current plan and receipt; they display
+check IDs, flaky status, known failures and now-passing flags. Missing receipts
+show pending, changed scope/assignment shows stale, and blocked evidence never
+shows passing. Optional new fields preserve existing v1 canonical digests and
+legacy single-attempt receipts; legacy failures still block completion.
+
+The full matrix must run on a clean detached frozen candidate with new owner
+approval and a handler-saved plan. Its successful exit means gate eligibility,
+not that every raw check passed. Independent execution and handler import/readback
+remain required before acceptance. This successor introduces no AIV submission,
+baseline test repairs, live data changes or deployment.

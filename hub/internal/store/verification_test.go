@@ -3,11 +3,14 @@ package store
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -129,7 +132,7 @@ func TestVerificationRejectsInvalidReceiptAndIdentities(t *testing.T) {
 	if _, err := f.s.SaveVerification(f.ctx, f.task.ID, f.item.ID, api.VerificationRequest{RequestID: "plan", AgentID: h.ID, RunID: h.RunID, Plan: &p}); err != nil {
 		t.Fatal(err)
 	}
-	cases := []func(*api.VerificationReceipt){func(r *api.VerificationReceipt) { r.Checks = nil }, func(r *api.VerificationReceipt) { r.Checks = append(r.Checks, r.Checks[0]) }, func(r *api.VerificationReceipt) { r.Checks[0].ExitCode = 1 }, func(r *api.VerificationReceipt) { r.Checks[0].ExitCode = 124; r.Checks[0].FailureReason = "timeout" }, func(r *api.VerificationReceipt) { r.CleanAfter = false }, func(r *api.VerificationReceipt) { r.Commit = candidateC }, func(r *api.VerificationReceipt) { r.VerifierRunID = api.NewID("run") }, func(r *api.VerificationReceipt) { r.Checks[0].Argv = []string{"true"} }, func(r *api.VerificationReceipt) { r.AIV.State = "submitted" }}
+	cases := []func(*api.VerificationReceipt){func(r *api.VerificationReceipt) { r.Checks = nil }, func(r *api.VerificationReceipt) { r.Checks = append(r.Checks, r.Checks[0]) }, func(r *api.VerificationReceipt) { r.CleanAfter = false }, func(r *api.VerificationReceipt) { r.Commit = candidateC }, func(r *api.VerificationReceipt) { r.VerifierRunID = api.NewID("run") }, func(r *api.VerificationReceipt) { r.Checks[0].Argv = []string{"true"} }, func(r *api.VerificationReceipt) { r.AIV.State = "submitted" }}
 	for i, mutate := range cases {
 		r := passingVerification(p)
 		mutate(&r)
@@ -367,6 +370,19 @@ func TestVerificationCrossRuntimeDigest(t *testing.T) {
 	if string(out) != verificationDigest(p) {
 		t.Fatalf("native/host mismatch %s %s", out, verificationDigest(p))
 	}
+	p.MaxAttempts = 3
+	p.KnownFailures = []api.VerificationKnownFailure{{CheckID: p.Checks[0].ID, BugTaskID: p.ItemTaskID, BugID: p.ItemID}}
+	for _, value := range []any{p, retryVerification(p, 1, 0), retryVerification(p, 1, 1, 1)} {
+		raw, _ = json.Marshal(value)
+		cmd = exec.Command("node", "--input-type=module", "-e", script)
+		cmd.Dir = "../../.."
+		cmd.Stdin = strings.NewReader(string(raw))
+		out, err = cmd.Output()
+		if err != nil || string(out) != verificationDigest(value) {
+			t.Fatal("retry canonical digest mismatch", string(out), verificationDigest(value), err)
+		}
+	}
+
 	_ = f
 }
 func TestVerificationScopeInvalidationAndStaleVerifier(t *testing.T) {
@@ -491,5 +507,224 @@ func TestVerificationLegacyCompletionPreserved(t *testing.T) {
 	done := "done"
 	if _, err := f.s.UpdateWorkItem(f.ctx, f.task.ID, f.item.ID, api.UpdateWorkItemRequest{Revision: 1, Status: &done}, f.by); err != nil {
 		t.Fatal("legacy completion", err)
+	}
+}
+
+func retryVerification(p api.VerificationPlan, codes ...int) api.VerificationReceipt {
+	r := passingVerification(p)
+	for i := range r.Checks {
+		c := &r.Checks[i]
+		for j, code := range codes {
+			start := time.Date(2026, 9, 26, 0, 0, j*2, 0, time.UTC)
+			a := api.VerificationAttempt{Attempt: j + 1, StartedAt: start.Format(time.RFC3339), EndedAt: start.Add(time.Second).Format(time.RFC3339), DurationMs: 1000, ExitCode: code, LogURI: fmt.Sprintf("/tmp/check-%d-attempt-%d.log", i, j), LogDigest: strings.Repeat("b", 64)}
+			if code != 0 {
+				a.FailureReason = "exit"
+			}
+			c.Attempts = append(c.Attempts, a)
+		}
+		a := c.Attempts[len(c.Attempts)-1]
+		c.StartedAt = a.StartedAt
+		c.EndedAt = a.EndedAt
+		c.DurationMs = a.DurationMs
+		c.ExitCode = a.ExitCode
+		c.FailureReason = a.FailureReason
+		c.LogURI = a.LogURI
+		c.LogDigest = a.LogDigest
+		c.Status = "fail"
+		if c.ExitCode == 0 {
+			c.Status = "pass"
+			if len(c.Attempts) > 1 {
+				c.Status = "flaky"
+			}
+		}
+		for _, e := range p.KnownFailures {
+			if e.CheckID == c.ID {
+				c.KnownFailure = true
+				c.NowPassing = c.ExitCode == 0
+			}
+		}
+	}
+	return r
+}
+func knownVerificationFixture(t *testing.T) (*convergenceFixture, api.Agent, api.VerificationPlan, api.WorkItem) {
+	f, h, p := verificationFixture(t)
+	bug, err := f.s.CreateWorkItem(f.ctx, f.task.ID, api.CreateWorkItemRequest{Kind: "bug", Title: "Known verification failure", RequestID: "known-bug"}, f.by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p.MaxAttempts = 3
+	p.KnownFailures = []api.VerificationKnownFailure{{CheckID: p.Checks[0].ID, BugTaskID: f.task.ID, BugID: bug.ID}}
+	return f, h, p, bug
+}
+func TestVerificationKnownFailureEvidenceAndAllCompletionGates(t *testing.T) {
+	for _, known := range []bool{false, true} {
+		for _, codes := range [][]int{{0}, {1, 0}, {1, 1, 0}, {1, 1, 1}} {
+			t.Run(fmt.Sprintf("known=%v/codes=%v", known, codes), func(t *testing.T) {
+				f, h, p, _ := knownVerificationFixture(t)
+				if !known {
+					p.KnownFailures = nil
+				}
+				request := f.review(t, p.Commit)
+				if _, err := f.post(f.resultEnv(p.Commit, map[string]string{"a1": "pass", "a2": "pass"}, api.ReviewMetadata{Mode: "general"}), "", request.Seq, f.reviewer); err != nil {
+					t.Fatal(err)
+				}
+				if _, err := f.s.SaveVerification(f.ctx, f.task.ID, f.item.ID, api.VerificationRequest{RequestID: "new-plan", AgentID: h.ID, RunID: h.RunID, Plan: &p}); err != nil {
+					t.Fatal(err)
+				}
+				r := retryVerification(p, codes...)
+				if _, err := f.s.SaveVerification(f.ctx, f.task.ID, f.item.ID, api.VerificationRequest{RequestID: "raw-receipt", AgentID: h.ID, RunID: h.RunID, ExpectedGeneration: 1, Receipt: &r}); err != nil {
+					t.Fatal("valid raw evidence rejected", err)
+				}
+				history, err := f.s.VerificationHistory(f.ctx, f.task.ID, f.item.ID, h.ID, h.RunID)
+				if err != nil || !reflect.DeepEqual(history[1].Receipt, &r) {
+					t.Fatal("roundtrip", err)
+				}
+				eligible := known || codes[len(codes)-1] == 0
+				accept := api.Envelope{Kind: "notice", Subject: "Accept exact fixture candidate", Body: api.EnvelopeBody{Text: "accept"}, Review: &api.ReviewMetadata{Mode: "disposition", Disposition: "accept", Candidate: p.Commit}}
+				_, err = f.post(accept, "", 0, api.Agent{})
+				if (err == nil) != eligible {
+					t.Fatal("accept gate", err)
+				}
+				tx, _ := f.s.db.BeginTx(f.ctx, nil)
+				err = reviewCompletion(f.ctx, tx, f.item, p.Commit)
+				tx.Rollback()
+				if (err == nil) != eligible {
+					t.Fatal("queue gate", err)
+				}
+				done := "done"
+				_, err = f.s.UpdateWorkItem(f.ctx, f.task.ID, f.item.ID, api.UpdateWorkItemRequest{Revision: 1, Status: &done}, f.by)
+				if (err == nil) != eligible {
+					t.Fatal("PATCH gate", err)
+				}
+				revision := int64(1)
+				if eligible {
+					revision = 2
+				}
+				_, _, err = f.s.CreateWorkItemUpdate(f.ctx, f.task.ID, f.item.ID, api.CreateWorkItemUpdate{RequestID: "keyed-done", ExpectedRevision: revision, Status: &done}, f.by)
+				if (err == nil) != eligible {
+					t.Fatal("keyed gate", err)
+				}
+			})
+		}
+	}
+}
+func TestVerificationMalformedAttemptsAndBugLinks(t *testing.T) {
+	f, h, p, bug := knownVerificationFixture(t)
+	feature, err := f.s.CreateWorkItem(f.ctx, f.task.ID, api.CreateWorkItemRequest{Kind: "feature", Title: "Not a bug", RequestID: "feature-link"}, f.by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i, mutate := range []func(*api.VerificationPlan){
+		func(p *api.VerificationPlan) { p.KnownFailures = append(p.KnownFailures, p.KnownFailures[0]) },
+		func(p *api.VerificationPlan) { p.KnownFailures[0].CheckID = "unknown" },
+		func(p *api.VerificationPlan) { p.KnownFailures[0].BugID = api.NewID("wi") },
+		func(p *api.VerificationPlan) { p.KnownFailures[0].BugID = feature.ID },
+		func(p *api.VerificationPlan) { p.MaxAttempts = 4 },
+	} {
+		b := p
+		b.KnownFailures = append([]api.VerificationKnownFailure{}, p.KnownFailures...)
+		mutate(&b)
+		if _, err := f.s.SaveVerification(f.ctx, f.task.ID, f.item.ID, api.VerificationRequest{RequestID: fmt.Sprintf("bad-plan-%d", i), AgentID: h.ID, RunID: h.RunID, Plan: &b}); !errors.Is(err, api.ErrConflict) {
+			t.Fatal(i, err)
+		}
+	}
+	if _, err := f.s.SaveVerification(f.ctx, f.task.ID, f.item.ID, api.VerificationRequest{RequestID: "plan", AgentID: h.ID, RunID: h.RunID, Plan: &p}); err != nil {
+		t.Fatal(err)
+	}
+	for i, mutate := range []func(*api.VerificationReceipt){
+		func(r *api.VerificationReceipt) { r.Checks[0].Attempts = nil },
+		func(r *api.VerificationReceipt) { r.Checks[0].Attempts[0].Attempt = 2 },
+		func(r *api.VerificationReceipt) {
+			r.Checks[0].Attempts[0].ExitCode = 0
+			r.Checks[0].Attempts[0].FailureReason = ""
+		},
+		func(r *api.VerificationReceipt) { r.Checks[0].Attempts[0].LogURI = r.Checks[0].Attempts[1].LogURI },
+		func(r *api.VerificationReceipt) { r.Checks[0].Attempts[0].LogDigest = "bad" },
+		func(r *api.VerificationReceipt) { r.Checks[0].Attempts[0].EndedAt = "bad" },
+		func(r *api.VerificationReceipt) {
+			r.Checks[0].Attempts[1].StartedAt = r.Checks[0].Attempts[0].StartedAt
+		},
+		func(r *api.VerificationReceipt) { r.Checks[0].ExitCode = 1 },
+		func(r *api.VerificationReceipt) { r.Checks[0].Status = "pass" },
+		func(r *api.VerificationReceipt) { r.Checks[0].KnownFailure = false },
+		func(r *api.VerificationReceipt) { r.Checks[0].NowPassing = false },
+		func(r *api.VerificationReceipt) {
+			r.Checks[0].Attempts = append(r.Checks[0].Attempts, r.Checks[0].Attempts...)
+		},
+	} {
+		r := retryVerification(p, 1, 0)
+		mutate(&r)
+		if _, err := f.s.SaveVerification(f.ctx, f.task.ID, f.item.ID, api.VerificationRequest{RequestID: fmt.Sprintf("bad-retry-%d", i), AgentID: h.ID, RunID: h.RunID, ExpectedGeneration: 1, Receipt: &r}); !errors.Is(err, api.ErrConflict) {
+			t.Fatal(i, err)
+		}
+	}
+	r := retryVerification(p, 1, 1)
+	if err := validateVerificationReceipt(p, r); err == nil {
+		t.Fatal("unexhausted failure accepted")
+	}
+	r = retryVerification(p, 1, 1, 1)
+	if _, err := f.s.SaveVerification(f.ctx, f.task.ID, f.item.ID, api.VerificationRequest{RequestID: "raw", AgentID: h.ID, RunID: h.RunID, ExpectedGeneration: 1, Receipt: &r}); err != nil {
+		t.Fatal(err)
+	}
+	done := "dismissed"
+	if _, err := f.s.UpdateWorkItem(f.ctx, f.task.ID, bug.ID, api.UpdateWorkItemRequest{Revision: 1, Status: &done}, f.by); err != nil {
+		t.Fatal(err)
+	}
+	tx, _ := f.s.db.BeginTx(f.ctx, nil)
+	err = verificationReady(f.ctx, tx, f.item, p.Commit)
+	tx.Rollback()
+	if !errors.Is(err, api.ErrConflict) {
+		t.Fatal("closed bug still waived", err)
+	}
+	p.OperationKey = "closed-bug"
+	if _, err = f.s.SaveVerification(f.ctx, f.task.ID, f.item.ID, api.VerificationRequest{RequestID: "closed-bug", AgentID: h.ID, RunID: h.RunID, ExpectedGeneration: 2, Plan: &p}); !errors.Is(err, api.ErrConflict) {
+		t.Fatal("closed bug plan", err)
+	}
+}
+func TestVerificationKnownFailuresApprovalInvalidation(t *testing.T) {
+	f, h, p, _ := knownVerificationFixture(t)
+	rawBefore := `{"maxAttempts":3,"knownFailures":[]}`
+	rawAfter := `{"maxAttempts":3,"knownFailures":[{"checkId":"fixture-check","bugId":"` + p.KnownFailures[0].BugID + `","bugTaskId":"` + p.ItemTaskID + `"}]}`
+	p.MatrixDigest = fmt.Sprintf("%x", sha256.Sum256([]byte(rawBefore)))
+	p.ApprovedMatrixDigest = p.MatrixDigest
+	approval, err := f.s.PostMessage(f.ctx, f.task.ID, api.PostMessageRequest{Text: "verification-matrix-approval:" + p.MatrixDigest}, f.by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p.MatrixApprovalMessageSeq = approval.Seq
+	// Only knownFailures bytes changed; reusing the old owner's token must fail.
+	p.MatrixDigest = fmt.Sprintf("%x", sha256.Sum256([]byte(rawAfter)))
+	p.ApprovedMatrixDigest = p.MatrixDigest
+	if _, err = f.s.SaveVerification(f.ctx, f.task.ID, f.item.ID, api.VerificationRequest{RequestID: "changed-list", AgentID: h.ID, RunID: h.RunID, Plan: &p}); !errors.Is(err, api.ErrConflict) {
+		t.Fatal("old approval accepted changed knownFailures bytes", err)
+	}
+	approval, err = f.s.PostMessage(f.ctx, f.task.ID, api.PostMessageRequest{Text: "verification-matrix-approval:" + p.MatrixDigest}, f.by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p.MatrixApprovalMessageSeq = approval.Seq
+	if _, err = f.s.SaveVerification(f.ctx, f.task.ID, f.item.ID, api.VerificationRequest{RequestID: "new-approval", AgentID: h.ID, RunID: h.RunID, Plan: &p}); err != nil {
+		t.Fatal("new approval rejected", err)
+	}
+}
+
+func TestVerificationRetainsRawFailureAfterBugCloses(t *testing.T) {
+	f, h, p, bug := knownVerificationFixture(t)
+	if _, err := f.s.SaveVerification(f.ctx, f.task.ID, f.item.ID, api.VerificationRequest{RequestID: "plan", AgentID: h.ID, RunID: h.RunID, Plan: &p}); err != nil {
+		t.Fatal(err)
+	}
+	dismissed := "dismissed"
+	if _, err := f.s.UpdateWorkItem(f.ctx, f.task.ID, bug.ID, api.UpdateWorkItemRequest{Revision: 1, Status: &dismissed}, f.by); err != nil {
+		t.Fatal(err)
+	}
+	r := retryVerification(p, 1, 1, 1)
+	if _, err := f.s.SaveVerification(f.ctx, f.task.ID, f.item.ID, api.VerificationRequest{RequestID: "raw-failure", AgentID: h.ID, RunID: h.RunID, ExpectedGeneration: 1, Receipt: &r}); err != nil {
+		t.Fatal("raw evidence lost after link closed", err)
+	}
+	tx, _ := f.s.db.BeginTx(f.ctx, nil)
+	err := verificationReady(f.ctx, tx, f.item, p.Commit)
+	tx.Rollback()
+	if !errors.Is(err, api.ErrConflict) {
+		t.Fatal("closed link allowed completion", err)
 	}
 }

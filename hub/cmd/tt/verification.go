@@ -87,21 +87,25 @@ func cmdVerification(e env, args []string) error {
 
 func verifyReceiptLogs(r api.VerificationReceipt) error {
 	for _, check := range r.Checks {
-		file, err := os.Open(check.LogURI)
-		if err != nil {
-			return fmt.Errorf("verification log unavailable: %w", err)
-		}
-		hash := sha256.New()
-		_, err = io.Copy(hash, file)
-		closeErr := file.Close()
-		if err != nil {
-			return err
-		}
-		if closeErr != nil {
-			return closeErr
-		}
-		if hex.EncodeToString(hash.Sum(nil)) != check.LogDigest {
-			return errors.New("verification log digest mismatch")
+		logs := []api.VerificationAttempt{{LogURI: check.LogURI, LogDigest: check.LogDigest}}
+		logs = append(logs, check.Attempts...)
+		for _, check := range logs {
+			file, err := os.Open(check.LogURI)
+			if err != nil {
+				return fmt.Errorf("verification log unavailable: %w", err)
+			}
+			hash := sha256.New()
+			_, err = io.Copy(hash, file)
+			closeErr := file.Close()
+			if err != nil {
+				return err
+			}
+			if closeErr != nil {
+				return closeErr
+			}
+			if hex.EncodeToString(hash.Sum(nil)) != check.LogDigest {
+				return errors.New("verification log digest mismatch")
+			}
 		}
 	}
 	return nil

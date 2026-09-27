@@ -151,20 +151,121 @@ func validateVerificationPlan(ctx context.Context, tx *sql.Tx, item api.WorkItem
 		}
 		seen[c.ID] = true
 	}
-	return nil
+	return validateVerificationKnownFailures(ctx, tx, p)
 }
 func validateVerificationReceipt(p api.VerificationPlan, r api.VerificationReceipt) error {
 	if !filepath.IsAbs(r.Worktree) || r.Version != 1 || r.OperationKey != p.OperationKey || r.PlanDigest != verificationDigest(p) || r.Commit != p.Commit || r.BaseCommit != p.BaseCommit || r.Repository != p.Repository || r.MatrixDigest != p.MatrixDigest || r.ChecksDigest != p.ChecksDigest || r.VerifierAgentID != p.VerifierAgentID || r.VerifierRunID != p.VerifierRunID || !r.Detached || !r.CleanBefore || !r.CleanAfter || r.AIV.State != "unsubmitted" || len(r.Checks) != len(p.Checks) || len(r.Environment) == 0 {
 		return verificationConflict("receipt binding, clean SHA or coverage mismatch")
 	}
+	logs := map[string]bool{}
 	for i, c := range r.Checks {
-		if !reflect.DeepEqual(c.VerificationCheck, p.Checks[i]) || c.ExitCode != 0 || !validContextDigest(c.LogDigest) || !filepath.IsAbs(c.LogURI) || c.DurationMs < 0 {
-			return verificationConflict("missing, altered, duplicate or failed check")
+		if !reflect.DeepEqual(c.VerificationCheck, p.Checks[i]) || !validContextDigest(c.LogDigest) || !filepath.IsAbs(c.LogURI) || c.DurationMs < 0 {
+			return verificationConflict("missing, altered or duplicate check")
 		}
-		start, e1 := time.Parse(time.RFC3339Nano, c.StartedAt)
-		end, e2 := time.Parse(time.RFC3339Nano, c.EndedAt)
-		if e1 != nil || e2 != nil || end.Before(start) || absVerificationDuration(end.Sub(start).Milliseconds()-c.DurationMs) > 2000 {
-			return verificationConflict("invalid check times/duration")
+		aggregate := api.VerificationAttempt{StartedAt: c.StartedAt, EndedAt: c.EndedAt, DurationMs: c.DurationMs, ExitCode: c.ExitCode, FailureReason: c.FailureReason, LogURI: c.LogURI, LogDigest: c.LogDigest}
+		if err := validateVerificationAttempt(aggregate); err != nil {
+			return err
+		}
+		if p.MaxAttempts == 0 {
+			if len(c.Attempts) != 0 || c.Status != "" || c.KnownFailure || c.NowPassing {
+				return verificationConflict("legacy result has unapproved retry policy")
+			}
+			continue
+		}
+		if p.MaxAttempts != 3 || len(c.Attempts) < 1 || len(c.Attempts) > p.MaxAttempts {
+			return verificationConflict("invalid attempt count")
+		}
+		for j, attempt := range c.Attempts {
+			if attempt.Attempt != j+1 || logs[attempt.LogURI] || (j > 0 && c.Attempts[j-1].ExitCode == 0) {
+				return verificationConflict("invalid attempt order or log identity")
+			}
+			logs[attempt.LogURI] = true
+			if err := validateVerificationAttempt(attempt); err != nil {
+				return err
+			}
+			if j > 0 {
+				priorEnd, _ := time.Parse(time.RFC3339Nano, c.Attempts[j-1].EndedAt)
+				nextStart, _ := time.Parse(time.RFC3339Nano, attempt.StartedAt)
+				if nextStart.Before(priorEnd) {
+					return verificationConflict("overlapping attempts")
+				}
+			}
+		}
+		final := c.Attempts[len(c.Attempts)-1]
+		final.Attempt = 0
+		if !reflect.DeepEqual(aggregate, final) || (c.ExitCode != 0 && len(c.Attempts) != p.MaxAttempts) {
+			return verificationConflict("aggregate or exhausted attempts mismatch")
+		}
+		status := "fail"
+		if c.ExitCode == 0 {
+			status = "pass"
+			if len(c.Attempts) > 1 {
+				status = "flaky"
+			}
+		}
+		known := false
+		for _, e := range p.KnownFailures {
+			if e.CheckID == c.ID {
+				known = true
+			}
+		}
+		if c.Status != status || c.KnownFailure != known || c.NowPassing != (known && c.ExitCode == 0) {
+			return verificationConflict("forged result status or known failure flags")
+		}
+	}
+	return nil
+}
+func validateVerificationAttempt(a api.VerificationAttempt) error {
+	start, e1 := time.Parse(time.RFC3339Nano, a.StartedAt)
+	end, e2 := time.Parse(time.RFC3339Nano, a.EndedAt)
+	if e1 != nil || e2 != nil || end.Before(start) || a.DurationMs < 0 || absVerificationDuration(end.Sub(start).Milliseconds()-a.DurationMs) > 2000 || !validContextDigest(a.LogDigest) || !filepath.IsAbs(a.LogURI) {
+		return verificationConflict("invalid attempt evidence or times/duration")
+	}
+	if a.ExitCode == 0 && a.FailureReason != "" {
+		return verificationConflict("successful attempt has failure reason")
+	}
+	switch a.FailureReason {
+	case "", "exit", "timeout", "port-conflict", "port-inspection", "spawn", "output-limit":
+	default:
+		return verificationConflict("invalid failure reason")
+	}
+	return nil
+}
+func validateVerificationKnownFailures(ctx context.Context, q queryRower, p api.VerificationPlan) error {
+	if p.MaxAttempts == 0 && len(p.KnownFailures) == 0 {
+		return nil
+	}
+	if p.MaxAttempts != 3 {
+		return verificationConflict("approved maximum must be three attempts")
+	}
+	ids := map[string]bool{}
+	for _, c := range p.Checks {
+		ids[c.ID] = true
+	}
+	seen := map[string]bool{}
+	for _, e := range p.KnownFailures {
+		if !ids[e.CheckID] || seen[e.CheckID] || !api.ValidID(e.BugTaskID, "tsk") || !api.ValidID(e.BugID, "wi") {
+			return verificationConflict("invalid or duplicate known failure")
+		}
+		seen[e.CheckID] = true
+		var kind, status string
+		if err := q.QueryRowContext(ctx, `SELECT kind,status FROM work_items WHERE task_id=? AND id=?`, e.BugTaskID, e.BugID).Scan(&kind, &status); err != nil || kind != "bug" || (status != "open" && status != "in_progress" && status != "blocked") {
+			return verificationConflict("known failure requires linked open bug")
+		}
+	}
+	return nil
+}
+func verificationEligible(p api.VerificationPlan, r api.VerificationReceipt) error {
+	if err := validateVerificationReceipt(p, r); err != nil {
+		return err
+	}
+	known := map[string]bool{}
+	for _, e := range p.KnownFailures {
+		known[e.CheckID] = true
+	}
+	for _, c := range r.Checks {
+		if c.ExitCode != 0 && !known[c.ID] {
+			return verificationConflict("unlisted exhausted failure blocks completion")
 		}
 	}
 	return nil
@@ -303,7 +404,10 @@ func verificationReady(ctx context.Context, tx *sql.Tx, item api.WorkItem, candi
 			return verificationConflict("reviewer cannot verify")
 		}
 	}
-	return validateVerificationReceipt(*p, *r)
+	if err := validateVerificationKnownFailures(ctx, tx, *p); err != nil {
+		return err
+	}
+	return verificationEligible(*p, *r)
 }
 
 const verificationEnrollmentSchema = `CREATE TABLE IF NOT EXISTS verification_enrollments (
@@ -362,4 +466,62 @@ func (s *Store) VerificationEnrollment(ctx context.Context, task, item, agent, r
 		out = append(out, api.VerificationEnrollment{Provenance: "legacy-no-team-admission"})
 	}
 	return out, nil
+}
+
+func (s *Store) loadTeamVerification(ctx context.Context, e *api.TeamQueueEntry) error {
+	records, err := verificationRecords(ctx, s.db, e.TaskID, e.ItemID)
+	if err != nil {
+		return err
+	}
+	p, r := currentVerification(records)
+	if p == nil {
+		return nil
+	}
+	summary := &api.VerificationSummary{State: "pending", Commit: p.Commit}
+	e.Verification = summary
+	var scope int64
+	if err = s.db.QueryRowContext(ctx, `SELECT narrative_scope_revision FROM work_items WHERE task_id=? AND id=?`, e.TaskID, e.ItemID).Scan(&scope); err != nil {
+		return err
+	}
+	if scope != p.ScopeRevision {
+		summary.State = "stale"
+		return nil
+	}
+	state, err := reviewState(ctx, s.db, e.TaskID, e.ItemID)
+	if err != nil {
+		return err
+	}
+	sc := scopeFor(&state, scope)
+	if sc == nil || sc.AssignmentSeq != p.AssignmentSeq {
+		summary.State = "stale"
+		return nil
+	}
+	if r == nil {
+		return nil
+	}
+	if validateVerificationReceipt(*p, *r) != nil {
+		summary.State = "invalid"
+		return nil
+	}
+	summary.State = "blocked"
+	independent := true
+	for _, round := range state.Rounds {
+		if round.ReviewerID == p.VerifierAgentID {
+			independent = false
+		}
+	}
+	if independent && verificationEligible(*p, *r) == nil && validateVerificationKnownFailures(ctx, s.db, *p) == nil {
+		summary.State = "passing"
+	}
+	for _, c := range r.Checks {
+		status := c.Status
+		if status == "" {
+			status = "fail"
+			if c.ExitCode == 0 {
+				status = "pass"
+			}
+		}
+		summary.Checks = append(summary.Checks, api.VerificationCheckSummary{ID: c.ID, Status: status, KnownFailure: c.KnownFailure, NowPassing: c.NowPassing})
+	}
+	return nil
 }

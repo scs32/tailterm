@@ -71,3 +71,35 @@ func TestVerificationTimeoutReceiptRoundTrip(t *testing.T) {
 		t.Fatal("successful result includes failure reason")
 	}
 }
+
+func TestVerificationRetryChecksEveryAttemptLog(t *testing.T) {
+	dir := t.TempDir()
+	paths := []string{filepath.Join(dir, "first.log"), filepath.Join(dir, "final.log")}
+	attempts := []api.VerificationAttempt{}
+	for i, p := range paths {
+		data := []byte(string(rune('a' + i)))
+		if err := os.WriteFile(p, data, 0600); err != nil {
+			t.Fatal(err)
+		}
+		hash := sha256.Sum256(data)
+		attempts = append(attempts, api.VerificationAttempt{Attempt: i + 1, ExitCode: 1 - i, LogURI: p, LogDigest: hex.EncodeToString(hash[:])})
+	}
+	r := api.VerificationReceipt{Checks: []api.VerificationResult{{Attempts: attempts, Status: "flaky", LogURI: attempts[1].LogURI, LogDigest: attempts[1].LogDigest}}}
+	raw, err := json.Marshal(r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var restored api.VerificationReceipt
+	if err = json.Unmarshal(raw, &restored); err != nil || len(restored.Checks[0].Attempts) != 2 || restored.Checks[0].Status != "flaky" {
+		t.Fatal("retry roundtrip", err)
+	}
+	if err = verifyReceiptLogs(restored); err != nil {
+		t.Fatal(err)
+	}
+	if err = os.WriteFile(paths[0], []byte("tampered first failure"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err = verifyReceiptLogs(restored); err == nil {
+		t.Fatal("first failed attempt log tampering accepted")
+	}
+}

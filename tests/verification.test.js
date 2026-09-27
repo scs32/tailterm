@@ -15,6 +15,8 @@ import {
   assertInventory,
   runCheck,
   occupiedPorts,
+  receiptEligible,
+  matrixPolicy,
 } from "../scripts/verify-matrix.mjs";
 const makePlan = (context, cwd) =>
   rawMakePlan(
@@ -80,6 +82,8 @@ function fixture(t) {
   git("config", "user.name", "Fixture");
   git("config", "user.email", "fixture@example.invalid");
   const m = {
+    maxAttempts: 3,
+    knownFailures: [],
     version: 1,
     browserSuites: [],
     excludedBrowserSuites: [],
@@ -364,7 +368,7 @@ test("matrix timeout kills its own process group descendants and retains failed 
   const f = fixture(t),
     external = mkdtempSync(join(tmpdir(), "verification-timeout-logs-")),
     info = join(external, "descendant.json");
-  const childCode = `const net=require('node:net'),fs=require('node:fs');process.on('SIGTERM',()=>{});const server=net.createServer();server.listen(0,'127.0.0.1',()=>fs.writeFileSync(${JSON.stringify(info)},JSON.stringify({pid:process.pid,parent:process.ppid,port:server.address().port})));setInterval(()=>{},1000);`;
+  const childCode = `const net=require('node:net'),fs=require('node:fs');process.on('SIGTERM',()=>{});const server=net.createServer();server.listen(0,'127.0.0.1',()=>fs.appendFileSync(${JSON.stringify(info)},JSON.stringify({pid:process.pid,parent:process.ppid,port:server.address().port})+String.fromCharCode(10)));setInterval(()=>{},1000);`;
   const parentCode = `import {spawn} from 'node:child_process';process.on('SIGTERM',()=>{});spawn(process.execPath,['-e',${JSON.stringify(childCode)}],{stdio:'ignore'});setInterval(()=>{},1000);`;
   writeFileSync(join(f.cwd, "timeout-fixture.mjs"), parentCode);
   writeFileSync(
@@ -396,27 +400,183 @@ test("matrix timeout kills its own process group descendants and retains failed 
   assert.match(log, /verification failureReason: timeout/);
   assert.equal(receipt.checks[0].logDigest, digest(log));
   assert.equal(receipt.checks[0].environment.VERIFICATION_TIMEOUT_MS, "1500");
-  const descendant = JSON.parse(readFileSync(info, "utf8"));
-  assert.deepEqual(
-    occupiedPorts({
-      environment: { VERIFICATION_REQUIRED_PORTS: String(descendant.port) },
-    }),
-    [],
-    "descendant listener ended despite ignored SIGTERM",
-  );
-  let state = "";
-  try {
-    state = execFileSync("ps", ["-p", String(descendant.pid), "-o", "stat="], {
-      encoding: "utf8",
-    }).trim();
-  } catch {}
-  assert(
-    !state || state.startsWith("Z"),
-    "descendant is exited rather than a surviving service",
-  );
+  assert.equal(receipt.checks[0].status, "fail");
+  assert.equal(receipt.checks[0].attempts.length, 3);
+  for (const attempt of receipt.checks[0].attempts) {
+    assert.equal(attempt.exitCode, 124);
+    assert.equal(attempt.failureReason, "timeout");
+    assert.equal(
+      attempt.logDigest,
+      digest(readFileSync(attempt.logURI, "utf8")),
+    );
+  }
+  const descendants = readFileSync(info, "utf8")
+    .trim()
+    .split("\n")
+    .map((line) => JSON.parse(line));
+  assert.equal(descendants.length, 3);
+  for (const descendant of descendants) {
+    assert.deepEqual(
+      occupiedPorts({
+        environment: { VERIFICATION_REQUIRED_PORTS: String(descendant.port) },
+      }),
+      [],
+      "descendant listener ended despite ignored SIGTERM",
+    );
+    let state = "";
+    try {
+      state = execFileSync(
+        "ps",
+        ["-p", String(descendant.pid), "-o", "stat="],
+        {
+          encoding: "utf8",
+        },
+      ).trim();
+    } catch {}
+    assert(
+      !state || state.startsWith("Z"),
+      "descendant is exited rather than a surviving service",
+    );
+  }
   const saved = JSON.parse(readFileSync(join(external, "receipt.json")));
   assert.equal(saved.checks[0].exitCode, 124);
   assert.equal(saved.checks[0].failureReason, "timeout");
-  const schema = JSON.parse(readFileSync(new URL("../verification/receipt.schema.json", import.meta.url)));
-  assert(schema.properties.checks.items.properties.failureReason.enum.includes(saved.checks[0].failureReason));
+  const schema = JSON.parse(
+    readFileSync(
+      new URL("../verification/receipt.schema.json", import.meta.url),
+    ),
+  );
+  assert(
+    schema.properties.checks.items.properties.failureReason.enum.includes(
+      saved.checks[0].failureReason,
+    ),
+  );
+});
+
+for (const [codes, expected] of [
+  [[0], "pass"],
+  [[1, 0], "flaky"],
+  [[1, 1, 0], "flaky"],
+  [[1, 1, 1], "fail"],
+]) {
+  test(
+    "actual retry sequence " + codes.join(",") + " records exact evidence",
+    (t) => {
+      const f = fixture(t),
+        output = mkdtempSync(join(tmpdir(), "verification-retry-"));
+      const counter = join(output, "count.json");
+      writeFileSync(
+        join(f.cwd, "retry.mjs"),
+        `import fs from 'node:fs';const p=${JSON.stringify(counter)};const n=fs.existsSync(p)?JSON.parse(fs.readFileSync(p)):0;fs.writeFileSync(p,JSON.stringify(n+1));console.log('attempt '+(n+1));process.exit(${JSON.stringify(codes)}[n]??1);`,
+      );
+      writeFileSync(
+        join(f.cwd, "package.json"),
+        JSON.stringify({ scripts: { test: "node retry.mjs" } }),
+      );
+      f.git("add", ".");
+      f.git("commit", "-qm", "retry fixture");
+      const commit = f.git("rev-parse", "HEAD");
+      const plan = makePlan(
+        { baseCommit: commit, commit, owned: ["docs/"] },
+        f.cwd,
+      );
+      const r = runPlan(plan, f.cwd, output),
+        c = r.checks[0];
+      assert.equal(c.status, expected);
+      assert.equal(c.attempts.length, codes.length);
+      assert.deepEqual(
+        c.attempts.map((a) => a.exitCode),
+        codes,
+      );
+      assert.equal(receiptEligible(r), expected !== "fail");
+      assert.equal(new Set(c.attempts.map((a) => a.logURI)).size, codes.length);
+      for (const [i, a] of c.attempts.entries()) {
+        assert.equal(a.attempt, i + 1);
+        const log = readFileSync(a.logURI, "utf8");
+        assert.match(log, new RegExp("attempt " + (i + 1)));
+        assert.equal(a.logDigest, digest(log));
+      }
+      for (const key of [
+        "startedAt",
+        "endedAt",
+        "durationMs",
+        "exitCode",
+        "logURI",
+        "logDigest",
+      ])
+        assert.equal(c[key], c.attempts.at(-1)[key]);
+    },
+  );
+}
+for (const pass of [false, true])
+  test(
+    "known failure " +
+      (pass ? "now passes" : "exhausts retries without blocking"),
+    (t) => {
+      const f = fixture(t),
+        m = JSON.parse(readFileSync(join(f.cwd, "verification/matrix.json")));
+      m.knownFailures = [
+        {
+          checkId: "npm-unit",
+          bugTaskId: "tsk_aaaaaaaaaaaaaaaa",
+          bugId: "wi_bbbbbbbbbbbbbbbb",
+        },
+      ];
+      writeFileSync(join(f.cwd, "verification/matrix.json"), JSON.stringify(m));
+      writeFileSync(
+        join(f.cwd, "package.json"),
+        JSON.stringify({
+          scripts: { test: `node -e "process.exit(${pass ? 0 : 1})"` },
+        }),
+      );
+      f.git("add", ".");
+      f.git("commit", "-qm", "known fixture");
+      const commit = f.git("rev-parse", "HEAD");
+      const plan = makePlan(
+          { baseCommit: commit, commit, owned: ["docs/"] },
+          f.cwd,
+        ),
+        r = runPlan(plan, f.cwd, mkdtempSync(join(tmpdir(), "known-logs-")));
+      assert.equal(r.checks[0].knownFailure, true);
+      assert.equal(!!r.checks[0].nowPassing, pass);
+      assert.equal(r.checks[0].status, pass ? "pass" : "fail");
+      assert.equal(receiptEligible(r), true);
+      assert.equal(r.checks[0].attempts.length, pass ? 1 : 3);
+    },
+  );
+test("only knownFailures bytes change invalidates prior approval and plan", (t) => {
+  const f = fixture(t),
+    raw = readFileSync(join(f.cwd, "verification/matrix.json"), "utf8"),
+    approved = digest(raw),
+    m = JSON.parse(raw);
+  m.knownFailures = [
+    {
+      checkId: "npm-unit",
+      bugTaskId: "tsk_aaaaaaaaaaaaaaaa",
+      bugId: "wi_bbbbbbbbbbbbbbbb",
+    },
+  ];
+  writeFileSync(join(f.cwd, "verification/matrix.json"), JSON.stringify(m));
+  assert.throws(
+    () =>
+      rawMakePlan(
+        {
+          baseCommit: f.base,
+          commit: f.commit,
+          owned: ["docs/"],
+          approvedMatrixDigest: approved,
+          matrixApprovalMessageSeq: 1,
+        },
+        f.cwd,
+      ),
+    /approved matrix/,
+  );
+  for (const knownFailures of [
+    [m.knownFailures[0], m.knownFailures[0]],
+    [{ ...m.knownFailures[0], checkId: "unknown" }],
+  ])
+    assert.throws(
+      () => matrixPolicy({ ...m, knownFailures }, []),
+      /known failure/,
+    );
 });

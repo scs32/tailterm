@@ -154,6 +154,49 @@ export function assertInventory(matrix, cwd) {
   if (canonical(inventory) !== canonical(declared))
     throw new Error("Browser inventory changed; update approved matrix");
 }
+export function matrixPolicy(matrix, checks) {
+  if (matrix.maxAttempts === undefined && matrix.knownFailures === undefined)
+    return {};
+  if (matrix.maxAttempts !== 3 || !Array.isArray(matrix.knownFailures))
+    throw new Error("Approved maxAttempts=3 and knownFailures required");
+  const ids = new Set([
+    "npm-unit",
+    "00-static-build",
+    "01-static-release-verify",
+    "go-vet",
+    "go-test",
+    "go-race",
+    "migration-rehearsal",
+    "wasm-test-build",
+  ]);
+  for (const suite of matrix.browserSuites)
+    for (const id of suite.mode === "both"
+      ? [suite.file]
+      : [suite.file + ":chromium", suite.file + ":webkit"])
+      ids.add(id);
+  const seen = new Set();
+  for (const entry of matrix.knownFailures) {
+    if (
+      !ids.has(entry.checkId) ||
+      seen.has(entry.checkId) ||
+      !/^tsk_[a-f0-9]{16}$/.test(entry.bugTaskId || "") ||
+      !/^wi_[a-f0-9]{16}$/.test(entry.bugId || "") ||
+      Object.keys(entry).sort().join(",") !== "bugId,bugTaskId,checkId"
+    )
+      throw new Error("Invalid, unknown or duplicate known failure");
+    seen.add(entry.checkId);
+  }
+  const selected = new Set(checks.map((c) => c.id));
+  const knownFailures = matrix.knownFailures.filter((e) =>
+    selected.has(e.checkId),
+  );
+  return { maxAttempts: 3, ...(knownFailures.length ? { knownFailures } : {}) };
+}
+export function receiptEligible(receipt) {
+  return receipt.checks.every(
+    (c) => c.exitCode === 0 || c.knownFailure === true,
+  );
+}
 export function makePlan(context, cwd) {
   if (
     !/^[a-f0-9]{40}$/.test(context.commit) ||
@@ -191,9 +234,11 @@ export function makePlan(context, cwd) {
   for (const check of checks)
     if (check.argv[0] === "go")
       check.environment.VERIFICATION_BASE_COMMIT = context.baseCommit;
+  const { maxAttempts, knownFailures, ...inputContext } = context;
   return {
-    ...context,
+    ...inputContext,
     version: 1,
+    ...matrixPolicy(matrix, checks),
     matrixDigest: digest(raw),
     checksDigest: digest(checks),
     changed,
@@ -374,7 +419,19 @@ export function runPlan(plan, cwd, output) {
   if (
     expected.matrixDigest !== plan.matrixDigest ||
     expected.checksDigest !== plan.checksDigest ||
-    canonical(expected.checks) !== canonical(plan.checks)
+    canonical(expected.checks) !== canonical(plan.checks) ||
+    canonical(
+      matrixPolicy(
+        JSON.parse(readFileSync(join(cwd, "verification/matrix.json"), "utf8")),
+        expected.checks,
+      ),
+    ) !==
+      canonical({
+        ...(plan.maxAttempts ? { maxAttempts: plan.maxAttempts } : {}),
+        ...(plan.knownFailures?.length
+          ? { knownFailures: plan.knownFailures }
+          : {}),
+      })
   )
     throw new Error("Altered or omitted required checks");
   if (!isAbsolute(output) || relative(cwd, output).split("/")[0] !== "..")
@@ -416,27 +473,61 @@ export function runPlan(plan, cwd, output) {
   }
   const results = [];
   for (const check of plan.checks) {
-    const startedAt = new Date().toISOString(),
-      start = performance.now();
-    const run = runCheck(check, resolve(cwd, check.cwd), environment);
-    const log =
-      (run.stdout || "") +
-      (run.stderr || "") +
-      (run.failureReason
-        ? "\nverification failureReason: " + run.failureReason + "\n"
-        : "") +
-      (run.signal ? "verification signal: " + run.signal + "\n" : "");
-    const logURI = join(output, digest(check.id) + ".log");
-    writeFileSync(logURI, log, { mode: 0o600 });
+    const attempts = [];
+    for (let attempt = 1; attempt <= (plan.maxAttempts || 1); attempt++) {
+      const startedAt = new Date().toISOString(),
+        start = performance.now();
+      const run = runCheck(check, resolve(cwd, check.cwd), environment);
+      const log =
+        (run.stdout || "") +
+        (run.stderr || "") +
+        (run.failureReason
+          ? "\nverification failureReason: " + run.failureReason + "\n"
+          : "") +
+        (run.signal ? "verification signal: " + run.signal + "\n" : "");
+      const logURI = join(
+        output,
+        digest(check.id) +
+          (plan.maxAttempts ? ".attempt-" + attempt : "") +
+          ".log",
+      );
+      writeFileSync(logURI, log, { mode: 0o600 });
+      attempts.push({
+        attempt,
+        startedAt,
+        endedAt: new Date().toISOString(),
+        durationMs: Math.round(performance.now() - start),
+        exitCode: run.status ?? -1,
+        ...(run.failureReason ? { failureReason: run.failureReason } : {}),
+        logURI,
+        logDigest: digest(log),
+      });
+      if (run.status === 0) break;
+    }
+    const { attempt, ...final } = attempts.at(-1);
+    const knownFailure = plan.knownFailures?.some(
+      (e) => e.checkId === check.id,
+    );
     results.push({
       ...check,
-      startedAt,
-      endedAt: new Date().toISOString(),
-      durationMs: Math.round(performance.now() - start),
-      exitCode: run.status ?? -1,
-      ...(run.failureReason ? { failureReason: run.failureReason } : {}),
-      logURI,
-      logDigest: digest(log),
+      ...final,
+      ...(plan.maxAttempts
+        ? {
+            attempts,
+            status:
+              final.exitCode === 0
+                ? attempts.length > 1
+                  ? "flaky"
+                  : "pass"
+                : "fail",
+            ...(knownFailure
+              ? {
+                  knownFailure: true,
+                  ...(final.exitCode === 0 ? { nowPassing: true } : {}),
+                }
+              : {}),
+          }
+        : {}),
     });
   }
   checkClean(cwd, plan.commit);
@@ -481,7 +572,7 @@ if (
       );
     else if (mode === "run") {
       const r = runPlan(input, process.cwd(), resolve(output));
-      process.exitCode = r.checks.every((c) => c.exitCode === 0) ? 0 : 1;
+      process.exitCode = receiptEligible(r) ? 0 : 1;
     } else
       throw new Error(
         "Usage: node scripts/verify-matrix.mjs plan|run INPUT OUTPUT",

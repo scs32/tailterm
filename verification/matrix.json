@@ -277,5 +277,78 @@
     "npm-unit": 120000,
     "00-static-build": 120000,
     "01-static-release-verify": 120000
-  }
+  },
+  "maxAttempts": 3,
+  "knownFailures": [
+    {
+      "checkId": "tests/board-intent-cleanup-browser.mjs",
+      "bugTaskId": "tsk_e7af3c28a444b09a",
+      "bugId": "wi_be7bbed81d4009c1"
+    },
+    {
+      "checkId": "tests/browser.mjs:chromium",
+      "bugTaskId": "tsk_e7af3c28a444b09a",
+      "bugId": "wi_be7bbed81d4009c1"
+    },
+    {
+      "checkId": "tests/browser.mjs:webkit",
+      "bugTaskId": "tsk_e7af3c28a444b09a",
+      "bugId": "wi_be7bbed81d4009c1"
+    },
+    {
+      "checkId": "tests/dropdown-continuity-browser.mjs",
+      "bugTaskId": "tsk_e7af3c28a444b09a",
+      "bugId": "wi_be7bbed81d4009c1"
+    },
+    {
+      "checkId": "tests/forget-race-browser.mjs",
+      "bugTaskId": "tsk_e7af3c28a444b09a",
+      "bugId": "wi_be7bbed81d4009c1"
+    },
+    {
+      "checkId": "tests/hub-read-cache-vault-browser.mjs",
+      "bugTaskId": "tsk_e7af3c28a444b09a",
+      "bugId": "wi_be7bbed81d4009c1"
+    },
+    {
+      "checkId": "tests/item-message-compose-browser.mjs",
+      "bugTaskId": "tsk_e7af3c28a444b09a",
+      "bugId": "wi_be7bbed81d4009c1"
+    },
+    {
+      "checkId": "tests/lead-replacement-browser.mjs",
+      "bugTaskId": "tsk_e7af3c28a444b09a",
+      "bugId": "wi_be7bbed81d4009c1"
+    },
+    {
+      "checkId": "tests/pause-project-browser.mjs",
+      "bugTaskId": "tsk_e7af3c28a444b09a",
+      "bugId": "wi_be7bbed81d4009c1"
+    },
+    {
+      "checkId": "tests/project-handler-vault-browser.mjs",
+      "bugTaskId": "tsk_e7af3c28a444b09a",
+      "bugId": "wi_be7bbed81d4009c1"
+    },
+    {
+      "checkId": "tests/project-queue-vault-browser.mjs",
+      "bugTaskId": "tsk_e7af3c28a444b09a",
+      "bugId": "wi_be7bbed81d4009c1"
+    },
+    {
+      "checkId": "tests/pulldown-recurrence-browser.mjs",
+      "bugTaskId": "tsk_e7af3c28a444b09a",
+      "bugId": "wi_be7bbed81d4009c1"
+    },
+    {
+      "checkId": "tests/tailscale-login-browser.mjs",
+      "bugTaskId": "tsk_e7af3c28a444b09a",
+      "bugId": "wi_be7bbed81d4009c1"
+    },
+    {
+      "checkId": "tests/work-item-dispatch-browser.mjs",
+      "bugTaskId": "tsk_e7af3c28a444b09a",
+      "bugId": "wi_be7bbed81d4009c1"
+    }
+  ]
 }

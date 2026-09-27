@@ -75,10 +75,7 @@
       "type": "array",
       "items": {
         "type": "object",
-        "required": [
-          "path",
-          "sha256"
-        ],
+        "required": ["path", "sha256"],
         "properties": {
           "path": {
             "type": "string"
@@ -161,16 +158,104 @@
               "exit",
               "output-limit"
             ]
+          },
+          "attempts": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 3,
+            "items": {
+              "type": "object",
+              "properties": {
+                "startedAt": {
+                  "type": "string",
+                  "format": "date-time"
+                },
+                "endedAt": {
+                  "type": "string",
+                  "format": "date-time"
+                },
+                "durationMs": {
+                  "type": "integer",
+                  "minimum": 0
+                },
+                "exitCode": {
+                  "type": "integer"
+                },
+                "logURI": {
+                  "type": "string"
+                },
+                "logDigest": {
+                  "type": "string",
+                  "pattern": "^[a-f0-9]{64}$"
+                },
+                "failureReason": {
+                  "type": "string",
+                  "enum": [
+                    "timeout",
+                    "port-conflict",
+                    "port-inspection",
+                    "spawn",
+                    "exit",
+                    "output-limit"
+                  ]
+                },
+                "attempt": {
+                  "type": "integer",
+                  "minimum": 1,
+                  "maximum": 3
+                }
+              },
+              "required": [
+                "startedAt",
+                "endedAt",
+                "durationMs",
+                "exitCode",
+                "logURI",
+                "logDigest",
+                "attempt"
+              ],
+              "additionalProperties": false
+            }
+          },
+          "status": {
+            "enum": ["pass", "flaky", "fail"]
+          },
+          "knownFailure": {
+            "type": "boolean"
+          },
+          "nowPassing": {
+            "type": "boolean"
           }
         },
-        "additionalProperties": false
+        "additionalProperties": false,
+        "allOf": [
+          {
+            "if": {
+              "anyOf": [
+                {
+                  "required": ["attempts"]
+                },
+                {
+                  "required": ["status"]
+                },
+                {
+                  "required": ["knownFailure"]
+                },
+                {
+                  "required": ["nowPassing"]
+                }
+              ]
+            },
+            "then": {
+              "required": ["attempts", "status"]
+            }
+          }
+        ]
       }
     },
     "aiv": {
       "type": "object",
-      "required": [
-        "state"
-      ],
+      "required": ["state"],
       "properties": {
         "state": {
           "const": "unsubmitted"
