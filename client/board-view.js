@@ -231,7 +231,9 @@ export function createBoardView({
   }
   const sending = new Set();
   let ownerRequests = [],
-    ownerRequestError = "",
+    ownerRequestTask = null,
+    ownerRequestClient = null,
+    ownerRequestGeneration = 0,
     stopOwnerClock;
   const ownerSending = new Set(),
     ownerErrors = new Map(),
@@ -755,6 +757,32 @@ export function createBoardView({
       onError: () => {},
     });
   }
+  // Owner requests are optional presentation data. A slow or older hub must
+  // never hold the conversation or its cached first paint behind this read.
+  async function loadOwnerRequests(id, token, actionClient) {
+    const requestGeneration = ++ownerRequestGeneration;
+    if (ownerRequestTask !== id || ownerRequestClient !== actionClient) {
+      ownerRequests = [];
+      ownerRequestTask = id;
+      ownerRequestClient = actionClient;
+    }
+    if (!id) return;
+    let requests = [];
+    try {
+      requests = (await actionClient.listOwnerObligations?.(id)) || [];
+    } catch {
+      // Unavailable optional content stays hidden; ordinary reads still enforce
+      // authentication and report hub errors through the existing path.
+    }
+    if (
+      requestGeneration !== ownerRequestGeneration ||
+      !currentAction(id, token, actionClient)
+    )
+      return;
+    if (JSON.stringify(ownerRequests) === JSON.stringify(requests)) return;
+    ownerRequests = requests;
+    if (detail?.task.id === id) render();
+  }
   async function reload(token = epoch, retry = () => show()) {
     if (!visible) return;
     if (pendingTokens.has(token)) {
@@ -780,24 +808,19 @@ export function createBoardView({
       if (!currentAction(id, token, actionClient)) return;
       if (tasks.find((t) => t.id === id)?.status === "open")
         completeConversations.delete(id);
+      void loadOwnerRequests(id, token, actionClient);
       const result = id
         ? await Promise.all([
             actionClient.getTask(id),
             completeConversations.has(id)
               ? Promise.resolve(completeConversations.get(id))
               : actionClient.listMessages(id, { limit: 200, latest: 1 }),
-            (
-              actionClient.listOwnerObligations?.(id) || Promise.resolve([])
-            ).then(
-              (value) => ({ value }),
-              (error) => ({ error }),
-            ),
             readAllDecisions(actionClient, id).then(
               (value) => ({ value }),
               (error) => ({ error }),
             ),
           ])
-        : [null, [], { value: [] }, { value: [] }];
+        : [null, [], { value: [] }];
       if (!currentAction(id, token, actionClient)) return;
       const loadedDetail = result[0];
       if (id && loadedDetail?.task.id !== id)
@@ -816,9 +839,7 @@ export function createBoardView({
         composeItemsError = "";
       }
       if (capabilitiesClient !== actionClient) capabilities = null;
-      ownerRequests = result[2].value || [];
-      ownerRequestError = result[2].error?.message || "";
-      const decisionResult = result[3];
+      const decisionResult = result[2];
       if (decisionResult.error) {
         if (decisionsTask !== id) decisions = [];
         decisionLoadError = decisionResult.error.message;
@@ -1089,7 +1110,7 @@ export function createBoardView({
             .map(rosterAgent)
             .join(
               "",
-            )}</div></div>${renderDecisionPanel({ records: decisions, taskId: selected, archived, name, drafts: decisionDrafts, sending: decisionSending, errors: decisionErrors, revealedAnswers, historyOpen: decisionPresentation.get(selected)?.historyOpen, loadError: decisionLoadError })}${renderOwnerRequests(ownerRequests, { archived, error: ownerRequestError, sending: ownerSending, errors: ownerErrors })}${recoveryMarkup}<div id="board-messages" class="board-messages">${messages.length === 200 && !completeConversations.has(selected) ? `<p class="fine">Latest 200 messages.${archived ? ' <button id="board-full-history">Show full conversation</button>' : " Full history remains on the hub."}</p>` : ""}${messageMarkup}</div>${
+            )}</div></div>${renderDecisionPanel({ records: decisions, taskId: selected, archived, name, drafts: decisionDrafts, sending: decisionSending, errors: decisionErrors, revealedAnswers, historyOpen: decisionPresentation.get(selected)?.historyOpen, loadError: decisionLoadError })}${renderOwnerRequests(ownerRequests, { archived, sending: ownerSending, errors: ownerErrors })}${recoveryMarkup}<div id="board-messages" class="board-messages">${messages.length === 200 && !completeConversations.has(selected) ? `<p class="fine">Latest 200 messages.${archived ? ' <button id="board-full-history">Show full conversation</button>' : " Full history remains on the hub."}</p>` : ""}${messageMarkup}</div>${
             archived
               ? ""
               : `<form id="board-compose">${d.replyTo ? `<div class="compose-reply">Replying to #${d.replyTo}<button type="button" id="board-cancel-reply">Cancel reply</button></div>` : ""}<label class="compose-recipient">To<select ${sending.has(selected) ? "disabled" : ""} id="board-to" data-view-control="recipient" aria-label="Recipient"><option value="">Everyone</option>${agents

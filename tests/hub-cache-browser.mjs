@@ -47,6 +47,7 @@ async function transport(url,init){
   if(path.pathname==='/v1/capabilities')return response(state.version===2?{projectPause:{supported:true,versions:[1]}}:{});
   if(path.pathname==='/v1/tasks')return response({tasks:[project()]});
   if(path.pathname==='/v1/tasks/'+taskId)return response({task:project(),agents:[agent()]});
+  if(path.pathname.endsWith('/obligations'))return response({obligations:[]});
   if(path.pathname.endsWith('/decisions'))return response({decisions:[],nextAfter:0});
   if(path.pathname.endsWith('/messages')){
     const after=Number(path.searchParams.get('after')||0);

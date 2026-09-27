@@ -40,6 +40,7 @@ async function transport(url,init){
  const match=p.match(/^\\/v1\\/tasks\\/([^/]+)(.*)$/);if(!match)throw Error('Unexpected synthetic route '+p);
  const [,id,tail]=match,task=tasks.find(t=>t.id===id);
  if(!tail)return response({task,agents:agents(id)});
+ if(tail==='/obligations')return response({obligations:[]});
  if(tail==='/decisions')return response({decisions:[],nextAfter:0});
  if(tail==='/messages'){
    if(method==='POST'){const list=messages.get(id);const row={...body,from:{user:'fixture'},seq:list.length+1,createdAt:'2026-09-08T12:00:00Z'};list.push(row);return response(row)}

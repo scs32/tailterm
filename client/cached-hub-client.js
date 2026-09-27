@@ -23,6 +23,15 @@ export function createCachedHubClient({
     auditEpochs = new Map(),
     auditMemory = new Map(),
     auditSaveQueues = new Map();
+  const optionalFailures = new Map();
+  let optionalAuthenticationError = null;
+  const optionalOwnerRead = (path) => {
+    const url = new URL(path, client.base);
+    return (
+      url.pathname.endsWith("/obligations") &&
+      url.searchParams.get("owner") === "1"
+    );
+  };
   const paths = new Set(),
     dirty = new Set(),
     touched = new Map(),
@@ -100,6 +109,11 @@ export function createCachedHubClient({
     }
     checked.set(path, now());
     const requestedRevision = revision;
+    const optionalAuthAtStart = optionalAuthenticationError;
+    const checkOptionalAuthentication = () => {
+      if (optionalAuthenticationError && optionalAuthenticationError !== optionalAuthAtStart)
+        throw optionalAuthenticationError;
+    };
     const work = (async () => {
       try {
         const old = await stored(path);
@@ -131,6 +145,10 @@ export function createCachedHubClient({
           else data = await client.request(path, { timeoutMs: 15000 });
         } else data = await client.request(path, { timeoutMs: 15000 });
         if (disposed) throw new Error("Workspace is locked.");
+        // A concurrent ordinary success must not erase an authentication
+        // rejection from the newly independent owner read. A later explicit
+        // connection refresh can still recover using the existing auth path.
+        checkOptionalAuthentication();
         if (requestedRevision !== revision) {
           checked.delete(path);
           notify(true);
@@ -143,17 +161,24 @@ export function createCachedHubClient({
           cacheFailed = true;
         }
         if (disposed) throw new Error("Workspace is locked.");
+        checkOptionalAuthentication();
         saved ||= retained;
+        const recoveredOptional = optionalFailures.delete(path);
         failed = false;
         authenticationError = null;
+        optionalAuthenticationError = null;
         dirty.delete(path);
-        if (JSON.stringify(old?.value.data) !== JSON.stringify(data))
+        if (
+          recoveredOptional ||
+          JSON.stringify(old?.value.data) !== JSON.stringify(data)
+        )
           notify(true);
         return data;
       } catch (error) {
         if (disposed) throw error;
         if (error.status === 401 || error.status === 403) {
           authenticationError = error;
+          if (optionalOwnerRead(path)) optionalAuthenticationError = error;
           await cache.clear(await scope).catch(() => {});
           saved = false;
         } else if (error.status === 404 || error.status === 410) {
@@ -163,8 +188,14 @@ export function createCachedHubClient({
             })
             .catch(() => {});
           dirty.delete(path);
-        } else failed = true;
-        notify(true);
+        } else if (!optionalOwnerRead(path)) failed = true;
+        // An unsupported/transient optional read must not flip ordinary cached
+        // views offline or trigger an endless read -> failure -> reload loop.
+        if (optionalOwnerRead(path) && ![401, 403].includes(error.status)) {
+          const newlyUnavailable = !optionalFailures.has(path);
+          optionalFailures.set(path, error);
+          notify(newlyUnavailable);
+        } else notify(true);
         throw error;
       } finally {
         pending.delete(path);
@@ -182,6 +213,11 @@ export function createCachedHubClient({
     const entry = await stored(path);
     if (disposed) throw new Error("Workspace is locked.");
     if (authenticationError) throw authenticationError;
+    if (
+      optionalFailures.has(path) &&
+      now() - (checked.get(path) || 0) < refreshMs
+    )
+      throw optionalFailures.get(path);
     if (
       entry &&
       (!dirty.has(path) ||

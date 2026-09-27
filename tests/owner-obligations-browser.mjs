@@ -56,9 +56,275 @@ async function show(mode,task){for(const v of [board,queue,tasks])v.hide();host.
 window.qa={board,queue,tasks,client,live,show,async refresh(){await client.refreshConnection();await board.reload();await queue.reload();await tasks.reload()}};
 await show('board',new URLSearchParams(location.search).get('task'));
 </script></body></html>`;
+// wi_5a411a2a78e3ad9e / order #12222: isolated real client/view regressions.
+const resilienceHTML = `<!doctype html><html><head><meta charset="utf-8"><link rel="stylesheet" href="/client/style.css"></head><body><main id="view"></main><script type="module">
+import {createBoardView} from '/client/board-view.js';
+import {createTasksView} from '/client/tasks-view.js';
+import {createHubClient} from '/client/hub-client.js';
+import {createCachedHubClient} from '/client/cached-hub-client.js';
+const ids=['tsk_1111111111111111','tsk_2222222222222222'];
+const tasks=ids.map((id,i)=>({id,name:'Project '+i,status:'open',goal:'Synthetic goal',createdAt:'2026-09-08T12:00:00Z'}));
+const owner=id=>({id:'owner-'+id,recipientKind:'owner',taskId:id,state:'open',messageSeq:10,subject:'Owner '+id,createdAt:'2026-09-08T12:00:00Z',dueAt:'2026-09-28T12:00:00Z',request:{text:'Synthetic request',workItems:[{itemTaskId:id,itemId:'item-'+id,relationship:'primary'}]}});
+const state={mode:'ok',online:true,ownerReads:0,waiting:[],token:'alpha'};
+const memory=new Map();
+const cache={async get(scope,key){return memory.get(scope+'|'+key)||null},async put(scope,key,value){memory.set(scope+'|'+key,{value});return true},async clear(scope){for(const key of memory.keys())if(key.startsWith(scope+'|'))memory.delete(key)},dispose(){}};
+const response=(data,status=200)=>new Response(JSON.stringify(data),{status});
+async function transport(url,init){
+ const u=new URL(url),p=u.pathname,id=p.split('/')[3];
+ if(!state.online)throw Error('Synthetic offline');
+ if(p.endsWith('/obligations')){
+   state.ownerReads++;
+   const result=[owner(id)];
+   if(state.mode==='hold')return await new Promise(resolve=>state.waiting.push(()=>resolve(response({obligations:result}))));
+   if(state.mode==='reject')throw Error('Optional transport rejected');
+   if(['404','503','401'].includes(state.mode))return response({error:'Optional unavailable'},Number(state.mode));
+   return response({obligations:state.mode==='empty'?[]:result});
+ }
+ if(p==='/v1/capabilities')return response({});
+ if(p==='/v1/tasks')return response({tasks});
+ if(p==='/v1/work-items')return response({items:[],next:0});
+ if(p.endsWith('/messages'))return response({messages:[{seq:1,from:{user:'fixture'},text:'Message '+id,createdAt:'2026-09-08T12:00:00Z'}]});
+ if(p.endsWith('/decisions'))return response({decisions:[],nextAfter:0});
+ if(p.endsWith('/team-queue'))return response({entries:[{itemId:'item-'+id,state:'running'}],concurrencyLimit:1});
+ return response({task:tasks.find(t=>t.id===id),agents:[]});
+}
+let client,live,current;
+const root=document.querySelector('#view'),noop=()=>{};
+function configure(token='alpha',missing=false){
+ client?.dispose();
+ live=createHubClient({baseURL:'http://synthetic.invalid',token,fetchImpl:transport});
+ // No polling or external connection: only actual cache notifications can reload.
+ live.subscribe=()=>({stop(){}});
+ client=createCachedHubClient({client:live,cache,online:()=>state.online,refreshMs:60000});
+ if(missing)delete client.listOwnerObligations;
+}
+configure();
+const common={client:()=>client,getTabs:()=>[],activate:noop,notice:noop,configure:noop};
+const board=createBoardView({...common,addAgent:noop,attachTask:noop,newTask:noop});
+const projects=createTasksView({...common,taskHub:{groupOf:()=>null},confirm:async()=>false,openBoard:noop});
+async function show(mode,id=ids[0]){
+ board.hide();projects.hide();root.replaceChildren();current=mode;
+ const view=mode==='board'?board:projects;view.mount(root);await view.show(id);
+ if(mode==='projects')root.querySelector('[data-task-select="'+id+'"]').click();
+}
+window.qa={ids,state,board,projects,show,configure,get client(){return client},
+ async warm(){await client.listTasks();for(const id of ids){await client.getTask(id);await client.listMessages(id,{limit:200,latest:1});await client.listDecisions(id)}},
+ refresh(){client.invalidate();return current==='board'?board.reload():projects.reload()},
+ release(){state.waiting.splice(0).forEach(resolve=>resolve())},
+ close(){board.hide();projects.hide();client.dispose()}
+};
+</script></body></html>`;
+async function checkOptionalReads(engine, origin) {
+  const browser = await engine.launch();
+  try {
+    for (const mode of ["board", "projects"]) {
+      for (const failure of ["missing", "404", "503", "reject"]) {
+        const context = await browser.newContext(),
+          page = await context.newPage(),
+          errors = [];
+        page.on("pageerror", (error) => errors.push(error.message));
+        await page.goto(origin + "/resilience");
+        await page.waitForFunction(() => !!window.qa);
+        await page.evaluate(
+          async ({ mode, failure }) => {
+            window.qa.state.mode = failure;
+            if (failure === "missing") window.qa.configure("alpha", true);
+            await window.qa.show(mode);
+          },
+          { mode, failure },
+        );
+        const normal =
+          mode === "board"
+            ? "#board-messages"
+            : '[data-testid="team-delivery-panel"]';
+        await expect(page.locator(normal)).toContainText(
+          mode === "board" ? "Message" : "Delivery",
+        );
+        await expect(
+          page.locator("[data-owner-requests], [data-owner-wait]"),
+        ).toHaveCount(0);
+        // Repeated view reloads must not repeatedly hit a failing optional route.
+        if (mode === "board")
+          await page
+            .locator("#board-text")
+            .fill("Draft survives optional refresh");
+        await page.evaluate(async () => {
+          for (let i = 0; i < 5; i++) await window.qa.refresh();
+        });
+        // Explicit invalidations intentionally allow retries; ordinary reloads
+        // within the same cache interval must remain bounded and stable.
+        const before = await page.evaluate(() => window.qa.state.ownerReads);
+        await page.evaluate(async (mode) => {
+          for (let i = 0; i < 5; i++)
+            await window.qa[mode === "board" ? "board" : "projects"].reload();
+        }, mode);
+        await page.waitForTimeout(100);
+        const after = await page.evaluate(() => window.qa.state.ownerReads);
+        assert.ok(after - before <= 1, mode + " optional retry loop");
+        if (mode === "board")
+          await expect(page.locator("#board-text")).toHaveValue(
+            "Draft survives optional refresh",
+          );
+        assert.deepEqual(errors, []);
+        await page.evaluate(() => window.qa.close());
+        await context.close();
+        console.log(
+          "PASS " + engine.name() + ": " + mode + " optional " + failure,
+        );
+      }
+      // Only ordinary reads are warm. An uncached held optional request must
+      // not gate first paint, delivery or compose; recovery restores content.
+      const context = await browser.newContext(),
+        page = await context.newPage();
+      await page.goto(origin + "/resilience");
+      await page.waitForFunction(() => !!window.qa);
+      await page.evaluate(async (mode) => {
+        await window.qa.warm();
+        window.qa.state.mode = "hold";
+        await window.qa.show(mode);
+      }, mode);
+      await expect(
+        page.locator(
+          mode === "board"
+            ? "#board-messages"
+            : '[data-testid="team-delivery-panel"]',
+        ),
+      ).toBeVisible();
+      await expect(
+        page.locator("[data-owner-requests], [data-owner-wait]"),
+      ).toHaveCount(0);
+      if (mode === "board")
+        await expect(page.locator("#board-text")).toBeVisible();
+      await page.evaluate(() => {
+        window.qa.state.mode = "ok";
+        window.qa.release();
+      });
+      await expect(
+        page.locator(
+          mode === "board" ? "[data-owner-request]" : "[data-owner-wait]",
+        ),
+      ).toHaveCount(1);
+      // A background failure hides previously loaded content, and identical
+      // data after recovery must still notify the views to restore it.
+      await page.evaluate(async () => {
+        window.qa.state.mode = "503";
+        await window.qa.client.refreshConnection();
+      });
+      await expect(
+        page.locator("[data-owner-requests], [data-owner-wait]"),
+      ).toHaveCount(0);
+      await page.evaluate(async () => {
+        window.qa.state.mode = "ok";
+        await window.qa.client.refreshConnection();
+      });
+      await expect(
+        page.locator(
+          mode === "board" ? "[data-owner-request]" : "[data-owner-wait]",
+        ),
+      ).toHaveCount(1);
+      // Same client, different task: release of an older request must not leak.
+      await page.evaluate(async (mode) => {
+        window.qa.state.mode = "hold";
+        window.qa.client.invalidate();
+        await window.qa[mode === "board" ? "board" : "projects"].reload();
+        window.qa.state.mode = "empty";
+        await window.qa.show(mode, window.qa.ids[1]);
+        window.qa.release();
+      }, mode);
+      await expect(
+        page.locator("[data-owner-requests], [data-owner-wait]"),
+      ).toHaveCount(0);
+      await expect(
+        page.locator(mode === "board" ? "#board-messages" : ".tasks-detail"),
+      ).toContainText(
+        mode === "board" ? "Message tsk_2222222222222222" : "Project 1",
+      );
+      // Same task, different credential/client: late old data is discarded.
+      await page.evaluate(async (mode) => {
+        window.qa.state.mode = "hold";
+        window.qa.client.invalidate();
+        await window.qa[mode === "board" ? "board" : "projects"].reload();
+        window.qa.configure("beta");
+        window.qa.state.mode = "empty";
+        await window.qa.show(mode, window.qa.ids[1]);
+        window.qa.release();
+      }, mode);
+      await expect(
+        page.locator("[data-owner-requests], [data-owner-wait]"),
+      ).toHaveCount(0);
+      await page.waitForTimeout(100);
+      await expect(
+        page.locator("[data-owner-requests], [data-owner-wait]"),
+      ).toHaveCount(0);
+      await page.evaluate(() => window.qa.close());
+      await context.close();
+      console.log(
+        "PASS " +
+          engine.name() +
+          ": " +
+          mode +
+          " warm cache/held recovery/task and client epochs",
+      );
+      const offlineContext = await browser.newContext(),
+        offlinePage = await offlineContext.newPage();
+      await offlinePage.goto(origin + "/resilience");
+      await offlinePage.waitForFunction(() => !!window.qa);
+      await offlinePage.evaluate(async (mode) => {
+        await window.qa.warm();
+        window.qa.state.online = false;
+        await window.qa.show(mode);
+      }, mode);
+      await expect(
+        offlinePage.locator(
+          mode === "board" ? "#board-messages" : ".tasks-detail",
+        ),
+      ).toContainText(mode === "board" ? "Message" : "Project");
+      await expect(
+        offlinePage.locator("[data-owner-requests], [data-owner-wait]"),
+      ).toHaveCount(0);
+      await offlinePage.evaluate(() => window.qa.close());
+      await offlineContext.close();
+      // Authentication remains authoritative even though the optional panel is hidden.
+      const authContext = await browser.newContext(),
+        authPage = await authContext.newPage();
+      await authPage.goto(origin + "/resilience");
+      await authPage.waitForFunction(() => !!window.qa);
+      await authPage.evaluate(async (mode) => {
+        window.qa.state.mode = "401";
+        await window.qa.show(mode);
+      }, mode);
+      await expect
+        .poll(() =>
+          authPage.evaluate(() => window.qa.client.cacheStatus().label),
+        )
+        .toBe("Hub sign-in required");
+      await assert.rejects(
+        authPage.evaluate(() => window.qa.client.listTasks()),
+        /Optional unavailable/,
+      );
+      await authPage.evaluate(() => window.qa.close());
+      await authContext.close();
+      console.log(
+        "PASS " +
+          engine.name() +
+          ": " +
+          mode +
+          " uncached obligations offline and authentication fence",
+      );
+    }
+  } finally {
+    await browser.close();
+  }
+}
+
 async function serve(req, res) {
   try {
     const u = new URL(req.url, origin);
+    if (u.pathname === "/resilience") {
+      res.setHeader("content-type", "text/html");
+      res.end(resilienceHTML);
+      return;
+    }
     if (u.pathname === "/") {
       res.setHeader("content-type", "text/html");
       res.end(html);
@@ -135,6 +401,7 @@ try {
   await once(web, "listening");
   origin = "http://127.0.0.1:" + web.address().port;
   for (const engine of [chromium, webkit]) {
+    await checkOptionalReads(engine, origin);
     const name = engine.name(),
       task = await api(
         "POST",

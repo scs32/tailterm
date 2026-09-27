@@ -58,25 +58,53 @@ export function createTasksView({
   const deliveries = new Map(),
     ownerRequests = new Map();
   let stopOwnerClock;
+  let deliveryGeneration = 0,
+    deliveryTask = null;
   async function loadDelivery(taskId, actionClient = client()) {
-    if (!taskId || !actionClient?.listTeamDelivery) return;
-    try {
-      const [queue, requests] = await Promise.all([
-        actionClient.listTeamDelivery(taskId),
-        actionClient.listOwnerObligations?.(taskId) || [],
-      ]);
-      if (!visible || client() !== actionClient) return;
-      deliveries.set(taskId, queue);
-      ownerRequests.set(taskId, requests);
-      if (selected === taskId) render();
-    } catch {
-      deliveries.delete(taskId);
+    const token = generation;
+    const requestGeneration = ++deliveryGeneration;
+    const current = () =>
+      visible &&
+      generation === token &&
+      deliveryGeneration === requestGeneration &&
+      selected === taskId &&
+      client() === actionClient;
+    if (!taskId) return;
+    if (deliveryTask !== taskId) {
+      ownerRequests.clear();
+      deliveryTask = taskId;
     }
+    const update = () => {
+      if (current()) render();
+    };
+    // Keep delivery independent of optional owner requests, including hangs.
+    void (async () => {
+      try {
+        const queue = await actionClient.listTeamDelivery?.(taskId);
+        if (!current()) return;
+        deliveries.set(taskId, queue);
+      } catch {
+        if (!current()) return;
+        deliveries.delete(taskId);
+      }
+      update();
+    })();
+    try {
+      const requests = await actionClient.listOwnerObligations?.(taskId);
+      if (!current()) return;
+      ownerRequests.set(taskId, requests || []);
+    } catch {
+      if (!current()) return;
+      ownerRequests.delete(taskId);
+    }
+    update();
   }
   function teamExpanded(task, count) {
     if (teamClient !== client()) {
       teamClient = client();
       teamChoices.clear();
+      deliveries.clear();
+      ownerRequests.clear();
     }
     const epoch = JSON.stringify([
       task.createdAt,
@@ -124,6 +152,8 @@ export function createTasksView({
     if (teamClient !== client()) {
       teamClient = client();
       teamChoices.clear();
+      deliveries.clear();
+      ownerRequests.clear();
     }
     if (!client()) {
       presentation.interrupt();
