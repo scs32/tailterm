@@ -345,3 +345,45 @@ func TestOwnerExplicitRequestStillRequiresExactContext(t *testing.T) {
 		}
 	}
 }
+
+// b1 / correction12121: explicit links do not make a legacy stale run current.
+func TestOwnerLegacyStaleRunWithExplicitLinks(t *testing.T) {
+	f := newDeliveryFixture(t)
+	ctx := context.Background()
+	req := api.PostMessageRequest{AgentID: f.worker.ID, RunID: api.NewID("run"), RequestID: "legacy-stale-linked", Envelope: &api.Envelope{Kind: api.EnvelopeKindRequest, Subject: "A stale legacy request keeps its exact links", Body: api.EnvelopeBody{Ask: "Please answer"}}, WorkItems: []api.MessageWorkItem{{ItemTaskID: f.task.ID, ItemID: f.item.ID, ItemRevision: f.item.Revision, Relationship: "primary"}}, WorkOrderMessage: &api.MessageReference{TaskID: f.task.ID, Seq: f.order.Seq}}
+	m, err := f.s.PostMessage(ctx, f.task.ID, req, f.by)
+	if err != nil {
+		t.Fatalf("legacy stale-run linked post rejected: %v", err)
+	}
+	stored, err := loadMessage(f.s.db, ctx, f.task.ID, m.Seq)
+	if err != nil || len(stored.WorkItems) != 1 || stored.WorkItems[0] != req.WorkItems[0] || stored.WorkOrderMessage == nil || *stored.WorkOrderMessage != *req.WorkOrderMessage || stored.Envelope.Body.Ask != req.Envelope.Body.Ask {
+		t.Fatalf("legacy post changed its supplied context: %+v %v", stored, err)
+	}
+	again, err := f.s.PostMessage(ctx, f.task.ID, req, f.by)
+	if err != nil || again.Seq != m.Seq {
+		t.Fatalf("legacy retry changed message: %+v %v", again, err)
+	}
+	list, err := f.s.ListObligations(ctx, f.task.ID, ObligationFilter{}, f.s.now())
+	if err != nil || len(list) != 0 {
+		t.Fatalf("stale run created an obligation: %+v %v", list, err)
+	}
+	// Explicit owner routing retains the same current-run rejection, even with exact links.
+	explicit := req
+	explicit.To, explicit.RequestID = "owner", "explicit-stale-linked"
+	env := *req.Envelope
+	env.To = "owner"
+	explicit.Envelope = &env
+	if _, err := f.s.PostMessage(ctx, f.task.ID, explicit, f.by); err == nil {
+		t.Fatal("explicit owner request accepted stale authority")
+	}
+	// The identical item/order with the actual current run creates an owner obligation.
+	current := req
+	current.RunID, current.RequestID = f.worker.RunID, "current-linked"
+	m, err = f.s.PostMessage(ctx, f.task.ID, current, f.by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if o := ownerFor(t, f, m.Seq); o.Request.WorkItems[0] != req.WorkItems[0] || *o.Request.WorkOrderMessage != *req.WorkOrderMessage {
+		t.Fatalf("current control changed links: %+v", o)
+	}
+}

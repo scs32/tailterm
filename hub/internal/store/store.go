@@ -1215,9 +1215,15 @@ func (s *Store) PostMessage(ctx context.Context, taskID string, req api.PostMess
 	// and actual obligations retain its current-run and primary-link checks.
 	skipOwnerObligation := legacyOwnerRequest
 	if legacyOwnerRequest && req.RunID != "" {
-		for _, link := range m.WorkItems {
-			if link.ItemTaskID == taskID && link.Relationship == "primary" {
-				skipOwnerObligation = false
+		runErr := s.requireCurrentRun(ctx, tx, taskID, req.AgentID, req.RunID)
+		if runErr != nil && !errors.Is(runErr, api.ErrConflict) {
+			return m, runErr
+		}
+		if runErr == nil {
+			for _, link := range m.WorkItems {
+				if link.ItemTaskID == taskID && link.Relationship == "primary" {
+					skipOwnerObligation = false
+				}
 			}
 		}
 	}
