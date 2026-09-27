@@ -82,6 +82,9 @@ partial writes. A new plan invalidates the prior receipt without deleting it.
 Scope/assignment changes and any different accepted SHA fail eligibility.
 Administrative priority/status revisions retain the original evidence provenance.
 The handler must freeze a new plan whenever the candidate matrix changes.
+One plan or receipt save may be up to 1 MiB (`api.MaxVerificationBody`); a full
+69-check receipt with retries is about 76 KB. Other hub requests keep the shared
+64 KiB limit.
 Unannounced filesystem changes cannot be observed by the hub; the runner checks
 exact detached HEAD and clean tracked/untracked status before and after execution.
 

@@ -27,6 +27,11 @@ const (
 	MaxAgentRegistrationBody = 6*MaxAgentWorkItemContextBytes + 16*1024
 	MaxWait                  = 30 * time.Second
 	MaxLimit                 = 200
+
+	// One verification plan or receipt save. A full approved matrix receipt
+	// (69 checks, up to three attempts each, with log references) is about
+	// 76 KB, over the shared MaxBody.
+	MaxVerificationBody = 1024 * 1024
 )
 
 var nameRE = regexp.MustCompile(`^[a-zA-Z0-9_-]{1,64}$`)

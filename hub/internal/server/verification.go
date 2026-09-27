@@ -11,7 +11,7 @@ func (s *Server) saveVerification(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req api.VerificationRequest
-	if !decodeScope(w, r, &req) {
+	if !decodeScopeLimited(w, r, &req, api.MaxVerificationBody) {
 		return
 	}
 	out, err := s.store.SaveVerification(r.Context(), r.PathValue("id"), r.PathValue("wid"), req)

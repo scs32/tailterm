@@ -12,7 +12,11 @@ import (
 // The metadata-only endpoints reject item fields instead of silently dropping
 // them, so callers cannot mistake a bookkeeping receipt for a scope edit.
 func decodeScope(w http.ResponseWriter, r *http.Request, v any) bool {
-	d := json.NewDecoder(http.MaxBytesReader(w, r.Body, api.MaxBody))
+	return decodeScopeLimited(w, r, v, api.MaxBody)
+}
+
+func decodeScopeLimited(w http.ResponseWriter, r *http.Request, v any, maxBytes int64) bool {
+	d := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxBytes))
 	d.DisallowUnknownFields()
 	if err := d.Decode(v); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid scope metadata request")

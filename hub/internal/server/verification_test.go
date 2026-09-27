@@ -123,3 +123,70 @@ func TestVerificationHTTPRetryEvidenceRoundTrip(t *testing.T) {
 		t.Fatal("HTTP evidence lost", err)
 	}
 }
+
+func TestVerificationHTTPAcceptsFullMatrixReceiptOnly(t *testing.T) {
+	c := newClient(t)
+	task := c.task("verification-full-matrix")
+	var item api.WorkItem
+	if code := c.do("POST", "/v1/tasks/"+task.ID+"/work-items", api.CreateWorkItemRequest{Kind: "bug", Title: "Full matrix receipt", RequestID: "full-matrix"}, &item); code != 201 {
+		t.Fatal(code)
+	}
+	native, err := api.NewClient(c.srv.URL, 20*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = testverification.PrepareMatrix(native, task.ID, item, 69); err != nil {
+		t.Fatal("full matrix import", err)
+	}
+	agents, err := native.ListAgents(context.Background(), task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var handler api.Agent
+	for _, a := range agents {
+		if a.Role == api.AgentRoleDatabaseHandler {
+			handler = a
+		}
+	}
+	history, err := native.VerificationHistory(context.Background(), task.ID, item.ID, handler.ID, handler.RunID)
+	if err != nil || len(history) != 2 || history[1].Receipt == nil || len(history[1].Receipt.Checks) != 69 {
+		t.Fatal("full matrix receipt lost", err)
+	}
+	last := history[1].Receipt.Checks[68]
+	if last.ID != "068-tests/fixture-068-browser.mjs" || last.LogURI != "/tmp/tailterm-verification-fixture-matrix/logs/068-tests-fixture-068-browser.mjs-attempt-1.log" || last.Environment["VERIFICATION_BASE_COMMIT"] != testverification.Commit {
+		t.Fatalf("full matrix receipt changed: %+v", last)
+	}
+	raw, _ := json.Marshal(api.VerificationRequest{RequestID: "size", AgentID: handler.ID, RunID: handler.RunID, ExpectedGeneration: 2, Receipt: history[1].Receipt})
+	if len(raw) <= api.MaxBody {
+		t.Fatalf("fixture receipt is %d bytes, not over the shared %d-byte limit", len(raw), api.MaxBody)
+	}
+
+	path := "/v1/tasks/" + task.ID + "/work-items/" + item.ID
+	post := func(route, body string) string {
+		var out struct {
+			Error string `json:"error"`
+		}
+		c.do("POST", path+route, body, &out)
+		return out.Error
+	}
+	const invalid = "invalid scope metadata request"
+	pad := func(n int) string {
+		body := `{"requestId":"pad"}`
+		return body + strings.Repeat(" ", n-len(body))
+	}
+	if got := post("/verification", pad(api.MaxVerificationBody)); got == invalid {
+		t.Fatal("verification body at the limit was not decoded")
+	}
+	if got := post("/verification", pad(api.MaxVerificationBody+1)); got != invalid {
+		t.Fatal("oversize verification body", got)
+	}
+	if got := post("/verification", `{"requestId":"unknown","bogus":1}`); got != invalid {
+		t.Fatal("unknown verification field", got)
+	}
+	if got := post("/verification", `{"requestId":"trailing"} {}`); got != invalid {
+		t.Fatal("trailing verification data", got)
+	}
+	if got := post("/order-scope/confirm", pad(api.MaxBody+1)); got != invalid {
+		t.Fatal("shared limit changed for scope metadata", got)
+	}
+}
