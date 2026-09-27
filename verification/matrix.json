@@ -92,6 +92,10 @@
       "mode": "both"
     },
     {
+      "file": "tests/owner-obligations-browser.mjs",
+      "mode": "both"
+    },
+    {
       "file": "tests/pane-option-drag-browser.mjs",
       "mode": "both"
     },
