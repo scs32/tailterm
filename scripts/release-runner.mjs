@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { execFileSync } from "node:child_process";
-import { openSync, closeSync, fsyncSync, writeFileSync, readFileSync, renameSync, mkdirSync, existsSync, rmSync } from "node:fs";
+import { openSync, closeSync, fsyncSync, writeFileSync, readFileSync, renameSync, mkdirSync, existsSync, rmSync, copyFileSync, constants } from "node:fs";
 import { join, resolve, dirname } from "node:path";
 import { digest, diffPaths } from "./verify-matrix.mjs";
 import { selectReleaseTargets } from "./release-targets.mjs";
@@ -59,10 +59,14 @@ export async function runRelease(config, adapter) {
   if(!job || !(["claimed","merged"].includes(job.state)) || !sha(job.commit) || !/^[a-f0-9]{64}$/.test(job.verificationDigest||""))throw new Error("Claimed verified job required");
   const lock=join(tmpdir(),"tailterm-release-locks",digest(cwd+"\0"+(job.taskId||"fixture"))+".lock");mkdirSync(dirname(lock),{recursive:true,mode:0o700});
   let fd;try{fd=openSync(lock,"wx",0o600);}catch{throw new Error("Release host locked; inspect prior execution");}
-  let state={version:1,jobId:job.id,commit:job.commit,phase:"prepared",effects:[]};
+  writeFileSync(fd,JSON.stringify({jobId:job.id,agentId:job.agentId,runId:job.runId}));fsyncSync(fd);
+  let state={version:1,jobId:job.id,commit:job.commit,agentId:job.agentId,runId:job.runId,phase:"prepared",effects:[]};
   if(existsSync(journalPath)){
-    const prior=JSON.parse(readFileSync(journalPath,"utf8"));
-    if(prior.jobId===job.id && prior.commit===job.commit && (prior.phase==="waiting_matrix" || prior.phase==="receipt_pending" || prior.phase==="finishing") && (prior.phase!=="waiting_matrix" || !prior.effects.length) && git(cwd,"rev-parse","HEAD")===prior.integrated && !git(cwd,"status","--porcelain")) {state=prior;}
+    const prior=JSON.parse(readFileSync(journalPath,"utf8")),recovery=job.reconciliations?.at(-1);
+    const recovered=recovery?.disposition==="requeue" && recovery.noActiveExecution===true && recovery.noPublication===true && recovery.journalState==="no_effects" && recovery.jobId===job.id && recovery.journalDigest===fileDigest(journalPath) && recovery.agentId===prior.agentId && recovery.runId===prior.runId && prior.effects.length===0 && prior.published!==true && prior.jobId===job.id && prior.commit===job.commit;
+    if(recovered){renameSync(journalPath,journalPath+".reconciled-"+recovery.journalDigest);}
+    else
+    if(prior.jobId===job.id && prior.commit===job.commit && (["waiting_matrix","waiting_inputs","receipt_pending","finishing"].includes(prior.phase)) && (!["waiting_matrix","waiting_inputs"].includes(prior.phase) || !prior.effects.length) && git(cwd,"rev-parse","HEAD")===prior.integrated && !git(cwd,"status","--porcelain")) {state=prior;}
     else {
       closeSync(fd);rmSync(lock);
       if(prior.jobId===job.id && prior.commit===job.commit && prior.phase==="complete") return prior.receipt;
@@ -76,11 +80,12 @@ export async function runRelease(config, adapter) {
       await adapter.finish(state.receipt,state.finishGeneration);state.phase="complete";checkpoint();return state.receipt;
     }
     checkpoint();await fence();
-    const integration=state.phase==="waiting_matrix"?{expected:state.expected,integrated:state.integrated}:integrateCandidate(cwd,job);state.integrated=integration.integrated;state.expected=integration.expected;state.phase="integrated";checkpoint();
+    const integration=["waiting_matrix","waiting_inputs"].includes(state.phase)?{expected:state.expected,integrated:state.integrated}:integrateCandidate(cwd,job);state.integrated=integration.integrated;state.expected=integration.expected;state.phase="integrated";checkpoint();
     if(integration.integrated!==job.commit){
       await fence();if(await adapter.verifyIntegrated({...job,integratedCommit:integration.integrated})!==true){state.phase="waiting_matrix";checkpoint();return {jobId:job.id,outcome:"waiting_matrix"};}
     }
-    await fence();publishIntegration(cwd,integration.integrated,integration.expected);
+    if(adapter.verifyInputs && !await adapter.verifyInputs(integration.integrated)){state.phase="waiting_inputs";checkpoint();return {jobId:job.id,outcome:"waiting_inputs"};}
+    await fence();publishIntegration(cwd,integration.integrated,integration.expected);state.published=true;checkpoint();
     await adapter.merged(integration.integrated);state.phase="merged";checkpoint();
     const selected=selectReleaseTargets(cwd,baselines,integration.integrated);
     const receipt={version:1,jobId:job.id,commit:integration.integrated,verificationDigest:job.verificationDigest,targets:[],outcome:"released"};
@@ -105,12 +110,16 @@ export async function runRelease(config, adapter) {
     }
     // An uncertain side effect cannot be replayed. Rollback uses only retained
     // target artifacts; the adapter must never restore an old live database.
+    if(!state.published && state.effects.length===0){
+      state.phase="refusing";checkpoint();await adapter.refuse();state.phase="refused";checkpoint();await adapter.escalate({jobId:job.id,outcome:"refused"});throw new Error("Release refused before publication");
+    }
     let blocked=state.effects.length===0;
     for(const effect of [...state.effects].reverse()){
       if(effect.rollbackAttempted){blocked=true;continue;}
       effect.rollbackAttempted=true;checkpoint();
-      try{await fence();if(await adapter.rollback(effect.target,effect.release)!==true)blocked=true;}catch{blocked=true;}
-      effect.rollback=blocked?"blocked":"restored";checkpoint();
+      let restored=false;
+      try{await fence();restored=await adapter.rollback(effect.target,effect.release)===true;}catch{}
+      blocked ||= !restored;effect.rollback=restored?"restored":"blocked";checkpoint();
     }
     state.phase="blocked";state.outcome=blocked?"blocked":"rolled_back";checkpoint();
     if(!state.escalationAttempted){state.escalationAttempted=true;checkpoint();await adapter.escalate({jobId:job.id,outcome:state.outcome});}
@@ -153,21 +162,59 @@ export class HostAdapter {
     this.command([this.config.tt||"tt","send","--kind","request","--to","db-handler","--subject","Import verification for the integrated release commit","--ask",`Import release verification plan and receipt for job ${job.id} integrated commit ${job.integratedCommit} through tt deployment verification --plan-file and --file. Preserve exact job generation and inspect logs; release publication waits for saved import.`,"--request-id",`${job.id}-integrated-matrix-${job.integratedCommit}`,"--ref",`release-job=${job.id}`,"--ref",`integrated-commit=${job.integratedCommit}`,"--attachment",planPath,"--attachment",receiptPath]);
     return false;
   }
+  async verifyInputs(commit){
+    const current=JSON.parse(this.command([this.config.tt||"tt","deployment","list"])).find(j=>j.id===this.job.id);
+    if(current?.inputsCommit===commit && /^[a-f0-9]{64}$/.test(current.inputsDigest||"")){this.job=current;this.jobInputs(commit);return true;}
+    this.command([this.config.tt||"tt","send","--kind","request","--to","db-handler","--subject","Import immutable inputs for this release job","--ask",`Prepare the private manifest ${join(this.config.journalDirectory,this.job.id+"-inputs.json")} for exact job ${this.job.id} accepted ${this.job.commit} integrated ${commit}; import its digest with tt deployment inputs --job --generation --commit --file. Include fresh exact-job backup/preflight pins and rollback programs; publication waits for saved handler input binding.`,"--request-id",`${this.job.id}-inputs-${commit}`,"--work-item",this.job.itemId,"--work-item-revision",String(this.job.itemRevision),"--work-order-message",String(this.job.orderMessageSeq),"--ref",`release-job=${this.job.id}`]);return false;
+  }
+  jobInputs(commit){
+    const path=join(this.config.journalDirectory,this.job.id+"-inputs.json"),raw=readFileSync(path,"utf8");
+    if(fileDigest(path)!==this.job.inputsDigest || this.job.inputsCommit!==commit)throw new Error("Handler input digest binding required");
+    const input=JSON.parse(raw);
+    if(input.version!==1 || input.jobId!==this.job.id || input.commit!==commit || input.acceptedCommit!==this.job.commit || input.verificationDigest!==this.job.verificationDigest)throw new Error("Exact job input binding required");
+    return input;
+  }
+  captureMiniRollback(artifact){
+    const path=join(this.config.journalDirectory,this.job.id+"-mini-before");
+    copyFileSync(artifact.installPath,path,constants.COPYFILE_EXCL);
+    artifact.rollbackPath=path;artifact.priorArtifactSHA256=fileDigest(path);artifact.rollbackCaptured=true;
+  }
   async prepare(target,commit){
+    if(git(this.config.cwd,"rev-parse","HEAD")!==commit)throw new Error("Candidate build checkout mismatch");
     const t=this.config.targets[target];if(!t)throw new Error("Target host config required");
-    const artifact={...t,release:t.release,commit};
+    const input=this.jobInputs(commit),perJob=input.targets?.[target];if(!perJob)throw new Error("Exact job target input required");
+    const release=this.job.id+"-"+commit.slice(0,12)+"-"+target;
+    if(perJob.release!==release)throw new Error("Unique job release identity required");
+    // Stable config contains private probe/host references only. Backup, release,
+    // compatibility and rollback inputs come from the handler-pinned job manifest.
+    const artifact={installPath:t.installPath,relayRestart:t.relayRestart,liveProbe:t.liveProbe,rollbackProbe:t.rollbackProbe,...perJob,release,commit,rollbackSafe:perJob.rollbackSafe===true};
+    const schemaBase=this.config.baselines.hub;
+    artifact.schemaChanged=["hub","bridge"].includes(target) && diffPaths(this.config.cwd,schemaBase,commit).some(p=>/^hub\/internal\/store\/.*\.go$/.test(p)&&!p.endsWith("_test.go"));
     if(target==="tailos"){
       this.command(["npm","run","build:static"]);this.command(["npm","run","verify:release"]);
       const manifest=JSON.parse(readFileSync(join(this.config.cwd,"dist-static/release.json"),"utf8"));
       if(manifest.commit!==commit)throw new Error("Static commit mismatch");
       artifact.artifactSHA256=digest(readFileSync(join(this.config.cwd,"dist-static/release.json"),"utf8"));
     }else{
-      const output=resolve(this.config.cwd,t.artifactPath);mkdirSync(dirname(output),{recursive:true,mode:0o700});
+      const filename={hub:"tailterm-hub-linux-amd64",bridge:"tailterm-discord-linux-amd64",mini:"tt-"+this.job.id}[target];
+      const output=join(this.config.cwd,".build/ttbin",filename);mkdirSync(dirname(output),{recursive:true,mode:0o700});
       const pkg={hub:"tailterm-hub",bridge:"tailterm-discord",mini:"tt"}[target];
       const os=target==="mini"?"darwin":"linux",arch=target==="mini"?"arm64":"amd64";
       this.command(["env","CGO_ENABLED=0",`GOOS=${os}`,`GOARCH=${arch}`,"go","build","-trimpath","-ldflags=-s -w","-o",output,`./cmd/${pkg}`],join(this.config.cwd,"hub"));
       artifact.artifactPath=output;artifact.artifactSHA256=fileDigest(output);if(target==="mini")artifact.version=commit;
     }
+    if(artifact.schemaChanged){
+      if(perJob.backupJobId!==this.job.id || !perJob.backup || !perJob.backup.includes(this.job.id))throw new Error("Fresh job backup identity required");
+      artifact.migrationBinary=join(this.config.journalDirectory,this.job.id+"-migration");
+      this.command(["env","CGO_ENABLED=0",`GOOS=${process.platform}`,`GOARCH=${process.arch==="arm64"?"arm64":"amd64"}`,"go","build","-trimpath","-o",artifact.migrationBinary,"./cmd/tailterm-hub"],join(this.config.cwd,"hub"));
+      artifact.migrationBinarySHA256=fileDigest(artifact.migrationBinary);
+    }
+    if(["hub","bridge"].includes(target)){
+      if(perJob.backupJobId!==this.job.id || !perJob.backup?.includes(this.job.id))throw new Error("Fresh job backup identity required");
+      const plan=JSON.parse(readFileSync(perJob.planPath,"utf8"));
+      if(plan.deployment.releaseName!==release || plan.backupDestination!==perJob.backup || fileDigest(perJob.preflightReceipt)!==perJob.preflightReceiptSHA256)throw new Error("Exact job preflight binding required");
+    }
+    if(target==="mini")this.captureMiniRollback(artifact);
     this.artifacts.set(target,artifact);return artifact;
   }
   async rehearse(a){
@@ -175,18 +222,20 @@ export class HostAdapter {
     if(fileDigest(a.backupCopy)!==a.backupSHA256)throw new Error("Imported backup hash mismatch");
     const {copyFileSync}=await import("node:fs");const copy=a.backupCopy+".rehearsal-"+this.job.id;
     if(existsSync(copy))throw new Error("Rehearsal copy already exists; inspect prior attempt");copyFileSync(a.backupCopy,copy);
+    if(fileDigest(a.migrationBinary)!==a.migrationBinarySHA256)throw new Error("Candidate migration binary changed");
     this.command([a.migrationBinary,"--migrate-only",copy]);
     return true;
   }
   async deploy(target,a){
+    if(a.artifactPath && fileDigest(a.artifactPath)!==a.artifactSHA256)throw new Error("Pinned candidate artifact changed");
     if(target==="hub" || target==="bridge"){
       const plan=JSON.parse(readFileSync(a.planPath,"utf8"));
       if(JSON.stringify(plan.deployment.targets)!==JSON.stringify([target]))throw new Error("Exact per-target middleware plan required");
       this.command(["python3","scripts/deploy-truenas-hub.py",a.release,"--plan",a.planPath,"--preflight-receipt",a.preflightReceipt,"--preflight-receipt-sha256",a.preflightReceiptSHA256,"--update"]);
     }else if(target==="mini"){
       const {copyFileSync,chmodSync}=await import("node:fs");
-      if(!a.installPath || !a.rollbackPath || existsSync(a.rollbackPath))throw new Error("Fresh Mini rollback path required");
-      copyFileSync(a.installPath,a.rollbackPath);copyFileSync(a.artifactPath,a.installPath+".next");chmodSync(a.installPath+".next",0o755);renameSync(a.installPath+".next",a.installPath);
+      if(!a.rollbackCaptured || fileDigest(a.rollbackPath)!==a.priorArtifactSHA256 || fileDigest(a.installPath)!==a.priorArtifactSHA256)throw new Error("Exact prior-live Mini rollback required");
+      copyFileSync(a.artifactPath,a.installPath+".next");chmodSync(a.installPath+".next",0o755);renameSync(a.installPath+".next",a.installPath);
       this.command(a.relayRestart);
     }else{
       const output=this.command(["npx","wrangler","pages","deploy","dist-static","--project-name","tailos","--branch","main","--commit-hash",a.commit,"--commit-dirty=false"]);
@@ -211,22 +260,34 @@ export class HostAdapter {
   async rollback(target){
     const a=this.artifacts.get(target);if(!a || a.rollbackSafe!==true)return false;
     if(target==="mini"){
+      if(!a.rollbackCaptured || fileDigest(a.rollbackPath)!==a.priorArtifactSHA256)return false;
       const {copyFileSync}=await import("node:fs");copyFileSync(a.rollbackPath,a.installPath+".rollback");renameSync(a.installPath+".rollback",a.installPath);this.command(a.relayRestart);
     }else{this.command(a.rollbackProgram);}
     const r=JSON.parse(this.command(a.rollbackProbe));return r.restored===true && r.databaseWritesPreserved===true;
   }
   async finish(receipt,expectedGeneration){const path=join(this.config.journalDirectory || dirname(this.config.journalPath),this.job.id+"-receipt.json");save(path,receipt);this.native("finish",["--file",path],expectedGeneration);}
   async block(){this.native("block");}
+  async refuse(){this.native("refuse");}
   async escalate(){
     return this.command([this.config.tt||"tt","send","--kind","notice","--subject","Release failed and requires recovery","--text",`Release failed for ${this.job.id}; inspect the private host journal. Automatic rollback attempted once; handler reconciliation required.`,"--request-id",`${this.job.id}-release-failure`,"--ref",`release-job=${this.job.id}`]);
   }
 }
 
-export function runnableJob(jobs,agent,run){
+export function runnableJob(jobs,agent,run,skipped=new Set()){
   const owned=jobs.find(j=>["claimed","merged"].includes(j.state) && j.agentId===agent && j.runId===run);
   if(owned)return owned;
   if(jobs.some(j=>["claimed","merged","blocked"].includes(j.state)))return null;
-  return jobs.find(j=>j.state==="verified")||null;
+  return jobs.find(j=>j.state==="verified" && !skipped.has(j.id))||null;
+}
+export function reconcileHostLocks(config,jobs){
+  for(const job of jobs){
+    const r=job.reconciliations?.at(-1);
+    if(!r?.lockDigest || !r.noActiveExecution || !r.refResolved || !["no_effects","restored"].includes(r.journalState) || !["verified","refused"].includes(job.state))continue;
+    const lock=join(tmpdir(),"tailterm-release-locks",digest(config.cwd+"\0"+(job.taskId||"fixture"))+".lock");
+    if(!existsSync(lock) || fileDigest(lock)!==r.lockDigest)continue;
+    const record=JSON.parse(readFileSync(lock,"utf8"));
+    if(record.jobId===job.id && record.agentId===r.agentId && record.runId===r.runId)rmSync(lock);
+  }
 }
 export function reconcileReceipts(config,jobs){
   for(const job of jobs){
@@ -239,19 +300,24 @@ export function reconcileReceipts(config,jobs){
 export async function serveDeployment(config,{once=false,signal}={}) {
   if(config.version!==1 || config.enabled!==true || !config.cwd || !config.journalDirectory)throw new Error("Explicit private activation config required");
   while(!signal?.aborted){
+    try {
     const reader=new HostAdapter(config,{});
     const jobs=JSON.parse(reader.command([config.tt||"tt","deployment","list"]));
-    reconcileReceipts(config,jobs);
-    const job=runnableJob(jobs,process.env.TAILTERM_AGENT,process.env.TAILTERM_RUN);
-    if(job){
+    reconcileReceipts(config,jobs);reconcileHostLocks(config,jobs);
+    const skipped=new Set();
+    for (;;) {
+      const job=runnableJob(jobs,process.env.TAILTERM_AGENT,process.env.TAILTERM_RUN,skipped);
+      if(!job)break;
       const adapter=new HostAdapter(config,job);
-      if(job.state==="verified")adapter.native("claim");
-      const current=adapter.job;
-      const baselines={...config.baselines};
+      try{if(job.state==="verified")adapter.native("claim");}
+      catch{skipped.add(job.id);process.stderr.write("Release claim held; handler reconciliation required.\n");continue;}
+      const current=adapter.job,baselines={...config.baselines};
       for(const released of jobs){if(released.receipt?.outcome!=="released")continue;for(const t of released.receipt.targets){if(t.outcome==="released")baselines[t.target]=released.receipt.commit;}}
       const {testPolicy,sleep,now,...activation}=config;
       try{await runRelease({...activation,baselines,job:current,journalPath:join(config.journalDirectory,current.id+".json")},adapter);}catch{process.stderr.write("Release held; inspect handler fence and private journal.\n");}
+      break;
     }
+    } catch {process.stderr.write("Deployment poll held; inspect native input or recovery evidence.\n");}
     if(once)return;
     await new Promise(r=>setTimeout(r,30000));
   }

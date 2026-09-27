@@ -1,9 +1,11 @@
 package main
 
 import (
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"flag"
+	"fmt"
 	"github.com/scs32/tailterm/hub/internal/api"
 	"os"
 	"os/exec"
@@ -15,7 +17,7 @@ func deploymentBriefing() string {
 }
 func cmdDeployment(e env, args []string) error {
 	if len(args) == 0 {
-		return errors.New("usage: tt deployment setup|list|enqueue|claim|check|verification|merged|finish|block")
+		return errors.New("usage: tt deployment setup|list|enqueue|claim|check|verification|merged|finish|block|inputs|reconcile|refuse")
 	}
 	if args[0] == "serve" {
 		if len(args) != 3 || args[1] != "--config" {
@@ -62,12 +64,28 @@ func cmdDeployment(e env, args []string) error {
 		return errors.New("exact agent/run and request-id required")
 	}
 	req := api.ReleaseRequest{RequestID: *key, Operation: args[0], AgentID: e.agent, RunID: e.runID, EntryID: *entry, JobID: *job, ExpectedGeneration: *generation, IntegratedCommit: *commit}
-	if args[0] == "finish" || args[0] == "verification" {
+	if args[0] == "finish" || args[0] == "verification" || args[0] == "inputs" || args[0] == "reconcile" {
 		b, err := os.ReadFile(*file)
 		if err != nil {
 			return err
 		}
-		if args[0] == "finish" {
+		if args[0] == "inputs" {
+			var binding struct {
+				Version int    `json:"version"`
+				JobID   string `json:"jobId"`
+				Commit  string `json:"commit"`
+			}
+			if err = json.Unmarshal(b, &binding); err != nil {
+				return err
+			}
+			if binding.Version != 1 || binding.JobID != *job || binding.Commit != *commit {
+				return errors.New("exact job manifest binding required")
+			}
+			req.InputsDigest = fmt.Sprintf("%x", sha256.Sum256(b))
+		} else if args[0] == "reconcile" {
+			req.Reconciliation = &api.ReleaseReconciliation{}
+			err = json.Unmarshal(b, req.Reconciliation)
+		} else if args[0] == "finish" {
 			req.Receipt = &api.ReleaseReceipt{}
 			err = json.Unmarshal(b, req.Receipt)
 		} else {

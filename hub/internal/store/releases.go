@@ -164,7 +164,26 @@ func (s *Store) ReleaseAction(ctx context.Context, task string, req api.ReleaseR
 		if j.Generation != req.ExpectedGeneration {
 			return zero, releaseConflict("generation changed")
 		}
-		if req.Operation == "verification" {
+		if req.Operation == "reconcile" {
+			if err = requireScopeHandler(tx, ctx, task, req.AgentID, req.RunID); err != nil {
+				return zero, err
+			}
+			if err = reconcileRelease(ctx, tx, task, &j, req.Reconciliation, generation); err != nil {
+				return zero, err
+			}
+		} else if req.Operation == "inputs" {
+			if err = requireScopeHandler(tx, ctx, task, req.AgentID, req.RunID); err != nil {
+				return zero, err
+			}
+			if j.State != "claimed" || j.InputsDigest != "" || !validContextDigest(req.InputsDigest) || !validGitCommit(req.IntegratedCommit) || (req.IntegratedCommit != j.Commit && (j.IntegratedVerification == nil || req.IntegratedCommit != j.IntegratedCommit)) {
+				return zero, releaseConflict("exact claimed integrated input binding required")
+			}
+			if j.PauseGeneration != generation {
+				return zero, releaseConflict("project generation changed")
+			}
+			j.InputsCommit = req.IntegratedCommit
+			j.InputsDigest = req.InputsDigest
+		} else if req.Operation == "verification" {
 			if err = requireScopeHandler(tx, ctx, task, req.AgentID, req.RunID); err != nil {
 				return zero, err
 			}
@@ -271,6 +290,11 @@ func (s *Store) ReleaseAction(ctx context.Context, task string, req api.ReleaseR
 				}
 				j.Receipt = r
 				j.State = r.Outcome
+			case "refuse":
+				if j.State != "claimed" || j.Receipt != nil {
+					return zero, releaseConflict("only an unpublished claim may refuse")
+				}
+				j.State = "refused"
 			case "block":
 				if j.State != "claimed" && j.State != "merged" {
 					return zero, releaseConflict("owned execution required")
@@ -322,4 +346,73 @@ func (s *Store) ValidateReleaseDatabase(ctx context.Context) error {
 		return releaseConflict("migration foreign key failure")
 	}
 	return rows.Err()
+}
+
+// Reconciliation refuses unknown/active execution. Exited-run rotation and a
+// handler's hashed host inspection are both required before releasing a fence.
+func reconcileRelease(ctx context.Context, tx *sql.Tx, task string, j *api.ReleaseJob, r *api.ReleaseReconciliation, generation int64) error {
+	if r == nil || r.JobID != j.ID || r.AgentID != j.AgentID || r.RunID != j.RunID || r.PauseGeneration != j.PauseGeneration || !validContextDigest(r.IncidentDigest) || !validContextDigest(r.JournalDigest) || !r.NoActiveExecution || !r.RefResolved || (r.JournalState != "no_effects" && r.JournalState != "restored") || (r.Disposition != "requeue" && r.Disposition != "refuse") {
+		return releaseConflict("exact inspected recovery evidence required")
+	}
+	if j.State != "verified" && j.State != "claimed" && j.State != "merged" && j.State != "blocked" {
+		return releaseConflict("job is not held")
+	}
+	for _, stamp := range []string{r.ObservedAt, r.LastActionAt, r.StoppedAt} {
+		if _, err := time.Parse(time.RFC3339Nano, stamp); err != nil {
+			return api.ErrInvalid
+		}
+	}
+	if r.LockDigest != "" && !validContextDigest(r.LockDigest) {
+		return api.ErrInvalid
+	}
+	for _, value := range []string{r.StopReason, r.LastAction, r.CausalEvidence, r.PreventionOwner, r.PreventionCriterion, r.ExpectedNextAction, r.ContributingConditions, r.UnresolvedQuestions} {
+		if value == "" || len(value) > 512 || strings.ContainsAny(value, "\x00\n\r") {
+			return api.ErrInvalid
+		}
+	}
+	incident, err := getWorkItem(tx, ctx, task, r.IncidentBugID)
+	if err != nil || incident.Kind != "bug" {
+		return releaseConflict("recorded incident bug required")
+	}
+	prevention, err := getWorkItem(tx, ctx, task, r.PreventionItemID)
+	if err != nil {
+		return err
+	}
+	if err = requireConfirmedTeamOrder(ctx, tx, task, prevention.ID, prevention.Revision, r.PreventionOrderMessage); err != nil {
+		return err
+	}
+	if j.AgentID != "" {
+		var run, status string
+		if err = tx.QueryRowContext(ctx, `SELECT run_id,status FROM agents WHERE task_id=? AND id=?`, task, j.AgentID).Scan(&run, &status); err != nil {
+			return err
+		}
+		if run == j.RunID && status != api.AgentExited && status != api.AgentClosed {
+			return releaseConflict("prior run has not exited; retirement is not termination")
+		}
+	}
+	if r.Disposition == "requeue" {
+		if !r.NoPublication || r.JournalState != "no_effects" || j.Receipt != nil {
+			return releaseConflict("only inspected unpublished no-effect execution can requeue")
+		}
+		_, p, v, err := releaseCandidate(ctx, tx, task, j.EntryID)
+		if err != nil {
+			return err
+		}
+		if p.Commit != j.Commit || verificationDigest(v) != j.VerificationDigest {
+			return releaseConflict("candidate changed")
+		}
+		j.State = "verified"
+		j.AgentID = ""
+		j.RunID = ""
+		j.IntegratedCommit = ""
+		j.IntegratedPlan = nil
+		j.IntegratedVerification = nil
+		j.InputsCommit = ""
+		j.InputsDigest = ""
+	} else {
+		j.State = "refused"
+	}
+	j.PauseGeneration = generation
+	j.Reconciliations = append(j.Reconciliations, *r)
+	return nil
 }
