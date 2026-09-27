@@ -28,8 +28,9 @@ export function createCachedHubClient({
   const optionalOwnerRead = (path) => {
     const url = new URL(path, client.base);
     return (
-      url.pathname.endsWith("/obligations") &&
-      url.searchParams.get("owner") === "1"
+      (url.pathname.includes("/usage") ||
+        url.pathname.endsWith("/obligations")) &&
+      (url.pathname.includes("/usage") || url.searchParams.get("owner") === "1")
     );
   };
   const paths = new Set(),
@@ -111,7 +112,10 @@ export function createCachedHubClient({
     const requestedRevision = revision;
     const optionalAuthAtStart = optionalAuthenticationError;
     const checkOptionalAuthentication = () => {
-      if (optionalAuthenticationError && optionalAuthenticationError !== optionalAuthAtStart)
+      if (
+        optionalAuthenticationError &&
+        optionalAuthenticationError !== optionalAuthAtStart
+      )
         throw optionalAuthenticationError;
     };
     const work = (async () => {
@@ -441,12 +445,30 @@ export function createCachedHubClient({
   return {
     ...client,
     cacheStatus: status,
+    getUsage: (task, filters = {}) =>
+      read(`/v1/tasks/${task}/usage` + query(filters)),
+    getUsagePrices: (task) => read(`/v1/tasks/${task}/usage/prices`),
+    setUsagePrices: async (task, body) => {
+      const result = await client.setUsagePrices(task, body);
+      invalidate();
+      return result;
+    },
     // Capability negotiation must reflect the connected hub. Persisting a 404
     // would strand this client on the legacy path after a hub upgrade, while
     // serving stale success offline could expose controls the hub cannot honor.
     capabilities: () => client.capabilities(),
-    listOwnerObligations: async (task, params = {}) => (await read(`/v1/tasks/${task}/obligations` + query({owner:1,open:1,...params}))).obligations,
-    answerOwnerObligation: async (task,id,body) => { const result = await client.answerOwnerObligation(task,id,body); invalidate(); return result; },
+    listOwnerObligations: async (task, params = {}) =>
+      (
+        await read(
+          `/v1/tasks/${task}/obligations` +
+            query({ owner: 1, open: 1, ...params }),
+        )
+      ).obligations,
+    answerOwnerObligation: async (task, id, body) => {
+      const result = await client.answerOwnerObligation(task, id, body);
+      invalidate();
+      return result;
+    },
     listTasks: async () => (await read("/v1/tasks")).tasks,
     getTask: (id) => read(`/v1/tasks/${id}`),
     listAgents: async (id) => (await read(`/v1/tasks/${id}/agents`)).agents,

@@ -181,6 +181,7 @@ func cmdSend(e env, args []string) error {
 	if err != nil {
 		return err
 	}
+	recordUsageContext(e, *task, "post", m.Seq)
 	fmt.Printf("posted #%d\n", m.Seq)
 	return nil
 }

@@ -130,3 +130,31 @@ func TestRelayBudgetPolicyRevisionDoesNotRefillBurst(t *testing.T) {
 		t.Fatal("policy revision refilled an exhausted queue burst")
 	}
 }
+
+func TestUsageUploadUsesSharedHostRequestBudget(t *testing.T) {
+	u := newSyntheticUsage(t, "claude")
+	u.Binding.Hub = "https://hub.example.invalid"
+	parseUsageLines(t, u, `{"type":"assistant","timestamp":"2026-09-27T10:00:01Z","message":{"id":"budget","model":"m","stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":2}}}`)
+	var budget relayRateBudget
+	now := time.Now().UTC()
+	if err := budget.configure(&api.TeamHostPolicy{LimiterDomain: u.Binding.Hub, Version: 1, ExpiresAt: now.Add(time.Hour).Format(time.RFC3339), MaxRequestsPerMinute: 120, MaxBurst: 4, HeadroomPercent: 50}, now); err != nil {
+		t.Fatal(err)
+	}
+	if err := budget.wait(context.Background(), u.Binding.Hub, "/v1/team-queues"); err != nil {
+		t.Fatal(err)
+	}
+	if err := budget.wait(context.Background(), u.Binding.Hub, "/v1/tasks/tsk_1111111111111111/agents"); err != nil {
+		t.Fatal(err)
+	}
+	requests := 0
+	c := &api.Client{Base: u.Binding.Hub, HTTP: &http.Client{Transport: budgetRoundTripFunc(func(*http.Request) (*http.Response, error) {
+		requests++
+		return &http.Response{StatusCode: 200, Body: http.NoBody, Header: http.Header{}}, nil
+	})}}
+	attachRelayBudget(c, &budget)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
+	defer cancel()
+	if err := uploadUsage(ctx, u, c); err == nil || requests != 0 || u.Pending == nil {
+		t.Fatal("upload bypassed budget or lost frozen batch", requests, err)
+	}
+}

@@ -40,6 +40,7 @@ Commands
   verification <plan|receipt|history|enrollment>  handler-owned native verification records
   work-items <command>         list/get/create/update/dispatch/history/evidence for bugs and features
   queue <command>              list/get/history/changes/action/receipt for deliberate Queue work
+  usage [--item ID] [--project ID] [--from TIME] [--to TIME] [--json]  token/cost ledger
   agents [--json]              list agents on this task
   event <kind> [--text T]      post started|running|done|needs_input|exited|closed
   post <text> [--to AGENT]     post a message to the task or one agent
@@ -189,6 +190,8 @@ func main() {
 		err = cmdWorkItems(e, args)
 	case "queue":
 		err = cmdQueue(e, args)
+	case "usage":
+		err = cmdUsage(e, args)
 	case "agents":
 		err = cmdAgents(e, args)
 	case "event":
@@ -496,6 +499,7 @@ func cmdPost(e env, args []string) error {
 	if err != nil {
 		return err
 	}
+	recordUsageContext(e, *task, "post", m.Seq)
 	fmt.Printf("posted #%d\n", m.Seq)
 	return nil
 }
@@ -571,6 +575,9 @@ func cmdInbox(e env, args []string) error {
 			}
 		}
 		msgs = filtered
+	}
+	for _, m := range msgs {
+		recordUsageContext(e, task, "inbox", m.Seq)
 	}
 	if *asJSON {
 		printJSON(msgs)

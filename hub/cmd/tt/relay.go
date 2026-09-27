@@ -584,7 +584,9 @@ func cmdRelay(args []string) error {
 					// Host observation runs after delivery, using the same host budget.
 					// A slow or drifting transcript never delays a broker or inbox turn.
 					activityCtx, stopActivity := context.WithTimeout(context.WithValue(context.Background(), activityWorktreeContextKey{}, worktreeCache), 5*time.Second)
-					if activityErr := runActivitySafely(func() error { return relayActivityTick(activityCtx, b, c, now, activityProbeNative) }); activityErr != nil {
+					if activityErr := runActivitySafely(func() error {
+						return relayActivityTick(prepareUsageContext(activityCtx, b, c, now), b, c, now, activityProbeNative)
+					}); activityErr != nil {
 						fmt.Fprintf(os.Stderr, "[tt relay] %s activity: %v\n", b.Agent, activityErr)
 					}
 					stopActivity()
@@ -600,6 +602,22 @@ func cmdRelay(args []string) error {
 			}
 			if err := saveRelayProgress(dir, progressPath, b, progress); err != nil {
 				fmt.Fprintln(os.Stderr, "[tt relay] save progress:", err)
+			}
+		}
+		if !*status {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			err := flushFrozenUsage(ctx, dir, func(b runtimeBinding) (*api.Client, error) {
+				e := env{hub: b.Hub}
+				e.loadConfig()
+				c, err := e.client(5 * time.Second)
+				if err == nil {
+					attachRelayBudget(c, activeRelayBudget)
+				}
+				return c, err
+			})
+			cancel()
+			if err != nil {
+				fmt.Fprintln(os.Stderr, "[tt relay] frozen usage:", err)
 			}
 		}
 		if *status {

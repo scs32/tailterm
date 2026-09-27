@@ -143,6 +143,7 @@ func cmdObligationAction(e env, action string, args []string) error {
 	if err != nil {
 		return err
 	}
+	recordUsageContext(e, task, action, o.MessageSeq)
 	fmt.Printf("#%d %s\n", o.MessageSeq, o.State)
 	return nil
 }

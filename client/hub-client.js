@@ -63,6 +63,12 @@ export function createHubClient({ fetchImpl, baseURL, token = "" }) {
   const client = {
     base,
     token,
+    getUsage: (id, filters = {}) =>
+      request("GET", `/v1/tasks/${encodeURIComponent(id)}/usage` + q(filters)),
+    getUsagePrices: (id) =>
+      request("GET", `/v1/tasks/${encodeURIComponent(id)}/usage/prices`),
+    setUsagePrices: (id, body) =>
+      request("PUT", `/v1/tasks/${encodeURIComponent(id)}/usage/prices`, body),
     request,
     onMutation(listener) {
       mutationListeners.add(listener);
@@ -104,7 +110,10 @@ export function createHubClient({ fetchImpl, baseURL, token = "" }) {
     getWorkItemRevision: (task, id, revision) =>
       request(`/v1/tasks/${task}/work-items/${id}/revisions/${revision}`),
     getWorkOrderScopeConfirmation: (task, id, revision, order) =>
-      request(`/v1/tasks/${task}/work-items/${id}/order-scope` + q({ revision, order })),
+      request(
+        `/v1/tasks/${task}/work-items/${id}/order-scope` +
+          q({ revision, order }),
+      ),
     listWorkItemHistoryGaps: (task, id, params = {}) =>
       request(`/v1/tasks/${task}/work-items/${id}/history-gaps` + q(params)),
     listWorkItemMessages: (task, id, params = {}) =>
@@ -258,8 +267,17 @@ export function createHubClient({ fetchImpl, baseURL, token = "" }) {
       ),
     listMessages: async (task, params = {}) =>
       (await request(`/v1/tasks/${task}/messages` + q(params))).messages,
-    listOwnerObligations: async (task, params = {}) => (await request(`/v1/tasks/${task}/obligations` + q({owner:1,open:1,...params}))).obligations,
-    answerOwnerObligation: (task, id, body) => request(`/v1/tasks/${task}/obligations/${id}/answer`, {method:"POST",body}),
+    listOwnerObligations: async (task, params = {}) =>
+      (
+        await request(
+          `/v1/tasks/${task}/obligations` + q({ owner: 1, open: 1, ...params }),
+        )
+      ).obligations,
+    answerOwnerObligation: (task, id, body) =>
+      request(`/v1/tasks/${task}/obligations/${id}/answer`, {
+        method: "POST",
+        body,
+      }),
     listDecisions: (task, params = {}) =>
       request(`/v1/tasks/${task}/decisions` + q(params)),
     answerDecision: (task, seq, body) =>

@@ -210,6 +210,9 @@ func retireRelayBinding(ctx context.Context, dir, path string, b runtimeBinding,
 			retired = true // loaded snapshot was superseded; do not act on it
 			return nil
 		}
+		if err := freezeRetiredUsage(b); err != nil {
+			return err
+		}
 		r := relayRetirement{Binding: b, BindingDigest: relayFileDigest(data), Reason: reason}
 		progress, err := os.ReadFile(filepath.Join(dir, bindingKey(b)+".progress.json"))
 		if err != nil && !os.IsNotExist(err) {
