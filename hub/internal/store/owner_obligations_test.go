@@ -287,3 +287,61 @@ func TestOwnerWithdrawPreservesAuthorityAndRetry(t *testing.T) {
 		t.Fatal(notices)
 	}
 }
+
+// b1 / correction12101: legacy board-wide messages must remain postable even
+// when their sender cannot supply the exact context needed for an obligation.
+func TestOwnerLegacyBoardwideRequestStorage(t *testing.T) {
+	for _, name := range []string{"unbound lead", "bound worker without run"} {
+		t.Run(name, func(t *testing.T) {
+			f := newDeliveryFixture(t)
+			ctx := context.Background()
+			agent, run := f.lead.ID, f.lead.RunID
+			if name == "bound worker without run" {
+				agent, run = f.worker.ID, ""
+			}
+			req := api.PostMessageRequest{AgentID: agent, RunID: run, RequestID: "legacy-boardwide", Envelope: &api.Envelope{Kind: api.EnvelopeKindRequest, Subject: "A legacy board request remains postable", Body: api.EnvelopeBody{Ask: "Please answer"}}}
+			m, err := f.s.PostMessage(ctx, f.task.ID, req, f.by)
+			if err != nil {
+				t.Fatalf("legacy post rejected: %v", err)
+			}
+			stored, err := loadMessage(f.s.db, ctx, f.task.ID, m.Seq)
+			if err != nil || stored.Envelope == nil || stored.Envelope.Body.Ask != "Please answer" || stored.From.AgentID != agent || len(stored.WorkItems) != 0 {
+				t.Fatalf("message not preserved or context guessed: %+v %v", stored, err)
+			}
+			again, err := f.s.PostMessage(ctx, f.task.ID, req, f.by)
+			if err != nil || again.Seq != m.Seq {
+				t.Fatalf("legacy retry changed message: %+v %v", again, err)
+			}
+			list, err := f.s.ListObligations(ctx, f.task.ID, ObligationFilter{}, f.s.now())
+			if err != nil || len(list) != 0 {
+				t.Fatalf("legacy post created an obligation: %+v %v", list, err)
+			}
+		})
+	}
+}
+
+func TestOwnerExplicitRequestStillRequiresExactContext(t *testing.T) {
+	f := newDeliveryFixture(t)
+	ctx := context.Background()
+	for _, agent := range []api.Agent{f.lead, f.worker} {
+		run := agent.RunID
+		if agent.ID == f.worker.ID {
+			run = ""
+		}
+		_, err := f.s.PostMessage(ctx, f.task.ID, api.PostMessageRequest{AgentID: agent.ID, RunID: run, To: "owner", RequestID: "explicit-invalid-" + agent.ID, Envelope: &api.Envelope{Kind: api.EnvelopeKindRequest, To: "owner", Subject: "Explicit owner requests require exact context", Body: api.EnvelopeBody{Ask: "Please answer"}}}, f.by)
+		if err == nil {
+			t.Fatal("explicit owner request bypassed context checks")
+		}
+	}
+	// Existing exact bound board-wide and explicit-owner paths still create owner obligations.
+	for _, to := range []string{"", "owner"} {
+		m, err := f.s.PostMessage(ctx, f.task.ID, api.PostMessageRequest{AgentID: f.worker.ID, RunID: f.worker.RunID, To: to, RequestID: "exact-control-" + to, Envelope: &api.Envelope{Kind: api.EnvelopeKindRequest, To: to, Subject: "Exact context creates the owner obligation", Body: api.EnvelopeBody{Ask: "Please answer"}}}, f.by)
+		if err != nil {
+			t.Fatal(err)
+		}
+		o := ownerFor(t, f, m.Seq)
+		if len(o.Request.WorkItems) != 1 || o.Request.WorkItems[0].ItemID != f.item.ID || o.Request.WorkOrderMessage == nil || o.Request.WorkOrderMessage.Seq != f.order.Seq {
+			t.Fatalf("exact control lost its context: %+v", o)
+		}
+	}
+}

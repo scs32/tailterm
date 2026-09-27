@@ -1130,6 +1130,8 @@ func (s *Store) PostMessage(ctx context.Context, taskID string, req api.PostMess
 			req.To = replyAuthor
 		}
 	}
+	// Capture effective board-wide routing before normalizing the reserved owner.
+	legacyOwnerRequest := isOwnerRequest(req) && req.To == "" && req.Envelope.To == ""
 	if req.Envelope != nil && req.Envelope.To == "owner" && req.To != "" && req.To != "owner" {
 		return api.Message{}, api.ErrInvalid
 	}
@@ -1208,7 +1210,18 @@ func (s *Store) PostMessage(ctx context.Context, taskID string, req api.PostMess
 	// Broker phase 2a: only posts through this public endpoint create or settle
 	// obligations. System notices, decisions, dispatches and lead notices use
 	// other insert paths and never oblige anyone.
-	if !ownerReply {
+	// Legacy board-wide requests remain stored when no exact obligation context
+	// resolves. Explicit owner requests still fail through createOwnerObligation,
+	// and actual obligations retain its current-run and primary-link checks.
+	skipOwnerObligation := legacyOwnerRequest
+	if legacyOwnerRequest && req.RunID != "" {
+		for _, link := range m.WorkItems {
+			if link.ItemTaskID == taskID && link.Relationship == "primary" {
+				skipOwnerObligation = false
+			}
+		}
+	}
+	if !ownerReply && !skipOwnerObligation {
 		if err = s.createObligations(ctx, tx, m, req, req.AgentID == "" && by.Node != api.BrokerNode); err != nil {
 			return m, err
 		}
