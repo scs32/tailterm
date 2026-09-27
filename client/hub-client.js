@@ -64,11 +64,14 @@ export function createHubClient({ fetchImpl, baseURL, token = "" }) {
     base,
     token,
     getUsage: (id, filters = {}) =>
-      request("GET", `/v1/tasks/${encodeURIComponent(id)}/usage` + q(filters)),
+      request(`/v1/tasks/${encodeURIComponent(id)}/usage` + q(filters)),
     getUsagePrices: (id) =>
-      request("GET", `/v1/tasks/${encodeURIComponent(id)}/usage/prices`),
+      request(`/v1/tasks/${encodeURIComponent(id)}/usage/prices`),
     setUsagePrices: (id, body) =>
-      request("PUT", `/v1/tasks/${encodeURIComponent(id)}/usage/prices`, body),
+      request(`/v1/tasks/${encodeURIComponent(id)}/usage/prices`, {
+        method: "PUT",
+        body,
+      }),
     request,
     onMutation(listener) {
       mutationListeners.add(listener);

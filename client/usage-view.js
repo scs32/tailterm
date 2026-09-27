@@ -1,4 +1,3 @@
-import "./usage.css";
 import {
   escapeUsage as esc,
   formatUsageCost,

@@ -1,5 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { createHubClient } from "../client/hub-client.js";
 import {
   compareRational,
   formatQuantity,
@@ -8,6 +9,32 @@ import {
   sortUsagePhases,
   usageSummary,
 } from "../client/usage-format.js";
+
+test("Usage client sends exact paths, methods, filters and price body", async () => {
+  const calls = [];
+  const client = createHubClient({
+    baseURL: "https://hub.example",
+    fetchImpl: async (url, init) => {
+      calls.push({ url, init });
+      return { status: 200, text: async () => "{}" };
+    },
+  });
+  await client.getUsage("tsk_fixture", { from: "2026-09-01", to: "2026-09-27" });
+  await client.getUsagePrices("tsk_fixture");
+  const prices = { expectedRevision: 1, rows: [{ runtime: "codex", model: "test" }] };
+  await client.setUsagePrices("tsk_fixture", prices);
+
+  assert.deepEqual(
+    calls.map(({ url, init }) => [url, init.method]),
+    [
+      ["https://hub.example/v1/tasks/tsk_fixture/usage?from=2026-09-01&to=2026-09-27", "GET"],
+      ["https://hub.example/v1/tasks/tsk_fixture/usage/prices", "GET"],
+      ["https://hub.example/v1/tasks/tsk_fixture/usage/prices", "PUT"],
+    ],
+  );
+  assert.deepEqual(JSON.parse(calls[2].init.body), prices);
+  assert.equal(calls[2].init.headers["Content-Type"], "application/json");
+});
 test("exact fractional comparison and unknown presentation", () => {
   assert.equal(compareRational("21/2", "10"), 1);
   assert.equal(compareRational("9007199254740993", "9007199254740992"), 1);

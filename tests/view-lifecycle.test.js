@@ -7,23 +7,49 @@ import {
 } from "../client/board-view.js";
 import { createTasksView } from "../client/tasks-view.js";
 import { createWorkItemsView } from "../client/work-items-view.js";
-const root = () => ({
-  innerHTML: "",
-  nodes: new Map(),
-  querySelector(q) {
-    if (!this.nodes.has(q))
-      this.nodes.set(q, {
-        value: "",
-        classList: { add() {}, remove() {} },
-        querySelector: () => null,
-        querySelectorAll: () => [],
-      });
-    return this.nodes.get(q);
-  },
-  querySelectorAll() {
-    return [];
-  },
-});
+const root = () => {
+  const usage = {
+    innerHTML: "",
+    scrollTop: 0,
+    nodes: new Map(),
+    querySelector(selector) {
+      const attribute = /^\[([^\]=]+)(?:="([^"]+)")?\]$/.exec(selector);
+      if (
+        !attribute ||
+        !this.innerHTML.includes(
+          attribute[2]
+            ? `${attribute[1]}="${attribute[2]}"`
+            : attribute[1],
+        )
+      )
+        return null;
+      if (!this.nodes.has(selector)) this.nodes.set(selector, { value: "" });
+      return this.nodes.get(selector);
+    },
+    querySelectorAll() {
+      return [];
+    },
+  };
+  return {
+    innerHTML: "",
+    nodes: new Map(),
+    querySelector(q) {
+      if (q === "[data-project-usage]")
+        return this.innerHTML.includes("data-project-usage") ? usage : null;
+      if (!this.nodes.has(q))
+        this.nodes.set(q, {
+          value: "",
+          classList: { add() {}, remove() {} },
+          querySelector: () => null,
+          querySelectorAll: () => [],
+        });
+      return this.nodes.get(q);
+    },
+    querySelectorAll() {
+      return [];
+    },
+  };
+};
 const deferred = () => {
   let resolve;
   const promise = new Promise((r) => (resolve = r));

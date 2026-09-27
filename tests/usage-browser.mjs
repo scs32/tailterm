@@ -90,6 +90,16 @@ try {
         );
       await page.locator("[data-usage-disclosure] > summary").click();
       await page.locator("[data-usage-item]").first().waitFor();
+      const usageStyle = await page.evaluate(() => {
+        const items = document.querySelector(".usage-items");
+        const item = document.querySelector(".usage-item");
+        return {
+          layout: getComputedStyle(items).display,
+          border: getComputedStyle(item).borderTopWidth,
+          radius: getComputedStyle(item).borderTopLeftRadius,
+        };
+      });
+      assert.deepEqual(usageStyle, { layout: "grid", border: "1px", radius: "4px" });
       let titles = await page
         .locator("[data-usage-item] > summary")
         .allTextContents();
