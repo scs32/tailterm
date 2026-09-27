@@ -388,3 +388,72 @@ func TestUsageReassignedObligationAndBindingFallbackSurviveBadAck(t *testing.T) 
 		t.Fatal("reassignment or exact binding discarded", report, err)
 	}
 }
+
+func TestUsageClaudeInclusiveOutputReportAndPricing(t *testing.T) {
+	for _, known := range []bool{false, true} {
+		t.Run(fmt.Sprint(known), func(t *testing.T) {
+			s, task, _, items, _ := usageFixture(t)
+			ctx := context.Background()
+			by := api.Caller{Node: "fixture", User: "owner"}
+			a, err := s.AddAgent(ctx, task.ID, api.AddAgentRequest{AgentID: api.NewID("agt"), Name: "focused-claude", Host: "fixture", Session: "synthetic", Runtime: "claude", Role: api.AgentRoleDatabaseHandler}, by)
+			if err != nil {
+				t.Fatal(err)
+			}
+			m, err := s.PostMessage(ctx, task.ID, api.PostMessageRequest{To: a.ID, RequestID: "focused-order", WorkItems: []api.MessageWorkItem{{ItemTaskID: task.ID, ItemID: items[0].ID, ItemRevision: 1, Relationship: "primary"}}, Envelope: &api.Envelope{Kind: "request", To: a.ID, Subject: "Handle focused synthetic evidence", Body: api.EnvelopeBody{Ask: "Record fixture"}}}, by)
+			if err != nil {
+				t.Fatal(err)
+			}
+			turn := syntheticUsageTurn("focused-output")
+			turn.Runtime = "claude"
+			turn.Model = "focused-model"
+			turn.Raw = map[string]int64{"input_tokens": 2, "cache_read_input_tokens": 3, "cache_creation_input_tokens": 4, "output_tokens": 7}
+			if known {
+				turn.Raw["output_tokens_details.thinking_tokens"] = 2
+			}
+			turn.Tokens, turn.Gap = api.NormalizeUsageTokens(turn.Runtime, turn.Raw)
+			turn.Handled = []api.UsageEvidence{{TaskID: task.ID, Seq: m.Seq, Operation: "ack", At: turn.At}}
+			if _, err = s.ReportUsage(ctx, task.ID, a.ID, usageBatch(a, "focused-output", turn)); err != nil {
+				t.Fatal(err)
+			}
+			if _, err = s.SetUsagePrices(ctx, task.ID, api.UsagePriceRequest{RequestID: "focused-prices", Rows: []api.UsagePrice{{Runtime: "claude", Model: turn.Model, Currency: "USD", EffectiveAt: turn.At, Rates: map[string]string{"input": "1", "cached": "1", "cacheWrite": "1", "output": "2", "reasoning": "3"}}}}); err != nil {
+				t.Fatal(err)
+			}
+			check := func(output, cost, state string, complete bool) {
+				t.Helper()
+				report, err := s.Usage(ctx, task.ID, api.UsageQuery{Item: items[0].ID})
+				if err != nil {
+					t.Fatal(err)
+				}
+				item := report.Items[0]
+				summaries := []api.UsageSummary{report.Summary, item.Summary, item.Phases[0].Summary, item.Roles[0].Summary, item.Models[0].Summary, item.PhaseRoles[0].Summary}
+				for _, summary := range summaries {
+					if summary.Requests != 1 || summary.Tokens["output"] != output || summary.PricedSubtotal["USD"] != cost || summary.State != state || summary.CostComplete != complete {
+						t.Fatal(summary)
+					}
+				}
+				if !complete {
+					if _, invented := report.Summary.Tokens["reasoning"]; invented || report.Summary.MeasuredRequests["reasoning"] != 0 {
+						t.Fatal("missing reasoning fabricated", report.Summary)
+					}
+				} else if report.Summary.Tokens["reasoning"] != "2" {
+					t.Fatal(report)
+				}
+			}
+			if known {
+				check("5", "1/40000", "measured", true)
+			} else {
+				check("7", "23/1000000", "partial", false)
+				// A later known subset revises the same complete request: retain inclusive
+				// provider output in Raw, replace its chargeable split, never add it twice.
+				turn.Revision = 2
+				turn.Raw["output_tokens_details.thinking_tokens"] = 2
+				turn.Tokens, turn.Gap = api.NormalizeUsageTokens(turn.Runtime, turn.Raw)
+				turn.SourceDigest = strings.Repeat("b", 64)
+				if _, err = s.ReportUsage(ctx, task.ID, a.ID, usageBatch(a, "focused-output-late", turn)); err != nil {
+					t.Fatal(err)
+				}
+				check("5", "1/40000", "measured", true)
+			}
+		})
+	}
+}

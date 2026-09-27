@@ -10,7 +10,9 @@ const UsageVersion = 1
 
 var UsageClasses = []string{"input", "cached", "cacheWrite", "output", "reasoning"}
 
-// Absent classes are unavailable, not measured zero. Classes are disjoint;
+// Absent classes are unavailable, not measured zero. Fully measured classes
+// are disjoint. Partial Claude output can remain inclusive with unavailable
+// reasoning, explicitly identified in Gap; never add missing reasoning as zero.
 // Raw retains provider quantities before normalization, without transcript text.
 type UsageTurn struct {
 	ID           string           `json:"id"`
@@ -201,8 +203,12 @@ func NormalizeUsageTokens(runtime string, raw map[string]int64) (map[string]int6
 		if output, ok := out["output"]; ok {
 			reasoning, rok := out["reasoning"]
 			if !rok {
-				delete(out, "output")
-				gap = "reasoning subset unavailable"
+				if runtime == "claude" {
+					gap = "reasoning unavailable; output retained inclusive"
+				} else {
+					delete(out, "output")
+					gap = "reasoning subset unavailable"
+				}
 			} else if reasoning > output {
 				delete(out, "output")
 				gap = "reasoning exceeds inclusive output"

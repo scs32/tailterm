@@ -546,7 +546,7 @@ func TestUsageNullClassesStayUnavailable(t *testing.T) {
 		t.Fatal(raw)
 	}
 	tokens, gap := normalizeUsage("claude", raw)
-	if _, ok := tokens["output"]; ok || gap == "" {
+	if tokens["output"] != 7 || gap == "" {
 		t.Fatal(tokens, gap)
 	}
 }
@@ -577,5 +577,29 @@ func TestUsageLiveRejectedBatchQuarantinesAndNextRequestContinues(t *testing.T) 
 	restarted.LastUploadAttempt = time.Time{}
 	if err = uploadUsage(context.Background(), restarted, c); err != nil || len(accepted.Turns) != 1 || accepted.Turns[0].ID != "claude-next" || !strings.Contains(accepted.Coverage, "upload rejected 409") {
 		t.Fatal(accepted, err)
+	}
+}
+
+func TestUsageClaudeAbsentNullAndPresentThinkingPreservesOutput(t *testing.T) {
+	for _, spec := range []struct {
+		name, details string
+		output        int64
+		known         bool
+	}{{"absent", "", 7, false}, {"null-details", `,"output_tokens_details":null`, 7, false}, {"null-thinking", `,"output_tokens_details":{"thinking_tokens":null}`, 7, false}, {"present", `,"output_tokens_details":{"thinking_tokens":2}`, 5, true}} {
+		t.Run(spec.name, func(t *testing.T) {
+			u := newSyntheticUsage(t, "claude")
+			parseUsageLines(t, u, `{"type":"user","timestamp":"2026-09-27T10:00:00Z","message":{"content":"synthetic"}}`, fmt.Sprintf(`{"type":"assistant","timestamp":"2026-09-27T10:00:01Z","message":{"id":"focused","model":"m","stop_reason":"end_turn","usage":{"input_tokens":2,"cache_read_input_tokens":3,"cache_creation_input_tokens":4,"output_tokens":7%s}}}`, spec.details))
+			turn := u.Turns["claude-focused"]
+			reasoning, known := turn.Tokens["reasoning"]
+			if turn.Tokens["output"] != spec.output || known != spec.known || !turn.Complete {
+				t.Fatal(turn)
+			}
+			if spec.known && (reasoning != 2 || turn.Gap != "") {
+				t.Fatal(turn)
+			}
+			if !spec.known && turn.Gap == "" {
+				t.Fatal("missing reasoning not explicit", turn)
+			}
+		})
 	}
 }

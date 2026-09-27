@@ -39,3 +39,19 @@ func TestUsageRealShapedClassesAndUncertainCodexWriteOverlap(t *testing.T) {
 		t.Fatal(got, gap)
 	}
 }
+
+func TestUsageClaudeAbsentThinkingPreservesInclusiveOutput(t *testing.T) {
+	raw := map[string]int64{"input_tokens": 2, "cache_read_input_tokens": 3, "cache_creation_input_tokens": 4, "output_tokens": 7}
+	got, gap := NormalizeUsageTokens("claude", raw)
+	if got["output"] != 7 || gap == "" {
+		t.Fatal("known output lost", got, gap)
+	}
+	if _, known := got["reasoning"]; known {
+		t.Fatal("reasoning fabricated", got)
+	}
+	raw["output_tokens_details.thinking_tokens"] = 2
+	got, gap = NormalizeUsageTokens("claude", raw)
+	if got["output"] != 5 || got["reasoning"] != 2 || gap != "" {
+		t.Fatal("thinking double counted", got, gap)
+	}
+}
