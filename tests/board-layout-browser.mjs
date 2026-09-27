@@ -248,7 +248,7 @@ async function actions(page) {
   await page.evaluate(() => qa.state.failWrites = false);
 
   await show(page, "tasks");
-  await page.locator("details > summary").click();
+  await page.locator(".tasks-closed > summary").click();
   await page.locator(`${selectors.tasks}[data-task-select="tsk_3333333333333333"]`).click();
   await expect(page.locator("[data-task-board]")).toContainText("history");
   await page.locator("[data-task-cleanup]").click(); await called("cleanup");
