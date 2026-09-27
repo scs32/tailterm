@@ -56,13 +56,13 @@ export async function liveCheck(adapter, target, policy, sleep=ms=>new Promise(r
 export async function runRelease(config, adapter) {
   const {cwd,job,baselines,journalPath}=config;
   const policy={startupMs:60000,failures:3,intervalMs:5000,relayCleanMs:30000,...config.testPolicy};
-  if(!job || job.state!=="claimed" || !sha(job.commit) || !/^[a-f0-9]{64}$/.test(job.verificationDigest||""))throw new Error("Claimed verified job required");
+  if(!job || !(["claimed","merged"].includes(job.state)) || !sha(job.commit) || !/^[a-f0-9]{64}$/.test(job.verificationDigest||""))throw new Error("Claimed verified job required");
   const lock=join(tmpdir(),"tailterm-release-locks",digest(cwd+"\0"+(job.taskId||"fixture"))+".lock");mkdirSync(dirname(lock),{recursive:true,mode:0o700});
   let fd;try{fd=openSync(lock,"wx",0o600);}catch{throw new Error("Release host locked; inspect prior execution");}
   let state={version:1,jobId:job.id,commit:job.commit,phase:"prepared",effects:[]};
   if(existsSync(journalPath)){
     const prior=JSON.parse(readFileSync(journalPath,"utf8"));
-    if(prior.jobId===job.id && prior.commit===job.commit && prior.phase==="waiting_matrix" && !prior.effects.length && git(cwd,"rev-parse","HEAD")===prior.integrated && !git(cwd,"status","--porcelain")) {state=prior;}
+    if(prior.jobId===job.id && prior.commit===job.commit && (prior.phase==="waiting_matrix" || prior.phase==="receipt_pending" || prior.phase==="finishing") && (prior.phase!=="waiting_matrix" || !prior.effects.length) && git(cwd,"rev-parse","HEAD")===prior.integrated && !git(cwd,"status","--porcelain")) {state=prior;}
     else {
       closeSync(fd);rmSync(lock);
       if(prior.jobId===job.id && prior.commit===job.commit && prior.phase==="complete") return prior.receipt;
@@ -72,6 +72,9 @@ export async function runRelease(config, adapter) {
   const checkpoint=()=>save(journalPath,state);
   const fence=async()=>{if(await adapter.fence(job)!==true)throw new Error("Exact release fence lost");};
   try {
+    if(state.phase==="receipt_pending" || state.phase==="finishing"){
+      await adapter.finish(state.receipt,state.finishGeneration);state.phase="complete";checkpoint();return state.receipt;
+    }
     checkpoint();await fence();
     const integration=state.phase==="waiting_matrix"?{expected:state.expected,integrated:state.integrated}:integrateCandidate(cwd,job);state.integrated=integration.integrated;state.expected=integration.expected;state.phase="integrated";checkpoint();
     if(integration.integrated!==job.commit){
@@ -95,8 +98,11 @@ export async function runRelease(config, adapter) {
       if(!await liveCheck(adapter,target,policy,config.sleep,config.now))throw new Error("Live verification failed");
       record.outcome="released";state.effects.at(-1).state="verified";checkpoint();
     }
-    state.receipt=receipt;state.phase="finishing";checkpoint();await fence();await adapter.finish(receipt);state.phase="complete";checkpoint();return receipt;
+    state.receipt=receipt;state.phase="finishing";checkpoint();await fence();state.finishGeneration=adapter.job?.generation??job.generation;checkpoint();await adapter.finish(receipt,state.finishGeneration);state.phase="complete";checkpoint();return receipt;
   } catch {
+    if(state.phase==="finishing" || state.phase==="receipt_pending"){
+      state.phase="receipt_pending";checkpoint();return {jobId:job.id,outcome:"receipt_pending"};
+    }
     // An uncertain side effect cannot be replayed. Rollback uses only retained
     // target artifacts; the adapter must never restore an old live database.
     let blocked=state.effects.length===0;
@@ -126,8 +132,8 @@ export class HostAdapter {
     if(!Array.isArray(argv)||!argv.length||argv.some(a=>typeof a!=="string"||/[\0\r\n]/.test(a)))throw new Error("Invalid host operation argv");
     try{return execFileSync(argv[0],argv.slice(1),{cwd,encoding:"utf8",stdio:["ignore","pipe","pipe"],maxBuffer:8*1024*1024,timeout:600000});}catch{throw new Error("Host operation failed");}
   }
-  native(operation,extra=[]){
-    const args=[this.config.tt||"tt","deployment",operation,"--job",this.job.id,"--generation",String(this.job.generation),"--request-id",`${this.job.id}-${operation}-${this.job.generation}`,...extra];
+  native(operation,extra=[],expectedGeneration=this.job.generation){
+    const args=[this.config.tt||"tt","deployment",operation,"--job",this.job.id,"--generation",String(expectedGeneration),"--request-id",`${this.job.id}-${operation}-${expectedGeneration}`,...extra];
     this.job=JSON.parse(this.command(args));return this.job;
   }
   async fence(){try{this.native("check");return true;}catch{return false;}}
@@ -166,7 +172,10 @@ export class HostAdapter {
   }
   async rehearse(a){
     if(!a.backupCopy || !a.migrationBinary)throw new Error("Handler backup-copy import required");
-    this.command([a.migrationBinary,"--migrate-only",a.backupCopy]);
+    if(fileDigest(a.backupCopy)!==a.backupSHA256)throw new Error("Imported backup hash mismatch");
+    const {copyFileSync}=await import("node:fs");const copy=a.backupCopy+".rehearsal-"+this.job.id;
+    if(existsSync(copy))throw new Error("Rehearsal copy already exists; inspect prior attempt");copyFileSync(a.backupCopy,copy);
+    this.command([a.migrationBinary,"--migrate-only",copy]);
     return true;
   }
   async deploy(target,a){
@@ -206,19 +215,34 @@ export class HostAdapter {
     }else{this.command(a.rollbackProgram);}
     const r=JSON.parse(this.command(a.rollbackProbe));return r.restored===true && r.databaseWritesPreserved===true;
   }
-  async finish(receipt){const path=join(dirname(this.config.journalPath),"receipt.json");save(path,receipt);this.native("finish",["--file",path]);}
+  async finish(receipt,expectedGeneration){const path=join(this.config.journalDirectory || dirname(this.config.journalPath),this.job.id+"-receipt.json");save(path,receipt);this.native("finish",["--file",path],expectedGeneration);}
   async block(){this.native("block");}
   async escalate(){
-    this.command([this.config.tt||"tt","post",`Release failed for ${this.job.id}; inspect the private host journal. Automatic rollback attempted once; handler reconciliation required.`]);
+    return this.command([this.config.tt||"tt","send","--kind","notice","--subject","Release failed and requires recovery","--text",`Release failed for ${this.job.id}; inspect the private host journal. Automatic rollback attempted once; handler reconciliation required.`,"--request-id",`${this.job.id}-release-failure`,"--ref",`release-job=${this.job.id}`]);
   }
 }
 
+export function runnableJob(jobs,agent,run){
+  const owned=jobs.find(j=>["claimed","merged"].includes(j.state) && j.agentId===agent && j.runId===run);
+  if(owned)return owned;
+  if(jobs.some(j=>["claimed","merged","blocked"].includes(j.state)))return null;
+  return jobs.find(j=>j.state==="verified")||null;
+}
+export function reconcileReceipts(config,jobs){
+  for(const job of jobs){
+    if(!job.receipt)continue;
+    const path=join(config.journalDirectory,job.id+".json");if(!existsSync(path))continue;
+    const journal=JSON.parse(readFileSync(path,"utf8"));
+    if(["finishing","receipt_pending"].includes(journal.phase) && journal.jobId===job.id && digest(journal.receipt)===digest(job.receipt)){journal.phase="complete";save(path,journal);}
+  }
+}
 export async function serveDeployment(config,{once=false,signal}={}) {
   if(config.version!==1 || config.enabled!==true || !config.cwd || !config.journalDirectory)throw new Error("Explicit private activation config required");
   while(!signal?.aborted){
     const reader=new HostAdapter(config,{});
     const jobs=JSON.parse(reader.command([config.tt||"tt","deployment","list"]));
-    const job=jobs.find(j=>j.state==="verified") || jobs.find(j=>j.state==="claimed" && j.agentId===process.env.TAILTERM_AGENT && j.runId===process.env.TAILTERM_RUN);
+    reconcileReceipts(config,jobs);
+    const job=runnableJob(jobs,process.env.TAILTERM_AGENT,process.env.TAILTERM_RUN);
     if(job){
       const adapter=new HostAdapter(config,job);
       if(job.state==="verified")adapter.native("claim");
@@ -226,7 +250,7 @@ export async function serveDeployment(config,{once=false,signal}={}) {
       const baselines={...config.baselines};
       for(const released of jobs){if(released.receipt?.outcome!=="released")continue;for(const t of released.receipt.targets){if(t.outcome==="released")baselines[t.target]=released.receipt.commit;}}
       const {testPolicy,sleep,now,...activation}=config;
-      await runRelease({...activation,baselines,job:current,journalPath:join(config.journalDirectory,current.id+".json")},adapter);
+      try{await runRelease({...activation,baselines,job:current,journalPath:join(config.journalDirectory,current.id+".json")},adapter);}catch{process.stderr.write("Release held; inspect handler fence and private journal.\n");}
     }
     if(once)return;
     await new Promise(r=>setTimeout(r,30000));

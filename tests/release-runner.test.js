@@ -4,7 +4,7 @@ import {mkdtempSync,mkdirSync,writeFileSync,readFileSync} from "node:fs";
 import {tmpdir} from "node:os";
 import {join} from "node:path";
 import {execFileSync} from "node:child_process";
-import {integrateCandidate,publishIntegration,runRelease,liveCheck} from "../scripts/release-runner.mjs";
+import {integrateCandidate,publishIntegration,runRelease,liveCheck,runnableJob,HostAdapter} from "../scripts/release-runner.mjs";
 import {targetsForPaths,selectReleaseTargets} from "../scripts/release-targets.mjs";
 const git=(cwd,...args)=>execFileSync("git",args,{cwd,encoding:"utf8",stdio:["ignore","pipe","pipe"]}).trim();
 function fixture(){const cwd=mkdtempSync(join(tmpdir(),"release-git-"));git(cwd,"init","-b","tasks-hub");git(cwd,"config","user.email","fixture@example.invalid");git(cwd,"config","user.name","Fixture");mkdirSync(join(cwd,"client"));writeFileSync(join(cwd,"client/base.js"),"base");git(cwd,"add",".");git(cwd,"commit","-m","base");const base=git(cwd,"rev-parse","HEAD");git(cwd,"checkout","-b","candidate");return {cwd,base};}
@@ -36,4 +36,32 @@ test("schema rehearsal and external backup pin gate every TrueNAS mutation",asyn
  const f=fixture();mkdirSync(join(f.cwd,"hub/internal/api"),{recursive:true});const j=job(f,change(f,"hub/internal/api/fixture.go","fixture"));const c=config(f,j),a=fake();
  a.prepare=async()=>({release:"fixture",artifactSHA256:"b".repeat(64),backup:"copy",backupSHA256:"c".repeat(64),preflightReceiptSHA256:"d".repeat(64),schemaChanged:true});a.rehearse=async()=>false;
  await assert.rejects(runRelease(c,a));assert.ok(!a.calls.some(x=>x.startsWith("deploy:")));
+});
+
+test("daemon prioritizes its waiting claim and respects another run or blocked fence",()=>{
+ const waiting={id:"waiting",state:"claimed",agentId:"agent",runId:"run"},queued={id:"next",state:"verified"};
+ assert.equal(runnableJob([queued,waiting],"agent","run"),waiting);
+ assert.equal(runnableJob([queued,waiting],"agent","rotated"),null);
+ assert.equal(runnableJob([queued,{state:"blocked"}],"agent","run"),null);
+});
+test("uncertain final receipt storage retries the receipt and never rolls back verified targets",async()=>{
+ const f=fixture(),j=job(f,change(f,"client/a.js","a")),a=fake(),c=config(f,j);let finishes=0;
+ a.finish=async()=>{finishes++;if(finishes===1)throw new Error("response lost");};
+ assert.equal((await runRelease(c,a)).outcome,"receipt_pending");assert.ok(!a.calls.some(x=>x.startsWith("rollback:")||x==="escalate"));
+ const result=await runRelease(c,a);assert.equal(result.outcome,"released");assert.equal(finishes,2);assert.equal(a.calls.filter(x=>x==="deploy:tailos").length,1);
+});
+
+test("host Mini adapter uses atomic install and retained rollback without changing fixture database",async()=>{
+ const cwd=mkdtempSync(join(tmpdir(),"mini-adapter-")),install=join(cwd,"tt"),artifact=join(cwd,"next"),backup=join(cwd,"before"),db=join(cwd,"fixture.sqlite");
+ writeFileSync(install,"old CLI");writeFileSync(artifact,"new CLI");writeFileSync(db,"newer writes");
+ const a={installPath:install,artifactPath:artifact,rollbackPath:backup,rollbackSafe:true,relayRestart:[process.execPath,"-e","process.exit(0)"],rollbackProbe:[process.execPath,"-e","console.log(JSON.stringify({restored:true,databaseWritesPreserved:true}))"]};
+ const adapter=new HostAdapter({cwd,journalDirectory:cwd},{id:"rel_fixture"});adapter.artifacts.set("mini",a);
+ await adapter.deploy("mini",a);assert.equal(readFileSync(install,"utf8"),"new CLI");assert.equal(readFileSync(backup,"utf8"),"old CLI");
+ assert.equal(await adapter.rollback("mini"),true);assert.equal(readFileSync(install,"utf8"),"old CLI");assert.equal(readFileSync(db,"utf8"),"newer writes");
+});
+test("host receipt adapter writes its receipt beneath the provisioned journal directory",async()=>{
+ const cwd=mkdtempSync(join(tmpdir(),"receipt-adapter-")),adapter=new HostAdapter({cwd,journalDirectory:cwd},{id:"rel_fixture",generation:5});let args;
+ adapter.command=argv=>{args=argv;return JSON.stringify({id:"rel_fixture",generation:6,state:"released"});};
+ const receipt={version:1,jobId:"rel_fixture",outcome:"released"};await adapter.finish(receipt,5);
+ assert.deepEqual(JSON.parse(readFileSync(join(cwd,"rel_fixture-receipt.json"),"utf8")),receipt);assert.ok(args.includes("rel_fixture-finish-5"));
 });

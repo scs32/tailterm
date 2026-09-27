@@ -81,6 +81,10 @@ func main() {
 		if err != nil {
 			log.Fatal("migration rehearsal failed")
 		}
+		if err = st.ValidateReleaseDatabase(context.Background()); err != nil {
+			_ = st.Close()
+			log.Fatal("migration integrity failed")
+		}
 		if err = st.Close(); err != nil {
 			log.Fatal("migration close failed")
 		}

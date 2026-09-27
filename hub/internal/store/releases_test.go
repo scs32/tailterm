@@ -195,3 +195,31 @@ func TestReleaseUnavailableHeartbeatPauseAndImportedMatrix(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestReleaseRehearsalRejectsForeignKeyDamage(t *testing.T) {
+	s, _, _, _, _ := releaseFixture(t)
+	ctx := context.Background()
+	if err := s.ValidateReleaseDatabase(ctx); err != nil {
+		t.Fatal(err)
+	}
+	// Synthetic orphan on a single connection models a structurally valid but
+	// semantically damaged imported backup without printing any row contents.
+	conn, err := s.db.Conn(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	if _, err = conn.ExecContext(ctx, `PRAGMA foreign_keys=OFF`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = conn.ExecContext(ctx, `UPDATE agents SET task_id='missing-fixture-task'`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = conn.ExecContext(ctx, `PRAGMA foreign_keys=ON`); err != nil {
+		t.Fatal(err)
+	}
+	conn.Close()
+	if err = s.ValidateReleaseDatabase(ctx); err == nil {
+		t.Fatal("damaged backup passed rehearsal")
+	}
+}

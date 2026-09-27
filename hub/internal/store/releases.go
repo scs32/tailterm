@@ -303,3 +303,23 @@ func (s *Store) ReleaseAction(ctx context.Context, task string, req api.ReleaseR
 	s.notify(task)
 	return j, nil
 }
+
+// ValidateReleaseDatabase checks a rehearsal copy without returning user data.
+func (s *Store) ValidateReleaseDatabase(ctx context.Context) error {
+	var integrity string
+	if err := s.db.QueryRowContext(ctx, `PRAGMA integrity_check`).Scan(&integrity); err != nil {
+		return err
+	}
+	if integrity != "ok" {
+		return releaseConflict("migration integrity failure")
+	}
+	rows, err := s.db.QueryContext(ctx, `PRAGMA foreign_key_check`)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	if rows.Next() {
+		return releaseConflict("migration foreign key failure")
+	}
+	return rows.Err()
+}

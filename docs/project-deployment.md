@@ -41,7 +41,7 @@ bases, conflicts, verification mismatches and release-ref races. A changed SHA
 waits before publication for a separate handler-imported release verification
 receipt covering the approved matrix on that exact integrated commit. The
 waiting-matrix journal can resume only with the same clean detached commit;
-other unfinished journals require reconciliation. The release branch update
+other unfinished journals require reconciliation. A lost final-receipt response retains receipt_pending and retries the same write-once receipt without rolling back live-verified targets; saved hub receipts reconcile that local pending state. The daemon prioritizes its own waiting claim and refuses a later release while another claim or blocked fence remains. The release branch update
 uses Git compare-and-swap. No Git push is performed.
 
 Targets are selected from each target's last successful commit through the
