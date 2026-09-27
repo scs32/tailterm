@@ -664,3 +664,21 @@ test("the optional Discord bridge is validated all-or-none and runs beside the h
     assert.match(JSON.parse(probe(plan).stdout).error, new RegExp(field));
   }
 });
+
+test("selected targets validate immutable retained mounts before remote effects", () => {
+  const directory=workspace("target-selection"),base="/mnt/deepfreeze/tailterm-hub";
+  const plan=planFor(directory,{});
+  Object.assign(plan.deployment,{releaseName:"new",binaryDestination:`${base}/releases/new/tailterm-hub`,targets:["hub"],discordTokenPath:`${base}/discord-token`,bridgeTokenPath:`${base}/bridge-token`,bridgeBinaryDestination:`${base}/releases/previous/tailterm-discord`,bridgeStateDirectory:`${base}/bridge-state`,discordGuildId:"123",discordApplicationId:"456",discordOwnerIds:"789",tailosUrl:"https://tailos.tailarr.com"});
+  const probe=p=>spawnSync("python3",["-c",[
+    "import json,sys,importlib.util as u",
+    "sys.path.insert(0,'scripts')",
+    "import truenas_release_preflight as pre",
+    "spec=u.spec_from_file_location('dep','scripts/deploy-truenas-hub.py');dep=u.module_from_spec(spec);spec.loader.exec_module(dep)",
+    "try:",
+    " p=pre.validate_plan(json.load(sys.stdin));print(json.dumps(dep.hub_compose(p['deployment'],p['deployment']['binaryDestination'])))",
+    "except pre.PreflightFailure as e: print(json.dumps({'error':e.message}))",
+  ].join("\n")],{cwd:root,input:JSON.stringify(p),encoding:"utf8"});
+  const valid=JSON.parse(probe(plan).stdout);assert.ok(valid.services['discord-bridge'].volumes.includes(`${base}/releases/previous/tailterm-discord:/opt/tailterm-discord:ro`));
+  for(const targets of [[],["hub","hub"],["unknown"],[{}]]){const p=structuredClone(plan);p.deployment.targets=targets;assert.match(JSON.parse(probe(p).stdout).error,/targets/);}
+  for(const bad of [`${base}/state/not-a-binary`,`${base}/releases/../tailterm-discord`,"/etc/private"]){const p=structuredClone(plan);p.deployment.bridgeBinaryDestination=bad;assert.match(JSON.parse(probe(p).stdout).error,/mount|plain path/);}
+});

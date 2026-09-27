@@ -326,6 +326,17 @@ func (s *Store) ListTeamQueue(ctx context.Context, task string) (api.TeamQueueLi
 	if err := rows.Close(); err != nil {
 		return out, err
 	}
+	releases, err := s.Releases(ctx, task)
+	if err != nil {
+		return out, err
+	}
+	for i := range out.Entries {
+		for j := range releases {
+			if releases[j].EntryID == out.Entries[i].ID {
+				out.Entries[i].Release = &releases[j]
+			}
+		}
+	}
 	activeCount := 0
 	for i, entry := range out.Entries {
 		summary, summaryErr := reviewState(ctx, s.db, out.Entries[i].TaskID, out.Entries[i].ItemID)
@@ -1285,6 +1296,30 @@ func (s *Store) TeamQueueAction(ctx context.Context, task string, req api.TeamQu
 		}
 	default:
 		return zero, api.ErrInvalid
+	}
+	// Acceptance with a native exact-SHA receipt durably enqueues delivery in
+	// the same transaction. Legacy acceptance remains visibly unreleased.
+	if req.Operation == "accept" {
+		records, loadErr := verificationRecords(ctx, tx, task, e.ItemID)
+		if loadErr != nil {
+			return zero, loadErr
+		}
+		plan, receipt := currentVerification(records)
+		if plan != nil && receipt != nil {
+			_, p, r, gateErr := releaseCandidate(ctx, tx, task, e.ID)
+			if gateErr != nil {
+				return zero, gateErr
+			}
+			j := api.ReleaseJob{ID: api.NewID("rel"), TaskID: task, EntryID: e.ID, ItemID: e.ItemID, ItemRevision: e.Acceptance.ItemRevision, ScopeRevision: p.ScopeRevision, OrderMessageSeq: p.OrderMessageSeq, Repository: p.Repository, BaseCommit: p.BaseCommit, Commit: p.Commit, VerificationDigest: verificationDigest(r), Plan: p, State: "verified", Generation: 1, PauseGeneration: t.PauseGeneration}
+			b, marshalErr := json.Marshal(j)
+			if marshalErr != nil {
+				return zero, marshalErr
+			}
+			if _, insertErr := tx.ExecContext(ctx, `INSERT INTO release_jobs VALUES(?,?,?,?,?,?)`, task, j.ID, e.ID, j.State, j.Generation, string(b)); insertErr != nil {
+				return zero, insertErr
+			}
+			e.Release = &j
+		}
 	}
 	if req.Operation == "reorder" {
 		e, err = scanTeamQueue(tx.QueryRowContext(ctx, `SELECT `+teamQueueCols+` FROM team_queue_entries WHERE id=?`, e.ID))

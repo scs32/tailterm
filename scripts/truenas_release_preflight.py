@@ -197,7 +197,7 @@ def validate_plan(plan: Any) -> dict[str, Any]:
         "tcpListener",
     }
     # Optional: a Jev (TypeSafe) API key file mounted read-only into the hub.
-    optional_fields = {"typesafeKeyPath"}
+    optional_fields = {"typesafeKeyPath", "targets"}
     # Optional, all or none: the Discord bridge (broker phase 2b).
     bridge_fields = {
         "discordTokenPath",
@@ -217,8 +217,22 @@ def validate_plan(plan: Any) -> dict[str, Any]:
         )
     normalized_deployment = {
         field: _string(deployment.get(field), f"deployment.{field}")
-        for field in sorted(set(deployment))
+        for field in sorted(set(deployment) - {"targets"})
     }
+    if "targets" in deployment:
+        targets = deployment["targets"]
+        if (not isinstance(targets, list) or not targets or
+                any(not isinstance(t, str) or t not in ("hub", "bridge") for t in targets) or
+                len(targets) != len(set(targets)) or
+                ("bridge" in targets and "discordTokenPath" not in deployment)):
+            raise PreflightFailure("invalid-input", "deployment.targets must select configured hub/bridge targets once")
+        normalized_deployment["targets"] = targets
+        for target, field, binary in (("hub", "binaryDestination", "tailterm-hub"),
+                                       ("bridge", "bridgeBinaryDestination", "tailterm-discord")):
+            value = normalized_deployment.get(field)
+            if value is not None and not re.fullmatch(
+                    r"/mnt/deepfreeze/tailterm-hub/releases/[A-Za-z0-9._-]+/" + binary, value):
+                raise PreflightFailure("invalid-input", f"deployment.{field} must be an immutable release mount")
     for field in ("typesafeKeyPath", "discordTokenPath", "bridgeTokenPath", "bridgeBinaryDestination", "bridgeStateDirectory"):
         path = normalized_deployment.get(field)
         if path is not None and (

@@ -36,6 +36,7 @@ Commands
   status                       identity, hub reachability, own agent, unread count
   projects                     list projects on the hub (tasks is an alias)
   project-pause <get|pause|handoff|resume>  explicit project team lifecycle
+  deployment <list|enqueue|claim|check|verification|merged|finish|block>  release ledger
   verification <plan|receipt|history|enrollment>  handler-owned native verification records
   work-items <command>         list/get/create/update/dispatch/history/evidence for bugs and features
   queue <command>              list/get/history/changes/action/receipt for deliberate Queue work
@@ -180,6 +181,8 @@ func main() {
 		err = cmdTasks(e, args)
 	case "project-pause":
 		err = cmdProjectPause(e, args)
+	case "deployment":
+		err = cmdDeployment(e, args)
 	case "verification":
 		err = cmdVerification(e, args)
 	case "work-items":
@@ -829,10 +832,10 @@ func cmdSpawn(e env, args []string) error {
 	if !api.ValidName(*name) {
 		return errors.New("name must match [A-Za-z0-9_-]{1,64}")
 	}
-	if *role != "" && *role != api.AgentRoleDatabaseHandler {
-		return errors.New("role must be database_handler when set")
+	if *role != "" && *role != api.AgentRoleDatabaseHandler && *role != api.AgentRoleDeployment {
+		return errors.New("role must be database_handler or deployment_agent when set")
 	}
-	if *role == api.AgentRoleDatabaseHandler && !api.ValidID(*agentID, "agt") {
+	if (*role == api.AgentRoleDatabaseHandler || *role == api.AgentRoleDeployment) && !api.ValidID(*agentID, "agt") {
 		return errors.New("database_handler requires a stable --agent-id")
 	}
 	if *agentID != "" && !api.ValidID(*agentID, "agt") {
@@ -1052,7 +1055,7 @@ func cmdSpawn(e env, args []string) error {
 		briefing += "\nAssignment: " + *prompt
 	}
 	if *runtime != "generic" {
-		if *role == api.AgentRoleDatabaseHandler {
+		if *role == api.AgentRoleDatabaseHandler || *role == api.AgentRoleDeployment {
 			command, err = freshRuntimeCommand(baseCommand, *runtime, *agentID, briefing)
 			if err != nil {
 				return err
@@ -1062,7 +1065,7 @@ func cmdSpawn(e env, args []string) error {
 		}
 	}
 	parent := e.agent
-	if *role == api.AgentRoleDatabaseHandler {
+	if *role == api.AgentRoleDatabaseHandler || *role == api.AgentRoleDeployment {
 		parent = ""
 	}
 	req := api.AddAgentRequest{
@@ -1099,7 +1102,7 @@ func cmdSpawn(e env, args []string) error {
 		opts.Env["TT_TMUX_SOCKET"] = socket
 	}
 	var agent api.Agent
-	if *role == api.AgentRoleDatabaseHandler {
+	if *role == api.AgentRoleDatabaseHandler || *role == api.AgentRoleDeployment {
 		agent, err = ensureHandler(ctx, c, *task, req, opts)
 		if err != nil {
 			return err
@@ -1236,7 +1239,7 @@ func cmdClose(e env, args []string) error {
 	if err != nil {
 		return err
 	}
-	if a.Role == api.AgentRoleDatabaseHandler {
+	if a.Role == api.AgentRoleDatabaseHandler || a.Role == api.AgentRoleDeployment {
 		return errors.New("the active database handler remains available while the project is open")
 	}
 	if detail.Task.Status == api.TaskOpen && detail.Task.Orchestrator != "" && strings.EqualFold(a.Name, detail.Task.Orchestrator) {

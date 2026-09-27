@@ -506,16 +506,16 @@ func (s *Store) AddAgent(ctx context.Context, taskID string, req api.AddAgentReq
 	if t.LifecycleGeneration != req.ExpectedLifecycleGeneration {
 		return api.Agent{}, fmt.Errorf("%w: project lifecycle generation changed; refresh before admission", api.ErrConflict)
 	}
-	if req.Role != "" && req.Role != api.AgentRoleDatabaseHandler {
+	if req.Role != "" && req.Role != api.AgentRoleDatabaseHandler && req.Role != api.AgentRoleDeployment {
 		return api.Agent{}, api.ErrInvalid
 	}
-	if req.Role == api.AgentRoleDatabaseHandler && req.ParentAgentID != "" {
+	if (req.Role == api.AgentRoleDatabaseHandler || req.Role == api.AgentRoleDeployment) && req.ParentAgentID != "" {
 		return api.Agent{}, api.ErrInvalid
 	}
-	if req.Role == api.AgentRoleDatabaseHandler && req.WorkItem != nil {
+	if (req.Role == api.AgentRoleDatabaseHandler || req.Role == api.AgentRoleDeployment) && req.WorkItem != nil {
 		return api.Agent{}, api.ErrInvalid
 	}
-	if req.Role == api.AgentRoleDatabaseHandler && !api.ValidID(req.AgentID, "agt") {
+	if (req.Role == api.AgentRoleDatabaseHandler || req.Role == api.AgentRoleDeployment) && !api.ValidID(req.AgentID, "agt") {
 		return api.Agent{}, api.ErrInvalid
 	}
 	if req.ExpectedRunID != "" && (!api.ValidID(req.AgentID, "agt") || !validRunID(req.ExpectedRunID)) {
@@ -586,7 +586,7 @@ func (s *Store) AddAgent(ctx context.Context, taskID string, req api.AddAgentReq
 			}
 		}
 	}
-	if req.ExpectedRunID != "" && req.Role != api.AgentRoleDatabaseHandler && resumeAdmission == nil && !queuePreallocated {
+	if req.ExpectedRunID != "" && req.Role != api.AgentRoleDatabaseHandler && req.Role != api.AgentRoleDeployment && resumeAdmission == nil && !queuePreallocated {
 		return api.Agent{}, api.ErrInvalid
 	}
 	if req.AgentID != "" {
@@ -605,11 +605,11 @@ func (s *Store) AddAgent(ctx context.Context, taskID string, req api.AddAgentReq
 			if existing.WorkItem != nil || (req.WorkItem != nil && req.Role == "") {
 				return api.Agent{}, fmt.Errorf("%w: item-bound agents require a fresh name and identity", api.ErrConflict)
 			}
-			if (existing.Role == api.AgentRoleDatabaseHandler || req.Role == api.AgentRoleDatabaseHandler) &&
+			if ((existing.Role == api.AgentRoleDatabaseHandler || existing.Role == api.AgentRoleDeployment) || (req.Role == api.AgentRoleDatabaseHandler || req.Role == api.AgentRoleDeployment)) &&
 				(existing.Name != req.Name || existing.Host != req.Host || existing.Session != req.Session || existing.Runtime != req.Runtime || existing.Cwd != req.Cwd || existing.ParentAgentID != req.ParentAgentID || existing.Role != req.Role) {
 				return api.Agent{}, fmt.Errorf("%w: database handler launch settings changed", api.ErrConflict)
 			}
-			if existing.Role == api.AgentRoleDatabaseHandler {
+			if existing.Role == api.AgentRoleDatabaseHandler || existing.Role == api.AgentRoleDeployment {
 				if existing.Status == api.AgentClosed {
 					return api.Agent{}, api.ErrClosed
 				}
@@ -679,7 +679,7 @@ func (s *Store) AddAgent(ctx context.Context, taskID string, req api.AddAgentReq
 		if e != nil {
 			return api.Agent{}, e
 		}
-		if req.Role == api.AgentRoleDatabaseHandler {
+		if req.Role == api.AgentRoleDatabaseHandler || req.Role == api.AgentRoleDeployment {
 			return api.Agent{}, fmt.Errorf("%w: database handler restart requires its stable agentId and expectedRunId", api.ErrConflict)
 		}
 		if req.WorkItem != nil {

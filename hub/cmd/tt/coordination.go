@@ -151,11 +151,14 @@ func agentTaskBriefing(t api.Task, name, role, selfPath string, agents []api.Age
 }
 
 func queueHandlerAcceptanceBriefing() string {
-	return "\nFor a queued item with a frozen repository, the exact leased handler must record integration acceptance after saving terminal acceptance for a done item and its completion report. Use `tt team queue list --task TASK` to find the entry and lease. After saving terminal acceptance, run `tt team queue accept --task TASK --entry ENTRY --worktree /absolute/accepted/builder/worktree --branch ACCEPTED_BRANCH --commit FULL_ACCEPTED_SHA --evidence 'handler-saved acceptance receipt'` from that exact leased handler run. The branch, SHA, worktree and evidence must be the saved accepted result, not the launch directory or a later HEAD. Confirm the queue acceptance receipt; if it fails, report the blocker and keep the item open. The runner then waits for exact close and cleanup before marking Ready to integrate. Integration remains owner-gated."
+	return "\nFor a queued item with a frozen repository, the exact leased handler must record integration acceptance after saving terminal acceptance for a done item and its completion report. Use `tt team queue list --task TASK` to find the entry and lease. After saving terminal acceptance, run `tt team queue accept --task TASK --entry ENTRY --worktree /absolute/accepted/builder/worktree --branch ACCEPTED_BRANCH --commit FULL_ACCEPTED_SHA --evidence 'handler-saved acceptance receipt'` from that exact leased handler run. The branch, SHA, worktree and evidence must be the saved accepted result, not the launch directory or a later HEAD. Confirm the queue acceptance receipt; if it fails, report the blocker and keep the item open. The runner then waits for exact close and cleanup before marking Ready to integrate. A native exact-SHA verification receipt now enqueues a release job atomically with acceptance; the persistent deployment agent consumes it automatically after project-level activation. Handler owns backup/preflight pins and changed integrated-SHA matrix import. Implementation orders do not activate production."
 }
 
 func agentTaskBriefingForLaunch(t api.Task, name, role, selfPath string, agents []api.Agent, plannedTeamMembers int) string {
 	briefing := taskBriefingForRoster(t, name, selfPath, agents, plannedTeamMembers)
+	if role == api.AgentRoleDeployment {
+		return briefing + deploymentBriefing()
+	}
 	if role == api.AgentRoleDatabaseHandler {
 		briefing += queueHandlerAcceptanceBriefing()
 		for _, existing := range agents {
