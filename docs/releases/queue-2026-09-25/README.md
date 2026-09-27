@@ -1,11 +1,15 @@
-# Queue releases: 2026-09-25 and 26
+# Queue releases: 2026-09-25 to 27
 
 Items delivered by the shadow-week team queue (`tsk_e7af3c28a444b09a`) after the overnight release
 [`cf80b46`](../overnight-cf80b46/README.md), each merged to `tasks-hub` and released from the
 owner's Claude Code session on the Mini. On 2026-09-25 from 09:31 to 18:00, and on 2026-09-26
-until 15:00, the owner authorized that session to make decisions, merges and deploys on its own
-recommendation. On 2026-09-26 the owner also said to release the queued items as they were
-accepted. Every item was built and reviewed by Tailterm agent teams on the board.
+until 18:00, the owner authorized that session to make decisions, merges and deploys on its own
+recommendation; from 19:37 that covered decisions only, until 23:59. On 2026-09-26 the owner also
+said to release queued items as they were accepted, and at about 19:25 extended that to the whole
+queue until the project's deployment agent takes over releases. Every queued item was built and
+reviewed by Tailterm agent teams on the board. Two fixes were made out-of-band by the owner's
+session, each announced on the board: `4b5adb2` (under the recommend-and-act window) and `c343819`
+(chosen by the owner in the terminal).
 
 The Discord server, application and owner IDs are redacted from the plan and receipt copies in
 the `hub-*` folders. The unredacted files are in `.build/*-release-*/`, and each pinned receipt
@@ -22,6 +26,14 @@ SHA-256 is of the unredacted receipt.
 | `33d3ab7` | Handler priority (`wi_7149909a1085b653`) | Live-team gates first; handler latency in `tt message-checks` | Hub `20260925-handler-priority-33d3ab7`, Mini `tt`, TailOS `64b64c0c` |
 | `6235924` | Parallel dispatch (`wi_0e910b68c82e91d6`), activity monitor (`wi_c738cdd5f9ef637b`), 390px roster fix (`wi_f415c845559a65b9`) | Up to N teams per project (default 1); relay agent activity states and token totals | Hub `20260926-parallel-activity-6235924`, Mini `tt`, TailOS `53b19023` |
 | `91a55e0` | Activity handler fix (`wi_24005da18408ab12`) | Classifies the database handler; no stale first report | Mini `tt` |
+| `7a49ec8` | Project work items (`wi_21a14f6e032ab182`) | The dispatch notice keeps its text when the ID-based fill runs | TailOS `ce71c43f` |
+| `3f083e1` | Docs (`wi_9f1fdba7cc969c0d`) | Task docs cover `tt team launch`/`queue`, `tt withdraw`, `tt close --team` | none (docs only) |
+| `0cab2fe` | Relay bindings (`wi_0f9f8dcdf0403899`) | The relay archives bindings of closed agents; 212 of 218 on the first pass | Mini `tt` |
+| `7ab5100` | Review convergence (`wi_3d6a4e3d1bf99a08`) | Numbered criteria, at most two general review rounds, focused-fix verification | Hub `20260926-review-convergence-7ab5100`, Mini `tt`, TailOS `3cc48b1b` |
+| `4b5adb2` | Owner-accept (out-of-band) | The owner can resolve an owner-decision review disposition | Hub `20260926-owner-accept-4b5adb2` |
+| `34944cf` | Objective verification (`wi_f23f767415ef9b30`), known failures (`wi_f148716909c88f9d`) | An independent verifier runs the owner-approved check matrix; named known failures and bounded retries | Hub `20260926-verification-34944cf`, Mini `tt`, TailOS `e52775cd` |
+| `8b1f4d4` | Owner obligations (`wi_deb2ce3cda1968d0`), browser fix (`wi_5a411a2a78e3ad9e`) | Requests to the owner are tracked with due times, shown as Discord cards and escalated | Hub `20260926-owner-obligations-8b1f4d4`, Mini `tt`, TailOS `892508b0` |
+| `c343819` | Receipt size (`wi_4aab49054893c8ce`, out-of-band) | The verification route accepts 1 MiB, so a full receipt can be saved | Hub `20260927-verification-body-c343819` |
 
 ## Hub releases
 
@@ -30,10 +42,19 @@ SHA-256 is of the unredacted receipt.
 | `20260925-handler-save-cf6b1cf` | `before-handler-save-cf6b1cf.sqlite` | 120,373,248 | `2471c1e5…` | ok, 0 FK | new `work_order_scope_confirmations`, `work_order_bookkeeping` |
 | `20260925-handler-priority-33d3ab7` | `before-handler-priority-33d3ab7.sqlite` | 120,373,248 | `8c83ce04…` | ok, 0 FK | none |
 | `20260926-parallel-activity-6235924` | `before-parallel-activity-6235924.sqlite` | 120,373,248 | `1102ab37…` | ok, 0 FK | reservations rebuilt (transactional); single-active and single-handler unique indexes replaced or dropped; new queue settings, host policy and usage, item leads, agent activity tables |
+| `20260926-review-convergence-7ab5100` | `before-review-convergence-7ab5100.sqlite` | 124,850,176 | `832c18b6…` | ok, 0 FK | new `review_convergence` |
+| `20260926-owner-accept-4b5adb2` | `before-owner-accept-4b5adb2.sqlite` | 127,098,880 | `7d834802…` | ok, 0 FK | none |
+| `20260926-verification-34944cf` | `before-verification-34944cf.sqlite` | 132,546,560 | `acac8c51…` | ok, 0 FK | new `verification_records`, `verification_enrollments` |
+| `20260926-owner-obligations-8b1f4d4` | `before-owner-obligations-8b1f4d4.sqlite` | 134,545,408 | `af51a1cf…` | ok, 0 FK | new `owner_obligation_delegations`; `obligations.recipient_kind` column |
+| `20260927-verification-body-c343819` | `before-verification-body-c343819-v2.sqlite` | 136,441,856 | `c9160ac1…` | ok, 0 FK | none |
 
 Before `6235924`, the combined migration was rehearsed on a copy of the `33d3ab7` backup: the new
 hub migrated it (integrity ok, no FK violations, 14 projects, queue at limit 1), and the
-`33d3ab7` hub opened the migrated copy. Rollback binaries: `.build/prev-*` (hub, bridge) and
+`33d3ab7` hub opened the migrated copy. The `34944cf` and `8b1f4d4` migrations were rehearsed
+the same way on a copy of the previous release's backup, including the old hub opening the
+migrated copy. The first `c343819` deploy attempt was refused by plan validation before any
+change (the plan carried the previous day's release name); the second, with a fresh backup
+(`-v2`), succeeded. Rollback binaries: `.build/prev-*` (hub, bridge) and
 `~/.local/bin/tt.prev-*` (Mini).
 
 ## Verification before each merge
@@ -42,7 +63,13 @@ suites the change touched (board-layout, hub-cache, task-form, project-compact-u
 `6235924` also parallel-team and activity), in Chromium and WebKit; plus `-race` on the queue,
 runner, migration and activity tests where they changed. The owner-side pre-merge run of the
 activity monitor found a 390px roster clipping regression that the team's runs had missed; it was
-fixed (`wi_f415c845559a65b9`) before release.
+fixed (`wi_f415c845559a65b9`) before release. From `7a49ec8`, every release that changed client
+code ran all seven browser suites (npm 219 → 244 tests). The owner-side check of owner obligations found three browser suites
+broken by an unhandled `/obligations` fetch; the fix (`wi_5a411a2a78e3ad9e`) shipped with it.
+Merging it also exposed an undeclared browser suite in the verification matrix, added in
+`8b1f4d4`. `c343819` is hub-only: `go vet`, `go test ./...`, `-race` on server and store, npm, and
+a test that saves a full 69-check receipt over 64 KiB and fails on the old limit with the live
+error.
 
 ## Found in production
 - The docs queue entry failed with "queued item changed before launch": the handler bumped
@@ -55,6 +82,19 @@ fixed (`wi_f415c845559a65b9`) before release.
 - The activity monitor could not classify the database handler and posted a stale first
   snapshot. Fixed in `91a55e0`; verified live (`working`, current `lastEventAt`).
 
+- Claude reviewers repeatedly hit the Fable usage limit at launch and sat idle; each was switched
+  to Opus 5.5 with `/model`. Detection is queued (`wi_72f41bd375032cf0`).
+- A review ending in an `owner-decision` disposition had no way to be resolved; `4b5adb2` added
+  the owner-only `owner-accept`.
+- The deployment agent was the first team verified natively. Its verifier found that
+  `profile-sync-browser` fails in any fresh checkout (it needs a binary a later suite builds;
+  `wi_21ba42f8f0542dc0`), and that a full receipt (75,820 bytes) exceeded the hub's 64 KiB request
+  limit, so no verified team could be accepted until `c343819`.
+
 ## Known open
-- `project-work-items-browser` dispatch-notice failure: product cause found in
-  `client/task-hub.js` setupHandler; fix in progress (`wi_21a14f6e032ab182`).
+- `profile-sync-browser` order dependency (`wi_21ba42f8f0542dc0`); verifiers build the test hub
+  binary as a prerequisite until it is fixed.
+- 14 browser suites fail on `tasks-hub` and are listed as known failures (`wi_be7bbed81d4009c1`,
+  queued).
+- The verification matrix changed in `8b1f4d4` (digest `58430970…`); candidates based on it need a
+  new owner matrix approval.
