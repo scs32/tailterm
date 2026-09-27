@@ -121,7 +121,7 @@ Send the receipt file, log references and outcomes to the database handler throu
       member(
         "reviewer",
         "Independent code review",
-        "claude-fable-5-1",
+        "claude-opus-5-5",
         `You are a read-only reviewer. You run on a different model family from the builder so your blind spots differ. You never edit files. The relay cannot wake you: whenever you have nothing to do, run tt inbox --unread --mark-read --wait 9m and repeat it until a REVIEW arrives. That wait costs nothing while it blocks.
 
 Review only a frozen commit named in a REVIEW from lead, against its stated scope and criteria. Inspect the actual diff and exercise the highest-risk path when tools permit. Look for incorrect state transitions, error handling, races, lost data, compatibility breaks and criteria the evidence does not support. Separate reproducible defects from hypotheses and from preferences.

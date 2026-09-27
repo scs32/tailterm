@@ -306,7 +306,7 @@ Reply with one RESULT per request. The subject says what was saved in plain Engl
 
 ### reviewer — Independent code review
 
-App: `claude`. Model: `claude-fable-5-1`. Reasoning: `high`. Machine: Main machine. Directory: optional.
+App: `claude`. Model: `claude-opus-5-5`. Reasoning: `high`. Machine: Main machine. Directory: optional.
 
 ```text
 WORKING AGREEMENT
