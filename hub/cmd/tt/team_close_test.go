@@ -16,6 +16,7 @@ import (
 	"github.com/scs32/tailterm/hub/internal/server"
 	"github.com/scs32/tailterm/hub/internal/spawn"
 	"github.com/scs32/tailterm/hub/internal/store"
+	"github.com/scs32/tailterm/hub/internal/testverification"
 )
 
 func teamCloseCLIContext(t *testing.T, item api.WorkItem, order api.Message) []byte {
@@ -124,6 +125,9 @@ func TestOwnerTeamCloseUsesRealFixtureHubWithoutAgentEnvironment(t *testing.T) {
 			}
 			status := tc.terminal
 			if status == "done" {
+				if err := testverification.Prepare(c, task.ID, item); err != nil {
+					t.Fatal(err)
+				}
 				report, _, err := st.PutNarrativeReport(ctx, task.ID, item.ID, api.PutNarrativeReportRequest{RequestID: "close-report", ScopeRevision: item.ScopeRevision,
 					Sections:   api.NarrativeReportSections{RequestedOutcome: "Close the item team.", DeliveredWork: "The synthetic delivery is complete.", Verification: "Isolated CLI and hub fixture.", Limitations: "Fixture only.", RemainingWork: "No remaining fixture work."},
 					References: []api.NarrativeReference{{Kind: "work-item-revision", TaskID: task.ID, ItemID: item.ID, Revision: item.Revision, Label: "bounded scope"}}}, by)

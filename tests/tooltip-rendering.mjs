@@ -1,7 +1,11 @@
-import { chromium } from "@playwright/test";
+import { chromium, webkit } from "@playwright/test";
+const engine = process.env.TEST_BROWSER || "chromium";
+if (!["chromium", "webkit"].includes(engine))
+  throw new Error("Unknown TEST_BROWSER");
+const selectedBrowser = engine === "webkit" ? webkit : chromium;
 import { readFile } from "node:fs/promises";
 import assert from "node:assert/strict";
-const browser = await chromium.launch();
+const browser = await selectedBrowser.launch();
 try {
   const page = await browser.newPage();
   await page.setContent(

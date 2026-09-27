@@ -72,7 +72,7 @@ minute for the host queue scan and up to six effects per polled project. This
 bounded worst-case estimate must fit both the total cap and its reserved
 queue/binding shares (one quarter and three quarters); the transport bucket
 enforces actual rate and burst. Reservations include every uncleaned agent run,
-uncertain and pending members, extras and manual launches (four slots before
+uncertain and pending members, extras and manual launches (five slots before
 a manual plan is known). The initial ceiling
 is two. The owner provisions
 additional database handlers as ordinary continuing handler agents; the runner
@@ -173,3 +173,23 @@ The command launches on the host where it runs. It does not select remote saved
 servers or read an encrypted browser profile. Tests use local test hubs, isolated
 home directories and private tmux sockets. This feature does not merge, deploy
 or release the source.
+
+## Independent verification
+
+New Planned delivery templates include a fifth item member, `verifier`, distinct
+from builder and reviewer; the project database handler remains shared. Host
+capacity conservatively reserves five sessions/bindings per pending team. Saved
+older launch plans retain their frozen members and retry identities. A frozen
+candidate needs a handler-approved full matrix plan and independent receipt before
+lead acceptance, handler completion and queue integration acceptance. See
+[objective verification](objective-verification.md). These template changes apply
+to new briefings; they do not rewrite running threads or saved launch plans.
+
+Owner decision #11866 places mandatory verification at new item-team admission.
+The admission transaction saves an immutable exact agent/run enrollment marker;
+no launch option disables it. Rollout retains existing bindings with explicit
+legacy provenance. A new team on an existing item becomes mandatory; frozen
+pre-rollout teams keep their completion path. The handler can inspect provenance
+with `tt verification enrollment --item ITEM`. Before saving a matrix plan, it
+requires the separate owner-authored token-only approval described in
+[objective verification](objective-verification.md).

@@ -333,6 +333,9 @@ func (s *Store) ListTeamQueue(ctx context.Context, task string) (api.TeamQueueLi
 			return out, summaryErr
 		}
 		out.Entries[i].Reviews = &summary
+		if err := s.loadTeamVerification(ctx, &out.Entries[i]); err != nil {
+			return out, err
+		}
 		if err := s.loadTeamActivities(ctx, &out.Entries[i]); err != nil {
 			return out, err
 		}
@@ -413,6 +416,9 @@ func (s *Store) TeamQueuesByHost(ctx context.Context, host string) (api.TeamQueu
 			return out, summaryErr
 		}
 		out.Entries[i].Reviews = &summary
+		if err := s.loadTeamVerification(ctx, &out.Entries[i]); err != nil {
+			return out, err
+		}
 		if err := s.loadTeamActivities(ctx, &out.Entries[i]); err != nil {
 			return out, err
 		}
@@ -441,6 +447,9 @@ func (s *Store) GetTeamQueueEntry(ctx context.Context, task, id string) (api.Tea
 		if summary.History == "recorded" {
 			e.Reviews = &summary
 		}
+	}
+	if err == nil {
+		err = s.loadTeamVerification(ctx, &e)
 	}
 	return e, err
 }
@@ -1154,6 +1163,18 @@ func (s *Store) TeamQueueAction(ctx context.Context, task string, req api.TeamQu
 				return zero, err
 			}
 			candidate := *req.Acceptance
+			records, loadErr := verificationRecords(ctx, tx, task, item.ID)
+			if loadErr != nil {
+				return zero, loadErr
+			}
+			verificationPlan, _ := currentVerification(records)
+			required, enrollmentErr := verificationRequired(ctx, tx, task, item.ID)
+			if enrollmentErr != nil {
+				return zero, enrollmentErr
+			}
+			if required && (verificationPlan == nil || verificationPlan.Repository != candidate.Repository || verificationPlan.BaseCommit != candidate.BaseCommit) {
+				return zero, verificationConflict("acceptance repository/base mismatch")
+			}
 			if err = reviewCompletion(ctx, tx, item, candidate.Commit); err != nil {
 				return zero, err
 			}

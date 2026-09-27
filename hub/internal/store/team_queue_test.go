@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"os"
 	"path/filepath"
 	"sync"
 	"testing"
@@ -473,5 +474,87 @@ func TestManualReservationSameItemLeadReplacementKeepsSafety(t *testing.T) {
 	}
 	if _, err := s.UpdateTask(ctx, task.ID, api.UpdateTaskRequest{Orchestrator: &lead}, by); err == nil {
 		t.Fatal("stale pause-generation replacement accepted")
+	}
+}
+
+func TestVerificationDeliverySummaryAndNewPlanClearing(t *testing.T) {
+	f, h, p, _ := knownVerificationFixture(t)
+	// Seed only the isolated delivery row; item admission already created its live team.
+	q := api.TeamQueueEntry{ID: api.NewID("tqe")}
+	_, err := f.s.db.Exec(`INSERT INTO team_queue_entries(id,task_id,item_id,item_revision,order_seq,template,position,state,host,cwd,created_at,updated_at) VALUES(?,?,?,1,?,'planned',1,'running','fixture','/tmp','fixture','fixture')`, q.ID, f.task.ID, f.item.ID, p.OrderMessageSeq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = f.s.SaveVerification(f.ctx, f.task.ID, f.item.ID, api.VerificationRequest{RequestID: "summary-plan", AgentID: h.ID, RunID: h.RunID, Plan: &p}); err != nil {
+		t.Fatal(err)
+	}
+	r := retryVerification(p, 1, 0)
+	if _, err = f.s.SaveVerification(f.ctx, f.task.ID, f.item.ID, api.VerificationRequest{RequestID: "summary-receipt", AgentID: h.ID, RunID: h.RunID, ExpectedGeneration: 1, Receipt: &r}); err != nil {
+		t.Fatal(err)
+	}
+	lists := []api.TeamQueueList{}
+	all, err := f.s.ListTeamQueue(f.ctx, f.task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lists = append(lists, all)
+	host, err := f.s.TeamQueuesByHost(f.ctx, "fixture")
+	if err != nil {
+		t.Fatal(err)
+	}
+	lists = append(lists, host)
+	entry, err := f.s.GetTeamQueueEntry(f.ctx, f.task.ID, q.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lists = append(lists, api.TeamQueueList{Entries: []api.TeamQueueEntry{entry}})
+	for _, list := range lists {
+		v := list.Entries[0].Verification
+		if v == nil || v.State != "passing" || len(v.Checks) != 1 || v.Checks[0].Status != "flaky" || !v.Checks[0].KnownFailure || !v.Checks[0].NowPassing {
+			t.Fatalf("native summary lost: %+v", v)
+		}
+	}
+	if path := os.Getenv("VERIFICATION_DELIVERY_FIXTURE_OUTPUT"); path != "" {
+		raw, _ := json.Marshal(entry.Verification)
+		if err = os.WriteFile(path, raw, 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	p.OperationKey = "replacement-plan"
+	if _, err = f.s.SaveVerification(f.ctx, f.task.ID, f.item.ID, api.VerificationRequest{RequestID: "replace", AgentID: h.ID, RunID: h.RunID, ExpectedGeneration: 2, Plan: &p}); err != nil {
+		t.Fatal(err)
+	}
+	entry, err = f.s.GetTeamQueueEntry(f.ctx, f.task.ID, q.ID)
+	if err != nil || entry.Verification.State != "pending" || len(entry.Verification.Checks) != 0 {
+		t.Fatal("old receipt displayed on new plan", entry.Verification, err)
+	}
+	tx, _ := f.s.db.BeginTx(f.ctx, nil)
+	err = verificationReady(f.ctx, tx, f.item, p.Commit)
+	tx.Rollback()
+	if err == nil {
+		t.Fatal("old receipt allowed completion after new plan")
+	}
+	// A valid unlisted exhausted failure is stored and displayed as blocked.
+	p.OperationKey = "unlisted-plan"
+	p.KnownFailures = nil
+	if _, err = f.s.SaveVerification(f.ctx, f.task.ID, f.item.ID, api.VerificationRequest{RequestID: "unlisted-plan", AgentID: h.ID, RunID: h.RunID, ExpectedGeneration: 3, Plan: &p}); err != nil {
+		t.Fatal(err)
+	}
+	failed := retryVerification(p, 1, 1, 1)
+	if _, err = f.s.SaveVerification(f.ctx, f.task.ID, f.item.ID, api.VerificationRequest{RequestID: "unlisted-receipt", AgentID: h.ID, RunID: h.RunID, ExpectedGeneration: 4, Receipt: &failed}); err != nil {
+		t.Fatal(err)
+	}
+	entry, err = f.s.GetTeamQueueEntry(f.ctx, f.task.ID, q.ID)
+	if err != nil || entry.Verification.State != "blocked" || entry.Verification.Checks[0].Status != "fail" || entry.Verification.Checks[0].KnownFailure {
+		t.Fatal("unlisted failure summary", entry.Verification, err)
+	}
+	// Scope changes also clear labels instead of presenting stale evidence as passing.
+	desc := "new scope"
+	if _, err = f.s.UpdateWorkItem(f.ctx, f.task.ID, f.item.ID, api.UpdateWorkItemRequest{Revision: 1, Description: &desc}, f.by); err != nil {
+		t.Fatal(err)
+	}
+	entry, err = f.s.GetTeamQueueEntry(f.ctx, f.task.ID, q.ID)
+	if err != nil || entry.Verification.State != "stale" || len(entry.Verification.Checks) != 0 {
+		t.Fatal("stale summary", entry.Verification, err)
 	}
 }

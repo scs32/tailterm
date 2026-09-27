@@ -250,6 +250,7 @@ func TestQueueDispatchCASClaimStartTerminalAndSourcePreservation(t *testing.T) {
 	if err != nil || !newOffer.Queue.Entry.PendingUpdate || newOffer.Queue.Entry.ClaimedItemRevision != original.Revision || newOffer.Queue.Entry.State != api.QueueStateActive {
 		t.Fatalf("pending active offer: %+v %v", newOffer, err)
 	}
+	seedPassingVerification(t, s, item, candidateA)
 	done := "done"
 	item, err = s.UpdateWorkItem(ctx, source.ID, item.ID, api.UpdateWorkItemRequest{Revision: item.Revision, Status: &done}, by)
 	if err != nil {

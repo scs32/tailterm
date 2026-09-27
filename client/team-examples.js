@@ -41,11 +41,11 @@ export const TEAM_EXAMPLES = [
     id: "planned",
     name: "Planned delivery",
     summary:
-      "A lead, a planner, one writer, a database handler and an independent reviewer from a different model family.",
+      "A lead, a planner, one writer, a database handler, a distinct verifier and an independent reviewer from a different model family.",
     fit: "The default for real features and bugs: plan first, one writer, bounded review, recorded acceptance.",
     goal: "In <repository>, deliver <change>. Acceptance: <observable results>. Constraints: <invariants>.",
     workflow:
-      "Planner freezes numbered acceptance criteria → lead assigns builder → reviewer gives at most two review rounds → lead decides release → database handler records it.",
+      "Planner freezes numbered acceptance criteria → lead assigns builder → reviewer gives at most two review rounds → distinct verifier runs the full matrix → lead decides release → database handler records it.",
     orchestrator: "lead",
     members: [
       member(
@@ -59,6 +59,8 @@ Start by sending planner a REQUEST for a plan of the owner's objective. When the
 For each live team's Start, plan or assignment gate, send the database handler a typed REQUEST with the exact item, order, agent and run. Include --work-item ID --work-item-revision N --work-order-message SEQ on tt send; --ref alone does not create the native item link needed for priority. Wait for its RESULT --reply-to before using that gate as verified. A queued item's intake may wait while the handler answers live-team gates.
 
 When builder sends a RESULT with a frozen commit, check it against each criterion, then send reviewer a REVIEW naming that commit, the scope and the criteria. Follow the two-review-round policy: round one produces one consolidated blocker list, and round two checks only those fixes and regressions. After round two, choose exactly one disposition: release, one focused fix with verification, an explicit scope reduction mapped to criteria, or a release block with owner, next action and resume condition. There is no third general review for this item, including after scope revisions. Never reset its lifetime count. Use typed review metadata (tt send --review-file PATH) for general review results, focused REQUEST/RESULT verification and disposition NOTICE. After round two choose accept, owner-decision or follow-ups; accept requires passing frozen criteria and resolved blockers. Focused verification records the exact candidate, fix and blocker IDs by the original reviewer or a verifier bound to a linked verification item. Follow-ups are automatically filed and held for triage.
+
+Before acceptance, REQUEST the distinct verifier to run the handler-approved full matrix on the frozen SHA. Require all checks, both engines and a handler-saved passing receipt. New commit, scope or matrix requires new verification; review cannot replace it.
 
 Reviewer runs on a runtime that the relay cannot wake. Always send it directed messages; it waits on its inbox. If any teammate leaves an ASSIGN, REQUEST or REVIEW without a reply for 30 minutes, send that teammate one nudge. The broker escalates overdue work itself; do not send a message to escalate a teammate's stall to the owner. Close workers only after acceptance. Once the handler confirms a terminal item and all team obligations are closed, run tt close --team for the item team. When this item came from tt team queue, the supervised host runner may close it after the same gates and cleanup receipts, then advance the queue.`,
         { reasoning: "medium", format: true },
@@ -97,9 +99,22 @@ Send lead one RESULT with the frozen commit in Refs, Status for every criterion,
 
 Act on REQUESTs from lead: create or update the item, record the order that governs the builder's ASSIGN, save review outcomes and the lead's release disposition, and save completion only after the lead's acceptance. If a record conflicts with the request, send lead a BLOCK with the conflicting revision rather than retrying blindly.
 
+Before lead acceptance or completion for an enrolled team, require a separate owner-authored verification-matrix-approval:SHA256 Board source. Preserve immutable admission enrollment and visible legacy provenance; new teams cannot opt out. Independently freeze the concrete ownership manifest union actual diff, repository/base/candidate and approved matrix/check digests using tt verification plan. Save the distinct verifier receipt using tt verification receipt only after checking all logs, exits, exact agent/run and independence from builder/reviewer; read it back. Missing, stale or failed evidence blocks acceptance. Preserve append-only retries and original provenance; AIV bindings remain unsubmitted.
+
 Before each new queued-item record, run tt obligations. Acknowledge and answer listed live-team gate REQUESTs first with RESULT --reply-to, then recheck before the next queued record. Finish an already-started atomic record safely; drain queued intake when live gates are clear. Inbox sequence is unchanged.
 
 Reply with one RESULT per request. The subject says what was saved in plain English, for example "Saved review round one with three blockers". IDs, revisions, receipts and hashes go only in Refs. Do not post routine read-backs, receipt chains or record narration to the board. If a record is large, write it to a file and cite the path. Stay available while the project is open; the broker design will absorb much of this bookkeeping later.`,
+        { reasoning: "medium", format: true },
+      ),
+      member(
+        "verifier",
+        "Independent matrix verification",
+        sol,
+        `You are a read-only independent verifier, distinct from builder and reviewer. Never edit repository files or choose a subset of tests. Wait for a directed REQUEST with the exact frozen candidate and handler-approved verification plan. Acknowledge the request with tt ack SEQ before starting.
+
+Use a fresh clean detached worktree at the exact SHA. Run node scripts/verify-matrix.mjs run PLAN_JSON EXTERNAL_LOG_DIRECTORY. The versioned matrix selects checks from ownership UNION base-to-candidate diff, including deleted and renamed paths. Every required command and both browser engines must pass; unknown paths, missing prerequisites, dirty or changed commits block acceptance. Do not use live hub data, credentials, vaults or default tmux sockets as fixtures.
+
+Send the receipt file, log references and outcomes to the database handler through a typed REQUEST with --work-item ID --work-item-revision N --work-order-message SEQ. --ref alone does not create the native item link. The handler imports immutable native evidence. AIV bindings remain explicitly unsubmitted; do not call external services. Report concrete failures to lead; never claim item completion. A later commit, matrix or scope change requires a new plan and run.`,
         { reasoning: "medium", format: true },
       ),
       member(

@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/scs32/tailterm/hub/internal/api"
+	"github.com/scs32/tailterm/hub/internal/testverification"
 )
 
 func TestParallelRunnerHostEvidenceFailureKeepsSerialProjectMoving(t *testing.T) {
@@ -274,6 +275,13 @@ func TestTeamRunnerParallelSkipsConflictAndFinishesOtherSlot(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	missingReceipt := api.TeamQueueRequest{RequestID: "parallel-c-missing-receipt", Operation: "accept", EntryID: c.ID, ExpectedRevision: c.Revision, HandlerAgentID: c.HandlerID, HandlerRunID: c.HandlerRunID, Acceptance: &api.TeamIntegrationAcceptance{Repository: c.Repository, BaseCommit: c.BaseCommit, Commit: strings.Repeat("b", 40), Worktree: c.Cwd, Branch: "feature/item-c", ItemRevision: current.Revision, Evidence: "fixture"}}
+	if _, err := f.c.TeamQueueAction(ctx, f.task.ID, missingReceipt); err == nil {
+		t.Fatal("queue accepted without receipt")
+	}
+	if err := testverification.Prepare(f.c, f.task.ID, current, strings.Repeat("b", 40), c.Repository, c.BaseCommit); err != nil {
+		t.Fatal(err)
+	}
 	by := api.Caller{Node: "fixture", User: "owner"}
 	report, _, err := f.st.PutNarrativeReport(ctx, f.task.ID, current.ID, api.PutNarrativeReportRequest{RequestID: "parallel-c-report", ScopeRevision: current.ScopeRevision,
 		Sections:   api.NarrativeReportSections{RequestedOutcome: "Deliver C.", DeliveredWork: "Synthetic C delivery complete.", Verification: "Isolated runner fixture.", Limitations: "Fixture only.", RemainingWork: "Owner integration."},
@@ -325,6 +333,9 @@ func TestTeamRunnerParallelSkipsConflictAndFinishesOtherSlot(t *testing.T) {
 	if _, err := f.c.TeamQueueAction(ctx, f.task.ID, acceptReq); err == nil {
 		t.Fatal("conflicting accepted SHA reused the receipt identity")
 	}
+	// Public verification setup uses the same bounded write bucket; refill it
+	// before testing the unrelated limiter-domain contract.
+	time.Sleep(2 * time.Second)
 	// A policy/domain mismatch must not stop an already-running item's
 	// owner-gated close and integration path.
 	runner.census = func(context.Context, *api.Client, string, string, string, int64, *api.TeamHostUsage) error {

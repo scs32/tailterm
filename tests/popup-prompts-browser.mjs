@@ -1,12 +1,16 @@
 import { createServer } from "vite";
-import { chromium } from "@playwright/test";
+import { chromium, webkit } from "@playwright/test";
+const engine = process.env.TEST_BROWSER || "chromium";
+if (!["chromium", "webkit"].includes(engine))
+  throw new Error("Unknown TEST_BROWSER");
+const selectedBrowser = engine === "webkit" ? webkit : chromium;
 import assert from "node:assert/strict";
 const server = await createServer({
   configFile: false,
   server: { host: "127.0.0.1", port: 0 },
 });
 await server.listen();
-const browser = await chromium.launch();
+const browser = await selectedBrowser.launch();
 try {
   const page = await browser.newPage();
   await page.route("**/popup-test", (r) =>

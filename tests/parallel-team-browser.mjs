@@ -7,11 +7,14 @@ import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 const nativeDir = mkdtempSync(join(tmpdir(), "review-convergence-browser-"));
-let native;
+let native, verification;
 try {
   const output = join(nativeDir, "native.json");
   execFileSync("go", ["test", "./cmd/tt", "-run", "^TestReviewConvergenceNativeCLISummaryAndProjection$", "-count=1"], {cwd:join(process.cwd(),"hub"), env:{...process.env,REVIEW_CONVERGENCE_FIXTURE_OUTPUT:output}, stdio:"pipe"});
   native = JSON.parse(readFileSync(output,"utf8"));
+  const verificationOutput=join(nativeDir,"verification.json");
+  execFileSync("go",["test","./internal/store","-run","^TestVerificationDeliverySummaryAndNewPlanClearing$","-count=1"],{cwd:join(process.cwd(),"hub"),env:{...process.env,VERIFICATION_DELIVERY_FIXTURE_OUTPUT:verificationOutput},stdio:"pipe"});
+  verification=JSON.parse(readFileSync(verificationOutput,"utf8"));
 } finally { rmSync(nativeDir,{recursive:true,force:true}); }
 
 
@@ -23,6 +26,7 @@ const queue={concurrencyLimit:2,entries:[
  {itemId:'wi_cccccccccccccccc',state:'finished',ownership:['src/c'],handlerId:'agt_handler_c',integration:{repository:'/fixture/git',baseCommit:'a'.repeat(40),worktree:'/fixture/builder-c',branch:'feature/c',commit:'b'.repeat(40),evidence:'item=C;close=receipt'}}
 ]};
 queue.entries.push(...${JSON.stringify(native.queue.entries).replaceAll("<", "\\u003c")});
+queue.entries[0].verification=${JSON.stringify(verification).replaceAll("<", "\\u003c")};
 const agents=[{id:'agt_lead_a',name:'Lead A',itemLead:true,workItem:{itemId:'wi_aaaaaaaaaaaaaaaa'}},{id:'agt_handler_a',name:'Handler A'},{id:'agt_handler_c',name:'Handler C'}];
 document.querySelector('#delivery').innerHTML=renderTeamDelivery(queue,agents);
 window.fixture={queue,agents,rerender(){document.querySelector('#delivery').innerHTML=renderTeamDelivery(queue,agents)}};
@@ -74,11 +78,22 @@ try {
         await page.locator('[data-testid="review-convergence-summary"]').first().waitFor();
         assert.match(await page.locator('[data-testid="team-delivery-entry"]').nth(3).innerText(),/Reviews 2\/2 · Follow-ups 1/);
         assert.match(await page.locator('[data-testid="team-delivery-entry"]').nth(4).innerText(),/Reviews unknown · Follow-ups unknown/);
+        const verificationText=await page.locator('[data-testid="verification-summary"]').innerText();
+        assert.match(verificationText,/Verification passing/);
+        assert.match(verificationText,/fixture-check: flaky/);
+        assert.match(verificationText,/known failure/);
+        assert.match(verificationText,/now passing; remove from known failures/);
+        assert.equal(verification.checks[0].status,"flaky");
         assert.match(native.summary,/reviews: 2\/2; follow-ups: 1/);
         assert.equal(await page.locator('#delivery script:not([type="module"])').count(),0);
         assert.match(await page.locator('[data-testid="team-delivery-entry"]').nth(3).innerText(),/<script>fixture escape<\/script>/);
         assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth),true,`overflow at ${width}`);
       }
+      await page.evaluate(()=>{fixture.queue.entries[0].verification={state:"pending",commit:"new"};fixture.rerender();});
+      assert.equal(await page.locator('[data-testid="verification-summary"]').innerText(),"Verification pending");
+      await page.evaluate(()=>{fixture.queue.entries[0].verification.checks=[{id:'<img src=x onerror="window.injected=true">',status:'flaky'}];fixture.rerender();});
+      assert.equal(await page.locator('[data-testid="verification-summary"] img').count(),0);
+      assert.equal(await page.evaluate(()=>!!window.injected),false);
       assert.deepEqual(errors, []);
       await context.close();
       console.log(`${engine.name()}: delivery ownership, blocker, item roles and gated integration receipt rendered`);
