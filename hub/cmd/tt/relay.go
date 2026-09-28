@@ -415,6 +415,10 @@ func relayWakeJob(ctx context.Context, b runtimeBinding, p *relayProgress, c *ap
 			// still-unread obligation eligible for the inbox path on the first
 			// later idle pass, even though BrokerWakes is enabled.
 			p.ClaudePendingInbox = true
+			// An earlier inbox pass may have skipped this broker-covered
+			// message and advanced Through. Revisit it after the busy skip;
+			// the agent-owned ReadUpTo cursor is never changed here.
+			p.Through = min(p.Through, max(0, job.MessageSeq-1))
 			p.LastAttempt = now // inbox retry keeps the normal 15-second spacing
 		}
 	}

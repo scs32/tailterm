@@ -560,3 +560,85 @@ func TestClaudeBusyBrokerSkipRetriesFromInboxAtFirstIdlePass(t *testing.T) {
 		t.Fatalf("idle inbox retry missing: prompts=%q progress=%+v err=%v", prompts, p, err)
 	}
 }
+
+func TestClaudeInboxFirstBusyBrokerSkipRewindsLocalProgress(t *testing.T) {
+	st, err := store.Open(filepath.Join(t.TempDir(), "hub.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	ctx := context.Background()
+	by := api.Caller{Node: "fixture", User: "owner"}
+	task, err := st.CreateTask(ctx, api.CreateTaskRequest{Name: "Inbox first Claude"}, by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lead, err := st.AddAgent(ctx, task.ID, api.AddAgentRequest{Name: "lead", Host: "test", Session: "lead", Runtime: "codex"}, by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	worker, err := st.AddAgent(ctx, task.ID, api.AddAgentRequest{Name: "worker", Host: "test", Session: "claude", Runtime: "claude"}, by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.PostEvent(ctx, task.ID, api.PostEventRequest{Kind: api.EventHeartbeat, AgentID: worker.ID, RunID: worker.RunID}, by); err != nil {
+		t.Fatal(err)
+	}
+	srv := httptest.NewServer(server.New(st, func(*http.Request) (api.Caller, error) { return by, nil }))
+	defer srv.Close()
+	client, err := api.NewClient(srv.URL, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b := runtimeBinding{Hub: srv.URL, Task: task.ID, Agent: worker.ID, Run: worker.RunID, Thread: "00000000-0000-4000-8000-000000000001", Runtime: "claude", Session: "claude"}
+	p := relayProgress{Run: b.Run, Thread: b.Thread}
+	t0 := time.Now().Add(time.Second)
+	busy := func(context.Context, runtimeBinding, string) error { return errClaudeWakeUnsafe }
+	if handled, err := relayWakeJob(ctx, b, &p, client, t0, busy); handled || err != nil || !p.BrokerWakes {
+		t.Fatalf("empty broker check: handled=%v err=%v progress=%+v", handled, err, p)
+	}
+	msg, err := st.PostMessage(ctx, task.ID, api.PostMessageRequest{AgentID: lead.ID, To: worker.ID, Envelope: &api.Envelope{Kind: "review", To: "worker", Subject: "Review fixture", Body: api.EnvelopeBody{Candidate: "abc1234", Scope: "fixture", Acceptance: map[string]string{"a1": "check"}}}}, by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if handled, err := relayWakeJob(ctx, b, &p, client, t0.Add(3*time.Second), busy); handled || err != nil {
+		t.Fatalf("broker check before due: handled=%v err=%v", handled, err)
+	}
+	if err := relayOne(ctx, b, &p, client, t0.Add(3*time.Second), busy); err != nil || p.Through != msg.Seq {
+		t.Fatalf("inbox did not skip broker-covered message: through=%d msg=%d err=%v", p.Through, msg.Seq, err)
+	}
+	tBusy := t0.Add(16 * time.Second)
+	if handled, err := relayWakeJob(ctx, b, &p, client, tBusy, busy); !handled || err == nil || !p.ClaudePendingInbox || p.Through != msg.Seq-1 {
+		t.Fatalf("busy lease did not retain earlier sequence: handled=%v err=%v through=%d msg=%d pending=%v", handled, err, p.Through, msg.Seq, p.ClaudePendingInbox)
+	}
+	data, err := json.Marshal(p)
+	if err != nil || json.Unmarshal(data, &p) != nil || !p.ClaudePendingInbox || p.Through != msg.Seq-1 {
+		t.Fatalf("rewound progress lost on reload: %v %+v", err, p)
+	}
+	var prompts []string
+	idle := func(_ context.Context, _ runtimeBinding, prompt string) error {
+		prompts = append(prompts, prompt)
+		return nil
+	}
+	if err := relayOne(ctx, b, &p, client, tBusy.Add(10*time.Second), idle); err != nil || len(prompts) != 0 {
+		t.Fatalf("inbox retried before spacing: prompts=%q err=%v", prompts, err)
+	}
+	tIdle := tBusy.Add(20 * time.Second)
+	if handled, err := relayWakeJob(ctx, b, &p, client, tIdle, idle); handled || err != nil {
+		t.Fatalf("unexpected later broker job: handled=%v err=%v", handled, err)
+	}
+	if err := relayOne(ctx, b, &p, client, tIdle, idle); err != nil || len(prompts) != 1 || !strings.Contains(prompts[0], fmt.Sprintf("#%d", msg.Seq)) || p.ClaudePendingInbox || p.Wakes > 8 {
+		t.Fatalf("first idle pass missed or duplicated: prompts=%q progress=%+v err=%v", prompts, p, err)
+	}
+	if err := relayOne(ctx, b, &p, client, tIdle.Add(20*time.Second), idle); err != nil || len(prompts) != 1 {
+		t.Fatalf("post-retry duplicate: prompts=%q err=%v", prompts, err)
+	}
+	got, err := st.GetAgent(ctx, worker.ID)
+	if err != nil || got.ReadUpTo != 0 {
+		t.Fatalf("relay moved agent read cursor: %+v %v", got, err)
+	}
+	open, err := st.ListObligations(ctx, task.ID, store.ObligationFilter{AgentID: worker.ID, OpenOnly: true}, time.Now())
+	if err != nil || len(open) != 1 || open[0].MessageSeq != msg.Seq {
+		t.Fatalf("relay changed acknowledgement: %+v %v", open, err)
+	}
+}
