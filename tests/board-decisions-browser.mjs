@@ -22,6 +22,8 @@ const fixtureEnv = Object.fromEntries(Object.entries(process.env).filter(([key])
 let hubBinary = path.join(state, "tailterm-hub"), ttBinary = path.join(state, "tt");
 let backend, web, browser, diagnosticPage;
 const results = [], failures = [], screenshots = [], requests = [], frozenReads = new Map();
+// Holds one project's message-audit reads so a Board reload can be hidden mid-flight.
+let auditHold = null;
 let fault = null;
 const engineNames = new Set((process.env.BOARD_DECISIONS_ENGINES || "chromium,webkit").split(","));
 assert.ok(engineNames.size > 0 && [...engineNames].every(name => ["chromium", "webkit"].includes(name)), "Choose chromium and/or webkit for the isolated fixture");
@@ -186,6 +188,10 @@ async function serve(req, res) {
       const requestLog = { method, path: req.url, body: body.length ? JSON.parse(body) : null };
       requests.push(requestLog);
       const task = url.pathname.match(/^\/v1\/tasks\/([^/]+)/)?.[1];
+      if (method === "GET" && auditHold?.task === task && url.pathname.includes("/message-audit")) {
+        auditHold.held++;
+        await auditHold.released;
+      }
       const freeze = frozenReads.get(task);
       if (method === "GET" && freeze) {
         const snapshot = frozenResponse(url, freeze);
@@ -596,6 +602,28 @@ try {
       await assertAnswer(mobile, q, { text: "A keyboard-entered custom answer." });
       await page.setViewportSize({ width: 1440, height: 1000 });
       await page.evaluate(id => qa.show(id), p.task.id);
+    });
+    await check(`${name}: a Board hidden during its audit reads starts no later hub read`, async () => {
+      await page.evaluate(id => qa.show(id), p.task.id);
+      await expect(page.locator(".board-head h2")).toHaveText(p.task.name);
+      let release;
+      auditHold = { task: p.task.id, held: 0, released: new Promise(resolve => (release = resolve)) };
+      try {
+        // show() starts a reload with a fresh token and settles only when that
+        // reload does; reload() may join one already in flight.
+        await page.evaluate(id => { window.heldBoardReload = qa.board.show(id); }, p.task.id);
+        await expect.poll(() => auditHold.held).toBeGreaterThan(0);
+        await page.evaluate(() => qa.board.hide());
+        const afterHide = requests.length;
+        release();
+        await page.evaluate(() => window.heldBoardReload);
+        assert.deepEqual(requests.slice(afterHide).filter(r => r.path.startsWith("/v1/work-items")).map(r => r.path), [],
+          "a hidden Board started a work-items read after its audit reads resumed");
+      } finally {
+        release();
+        auditHold = null;
+        await page.evaluate(id => qa.show(id), p.task.id);
+      }
     });
     await check(`${name}: closed decisions/history remain readable with no enabled answer controls`, async () => {
       await page.setViewportSize({ width: 1440, height: 1000 });

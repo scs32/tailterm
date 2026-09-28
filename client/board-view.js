@@ -877,6 +877,9 @@ export function createBoardView({
           );
         }
       }
+      // A reload hidden or superseded during the audit reads must not start
+      // another hub read (wi_a9a69169f732121d).
+      if (!currentAction(id, token, actionClient)) return;
       let loadedItems = [],
         itemsError = "";
       if (id && actionClient.listWorkItems) {
