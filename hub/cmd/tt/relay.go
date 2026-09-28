@@ -52,6 +52,7 @@ type relayProgress struct {
 	NextBrokerCheck     time.Time        `json:"nextBrokerCheck,omitempty"`
 	NextRetirementCheck time.Time        `json:"nextRetirementCheck,omitempty"`
 	Wake                *api.WakeOutcome `json:"wake,omitempty"`
+	ClaudePendingInbox  bool             `json:"claudePendingInbox,omitempty"`
 }
 
 func relayDir() string {
@@ -409,11 +410,22 @@ func relayWakeJob(ctx context.Context, b runtimeBinding, p *relayProgress, c *ap
 		if strings.Contains(qerr.Error(), "did not confirm") {
 			report.Status = "ambiguous"
 		}
+		if b.Runtime == "claude" && (errors.Is(qerr, errClaudeWakeUnsafe) || strings.Contains(qerr.Error(), errClaudeWakeUnsafe.Error())) {
+			// The broker job becomes terminal after a safe skip. Keep its
+			// still-unread obligation eligible for the inbox path on the first
+			// later idle pass, even though BrokerWakes is enabled.
+			p.ClaudePendingInbox = true
+			p.LastAttempt = now // inbox retry keeps the normal 15-second spacing
+		}
 	}
 	reportErr := c.ReportWakeJob(ctx, b.Task, job.ID, report)
 	if report.Status != "accepted" {
-		// Nothing reached the runtime: let the other relay paths run this pass.
-		return false, fmt.Errorf("broker wake %s: %s", report.Status, report.Detail)
+		// Avoid a second attempt into the same busy pane in this pass. The
+		// persisted inbox fallback will retry at normal spacing.
+		return b.Runtime == "claude" && p.ClaudePendingInbox, fmt.Errorf("broker wake %s: %s", report.Status, report.Detail)
+	}
+	if reportErr == nil {
+		p.ClaudePendingInbox = false
 	}
 	return true, reportErr
 }
@@ -470,7 +482,7 @@ func relayOne(ctx context.Context, b runtimeBinding, p *relayProgress, c *api.Cl
 	// Progress covers the whole page, even messages the broker wakes for.
 	through, _ := wakeThrough(msgs, b.Agent)
 	eligibleMsgs := msgs
-	if p.BrokerWakes {
+	if p.BrokerWakes && !p.ClaudePendingInbox {
 		// Only typed kinds that create an obligation for this agent are woken
 		// by broker wake jobs; replies, free text, decision answers, lead
 		// notices and dispatches still wake through the inbox.
@@ -521,6 +533,7 @@ func relayOne(ctx context.Context, b runtimeBinding, p *relayProgress, c *api.Cl
 		recordClaudeWake(p, prompt, nil, now)
 	}
 	p.Through = through
+	p.ClaudePendingInbox = false
 	p.Error = ""
 	return nil
 }

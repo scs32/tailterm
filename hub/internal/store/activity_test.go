@@ -2,7 +2,9 @@ package store
 
 import (
 	"context"
+	"fmt"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -71,6 +73,56 @@ func TestActivityTransitionReceiptsAndSnapshots(t *testing.T) {
 	var receipts int
 	if err := s.db.QueryRow(`SELECT count(*) FROM agent_activity_receipts`).Scan(&receipts); err != nil || receipts != 1 {
 		t.Fatalf("transition receipts %d %v", receipts, err)
+	}
+}
+
+func TestActivityWakeOnlyChangesDoNotRepeatCrashAlerts(t *testing.T) {
+	ctx := context.Background()
+	s, err := Open(filepath.Join(t.TempDir(), "alerts.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	by := api.Caller{Node: "fixture", User: "owner"}
+	task, err := s.CreateTask(ctx, api.CreateTaskRequest{Name: "Wake alerts"}, by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	a, err := s.AddAgent(ctx, task.ID, api.AddAgentRequest{AgentID: api.NewID("agt"), Name: "claude", Host: "mini", Session: "test", Runtime: "claude", Cwd: t.TempDir()}, by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 9, 25, 20, 0, 0, 0, time.UTC)
+	count := func() int {
+		msgs, err := s.ListMessages(ctx, task.ID, 0, "", 500)
+		if err != nil {
+			t.Fatal(err)
+		}
+		n := 0
+		for _, m := range msgs {
+			if m.Envelope != nil && strings.Contains(m.Envelope.Subject, "needs owner attention") {
+				n++
+			}
+		}
+		return n
+	}
+	r := api.ActivityReport{RequestID: "crash-transition", RunID: a.RunID, Activity: api.AgentActivity{State: "crashed", ObservedAt: now}}
+	if _, err := s.ReportActivity(ctx, task.ID, a.ID, r); err != nil {
+		t.Fatal(err)
+	}
+	if count() != 1 {
+		t.Fatal("crashed state did not alert once")
+	}
+	for i, seq := range []int64{11, 12, 13} {
+		w := r
+		w.RequestID = fmt.Sprintf("wake-%d", seq)
+		w.Activity.Wake = &api.WakeOutcome{Status: "skipped", Reason: "Claude pane busy", MessageSeqs: []int64{seq}, At: now.Add(time.Duration(i+1) * time.Second)}
+		if _, err := s.ReportActivity(ctx, task.ID, a.ID, w); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := count(); got != 1 {
+		t.Fatalf("wake-only updates repeated crashed alert: %d", got)
 	}
 }
 

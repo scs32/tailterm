@@ -438,6 +438,19 @@ func TestClaudeUserTextClearsCompletedTurn(t *testing.T) {
 	if err := parseClaudeActivity([]byte(`{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"tool"}]}}`), &c); err != nil || !c.TurnComplete {
 		t.Fatalf("tool result changed turn boundary: %+v %v", c, err)
 	}
+	for _, record := range []string{
+		`{"type":"user","isMeta":true,"message":{"content":"<local-command-caveat>local command</local-command-caveat>"}}`,
+		`{"type":"user","message":{"content":"<command-name>/model</command-name>\n<command-message>model</command-message>"}}`,
+		`{"type":"user","message":{"content":"<local-command-stdout>Set model to opus</local-command-stdout>"}}`,
+		`{"type":"user","isCompactSummary":true,"message":{"content":"previous context summary"}}`,
+	} {
+		if err := parseClaudeActivity([]byte(record), &c); err != nil || !c.TurnComplete {
+			t.Fatalf("local or summary record changed completion: %+v %v", c, err)
+		}
+	}
+	if err := parseClaudeActivity([]byte(`{"type":"user","message":{"content":"new real prompt"}}`), &c); err != nil || c.TurnComplete {
+		t.Fatalf("real prompt did not clear completion: %+v %v", c, err)
+	}
 }
 
 func TestActivityClaudeExactRetryAndPanicIsolation(t *testing.T) {

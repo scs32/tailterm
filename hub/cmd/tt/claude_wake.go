@@ -60,6 +60,8 @@ type claudeWakeOps struct {
 	now     func() time.Time
 }
 
+var errClaudeWakeUnsafe = errors.New("Claude is not safely idle")
+
 func claudeWakePath(b runtimeBinding) string {
 	return filepath.Join(relayDir(), bindingKey(b)+"-"+b.Run+".claude-wake.json")
 }
@@ -138,16 +140,29 @@ func exactClaudeInput(screen, expected string) bool {
 			input = i // the final prompt is the active input, not scrollback
 		}
 	}
-	if input < 0 || len(lines)-input > 5 || strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(lines[input]), "❯")) != expected {
+	if input < 0 || len(lines)-input > 10 {
 		return false
 	}
+	parts := []string{strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(lines[input]), "❯"))}
+	border := false
 	for _, line := range lines[input+1:] {
 		trimmed := strings.TrimSpace(line)
-		if trimmed != "" && !strings.HasPrefix(trimmed, "⏵⏵") && !strings.HasPrefix(trimmed, "──") && !strings.HasPrefix(trimmed, "? for shortcuts") {
+		if strings.HasPrefix(trimmed, "──") {
+			border = true
+			continue
+		}
+		if border && (trimmed == "" || strings.HasPrefix(trimmed, "⏵⏵") || strings.HasPrefix(trimmed, "? for shortcuts")) {
+			continue
+		}
+		if !border && trimmed != "" && strings.HasPrefix(line, "  ") && !strings.HasPrefix(trimmed, "⏵⏵") {
+			parts = append(parts, trimmed) // Claude wraps editor text at words.
+			continue
+		}
+		if trimmed != "" {
 			return false
 		}
 	}
-	return true
+	return strings.Join(strings.Fields(strings.Join(parts, " ")), " ") == strings.Join(strings.Fields(expected), " ")
 }
 
 func claudeTranscriptSnapshot(b runtimeBinding) (claudeWakeSnapshot, error) {
@@ -269,16 +284,23 @@ func nativeClaudeSend(ctx context.Context, pane, value string, literal bool) err
 
 func claudeUserText(line []byte) string {
 	var record struct {
-		Type    string `json:"type"`
-		Message struct {
+		Type             string `json:"type"`
+		IsMeta           bool   `json:"isMeta"`
+		IsCompactSummary bool   `json:"isCompactSummary"`
+		Message          struct {
 			Content json.RawMessage `json:"content"`
 		} `json:"message"`
 	}
-	if json.Unmarshal(line, &record) != nil || record.Type != "user" {
+	if json.Unmarshal(line, &record) != nil || record.Type != "user" || record.IsMeta || record.IsCompactSummary {
 		return ""
 	}
 	var direct string
 	if json.Unmarshal(record.Message.Content, &direct) == nil {
+		for _, prefix := range []string{"<command-name>", "<local-command-stdout>", "<local-command-caveat>"} {
+			if strings.HasPrefix(strings.TrimSpace(direct), prefix) {
+				return ""
+			}
+		}
 		return direct
 	}
 	var parts []struct {
@@ -367,14 +389,17 @@ func claudeWakeWith(ctx context.Context, b runtimeBinding, prompt string, ops cl
 	}
 	first, err := ops.inspect(ctx, b, "")
 	if err != nil {
-		return err
+		return fmt.Errorf("%w: %v", errClaudeWakeUnsafe, err)
 	}
 	if !emptyClaudeInput(first.Screen) || !first.Cursor.TurnComplete || !first.Cursor.Ready || first.Cursor.Unknown || len(first.Cursor.Pending) != 0 {
-		return errors.New("Claude is not safely idle")
+		return errClaudeWakeUnsafe
 	}
 	second, err := ops.inspect(ctx, b, "")
-	if err != nil || !sameClaudeSnapshot(first, second) {
-		return errors.New("Claude identity or input changed before wake")
+	if err != nil {
+		return fmt.Errorf("%w: Claude input recheck: %v", errClaudeWakeUnsafe, err)
+	}
+	if !sameClaudeSnapshot(first, second) {
+		return fmt.Errorf("%w: Claude identity or input changed before wake", errClaudeWakeUnsafe)
 	}
 	nonce, err := claudeWakeNonce()
 	if err != nil {

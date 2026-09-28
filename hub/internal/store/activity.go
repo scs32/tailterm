@@ -115,8 +115,10 @@ func (s *Store) ReportActivity(ctx context.Context, task, agent string, report a
 	if _, err = tx.ExecContext(ctx, `INSERT INTO agent_activity_receipts(task_id,request_id,agent_id,run_id,payload,request_payload) VALUES(?,?,?,?,?,?)`, task, report.RequestID, agent, run, string(payload), string(requestBytes)); err != nil {
 		return zero, err
 	}
-	if err := s.postActivityAlerts(ctx, tx, task, agent, run, report.Activity); err != nil {
-		return zero, err
+	if oldState != report.Activity.State {
+		if err := s.postActivityAlerts(ctx, tx, task, agent, run, report.Activity); err != nil {
+			return zero, err
+		}
 	}
 	if err = tx.Commit(); err != nil {
 		return zero, err

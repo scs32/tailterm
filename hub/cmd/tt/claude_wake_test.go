@@ -53,6 +53,45 @@ func TestClaudeInputAllowlist(t *testing.T) {
 	}
 }
 
+func TestClaudeWrappedBrokerAndInboxInput(t *testing.T) {
+	broker := claudeBrokerPrompt("Tailterm obligations #13260", 13260, "wake_0123456789abcdef")
+	// The first screen is the editor region from a real 80x24 Claude pane.
+	actual80 := "❯ Tailterm obligations #13260. Run tt inbox --unread --mark-read. Wake          \n  wake_0123456789abcdef.\n────────────────────────────────────────────────────────────────────────────────\n  ⏵⏵ bypass permissions on (shift+tab to cycle)\n"
+	if !exactClaudeInput(actual80, broker) {
+		t.Fatal("real 80-column broker editor was not recognized")
+	}
+	maxInbox := "Tailterm messages #13260,#13261,#13262,#13263,#13264. Run tt inbox --unread --mark-read."
+	for _, tc := range []struct {
+		name, prompt string
+		width        int
+	}{
+		{"broker-40", broker, 40},
+		{"inbox-80", maxInbox, 80},
+		{"inbox-40", maxInbox, 40},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			// A narrow editor word-wraps into indented continuation lines.
+			var lines []string
+			line := "❯ "
+			for _, word := range strings.Fields(tc.prompt) {
+				if len([]rune(line))+len([]rune(word))+1 > tc.width && line != "❯ " {
+					lines = append(lines, line)
+					line = "  " + word
+				} else {
+					if line != "❯ " && line != "  " {
+						line += " "
+					}
+					line += word
+				}
+			}
+			lines = append(lines, line, strings.Repeat("─", tc.width), "  ⏵⏵ bypass permissions on")
+			if !exactClaudeInput(strings.Join(lines, "\n"), tc.prompt) {
+				t.Fatalf("wrapped %d-column input was not recognized: %q", tc.width, lines)
+			}
+		})
+	}
+}
+
 func TestClaudeWakeConfirmationAndNoResend(t *testing.T) {
 	t.Setenv("TAILTERM_RELAY_STATE", t.TempDir())
 	b := testClaudeBinding()
@@ -303,15 +342,20 @@ func TestClaudeWakeLivePrivateSession(t *testing.T) {
 	thread := "00000000-0000-4000-8000-" + strings.TrimPrefix(api.NewID("agt"), "agt_")[:12]
 	b := runtimeBinding{Hub: localHub.URL, Task: task.ID, Agent: agent.ID, Run: agent.RunID, Thread: thread, Runtime: "claude", Session: session}
 	// The child runs in the exact owned session with a test-only hub identity.
-	start := exec.Command("tmux", "-L", os.Getenv("TT_TMUX_SOCKET"), "new-session", "-d", "-s", session, "-c", trustedCwd, claude+" --session-id "+thread)
+	start := exec.Command("tmux", "-L", os.Getenv("TT_TMUX_SOCKET"), "new-session", "-d", "-x", "80", "-y", "24", "-s", session, "-c", trustedCwd, claude+" --session-id "+thread)
 	start.Env = append(os.Environ(), "TAILTERM_HUB="+b.Hub, "TAILTERM_TASK="+b.Task, "TAILTERM_AGENT="+b.Agent, "TAILTERM_RUN="+b.Run)
 	if out, err := start.CombinedOutput(); err != nil {
 		t.Fatalf("private tmux start: %v %s", err, out)
 	}
 	defer func() {
 		out, err := exec.Command("tmux", "-L", os.Getenv("TT_TMUX_SOCKET"), "kill-session", "-t", session).CombinedOutput()
-		t.Logf("private tmux cleanup: %v %s", err, strings.TrimSpace(string(out)))
+		t.Logf("private tmux cleanup session=%s socket=%s: %v %s", session, os.Getenv("TT_TMUX_SOCKET"), err, strings.TrimSpace(string(out)))
 	}()
+	if out, err := exec.Command("tmux", "-L", os.Getenv("TT_TMUX_SOCKET"), "display-message", "-p", "-t", session, "#{window_width}x#{window_height}").CombinedOutput(); err != nil || strings.TrimSpace(string(out)) != "80x24" {
+		t.Fatalf("private tmux dimensions: %q %v", out, err)
+	} else {
+		t.Logf("private tmux dimensions: %s", strings.TrimSpace(string(out)))
+	}
 	for key, value := range map[string]string{"TAILTERM_HUB": b.Hub, "TAILTERM_TASK": b.Task, "TAILTERM_AGENT": b.Agent, "TAILTERM_RUN": b.Run} {
 		if out, err := exec.Command("tmux", "-L", os.Getenv("TT_TMUX_SOCKET"), "set-environment", "-t", session, key, value).CombinedOutput(); err != nil {
 			t.Fatalf("session identity: %v %s", err, out)
@@ -346,7 +390,7 @@ func TestClaudeWakeLivePrivateSession(t *testing.T) {
 	idle := false
 	for time.Now().Before(deadline) {
 		if snap, err := nativeClaudeInspect(context.Background(), b, ""); err == nil && snap.Cursor.TurnComplete {
-			t.Logf("idle pane=%s session=%s created=%s offset=%d", snap.Pane, snap.SessionID, snap.Created, snap.Offset)
+			t.Logf("idle name=%s session=%s run=%s thread=%s pane=%s created=%s offset=%d", session, snap.SessionID, b.Run, b.Thread, snap.Pane, snap.Created, snap.Offset)
 			idle = true
 			break
 		} else if err != nil {
@@ -359,7 +403,7 @@ func TestClaudeWakeLivePrivateSession(t *testing.T) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
-	prompt := fmt.Sprintf("Tailterm messages #1. Run tt inbox --unread --mark-read.")
+	prompt := claudeBrokerPrompt("Tailterm obligations #13260", 13260, "wake_0123456789abcdef")
 	if err := claudeQueue(ctx, b, prompt); err != nil {
 		if screen, captureErr := exec.Command("tmux", "-L", os.Getenv("TT_TMUX_SOCKET"), "capture-pane", "-p", "-J", "-t", session).Output(); captureErr == nil {
 			t.Logf("dedicated pane after attempted wake: %q", string(screen))
