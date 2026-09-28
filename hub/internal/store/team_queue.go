@@ -1162,49 +1162,12 @@ func (s *Store) TeamQueueAction(ctx context.Context, task string, req api.TeamQu
 			}
 			e.CloseJSON = nil
 		case "accept":
-			if e.State != "running" || e.Acceptance != nil || e.Repository == "" || req.Acceptance == nil || req.HandlerAgentID != e.HandlerID || req.HandlerRunID != e.HandlerRunID {
+			if req.Acceptance == nil {
 				return zero, fmt.Errorf("%w: exact active handler and unaccepted team are required", api.ErrConflict)
 			}
-			var handlerRole, handlerStatus, handlerRun string
-			if err := tx.QueryRowContext(ctx, `SELECT role,status,run_id FROM agents WHERE task_id=? AND id=?`, task, req.HandlerAgentID).Scan(&handlerRole, &handlerStatus, &handlerRun); err != nil || handlerRole != api.AgentRoleDatabaseHandler || handlerRun != req.HandlerRunID || handlerStatus == api.AgentClosed || handlerStatus == api.AgentExited || handlerStatus == api.AgentRetired {
-				return zero, fmt.Errorf("%w: assigned handler run is unavailable", api.ErrConflict)
-			}
-			item, err := getWorkItem(tx, ctx, task, e.ItemID)
-			if err != nil {
+			if err = acceptTeamQueueEntry(ctx, tx, task, &e, *req.Acceptance, req.HandlerAgentID, req.HandlerRunID, now); err != nil {
 				return zero, err
 			}
-			candidate := *req.Acceptance
-			records, loadErr := verificationRecords(ctx, tx, task, item.ID)
-			if loadErr != nil {
-				return zero, loadErr
-			}
-			verificationPlan, _ := currentVerification(records)
-			required, enrollmentErr := verificationRequired(ctx, tx, task, item.ID)
-			if enrollmentErr != nil {
-				return zero, enrollmentErr
-			}
-			// A verified team is accepted on its verified base, which is the
-			// tasks-hub tip at launch rather than the queue-time base. Its plan
-			// may name the repository (its .git directory or its root) or the
-			// exact candidate worktree, which tt has already resolved to this
-			// entry's repository.
-			if required && (verificationPlan == nil || !verifiedRepository(verificationPlan.Repository, candidate) || (candidate.BaseCommit != e.BaseCommit && candidate.BaseCommit != verificationPlan.BaseCommit)) {
-				return zero, verificationConflict("acceptance repository/base mismatch")
-			}
-			base := e.BaseCommit
-			if required {
-				base = verificationPlan.BaseCommit
-				candidate.BaseCommit = base
-			}
-			if err = reviewCompletion(ctx, tx, item, candidate.Commit); err != nil {
-				return zero, err
-			}
-			if item.Status != "done" || candidate.ItemRevision != item.Revision || !reflect.DeepEqual(candidate.CompletionReport, item.CompletionReport) || candidate.Repository != e.Repository || candidate.BaseCommit != base || !filepath.IsAbs(candidate.Worktree) || filepath.Clean(candidate.Worktree) != candidate.Worktree || strings.ContainsRune(candidate.Worktree, '\x00') || !validGitCommit(candidate.Commit) || candidate.Branch == "" || len(candidate.Branch) > 200 || strings.ContainsAny(candidate.Branch, "\x00\n\r") || strings.TrimSpace(candidate.Evidence) == "" || candidate.AcceptedAt != "" {
-				return zero, api.ErrInvalid
-			}
-			candidate.AcceptedAt = now
-			e.Acceptance = &candidate
-			e.BaseCommit = base
 		case "finish":
 			if e.State != "running" || len(e.CloseJSON) == 0 {
 				return zero, api.ErrConflict
@@ -1311,25 +1274,8 @@ func (s *Store) TeamQueueAction(ctx context.Context, task string, req api.TeamQu
 	// Acceptance with a native exact-SHA receipt durably enqueues delivery in
 	// the same transaction. Legacy acceptance remains visibly unreleased.
 	if req.Operation == "accept" {
-		records, loadErr := verificationRecords(ctx, tx, task, e.ItemID)
-		if loadErr != nil {
-			return zero, loadErr
-		}
-		plan, receipt := currentVerification(records)
-		if plan != nil && receipt != nil {
-			_, p, r, gateErr := releaseCandidate(ctx, tx, task, e.ID)
-			if gateErr != nil {
-				return zero, gateErr
-			}
-			j := api.ReleaseJob{ID: api.NewID("rel"), TaskID: task, EntryID: e.ID, ItemID: e.ItemID, ItemRevision: e.Acceptance.ItemRevision, ScopeRevision: p.ScopeRevision, OrderMessageSeq: p.OrderMessageSeq, Repository: p.Repository, BaseCommit: p.BaseCommit, Commit: p.Commit, VerificationDigest: verificationDigest(r), Plan: p, State: "verified", Generation: 1, PauseGeneration: t.PauseGeneration}
-			b, marshalErr := json.Marshal(j)
-			if marshalErr != nil {
-				return zero, marshalErr
-			}
-			if _, insertErr := tx.ExecContext(ctx, `INSERT INTO release_jobs VALUES(?,?,?,?,?,?)`, task, j.ID, e.ID, j.State, j.Generation, string(b)); insertErr != nil {
-				return zero, insertErr
-			}
-			e.Release = &j
+		if err = enqueueAcceptedRelease(ctx, tx, t, &e); err != nil {
+			return zero, err
 		}
 	}
 	if req.Operation == "reorder" {
@@ -1359,4 +1305,82 @@ func verifiedRepository(planRepository string, a api.TeamIntegrationAcceptance) 
 		return true
 	}
 	return filepath.Base(repository) == ".git" && plan == filepath.Dir(repository)
+}
+
+// acceptTeamQueueEntry records the exact handler's integration acceptance on a
+// running, repository-backed entry. Both the queue accept operation and the
+// handler's done save use it, so they refuse exactly the same candidates.
+func acceptTeamQueueEntry(ctx context.Context, tx *sql.Tx, task string, e *api.TeamQueueEntry, candidate api.TeamIntegrationAcceptance, handlerAgent, handlerRun, now string) error {
+	if e.State != "running" || e.Acceptance != nil || e.Repository == "" || handlerAgent != e.HandlerID || handlerRun != e.HandlerRunID {
+		return fmt.Errorf("%w: exact active handler and unaccepted team are required", api.ErrConflict)
+	}
+	var handlerRole, handlerStatus, handlerRunID string
+	if err := tx.QueryRowContext(ctx, `SELECT role,status,run_id FROM agents WHERE task_id=? AND id=?`, task, handlerAgent).Scan(&handlerRole, &handlerStatus, &handlerRunID); err != nil || handlerRole != api.AgentRoleDatabaseHandler || handlerRunID != handlerRun || handlerStatus == api.AgentClosed || handlerStatus == api.AgentExited || handlerStatus == api.AgentRetired {
+		return fmt.Errorf("%w: assigned handler run is unavailable", api.ErrConflict)
+	}
+	item, err := getWorkItem(tx, ctx, task, e.ItemID)
+	if err != nil {
+		return err
+	}
+	records, err := verificationRecords(ctx, tx, task, item.ID)
+	if err != nil {
+		return err
+	}
+	verificationPlan, _ := currentVerification(records)
+	required, err := verificationRequired(ctx, tx, task, item.ID)
+	if err != nil {
+		return err
+	}
+	// A verified team is accepted on its verified base, which is the
+	// tasks-hub tip at launch rather than the queue-time base. Its plan
+	// may name the repository (its .git directory or its root) or the
+	// exact candidate worktree, which tt has already resolved to this
+	// entry's repository.
+	if required && (verificationPlan == nil || !verifiedRepository(verificationPlan.Repository, candidate) || (candidate.BaseCommit != e.BaseCommit && candidate.BaseCommit != verificationPlan.BaseCommit)) {
+		return verificationConflict("acceptance repository/base mismatch")
+	}
+	base := e.BaseCommit
+	if required {
+		base = verificationPlan.BaseCommit
+		candidate.BaseCommit = base
+	}
+	if err = reviewCompletion(ctx, tx, item, candidate.Commit); err != nil {
+		return err
+	}
+	if item.Status != "done" || candidate.ItemRevision != item.Revision || !reflect.DeepEqual(candidate.CompletionReport, item.CompletionReport) || candidate.Repository != e.Repository || candidate.BaseCommit != base || !filepath.IsAbs(candidate.Worktree) || filepath.Clean(candidate.Worktree) != candidate.Worktree || strings.ContainsRune(candidate.Worktree, '\x00') || !validGitCommit(candidate.Commit) || candidate.Branch == "" || len(candidate.Branch) > 200 || strings.ContainsAny(candidate.Branch, "\x00\n\r") || strings.TrimSpace(candidate.Evidence) == "" || candidate.AcceptedAt != "" {
+		return api.ErrInvalid
+	}
+	candidate.AcceptedAt = now
+	e.Acceptance = &candidate
+	e.BaseCommit = base
+	return nil
+}
+
+// enqueueAcceptedRelease durably enqueues delivery for an acceptance with a
+// native exact-SHA receipt, in the accepting transaction. The entry's
+// acceptance must already be written. Legacy acceptance remains visibly
+// unreleased.
+func enqueueAcceptedRelease(ctx context.Context, tx *sql.Tx, t api.Task, e *api.TeamQueueEntry) error {
+	records, err := verificationRecords(ctx, tx, t.ID, e.ItemID)
+	if err != nil {
+		return err
+	}
+	plan, receipt := currentVerification(records)
+	if plan == nil || receipt == nil {
+		return nil
+	}
+	_, p, r, err := releaseCandidate(ctx, tx, t.ID, e.ID)
+	if err != nil {
+		return err
+	}
+	j := api.ReleaseJob{ID: api.NewID("rel"), TaskID: t.ID, EntryID: e.ID, ItemID: e.ItemID, ItemRevision: e.Acceptance.ItemRevision, ScopeRevision: p.ScopeRevision, OrderMessageSeq: p.OrderMessageSeq, Repository: p.Repository, BaseCommit: p.BaseCommit, Commit: p.Commit, VerificationDigest: verificationDigest(r), Plan: p, State: "verified", Generation: 1, PauseGeneration: t.PauseGeneration}
+	b, err := json.Marshal(j)
+	if err != nil {
+		return err
+	}
+	if _, err = tx.ExecContext(ctx, `INSERT INTO release_jobs VALUES(?,?,?,?,?,?)`, t.ID, j.ID, e.ID, j.State, j.Generation, string(b)); err != nil {
+		return err
+	}
+	e.Release = &j
+	return nil
 }
