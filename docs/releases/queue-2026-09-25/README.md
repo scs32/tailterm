@@ -35,6 +35,9 @@ SHA-256 is of the unredacted receipt.
 | `8b1f4d4` | Owner obligations (`wi_deb2ce3cda1968d0`), browser fix (`wi_5a411a2a78e3ad9e`) | Requests to the owner are tracked with due times, shown as Discord cards and escalated | Hub `20260926-owner-obligations-8b1f4d4`, Mini `tt`, TailOS `892508b0` |
 | `c343819` | Receipt size (`wi_4aab49054893c8ce`, out-of-band) | The verification route accepts 1 MiB, so a full receipt can be saved | Hub `20260927-verification-body-c343819` |
 | `8e32dc0` | Deployment agent (`wi_c526e6f62370fbe9`) | Persistent project deployment role: release jobs, fenced release runner, rollback and receipts (not yet activated) | Hub `20260927-deployment-agent-8e32dc0`, Mini `tt`, TailOS `bff3ee3c` |
+| `9c99ddc` | Reviewer model (out-of-band) | Planned-template reviewers launch on Opus 5.5 instead of Fable, which hit its usage limit at every launch | Mini `tt`, TailOS `5c9063a5` |
+| `5480dae` | Queue acceptance (`wi_4656983381013e99`, out-of-band) | A verified team is accepted on its verified base and worktree, not the queue-time base | Hub `20260927-queue-accept-5480dae` |
+| `acfe2d0` | Token accounting (`wi_ca6a62f5e74114b4`) | Per-request token ledger by item, phase and role, with optional prices; `tt usage` and a TailOS Usage view | Hub `20260927-token-accounting-acfe2d0`, Mini `tt`, TailOS `784c6588` |
 
 ## Hub releases
 
@@ -49,10 +52,12 @@ SHA-256 is of the unredacted receipt.
 | `20260926-owner-obligations-8b1f4d4` | `before-owner-obligations-8b1f4d4.sqlite` | 134,545,408 | `af51a1cf…` | ok, 0 FK | new `owner_obligation_delegations`; `obligations.recipient_kind` column |
 | `20260927-verification-body-c343819` | `before-verification-body-c343819-v2.sqlite` | 136,441,856 | `c9160ac1…` | ok, 0 FK | none |
 | `20260927-deployment-agent-8e32dc0` | `before-deployment-agent-8e32dc0.sqlite` | 137,097,216 | `e876dfb9…` | ok, 0 FK | new `release_jobs`, `release_action_receipts`; unique index for one deployment agent per project |
+| `20260927-queue-accept-5480dae` | `before-queue-accept-5480dae.sqlite` | 137,195,520 | `bcccb27e…` | ok, 0 FK | none |
+| `20260927-token-accounting-acfe2d0` | `before-token-accounting-acfe2d0.sqlite` | 142,581,760 | `318c21f2…` | ok, 0 FK | seven new usage tables (turns, runs, receipts, prices, host usage) |
 
 Before `6235924`, the combined migration was rehearsed on a copy of the `33d3ab7` backup: the new
 hub migrated it (integrity ok, no FK violations, 14 projects, queue at limit 1), and the
-`33d3ab7` hub opened the migrated copy. The `34944cf`, `8b1f4d4` and `8e32dc0` migrations were rehearsed
+`33d3ab7` hub opened the migrated copy. The `34944cf`, `8b1f4d4`, `8e32dc0` and `acfe2d0` migrations were rehearsed
 the same way on a copy of the previous release's backup, including the old hub opening the
 migrated copy. The first `c343819` deploy attempt was refused by plan validation before any
 change (the plan carried the previous day's release name); the second, with a fresh backup
