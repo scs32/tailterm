@@ -343,6 +343,9 @@ func (s *Store) UpdateWorkItem(ctx context.Context, taskID, itemID string, req a
 		if err = reviewCompletion(ctx, tx, gateItem, ""); err != nil {
 			return api.WorkItem{}, err
 		}
+		if _, err = doneSaveQueueGate(ctx, tx, taskID, itemID, req.AgentID, nil); err != nil {
+			return api.WorkItem{}, err
+		}
 	}
 	transitioningDone := item.Kind == "feature" && item.Status != "done" && req.Status != nil && *req.Status == "done"
 	if transitioningDone {
@@ -467,6 +470,9 @@ func validateCreateWorkItemUpdate(taskID, itemID string, req api.CreateWorkItemU
 	if req.Priority != nil && !validWorkItemPriority(*req.Priority) {
 		return api.ErrInvalid
 	}
+	if a := req.QueueAcceptance; a != nil && (req.Status == nil || *req.Status != "done" || req.RunID == "" || !validTeamQueueID(a.EntryID) || a.Worktree == "" || a.Branch == "" || a.Commit == "") {
+		return api.ErrInvalid
+	}
 	return nil
 }
 
@@ -549,12 +555,16 @@ func (s *Store) CreateWorkItemUpdate(ctx context.Context, taskID, itemID string,
 	if item.Revision != req.ExpectedRevision {
 		return api.WorkItemUpdateResult{}, false, workItemConflict("work item revision changed; refresh it before updating")
 	}
+	var queueEntry *api.TeamQueueEntry
 	if req.Status != nil && *req.Status == "done" {
 		gateItem := item
 		if req.Title != nil || req.Description != nil {
 			gateItem.ScopeRevision++
 		}
 		if err = reviewCompletion(ctx, tx, gateItem, ""); err != nil {
+			return api.WorkItemUpdateResult{}, false, err
+		}
+		if queueEntry, err = doneSaveQueueGate(ctx, tx, taskID, itemID, req.AgentID, req.QueueAcceptance); err != nil {
 			return api.WorkItemUpdateResult{}, false, err
 		}
 	}
@@ -653,6 +663,11 @@ func (s *Store) CreateWorkItemUpdate(ctx context.Context, taskID, itemID string,
 	}
 	if err = s.syncQueueForWorkItem(ctx, tx, item, req.RunID, by); err != nil {
 		return api.WorkItemUpdateResult{}, false, err
+	}
+	if queueEntry != nil {
+		if err = acceptTeamQueueOnDoneSave(ctx, tx, task, queueEntry, *req.QueueAcceptance, req.AgentID, req.RunID, receipt.ID, ts(now)); err != nil {
+			return api.WorkItemUpdateResult{}, false, err
+		}
 	}
 	if _, err = s.insertEvent(ctx, tx, taskID, "work_item_updated", req.AgentID, item.Title, map[string]any{"itemId": item.ID, "kind": item.Kind, "revision": item.Revision, "fields": changedFields, "requestId": req.RequestID}, by); err != nil {
 		return api.WorkItemUpdateResult{}, false, err

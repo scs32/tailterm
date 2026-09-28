@@ -117,7 +117,7 @@ func TestHandlerQueueAcceptanceInstructionsReachPrimaryAndAuxiliary(t *testing.T
 	auxiliary := api.Agent{ID: "agt_0000000000000002", Name: "aux-handler", Role: api.AgentRoleDatabaseHandler, Status: api.AgentRunning}
 	for _, handler := range []api.Agent{primary, auxiliary} {
 		briefing := agentTaskBriefingForLaunch(task, handler.Name, handler.Role, "tt", []api.Agent{primary, auxiliary}, 0)
-		for _, required := range []string{"After saving terminal acceptance", "tt team queue accept", "--entry", "--worktree", "--branch", "--commit", "--evidence", "exact leased handler", "Ready to integrate"} {
+		for _, required := range []string{"same done save", "tt work-items update", "--status done", "tt team queue accept", "--entry", "--worktree", "--branch", "--commit", "--evidence", "exact leased handler", "no-op", "Ready to integrate"} {
 			if !strings.Contains(briefing, required) {
 				t.Errorf("%s missing %q", handler.Name, required)
 			}

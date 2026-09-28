@@ -184,13 +184,9 @@ func cmdTeamQueue(e env, args []string) error {
 			if e.agent == "" || e.runID == "" || e.agent != q.HandlerID || e.runID != q.HandlerRunID || *worktree == "" || *branch == "" || *commit == "" || *acceptanceEvidence == "" {
 				return errors.New("accept requires the exact assigned handler and --worktree, --branch, --commit and --evidence")
 			}
-			realWorktree, err := filepath.EvalSymlinks(*worktree)
-			if err != nil || !filepath.IsAbs(realWorktree) {
-				return errors.New("accepted worktree must be an existing absolute path")
-			}
-			repository, err := queueRepositoryScope(realWorktree, nil)
-			if err != nil || repository != q.Repository {
-				return errors.New("accepted worktree is outside the frozen repository")
+			realWorktree, err := acceptedWorktree(*worktree, q.Repository)
+			if err != nil {
+				return err
 			}
 			item, err := c.GetWorkItem(ctx, *task, q.ItemID)
 			if err != nil {

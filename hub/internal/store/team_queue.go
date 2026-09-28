@@ -1165,6 +1165,12 @@ func (s *Store) TeamQueueAction(ctx context.Context, task string, req api.TeamQu
 			if req.Acceptance == nil {
 				return zero, fmt.Errorf("%w: exact active handler and unaccepted team are required", api.ErrConflict)
 			}
+			if (e.State == "running" || e.State == "finished") && e.Acceptance != nil && req.HandlerAgentID == e.HandlerID && req.HandlerRunID == e.HandlerRunID && sameTeamAcceptance(*e.Acceptance, *req.Acceptance) {
+				// Recovery re-accept of the saved tuple (for example after the
+				// handler's done save already recorded it) changes nothing: no
+				// new revision and no second release job.
+				return e, nil
+			}
 			if err = acceptTeamQueueEntry(ctx, tx, task, &e, *req.Acceptance, req.HandlerAgentID, req.HandlerRunID, now); err != nil {
 				return zero, err
 			}
@@ -1383,4 +1389,84 @@ func enqueueAcceptedRelease(ctx context.Context, tx *sql.Tx, t api.Task, e *api.
 	}
 	e.Release = &j
 	return nil
+}
+
+// sameTeamAcceptance reports whether a submitted acceptance names the saved
+// one. Evidence text and the acceptance time are not part of the identity.
+func sameTeamAcceptance(saved, submitted api.TeamIntegrationAcceptance) bool {
+	return saved.Repository == submitted.Repository && saved.BaseCommit == submitted.BaseCommit && saved.Worktree == submitted.Worktree && saved.Branch == submitted.Branch && saved.Commit == submitted.Commit && saved.ItemRevision == submitted.ItemRevision && reflect.DeepEqual(saved.CompletionReport, submitted.CompletionReport)
+}
+
+// pendingTeamQueueAcceptance returns the item's running, repository-backed team
+// queue entry that still waits on handler acceptance, or nil.
+func pendingTeamQueueAcceptance(ctx context.Context, tx *sql.Tx, task, item string) (*api.TeamQueueEntry, error) {
+	e, err := scanTeamQueue(tx.QueryRowContext(ctx, `SELECT `+teamQueueCols+` FROM team_queue_entries WHERE task_id=? AND item_id=? AND state='running' AND repository<>'' AND acceptance_json='' ORDER BY position LIMIT 1`, task, item))
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &e, nil
+}
+
+// doneSaveQueueGate checks a done save against the item's team queue before
+// any write. A save that carries an acceptance must name the entry waiting on
+// it. A database handler's save without one is refused while an entry waits,
+// so the queue can no longer stall on a separate remembered accept. Owner and
+// UI saves are unchanged; tt team queue accept stays their recovery path.
+func doneSaveQueueGate(ctx context.Context, tx *sql.Tx, task, item, agentID string, accept *api.WorkItemQueueAcceptance) (*api.TeamQueueEntry, error) {
+	pending, err := pendingTeamQueueAcceptance(ctx, tx, task, item)
+	if err != nil {
+		return nil, err
+	}
+	if accept != nil {
+		if pending == nil || pending.ID != accept.EntryID {
+			return nil, fmt.Errorf("%w: no running team queue entry waits on this acceptance", api.ErrConflict)
+		}
+		return pending, nil
+	}
+	if pending == nil || agentID == "" {
+		return nil, nil
+	}
+	var role string
+	if err = tx.QueryRowContext(ctx, `SELECT role FROM agents WHERE task_id=? AND id=?`, task, agentID).Scan(&role); err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return nil, err
+	}
+	if role == api.AgentRoleDatabaseHandler {
+		return nil, fmt.Errorf("%w: team queue entry %s waits on acceptance; save done with the accepted --worktree, --branch and --commit", api.ErrConflict, pending.ID)
+	}
+	return nil, nil
+}
+
+// acceptTeamQueueOnDoneSave records the queue acceptance inside the handler's
+// done save, after the item row and its update receipt are written. Any
+// refusal rolls back the whole save, so the item stays open.
+func acceptTeamQueueOnDoneSave(ctx context.Context, tx *sql.Tx, t api.Task, e *api.TeamQueueEntry, accept api.WorkItemQueueAcceptance, agentID, runID, receiptID, now string) error {
+	item, err := getWorkItem(tx, ctx, t.ID, e.ItemID)
+	if err != nil {
+		return err
+	}
+	evidence := accept.Evidence
+	if evidence == "" {
+		evidence = fmt.Sprintf("handler-saved completion receipt %s revision %d", receiptID, item.Revision)
+	}
+	candidate := api.TeamIntegrationAcceptance{Repository: e.Repository, BaseCommit: e.BaseCommit, Worktree: accept.Worktree, Branch: accept.Branch, Commit: accept.Commit, ItemRevision: item.Revision, CompletionReport: item.CompletionReport, Evidence: evidence}
+	prior := e.Revision
+	if err = acceptTeamQueueEntry(ctx, tx, t.ID, e, candidate, agentID, runID, now); err != nil {
+		return err
+	}
+	e.Revision++
+	data, err := json.Marshal(e.Acceptance)
+	if err != nil {
+		return err
+	}
+	result, err := tx.ExecContext(ctx, `UPDATE team_queue_entries SET revision=?,acceptance_json=?,base_commit=?,updated_at=? WHERE task_id=? AND id=? AND revision=?`, e.Revision, string(data), e.BaseCommit, now, t.ID, e.ID, prior)
+	if err != nil {
+		return err
+	}
+	if rows, rowsErr := result.RowsAffected(); rowsErr != nil || rows != 1 {
+		return fmt.Errorf("%w: entry revision changed", api.ErrConflict)
+	}
+	return enqueueAcceptedRelease(ctx, tx, t, e)
 }

@@ -105,8 +105,19 @@ func queueIntegrationSnapshot(ctx context.Context, q api.TeamQueueEntry, item ap
 	if item.Status != "done" || accepted == nil || q.Repository == "" || q.BaseCommit == "" || accepted.Repository != q.Repository || accepted.BaseCommit != q.BaseCommit || accepted.ItemRevision != item.Revision || !reflect.DeepEqual(accepted.CompletionReport, item.CompletionReport) {
 		return nil, errors.New("accepted item lacks an exact saved handler acceptance receipt")
 	}
+	if err := verifyAcceptedGit(ctx, q.Repository, q.BaseCommit, accepted.Worktree, accepted.Branch, accepted.Commit); err != nil {
+		return nil, err
+	}
+	return &api.TeamIntegrationReady{Repository: accepted.Repository, BaseCommit: accepted.BaseCommit, Worktree: accepted.Worktree, Branch: accepted.Branch, Commit: accepted.Commit, Evidence: accepted.Evidence}, nil
+}
+
+// verifyAcceptedGit checks an accepted builder result on this host: the
+// worktree is its canonical Git root in the frozen repository, sits on the
+// accepted branch and commit, is clean and descends from the frozen base.
+// tt team queue accept, the handler's done save and the runner share it.
+func verifyAcceptedGit(ctx context.Context, repository, base, worktree, branch, commit string) error {
 	git := func(args ...string) (string, error) {
-		argv := append([]string{"-C", accepted.Worktree}, args...)
+		argv := append([]string{"-C", worktree}, args...)
 		output, err := exec.CommandContext(ctx, "git", argv...).Output()
 		if err != nil {
 			return "", err
@@ -115,50 +126,64 @@ func queueIntegrationSnapshot(ctx context.Context, q api.TeamQueueEntry, item ap
 	}
 	root, err := git("rev-parse", "--show-toplevel")
 	if err != nil {
-		return nil, err
+		return err
 	}
 	realRoot, err := filepath.EvalSymlinks(root)
 	if err != nil {
-		return nil, err
+		return err
 	}
-	realAccepted, err := filepath.EvalSymlinks(accepted.Worktree)
+	realAccepted, err := filepath.EvalSymlinks(worktree)
 	if err != nil || realRoot != realAccepted {
-		return nil, errors.New("accepted worktree is not its canonical Git root")
+		return errors.New("accepted worktree is not its canonical Git root")
 	}
 	common, err := git("rev-parse", "--git-common-dir")
 	if err != nil {
-		return nil, err
+		return err
 	}
 	if !filepath.IsAbs(common) {
-		common = filepath.Join(accepted.Worktree, common)
+		common = filepath.Join(worktree, common)
 	}
 	common, err = filepath.EvalSymlinks(common)
 	if err != nil {
-		return nil, err
+		return err
 	}
-	if common != q.Repository {
-		return nil, errors.New("repository identity changed before integration receipt")
+	if common != repository {
+		return errors.New("repository identity changed before integration receipt")
 	}
-	branch, err := git("symbolic-ref", "--short", "HEAD")
-	if err != nil || branch == "" {
-		return nil, errors.New("accepted worktree has no branch")
+	head, err := git("symbolic-ref", "--short", "HEAD")
+	if err != nil || head == "" {
+		return errors.New("accepted worktree has no branch")
 	}
-	commit, err := git("rev-parse", "HEAD")
+	sha, err := git("rev-parse", "HEAD")
 	if err != nil {
-		return nil, err
+		return err
 	}
-	if branch != accepted.Branch || commit != accepted.Commit {
-		return nil, errors.New("accepted worktree moved from the saved branch and commit")
+	if head != branch || sha != commit {
+		return errors.New("accepted worktree moved from the saved branch and commit")
 	}
 	status, err := git("status", "--porcelain")
 	if err != nil {
-		return nil, err
+		return err
 	}
 	if status != "" {
-		return nil, errors.New("accepted worktree is dirty")
+		return errors.New("accepted worktree is dirty")
 	}
-	if _, err := git("merge-base", "--is-ancestor", q.BaseCommit, commit); err != nil {
-		return nil, errors.New("accepted commit is not descended from frozen base")
+	if _, err := git("merge-base", "--is-ancestor", base, sha); err != nil {
+		return errors.New("accepted commit is not descended from frozen base")
 	}
-	return &api.TeamIntegrationReady{Repository: accepted.Repository, BaseCommit: accepted.BaseCommit, Worktree: accepted.Worktree, Branch: accepted.Branch, Commit: accepted.Commit, Evidence: accepted.Evidence}, nil
+	return nil
+}
+
+// acceptedWorktree resolves an accepted builder worktree and checks that it
+// belongs to the entry's frozen repository.
+func acceptedWorktree(worktree, repository string) (string, error) {
+	realWorktree, err := filepath.EvalSymlinks(worktree)
+	if err != nil || !filepath.IsAbs(realWorktree) {
+		return "", errors.New("accepted worktree must be an existing absolute path")
+	}
+	scope, err := queueRepositoryScope(realWorktree, nil)
+	if err != nil || scope != repository {
+		return "", errors.New("accepted worktree is outside the frozen repository")
+	}
+	return realWorktree, nil
 }
