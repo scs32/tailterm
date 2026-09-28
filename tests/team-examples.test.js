@@ -186,6 +186,8 @@ test("Planned delivery marks verification-owned criteria pending for the reviewe
   const lead = members.find((member) => member.name === "lead").prompt;
   const reviewer = members.find((member) => member.name === "reviewer").prompt;
   assert.match(lead, /--verification-criterion aN on ASSIGN and REVIEW/);
+  assert.match(lead, /send builder one ASSIGN/);
+  assert.match(lead, /do not narrate record bookkeeping on the board yourself/);
   assert.match(reviewer, /Mark verification-owned criteria pending-verification/);
   assert.match(reviewer, /handler-imported eligible receipt judges those criteria/);
 });

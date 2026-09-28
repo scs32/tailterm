@@ -286,6 +286,54 @@ func TestReviewConvergenceVerificationOwnership(t *testing.T) {
 	}
 }
 
+func TestProbeReclassifiedBlockerWedge(t *testing.T) {
+	f := newConvergenceFixture(t)
+	r1 := f.review(t, candidateA)
+	blocker := api.ReviewFinding{ID: "b1", Criterion: "a2", Title: "Retry loses state", File: "fixture.go", Line: 7}
+	failed := map[string]string{"a1": "pass", "a2": "fail"}
+	if _, err := f.post(f.resultEnv(candidateA, failed, api.ReviewMetadata{Mode: "general", Blockers: []api.ReviewFinding{blocker}}), "", r1.Seq, f.reviewer); err != nil {
+		t.Fatal(err)
+	}
+	desc := "scope revision after first completed review"
+	var err error
+	f.item, err = f.s.UpdateWorkItem(f.ctx, f.task.ID, f.item.ID, api.UpdateWorkItemRequest{Revision: f.item.Revision, Description: &desc}, f.by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	badAssign := api.Envelope{Kind: "assign", Subject: "Attempt verification reclassification", Body: api.EnvelopeBody{Objective: "fixture", Owns: []string{"fixture"}, Acceptance: f.criteria, VerificationCriteria: []string{"a2"}}}
+	if _, err := f.post(badAssign, f.builder.ID, 0, api.Agent{}); !errors.Is(err, api.ErrConflict) {
+		t.Fatal("reclassified blocked criterion", err)
+	}
+	goodAssign := badAssign
+	goodAssign.Body.VerificationCriteria = nil
+	if _, err := f.post(goodAssign, f.builder.ID, 0, api.Agent{}); err != nil {
+		t.Fatal(err)
+	}
+	badReview := api.Envelope{Kind: "review", Subject: "Attempt review reclassification", Body: api.EnvelopeBody{Candidate: candidateB, Scope: "fixture", Acceptance: f.criteria, VerificationCriteria: []string{"a2"}}}
+	if _, err := f.post(badReview, f.reviewer.ID, 0, api.Agent{}); !errors.Is(err, api.ErrConflict) {
+		t.Fatal("review reclassified blocked criterion", err)
+	}
+	r2 := f.review(t, candidateB)
+	if _, err := f.post(f.resultEnv(candidateB, failed, api.ReviewMetadata{Mode: "general", Blockers: []api.ReviewFinding{blocker}}), "", r2.Seq, f.reviewer); err != nil {
+		t.Fatal(err)
+	}
+	decision := api.Envelope{Kind: "notice", Subject: "Record owner decision for unresolved blocker", Body: api.EnvelopeBody{Text: "decision"}, Review: &api.ReviewMetadata{Mode: "disposition", Disposition: "owner-decision", Candidate: candidateB}}
+	if _, err := f.post(decision, "", 0, api.Agent{}); err != nil {
+		t.Fatal(err)
+	}
+	decision.Review.Disposition = "owner-accept"
+	if _, err := f.post(decision, "", 0, api.Agent{}); err != nil {
+		t.Fatal(err)
+	}
+	state := f.state(t)
+	if len(state.Rounds) != 2 || state.Rounds[1].ResultSeq == 0 || state.Disposition == nil || state.Disposition.Kind != "owner-accept" {
+		t.Fatal("owner path wedged", state)
+	}
+	if _, err := f.post(badReview, f.reviewer.ID, 0, api.Agent{}); !errors.Is(err, api.ErrConflict) {
+		t.Fatal("third round", err)
+	}
+}
+
 func TestReviewConvergenceVerificationReceiptAcceptance(t *testing.T) {
 	f, h, p := verificationFixture(t, verificationOwnershipFixture{map[string]string{"a1": "code", "a2": "matrix"}, []string{"a2"}})
 	r := f.review(t, candidateA)
@@ -344,13 +392,17 @@ func TestReviewConvergenceVerificationReceiptRefusals(t *testing.T) {
 				t.Fatal(err)
 			}
 			if tc.receipt {
+				if tc.stale {
+					p.Commit = candidateC
+				}
 				saveFixtureVerification(t, f, h, p, 0)
 			}
-			candidate := candidateA
 			if tc.stale {
-				candidate = candidateB
+				if err := reviewReady(f.state(t), f.item.ScopeRevision, candidateA); err != nil {
+					t.Fatal("review gate should pass before stale receipt gate", err)
+				}
 			}
-			accept := api.Envelope{Kind: "notice", Subject: "Attempt fixture candidate acceptance", Body: api.EnvelopeBody{Text: "accept"}, Review: &api.ReviewMetadata{Mode: "disposition", Disposition: "accept", Candidate: candidate}}
+			accept := api.Envelope{Kind: "notice", Subject: "Attempt fixture candidate acceptance", Body: api.EnvelopeBody{Text: "accept"}, Review: &api.ReviewMetadata{Mode: "disposition", Disposition: "accept", Candidate: candidateA}}
 			if _, err := f.post(accept, "", 0, f.lead); !errors.Is(err, api.ErrConflict) {
 				t.Fatal("gate bypass", err)
 			}
@@ -359,6 +411,31 @@ func TestReviewConvergenceVerificationReceiptRefusals(t *testing.T) {
 			}
 		})
 	}
+	t.Run("stale-scope-receipt", func(t *testing.T) {
+		f, h, p := verificationFixture(t, verificationOwnershipFixture{map[string]string{"a1": "code", "a2": "matrix"}, []string{"a2"}})
+		saveFixtureVerification(t, f, h, p, 0)
+		desc := "scope revision invalidates prior receipt"
+		var err error
+		f.item, err = f.s.UpdateWorkItem(f.ctx, f.task.ID, f.item.ID, api.UpdateWorkItemRequest{Revision: f.item.Revision, Description: &desc}, f.by)
+		if err != nil {
+			t.Fatal(err)
+		}
+		assign := api.Envelope{Kind: "assign", Subject: "Assign current verification scope", Body: api.EnvelopeBody{Objective: "fixture", Owns: []string{"fixture"}, Acceptance: f.criteria, VerificationCriteria: f.verificationCriteria}}
+		if _, err := f.post(assign, f.builder.ID, 0, f.lead); err != nil {
+			t.Fatal(err)
+		}
+		r := f.review(t, candidateA)
+		if _, err := f.post(f.resultEnv(candidateA, map[string]string{"a1": "pass", "a2": "pending-verification"}, api.ReviewMetadata{Mode: "general"}), "", r.Seq, f.reviewer); err != nil {
+			t.Fatal(err)
+		}
+		if err := reviewReady(f.state(t), f.item.ScopeRevision, candidateA); err != nil {
+			t.Fatal("current review gate should pass", err)
+		}
+		accept := api.Envelope{Kind: "notice", Subject: "Attempt current scope acceptance", Body: api.EnvelopeBody{Text: "accept"}, Review: &api.ReviewMetadata{Mode: "disposition", Disposition: "accept", Candidate: candidateA}}
+		if _, err := f.post(accept, "", 0, f.lead); !errors.Is(err, api.ErrConflict) {
+			t.Fatal("stale scope receipt accepted", err)
+		}
+	})
 }
 
 func TestReviewConvergenceVerificationHistoryFixtures(t *testing.T) {

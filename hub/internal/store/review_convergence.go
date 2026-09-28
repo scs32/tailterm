@@ -128,6 +128,21 @@ func verificationOwned(ids []string, key string) bool {
 	}
 	return false
 }
+func compatibleVerificationDesignation(state api.ReviewConvergence, ids []string) error {
+	for _, id := range ids {
+		for _, round := range state.Rounds {
+			if round.ResultSeq != 0 && round.Verdicts[id] != "" && round.Verdicts[id] != "pending-verification" {
+				return reviewConflict("cannot reclassify completed reviewer verdict for " + id)
+			}
+			for _, blocker := range round.Blockers {
+				if blocker.Criterion == id {
+					return reviewConflict("cannot reclassify criterion with prior blocker " + id)
+				}
+			}
+		}
+	}
+	return nil
+}
 func completeVerdicts(criteria map[string]string, owned []string, verdicts map[string]string) error {
 	if len(criteria) != len(verdicts) {
 		return reviewConflict("verdicts must cover every frozen criterion")
@@ -401,6 +416,9 @@ func (s *Store) applyReviewConvergence(ctx context.Context, tx *sql.Tx, m api.Me
 		}
 		sc := scopeFor(&state, item.ScopeRevision)
 		owned := normalizedVerificationCriteria(e.Body.VerificationCriteria)
+		if err = compatibleVerificationDesignation(state, owned); err != nil {
+			return err
+		}
 		if sc != nil && (!reflect.DeepEqual(sc.Criteria, e.Body.Acceptance) || !reflect.DeepEqual(normalizedVerificationCriteria(sc.VerificationCriteria), owned)) {
 			return reviewConflict("criteria frozen; revision-checked scope update required")
 		}
@@ -433,6 +451,9 @@ func (s *Store) applyReviewConvergence(ctx context.Context, tx *sql.Tx, m api.Me
 			return reviewConflict("previous general review is incomplete")
 		}
 		sc := scopeFor(&state, item.ScopeRevision)
+		if err = compatibleVerificationDesignation(state, normalizedVerificationCriteria(e.Body.VerificationCriteria)); err != nil {
+			return err
+		}
 		if sc == nil || !reflect.DeepEqual(sc.Criteria, e.Body.Acceptance) || !reflect.DeepEqual(normalizedVerificationCriteria(sc.VerificationCriteria), normalizedVerificationCriteria(e.Body.VerificationCriteria)) {
 			return reviewConflict("review must use frozen assignment criteria")
 		}
