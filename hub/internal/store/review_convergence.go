@@ -439,8 +439,10 @@ func (s *Store) applyReviewConvergence(ctx context.Context, tx *sql.Tx, m api.Me
 		if e.Kind != "notice" {
 			return reviewConflict("disposition requires NOTICE")
 		}
-		// owner-accept is the owner's own resolution of an owner-decision
-		// disposition: it binds one exact candidate and never comes from an agent.
+		// owner-accept is the owner's own resolution of an owner-decision or
+		// follow-ups disposition: it binds one exact candidate and never comes
+		// from an agent. Resolving follow-ups also requires the candidate's
+		// independent verification to be ready, as an ordinary accept does.
 		ownerAccept := meta.Disposition == "owner-accept"
 		if ownerAccept {
 			if req.AgentID != "" || req.RunID != "" {
@@ -455,8 +457,13 @@ func (s *Store) applyReviewConvergence(ctx context.Context, tx *sql.Tx, m api.Me
 		if len(state.Rounds) == 0 || state.Rounds[len(state.Rounds)-1].ResultSeq == 0 {
 			return reviewConflict("completed review required for disposition")
 		}
-		if ownerAccept && (state.Disposition == nil || state.Disposition.Kind != "owner-decision") {
-			return reviewConflict("owner-accept resolves an owner-decision disposition")
+		if ownerAccept && (state.Disposition == nil || (state.Disposition.Kind != "owner-decision" && state.Disposition.Kind != "follow-ups")) {
+			return reviewConflict("owner-accept resolves an owner-decision or follow-ups disposition")
+		}
+		if ownerAccept && state.Disposition.Kind == "follow-ups" {
+			if err = verificationReady(ctx, tx, item, meta.Candidate); err != nil {
+				return err
+			}
 		}
 		if state.Disposition != nil && !ownerAccept {
 			return reviewConflict("disposition already recorded")

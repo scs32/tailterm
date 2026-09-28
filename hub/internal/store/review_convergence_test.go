@@ -958,3 +958,52 @@ func TestReviewConvergenceOwnerAcceptResolvesOwnerDecision(t *testing.T) {
 		t.Fatal("owner-accepted exact commit", err)
 	}
 }
+
+// A follow-ups disposition recorded while independent verification was pending
+// left no acceptance path (wi_be41cf76f6148a9c). The owner may resolve it with
+// owner-accept, but only once the candidate's verification is ready.
+func TestReviewConvergenceOwnerAcceptResolvesFollowUpsAfterVerification(t *testing.T) {
+	f := newConvergenceFixture(t)
+	partial := map[string]string{"a1": "pass", "a2": "partial"}
+	for _, candidate := range []string{candidateA, candidateB} {
+		r := f.review(t, candidate)
+		if _, err := f.post(f.resultEnv(candidate, partial, api.ReviewMetadata{Mode: "general"}), "", r.Seq, f.reviewer); err != nil {
+			t.Fatal(err)
+		}
+	}
+	disposition := func(kind, candidate string, from api.Agent) error {
+		_, err := f.post(api.Envelope{Kind: "notice", Subject: "Record the review disposition", Review: &api.ReviewMetadata{Mode: "disposition", Disposition: kind, Candidate: candidate}, Body: api.EnvelopeBody{Text: kind}}, "", 0, from)
+		return err
+	}
+	if err := disposition("follow-ups", candidateB, api.Agent{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := disposition("accept", candidateB, api.Agent{}); !errors.Is(err, api.ErrConflict) {
+		t.Fatal("ordinary accept after follow-ups", err)
+	}
+	if err := disposition("owner-accept", candidateB, f.reviewer); !errors.Is(err, api.ErrConflict) {
+		t.Fatal("agent-authored owner-accept", err)
+	}
+	if _, err := f.s.db.Exec(`INSERT INTO verification_enrollments(task_id,item_id,agent_id,run_id,required,provenance,created_at) VALUES(?,?,?,?,1,'fixture','2026-09-28T00:00:00Z')`, f.item.TaskID, f.item.ID, api.NewID("agt"), api.NewID("run")); err != nil {
+		t.Fatal(err)
+	}
+	if err := disposition("owner-accept", candidateB, api.Agent{}); err == nil {
+		t.Fatal("owner-accept resolved follow-ups without verification")
+	}
+	seedPassingVerification(t, f.s, f.item, candidateB)
+	if err := disposition("owner-accept", candidateB, api.Agent{}); err != nil {
+		t.Fatal("owner-accept after verification", err)
+	}
+	state := f.state(t)
+	if len(state.Dispositions) != 2 || state.Dispositions[0].Kind != "follow-ups" || state.Disposition.Kind != "owner-accept" {
+		t.Fatal("history not preserved", state.Dispositions)
+	}
+	tx, err := f.s.db.BeginTx(f.ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback()
+	if err = reviewCompletion(f.ctx, tx, f.item, candidateB); err != nil {
+		t.Fatal("owner-accepted exact commit", err)
+	}
+}
