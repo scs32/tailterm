@@ -14,7 +14,7 @@ import {
 import { resolve, relative, join, isAbsolute } from "node:path";
 import { tmpdir } from "node:os";
 import { createHash } from "node:crypto";
-import { execFileSync, spawnSync } from "node:child_process";
+import { execFileSync, spawn, spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
 export function canonical(value) {
@@ -197,8 +197,9 @@ export function matrixPolicy(matrix, checks) {
   return { maxAttempts: 3, ...(knownFailures.length ? { knownFailures } : {}) };
 }
 export function receiptEligible(receipt) {
-  return receipt.checks.every(
-    (c) => c.exitCode === 0 || c.knownFailure === true,
+  return (
+    !receipt.environment?.VERIFICATION_HOME_CLEANUP_ERROR &&
+    receipt.checks.every((c) => c.exitCode === 0 || c.knownFailure === true)
   );
 }
 export function makePlan(context, cwd) {
@@ -288,87 +289,7 @@ export function occupiedPorts(check) {
     return [{ port, pids: [...new Set(pids)] }];
   });
 }
-async function checkController() {
-  const { spawn } = await import("node:child_process");
-  const argv = JSON.parse(process.argv[1]),
-    timeout = Number(process.argv[2]);
-  const child = spawn(argv[0], argv.slice(1), {
-    detached: true,
-    stdio: ["ignore", "pipe", "pipe"],
-  });
-  let stdout = [],
-    stderr = [],
-    size = 0,
-    reason = "",
-    closed = false,
-    forced = false,
-    code = -1,
-    signal = "",
-    timer,
-    killTimer;
-  const signalGroup = (kind) => {
-    if (!child.pid) return;
-    try {
-      process.kill(-child.pid, kind);
-    } catch (error) {
-      if (error.code !== "ESRCH")
-        stderr.push(Buffer.from("\nGroup signal: " + error.message));
-    }
-  };
-  let finished = false;
-  const finish = () => {
-    if (finished || !closed || (reason && !forced)) return;
-    finished = true;
-    clearTimeout(timer);
-    clearTimeout(killTimer);
-    process.stdout.write(
-      JSON.stringify({
-        status:
-          reason === "timeout" ? 124 : reason === "output-limit" ? 125 : code,
-        stdout: Buffer.concat(stdout).toString(),
-        stderr: Buffer.concat(stderr).toString(),
-        failureReason: reason || (code !== 0 ? "exit" : ""),
-        signal,
-      }),
-    );
-  };
-  const stop = (why) => {
-    if (reason) return;
-    reason = why;
-    clearTimeout(timer);
-    signalGroup("SIGTERM");
-    killTimer = setTimeout(() => {
-      signalGroup("SIGKILL");
-      forced = true;
-      finish();
-    }, 250);
-  };
-  const capture = (dest) => (data) => {
-    size += data.length;
-    if (size > 128 * 1024 * 1024) {
-      stop("output-limit");
-      return;
-    }
-    dest.push(data);
-  };
-  child.stdout.on("data", capture(stdout));
-  child.stderr.on("data", capture(stderr));
-  child.on("error", (error) => {
-    stderr.push(Buffer.from(error.message));
-    reason = "spawn";
-    forced = true;
-    closed = true;
-    finish();
-  });
-  child.on("close", (status, whichSignal) => {
-    code = status ?? -1;
-    signal = whichSignal || "";
-    closed = true;
-    finish();
-  });
-  timer = setTimeout(() => stop("timeout"), timeout);
-}
-export function runCheck(check, cwd, environment) {
+export async function runCheck(check, cwd, environment, abortSignal) {
   const timeout = Number(check.environment.VERIFICATION_TIMEOUT_MS);
   if (!Number.isSafeInteger(timeout) || timeout <= 0 || timeout > 1800000)
     throw new Error("Invalid approved check timeout");
@@ -399,23 +320,113 @@ export function runCheck(check, cwd, environment) {
       failureReason: "port-inspection",
     };
   }
-  const raw = execFileSync(
-    process.execPath,
-    [
-      "--input-type=module",
-      "-e",
-      "(" + checkController.toString() + ")()",
-      JSON.stringify(check.argv),
-      String(timeout),
-    ],
-    {
-      cwd,
-      env: { ...environment, ...check.environment },
-      encoding: "utf8",
-      maxBuffer: 512 * 1024 * 1024,
-    },
-  );
-  return JSON.parse(raw);
+  if (abortSignal?.aborted)
+    return {
+      status: abortSignal.reason === "SIGINT" ? 130 : 143,
+      stdout: "",
+      stderr: "",
+      failureReason: "interrupted",
+    };
+  return new Promise((resolveResult) => {
+    const stdout = [],
+      stderr = [];
+    let size = 0,
+      reason = "",
+      closed = false,
+      forced = false;
+    let code = -1,
+      whichSignal = "",
+      timer,
+      killTimer,
+      finished = false;
+    let child;
+    const signalGroup = (kind) => {
+      if (!child?.pid) return;
+      try {
+        process.kill(-child.pid, kind);
+      } catch (error) {
+        if (error.code !== "ESRCH")
+          stderr.push(Buffer.from("\nGroup signal: " + error.message));
+      }
+    };
+    const finish = () => {
+      if (finished || !closed || (reason && !forced)) return;
+      finished = true;
+      clearTimeout(timer);
+      clearTimeout(killTimer);
+      abortSignal?.removeEventListener("abort", onAbort);
+      resolveResult({
+        status:
+          reason === "timeout"
+            ? 124
+            : reason === "output-limit"
+              ? 125
+              : reason === "interrupted"
+                ? abortSignal.reason === "SIGINT"
+                  ? 130
+                  : 143
+                : code,
+        stdout: Buffer.concat(stdout).toString(),
+        stderr: Buffer.concat(stderr).toString(),
+        failureReason: reason || (code !== 0 ? "exit" : ""),
+        signal: whichSignal,
+      });
+    };
+    const stop = (why) => {
+      if (reason) return;
+      reason = why;
+      clearTimeout(timer);
+      signalGroup("SIGTERM");
+      killTimer = setTimeout(() => {
+        signalGroup("SIGKILL");
+        forced = true;
+        finish();
+      }, 250);
+    };
+    const onAbort = () => stop("interrupted");
+    const capture = (dest) => (data) => {
+      size += data.length;
+      if (size > 128 * 1024 * 1024) {
+        stop("output-limit");
+        return;
+      }
+      dest.push(data);
+    };
+    try {
+      child = spawn(check.argv[0], check.argv.slice(1), {
+        cwd,
+        env: { ...environment, ...check.environment },
+        detached: true,
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+    } catch (error) {
+      resolveResult({
+        status: -1,
+        stdout: "",
+        stderr: error.message,
+        failureReason: "spawn",
+      });
+      return;
+    }
+    abortSignal?.addEventListener("abort", onAbort, { once: true });
+    child.stdout.on("data", capture(stdout));
+    child.stderr.on("data", capture(stderr));
+    child.on("error", (error) => {
+      stderr.push(Buffer.from(error.message));
+      reason = "spawn";
+      forced = true;
+      closed = true;
+      finish();
+    });
+    child.on("close", (status, signal) => {
+      code = status ?? -1;
+      whichSignal = signal || "";
+      closed = true;
+      finish();
+    });
+    timer = setTimeout(() => stop("timeout"), timeout);
+    if (abortSignal?.aborted) onAbort();
+  });
 }
 const DEFAULT_MIN_FREE_BYTES = 2 * 1024 * 1024 * 1024;
 
@@ -453,11 +464,13 @@ export function removeVerifierHome(home) {
   rmSync(home, { recursive: true, force: true });
 }
 
-export function runPlan(plan, cwd, output, options = {}) {
+export async function runPlan(plan, cwd, output, options = {}) {
   const {
     keepHome = false,
     minFreeBytes = DEFAULT_MIN_FREE_BYTES,
     getAvailableBytes = availableBytes,
+    abortSignal,
+    removeHome = removeVerifierHome,
   } = options;
   if (typeof keepHome !== "boolean")
     throw new Error("Invalid --keep-home value");
@@ -485,6 +498,8 @@ export function runPlan(plan, cwd, output, options = {}) {
     throw new Error("Logs/receipt must be outside worktree");
   requireFreeSpace(minFreeBytes, getAvailableBytes);
   const home = mkdtempSync(join(tmpdir(), "tailterm-verifier-"));
+  const receiptPath = join(output, "receipt.json");
+  let receiptWritten = false;
   try {
     mkdirSync(output, { recursive: true });
     const environment = {
@@ -528,10 +543,17 @@ export function runPlan(plan, cwd, output, options = {}) {
     for (const check of plan.checks) {
       const attempts = [];
       for (let attempt = 1; attempt <= (plan.maxAttempts || 1); attempt++) {
+        if (abortSignal?.aborted)
+          throw new Error("Verification interrupted by " + abortSignal.reason);
         requireFreeSpace(minFreeBytes, getAvailableBytes);
         const startedAt = new Date().toISOString(),
           start = performance.now();
-        const run = runCheck(check, resolve(cwd, check.cwd), environment);
+        const run = await runCheck(
+          check,
+          resolve(cwd, check.cwd),
+          environment,
+          abortSignal,
+        );
         const log =
           (run.stdout || "") +
           (run.stderr || "") +
@@ -556,6 +578,8 @@ export function runPlan(plan, cwd, output, options = {}) {
           logURI,
           logDigest: digest(log),
         });
+        if (abortSignal?.aborted)
+          throw new Error("Verification interrupted by " + abortSignal.reason);
         if (run.status === 0) break;
       }
       const { attempt, ...final } = attempts.at(-1);
@@ -584,6 +608,8 @@ export function runPlan(plan, cwd, output, options = {}) {
           : {}),
       });
     }
+    if (abortSignal?.aborted)
+      throw new Error("Verification interrupted by " + abortSignal.reason);
     checkClean(cwd, plan.commit);
     const receipt = {
       worktree: resolve(cwd),
@@ -605,27 +631,41 @@ export function runPlan(plan, cwd, output, options = {}) {
       checks: results,
       aiv: { state: "unsubmitted" },
     };
-    writeFileSync(
-      join(output, "receipt.json"),
-      JSON.stringify(receipt, null, 2) + "\n",
-      { mode: 0o600 },
-    );
+    writeFileSync(receiptPath, JSON.stringify(receipt, null, 2) + "\n", {
+      mode: 0o600,
+    });
+    receiptWritten = true;
     return receipt;
   } finally {
-    if (!keepHome) removeVerifierHome(home);
+    if (!keepHome) {
+      try {
+        removeHome(home);
+      } catch (error) {
+        if (receiptWritten) rmSync(receiptPath, { force: true });
+        try {
+          writeFileSync(
+            join(output, "cleanup-error.json"),
+            JSON.stringify({ home, error: error.message }) + "\n",
+            { mode: 0o600 },
+          );
+        } catch {}
+        throw new Error(
+          `Failed to remove verifier home ${home}: ${error.message}`,
+        );
+      }
+    }
   }
 }
 if (
   process.argv[1] &&
   resolve(process.argv[1]) === fileURLToPath(import.meta.url)
 ) {
-  // Installing handlers before synchronous checks prevents a signal's default
-  // termination from bypassing runPlan's finally block. The check completes (or
-  // times out), its external evidence is saved, then the home is removed.
+  const interruption = new AbortController();
   let interruptedBy = "";
   for (const signal of ["SIGINT", "SIGTERM"])
     process.on(signal, () => {
       interruptedBy ||= signal;
+      interruption.abort(interruptedBy);
       process.exitCode = signal === "SIGINT" ? 130 : 143;
     });
   try {
@@ -641,17 +681,27 @@ if (
       let minFreeBytes = DEFAULT_MIN_FREE_BYTES;
       for (let i = 0; i < flags.length; i++) {
         if (flags[i] === "--keep-home") keepHome = true;
-        else if (flags[i] === "--min-free-bytes" && i + 1 < flags.length)
-          minFreeBytes = Number(flags[++i]);
-        else throw new Error("Unknown verifier run option: " + flags[i]);
+        else if (flags[i] === "--min-free-bytes") {
+          const value = flags[++i];
+          if (!/^(0|[1-9][0-9]*)$/.test(value || ""))
+            throw new Error(
+              "--min-free-bytes requires a nonnegative integer byte count",
+            );
+          minFreeBytes = Number(value);
+          if (!Number.isSafeInteger(minFreeBytes))
+            throw new Error(
+              "--min-free-bytes requires a safe integer byte count",
+            );
+        } else throw new Error("Unknown verifier run option: " + flags[i]);
       }
-      const r = runPlan(input, process.cwd(), resolve(output), {
+      const r = await runPlan(input, process.cwd(), resolve(output), {
         keepHome,
         minFreeBytes,
+        abortSignal: interruption.signal,
       });
-      // A signal received during spawnSync is dispatched when the event loop
-      // runs again, after runPlan has written evidence and cleaned its home.
       await new Promise((resolve) => setImmediate(resolve));
+      if (interruptedBy)
+        rmSync(join(resolve(output), "receipt.json"), { force: true });
       process.exitCode = interruptedBy
         ? interruptedBy === "SIGINT"
           ? 130
@@ -665,6 +715,7 @@ if (
       );
   } catch (e) {
     console.error(e.message);
-    process.exitCode = 1;
+    process.exitCode =
+      interruptedBy === "SIGINT" ? 130 : interruptedBy === "SIGTERM" ? 143 : 1;
   }
 }

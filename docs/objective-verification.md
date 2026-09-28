@@ -86,7 +86,12 @@ the retained directory when finished. `--min-free-bytes N` sets the free-space
 reserve (default 2147483648 bytes). The runner checks available space before
 allocating a home and before every check attempt, and refuses to start an
 attempt below the reserve. A failed preflight reports the available and required
-byte counts.
+byte counts. This reserve guards attempt starts; a single attempt can still use
+more than the available space. SIGINT or SIGTERM stops the active check process
+group, saves its partial log, skips remaining attempts and checks, and leaves no
+eligible receipt. If home removal fails, the runner removes `receipt.json`, writes
+`cleanup-error.json` beside the logs, exits nonzero, and reports the retained
+home path for manual recovery.
 
 Go's `GOPATH`, `GOMODCACHE`, and `GOCACHE` all resolve inside the disposable
 home. We decline the optional shared module download cache for this phase: it

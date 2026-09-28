@@ -130,7 +130,7 @@ function commandPlan(f, source) {
   const commit = f.git("rev-parse", "HEAD");
   return makePlan({ baseCommit: commit, commit, owned: ["docs/"] }, f.cwd);
 }
-test("run removes locked Go cache after success and leaves symlink target untouched", (t) => {
+test("run removes locked Go cache after success and leaves symlink target untouched", async (t) => {
   const f = fixture(t),
     outside = tempDir(t, "verification-sibling-");
   writeFileSync(join(outside, "keep"), "sibling");
@@ -139,7 +139,7 @@ test("run removes locked Go cache after success and leaves symlink target untouc
     `import fs from 'node:fs';import path from 'node:path';const home=process.env.HOME;const cache=path.join(process.env.GOMODCACHE,'locked');fs.mkdirSync(cache,{recursive:true});fs.writeFileSync(path.join(cache,'module'), 'module');fs.chmodSync(path.join(cache,'module'),0o400);fs.chmodSync(cache,0o500);fs.symlinkSync(${JSON.stringify(outside)},path.join(home,'sibling'));console.log(JSON.stringify({HOME:home,GOPATH:process.env.GOPATH,GOMODCACHE:process.env.GOMODCACHE,GOCACHE:process.env.GOCACHE}));`,
   );
   const output = tempDir(t, "verification-clean-logs-");
-  const receipt = runPlan(plan, f.cwd, output);
+  const receipt = await runPlan(plan, f.cwd, output);
   assert.equal(receipt.checks[0].exitCode, 0);
   assert.equal(receipt.environment.VERIFICATION_KEEP_HOME, "0");
   assert(!existsSync(receipt.environment.HOME));
@@ -156,10 +156,14 @@ test("run removes locked Go cache after success and leaves symlink target untouc
   for (const key of ["GOPATH", "GOMODCACHE", "GOCACHE"])
     assert(receipt.environment[key].startsWith(receipt.environment.HOME + "/"));
 });
-test("failed run removes home after saving failed logs", (t) => {
+test("failed run removes home after saving failed logs", async (t) => {
   const f = fixture(t),
     plan = commandPlan(f, "console.error('fixture failure');process.exit(7);");
-  const receipt = runPlan(plan, f.cwd, tempDir(t, "verification-failed-logs-"));
+  const receipt = await runPlan(
+    plan,
+    f.cwd,
+    tempDir(t, "verification-failed-logs-"),
+  );
   assert.equal(receipt.checks[0].exitCode, 7);
   assert(!existsSync(receipt.environment.HOME));
   assert.match(
@@ -167,11 +171,11 @@ test("failed run removes home after saving failed logs", (t) => {
     /fixture failure/,
   );
 });
-test("keep-home retains exact home and records opt-in with cache isolation", (t) => {
+test("keep-home retains exact home and records opt-in with cache isolation", async (t) => {
   const f = fixture(t),
     plan = commandPlan(f, "console.log(process.env.HOME);");
   const output = tempDir(t, "verification-kept-logs-");
-  const receipt = runPlan(plan, f.cwd, output, { keepHome: true });
+  const receipt = await runPlan(plan, f.cwd, output, { keepHome: true });
   t.after(() => removeVerifierHome(receipt.environment.HOME));
   assert.equal(receipt.environment.VERIFICATION_KEEP_HOME, "1");
   assert(existsSync(receipt.environment.HOME));
@@ -182,7 +186,7 @@ test("keep-home retains exact home and records opt-in with cache isolation", (t)
   for (const key of ["GOPATH", "GOMODCACHE", "GOCACHE"])
     assert(receipt.environment[key].startsWith(receipt.environment.HOME + "/"));
 });
-test("free-space reserve rejects before run and before retry without filling disk", (t) => {
+test("free-space reserve rejects before run and before retry without filling disk", async (t) => {
   const f = fixture(t),
     output = tempDir(t, "verification-space-logs-");
   const counter = join(output, "count");
@@ -190,11 +194,11 @@ test("free-space reserve rejects before run and before retry without filling dis
     f,
     `import fs from 'node:fs';fs.appendFileSync(${JSON.stringify(counter)},'x');process.exit(9);`,
   );
-  assert.throws(
+  await assert.rejects(
     () => runPlan(plan, f.cwd, output, { minFreeBytes: -1 }),
     /Invalid --min-free-bytes/,
   );
-  assert.throws(
+  await assert.rejects(
     () =>
       runPlan(plan, f.cwd, output, {
         minFreeBytes: 10,
@@ -204,7 +208,7 @@ test("free-space reserve rejects before run and before retry without filling dis
   );
   assert(!existsSync(counter), "low-space refusal starts no command");
   let probes = 0;
-  assert.throws(
+  await assert.rejects(
     () =>
       runPlan(plan, f.cwd, output, {
         minFreeBytes: 10,
@@ -218,14 +222,14 @@ test("free-space reserve rejects before run and before retry without filling dis
     "only the first attempt ran",
   );
   assert.equal(probes, 3);
-  const receipt = runPlan(plan, f.cwd, output, {
+  const receipt = await runPlan(plan, f.cwd, output, {
     minFreeBytes: 0,
     getAvailableBytes: () => 10,
   });
   assert.equal(receipt.checks[0].exitCode, 9);
   assert.equal(readFileSync(counter, "utf8"), "xxxx");
 });
-test("missing prerequisites and output errors clean their allocated homes", (t) => {
+test("missing prerequisites and output errors clean their allocated homes", async (t) => {
   const f = fixture(t),
     root = tempDir(t, "verification-home-root-");
   const prerequisiteOutput = tempDir(t, "verification-prereq-logs-");
@@ -254,12 +258,12 @@ test("missing prerequisites and output errors clean their allocated homes", (t) 
     { baseCommit: commit, commit, owned: ["docs/"] },
     f.cwd,
   );
-  assert.throws(
+  await assert.rejects(
     () => runPlan(plan, f.cwd, prerequisiteOutput),
     /Missing prerequisite/,
   );
   assert.deepEqual(readdirSync(root), []);
-  assert.throws(() => runPlan(plan, f.cwd, outputFile), /EEXIST/);
+  await assert.rejects(() => runPlan(plan, f.cwd, outputFile), /EEXIST/);
   assert.deepEqual(readdirSync(root), []);
 });
 test("CLI flags retain home only when requested", (t) => {
@@ -283,24 +287,28 @@ test("CLI flags retain home only when requested", (t) => {
     if (existsSync(receipt.environment.HOME))
       removeVerifierHome(receipt.environment.HOME);
   });
-  assert.throws(
-    () =>
-      execFileSync(
-        process.execPath,
-        [script, "run", planFile, output, "--min-free-bytes", "-1"],
-        { cwd: f.cwd, env: { ...process.env, TMPDIR: root }, stdio: "pipe" },
-      ),
-    /Invalid --min-free-bytes/,
-  );
+  for (const value of ["-1", "", null]) {
+    const args = [script, "run", planFile, output, "--min-free-bytes"];
+    if (value !== null) args.push(value);
+    assert.throws(
+      () =>
+        execFileSync(process.execPath, args, {
+          cwd: f.cwd,
+          env: { ...process.env, TMPDIR: root },
+          stdio: "pipe",
+        }),
+      /--min-free-bytes requires/,
+    );
+  }
 });
 for (const signal of ["SIGINT", "SIGTERM"])
-  test(`CLI ${signal} interruption removes its home and preserves external logs`, async (t) => {
+  test(`CLI ${signal} stops after the interrupted first attempt`, async (t) => {
     const f = fixture(t),
       root = tempDir(t, "verification-signal-root-");
     const marker = join(root, "started");
     const plan = commandPlan(
       f,
-      `import fs from 'node:fs';fs.writeFileSync(${JSON.stringify(marker)},'started');setTimeout(()=>console.log('finished'),900);`,
+      `import fs from 'node:fs';fs.appendFileSync(${JSON.stringify(marker)},'s');setTimeout(()=>process.exit(${signal === "SIGINT" ? 0 : 1}),2000);`,
     );
     const planFile = join(root, "plan.json"),
       output = tempDir(t, "verification-signal-logs-");
@@ -321,19 +329,129 @@ for (const signal of ["SIGINT", "SIGTERM"])
     assert(existsSync(marker), "check command started before interruption");
     child.kill(signal);
     const [code, closedBy] = await once(child, "close");
-    assert(
-      code === (signal === "SIGINT" ? 130 : 143) || closedBy === signal,
-      `exit code ${code}, signal ${closedBy}`,
+    assert.equal(
+      code,
+      signal === "SIGINT" ? 130 : 143,
+      `closed by ${closedBy}`,
     );
     assert.deepEqual(readdirSync(root).sort(), ["plan.json", "started"]);
+    assert.equal(readFileSync(marker, "utf8"), "s", "no retry started");
     assert(
-      existsSync(join(output, "receipt.json")),
-      "receipt was saved outside home",
+      !existsSync(join(output, "receipt.json")),
+      "no eligible receipt survives interruption",
     );
-    const receipt = JSON.parse(readFileSync(join(output, "receipt.json")));
-    assert(!existsSync(receipt.environment.HOME));
-    assert(existsSync(receipt.checks[0].logURI));
+    assert(existsSync(join(output, digest("npm-unit") + ".attempt-1.log")));
   });
+test("foreground group SIGINT stops detached check descendants before cleanup", async (t) => {
+  const f = fixture(t),
+    root = tempDir(t, "verification-group-root-");
+  const info = join(root, "descendant.json");
+  const descendant = `const fs=require('node:fs'),net=require('node:net'),path=require('node:path');process.on('SIGTERM',()=>{});const server=net.createServer();server.listen(0,'127.0.0.1',()=>{fs.writeFileSync(${JSON.stringify(info)},JSON.stringify({pid:process.pid,port:server.address().port,home:process.env.HOME}));console.log('listener ready')});setInterval(()=>fs.writeFileSync(path.join(process.env.HOME,'w'),'w'),100);`;
+  const plan = commandPlan(
+    f,
+    `import {spawn} from 'node:child_process';spawn(process.execPath,['-e',${JSON.stringify(descendant)}],{stdio:'inherit'});setInterval(()=>{},1000);`,
+  );
+  const planFile = join(root, "plan.json"),
+    output = tempDir(t, "verification-group-logs-");
+  writeFileSync(planFile, JSON.stringify(plan));
+  const script = new URL("../scripts/verify-matrix.mjs", import.meta.url)
+    .pathname;
+  const runner = spawn(
+    process.execPath,
+    [script, "run", planFile, output, "--min-free-bytes", "0"],
+    {
+      cwd: f.cwd,
+      env: { ...process.env, TMPDIR: root },
+      detached: true,
+      stdio: "ignore",
+    },
+  );
+  let descendantInfo;
+  try {
+    for (let i = 0; !existsSync(info) && i < 250; i++)
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    assert(existsSync(info), "descendant listener started");
+    descendantInfo = JSON.parse(readFileSync(info));
+    process.kill(-runner.pid, "SIGINT");
+    const [code] = await once(runner, "close");
+    assert.equal(code, 130);
+    assert.deepEqual(
+      occupiedPorts({
+        environment: {
+          VERIFICATION_REQUIRED_PORTS: String(descendantInfo.port),
+        },
+      }),
+      [],
+    );
+    assert(!existsSync(descendantInfo.home));
+    await new Promise((resolve) => setTimeout(resolve, 350));
+    assert(!existsSync(descendantInfo.home), "orphan did not recreate home");
+    assert(!existsSync(join(output, "receipt.json")));
+    assert(existsSync(join(output, digest("npm-unit") + ".attempt-1.log")));
+  } finally {
+    if (runner.exitCode === null && runner.signalCode === null)
+      runner.kill("SIGKILL");
+    if (descendantInfo) {
+      try {
+        process.kill(descendantInfo.pid, "SIGKILL");
+      } catch {}
+    }
+  }
+});
+test("cleanup failure removes eligible receipt and reports retained home", async (t) => {
+  const f = fixture(t),
+    plan = commandPlan(f, "console.log('check passed');");
+  const output = tempDir(t, "verification-cleanup-failure-logs-");
+  let retained = "";
+  await assert.rejects(
+    () =>
+      runPlan(plan, f.cwd, output, {
+        removeHome: (home) => {
+          retained = home;
+          throw new Error("EPERM synthetic cleanup failure");
+        },
+      }),
+    /Failed to remove verifier home .*EPERM synthetic cleanup failure/,
+  );
+  t.after(() => {
+    if (retained && existsSync(retained)) removeVerifierHome(retained);
+  });
+  assert(existsSync(retained));
+  assert(!existsSync(join(output, "receipt.json")));
+  assert.equal(
+    JSON.parse(readFileSync(join(output, "cleanup-error.json"))).home,
+    retained,
+  );
+  assert(existsSync(join(output, digest("npm-unit") + ".attempt-1.log")));
+});
+test("immutable cache entry cannot leave a passing receipt", async (t) => {
+  if (process.platform !== "darwin")
+    return t.skip("chflags uchg requires macOS");
+  const f = fixture(t);
+  const output = tempDir(t, "verification-immutable-logs-");
+  const homeFile = join(output, "home-path");
+  const plan = commandPlan(
+    f,
+    `import fs from 'node:fs';import {execFileSync} from 'node:child_process';fs.writeFileSync(${JSON.stringify(homeFile)},process.env.HOME);const locked=process.env.HOME+'/locked';fs.writeFileSync(locked,'locked');execFileSync('chflags',['uchg',locked]);`,
+  );
+  let home = "";
+  try {
+    await assert.rejects(
+      () => runPlan(plan, f.cwd, output),
+      /Failed to remove verifier home .*EPERM/,
+    );
+    home = JSON.parse(readFileSync(join(output, "cleanup-error.json"))).home;
+    assert(existsSync(join(home, "locked")));
+    assert(!existsSync(join(output, "receipt.json")));
+  } finally {
+    home ||= existsSync(homeFile) ? readFileSync(homeFile, "utf8") : "";
+    if (home && existsSync(home)) {
+      if (existsSync(join(home, "locked")))
+        execFileSync("chflags", ["nouchg", join(home, "locked")]);
+      removeVerifierHome(home);
+    }
+  }
+});
 test("rename and delete paths preserved in source selection", (t) => {
   const f = fixture(t);
   assert.deepEqual(diffPaths(f.cwd, f.base, f.commit), [
@@ -346,7 +464,7 @@ test("rename and delete paths preserved in source selection", (t) => {
     "docs/new.md",
   ]);
 });
-test("clean detached run emits complete command evidence and unsubmitted AIV bindings", (t) => {
+test("clean detached run emits complete command evidence and unsubmitted AIV bindings", async (t) => {
   const f = fixture(t),
     plan = makePlan(
       {
@@ -361,16 +479,19 @@ test("clean detached run emits complete command evidence and unsubmitted AIV bin
       f.cwd,
     );
   const out = tempDir(t, "verification-logs-");
-  const receipt = runPlan(plan, f.cwd, out);
+  const receipt = await runPlan(plan, f.cwd, out);
   assert.equal(receipt.checks[0].exitCode, 0);
   assert.equal(receipt.planDigest, digest(plan));
   assert.equal(receipt.aiv.state, "unsubmitted");
   assert.match(receipt.checks[0].logDigest, /^[a-f0-9]{64}$/);
-  assert.throws(() => runPlan({ ...plan, checks: [] }, f.cwd, out), /omitted/);
+  await assert.rejects(
+    () => runPlan({ ...plan, checks: [] }, f.cwd, out),
+    /omitted/,
+  );
   writeFileSync(join(f.cwd, "docs/untracked.md"), "dirty");
-  assert.throws(() => runPlan(plan, f.cwd, out), /Clean detached/);
+  await assert.rejects(() => runPlan(plan, f.cwd, out), /Clean detached/);
 });
-test("attached or wrong SHA cannot execute checks", (t) => {
+test("attached or wrong SHA cannot execute checks", async (t) => {
   const f = fixture(t),
     plan = makePlan(
       { baseCommit: f.base, commit: f.commit, owned: ["docs/"] },
@@ -378,14 +499,14 @@ test("attached or wrong SHA cannot execute checks", (t) => {
     ),
     out = tempDir(t, "verification-out-");
   f.git("checkout", "-b", "attached");
-  assert.throws(() => runPlan(plan, f.cwd, out), /detached/);
-  assert.throws(
+  await assert.rejects(() => runPlan(plan, f.cwd, out), /detached/);
+  await assert.rejects(
     () => runPlan({ ...plan, commit: f.base }, f.cwd, out),
     /Wrong candidate/,
   );
 });
 
-test("browser run refuses missing prerequisite assets before commands execute", (t) => {
+test("browser run refuses missing prerequisite assets before commands execute", async (t) => {
   const f = fixture(t);
   writeFileSync(join(f.cwd, "tests/fixture.mjs"), "// browser.launch(");
   writeFileSync(
@@ -405,7 +526,7 @@ test("browser run refuses missing prerequisite assets before commands execute", 
     f.cwd,
   );
   const output = tempDir(t, "verification-missing-assets-");
-  assert.throws(
+  await assert.rejects(
     () => runPlan(plan, f.cwd, output),
     /Missing prerequisite: node_modules/,
   );
@@ -575,7 +696,9 @@ test("occupied required port reports its PID and never starts or kills a listene
     assert(
       holders.some((h) => h.port === port && h.pids.includes(process.pid)),
     );
-    const result = runCheck(check, process.cwd(), { PATH: process.env.PATH });
+    const result = await runCheck(check, process.cwd(), {
+      PATH: process.env.PATH,
+    });
     assert.equal(result.status, -1);
     assert.equal(result.failureReason, "port-conflict");
     assert.match(
@@ -593,7 +716,7 @@ test("occupied required port reports its PID and never starts or kills a listene
   }
 });
 
-test("matrix timeout kills its own process group descendants and retains failed receipt evidence", (t) => {
+test("matrix timeout kills its own process group descendants and retains failed receipt evidence", async (t) => {
   const f = fixture(t),
     external = tempDir(t, "verification-timeout-logs-"),
     info = join(external, "descendant.json");
@@ -621,7 +744,7 @@ test("matrix timeout kills its own process group descendants and retains failed 
     f.cwd,
   );
   const started = Date.now();
-  const receipt = runPlan(plan, f.cwd, external);
+  const receipt = await runPlan(plan, f.cwd, external);
   assert(Date.now() - started < 10000, "timeout completes promptly");
   assert(
     !existsSync(receipt.environment.HOME),
@@ -694,7 +817,7 @@ for (const [codes, expected] of [
 ]) {
   test(
     "actual retry sequence " + codes.join(",") + " records exact evidence",
-    (t) => {
+    async (t) => {
       const f = fixture(t),
         output = tempDir(t, "verification-retry-");
       const counter = join(output, "count.json");
@@ -713,7 +836,7 @@ for (const [codes, expected] of [
         { baseCommit: commit, commit, owned: ["docs/"] },
         f.cwd,
       );
-      const r = runPlan(plan, f.cwd, output),
+      const r = await runPlan(plan, f.cwd, output),
         c = r.checks[0];
       assert.equal(c.status, expected);
       assert.equal(c.attempts.length, codes.length);
@@ -745,7 +868,7 @@ for (const pass of [false, true])
   test(
     "known failure " +
       (pass ? "now passes" : "exhausts retries without blocking"),
-    (t) => {
+    async (t) => {
       const f = fixture(t),
         m = JSON.parse(readFileSync(join(f.cwd, "verification/matrix.json")));
       m.knownFailures = [
@@ -769,7 +892,7 @@ for (const pass of [false, true])
           { baseCommit: commit, commit, owned: ["docs/"] },
           f.cwd,
         ),
-        r = runPlan(plan, f.cwd, tempDir(t, "known-logs-"));
+        r = await runPlan(plan, f.cwd, tempDir(t, "known-logs-"));
       assert.equal(r.checks[0].knownFailure, true);
       assert.equal(!!r.checks[0].nowPassing, pass);
       assert.equal(r.checks[0].status, pass ? "pass" : "fail");
