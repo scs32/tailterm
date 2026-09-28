@@ -243,9 +243,38 @@ origin = "http://127.0.0.1:" + vite.httpServer.address().port;
       const wrong = await fresh("A different but long passphrase");
       await wrong.evaluate(() => qa.online(true));
       assert.equal(await wrong.evaluate(() => qa.data().servers.length), 0);
+      // A reached revision 4, but B may still be applying it. Disconnect is an
+      // action that deliberately rejects while sync is busy, so observe B's
+      // completed remote revision before clicking it.
+      phase = "wait for device B revision 4";
+      console.log(
+        engineName + ": device B revision before disconnect synchronization=" +
+          (await b.evaluate(() => qa.data().profile.revision)),
+      );
+      await b.evaluate(() => qa.online(true));
+      await b.waitForFunction(() => qa.data().profile.revision === 4);
+      assert.equal(
+        await b.evaluate(() => qa.data().servers[0].name),
+        "Persisted offline edit",
+      );
+      phase = "disconnect";
       await b.evaluate(() => qa.show());
       await b.locator("#profile-disconnect").click();
-      await b.waitForFunction(() => !qa.data().profile.hub);
+      try {
+        await b.waitForFunction(() => !qa.data().profile.hub);
+      } catch (error) {
+        const observed = await b.evaluate(() => ({
+          status: document.querySelector("#profile-sync-status")?.textContent,
+          hub: !!qa.data().profile.hub,
+          autoRestore: qa.data().profile.autoRestore,
+          revision: qa.data().profile.revision,
+          dirty: qa.data().profile.dirty,
+          requests: qa.requests(),
+          dialogOpen: document.querySelector("#dialog")?.open,
+        })).catch((e) => ({ captureError: e.message }));
+        console.error("profile-sync disconnect observation:", JSON.stringify(observed));
+        throw error;
+      }
       assert.equal(
         await b.evaluate(() => qa.data().profile.autoRestore),
         false,
@@ -273,7 +302,10 @@ origin = "http://127.0.0.1:" + vite.httpServer.address().port;
     }
   }
 } catch (error) {
-  error.message += ` [phase=${phase}, engine=${engineLabel}, ready=${ready}, readinessAttempts=${readinessAttempts}, childExit=${JSON.stringify(childExit)}, childError=${JSON.stringify(childError)}, stderr=${JSON.stringify(childStderr)}]`;
+  console.error("profile-sync failure diagnostics:", JSON.stringify({
+    phase, engine: engineLabel, ready, readinessAttempts, childExit, childError,
+    stderr: childStderr.replaceAll(state, "<state>"),
+  }));
   throw error;
 } finally {
   if (vite) await vite.close();

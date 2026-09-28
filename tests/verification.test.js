@@ -4,7 +4,7 @@ import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, chmodSync } from "
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { prepareTestBinary, sourceIdentity, fileHash } from "./test-binaries.mjs";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import { createServer } from "node:net";
 import { once } from "node:events";
 import {
@@ -55,6 +55,27 @@ test("prepared binary reuse rejects source changes, tampering and a different ch
   mkdirSync(join(other, "hub"));
   writeFileSync(join(other, "hub", "go.mod"), "module fixture\n");
   await assert.rejects(prepareTestBinary({ ...options, root: other }), /No prepared/);
+});
+test("profile startup failure emits child exit, stderr and phase diagnostics", async () => {
+  const root = new URL("..", import.meta.url).pathname;
+  const dir = mkdtempSync(join(tmpdir(), "profile-startup-failure-"));
+  const binary = join(dir, "hub");
+  writeFileSync(binary, "#!/bin/sh\necho synthetic-startup-boom >&2\nexit 7\n");
+  chmodSync(binary, 0o755);
+  const manifest = join(dir, "manifest.json");
+  writeFileSync(manifest, JSON.stringify({ binaries: [{ target: "hub", historicalCommit: null,
+    source: await sourceIdentity(root), path: binary, sha256: await fileHash(binary) }] }));
+  const result = spawnSync(process.execPath, ["tests/profile-sync-browser.mjs"], {
+    cwd: root, encoding: "utf8", timeout: 10000,
+    env: { PATH: process.env.PATH, HOME: process.env.HOME, TMPDIR: process.env.TMPDIR,
+      TAILTERM_TEST_BINARIES: manifest },
+  });
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /profile-sync failure diagnostics:/);
+  assert.match(result.stderr, /"phase":"startup"/);
+  assert.match(result.stderr, /"ready":false/);
+  assert.match(result.stderr, /"code":7/);
+  assert.match(result.stderr, /synthetic-startup-boom/);
 });
 test("ownership union diff selects all engines, migration and touched race packages", () => {
   const checks = selectChecks(
