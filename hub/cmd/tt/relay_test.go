@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"github.com/scs32/tailterm/hub/internal/api"
 	"io"
 	"net/http"
@@ -12,6 +13,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -76,7 +78,11 @@ func TestClaudeWakeRejectsIneligibleHubRuns(t *testing.T) {
 	}{
 		{"stale run", "run_0000000000000002", api.AgentRunning, api.ProjectPauseActive, true},
 		{"retired", b.Run, api.AgentRetired, api.ProjectPauseActive, true},
-		{"needs input", b.Run, api.AgentNeedsInput, api.ProjectPauseActive, true},
+		// needs_input alone no longer refuses (wi_9201e1f3901d6fdc); every other
+		// gate still does while the agent waits for input.
+		{"stale run needing input", "run_0000000000000002", api.AgentNeedsInput, api.ProjectPauseActive, true},
+		{"offline needing input", b.Run, api.AgentNeedsInput, api.ProjectPauseActive, false},
+		{"paused needing input", b.Run, api.AgentNeedsInput, "paused", true},
 		{"closed", b.Run, api.AgentClosed, api.ProjectPauseActive, true},
 		{"offline", b.Run, api.AgentRunning, api.ProjectPauseActive, false},
 		{"paused", b.Run, api.AgentRunning, "paused", true},
@@ -592,6 +598,395 @@ func TestSwarmWakePreservesOwnershipAndExcludesSelf(t *testing.T) {
 	for _, name := range []string{"worker", "lead"} {
 		if got := strings.ToLower(taskBriefing(task, name, "")); !strings.Contains(got, "tt ack seq") || strings.Contains(got, "not acknowledge") {
 			t.Fatalf("%s briefing: %s", name, got)
+		}
+	}
+}
+
+// needsInputHub is an isolated hub fixture for the relay's Claude paths. It
+// answers only the reads and broker writes the relay already makes and fails
+// the test on any other call.
+type needsInputHub struct {
+	t        *testing.T
+	mu       sync.Mutex
+	agent    api.Agent
+	paused   bool
+	messages []api.Message
+	jobs     []api.WakeJob
+	reports  []api.WakeJobReport
+	calls    []string
+}
+
+func (h *needsInputHub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	w.Header().Set("Content-Type", "application/json")
+	h.calls = append(h.calls, r.Method+" "+r.URL.Path)
+	switch {
+	case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/pause"):
+		state := api.ProjectPauseActive
+		if h.paused {
+			state = "paused"
+		}
+		_ = json.NewEncoder(w).Encode(api.ProjectPauseStatus{State: state})
+	case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/wake-jobs/lease"):
+		job := api.WakeJob{}
+		if len(h.jobs) > 0 {
+			job, h.jobs = h.jobs[0], h.jobs[1:]
+		}
+		_ = json.NewEncoder(w).Encode(job)
+	case r.Method == http.MethodPost && strings.Contains(r.URL.Path, "/wake-jobs/") && strings.HasSuffix(r.URL.Path, "/report"):
+		var report api.WakeJobReport
+		_ = json.NewDecoder(r.Body).Decode(&report)
+		h.reports = append(h.reports, report)
+		_, _ = w.Write([]byte("{}"))
+	case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/obligations"):
+		_ = json.NewEncoder(w).Encode(api.ObligationList{})
+	case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/messages"):
+		after, _ := strconv.ParseInt(r.URL.Query().Get("after"), 10, 64)
+		var page []api.Message
+		for _, m := range h.messages {
+			if m.Seq > after {
+				page = append(page, m)
+			}
+		}
+		_ = json.NewEncoder(w).Encode(api.MessageList{Messages: page})
+	case r.Method == http.MethodGet && strings.Contains(r.URL.Path, "/agents/"):
+		_ = json.NewEncoder(w).Encode(h.agent)
+	default:
+		h.t.Errorf("unexpected hub call %s %s", r.Method, r.URL)
+		http.Error(w, "unexpected", http.StatusInternalServerError)
+	}
+}
+
+func (h *needsInputHub) update(change func(*needsInputHub)) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	change(h)
+}
+
+func (h *needsInputHub) takeCalls() []string {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	calls := h.calls
+	h.calls = nil
+	return calls
+}
+
+// fakeClaudePane runs the real claudeWakeWith guard and claudeInputScreen
+// against a captured pane and a synthetic transcript. Enter appends the typed
+// text as a new user record, as Claude Code does.
+type fakeClaudePane struct {
+	transcript       string
+	raw              string
+	cursorX, cursorY int
+	busy             bool
+	typed            string
+	sent             []string
+}
+
+const fakeClaudeRule = "\x1b[38;5;244m────────────────────────────────────────"
+
+func newFakeClaudePane(t *testing.T) *fakeClaudePane {
+	transcript := filepath.Join(t.TempDir(), "claude.jsonl")
+	if err := os.WriteFile(transcript, []byte(`{"type":"assistant","message":{"stop_reason":"end_turn","content":[]}}`+"\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	return &fakeClaudePane{transcript: transcript, raw: "Posted the decision request.\n" + fakeClaudeRule + "\n\x1b[39m❯ \n" + fakeClaudeRule + "\n\x1b[39m  ⏵⏵ bypass permissions on\n", cursorX: 2, cursorY: 2}
+}
+
+func (f *fakeClaudePane) inspect(_ context.Context, _ runtimeBinding, expected string) (claudeWakeSnapshot, error) {
+	raw := f.raw
+	if expected != "" {
+		raw = "\x1b[39m❯ " + f.typed + "\n" + fakeClaudeRule + "\n"
+	}
+	screen, err := claudeInputScreen(raw, f.cursorX, f.cursorY, expected)
+	if err != nil {
+		return claudeWakeSnapshot{}, err
+	}
+	info, err := os.Stat(f.transcript)
+	if err != nil {
+		return claudeWakeSnapshot{}, err
+	}
+	return claudeWakeSnapshot{Pane: "%1", SessionID: "$1", Created: "100", PanePID: 1001, Path: f.transcript, FileID: fileIdentity(info), Offset: info.Size(), Screen: screen,
+		Cursor: activityCursor{Ready: true, SeenTurn: true, TurnComplete: !f.busy}}, nil
+}
+
+func (f *fakeClaudePane) send(_ context.Context, pane, value string, literal bool) error {
+	if literal {
+		f.typed = value
+		f.sent = append(f.sent, value)
+		return nil
+	}
+	line, _ := json.Marshal(map[string]any{"type": "user", "message": map[string]any{"content": f.typed}})
+	file, err := os.OpenFile(f.transcript, os.O_APPEND|os.O_WRONLY, 0600)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+	f.typed = ""
+	_, err = file.Write(append(line, '\n'))
+	return err
+}
+
+func (f *fakeClaudePane) queue(ctx context.Context, b runtimeBinding, prompt string) error {
+	return claudeWakeWith(ctx, b, prompt, claudeWakeOps{inspect: f.inspect, send: f.send, sleep: func(time.Duration) {}, now: time.Now})
+}
+
+// relayPass mirrors one cmdRelay binding pass: the broker path first, and the
+// inbox path when the broker path did not queue.
+func relayPass(b runtimeBinding, p *relayProgress, c *api.Client, now time.Time, queue func(context.Context, runtimeBinding, string) error) error {
+	queued, _ := relayWakeJob(context.Background(), b, p, c, now, queue)
+	if queued {
+		return nil
+	}
+	return relayOne(context.Background(), b, p, c, now, queue)
+}
+
+func needsInputFixture(t *testing.T) (runtimeBinding, *needsInputHub, *api.Client, *fakeClaudePane) {
+	t.Helper()
+	t.Setenv("TAILTERM_RELAY_STATE", t.TempDir())
+	b := testClaudeBinding()
+	hub := &needsInputHub{t: t, agent: api.Agent{ID: b.Agent, RunID: b.Run, Status: api.AgentNeedsInput, Online: true, Runtime: "claude", Session: b.Session}}
+	server := httptest.NewServer(hub)
+	t.Cleanup(server.Close)
+	b.Hub = server.URL
+	c, err := api.NewClient(server.URL, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return b, hub, c, newFakeClaudePane(t)
+}
+
+const needsInputHandler = "agt_00000000000000aa"
+
+// k1: an agent in needs_input is woken by an answer to its decision, by a
+// directed message and by a broker job, each once; a later message wakes once
+// more.
+func TestClaudeWakeNeedsInputWakesForNewInput(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		input api.Message
+		job   bool
+		want  string
+	}{
+		{"decision answer", api.Message{Seq: 102, To: "self", From: api.Sender{Node: "workspace", User: "owner"}, ReplyTo: 101, DecisionAnswer: &api.DecisionAnswer{}, Text: "Option A"}, false, "Tailterm messages #102. Run tt inbox --unread --mark-read."},
+		{"directed message", api.Message{Seq: 102, To: "self", From: api.Sender{AgentID: needsInputHandler}, Text: "Start saved"}, false, "Tailterm messages #102. Run tt inbox --unread --mark-read."},
+		{"broker job", api.Message{Seq: 102, To: "self", From: api.Sender{AgentID: needsInputHandler}, Envelope: &api.Envelope{Kind: api.EnvelopeKindNotice, Subject: "Handler notice for the waiting lead"}}, true, "Tailterm obligations #102. Run tt inbox --unread --mark-read. Wake wake_0123456789abcdef."},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			b, hub, c, pane := needsInputFixture(t)
+			input := tc.input
+			input.To = b.Agent
+			hub.update(func(h *needsInputHub) {
+				h.agent.ReadUpTo, h.agent.Unread = 101, 1
+				h.messages = []api.Message{{Seq: 101, From: api.Sender{AgentID: b.Agent}, Text: "Decision request"}, input}
+				if tc.job {
+					h.jobs = []api.WakeJob{{ID: "wake_0123456789abcdef", LeaseToken: "lease", MessageSeq: 102, AgentID: b.Agent, RunID: b.Run, Prompt: "Tailterm broker: #102 notice."}}
+				}
+			})
+			var p relayProgress
+			now := time.Date(2026, 9, 28, 16, 0, 0, 0, time.UTC)
+			if err := relayPass(b, &p, c, now, pane.queue); err != nil {
+				t.Fatal(err)
+			}
+			if len(pane.sent) != 1 || pane.sent[0] != tc.want || p.Wake == nil || p.Wake.Status != "confirmed" || p.Skip != nil {
+				t.Fatalf("needs_input agent was not woken once: sent=%q wake=%+v skip=%+v", pane.sent, p.Wake, p.Skip)
+			}
+			if tc.job && (len(hub.reports) != 1 || hub.reports[0].Status != "accepted") {
+				t.Fatalf("broker report: %+v", hub.reports)
+			}
+			// k1/a2: input already delivered is not woken again.
+			for _, later := range []time.Duration{20 * time.Second, 40 * time.Second} {
+				if err := relayPass(b, &p, c, now.Add(later), pane.queue); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if len(pane.sent) != 1 {
+				t.Fatalf("repeat wake for delivered input: %q", pane.sent)
+			}
+			hub.update(func(h *needsInputHub) {
+				h.agent.Unread = 2
+				h.messages = append(h.messages, api.Message{Seq: 105, To: b.Agent, From: api.Sender{AgentID: needsInputHandler}, Text: "Follow-up"})
+			})
+			for _, later := range []time.Duration{time.Minute, 80 * time.Second} {
+				if err := relayPass(b, &p, c, now.Add(later), pane.queue); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if len(pane.sent) != 2 || pane.sent[1] != "Tailterm messages #105. Run tt inbox --unread --mark-read." {
+				t.Fatalf("new later message did not wake exactly once: %q", pane.sent)
+			}
+		})
+	}
+}
+
+// k2: replay of the 2026-09-28 stall. lead-52bec739 posted decision #13896,
+// ran tt event needs_input and finished its turn; the owner's answer #13897
+// and the handler's directed #13899 and #13901 then arrived and never woke it.
+func TestClaudeWakeNeedsInputIncidentReplay(t *testing.T) {
+	incident := func(agent string) []api.Message {
+		return []api.Message{
+			{Seq: 13896, From: api.Sender{AgentID: agent}, DecisionRequest: &api.DecisionRequest{}, Text: "Decision request"},
+			{Seq: 13897, To: agent, From: api.Sender{Node: "workspace", User: "owner"}, ReplyTo: 13896, DecisionAnswer: &api.DecisionAnswer{}, Text: "Answer"},
+			{Seq: 13899, To: agent, From: api.Sender{AgentID: needsInputHandler}, Envelope: &api.Envelope{Kind: api.EnvelopeKindResult, Subject: "Handler saved the requested record"}},
+			{Seq: 13901, To: agent, From: api.Sender{AgentID: needsInputHandler}, Text: "Handler follow-up"},
+		}
+	}
+	now := time.Date(2026, 9, 28, 15, 59, 0, 0, time.UTC)
+	t.Run("wakes", func(t *testing.T) {
+		b, hub, c, pane := needsInputFixture(t)
+		// The lead is mid-turn while it posts the decision request.
+		pane.busy = true
+		hub.update(func(h *needsInputHub) {
+			h.agent.Status, h.agent.ReadUpTo = api.AgentRunning, 13896
+			h.messages = incident(b.Agent)[:1]
+		})
+		var p relayProgress
+		if err := relayPass(b, &p, c, now, pane.queue); err != nil {
+			t.Fatal(err)
+		}
+		// tt event needs_input, turn complete, then the answer and messages.
+		pane.busy = false
+		hub.update(func(h *needsInputHub) {
+			h.agent.Status, h.agent.Unread = api.AgentNeedsInput, 3
+			h.messages = incident(b.Agent)
+		})
+		for _, later := range []time.Duration{20 * time.Second, 40 * time.Second, 60 * time.Second} {
+			if err := relayPass(b, &p, c, now.Add(later), pane.queue); err != nil {
+				t.Fatal(err)
+			}
+		}
+		want := "Tailterm messages #13897,#13899,#13901. Run tt inbox --unread --mark-read."
+		if len(pane.sent) != 1 || pane.sent[0] != want {
+			t.Fatalf("incident replay did not wake exactly once: %q", pane.sent)
+		}
+		if p.Wake == nil || p.Wake.Status != "confirmed" || fmt.Sprint(p.Wake.MessageSeqs) != "[13897 13899 13901]" || p.Through != 13901 {
+			t.Fatalf("wake outcome: %+v through=%d", p.Wake, p.Through)
+		}
+	})
+	for _, tc := range []struct {
+		name, reason string
+		setup        func(*needsInputHub, *fakeClaudePane)
+		listed       bool
+	}{
+		{"busy transcript", "not safely idle", func(_ *needsInputHub, pane *fakeClaudePane) { pane.busy = true }, true},
+		{"permission dialog", "permission or selection prompt", func(_ *needsInputHub, pane *fakeClaudePane) {
+			pane.raw = "\x1b[1mBash command\x1b[0m\n  rm -rf build\nDo you want to proceed?\n\x1b[39m❯ 1. Yes\n  2. No\n\nEsc to cancel\n"
+			pane.cursorY = 3
+		}, true},
+		{"wrong run", "run superseded", func(h *needsInputHub, _ *fakeClaudePane) { h.agent.RunID = "run_0000000000000002" }, false},
+	} {
+		t.Run("refuses "+tc.name, func(t *testing.T) {
+			b, hub, c, pane := needsInputFixture(t)
+			hub.update(func(h *needsInputHub) {
+				h.agent.ReadUpTo, h.agent.Unread = 13896, 3
+				h.messages = incident(b.Agent)
+				tc.setup(h, pane)
+			})
+			var p relayProgress
+			_, err := captureRelayOutput(t, true, func() error { return relayPass(b, &p, c, now, pane.queue) })
+			if len(pane.sent) != 0 {
+				t.Fatalf("%s with needs_input typed input: %q (%v)", tc.name, pane.sent, err)
+			}
+			if p.Skip == nil || !strings.Contains(p.Skip.Reason, tc.reason) || p.Through != 0 {
+				t.Fatalf("%s skip: %+v through=%d err=%v", tc.name, p.Skip, p.Through, err)
+			}
+			if tc.listed && fmt.Sprint(p.Skip.MessageSeqs) != "[13897 13899 13901]" {
+				t.Fatalf("%s skip seqs: %+v", tc.name, p.Skip)
+			}
+			if !tc.listed && (p.Skip.After != 13896 || p.Skip.Unread != 3) {
+				t.Fatalf("%s skip cursor: %+v", tc.name, p.Skip)
+			}
+			for _, call := range hub.takeCalls() {
+				if !tc.listed && strings.HasSuffix(call, "/messages") {
+					t.Fatalf("wrong run listed messages: %s", call)
+				}
+			}
+		})
+	}
+}
+
+// k3: each held-back wake records its reason with the agent and sequences,
+// logs once per change with an RFC3339 time, and adds no hub calls.
+func TestRelaySkipRecordsReasonAndSeqsOnce(t *testing.T) {
+	b, hub, c, pane := needsInputFixture(t)
+	now := time.Date(2026, 9, 28, 16, 0, 0, 0, time.UTC)
+	line := func(want string, run func() error) {
+		t.Helper()
+		out, _ := captureRelayOutput(t, true, run)
+		if want == "" {
+			if out != "" {
+				t.Fatalf("repeated skip logged again: %q", out)
+			}
+			return
+		}
+		if !strings.HasPrefix(out, "[tt relay] 2026-09-28T16:") || !strings.Contains(out, " "+b.Agent+" wake skipped: ") || !strings.HasSuffix(strings.TrimSpace(out), want) || strings.Count(out, "\n") != 1 {
+			t.Fatalf("skip log %q, want suffix %q", out, want)
+		}
+	}
+	var p relayProgress
+	hub.update(func(h *needsInputHub) {
+		h.agent.Online, h.agent.ReadUpTo, h.agent.Unread = false, 40, 2
+		h.messages = []api.Message{{Seq: 41, To: b.Agent, From: api.Sender{AgentID: needsInputHandler}}, {Seq: 42, To: b.Agent, From: api.Sender{Node: "workspace", User: "owner"}}}
+	})
+	hub.takeCalls()
+	line("agent offline after=#40 unread=2", func() error { return relayOne(context.Background(), b, &p, c, now, pane.queue) })
+	if calls := hub.takeCalls(); len(calls) != 2 || !strings.HasSuffix(calls[0], "/pause") || !strings.Contains(calls[1], "/agents/") {
+		t.Fatalf("skip recording changed hub calls: %v", calls)
+	}
+	first := p.Skip.At
+	line("", func() error { return relayOne(context.Background(), b, &p, c, now.Add(30*time.Second), pane.queue) })
+	if p.Skip == nil || !p.Skip.At.Equal(first) || p.Skip.Reason != "agent offline" {
+		t.Fatalf("steady skip: %+v", p.Skip)
+	}
+	hub.update(func(h *needsInputHub) { h.paused = true })
+	line("project not active after=#0 unread=0", func() error { return relayOne(context.Background(), b, &p, c, now.Add(time.Minute), pane.queue) })
+	hub.update(func(h *needsInputHub) { h.paused, h.agent.Online = false, true })
+	p.Wakes, p.Window = 8, now.Add(time.Minute)
+	line("five-minute rate window resets after=#40 unread=2", func() error { return relayOne(context.Background(), b, &p, c, now.Add(2*time.Minute), pane.queue) })
+	p.Wakes = 0
+	pane.busy = true
+	line("seqs=[41 42]", func() error { return relayOne(context.Background(), b, &p, c, now.Add(3*time.Minute), pane.queue) })
+	if !strings.Contains(p.Skip.Reason, "not safely idle") || p.Wake == nil || p.Wake.Status != "skipped" {
+		t.Fatalf("unsafe wake skip: %+v wake=%+v", p.Skip, p.Wake)
+	}
+	line("", func() error { return relayOne(context.Background(), b, &p, c, now.Add(4*time.Minute), pane.queue) })
+	pane.busy = false
+	line("", func() error { return relayOne(context.Background(), b, &p, c, now.Add(5*time.Minute), pane.queue) })
+	if p.Skip != nil || len(pane.sent) != 1 || p.Wake.Status != "confirmed" {
+		t.Fatalf("confirmed wake kept skip: %+v sent=%q", p.Skip, pane.sent)
+	}
+}
+
+// k3: tt relay --status shows the latest skip from local progress only.
+func TestRelaySkipStatusShowsLastSkip(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("TAILTERM_RELAY_STATE", dir)
+	b := testClaudeBinding()
+	if err := writeRelayBinding(b); err != nil {
+		t.Fatal(err)
+	}
+	at := time.Date(2026, 9, 28, 16, 0, 2, 0, time.UTC)
+	path := filepath.Join(dir, bindingKey(b)+".progress.json")
+	for _, tc := range []struct {
+		skip relaySkip
+		want []string
+	}{
+		{relaySkip{Reason: "Claude is not safely idle", MessageSeqs: []int64{13897, 13899}, At: at}, []string{`skip="Claude is not safely idle"`, "skip-seqs=[13897 13899]", "skip-at=2026-09-28T16:00:02Z"}},
+		{relaySkip{Reason: "agent offline", After: 13896, Unread: 3, At: at}, []string{`skip="agent offline"`, "skip-seqs=[]", "skip-at=2026-09-28T16:00:02Z", "skip-after=#13896 skip-unread=3"}},
+	} {
+		skip := tc.skip
+		if err := saveRelayProgress(dir, path, b, relayProgress{Run: b.Run, Thread: b.Thread, Skip: &skip}); err != nil {
+			t.Fatal(err)
+		}
+		out, err := captureRelayOutput(t, false, func() error { return cmdRelay([]string{"--status"}) })
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, want := range tc.want {
+			if !strings.Contains(out, want) {
+				t.Fatalf("status %q missing %q", out, want)
+			}
 		}
 	}
 }
