@@ -9,6 +9,7 @@ import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import assert from "node:assert/strict";
+import { prepareTestBinary } from "./test-binaries.mjs";
 
 const exec = promisify(execFile);
 const root = process.cwd();
@@ -18,10 +19,7 @@ const state = await mkdtemp(path.join(tmpdir(), "tailterm-work-items-"));
 const fixtureEnv = Object.fromEntries(
   Object.entries(process.env).filter(([key]) => !key.startsWith("TAILTERM_")),
 );
-const binary = path.join(root, ".build/ttbin/tailterm-hub-work-items-test");
-await exec("go", ["build", "-ldflags=-s -w", "-o", binary, "./cmd/tailterm-hub"], {
-  cwd: path.join(root, "hub"),
-});
+const binary = await prepareTestBinary({ root, target: "hub", output: path.join(root, ".build/ttbin/tailterm-hub-work-items-test") });
 const reserve = createServer();
 reserve.listen(0, "127.0.0.1");
 await once(reserve, "listening");

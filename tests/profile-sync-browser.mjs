@@ -9,28 +9,39 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { once } from "node:events";
 import assert from "node:assert/strict";
+import { prepareTestBinary } from "./test-binaries.mjs";
+const binary = await prepareTestBinary({ target: "hub", output: path.resolve(".build/ttbin/tailterm-hub-test") });
 const state = await mkdtemp(path.join(tmpdir(), "tt-profile-test-"));
 const reserve = createServer();
 reserve.listen(0, "127.0.0.1");
 await once(reserve, "listening");
 const port = reserve.address().port;
 await new Promise((r) => reserve.close(r));
-const backend = spawn(".build/ttbin/tailterm-hub-test", {
+const backend = spawn(binary, {
   env: {
-    ...process.env,
+    ...Object.fromEntries(Object.entries(process.env).filter(([key]) => !/^(TAILTERM_|CODEX_|TT_|TMUX)/.test(key))),
     TAILTERM_STATE: state,
     TAILTERM_DEV_LISTEN: "127.0.0.1:" + port,
     TAILTERM_TCP_LISTEN: "",
   },
-  stdio: "ignore",
+  stdio: ["ignore", "ignore", "pipe"],
 });
+let childError = null, childExit = null, childStderr = "", phase = "startup", engineLabel = "none", ready = false, readinessAttempts = 0;
+backend.on("error", (error) => { childError = error.message; });
+backend.on("exit", (code, signal) => { childExit = { code, signal }; });
+backend.stderr.on("data", (chunk) => { childStderr = (childStderr + chunk.toString()).slice(-4000); });
+const childClosed = once(backend, "close").catch(() => []);
 const html = `<!doctype html><html><head><meta charset="utf-8"><link rel="stylesheet" href="/client/style.css"></head><body><div id="app"><div id="workspace"><aside><button id="profile-sync"><span class="nav-label">Profile sync</span></button></aside><main><header>Profile check</header><div id="status"></div></main></div><dialog id="dialog"></dialog></div><script type="module">
 import * as vault from '/client/local-vault.js';import {createProfileSync} from '/client/profile-sync.js';import {confirmDialog} from '/client/confirm-dialog.js';
 let online=false, sync, requests=0, unavailable=false;
 const host={getIPN:()=>online?{fetch:async(url,init)=>{requests++;if(unavailable)throw new Error("Host temporarily unavailable");return fetch(url.replace('http://profile-fixture:18765',location.origin+'/profile-hub'),init)}}:null,getPeers:()=>[{name:'profile-fixture.',online:true}],getData:()=>vault.localData(),getAppearance:()=>({theme:'default',font:'system',idleMinutes:15}),connect(){},notice:text=>document.querySelector('#status').textContent=text,download(){},confirm:(title,message)=>confirmDialog({title,message}),reloadData:async()=>{},dialog:(title,body)=>{const d=document.querySelector('#dialog');if(d.open)d.close();d.innerHTML='<div class="dialog-head"><h2>'+title+'</h2><button id="dialog-close">×</button></div>'+body;d.querySelector('#dialog-close').onclick=()=>d.close();d.showModal()}};
 window.qa={vault,unavailable:value=>unavailable=value,async unlock(username,password){await vault.localAPI('/unlock','POST',{username,password});sync=createProfileSync(host,vault);document.querySelector('#profile-sync').onclick=()=>sync.show();},online:async(value)=>{online=value;return sync.connected()},show:()=>sync.show(),data:()=>vault.localData(),requests:()=>requests,stop:()=>sync.stop(),async addServer(name,password){await vault.localAPI('/servers','POST',{name,host:'test.example',port:22,username:'test',mode:'ssh'});await vault.rememberCredential(vault.localData().servers.at(-1).id,{password})},async rename(name){const s=vault.localData().servers[0];return vault.localAPI('/servers','POST',{...s,name})},async configure(){await vault.localAPI('/hub','POST',{url:location.origin+'/profile-hub',token:'fixture-token-not-live'})}};
 </script></body></html>`;
-const vite = await createVite({
+let vite;
+let origin;
+const pass = "A sufficiently long profile passphrase";
+try {
+vite = await createVite({
   configFile: false,
   root: process.cwd(),
   server: {
@@ -56,19 +67,22 @@ const vite = await createVite({
   ],
 });
 await vite.listen();
-const origin = "http://127.0.0.1:" + vite.httpServer.address().port;
-const pass = "A sufficiently long profile passphrase";
-try {
+origin = "http://127.0.0.1:" + vite.httpServer.address().port;
   for (let i = 0; i < 50; i++) {
+    readinessAttempts = i + 1;
     try {
-      if ((await fetch("http://127.0.0.1:" + port + "/v1/profiles")).ok) break;
+      if ((await fetch("http://127.0.0.1:" + port + "/v1/profiles", { signal: AbortSignal.timeout(1000) })).ok) { ready = true; break; }
     } catch {}
+    if (childError || childExit) break;
     await new Promise((r) => setTimeout(r, 100));
   }
+  assert.ok(ready, "isolated profile hub did not become ready");
   for (const [engineName, engine] of [
     ["chromium", chromium],
     ["webkit", webkit],
   ]) {
+    engineLabel = engineName;
+    phase = "browser assertions";
     const browser = await engine.launch();
     const contexts = [];
     const errors = [];
@@ -258,9 +272,13 @@ try {
       await browser.close();
     }
   }
+} catch (error) {
+  error.message += ` [phase=${phase}, engine=${engineLabel}, ready=${ready}, readinessAttempts=${readinessAttempts}, childExit=${JSON.stringify(childExit)}, childError=${JSON.stringify(childError)}, stderr=${JSON.stringify(childStderr)}]`;
+  throw error;
 } finally {
-  await vite.close();
-  backend.kill("SIGTERM");
-  await once(backend, "exit");
+  if (vite) await vite.close();
+  if (!childExit && !childError) backend.kill("SIGTERM");
+  await Promise.race([childClosed, new Promise((resolve) => setTimeout(resolve, 3000))]);
+  if (!childExit && !childError) backend.kill("SIGKILL");
   await rm(state, { recursive: true, force: true });
 }

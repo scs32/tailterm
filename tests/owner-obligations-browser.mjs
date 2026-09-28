@@ -9,6 +9,7 @@ import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import assert from "node:assert/strict";
+import { prepareTestBinary } from "./test-binaries.mjs";
 const exec = promisify(execFile),
   root = process.cwd(),
   temp = await mkdtemp(path.join(tmpdir(), "owner-obligations-"));
@@ -18,6 +19,7 @@ const cleanEnv = Object.fromEntries(
   ),
 );
 let backend, web, browser, hub, origin;
+let hubBinary = path.join(temp, "hub"), ttBinary = path.join(temp, "tt");
 const pause = (ms) => new Promise((r) => setTimeout(r, ms));
 async function freePort() {
   const s = createServer();
@@ -369,16 +371,12 @@ async function serve(req, res) {
   }
 }
 try {
-  await Promise.all([
-    exec("go", ["build", "-o", path.join(temp, "hub"), "./cmd/tailterm-hub"], {
-      cwd: path.join(root, "hub"),
-    }),
-    exec("go", ["build", "-o", path.join(temp, "tt"), "./cmd/tt"], {
-      cwd: path.join(root, "hub"),
-    }),
+  [hubBinary, ttBinary] = await Promise.all([
+    prepareTestBinary({ root, target: "hub", output: hubBinary }),
+    prepareTestBinary({ root, target: "tt", output: ttBinary }),
   ]);
   hub = "http://127.0.0.1:" + (await freePort());
-  backend = spawn(path.join(temp, "hub"), {
+  backend = spawn(hubBinary, {
     env: {
       ...cleanEnv,
       TAILTERM_STATE: temp,
@@ -561,7 +559,7 @@ try {
     const latest = await api("GET", base + "/messages?latest=1&limit=200");
     assert.ok(!latest.messages.some((m) => m.seq === messages[0].seq));
     const cli = await exec(
-      path.join(temp, "tt"),
+      ttBinary,
       ["obligations", "--owner", "--json"],
       {
         cwd: temp,

@@ -4,10 +4,11 @@ import { createServer } from "node:http";
 import { once } from "node:events";
 import { spawn, execFile } from "node:child_process";
 import { promisify } from "node:util";
-import { chmod, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import assert from "node:assert/strict";
+import { prepareTestBinary } from "./test-binaries.mjs";
 const exec = promisify(execFile),
   root = process.cwd(),
   state = await mkdtemp(path.join(tmpdir(), "tailterm-task-form-"));
@@ -16,30 +17,15 @@ const exec = promisify(execFile),
 const fixtureEnv = Object.fromEntries(
   Object.entries(process.env).filter(([key]) => !key.startsWith("TAILTERM_")),
 );
-await exec(
-  "go",
-  [
-    "build",
-    "-ldflags=-s -w",
-    "-o",
-    path.join(root, ".build/ttbin/tailterm-hub-test"),
-    "./cmd/tailterm-hub",
-  ],
-  { cwd: path.join(root, "hub") },
-);
-await exec(
-  "go",
-  ["build", "-ldflags=-s -w", "-o", path.join(state, "tt"), "./cmd/tt"],
-  {
-    cwd: path.join(root, "hub"),
-  },
-);
+const hubBinary = await prepareTestBinary({ root, target: "hub", output: path.join(root, ".build/ttbin/tailterm-hub-test") });
+const ttBinary = await prepareTestBinary({ root, target: "tt", output: path.join(state, "tt") });
+if (ttBinary !== path.join(state, "tt")) await symlink(ttBinary, path.join(state, "tt"));
 const reserve = createServer();
 reserve.listen(0, "127.0.0.1");
 await once(reserve, "listening");
 const port = reserve.address().port;
 await new Promise((r) => reserve.close(r));
-const backend = spawn(path.join(root, ".build/ttbin/tailterm-hub-test"), {
+const backend = spawn(hubBinary, {
   env: {
     ...fixtureEnv,
     TAILTERM_STATE: state,

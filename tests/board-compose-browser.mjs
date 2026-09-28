@@ -10,11 +10,12 @@ import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import assert from "node:assert/strict";
+import { prepareTestBinary } from "./test-binaries.mjs";
 
 const exec = promisify(execFile);
 const root = process.cwd();
 const state = await mkdtemp(path.join(tmpdir(), "tailterm-board-compose-"));
-const binary = path.join(state, "tailterm-hub");
+let binary = path.join(state, "tailterm-hub");
 const fixtureEnv = Object.fromEntries(
   Object.entries(process.env).filter(
     ([key]) => !/^(TAILTERM_|CODEX_|TT_|TMUX)/.test(key) && key !== "HOME",
@@ -91,9 +92,7 @@ window.qa={board};
 </script></body></html>`;
 
 try {
-  await exec("go", ["build", "-o", binary, "./cmd/tailterm-hub"], {
-    cwd: path.join(root, "hub"),
-  });
+  binary = await prepareTestBinary({ root, target: "hub", output: binary });
   const hubPort = await freePort();
   const hub = `http://127.0.0.1:${hubPort}`;
   backend = spawn(binary, {
