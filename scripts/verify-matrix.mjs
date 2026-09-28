@@ -12,6 +12,14 @@ import { tmpdir } from "node:os";
 import { createHash } from "node:crypto";
 import { execFileSync, spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
+import { buildHistoricalHub, buildMatrixBinaries, fileHash } from "../tests/test-binaries.mjs";
+
+const binarySuites = new Set([
+  "profile-sync", "task-form", "lead-replacement", "project-work-items",
+  "board-compose", "item-message-compose", "project-queue", "board-decisions",
+  "owner-obligations", "dropdown-continuity", "board-audit-old-hub",
+]);
+const historicalHubCommit = "58f9185981625b148b30ad4b5070a1a658e17f77";
 
 export function canonical(value) {
   if (Array.isArray(value)) return "[" + value.map(canonical).join(",") + "]";
@@ -413,7 +421,7 @@ export function runCheck(check, cwd, environment) {
   );
   return JSON.parse(raw);
 }
-export function runPlan(plan, cwd, output) {
+export async function runPlan(plan, cwd, output) {
   checkClean(cwd, plan.commit);
   const expected = makePlan(plan, cwd);
   if (
@@ -470,6 +478,23 @@ export function runPlan(plan, cwd, output) {
     environment.PLAYWRIGHT_BROWSERS_PATH =
       process.env.PLAYWRIGHT_BROWSERS_PATH ||
       join(process.env.HOME, "Library/Caches/ms-playwright");
+  }
+  const needsBinaries = plan.checks.some((check) =>
+    [...binarySuites].some((suite) => check.id.startsWith(`tests/${suite}-browser.mjs`)));
+  if (needsBinaries) {
+    const binaries = await buildMatrixBinaries(cwd, output);
+    if (plan.checks.some((check) => check.id.startsWith("tests/board-audit-old-hub-browser.mjs")))
+      binaries.push(await buildHistoricalHub(cwd, join(output, "tailterm-historical-hub-test"), historicalHubCommit));
+    const manifest = join(output, "test-binaries.json");
+    writeFileSync(manifest, JSON.stringify({ version: 1, binaries }, null, 2) + "\n", { mode: 0o600 });
+    writeFileSync(join(output, "test-binary-builds.json"), JSON.stringify(binaries.map(({ target, historicalCommit, source, buildLog, startedAt, endedAt, path, sha256 }) => ({ target, historicalCommit, source, buildLog, startedAt, endedAt, path, sha256 })), null, 2) + "\n", { mode: 0o600 });
+    environment.TAILTERM_TEST_BINARIES = manifest;
+    for (const binary of binaries)
+      prerequisites.push({ path: binary.path, sha256: binary.sha256,
+        source: binary.source, target: binary.target,
+        historicalCommit: binary.historicalCommit,
+        buildCommand: binary.buildLog.argv,
+        startedAt: binary.startedAt, endedAt: binary.endedAt });
   }
   const results = [];
   for (const check of plan.checks) {
@@ -530,6 +555,12 @@ export function runPlan(plan, cwd, output) {
         : {}),
     });
   }
+  if (needsBinaries) {
+    const manifest = JSON.parse(readFileSync(environment.TAILTERM_TEST_BINARIES, "utf8"));
+    for (const binary of manifest.binaries)
+      if ((await fileHash(binary.path)) !== binary.sha256)
+        throw new Error("Prepared test binary changed during verification: " + binary.path);
+  }
   checkClean(cwd, plan.commit);
   const receipt = {
     worktree: resolve(cwd),
@@ -571,7 +602,7 @@ if (
         JSON.stringify(makePlan(input, process.cwd()), null, 2) + "\n",
       );
     else if (mode === "run") {
-      const r = runPlan(input, process.cwd(), resolve(output));
+      const r = await runPlan(input, process.cwd(), resolve(output));
       process.exitCode = receiptEligible(r) ? 0 : 1;
     } else
       throw new Error(

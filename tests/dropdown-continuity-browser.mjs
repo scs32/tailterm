@@ -12,6 +12,7 @@ import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import assert from "node:assert/strict";
+import { prepareTestBinary } from "./test-binaries.mjs";
 
 const exec = promisify(execFile), root = process.cwd();
 const source = path.resolve(process.env.DROPDOWN_SOURCE || root);
@@ -276,8 +277,7 @@ async function keyboardStatusCommitCase(engine, mode) {
 }
 
 try {
-  const binary = path.join(stateDir, "tailterm-hub");
-  await exec("go", ["build", "-o", binary, "./cmd/tailterm-hub"], { cwd: path.join(source, "hub") });
+  const binary = await prepareTestBinary({ root: source, target: "hub", output: path.join(stateDir, "tailterm-hub") });
   const reserve = createServer(); reserve.listen(0, "127.0.0.1"); await once(reserve, "listening");
   const port = reserve.address().port; await new Promise(resolve => reserve.close(resolve));
   hub = `http://127.0.0.1:${port}`;

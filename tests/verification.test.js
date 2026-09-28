@@ -1,9 +1,10 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync } from "node:fs";
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, chmodSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { execFileSync } from "node:child_process";
+import { prepareTestBinary, sourceIdentity, fileHash } from "./test-binaries.mjs";
+import { execFileSync, spawnSync } from "node:child_process";
 import { createServer } from "node:net";
 import { once } from "node:events";
 import {
@@ -32,6 +33,50 @@ const makePlan = (context, cwd) =>
 const matrix = JSON.parse(
   readFileSync(new URL("../verification/matrix.json", import.meta.url)),
 );
+test("prepared binary reuse rejects source changes, tampering and a different checkout", async () => {
+  const root = mkdtempSync(join(tmpdir(), "test-binary-source-"));
+  mkdirSync(join(root, "hub"));
+  writeFileSync(join(root, "hub", "go.mod"), "module fixture\n");
+  const binary = join(root, "hub-test");
+  writeFileSync(binary, "synthetic executable");
+  chmodSync(binary, 0o755);
+  const manifest = join(root, "manifest.json");
+  const source = await sourceIdentity(root);
+  writeFileSync(manifest, JSON.stringify({ binaries: [{ target: "hub", historicalCommit: null,
+    source, path: binary, sha256: await fileHash(binary) }] }));
+  const options = { root, target: "hub", manifestPath: manifest };
+  assert.equal(await prepareTestBinary(options), binary);
+  writeFileSync(binary, "tampered executable");
+  await assert.rejects(prepareTestBinary(options), /hash mismatch/);
+  writeFileSync(binary, "synthetic executable");
+  writeFileSync(join(root, "hub", "go.mod"), "module changed\n");
+  await assert.rejects(prepareTestBinary(options), /Source mismatch/);
+  const other = mkdtempSync(join(tmpdir(), "test-binary-other-"));
+  mkdirSync(join(other, "hub"));
+  writeFileSync(join(other, "hub", "go.mod"), "module fixture\n");
+  await assert.rejects(prepareTestBinary({ ...options, root: other }), /No prepared/);
+});
+test("profile startup failure emits child exit, stderr and phase diagnostics", async () => {
+  const root = new URL("..", import.meta.url).pathname;
+  const dir = mkdtempSync(join(tmpdir(), "profile-startup-failure-"));
+  const binary = join(dir, "hub");
+  writeFileSync(binary, "#!/bin/sh\necho synthetic-startup-boom >&2\nexit 7\n");
+  chmodSync(binary, 0o755);
+  const manifest = join(dir, "manifest.json");
+  writeFileSync(manifest, JSON.stringify({ binaries: [{ target: "hub", historicalCommit: null,
+    source: await sourceIdentity(root), path: binary, sha256: await fileHash(binary) }] }));
+  const result = spawnSync(process.execPath, ["tests/profile-sync-browser.mjs"], {
+    cwd: root, encoding: "utf8", timeout: 10000,
+    env: { PATH: process.env.PATH, HOME: process.env.HOME, TMPDIR: process.env.TMPDIR,
+      TAILTERM_TEST_BINARIES: manifest },
+  });
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /profile-sync failure diagnostics:/);
+  assert.match(result.stderr, /"phase":"startup"/);
+  assert.match(result.stderr, /"ready":false/);
+  assert.match(result.stderr, /"code":7/);
+  assert.match(result.stderr, /synthetic-startup-boom/);
+});
 test("ownership union diff selects all engines, migration and touched race packages", () => {
   const checks = selectChecks(
     matrix,
@@ -117,7 +162,7 @@ test("rename and delete paths preserved in source selection", (t) => {
     "docs/new.md",
   ]);
 });
-test("clean detached run emits complete command evidence and unsubmitted AIV bindings", (t) => {
+test("clean detached run emits complete command evidence and unsubmitted AIV bindings", async (t) => {
   const f = fixture(t),
     plan = makePlan(
       {
@@ -132,16 +177,16 @@ test("clean detached run emits complete command evidence and unsubmitted AIV bin
       f.cwd,
     );
   const out = mkdtempSync(join(tmpdir(), "verification-logs-"));
-  const receipt = runPlan(plan, f.cwd, out);
+  const receipt = await runPlan(plan, f.cwd, out);
   assert.equal(receipt.checks[0].exitCode, 0);
   assert.equal(receipt.planDigest, digest(plan));
   assert.equal(receipt.aiv.state, "unsubmitted");
   assert.match(receipt.checks[0].logDigest, /^[a-f0-9]{64}$/);
-  assert.throws(() => runPlan({ ...plan, checks: [] }, f.cwd, out), /omitted/);
+  await assert.rejects(runPlan({ ...plan, checks: [] }, f.cwd, out), /omitted/);
   writeFileSync(join(f.cwd, "docs/untracked.md"), "dirty");
-  assert.throws(() => runPlan(plan, f.cwd, out), /Clean detached/);
+  await assert.rejects(runPlan(plan, f.cwd, out), /Clean detached/);
 });
-test("attached or wrong SHA cannot execute checks", (t) => {
+test("attached or wrong SHA cannot execute checks", async (t) => {
   const f = fixture(t),
     plan = makePlan(
       { baseCommit: f.base, commit: f.commit, owned: ["docs/"] },
@@ -149,14 +194,14 @@ test("attached or wrong SHA cannot execute checks", (t) => {
     ),
     out = mkdtempSync(join(tmpdir(), "verification-out-"));
   f.git("checkout", "-b", "attached");
-  assert.throws(() => runPlan(plan, f.cwd, out), /detached/);
-  assert.throws(
-    () => runPlan({ ...plan, commit: f.base }, f.cwd, out),
+  await assert.rejects(runPlan(plan, f.cwd, out), /detached/);
+  await assert.rejects(
+    runPlan({ ...plan, commit: f.base }, f.cwd, out),
     /Wrong candidate/,
   );
 });
 
-test("browser run refuses missing prerequisite assets before commands execute", (t) => {
+test("browser run refuses missing prerequisite assets before commands execute", async (t) => {
   const f = fixture(t);
   writeFileSync(join(f.cwd, "tests/fixture.mjs"), "// browser.launch(");
   writeFileSync(
@@ -176,10 +221,33 @@ test("browser run refuses missing prerequisite assets before commands execute", 
     f.cwd,
   );
   const output = mkdtempSync(join(tmpdir(), "verification-missing-assets-"));
-  assert.throws(
-    () => runPlan(plan, f.cwd, output),
+  await assert.rejects(
+    runPlan(plan, f.cwd, output),
     /Missing prerequisite: node_modules/,
   );
+});
+test("test binary build failure starts no matrix check", async (t) => {
+  const f = fixture(t);
+  writeFileSync(join(f.cwd, ".gitignore"), "node_modules/\n.build/\n");
+  mkdirSync(join(f.cwd, "wasm"));
+  writeFileSync(join(f.cwd, "wasm/tailserve.wasm"), "fixture");
+  mkdirSync(join(f.cwd, "node_modules"));
+  writeFileSync(join(f.cwd, "node_modules/.package-lock.json"), "{}");
+  mkdirSync(join(f.cwd, ".build"));
+  for (const name of ["test.wasm", "speech-fixture.wav", "go-modules.txt"])
+    writeFileSync(join(f.cwd, ".build", name), "fixture");
+  writeFileSync(join(f.cwd, "tests/profile-sync-browser.mjs"), "// browser.launch(\n");
+  writeFileSync(join(f.cwd, "verification/matrix.json"), JSON.stringify({
+    version: 1, browserSuites: [{ file: "tests/profile-sync-browser.mjs", mode: "both" }],
+    excludedBrowserSuites: [], rules: [{ prefixes: ["docs/"], groups: ["browser"] }],
+  }));
+  f.git("add", ".gitignore", "wasm", "tests", "verification");
+  f.git("commit", "-qm", "browser fixture");
+  const commit = f.git("rev-parse", "HEAD");
+  const plan = makePlan({ baseCommit: commit, commit, owned: ["docs/"] }, f.cwd);
+  const output = mkdtempSync(join(tmpdir(), "verification-build-failure-"));
+  await assert.rejects(runPlan(plan, f.cwd, output), /ENOENT.*hub|no such file.*hub/i);
+  assert.deepEqual((await import("node:fs")).readdirSync(output), []);
 });
 
 test("candidate matrix weakening cannot replace the independently approved digest", (t) => {
@@ -364,7 +432,7 @@ test("occupied required port reports its PID and never starts or kills a listene
   }
 });
 
-test("matrix timeout kills its own process group descendants and retains failed receipt evidence", (t) => {
+test("matrix timeout kills its own process group descendants and retains failed receipt evidence", async (t) => {
   const f = fixture(t),
     external = mkdtempSync(join(tmpdir(), "verification-timeout-logs-")),
     info = join(external, "descendant.json");
@@ -392,7 +460,7 @@ test("matrix timeout kills its own process group descendants and retains failed 
     f.cwd,
   );
   const started = Date.now();
-  const receipt = runPlan(plan, f.cwd, external);
+  const receipt = await runPlan(plan, f.cwd, external);
   assert(Date.now() - started < 10000, "timeout completes promptly");
   assert.equal(receipt.checks[0].exitCode, 124);
   assert.equal(receipt.checks[0].failureReason, "timeout");
@@ -461,7 +529,7 @@ for (const [codes, expected] of [
 ]) {
   test(
     "actual retry sequence " + codes.join(",") + " records exact evidence",
-    (t) => {
+    async (t) => {
       const f = fixture(t),
         output = mkdtempSync(join(tmpdir(), "verification-retry-"));
       const counter = join(output, "count.json");
@@ -480,7 +548,7 @@ for (const [codes, expected] of [
         { baseCommit: commit, commit, owned: ["docs/"] },
         f.cwd,
       );
-      const r = runPlan(plan, f.cwd, output),
+      const r = await runPlan(plan, f.cwd, output),
         c = r.checks[0];
       assert.equal(c.status, expected);
       assert.equal(c.attempts.length, codes.length);
@@ -512,7 +580,7 @@ for (const pass of [false, true])
   test(
     "known failure " +
       (pass ? "now passes" : "exhausts retries without blocking"),
-    (t) => {
+    async (t) => {
       const f = fixture(t),
         m = JSON.parse(readFileSync(join(f.cwd, "verification/matrix.json")));
       m.knownFailures = [
@@ -536,7 +604,7 @@ for (const pass of [false, true])
           { baseCommit: commit, commit, owned: ["docs/"] },
           f.cwd,
         ),
-        r = runPlan(plan, f.cwd, mkdtempSync(join(tmpdir(), "known-logs-")));
+        r = await runPlan(plan, f.cwd, mkdtempSync(join(tmpdir(), "known-logs-")));
       assert.equal(r.checks[0].knownFailure, true);
       assert.equal(!!r.checks[0].nowPassing, pass);
       assert.equal(r.checks[0].status, pass ? "pass" : "fail");

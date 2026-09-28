@@ -10,6 +10,7 @@ import { mkdtemp, mkdir, readFile, writeFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import assert from "node:assert/strict";
+import { prepareTestBinary } from "./test-binaries.mjs";
 
 const exec = promisify(execFile), root = process.cwd();
 const state = await mkdtemp(path.join(tmpdir(), "tailterm-board-decisions-"));
@@ -18,7 +19,7 @@ await mkdir(artifacts, { recursive: true });
 // Omit HOME as well: the CLI must not read the host's hub credential file.
 const fixtureEnv = Object.fromEntries(Object.entries(process.env).filter(([key]) =>
   !/^(TAILTERM_|CODEX_|TT_|TMUX)/.test(key) && key !== "HOME"));
-const hubBinary = path.join(state, "tailterm-hub"), ttBinary = path.join(state, "tt");
+let hubBinary = path.join(state, "tailterm-hub"), ttBinary = path.join(state, "tt");
 let backend, web, browser, diagnosticPage;
 const results = [], failures = [], screenshots = [], requests = [], frozenReads = new Map();
 let fault = null;
@@ -324,9 +325,9 @@ async function check(name, fn) {
 }
 
 try {
-  await Promise.all([
-    exec("go", ["build", "-o", hubBinary, "./cmd/tailterm-hub"], { cwd: path.join(root, "hub") }),
-    exec("go", ["build", "-o", ttBinary, "./cmd/tt"], { cwd: path.join(root, "hub") }),
+  [hubBinary, ttBinary] = await Promise.all([
+    prepareTestBinary({ root, target: "hub", output: hubBinary }),
+    prepareTestBinary({ root, target: "tt", output: ttBinary }),
   ]);
   hub = `http://127.0.0.1:${await freePort()}`;
   backend = spawn(hubBinary, { env: { ...fixtureEnv, TAILTERM_STATE: state, TAILTERM_DEV_LISTEN: new URL(hub).host, TAILTERM_TCP_LISTEN: "" }, stdio: "ignore" });

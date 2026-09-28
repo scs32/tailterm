@@ -10,6 +10,7 @@ import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import assert from "node:assert/strict";
+import { prepareTestBinary } from "./test-binaries.mjs";
 
 const exec = promisify(execFile);
 const baseline = "58f9185981625b148b30ad4b5070a1a658e17f77";
@@ -17,7 +18,7 @@ const root = process.cwd();
 const state = await mkdtemp(path.join(tmpdir(), "tailterm-old-a2-board-"));
 const source = path.join(state, "source");
 const archive = path.join(state, "source.tar");
-const binary = path.join(state, "tailterm-hub-a2");
+let binary = path.join(state, "tailterm-hub-a2");
 const fixtureEnv = Object.fromEntries(
   Object.entries(process.env).filter(
     ([key]) => !/^(TAILTERM_|CODEX_|TT_|TMUX)/.test(key) && key !== "HOME",
@@ -68,9 +69,7 @@ try {
   await writeFile(archive, archived.stdout);
   await mkdir(source);
   await exec("tar", ["-xf", archive, "-C", source]);
-  await exec("go", ["build", "-o", binary, "./cmd/tailterm-hub"], {
-    cwd: path.join(source, "hub"),
-  });
+  binary = await prepareTestBinary({ root: source, target: "hub", output: binary, historicalCommit: baseline });
 
   const hubPort = await freePort();
   const hub = `http://127.0.0.1:${hubPort}`;
