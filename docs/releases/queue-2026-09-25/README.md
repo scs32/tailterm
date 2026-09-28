@@ -39,6 +39,10 @@ SHA-256 is of the unredacted receipt.
 | `5480dae` | Queue acceptance (`wi_4656983381013e99`, out-of-band) | A verified team is accepted on its verified base and worktree, not the queue-time base | Hub `20260927-queue-accept-5480dae` |
 | `acfe2d0` | Token accounting (`wi_ca6a62f5e74114b4`) | Per-request token ledger by item, phase and role, with optional prices; `tt usage` and a TailOS Usage view | Hub `20260927-token-accounting-acfe2d0`, Mini `tt`, TailOS `784c6588` |
 | `3c2de08` | Claude wake (`wi_8401f9220e95bff5`) | The relay wakes an idle Claude Code agent inside its own tmux session when it is safely idle | Hub `20260928-claude-wake-3c2de08`, Mini `tt`, TailOS `111e8c19` |
+| `f3b1c19` | Owner-accept for follow-ups (`wi_be41cf76f6148a9c`, out-of-band) | Owner-accept also resolves a follow-ups disposition once verification is ready | Hub `20260928-owner-accept-followups-f3b1c19` |
+| `0ce60c0` | Repository identity (`wi_0842a90ecb62e82a`, out-of-band) | A plan naming the repository root matches the queue entry's `.git` | Hub `20260928-repository-identity-0ce60c0` |
+| `2488e75` | Profile-sync order dependency (`wi_21ba42f8f0542dc0`) | Test binaries built once before checks; profile-sync passes first in a fresh checkout | none (tests and scripts only) |
+| `172becd` | Verification criterion (`wi_def1f8fa52bec739`) | Verification-owned review criteria are judged by the eligible receipt; no owner-accept needed | Hub `20260928-verification-criterion-172becd`, Mini `tt`, TailOS `bc20b212` |
 
 ## Hub releases
 
@@ -56,12 +60,15 @@ SHA-256 is of the unredacted receipt.
 | `20260927-queue-accept-5480dae` | `before-queue-accept-5480dae.sqlite` | 137,195,520 | `bcccb27e…` | ok, 0 FK | none |
 | `20260927-token-accounting-acfe2d0` | `before-token-accounting-acfe2d0.sqlite` | 142,581,760 | `318c21f2…` | ok, 0 FK | seven new usage tables (turns, runs, receipts, prices, host usage) |
 | `20260928-claude-wake-3c2de08` | `before-claude-wake-3c2de08.sqlite` | 183,001,088 | `afb40749…` | ok, 0 FK | none |
+| `20260928-owner-accept-followups-f3b1c19` | `before-owner-accept-followups-f3b1c19.sqlite` | 204,869,632 | `80df2e50…` | ok, 0 FK | none |
+| `20260928-repository-identity-0ce60c0` | `before-repository-identity-0ce60c0.sqlite` | 205,438,976 | `1e582fd3…` | ok, 0 FK | none |
+| `20260928-verification-criterion-172becd` | `before-verification-criterion-172becd.sqlite` | 229,027,840 | `205ddf33…` | ok, 0 FK | none |
 
 Before `6235924`, the combined migration was rehearsed on a copy of the `33d3ab7` backup: the new
 hub migrated it (integrity ok, no FK violations, 14 projects, queue at limit 1), and the
 `33d3ab7` hub opened the migrated copy. The `34944cf`, `8b1f4d4`, `8e32dc0` and `acfe2d0` migrations were rehearsed
 the same way on a copy of the previous release's backup, including the old hub opening the
-migrated copy. The first `c343819` deploy attempt was refused by plan validation before any
+migrated copy. `172becd` fast-forwarded `tasks-hub` and shipped on its independent receipt without an owner-side rerun, per the deployment agent's rule. The first `c343819` deploy attempt was refused by plan validation before any
 change (the plan carried the previous day's release name); the second, with a fresh backup
 (`-v2`), succeeded. Rollback binaries: `.build/prev-*` (hub, bridge) and
 `~/.local/bin/tt.prev-*` (Mini).
