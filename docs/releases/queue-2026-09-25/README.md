@@ -1,4 +1,4 @@
-# Queue releases: 2026-09-25 to 27
+# Queue releases: 2026-09-25 to 28
 
 Items delivered by the shadow-week team queue (`tsk_e7af3c28a444b09a`) after the overnight release
 [`cf80b46`](../overnight-cf80b46/README.md), each merged to `tasks-hub` and released from the
@@ -38,6 +38,7 @@ SHA-256 is of the unredacted receipt.
 | `9c99ddc` | Reviewer model (out-of-band) | Planned-template reviewers launch on Opus 5.5 instead of Fable, which hit its usage limit at every launch | Mini `tt`, TailOS `5c9063a5` |
 | `5480dae` | Queue acceptance (`wi_4656983381013e99`, out-of-band) | A verified team is accepted on its verified base and worktree, not the queue-time base | Hub `20260927-queue-accept-5480dae` |
 | `acfe2d0` | Token accounting (`wi_ca6a62f5e74114b4`) | Per-request token ledger by item, phase and role, with optional prices; `tt usage` and a TailOS Usage view | Hub `20260927-token-accounting-acfe2d0`, Mini `tt`, TailOS `784c6588` |
+| `3c2de08` | Claude wake (`wi_8401f9220e95bff5`) | The relay wakes an idle Claude Code agent inside its own tmux session when it is safely idle | Hub `20260928-claude-wake-3c2de08`, Mini `tt`, TailOS `111e8c19` |
 
 ## Hub releases
 
@@ -54,6 +55,7 @@ SHA-256 is of the unredacted receipt.
 | `20260927-deployment-agent-8e32dc0` | `before-deployment-agent-8e32dc0.sqlite` | 137,097,216 | `e876dfb9…` | ok, 0 FK | new `release_jobs`, `release_action_receipts`; unique index for one deployment agent per project |
 | `20260927-queue-accept-5480dae` | `before-queue-accept-5480dae.sqlite` | 137,195,520 | `bcccb27e…` | ok, 0 FK | none |
 | `20260927-token-accounting-acfe2d0` | `before-token-accounting-acfe2d0.sqlite` | 142,581,760 | `318c21f2…` | ok, 0 FK | seven new usage tables (turns, runs, receipts, prices, host usage) |
+| `20260928-claude-wake-3c2de08` | `before-claude-wake-3c2de08.sqlite` | 183,001,088 | `afb40749…` | ok, 0 FK | none |
 
 Before `6235924`, the combined migration was rehearsed on a copy of the `33d3ab7` backup: the new
 hub migrated it (integrity ok, no FK violations, 14 projects, queue at limit 1), and the
