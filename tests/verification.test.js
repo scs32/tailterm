@@ -1,9 +1,17 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync } from "node:fs";
+import {
+  mkdtempSync,
+  mkdirSync,
+  writeFileSync,
+  readFileSync,
+  rmSync,
+  existsSync,
+  readdirSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import { createServer } from "node:net";
 import { once } from "node:events";
 import {
@@ -17,6 +25,7 @@ import {
   occupiedPorts,
   receiptEligible,
   matrixPolicy,
+  removeVerifierHome,
 } from "../scripts/verify-matrix.mjs";
 const makePlan = (context, cwd) =>
   rawMakePlan(
@@ -73,7 +82,7 @@ test("unknown and traversal paths fail closed", () => {
 test("browser inventory includes every standalone entry and only explicit deployed exclusions", () =>
   assertInventory(matrix, new URL("..", import.meta.url).pathname));
 function fixture(t) {
-  const cwd = mkdtempSync(join(tmpdir(), "verification-fixture-"));
+  const cwd = tempDir(t, "verification-fixture-");
   mkdirSync(join(cwd, "tests"));
   mkdirSync(join(cwd, "verification"));
   const git = (...args) =>
@@ -105,6 +114,226 @@ function fixture(t) {
   git("checkout", "--detach", commit);
   return { cwd, git, base, commit };
 }
+function tempDir(t, prefix) {
+  const directory = mkdtempSync(join(tmpdir(), prefix));
+  t.after(() => rmSync(directory, { recursive: true, force: true }));
+  return directory;
+}
+function commandPlan(f, source) {
+  writeFileSync(join(f.cwd, "check.mjs"), source);
+  writeFileSync(
+    join(f.cwd, "package.json"),
+    JSON.stringify({ scripts: { test: "node check.mjs" } }),
+  );
+  f.git("add", ".");
+  f.git("commit", "-qm", "fixture command");
+  const commit = f.git("rev-parse", "HEAD");
+  return makePlan({ baseCommit: commit, commit, owned: ["docs/"] }, f.cwd);
+}
+test("run removes locked Go cache after success and leaves symlink target untouched", (t) => {
+  const f = fixture(t),
+    outside = tempDir(t, "verification-sibling-");
+  writeFileSync(join(outside, "keep"), "sibling");
+  const plan = commandPlan(
+    f,
+    `import fs from 'node:fs';import path from 'node:path';const home=process.env.HOME;const cache=path.join(process.env.GOMODCACHE,'locked');fs.mkdirSync(cache,{recursive:true});fs.writeFileSync(path.join(cache,'module'), 'module');fs.chmodSync(path.join(cache,'module'),0o400);fs.chmodSync(cache,0o500);fs.symlinkSync(${JSON.stringify(outside)},path.join(home,'sibling'));console.log(JSON.stringify({HOME:home,GOPATH:process.env.GOPATH,GOMODCACHE:process.env.GOMODCACHE,GOCACHE:process.env.GOCACHE}));`,
+  );
+  const output = tempDir(t, "verification-clean-logs-");
+  const receipt = runPlan(plan, f.cwd, output);
+  assert.equal(receipt.checks[0].exitCode, 0);
+  assert.equal(receipt.environment.VERIFICATION_KEEP_HOME, "0");
+  assert(!existsSync(receipt.environment.HOME));
+  assert.equal(readFileSync(join(outside, "keep"), "utf8"), "sibling");
+  assert(existsSync(receipt.checks[0].logURI));
+  assert(existsSync(join(output, "receipt.json")));
+  const childEnvironment = JSON.parse(
+    readFileSync(receipt.checks[0].logURI, "utf8")
+      .split("\n")
+      .find((line) => line.startsWith('{"HOME":')),
+  );
+  for (const key of ["HOME", "GOPATH", "GOMODCACHE", "GOCACHE"])
+    assert.equal(childEnvironment[key], receipt.environment[key]);
+  for (const key of ["GOPATH", "GOMODCACHE", "GOCACHE"])
+    assert(receipt.environment[key].startsWith(receipt.environment.HOME + "/"));
+});
+test("failed run removes home after saving failed logs", (t) => {
+  const f = fixture(t),
+    plan = commandPlan(f, "console.error('fixture failure');process.exit(7);");
+  const receipt = runPlan(plan, f.cwd, tempDir(t, "verification-failed-logs-"));
+  assert.equal(receipt.checks[0].exitCode, 7);
+  assert(!existsSync(receipt.environment.HOME));
+  assert.match(
+    readFileSync(receipt.checks[0].logURI, "utf8"),
+    /fixture failure/,
+  );
+});
+test("keep-home retains exact home and records opt-in with cache isolation", (t) => {
+  const f = fixture(t),
+    plan = commandPlan(f, "console.log(process.env.HOME);");
+  const output = tempDir(t, "verification-kept-logs-");
+  const receipt = runPlan(plan, f.cwd, output, { keepHome: true });
+  t.after(() => removeVerifierHome(receipt.environment.HOME));
+  assert.equal(receipt.environment.VERIFICATION_KEEP_HOME, "1");
+  assert(existsSync(receipt.environment.HOME));
+  assert.equal(
+    JSON.parse(readFileSync(join(output, "receipt.json"))).environment.HOME,
+    receipt.environment.HOME,
+  );
+  for (const key of ["GOPATH", "GOMODCACHE", "GOCACHE"])
+    assert(receipt.environment[key].startsWith(receipt.environment.HOME + "/"));
+});
+test("free-space reserve rejects before run and before retry without filling disk", (t) => {
+  const f = fixture(t),
+    output = tempDir(t, "verification-space-logs-");
+  const counter = join(output, "count");
+  const plan = commandPlan(
+    f,
+    `import fs from 'node:fs';fs.appendFileSync(${JSON.stringify(counter)},'x');process.exit(9);`,
+  );
+  assert.throws(
+    () => runPlan(plan, f.cwd, output, { minFreeBytes: -1 }),
+    /Invalid --min-free-bytes/,
+  );
+  assert.throws(
+    () =>
+      runPlan(plan, f.cwd, output, {
+        minFreeBytes: 10,
+        getAvailableBytes: () => 9,
+      }),
+    /Insufficient free space/,
+  );
+  assert(!existsSync(counter), "low-space refusal starts no command");
+  let probes = 0;
+  assert.throws(
+    () =>
+      runPlan(plan, f.cwd, output, {
+        minFreeBytes: 10,
+        getAvailableBytes: () => (++probes < 3 ? 10 : 9),
+      }),
+    /Insufficient free space/,
+  );
+  assert.equal(
+    readFileSync(counter, "utf8"),
+    "x",
+    "only the first attempt ran",
+  );
+  assert.equal(probes, 3);
+  const receipt = runPlan(plan, f.cwd, output, {
+    minFreeBytes: 0,
+    getAvailableBytes: () => 10,
+  });
+  assert.equal(receipt.checks[0].exitCode, 9);
+  assert.equal(readFileSync(counter, "utf8"), "xxxx");
+});
+test("missing prerequisites and output errors clean their allocated homes", (t) => {
+  const f = fixture(t),
+    root = tempDir(t, "verification-home-root-");
+  const prerequisiteOutput = tempDir(t, "verification-prereq-logs-");
+  const outputFile = join(tempDir(t, "verification-output-parent-"), "file");
+  writeFileSync(outputFile, "not a directory");
+  const original = process.env.TMPDIR;
+  process.env.TMPDIR = root;
+  t.after(() => {
+    if (original === undefined) delete process.env.TMPDIR;
+    else process.env.TMPDIR = original;
+  });
+  const browser = JSON.parse(
+    readFileSync(join(f.cwd, "verification/matrix.json")),
+  );
+  browser.browserSuites = [{ file: "tests/fixture.mjs", mode: "selected" }];
+  browser.rules = [{ prefixes: ["docs/"], groups: ["browser"] }];
+  writeFileSync(join(f.cwd, "tests/fixture.mjs"), "// browser.launch(");
+  writeFileSync(
+    join(f.cwd, "verification/matrix.json"),
+    JSON.stringify(browser),
+  );
+  f.git("add", ".");
+  f.git("commit", "-qm", "browser fixture");
+  const commit = f.git("rev-parse", "HEAD");
+  const plan = makePlan(
+    { baseCommit: commit, commit, owned: ["docs/"] },
+    f.cwd,
+  );
+  assert.throws(
+    () => runPlan(plan, f.cwd, prerequisiteOutput),
+    /Missing prerequisite/,
+  );
+  assert.deepEqual(readdirSync(root), []);
+  assert.throws(() => runPlan(plan, f.cwd, outputFile), /EEXIST/);
+  assert.deepEqual(readdirSync(root), []);
+});
+test("CLI flags retain home only when requested", (t) => {
+  const f = fixture(t),
+    plan = commandPlan(f, "console.log(process.env.HOME);");
+  const root = tempDir(t, "verification-cli-root-");
+  const planFile = join(root, "plan.json");
+  writeFileSync(planFile, JSON.stringify(plan));
+  const script = new URL("../scripts/verify-matrix.mjs", import.meta.url)
+    .pathname;
+  const output = tempDir(t, "verification-cli-logs-");
+  execFileSync(
+    process.execPath,
+    [script, "run", planFile, output, "--keep-home", "--min-free-bytes", "0"],
+    { cwd: f.cwd, env: { ...process.env, TMPDIR: root } },
+  );
+  const receipt = JSON.parse(readFileSync(join(output, "receipt.json")));
+  assert.equal(receipt.environment.VERIFICATION_KEEP_HOME, "1");
+  assert(existsSync(receipt.environment.HOME));
+  t.after(() => {
+    if (existsSync(receipt.environment.HOME))
+      removeVerifierHome(receipt.environment.HOME);
+  });
+  assert.throws(
+    () =>
+      execFileSync(
+        process.execPath,
+        [script, "run", planFile, output, "--min-free-bytes", "-1"],
+        { cwd: f.cwd, env: { ...process.env, TMPDIR: root }, stdio: "pipe" },
+      ),
+    /Invalid --min-free-bytes/,
+  );
+});
+for (const signal of ["SIGINT", "SIGTERM"])
+  test(`CLI ${signal} interruption removes its home and preserves external logs`, async (t) => {
+    const f = fixture(t),
+      root = tempDir(t, "verification-signal-root-");
+    const marker = join(root, "started");
+    const plan = commandPlan(
+      f,
+      `import fs from 'node:fs';fs.writeFileSync(${JSON.stringify(marker)},'started');setTimeout(()=>console.log('finished'),900);`,
+    );
+    const planFile = join(root, "plan.json"),
+      output = tempDir(t, "verification-signal-logs-");
+    writeFileSync(planFile, JSON.stringify(plan));
+    const script = new URL("../scripts/verify-matrix.mjs", import.meta.url)
+      .pathname;
+    const child = spawn(
+      process.execPath,
+      [script, "run", planFile, output, "--min-free-bytes", "0"],
+      { cwd: f.cwd, env: { ...process.env, TMPDIR: root }, stdio: "ignore" },
+    );
+    t.after(() => {
+      if (child.exitCode === null && child.signalCode === null)
+        child.kill("SIGKILL");
+    });
+    for (let i = 0; !existsSync(marker) && i < 200; i++)
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    assert(existsSync(marker), "check command started before interruption");
+    child.kill(signal);
+    const [code, closedBy] = await once(child, "close");
+    assert(
+      code === (signal === "SIGINT" ? 130 : 143) || closedBy === signal,
+      `exit code ${code}, signal ${closedBy}`,
+    );
+    assert.deepEqual(readdirSync(root).sort(), ["plan.json", "started"]);
+    assert(
+      existsSync(join(output, "receipt.json")),
+      "receipt was saved outside home",
+    );
+    const receipt = JSON.parse(readFileSync(join(output, "receipt.json")));
+    assert(!existsSync(receipt.environment.HOME));
+    assert(existsSync(receipt.checks[0].logURI));
+  });
 test("rename and delete paths preserved in source selection", (t) => {
   const f = fixture(t);
   assert.deepEqual(diffPaths(f.cwd, f.base, f.commit), [
@@ -131,7 +360,7 @@ test("clean detached run emits complete command evidence and unsubmitted AIV bin
       },
       f.cwd,
     );
-  const out = mkdtempSync(join(tmpdir(), "verification-logs-"));
+  const out = tempDir(t, "verification-logs-");
   const receipt = runPlan(plan, f.cwd, out);
   assert.equal(receipt.checks[0].exitCode, 0);
   assert.equal(receipt.planDigest, digest(plan));
@@ -147,7 +376,7 @@ test("attached or wrong SHA cannot execute checks", (t) => {
       { baseCommit: f.base, commit: f.commit, owned: ["docs/"] },
       f.cwd,
     ),
-    out = mkdtempSync(join(tmpdir(), "verification-out-"));
+    out = tempDir(t, "verification-out-");
   f.git("checkout", "-b", "attached");
   assert.throws(() => runPlan(plan, f.cwd, out), /detached/);
   assert.throws(
@@ -175,7 +404,7 @@ test("browser run refuses missing prerequisite assets before commands execute", 
     { baseCommit: commit, commit, owned: ["docs/"] },
     f.cwd,
   );
-  const output = mkdtempSync(join(tmpdir(), "verification-missing-assets-"));
+  const output = tempDir(t, "verification-missing-assets-");
   assert.throws(
     () => runPlan(plan, f.cwd, output),
     /Missing prerequisite: node_modules/,
@@ -366,7 +595,7 @@ test("occupied required port reports its PID and never starts or kills a listene
 
 test("matrix timeout kills its own process group descendants and retains failed receipt evidence", (t) => {
   const f = fixture(t),
-    external = mkdtempSync(join(tmpdir(), "verification-timeout-logs-")),
+    external = tempDir(t, "verification-timeout-logs-"),
     info = join(external, "descendant.json");
   const childCode = `const net=require('node:net'),fs=require('node:fs');process.on('SIGTERM',()=>{});const server=net.createServer();server.listen(0,'127.0.0.1',()=>fs.appendFileSync(${JSON.stringify(info)},JSON.stringify({pid:process.pid,parent:process.ppid,port:server.address().port})+String.fromCharCode(10)));setInterval(()=>{},1000);`;
   const parentCode = `import {spawn} from 'node:child_process';process.on('SIGTERM',()=>{});spawn(process.execPath,['-e',${JSON.stringify(childCode)}],{stdio:'ignore'});setInterval(()=>{},1000);`;
@@ -394,6 +623,10 @@ test("matrix timeout kills its own process group descendants and retains failed 
   const started = Date.now();
   const receipt = runPlan(plan, f.cwd, external);
   assert(Date.now() - started < 10000, "timeout completes promptly");
+  assert(
+    !existsSync(receipt.environment.HOME),
+    "timed out run removed its home",
+  );
   assert.equal(receipt.checks[0].exitCode, 124);
   assert.equal(receipt.checks[0].failureReason, "timeout");
   const log = readFileSync(receipt.checks[0].logURI, "utf8");
@@ -463,7 +696,7 @@ for (const [codes, expected] of [
     "actual retry sequence " + codes.join(",") + " records exact evidence",
     (t) => {
       const f = fixture(t),
-        output = mkdtempSync(join(tmpdir(), "verification-retry-"));
+        output = tempDir(t, "verification-retry-");
       const counter = join(output, "count.json");
       writeFileSync(
         join(f.cwd, "retry.mjs"),
@@ -536,7 +769,7 @@ for (const pass of [false, true])
           { baseCommit: commit, commit, owned: ["docs/"] },
           f.cwd,
         ),
-        r = runPlan(plan, f.cwd, mkdtempSync(join(tmpdir(), "known-logs-")));
+        r = runPlan(plan, f.cwd, tempDir(t, "known-logs-"));
       assert.equal(r.checks[0].knownFailure, true);
       assert.equal(!!r.checks[0].nowPassing, pass);
       assert.equal(r.checks[0].status, pass ? "pass" : "fail");

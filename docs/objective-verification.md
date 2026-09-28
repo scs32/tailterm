@@ -75,6 +75,25 @@ tt verification receipt --item ITEM --file /absolute/external/log-directory/rece
 tt verification history --item ITEM
 ```
 
+The runner creates a fresh temporary HOME/TMPDIR for each invocation and removes
+it after writing external logs and the receipt, including on failed checks and
+timeouts. It makes Go's read-only module-cache entries writable before removal;
+cleanup walks only that invocation's home and does not follow symlinks. The
+receipt's allowlisted environment records `VERIFICATION_KEEP_HOME=0` and the
+exact `HOME` path. For local debugging, append `--keep-home` to retain that home;
+the receipt then records `VERIFICATION_KEEP_HOME=1`, and the operator must remove
+the retained directory when finished. `--min-free-bytes N` sets the free-space
+reserve (default 2147483648 bytes). The runner checks available space before
+allocating a home and before every check attempt, and refuses to start an
+attempt below the reserve. A failed preflight reports the available and required
+byte counts.
+
+Go's `GOPATH`, `GOMODCACHE`, and `GOCACHE` all resolve inside the disposable
+home. We decline the optional shared module download cache for this phase: it
+would require a separately managed read-only cache with its own ownership,
+integrity and cleanup policy. Keeping both module downloads and build artifacts
+inside the run home preserves the current isolation boundary.
+
 Plans and receipts are append-only. Every mutation has a stable request ID and
 expected generation. Identical retries return the saved record after later
 lifecycle changes; altered payloads or competing generations conflict without
@@ -149,7 +168,6 @@ Deleted and renamed-away paths remain in coverage selection, but are excluded
 from command targets; existing moved destinations are selected. If no touched
 package survives, the race check falls back to `./...`. Tests execute the real Go
 race command after a complete package move and deletion.
-
 
 ## Known failures and retries
 

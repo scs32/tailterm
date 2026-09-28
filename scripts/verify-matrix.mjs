@@ -6,6 +6,10 @@ import {
   existsSync,
   readdirSync,
   statSync,
+  statfsSync,
+  lstatSync,
+  chmodSync,
+  rmSync,
 } from "node:fs";
 import { resolve, relative, join, isAbsolute } from "node:path";
 import { tmpdir } from "node:os";
@@ -413,7 +417,50 @@ export function runCheck(check, cwd, environment) {
   );
   return JSON.parse(raw);
 }
-export function runPlan(plan, cwd, output) {
+const DEFAULT_MIN_FREE_BYTES = 2 * 1024 * 1024 * 1024;
+
+export function availableBytes(path = tmpdir()) {
+  const { bavail, bsize } = statfsSync(path);
+  return bavail * bsize;
+}
+
+export function requireFreeSpace(reserve, getAvailableBytes = availableBytes) {
+  if (!Number.isSafeInteger(reserve) || reserve < 0)
+    throw new Error("Invalid --min-free-bytes reserve");
+  const free = getAvailableBytes();
+  if (!Number.isSafeInteger(free) || free < 0)
+    throw new Error("Unable to determine free space for verifier home");
+  if (free < reserve)
+    throw new Error(
+      `Insufficient free space for verifier home: ${free} bytes available, ${reserve} bytes required`,
+    );
+}
+
+// Go makes module-cache directories read-only. Only walk the exact home this
+// invocation created; lstat avoids traversing symlinks into sibling runs.
+export function removeVerifierHome(home) {
+  const visit = (path) => {
+    const entry = lstatSync(path);
+    if (entry.isSymbolicLink()) return;
+    if (entry.isDirectory()) {
+      chmodSync(path, entry.mode | 0o700);
+      for (const name of readdirSync(path)) visit(join(path, name));
+    } else if (entry.isFile()) {
+      chmodSync(path, entry.mode | 0o600);
+    }
+  };
+  visit(home);
+  rmSync(home, { recursive: true, force: true });
+}
+
+export function runPlan(plan, cwd, output, options = {}) {
+  const {
+    keepHome = false,
+    minFreeBytes = DEFAULT_MIN_FREE_BYTES,
+    getAvailableBytes = availableBytes,
+  } = options;
+  if (typeof keepHome !== "boolean")
+    throw new Error("Invalid --keep-home value");
   checkClean(cwd, plan.commit);
   const expected = makePlan(plan, cwd);
   if (
@@ -436,134 +483,153 @@ export function runPlan(plan, cwd, output) {
     throw new Error("Altered or omitted required checks");
   if (!isAbsolute(output) || relative(cwd, output).split("/")[0] !== "..")
     throw new Error("Logs/receipt must be outside worktree");
+  requireFreeSpace(minFreeBytes, getAvailableBytes);
   const home = mkdtempSync(join(tmpdir(), "tailterm-verifier-"));
-  mkdirSync(output, { recursive: true });
-  const environment = {
-    PATH: process.env.PATH,
-    HOME: home,
-    TMPDIR: home,
-    LANG: "en_US.UTF-8",
-    CI: "1",
-    GOTOOLCHAIN: "auto",
-  };
-  // No inherited task/hub credentials, runtime config, vault or tmux socket.
-  const prerequisites = [];
-  if (
-    plan.checks.some(
-      (c) => c.id.includes("browser") || c.environment.TEST_BROWSER,
-    )
-  ) {
-    for (const p of [
-      "node_modules/.package-lock.json",
-      "wasm/tailserve.wasm",
-      ".build/test.wasm",
-      ".build/speech-fixture.wav",
-      ".build/go-modules.txt",
-    ]) {
-      const f = join(cwd, p);
-      if (!existsSync(f)) throw new Error("Missing prerequisite: " + p);
-      prerequisites.push({
-        path: p,
-        sha256: createHash("sha256").update(readFileSync(f)).digest("hex"),
-      });
+  try {
+    mkdirSync(output, { recursive: true });
+    const environment = {
+      PATH: process.env.PATH,
+      HOME: home,
+      TMPDIR: home,
+      GOPATH: join(home, "go"),
+      GOMODCACHE: join(home, "go", "pkg", "mod"),
+      GOCACHE: join(home, "go-build"),
+      VERIFICATION_KEEP_HOME: keepHome ? "1" : "0",
+      LANG: "en_US.UTF-8",
+      CI: "1",
+      GOTOOLCHAIN: "auto",
+    };
+    // No inherited task/hub credentials, runtime config, vault or tmux socket.
+    const prerequisites = [];
+    if (
+      plan.checks.some(
+        (c) => c.id.includes("browser") || c.environment.TEST_BROWSER,
+      )
+    ) {
+      for (const p of [
+        "node_modules/.package-lock.json",
+        "wasm/tailserve.wasm",
+        ".build/test.wasm",
+        ".build/speech-fixture.wav",
+        ".build/go-modules.txt",
+      ]) {
+        const f = join(cwd, p);
+        if (!existsSync(f)) throw new Error("Missing prerequisite: " + p);
+        prerequisites.push({
+          path: p,
+          sha256: createHash("sha256").update(readFileSync(f)).digest("hex"),
+        });
+      }
+      environment.PLAYWRIGHT_BROWSERS_PATH =
+        process.env.PLAYWRIGHT_BROWSERS_PATH ||
+        join(process.env.HOME, "Library/Caches/ms-playwright");
     }
-    environment.PLAYWRIGHT_BROWSERS_PATH =
-      process.env.PLAYWRIGHT_BROWSERS_PATH ||
-      join(process.env.HOME, "Library/Caches/ms-playwright");
-  }
-  const results = [];
-  for (const check of plan.checks) {
-    const attempts = [];
-    for (let attempt = 1; attempt <= (plan.maxAttempts || 1); attempt++) {
-      const startedAt = new Date().toISOString(),
-        start = performance.now();
-      const run = runCheck(check, resolve(cwd, check.cwd), environment);
-      const log =
-        (run.stdout || "") +
-        (run.stderr || "") +
-        (run.failureReason
-          ? "\nverification failureReason: " + run.failureReason + "\n"
-          : "") +
-        (run.signal ? "verification signal: " + run.signal + "\n" : "");
-      const logURI = join(
-        output,
-        digest(check.id) +
-          (plan.maxAttempts ? ".attempt-" + attempt : "") +
-          ".log",
+    const results = [];
+    for (const check of plan.checks) {
+      const attempts = [];
+      for (let attempt = 1; attempt <= (plan.maxAttempts || 1); attempt++) {
+        requireFreeSpace(minFreeBytes, getAvailableBytes);
+        const startedAt = new Date().toISOString(),
+          start = performance.now();
+        const run = runCheck(check, resolve(cwd, check.cwd), environment);
+        const log =
+          (run.stdout || "") +
+          (run.stderr || "") +
+          (run.failureReason
+            ? "\nverification failureReason: " + run.failureReason + "\n"
+            : "") +
+          (run.signal ? "verification signal: " + run.signal + "\n" : "");
+        const logURI = join(
+          output,
+          digest(check.id) +
+            (plan.maxAttempts ? ".attempt-" + attempt : "") +
+            ".log",
+        );
+        writeFileSync(logURI, log, { mode: 0o600 });
+        attempts.push({
+          attempt,
+          startedAt,
+          endedAt: new Date().toISOString(),
+          durationMs: Math.round(performance.now() - start),
+          exitCode: run.status ?? -1,
+          ...(run.failureReason ? { failureReason: run.failureReason } : {}),
+          logURI,
+          logDigest: digest(log),
+        });
+        if (run.status === 0) break;
+      }
+      const { attempt, ...final } = attempts.at(-1);
+      const knownFailure = plan.knownFailures?.some(
+        (e) => e.checkId === check.id,
       );
-      writeFileSync(logURI, log, { mode: 0o600 });
-      attempts.push({
-        attempt,
-        startedAt,
-        endedAt: new Date().toISOString(),
-        durationMs: Math.round(performance.now() - start),
-        exitCode: run.status ?? -1,
-        ...(run.failureReason ? { failureReason: run.failureReason } : {}),
-        logURI,
-        logDigest: digest(log),
+      results.push({
+        ...check,
+        ...final,
+        ...(plan.maxAttempts
+          ? {
+              attempts,
+              status:
+                final.exitCode === 0
+                  ? attempts.length > 1
+                    ? "flaky"
+                    : "pass"
+                  : "fail",
+              ...(knownFailure
+                ? {
+                    knownFailure: true,
+                    ...(final.exitCode === 0 ? { nowPassing: true } : {}),
+                  }
+                : {}),
+            }
+          : {}),
       });
-      if (run.status === 0) break;
     }
-    const { attempt, ...final } = attempts.at(-1);
-    const knownFailure = plan.knownFailures?.some(
-      (e) => e.checkId === check.id,
+    checkClean(cwd, plan.commit);
+    const receipt = {
+      worktree: resolve(cwd),
+      version: 1,
+      operationKey: plan.operationKey,
+      planDigest: digest(plan),
+      repository: plan.repository,
+      baseCommit: plan.baseCommit,
+      commit: plan.commit,
+      matrixDigest: plan.matrixDigest,
+      checksDigest: plan.checksDigest,
+      verifierAgentId: plan.verifierAgentId,
+      verifierRunId: plan.verifierRunId,
+      detached: true,
+      cleanBefore: true,
+      cleanAfter: true,
+      environment,
+      prerequisites,
+      checks: results,
+      aiv: { state: "unsubmitted" },
+    };
+    writeFileSync(
+      join(output, "receipt.json"),
+      JSON.stringify(receipt, null, 2) + "\n",
+      { mode: 0o600 },
     );
-    results.push({
-      ...check,
-      ...final,
-      ...(plan.maxAttempts
-        ? {
-            attempts,
-            status:
-              final.exitCode === 0
-                ? attempts.length > 1
-                  ? "flaky"
-                  : "pass"
-                : "fail",
-            ...(knownFailure
-              ? {
-                  knownFailure: true,
-                  ...(final.exitCode === 0 ? { nowPassing: true } : {}),
-                }
-              : {}),
-          }
-        : {}),
-    });
+    return receipt;
+  } finally {
+    if (!keepHome) removeVerifierHome(home);
   }
-  checkClean(cwd, plan.commit);
-  const receipt = {
-    worktree: resolve(cwd),
-    version: 1,
-    operationKey: plan.operationKey,
-    planDigest: digest(plan),
-    repository: plan.repository,
-    baseCommit: plan.baseCommit,
-    commit: plan.commit,
-    matrixDigest: plan.matrixDigest,
-    checksDigest: plan.checksDigest,
-    verifierAgentId: plan.verifierAgentId,
-    verifierRunId: plan.verifierRunId,
-    detached: true,
-    cleanBefore: true,
-    cleanAfter: true,
-    environment,
-    prerequisites,
-    checks: results,
-    aiv: { state: "unsubmitted" },
-  };
-  writeFileSync(
-    join(output, "receipt.json"),
-    JSON.stringify(receipt, null, 2) + "\n",
-    { mode: 0o600 },
-  );
-  return receipt;
 }
 if (
   process.argv[1] &&
   resolve(process.argv[1]) === fileURLToPath(import.meta.url)
 ) {
+  // Installing handlers before synchronous checks prevents a signal's default
+  // termination from bypassing runPlan's finally block. The check completes (or
+  // times out), its external evidence is saved, then the home is removed.
+  let interruptedBy = "";
+  for (const signal of ["SIGINT", "SIGTERM"])
+    process.on(signal, () => {
+      interruptedBy ||= signal;
+      process.exitCode = signal === "SIGINT" ? 130 : 143;
+    });
   try {
-    const [mode, file, output] = process.argv.slice(2),
+    const [mode, file, output, ...flags] = process.argv.slice(2),
       input = JSON.parse(readFileSync(file, "utf8"));
     if (mode === "plan")
       writeFileSync(
@@ -571,11 +637,31 @@ if (
         JSON.stringify(makePlan(input, process.cwd()), null, 2) + "\n",
       );
     else if (mode === "run") {
-      const r = runPlan(input, process.cwd(), resolve(output));
-      process.exitCode = receiptEligible(r) ? 0 : 1;
+      let keepHome = false;
+      let minFreeBytes = DEFAULT_MIN_FREE_BYTES;
+      for (let i = 0; i < flags.length; i++) {
+        if (flags[i] === "--keep-home") keepHome = true;
+        else if (flags[i] === "--min-free-bytes" && i + 1 < flags.length)
+          minFreeBytes = Number(flags[++i]);
+        else throw new Error("Unknown verifier run option: " + flags[i]);
+      }
+      const r = runPlan(input, process.cwd(), resolve(output), {
+        keepHome,
+        minFreeBytes,
+      });
+      // A signal received during spawnSync is dispatched when the event loop
+      // runs again, after runPlan has written evidence and cleaned its home.
+      await new Promise((resolve) => setImmediate(resolve));
+      process.exitCode = interruptedBy
+        ? interruptedBy === "SIGINT"
+          ? 130
+          : 143
+        : receiptEligible(r)
+          ? 0
+          : 1;
     } else
       throw new Error(
-        "Usage: node scripts/verify-matrix.mjs plan|run INPUT OUTPUT",
+        "Usage: node scripts/verify-matrix.mjs plan|run INPUT OUTPUT [--keep-home] [--min-free-bytes N]",
       );
   } catch (e) {
     console.error(e.message);
