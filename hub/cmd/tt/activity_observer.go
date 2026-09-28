@@ -81,10 +81,12 @@ type activityCursor struct {
 	MissingSince      time.Time                      `json:"missingSince,omitempty"`
 	LastCheck         time.Time                      `json:"lastCheck,omitempty"`
 	LastState         string                         `json:"lastState,omitempty"`
+	LastWakeKey       string                         `json:"lastWakeKey,omitempty"`
 	Transition        int64                          `json:"transition,omitempty"`
 	PendingReport     *api.ActivityReport            `json:"pendingReport,omitempty"`
 	LastReportAttempt time.Time                      `json:"lastReportAttempt,omitempty"`
 	RejectedState     string                         `json:"rejectedState,omitempty"`
+	RejectedWakeKey   string                         `json:"rejectedWakeKey,omitempty"`
 	Ineligible        bool                           `json:"ineligible,omitempty"`
 }
 
@@ -433,6 +435,11 @@ func parseClaudeActivity(line []byte, c *activityCursor) error {
 			c.TurnComplete = true
 		}
 	case "user":
+		// A real user prompt starts a new turn. Tool results are also encoded as
+		// user records, but they continue the assistant's existing turn.
+		if claudeUserText(line) != "" {
+			c.SeenTurn, c.TurnComplete = true, false
+		}
 		for _, part := range msg.Content {
 			if part.Type == "tool_result" {
 				finishActivityCall(c, part.ToolUseID, now)
@@ -440,7 +447,7 @@ func parseClaudeActivity(line []byte, c *activityCursor) error {
 		}
 	case "result":
 		c.SeenTurn, c.TurnComplete = true, true
-	case "system", "summary", "progress", "file-history-snapshot":
+	case "system", "summary", "progress", "file-history-snapshot", "mode", "permission-mode", "ai-title", "atis-latch", "cost-state", "last-prompt", "attachment":
 	default:
 		return fmt.Errorf("unknown Claude record type %q", rec.Type)
 	}

@@ -17,5 +17,8 @@ export function activityDetail(activity, now = Date.now()) {
   const age = Math.max(0, Math.floor((now - Date.parse(activity.observedAt || "")) / 1000));
   const evidence = Number.isFinite(age) ? ` · observed ${age}s ago` : "";
   const tool = activity.pendingTool ? ` · ${activity.pendingTool}` : "";
-  return `${activityLabel(activity)}${tool}${evidence} · ${tokenSnapshot(activity.tokens)}`;
+  const wake = activity.wake
+    ? ` · Claude wake ${activity.wake.status}${activity.wake.messageSeqs?.length ? ` #${activity.wake.messageSeqs.join(", #")}` : ""}${activity.wake.reason ? `: ${activity.wake.reason}` : ""}`
+    : "";
+  return `${activityLabel(activity)}${tool}${wake}${evidence} · ${tokenSnapshot(activity.tokens)}`;
 }

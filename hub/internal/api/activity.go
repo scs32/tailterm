@@ -18,13 +18,23 @@ type TokenTotals struct {
 }
 
 type AgentActivity struct {
-	State        string      `json:"state"`
-	ObservedAt   time.Time   `json:"observedAt"`
-	LastEventAt  time.Time   `json:"lastEventAt,omitempty"`
-	PendingTool  string      `json:"pendingTool,omitempty"`
-	PendingSince time.Time   `json:"pendingSince,omitempty"`
-	Tokens       TokenTotals `json:"tokens"`
-	Reason       string      `json:"reason,omitempty"`
+	State        string       `json:"state"`
+	ObservedAt   time.Time    `json:"observedAt"`
+	LastEventAt  time.Time    `json:"lastEventAt,omitempty"`
+	PendingTool  string       `json:"pendingTool,omitempty"`
+	PendingSince time.Time    `json:"pendingSince,omitempty"`
+	Tokens       TokenTotals  `json:"tokens"`
+	Reason       string       `json:"reason,omitempty"`
+	Wake         *WakeOutcome `json:"wake,omitempty"`
+}
+
+// WakeOutcome is independent of execution state. A safe skip can be visible
+// while the agent remains idle, and a confirmed delivery does not imply work.
+type WakeOutcome struct {
+	Status      string    `json:"status"`
+	Reason      string    `json:"reason,omitempty"`
+	MessageSeqs []int64   `json:"messageSeqs,omitempty"`
+	At          time.Time `json:"at"`
 }
 
 type ActivityReport struct {

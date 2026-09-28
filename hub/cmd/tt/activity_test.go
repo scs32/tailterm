@@ -421,6 +421,25 @@ func TestActivityManyStaleBindingsSkipTranscriptAndFutureReads(t *testing.T) {
 	}
 }
 
+func TestClaudeUserTextClearsCompletedTurn(t *testing.T) {
+	var c activityCursor
+	if err := parseClaudeActivity([]byte(`{"type":"assistant","message":{"stop_reason":"end_turn"}}`), &c); err != nil || !c.TurnComplete {
+		t.Fatalf("completed turn: %+v %v", c, err)
+	}
+	if err := parseClaudeActivity([]byte(`{"type":"user","message":{"content":"new human prompt"}}`), &c); err != nil || c.TurnComplete {
+		t.Fatalf("new text did not clear completion: %+v %v", c, err)
+	}
+	if err := parseClaudeActivity([]byte(`{"type":"assistant","message":{"stop_reason":"end_turn"}}`), &c); err != nil || !c.TurnComplete {
+		t.Fatalf("second completion: %+v %v", c, err)
+	}
+	if err := parseClaudeActivity([]byte(`{"type":"mode","mode":"default","sessionId":"00000000-0000-4000-8000-000000000001"}`), &c); err != nil || !c.TurnComplete {
+		t.Fatalf("mode record changed turn boundary: %+v %v", c, err)
+	}
+	if err := parseClaudeActivity([]byte(`{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"tool"}]}}`), &c); err != nil || !c.TurnComplete {
+		t.Fatalf("tool result changed turn boundary: %+v %v", c, err)
+	}
+}
+
 func TestActivityClaudeExactRetryAndPanicIsolation(t *testing.T) {
 	t.Setenv("TAILTERM_RELAY_STATE", filepath.Join(t.TempDir(), "state"))
 	s := ownedSession{ID: "$1", Created: "123", Name: "fake", Task: "tsk_0123456789abcdef", Agent: "agt_0123456789abcdef", Run: "run_0123456789abcdef"}

@@ -74,6 +74,55 @@ func TestActivityTransitionReceiptsAndSnapshots(t *testing.T) {
 	}
 }
 
+func TestActivityWakeOutcomePersistsWithoutStateTransition(t *testing.T) {
+	ctx := context.Background()
+	s, err := Open(filepath.Join(t.TempDir(), "wake.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	by := api.Caller{Node: "fixture", User: "owner"}
+	task, err := s.CreateTask(ctx, api.CreateTaskRequest{Name: "Wake outcome"}, by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	a, err := s.AddAgent(ctx, task.ID, api.AddAgentRequest{AgentID: api.NewID("agt"), Name: "claude", Host: "mini", Session: "test", Runtime: "claude", Cwd: t.TempDir()}, by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 9, 25, 20, 0, 0, 0, time.UTC)
+	base := api.ActivityReport{RequestID: "wake-base", RunID: a.RunID, Activity: api.AgentActivity{State: "idle", ObservedAt: now}}
+	if _, err := s.ReportActivity(ctx, task.ID, a.ID, base); err != nil {
+		t.Fatal(err)
+	}
+	wake := base
+	wake.RequestID = "wake-skipped"
+	wake.Activity.Wake = &api.WakeOutcome{Status: "skipped", Reason: "input occupied", MessageSeqs: []int64{42}, At: now.Add(time.Second)}
+	if _, err := s.ReportActivity(ctx, task.ID, a.ID, wake); err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.GetAgent(ctx, a.ID)
+	if err != nil || got.Activity == nil || got.Activity.State != "idle" || got.Activity.Wake == nil || got.Activity.Wake.Reason != "input occupied" {
+		t.Fatalf("same-state wake missing: %+v %v", got.Activity, err)
+	}
+	steady := wake
+	steady.RequestID = "wake-steady"
+	steady.Activity.Tokens.Total = 100
+	if saved, err := s.ReportActivity(ctx, task.ID, a.ID, steady); err != nil || saved.Tokens.Total != 0 {
+		t.Fatalf("steady outcome duplicated: %+v %v", saved, err)
+	}
+	confirmed := wake
+	confirmed.RequestID = "wake-confirmed"
+	confirmed.Activity.Wake = &api.WakeOutcome{Status: "confirmed", MessageSeqs: []int64{42}, At: now.Add(2 * time.Second)}
+	if _, err := s.ReportActivity(ctx, task.ID, a.ID, confirmed); err != nil {
+		t.Fatal(err)
+	}
+	got, err = s.GetAgent(ctx, a.ID)
+	if err != nil || got.Activity.Wake == nil || got.Activity.Wake.Status != "confirmed" {
+		t.Fatalf("confirmed wake missing: %+v %v", got.Activity, err)
+	}
+}
+
 func TestActivityAlertRoutingAndTeamIsolation(t *testing.T) {
 	s, task, items, orders := queueFixture(t)
 	ctx := context.Background()

@@ -33,6 +33,16 @@ test("lead and worker prompts teach withdrawal of superseded requests", () => {
   }
 });
 
+test("fresh planned delivery uses a Claude lead without reviewer polling", () => {
+  const team = exampleTeam("planned");
+  const lead = team.members.find((member) => member.name === "lead");
+  const reviewer = team.members.find((member) => member.name === "reviewer");
+  assert.equal(lead.runtime, "claude");
+  assert.equal(lead.model, "claude-opus-5-5");
+  assert.doesNotMatch(reviewer.prompt, /inbox --unread --mark-read --wait|relay cannot wake/i);
+  assert.match(reviewer.prompt, /relay can wake your idle Claude session/);
+});
+
 test("example orchestrators route implementation to builders without erasing worker roles", () => {
   const solo = exampleTeam("solo");
   assert.match(
