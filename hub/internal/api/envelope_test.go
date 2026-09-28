@@ -51,6 +51,28 @@ func TestValidEnvelopePerKind(t *testing.T) {
 	}
 }
 
+func TestEnvelopeVerificationCriteria(t *testing.T) {
+	e := validEnvelopes()[EnvelopeKindAssign]
+	e.Body.VerificationCriteria = []string{"a2"}
+	if ps := ValidateEnvelope(e); ps != nil {
+		t.Fatal(ps)
+	}
+	text := RenderText(e)
+	parsed, ok := ParseTextConvention(text)
+	if !ok || !reflect.DeepEqual(parsed.Body.VerificationCriteria, []string{"a2"}) {
+		t.Fatal(text, parsed, ok)
+	}
+	e.Body.VerificationCriteria = []string{"a2", "a2", "a9"}
+	if !hasProblem(ValidateEnvelope(e), "body.verificationCriteria.1") || !hasProblem(ValidateEnvelope(e), "body.verificationCriteria.2") {
+		t.Fatal(ValidateEnvelope(e))
+	}
+	result := validEnvelopes()[EnvelopeKindResult]
+	result.Body.Status["a2"] = "pending-verification"
+	if ps := ValidateEnvelope(result); ps != nil {
+		t.Fatal(ps)
+	}
+}
+
 func TestEnvelopeRequiredFieldsPerKind(t *testing.T) {
 	want := map[string][]string{
 		EnvelopeKindAssign:   {"body.objective", "body.owns", "body.acceptance"},

@@ -112,12 +112,34 @@ func numberedCriteria(criteria map[string]string) bool {
 	}
 	return true
 }
-func completeVerdicts(criteria, verdicts map[string]string) error {
+func normalizedVerificationCriteria(ids []string) []string {
+	if len(ids) == 0 {
+		return nil
+	}
+	out := append([]string(nil), ids...)
+	sort.Strings(out)
+	return out
+}
+func verificationOwned(ids []string, key string) bool {
+	for _, id := range ids {
+		if id == key {
+			return true
+		}
+	}
+	return false
+}
+func completeVerdicts(criteria map[string]string, owned []string, verdicts map[string]string) error {
 	if len(criteria) != len(verdicts) {
 		return reviewConflict("verdicts must cover every frozen criterion")
 	}
 	for key := range criteria {
 		v := verdicts[key]
+		if verificationOwned(owned, key) {
+			if v != "pending-verification" {
+				return reviewConflict("verification-owned criterion " + key + " must be pending-verification")
+			}
+			continue
+		}
 		if v != "pass" && v != "fail" && v != "partial" {
 			return reviewConflict("invalid or missing verdict for " + key)
 		}
@@ -215,7 +237,7 @@ func reviewReady(state api.ReviewConvergence, scope int64, candidate string) err
 		return reviewConflict("no completed general review")
 	}
 	last := state.Rounds[len(state.Rounds)-1]
-	if last.ResultSeq == 0 || !reflect.DeepEqual(roundCriteria(&state, last), sc.Criteria) {
+	if last.ResultSeq == 0 || !reflect.DeepEqual(roundCriteria(&state, last), sc.Criteria) || !reflect.DeepEqual(normalizedVerificationCriteria(last.VerificationCriteria), normalizedVerificationCriteria(sc.VerificationCriteria)) {
 		return reviewConflict("latest general review is incomplete or stale")
 	}
 	verdicts := map[string]string{}
@@ -248,6 +270,12 @@ func reviewReady(state api.ReviewConvergence, scope int64, candidate string) err
 		}
 	}
 	for key := range sc.Criteria {
+		if verificationOwned(sc.VerificationCriteria, key) {
+			if verdicts[key] != "pending-verification" {
+				return reviewConflict("verification-owned criterion " + key + " was not pending")
+			}
+			continue
+		}
 		if verdicts[key] != "pass" {
 			return reviewConflict("criterion " + key + " has not passed")
 		}
@@ -372,11 +400,12 @@ func (s *Store) applyReviewConvergence(ctx context.Context, tx *sql.Tx, m api.Me
 			return reviewConflict("assignment criteria must be contiguous a1..aN")
 		}
 		sc := scopeFor(&state, item.ScopeRevision)
-		if sc != nil && !reflect.DeepEqual(sc.Criteria, e.Body.Acceptance) {
+		owned := normalizedVerificationCriteria(e.Body.VerificationCriteria)
+		if sc != nil && (!reflect.DeepEqual(sc.Criteria, e.Body.Acceptance) || !reflect.DeepEqual(normalizedVerificationCriteria(sc.VerificationCriteria), owned)) {
 			return reviewConflict("criteria frozen; revision-checked scope update required")
 		}
 		if sc == nil {
-			state.Scopes = append(state.Scopes, api.ReviewScope{ScopeRevision: item.ScopeRevision, ItemRevision: item.Revision, AssignmentSeq: m.Seq, Criteria: e.Body.Acceptance})
+			state.Scopes = append(state.Scopes, api.ReviewScope{ScopeRevision: item.ScopeRevision, ItemRevision: item.Revision, AssignmentSeq: m.Seq, Criteria: e.Body.Acceptance, VerificationCriteria: owned})
 		}
 		if len(state.Scopes) == 1 && state.Scopes[0].AssignmentSeq == m.Seq {
 			var legacyReviews int
@@ -404,7 +433,7 @@ func (s *Store) applyReviewConvergence(ctx context.Context, tx *sql.Tx, m api.Me
 			return reviewConflict("previous general review is incomplete")
 		}
 		sc := scopeFor(&state, item.ScopeRevision)
-		if sc == nil || !reflect.DeepEqual(sc.Criteria, e.Body.Acceptance) {
+		if sc == nil || !reflect.DeepEqual(sc.Criteria, e.Body.Acceptance) || !reflect.DeepEqual(normalizedVerificationCriteria(sc.VerificationCriteria), normalizedVerificationCriteria(e.Body.VerificationCriteria)) {
 			return reviewConflict("review must use frozen assignment criteria")
 		}
 		if !validGitCommit(e.Body.Candidate) || target.ID == "" || target.RunID == "" {
@@ -413,7 +442,7 @@ func (s *Store) applyReviewConvergence(ctx context.Context, tx *sql.Tx, m api.Me
 		if meta != nil && (meta.Mode != "general" || (meta.Candidate != "" && meta.Candidate != e.Body.Candidate)) {
 			return reviewConflict("REVIEW is always a general review")
 		}
-		state.Rounds = append(state.Rounds, api.ReviewRound{Number: len(state.Rounds) + 1, ScopeRevision: item.ScopeRevision, Criteria: sc.Criteria, RequestSeq: m.Seq, Candidate: e.Body.Candidate, ReviewerID: target.ID, ReviewerRun: target.RunID, StartedAt: ts(s.now())})
+		state.Rounds = append(state.Rounds, api.ReviewRound{Number: len(state.Rounds) + 1, ScopeRevision: item.ScopeRevision, Criteria: sc.Criteria, VerificationCriteria: normalizedVerificationCriteria(sc.VerificationCriteria), RequestSeq: m.Seq, Candidate: e.Body.Candidate, ReviewerID: target.ID, ReviewerRun: target.RunID, StartedAt: ts(s.now())})
 		state.Disposition = nil
 		return saveReviewState(ctx, tx, m.TaskID, state)
 	}
@@ -580,14 +609,14 @@ func (s *Store) applyReviewConvergence(ctx context.Context, tx *sql.Tx, m api.Me
 	if round == nil || round.ResultSeq != 0 || round.ReviewerID != req.AgentID || round.ReviewerRun != req.RunID || round.Candidate != meta.Candidate {
 		return reviewConflict("review result identity, scope or candidate mismatch")
 	}
-	sc = &api.ReviewScope{ScopeRevision: round.ScopeRevision, Criteria: roundCriteria(&state, *round)}
+	sc = &api.ReviewScope{ScopeRevision: round.ScopeRevision, Criteria: roundCriteria(&state, *round), VerificationCriteria: roundVerificationCriteria(&state, *round)}
 	if len(sc.Criteria) == 0 {
 		return reviewConflict("round frozen criteria are missing")
 	}
 	if round.Number == 2 && state.Rounds[0].ResultSeq == 0 {
 		return reviewConflict("first general review must complete before second result")
 	}
-	if err = completeVerdicts(sc.Criteria, e.Body.Status); err != nil {
+	if err = completeVerdicts(sc.Criteria, sc.VerificationCriteria, e.Body.Status); err != nil {
 		return err
 	}
 	seen := map[string]bool{}
@@ -792,6 +821,15 @@ func roundCriteria(state *api.ReviewConvergence, r api.ReviewRound) map[string]s
 	}
 	if sc := scopeFor(state, r.ScopeRevision); sc != nil {
 		return sc.Criteria
+	}
+	return nil
+}
+func roundVerificationCriteria(state *api.ReviewConvergence, r api.ReviewRound) []string {
+	if len(r.Criteria) > 0 {
+		return r.VerificationCriteria
+	}
+	if sc := scopeFor(state, r.ScopeRevision); sc != nil {
+		return sc.VerificationCriteria
 	}
 	return nil
 }

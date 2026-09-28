@@ -70,6 +70,31 @@ func TestSendPostsTypedMessage(t *testing.T) {
 	}
 }
 
+func TestSendPendingVerification(t *testing.T) {
+	e, c, task, lead := cliWorkItemFixture(t)
+	_ = lead
+	args := []string{"--kind", "assign", "--subject", "Assign verification criterion fixture", "--to", "lead", "--objective", "fixture", "--owns", "fixture", "--acceptance", "a1=code", "--acceptance", "a2=matrix", "--verification-criterion", "a2"}
+	if _, err := captureCLIOutput(t, func() error { return cmdSend(e, args) }); err != nil {
+		t.Fatal(err)
+	}
+	msgs, err := c.ListMessages(context.Background(), task.ID, 0, "", 10)
+	if err != nil || len(msgs) != 1 || len(msgs[0].Envelope.Body.VerificationCriteria) != 1 || msgs[0].Envelope.Body.VerificationCriteria[0] != "a2" || !strings.Contains(msgs[0].Text, "Verification-criteria: a2") {
+		t.Fatal(msgs, err)
+	}
+	file := filepath.Join(t.TempDir(), "pending.json")
+	raw := `{"kind":"result","subject":"Independent verification criterion pending","body":{"outcome":"done","status":{"a1":"pass","a2":"pending-verification"}},"evidence":{"e1":{"type":"command","value":"fixture check","outcome":"ok"}}}`
+	if err := os.WriteFile(file, []byte(raw), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := captureCLIOutput(t, func() error { return cmdSend(e, []string{"--file", file}) }); err != nil {
+		t.Fatal(err)
+	}
+	msgs, err = c.ListMessages(context.Background(), task.ID, 0, "", 10)
+	if err != nil || len(msgs) != 2 || msgs[1].Envelope.Body.Status["a2"] != "pending-verification" {
+		t.Fatal(msgs, err)
+	}
+}
+
 // Criterion a11: the summary counts forms, validity and senders.
 func TestMessageChecksSummary(t *testing.T) {
 	e, c, task, lead := cliWorkItemFixture(t)

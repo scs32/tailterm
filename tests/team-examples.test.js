@@ -180,3 +180,12 @@ test("Planned delivery freezes criteria and never resets the review cap", () => 
   assert.match(instructions, /held for triage/);
   assert.match(instructions, /tt send --review-file/);
 });
+
+test("Planned delivery marks verification-owned criteria pending for the reviewer", () => {
+  const members = exampleTeam("planned").members;
+  const lead = members.find((member) => member.name === "lead").prompt;
+  const reviewer = members.find((member) => member.name === "reviewer").prompt;
+  assert.match(lead, /--verification-criterion aN on ASSIGN and REVIEW/);
+  assert.match(reviewer, /Mark verification-owned criteria pending-verification/);
+  assert.match(reviewer, /handler-imported eligible receipt judges those criteria/);
+});

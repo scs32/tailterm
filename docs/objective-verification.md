@@ -1,5 +1,12 @@
 # Native objective verification
 
+When an order or plan designates acceptance criteria for independent verification,
+the lead lists their IDs in `body.verificationCriteria` on the frozen ASSIGN and
+REVIEW. The general reviewer reports `pending-verification` for those IDs. The
+handler-imported eligible receipt for the exact accepted candidate, current scope
+and assignment determines whether they pass. Reviewer-owned criteria still need
+passing verdicts, and a missing, stale or ineligible receipt blocks acceptance.
+
 Feature `wi_f23f767415ef9b30`, owner order #11571, assignment #11766,
 prospective Start #11775. Owner decisions #11753–11755 approve the full local
 matrix, a separate fifth verifier and native evidence with AIV unsubmitted.

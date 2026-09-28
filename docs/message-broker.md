@@ -127,7 +127,7 @@ hub wraps them as `kind: human` with the text as the body.
 | --- | --- | --- | --- |
 | `assign` | objective, owns, acceptance{…}, (due) | ack + outcome for recipient | `result`, `decline`, `block`→resolved, supersede, cancel |
 | `request` | ask, (acceptance{…}), (due) | ack + outcome | same as assign |
-| `review` | candidate (commit/artifact), scope, acceptance{…} | ack + outcome | `result` with verdict |
+| `review` | candidate (commit/artifact), scope, acceptance{…}, optional verificationCriteria IDs | ack + outcome | `result` with verdict |
 | `question` | question (exactly one), (options{…}) | answer | `answer` referencing it |
 | `result` | outcome: done/partial, per-criterion status {a1:…}, evidence | none; closes one | — |
 | `answer` | answer, (choice) | none; closes one | — |
@@ -353,6 +353,14 @@ Source feature `wi_3d6a4e3d1bf99a08`, order #11569, assignment #11656.
 The first item-linked ASSIGN freezes contiguous a1..aN for that scope. Linked
 REVIEW messages reserve at most two lifetime rounds, serially, with the exact
 40/64-character candidate commit, target agent/run and identical acceptance map.
+An ASSIGN may also freeze `body.verificationCriteria` (CLI:
+`--verification-criterion aN`) for IDs designated by the order or plan as
+independently verified. REVIEW repeats those exact IDs. Each general RESULT must
+mark them `pending-verification`; it is distinct from pass and partial. The
+handler-imported eligible receipt for the exact candidate, scope and assignment
+judges those IDs, including on items without mandatory enrollment. All other
+criteria still need reviewer pass, and partial or failed verdicts still block.
+Existing completed verdicts remain frozen with their owner-accept route.
 A review RESULT replies to that request, includes every criterion in Status and
 structured `review` metadata. `tt send --review-file metadata.json` supports the
 same metadata; `--file` can contain it directly. Example:

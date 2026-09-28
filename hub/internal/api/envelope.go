@@ -29,23 +29,24 @@ type Envelope struct {
 // EnvelopeBody holds the named fields of every kind. Maps use short named keys
 // (a1, e2) so each entry can be addressed directly, never by position.
 type EnvelopeBody struct {
-	Objective  string            `json:"objective,omitempty"`
-	Owns       []string          `json:"owns,omitempty"`
-	Ask        string            `json:"ask,omitempty"`
-	Candidate  string            `json:"candidate,omitempty"`
-	Scope      string            `json:"scope,omitempty"`
-	Question   string            `json:"question,omitempty"`
-	Options    map[string]string `json:"options,omitempty"`
-	Outcome    string            `json:"outcome,omitempty"`
-	Answer     string            `json:"answer,omitempty"`
-	Reason     string            `json:"reason,omitempty"`
-	Needs      string            `json:"needs,omitempty"`
-	ResumeWhen string            `json:"resumeWhen,omitempty"`
-	Severity   string            `json:"severity,omitempty"`
-	Summary    string            `json:"summary,omitempty"`
-	Text       string            `json:"text,omitempty"`
-	Acceptance map[string]string `json:"acceptance,omitempty"`
-	Status     map[string]string `json:"status,omitempty"`
+	Objective            string            `json:"objective,omitempty"`
+	Owns                 []string          `json:"owns,omitempty"`
+	Ask                  string            `json:"ask,omitempty"`
+	Candidate            string            `json:"candidate,omitempty"`
+	Scope                string            `json:"scope,omitempty"`
+	Question             string            `json:"question,omitempty"`
+	Options              map[string]string `json:"options,omitempty"`
+	Outcome              string            `json:"outcome,omitempty"`
+	Answer               string            `json:"answer,omitempty"`
+	Reason               string            `json:"reason,omitempty"`
+	Needs                string            `json:"needs,omitempty"`
+	ResumeWhen           string            `json:"resumeWhen,omitempty"`
+	Severity             string            `json:"severity,omitempty"`
+	Summary              string            `json:"summary,omitempty"`
+	Text                 string            `json:"text,omitempty"`
+	Acceptance           map[string]string `json:"acceptance,omitempty"`
+	VerificationCriteria []string          `json:"verificationCriteria,omitempty"`
+	Status               map[string]string `json:"status,omitempty"`
 }
 
 type Evidence struct {
@@ -160,7 +161,7 @@ var (
 
 var (
 	evidenceTypes  = map[string]bool{"command": true, "commit": true, "file": true, "record": true, "url": true}
-	statusValues   = map[string]bool{"pass": true, "fail": true, "partial": true}
+	statusValues   = map[string]bool{"pass": true, "fail": true, "partial": true, "pending-verification": true}
 	outcomeValues  = map[string]bool{"done": true, "partial": true}
 	severityValues = map[string]bool{"low": true, "medium": true, "high": true, "critical": true}
 )
@@ -260,6 +261,16 @@ func ValidateEnvelope(e Envelope) []Problem {
 	checkNamed("body.acceptance", e.Body.Acceptance, nil)
 	checkNamed("body.status", e.Body.Status, statusValues)
 	checkNamed("body.options", e.Body.Options, nil)
+	if len(e.Body.VerificationCriteria) > 0 && e.Kind != EnvelopeKindAssign && e.Kind != EnvelopeKindReview {
+		add("body.verificationCriteria", "only assign and review may designate verification-owned criteria")
+	}
+	seenVerification := map[string]bool{}
+	for i, id := range e.Body.VerificationCriteria {
+		if seenVerification[id] || e.Body.Acceptance[id] == "" {
+			add(fmt.Sprintf("body.verificationCriteria.%d", i), "must name a unique acceptance criterion")
+		}
+		seenVerification[id] = true
+	}
 	for _, k := range sortedKeys(e.Evidence) {
 		ev := e.Evidence[k]
 		if !namedKey.MatchString(k) {
@@ -416,6 +427,7 @@ func RenderText(e Envelope) string {
 	line("Summary", body.Summary)
 	line("Text", body.Text)
 	line("Acceptance", joinPairs(body.Acceptance, ": "))
+	line("Verification-criteria", strings.Join(body.VerificationCriteria, ", "))
 	if e.Review != nil {
 		raw, _ := json.Marshal(e.Review)
 		line("Review metadata", string(raw))
@@ -514,6 +526,8 @@ func ParseTextConvention(text string) (e Envelope, matched bool) {
 			b.Text, last = value, &b.Text
 		case "acceptance":
 			b.Acceptance = parseNamed(splitEscaped(value))
+		case "verification-criteria":
+			b.VerificationCriteria = splitList(value)
 		case "status":
 			b.Status = parseNamed(splitEntryList(value))
 			for k, v := range b.Status {

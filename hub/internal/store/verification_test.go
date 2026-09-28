@@ -19,9 +19,19 @@ import (
 	"github.com/scs32/tailterm/hub/internal/api"
 )
 
-func verificationFixture(t *testing.T) (*convergenceFixture, api.Agent, api.VerificationPlan) {
+type verificationOwnershipFixture struct {
+	criteria map[string]string
+	ids      []string
+}
+
+func verificationFixture(t *testing.T, ownership ...verificationOwnershipFixture) (*convergenceFixture, api.Agent, api.VerificationPlan) {
 	t.Helper()
-	f := newConvergenceFixture(t)
+	var f *convergenceFixture
+	if len(ownership) > 0 {
+		f = newConvergenceFixtureWithCriteria(t, ownership[0].criteria, ownership[0].ids)
+	} else {
+		f = newConvergenceFixture(t)
+	}
 	h, err := f.s.AddAgent(f.ctx, f.task.ID, api.AddAgentRequest{AgentID: api.NewID("agt"), Name: "handler", Host: "fixture", Session: "handler", Role: api.AgentRoleDatabaseHandler}, f.by)
 	if err != nil {
 		t.Fatal(err)
@@ -37,7 +47,7 @@ func verificationFixture(t *testing.T) (*convergenceFixture, api.Agent, api.Veri
 		t.Fatal(err)
 	}
 	checks := []api.VerificationCheck{{ID: "fixture-check", Argv: []string{"node", "fixture.js"}, Cwd: ".", Environment: map[string]string{}}}
-	p := api.VerificationPlan{ItemID: f.item.ID, ItemTaskID: f.task.ID, AssignmentOwnershipDigest: verificationDigest([]string{"fixture"}), Version: 1, OperationKey: "fixture-verification", Repository: "fixture", BaseCommit: candidateB, Commit: candidateA, ItemRevision: 1, ScopeRevision: 1, OrderMessageSeq: order, AssignmentSeq: order, BuilderAgentID: f.reviewer.ID, BuilderRunID: f.reviewer.RunID, VerifierAgentID: v.ID, VerifierRunID: v.RunID, MatrixDigest: strings.Repeat("a", 64), ChecksDigest: verificationDigest(checks), Owned: []string{"fixture"}, Changed: []string{}, Checks: checks}
+	p := api.VerificationPlan{ItemID: f.item.ID, ItemTaskID: f.task.ID, AssignmentOwnershipDigest: verificationDigest([]string{"fixture"}), Version: 1, OperationKey: "fixture-verification", Repository: "fixture", BaseCommit: candidateB, Commit: candidateA, ItemRevision: 1, ScopeRevision: 1, OrderMessageSeq: order, AssignmentSeq: order, BuilderAgentID: f.builder.ID, BuilderRunID: f.builder.RunID, VerifierAgentID: v.ID, VerifierRunID: v.RunID, MatrixDigest: strings.Repeat("a", 64), ChecksDigest: verificationDigest(checks), Owned: []string{"fixture"}, Changed: []string{}, Checks: checks}
 	approval, err := f.s.PostMessage(f.ctx, f.task.ID, api.PostMessageRequest{Text: "verification-matrix-approval:" + p.MatrixDigest}, f.by)
 	if err != nil {
 		t.Fatal(err)

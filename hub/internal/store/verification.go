@@ -380,6 +380,13 @@ func verificationReady(ctx context.Context, tx *sql.Tx, item api.WorkItem, candi
 	if err != nil {
 		return err
 	}
+	state, err := reviewState(ctx, tx, item.TaskID, item.ID)
+	if err != nil {
+		return err
+	}
+	if sc := scopeFor(&state, item.ScopeRevision); sc != nil && len(sc.VerificationCriteria) > 0 {
+		required = true
+	}
 	if !required {
 		return nil
 	}
@@ -390,10 +397,6 @@ func verificationReady(ctx context.Context, tx *sql.Tx, item api.WorkItem, candi
 	p, r := currentVerification(records)
 	if p == nil || r == nil || p.ScopeRevision != item.ScopeRevision || candidate == "" || p.Commit != candidate {
 		return verificationConflict("passing receipt for current scope and exact accepted candidate required")
-	}
-	state, err := reviewState(ctx, tx, item.TaskID, item.ID)
-	if err != nil {
-		return err
 	}
 	sc := scopeFor(&state, item.ScopeRevision)
 	if sc == nil || sc.AssignmentSeq != p.AssignmentSeq {

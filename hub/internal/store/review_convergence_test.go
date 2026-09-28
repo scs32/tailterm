@@ -49,19 +49,26 @@ func TestReviewConvergenceBaselineCap(t *testing.T) {
 }
 
 type convergenceFixture struct {
-	s        *Store
-	ctx      context.Context
-	by       api.Caller
-	task     api.Task
-	item     api.WorkItem
-	reviewer api.Agent
-	path     string
-	serial   int
+	s                    *Store
+	ctx                  context.Context
+	by                   api.Caller
+	task                 api.Task
+	item                 api.WorkItem
+	reviewer             api.Agent
+	builder              api.Agent
+	lead                 api.Agent
+	criteria             map[string]string
+	verificationCriteria []string
+	path                 string
+	serial               int
 }
 
 func newConvergenceFixture(t *testing.T) *convergenceFixture {
+	return newConvergenceFixtureWithCriteria(t, map[string]string{"a1": "works", "a2": "retries"}, nil)
+}
+func newConvergenceFixtureWithCriteria(t *testing.T, criteria map[string]string, verificationCriteria []string) *convergenceFixture {
 	t.Helper()
-	f := &convergenceFixture{ctx: context.Background(), by: api.Caller{Node: "fixture", User: "owner"}, path: filepath.Join(t.TempDir(), "review.sqlite")}
+	f := &convergenceFixture{ctx: context.Background(), by: api.Caller{Node: "fixture", User: "owner"}, path: filepath.Join(t.TempDir(), "review.sqlite"), criteria: criteria, verificationCriteria: verificationCriteria}
 	var err error
 	f.s, err = Open(f.path)
 	if err != nil {
@@ -80,8 +87,23 @@ func newConvergenceFixture(t *testing.T) *convergenceFixture {
 	if err != nil {
 		t.Fatal(err)
 	}
-	env := api.Envelope{Kind: "assign", Subject: "Implement frozen fixture criteria", Body: api.EnvelopeBody{Objective: "Fixture", Owns: []string{"fixture"}, Acceptance: map[string]string{"a1": "works", "a2": "retries"}}}
-	if _, err = f.post(env, f.reviewer.ID, 0, api.Agent{}); err != nil {
+	f.builder = f.reviewer
+	if len(verificationCriteria) > 0 {
+		f.lead, err = f.s.AddAgent(f.ctx, f.task.ID, api.AddAgentRequest{Name: "lead", Host: "fixture", Session: "lead"}, f.by)
+		if err != nil {
+			t.Fatal(err)
+		}
+		name := f.lead.Name
+		if _, err = f.s.UpdateTask(f.ctx, f.task.ID, api.UpdateTaskRequest{Orchestrator: &name}, f.by); err != nil {
+			t.Fatal(err)
+		}
+		f.builder, err = f.s.AddAgent(f.ctx, f.task.ID, api.AddAgentRequest{Name: "builder", Host: "fixture", Session: "builder"}, f.by)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	env := api.Envelope{Kind: "assign", Subject: "Implement frozen fixture criteria", Body: api.EnvelopeBody{Objective: "Fixture", Owns: []string{"fixture"}, Acceptance: criteria, VerificationCriteria: verificationCriteria}}
+	if _, err = f.post(env, f.builder.ID, 0, api.Agent{}); err != nil {
 		t.Fatal(err)
 	}
 	return f
@@ -95,7 +117,7 @@ func (f *convergenceFixture) post(env api.Envelope, to string, reply int64, from
 }
 func (f *convergenceFixture) review(t *testing.T, candidate string) api.Message {
 	t.Helper()
-	m, err := f.post(api.Envelope{Kind: "review", Subject: "Review frozen fixture candidate", Body: api.EnvelopeBody{Candidate: candidate, Scope: "Fixture", Acceptance: map[string]string{"a1": "works", "a2": "retries"}}}, f.reviewer.ID, 0, api.Agent{})
+	m, err := f.post(api.Envelope{Kind: "review", Subject: "Review frozen fixture candidate", Body: api.EnvelopeBody{Candidate: candidate, Scope: "Fixture", Acceptance: f.criteria, VerificationCriteria: f.verificationCriteria}}, f.reviewer.ID, 0, api.Agent{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -219,6 +241,199 @@ func TestReviewConvergenceFrozenCriteriaAndConcurrentStarts(t *testing.T) {
 		if m, err := f.s.PostMessage(f.ctx, f.task.ID, req, f.by); err == nil && m.Seq != state.Rounds[0].RequestSeq {
 			t.Fatal("replay changed round")
 		}
+	}
+}
+
+func TestReviewConvergenceVerificationOwnership(t *testing.T) {
+	unenrolled := newConvergenceFixtureWithCriteria(t, map[string]string{"a1": "code", "a2": "matrix"}, []string{"a2"})
+	tx, err := unenrolled.s.db.BeginTx(unenrolled.ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	required, err := verificationRequired(unenrolled.ctx, tx, unenrolled.task.ID, unenrolled.item.ID)
+	if err != nil || required {
+		t.Fatal("expected unenrolled fixture", required, err)
+	}
+	if err := verificationReady(unenrolled.ctx, tx, unenrolled.item, candidateA); !errors.Is(err, api.ErrConflict) {
+		t.Fatal("unenrolled designation bypassed receipt", err)
+	}
+	tx.Rollback()
+	f, _, _ := verificationFixture(t, verificationOwnershipFixture{map[string]string{"a1": "code", "a2": "matrix"}, []string{"a2"}})
+	state := f.state(t)
+	if len(state.Scopes) != 1 || state.Scopes[0].VerificationCriteria[0] != "a2" {
+		t.Fatal(state)
+	}
+	changed := api.Envelope{Kind: "assign", Subject: "Change frozen verification ownership", Body: api.EnvelopeBody{Objective: "fixture", Owns: []string{"fixture"}, Acceptance: f.criteria}}
+	if _, err := f.post(changed, f.builder.ID, 0, api.Agent{}); !errors.Is(err, api.ErrConflict) {
+		t.Fatal("reclassification", err)
+	}
+	bad := api.Envelope{Kind: "review", Subject: "Review with changed verification ownership", Body: api.EnvelopeBody{Candidate: candidateA, Scope: "fixture", Acceptance: f.criteria}}
+	if _, err := f.post(bad, f.reviewer.ID, 0, api.Agent{}); !errors.Is(err, api.ErrConflict) {
+		t.Fatal("review ownership", err)
+	}
+	r := f.review(t, candidateA)
+	for _, status := range []map[string]string{{"a1": "pass", "a2": "partial"}, {"a1": "pending-verification", "a2": "pending-verification"}} {
+		if _, err := f.post(f.resultEnv(candidateA, status, api.ReviewMetadata{Mode: "general"}), "", r.Seq, f.reviewer); !errors.Is(err, api.ErrConflict) {
+			t.Fatal("invalid verdict ownership", err)
+		}
+	}
+	if _, err := f.post(f.resultEnv(candidateA, map[string]string{"a1": "pass", "a2": "pending-verification"}, api.ReviewMetadata{Mode: "general"}), "", r.Seq, f.reviewer); err != nil {
+		t.Fatal(err)
+	}
+	state = f.state(t)
+	if state.Rounds[0].Verdicts["a2"] != "pending-verification" || state.Rounds[0].VerificationCriteria[0] != "a2" {
+		t.Fatal(state)
+	}
+}
+
+func TestReviewConvergenceVerificationReceiptAcceptance(t *testing.T) {
+	f, h, p := verificationFixture(t, verificationOwnershipFixture{map[string]string{"a1": "code", "a2": "matrix"}, []string{"a2"}})
+	r := f.review(t, candidateA)
+	if _, err := f.post(f.resultEnv(candidateA, map[string]string{"a1": "pass", "a2": "pending-verification"}, api.ReviewMetadata{Mode: "general"}), "", r.Seq, f.reviewer); err != nil {
+		t.Fatal(err)
+	}
+	accept := api.Envelope{Kind: "notice", Subject: "Accept verified fixture candidate", Body: api.EnvelopeBody{Text: "accept"}, Review: &api.ReviewMetadata{Mode: "disposition", Disposition: "accept", Candidate: candidateA}}
+	if _, err := f.post(accept, "", 0, f.lead); !errors.Is(err, api.ErrConflict) {
+		t.Fatal("missing receipt", err)
+	}
+	before := f.state(t)
+	if err := f.s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := Open(f.path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.s = reopened
+	if got := f.state(t); got.Rounds[0].Verdicts["a2"] != "pending-verification" {
+		t.Fatal("restart lost frozen verdict", got)
+	}
+	saveFixtureVerification(t, f, h, p, 0)
+	if _, err := f.post(accept, "", 0, f.lead); err != nil {
+		t.Fatal(err)
+	}
+	after := f.state(t)
+	if after.Disposition == nil || after.Disposition.Kind != "accept" || len(after.Rounds) != 1 || after.Rounds[0].Verdicts["a2"] != "pending-verification" || before.Rounds[0].ResultSeq != after.Rounds[0].ResultSeq {
+		t.Fatal("review history changed", after)
+	}
+	tx, err := f.s.db.BeginTx(f.ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := reviewCompletion(f.ctx, tx, f.item, candidateA); err != nil {
+		t.Fatal(err)
+	}
+	tx.Rollback()
+}
+
+func TestReviewConvergenceVerificationReceiptRefusals(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		reviewer string
+		receipt  bool
+		stale    bool
+	}{
+		{"reviewer-partial", "partial", true, false}, {"reviewer-failed", "fail", true, false},
+		{"missing-receipt", "pass", false, false}, {"stale-receipt", "pass", true, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f, h, p := verificationFixture(t, verificationOwnershipFixture{map[string]string{"a1": "code", "a2": "matrix"}, []string{"a2"}})
+			r := f.review(t, candidateA)
+			status := map[string]string{"a1": tc.reviewer, "a2": "pending-verification"}
+			if _, err := f.post(f.resultEnv(candidateA, status, api.ReviewMetadata{Mode: "general"}), "", r.Seq, f.reviewer); err != nil {
+				t.Fatal(err)
+			}
+			if tc.receipt {
+				saveFixtureVerification(t, f, h, p, 0)
+			}
+			candidate := candidateA
+			if tc.stale {
+				candidate = candidateB
+			}
+			accept := api.Envelope{Kind: "notice", Subject: "Attempt fixture candidate acceptance", Body: api.EnvelopeBody{Text: "accept"}, Review: &api.ReviewMetadata{Mode: "disposition", Disposition: "accept", Candidate: candidate}}
+			if _, err := f.post(accept, "", 0, f.lead); !errors.Is(err, api.ErrConflict) {
+				t.Fatal("gate bypass", err)
+			}
+			if f.state(t).Disposition != nil {
+				t.Fatal("failed acceptance wrote disposition")
+			}
+		})
+	}
+}
+
+func TestReviewConvergenceVerificationHistoryFixtures(t *testing.T) {
+	for _, history := range []struct {
+		name  string
+		count int
+	}{{"DeploymentAgentA7", 7}, {"TokenAccountingA8", 8}} {
+		t.Run(history.name, func(t *testing.T) {
+			criteria := map[string]string{}
+			status := map[string]string{}
+			for i := 1; i <= history.count; i++ {
+				id := fmt.Sprintf("a%d", i)
+				criteria[id] = "synthetic criterion " + id
+				status[id] = "pass"
+			}
+			owned := fmt.Sprintf("a%d", history.count)
+			status[owned] = "pending-verification"
+			f, h, p := verificationFixture(t, verificationOwnershipFixture{criteria, []string{owned}})
+			for i := 0; i < 2; i++ {
+				r := f.review(t, candidateA)
+				if _, err := f.post(f.resultEnv(candidateA, status, api.ReviewMetadata{Mode: "general"}), "", r.Seq, f.reviewer); err != nil {
+					t.Fatal(err)
+				}
+			}
+			accept := api.Envelope{Kind: "notice", Subject: "Accept historical fixture candidate", Body: api.EnvelopeBody{Text: "accept"}, Review: &api.ReviewMetadata{Mode: "disposition", Disposition: "accept", Candidate: candidateA}}
+			if _, err := f.post(accept, "", 0, f.lead); !errors.Is(err, api.ErrConflict) {
+				t.Fatal("accepted without receipt", err)
+			}
+			before := f.state(t)
+			saveFixtureVerification(t, f, h, p, 0)
+			if _, err := f.post(accept, "", 0, f.lead); err != nil {
+				t.Fatal(err)
+			}
+			after := f.state(t)
+			if after.Disposition == nil || after.Disposition.Kind != "accept" || len(after.Rounds) != 2 || before.Rounds[1].Verdicts[owned] != after.Rounds[1].Verdicts[owned] {
+				t.Fatal("history changed", after)
+			}
+			if _, err := f.post(api.Envelope{Kind: "review", Subject: "Attempt forbidden third general review", Body: api.EnvelopeBody{Candidate: candidateA, Scope: "fixture", Acceptance: criteria, VerificationCriteria: []string{owned}}}, f.reviewer.ID, 0, f.lead); !errors.Is(err, api.ErrConflict) {
+				t.Fatal("third general review", err)
+			}
+		})
+	}
+	for _, variant := range []string{"partial", "ineligible-receipt"} {
+		t.Run(variant, func(t *testing.T) {
+			criteria := map[string]string{"a1": "code", "a2": "integration", "a3": "matrix"}
+			f, h, p := verificationFixture(t, verificationOwnershipFixture{criteria, []string{"a3"}})
+			status := map[string]string{"a1": "pass", "a2": "pass", "a3": "pending-verification"}
+			if variant == "partial" {
+				status["a2"] = "partial"
+			}
+			for i := 0; i < 2; i++ {
+				r := f.review(t, candidateA)
+				if _, err := f.post(f.resultEnv(candidateA, status, api.ReviewMetadata{Mode: "general"}), "", r.Seq, f.reviewer); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if variant == "partial" {
+				saveFixtureVerification(t, f, h, p, 0)
+			} else {
+				_, err := f.s.SaveVerification(f.ctx, f.task.ID, f.item.ID, api.VerificationRequest{RequestID: "ineligible-plan", AgentID: h.ID, RunID: h.RunID, Plan: &p})
+				if err != nil {
+					t.Fatal(err)
+				}
+				r := passingVerification(p)
+				r.Checks[0].ExitCode = 1
+				r.Checks[0].FailureReason = "exit"
+				if _, err := f.s.SaveVerification(f.ctx, f.task.ID, f.item.ID, api.VerificationRequest{RequestID: "ineligible-receipt", AgentID: h.ID, RunID: h.RunID, ExpectedGeneration: 1, Receipt: &r}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			accept := api.Envelope{Kind: "notice", Subject: "Reject historical fixture candidate", Body: api.EnvelopeBody{Text: "accept"}, Review: &api.ReviewMetadata{Mode: "disposition", Disposition: "accept", Candidate: candidateA}}
+			if _, err := f.post(accept, "", 0, f.lead); !errors.Is(err, api.ErrConflict) {
+				t.Fatal("gate bypass", err)
+			}
+		})
 	}
 }
 

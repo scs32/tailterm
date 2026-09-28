@@ -46,12 +46,13 @@ func cmdSend(e env, args []string) error {
 	} {
 		fs.StringVar(target, name, "", name+" field")
 	}
-	var owns, attachments, refs, acceptance, status, options, evidence stringListFlag
+	var owns, attachments, refs, acceptance, status, options, evidence, verificationCriteria stringListFlag
 	fs.Var(&owns, "owns", "owned file or artifact (repeatable)")
 	fs.Var(&attachments, "attachment", "file path or artifact id (repeatable)")
 	fs.Var(&refs, "ref", "reference as key=value, such as commit=abc1234 (repeatable)")
 	fs.Var(&acceptance, "acceptance", "criterion as a1=text (repeatable)")
-	fs.Var(&status, "status", "criterion result as a1=pass|fail|partial (repeatable)")
+	fs.Var(&verificationCriteria, "verification-criterion", "acceptance criterion judged by independent verification (repeatable)")
+	fs.Var(&status, "status", "criterion result as a1=pass|fail|partial|pending-verification (repeatable)")
 	fs.Var(&options, "option", "question option as o1=text (repeatable)")
 	fs.Var(&evidence, "evidence", `evidence as "e1: go test -> ok" or "e2 (commit): abc1234" (repeatable)`)
 	if err := fs.Parse(args); err != nil {
@@ -97,6 +98,7 @@ func cmdSend(e env, args []string) error {
 	} else {
 		var err error
 		b.Owns = owns
+		b.VerificationCriteria = verificationCriteria
 		env.Attachments = attachments
 		if env.Refs, err = pairs("ref", refs, "="); err == nil {
 			if b.Acceptance, err = pairs("acceptance", acceptance, "="); err == nil {

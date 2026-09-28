@@ -32,10 +32,11 @@ type ReviewFinding struct {
 }
 
 type ReviewScope struct {
-	ScopeRevision int64             `json:"scopeRevision"`
-	ItemRevision  int64             `json:"itemRevision"`
-	AssignmentSeq int64             `json:"assignmentSeq"`
-	Criteria      map[string]string `json:"criteria"`
+	ScopeRevision        int64             `json:"scopeRevision"`
+	ItemRevision         int64             `json:"itemRevision"`
+	AssignmentSeq        int64             `json:"assignmentSeq"`
+	Criteria             map[string]string `json:"criteria"`
+	VerificationCriteria []string          `json:"verificationCriteria,omitempty"`
 }
 
 type LegacyReviewerBinding struct {
@@ -45,22 +46,23 @@ type LegacyReviewerBinding struct {
 }
 
 type ReviewRound struct {
-	SourceReviewerID  string            `json:"sourceReviewerId,omitempty"`
-	Findings          []ReviewFinding   `json:"findings,omitempty"`
-	Criteria          map[string]string `json:"criteria,omitempty"`
-	ReconciliationSeq int64             `json:"reconciliationSeq,omitempty"`
-	ActiveRequestSeq  int64             `json:"activeRequestSeq,omitempty"`
-	Number            int               `json:"number"`
-	ScopeRevision     int64             `json:"scopeRevision"`
-	RequestSeq        int64             `json:"requestSeq"`
-	ResultSeq         int64             `json:"resultSeq,omitempty"`
-	Candidate         string            `json:"candidate"`
-	ReviewerID        string            `json:"reviewerId"`
-	ReviewerRun       string            `json:"reviewerRun"`
-	StartedAt         string            `json:"startedAt"`
-	CompletedAt       string            `json:"completedAt,omitempty"`
-	Verdicts          map[string]string `json:"verdicts,omitempty"`
-	Blockers          []ReviewFinding   `json:"blockers,omitempty"`
+	SourceReviewerID     string            `json:"sourceReviewerId,omitempty"`
+	Findings             []ReviewFinding   `json:"findings,omitempty"`
+	Criteria             map[string]string `json:"criteria,omitempty"`
+	VerificationCriteria []string          `json:"verificationCriteria,omitempty"`
+	ReconciliationSeq    int64             `json:"reconciliationSeq,omitempty"`
+	ActiveRequestSeq     int64             `json:"activeRequestSeq,omitempty"`
+	Number               int               `json:"number"`
+	ScopeRevision        int64             `json:"scopeRevision"`
+	RequestSeq           int64             `json:"requestSeq"`
+	ResultSeq            int64             `json:"resultSeq,omitempty"`
+	Candidate            string            `json:"candidate"`
+	ReviewerID           string            `json:"reviewerId"`
+	ReviewerRun          string            `json:"reviewerRun"`
+	StartedAt            string            `json:"startedAt"`
+	CompletedAt          string            `json:"completedAt,omitempty"`
+	Verdicts             map[string]string `json:"verdicts,omitempty"`
+	Blockers             []ReviewFinding   `json:"blockers,omitempty"`
 }
 
 type ReviewFollowUp struct {

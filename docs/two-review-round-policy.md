@@ -65,6 +65,14 @@ separately. Keep the Feature open until the handler saves verified completion.
 Typed transitions use `tt send --review-file PATH`, or `review` in an envelope
 file. See [the message contract](message-broker.md#review-convergence).
 Criteria are frozen as contiguous a1..aN at the first linked ASSIGN per scope.
+The lead also freezes any criteria designated by the order or plan for independent
+verification as `verificationCriteria` on ASSIGN and REVIEW. The reviewer records
+`pending-verification` for exactly those IDs, rather than partial or pass. The
+database-handler-imported eligible receipt judges them for the exact candidate,
+scope and assignment. Other criteria retain the reviewer pass/fail/partial gate.
+An item with verification-owned criteria needs that receipt even if older
+enrollment says verification was optional. Existing completed rounds and verdicts
+remain immutable; their owner-accept route is preserved without a third round.
 A revision-checked title/description update permits a new scope snapshot, but
 never another general review beyond two. Follow-ups are native open work items
 with source-message provenance and a parent relationship in the review ledger;
