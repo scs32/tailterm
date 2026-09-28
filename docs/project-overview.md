@@ -56,7 +56,7 @@ HTTPS static site (Cloudflare Pages project: tailos)
 Each agent host
   ├─ tt: spawn, briefing, inbox, messages, events, retirement, cleanup
   ├─ tt wrap: process lifecycle and heartbeats
-  ├─ tt relay: native Codex inbox wake-up and closed-task cleanup
+  ├─ tt relay: exact Codex/Claude inbox wake-up and closed-task cleanup
   └─ locally installed agent runtimes and their own credentials/configuration
 ```
 
@@ -369,20 +369,22 @@ messages; the read cursor means retrieval, not completion. `tt post --to NAME`
 addresses an agent. To reply to the human owner, use `--reply-to SEQ` without
 `--to owner`; humans are not agent roster entries.
 
-A prompt telling an agent to check its inbox cannot wake an idle agent. The host
-relay handles this for compatible Codex installations: the first task-aware `tt`
-command inside a Codex thread binds the exact thread UUID and run ID, and the
-relay uses native `codex queue` to notify that thread. It does not inject text
-into tmux or mark messages read. Delivery is bounded to eight wake attempts per
-agent per five minutes and persists progress across relay restarts.
+The host relay wakes compatible Codex and Claude sessions. The first task-aware
+`tt` command inside a Codex thread binds its exact thread UUID and run ID; the
+relay uses native `codex queue`. A Claude launch binds its stable session UUID,
+run and owned tmux session. Its relay checks completed transcript activity, one
+exact pane and an empty input before typing a short prompt, then sends Enter
+separately and confirms a new user transcript turn. An uncertain send is not
+retyped. The relay never marks messages read. Delivery is bounded to eight wake
+attempts per agent per five minutes and persists progress across restarts. See
+[Claude wake safety](claude-wake.md).
 
-Ordinary directed messages and human announcements can wake Codex. In swarm mode,
+Ordinary directed messages and human announcements can wake either runtime. In swarm mode,
 broadcast messages can also wake peers. Retired, closed, exited, offline, or stale
 runs are excluded. A direct human message resumes its explicitly addressed retired
 agent if its current session is online, allowing the existing eligible run to
 receive the message; broadcasts and agent-authored messages do not resume it.
-Other runtimes use their supported hooks/checkpoints and do
-not have equivalent guaranteed automatic resumption.
+Other runtimes use their supported hooks/checkpoints.
 
 `running`, `done` (turn complete), `needs_input`, `retired`, `exited`, and `closed`
 are different states. The wrapper reports heartbeats every 30 seconds; the UI
@@ -538,8 +540,9 @@ Important remaining limits:
 
 - Reliable unattended launch still depends on host trust, authentication and
   runtime capabilities. No promise that permission prompts can all be eliminated.
-- Native inbox wake-up depends on compatible `codex queue` behavior and exact
-  thread binding; other runtimes require their own integrations.
+- Native Codex inbox wake-up depends on compatible `codex queue` and exact thread
+  binding. Claude wake-up requires a completed transcript and a safe exact pane;
+  an unknown or occupied input is skipped. Other runtimes need their own integration.
 - Closing the browser does not run background profile sync. Host relay work is
   independent of the browser only while the host service is running.
 - No full agent-session transcript archive, central scheduler, automatic worktree

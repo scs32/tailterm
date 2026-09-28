@@ -39,6 +39,78 @@ func TestTeamQueuePollBackoffKeepsRateLimitSpacing(t *testing.T) {
 	}
 }
 
+func TestClaudeWakePromptAndStableOutcome(t *testing.T) {
+	messages := []api.Message{
+		{Seq: 11, From: api.Sender{AgentID: "worker"}, Broadcast: true},
+		{Seq: 12, From: api.Sender{AgentID: "lead"}, To: "worker"},
+		{Seq: 13, From: api.Sender{AgentID: "lead"}, Broadcast: true},
+	}
+	prompt := claudeWakePrompt(messages, "worker")
+	if strings.Contains(prompt, "#11") || !strings.Contains(prompt, "#12") || !strings.Contains(prompt, "#13") || !strings.Contains(prompt, "tt inbox") {
+		t.Fatalf("wrong pending sequences: %q", prompt)
+	}
+	if got := claudeBrokerPrompt("Tailterm broker: #18 assign; #19 review. Run tt obligations.", 19, "wake_fixture"); !strings.Contains(got, "#18,#19") || !strings.Contains(got, "tt inbox") || !strings.Contains(got, "wake_fixture") {
+		t.Fatalf("broker prompt: %q", got)
+	}
+	now := time.Date(2026, 9, 25, 20, 0, 0, 0, time.UTC)
+	var p relayProgress
+	recordClaudeWake(&p, prompt, errors.New("Claude input is occupied"), now)
+	if p.Wake == nil || p.Wake.Status != "skipped" || len(p.Wake.MessageSeqs) != 2 {
+		t.Fatalf("skip outcome: %+v", p.Wake)
+	}
+	recordClaudeWake(&p, prompt, errors.New("Claude input is occupied"), now.Add(time.Minute))
+	if !p.Wake.At.Equal(now) {
+		t.Fatalf("steady skip changed timestamp: %+v", p.Wake)
+	}
+	recordClaudeWake(&p, prompt, nil, now.Add(time.Minute))
+	if p.Wake.Status != "confirmed" || !p.Wake.At.Equal(now.Add(time.Minute)) {
+		t.Fatalf("confirmed outcome: %+v", p.Wake)
+	}
+}
+
+func TestClaudeWakeRejectsIneligibleHubRuns(t *testing.T) {
+	b := testClaudeBinding()
+	for _, tc := range []struct {
+		name, run, status, pause string
+		online                   bool
+	}{
+		{"stale run", "run_0000000000000002", api.AgentRunning, api.ProjectPauseActive, true},
+		{"retired", b.Run, api.AgentRetired, api.ProjectPauseActive, true},
+		{"needs input", b.Run, api.AgentNeedsInput, api.ProjectPauseActive, true},
+		{"closed", b.Run, api.AgentClosed, api.ProjectPauseActive, true},
+		{"offline", b.Run, api.AgentRunning, api.ProjectPauseActive, false},
+		{"paused", b.Run, api.AgentRunning, "paused", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch {
+				case strings.HasSuffix(r.URL.Path, "/pause"):
+					_ = json.NewEncoder(w).Encode(api.ProjectPauseStatus{State: tc.pause})
+				case strings.Contains(r.URL.Path, "/agents/") && !strings.Contains(r.URL.Path, "/wake-jobs"):
+					_ = json.NewEncoder(w).Encode(api.Agent{ID: b.Agent, RunID: tc.run, Status: tc.status, Online: tc.online, Runtime: "claude", Session: b.Session})
+				default:
+					t.Fatalf("ineligible wake made %s %s", r.Method, r.URL.Path)
+				}
+			}))
+			defer server.Close()
+			binding := b
+			binding.Hub = server.URL
+			client, _ := api.NewClient(server.URL, time.Second)
+			queued := 0
+			queue := func(context.Context, runtimeBinding, string) error { queued++; return nil }
+			if handled, err := relayWakeJob(context.Background(), binding, &relayProgress{}, client, time.Now(), queue); err != nil || handled {
+				t.Fatalf("broker ineligible: %v %v", handled, err)
+			}
+			if err := relayOne(context.Background(), binding, &relayProgress{}, client, time.Now(), queue); err != nil {
+				t.Fatalf("inbox ineligible: %v", err)
+			}
+			if queued != 0 {
+				t.Fatalf("queued %d ineligible wakes", queued)
+			}
+		})
+	}
+}
+
 func captureRelayOutput(t *testing.T, stderr bool, run func() error) (string, error) {
 	t.Helper()
 	r, w, err := os.Pipe()

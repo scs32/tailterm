@@ -2,7 +2,9 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -185,6 +187,104 @@ func TestRelayBrokerFairness(t *testing.T) {
 // Round-two focused fix N1/N2 (Codex, Fable): directed messages that create no
 // obligation still wake their recipient through the inbox path, and a page of
 // broker-covered messages never freezes the relay cursor.
+func TestClaudeRelayLeavesInboxCursorAndObligationAgentOwned(t *testing.T) {
+	st, err := store.Open(filepath.Join(t.TempDir(), "hub.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	by := api.Caller{Node: "fixture", User: "owner"}
+	ctx := context.Background()
+	task, err := st.CreateTask(ctx, api.CreateTaskRequest{Name: "Claude cursor"}, by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lead, err := st.AddAgent(ctx, task.ID, api.AddAgentRequest{Name: "lead", Host: "test", Session: "lead", Runtime: "codex"}, by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	worker, err := st.AddAgent(ctx, task.ID, api.AddAgentRequest{Name: "worker", Host: "test", Session: "claude", Runtime: "claude"}, by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.PostEvent(ctx, task.ID, api.PostEventRequest{Kind: api.EventHeartbeat, AgentID: worker.ID, RunID: worker.RunID}, by); err != nil {
+		t.Fatal(err)
+	}
+	message, err := st.PostMessage(ctx, task.ID, api.PostMessageRequest{AgentID: lead.ID, To: worker.ID, Text: "Review the bounded handoff"}, by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := httptest.NewServer(server.New(st, func(*http.Request) (api.Caller, error) { return by, nil }))
+	defer server.Close()
+	client, err := api.NewClient(server.URL, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b := runtimeBinding{Hub: server.URL, Task: task.ID, Agent: worker.ID, Run: worker.RunID, Thread: "00000000-0000-4000-8000-000000000001", Runtime: "claude", Session: "claude"}
+	var prompt string
+	p := relayProgress{Run: worker.RunID, Thread: b.Thread}
+	if err := relayOne(ctx, b, &p, client, time.Now(), func(_ context.Context, _ runtimeBinding, text string) error { prompt = text; return nil }); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(prompt, fmt.Sprintf("#%d", message.Seq)) || !strings.Contains(prompt, "tt inbox") {
+		t.Fatalf("wake prompt %q", prompt)
+	}
+	got, err := st.GetAgent(ctx, worker.ID)
+	if err != nil || got.ReadUpTo != worker.ReadUpTo || got.Unread == 0 {
+		t.Fatalf("relay changed read cursor: %+v %v", got, err)
+	}
+}
+
+func TestClaudeBrokerWakeKeepsObligationOpen(t *testing.T) {
+	st, err := store.Open(filepath.Join(t.TempDir(), "hub.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	by := api.Caller{Node: "fixture", User: "owner"}
+	ctx := context.Background()
+	task, err := st.CreateTask(ctx, api.CreateTaskRequest{Name: "Claude broker"}, by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lead, err := st.AddAgent(ctx, task.ID, api.AddAgentRequest{Name: "lead", Host: "test", Session: "lead", Runtime: "codex"}, by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	worker, err := st.AddAgent(ctx, task.ID, api.AddAgentRequest{Name: "worker", Host: "test", Session: "claude", Runtime: "claude"}, by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.PostEvent(ctx, task.ID, api.PostEventRequest{Kind: api.EventHeartbeat, AgentID: worker.ID, RunID: worker.RunID}, by); err != nil {
+		t.Fatal(err)
+	}
+	message, err := st.PostMessage(ctx, task.ID, api.PostMessageRequest{AgentID: lead.ID, To: worker.ID, Envelope: &api.Envelope{Kind: "assign", To: "worker", Subject: "Review the local fixture", Body: api.EnvelopeBody{Objective: "Check local evidence", Owns: []string{"fixture"}, Acceptance: map[string]string{"a1": "local check"}}}}, by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := httptest.NewServer(server.New(st, func(*http.Request) (api.Caller, error) { return by, nil }))
+	defer srv.Close()
+	client, err := api.NewClient(srv.URL, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b := runtimeBinding{Hub: srv.URL, Task: task.ID, Agent: worker.ID, Run: worker.RunID, Thread: "00000000-0000-4000-8000-000000000001", Runtime: "claude", Session: "claude"}
+	p := relayProgress{Run: worker.RunID, Thread: b.Thread}
+	var prompt string
+	handled, err := relayWakeJob(ctx, b, &p, client, time.Now().Add(time.Second), func(_ context.Context, _ runtimeBinding, text string) error { prompt = text; return nil })
+	if err != nil || !handled || !strings.Contains(prompt, fmt.Sprintf("#%d", message.Seq)) || !strings.Contains(prompt, "tt inbox") || p.Wake == nil || p.Wake.Status != "confirmed" {
+		t.Fatalf("broker wake: handled=%v prompt=%q outcome=%+v err=%v", handled, prompt, p.Wake, err)
+	}
+	got, err := st.GetAgent(ctx, worker.ID)
+	if err != nil || got.ReadUpTo != worker.ReadUpTo || got.Unread == 0 {
+		t.Fatalf("broker changed cursor: %+v %v", got, err)
+	}
+	obligations, err := st.ListObligations(ctx, task.ID, store.ObligationFilter{AgentID: worker.ID, OpenOnly: true}, time.Now())
+	if err != nil || len(obligations) != 1 {
+		t.Fatalf("broker closed obligation: %+v %v", obligations, err)
+	}
+}
+
 func TestRelayStillWakesNonObligatingDirectedMessages(t *testing.T) {
 	st, err := store.Open(filepath.Join(t.TempDir(), "hub.sqlite"))
 	if err != nil {
@@ -395,5 +495,150 @@ func TestRelayLeasesOnlyForLiveBindingsAndSpacesChecks(t *testing.T) {
 	}
 	if _, err := relayWakeJob(ctx, b, p, c, now.Add(3*time.Second), queue); err != nil || leases != 1 {
 		t.Fatalf("lease check was not spaced: leases %d", leases)
+	}
+}
+
+func TestClaudeBusyBrokerSkipRetriesFromInboxAtFirstIdlePass(t *testing.T) {
+	st, err := store.Open(filepath.Join(t.TempDir(), "hub.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	ctx := context.Background()
+	by := api.Caller{Node: "fixture", User: "owner"}
+	task, err := st.CreateTask(ctx, api.CreateTaskRequest{Name: "Busy Claude"}, by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lead, err := st.AddAgent(ctx, task.ID, api.AddAgentRequest{Name: "lead", Host: "test", Session: "lead", Runtime: "codex"}, by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	worker, err := st.AddAgent(ctx, task.ID, api.AddAgentRequest{Name: "worker", Host: "test", Session: "claude", Runtime: "claude"}, by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.PostEvent(ctx, task.ID, api.PostEventRequest{Kind: api.EventHeartbeat, AgentID: worker.ID, RunID: worker.RunID}, by); err != nil {
+		t.Fatal(err)
+	}
+	msg, err := st.PostMessage(ctx, task.ID, api.PostMessageRequest{AgentID: lead.ID, To: worker.ID, Envelope: &api.Envelope{Kind: "review", To: "worker", Subject: "Review fixture", Body: api.EnvelopeBody{Candidate: "abc1234", Scope: "fixture", Acceptance: map[string]string{"a1": "check"}}}}, by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := httptest.NewServer(server.New(st, func(*http.Request) (api.Caller, error) { return by, nil }))
+	defer srv.Close()
+	client, err := api.NewClient(srv.URL, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b := runtimeBinding{Hub: srv.URL, Task: task.ID, Agent: worker.ID, Run: worker.RunID, Thread: "00000000-0000-4000-8000-000000000001", Runtime: "claude", Session: "claude"}
+	p := relayProgress{Run: b.Run, Thread: b.Thread}
+	now := time.Now().Add(time.Second)
+	busyCalls := 0
+	busy := func(context.Context, runtimeBinding, string) error { busyCalls++; return errClaudeWakeUnsafe }
+	handled, err := relayWakeJob(ctx, b, &p, client, now, busy)
+	if !handled || err == nil || !p.ClaudePendingInbox || busyCalls != 1 {
+		t.Fatalf("busy broker skip did not retain inbox fallback: handled=%v err=%v progress=%+v calls=%d", handled, err, p, busyCalls)
+	}
+	data, err := json.Marshal(p)
+	if err != nil || json.Unmarshal(data, &p) != nil || !p.ClaudePendingInbox {
+		t.Fatalf("busy fallback did not survive progress reload: %v %+v", err, p)
+	}
+	var prompts []string
+	idle := func(_ context.Context, _ runtimeBinding, prompt string) error {
+		prompts = append(prompts, prompt)
+		return nil
+	}
+	if err := relayOne(ctx, b, &p, client, now.Add(10*time.Second), idle); err != nil || len(prompts) != 0 {
+		t.Fatalf("inbox retried before spacing: prompts=%q err=%v", prompts, err)
+	}
+	later := now.Add(20 * time.Second)
+	if handled, err := relayWakeJob(ctx, b, &p, client, later, idle); err != nil || handled {
+		t.Fatalf("unexpected second broker job: handled=%v err=%v", handled, err)
+	}
+	if err := relayOne(ctx, b, &p, client, later, idle); err != nil || len(prompts) != 1 || !strings.Contains(prompts[0], fmt.Sprintf("#%d", msg.Seq)) || p.ClaudePendingInbox {
+		t.Fatalf("idle inbox retry missing: prompts=%q progress=%+v err=%v", prompts, p, err)
+	}
+}
+
+func TestClaudeInboxFirstBusyBrokerSkipRewindsLocalProgress(t *testing.T) {
+	st, err := store.Open(filepath.Join(t.TempDir(), "hub.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	ctx := context.Background()
+	by := api.Caller{Node: "fixture", User: "owner"}
+	task, err := st.CreateTask(ctx, api.CreateTaskRequest{Name: "Inbox first Claude"}, by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lead, err := st.AddAgent(ctx, task.ID, api.AddAgentRequest{Name: "lead", Host: "test", Session: "lead", Runtime: "codex"}, by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	worker, err := st.AddAgent(ctx, task.ID, api.AddAgentRequest{Name: "worker", Host: "test", Session: "claude", Runtime: "claude"}, by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.PostEvent(ctx, task.ID, api.PostEventRequest{Kind: api.EventHeartbeat, AgentID: worker.ID, RunID: worker.RunID}, by); err != nil {
+		t.Fatal(err)
+	}
+	srv := httptest.NewServer(server.New(st, func(*http.Request) (api.Caller, error) { return by, nil }))
+	defer srv.Close()
+	client, err := api.NewClient(srv.URL, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b := runtimeBinding{Hub: srv.URL, Task: task.ID, Agent: worker.ID, Run: worker.RunID, Thread: "00000000-0000-4000-8000-000000000001", Runtime: "claude", Session: "claude"}
+	p := relayProgress{Run: b.Run, Thread: b.Thread}
+	t0 := time.Now().Add(time.Second)
+	busy := func(context.Context, runtimeBinding, string) error { return errClaudeWakeUnsafe }
+	if handled, err := relayWakeJob(ctx, b, &p, client, t0, busy); handled || err != nil || !p.BrokerWakes {
+		t.Fatalf("empty broker check: handled=%v err=%v progress=%+v", handled, err, p)
+	}
+	msg, err := st.PostMessage(ctx, task.ID, api.PostMessageRequest{AgentID: lead.ID, To: worker.ID, Envelope: &api.Envelope{Kind: "review", To: "worker", Subject: "Review fixture", Body: api.EnvelopeBody{Candidate: "abc1234", Scope: "fixture", Acceptance: map[string]string{"a1": "check"}}}}, by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if handled, err := relayWakeJob(ctx, b, &p, client, t0.Add(3*time.Second), busy); handled || err != nil {
+		t.Fatalf("broker check before due: handled=%v err=%v", handled, err)
+	}
+	if err := relayOne(ctx, b, &p, client, t0.Add(3*time.Second), busy); err != nil || p.Through != msg.Seq {
+		t.Fatalf("inbox did not skip broker-covered message: through=%d msg=%d err=%v", p.Through, msg.Seq, err)
+	}
+	tBusy := t0.Add(16 * time.Second)
+	if handled, err := relayWakeJob(ctx, b, &p, client, tBusy, busy); !handled || err == nil || !p.ClaudePendingInbox || p.Through != msg.Seq-1 {
+		t.Fatalf("busy lease did not retain earlier sequence: handled=%v err=%v through=%d msg=%d pending=%v", handled, err, p.Through, msg.Seq, p.ClaudePendingInbox)
+	}
+	data, err := json.Marshal(p)
+	if err != nil || json.Unmarshal(data, &p) != nil || !p.ClaudePendingInbox || p.Through != msg.Seq-1 {
+		t.Fatalf("rewound progress lost on reload: %v %+v", err, p)
+	}
+	var prompts []string
+	idle := func(_ context.Context, _ runtimeBinding, prompt string) error {
+		prompts = append(prompts, prompt)
+		return nil
+	}
+	if err := relayOne(ctx, b, &p, client, tBusy.Add(10*time.Second), idle); err != nil || len(prompts) != 0 {
+		t.Fatalf("inbox retried before spacing: prompts=%q err=%v", prompts, err)
+	}
+	tIdle := tBusy.Add(20 * time.Second)
+	if handled, err := relayWakeJob(ctx, b, &p, client, tIdle, idle); handled || err != nil {
+		t.Fatalf("unexpected later broker job: handled=%v err=%v", handled, err)
+	}
+	if err := relayOne(ctx, b, &p, client, tIdle, idle); err != nil || len(prompts) != 1 || !strings.Contains(prompts[0], fmt.Sprintf("#%d", msg.Seq)) || p.ClaudePendingInbox || p.Wakes > 8 {
+		t.Fatalf("first idle pass missed or duplicated: prompts=%q progress=%+v err=%v", prompts, p, err)
+	}
+	if err := relayOne(ctx, b, &p, client, tIdle.Add(20*time.Second), idle); err != nil || len(prompts) != 1 {
+		t.Fatalf("post-retry duplicate: prompts=%q err=%v", prompts, err)
+	}
+	got, err := st.GetAgent(ctx, worker.ID)
+	if err != nil || got.ReadUpTo != 0 {
+		t.Fatalf("relay moved agent read cursor: %+v %v", got, err)
+	}
+	open, err := st.ListObligations(ctx, task.ID, store.ObligationFilter{AgentID: worker.ID, OpenOnly: true}, time.Now())
+	if err != nil || len(open) != 1 || open[0].MessageSeq != msg.Seq {
+		t.Fatalf("relay changed acknowledgement: %+v %v", open, err)
 	}
 }

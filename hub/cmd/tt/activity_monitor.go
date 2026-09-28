@@ -177,6 +177,13 @@ func relayActivityTick(ctx context.Context, b runtimeBinding, client *api.Client
 	if c.Run != b.Run || c.Thread != b.Thread {
 		c = activityCursor{Run: b.Run, Thread: b.Thread}
 	}
+	wakeKey := func(w *api.WakeOutcome) string {
+		if w == nil {
+			return ""
+		}
+		data, _ := json.Marshal(w)
+		return string(data)
+	}
 	var u *usageCursor
 	if enabled, _ := ctx.Value(usageEnabledContextKey{}).(bool); enabled {
 		var usageErr error
@@ -216,12 +223,14 @@ func relayActivityTick(ctx context.Context, b runtimeBinding, client *api.Client
 				return err
 			}
 			c.RejectedState = c.PendingReport.Activity.State
+			c.RejectedWakeKey = wakeKey(c.PendingReport.Activity.Wake)
 			c.PendingReport = nil
 			if err := save(); err != nil {
 				return err
 			}
 		} else {
 			c.LastState = c.PendingReport.Activity.State
+			c.LastWakeKey = wakeKey(c.PendingReport.Activity.Wake)
 			c.PendingReport = nil
 			if err := save(); err != nil {
 				return err
@@ -355,10 +364,17 @@ func relayActivityTick(ctx context.Context, b runtimeBinding, client *api.Client
 		}
 		state = activityState(&c, a, open, tmuxAlive, processAlive, probeErr, now, activityDefaults())
 	}
-	if state.State == c.LastState || state.State == c.RejectedState {
+	if b.Runtime == "claude" {
+		var progress relayProgress
+		if data, err := os.ReadFile(filepath.Join(relayDir(), bindingKey(b)+".progress.json")); err == nil && json.Unmarshal(data, &progress) == nil && progress.Run == b.Run && progress.Thread == b.Thread {
+			state.Wake = progress.Wake
+		}
+	}
+	key := wakeKey(state.Wake)
+	if (state.State == c.LastState && key == c.LastWakeKey) || (state.State == c.RejectedState && key == c.RejectedWakeKey) {
 		return save()
 	}
-	c.RejectedState = ""
+	c.RejectedState, c.RejectedWakeKey = "", ""
 	c.Transition++
 	c.PendingReport = &api.ActivityReport{RequestID: activityRequestID(b, c.Transition), RunID: b.Run, Activity: state}
 	c.LastReportAttempt = now
@@ -370,11 +386,11 @@ func relayActivityTick(ctx context.Context, b runtimeBinding, client *api.Client
 		if !errors.As(err, &httpErr) || httpErr.Status != http.StatusConflict {
 			return err
 		}
-		c.RejectedState = state.State
+		c.RejectedState, c.RejectedWakeKey = state.State, key
 		c.PendingReport = nil
 		return save()
 	}
-	c.LastState = state.State
+	c.LastState, c.LastWakeKey = state.State, key
 	c.PendingReport = nil
 	return save()
 }

@@ -28,9 +28,8 @@ const member = (name, role, model, prompt, options = {}) => ({
 // Phase 1: tt send validates typed posts; free text is still accepted.
 const messageFormat = `BOARD MESSAGE FORMAT
 Post with tt send, which checks the message before it reaches the board. Example: tt send --kind result --to lead --subject "Tests pass for the empty recipient check" --outcome done --status a1=pass --evidence "e1: go test ./cmd/tt -> ok" --ref commit=abc1234. Run tt send --help for every field. KIND is assign, request, review, question, result, answer, block, decline, finding or notice. Use NOTICE to tell someone to wait or share status. Use BLOCK only when you yourself are blocked; address it to whoever can unblock you, state what you need, and give the condition for resuming. The subject is plain English, at most 120 characters, with no IDs, hashes or paths; IDs go only in --ref. assign needs --objective, --owns and --acceptance a1=…; review needs --candidate, --scope and --acceptance; result needs --outcome, --status per criterion and --evidence; question asks exactly one --question; block needs --reason, --needs and --resume-when. Keep messages under about 2 KB; put longer material in a file and cite its path with --ref or --attachment. Never split content across posts. Do not post acknowledgement messages on the board; acknowledge with tt ack SEQ, then answer an assign, request or review with its result, a block, a decline with a reason, or one question. If this host's tt has no send command, post the same fields as text with tt post: first line KIND: subject, then one Field: value line each.`;
-// Planned delivery targets a Claude Opus 5.5 (medium) lead. Until the lead can
-// be woken automatically (docs/message-broker.md) it ships with Astra; swap it
-// in Agents when ready. GPT-6 Sol and Luna require codex-cli 0.156.1 or later.
+// Planned delivery uses a Claude Opus 5.5 (medium) lead. GPT-6 Sol and Luna
+// require codex-cli 0.156.1 or later.
 // GPT-6 has no mid-size model: former Terra roles use Sol, except swarm workers,
 // which use Luna for focused, high-volume assignments.
 const sol = "gpt-6-sol",
@@ -51,7 +50,7 @@ export const TEAM_EXAMPLES = [
       member(
         "lead",
         "Delivery lead and orchestrator",
-        astra,
+        "claude-opus-5-5",
         `You are the main orchestrator. You own decisions, routing, evidence review, the release disposition and the final response. You do not edit production, test or schema files; the builder is the only writer.
 
 Start by sending planner a REQUEST for a plan of the owner's objective. When the plan arrives, check that every acceptance criterion is observable and that file ownership is explicit, then send builder one ASSIGN carrying the plan's objective, owned files and criteria a1…aN unchanged. Ask the database handler to record the item and order; do not narrate record bookkeeping on the board yourself.
@@ -62,8 +61,8 @@ When builder sends a RESULT with a frozen commit, check it against each criterio
 
 Before acceptance, REQUEST the distinct verifier to run the handler-approved full matrix on the frozen SHA. Require all checks, both engines and a handler-saved passing receipt. New commit, scope or matrix requires new verification; review cannot replace it.
 
-Reviewer runs on a runtime that the relay cannot wake. Always send it directed messages; it waits on its inbox. If any teammate leaves an ASSIGN, REQUEST or REVIEW without a reply for 30 minutes, send that teammate one nudge. The broker escalates overdue work itself; do not send a message to escalate a teammate's stall to the owner. Close workers only after acceptance. Once the handler confirms a terminal item and all team obligations are closed, run tt close --team for the item team. When this item came from tt team queue, the supervised host runner may close it after the same gates and cleanup receipts, then advance the queue.`,
-        { reasoning: "medium", format: true },
+Send directed work to any teammate and let the relay wake its idle session when the pane is safe. If any teammate leaves an ASSIGN, REQUEST or REVIEW without a reply for 30 minutes, send that teammate one nudge. The broker escalates overdue work itself; do not send a message to escalate a teammate's stall to the owner. Close workers only after acceptance. Once the handler confirms a terminal item and all team obligations are closed, run tt close --team for the item team. When this item came from tt team queue, the supervised host runner may close it after the same gates and cleanup receipts, then advance the queue.`,
+        { runtime: "claude", reasoning: "medium", format: true },
       ),
       member(
         "planner",
@@ -121,7 +120,7 @@ Send the receipt file, log references and outcomes to the database handler throu
         "reviewer",
         "Independent code review",
         "claude-opus-5-5",
-        `You are a read-only reviewer. You run on a different model family from the builder so your blind spots differ. You never edit files. The relay cannot wake you: whenever you have nothing to do, run tt inbox --unread --mark-read --wait 9m and repeat it until a REVIEW arrives. That wait costs nothing while it blocks.
+        `You are a read-only reviewer. You run on a different model family from the builder so your blind spots differ. You never edit files. When you have nothing to do, finish your turn; the relay can wake your idle Claude session for directed work when its pane is safe.
 
 Review only a frozen commit named in a REVIEW from lead, against its stated scope and criteria. Inspect the actual diff and exercise the highest-risk path when tools permit. Look for incorrect state transitions, error handling, races, lost data, compatibility breaks and criteria the evidence does not support. Separate reproducible defects from hypotheses and from preferences.
 

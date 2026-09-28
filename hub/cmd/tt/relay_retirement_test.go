@@ -446,8 +446,25 @@ func TestRelayRetirementLiveBindingRequestCounts(t *testing.T) {
 		t.Logf("%-70s %d", k, counts[k])
 	}
 	t.Logf("TOTAL requests in one --once pass: %d", total)
-	if total != 11 {
-		t.Errorf("first unexamined pass=%d, want base8 plus one initial probe per binding and one cached host usage discovery", total)
+	// Enabling Claude delivery adds precisely its broker lease and the paired
+	// project/run checks on broker and unread paths. Codex's own counts remain
+	// unchanged; the shared host capability/queue calls remain one each.
+	firstExpected := map[string]int{
+		"GET /v1/capabilities":                                                1,
+		"GET /v1/team-queues":                                                 1,
+		"GET /v1/tasks/tsk_0000000000000001/pause":                            4,
+		"GET /v1/tasks/tsk_0000000000000001/agents/<codex>":                   4,
+		"GET /v1/tasks/tsk_0000000000000001/agents/<claude>":                  4,
+		"POST /v1/tasks/tsk_0000000000000001/agents/<codex>/wake-jobs/lease":  1,
+		"POST /v1/tasks/tsk_0000000000000001/agents/<claude>/wake-jobs/lease": 1,
+	}
+	if total != 16 || len(counts) != len(firstExpected) {
+		t.Errorf("first live pass=%d, want exact Claude-enabled 16", total)
+	}
+	for key, want := range firstExpected {
+		if counts[key] != want {
+			t.Errorf("first %s = %d, want %d", key, counts[key], want)
+		}
 	}
 	// Reset delivery/activity cadence to the same first-pass conditions, keeping
 	// only the saved probe deadline: the repeated --once must add no agent reads.
@@ -480,13 +497,27 @@ func TestRelayRetirementLiveBindingRequestCounts(t *testing.T) {
 	}
 	mu.Lock()
 	total = 0
-	for _, n := range counts {
+	for key, n := range counts {
+		t.Logf("saved schedule %-70s %d", key, n)
 		total += n
 	}
 	mu.Unlock()
 	t.Logf("TOTAL requests with saved probe schedule: %d", total)
-	if total != 8 {
-		t.Errorf("examined live pass=%d, want base8", total)
+	secondExpected := map[string]int{
+		"GET /v1/team-queues":                                                 1,
+		"GET /v1/tasks/tsk_0000000000000001/pause":                            4,
+		"GET /v1/tasks/tsk_0000000000000001/agents/<codex>":                   3,
+		"GET /v1/tasks/tsk_0000000000000001/agents/<claude>":                  3,
+		"POST /v1/tasks/tsk_0000000000000001/agents/<codex>/wake-jobs/lease":  1,
+		"POST /v1/tasks/tsk_0000000000000001/agents/<claude>/wake-jobs/lease": 1,
+	}
+	if total != 13 || len(counts) != len(secondExpected) {
+		t.Errorf("examined live pass=%d, want Claude-enabled 13 with cached retirement probe", total)
+	}
+	for key, want := range secondExpected {
+		if counts[key] != want {
+			t.Errorf("saved schedule %s = %d, want %d", key, counts[key], want)
+		}
 	}
 	if _, err := os.Stat(filepath.Join(dir, bindingKey(codex)+".binding.json")); err != nil {
 		t.Fatalf("live codex binding missing: %v", err)

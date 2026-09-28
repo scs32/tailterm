@@ -34,6 +34,21 @@ func validActivity(a api.AgentActivity) bool {
 	if a.ObservedAt.IsZero() || len(a.PendingTool) > 120 || len(a.Reason) > 240 || strings.ContainsAny(a.PendingTool+a.Reason, "\n\r") {
 		return false
 	}
+	if wake := a.Wake; wake != nil {
+		switch wake.Status {
+		case "confirmed", "skipped", "failed", "ambiguous":
+		default:
+			return false
+		}
+		if wake.At.IsZero() || len(wake.Reason) > 240 || strings.ContainsAny(wake.Reason, "\n\r") || len(wake.MessageSeqs) > 5 {
+			return false
+		}
+		for _, seq := range wake.MessageSeqs {
+			if seq < 1 {
+				return false
+			}
+		}
+	}
 	t := a.Tokens
 	return t.Input >= 0 && t.Cached >= 0 && t.CacheWrite >= 0 && t.Output >= 0 && t.Reasoning >= 0 && t.Total >= 0
 }
@@ -81,7 +96,11 @@ func (s *Store) ReportActivity(ctx context.Context, task, agent string, report a
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return zero, err
 	}
-	if oldState == report.Activity.State {
+	var oldActivity api.AgentActivity
+	if oldPayload != "" && json.Unmarshal([]byte(oldPayload), &oldActivity) != nil {
+		return zero, api.ErrConflict
+	}
+	if oldState == report.Activity.State && sameWakeOutcome(oldActivity.Wake, report.Activity.Wake) {
 		var saved api.AgentActivity
 		if json.Unmarshal([]byte(oldPayload), &saved) != nil {
 			return zero, api.ErrConflict
@@ -96,14 +115,31 @@ func (s *Store) ReportActivity(ctx context.Context, task, agent string, report a
 	if _, err = tx.ExecContext(ctx, `INSERT INTO agent_activity_receipts(task_id,request_id,agent_id,run_id,payload,request_payload) VALUES(?,?,?,?,?,?)`, task, report.RequestID, agent, run, string(payload), string(requestBytes)); err != nil {
 		return zero, err
 	}
-	if err := s.postActivityAlerts(ctx, tx, task, agent, run, report.Activity); err != nil {
-		return zero, err
+	if oldState != report.Activity.State {
+		if err := s.postActivityAlerts(ctx, tx, task, agent, run, report.Activity); err != nil {
+			return zero, err
+		}
 	}
 	if err = tx.Commit(); err != nil {
 		return zero, err
 	}
 	s.notify(task)
 	return report.Activity, nil
+}
+
+func sameWakeOutcome(a, b *api.WakeOutcome) bool {
+	if a == nil || b == nil {
+		return a == nil && b == nil
+	}
+	if a.Status != b.Status || a.Reason != b.Reason || !a.At.Equal(b.At) || len(a.MessageSeqs) != len(b.MessageSeqs) {
+		return false
+	}
+	for i := range a.MessageSeqs {
+		if a.MessageSeqs[i] != b.MessageSeqs[i] {
+			return false
+		}
+	}
+	return true
 }
 
 func (s *Store) postActivityAlerts(ctx context.Context, tx *sql.Tx, task, agent, run string, activity api.AgentActivity) error {

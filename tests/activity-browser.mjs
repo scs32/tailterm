@@ -7,7 +7,7 @@ const html = `<!doctype html><html><head><link rel="stylesheet" href="/client/st
 import {createTasksView} from '/client/tasks-view.js';
 const states=['working','hung_tool','finished_silent','crashed','looping','idle','unknown'];
 const task={id:'tsk_1111111111111111',name:'Synthetic activity project',goal:'Synthetic only',status:'open',createdAt:'2026-09-25T20:00:00Z'};
-const agents=states.map((state,i)=>({id:'agt_'+String(i+1).padStart(16,'0'),name:'member-'+i,host:'fixture.invalid',session:'fake',status:'running',runId:'run_'+String(i+1).padStart(16,'0'),lastSeenAt:'2026-09-25T20:00:00Z',createdAt:'2026-09-25T20:00:00Z',activity:{state,observedAt:new Date().toISOString(),pendingTool:state==='hung_tool'?'exec_command':'',tokens:{total:100+i}}}));
+const agents=states.map((state,i)=>({id:'agt_'+String(i+1).padStart(16,'0'),name:'member-'+i,host:'fixture.invalid',session:'fake',status:'running',runId:'run_'+String(i+1).padStart(16,'0'),lastSeenAt:'2026-09-25T20:00:00Z',createdAt:'2026-09-25T20:00:00Z',activity:{state,observedAt:new Date().toISOString(),pendingTool:state==='hung_tool'?'exec_command':'',wake:state==='idle'?{status:'skipped',reason:'Claude input is occupied',messageSeqs:[41]}:undefined,tokens:{total:100+i}}}));
 const queue={concurrencyLimit:1,entries:[{itemId:'wi_1111111111111111',state:'running',ownership:['synthetic'],activities:agents.map(a=>({agentId:a.id,name:a.name,activity:a.activity})),tokens:{total:721}}]};
 const client={listTasks:async()=>[task],getTask:async()=>({task,agents}),listTeamDelivery:async()=>queue,capabilities:async()=>({}),subscribe:()=>({stop(){}})};
 const view=createTasksView({client:()=>client,taskHub:{hasPendingResume:()=>false,groupOf:()=>null},getTabs:()=>[],activate:()=>{},notice:()=>{},confirm:async()=>true,openBoard:()=>{},openWorkItems:()=>{},configure:()=>{}});
@@ -32,6 +32,7 @@ try {
       const roster=await page.locator('[data-team-roster]').innerText();
       for(const state of ["Working","Hung tool","Finished silently","Crashed","Looping","Idle","Unknown"]) assert.match(roster,new RegExp(state));
       assert.match(await page.locator('[data-task-agent]').first().getAttribute('title'),/Last transition snapshot: 100 tokens/);
+      assert.match(await page.locator('[data-task-agent]').nth(5).getAttribute('title'),/Claude wake skipped #41: Claude input is occupied/);
       assert.match(await page.locator('[data-testid="team-delivery-panel"]').innerText(),/Last transition snapshot: 721 tokens/);
       assert.deepEqual(errors,[]);
       await context.close();
