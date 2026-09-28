@@ -217,7 +217,7 @@ Send directed work to any teammate and let the relay wake its idle session when 
 
 ### planner — Planning and acceptance criteria
 
-App: `codex`. Model: `gpt-6-astra`. Reasoning: `high`. Machine: Main machine. Directory: optional.
+App: `claude`. Model: `claude-opus-5-5`. Reasoning: `high`. Machine: Main machine. Directory: optional.
 
 ```text
 WORKING AGREEMENT
@@ -246,7 +246,7 @@ When lead or builder reports new evidence that invalidates the plan, send a revi
 
 ### builder — Implementation
 
-App: `codex`. Model: `gpt-6-sol`. Reasoning: `medium`. Machine: Main machine. Directory: optional.
+App: `claude`. Model: `claude-opus-5-5`. Reasoning: `high`. Machine: Main machine. Directory: optional.
 
 ```text
 WORKING AGREEMENT
@@ -275,7 +275,7 @@ Send lead one RESULT with the frozen commit in Refs, Status for every criterion,
 
 ### database — Database handler
 
-App: `codex`. Model: `gpt-6-sol`. Reasoning: `medium`. Machine: Main machine. Directory: optional.
+App: `claude`. Model: `claude-opus-5-5`. Reasoning: `high`. Machine: Main machine. Directory: optional.
 
 ```text
 WORKING AGREEMENT
@@ -349,7 +349,7 @@ One capable agent for a bounded change, without coordination overhead.
 
 ### builder — Implementation and verification
 
-App: `codex`. Model: `gpt-6-sol`. Machine: Main machine. Directory: optional.
+App: `claude`. Model: `claude-opus-5-5`. Reasoning: `high`. Machine: Main machine. Directory: optional.
 
 ```text
 WORKING AGREEMENT
@@ -387,7 +387,7 @@ A single writer plus an independent reviewer. A practical default for most codin
 
 ### builder — Implementation lead
 
-App: `codex`. Model: `gpt-6-sol`. Machine: Main machine. Directory: optional.
+App: `claude`. Model: `claude-opus-5-5`. Reasoning: `high`. Machine: Main machine. Directory: optional.
 
 ```text
 WORKING AGREEMENT
@@ -411,7 +411,7 @@ Before finishing, read the inbox, confirm the reviewed artifact matches your fin
 
 ### reviewer — Independent correctness review
 
-App: `codex`. Model: `gpt-6-sol`. Machine: Main machine. Directory: optional.
+App: `claude`. Model: `claude-opus-5-5`. Reasoning: `high`. Machine: Main machine. Directory: optional.
 
 ```text
 WORKING AGREEMENT
@@ -447,7 +447,7 @@ A lead, two implementation lanes, and independent acceptance testing.
 
 ### lead — Architecture and delivery orchestration
 
-App: `codex`. Model: `gpt-6-astra`. Machine: Main machine. Directory: optional.
+App: `claude`. Model: `claude-opus-5-5`. Reasoning: `high`. Machine: Main machine. Directory: optional.
 
 ```text
 WORKING AGREEMENT
@@ -471,7 +471,7 @@ Close with qa's evidence and any unresolved findings. Do not announce completion
 
 ### ui — Client implementation
 
-App: `codex`. Model: `gpt-6-sol`. Machine: Main machine. Directory: optional.
+App: `claude`. Model: `claude-opus-5-5`. Reasoning: `high`. Machine: Main machine. Directory: optional.
 
 ```text
 WORKING AGREEMENT
@@ -495,7 +495,7 @@ Exercise keyboard and pointer interactions, relevant viewport sizes, and the bro
 
 ### api — Service and data implementation
 
-App: `codex`. Model: `gpt-6-sol`. Machine: Main machine. Directory: optional.
+App: `claude`. Model: `claude-opus-5-5`. Reasoning: `high`. Machine: Main machine. Directory: optional.
 
 ```text
 WORKING AGREEMENT
@@ -519,7 +519,7 @@ Verify the happy path and the most important failure or concurrency case through
 
 ### qa — Independent acceptance testing
 
-App: `codex`. Model: `gpt-6-sol`. Machine: Main machine. Directory: optional.
+App: `claude`. Model: `claude-opus-5-5`. Reasoning: `high`. Machine: Main machine. Directory: optional.
 
 ```text
 WORKING AGREEMENT
@@ -555,7 +555,7 @@ Two independent lines of diagnosis, with one agent responsible for the fix.
 
 ### fixer — Diagnosis orchestration
 
-App: `codex`. Model: `gpt-6-astra`. Machine: Main machine. Directory: optional.
+App: `claude`. Model: `claude-opus-5-5`. Reasoning: `high`. Machine: Main machine. Directory: optional.
 
 ```text
 WORKING AGREEMENT
@@ -579,7 +579,7 @@ Send the precise patch and claimed mechanism to both teammates. Have reproducer 
 
 ### reproducer — Failure reproduction
 
-App: `codex`. Model: `gpt-6-sol`. Machine: Main machine. Directory: optional.
+App: `claude`. Model: `claude-opus-5-5`. Reasoning: `high`. Machine: Main machine. Directory: optional.
 
 ```text
 WORKING AGREEMENT
@@ -603,7 +603,7 @@ After the patch, rerun the original scenario and a nearby negative case, includi
 
 ### analyst — Causal analysis and repair implementation
 
-App: `codex`. Model: `gpt-6-sol`. Machine: Main machine. Directory: optional.
+App: `claude`. Model: `claude-opus-5-5`. Reasoning: `high`. Machine: Main machine. Directory: optional.
 
 ```text
 WORKING AGREEMENT
@@ -639,7 +639,7 @@ A design audit, a single UI writer, and browser/accessibility verification.
 
 ### designer — Interaction and visual audit
 
-App: `codex`. Model: `gpt-6-astra`. Machine: Main machine. Directory: optional.
+App: `claude`. Model: `claude-opus-5-5`. Reasoning: `high`. Machine: Main machine. Directory: optional.
 
 ```text
 WORKING AGREEMENT
@@ -663,7 +663,7 @@ Review the rendered result after implementation, including a narrow viewport. Di
 
 ### implementer — UI implementation lead
 
-App: `codex`. Model: `gpt-6-sol`. Machine: Main machine. Directory: optional.
+App: `claude`. Model: `claude-opus-5-5`. Reasoning: `high`. Machine: Main machine. Directory: optional.
 
 ```text
 WORKING AGREEMENT
@@ -687,7 +687,7 @@ Send verifier exact scenarios and the artifact to test, then correct reproducibl
 
 ### verifier — Browser and accessibility checks
 
-App: `codex`. Model: `gpt-6-sol`. Machine: Main machine. Directory: optional.
+App: `claude`. Model: `claude-opus-5-5`. Reasoning: `high`. Machine: Main machine. Directory: optional.
 
 ```text
 WORKING AGREEMENT
@@ -723,7 +723,7 @@ A threat model and two independent, evidence-focused review lanes.
 
 ### lead — Threat model and triage
 
-App: `codex`. Model: `gpt-6-astra`. Machine: Main machine. Directory: optional.
+App: `claude`. Model: `claude-opus-5-5`. Reasoning: `high`. Machine: Main machine. Directory: optional.
 
 ```text
 WORKING AGREEMENT
@@ -747,7 +747,7 @@ Keep investigation within the authorized system and use isolated, non-destructiv
 
 ### identity — Identity and state review
 
-App: `codex`. Model: `gpt-6-sol`. Machine: Main machine. Directory: optional.
+App: `claude`. Model: `claude-opus-5-5`. Reasoning: `high`. Machine: Main machine. Directory: optional.
 
 ```text
 WORKING AGREEMENT
@@ -771,7 +771,7 @@ Send lead each confirmed finding with exact location, attacker preconditions, ob
 
 ### surfaces — Input and output boundary review
 
-App: `codex`. Model: `gpt-6-sol`. Machine: Main machine. Directory: optional.
+App: `claude`. Model: `claude-opus-5-5`. Reasoning: `high`. Machine: Main machine. Directory: optional.
 
 ```text
 WORKING AGREEMENT
@@ -807,7 +807,7 @@ A change plan, one operator, and independent readiness/rollback checks.
 
 ### lead — Change planning and coordination
 
-App: `codex`. Model: `gpt-6-astra`. Machine: Main machine. Directory: optional.
+App: `claude`. Model: `claude-opus-5-5`. Reasoning: `high`. Machine: Main machine. Directory: optional.
 
 ```text
 WORKING AGREEMENT
@@ -831,7 +831,7 @@ Coordinate the operator and verifier through the change, keeping the owner infor
 
 ### operator — Deployment and migration operator
 
-App: `codex`. Model: `gpt-6-sol`. Machine: Main machine. Directory: optional.
+App: `claude`. Model: `claude-opus-5-5`. Reasoning: `high`. Machine: Main machine. Directory: optional.
 
 ```text
 WORKING AGREEMENT
@@ -855,7 +855,7 @@ Send verifier the deployed artifact, endpoints, expected behavior and relevant b
 
 ### verifier — Readiness and recovery verification
 
-App: `codex`. Model: `gpt-6-sol`. Machine: Main machine. Directory: optional.
+App: `claude`. Model: `claude-opus-5-5`. Reasoning: `high`. Machine: Main machine. Directory: optional.
 
 ```text
 WORKING AGREEMENT
@@ -891,7 +891,7 @@ Separated evidence collection, counterarguments and a final decision brief.
 
 ### lead — Decision framing and synthesis
 
-App: `codex`. Model: `gpt-6-astra`. Machine: Main machine. Directory: optional.
+App: `claude`. Model: `claude-opus-5-5`. Reasoning: `high`. Machine: Main machine. Directory: optional.
 
 ```text
 WORKING AGREEMENT
@@ -915,7 +915,7 @@ Ask critic to challenge the provisional conclusion before finalizing it. Resolve
 
 ### researcher — Primary-source evidence
 
-App: `codex`. Model: `gpt-6-sol`. Machine: Main machine. Directory: optional.
+App: `claude`. Model: `claude-opus-5-5`. Reasoning: `high`. Machine: Main machine. Directory: optional.
 
 ```text
 WORKING AGREEMENT
@@ -939,7 +939,7 @@ Send lead the strongest evidence early and flag gaps that could change the resul
 
 ### critic — Counterarguments and source checking
 
-App: `codex`. Model: `gpt-6-sol`. Machine: Main machine. Directory: optional.
+App: `claude`. Model: `claude-opus-5-5`. Reasoning: `high`. Machine: Main machine. Directory: optional.
 
 ```text
 WORKING AGREEMENT
@@ -975,7 +975,7 @@ An Astra orchestrator and four Luna workers sharing one broadcast conversation.
 
 ### orchestrator — Main orchestrator
 
-App: `codex`. Model: `gpt-6-astra`. Machine: Main machine. Directory: optional.
+App: `claude`. Model: `claude-opus-5-5`. Reasoning: `high`. Machine: Main machine. Directory: optional.
 
 ```text
 WORKING AGREEMENT
