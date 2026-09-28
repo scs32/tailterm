@@ -193,7 +193,10 @@ func readActivityAppend(path string, c *activityCursor, parse func([]byte, *acti
 	// record (including an oversized one being skipped) delays publication.
 	defer func() { c.Ready = c.Offset == info.Size() && c.Partial == "" && !c.Skipping }()
 	reader := bufio.NewReaderSize(io.LimitReader(f, remaining), 64<<10)
-	for {
+	for records := 0; ; records++ {
+		if records >= 256 {
+			return nil
+		}
 		line, readErr := reader.ReadBytes('\n')
 		c.Offset += int64(len(line))
 		if c.Skipping {

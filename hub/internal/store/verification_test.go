@@ -256,7 +256,18 @@ func TestVerificationMigrationRehearsal(t *testing.T) {
 	program := `package main
 import("os";"context";"database/sql";"time";"github.com/scs32/tailterm/hub/internal/store";"github.com/scs32/tailterm/hub/internal/api")
 func main(){s,e:=store.Open(os.Args[1]);if e!=nil{panic(e)}
-if os.Args[2]=="seed" {ctx:=context.Background();by:=api.Caller{Node:"fixture",User:"owner"};task,e:=s.CreateTask(ctx,api.CreateTaskRequest{Name:"base-created migration fixture"},by);if e!=nil{panic(e)};item,e:=s.CreateWorkItem(ctx,task.ID,api.CreateWorkItemRequest{Kind:"bug",Title:"base-created item",RequestID:"base-seed"},by);if e!=nil{panic(e)};a,e:=s.AddAgent(ctx,task.ID,api.AddAgentRequest{Name:"legacy",Host:"fixture",Session:"fixture"},by);if e!=nil{panic(e)};m,e:=s.PostMessage(ctx,task.ID,api.PostMessageRequest{Text:"base fixture order"},by);if e!=nil{panic(e)};q,e:=sql.Open("sqlite",os.Args[1]);if e!=nil{panic(e)};_,e=q.Exec("INSERT INTO agent_work_item_bindings(agent_id,run_id,item_task_id,item_id,item_revision,work_order_task_id,work_order_message_seq,context_through_message_seq,context_digest,context_json,created_at) VALUES(?,?,?,?,1,?,?,0,'fixture','{}',?)",a.ID,a.RunID,task.ID,item.ID,task.ID,m.Seq,time.Now().UTC().Format(time.RFC3339Nano));if e!=nil{panic(e)};q.Close()};if e=s.Close();e!=nil{panic(e)}}`
+if os.Args[2]=="seed" {ctx:=context.Background();by:=api.Caller{Node:"fixture",User:"owner"};task,e:=s.CreateTask(ctx,api.CreateTaskRequest{Name:"base-created migration fixture"},by);if e!=nil{panic(e)};item,e:=s.CreateWorkItem(ctx,task.ID,api.CreateWorkItemRequest{Kind:"bug",Title:"base-created item",RequestID:"base-seed"},by);if e!=nil{panic(e)};a,e:=s.AddAgent(ctx,task.ID,api.AddAgentRequest{Name:"legacy",Host:"fixture",Session:"fixture",Runtime:"codex"},by);if e!=nil{panic(e)};m,e:=s.PostMessage(ctx,task.ID,api.PostMessageRequest{Text:"base fixture order"},by);if e!=nil{panic(e)};q,e:=sql.Open("sqlite",os.Args[1]);if e!=nil{panic(e)};_,e=q.Exec("INSERT INTO agent_work_item_bindings(agent_id,run_id,item_task_id,item_id,item_revision,work_order_task_id,work_order_message_seq,context_through_message_seq,context_digest,context_json,created_at) VALUES(?,?,?,?,1,?,?,0,'fixture','{}',?)",a.ID,a.RunID,task.ID,item.ID,task.ID,m.Seq,time.Now().UTC().Format(time.RFC3339Nano));if e!=nil{panic(e)};
+second,e:=s.CreateWorkItem(ctx,task.ID,api.CreateWorkItemRequest{Kind:"bug",Title:"base second item",RequestID:"base-second"},by);if e!=nil{panic(e)}
+description:="synthetic second revision";_,e=s.UpdateWorkItem(ctx,task.ID,second.ID,api.UpdateWorkItemRequest{Revision:second.Revision,Description:&description},by);if e!=nil{panic(e)}
+other,e:=s.CreateTask(ctx,api.CreateTaskRequest{Name:"base other project"},by);if e!=nil{panic(e)}
+_,e=s.CreateWorkItem(ctx,other.ID,api.CreateWorkItemRequest{Kind:"bug",Title:"old not measured",RequestID:"base-unmeasured"},by);if e!=nil{panic(e)}
+handler,e:=s.AddAgent(ctx,task.ID,api.AddAgentRequest{Name:"persistent-handler",AgentID:api.NewID("agt"),Role:api.AgentRoleDatabaseHandler,Host:"fixture",Session:"handler",Runtime:"codex"},by);if e!=nil{panic(e)}
+_,e=s.PostMessage(ctx,task.ID,api.PostMessageRequest{To:handler.ID,RequestID:"base-shared-order",WorkItems:[]api.MessageWorkItem{{ItemTaskID:task.ID,ItemID:item.ID,ItemRevision:item.Revision,Relationship:"primary"},{ItemTaskID:task.ID,ItemID:second.ID,ItemRevision:2,Relationship:"related"}},Envelope:&api.Envelope{Kind:"request",To:handler.ID,Subject:"Synthetic handler bookkeeping",Body:api.EnvelopeBody{Ask:"Handle these two synthetic items"}}},by);if e!=nil{panic(e)}
+_,e=s.ReportActivity(ctx,task.ID,a.ID,api.ActivityReport{RequestID:"base-activity",RunID:a.RunID,Activity:api.AgentActivity{State:"working",ObservedAt:time.Now().UTC(),Tokens:api.TokenTotals{Input:100,Cached:80,Output:3,Total:103}}});if e!=nil{panic(e)}
+closed,e:=s.AddAgent(ctx,other.ID,api.AddAgentRequest{Name:"closed-retained",Host:"fixture",Session:"closed",Runtime:"codex"},by);if e!=nil{panic(e)};_,e=s.CloseAgent(ctx,closed.ID,by);if e!=nil{panic(e)}
+_,e=q.Exec("UPDATE agents SET cleanup_done=1 WHERE id=?",closed.ID);if e!=nil{panic(e)}
+_,e=q.Exec("INSERT INTO profiles VALUES('synthetic-usage-profile','synthetic-hash',1,'2026-09-27T00:00:00Z',x'010203'); INSERT INTO profile_history VALUES('synthetic-usage-profile',1,'2026-09-27T00:00:00Z',x'010203')");if e!=nil{panic(e)}
+q.Close()};if e=s.Close();e!=nil{panic(e)}}`
 	if err = os.WriteFile(helper, []byte(program), 0600); err != nil {
 		t.Fatal(err)
 	}
@@ -285,6 +296,23 @@ if os.Args[2]=="seed" {ctx:=context.Background();by:=api.Caller{Node:"fixture",U
 	if _, err = current.db.Exec(`INSERT INTO verification_records VALUES(?,?,1,'fixture','migration-fixture','fixture','{"fixture":"candidate"}')`, task, item); err != nil {
 		t.Fatal(err)
 	}
+
+	var metered api.Agent
+	metered, err = current.GetAgent(context.Background(), func() string {
+		var id string
+		current.db.QueryRow(`SELECT id FROM agents WHERE name='legacy'`).Scan(&id)
+		return id
+	}())
+	if err != nil {
+		t.Fatal(err)
+	}
+	turn := syntheticUsageTurn("migration-usage")
+	if _, err = current.ReportUsage(context.Background(), task, metered.ID, usageBatch(metered, "migration-metered", turn)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = current.SetUsagePrices(context.Background(), task, api.UsagePriceRequest{RequestID: "migration-prices", ExpectedRevision: 0, Rows: []api.UsagePrice{{Runtime: "codex", Model: turn.Model, Currency: "USD", EffectiveAt: turn.At, Rates: map[string]string{"input": "2"}}}}); err != nil {
+		t.Fatal(err)
+	}
 	current.Close()
 	t.Log("reopen migrated fixture with base binary")
 	runBase("reopen")
@@ -297,6 +325,48 @@ if os.Args[2]=="seed" {ctx:=context.Background();by:=api.Caller{Node:"fixture",U
 	var count int
 	if err = current.db.QueryRow(`SELECT count(*) FROM verification_records WHERE task_id=? AND item_id=?`, task, item).Scan(&count); err != nil || count != 1 {
 		t.Fatal("candidate evidence lost", count, err)
+	}
+
+	report, readErr := current.Usage(context.Background(), task, api.UsageQuery{})
+	if readErr != nil || report.Summary.Requests != 1 || report.Summary.Tokens["input"] != "21" || report.PriceRevision != 1 {
+		t.Fatal("usage/prices lost across base reopen", report, readErr)
+	}
+	for query, want := range map[string]int{`SELECT count(*) FROM tasks`: 2, `SELECT count(*) FROM work_items`: 3, `SELECT count(*) FROM agents WHERE role='database_handler'`: 1, `SELECT count(*) FROM agents WHERE status='closed' AND cleanup_done=1`: 1, `SELECT count(*) FROM agent_activity`: 1, `SELECT count(*) FROM profiles WHERE username='synthetic-usage-profile' AND hex(envelope)='010203'`: 1, `SELECT count(*) FROM profile_history WHERE username='synthetic-usage-profile'`: 1, `SELECT count(*) FROM work_item_changes WHERE revision=2`: 1} {
+		var got int
+		if e := current.db.QueryRow(query).Scan(&got); e != nil || got != want {
+			t.Fatal("retained fixture changed", query, got, want, e)
+		}
+	}
+	var secondItem string
+	if err = current.db.QueryRow(`SELECT id FROM work_items WHERE task_id=? AND title='base second item'`, task).Scan(&secondItem); err != nil {
+		t.Fatal("second fixture item lost", err)
+	}
+	var legacyCount, legacyRevision int
+	var legacyTask, legacyItem, legacyRelationship string
+	if err = current.db.QueryRow(`SELECT count(*),min(item_task_id),min(item_id),min(item_revision),min(relationship) FROM message_work_item_links WHERE message_task_id=?`, task).Scan(&legacyCount, &legacyTask, &legacyItem, &legacyRevision, &legacyRelationship); err != nil || legacyCount != 1 || legacyTask != task || legacyItem != item || legacyRevision != 1 || legacyRelationship != "primary" {
+		t.Fatal("legacy primary link changed", legacyCount, legacyTask, legacyItem, legacyRevision, legacyRelationship, err)
+	}
+	links, err := current.db.Query(`SELECT ordinal,item_task_id,item_id,item_revision,relationship FROM message_audit_links WHERE message_task_id=? ORDER BY ordinal`, task)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer links.Close()
+	for ordinal, want := range []struct {
+		item         string
+		revision     int
+		relationship string
+	}{{item, 1, "primary"}, {secondItem, 2, "related"}} {
+		if !links.Next() {
+			t.Fatal("audit projection link missing", ordinal, links.Err())
+		}
+		var gotOrdinal, revision int
+		var itemTask, linkedItem, relationship string
+		if err = links.Scan(&gotOrdinal, &itemTask, &linkedItem, &revision, &relationship); err != nil || gotOrdinal != ordinal || itemTask != task || linkedItem != want.item || revision != want.revision || relationship != want.relationship {
+			t.Fatal("audit projection link changed", gotOrdinal, itemTask, linkedItem, revision, relationship, want, err)
+		}
+	}
+	if links.Next() || links.Err() != nil {
+		t.Fatal("unexpected audit projection links", links.Err())
 	}
 	var integrity string
 	if err = current.db.QueryRow(`PRAGMA integrity_check`).Scan(&integrity); err != nil || integrity != "ok" {

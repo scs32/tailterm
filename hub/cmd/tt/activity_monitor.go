@@ -177,7 +177,28 @@ func relayActivityTick(ctx context.Context, b runtimeBinding, client *api.Client
 	if c.Run != b.Run || c.Thread != b.Thread {
 		c = activityCursor{Run: b.Run, Thread: b.Thread}
 	}
-	save := func() error { return writePrivateJSON(path, c) }
+	var u *usageCursor
+	if enabled, _ := ctx.Value(usageEnabledContextKey{}).(bool); enabled {
+		var usageErr error
+		u, usageErr = loadUsageCursor(b)
+		if usageErr != nil {
+			fmt.Fprintln(os.Stderr, "[tt relay] usage cursor unavailable:", usageErr)
+		}
+	}
+	save := func() error {
+		if u != nil {
+			if err := saveUsageCursor(u); err != nil {
+				return err
+			}
+		}
+		return writePrivateJSON(path, c)
+	}
+	// Metering failures never suppress activity transitions or alerts.
+	if u != nil && (len(u.Dirty) > 0 || u.Pending != nil || !u.Enrolled || u.Coverage != u.UploadedCoverage) {
+		if err := uploadUsage(ctx, u, client); err != nil {
+			fmt.Fprintln(os.Stderr, "[tt relay] usage upload deferred:", err)
+		}
+	}
 	if c.Ineligible {
 		return nil
 	}
@@ -256,7 +277,29 @@ func relayActivityTick(ctx context.Context, b runtimeBinding, client *api.Client
 		if b.Runtime == "claude" {
 			parse = parseClaudeActivity
 		}
-		transcriptReadErr = readActivityAppend(transcript, &c, parse)
+		transcriptReadErr = readActivityAppend(transcript, &c, func(line []byte, cursor *activityCursor) error {
+			var usageParseErr error
+			if u != nil {
+				if len(u.Dirty) < 512 {
+					usageParseErr = u.parse(line)
+				} else {
+					u.Coverage = "partial: usage outbox capacity exceeded"
+				}
+			}
+			activityParseErr := parse(line, cursor)
+			if usageParseErr != nil {
+				u.Coverage = "partial: malformed usage record"
+			}
+			return activityParseErr
+		})
+		if u != nil && c.Skipping {
+			u.Coverage = "partial: oversized transcript record"
+		}
+		if u != nil {
+			if err := freezeUsageBatch(u); err != nil {
+				fmt.Fprintln(os.Stderr, "[tt relay] usage batch freeze deferred:", err)
+			}
+		}
 		if transcriptReadErr != nil {
 			c.Unknown = true
 			c.Ready = false

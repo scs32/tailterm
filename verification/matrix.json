@@ -226,6 +226,10 @@
     {
       "file": "tests/work-items-scroll-browser.mjs",
       "mode": "both"
+    },
+    {
+      "file": "tests/usage-browser.mjs",
+      "mode": "both"
     }
   ],
   "excludedBrowserSuites": [

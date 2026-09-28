@@ -1,0 +1,98 @@
+.project-usage {
+  border-top: 1px solid var(--border, #343434);
+  margin-top: 0.7rem;
+  padding-top: 0.6rem;
+}
+.project-usage summary {
+  cursor: pointer;
+  font-size: 0.85rem;
+}
+.usage-controls {
+  display: flex;
+  gap: 0.4rem;
+  align-items: end;
+  flex-wrap: wrap;
+  margin: 0.6rem 0;
+}
+.usage-controls label,
+.usage-price-row label {
+  display: grid;
+  gap: 0.2rem;
+  font-size: 0.75rem;
+}
+.usage-controls input,
+.usage-controls button,
+.usage-price-row input,
+.usage-price-row select {
+  height: 1.9rem;
+  box-sizing: border-box;
+}
+.usage-controls input::placeholder,
+.usage-price-row input::placeholder {
+  color: var(--muted, #888);
+}
+.usage-items {
+  display: grid;
+  gap: 0.35rem;
+  min-width: 0;
+}
+.usage-item {
+  border: 1px solid var(--border, #343434);
+  border-radius: 4px;
+  padding: 0.45rem;
+  overflow-wrap: anywhere;
+}
+.usage-item:hover {
+  outline: 1px solid var(--border, #555);
+}
+.usage-item[open] {
+  background: var(--selection-background, #ffffff08);
+}
+.usage-item p {
+  margin: 0.35rem 0;
+  font-size: 0.75rem;
+  color: var(--muted, #999);
+}
+.usage-breakdown {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.75rem;
+}
+.usage-breakdown td {
+  padding: 0.25rem;
+  vertical-align: top;
+  overflow-wrap: anywhere;
+}
+.usage-price-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+  padding: 0.45rem 0;
+}
+.usage-price-row input {
+  max-width: 11rem;
+  width: 100%;
+}
+.usage-price-row label {
+  flex: 1 1 5.5rem;
+  min-width: 0;
+}
+.usage-price-row .usage-model {
+  flex-basis: 10rem;
+}
+.usage-prices-actions {
+  display: flex;
+  gap: 0.4rem;
+  margin-top: 0.5rem;
+}
+@media (max-width: 600px) {
+  .usage-breakdown td {
+    display: block;
+  }
+  .usage-controls label {
+    flex: 1 1 8rem;
+  }
+  .usage-controls input {
+    width: 100%;
+  }
+}

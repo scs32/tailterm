@@ -9,15 +9,22 @@ import assert from "node:assert/strict";
 const source = await readFile(
   new URL("../client/queue-view.js", import.meta.url),
 );
+const ownerObligations = await readFile(
+  new URL("../client/owner-obligations.js", import.meta.url),
+);
 const server = createServer((request, response) => {
-  response.setHeader(
-    "content-type",
-    request.url === "/queue.js" ? "text/javascript" : "text/html",
-  );
-  response.end(
+  const moduleSource =
     request.url === "/queue.js"
       ? source
-      : '<main id="root"></main><dialog id="dialog"></dialog>',
+      : request.url === "/owner-obligations.js"
+        ? ownerObligations
+        : null;
+  response.setHeader(
+    "content-type",
+    moduleSource ? "text/javascript" : "text/html",
+  );
+  response.end(
+    moduleSource ?? '<main id="root"></main><dialog id="dialog"></dialog>',
   );
 });
 server.listen(0, "127.0.0.1");

@@ -1,3 +1,4 @@
+import { createUsageView } from "./usage-view.js";
 import { startOwnerAgeClock } from "./owner-obligations.js";
 // Projects mode: start and manage tasks. Lists open and closed projects with their
 // agents, and offers attach, board, add agent, and close actions.
@@ -38,6 +39,7 @@ export function createTasksView({
   openWorkItems,
   configure,
 }) {
+  const usageView = createUsageView({ client, notice });
   let root = null,
     details = [],
     subscription = null,
@@ -172,6 +174,7 @@ export function createTasksView({
       );
   }
   function hide() {
+    usageView.dispose();
     stopOwnerClock?.();
     const wasVisible = visible;
     visible = false;
@@ -333,7 +336,8 @@ export function createTasksView({
           "",
         )}</div><footer class="task-actions"><span class="fine">${resumePending ? "Fresh-team launch incomplete" : task.allowAgentSpawn ? "Helpers allowed" : "Helpers off"}</span><button data-task-board="${esc(task.id)}">Open board →</button><button data-task-add="${esc(task.id)}" ${resumePending ? "disabled" : ""}>＋ Add agent</button><button data-task-lead="${esc(task.id)}" ${resumePending ? "disabled" : ""}>Replace lead</button>${!resumePending && (!handler || handler.status === "exited" || (!handler.online && !["retired", "closed"].includes(handler.status))) ? `<button data-handler-setup="${esc(task.id)}">${handler ? (handler.status === "exited" ? "Restart" : "Check") : "Set up"} database handler</button>` : ""}${openWorkItems ? `<button data-project-bugs="${esc(task.id)}">Bugs</button><button data-project-features="${esc(task.id)}">Features</button>` : ""}<div class="task-more"><button type="button" data-task-more="${esc(task.id)}" aria-expanded="false" aria-controls="task-menu-${esc(task.id)}">More</button><div id="task-menu-${esc(task.id)}" class="task-menu" popover="auto" aria-label="More project actions"><button data-task-attach="${esc(task.id)}">Open terminals</button><button data-task-settings="${esc(task.id)}">Settings</button><button data-task-pause="${esc(task.id)}" data-testid="pause-project" ${pauseState === "active" && !resumePending ? "" : `disabled aria-disabled="true" title="${resumePending ? "Finish the saved Resume first" : "Update the hub to projectPause v1"}"`}>Pause project…</button>${pauseState === "legacy" ? '<span class="fine" data-testid="pause-project-legacy">Pause unavailable · hub update required</span>' : ""}<button data-task-close="${esc(task.id)}" class="danger">Close project</button></div></div></footer></article>${renderTeamDelivery(deliveries.get(task.id), agents, ownerRequests.get(task.id), task.id)}`;
     };
-    root.innerHTML = `<div class="board mode-board tasks-view"><aside class="board-rail"><div class="board-rail-head"><span class="eyebrow">PROJECTS</span><button id="tasks-new" title="New project" aria-label="New project">＋</button></div>${open.map(projectButton).join("")}${closed.length ? `<details class="board-closed tasks-closed" data-view-disclosure="closed" ${current?.task.status !== "open" ? "open" : ""}><summary>Closed · ${closed.length}</summary>${closed.map(projectButton).join("")}</details>` : ""}</aside><section class="board-thread tasks-detail">${detail(current)}</section></div>`;
+    root.innerHTML = `<div class="board mode-board tasks-view"><aside class="board-rail"><div class="board-rail-head"><span class="eyebrow">PROJECTS</span><button id="tasks-new" title="New project" aria-label="New project">＋</button></div>${open.map(projectButton).join("")}${closed.length ? `<details class="board-closed tasks-closed" data-view-disclosure="closed" ${current?.task.status !== "open" ? "open" : ""}><summary>Closed · ${closed.length}</summary>${closed.map(projectButton).join("")}</details>` : ""}</aside><section class="board-thread tasks-detail">${detail(current)}${current ? "<div data-project-usage></div>" : ""}</section></div>`;
+    usageView.mount(root.querySelector("[data-project-usage]"), selected);
     presentation.afterRender(selected);
     bindTeamDisclosure(selected);
     root.querySelectorAll("[data-task-select]").forEach(

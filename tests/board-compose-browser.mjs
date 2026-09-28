@@ -450,7 +450,23 @@ try {
       assert.equal(auditMutationAttempts.at(-1).body.expectedRevision, 1);
       assert.equal(auditMutationAttempts.at(-1).body.newItem.kind, "feature");
 
-      await selectAuditKind(page, "work");
+      await page
+        .locator(".board-intent-recovery", { hasText: "Uncertain resolve" })
+        .waitFor({ state: "detached" });
+      const auditDetails = page.locator("details.board-audit-compose");
+      if (!(await auditDetails.evaluate((element) => element.open))) {
+        await auditDetails.locator(":scope > summary").click();
+      }
+      await page.waitForFunction(() => {
+        const details = document.querySelector("details.board-audit-compose");
+        const select = document.querySelector("#board-audit-kind");
+        const work = select?.querySelector('option[value="work"]');
+        return details?.open && !select?.disabled && work && !work.disabled;
+      });
+      await page.locator("#board-audit-kind").selectOption("work");
+      await page.waitForFunction(
+        () => document.querySelector("#board-audit-kind")?.value === "work",
+      );
       await page.locator("#board-primary-task").fill(fixture.task.id);
       await page.locator("#board-primary-item").fill(fixture.primary.id);
       await page

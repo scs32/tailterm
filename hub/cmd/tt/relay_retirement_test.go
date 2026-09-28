@@ -446,8 +446,8 @@ func TestRelayRetirementLiveBindingRequestCounts(t *testing.T) {
 		t.Logf("%-70s %d", k, counts[k])
 	}
 	t.Logf("TOTAL requests in one --once pass: %d", total)
-	if total != 10 {
-		t.Errorf("first unexamined pass=%d, want base8 plus one initial probe per binding", total)
+	if total != 11 {
+		t.Errorf("first unexamined pass=%d, want base8 plus one initial probe per binding and one cached host usage discovery", total)
 	}
 	// Reset delivery/activity cadence to the same first-pass conditions, keeping
 	// only the saved probe deadline: the repeated --once must add no agent reads.

@@ -4,16 +4,39 @@ if (!["chromium", "webkit"].includes(engine))
   throw new Error("Unknown TEST_BROWSER");
 const selectedBrowser = engine === "webkit" ? webkit : chromium;
 import { readFile } from "node:fs/promises";
+import { createServer } from "node:http";
+import { once } from "node:events";
 import assert from "node:assert/strict";
-const browser = await selectedBrowser.launch();
+const stylesheets = new Map([
+  ["/client/style.css", await readFile("client/style.css", "utf8")],
+  ["/client/usage.css", await readFile("client/usage.css", "utf8")],
+]);
+const cssLoads = new Set();
+const html = '<button id="action" title="Workspace action" aria-describedby="existing-help">Action</button><span id="existing-help">Help</span><button id="keys" title="SSH keys">Keys</button><button id="diagnostics" title="Connection diagnostics">Diagnostics</button><button id="tab" title="Workspace tab">Tab</button><div class="xterm"><div id="rows"></div></div>';
+const server = createServer((request, response) => {
+  if (request.url === "/") {
+    response.writeHead(200, { "content-type": "text/html" });
+    response.end(html);
+  } else if (stylesheets.has(request.url)) {
+    cssLoads.add(request.url);
+    response.writeHead(200, { "content-type": "text/css" });
+    response.end(stylesheets.get(request.url));
+  } else {
+    response.writeHead(404);
+    response.end();
+  }
+});
+server.listen(0, "127.0.0.1");
+await once(server, "listening");
+const origin = `http://127.0.0.1:${server.address().port}`;
+let browser;
 try {
+  browser = await selectedBrowser.launch();
   const page = await browser.newPage();
-  await page.setContent(
-    '<button id="action" title="Workspace action" aria-describedby="existing-help">Action</button><span id="existing-help">Help</span><button id="keys" title="SSH keys">Keys</button><button id="diagnostics" title="Connection diagnostics">Diagnostics</button><button id="tab" title="Workspace tab">Tab</button><div class="xterm"><div id="rows"></div></div>',
-  );
-  await page.addStyleTag({
-    content: await readFile("client/style.css", "utf8"),
-  });
+  await page.goto(origin);
+  await page.addStyleTag({ url: `${origin}/client/style.css` });
+  assert.ok(cssLoads.has("/client/style.css"), "style.css was not loaded");
+  assert.ok(cssLoads.has("/client/usage.css"), "usage.css import was not loaded");
   const source = await readFile("client/tooltips.js", "utf8");
   await page.addScriptTag({
     content:
@@ -92,5 +115,13 @@ try {
       "Terminal redraws must not trigger tooltip subtree scans",
     );
 } finally {
-  await browser.close();
+  try {
+    await browser?.close();
+  } finally {
+    await new Promise((resolve, reject) =>
+      server.close((error) => (error ? reject(error) : resolve())),
+    );
+  }
+  assert.equal(server.listening, false);
+  console.log("Isolated tooltip browser and CSS server closed.");
 }

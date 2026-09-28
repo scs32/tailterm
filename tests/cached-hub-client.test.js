@@ -92,7 +92,11 @@ test("routine saved-status transitions do not notify views, but data and errors 
     view.subscribe("", () => notifications++);
     await view.refreshConnection();
     await settle();
-    assert.equal(notifications, 0, "unchanged save and refresh labels are quiet");
+    assert.equal(
+      notifications,
+      0,
+      "unchanged save and refresh labels are quiet",
+    );
 
     f.response({ tasks: [{ id: "one", name: "Updated project" }] });
     await view.refreshConnection();
@@ -102,7 +106,11 @@ test("routine saved-status transitions do not notify views, but data and errors 
     f.offline();
     await view.refreshConnection();
     await settle();
-    assert.equal(notifications, 2, "visible offline status still notifies views");
+    assert.equal(
+      notifications,
+      2,
+      "visible offline status still notifies views",
+    );
   } finally {
     view.dispose();
   }
@@ -453,4 +461,35 @@ test("disposing during an exact audit bootstrap rejects the late projection", as
     current: { revision: 1, classification: "intake", workItems: [] },
   });
   await assert.rejects(pending, /locked|disposed/i);
+});
+
+test("Usage saves presentation reads offline and optional old-hub errors leave Projects usable", async () => {
+  const f = fixture(),
+    view = f.make();
+  try {
+    f.response({
+      version: 1,
+      projectId: "synthetic",
+      items: [],
+      priceRevision: 0,
+    });
+    assert.equal((await view.getUsage("synthetic")).version, 1);
+    f.offline();
+    assert.equal((await view.getUsage("synthetic")).projectId, "synthetic");
+    assert.match(view.cacheStatus().label, /offline/);
+  } finally {
+    view.dispose();
+  }
+  const g = fixture(),
+    old = g.make();
+  try {
+    g.status(404);
+    await assert.rejects(old.getUsage("missing"));
+    g.status(200);
+    g.response({ tasks: [{ id: "synthetic", name: "Project usable" }] });
+    assert.equal((await old.listTasks())[0].name, "Project usable");
+    assert.doesNotMatch(old.cacheStatus().label, /offline/);
+  } finally {
+    old.dispose();
+  }
 });

@@ -87,6 +87,7 @@ func TestRelayClearsRecoveredErrorAndLogsSameFailureAgain(t *testing.T) {
 	t.Setenv("TAILTERM_RUN", "")
 	var down atomic.Bool
 	down.Store(true)
+	var capabilityReads atomic.Int32
 	b := runtimeBinding{Task: "tsk_0000000000000001", Agent: "agt_0000000000000001", Run: "run_0000000000000001", Thread: "00000000-0000-4000-8000-000000000001", Codex: queuePath}
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if down.Load() {
@@ -95,6 +96,9 @@ func TestRelayClearsRecoveredErrorAndLogsSameFailureAgain(t *testing.T) {
 		}
 		w.Header().Set("Content-Type", "application/json")
 		switch {
+		case r.URL.Path == "/v1/capabilities":
+			capabilityReads.Add(1)
+			http.NotFound(w, r) // This fixture models a hub without usage support.
 		case r.URL.Path == "/v1/team-queues":
 			_, _ = w.Write([]byte(`{"entries":[]}`))
 		case strings.HasSuffix(r.URL.Path, "/pause"):
@@ -155,6 +159,9 @@ func TestRelayClearsRecoveredErrorAndLogsSameFailureAgain(t *testing.T) {
 	if got := strings.Count(bindingLogs, "[tt relay] "+b.Agent+": "); got != 2 {
 		t.Fatalf("binding error log entries = %d, want 2: %s", got, bindingLogs)
 	}
+	if got := capabilityReads.Load(); got != 1 {
+		t.Fatalf("capability discovery requests = %d, want 1 after recovery", got)
+	}
 }
 
 func TestRelayClearsErrorOnOtherSuccessfulPaths(t *testing.T) {
@@ -176,9 +183,13 @@ func TestRelayClearsErrorOnOtherSuccessfulPaths(t *testing.T) {
 			}
 			b := runtimeBinding{Task: "tsk_0000000000000001", Agent: "agt_0000000000000001", Run: "run_0000000000000001", Thread: "00000000-0000-4000-8000-000000000001", Codex: queuePath}
 			var reports atomic.Int32
+			var capabilityReads atomic.Int32
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				w.Header().Set("Content-Type", "application/json")
 				switch {
+				case r.URL.Path == "/v1/capabilities":
+					capabilityReads.Add(1)
+					http.NotFound(w, r) // This fixture models a hub without usage support.
 				case r.URL.Path == "/v1/team-queues":
 					_, _ = w.Write([]byte(`{"entries":[]}`))
 				case strings.HasSuffix(r.URL.Path, "/pause"):
@@ -239,6 +250,9 @@ func TestRelayClearsErrorOnOtherSuccessfulPaths(t *testing.T) {
 			} else if !os.IsNotExist(err) || reports.Load() != 0 {
 				t.Fatalf("%s unexpectedly queued: %q err=%v reports=%d", path, queueData, err, reports.Load())
 			}
+			if got := capabilityReads.Load(); got != 1 {
+				t.Fatalf("%s capability discovery requests = %d, want 1", path, got)
+			}
 		})
 	}
 }
@@ -259,10 +273,13 @@ func TestRelayActivityFailureLeavesQueueAndInboxDeliveryWorking(t *testing.T) {
 		t.Fatal(err)
 	}
 	b := runtimeBinding{Task: "tsk_0000000000000001", Agent: "agt_0000000000000001", Run: "run_0000000000000001", Thread: "00000000-0000-4000-8000-000000000001", Codex: queuePath, CreatedAt: time.Now().UTC()}
-	var teamTicks, agentReads atomic.Int32
+	var teamTicks, agentReads, capabilityReads atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		switch {
+		case r.URL.Path == "/v1/capabilities":
+			capabilityReads.Add(1)
+			http.NotFound(w, r) // This fixture models a hub without usage support.
 		case r.URL.Path == "/v1/team-queues":
 			teamTicks.Add(1)
 			_, _ = w.Write([]byte(`{"entries":[]}`))
@@ -296,6 +313,9 @@ func TestRelayActivityFailureLeavesQueueAndInboxDeliveryWorking(t *testing.T) {
 	}
 	if data, err := os.ReadFile(queueLog); err != nil || !strings.Contains(string(data), "queued") {
 		t.Fatalf("inbox delivery lost: %q %v stderr=%q", data, err, stderr)
+	}
+	if got := capabilityReads.Load(); got != 1 {
+		t.Fatalf("capability discovery requests = %d, want 1", got)
 	}
 }
 

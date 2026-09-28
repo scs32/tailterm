@@ -40,6 +40,10 @@ const queueViewPath = path.join(artifactDir, "fixture-queue-view.js");
 const fixtureScriptPath = path.join(artifactDir, "fixture.js");
 writeFileSync(queueStylePath, queueCSS);
 writeFileSync(queueViewPath, queueView);
+writeFileSync(
+  path.join(artifactDir, "owner-obligations.js"),
+  readFileSync(new URL("../client/owner-obligations.js", import.meta.url)),
+);
 
 const scenarios = [
   { name: "narrow-320", width: 320, height: 720, deviceScaleFactor: 1 },

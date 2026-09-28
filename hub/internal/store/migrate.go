@@ -426,6 +426,9 @@ CREATE INDEX IF NOT EXISTS agent_allocation_intents_item ON agent_allocation_int
 	if err := migrateDeliveryFollowThrough(db); err != nil {
 		return err
 	}
+	if err := migrateUsage(db); err != nil {
+		return err
+	}
 	if err := migrateActivity(db); err != nil {
 		return err
 	}
