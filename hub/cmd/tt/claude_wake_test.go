@@ -611,7 +611,7 @@ func startLiveClaude(t *testing.T, suggestions bool) *liveClaude {
 	for deadline := time.Now().Add(30 * time.Second); ; time.Sleep(300 * time.Millisecond) {
 		screen = lc.capture(false)
 		if raw := lc.capture(true); strings.Contains(raw, "❯") {
-			if plain, err := claudePlainScreen(raw); err == nil && emptyClaudeInput(plain) {
+			if _, plain, err := claudePlainScreen(raw); err == nil && emptyClaudeInput(plain) {
 				break
 			}
 		}
@@ -860,4 +860,23 @@ func TestClaudeWakeLivePromptSuggestion(t *testing.T) {
 	t.Logf("k5 live typed: message=#%d %s", typed.Seq, lc.status(p))
 	t.Logf("relay log: %s", strings.TrimSpace(out))
 	lc.tmux("send-keys", "-t", lc.session, "C-u")
+}
+
+// Review f2: dialogs are detected on the full screen, before faint text is
+// dropped from the input area.
+func TestClaudeInputFaintDialogTextStillRefuses(t *testing.T) {
+	rule := "\x1b[38;5;244m────────────────\n"
+	for _, tc := range []struct {
+		name, raw string
+		cursorX   int
+	}{
+		{"faint Esc to cancel under a selection menu", "Allow Bash?\n\x1b[39m❯ 1. Yes\n  2. No\n\x1b[2mEsc to cancel\x1b[0m\n", 2},
+		{"faint selection text on an otherwise empty input", rule + "\x1b[39m❯ \x1b[2mSelect an option (y/n)\x1b[0m\n" + rule, 2},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := claudeInputScreen(tc.raw, tc.cursorX, 1, ""); err == nil || !strings.Contains(err.Error(), "permission or selection prompt") {
+				t.Fatalf("faint dialog text was not refused as a prompt: %v", err)
+			}
+		})
+	}
 }

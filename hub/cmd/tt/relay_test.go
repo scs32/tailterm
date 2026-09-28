@@ -990,3 +990,61 @@ func TestRelaySkipStatusShowsLastSkip(t *testing.T) {
 		}
 	}
 }
+
+// k3 review f1: a message left to broker wake jobs is a deferral, not a skip.
+// After a confirmed broker wake, and inside the broker spacing before a job
+// is leased, the inbox path records and logs nothing.
+func TestRelaySkipNotRecordedForBrokerDeferral(t *testing.T) {
+	b, hub, c, pane := needsInputFixture(t)
+	notice := func(seq int64) api.Message {
+		return api.Message{Seq: seq, To: b.Agent, From: api.Sender{AgentID: needsInputHandler}, Envelope: &api.Envelope{Kind: api.EnvelopeKindNotice, Subject: "Handler notice for the waiting lead"}}
+	}
+	hub.update(func(h *needsInputHub) {
+		h.agent.ReadUpTo, h.agent.Unread = 101, 1
+		h.messages = []api.Message{notice(102)}
+		h.jobs = []api.WakeJob{{ID: "wake_0123456789abcdef", LeaseToken: "lease", MessageSeq: 102, AgentID: b.Agent, RunID: b.Run, Prompt: "Tailterm broker: #102 notice."}}
+	})
+	var p relayProgress
+	now := time.Date(2026, 9, 28, 16, 0, 0, 0, time.UTC)
+	pass := func(at time.Duration) string {
+		t.Helper()
+		out, err := captureRelayOutput(t, true, func() error { return relayPass(b, &p, c, now.Add(at), pane.queue) })
+		if err != nil {
+			t.Fatal(err)
+		}
+		return out
+	}
+	if out := pass(0); out != "" || len(pane.sent) != 1 || p.Wake == nil || p.Wake.Status != "confirmed" {
+		t.Fatalf("broker wake: sent=%q wake=%+v log=%q", pane.sent, p.Wake, out)
+	}
+	// The reviewer's probe: the agent has not read #102 yet 3 and 20 seconds on.
+	for _, at := range []time.Duration{3 * time.Second, 20 * time.Second} {
+		if out := pass(at); out != "" || p.Skip != nil {
+			t.Fatalf("false skip %v after a confirmed broker wake: %+v log=%q", at, p.Skip, out)
+		}
+	}
+	// A new broker-covered message inside the 15-second broker spacing, before
+	// its job is leased, is deferred without a skip.
+	p.LastBrokerWake = now.Add(25 * time.Second)
+	hub.update(func(h *needsInputHub) {
+		h.agent.Unread = 2
+		h.messages = append(h.messages, notice(103))
+		h.jobs = []api.WakeJob{{ID: "wake_00000000000000ab", LeaseToken: "lease", MessageSeq: 103, AgentID: b.Agent, RunID: b.Run, Prompt: "Tailterm broker: #103 notice."}}
+	})
+	if out := pass(30 * time.Second); out != "" || p.Skip != nil || len(pane.sent) != 1 {
+		t.Fatalf("broker spacing recorded a skip: %+v sent=%q log=%q", p.Skip, pane.sent, out)
+	}
+	if out := pass(45 * time.Second); len(pane.sent) != 2 || !strings.Contains(pane.sent[1], "#103") || out != "" {
+		t.Fatalf("leased job after spacing: sent=%q log=%q", pane.sent, out)
+	}
+	// An unsafe broker attempt is still recorded with its sequence.
+	pane.busy = true
+	hub.update(func(h *needsInputHub) {
+		h.agent.Unread = 3
+		h.messages = append(h.messages, notice(104))
+		h.jobs = []api.WakeJob{{ID: "wake_00000000000000ac", LeaseToken: "lease", MessageSeq: 104, AgentID: b.Agent, RunID: b.Run, Prompt: "Tailterm broker: #104 notice."}}
+	})
+	if out := pass(time.Minute + 5*time.Second); p.Skip == nil || fmt.Sprint(p.Skip.MessageSeqs) != "[104]" || !strings.Contains(p.Skip.Reason, "not safely idle") || !strings.Contains(out, "wake skipped") {
+		t.Fatalf("unsafe broker wake skip: %+v log=%q", p.Skip, out)
+	}
+}

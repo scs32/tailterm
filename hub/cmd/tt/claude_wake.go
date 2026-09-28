@@ -270,11 +270,12 @@ func nativeClaudeInspect(ctx context.Context, b runtimeBinding, expected string)
 // the start of an empty input, and only the screen from the cursor row down
 // is returned.
 func claudeInputScreen(raw string, cursorX, cursorY int, expected string) (string, error) {
-	visible, err := claudePlainScreen(raw)
+	full, visible, err := claudePlainScreen(raw)
 	if err != nil {
 		return "", err
 	}
-	if claudeBlockedScreen(visible) {
+	// Dialogs are detected on everything drawn, faint text included.
+	if claudeBlockedScreen(full) {
 		return "", errors.New("Claude pane has a permission or selection prompt")
 	}
 	if expected == "" {
@@ -295,14 +296,14 @@ type claudeCell struct {
 	faint bool
 }
 
-// claudePlainScreen strips SGR attributes from a capture and drops the faint
-// text Claude Code draws after the input marker: its prompt suggestion and its
-// Try "…" placeholder, neither of which is input (Claude Code 2.1.284 draws
-// both with SGR 2 and removes the suggestion as soon as a key is typed; see
+// claudePlainScreen strips SGR attributes from a capture. It returns the full
+// text and a copy without the faint text Claude Code draws after the input
+// marker: its prompt suggestion and its Try "…" placeholder, neither of
+// which is input (Claude Code 2.1.284 draws both with SGR 2 and removes the suggestion as soon as a key is typed; see
 // testdata/claude-pane). Faint text must be a trailing run: faint text followed
 // by normal text, or any escape other than SGR in the input area, fails closed.
 // Attributes carry across rows, as tmux emits only changes.
-func claudePlainScreen(raw string) (string, error) {
+func claudePlainScreen(raw string) (string, string, error) {
 	var rows [][]claudeCell
 	var bad []bool
 	var row []claudeCell
@@ -320,7 +321,7 @@ func claudePlainScreen(raw string) (string, error) {
 				j++
 			}
 			if j >= len(raw) {
-				return "", errors.New("Claude pane capture has a truncated escape")
+				return "", "", errors.New("Claude pane capture has a truncated escape")
 			}
 			if raw[j] != 'm' || !applyClaudeSGR(raw[i+2:j], &faint) {
 				rowBad = true
@@ -333,7 +334,7 @@ func claudePlainScreen(raw string) (string, error) {
 				j++
 			}
 			if j >= len(raw) {
-				return "", errors.New("Claude pane capture has a truncated escape")
+				return "", "", errors.New("Claude pane capture has a truncated escape")
 			}
 			if raw[j] == 0x1b {
 				j++
@@ -360,6 +361,7 @@ func claudePlainScreen(raw string) (string, error) {
 	for i, cells := range rows {
 		lines[i] = claudeCellText(cells)
 	}
+	full := strings.Join(lines, "\n")
 	if input >= 0 {
 		// The input area runs from the marker row to Claude's lower border.
 		end := input + 1
@@ -369,7 +371,7 @@ func claudePlainScreen(raw string) (string, error) {
 		seenFaint := false
 		for i := input; i < end; i++ {
 			if bad[i] {
-				return "", errors.New("Claude input has unknown terminal attributes")
+				return "", "", errors.New("Claude input has unknown terminal attributes")
 			}
 			start := 0
 			if i == input {
@@ -388,7 +390,7 @@ func claudePlainScreen(raw string) (string, error) {
 				if cell.faint && !seenFaint {
 					seenFaint, cut = true, k
 				} else if !cell.faint && seenFaint {
-					return "", errors.New("Claude input mixes faint and typed text")
+					return "", "", errors.New("Claude input mixes faint and typed text")
 				}
 			}
 			if cut >= 0 {
@@ -396,7 +398,7 @@ func claudePlainScreen(raw string) (string, error) {
 			}
 		}
 	}
-	return strings.Join(lines, "\n"), nil
+	return full, strings.Join(lines, "\n"), nil
 }
 
 func claudeCellText(cells []claudeCell) string {

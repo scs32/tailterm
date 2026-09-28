@@ -583,15 +583,13 @@ func relayOne(ctx context.Context, b runtimeBinding, p *relayProgress, c *api.Cl
 	}
 	_, eligible := wakeThrough(eligibleMsgs, b.Agent)
 	if !eligible {
+		// Nothing is held back here. The page holds input already delivered,
+		// messages that broker wake jobs deliver, or messages that never wake
+		// (own posts, hub notices). Leaving a message to the broker is a
+		// deferral, not a skip: the broker path records its own failed or
+		// unsafe attempts with their sequences, and an unsafe one returns the
+		// message to this path.
 		p.Through = max(p.Through, through)
-		if len(msgs) == 0 {
-			return nil // unread input was already delivered; the agent has not read it yet
-		}
-		if seqs := wakeSeqs(msgs, b.Agent); len(seqs) > 0 {
-			recordRelaySkip(p, b.Agent, "broker-covered; left to broker wake jobs", seqs, 0, 0, now)
-		} else {
-			recordRelaySkip(p, b.Agent, "no wake-eligible unread messages (own posts or hub notices)", nil, max(a.ReadUpTo, through), a.Unread, now)
-		}
 		return nil
 	}
 	seqs := wakeSeqs(eligibleMsgs, b.Agent)
