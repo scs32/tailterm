@@ -393,6 +393,13 @@ try {
         await page.mouse.up();
         await expect(page.locator(".board-head h2")).toHaveText(other.task.name);
         await page.locator(`[data-board-task="${p.task.id}"]`).focus();
+        // A background render between focus and Enter must keep the keyboard
+        // position (wi_a9a69169f732121d): force one deterministically.
+        const focusedRail = await page.evaluateHandle(() => document.activeElement);
+        await page.evaluate(() => qa.board.reload());
+        await page.waitForFunction(element => !element.isConnected, focusedRail);
+        assert.equal(await page.evaluate(() => document.activeElement?.dataset.boardTask), p.task.id,
+          "a Board render dropped keyboard focus from the Decision project");
         await page.keyboard.press("Enter");
         await expect(page.locator(".board-head h2")).toHaveText(p.task.name);
         await expect(page.locator("#board-messages")).toContainText(marker);
@@ -436,12 +443,12 @@ try {
       const history = page.locator(".decision-history"), panel = page.locator("#board-decisions");
       if (!(await history.evaluate(el => el.open))) await history.locator("summary").click();
       await page.locator("#board-text").focus();
-      await expect.poll(() => panel.evaluate(el => {
+      // Keep the value from the read that passed: a second locator read can land on
+      // a panel detached by a background render and see 0 (wi_a9a69169f732121d).
+      let scroll = 0;
+      await expect.poll(async () => (scroll = await panel.evaluate(el => {
         el.scrollTop = Math.min(180, el.scrollHeight - el.clientHeight); return el.scrollTop;
-      })).toBeGreaterThan(0);
-      const scroll = await panel.evaluate(el => {
-        el.scrollTop = Math.min(180, el.scrollHeight - el.clientHeight); return el.scrollTop;
-      });
+      }))).toBeGreaterThan(0);
       assert.ok(scroll > 0, "fixture must exercise a scrollable decision panel");
       await page.evaluate(() => qa.board.reload());
       await expect.poll(() => history.evaluate(el => el.open)).toBe(true);

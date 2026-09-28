@@ -25,6 +25,10 @@ let web;
 let hub;
 let loseNextAction = false;
 const actionAttempts = [];
+// Deterministic lost-response ordering (wi_a9a69169f732121d): the synthetic 503
+// is held until the page's event-driven refresh has started a new Queue read.
+let queueReadsStarted = 0;
+const orderingFailures = [];
 const pause = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 async function freePort() {
@@ -143,6 +147,8 @@ try {
         return;
       }
       if (url.pathname.startsWith("/v1/")) {
+        if (request.method === "GET" && /\/queue$/.test(url.pathname))
+          queueReadsStarted++;
         const chunks = [];
         for await (const chunk of request) chunks.push(chunk);
         const raw = Buffer.concat(chunks);
@@ -160,6 +166,13 @@ try {
         const text = await upstream.text();
         if (isAction && loseNextAction) {
           loseNextAction = false;
+          const committedReads = queueReadsStarted;
+          for (let i = 0; i < 200 && queueReadsStarted === committedReads; i++)
+            await pause(25);
+          if (queueReadsStarted === committedReads)
+            orderingFailures.push(
+              "no Queue refresh started after the lost action committed",
+            );
           response.writeHead(503, { "content-type": "application/json" });
           response.end(
             JSON.stringify({ error: "Synthetic lost Queue response" }),
@@ -270,6 +283,11 @@ try {
       await page
         .getByText("Synthetic lost Queue response", { exact: true })
         .waitFor();
+      assert.deepEqual(
+        orderingFailures,
+        [],
+        "lost-response ordering was not exercised",
+      );
       await page.getByRole("button", { name: "Retry exact request" }).click();
       await page.waitForFunction(
         () => !document.querySelector("[data-queue-retry-intent]"),

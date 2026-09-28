@@ -313,11 +313,43 @@ try {
       const input = page.locator("#board-text");
       const sendButton = page.locator("#board-compose button[type=submit]");
       await input.waitFor();
+      let renderChecked = false;
+      const focusedControl = () =>
+        page.evaluate(() => {
+          const element = document.activeElement;
+          if (!element?.closest("#mode-view") || element.id === "board-text")
+            return "";
+          return [
+            element.tagName,
+            element.id,
+            element.dataset.boardTask || "",
+            element.textContent.trim(),
+          ].join("|");
+        });
       for (let step = 0; step < 40; step++) {
         if (await input.evaluate((element) => element === document.activeElement))
           break;
         await page.keyboard.press("Tab");
+        const control = renderChecked ? "" : await focusedControl();
+        if (control) {
+          // A background Board render must keep the keyboard position
+          // (wi_a9a69169f732121d): force one on the first Board control the
+          // walk reaches before the composer.
+          renderChecked = true;
+          const focused = await page.evaluateHandle(() => document.activeElement);
+          await page.evaluate(() => window.qa.board.reload());
+          await page.waitForFunction((element) => !element.isConnected, focused);
+          assert.equal(
+            await focusedControl(),
+            control,
+            `${name}: a Board render dropped keyboard focus from ${control}`,
+          );
+        }
       }
+      assert.ok(
+        renderChecked,
+        `${name}: the Tab walk must reach a Board control before the composer`,
+      );
       assert.equal(
         await input.evaluate((element) => element === document.activeElement),
         true,
