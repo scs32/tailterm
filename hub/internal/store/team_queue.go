@@ -1185,9 +1185,10 @@ func (s *Store) TeamQueueAction(ctx context.Context, task string, req api.TeamQu
 			}
 			// A verified team is accepted on its verified base, which is the
 			// tasks-hub tip at launch rather than the queue-time base. Its plan
-			// may name the canonical repository or the exact candidate worktree,
-			// which tt has already resolved to this entry's repository.
-			if required && (verificationPlan == nil || (verificationPlan.Repository != candidate.Repository && verificationPlan.Repository != candidate.Worktree) || (candidate.BaseCommit != e.BaseCommit && candidate.BaseCommit != verificationPlan.BaseCommit)) {
+			// may name the repository (its .git directory or its root) or the
+			// exact candidate worktree, which tt has already resolved to this
+			// entry's repository.
+			if required && (verificationPlan == nil || !verifiedRepository(verificationPlan.Repository, candidate) || (candidate.BaseCommit != e.BaseCommit && candidate.BaseCommit != verificationPlan.BaseCommit)) {
 				return zero, verificationConflict("acceptance repository/base mismatch")
 			}
 			base := e.BaseCommit
@@ -1346,4 +1347,16 @@ func (s *Store) TeamQueueAction(ctx context.Context, task string, req api.TeamQu
 	}
 	s.notify(task)
 	return e, nil
+}
+
+// verifiedRepository reports whether a verification plan's repository names the
+// accepted candidate's repository: the same .git directory, that repository's
+// root (the directory holding .git), or the exact candidate worktree.
+func verifiedRepository(planRepository string, a api.TeamIntegrationAcceptance) bool {
+	plan := filepath.Clean(planRepository)
+	repository := filepath.Clean(a.Repository)
+	if plan == repository || plan == filepath.Clean(a.Worktree) {
+		return true
+	}
+	return filepath.Base(repository) == ".git" && plan == filepath.Dir(repository)
 }

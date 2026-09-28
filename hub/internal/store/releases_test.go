@@ -439,6 +439,32 @@ func TestReleaseCorrectionHandlerRefusesResolvedHeldJobWithoutAmbiguousTakeover(
 // the base recorded when the item was queued, and its plan names the builder
 // worktree. Queue acceptance must still bind the verified base and repository.
 func TestQueueAcceptanceUsesVerifiedBaseAndWorktree(t *testing.T) {
+	verifiedAcceptance(t, "/fixture/worktrees/builder")
+}
+
+// The plan may also name the repository root, the directory holding .git
+// (wi_0842a90ecb62e82a, profile-sync acceptance on 2026-09-28).
+func TestQueueAcceptanceAcceptsVerifiedRepositoryRoot(t *testing.T) {
+	verifiedAcceptance(t, "/fixture/repo")
+}
+
+func TestVerifiedRepositoryIdentity(t *testing.T) {
+	a := api.TeamIntegrationAcceptance{Repository: "/fixture/repo/.git", Worktree: "/fixture/worktrees/builder"}
+	for plan, want := range map[string]bool{
+		"/fixture/repo/.git": true, "/fixture/repo": true, "/fixture/repo/": true, "/fixture/worktrees/builder": true,
+		"/fixture/other": false, "/fixture": false, "/fixture/repo/sub": false, "/fixture/worktrees/other": false,
+	} {
+		if got := verifiedRepository(plan, a); got != want {
+			t.Errorf("verifiedRepository(%q) = %v, want %v", plan, got, want)
+		}
+	}
+	if verifiedRepository("/fixture", api.TeamIntegrationAcceptance{Repository: "/fixture/repo", Worktree: "/fixture/wt"}) {
+		t.Error("a parent directory matched a repository that is not a .git directory")
+	}
+}
+
+func verifiedAcceptance(t *testing.T, planRepository string) {
+	t.Helper()
 	s, err := Open(filepath.Join(t.TempDir(), "hub.sqlite"))
 	if err != nil {
 		t.Fatal(err)
@@ -459,7 +485,7 @@ func TestQueueAcceptanceUsesVerifiedBaseAndWorktree(t *testing.T) {
 		t.Fatal(err)
 	}
 	const repository, worktree = "/fixture/repo/.git", "/fixture/worktrees/builder"
-	seedPassingVerificationAt(t, s, item, candidateB, worktree)
+	seedPassingVerificationAt(t, s, item, candidateB, planRepository)
 	now := ts(time.Now())
 	if _, err = s.db.Exec(`UPDATE work_items SET status='done' WHERE id=?`, item.ID); err != nil {
 		t.Fatal(err)
@@ -479,8 +505,10 @@ func TestQueueAcceptanceUsesVerifiedBaseAndWorktree(t *testing.T) {
 		return s.TeamQueueAction(ctx, task.ID, api.TeamQueueRequest{RequestID: key, Operation: "accept", EntryID: entry, ExpectedRevision: current.Revision, HandlerAgentID: h.ID, HandlerRunID: h.RunID,
 			Acceptance: &api.TeamIntegrationAcceptance{Repository: repository, BaseCommit: base, Worktree: planRepository, Branch: "feature/fixture", Commit: candidateB, ItemRevision: item.Revision, Evidence: "handler terminal save"}})
 	}
-	if _, err = accept("other-worktree", "/fixture/worktrees/other", candidateC); !errors.Is(err, api.ErrConflict) {
-		t.Fatal("a plan for a different worktree was accepted", err)
+	if planRepository == worktree {
+		if _, err = accept("other-worktree", "/fixture/worktrees/other", candidateC); !errors.Is(err, api.ErrConflict) {
+			t.Fatal("a plan for a different worktree was accepted", err)
+		}
 	}
 	if _, err = accept("wrong-base", worktree, strings.Repeat("d", 40)); !errors.Is(err, api.ErrConflict) {
 		t.Fatal("an unrelated base was accepted", err)
