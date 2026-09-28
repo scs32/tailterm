@@ -1108,6 +1108,11 @@ func cmdSpawn(e env, args []string) error {
 	if socket := os.Getenv("TT_TMUX_SOCKET"); socket != "" {
 		opts.Env["TT_TMUX_SOCKET"] = socket
 	}
+	if *runtime == "claude" {
+		// Claude Code's prompt suggestion fills the input the relay inspects
+		// before a wake; the relay also tells it apart from typed text.
+		opts.Env["CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION"] = "0"
+	}
 	var agent api.Agent
 	if *role == api.AgentRoleDatabaseHandler || *role == api.AgentRoleDeployment {
 		agent, err = ensureHandler(ctx, c, *task, req, opts)

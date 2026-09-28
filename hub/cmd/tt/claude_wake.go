@@ -15,6 +15,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/scs32/tailterm/hub/internal/api"
 )
@@ -79,20 +81,62 @@ func claudeWakeNonce() (string, error) {
 	return hex.EncodeToString(raw[:]), nil
 }
 
-// A captured pane is accepted only with a single, empty Claude input line.
-// Unknown footers, choices, a cursor in an editor, and multiline input fail
-// closed. ANSI escapes are not requested from capture-pane.
-func emptyClaudeInput(screen string) bool {
-	lines := strings.Split(strings.TrimRight(screen, "\n"), "\n")
-	if len(lines) == 0 {
-		return false
-	}
-	for _, line := range lines {
-		lower := strings.ToLower(line)
-		if strings.Contains(lower, "allow this") || strings.Contains(lower, "do you want to proceed") || strings.Contains(lower, "esc to cancel") || strings.Contains(lower, "select an option") || strings.Contains(lower, "(y/n)") || strings.Contains(lower, "[y/n]") {
-			return false
+// claudeDialogPhrases mark a permission, selection or confirmation prompt.
+var claudeDialogPhrases = []string{"allow this", "do you want to proceed", "esc to cancel", "select an option", "(y/n)", "[y/n]"}
+
+// claudePromptArea returns the rows of a plain Claude capture that belong to
+// the active prompt, and whether an input box bounds them. The area runs from
+// the input box's top rule, the rule directly above the last ❯ row, to the end
+// of the capture; the transcript above it (answers that quote a dialog, for
+// example) is not part of it. With no ❯ row, or no rule directly above it (a
+// dialog's "❯ 1. Yes" row, an unknown layout), the whole capture is the area,
+// so anything the rule cannot place is still checked everywhere.
+func claudePromptArea(lines []string) ([]string, bool) {
+	input := -1
+	for i, line := range lines {
+		if strings.HasPrefix(strings.TrimSpace(line), "❯") {
+			input = i
 		}
 	}
+	if input >= 1 && claudeRuleLine(lines[input-1]) {
+		return lines[input-1:], true
+	}
+	return lines, false
+}
+
+func claudeRuleLine(line string) bool {
+	trimmed := strings.TrimSpace(line)
+	return trimmed != "" && strings.Trim(trimmed, "─") == ""
+}
+
+// claudeDialog names the lowest dialog phrase in the active prompt area, the
+// one nearest a live dialog footer, and its 1-based row there. The text is
+// stable for an unchanged screen, so the relay logs a steady refusal once.
+func claudeDialog(screen string) (string, bool) {
+	area, boxed := claudePromptArea(strings.Split(strings.TrimRight(screen, "\n"), "\n"))
+	for i := len(area) - 1; i >= 0; i-- {
+		lower := strings.ToLower(area[i])
+		for _, phrase := range claudeDialogPhrases {
+			if strings.Contains(lower, phrase) {
+				where := fmt.Sprintf("prompt area row %d", i+1)
+				if !boxed {
+					where = fmt.Sprintf("capture row %d (no input box, whole capture checked)", i+1)
+				}
+				return fmt.Sprintf("%q in %s", phrase, where), true
+			}
+		}
+	}
+	return "", false
+}
+
+// A captured pane is accepted only with a single, empty Claude input line in
+// the active prompt area. Unknown footers, choices, a cursor in an editor, and
+// multiline input fail closed. ANSI escapes are not requested from capture-pane.
+func emptyClaudeInput(screen string) bool {
+	if claudeBlockedScreen(screen) {
+		return false
+	}
+	lines, _ := claudePromptArea(strings.Split(strings.TrimRight(screen, "\n"), "\n"))
 	input := -1
 	for i, line := range lines {
 		trimmed := strings.TrimSpace(line)
@@ -118,11 +162,10 @@ func emptyClaudeInput(screen string) bool {
 	return true
 }
 
+// claudeBlockedScreen reports a dialog phrase in the active prompt area.
 func claudeBlockedScreen(screen string) bool {
-	lower := strings.ToLower(screen)
-	return strings.Contains(lower, "allow this") || strings.Contains(lower, "do you want to proceed") ||
-		strings.Contains(lower, "esc to cancel") || strings.Contains(lower, "select an option") ||
-		strings.Contains(lower, "(y/n)") || strings.Contains(lower, "[y/n]")
+	_, blocked := claudeDialog(screen)
+	return blocked
 }
 
 func exactClaudeInput(screen, expected string) bool {
@@ -241,7 +284,9 @@ func nativeClaudeInspect(ctx context.Context, b runtimeBinding, expected string)
 	if xerr != nil || yerr != nil || cursorY < 0 || cursorX < 0 {
 		return claudeWakeSnapshot{}, errors.New("Claude cursor identity unavailable")
 	}
-	args := []string{"capture-pane", "-p", "-t", row[7]}
+	// -e keeps text attributes, so Claude's faint prompt suggestion can be told
+	// apart from typed input that reads the same.
+	args := []string{"capture-pane", "-p", "-e", "-t", row[7]}
 	if expected != "" {
 		args = append(args, "-J")
 	}
@@ -249,19 +294,9 @@ func nativeClaudeInspect(ctx context.Context, b runtimeBinding, expected string)
 	if err != nil {
 		return claudeWakeSnapshot{}, fmt.Errorf("Claude pane capture unavailable: %w", err)
 	}
-	visible := string(screen)
-	if claudeBlockedScreen(visible) {
-		return claudeWakeSnapshot{}, errors.New("Claude pane has a permission or selection prompt")
-	}
-	if expected == "" {
-		lines := strings.Split(visible, "\n")
-		if cursorX != 2 || cursorY >= len(lines) {
-			return claudeWakeSnapshot{}, errors.New("Claude cursor is not at an empty input")
-		}
-		visible = strings.Join(lines[cursorY:], "\n")
-	}
-	if !exactClaudeInput(visible, expected) {
-		return claudeWakeSnapshot{}, errors.New("Claude input is occupied, prompting, or unknown")
+	visible, err := claudeInputScreen(string(screen), cursorX, cursorY, expected)
+	if err != nil {
+		return claudeWakeSnapshot{}, err
 	}
 	transcript, err := claudeTranscriptSnapshot(b)
 	if err != nil {
@@ -269,6 +304,184 @@ func nativeClaudeInspect(ctx context.Context, b runtimeBinding, expected string)
 	}
 	transcript.Pane, transcript.SessionID, transcript.Created, transcript.PanePID, transcript.Screen = row[7], row[0], row[1], receipt.PanePID, visible
 	return transcript, nil
+}
+
+// claudeInputScreen turns one `capture-pane -p -e` capture into the plain
+// screen the input checks read. With no expected text the cursor must be at
+// the start of an empty input, and only the screen from the cursor row down
+// is returned.
+func claudeInputScreen(raw string, cursorX, cursorY int, expected string) (string, error) {
+	full, visible, err := claudePlainScreen(raw)
+	if err != nil {
+		return "", err
+	}
+	// Dialogs are detected on everything drawn in the active prompt area,
+	// faint text included; the transcript above the input box is not a prompt.
+	if match, blocked := claudeDialog(full); blocked {
+		return "", errors.New("Claude pane has a permission or selection prompt: " + match)
+	}
+	if expected == "" {
+		lines := strings.Split(visible, "\n")
+		if cursorX != 2 || cursorY >= len(lines) {
+			return "", errors.New("Claude cursor is not at an empty input")
+		}
+		visible = strings.Join(lines[cursorY:], "\n")
+	}
+	if !exactClaudeInput(visible, expected) {
+		return "", errors.New("Claude input is occupied, prompting, or unknown")
+	}
+	return visible, nil
+}
+
+type claudeCell struct {
+	r     rune
+	faint bool
+}
+
+// claudePlainScreen strips SGR attributes from a capture. It returns the full
+// text and a copy without the faint text Claude Code draws after the input
+// marker: its prompt suggestion and its Try "…" placeholder, neither of
+// which is input (Claude Code 2.1.284 draws both with SGR 2 and removes the suggestion as soon as a key is typed; see
+// testdata/claude-pane). Faint text must be a trailing run: faint text followed
+// by normal text, or any escape other than SGR in the input area, fails closed.
+// Attributes carry across rows, as tmux emits only changes.
+func claudePlainScreen(raw string) (string, string, error) {
+	var rows [][]claudeCell
+	var bad []bool
+	var row []claudeCell
+	rowBad, faint := false, false
+	for i := 0; i < len(raw); {
+		c := raw[i]
+		switch {
+		case c == '\n':
+			rows, bad = append(rows, row), append(bad, rowBad)
+			row, rowBad = nil, false
+			i++
+		case c == 0x1b && i+1 < len(raw) && raw[i+1] == '[':
+			j := i + 2
+			for j < len(raw) && (raw[j] < 0x40 || raw[j] > 0x7e) {
+				j++
+			}
+			if j >= len(raw) {
+				return "", "", errors.New("Claude pane capture has a truncated escape")
+			}
+			if raw[j] != 'm' || !applyClaudeSGR(raw[i+2:j], &faint) {
+				rowBad = true
+			}
+			i = j + 1
+		case c == 0x1b && i+1 < len(raw) && raw[i+1] == ']':
+			// OSC (for example a hyperlink) ends at BEL or ESC \.
+			j := i + 2
+			for j < len(raw) && raw[j] != 0x07 && !(raw[j] == 0x1b && j+1 < len(raw) && raw[j+1] == '\\') {
+				j++
+			}
+			if j >= len(raw) {
+				return "", "", errors.New("Claude pane capture has a truncated escape")
+			}
+			if raw[j] == 0x1b {
+				j++
+			}
+			rowBad, i = true, j+1
+		case c == 0x1b:
+			rowBad, i = true, i+2
+		default:
+			r, size := utf8.DecodeRuneInString(raw[i:])
+			row = append(row, claudeCell{r: r, faint: faint})
+			i += size
+		}
+	}
+	if len(row) > 0 {
+		rows, bad = append(rows, row), append(bad, rowBad)
+	}
+	input := -1
+	for i, cells := range rows {
+		if strings.HasPrefix(strings.TrimSpace(claudeCellText(cells)), "❯") {
+			input = i
+		}
+	}
+	lines := make([]string, len(rows))
+	for i, cells := range rows {
+		lines[i] = claudeCellText(cells)
+	}
+	full := strings.Join(lines, "\n")
+	if input >= 0 {
+		// The input area runs from the marker row to Claude's lower border.
+		end := input + 1
+		for end < len(rows) && !strings.HasPrefix(strings.TrimSpace(lines[end]), "──") {
+			end++
+		}
+		seenFaint := false
+		for i := input; i < end; i++ {
+			if bad[i] {
+				return "", "", errors.New("Claude input has unknown terminal attributes")
+			}
+			start := 0
+			if i == input {
+				marker := strings.IndexRune(lines[i], '❯')
+				start = utf8.RuneCountInString(lines[i][:marker]) + 1
+			}
+			cut := -1
+			if seenFaint {
+				cut = start
+			}
+			for k := start; k < len(rows[i]); k++ {
+				cell := rows[i][k]
+				if unicode.IsSpace(cell.r) {
+					continue
+				}
+				if cell.faint && !seenFaint {
+					seenFaint, cut = true, k
+				} else if !cell.faint && seenFaint {
+					return "", "", errors.New("Claude input mixes faint and typed text")
+				}
+			}
+			if cut >= 0 {
+				lines[i] = claudeCellText(rows[i][:cut])
+			}
+		}
+	}
+	return full, strings.Join(lines, "\n"), nil
+}
+
+func claudeCellText(cells []claudeCell) string {
+	var text strings.Builder
+	for _, cell := range cells {
+		text.WriteRune(cell.r)
+	}
+	return text.String()
+}
+
+// applyClaudeSGR tracks only faint (SGR 2) and reports false for parameters
+// it cannot account for, including colon subparameters.
+func applyClaudeSGR(params string, faint *bool) bool {
+	fields := strings.Split(params, ";")
+	for i := 0; i < len(fields); i++ {
+		n, err := strconv.Atoi(fields[i])
+		if fields[i] == "" {
+			n, err = 0, nil
+		}
+		if err != nil {
+			return false
+		}
+		switch {
+		case n == 0 || n == 22:
+			*faint = false
+		case n == 2:
+			*faint = true
+		case n == 38 || n == 48 || n == 58:
+			if i+1 < len(fields) && fields[i+1] == "5" {
+				i += 2
+			} else if i+1 < len(fields) && fields[i+1] == "2" {
+				i += 4
+			} else {
+				return false
+			}
+			if i >= len(fields) {
+				return false
+			}
+		}
+	}
+	return true
 }
 
 func nativeClaudeSend(ctx context.Context, pane, value string, literal bool) error {
