@@ -81,20 +81,62 @@ func claudeWakeNonce() (string, error) {
 	return hex.EncodeToString(raw[:]), nil
 }
 
-// A captured pane is accepted only with a single, empty Claude input line.
-// Unknown footers, choices, a cursor in an editor, and multiline input fail
-// closed. ANSI escapes are not requested from capture-pane.
-func emptyClaudeInput(screen string) bool {
-	lines := strings.Split(strings.TrimRight(screen, "\n"), "\n")
-	if len(lines) == 0 {
-		return false
-	}
-	for _, line := range lines {
-		lower := strings.ToLower(line)
-		if strings.Contains(lower, "allow this") || strings.Contains(lower, "do you want to proceed") || strings.Contains(lower, "esc to cancel") || strings.Contains(lower, "select an option") || strings.Contains(lower, "(y/n)") || strings.Contains(lower, "[y/n]") {
-			return false
+// claudeDialogPhrases mark a permission, selection or confirmation prompt.
+var claudeDialogPhrases = []string{"allow this", "do you want to proceed", "esc to cancel", "select an option", "(y/n)", "[y/n]"}
+
+// claudePromptArea returns the rows of a plain Claude capture that belong to
+// the active prompt, and whether an input box bounds them. The area runs from
+// the input box's top rule, the rule directly above the last ❯ row, to the end
+// of the capture; the transcript above it (answers that quote a dialog, for
+// example) is not part of it. With no ❯ row, or no rule directly above it (a
+// dialog's "❯ 1. Yes" row, an unknown layout), the whole capture is the area,
+// so anything the rule cannot place is still checked everywhere.
+func claudePromptArea(lines []string) ([]string, bool) {
+	input := -1
+	for i, line := range lines {
+		if strings.HasPrefix(strings.TrimSpace(line), "❯") {
+			input = i
 		}
 	}
+	if input >= 1 && claudeRuleLine(lines[input-1]) {
+		return lines[input-1:], true
+	}
+	return lines, false
+}
+
+func claudeRuleLine(line string) bool {
+	trimmed := strings.TrimSpace(line)
+	return trimmed != "" && strings.Trim(trimmed, "─") == ""
+}
+
+// claudeDialog names the lowest dialog phrase in the active prompt area, the
+// one nearest a live dialog footer, and its 1-based row there. The text is
+// stable for an unchanged screen, so the relay logs a steady refusal once.
+func claudeDialog(screen string) (string, bool) {
+	area, boxed := claudePromptArea(strings.Split(strings.TrimRight(screen, "\n"), "\n"))
+	for i := len(area) - 1; i >= 0; i-- {
+		lower := strings.ToLower(area[i])
+		for _, phrase := range claudeDialogPhrases {
+			if strings.Contains(lower, phrase) {
+				where := fmt.Sprintf("prompt area row %d", i+1)
+				if !boxed {
+					where = fmt.Sprintf("capture row %d (no input box, whole capture checked)", i+1)
+				}
+				return fmt.Sprintf("%q in %s", phrase, where), true
+			}
+		}
+	}
+	return "", false
+}
+
+// A captured pane is accepted only with a single, empty Claude input line in
+// the active prompt area. Unknown footers, choices, a cursor in an editor, and
+// multiline input fail closed. ANSI escapes are not requested from capture-pane.
+func emptyClaudeInput(screen string) bool {
+	if claudeBlockedScreen(screen) {
+		return false
+	}
+	lines, _ := claudePromptArea(strings.Split(strings.TrimRight(screen, "\n"), "\n"))
 	input := -1
 	for i, line := range lines {
 		trimmed := strings.TrimSpace(line)
@@ -120,11 +162,10 @@ func emptyClaudeInput(screen string) bool {
 	return true
 }
 
+// claudeBlockedScreen reports a dialog phrase in the active prompt area.
 func claudeBlockedScreen(screen string) bool {
-	lower := strings.ToLower(screen)
-	return strings.Contains(lower, "allow this") || strings.Contains(lower, "do you want to proceed") ||
-		strings.Contains(lower, "esc to cancel") || strings.Contains(lower, "select an option") ||
-		strings.Contains(lower, "(y/n)") || strings.Contains(lower, "[y/n]")
+	_, blocked := claudeDialog(screen)
+	return blocked
 }
 
 func exactClaudeInput(screen, expected string) bool {
@@ -274,9 +315,10 @@ func claudeInputScreen(raw string, cursorX, cursorY int, expected string) (strin
 	if err != nil {
 		return "", err
 	}
-	// Dialogs are detected on everything drawn, faint text included.
-	if claudeBlockedScreen(full) {
-		return "", errors.New("Claude pane has a permission or selection prompt")
+	// Dialogs are detected on everything drawn in the active prompt area,
+	// faint text included; the transcript above the input box is not a prompt.
+	if match, blocked := claudeDialog(full); blocked {
+		return "", errors.New("Claude pane has a permission or selection prompt: " + match)
 	}
 	if expected == "" {
 		lines := strings.Split(visible, "\n")

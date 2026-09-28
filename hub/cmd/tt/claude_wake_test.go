@@ -523,7 +523,7 @@ type liveClaude struct {
 	session string
 }
 
-func startLiveClaude(t *testing.T, suggestions bool) *liveClaude {
+func startLiveClaude(t *testing.T, suggestions bool, flags ...string) *liveClaude {
 	t.Helper()
 	if os.Getenv("TT_LIVE_CLAUDE") != "1" {
 		t.Skip("requires an explicit live Claude check")
@@ -579,6 +579,9 @@ func startLiveClaude(t *testing.T, suggestions bool) *liveClaude {
 		childEnv = append(childEnv, key+"="+value)
 	}
 	command := claude + " --session-id " + thread
+	for _, flag := range flags {
+		command += " " + spawn.ShellQuote(flag)
+	}
 	if suggestions {
 		// Per process only; the owner's user settings stay as they are.
 		childEnv = append(childEnv, "CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=1")
@@ -613,13 +616,20 @@ func startLiveClaude(t *testing.T, suggestions bool) *liveClaude {
 		if raw := lc.capture(true); strings.Contains(raw, "❯") {
 			if _, plain, err := claudePlainScreen(raw); err == nil && emptyClaudeInput(plain) {
 				break
+			} else if err == nil && len(flags) > 0 {
+				// Outside bypass mode the footer (for example "⏸ manual mode
+				// on") is not on the wake allowlist; typing only needs an empty
+				// input box.
+				if area, boxed := claudePromptArea(strings.Split(plain, "\n")); boxed && strings.TrimSpace(area[1]) == "❯" {
+					break
+				}
 			}
 		}
 		if time.Now().After(deadline) {
 			t.Fatalf("dedicated Claude prompt did not become idle: %q", screen)
 		}
 	}
-	t.Logf("live session agent=%s run=%s session=%s thread=%s socket=%s cwd=%s suggestions=%v", b.Agent, b.Run, session, thread, socket, cwd, suggestions)
+	t.Logf("live session agent=%s run=%s session=%s thread=%s socket=%s cwd=%s suggestions=%v flags=%q", b.Agent, b.Run, session, thread, socket, cwd, suggestions, flags)
 	return lc
 }
 
@@ -879,4 +889,272 @@ func TestClaudeInputFaintDialogTextStillRefuses(t *testing.T) {
 			}
 		})
 	}
+}
+
+// scrollbackWake is the wake prompt typed into the scrollback-dialog-words-typed
+// capture.
+const scrollbackWake = "Tailterm messages #14142. Run tt inbox --unread --mark-read."
+
+// k7/k8: live Claude Code 2.1.284 captures (testdata/claude-pane/README.md).
+// Dialog words in the transcript above an idle, empty input box wake, on the
+// empty check and on the pre-Enter check. A real permission, selection or
+// trust dialog refuses both.
+func TestClaudeInputDialogWordsInScrollback(t *testing.T) {
+	raw, x, y := readClaudePaneFixture(t, "scrollback-dialog-words")
+	full, plain, err := claudePlainScreen(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, phrase := range []string{"permission dialog", "Esc to cancel", "Allow this tool?", "Do you want to proceed?", "Select an option", "(y/n)"} {
+		if !strings.Contains(full, phrase) {
+			t.Fatalf("fixture scrollback lacks %q", phrase)
+		}
+	}
+	screen, err := claudeInputScreen(raw, x, y, "")
+	if err != nil || !emptyClaudeInput(screen) {
+		t.Fatalf("idle prompt under dialog words refused: %q %v", screen, err)
+	}
+	// Whole-screen callers (the live harness) read the same area.
+	if !emptyClaudeInput(plain) {
+		t.Fatal("whole idle screen refused")
+	}
+	raw, x, y = readClaudePaneFixture(t, "scrollback-dialog-words-typed.joined")
+	if _, err := claudeInputScreen(raw, x, y, scrollbackWake); err != nil {
+		t.Fatalf("pre-Enter check refused the typed wake prompt: %v", err)
+	}
+	raw, x, y = readClaudePaneFixture(t, "scrollback-dialog-words-typed")
+	if _, err := claudeInputScreen(raw, x, y, ""); err == nil {
+		t.Fatal("typed wake prompt passed the empty check")
+	}
+	for _, fixture := range []string{"permission-dialog", "permission-dialog.joined", "selection-dialog", "selection-dialog.joined", "trust-dialog"} {
+		for _, expected := range []string{"", scrollbackWake} {
+			t.Run(fixture+"/"+expected, func(t *testing.T) {
+				raw, x, y := readClaudePaneFixture(t, fixture)
+				if _, err := claudeInputScreen(raw, x, y, expected); err == nil || !strings.Contains(err.Error(), "Claude pane has a permission or selection prompt: ") {
+					t.Fatalf("real dialog was not refused as a prompt: %v", err)
+				}
+			})
+		}
+	}
+}
+
+// k7: only the input box, from its top rule down, is the active prompt area.
+// Anything the rule cannot place is checked on the whole capture.
+func TestClaudePromptArea(t *testing.T) {
+	rule := "────────────────"
+	footer := "  ⏵⏵ bypass permissions on (shift+tab to cycle)"
+	words := "⏺ The permission dialog said Allow this tool? Do you want to proceed?\n  Select an option (y/n), Esc to cancel.\n"
+	for _, tc := range []struct {
+		name, raw, reason string
+		wake              bool
+	}{
+		{"words directly above the top rule", words + rule + "\n❯ \n" + rule + "\n" + footer + "\n", "", true},
+		{"words above a hint row", words + "  Ctrl+Y to paste deleted text\n" + rule + "\n❯ \n" + rule + "\n" + footer + "\n", "", true},
+		{"phrase on the input row", rule + "\n❯ Esc to cancel\n" + rule + "\n" + footer + "\n", `"esc to cancel" in prompt area row 2`, false},
+		{"phrase in the footer", words + rule + "\n❯ \n" + rule + "\n  Esc to cancel · Tab to amend\n", `"esc to cancel" in prompt area row 4`, false},
+		{"faint phrase on the input row", rule + "\n\x1b[39m❯ \x1b[2mSelect an option\x1b[0m\n" + rule + "\n" + footer + "\n", `"select an option" in prompt area row 2`, false},
+		{"unbordered prompt", words + "❯ \n" + rule + "\n" + footer + "\n", "whole capture checked", false},
+		{"rule not directly above the prompt", words + rule + "\nlater answer\n❯ \n" + rule + "\n" + footer + "\n", "whole capture checked", false},
+		{"dialog selection row", words + rule + "\n Do you want to proceed?\n❯ 1. Yes\n  2. No\n Esc to cancel · Tab to amend\n", `"esc to cancel" in capture row 7`, false},
+		{"no input marker", words + rule + "\n" + footer + "\n", "whole capture checked", false},
+		{"two prompt rows below the rule", rule + "\n❯ \n❯ \n" + rule + "\n" + footer + "\n", "", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			y := strings.Count(tc.raw[:max(strings.Index(tc.raw, "❯"), 0)], "\n")
+			screen, err := claudeInputScreen(tc.raw, 2, y, "")
+			if (err == nil) != tc.wake || err == nil && !emptyClaudeInput(screen) {
+				t.Fatalf("wake=%v screen=%q err=%v", err == nil, screen, err)
+			}
+			if tc.reason != "" && (err == nil || !strings.Contains(err.Error(), "Claude pane has a permission or selection prompt: ") || !strings.Contains(err.Error(), tc.reason)) {
+				t.Fatalf("refusal %v does not name %q", err, tc.reason)
+			}
+			// Whole-screen callers see faint text too.
+			full, _, _ := claudePlainScreen(tc.raw)
+			if emptyClaudeInput(full) != tc.wake {
+				t.Fatalf("emptyClaudeInput(whole screen) = %v", !tc.wake)
+			}
+		})
+	}
+	prompt := "Tailterm messages #7. Run tt inbox."
+	if !exactClaudeInput(words+rule+"\n❯ "+prompt+"\n"+rule+"\n"+footer+"\n", prompt) {
+		t.Fatal("typed prompt under dialog words was not recognized")
+	}
+	if exactClaudeInput(words+rule+"\n❯ "+prompt+"\n"+rule+"\n  Esc to cancel\n", prompt) {
+		t.Fatal("typed prompt above a dialog footer was recognized")
+	}
+	if exactClaudeInput(rule+"\n Do you want to proceed?\n❯ "+prompt+"\n", prompt) {
+		t.Fatal("typed prompt inside an unbordered dialog was recognized")
+	}
+}
+
+// fixtureClaudeOps inspects live captures through claudeInputScreen, as
+// nativeClaudeInspect does: idle for the empty checks, typed before Enter.
+func fixtureClaudeOps(t *testing.T, idle, typed string, sent *[]string) claudeWakeOps {
+	transcript := filepath.Join(t.TempDir(), "claude.jsonl")
+	if err := os.WriteFile(transcript, []byte(`{"type":"assistant","message":{"stop_reason":"end_turn","content":[]}}`+"\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	var pending string
+	return claudeWakeOps{inspect: func(_ context.Context, _ runtimeBinding, expected string) (claudeWakeSnapshot, error) {
+		fixture := idle
+		if expected != "" {
+			fixture = typed
+		}
+		raw, x, y := readClaudePaneFixture(t, fixture)
+		screen, err := claudeInputScreen(raw, x, y, expected)
+		if err != nil {
+			return claudeWakeSnapshot{}, err
+		}
+		info, err := os.Stat(transcript)
+		if err != nil {
+			return claudeWakeSnapshot{}, err
+		}
+		return claudeWakeSnapshot{Pane: "%1", SessionID: "$1", Created: "100", PanePID: 1001, Path: transcript, FileID: fileIdentity(info), Offset: info.Size(), Screen: screen, Cursor: activityCursor{Ready: true, SeenTurn: true, TurnComplete: true}}, nil
+	}, send: func(_ context.Context, _ string, value string, literal bool) error {
+		if literal {
+			pending = value
+			*sent = append(*sent, "text:"+value)
+			return nil
+		}
+		*sent = append(*sent, "Enter")
+		line, _ := json.Marshal(map[string]any{"type": "user", "message": map[string]any{"content": pending}})
+		f, err := os.OpenFile(transcript, os.O_APPEND|os.O_WRONLY, 0600)
+		if err != nil {
+			return err
+		}
+		defer f.Close()
+		_, err = f.Write(append(line, '\n'))
+		return err
+	}, sleep: func(time.Duration) {}, now: time.Now}
+}
+
+// k7: a wake under dialog words in the transcript types once, passes the
+// pre-Enter check and confirms; a real dialog gets no input at all.
+func TestClaudeWakeScrollbackDialogWordsFixtures(t *testing.T) {
+	t.Run("scrollback words", func(t *testing.T) {
+		t.Setenv("TAILTERM_RELAY_STATE", t.TempDir())
+		var sent []string
+		if err := claudeWakeWith(context.Background(), testClaudeBinding(), scrollbackWake, fixtureClaudeOps(t, "scrollback-dialog-words", "scrollback-dialog-words-typed.joined", &sent)); err != nil {
+			t.Fatalf("wake: %v sent=%q", err, sent)
+		}
+		if fmt.Sprint(sent) != fmt.Sprint([]string{"text:" + scrollbackWake, "Enter"}) {
+			t.Fatalf("sends %q", sent)
+		}
+	})
+	for _, fixture := range []string{"permission-dialog", "selection-dialog", "trust-dialog"} {
+		t.Run(fixture, func(t *testing.T) {
+			t.Setenv("TAILTERM_RELAY_STATE", t.TempDir())
+			var sent []string
+			err := claudeWakeWith(context.Background(), testClaudeBinding(), scrollbackWake, fixtureClaudeOps(t, fixture, fixture, &sent))
+			if !errors.Is(err, errClaudeWakeUnsafe) || !strings.Contains(err.Error(), "permission or selection prompt") || len(sent) != 0 {
+				t.Fatalf("dialog wake: %v sent=%q", err, sent)
+			}
+		})
+	}
+}
+
+// k3 for #14113: a dialog refusal names the phrase and its row, logs once while
+// the screen is unchanged, and the pane gets no input; the transcript quoting
+// the same words then wakes.
+func TestClaudeDialogRefusalLogsPhraseOnce(t *testing.T) {
+	b, hub, c, pane := needsInputFixture(t)
+	pane.raw, pane.cursorX, pane.cursorY = readClaudePaneFixture(t, "permission-dialog")
+	now := time.Date(2026, 9, 28, 22, 30, 0, 0, time.UTC)
+	hub.update(func(h *needsInputHub) {
+		h.agent.ReadUpTo, h.agent.Unread = 40, 2
+		h.messages = []api.Message{{Seq: 41, To: b.Agent, From: api.Sender{AgentID: needsInputHandler}}, {Seq: 42, To: b.Agent, From: api.Sender{Node: "workspace", User: "owner"}}}
+	})
+	var p relayProgress
+	want := `Claude pane has a permission or selection prompt: "esc to cancel" in capture row 30 (no input box, whole capture checked)`
+	out, _ := captureRelayOutput(t, true, func() error { return relayOne(context.Background(), b, &p, c, now, pane.queue) })
+	if strings.Count(out, "\n") != 1 || !strings.Contains(out, " "+b.Agent+" wake skipped: ") || !strings.Contains(out, want+" seqs=[41 42]") {
+		t.Fatalf("dialog skip log %q, want %q", out, want)
+	}
+	if p.Skip == nil || !strings.Contains(p.Skip.Reason, want) || len(pane.sent) != 0 {
+		t.Fatalf("dialog skip %+v sent=%q", p.Skip, pane.sent)
+	}
+	out, _ = captureRelayOutput(t, true, func() error { return relayOne(context.Background(), b, &p, c, now.Add(20*time.Second), pane.queue) })
+	if out != "" || len(pane.sent) != 0 || p.LastAttempt != now.Add(20*time.Second) {
+		t.Fatalf("steady dialog refusal logged again %q sent=%q", out, pane.sent)
+	}
+	pane.raw, pane.cursorX, pane.cursorY = readClaudePaneFixture(t, "scrollback-dialog-words")
+	if err := relayOne(context.Background(), b, &p, c, now.Add(40*time.Second), pane.queue); err != nil {
+		t.Fatal(err)
+	}
+	if p.Skip != nil || len(pane.sent) != 1 || p.Wake == nil || p.Wake.Status != "confirmed" || fmt.Sprint(p.Wake.MessageSeqs) != "[41 42]" {
+		t.Fatalf("scrollback words did not wake: skip=%+v wake=%+v sent=%q", p.Skip, p.Wake, pane.sent)
+	}
+}
+
+// k7 live: run with TT_LIVE_CLAUDE=1. (a) An answer that quotes dialog words
+// leaves them in the transcript above an idle prompt; a directed message wakes
+// the session. (b) A real Bash permission prompt (this process only runs with
+// --permission-mode default) refuses with a logged reason naming the dialog,
+// and the pane gets no input: the command is never approved.
+func TestClaudeWakeLiveScrollbackDialogWords(t *testing.T) {
+	t.Run("scrollback words wake", func(t *testing.T) {
+		lc := startLiveClaude(t, false)
+		lc.submit("Do not use any tools. Reply with exactly these six lines, then stop: 1. The permission dialog appeared. 2. Its footer said Esc to cancel. 3. It asked Allow this tool? 4. Then: Do you want to proceed? 5. A menu said Select an option. 6. The shell asked (y/n).")
+		snap := lc.idle(2 * time.Minute)
+		if screen := lc.capture(false); !strings.Contains(screen, "Allow this tool?") || !strings.Contains(screen, "Esc to cancel") {
+			t.Fatalf("transcript does not show the dialog words:\n%s", lc.capture(false))
+		}
+		m := lc.post("Relay scrollback check: reply OK only.", 0)
+		posted := time.Now().UTC()
+		var p relayProgress
+		woken := func() bool {
+			return p.Wake != nil && p.Wake.Status == "confirmed" && slices.Contains(p.Wake.MessageSeqs, m.Seq)
+		}
+		lc.relay(&p, time.Minute, woken)
+		if !woken() {
+			t.Fatalf("scrollback dialog words blocked the wake: %s\n%s", lc.status(p), lc.capture(false))
+		}
+		intent := lc.intent()
+		if intent.Phase != "confirmed" || !strings.Contains(intent.Prompt, fmt.Sprintf("#%d", m.Seq)) {
+			t.Fatalf("confirmed prompt: %+v", intent)
+		}
+		t.Logf("k7 live wake: message=#%d pane-offset=%d posted=%s text=%s enter=%s confirmed=%s posted-to-confirmed=%s prompt=%q transcript=%s offset=%d",
+			m.Seq, snap.Offset, posted.Format(time.RFC3339Nano), intent.TextAt.Format(time.RFC3339Nano), intent.EnterAt.Format(time.RFC3339Nano),
+			intent.ConfirmedAt.Format(time.RFC3339Nano), intent.ConfirmedAt.Sub(posted), intent.Prompt, intent.Path, intent.Offset)
+		t.Logf("relay status: %s", lc.status(p))
+	})
+	t.Run("real dialog refuses", func(t *testing.T) {
+		lc := startLiveClaude(t, false, "--permission-mode", "default")
+		target := filepath.Join(t.TempDir(), "approved-by-relay")
+		lc.submit("Run this exact Bash command: touch " + target)
+		var dialog string
+		for deadline := time.Now().Add(2 * time.Minute); ; time.Sleep(time.Second) {
+			if dialog = lc.capture(false); strings.Contains(dialog, "Do you want to proceed?") {
+				break
+			}
+			if time.Now().After(deadline) {
+				t.Fatalf("no permission prompt appeared:\n%s", dialog)
+			}
+		}
+		m := lc.post("Relay dialog check: reply OK only.", 0)
+		var p relayProgress
+		refused := func() bool {
+			return p.Skip != nil && slices.Contains(p.Skip.MessageSeqs, m.Seq) && strings.Contains(p.Skip.Reason, "Claude pane has a permission or selection prompt: ")
+		}
+		out, _ := captureRelayOutput(t, true, func() error {
+			lc.relay(&p, 40*time.Second, refused)
+			return nil
+		})
+		if !refused() || !strings.Contains(out, "Claude is not safely idle: Claude pane has a permission or selection prompt: ") || strings.Count(out, "wake skipped") != 1 {
+			t.Fatalf("real dialog did not refuse once with a logged reason: %s\nlog=%q\n%s", lc.status(p), out, lc.capture(false))
+		}
+		// The transcript's ⏺ glyph blinks; the dialog from its top rule down
+		// must be exactly as it was, with nothing typed or selected.
+		after := lc.capture(false)
+		box := func(screen string) string { return screen[max(strings.LastIndex(screen, "────"), 0):] }
+		if _, err := os.Stat(claudeWakePath(lc.b)); !errors.Is(err, os.ErrNotExist) || !strings.Contains(box(after), "Do you want to proceed?") || box(after) != box(dialog) {
+			t.Fatalf("dialog pane was disturbed (wake intent %v):\nbefore:\n%s\nafter:\n%s", err, dialog, after)
+		}
+		if _, err := os.Stat(target); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("the Bash command ran: %v", err)
+		}
+		t.Logf("k7 live dialog: message=#%d %s", m.Seq, lc.status(p))
+		t.Logf("relay log: %s", strings.TrimSpace(out))
+		lc.tmux("send-keys", "-t", lc.session, "Escape")
+	})
 }
