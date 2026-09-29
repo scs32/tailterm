@@ -1,10 +1,20 @@
 package main
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"net/http"
+	"os"
+	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/scs32/tailterm/hub/internal/api"
 )
@@ -266,4 +276,397 @@ func classifyClaudePrompt(lines []string) (runtimePromptMatch, bool) {
 		kind = api.RuntimePromptClaudeSelection
 	}
 	return runtimePromptMatch{Kind: kind, Fingerprint: runtimePromptPrint("claude", kind, rows), Options: options}, true
+}
+
+// runtimePromptQuiet is how long a runtime's transcript must be quiet before
+// the relay captures its pane. TAILTERM_ACTIVITY_PROMPT_SECONDS overrides it.
+func runtimePromptQuiet() time.Duration {
+	v, err := strconv.Atoi(os.Getenv("TAILTERM_ACTIVITY_PROMPT_SECONDS"))
+	if err != nil || v < 1 || v > 86400 {
+		v = 30
+	}
+	return time.Duration(v) * time.Second
+}
+
+const (
+	runtimePromptAnswerLimit  = 3
+	runtimePromptAnswerWindow = 5 * time.Minute
+	runtimePromptConfirmWait  = 5 * time.Second
+	runtimePromptSeenCap      = 64
+)
+
+// runtimePromptTargets names the option each answering action selects.
+var runtimePromptTargets = map[string]map[string]string{
+	api.RuntimePromptCodexRateLimit: {
+		api.RuntimePromptKeepCurrentNeverShow: "Keep current model (never show again)",
+		api.RuntimePromptKeepCurrent:          "Keep current model",
+	},
+	api.RuntimePromptCodexModelMigration: {api.RuntimePromptUseExisting: "Use existing model"},
+}
+
+// runtimePromptDeps are the host operations detection and answers use. The
+// relay loop installs the native ones in the activity context; without them
+// detection is off, which keeps other activity callers unchanged.
+type runtimePromptDeps struct {
+	inspect func(context.Context, runtimeBinding) (runtimePane, error)
+	send    func(ctx context.Context, pane string, keys ...string) error
+	sleep   func(time.Duration)
+	now     func() time.Time
+}
+
+type runtimePromptDepsKey struct{}
+
+func nativeRuntimePromptDeps() *runtimePromptDeps {
+	return &runtimePromptDeps{
+		inspect: func(ctx context.Context, b runtimeBinding) (runtimePane, error) {
+			name := "Codex"
+			if b.Runtime == "claude" {
+				name = "Claude"
+			}
+			return inspectRuntimePane(ctx, b, name, false)
+		},
+		send: func(ctx context.Context, pane string, keys ...string) error {
+			_, err := startupTmux(ctx, append([]string{"send-keys", "-t", pane}, keys...)...)
+			return err
+		},
+		sleep: time.Sleep,
+		now:   time.Now,
+	}
+}
+
+// runtimePromptSeen is the decision for one prompt fingerprint in one run.
+// Attempted is saved before the first key, so a relay that stops mid-answer
+// never types into that prompt again.
+type runtimePromptSeen struct {
+	Kind      string    `json:"kind"`
+	Since     time.Time `json:"since"`
+	Action    string    `json:"action,omitempty"`
+	Outcome   string    `json:"outcome,omitempty"`
+	Reason    string    `json:"reason,omitempty"`
+	At        time.Time `json:"at,omitempty"`
+	Attempted bool      `json:"attempted,omitempty"`
+}
+
+// runtimePromptIntent is the answer in progress, written before any key.
+type runtimePromptIntent struct {
+	Fingerprint string    `json:"fingerprint"`
+	Kind        string    `json:"kind"`
+	Action      string    `json:"action"`
+	Target      string    `json:"target"`
+	Keys        []string  `json:"keys"`
+	Pane        string    `json:"pane"`
+	Phase       string    `json:"phase"`
+	At          time.Time `json:"at"`
+}
+
+// runtimePromptLocal is private host state for one binding run. It holds no
+// screen text: only kinds, hashes, option labels from the fixed target table
+// and outcomes.
+type runtimePromptLocal struct {
+	Run     string                       `json:"run"`
+	Thread  string                       `json:"thread"`
+	Prompt  *api.RuntimePrompt           `json:"prompt,omitempty"`
+	Seen    map[string]runtimePromptSeen `json:"seen,omitempty"`
+	Answers []time.Time                  `json:"answers,omitempty"`
+	Intent  *runtimePromptIntent         `json:"intent,omitempty"`
+	Logged  string                       `json:"logged,omitempty"`
+}
+
+func runtimePromptPath(b runtimeBinding) string {
+	return filepath.Join(relayDir(), bindingKey(b)+"-"+b.Run+".runtime-prompt.json")
+}
+
+func loadRuntimePromptLocal(b runtimeBinding) runtimePromptLocal {
+	var l runtimePromptLocal
+	if data, err := os.ReadFile(runtimePromptPath(b)); err == nil {
+		_ = json.Unmarshal(data, &l)
+	}
+	if l.Run != b.Run || l.Thread != b.Thread {
+		l = runtimePromptLocal{Run: b.Run, Thread: b.Thread}
+	}
+	if l.Seen == nil {
+		l.Seen = map[string]runtimePromptSeen{}
+	}
+	return l
+}
+
+// runtimePromptPolicies caches each project's policy for a minute per relay
+// process, inside the host's request budget.
+var runtimePromptPolicies struct {
+	sync.Mutex
+	entries map[string]runtimePromptPolicyEntry
+}
+
+type runtimePromptPolicyEntry struct {
+	actions map[string]string
+	at      time.Time
+}
+
+func resetRuntimePromptPolicies() {
+	runtimePromptPolicies.Lock()
+	runtimePromptPolicies.entries = nil
+	runtimePromptPolicies.Unlock()
+}
+
+var errRuntimePromptUnsupported = errors.New("hub has no runtime prompt policy")
+
+func runtimePromptActions(ctx context.Context, client *api.Client, b runtimeBinding, now time.Time) (map[string]string, error) {
+	key := b.Hub + "\x00" + b.Task
+	runtimePromptPolicies.Lock()
+	entry, ok := runtimePromptPolicies.entries[key]
+	runtimePromptPolicies.Unlock()
+	if ok && now.Sub(entry.at) < time.Minute && now.Sub(entry.at) >= 0 {
+		return entry.actions, nil
+	}
+	p, err := client.RuntimePromptPolicy(ctx, b.Task)
+	var httpErr *api.HTTPError
+	if errors.As(err, &httpErr) && (httpErr.Status == http.StatusNotFound || httpErr.Status == http.StatusMethodNotAllowed) {
+		// An older hub cannot store runtime_prompt either; stay silent.
+		return nil, errRuntimePromptUnsupported
+	}
+	if err != nil {
+		return nil, err
+	}
+	runtimePromptPolicies.Lock()
+	if runtimePromptPolicies.entries == nil {
+		runtimePromptPolicies.entries = map[string]runtimePromptPolicyEntry{}
+	}
+	runtimePromptPolicies.entries[key] = runtimePromptPolicyEntry{actions: p.Actions, at: now}
+	runtimePromptPolicies.Unlock()
+	return p.Actions, nil
+}
+
+func samePane(a, b runtimePane) bool {
+	return a.Pane == b.Pane && a.SessionID == b.SessionID && a.Created == b.Created && a.PanePID == b.PanePID
+}
+
+// logRuntimePrompt writes one relay line when the prompt, its action or its
+// outcome changes, and one when it clears.
+func logRuntimePrompt(l *runtimePromptLocal, agent string, now time.Time) {
+	key := ""
+	line := ""
+	if p := l.Prompt; p != nil {
+		key = p.Kind + "/" + p.Fingerprint + "/" + p.Action + "/" + p.Outcome
+		line = fmt.Sprintf("runtime prompt %s: %s %s", p.Kind, p.Action, p.Outcome)
+		if p.Reason != "" {
+			line += " (" + p.Reason + ")"
+		}
+	} else if l.Logged != "" {
+		line = "runtime prompt cleared"
+	}
+	if key == l.Logged {
+		return
+	}
+	l.Logged = key
+	fmt.Fprintf(os.Stderr, "[tt relay] %s %s %s\n", now.UTC().Format(time.RFC3339), agent, line)
+}
+
+// observeRuntimePrompt runs inside the activity tick for a live runtime. It
+// captures the pane only after the transcript has been quiet, classifies the
+// prompt area, applies the project's policy once per prompt, and returns the
+// prompt to report, or nil when the runtime is not on one.
+func observeRuntimePrompt(ctx context.Context, deps *runtimePromptDeps, b runtimeBinding, client *api.Client, c *activityCursor, now time.Time) (*api.RuntimePrompt, error) {
+	l := loadRuntimePromptLocal(b)
+	save := func() error { return writePrivateJSON(runtimePromptPath(b), l) }
+	clear := func() (*api.RuntimePrompt, error) {
+		if l.Prompt == nil && l.Logged == "" {
+			return nil, nil
+		}
+		l.Prompt = nil
+		logRuntimePrompt(&l, b.Agent, now)
+		return nil, save()
+	}
+	if b.Session == "" || (c.SeenTurn && now.Sub(c.LastEventAt) < runtimePromptQuiet()) {
+		return clear()
+	}
+	runtime := b.Runtime
+	if runtime == "" {
+		runtime = "codex"
+	}
+	first, err := deps.inspect(ctx, b)
+	if err != nil {
+		// An unreadable pane is not evidence of a prompt; keep the last report.
+		if l.Prompt != nil {
+			return l.Prompt, nil
+		}
+		return nil, nil
+	}
+	match, ok := classifyRuntimePrompt(runtime, plainRuntimeScreen(first.Raw))
+	if !ok {
+		return clear()
+	}
+	actions, err := runtimePromptActions(ctx, client, b, now)
+	if errors.Is(err, errRuntimePromptUnsupported) {
+		return nil, nil
+	}
+	action := api.RuntimePromptEscalate
+	if err == nil && api.RuntimePromptActionAllowed(match.Kind, actions[match.Kind]) {
+		action = actions[match.Kind]
+	} else if err != nil {
+		fmt.Fprintf(os.Stderr, "[tt relay] %s runtime prompt policy unavailable; escalating: %v\n", b.Agent, err)
+	}
+	seen, known := l.Seen[match.Fingerprint]
+	if !known {
+		seen = runtimePromptSeen{Kind: match.Kind, Since: now}
+		if len(l.Seen) >= runtimePromptSeenCap {
+			oldest := ""
+			for fp, s := range l.Seen {
+				if oldest == "" || s.Since.Before(l.Seen[oldest].Since) {
+					oldest = fp
+				}
+			}
+			delete(l.Seen, oldest)
+		}
+	}
+	switch {
+	case seen.Attempted && seen.Outcome == "":
+		// A relay stopped between intent and outcome. Never type again.
+		seen.Outcome, seen.Reason, seen.At = api.RuntimePromptAmbiguous, "relay stopped during an answer", now
+	case seen.Outcome != "" && seen.Outcome != api.RuntimePromptSkipped:
+		// Decided once per prompt and run.
+	case api.RuntimePromptAnswers(action) && runtime == "codex" && runtimePromptTargets[match.Kind][action] != "":
+		seen.Action = action
+		l.Seen[match.Fingerprint] = seen
+		// An answer outlives the tick's short budget: its confirmation alone
+		// may take five seconds.
+		answerCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 20*time.Second)
+		seen.Outcome, seen.Reason = answerRuntimePrompt(answerCtx, deps, b, client, &l, first, match, action, save)
+		cancel()
+		seen.At = deps.now().UTC()
+		if seen.Outcome != api.RuntimePromptSkipped {
+			seen.Attempted = true
+		}
+	case action == api.RuntimePromptReport:
+		seen.Action, seen.Outcome, seen.Reason, seen.At = action, api.RuntimePromptReported, "", now
+	default:
+		seen.Action, seen.Outcome, seen.Reason, seen.At = api.RuntimePromptEscalate, api.RuntimePromptEscalated, "", now
+	}
+	if seen.Action == "" {
+		seen.Action = action
+	}
+	l.Seen[match.Fingerprint] = seen
+	kind, _ := api.LookupRuntimePromptKind(match.Kind)
+	l.Prompt = &api.RuntimePrompt{Kind: match.Kind, Runtime: runtime, Label: kind.Label, Fingerprint: match.Fingerprint, Since: seen.Since.UTC(), Action: seen.Action, Outcome: seen.Outcome, Reason: seen.Reason, At: seen.At.UTC()}
+	logRuntimePrompt(&l, b.Agent, now)
+	if err := save(); err != nil {
+		return nil, err
+	}
+	return l.Prompt, nil
+}
+
+// answerRuntimePrompt selects the policy's option with the same safety rules
+// as a Claude wake: an eligible agent in an active project, two identical
+// inspections, a durable intent before any key, the selection verified on
+// the exact target label before a separate Enter, confirmation that the
+// prompt is gone, and no resend. It returns the outcome and a bounded reason.
+func answerRuntimePrompt(ctx context.Context, deps *runtimePromptDeps, b runtimeBinding, client *api.Client, l *runtimePromptLocal, first runtimePane, match runtimePromptMatch, action string, save func() error) (string, string) {
+	now := deps.now()
+	recent := l.Answers[:0]
+	for _, at := range l.Answers {
+		if now.Sub(at) < runtimePromptAnswerWindow {
+			recent = append(recent, at)
+		}
+	}
+	l.Answers = recent
+	if len(l.Answers) >= runtimePromptAnswerLimit {
+		return api.RuntimePromptSkipped, fmt.Sprintf("answer limit of %d per %s reached", runtimePromptAnswerLimit, runtimePromptAnswerWindow)
+	}
+	if active, err := relayProjectActive(ctx, client, b); err != nil || !active {
+		return api.RuntimePromptSkipped, "project not active"
+	}
+	a, err := client.GetAgent(ctx, b.Task, b.Agent)
+	if err != nil {
+		return api.RuntimePromptSkipped, "agent unavailable"
+	}
+	if reason := relayAgentSkipReason(a, b); reason != "" {
+		return api.RuntimePromptSkipped, reason
+	}
+	target := runtimePromptTargets[match.Kind][action]
+	second, err := deps.inspect(ctx, b)
+	if err != nil || !samePane(first, second) {
+		return api.RuntimePromptSkipped, "pane changed before the answer"
+	}
+	again, ok := classifyRuntimePrompt("codex", plainRuntimeScreen(second.Raw))
+	if !ok || again.Fingerprint != match.Fingerprint || again.Kind != match.Kind {
+		return api.RuntimePromptSkipped, "prompt changed before the answer"
+	}
+	from, to := again.selected(), again.option(target)
+	if from < 0 || to < 0 {
+		return api.RuntimePromptFailed, "target option not found"
+	}
+	key, steps := "Down", to-from
+	if steps < 0 {
+		key, steps = "Up", -steps
+	}
+	keys := make([]string, steps)
+	for i := range keys {
+		keys[i] = key
+	}
+	l.Intent = &runtimePromptIntent{Fingerprint: match.Fingerprint, Kind: match.Kind, Action: action, Target: target, Keys: append(keys, "Enter"), Pane: second.Pane, Phase: "uncertain", At: now.UTC()}
+	seen := l.Seen[match.Fingerprint]
+	seen.Attempted = true
+	l.Seen[match.Fingerprint] = seen
+	l.Answers = append(l.Answers, now.UTC())
+	if err := save(); err != nil {
+		return api.RuntimePromptFailed, "answer intent could not be saved"
+	}
+	finish := func(outcome, reason string) (string, string) {
+		l.Intent.Phase = outcome
+		_ = save()
+		return outcome, reason
+	}
+	if len(keys) > 0 {
+		if err := deps.send(ctx, second.Pane, keys...); err != nil {
+			return finish(api.RuntimePromptAmbiguous, "navigation keys failed")
+		}
+		deps.sleep(150 * time.Millisecond)
+	}
+	third, err := deps.inspect(ctx, b)
+	if err != nil || !samePane(first, third) {
+		return finish(api.RuntimePromptFailed, "pane changed before Enter")
+	}
+	moved, ok := classifyRuntimePrompt("codex", plainRuntimeScreen(third.Raw))
+	if !ok || moved.Fingerprint != match.Fingerprint {
+		return finish(api.RuntimePromptFailed, "prompt changed before Enter")
+	}
+	if at := moved.selected(); at < 0 || moved.Options[at].Label != target {
+		return finish(api.RuntimePromptFailed, "selection is not on the policy option")
+	}
+	l.Intent.Phase = "entered"
+	if err := save(); err != nil {
+		return api.RuntimePromptFailed, "answer intent could not be saved"
+	}
+	if err := deps.send(ctx, third.Pane, "Enter"); err != nil {
+		return finish(api.RuntimePromptAmbiguous, "Enter failed")
+	}
+	deadline := deps.now().Add(runtimePromptConfirmWait)
+	for {
+		deps.sleep(100 * time.Millisecond)
+		if pane, err := deps.inspect(ctx, b); err == nil && samePane(first, pane) {
+			if after, ok := classifyRuntimePrompt("codex", plainRuntimeScreen(pane.Raw)); !ok || after.Fingerprint != match.Fingerprint {
+				return finish(api.RuntimePromptConfirmed, "selected the policy option")
+			}
+		}
+		if !deps.now().Before(deadline) || ctx.Err() != nil {
+			return finish(api.RuntimePromptAmbiguous, "prompt still shown after Enter")
+		}
+	}
+}
+
+// runtimePromptKey is the prompt part of the activity tick's change key. It
+// is empty without a prompt, so existing cursors keep their keys.
+func runtimePromptKey(p *api.RuntimePrompt) string {
+	if p == nil {
+		return ""
+	}
+	return "|prompt:" + p.Kind + "/" + p.Fingerprint + "/" + p.Action + "/" + p.Outcome + "/" + p.Reason
+}
+
+// runtimePromptStatus is the prompt part of a tt relay --status line.
+func runtimePromptStatus(b runtimeBinding) string {
+	p := loadRuntimePromptLocal(b).Prompt
+	if p == nil {
+		return ""
+	}
+	return fmt.Sprintf(" prompt=%s action=%s outcome=%s prompt-at=%s", p.Kind, p.Action, p.Outcome, p.At.Format(time.RFC3339))
 }
