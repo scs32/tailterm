@@ -572,8 +572,8 @@ try {
     const context = await browser.newContext({
         viewport: { width: 390, height: 844 },
       }),
-      page = await context.newPage(),
       errors = [];
+    let page = await context.newPage();
     page.on("pageerror", (e) => errors.push(e.message));
     await page.goto(origin + "/?task=" + task.id);
     await page.waitForFunction(() => !!window.qa);
@@ -643,6 +643,115 @@ try {
     await page.evaluate(() => window.qa.show("tasks"));
     await page.locator('[data-task-select="' + task.id + '"]').click();
     await expect(page.locator("[data-owner-wait]")).toHaveCount(0);
+    // wi_2f6f24bc62b24a7a / order #13877: owner delegation windows in TailOS.
+    // A reload is a fresh page after the old one stops its reads, so a
+    // cancelled in-flight fetch is not mistaken for a page error.
+    const reopen = async () => {
+      await page.evaluate(() => {
+        for (const v of [window.qa.board, window.qa.queue, window.qa.tasks])
+          v.hide();
+        window.qa.client.dispose();
+      });
+      await page.close();
+      page = await context.newPage();
+      page.on("pageerror", (e) => errors.push(e.message));
+      await page.goto(origin + "/?task=" + task.id);
+      await page.waitForFunction(() => !!window.qa);
+    };
+    await page.evaluate((task) => window.qa.show("board", task), task.id);
+    await page.locator("[data-delegation-toggle] summary").click();
+    await page
+      .locator("[data-delegation-open] select[name=delegate]")
+      .selectOption(lead.id);
+    await page
+      .locator("[data-delegation-open] select[name=scope]")
+      .selectOption("decisions_merges_deploys");
+    await page.locator("[data-delegation-open] button[type=submit]").click();
+    await expect(page.locator("[data-delegation-window]")).toContainText(
+      "Delegated to lead",
+    );
+    await expect(page.locator("[data-delegation-window]")).toContainText(
+      "Decisions, merges and deploys",
+    );
+    await reopen();
+    await expect(page.locator("[data-delegation-window]")).toContainText(
+      "Delegated to lead",
+    );
+    const routed = await api(
+      "POST",
+      base + "/messages",
+      {
+        agentId: worker.id,
+        runId: worker.runId,
+        to: "owner",
+        requestId: name + "-delegated-request",
+        workItems: [
+          {
+            itemTaskId: task.id,
+            itemId: items[0].id,
+            itemRevision: items[0].revision,
+            relationship: "primary",
+          },
+        ],
+        workOrderMessage: { taskId: task.id, seq: items[0].order.seq },
+        envelope: {
+          kind: "request",
+          to: "owner",
+          subject: "Choose the delegated rollout order",
+          body: { ask: "Staged or all at once?" },
+        },
+      },
+      201,
+    );
+    await page.evaluate(() => window.qa.refresh());
+    await expect(page.locator("[data-delegated-to]")).toHaveText(
+      "Delegated to lead",
+    );
+    const delegated = (
+      await api("GET", base + "/obligations?owner=1&open=1")
+    ).obligations.find((o) => o.messageSeq === routed.seq);
+    await api(
+      "POST",
+      base + "/obligations/" + delegated.id + "/answer",
+      {
+        agentId: lead.id,
+        runId: lead.runId,
+        text: "Staged first",
+        rationale: "Staged keeps the rollback simple.",
+        requestId: name + "-delegate-answer",
+      },
+      201,
+    );
+    await page.evaluate(() => window.qa.refresh());
+    await expect(page.locator("[data-delegated-answers] summary")).toHaveText(
+      "Delegated answers (1)",
+    );
+    await page.locator("[data-delegated-answers] summary").click();
+    await expect(page.locator("[data-delegated-answer]")).toContainText(
+      "Rationale: Staged keeps the rollback simple.",
+    );
+    await expect(page.locator("[data-delegated-answer]")).toContainText(
+      "Staged first",
+    );
+    await page.screenshot({
+      path: ".build/owner-delegation-" + name + "-open.png",
+    });
+    await page.locator("[data-delegation-end]").click();
+    await expect(page.locator("[data-delegation-window]")).toHaveCount(0);
+    await expect(page.locator("[data-delegation-toggle]")).toHaveCount(1);
+    await page.locator("[data-delegation-toggle] summary").click();
+    await page.screenshot({
+      path: ".build/owner-delegation-" + name + "-form.png",
+    });
+    const windows = await api("GET", base + "/delegation-windows");
+    assert.equal(windows.windows[0].state, "closed");
+    assert.equal(windows.windows[0].openedSource.kind, "tailos");
+    await reopen();
+    await expect(page.locator("[data-delegated-answers] summary")).toHaveText(
+      "Delegated answers (1)",
+    );
+    const strip = await page.locator("[data-delegation]").boundingBox();
+    assert.ok(strip.width <= 390, "delegation strip fits a phone width");
     assert.deepEqual(errors, []);
     await page.evaluate(() => {
       for (const v of [window.qa.board, window.qa.queue, window.qa.tasks])
@@ -655,7 +764,7 @@ try {
     console.log(
       "PASS " +
         name +
-        ": full owner requests beyond 200, exact approval, CLI, item isolation, clocks and resolution refresh",
+        ": full owner requests beyond 200, exact approval, CLI, item isolation, clocks, resolution refresh and delegation windows",
     );
   }
 } finally {

@@ -26,6 +26,9 @@ type DecisionRequest struct {
 	Options              []DecisionOption `json:"options"`
 	RecommendedOptionID  string           `json:"recommendedOptionId"`
 	RecommendationReason string           `json:"recommendationReason"`
+	// Category is decision (the default), merge, deploy or matrix; it decides
+	// whether an owner delegation window may route the decision.
+	Category string `json:"category,omitempty"`
 }
 
 type CreateDecisionRequest struct {
@@ -40,7 +43,11 @@ type AnswerDecisionRequest struct {
 	RequestID string `json:"requestId"`
 	OptionID  string `json:"optionId,omitempty"`
 	Text      string `json:"text,omitempty"`
+	// AgentID, RunID and Rationale are set only by a delegate answering under
+	// an owner delegation window; otherwise only a human answers.
 	AgentID   string `json:"agentId,omitempty"`
+	RunID     string `json:"runId,omitempty"`
+	Rationale string `json:"rationale,omitempty"`
 }
 
 type DecisionAnswer struct {
@@ -83,6 +90,9 @@ func ValidateDecisionRequest(req DecisionRequest) error {
 	if !recommended || !decisionText(req.RecommendationReason, 1000, true) {
 		return fmt.Errorf("%w: recommend one listed choice and explain why", ErrInvalid)
 	}
+	if req.Category != "" && !ValidRequestCategory(req.Category) {
+		return fmt.Errorf("%w: category must be decision, merge, deploy or matrix", ErrInvalid)
+	}
 	if !ValidText(FormatDecisionRequest(req), MaxTextLen) {
 		return fmt.Errorf("%w: rendered decision exceeds the message limit", ErrInvalid)
 	}
@@ -100,6 +110,9 @@ func FormatDecisionRequest(req DecisionRequest) string {
 		out.WriteString("\n" + option.Description)
 	}
 	out.WriteString("\n\nRecommendation: " + req.RecommendationReason)
+	if req.Category != "" && req.Category != RequestCategoryDecision {
+		out.WriteString("\n\nCategory: " + req.Category)
+	}
 	out.WriteString("\n\nAnswer this decision on the Board. A recommendation is not a submitted answer.")
 	return out.String()
 }
@@ -134,6 +147,11 @@ func FormatDecisionAnswer(seq int64, req AnswerDecisionRequest, question Decisio
 		text += "\n" + req.Text
 	}
 	return text
+}
+
+// FormatDelegatedDecisionAnswer marks a delegate's answer and its rationale.
+func FormatDelegatedDecisionAnswer(seq int64, req AnswerDecisionRequest, question DecisionRequest, delegate string) string {
+	return FormatDecisionAnswer(seq, req, question) + "\n\nDelegated answer by " + delegate + " on behalf of the owner.\nRationale: " + req.Rationale
 }
 
 func (c *Client) CreateDecision(ctx context.Context, taskID string, req CreateDecisionRequest) (Message, error) {

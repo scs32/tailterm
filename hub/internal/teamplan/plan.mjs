@@ -1720,6 +1720,15 @@ function createHubClient({ fetchImpl, baseURL, token = "" }) {
         method: "POST",
         body,
       }),
+    listDelegationWindows: async (task) =>
+      (await request(`/v1/tasks/${task}/delegation-windows`)).windows,
+    openDelegationWindow: (task, body) =>
+      request(`/v1/tasks/${task}/delegation-windows`, { method: "POST", body }),
+    closeDelegationWindow: (task, id, body) =>
+      request(
+        `/v1/tasks/${task}/delegation-windows/${encodeURIComponent(id)}/close`,
+        { method: "POST", body },
+      ),
     listDecisions: (task, params = {}) =>
       request(`/v1/tasks/${task}/decisions` + q(params)),
     listInterventions: (task, params = {}) =>

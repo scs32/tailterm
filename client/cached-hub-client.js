@@ -28,9 +28,11 @@ export function createCachedHubClient({
   const optionalOwnerRead = (path) => {
     const url = new URL(path, client.base);
     return (
-      (url.pathname.includes("/usage") ||
+      url.pathname.endsWith("/delegation-windows") ||
+      ((url.pathname.includes("/usage") ||
         url.pathname.endsWith("/obligations")) &&
-      (url.pathname.includes("/usage") || url.searchParams.get("owner") === "1")
+        (url.pathname.includes("/usage") ||
+          url.searchParams.get("owner") === "1"))
     );
   };
   const paths = new Set(),
@@ -466,6 +468,18 @@ export function createCachedHubClient({
       ).obligations,
     answerOwnerObligation: async (task, id, body) => {
       const result = await client.answerOwnerObligation(task, id, body);
+      invalidate();
+      return result;
+    },
+    listDelegationWindows: async (task) =>
+      (await read(`/v1/tasks/${task}/delegation-windows`)).windows,
+    openDelegationWindow: async (task, body) => {
+      const result = await client.openDelegationWindow(task, body);
+      invalidate();
+      return result;
+    },
+    closeDelegationWindow: async (task, id, body) => {
+      const result = await client.closeDelegationWindow(task, id, body);
       invalidate();
       return result;
     },

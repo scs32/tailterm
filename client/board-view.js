@@ -1,4 +1,5 @@
 import {
+  renderDelegationStrip,
   renderOwnerRequests,
   startOwnerAgeClock,
 } from "./owner-obligations.js";
@@ -239,6 +240,17 @@ export function createBoardView({
     ownerErrors = new Map(),
     ownerAnswerDrafts = new Map(),
     ownerAnswerKeys = new Map();
+  // Owner delegation windows: hub state per project plus per-project drafts.
+  let delegationWindows = [],
+    delegationTask = null,
+    delegationClient = null,
+    delegationGeneration = 0;
+  const delegationSending = new Set(),
+    delegationErrors = new Map(),
+    delegationDrafts = new Map(),
+    delegationKeys = new Map(),
+    delegationFormOpen = new Set(),
+    delegationAnswersOpen = new Set();
   const decisionSending = new Set();
   const decisionErrors = new Map();
   const revealedAnswers = new Set();
@@ -783,6 +795,30 @@ export function createBoardView({
     ownerRequests = requests;
     if (detail?.task.id === id) render();
   }
+  // Delegation windows are optional presentation data, loaded like owner requests.
+  async function loadDelegationWindows(id, token, actionClient) {
+    const generation = ++delegationGeneration;
+    if (delegationTask !== id || delegationClient !== actionClient) {
+      delegationWindows = [];
+      delegationTask = id;
+      delegationClient = actionClient;
+    }
+    if (!id) return;
+    let windows = [];
+    try {
+      windows = (await actionClient.listDelegationWindows?.(id)) || [];
+    } catch {
+      // An older hub without windows keeps the strip hidden.
+    }
+    if (
+      generation !== delegationGeneration ||
+      !currentAction(id, token, actionClient)
+    )
+      return;
+    if (JSON.stringify(delegationWindows) === JSON.stringify(windows)) return;
+    delegationWindows = windows;
+    if (detail?.task.id === id) render();
+  }
   async function reload(token = epoch, retry = () => show()) {
     if (!visible) return;
     if (pendingTokens.has(token)) {
@@ -809,6 +845,7 @@ export function createBoardView({
       if (tasks.find((t) => t.id === id)?.status === "open")
         completeConversations.delete(id);
       void loadOwnerRequests(id, token, actionClient);
+      void loadDelegationWindows(id, token, actionClient);
       const result = id
         ? await Promise.all([
             actionClient.getTask(id),
@@ -1113,7 +1150,7 @@ export function createBoardView({
             .map(rosterAgent)
             .join(
               "",
-            )}</div></div>${renderDecisionPanel({ records: decisions, taskId: selected, archived, name, drafts: decisionDrafts, sending: decisionSending, errors: decisionErrors, revealedAnswers, historyOpen: decisionPresentation.get(selected)?.historyOpen, loadError: decisionLoadError })}${renderOwnerRequests(ownerRequests, { archived, sending: ownerSending, errors: ownerErrors })}${recoveryMarkup}<div id="board-messages" class="board-messages">${messages.length === 200 && !completeConversations.has(selected) ? `<p class="fine">Latest 200 messages.${archived ? ' <button id="board-full-history">Show full conversation</button>' : " Full history remains on the hub."}</p>` : ""}${messageMarkup}</div>${
+            )}</div></div>${renderDecisionPanel({ records: decisions, taskId: selected, archived, name, drafts: decisionDrafts, sending: decisionSending, errors: decisionErrors, revealedAnswers, historyOpen: decisionPresentation.get(selected)?.historyOpen, loadError: decisionLoadError })}${delegationTask === selected ? renderDelegationStrip(delegationWindows, { agents, archived, sending: delegationSending.has(selected), error: delegationErrors.get(selected), draft: delegationDrafts.get(selected), formOpen: delegationFormOpen.has(selected), answersOpen: delegationAnswersOpen.has(selected) }) : ""}${renderOwnerRequests(ownerRequests, { archived, sending: ownerSending, errors: ownerErrors, windows: delegationTask === selected ? delegationWindows : [] })}${recoveryMarkup}<div id="board-messages" class="board-messages">${messages.length === 200 && !completeConversations.has(selected) ? `<p class="fine">Latest 200 messages.${archived ? ' <button id="board-full-history">Show full conversation</button>' : " Full history remains on the hub."}</p>` : ""}${messageMarkup}</div>${
             archived
               ? ""
               : `<form id="board-compose">${d.replyTo ? `<div class="compose-reply">Replying to #${d.replyTo}<button type="button" id="board-cancel-reply" data-view-control="cancel-reply">Cancel reply</button></div>` : ""}<label class="compose-recipient">To<select ${sending.has(selected) ? "disabled" : ""} id="board-to" data-view-control="recipient" aria-label="Recipient"><option value="">Everyone</option>${agents
@@ -1169,6 +1206,85 @@ export function createBoardView({
       (button) =>
         (button.onclick = () => {
           void submitOwner(button.dataset.ownerApprove, true, "");
+        }),
+    );
+    const delegationAction = async (run) => {
+      if (delegationSending.has(ownerTask)) return;
+      delegationSending.add(ownerTask);
+      delegationErrors.delete(ownerTask);
+      render();
+      try {
+        await run();
+        if (visible && selected === ownerTask && client() === ownerClient)
+          await loadDelegationWindows(ownerTask, epoch, ownerClient);
+      } catch (error) {
+        delegationErrors.set(ownerTask, error.message);
+      } finally {
+        delegationSending.delete(ownerTask);
+        if (visible && selected === ownerTask && client() === ownerClient)
+          render();
+      }
+    };
+    const delegationToggle = root.querySelector("[data-delegation-toggle]");
+    if (delegationToggle)
+      delegationToggle.ontoggle = () =>
+        delegationToggle.open
+          ? delegationFormOpen.add(ownerTask)
+          : delegationFormOpen.delete(ownerTask);
+    const answersToggle = root.querySelector("[data-delegated-answers]");
+    if (answersToggle)
+      answersToggle.ontoggle = () =>
+        answersToggle.open
+          ? delegationAnswersOpen.add(ownerTask)
+          : delegationAnswersOpen.delete(ownerTask);
+    const delegationForm = root.querySelector("[data-delegation-open]");
+    if (delegationForm) {
+      const draft = () => ({
+        delegate: delegationForm.elements.delegate.value,
+        endsAt: delegationForm.elements.endsAt.value,
+        scope: delegationForm.elements.scope.value,
+      });
+      delegationForm.oninput = () => delegationDrafts.set(ownerTask, draft());
+      delegationForm.onsubmit = (event) => {
+        event.preventDefault();
+        const value = draft();
+        delegationDrafts.set(ownerTask, value);
+        const body = {
+          delegate: value.delegate,
+          endsAt: new Date(value.endsAt).toISOString(),
+          scope: value.scope,
+          source: { kind: "tailos" },
+        };
+        const key = `${ownerTask}/open/${JSON.stringify(body)}`;
+        if (!delegationKeys.has(key))
+          delegationKeys.set(key, crypto.randomUUID());
+        void delegationAction(async () => {
+          await ownerClient.openDelegationWindow(ownerTask, {
+            ...body,
+            requestId: delegationKeys.get(key),
+          });
+          delegationDrafts.delete(ownerTask);
+          delegationFormOpen.delete(ownerTask);
+        });
+      };
+    }
+    root.querySelectorAll("[data-delegation-end]").forEach(
+      (button) =>
+        (button.onclick = () => {
+          const key = `${ownerTask}/close/${button.dataset.delegationEnd}`;
+          if (!delegationKeys.has(key))
+            delegationKeys.set(key, crypto.randomUUID());
+          void delegationAction(() =>
+            ownerClient.closeDelegationWindow(
+              ownerTask,
+              button.dataset.delegationEnd,
+              {
+                reason: "ended in TailOS",
+                source: { kind: "tailos" },
+                requestId: delegationKeys.get(key),
+              },
+            ),
+          );
         }),
     );
     presentation.afterRender(selected);

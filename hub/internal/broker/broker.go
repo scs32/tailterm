@@ -26,7 +26,8 @@ type Step struct {
 	TaskID       string
 	ObligationID string
 	MessageSeq   int64
-	Action       string // wake, nudge, escalate-lead, escalate-owner, recipient-gone, project-stalled
+	WindowID     string // delegation-expired only
+	Action       string // wake, nudge, escalate-lead, escalate-owner, recipient-gone, project-stalled, delegation-expired
 }
 
 func wakesDue(o store.BrokerObligation, now time.Time) int {
@@ -41,12 +42,22 @@ func wakesDue(o store.BrokerObligation, now time.Time) int {
 
 // Tick runs one scheduling pass at now.
 func (b *Broker) Tick(ctx context.Context, now time.Time) ([]Step, error) {
-	open, err := b.Store.BrokerOpenObligations(ctx)
-	if err != nil {
-		return nil, err
-	}
 	var steps []Step
 	var firstErr error
+	// Owner delegation windows end at their time, in paused projects too, so
+	// routed requests return to the owner. Answers are refused at the end time
+	// by the store itself; this hands the requests back.
+	expired, err := b.Store.BrokerExpireDelegationWindows(ctx, now)
+	for _, id := range expired {
+		steps = append(steps, Step{WindowID: id, Action: "delegation-expired"})
+	}
+	if err != nil {
+		firstErr = err
+	}
+	open, err := b.Store.BrokerOpenObligations(ctx)
+	if err != nil {
+		return steps, err
+	}
 	act := func(o store.BrokerObligation, action string, err error) {
 		switch {
 		case errors.Is(err, store.ErrBrokerStale):
@@ -160,7 +171,9 @@ func (b *Broker) Start(ctx context.Context) <-chan struct{} {
 					b.Log("broker: %v", err)
 				}
 				for _, s := range steps {
-					if s.Action != "wake" {
+					if s.Action == "delegation-expired" {
+						b.Log("broker: %s %s", s.Action, s.WindowID)
+					} else if s.Action != "wake" {
 						b.Log("broker: %s %s message %d", s.Action, s.ObligationID, s.MessageSeq)
 					}
 				}

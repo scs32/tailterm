@@ -53,8 +53,13 @@ func (s *Store) createOwnerObligation(ctx context.Context, tx *sql.Tx, m api.Mes
 		}
 		due = m.CreatedAt.Add(d)
 	}
-	_, err := tx.ExecContext(ctx, `INSERT INTO obligations (id,task_id,message_seq,agent_id,subject,source_kind,needs,state,created_at,ack_due_at,due_at,changed_at,recipient_kind) VALUES (?,?,?,'',?,?,?,?,?,?,?,?,?)`, newObligationID("obl"), m.TaskID, m.Seq, req.Envelope.Subject, api.EnvelopeKindRequest, api.ObligationNeedsAnswer, api.ObligationDelivered, ts(m.CreatedAt), ts(due), ts(due), ts(m.CreatedAt), api.ObligationRecipientOwner)
-	return err
+	id := newObligationID("obl")
+	if _, err := tx.ExecContext(ctx, `INSERT INTO obligations (id,task_id,message_seq,agent_id,subject,source_kind,needs,state,created_at,ack_due_at,due_at,changed_at,recipient_kind) VALUES (?,?,?,'',?,?,?,?,?,?,?,?,?)`, id, m.TaskID, m.Seq, req.Envelope.Subject, api.EnvelopeKindRequest, api.ObligationNeedsAnswer, api.ObligationDelivered, ts(m.CreatedAt), ts(due), ts(due), ts(m.CreatedAt), api.ObligationRecipientOwner); err != nil {
+		return err
+	}
+	// An open delegation window takes covered requests in the same transaction.
+	return s.routeIfDelegated(ctx, tx, m.TaskID, routable{kind: api.DelegationRouteObligation, seq: m.Seq, obligationID: id,
+		subject: req.Envelope.Subject, category: api.OwnerRequestCategory(m.Envelope), author: req.AgentID, source: m})
 }
 
 // Owner requests never enter agent wake, acknowledgement or project-stall scheduling.
