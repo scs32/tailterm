@@ -169,9 +169,34 @@ func verifyAcceptedGit(ctx context.Context, repository, base, worktree, branch, 
 		return errors.New("accepted worktree is dirty")
 	}
 	if _, err := git("merge-base", "--is-ancestor", base, sha); err != nil {
-		return errors.New("accepted commit is not descended from frozen base")
+		return errors.New("accepted commit is not a fast-forward of the recorded base")
 	}
 	return nil
+}
+
+// acceptanceBase returns the base an accepted candidate must fast-forward.
+// When the item has a current verification plan, that plan's base is the
+// recorded base the store saves with the acceptance, and the plan pins the
+// exact commit; otherwise the queue entry's base applies, as for legacy
+// items. Both callers are the item's handler, which may read the history.
+func acceptanceBase(ctx context.Context, c *api.Client, task, item, handlerAgent, handlerRun, entryBase, commit string) (string, error) {
+	records, err := c.VerificationHistory(ctx, task, item, handlerAgent, handlerRun)
+	if err != nil {
+		return "", fmt.Errorf("verification history for the acceptance base: %w", err)
+	}
+	var plan *api.VerificationPlan
+	for _, record := range records {
+		if record.Plan != nil {
+			plan = record.Plan
+		}
+	}
+	if plan == nil {
+		return entryBase, nil
+	}
+	if plan.Commit != commit {
+		return "", fmt.Errorf("--commit %s is not the verification plan commit %s", commit, plan.Commit)
+	}
+	return plan.BaseCommit, nil
 }
 
 // acceptedWorktree resolves an accepted builder worktree and checks that it

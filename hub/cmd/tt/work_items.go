@@ -296,7 +296,11 @@ func cmdWorkItemUpdate(e env, args []string) error {
 		// A retry after a lost response finds the entry already accepted: send
 		// the identical request so the hub replays the saved receipt.
 		if entry.Acceptance == nil {
-			if err = verifyAcceptedGit(ctx, entry.Repository, entry.BaseCommit, realWorktree, *branch, *commit); err != nil {
+			base, err := acceptanceBase(ctx, c, project, entry.ItemID, e.agent, e.runID, entry.BaseCommit, *commit)
+			if err != nil {
+				return err
+			}
+			if err = verifyAcceptedGit(ctx, entry.Repository, base, realWorktree, *branch, *commit); err != nil {
 				return fmt.Errorf("accepted Git tuple failed worktree verification: %v", err)
 			}
 		}

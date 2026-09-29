@@ -284,11 +284,15 @@ func cmdTeamQueue(e env, args []string) error {
 			if item.Status != "done" {
 				return errors.New("handler acceptance requires the saved done item")
 			}
+			base, err := acceptanceBase(ctx, c, *task, q.ItemID, e.agent, e.runID, q.BaseCommit, *commit)
+			if err != nil {
+				return err
+			}
 			req.Operation, req.RequestID = "accept", "queue-accept-"+q.ID
 			req.HandlerAgentID, req.HandlerRunID = e.agent, e.runID
-			req.Acceptance = &api.TeamIntegrationAcceptance{Repository: q.Repository, BaseCommit: q.BaseCommit, Worktree: realWorktree, Branch: *branch, Commit: *commit, ItemRevision: item.Revision, CompletionReport: item.CompletionReport, Evidence: *acceptanceEvidence}
+			req.Acceptance = &api.TeamIntegrationAcceptance{Repository: q.Repository, BaseCommit: base, Worktree: realWorktree, Branch: *branch, Commit: *commit, ItemRevision: item.Revision, CompletionReport: item.CompletionReport, Evidence: *acceptanceEvidence}
 			if q.Acceptance == nil {
-				ready, err := queueIntegrationSnapshot(ctx, api.TeamQueueEntry{Repository: q.Repository, BaseCommit: q.BaseCommit, Acceptance: req.Acceptance}, item, api.TeamCloseRequest{})
+				ready, err := queueIntegrationSnapshot(ctx, api.TeamQueueEntry{Repository: q.Repository, BaseCommit: base, Acceptance: req.Acceptance}, item, api.TeamCloseRequest{})
 				if err != nil || ready.Commit != *commit {
 					return fmt.Errorf("accepted Git tuple failed worktree verification: %v", err)
 				}
