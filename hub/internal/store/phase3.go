@@ -51,7 +51,10 @@ func migratePhase3(db *sql.DB) error {
 			return err
 		}
 	}
-	return migrateOwnerObligations(db)
+	if err := migrateOwnerObligations(db); err != nil {
+		return err
+	}
+	return migrateDelegationWindows(db)
 }
 
 // ---- Legacy close-out ----
@@ -472,6 +475,15 @@ func (s *Store) AnswerObligation(ctx context.Context, taskID, obligationID strin
 	if (!req.Approve && strings.TrimSpace(text) == "") || !api.ValidText(text, 4000) || (req.Source != nil && !api.ValidMessageSource(*req.Source)) {
 		return api.OwnerActionResult{}, api.ErrInvalid
 	}
+	// An agent answering without a per-request session grant answers under an
+	// owner delegation window, and must give its rationale.
+	windowAnswer := req.DelegateSession == "" && (req.AgentID != "" || req.RunID != "")
+	if windowAnswer && (!api.ValidID(req.AgentID, "agt") || req.Source != nil) {
+		return api.OwnerActionResult{}, fmt.Errorf("%w: a delegated answer needs the delegate's agent and run", api.ErrInvalid)
+	}
+	if !windowAnswer && req.Rationale != "" {
+		return api.OwnerActionResult{}, fmt.Errorf("%w: a rationale belongs to a delegated answer", api.ErrInvalid)
+	}
 	return s.ownerAction(ctx, taskID, "answer", obligationID, req.RequestID, req, by, func(tx *sql.Tx, task api.Task, now time.Time) (api.OwnerActionResult, error) {
 		o, err := openObligation(ctx, tx, taskID, obligationID)
 		if err != nil {
@@ -484,7 +496,19 @@ func (s *Store) AnswerObligation(ctx context.Context, taskID, obligationID strin
 		if err != nil {
 			return api.OwnerActionResult{}, err
 		}
-		grant, err := s.verifyOwnerDelegate(ctx, tx, taskID, o.ID, req)
+		var grant string
+		var delegated delegatedRoute
+		if windowAnswer {
+			if o.RecipientKind != api.ObligationRecipientOwner {
+				return api.OwnerActionResult{}, fmt.Errorf("%w: only owner requests can be delegated", api.ErrDelegationForbidden)
+			}
+			delegated, err = s.verifyWindowDelegate(ctx, tx, taskID, api.DelegationRouteObligation, o.MessageSeq, req.AgentID, req.RunID, now)
+			if err == nil && !api.ValidDelegationRationale(req.Rationale) {
+				err = errDelegationRationale
+			}
+		} else {
+			grant, err = s.verifyOwnerDelegate(ctx, tx, taskID, o.ID, req)
+		}
 		if err != nil {
 			return api.OwnerActionResult{}, err
 		}
@@ -493,6 +517,9 @@ func (s *Store) AnswerObligation(ctx context.Context, taskID, obligationID strin
 				return api.OwnerActionResult{}, api.ErrInvalid
 			}
 			text = source.Envelope.ExpectedAnswer
+		}
+		if windowAnswer && api.MentionsMatrixApproval(text, req.Rationale) {
+			return api.OwnerActionResult{}, errDelegateMatrix
 		}
 		reason := "answered by the owner"
 		if grant != "" {
@@ -512,10 +539,24 @@ func (s *Store) AnswerObligation(ctx context.Context, taskID, obligationID strin
 			env.Refs["delegation"] = grant
 			env.Refs["onBehalfOf"] = "owner"
 		}
+		// A window delegate's answer is its own message, marked as delegated
+		// and carrying its rationale. Being agent-authored, it can never serve
+		// as the owner's matrix approval.
+		if windowAnswer {
+			reason = "answered by delegate " + delegated.window.DelegateName + " on behalf of the owner under delegation window " + delegated.window.ID
+			env.Subject = "A delegate answered this owner request for the owner"
+			env.Body.Reason = req.Rationale
+			for k, v := range delegatedRefs(delegated.window) {
+				env.Refs[k] = v
+			}
+		}
 		// The answer keeps the question's item links, so an item-bound asker
 		// sees it in its inbox (as decision answers do).
 		reply := api.PostMessageRequest{Envelope: env, ReplyTo: o.MessageSeq, RequestID: "owner-answer-" + o.ID,
 			WorkItems: source.WorkItems, WorkOrderMessage: source.WorkOrderMessage}
+		if windowAnswer {
+			reply.AgentID, reply.RunID = req.AgentID, req.RunID
+		}
 		var asker api.Agent
 		if source.From.AgentID != "" {
 			if a, err := scanAgent(tx.QueryRowContext(ctx, `SELECT `+agentCols+` FROM agents WHERE id=?`, source.From.AgentID)); err == nil && a.Status != api.AgentClosed {
@@ -537,6 +578,11 @@ func (s *Store) AnswerObligation(ctx context.Context, taskID, obligationID strin
 		if _, err := tx.ExecContext(ctx, `UPDATE obligations SET state=?,outcome=?,outcome_seq=?,reason=?,closed_at=?,changed_at=? WHERE id=?`,
 			api.ObligationClosed, api.OutcomeAnswered, m.Seq, reason, ts(now), ts(now), o.ID); err != nil {
 			return api.OwnerActionResult{}, err
+		}
+		if windowAnswer {
+			if err := recordDelegatedAnswer(ctx, tx, delegated, m.Seq, req.RunID, req.Rationale, nil, now); err != nil {
+				return api.OwnerActionResult{}, err
+			}
 		}
 		o, err = scanObligation(tx.QueryRowContext(ctx, `SELECT `+obligationCols+` FROM obligations WHERE id=?`, o.ID))
 		return api.OwnerActionResult{Obligation: &o, Message: &m}, err

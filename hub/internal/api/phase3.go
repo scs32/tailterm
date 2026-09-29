@@ -35,7 +35,10 @@ type ObligationAnswerRequest struct {
 	Approve         bool           `json:"approve,omitempty"`
 	Source          *MessageSource `json:"source,omitempty"`
 	Text            string         `json:"text"`
-	RequestID       string         `json:"requestId"`
+	// Rationale is required from an agent answering under an owner delegation
+	// window (AgentID and RunID set, no DelegateSession), and only then.
+	Rationale string `json:"rationale,omitempty"`
+	RequestID string `json:"requestId"`
 }
 
 // ObligationCancelRequest closes an open obligation as cancelled.
@@ -52,10 +55,11 @@ type AgentResumeRequest struct {
 // OwnerActionResult is what an owner action changed. A retry with the same
 // request ID returns the original result.
 type OwnerActionResult struct {
-	DelegationID string      `json:"delegationId,omitempty"`
-	Action       string      `json:"action"`
-	Obligation   *Obligation `json:"obligation,omitempty"`
-	Message      *Message    `json:"message,omitempty"`
-	Agent        *Agent      `json:"agent,omitempty"`
-	Replay       bool        `json:"replay,omitempty"`
+	DelegationID string            `json:"delegationId,omitempty"`
+	Action       string            `json:"action"`
+	Obligation   *Obligation       `json:"obligation,omitempty"`
+	Message      *Message          `json:"message,omitempty"`
+	Agent        *Agent            `json:"agent,omitempty"`
+	Window       *DelegationWindow `json:"window,omitempty"`
+	Replay       bool              `json:"replay,omitempty"`
 }

@@ -59,7 +59,14 @@ VALUES(?,?,?,?,?,?,?)`, message.Seq, message.TaskID, request.Question, string(op
 		request.RecommendedOptionID, request.RecommendationReason, ts(message.CreatedAt)); err != nil {
 		return err
 	}
+	// The category lives beside the immutable request; the message projection
+	// never carries it, so a created and a reloaded request look the same.
+	if _, err = tx.ExecContext(ctx, `INSERT INTO decision_request_categories (task_id,message_seq,category) VALUES (?,?,?)`,
+		message.TaskID, message.Seq, api.DecisionCategory(request)); err != nil {
+		return err
+	}
 	copy := cloneDecisionRequest(request)
+	copy.Category = ""
 	message.DecisionRequest = &copy
 	return nil
 }
@@ -67,9 +74,10 @@ VALUES(?,?,?,?,?,?,?)`, message.Seq, message.TaskID, request.Question, string(op
 func loadDecisionRequest(q queryRower, ctx context.Context, taskID string, requestSeq int64) (api.DecisionRequest, error) {
 	var request api.DecisionRequest
 	var options string
-	err := q.QueryRowContext(ctx, `SELECT question,options,recommended_option_id,recommendation_reason
-FROM decision_requests WHERE task_id=? AND message_seq=?`, taskID, requestSeq).Scan(
-		&request.Question, &options, &request.RecommendedOptionID, &request.RecommendationReason,
+	err := q.QueryRowContext(ctx, `SELECT r.question,r.options,r.recommended_option_id,r.recommendation_reason,COALESCE(c.category,'')
+FROM decision_requests r LEFT JOIN decision_request_categories c ON c.task_id=r.task_id AND c.message_seq=r.message_seq
+WHERE r.task_id=? AND r.message_seq=?`, taskID, requestSeq).Scan(
+		&request.Question, &options, &request.RecommendedOptionID, &request.RecommendationReason, &request.Category,
 	)
 	if errors.Is(err, sql.ErrNoRows) {
 		return request, api.ErrNotFound
@@ -168,6 +176,10 @@ func (s *Store) CreateDecision(ctx context.Context, taskID string, req api.Creat
 	if err = insertDecisionRequest(ctx, tx, &message, req.DecisionRequest); err != nil {
 		return message, err
 	}
+	if err = s.routeIfDelegated(ctx, tx, taskID, routable{kind: api.DelegationRouteDecision, seq: message.Seq,
+		subject: clip(req.Question, 100), category: api.DecisionCategory(req.DecisionRequest), author: req.AgentID, source: message}); err != nil {
+		return message, err
+	}
 	if err = insertMessagePostReceipt(ctx, tx, &message, req.RequestID, payload, by); err != nil {
 		return message, err
 	}
@@ -186,8 +198,13 @@ type answerHashPayload struct {
 // AnswerDecision atomically stores the first human answer as a directed reply.
 // An exact retry is recovered before closure, resolution, or agent state checks.
 func (s *Store) AnswerDecision(ctx context.Context, taskID string, requestSeq int64, req api.AnswerDecisionRequest, by api.Caller) (api.Message, error) {
-	if req.AgentID != "" {
+	// Only a human answers, except a delegate under an owner delegation window.
+	windowAnswer := req.AgentID != "" || req.RunID != ""
+	if windowAnswer && !api.ValidID(req.AgentID, "agt") {
 		return api.Message{}, ErrDecisionAnswerForbidden
+	}
+	if !windowAnswer && req.Rationale != "" {
+		return api.Message{}, fmt.Errorf("%w: a rationale belongs to a delegated answer", api.ErrInvalid)
 	}
 	if !api.ValidID(taskID, "tsk") || requestSeq < 1 || !validRequestID(req.RequestID) {
 		return api.Message{}, api.ErrInvalid
@@ -201,7 +218,7 @@ func (s *Store) AnswerDecision(ctx context.Context, taskID string, requestSeq in
 		return api.Message{}, err
 	}
 	defer tx.Rollback()
-	if replay, found, err := replayMessageRequest(tx, ctx, taskID, req.RequestID, "", payload, by); found || err != nil {
+	if replay, found, err := replayMessageRequest(tx, ctx, taskID, req.RequestID, req.AgentID, payload, by); found || err != nil {
 		return replay, err
 	}
 	task, err := decisionTask(tx, ctx, taskID)
@@ -214,6 +231,22 @@ func (s *Store) AnswerDecision(ctx context.Context, taskID string, requestSeq in
 	request, err := loadDecisionRequest(tx, ctx, taskID, requestSeq)
 	if err != nil {
 		return api.Message{}, err
+	}
+	now := s.now()
+	var delegated delegatedRoute
+	if windowAnswer {
+		if delegated, err = s.verifyWindowDelegate(ctx, tx, taskID, api.DelegationRouteDecision, requestSeq, req.AgentID, req.RunID, now); err != nil {
+			if errors.Is(err, api.ErrDelegationForbidden) {
+				return api.Message{}, fmt.Errorf("%w: %w", ErrDecisionAnswerForbidden, err)
+			}
+			return api.Message{}, err
+		}
+		if !api.ValidDelegationRationale(req.Rationale) {
+			return api.Message{}, errDelegationRationale
+		}
+		if api.MentionsMatrixApproval(req.Text, req.Rationale) {
+			return api.Message{}, errDelegateMatrix
+		}
 	}
 	if err = api.ValidateDecisionAnswer(req, request); err != nil {
 		return api.Message{}, err
@@ -243,6 +276,16 @@ func (s *Store) AnswerDecision(ctx context.Context, taskID string, requestSeq in
 		WorkItems:        requestMessage.WorkItems,
 		WorkOrderMessage: requestMessage.WorkOrderMessage,
 	}
+	// A delegate's answer is its own message, marked delegated with its
+	// rationale; being agent-authored it can never be a matrix approval.
+	if windowAnswer {
+		messageReq.AgentID, messageReq.RunID = req.AgentID, req.RunID
+		refs := delegatedRefs(delegated.window)
+		refs["decision"] = fmt.Sprint(requestSeq)
+		messageReq.Envelope = &api.Envelope{Kind: api.EnvelopeKindAnswer, To: target.Name, Subject: "A delegate answered this decision for the owner", Refs: refs,
+			Body: api.EnvelopeBody{Answer: api.FormatDelegatedDecisionAnswer(requestSeq, req, request, delegated.window.DelegateName), Reason: req.Rationale}}
+		messageReq.Text = ""
+	}
 	// This typed answer copies the immutable request's exact item coordinates.
 	// The item may have advanced since the owner was asked, so the preserved
 	// considered revision is valid even when it is no longer current.
@@ -253,6 +296,16 @@ func (s *Store) AnswerDecision(ctx context.Context, taskID string, requestSeq in
 	answer := api.DecisionAnswer{RequestSeq: requestSeq, OptionID: req.OptionID, Text: req.Text}
 	if err = insertDecisionAnswer(ctx, tx, &message, answer); err != nil {
 		return message, err
+	}
+	if windowAnswer {
+		var followed *bool
+		if req.OptionID != "" {
+			v := req.OptionID == request.RecommendedOptionID
+			followed = &v
+		}
+		if err = recordDelegatedAnswer(ctx, tx, delegated, message.Seq, req.RunID, req.Rationale, followed, now); err != nil {
+			return message, err
+		}
 	}
 	if err = insertMessagePostReceipt(ctx, tx, &message, req.RequestID, payload, by); err != nil {
 		return message, err
