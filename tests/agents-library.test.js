@@ -318,6 +318,20 @@ test("Claude effort reaches tt argv only for exact verified models", () => {
     }),
     /--reasoning/,
   );
+  assert.match(
+    agentSpawnCommand({
+      ...base,
+      runtime: "codex",
+      run: "codex",
+      model: "gpt-6.1-sol",
+      reasoning: "xhigh",
+    }),
+    /--reasoning/,
+  );
+  assert.deepEqual(
+    reasoningOptions("codex", "gpt-6.1-sol"),
+    reasoningOptions("codex", "gpt-6-sol"),
+  );
   const supported = migrateAgentData({
     teams: [
       {

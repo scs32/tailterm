@@ -13,6 +13,7 @@ var effortFlag = regexp.MustCompile(`(^|\s)--effort(=|\s|$)`)
 
 var codexReasoningModels = map[string]map[string]bool{
 	"gpt-5.3-codex": {"low": true, "medium": true, "high": true, "xhigh": true},
+	"gpt-6.1-sol":   {"low": true, "medium": true, "high": true, "xhigh": true},
 	"gpt-6-astra":   {"low": true, "medium": true, "high": true, "xhigh": true},
 	"gpt-6-sol":     {"low": true, "medium": true, "high": true, "xhigh": true},
 	"gpt-6-luna":    {"low": true, "medium": true, "high": true, "xhigh": true},

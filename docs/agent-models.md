@@ -21,6 +21,8 @@ Sources checked September 7, 2026:
 - GPT-6 Sol (`gpt-6-sol`) and Luna (`gpt-6-luna`) were added September 23, 2026 from the
   [Codex models page](https://learn.chatgpt.com/docs/models); served to the owner's
   ChatGPT-account Codex from `codex-cli` 0.156.1 (0.154.0 rejected it).
+- GPT-6.1 Sol (`gpt-6.1-sol`) was added September 29, 2026; served from `codex-cli`
+  0.159.0 (0.156.1 rejected it on ChatGPT accounts).
 - [Gemini CLI model selection](https://geminicli.com/docs/cli/model/): explicit
   Gemini 3 preview and Gemini 2.5 Pro/Flash IDs.
 
