@@ -250,7 +250,8 @@
         "package-lock.json",
         "vite.config.js",
         "scripts/",
-        "verification/"
+        "verification/",
+        "shared/tmux-command.js"
       ],
       "groups": ["unit", "browser"]
     },
