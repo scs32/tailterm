@@ -1,0 +1,48 @@
+# Runtime prompt live check (plan a12)
+# Bug wi_7d5050c57193db78 r1, order #13871, assign #14367
+# Host: Stephens-Mini, macOS 26.5.2, tmux 3.7b, go1.26.6
+# Code: branch rtprompt-7d5050c5 at 5f7f99e (clean: 0 changed files)
+# Started: 2026-09-29T03:42:05Z
+# Command (from hub/): TT_LIVE_RUNTIME_PROMPT=1 go test ./cmd/tt -run '^TestRuntimePromptLive' -count=1 -v
+# Private tmux sockets, isolated SQLite/HTTP hub in a temp folder, disposable CODEX_HOME with a fake API key.
+# The relay's 'now' runs 16 s ahead per tick to keep the tick spacing without waiting; the quiet window is set to 5 s.
+
+=== RUN   TestRuntimePromptLiveClaudePermission
+    runtime_prompt_live_test.go:52: claude version: 2.1.284 (Claude Code)
+    runtime_prompt_live_test.go:53: ~/.claude/settings.json before: ac8f3d16292b40647bdcace1cc7e745b700f086b944480bb4adcd06531f7335c mtime=2026-09-28T23:28:11.771844836Z
+    runtime_prompt_live_test.go:144: permission dialog is up
+[tt relay] 2026-09-29T03:42:28Z agt_5032c5c730d76948 runtime prompt claude_permission: escalate escalated
+    runtime_prompt_live_test.go:164: activity state=runtime_prompt reason=""
+    runtime_prompt_live_test.go:173: reported runtime_prompt kind=claude_permission action=escalate outcome=escalated fingerprint=e1e9701bacf9b9937093720bbf816dec
+    runtime_prompt_live_test.go:187: owner notice #1: NOTICE: Agent is waiting on a runtime prompt
+        Refs: activity=runtime_prompt; agent=agt_5032c5c730d76948; promptKind=claude_permission; run=run_a12df761ad476485
+        Text: claude-live is waiting on a runtime prompt: Claude permission dialog (since 2026-09-29T03:42:28Z). Policy action escalate, outcome escalated. Open the agent's terminal to answer it; the relay will not type into it.
+    runtime_prompt_live_test.go:199: dialog still up, zero keys sent, command did not run
+    runtime_prompt_live_test.go:101: private tmux cleanup socket=tt-rtprompt-live-5d791a45a4893dce: <nil> 
+    runtime_prompt_live_test.go:103: ~/.claude/settings.json after: ac8f3d16292b40647bdcace1cc7e745b700f086b944480bb4adcd06531f7335c mtime=2026-09-28T23:28:11.771844836Z
+--- PASS: TestRuntimePromptLiveClaudePermission (4.98s)
+=== RUN   TestRuntimePromptLiveCodexMigration
+    runtime_prompt_live_test.go:220: codex version: codex-cli 0.156.1
+    runtime_prompt_live_test.go:221: ~/.codex/config.toml before: 003209d7f82b44a427cd11f0a1ba84e27973cda0412fed03a9dbe2a0fe4a960e mtime=2026-09-28T17:26:11.091760022Z
+    runtime_prompt_live_test.go:294: model migration menu is up
+[tt relay] 2026-09-29T03:42:29Z agt_3adcffc29b15340c runtime prompt codex_model_migration: use_existing confirmed (selected the policy option)
+    runtime_prompt_live_test.go:313: activity state=runtime_prompt reason=""
+    runtime_prompt_live_test.go:322: reported runtime_prompt kind=codex_model_migration action=use_existing outcome=confirmed reason="selected the policy option"; keys sent [Down Enter]
+    runtime_prompt_live_test.go:335: pane shows the idle composer on GPT-5.5; disposable config:
+        model = "gpt-5.5"
+        check_for_update_on_startup = false
+        
+        [projects."/private/var/folders/p8/3rs14vyj49qcyw14jy7dddcr0000gn/T/TestRuntimePromptLiveCodexMigration3272771881/003"]
+        trust_level = "trusted"
+        
+        [tui]
+        screen_reader_detection_done = true
+        
+        [notice.model_migrations]
+        "gpt-5.5" = "gpt-6-sol"
+    runtime_prompt_live_test.go:271: private tmux cleanup socket=tt-rtprompt-live-65b3a144ef0b68e7: <nil> 
+    runtime_prompt_live_test.go:273: ~/.codex/config.toml after: 003209d7f82b44a427cd11f0a1ba84e27973cda0412fed03a9dbe2a0fe4a960e mtime=2026-09-28T17:26:11.091760022Z
+--- PASS: TestRuntimePromptLiveCodexMigration (2.25s)
+PASS
+ok  	github.com/scs32/tailterm/hub/cmd/tt	7.610s
+# exit=0

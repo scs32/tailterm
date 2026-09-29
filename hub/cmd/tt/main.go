@@ -37,6 +37,7 @@ Commands
   projects                     list projects on the hub (tasks is an alias)
   project-pause <get|pause|handoff|resume>  explicit project team lifecycle
   handler <rotate|rotation|policy|spec>  rotate a project's database handler (owner)
+  prompt-policy <get|set>      runtime prompt policy per prompt kind (set: owner)
   deployment <list|enqueue|claim|check|verification|merged|finish|block>  release ledger
   verification <plan|receipt|history|enrollment>  handler-owned native verification records
   work-items <command>         list/get/create/update/dispatch/history/evidence for bugs and features
@@ -183,6 +184,8 @@ func main() {
 		err = cmdTasks(e, args)
 	case "handler":
 		err = cmdHandler(e, args)
+	case "prompt-policy":
+		err = cmdPromptPolicy(e, args)
 	case "project-pause":
 		err = cmdProjectPause(e, args)
 	case "deployment":
@@ -373,6 +376,13 @@ func cmdAgents(e env, args []string) error {
 		fmt.Printf("%s %s  %-12s %-12s %s@%s%s activity=%s unread=%d\n", self, a.ID, a.Status, a.Name, a.Session, a.Host, role, activity, a.Unread)
 		if a.Activity != nil {
 			fmt.Printf("  last-transition tokens=%d observed=%s pending=%s since=%s\n", a.Activity.Tokens.Total, a.Activity.ObservedAt.Format(time.RFC3339), a.Activity.PendingTool, a.Activity.PendingSince.Format(time.RFC3339))
+			if p := a.Activity.Prompt; p != nil {
+				fmt.Printf("  runtime-prompt kind=%s action=%s outcome=%s since=%s", p.Kind, p.Action, p.Outcome, p.Since.Format(time.RFC3339))
+				if p.Reason != "" {
+					fmt.Printf(" reason=%q", p.Reason)
+				}
+				fmt.Println()
+			}
 		}
 	}
 	return nil

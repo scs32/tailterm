@@ -377,12 +377,31 @@ func claudeCompletedRecord(line []byte) bool {
 	return rec.Type == "result" || rec.Type == "assistant" && rec.Message.StopReason == "end_turn"
 }
 
-func nativeClaudeInspect(ctx context.Context, b runtimeBinding, expected string) (claudeWakeSnapshot, error) {
-	// Discovery requires one pane, the exact tmux run environment and one live
-	// Claude process descended from that pane. It also checks creation identity.
-	receipt, err := nativeRuntimeDiscovery(ctx, b, api.Agent{Runtime: "claude"})
+// runtimePane is one exact-identity capture of an owned runtime pane.
+type runtimePane struct {
+	Pane      string
+	SessionID string
+	Created   string
+	PanePID   int
+	CursorX   int
+	CursorY   int
+	Raw       string
+}
+
+// inspectRuntimePane captures the one pane of a binding's tmux session after
+// proving its identity. Discovery requires one pane, the exact tmux run
+// environment and one live runtime process descended from that pane. It also
+// checks creation identity and that the pane is not in a copy or view mode.
+// name prefixes errors ("Claude", "Codex"). -e keeps text attributes; joined
+// adds -J, which unwraps wrapped lines.
+func inspectRuntimePane(ctx context.Context, b runtimeBinding, name string, joined bool) (runtimePane, error) {
+	runtime := b.Runtime
+	if runtime == "" {
+		runtime = "codex"
+	}
+	receipt, err := nativeRuntimeDiscovery(ctx, b, api.Agent{Runtime: runtime})
 	if err != nil {
-		return claudeWakeSnapshot{}, fmt.Errorf("Claude pane identity unavailable: %w", err)
+		return runtimePane{}, fmt.Errorf("%s pane identity unavailable: %w", name, err)
 	}
 	fields := []string{"session_id", "session_created", "session_name", "TAILTERM_HUB", "TAILTERM_TASK", "TAILTERM_AGENT", "TAILTERM_RUN", "pane_id", "pane_pid", "pane_in_mode", "cursor_x", "cursor_y"}
 	for i, field := range fields {
@@ -390,7 +409,7 @@ func nativeClaudeInspect(ctx context.Context, b runtimeBinding, expected string)
 	}
 	raw, err := startupTmux(ctx, "list-panes", "-s", "-t", b.Session, "-F", "["+strings.Join(fields, ",")+"]")
 	if err != nil {
-		return claudeWakeSnapshot{}, fmt.Errorf("Claude pane unavailable: %w", err)
+		return runtimePane{}, fmt.Errorf("%s pane unavailable: %w", name, err)
 	}
 	lines := strings.Split(strings.TrimSpace(string(raw)), "\n")
 	var row []string
@@ -398,24 +417,32 @@ func nativeClaudeInspect(ctx context.Context, b runtimeBinding, expected string)
 		row[0] != receipt.SessionID || row[1] != receipt.SessionCreated || row[2] != b.Session ||
 		row[3] != b.Hub || row[4] != b.Task || row[5] != b.Agent || row[6] != b.Run ||
 		row[8] != fmt.Sprint(receipt.PanePID) || row[9] != "0" || row[7] == "" {
-		return claudeWakeSnapshot{}, errors.New("Claude pane identity changed or pane is in a mode")
+		return runtimePane{}, fmt.Errorf("%s pane identity changed or pane is in a mode", name)
 	}
 	cursorX, xerr := strconv.Atoi(row[10])
 	cursorY, yerr := strconv.Atoi(row[11])
 	if xerr != nil || yerr != nil || cursorY < 0 || cursorX < 0 {
-		return claudeWakeSnapshot{}, errors.New("Claude cursor identity unavailable")
+		return runtimePane{}, fmt.Errorf("%s cursor identity unavailable", name)
 	}
-	// -e keeps text attributes, so Claude's faint prompt suggestion can be told
-	// apart from typed input that reads the same.
 	args := []string{"capture-pane", "-p", "-e", "-t", row[7]}
-	if expected != "" {
+	if joined {
 		args = append(args, "-J")
 	}
 	screen, err := startupTmux(ctx, args...)
 	if err != nil {
-		return claudeWakeSnapshot{}, fmt.Errorf("Claude pane capture unavailable: %w", err)
+		return runtimePane{}, fmt.Errorf("%s pane capture unavailable: %w", name, err)
 	}
-	visible, err := claudeInputScreen(string(screen), cursorX, cursorY, expected)
+	return runtimePane{Pane: row[7], SessionID: row[0], Created: row[1], PanePID: receipt.PanePID, CursorX: cursorX, CursorY: cursorY, Raw: string(screen)}, nil
+}
+
+func nativeClaudeInspect(ctx context.Context, b runtimeBinding, expected string) (claudeWakeSnapshot, error) {
+	// -e keeps text attributes, so Claude's faint prompt suggestion can be told
+	// apart from typed input that reads the same.
+	pane, err := inspectRuntimePane(ctx, b, "Claude", expected != "")
+	if err != nil {
+		return claudeWakeSnapshot{}, err
+	}
+	visible, err := claudeInputScreen(pane.Raw, pane.CursorX, pane.CursorY, expected)
 	if err != nil {
 		return claudeWakeSnapshot{}, err
 	}
@@ -423,7 +450,7 @@ func nativeClaudeInspect(ctx context.Context, b runtimeBinding, expected string)
 	if err != nil {
 		return claudeWakeSnapshot{}, err
 	}
-	transcript.Pane, transcript.SessionID, transcript.Created, transcript.PanePID, transcript.Screen = row[7], row[0], row[1], receipt.PanePID, visible
+	transcript.Pane, transcript.SessionID, transcript.Created, transcript.PanePID, transcript.Screen = pane.Pane, pane.SessionID, pane.Created, pane.PanePID, visible
 	return transcript, nil
 }
 

@@ -676,6 +676,7 @@ func cmdRelay(args []string) error {
 		defer syscall.Flock(int(lock.Fd()), syscall.LOCK_UN)
 	}
 	var queueBackoff teamQueuePollBackoff
+	promptDeps := nativeRuntimePromptDeps()
 	var lastClaudeRetry time.Time
 	var claudeRetryCursor int
 	for {
@@ -757,6 +758,7 @@ func cmdRelay(args []string) error {
 						wake += fmt.Sprintf(" skip-after=#%d skip-unread=%d", s.After, s.Unread)
 					}
 				}
+				wake += runtimePromptStatus(b)
 				fmt.Printf("%s %s thread=%s queued-through=%d broker-wakes=%v%s %s\n", b.Task, b.Agent, b.Thread, progress.Through, progress.BrokerWakes, wake, progress.Error)
 				continue
 			}
@@ -795,7 +797,7 @@ func cmdRelay(args []string) error {
 					cancel()
 					// Host observation runs after delivery, using the same host budget.
 					// A slow or drifting transcript never delays a broker or inbox turn.
-					activityCtx, stopActivity := context.WithTimeout(context.WithValue(context.Background(), activityWorktreeContextKey{}, worktreeCache), 5*time.Second)
+					activityCtx, stopActivity := context.WithTimeout(context.WithValue(context.WithValue(context.Background(), activityWorktreeContextKey{}, worktreeCache), runtimePromptDepsKey{}, promptDeps), 5*time.Second)
 					if activityErr := runActivitySafely(func() error {
 						return relayActivityTick(prepareUsageContext(activityCtx, b, c, now), b, c, now, activityProbeNative)
 					}); activityErr != nil {

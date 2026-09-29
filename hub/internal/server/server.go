@@ -42,6 +42,8 @@ func New(st *store.Store, identity Identity) *Server {
 	m.HandleFunc("POST /v1/tasks/{id}/lead", s.assignLead)
 	m.HandleFunc("GET /v1/tasks/{id}/handler-rotation/policy", s.getHandlerRotationPolicy)
 	m.HandleFunc("PUT /v1/tasks/{id}/handler-rotation/policy", s.setHandlerRotationPolicy)
+	m.HandleFunc("GET /v1/tasks/{id}/runtime-prompt/policy", s.getRuntimePromptPolicy)
+	m.HandleFunc("PUT /v1/tasks/{id}/runtime-prompt/policy", s.setRuntimePromptPolicy)
 	m.HandleFunc("GET /v1/tasks/{id}/handler-rotations", s.listHandlerRotations)
 	m.HandleFunc("POST /v1/tasks/{id}/handler-rotations", s.handlerRotationAction)
 	m.HandleFunc("GET /v1/tasks/{id}/handler-rotations/{rid}", s.getHandlerRotation)
