@@ -441,6 +441,12 @@ try {
             cleanupDone: true,
           });
       });
+      // The open dialog retries from the journal it loaded, so a change made
+      // only to the saved plan is seen after reopening, as after a reload.
+      await page.keyboard.press("Escape");
+      await page.waitForFunction(() => !document.querySelector("#dialog").open);
+      await page.evaluate(() => window.fixture.render());
+      await page.getByTestId("continue-project-resume").click();
 
       await page.getByTestId("resume-project-confirm").click();
       await page.waitForFunction(
