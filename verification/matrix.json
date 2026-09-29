@@ -80,6 +80,10 @@
       "mode": "both"
     },
     {
+      "file": "tests/interventions-browser.mjs",
+      "mode": "both"
+    },
+    {
       "file": "tests/item-message-compose-browser.mjs",
       "mode": "both"
     },
