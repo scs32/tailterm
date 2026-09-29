@@ -52,6 +52,7 @@ SHA-256 is of the unredacted receipt.
 | `4a6cdfd` | Claude queue-operation wake (`wi_614f0e656fcc0c35`, merge of `596fd0e`) | The relay's Claude idle check understands queue-operation transcript records and no longer drops wakes on unknown record types | Mini `tt` |
 | `75e8d2d` | Pre-existing browser suites (`wi_be7bbed81d4009c1`, merge of `07e1f79`, owner-integrated) | All 14 known-failing browser suites pass on the first attempt (67/67); the bug stays open until the matrix follow-up `wi_0f8ec0f080ddd930` empties knownFailures | none (tests only) |
 | `77a09c5` | Runtime prompt detection (`wi_7d5050c57193db78`, merge of `318a738`) | The relay recognizes agents waiting on their runtime's own prompts, answers them per project policy and escalates unknown ones | Hub `20260928-runtime-prompts-77a09c5`, Mini `tt`, TailOS `8906f0c2` |
+| `85ad88f` | Empty known failures (`wi_0f8ec0f080ddd930`, merge of `b0f578a`) | The approved verification matrix has no known failures (digest `2d75824b…`, owner approval #14468) | none (matrix only) |
 
 ## Hub releases
 
@@ -80,7 +81,7 @@ Before `6235924`, the combined migration was rehearsed on a copy of the `33d3ab7
 hub migrated it (integrity ok, no FK violations, 14 projects, queue at limit 1), and the
 `33d3ab7` hub opened the migrated copy. The `34944cf`, `8b1f4d4`, `8e32dc0`, `acfe2d0`, `ffda442` and `77a09c5` migrations were rehearsed
 the same way on a copy of the previous release's backup, including the old hub opening the
-migrated copy. `172becd` fast-forwarded `tasks-hub` and shipped on its independent receipt without an owner-side rerun, per the deployment agent's rule. `6692a57`, `1e8e8df`, `66b55ed`, `0973558`, `ffda442`, `4a6cdfd`, `75e8d2d` and `77a09c5` were merges, so each shipped only after a full check run on the merge commit. `1e8e8df` was integrated by the owner release step: the team's branch predated the queue's frozen base, and re-accepting the done item was refused, so its queue entry was failed and released. The first `c343819` deploy attempt was refused by plan validation before any
+migrated copy. `172becd` fast-forwarded `tasks-hub` and shipped on its independent receipt without an owner-side rerun, per the deployment agent's rule. `6692a57`, `1e8e8df`, `66b55ed`, `0973558`, `ffda442`, `4a6cdfd`, `75e8d2d`, `77a09c5` and `85ad88f` were merges, so each shipped only after a full check run on the merge commit. `1e8e8df` was integrated by the owner release step: the team's branch predated the queue's frozen base, and re-accepting the done item was refused, so its queue entry was failed and released. The first `c343819` deploy attempt was refused by plan validation before any
 change (the plan carried the previous day's release name); the second, with a fresh backup
 (`-v2`), succeeded. Rollback binaries: `.build/prev-*` (hub, bridge) and
 `~/.local/bin/tt.prev-*` (Mini).
@@ -122,7 +123,8 @@ error.
 ## Known open
 - `profile-sync-browser` order dependency (`wi_21ba42f8f0542dc0`); verifiers build the test hub
   binary as a prerequisite until it is fixed.
-- 14 browser suites fail on `tasks-hub` and are listed as known failures (`wi_be7bbed81d4009c1`,
-  queued).
+- The 14 browser suites that failed on `tasks-hub` pass since `75e8d2d`, and the matrix has no known
+  failures since `85ad88f`. `wi_be7bbed81d4009c1` closes when `wi_6fb81e10c366d7b4` lets a bug close on its
+  passing receipt.
 - The verification matrix changed in `8b1f4d4` (digest `58430970…`); candidates based on it need a
   new owner matrix approval.
