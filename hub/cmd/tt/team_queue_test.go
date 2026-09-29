@@ -2,10 +2,18 @@ package main
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
-	"github.com/scs32/tailterm/hub/internal/api"
+	"os"
+	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/scs32/tailterm/hub/internal/api"
+	"github.com/scs32/tailterm/hub/internal/spawn"
 )
 
 func TestTeamQueueCLIAddAndListAgainstTestHub(t *testing.T) {
@@ -106,4 +114,255 @@ func TestTeamQueueCLIReleaseAndAbandonAgainstTestHub(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("abandon receipt retry: %v", err)
 	}
+}
+
+// queueGitRepo makes a temporary repository with one commit and returns its
+// real root and HEAD.
+func queueGitRepo(t *testing.T) (string, string) {
+	t.Helper()
+	root, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, args := range [][]string{
+		{"init", "-q"},
+		{"-c", "user.email=fixture@example.invalid", "-c", "user.name=fixture", "commit", "-q", "--allow-empty", "-m", "fixture"},
+	} {
+		if output, err := exec.Command("git", append([]string{"-C", root}, args...)...).CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v %s", args, err, output)
+		}
+	}
+	head, err := queueGitCommit(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return root, head
+}
+
+// parallelCLIProject gives the fixture's project a host policy for this host
+// with a 1 MiB disk reserve and sets its limit through the CLI.
+func parallelCLIProject(t *testing.T, f teamFixture, limit string) string {
+	t.Helper()
+	if _, err := captureCLIOutput(t, func() error {
+		return cmdTeamQueue(f.e, []string{"policy", "--policy-version", fmt.Sprint(time.Now().UnixNano()), "--expires", time.Now().Add(time.Hour).UTC().Format(time.RFC3339), "--sessions", "100", "--polling", "10", "--bindings", "100", "--requests-per-minute", "100000", "--burst", "10000", "--headroom-percent", "20", "--min-free-disk-mib", "1"})
+	}); err != nil {
+		t.Fatal(err)
+	}
+	out, err := captureCLIOutput(t, func() error { return cmdTeamQueue(f.e, []string{"limit", "--limit", limit}) })
+	if err != nil {
+		t.Fatalf("limit %s: %v", limit, err)
+	}
+	return out
+}
+
+func queueFixtureItem(t *testing.T, f teamFixture, key string) (api.WorkItem, int64) {
+	t.Helper()
+	ctx := context.Background()
+	item, err := f.c.CreateWorkItem(ctx, f.task.ID, api.CreateWorkItemRequest{Kind: "feature", Title: key, RequestID: key})
+	if err != nil {
+		t.Fatal(err)
+	}
+	order, err := f.c.PostMessage(ctx, f.task.ID, api.PostMessageRequest{Text: key + " bounded order", RequestID: key + "-order", WorkItems: []api.MessageWorkItem{{ItemTaskID: f.task.ID, ItemID: item.ID, ItemRevision: item.Revision, Relationship: "primary"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.confirmOrder(t, item, order.Seq)
+	return item, order.Seq
+}
+
+// a1 (CLI): --limit none and N are saved and printed; invalid values print usage.
+func TestTeamQueueCLILimitNoneAndCeiling(t *testing.T) {
+	f := newTeamFixture(t, true)
+	repo, _ := queueGitRepo(t)
+	if out := parallelCLIProject(t, f, "none"); !strings.Contains(out, "concurrency limit=none") {
+		t.Fatalf("limit none output %q", out)
+	}
+	if _, err := captureCLIOutput(t, func() error {
+		return cmdTeamQueue(f.e, []string{"add", "--item", f.item.ID, "--order", fmt.Sprint(f.order), "--cwd", repo, "--owns", "client"})
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if out, err := captureCLIOutput(t, func() error { return cmdTeamQueue(f.e, []string{"list"}) }); err != nil || !strings.Contains(out, "concurrency limit=none") {
+		t.Fatalf("list %q %v", out, err)
+	}
+	if out, err := captureCLIOutput(t, func() error { return cmdTeamQueue(f.e, []string{"limit", "--limit", "5"}) }); err != nil || !strings.Contains(out, "concurrency limit=5") {
+		t.Fatalf("limit 5 %q %v", out, err)
+	}
+	if out, err := captureCLIOutput(t, func() error { return cmdTeamQueue(f.e, []string{"list"}) }); err != nil || !strings.Contains(out, "concurrency limit=5") {
+		t.Fatalf("list %q %v", out, err)
+	}
+	for _, bad := range []string{"-1", "0", "two"} {
+		if _, err := captureCLIOutput(t, func() error { return cmdTeamQueue(f.e, []string{"limit", "--limit", bad}) }); err == nil || !strings.Contains(err.Error(), "usage: tt team queue limit --limit none|N") {
+			t.Fatalf("limit %s: %v", bad, err)
+		}
+	}
+}
+
+// a5: a parallel project's add creates the entry's own detached worktree by
+// default; --no-new-worktree keeps the checkout; a taken path is refused.
+func TestTeamQueueCLINewWorktreeDefault(t *testing.T) {
+	f := newTeamFixture(t, true)
+	repo, head := queueGitRepo(t)
+	parallelCLIProject(t, f, "none")
+	t.Chdir(repo)
+	out, err := captureCLIOutput(t, func() error {
+		return cmdTeamQueue(f.e, []string{"add", "--item", f.item.ID, "--order", fmt.Sprint(f.order), "--owns", "client"})
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := filepath.Join(repo, ".build", "worktrees", "queue-"+strings.TrimPrefix(f.item.ID, "wi_")[:8])
+	if !strings.Contains(out, "worktree "+want) {
+		t.Fatalf("add output %q", out)
+	}
+	list, err := f.c.ListTeamQueue(context.Background(), f.task.ID)
+	if err != nil || len(list.Entries) != 1 {
+		t.Fatalf("queue %+v %v", list, err)
+	}
+	q := list.Entries[0]
+	realCwd, _ := filepath.EvalSymlinks(q.Cwd)
+	if realCwd != want || q.Repository != filepath.Join(repo, ".git") || q.BaseCommit != head {
+		t.Fatalf("entry cwd=%s repository=%s base=%s", q.Cwd, q.Repository, q.BaseCommit)
+	}
+	if branch, err := exec.Command("git", "-C", want, "rev-parse", "--abbrev-ref", "HEAD").Output(); err != nil || strings.TrimSpace(string(branch)) != "HEAD" {
+		t.Fatalf("worktree is not detached: %q %v", branch, err)
+	}
+	if sha, err := queueGitCommit(want); err != nil || sha != head {
+		t.Fatalf("worktree HEAD %s %v", sha, err)
+	}
+	if _, err := captureCLIOutput(t, func() error {
+		return cmdTeamQueue(f.e, []string{"add", "--item", f.item.ID, "--order", fmt.Sprint(f.order), "--owns", "client"})
+	}); err == nil || !strings.Contains(err.Error(), "queue worktree already exists") {
+		t.Fatalf("second add for the same path: %v", err)
+	}
+
+	second, order := queueFixtureItem(t, f, "opt-out")
+	if _, err := captureCLIOutput(t, func() error {
+		return cmdTeamQueue(f.e, []string{"add", "--item", second.ID, "--order", fmt.Sprint(order), "--owns", "docs", "--no-new-worktree"})
+	}); err != nil {
+		t.Fatal(err)
+	}
+	list, _ = f.c.ListTeamQueue(context.Background(), f.task.ID)
+	if got, _ := filepath.EvalSymlinks(list.Entries[1].Cwd); got != repo {
+		t.Fatalf("opt-out cwd %s", list.Entries[1].Cwd)
+	}
+	if _, err := os.Stat(filepath.Join(repo, ".build", "worktrees", "queue-"+strings.TrimPrefix(second.ID, "wi_")[:8])); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("opt-out created a worktree: %v", err)
+	}
+
+	// A definite hub refusal removes the new worktree so the add can be retried.
+	third, _ := queueFixtureItem(t, f, "refused")
+	refused := filepath.Join(repo, ".build", "worktrees", "queue-"+strings.TrimPrefix(third.ID, "wi_")[:8])
+	if _, err := captureCLIOutput(t, func() error {
+		return cmdTeamQueue(f.e, []string{"add", "--item", third.ID, "--order", fmt.Sprint(f.order), "--owns", "tests"})
+	}); err == nil {
+		t.Fatal("hub accepted another item's order")
+	}
+	if _, err := os.Stat(refused); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("refused add left its worktree: %v", err)
+	}
+	if _, err := captureCLIOutput(t, func() error {
+		return cmdTeamQueue(f.e, []string{"add", "--item", third.ID, "--order", "1", "--new-worktree", "--cwd", repo})
+	}); err == nil || !strings.Contains(err.Error(), "usage:") {
+		t.Fatalf("--new-worktree with --cwd: %v", err)
+	}
+}
+
+// a6 (CLI) and a9: the owner and an available handler scope entries; a plain
+// agent may not; only the owner fails an entry.
+func TestTeamQueueCLIScopeAndOwnerFail(t *testing.T) {
+	f := newTeamFixture(t, true)
+	ctx := context.Background()
+	repo, head := queueGitRepo(t)
+	parallelCLIProject(t, f, "none")
+	q, err := f.c.TeamQueueAction(ctx, f.task.ID, api.TeamQueueRequest{RequestID: "scope-add", Operation: "add", ItemID: f.item.ID, OrderMessageSeq: f.order, Host: spawn.Host(), Cwd: repo, Repository: filepath.Join(repo, ".git"), BaseCommit: head})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := captureCLIOutput(t, func() error { return cmdTeamQueue(f.e, []string{"scope", "--entry", q.ID}) }); err == nil || !strings.Contains(err.Error(), "usage: tt team queue scope") {
+		t.Fatalf("scope without paths: %v", err)
+	}
+	if _, err := captureCLIOutput(t, func() error {
+		return cmdTeamQueue(f.e, []string{"scope", "--entry", q.ID, "--owns", "client", "--owns", "docs/team-launch.md"})
+	}); err != nil {
+		t.Fatalf("owner scope: %v", err)
+	}
+	if got, _ := f.c.GetTeamQueueEntry(ctx, f.task.ID, q.ID); strings.Join(got.Ownership, ",") != "client,docs/team-launch.md" || got.Revision != q.Revision+1 {
+		t.Fatalf("owner scope saved %+v", got)
+	}
+	handlerEnv := f.e
+	handlerEnv.agent, handlerEnv.runID = f.handler.ID, f.handler.RunID
+	if _, err := captureCLIOutput(t, func() error {
+		return cmdTeamQueue(handlerEnv, []string{"scope", "--entry", q.ID, "--owns", "client"})
+	}); err != nil {
+		t.Fatalf("handler scope of a queued entry: %v", err)
+	}
+	staleEnv := handlerEnv
+	staleEnv.runID = api.NewID("run")
+	if _, err := captureCLIOutput(t, func() error {
+		return cmdTeamQueue(staleEnv, []string{"scope", "--entry", q.ID, "--owns", "hub"})
+	}); err == nil {
+		t.Fatal("mismatched handler run scoped an entry")
+	}
+	worker, err := f.c.AddAgent(ctx, f.task.ID, api.AddAgentRequest{AgentID: api.NewID("agt"), Name: "worker", Host: "fixture", Session: "worker", Runtime: "codex"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	workerEnv := f.e
+	workerEnv.agent, workerEnv.runID = worker.ID, worker.RunID
+	if _, err := captureCLIOutput(t, func() error {
+		return cmdTeamQueue(workerEnv, []string{"scope", "--entry", q.ID, "--owns", "hub"})
+	}); err == nil {
+		t.Fatal("a plain agent scoped a queued entry")
+	}
+	if _, err := captureCLIOutput(t, func() error {
+		return cmdTeamQueue(handlerEnv, []string{"fail", "--entry", q.ID, "--reason", "owner integrated abc1234"})
+	}); err == nil || !strings.Contains(err.Error(), "unbound CLI session") {
+		t.Fatalf("agent-bound fail: %v", err)
+	}
+	if _, err := captureCLIOutput(t, func() error { return cmdTeamQueue(f.e, []string{"fail", "--entry", q.ID}) }); err == nil || !strings.Contains(err.Error(), "usage: tt team queue fail") {
+		t.Fatalf("fail without reason: %v", err)
+	}
+
+	// Drive the entry to running, then the owner fails it.
+	running := runQueueEntry(t, f, q.ID)
+	if _, err := captureCLIOutput(t, func() error {
+		return cmdTeamQueue(f.e, []string{"fail", "--entry", running.ID, "--reason", "owner integrated abc1234"})
+	}); err != nil {
+		t.Fatalf("owner fail: %v", err)
+	}
+	failed, err := f.c.GetTeamQueueEntry(ctx, f.task.ID, running.ID)
+	if err != nil || failed.State != "failed" || failed.Failure != "Owner failed this entry: owner integrated abc1234" || failed.EscalationSeq == 0 || failed.ReleasedAt != "" {
+		t.Fatalf("owner-failed entry %+v %v", failed, err)
+	}
+}
+
+// runQueueEntry claims, freezes and starts a one-member launch through the
+// hub so an entry reaches running without a real spawn.
+func runQueueEntry(t *testing.T, f teamFixture, id string) api.TeamQueueEntry {
+	t.Helper()
+	ctx := context.Background()
+	q, err := f.c.GetTeamQueueEntry(ctx, f.task.ID, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	detail, err := f.c.GetTask(ctx, f.task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	step := func(req api.TeamQueueRequest) {
+		t.Helper()
+		req.EntryID, req.ExpectedRevision = q.ID, q.Revision
+		if q, err = f.c.TeamQueueAction(ctx, f.task.ID, req); err != nil {
+			t.Fatalf("%s: %v", req.Operation, err)
+		}
+	}
+	step(api.TeamQueueRequest{RequestID: "run-claim-" + id, Operation: "claim", Host: q.Host, PauseGeneration: detail.Task.PauseGeneration})
+	run := api.NewID("run")
+	plan, _ := json.Marshal(map[string]any{"task": f.task.ID, "item": q.ItemID, "revision": q.ItemRevision, "order": q.OrderMessageSeq, "handlerId": q.HandlerID, "handlerRunId": q.HandlerRunID, "handlerLeaseGeneration": q.HandlerLeaseGeneration, "context": map[string]any{"version": 1}, "members": []any{map[string]any{"state": "unstarted", "runId": run, "fields": map[string]any{"agentId": api.NewID("agt"), "name": "lead-" + id[4:12], "cwd": q.Cwd}}}})
+	step(api.TeamQueueRequest{RequestID: "run-freeze-" + id, Operation: "freeze", LaunchJSON: plan})
+	step(api.TeamQueueRequest{RequestID: "run-attempt-" + id, Operation: "attempt", MemberIndex: 0})
+	step(api.TeamQueueRequest{RequestID: "run-started-" + id, Operation: "started", MemberIndex: 0, MemberRunID: run})
+	step(api.TeamQueueRequest{RequestID: "run-running-" + id, Operation: "running"})
+	return q
 }

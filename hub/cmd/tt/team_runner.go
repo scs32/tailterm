@@ -28,7 +28,7 @@ type teamRunner struct {
 	owned       func(context.Context, env, api.Agent) error
 	cleanup     func(context.Context, env, string, string) error
 	integration func(context.Context, api.TeamQueueEntry, api.WorkItem, api.TeamCloseRequest) (*api.TeamIntegrationReady, error)
-	census      func(context.Context, *api.Client, string, string, string, int64, *api.TeamHostUsage) error
+	census      func(ctx context.Context, c *api.Client, task, host string, policy api.TeamHostPolicy, prior *api.TeamHostUsage, cwds []string) error
 	roundRobin  bool
 }
 
@@ -110,8 +110,8 @@ func productionTeamRunner() teamRunner {
 			return nil
 		},
 		integration: queueIntegrationSnapshot,
-		census: func(ctx context.Context, c *api.Client, task, host, domain string, version int64, prior *api.TeamHostUsage) error {
-			return saveHostRelayCensus(ctx, c, task, host, domain, version, prior, time.Now())
+		census: func(ctx context.Context, c *api.Client, task, host string, policy api.TeamHostPolicy, prior *api.TeamHostUsage, cwds []string) error {
+			return saveHostRelayCensus(ctx, c, task, host, policy, prior, cwds, time.Now())
 		},
 		roundRobin: true,
 	}
@@ -129,7 +129,7 @@ func (r teamRunner) tick(ctx context.Context, e env, c *api.Client, host string)
 			hostBudgetErr = errors.New("host policy limiter domain differs from relay hub")
 		} else if err := activeRelayBudget.configure(list.HostPolicy, time.Now()); err != nil {
 			hostBudgetErr = err
-		} else if err := r.census(ctx, c, list.Entries[0].TaskID, host, list.HostPolicy.LimiterDomain, list.HostPolicy.Version, list.HostUsage); err != nil {
+		} else if err := r.census(ctx, c, list.Entries[0].TaskID, host, *list.HostPolicy, list.HostUsage, queueCwds(list.Entries)); err != nil {
 			hostBudgetErr = fmt.Errorf("host relay binding census: %w", err)
 		}
 	}
@@ -152,6 +152,7 @@ func (r teamRunner) tick(ctx context.Context, e env, c *api.Client, host string)
 			projectErrors = append(projectErrors, fmt.Errorf("team queue project %s: %w", taskID, err))
 			continue
 		}
+		parallel := queueParallel(queue.ConcurrencyLimit)
 		for _, q := range queue.Entries {
 			if q.Host != host {
 				continue
@@ -159,11 +160,20 @@ func (r teamRunner) tick(ctx context.Context, e env, c *api.Client, host string)
 			// An unsafe host observation cannot start or continue a parallel
 			// launch. Serial teams and already-running parallel teams still
 			// advance through their own close and cleanup paths.
-			if queue.ConcurrencyLimit > 1 && (hostBudgetErr != nil || list.HostPolicy == nil) && (q.State == "queued" || q.State == "launching") {
+			if parallel && (hostBudgetErr != nil || list.HostPolicy == nil) && (q.State == "queued" || q.State == "launching") {
 				continue
 			}
-			if q.State == "failed" && q.ReleasedAt == "" && queue.ConcurrencyLimit == 1 {
-				break
+			if q.State == "failed" && q.ReleasedAt == "" {
+				// A serial queue halts until the owner reconciles. A parallel
+				// one frees the slot and handler lease once the failed team
+				// is closed and cleaned.
+				if !parallel {
+					break
+				}
+				if err := r.releaseFailed(ctx, e, c, q, host); err != nil {
+					projectErrors = append(projectErrors, fmt.Errorf("team queue %s: %w", q.ID, err))
+				}
+				continue
 			}
 			if q.State != "queued" && q.State != "launching" && q.State != "running" {
 				continue
@@ -171,7 +181,7 @@ func (r teamRunner) tick(ctx context.Context, e env, c *api.Client, host string)
 			if err := r.advance(ctx, e, c, q, host); err != nil {
 				projectErrors = append(projectErrors, fmt.Errorf("team queue %s: %w", q.ID, err))
 			}
-			if queue.ConcurrencyLimit == 1 {
+			if !parallel {
 				break
 			}
 		}
@@ -198,7 +208,7 @@ func (r teamRunner) advance(ctx context.Context, e env, c *api.Client, q api.Tea
 		if err != nil {
 			return err
 		}
-		if queue.ConcurrencyLimit == 1 && detail.Task.Orchestrator != "" {
+		if !queueParallel(queue.ConcurrencyLimit) && detail.Task.Orchestrator != "" {
 			return nil
 		}
 		item, err := c.GetWorkItem(ctx, q.TaskID, q.ItemID)
@@ -226,6 +236,60 @@ func (r teamRunner) advance(ctx context.Context, e env, c *api.Client, q api.Tea
 		return r.finish(ctx, e, c, q, host)
 	}
 	return nil
+}
+
+// queueParallel mirrors the hub: 1 is the serial queue, 0 has no fixed cap
+// and N >= 2 is an owner ceiling.
+func queueParallel(limit int) bool { return limit != 1 }
+
+// queueCwds lists the launch folders of a host's queue entries for the disk
+// census.
+func queueCwds(entries []api.TeamQueueEntry) []string {
+	var cwds []string
+	for _, q := range entries {
+		if q.Cwd != "" {
+			cwds = append(cwds, q.Cwd)
+		}
+	}
+	return cwds
+}
+
+// releaseFailed frees a failed parallel entry's slot and handler lease once
+// every run bound to its item is closed and cleaned. It checks the roster
+// first, so an unreleasable entry costs no hub write per tick; the hub
+// repeats the exact release checks.
+func (r teamRunner) releaseFailed(ctx context.Context, e env, c *api.Client, q api.TeamQueueEntry, host string) error {
+	if q.Host != host {
+		return nil
+	}
+	detail, err := c.GetTask(ctx, q.TaskID)
+	if err != nil {
+		return err
+	}
+	if detail.Task.Status != api.TaskOpen || detail.Task.PauseState != api.ProjectPauseActive {
+		return nil
+	}
+	for _, a := range detail.Agents {
+		if a.WorkItem != nil && a.WorkItem.ItemTaskID == q.TaskID && a.WorkItem.ItemID == q.ItemID && (a.Status != api.AgentClosed || !a.CleanupDone) {
+			return nil
+		}
+	}
+	lock, err := queueLaunchLock(e.hub, q.TaskID, q.ID)
+	if err != nil {
+		return nil // The owner's release or a launch holds this entry.
+	}
+	defer unlockQueueLaunch(lock)
+	req, unlock, err := queueReleaseRequest(ctx, c, e.hub, q.TaskID, q, true)
+	if err != nil {
+		return err
+	}
+	defer unlock()
+	_, err = c.TeamQueueAction(ctx, q.TaskID, req)
+	var response *api.HTTPError
+	if errors.As(err, &response) && response.Status == 409 {
+		return nil // The list names what still holds the entry.
+	}
+	return err
 }
 
 func claimRaceConflict(message string) bool {
@@ -287,7 +351,7 @@ func (r teamRunner) launch(ctx context.Context, e env, c *api.Client, q api.Team
 	if err != nil {
 		return err
 	}
-	parallel := queueState.ConcurrencyLimit > 1
+	parallel := queueParallel(queueState.ConcurrencyLimit)
 	var journal teamLaunchJournal
 	if len(q.LaunchJSON) == 0 {
 		item, err := c.GetWorkItem(ctx, q.TaskID, q.ItemID)

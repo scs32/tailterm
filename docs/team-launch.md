@@ -44,8 +44,11 @@ On the launch host, the owner can save a sequence of recorded item orders:
 ```sh
 tt team queue add --task tsk_... --item wi_... --order 123 --template planned
 tt team queue add --task tsk_... --item wi_... --order 124 --cwd /absolute/worktree --owns client --owns hub/internal/store
-tt team queue policy --task tsk_... --policy-version 1 --expires RFC3339 --sessions N --polling N --bindings N --requests-per-minute N --burst N --headroom-percent N
-tt team queue limit --task tsk_... --limit 2
+tt team queue add --task tsk_... --item wi_... --order 125 --new-worktree --owns docs/team-launch.md
+tt team queue policy --task tsk_... --policy-version 1 --expires RFC3339 --sessions N --polling N --bindings N --requests-per-minute N --burst N --headroom-percent N [--min-free-disk-mib N]
+tt team queue limit --task tsk_... --limit none   # or --limit N; --limit 1 is serial
+tt team queue scope --task tsk_... --entry tqe_... --owns client/team-delivery-view.js --owns tests/parallel-team-browser.mjs
+tt team queue fail --task tsk_... --entry tqe_... --reason 'owner integrated abc1234'
 tt team queue list --task tsk_...
 tt team queue replace-lead --task tsk_... --entry tqe_... --lead-agent agt_...
 tt team queue accept --task tsk_... --entry tqe_... --worktree /absolute/builder/worktree --branch feature/name --commit FULL_SHA --evidence 'handler-saved acceptance receipt'  # recovery only
@@ -55,8 +58,10 @@ tt team queue release --task tsk_... --entry tqe_...
 tt team queue abandon --task tsk_... --item wi_... --order 123
 ```
 
-The default project limit is one. The owner may set two only under a fresh,
-versioned owner policy whose session, project polling, relay binding, request
+The default project limit is one: the serial queue. `--limit none` removes the
+fixed cap, and `--limit N` sets an optional owner ceiling; `list` prints
+`concurrency limit=none` and the Delivery panel says **No fixed limit**. Any
+limit other than one needs a fresh, versioned owner policy whose session, project polling, relay binding, request
 rate, burst and headroom caps cover the host's hub limiter domain. The CLI
 derives the domain from the configured hub origin. No safe production values
 are inferred. The host CLI inventories every local relay binding file before
@@ -73,22 +78,64 @@ bounded worst-case estimate must fit both the total cap and its reserved
 queue/binding shares (one quarter and three quarters); the transport bucket
 enforces actual rate and burst. Reservations include every uncleaned agent run,
 uncertain and pending members, extras and manual launches (five slots before
-a manual plan is known). The initial ceiling
-is two. The owner provisions
+a manual plan is known).
+
+Without a fixed cap, admission is governed by real constraints only:
+non-overlapping declared ownership and worktrees, a free database handler for
+each running entry, the host policy's session, polling, binding and request
+budgets, and a free-disk reserve. The runner reports the least free space
+across the host's queue worktrees with each census (a worktree that no longer
+exists is skipped; with none it reports the invoking checkout's filesystem)
+and writes a census early when the reserve comparison flips. A new parallel
+claim is refused with `host free disk N MiB is below the M MiB reserve`, or
+`host free disk is not observed` when an older `tt` sent the census; the
+reserve is `--min-free-disk-mib` or 8192 MiB when unset. The reserve gates new
+admission only (claim, the queued entry's list reason and raising the limit);
+a launch already under way still starts its members. Provider usage limits
+are not consulted yet: no provider-limit signal exists, so that headroom
+waits for usage-limit detection (`wi_72f41bd375032cf0`).
+
+To lower the limit, run `tt team queue limit --limit 1` (serial) or
+`--limit N`; it is refused while more entries than N are active, so wait for
+them or release failed ones first. Before rolling the hub back to a build
+older than the uncapped queue, set `--limit 2` (or 1): an older hub reads
+`none` as every slot reserved and stops launching until it is changed.
+
+The owner provisions
 additional database handlers as ordinary continuing handler agents; the runner
 never starts or resumes them. Each running item leases a distinct exact
 handler ID and run. A retired or offline handler is unavailable for a new
 lease. Existing one-at-a-time projects retain their primary handler.
 
-Use one canonical worktree per parallel item. `--owns` accepts repository
-relative files and directories; an ancestor directory overlaps its descendants,
+Use one canonical worktree per parallel item. In a parallel project, `add`
+without `--cwd` creates one: from the invoking Git worktree root it runs
+`git worktree add --detach <repository root>/.build/worktrees/queue-<first 8
+hex of the item ID> HEAD` and queues that folder, so the repository, base and
+ownership checks apply unchanged. It refuses an existing path, and removes the
+new worktree if the hub definitely refuses the entry. `--new-worktree` does the
+same in a serial project; `--no-new-worktree` keeps the current checkout.
+`--owns` accepts repository relative files and directories; an ancestor directory overlaps its descendants,
 while sibling directories do not. Missing ownership conflicts with every item.
 The queue command rejects traversal, absolute or dot segments, symlink paths,
 and case aliases. It records the shared repository identity and starting commit
 across worktrees. `list` and the Projects Delivery panel show ownership,
-blockers, item lead, handler, and limit. When two slots are available, the
+blockers, item lead, handler, and limit. When slots are available, the
 runner takes queued items in order and skips one blocked by active ownership
-before trying the next. It keeps distinct worktree and handler leases.
+before trying the next. It keeps distinct worktree and handler leases. A
+queued entry's reason names the first real limit it waits for: slots, host
+capacity or disk, `No free database handler`, or `Unscoped: declare ownership
+to run beside other teams`.
+
+`scope` replaces an entry's declared ownership with a non-empty canonical
+list and increments its revision; a retried request returns the saved result.
+The owner may scope any queued, launching or running entry from an unbound
+CLI. From an agent session, any available database handler may scope a queued
+entry, and the leased handler or the item's current lead may scope its own
+launching or running entry; the hub checks the exact agent and run like
+`accept`. An admitted entry may narrow its paths, but widening into another
+active entry's paths is refused with `ownership overlaps active entry tqe_…`.
+The planned lead declares its frozen ownership this way, and the handler
+scopes an unscoped queued entry from its item and intake before launch.
 
 The hub stores queue state and retry receipts. The supervised Mini relay checks
 the queue on each tick, including when no Codex thread is bound. It records a
@@ -141,6 +188,16 @@ the host census or limiter domain fails, the runner reports that error and
 holds new parallel launch effects while serial projects and already-running
 teams continue their safe close and cleanup paths. The host's capacity checks
 still refuse new parallel work until current matching evidence is available.
+
+In a parallel project the runner releases a failed entry itself on its launch
+host, under the same launch lock and checks as `release`, once every run bound
+to its item is closed and cleaned; it checks the roster first, so an entry
+that cannot be released costs no hub write. The failure and escalation stay.
+Until then its list reason counts the item-bound runs still live or uncleaned.
+A serial queue still halts until the owner reconciles. For an entry the owner
+integrated outside the queue, or one otherwise stuck, `fail --entry --reason`
+(owner only, unbound CLI) fails a queued, launching or running entry with the
+owner escalation; after its team is closed, the release follows.
 
 After inspecting a failed entry, use `release --entry` to clear its reservation
 and let the next queued item run. The failed entry and escalation remain in

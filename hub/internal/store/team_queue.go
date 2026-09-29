@@ -83,7 +83,7 @@ func migrateTeamQueue(db *sql.DB) error {
 			}
 		}
 	}
-	_, err = tx.Exec(`CREATE TABLE IF NOT EXISTS team_queue_settings(task_id TEXT PRIMARY KEY REFERENCES tasks(id), concurrency_limit INTEGER NOT NULL DEFAULT 1 CHECK(concurrency_limit BETWEEN 1 AND 2));
+	_, err = tx.Exec(`CREATE TABLE IF NOT EXISTS team_queue_settings(task_id TEXT PRIMARY KEY REFERENCES tasks(id), concurrency_limit INTEGER NOT NULL DEFAULT 1 CHECK(concurrency_limit >= 0));
 		CREATE TABLE IF NOT EXISTS team_host_policies(host TEXT PRIMARY KEY,version INTEGER NOT NULL,expires_at TEXT NOT NULL,max_sessions INTEGER NOT NULL,max_polling INTEGER NOT NULL);
 		CREATE TABLE IF NOT EXISTS team_host_usage(host TEXT PRIMARY KEY,limiter_domain TEXT NOT NULL,policy_version INTEGER NOT NULL DEFAULT 0,observed_at TEXT NOT NULL,relay_bindings INTEGER NOT NULL,complete INTEGER NOT NULL,source_digest TEXT NOT NULL);
 		CREATE TABLE IF NOT EXISTS item_team_leads(task_id TEXT NOT NULL,item_id TEXT NOT NULL,agent_id TEXT NOT NULL,run_id TEXT NOT NULL,revision INTEGER NOT NULL DEFAULT 1,state TEXT NOT NULL CHECK(state IN ('launching','running','closed')),PRIMARY KEY(task_id,item_id));
@@ -92,7 +92,22 @@ func migrateTeamQueue(db *sql.DB) error {
 	if err != nil {
 		return err
 	}
+	// The first parallel queue allowed only 1 or 2. Zero now means no fixed
+	// cap, so an older table is rebuilt with the wider check.
+	var settingsSQL string
+	if err := tx.QueryRow(`SELECT sql FROM sqlite_master WHERE type='table' AND name='team_queue_settings'`).Scan(&settingsSQL); err != nil {
+		return err
+	}
+	if strings.Contains(settingsSQL, "BETWEEN 1 AND 2") {
+		if _, err := tx.Exec(`CREATE TABLE team_queue_settings_v2(task_id TEXT PRIMARY KEY REFERENCES tasks(id), concurrency_limit INTEGER NOT NULL DEFAULT 1 CHECK(concurrency_limit >= 0));
+			INSERT INTO team_queue_settings_v2(task_id,concurrency_limit) SELECT task_id,concurrency_limit FROM team_queue_settings;
+			DROP TABLE team_queue_settings;
+			ALTER TABLE team_queue_settings_v2 RENAME TO team_queue_settings;`); err != nil {
+			return err
+		}
+	}
 	for _, column := range []struct{ name, definition string }{
+		{"min_free_disk_mib", "INTEGER NOT NULL DEFAULT 0"},
 		{"limiter_domain", "TEXT NOT NULL DEFAULT ''"},
 		{"max_relay_bindings", "INTEGER NOT NULL DEFAULT 0"},
 		{"max_requests_per_minute", "INTEGER NOT NULL DEFAULT 0"},
@@ -109,13 +124,18 @@ func migrateTeamQueue(db *sql.DB) error {
 			}
 		}
 	}
-	var usageVersion int
-	if err := tx.QueryRow(`SELECT count(*) FROM pragma_table_info('team_host_usage') WHERE name='policy_version'`).Scan(&usageVersion); err != nil {
-		return err
-	}
-	if usageVersion == 0 {
-		if _, err := tx.Exec(`ALTER TABLE team_host_usage ADD COLUMN policy_version INTEGER NOT NULL DEFAULT 0`); err != nil {
+	for _, column := range []struct{ name, definition string }{
+		{"policy_version", "INTEGER NOT NULL DEFAULT 0"},
+		{"free_disk_mib", "INTEGER"},
+	} {
+		var count int
+		if err := tx.QueryRow(`SELECT count(*) FROM pragma_table_info('team_host_usage') WHERE name=?`, column.name).Scan(&count); err != nil {
 			return err
+		}
+		if count == 0 {
+			if _, err := tx.Exec("ALTER TABLE team_host_usage ADD COLUMN " + column.name + " " + column.definition); err != nil {
+				return err
+			}
 		}
 	}
 	var entryPK int
@@ -159,6 +179,69 @@ func migrateTeamQueue(db *sql.DB) error {
 		}
 	}
 	return tx.Commit()
+}
+
+// queueConcurrencyLimit reads a project's team queue limit. A project with no
+// setting is the serial queue (1); 0 means no fixed cap, and N >= 2 is an
+// owner ceiling. Parallel admission is otherwise governed by ownership,
+// handler leases, host capacity and the disk reserve.
+func queueConcurrencyLimit(ctx context.Context, q queryRower, task string) (int, error) {
+	var limit int
+	err := q.QueryRowContext(ctx, `SELECT COALESCE((SELECT concurrency_limit FROM team_queue_settings WHERE task_id=?),1)`, task).Scan(&limit)
+	return limit, err
+}
+
+// queueParallel reports whether a limit runs teams beside each other, with
+// item-scoped leads instead of the project lead slot.
+func queueParallel(limit int) bool { return limit != 1 }
+
+// queueSlotsFull reports whether a positive limit is reached. Zero has no cap.
+func queueSlotsFull(limit, active int) bool { return limit > 0 && active >= limit }
+
+// projectQueueParallel reads whether a project's team queue is parallel.
+func projectQueueParallel(ctx context.Context, q queryRower, task string) (bool, error) {
+	limit, err := queueConcurrencyLimit(ctx, q, task)
+	return queueParallel(limit), err
+}
+
+// freeQueueHandler returns the first online database handler that no active
+// entry leases, or a zero agent. Neither side of an open handler rotation
+// takes a new lease.
+func freeQueueHandler(ctx context.Context, q queryRower, task string, active []api.TeamQueueEntry) (api.Agent, error) {
+	rows, err := q.QueryContext(ctx, `SELECT `+agentCols+` FROM agents WHERE task_id=? AND role=? AND status NOT IN ('retired','closed','exited')
+ AND id NOT IN (SELECT old_agent_id FROM handler_rotations WHERE task_id=? AND state='prepared' UNION SELECT successor_agent_id FROM handler_rotations WHERE task_id=? AND state='prepared') ORDER BY created_at,id`, task, api.AgentRoleDatabaseHandler, task, task)
+	if err != nil {
+		return api.Agent{}, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		a, err := scanAgent(rows)
+		if err != nil {
+			return api.Agent{}, err
+		}
+		if !a.Online {
+			continue
+		}
+		inUse := false
+		for _, entry := range active {
+			if entry.HandlerID == a.ID {
+				inUse = true
+				break
+			}
+		}
+		if !inUse {
+			return a, nil
+		}
+	}
+	return api.Agent{}, rows.Err()
+}
+
+// liveItemRuns counts the item-bound runs that are not yet closed and
+// cleaned, which keep a failed entry from being released.
+func liveItemRuns(ctx context.Context, q queryRower, task, item string) (int, error) {
+	var live int
+	err := q.QueryRowContext(ctx, `SELECT count(*) FROM agent_work_item_bindings b JOIN agents a ON a.id=b.agent_id AND a.run_id=b.run_id WHERE b.item_task_id=? AND b.item_id=? AND (a.status<>'closed' OR a.cleanup_done=0)`, task, item).Scan(&live)
+	return live, err
 }
 
 func validTeamQueueID(id string) bool {
@@ -305,7 +388,8 @@ func (s *Store) ListTeamQueue(ctx context.Context, task string) (api.TeamQueueLi
 		return api.TeamQueueList{}, api.ErrInvalid
 	}
 	out := api.TeamQueueList{Entries: []api.TeamQueueEntry{}}
-	if err := s.db.QueryRowContext(ctx, `SELECT COALESCE((SELECT concurrency_limit FROM team_queue_settings WHERE task_id=?),1)`, task).Scan(&out.ConcurrencyLimit); err != nil {
+	var err error
+	if out.ConcurrencyLimit, err = queueConcurrencyLimit(ctx, s.db, task); err != nil {
 		return out, err
 	}
 	rows, err := s.db.QueryContext(ctx, `SELECT `+teamQueueCols+` FROM team_queue_entries WHERE task_id=? ORDER BY position`, task)
@@ -363,23 +447,49 @@ func (s *Store) ListTeamQueue(ctx context.Context, task string) (api.TeamQueueLi
 			}
 		}
 	}
+	parallel := queueParallel(out.ConcurrencyLimit)
 	var capacityTx *sql.Tx
-	if out.ConcurrencyLimit > 1 {
+	var active []api.TeamQueueEntry
+	var freeHandler api.Agent
+	if parallel {
 		capacityTx, err = s.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
 		if err != nil {
 			return out, err
 		}
 		defer capacityTx.Rollback()
+		for _, entry := range out.Entries {
+			if entry.State == "launching" || entry.State == "running" || (entry.State == "failed" && entry.ReleasedAt == "") {
+				active = append(active, entry)
+			}
+		}
+		if freeHandler, err = freeQueueHandler(ctx, capacityTx, task, active); err != nil {
+			return out, err
+		}
 	}
 	for i := range out.Entries {
+		if parallel && out.Entries[i].State == "failed" && out.Entries[i].ReleasedAt == "" {
+			live, liveErr := liveItemRuns(ctx, capacityTx, task, out.Entries[i].ItemID)
+			if liveErr != nil {
+				return out, liveErr
+			}
+			if live > 0 {
+				out.Entries[i].BlockReason = fmt.Sprintf("Failed; %d item-bound runs are still live or uncleaned", live)
+			} else {
+				out.Entries[i].BlockReason = "Failed; the runner releases it on its next pass"
+			}
+		}
 		if out.Entries[i].State != "queued" {
 			continue
 		}
-		if activeCount >= out.ConcurrencyLimit {
+		if queueSlotsFull(out.ConcurrencyLimit, activeCount) {
 			out.Entries[i].BlockReason = "All team slots are reserved"
-		} else if capacityTx != nil {
-			if capacityErr := checkTeamHostCapacity(ctx, capacityTx, out.Entries[i].Host, s.now(), 1); capacityErr != nil {
+		} else if parallel {
+			if capacityErr := checkTeamHostAdmission(ctx, capacityTx, out.Entries[i].Host, s.now()); capacityErr != nil {
 				out.Entries[i].BlockReason = capacityErr.Error()
+			} else if freeHandler.ID == "" {
+				out.Entries[i].BlockReason = "No free database handler"
+			} else if len(out.Entries[i].Ownership) == 0 && len(active) > 0 {
+				out.Entries[i].BlockReason = "Unscoped: declare ownership to run beside other teams"
 			}
 		}
 		for j := range out.Entries {
@@ -533,7 +643,7 @@ func (s *Store) TeamQueueAction(ctx context.Context, task string, req api.TeamQu
 	var e api.TeamQueueEntry
 	switch req.Operation {
 	case "set_host_policy":
-		if req.Host == "" || !validLimiterDomain(req.LimiterDomain) || len(req.LimiterDomain) > 255 || req.HostPolicyVersion < 1 || req.HostMaxSessions < 1 || req.HostMaxPolling < 1 || req.HostMaxRelayBindings < 1 || req.HostMaxRequestsPerMinute < 1 || req.HostMaxBurst < 1 || req.HostHeadroomPercent < 1 || req.HostHeadroomPercent >= 100 || req.HostMaxRequestsPerMinute > 1000000 || req.HostMaxBurst > 100000 {
+		if req.Host == "" || !validLimiterDomain(req.LimiterDomain) || len(req.LimiterDomain) > 255 || req.HostPolicyVersion < 1 || req.HostMaxSessions < 1 || req.HostMaxPolling < 1 || req.HostMaxRelayBindings < 1 || req.HostMaxRequestsPerMinute < 1 || req.HostMaxBurst < 1 || req.HostHeadroomPercent < 1 || req.HostHeadroomPercent >= 100 || req.HostMaxRequestsPerMinute > 1000000 || req.HostMaxBurst > 100000 || req.HostMinFreeDiskMiB < 0 {
 			return zero, api.ErrInvalid
 		}
 		expires, parseErr := time.Parse(time.RFC3339, req.HostPolicyExpires)
@@ -548,13 +658,13 @@ func (s *Store) TeamQueueAction(ctx context.Context, task string, req api.TeamQu
 		if previous >= req.HostPolicyVersion {
 			return zero, fmt.Errorf("%w: host policy version must increase", api.ErrConflict)
 		}
-		if _, err := tx.ExecContext(ctx, `INSERT INTO team_host_policies(host,version,expires_at,max_sessions,max_polling,limiter_domain,max_relay_bindings,max_requests_per_minute,max_burst,headroom_percent) VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(host) DO UPDATE SET version=excluded.version,expires_at=excluded.expires_at,max_sessions=excluded.max_sessions,max_polling=excluded.max_polling,limiter_domain=excluded.limiter_domain,max_relay_bindings=excluded.max_relay_bindings,max_requests_per_minute=excluded.max_requests_per_minute,max_burst=excluded.max_burst,headroom_percent=excluded.headroom_percent`, req.Host, req.HostPolicyVersion, req.HostPolicyExpires, req.HostMaxSessions, req.HostMaxPolling, req.LimiterDomain, req.HostMaxRelayBindings, req.HostMaxRequestsPerMinute, req.HostMaxBurst, req.HostHeadroomPercent); err != nil {
+		if _, err := tx.ExecContext(ctx, `INSERT INTO team_host_policies(host,version,expires_at,max_sessions,max_polling,limiter_domain,max_relay_bindings,max_requests_per_minute,max_burst,headroom_percent,min_free_disk_mib) VALUES(?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(host) DO UPDATE SET version=excluded.version,expires_at=excluded.expires_at,max_sessions=excluded.max_sessions,max_polling=excluded.max_polling,limiter_domain=excluded.limiter_domain,max_relay_bindings=excluded.max_relay_bindings,max_requests_per_minute=excluded.max_requests_per_minute,max_burst=excluded.max_burst,headroom_percent=excluded.headroom_percent,min_free_disk_mib=excluded.min_free_disk_mib`, req.Host, req.HostPolicyVersion, req.HostPolicyExpires, req.HostMaxSessions, req.HostMaxPolling, req.LimiterDomain, req.HostMaxRelayBindings, req.HostMaxRequestsPerMinute, req.HostMaxBurst, req.HostHeadroomPercent, req.HostMinFreeDiskMiB); err != nil {
 			return zero, err
 		}
 		e = api.TeamQueueEntry{TaskID: task, Host: req.Host, State: "host_policy", Revision: req.HostPolicyVersion}
 	case "observe_host":
 		u := req.HostUsage
-		if req.Host == "" || u == nil || u.Host != req.Host || !validLimiterDomain(u.LimiterDomain) || u.PolicyVersion < 1 || u.RelayBindings < 0 || !validContextDigest(u.SourceDigest) {
+		if req.Host == "" || u == nil || u.Host != req.Host || !validLimiterDomain(u.LimiterDomain) || u.PolicyVersion < 1 || u.RelayBindings < 0 || !validContextDigest(u.SourceDigest) || (u.FreeDiskMiB != nil && *u.FreeDiskMiB < 0) {
 			return zero, api.ErrInvalid
 		}
 		observed, parseErr := time.Parse(time.RFC3339Nano, u.ObservedAt)
@@ -574,23 +684,27 @@ func (s *Store) TeamQueueAction(ctx context.Context, task string, req api.TeamQu
 		}
 		if previous != nil && previous.PolicyVersion == u.PolicyVersion {
 			previousAt, parseErr := time.Parse(time.RFC3339Nano, previous.ObservedAt)
-			if parseErr != nil || !observed.After(previousAt) && (observed.Before(previousAt) || previous.SourceDigest != u.SourceDigest || previous.Complete != u.Complete || previous.RelayBindings != u.RelayBindings) {
+			if parseErr != nil || !observed.After(previousAt) && (observed.Before(previousAt) || previous.SourceDigest != u.SourceDigest || previous.Complete != u.Complete || previous.RelayBindings != u.RelayBindings || !sameFreeDisk(previous.FreeDiskMiB, u.FreeDiskMiB)) {
 				return zero, fmt.Errorf("%w: host usage observation regressed", api.ErrConflict)
 			}
 		}
-		if _, err := tx.ExecContext(ctx, `INSERT INTO team_host_usage(host,limiter_domain,policy_version,observed_at,relay_bindings,complete,source_digest) VALUES(?,?,?,?,?,?,?) ON CONFLICT(host) DO UPDATE SET limiter_domain=excluded.limiter_domain,policy_version=excluded.policy_version,observed_at=excluded.observed_at,relay_bindings=excluded.relay_bindings,complete=excluded.complete,source_digest=excluded.source_digest`, u.Host, u.LimiterDomain, u.PolicyVersion, u.ObservedAt, u.RelayBindings, u.Complete, u.SourceDigest); err != nil {
+		var freeDisk sql.NullInt64
+		if u.FreeDiskMiB != nil {
+			freeDisk = sql.NullInt64{Int64: *u.FreeDiskMiB, Valid: true}
+		}
+		if _, err := tx.ExecContext(ctx, `INSERT INTO team_host_usage(host,limiter_domain,policy_version,observed_at,relay_bindings,complete,source_digest,free_disk_mib) VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(host) DO UPDATE SET limiter_domain=excluded.limiter_domain,policy_version=excluded.policy_version,observed_at=excluded.observed_at,relay_bindings=excluded.relay_bindings,complete=excluded.complete,source_digest=excluded.source_digest,free_disk_mib=excluded.free_disk_mib`, u.Host, u.LimiterDomain, u.PolicyVersion, u.ObservedAt, u.RelayBindings, u.Complete, u.SourceDigest, freeDisk); err != nil {
 			return zero, err
 		}
 		e = api.TeamQueueEntry{TaskID: task, Host: req.Host, State: "host_usage"}
 	case "set_limit":
-		if req.ConcurrencyLimit < 1 || req.ConcurrencyLimit > 2 {
+		if req.ConcurrencyLimit < 0 {
 			return zero, api.ErrInvalid
 		}
-		if req.ConcurrencyLimit > 1 {
+		if queueParallel(req.ConcurrencyLimit) {
 			if req.Host == "" {
 				return zero, api.ErrInvalid
 			}
-			if err := checkTeamHostCapacity(ctx, tx, req.Host, s.now(), 1); err != nil {
+			if err := checkTeamHostAdmission(ctx, tx, req.Host, s.now()); err != nil {
 				return zero, err
 			}
 			var unverified int
@@ -605,7 +719,7 @@ func (s *Store) TeamQueueAction(ctx context.Context, task string, req api.TeamQu
 		if err := tx.QueryRowContext(ctx, `SELECT count(*) FROM team_queue_entries WHERE task_id=? AND (state IN ('launching','running') OR (state='failed' AND released_at=''))`, task).Scan(&active); err != nil {
 			return zero, err
 		}
-		if active > req.ConcurrencyLimit {
+		if req.ConcurrencyLimit > 0 && active > req.ConcurrencyLimit {
 			return zero, fmt.Errorf("%w: active safety reservations exceed requested limit", api.ErrConflict)
 		}
 		if _, err := tx.ExecContext(ctx, `INSERT INTO team_queue_settings(task_id,concurrency_limit) VALUES(?,?) ON CONFLICT(task_id) DO UPDATE SET concurrency_limit=excluded.concurrency_limit`, task, req.ConcurrencyLimit); err != nil {
@@ -726,11 +840,11 @@ func (s *Store) TeamQueueAction(ctx context.Context, task string, req api.TeamQu
 		if req.Repository != "" && !validGitCommit(req.BaseCommit) {
 			return zero, api.ErrInvalid
 		}
-		var limit int
-		if err := tx.QueryRowContext(ctx, `SELECT COALESCE((SELECT concurrency_limit FROM team_queue_settings WHERE task_id=?),1)`, task).Scan(&limit); err != nil {
+		limit, err := queueConcurrencyLimit(ctx, tx, task)
+		if err != nil {
 			return zero, err
 		}
-		if limit > 1 && (req.Repository == "" || req.BaseCommit == "") {
+		if queueParallel(limit) && (req.Repository == "" || req.BaseCommit == "") {
 			return zero, fmt.Errorf("%w: parallel queue entry needs a frozen repository and base", api.ErrConflict)
 		}
 		item, err := getWorkItem(tx, ctx, task, req.ItemID)
@@ -761,7 +875,7 @@ func (s *Store) TeamQueueAction(ctx context.Context, task string, req api.TeamQu
 		if err != nil {
 			return zero, fmt.Errorf("%w: duplicate item or queue entry: %v", api.ErrConflict, err)
 		}
-	case "remove", "reorder", "claim", "freeze", "attempt", "started", "running", "replace_lead", "close", "close_refresh", "accept", "finish", "fail", "release":
+	case "remove", "reorder", "claim", "freeze", "attempt", "started", "running", "replace_lead", "close", "close_refresh", "accept", "finish", "fail", "release", "scope":
 		if !validTeamQueueID(req.EntryID) {
 			return zero, api.ErrInvalid
 		}
@@ -776,12 +890,56 @@ func (s *Store) TeamQueueAction(ctx context.Context, task string, req api.TeamQu
 			return zero, fmt.Errorf("%w: entry revision changed", api.ErrConflict)
 		}
 		switch req.Operation {
-		case "release":
-			var limit int
-			if err := tx.QueryRowContext(ctx, `SELECT COALESCE((SELECT concurrency_limit FROM team_queue_settings WHERE task_id=?),1)`, task).Scan(&limit); err != nil {
+		case "scope":
+			ownership, err := canonicalQueueOwnership(req.Ownership)
+			if err != nil {
 				return zero, err
 			}
-			if e.State != "failed" || e.ReleasedAt != "" || (limit == 1 && (t.Orchestrator != "" || t.CleanupPending != 0)) {
+			if len(ownership) == 0 {
+				return zero, fmt.Errorf("%w: scope needs at least one owned path", api.ErrInvalid)
+			}
+			if e.State != "queued" && e.State != "launching" && e.State != "running" {
+				return zero, fmt.Errorf("%w: only a queued, launching or running entry can be scoped", api.ErrConflict)
+			}
+			if err := queueScopeAuthority(ctx, tx, task, e, req); err != nil {
+				return zero, err
+			}
+			if e.State != "queued" {
+				// An admitted team may narrow its declaration, but it may not
+				// widen into paths another active team holds.
+				scoped := e
+				scoped.Ownership = ownership
+				rows, err := tx.QueryContext(ctx, `SELECT `+teamQueueCols+` FROM team_queue_entries WHERE task_id=? AND id<>? AND (state IN ('launching','running') OR (state='failed' AND released_at='')) ORDER BY position`, task, e.ID)
+				if err != nil {
+					return zero, err
+				}
+				var overlap string
+				for rows.Next() {
+					other, scanErr := scanTeamQueue(rows)
+					if scanErr != nil {
+						rows.Close()
+						return zero, scanErr
+					}
+					if overlap == "" && queueEntryConflicts(scoped, other) {
+						overlap = other.ID
+					}
+				}
+				err = rows.Err()
+				rows.Close()
+				if err != nil {
+					return zero, err
+				}
+				if overlap != "" {
+					return zero, fmt.Errorf("%w: ownership overlaps active entry %s", api.ErrConflict, overlap)
+				}
+			}
+			e.Ownership = ownership
+		case "release":
+			limit, err := queueConcurrencyLimit(ctx, tx, task)
+			if err != nil {
+				return zero, err
+			}
+			if e.State != "failed" || e.ReleasedAt != "" || (!queueParallel(limit) && (t.Orchestrator != "" || t.CleanupPending != 0)) {
 				return zero, api.ErrConflict
 			}
 			if req.ReleaseProof != nil && (!req.SessionsChecked || req.Host != e.Host) {
@@ -791,7 +949,7 @@ func (s *Store) TeamQueueAction(ctx context.Context, task string, req api.TeamQu
 				return zero, err
 			}
 			var reservedEntry string
-			err := tx.QueryRowContext(ctx, `SELECT entry_id FROM team_launch_reservations WHERE task_id=? AND entry_id=?`, task, e.ID).Scan(&reservedEntry)
+			err = tx.QueryRowContext(ctx, `SELECT entry_id FROM team_launch_reservations WHERE task_id=? AND entry_id=?`, task, e.ID).Scan(&reservedEntry)
 			if err != nil && !errors.Is(err, sql.ErrNoRows) {
 				return zero, err
 			}
@@ -871,11 +1029,11 @@ func (s *Store) TeamQueueAction(ctx context.Context, task string, req api.TeamQu
 				}
 			}
 		case "claim":
-			var limit int
-			if err := tx.QueryRowContext(ctx, `SELECT COALESCE((SELECT concurrency_limit FROM team_queue_settings WHERE task_id=?),1)`, task).Scan(&limit); err != nil {
+			limit, err := queueConcurrencyLimit(ctx, tx, task)
+			if err != nil {
 				return zero, err
 			}
-			if e.State != "queued" || t.PauseState != api.ProjectPauseActive || (limit == 1 && t.Orchestrator != "") || (limit == 1 && t.CleanupPending != 0) || req.Host != e.Host || req.PauseGeneration != t.PauseGeneration {
+			if e.State != "queued" || t.PauseState != api.ProjectPauseActive || (!queueParallel(limit) && (t.Orchestrator != "" || t.CleanupPending != 0)) || req.Host != e.Host || req.PauseGeneration != t.PauseGeneration {
 				return zero, fmt.Errorf("%w: project is not launchable", api.ErrConflict)
 			}
 			if err := requireConfirmedTeamOrder(ctx, tx, task, e.ItemID, e.ItemRevision, e.OrderMessageSeq); err != nil {
@@ -910,11 +1068,11 @@ func (s *Store) TeamQueueAction(ctx context.Context, task string, req api.TeamQu
 			if err != nil {
 				return zero, err
 			}
-			if len(activeEntries) >= limit {
+			if queueSlotsFull(limit, len(activeEntries)) {
 				return zero, fmt.Errorf("%w: all team slots are reserved", api.ErrConflict)
 			}
-			if limit > 1 {
-				if err := checkTeamHostCapacity(ctx, tx, e.Host, s.now(), 1); err != nil {
+			if queueParallel(limit) {
+				if err := checkTeamHostAdmission(ctx, tx, e.Host, s.now()); err != nil {
 					return zero, err
 				}
 			}
@@ -935,36 +1093,7 @@ func (s *Store) TeamQueueAction(ctx context.Context, task string, req api.TeamQu
 			if head != e.ID {
 				return zero, fmt.Errorf("%w: not queue head", api.ErrConflict)
 			}
-			// Neither side of an open handler rotation takes a new lease.
-			handlers, err := tx.QueryContext(ctx, `SELECT `+agentCols+` FROM agents WHERE task_id=? AND role=? AND status NOT IN ('retired','closed','exited')
- AND id NOT IN (SELECT old_agent_id FROM handler_rotations WHERE task_id=? AND state='prepared' UNION SELECT successor_agent_id FROM handler_rotations WHERE task_id=? AND state='prepared') ORDER BY created_at,id`, task, api.AgentRoleDatabaseHandler, task, task)
-			if err != nil {
-				return zero, err
-			}
-			var chosen api.Agent
-			for handlers.Next() {
-				a, scanErr := scanAgent(handlers)
-				if scanErr != nil {
-					handlers.Close()
-					return zero, scanErr
-				}
-				if !a.Online {
-					continue
-				}
-				inUse := false
-				for _, active := range activeEntries {
-					if active.HandlerID == a.ID {
-						inUse = true
-						break
-					}
-				}
-				if !inUse {
-					chosen = a
-					break
-				}
-			}
-			err = handlers.Err()
-			handlers.Close()
+			chosen, err := freeQueueHandler(ctx, tx, task, activeEntries)
 			if err != nil {
 				return zero, err
 			}
@@ -1012,11 +1141,11 @@ func (s *Store) TeamQueueAction(ctx context.Context, task string, req api.TeamQu
 			if json.Unmarshal(req.LaunchJSON, &plan) != nil || plan.Task != task || plan.Item != e.ItemID || plan.Revision != e.ItemRevision || plan.Order != e.OrderMessageSeq || len(plan.Context) == 0 || !json.Valid(plan.Context) || len(plan.Members) == 0 {
 				return zero, api.ErrInvalid
 			}
-			var limit int
-			if err := tx.QueryRowContext(ctx, `SELECT COALESCE((SELECT concurrency_limit FROM team_queue_settings WHERE task_id=?),1)`, task).Scan(&limit); err != nil {
+			limit, err := queueConcurrencyLimit(ctx, tx, task)
+			if err != nil {
 				return zero, err
 			}
-			if (limit > 1 || plan.HandlerID != "") && (plan.HandlerID != e.HandlerID || plan.HandlerRunID != e.HandlerRunID || plan.HandlerLeaseGeneration != e.HandlerLeaseGeneration) {
+			if (queueParallel(limit) || plan.HandlerID != "") && (plan.HandlerID != e.HandlerID || plan.HandlerRunID != e.HandlerRunID || plan.HandlerLeaseGeneration != e.HandlerLeaseGeneration) {
 				return zero, fmt.Errorf("%w: frozen handler lease differs from queue claim", api.ErrConflict)
 			}
 			seenAgents := map[string]bool{}
@@ -1052,11 +1181,13 @@ func (s *Store) TeamQueueAction(ctx context.Context, task string, req api.TeamQu
 				if err := requireCurrentConfirmedTeamOrder(ctx, tx, task, e.ItemID, e.ItemRevision, e.OrderMessageSeq); err != nil {
 					return zero, err
 				}
-				var limit int
-				if err := tx.QueryRowContext(ctx, `SELECT COALESCE((SELECT concurrency_limit FROM team_queue_settings WHERE task_id=?),1)`, task).Scan(&limit); err != nil {
+				limit, err := queueConcurrencyLimit(ctx, tx, task)
+				if err != nil {
 					return zero, err
 				}
-				if limit > 1 {
+				// A launch already under way keeps its members; the disk
+				// reserve gates only new admission.
+				if queueParallel(limit) {
 					if err := checkTeamHostCapacity(ctx, tx, e.Host, s.now(), 0); err != nil {
 						return zero, err
 					}
@@ -1271,7 +1402,8 @@ func (s *Store) TeamQueueAction(ctx context.Context, task string, req api.TeamQu
 				data, _ := json.Marshal(e.Integration)
 				integrationJSON = string(data)
 			}
-			_, err = tx.ExecContext(ctx, `UPDATE team_queue_entries SET state=?,revision=?,pause_generation=?,launch_json=?,close_json=?,failure=?,escalation_seq=?,released_at=?,handler_id=?,handler_run_id=?,handler_lease_generation=?,acceptance_json=?,integration_json=?,base_commit=?,updated_at=? WHERE id=?`, e.State, e.Revision, e.PauseGeneration, string(e.LaunchJSON), string(e.CloseJSON), e.Failure, e.EscalationSeq, e.ReleasedAt, e.HandlerID, e.HandlerRunID, e.HandlerLeaseGeneration, acceptanceJSON, integrationJSON, e.BaseCommit, now, e.ID)
+			ownedJSON, _ := json.Marshal(e.Ownership)
+			_, err = tx.ExecContext(ctx, `UPDATE team_queue_entries SET state=?,revision=?,pause_generation=?,launch_json=?,close_json=?,failure=?,escalation_seq=?,released_at=?,handler_id=?,handler_run_id=?,handler_lease_generation=?,acceptance_json=?,integration_json=?,base_commit=?,ownership_json=?,updated_at=? WHERE id=?`, e.State, e.Revision, e.PauseGeneration, string(e.LaunchJSON), string(e.CloseJSON), e.Failure, e.EscalationSeq, e.ReleasedAt, e.HandlerID, e.HandlerRunID, e.HandlerLeaseGeneration, acceptanceJSON, integrationJSON, e.BaseCommit, string(ownedJSON), now, e.ID)
 			if err != nil {
 				return zero, err
 			}
@@ -1301,6 +1433,45 @@ func (s *Store) TeamQueueAction(ctx context.Context, task string, req api.TeamQu
 	}
 	s.notify(task)
 	return e, nil
+}
+
+// queueScopeAuthority checks who may declare an entry's ownership. A request
+// without an agent is the owner's unbound CLI. A database handler names its
+// exact live run: any handler may scope a queued entry, and only the leased
+// handler an admitted one. The item's current lead may scope its own admitted
+// entry. Like accept, the named run is checked against the hub's records.
+func queueScopeAuthority(ctx context.Context, tx *sql.Tx, task string, e api.TeamQueueEntry, req api.TeamQueueRequest) error {
+	refused := fmt.Errorf("%w: only the owner, a database handler or the entry's item lead may scope it", api.ErrConflict)
+	live := func(agentID, runID, role string) bool {
+		var actualRole, actualRun, status string
+		err := tx.QueryRowContext(ctx, `SELECT role,run_id,status FROM agents WHERE task_id=? AND id=?`, task, agentID).Scan(&actualRole, &actualRun, &status)
+		return err == nil && actualRole == role && actualRun == runID && status != api.AgentClosed && status != api.AgentExited && status != api.AgentRetired
+	}
+	handler := req.HandlerAgentID != "" || req.HandlerRunID != ""
+	lead := req.LeadAgentID != "" || req.LeadRunID != ""
+	switch {
+	case !handler && !lead:
+		return nil
+	case handler && lead:
+		return api.ErrInvalid
+	case handler:
+		if !live(req.HandlerAgentID, req.HandlerRunID, api.AgentRoleDatabaseHandler) {
+			return refused
+		}
+		if e.State != "queued" && (req.HandlerAgentID != e.HandlerID || req.HandlerRunID != e.HandlerRunID) {
+			return refused
+		}
+		return nil
+	default:
+		if e.State == "queued" || !live(req.LeadAgentID, req.LeadRunID, "") {
+			return refused
+		}
+		var agentID, runID, state string
+		if err := tx.QueryRowContext(ctx, `SELECT agent_id,run_id,state FROM item_team_leads WHERE task_id=? AND item_id=?`, task, e.ItemID).Scan(&agentID, &runID, &state); err != nil || state == "closed" || agentID != req.LeadAgentID || runID != req.LeadRunID {
+			return refused
+		}
+		return nil
+	}
 }
 
 // verifiedRepository reports whether a verification plan's repository names the

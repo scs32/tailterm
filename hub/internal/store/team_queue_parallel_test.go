@@ -19,12 +19,20 @@ func syntheticHostUsage(t *testing.T, s *Store, taskID, host string) {
 	if err != nil || policy == nil {
 		t.Fatalf("synthetic policy missing: %v", err)
 	}
-	if _, err := s.TeamQueueAction(context.Background(), taskID, api.TeamQueueRequest{RequestID: api.NewID("tqr"), Operation: "observe_host", Host: host, HostUsage: &api.TeamHostUsage{Host: host, LimiterDomain: "https://fixture.invalid", PolicyVersion: policy.Version, ObservedAt: s.now().UTC().Format(time.RFC3339Nano), RelayBindings: 1, Complete: true, SourceDigest: strings.Repeat("a", 64)}}); err != nil {
+	if _, err := s.TeamQueueAction(context.Background(), taskID, api.TeamQueueRequest{RequestID: api.NewID("tqr"), Operation: "observe_host", Host: host, HostUsage: &api.TeamHostUsage{Host: host, LimiterDomain: "https://fixture.invalid", PolicyVersion: policy.Version, ObservedAt: s.now().UTC().Format(time.RFC3339Nano), RelayBindings: 1, Complete: true, SourceDigest: strings.Repeat("a", 64), FreeDiskMiB: freeDiskMiB(1 << 20)}}); err != nil {
 		t.Fatal(err)
 	}
 }
 
+func freeDiskMiB(n int64) *int64 { return &n }
+
 func TestParallelQueueSkipsConflictAndLeasesDistinctHandlers(t *testing.T) {
+	for _, limit := range []int{2, 0} {
+		t.Run(fmt.Sprintf("limit-%d", limit), func(t *testing.T) { parallelQueueSkipsConflictAndLeasesDistinctHandlers(t, limit) })
+	}
+}
+
+func parallelQueueSkipsConflictAndLeasesDistinctHandlers(t *testing.T, limit int) {
 	s, task, items, orders := queueFixture(t)
 	ctx := context.Background()
 	by := api.Caller{Node: "fixture", User: "owner"}
@@ -62,7 +70,7 @@ func TestParallelQueueSkipsConflictAndLeasesDistinctHandlers(t *testing.T) {
 		t.Fatal(err)
 	}
 	syntheticHostUsage(t, s, task.ID, "mini")
-	if _, err := s.TeamQueueAction(ctx, task.ID, api.TeamQueueRequest{RequestID: "limit-two", Operation: "set_limit", Host: "mini", ConcurrencyLimit: 2}); err != nil {
+	if _, err := s.TeamQueueAction(ctx, task.ID, api.TeamQueueRequest{RequestID: "parallel-limit", Operation: "set_limit", Host: "mini", ConcurrencyLimit: limit}); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := claim(1, "conflicting-b"); err == nil {
@@ -344,8 +352,8 @@ func TestParallelLimitRequiresFreshHostBudgetBeforeEffects(t *testing.T) {
 	if err := limit("missing-policy", 2); err == nil {
 		t.Fatal("missing host policy admitted limit 2")
 	}
-	if err := limit("invalid-limit", 3); err == nil {
-		t.Fatal("over ceiling admitted")
+	if err := limit("invalid-limit", -1); err == nil {
+		t.Fatal("negative limit admitted")
 	}
 	policy := func(key string, version int64, sessions, polling int, expiry time.Time) error {
 		_, err := s.TeamQueueAction(ctx, task.ID, api.TeamQueueRequest{RequestID: key, Operation: "set_host_policy", Host: "mini", HostPolicyVersion: version, HostPolicyExpires: expiry.Format(time.RFC3339), HostMaxSessions: sessions, HostMaxPolling: polling, LimiterDomain: "https://fixture.invalid", HostMaxRelayBindings: 100, HostMaxRequestsPerMinute: 100000, HostMaxBurst: 10000, HostHeadroomPercent: 20})
@@ -413,6 +421,12 @@ func TestParallelLimitRequiresFreshHostBudgetBeforeEffects(t *testing.T) {
 }
 
 func TestParallelHostBudgetRejectsIncompleteStaleRateAndBurstEvidence(t *testing.T) {
+	for _, limit := range []int{2, 0} {
+		t.Run(fmt.Sprintf("limit-%d", limit), func(t *testing.T) { parallelHostBudgetRejectsIncompleteStaleRateAndBurstEvidence(t, limit) })
+	}
+}
+
+func parallelHostBudgetRejectsIncompleteStaleRateAndBurstEvidence(t *testing.T, parallelLimit int) {
 	s, task, _, _ := queueFixture(t)
 	ctx := context.Background()
 	now := s.now()
@@ -424,7 +438,7 @@ func TestParallelHostBudgetRejectsIncompleteStaleRateAndBurstEvidence(t *testing
 		}
 	}
 	limit := func(key string) error {
-		_, err := s.TeamQueueAction(ctx, task.ID, api.TeamQueueRequest{RequestID: key, Operation: "set_limit", Host: "mini", ConcurrencyLimit: 2})
+		_, err := s.TeamQueueAction(ctx, task.ID, api.TeamQueueRequest{RequestID: key, Operation: "set_limit", Host: "mini", ConcurrencyLimit: parallelLimit})
 		return err
 	}
 	policy("budget-rate-low", 1, 100, 1000)

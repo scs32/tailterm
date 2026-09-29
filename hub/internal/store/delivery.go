@@ -1544,11 +1544,11 @@ func (s *Store) escalateDeliveryFollowThrough(ctx context.Context, tx *sql.Tx, d
 		return api.Message{}, api.DeliveryEvent{}, err
 	}
 	if scopedRows == 0 {
-		var limit int
-		if err := tx.QueryRowContext(ctx, `SELECT COALESCE((SELECT concurrency_limit FROM team_queue_settings WHERE task_id=?),1)`, d.TaskID).Scan(&limit); err != nil {
+		parallel, err := projectQueueParallel(ctx, tx, d.TaskID)
+		if err != nil {
 			return api.Message{}, api.DeliveryEvent{}, err
 		}
-		if limit > 1 {
+		if parallel {
 			return api.Message{}, api.DeliveryEvent{}, workItemConflict("exact item lead is unavailable for follow-through escalation")
 		}
 	}

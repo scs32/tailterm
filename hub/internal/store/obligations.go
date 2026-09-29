@@ -576,11 +576,12 @@ func (s *Store) ReassignObligation(ctx context.Context, taskID, obligationID str
 			return api.Message{}, err
 		}
 		if item == "" {
-			var limit, bound int
-			if err := tx.QueryRowContext(ctx, `SELECT COALESCE((SELECT concurrency_limit FROM team_queue_settings WHERE task_id=?),1)`, taskID).Scan(&limit); err != nil {
+			var bound int
+			parallel, err := projectQueueParallel(ctx, tx, taskID)
+			if err != nil {
 				return api.Message{}, err
 			}
-			if limit > 1 {
+			if parallel {
 				if err := tx.QueryRowContext(ctx, `SELECT count(*) FROM agent_work_item_bindings WHERE agent_id=? AND run_id=? AND item_task_id=?`, lead.ID, lead.RunID, taskID).Scan(&bound); err != nil {
 					return api.Message{}, err
 				}

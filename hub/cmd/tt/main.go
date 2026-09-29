@@ -97,7 +97,7 @@ Commands
   new-project --name N [--goal G] create a project (new-task is an alias)
   team launch --item ID --order SEQ [--template planned] [--dry-run]
                                launch an item-bound Planned delivery team locally
-  team queue add|list|remove|reorder|release|abandon
+  team queue add|list|policy|limit|scope|fail|accept|replace-lead|remove|reorder|release|abandon
                                manage a project's durable delivery queue
 `
 

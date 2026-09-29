@@ -1,12 +1,17 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"fmt"
+	"io"
+	"net/http"
 	"os"
+	"path/filepath"
 	"reflect"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -49,7 +54,7 @@ func TestParallelRunnerHostEvidenceFailureKeepsSerialProjectMoving(t *testing.T)
 			if _, err := f.c.TeamQueueAction(ctx, parallelTask.ID, policy); err != nil {
 				t.Fatal(err)
 			}
-			if _, err := f.c.TeamQueueAction(ctx, parallelTask.ID, api.TeamQueueRequest{RequestID: "peer-usage", Operation: "observe_host", Host: "fixture", HostUsage: &api.TeamHostUsage{Host: "fixture", LimiterDomain: domain, PolicyVersion: 1, ObservedAt: time.Now().UTC().Format(time.RFC3339Nano), RelayBindings: 2, Complete: true, SourceDigest: strings.Repeat("a", 64)}}); err != nil {
+			if _, err := f.c.TeamQueueAction(ctx, parallelTask.ID, api.TeamQueueRequest{RequestID: "peer-usage", Operation: "observe_host", Host: "fixture", HostUsage: &api.TeamHostUsage{Host: "fixture", LimiterDomain: domain, PolicyVersion: 1, ObservedAt: time.Now().UTC().Format(time.RFC3339Nano), RelayBindings: 2, Complete: true, SourceDigest: strings.Repeat("a", 64), FreeDiskMiB: freeDiskMiB(1 << 20)}}); err != nil {
 				t.Fatal(err)
 			}
 			if _, err := f.c.TeamQueueAction(ctx, parallelTask.ID, api.TeamQueueRequest{RequestID: "peer-limit", Operation: "set_limit", Host: "fixture", ConcurrencyLimit: 2}); err != nil {
@@ -65,7 +70,8 @@ func TestParallelRunnerHostEvidenceFailureKeepsSerialProjectMoving(t *testing.T)
 			}
 			runner := queueCorrectionRunner(t, f, 1)
 			if failure == "census" {
-				runner.census = func(ctx context.Context, c *api.Client, task, host, domain string, version int64, _ *api.TeamHostUsage) error {
+				runner.census = func(ctx context.Context, c *api.Client, task, host string, policy api.TeamHostPolicy, _ *api.TeamHostUsage, _ []string) error {
+					domain, version := policy.LimiterDomain, policy.Version
 					_, err := c.TeamQueueAction(ctx, task, api.TeamQueueRequest{RequestID: "future-census", Operation: "observe_host", Host: host, HostUsage: &api.TeamHostUsage{Host: host, LimiterDomain: domain, PolicyVersion: version, ObservedAt: time.Now().UTC().Add(7 * time.Second).Format(time.RFC3339Nano), RelayBindings: 2, Complete: true, SourceDigest: strings.Repeat("b", 64)}})
 					if err == nil {
 						t.Fatal("test hub accepted a clock-skewed census")
@@ -77,7 +83,7 @@ func TestParallelRunnerHostEvidenceFailureKeepsSerialProjectMoving(t *testing.T)
 				if _, err := f.c.TeamQueueAction(ctx, parallelTask.ID, policy); err != nil {
 					t.Fatal(err)
 				}
-				runner.census = func(context.Context, *api.Client, string, string, string, int64, *api.TeamHostUsage) error {
+				runner.census = func(context.Context, *api.Client, string, string, api.TeamHostPolicy, *api.TeamHostUsage, []string) error {
 					t.Fatal("mismatched domain reached census")
 					return nil
 				}
@@ -108,6 +114,12 @@ func TestParallelRunnerRotatesProjectPollingOrder(t *testing.T) {
 }
 
 func TestTeamRunnerParallelSkipsConflictAndFinishesOtherSlot(t *testing.T) {
+	for _, limit := range []int{2, 0} {
+		t.Run(fmt.Sprintf("limit-%d", limit), func(t *testing.T) { teamRunnerParallelSkipsConflictAndFinishesOtherSlot(t, limit) })
+	}
+}
+
+func teamRunnerParallelSkipsConflictAndFinishesOtherSlot(t *testing.T, limit int) {
 	f := newTeamFixture(t, true)
 	ctx := context.Background()
 	otherHandler, err := f.c.AddAgent(ctx, f.task.ID, api.AddAgentRequest{AgentID: api.NewID("agt"), Name: "aux-handler", Role: api.AgentRoleDatabaseHandler, Host: "fixture", Session: "aux-handler", Runtime: "codex"})
@@ -135,10 +147,10 @@ func TestTeamRunnerParallelSkipsConflictAndFinishesOtherSlot(t *testing.T) {
 	if _, err := f.c.TeamQueueAction(ctx, f.task.ID, api.TeamQueueRequest{RequestID: "parallel-policy", Operation: "set_host_policy", Host: "fixture", HostPolicyVersion: 1, HostPolicyExpires: time.Now().Add(time.Hour).Format(time.RFC3339), HostMaxSessions: 20, HostMaxPolling: 2, LimiterDomain: "https://fixture.invalid", HostMaxRelayBindings: 100, HostMaxRequestsPerMinute: 100000, HostMaxBurst: 10000, HostHeadroomPercent: 20}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := f.c.TeamQueueAction(ctx, f.task.ID, api.TeamQueueRequest{RequestID: "parallel-usage", Operation: "observe_host", Host: "fixture", HostUsage: &api.TeamHostUsage{Host: "fixture", LimiterDomain: "https://fixture.invalid", PolicyVersion: 1, ObservedAt: time.Now().UTC().Format(time.RFC3339Nano), RelayBindings: 1, Complete: true, SourceDigest: strings.Repeat("a", 64)}}); err != nil {
+	if _, err := f.c.TeamQueueAction(ctx, f.task.ID, api.TeamQueueRequest{RequestID: "parallel-usage", Operation: "observe_host", Host: "fixture", HostUsage: &api.TeamHostUsage{Host: "fixture", LimiterDomain: "https://fixture.invalid", PolicyVersion: 1, ObservedAt: time.Now().UTC().Format(time.RFC3339Nano), RelayBindings: 1, Complete: true, SourceDigest: strings.Repeat("a", 64), FreeDiskMiB: freeDiskMiB(1 << 20)}}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := f.c.TeamQueueAction(ctx, f.task.ID, api.TeamQueueRequest{RequestID: "parallel-limit", Operation: "set_limit", Host: "fixture", ConcurrencyLimit: 2}); err != nil {
+	if _, err := f.c.TeamQueueAction(ctx, f.task.ID, api.TeamQueueRequest{RequestID: "parallel-limit", Operation: "set_limit", Host: "fixture", ConcurrencyLimit: limit}); err != nil {
 		t.Fatal(err)
 	}
 	var entries []api.TeamQueueEntry
@@ -338,7 +350,7 @@ func TestTeamRunnerParallelSkipsConflictAndFinishesOtherSlot(t *testing.T) {
 	time.Sleep(2 * time.Second)
 	// A policy/domain mismatch must not stop an already-running item's
 	// owner-gated close and integration path.
-	runner.census = func(context.Context, *api.Client, string, string, string, int64, *api.TeamHostUsage) error {
+	runner.census = func(context.Context, *api.Client, string, string, api.TeamHostPolicy, *api.TeamHostUsage, []string) error {
 		t.Fatal("mismatched limiter domain reached census")
 		return nil
 	}
@@ -356,5 +368,207 @@ func TestTeamRunnerParallelSkipsConflictAndFinishesOtherSlot(t *testing.T) {
 	still, err := f.c.GetTeamQueueEntry(ctx, f.task.ID, a.ID)
 	if err != nil || still.EscalationSeq != failed.EscalationSeq || still.ReleasedAt != "" {
 		t.Fatalf("A reservation/escalation changed: %+v %v", still, err)
+	}
+}
+
+func freeDiskMiB(n int64) *int64 { return &n }
+
+// releaseCounter counts team queue release requests sent through a client.
+type releaseCounter struct {
+	next     http.RoundTripper
+	releases atomic.Int64
+	actions  atomic.Int64
+}
+
+func (r *releaseCounter) RoundTrip(req *http.Request) (*http.Response, error) {
+	if req.Method == "POST" && strings.HasSuffix(req.URL.Path, "/team-queue/actions") && req.Body != nil {
+		body, err := io.ReadAll(req.Body)
+		if err != nil {
+			return nil, err
+		}
+		req.Body = io.NopCloser(bytes.NewReader(body))
+		r.actions.Add(1)
+		if bytes.Contains(body, []byte(`"operation":"release"`)) {
+			r.releases.Add(1)
+		}
+	}
+	return r.next.RoundTrip(req)
+}
+
+func observeRunnerHost(t *testing.T, f teamFixture, host string, version int64) {
+	t.Helper()
+	ctx := context.Background()
+	if _, err := f.c.TeamQueueAction(ctx, f.task.ID, api.TeamQueueRequest{RequestID: fmt.Sprintf("policy-%s-%d", host, version), Operation: "set_host_policy", Host: host, HostPolicyVersion: version, HostPolicyExpires: time.Now().Add(time.Hour).Format(time.RFC3339), HostMaxSessions: 100, HostMaxPolling: 10, LimiterDomain: "https://fixture.invalid", HostMaxRelayBindings: 100, HostMaxRequestsPerMinute: 100000, HostMaxBurst: 10000, HostHeadroomPercent: 20}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.c.TeamQueueAction(ctx, f.task.ID, api.TeamQueueRequest{RequestID: fmt.Sprintf("usage-%s-%d", host, version), Operation: "observe_host", Host: host, HostUsage: &api.TeamHostUsage{Host: host, LimiterDomain: "https://fixture.invalid", PolicyVersion: version, ObservedAt: time.Now().UTC().Format(time.RFC3339Nano), RelayBindings: 1, Complete: true, SourceDigest: strings.Repeat("a", 64), FreeDiskMiB: freeDiskMiB(1 << 20)}}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// a8: in a parallel project the runner releases a failed entry once its
+// item-bound runs are closed and cleaned, and never while one is live; a
+// serial project still waits for the owner.
+func TestTeamRunnerReleasesFailedParallelEntry(t *testing.T) {
+	for _, limit := range []int{0, 1} {
+		t.Run(fmt.Sprintf("limit-%d", limit), func(t *testing.T) {
+			f := newTeamFixture(t, true)
+			ctx := context.Background()
+			observeRunnerHost(t, f, "fixture", 1)
+			if _, err := f.c.TeamQueueAction(ctx, f.task.ID, api.TeamQueueRequest{RequestID: "release-limit", Operation: "set_limit", Host: "fixture", ConcurrencyLimit: limit}); err != nil {
+				t.Fatal(err)
+			}
+			add := func(item api.WorkItem, order int64, owns string) api.TeamQueueEntry {
+				q, err := f.c.TeamQueueAction(ctx, f.task.ID, api.TeamQueueRequest{RequestID: "add-" + item.ID, Operation: "add", ItemID: item.ID, OrderMessageSeq: order, Host: "fixture", Cwd: t.TempDir(), Repository: "fixture-repo", BaseCommit: strings.Repeat("a", 40), Ownership: []string{owns}})
+				if err != nil {
+					t.Fatal(err)
+				}
+				return q
+			}
+			a := add(f.item, f.order, "src/a")
+			other, otherOrder := queueFixtureItem(t, f, "release-other")
+			c := add(other, otherOrder, "src/c")
+			detail, err := f.c.GetTask(ctx, f.task.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			a, err = f.c.TeamQueueAction(ctx, f.task.ID, api.TeamQueueRequest{RequestID: "claim-a", Operation: "claim", EntryID: a.ID, ExpectedRevision: a.Revision, Host: "fixture", PauseGeneration: detail.Task.PauseGeneration})
+			if err != nil {
+				t.Fatal(err)
+			}
+			member, err := f.c.AddAgent(ctx, f.task.ID, api.AddAgentRequest{AgentID: api.NewID("agt"), Name: "member-a", Host: "fixture", Session: "member-a", Runtime: "codex", WorkItem: &api.AgentWorkItemRequest{ItemTaskID: f.task.ID, ItemID: f.item.ID, ItemRevision: f.item.Revision, WorkOrderMessage: api.MessageReference{TaskID: f.task.ID, Seq: f.order}, ContextBundle: teamCloseCLIContext(t, f.item, api.Message{TaskID: f.task.ID, Seq: f.order, Text: "bounded fixture order"})}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			failed, err := f.c.TeamQueueAction(ctx, f.task.ID, api.TeamQueueRequest{RequestID: "fail-a", Operation: "fail", EntryID: a.ID, ExpectedRevision: a.Revision, Failure: "owner integrated abc1234"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			counter := &releaseCounter{next: http.DefaultTransport}
+			counted := *f.c
+			counted.HTTP = &http.Client{Timeout: 10 * time.Second, Transport: counter}
+			// The fixture policy's limiter domain differs from the test hub,
+			// so queued entries hold and only the failed entry can advance.
+			runner := teamRunner{
+				plan: func(context.Context, map[string]any, *teamLaunchResolved) error {
+					t.Fatal("runner launched a queued entry")
+					return nil
+				},
+				census: func(context.Context, *api.Client, string, string, api.TeamHostPolicy, *api.TeamHostUsage, []string) error {
+					t.Fatal("mismatched limiter domain reached census")
+					return nil
+				},
+			}
+			for i := 0; i < 2; i++ {
+				if err := runner.tick(ctx, f.e, &counted, "fixture"); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if counter.actions.Load() != 0 {
+				t.Fatalf("live failed entry cost %d queue writes", counter.actions.Load())
+			}
+			list, err := f.c.ListTeamQueue(ctx, f.task.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := list.Entries[0]; got.ReleasedAt != "" || got.Revision != failed.Revision {
+				t.Fatalf("live failed entry changed: %+v", got)
+			} else if limit == 0 && got.BlockReason != "Failed; 1 item-bound runs are still live or uncleaned" {
+				t.Fatalf("live-run reason %q", got.BlockReason)
+			}
+			if _, err := f.c.CloseAgent(ctx, f.task.ID, member.ID, member.RunID); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := f.c.ReportCleanup(ctx, f.task.ID, member.ID, api.CleanupRequest{RunID: member.RunID}); err != nil {
+				t.Fatal(err)
+			}
+			time.Sleep(2 * time.Second) // isolated test hub's write bucket refills
+			if err := runner.tick(ctx, f.e, &counted, "fixture"); err != nil {
+				t.Fatal(err)
+			}
+			released, err := f.c.GetTeamQueueEntry(ctx, f.task.ID, a.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if limit == 1 {
+				if released.ReleasedAt != "" || counter.releases.Load() != 0 {
+					t.Fatalf("serial failed entry was released automatically: %+v", released)
+				}
+				return
+			}
+			if released.ReleasedAt == "" || released.State != "failed" || released.Failure != failed.Failure || released.EscalationSeq != failed.EscalationSeq || counter.releases.Load() != 1 {
+				t.Fatalf("closed failed entry not released once: %+v releases=%d", released, counter.releases.Load())
+			}
+			observeRunnerHost(t, f, "fixture", 2)
+			detail, err = f.c.GetTask(ctx, f.task.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			claimed, err := f.c.TeamQueueAction(ctx, f.task.ID, api.TeamQueueRequest{RequestID: "claim-c", Operation: "claim", EntryID: c.ID, ExpectedRevision: c.Revision, Host: "fixture", PauseGeneration: detail.Task.PauseGeneration})
+			if err != nil || claimed.HandlerID != a.HandlerID || claimed.HandlerLeaseGeneration <= a.HandlerLeaseGeneration {
+				t.Fatalf("next claim did not take the freed handler: %+v %v", claimed, err)
+			}
+		})
+	}
+}
+
+// a3 (runner side): the census reports the least free space across the
+// host's queue worktrees and writes early when the reserve comparison flips.
+func TestHostCensusReportsLeastFreeDisk(t *testing.T) {
+	a, b := t.TempDir(), t.TempDir()
+	free := map[string]int64{a: 9000, b: 3000}
+	statfs := func(path string) (int64, error) {
+		if v, ok := free[path]; ok {
+			return v, nil
+		}
+		return 0, os.ErrNotExist
+	}
+	if got := hostFreeDiskMiB([]string{a, b, a, filepath.Join(a, "gone")}, statfs); got == nil || *got != 3000 {
+		t.Fatalf("least free disk %v", got)
+	}
+	wd, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	free[wd] = 7000
+	if got := hostFreeDiskMiB([]string{filepath.Join(a, "gone")}, statfs); got == nil || *got != 7000 {
+		t.Fatalf("fallback free disk %v", got)
+	}
+	delete(free, wd)
+	if got := hostFreeDiskMiB(nil, statfs); got != nil {
+		t.Fatalf("unobservable disk reported %d", *got)
+	}
+
+	f := newTeamFixture(t, true)
+	ctx := context.Background()
+	if _, err := f.c.TeamQueueAction(ctx, f.task.ID, api.TeamQueueRequest{RequestID: "census-policy", Operation: "set_host_policy", Host: "fixture", HostPolicyVersion: 1, HostPolicyExpires: time.Now().Add(time.Hour).Format(time.RFC3339), HostMaxSessions: 100, HostMaxPolling: 10, LimiterDomain: "https://fixture.invalid", HostMaxRelayBindings: 100, HostMaxRequestsPerMinute: 100000, HostMaxBurst: 10000, HostHeadroomPercent: 20, HostMinFreeDiskMiB: 1000}); err != nil {
+		t.Fatal(err)
+	}
+	previous := statfsFreeMiB
+	t.Cleanup(func() { statfsFreeMiB = previous })
+	census := func(value int64) *api.TeamHostUsage {
+		t.Helper()
+		statfsFreeMiB = func(string) (int64, error) { return value, nil }
+		list, err := f.c.TeamQueueByHost(ctx, "fixture")
+		if err != nil || list.HostPolicy == nil {
+			t.Fatalf("host list %+v %v", list, err)
+		}
+		if err := saveHostRelayCensus(ctx, f.c, f.task.ID, "fixture", *list.HostPolicy, list.HostUsage, []string{a, b}, time.Now()); err != nil {
+			t.Fatal(err)
+		}
+		list, err = f.c.TeamQueueByHost(ctx, "fixture")
+		if err != nil || list.HostUsage == nil {
+			t.Fatalf("host usage %+v %v", list, err)
+		}
+		return list.HostUsage
+	}
+	if got := census(5000); got.FreeDiskMiB == nil || *got.FreeDiskMiB != 5000 {
+		t.Fatalf("first census %+v", got)
+	}
+	if got := census(4000); got.FreeDiskMiB == nil || *got.FreeDiskMiB != 5000 {
+		t.Fatalf("unchanged reserve state rewrote the census: %+v", got)
+	}
+	if got := census(500); got.FreeDiskMiB == nil || *got.FreeDiskMiB != 500 {
+		t.Fatalf("reserve flip did not write the census: %+v", got)
 	}
 }

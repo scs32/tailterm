@@ -114,14 +114,15 @@ func (s *Store) CreateAllocationIntent(ctx context.Context, taskID string, req a
 	if err := s.db.QueryRowContext(ctx, `SELECT count(*) FROM item_team_leads WHERE task_id=? AND item_id=? AND agent_id=? AND run_id=? AND state IN ('launching','running')`, taskID, req.ItemID, req.AuthorAgentID, req.AuthorRunID).Scan(&scopedLead); err != nil {
 		return api.AllocationIntent{}, err
 	}
-	var scopedRows, limit int
+	var scopedRows int
 	if err := s.db.QueryRowContext(ctx, `SELECT count(*) FROM item_team_leads WHERE task_id=? AND item_id=?`, taskID, req.ItemID).Scan(&scopedRows); err != nil {
 		return api.AllocationIntent{}, err
 	}
-	if err := s.db.QueryRowContext(ctx, `SELECT COALESCE((SELECT concurrency_limit FROM team_queue_settings WHERE task_id=?),1)`, taskID).Scan(&limit); err != nil {
+	parallel, err := projectQueueParallel(ctx, s.db, taskID)
+	if err != nil {
 		return api.AllocationIntent{}, err
 	}
-	legacyLead := limit == 1 && scopedRows == 0 && t.Orchestrator != "" && strings.EqualFold(authorName, t.Orchestrator)
+	legacyLead := !parallel && scopedRows == 0 && t.Orchestrator != "" && strings.EqualFold(authorName, t.Orchestrator)
 	authorized := authorRole == api.AgentRoleDatabaseHandler || scopedLead == 1 || legacyLead
 	// Independent review #3003/#3010 additional gap: a retired author was
 	// previously accepted because only closed/exited status was checked.

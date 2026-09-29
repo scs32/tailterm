@@ -256,11 +256,11 @@ func resolveRole(ctx context.Context, tx *sql.Tx, task api.Task, role, itemID st
 			return a, nil
 		}
 	}
-	var parallel int
-	if err := tx.QueryRowContext(ctx, `SELECT COALESCE((SELECT concurrency_limit FROM team_queue_settings WHERE task_id=?),1)`, task.ID).Scan(&parallel); err != nil {
+	parallel, err := projectQueueParallel(ctx, tx, task.ID)
+	if err != nil {
 		return api.Agent{}, err
 	}
-	if parallel > 1 {
+	if parallel {
 		return api.Agent{}, fmt.Errorf("%w: role:%s needs an exact item link in parallel mode", api.ErrConflict, role)
 	}
 	switch role {

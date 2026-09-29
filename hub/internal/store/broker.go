@@ -207,13 +207,14 @@ func (s *Store) BrokerEscalate(ctx context.Context, o BrokerObligation, level in
 				return err
 			}
 		}
-		var scopedRows, limit int
+		var scopedRows int
 		if linkedItem != "" {
 			if err := tx.QueryRowContext(ctx, `SELECT count(*) FROM item_team_leads WHERE task_id=? AND item_id=?`, o.TaskID, linkedItem).Scan(&scopedRows); err != nil {
 				return err
 			}
 		}
-		if err := tx.QueryRowContext(ctx, `SELECT COALESCE((SELECT concurrency_limit FROM team_queue_settings WHERE task_id=?),1)`, o.TaskID).Scan(&limit); err != nil {
+		parallel, err := projectQueueParallel(ctx, tx, o.TaskID)
+		if err != nil {
 			return err
 		}
 		if level == 1 && linkedItem != "" && scopedRows != 0 {
@@ -223,7 +224,7 @@ func (s *Store) BrokerEscalate(ctx context.Context, o BrokerObligation, level in
 			} else if err != nil && !errors.Is(err, sql.ErrNoRows) {
 				return err
 			}
-		} else if level == 1 && task.Orchestrator != "" && (linkedItem == "" || limit == 1) {
+		} else if level == 1 && task.Orchestrator != "" && (linkedItem == "" || !parallel) {
 			l, err := scanAgent(tx.QueryRowContext(ctx, `SELECT `+agentCols+` FROM agents WHERE task_id=? AND name=? AND status<>? ORDER BY created_at DESC LIMIT 1`, o.TaskID, task.Orchestrator, api.AgentClosed))
 			if err == nil && l.ID != o.AgentID {
 				lead = l
@@ -253,7 +254,7 @@ func (s *Store) BrokerEscalate(ctx context.Context, o BrokerObligation, level in
 		if err := s.postBrokerNotice(ctx, tx, task, lead, who, subject, "Overdue obligation needs attention", text, refs); err != nil {
 			return err
 		}
-		_, err := tx.ExecContext(ctx, `UPDATE obligations SET escalation=?,escalated_at=? WHERE id=?`, level, ts(now), o.ID)
+		_, err = tx.ExecContext(ctx, `UPDATE obligations SET escalation=?,escalated_at=? WHERE id=?`, level, ts(now), o.ID)
 		return err
 	})
 }

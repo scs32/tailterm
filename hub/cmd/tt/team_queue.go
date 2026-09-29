@@ -10,7 +10,9 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -27,9 +29,57 @@ func validTeamQueueEntryID(id string) bool {
 	return err == nil
 }
 
+const teamQueueUsage = "usage: tt team queue add|list|policy|limit|scope|fail|accept|replace-lead|remove|reorder|release|abandon"
+
+// parseQueueLimit reads --limit: none (no fixed cap, stored as 0) or N >= 1.
+func parseQueueLimit(raw string) (int, bool) {
+	if raw == "none" {
+		return 0, true
+	}
+	n, err := strconv.Atoi(raw)
+	return n, err == nil && n >= 1
+}
+
+func queueLimitText(limit int) string {
+	if limit == 0 {
+		return "none"
+	}
+	return strconv.Itoa(limit)
+}
+
+// addQueueWorktree gives an entry its own detached worktree at the current
+// HEAD, under the repository root's .build/worktrees, named for the item.
+func addQueueWorktree(checkout, item string) (string, error) {
+	top, err := exec.Command("git", "-C", checkout, "rev-parse", "--show-toplevel").Output()
+	if err != nil {
+		return "", errors.New("--new-worktree must run from a Git worktree root")
+	}
+	realTop, err := filepath.EvalSymlinks(strings.TrimSpace(string(top)))
+	if err != nil {
+		return "", err
+	}
+	realCheckout, err := filepath.EvalSymlinks(checkout)
+	if err != nil || realCheckout != realTop {
+		return "", errors.New("--new-worktree must run from a Git worktree root")
+	}
+	common, err := exec.Command("git", "-C", checkout, "rev-parse", "--path-format=absolute", "--git-common-dir").Output()
+	if err != nil {
+		return "", err
+	}
+	root := filepath.Dir(strings.TrimSpace(string(common)))
+	path := filepath.Join(root, ".build", "worktrees", "queue-"+strings.TrimPrefix(item, "wi_")[:8])
+	if _, err := os.Lstat(path); err == nil || !errors.Is(err, os.ErrNotExist) {
+		return "", fmt.Errorf("queue worktree already exists: %s", path)
+	}
+	if output, err := exec.Command("git", "-C", checkout, "worktree", "add", "--detach", path, "HEAD").CombinedOutput(); err != nil {
+		return "", fmt.Errorf("git worktree add: %v: %s", err, strings.TrimSpace(string(output)))
+	}
+	return path, nil
+}
+
 func cmdTeamQueue(e env, args []string) error {
 	if len(args) == 0 {
-		return errors.New("usage: tt team queue add|list|policy|limit|accept|replace-lead|remove|reorder|release|abandon")
+		return errors.New(teamQueueUsage)
 	}
 	sub := args[0]
 	fs := flag.NewFlagSet("team queue "+sub, flag.ContinueOnError)
@@ -48,7 +98,11 @@ func cmdTeamQueue(e env, args []string) error {
 	cwd := fs.String("cwd", "", "absolute project folder for launch host")
 	var ownership ownershipFlags
 	fs.Var(&ownership, "owns", "repository-relative owned file or directory (repeatable)")
-	limit := fs.Int("limit", 0, "project concurrency limit (1 or 2)")
+	limit := fs.String("limit", "", "project concurrency limit: none (no fixed cap), 1 (serial) or N")
+	minFreeDisk := fs.Int64("min-free-disk-mib", 0, "free-disk reserve for new parallel teams in MiB (0: default 8192)")
+	newWorktree := fs.Bool("new-worktree", false, "add: create the entry's own detached worktree under .build/worktrees")
+	noNewWorktree := fs.Bool("no-new-worktree", false, "add: use the current checkout in a parallel project")
+	reason := fs.String("reason", "", "fail: why the owner is failing this entry")
 	policyVersion := fs.Int64("policy-version", 0, "owner host policy version")
 	policyExpires := fs.String("expires", "", "host policy expiry in RFC3339")
 	policySessions := fs.Int("sessions", 0, "host session budget")
@@ -84,7 +138,7 @@ func cmdTeamQueue(e env, args []string) error {
 			fmt.Println("(empty team queue)")
 			return nil
 		}
-		fmt.Printf("concurrency limit=%d\n", list.ConcurrencyLimit)
+		fmt.Printf("concurrency limit=%s\n", queueLimitText(list.ConcurrencyLimit))
 		for _, q := range list.Entries {
 			state := q.State
 			owns := strings.Join(q.Ownership, ",")
@@ -111,15 +165,17 @@ func cmdTeamQueue(e env, args []string) error {
 		}
 		return nil
 	}
-	if e.agent != "" && sub != "accept" {
+	if e.agent != "" && sub != "accept" && sub != "scope" {
 		return errors.New("owner-side team queue changes require an unbound CLI session")
 	}
 	req := api.TeamQueueRequest{RequestID: api.NewID("tqr"), Operation: sub}
+	createdWorktree := ""
 	switch sub {
 	case "policy":
-		if *policyVersion < 1 || *policyExpires == "" || *policySessions < 1 || *policyPolling < 1 || *policyBindings < 1 || *policyRate < 1 || *policyBurst < 1 || *policyHeadroom < 1 || *policyHeadroom >= 100 {
-			return errors.New("usage: tt team queue policy --policy-version N --expires RFC3339 --sessions N --polling N --bindings N --requests-per-minute N --burst N --headroom-percent N")
+		if *policyVersion < 1 || *policyExpires == "" || *policySessions < 1 || *policyPolling < 1 || *policyBindings < 1 || *policyRate < 1 || *policyBurst < 1 || *policyHeadroom < 1 || *policyHeadroom >= 100 || *minFreeDisk < 0 {
+			return errors.New("usage: tt team queue policy --policy-version N --expires RFC3339 --sessions N --polling N --bindings N --requests-per-minute N --burst N --headroom-percent N [--min-free-disk-mib N]")
 		}
+		req.HostMinFreeDiskMiB = *minFreeDisk
 		req.Operation, req.Host, req.HostPolicyVersion, req.HostPolicyExpires, req.HostMaxSessions, req.HostMaxPolling = "set_host_policy", spawn.Host(), *policyVersion, *policyExpires, *policySessions, *policyPolling
 		req.LimiterDomain, err = canonicalLimiterDomain(e.hub)
 		if err != nil {
@@ -127,24 +183,45 @@ func cmdTeamQueue(e env, args []string) error {
 		}
 		req.HostMaxRelayBindings, req.HostMaxRequestsPerMinute, req.HostMaxBurst, req.HostHeadroomPercent = *policyBindings, *policyRate, *policyBurst, *policyHeadroom
 	case "limit":
-		if *limit < 1 || *limit > 2 {
-			return errors.New("usage: tt team queue limit --limit 1|2")
+		value, ok := parseQueueLimit(*limit)
+		if !ok {
+			return errors.New("usage: tt team queue limit --limit none|N (none: no fixed cap; 1: serial)")
 		}
-		req.Operation, req.ConcurrencyLimit, req.Host = "set_limit", *limit, spawn.Host()
-		if *limit > 1 {
+		req.Operation, req.ConcurrencyLimit, req.Host = "set_limit", value, spawn.Host()
+		if queueParallel(value) {
 			list, listErr := c.TeamQueueByHost(ctx, req.Host)
 			if listErr != nil {
 				return listErr
 			}
 			if list.HostPolicy != nil {
-				if err := saveHostRelayCensus(ctx, c, *task, req.Host, list.HostPolicy.LimiterDomain, list.HostPolicy.Version, list.HostUsage, time.Now()); err != nil {
+				if err := saveHostRelayCensus(ctx, c, *task, req.Host, *list.HostPolicy, list.HostUsage, queueCwds(list.Entries), time.Now()); err != nil {
 					return err
 				}
 			}
 		}
 	case "add":
-		if !api.ValidID(*item, "wi") || *order < 1 || *template != "planned" {
-			return errors.New("usage: tt team queue add --item wi_ID --order SEQ [--template planned]")
+		if !api.ValidID(*item, "wi") || *order < 1 || *template != "planned" || (*newWorktree && (*noNewWorktree || *cwd != "")) {
+			return errors.New("usage: tt team queue add --item wi_ID --order SEQ [--template planned] [--owns PATH...] [--cwd DIR | --new-worktree | --no-new-worktree]")
+		}
+		if *cwd == "" && !*noNewWorktree && !*newWorktree {
+			// A parallel project gives each entry its own worktree by default.
+			list, listErr := c.ListTeamQueue(ctx, *task)
+			if listErr != nil {
+				return listErr
+			}
+			*newWorktree = queueParallel(list.ConcurrencyLimit)
+		}
+		if *newWorktree {
+			checkout, wdErr := os.Getwd()
+			if wdErr != nil {
+				return wdErr
+			}
+			*cwd, err = addQueueWorktree(checkout, *item)
+			if err != nil {
+				return err
+			}
+			createdWorktree = *cwd
+			fmt.Printf("worktree %s\n", *cwd)
 		}
 		if *cwd == "" {
 			*cwd, err = os.Getwd()
@@ -171,9 +248,9 @@ func cmdTeamQueue(e env, args []string) error {
 				return err
 			}
 		}
-	case "remove", "reorder", "release", "replace-lead", "accept":
+	case "remove", "reorder", "release", "replace-lead", "accept", "scope", "fail":
 		if !validTeamQueueEntryID(*entry) {
-			return errors.New("remove/reorder/release/replace-lead requires --entry tqe_ID")
+			return errors.New(sub + " requires --entry tqe_ID")
 		}
 		q, err := c.GetTeamQueueEntry(ctx, *task, *entry)
 		if err != nil {
@@ -228,66 +305,49 @@ func cmdTeamQueue(e env, args []string) error {
 			}
 			req.Operation, req.LeadAgentID, req.LeadRunID = "replace_lead", candidate.ID, candidate.RunID
 		}
+		if sub == "scope" {
+			if len(ownership) == 0 {
+				return errors.New("usage: tt team queue scope --entry tqe_ID --owns PATH [--owns PATH...]")
+			}
+			req.Ownership = ownership
+			if q.Repository != "" && q.Cwd != "" {
+				if _, statErr := os.Stat(q.Cwd); statErr == nil {
+					if _, scopeErr := queueRepositoryScope(q.Cwd, ownership); scopeErr != nil {
+						return scopeErr
+					}
+				}
+			}
+			if e.agent != "" {
+				// An agent names its exact run; the hub checks it is an
+				// available handler, the leased handler or the item lead.
+				if e.runID == "" {
+					return errors.New("scope from an agent session needs its exact run")
+				}
+				self, selfErr := c.GetAgent(ctx, *task, e.agent)
+				if selfErr != nil {
+					return selfErr
+				}
+				if self.Role == api.AgentRoleDatabaseHandler {
+					req.HandlerAgentID, req.HandlerRunID = e.agent, e.runID
+				} else {
+					req.LeadAgentID, req.LeadRunID = e.agent, e.runID
+				}
+			}
+		}
+		if sub == "fail" {
+			if strings.TrimSpace(*reason) == "" {
+				return errors.New("usage: tt team queue fail --entry tqe_ID --reason TEXT")
+			}
+			req.Failure = "Owner failed this entry: " + strings.TrimSpace(*reason)
+			req.RequestID = fmt.Sprintf("queue-owner-fail-%s-%d", q.ID, q.Revision)
+		}
 		if sub == "release" {
-			req.RequestID = "queue-release-" + q.ID
-			var journal teamLaunchJournal
-			if len(q.LaunchJSON) > 0 && json.Unmarshal(q.LaunchJSON, &journal) != nil {
-				return errors.New("failed queue launch journal is invalid")
+			var unlock func()
+			req, unlock, err = queueReleaseRequest(ctx, c, *hub, *task, q, false)
+			if err != nil {
+				return err
 			}
-			uncertain := false
-			for _, m := range journal.Members {
-				if m.State == "uncertain" {
-					uncertain = true
-				}
-			}
-			if uncertain {
-				if q.Host != spawn.Host() {
-					return errors.New("uncertain queue release must run on the saved launch host")
-				}
-				lock, lockErr := queueLaunchLock(*hub, *task, q.ID)
-				if lockErr != nil {
-					return lockErr
-				}
-				defer unlockQueueLaunch(lock)
-				fresh, fetchErr := c.GetTeamQueueEntry(ctx, *task, q.ID)
-				if fetchErr != nil {
-					return fetchErr
-				}
-				if fresh.Revision != q.Revision || fresh.State != q.State || !bytes.Equal(fresh.LaunchJSON, q.LaunchJSON) {
-					return errors.New("queue entry changed while acquiring the host launch lock")
-				}
-				sessions, sessionErr := localSessions(ctx)
-				if sessionErr != nil {
-					return sessionErr
-				}
-				proof := &api.TeamQueueReleaseProof{TaskID: *task, EntryID: q.ID, ItemID: q.ItemID, Host: q.Host}
-				digest := sha256.Sum256(q.LaunchJSON)
-				proof.LaunchDigest = hex.EncodeToString(digest[:])
-				for _, member := range journal.Members {
-					if member.State != "uncertain" {
-						continue
-					}
-					for _, session := range sessions {
-						if (session.Hub == *hub && session.Task == *task && session.Agent == member.Fields.AgentID) || session.Name == member.Fields.Name {
-							return fmt.Errorf("uncertain member %s still has an owned or name-conflicting session", member.Fields.AgentID)
-						}
-					}
-					_, agentErr := c.GetAgent(ctx, *task, member.Fields.AgentID)
-					if agentErr == nil {
-						continue
-					}
-					var response *api.HTTPError
-					if !errors.As(agentErr, &response) || response.Status != 404 {
-						return agentErr
-					}
-					proof.Members = append(proof.Members, api.TeamQueueReleaseMember{AgentID: member.Fields.AgentID, RunID: member.RunID, Name: member.Fields.Name})
-				}
-				if len(proof.Members) > 0 {
-					req.ReleaseProof = proof
-					req.SessionsChecked = true
-					req.Host = q.Host
-				}
-			}
+			defer unlock()
 		}
 	case "abandon":
 		if !api.ValidID(*item, "wi") || *order < 1 {
@@ -353,20 +413,102 @@ func cmdTeamQueue(e env, args []string) error {
 		req.ReservationToken = fmt.Sprintf("manual-%s-%s-%d", *task, *item, *order)
 		req.RequestID = fmt.Sprintf("manual-release-%s-%s-%d", *task, *item, *order)
 	default:
-		return errors.New("usage: tt team queue add|list|policy|limit|replace-lead|remove|reorder|release|abandon")
+		return errors.New(teamQueueUsage)
 	}
 	result, err := c.TeamQueueAction(ctx, *task, req)
 	if err != nil {
+		// A definite refusal leaves no entry naming the new worktree, so it
+		// is removed and the add can be retried. An uncertain result keeps it.
+		var response *api.HTTPError
+		if createdWorktree != "" && errors.As(err, &response) && response.Status >= 400 && response.Status < 500 {
+			_ = exec.Command("git", "-C", createdWorktree, "worktree", "remove", "--force", createdWorktree).Run()
+		}
 		return err
 	}
 	if *jsonOut {
 		printJSON(result)
 	} else {
 		if sub == "limit" {
-			fmt.Printf("concurrency limit=%d\n", result.Revision)
+			fmt.Printf("concurrency limit=%s\n", queueLimitText(int(result.Revision)))
 		} else {
 			fmt.Printf("%s %s %s at %d\n", sub, result.ID, result.ItemID, result.Position)
 		}
 	}
 	return nil
+}
+
+// queueReleaseRequest builds the release of a failed entry for the owner's
+// command and the runner. An uncertain spawn needs this host's launch lock,
+// an unchanged entry and proof that no session or registration exists for
+// it. When locked is false it takes the lock and returns its unlock, which
+// the caller holds until the release is sent.
+func queueReleaseRequest(ctx context.Context, c *api.Client, hub, task string, q api.TeamQueueEntry, locked bool) (api.TeamQueueRequest, func(), error) {
+	req := api.TeamQueueRequest{RequestID: "queue-release-" + q.ID, Operation: "release", EntryID: q.ID, ExpectedRevision: q.Revision}
+	unlock := func() {}
+	var journal teamLaunchJournal
+	if len(q.LaunchJSON) > 0 && json.Unmarshal(q.LaunchJSON, &journal) != nil {
+		return req, unlock, errors.New("failed queue launch journal is invalid")
+	}
+	uncertain := false
+	for _, m := range journal.Members {
+		if m.State == "uncertain" {
+			uncertain = true
+		}
+	}
+	if !uncertain {
+		return req, unlock, nil
+	}
+	if q.Host != spawn.Host() {
+		return req, unlock, errors.New("uncertain queue release must run on the saved launch host")
+	}
+	if !locked {
+		lock, lockErr := queueLaunchLock(hub, task, q.ID)
+		if lockErr != nil {
+			return req, unlock, lockErr
+		}
+		unlock = func() { unlockQueueLaunch(lock) }
+	}
+	fail := func(err error) (api.TeamQueueRequest, func(), error) {
+		unlock()
+		return req, func() {}, err
+	}
+	fresh, fetchErr := c.GetTeamQueueEntry(ctx, task, q.ID)
+	if fetchErr != nil {
+		return fail(fetchErr)
+	}
+	if fresh.Revision != q.Revision || fresh.State != q.State || !bytes.Equal(fresh.LaunchJSON, q.LaunchJSON) {
+		return fail(errors.New("queue entry changed while acquiring the host launch lock"))
+	}
+	sessions, sessionErr := localSessions(ctx)
+	if sessionErr != nil {
+		return fail(sessionErr)
+	}
+	proof := &api.TeamQueueReleaseProof{TaskID: task, EntryID: q.ID, ItemID: q.ItemID, Host: q.Host}
+	digest := sha256.Sum256(q.LaunchJSON)
+	proof.LaunchDigest = hex.EncodeToString(digest[:])
+	for _, member := range journal.Members {
+		if member.State != "uncertain" {
+			continue
+		}
+		for _, session := range sessions {
+			if (session.Hub == hub && session.Task == task && session.Agent == member.Fields.AgentID) || session.Name == member.Fields.Name {
+				return fail(fmt.Errorf("uncertain member %s still has an owned or name-conflicting session", member.Fields.AgentID))
+			}
+		}
+		_, agentErr := c.GetAgent(ctx, task, member.Fields.AgentID)
+		if agentErr == nil {
+			continue
+		}
+		var response *api.HTTPError
+		if !errors.As(agentErr, &response) || response.Status != 404 {
+			return fail(agentErr)
+		}
+		proof.Members = append(proof.Members, api.TeamQueueReleaseMember{AgentID: member.Fields.AgentID, RunID: member.RunID, Name: member.Fields.Name})
+	}
+	if len(proof.Members) > 0 {
+		req.ReleaseProof = proof
+		req.SessionsChecked = true
+		req.Host = q.Host
+	}
+	return req, unlock, nil
 }

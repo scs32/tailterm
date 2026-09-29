@@ -19,7 +19,7 @@ func validLimiterDomain(raw string) bool {
 
 func readTeamHostPolicy(ctx context.Context, q queryRower, host string) (*api.TeamHostPolicy, error) {
 	var p api.TeamHostPolicy
-	err := q.QueryRowContext(ctx, `SELECT host,limiter_domain,version,expires_at,max_sessions,max_polling,max_relay_bindings,max_requests_per_minute,max_burst,headroom_percent FROM team_host_policies WHERE host=?`, host).Scan(&p.Host, &p.LimiterDomain, &p.Version, &p.ExpiresAt, &p.MaxSessions, &p.MaxPolling, &p.MaxRelayBindings, &p.MaxRequestsPerMinute, &p.MaxBurst, &p.HeadroomPercent)
+	err := q.QueryRowContext(ctx, `SELECT host,limiter_domain,version,expires_at,max_sessions,max_polling,max_relay_bindings,max_requests_per_minute,max_burst,headroom_percent,min_free_disk_mib FROM team_host_policies WHERE host=?`, host).Scan(&p.Host, &p.LimiterDomain, &p.Version, &p.ExpiresAt, &p.MaxSessions, &p.MaxPolling, &p.MaxRelayBindings, &p.MaxRequestsPerMinute, &p.MaxBurst, &p.HeadroomPercent, &p.MinFreeDiskMiB)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
@@ -28,11 +28,43 @@ func readTeamHostPolicy(ctx context.Context, q queryRower, host string) (*api.Te
 
 func readTeamHostUsage(ctx context.Context, q queryRower, host string) (*api.TeamHostUsage, error) {
 	var u api.TeamHostUsage
-	err := q.QueryRowContext(ctx, `SELECT host,limiter_domain,policy_version,observed_at,relay_bindings,complete,source_digest FROM team_host_usage WHERE host=?`, host).Scan(&u.Host, &u.LimiterDomain, &u.PolicyVersion, &u.ObservedAt, &u.RelayBindings, &u.Complete, &u.SourceDigest)
+	var free sql.NullInt64
+	err := q.QueryRowContext(ctx, `SELECT host,limiter_domain,policy_version,observed_at,relay_bindings,complete,source_digest,free_disk_mib FROM team_host_usage WHERE host=?`, host).Scan(&u.Host, &u.LimiterDomain, &u.PolicyVersion, &u.ObservedAt, &u.RelayBindings, &u.Complete, &u.SourceDigest, &free)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
+	if free.Valid {
+		u.FreeDiskMiB = &free.Int64
+	}
 	return &u, err
+}
+
+func sameFreeDisk(a, b *int64) bool {
+	return (a == nil) == (b == nil) && (a == nil || *a == *b)
+}
+
+// checkTeamHostAdmission gates a new parallel team: host capacity for one
+// more reservation and the free-disk reserve. A launch already admitted
+// checks capacity alone, so low disk never strands a half-started team.
+func checkTeamHostAdmission(ctx context.Context, tx *sql.Tx, host string, now time.Time) error {
+	if err := checkTeamHostCapacity(ctx, tx, host, now, 1); err != nil {
+		return err
+	}
+	policy, err := readTeamHostPolicy(ctx, tx, host)
+	if err != nil {
+		return err
+	}
+	usage, err := readTeamHostUsage(ctx, tx, host)
+	if err != nil {
+		return err
+	}
+	if usage.FreeDiskMiB == nil {
+		return fmt.Errorf("%w: host free disk is not observed", api.ErrConflict)
+	}
+	if reserve := policy.DiskReserveMiB(); *usage.FreeDiskMiB < reserve {
+		return fmt.Errorf("%w: host free disk %d MiB is below the %d MiB reserve", api.ErrConflict, *usage.FreeDiskMiB, reserve)
+	}
+	return nil
 }
 
 // Capacity is owner supplied and expires. Conservative reservations include

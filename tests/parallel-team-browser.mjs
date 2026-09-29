@@ -59,6 +59,10 @@ try {
       await page.locator('[data-testid="team-delivery-entry"]').first().waitFor();
       assert.equal(await page.locator('[data-testid="team-delivery-entry"]').count(), 5);
       assert.match(await page.locator('[data-testid="team-delivery-panel"]').innerText(), /Limit 2/);
+      await page.evaluate(() => { fixture.queue.concurrencyLimit = 0; fixture.rerender(); });
+      assert.match(await page.locator('[data-testid="team-delivery-panel"] header').innerText(), /No fixed limit/);
+      assert.doesNotMatch(await page.locator('[data-testid="team-delivery-panel"] header').innerText(), /Limit 0/);
+      await page.evaluate(() => { fixture.queue.concurrencyLimit = 2; fixture.rerender(); });
       assert.match(await page.locator('[data-testid="team-delivery-entry"]').nth(1).innerText(), /Waiting for tqe_aaaaaaaaaaaaaaaa/);
       assert.match(await page.locator('[data-testid="team-delivery-entry"]').nth(0).innerText(), /Lead Lead A · Handler Handler A/);
       assert.doesNotMatch(await page.locator('[data-testid="team-delivery-entry"]').nth(0).innerText(), /waiting for team cleanup/);

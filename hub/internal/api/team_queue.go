@@ -79,6 +79,21 @@ type TeamHostPolicy struct {
 	MaxRequestsPerMinute int    `json:"maxRequestsPerMinute"`
 	MaxBurst             int    `json:"maxBurst"`
 	HeadroomPercent      int    `json:"headroomPercent"`
+	// MinFreeDiskMiB is the free-disk reserve for new parallel admission;
+	// 0 means the built-in default.
+	MinFreeDiskMiB int64 `json:"minFreeDiskMiB,omitempty"`
+}
+
+// DefaultMinFreeDiskMiB is the free-disk reserve when a host policy leaves it
+// unset. Each team adds builds and browser runs to the launch host.
+const DefaultMinFreeDiskMiB = 8192
+
+// DiskReserveMiB is the free-disk reserve that gates new parallel admission.
+func (p TeamHostPolicy) DiskReserveMiB() int64 {
+	if p.MinFreeDiskMiB > 0 {
+		return p.MinFreeDiskMiB
+	}
+	return DefaultMinFreeDiskMiB
 }
 
 type TeamHostUsage struct {
@@ -89,6 +104,9 @@ type TeamHostUsage struct {
 	RelayBindings int    `json:"relayBindings"`
 	Complete      bool   `json:"complete"`
 	SourceDigest  string `json:"sourceDigest"`
+	// FreeDiskMiB is the least free space across the host's queue worktrees;
+	// nil means the runner did not observe it.
+	FreeDiskMiB *int64 `json:"freeDiskMiB,omitempty"`
 }
 
 type TeamQueueRequest struct {
@@ -113,6 +131,7 @@ type TeamQueueRequest struct {
 	HostMaxRequestsPerMinute int                        `json:"hostMaxRequestsPerMinute,omitempty"`
 	HostMaxBurst             int                        `json:"hostMaxBurst,omitempty"`
 	HostHeadroomPercent      int                        `json:"hostHeadroomPercent,omitempty"`
+	HostMinFreeDiskMiB       int64                      `json:"hostMinFreeDiskMiB,omitempty"`
 	LimiterDomain            string                     `json:"limiterDomain,omitempty"`
 	HostUsage                *TeamHostUsage             `json:"hostUsage,omitempty"`
 	BaseCommit               string                     `json:"baseCommit,omitempty"`

@@ -817,3 +817,17 @@ func TestHandlerRotationRunnerNoSpecCurrentTemplateIsNotDue(t *testing.T) {
 		t.Fatalf("legacy run without a spec: %v", reasons)
 	}
 }
+
+// The queue handler briefing tells the handler to scope an unscoped queued
+// entry in a parallel project. The briefing is part of the handler template
+// digest, so this release rotates handlers where prompt-change rotation is on.
+func TestQueueHandlerBriefingScopesUnscopedEntries(t *testing.T) {
+	if !strings.Contains(queueHandlerAcceptanceBriefing(), "tt team queue scope --task TASK --entry ENTRY --owns PATH") {
+		t.Fatal("queue handler briefing lacks the scoping instruction")
+	}
+	const before = "1a50d74558964f3f03cb5a67d76fb11abee6700d677e482f5f3d22fb2394b025" // 66fd525
+	const current = "4556752233b1d6c05364c7b689d2485781534d3411a2493738e467619a70d0bf"
+	if got := handlerTemplateDigest("handler assignment"); got != current || got == before {
+		t.Fatalf("handler template digest %s, want %s", got, current)
+	}
+}

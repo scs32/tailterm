@@ -33,11 +33,12 @@ func ensureLeadItemLinks(ctx context.Context, tx *sql.Tx, task, agent, run strin
 		return err
 	}
 	if item == "" {
-		var limit, bound int
-		if err := tx.QueryRowContext(ctx, `SELECT COALESCE((SELECT concurrency_limit FROM team_queue_settings WHERE task_id=?),1)`, task).Scan(&limit); err != nil {
+		var bound int
+		parallel, err := projectQueueParallel(ctx, tx, task)
+		if err != nil {
 			return err
 		}
-		if limit > 1 {
+		if parallel {
 			if err := tx.QueryRowContext(ctx, `SELECT count(*) FROM agent_work_item_bindings WHERE agent_id=? AND run_id=? AND item_task_id=?`, agent, run, task).Scan(&bound); err != nil {
 				return err
 			}
