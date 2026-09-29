@@ -205,13 +205,37 @@ func TestTeamQueueCLINewWorktreeDefault(t *testing.T) {
 	repo, head := queueGitRepo(t)
 	parallelCLIProject(t, f, "none")
 	t.Chdir(repo)
+	want := filepath.Join(repo, ".build", "worktrees", "queue-"+strings.TrimPrefix(f.item.ID, "wi_")[:8])
+	// Bad ownership, a hub refusal and an unreachable hub all leave no
+	// worktree behind, so the add can be retried.
+	offline := f.e
+	offline.hub = "http://127.0.0.1:1"
+	for _, attempt := range []struct {
+		name string
+		e    env
+		args []string
+	}{
+		{"traversal refused before creation", f.e, []string{"--owns", "../escape"}},
+		{"hub refuses the ownership", f.e, []string{"--owns", "client:x"}},
+		{"hub unreachable", offline, []string{"--owns", "client", "--new-worktree"}},
+	} {
+		args := append([]string{"add", "--item", f.item.ID, "--order", fmt.Sprint(f.order)}, attempt.args...)
+		if _, err := captureCLIOutput(t, func() error { return cmdTeamQueue(attempt.e, args) }); err == nil {
+			t.Fatalf("%s: add succeeded", attempt.name)
+		}
+		if _, err := os.Lstat(want); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("%s: left worktree %s: %v", attempt.name, want, err)
+		}
+		if list, err := exec.Command("git", "-C", repo, "worktree", "list", "--porcelain").Output(); err != nil || strings.Contains(string(list), want) {
+			t.Fatalf("%s: git still lists the worktree: %s %v", attempt.name, list, err)
+		}
+	}
 	out, err := captureCLIOutput(t, func() error {
 		return cmdTeamQueue(f.e, []string{"add", "--item", f.item.ID, "--order", fmt.Sprint(f.order), "--owns", "client"})
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := filepath.Join(repo, ".build", "worktrees", "queue-"+strings.TrimPrefix(f.item.ID, "wi_")[:8])
 	if !strings.Contains(out, "worktree "+want) {
 		t.Fatalf("add output %q", out)
 	}
@@ -232,7 +256,7 @@ func TestTeamQueueCLINewWorktreeDefault(t *testing.T) {
 	}
 	if _, err := captureCLIOutput(t, func() error {
 		return cmdTeamQueue(f.e, []string{"add", "--item", f.item.ID, "--order", fmt.Sprint(f.order), "--owns", "client"})
-	}); err == nil || !strings.Contains(err.Error(), "queue worktree already exists") {
+	}); err == nil || !strings.Contains(err.Error(), "queue worktree already exists") || !strings.Contains(err.Error(), "--cwd "+want) {
 		t.Fatalf("second add for the same path: %v", err)
 	}
 

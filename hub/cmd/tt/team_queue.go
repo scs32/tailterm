@@ -69,7 +69,7 @@ func addQueueWorktree(checkout, item string) (string, error) {
 	root := filepath.Dir(strings.TrimSpace(string(common)))
 	path := filepath.Join(root, ".build", "worktrees", "queue-"+strings.TrimPrefix(item, "wi_")[:8])
 	if _, err := os.Lstat(path); err == nil || !errors.Is(err, os.ErrNotExist) {
-		return "", fmt.Errorf("queue worktree already exists: %s", path)
+		return "", fmt.Errorf("queue worktree already exists: %s; queue from it with --cwd %s", path, path)
 	}
 	if output, err := exec.Command("git", "-C", checkout, "worktree", "add", "--detach", path, "HEAD").CombinedOutput(); err != nil {
 		return "", fmt.Errorf("git worktree add: %v: %s", err, strings.TrimSpace(string(output)))
@@ -216,11 +216,23 @@ func cmdTeamQueue(e env, args []string) error {
 			if wdErr != nil {
 				return wdErr
 			}
+			// Refuse bad ownership before any worktree exists; the new
+			// worktree is the same repository at the checkout's HEAD.
+			if _, scopeErr := queueRepositoryScope(checkout, ownership); scopeErr != nil {
+				return scopeErr
+			}
 			*cwd, err = addQueueWorktree(checkout, *item)
 			if err != nil {
 				return err
 			}
 			createdWorktree = *cwd
+			// Until the hub confirms the entry, any failure removes the new
+			// worktree so a retry can create it again.
+			defer func() {
+				if createdWorktree != "" {
+					_ = exec.Command("git", "-C", checkout, "worktree", "remove", "--force", createdWorktree).Run()
+				}
+			}()
 			fmt.Printf("worktree %s\n", *cwd)
 		}
 		if *cwd == "" {
@@ -417,14 +429,9 @@ func cmdTeamQueue(e env, args []string) error {
 	}
 	result, err := c.TeamQueueAction(ctx, *task, req)
 	if err != nil {
-		// A definite refusal leaves no entry naming the new worktree, so it
-		// is removed and the add can be retried. An uncertain result keeps it.
-		var response *api.HTTPError
-		if createdWorktree != "" && errors.As(err, &response) && response.Status >= 400 && response.Status < 500 {
-			_ = exec.Command("git", "-C", createdWorktree, "worktree", "remove", "--force", createdWorktree).Run()
-		}
 		return err
 	}
+	createdWorktree = "" // The saved entry now names it.
 	if *jsonOut {
 		printJSON(result)
 	} else {

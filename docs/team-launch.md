@@ -111,8 +111,9 @@ Use one canonical worktree per parallel item. In a parallel project, `add`
 without `--cwd` creates one: from the invoking Git worktree root it runs
 `git worktree add --detach <repository root>/.build/worktrees/queue-<first 8
 hex of the item ID> HEAD` and queues that folder, so the repository, base and
-ownership checks apply unchanged. It refuses an existing path, and removes the
-new worktree if the hub definitely refuses the entry. `--new-worktree` does the
+ownership checks apply unchanged. It checks ownership first, refuses an existing path
+(queue from it with `--cwd` instead), and removes the new worktree on any
+failure before the hub saves the entry, so the add can be retried. `--new-worktree` does the
 same in a serial project; `--no-new-worktree` keeps the current checkout.
 `--owns` accepts repository relative files and directories; an ancestor directory overlaps its descendants,
 while sibling directories do not. Missing ownership conflicts with every item.
