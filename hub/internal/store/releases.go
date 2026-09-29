@@ -93,7 +93,7 @@ func releaseCandidate(ctx context.Context, tx *sql.Tx, task, entry string) (api.
 	if err = verificationEligible(*plan, *receipt); err != nil {
 		return e, p, r, err
 	}
-	if err = validateVerificationKnownFailures(ctx, tx, *plan); err != nil {
+	if _, err = validateVerificationKnownFailures(ctx, tx, *plan, item, receipt); err != nil {
 		return e, p, r, err
 	}
 	if err = reviewCompletion(ctx, tx, item, plan.Commit); err != nil {
@@ -211,10 +211,16 @@ func (s *Store) ReleaseAction(ctx context.Context, task string, req api.ReleaseR
 					return zero, releaseConflict("integrated matrix omitted approved check")
 				}
 			}
-			if err = validateVerificationKnownFailures(ctx, tx, p); err != nil {
+			if err = verificationEligible(p, *req.Verification); err != nil {
 				return zero, err
 			}
-			if err = verificationEligible(p, *req.Verification); err != nil {
+			// The plan's own item fields are not bound here, so the closing
+			// item is the job's, not whatever the submitted plan names.
+			var self api.WorkItem
+			if self, err = getWorkItem(tx, ctx, j.TaskID, j.ItemID); err != nil {
+				return zero, err
+			}
+			if _, err = validateVerificationKnownFailures(ctx, tx, p, self, req.Verification); err != nil {
 				return zero, err
 			}
 			j.IntegratedCommit = req.IntegratedCommit

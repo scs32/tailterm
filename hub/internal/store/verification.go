@@ -151,7 +151,8 @@ func validateVerificationPlan(ctx context.Context, tx *sql.Tx, item api.WorkItem
 		}
 		seen[c.ID] = true
 	}
-	return validateVerificationKnownFailures(ctx, tx, p)
+	_, err = validateVerificationKnownFailures(ctx, tx, p, item, nil)
+	return err
 }
 func validateVerificationReceipt(p api.VerificationPlan, r api.VerificationReceipt) error {
 	if !filepath.IsAbs(r.Worktree) || r.Version != 1 || r.OperationKey != p.OperationKey || r.PlanDigest != verificationDigest(p) || r.Commit != p.Commit || r.BaseCommit != p.BaseCommit || r.Repository != p.Repository || r.MatrixDigest != p.MatrixDigest || r.ChecksDigest != p.ChecksDigest || r.VerifierAgentID != p.VerifierAgentID || r.VerifierRunID != p.VerifierRunID || !r.Detached || !r.CleanBefore || !r.CleanAfter || r.AIV.State != "unsubmitted" || len(r.Checks) != len(p.Checks) || len(r.Environment) == 0 {
@@ -231,29 +232,66 @@ func validateVerificationAttempt(a api.VerificationAttempt) error {
 	}
 	return nil
 }
-func validateVerificationKnownFailures(ctx context.Context, q queryRower, p api.VerificationPlan) error {
+
+// validateVerificationKnownFailures requires every known failure to name an
+// open bug. The one exception is the closing item's own entries: self, the item
+// whose completion is being checked, may be done when its current receipt r
+// shows each of them passing with nowPassing. Those entries are returned as
+// resolved. self's status comes from self rather than the database, so a done
+// save can check the status it is about to write. Callers bind r to p and its
+// exact commit before calling; a nil r resolves nothing.
+func validateVerificationKnownFailures(ctx context.Context, q queryRower, p api.VerificationPlan, self api.WorkItem, r *api.VerificationReceipt) ([]api.VerificationKnownFailure, error) {
 	if p.MaxAttempts == 0 && len(p.KnownFailures) == 0 {
-		return nil
+		return nil, nil
 	}
 	if p.MaxAttempts != 3 {
-		return verificationConflict("approved maximum must be three attempts")
+		return nil, verificationConflict("approved maximum must be three attempts")
 	}
 	ids := map[string]bool{}
 	for _, c := range p.Checks {
 		ids[c.ID] = true
 	}
 	seen := map[string]bool{}
+	var resolved []api.VerificationKnownFailure
 	for _, e := range p.KnownFailures {
 		if !ids[e.CheckID] || seen[e.CheckID] || !api.ValidID(e.BugTaskID, "tsk") || !api.ValidID(e.BugID, "wi") {
-			return verificationConflict("invalid or duplicate known failure")
+			return nil, verificationConflict("invalid or duplicate known failure")
 		}
 		seen[e.CheckID] = true
 		var kind, status string
-		if err := q.QueryRowContext(ctx, `SELECT kind,status FROM work_items WHERE task_id=? AND id=?`, e.BugTaskID, e.BugID).Scan(&kind, &status); err != nil || kind != "bug" || (status != "open" && status != "in_progress" && status != "blocked") {
-			return verificationConflict("known failure requires linked open bug")
+		if err := q.QueryRowContext(ctx, `SELECT kind,status FROM work_items WHERE task_id=? AND id=?`, e.BugTaskID, e.BugID).Scan(&kind, &status); err != nil || kind != "bug" {
+			return nil, verificationConflict("known failure requires linked open bug")
+		}
+		isSelf := e.BugTaskID == self.TaskID && e.BugID == self.ID
+		if isSelf {
+			status = self.Status
+		}
+		if status == "open" || status == "in_progress" || status == "blocked" {
+			continue
+		}
+		if !isSelf {
+			return nil, verificationConflict("known failure requires linked open bug")
+		}
+		if status != "done" || !knownFailurePassing(r, e.CheckID) {
+			return nil, verificationConflict("known failure for closing bug is not passing in its current receipt")
+		}
+		resolved = append(resolved, e)
+	}
+	return resolved, nil
+}
+
+// knownFailurePassing reports whether receipt r shows check id passing on its
+// first attempt as a known failure that now passes. A flaky pass does not count.
+func knownFailurePassing(r *api.VerificationReceipt, id string) bool {
+	if r == nil {
+		return false
+	}
+	for _, c := range r.Checks {
+		if c.ID == id {
+			return c.Status == "pass" && c.NowPassing && c.KnownFailure && c.ExitCode == 0
 		}
 	}
-	return nil
+	return false
 }
 func verificationEligible(p api.VerificationPlan, r api.VerificationReceipt) error {
 	if err := validateVerificationReceipt(p, r); err != nil {
@@ -375,42 +413,78 @@ func (s *Store) SaveVerification(ctx context.Context, task, itemID string, req a
 	}
 	return record, nil
 }
+
+// verificationCompletion is the item's exact-candidate verification state for
+// completion. It is nil when verification is not required. Resolved lists the
+// item's own known failures that its current receipt shows now passing.
+type verificationCompletion struct {
+	Plan              api.VerificationPlan
+	Receipt           api.VerificationReceipt
+	ReceiptGeneration int64
+	Resolved          []api.VerificationKnownFailure
+}
+
 func verificationReady(ctx context.Context, tx *sql.Tx, item api.WorkItem, candidate string) error {
+	_, err := checkVerificationCompletion(ctx, tx, item, candidate)
+	return err
+}
+func checkVerificationCompletion(ctx context.Context, tx *sql.Tx, item api.WorkItem, candidate string) (*verificationCompletion, error) {
 	required, err := verificationRequired(ctx, tx, item.TaskID, item.ID)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	state, err := reviewState(ctx, tx, item.TaskID, item.ID)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if sc := scopeFor(&state, item.ScopeRevision); sc != nil && len(sc.VerificationCriteria) > 0 {
 		required = true
 	}
 	if !required {
-		return nil
+		return nil, nil
 	}
 	records, err := verificationRecords(ctx, tx, item.TaskID, item.ID)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	p, r := currentVerification(records)
 	if p == nil || r == nil || p.ScopeRevision != item.ScopeRevision || candidate == "" || p.Commit != candidate {
-		return verificationConflict("passing receipt for current scope and exact accepted candidate required")
+		return nil, verificationConflict("passing receipt for current scope and exact accepted candidate required")
 	}
 	sc := scopeFor(&state, item.ScopeRevision)
 	if sc == nil || sc.AssignmentSeq != p.AssignmentSeq {
-		return verificationConflict("assignment changed")
+		return nil, verificationConflict("assignment changed")
 	}
 	for _, round := range state.Rounds {
 		if round.ReviewerID == r.VerifierAgentID {
-			return verificationConflict("reviewer cannot verify")
+			return nil, verificationConflict("reviewer cannot verify")
 		}
 	}
-	if err := validateVerificationKnownFailures(ctx, tx, *p); err != nil {
-		return err
+	// The receipt is bound to the plan and candidate before any known
+	// failure can be resolved by it.
+	if err = verificationEligible(*p, *r); err != nil {
+		return nil, err
 	}
-	return verificationEligible(*p, *r)
+	resolved, err := validateVerificationKnownFailures(ctx, tx, *p, item, r)
+	if err != nil {
+		return nil, err
+	}
+	return &verificationCompletion{Plan: *p, Receipt: *r, ReceiptGeneration: currentReceiptGeneration(records), Resolved: resolved}, nil
+}
+
+// currentReceiptGeneration is the generation of the receipt currentVerification
+// returns, or 0 when the current plan has none.
+func currentReceiptGeneration(records []api.VerificationRecord) int64 {
+	var generation int64
+	for _, v := range records {
+		if v.Plan != nil {
+			generation = 0
+		}
+		if v.Receipt != nil {
+			generation = v.Generation
+		}
+	}
+	return generation
 }
 
 const verificationEnrollmentSchema = `CREATE TABLE IF NOT EXISTS verification_enrollments (
@@ -513,8 +587,14 @@ func (s *Store) loadTeamVerification(ctx context.Context, e *api.TeamQueueEntry)
 			independent = false
 		}
 	}
-	if independent && verificationEligible(*p, *r) == nil && validateVerificationKnownFailures(ctx, s.db, *p) == nil {
-		summary.State = "passing"
+	if independent && verificationEligible(*p, *r) == nil {
+		item, err := getWorkItem(s.db, ctx, e.TaskID, e.ItemID)
+		if err != nil {
+			return err
+		}
+		if _, err = validateVerificationKnownFailures(ctx, s.db, *p, item, r); err == nil {
+			summary.State = "passing"
+		}
 	}
 	for _, c := range r.Checks {
 		status := c.Status

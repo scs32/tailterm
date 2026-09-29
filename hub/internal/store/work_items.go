@@ -337,6 +337,7 @@ func (s *Store) UpdateWorkItem(ctx context.Context, taskID, itemID string, req a
 	}
 	if req.Status != nil && *req.Status == "done" {
 		gateItem := item
+		gateItem.Status = "done" // known failures are checked against the status being saved
 		if req.Title != nil || req.Description != nil {
 			gateItem.ScopeRevision++
 		}
@@ -558,6 +559,7 @@ func (s *Store) CreateWorkItemUpdate(ctx context.Context, taskID, itemID string,
 	var queueEntry *api.TeamQueueEntry
 	if req.Status != nil && *req.Status == "done" {
 		gateItem := item
+		gateItem.Status = "done" // known failures are checked against the status being saved
 		if req.Title != nil || req.Description != nil {
 			gateItem.ScopeRevision++
 		}

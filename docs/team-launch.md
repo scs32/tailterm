@@ -116,7 +116,9 @@ repository for an enrolled item, accepted review candidate, saved item
 revision and completion report) in the save's own transaction, and enqueues the
 release job for an exact-SHA verification receipt. Any refusal leaves the item
 open and the entry unaccepted. The evidence defaults to the saved completion
-receipt. While an entry waits, the hub refuses a handler done save without the
+receipt. When the receipt lets a bug close with known failures that name it now
+passing, the acceptance records them as `resolvedKnownFailures`; the hub
+derives that field and refuses a client-supplied one. While an entry waits, the hub refuses a handler done save without the
 tuple, so acceptance is no longer a separate step. A retried save with the same
 request key replays its receipt without a second acceptance or release job.
 

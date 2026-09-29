@@ -1355,10 +1355,17 @@ func acceptTeamQueueEntry(ctx context.Context, tx *sql.Tx, task string, e *api.T
 	if err = reviewCompletion(ctx, tx, item, candidate.Commit); err != nil {
 		return err
 	}
-	if item.Status != "done" || candidate.ItemRevision != item.Revision || !reflect.DeepEqual(candidate.CompletionReport, item.CompletionReport) || candidate.Repository != e.Repository || candidate.BaseCommit != base || !filepath.IsAbs(candidate.Worktree) || filepath.Clean(candidate.Worktree) != candidate.Worktree || strings.ContainsRune(candidate.Worktree, '\x00') || !validGitCommit(candidate.Commit) || candidate.Branch == "" || len(candidate.Branch) > 200 || strings.ContainsAny(candidate.Branch, "\x00\n\r") || strings.TrimSpace(candidate.Evidence) == "" || candidate.AcceptedAt != "" {
+	completion, err := checkVerificationCompletion(ctx, tx, item, candidate.Commit)
+	if err != nil {
+		return err
+	}
+	if candidate.ResolvedKnownFailures != nil || item.Status != "done" || candidate.ItemRevision != item.Revision || !reflect.DeepEqual(candidate.CompletionReport, item.CompletionReport) || candidate.Repository != e.Repository || candidate.BaseCommit != base || !filepath.IsAbs(candidate.Worktree) || filepath.Clean(candidate.Worktree) != candidate.Worktree || strings.ContainsRune(candidate.Worktree, '\x00') || !validGitCommit(candidate.Commit) || candidate.Branch == "" || len(candidate.Branch) > 200 || strings.ContainsAny(candidate.Branch, "\x00\n\r") || strings.TrimSpace(candidate.Evidence) == "" || candidate.AcceptedAt != "" {
 		return api.ErrInvalid
 	}
 	candidate.AcceptedAt = now
+	if completion != nil && len(completion.Resolved) > 0 {
+		candidate.ResolvedKnownFailures = &api.ResolvedKnownFailures{ReceiptGeneration: completion.ReceiptGeneration, ReceiptDigest: verificationDigest(completion.Receipt), MatrixDigest: completion.Plan.MatrixDigest, Entries: completion.Resolved}
+	}
 	e.Acceptance = &candidate
 	e.BaseCommit = base
 	return nil
