@@ -88,6 +88,9 @@ type activityCursor struct {
 	RejectedState     string                         `json:"rejectedState,omitempty"`
 	RejectedWakeKey   string                         `json:"rejectedWakeKey,omitempty"`
 	Ineligible        bool                           `json:"ineligible,omitempty"`
+	// StuckUnsupported records that this hub rejected the stuck state; later
+	// stuck observations are reported as unknown with a "stuck:" reason.
+	StuckUnsupported bool `json:"stuckUnsupported,omitempty"`
 	// ClaudeQueued counts input Claude Code queued while busy (queue-operation
 	// enqueue) that no dequeue or remove has taken yet. ClaudeQueuedAt is the
 	// latest enqueue. A real user prompt resets both, which bounds drift from
@@ -102,6 +105,9 @@ type activityThresholds struct {
 	Loop       time.Duration
 	LoopCalls  int
 	CrashProbe time.Duration
+	// WakeStuck is how long a Claude wake may stay unconfirmed, with unread
+	// input, before the agent is reported stuck.
+	WakeStuck time.Duration
 }
 
 func activityDefaults() activityThresholds {
@@ -116,7 +122,7 @@ func activityDefaults() activityThresholds {
 	if err != nil || calls < 2 || calls > 100 {
 		calls = 5
 	}
-	return activityThresholds{seconds("TAILTERM_ACTIVITY_WORKING_SECONDS", 120), seconds("TAILTERM_ACTIVITY_HUNG_SECONDS", 600), seconds("TAILTERM_ACTIVITY_LOOP_SECONDS", 300), calls, seconds("TAILTERM_ACTIVITY_CRASH_PROBE_SECONDS", 15)}
+	return activityThresholds{seconds("TAILTERM_ACTIVITY_WORKING_SECONDS", 120), seconds("TAILTERM_ACTIVITY_HUNG_SECONDS", 600), seconds("TAILTERM_ACTIVITY_LOOP_SECONDS", 300), calls, seconds("TAILTERM_ACTIVITY_CRASH_PROBE_SECONDS", 15), seconds("TAILTERM_ACTIVITY_WAKE_STUCK_SECONDS", 180)}
 }
 
 func activityTranscript(b runtimeBinding) (string, error) {

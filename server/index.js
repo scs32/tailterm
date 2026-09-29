@@ -465,7 +465,7 @@ wss.on("connection", (ws, req) => {
         if (!s) throw new Error("Unknown SSH server");
         connectedProfile = { ...s };
         const command = m.tmux
-          ? tmuxCommand(m.session, s.tmuxPath, m.resumeOnly === true)
+          ? tmuxCommand(m.session, s.tmuxPath, m.resumeOnly === true, undefined, "", { ignoreSize: m.ignoreSize === true })
           : null;
         const auth = interactiveSSHConfig(
           { ...s },

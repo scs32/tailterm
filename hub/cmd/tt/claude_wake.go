@@ -26,8 +26,12 @@ import (
 
 // A wake is uncertain from the moment its intent is durable. A crash between
 // that write and terminal input cannot safely be distinguished from a crash
-// after input, so no later relay pass types another prompt until the exact new
-// user record proves delivery. The file is private host state, scoped to a run.
+// after input, so a later relay pass never retypes while its own text may still
+// be in the prompt: it retries only after a backoff, with Enter alone on its
+// own idle text or one retype into a proven-empty input (claudeWakeRetry). The
+// file is private host state, scoped to a run. Phases: uncertain, confirmed,
+// exhausted (retries used up; cooling down) and abandoned (the transcript moved
+// on without it).
 type claudeWakeIntent struct {
 	Run         string    `json:"run"`
 	Thread      string    `json:"thread"`
@@ -44,6 +48,14 @@ type claudeWakeIntent struct {
 	TextAt      time.Time `json:"textAt,omitempty"`
 	EnterAt     time.Time `json:"enterAt,omitempty"`
 	ConfirmedAt time.Time `json:"confirmedAt,omitempty"`
+	// Retry state. FirstAt is the first attempt of this unconfirmed wake and
+	// survives retry cycles; CycleAt starts the current bounded cycle.
+	Attempts    int       `json:"attempts,omitempty"`
+	FirstAt     time.Time `json:"firstAt,omitempty"`
+	CycleAt     time.Time `json:"cycleAt,omitempty"`
+	RetryAt     time.Time `json:"retryAt,omitempty"`
+	ExhaustedAt time.Time `json:"exhaustedAt,omitempty"`
+	LastRetry   string    `json:"lastRetry,omitempty"`
 }
 
 type claudeWakeSnapshot struct {
@@ -681,43 +693,76 @@ func claudeUserText(line []byte) string {
 	return text.String()
 }
 
-func claudeWakeConfirmed(intent claudeWakeIntent) (bool, error) {
+// claudeWakeScan reads the transcript after an intent's offset. found reports
+// the intent's exact prompt as a complete new user turn; other reports a
+// complete new user turn with different text (someone else submitted input).
+func claudeWakeScan(intent claudeWakeIntent) (found, other bool, err error) {
 	f, err := os.Open(intent.Path)
 	if err != nil {
-		return false, err
+		return false, false, err
 	}
 	defer f.Close()
 	info, err := f.Stat()
 	if err != nil || fileIdentity(info) != intent.FileID || info.Size() < intent.Offset {
-		return false, errors.New("Claude transcript identity changed")
+		return false, false, errors.New("Claude transcript identity changed")
 	}
 	if info.Size()-intent.Offset > 4<<20 {
-		return false, errors.New("Claude confirmation scan budget exceeded")
+		return false, false, errors.New("Claude confirmation scan budget exceeded")
 	}
 	if _, err := f.Seek(intent.Offset, io.SeekStart); err != nil {
-		return false, err
+		return false, false, err
 	}
 	reader := bufio.NewReader(io.LimitReader(f, 4<<20))
 	for {
 		line, err := reader.ReadBytes('\n')
 		if err == io.EOF {
-			return false, nil // a partial tail cannot confirm a submitted turn
+			return false, other, nil // a partial tail cannot confirm a submitted turn
 		}
 		if err != nil {
-			return false, err
+			return false, other, err
 		}
 		if len(line) > maxActivityLine {
-			return false, errors.New("Claude confirmation record too large")
+			return false, other, errors.New("Claude confirmation record too large")
 		}
-		if claudeUserText(line) == intent.Prompt {
-			return true, nil
+		switch text := claudeUserText(line); {
+		case text == intent.Prompt:
+			return true, other, nil
+		case text != "":
+			other = true
 		}
 	}
+}
+
+func claudeWakeConfirmed(intent claudeWakeIntent) (bool, error) {
+	found, _, err := claudeWakeScan(intent)
+	return found, err
 }
 
 func sameClaudeSnapshot(a, b claudeWakeSnapshot) bool {
 	return a.Pane == b.Pane && a.SessionID == b.SessionID && a.Created == b.Created && a.PanePID == b.PanePID &&
 		a.Path == b.Path && a.FileID == b.FileID && a.Offset == b.Offset
+}
+
+// An unconfirmed wake is retried a bounded number of times: Enter alone when
+// Claude is idle and its own text still sits in the prompt, or one retype of
+// the current prompt when the input is empty and the transcript lacks the
+// prompt. Retries wait claudeWakeBackoff[n] after the previous attempt. After
+// the last retry the intent is exhausted; a new retry cycle may start after
+// claudeWakeCooldown, so the relay is bounded but never silent forever.
+var claudeWakeBackoff = []time.Duration{15 * time.Second, 30 * time.Second, 60 * time.Second, 120 * time.Second}
+
+const (
+	claudeWakeMaxRetries = 4
+	claudeWakeCooldown   = 15 * time.Minute
+)
+
+// claudeWakeIdle reports a snapshot that may safely receive input.
+func claudeWakeIdle(s claudeWakeSnapshot, now time.Time) bool {
+	return s.Cursor.TurnComplete && s.Cursor.Ready && !s.Cursor.Unknown && len(s.Cursor.Pending) == 0 && !claudeQueueFresh(s.Cursor, now)
+}
+
+func claudeWakeSaveReason(intent *claudeWakeIntent, reason string) {
+	intent.LastRetry = claudeClip(strings.Join(strings.Fields(reason), " "), 200)
 }
 
 func claudeWakeWith(ctx context.Context, b runtimeBinding, prompt string, ops claudeWakeOps) error {
@@ -733,16 +778,13 @@ func claudeWakeWith(ctx context.Context, b runtimeBinding, prompt string, ops cl
 		if previous.Run != b.Run || previous.Thread != b.Thread || previous.Session != b.Session {
 			return errors.New("Claude wake guard identity mismatch; did not confirm")
 		}
-		if previous.Phase != "confirmed" {
-			if confirmed, _ := claudeWakeConfirmed(previous); !confirmed {
-				return errors.New("prior Claude wake did not confirm; no resend")
-			}
-			previous.Phase = "confirmed"
-			if err := writePrivateJSON(path, previous); err != nil {
+		if previous.Phase != "confirmed" && previous.Phase != "abandoned" {
+			done, err := claudeWakeRetry(ctx, b, prompt, ops, path, &previous)
+			if done || err != nil {
 				return err
 			}
 		}
-		if previous.PromptSHA == claudeWakeHash(prompt) {
+		if previous.Phase == "confirmed" && previous.PromptSHA == claudeWakeHash(prompt) {
 			return nil
 		}
 	} else if !errors.Is(err, os.ErrNotExist) {
@@ -752,9 +794,135 @@ func claudeWakeWith(ctx context.Context, b runtimeBinding, prompt string, ops cl
 	if err != nil {
 		return fmt.Errorf("%w: %v", errClaudeWakeUnsafe, err)
 	}
-	if !emptyClaudeInput(first.Screen) || !first.Cursor.TurnComplete || !first.Cursor.Ready || first.Cursor.Unknown || len(first.Cursor.Pending) != 0 || claudeQueueFresh(first.Cursor, ops.now()) {
+	if !emptyClaudeInput(first.Screen) || !claudeWakeIdle(first, ops.now()) {
 		return errClaudeWakeUnsafe
 	}
+	now := ops.now().UTC()
+	intent := claudeWakeIntent{Run: b.Run, Thread: b.Thread, Session: b.Session, Phase: "uncertain", At: now, FirstAt: now, CycleAt: now}
+	return claudeWakeType(ctx, b, prompt, ops, path, &intent, first)
+}
+
+// claudeWakeRetry handles a saved intent that has not confirmed. It returns
+// done=true when this call is finished (confirmed now, waiting, exhausted,
+// unsafe or retried). done=false with a nil error lets the caller start a
+// fresh wake: the intent confirmed, or was abandoned because the transcript
+// moved on without it.
+func claudeWakeRetry(ctx context.Context, b runtimeBinding, prompt string, ops claudeWakeOps, path string, previous *claudeWakeIntent) (bool, error) {
+	now := ops.now().UTC()
+	if previous.FirstAt.IsZero() {
+		previous.FirstAt = previous.At // an intent saved before retries existed
+	}
+	if previous.CycleAt.IsZero() {
+		previous.CycleAt = previous.FirstAt
+	}
+	found, other, scanErr := claudeWakeScan(*previous)
+	switch {
+	case found:
+		previous.Phase = "confirmed"
+		previous.ConfirmedAt = now
+		return false, writePrivateJSON(path, previous)
+	case scanErr != nil || other:
+		// The transcript was replaced, or someone else's turn was submitted
+		// after the wake text; this intent can no longer confirm.
+		reason := "a different user turn was submitted"
+		if scanErr != nil {
+			reason = scanErr.Error()
+		}
+		previous.Phase = "abandoned"
+		claudeWakeSaveReason(previous, "abandoned: "+reason)
+		return false, writePrivateJSON(path, previous)
+	}
+	if previous.Phase == "exhausted" {
+		if now.Before(previous.ExhaustedAt.Add(claudeWakeCooldown)) {
+			return true, fmt.Errorf("Claude wake did not confirm after %d retries; needs attention until %s", claudeWakeMaxRetries, previous.ExhaustedAt.Add(claudeWakeCooldown).Format(time.RFC3339))
+		}
+		// Cool-down over: a new bounded retry cycle, keeping FirstAt for the
+		// stuck age.
+		previous.Phase, previous.Attempts, previous.CycleAt, previous.RetryAt = "uncertain", 0, now, now
+		claudeWakeSaveReason(previous, "new retry cycle after cool-down")
+		if err := writePrivateJSON(path, previous); err != nil {
+			return true, err
+		}
+	}
+	if previous.Attempts >= claudeWakeMaxRetries {
+		previous.Phase, previous.ExhaustedAt = "exhausted", now
+		claudeWakeSaveReason(previous, fmt.Sprintf("exhausted after %d retries: %s", previous.Attempts, previous.LastRetry))
+		if err := writePrivateJSON(path, previous); err != nil {
+			return true, err
+		}
+		fmt.Fprintf(os.Stderr, "[tt relay] %s %s Claude wake did not confirm after %d retries; exhausted, next cycle after %s\n", now.Format(time.RFC3339), b.Agent, previous.Attempts, claudeWakeCooldown)
+		return true, fmt.Errorf("Claude wake did not confirm after %d retries; needs attention", claudeWakeMaxRetries)
+	}
+	retryAt := previous.RetryAt
+	if retryAt.IsZero() {
+		retryAt = previous.At.Add(claudeWakeBackoff[0])
+	}
+	if now.Before(retryAt) {
+		return true, fmt.Errorf("prior Claude wake unconfirmed; retry %d/%d after %s; did not confirm", previous.Attempts+1, claudeWakeMaxRetries, retryAt.Format(time.RFC3339))
+	}
+	// Enter alone when Claude is idle and its own text is still in the prompt.
+	own, ownErr := ops.inspect(ctx, b, previous.Prompt)
+	if ownErr == nil && own.Pane == previous.Pane && own.Path == previous.Path && own.FileID == previous.FileID && exactClaudeInput(own.Screen, previous.Prompt) && claudeWakeIdle(own, ops.now()) {
+		if found, other, err := claudeWakeScan(*previous); found || other || err != nil {
+			return true, errors.New("Claude transcript changed before retry; did not confirm")
+		}
+		previous.Attempts++
+		claudeWakeSaveReason(previous, fmt.Sprintf("retry %d/%d: Enter on own unsubmitted text", previous.Attempts, claudeWakeMaxRetries))
+		previous.RetryAt = now.Add(claudeWakeBackoffAfter(previous.Attempts))
+		if err := writePrivateJSON(path, previous); err != nil {
+			return true, err
+		}
+		fmt.Fprintf(os.Stderr, "[tt relay] %s %s Claude wake %s\n", now.Format(time.RFC3339), b.Agent, previous.LastRetry)
+		if err := ops.send(ctx, own.Pane, "", false); err != nil {
+			return true, fmt.Errorf("Claude retry Enter failed; did not confirm: %w", err)
+		}
+		previous.EnterAt = ops.now().UTC()
+		if err := writePrivateJSON(path, previous); err != nil {
+			return true, fmt.Errorf("Claude Enter receipt save failed; did not confirm: %w", err)
+		}
+		return true, claudeWakeAwait(ctx, ops, path, previous)
+	}
+	// One retype of the current prompt when the input is empty, Claude is idle
+	// and the transcript still lacks the earlier prompt.
+	empty, emptyErr := ops.inspect(ctx, b, "")
+	if emptyErr == nil && empty.Pane == previous.Pane && emptyClaudeInput(empty.Screen) && claudeWakeIdle(empty, ops.now()) {
+		if found, other, err := claudeWakeScan(*previous); found || other || err != nil {
+			return true, errors.New("Claude transcript changed before retry; did not confirm")
+		}
+		retry := *previous
+		retry.Attempts++
+		claudeWakeSaveReason(&retry, fmt.Sprintf("retry %d/%d: retyped after lost text", retry.Attempts, claudeWakeMaxRetries))
+		fmt.Fprintf(os.Stderr, "[tt relay] %s %s Claude wake %s\n", now.Format(time.RFC3339), b.Agent, retry.LastRetry)
+		return true, claudeWakeType(ctx, b, prompt, ops, path, &retry, empty)
+	}
+	reason := "pane not safe for retry"
+	if ownErr != nil && emptyErr != nil {
+		reason += ": " + emptyErr.Error()
+	} else if emptyErr == nil && !emptyClaudeInput(empty.Screen) {
+		reason += ": input holds other text"
+	} else if (emptyErr == nil && empty.Pane != previous.Pane) || (ownErr == nil && own.Pane != previous.Pane) {
+		reason += ": pane changed"
+	}
+	claudeWakeSaveReason(previous, reason)
+	if err := writePrivateJSON(path, previous); err != nil {
+		return true, err
+	}
+	return true, fmt.Errorf("%w: prior wake unconfirmed; %s", errClaudeWakeUnsafe, reason)
+}
+
+// claudeWakeBackoffAfter is the wait after the nth attempt (0 = the first
+// wake).
+func claudeWakeBackoffAfter(attempts int) time.Duration {
+	if attempts >= len(claudeWakeBackoff) {
+		return claudeWakeBackoff[len(claudeWakeBackoff)-1]
+	}
+	return claudeWakeBackoff[attempts]
+}
+
+// claudeWakeType types prompt into an empty, idle input, verifies it, presses
+// Enter and waits for the transcript to confirm. The intent carries its retry
+// state; it becomes uncertain before any input.
+func claudeWakeType(ctx context.Context, b runtimeBinding, prompt string, ops claudeWakeOps, path string, intent *claudeWakeIntent, first claudeWakeSnapshot) error {
 	second, err := ops.inspect(ctx, b, "")
 	if err != nil {
 		return fmt.Errorf("%w: Claude input recheck: %v", errClaudeWakeUnsafe, err)
@@ -766,7 +934,12 @@ func claudeWakeWith(ctx context.Context, b runtimeBinding, prompt string, ops cl
 	if err != nil {
 		return fmt.Errorf("Claude wake nonce unavailable: %w", err)
 	}
-	intent := claudeWakeIntent{Run: b.Run, Thread: b.Thread, Session: b.Session, PromptSHA: claudeWakeHash(prompt), Nonce: nonce, Prompt: prompt, Path: first.Path, FileID: first.FileID, Offset: first.Offset, Pane: first.Pane, Phase: "uncertain", At: ops.now().UTC()}
+	now := ops.now().UTC()
+	intent.PromptSHA, intent.Nonce, intent.Prompt = claudeWakeHash(prompt), nonce, prompt
+	intent.Path, intent.FileID, intent.Offset, intent.Pane = first.Path, first.FileID, first.Offset, first.Pane
+	intent.Phase, intent.At = "uncertain", now
+	intent.TextAt, intent.EnterAt, intent.ConfirmedAt = time.Time{}, time.Time{}, time.Time{}
+	intent.RetryAt = now.Add(claudeWakeBackoffAfter(intent.Attempts))
 	if err := writePrivateJSON(path, intent); err != nil {
 		return err
 	}
@@ -792,9 +965,14 @@ func claudeWakeWith(ctx context.Context, b runtimeBinding, prompt string, ops cl
 	if err := writePrivateJSON(path, intent); err != nil {
 		return fmt.Errorf("Claude Enter receipt save failed; did not confirm: %w", err)
 	}
+	return claudeWakeAwait(ctx, ops, path, intent)
+}
+
+// claudeWakeAwait waits up to five seconds for the new user turn.
+func claudeWakeAwait(ctx context.Context, ops claudeWakeOps, path string, intent *claudeWakeIntent) error {
 	deadline := ops.now().Add(5 * time.Second)
 	for {
-		if confirmed, err := claudeWakeConfirmed(intent); confirmed {
+		if confirmed, err := claudeWakeConfirmed(*intent); confirmed {
 			intent.Phase = "confirmed"
 			intent.ConfirmedAt = ops.now().UTC()
 			if err := writePrivateJSON(path, intent); err != nil {
@@ -805,6 +983,11 @@ func claudeWakeWith(ctx context.Context, b runtimeBinding, prompt string, ops cl
 			return fmt.Errorf("Claude confirmation unavailable; did not confirm: %w", err)
 		}
 		if !ops.now().Before(deadline) || ctx.Err() != nil {
+			// The backoff runs from the end of this attempt.
+			intent.RetryAt = ops.now().UTC().Add(claudeWakeBackoffAfter(intent.Attempts))
+			if err := writePrivateJSON(path, intent); err != nil {
+				return fmt.Errorf("Claude retry schedule save failed; did not confirm: %w", err)
+			}
 			return errors.New("Claude new user turn did not confirm within five seconds")
 		}
 		ops.sleep(50 * time.Millisecond)

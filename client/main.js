@@ -154,6 +154,10 @@ let data = { servers: [], keys: [], sessions: [] },
   persistQueue = Promise.resolve();
 const remoteSnapshots = new Map();
 const pendingConnections = new Set();
+// Agent windows are fixed at this size (hub spawn); a hidden tile opens its
+// PTY here instead of an unmeasured size.
+const HIDDEN_TILE_COLS = 200,
+  HIDDEN_TILE_ROWS = 50;
 const remoteRequests = new Map();
 let connectionNumber = 0;
 let tabStrip;
@@ -1694,9 +1698,11 @@ function appearanceDialog() {
       }),
   );
 }
-function tmuxCommand(name, path, resumeOnly = false, cwd = "") {
+function tmuxCommand(name, path, resumeOnly = false, cwd = "", options = {}) {
   return (
-    "exec " + remoteTmuxCommand(name, path, resumeOnly, undefined, cwd) + "\r"
+    "exec " +
+    remoteTmuxCommand(name, path, resumeOnly, undefined, cwd, options) +
+    "\r"
   );
 }
 async function connect(
@@ -1747,6 +1753,9 @@ async function connect(
     }
     const el = document.createElement("div");
     el.className = "terminal-instance";
+    // A quiet tab stays hidden until its pane group shows it, so an unplaced
+    // tile is never measured into a tiny terminal.
+    if (options.quiet) el.hidden = true;
     $("#terminal-body").append(el);
     const sessionFontSize =
       normalizeSessionFontSize(options.replace?.fontSize ?? options.fontSize) ??
@@ -1809,7 +1818,10 @@ async function connect(
       enabled: () => appearance.gpuRendering,
     });
     if (!options.quiet) activate(t.id);
-    fit.fit();
+    // A hidden tile has no real size. Open its PTY at the agent default and
+    // send the real tile size the first time it is shown.
+    if (el.hidden) term.resize(HIDDEN_TILE_COLS, HIDDEN_TILE_ROWS);
+    else fit.fit();
     term.onTitleChange((title) => {
       t.title = title.slice(0, 200);
       if (active === t.id) renderContext();
@@ -1878,7 +1890,7 @@ async function connect(
     });
     term.onResize(({ rows, cols }) => {
       t.activitySnapshot = activitySnapshot(term, tmux);
-      t.resize?.(rows, cols);
+      if (!t.el.hidden) t.resize?.(rows, cols);
       if (active === t.id) $("#dimensions").textContent = `${cols} × ${rows}`;
     });
     setupTerminalInput(t, {
@@ -1945,6 +1957,8 @@ async function connect(
                 t.server.tmuxPath,
                 t.wasConnected || options.resumeOnly,
                 t.target,
+                "",
+                { ignoreSize: !!t.task },
               )
             : "",
           onData: (d) => {
@@ -2035,6 +2049,7 @@ async function connect(
                     server.tmuxPath,
                     options.resumeOnly,
                     options.cwd || "",
+                    { ignoreSize: !!t.task },
                   ),
                 ),
               );
@@ -2057,6 +2072,7 @@ async function connect(
                     server.tmuxPath,
                     options.resumeOnly,
                     options.cwd || "",
+                    { ignoreSize: !!t.task },
                   ),
                 ),
               );
@@ -2112,6 +2128,7 @@ function openStandardSSH(t, ready, error, update) {
       tmux,
       session,
       resumeOnly: t.resumeOnly,
+      ignoreSize: !!t.task,
       rows: term.rows,
       cols: term.cols,
     });

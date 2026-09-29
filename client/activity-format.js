@@ -1,7 +1,7 @@
 const labels = {
   working: "Working", hung_tool: "Hung tool", finished_silent: "Finished silently",
   crashed: "Crashed", looping: "Looping", idle: "Idle", unknown: "Unknown",
-  runtime_prompt: "Runtime prompt",
+  runtime_prompt: "Runtime prompt", stuck: "Stuck",
 };
 
 // Runtime prompt kinds and policy actions (docs/runtime-prompts.md).
@@ -41,5 +41,6 @@ export function activityDetail(activity, now = Date.now()) {
     ? ` · Claude wake ${activity.wake.status}${activity.wake.messageSeqs?.length ? ` #${activity.wake.messageSeqs.join(", #")}` : ""}${activity.wake.reason ? `: ${activity.wake.reason}` : ""}`
     : "";
   const prompt = activity.prompt ? ` · ${runtimePromptDetail(activity.prompt)}` : "";
-  return `${activityLabel(activity)}${prompt}${tool}${wake}${evidence} · ${tokenSnapshot(activity.tokens)}`;
+  const reason = activity.state === "stuck" && activity.reason ? `: ${activity.reason}` : "";
+  return `${activityLabel(activity)}${reason}${prompt}${tool}${wake}${evidence} · ${tokenSnapshot(activity.tokens)}`;
 }

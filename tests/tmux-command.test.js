@@ -111,6 +111,52 @@ test("new-session honours an absolute start directory", () => {
   assert.throws(() => tmuxCommand("work", "", false, undefined, "relative"));
 });
 
+test("agent tiles attach with ignore-size on tmux 3.2+ only; other attaches never do", () => {
+  const dir = mkdtempSync(path.join(tmpdir(), "tailterm-ignore-size-"));
+  try {
+    // The fake reports $FAKE_TMUX_VERSION, lists one session and prints the
+    // attach arguments one per line.
+    writeFileSync(
+      path.join(dir, "tmux"),
+      '#!/bin/sh\ncase "$1" in -V) printf \'tmux %s\\n\' "$FAKE_TMUX_VERSION"; exit 0 ;; list-sessions) printf \'work|$4\\n\'; exit 0 ;; esac\nprintf \'%s\\n\' "$@"\n',
+      { mode: 0o700 },
+    );
+    const run = (cmd, version) =>
+      spawnSync("/bin/sh", ["-c", cmd], {
+        encoding: "utf8",
+        env: { ...process.env, PATH: dir, FAKE_TMUX_VERSION: version },
+      });
+    const agent = tmuxCommand("work", "", true, undefined, "", {
+      ignoreSize: true,
+    });
+    const modern = run(agent, "3.7b");
+    assert.equal(modern.status, 0, modern.stderr);
+    assert.match(
+      modern.stdout,
+      /^-u\n-T\nclipboard\nattach-session\n-f\nignore-size\n-t\n\$4\n;/,
+    );
+    for (const old of ["3.1c", "2.9"]) {
+      const legacy = run(agent, old);
+      assert.equal(legacy.status, 0, legacy.stderr);
+      assert.match(legacy.stdout, /attach-session\n-t\n\$4\n;/);
+      assert.doesNotMatch(legacy.stdout, /ignore-size/);
+    }
+    // A human attach, a new session and an unflagged resume never ignore size.
+    for (const cmd of [
+      tmuxCommand("work", "", true),
+      tmuxCommand("work", "", false, undefined, "", { ignoreSize: true }),
+      tmuxCommand("work"),
+    ]) {
+      assert.doesNotMatch(cmd, /ignore-size/);
+      const result = run(cmd, "3.7b");
+      assert.equal(result.status, 0, result.stderr);
+      assert.doesNotMatch(result.stdout, /ignore-size/);
+    }
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("agent launch forwards an explicit model as one argument and omits defaults", async () => {
   const { agentSpawnCommand } = await import("../shared/tmux-command.js");
   const dir = mkdtempSync(path.join(tmpdir(), "tailterm-model-"));

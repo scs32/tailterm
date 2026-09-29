@@ -27,7 +27,7 @@ CREATE TABLE IF NOT EXISTS agent_activity_receipts (
 
 func validActivity(a api.AgentActivity) bool {
 	switch a.State {
-	case "working", "hung_tool", "finished_silent", "crashed", "looping", "idle", "unknown", "runtime_prompt":
+	case "working", "hung_tool", "finished_silent", "crashed", "looping", "idle", "unknown", "runtime_prompt", "stuck":
 	default:
 		return false
 	}
