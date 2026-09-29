@@ -47,6 +47,7 @@ SHA-256 is of the unredacted receipt.
 | `6692a57` | Runner integration (merge of `6195085`) | Verifier temporary homes are cleaned up; test binaries prepared for profile-sync | Mini `tt`, TailOS (`6692a57` build) |
 | `1e8e8df` | Claude wake prompt area (`wi_7757e967b69a5ba6`, merge of `2a0bc33`) | Claude agents wake on needs_input, with prompt-suggestion text present, and dialog detection reads only the active prompt area | Mini `tt` |
 | `66b55ed` | Automatic queue acceptance (`wi_b4ec031a206d1326`, merge of `6f4a660`) | The handler's done save also records the team queue acceptance, so a finished entry no longer waits for a separate step | Hub `20260928-queue-acceptance-66b55ed`, Mini `tt` |
+| `0973558` | Flaky browser suites (`wi_a9a69169f732121d`, merge of `a577d78`) | Queue refresh races, Board focus loss and a hidden Board reload fixed; board-compose, board-decisions and project-queue pass reliably | TailOS `9749cde5` |
 
 ## Hub releases
 
@@ -73,7 +74,7 @@ Before `6235924`, the combined migration was rehearsed on a copy of the `33d3ab7
 hub migrated it (integrity ok, no FK violations, 14 projects, queue at limit 1), and the
 `33d3ab7` hub opened the migrated copy. The `34944cf`, `8b1f4d4`, `8e32dc0` and `acfe2d0` migrations were rehearsed
 the same way on a copy of the previous release's backup, including the old hub opening the
-migrated copy. `172becd` fast-forwarded `tasks-hub` and shipped on its independent receipt without an owner-side rerun, per the deployment agent's rule. `6692a57`, `1e8e8df` and `66b55ed` were merges, so each shipped only after a full check run on the merge commit. `1e8e8df` was integrated by the owner release step: the team's branch predated the queue's frozen base, and re-accepting the done item was refused, so its queue entry was failed and released. The first `c343819` deploy attempt was refused by plan validation before any
+migrated copy. `172becd` fast-forwarded `tasks-hub` and shipped on its independent receipt without an owner-side rerun, per the deployment agent's rule. `6692a57`, `1e8e8df`, `66b55ed` and `0973558` were merges, so each shipped only after a full check run on the merge commit. `1e8e8df` was integrated by the owner release step: the team's branch predated the queue's frozen base, and re-accepting the done item was refused, so its queue entry was failed and released. The first `c343819` deploy attempt was refused by plan validation before any
 change (the plan carried the previous day's release name); the second, with a fresh backup
 (`-v2`), succeeded. Rollback binaries: `.build/prev-*` (hub, bridge) and
 `~/.local/bin/tt.prev-*` (Mini).
