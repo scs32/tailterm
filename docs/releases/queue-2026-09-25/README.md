@@ -59,6 +59,7 @@ SHA-256 is of the unredacted receipt.
 | `6580463` | Login workspace restore (`wi_f378f10d36cb093b`, fast-forward) | The TailOS login restore always finishes, skips closed agents' tabs, and opens every open, non-paused project's live sessions | TailOS `30179f2a` |
 | `4dd3841` | Sonnet 5.5 database handler (`wi_519d2df4f04c2e1c`, merge of `adb7160`) | `claude-sonnet-5-5` is an allowed model, and the Planned template's database handler runs on it at high reasoning | Mini `tt`, TailOS `39fe264e` |
 | `5ed02c0` | GPT-6.1 Sol availability (`wi_b1bff047121dec24`, merge of `721745d`) | `gpt-6.1-sol` is allowed in the model lists and pickers; the owner session removed a duplicate test import left by the clean textual merge with `4dd3841` | Mini `tt`, TailOS `4716aff4` |
+| `fe56621` | Agent window size and wake resend (`wi_b6b79229c8fec99d`, merge of `eacb486`) | Agent tmux windows keep a usable fixed size regardless of viewers; the relay retries unconfirmed Claude wakes; stuck agents are flagged; matrix `3ac190a1` (owner approval #14936) | Hub `20260929-window-size-fe56621`, Mini `tt`, TailOS `ba74b356` |
 
 ## Hub releases
 
@@ -85,6 +86,7 @@ SHA-256 is of the unredacted receipt.
 | `20260929-known-failure-close-733e66b` | `before-known-failure-close-733e66b.sqlite` | 311,111,680 | `79db1ad4…` | ok, 0 FK | none |
 | `20260929-interventions-0365cf6` | `before-interventions-0365cf6.sqlite` | 323,424,256 | `bfe949a7…` | ok, 0 FK | new `owner_interventions` |
 | `20260929-parallel-teams-4f59982` | `before-parallel-teams-4f59982.sqlite` | 329,560,064 | `158812b0…` | ok, 0 FK | `team_queue_settings` rebuilt without the 1-2 cap; new `team_host_usage` columns |
+| `20260929-window-size-fe56621` | `before-window-size-fe56621.sqlite` | 368,881,664 | `0ddaea58…` | ok, 0 FK | none |
 
 Before `6235924`, the combined migration was rehearsed on a copy of the `33d3ab7` backup: the new
 hub migrated it (integrity ok, no FK violations, 14 projects, queue at limit 1), and the
