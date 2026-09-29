@@ -58,6 +58,7 @@ SHA-256 is of the unredacted receipt.
 | `4f59982` | Parallel teams, no fixed cap (`wi_f27393853cd0e0da`, fast-forward) | The queue runs unrelated items in parallel without a fixed 2-lane cap, admitting on ownership, a free handler, host policy and disk; failed or stuck entries don't hold slots (owner acceptance #14692) | Hub `20260929-parallel-teams-4f59982`, Mini `tt`, TailOS `b5bdbd6c` |
 | `6580463` | Login workspace restore (`wi_f378f10d36cb093b`, fast-forward) | The TailOS login restore always finishes, skips closed agents' tabs, and opens every open, non-paused project's live sessions | TailOS `30179f2a` |
 | `4dd3841` | Sonnet 5.5 database handler (`wi_519d2df4f04c2e1c`, merge of `adb7160`) | `claude-sonnet-5-5` is an allowed model, and the Planned template's database handler runs on it at high reasoning | Mini `tt`, TailOS `39fe264e` |
+| `5ed02c0` | GPT-6.1 Sol availability (`wi_b1bff047121dec24`, merge of `721745d`) | `gpt-6.1-sol` is allowed in the model lists and pickers; the owner session removed a duplicate test import left by the clean textual merge with `4dd3841` | Mini `tt`, TailOS `4716aff4` |
 
 ## Hub releases
 
