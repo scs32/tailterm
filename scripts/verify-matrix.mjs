@@ -12,7 +12,7 @@ import {
   rmSync,
 } from "node:fs";
 import { resolve, relative, join, isAbsolute } from "node:path";
-import { tmpdir } from "node:os";
+import { tmpdir, availableParallelism, totalmem } from "node:os";
 import { createHash } from "node:crypto";
 import { execFileSync, spawn, spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
@@ -58,8 +58,31 @@ export function diffPaths(cwd, base, commit) {
   }
   return paths;
 }
-export function selectChecks(matrix, owned, changed, candidatePackages) {
-  if (matrix.version !== 1 || !owned.length)
+// A plan verifies exactly what merges only when the candidate contains its
+// base, so the candidate lands on that base as a fast-forward.
+export function assertFastForward(cwd, base, commit) {
+  const ancestry = spawnSync("git", ["merge-base", "--is-ancestor", base, commit], {
+    cwd,
+    encoding: "utf8",
+  });
+  if (ancestry.status === 1)
+    throw new Error(
+      "candidate is not a fast-forward of its base; rebase onto the current tip",
+    );
+  if (ancestry.status !== 0)
+    throw new Error(
+      "Unable to check candidate ancestry: " +
+        (ancestry.error?.message || ancestry.stderr.trim()),
+    );
+}
+export function selectChecks(
+  matrix,
+  owned,
+  changed,
+  candidatePackages,
+  { targeted = false } = {},
+) {
+  if (matrix.version !== 1 || (!owned.length && !targeted))
     throw new Error("Versioned matrix and ownership required");
   const paths = [...new Set([...owned, ...changed])].sort(),
     groups = new Set();
@@ -210,6 +233,16 @@ export function receiptEligible(receipt) {
     receipt.checks.every((c) => c.exitCode === 0 || c.knownFailure === true)
   );
 }
+const candidateGoPackages = (cwd, commit) =>
+  new Set(
+    execFileSync("git", ["ls-tree", "-r", "--name-only", commit, "hub"], {
+      cwd,
+      encoding: "utf8",
+    })
+      .split("\n")
+      .filter((p) => p.endsWith(".go"))
+      .map((p) => "./" + p.slice(4, p.lastIndexOf("/"))),
+  );
 export function makePlan(context, cwd) {
   if (
     !/^[a-f0-9]{40}$/.test(context.commit) ||
@@ -227,22 +260,13 @@ export function makePlan(context, cwd) {
       "Independent owner-approved matrix digest and source required",
     );
   assertInventory(matrix, cwd);
+  assertFastForward(cwd, context.baseCommit, context.commit);
   const changed = diffPaths(cwd, context.baseCommit, context.commit);
-  const candidatePackages = new Set(
-    execFileSync(
-      "git",
-      ["ls-tree", "-r", "--name-only", context.commit, "hub"],
-      { cwd, encoding: "utf8" },
-    )
-      .split("\n")
-      .filter((p) => p.endsWith(".go"))
-      .map((p) => "./" + p.slice(4, p.lastIndexOf("/"))),
-  );
   const checks = selectChecks(
     matrix,
     context.owned,
     changed,
-    candidatePackages,
+    candidateGoPackages(cwd, context.commit),
   );
   for (const check of checks)
     if (check.argv[0] === "go")
@@ -472,16 +496,236 @@ export function removeVerifierHome(home) {
   rmSync(home, { recursive: true, force: true });
 }
 
-export async function runPlan(plan, cwd, output, options = {}) {
-  const {
-    keepHome = false,
-    minFreeBytes = DEFAULT_MIN_FREE_BYTES,
-    getAvailableBytes = availableBytes,
-    abortSignal,
-    removeHome = removeVerifierHome,
-  } = options;
+// Checks that rewrite inputs every later check reads (dist-static, the wasm
+// fixtures and their prerequisite digests) run alone, and act as barriers: no
+// later check starts until an earlier exclusive check has finished.
+export const EXCLUSIVE_CHECKS = new Set([
+  "00-static-build",
+  "01-static-release-verify",
+  "wasm-test-build",
+]);
+// Browser suites that share a resource the lock rules below cannot see. All
+// members hold one lock, so no two of them overlap. Each entry names the
+// shared resource that was found by running the suite in parallel.
+export const SERIAL_SUITES = new Map([]);
+
+// Locks a check holds while it runs; two checks sharing any lock never
+// overlap. Fixed ports come from the approved matrix, identical argv+cwd
+// covers engine splits of one script (same screenshots and build output), and
+// every Go check shares one lane because each can saturate the CPU.
+export function executionLocks(check) {
+  const locks = [];
+  for (const port of (check.environment?.VERIFICATION_REQUIRED_PORTS || "")
+    .split(",")
+    .filter(Boolean))
+    locks.push("port:" + Number(port));
+  locks.push("argv:" + canonical({ argv: check.argv, cwd: check.cwd }));
+  if (check.cwd === "hub") locks.push("go");
+  if (check.argv.some((arg) => SERIAL_SUITES.has(arg)))
+    locks.push("serial-suites");
+  return locks;
+}
+
+export function defaultJobs(
+  cpus = availableParallelism(),
+  memory = totalmem(),
+) {
+  return Math.max(
+    1,
+    Math.min(8, Math.floor(cpus / 2), Math.floor(memory / (3 * 1024 ** 3))),
+  );
+}
+
+function validJobs(jobs) {
+  if (!Number.isSafeInteger(jobs) || jobs < 1 || jobs > 16)
+    throw new Error("Invalid --jobs value; use an integer from 1 to 16");
+  return jobs;
+}
+
+// Greedy list scheduling in plan order. Results keep plan positions, so a
+// receipt lists checks exactly as the plan does. On the first error, or when
+// the caller aborts, nothing new starts, every running check is stopped
+// through the shared signal, and the error is thrown once all have settled.
+export async function runScheduled(checks, options, runOne) {
+  const jobs = validJobs(options.jobs);
+  const outer = options.abortSignal;
+  const stop = new AbortController();
+  const forward = () => stop.abort(outer.reason);
+  if (outer?.aborted) forward();
+  else outer?.addEventListener("abort", forward, { once: true });
+  const results = new Array(checks.length);
+  const locks = checks.map(executionLocks);
+  const state = checks.map(() => "pending");
+  const held = new Map();
+  let running = 0,
+    exclusiveRunning = false,
+    failure;
+  const eligible = (i) =>
+    EXCLUSIVE_CHECKS.has(checks[i].id)
+      ? running === 0 && state.slice(0, i).every((s) => s === "done")
+      : locks[i].every((lock) => !held.has(lock));
+  try {
+    await new Promise((resolveAll) => {
+      const launch = () => {
+        if (!failure && !stop.signal.aborted)
+          for (let i = 0; i < checks.length && running < jobs; i++) {
+            if (exclusiveRunning) break;
+            if (state[i] !== "pending") continue;
+            const exclusive = EXCLUSIVE_CHECKS.has(checks[i].id);
+            if (!eligible(i)) {
+              if (exclusive) break;
+              continue;
+            }
+            state[i] = "running";
+            running++;
+            exclusiveRunning = exclusive;
+            for (const lock of locks[i]) held.set(lock, i);
+            Promise.resolve()
+              .then(() => runOne(checks[i], i, stop.signal))
+              .then(
+                (result) => {
+                  results[i] = result;
+                },
+                (error) => {
+                  failure ??= error;
+                  if (!stop.signal.aborted) stop.abort("SIGTERM");
+                },
+              )
+              .finally(() => {
+                state[i] = "done";
+                running--;
+                if (exclusive) exclusiveRunning = false;
+                for (const lock of locks[i]) held.delete(lock);
+                launch();
+              });
+            if (exclusive) break;
+          }
+        if (running === 0) resolveAll();
+      };
+      launch();
+    });
+  } finally {
+    outer?.removeEventListener("abort", forward);
+  }
+  if (outer?.aborted)
+    throw new Error("Verification interrupted by " + outer.reason);
+  if (failure) throw failure;
+  return results;
+}
+
+// Scans receipt checks (plan order, with recorded attempt times) for runs
+// that broke the scheduling rules: an overlap of two checks sharing a lock, an
+// overlap with an exclusive check, or a later check starting before an earlier
+// exclusive check ended. The verifier runs this over a real receipt.
+export function overlapViolations(checks) {
+  const spans = checks.map((check) => {
+    const attempts = check.attempts?.length ? check.attempts : [check];
+    return {
+      id: check.id,
+      locks: executionLocks(check),
+      exclusive: EXCLUSIVE_CHECKS.has(check.id),
+      start: Date.parse(attempts[0].startedAt),
+      end: Date.parse(attempts.at(-1).endedAt),
+    };
+  });
+  const violations = [];
+  for (let i = 0; i < spans.length; i++)
+    for (let j = i + 1; j < spans.length; j++) {
+      const a = spans[i],
+        b = spans[j],
+        overlap = a.start < b.end && b.start < a.end,
+        shared = a.locks.filter((lock) => b.locks.includes(lock));
+      const reason =
+        a.exclusive && b.start < a.end
+          ? "barrier"
+          : b.exclusive && a.end > b.start
+            ? "exclusive"
+            : overlap && shared.length
+              ? shared.join(" ")
+              : "";
+      if (reason) violations.push({ checks: [a.id, b.id], reason });
+    }
+  return violations;
+}
+
+async function runCheckWithAttempts(check, plan, cwd, output, environment, options) {
+  const { abortSignal, minFreeBytes, getAvailableBytes } = options;
+  const attempts = [];
+  for (let attempt = 1; attempt <= (plan.maxAttempts || 1); attempt++) {
+    if (abortSignal?.aborted)
+      throw new Error("Verification interrupted by " + abortSignal.reason);
+    requireFreeSpace(minFreeBytes, getAvailableBytes);
+    const startedAt = new Date().toISOString(),
+      start = performance.now();
+    const run = await runCheck(
+      check,
+      resolve(cwd, check.cwd),
+      environment,
+      abortSignal,
+    );
+    const log =
+      (run.stdout || "") +
+      (run.stderr || "") +
+      (run.failureReason
+        ? "\nverification failureReason: " + run.failureReason + "\n"
+        : "") +
+      (run.signal ? "verification signal: " + run.signal + "\n" : "");
+    const logURI = join(
+      output,
+      digest(check.id) +
+        (plan.maxAttempts ? ".attempt-" + attempt : "") +
+        ".log",
+    );
+    writeFileSync(logURI, log, { mode: 0o600 });
+    attempts.push({
+      attempt,
+      startedAt,
+      endedAt: new Date().toISOString(),
+      durationMs: Math.round(performance.now() - start),
+      exitCode: run.status ?? -1,
+      ...(run.failureReason ? { failureReason: run.failureReason } : {}),
+      logURI,
+      logDigest: digest(log),
+    });
+    if (abortSignal?.aborted)
+      throw new Error("Verification interrupted by " + abortSignal.reason);
+    if (run.status === 0) break;
+  }
+  const { attempt, ...final } = attempts.at(-1);
+  const knownFailure = plan.knownFailures?.some(
+    (e) => e.checkId === check.id,
+  );
+  return {
+    ...check,
+    ...final,
+    ...(plan.maxAttempts
+      ? {
+          attempts,
+          status:
+            final.exitCode === 0
+              ? attempts.length > 1
+                ? "flaky"
+                : "pass"
+              : "fail",
+          ...(knownFailure
+            ? {
+                knownFailure: true,
+                ...(final.exitCode === 0 ? { nowPassing: true } : {}),
+              }
+            : {}),
+        }
+      : {}),
+  };
+}
+
+function validRunOptions({ keepHome = false, jobs = defaultJobs() }) {
   if (typeof keepHome !== "boolean")
     throw new Error("Invalid --keep-home value");
+  validJobs(jobs);
+}
+
+export async function runPlan(plan, cwd, output, options = {}) {
+  validRunOptions(options);
   checkClean(cwd, plan.commit);
   const expected = makePlan(plan, cwd);
   if (
@@ -502,11 +746,42 @@ export async function runPlan(plan, cwd, output, options = {}) {
       })
   )
     throw new Error("Altered or omitted required checks");
+  return executePlan(plan, cwd, output, options, "receipt.json", (run) => ({
+    worktree: resolve(cwd),
+    version: 1,
+    operationKey: plan.operationKey,
+    planDigest: digest(plan),
+    repository: plan.repository,
+    baseCommit: plan.baseCommit,
+    commit: plan.commit,
+    matrixDigest: plan.matrixDigest,
+    checksDigest: plan.checksDigest,
+    verifierAgentId: plan.verifierAgentId,
+    verifierRunId: plan.verifierRunId,
+    detached: true,
+    cleanBefore: true,
+    cleanAfter: true,
+    ...run,
+    aiv: { state: "unsubmitted" },
+  }));
+}
+
+// Runs a validated plan in a fresh verifier home and writes receiptName only
+// when every check ran to completion on the unchanged clean candidate.
+async function executePlan(plan, cwd, output, options, receiptName, makeReceipt) {
+  const {
+    keepHome = false,
+    minFreeBytes = DEFAULT_MIN_FREE_BYTES,
+    getAvailableBytes = availableBytes,
+    abortSignal,
+    removeHome = removeVerifierHome,
+    jobs = defaultJobs(),
+  } = options;
   if (!isAbsolute(output) || relative(cwd, output).split("/")[0] !== "..")
     throw new Error("Logs/receipt must be outside worktree");
   requireFreeSpace(minFreeBytes, getAvailableBytes);
   const home = mkdtempSync(join(tmpdir(), "tailterm-verifier-"));
-  const receiptPath = join(output, "receipt.json");
+  const receiptPath = join(output, receiptName);
   let receiptWritten = false;
   try {
     mkdirSync(output, { recursive: true });
@@ -521,6 +796,7 @@ export async function runPlan(plan, cwd, output, options = {}) {
       LANG: "en_US.UTF-8",
       CI: "1",
       GOTOOLCHAIN: "auto",
+      VERIFICATION_JOBS: String(jobs),
     };
     // No inherited task/hub credentials, runtime config, vault or tmux socket.
     const prerequisites = [];
@@ -570,75 +846,16 @@ export async function runPlan(plan, cwd, output, options = {}) {
           buildCommand: binary.buildLog.argv,
           startedAt: binary.startedAt, endedAt: binary.endedAt });
     }
-    const results = [];
-    for (const check of plan.checks) {
-      const attempts = [];
-      for (let attempt = 1; attempt <= (plan.maxAttempts || 1); attempt++) {
-        if (abortSignal?.aborted)
-          throw new Error("Verification interrupted by " + abortSignal.reason);
-        requireFreeSpace(minFreeBytes, getAvailableBytes);
-        const startedAt = new Date().toISOString(),
-          start = performance.now();
-        const run = await runCheck(
-          check,
-          resolve(cwd, check.cwd),
-          environment,
-          abortSignal,
-        );
-        const log =
-          (run.stdout || "") +
-          (run.stderr || "") +
-          (run.failureReason
-            ? "\nverification failureReason: " + run.failureReason + "\n"
-            : "") +
-          (run.signal ? "verification signal: " + run.signal + "\n" : "");
-        const logURI = join(
-          output,
-          digest(check.id) +
-            (plan.maxAttempts ? ".attempt-" + attempt : "") +
-            ".log",
-        );
-        writeFileSync(logURI, log, { mode: 0o600 });
-        attempts.push({
-          attempt,
-          startedAt,
-          endedAt: new Date().toISOString(),
-          durationMs: Math.round(performance.now() - start),
-          exitCode: run.status ?? -1,
-          ...(run.failureReason ? { failureReason: run.failureReason } : {}),
-          logURI,
-          logDigest: digest(log),
-        });
-        if (abortSignal?.aborted)
-          throw new Error("Verification interrupted by " + abortSignal.reason);
-        if (run.status === 0) break;
-      }
-      const { attempt, ...final } = attempts.at(-1);
-      const knownFailure = plan.knownFailures?.some(
-        (e) => e.checkId === check.id,
-      );
-      results.push({
-        ...check,
-        ...final,
-        ...(plan.maxAttempts
-          ? {
-              attempts,
-              status:
-                final.exitCode === 0
-                  ? attempts.length > 1
-                    ? "flaky"
-                    : "pass"
-                  : "fail",
-              ...(knownFailure
-                ? {
-                    knownFailure: true,
-                    ...(final.exitCode === 0 ? { nowPassing: true } : {}),
-                  }
-                : {}),
-            }
-          : {}),
-      });
-    }
+    const results = await runScheduled(
+      plan.checks,
+      { jobs, abortSignal },
+      (check, _index, signal) =>
+        runCheckWithAttempts(check, plan, cwd, output, environment, {
+          abortSignal: signal,
+          minFreeBytes,
+          getAvailableBytes,
+        }),
+    );
     if (abortSignal?.aborted)
       throw new Error("Verification interrupted by " + abortSignal.reason);
     if (needsBinaries) {
@@ -650,26 +867,7 @@ export async function runPlan(plan, cwd, output, options = {}) {
     if (abortSignal?.aborted)
       throw new Error("Verification interrupted by " + abortSignal.reason);
     checkClean(cwd, plan.commit);
-    const receipt = {
-      worktree: resolve(cwd),
-      version: 1,
-      operationKey: plan.operationKey,
-      planDigest: digest(plan),
-      repository: plan.repository,
-      baseCommit: plan.baseCommit,
-      commit: plan.commit,
-      matrixDigest: plan.matrixDigest,
-      checksDigest: plan.checksDigest,
-      verifierAgentId: plan.verifierAgentId,
-      verifierRunId: plan.verifierRunId,
-      detached: true,
-      cleanBefore: true,
-      cleanAfter: true,
-      environment,
-      prerequisites,
-      checks: results,
-      aiv: { state: "unsubmitted" },
-    };
+    const receipt = makeReceipt({ environment, prerequisites, checks: results });
     writeFileSync(receiptPath, JSON.stringify(receipt, null, 2) + "\n", {
       mode: 0o600,
     });
@@ -695,6 +893,76 @@ export async function runPlan(plan, cwd, output, options = {}) {
     }
   }
 }
+// Targeted mode checks one fix between two frozen candidates: the matrix
+// rules select checks from the paths the fix changed, nothing else. Its
+// receipt is advisory iteration evidence, never a gating receipt: it is named
+// targeted-receipt.json, marked targeted, and has no plan binding to import.
+export function makeTargetedPlan(context, cwd) {
+  if (
+    !/^[a-f0-9]{40}$/.test(context.commit) ||
+    !/^[a-f0-9]{40}$/.test(context.baseCommit)
+  )
+    throw new Error("Exact previous and fix candidate SHAs required");
+  if (context.baseCommit === context.commit)
+    throw new Error("Targeted run needs a fix that differs from its previous candidate");
+  const raw = readFileSync(join(cwd, "verification/matrix.json"), "utf8"),
+    matrix = JSON.parse(raw);
+  assertInventory(matrix, cwd);
+  assertFastForward(cwd, context.baseCommit, context.commit);
+  const changed = diffPaths(cwd, context.baseCommit, context.commit);
+  const checks = selectChecks(
+    matrix,
+    [],
+    changed,
+    candidateGoPackages(cwd, context.commit),
+    { targeted: true },
+  );
+  for (const check of checks)
+    if (check.argv[0] === "go")
+      check.environment.VERIFICATION_BASE_COMMIT = context.baseCommit;
+  return {
+    targeted: true,
+    version: 1,
+    ...(context.repository ? { repository: context.repository } : {}),
+    baseCommit: context.baseCommit,
+    commit: context.commit,
+    ...matrixPolicy(matrix, checks),
+    matrixDigest: digest(raw),
+    checksDigest: digest(checks),
+    changed,
+    checks,
+  };
+}
+
+export async function runTargeted(context, cwd, output, options = {}) {
+  validRunOptions(options);
+  checkClean(cwd, context.commit);
+  const plan = makeTargetedPlan(context, cwd);
+  return executePlan(
+    plan,
+    cwd,
+    output,
+    options,
+    "targeted-receipt.json",
+    (run) => ({
+      targeted: true,
+      worktree: resolve(cwd),
+      version: 1,
+      planDigest: digest(plan),
+      ...(plan.repository ? { repository: plan.repository } : {}),
+      baseCommit: plan.baseCommit,
+      commit: plan.commit,
+      matrixDigest: plan.matrixDigest,
+      checksDigest: plan.checksDigest,
+      changed: plan.changed,
+      detached: true,
+      cleanBefore: true,
+      cleanAfter: true,
+      ...run,
+    }),
+  );
+}
+
 if (
   process.argv[1] &&
   resolve(process.argv[1]) === fileURLToPath(import.meta.url)
@@ -715,11 +983,18 @@ if (
         output,
         JSON.stringify(makePlan(input, process.cwd()), null, 2) + "\n",
       );
-    else if (mode === "run") {
+    else if (mode === "run" || mode === "targeted") {
       let keepHome = false;
       let minFreeBytes = DEFAULT_MIN_FREE_BYTES;
+      let jobs = defaultJobs();
       for (let i = 0; i < flags.length; i++) {
         if (flags[i] === "--keep-home") keepHome = true;
+        else if (flags[i] === "--jobs") {
+          const value = flags[++i];
+          if (!/^[1-9][0-9]?$/.test(value || ""))
+            throw new Error("--jobs requires an integer from 1 to 16");
+          jobs = validJobs(Number(value));
+        }
         else if (flags[i] === "--min-free-bytes") {
           const value = flags[++i];
           if (!/^(0|[1-9][0-9]*)$/.test(value || ""))
@@ -733,14 +1008,21 @@ if (
             );
         } else throw new Error("Unknown verifier run option: " + flags[i]);
       }
-      const r = await runPlan(input, process.cwd(), resolve(output), {
-        keepHome,
-        minFreeBytes,
-        abortSignal: interruption.signal,
-      });
+      const r = await (mode === "run" ? runPlan : runTargeted)(
+        input,
+        process.cwd(),
+        resolve(output),
+        { keepHome, minFreeBytes, jobs, abortSignal: interruption.signal },
+      );
       await new Promise((resolve) => setImmediate(resolve));
       if (interruptedBy)
-        rmSync(join(resolve(output), "receipt.json"), { force: true });
+        rmSync(
+          join(
+            resolve(output),
+            mode === "run" ? "receipt.json" : "targeted-receipt.json",
+          ),
+          { force: true },
+        );
       process.exitCode = interruptedBy
         ? interruptedBy === "SIGINT"
           ? 130
@@ -750,7 +1032,7 @@ if (
           : 1;
     } else
       throw new Error(
-        "Usage: node scripts/verify-matrix.mjs plan|run INPUT OUTPUT [--keep-home] [--min-free-bytes N]",
+        "Usage: node scripts/verify-matrix.mjs plan|run|targeted INPUT OUTPUT [--keep-home] [--min-free-bytes N] [--jobs N]",
       );
   } catch (e) {
     console.error(e.message);

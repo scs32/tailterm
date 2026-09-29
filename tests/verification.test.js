@@ -28,6 +28,13 @@ import {
   receiptEligible,
   matrixPolicy,
   removeVerifierHome,
+  runScheduled,
+  executionLocks,
+  overlapViolations,
+  defaultJobs,
+  SERIAL_SUITES,
+  makeTargetedPlan,
+  runTargeted,
 } from "../scripts/verify-matrix.mjs";
 const makePlan = (context, cwd) =>
   rawMakePlan(
@@ -1013,4 +1020,366 @@ test("only knownFailures bytes change invalidates prior approval and plan", (t) 
       () => matrixPolicy({ ...m, knownFailures }, []),
       /known failure/,
     );
+});
+
+// wi_82ed4c6924930bad / order #13844: parallel scheduling, targeted fix runs
+// and fast-forward bases.
+const fakeCheck = (id, extra = {}) => ({
+  id,
+  argv: ["node", id],
+  cwd: ".",
+  environment: {},
+  ...extra,
+});
+async function simulate(checks, jobs, duration = () => 5 + Math.random() * 10) {
+  let active = 0,
+    peak = 0;
+  const starts = [];
+  const results = await runScheduled(checks, { jobs }, async (check) => {
+    starts.push(check.id);
+    peak = Math.max(peak, ++active);
+    const startedAt = new Date().toISOString();
+    await new Promise((resolve) => setTimeout(resolve, duration(check)));
+    active--;
+    return { ...check, startedAt, endedAt: new Date().toISOString() };
+  });
+  return { results, peak, starts };
+}
+test("scheduler bounds concurrency by jobs and one job runs strictly in plan order", async () => {
+  const checks = Array.from({ length: 12 }, (_, i) =>
+    fakeCheck("check-" + String(i).padStart(2, "0")),
+  );
+  const parallel = await simulate(checks, 3);
+  assert.equal(parallel.peak, 3);
+  assert.deepEqual(
+    parallel.results.map((r) => r.id),
+    checks.map((c) => c.id),
+    "results keep plan order",
+  );
+  const serial = await simulate(checks, 1);
+  assert.equal(serial.peak, 1);
+  assert.deepEqual(serial.starts, checks.map((c) => c.id));
+  for (let i = 1; i < serial.results.length; i++)
+    assert(serial.results[i].startedAt >= serial.results[i - 1].endedAt);
+  assert.equal(defaultJobs(10, 16 * 1024 ** 3), 5, "Mini default");
+  assert.equal(defaultJobs(1, 1024 ** 3), 1);
+  assert.equal(defaultJobs(64, 512 * 1024 ** 3), 8);
+  for (const jobs of [0, 17, 1.5, "4"])
+    await assert.rejects(() => runScheduled(checks, { jobs }, async () => ({})), /--jobs/);
+});
+test("shared ports, engine splits, Go checks and serial suites never overlap", async (t) => {
+  SERIAL_SUITES.set("tests/serial-a.mjs", "fixture shared resource");
+  SERIAL_SUITES.set("tests/serial-b.mjs", "fixture shared resource");
+  t.after(() => {
+    SERIAL_SUITES.delete("tests/serial-a.mjs");
+    SERIAL_SUITES.delete("tests/serial-b.mjs");
+  });
+  const port = { VERIFICATION_REQUIRED_PORTS: "4319" };
+  const checks = [
+    fakeCheck("go-race", { argv: ["go", "test", "-race"], cwd: "hub" }),
+    fakeCheck("go-test", { argv: ["go", "test"], cwd: "hub" }),
+    fakeCheck("go-vet", { argv: ["go", "vet"], cwd: "hub" }),
+    fakeCheck("npm-unit", { argv: ["npm", "test"] }),
+    fakeCheck("tests/a.mjs", { environment: port }),
+    fakeCheck("tests/b.mjs", { environment: port }),
+    fakeCheck("tests/c.mjs:chromium", { argv: ["node", "tests/c.mjs"] }),
+    fakeCheck("tests/c.mjs:webkit", { argv: ["node", "tests/c.mjs"] }),
+    fakeCheck("tests/free-1.mjs"),
+    fakeCheck("tests/free-2.mjs"),
+    fakeCheck("tests/serial-a.mjs", { argv: ["node", "tests/serial-a.mjs"] }),
+    fakeCheck("tests/serial-b.mjs", { argv: ["node", "tests/serial-b.mjs"] }),
+  ];
+  assert.deepEqual(
+    executionLocks(checks[4]).filter((l) => executionLocks(checks[5]).includes(l)),
+    ["port:4319"],
+  );
+  assert(executionLocks(checks[0]).includes("go"));
+  assert(executionLocks(checks[10]).includes("serial-suites"));
+  assert(!executionLocks(checks[8]).includes("serial-suites"));
+  const { results, peak } = await simulate(checks, 8, () => 25);
+  assert.deepEqual(overlapViolations(results), []);
+  assert(peak > 1, "independent checks ran in parallel");
+  const span = (id) => results.find((r) => r.id === id);
+  const overlaps = (a, b) =>
+    span(a).startedAt < span(b).endedAt && span(b).startedAt < span(a).endedAt;
+  assert(overlaps("tests/free-1.mjs", "tests/free-2.mjs"));
+  for (const [a, b] of [
+    ["go-race", "go-test"],
+    ["go-test", "go-vet"],
+    ["tests/a.mjs", "tests/b.mjs"],
+    ["tests/c.mjs:chromium", "tests/c.mjs:webkit"],
+    ["tests/serial-a.mjs", "tests/serial-b.mjs"],
+  ])
+    assert(!overlaps(a, b), a + " overlapped " + b);
+  const forged = results.map((r) => ({ ...r }));
+  forged[5].startedAt = forged[4].startedAt;
+  assert.deepEqual(
+    overlapViolations(forged).map((v) => v.reason),
+    ["port:4319"],
+    "scanner detects a shared-port overlap",
+  );
+});
+test("exclusive checks run alone and hold back every later check", async () => {
+  const checks = [
+    fakeCheck("early-1"),
+    fakeCheck("early-2"),
+    fakeCheck("00-static-build"),
+    fakeCheck("late-1"),
+    fakeCheck("late-2"),
+    fakeCheck("wasm-test-build"),
+  ];
+  const { results, starts } = await simulate(checks, 6, (c) =>
+    c.id === "early-2" ? 40 : 10,
+  );
+  assert.deepEqual(overlapViolations(results), []);
+  assert.deepEqual(starts.slice(0, 2), ["early-1", "early-2"]);
+  assert.equal(starts[2], "00-static-build", "later checks wait for the barrier");
+  assert.equal(starts.at(-1), "wasm-test-build");
+  const forged = results.map((r) => ({ ...r }));
+  forged[3].startedAt = forged[0].startedAt;
+  assert(
+    overlapViolations(forged).some((v) => v.reason === "barrier"),
+    "scanner detects a later check started past an exclusive barrier",
+  );
+});
+test("full diagnostic selection schedules with no lock or barrier violation", async () => {
+  const checks = selectChecks(
+    matrix,
+    ["client/", "hub/", "scripts/", "tests/", "wasm/"],
+    [],
+  );
+  assert(checks.length >= 70, "diagnostic selection is the full matrix");
+  const { results, peak } = await simulate(checks, defaultJobs(10, 16 * 1024 ** 3), () =>
+    1 + Math.random() * 6,
+  );
+  assert.equal(peak, 5);
+  assert.deepEqual(results.map((r) => r.id), checks.map((c) => c.id));
+  assert.deepEqual(overlapViolations(results), []);
+});
+test("scheduler stops running checks, starts nothing new and throws on the first error", async () => {
+  const checks = [fakeCheck("a"), fakeCheck("b"), fakeCheck("c"), fakeCheck("d")];
+  const started = [],
+    stopped = [];
+  await assert.rejects(
+    () =>
+      runScheduled(checks, { jobs: 2 }, async (check, _i, signal) => {
+        started.push(check.id);
+        if (check.id === "b") throw new Error("disk reserve");
+        await new Promise((resolve) => signal.addEventListener("abort", resolve));
+        stopped.push(check.id);
+        return check;
+      }),
+    /disk reserve/,
+  );
+  assert.deepEqual(started, ["a", "b"]);
+  assert.deepEqual(stopped, ["a"]);
+});
+function browserFixture(t, suites) {
+  const f = fixture(t);
+  writeFileSync(join(f.cwd, ".gitignore"), "node_modules/\n.build/\n");
+  mkdirSync(join(f.cwd, "wasm"));
+  writeFileSync(join(f.cwd, "wasm/tailserve.wasm"), "fixture");
+  mkdirSync(join(f.cwd, "node_modules"));
+  writeFileSync(join(f.cwd, "node_modules/.package-lock.json"), "{}");
+  mkdirSync(join(f.cwd, ".build"));
+  for (const name of ["test.wasm", "speech-fixture.wav", "go-modules.txt"])
+    writeFileSync(join(f.cwd, ".build", name), "fixture");
+  for (const [name, source] of Object.entries(suites))
+    writeFileSync(join(f.cwd, "tests", name), "// browser.launch(\n" + source);
+  writeFileSync(
+    join(f.cwd, "package.json"),
+    JSON.stringify({
+      scripts: {
+        test: 'node -e "process.exit(0)"',
+        "build:static": 'node -e "process.exit(0)"',
+        "verify:release": 'node -e "process.exit(0)"',
+      },
+    }),
+  );
+  writeFileSync(
+    join(f.cwd, "verification/matrix.json"),
+    JSON.stringify({
+      version: 1,
+      maxAttempts: 3,
+      knownFailures: [],
+      browserSuites: Object.keys(suites).map((name) => ({
+        file: "tests/" + name,
+        mode: "both",
+      })),
+      excludedBrowserSuites: [],
+      rules: [
+        { prefixes: ["docs/"], groups: ["unit"] },
+        { prefixes: ["client/"], groups: ["unit", "browser"] },
+        { prefixes: ["hub/"], groups: ["go"] },
+      ],
+    }),
+  );
+  f.git("add", ".");
+  f.git("commit", "-qm", "browser fixture");
+  const commit = f.git("rev-parse", "HEAD");
+  f.git("checkout", "-q", "--detach", commit);
+  return { ...f, commit };
+}
+test("concurrent checks keep plan-ordered receipts and record the job count", async (t) => {
+  const f = browserFixture(t, {
+    "slow-browser.mjs": "setTimeout(()=>console.log('slow done'),600);",
+    "fast-browser.mjs": "console.log('fast done');",
+  });
+  const plan = makePlan(
+    { baseCommit: f.commit, commit: f.commit, owned: ["client/"] },
+    f.cwd,
+  );
+  const receipt = await runPlan(plan, f.cwd, tempDir(t, "verification-parallel-"), {
+    minFreeBytes: 0,
+    jobs: 4,
+  });
+  assert.deepEqual(receipt.checks.map((c) => c.id), plan.checks.map((c) => c.id));
+  assert.equal(receipt.environment.VERIFICATION_JOBS, "4");
+  assert.deepEqual(overlapViolations(receipt.checks), []);
+  const slow = receipt.checks.find((c) => c.id === "tests/slow-browser.mjs"),
+    fast = receipt.checks.find((c) => c.id === "tests/fast-browser.mjs");
+  assert(fast.startedAt < slow.endedAt && slow.startedAt < fast.endedAt);
+  assert(receipt.checks.every((c) => c.status === "pass"));
+});
+test("CLI SIGINT stops every concurrent check group, keeps partial logs and leaves no receipt", async (t) => {
+  const root = tempDir(t, "verification-concurrent-signal-");
+  const suite = (name) =>
+    `import {spawn} from 'node:child_process';import fs from 'node:fs';` +
+    `const c=spawn(process.execPath,['-e','process.on("SIGTERM",()=>{});setInterval(()=>{},1000)'],{stdio:'ignore'});` +
+    `fs.writeFileSync(${JSON.stringify(join(root, name))},JSON.stringify([process.pid,c.pid]));` +
+    `console.log('partial ${name}');setInterval(()=>{},1000);`;
+  const f = browserFixture(t, {
+    "one-browser.mjs": suite("one"),
+    "two-browser.mjs": suite("two"),
+  });
+  const plan = makePlan(
+    { baseCommit: f.commit, commit: f.commit, owned: ["client/"] },
+    f.cwd,
+  );
+  const planFile = join(root, "plan.json"),
+    output = tempDir(t, "verification-concurrent-signal-logs-");
+  writeFileSync(planFile, JSON.stringify(plan));
+  const script = new URL("../scripts/verify-matrix.mjs", import.meta.url).pathname;
+  const runner = spawn(
+    process.execPath,
+    [script, "run", planFile, output, "--min-free-bytes", "0", "--jobs", "3"],
+    { cwd: f.cwd, env: { ...process.env, TMPDIR: root }, stdio: "ignore" },
+  );
+  const pids = [];
+  try {
+    for (let i = 0; !(existsSync(join(root, "one")) && existsSync(join(root, "two"))) && i < 250; i++)
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    for (const name of ["one", "two"])
+      pids.push(...JSON.parse(readFileSync(join(root, name), "utf8")));
+    runner.kill("SIGINT");
+    const [code] = await once(runner, "close");
+    assert.equal(code, 130);
+    const alive = (pid) => {
+      try {
+        process.kill(pid, 0);
+        return true;
+      } catch {
+        return false;
+      }
+    };
+    for (let i = 0; pids.some(alive) && i < 100; i++)
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    assert.deepEqual(pids.filter(alive), [], "every check group was stopped");
+    assert(!existsSync(join(output, "receipt.json")));
+    for (const name of ["one", "two"]) {
+      const log = readFileSync(
+        join(output, digest(`tests/${name}-browser.mjs`) + ".attempt-1.log"),
+        "utf8",
+      );
+      assert.match(log, new RegExp("partial " + name));
+      assert.match(log, /failureReason: interrupted/);
+    }
+  } finally {
+    if (runner.exitCode === null && runner.signalCode === null) runner.kill("SIGKILL");
+    for (const pid of pids)
+      try {
+        process.kill(pid, "SIGKILL");
+      } catch {}
+  }
+});
+function commitChange(f, path, content, message) {
+  mkdirSync(join(f.cwd, path, ".."), { recursive: true });
+  writeFileSync(join(f.cwd, path), content);
+  f.git("add", ".");
+  f.git("commit", "-qm", message);
+  return f.git("rev-parse", "HEAD");
+}
+test("targeted mode selects checks only from the fix's changed paths", async (t) => {
+  const f = browserFixture(t, { "fixture-browser.mjs": "" });
+  mkdirSync(join(f.cwd, "hub"));
+  writeFileSync(join(f.cwd, "hub/go.mod"), "module fixture\n\ngo 1.24.0\n");
+  const previous = commitChange(f, "hub/pkg/a.go", "package pkg\n", "hub package");
+  const docsFix = commitChange(f, "docs/fix.md", "fix\n", "docs fix");
+  const hubFix = commitChange(f, "hub/pkg/a.go", "package pkg\n\n// fix\n", "hub fix");
+  const clientFix = commitChange(f, "client/app.js", "export {}\n", "client fix");
+  const ids = (baseCommit, commit) =>
+    makeTargetedPlan({ baseCommit, commit }, f.cwd).checks.map((c) => c.id);
+  assert.deepEqual(ids(previous, docsFix), ["npm-unit"]);
+  assert.deepEqual(ids(docsFix, hubFix), ["go-race", "go-test", "go-vet"]);
+  assert.deepEqual(
+    makeTargetedPlan({ baseCommit: docsFix, commit: hubFix }, f.cwd).checks.find(
+      (c) => c.id === "go-race",
+    ).argv,
+    ["go", "test", "-race", "./pkg"],
+  );
+  assert.deepEqual(ids(hubFix, clientFix), [
+    "00-static-build",
+    "01-static-release-verify",
+    "npm-unit",
+    "tests/fixture-browser.mjs",
+  ]);
+  const unknown = commitChange(f, "unknown/file.txt", "x\n", "unknown path");
+  assert.throws(() => ids(clientFix, unknown), /Unknown path: unknown\/file.txt/);
+  assert.throws(() => ids(docsFix, docsFix), /differs from its previous/);
+
+  f.git("checkout", "-q", "--detach", docsFix);
+  const output = tempDir(t, "verification-targeted-");
+  const receipt = await runTargeted({ baseCommit: previous, commit: docsFix }, f.cwd, output, {
+    minFreeBytes: 0,
+  });
+  assert.equal(receipt.targeted, true);
+  assert.deepEqual(receipt.checks.map((c) => c.id), ["npm-unit"]);
+  assert.equal(receipt.checks[0].status, "pass");
+  assert(existsSync(join(output, "targeted-receipt.json")));
+  assert(!existsSync(join(output, "receipt.json")), "never a gating receipt");
+  assert.equal(receipt.aiv, undefined);
+
+  writeFileSync(join(f.cwd, "docs/fix.md"), "dirty\n");
+  await assert.rejects(
+    () => runTargeted({ baseCommit: previous, commit: docsFix }, f.cwd, tempDir(t, "vt-dirty-")),
+    /Clean detached/,
+  );
+  f.git("checkout", "--", "docs/fix.md");
+  f.git("checkout", "-q", "-B", "attached", docsFix);
+  await assert.rejects(
+    () => runTargeted({ baseCommit: previous, commit: docsFix }, f.cwd, tempDir(t, "vt-attached-")),
+    /Clean detached/,
+  );
+});
+test("plans and targeted runs refuse a base the candidate does not contain", async (t) => {
+  const f = fixture(t);
+  f.git("checkout", "-q", "--detach", f.base);
+  writeFileSync(join(f.cwd, "docs/other.md"), "diverged\n");
+  f.git("add", ".");
+  f.git("commit", "-qm", "diverged tip");
+  const diverged = f.git("rev-parse", "HEAD");
+  f.git("checkout", "-q", "--detach", f.commit);
+  const context = { baseCommit: diverged, commit: f.commit, owned: ["docs/"] };
+  assert.throws(() => makePlan(context, f.cwd), /not a fast-forward of its base; rebase onto the current tip/);
+  const linear = makePlan({ ...context, baseCommit: f.base }, f.cwd);
+  await assert.rejects(
+    () => runPlan({ ...linear, baseCommit: diverged }, f.cwd, tempDir(t, "vt-diverged-")),
+    /not a fast-forward/,
+  );
+  assert.throws(
+    () => makeTargetedPlan({ baseCommit: diverged, commit: f.commit }, f.cwd),
+    /not a fast-forward/,
+  );
+  assert.equal(makePlan({ ...context, baseCommit: f.commit }, f.cwd).changed.length, 0);
+  assert.deepEqual(linear.changed, ["docs/old.md", "docs/new.md"]);
 });
