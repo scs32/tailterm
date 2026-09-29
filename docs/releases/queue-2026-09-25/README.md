@@ -53,6 +53,7 @@ SHA-256 is of the unredacted receipt.
 | `75e8d2d` | Pre-existing browser suites (`wi_be7bbed81d4009c1`, merge of `07e1f79`, owner-integrated) | All 14 known-failing browser suites pass on the first attempt (67/67); the bug stays open until the matrix follow-up `wi_0f8ec0f080ddd930` empties knownFailures | none (tests only) |
 | `77a09c5` | Runtime prompt detection (`wi_7d5050c57193db78`, merge of `318a738`) | The relay recognizes agents waiting on their runtime's own prompts, answers them per project policy and escalates unknown ones | Hub `20260928-runtime-prompts-77a09c5`, Mini `tt`, TailOS `8906f0c2` |
 | `85ad88f` | Empty known failures (`wi_0f8ec0f080ddd930`, merge of `b0f578a`) | The approved verification matrix has no known failures (digest `2d75824b…`, owner approval #14468) | none (matrix only) |
+| `733e66b` | Known-failure close (`wi_6fb81e10c366d7b4`, merge of `d0b27bc`) | A bug listed in its own plan's known failures can be saved done when its exact receipt shows all of them now passing | Hub `20260929-known-failure-close-733e66b`, Mini `tt` |
 
 ## Hub releases
 
@@ -76,12 +77,13 @@ SHA-256 is of the unredacted receipt.
 | `20260928-queue-acceptance-66b55ed` | `before-queue-acceptance-66b55ed.sqlite` | 271,040,512 | `ae2af9fe…` | ok, 0 FK | none |
 | `20260928-handler-rotation-ffda442` | `before-handler-rotation-ffda442.sqlite` | 284,246,016 | `22ab27dd…` | ok, 0 FK | `tasks.primary_handler_id`, `tasks.handler_revision`; new `handler_runs`, `handler_rotations`, `handler_rotation_requests`, `handler_rotation_policy` |
 | `20260928-runtime-prompts-77a09c5` | `before-runtime-prompts-77a09c5.sqlite` | 303,017,984 | `983b4790…` | ok, 0 FK | new `runtime_prompt_policy`, `runtime_prompt_escalations` |
+| `20260929-known-failure-close-733e66b` | `before-known-failure-close-733e66b.sqlite` | 311,111,680 | `79db1ad4…` | ok, 0 FK | none |
 
 Before `6235924`, the combined migration was rehearsed on a copy of the `33d3ab7` backup: the new
 hub migrated it (integrity ok, no FK violations, 14 projects, queue at limit 1), and the
 `33d3ab7` hub opened the migrated copy. The `34944cf`, `8b1f4d4`, `8e32dc0`, `acfe2d0`, `ffda442` and `77a09c5` migrations were rehearsed
 the same way on a copy of the previous release's backup, including the old hub opening the
-migrated copy. `172becd` fast-forwarded `tasks-hub` and shipped on its independent receipt without an owner-side rerun, per the deployment agent's rule. `6692a57`, `1e8e8df`, `66b55ed`, `0973558`, `ffda442`, `4a6cdfd`, `75e8d2d`, `77a09c5` and `85ad88f` were merges, so each shipped only after a full check run on the merge commit. `1e8e8df` was integrated by the owner release step: the team's branch predated the queue's frozen base, and re-accepting the done item was refused, so its queue entry was failed and released. The first `c343819` deploy attempt was refused by plan validation before any
+migrated copy. `172becd` fast-forwarded `tasks-hub` and shipped on its independent receipt without an owner-side rerun, per the deployment agent's rule. `6692a57`, `1e8e8df`, `66b55ed`, `0973558`, `ffda442`, `4a6cdfd`, `75e8d2d`, `77a09c5`, `85ad88f` and `733e66b` were merges, so each shipped only after a full check run on the merge commit. `1e8e8df` was integrated by the owner release step: the team's branch predated the queue's frozen base, and re-accepting the done item was refused, so its queue entry was failed and released. The first `c343819` deploy attempt was refused by plan validation before any
 change (the plan carried the previous day's release name); the second, with a fresh backup
 (`-v2`), succeeded. Rollback binaries: `.build/prev-*` (hub, bridge) and
 `~/.local/bin/tt.prev-*` (Mini).
