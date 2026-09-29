@@ -69,6 +69,17 @@ const ssh = new ssh2.Server({ hostKeys: [hostKey] }, (client) => {
 });
 ssh.listen(0, "127.0.0.1");
 await once(ssh, "listening");
+// NODE_ENV=production serves dist/, which the verification matrix does not
+// build (it builds dist-static). Build it from this checkout so the suite never
+// depends on, or serves, a missing or stale bundle.
+const build = spawn(process.execPath, ["node_modules/vite/bin/vite.js", "build"], {
+  stdio: ["ignore", "pipe", "pipe"],
+});
+let buildLog = "";
+build.stdout.on("data", (d) => (buildLog += d));
+build.stderr.on("data", (d) => (buildLog += d));
+const [buildCode] = await once(build, "exit");
+assert.equal(buildCode, 0, "vite build failed:\n" + buildLog);
 const dir = mkdtempSync(path.join(os.tmpdir(), "tailterm-browser-"));
 const proc = spawn(process.execPath, ["server/index.js"], {
   env: {
@@ -87,14 +98,22 @@ try {
   for (let i = 0; i < 100 && !log.includes("Tailterm:"); i++)
     await new Promise((r) => setTimeout(r, 50));
   assert.match(log, /Tailterm:/);
-  browser = await (
-    process.env.TEST_BROWSER === "webkit" ? webkit : chromium
-  ).launch();
+  const isWebKit = process.env.TEST_BROWSER === "webkit";
+  browser = await (isWebKit ? webkit : chromium).launch();
   const page = await browser.newPage({
     viewport: { width: 1440, height: 1050 },
-    permissions: ["clipboard-read", "clipboard-write"],
+    // WebKit has no clipboard-write permission; a click's user activation
+    // already allows writeText there.
+    permissions: isWebKit
+      ? ["clipboard-read"]
+      : ["clipboard-read", "clipboard-write"],
   });
   await useDomRenderer(page);
+  // Inactive tabs reveal their close control only on hover or focus.
+  async function closeTab(id) {
+    await page.locator(`#tabs .tab:has([data-tab="${id}"])`).hover();
+    await page.locator(`[data-close="${id}"]`).click();
+  }
   const errors = [];
   page.on("pageerror", (e) => errors.push(e.message));
   await page.goto("http://127.0.0.1:14318");
@@ -296,7 +315,17 @@ try {
     return a.left >= v.left - 1 && a.right <= v.right + 1;
   });
   await page.setViewportSize({ width: 1440, height: 1050 });
-  await exercisePaneGroups(page);
+  // Safari traverses every control with Option+Tab when macOS Full Keyboard
+  // Access is off; use that native key as static-browser.mjs does.
+  const press = page.keyboard.press.bind(page.keyboard);
+  if (isWebKit)
+    page.keyboard.press = (key, options) =>
+      press(key === "Tab" ? "Alt+Tab" : key, options);
+  try {
+    await exercisePaneGroups(page, undefined, { staticControls: false });
+  } finally {
+    page.keyboard.press = press;
+  }
   while ((await page.locator("[data-close]").count()) > 1) {
     await page.locator("#tabs .tab").last().hover();
     await page.locator("[data-close]").last().click();
@@ -427,7 +456,7 @@ try {
     "Password host",
   );
   assert.equal(await page.locator("#tmux").count(), 0);
-  await page.locator(`[data-close="${secondTabId}"]`).click();
+  await closeTab(secondTabId);
   assert.equal(
     await page.locator(".tab.active [data-tab]").getAttribute("data-tab"),
     originalTmuxId,
@@ -493,7 +522,7 @@ try {
         ""
       ).includes("unverified"),
   );
-  await page.locator(`[data-close="${autoId}"]`).click();
+  await closeTab(autoId);
   await page.locator("#new-tab").click();
   await page.locator("[data-resume]").filter({ hasText: autoName }).click();
   await page.waitForFunction(() =>
@@ -510,7 +539,7 @@ try {
   const resumedId = await page
     .locator(".tab.active [data-tab]")
     .getAttribute("data-tab");
-  await page.locator(`[data-close="${resumedId}"]`).click();
+  await closeTab(resumedId);
   await page.locator("#new-tab").click();
   await page.locator("#launcher-name").fill("named-from-fullscreen");
   await page.locator("#start-session").click();
@@ -536,7 +565,7 @@ try {
         ""
       ).includes("unverified"),
   );
-  await page.locator(`[data-close="${namedId}"]`).click();
+  await closeTab(namedId);
   await page.locator("#fullscreen").click();
   await page.locator("#new-tab").click();
   await page.locator("#launcher-name").fill("missing");
