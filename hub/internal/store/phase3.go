@@ -270,7 +270,15 @@ func resolveRole(ctx context.Context, tx *sql.Tx, task api.Task, role, itemID st
 		}
 		row = tx.QueryRowContext(ctx, `SELECT `+agentCols+` FROM agents WHERE task_id=? AND name=? COLLATE NOCASE AND status NOT IN (?,?) ORDER BY created_at DESC LIMIT 1`, task.ID, task.Orchestrator, api.AgentClosed, api.AgentExited)
 	case api.RoleDatabaseHandler:
-		row = tx.QueryRowContext(ctx, `SELECT `+agentCols+` FROM agents WHERE task_id=? AND role=? AND status NOT IN (?,?) ORDER BY created_at DESC LIMIT 1`, task.ID, api.AgentRoleDatabaseHandler, api.AgentClosed, api.AgentExited)
+		// A committed rotation makes the primary explicit; the successor of an
+		// open rotation does not hold the role until it commits.
+		if task.PrimaryHandlerID != "" {
+			a, err := scanAgent(tx.QueryRowContext(ctx, `SELECT `+agentCols+` FROM agents WHERE task_id=? AND id=? AND status NOT IN (?,?)`, task.ID, task.PrimaryHandlerID, api.AgentClosed, api.AgentExited))
+			if err == nil || !errors.Is(err, sql.ErrNoRows) {
+				return a, err
+			}
+		}
+		row = tx.QueryRowContext(ctx, `SELECT `+agentCols+` FROM agents WHERE task_id=? AND role=? AND status NOT IN (?,?) AND id NOT IN (SELECT successor_agent_id FROM handler_rotations WHERE task_id=? AND state='prepared') ORDER BY created_at DESC LIMIT 1`, task.ID, api.AgentRoleDatabaseHandler, api.AgentClosed, api.AgentExited, task.ID)
 	default:
 		return api.Agent{}, fmt.Errorf("%w: unknown role %q; use role:lead or role:database_handler", api.ErrConflict, role)
 	}

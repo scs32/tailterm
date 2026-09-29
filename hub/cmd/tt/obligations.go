@@ -175,7 +175,7 @@ func cmdReassign(e env, args []string) error {
 	}
 	ctx, cancel := ctxTimeout(10 * time.Second)
 	defer cancel()
-	target, err := resolveAgent(ctx, c, task, *to)
+	target, _, err := resolveRecipient(ctx, c, task, *to)
 	if err != nil {
 		return err
 	}

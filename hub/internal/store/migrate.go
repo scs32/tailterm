@@ -60,6 +60,8 @@ func migrate(db *sql.DB) error {
 		{"tasks", "lifecycle_generation", "INTEGER NOT NULL DEFAULT 0"},
 		{"tasks", "pause_generation", "INTEGER NOT NULL DEFAULT 0"},
 		{"tasks", "paused_at", "TEXT NOT NULL DEFAULT ''"},
+		{"tasks", "primary_handler_id", "TEXT NOT NULL DEFAULT ''"},
+		{"tasks", "handler_revision", "INTEGER NOT NULL DEFAULT 1"},
 		{"messages", "broadcast", "INTEGER NOT NULL DEFAULT 0"},
 		{"messages", "envelope", "TEXT NOT NULL DEFAULT ''"},
 	} {
@@ -442,6 +444,9 @@ CREATE INDEX IF NOT EXISTS agent_allocation_intents_item ON agent_allocation_int
 		return err
 	}
 	if err := migrateVerificationEnrollment(db); err != nil {
+		return err
+	}
+	if err := migrateHandlerRotation(db); err != nil {
 		return err
 	}
 	_, err := db.Exec(`INSERT OR IGNORE INTO profile_meta(key,value) VALUES('instance',?)`, api.NewID("profilehub"))
