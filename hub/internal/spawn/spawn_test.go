@@ -263,3 +263,34 @@ func TestWindowSizePolicyAfterTmuxServerRestart(t *testing.T) {
 		t.Fatalf("agent window after server restart = %q, want 200x50 manual", got)
 	}
 }
+
+// tt spawn usually runs inside another agent's tmux pane on the same server.
+// The size policy must land on the new agent session only, never on the
+// caller's session that $TMUX and $TMUX_PANE name.
+func TestSpawnFromInsideTmuxTargetsOnlyTheAgent(t *testing.T) {
+	run := privateTmux(t)
+	run("new-session", "-d", "-s", "caller", "-x", "100", "-y", "30", "sleep 60")
+	socket := run("display-message", "-p", "-t", "caller:", "#{socket_path}")
+	pid := run("display-message", "-p", "-t", "caller:", "#{pid}")
+	sessionID := strings.TrimPrefix(run("display-message", "-p", "-t", "caller:", "#{session_id}"), "$")
+	t.Setenv("TMUX", socket+","+pid+","+sessionID)
+	t.Setenv("TMUX_PANE", run("display-message", "-p", "-t", "caller:", "#{pane_id}"))
+	callerSession, callerWindow := run("show-options", "-t", "caller"), run("show-options", "-w", "-t", "caller:")
+	createAgent(t, "agent-a")
+	if got := run("show-options", "-t", "caller"); got != callerSession {
+		t.Fatalf("caller session options changed:\nbefore %q\nafter %q", callerSession, got)
+	}
+	if got := run("show-options", "-w", "-t", "caller:"); got != callerWindow || strings.Contains(got, "window-size") {
+		t.Fatalf("caller window options changed:\nbefore %q\nafter %q", callerWindow, got)
+	}
+	if got := run("show-options", "-t", "agent-a", "default-size"); got != "default-size 200x50" {
+		t.Fatalf("agent default-size = %q", got)
+	}
+	if got := windowSize(run, "agent-a"); got != "200x50 manual" {
+		t.Fatalf("agent window = %q, want 200x50 manual", got)
+	}
+	attachTinyViewer(t, run, "agent-a", 16, 2)
+	if got := windowSize(run, "agent-a"); got != "200x50 manual" {
+		t.Fatalf("agent window behind a 16x2 viewer = %q, want 200x50 manual", got)
+	}
+}

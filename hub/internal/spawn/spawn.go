@@ -172,9 +172,12 @@ func Create(o Options) error {
 	agentCmd := ShellQuote(o.Self) + " wrap --shell-file " + ShellQuote(filepath.Clean(launchPath))
 	args = append(args, agentCmd)
 	// Set the size policy in the same tmux command so no viewer can attach
-	// between creation and policy. Without -t, both options land on the new
-	// session and its window only; global options stay untouched.
-	args = append(args, ";", "set-option", "default-size", AgentDefaultSize, ";", "set-option", "-w", "window-size", "manual")
+	// between creation and policy. The exact =S: target names the new session
+	// and its window even when tt runs inside another tmux pane ($TMUX would
+	// otherwise pick the caller's session); a bare =S fails inside the chain.
+	// Global options stay untouched.
+	target := "=" + o.Session + ":"
+	args = append(args, ";", "set-option", "-t", target, "default-size", AgentDefaultSize, ";", "set-option", "-w", "-t", target, "window-size", "manual")
 	if out, err := tmux(args...).CombinedOutput(); err != nil {
 		return fmt.Errorf("tmux new-session: %s", strings.TrimSpace(string(out)))
 	}
