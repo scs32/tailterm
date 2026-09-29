@@ -52,6 +52,10 @@ const vite = await createViteServer({
   configFile: "vite.config.js",
   mode: "static",
   server: { host: "127.0.0.1", port: 0 },
+  // Only the speech worker imports @huggingface/transformers, and Vite's
+  // dependency scan does not follow workers. Without this, a cold or
+  // invalidated optimizer cache finds it mid-test and reloads the page.
+  optimizeDeps: { include: ["@huggingface/transformers"] },
   logLevel: "error",
 });
 await vite.listen();

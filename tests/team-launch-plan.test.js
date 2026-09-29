@@ -70,7 +70,7 @@ test("CLI embedded planner and TailOS resolve identical complete member fields",
   assert.deepEqual(resolved.itemRouting, routing);
   assert.deepEqual(
     ui.map((entry) => entry.fields.reasoning),
-    ["medium", "high", "medium", "medium", "high"],
+    ["medium", "high", "high", "high", "high"],
   );
   assert.deepEqual(
     ui.map((entry) => entry.fields.name),

@@ -398,6 +398,13 @@ A running/queued turn can finish. Late runtime hooks cannot silently unretire a
 worker. Explicit Resume or a direct human message to that online retired worker
 makes it available again. See [retirement](agent-retirement.md).
 
+The project's database handler is the one long-lived role. The owner command
+`tt handler rotate`, or the host relay when the project's policy says it is due
+(finished leased items, total tokens or a changed handler prompt), replaces it
+with a fresh session. That session inherits every open obligation and a durable
+handoff, and becomes the explicit primary handler. The old handler closes. See
+[handler rotation](handler-rotation.md).
+
 Individual closeout records the exact agent/run as closed, then asks only its
 saved host to stop the tmux session whose hub/task/agent/run, stable tmux ID and
 creation time all match. The parent project stays open. Closure intent and the

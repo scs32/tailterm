@@ -877,6 +877,9 @@ export function createBoardView({
           );
         }
       }
+      // A reload hidden or superseded during the audit reads must not start
+      // another hub read (wi_a9a69169f732121d).
+      if (!currentAction(id, token, actionClient)) return;
       let loadedItems = [],
         itemsError = "";
       if (id && actionClient.listWorkItems) {
@@ -1018,7 +1021,7 @@ export function createBoardView({
     };
     const archived = detail?.task.status === "closed";
     const taskButton = (t) =>
-      `<button data-board-task="${esc(t.id)}" aria-pressed="${t.id === selected}"><span class="board-task-name">${esc(t.name)}</span>${t.goal ? `<span class="fine">${esc(t.goal)}</span>` : ""}</button>`;
+      `<button data-board-task="${esc(t.id)}" data-view-control="task:${esc(t.id)}" aria-pressed="${t.id === selected}"><span class="board-task-name">${esc(t.name)}</span>${t.goal ? `<span class="fine">${esc(t.goal)}</span>` : ""}</button>`;
     const closedTasks = tasks.filter((t) => t.status === "closed");
     const auditSupported = capabilities?.messageAudit?.versions?.includes(2);
     const exportSupported = capabilities?.auditExport?.versions?.includes(2);
@@ -1058,9 +1061,9 @@ export function createBoardView({
         const auditActions = !auditSupported
           ? ""
           : !record?.original
-            ? `<button data-audit-retry="${message.seq}">Retry audit</button>`
-            : `<button data-audit-history="${message.seq}">History</button>${archived ? "" : `<button data-audit-correct-open="${message.seq}">Correct</button>${currentKind === "intake" ? `<button data-audit-resolve-open="${message.seq}">Resolve</button>` : ""}`}`;
-        return `<article class="board-message" data-message="${message.seq}"><div class="board-meta"><strong>${esc(name(message))}</strong><span>${message.to ? "to " + esc(names.get(message.to) || message.to) : "Team announcement"}${message.broadcast ? " · Swarm broadcast" : ""} · ${esc(archived ? new Date(message.createdAt).toLocaleString() : new Date(message.createdAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }))}</span></div>${message.replyTo ? `<div class="reply-context">Reply to #${message.replyTo}: ${esc(messages.find((candidate) => candidate.seq === message.replyTo)?.text.slice(0, 100) || "Earlier message")}</div>` : ""}<div class="board-text">${esc(message.text)}</div>${auditSupported ? auditContextMarkup(record) : ""}<div class="message-footer"><span>${receipt(message)}</span>${archived ? "" : `<button data-reply="${message.seq}">Reply</button>`}${auditActions}</div>${auditHistoryMarkup(record, history)}${archived ? "" : renderAuditEditor(message)}</article>`;
+            ? `<button data-audit-retry="${message.seq}" data-view-control="audit-retry:${message.seq}">Retry audit</button>`
+            : `<button data-audit-history="${message.seq}" data-view-control="audit-history:${message.seq}">History</button>${archived ? "" : `<button data-audit-correct-open="${message.seq}" data-view-control="audit-correct:${message.seq}">Correct</button>${currentKind === "intake" ? `<button data-audit-resolve-open="${message.seq}" data-view-control="audit-resolve:${message.seq}">Resolve</button>` : ""}`}`;
+        return `<article class="board-message" data-message="${message.seq}"><div class="board-meta"><strong>${esc(name(message))}</strong><span>${message.to ? "to " + esc(names.get(message.to) || message.to) : "Team announcement"}${message.broadcast ? " · Swarm broadcast" : ""} · ${esc(archived ? new Date(message.createdAt).toLocaleString() : new Date(message.createdAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }))}</span></div>${message.replyTo ? `<div class="reply-context">Reply to #${message.replyTo}: ${esc(messages.find((candidate) => candidate.seq === message.replyTo)?.text.slice(0, 100) || "Earlier message")}</div>` : ""}<div class="board-text">${esc(message.text)}</div>${auditSupported ? auditContextMarkup(record) : ""}<div class="message-footer"><span>${receipt(message)}</span>${archived ? "" : `<button data-reply="${message.seq}" data-view-control="reply:${message.seq}">Reply</button>`}${auditActions}</div>${auditHistoryMarkup(record, history)}${archived ? "" : renderAuditEditor(message)}</article>`;
       })
       .join("");
     const recoveryMarkup = (
@@ -1087,18 +1090,18 @@ export function createBoardView({
         : "";
     const roster = agents.filter((a) => archived || a.status !== "closed");
     const rosterAgent = (a) =>
-      `<button class="board-agent" ${archived ? "disabled" : `data-board-agent="${esc(a.id)}"`} title="${esc(a.blockedText || a.host + " · " + a.session)}"><span class="status-dot ${a.status === "running" ? "online" : a.status === "needs_input" ? "attention" : ""}"></span>${esc(a.name)}<span class="fine">${esc(status(a))}</span></button>`;
-    const headActions = `${exportSupported ? '<button id="board-audit-export">Export audit</button>' : '<button id="board-download">Legacy JSON · non-snapshot</button>'}${archived ? `<span class="fine">Closed · ${esc(new Date(detail.task.closedAt).toLocaleDateString())}</span>${exportSupported ? '<button id="board-download">Legacy JSON · non-snapshot</button>' : ""}` : '<button id="board-attach">Terminals</button><button id="board-settings" title="Project settings">Settings</button>'}`;
+      `<button class="board-agent" ${archived ? "disabled" : `data-board-agent="${esc(a.id)}" data-view-control="agent:${esc(a.id)}"`} title="${esc(a.blockedText || a.host + " · " + a.session)}"><span class="status-dot ${a.status === "running" ? "online" : a.status === "needs_input" ? "attention" : ""}"></span>${esc(a.name)}<span class="fine">${esc(status(a))}</span></button>`;
+    const headActions = `${exportSupported ? '<button id="board-audit-export" data-view-control="audit-export">Export audit</button>' : '<button id="board-download" data-view-control="download">Legacy JSON · non-snapshot</button>'}${archived ? `<span class="fine">Closed · ${esc(new Date(detail.task.closedAt).toLocaleDateString())}</span>${exportSupported ? '<button id="board-download" data-view-control="download">Legacy JSON · non-snapshot</button>' : ""}` : '<button id="board-attach" data-view-control="attach">Terminals</button><button id="board-settings" data-view-control="settings" title="Project settings">Settings</button>'}`;
     renderedTask = selected;
     renderedClient = client();
-    root.innerHTML = `<div class="board mode-board"><aside class="board-rail"><div class="board-rail-head"><span class="eyebrow">PROJECTS</span><button id="board-new-task" title="New project">＋</button></div>${tasks
+    root.innerHTML = `<div class="board mode-board"><aside class="board-rail"><div class="board-rail-head"><span class="eyebrow">PROJECTS</span><button id="board-new-task" data-view-control="new-task" title="New project">＋</button></div>${tasks
       .filter((t) => t.status === "open")
       .map(taskButton)
       .join(
         "",
-      )}${closedTasks.length ? `<details class="board-closed" data-view-disclosure="closed" ${archived ? "open" : ""}><summary>Closed projects · ${closedTasks.length}</summary>${closedTasks.map(taskButton).join("")}</details>` : ""}</aside><section class="board-thread">${
+      )}${closedTasks.length ? `<details class="board-closed" data-view-disclosure="closed" ${archived ? "open" : ""}><summary data-view-control="closed-projects">Closed projects · ${closedTasks.length}</summary>${closedTasks.map(taskButton).join("")}</details>` : ""}</aside><section class="board-thread">${
       detail
-        ? `<div class="board-head"><div class="view-heading"><div><span class="eyebrow">BOARD</span><h2>${esc(detail.task.name)}</h2></div><div class="view-actions">${headActions}</div></div><p class="fine">${esc(detail.task.goal)}</p>${cacheFeedback(client()?.cacheStatus?.().label) ? `<span class="fine hub-sync-status" role="status">${esc(cacheFeedback(client()?.cacheStatus?.().label))}</span>` : ""}<div class="project-team-heading">${roster.length ? `<button type="button" class="project-team-toggle" data-team-toggle data-view-control="team" aria-label="${teamExpanded(detail.task, roster.length) ? "Hide team" : "Show team"}" aria-expanded="${teamExpanded(detail.task, roster.length)}" aria-controls="board-team-roster"><span class="project-team-chevron" aria-hidden="true">›</span><span>Team · ${roster.length}</span></button>` : ""}${archived ? "" : '<button id="board-add-agent">＋ Agent</button>'}</div>${
+        ? `<div class="board-head"><div class="view-heading"><div><span class="eyebrow">BOARD</span><h2>${esc(detail.task.name)}</h2></div><div class="view-actions">${headActions}</div></div><p class="fine">${esc(detail.task.goal)}</p>${cacheFeedback(client()?.cacheStatus?.().label) ? `<span class="fine hub-sync-status" role="status">${esc(cacheFeedback(client()?.cacheStatus?.().label))}</span>` : ""}<div class="project-team-heading">${roster.length ? `<button type="button" class="project-team-toggle" data-team-toggle data-view-control="team" aria-label="${teamExpanded(detail.task, roster.length) ? "Hide team" : "Show team"}" aria-expanded="${teamExpanded(detail.task, roster.length)}" aria-controls="board-team-roster"><span class="project-team-chevron" aria-hidden="true">›</span><span>Team · ${roster.length}</span></button>` : ""}${archived ? "" : '<button id="board-add-agent" data-view-control="add-agent">＋ Agent</button>'}</div>${
             roster.some((a) => a.status === "needs_input")
               ? `<div class="board-agents-row project-team-attention" aria-label="Needs you">${roster
                   .filter((a) => a.status === "needs_input")
@@ -1113,7 +1116,7 @@ export function createBoardView({
             )}</div></div>${renderDecisionPanel({ records: decisions, taskId: selected, archived, name, drafts: decisionDrafts, sending: decisionSending, errors: decisionErrors, revealedAnswers, historyOpen: decisionPresentation.get(selected)?.historyOpen, loadError: decisionLoadError })}${renderOwnerRequests(ownerRequests, { archived, sending: ownerSending, errors: ownerErrors })}${recoveryMarkup}<div id="board-messages" class="board-messages">${messages.length === 200 && !completeConversations.has(selected) ? `<p class="fine">Latest 200 messages.${archived ? ' <button id="board-full-history">Show full conversation</button>' : " Full history remains on the hub."}</p>` : ""}${messageMarkup}</div>${
             archived
               ? ""
-              : `<form id="board-compose">${d.replyTo ? `<div class="compose-reply">Replying to #${d.replyTo}<button type="button" id="board-cancel-reply">Cancel reply</button></div>` : ""}<label class="compose-recipient">To<select ${sending.has(selected) ? "disabled" : ""} id="board-to" data-view-control="recipient" aria-label="Recipient"><option value="">Everyone</option>${agents
+              : `<form id="board-compose">${d.replyTo ? `<div class="compose-reply">Replying to #${d.replyTo}<button type="button" id="board-cancel-reply" data-view-control="cancel-reply">Cancel reply</button></div>` : ""}<label class="compose-recipient">To<select ${sending.has(selected) ? "disabled" : ""} id="board-to" data-view-control="recipient" aria-label="Recipient"><option value="">Everyone</option>${agents
                   .filter((a) => a.status !== "closed")
                   .map(
                     (a) =>

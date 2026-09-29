@@ -1,0 +1,30 @@
+
+
+[38;5;239m[48;5;237m❯ [38;5;231mWithout using tools, offer three numbered options for naming a Go test helper that reads a [39m
+  [38;5;231mfixture file, then ask which one I want.[39m
+[49m
+[38;5;231m⏺[39m 1. [38;5;153mreadFixture[39m
+  2. [38;5;153mloadTestdata[39m
+  3. [38;5;153mmustReadFixture[39m
+
+  Which one do you want?
+
+[38;5;246m✻[39m [38;5;246mCooked for 1s · done 1:48 PM[39m
+
+[38;5;239m[48;5;237m❯ [38;5;231mRun ls hub/cmd/tt | head -3, show the output, then ask whether I want the full list or only test [39m
+  [38;5;231mfiles.[39m
+
+[49m  [38;5;246mListed [1m1[0m[38;5;246m directory [39m
+
+[38;5;231m⏺[39m [38;5;153mackdiscipline_test.go[39m
+  [38;5;153mactivity_monitor.go[39m
+  [38;5;153mactivity_observer.go[39m
+
+  Do you want the full list, or only the test files?
+
+[38;5;246m✻[39m [38;5;246mBrewed for 4s · done 1:49 PM[39m
+                                                                      [38;5;246mCtrl+Y to paste deleted text[39m
+[38;5;244m────────────────────────────────────────────────────────────────────────────────────────────────────
+[39m❯ hello there
+[38;5;244m────────────────────────────────────────────────────────────────────────────────────────────────────
+[39m  [38;5;211m⏵⏵ bypass permissions on[38;5;246m (shift+tab to cycle)[39m

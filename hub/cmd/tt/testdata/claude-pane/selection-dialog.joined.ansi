@@ -1,0 +1,30 @@
+  3. It asked Allow this tool?                                                                      
+  4. Then: Do you want to proceed?                                                                  
+  5. A menu said Select an option.                                                                  
+  6. The shell asked (y/n).
+
+[38;5;246m✻[39m [38;5;246mCooked for 3s · done 3:18 PM[39m                                                                      
+                                                                                                    
+[38;5;239m[48;5;237m❯ [38;5;231mRun this exact Bash command: touch /private/tmp/claude-501/-Users-stephenspeicher-projects-tailte[39m 
+  [38;5;231mrm/566a176c-b628-4b00-9734-4c8cc7e81e62/scratchpad/cap2/work/x[39m                                    
+[49m                                    
+  [38;5;246mRan [1m1[0m[38;5;246m shell command [39m                   
+[38;5;246m  ⎿  Interrupted · What should Claude do instead?[39m                                                   
+                                          
+[38;5;246m✻[39m [38;5;246mBrewed for 1s · done 3:19 PM[39m                                                                      
+
+[38;5;239m[48;5;237m❯ [38;5;231mUse your AskUserQuestion tool to ask me to pick A or B (two options). Do nothing else.[39m            
+[38;5;246m[49m────────────────────────────────────────────────────────────────────────────────────────────────────
+[38;5;16m[48;5;153m ☐ Choice [39m[49m                                       
+
+[1m[38;5;231mWhich do you pick: A or B?[0m                                                                          
+                                        
+[38;5;153m❯[39m [38;5;246m1.[39m [38;5;153mA[39m                                                                                              
+     [38;5;246mOption A
+[39m  [38;5;246m2.[39m B                                                                                            
+     [38;5;246mOption B[39m                                                                                       
+  [38;5;246m3. Type something.[39m                                                                              
+[38;5;246m────────────────────────────────────────────────────────────────────────────────────────────────────
+[39m  4. Chat about this                                                                    
+
+[38;5;246mEnter to select · ↑/↓ to navigate · Esc to cancel[39m       

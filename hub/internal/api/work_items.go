@@ -83,6 +83,20 @@ type CreateWorkItemUpdate struct {
 	RunID            string              `json:"runId,omitempty"`
 	RequestID        string              `json:"requestId"`
 	CompletionReport *NarrativeReportPin `json:"completionReport,omitempty"`
+	// QueueAcceptance records the leased handler's team queue acceptance in
+	// the same transaction as a done save. The hub fills the repository, base,
+	// item revision and completion report from the entry and the saved item.
+	QueueAcceptance *WorkItemQueueAcceptance `json:"queueAcceptance,omitempty"`
+}
+
+// WorkItemQueueAcceptance is the Git tuple of the accepted builder result for
+// the item's running team queue entry.
+type WorkItemQueueAcceptance struct {
+	EntryID  string `json:"entryId"`
+	Worktree string `json:"worktree"`
+	Branch   string `json:"branch"`
+	Commit   string `json:"commit"`
+	Evidence string `json:"evidence,omitempty"`
 }
 
 // NarrativeReportPin is verified atomically when a feature first transitions

@@ -48,7 +48,7 @@ tt team queue policy --task tsk_... --policy-version 1 --expires RFC3339 --sessi
 tt team queue limit --task tsk_... --limit 2
 tt team queue list --task tsk_...
 tt team queue replace-lead --task tsk_... --entry tqe_... --lead-agent agt_...
-tt team queue accept --task tsk_... --entry tqe_... --worktree /absolute/builder/worktree --branch feature/name --commit FULL_SHA --evidence 'handler-saved acceptance receipt'
+tt team queue accept --task tsk_... --entry tqe_... --worktree /absolute/builder/worktree --branch feature/name --commit FULL_SHA --evidence 'handler-saved acceptance receipt'  # recovery only
 tt team queue reorder --task tsk_... --entry tqe_... --before tqe_...
 tt team queue remove --task tsk_... --entry tqe_...
 tt team queue release --task tsk_... --entry tqe_...
@@ -103,11 +103,30 @@ continue; ownership blocked by the failed entry waits for an explicit verified
 release. Pausing the project stops launch ticks. The deliberate agent Queue is
 separate.
 
-After the database handler saves terminal acceptance, that exact assigned
-handler records the accepted builder worktree, branch, full SHA and saved
-acceptance evidence with `team queue accept`. Its retry key is stable and pins
-the exact item revision and completion report. The runner waits for this
-receipt and exact team close and cleanup receipts. It verifies that the
+The exact assigned database handler records the accepted builder worktree,
+branch and full SHA in the same save that marks the item done:
+
+```sh
+tt work-items update wi_... --revision N --request-id KEY --status done --worktree /absolute/builder/worktree --branch feature/name --commit FULL_SHA
+```
+
+tt checks the Git tuple on the host first; the hub then applies exactly the
+`team queue accept` rules (exact leased handler run, verified base and
+repository for an enrolled item, accepted review candidate, saved item
+revision and completion report) in the save's own transaction, and enqueues the
+release job for an exact-SHA verification receipt. Any refusal leaves the item
+open and the entry unaccepted. The evidence defaults to the saved completion
+receipt. When the receipt lets a bug close with known failures that name it now
+passing, the acceptance records them as `resolvedKnownFailures`; the hub
+derives that field and refuses a client-supplied one. While an entry waits, the hub refuses a handler done save without the
+tuple, so acceptance is no longer a separate step. A retried save with the same
+request key replays its receipt without a second acceptance or release job.
+
+`team queue accept` stays as the idempotent recovery path, for example after
+an owner saved the item done: re-running it with the saved tuple changes
+nothing, and a different tuple is refused. Its retry key is stable and pins the
+exact item revision and completion report. The runner waits for the acceptance
+and exact team close and cleanup receipts. It verifies that the
 accepted worktree still has the saved branch, commit, repository, base ancestry
 and a clean tree; a later HEAD cannot replace the accepted SHA. Then the item
 becomes **Ready to integrate**. The saved tuple and evidence appear in the
@@ -115,8 +134,8 @@ queue and Projects Delivery panel. The
 owner performs any merge, push or deployment separately. Dismissed items have
 no integration record.
 
-Both primary and auxiliary handler briefings include the exact queue acceptance
-step. A done repository-backed entry without its receipt remains running and
+Both primary and auxiliary handler briefings include the done save with its
+acceptance tuple and the recovery command. A done repository-backed entry without its receipt remains running and
 the queue list and Delivery panel say **Waiting for handler acceptance**. If
 the host census or limiter domain fails, the runner reports that error and
 holds new parallel launch effects while serial projects and already-running

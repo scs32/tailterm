@@ -36,6 +36,8 @@ Commands
   status                       identity, hub reachability, own agent, unread count
   projects                     list projects on the hub (tasks is an alias)
   project-pause <get|pause|handoff|resume>  explicit project team lifecycle
+  handler <rotate|rotation|policy|spec>  rotate a project's database handler (owner)
+  prompt-policy <get|set>      runtime prompt policy per prompt kind (set: owner)
   deployment <list|enqueue|claim|check|verification|merged|finish|block>  release ledger
   verification <plan|receipt|history|enrollment>  handler-owned native verification records
   work-items <command>         list/get/create/update/dispatch/history/evidence for bugs and features
@@ -182,6 +184,10 @@ func main() {
 		err = cmdStatus(e)
 	case "tasks", "projects":
 		err = cmdTasks(e, args)
+	case "handler":
+		err = cmdHandler(e, args)
+	case "prompt-policy":
+		err = cmdPromptPolicy(e, args)
 	case "project-pause":
 		err = cmdProjectPause(e, args)
 	case "deployment":
@@ -372,6 +378,13 @@ func cmdAgents(e env, args []string) error {
 		fmt.Printf("%s %s  %-12s %-12s %s@%s%s activity=%s unread=%d\n", self, a.ID, a.Status, a.Name, a.Session, a.Host, role, activity, a.Unread)
 		if a.Activity != nil {
 			fmt.Printf("  last-transition tokens=%d observed=%s pending=%s since=%s\n", a.Activity.Tokens.Total, a.Activity.ObservedAt.Format(time.RFC3339), a.Activity.PendingTool, a.Activity.PendingSince.Format(time.RFC3339))
+			if p := a.Activity.Prompt; p != nil {
+				fmt.Printf("  runtime-prompt kind=%s action=%s outcome=%s since=%s", p.Kind, p.Action, p.Outcome, p.Since.Format(time.RFC3339))
+				if p.Reason != "" {
+					fmt.Printf(" reason=%q", p.Reason)
+				}
+				fmt.Println()
+			}
 		}
 	}
 	return nil
@@ -427,6 +440,50 @@ func resolveAgent(ctx context.Context, c *api.Client, task, ref string) (string,
 		}
 	}
 	return "", fmt.Errorf("no open agent named %q on this task", ref)
+}
+
+// resolveRecipient resolves a message recipient like resolveAgent, but a
+// handler closed by a committed rotation forwards to its live successor. It
+// returns the recipient's ID and current name. Lifecycle commands keep
+// resolveAgent, so retire or resume never follows a rotation.
+func resolveRecipient(ctx context.Context, c *api.Client, task, ref string) (string, string, error) {
+	if ref == "" {
+		return "", "", nil
+	}
+	agents, err := c.ListAgents(ctx, task)
+	if err != nil {
+		return "", "", err
+	}
+	byID := map[string]api.Agent{}
+	for _, a := range agents {
+		byID[a.ID] = a
+	}
+	var start *api.Agent
+	for i, a := range agents {
+		if (a.ID == ref || a.Name == ref) && a.Status != api.AgentClosed {
+			return a.ID, a.Name, nil
+		}
+		if (a.ID == ref || a.Name == ref) && a.SuccessorID != "" {
+			start = &agents[i]
+		}
+	}
+	if start != nil {
+		current := *start
+		for range len(agents) {
+			next, ok := byID[current.SuccessorID]
+			if !ok {
+				break
+			}
+			if next.Status != api.AgentClosed && next.Status != api.AgentExited {
+				return next.ID, next.Name, nil
+			}
+			current = next
+		}
+	}
+	if api.ValidID(ref, "agt") {
+		return ref, "", nil
+	}
+	return "", "", fmt.Errorf("no open agent named %q on this task", ref)
 }
 
 func resolveCloseAgent(ctx context.Context, c *api.Client, task, ref string) (string, error) {
@@ -489,7 +546,7 @@ func cmdPost(e env, args []string) error {
 	}
 	ctx, cancel := ctxTimeout(10 * time.Second)
 	defer cancel()
-	target, err := resolveAgent(ctx, c, *task, *to)
+	target, _, err := resolveRecipient(ctx, c, *task, *to)
 	if err != nil {
 		return fmt.Errorf("%w; --to accepts agents only. To reply to a human, use tt post --reply-to SEQ \"message\" without --to (shared board reply)", err)
 	}
@@ -821,6 +878,7 @@ func cmdSpawn(e env, args []string) error {
 	plannedTeamMembers := fs.Int("planned-team-members", 0, "planned non-database team members for this launch (1-32)")
 	teamLeadName := fs.String("team-lead-name", "", "frozen item-team lead for this launch briefing")
 	teamHandlerID := fs.String("team-handler-id", "", "exact leased item-team handler for this launch briefing")
+	handlerSuccessor := fs.Bool("handler-successor", false, "brief this database handler as a rotation successor (set by tt handler rotate)")
 	run := fs.String("run", "", "command to run in the agent window (required)")
 	cwd := fs.String("cwd", "", "working directory")
 	prompt := fs.String("prompt", "", "appended to the command as a quoted argument")
@@ -1047,10 +1105,14 @@ func cmdSpawn(e env, args []string) error {
 	if *teamLeadName != "" && *workItemID != "" {
 		detail.Task.Orchestrator = *teamLeadName
 	}
+	detail.Agents = primaryHandlerFirst(detail.Task, detail.Agents)
 	if *teamHandlerID != "" && *workItemID != "" {
 		detail.Agents = handlerFirst(detail.Agents, *teamHandlerID)
 	}
-	briefing := agentTaskBriefingForLaunch(detail.Task, *name, *role, launcherSelfPath, detail.Agents, *plannedTeamMembers)
+	if *handlerSuccessor && *role != api.AgentRoleDatabaseHandler {
+		return errors.New("--handler-successor requires --role database_handler")
+	}
+	briefing := agentTaskBriefingForHandler(detail.Task, *name, *role, launcherSelfPath, detail.Agents, *plannedTeamMembers, *handlerSuccessor)
 	if *permissionMode != "" {
 		briefing += "\nRequested launch permission mode: " + *permissionMode + ". Permission denials are real failures, not approvals. Do not repeat an unchanged denied action. Report a precise Permission blocked status to the orchestrator and continue independent permitted work."
 	}
@@ -1083,6 +1145,9 @@ func cmdSpawn(e env, args []string) error {
 		Name: *name, Host: spawn.Host(), Session: session,
 		Runtime: *runtime, Cwd: *cwd, ParentAgentID: parent,
 	}
+	if *role == api.AgentRoleDatabaseHandler {
+		req.TemplateDigest = handlerTemplateDigest(*prompt)
+	}
 	if itemFlagCount > 0 {
 		contextData, readErr := readPreparedWorkContext(*workContextJSON, *workContextFile)
 		if readErr != nil {
@@ -1109,6 +1174,11 @@ func cmdSpawn(e env, args []string) error {
 	}
 	if socket := os.Getenv("TT_TMUX_SOCKET"); socket != "" {
 		opts.Env["TT_TMUX_SOCKET"] = socket
+	}
+	if *runtime == "claude" {
+		// Claude Code's prompt suggestion fills the input the relay inspects
+		// before a wake; the relay also tells it apart from typed text.
+		opts.Env["CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION"] = "0"
 	}
 	var agent api.Agent
 	if *role == api.AgentRoleDatabaseHandler || *role == api.AgentRoleDeployment {

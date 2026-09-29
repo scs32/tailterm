@@ -26,6 +26,9 @@ type AgentActivity struct {
 	Tokens       TokenTotals  `json:"tokens"`
 	Reason       string       `json:"reason,omitempty"`
 	Wake         *WakeOutcome `json:"wake,omitempty"`
+	// Prompt is set only with state runtime_prompt: the runtime is waiting on
+	// its own modal prompt rather than at its input.
+	Prompt *RuntimePrompt `json:"prompt,omitempty"`
 }
 
 // WakeOutcome is independent of execution state. A safe skip can be visible

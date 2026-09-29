@@ -10,11 +10,16 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/scs32/tailterm/hub/internal/api"
 )
@@ -51,6 +56,8 @@ type claudeWakeSnapshot struct {
 	Offset    int64
 	Screen    string
 	Cursor    activityCursor
+	// UnknownTypes lists transcript record types the idle check ignored.
+	UnknownTypes []string
 }
 
 type claudeWakeOps struct {
@@ -79,20 +86,62 @@ func claudeWakeNonce() (string, error) {
 	return hex.EncodeToString(raw[:]), nil
 }
 
-// A captured pane is accepted only with a single, empty Claude input line.
-// Unknown footers, choices, a cursor in an editor, and multiline input fail
-// closed. ANSI escapes are not requested from capture-pane.
-func emptyClaudeInput(screen string) bool {
-	lines := strings.Split(strings.TrimRight(screen, "\n"), "\n")
-	if len(lines) == 0 {
-		return false
-	}
-	for _, line := range lines {
-		lower := strings.ToLower(line)
-		if strings.Contains(lower, "allow this") || strings.Contains(lower, "do you want to proceed") || strings.Contains(lower, "esc to cancel") || strings.Contains(lower, "select an option") || strings.Contains(lower, "(y/n)") || strings.Contains(lower, "[y/n]") {
-			return false
+// claudeDialogPhrases mark a permission, selection or confirmation prompt.
+var claudeDialogPhrases = []string{"allow this", "do you want to proceed", "esc to cancel", "select an option", "(y/n)", "[y/n]"}
+
+// claudePromptArea returns the rows of a plain Claude capture that belong to
+// the active prompt, and whether an input box bounds them. The area runs from
+// the input box's top rule, the rule directly above the last ❯ row, to the end
+// of the capture; the transcript above it (answers that quote a dialog, for
+// example) is not part of it. With no ❯ row, or no rule directly above it (a
+// dialog's "❯ 1. Yes" row, an unknown layout), the whole capture is the area,
+// so anything the rule cannot place is still checked everywhere.
+func claudePromptArea(lines []string) ([]string, bool) {
+	input := -1
+	for i, line := range lines {
+		if strings.HasPrefix(strings.TrimSpace(line), "❯") {
+			input = i
 		}
 	}
+	if input >= 1 && claudeRuleLine(lines[input-1]) {
+		return lines[input-1:], true
+	}
+	return lines, false
+}
+
+func claudeRuleLine(line string) bool {
+	trimmed := strings.TrimSpace(line)
+	return trimmed != "" && strings.Trim(trimmed, "─") == ""
+}
+
+// claudeDialog names the lowest dialog phrase in the active prompt area, the
+// one nearest a live dialog footer, and its 1-based row there. The text is
+// stable for an unchanged screen, so the relay logs a steady refusal once.
+func claudeDialog(screen string) (string, bool) {
+	area, boxed := claudePromptArea(strings.Split(strings.TrimRight(screen, "\n"), "\n"))
+	for i := len(area) - 1; i >= 0; i-- {
+		lower := strings.ToLower(area[i])
+		for _, phrase := range claudeDialogPhrases {
+			if strings.Contains(lower, phrase) {
+				where := fmt.Sprintf("prompt area row %d", i+1)
+				if !boxed {
+					where = fmt.Sprintf("capture row %d (no input box, whole capture checked)", i+1)
+				}
+				return fmt.Sprintf("%q in %s", phrase, where), true
+			}
+		}
+	}
+	return "", false
+}
+
+// A captured pane is accepted only with a single, empty Claude input line in
+// the active prompt area. Unknown footers, choices, a cursor in an editor, and
+// multiline input fail closed. ANSI escapes are not requested from capture-pane.
+func emptyClaudeInput(screen string) bool {
+	if claudeBlockedScreen(screen) {
+		return false
+	}
+	lines, _ := claudePromptArea(strings.Split(strings.TrimRight(screen, "\n"), "\n"))
 	input := -1
 	for i, line := range lines {
 		trimmed := strings.TrimSpace(line)
@@ -118,11 +167,10 @@ func emptyClaudeInput(screen string) bool {
 	return true
 }
 
+// claudeBlockedScreen reports a dialog phrase in the active prompt area.
 func claudeBlockedScreen(screen string) bool {
-	lower := strings.ToLower(screen)
-	return strings.Contains(lower, "allow this") || strings.Contains(lower, "do you want to proceed") ||
-		strings.Contains(lower, "esc to cancel") || strings.Contains(lower, "select an option") ||
-		strings.Contains(lower, "(y/n)") || strings.Contains(lower, "[y/n]")
+	_, blocked := claudeDialog(screen)
+	return blocked
 }
 
 func exactClaudeInput(screen, expected string) bool {
@@ -165,7 +213,92 @@ func exactClaudeInput(screen, expected string) bool {
 	return strings.Join(strings.Fields(strings.Join(parts, " ")), " ") == strings.Join(strings.Fields(expected), " ")
 }
 
-func claudeTranscriptSnapshot(b runtimeBinding) (claudeWakeSnapshot, error) {
+// claudeQueueStaleAfter bounds how long queued input can hold a wake after a
+// completed turn. Claude Code dequeues queued input within about 50 ms of a
+// turn ending, so an older unmatched enqueue is drift (an unrecorded removal,
+// for example) and the pane check decides instead.
+const claudeQueueStaleAfter = 30 * time.Second
+
+// claudeQueueFresh reports input Claude Code queued recently enough that a new
+// turn is about to start from it.
+func claudeQueueFresh(c activityCursor, now time.Time) bool {
+	return c.ClaudeQueued > 0 && now.Sub(c.ClaudeQueuedAt) < claudeQueueStaleAfter
+}
+
+// claudeRecordLog remembers which unrecognized transcript record types this
+// relay process has already logged, so each is reported once.
+var claudeRecordLog struct {
+	sync.Mutex
+	seen map[string]bool
+}
+
+const claudeRecordLogCap = 64
+
+// logClaudeRecordOnce writes one relay log line per key per process. The set
+// is capped so a transcript full of novel types cannot grow it without bound.
+func logClaudeRecordOnce(key, format string, args ...any) {
+	claudeRecordLog.Lock()
+	if claudeRecordLog.seen == nil {
+		claudeRecordLog.seen = map[string]bool{}
+	}
+	if claudeRecordLog.seen[key] || len(claudeRecordLog.seen) >= claudeRecordLogCap {
+		claudeRecordLog.Unlock()
+		return
+	}
+	claudeRecordLog.seen[key] = true
+	claudeRecordLog.Unlock()
+	fmt.Fprintf(os.Stderr, format, args...)
+}
+
+// claudeRecordSample describes a transcript record without its content:
+// the sorted top-level key names plus the short scalar values of type,
+// subtype, operation and reason. Transcripts carry prompts and tool output,
+// so message and content strings are never included.
+func claudeRecordSample(line []byte) string {
+	var fields map[string]json.RawMessage
+	if json.Unmarshal(line, &fields) != nil {
+		return "unparsable"
+	}
+	keys := make([]string, 0, len(fields))
+	for key := range fields {
+		// Key names are schema, but keep an odd one from splitting the line.
+		key = strings.Map(func(r rune) rune {
+			if unicode.IsLetter(r) || unicode.IsDigit(r) || strings.ContainsRune("_-.", r) {
+				return r
+			}
+			return '?'
+		}, key)
+		keys = append(keys, claudeClip(key, 64))
+	}
+	slices.Sort(keys)
+	sample := "keys=[" + strings.Join(keys, " ") + "]"
+	for _, key := range []string{"type", "subtype", "operation", "reason"} {
+		var value string
+		if raw, ok := fields[key]; ok && json.Unmarshal(raw, &value) == nil && len(value) <= 64 {
+			sample += fmt.Sprintf(" %s=%q", key, value)
+		}
+	}
+	return claudeClip(sample, 200)
+}
+
+// claudeClip shortens value to at most limit bytes on a rune boundary.
+func claudeClip(value string, limit int) string {
+	if len(value) <= limit {
+		return value
+	}
+	cut := limit - len("…")
+	for cut > 0 && !utf8.RuneStart(value[cut]) {
+		cut--
+	}
+	return value[:cut] + "…"
+}
+
+// claudeTranscriptSnapshot reads the whole transcript and decides idleness
+// from turn state: a completed turn, no pending tool call and no freshly
+// queued input. A record type the parser does not know is logged once and
+// otherwise ignored, so the pane check decides; other parse errors still
+// refuse unless a later completed turn supersedes them.
+func claudeTranscriptSnapshot(b runtimeBinding, now time.Time) (claudeWakeSnapshot, error) {
 	path, err := activityTranscript(b)
 	if err != nil || path == "" {
 		return claudeWakeSnapshot{}, errors.New("Claude transcript unavailable")
@@ -173,9 +306,19 @@ func claudeTranscriptSnapshot(b runtimeBinding) (claudeWakeSnapshot, error) {
 	var cursor activityCursor
 	strictUnknown := false
 	unknownReason := ""
+	var unknownTypes []string
 	for i := 0; i < 128; i++ {
 		if err := readActivityAppend(path, &cursor, func(line []byte, cursor *activityCursor) error {
 			err := parseClaudeActivity(line, cursor)
+			var unknown unknownClaudeRecordError
+			if errors.As(err, &unknown) {
+				kind := claudeClip(unknown.Type, 64)
+				if !slices.Contains(unknownTypes, kind) {
+					unknownTypes = append(unknownTypes, kind)
+					logClaudeRecordOnce("type/"+kind, "[tt relay] %s %s Claude transcript record type %q not recognized; idle from turn state and pane check; sample=%s\n", now.UTC().Format(time.RFC3339), b.Agent, kind, claudeRecordSample(line))
+				}
+				return nil
+			}
 			if err != nil {
 				strictUnknown = true
 				if unknownReason == "" {
@@ -183,7 +326,7 @@ func claudeTranscriptSnapshot(b runtimeBinding) (claudeWakeSnapshot, error) {
 				}
 			} else if cursor.TurnComplete && claudeCompletedRecord(line) {
 				// A later fully completed turn supersedes an older malformed
-				// record. Unknown data after that boundary still blocks input.
+				// record. Malformed data after that boundary still blocks input.
 				strictUnknown, unknownReason = false, ""
 			}
 			return err
@@ -194,10 +337,31 @@ func claudeTranscriptSnapshot(b runtimeBinding) (claudeWakeSnapshot, error) {
 			break
 		}
 	}
-	if !cursor.Ready || cursor.Unknown || strictUnknown || !cursor.SeenTurn || !cursor.TurnComplete || len(cursor.Pending) != 0 {
-		return claudeWakeSnapshot{}, fmt.Errorf("Claude transcript busy, incomplete, or unknown: %s", unknownReason)
+	reason := ""
+	switch {
+	case !cursor.Ready:
+		reason = "transcript incomplete"
+	case !cursor.SeenTurn:
+		reason = "no completed turn yet"
+	case !cursor.TurnComplete:
+		reason = "turn in progress"
+	case len(cursor.Pending) != 0:
+		ids := slices.Sorted(maps.Keys(cursor.Pending))
+		reason = "tool call pending: " + cursor.Pending[ids[0]].Name
+	case claudeQueueFresh(cursor, now):
+		reason = fmt.Sprintf("queued input pending (%d)", cursor.ClaudeQueued)
+	case strictUnknown:
+		reason = unknownReason
+	case cursor.Unknown:
+		reason = "transcript format unknown"
 	}
-	return claudeWakeSnapshot{Path: path, FileID: cursor.FileID, Offset: cursor.Offset, Cursor: cursor}, nil
+	if reason != "" {
+		return claudeWakeSnapshot{}, fmt.Errorf("Claude transcript busy, incomplete, or unknown: %s", reason)
+	}
+	if cursor.ClaudeQueued > 0 {
+		logClaudeRecordOnce("queue-operation/stale", "[tt relay] %s %s Claude transcript has %d queued input older than %s after a completed turn; idle from turn state and pane check\n", now.UTC().Format(time.RFC3339), b.Agent, cursor.ClaudeQueued, claudeQueueStaleAfter)
+	}
+	return claudeWakeSnapshot{Path: path, FileID: cursor.FileID, Offset: cursor.Offset, Cursor: cursor, UnknownTypes: unknownTypes}, nil
 }
 
 func claudeCompletedRecord(line []byte) bool {
@@ -213,12 +377,31 @@ func claudeCompletedRecord(line []byte) bool {
 	return rec.Type == "result" || rec.Type == "assistant" && rec.Message.StopReason == "end_turn"
 }
 
-func nativeClaudeInspect(ctx context.Context, b runtimeBinding, expected string) (claudeWakeSnapshot, error) {
-	// Discovery requires one pane, the exact tmux run environment and one live
-	// Claude process descended from that pane. It also checks creation identity.
-	receipt, err := nativeRuntimeDiscovery(ctx, b, api.Agent{Runtime: "claude"})
+// runtimePane is one exact-identity capture of an owned runtime pane.
+type runtimePane struct {
+	Pane      string
+	SessionID string
+	Created   string
+	PanePID   int
+	CursorX   int
+	CursorY   int
+	Raw       string
+}
+
+// inspectRuntimePane captures the one pane of a binding's tmux session after
+// proving its identity. Discovery requires one pane, the exact tmux run
+// environment and one live runtime process descended from that pane. It also
+// checks creation identity and that the pane is not in a copy or view mode.
+// name prefixes errors ("Claude", "Codex"). -e keeps text attributes; joined
+// adds -J, which unwraps wrapped lines.
+func inspectRuntimePane(ctx context.Context, b runtimeBinding, name string, joined bool) (runtimePane, error) {
+	runtime := b.Runtime
+	if runtime == "" {
+		runtime = "codex"
+	}
+	receipt, err := nativeRuntimeDiscovery(ctx, b, api.Agent{Runtime: runtime})
 	if err != nil {
-		return claudeWakeSnapshot{}, fmt.Errorf("Claude pane identity unavailable: %w", err)
+		return runtimePane{}, fmt.Errorf("%s pane identity unavailable: %w", name, err)
 	}
 	fields := []string{"session_id", "session_created", "session_name", "TAILTERM_HUB", "TAILTERM_TASK", "TAILTERM_AGENT", "TAILTERM_RUN", "pane_id", "pane_pid", "pane_in_mode", "cursor_x", "cursor_y"}
 	for i, field := range fields {
@@ -226,7 +409,7 @@ func nativeClaudeInspect(ctx context.Context, b runtimeBinding, expected string)
 	}
 	raw, err := startupTmux(ctx, "list-panes", "-s", "-t", b.Session, "-F", "["+strings.Join(fields, ",")+"]")
 	if err != nil {
-		return claudeWakeSnapshot{}, fmt.Errorf("Claude pane unavailable: %w", err)
+		return runtimePane{}, fmt.Errorf("%s pane unavailable: %w", name, err)
 	}
 	lines := strings.Split(strings.TrimSpace(string(raw)), "\n")
 	var row []string
@@ -234,41 +417,219 @@ func nativeClaudeInspect(ctx context.Context, b runtimeBinding, expected string)
 		row[0] != receipt.SessionID || row[1] != receipt.SessionCreated || row[2] != b.Session ||
 		row[3] != b.Hub || row[4] != b.Task || row[5] != b.Agent || row[6] != b.Run ||
 		row[8] != fmt.Sprint(receipt.PanePID) || row[9] != "0" || row[7] == "" {
-		return claudeWakeSnapshot{}, errors.New("Claude pane identity changed or pane is in a mode")
+		return runtimePane{}, fmt.Errorf("%s pane identity changed or pane is in a mode", name)
 	}
 	cursorX, xerr := strconv.Atoi(row[10])
 	cursorY, yerr := strconv.Atoi(row[11])
 	if xerr != nil || yerr != nil || cursorY < 0 || cursorX < 0 {
-		return claudeWakeSnapshot{}, errors.New("Claude cursor identity unavailable")
+		return runtimePane{}, fmt.Errorf("%s cursor identity unavailable", name)
 	}
-	args := []string{"capture-pane", "-p", "-t", row[7]}
-	if expected != "" {
+	args := []string{"capture-pane", "-p", "-e", "-t", row[7]}
+	if joined {
 		args = append(args, "-J")
 	}
 	screen, err := startupTmux(ctx, args...)
 	if err != nil {
-		return claudeWakeSnapshot{}, fmt.Errorf("Claude pane capture unavailable: %w", err)
+		return runtimePane{}, fmt.Errorf("%s pane capture unavailable: %w", name, err)
 	}
-	visible := string(screen)
-	if claudeBlockedScreen(visible) {
-		return claudeWakeSnapshot{}, errors.New("Claude pane has a permission or selection prompt")
+	return runtimePane{Pane: row[7], SessionID: row[0], Created: row[1], PanePID: receipt.PanePID, CursorX: cursorX, CursorY: cursorY, Raw: string(screen)}, nil
+}
+
+func nativeClaudeInspect(ctx context.Context, b runtimeBinding, expected string) (claudeWakeSnapshot, error) {
+	// -e keeps text attributes, so Claude's faint prompt suggestion can be told
+	// apart from typed input that reads the same.
+	pane, err := inspectRuntimePane(ctx, b, "Claude", expected != "")
+	if err != nil {
+		return claudeWakeSnapshot{}, err
+	}
+	visible, err := claudeInputScreen(pane.Raw, pane.CursorX, pane.CursorY, expected)
+	if err != nil {
+		return claudeWakeSnapshot{}, err
+	}
+	transcript, err := claudeTranscriptSnapshot(b, time.Now())
+	if err != nil {
+		return claudeWakeSnapshot{}, err
+	}
+	transcript.Pane, transcript.SessionID, transcript.Created, transcript.PanePID, transcript.Screen = pane.Pane, pane.SessionID, pane.Created, pane.PanePID, visible
+	return transcript, nil
+}
+
+// claudeInputScreen turns one `capture-pane -p -e` capture into the plain
+// screen the input checks read. With no expected text the cursor must be at
+// the start of an empty input, and only the screen from the cursor row down
+// is returned.
+func claudeInputScreen(raw string, cursorX, cursorY int, expected string) (string, error) {
+	full, visible, err := claudePlainScreen(raw)
+	if err != nil {
+		return "", err
+	}
+	// Dialogs are detected on everything drawn in the active prompt area,
+	// faint text included; the transcript above the input box is not a prompt.
+	if match, blocked := claudeDialog(full); blocked {
+		return "", errors.New("Claude pane has a permission or selection prompt: " + match)
 	}
 	if expected == "" {
 		lines := strings.Split(visible, "\n")
 		if cursorX != 2 || cursorY >= len(lines) {
-			return claudeWakeSnapshot{}, errors.New("Claude cursor is not at an empty input")
+			return "", errors.New("Claude cursor is not at an empty input")
 		}
 		visible = strings.Join(lines[cursorY:], "\n")
 	}
 	if !exactClaudeInput(visible, expected) {
-		return claudeWakeSnapshot{}, errors.New("Claude input is occupied, prompting, or unknown")
+		return "", errors.New("Claude input is occupied, prompting, or unknown")
 	}
-	transcript, err := claudeTranscriptSnapshot(b)
-	if err != nil {
-		return claudeWakeSnapshot{}, err
+	return visible, nil
+}
+
+type claudeCell struct {
+	r     rune
+	faint bool
+}
+
+// claudePlainScreen strips SGR attributes from a capture. It returns the full
+// text and a copy without the faint text Claude Code draws after the input
+// marker: its prompt suggestion and its Try "…" placeholder, neither of
+// which is input (Claude Code 2.1.284 draws both with SGR 2 and removes the suggestion as soon as a key is typed; see
+// testdata/claude-pane). Faint text must be a trailing run: faint text followed
+// by normal text, or any escape other than SGR in the input area, fails closed.
+// Attributes carry across rows, as tmux emits only changes.
+func claudePlainScreen(raw string) (string, string, error) {
+	var rows [][]claudeCell
+	var bad []bool
+	var row []claudeCell
+	rowBad, faint := false, false
+	for i := 0; i < len(raw); {
+		c := raw[i]
+		switch {
+		case c == '\n':
+			rows, bad = append(rows, row), append(bad, rowBad)
+			row, rowBad = nil, false
+			i++
+		case c == 0x1b && i+1 < len(raw) && raw[i+1] == '[':
+			j := i + 2
+			for j < len(raw) && (raw[j] < 0x40 || raw[j] > 0x7e) {
+				j++
+			}
+			if j >= len(raw) {
+				return "", "", errors.New("Claude pane capture has a truncated escape")
+			}
+			if raw[j] != 'm' || !applyClaudeSGR(raw[i+2:j], &faint) {
+				rowBad = true
+			}
+			i = j + 1
+		case c == 0x1b && i+1 < len(raw) && raw[i+1] == ']':
+			// OSC (for example a hyperlink) ends at BEL or ESC \.
+			j := i + 2
+			for j < len(raw) && raw[j] != 0x07 && !(raw[j] == 0x1b && j+1 < len(raw) && raw[j+1] == '\\') {
+				j++
+			}
+			if j >= len(raw) {
+				return "", "", errors.New("Claude pane capture has a truncated escape")
+			}
+			if raw[j] == 0x1b {
+				j++
+			}
+			rowBad, i = true, j+1
+		case c == 0x1b:
+			rowBad, i = true, i+2
+		default:
+			r, size := utf8.DecodeRuneInString(raw[i:])
+			row = append(row, claudeCell{r: r, faint: faint})
+			i += size
+		}
 	}
-	transcript.Pane, transcript.SessionID, transcript.Created, transcript.PanePID, transcript.Screen = row[7], row[0], row[1], receipt.PanePID, visible
-	return transcript, nil
+	if len(row) > 0 {
+		rows, bad = append(rows, row), append(bad, rowBad)
+	}
+	input := -1
+	for i, cells := range rows {
+		if strings.HasPrefix(strings.TrimSpace(claudeCellText(cells)), "❯") {
+			input = i
+		}
+	}
+	lines := make([]string, len(rows))
+	for i, cells := range rows {
+		lines[i] = claudeCellText(cells)
+	}
+	full := strings.Join(lines, "\n")
+	if input >= 0 {
+		// The input area runs from the marker row to Claude's lower border.
+		end := input + 1
+		for end < len(rows) && !strings.HasPrefix(strings.TrimSpace(lines[end]), "──") {
+			end++
+		}
+		seenFaint := false
+		for i := input; i < end; i++ {
+			if bad[i] {
+				return "", "", errors.New("Claude input has unknown terminal attributes")
+			}
+			start := 0
+			if i == input {
+				marker := strings.IndexRune(lines[i], '❯')
+				start = utf8.RuneCountInString(lines[i][:marker]) + 1
+			}
+			cut := -1
+			if seenFaint {
+				cut = start
+			}
+			for k := start; k < len(rows[i]); k++ {
+				cell := rows[i][k]
+				if unicode.IsSpace(cell.r) {
+					continue
+				}
+				if cell.faint && !seenFaint {
+					seenFaint, cut = true, k
+				} else if !cell.faint && seenFaint {
+					return "", "", errors.New("Claude input mixes faint and typed text")
+				}
+			}
+			if cut >= 0 {
+				lines[i] = claudeCellText(rows[i][:cut])
+			}
+		}
+	}
+	return full, strings.Join(lines, "\n"), nil
+}
+
+func claudeCellText(cells []claudeCell) string {
+	var text strings.Builder
+	for _, cell := range cells {
+		text.WriteRune(cell.r)
+	}
+	return text.String()
+}
+
+// applyClaudeSGR tracks only faint (SGR 2) and reports false for parameters
+// it cannot account for, including colon subparameters.
+func applyClaudeSGR(params string, faint *bool) bool {
+	fields := strings.Split(params, ";")
+	for i := 0; i < len(fields); i++ {
+		n, err := strconv.Atoi(fields[i])
+		if fields[i] == "" {
+			n, err = 0, nil
+		}
+		if err != nil {
+			return false
+		}
+		switch {
+		case n == 0 || n == 22:
+			*faint = false
+		case n == 2:
+			*faint = true
+		case n == 38 || n == 48 || n == 58:
+			if i+1 < len(fields) && fields[i+1] == "5" {
+				i += 2
+			} else if i+1 < len(fields) && fields[i+1] == "2" {
+				i += 4
+			} else {
+				return false
+			}
+			if i >= len(fields) {
+				return false
+			}
+		}
+	}
+	return true
 }
 
 func nativeClaudeSend(ctx context.Context, pane, value string, literal bool) error {
@@ -391,7 +752,7 @@ func claudeWakeWith(ctx context.Context, b runtimeBinding, prompt string, ops cl
 	if err != nil {
 		return fmt.Errorf("%w: %v", errClaudeWakeUnsafe, err)
 	}
-	if !emptyClaudeInput(first.Screen) || !first.Cursor.TurnComplete || !first.Cursor.Ready || first.Cursor.Unknown || len(first.Cursor.Pending) != 0 {
+	if !emptyClaudeInput(first.Screen) || !first.Cursor.TurnComplete || !first.Cursor.Ready || first.Cursor.Unknown || len(first.Cursor.Pending) != 0 || claudeQueueFresh(first.Cursor, ops.now()) {
 		return errClaudeWakeUnsafe
 	}
 	second, err := ops.inspect(ctx, b, "")

@@ -82,6 +82,33 @@ tt verification receipt --item ITEM --file /absolute/external/log-directory/rece
 tt verification history --item ITEM
 ```
 
+The runner creates a fresh temporary HOME/TMPDIR for each invocation and removes
+it after writing external logs and the receipt, including on failed checks and
+timeouts. It makes Go's read-only module-cache entries writable before removal;
+cleanup walks only that invocation's home and does not follow symlinks. The
+receipt's allowlisted environment records `VERIFICATION_KEEP_HOME=0` and the
+exact `HOME` path. For local debugging, append `--keep-home` to retain that home;
+the receipt then records `VERIFICATION_KEEP_HOME=1`, and the operator must remove
+the retained directory when finished. `--min-free-bytes N` sets the free-space
+reserve (default 2147483648 bytes). The runner checks available space before
+allocating a home and before every check attempt, and refuses to start an
+attempt below the reserve. A failed preflight reports the available and required
+byte counts. This reserve guards attempt starts; a single attempt can still use
+more than the available space. SIGINT or SIGTERM stops the active check process
+group, saves its partial log, skips remaining attempts and checks, and leaves no
+eligible receipt. If home removal fails, the runner removes `receipt.json`, writes
+`cleanup-error.json` beside the logs, exits nonzero, and reports the retained
+home path for manual recovery.
+
+Go's `GOPATH`, `GOMODCACHE`, and `GOCACHE` all resolve inside the disposable
+home for matrix checks. The binary preparation helper runs before those checks
+with its existing host-cache environment; a signal during a preparatory Go build
+is observed when that build returns, before any check or eligible receipt. We
+decline the optional shared module download cache for this phase: it
+would require a separately managed read-only cache with its own ownership,
+integrity and cleanup policy. Keeping both module downloads and build artifacts
+inside the run home for matrix checks preserves the current isolation boundary.
+
 Plans and receipts are append-only. Every mutation has a stable request ID and
 expected generation. Identical retries return the saved record after later
 lifecycle changes; altered payloads or competing generations conflict without
@@ -157,7 +184,6 @@ from command targets; existing moved destinations are selected. If no touched
 package survives, the race check falls back to `./...`. Tests execute the real Go
 race command after a complete package move and deletion.
 
-
 ## Known failures and retries
 
 Successor Feature `wi_f148716909c88f9d` revision 1, owner order #11964,
@@ -170,7 +196,21 @@ Any list or retry-policy change requires a new owner matrix approval token.
 The runner derives the selected exceptions and retry policy from those exact
 bytes; the handler independently reproduces the plan and the store checks every
 linked bug exists, is a bug, and remains open/in progress/blocked. Closing or
-dismissing a linked bug removes eligibility until a new plan resolves the entry.
+dismissing a linked bug removes eligibility for every other item until a new
+plan resolves the entry, and a new plan can never list a closed bug.
+
+One exception lets a bug close while the approved matrix still lists entries
+that name it (Feature `wi_6fb81e10c366d7b4`, order #14489). The bug's own done
+save, its queue acceptance, its release, and its integrated-commit import accept
+those entries when the bug's current receipt, already bound to its plan and the
+exact accepted SHA, shows each of them `status: pass` with `nowPassing`. An entry
+that failed, or passed only on retry (`flaky`), keeps the bug open: a flaky self
+entry is reported for removal yet still blocks its own bug's close until a later
+receipt shows `pass`. Entries naming any other closed or dismissed bug are
+refused as before. The queue acceptance records the resolved entries as
+`resolvedKnownFailures` (receipt generation, receipt digest, matrix digest and
+the exact entries), derived by the hub and never accepted from a client, so the
+later matrix cleanup has an exact source. Plans and receipts are not rewritten.
 
 Every failed check, including a listed check, runs up to two further attempts
 with the identical argv, cwd, environment, timeout and process-group/port guards.

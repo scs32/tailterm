@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"flag"
 	"fmt"
@@ -219,12 +220,16 @@ func cmdWorkItemUpdate(e env, args []string) error {
 	reportVersion := fs.Int64("report-version", 0, "completion report version")
 	reportDigest := fs.String("report-digest", "", "completion report SHA-256")
 	reportScope := fs.Int64("report-scope-revision", 0, "completion report feature scope revision")
+	worktree := fs.String("worktree", "", "accepted builder worktree root (records team queue acceptance with a done save)")
+	branch := fs.String("branch", "", "accepted branch")
+	commit := fs.String("commit", "", "accepted commit SHA")
+	acceptanceEvidence := fs.String("evidence", "", "queue acceptance evidence (default: the saved completion receipt)")
 	asJSON := fs.Bool("json", false, "JSON output")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 	if fs.NArg() != 1 || !api.ValidID(fs.Arg(0), "wi") || *revision < 1 {
-		return errors.New("usage: tt work-items update --revision N --request-id KEY [fields] WI_ID")
+		return errors.New("usage: tt work-items update --revision N --request-id KEY [fields] [--worktree DIR --branch B --commit SHA] WI_ID")
 	}
 	project, err := workItemProject(e, *projectFlag)
 	if err != nil {
@@ -259,21 +264,98 @@ func cmdWorkItemUpdate(e env, args []string) error {
 	if err != nil {
 		return err
 	}
-	ctx, cancel := ctxTimeout(10 * time.Second)
+	ctx, cancel := ctxTimeout(30 * time.Second)
 	defer cancel()
 	if *requestID == "" {
 		return errors.New("--request-id is required")
+	}
+	acceptFlags := *worktree != "" || *branch != "" || *commit != "" || *acceptanceEvidence != ""
+	var entry *api.TeamQueueEntry
+	if req.Status != nil && *req.Status == "done" && e.agent != "" {
+		// A leased handler's done save carries the queue acceptance, so the
+		// team never waits on a separate remembered accept.
+		entry, err = pendingQueueAcceptance(ctx, c, project, fs.Arg(0), e.agent, e.runID)
+		if err != nil {
+			return err
+		}
+	}
+	if entry != nil && entry.Acceptance != nil && !acceptFlags {
+		entry = nil // already accepted; nothing to carry
+	}
+	if entry == nil && acceptFlags {
+		return errors.New("--worktree, --branch, --commit and --evidence apply only to the leased handler's done save of an item whose running team waits on acceptance")
+	}
+	if entry != nil {
+		if *worktree == "" || *branch == "" || *commit == "" {
+			return fmt.Errorf("team queue entry %s waits on acceptance: save done with the accepted --worktree, --branch and --commit", entry.ID)
+		}
+		realWorktree, err := acceptedWorktree(*worktree, entry.Repository)
+		if err != nil {
+			return err
+		}
+		// A retry after a lost response finds the entry already accepted: send
+		// the identical request so the hub replays the saved receipt.
+		if entry.Acceptance == nil {
+			if err = verifyAcceptedGit(ctx, entry.Repository, entry.BaseCommit, realWorktree, *branch, *commit); err != nil {
+				return fmt.Errorf("accepted Git tuple failed worktree verification: %v", err)
+			}
+		}
+		req.QueueAcceptance = &api.WorkItemQueueAcceptance{EntryID: entry.ID, Worktree: realWorktree, Branch: *branch, Commit: *commit, Evidence: *acceptanceEvidence}
 	}
 	result, err := c.CreateWorkItemUpdate(ctx, project, fs.Arg(0), req)
 	if err != nil {
 		return err
 	}
+	var accepted api.TeamQueueEntry
+	if entry != nil {
+		accepted, err = c.GetTeamQueueEntry(ctx, project, entry.ID)
+		if err != nil {
+			return fmt.Errorf("saved %s revision %d receipt %s; queue acceptance readback failed: %w", result.Revision.ItemID, result.Revision.Revision, result.Receipt.ID, err)
+		}
+		if accepted.Acceptance == nil || accepted.Acceptance.Commit != *commit || accepted.Acceptance.ItemRevision != result.Revision.Revision {
+			return fmt.Errorf("saved %s revision %d receipt %s but queue entry %s shows no matching acceptance", result.Revision.ItemID, result.Revision.Revision, result.Receipt.ID, entry.ID)
+		}
+	}
 	if *asJSON {
-		printJSON(result)
+		if entry != nil {
+			printJSON(struct {
+				api.WorkItemUpdateResult
+				QueueEntry api.TeamQueueEntry `json:"queueEntry"`
+			}{result, accepted})
+		} else {
+			printJSON(result)
+		}
 	} else {
 		fmt.Printf("%s revision %d receipt %s\n", result.Revision.ItemID, result.Revision.Revision, result.Receipt.ID)
+		if entry != nil {
+			fmt.Printf("queue acceptance recorded: entry %s revision %d commit %s\n", accepted.ID, accepted.Revision, accepted.Acceptance.Commit)
+		}
 	}
 	return nil
+}
+
+// pendingQueueAcceptance returns the item's repository-backed team queue entry
+// leased to this exact handler run: the running entry that waits on its
+// acceptance, else one it has already accepted (a retried save), else nil.
+func pendingQueueAcceptance(ctx context.Context, c *api.Client, project, item, agent, run string) (*api.TeamQueueEntry, error) {
+	list, err := c.ListTeamQueue(ctx, project)
+	if err != nil {
+		return nil, err
+	}
+	var accepted *api.TeamQueueEntry
+	for i := range list.Entries {
+		q := list.Entries[i]
+		if q.ItemID != item || q.Repository == "" || q.HandlerID != agent || q.HandlerRunID != run {
+			continue
+		}
+		if q.State == "running" && q.Acceptance == nil {
+			return &q, nil
+		}
+		if q.Acceptance != nil && accepted == nil {
+			accepted = &q
+		}
+	}
+	return accepted, nil
 }
 
 func cmdWorkItemReceipt(e env, args []string) error {

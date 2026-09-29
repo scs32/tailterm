@@ -69,11 +69,15 @@ try {
             const request = database
               .transaction("vault")
               .objectStore("vault")
-              .get("encrypted");
+              .get("encrypted-v2");
             request.onerror = () => reject(request.error);
             request.onsuccess = () => {
-              resolve(request.result);
               database.close();
+              if (!request.result)
+                reject(
+                  new Error("Expected the current v2 encrypted vault envelope"),
+                );
+              else resolve(request.result);
             };
           };
         });

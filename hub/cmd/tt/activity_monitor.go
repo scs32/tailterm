@@ -223,14 +223,14 @@ func relayActivityTick(ctx context.Context, b runtimeBinding, client *api.Client
 				return err
 			}
 			c.RejectedState = c.PendingReport.Activity.State
-			c.RejectedWakeKey = wakeKey(c.PendingReport.Activity.Wake)
+			c.RejectedWakeKey = wakeKey(c.PendingReport.Activity.Wake) + runtimePromptKey(c.PendingReport.Activity.Prompt)
 			c.PendingReport = nil
 			if err := save(); err != nil {
 				return err
 			}
 		} else {
 			c.LastState = c.PendingReport.Activity.State
-			c.LastWakeKey = wakeKey(c.PendingReport.Activity.Wake)
+			c.LastWakeKey = wakeKey(c.PendingReport.Activity.Wake) + runtimePromptKey(c.PendingReport.Activity.Prompt)
 			c.PendingReport = nil
 			if err := save(); err != nil {
 				return err
@@ -316,6 +316,7 @@ func relayActivityTick(ctx context.Context, b runtimeBinding, client *api.Client
 	}
 	tmuxAlive, processAlive, probeErr := probe(b, a)
 	var state api.AgentActivity
+	observed := false
 	if transcript != "" && !c.Ready {
 		if transcriptReadErr == nil && probeErr == nil && tmuxAlive && processAlive {
 			// A healthy writer may still finish its tail. Continue bounded catch-up
@@ -363,6 +364,18 @@ func relayActivityTick(ctx context.Context, b runtimeBinding, client *api.Client
 			c.Verified = &verifiedActivitySnapshot{Path: c.Path, FileID: c.FileID, Offset: c.Offset, LastEventAt: c.LastEventAt, Tokens: c.Tokens}
 		}
 		state = activityState(&c, a, open, tmuxAlive, processAlive, probeErr, now, activityDefaults())
+		observed = true
+	}
+	// A live runtime quiet on its own modal prompt is not idle at its input.
+	// The agent's hub status (needs_input included) is left as it is.
+	if deps, ok := ctx.Value(runtimePromptDepsKey{}).(*runtimePromptDeps); ok && observed && probeErr == nil && tmuxAlive && processAlive {
+		prompt, promptErr := observeRuntimePrompt(ctx, deps, b, client, &c, now)
+		if promptErr != nil {
+			fmt.Fprintf(os.Stderr, "[tt relay] %s runtime prompt: %v\n", b.Agent, promptErr)
+		}
+		if prompt != nil {
+			state.State, state.Prompt, state.Reason = "runtime_prompt", prompt, ""
+		}
 	}
 	if b.Runtime == "claude" {
 		var progress relayProgress
@@ -370,7 +383,7 @@ func relayActivityTick(ctx context.Context, b runtimeBinding, client *api.Client
 			state.Wake = progress.Wake
 		}
 	}
-	key := wakeKey(state.Wake)
+	key := wakeKey(state.Wake) + runtimePromptKey(state.Prompt)
 	if (state.State == c.LastState && key == c.LastWakeKey) || (state.State == c.RejectedState && key == c.RejectedWakeKey) {
 		return save()
 	}

@@ -6,11 +6,15 @@ import {
   existsSync,
   readdirSync,
   statSync,
+  statfsSync,
+  lstatSync,
+  chmodSync,
+  rmSync,
 } from "node:fs";
 import { resolve, relative, join, isAbsolute } from "node:path";
 import { tmpdir } from "node:os";
 import { createHash } from "node:crypto";
-import { execFileSync, spawnSync } from "node:child_process";
+import { execFileSync, spawn, spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { buildHistoricalHub, buildMatrixBinaries, fileHash } from "../tests/test-binaries.mjs";
 
@@ -201,8 +205,9 @@ export function matrixPolicy(matrix, checks) {
   return { maxAttempts: 3, ...(knownFailures.length ? { knownFailures } : {}) };
 }
 export function receiptEligible(receipt) {
-  return receipt.checks.every(
-    (c) => c.exitCode === 0 || c.knownFailure === true,
+  return (
+    !receipt.environment?.VERIFICATION_HOME_CLEANUP_ERROR &&
+    receipt.checks.every((c) => c.exitCode === 0 || c.knownFailure === true)
   );
 }
 export function makePlan(context, cwd) {
@@ -292,87 +297,7 @@ export function occupiedPorts(check) {
     return [{ port, pids: [...new Set(pids)] }];
   });
 }
-async function checkController() {
-  const { spawn } = await import("node:child_process");
-  const argv = JSON.parse(process.argv[1]),
-    timeout = Number(process.argv[2]);
-  const child = spawn(argv[0], argv.slice(1), {
-    detached: true,
-    stdio: ["ignore", "pipe", "pipe"],
-  });
-  let stdout = [],
-    stderr = [],
-    size = 0,
-    reason = "",
-    closed = false,
-    forced = false,
-    code = -1,
-    signal = "",
-    timer,
-    killTimer;
-  const signalGroup = (kind) => {
-    if (!child.pid) return;
-    try {
-      process.kill(-child.pid, kind);
-    } catch (error) {
-      if (error.code !== "ESRCH")
-        stderr.push(Buffer.from("\nGroup signal: " + error.message));
-    }
-  };
-  let finished = false;
-  const finish = () => {
-    if (finished || !closed || (reason && !forced)) return;
-    finished = true;
-    clearTimeout(timer);
-    clearTimeout(killTimer);
-    process.stdout.write(
-      JSON.stringify({
-        status:
-          reason === "timeout" ? 124 : reason === "output-limit" ? 125 : code,
-        stdout: Buffer.concat(stdout).toString(),
-        stderr: Buffer.concat(stderr).toString(),
-        failureReason: reason || (code !== 0 ? "exit" : ""),
-        signal,
-      }),
-    );
-  };
-  const stop = (why) => {
-    if (reason) return;
-    reason = why;
-    clearTimeout(timer);
-    signalGroup("SIGTERM");
-    killTimer = setTimeout(() => {
-      signalGroup("SIGKILL");
-      forced = true;
-      finish();
-    }, 250);
-  };
-  const capture = (dest) => (data) => {
-    size += data.length;
-    if (size > 128 * 1024 * 1024) {
-      stop("output-limit");
-      return;
-    }
-    dest.push(data);
-  };
-  child.stdout.on("data", capture(stdout));
-  child.stderr.on("data", capture(stderr));
-  child.on("error", (error) => {
-    stderr.push(Buffer.from(error.message));
-    reason = "spawn";
-    forced = true;
-    closed = true;
-    finish();
-  });
-  child.on("close", (status, whichSignal) => {
-    code = status ?? -1;
-    signal = whichSignal || "";
-    closed = true;
-    finish();
-  });
-  timer = setTimeout(() => stop("timeout"), timeout);
-}
-export function runCheck(check, cwd, environment) {
+export async function runCheck(check, cwd, environment, abortSignal) {
   const timeout = Number(check.environment.VERIFICATION_TIMEOUT_MS);
   if (!Number.isSafeInteger(timeout) || timeout <= 0 || timeout > 1800000)
     throw new Error("Invalid approved check timeout");
@@ -403,25 +328,160 @@ export function runCheck(check, cwd, environment) {
       failureReason: "port-inspection",
     };
   }
-  const raw = execFileSync(
-    process.execPath,
-    [
-      "--input-type=module",
-      "-e",
-      "(" + checkController.toString() + ")()",
-      JSON.stringify(check.argv),
-      String(timeout),
-    ],
-    {
-      cwd,
-      env: { ...environment, ...check.environment },
-      encoding: "utf8",
-      maxBuffer: 512 * 1024 * 1024,
-    },
-  );
-  return JSON.parse(raw);
+  if (abortSignal?.aborted)
+    return {
+      status: abortSignal.reason === "SIGINT" ? 130 : 143,
+      stdout: "",
+      stderr: "",
+      failureReason: "interrupted",
+    };
+  return new Promise((resolveResult) => {
+    const stdout = [],
+      stderr = [];
+    let size = 0,
+      reason = "",
+      closed = false,
+      forced = false;
+    let code = -1,
+      whichSignal = "",
+      timer,
+      killTimer,
+      finished = false;
+    let child;
+    const signalGroup = (kind) => {
+      if (!child?.pid) return;
+      try {
+        process.kill(-child.pid, kind);
+      } catch (error) {
+        if (error.code !== "ESRCH")
+          stderr.push(Buffer.from("\nGroup signal: " + error.message));
+      }
+    };
+    const finish = () => {
+      if (finished || !closed || (reason && !forced)) return;
+      finished = true;
+      clearTimeout(timer);
+      clearTimeout(killTimer);
+      abortSignal?.removeEventListener("abort", onAbort);
+      resolveResult({
+        status:
+          reason === "timeout"
+            ? 124
+            : reason === "output-limit"
+              ? 125
+              : reason === "interrupted"
+                ? abortSignal.reason === "SIGINT"
+                  ? 130
+                  : 143
+                : code,
+        stdout: Buffer.concat(stdout).toString(),
+        stderr: Buffer.concat(stderr).toString(),
+        failureReason: reason || (code !== 0 ? "exit" : ""),
+        signal: whichSignal,
+      });
+    };
+    const stop = (why) => {
+      if (reason) return;
+      reason = why;
+      clearTimeout(timer);
+      signalGroup("SIGTERM");
+      killTimer = setTimeout(() => {
+        signalGroup("SIGKILL");
+        forced = true;
+        finish();
+      }, 250);
+    };
+    const onAbort = () => stop("interrupted");
+    const capture = (dest) => (data) => {
+      size += data.length;
+      if (size > 128 * 1024 * 1024) {
+        stop("output-limit");
+        return;
+      }
+      dest.push(data);
+    };
+    try {
+      child = spawn(check.argv[0], check.argv.slice(1), {
+        cwd,
+        env: { ...environment, ...check.environment },
+        detached: true,
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+    } catch (error) {
+      resolveResult({
+        status: -1,
+        stdout: "",
+        stderr: error.message,
+        failureReason: "spawn",
+      });
+      return;
+    }
+    abortSignal?.addEventListener("abort", onAbort, { once: true });
+    child.stdout.on("data", capture(stdout));
+    child.stderr.on("data", capture(stderr));
+    child.on("error", (error) => {
+      stderr.push(Buffer.from(error.message));
+      reason = "spawn";
+      forced = true;
+      closed = true;
+      finish();
+    });
+    child.on("close", (status, signal) => {
+      code = status ?? -1;
+      whichSignal = signal || "";
+      closed = true;
+      finish();
+    });
+    timer = setTimeout(() => stop("timeout"), timeout);
+    if (abortSignal?.aborted) onAbort();
+  });
 }
-export async function runPlan(plan, cwd, output) {
+const DEFAULT_MIN_FREE_BYTES = 2 * 1024 * 1024 * 1024;
+
+export function availableBytes(path = tmpdir()) {
+  const { bavail, bsize } = statfsSync(path);
+  return bavail * bsize;
+}
+
+export function requireFreeSpace(reserve, getAvailableBytes = availableBytes) {
+  if (!Number.isSafeInteger(reserve) || reserve < 0)
+    throw new Error("Invalid --min-free-bytes reserve");
+  const free = getAvailableBytes();
+  if (!Number.isSafeInteger(free) || free < 0)
+    throw new Error("Unable to determine free space for verifier home");
+  if (free < reserve)
+    throw new Error(
+      `Insufficient free space for verifier home: ${free} bytes available, ${reserve} bytes required`,
+    );
+}
+
+// Go makes module-cache directories read-only. Only walk the exact home this
+// invocation created; lstat avoids traversing symlinks into sibling runs.
+export function removeVerifierHome(home) {
+  const visit = (path) => {
+    const entry = lstatSync(path);
+    if (entry.isSymbolicLink()) return;
+    if (entry.isDirectory()) {
+      chmodSync(path, entry.mode | 0o700);
+      for (const name of readdirSync(path)) visit(join(path, name));
+    } else if (entry.isFile()) {
+      chmodSync(path, entry.mode | 0o600);
+    }
+  };
+  visit(home);
+  rmSync(home, { recursive: true, force: true });
+}
+
+export async function runPlan(plan, cwd, output, options = {}) {
+  const {
+    keepHome = false,
+    minFreeBytes = DEFAULT_MIN_FREE_BYTES,
+    getAvailableBytes = availableBytes,
+    abortSignal,
+    removeHome = removeVerifierHome,
+  } = options;
+  if (typeof keepHome !== "boolean")
+    throw new Error("Invalid --keep-home value");
   checkClean(cwd, plan.commit);
   const expected = makePlan(plan, cwd);
   if (
@@ -444,157 +504,211 @@ export async function runPlan(plan, cwd, output) {
     throw new Error("Altered or omitted required checks");
   if (!isAbsolute(output) || relative(cwd, output).split("/")[0] !== "..")
     throw new Error("Logs/receipt must be outside worktree");
+  requireFreeSpace(minFreeBytes, getAvailableBytes);
   const home = mkdtempSync(join(tmpdir(), "tailterm-verifier-"));
-  mkdirSync(output, { recursive: true });
-  const environment = {
-    PATH: process.env.PATH,
-    HOME: home,
-    TMPDIR: home,
-    LANG: "en_US.UTF-8",
-    CI: "1",
-    GOTOOLCHAIN: "auto",
-  };
-  // No inherited task/hub credentials, runtime config, vault or tmux socket.
-  const prerequisites = [];
-  if (
-    plan.checks.some(
-      (c) => c.id.includes("browser") || c.environment.TEST_BROWSER,
-    )
-  ) {
-    for (const p of [
-      "node_modules/.package-lock.json",
-      "wasm/tailserve.wasm",
-      ".build/test.wasm",
-      ".build/speech-fixture.wav",
-      ".build/go-modules.txt",
-    ]) {
-      const f = join(cwd, p);
-      if (!existsSync(f)) throw new Error("Missing prerequisite: " + p);
-      prerequisites.push({
-        path: p,
-        sha256: createHash("sha256").update(readFileSync(f)).digest("hex"),
-      });
+  const receiptPath = join(output, "receipt.json");
+  let receiptWritten = false;
+  try {
+    mkdirSync(output, { recursive: true });
+    const environment = {
+      PATH: process.env.PATH,
+      HOME: home,
+      TMPDIR: home,
+      GOPATH: join(home, "go"),
+      GOMODCACHE: join(home, "go", "pkg", "mod"),
+      GOCACHE: join(home, "go-build"),
+      VERIFICATION_KEEP_HOME: keepHome ? "1" : "0",
+      LANG: "en_US.UTF-8",
+      CI: "1",
+      GOTOOLCHAIN: "auto",
+    };
+    // No inherited task/hub credentials, runtime config, vault or tmux socket.
+    const prerequisites = [];
+    if (
+      plan.checks.some(
+        (c) => c.id.includes("browser") || c.environment.TEST_BROWSER,
+      )
+    ) {
+      for (const p of [
+        "node_modules/.package-lock.json",
+        "wasm/tailserve.wasm",
+        ".build/test.wasm",
+        ".build/speech-fixture.wav",
+        ".build/go-modules.txt",
+      ]) {
+        const f = join(cwd, p);
+        if (!existsSync(f)) throw new Error("Missing prerequisite: " + p);
+        prerequisites.push({
+          path: p,
+          sha256: createHash("sha256").update(readFileSync(f)).digest("hex"),
+        });
+      }
+      environment.PLAYWRIGHT_BROWSERS_PATH =
+        process.env.PLAYWRIGHT_BROWSERS_PATH ||
+        join(process.env.HOME, "Library/Caches/ms-playwright");
     }
-    environment.PLAYWRIGHT_BROWSERS_PATH =
-      process.env.PLAYWRIGHT_BROWSERS_PATH ||
-      join(process.env.HOME, "Library/Caches/ms-playwright");
-  }
-  const needsBinaries = plan.checks.some((check) =>
-    [...binarySuites].some((suite) => check.id.startsWith(`tests/${suite}-browser.mjs`)));
-  if (needsBinaries) {
-    const binaries = await buildMatrixBinaries(cwd, output);
-    if (plan.checks.some((check) => check.id.startsWith("tests/board-audit-old-hub-browser.mjs")))
-      binaries.push(await buildHistoricalHub(cwd, join(output, "tailterm-historical-hub-test"), historicalHubCommit));
-    const manifest = join(output, "test-binaries.json");
-    writeFileSync(manifest, JSON.stringify({ version: 1, binaries }, null, 2) + "\n", { mode: 0o600 });
-    writeFileSync(join(output, "test-binary-builds.json"), JSON.stringify(binaries.map(({ target, historicalCommit, source, buildLog, startedAt, endedAt, path, sha256 }) => ({ target, historicalCommit, source, buildLog, startedAt, endedAt, path, sha256 })), null, 2) + "\n", { mode: 0o600 });
-    environment.TAILTERM_TEST_BINARIES = manifest;
-    for (const binary of binaries)
-      prerequisites.push({ path: binary.path, sha256: binary.sha256,
-        source: binary.source, target: binary.target,
-        historicalCommit: binary.historicalCommit,
-        buildCommand: binary.buildLog.argv,
-        startedAt: binary.startedAt, endedAt: binary.endedAt });
-  }
-  const results = [];
-  for (const check of plan.checks) {
-    const attempts = [];
-    for (let attempt = 1; attempt <= (plan.maxAttempts || 1); attempt++) {
-      const startedAt = new Date().toISOString(),
-        start = performance.now();
-      const run = runCheck(check, resolve(cwd, check.cwd), environment);
-      const log =
-        (run.stdout || "") +
-        (run.stderr || "") +
-        (run.failureReason
-          ? "\nverification failureReason: " + run.failureReason + "\n"
-          : "") +
-        (run.signal ? "verification signal: " + run.signal + "\n" : "");
-      const logURI = join(
-        output,
-        digest(check.id) +
-          (plan.maxAttempts ? ".attempt-" + attempt : "") +
-          ".log",
+    if (abortSignal?.aborted)
+      throw new Error("Verification interrupted by " + abortSignal.reason);
+    const needsBinaries = plan.checks.some((check) =>
+      [...binarySuites].some((suite) => check.id.startsWith(`tests/${suite}-browser.mjs`)));
+    if (needsBinaries) {
+      const binaries = await buildMatrixBinaries(cwd, output);
+      if (abortSignal?.aborted)
+        throw new Error("Verification interrupted by " + abortSignal.reason);
+      if (plan.checks.some((check) => check.id.startsWith("tests/board-audit-old-hub-browser.mjs")))
+        binaries.push(await buildHistoricalHub(cwd, join(output, "tailterm-historical-hub-test"), historicalHubCommit));
+      if (abortSignal?.aborted)
+        throw new Error("Verification interrupted by " + abortSignal.reason);
+      const manifest = join(output, "test-binaries.json");
+      writeFileSync(manifest, JSON.stringify({ version: 1, binaries }, null, 2) + "\n", { mode: 0o600 });
+      writeFileSync(join(output, "test-binary-builds.json"), JSON.stringify(binaries.map(({ target, historicalCommit, source, buildLog, startedAt, endedAt, path, sha256 }) => ({ target, historicalCommit, source, buildLog, startedAt, endedAt, path, sha256 })), null, 2) + "\n", { mode: 0o600 });
+      environment.TAILTERM_TEST_BINARIES = manifest;
+      for (const binary of binaries)
+        prerequisites.push({ path: binary.path, sha256: binary.sha256,
+          source: binary.source, target: binary.target,
+          historicalCommit: binary.historicalCommit,
+          buildCommand: binary.buildLog.argv,
+          startedAt: binary.startedAt, endedAt: binary.endedAt });
+    }
+    const results = [];
+    for (const check of plan.checks) {
+      const attempts = [];
+      for (let attempt = 1; attempt <= (plan.maxAttempts || 1); attempt++) {
+        if (abortSignal?.aborted)
+          throw new Error("Verification interrupted by " + abortSignal.reason);
+        requireFreeSpace(minFreeBytes, getAvailableBytes);
+        const startedAt = new Date().toISOString(),
+          start = performance.now();
+        const run = await runCheck(
+          check,
+          resolve(cwd, check.cwd),
+          environment,
+          abortSignal,
+        );
+        const log =
+          (run.stdout || "") +
+          (run.stderr || "") +
+          (run.failureReason
+            ? "\nverification failureReason: " + run.failureReason + "\n"
+            : "") +
+          (run.signal ? "verification signal: " + run.signal + "\n" : "");
+        const logURI = join(
+          output,
+          digest(check.id) +
+            (plan.maxAttempts ? ".attempt-" + attempt : "") +
+            ".log",
+        );
+        writeFileSync(logURI, log, { mode: 0o600 });
+        attempts.push({
+          attempt,
+          startedAt,
+          endedAt: new Date().toISOString(),
+          durationMs: Math.round(performance.now() - start),
+          exitCode: run.status ?? -1,
+          ...(run.failureReason ? { failureReason: run.failureReason } : {}),
+          logURI,
+          logDigest: digest(log),
+        });
+        if (abortSignal?.aborted)
+          throw new Error("Verification interrupted by " + abortSignal.reason);
+        if (run.status === 0) break;
+      }
+      const { attempt, ...final } = attempts.at(-1);
+      const knownFailure = plan.knownFailures?.some(
+        (e) => e.checkId === check.id,
       );
-      writeFileSync(logURI, log, { mode: 0o600 });
-      attempts.push({
-        attempt,
-        startedAt,
-        endedAt: new Date().toISOString(),
-        durationMs: Math.round(performance.now() - start),
-        exitCode: run.status ?? -1,
-        ...(run.failureReason ? { failureReason: run.failureReason } : {}),
-        logURI,
-        logDigest: digest(log),
+      results.push({
+        ...check,
+        ...final,
+        ...(plan.maxAttempts
+          ? {
+              attempts,
+              status:
+                final.exitCode === 0
+                  ? attempts.length > 1
+                    ? "flaky"
+                    : "pass"
+                  : "fail",
+              ...(knownFailure
+                ? {
+                    knownFailure: true,
+                    ...(final.exitCode === 0 ? { nowPassing: true } : {}),
+                  }
+                : {}),
+            }
+          : {}),
       });
-      if (run.status === 0) break;
     }
-    const { attempt, ...final } = attempts.at(-1);
-    const knownFailure = plan.knownFailures?.some(
-      (e) => e.checkId === check.id,
-    );
-    results.push({
-      ...check,
-      ...final,
-      ...(plan.maxAttempts
-        ? {
-            attempts,
-            status:
-              final.exitCode === 0
-                ? attempts.length > 1
-                  ? "flaky"
-                  : "pass"
-                : "fail",
-            ...(knownFailure
-              ? {
-                  knownFailure: true,
-                  ...(final.exitCode === 0 ? { nowPassing: true } : {}),
-                }
-              : {}),
-          }
-        : {}),
+    if (abortSignal?.aborted)
+      throw new Error("Verification interrupted by " + abortSignal.reason);
+    if (needsBinaries) {
+      const manifest = JSON.parse(readFileSync(environment.TAILTERM_TEST_BINARIES, "utf8"));
+      for (const binary of manifest.binaries)
+        if ((await fileHash(binary.path)) !== binary.sha256)
+          throw new Error("Prepared test binary changed during verification: " + binary.path);
+    }
+    if (abortSignal?.aborted)
+      throw new Error("Verification interrupted by " + abortSignal.reason);
+    checkClean(cwd, plan.commit);
+    const receipt = {
+      worktree: resolve(cwd),
+      version: 1,
+      operationKey: plan.operationKey,
+      planDigest: digest(plan),
+      repository: plan.repository,
+      baseCommit: plan.baseCommit,
+      commit: plan.commit,
+      matrixDigest: plan.matrixDigest,
+      checksDigest: plan.checksDigest,
+      verifierAgentId: plan.verifierAgentId,
+      verifierRunId: plan.verifierRunId,
+      detached: true,
+      cleanBefore: true,
+      cleanAfter: true,
+      environment,
+      prerequisites,
+      checks: results,
+      aiv: { state: "unsubmitted" },
+    };
+    writeFileSync(receiptPath, JSON.stringify(receipt, null, 2) + "\n", {
+      mode: 0o600,
     });
+    receiptWritten = true;
+    return receipt;
+  } finally {
+    if (!keepHome) {
+      try {
+        removeHome(home);
+      } catch (error) {
+        if (receiptWritten) rmSync(receiptPath, { force: true });
+        try {
+          writeFileSync(
+            join(output, "cleanup-error.json"),
+            JSON.stringify({ home, error: error.message }) + "\n",
+            { mode: 0o600 },
+          );
+        } catch {}
+        throw new Error(
+          `Failed to remove verifier home ${home}: ${error.message}`,
+        );
+      }
+    }
   }
-  if (needsBinaries) {
-    const manifest = JSON.parse(readFileSync(environment.TAILTERM_TEST_BINARIES, "utf8"));
-    for (const binary of manifest.binaries)
-      if ((await fileHash(binary.path)) !== binary.sha256)
-        throw new Error("Prepared test binary changed during verification: " + binary.path);
-  }
-  checkClean(cwd, plan.commit);
-  const receipt = {
-    worktree: resolve(cwd),
-    version: 1,
-    operationKey: plan.operationKey,
-    planDigest: digest(plan),
-    repository: plan.repository,
-    baseCommit: plan.baseCommit,
-    commit: plan.commit,
-    matrixDigest: plan.matrixDigest,
-    checksDigest: plan.checksDigest,
-    verifierAgentId: plan.verifierAgentId,
-    verifierRunId: plan.verifierRunId,
-    detached: true,
-    cleanBefore: true,
-    cleanAfter: true,
-    environment,
-    prerequisites,
-    checks: results,
-    aiv: { state: "unsubmitted" },
-  };
-  writeFileSync(
-    join(output, "receipt.json"),
-    JSON.stringify(receipt, null, 2) + "\n",
-    { mode: 0o600 },
-  );
-  return receipt;
 }
 if (
   process.argv[1] &&
   resolve(process.argv[1]) === fileURLToPath(import.meta.url)
 ) {
+  const interruption = new AbortController();
+  let interruptedBy = "";
+  for (const signal of ["SIGINT", "SIGTERM"])
+    process.on(signal, () => {
+      interruptedBy ||= signal;
+      interruption.abort(interruptedBy);
+      process.exitCode = signal === "SIGINT" ? 130 : 143;
+    });
   try {
-    const [mode, file, output] = process.argv.slice(2),
+    const [mode, file, output, ...flags] = process.argv.slice(2),
       input = JSON.parse(readFileSync(file, "utf8"));
     if (mode === "plan")
       writeFileSync(
@@ -602,14 +716,45 @@ if (
         JSON.stringify(makePlan(input, process.cwd()), null, 2) + "\n",
       );
     else if (mode === "run") {
-      const r = await runPlan(input, process.cwd(), resolve(output));
-      process.exitCode = receiptEligible(r) ? 0 : 1;
+      let keepHome = false;
+      let minFreeBytes = DEFAULT_MIN_FREE_BYTES;
+      for (let i = 0; i < flags.length; i++) {
+        if (flags[i] === "--keep-home") keepHome = true;
+        else if (flags[i] === "--min-free-bytes") {
+          const value = flags[++i];
+          if (!/^(0|[1-9][0-9]*)$/.test(value || ""))
+            throw new Error(
+              "--min-free-bytes requires a nonnegative integer byte count",
+            );
+          minFreeBytes = Number(value);
+          if (!Number.isSafeInteger(minFreeBytes))
+            throw new Error(
+              "--min-free-bytes requires a safe integer byte count",
+            );
+        } else throw new Error("Unknown verifier run option: " + flags[i]);
+      }
+      const r = await runPlan(input, process.cwd(), resolve(output), {
+        keepHome,
+        minFreeBytes,
+        abortSignal: interruption.signal,
+      });
+      await new Promise((resolve) => setImmediate(resolve));
+      if (interruptedBy)
+        rmSync(join(resolve(output), "receipt.json"), { force: true });
+      process.exitCode = interruptedBy
+        ? interruptedBy === "SIGINT"
+          ? 130
+          : 143
+        : receiptEligible(r)
+          ? 0
+          : 1;
     } else
       throw new Error(
-        "Usage: node scripts/verify-matrix.mjs plan|run INPUT OUTPUT",
+        "Usage: node scripts/verify-matrix.mjs plan|run INPUT OUTPUT [--keep-home] [--min-free-bytes N]",
       );
   } catch (e) {
     console.error(e.message);
-    process.exitCode = 1;
+    process.exitCode =
+      interruptedBy === "SIGINT" ? 130 : interruptedBy === "SIGTERM" ? 143 : 1;
   }
 }

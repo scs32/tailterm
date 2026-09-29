@@ -183,6 +183,18 @@ try {
         await page.close();
       }
 
+      // 013a582 keeps the composer text and recipient disabled while a post
+      // is pending, so a newer unsent generation can no longer be typed.
+      // Reply stays live: replying during the held post saves the same text
+      // as a reply, which is a newer draft than the payload being confirmed.
+      async function heldComposer(page) {
+        await waitFor(
+          async () => await page.locator("#board-text").isDisabled(),
+          `${name} held post composer`,
+        );
+        assert.equal(await page.locator("#board-to").isDisabled(), true);
+      }
+
       {
         const page = await pageFor("post");
         const input = page.locator("#board-text");
@@ -190,30 +202,39 @@ try {
         await gate(page);
         await page.locator('#board-compose button[type="submit"]').click();
         await page.evaluate(() => qa.operationStarted);
-        await input.fill("Newer unsent post");
+        await heldComposer(page);
+        await page.locator('[data-reply="1"]').click();
         await page.evaluate(() => qa.operationRelease());
         await waitFor(
-          async () => (await input.inputValue()) === "Newer unsent post",
-          `${name} newer post draft`,
+          async () => await input.isEnabled(),
+          `${name} released post composer`,
         );
+        const first = await page.evaluate(() => qa.calls.post[0]);
+        assert.equal(first.text, "First post");
+        assert.ok(!first.replyTo, "the confirmed post was the older draft");
+        assert.equal(await input.inputValue(), "First post");
         await waitFor(
           async () =>
             (await page.evaluate(
-              () => qa.record("draft:" + qa.task)?.values.text,
-            )) === "Newer unsent post",
-          `${name} durable post draft`,
+              () => qa.record("draft:" + qa.task)?.values.replyTo,
+            )) === 1,
+          `${name} durable reply draft`,
         );
         const saved = await page.evaluate(() => qa.record("draft:" + qa.task));
-        assert.equal(saved.values.text, "Newer unsent post");
+        assert.equal(saved.values.text, "First post");
+        assert.equal(saved.values.to, agent);
         await page.evaluate(() => qa.board.hide());
         await page.reload();
-        assert.equal(await input.inputValue(), "Newer unsent post");
+        assert.equal(await input.inputValue(), "First post");
         await gate(page);
         await page.locator('#board-compose button[type="submit"]').click();
         await page.evaluate(() => qa.operationStarted);
         const calls = await page.evaluate(() => qa.calls.post);
         assert.equal(calls.length, 1);
-        assert.equal(calls[0].text, "Newer unsent post");
+        assert.equal(calls[0].text, "First post");
+        assert.equal(calls[0].replyTo, 1);
+        assert.equal(calls[0].to, agent);
+        assert.notEqual(calls[0].requestId, first.requestId);
         assert.notEqual(calls[0].requestId, saved.requestId);
         await page.evaluate(() => qa.operationRelease());
         await page.close();
@@ -226,6 +247,7 @@ try {
         await gate(page);
         await page.locator('#board-compose button[type="submit"]').click();
         await page.evaluate(() => qa.operationStarted);
+        await heldComposer(page);
         await page.evaluate(() => {
           const value = qa.delayRemove("draft:" + qa.task);
           qa.draftRemoveStarted = value.started.promise;
@@ -233,24 +255,34 @@ try {
           qa.operationRelease();
         });
         await page.evaluate(() => qa.draftRemoveStarted);
-        await input.fill("Post written while removal is delayed");
+        // The post is confirmed but its draft cleanup is still in progress.
+        await heldComposer(page);
+        await page.locator('[data-reply="1"]').click();
         await page.evaluate(() => qa.draftRemoveRelease());
         await waitFor(
           async () =>
             (await page.evaluate(
-              () => qa.record("draft:" + qa.task)?.values.text,
-            )) === "Post written while removal is delayed",
+              () => qa.record("draft:" + qa.task)?.values.replyTo,
+            )) === 1,
           `${name} delayed post removal repair`,
         );
+        await waitFor(
+          async () => await input.isEnabled(),
+          `${name} released delayed-removal composer`,
+        );
+        assert.equal(await input.inputValue(), "Post before delayed removal");
         assert.equal(
-          await input.inputValue(),
-          "Post written while removal is delayed",
+          (await page.evaluate(() => qa.record("draft:" + qa.task))).values
+            .text,
+          "Post before delayed removal",
         );
         await page.evaluate(() => qa.board.hide());
         await page.reload();
+        assert.equal(await input.inputValue(), "Post before delayed removal");
         assert.equal(
-          await input.inputValue(),
-          "Post written while removal is delayed",
+          (await page.evaluate(() => qa.record("draft:" + qa.task))).values
+            .replyTo,
+          1,
         );
         await page.close();
       }

@@ -158,6 +158,19 @@ type TeamIntegrationAcceptance struct {
 	CompletionReport *NarrativeReportPin `json:"completionReport,omitempty"`
 	Evidence         string              `json:"evidence"`
 	AcceptedAt       string              `json:"acceptedAt"`
+	// ResolvedKnownFailures is server-derived: the item's own known failures
+	// that its current receipt shows now passing, recorded so a later matrix
+	// cleanup has an exact source. It is absent when nothing was resolved.
+	ResolvedKnownFailures *ResolvedKnownFailures `json:"resolvedKnownFailures,omitempty"`
+}
+
+// ResolvedKnownFailures names the exact receipt that let a bug close with
+// known failures that name it still listed in its approved matrix.
+type ResolvedKnownFailures struct {
+	ReceiptGeneration int64                      `json:"receiptGeneration"`
+	ReceiptDigest     string                     `json:"receiptDigest"`
+	MatrixDigest      string                     `json:"matrixDigest"`
+	Entries           []VerificationKnownFailure `json:"entries"`
 }
 
 type TeamQueueReleaseProof struct {

@@ -88,6 +88,12 @@ type activityCursor struct {
 	RejectedState     string                         `json:"rejectedState,omitempty"`
 	RejectedWakeKey   string                         `json:"rejectedWakeKey,omitempty"`
 	Ineligible        bool                           `json:"ineligible,omitempty"`
+	// ClaudeQueued counts input Claude Code queued while busy (queue-operation
+	// enqueue) that no dequeue or remove has taken yet. ClaudeQueuedAt is the
+	// latest enqueue. A real user prompt resets both, which bounds drift from
+	// unmatched removes and sessions that ended with input still queued.
+	ClaudeQueued   int       `json:"claudeQueued,omitempty"`
+	ClaudeQueuedAt time.Time `json:"claudeQueuedAt,omitempty"`
 }
 
 type activityThresholds struct {
@@ -179,6 +185,7 @@ func readActivityAppend(path string, c *activityCursor, parse func([]byte, *acti
 		c.Pending = map[string]pendingActivityCall{}
 		c.Completed = nil
 		c.SeenTurn, c.TurnComplete = false, false
+		c.ClaudeQueued, c.ClaudeQueuedAt = 0, time.Time{}
 		if c.ClaudeUsage == nil {
 			c.ClaudeUsage = map[string]api.TokenTotals{}
 		}
@@ -379,6 +386,15 @@ func parseCodexActivity(line []byte, c *activityCursor) error {
 	return nil
 }
 
+// unknownClaudeRecordError names a transcript record type (or queue-operation
+// operation) the parser does not know. The wake check tolerates it; any other
+// parse error is still strict.
+type unknownClaudeRecordError struct{ Type string }
+
+func (e unknownClaudeRecordError) Error() string {
+	return fmt.Sprintf("unknown Claude record type %q", e.Type)
+}
+
 func parseClaudeActivity(line []byte, c *activityCursor) error {
 	if len(line) == 0 {
 		return nil
@@ -439,6 +455,7 @@ func parseClaudeActivity(line []byte, c *activityCursor) error {
 		// user records, but they continue the assistant's existing turn.
 		if claudeUserText(line) != "" {
 			c.SeenTurn, c.TurnComplete = true, false
+			c.ClaudeQueued, c.ClaudeQueuedAt = 0, time.Time{}
 		}
 		for _, part := range msg.Content {
 			if part.Type == "tool_result" {
@@ -447,9 +464,30 @@ func parseClaudeActivity(line []byte, c *activityCursor) error {
 		}
 	case "result":
 		c.SeenTurn, c.TurnComplete = true, true
+	case "queue-operation":
+		// Claude Code queues input typed or delivered while it is busy. The
+		// record never changes turn state: a dequeued prompt arrives as its own
+		// user record, and a removed one was absorbed into the running turn or
+		// discarded.
+		var q struct {
+			Operation string `json:"operation"`
+		}
+		_ = json.Unmarshal(line, &q)
+		switch q.Operation {
+		case "enqueue":
+			c.ClaudeQueued++
+			c.ClaudeQueuedAt = now
+		case "dequeue", "remove":
+			c.ClaudeQueued = max(0, c.ClaudeQueued-1)
+			if c.ClaudeQueued == 0 {
+				c.ClaudeQueuedAt = time.Time{}
+			}
+		default:
+			return unknownClaudeRecordError{Type: "queue-operation/" + q.Operation}
+		}
 	case "system", "summary", "progress", "file-history-snapshot", "mode", "permission-mode", "ai-title", "atis-latch", "cost-state", "last-prompt", "attachment":
 	default:
-		return fmt.Errorf("unknown Claude record type %q", rec.Type)
+		return unknownClaudeRecordError{Type: rec.Type}
 	}
 	return nil
 }

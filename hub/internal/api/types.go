@@ -185,6 +185,11 @@ type Task struct {
 	CreatedAt           time.Time  `json:"createdAt"`
 	CreatedBy           Caller     `json:"createdBy"`
 	ClosedAt            *time.Time `json:"closedAt"`
+
+	// PrimaryHandlerID is the project's explicit primary database handler,
+	// set by a committed handler rotation; empty keeps the legacy rules.
+	PrimaryHandlerID string `json:"primaryHandlerId,omitempty"`
+	HandlerRevision  int64  `json:"handlerRevision"`
 }
 
 type Agent struct {
@@ -214,6 +219,9 @@ type Agent struct {
 	LastEventAt      time.Time             `json:"lastEventAt"`
 	Unread           int                   `json:"unread"`
 	ReadUpTo         int64                 `json:"readUpTo"`
+
+	// SuccessorID is set on a handler closed by a committed rotation.
+	SuccessorID string `json:"successorId,omitempty"`
 }
 
 type Sender struct {
@@ -288,6 +296,9 @@ type AddAgentRequest struct {
 	Runtime                     string                `json:"runtime"`
 	Cwd                         string                `json:"cwd"`
 	ParentAgentID               string                `json:"parentAgentId"`
+
+	// TemplateDigest records a database handler run's prompt template.
+	TemplateDigest string `json:"templateDigest,omitempty"`
 }
 
 type UpdateAgentRequest struct {
