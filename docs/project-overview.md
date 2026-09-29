@@ -84,8 +84,11 @@ The deployed frontend uses `npm run build:static` instead.
 - Every main terminal tab is a group, even if it contains one session.
 - Ordinary groups can be rearranged and combined; panes can be resized.
 - Ordinary pane dragging swaps positions. Holding physical Left Option places
-  the dragged pane to the target's right; Right Option places it above. The
-  preview follows modifier changes while preserving project-group boundaries.
+  the dragged pane to the target's right; Shift + Left Option places it above.
+  Right Option has no effect. The preview follows modifier changes while
+  preserving project-group boundaries. From the keyboard, the Commands palette's
+  "Move current pane" places the focused pane above, below, left or right of
+  another pane in its group.
 - Each task owns a dedicated group named after the task. Agent registration
   causes its pane to appear in that group, including agents spawned later.
 - Task groups cannot merge into another task or ordinary group. An ordinary
