@@ -196,7 +196,21 @@ Any list or retry-policy change requires a new owner matrix approval token.
 The runner derives the selected exceptions and retry policy from those exact
 bytes; the handler independently reproduces the plan and the store checks every
 linked bug exists, is a bug, and remains open/in progress/blocked. Closing or
-dismissing a linked bug removes eligibility until a new plan resolves the entry.
+dismissing a linked bug removes eligibility for every other item until a new
+plan resolves the entry, and a new plan can never list a closed bug.
+
+One exception lets a bug close while the approved matrix still lists entries
+that name it (Feature `wi_6fb81e10c366d7b4`, order #14489). The bug's own done
+save, its queue acceptance, its release, and its integrated-commit import accept
+those entries when the bug's current receipt, already bound to its plan and the
+exact accepted SHA, shows each of them `status: pass` with `nowPassing`. An entry
+that failed, or passed only on retry (`flaky`), keeps the bug open: a flaky self
+entry is reported for removal yet still blocks its own bug's close until a later
+receipt shows `pass`. Entries naming any other closed or dismissed bug are
+refused as before. The queue acceptance records the resolved entries as
+`resolvedKnownFailures` (receipt generation, receipt digest, matrix digest and
+the exact entries), derived by the hub and never accepted from a client, so the
+later matrix cleanup has an exact source. Plans and receipts are not rewritten.
 
 Every failed check, including a listed check, runs up to two further attempts
 with the identical argv, cwd, environment, timeout and process-group/port guards.
