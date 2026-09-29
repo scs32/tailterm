@@ -33,6 +33,35 @@ export function matchServer(host, servers) {
 
 export const openAgent = (a) => a.status !== "closed";
 
+// A pane bound to an earlier run of this agent belongs to a session the hub
+// has replaced. The restore preflight and the mirror must agree on this.
+export const runChanged = (ref, a) => !!a.runId && ref?.runId !== a.runId;
+
+// An open project whose team is present. A missing pauseState (older hubs)
+// counts as active; resuming projects are coming back and stay bound.
+export const liveProject = (task) =>
+  task?.status === "open" &&
+  [undefined, null, "", "active", "resuming"].includes(task.pauseState);
+
+// What the login restore should do with a saved pane bound to a hub agent.
+// detail is the hub's getTask result: undefined when the hub is unknown or
+// unreachable (restore as before), null when the hub no longer has the task.
+//   keep | unknown | gone | closed | paused | run-changed
+export function restoreVerdict(binding, detail) {
+  if (detail === undefined) return "unknown";
+  if (detail === null) return "gone";
+  if (detail.task?.status !== "open") return "closed";
+  if (!liveProject(detail.task)) return "paused";
+  const agent = detail.agents?.find((a) => a.id === binding?.agentId);
+  if (!agent || !openAgent(agent)) return "closed";
+  if (runChanged(binding, agent)) return "run-changed";
+  return "keep";
+}
+
+// Finished agents may have left their tmux session; open them only when the
+// session still exists.
+export const sessionCheckNeeded = (a) => ["done", "exited"].includes(a?.status);
+
 // reconcileTask compares the hub's agent list with the panes that exist.
 //   open:     agents that need a pane, with the server to use
 //   unknown:  open agents whose host matches no saved server
@@ -51,9 +80,7 @@ export function reconcileTask({
     if (
       t.task?.taskId === taskId &&
       t.task.agentId &&
-      !agents.some(
-        (a) => a.id === t.task.agentId && a.runId && t.task.runId !== a.runId,
-      )
+      !agents.some((a) => a.id === t.task.agentId && runChanged(t.task, a))
     )
       byAgent.set(t.task.agentId, t);
   const open = [],
@@ -95,9 +122,7 @@ export function reconcileTask({
     (t) =>
       t.task?.taskId === taskId &&
       (!ids.has(t.task.agentId) ||
-        agents.some(
-          (a) => a.id === t.task.agentId && a.runId && t.task.runId !== a.runId,
-        )),
+        agents.some((a) => a.id === t.task.agentId && runChanged(t.task, a))),
   );
   return { open, unknown, close, adopt };
 }

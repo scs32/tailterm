@@ -15,6 +15,7 @@ import "./work-items.css";
 import "./queue.css";
 import { createFilesView } from "./files-view.js";
 import { normalizeTaskRef } from "./task-ref.js";
+import { liveProject, restoreVerdict, sessionCheckNeeded } from "./tasks.js";
 import { createInactivityLock, IDLE_MINUTES } from "./inactivity.js";
 import { createAppearancePreview } from "./appearance-preview.js";
 import { normalizeTabDecoration, showTabDecoration } from "./tab-decoration.js";
@@ -235,25 +236,82 @@ async function restoreWorkspace(value) {
   restoring = true;
   if ($("#workspace")) $("#workspace").dataset.restoring = "true";
   try {
-    paneGroups.model.loadProjectLayouts(snapshot?.projectLayouts || []);
+    const saved = (snapshot?.tabs || []).flatMap((item) => {
+      const server = data.servers.find((s) => s.id === item.serverId);
+      if (!server || endpointKey(server) !== item.endpoint) return [];
+      const bookmark = data.sessions.find(
+        (b) => b.serverId === server.id && b.name === item.session,
+      );
+      return [
+        { item, server, task: normalizeTaskRef(item.task || bookmark?.task) },
+      ];
+    });
+    // Read the hub before reconnecting project panes, so panes of closed,
+    // replaced or paused agents are never opened only to be closed again.
+    const projectIds = [
+      ...saved.map((s) => s.task?.taskId),
+      ...(snapshot?.tasks || []),
+      ...(snapshot?.groups || []).map((g) => g.taskId),
+    ].filter(Boolean);
+    // Without saved project panes, the startup discovery settles bindings.
+    const hub = saved.some((s) => s.task)
+      ? await (async () => {
+          // Reconnecting would wait for Tailscale anyway; wait before the hub read.
+          if (staticMode && data.hub?.url)
+            await waitForTailscale().catch(() => {});
+          return (await taskHub?.preflight(projectIds)) || new Map();
+        })()
+      : new Map();
+    const dropped = new Set(
+      [...hub]
+        .filter(([, detail]) => detail === null || !liveProject(detail.task))
+        .map(([id]) => id),
+    );
+    const sessionExists = taskHub?.sessionProbe();
+    paneGroups.model.loadProjectLayouts(
+      (snapshot?.projectLayouts || []).filter(
+        (layout) => !dropped.has(layout.taskId),
+      ),
+    );
     if (snapshot?.tabs.length) {
       notice("Restoring your terminal workspace...");
-      for (const item of snapshot.tabs) {
-        const server = data.servers.find((s) => s.id === item.serverId);
-        if (!server || endpointKey(server) !== item.endpoint) continue;
-        const bookmark = data.sessions.find(
-          (b) => b.serverId === server.id && b.name === item.session,
-        );
+      for (const { item, server, task } of saved) {
+        if (task) {
+          const detail = hub.get(task.taskId);
+          const verdict = restoreVerdict(task, detail);
+          const agent = detail?.agents?.find((a) => a.id === task.agentId);
+          if (
+            !["keep", "unknown"].includes(verdict) ||
+            (verdict === "keep" &&
+              item.tmux &&
+              sessionCheckNeeded(agent) &&
+              (await sessionExists(server, item.session)) === false)
+          ) {
+            clearAgentBookmark(task.taskId, task.agentId, task.runId);
+            continue;
+          }
+        }
         const t = await connect(server, item.tmux, item.session, {
           restoreId: item.id,
           resumeOnly: item.tmux,
           target: item.target,
           decoration: item.decoration,
           fontSize: item.fontSize,
-          task: item.task || bookmark?.task,
+          task: task || undefined,
         });
         if (t) await t.initialReady;
       }
+      for (const taskId of dropped)
+        void api("/hub/forget-task", "POST", { taskId })
+          .then((updated) => {
+            data.sessions = updated.sessions;
+          })
+          .catch(() => {});
+      for (const group of snapshot.groups)
+        if (dropped.has(group.taskId)) {
+          delete group.taskId;
+          delete group.guests;
+        }
       paneGroups.model.groups = snapshot.groups;
       paneGroups.sync();
       activate(
@@ -265,7 +323,11 @@ async function restoreWorkspace(value) {
         "Workspace restored. Plain SSH tabs open a fresh shell; tmux sessions resume.",
       );
     }
-    if (snapshot) taskHub?.restore(snapshot.tasks, snapshot.hiddenAgents);
+    if (snapshot)
+      taskHub?.restore(
+        snapshot.tasks.filter((id) => !dropped.has(id)),
+        snapshot.hiddenAgents,
+      );
   } catch (e) {
     notice("Workspace restoration paused: " + e.message);
   } finally {
@@ -290,7 +352,15 @@ async function restoreWorkspace(value) {
     if ($("#workspace")) $("#workspace").dataset.restoring = "false";
     workspaceReady = true;
     scheduleWorkspaceSave();
+    void taskHub?.discover();
   }
+}
+function clearAgentBookmark(taskId, agentId, runId) {
+  return api("/hub/forget-agent", "POST", { taskId, agentId, runId })
+    .then((updated) => {
+      data.sessions = updated.sessions;
+    })
+    .catch(() => {});
 }
 async function api(url, method = "GET", body) {
   if (staticMode) return localVault.localAPI(url, method, body);
@@ -564,6 +634,18 @@ function mount() {
         boardView?.show(id);
       },
       showTerminals: () => modes?.set("terminals"),
+      clearAgentBookmark,
+      tmuxSessions: async (server) => {
+        if (
+          netState !== "Running" ||
+          endpointKey(server) !==
+            endpointKey(data.servers.find((s) => s.id === server.id) || {})
+        )
+          throw new Error("Server unavailable for a session check.");
+        return (
+          await browserTransport.browserTmux(ipn, server, peers)
+        ).sessions.map((s) => s.name);
+      },
       clearTaskBookmarks: (id) =>
         api("/hub/forget-task", "POST", { taskId: id })
           .then((updated) => {
@@ -1192,6 +1274,7 @@ function activate(id) {
 function disposeTab(t, replacing = false) {
   reconnects.cancel(t.id);
   t.disposed = true;
+  t.settleInitial?.();
   clearTimeout(t.activityTimer);
   t.history?.clear();
   t.close?.();
@@ -1713,6 +1796,9 @@ async function connect(
     t.initialReady = new Promise((resolve) => {
       initialDone = resolve;
     });
+    // A tab closed mid-connect (by the hub mirror or the user) must not leave
+    // the workspace restore waiting on it.
+    t.settleInitial = initialDone;
     if (replacementIndex >= 0) tabs.splice(replacementIndex, 0, t);
     else tabs.push(t);
     t.observer = new ResizeObserver(() => {

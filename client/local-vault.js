@@ -1050,6 +1050,16 @@ export async function localAPI(url, method = "GET", body = {}) {
       for (const session of d.sessions)
         if (session.task?.taskId === body.taskId) delete session.task;
     });
+  if (url === "/hub/forget-agent" && method === "POST")
+    return mutate((d) => {
+      for (const session of d.sessions)
+        if (
+          session.task?.taskId === body.taskId &&
+          session.task.agentId === body.agentId &&
+          (!body.runId || session.task.runId === body.runId)
+        )
+          delete session.task;
+    }, true);
   if (url === "/hub" && method === "POST")
     return editVault((d) => {
       const value = String(body?.url || "").trim();

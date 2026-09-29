@@ -34,7 +34,7 @@ import { exerciseVaultReset } from "./vault-reset-browser.mjs";
 import { openVault } from "../client/vault-crypto.js";
 import { attachSFTP } from "./sftp-fixture.mjs";
 import { createFixtureHub } from "./fixture-hub.mjs";
-import { exerciseTasks } from "./tasks-browser.mjs";
+import { exerciseTasks, exerciseTaskRestore } from "./tasks-browser.mjs";
 const fixtureHub = createFixtureHub();
 import { exerciseImageUpload } from "./upload-browser.mjs";
 import { finishRestoration } from "./restore-browser.mjs";
@@ -68,6 +68,37 @@ function identity(name) {
   return identities.get(name);
 }
 const authMethods = [];
+// Controls for project panes: which sessions were attached, attaches held
+// mid-connect until released, and sessions that no longer exist.
+const sshControl = {
+  sessions,
+  attachLog: [],
+  gone: new Set(),
+  holding: new Set(),
+  held: new Map(),
+  hold(name) {
+    this.holding.add(name);
+  },
+  release(name) {
+    this.holding.delete(name);
+    const run = this.held.get(name);
+    this.held.delete(name);
+    try {
+      run?.();
+    } catch {}
+  },
+};
+// The tmux session a resuming attach command names, if any.
+function attachedSession(command) {
+  if (!command.includes("attach-session")) return "";
+  const text = command.replace(/'\\''/g, "'");
+  const name = text.match(/"\$tailterm_tmux_name" = '([^']+)'/)?.[1];
+  if (name) return name;
+  const target = text.match(/tailterm_tmux_target='(\$[0-9]+)'/)?.[1];
+  return (
+    [...identities].find(([, identity]) => identity.id === target)?.[0] || ""
+  );
+}
 const ssh = new ssh2.Server(
   { hostKeys: [hostKey], banner: "Fixture SSH sign-in message" },
   (client) => {
@@ -116,7 +147,26 @@ const ssh = new ssh2.Server(
         };
         session.on("shell", (accept) => terminal(accept()));
         session.on("exec", (accept, reject, info) => {
+          const name = attachedSession(info.command);
+          if (!name) return exec(accept, reject, info);
+          sshControl.attachLog.push(name);
+          if (sshControl.gone.has(name)) {
+            const accepted = accept();
+            accepted.stderr.write(`can't find session: ${name}\n`);
+            accepted.exit(1);
+            accepted.end();
+          } else if (sshControl.holding.has(name))
+            sshControl.held.set(name, () => exec(accept, reject, info));
+          else exec(accept, reject, info);
+        });
+        const exec = (accept, reject, info) => {
           const accepted = accept();
+          if (info.command === "hostname -s") {
+            accepted.write("production\n");
+            accepted.exit(0);
+            accepted.end();
+            return;
+          }
           if (info.command.includes("capture-pane -p -e -J")) {
             accepted.write(
               Array.from(
@@ -205,6 +255,7 @@ const ssh = new ssh2.Server(
             discoveries++;
             accepted.write(
               [...sessions]
+                .filter((s) => !sshControl.gone.has(s))
                 .map(
                   (s) => `${s}|2|1|${identity(s).id}|${identity(s).created}\n`,
                 )
@@ -219,7 +270,7 @@ const ssh = new ssh2.Server(
             if (name) sessions.add(name[0]);
             terminal(accepted);
           }
-        });
+        };
       }),
     );
   },
@@ -723,6 +774,7 @@ try {
   if (process.env.TAILTERM_ACTIVITY_ONLY) throw new FocusedActivityComplete();
   await exerciseWorkspaceContinuity(page, context, () => terminalStarts);
   await exerciseTasks(page, fixtureHub, origin);
+  await exerciseTaskRestore(page, fixtureHub, sshControl);
   assert.equal(
     await page.locator("[data-mode=files]").count(),
     0,

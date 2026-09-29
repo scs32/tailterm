@@ -1,4 +1,6 @@
 import assert from "node:assert/strict";
+import { readFile } from "node:fs/promises";
+import { openVault } from "../client/vault-crypto.js";
 
 // Drives the task hub through the UI against tests/fixture-hub.mjs: hub
 // configuration, task creation with a spawned agent, mirroring of agents the
@@ -195,5 +197,294 @@ export async function exerciseTasks(page, hub, origin) {
   );
   console.log(
     "Tasks passed: dedicated task-named groups, automatic agent membership, hub configuration, spawn over SSH, attention, board, and close.",
+  );
+}
+
+// Login restore of project panes (wi_f378f10d36cb093b). Three lock/unlock
+// cycles against the fixture hub and SSH server:
+//   1. Hub changes while locked: a paused project, a replaced run, a finished
+//      agent whose tmux session is gone, new live and closed projects, and a
+//      project on an unknown host. Nothing may open and then close.
+//   2. The hub closes an agent while its restored pane is still connecting.
+//      The restore must finish, and saving must resume.
+//   3. The next login restores the tab opened after cycle 2 and nothing stale.
+export async function exerciseTaskRestore(page, hub, ssh) {
+  const passphrase = "static browser vault passphrase";
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  const waitFor = async (fn, label, timeout = 30000) => {
+    const deadline = Date.now() + timeout;
+    while (Date.now() < deadline) {
+      await answerPrompts();
+      if (await fn()) return;
+      await sleep(100);
+    }
+    throw new Error("Timed out waiting for " + label);
+  };
+  // Restored connections ask for the fixture password and host trust.
+  async function answerPrompts() {
+    const method = page.locator(".login-prompt [name=method]");
+    if (await method.isVisible()) await method.selectOption("password");
+    const password = page.locator(".login-prompt [name=password]");
+    if (await password.isVisible()) {
+      await password.fill("static-ssh-password");
+      await page.locator(".login-prompt button[type=submit]").click();
+    }
+    const trust = page.getByRole("button", { name: "Trust & continue" });
+    if (await trust.isVisible()) await trust.click();
+  }
+  const restored = () =>
+    page.locator('#workspace[data-restoring="false"]').count();
+  const palette = async (label) => {
+    await page.locator("#commands").click();
+    await page.locator("#command-query").fill(label);
+    await page
+      .locator("#command-results button")
+      .filter({ hasText: label })
+      .first()
+      .click();
+  };
+  // Every tab and the tmux session of each of its panes, read from the UI.
+  async function inventory() {
+    await page.locator(".mode-switch [data-mode=terminals]").click();
+    const out = [];
+    const count = await page.locator("#tabs .tab button[role=tab]").count();
+    for (let i = 0; i < count; i++) {
+      const tab = page.locator("#tabs .tab").nth(i);
+      await tab.locator("button[role=tab]").click();
+      const labels = await page
+        .locator(".pane-header .pane-label")
+        .allInnerTexts();
+      out.push({
+        name: await tab.locator(".tab-name").innerText(),
+        project: (await tab.getAttribute("class")).includes("task-tab"),
+        panes: labels.map((text) => {
+          const parts = text.split(" · ");
+          return { session: parts.at(-2), status: parts.at(-1) };
+        }),
+      });
+    }
+    return out;
+  }
+  const sessionsOf = (tabs, name) =>
+    tabs
+      .find((t) => t.project && t.name === name)
+      ?.panes.map((p) => p.session)
+      .sort();
+  const allPanes = (tabs) => tabs.flatMap((t) => t.panes.map((p) => p.session));
+  async function readVault() {
+    const record = await page.evaluate(
+      () =>
+        new Promise((resolve, reject) => {
+          const r = indexedDB.open("tailserve", 1);
+          r.onsuccess = () => {
+            const q = r.result
+              .transaction("vault")
+              .objectStore("vault")
+              .get("encrypted-v2");
+            q.onsuccess = () => resolve(q.result);
+            q.onerror = reject;
+          };
+          r.onerror = reject;
+        }),
+    );
+    return (await openVault(record, passphrase)).data;
+  }
+  const lock = async () => {
+    await page.locator("#lock").click();
+    await page.locator("#lockscreen").waitFor();
+  };
+  const unlock = async () => {
+    await page.locator("#password").fill(passphrase);
+    await page.locator("#unlock-button").click();
+    await page.locator("#workspace").waitFor();
+  };
+  const paneChanges = () => page.evaluate(() => ({ ...globalThis.__panes }));
+  const project = (name, agents) => {
+    const task = hub.api.createTask(name);
+    const byName = {};
+    for (const [agentName, host = "production"] of agents) {
+      const agent = hub.api.addAgent(task.id, { name: agentName, host });
+      hub.api.event(task.id, "started", agent.id);
+      ssh.sessions.add(agentName);
+      byName[agentName] = agent;
+    }
+    return { task, agents: byName };
+  };
+
+  // Count terminal elements added and removed in each page load.
+  await page.addInitScript(() => {
+    globalThis.__panes = { added: 0, removed: 0 };
+    const count = (nodes, key) => {
+      for (const node of nodes)
+        if (node.nodeType === 1)
+          globalThis.__panes[key] +=
+            (node.matches(".terminal-instance") ? 1 : 0) +
+            node.querySelectorAll(".terminal-instance").length;
+    };
+    new MutationObserver((records) => {
+      for (const r of records) {
+        count(r.addedNodes, "added");
+        count(r.removedNodes, "removed");
+      }
+    }).observe(document, { childList: true, subtree: true });
+  });
+
+  // Two bound projects with live panes.
+  const P = project("restore-paused", [["p1"], ["p2"]]);
+  const L = project("restore-live", [["l1"], ["l2"], ["l3"]]);
+  for (const { task } of [P, L]) {
+    await palette("Project: open terminals…");
+    await page.locator(`[data-open-task="${task.id}"]`).click();
+  }
+  await waitFor(async () => {
+    const tabs = await inventory();
+    return (
+      sessionsOf(tabs, "restore-paused")?.join() === "p1,p2" &&
+      sessionsOf(tabs, "restore-live")?.join() === "l1,l2,l3" &&
+      tabs.every((t) => t.panes.every((p) => p.status === "Connected"))
+    );
+  }, "bound project panes");
+
+  // Each pane saves its project binding in its session bookmark once tmux
+  // verifies the session.
+  await waitFor(async () => {
+    const { sessions } = await readVault();
+    return ["p1", "p2", "l1", "l2", "l3"].every(
+      (name) => sessions.find((s) => s.name === name)?.task,
+    );
+  }, "bound session bookmarks");
+
+  // Cycle 1: the hub changes while the workspace is locked.
+  const oldL2Run = L.agents.l2.runId;
+  await lock();
+  assert.ok((await readVault()).workspace.tasks.includes(P.task.id));
+  hub.api.pauseTask(P.task.id);
+  hub.api.restartAgent(L.agents.l2.id);
+  assert.notEqual(L.agents.l2.runId, oldL2Run);
+  hub.api.event(L.task.id, "done", L.agents.l3.id);
+  ssh.gone.add("l3");
+  const N = project("restore-new", [["n1"], ["n2"], ["n3"]]);
+  hub.api.event(N.task.id, "exited", N.agents.n2.id);
+  ssh.gone.add("n2");
+  hub.api.event(N.task.id, "done", N.agents.n3.id);
+  const X = project("restore-elsewhere", [["x1", "elsewhere"]]);
+  const C = project("restore-closed", [["c1"]]);
+  hub.api.closeTask(C.task.id);
+  ssh.attachLog.length = 0;
+  await unlock();
+  try {
+    await waitFor(restored, "cycle 1 restore", 90000);
+  } catch (error) {
+    error.message += `; attached ${ssh.attachLog.join(",")}; panes ${JSON.stringify(await paneChanges())}`;
+    throw error;
+  }
+  let tabs;
+  await waitFor(async () => {
+    tabs = await inventory();
+    return (
+      sessionsOf(tabs, "restore-live")?.join() === "l1,l2" &&
+      sessionsOf(tabs, "restore-new")?.join() === "n1,n3"
+    );
+  }, "live and discovered project panes");
+  await sleep(1000);
+  tabs = await inventory();
+  const cycle1 = [...ssh.attachLog];
+  const changes = await paneChanges();
+  assert.ok(changes.added >= 4, "the pane observer saw restored panes");
+  assert.equal(changes.removed, 0, "no pane opened and closed");
+  for (const name of ["p1", "p2", "l3", "n2", "x1", "c1"])
+    assert.ok(!cycle1.includes(name), `${name} is not attached`);
+  assert.equal(cycle1.filter((n) => n === "l2").length, 1, "l2 attaches once");
+  assert.equal(sessionsOf(tabs, "restore-live").join(), "l1,l2");
+  assert.equal(sessionsOf(tabs, "restore-new").join(), "n1,n3");
+  for (const name of ["restore-paused", "restore-closed", "restore-elsewhere"])
+    assert.ok(!tabs.some((t) => t.name === name), `${name} has no tab`);
+  const panes = allPanes(tabs);
+  assert.equal(new Set(panes).size, panes.length, "no agent has two panes");
+
+  // Cycle 2: the hub closes l1 while its restored pane is connecting.
+  ssh.hold("l1");
+  ssh.attachLog.length = 0;
+  await lock();
+  const afterCycle1 = await readVault();
+  assert.ok(!afterCycle1.workspace.tasks.includes(P.task.id), "P unbound");
+  assert.ok(afterCycle1.workspace.tasks.includes(L.task.id));
+  assert.ok(afterCycle1.workspace.tasks.includes(N.task.id));
+  assert.ok(!afterCycle1.workspace.tasks.includes(X.task.id));
+  assert.equal(
+    afterCycle1.sessions.find((s) => s.name === "l2")?.task?.runId,
+    L.agents.l2.runId,
+    "l2 is bound to its new run",
+  );
+  await unlock();
+  await waitFor(() => ssh.held.has("l1"), "held l1 attach", 90000);
+  assert.equal(await restored(), 0, "restore waits on l1");
+  const closedAt = Date.now();
+  hub.api.event(L.task.id, "closed", L.agents.l1.id);
+  await waitFor(restored, "restore after l1 closed", 20000);
+  const finishedIn = Date.now() - closedAt;
+  ssh.release("l1");
+  await waitFor(async () => {
+    tabs = await inventory();
+    return sessionsOf(tabs, "restore-live")?.join() === "l2";
+  }, "l1 pane removed");
+  // Saving resumed: a tab opened now is restored at the next login.
+  ssh.sessions.add("marker");
+  await page.locator("#new-tab").click();
+  await page.locator("#launcher-name").fill("marker");
+  await page.locator("#start-session").click();
+  await waitFor(async () => {
+    tabs = await inventory();
+    return tabs.some((t) =>
+      t.panes.some((p) => p.session === "marker" && p.status === "Connected"),
+    );
+  }, "marker tab");
+
+  // Cycle 3: the marker comes back and nothing stale attaches.
+  ssh.attachLog.length = 0;
+  await lock();
+  await unlock();
+  await waitFor(restored, "cycle 3 restore", 90000);
+  await waitFor(async () => {
+    tabs = await inventory();
+    return (
+      tabs.some((t) => t.panes.some((p) => p.session === "marker")) &&
+      sessionsOf(tabs, "restore-live")?.join() === "l2" &&
+      sessionsOf(tabs, "restore-new")?.join() === "n1,n3"
+    );
+  }, "cycle 3 panes");
+  const cycle3 = [...ssh.attachLog];
+  assert.ok(cycle3.includes("marker"), "marker tab restored");
+  for (const name of ["p1", "p2", "l1", "l3", "n2"])
+    assert.ok(!cycle3.includes(name), `${name} is not attached in cycle 3`);
+
+  // Bookmarks of closed and finished agents lose their project binding.
+  await page.locator("#backup-vault").click();
+  const download = page.waitForEvent("download");
+  await page.locator("#export-backup").click();
+  const backup = await openVault(
+    JSON.parse(await readFile(await (await download).path(), "utf8")),
+    passphrase,
+  );
+  await page.locator("#dialog-close").click();
+  const bookmark = (name) => backup.data.sessions.find((s) => s.name === name);
+  for (const name of ["p1", "p2", "l3", "l1"])
+    assert.ok(!bookmark(name)?.task, `${name} bookmark is unbound`);
+  for (const name of ["n1", "n3"])
+    assert.equal(bookmark(name)?.task?.taskId, N.task.id, `${name} bound`);
+
+  // Leave the hub and tabs as the later checks expect them.
+  for (const { task } of [L, N, X]) hub.api.closeTask(task.id);
+  await waitFor(
+    async () => (await page.locator("#tabs .tab.task-tab").count()) === 0,
+    "restore projects closed",
+  );
+  const marker = page.locator("#tabs .tab", {
+    has: page.locator(".tab-name", { hasText: /^marker$/ }),
+  });
+  if (await marker.count()) await marker.locator("[data-close]").click();
+  for (const name of ["l3", "n2"]) ssh.gone.delete(name);
+  console.log(
+    `Task restore passed: stuck restore finished ${finishedIn} ms after the hub closed a connecting pane, no flash, paused/closed projects dropped, live projects bound, finished sessions checked, bookmarks unbound.`,
   );
 }

@@ -51,6 +51,7 @@ export function createFixtureHub({
         allowAgentSpawn,
         orchestrator,
         status: "open",
+        pauseState: "active",
         createdAt: now(),
         createdBy: { node, user },
         closedAt: null,
@@ -105,6 +106,7 @@ export function createFixtureHub({
         running: "running",
         done: "done",
         needs_input: "needs_input",
+        exited: "exited",
         closed: "closed",
       }[kind];
       if (a && status) a.status = status;
@@ -136,6 +138,22 @@ export function createFixtureHub({
       t.closedAt = now();
       emit(taskId, "task_closed", { text: t.name });
       return t;
+    },
+    // Pausing closes every run and keeps the project open, as the hub does.
+    pauseTask(taskId) {
+      const t = tasks.get(taskId);
+      for (const a of agents.values())
+        if (a.taskId === taskId && a.status !== "closed")
+          api.event(taskId, "closed", a.id);
+      t.pauseState = "paused";
+      emit(taskId, "task_updated");
+      return t;
+    },
+    // A fresh run of the same agent in the same tmux session.
+    restartAgent(agentId) {
+      const a = agents.get(agentId);
+      a.runId = id("run");
+      return api.event(a.taskId, "started", a.id);
     },
     agents: () => [...agents.values()],
     messages: () => messages,

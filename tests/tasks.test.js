@@ -5,6 +5,10 @@ import {
   reconcileTask,
   taskRollup,
   applyEvents,
+  liveProject,
+  restoreVerdict,
+  runChanged,
+  sessionCheckNeeded,
   MAX_TASK_PANES,
 } from "../client/tasks.js";
 import { normalizeTaskRef } from "../client/task-ref.js";
@@ -165,4 +169,106 @@ test("retired agents retain panes and ignore late lifecycle hooks until explicit
   assert.equal(agents[0].status, "done");
   applyEvents(agents, [{ kind: "retired", agentId: "worker" }]);
   assert.equal(agents[0].status, "retired");
+});
+
+test("liveProject keeps active and resuming projects, drops paused and closed", () => {
+  assert.equal(liveProject({ status: "open" }), true, "older hubs");
+  assert.equal(liveProject({ status: "open", pauseState: "" }), true);
+  assert.equal(liveProject({ status: "open", pauseState: "active" }), true);
+  assert.equal(liveProject({ status: "open", pauseState: "resuming" }), true);
+  assert.equal(liveProject({ status: "open", pauseState: "paused" }), false);
+  assert.equal(
+    liveProject({ status: "open", pauseState: "cleanup_pending" }),
+    false,
+  );
+  assert.equal(liveProject({ status: "closed", pauseState: "active" }), false);
+  assert.equal(liveProject(undefined), false);
+});
+
+test("restoreVerdict decides saved task panes from the hub state", () => {
+  const RUN = "run_00000000000000a1",
+    NEXT = "run_00000000000000a2";
+  const live = agent(1, { runId: RUN });
+  const binding = normalizeTaskRef({
+    taskId: TASK,
+    agentId: live.id,
+    runId: RUN,
+  });
+  const detail = (task, agents = [live]) => ({
+    task: { id: TASK, status: "open", pauseState: "active", ...task },
+    agents,
+  });
+  assert.equal(restoreVerdict(binding, undefined), "unknown", "hub down");
+  assert.equal(restoreVerdict(binding, null), "gone");
+  assert.equal(restoreVerdict(binding, detail({ status: "closed" })), "closed");
+  assert.equal(
+    restoreVerdict(binding, detail({ pauseState: "paused" })),
+    "paused",
+  );
+  assert.equal(
+    restoreVerdict(binding, detail({ pauseState: "cleanup_pending" })),
+    "paused",
+  );
+  assert.equal(restoreVerdict(binding, detail({}, [])), "closed", "missing");
+  assert.equal(
+    restoreVerdict(binding, detail({}, [{ ...live, status: "closed" }])),
+    "closed",
+  );
+  assert.equal(
+    restoreVerdict(binding, detail({}, [{ ...live, runId: NEXT }])),
+    "run-changed",
+  );
+  assert.equal(restoreVerdict(binding, detail({})), "keep");
+  assert.equal(
+    restoreVerdict(binding, detail({ pauseState: "resuming" })),
+    "keep",
+  );
+  assert.equal(
+    restoreVerdict(binding, detail({}, [{ ...live, status: "exited" }])),
+    "keep",
+    "finished agents are kept; their session is checked separately",
+  );
+  // An agent without a run keeps any binding, as in reconcileTask.
+  assert.equal(
+    restoreVerdict(binding, detail({}, [{ ...live, runId: undefined }])),
+    "keep",
+  );
+});
+
+test("restoreVerdict run-changed matches the pane reconcileTask closes", () => {
+  const RUN = "run_00000000000000b1";
+  const cases = [
+    [RUN, RUN],
+    [RUN, "run_00000000000000b2"],
+    [undefined, RUN],
+    [RUN, undefined],
+    [undefined, undefined],
+  ];
+  for (const [bound, current] of cases) {
+    const a = agent(7, { runId: current });
+    const task = normalizeTaskRef({
+      taskId: TASK,
+      agentId: a.id,
+      runId: bound,
+    });
+    const tabs = [
+      { id: "t", server: servers[0], tmux: true, session: "a7", task },
+    ];
+    const closes =
+      reconcileTask({ taskId: TASK, agents: [a], tabs, servers }).close
+        .length === 1;
+    const verdict = restoreVerdict(task, {
+      task: { status: "open", pauseState: "active" },
+      agents: [a],
+    });
+    assert.equal(runChanged(task, a), closes, `${bound} -> ${current}`);
+    assert.equal(verdict === "run-changed", closes, `${bound} -> ${current}`);
+  }
+});
+
+test("sessionCheckNeeded covers finished agents only", () => {
+  assert.equal(sessionCheckNeeded({ status: "done" }), true);
+  assert.equal(sessionCheckNeeded({ status: "exited" }), true);
+  for (const status of ["running", "starting", "needs_input", "retired"])
+    assert.equal(sessionCheckNeeded({ status }), false, status);
 });

@@ -40,6 +40,8 @@ import {
   applyEvents,
   matchServer,
   openAgent,
+  liveProject,
+  sessionCheckNeeded,
 } from "./tasks.js";
 import {
   agentCleanupCommand,
@@ -85,6 +87,8 @@ export function createTaskHub(host) {
   const hidden = new Set();
   const bound = new Set(); // task ids mirrored into tabs
   const cache = new Map(); // taskId -> {task, agents} for tooltips/dialogs
+  // Startup binding of live projects; see discover().
+  const discovery = { pending: false, running: null, done: false };
   let tasksList = [];
   let launchEpoch = 0;
   const serverHosts = new Map();
@@ -308,8 +312,10 @@ export function createTaskHub(host) {
     }
     if (!!ipn !== connected) viewClient?.refreshConnection?.();
     connected = !!ipn;
-    if (ipn) sync();
-    else stopAll();
+    if (ipn) {
+      sync();
+      if (discovery.pending) void runDiscovery();
+    } else stopAll();
     return client;
   }
   const ready = () => !!client && !!host.getIPN();
@@ -503,7 +509,10 @@ export function createTaskHub(host) {
       host.bookmark(tab);
     }
     syncLayout();
-    for (const tab of r.close) host.closeTab(tab.id, { fromHub: true });
+    for (const tab of r.close) {
+      host.clearAgentBookmark?.(feed.taskId, tab.task.agentId, tab.task.runId);
+      host.closeTab(tab.id, { fromHub: true });
+    }
     if (feed.task?.status === "closed") {
       const group = host.paneGroups()?.model.taskGroup(feed.taskId);
       if (group) {
@@ -511,7 +520,10 @@ export function createTaskHub(host) {
         delete group.guests;
       }
     }
+    const probe = sessionProbe();
     for (const { agent, server } of r.open) {
+      if (feed.stopped) return;
+      if (await finishedSessionGone(feed, agent, server, probe)) continue;
       if (feed.stopped) return;
       try {
         const tab = await host.connect(server, true, agent.session, {
@@ -527,6 +539,133 @@ export function createTaskHub(host) {
     syncLayout();
     host.scheduleWorkspaceSave();
   }
+  // A done or exited agent may have left its tmux session. Probe once per
+  // agent run and status, so each event batch does not list sessions again.
+  async function finishedSessionGone(feed, agent, server, probe) {
+    if (!sessionCheckNeeded(agent)) return false;
+    feed.sessions ||= new Map();
+    const key = `${agent.runId || ""}:${agent.status}`;
+    const cached = feed.sessions.get(agent.id);
+    if (cached?.key === key) return cached.gone;
+    const gone = (await probe(server, agent.session)) === false;
+    feed.sessions.set(agent.id, { key, gone });
+    return gone;
+  }
+
+  // sessionProbe answers whether a tmux session exists on a server: true,
+  // false, or "unknown" when the listing fails (callers then open as before).
+  // Each probe lists a server's sessions at most once.
+  function sessionProbe() {
+    const listings = new Map();
+    return async (server, name) => {
+      if (!host.tmuxSessions) return "unknown";
+      if (!listings.has(server.id))
+        listings.set(
+          server.id,
+          Promise.resolve()
+            .then(() => host.tmuxSessions(server))
+            .catch(() => null),
+        );
+      const names = await listings.get(server.id);
+      return Array.isArray(names) ? names.includes(name) : "unknown";
+    };
+  }
+
+  // Read the hub state of the projects bound to saved panes before the login
+  // restore reconnects them. Returns taskId -> getTask detail, null for a
+  // project the hub no longer has (404). A project missing from the map is
+  // unknown: the hub is unconfigured, unreachable or slow, and the restore
+  // proceeds as before. Never throws.
+  async function preflight(taskIds = [], { timeoutMs = 15000 } = {}) {
+    const details = new Map();
+    const ids = [...new Set(taskIds.filter((id) => normalizeTaskId(id)))];
+    if (!ids.length || !normalizeHubURL(host.getData()?.hub?.url))
+      return details;
+    const deadline = Date.now() + timeoutMs;
+    while (!ready() && Date.now() < deadline)
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    if (!ready()) return details;
+    const current = client;
+    await Promise.all(
+      ids.map(async (id) => {
+        let timer;
+        try {
+          const detail = await Promise.race([
+            current.getTask(id),
+            new Promise((resolve) => {
+              timer = setTimeout(resolve, Math.max(0, deadline - Date.now()));
+            }),
+          ]);
+          if (!detail?.task) return;
+          details.set(id, detail);
+          cache.set(id, { task: detail.task, agents: detail.agents });
+        } catch (error) {
+          if (error?.status === 404) details.set(id, null);
+        } finally {
+          clearTimeout(timer);
+        }
+      }),
+    );
+    return details;
+  }
+
+  // Once per page load, after the workspace restore: bind every open,
+  // non-paused project with an agent on a saved server, and drop bound
+  // projects the hub reports closed, paused or missing. Waits for the hub to
+  // become reachable; a failed listing retries on the next refresh.
+  function discover() {
+    if (discovery.done) return discovery.running || Promise.resolve();
+    discovery.pending = true;
+    return runDiscovery();
+  }
+  function runDiscovery() {
+    if (discovery.running) return discovery.running;
+    if (!discovery.pending || !ready()) return Promise.resolve();
+    discovery.running = (async () => {
+      const current = client;
+      const tasks = await current.listTasks();
+      if (current !== client) return;
+      discovery.pending = false;
+      discovery.done = true;
+      const byId = new Map(tasks.map((task) => [task.id, task]));
+      for (const id of [...bound])
+        if (!liveProject(byId.get(id))) forgetTask(id);
+      const candidates = [];
+      for (const task of tasks) {
+        if (!liveProject(task) || bound.has(task.id)) continue;
+        try {
+          const detail = await current.getTask(task.id);
+          if (!liveProject(detail.task)) continue;
+          cache.set(task.id, { task: detail.task, agents: detail.agents });
+          candidates.push(detail);
+        } catch {}
+      }
+      const onSavedServer = (detail) =>
+        detail.agents.some(
+          (agent) =>
+            openAgent(agent) &&
+            !hidden.has(agent.id) &&
+            matchServer(agent.host, taskServers()),
+        );
+      let unmatched = candidates.filter((detail) => !onSavedServer(detail));
+      if (unmatched.length) {
+        await resolveAgentHosts();
+        unmatched = unmatched.filter((detail) => !onSavedServer(detail));
+      }
+      if (current !== client) return;
+      for (const detail of candidates)
+        if (!unmatched.includes(detail)) bound.add(detail.task.id);
+      sync();
+      host.scheduleWorkspaceSave();
+      host.render();
+    })()
+      .catch(() => {})
+      .finally(() => {
+        discovery.running = null;
+      });
+    return discovery.running;
+  }
+
   // Put a pane into the project's tab, or make its own tab carry the project.
   function place(taskId, tab) {
     const groups = host.paneGroups();
@@ -3402,6 +3541,9 @@ export function createTaskHub(host) {
     attach,
     detach,
     restore,
+    preflight,
+    sessionProbe,
+    discover,
     rollup,
     taskOfTab,
     bound: () => [...bound],
