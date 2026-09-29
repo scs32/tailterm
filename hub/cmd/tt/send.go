@@ -160,8 +160,14 @@ func cmdSend(e env, args []string) error {
 		target = "owner"
 	}
 	if env.To != "" && env.To != "owner" && !strings.HasPrefix(env.To, "role:") {
-		if target, err = resolveAgent(ctx, c, *task, env.To); err != nil {
+		var name string
+		if target, name, err = resolveRecipient(ctx, c, *task, env.To); err != nil {
 			return err
+		}
+		// A rotated handler's name forwards to its successor; the stated
+		// recipient must name the agent the message is routed to.
+		if name != "" && name != env.To && target != env.To {
+			env.To = name
 		}
 	}
 	if *requestID == "" {

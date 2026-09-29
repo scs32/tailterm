@@ -935,7 +935,9 @@ func (s *Store) TeamQueueAction(ctx context.Context, task string, req api.TeamQu
 			if head != e.ID {
 				return zero, fmt.Errorf("%w: not queue head", api.ErrConflict)
 			}
-			handlers, err := tx.QueryContext(ctx, `SELECT `+agentCols+` FROM agents WHERE task_id=? AND role=? AND status NOT IN ('retired','closed','exited') ORDER BY created_at,id`, task, api.AgentRoleDatabaseHandler)
+			// Neither side of an open handler rotation takes a new lease.
+			handlers, err := tx.QueryContext(ctx, `SELECT `+agentCols+` FROM agents WHERE task_id=? AND role=? AND status NOT IN ('retired','closed','exited')
+ AND id NOT IN (SELECT old_agent_id FROM handler_rotations WHERE task_id=? AND state='prepared' UNION SELECT successor_agent_id FROM handler_rotations WHERE task_id=? AND state='prepared') ORDER BY created_at,id`, task, api.AgentRoleDatabaseHandler, task, task)
 			if err != nil {
 				return zero, err
 			}

@@ -690,6 +690,14 @@ func cmdRelay(args []string) error {
 					fmt.Fprintf(os.Stderr, "[tt relay] team queue: %v\n", queueErr)
 				}
 			}
+			// Handler rotation shares the queue's request budget and backoff.
+			if queueBackoff.ready(time.Now()) {
+				rotationErr := relayHandlerRotationTick(ctx)
+				queueBackoff.observe(time.Now(), rotationErr)
+				if rotationErr != nil {
+					fmt.Fprintf(os.Stderr, "[tt relay] handler rotation: %v\n", rotationErr)
+				}
+			}
 			cancel()
 			if time.Since(lastClaudeRetry) >= 15*time.Second {
 				lastClaudeRetry = time.Now()

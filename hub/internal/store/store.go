@@ -182,7 +182,7 @@ func scanTask(row interface{ Scan(...any) error }) (api.Task, error) {
 	var t api.Task
 	var created, paused string
 	var closed sql.NullString
-	err := row.Scan(&t.ID, &t.Name, &t.Goal, &t.Status, &created, &t.CreatedBy.Node, &t.CreatedBy.User, &closed, &t.AllowAgentSpawn, &t.MaxNewAgents, &t.Swarm, &t.Orchestrator, &t.LeadRevision, &t.CleanupPending, &t.PauseState, &t.LifecycleGeneration, &t.PauseGeneration, &t.PauseCleanupPending, &t.PauseHandoffPending, &paused)
+	err := row.Scan(&t.ID, &t.Name, &t.Goal, &t.Status, &created, &t.CreatedBy.Node, &t.CreatedBy.User, &closed, &t.AllowAgentSpawn, &t.MaxNewAgents, &t.Swarm, &t.Orchestrator, &t.LeadRevision, &t.CleanupPending, &t.PauseState, &t.LifecycleGeneration, &t.PauseGeneration, &t.PauseCleanupPending, &t.PauseHandoffPending, &paused, &t.PrimaryHandlerID, &t.HandlerRevision)
 	if err != nil {
 		return t, err
 	}
@@ -203,7 +203,7 @@ CASE WHEN tasks.status='closed' THEN (SELECT count(*) FROM agents WHERE task_id=
 tasks.pause_state,tasks.lifecycle_generation,tasks.pause_generation,
 CASE WHEN tasks.pause_state<>'active' THEN (SELECT count(*) FROM project_pause_targets pt JOIN project_pause_cycles pc ON pc.id=pt.cycle_id JOIN agents pa ON pa.id=pt.agent_id AND pa.run_id=pt.run_id WHERE pc.task_id=tasks.id AND pc.pause_generation=tasks.pause_generation AND pa.cleanup_done=0) ELSE 0 END,
 CASE WHEN tasks.pause_state<>'active' THEN (SELECT count(*) FROM project_pause_targets pt JOIN project_pause_cycles pc ON pc.id=pt.cycle_id WHERE pc.task_id=tasks.id AND pc.pause_generation=tasks.pause_generation AND (pt.service_verified=0 OR pt.service_disposition='unresolved')) ELSE 0 END,
-tasks.paused_at`
+tasks.paused_at,tasks.primary_handler_id,tasks.handler_revision`
 
 func (s *Store) GetTask(ctx context.Context, id string) (api.Task, error) {
 	t, err := scanTask(s.db.QueryRowContext(ctx, `SELECT `+taskCols+` FROM tasks WHERE id=?`, id))
@@ -467,6 +467,31 @@ func scanAgent(row interface{ Scan(...any) error }) (api.Agent, error) {
 }
 
 func (s *Store) AddAgent(ctx context.Context, taskID string, req api.AddAgentRequest, by api.Caller) (api.Agent, error) {
+	if req.TemplateDigest != "" && req.Role != api.AgentRoleDatabaseHandler {
+		return api.Agent{}, api.ErrInvalid
+	}
+	priorRun := ""
+	if req.TemplateDigest != "" && req.AgentID != "" {
+		if prior, err := s.GetAgent(ctx, req.AgentID); err == nil {
+			priorRun = prior.RunID
+		}
+	}
+	a, err := s.addAgent(ctx, taskID, req, by)
+	if err != nil {
+		return a, err
+	}
+	// Handler rotation compares a run's template with the current one. Only a
+	// run this call started records one: replaying the launch of an existing
+	// legacy run must not mark its older prompt current.
+	if a.RunID != priorRun {
+		if err = s.recordHandlerRun(ctx, a, req.TemplateDigest); err != nil {
+			return a, err
+		}
+	}
+	return a, nil
+}
+
+func (s *Store) addAgent(ctx context.Context, taskID string, req api.AddAgentRequest, by api.Caller) (api.Agent, error) {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
 	t, err := s.GetTask(ctx, taskID)
@@ -915,6 +940,9 @@ func (s *Store) GetAgent(ctx context.Context, id string) (api.Agent, error) {
 	if err = s.loadActivity(ctx, &a); err != nil {
 		return a, err
 	}
+	if err = s.loadSuccessor(ctx, &a); err != nil {
+		return a, err
+	}
 	err = s.db.QueryRowContext(ctx, `SELECT revision FROM item_team_leads WHERE task_id=? AND agent_id=? AND run_id=? AND state<>'closed'`, a.TaskID, a.ID, a.RunID).Scan(&a.ItemLeadRevision)
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return a, err
@@ -949,6 +977,9 @@ func (s *Store) ListAgents(ctx context.Context, taskID string) ([]api.Agent, err
 			return nil, err
 		}
 		if err = s.loadAgentWorkItem(ctx, &out[i]); err != nil {
+			return nil, err
+		}
+		if err = s.loadSuccessor(ctx, &out[i]); err != nil {
 			return nil, err
 		}
 		err = s.db.QueryRowContext(ctx, `SELECT revision FROM item_team_leads WHERE task_id=? AND agent_id=? AND run_id=? AND state<>'closed'`, taskID, out[i].ID, out[i].RunID).Scan(&out[i].ItemLeadRevision)
@@ -1128,6 +1159,16 @@ func (s *Store) PostMessage(ctx context.Context, taskID string, req api.PostMess
 		// remain board-wide. Explicit, person and self replies retain their To.
 		if req.AgentID != "" && req.To == "" && (req.Envelope == nil || req.Envelope.To == "") && replyAuthor != "" && replyAuthor != req.AgentID && replyAuthorStatus != api.AgentClosed && replyAuthorStatus != api.AgentExited {
 			req.To = replyAuthor
+		}
+		// A reply to a rotated handler goes to its live successor.
+		if req.AgentID != "" && req.To == "" && (req.Envelope == nil || req.Envelope.To == "") && replyAuthor != "" && replyAuthorStatus == api.AgentClosed {
+			successor, err := liveSuccessor(ctx, tx, replyAuthor)
+			if err != nil {
+				return api.Message{}, err
+			}
+			if successor != "" && successor != req.AgentID {
+				req.To = successor
+			}
 		}
 	}
 	// Capture effective board-wide routing before normalizing the reserved owner.
