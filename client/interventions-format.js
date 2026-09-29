@@ -52,7 +52,7 @@ export function interventionsHtml(summary) {
   const total = summary?.total || 0;
   let html = `<p class="interventions-headline" data-interventions-headline>${esc(interventionHeadline(summary))}${summary?.timeZone ? ` <span class="fine">· days in ${esc(summary.timeZone)}</span>` : ""}</p>`;
   if (!total) return html;
-  html += `<table class="usage-breakdown interventions-kinds" data-interventions-kinds><caption>By kind</caption><tbody>${kindCounts(
+  html += `<table class="interventions-table interventions-kinds" data-interventions-kinds><caption>By kind</caption><tbody>${kindCounts(
     summary.byKind,
   )
     .map(
@@ -60,7 +60,7 @@ export function interventionsHtml(summary) {
         `<tr><td>${esc(kind)}</td><td>${esc(count)}</td></tr>`,
     )
     .join("")}</tbody></table>`;
-  html += `<table class="usage-breakdown interventions-days" data-interventions-days><caption>By day</caption><thead><tr><th scope="col">Day</th><th scope="col">Total</th><th scope="col">Linked</th><th scope="col">Kinds</th></tr></thead><tbody>${(
+  html += `<table class="interventions-table interventions-days" data-interventions-days><caption>By day</caption><thead><tr><th scope="col">Day</th><th scope="col">Total</th><th scope="col">Linked</th><th scope="col">Kinds</th></tr></thead><tbody>${(
     summary.days || []
   )
     .map(

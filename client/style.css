@@ -5853,42 +5853,55 @@ body:is(
     margin-left: 0;
   }
 }
-/* Projects: owner interventions reuse the Usage disclosure and tables. */
-.project-interventions .interventions-headline {
+/* Projects: owner interventions, laid out like the Usage disclosure. */
+.project-interventions {
+  border-top: 1px solid var(--border, #343434);
+  margin-top: 0.7rem;
+  padding-top: 0.6rem;
+}
+.project-interventions summary {
+  cursor: pointer;
+  font-size: 0.85rem;
+}
+.interventions-controls {
+  display: flex;
+  gap: 0.4rem;
+  margin: 0.6rem 0;
+}
+.interventions-controls button {
+  height: 1.9rem;
+  box-sizing: border-box;
+  padding-block: 0;
+  line-height: 1;
+}
+.interventions-headline {
   margin: 0.35rem 0;
   font-size: 0.8rem;
 }
-.project-interventions .usage-breakdown {
-  width: auto;
+.interventions-table {
+  border-collapse: collapse;
+  font-size: 0.75rem;
   margin: 0.35rem 0;
 }
-.project-interventions .usage-breakdown td,
-.project-interventions th {
-  padding-right: 1.2rem;
-}
-.project-interventions caption {
+.interventions-table caption {
   text-align: left;
-  font-size: 0.75rem;
   color: var(--muted, #999);
   padding: 0.25rem 0;
 }
-.project-interventions th {
+.interventions-table th,
+.interventions-table td {
+  padding: 0.25rem 1.2rem 0.25rem 0.25rem;
   text-align: left;
+  vertical-align: top;
+  overflow-wrap: anywhere;
+}
+.interventions-table th {
   font-weight: normal;
   color: var(--muted, #999);
-  padding: 0.25rem;
 }
-.project-interventions .interventions-unlinked ul {
+.interventions-unlinked ul {
   margin: 0;
   padding-left: 1rem;
   font-size: 0.75rem;
   overflow-wrap: anywhere;
-}
-/* Short numeric columns stay tabular on phones, unlike Usage breakdowns. */
-.project-interventions .usage-breakdown td {
-  display: table-cell;
-}
-.project-interventions .usage-controls button {
-  padding-block: 0;
-  line-height: 1;
 }
