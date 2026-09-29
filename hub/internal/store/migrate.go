@@ -26,6 +26,9 @@ func migrate(db *sql.DB) error {
 	if _, err := db.Exec(obligationsSchema); err != nil {
 		return err
 	}
+	if _, err := db.Exec(ownerInterventionsSchema); err != nil {
+		return err
+	}
 	if _, err := db.Exec(`CREATE TABLE IF NOT EXISTS team_close_receipts (
 		task_id TEXT NOT NULL REFERENCES tasks(id),
 		request_id TEXT NOT NULL,

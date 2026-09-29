@@ -2,7 +2,11 @@ package main
 
 import (
 	"context"
+	"net/http"
+	"net/http/httptest"
+	"reflect"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -92,5 +96,89 @@ func TestOwnerIDValidationDoesNotWidenSharedValidID(t *testing.T) {
 		if api.ValidID(id, prefix) {
 			t.Fatalf("shared ValidID unexpectedly accepted %s as %s", id, prefix)
 		}
+	}
+}
+
+func TestOwnerInterveneRecordsAndListsInterventions(t *testing.T) {
+	e, c, task, _ := cliWorkItemFixture(t)
+	e.agent, e.agentName = "", "" // the owner CLI has no agent identity
+	ctx := context.Background()
+	item, err := c.CreateWorkItem(ctx, task.ID, api.CreateWorkItemRequest{Kind: "feature", Title: "Concerned item", RequestID: "cli-concerned"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	home, err := c.CreateTask(ctx, api.CreateTaskRequest{Name: "CLI product home"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	product, err := c.CreateWorkItem(ctx, home.ID, api.CreateWorkItemRequest{Kind: "feature", Title: "Product fix", RequestID: "cli-product"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	out, err := captureCLIOutput(t, func() error {
+		return cmdOwner(e, []string{"intervene", "--kind", "nudge", "--item", item.ID, "--product-item", product.ID, "--text", "Nudged the stalled builder"})
+	})
+	if err != nil || !strings.HasPrefix(out, "intervention #") || !strings.Contains(out, "nudge on "+item.ID+" (product fix "+product.ID+")") {
+		t.Fatalf("intervene output %q: %v", out, err)
+	}
+	messages, err := c.ListMessages(ctx, task.ID, 0, "", 50)
+	if err != nil || len(messages) != 1 {
+		t.Fatalf("board: %+v %v", messages, err)
+	}
+	m := messages[0]
+	want := api.Intervention{Kind: "nudge", ItemTaskID: task.ID, ItemID: item.ID, ProductTaskID: home.ID, ProductItemID: product.ID}
+	wantLinks := []api.MessageWorkItem{{ItemTaskID: task.ID, ItemID: item.ID, ItemRevision: item.Revision, Relationship: "primary"}}
+	if m.Intervention == nil || *m.Intervention != want || !reflect.DeepEqual(m.WorkItems, wantLinks) || m.From.AgentID != "" || m.From.User != "owner" {
+		t.Fatalf("recorded message: %+v", m)
+	}
+	// Same-minute identical retry derives the same request ID: no duplicate.
+	if _, err = captureCLIOutput(t, func() error {
+		return cmdOwner(e, []string{"intervene", "--kind", "nudge", "--item", item.ID, "--product-item", product.ID, "--text", "Nudged the stalled builder"})
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = captureCLIOutput(t, func() error {
+		return cmdOwner(e, []string{"intervene", "--kind", "release", "--item", item.ID, "--text", "Released by hand", "--request-id", "cli-release"})
+	}); err != nil {
+		t.Fatal(err)
+	}
+	out, err = captureCLIOutput(t, func() error { return cmdOwner(e, []string{"interventions", "--tz", "UTC"}) })
+	if err != nil || !strings.Contains(out, "2 interventions (UTC); 1 of 2 linked to a product item") || !strings.Contains(out, "by kind: release 1, nudge 1") || !strings.Contains(out, "unlinked:") || !strings.Contains(out, "release  "+item.ID) {
+		t.Fatalf("interventions output %q: %v", out, err)
+	}
+	if err = cmdOwner(e, []string{"interventions", "--tz", "Mars/Olympus"}); err == nil {
+		t.Fatal("invalid time zone accepted")
+	}
+}
+
+func TestOwnerInterveneRefusesAgentsAndBadInputBeforeAnyRequest(t *testing.T) {
+	var requests atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests.Add(1)
+		http.Error(w, "unexpected request", http.StatusTeapot)
+	}))
+	t.Cleanup(srv.Close)
+	agent := env{hub: srv.URL, task: "tsk_0000000000000001", agent: "agt_0000000000000001", agentName: "builder"}
+	valid := []string{"intervene", "--kind", "nudge", "--item", "wi_0000000000000001", "--text", "t"}
+	for _, args := range [][]string{valid, {"interventions"}} {
+		if err := cmdOwner(agent, args); err == nil || !strings.Contains(err.Error(), "not agent sessions") {
+			t.Fatalf("agent %v: err=%v", args, err)
+		}
+	}
+	owner := agent
+	owner.agent, owner.agentName = "", ""
+	for _, args := range [][]string{
+		{"intervene", "--kind", "foo", "--item", "wi_0000000000000001", "--text", "t"},
+		{"intervene", "--kind", "nudge", "--item", "wi_0000000000000001", "--text", "  "},
+		{"intervene", "--kind", "nudge", "--text", "t"},
+		{"intervene", "--kind", "nudge", "--item", "wi_0000000000000001", "--product-item", "bad", "--text", "t"},
+		{"intervene", "--kind", "nudge", "--item", "wi_0000000000000001", "--text", "t", "extra"},
+	} {
+		if err := cmdOwner(owner, args); err == nil || !strings.Contains(err.Error(), "usage: tt owner intervene") {
+			t.Fatalf("owner %v: err=%v", args, err)
+		}
+	}
+	if n := requests.Load(); n != 0 {
+		t.Fatalf("refused commands sent %d requests", n)
 	}
 }

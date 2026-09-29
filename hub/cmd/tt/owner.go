@@ -5,7 +5,10 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"os"
 	"regexp"
+	"sort"
+	"strings"
 	"time"
 
 	"github.com/scs32/tailterm/hub/internal/api"
@@ -19,7 +22,17 @@ var obligationIDRE = regexp.MustCompile(`^obl_[0-9a-f]{16}$`)
 // cmdOwner is the owner's control over obligations (broker phase 3):
 // extend a deadline, answer on the recipient's behalf, or cancel.
 func cmdOwner(e env, args []string) error {
-	usage := errors.New("usage: tt owner extend OBLIGATION_ID --for 30m [--reason T] | answer OBLIGATION_ID (--text T | --approve) [--session S] | delegate OBLIGATION_ID --session S --authorization REF [--agent ID --run ID] | cancel OBLIGATION_ID --reason T")
+	if len(args) > 0 && (args[0] == "intervene" || args[0] == "interventions") {
+		// Checked before any request: an agent session never records or reads these.
+		if e.agent != "" {
+			return errors.New("tt owner is for the owner, not agent sessions")
+		}
+		if args[0] == "intervene" {
+			return cmdOwnerIntervene(e, args[1:])
+		}
+		return cmdOwnerInterventions(e, args[1:])
+	}
+	usage := errors.New("usage: tt owner extend OBLIGATION_ID --for 30m [--reason T] | answer OBLIGATION_ID (--text T | --approve) [--session S] | delegate OBLIGATION_ID --session S --authorization REF [--agent ID --run ID] | cancel OBLIGATION_ID --reason T | intervene --kind KIND --item ID [--product-item ID] --text T | interventions [--tz ZONE]")
 	if len(args) < 2 {
 		return usage
 	}
@@ -85,4 +98,141 @@ func cmdOwner(e env, args []string) error {
 		fmt.Println()
 	}
 	return nil
+}
+
+const interventionUsage = "usage: tt owner intervene --kind KIND --item ID [--product-item ID] --text T [--request-id R] [--json]\n  KIND is one of "
+
+// cmdOwnerIntervene records one owner-side intervention on the Board.
+func cmdOwnerIntervene(e env, args []string) error {
+	usage := errors.New(interventionUsage + strings.Join(api.InterventionKinds, ", "))
+	fs := flag.NewFlagSet("owner intervene", flag.ContinueOnError)
+	task := fs.String("task", e.task, "project id")
+	kind := fs.String("kind", "", "one of "+strings.Join(api.InterventionKinds, ", "))
+	item := fs.String("item", "", "the work item the intervention concerns (this project)")
+	product := fs.String("product-item", "", "the product item expected to remove this intervention (any project)")
+	text := fs.String("text", "", "what the owner did and why")
+	requestID := fs.String("request-id", "", "stable retry key (default: derived per minute)")
+	asJSON := fs.Bool("json", false, "print the recorded message as JSON")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if fs.NArg() != 0 || *task == "" {
+		return usage
+	}
+	req := api.CreateInterventionRequest{Kind: *kind, ItemID: *item, ProductItemID: *product, Text: *text, RequestID: *requestID}
+	if err := api.ValidateIntervention(req); err != nil {
+		return fmt.Errorf("%v\n%v", err, usage)
+	}
+	if req.RequestID == "" {
+		scope := time.Now().UTC().Truncate(time.Minute).Format(time.RFC3339)
+		digest := sha256.Sum256([]byte(req.Kind + "\x00" + req.ItemID + "\x00" + req.ProductItemID + "\x00" + req.Text + "\x00" + scope))
+		req.RequestID = fmt.Sprintf("owner-intervene-%x", digest[:12])
+	}
+	c, err := e.client(10 * time.Second)
+	if err != nil {
+		return err
+	}
+	ctx, cancel := ctxTimeout(10 * time.Second)
+	defer cancel()
+	m, err := c.CreateIntervention(ctx, *task, req)
+	if err != nil {
+		return err
+	}
+	if *asJSON {
+		printJSON(m)
+		return nil
+	}
+	link := "no product item"
+	if m.Intervention != nil && m.Intervention.ProductItemID != "" {
+		link = "product fix " + m.Intervention.ProductItemID
+	}
+	fmt.Printf("intervention #%d recorded: %s on %s (%s)\n", m.Seq, req.Kind, req.ItemID, link)
+	return nil
+}
+
+// cmdOwnerInterventions prints the project's per-day and per-kind counts.
+func cmdOwnerInterventions(e env, args []string) error {
+	fs := flag.NewFlagSet("owner interventions", flag.ContinueOnError)
+	task := fs.String("task", e.task, "project id")
+	zone := fs.String("tz", localTimeZoneName(), "IANA time zone for day buckets")
+	asJSON := fs.Bool("json", false, "print every intervention and the summary as JSON")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if fs.NArg() != 0 || *task == "" {
+		return errors.New("usage: tt owner interventions [--tz ZONE] [--json]")
+	}
+	c, err := e.client(30 * time.Second)
+	if err != nil {
+		return err
+	}
+	ctx, cancel := ctxTimeout(30 * time.Second)
+	defer cancel()
+	var all api.InterventionList
+	for after := int64(0); ; {
+		page, err := c.ListInterventions(ctx, *task, after, api.MaxInterventionPage, *zone)
+		if err != nil {
+			return err
+		}
+		all.Summary = page.Summary
+		all.Interventions = append(all.Interventions, page.Interventions...)
+		if page.NextAfter == 0 {
+			break
+		}
+		after = page.NextAfter
+	}
+	if *asJSON {
+		printJSON(all)
+		return nil
+	}
+	s := all.Summary
+	fmt.Printf("%d interventions (%s); %d of %d linked to a product item\n", s.Total, s.TimeZone, s.Linked, s.Total)
+	if s.Total == 0 {
+		return nil
+	}
+	fmt.Printf("by kind: %s\n", formatKindCounts(s.ByKind))
+	for _, day := range s.Days {
+		fmt.Printf("%s  %3d  linked %d  %s\n", day.Day, day.Total, day.Linked, formatKindCounts(day.ByKind))
+	}
+	if len(s.Unlinked) > 0 {
+		fmt.Println("unlinked:")
+		for _, ref := range s.Unlinked {
+			fmt.Printf("  #%d  %s  %s  %s\n", ref.Seq, ref.Day, ref.Kind, ref.ItemID)
+		}
+	}
+	return nil
+}
+
+// formatKindCounts lists kinds in the fixed vocabulary order.
+func formatKindCounts(counts map[string]int) string {
+	order := map[string]int{}
+	for i, kind := range api.InterventionKinds {
+		order[kind] = i
+	}
+	kinds := make([]string, 0, len(counts))
+	for kind := range counts {
+		kinds = append(kinds, kind)
+	}
+	sort.Slice(kinds, func(i, j int) bool { return order[kinds[i]] < order[kinds[j]] })
+	parts := make([]string, 0, len(kinds))
+	for _, kind := range kinds {
+		parts = append(parts, fmt.Sprintf("%s %d", kind, counts[kind]))
+	}
+	return strings.Join(parts, ", ")
+}
+
+// localTimeZoneName returns this machine's IANA zone so day buckets match the
+// owner's calendar; the hub rejects anything it cannot load.
+func localTimeZoneName() string {
+	if tz := os.Getenv("TZ"); tz != "" && !strings.HasPrefix(tz, ":") && !strings.HasPrefix(tz, "/") {
+		if _, err := time.LoadLocation(tz); err == nil && tz != "Local" {
+			return tz
+		}
+	}
+	if target, err := os.Readlink("/etc/localtime"); err == nil {
+		if i := strings.LastIndex(target, "zoneinfo/"); i >= 0 {
+			return target[i+len("zoneinfo/"):]
+		}
+	}
+	return "UTC"
 }

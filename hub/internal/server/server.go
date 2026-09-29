@@ -110,6 +110,8 @@ func New(st *store.Store, identity Identity) *Server {
 	m.HandleFunc("POST /v1/tasks/{id}/decisions", s.createDecision)
 	m.HandleFunc("GET /v1/tasks/{id}/decisions", s.listDecisions)
 	m.HandleFunc("POST /v1/tasks/{id}/decisions/{seq}/answer", s.answerDecision)
+	m.HandleFunc("POST /v1/tasks/{id}/interventions", s.createIntervention)
+	m.HandleFunc("GET /v1/tasks/{id}/interventions", s.listInterventions)
 	m.HandleFunc("POST /v1/tasks/{id}/messages/read", s.markRead)
 	m.HandleFunc("POST /v1/tasks/{id}/required-deliveries", retiredWriter)
 	m.HandleFunc("POST /v1/tasks/{id}/operational-records", retiredWriter)
@@ -222,6 +224,8 @@ func fail(w http.ResponseWriter, err error) {
 		writeError(w, http.StatusConflict, err.Error())
 	case errors.Is(err, store.ErrDecisionAnswerForbidden):
 		writeError(w, http.StatusForbidden, "only a human can answer a decision request")
+	case errors.Is(err, store.ErrInterventionForbidden):
+		writeError(w, http.StatusForbidden, "only the owner can record an owner intervention")
 	case errors.As(err, &envelopeErr):
 		writeJSON(w, http.StatusBadRequest, api.ErrorResponse{Error: "invalid envelope", Code: "invalid-envelope", Problems: envelopeErr.Problems})
 	case errors.Is(err, api.ErrInvalid):

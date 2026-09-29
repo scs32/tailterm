@@ -59,6 +59,7 @@ var exportQueries = []exportQuery{
 	{"messagePostReceipts", `SELECT receipt_id,task_id,agent_id,by_node,by_user,request_id,payload_hash,message_seq,created_at FROM message_post_requests WHERE task_id=? ORDER BY created_at,receipt_id`, oneArg},
 	{"decisionRequests", `SELECT * FROM decision_requests WHERE task_id=? ORDER BY message_seq`, oneArg},
 	{"decisionAnswers", `SELECT * FROM decision_answers WHERE task_id=? ORDER BY message_seq`, oneArg},
+	{"ownerInterventions", `SELECT * FROM owner_interventions WHERE task_id=? ORDER BY message_seq`, oneArg},
 	{"workItemRevisions", `SELECT * FROM work_item_revisions WHERE item_task_id=? ORDER BY item_seq,revision`, oneArg},
 	{"workItemHistoryGaps", `SELECT * FROM work_item_history_gaps WHERE item_task_id=? ORDER BY seq`, oneArg},
 	{"workItemHistoryState", `SELECT * FROM work_item_history_state WHERE item_task_id=? ORDER BY item_id`, oneArg},

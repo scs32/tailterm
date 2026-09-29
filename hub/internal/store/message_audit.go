@@ -16,14 +16,16 @@ COALESCE(r.receipt_id,''),COALESCE(r.request_id,''),COALESCE(r.task_id,''),COALE
 COALESCE(dr.question,''),COALESCE(dr.options,''),COALESCE(dr.recommended_option_id,''),COALESCE(dr.recommendation_reason,''),
 COALESCE(da.request_seq,0),COALESCE(da.option_id,''),COALESCE(da.text,''),
 COALESCE(m.system_notice_kind,''),COALESCE(m.system_notice_id,''),m.envelope,
-COALESCE(ms.kind,''),COALESCE(ms.source_id,''),COALESCE(ms.user_id,'')`
+COALESCE(ms.kind,''),COALESCE(ms.source_id,''),COALESCE(ms.user_id,''),
+COALESCE(oi.kind,''),COALESCE(oi.item_task_id,''),COALESCE(oi.item_id,''),COALESCE(oi.product_task_id,''),COALESCE(oi.product_item_id,'')`
 
 const messageSelectJoins = `
 LEFT JOIN message_work_item_links l ON l.message_seq=m.seq
 LEFT JOIN message_post_requests r ON r.message_seq=m.seq
 LEFT JOIN decision_requests dr ON dr.message_seq=m.seq
 LEFT JOIN decision_answers da ON da.message_seq=m.seq
-LEFT JOIN message_sources ms ON ms.message_seq=m.seq`
+LEFT JOIN message_sources ms ON ms.message_seq=m.seq
+LEFT JOIN owner_interventions oi ON oi.message_seq=m.seq`
 
 type rowScanner interface {
 	Scan(...any) error
@@ -39,6 +41,7 @@ func scanMessage(row rowScanner) (api.Message, error) {
 	var decisionAnswer api.DecisionAnswer
 	var systemNoticeKind, systemNoticeID, envelope string
 	var source api.MessageSource
+	var intervention api.Intervention
 	var itemRevision, orderSeq int64
 	err := row.Scan(
 		&message.Seq, &message.TaskID,
@@ -51,6 +54,7 @@ func scanMessage(row rowScanner) (api.Message, error) {
 		&decisionAnswer.RequestSeq, &decisionAnswer.OptionID, &decisionAnswer.Text,
 		&systemNoticeKind, &systemNoticeID, &envelope,
 		&source.Kind, &source.ID, &source.UserID,
+		&intervention.Kind, &intervention.ItemTaskID, &intervention.ItemID, &intervention.ProductTaskID, &intervention.ProductItemID,
 	)
 	if err != nil {
 		return message, err
@@ -85,6 +89,9 @@ func scanMessage(row rowScanner) (api.Message, error) {
 	}
 	if source.Kind != "" {
 		message.Source = &source
+	}
+	if intervention.Kind != "" {
+		message.Intervention = &intervention
 	}
 	if envelope != "" {
 		message.Envelope = &api.Envelope{}

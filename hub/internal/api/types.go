@@ -225,6 +225,7 @@ type Sender struct {
 type Message struct {
 	DecisionRequest  *DecisionRequest    `json:"decisionRequest,omitempty"`
 	DecisionAnswer   *DecisionAnswer     `json:"decisionAnswer,omitempty"`
+	Intervention     *Intervention       `json:"intervention,omitempty"`
 	WorkItems        []MessageWorkItem   `json:"workItems,omitempty"`
 	WorkOrderMessage *MessageReference   `json:"workOrderMessage,omitempty"`
 	PostReceipt      *MessagePostReceipt `json:"postReceipt,omitempty"`
