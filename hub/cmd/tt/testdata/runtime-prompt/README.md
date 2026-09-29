@@ -37,6 +37,17 @@ Fixtures for `TestRuntimePromptClassify`, `TestRuntimePromptAnswer` and
 | `codex-model-picker` | Live. `/model` opened Codex's bottom-pane selection list under that transcript: `Select Model and Effort`, seven numbered models with `› 7. GPT-5.5 (current)` selected, `enter select · esc back`. | `unknown` |
 | `codex-rate-limit.reconstructed` | **Reconstructed, not captured.** Codex shows this menu only at 90% or more of a rate limit, and a fake key has none, so it could not be triggered on demand. Rows 1-18 are the real transcript rows of `codex-model-picker`. The menu below them uses that capture's bottom-pane list layout and attributes, with the title, subtitle, option labels and descriptions from the Codex 0.156.1 binary strings (`rate-limit-switch-prompt`, `Approaching rate limits`, `Switch to <model> for lower credit usage?`, `Uses fewer credits for upcoming turns.`, `Keep current model`, `Keep current model (never show again)`, `Hide future rate limit reminders about switching models.`). The option order follows those strings, the first option selected. The footer is a guess copied from the `/model` list. Replace this file when a live occurrence is captured. | `codex_rate_limit_switch` (selected option 0; target option 2) |
 
+## Derived Claude fixtures (review #14417 b1)
+
+Each is a byte-for-byte copy of a live `../claude-pane/` capture with only the
+input text replaced, to show that an idle input box is never read as a dialog.
+
+| Fixture | Source and change | Classifier result |
+| --- | --- | --- |
+| `claude-typed-numbered.derived` | `typed.ansi`, typed `hello there` → `1. rename the helper` | no prompt |
+| `claude-typed-allow.derived` | `typed.ansi`, typed `hello there` → `please allow this change` (holds the dialog phrase `allow this`) | no prompt |
+| `claude-suggestion-numbered.derived` | `suggestion.ansi`, faint suggestion `only test files` → `1. rename the helper` | no prompt |
+
 The classifier needs the exact title and option labels for a known kind, and a
 key-hint footer as the last row for any Codex prompt, so a reconstruction
 error in the footer or column spacing does not change the result. A label

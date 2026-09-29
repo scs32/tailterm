@@ -209,33 +209,35 @@ func classifyCodexPrompt(lines []string) (runtimePromptMatch, bool) {
 	return runtimePromptMatch{Kind: kind, Fingerprint: runtimePromptPrint("codex", kind, area), Options: options}, true
 }
 
-// classifyClaudePrompt reads Claude's active prompt area. Below an idle
-// input box's top rule (claudePromptArea) nothing is a dialog. With no input
-// box, as while a dialog is up, the dialog starts at the rule Claude draws
-// above it: the nearest rule above its first numbered option, or the last
-// rule on screen. The transcript above that rule is never read.
+// classifyClaudePrompt reads Claude's active prompt area. An idle input box
+// (claudePromptArea reports it boxed) is never a dialog: its rows are the
+// agent's draft or Claude's suggestion, whatever they say. With no input box,
+// as while a dialog is up, the dialog starts at the rule Claude draws above
+// it: the nearest rule above its first numbered option, or the last rule on
+// screen. The transcript above that rule is never read.
 func classifyClaudePrompt(lines []string) (runtimePromptMatch, bool) {
 	area, boxed := claudePromptArea(lines)
-	if !boxed {
-		first := -1
-		for i := len(area) - 1; i >= 0 && i >= len(area)-30; i-- {
-			if m := runtimePromptOptionRow.FindStringSubmatch(area[i]); m != nil && m[2] == "1" {
-				first = i
-				break
-			}
-		}
-		if first < 0 {
-			first = len(area) - 1
-		}
-		top := max(0, len(area)-12)
-		for i := first; i >= 0 && i >= first-20; i-- {
-			if claudeRuleLine(area[i]) {
-				top = i
-				break
-			}
-		}
-		area = area[top:]
+	if boxed {
+		return runtimePromptMatch{}, false
 	}
+	first := -1
+	for i := len(area) - 1; i >= 0 && i >= len(area)-30; i-- {
+		if m := runtimePromptOptionRow.FindStringSubmatch(area[i]); m != nil && m[2] == "1" {
+			first = i
+			break
+		}
+	}
+	if first < 0 {
+		first = len(area) - 1
+	}
+	top := max(0, len(area)-12)
+	for i := first; i >= 0 && i >= first-20; i-- {
+		if claudeRuleLine(area[i]) {
+			top = i
+			break
+		}
+	}
+	area = area[top:]
 	var rows []string
 	for _, row := range area {
 		if !blankRow(row) {

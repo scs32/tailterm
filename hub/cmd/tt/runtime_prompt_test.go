@@ -116,6 +116,11 @@ func TestRuntimePromptClassify(t *testing.T) {
 		{"claude", "claude-pane/scrollback-dialog-words.ansi"},
 		{"claude", "claude-pane/scrollback-dialog-words-typed.ansi"},
 		{"claude", "claude-pane/typed.ansi"},
+		// Drafts and a faint suggestion that look like an option or a dialog
+		// phrase inside the idle input box (review #14417 b1).
+		{"claude", "runtime-prompt/claude-typed-numbered.derived.ansi"},
+		{"claude", "runtime-prompt/claude-typed-allow.derived.ansi"},
+		{"claude", "runtime-prompt/claude-suggestion-numbered.derived.ansi"},
 		{"codex", "runtime-prompt/codex-idle-composer.ansi"},
 		{"codex", "runtime-prompt/codex-scrollback-quote.ansi"},
 	} {
