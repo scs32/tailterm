@@ -33,6 +33,8 @@ export function createQueueView({
   let root,
     visible = false,
     generation = 0,
+    viewEpoch = 0,
+    intentVersion = 0,
     subscription,
     subscriptionClient,
     activeClient,
@@ -50,6 +52,7 @@ export function createQueueView({
     stopOwnerClock;
   const errors = new Map(),
     intents = new Map(),
+    intentChanges = [],
     memory = new Map();
   const persistence = intentPersistence || {
     list: async (key) =>
@@ -70,6 +73,7 @@ export function createQueueView({
     stopOwnerClock?.();
     visible = false;
     generation++;
+    viewEpoch++;
     subscription?.stop();
     subscription = null;
     subscriptionClient = null;
@@ -144,7 +148,8 @@ export function createQueueView({
             "",
         nextPersistenceScope = await scopeKey(connected);
       if (!stillCurrent()) return;
-      const savedIntents = await persistence.list(nextPersistenceScope),
+      const intentMark = intentVersion,
+        savedIntents = await persistence.list(nextPersistenceScope),
         nextIntents = new Map(
           savedIntents.map((intent) => [intent.id, intent]),
         );
@@ -169,6 +174,14 @@ export function createQueueView({
           ? await connected.listOwnerObligations(nextScope)
           : [];
       if (!stillCurrent()) return;
+      // A refresh read may predate this view's own committed actions. Keep the
+      // newer entry revision and the intent changes made after the snapshot.
+      const known =
+        activeClient === connected &&
+        activeClientScope === nextPersistenceScope &&
+        scope === nextScope
+          ? new Map(entries.map((entry) => [entry.id, entry]))
+          : new Map();
       ownerRequests = nextOwnerRequests;
       capability = nextCapability;
       tasks = nextTasks;
@@ -176,7 +189,21 @@ export function createQueueView({
       persistenceScope = nextPersistenceScope;
       intents.clear();
       for (const [id, intent] of nextIntents) intents.set(id, intent);
-      entries = next;
+      for (const change of intentChanges) {
+        if (
+          change.version <= intentMark ||
+          change.scope !== nextPersistenceScope
+        )
+          continue;
+        if (change.intent) intents.set(change.intent.id, change.intent);
+        else if (intents.get(change.id)?.requestId === change.requestId)
+          intents.delete(change.id);
+      }
+      intentChanges.length = 0;
+      entries = next.map((entry) => {
+        const current = known.get(entry.id);
+        return current?.revision > entry.revision ? current : entry;
+      });
       if (!entries.some((entry) => entry.id === selected))
         selected = entries[0]?.id || "";
       activeClient = connected;
@@ -308,7 +335,7 @@ export function createQueueView({
   function canSend(session) {
     return (
       visible &&
-      generation === session.generation &&
+      viewEpoch === session.viewEpoch &&
       scope === session.taskId &&
       persistenceScope === session.connectionScope
     );
@@ -320,6 +347,10 @@ export function createQueueView({
       activeClient === session.connected &&
       activeClientScope === session.connectionScope
     );
+  }
+  // Persisted intent changes after a refresh's snapshot, applied when it commits.
+  function noteIntentChange(change) {
+    intentChanges.push({ version: ++intentVersion, ...change });
   }
   async function saveIntent(id, entry, payload, session) {
     const intent = {
@@ -333,6 +364,7 @@ export function createQueueView({
       updatedAt: new Date().toISOString(),
     };
     await persistence.save(intent);
+    noteIntentChange({ scope: intent.scope, intent });
     if (isCurrent(session)) {
       intents.set(id, intent);
       render();
@@ -348,6 +380,11 @@ export function createQueueView({
         intent.payload,
       );
       await persistence.remove(intent.scope, intent.id, intent.requestId);
+      noteIntentChange({
+        scope: intent.scope,
+        id: intent.id,
+        requestId: intent.requestId,
+      });
       const current = intents.get(intent.id);
       if (
         current?.requestId === intent.requestId &&
@@ -394,7 +431,7 @@ export function createQueueView({
     const session = {
         connected: activeClient,
         connectionScope: activeClientScope,
-        generation,
+        viewEpoch,
         taskId: entry.targetTaskId,
       },
       requestId = crypto.randomUUID(),
@@ -452,7 +489,7 @@ export function createQueueView({
     const session = {
       connected: activeClient,
       connectionScope: activeClientScope,
-      generation,
+      viewEpoch,
       taskId: entry.targetTaskId,
       entryId: entry.id,
     };
@@ -499,11 +536,11 @@ export function createQueueView({
     const intent = intents.get(id);
     if (!intent) return;
     const connected = client(),
-      requestAt = generation,
+      requestAt = viewEpoch,
       connectionScope = await scopeKey(connected);
     if (
       !visible ||
-      generation !== requestAt ||
+      viewEpoch !== requestAt ||
       client() !== connected ||
       connectionScope !== intent.scope ||
       persistenceScope !== intent.scope ||
@@ -521,7 +558,7 @@ export function createQueueView({
     await submitIntent(intent, {
       connected,
       connectionScope,
-      generation: requestAt,
+      viewEpoch: requestAt,
       taskId: intent.taskId,
     });
   }
@@ -530,6 +567,7 @@ export function createQueueView({
     if (!intent) return;
     intents.delete(id);
     await persistence.remove(intent.scope, id, intent.requestId);
+    noteIntentChange({ scope: intent.scope, id, requestId: intent.requestId });
     render();
   }
   return { mount, show, hide, reload };
