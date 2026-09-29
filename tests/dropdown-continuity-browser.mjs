@@ -127,9 +127,12 @@ async function serve(req, res) {
     res.end(contents);
   } catch (error) { if (!res.destroyed) { res.writeHead(500, { "content-type": "application/json" }); res.end(JSON.stringify({ error: error.message })); } }
 }
-async function open(mode, width = 1440) {
+async function open(mode, width = 1440, clockTime) {
   if (page) { await page.evaluate(async () => { if (window.qa) await qa.stop(); }).catch(() => {}); await page.close(); }
   page = await browser.newPage({ viewport: { width, height: width === 390 ? 844 : 1000 } });
+  // The Projects view starts its 30s status clock in show(), so a fake clock
+  // must be installed before the page loads for fastForward to drive it.
+  if (clockTime) await page.clock.install({ time: clockTime });
   await page.route("**/*", route => new URL(route.request().url()).origin === origin ? route.continue() : route.abort());
   page.setDefaultTimeout(6000);
   await page.goto(`${origin}/?mode=${mode}`);
@@ -241,7 +244,7 @@ async function statusPointerCommitCase(engine, mode, documentRelease) {
   }, { selector, documentRelease });
   await expect(page.locator(selector)).toHaveValue("done");
   await expect(page.locator(".work-items-empty")).toContainText(
-    `No ${mode} match these filters.`,
+    `No ${mode} match this search and the selected filters.`,
   );
   assert.equal(
     await page.locator(".work-item").count(),
@@ -265,7 +268,7 @@ async function keyboardStatusCommitCase(engine, mode) {
   await page.keyboard.press("i");
   await expect(page.locator(selector)).toHaveValue("in_progress");
   await expect(page.locator(".work-items-empty")).toContainText(
-    `No ${mode} match these filters.`,
+    `No ${mode} match this search and the selected filters.`,
   );
   observations.push({
     engine,
@@ -310,8 +313,12 @@ try {
       await shot(`${name}-${mode}-closed-choice`);
     });
     await check(`${name} Projects30s status clock keeps Closed expanded`, async () => {
-      await open("tasks"); await page.locator(".board-closed summary").click();
-      await page.clock.install({ time: new Date(Date.now() + 95000) });
+      // Agents turn offline 90s after they were last seen. Start 70s after the
+      // oldest one, so only the 30s clock tick can reveal "offline".
+      const { agents } = await api("GET", `/v1/tasks/${data.alpha.task.id}`);
+      const oldest = Math.min(...agents.filter(a => a.runId).map(a => Date.parse(a.lastSeenAt) > 0 ? Date.parse(a.lastSeenAt) : Date.parse(a.createdAt)));
+      await open("tasks", 1440, new Date(oldest + 70000)); await page.locator(".board-closed summary").click();
+      await expect(page.locator(".task-detail-card")).not.toContainText("offline");
       await page.clock.fastForward(30001);
       await expect(page.locator(".task-detail-card")).toContainText("offline");
       await expect.poll(() => page.locator(".board-closed").evaluate(el => el.open)).toBe(true);
@@ -370,7 +377,7 @@ try {
       await expect(page.locator("#board-to")).toHaveValue(recipient.id);
       await page.locator("#board-text").fill("Keep removed-recipient draft unsent.");
       const opened = await activateSelect("#board-to");
-      await api("DELETE", `/v1/tasks/${data.alpha.task.id}/agents/${recipient.id}`);
+      await api("DELETE", `/v1/tasks/${data.alpha.task.id}/agents/${recipient.id}?runId=${recipient.runId}`);
       await refresh(`${name} recipient removed while menu held`);
       assert.ok((await nativeState("#board-to")).same);
       if (opened.open) assert.equal((await nativeState("#board-to")).open, true);
