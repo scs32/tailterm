@@ -486,6 +486,8 @@ export function createCachedHubClient({
     refreshMessageAuditOverlay: refreshAuditOverlay,
     listDecisions: (task, params) =>
       read(`/v1/tasks/${task}/decisions` + query(params)),
+    listInterventions: (task, params) =>
+      read(`/v1/tasks/${task}/interventions` + query(params)),
     listWorkItems: (params) => read("/v1/work-items" + query(params)),
     getWorkItem: (task, id) => read(`/v1/tasks/${task}/work-items/${id}`),
     listWorkItemRevisions: (task, id, params) =>

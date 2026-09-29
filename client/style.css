@@ -5853,3 +5853,42 @@ body:is(
     margin-left: 0;
   }
 }
+/* Projects: owner interventions reuse the Usage disclosure and tables. */
+.project-interventions .interventions-headline {
+  margin: 0.35rem 0;
+  font-size: 0.8rem;
+}
+.project-interventions .usage-breakdown {
+  width: auto;
+  margin: 0.35rem 0;
+}
+.project-interventions .usage-breakdown td,
+.project-interventions th {
+  padding-right: 1.2rem;
+}
+.project-interventions caption {
+  text-align: left;
+  font-size: 0.75rem;
+  color: var(--muted, #999);
+  padding: 0.25rem 0;
+}
+.project-interventions th {
+  text-align: left;
+  font-weight: normal;
+  color: var(--muted, #999);
+  padding: 0.25rem;
+}
+.project-interventions .interventions-unlinked ul {
+  margin: 0;
+  padding-left: 1rem;
+  font-size: 0.75rem;
+  overflow-wrap: anywhere;
+}
+/* Short numeric columns stay tabular on phones, unlike Usage breakdowns. */
+.project-interventions .usage-breakdown td {
+  display: table-cell;
+}
+.project-interventions .usage-controls button {
+  padding-block: 0;
+  line-height: 1;
+}
