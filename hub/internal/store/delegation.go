@@ -673,7 +673,7 @@ func (s *Store) verifyWindowDelegate(ctx context.Context, tx *sql.Tx, taskID, ki
 	var out delegatedRoute
 	rows, err := tx.QueryContext(ctx, `SELECT r.window_id,r.request_kind,r.request_seq,r.obligation_id,r.category,r.notice_seq,r.routed_at,r.returned_at,r.answer_seq,r.answered_by_agent_id,r.answered_by_run_id,r.rationale,r.followed_recommendation,r.answered_at
 FROM owner_delegation_routes r JOIN owner_delegation_windows w ON w.id=r.window_id
-WHERE r.task_id=? AND r.request_kind=? AND r.request_seq=? AND w.delegate_agent_id=? ORDER BY r.routed_at DESC`, taskID, kind, seq, agentID)
+WHERE r.task_id=? AND r.request_kind=? AND r.request_seq=? AND w.delegate_agent_id=? ORDER BY r.routed_at DESC,r.rowid DESC`, taskID, kind, seq, agentID)
 	if err != nil {
 		return out, err
 	}
