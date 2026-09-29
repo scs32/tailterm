@@ -49,24 +49,33 @@ export function tmuxCommand(
   resumeOnly = false,
   target,
   cwd = "",
+  { ignoreSize = false } = {},
 ) {
   validateSession(name);
   validateStartDirectory(cwd);
   const start = cwd && !resumeOnly ? " -c " + shellQuote(cwd) : "";
+  // An agent tile never overrides other clients' size (tmux 3.2+ ignore-size).
+  // The agent window's fixed manual size (tt spawn) is what protects it.
+  const attachFlags = ignoreSize && resumeOnly ? "$tailterm_tmux_attach_flags " : "";
   return (
     "/bin/sh -c " +
     shellQuote(
       resolver(path) +
         clipboardFeatures() +
+        (attachFlags ? attachFlagsFeature() : "") +
         (resumeOnly
           ? target
             ? exactTarget(target)
             : exactSession(name)
           : "") +
         // Browser terminals always support UTF-8, even when SSH has no locale.
-        `"$tailterm_tmux_bin" -u $tailterm_tmux_features ${resumeOnly ? 'attach-session -t "$tailterm_tmux_target"' : "new-session -A -s " + shellQuote(name) + start} \\; if-shell -F '#{==:#{set-clipboard},off}' 'set-option -s set-clipboard external' \\; set-option mouse on; tailterm_tmux_status=$?; if [ "$tailterm_tmux_status" -ne 0 ]; then printf 'tmux failed with exit status %s; see its error above.\\n' "$tailterm_tmux_status" >&2; fi; exit "$tailterm_tmux_status"`,
+        `"$tailterm_tmux_bin" -u $tailterm_tmux_features ${resumeOnly ? "attach-session " + attachFlags + '-t "$tailterm_tmux_target"' : "new-session -A -s " + shellQuote(name) + start} \\; if-shell -F '#{==:#{set-clipboard},off}' 'set-option -s set-clipboard external' \\; set-option mouse on; tailterm_tmux_status=$?; if [ "$tailterm_tmux_status" -ne 0 ]; then printf 'tmux failed with exit status %s; see its error above.\\n' "$tailterm_tmux_status" >&2; fi; exit "$tailterm_tmux_status"`,
     )
   );
+}
+function attachFlagsFeature() {
+  // attach-session -f ignore-size needs tmux 3.2+; older tmux attaches plainly.
+  return `tailterm_tmux_attach_flags='-f ignore-size'; case "$("$tailterm_tmux_bin" -V 2>/dev/null)" in 'tmux 0.'*|'tmux 1.'*|'tmux 2.'*|'tmux 3.0'*|'tmux 3.1'|'tmux 3.1a'|'tmux 3.1b'|'tmux 3.1c') tailterm_tmux_attach_flags='' ;; esac; `;
 }
 function clipboardFeatures() {
   // -T is available in tmux 3.2+. Older tmux uses the terminal's Ms capability.

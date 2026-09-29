@@ -257,3 +257,28 @@ func TestActivityAlertRoutingAndTeamIsolation(t *testing.T) {
 		t.Fatalf("team totals not isolated: %+v", queue.Entries)
 	}
 }
+
+func TestStuckActivityState(t *testing.T) {
+	s, task := newRuntimePromptStore(t)
+	ctx := context.Background()
+	a, err := s.AddAgent(ctx, task.ID, api.AddAgentRequest{AgentID: api.NewID("agt"), Name: "builder", Host: "mini", Session: "fake", Runtime: "claude", Cwd: t.TempDir()}, api.Caller{Node: "fixture", User: "owner"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 9, 29, 21, 0, 0, 0, time.UTC)
+	stuck := api.AgentActivity{State: "stuck", ObservedAt: now, Reason: "pane 16x1 below minimum 80x24"}
+	if _, err := s.ReportActivity(ctx, task.ID, a.ID, api.ActivityReport{RequestID: "stuck-1", RunID: a.RunID, Activity: stuck}); err != nil {
+		t.Fatalf("stuck refused: %v", err)
+	}
+	got, err := s.GetAgent(ctx, a.ID)
+	if err != nil || got.Activity == nil || got.Activity.State != "stuck" || got.Activity.Reason != stuck.Reason {
+		t.Fatalf("stuck snapshot %+v %v", got.Activity, err)
+	}
+	for _, reason := range []string{strings.Repeat("r", 241), "one\ntwo"} {
+		bad := stuck
+		bad.Reason = reason
+		if _, err := s.ReportActivity(ctx, task.ID, a.ID, api.ActivityReport{RequestID: fmt.Sprintf("stuck-bad-%d", len(reason)), RunID: a.RunID, Activity: bad}); err == nil {
+			t.Fatalf("invalid stuck reason %q accepted", reason)
+		}
+	}
+}

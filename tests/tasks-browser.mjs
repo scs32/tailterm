@@ -5,7 +5,7 @@ import { openVault } from "../client/vault-crypto.js";
 // Drives the task hub through the UI against tests/fixture-hub.mjs: hub
 // configuration, task creation with a spawned agent, mirroring of agents the
 // hub adds and closes, attention labels from lifecycle events, and the board.
-export async function exerciseTasks(page, hub, origin) {
+export async function exerciseTasks(page, hub, origin, ssh) {
   const palette = async (label) => {
     await page.locator("#commands").click();
     await page.locator("#command-query").fill(label);
@@ -171,6 +171,46 @@ export async function exerciseTasks(page, hub, origin) {
     "terminals mode",
   );
   assert.equal(await panes(), 3);
+
+  // An agent the mirror opens into a hidden project group (wi_b6b79229c8fec99d)
+  // opens its PTY at the fixed agent size and sends no resize while hidden;
+  // shown, it sends one resize equal to its tile. The attach ignores size.
+  await page.locator("#tabs .tab button[role=tab]").nth(originalIndex).click();
+  await waitFor(
+    async () =>
+      !(await page.locator("#tabs .tab.task-tab").getAttribute("class")).includes(
+        "active",
+      ),
+    "project group hidden",
+  );
+  const ordinaryPanes = await panes();
+  const sizes = () => ssh.sizeLog.filter((e) => e.session === "sizer");
+  const sizer = hub.api.addAgent(task.id, { name: "sizer", session: "sizer" });
+  hub.api.event(task.id, "started", sizer.id);
+  await waitFor(async () => sizes().length > 0, "hidden sizer attach");
+  await new Promise((r) => setTimeout(r, 1000));
+  assert.deepEqual(
+    sizes(),
+    [{ session: "sizer", kind: "open", cols: 200, rows: 50, ignoreSize: true }],
+    "hidden agent tile opens at 200x50 with ignore-size and never resizes",
+  );
+  assert.equal(await panes(), ordinaryPanes, "the sizer pane stays hidden");
+  await page.locator("#tabs .task-tab button[role=tab]").click();
+  await waitFor(async () => (await panes()) === 4, "sizer pane shown");
+  await waitFor(async () => sizes().length > 1, "shown sizer resize");
+  await new Promise((r) => setTimeout(r, 1000));
+  await page.locator(".pane-header .pane-label", { hasText: "sizer" }).click();
+  const [cols, rows] = (await page.locator("#dimensions").innerText())
+    .split("×")
+    .map((n) => Number(n.trim()));
+  assert.deepEqual(
+    sizes().slice(1),
+    [{ session: "sizer", kind: "resize", cols, rows }],
+    "shown tile sends exactly one resize with its real size",
+  );
+  assert.ok(cols < 200 && rows < 50, "the tile is smaller than the default");
+  hub.api.event(task.id, "closed", sizer.id);
+  await waitFor(async () => (await panes()) === 3, "sizer pane closed");
 
   // Closing an agent removes its pane; closing the task removes the rest.
   hub.api.event(task.id, "closed", tester.id);

@@ -154,60 +154,331 @@ func TestClaudeWakeConfirmationAndNoResend(t *testing.T) {
 	}
 }
 
-func TestClaudeWakeTimeoutAndRestartGuard(t *testing.T) {
-	t.Setenv("TAILTERM_RELAY_STATE", t.TempDir())
-	b := testClaudeBinding()
-	transcript := filepath.Join(t.TempDir(), "claude.jsonl")
-	if err := os.WriteFile(transcript, []byte(`{"type":"assistant","message":{"stop_reason":"end_turn"}}`+"\n"), 0600); err != nil {
-		t.Fatal(err)
-	}
-	now := time.Now()
-	sends := 0
-	ops := claudeWakeOps{inspect: func(_ context.Context, _ runtimeBinding, expected string) (claudeWakeSnapshot, error) {
-		info, _ := os.Stat(transcript)
-		screen := "❯ \n"
-		if expected != "" {
-			screen = "❯ " + expected + "\n"
-		}
-		return claudeWakeSnapshot{Pane: "%1", SessionID: "$1", Created: "100", PanePID: 1001, Path: transcript, FileID: fileIdentity(info), Offset: info.Size(), Screen: screen, Cursor: activityCursor{Ready: true, SeenTurn: true, TurnComplete: true}}, nil
-	}, send: func(context.Context, string, string, bool) error { sends++; return nil }, sleep: func(d time.Duration) { now = now.Add(d) }, now: func() time.Time { return now }}
-	prompt := "Tailterm obligations #41. Run tt inbox --unread --mark-read."
-	if err := claudeWakeWith(context.Background(), b, prompt, ops); err == nil || !strings.Contains(err.Error(), "did not confirm") || sends != 2 {
-		t.Fatalf("timeout: sends=%d err=%v", sends, err)
-	}
-	if err := claudeWakeWith(context.Background(), b, prompt, ops); err == nil || sends != 2 {
-		t.Fatalf("uncertain retry typed: sends=%d err=%v", sends, err)
-	}
+// wakeRetryPane models one Claude pane and its transcript for wake tests:
+// typed text stays in the input until an Enter that submits appends it to the
+// transcript as a user turn. Inspect fails like the native one when the input
+// does not match what the caller expects.
+type wakeRetryPane struct {
+	t          *testing.T
+	transcript string
+	input      string
+	dialog     bool
+	busy       bool
+	submit     bool
+	enterErr   error
+	now        time.Time
+	sends      []string
 }
 
-func TestClaudeWakePartialSendNeverRetypes(t *testing.T) {
+func newWakeRetryPane(t *testing.T) *wakeRetryPane {
 	t.Setenv("TAILTERM_RELAY_STATE", t.TempDir())
-	b := testClaudeBinding()
 	path := filepath.Join(t.TempDir(), "claude.jsonl")
 	if err := os.WriteFile(path, []byte(`{"type":"assistant","message":{"stop_reason":"end_turn"}}`+"\n"), 0600); err != nil {
 		t.Fatal(err)
 	}
-	sends := 0
-	ops := claudeWakeOps{inspect: func(_ context.Context, _ runtimeBinding, expected string) (claudeWakeSnapshot, error) {
-		info, _ := os.Stat(path)
-		screen := "❯ \n"
-		if expected != "" {
-			screen = "❯ " + expected + "\n"
-		}
-		return claudeWakeSnapshot{Pane: "%1", SessionID: "$1", Created: "100", PanePID: 1001, Path: path, FileID: fileIdentity(info), Offset: info.Size(), Screen: screen, Cursor: activityCursor{Ready: true, SeenTurn: true, TurnComplete: true}}, nil
-	}, send: func(_ context.Context, _ string, _ string, literal bool) error {
-		sends++
-		if !literal {
-			return errors.New("synthetic Enter failure")
-		}
-		return nil
-	}, sleep: func(time.Duration) {}, now: time.Now}
-	prompt := "Tailterm #42. Run tt inbox --unread --mark-read."
-	if err := claudeWakeWith(context.Background(), b, prompt, ops); err == nil || !strings.Contains(err.Error(), "did not confirm") || sends != 2 {
-		t.Fatalf("partial send %d %v", sends, err)
+	return &wakeRetryPane{t: t, transcript: path, now: time.Now()}
+}
+
+func (f *wakeRetryPane) appendUser(text string) {
+	f.t.Helper()
+	line, _ := json.Marshal(map[string]any{"type": "user", "message": map[string]any{"content": text}})
+	file, err := os.OpenFile(f.transcript, os.O_APPEND|os.O_WRONLY, 0600)
+	if err != nil {
+		f.t.Fatal(err)
 	}
-	if err := claudeWakeWith(context.Background(), b, prompt, ops); err == nil || sends != 2 {
-		t.Fatalf("ambiguous retry %d %v", sends, err)
+	defer file.Close()
+	if _, err := file.Write(append(line, '\n')); err != nil {
+		f.t.Fatal(err)
+	}
+}
+
+func (f *wakeRetryPane) ops() claudeWakeOps {
+	return claudeWakeOps{
+		inspect: func(_ context.Context, _ runtimeBinding, expected string) (claudeWakeSnapshot, error) {
+			info, err := os.Stat(f.transcript)
+			if err != nil {
+				return claudeWakeSnapshot{}, err
+			}
+			if f.dialog {
+				return claudeWakeSnapshot{}, errors.New("Claude pane has a permission or selection prompt")
+			}
+			if f.input != expected {
+				return claudeWakeSnapshot{}, errors.New("Claude input is occupied, prompting, or unknown")
+			}
+			return claudeWakeSnapshot{Pane: "%1", SessionID: "$1", Created: "100", PanePID: 1001, Path: f.transcript, FileID: fileIdentity(info), Offset: info.Size(), Screen: "❯ " + expected + "\n", Cursor: activityCursor{Ready: true, SeenTurn: true, TurnComplete: !f.busy}}, nil
+		},
+		send: func(_ context.Context, _ string, value string, literal bool) error {
+			if literal {
+				f.sends = append(f.sends, "text:"+value)
+				f.input += value
+				return nil
+			}
+			f.sends = append(f.sends, "Enter")
+			if f.enterErr != nil {
+				return f.enterErr
+			}
+			if f.submit && f.input != "" {
+				f.appendUser(f.input)
+				f.input = ""
+			}
+			return nil
+		},
+		sleep: func(d time.Duration) { f.now = f.now.Add(d) },
+		now:   func() time.Time { return f.now },
+	}
+}
+
+func (f *wakeRetryPane) intent(b runtimeBinding) claudeWakeIntent {
+	f.t.Helper()
+	var saved claudeWakeIntent
+	data, err := os.ReadFile(claudeWakePath(b))
+	if err != nil || json.Unmarshal(data, &saved) != nil {
+		f.t.Fatalf("wake intent unreadable: %v %s", err, data)
+	}
+	return saved
+}
+
+// An unconfirmed wake is never resent immediately, including after a relay
+// restart (the guard is durable); only the backoff-gated retry may act.
+func TestClaudeWakeTimeoutAndRestartGuard(t *testing.T) {
+	f := newWakeRetryPane(t)
+	b := testClaudeBinding()
+	prompt := "Tailterm obligations #41. Run tt inbox --unread --mark-read."
+	if err := claudeWakeWith(context.Background(), b, prompt, f.ops()); err == nil || !strings.Contains(err.Error(), "did not confirm") || len(f.sends) != 2 {
+		t.Fatalf("timeout: sends=%v err=%v", f.sends, err)
+	}
+	for _, advance := range []time.Duration{0, 5 * time.Second, 9 * time.Second} {
+		f.now = f.now.Add(advance)
+		// A fresh ops value stands in for a restarted relay reading the guard.
+		if err := claudeWakeWith(context.Background(), b, prompt, f.ops()); err == nil || !strings.Contains(err.Error(), "did not confirm") || len(f.sends) != 2 {
+			t.Fatalf("uncertain wake resent before backoff: sends=%v err=%v", f.sends, err)
+		}
+	}
+	if got := f.intent(b); got.Phase != "uncertain" || got.Attempts != 0 || got.FirstAt.IsZero() || !got.RetryAt.After(got.EnterAt) {
+		t.Fatalf("guard after timeout: %+v", got)
+	}
+}
+
+// A failed Enter leaves the wake text in the prompt. Nothing is retyped: after
+// the backoff the retry presses Enter alone on that text.
+func TestClaudeWakePartialSendNeverRetypes(t *testing.T) {
+	f := newWakeRetryPane(t)
+	f.enterErr = errors.New("synthetic Enter failure")
+	b := testClaudeBinding()
+	prompt := "Tailterm #42. Run tt inbox --unread --mark-read."
+	if err := claudeWakeWith(context.Background(), b, prompt, f.ops()); err == nil || !strings.Contains(err.Error(), "did not confirm") || len(f.sends) != 2 {
+		t.Fatalf("partial send %v %v", f.sends, err)
+	}
+	if err := claudeWakeWith(context.Background(), b, prompt, f.ops()); err == nil || len(f.sends) != 2 {
+		t.Fatalf("ambiguous retry before backoff %v %v", f.sends, err)
+	}
+	f.enterErr, f.submit = nil, true
+	f.now = f.now.Add(15 * time.Second)
+	if err := claudeWakeWith(context.Background(), b, prompt, f.ops()); err != nil {
+		t.Fatalf("retry after backoff: %v", err)
+	}
+	if want := []string{"text:" + prompt, "Enter", "Enter"}; !slices.Equal(f.sends, want) {
+		t.Fatalf("sends %v, want %v (no retyped text)", f.sends, want)
+	}
+}
+
+func TestClaudeWakeRetriesEnterWhenOwnTextRemains(t *testing.T) {
+	f := newWakeRetryPane(t)
+	b := testClaudeBinding()
+	prompt := "Tailterm messages #50. Run tt inbox --unread --mark-read."
+	// Enter reaches a pane too small to submit: the text stays typed.
+	if err := claudeWakeWith(context.Background(), b, prompt, f.ops()); err == nil || !strings.Contains(err.Error(), "did not confirm") {
+		t.Fatalf("first wake: %v", err)
+	}
+	if f.input != prompt {
+		t.Fatalf("fixture input %q", f.input)
+	}
+	if err := claudeWakeWith(context.Background(), b, prompt, f.ops()); err == nil || len(f.sends) != 2 {
+		t.Fatalf("immediate second call sent %v (%v)", f.sends, err)
+	}
+	f.submit = true
+	f.now = f.now.Add(15 * time.Second)
+	// A newer prompt does not replace the text already typed.
+	newer := "Tailterm messages #50,#51. Run tt inbox --unread --mark-read."
+	if err := claudeWakeWith(context.Background(), b, newer, f.ops()); err != nil {
+		t.Fatalf("Enter retry: %v", err)
+	}
+	if want := []string{"text:" + prompt, "Enter", "Enter"}; !slices.Equal(f.sends, want) {
+		t.Fatalf("sends %v, want %v", f.sends, want)
+	}
+	if got := f.intent(b); got.Phase != "confirmed" || got.Attempts != 1 || !strings.Contains(got.LastRetry, "Enter on own unsubmitted text") {
+		t.Fatalf("intent after Enter retry: %+v", got)
+	}
+}
+
+func TestClaudeWakeRetypesAfterLostText(t *testing.T) {
+	f := newWakeRetryPane(t)
+	b := testClaudeBinding()
+	prompt := "Tailterm messages #60. Run tt inbox --unread --mark-read."
+	if err := claudeWakeWith(context.Background(), b, prompt, f.ops()); err == nil {
+		t.Fatal("first wake confirmed")
+	}
+	f.input = "" // the typed text was lost; nothing reached the transcript
+	f.now = f.now.Add(10 * time.Second)
+	current := "Tailterm messages #60,#61. Run tt inbox --unread --mark-read."
+	if err := claudeWakeWith(context.Background(), b, current, f.ops()); err == nil || len(f.sends) != 2 {
+		t.Fatalf("retype before backoff: %v %v", f.sends, err)
+	}
+	f.now = f.now.Add(5 * time.Second)
+	f.submit = true
+	if err := claudeWakeWith(context.Background(), b, current, f.ops()); err != nil {
+		t.Fatalf("retype: %v", err)
+	}
+	if want := []string{"text:" + prompt, "Enter", "text:" + current, "Enter"}; !slices.Equal(f.sends, want) {
+		t.Fatalf("sends %v, want %v", f.sends, want)
+	}
+	if got := f.intent(b); got.Phase != "confirmed" || got.Attempts != 1 || got.Prompt != current || !strings.Contains(got.LastRetry, "retyped") {
+		t.Fatalf("intent after retype: %+v", got)
+	}
+
+	// The same shape where the first text did reach the transcript late
+	// confirms without typing anything.
+	g := newWakeRetryPane(t)
+	if err := claudeWakeWith(context.Background(), b, prompt, g.ops()); err == nil {
+		t.Fatal("first wake confirmed")
+	}
+	g.appendUser(g.input)
+	g.input = ""
+	g.now = g.now.Add(time.Minute)
+	if err := claudeWakeWith(context.Background(), b, prompt, g.ops()); err != nil || len(g.sends) != 2 {
+		t.Fatalf("late submission retyped: %v %v", g.sends, err)
+	}
+	if got := g.intent(b); got.Phase != "confirmed" {
+		t.Fatalf("late submission not confirmed: %+v", got)
+	}
+}
+
+func TestClaudeWakeRetryIsBoundedAndBacksOff(t *testing.T) {
+	f := newWakeRetryPane(t)
+	b := testClaudeBinding()
+	prompt := "Tailterm messages #70. Run tt inbox --unread --mark-read."
+	wake := func() error { return claudeWakeWith(context.Background(), b, prompt, f.ops()) }
+	if err := wake(); err == nil {
+		t.Fatal("first wake confirmed")
+	}
+	sent := len(f.sends)
+	for i, backoff := range []time.Duration{15 * time.Second, 30 * time.Second, 60 * time.Second, 120 * time.Second} {
+		last := f.intent(b)
+		// Just before the backoff elapses: nothing is sent.
+		f.now = last.RetryAt.Add(-time.Second)
+		if err := wake(); err == nil || !strings.Contains(err.Error(), fmt.Sprintf("retry %d/4", i+1)) || len(f.sends) != sent {
+			t.Fatalf("retry %d before backoff %s: %v %v", i+1, backoff, f.sends, err)
+		}
+		if got := last.RetryAt.Sub(last.EnterAt); got < backoff || got > backoff+6*time.Second {
+			t.Fatalf("retry %d backoff %s, want %s", i+1, got, backoff)
+		}
+		f.now = last.RetryAt
+		if err := wake(); err == nil || !strings.Contains(err.Error(), "did not confirm") {
+			t.Fatalf("retry %d confirmed: %v", i+1, err)
+		}
+		if len(f.sends) != sent+1 || f.sends[len(f.sends)-1] != "Enter" {
+			t.Fatalf("retry %d sends %v", i+1, f.sends)
+		}
+		sent++
+	}
+	f.now = f.intent(b).RetryAt
+	if err := wake(); err == nil || !strings.Contains(err.Error(), "after 4 retries") {
+		t.Fatalf("exhaustion: %v", err)
+	}
+	exhausted := f.intent(b)
+	if exhausted.Phase != "exhausted" || exhausted.Attempts != 4 || !strings.Contains(exhausted.LastRetry, "exhausted after 4 retries") {
+		t.Fatalf("exhausted intent: %+v", exhausted)
+	}
+	for _, advance := range []time.Duration{time.Minute, 10 * time.Minute, 3 * time.Minute} {
+		f.now = f.now.Add(advance)
+		if err := wake(); err == nil || !strings.Contains(err.Error(), "needs attention") || len(f.sends) != sent {
+			t.Fatalf("typed during cool-down: %v %v", f.sends, err)
+		}
+	}
+	if total := len(f.sends); total != 6 {
+		t.Fatalf("total sends %d, want 2 + 4 retries", total)
+	}
+	// After the cool-down a new bounded cycle starts; the stuck age survives.
+	f.now = exhausted.ExhaustedAt.Add(15 * time.Minute)
+	f.submit = true
+	if err := wake(); err != nil {
+		t.Fatalf("new cycle: %v", err)
+	}
+	if got := f.intent(b); got.Phase != "confirmed" || !got.FirstAt.Equal(exhausted.FirstAt) || got.Attempts != 1 {
+		t.Fatalf("new cycle intent: %+v", got)
+	}
+}
+
+func TestClaudeWakeNeverPressesEnterOnForeignText(t *testing.T) {
+	f := newWakeRetryPane(t)
+	b := testClaudeBinding()
+	prompt := "Tailterm messages #80. Run tt inbox --unread --mark-read."
+	if err := claudeWakeWith(context.Background(), b, prompt, f.ops()); err == nil {
+		t.Fatal("first wake confirmed")
+	}
+	sent := len(f.sends)
+	for _, tc := range []struct {
+		name  string
+		setup func()
+	}{
+		{"owner draft", func() { f.input = "my own draft, not the wake" }},
+		{"wake text plus more", func() { f.input = prompt + " and more" }},
+		{"dialog", func() { f.input, f.dialog = prompt, true }},
+		{"busy", func() { f.input, f.dialog, f.busy = "", false, true }},
+	} {
+		tc.setup()
+		f.now = f.now.Add(10 * time.Minute)
+		err := claudeWakeWith(context.Background(), b, prompt, f.ops())
+		if !errors.Is(err, errClaudeWakeUnsafe) || len(f.sends) != sent {
+			t.Fatalf("%s: sends %v err %v", tc.name, f.sends, err)
+		}
+		if got := f.intent(b); got.Attempts != 0 || got.Phase != "uncertain" || !strings.Contains(got.LastRetry, "not safe") {
+			t.Fatalf("%s: unsafe pass counted as a retry: %+v", tc.name, got)
+		}
+	}
+}
+
+func TestClaudeWakeAbandonsOnTranscriptChange(t *testing.T) {
+	f := newWakeRetryPane(t)
+	b := testClaudeBinding()
+	prompt := "Tailterm messages #90. Run tt inbox --unread --mark-read."
+	if err := claudeWakeWith(context.Background(), b, prompt, f.ops()); err == nil {
+		t.Fatal("first wake confirmed")
+	}
+	// The owner cleared the wake text and submitted a turn of their own.
+	f.input = ""
+	f.appendUser("owner turn")
+	f.submit = true
+	newer := "Tailterm messages #90,#91. Run tt inbox --unread --mark-read."
+	if err := claudeWakeWith(context.Background(), b, newer, f.ops()); err != nil {
+		t.Fatalf("fresh wake after abandonment: %v", err)
+	}
+	if want := []string{"text:" + prompt, "Enter", "text:" + newer, "Enter"}; !slices.Equal(f.sends, want) {
+		t.Fatalf("sends %v, want %v", f.sends, want)
+	}
+	if got := f.intent(b); got.Phase != "confirmed" || got.Attempts != 0 || got.Prompt != newer {
+		t.Fatalf("fresh intent: %+v", got)
+	}
+	// A replaced transcript file abandons the uncertain intent the same way,
+	// before its backoff, and a fresh wake starts at once.
+	g := newWakeRetryPane(t)
+	if err := claudeWakeWith(context.Background(), b, prompt, g.ops()); err == nil || !strings.Contains(err.Error(), "did not confirm") {
+		t.Fatalf("setup wake: %v", err)
+	}
+	before := g.intent(b)
+	replacement := g.transcript + ".new"
+	if err := os.WriteFile(replacement, []byte(`{"type":"assistant","message":{"stop_reason":"end_turn"}}`+"\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(replacement, g.transcript); err != nil {
+		t.Fatal(err)
+	}
+	g.input, g.submit = "", true
+	if err := claudeWakeWith(context.Background(), b, prompt, g.ops()); err != nil {
+		t.Fatalf("fresh wake into the replaced transcript: %v", err)
+	}
+	if got := g.intent(b); got.FileID == before.FileID || got.Phase != "confirmed" || got.Attempts != 0 || len(g.sends) != 4 {
+		t.Fatalf("replaced transcript was not abandoned for a fresh intent: %+v sends %v", got, g.sends)
 	}
 }
 

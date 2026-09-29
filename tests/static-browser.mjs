@@ -73,6 +73,8 @@ const authMethods = [];
 const sshControl = {
   sessions,
   attachLog: [],
+  // PTY sizes requested by attaches and later window changes, per session.
+  sizeLog: [],
   gone: new Set(),
   holding: new Set(),
   held: new Map(),
@@ -134,8 +136,22 @@ const ssh = new ssh2.Server(
       client.on("session", (accept) => {
         const session = accept();
         attachSFTP(session, uploadedFiles, uploadControl);
-        session.on("pty", (accept) => accept());
-        session.on("window-change", (accept) => accept?.());
+        let pty = null,
+          attached = "";
+        session.on("pty", (accept, reject, info) => {
+          pty = info;
+          accept();
+        });
+        session.on("window-change", (accept, reject, info) => {
+          if (attached)
+            sshControl.sizeLog.push({
+              session: attached,
+              kind: "resize",
+              cols: info.cols,
+              rows: info.rows,
+            });
+          accept?.();
+        });
         const terminal = (accepted) => {
           terminalStarts++;
           stream = accepted;
@@ -150,6 +166,14 @@ const ssh = new ssh2.Server(
           const name = attachedSession(info.command);
           if (!name) return exec(accept, reject, info);
           sshControl.attachLog.push(name);
+          attached = name;
+          sshControl.sizeLog.push({
+            session: name,
+            kind: "open",
+            cols: pty?.cols,
+            rows: pty?.rows,
+            ignoreSize: info.command.includes("ignore-size"),
+          });
           if (sshControl.gone.has(name)) {
             const accepted = accept();
             accepted.stderr.write(`can't find session: ${name}\n`);
@@ -773,7 +797,7 @@ try {
   await exerciseWorkspaceActions(page, stream);
   if (process.env.TAILTERM_ACTIVITY_ONLY) throw new FocusedActivityComplete();
   await exerciseWorkspaceContinuity(page, context, () => terminalStarts);
-  await exerciseTasks(page, fixtureHub, origin);
+  await exerciseTasks(page, fixtureHub, origin, sshControl);
   await exerciseTaskRestore(page, fixtureHub, sshControl);
   assert.equal(
     await page.locator("[data-mode=files]").count(),

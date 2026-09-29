@@ -22,3 +22,11 @@ test("runtime prompt state names the prompt, the policy action and the outcome",
   assert.equal(runtimePromptDetail({kind:"codex_new_thing", action:"escalate", outcome:"escalated"}), "Unrecognized runtime prompt: ask the owner · escalated");
   assert.equal(runtimePromptDetail(null), "");
 });
+
+test("stuck state says why the agent cannot make progress", () => {
+  const stuck = {state:"stuck", reason:"Claude wake unconfirmed for 4m (retry 2/4): retry 2/4: Enter on own unsubmitted text", observedAt:"2026-09-29T21:00:00Z", tokens:{total:7}};
+  assert.equal(activityLabel(stuck), "Stuck");
+  assert.equal(activityDetail(stuck, Date.parse("2026-09-29T21:00:05Z")), "Stuck: Claude wake unconfirmed for 4m (retry 2/4): retry 2/4: Enter on own unsubmitted text · observed 5s ago · Last transition snapshot: 7 tokens");
+  // Other states keep their reason out of the summary, as before.
+  assert.equal(activityDetail({state:"unknown", reason:"turn boundary unavailable", observedAt:"2026-09-29T21:00:00Z", tokens:{total:7}}, Date.parse("2026-09-29T21:00:05Z")), "Unknown · observed 5s ago · Last transition snapshot: 7 tokens");
+});

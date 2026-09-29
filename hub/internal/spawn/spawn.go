@@ -26,6 +26,20 @@ const (
 	WatchWindow  = "tt-watch"
 )
 
+// Agent windows keep a fixed size whatever attaches to them. With tmux's
+// default `window-size latest`, a tiny viewer (a hidden browser tile) shrinks
+// the agent's window until its UI cannot render or submit input.
+const (
+	AgentWindowCols = 200
+	AgentWindowRows = 50
+	// Below this a pane is too small for an agent UI to render.
+	MinUsableCols = 80
+	MinUsableRows = 24
+)
+
+// AgentDefaultSize is the tmux default-size value for agent sessions.
+var AgentDefaultSize = fmt.Sprintf("%dx%d", AgentWindowCols, AgentWindowRows)
+
 var Tmux = "tmux"
 
 // tmux builds a tmux command, honouring TT_TMUX_SOCKET (a -L socket name) so
@@ -121,7 +135,7 @@ func Create(o Options) error {
 	if v < 3.02 {
 		return fmt.Errorf("tmux %.2f is too old; 3.2 or newer is required for per-session environment", v)
 	}
-	args := []string{"new-session", "-d", "-s", o.Session, "-n", AgentWindow}
+	args := []string{"new-session", "-d", "-s", o.Session, "-n", AgentWindow, "-x", strconv.Itoa(AgentWindowCols), "-y", strconv.Itoa(AgentWindowRows)}
 	if o.Cwd != "" {
 		args = append(args, "-c", o.Cwd)
 	}
@@ -157,6 +171,13 @@ func Create(o Options) error {
 	}
 	agentCmd := ShellQuote(o.Self) + " wrap --shell-file " + ShellQuote(filepath.Clean(launchPath))
 	args = append(args, agentCmd)
+	// Set the size policy in the same tmux command so no viewer can attach
+	// between creation and policy. The exact =S: target names the new session
+	// and its window even when tt runs inside another tmux pane ($TMUX would
+	// otherwise pick the caller's session); a bare =S fails inside the chain.
+	// Global options stay untouched.
+	target := "=" + o.Session + ":"
+	args = append(args, ";", "set-option", "-t", target, "default-size", AgentDefaultSize, ";", "set-option", "-w", "-t", target, "window-size", "manual")
 	if out, err := tmux(args...).CombinedOutput(); err != nil {
 		return fmt.Errorf("tmux new-session: %s", strings.TrimSpace(string(out)))
 	}

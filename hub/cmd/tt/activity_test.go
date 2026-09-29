@@ -930,3 +930,189 @@ func TestActivityHealthRetainsOnlyVerifiedSnapshot(t *testing.T) {
 		})
 	}
 }
+
+// stuckHub is a fake hub for stuck-state ticks. It serves one agent and
+// records each distinct activity report; rejectStuck answers 400 to the stuck
+// state, like a hub from before it existed.
+type stuckHub struct {
+	t           *testing.T
+	agent       api.Agent
+	rejectStuck bool
+	reports     []api.AgentActivity
+	seen        map[string]bool
+}
+
+func (h *stuckHub) serve() *httptest.Server {
+	h.seen = map[string]bool{}
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == "GET" && strings.HasSuffix(r.URL.Path, "/agents/"+h.agent.ID):
+			_ = json.NewEncoder(w).Encode(h.agent)
+		case r.Method == "GET" && strings.HasSuffix(r.URL.Path, "/obligations"):
+			_ = json.NewEncoder(w).Encode(api.ObligationList{})
+		case r.Method == "POST" && strings.HasSuffix(r.URL.Path, "/activity"):
+			var req api.ActivityReport
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				h.t.Error("invalid report")
+			}
+			if h.rejectStuck && req.Activity.State == "stuck" {
+				http.Error(w, "invalid activity", http.StatusBadRequest)
+				return
+			}
+			if !h.seen[req.RequestID] {
+				h.seen[req.RequestID] = true
+				h.reports = append(h.reports, req.Activity)
+			}
+			_ = json.NewEncoder(w).Encode(req.Activity)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+}
+
+func stuckFixture(t *testing.T, runtime string) (runtimeBinding, *stuckHub, *api.Client, func(time.Time) error) {
+	t.Helper()
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("TAILTERM_RELAY_STATE", filepath.Join(home, "relay"))
+	thread := "12345678-1234-1234-1234-123456789abc"
+	var path, transcript string
+	if runtime == "claude" {
+		path = filepath.Join(home, ".claude", "projects", "p", thread+".jsonl")
+		transcript = `{"type":"assistant","message":{"stop_reason":"end_turn"}}` + "\n"
+	} else {
+		path = filepath.Join(home, ".codex", "sessions", "2026", "09", "29", "rollout-test-"+thread+".jsonl")
+		transcript = `{"type":"task_started","timestamp":"2026-09-29T20:00:00Z"}` + "\n"
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte(transcript), 0600); err != nil {
+		t.Fatal(err)
+	}
+	h := &stuckHub{t: t, agent: api.Agent{ID: "agt_0123456789abcdef", RunID: "run_0123456789abcdef", Status: api.AgentRunning, Online: true, Session: "stuck-agent", Runtime: runtime}}
+	server := h.serve()
+	t.Cleanup(server.Close)
+	client, _ := api.NewClient(server.URL, 5*time.Second)
+	b := runtimeBinding{Hub: server.URL, Task: "tsk_0123456789abcdef", Agent: h.agent.ID, Run: h.agent.RunID, Thread: thread, Runtime: runtime, Session: "stuck-agent", Codex: filepath.Join(home, "codex")}
+	probe := func(runtimeBinding, api.Agent) (bool, bool, error) { return true, true, nil }
+	tick := func(now time.Time) error { return relayActivityTick(context.Background(), b, client, now, probe) }
+	return b, h, client, tick
+}
+
+func stubPaneSize(t *testing.T, cols, rows *int) {
+	t.Helper()
+	previous := activityPaneSize
+	activityPaneSize = func(_ context.Context, session string) (int, int, error) {
+		if session != "stuck-agent" {
+			t.Errorf("pane size read for %q", session)
+		}
+		return *cols, *rows, nil
+	}
+	t.Cleanup(func() { activityPaneSize = previous })
+}
+
+func TestActivityStuckOnTinyPane(t *testing.T) {
+	cols, rows := 16, 1
+	stubPaneSize(t, &cols, &rows)
+	_, h, _, tick := stuckFixture(t, "codex")
+	now := time.Date(2026, 9, 29, 20, 0, 5, 0, time.UTC)
+	if err := tick(now); err != nil {
+		t.Fatal(err)
+	}
+	if len(h.reports) != 1 || h.reports[0].State != "stuck" || h.reports[0].Reason != "pane 16x1 below minimum 80x24" {
+		t.Fatalf("tiny pane reports %+v", h.reports)
+	}
+	// Restored to the fixed size, the agent is working again.
+	cols, rows = 200, 50
+	if err := tick(now.Add(16 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if len(h.reports) != 2 || h.reports[1].State != "working" {
+		t.Fatalf("after resize %+v", h.reports)
+	}
+	// At the minimum exactly, the pane is usable.
+	cols, rows = 80, 24
+	if reason := activityStuckReason(context.Background(), runtimeBinding{Session: "stuck-agent", Runtime: "codex"}, api.Agent{}, "idle", now, activityDefaults()); reason != "" {
+		t.Fatalf("80x24 flagged: %q", reason)
+	}
+}
+
+func TestActivityStuckOnUnconfirmedWake(t *testing.T) {
+	cols, rows := 200, 50
+	stubPaneSize(t, &cols, &rows)
+	b, h, _, tick := stuckFixture(t, "claude")
+	now := time.Date(2026, 9, 29, 20, 10, 0, 0, time.UTC)
+	intent := claudeWakeIntent{Run: b.Run, Thread: b.Thread, Session: b.Session, Phase: "uncertain", At: now.Add(-3 * time.Minute), FirstAt: now.Add(-3 * time.Minute), Attempts: 2, LastRetry: "retry 2/4: Enter on own unsubmitted text"}
+	if err := os.MkdirAll(relayDir(), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := writePrivateJSON(claudeWakePath(b), intent); err != nil {
+		t.Fatal(err)
+	}
+	// No unread input: an old unconfirmed wake alone is not stuck.
+	if err := tick(now); err != nil {
+		t.Fatal(err)
+	}
+	if len(h.reports) != 1 || h.reports[0].State != "idle" {
+		t.Fatalf("no unread %+v", h.reports)
+	}
+	h.agent.Unread = 3
+	if err := tick(now.Add(16 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	want := "Claude wake unconfirmed for 3m (retry 2/4): retry 2/4: Enter on own unsubmitted text"
+	if len(h.reports) != 2 || h.reports[1].State != "stuck" || h.reports[1].Reason != want {
+		t.Fatalf("unconfirmed wake reports %+v", h.reports)
+	}
+	// Under the threshold, or once confirmed, it is not stuck.
+	intent.FirstAt = now.Add(-2 * time.Minute)
+	_ = writePrivateJSON(claudeWakePath(b), intent)
+	if reason := activityStuckReason(context.Background(), b, h.agent, "idle", now, activityDefaults()); reason != "" {
+		t.Fatalf("2m flagged: %q", reason)
+	}
+	intent.FirstAt, intent.Phase = now.Add(-10*time.Minute), "confirmed"
+	_ = writePrivateJSON(claudeWakePath(b), intent)
+	if reason := activityStuckReason(context.Background(), b, h.agent, "idle", now, activityDefaults()); reason != "" {
+		t.Fatalf("confirmed flagged: %q", reason)
+	}
+	// A working agent is making progress whatever its wake says.
+	intent.Phase = "exhausted"
+	_ = writePrivateJSON(claudeWakePath(b), intent)
+	if reason := activityStuckReason(context.Background(), b, h.agent, "working", now, activityDefaults()); reason != "" {
+		t.Fatalf("working flagged: %q", reason)
+	}
+	if reason := activityStuckReason(context.Background(), b, h.agent, "idle", now, activityDefaults()); !strings.Contains(reason, "exhausted") {
+		t.Fatalf("exhausted reason %q", reason)
+	}
+	t.Setenv("TAILTERM_ACTIVITY_WAKE_STUCK_SECONDS", "900")
+	if reason := activityStuckReason(context.Background(), b, h.agent, "idle", now, activityDefaults()); reason != "" {
+		t.Fatalf("threshold override ignored: %q", reason)
+	}
+}
+
+func TestActivityStuckFallsBackOnOldHub(t *testing.T) {
+	cols, rows := 16, 1
+	stubPaneSize(t, &cols, &rows)
+	_, h, _, tick := stuckFixture(t, "codex")
+	h.rejectStuck = true
+	now := time.Date(2026, 9, 29, 20, 0, 5, 0, time.UTC)
+	if err := tick(now); err != nil {
+		t.Fatal(err)
+	}
+	if len(h.reports) != 1 || h.reports[0].State != "unknown" || h.reports[0].Reason != "stuck: pane 16x1 below minimum 80x24" {
+		t.Fatalf("old hub fallback %+v", h.reports)
+	}
+	// The downgrade is remembered: no repeated 400 or duplicate report.
+	if err := tick(now.Add(16 * time.Second)); err != nil || len(h.reports) != 1 {
+		t.Fatalf("repeat %v %+v", err, h.reports)
+	}
+	// Later transitions still post.
+	cols, rows = 200, 50
+	if err := tick(now.Add(32 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if len(h.reports) != 2 || h.reports[1].State != "working" {
+		t.Fatalf("later transition blocked %+v", h.reports)
+	}
+}

@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -217,7 +218,14 @@ func relayActivityTick(ctx context.Context, b runtimeBinding, client *api.Client
 		if err := save(); err != nil {
 			return err
 		}
-		if _, err := client.ReportActivity(ctx, b.Task, b.Agent, *c.PendingReport); err != nil {
+		_, err := client.ReportActivity(ctx, b.Task, b.Agent, *c.PendingReport)
+		if retry, downgraded := stuckFallback(b, &c, err); downgraded {
+			if err := save(); err != nil {
+				return err
+			}
+			_, err = client.ReportActivity(ctx, b.Task, b.Agent, *retry)
+		}
+		if err != nil {
 			var httpErr *api.HTTPError
 			if !errors.As(err, &httpErr) || httpErr.Status != http.StatusConflict {
 				return err
@@ -383,6 +391,14 @@ func relayActivityTick(ctx context.Context, b runtimeBinding, client *api.Client
 			state.Wake = progress.Wake
 		}
 	}
+	if state.State != "runtime_prompt" && probeErr == nil && tmuxAlive && processAlive {
+		if reason := activityStuckReason(ctx, b, a, state.State, now, activityDefaults()); reason != "" {
+			state.State, state.Reason = "stuck", reason
+		}
+	}
+	if state.State == "stuck" && c.StuckUnsupported {
+		downgradeStuck(&state)
+	}
 	key := wakeKey(state.Wake) + runtimePromptKey(state.Prompt)
 	if (state.State == c.LastState && key == c.LastWakeKey) || (state.State == c.RejectedState && key == c.RejectedWakeKey) {
 		return save()
@@ -394,7 +410,16 @@ func relayActivityTick(ctx context.Context, b runtimeBinding, client *api.Client
 	if err := save(); err != nil {
 		return err
 	}
-	if _, err := client.ReportActivity(ctx, b.Task, b.Agent, *c.PendingReport); err != nil {
+	_, err = client.ReportActivity(ctx, b.Task, b.Agent, *c.PendingReport)
+	if retry, downgraded := stuckFallback(b, &c, err); downgraded {
+		if err := save(); err != nil {
+			return err
+		}
+		// A failure leaves the downgraded report pending; it replays.
+		_, err = client.ReportActivity(ctx, b.Task, b.Agent, *retry)
+		state = retry.Activity
+	}
+	if err != nil {
 		var httpErr *api.HTTPError
 		if !errors.As(err, &httpErr) || httpErr.Status != http.StatusConflict {
 			return err
@@ -406,4 +431,101 @@ func relayActivityTick(ctx context.Context, b runtimeBinding, client *api.Client
 	c.LastState, c.LastWakeKey = state.State, key
 	c.PendingReport = nil
 	return save()
+}
+
+// activityPaneSize reads the agent pane's size; tests replace it.
+var activityPaneSize = nativeActivityPaneSize
+
+// nativeActivityPaneSize returns the size of the session's agent-window pane,
+// or its first pane when no window is named for the agent.
+func nativeActivityPaneSize(ctx context.Context, session string) (int, int, error) {
+	raw, err := startupTmux(ctx, "list-panes", "-s", "-t", session, "-F", "#{window_name}\t#{pane_width}\t#{pane_height}")
+	if err != nil {
+		return 0, 0, err
+	}
+	var cols, rows int
+	found := false
+	for _, line := range strings.Split(strings.TrimSpace(string(raw)), "\n") {
+		f := strings.Split(line, "\t")
+		if len(f) != 3 {
+			continue
+		}
+		w, werr := strconv.Atoi(f[1])
+		h, herr := strconv.Atoi(f[2])
+		if werr != nil || herr != nil {
+			continue
+		}
+		if !found || f[0] == spawn.AgentWindow {
+			cols, rows, found = w, h, true
+		}
+		if f[0] == spawn.AgentWindow {
+			break
+		}
+	}
+	if !found {
+		return 0, 0, errors.New("agent pane size unavailable")
+	}
+	return cols, rows, nil
+}
+
+// activityStuckReason names why a live agent cannot make progress: its pane is
+// too small for the runtime UI, or (Claude) a wake has stayed unconfirmed with
+// unread input past the threshold. It returns "" when neither applies.
+func activityStuckReason(ctx context.Context, b runtimeBinding, a api.Agent, state string, now time.Time, threshold activityThresholds) string {
+	if b.Session != "" {
+		if cols, rows, err := activityPaneSize(ctx, b.Session); err == nil && (cols < spawn.MinUsableCols || rows < spawn.MinUsableRows) {
+			return fmt.Sprintf("pane %dx%d below minimum %dx%d", cols, rows, spawn.MinUsableCols, spawn.MinUsableRows)
+		}
+	}
+	if b.Runtime != "claude" || a.Unread == 0 || (state != "idle" && state != "finished_silent" && state != "unknown") {
+		return ""
+	}
+	data, err := os.ReadFile(claudeWakePath(b))
+	if err != nil {
+		return ""
+	}
+	var intent claudeWakeIntent
+	if json.Unmarshal(data, &intent) != nil || intent.Run != b.Run || (intent.Phase != "uncertain" && intent.Phase != "exhausted") {
+		return ""
+	}
+	since := intent.FirstAt
+	if since.IsZero() {
+		since = intent.At
+	}
+	age := now.Sub(since)
+	if since.IsZero() || age < threshold.WakeStuck {
+		return ""
+	}
+	reason := fmt.Sprintf("Claude wake unconfirmed for %dm (retry %d/%d)", int(age.Minutes()), intent.Attempts, claudeWakeMaxRetries)
+	if intent.Phase == "exhausted" {
+		reason += " exhausted"
+	}
+	if intent.LastRetry != "" {
+		reason += ": " + intent.LastRetry
+	}
+	return claudeClip(strings.Join(strings.Fields(reason), " "), 240)
+}
+
+// downgradeStuck turns a stuck observation into the unknown state an older hub
+// accepts, keeping the reason.
+func downgradeStuck(state *api.AgentActivity) {
+	state.State = "unknown"
+	state.Reason = claudeClip("stuck: "+state.Reason, 240)
+}
+
+// stuckFallback handles a hub that rejects the stuck state (HTTP 400): it
+// remembers the downgrade and replaces the pending report with an unknown one
+// under a new request ID, so later transitions are never blocked.
+func stuckFallback(b runtimeBinding, c *activityCursor, err error) (*api.ActivityReport, bool) {
+	var httpErr *api.HTTPError
+	if c.PendingReport == nil || c.PendingReport.Activity.State != "stuck" || !errors.As(err, &httpErr) || httpErr.Status != http.StatusBadRequest {
+		return nil, false
+	}
+	c.StuckUnsupported = true
+	report := *c.PendingReport
+	downgradeStuck(&report.Activity)
+	c.Transition++
+	report.RequestID = activityRequestID(b, c.Transition)
+	c.PendingReport = &report
+	return c.PendingReport, true
 }

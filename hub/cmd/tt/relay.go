@@ -677,7 +677,7 @@ func cmdRelay(args []string) error {
 	}
 	var queueBackoff teamQueuePollBackoff
 	promptDeps := nativeRuntimePromptDeps()
-	var lastClaudeRetry time.Time
+	var lastClaudeRetry, lastWindowSize time.Time
 	var claudeRetryCursor int
 	for {
 		if !*status {
@@ -728,6 +728,11 @@ func cmdRelay(args []string) error {
 			}
 		}
 		if !*status {
+			// Fix shrunken agent windows before any wake is typed into them.
+			if time.Since(lastWindowSize) >= windowSizeInterval {
+				lastWindowSize = time.Now()
+				relayWindowSizeTick()
+			}
 			if err := recoverRelayRetirements(dir); err != nil {
 				fmt.Fprintln(os.Stderr, "[tt relay] recover retirement:", err)
 			}
