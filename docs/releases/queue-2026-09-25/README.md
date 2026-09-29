@@ -60,6 +60,7 @@ SHA-256 is of the unredacted receipt.
 | `4dd3841` | Sonnet 5.5 database handler (`wi_519d2df4f04c2e1c`, merge of `adb7160`) | `claude-sonnet-5-5` is an allowed model, and the Planned template's database handler runs on it at high reasoning | Mini `tt`, TailOS `39fe264e` |
 | `5ed02c0` | GPT-6.1 Sol availability (`wi_b1bff047121dec24`, merge of `721745d`) | `gpt-6.1-sol` is allowed in the model lists and pickers; the owner session removed a duplicate test import left by the clean textual merge with `4dd3841` | Mini `tt`, TailOS `4716aff4` |
 | `fe56621` | Agent window size and wake resend (`wi_b6b79229c8fec99d`, merge of `eacb486`) | Agent tmux windows keep a usable fixed size regardless of viewers; the relay retries unconfirmed Claude wakes; stuck agents are flagged; matrix `3ac190a1` (owner approval #14936) | Hub `20260929-window-size-fe56621`, Mini `tt`, TailOS `ba74b356` |
+| `ee47773` | Owner delegation windows (`wi_2f6f24bc62b24a7a`, merge of `1ff9b11`) | The owner can delegate decisions (and optionally merges and deploys) to a named agent until a set time; delegated answers need a rationale and are listed for the owner; matrix approvals never leave the owner | Hub `20260929-delegation-ee47773`, Mini `tt`, TailOS `0e3eba25` |
 
 ## Hub releases
 
@@ -87,10 +88,11 @@ SHA-256 is of the unredacted receipt.
 | `20260929-interventions-0365cf6` | `before-interventions-0365cf6.sqlite` | 323,424,256 | `bfe949a7…` | ok, 0 FK | new `owner_interventions` |
 | `20260929-parallel-teams-4f59982` | `before-parallel-teams-4f59982.sqlite` | 329,560,064 | `158812b0…` | ok, 0 FK | `team_queue_settings` rebuilt without the 1-2 cap; new `team_host_usage` columns |
 | `20260929-window-size-fe56621` | `before-window-size-fe56621.sqlite` | 368,881,664 | `0ddaea58…` | ok, 0 FK | none |
+| `20260929-delegation-ee47773` | `before-delegation-ee47773.sqlite` | 370,860,032 | `cae97f92…` | ok, 0 FK | new `owner_delegation_windows`, `owner_delegation_routes`, `decision_request_categories` |
 
 Before `6235924`, the combined migration was rehearsed on a copy of the `33d3ab7` backup: the new
 hub migrated it (integrity ok, no FK violations, 14 projects, queue at limit 1), and the
-`33d3ab7` hub opened the migrated copy. The `34944cf`, `8b1f4d4`, `8e32dc0`, `acfe2d0`, `ffda442`, `77a09c5`, `0365cf6` and `4f59982` migrations were rehearsed
+`33d3ab7` hub opened the migrated copy. The `34944cf`, `8b1f4d4`, `8e32dc0`, `acfe2d0`, `ffda442`, `77a09c5`, `0365cf6`, `4f59982` and `ee47773` migrations were rehearsed
 the same way on a copy of the previous release's backup, including the old hub opening the
 migrated copy. `172becd` fast-forwarded `tasks-hub` and shipped on its independent receipt without an owner-side rerun, per the deployment agent's rule. `6692a57`, `1e8e8df`, `66b55ed`, `0973558`, `ffda442`, `4a6cdfd`, `75e8d2d`, `77a09c5`, `85ad88f` and `733e66b` were merges, so each shipped only after a full check run on the merge commit. `1e8e8df` was integrated by the owner release step: the team's branch predated the queue's frozen base, and re-accepting the done item was refused, so its queue entry was failed and released. The first `c343819` deploy attempt was refused by plan validation before any
 change (the plan carried the previous day's release name); the second, with a fresh backup
