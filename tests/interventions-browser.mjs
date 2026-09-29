@@ -50,7 +50,8 @@ async function api(method, route, body, expected = 200) {
   assert.equal(response.status, expected, `${method} ${route}: ${text}`);
   return text ? JSON.parse(text) : null;
 }
-const ttBinary = path.join(state, "tt");
+// Under the matrix TAILTERM_TEST_BINARIES supplies prepared binaries elsewhere.
+let ttBinary = path.join(state, "tt");
 async function tt(task, args, agent = null) {
   await pause(60);
   const env = { ...fixtureEnv, TAILTERM_HUB: hub, TAILTERM_TASK: task };
@@ -72,7 +73,7 @@ try {
     target: "hub",
     output: path.join(state, "tailterm-hub"),
   });
-  await prepareTestBinary({ root, target: "tt", output: ttBinary });
+  ttBinary = await prepareTestBinary({ root, target: "tt", output: ttBinary });
   hub = `http://127.0.0.1:${await freePort()}`;
   backend = spawn(hubBinary, {
     env: {
