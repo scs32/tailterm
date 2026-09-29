@@ -56,6 +56,7 @@ SHA-256 is of the unredacted receipt.
 | `733e66b` | Known-failure close (`wi_6fb81e10c366d7b4`, merge of `d0b27bc`) | A bug listed in its own plan's known failures can be saved done when its exact receipt shows all of them now passing | Hub `20260929-known-failure-close-733e66b`, Mini `tt` |
 | `0365cf6` | Owner interventions (`wi_d55e7d8c840a3739`, fast-forward) | Owner-side interventions are recorded and counted, with a TailOS view; matrix `5c860f97` adds its browser suite (owner approval #14594, owner acceptance #14635) | Hub `20260929-interventions-0365cf6`, Mini `tt`, TailOS `1dbe2814` |
 | `4f59982` | Parallel teams, no fixed cap (`wi_f27393853cd0e0da`, fast-forward) | The queue runs unrelated items in parallel without a fixed 2-lane cap, admitting on ownership, a free handler, host policy and disk; failed or stuck entries don't hold slots (owner acceptance #14692) | Hub `20260929-parallel-teams-4f59982`, Mini `tt`, TailOS `b5bdbd6c` |
+| `6580463` | Login workspace restore (`wi_f378f10d36cb093b`, fast-forward) | The TailOS login restore always finishes, skips closed agents' tabs, and opens every open, non-paused project's live sessions | TailOS `30179f2a` |
 
 ## Hub releases
 
