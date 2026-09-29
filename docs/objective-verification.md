@@ -67,7 +67,10 @@ message whose entire trimmed text is `verification-matrix-approval:SHA256`.
 The runner refuses candidate matrix bytes differing from that approved digest;
 the native plan save verifies the owner source and token. A worker-authored token
 or a candidate's replacement digest cannot authorize a weaker matrix. A new
-matrix requires a new explicit owner approval. This is declared shared-workspace
+matrix requires a new explicit owner approval.
+An owner matrix approval covers any candidate, for any item, while
+`verification/matrix.json` bytes are unchanged: no per-candidate re-approval.
+This is declared shared-workspace
 provenance, under the same trust boundary as other owner messages. Canonical digests use recursively sorted JSON
 keys, UTF-8 bytes and SHA-256; matrixDigest hashes the exact matrix file bytes.
 
@@ -94,8 +97,8 @@ reserve (default 2147483648 bytes). The runner checks available space before
 allocating a home and before every check attempt, and refuses to start an
 attempt below the reserve. A failed preflight reports the available and required
 byte counts. This reserve guards attempt starts; a single attempt can still use
-more than the available space. SIGINT or SIGTERM stops the active check process
-group, saves its partial log, skips remaining attempts and checks, and leaves no
+more than the available space. SIGINT or SIGTERM stops every active check process
+group, saves each partial log, starts no further attempt or check, and leaves no
 eligible receipt. If home removal fails, the runner removes `receipt.json`, writes
 `cleanup-error.json` beside the logs, exits nonzero, and reports the retained
 home path for manual recovery.
@@ -159,6 +162,61 @@ also checks receipt repository/base against its accepted integration context.
 Enrolled unknown review history cannot bypass the receipt requirement. Existing
 saved historical completion remains readable. This changes completion after new admission;
 it does not certify historical records or deploy a hub/CLI.
+
+## Parallel scheduling and targeted runs
+
+Feature `wi_82ed4c6924930bad`, order #13844. The runner executes independent
+checks in parallel. `--jobs N` (1–16) bounds how many run at once. The default is
+half the CPU cores or one job per 3 GiB of memory, whichever is lower, between 1
+and 8. That gives 5 on the Mini. The receipt's allowlisted environment records
+`VERIFICATION_JOBS`. `--jobs 1` runs strictly serially in plan order.
+
+Scheduling is greedy in plan order. Each check holds locks while it runs, and two
+checks that share a lock never overlap:
+
+- `port:N` for each approved `requiredPorts` entry
+- identical argv and cwd, so the Chromium and WebKit runs of one script (which
+  share build output and screenshots) take turns
+- one Go lane: vet, test, race and migration rehearsal each saturate the CPU
+- the `SERIAL_SUITES` table in `scripts/verify-matrix.mjs`, for suites found to
+  share a resource the rules above cannot see. Each entry names that resource.
+
+`00-static-build`, `01-static-release-verify` and `wasm-test-build` rewrite inputs
+that later checks read. Each runs alone, only after every earlier check has
+finished, and no later check starts until it ends. The serialization rules live
+in runner code and derive from the plan, so `verification/matrix.json` and its
+approval are unchanged. Attempts stay sequential within a check. Receipts list
+checks in plan order with the same fields, attempts, log names and status
+semantics as before. `overlapViolations(receipt.checks)` in the runner reports
+any lock, exclusive or barrier breach in a real receipt.
+
+For a fix between two frozen candidates, run a targeted check set instead of the
+full matrix:
+
+```sh
+# context.json: {"baseCommit": "<previous candidate>", "commit": "<fix>"}
+node scripts/verify-matrix.mjs targeted context.json /absolute/external/log-directory [--jobs N]
+```
+
+Targeted mode selects checks only from the paths the fix changed, using the same
+matrix rules: a docs-only fix runs `npm-unit`, a `hub/` fix runs the Go checks,
+and a `client/` fix runs unit and browser checks. Unknown paths still refuse, and
+so do a dirty or attached worktree and a fix equal to its previous candidate. The
+run uses the same runner, retries and clean-detached checks. It writes
+`targeted-receipt.json`, marked `targeted: true`, and never `receipt.json`. A
+targeted receipt is advisory iteration evidence. It has no plan binding, and the
+handler never imports it. The full plan runs once, on the final candidate.
+
+Both `plan`/`run` and `targeted` refuse a base that the candidate does not
+contain, with "candidate is not a fast-forward of its base; rebase onto the
+current tip". Equal and linear commits are accepted. At acceptance,
+`tt team queue accept` and the leased handler's done save read the item's current
+verification plan. `--commit` must equal the plan commit, and the accepted
+worktree must be a fast-forward of the plan base. That base is saved as the
+acceptance base, so a candidate built on an older base is refused with "not a
+fast-forward of the recorded base". Items without a plan keep the queue entry's
+base. The team rebases onto the current tasks-hub tip before the handler freezes
+the final plan, so the verified commit is exactly what merges.
 
 ## AIV mapping boundary
 

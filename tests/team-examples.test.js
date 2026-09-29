@@ -212,3 +212,33 @@ test("Planned delivery runs only the database handler on Sonnet 5.5", () => {
   assert.match(reviewer.prompt, /separate session with its own context that did not write the change/);
   assert.match(planned.summary, /independent reviewer in its own session/);
 });
+
+// wi_82ed4c6924930bad / order #13844: verification runs alongside review,
+// fixes get targeted runs, and the final rebased candidate gets the full plan.
+test("Planned delivery verifies alongside review and verifies exactly what merges", () => {
+  const planned = TEAM_EXAMPLES.find((example) => example.id === "planned");
+  const prompt = (name) =>
+    exampleTeam("planned").members.find((member) => member.name === name).prompt;
+  const lead = prompt("lead"),
+    verifier = prompt("verifier"),
+    handler = prompt("database"),
+    builder = prompt("builder");
+  assert.match(lead, /send reviewer a REVIEW naming that commit, the scope and the criteria, and start its verification at once/);
+  assert.match(lead, /Verify alongside review: have the handler freeze the plan on the current tasks-hub tip and REQUEST the distinct verifier/);
+  assert.match(lead, /Each later candidate gets a fresh run, targeted from the previous candidate for fixes; withdraw the superseded REQUEST/);
+  assert.match(lead, /final candidate, rebased onto the current tip, gets the full plan once/);
+  assert.match(lead, /handler-saved passing receipt for the exact final SHA/);
+  assert.doesNotMatch(lead, /Before acceptance, REQUEST the distinct verifier/);
+  assert.match(verifier, /verify-matrix\.mjs targeted CONTEXT_JSON/);
+  assert.match(verifier, /never imported and never gates acceptance/);
+  assert.match(verifier, /stop its run with SIGINT/);
+  assert.match(verifier, /one matrix run per host at a time/);
+  assert.match(verifier, /pick checks yourself; the runner selects them/);
+  assert.match(handler, /Freeze each plan's base at the current local tasks-hub tip/);
+  assert.match(handler, /Never import a targeted-receipt\.json/);
+  assert.match(handler, /owner matrix approval covers every candidate, for any item, while verification\/matrix\.json bytes are unchanged/);
+  assert.match(builder, /rebase the candidate onto the current local tasks-hub/);
+  assert.match(planned.workflow, /reviewer and distinct verifier start together on each frozen candidate/);
+  for (const member of planned.members)
+    assert.ok(Buffer.byteLength(member.prompt) < 8192, member.name);
+});
