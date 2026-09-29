@@ -5905,3 +5905,84 @@ body:is(
   font-size: 0.75rem;
   overflow-wrap: anywhere;
 }
+
+/* Owner delegation windows: one compact strip above the owner requests. */
+.delegation-strip {
+  display: grid;
+  gap: 6px;
+  padding: 6px 0 8px;
+  border-bottom: 1px solid var(--line);
+  font-size: 12px;
+}
+.delegation-state,
+.delegation-open form {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+.delegation-state > span {
+  flex: 1 1 16rem;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.delegation-open form {
+  margin-top: 6px;
+}
+.delegation-open label {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  margin: 0;
+  font-size: 11px;
+}
+/* One control height, matching the Board compose recipient. */
+.delegation-strip select,
+.delegation-strip input,
+.delegation-strip button {
+  width: auto;
+  height: 28px;
+  margin: 0;
+  padding: 3px 9px;
+  font-size: 11px;
+}
+.delegation-strip select {
+  max-width: 240px;
+  min-width: 125px;
+}
+.delegation-open summary,
+.delegated-answers summary {
+  width: fit-content;
+  padding: 2px 4px;
+  color: var(--muted);
+  cursor: pointer;
+  outline: 1px solid transparent;
+}
+.delegation-open summary:hover,
+.delegated-answers summary:hover {
+  outline-color: var(--line);
+}
+.delegation-open > .fine {
+  margin: 4px 0 0;
+}
+.delegated-answers ul {
+  display: grid;
+  gap: 0;
+  margin: 4px 0 0;
+  padding: 0;
+  list-style: none;
+}
+.delegated-answers li {
+  display: grid;
+  gap: 2px;
+  padding: 6px 0;
+  border-top: 1px solid var(--line);
+}
+.delegated-answers p {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+.delegated-tag {
+  color: var(--ink);
+}
