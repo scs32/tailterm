@@ -52,12 +52,14 @@ export function createInterventionsView({ client }) {
       (s.loading ? "Loading interventions…" : s.error) ||
       (offline() ? "Saved data · offline" : s.summary ? "" : "Not loaded");
     root.innerHTML = `<details class="project-usage project-interventions" ${s.open ? "open" : ""} data-interventions-disclosure><summary>Interventions</summary><div class="usage-controls"><button data-interventions-refresh>Refresh</button></div>${status ? `<p class="fine" role="status">${esc(status)}</p>` : ""}${s.summary ? interventionsHtml(s.summary) : ""}</details>`;
-    root.querySelector("[data-interventions-disclosure]").ontoggle = (e) => {
-      s.open = e.target.open;
-      if (s.open && !s.summary && !s.error && !s.loading) void load();
-    };
-    root.querySelector("[data-interventions-refresh]").onclick = () =>
-      void load();
+    const disclosure = root.querySelector("[data-interventions-disclosure]");
+    if (disclosure)
+      disclosure.ontoggle = (e) => {
+        s.open = e.target.open;
+        if (s.open && !s.summary && !s.error && !s.loading) void load();
+      };
+    const refresh = root.querySelector("[data-interventions-refresh]");
+    if (refresh) refresh.onclick = () => void load();
   }
   async function load() {
     const s = state(),
