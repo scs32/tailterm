@@ -10,10 +10,13 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 	"unicode"
 	"unicode/utf8"
@@ -53,6 +56,8 @@ type claudeWakeSnapshot struct {
 	Offset    int64
 	Screen    string
 	Cursor    activityCursor
+	// UnknownTypes lists transcript record types the idle check ignored.
+	UnknownTypes []string
 }
 
 type claudeWakeOps struct {
@@ -208,7 +213,92 @@ func exactClaudeInput(screen, expected string) bool {
 	return strings.Join(strings.Fields(strings.Join(parts, " ")), " ") == strings.Join(strings.Fields(expected), " ")
 }
 
-func claudeTranscriptSnapshot(b runtimeBinding) (claudeWakeSnapshot, error) {
+// claudeQueueStaleAfter bounds how long queued input can hold a wake after a
+// completed turn. Claude Code dequeues queued input within about 50 ms of a
+// turn ending, so an older unmatched enqueue is drift (an unrecorded removal,
+// for example) and the pane check decides instead.
+const claudeQueueStaleAfter = 30 * time.Second
+
+// claudeQueueFresh reports input Claude Code queued recently enough that a new
+// turn is about to start from it.
+func claudeQueueFresh(c activityCursor, now time.Time) bool {
+	return c.ClaudeQueued > 0 && now.Sub(c.ClaudeQueuedAt) < claudeQueueStaleAfter
+}
+
+// claudeRecordLog remembers which unrecognized transcript record types this
+// relay process has already logged, so each is reported once.
+var claudeRecordLog struct {
+	sync.Mutex
+	seen map[string]bool
+}
+
+const claudeRecordLogCap = 64
+
+// logClaudeRecordOnce writes one relay log line per key per process. The set
+// is capped so a transcript full of novel types cannot grow it without bound.
+func logClaudeRecordOnce(key, format string, args ...any) {
+	claudeRecordLog.Lock()
+	if claudeRecordLog.seen == nil {
+		claudeRecordLog.seen = map[string]bool{}
+	}
+	if claudeRecordLog.seen[key] || len(claudeRecordLog.seen) >= claudeRecordLogCap {
+		claudeRecordLog.Unlock()
+		return
+	}
+	claudeRecordLog.seen[key] = true
+	claudeRecordLog.Unlock()
+	fmt.Fprintf(os.Stderr, format, args...)
+}
+
+// claudeRecordSample describes a transcript record without its content:
+// the sorted top-level key names plus the short scalar values of type,
+// subtype, operation and reason. Transcripts carry prompts and tool output,
+// so message and content strings are never included.
+func claudeRecordSample(line []byte) string {
+	var fields map[string]json.RawMessage
+	if json.Unmarshal(line, &fields) != nil {
+		return "unparsable"
+	}
+	keys := make([]string, 0, len(fields))
+	for key := range fields {
+		// Key names are schema, but keep an odd one from splitting the line.
+		key = strings.Map(func(r rune) rune {
+			if unicode.IsLetter(r) || unicode.IsDigit(r) || strings.ContainsRune("_-.", r) {
+				return r
+			}
+			return '?'
+		}, key)
+		keys = append(keys, claudeClip(key, 64))
+	}
+	slices.Sort(keys)
+	sample := "keys=[" + strings.Join(keys, " ") + "]"
+	for _, key := range []string{"type", "subtype", "operation", "reason"} {
+		var value string
+		if raw, ok := fields[key]; ok && json.Unmarshal(raw, &value) == nil && len(value) <= 64 {
+			sample += fmt.Sprintf(" %s=%q", key, value)
+		}
+	}
+	return claudeClip(sample, 200)
+}
+
+// claudeClip shortens value to at most limit bytes on a rune boundary.
+func claudeClip(value string, limit int) string {
+	if len(value) <= limit {
+		return value
+	}
+	cut := limit - len("…")
+	for cut > 0 && !utf8.RuneStart(value[cut]) {
+		cut--
+	}
+	return value[:cut] + "…"
+}
+
+// claudeTranscriptSnapshot reads the whole transcript and decides idleness
+// from turn state: a completed turn, no pending tool call and no freshly
+// queued input. A record type the parser does not know is logged once and
+// otherwise ignored, so the pane check decides; other parse errors still
+// refuse unless a later completed turn supersedes them.
+func claudeTranscriptSnapshot(b runtimeBinding, now time.Time) (claudeWakeSnapshot, error) {
 	path, err := activityTranscript(b)
 	if err != nil || path == "" {
 		return claudeWakeSnapshot{}, errors.New("Claude transcript unavailable")
@@ -216,9 +306,19 @@ func claudeTranscriptSnapshot(b runtimeBinding) (claudeWakeSnapshot, error) {
 	var cursor activityCursor
 	strictUnknown := false
 	unknownReason := ""
+	var unknownTypes []string
 	for i := 0; i < 128; i++ {
 		if err := readActivityAppend(path, &cursor, func(line []byte, cursor *activityCursor) error {
 			err := parseClaudeActivity(line, cursor)
+			var unknown unknownClaudeRecordError
+			if errors.As(err, &unknown) {
+				kind := claudeClip(unknown.Type, 64)
+				if !slices.Contains(unknownTypes, kind) {
+					unknownTypes = append(unknownTypes, kind)
+					logClaudeRecordOnce("type/"+kind, "[tt relay] %s %s Claude transcript record type %q not recognized; idle from turn state and pane check; sample=%s\n", now.UTC().Format(time.RFC3339), b.Agent, kind, claudeRecordSample(line))
+				}
+				return nil
+			}
 			if err != nil {
 				strictUnknown = true
 				if unknownReason == "" {
@@ -226,7 +326,7 @@ func claudeTranscriptSnapshot(b runtimeBinding) (claudeWakeSnapshot, error) {
 				}
 			} else if cursor.TurnComplete && claudeCompletedRecord(line) {
 				// A later fully completed turn supersedes an older malformed
-				// record. Unknown data after that boundary still blocks input.
+				// record. Malformed data after that boundary still blocks input.
 				strictUnknown, unknownReason = false, ""
 			}
 			return err
@@ -237,10 +337,31 @@ func claudeTranscriptSnapshot(b runtimeBinding) (claudeWakeSnapshot, error) {
 			break
 		}
 	}
-	if !cursor.Ready || cursor.Unknown || strictUnknown || !cursor.SeenTurn || !cursor.TurnComplete || len(cursor.Pending) != 0 {
-		return claudeWakeSnapshot{}, fmt.Errorf("Claude transcript busy, incomplete, or unknown: %s", unknownReason)
+	reason := ""
+	switch {
+	case !cursor.Ready:
+		reason = "transcript incomplete"
+	case !cursor.SeenTurn:
+		reason = "no completed turn yet"
+	case !cursor.TurnComplete:
+		reason = "turn in progress"
+	case len(cursor.Pending) != 0:
+		ids := slices.Sorted(maps.Keys(cursor.Pending))
+		reason = "tool call pending: " + cursor.Pending[ids[0]].Name
+	case claudeQueueFresh(cursor, now):
+		reason = fmt.Sprintf("queued input pending (%d)", cursor.ClaudeQueued)
+	case strictUnknown:
+		reason = unknownReason
+	case cursor.Unknown:
+		reason = "transcript format unknown"
 	}
-	return claudeWakeSnapshot{Path: path, FileID: cursor.FileID, Offset: cursor.Offset, Cursor: cursor}, nil
+	if reason != "" {
+		return claudeWakeSnapshot{}, fmt.Errorf("Claude transcript busy, incomplete, or unknown: %s", reason)
+	}
+	if cursor.ClaudeQueued > 0 {
+		logClaudeRecordOnce("queue-operation/stale", "[tt relay] %s %s Claude transcript has %d queued input older than %s after a completed turn; idle from turn state and pane check\n", now.UTC().Format(time.RFC3339), b.Agent, cursor.ClaudeQueued, claudeQueueStaleAfter)
+	}
+	return claudeWakeSnapshot{Path: path, FileID: cursor.FileID, Offset: cursor.Offset, Cursor: cursor, UnknownTypes: unknownTypes}, nil
 }
 
 func claudeCompletedRecord(line []byte) bool {
@@ -298,7 +419,7 @@ func nativeClaudeInspect(ctx context.Context, b runtimeBinding, expected string)
 	if err != nil {
 		return claudeWakeSnapshot{}, err
 	}
-	transcript, err := claudeTranscriptSnapshot(b)
+	transcript, err := claudeTranscriptSnapshot(b, time.Now())
 	if err != nil {
 		return claudeWakeSnapshot{}, err
 	}
@@ -604,7 +725,7 @@ func claudeWakeWith(ctx context.Context, b runtimeBinding, prompt string, ops cl
 	if err != nil {
 		return fmt.Errorf("%w: %v", errClaudeWakeUnsafe, err)
 	}
-	if !emptyClaudeInput(first.Screen) || !first.Cursor.TurnComplete || !first.Cursor.Ready || first.Cursor.Unknown || len(first.Cursor.Pending) != 0 {
+	if !emptyClaudeInput(first.Screen) || !first.Cursor.TurnComplete || !first.Cursor.Ready || first.Cursor.Unknown || len(first.Cursor.Pending) != 0 || claudeQueueFresh(first.Cursor, ops.now()) {
 		return errClaudeWakeUnsafe
 	}
 	second, err := ops.inspect(ctx, b, "")
