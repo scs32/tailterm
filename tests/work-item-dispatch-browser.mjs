@@ -15,7 +15,8 @@ const tasks=[
 ];
 const item={id:'item_1',taskId:'tsk_source',kind,title:'Synthetic '+kind,status:'open',priority:'normal',revision:3};
 const state={outcome:'success',calls:[],notices:[],openBoard:[],pending:[],settled:0};
-const result=body=>({dispatch:{targetTaskId:body.targetTaskId,messageSeq:40+state.calls.length},item:{...item,lastDispatch:{targetTaskId:body.targetTaskId}}});
+// A queue-capable hub returns the durable queue entry (0c26e69); a legacy hub returns none.
+const result=(body,legacy)=>({dispatch:{targetTaskId:body.targetTaskId,messageSeq:40+state.calls.length},item:{...item,lastDispatch:{targetTaskId:body.targetTaskId}},...(legacy?{}:{queue:{entry:{cycle:state.settled}}})});
 const client={
   async listTasks(){return tasks.map(task=>({...task}))},
   async listWorkItems(){return {items:[{...item}],next:0}},
@@ -27,7 +28,7 @@ const client={
     if(outcome==='pending')outcome=await new Promise(resolve=>state.pending.push(resolve));
     if(outcome==='failure')throw new Error('Synthetic dispatch rejected');
     item.lastDispatch={targetTaskId:body.targetTaskId};state.settled++;
-    return result(body);
+    return result(body,outcome==='legacy');
   },
 };
 const root=document.querySelector('#mode-view'),dialogNode=document.querySelector('#dialog');
@@ -101,8 +102,9 @@ try {
           .locator("#work-item-dispatch")
           .evaluate((form) => form.requestSubmit());
         await expect(page.locator("#dialog")).not.toBeVisible();
-        await expect(page.locator("#notice")).toContainText(
-          `${kind === "bug" ? "Bug" : "Feature"} sent to Target project`,
+        const singular = kind === "bug" ? "Bug" : "Feature";
+        await expect(page.locator("#notice")).toHaveText(
+          `${singular} enqueued for Target project · Queue cycle 1 · notice #41.`,
         );
         let state = await page.evaluate(() => qa.state);
         assert.deepEqual(state.calls[0].body.targetTaskId, "tsk_target");
@@ -113,6 +115,18 @@ try {
           `${label}: navigated on success`,
         );
         results.push(`${label}: success closes with durable notice`);
+
+        await load(page, kind);
+        await page.evaluate(() => qa.outcome("legacy"));
+        await openDispatch(page);
+        await page
+          .locator("#work-item-dispatch")
+          .evaluate((form) => form.requestSubmit());
+        await expect(page.locator("#dialog")).not.toBeVisible();
+        await expect(page.locator("#notice")).toHaveText(
+          `${singular} sent using a legacy hub · Queue support was not confirmed · board message #41.`,
+        );
+        results.push(`${label}: legacy hub success names the missing queue`);
 
         await load(page, kind);
         await page.evaluate(() => qa.outcome("failure"));
