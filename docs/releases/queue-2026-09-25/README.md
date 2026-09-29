@@ -61,6 +61,7 @@ SHA-256 is of the unredacted receipt.
 | `5ed02c0` | GPT-6.1 Sol availability (`wi_b1bff047121dec24`, merge of `721745d`) | `gpt-6.1-sol` is allowed in the model lists and pickers; the owner session removed a duplicate test import left by the clean textual merge with `4dd3841` | Mini `tt`, TailOS `4716aff4` |
 | `fe56621` | Agent window size and wake resend (`wi_b6b79229c8fec99d`, merge of `eacb486`) | Agent tmux windows keep a usable fixed size regardless of viewers; the relay retries unconfirmed Claude wakes; stuck agents are flagged; matrix `3ac190a1` (owner approval #14936) | Hub `20260929-window-size-fe56621`, Mini `tt`, TailOS `ba74b356` |
 | `ee47773` | Owner delegation windows (`wi_2f6f24bc62b24a7a`, merge of `1ff9b11`) | The owner can delegate decisions (and optionally merges and deploys) to a named agent until a set time; delegated answers need a rationale and are listed for the owner; matrix approvals never leave the owner | Hub `20260929-delegation-ee47773`, Mini `tt`, TailOS `0e3eba25` |
+| `abfd0dc` | Split above with Shift + Left Option (`wi_7cab0b4cbf3232c8`, merge of `14ecf6e`) | Dropping a pane with Shift + Left Option splits above; Left Option alone splits right; Right Option no longer selects a placement | TailOS (`abfd0dc` build) |
 
 ## Hub releases
 
