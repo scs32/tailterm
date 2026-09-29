@@ -182,3 +182,35 @@ func TestOwnerInterveneRefusesAgentsAndBadInputBeforeAnyRequest(t *testing.T) {
 		t.Fatalf("refused commands sent %d requests", n)
 	}
 }
+
+// The owner's shell has no TAILTERM_TASK, so the usage must name --task.
+func TestOwnerInterventionUsageNamesTaskWhenNoProjectIsSet(t *testing.T) {
+	var requests atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests.Add(1)
+		http.Error(w, "unexpected request", http.StatusTeapot)
+	}))
+	t.Cleanup(srv.Close)
+	owner := env{hub: srv.URL}
+	for _, tc := range []struct {
+		args []string
+		want string
+	}{
+		{[]string{"intervene", "--kind", "nudge", "--item", "wi_0000000000000001", "--text", "t"}, "usage: tt owner intervene --task ID "},
+		{[]string{"interventions"}, "usage: tt owner interventions --task ID "},
+		{nil, "intervene --task ID --kind KIND"},
+		{nil, "interventions --task ID [--tz ZONE]"},
+	} {
+		err := cmdOwner(owner, tc.args)
+		if err == nil || !strings.Contains(err.Error(), tc.want) {
+			t.Fatalf("%v: err=%v, want %q", tc.args, err, tc.want)
+		}
+		if len(tc.args) > 0 && !strings.Contains(err.Error(), "required unless TAILTERM_TASK is set") {
+			t.Fatalf("%v: usage does not explain --task: %v", tc.args, err)
+		}
+	}
+	// With --task the same command reaches the hub.
+	if err := cmdOwner(owner, []string{"interventions", "--task", "tsk_0000000000000001", "--tz", "UTC"}); err == nil || requests.Load() != 1 {
+		t.Fatalf("explicit --task: err=%v requests=%d", err, requests.Load())
+	}
+}

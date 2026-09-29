@@ -57,8 +57,8 @@ Commands
   inbox [--unread] [--mark-read] [--wait 9m] [--json]
   context [--json]             print this exact run's bound work-item context
   owner extend|answer|cancel OBLIGATION_ID ...  the owner's controls over an obligation
-  owner intervene --kind K --item ID [--product-item ID] --text T  record an owner intervention
-  owner interventions [--tz ZONE]  owner interventions per day and kind
+  owner intervene --task ID --kind K --item ID [--product-item ID] --text T  record an owner intervention
+  owner interventions --task ID [--tz ZONE]  owner interventions per day and kind
   operational-record get       read a legacy operational record (writes retired in phase 3)
   current-assignment [--item ID --action-key KEY] [--json]  read a legacy directive
   delivery coverage [--json]   read legacy directive coverage (writes retired in phase 3)

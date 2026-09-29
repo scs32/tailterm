@@ -32,7 +32,7 @@ func cmdOwner(e env, args []string) error {
 		}
 		return cmdOwnerInterventions(e, args[1:])
 	}
-	usage := errors.New("usage: tt owner extend OBLIGATION_ID --for 30m [--reason T] | answer OBLIGATION_ID (--text T | --approve) [--session S] | delegate OBLIGATION_ID --session S --authorization REF [--agent ID --run ID] | cancel OBLIGATION_ID --reason T | intervene --kind KIND --item ID [--product-item ID] --text T | interventions [--tz ZONE]")
+	usage := errors.New("usage: tt owner extend OBLIGATION_ID --for 30m [--reason T] | answer OBLIGATION_ID (--text T | --approve) [--session S] | delegate OBLIGATION_ID --session S --authorization REF [--agent ID --run ID] | cancel OBLIGATION_ID --reason T | intervene --task ID --kind KIND --item ID [--product-item ID] --text T | interventions --task ID [--tz ZONE]")
 	if len(args) < 2 {
 		return usage
 	}
@@ -100,7 +100,7 @@ func cmdOwner(e env, args []string) error {
 	return nil
 }
 
-const interventionUsage = "usage: tt owner intervene --kind KIND --item ID [--product-item ID] --text T [--request-id R] [--json]\n  KIND is one of "
+const interventionUsage = "usage: tt owner intervene --task ID --kind KIND --item ID [--product-item ID] --text T [--request-id R] [--json]\n  --task is the project ID; required unless TAILTERM_TASK is set\n  KIND is one of "
 
 // cmdOwnerIntervene records one owner-side intervention on the Board.
 func cmdOwnerIntervene(e env, args []string) error {
@@ -160,7 +160,7 @@ func cmdOwnerInterventions(e env, args []string) error {
 		return err
 	}
 	if fs.NArg() != 0 || *task == "" {
-		return errors.New("usage: tt owner interventions [--tz ZONE] [--json]")
+		return errors.New("usage: tt owner interventions --task ID [--tz ZONE] [--json]\n  --task is the project ID; required unless TAILTERM_TASK is set")
 	}
 	c, err := e.client(30 * time.Second)
 	if err != nil {

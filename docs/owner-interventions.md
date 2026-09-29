@@ -11,9 +11,12 @@ and links each intervention to the product item expected to remove it.
 ## Record
 
 ```
-tt owner intervene --kind KIND --item ID [--product-item ID] --text T [--request-id R] [--json]
+tt owner intervene --task ID --kind KIND --item ID [--product-item ID] --text T [--request-id R] [--json]
 ```
 
+- `--task` is the project ID. It is required outside agent sessions, where
+  `TAILTERM_TASK` is normally unset; when that variable is set it is the
+  default. Agent sessions are refused regardless (see below).
 - `--kind` is one of `release`, `nudge`, `decision-on-behalf`, `gate-fix`,
   `cleanup`, `diagnosis`, `status`, `other`.
 - `--item` is the work item in this project the intervention concerns. Any
@@ -63,8 +66,10 @@ form and they never affect the typed-agent adoption rate.
 ## Read
 
 ```
-tt owner interventions [--tz ZONE] [--json]
+tt owner interventions --task ID [--tz ZONE] [--json]
 ```
+
+`--task` is required here too unless `TAILTERM_TASK` is set.
 
 `GET /v1/tasks/{id}/interventions?after=&limit=&tz=` returns one page of
 intervention messages (at most 100, by message sequence, with `nextAfter` for
