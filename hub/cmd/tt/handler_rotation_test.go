@@ -788,3 +788,32 @@ func TestHandlerRotationRunnerSpacesDueRequestsWhileEnabled(t *testing.T) {
 		t.Fatalf("due requests after the interval: %d", f.dueCalls.Load())
 	}
 }
+
+// Round-one blocker b1 (#14244): a current handler launched with a prompt and
+// no saved spec on this host is not template-due and gets no owner notice.
+func TestHandlerRotationRunnerNoSpecCurrentTemplateIsNotDue(t *testing.T) {
+	f := newRotationCLI(t, handlerTemplateDigest("handler assignment"))
+	for i := 0; i < 2; i++ {
+		f.tick(t, f.runner())
+	}
+	messages, err := f.c.ListMessages(context.Background(), f.task.ID, 0, "", 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, m := range messages {
+		if m.Envelope != nil && strings.Contains(m.Envelope.Subject, "no saved launch spec") {
+			t.Fatalf("false due notice for a current-template handler: %s", m.Envelope.Body.Text)
+		}
+	}
+	if f.actions.Load() != 0 || f.spawns != 0 {
+		t.Fatalf("rotation requested: actions=%d spawns=%d", f.actions.Load(), f.spawns)
+	}
+	due := api.HandlerRotationDue{Policy: api.HandlerRotationPolicy{OnTemplateChange: true}, RecordedDigest: handlerTemplateDigest("some other prompt")}
+	if reasons := rotationDueReasons(due, nil); len(reasons) != 0 {
+		t.Fatalf("recorded digest without a spec asserted a change: %v", reasons)
+	}
+	due.RecordedDigest = ""
+	if reasons := rotationDueReasons(due, nil); len(reasons) != 1 || reasons[0] != api.HandlerRotationReasonTemplate {
+		t.Fatalf("legacy run without a spec: %v", reasons)
+	}
+}

@@ -743,7 +743,8 @@ func hostRunsHandler(ctx context.Context, hub string) (bool, error) {
 }
 
 // rotationDueReasons decides what the runner acts on. Item and token limits
-// come from the hub; the template check uses this host's saved prompt.
+// come from the hub; the template check uses this host's saved prompt, or,
+// with no saved spec, only flags a legacy run with no recorded template.
 func rotationDueReasons(d api.HandlerRotationDue, spec *handlerSpec) []string {
 	var reasons []string
 	for _, r := range d.DueReasons {
@@ -751,11 +752,18 @@ func rotationDueReasons(d api.HandlerRotationDue, spec *handlerSpec) []string {
 			reasons = append(reasons, r)
 		}
 	}
-	expected := handlerTemplateDigest("")
-	if spec != nil {
-		expected = handlerTemplateDigest(spec.value("prompt"))
+	if !d.Policy.OnTemplateChange {
+		return reasons
 	}
-	if d.Policy.OnTemplateChange && d.RecordedDigest != expected {
+	// Without a saved spec this host does not know the handler's prompt, so
+	// only a legacy run with no recorded template is known to be stale.
+	if spec == nil {
+		if d.RecordedDigest == "" {
+			reasons = append(reasons, api.HandlerRotationReasonTemplate)
+		}
+		return reasons
+	}
+	if d.RecordedDigest != handlerTemplateDigest(spec.value("prompt")) {
 		reasons = append(reasons, api.HandlerRotationReasonTemplate)
 	}
 	return reasons

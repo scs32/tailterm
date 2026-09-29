@@ -185,7 +185,9 @@ For each listed project:
   due reason.
 - Due but busy: nothing this tick. It rotates on the first idle tick.
 - Due with no saved spec: one board NOTICE per exact handler run, keyed so a
-  relay restart does not repeat it. No spawn.
+  relay restart does not repeat it. No spawn. Without a spec the host does not
+  know the handler's prompt, so it reports a template change only for a legacy
+  run with no recorded digest.
 - Policy disabled: the project is not listed, so no rotation request is made.
 
 ## API
