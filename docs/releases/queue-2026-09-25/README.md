@@ -50,6 +50,7 @@ SHA-256 is of the unredacted receipt.
 | `0973558` | Flaky browser suites (`wi_a9a69169f732121d`, merge of `a577d78`) | Queue refresh races, Board focus loss and a hidden Board reload fixed; board-compose, board-decisions and project-queue pass reliably | TailOS `9749cde5` |
 | `ffda442` | Handler rotation (`wi_611e4d3c6992a664`, merge of `839127c`) | A long-lived database handler can be replaced by a fresh session that takes over its obligations; default limits 10 items, 300M tokens or a prompt change (off for existing projects until enabled) | Hub `20260928-handler-rotation-ffda442`, Mini `tt` |
 | `4a6cdfd` | Claude queue-operation wake (`wi_614f0e656fcc0c35`, merge of `596fd0e`) | The relay's Claude idle check understands queue-operation transcript records and no longer drops wakes on unknown record types | Mini `tt` |
+| `75e8d2d` | Pre-existing browser suites (`wi_be7bbed81d4009c1`, merge of `07e1f79`, owner-integrated) | All 14 known-failing browser suites pass on the first attempt (67/67); the bug stays open until the matrix follow-up `wi_0f8ec0f080ddd930` empties knownFailures | none (tests only) |
 
 ## Hub releases
 
@@ -77,7 +78,7 @@ Before `6235924`, the combined migration was rehearsed on a copy of the `33d3ab7
 hub migrated it (integrity ok, no FK violations, 14 projects, queue at limit 1), and the
 `33d3ab7` hub opened the migrated copy. The `34944cf`, `8b1f4d4`, `8e32dc0`, `acfe2d0` and `ffda442` migrations were rehearsed
 the same way on a copy of the previous release's backup, including the old hub opening the
-migrated copy. `172becd` fast-forwarded `tasks-hub` and shipped on its independent receipt without an owner-side rerun, per the deployment agent's rule. `6692a57`, `1e8e8df`, `66b55ed`, `0973558`, `ffda442` and `4a6cdfd` were merges, so each shipped only after a full check run on the merge commit. `1e8e8df` was integrated by the owner release step: the team's branch predated the queue's frozen base, and re-accepting the done item was refused, so its queue entry was failed and released. The first `c343819` deploy attempt was refused by plan validation before any
+migrated copy. `172becd` fast-forwarded `tasks-hub` and shipped on its independent receipt without an owner-side rerun, per the deployment agent's rule. `6692a57`, `1e8e8df`, `66b55ed`, `0973558`, `ffda442`, `4a6cdfd` and `75e8d2d` were merges, so each shipped only after a full check run on the merge commit. `1e8e8df` was integrated by the owner release step: the team's branch predated the queue's frozen base, and re-accepting the done item was refused, so its queue entry was failed and released. The first `c343819` deploy attempt was refused by plan validation before any
 change (the plan carried the previous day's release name); the second, with a fresh backup
 (`-v2`), succeeded. Rollback binaries: `.build/prev-*` (hub, bridge) and
 `~/.local/bin/tt.prev-*` (Mini).
