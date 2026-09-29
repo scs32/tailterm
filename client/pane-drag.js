@@ -4,9 +4,10 @@ export function setupPaneDrag(shell, { start, move, drop, cancel }) {
   let pending,
     dragging = false,
     suppressClick = false,
-    optionSequence = 0,
+    shift = false,
     lastPointer = null;
-  const optionKeys = new Map();
+  // Only Left Option places a pane; Shift turns "split right" into "split above".
+  const leftOptions = new Set();
   const optionSide = (event) => {
     if (event.code === "AltLeft") return "left";
     if (event.code === "AltRight") return "right";
@@ -15,12 +16,8 @@ export function setupPaneDrag(shell, { start, move, drop, cancel }) {
     if (event.location === KeyboardEvent.DOM_KEY_LOCATION_RIGHT) return "right";
     return null;
   };
-  const placement = () => {
-    const latest = [...optionKeys.entries()].sort(
-      (a, b) => b[1].order - a[1].order,
-    )[0]?.[1]?.side;
-    return latest === "left" ? "right" : latest === "right" ? "above" : null;
-  };
+  const placement = () =>
+    leftOptions.size ? (shift ? "above" : "right") : null;
   const gesture = () => ({ placement: placement() });
   const updateMove = () => {
     if (!dragging || !lastPointer) return;
@@ -49,6 +46,7 @@ export function setupPaneDrag(shell, { start, move, drop, cancel }) {
   shell.addEventListener("pointermove", (e) => {
     if (!pending || pending.pointer !== e.pointerId) return;
     lastPointer = { x: e.clientX, y: e.clientY };
+    shift = e.shiftKey;
     if (
       !dragging &&
       Math.hypot(e.clientX - pending.x, e.clientY - pending.y) < 6
@@ -75,6 +73,7 @@ export function setupPaneDrag(shell, { start, move, drop, cancel }) {
       wasDragging = dragging;
     pending = null;
     dragging = false;
+    if (typeof e.shiftKey === "boolean") shift = e.shiftKey;
     if (wasDragging) {
       suppressClick = true;
       setTimeout(() => {
@@ -104,10 +103,9 @@ export function setupPaneDrag(shell, { start, move, drop, cancel }) {
     "keydown",
     (e) => {
       const side = optionSide(e);
-      if (side) {
-        const code = e.code || `Alt-${e.location}`;
-        if (!optionKeys.has(code))
-          optionKeys.set(code, { side, order: ++optionSequence });
+      shift = e.shiftKey;
+      if (side || e.key === "Shift") {
+        if (side === "left") leftOptions.add(e.code || `Alt-${e.location}`);
         if (dragging) e.preventDefault();
         updateMove();
       }
@@ -123,15 +121,17 @@ export function setupPaneDrag(shell, { start, move, drop, cancel }) {
     "keyup",
     (e) => {
       const side = optionSide(e);
-      if (!side) return;
-      optionKeys.delete(e.code || `Alt-${e.location}`);
+      shift = e.shiftKey;
+      if (!side && e.key !== "Shift") return;
+      if (side === "left") leftOptions.delete(e.code || `Alt-${e.location}`);
       if (dragging) e.preventDefault();
       updateMove();
     },
     true,
   );
   window.addEventListener("blur", () => {
-    optionKeys.clear();
+    leftOptions.clear();
+    shift = false;
     finish({}, true);
   });
   document.addEventListener("fullscreenchange", () => finish({}, true));

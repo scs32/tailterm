@@ -475,6 +475,8 @@ function mount() {
     upload: staticMode
       ? (id) => imageUploads?.choose(tabs.find((t) => t.id === id))
       : null,
+    dialog,
+    closeDialog,
     preferences: () => appearance,
     label: (t) => tabName(t, true),
     changed: scheduleWorkspaceSave,
@@ -1640,6 +1642,7 @@ function appearanceDialog() {
     <h3>Rendering</h3><div class="appearance-toggles"><label><input type="checkbox" data-preference="gpuRendering" ${appearance.gpuRendering ? "checked" : ""} ${webglSupported() ? "" : "disabled"}>GPU rendering (WebGL)</label></div><p class="fine">${webglSupported() ? "Faster scrolling and output for large histories and grouped panes. Font ligatures such as -> and => only render with GPU rendering off." : "WebGL is unavailable in this browser; the standard renderer is in use."}</p>
     <h3>Attention sound</h3><div class="appearance-toggles"><label><input type="checkbox" data-preference="attentionSound" ${appearance.attentionSound ? "checked" : ""}>Play a gentle chime</label></div><button id="preview-attention-sound">Preview sound</button><p class="fine">Off by default. Chimes for bells, command completion, and connection problems in unattended tabs, at most once every five seconds. Ordinary output stays silent. Keep Tailterm open and interact once after loading to enable browser audio.</p>
     <details class="dialog-details"><summary>Keyboard & selection tips</summary><p class="fine">Switch grouped panes with Option + Shift + arrow keys on Mac, or Ctrl + Alt + arrow keys on Windows/Linux.</p>
+    <p class="fine">While dragging a pane header, hold Left Option (Alt) to split right or Shift + Left Option to split above. From the keyboard, open Commands (⌘/Ctrl + Shift + P) → Move current pane.</p>
     <p class="fine">Hold Shift while dragging to select text when tmux handles the mouse. Plain Ctrl+C still interrupts a command. Remote clipboard read requests are never answered.</p></details>`,
   );
   // Preview terminal font changes without reflowing the controls being clicked.
@@ -2915,10 +2918,16 @@ function openCommands() {
           run: () => paneGroups.navigate(direction),
         });
     if (paneGroups.members(t.id).length > 1)
-      commands.push({
-        label: "Separate current pane into a tab",
-        run: () => paneGroups.detach(t.id),
-      });
+      commands.push(
+        {
+          label: "Move current pane above, below, left or right",
+          run: () => paneGroups.showMove(t.id),
+        },
+        {
+          label: "Separate current pane into a tab",
+          run: () => paneGroups.detach(t.id),
+        },
+      );
   }
   commands.push(
     { label: "Appearance", run: () => $("#appearance").click() },

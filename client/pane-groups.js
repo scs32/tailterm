@@ -16,6 +16,8 @@ export function setupPaneGroups({
   activate,
   close,
   upload,
+  dialog,
+  closeDialog,
   preferences,
   label,
   changed = () => {},
@@ -178,9 +180,9 @@ export function setupPaneGroups({
         header.draggable = false;
         header.title =
           group?.taskId && !group.guests?.includes(id)
-            ? "Drag to rearrange within this project. Project agents stay in their project group.\nLeft Option: split right · Right Option: split above."
+            ? "Drag to rearrange within this project. Project agents stay in their project group.\nLeft Option: split right · Shift + Left Option: split above."
             : grouped
-              ? "Drag to rearrange\nDrop onto another pane in this group to swap positions, or onto the tab bar to ungroup.\nLeft Option: split right · Right Option: split above."
+              ? "Drag to rearrange\nDrop onto another pane in this group to swap positions, or onto the tab bar to ungroup.\nLeft Option: split right · Shift + Left Option: split above."
               : "Drag to group\nDrop onto another session tab to group these terminals.";
         const focus = document.createElement("button");
         focus.className = "pane-label";
@@ -515,6 +517,26 @@ export function setupPaneGroups({
     merge,
     place,
     detach,
+    showMove(id) {
+      const others = members(id).filter((other) => other !== id);
+      if (!dialog || !others.length) return;
+      dialog(
+        "Move pane",
+        '<label>Next to<select id="pane-move-target"></select></label><div class="dialog-menu"><button data-pane-move="above">Move above</button><button data-pane-move="below">Move below</button><button data-pane-move="left">Move left</button><button data-pane-move="right">Move right</button></div>',
+      );
+      const select = document.querySelector("#pane-move-target");
+      for (const other of others)
+        select.append(
+          new Option(label(getTabs().find((t) => t.id === other)), other),
+        );
+      for (const button of document.querySelectorAll("[data-pane-move]"))
+        button.onclick = () => {
+          const target = select.value;
+          closeDialog();
+          place(id, target, button.dataset.paneMove);
+        };
+      select.focus();
+    },
     navigate(direction) {
       const group = current();
       if (!group) return;

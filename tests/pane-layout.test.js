@@ -424,5 +424,28 @@ test("directional placement respects task ownership and guest rules", () => {
   assert.deepEqual(model.taskGroup("one").guests, ["shell"]);
   assert.equal(model.place("missing", "lead", "right"), false);
   assert.equal(model.place("lead", "lead", "above"), false);
-  assert.equal(model.place("lead", "peer", "below"), false);
+  assert.equal(model.place("lead", "peer", "diagonal"), false);
+});
+
+test("directional placement supports left and below", () => {
+  const relation = (tree, first, second) =>
+    tree.tab
+      ? null
+      : tree.a.tab === first && tree.b.tab === second
+        ? tree.axis
+        : relation(tree.a, first, second) || relation(tree.b, first, second);
+  const model = new PaneGroups();
+  model.sync(["a", "b", "c", "d"]);
+  model.merge("b", "a");
+  model.merge("c", "b");
+
+  assert.equal(model.place("a", "c", "left"), true);
+  assert.equal(relation(model.group("a").tree, "a", "c"), "x");
+  assert.equal(model.place("a", "c", "below"), true);
+  assert.equal(relation(model.group("a").tree, "c", "a"), "y");
+  assert.deepEqual(leaves(model.group("a").tree).sort(), ["a", "b", "c"]);
+
+  assert.equal(model.place("d", "b", "left"), true);
+  assert.equal(model.group("d"), model.group("b"));
+  assert.equal(relation(model.group("b").tree, "d", "b"), "x");
 });

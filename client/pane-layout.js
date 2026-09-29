@@ -345,15 +345,15 @@ export class PaneGroups {
   place(source, target, placement) {
     if (
       source === target ||
-      !["right", "above"].includes(placement) ||
+      !["right", "left", "above", "below"].includes(placement) ||
       !this.group(source) ||
       !this.group(target)
     )
       return false;
     const from = this.group(source),
       to = this.group(target),
-      axis = placement === "right" ? "x" : "y",
-      before = placement === "above";
+      axis = placement === "right" || placement === "left" ? "x" : "y",
+      before = placement === "above" || placement === "left";
     if (from !== to)
       return this.merge(source, target, { whole: false, axis, before });
     this.customize(source);
