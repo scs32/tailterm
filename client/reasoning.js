@@ -6,6 +6,7 @@ export const REASONING_INHERIT = "";
 // an API model page (for example `none` or `max`) are not advertised here.
 export const CODEX_REASONING_MODELS = Object.freeze({
   "gpt-5.3-codex": ["low", "medium", "high", "xhigh"],
+  "gpt-6.1-sol": ["low", "medium", "high", "xhigh"],
   "gpt-6-astra": ["low", "medium", "high", "xhigh"],
   "gpt-6-sol": ["low", "medium", "high", "xhigh"],
   "gpt-6-luna": ["low", "medium", "high", "xhigh"],

@@ -3,6 +3,7 @@
 export const MODEL_OPTIONS = {
   codex: [
     ["gpt-5.3-codex", "GPT-5.3 Codex"],
+    ["gpt-6.1-sol", "Sol (GPT-6.1)"],
     ["gpt-6-astra", "Astra (GPT-6)"],
     ["gpt-6-sol", "Sol (GPT-6)"],
     ["gpt-6-luna", "Luna (GPT-6)"],
