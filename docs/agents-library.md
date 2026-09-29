@@ -32,7 +32,7 @@ The advertised Codex reasoning matrix is the documented intersection of `low`, `
 
 GPT-6 Sol (`gpt-6-sol`) and GPT-6 Luna (`gpt-6-luna`) join the same Codex matrix (September 23, 2026), per the [Codex models page](https://learn.chatgpt.com/docs/models). Live check that day: `codex-cli` 0.154.0 did not list `gpt-6-sol`, and the server rejected it for the ChatGPT-account login. After upgrading the npm global `@openai/codex` to 0.156.1, the catalog listed `gpt-6-sol` (low–ultra) and `gpt-6-luna`. A real `codex exec -m gpt-6-sol` call at `medium` succeeded, and the `codex queue --help` surface the relay uses was unchanged.
 
-Claude Code accepts `--effort low|medium|high|xhigh|max`, and Tailterm passes it for exact model IDs only: `claude-opus-5-5`, `claude-fable-5-1`, `claude-opus-5` and `claude-sonnet-5` all support all five levels. Aliases (`opus`, `sonnet`, `opusplan`) follow the server's configuration and stay inherit-only. Haiku 4.5 has no effort control. As with Codex, explicit effort requires the exact native `claude` run command. A command override that already contains `--effort` is rejected. Verified against installed Claude Code 2.1.281 `--help`.
+Claude Code accepts `--effort low|medium|high|xhigh|max`, and Tailterm passes it for exact model IDs only: `claude-opus-5-5`, `claude-fable-5-1`, `claude-opus-5`, `claude-sonnet-5-5` and `claude-sonnet-5` all support all five levels. Aliases (`opus`, `sonnet`, `opusplan`) follow the server's configuration and stay inherit-only. Haiku 4.5 has no effort control. As with Codex, explicit effort requires the exact native `claude` run command. A command override that already contains `--effort` is rejected. Verified against installed Claude Code 2.1.281 `--help`.
 
 ## Verification and rollback
 

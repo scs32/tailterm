@@ -25,6 +25,16 @@ func TestReasoningLaunchArguments(t *testing.T) {
 	if out, err := exec.Command("/bin/sh", "-c", claude+" briefing").Output(); err != nil || string(out) != "--effort\nmedium\nbriefing\n" {
 		t.Fatalf("claude argv = %q, err = %v", out, err)
 	}
+	sonnet, err := reasoningCommand("printf '%s\\n'", "claude", "claude-sonnet-5-5", "high", "claude")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out, err := exec.Command("/bin/sh", "-c", sonnet+" briefing").Output(); err != nil || string(out) != "--effort\nhigh\nbriefing\n" {
+		t.Fatalf("sonnet argv = %q, err = %v", out, err)
+	}
+	if _, err := reasoningCommand("claude", "claude", "claude-sonnet-5-5", "ultra", "claude"); err == nil || !strings.Contains(err.Error(), "unsupported claude") {
+		t.Fatal("accepted claude-sonnet-5-5 ultra", err)
+	}
 	if _, err := reasoningCommand("claude --effort high", "claude", "claude-opus-5-5", "low", "claude"); err == nil || !strings.Contains(err.Error(), "remove --effort") {
 		t.Fatal("accepted conflicting claude effort", err)
 	}

@@ -191,3 +191,24 @@ test("Planned delivery marks verification-owned criteria pending for the reviewe
   assert.match(reviewer, /Mark verification-owned criteria pending-verification/);
   assert.match(reviewer, /handler-imported eligible receipt judges those criteria/);
 });
+
+// Owner trial wi_519d2df4f04c2e1c: only the Planned database handler moves to
+// Claude Sonnet 5.5; every other seat keeps its runtime, model and effort.
+test("Planned delivery runs only the database handler on Sonnet 5.5", () => {
+  const planned = TEAM_EXAMPLES.find((example) => example.id === "planned");
+  const seats = Object.fromEntries(
+    planned.members.map((m) => [m.name, [m.runtime, m.model, m.reasoning]]),
+  );
+  assert.deepEqual(seats, {
+    lead: ["claude", "claude-opus-5-5", "medium"],
+    planner: ["claude", "claude-opus-5-5", "high"],
+    builder: ["claude", "claude-opus-5-5", "high"],
+    database: ["claude", "claude-sonnet-5-5", "high"],
+    verifier: ["claude", "claude-opus-5-5", "high"],
+    reviewer: ["claude", "claude-opus-5-5", "high"],
+  });
+  assert.doesNotMatch(JSON.stringify(planned), /different model family/i);
+  const reviewer = planned.members.find((m) => m.name === "reviewer");
+  assert.match(reviewer.prompt, /separate session with its own context that did not write the change/);
+  assert.match(planned.summary, /independent reviewer in its own session/);
+});

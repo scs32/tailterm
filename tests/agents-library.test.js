@@ -20,6 +20,8 @@ import {
   reconciledAgentProblem,
 } from "../client/launch-reconciliation.js";
 import { agentSpawnCommand } from "../shared/tmux-command.js";
+import { reasoningOptions, validateReasoning } from "../client/reasoning.js";
+import { MODEL_OPTIONS } from "../client/model-picker.js";
 import { MAX_WORK_CONTEXT_BYTES } from "../shared/work-context.js";
 
 const legacyMember = (name, overrides = {}) => ({
@@ -291,6 +293,10 @@ test("Claude effort reaches tt argv only for exact verified models", () => {
   assert.throws(
     () => agentSpawnCommand({ ...base, model: "opus", reasoning: "medium" }),
     /verified Claude/,
+  );
+  assert.match(
+    agentSpawnCommand({ ...base, model: "claude-sonnet-5-5", reasoning: "high" }),
+    /--reasoning/,
   );
   assert.throws(
     () =>
@@ -704,5 +710,22 @@ test("project creation journal and agent reconciliation preserve exact identitie
       workItem: { ...agent.workItem, itemRevision: 3 },
     }),
     "work-item/order/context binding",
+  );
+});
+
+test("Claude Sonnet 5.5 takes every documented effort level", () => {
+  const levels = ["low", "medium", "high", "xhigh", "max"];
+  assert.deepEqual(reasoningOptions("claude", "claude-sonnet-5-5"), levels);
+  for (const level of levels)
+    assert.equal(
+      validateReasoning("claude", "claude-sonnet-5-5", level, "claude"),
+      level,
+    );
+  assert.throws(
+    () => validateReasoning("claude", "claude-sonnet-5-5", "ultra", "claude"),
+    /verified Claude/,
+  );
+  assert.ok(
+    MODEL_OPTIONS.claude.some(([model]) => model === "claude-sonnet-5-5"),
   );
 });

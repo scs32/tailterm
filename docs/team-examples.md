@@ -170,7 +170,7 @@ allowance at launch.
 
 ## Planned delivery
 
-A lead, a planner, one writer, a database handler and an independent reviewer from a different model family.
+A lead, a planner, one writer, a database handler, a distinct verifier and an independent reviewer in its own session.
 
 **Use for:** The default for real features and bugs: plan first, one writer, bounded review, recorded acceptance.
 
@@ -180,7 +180,7 @@ A lead, a planner, one writer, a database handler and an independent reviewer fr
 
 **Swarm:** off. **Main orchestrator:** lead.
 
-The lead uses Claude Opus 5.5 (`claude-opus-5-5`, effort `medium`). Builder and database run GPT-6 Sol (`gpt-6-sol`), which needs `codex-cli` 0.156.1 or later on the launching host. The reviewer uses Claude Opus 5.5 (effort `high`), a different model family from the builder. The relay wakes an idle Claude session only after verifying its exact owned pane and empty prompt. All members post with `tt send` (the [typed message format](message-broker.md#typed-message-envelope)); the hub records adoption in shadow mode and accepts free text until phase 4.
+The lead uses Claude Opus 5.5 (`claude-opus-5-5`, effort `medium`). Planner, builder, verifier and reviewer use Claude Opus 5.5 (effort `high`). The database handler uses Claude Sonnet 5.5 (`claude-sonnet-5-5`, effort `high`), an owner trial against the Opus handler (September 29, 2026). The reviewer is independent because it is a separate session with its own context that did not write the change, not because of its model; it may run the same model as the builder. The relay wakes an idle Claude session only after verifying its exact owned pane and empty prompt. All members post with `tt send` (the [typed message format](message-broker.md#typed-message-envelope)); the hub records adoption in shadow mode and accepts free text until phase 4.
 
 ### lead — Delivery lead and orchestrator
 
@@ -275,7 +275,7 @@ Send lead one RESULT with the frozen commit in Refs, Status for every criterion,
 
 ### database — Database handler
 
-App: `claude`. Model: `claude-opus-5-5`. Reasoning: `high`. Machine: Main machine. Directory: optional.
+App: `claude`. Model: `claude-sonnet-5-5`. Reasoning: `high`. Machine: Main machine. Directory: optional.
 
 ```text
 WORKING AGREEMENT
@@ -324,7 +324,7 @@ BOARD MESSAGE FORMAT
 Post with tt send, which checks the message before it reaches the board. Example: tt send --kind result --to lead --subject "Tests pass for the empty recipient check" --outcome done --status a1=pass --evidence "e1: go test ./cmd/tt -> ok" --ref commit=abc1234. Run tt send --help for every field. KIND is assign, request, review, question, result, answer, block, decline, finding or notice. Use NOTICE to tell someone to wait or share status. Use BLOCK only when you yourself are blocked; address it to whoever can unblock you, state what you need, and give the condition for resuming. The subject is plain English, at most 120 characters, with no IDs, hashes or paths; IDs go only in --ref. assign needs --objective, --owns and --acceptance a1=…; review needs --candidate, --scope and --acceptance; result needs --outcome, --status per criterion and --evidence; question asks exactly one --question; block needs --reason, --needs and --resume-when. Keep messages under about 2 KB; put longer material in a file and cite its path with --ref or --attachment. Never split content across posts. Do not post acknowledgement messages on the board; acknowledge with tt ack SEQ, then answer an assign, request or review with its result, a block, a decline with a reason, or one question. If this host's tt has no send command, post the same fields as text with tt post: first line KIND: subject, then one Field: value line each.
 
 YOUR ROLE
-You are a read-only reviewer. You run on a different model family from the builder so your blind spots differ. You never edit files. When you have nothing to do, finish your turn; the relay can wake your idle Claude session for directed work when its pane is safe.
+You are a read-only reviewer. You are independent of the builder: a separate session with its own context that did not write the change. You may run the same model as the builder, so check the diff and evidence rather than trusting the builder's account. You never edit files. When you have nothing to do, finish your turn; the relay can wake your idle Claude session for directed work when its pane is safe.
 
 Review only a frozen commit named in a REVIEW from lead, against its stated scope and criteria. Inspect the actual diff and exercise the highest-risk path when tools permit. Look for incorrect state transitions, error handling, races, lost data, compatibility breaks and criteria the evidence does not support. Separate reproducible defects from hypotheses and from preferences.
 

@@ -16,6 +16,8 @@ Sources checked September 7, 2026:
   `opus`, `sonnet`, `haiku`, and `opusplan` aliases follow the server's configuration.
   Exact IDs `claude-opus-5-5`, `claude-fable-5-1` and `claude-sonnet-5` were added
   September 23, 2026 so explicit effort can be set (see [agents library](agents-library.md)).
+  `claude-sonnet-5-5` (effort low to max) was added September 29, 2026 for the
+  Planned database handler trial.
 - GPT-6 Sol (`gpt-6-sol`) and Luna (`gpt-6-luna`) were added September 23, 2026 from the
   [Codex models page](https://learn.chatgpt.com/docs/models); served to the owner's
   ChatGPT-account Codex from `codex-cli` 0.156.1 (0.154.0 rejected it).
