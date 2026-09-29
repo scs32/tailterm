@@ -32,7 +32,10 @@ func cmdOwner(e env, args []string) error {
 		}
 		return cmdOwnerInterventions(e, args[1:])
 	}
-	usage := errors.New("usage: tt owner extend OBLIGATION_ID --for 30m [--reason T] | answer OBLIGATION_ID (--text T | --approve) [--session S] | delegate OBLIGATION_ID --session S --authorization REF [--agent ID --run ID] | cancel OBLIGATION_ID --reason T | intervene --task ID --kind KIND --item ID [--product-item ID] --text T | interventions --task ID [--tz ZONE]")
+	if len(args) > 0 && args[0] == "delegation" {
+		return cmdOwnerDelegation(e, args[1:])
+	}
+	usage := errors.New("usage: tt owner extend OBLIGATION_ID --for 30m [--reason T] | answer OBLIGATION_ID (--text T | --approve) [--session S | --rationale R] | delegation open|close|list ... | delegate OBLIGATION_ID --session S --authorization REF [--agent ID --run ID] | cancel OBLIGATION_ID --reason T | intervene --task ID --kind KIND --item ID [--product-item ID] --text T | interventions --task ID [--tz ZONE]")
 	if len(args) < 2 {
 		return usage
 	}
@@ -50,6 +53,7 @@ func cmdOwner(e env, args []string) error {
 	delegateAgent := fs.String("agent", "", "delegate: optional exact agent id")
 	delegateRun := fs.String("run", "", "delegate: optional exact run id")
 	approve := fs.Bool("approve", false, "answer with server-retained exact expected text")
+	rationale := fs.String("rationale", "", "answer: why, required from a delegation-window delegate")
 	requestID := fs.String("request-id", "", "stable retry key (default: derived per minute)")
 	if err := fs.Parse(args[2:]); err != nil {
 		return err
@@ -59,7 +63,7 @@ func cmdOwner(e env, args []string) error {
 	}
 	if *requestID == "" {
 		scope := time.Now().UTC().Truncate(time.Minute).Format(time.RFC3339)
-		digest := sha256.Sum256([]byte(sub + "\x00" + obligation + "\x00" + *forFlag + "\x00" + *reason + "\x00" + *text + "\x00" + *session + "\x00" + *authorization + "\x00" + *delegateAgent + "\x00" + *delegateRun + fmt.Sprint(*approve) + "\x00" + scope))
+		digest := sha256.Sum256([]byte(sub + "\x00" + obligation + "\x00" + *forFlag + "\x00" + *reason + "\x00" + *text + "\x00" + *session + "\x00" + *authorization + "\x00" + *delegateAgent + "\x00" + *delegateRun + fmt.Sprint(*approve) + "\x00" + *rationale + "\x00" + scope))
 		*requestID = fmt.Sprintf("owner-%s-%x", sub, digest[:12])
 	}
 	c, err := e.client(10 * time.Second)
@@ -75,10 +79,12 @@ func cmdOwner(e env, args []string) error {
 	case "delegate":
 		out, err = c.DelegateOwnerObligation(ctx, *task, obligation, api.OwnerDelegationRequest{Session: *session, AgentID: *delegateAgent, RunID: *delegateRun, AuthorizationRef: *authorization, RequestID: *requestID})
 	case "answer":
-		if e.agent != "" && *session == "" {
-			return errors.New("an agent answer requires an owner-authorized delegate session")
+		// An agent answers with a per-request session grant, or as the
+		// delegate of an open delegation window with a rationale.
+		if e.agent != "" && *session == "" && strings.TrimSpace(*rationale) == "" {
+			return errors.New("an agent answer requires an owner-authorized delegate session, or --rationale as the delegation window's delegate")
 		}
-		out, err = c.AnswerObligation(ctx, *task, obligation, api.ObligationAnswerRequest{Text: *text, RequestID: *requestID, Approve: *approve, DelegateSession: *session, AgentID: e.agent, RunID: e.runID})
+		out, err = c.AnswerObligation(ctx, *task, obligation, api.ObligationAnswerRequest{Text: *text, RequestID: *requestID, Approve: *approve, DelegateSession: *session, AgentID: e.agent, RunID: e.runID, Rationale: *rationale})
 	case "cancel":
 		out, err = c.CancelObligation(ctx, *task, obligation, api.ObligationCancelRequest{Reason: *reason, RequestID: *requestID})
 	default:

@@ -132,6 +132,14 @@ var Commands = []discord.Command{
 		{Type: discord.OptionString, Name: "reason", Description: "Why (the agent is told)", Required: true}}},
 	{Name: "resume", Description: "Re-enable wake-ups for a retired agent", Options: []discord.CommandOption{
 		{Type: discord.OptionString, Name: "agent", Description: "The agent's name", Required: true}}},
+	// Owner delegation windows (docs/owner-delegation-windows.md).
+	{Name: "delegate", Description: "Let an agent answer your decision requests until a set time", Options: []discord.CommandOption{
+		{Type: discord.OptionString, Name: "agent", Description: "The delegate agent's name", Required: true},
+		{Type: discord.OptionString, Name: "until", Description: "How long, such as 3h, or an end time in RFC3339", Required: true},
+		{Type: discord.OptionString, Name: "scope", Description: "decisions, or decisions-merges-deploys; matrix approvals stay with you", Required: true},
+		{Type: discord.OptionString, Name: "reason", Description: "Why (the delegate is told)"}}},
+	{Name: "delegate-end", Description: "End the open delegation window now; open requests return to you", Options: []discord.CommandOption{
+		{Type: discord.OptionString, Name: "reason", Description: "Why (optional)"}}},
 }
 
 // Run starts every loop and blocks until ctx ends or the Gateway fails for

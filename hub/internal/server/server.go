@@ -118,6 +118,9 @@ func New(st *store.Store, identity Identity) *Server {
 	m.HandleFunc("POST /v1/tasks/{id}/decisions", s.createDecision)
 	m.HandleFunc("GET /v1/tasks/{id}/decisions", s.listDecisions)
 	m.HandleFunc("POST /v1/tasks/{id}/decisions/{seq}/answer", s.answerDecision)
+	m.HandleFunc("GET /v1/tasks/{id}/delegation-windows", s.listDelegationWindows)
+	m.HandleFunc("POST /v1/tasks/{id}/delegation-windows", s.openDelegationWindow)
+	m.HandleFunc("POST /v1/tasks/{id}/delegation-windows/{wid}/close", s.closeDelegationWindow)
 	m.HandleFunc("POST /v1/tasks/{id}/interventions", s.createIntervention)
 	m.HandleFunc("GET /v1/tasks/{id}/interventions", s.listInterventions)
 	m.HandleFunc("POST /v1/tasks/{id}/messages/read", s.markRead)
@@ -230,6 +233,8 @@ func fail(w http.ResponseWriter, err error) {
 		writeError(w, http.StatusForbidden, "Agents cannot add agents to this task. Ask the owner to enable Allow agents to add other agents in task settings.")
 	case errors.Is(err, api.ErrContextLimit):
 		writeError(w, http.StatusConflict, err.Error())
+	case errors.Is(err, api.ErrDelegationForbidden):
+		writeError(w, http.StatusForbidden, err.Error())
 	case errors.Is(err, store.ErrDecisionAnswerForbidden):
 		writeError(w, http.StatusForbidden, "only a human can answer a decision request")
 	case errors.Is(err, store.ErrInterventionForbidden):

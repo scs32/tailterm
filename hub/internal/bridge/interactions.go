@@ -128,6 +128,10 @@ func (b *Bridge) act(ctx context.Context, taskID string, in discord.Interaction)
 			return b.cancel(ctx, taskID, option("obligation"), option("reason"), in.ID)
 		case "resume":
 			return b.resume(ctx, taskID, option("agent"), in.ID)
+		case "delegate":
+			return b.delegate(ctx, taskID, in, option("agent"), option("until"), option("scope"), option("reason"))
+		case "delegate-end":
+			return b.delegateEnd(ctx, taskID, in, option("reason"))
 		}
 		return ephemeral("Unknown command.")
 	}
@@ -501,4 +505,58 @@ func (b *Bridge) resume(ctx context.Context, taskID, agentName, interactionID st
 		return r
 	}
 	return ephemeral("▶️ Resumed %s: automatic wake-ups are on again.", clean(agent.Name))
+}
+
+func discordSource(in discord.Interaction) *api.DelegationSource {
+	return &api.DelegationSource{Kind: api.DelegationSourceDiscord, ID: in.ID, UserID: in.UserID()}
+}
+
+// delegate opens an owner delegation window. until is a duration from now or
+// an RFC3339 time; the hub enforces 1 minute to 7 days.
+func (b *Bridge) delegate(ctx context.Context, taskID string, in discord.Interaction, agent, until, scope, reason string) reply {
+	ends, err := time.Parse(time.RFC3339, until)
+	if err != nil {
+		d, derr := time.ParseDuration(until)
+		if derr != nil || d < time.Minute || d > api.MaxDelegationWindow {
+			return ephemeral("⚠️ Give how long, from 1m to 168h (such as 3h), or an RFC3339 end time.")
+		}
+		ends = time.Now().Add(d)
+	}
+	scope = api.NormalizeDelegationScope(scope)
+	if !api.ValidDelegationScope(scope) {
+		return ephemeral("⚠️ Scope is decisions or decisions-merges-deploys. Matrix approvals always stay with you.")
+	}
+	out, err := b.cfg.Hub.OpenDelegationWindow(ctx, taskID, api.OpenDelegationWindowRequest{Delegate: agent, EndsAt: ends.UTC().Truncate(time.Second), Scope: scope, Reason: reason,
+		Source: discordSource(in), RequestID: "discord-interaction-" + in.ID})
+	if r, done := ownerOutcome(err); done {
+		return r
+	}
+	w := out.Window
+	return ephemeral("🤝 %s answers your %s until %s; %d waiting requests routed. Matrix approvals stay with you. End it early with /delegate-end.",
+		w.DelegateName, strings.ReplaceAll(w.Scope, "_", ", "), w.EndsAt.UTC().Format("Jan 2 15:04 UTC"), len(w.Routes))
+}
+
+// delegateEnd closes the project's open window.
+func (b *Bridge) delegateEnd(ctx context.Context, taskID string, in discord.Interaction, reason string) reply {
+	list, err := b.cfg.Hub.ListDelegationWindows(ctx, taskID)
+	if err != nil {
+		return ephemeral("⚠️ %s.", hubMessage(err))
+	}
+	for _, w := range list.Windows {
+		if w.State != api.DelegationOpen {
+			continue
+		}
+		out, err := b.cfg.Hub.CloseDelegationWindow(ctx, taskID, w.ID, api.CloseDelegationWindowRequest{Reason: reason, Source: discordSource(in), RequestID: "discord-interaction-" + in.ID})
+		if r, done := ownerOutcome(err); done {
+			return r
+		}
+		returned := 0
+		for _, r := range out.Window.Routes {
+			if r.ReturnedAt != nil {
+				returned++
+			}
+		}
+		return ephemeral("✅ Ended the delegation window to %s; %d open requests are yours again.", out.Window.DelegateName, returned)
+	}
+	return ephemeral("No delegation window is open in this project.")
 }

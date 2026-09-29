@@ -61,9 +61,13 @@ func decodeAskFile(data []byte) (askFileInput, error) {
 }
 
 func cmdAsk(e env, args []string) error {
+	if len(args) > 0 && args[0] == "answer" {
+		return cmdAskAnswer(e, args[1:])
+	}
 	fs := flag.NewFlagSet("ask", flag.ContinueOnError)
 	fs.Usage = func() {
 		fmt.Fprintln(fs.Output(), "Usage: tt ask --request-id KEY --file PATH [--task ID] [--json]")
+		fmt.Fprintln(fs.Output(), "       tt ask answer SEQ (--option ID | --text T) --rationale R   (a delegation window's delegate)")
 		fmt.Fprintln(fs.Output(), "Use --file - for stdin. JSON fields: question, options [{id,label,description}], recommendedOptionId, recommendationReason; optional workItems and workOrderMessage.")
 		fmt.Fprintln(fs.Output(), "Reuse the same key and file after an uncertain response. Identity comes from this agent session. An owner answers on the Board; recommendations never submit consent.")
 		fs.PrintDefaults()
