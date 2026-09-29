@@ -27,8 +27,12 @@ CREATE TABLE IF NOT EXISTS agent_activity_receipts (
 
 func validActivity(a api.AgentActivity) bool {
 	switch a.State {
-	case "working", "hung_tool", "finished_silent", "crashed", "looping", "idle", "unknown":
+	case "working", "hung_tool", "finished_silent", "crashed", "looping", "idle", "unknown", "runtime_prompt":
 	default:
+		return false
+	}
+	// A prompt belongs to runtime_prompt and nowhere else.
+	if (a.State == "runtime_prompt") != (a.Prompt != nil) || (a.Prompt != nil && !a.Prompt.Valid()) {
 		return false
 	}
 	if a.ObservedAt.IsZero() || len(a.PendingTool) > 120 || len(a.Reason) > 240 || strings.ContainsAny(a.PendingTool+a.Reason, "\n\r") {
@@ -100,7 +104,7 @@ func (s *Store) ReportActivity(ctx context.Context, task, agent string, report a
 	if oldPayload != "" && json.Unmarshal([]byte(oldPayload), &oldActivity) != nil {
 		return zero, api.ErrConflict
 	}
-	if oldState == report.Activity.State && sameWakeOutcome(oldActivity.Wake, report.Activity.Wake) {
+	if oldState == report.Activity.State && sameWakeOutcome(oldActivity.Wake, report.Activity.Wake) && sameRuntimePrompt(oldActivity.Prompt, report.Activity.Prompt) {
 		var saved api.AgentActivity
 		if json.Unmarshal([]byte(oldPayload), &saved) != nil {
 			return zero, api.ErrConflict
@@ -119,6 +123,9 @@ func (s *Store) ReportActivity(ctx context.Context, task, agent string, report a
 		if err := s.postActivityAlerts(ctx, tx, task, agent, run, report.Activity); err != nil {
 			return zero, err
 		}
+	}
+	if err := s.postRuntimePromptEscalation(ctx, tx, task, agent, run, report.Activity); err != nil {
+		return zero, err
 	}
 	if err = tx.Commit(); err != nil {
 		return zero, err
@@ -140,6 +147,14 @@ func sameWakeOutcome(a, b *api.WakeOutcome) bool {
 		}
 	}
 	return true
+}
+
+// sameRuntimePrompt compares the parts of a prompt that make a new report.
+func sameRuntimePrompt(a, b *api.RuntimePrompt) bool {
+	if a == nil || b == nil {
+		return a == nil && b == nil
+	}
+	return a.Kind == b.Kind && a.Fingerprint == b.Fingerprint && a.Action == b.Action && a.Outcome == b.Outcome && a.Reason == b.Reason && a.Since.Equal(b.Since)
 }
 
 func (s *Store) postActivityAlerts(ctx context.Context, tx *sql.Tx, task, agent, run string, activity api.AgentActivity) error {
