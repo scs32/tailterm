@@ -33,14 +33,17 @@ Post with tt send, which checks the message before it reaches the board. Example
 // require codex-cli 0.156.1 or later.
 // Owner decision 2026-09-28: team roles run on Claude Opus 5.5 (high) to move
 // load off OpenAI; swarm workers stay on GPT-6 Luna for high-volume assignments.
+// Owner trial 2026-09-29 (wi_519d2df4f04c2e1c): the Planned database handler
+// runs Claude Sonnet 5.5 (high).
 const opus = "claude-opus-5-5",
+  sonnet = "claude-sonnet-5-5",
   luna = "gpt-6-luna";
 const TEAM_EXAMPLES = [
   {
     id: "planned",
     name: "Planned delivery",
     summary:
-      "A lead, a planner, one writer, a database handler, a distinct verifier and an independent reviewer from a different model family.",
+      "A lead, a planner, one writer, a database handler, a distinct verifier and an independent reviewer in its own session.",
     fit: "The default for real features and bugs: plan first, one writer, bounded review, recorded acceptance.",
     goal: "In <repository>, deliver <change>. Acceptance: <observable results>. Constraints: <invariants>.",
     workflow:
@@ -93,7 +96,7 @@ Send lead one RESULT with the frozen commit in Refs, Status for every criterion,
       member(
         "database",
         "Database handler",
-        opus,
+        sonnet,
         `You own native Tailterm records for this project: work items, revisions, orders, saved acceptance and release receipts. Use tt work-items and related commands with request IDs; read every mutation back before reporting it. You do not implement, review or decide acceptance.
 
 Act on REQUESTs from lead: create or update the item, record the order that governs the builder's ASSIGN, save review outcomes and the lead's release disposition, and save completion only after the lead's acceptance. If a record conflicts with the request, send lead a BLOCK with the conflicting revision rather than retrying blindly.
@@ -120,7 +123,7 @@ Send the receipt file, log references and outcomes to the database handler throu
         "reviewer",
         "Independent code review",
         "claude-opus-5-5",
-        `You are a read-only reviewer. You run on a different model family from the builder so your blind spots differ. You never edit files. When you have nothing to do, finish your turn; the relay can wake your idle Claude session for directed work when its pane is safe.
+        `You are a read-only reviewer. You are independent of the builder: a separate session with its own context that did not write the change. You may run the same model as the builder, so check the diff and evidence rather than trusting the builder's account. You never edit files. When you have nothing to do, finish your turn; the relay can wake your idle Claude session for directed work when its pane is safe.
 
 Review only a frozen commit named in a REVIEW from lead, against its stated scope and criteria. Inspect the actual diff and exercise the highest-risk path when tools permit. Look for incorrect state transitions, error handling, races, lost data, compatibility breaks and criteria the evidence does not support. Separate reproducible defects from hypotheses and from preferences.
 
@@ -646,6 +649,7 @@ const CLAUDE_EFFORT_MODELS = Object.freeze({
   "claude-opus-5-5": ["low", "medium", "high", "xhigh", "max"],
   "claude-fable-5-1": ["low", "medium", "high", "xhigh", "max"],
   "claude-opus-5": ["low", "medium", "high", "xhigh", "max"],
+  "claude-sonnet-5-5": ["low", "medium", "high", "xhigh", "max"],
   "claude-sonnet-5": ["low", "medium", "high", "xhigh", "max"],
 });
 

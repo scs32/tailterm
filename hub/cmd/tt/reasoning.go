@@ -24,10 +24,11 @@ var codexReasoningModels = map[string]map[string]bool{
 // Claude Code --effort levels per exact model ID. Aliases (opus, sonnet)
 // follow the server's configuration and stay inherit-only.
 var claudeEffortModels = map[string]map[string]bool{
-	"claude-opus-5-5":  {"low": true, "medium": true, "high": true, "xhigh": true, "max": true},
-	"claude-fable-5-1": {"low": true, "medium": true, "high": true, "xhigh": true, "max": true},
-	"claude-opus-5":    {"low": true, "medium": true, "high": true, "xhigh": true, "max": true},
-	"claude-sonnet-5":  {"low": true, "medium": true, "high": true, "xhigh": true, "max": true},
+	"claude-opus-5-5":   {"low": true, "medium": true, "high": true, "xhigh": true, "max": true},
+	"claude-fable-5-1":  {"low": true, "medium": true, "high": true, "xhigh": true, "max": true},
+	"claude-opus-5":     {"low": true, "medium": true, "high": true, "xhigh": true, "max": true},
+	"claude-sonnet-5-5": {"low": true, "medium": true, "high": true, "xhigh": true, "max": true},
+	"claude-sonnet-5":   {"low": true, "medium": true, "high": true, "xhigh": true, "max": true},
 }
 
 // Explicit reasoning is supported only for exact documented Codex and Claude
