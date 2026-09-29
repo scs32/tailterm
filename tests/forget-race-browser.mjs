@@ -48,7 +48,11 @@ try {
         }
       });
       assert.equal(result.saveStatus, "rejected");
-      assert.deepEqual(result.vault, { initialized: false, unlocked: false });
+      assert.deepEqual(result.vault, {
+        initialized: false,
+        unlocked: false,
+        username: "",
+      });
       console.log(
         `${engine.name()}: a late encrypted save cannot resurrect a forgotten vault.`,
       );

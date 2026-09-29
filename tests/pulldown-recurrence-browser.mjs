@@ -98,9 +98,14 @@ try {
             assert.equal(focused.border, "1px");
             assert.equal(focused.borderColor, focused.outlineColor);
           } else {
-            assert.equal(focused.offset, "-2px");
-            assert.equal(focused.outline, "2px");
-            assert.equal(focused.outlineStyle, "solid");
+            // 727d91b: an inset 2px accent ring inside the border replaces the
+            // offset outline, so no detached second frame can render.
+            assert.equal(focused.outlineStyle, "none");
+            assert.equal(focused.border, "1px");
+            assert.equal(
+              focused.boxShadow,
+              `${focused.borderColor} 0px 0px 0px 2px inset`,
+            );
           }
           await page.screenshot({
             path: artifacts + "/" + engine.name() + "-composer-focused.png",

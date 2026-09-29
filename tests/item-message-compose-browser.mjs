@@ -292,7 +292,20 @@ try {
       await page.goto(`${origin}/?task=${fixture.task.id}`);
       const input = page.locator("#board-text"),
         send = page.locator("#board-compose button[type=submit]");
-      await input.waitFor();
+      // The composer renders before board.show() settles and the fixture
+      // publishes window.qa, so wait for both after every navigation.
+      async function loaded() {
+        await input.waitFor();
+        await page.waitForFunction(() => !!window.qa);
+      }
+      await loaded();
+      // The fixture notice never auto-hides (the app hides it after 8s): clear
+      // the previous attempt's notice so it cannot cover Send or satisfy the
+      // next attempt's assertion.
+      async function submit() {
+        await page.locator("#notice").evaluate((el) => (el.textContent = ""));
+        await send.click();
+      }
       async function idle() {
         await waitFor(async () => await send.isEnabled(), name + " idle");
       }
@@ -481,7 +494,7 @@ try {
       // End R2's independent draft setup before the original compose matrix.
       await page.evaluate(() => sessionStorage.clear());
       await page.goto(`${origin}/?task=${fixture.task.id}`);
-      await input.waitFor();
+      await loaded();
       // R1 correction8184/release8187: refresh behind a held row must not
       // silently adopt its unseen revision or title (12 engine/kind/gesture cases).
       for (const [kind, initial] of [
@@ -548,7 +561,7 @@ try {
           await input.fill(text);
           const beforeAttempt = attempts.length;
           const beforeCount = (await messages(fixture)).length;
-          await send.click();
+          await submit();
           await idle();
           assert.match(await page.locator("#notice").textContent(), /stale/);
           assert.equal(attempts.length, beforeAttempt);
@@ -606,7 +619,7 @@ try {
       assert.deepEqual(opts, ["", `${active.id}@${active.revision}`]);
       await input.fill("Must select an item");
       const before = attempts.length;
-      await send.click();
+      await submit();
       await idle();
       assert.equal(attempts.length, before);
       assert.match(await page.locator("#notice").textContent(), /Choose a bug/);
@@ -667,7 +680,7 @@ try {
       await openItem("bug", bug);
       assert.equal((await draftValue()).primaryRevision, String(bug.revision));
       await input.fill("Direct blocked bug");
-      await send.click();
+      await submit();
       await waitFor(
         async () =>
           (await messages(fixture)).some(
@@ -678,7 +691,7 @@ try {
       await idle();
       await openItem("feature", active);
       await input.fill("Direct current feature");
-      await send.click();
+      await submit();
       await waitFor(
         async () =>
           (await messages(fixture)).some(
@@ -702,7 +715,7 @@ try {
       await openItem("feature", active);
       await input.fill("Stale text retained");
       active = await update(active, { title: "Changed feature title" });
-      await send.click();
+      await submit();
       await idle();
       assert.match(await page.locator("#notice").textContent(), /stale/);
       assert.equal(await input.inputValue(), "Stale text retained");
@@ -715,12 +728,13 @@ try {
       // Commit with response loss, reload, then exact retry after a later item revision.
       await input.fill("Lost response once");
       loseNextResponse = true;
-      await send.click();
+      await submit();
       await idle();
       await page.locator("[data-intent-retry]").waitFor();
       const frozen = structuredClone(attempts.at(-1).body);
       active = await update(active, { title: "Later revision" });
       await page.reload();
+      await loaded();
       await page.locator("[data-intent-retry]").click();
       await page.locator("[data-intent-retry]").waitFor({ state: "detached" });
       await waitFor(
@@ -741,7 +755,7 @@ try {
       await choose(active);
       await input.fill("Older pending selection");
       const gate = holdNextMessage();
-      await send.click();
+      await submit();
       await gate.started;
       const oldKey = attempts.at(-1).body.requestId;
       await choose(bug);
@@ -755,11 +769,11 @@ try {
       await idle();
       assert.equal(await input.inputValue(), "Newer bug draft");
       await page.reload();
-      await input.waitFor();
+      await loaded();
       assert.equal(await input.inputValue(), "Newer bug draft");
       assert.equal((await draftValue()).primaryItem, bug.id);
       assert.equal((await draftValue()).replyTo, fixture.source.seq);
-      await send.click();
+      await submit();
       await waitFor(
         async () =>
           (await messages(fixture)).some((x) => x.text === "Newer bug draft"),
@@ -773,7 +787,7 @@ try {
       await choose(active);
       await input.fill("Pending project A");
       const projectGate = holdNextMessage();
-      await send.click();
+      await submit();
       await projectGate.started;
       await page.evaluate((id) => qa.board.show(id), other.task.id);
       await input.fill("Project B unsent");
@@ -785,7 +799,7 @@ try {
       );
       assert.equal(await input.inputValue(), "Project B unsent");
       await page.goto(`${origin}/?task=${other.task.id}`);
-      await input.waitFor();
+      await loaded();
       assert.equal(await input.inputValue(), "Project B unsent");
       await page.locator("#board-message-item-mode").click();
       assert.deepEqual(
@@ -795,7 +809,7 @@ try {
         [""],
       );
       const emptyProjectBefore = attempts.length;
-      await send.click();
+      await submit();
       await idle();
       assert.equal(attempts.length, emptyProjectBefore);
       // Explicit classified Work still requires an actual order.
@@ -804,7 +818,7 @@ try {
       await page.locator("#board-primary-item").fill(other.primary.id);
       await page.locator("#board-primary-revision").fill("1");
       const workBefore = attempts.length;
-      await send.click();
+      await submit();
       await idle();
       assert.equal(attempts.length, workBefore);
       assert.match(await page.locator("#notice").textContent(), /exact order/);

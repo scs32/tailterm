@@ -1,7 +1,14 @@
 import assert from "node:assert/strict";
 import { assertTerminalBounds } from "./terminal-bounds.mjs";
 
-export async function exercisePaneGroups(page, getInput = () => undefined) {
+// Pane image upload (fa356b7) and the tab session menu with its decoration
+// (f9be48d) are static-mode controls. Server mode must not show them; every
+// other layout, drag, keyboard and close check runs in both modes.
+export async function exercisePaneGroups(
+  page,
+  getInput = () => undefined,
+  { staticControls = true } = {},
+) {
   const originalCount = await page.locator("#tabs .tab").count();
   const ids = await page
     .locator("#tabs [data-tab]")
@@ -9,6 +16,14 @@ export async function exercisePaneGroups(page, getInput = () => undefined) {
   const tab = (id) => page.locator(`#tabs .tab:has([data-tab="${id}"])`);
   const pane = (id) => page.locator(`.pane-header[data-pane="${id}"]`);
   async function checkUploadButton(id) {
+    if (!staticControls) {
+      assert.equal(
+        await pane(id).locator("[data-pane-upload]").count(),
+        0,
+        "server mode has no pane upload control",
+      );
+      return;
+    }
     const session = (await pane(id).locator(".pane-label").textContent())
       .split(" · ")
       .at(-2);
@@ -52,6 +67,14 @@ export async function exercisePaneGroups(page, getInput = () => undefined) {
   await checkUploadButton(ids[0]);
   await page.mouse.move(0, 0);
   const inactive = tab(ids[1]);
+  if (!staticControls)
+    assert.equal(
+      await page.locator("#tabs [data-session-menu]").count(),
+      0,
+      "server mode has no tab session menu",
+    );
+  // The control a focused inactive tab reveals and Tab moves to next.
+  const tabControl = staticControls ? "[data-session-menu]" : "[data-close]";
   assert.ok(await inactive.locator("[data-close]").isHidden());
   assert.ok(await inactive.locator("[data-session-menu]").isHidden());
   assert.ok(await inactive.locator(".tab-tmux").isHidden());
@@ -62,7 +85,7 @@ export async function exercisePaneGroups(page, getInput = () => undefined) {
   assert.ok(await tab(ids[0]).locator("[data-close]").isHidden());
   assert.ok(await tab(ids[0]).locator(".tab-tmux").isHidden());
   assert.ok(await inactive.locator("[data-close]").isVisible());
-  assert.ok(await inactive.locator("[data-session-menu]").isVisible());
+  assert.ok(await inactive.locator(tabControl).isVisible());
   assert.equal(await inactive.locator(".tab-tmux, .tab-activity").count(), 0);
   assert.equal(
     await inactive.locator("[data-tab]").innerText(),
@@ -79,11 +102,11 @@ export async function exercisePaneGroups(page, getInput = () => undefined) {
   await page.mouse.move(0, 0);
   assert.ok(await tab(ids[0]).locator("[data-close]").isVisible());
   await inactive.locator("[data-tab]").focus();
-  assert.ok(await inactive.locator("[data-session-menu]").isVisible());
+  assert.ok(await inactive.locator(tabControl).isVisible());
   await page.keyboard.press("Tab");
   assert.ok(
     await inactive
-      .locator("[data-session-menu]")
+      .locator(tabControl)
       .evaluate((el) => el === document.activeElement),
   );
   await page.evaluate(() => document.activeElement.blur());
@@ -112,6 +135,7 @@ export async function exercisePaneGroups(page, getInput = () => undefined) {
   );
   assert.equal(await page.locator("#tabs .tab").count(), originalCount);
   const decorate = async (target, values) => {
+    if (!staticControls) return;
     await target.hover();
     await target.locator("[data-session-menu]").click();
     await page.locator("#decorate-tab").click();
@@ -198,19 +222,21 @@ export async function exercisePaneGroups(page, getInput = () => undefined) {
     fill: "amber",
     emoji: "📦",
   });
+  // Server mode cannot decorate: the parent keeps the default appearance.
   const checkParent = async () => {
     assert.equal(
       await page.locator(".group-tab").getAttribute("data-tab-color"),
-      "violet",
+      staticControls ? "violet" : "default",
     );
     assert.equal(
       await page.locator(".group-tab").getAttribute("data-tab-fill"),
-      "amber",
+      staticControls ? "amber" : "default",
     );
-    assert.match(
-      await page.locator(".group-tab .tab-name").innerText(),
-      /📦 My machines$/,
-    );
+    if (staticControls)
+      assert.match(
+        await page.locator(".group-tab .tab-name").innerText(),
+        /📦 My machines$/,
+      );
   };
   const beforeSwap = await pane(ids[0]).boundingBox();
   const otherBeforeSwap = await pane(ids[1]).boundingBox();
@@ -245,10 +271,13 @@ export async function exercisePaneGroups(page, getInput = () => undefined) {
       Math.abs(restored.y - beforeSwap.y) < 1,
   );
   await checkParent();
-  for (const [id, name, color] of [
-    [ids[0], "🍎 Air A", "blue"],
-    [ids[1], "🚀 Air B", "rose"],
-  ]) {
+  // Per-session colors need the static session menu's decoration.
+  for (const [id, name, color] of staticControls
+    ? [
+        [ids[0], "🍎 Air A", "blue"],
+        [ids[1], "🚀 Air B", "rose"],
+      ]
+    : []) {
     await pane(id).locator(".pane-label").click();
     await checkParent();
     assert.equal(await pane(id).getAttribute("data-tab-color"), color);
@@ -492,15 +521,26 @@ export async function exercisePaneGroups(page, getInput = () => undefined) {
     await page.locator(".terminal-instance:not([hidden])").count(),
     1,
   );
-  assert.equal(await tab(ids[0]).getAttribute("data-tab-color"), "blue");
-  assert.equal(await tab(ids[1]).getAttribute("data-tab-color"), "rose");
-  assert.equal(await tab(ids[0]).locator(".tab-name").innerText(), "🍎 Air A");
-  assert.equal(await tab(ids[1]).locator(".tab-name").innerText(), "🚀 Air B");
-  for (const id of ids.slice(0, 2)) {
-    await tab(id).hover();
-    await tab(id).locator("[data-session-menu]").click();
-    await page.locator("#decorate-tab").click();
-    await page.locator("#reset-tab-decoration").click();
-    await page.locator("#tab-decoration-form .primary").click();
+  if (staticControls) {
+    assert.equal(await tab(ids[0]).getAttribute("data-tab-color"), "blue");
+    assert.equal(await tab(ids[1]).getAttribute("data-tab-color"), "rose");
+    assert.equal(
+      await tab(ids[0]).locator(".tab-name").innerText(),
+      "🍎 Air A",
+    );
+    assert.equal(
+      await tab(ids[1]).locator(".tab-name").innerText(),
+      "🚀 Air B",
+    );
+    for (const id of ids.slice(0, 2)) {
+      await tab(id).hover();
+      await tab(id).locator("[data-session-menu]").click();
+      await page.locator("#decorate-tab").click();
+      await page.locator("#reset-tab-decoration").click();
+      await page.locator("#tab-decoration-form .primary").click();
+    }
+  } else {
+    for (const id of ids.slice(0, 2))
+      assert.equal(await tab(id).getAttribute("data-tab-color"), "default");
   }
 }

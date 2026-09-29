@@ -77,6 +77,10 @@ try {
             },
           },
         ])[1].fields;
+        // The handler never inherits the first member's model (b6fdc51); give
+        // the saved plan a known model so the gated update below is observable.
+        const inheritedModel = fields.model;
+        fields.model = "fixture-model";
         fields.agentId = "agt_0123456789abcdef";
         const plan = {
           hub: "http://fixture-hub:18765/",
@@ -112,12 +116,17 @@ try {
           };
           release();
           await saving;
-          return { before, plans: vault.localData().projectHandlerPlans };
+          return {
+            inheritedModel,
+            before,
+            plans: vault.localData().projectHandlerPlans,
+          };
         } finally {
           release();
           crypto.subtle.encrypt = encrypt;
         }
       });
+      assert.equal(first.inheritedModel, "");
       assert.deepEqual(first.before, {
         settled: false,
         model: "fixture-model",

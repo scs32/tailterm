@@ -69,8 +69,18 @@ import * as vault from '/client/local-vault.js';
 await vault.localAPI('/unlock','POST',{password:'isolated lead recovery browser passphrase'});
 const data={hub:{url:location.origin},projectHandlerPlans:[],teamLaunchPlans:(await vault.localAPI('/data')).teamLaunchPlans||[]};
 const servers=[{id:'fixture',name:'Fixture host',host:'host-fixture',username:'fixture',runtimes:['codex']}];
-const client=createHubClient({baseURL:location.origin,fetchImpl:(u,i)=>fetch(u,i)});
-const host={getIPN:()=>({fetch:(u,i)=>fetch(u,i)}),getData:()=>data,getServers:()=>servers,currentServer:()=>servers[0],currentTab:()=>null,getTabs:()=>[],paneGroups:()=>({model:{groups:[]},sync(){}}),render(){},scheduleWorkspaceSave(){},bookmark(){},closeTab(){},connect:async()=>null,
+// The app reaches the hub through ipn.fetch inside the Tailscale WASM, never a
+// browser page load. This stand-in uses native fetch, and WebKit blocks a native
+// load started while the page unloads (the refetch or next long-poll after an
+// event), logging "Fetch API cannot load ... due to access control checks",
+// which Playwright reports as a pageerror. Like ipn.fetch, the stand-in starts
+// no page load once unloading begins and aborts the ones in flight.
+const inflight=new Set();let leaving=false;
+const leave=()=>{leaving=true;for(const c of inflight)c.abort()};
+addEventListener('beforeunload',leave);addEventListener('pagehide',leave);
+const hubFetch=async(u,i={})=>{if(leaving)throw new DOMException('Page is unloading','AbortError');const c=new AbortController();inflight.add(c);try{return await fetch(u,{...i,signal:c.signal})}finally{inflight.delete(c)}};
+const client=createHubClient({baseURL:location.origin,fetchImpl:hubFetch});
+const host={getIPN:()=>({fetch:hubFetch}),getData:()=>data,getServers:()=>servers,currentServer:()=>servers[0],currentTab:()=>null,getTabs:()=>[],paneGroups:()=>({model:{groups:[]},sync(){}}),render(){},scheduleWorkspaceSave(){},bookmark(){},closeTab(){},connect:async()=>null,
  notice:t=>document.querySelector('#notice').textContent=t,
  dialog:(title,body)=>{const d=document.querySelector('#dialog');if(d.open)d.close();d.innerHTML='<div class="dialog-head"><h2>'+title+'</h2></div>'+body;d.showModal()},
  closeDialog:()=>document.querySelector('#dialog').close(),
