@@ -219,7 +219,12 @@ export async function runRelease(config, adapter) {
       state.phase="refusing";checkpoint();await adapter.refuse();state.phase="refused";checkpoint();await adapter.escalate({jobId:job.id,outcome:"refused"});throw new Error("Release refused before publication");
     }
     let blocked=state.effects.length===0;
-    for(const effect of [...state.effects].reverse()){
+    // Newest effect first, except that a paired hub is restored before its
+    // bridge: the bridge's rollback probe needs a responding hub, and a broken
+    // new hub would otherwise leave the pair blocked.
+    const order=[...state.effects].reverse(),hub=order.findIndex(e=>e.target==="hub"),bridge=order.findIndex(e=>e.target==="bridge");
+    if(hub>=0 && bridge>=0 && hub>bridge)[order[hub],order[bridge]]=[order[bridge],order[hub]];
+    for(const effect of order){
       if(effect.rollbackAttempted){blocked=true;continue;}
       effect.rollbackAttempted=true;checkpoint();
       let restored=false;

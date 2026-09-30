@@ -309,7 +309,7 @@ test("a2 a paired plan whose members disagree or whose partner is not selected i
  const f=fixture();mkdirSync(join(f.cwd,"hub/cmd/tailterm-hub"),{recursive:true});const j=job(f,change(f,"hub/cmd/tailterm-hub/x.go","x")),a=fake(),c=config(f,j);a.prepare=async()=>PAIRED;
  await assert.rejects(runRelease(c,a));assert.ok(!a.calls.some(x=>x.startsWith("deploy:")));assert.equal(JSON.parse(readFileSync(c.journalPath,"utf8")).failure.reason,"Paired plan partner is not selected");
 });
-test("a4 a paired release rolls back bridge then hub to the prior pair whichever step fails",async()=>{
+test("a4 a paired release rolls back hub then bridge to the prior pair whichever step fails",async()=>{
  const cases=[
   ["bridge live check fails",a=>{a.check=async t=>t!=="bridge";},{step:"live-check",target:"bridge",reason:"live verification failed"}],
   ["combined deploy throws",a=>{a.deploy=async t=>{a.calls.push("deploy:"+t);throw new Error("SYNTHETIC_PRIVATE_TOKEN");};},{step:"deploy",target:"hub",reason:"unclassified"}],
@@ -317,10 +317,23 @@ test("a4 a paired release rolls back bridge then hub to the prior pair whichever
  ];
  for(const [name,arrange,failure] of cases){
   const p=pairedRelease();arrange(p.a);await assert.rejects(runRelease(p.c,p.a),/failed/,name);
-  assert.deepEqual(p.a.calls,["merged","deploy:hub","rollback:bridge","rollback:hub","escalate","bug","finish"],name);
+  assert.deepEqual(p.a.calls,["merged","deploy:hub","rollback:hub","rollback:bridge","escalate","bug","finish"],name);
   assert.equal(p.receipt().outcome,"rolled_back",name);
   assert.deepEqual(p.receipt().targets.map(t=>[t.target,t.outcome,t.rollback]),[["hub","rolled_back","restored"],["bridge","rolled_back","restored"]],name);
   const raw=readFileSync(p.c.journalPath,"utf8");assert.deepEqual(JSON.parse(raw).failure,failure,name);assert.ok(!raw.includes("SYNTHETIC_PRIVATE_TOKEN"),name);
+ }
+});
+test("a4 a new hub that never responds still ends rolled back, because the bridge is restored after the hub",async()=>{
+ // Like the real bridge rollback probe, the fake bridge restore succeeds only while the hub responds.
+ for(const [name,deployThrows] of [["hub live check fails",false],["combined deploy throws",true]]){
+  const p=pairedRelease(),live={hub:true};
+  p.a.deploy=async t=>{p.a.calls.push("deploy:"+t);live.hub=false;if(deployThrows)throw new Error("deploy failed");};
+  p.a.check=async t=>t==="hub"?live.hub:true;
+  p.a.rollback=async t=>{p.a.calls.push("rollback:"+t);if(t==="hub")live.hub=true;return live.hub;};
+  await assert.rejects(runRelease(p.c,p.a),/failed/,name);
+  assert.deepEqual(p.a.calls.filter(x=>x.startsWith("rollback:")),["rollback:hub","rollback:bridge"],name);
+  assert.equal(p.receipt().outcome,"rolled_back",name);
+  assert.deepEqual(p.receipt().targets.map(t=>[t.target,t.outcome,t.rollback]),[["hub","rolled_back","restored"],["bridge","rolled_back","restored"]],name);
  }
 });
 test("a7 the journal names the failed step, target and a bounded non-secret reason",async()=>{

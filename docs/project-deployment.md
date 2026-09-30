@@ -60,8 +60,9 @@ preflight): two plans made before either deploy would each pin the other's
 pre-release mount, and the second deploy would put the old partner back. The
 runner prepares both, journals both effects as attempting, runs
 `deploy-truenas-hub.py` once, then live-checks hub and then bridge; any failure
-from the deploy on rolls back bridge, then hub, each with its own rollback
-program, so both return to the prior pair. A plan for one target retains the
+from the deploy on rolls back hub, then bridge, each with its own rollback
+program, so both return to the prior pair. The hub goes first because the
+bridge's rollback probe needs a responding hub. A plan for one target retains the
 other target's live mount, and `deploy-truenas-hub.py --update` refuses it (stage
 `partner-mount`, before any mutation) when that mount is not the one live now.
 The runner refuses unpaired hub and bridge inputs before publication, and a plan
@@ -313,7 +314,8 @@ journal or lock by hand.
   scripts/release-probe.mjs rollback TARGET --expect-release PRIOR_RELEASE
   --expect-sha PRIOR_SHA --config PRIVATE`. The prior release and hash are in the
   job's manifest (`rollbackProgram`) or a previous receipt. After a paired
-  release roll back both, bridge first, each to its own prior release.
+  release roll back both, hub first (the bridge probe needs a responding hub),
+  each to its own prior release.
 - Mini: copy `journalDirectory/ID-mini-before` over the installed `tt`
   atomically (copy to `tt.rollback`, then rename) and restart the relay with the
   configured command.
