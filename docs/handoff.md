@@ -1,5 +1,18 @@
 # Development handoff — September 10, 2026
 
+## September 30 backlog steward — built on `steward-5b4b94db`, not merged
+
+Feature `wi_5b4b94dbc9a11e8b`, work order #14942, plan r2. A persistent,
+one-per-project `backlog_steward` role: intake research and drafts filed through
+the database handler, held follow-ups and Discord-filed items, owner-decision
+proposals, a durable backlog summary and two-phase rotation with a summary
+handoff. The multi-item queue side moved to `wi_faeef2716575d0eb` (owner answer
+#15465). See [backlog steward](backlog-steward.md) and
+[project roles](project-roles.md). Not yet reviewed, verified, merged or
+deployed. After deployment, provision with `tt steward setup --task ID --cwd DIR`
+and send the running primary handler a one-line NOTICE naming the steward
+(running handlers keep their launch briefing).
+
 ## September 13 allocation-context CLI preflight — Mini deployed and accepted
 
 Bug `wi_5209b017e66bbf20` revision1, source order #5969 and Mini-only release

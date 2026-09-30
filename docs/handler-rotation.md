@@ -9,6 +9,11 @@ with a fresh session that starts with the current prompt. The fresh session take
 over every open obligation and a durable handoff, and the old session closes.
 Nothing in flight is lost or duplicated.
 
+The [backlog steward](backlog-steward.md#rotation) rotates separately, with its own
+policy, records, commands (`tt steward rotate`) and relay tick, and hands over its
+backlog summary. A steward's arrival does not change the handler template digest,
+so it never makes a handler rotation due.
+
 ## Primary handler
 
 `tasks.primary_handler_id` names the project's primary handler once a rotation

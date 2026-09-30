@@ -18,6 +18,14 @@ It is not a team member. It is never leased to a queue entry, never counted as a
 team member or database handler, and never closed with an item team. A later
 Discord slice (`wi_2de2c1273e34473a` h1–h2) reuses this binding.
 
+When the project has a [backlog steward](backlog-steward.md), the owner session
+sends new bug and feature intake to it with `tt send --to role:backlog_steward`
+instead of filing items itself. The steward researches the request, drafts the
+item and has the database handler file it with the owner's source message; it
+proposes batches, queue order, scopes and triage outcomes as `tt ask` decisions.
+Confirming those decisions, including triage outcomes, stays the owner's; the
+owner session relays them. See [Project roles](project-roles.md).
+
 ## Register
 
 Run this in the owner's Claude Code session, in a dedicated one-pane tmux session:

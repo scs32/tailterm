@@ -39,6 +39,9 @@ Persistent owner instructions:
   dispatch) go through the project's actual database handler roster name. Do not
   bypass it with CLI/API/database access if unavailable; arrange authorized
   setup/resume or report the dependency. Human UI access remains available.
+  One exception (owner decision #15466): the backlog steward reads work items,
+  their history, the queue and triage directly; all its writes still go through
+  the database handler.
 - The database handler verifies committed records, preserves source provenance,
   revision checks and retry identities, and records assignment/result links and
   acceptance evidence. Only report item completion after its saved confirmation.

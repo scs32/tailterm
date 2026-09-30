@@ -33,6 +33,8 @@ test("the steward prompt teaches ack, handler writes and owner decisions", () =>
   assert.match(prompt, /you never create, update or dispatch items yourself/);
   assert.match(prompt, /every write goes through the database handler/);
   assert.match(prompt, /heldForTriage/);
+  assert.match(prompt, /Discord \/bug and \/feature/);
+  assert.match(prompt, /created by discord-bridge that are still at revision 1/);
   assert.match(prompt, /tt ask decision/);
   assert.match(prompt, /to the owner, or the delegate under a window, for queue reorder/);
   assert.match(prompt, /no per-item records, merges, releases or acceptance/);

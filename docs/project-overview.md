@@ -345,6 +345,16 @@ relay never stops, resizes or rebinds its session; when that session is not runn
 it shows offline, not stuck. It counts toward the open-agent cap. See
 [owner helper](owner-helper.md).
 
+**Backlog steward.** One persistent `backlog_steward` agent per project holds the
+backlog as its context (Claude Opus 5.5, high). Owner requests and agents'
+follow-ups reach it as `role:backlog_steward`. It researches each into a draft
+the database handler files with the owner's source message, refines held review
+follow-ups and Discord-filed items, and proposes batches, queue order, scopes and
+triage outcomes as owner decisions. It reads the backlog directly; the hub
+refuses its record writes. Its durable state is a backlog summary that rotation
+hands to a fresh session. The owner provisions it with `tt steward setup`. See
+[project roles](project-roles.md) and [backlog steward](backlog-steward.md).
+
 **Allow agents to add other agents** controls agent-originated extra-helper
 launches specifically; it does not gate a genuine regular team member bound to
 a work item (see below).
