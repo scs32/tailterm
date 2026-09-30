@@ -1116,3 +1116,114 @@ func TestActivityStuckFallsBackOnOldHub(t *testing.T) {
 		t.Fatalf("later transition blocked %+v", h.reports)
 	}
 }
+
+func TestOwnerHelperOfflineActivity(t *testing.T) {
+	now := time.Date(2026, 9, 29, 20, 0, 0, 0, time.UTC)
+	threshold := activityDefaults()
+	helper := api.Agent{Role: api.AgentRoleOwnerHelper, Status: api.AgentRunning}
+	var c activityCursor
+	for _, at := range []time.Time{now, now.Add(threshold.CrashProbe), now.Add(10 * threshold.CrashProbe)} {
+		got := activityState(&c, helper, 1, false, false, nil, at, threshold)
+		if got.State != "unknown" || got.Reason != "owner session offline" {
+			t.Fatalf("helper absent at %s: %+v", at, got)
+		}
+	}
+	// The same absence is a crash for an ordinary agent.
+	var ordinary activityCursor
+	activityState(&ordinary, api.Agent{Status: api.AgentRunning}, 0, false, false, nil, now, threshold)
+	if got := activityState(&ordinary, api.Agent{Status: api.AgentRunning}, 0, false, false, nil, now.Add(threshold.CrashProbe), threshold); got.State != "crashed" {
+		t.Fatalf("ordinary agent %+v", got)
+	}
+	// Through the relay tick: offline is reported as unknown, never crashed or stuck.
+	cols, rows := 16, 1
+	stubPaneSize(t, &cols, &rows)
+	b, h, client, _ := stuckFixture(t, "claude")
+	b.Role, h.agent.Role = api.AgentRoleOwnerHelper, api.AgentRoleOwnerHelper
+	absent := func(runtimeBinding, api.Agent) (bool, bool, error) { return false, false, nil }
+	for i := range 3 {
+		if err := relayActivityTick(context.Background(), b, client, now.Add(time.Duration(i)*20*time.Second), absent); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if len(h.reports) != 1 || h.reports[0].State != "unknown" || h.reports[0].Reason != "owner session offline" {
+		t.Fatalf("offline reports %+v", h.reports)
+	}
+	// Live in a tiny pane: the owner sizes that terminal, so it is not stuck.
+	live := func(runtimeBinding, api.Agent) (bool, bool, error) { return true, true, nil }
+	if err := relayActivityTick(context.Background(), b, client, now.Add(time.Minute), live); err != nil {
+		t.Fatal(err)
+	}
+	for _, r := range h.reports {
+		if r.State == "stuck" || r.State == "crashed" {
+			t.Fatalf("helper reported %+v", h.reports)
+		}
+	}
+}
+
+func TestOwnerHelperHeartbeat(t *testing.T) {
+	agent := api.Agent{ID: api.NewID("agt"), TaskID: api.NewID("tsk"), RunID: api.NewID("run"), Role: api.AgentRoleOwnerHelper, Status: api.AgentRunning, Session: "owner", Runtime: "claude"}
+	var beats []api.PostEventRequest
+	hub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == "POST" && strings.HasSuffix(r.URL.Path, "/events") {
+			var req api.PostEventRequest
+			_ = json.NewDecoder(r.Body).Decode(&req)
+			beats = append(beats, req)
+			_ = json.NewEncoder(w).Encode(api.Event{Kind: req.Kind})
+			return
+		}
+		_ = json.NewEncoder(w).Encode(agent)
+	}))
+	defer hub.Close()
+	c, _ := api.NewClient(hub.URL, 5*time.Second)
+	b := runtimeBinding{Hub: hub.URL, Task: agent.TaskID, Agent: agent.ID, Run: agent.RunID, Thread: "12345678-1234-1234-1234-123456789abc", Runtime: "claude", Role: api.AgentRoleOwnerHelper, Session: "owner"}
+	alive := true
+	probe := func(runtimeBinding, api.Agent) (bool, bool, error) { return alive, alive, nil }
+	now := time.Date(2026, 9, 29, 20, 0, 0, 0, time.UTC)
+	var p relayProgress
+	tick := func(at time.Time) {
+		t.Helper()
+		if err := relayHelperHeartbeat(context.Background(), b, &p, c, at, probe); err != nil {
+			t.Fatal(err)
+		}
+	}
+	tick(now)
+	tick(now.Add(10 * time.Second)) // spaced to 30 seconds
+	if len(beats) != 1 || beats[0].Kind != api.EventHeartbeat || beats[0].AgentID != agent.ID || beats[0].RunID != agent.RunID {
+		t.Fatalf("beats %+v", beats)
+	}
+	tick(now.Add(31 * time.Second))
+	alive = false // session gone: no heartbeat, so the helper goes offline
+	tick(now.Add(62 * time.Second))
+	agent.RunID = api.NewID("run") // re-registered elsewhere: this binding never beats
+	alive = true
+	tick(now.Add(93 * time.Second))
+	ordinary := b
+	ordinary.Role = ""
+	p = relayProgress{}
+	if err := relayHelperHeartbeat(context.Background(), ordinary, &p, c, now.Add(200*time.Second), probe); err != nil {
+		t.Fatal(err)
+	}
+	if len(beats) != 2 {
+		t.Fatalf("beats %+v", beats)
+	}
+}
+
+func TestOwnerHelperWakeText(t *testing.T) {
+	b := runtimeBinding{Task: "tsk_0123456789abcdef", Role: api.AgentRoleOwnerHelper}
+	messages := []api.Message{{Seq: 41, Text: "hi"}}
+	inbox := claudeWakeFor(b, claudeWakePrompt(messages, "agt_0123456789abcdef"))
+	broker := claudeWakeFor(b, claudeBrokerPrompt("Tailterm obligations #42", 42, "wake_0123456789abcdef"))
+	if inbox != "Tailterm messages #41. Run tt helper inbox --task tsk_0123456789abcdef." ||
+		broker != "Tailterm obligations #42. Run tt helper inbox --task tsk_0123456789abcdef. Wake wake_0123456789abcdef." {
+		t.Fatalf("helper prompts %q %q", inbox, broker)
+	}
+	for _, prompt := range []string{inbox, broker} {
+		if strings.ContainsAny(prompt, "\"'`$\n") {
+			t.Fatalf("unsafe prompt %q", prompt)
+		}
+	}
+	b.Role = ""
+	if got := claudeWakeFor(b, claudeWakePrompt(messages, "agt_0123456789abcdef")); got != "Tailterm messages #41. Run tt inbox --unread --mark-read." {
+		t.Fatalf("ordinary prompt changed %q", got)
+	}
+}

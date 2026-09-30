@@ -88,6 +88,12 @@ func activityState(c *activityCursor, a api.Agent, openObligations int, tmuxAliv
 		result.Reason = "process probe unavailable"
 		return result
 	}
+	if a.Role == api.AgentRoleOwnerHelper && (!tmuxAlive || !processAlive) {
+		// The owner's own session: absent means offline, never crashed.
+		c.MissingSince = time.Time{}
+		result.Reason = "owner session offline"
+		return result
+	}
 	if a.Status == api.AgentRunning {
 		if !tmuxAlive || !processAlive {
 			if c.MissingSince.IsZero() {
@@ -472,7 +478,8 @@ func nativeActivityPaneSize(ctx context.Context, session string) (int, int, erro
 // too small for the runtime UI, or (Claude) a wake has stayed unconfirmed with
 // unread input past the threshold. It returns "" when neither applies.
 func activityStuckReason(ctx context.Context, b runtimeBinding, a api.Agent, state string, now time.Time, threshold activityThresholds) string {
-	if b.Session != "" {
+	// The owner sizes the helper's terminal; its pane size is never a stuck reason.
+	if b.Session != "" && b.Role != api.AgentRoleOwnerHelper && a.Role != api.AgentRoleOwnerHelper {
 		if cols, rows, err := activityPaneSize(ctx, b.Session); err == nil && (cols < spawn.MinUsableCols || rows < spawn.MinUsableRows) {
 			return fmt.Sprintf("pane %dx%d below minimum %dx%d", cols, rows, spawn.MinUsableCols, spawn.MinUsableRows)
 		}

@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/scs32/tailterm/hub/internal/api"
 	"github.com/scs32/tailterm/hub/internal/spawn"
 )
 
@@ -28,7 +29,8 @@ func reconcileAgentWindowSizes(ctx context.Context, run func(context.Context, ..
 	}
 	owned := map[string]bool{}
 	for _, s := range sessions {
-		if s.valid() {
+		// The owner helper's session is the owner's terminal: never resized.
+		if s.valid() && s.Role != api.AgentRoleOwnerHelper {
 			owned[s.ID] = true
 		}
 	}

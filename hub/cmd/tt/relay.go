@@ -27,16 +27,19 @@ var runIDPattern = regexp.MustCompile(`^run_[0-9a-f]{16}$`)
 var threadIDPattern = regexp.MustCompile(`^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$`)
 
 type runtimeBinding struct {
-	Hub       string    `json:"hub"`
-	Task      string    `json:"task"`
-	Agent     string    `json:"agent"`
-	Run       string    `json:"run"`
-	Thread    string    `json:"thread"`
-	Codex     string    `json:"codex"`
-	CodexHome string    `json:"codexHome,omitempty"`
-	Runtime   string    `json:"runtime,omitempty"`
-	Session   string    `json:"session,omitempty"`
-	Cwd       string    `json:"cwd,omitempty"`
+	Hub       string `json:"hub"`
+	Task      string `json:"task"`
+	Agent     string `json:"agent"`
+	Run       string `json:"run"`
+	Thread    string `json:"thread"`
+	Codex     string `json:"codex"`
+	CodexHome string `json:"codexHome,omitempty"`
+	Runtime   string `json:"runtime,omitempty"`
+	Session   string `json:"session,omitempty"`
+	Cwd       string `json:"cwd,omitempty"`
+	// Role is set for the owner helper (api.AgentRoleOwnerHelper), whose
+	// binding is written by tt helper register and never rebound by the relay.
+	Role      string    `json:"role,omitempty"`
 	CreatedAt time.Time `json:"createdAt,omitempty"`
 }
 type relayProgress struct {
@@ -53,6 +56,8 @@ type relayProgress struct {
 	NextRetirementCheck time.Time        `json:"nextRetirementCheck,omitempty"`
 	Wake                *api.WakeOutcome `json:"wake,omitempty"`
 	ClaudePendingInbox  bool             `json:"claudePendingInbox,omitempty"`
+	// LastHeartbeat spaces the owner helper's relay heartbeats.
+	LastHeartbeat time.Time `json:"lastHeartbeat,omitempty"`
 	// Skip is host-local diagnostics for tt relay --status and the relay log.
 	// It never flows into Wake, the activity snapshot or any hub write.
 	Skip *relaySkip `json:"lastSkip,omitempty"`
@@ -243,6 +248,11 @@ func retryClaudeBinding(ctx context.Context, s ownedSession, client *api.Client)
 	if a.RunID != s.Run || a.Session != s.Name || a.Runtime != "claude" || a.Status == api.AgentClosed || a.Status == api.AgentExited || a.Status == api.AgentRetired {
 		return errors.New("local session does not match an open Claude run")
 	}
+	// The helper's binding names the owner's real Claude session; the derived
+	// spawn session ID would point at the wrong transcript.
+	if a.Role == api.AgentRoleOwnerHelper {
+		return errors.New("the owner helper is bound only by tt helper register")
+	}
 	return bindClaudeRuntime(s.Hub, s.Task, a)
 }
 
@@ -307,6 +317,39 @@ func claudeWakePrompt(messages []api.Message, agent string) string {
 		seqs[4] = fmt.Sprintf("#%d", last)
 	}
 	return "Tailterm messages " + strings.Join(seqs, ",") + ". Run tt inbox --unread --mark-read."
+}
+
+// claudeWakeFor names the owner helper's inbox command in a Claude wake
+// prompt: the owner's session has no agent environment, so it reads as the
+// helper through tt helper inbox. Other bindings keep the prompt as it is.
+func claudeWakeFor(b runtimeBinding, prompt string) string {
+	if b.Role != api.AgentRoleOwnerHelper {
+		return prompt
+	}
+	return strings.Replace(prompt, "Run tt inbox --unread --mark-read.", "Run tt helper inbox --task "+b.Task+".", 1)
+}
+
+// relayHelperHeartbeat keeps the owner helper online while its exact pane and
+// Claude process are verified. The helper is not wrapped, so nothing else
+// heartbeats for it; with the session gone it goes offline within 90 seconds
+// and the relay's usual offline skip applies. It writes only for a live run.
+func relayHelperHeartbeat(ctx context.Context, b runtimeBinding, p *relayProgress, c *api.Client, now time.Time, probe activityProbe) error {
+	if b.Role != api.AgentRoleOwnerHelper || now.Sub(p.LastHeartbeat) < 30*time.Second {
+		return nil
+	}
+	p.LastHeartbeat = now // spaces attempts too
+	a, err := c.GetAgent(ctx, b.Task, b.Agent)
+	if err != nil {
+		return err
+	}
+	if a.RunID != b.Run || a.Role != api.AgentRoleOwnerHelper || a.Status == api.AgentClosed || a.Status == api.AgentExited {
+		return nil
+	}
+	if tmuxAlive, processAlive, err := probe(b, a); err != nil || !tmuxAlive || !processAlive {
+		return nil
+	}
+	_, err = c.PostEvent(ctx, b.Task, api.PostEventRequest{Kind: api.EventHeartbeat, AgentID: b.Agent, RunID: b.Run})
+	return err
 }
 
 var brokerPromptSeq = regexp.MustCompile(`#[0-9]+`)
@@ -465,7 +508,7 @@ func relayWakeJob(ctx context.Context, b runtimeBinding, p *relayProgress, c *ap
 	report := api.WakeJobReport{LeaseToken: job.LeaseToken, Status: "accepted"}
 	prompt := job.Prompt
 	if b.Runtime == "claude" {
-		prompt = claudeBrokerPrompt(prompt, job.MessageSeq, job.ID)
+		prompt = claudeWakeFor(b, claudeBrokerPrompt(prompt, job.MessageSeq, job.ID))
 	}
 	qerr := queue(ctx, b, prompt)
 	if b.Runtime == "claude" {
@@ -613,7 +656,7 @@ func relayOne(ctx context.Context, b runtimeBinding, p *relayProgress, c *api.Cl
 	}
 	prompt := wakePrompt(b, through)
 	if b.Runtime == "claude" {
-		prompt = claudeWakePrompt(eligibleMsgs, b.Agent)
+		prompt = claudeWakeFor(b, claudeWakePrompt(eligibleMsgs, b.Agent))
 	}
 	if err := queue(ctx, b, prompt); err != nil {
 		if b.Runtime == "claude" {
@@ -706,7 +749,7 @@ func cmdRelay(args []string) error {
 				if sessions, sessionErr := localSessions(retryCtx); sessionErr == nil && len(sessions) > 0 {
 					for scanned := 0; scanned < len(sessions); scanned++ {
 						s := sessions[(claudeRetryCursor+scanned)%len(sessions)]
-						if !s.valid() {
+						if !s.valid() || s.Role == api.AgentRoleOwnerHelper {
 							continue
 						}
 						bindingPath := filepath.Join(dir, bindingKey(runtimeBinding{Hub: s.Hub, Agent: s.Agent})+".binding.json")
@@ -786,6 +829,9 @@ func cmdRelay(args []string) error {
 					cancel()
 				} else {
 					now := time.Now().UTC()
+					if heartbeatErr := relayHelperHeartbeat(ctx, b, &progress, c, now, activityProbeNative); heartbeatErr != nil {
+						fmt.Fprintf(os.Stderr, "[tt relay] %s helper heartbeat: %v\n", b.Agent, heartbeatErr)
+					}
 					// A broker-path error never suppresses the existing paths.
 					queued, brokerErr := false, error(nil)
 					queue := nativeQueue

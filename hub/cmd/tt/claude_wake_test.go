@@ -1429,3 +1429,124 @@ func TestClaudeWakeLiveScrollbackDialogWords(t *testing.T) {
 		lc.tmux("send-keys", "-t", lc.session, "Escape")
 	})
 }
+
+// helperWakeBinding registers the owner helper through the CLI in a private
+// tmux session running a fake claude process, and returns the binding the
+// relay would read.
+func helperWakeBinding(t *testing.T) (helperFixture, runtimeBinding) {
+	t.Helper()
+	f := newHelperFixture(t)
+	a := *f.mustRegister(t).Agent
+	b, ok := readBinding(t, f.owner.hub, a.ID)
+	if !ok {
+		t.Fatal("no helper binding")
+	}
+	return f, b
+}
+
+func TestOwnerHelperWakePrivateSession(t *testing.T) {
+	f, b := helperWakeBinding(t)
+	ctx := context.Background()
+	if b.Thread != f.thread || b.Thread == mustClaudeSessionID(t, b.Agent) {
+		t.Fatalf("binding thread %q", b.Thread)
+	}
+	receipt, err := nativeRuntimeDiscovery(ctx, b, api.Agent{Runtime: "claude"})
+	if err != nil || receipt.PID < 1 || receipt.Session != "owner" {
+		t.Fatalf("discovery %+v %v", receipt, err)
+	}
+	if pane, err := inspectRuntimePane(ctx, b, "Claude", false); err != nil || pane.PanePID != receipt.PanePID {
+		t.Fatalf("pane identity %+v %v", pane, err)
+	}
+	snapshot, err := claudeTranscriptSnapshot(b, time.Now())
+	if err != nil || filepath.Base(snapshot.Path) != f.thread+".jsonl" {
+		t.Fatalf("transcript %+v %v", snapshot, err)
+	}
+	// The verified pane and process keep the helper online through the relay heartbeat.
+	var p relayProgress
+	before, _ := f.c.GetAgent(ctx, f.task.ID, b.Agent)
+	time.Sleep(1100 * time.Millisecond)
+	if err := relayHelperHeartbeat(ctx, b, &p, f.c, time.Now(), activityProbeNative); err != nil {
+		t.Fatal(err)
+	}
+	after, _ := f.c.GetAgent(ctx, f.task.ID, b.Agent)
+	if !after.LastSeenAt.After(before.LastSeenAt) || !after.Online {
+		t.Fatalf("heartbeat %s -> %s online=%v", before.LastSeenAt, after.LastSeenAt, after.Online)
+	}
+	// The helper prompt is typed once and confirmed by the transcript.
+	pane := newWakeRetryPane(t)
+	pane.submit = true
+	prompt := claudeWakeFor(b, claudeBrokerPrompt("Tailterm obligations #73", 73, "wake_0123456789abcdef"))
+	if err := claudeWakeWith(ctx, b, prompt, pane.ops()); err != nil {
+		t.Fatal(err)
+	}
+	if len(pane.sends) != 2 || pane.sends[0] != "text:"+prompt || pane.sends[1] != "Enter" || pane.intent(b).Phase != "confirmed" {
+		t.Fatalf("sends %v intent %+v", pane.sends, pane.intent(b))
+	}
+	if err := claudeWakeWith(ctx, b, prompt, pane.ops()); err != nil || len(pane.sends) != 2 {
+		t.Fatalf("retyped a confirmed wake: %v %v", pane.sends, err)
+	}
+	// With the session gone there is no heartbeat.
+	f.tmux(t, "kill-session", "-t", "owner")
+	p = relayProgress{}
+	seen := after.LastSeenAt
+	time.Sleep(1100 * time.Millisecond)
+	if err := relayHelperHeartbeat(ctx, b, &p, f.c, time.Now(), activityProbeNative); err != nil {
+		t.Fatal(err)
+	}
+	if gone, _ := f.c.GetAgent(ctx, f.task.ID, b.Agent); !gone.LastSeenAt.Equal(seen) {
+		t.Fatal("heartbeat without the owner session")
+	}
+}
+
+func TestOwnerHelperWakeMultiPaneRefused(t *testing.T) {
+	f, b := helperWakeBinding(t)
+	ctx := context.Background()
+	f.tmux(t, "split-window", "-t", "owner:", "sleep 300")
+	if _, err := nativeRuntimeDiscovery(ctx, b, api.Agent{Runtime: "claude"}); err == nil || err.Error() != "ambiguous owned runtime pane" {
+		t.Fatalf("two panes: %v", err)
+	}
+	prompt := claudeWakeFor(b, claudeWakePrompt([]api.Message{{Seq: 9}}, b.Agent))
+	if err := claudeQueue(ctx, b, prompt); err == nil || !strings.Contains(err.Error(), "ambiguous owned runtime pane") {
+		t.Fatalf("queue into two panes: %v", err)
+	}
+	for _, pane := range strings.Fields(f.tmux(t, "list-panes", "-s", "-t", "owner", "-F", "#{pane_id}")) {
+		if screen := f.tmux(t, "capture-pane", "-p", "-t", pane); strings.Contains(screen, "Tailterm") {
+			t.Fatalf("typed into %s: %q", pane, screen)
+		}
+	}
+	if _, err := os.Stat(claudeWakePath(b)); !os.IsNotExist(err) {
+		t.Fatalf("wake intent written: %v", err)
+	}
+}
+
+func TestOwnerHelperWakePromptWraps(t *testing.T) {
+	b := runtimeBinding{Task: "tsk_e7af3c28a444b09a", Role: api.AgentRoleOwnerHelper}
+	prompts := []string{
+		claudeWakeFor(b, claudeBrokerPrompt("Tailterm obligations #15073", 15073, "wake_c7370d00057feac6")),
+		claudeWakeFor(b, "Tailterm messages #13260,#13261,#13262,#13263,#13264. Run tt inbox --unread --mark-read."),
+	}
+	for _, prompt := range prompts {
+		if !strings.Contains(prompt, "tt helper inbox --task "+b.Task) {
+			t.Fatalf("prompt %q", prompt)
+		}
+		for _, width := range []int{80, 40} {
+			var lines []string
+			line := "❯ "
+			for _, word := range strings.Fields(prompt) {
+				if len([]rune(line))+len([]rune(word))+1 > width && line != "❯ " {
+					lines = append(lines, line)
+					line = "  " + word
+				} else {
+					if line != "❯ " && line != "  " {
+						line += " "
+					}
+					line += word
+				}
+			}
+			lines = append(lines, line, strings.Repeat("─", width), "  ⏵⏵ bypass permissions on")
+			if !exactClaudeInput(strings.Join(lines, "\n"), prompt) {
+				t.Fatalf("wrapped %d-column helper input not recognized: %q", width, lines)
+			}
+		}
+	}
+}

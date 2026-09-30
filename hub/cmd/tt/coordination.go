@@ -56,7 +56,7 @@ func postArgs(args []string) []string {
 func ordinaryTeamMemberCount(agents []api.Agent, currentName string) int {
 	members := map[string]struct{}{}
 	for _, agent := range agents {
-		if agent.Role == api.AgentRoleDatabaseHandler || agent.Name == "" {
+		if agent.Role == api.AgentRoleDatabaseHandler || agent.Role == api.AgentRoleOwnerHelper || agent.Name == "" {
 			continue
 		}
 		members[strings.ToLower(agent.Name)] = struct{}{}

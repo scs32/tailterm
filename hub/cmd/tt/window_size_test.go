@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/scs32/tailterm/hub/internal/api"
 	"github.com/scs32/tailterm/hub/internal/spawn"
 )
 
@@ -166,4 +167,44 @@ func attachSized(t *testing.T, run func(...string) string, sock, session string,
 		}
 	}
 	t.Fatalf("viewer never attached to %s", session)
+}
+
+func TestWindowSizeSkipsOwnerHelper(t *testing.T) {
+	if _, err := exec.LookPath("tmux"); err != nil {
+		t.Skip("tmux not available")
+	}
+	sock := fmt.Sprintf("tt-helper-size-%d-%d", os.Getpid(), time.Now().UnixNano())
+	t.Setenv("TT_TMUX_SOCKET", sock)
+	t.Cleanup(func() { _ = exec.Command("tmux", "-L", sock, "kill-server").Run() })
+	run := func(args ...string) string {
+		out, err := exec.Command("tmux", append([]string{"-L", sock, "-f", "/dev/null"}, args...)...).CombinedOutput()
+		if err != nil {
+			t.Fatalf("tmux %v: %v: %s", args, err, out)
+		}
+		return strings.TrimSpace(string(out))
+	}
+	session := func(name, agent, role string) {
+		args := []string{"new-session", "-d", "-s", name, "-x", "100", "-y", "30", "-e", "TAILTERM_HUB=http://hub.test", "-e", "TAILTERM_TASK=tsk_0000000000000001",
+			"-e", "TAILTERM_AGENT=" + agent, "-e", "TAILTERM_RUN=run_0000000000000001"}
+		if role != "" {
+			args = append(args, "-e", "TAILTERM_ROLE="+role)
+		}
+		run(append(args, "sleep 60")...)
+		run("set-option", "-w", "-t", name+":", "window-size", "latest")
+	}
+	session("owner", "agt_0000000000000001", api.AgentRoleOwnerHelper)
+	session("agent", "agt_0000000000000002", "")
+	changed, err := reconcileAgentWindowSizes(context.Background(), startupTmux, func(string, ...any) {})
+	if err != nil || changed != 1 {
+		t.Fatalf("changed=%d err=%v", changed, err)
+	}
+	size := func(s string) string {
+		return run("display-message", "-p", "-t", s+":", "#{window_width}x#{window_height} #{window-size}")
+	}
+	if got := size("owner"); got != "100x30 latest" {
+		t.Fatalf("owner helper window changed: %q", got)
+	}
+	if got := size("agent"); got != "200x50 manual" {
+		t.Fatalf("agent window not reconciled: %q", got)
+	}
 }

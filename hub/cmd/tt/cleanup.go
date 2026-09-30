@@ -26,6 +26,9 @@ type ownedSession struct {
 	Task    string `json:"task"`
 	Agent   string `json:"agent"`
 	Run     string `json:"run"`
+	// Role is the session's TAILTERM_ROLE tag; the owner helper's session
+	// (api.AgentRoleOwnerHelper) is the owner's and is never stopped or resized.
+	Role string `json:"role,omitempty"`
 }
 
 var sessionIDPattern = regexp.MustCompile(`^\$[0-9]+$`)
@@ -38,7 +41,7 @@ func (s ownedSession) path() string {
 	return filepath.Join(relayDir(), bindingKey(runtimeBinding{Hub: s.Hub, Agent: s.Agent})+"-"+s.Run+".session.json")
 }
 func localSessions(ctx context.Context) ([]ownedSession, error) {
-	fields := []string{"session_id", "session_created", "session_name", "TAILTERM_HUB", "TAILTERM_TASK", "TAILTERM_AGENT", "TAILTERM_RUN"}
+	fields := []string{"session_id", "session_created", "session_name", "TAILTERM_HUB", "TAILTERM_TASK", "TAILTERM_AGENT", "TAILTERM_RUN", "TAILTERM_ROLE"}
 	for i, f := range fields {
 		fields[i] = `"#{q/e:` + f + `}"`
 	}
@@ -56,10 +59,13 @@ func localSessions(ctx context.Context) ([]ownedSession, error) {
 			continue
 		}
 		var f []string
-		if json.Unmarshal([]byte(line), &f) != nil || len(f) != 7 {
+		// Real tmux prints every requested field; seven is the pre-role line
+		// that synthetic tmux fixtures print, read as no role.
+		if json.Unmarshal([]byte(line), &f) != nil || (len(f) != 8 && len(f) != 7) {
 			return nil, errors.New("cannot verify tmux session identities")
 		}
-		sessions = append(sessions, ownedSession{f[0], f[1], f[2], f[3], f[4], f[5], f[6]})
+		f = append(f, "")
+		sessions = append(sessions, ownedSession{f[0], f[1], f[2], f[3], f[4], f[5], f[6], f[7]})
 	}
 	return sessions, nil
 }
@@ -69,7 +75,8 @@ func rememberSessions(ctx context.Context, hub string) ([]ownedSession, error) {
 		return nil, err
 	}
 	for _, s := range sessions {
-		if s.Hub == hub && s.valid() {
+		// The owner helper's session belongs to the owner: no cleanup record.
+		if s.Hub == hub && s.valid() && s.Role != api.AgentRoleOwnerHelper {
 			if err := writePrivateJSON(s.path(), s); err != nil {
 				return nil, err
 			}
@@ -90,13 +97,17 @@ func stopOwnedSession(ctx context.Context, s ownedSession) error {
 		if current.Created != s.Created || current.Hub != s.Hub || current.Task != s.Task || current.Agent != s.Agent || current.Run != s.Run {
 			return errors.New("session identity changed; replacement left open")
 		}
+		if current.Role == api.AgentRoleOwnerHelper {
+			return errors.New("the owner helper's session belongs to the owner; left open")
+		}
 		found = true
 	}
 	if !found {
 		return nil
 	}
 	// Check and kill inside tmux's command queue, without shell evaluation.
-	cond := fmt.Sprintf("#{&&:#{==:#{session_created},%s},#{&&:#{==:#{TAILTERM_TASK},%s},#{&&:#{==:#{TAILTERM_AGENT},%s},#{==:#{TAILTERM_RUN},%s}}}}", s.Created, s.Task, s.Agent, s.Run)
+	// The role check makes a helper tag set between the read and the kill refuse too.
+	cond := fmt.Sprintf("#{&&:#{==:#{session_created},%s},#{&&:#{==:#{TAILTERM_TASK},%s},#{&&:#{==:#{TAILTERM_AGENT},%s},#{&&:#{==:#{TAILTERM_RUN},%s},#{!=:#{TAILTERM_ROLE},%s}}}}}", s.Created, s.Task, s.Agent, s.Run, api.AgentRoleOwnerHelper)
 	if _, err = startupTmux(ctx, "if-shell", "-F", "-t", s.ID, cond, "kill-session -t "+spawn.ShellQuote(s.ID), "display-message -p 'session identity changed'"); err != nil {
 		return errors.New("tmux could not stop the session")
 	}
@@ -171,7 +182,7 @@ func cleanupSessions(ctx context.Context, e env, task string, selected []string)
 				break
 			}
 		}
-		if a == nil || a.Status != api.AgentClosed {
+		if a == nil || a.Status != api.AgentClosed || a.Role == api.AgentRoleOwnerHelper {
 			continue
 		}
 		// Individual closeout of an open project applies only to the exact

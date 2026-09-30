@@ -36,6 +36,7 @@ Commands
   status                       identity, hub reachability, own agent, unread count
   projects                     list projects on the hub (tasks is an alias)
   project-pause <get|pause|handoff|resume>  explicit project team lifecycle
+  helper register|env|inbox --task ID  the owner's Claude Code session as the project's owner helper
   handler <rotate|rotation|policy|spec>  rotate a project's database handler (owner)
   prompt-policy <get|set>      runtime prompt policy per prompt kind (set: owner)
   deployment <list|enqueue|claim|check|verification|merged|finish|block>  release ledger
@@ -238,6 +239,8 @@ func main() {
 		err = cmdDelivery(e, args)
 	case "owner":
 		err = cmdOwner(e, args)
+	case "helper":
+		err = cmdHelper(e, args)
 	case "spawn":
 		err = cmdSpawn(e, args)
 	case "team":
@@ -374,6 +377,9 @@ func cmdAgents(e env, args []string) error {
 		activity := "unknown"
 		if a.Activity != nil {
 			activity = a.Activity.State
+		}
+		if helperOffline(a) {
+			activity = "offline"
 		}
 		fmt.Printf("%s %s  %-12s %-12s %s@%s%s activity=%s unread=%d\n", self, a.ID, a.Status, a.Name, a.Session, a.Host, role, activity, a.Unread)
 		if a.Activity != nil {
