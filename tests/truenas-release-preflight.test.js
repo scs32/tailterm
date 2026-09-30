@@ -768,6 +768,7 @@ test("optional Discord helper fields need the bridge and reach the bridge enviro
   ]) {
     rejects(fields, /bridge fields/);
   }
+  rejects({ ...bridge, discordHelperChannelId: helper.discordHelperChannelId }, /needs deployment\.discordHelperTask/);
 });
 
 test("selected targets validate immutable retained mounts before remote effects", () => {

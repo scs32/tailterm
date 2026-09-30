@@ -223,6 +223,11 @@ def validate_plan(plan: Any) -> dict[str, Any]:
         raise PreflightFailure(
             "invalid-input", "deployment Discord helper fields need the Discord bridge fields"
         )
+    # The bridge refuses to start with a helper channel but no helper project.
+    if "discordHelperChannelId" in deployment and "discordHelperTask" not in deployment:
+        raise PreflightFailure(
+            "invalid-input", "deployment.discordHelperChannelId needs deployment.discordHelperTask"
+        )
     normalized_deployment = {
         field: _string(deployment.get(field), f"deployment.{field}")
         for field in sorted(set(deployment) - {"targets"})

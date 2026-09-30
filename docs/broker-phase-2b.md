@@ -199,7 +199,7 @@ Two more optional fields turn on the owner helper conversation
 | Field | Sets | Value | When absent |
 | --- | --- | --- | --- |
 | `discordHelperTask` | `DISCORD_HELPER_TASK` | A `tsk_` project ID | The helper is off |
-| `discordHelperChannelId` | `DISCORD_HELPER_CHANNEL` | A 1–20 digit Discord channel ID | Only the DM works |
+| `discordHelperChannelId` | `DISCORD_HELPER_CHANNEL` | A 1–20 digit Discord channel ID; needs `discordHelperTask` | Only the DM works |
 
 Both need the eight bridge fields. When neither is given, the bridge environment and the
 rendered app definition are unchanged. The preflight receipt covers these fields, so turning the helper
