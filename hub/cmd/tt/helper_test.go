@@ -599,3 +599,83 @@ func TestOwnerHelperTeamCountAndOfflineLabel(t *testing.T) {
 		t.Fatal("online helper shown offline")
 	}
 }
+
+// wi_2de2c1273e34473a a10, f0: tt helper reply posts as the verified helper
+// with replyTo (SEQ before or after the flags), answering one of two
+// pending messages is accepted, and an unverified helper is refused.
+func TestHelperReply(t *testing.T) {
+	f := newHelperFixture(t)
+	ctx := context.Background()
+	reply := func(args ...string) (string, error) {
+		return captureCLIOutput(t, func() error { return cmdHelper(f.owner, append([]string{"reply"}, args...)) })
+	}
+	if _, err := reply("--task", f.task.ID, "1", "--text", "too early"); err == nil || !strings.Contains(err.Error(), "no owner helper is registered") {
+		t.Fatalf("reply before registering: %v", err)
+	}
+	a := *f.mustRegister(t).Agent
+	var asked []api.Message
+	for _, text := range []string{"first question", "second question"} {
+		m, err := f.c.PostMessage(ctx, f.task.ID, api.PostMessageRequest{To: a.ID, Text: text})
+		if err != nil {
+			t.Fatal(err)
+		}
+		asked = append(asked, m)
+	}
+	out, err := reply("--task", f.task.ID, fmt.Sprint(asked[1].Seq), "--text", "answer to the second")
+	if err != nil || !strings.Contains(out, fmt.Sprintf("replying to #%d", asked[1].Seq)) {
+		t.Fatalf("reply = %q %v", out, err)
+	}
+	if _, err := reply("--text", "answer to the first", "--task", f.task.ID, fmt.Sprintf("#%d", asked[0].Seq)); err != nil {
+		t.Fatalf("flags before SEQ: %v", err)
+	}
+	msgs, err := f.c.ListMessages(ctx, f.task.ID, asked[1].Seq, "", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(msgs) != 2 {
+		t.Fatalf("messages after the questions = %+v", msgs)
+	}
+	for i, want := range []struct {
+		text    string
+		replyTo int64
+	}{{"answer to the second", asked[1].Seq}, {"answer to the first", asked[0].Seq}} {
+		m := msgs[i]
+		if m.From.AgentID != a.ID || m.ReplyTo != want.replyTo || m.Text != want.text {
+			t.Fatalf("reply %d = %+v, want from %s replying to %d", i, m, a.ID, want.replyTo)
+		}
+	}
+	for _, bad := range [][]string{{"--task", f.task.ID, "--text", "no seq"}, {"--task", f.task.ID, "x", "--text", "t"}, {"--task", f.task.ID, "5"}, {"--task", f.task.ID, "5", "6", "--text", "t"}} {
+		if _, err := reply(bad...); err == nil {
+			t.Errorf("reply %v was accepted", bad)
+		}
+	}
+	// Registered again from elsewhere: this host's helper is no longer verified.
+	if _, err := f.c.RegisterOwnerHelper(ctx, f.task.ID, api.RegisterOwnerHelperRequest{Host: "other-mac", Session: "owner", Runtime: "claude", RequestID: "ohreg-elsewhere"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := reply("--task", f.task.ID, fmt.Sprint(asked[0].Seq), "--text", "stale"); err == nil || !strings.Contains(err.Error(), "registered again elsewhere") {
+		t.Fatalf("a stale helper replied: %v", err)
+	}
+}
+
+// a10: the helper inbox shows the tt helper reply hint for a message the
+// owner sent from Discord, and the usual hint for everything else.
+func TestHelperInboxDiscordHint(t *testing.T) {
+	names := map[string]string{}
+	discordMsg := api.Message{Seq: 42, From: api.Sender{Node: api.BridgeNode, User: "owner"}, Text: "what's stuck?", Source: &api.MessageSource{Kind: api.SourceDiscord, ID: "1", UserID: "2"}}
+	line := helperMessageLine(discordMsg, names, "tsk_0123456789abcdef")
+	if !strings.Contains(line, `tt helper reply --task tsk_0123456789abcdef 42 --text "your reply"`) || !strings.Contains(line, "tt ack 42") || strings.Contains(line, "Reply on the shared board") {
+		t.Fatalf("Discord hint = %q", line)
+	}
+	if !strings.HasPrefix(line, strings.SplitN(formatMessage(discordMsg, names), "\n", 2)[0]) {
+		t.Fatalf("the message line itself changed: %q", line)
+	}
+	plain := api.Message{Seq: 43, From: api.Sender{Node: "workspace", User: "owner"}, Text: "from TailOS"}
+	if got := helperMessageLine(plain, names, "tsk_0123456789abcdef"); got != formatMessage(plain, names) {
+		t.Fatalf("a non-Discord message changed: %q", got)
+	}
+	agentMsg := api.Message{Seq: 44, From: api.Sender{AgentID: "agt_0123456789abcdef"}, Text: "from an agent"}
+	if got := helperMessageLine(agentMsg, names, "tsk_0123456789abcdef"); got != formatMessage(agentMsg, names) {
+		t.Fatalf("an agent message changed: %q", got)
+	}
+}

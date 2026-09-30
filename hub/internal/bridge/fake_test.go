@@ -34,12 +34,20 @@ type fakeDiscord struct {
 	commands  []discord.Command
 	requests  []recordedRequest
 
+	// Owner helper (helper_test.go).
+	globalCommands []discord.Command
+	globalPuts     int
+	dms            map[string]string // recipient → DM channel ID
+	threadStarts   []string          // starter message IDs, in order
+
 	// Faults, consumed once each.
 	loseCreateChannel int // create the channel, then answer 500
 	loseCreateMessage int // create the message, then answer 500
 	rateLimitMessages int // answer 429 with a short retry_after
 	failMessages      int // answer 500 without creating
 	failPins          int // answer 403 missing permissions
+	failThreads       int // answer 500 to a thread start without creating it
+	failDMs           int // answer 500 to a DM open
 }
 
 type fakeMessage struct {
@@ -109,6 +117,47 @@ func (f *fakeDiscord) serve(w http.ResponseWriter, r *http.Request) {
 	case r.Method == "PUT" && len(parts) == 5 && parts[0] == "applications" && parts[4] == "commands":
 		_ = json.Unmarshal(raw, &f.commands)
 		writeJSON(w, 200, f.commands)
+	case r.Method == "PUT" && len(parts) == 3 && parts[0] == "applications" && parts[2] == "commands":
+		f.globalCommands = nil
+		_ = json.Unmarshal(raw, &f.globalCommands)
+		f.globalPuts++
+		writeJSON(w, 200, f.globalCommands)
+	case route == "POST /users/@me/channels":
+		if f.failDMs > 0 {
+			f.failDMs--
+			writeJSON(w, 500, map[string]any{"message": "boom"})
+			return
+		}
+		var req struct {
+			Recipient string `json:"recipient_id"`
+		}
+		_ = json.Unmarshal(raw, &req)
+		if f.dms == nil {
+			f.dms = map[string]string{}
+		}
+		id, ok := f.dms[req.Recipient]
+		if !ok {
+			id = f.id()
+			f.dms[req.Recipient] = id
+			f.channels[id] = &discord.Channel{ID: id, Type: discord.ChannelDM}
+		}
+		writeJSON(w, 200, f.channels[id])
+	case r.Method == "POST" && len(parts) == 5 && parts[0] == "channels" && parts[2] == "messages" && parts[4] == "threads":
+		if f.failThreads > 0 {
+			f.failThreads--
+			writeJSON(w, 500, map[string]any{"message": "boom"})
+			return
+		}
+		if _, ok := f.channels[parts[3]]; ok {
+			writeJSON(w, 400, map[string]any{"code": discord.CodeThreadAlreadyCreated, "message": "A thread has already been created for this message"})
+			return
+		}
+		var req discord.StartThread
+		_ = json.Unmarshal(raw, &req)
+		c := &discord.Channel{ID: parts[3], Type: discord.ChannelPublicThread, GuildID: "guild", Name: req.Name, ParentID: parts[1]}
+		f.channels[c.ID] = c
+		f.threadStarts = append(f.threadStarts, c.ID)
+		writeJSON(w, 201, c)
 	case r.Method == "GET" && len(parts) == 3 && parts[0] == "guilds" && parts[2] == "channels":
 		var out []discord.Channel
 		for _, id := range f.order {
@@ -213,7 +262,9 @@ func (f *fakeDiscord) serveMessages(w http.ResponseWriter, r *http.Request, part
 		var asc []discord.Message // oldest first
 		for _, m := range f.messages[channel] {
 			if after == "" || snowflakeAfter(m.ID, after) {
-				asc = append(asc, m.Message)
+				read := m.Message
+				read.GuildID = "" // Discord's REST reads never carry guild_id
+				asc = append(asc, read)
 			}
 		}
 		if after != "" && len(asc) > limit {
@@ -370,4 +421,42 @@ func (f *fakeDiscord) clearNonces() {
 	f.mu.Lock()
 	f.nonces = map[string]string{}
 	f.mu.Unlock()
+}
+
+// addChannel creates a channel outside any project (the helper channel).
+func (f *fakeDiscord) addChannel(kind int, name string) string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	id := f.id()
+	f.channels[id] = &discord.Channel{ID: id, Type: kind, GuildID: "guild", Name: name}
+	return id
+}
+
+// dmMessage is a user writing in a DM: stored like any message, and
+// returned in its Gateway form, which has no guild_id.
+func (f *fakeDiscord) dmMessage(channel, author, content string) discord.Message {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	m := &fakeMessage{Message: discord.Message{ID: f.id(), ChannelID: channel, Author: discord.User{ID: author}, Content: content}}
+	f.messages[channel] = append(f.messages[channel], m)
+	return m.Message
+}
+
+func (f *fakeDiscord) hasChannel(id string) bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	_, ok := f.channels[id]
+	return ok
+}
+
+func (f *fakeDiscord) reactionsOn(id string) []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var out []string
+	for _, r := range f.reactions {
+		if strings.HasPrefix(r, id+":") {
+			out = append(out, r)
+		}
+	}
+	return out
 }

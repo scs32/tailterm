@@ -60,6 +60,8 @@ const (
 	CodeUnknownInteraction = 10062
 	CodeMissingAccess      = 50001
 	CodeMissingPermissions = 50013
+	// CodeThreadAlreadyCreated answers a second thread start on one message.
+	CodeThreadAlreadyCreated = 160004
 )
 
 // Permanent reports whether retrying the same request cannot succeed.
@@ -394,6 +396,29 @@ func (c *Client) EditInteractionResponse(ctx context.Context, app, token string,
 // SetGuildCommands replaces the application's commands in one guild.
 func (c *Client) SetGuildCommands(ctx context.Context, app, guild string, commands []Command) error {
 	return c.do(ctx, "PUT", "/applications/"+app+"/guilds/"+guild+"/commands", commands, nil)
+}
+
+// SetGlobalCommands replaces the application's global commands. An empty
+// list removes them all.
+func (c *Client) SetGlobalCommands(ctx context.Context, app string, commands []Command) error {
+	if commands == nil {
+		commands = []Command{}
+	}
+	return c.do(ctx, "PUT", "/applications/"+app+"/commands", commands, nil)
+}
+
+// CreateDM opens (or returns the existing) DM channel with a user.
+func (c *Client) CreateDM(ctx context.Context, recipient string) (Channel, error) {
+	var out Channel
+	return out, c.do(ctx, "POST", "/users/@me/channels", map[string]string{"recipient_id": recipient}, &out)
+}
+
+// StartThreadFromMessage starts a public thread on a message. Discord gives
+// the thread the message's ID, and answers CodeThreadAlreadyCreated when
+// the message already has one.
+func (c *Client) StartThreadFromMessage(ctx context.Context, channel, message string, req StartThread) (Channel, error) {
+	var out Channel
+	return out, c.do(ctx, "POST", "/channels/"+channel+"/messages/"+message+"/threads", req, &out)
 }
 
 // CurrentUser is the bot's own user.

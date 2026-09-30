@@ -15,8 +15,8 @@ project as that project's one **owner helper**: an agent with role
 - be woken by the host relay with the same safe Claude wake as other Claude agents.
 
 It is not a team member. It is never leased to a queue entry, never counted as a
-team member or database handler, and never closed with an item team. A later
-Discord slice (`wi_2de2c1273e34473a` h1–h2) reuses this binding.
+team member or database handler, and never closed with an item team. The
+owner can also talk with it from Discord (see below).
 
 When the project has a [backlog steward](backlog-steward.md), the owner session
 sends new bug and feature intake to it with `tt send --to role:backlog_steward`
@@ -107,6 +107,15 @@ TAILTERM_RUN=… TAILTERM_AGENT_NAME=…` after checking that the hub's helper i
 and its current run is the one registered on this host. It never prints the token;
 the owner's own configuration supplies it. Both commands refuse when the helper was
 registered again elsewhere, closed or exited.
+
+## Talking from Discord
+
+With the bridge's `DISCORD_HELPER_TASK` set to this project, the owner's plain
+messages in their DM with the bot, or in the helper channel, reach the helper as
+directed owner messages. `tt helper reply --task tsk_... SEQ --text "..."` sends
+the answer back to the same DM or thread. `/status` and `/digest` work there from
+hub data even while the helper is offline. Reply to, or `tt ack`, each Discord
+message: each one is an obligation. See [Discord helper chat](discord-helper-chat.md).
 
 ## Opening a window for the helper
 

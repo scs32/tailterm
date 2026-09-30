@@ -48,4 +48,6 @@ var BridgeRoutes = map[string]bool{
 	// Create only: /bug and /feature file an owner item; the bridge can
 	// never update, dispatch or queue one.
 	"POST /v1/tasks/{id}/work-items": true,
+	// Read only: the owner helper's /status shows work item titles.
+	"GET /v1/tasks/{id}/work-items/{wid}": true,
 }

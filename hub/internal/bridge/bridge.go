@@ -39,6 +39,13 @@ type Config struct {
 	SyncInterval   time.Duration // project reconcile, default 30 s
 	CardInterval   time.Duration // minimum time between card edits, default 30 s
 	InitialHistory int64         // board messages mirrored into a new channel, default 10
+
+	// The owner helper conversation (docs/discord-helper-chat.md). With
+	// HelperTask empty it is off and the bridge behaves exactly as before.
+	HelperTask     string           // the project whose owner_helper agent the owner talks with
+	HelperChannel  string           // optional guild channel for helper conversations
+	Now            func() time.Time // digest clock; time.Now when nil
+	DigestInterval time.Duration    // digest tick, default 1 min
 }
 
 // Bridge mirrors the hub to Discord and Discord owner input to the hub.
@@ -57,6 +64,23 @@ type Bridge struct {
 	// needBackfill is set when a Gateway event could not be queued; the event
 	// loop then backfills without waiting for its periodic pass.
 	needBackfill atomic.Bool
+
+	// Owner helper: the status card pass's latest reads, reused by the
+	// digest, and work item titles for the summary.
+	snapshots       map[string]projectSnapshot
+	titles          map[string]string
+	titlesForbidden bool
+}
+
+// GatewayIntents are the Gateway intents the bridge asks for: guild
+// channels, guild messages and their content, and direct messages only while
+// the owner helper conversation is on.
+func GatewayIntents(helper bool) int {
+	intents := discord.IntentGuilds | discord.IntentGuildMessages | discord.IntentMessageContent
+	if helper {
+		intents |= discord.IntentDirectMessages
+	}
+	return intents
 }
 
 // BackfillInterval is how often every channel is read for owner messages the
@@ -87,6 +111,9 @@ func New(cfg Config) (*Bridge, error) {
 	}
 	if cfg.Log == nil {
 		cfg.Log = func(string, ...any) {}
+	}
+	if err := validateHelperConfig(cfg); err != nil {
+		return nil, err
 	}
 	b := &Bridge{cfg: cfg, owners: map[string]bool{}, wake: make(chan struct{}, 1), categories: map[string]string{}, events: make(chan discord.Dispatch, 256), runCtx: context.Background()}
 	for _, id := range cfg.Owners {
@@ -163,8 +190,17 @@ func (b *Bridge) Run(parent context.Context) error {
 	if err := b.registerCommands(ctx); err != nil {
 		return fmt.Errorf("register commands: %w", err)
 	}
+	if err := b.registerGlobalCommands(ctx); err != nil {
+		return fmt.Errorf("register DM commands: %w", err)
+	}
 	var wg sync.WaitGroup
 	loops := []func(context.Context){b.syncLoop, b.outboxLoop, b.inboundRetryLoop, b.eventLoop}
+	if b.helperEnabled() {
+		if err := b.startHelper(ctx); err != nil {
+			return fmt.Errorf("start owner helper: %w", err)
+		}
+		loops = append(loops, b.digestLoop)
+	}
 	for _, loop := range loops {
 		wg.Add(1)
 		go func(loop func(context.Context)) {
@@ -191,12 +227,13 @@ func (b *Bridge) Run(parent context.Context) error {
 // registerCommands replaces the guild's commands only when they changed,
 // so restarts do not spend Discord's daily command-update budget.
 func (b *Bridge) registerCommands(ctx context.Context) error {
-	raw, _ := json.Marshal(Commands)
+	commands := b.guildCommands()
+	raw, _ := json.Marshal(commands)
 	want := b.cfg.AppID + "|" + b.cfg.GuildID + "|" + string(raw)
 	if have, err := b.cfg.State.Get(ctx, "commands"); err == nil && have == want {
 		return nil
 	}
-	if err := b.cfg.Discord.SetGuildCommands(ctx, b.cfg.AppID, b.cfg.GuildID, Commands); err != nil {
+	if err := b.cfg.Discord.SetGuildCommands(ctx, b.cfg.AppID, b.cfg.GuildID, commands); err != nil {
 		return err
 	}
 	return b.cfg.State.Set(ctx, "commands", want)
@@ -268,6 +305,11 @@ func (b *Bridge) syncLoop(ctx context.Context) {
 		}
 		if err := b.mirrorAll(ctx); err != nil {
 			b.logf("discord bridge: mirror: %v", err)
+		}
+		if b.helperEnabled() {
+			if err := b.helperReplies(ctx); err != nil {
+				b.logf("discord bridge: helper replies: %v", err)
+			}
 		}
 		select {
 		case <-ctx.Done():
@@ -524,6 +566,7 @@ func (b *Bridge) refreshCard(ctx context.Context, m Mapping) error {
 	if err != nil {
 		return err
 	}
+	b.rememberSnapshot(detail.Task, detail.Agents, obligations, queue)
 	send, hash := renderCardWithQueue(detail.Task, detail.Agents, obligations, queue)
 	if hash == m.CardHash && m.CardMessageID != "" {
 		return nil
@@ -698,11 +741,24 @@ func (b *Bridge) drainOutbox(ctx context.Context) error {
 // or dropped as permanently undeliverable); any other outcome holds the
 // project's queue and schedules a retry.
 func (b *Bridge) send(ctx context.Context, row OutboxRow) error {
-	m, err := b.cfg.State.Mapping(ctx, row.TaskID)
-	if err != nil || m.ChannelID == "" {
-		// No channel yet (or it is being re-provisioned): wait for it.
-		_ = b.cfg.State.MarkRetry(ctx, row.ID, time.Now().Add(5*time.Second), "no channel")
-		return errNoChannel
+	channel := row.ChannelID
+	if channel == "" {
+		m, err := b.cfg.State.Mapping(ctx, row.TaskID)
+		if err != nil || m.ChannelID == "" {
+			// No channel yet (or it is being re-provisioned): wait for it.
+			_ = b.cfg.State.MarkRetry(ctx, row.ID, time.Now().Add(5*time.Second), "no channel")
+			return errNoChannel
+		}
+		channel = m.ChannelID
+	} else if err := b.ensureHelperThread(ctx, row.TaskID); err != nil {
+		// An owner helper thread that could not be started yet.
+		if discord.Permanent(err) {
+			b.logf("discord bridge: dropping %s: thread: %v", row.Key, err)
+			return b.cfg.State.MarkFailed(ctx, row.ID, "thread: "+err.Error())
+		}
+		backoff := time.Duration(1<<min(row.Attempts, 6)) * time.Second
+		_ = b.cfg.State.MarkRetry(ctx, row.ID, time.Now().Add(backoff), "thread: "+err.Error())
+		return err
 	}
 	var p outboxPayload
 	if err := json.Unmarshal([]byte(row.Payload), &p); err != nil {
@@ -711,7 +767,12 @@ func (b *Bridge) send(ctx context.Context, row OutboxRow) error {
 	// A row tried before may already be in Discord (its reply lost, or the
 	// bridge killed before recording it): find it by marker before sending.
 	if row.Attempts > 0 && p.Marker != "" {
-		id, err := b.findOwn(ctx, m.ChannelID, p.Marker, row.FirstAttemptAt)
+		id, err := b.findOwn(ctx, channel, p.Marker, row.FirstAttemptAt)
+		if err != nil && row.ChannelID != "" && discord.Permanent(err) {
+			// A helper DM or thread that can no longer be read.
+			b.logf("discord bridge: dropping %s: reconcile: %v", row.Key, err)
+			return b.cfg.State.MarkFailed(ctx, row.ID, "reconcile: "+err.Error())
+		}
 		if err != nil {
 			_ = b.cfg.State.MarkRetry(ctx, row.ID, time.Now().Add(30*time.Second), "reconcile: "+err.Error())
 			return b.channelError(ctx, row.TaskID, err)
@@ -720,18 +781,19 @@ func (b *Bridge) send(ctx context.Context, row OutboxRow) error {
 			return b.cfg.State.MarkSent(ctx, row, id)
 		}
 	}
-	if row, err = b.cfg.State.MarkAttempt(ctx, row.ID); err != nil {
+	row, err := b.cfg.State.MarkAttempt(ctx, row.ID)
+	if err != nil {
 		return err
 	}
 	send := p.Message
 	send.AllowedMentions = discord.AllowedMentions{Parse: []string{}, Users: p.MentionUser}
 	send.Nonce = "tt" + strconv.FormatInt(row.ID, 10)
 	send.EnforceNonce = true
-	msg, err := b.cfg.Discord.CreateMessage(ctx, m.ChannelID, send)
+	msg, err := b.cfg.Discord.CreateMessage(ctx, channel, send)
 	if err == nil {
 		return b.cfg.State.MarkSent(ctx, row, msg.ID)
 	}
-	if discord.IsCode(err, discord.CodeUnknownChannel) {
+	if discord.IsCode(err, discord.CodeUnknownChannel) && row.ChannelID == "" {
 		_ = b.cfg.State.MarkRetry(ctx, row.ID, time.Now().Add(5*time.Second), err.Error())
 		return b.channelError(ctx, row.TaskID, err)
 	}
@@ -754,6 +816,11 @@ var errNoChannel = errors.New("no channel")
 // It returns an error only when an owner message could not be recorded, so
 // backfill stops there and reads it again next time.
 func (b *Bridge) handleMessage(ctx context.Context, msg discord.Message) error {
+	if route, err := b.helperRouteOf(ctx, msg); err != nil {
+		return err
+	} else if route != routeNone {
+		return b.handleHelperMessage(ctx, route, msg)
+	}
 	m, ok := b.ownerMessage(ctx, msg)
 	if !ok {
 		return nil
@@ -918,6 +985,10 @@ func (b *Bridge) retryInbound1(ctx context.Context) {
 		return
 	}
 	for _, in := range pending {
+		if in.Kind == kindHelperMessage || in.Kind == kindHelperInteraction {
+			b.retryHelperInbound(ctx, in)
+			continue
+		}
 		m, err := b.cfg.State.Mapping(ctx, in.TaskID)
 		if err != nil {
 			continue
@@ -983,5 +1054,8 @@ func (b *Bridge) backfill(ctx context.Context) {
 				break pages
 			}
 		}
+	}
+	if b.helperEnabled() {
+		b.helperBackfill(ctx)
 	}
 }

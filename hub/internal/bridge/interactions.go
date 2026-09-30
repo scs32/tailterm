@@ -35,6 +35,10 @@ func ephemeral(format string, args ...any) reply {
 func (b *Bridge) handleInteraction(ctx context.Context, in discord.Interaction) {
 	ctx, cancel := context.WithTimeout(ctx, 2*time.Minute)
 	defer cancel()
+	if b.isHelperInteraction(ctx, in) {
+		b.handleHelperInteraction(ctx, in)
+		return
+	}
 	if in.GuildID != b.cfg.GuildID || !b.owners[in.UserID()] {
 		b.respondNow(ctx, in, ephemeral("⛔ Only the project owner can use Tailterm controls here."))
 		return
@@ -136,6 +140,8 @@ func (b *Bridge) act(ctx context.Context, taskID string, in discord.Interaction)
 			return b.delegateEnd(ctx, taskID, in, option("reason"))
 		case "bug", "feature":
 			return b.fileItem(ctx, taskID, in, in.Data.Name, option("text"))
+		case "digest":
+			return ephemeral("Use /digest in the helper channel or your DM with the bot.")
 		}
 		return ephemeral("Unknown command.")
 	}

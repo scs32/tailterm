@@ -353,3 +353,28 @@ func TestEscalationNoticesCarryTheirLevel(t *testing.T) {
 		}
 	}
 }
+
+// wi_2de2c1273e34473a a12: the owner helper's /status reads a work item's
+// title; every other work item route stays closed to the bridge.
+func TestBridgeCanReadAWorkItemOnly(t *testing.T) {
+	h := newTokenHub(t)
+	task, _, _ := h.project()
+	base := "/v1/tasks/" + task.ID
+	var item api.WorkItem
+	if code, _ := h.do(ownerToken, "POST", base+"/work-items", api.CreateWorkItemRequest{Kind: "feature", Title: "Talk with the helper", RequestID: "helper-read"}, &item); code != http.StatusCreated {
+		t.Fatalf("owner create = %d", code)
+	}
+	path := base + "/work-items/" + item.ID
+	var got api.WorkItem
+	if code, _ := h.do(bridgeToken, "GET", path, nil, &got); code != 200 || got.Title != "Talk with the helper" {
+		t.Fatalf("bridge GET work item = %d %+v, want 200 with its title", code, got)
+	}
+	for _, denied := range []struct{ method, path string }{
+		{"PATCH", path}, {"POST", path + "/dispatch"}, {"POST", path + "/updates"}, {"GET", base + "/work-items"},
+		{"GET", path + "/revisions/1"}, {"POST", path + "/verification"}, {"GET", path + "/order-scope"},
+	} {
+		if code, _ := h.do(bridgeToken, denied.method, denied.path, map[string]any{}, nil); code != http.StatusForbidden {
+			t.Errorf("bridge %s %s = %d, want 403", denied.method, denied.path, code)
+		}
+	}
+}

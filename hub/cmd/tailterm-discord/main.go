@@ -86,15 +86,21 @@ func main() {
 		}
 		app = me.ID // a bot's user ID is its application ID
 	}
+	// The owner helper conversation (docs/discord-helper-chat.md) is off
+	// unless DISCORD_HELPER_TASK names its project; only then does the
+	// bridge ask for direct messages.
+	helperTask := env("DISCORD_HELPER_TASK", "")
 	b, err := bridge.New(bridge.Config{
 		Hub: hub, Discord: client,
 		Gateway: &discord.Gateway{
 			Token:   token,
-			Intents: discord.IntentGuilds | discord.IntentGuildMessages | discord.IntentMessageContent,
+			Intents: bridge.GatewayIntents(helperTask != ""),
 			URL:     client.GatewayURL,
 			Log:     log.Printf,
 		},
-		AppID: app, GuildID: guild, Owners: owners,
+		HelperTask:    helperTask,
+		HelperChannel: env("DISCORD_HELPER_CHANNEL", ""),
+		AppID:         app, GuildID: guild, Owners: owners,
 		ActiveCategory:  env("DISCORD_ACTIVE_CATEGORY", "Tailterm projects"),
 		ArchiveCategory: env("DISCORD_ARCHIVE_CATEGORY", "Tailterm archive"),
 		TailOSURL:       env("TAILOS_URL", ""),
@@ -105,6 +111,9 @@ func main() {
 		log.Fatal(err)
 	}
 	log.Printf("discord bridge starting for guild %s with %d owner(s)", guild, len(owners))
+	if helperTask != "" {
+		log.Printf("discord bridge: owner helper conversation on for project %s", helperTask)
+	}
 	if err := b.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
 		log.Fatal(err)
 	}

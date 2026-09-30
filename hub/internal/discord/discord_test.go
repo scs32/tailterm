@@ -314,3 +314,82 @@ func TestOneInteractionsLimitDoesNotDelayTheNext(t *testing.T) {
 		}
 	}
 }
+
+// Owner helper conversation (docs/discord-helper-chat.md): the three REST
+// calls send Discord's documented shapes.
+func TestHelperRESTCalls(t *testing.T) {
+	type call struct {
+		Method, Path string
+		Body         json.RawMessage
+	}
+	var mu sync.Mutex
+	var calls []call
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body json.RawMessage
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		mu.Lock()
+		calls = append(calls, call{r.Method, r.URL.Path, body})
+		mu.Unlock()
+		switch {
+		case r.URL.Path == "/users/@me/channels":
+			_, _ = w.Write([]byte(`{"id":"900","type":1}`))
+		case strings.HasSuffix(r.URL.Path, "/threads") && strings.Contains(r.URL.Path, "/messages/77/"):
+			w.WriteHeader(400)
+			_, _ = w.Write([]byte(`{"code":160004,"message":"A thread has already been created for this message"}`))
+		case strings.HasSuffix(r.URL.Path, "/threads"):
+			_, _ = w.Write([]byte(`{"id":"55","type":11,"parent_id":"10"}`))
+		default:
+			_, _ = w.Write([]byte(`[]`))
+		}
+	}))
+	defer srv.Close()
+	c := &Client{Token: "t", Base: srv.URL, HTTP: srv.Client()}
+	ctx := context.Background()
+	dm, err := c.CreateDM(ctx, "42")
+	if err != nil || dm.ID != "900" || dm.Type != ChannelDM {
+		t.Fatalf("CreateDM = %+v %v", dm, err)
+	}
+	th, err := c.StartThreadFromMessage(ctx, "10", "55", StartThread{Name: "Owner helper", AutoArchiveDuration: 1440})
+	if err != nil || th.ID != "55" || th.Type != ChannelPublicThread {
+		t.Fatalf("StartThreadFromMessage = %+v %v", th, err)
+	}
+	if _, err := c.StartThreadFromMessage(ctx, "10", "77", StartThread{Name: "x"}); !IsCode(err, CodeThreadAlreadyCreated) {
+		t.Fatalf("a second thread start should be code 160004, got %v", err)
+	}
+	global := []Command{{Name: "status", Description: "d", Contexts: []int{ContextBotDM}, IntegrationTypes: []int{IntegrationGuildInstall}}}
+	if err := c.SetGlobalCommands(ctx, "app", global); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.SetGlobalCommands(ctx, "app", nil); err != nil {
+		t.Fatal(err)
+	}
+	want := []call{
+		{"POST", "/users/@me/channels", json.RawMessage(`{"recipient_id":"42"}`)},
+		{"POST", "/channels/10/messages/55/threads", json.RawMessage(`{"name":"Owner helper","auto_archive_duration":1440}`)},
+		{"POST", "/channels/10/messages/77/threads", json.RawMessage(`{"name":"x"}`)},
+		{"PUT", "/applications/app/commands", json.RawMessage(`[{"name":"status","description":"d","contexts":[1],"integration_types":[0]}]`)},
+		{"PUT", "/applications/app/commands", json.RawMessage(`[]`)},
+	}
+	if len(calls) != len(want) {
+		t.Fatalf("calls = %+v", calls)
+	}
+	for i, w := range want {
+		if calls[i].Method != w.Method || calls[i].Path != w.Path || string(calls[i].Body) != string(w.Body) {
+			t.Errorf("call %d = %s %s %s, want %s %s %s", i, calls[i].Method, calls[i].Path, calls[i].Body, w.Method, w.Path, w.Body)
+		}
+	}
+	// A guild command keeps its old JSON: no contexts or integration types.
+	raw, _ := json.Marshal(Command{Name: "status", Description: "d"})
+	if string(raw) != `{"name":"status","description":"d"}` {
+		t.Errorf("guild command JSON changed: %s", raw)
+	}
+	for path, want := range map[string]string{
+		"/users/@me/channels":              "POST users/@me/channels",
+		"/channels/10/messages/55/threads": "POST channels/{id}/messages/{id}/threads",
+		"/applications/1/commands":         "POST applications/{id}/commands",
+	} {
+		if got := routeOf("POST", path).Template; got != want {
+			t.Errorf("routeOf(%s) = %s, want %s", path, got, want)
+		}
+	}
+}

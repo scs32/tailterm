@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -23,7 +24,8 @@ import (
 
 const helperUsage = "usage: tt helper register --task T [--name N] [--request-id K] [--json]\n" +
 	"       tt helper env --task T\n" +
-	"       tt helper inbox --task T"
+	"       tt helper inbox --task T\n" +
+	"       tt helper reply --task T SEQ --text TEXT [--request-id K]"
 
 // ownerHelperFile is private host state for one project's helper: the exact
 // registered identity and tmux session, and a pending request ID that makes a
@@ -74,6 +76,8 @@ func cmdHelper(e env, args []string) error {
 		return helperEnv(e, args[1:])
 	case "inbox":
 		return helperInbox(e, args[1:])
+	case "reply":
+		return helperReply(e, args[1:])
 	}
 	return errors.New(helperUsage)
 }
@@ -388,7 +392,8 @@ func helperEnv(e env, args []string) error {
 }
 
 // helperInbox reads the helper's unread messages as the helper, in-process,
-// so a wake prompt needs no shell evaluation.
+// so a wake prompt needs no shell evaluation. It marks them read. A message
+// the owner sent from Discord shows how to answer it there.
 func helperInbox(e env, args []string) error {
 	fs := flag.NewFlagSet("helper inbox", flag.ContinueOnError)
 	task := fs.String("task", e.task, "project id")
@@ -399,5 +404,102 @@ func helperInbox(e env, args []string) error {
 	if err != nil {
 		return err
 	}
-	return cmdInbox(helper, []string{"--unread", "--mark-read"})
+	c, err := helper.client(10 * time.Second)
+	if err != nil {
+		return err
+	}
+	ctx, cancel := ctxTimeout(10 * time.Second)
+	defer cancel()
+	agents, err := c.ListAgents(ctx, helper.task)
+	if err != nil {
+		return err
+	}
+	names := map[string]string{}
+	for _, a := range agents {
+		names[a.ID] = a.Name
+	}
+	after, err := readCursor(ctx, c, helper.task, helper.agent)
+	if err != nil {
+		return err
+	}
+	msgs, err := c.ListMessages(ctx, helper.task, after, helper.agent, 50)
+	if err != nil {
+		return err
+	}
+	shown := msgs[:0]
+	for _, m := range msgs {
+		if m.From.AgentID != helper.agent {
+			shown = append(shown, m)
+		}
+	}
+	for _, m := range shown {
+		recordUsageContext(helper, helper.task, "inbox", m.Seq)
+		fmt.Println(helperMessageLine(m, names, helper.task))
+	}
+	if len(shown) == 0 {
+		fmt.Println("(no messages)")
+		return nil
+	}
+	return c.MarkRead(ctx, helper.task, api.MarkReadRequest{AgentID: helper.agent, UpTo: shown[len(shown)-1].Seq})
+}
+
+// helperMessageLine is the inbox line. The owner's Discord messages get a
+// tt helper reply hint in place of the shared-board one, since only a
+// helper reply goes back to their DM or thread.
+func helperMessageLine(m api.Message, names map[string]string, task string) string {
+	line := formatMessage(m, names)
+	if m.From.AgentID != "" || m.Source == nil || m.Source.Kind != api.SourceDiscord {
+		return line
+	}
+	line, _, _ = strings.Cut(line, "\n  Reply on the shared board:")
+	return line + fmt.Sprintf("\n  From the owner on Discord. Answer with tt helper reply --task %s %d --text \"your reply\" (it goes back to their DM or thread), or tt ack %d. Until you reply or ack, the hub holds your other posts.", task, m.Seq, m.Seq)
+}
+
+// helperReply posts the helper's answer to one message. The Discord bridge
+// sends a helper reply to a Discord message back to the owner's DM or
+// thread (docs/discord-helper-chat.md).
+func helperReply(e env, args []string) error {
+	fs := flag.NewFlagSet("helper reply", flag.ContinueOnError)
+	task := fs.String("task", e.task, "project id")
+	text := fs.String("text", "", "the reply")
+	requestID := fs.String("request-id", "", "stable retry identity for this exact reply")
+	// SEQ may come before or after the flags.
+	var positional []string
+	for {
+		if err := fs.Parse(args); err != nil {
+			return err
+		}
+		if fs.NArg() == 0 {
+			break
+		}
+		positional = append(positional, fs.Arg(0))
+		args = fs.Args()[1:]
+	}
+	if len(positional) != 1 {
+		return errors.New(helperUsage)
+	}
+	seq, err := strconv.ParseInt(strings.TrimPrefix(positional[0], "#"), 10, 64)
+	if err != nil || seq <= 0 {
+		return fmt.Errorf("SEQ must be a message number, got %q", positional[0])
+	}
+	if strings.TrimSpace(*text) == "" {
+		return errors.New("tt helper reply needs --text")
+	}
+	helper, _, err := verifiedHelper(e, *task)
+	if err != nil {
+		return err
+	}
+	c, err := helper.client(10 * time.Second)
+	if err != nil {
+		return err
+	}
+	ctx, cancel := ctxTimeout(10 * time.Second)
+	defer cancel()
+	m, err := c.PostMessage(ctx, helper.task, api.PostMessageRequest{AgentID: helper.agent, RunID: helper.runID, ReplyTo: seq, Text: *text, RequestID: *requestID})
+	if err != nil {
+		return err
+	}
+	recordUsageContext(helper, helper.task, "post", m.Seq)
+	fmt.Printf("posted #%d as %s, replying to #%d\n", m.Seq, helper.agentName, seq)
+	return nil
 }

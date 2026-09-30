@@ -68,6 +68,24 @@ CREATE TABLE IF NOT EXISTS inbound (
 CREATE TABLE IF NOT EXISTS kv (
   key TEXT PRIMARY KEY,
   value TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS helper_conversations (
+  id TEXT PRIMARY KEY,
+  kind TEXT NOT NULL,
+  channel_id TEXT NOT NULL,
+  owner_id TEXT NOT NULL DEFAULT '',
+  thread_ready INTEGER NOT NULL DEFAULT 0,
+  last_seq INTEGER NOT NULL DEFAULT 0,
+  ingest_after TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS helper_messages (
+  task_id TEXT NOT NULL,
+  seq INTEGER NOT NULL,
+  conversation_id TEXT NOT NULL,
+  author TEXT NOT NULL,
+  PRIMARY KEY (task_id, seq)
 );`
 
 // Outbox and inbound states.
@@ -246,14 +264,18 @@ type OutboxRow struct {
 	// FirstAttemptAt is when a send was first tried; any row with an attempt
 	// may already be in Discord and is looked for before it is sent again.
 	FirstAttemptAt time.Time
+	// ChannelID, when set, is where the row goes instead of its project's
+	// channel. Owner helper rows set it, with TaskID naming their own lane
+	// ("helper:…"), so they never hold back a project's sends.
+	ChannelID string
 }
 
-const outboxCols = `id,key,task_id,seq,agent_id,kind,payload,state,attempts,next_at,discord_id,last_error,first_attempt_at`
+const outboxCols = `id,key,task_id,seq,agent_id,kind,payload,state,attempts,next_at,discord_id,last_error,first_attempt_at,channel_id`
 
 func scanOutbox(row interface{ Scan(...any) error }) (OutboxRow, error) {
 	var o OutboxRow
 	var next, first string
-	err := row.Scan(&o.ID, &o.Key, &o.TaskID, &o.Seq, &o.AgentID, &o.Kind, &o.Payload, &o.State, &o.Attempts, &next, &o.DiscordID, &o.LastError, &first)
+	err := row.Scan(&o.ID, &o.Key, &o.TaskID, &o.Seq, &o.AgentID, &o.Kind, &o.Payload, &o.State, &o.Attempts, &next, &o.DiscordID, &o.LastError, &first, &o.ChannelID)
 	o.NextAt, o.FirstAttemptAt = parseTS(next), parseTS(first)
 	return o, err
 }
@@ -269,8 +291,8 @@ func (s *State) Enqueue(ctx context.Context, taskID string, mirrorAfter int64, r
 	defer tx.Rollback()
 	now := ts(s.now())
 	for _, r := range rows {
-		if _, err := tx.ExecContext(ctx, `INSERT INTO outbox (key,task_id,seq,agent_id,kind,payload,next_at,created_at) VALUES (?,?,?,?,?,?,?,?) ON CONFLICT(key) DO NOTHING`,
-			r.Key, r.TaskID, r.Seq, r.AgentID, r.Kind, r.Payload, now, now); err != nil {
+		if _, err := tx.ExecContext(ctx, `INSERT INTO outbox (key,task_id,seq,agent_id,kind,payload,next_at,created_at,channel_id) VALUES (?,?,?,?,?,?,?,?,?) ON CONFLICT(key) DO NOTHING`,
+			r.Key, r.TaskID, r.Seq, r.AgentID, r.Kind, r.Payload, now, now, r.ChannelID); err != nil {
 			return err
 		}
 	}
@@ -454,6 +476,7 @@ func addColumns(db *sql.DB) error {
 		{"channels", "card_pinned", "INTEGER NOT NULL DEFAULT 0"},
 		{"channels", "card_pin_at", "TEXT NOT NULL DEFAULT ''"},
 		{"outbox", "first_attempt_at", "TEXT NOT NULL DEFAULT ''"},
+		{"outbox", "channel_id", "TEXT NOT NULL DEFAULT ''"},
 	} {
 		var n int
 		if err := db.QueryRow(`SELECT count(*) FROM pragma_table_info(?) WHERE name=?`, c.table, c.name).Scan(&n); err != nil {

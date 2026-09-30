@@ -7,17 +7,30 @@ import "encoding/json"
 
 // Channel types and message flags used by the bridge.
 const (
-	ChannelText     = 0
-	ChannelCategory = 4
+	ChannelText         = 0
+	ChannelDM           = 1
+	ChannelCategory     = 4
+	ChannelPublicThread = 11
 
 	FlagEphemeral = 1 << 6
 )
 
-// Gateway intents: guild channel events, guild messages and their content.
+// Gateway intents: guild channel events, guild messages and their content,
+// and direct messages to the bot (not privileged; used only by the owner
+// helper conversation, docs/discord-helper-chat.md).
 const (
 	IntentGuilds         = 1 << 0
 	IntentGuildMessages  = 1 << 9
+	IntentDirectMessages = 1 << 12
 	IntentMessageContent = 1 << 15
+)
+
+// Interaction contexts and application integration types.
+const (
+	ContextGuild = 0
+	ContextBotDM = 1
+
+	IntegrationGuildInstall = 0
 )
 
 // Interaction and response types.
@@ -157,6 +170,13 @@ type CreateChannel struct {
 	ParentID string `json:"parent_id,omitempty"`
 }
 
+// StartThread starts a thread from an existing message; the thread's ID is
+// the starter message's ID.
+type StartThread struct {
+	Name                string `json:"name"`
+	AutoArchiveDuration int    `json:"auto_archive_duration,omitempty"`
+}
+
 type ModifyChannel struct {
 	Name     *string `json:"name,omitempty"`
 	Topic    *string `json:"topic,omitempty"`
@@ -179,6 +199,10 @@ type Command struct {
 	Name        string          `json:"name"`
 	Description string          `json:"description"`
 	Options     []CommandOption `json:"options,omitempty"`
+	// Contexts and IntegrationTypes are set only on global commands; guild
+	// commands leave them out, so their JSON is unchanged.
+	Contexts         []int `json:"contexts,omitempty"`
+	IntegrationTypes []int `json:"integration_types,omitempty"`
 }
 
 type InteractionOption struct {
@@ -213,6 +237,8 @@ type Interaction struct {
 	User          *User           `json:"user,omitempty"`
 	Token         string          `json:"token"`
 	Message       *Message        `json:"message,omitempty"`
+	// Context is where the command ran: ContextGuild or ContextBotDM.
+	Context int `json:"context,omitempty"`
 }
 
 // UserID is the invoking user, in a guild (Member) or a DM (User).
