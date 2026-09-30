@@ -940,3 +940,31 @@ func TestTeamRunnerClaimRaceConflictArmWaits(t *testing.T) {
 		t.Fatalf("arm wait changed the entry %+v %v", after, err)
 	}
 }
+
+// q2: a runner pass reads only each project's active entries, however much
+// history the project has.
+func TestTeamRunnerTickReadsActiveEntries(t *testing.T) {
+	f := newTeamFixture(t, true)
+	ctx := context.Background()
+	insertFinishedQueueRows(t, f, 1, 3)
+	q, err := f.c.TeamQueueAction(ctx, f.task.ID, api.TeamQueueRequest{RequestID: "active-queue", Operation: "add", ItemID: f.item.ID, OrderMessageSeq: f.order, Host: "fixture", Cwd: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	e, c, queries := recordTeamQueueListings(t, f)
+	if err := queueCorrectionRunner(t, f, 1).tick(ctx, e, c, "fixture"); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := f.c.GetTeamQueueEntry(ctx, f.task.ID, q.ID); err != nil || got.State != "running" {
+		t.Fatalf("entry after tick %+v %v", got.State, err)
+	}
+	got := queries()
+	if len(got) < 3 {
+		t.Fatalf("tick, claim and launch should each read the queue: %v", got)
+	}
+	for _, query := range got {
+		if query != "view=active" {
+			t.Fatalf("runner listing query %q, want view=active (all %v)", query, got)
+		}
+	}
+}

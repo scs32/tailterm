@@ -68,6 +68,14 @@ type TeamQueueEntry struct {
 	// HandlerArm is the arm assignment of the current lease under a handler
 	// arm policy (docs/handler-ab.md).
 	HandlerArm *TeamQueueHandlerArm `json:"handlerArm,omitempty"`
+
+	// Summary marks a trimmed history entry in a listing: it carries no
+	// launch, close or activities and bounded reviews, verification and
+	// release. GET .../team-queue/{entry} returns it in full.
+	Summary bool `json:"summary,omitempty"`
+	// TeamShape is "plan-review" or "plan-only", derived from the launch a
+	// summary entry no longer carries.
+	TeamShape string `json:"teamShape,omitempty"`
 }
 
 // TeamQueueOwnerIntegration is kept distinct from TeamIntegrationReady, the
@@ -123,6 +131,57 @@ type TeamQueueList struct {
 	ConcurrencyLimit int              `json:"concurrencyLimit"`
 	HostPolicy       *TeamHostPolicy  `json:"hostPolicy,omitempty"`
 	HostUsage        *TeamHostUsage   `json:"hostUsage,omitempty"`
+	// History describes the page of history entries that follows the
+	// active entries; it is absent for view=active and item listings.
+	History *TeamQueueHistoryPage `json:"history,omitempty"`
+}
+
+// TeamQueueHistoryPage is one newest-first page of finished and released
+// failed entries. NextAfter, when set, is the after cursor of the next page.
+type TeamQueueHistoryPage struct {
+	Total     int   `json:"total"`
+	Limit     int   `json:"limit"`
+	NextAfter int64 `json:"nextAfter,omitempty"`
+}
+
+// TeamQueueViewActive lists only the entries that are not history.
+const TeamQueueViewActive = "active"
+
+// DefaultTeamQueueHistoryLimit is the history page size when none is given.
+const DefaultTeamQueueHistoryLimit = 50
+
+// TeamQueueListOptions selects a team queue listing. The zero value is the
+// default: active entries in full, then one page of history summaries.
+type TeamQueueListOptions struct {
+	// View is "" (default) or TeamQueueViewActive.
+	View string
+	// Item returns only that item's entry, in any state and in full.
+	Item string
+	// Limit is the history page size, 1..MaxLimit; 0 means the default.
+	Limit int
+	// After returns history entries with a lower position.
+	After int64
+}
+
+// Query encodes the options, omitting zero values.
+func (o TeamQueueListOptions) Query() string {
+	v := url.Values{}
+	if o.View != "" {
+		v.Set("view", o.View)
+	}
+	if o.Item != "" {
+		v.Set("item", o.Item)
+	}
+	if o.Limit != 0 {
+		v.Set("limit", strconv.Itoa(o.Limit))
+	}
+	if o.After != 0 {
+		v.Set("after", strconv.FormatInt(o.After, 10))
+	}
+	if len(v) == 0 {
+		return ""
+	}
+	return "?" + v.Encode()
 }
 
 type TeamHostPolicy struct {
@@ -268,15 +327,24 @@ type TeamQueueReleaseMember struct {
 	Name    string `json:"name"`
 }
 
-// MaxTeamQueueListResponse bounds a team queue listing. The queue keeps every
-// entry with its launch context, so a busy project's list outgrows the
-// client's default 4 MiB response cap; a truncated body then fails to parse and
-// stalls both tt team queue list and the queue runner.
+// MaxTeamQueueListResponse bounds a team queue listing. The hub trims history
+// entries to summaries and pages them, but an older hub returns every entry
+// with its launch context, which outgrows the client's default 4 MiB response
+// cap; a truncated body then fails to parse and stalls both tt team queue list
+// and the queue runner. The larger cap stays as a backstop.
 const MaxTeamQueueListResponse = 64 << 20
 
+// ListTeamQueue reads the default listing: active entries in full, then the
+// newest page of history summaries.
 func (c *Client) ListTeamQueue(ctx context.Context, task string) (TeamQueueList, error) {
+	return c.ListTeamQueuePage(ctx, task, TeamQueueListOptions{})
+}
+
+// ListTeamQueuePage reads the listing the options select. An older hub
+// ignores them and returns every entry, so callers keep filtering.
+func (c *Client) ListTeamQueuePage(ctx context.Context, task string, opts TeamQueueListOptions) (TeamQueueList, error) {
 	var out TeamQueueList
-	return out, c.doLimited(ctx, "GET", "/v1/tasks/"+url.PathEscape(task)+"/team-queue", nil, &out, MaxTeamQueueListResponse)
+	return out, c.doLimited(ctx, "GET", "/v1/tasks/"+url.PathEscape(task)+"/team-queue"+opts.Query(), nil, &out, MaxTeamQueueListResponse)
 }
 
 func (c *Client) TeamQueueAction(ctx context.Context, task string, req TeamQueueRequest) (TeamQueueEntry, error) {

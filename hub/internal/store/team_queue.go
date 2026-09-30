@@ -401,6 +401,8 @@ func scanTeamQueue(row interface{ Scan(...any) error }) (api.TeamQueueEntry, err
 	return e, nil
 }
 
+// ListTeamQueue returns every entry of the project in full. The hub uses it
+// internally; the HTTP listing is TeamQueuePage, which trims history.
 func (s *Store) ListTeamQueue(ctx context.Context, task string) (api.TeamQueueList, error) {
 	if !api.ValidID(task, "tsk") {
 		return api.TeamQueueList{}, api.ErrInvalid
@@ -410,50 +412,80 @@ func (s *Store) ListTeamQueue(ctx context.Context, task string) (api.TeamQueueLi
 	if out.ConcurrencyLimit, err = queueConcurrencyLimit(ctx, s.db, task); err != nil {
 		return out, err
 	}
-	rows, err := s.db.QueryContext(ctx, `SELECT `+teamQueueCols+` FROM team_queue_entries WHERE task_id=? ORDER BY position`, task)
-	if err != nil {
+	if out.Entries, err = s.teamQueueRows(ctx, `SELECT `+teamQueueCols+` FROM team_queue_entries WHERE task_id=? ORDER BY position`, task); err != nil {
 		return api.TeamQueueList{}, err
 	}
+	return out, s.explainTeamQueue(ctx, task, &out)
+}
+
+// teamQueueRows scans the entries a query selects.
+func (s *Store) teamQueueRows(ctx context.Context, query string, args ...any) ([]api.TeamQueueEntry, error) {
+	rows, err := s.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
 	defer rows.Close()
+	out := []api.TeamQueueEntry{}
 	for rows.Next() {
 		e, err := scanTeamQueue(rows)
 		if err != nil {
 			return out, err
 		}
-		out.Entries = append(out.Entries, e)
+		out = append(out, e)
 	}
 	if err := rows.Err(); err != nil {
 		return out, err
 	}
-	if err := rows.Close(); err != nil {
-		return out, err
+	return out, rows.Close()
+}
+
+// teamQueueRelease attaches the entry's release job, if any.
+func (s *Store) teamQueueRelease(ctx context.Context, e *api.TeamQueueEntry) error {
+	var raw string
+	err := s.db.QueryRowContext(ctx, `SELECT record_json FROM release_jobs WHERE task_id=? AND entry_id=? ORDER BY rowid DESC LIMIT 1`, e.TaskID, e.ID).Scan(&raw)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil
 	}
-	releases, err := s.Releases(ctx, task)
 	if err != nil {
-		return out, err
+		return err
 	}
-	for i := range out.Entries {
-		for j := range releases {
-			if releases[j].EntryID == out.Entries[i].ID {
-				out.Entries[i].Release = &releases[j]
-			}
-		}
+	var j api.ReleaseJob
+	if err := json.Unmarshal([]byte(raw), &j); err != nil {
+		return err
 	}
+	e.Release = &j
+	return nil
+}
+
+// enrichTeamQueueEntry attaches what a listing shows beside the row: its
+// release, reviews, verification, member activity and tokens, handler arm.
+func (s *Store) enrichTeamQueueEntry(ctx context.Context, e *api.TeamQueueEntry) error {
+	if err := s.teamQueueRelease(ctx, e); err != nil {
+		return err
+	}
+	summary, err := reviewState(ctx, s.db, e.TaskID, e.ItemID)
+	if err != nil {
+		return err
+	}
+	e.Reviews = &summary
+	if err := s.loadTeamVerification(ctx, e); err != nil {
+		return err
+	}
+	if err := s.loadTeamActivities(ctx, e); err != nil {
+		return err
+	}
+	return attachHandlerArm(ctx, s.db, e)
+}
+
+// explainTeamQueue enriches loaded entries and computes block reasons,
+// shared-checkout hints, arm waits and stalls. Those read only queued entries
+// and entries that hold resources, so history entries may be left out.
+func (s *Store) explainTeamQueue(ctx context.Context, task string, out *api.TeamQueueList) error {
+	var err error
 	activeCount := 0
 	for i, entry := range out.Entries {
-		summary, summaryErr := reviewState(ctx, s.db, out.Entries[i].TaskID, out.Entries[i].ItemID)
-		if summaryErr != nil {
-			return out, summaryErr
-		}
-		out.Entries[i].Reviews = &summary
-		if err := s.loadTeamVerification(ctx, &out.Entries[i]); err != nil {
-			return out, err
-		}
-		if err := s.loadTeamActivities(ctx, &out.Entries[i]); err != nil {
-			return out, err
-		}
-		if err := attachHandlerArm(ctx, s.db, &out.Entries[i]); err != nil {
-			return out, err
+		if err := s.enrichTeamQueueEntry(ctx, &out.Entries[i]); err != nil {
+			return err
 		}
 		if queueEntryHoldsResources(entry) {
 			activeCount++
@@ -461,7 +493,7 @@ func (s *Store) ListTeamQueue(ctx context.Context, task string) (api.TeamQueueLi
 		if entry.State == "running" && entry.Repository != "" && entry.Acceptance == nil {
 			var status string
 			if err := s.db.QueryRowContext(ctx, `SELECT status FROM work_items WHERE task_id=? AND id=?`, task, entry.ItemID).Scan(&status); err != nil {
-				return out, err
+				return err
 			}
 			if status == "done" {
 				out.Entries[i].BlockReason = "Waiting for handler acceptance"
@@ -475,7 +507,7 @@ func (s *Store) ListTeamQueue(ctx context.Context, task string) (api.TeamQueueLi
 	if parallel {
 		capacityTx, err = s.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
 		if err != nil {
-			return out, err
+			return err
 		}
 		defer capacityTx.Rollback()
 		for _, entry := range out.Entries {
@@ -484,7 +516,7 @@ func (s *Store) ListTeamQueue(ctx context.Context, task string) (api.TeamQueueLi
 			}
 		}
 		if freeHandler, err = freeQueueHandler(ctx, capacityTx, task, active); err != nil {
-			return out, err
+			return err
 		}
 	}
 	// sharedOnly lists, per queued entry, the active entries that block it
@@ -494,7 +526,7 @@ func (s *Store) ListTeamQueue(ctx context.Context, task string) (api.TeamQueueLi
 		if parallel && out.Entries[i].State == "failed" && out.Entries[i].ReleasedAt == "" {
 			live, liveErr := liveItemRuns(ctx, capacityTx, task, out.Entries[i].ItemID)
 			if liveErr != nil {
-				return out, liveErr
+				return liveErr
 			}
 			if live > 0 {
 				out.Entries[i].BlockReason = fmt.Sprintf("Failed; %d item-bound runs are still live or uncleaned", live)
@@ -558,11 +590,11 @@ func (s *Store) ListTeamQueue(ctx context.Context, task string) (api.TeamQueueLi
 			holding = append(holding, entry)
 		}
 	}
-	if err := explainArmWaits(ctx, reader, &out, holding, s.now()); err != nil {
-		return out, err
+	if err := explainArmWaits(ctx, reader, out, holding, s.now()); err != nil {
+		return err
 	}
-	if err := s.explainQueueStalls(ctx, reader, capacityTx, &out); err != nil {
-		return out, err
+	if err := s.explainQueueStalls(ctx, reader, capacityTx, out); err != nil {
+		return err
 	}
 	// A stall behind an entry that only shares the checkout keeps the move,
 	// which frees the queued entry at once; the stall notice carries it too.
@@ -578,7 +610,7 @@ func (s *Store) ListTeamQueue(ctx context.Context, task string) (api.TeamQueueLi
 			}
 		}
 	}
-	return out, nil
+	return nil
 }
 
 func sharedCheckoutHint(e api.TeamQueueEntry, active string) string {
@@ -634,6 +666,172 @@ func (s *Store) TeamQueuesByHost(ctx context.Context, host string) (api.TeamQueu
 	return out, err
 }
 
+// queueHistorySQL is the SQL form of queueEntryIsHistory.
+const queueHistorySQL = `(state='finished' OR (state='failed' AND released_at<>'' AND owner_integration_json=''))`
+
+// queueEntryIsHistory reports whether an entry is done with the queue: it is
+// finished, or failed and released without an owner integration the runner
+// must still close. History entries never block, stall or hold resources.
+func queueEntryIsHistory(e api.TeamQueueEntry) bool {
+	return e.State == "finished" || (e.State == "failed" && e.ReleasedAt != "" && e.OwnerIntegration == nil)
+}
+
+// TeamQueuePage is the team queue listing: active entries in full, in
+// position order, then one newest-first page of history summaries. View
+// active leaves history out; Item returns only that item's entry in full.
+func (s *Store) TeamQueuePage(ctx context.Context, task string, opts api.TeamQueueListOptions) (api.TeamQueueList, error) {
+	if !api.ValidID(task, "tsk") || (opts.View != "" && opts.View != api.TeamQueueViewActive) || (opts.Item != "" && !api.ValidID(opts.Item, "wi")) || opts.Limit < 0 || opts.Limit > api.MaxLimit || opts.After < 0 {
+		return api.TeamQueueList{}, api.ErrInvalid
+	}
+	out := api.TeamQueueList{Entries: []api.TeamQueueEntry{}}
+	var err error
+	if out.ConcurrencyLimit, err = queueConcurrencyLimit(ctx, s.db, task); err != nil {
+		return out, err
+	}
+	if opts.Item != "" {
+		rows, err := s.teamQueueRows(ctx, `SELECT `+teamQueueCols+` FROM team_queue_entries WHERE task_id=? AND item_id=?`, task, opts.Item)
+		if err != nil || len(rows) == 0 {
+			return out, err
+		}
+		if queueEntryIsHistory(rows[0]) {
+			out.Entries = rows[:1]
+			return out, s.enrichTeamQueueEntry(ctx, &out.Entries[0])
+		}
+	}
+	if out.Entries, err = s.teamQueueRows(ctx, `SELECT `+teamQueueCols+` FROM team_queue_entries WHERE task_id=? AND NOT `+queueHistorySQL+` ORDER BY position`, task); err != nil {
+		return api.TeamQueueList{}, err
+	}
+	if err := s.explainTeamQueue(ctx, task, &out); err != nil {
+		return out, err
+	}
+	if opts.Item != "" {
+		// The whole active queue explains the entry's blockers; return only it.
+		kept := []api.TeamQueueEntry{}
+		for _, e := range out.Entries {
+			if e.ItemID == opts.Item {
+				kept = append(kept, e)
+			}
+		}
+		out.Entries = kept
+		return out, nil
+	}
+	if opts.View == api.TeamQueueViewActive {
+		return out, nil
+	}
+	limit := opts.Limit
+	if limit == 0 {
+		limit = api.DefaultTeamQueueHistoryLimit
+	}
+	page := &api.TeamQueueHistoryPage{Limit: limit}
+	if err := s.db.QueryRowContext(ctx, `SELECT count(*) FROM team_queue_entries WHERE task_id=? AND `+queueHistorySQL, task).Scan(&page.Total); err != nil {
+		return out, err
+	}
+	// Positions of non-queued entries never change, so a position cursor is
+	// stable while entries finish between pages.
+	history, err := s.teamQueueRows(ctx, `SELECT `+teamQueueCols+` FROM team_queue_entries WHERE task_id=? AND `+queueHistorySQL+` AND (?=0 OR position<?) ORDER BY position DESC LIMIT ?`, task, opts.After, opts.After, limit+1)
+	if err != nil {
+		return out, err
+	}
+	if len(history) > limit {
+		history = history[:limit]
+		page.NextAfter = history[limit-1].Position
+	}
+	for i := range history {
+		if err := s.enrichTeamQueueEntry(ctx, &history[i]); err != nil {
+			return out, err
+		}
+		out.Entries = append(out.Entries, summarizeTeamQueueEntry(history[i]))
+	}
+	out.History = page
+	return out, nil
+}
+
+// Summary bounds for a history entry in a listing.
+const (
+	summaryTitleBytes    = 200
+	summaryEvidenceBytes = 500
+	summaryChangedFiles  = 20
+)
+
+// teamShape reads the team shape from a frozen launch: a plan review team
+// when a member has the Plan review role, else a plan-only team.
+func teamShape(launch json.RawMessage) string {
+	if len(launch) == 0 {
+		return ""
+	}
+	var l struct {
+		Members []struct {
+			Fields struct {
+				Role string `json:"role"`
+			} `json:"fields"`
+		} `json:"members"`
+	}
+	if json.Unmarshal(launch, &l) != nil || len(l.Members) == 0 {
+		return ""
+	}
+	for _, m := range l.Members {
+		if m.Fields.Role == "Plan review" {
+			return "plan-review"
+		}
+	}
+	return "plan-only"
+}
+
+// summarizeTeamQueueEntry trims a history entry for a listing: no launch,
+// close or activities, and reviews, verification, release and evidence cut
+// to what the Delivery view and tt show. Tokens and identity stay.
+func summarizeTeamQueueEntry(e api.TeamQueueEntry) api.TeamQueueEntry {
+	e.Summary = true
+	e.TeamShape = teamShape(e.LaunchJSON)
+	e.LaunchJSON, e.CloseJSON, e.Activities = nil, nil, nil
+	if r := e.Reviews; r != nil {
+		sum := api.ReviewConvergence{ItemID: r.ItemID, History: r.History, Disposition: r.Disposition, Scopes: []api.ReviewScope{}, Rounds: make([]api.ReviewRound, 0, len(r.Rounds)), FollowUps: make([]api.ReviewFollowUp, 0, len(r.FollowUps)), Focused: []api.FocusedReview{}}
+		for _, round := range r.Rounds {
+			round.Findings, round.Criteria, round.VerificationCriteria, round.Blockers = nil, nil, nil, nil
+			sum.Rounds = append(sum.Rounds, round)
+		}
+		for _, f := range r.FollowUps {
+			sum.FollowUps = append(sum.FollowUps, api.ReviewFollowUp{ItemID: f.ItemID, MessageSeq: f.MessageSeq, Finding: api.ReviewFinding{ID: f.Finding.ID, Title: clip(f.Finding.Title, summaryTitleBytes)}})
+		}
+		e.Reviews = &sum
+	}
+	if v := e.Verification; v != nil {
+		sum := api.VerificationSummary{State: v.State, Commit: v.Commit}
+		for _, c := range v.Checks {
+			if c.Status != "pass" || c.KnownFailure || c.NowPassing {
+				sum.Checks = append(sum.Checks, c)
+			}
+		}
+		e.Verification = &sum
+	}
+	if r := e.Release; r != nil {
+		sum := *r
+		sum.Plan = api.VerificationPlan{}
+		sum.IntegratedPlan, sum.IntegratedVerification, sum.Reconciliations = nil, nil, nil
+		e.Release = &sum
+	}
+	if a := e.Acceptance; a != nil {
+		sum := *a
+		sum.Evidence = clip(sum.Evidence, summaryEvidenceBytes)
+		sum.ResolvedKnownFailures = nil
+		e.Acceptance = &sum
+	}
+	if i := e.Integration; i != nil {
+		sum := *i
+		sum.Evidence = clip(sum.Evidence, summaryEvidenceBytes)
+		e.Integration = &sum
+	}
+	if o := e.OwnerIntegration; o != nil {
+		sum := *o
+		sum.Evidence = clip(sum.Evidence, summaryEvidenceBytes)
+		if len(sum.ChangedFiles) > summaryChangedFiles {
+			sum.ChangedFiles = sum.ChangedFiles[:summaryChangedFiles]
+		}
+		e.OwnerIntegration = &sum
+	}
+	return e
+}
+
 func (s *Store) GetTeamQueueEntry(ctx context.Context, task, id string) (api.TeamQueueEntry, error) {
 	if !api.ValidID(task, "tsk") || !validTeamQueueID(id) {
 		return api.TeamQueueEntry{}, api.ErrInvalid
@@ -656,6 +854,13 @@ func (s *Store) GetTeamQueueEntry(ctx context.Context, task, id string) (api.Tea
 	}
 	if err == nil {
 		err = attachHandlerArm(ctx, s.db, &e)
+	}
+	// One entry carries at least what any listing shows for it.
+	if err == nil {
+		err = s.teamQueueRelease(ctx, &e)
+	}
+	if err == nil {
+		err = s.loadTeamActivities(ctx, &e)
 	}
 	return e, err
 }

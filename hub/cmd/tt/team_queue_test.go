@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -15,6 +16,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -834,4 +836,165 @@ func TestTeamQueueCLIScopeNewWorktreeRepairsLostMove(t *testing.T) {
 		t.Fatalf("missing unrelated checkout: %v", err)
 	}
 	requireNoQueueWorktree(t, repo, queueWorktreeFor(repo, other.ID), "missing unrelated checkout")
+}
+
+// recordTeamQueueListings fronts the fixture hub with a proxy that records
+// the query of every team queue listing request (not entry reads or actions).
+func recordTeamQueueListings(t *testing.T, f teamFixture) (env, *api.Client, func() []string) {
+	t.Helper()
+	target, err := url.Parse(f.e.hub)
+	if err != nil {
+		t.Fatal(err)
+	}
+	forward := httputil.NewSingleHostReverseProxy(target)
+	var mu sync.Mutex
+	var queries []string
+	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == "GET" && r.URL.Path == "/v1/tasks/"+f.task.ID+"/team-queue" {
+			mu.Lock()
+			queries = append(queries, r.URL.RawQuery)
+			mu.Unlock()
+		}
+		forward.ServeHTTP(w, r)
+	}))
+	t.Cleanup(proxy.Close)
+	c, err := api.NewClient(proxy.URL, 10*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	e := f.e
+	e.hub = proxy.URL
+	return e, c, func() []string {
+		mu.Lock()
+		defer mu.Unlock()
+		return append([]string(nil), queries...)
+	}
+}
+
+// insertFinishedQueueRows files n items with finished queue entries at
+// positions from..from+n-1, each carrying a 32 KiB launch.
+func insertFinishedQueueRows(t *testing.T, f teamFixture, from, n int) []api.TeamQueueEntry {
+	t.Helper()
+	db, err := sql.Open("sqlite", f.dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	launch := `{"members":[{"fields":{"name":"lead","role":"lead"}}],"pad":"` + strings.Repeat("x", 32<<10) + `"}`
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	out := make([]api.TeamQueueEntry, 0, n)
+	for i := 0; i < n; i++ {
+		item, err := f.st.CreateWorkItem(context.Background(), f.task.ID, api.CreateWorkItemRequest{Kind: "bug", Title: "finished fixture", RequestID: api.NewID("req")}, api.Caller{Node: "team-fixture", User: "owner"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		id := api.NewID("tqe")
+		if _, err := db.Exec(`INSERT INTO team_queue_entries(id,task_id,item_id,item_revision,order_seq,template,position,state,revision,host,cwd,launch_json,created_at,updated_at) VALUES(?,?,?,?,1,'planned',?,'finished',3,'fixture','/tmp',?,?,?)`, id, f.task.ID, item.ID, item.Revision, from+i, launch, now, now); err != nil {
+			t.Fatal(err)
+		}
+		out = append(out, api.TeamQueueEntry{ID: id, ItemID: item.ID, Position: int64(from + i)})
+	}
+	return out
+}
+
+// q2: tt team queue add reads only the active entries.
+func TestTeamQueueCLIAddReadsActiveEntries(t *testing.T) {
+	f := newTeamFixture(t, true)
+	insertFinishedQueueRows(t, f, 1, 3)
+	e, _, queries := recordTeamQueueListings(t, f)
+	if _, err := captureCLIOutput(t, func() error {
+		return cmdTeamQueue(e, []string{"add", "--item", f.item.ID, "--order", fmt.Sprint(f.order), "--cwd", t.TempDir()})
+	}); err != nil {
+		t.Fatal(err)
+	}
+	got := queries()
+	if len(got) == 0 {
+		t.Fatal("add read no listing")
+	}
+	for _, q := range got {
+		if q != "view=active" {
+			t.Fatalf("add listing query %q, want view=active (all %v)", q, got)
+		}
+	}
+}
+
+// q3: tt team queue list shows the newest history page and how to read
+// older pages and one entry in full.
+func TestTeamQueueCLIListPagesHistory(t *testing.T) {
+	f := newTeamFixture(t, true)
+	history := insertFinishedQueueRows(t, f, 1, 5)
+	e, _, queries := recordTeamQueueListings(t, f)
+	out, err := captureCLIOutput(t, func() error { return cmdTeamQueue(e, []string{"list", "--limit", "2"}) })
+	if err != nil {
+		t.Fatal(err)
+	}
+	older := fmt.Sprintf("older: tt team queue list --task %s --limit 2 --after 4", f.task.ID)
+	if !strings.Contains(out, "history: showing 2 of 5") || !strings.Contains(out, older) || !strings.Contains(out, history[4].ID) || strings.Contains(out, history[2].ID) {
+		t.Fatalf("first page:\n%s", out)
+	}
+	out, err = captureCLIOutput(t, func() error { return cmdTeamQueue(e, []string{"list", "--limit", "2", "--after", "4"}) })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out, "history: showing 2 of 5") || !strings.Contains(out, "--after 2") || !strings.Contains(out, history[2].ID) || strings.Contains(out, history[4].ID) {
+		t.Fatalf("second page:\n%s", out)
+	}
+	out, err = captureCLIOutput(t, func() error { return cmdTeamQueue(e, []string{"list", "--limit", "2", "--after", "2"}) })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out, "history: showing 1 of 5") || strings.Contains(out, "older:") || !strings.Contains(out, history[0].ID) {
+		t.Fatalf("last page:\n%s", out)
+	}
+	out, err = captureCLIOutput(t, func() error { return cmdTeamQueue(e, []string{"list", "--item", history[0].ItemID, "--json"}) })
+	if err != nil {
+		t.Fatal(err)
+	}
+	var one api.TeamQueueList
+	if err := json.Unmarshal([]byte(out), &one); err != nil || len(one.Entries) != 1 || one.Entries[0].Summary || len(one.Entries[0].LaunchJSON) < 32<<10 {
+		t.Fatalf("item listing %v: %.300s", err, out)
+	}
+	want := []string{"limit=2", "after=4&limit=2", "after=2&limit=2", "item=" + history[0].ItemID}
+	if got := queries(); strings.Join(got, " ") != strings.Join(want, " ") {
+		t.Fatalf("queries %v, want %v", got, want)
+	}
+	for _, bad := range [][]string{{"list", "--limit", "0"}, {"list", "--limit", "201"}, {"list", "--active", "--after", "2"}, {"list", "--item", "tqe_x"}} {
+		if _, err := captureCLIOutput(t, func() error { return cmdTeamQueue(e, bad) }); err == nil || !strings.Contains(err.Error(), "usage:") {
+			t.Fatalf("%v: %v", bad, err)
+		}
+	}
+}
+
+// q2: a retried done-save finds its accepted entry by item even after it
+// finished and newer history pushed it off the default page.
+func TestPendingQueueAcceptanceFindsFinishedEntryByItem(t *testing.T) {
+	f := newTeamFixture(t, true)
+	accepted := insertFinishedQueueRows(t, f, 1, 1)[0]
+	db, err := sql.Open("sqlite", f.dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	acceptance := `{"repository":"repo","baseCommit":"base","worktree":"/w","branch":"b","commit":"abc","itemRevision":2,"evidence":"saved","acceptedAt":"2026-09-30T00:00:00Z"}`
+	if _, err := db.Exec(`UPDATE team_queue_entries SET repository='repo',handler_id=?,handler_run_id=?,acceptance_json=? WHERE id=?`, f.handler.ID, f.handler.RunID, acceptance, accepted.ID); err != nil {
+		t.Fatal(err)
+	}
+	insertFinishedQueueRows(t, f, 2, api.DefaultTeamQueueHistoryLimit+5)
+	if list, err := f.c.ListTeamQueue(context.Background(), f.task.ID); err != nil || len(list.Entries) != api.DefaultTeamQueueHistoryLimit {
+		t.Fatalf("default page %d entries %v", len(list.Entries), err)
+	} else {
+		for _, q := range list.Entries {
+			if q.ID == accepted.ID {
+				t.Fatal("the fixture's accepted entry is still on the default page")
+			}
+		}
+	}
+	_, c, queries := recordTeamQueueListings(t, f)
+	got, err := pendingQueueAcceptance(context.Background(), c, f.task.ID, accepted.ItemID, f.handler.ID, f.handler.RunID)
+	if err != nil || got == nil || got.ID != accepted.ID || got.Acceptance == nil || got.Acceptance.Commit != "abc" || got.State != "finished" {
+		t.Fatalf("pending acceptance %+v %v", got, err)
+	}
+	if q := queries(); len(q) != 1 || q[0] != "item="+accepted.ItemID {
+		t.Fatalf("queries %v", q)
+	}
 }

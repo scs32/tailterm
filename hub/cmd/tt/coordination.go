@@ -323,7 +323,7 @@ func cmdBrief(e env) error {
 		}
 	}
 	if itemID != "" {
-		queue, queueErr := c.ListTeamQueue(ctx, e.task)
+		queue, queueErr := c.ListTeamQueuePage(ctx, e.task, api.TeamQueueListOptions{Item: itemID})
 		if queueErr != nil {
 			return queueErr
 		}

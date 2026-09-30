@@ -345,7 +345,8 @@ func cmdWorkItemUpdate(e env, args []string) error {
 // leased to this exact handler run: the running entry that waits on its
 // acceptance, else one it has already accepted (a retried save), else nil.
 func pendingQueueAcceptance(ctx context.Context, c *api.Client, project, item, agent, run string) (*api.TeamQueueEntry, error) {
-	list, err := c.ListTeamQueue(ctx, project)
+	// The item's own entry in any state; an older hub returns every entry.
+	list, err := c.ListTeamQueuePage(ctx, project, api.TeamQueueListOptions{Item: item})
 	if err != nil {
 		return nil, err
 	}

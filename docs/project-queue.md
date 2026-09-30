@@ -644,3 +644,67 @@ When a queued entry that only shares a checkout waits behind a stalled active
 entry, its `Stalled:` reason, and the stall notice posted to the Board, ends
 with `Or: Shares checkout DIR with active entry tqe_A; move it: ...`, since
 moving frees it at once.
+
+## Team queue listing
+
+`GET /v1/tasks/{id}/team-queue` returns the project's active entries in full,
+in position order, followed by one newest-first page of history entries as
+summaries (wi_f6c458bfb60667c6). The queue keeps every entry, so a listing
+that carried each one's launch context grew past 4 MiB on 2026-09-30 and
+stalled `tt team queue list` and the queue runner.
+
+A history entry is `finished`, or `failed` and released with no owner
+integration. Every other entry is active: `queued`, `launching`, `running`, a
+failed entry that is not released, and a failed entry the owner recorded as
+integrated, whose team the runner still closes. Block reasons, `blockedBy`,
+stalls and arm waits read only active entries, so they are unchanged.
+
+A history summary has `summary: true` and carries no `launch`, `close` or
+`activities`; `tokens` stays. `teamShape` (`plan-review` or `plan-only`)
+replaces the launch the Delivery view read its shape from. `reviews` keeps its
+history, disposition and each round's number, sequences, candidate, reviewer
+and verdicts, without findings, blockers or criteria; `scopes` and `focused`
+are empty; follow-ups keep their item, message and finding ID and a title of
+at most 200 bytes. `verification` keeps its state, commit and only the checks
+that did not pass, are known failures or now pass. `release` keeps its ID,
+state, commits, digest, receipt, supersession and `published`, and drops
+`integratedPlan`, `integratedVerification` and `reconciliations`; `plan` is
+emitted as a zero object because the release type always carries it (read the
+full job from `GET /v1/tasks/{id}/releases`). Acceptance, integration and
+owner-integration evidence is cut to 500 bytes, owner-integration
+`changedFiles` to the first 20, and acceptance `resolvedKnownFailures` is
+left out. A summary stays under 8 KiB; 200 of them stay under 256 KiB.
+
+Query parameters, all optional; anything else is a 400:
+
+| Parameter | Meaning |
+|---|---|
+| `view=active` | active entries only; no history and no `history` object |
+| `item=wi_ID` | only that item's entry (0 or 1), in any state and in full |
+| `limit=N` | history page size, 1 to 200; default 50 |
+| `after=P` | history entries below position `P` |
+
+The `history` object gives `total` history entries, the page `limit` and, when
+older entries remain, `nextAfter`, the `after` for the next page. Positions of
+entries that have left `queued` never change, so the cursor is stable while
+entries finish between pages.
+
+`GET /v1/tasks/{id}/team-queue/{entry}` returns one entry in full, now with
+its release and member activities too, as does `item=`. The runner and
+`tt team queue add` read `view=active`; the done-save acceptance check and
+the briefing's handler lookup read `item=`. `tt team queue list` takes
+`--active`, `--limit N`, `--after P` and `--item wi_ID`, and after the entries
+prints `history: showing N of TOTAL` and, when older entries remain, the
+`older:` command for the next page. The Delivery panel shows `Showing N of
+TOTAL finished` when older entries are not listed.
+
+Compatibility: no schema change or migration; rollback is a binary swap. An
+older tt, bridge or TailOS on this hub gets the default listing: active
+entries in full, as before, then the newest 50 history summaries. The old
+runner acts only on active entries, so it behaves as before; an older tt
+looking for an accepted entry that has left the newest 50 misses it until tt
+is released, and an older TailOS drops the plan-review label from finished
+rows. A newer client on an older hub gets every entry in full, since the hub
+ignores the parameters; every caller still filters by state or item, so the
+results are correct, and the client's 64 MiB listing cap
+(`api.MaxTeamQueueListResponse`) remains the backstop.

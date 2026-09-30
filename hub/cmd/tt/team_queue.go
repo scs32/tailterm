@@ -139,7 +139,9 @@ func cmdTeamQueue(e env, args []string) error {
 	cwd := fs.String("cwd", "", "absolute project folder for launch host")
 	var ownership ownershipFlags
 	fs.Var(&ownership, "owns", "repository-relative owned file or directory (repeatable)")
-	limit := fs.String("limit", "", "project concurrency limit: none (no fixed cap), 1 (serial) or N")
+	limit := fs.String("limit", "", "limit: project concurrency limit, none (no fixed cap), 1 (serial) or N; list: history page size 1..200")
+	after := fs.Int64("after", 0, "list: history entries older than this position (the previous page's older cursor)")
+	activeOnly := fs.Bool("active", false, "list: active entries only, no history")
 	minFreeDisk := fs.Int64("min-free-disk-mib", 0, "free-disk reserve for new parallel teams in MiB (0: default 8192)")
 	newWorktree := fs.Bool("new-worktree", false, "add, scope: create the entry's own detached worktree under .build/worktrees (scope: at its frozen base)")
 	noNewWorktree := fs.Bool("no-new-worktree", false, "add: use the current checkout in a parallel project")
@@ -168,7 +170,24 @@ func cmdTeamQueue(e env, args []string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	if sub == "list" {
-		list, err := c.ListTeamQueue(ctx, *task)
+		opts := api.TeamQueueListOptions{After: *after, Item: *item}
+		if *item != "" && (!api.ValidID(*item, "wi") || *activeOnly || *after != 0 || *limit != "") {
+			return errors.New("usage: tt team queue list --item wi_ID prints that item's entry in full")
+		}
+		if *activeOnly {
+			opts.View = api.TeamQueueViewActive
+		}
+		if *limit != "" {
+			n, convErr := strconv.Atoi(*limit)
+			if convErr != nil || n < 1 || n > api.MaxLimit {
+				return fmt.Errorf("usage: tt team queue list [--active | --item wi_ID] [--limit 1..%d] [--after POSITION] [--json]", api.MaxLimit)
+			}
+			opts.Limit = n
+		}
+		if *after < 0 || (*activeOnly && (*after != 0 || *limit != "")) {
+			return fmt.Errorf("usage: tt team queue list [--active | --item wi_ID] [--limit 1..%d] [--after POSITION] [--json]", api.MaxLimit)
+		}
+		list, err := c.ListTeamQueuePage(ctx, *task, opts)
 		if err != nil {
 			return err
 		}
@@ -210,6 +229,18 @@ func cmdTeamQueue(e env, args []string) error {
 				fmt.Printf("  Ready to integrate: base=%s worktree=%s branch=%s commit=%s evidence=%s\n", q.Integration.BaseCommit, q.Integration.Worktree, q.Integration.Branch, q.Integration.Commit, q.Integration.Evidence)
 			} else if q.Acceptance != nil {
 				fmt.Printf("  Accepted for integration: worktree=%s branch=%s commit=%s; waiting for exact cleanup\n", q.Acceptance.Worktree, q.Acceptance.Branch, q.Acceptance.Commit)
+			}
+		}
+		if h := list.History; h != nil {
+			shown := 0
+			for _, q := range list.Entries {
+				if q.Summary {
+					shown++
+				}
+			}
+			fmt.Printf("history: showing %d of %d (newest first; full entry: tt team queue list --task %s --item wi_ID)\n", shown, h.Total, *task)
+			if h.NextAfter > 0 {
+				fmt.Printf("older: tt team queue list --task %s --limit %d --after %d\n", *task, h.Limit, h.NextAfter)
 			}
 		}
 		return nil
@@ -255,7 +286,7 @@ func cmdTeamQueue(e env, args []string) error {
 		if *serial && len(ownership) > 0 {
 			return errors.New("--serial declares no ownership; pass either --owns or --serial")
 		}
-		list, listErr := c.ListTeamQueue(ctx, *task)
+		list, listErr := c.ListTeamQueuePage(ctx, *task, api.TeamQueueListOptions{View: api.TeamQueueViewActive})
 		if listErr != nil {
 			return listErr
 		}

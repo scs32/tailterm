@@ -158,7 +158,7 @@ func (r teamRunner) tick(ctx context.Context, e env, c *api.Client, host string)
 	}
 	var projectErrors []error
 	for _, taskID := range projects {
-		queue, err := c.ListTeamQueue(ctx, taskID)
+		queue, err := c.ListTeamQueuePage(ctx, taskID, api.TeamQueueListOptions{View: api.TeamQueueViewActive})
 		if err != nil {
 			projectErrors = append(projectErrors, fmt.Errorf("team queue project %s: %w", taskID, err))
 			continue
@@ -225,7 +225,7 @@ func (r teamRunner) advance(ctx context.Context, e env, c *api.Client, q api.Tea
 		return nil
 	}
 	if q.State == "queued" {
-		queue, err := c.ListTeamQueue(ctx, q.TaskID)
+		queue, err := c.ListTeamQueuePage(ctx, q.TaskID, api.TeamQueueListOptions{View: api.TeamQueueViewActive})
 		if err != nil {
 			return err
 		}
@@ -431,7 +431,7 @@ func (r teamRunner) launch(ctx context.Context, e env, c *api.Client, q api.Team
 	if q.Host != host {
 		return nil
 	}
-	queueState, err := c.ListTeamQueue(ctx, q.TaskID)
+	queueState, err := c.ListTeamQueuePage(ctx, q.TaskID, api.TeamQueueListOptions{View: api.TeamQueueViewActive})
 	if err != nil {
 		return err
 	}

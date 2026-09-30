@@ -37,3 +37,31 @@ test("the frozen launch shows a plan review team or a plan-only team", () => {
   const queued = row({ state: "queued" });
   assert.ok(!queued.includes("Plan review team") && !queued.includes("Plan-only team"));
 });
+
+// wi_f6c458bfb60667c6: finished entries arrive as hub summaries without their
+// launch; the row reads the team shape and summaries from the summary fields.
+test("a finished summary entry renders its shape, reviews, verification and release", () => {
+  const html = renderTeamDelivery({ entries: [{
+    itemId: "wi_summary", state: "finished", summary: true, teamShape: "plan-review", tokens: { total: 7 },
+    reviews: { history: "recorded", rounds: [{ number: 1 }, { number: 2 }], followUps: [{ itemId: "wi_follow", finding: { id: "F1", title: "Short title" } }], scopes: [], focused: [], disposition: { kind: "accepted" } },
+    verification: { state: "passing", commit: "c".repeat(40), checks: [{ id: "a3", status: "fail", knownFailure: true }] },
+    acceptance: { branch: "fix/summary", commit: "a".repeat(40) },
+    release: { id: "rel_summary", state: "released", verificationDigest: "d".repeat(64), plan: {}, receipt: { outcome: "released", targets: [{ target: "hub", outcome: "deployed", release: "r1" }] } },
+  }] });
+  assert.match(html, /finished · Plan review team/);
+  assert.match(html, /Reviews 2\/2 · Follow-ups 1 · accepted/);
+  assert.match(html, /wi_follow: Short title/);
+  assert.match(html, /Verification passing · a3: fail · known failure/);
+  assert.match(html, /Accepted → verified → merged → released · released · job rel_summary/);
+  assert.ok(!html.includes("activity"));
+  const planOnly = renderTeamDelivery({ entries: [{ itemId: "wi_bug", state: "finished", summary: true, teamShape: "plan-only" }] });
+  assert.match(planOnly, /finished · Plan-only team/);
+});
+
+test("the panel says when older finished entries are not shown", () => {
+  const entries = [{ itemId: "wi_running", state: "running" }, ...Array.from({ length: 50 }, (_, i) => ({ itemId: `wi_done${i}`, state: "finished", summary: true }))];
+  const paged = renderTeamDelivery({ entries, history: { total: 120, limit: 50, nextAfter: 70 } });
+  assert.match(paged, /Showing 50 of 120 finished/);
+  const whole = renderTeamDelivery({ entries, history: { total: 50, limit: 50 } });
+  assert.ok(!whole.includes("Showing"));
+});

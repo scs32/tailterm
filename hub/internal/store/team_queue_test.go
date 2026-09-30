@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -776,5 +777,332 @@ func TestTeamQueueStalledSharedCheckoutKeepsMoveHint(t *testing.T) {
 	}
 	if !found {
 		t.Fatal("stall notice lacks the move hint")
+	}
+}
+
+// paddedLaunch is a frozen launch JSON of about size bytes whose second
+// member has the given role.
+func paddedLaunch(size int, role string) []byte {
+	head := fmt.Sprintf(`{"members":[{"fields":{"name":"lead","role":"Delivery lead and orchestrator"}},{"fields":{"name":"second","role":%q}}],"pad":"`, role)
+	return []byte(head + strings.Repeat("x", max(size-len(head)-2, 0)) + `"}`)
+}
+
+// insertHistoryEntries adds n work items, each with a finished queue entry
+// at positions from..from+n-1 carrying the given launch and close JSON.
+func insertHistoryEntries(t *testing.T, s *Store, task api.Task, from, n int, launch, closeJSON []byte) []api.TeamQueueEntry {
+	t.Helper()
+	ctx := context.Background()
+	by := api.Caller{Node: "fixture", User: "owner"}
+	out := make([]api.TeamQueueEntry, 0, n)
+	for i := 0; i < n; i++ {
+		item, err := s.CreateWorkItem(ctx, task.ID, api.CreateWorkItemRequest{Kind: "bug", Title: "Finished work", Priority: "normal", RequestID: api.NewID("req")}, by)
+		if err != nil {
+			t.Fatal(err)
+		}
+		id, now := api.NewID("tqe"), ts(s.now())
+		if _, err := s.db.Exec(`INSERT INTO team_queue_entries(id,task_id,item_id,item_revision,order_seq,template,position,state,revision,host,cwd,launch_json,close_json,created_at,updated_at) VALUES(?,?,?,?,1,'planned',?,'finished',3,'mini','/tmp',?,?,?,?)`, id, task.ID, item.ID, item.Revision, from+i, string(launch), string(closeJSON), now, now); err != nil {
+			t.Fatal(err)
+		}
+		out = append(out, api.TeamQueueEntry{ID: id, ItemID: item.ID, Position: int64(from + i)})
+	}
+	return out
+}
+
+// q1, q4: finished entries with large launch contexts cost a small fixed
+// amount in the listing; one entry still reads in full.
+func TestTeamQueueListingStaysWithinBudget(t *testing.T) {
+	s, task, items, orders := queueFixture(t)
+	ctx := context.Background()
+	launch, closeJSON := paddedLaunch(64<<10, "Plan review"), []byte(`{"pad":"`+strings.Repeat("c", 16<<10)+`"}`)
+	history := insertHistoryEntries(t, s, task, 1, 200, launch, closeJSON)
+	running := api.NewID("tqe")
+	if _, err := s.db.Exec(`INSERT INTO team_queue_entries(id,task_id,item_id,item_revision,order_seq,template,position,state,revision,host,cwd,launch_json,created_at,updated_at) VALUES(?,?,?,?,?,'planned',201,'running',2,'mini','/tmp',?,?,?)`, running, task.ID, items[0].ID, items[0].Revision, orders[0].Seq, string(launch), ts(s.now()), ts(s.now())); err != nil {
+		t.Fatal(err)
+	}
+	queued, err := s.TeamQueueAction(ctx, task.ID, api.TeamQueueRequest{RequestID: "add-queued", Operation: "add", ItemID: items[1].ID, OrderMessageSeq: orders[1].Seq, Host: "mini", Cwd: "/tmp"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range []struct {
+		opts api.TeamQueueListOptions
+		want int
+	}{{api.TeamQueueListOptions{}, api.DefaultTeamQueueHistoryLimit}, {api.TeamQueueListOptions{Limit: 200}, 200}} {
+		list, err := s.TeamQueuePage(ctx, task.ID, c.opts)
+		if err != nil {
+			t.Fatal(err)
+		}
+		raw, err := json.Marshal(list)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(raw) >= 256<<10 {
+			t.Fatalf("limit %d listing is %d bytes, budget 256 KiB", c.opts.Limit, len(raw))
+		}
+		if len(list.Entries) != 2+c.want || list.Entries[0].ID != running || list.Entries[1].ID != queued.ID {
+			t.Fatalf("limit %d: %d entries, active first %s %s", c.opts.Limit, len(list.Entries), list.Entries[0].ID, list.Entries[1].ID)
+		}
+		if string(list.Entries[0].LaunchJSON) != string(launch) || list.Entries[0].Summary {
+			t.Fatal("the running entry's launch was trimmed")
+		}
+		if list.History == nil || list.History.Total != 200 || list.History.Limit != c.want {
+			t.Fatalf("history %+v", list.History)
+		}
+		for i, e := range list.Entries[2:] {
+			if e.ID != history[199-i].ID || !e.Summary || len(e.LaunchJSON) != 0 || len(e.CloseJSON) != 0 || e.Activities != nil || e.TeamShape != "plan-review" {
+				t.Fatalf("history entry %d: id %s summary %v launch %d close %d activities %v shape %q", i, e.ID, e.Summary, len(e.LaunchJSON), len(e.CloseJSON), e.Activities, e.TeamShape)
+			}
+		}
+		t.Logf("limit %d: %d bytes", c.opts.Limit, len(raw))
+	}
+	full, err := s.GetTeamQueueEntry(ctx, task.ID, history[0].ID)
+	if err != nil || string(full.LaunchJSON) != string(launch) || string(full.CloseJSON) != string(closeJSON) || full.Summary {
+		t.Fatalf("full entry: launch %d close %d summary %v %v", len(full.LaunchJSON), len(full.CloseJSON), full.Summary, err)
+	}
+	// The unpaged internal listing is what outgrew the 4 MiB client cap.
+	all, err := s.ListTeamQueue(ctx, task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if raw, _ := json.Marshal(all); len(raw) < 4<<20 {
+		t.Fatalf("full listing %d bytes; the fixture no longer reproduces the incident", len(raw))
+	}
+}
+
+// q1: one history entry with every heavy field summarizes to a bounded size
+// that keeps what the Delivery view and tt read.
+func TestTeamQueueSummaryBoundsHeavyFields(t *testing.T) {
+	big := func(n int) string { return strings.Repeat("y", n) }
+	e := api.TeamQueueEntry{ID: "tqe_heavy", TaskID: "tsk_heavy", ItemID: "wi_heavy", State: "finished", Position: 7, Revision: 9, Host: "mini", Cwd: "/w", Repository: "repo", Ownership: []string{"hub/a", "hub/b"}, HandlerID: "agt_h", HandlerRunID: "run_h", HandlerLeaseGeneration: 2, ReleasedAt: "2026-09-30T00:00:00Z", Tokens: api.TokenTotals{Input: 11, Total: 42}}
+	e.LaunchJSON = paddedLaunch(1<<20, "Implementation")
+	e.CloseJSON = []byte(`{"pad":"` + big(256<<10) + `"}`)
+	for i := 0; i < 10; i++ {
+		e.Activities = append(e.Activities, api.TeamAgentActivity{AgentID: fmt.Sprint("agt_", i), RunID: "run", Name: big(64), Activity: &api.AgentActivity{State: "idle", Reason: big(1024)}})
+	}
+	reviews := api.ReviewConvergence{ItemID: e.ItemID, History: "recorded", Disposition: &api.ReviewDisposition{Kind: "accepted", Candidate: "abc", MessageSeq: 5}}
+	for r := 1; r <= 5; r++ {
+		round := api.ReviewRound{Number: r, RequestSeq: int64(100 + r), Candidate: "abc", ReviewerID: "agt_r", Criteria: map[string]string{"a1": big(2048)}, VerificationCriteria: []string{"a1"}}
+		for f := 0; f < 20; f++ {
+			round.Findings = append(round.Findings, api.ReviewFinding{ID: fmt.Sprint("F", f), Title: big(128), Description: big(4096)})
+		}
+		round.Blockers = round.Findings[:5]
+		reviews.Rounds = append(reviews.Rounds, round)
+		reviews.Scopes = append(reviews.Scopes, api.ReviewScope{ScopeRevision: int64(r), Criteria: map[string]string{"a1": big(2048)}})
+		reviews.Focused = append(reviews.Focused, api.FocusedReview{RequestSeq: int64(r), Fix: big(2048)})
+	}
+	for f := 0; f < 10; f++ {
+		reviews.FollowUps = append(reviews.FollowUps, api.ReviewFollowUp{ItemID: fmt.Sprint("wi_follow", f), MessageSeq: int64(f), Finding: api.ReviewFinding{ID: fmt.Sprint("U", f), Title: "é" + big(1024), Description: big(4096)}})
+	}
+	e.Reviews = &reviews
+	verification := api.VerificationSummary{State: "passing", Commit: "abc"}
+	for i := 0; i < 200; i++ {
+		verification.Checks = append(verification.Checks, api.VerificationCheckSummary{ID: fmt.Sprint("check-", i), Status: "pass"})
+	}
+	verification.Checks[3].Status = "fail"
+	verification.Checks[50].KnownFailure = true
+	verification.Checks[150].NowPassing = true
+	e.Verification = &verification
+	plan := api.VerificationPlan{ItemID: e.ItemID, Commit: "abc"}
+	for i := 0; i < 200; i++ {
+		plan.Checks = append(plan.Checks, api.VerificationCheck{ID: fmt.Sprint("check-", i), Argv: []string{"go", "test", big(64)}, Cwd: "/w"})
+	}
+	receipt := api.VerificationReceipt{Commit: "abc"}
+	for i := 0; i < 200; i++ {
+		receipt.Checks = append(receipt.Checks, api.VerificationResult{Status: "pass", VerificationCheck: plan.Checks[i]})
+	}
+	e.Release = &api.ReleaseJob{ID: "rel_heavy", State: "released", Commit: "abc", VerificationDigest: "d", Plan: plan, IntegratedPlan: &plan, IntegratedVerification: &receipt, Reconciliations: []api.ReleaseReconciliation{{CausalEvidence: big(4096)}}, Receipt: &api.ReleaseReceipt{JobID: "rel_heavy", Outcome: "released", Targets: []api.ReleaseTargetReceipt{{Target: "hub", Outcome: "deployed", Release: "r1"}}}}
+	e.Acceptance = &api.TeamIntegrationAcceptance{Branch: "b", Commit: "abc", Evidence: big(2000)}
+	e.Integration = &api.TeamIntegrationReady{Branch: "b", Commit: "abc", Evidence: big(2000)}
+	e.OwnerIntegration = &api.TeamQueueOwnerIntegration{Commit: "abc", Evidence: big(2000)}
+	for i := 0; i < 4096; i++ {
+		e.OwnerIntegration.ChangedFiles = append(e.OwnerIntegration.ChangedFiles, fmt.Sprintf("hub/internal/file_%04d.go", i))
+	}
+	if raw, _ := json.Marshal(e); len(raw) < 1<<20 {
+		t.Fatalf("fixture is only %d bytes", len(raw))
+	}
+	sum := summarizeTeamQueueEntry(e)
+	raw, err := json.Marshal(sum)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(raw) >= 8<<10 {
+		t.Fatalf("summary is %d bytes, budget 8 KiB: %s", len(raw), raw)
+	}
+	t.Logf("summary: %d bytes", len(raw))
+	if !sum.Summary || sum.TeamShape != "plan-only" || sum.ID != e.ID || sum.ItemID != e.ItemID || sum.State != e.State || sum.Position != e.Position || sum.Revision != e.Revision || sum.Tokens != e.Tokens || strings.Join(sum.Ownership, ",") != "hub/a,hub/b" || sum.HandlerID != e.HandlerID || sum.ReleasedAt != e.ReleasedAt {
+		t.Fatalf("identity lost: %s", raw)
+	}
+	if len(sum.LaunchJSON) != 0 || len(sum.CloseJSON) != 0 || sum.Activities != nil {
+		t.Fatal("launch, close or activities kept")
+	}
+	if r := sum.Release; r == nil || r.ID != "rel_heavy" || r.State != "released" || r.Receipt == nil || r.Receipt.Targets[0].Release != "r1" || len(r.Plan.Checks) != 0 || r.IntegratedPlan != nil || r.IntegratedVerification != nil || r.Reconciliations != nil {
+		t.Fatalf("release summary %+v", sum.Release)
+	}
+	rv := sum.Reviews
+	if rv == nil || rv.History != "recorded" || rv.Disposition == nil || rv.Disposition.Kind != "accepted" || len(rv.Rounds) != 5 || len(rv.Scopes) != 0 || len(rv.Focused) != 0 || len(rv.FollowUps) != 10 {
+		t.Fatalf("review summary %+v", rv)
+	}
+	for i, round := range rv.Rounds {
+		if round.Number != i+1 || round.Findings != nil || round.Criteria != nil || round.Blockers != nil {
+			t.Fatalf("round %d %+v", i, round)
+		}
+	}
+	for i, f := range rv.FollowUps {
+		if f.ItemID != fmt.Sprint("wi_follow", i) || len(f.Finding.Title) > summaryTitleBytes || !strings.HasPrefix(f.Finding.Title, "é") || f.Finding.Description != "" {
+			t.Fatalf("follow-up %d %+v", i, f)
+		}
+	}
+	if v := sum.Verification; v == nil || v.State != "passing" || len(v.Checks) != 3 || v.Checks[0].ID != "check-3" || v.Checks[1].ID != "check-50" || v.Checks[2].ID != "check-150" {
+		t.Fatalf("verification summary %+v", sum.Verification)
+	}
+	if len(sum.OwnerIntegration.ChangedFiles) != summaryChangedFiles || len(sum.Acceptance.Evidence) > summaryEvidenceBytes || len(sum.Integration.Evidence) > summaryEvidenceBytes || len(sum.OwnerIntegration.Evidence) > summaryEvidenceBytes {
+		t.Fatal("evidence or changed files not bounded")
+	}
+	// The source entry is untouched.
+	if len(e.Reviews.Rounds[0].Findings) != 20 || len(e.Release.Plan.Checks) != 200 || len(e.OwnerIntegration.ChangedFiles) != 4096 || len(e.Verification.Checks) != 200 {
+		t.Fatal("summarizing changed the source entry")
+	}
+}
+
+// q3: history pages newest first by a stable position cursor, behind the
+// active entries, while entries finish between pages.
+func TestTeamQueuePageHistoryPaging(t *testing.T) {
+	s, task, items, orders := queueFixture(t)
+	ctx := context.Background()
+	history := insertHistoryEntries(t, s, task, 1, 120, []byte(`{}`), nil)
+	// A released failed entry is history; an owner-integrated failed one is
+	// still active, because the runner must close its team.
+	extra := insertHistoryEntries(t, s, task, 121, 2, []byte(`{}`), nil)
+	if _, err := s.db.Exec(`UPDATE team_queue_entries SET state='failed',released_at='2026-09-30T00:00:00Z' WHERE id=?`, extra[0].ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.db.Exec(`UPDATE team_queue_entries SET state='failed',released_at='2026-09-30T00:00:00Z',owner_integration_json='{"commit":"abc","baseCommit":"def","changedFiles":[],"at":"2026-09-30T00:00:00Z"}' WHERE id=?`, extra[1].ID); err != nil {
+		t.Fatal(err)
+	}
+	history = append(history, extra[0])
+	running := api.NewID("tqe")
+	if _, err := s.db.Exec(`INSERT INTO team_queue_entries(id,task_id,item_id,item_revision,order_seq,template,position,state,revision,host,cwd,created_at,updated_at) VALUES(?,?,?,?,?,'planned',123,'running',2,'mini','/tmp',?,?)`, running, task.ID, items[0].ID, items[0].Revision, orders[0].Seq, ts(s.now()), ts(s.now())); err != nil {
+		t.Fatal(err)
+	}
+	active := []string{extra[1].ID, running}
+	page := func(after int64) api.TeamQueueList {
+		t.Helper()
+		list, err := s.TeamQueuePage(ctx, task.ID, api.TeamQueueListOptions{Limit: 50, After: after})
+		if err != nil {
+			t.Fatal(err)
+		}
+		for i, id := range active {
+			if list.Entries[i].ID != id || list.Entries[i].Summary {
+				t.Fatalf("active entry %d is %s summary %v", i, list.Entries[i].ID, list.Entries[i].Summary)
+			}
+		}
+		return list
+	}
+	seen := map[string]int{}
+	first := page(0)
+	if first.History.Total != 121 || first.History.NextAfter != first.Entries[len(first.Entries)-1].Position || len(first.Entries) != 2+50 {
+		t.Fatalf("page 1 %+v with %d entries", first.History, len(first.Entries))
+	}
+	// Finish the running entry between pages: it joins history at a
+	// position above the cursor, so older pages neither repeat nor skip.
+	if _, err := s.db.Exec(`UPDATE team_queue_entries SET state='finished' WHERE id=?`, running); err != nil {
+		t.Fatal(err)
+	}
+	active = active[:1]
+	pages := []api.TeamQueueList{first}
+	for after := first.History.NextAfter; after != 0; {
+		next := page(after)
+		pages = append(pages, next)
+		after = next.History.NextAfter
+	}
+	if len(pages) != 3 || len(pages[1].Entries) != 1+50 || len(pages[2].Entries) != 1+21 || pages[2].History.NextAfter != 0 || pages[1].History.Total != 122 {
+		t.Fatalf("%d pages, sizes %d %d", len(pages), len(pages[1].Entries), len(pages[len(pages)-1].Entries))
+	}
+	for p, list := range pages {
+		last := int64(1 << 62)
+		for _, e := range list.Entries {
+			if !e.Summary {
+				continue
+			}
+			if e.Position >= last {
+				t.Fatalf("page %d not newest first at %d", p, e.Position)
+			}
+			last = e.Position
+			seen[e.ID]++
+		}
+	}
+	for _, h := range history {
+		if seen[h.ID] != 1 {
+			t.Fatalf("history entry %s at %d listed %d times", h.ID, h.Position, seen[h.ID])
+		}
+	}
+	if len(seen) != len(history) {
+		t.Fatalf("listed %d history entries, want %d", len(seen), len(history))
+	}
+	// Active only, and one item in any state and in full.
+	activeList, err := s.TeamQueuePage(ctx, task.ID, api.TeamQueueListOptions{View: api.TeamQueueViewActive})
+	if err != nil || len(activeList.Entries) != 1 || activeList.Entries[0].ID != extra[1].ID || activeList.History != nil {
+		t.Fatalf("active view %+v %v", activeList, err)
+	}
+	one, err := s.TeamQueuePage(ctx, task.ID, api.TeamQueueListOptions{Item: history[5].ItemID})
+	if err != nil || len(one.Entries) != 1 || one.Entries[0].ID != history[5].ID || one.Entries[0].Summary || string(one.Entries[0].LaunchJSON) != `{}` || one.History != nil {
+		t.Fatalf("item listing %+v %v", one, err)
+	}
+	if none, err := s.TeamQueuePage(ctx, task.ID, api.TeamQueueListOptions{Item: items[1].ID}); err != nil || len(none.Entries) != 0 {
+		t.Fatalf("item with no entry %+v %v", none, err)
+	}
+	for _, bad := range []api.TeamQueueListOptions{{View: "all"}, {Item: "tqe_x"}, {Limit: -1}, {Limit: api.MaxLimit + 1}, {After: -1}} {
+		if _, err := s.TeamQueuePage(ctx, task.ID, bad); !errors.Is(err, api.ErrInvalid) {
+			t.Fatalf("options %+v: %v", bad, err)
+		}
+	}
+}
+
+// Block reasons, blockers and stalls read only active entries, so the paged
+// listing reports them exactly as the full listing does.
+func TestTeamQueuePageMatchesFullListingBlockers(t *testing.T) {
+	s, task, items, orders := sharedCheckoutFixture(t, 4)
+	ctx := context.Background()
+	s.queueStallGrace = time.Nanosecond
+	a := addCheckoutEntry(t, s, task, items[0], orders[0], "/main", "src/a")
+	addCheckoutEntry(t, s, task, items[1], orders[1], "/main", "src/b")
+	addCheckoutEntry(t, s, task, items[2], orders[2], "/other", "src/a/child")
+	addCheckoutEntry(t, s, task, items[3], orders[3], "/main", "src/a/other")
+	if _, err := s.TeamQueueAction(ctx, task.ID, api.TeamQueueRequest{RequestID: "claim-a", Operation: "claim", EntryID: a.ID, ExpectedRevision: a.Revision, Host: "mini"}); err != nil {
+		t.Fatal(err)
+	}
+	insertHistoryEntries(t, s, task, 100, 5, paddedLaunch(1024, "Implementation"), nil)
+	time.Sleep(time.Millisecond)
+	full, err := s.ListTeamQueue(ctx, task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	paged, err := s.TeamQueuePage(ctx, task.ID, api.TeamQueueListOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	stalled := 0
+	byID := map[string]api.TeamQueueEntry{}
+	for _, e := range paged.Entries {
+		byID[e.ID] = e
+	}
+	for _, want := range full.Entries {
+		got, ok := byID[want.ID]
+		if !ok {
+			t.Fatalf("entry %s missing from the paged listing", want.ID)
+		}
+		if queueEntryIsHistory(want) {
+			continue
+		}
+		wantStall, _ := json.Marshal(want.Stall)
+		gotStall, _ := json.Marshal(got.Stall)
+		if got.BlockReason != want.BlockReason || strings.Join(got.BlockedBy, ",") != strings.Join(want.BlockedBy, ",") || string(gotStall) != string(wantStall) {
+			t.Fatalf("entry %s: paged %q %v %s, full %q %v %s", want.ID, got.BlockReason, got.BlockedBy, gotStall, want.BlockReason, want.BlockedBy, wantStall)
+		}
+		if want.Stall != nil {
+			stalled++
+		}
+	}
+	if stalled == 0 {
+		t.Fatal("the fixture has no stall to compare")
 	}
 }
