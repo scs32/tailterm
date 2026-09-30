@@ -1,8 +1,11 @@
 package main
 
 import (
+	"errors"
 	"github.com/scs32/tailterm/hub/internal/api"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -63,5 +66,16 @@ func TestSupersedeAncestryRequiresHandReleaseOnTasksHub(t *testing.T) {
 	}
 	if err := supersedeAncestry(dir, jobs, "rel_missing", candidate); err == nil {
 		t.Fatal("missing job accepted")
+	}
+	// f5: a malformed released commit is refused before git runs, so an
+	// option-shaped value cannot write a file.
+	marker := filepath.Join(t.TempDir(), "written")
+	for _, bad := range []string{"--output=" + marker, candidate[:12], strings.ToUpper(candidate), ""} {
+		if err := supersedeAncestry(filepath.Join(t.TempDir(), "no-repo"), jobs, "rel_hand", bad); err == nil || !strings.Contains(err.Error(), "40-hex") {
+			t.Fatalf("%q: %v", bad, err)
+		}
+	}
+	if _, err := os.Stat(marker); !errors.Is(err, os.ErrNotExist) {
+		t.Fatal("git ran with an option-shaped commit", err)
 	}
 }

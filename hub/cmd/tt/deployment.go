@@ -138,9 +138,17 @@ func cmdDeployment(e env, args []string) error {
 // supersedeAncestry proves the job's accepted commit shipped by hand: it is
 // an ancestor of the released commit, which is on the current local tasks-hub.
 func supersedeAncestry(repo string, jobs []api.ReleaseJob, id, released string) error {
+	// Validated before any git call: an argument such as --output=PATH must
+	// never reach git as an option.
+	if !fullCommit(released) {
+		return errors.New("supersede needs --released-commit as a full 40-hex commit")
+	}
 	for _, j := range jobs {
 		if j.ID != id {
 			continue
+		}
+		if !fullCommit(j.Commit) {
+			return errors.New("release job has no full commit")
 		}
 		for _, pair := range [][2]string{{j.Commit, released}, {released, "refs/heads/tasks-hub"}} {
 			if err := exec.Command("git", "-C", repo, "merge-base", "--is-ancestor", pair[0], pair[1]).Run(); err != nil {
@@ -150,4 +158,16 @@ func supersedeAncestry(repo string, jobs []api.ReleaseJob, id, released string) 
 		return nil
 	}
 	return errors.New("release job not found")
+}
+
+func fullCommit(s string) bool {
+	if len(s) != 40 {
+		return false
+	}
+	for _, c := range s {
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
+			return false
+		}
+	}
+	return true
 }

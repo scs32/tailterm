@@ -299,9 +299,21 @@ journal or lock by hand.
   checkout and move the ref with `git update-ref refs/heads/tasks-hub REVERT
   INTEGRATED` (never force).
 
+**A blocked receipt with a committed revert.** When a rollback could not run or
+did not restore a target (for example the fence was lost), the receipt outcome is
+`blocked`, that target shows `rollback: blocked`, and `revert.outcome` may still be
+`committed`. Then `tasks-hub` no longer contains the release while that target
+still runs the released code; the escalation says so. Roll the blocked targets
+back by hand (above) and confirm with their rollback probes before reconciling
+the job, so live code and `tasks-hub` agree again.
+
 **Hand release while the agent is provisioned.** Retire the deployer (pause
 above), release by hand, then order the handler to supersede that item's job with
-the released commit and release name, and resume the deployer.
+the released commit and release name. A hand release writes no deployer receipt,
+so the deployer's baselines do not move by themselves: for each target released
+by hand, run `node scripts/release-probe.mjs live TARGET --config PRIVATE`
+(`live tailos` for TailOS) and set `baselines.TARGET` in the private config to the
+printed `commit`. Only then resume the deployer.
 
 **Detached main checkout (#15223).** The deployer's checkout is a detached
 worktree (`git worktree add --detach PATH tasks-hub`) that shares objects with the
