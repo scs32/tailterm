@@ -487,6 +487,9 @@ func (s *Store) ListTeamQueue(ctx context.Context, task string) (api.TeamQueueLi
 			return out, err
 		}
 	}
+	// sharedOnly lists, per queued entry, the active entries that block it
+	// only by sharing its checkout, when nothing blocks it by ownership.
+	sharedOnly := map[string][]string{}
 	for i := range out.Entries {
 		if parallel && out.Entries[i].State == "failed" && out.Entries[i].ReleasedAt == "" {
 			live, liveErr := liveItemRuns(ctx, capacityTx, task, out.Entries[i].ItemID)
@@ -517,7 +520,8 @@ func (s *Store) ListTeamQueue(ctx context.Context, task string) (api.TeamQueueLi
 				}
 			}
 		}
-		sharedWith, overlaps := "", false
+		var sharedWith []string
+		overlaps := false
 		for j := range out.Entries {
 			if i == j {
 				continue
@@ -532,15 +536,16 @@ func (s *Store) ListTeamQueue(ctx context.Context, task string) (api.TeamQueueLi
 				overlaps = true
 			} else if sameCwd {
 				out.Entries[i].BlockedBy = append(out.Entries[i].BlockedBy, other.ID)
-				if sharedWith == "" {
-					sharedWith = other.ID
-				}
+				sharedWith = append(sharedWith, other.ID)
 			}
 		}
-		if sharedWith != "" && !overlaps && out.Entries[i].BlockReason == "" {
+		if len(sharedWith) > 0 && !overlaps {
 			// Two teams never edit one checkout; a scoped entry that
 			// conflicts only by cwd can move to its own worktree.
-			out.Entries[i].BlockReason = fmt.Sprintf("Shares checkout %s with active entry %s; move it: tt team queue scope --task %s --entry %s --new-worktree", out.Entries[i].Cwd, sharedWith, task, out.Entries[i].ID)
+			sharedOnly[out.Entries[i].ID] = sharedWith
+			if out.Entries[i].BlockReason == "" {
+				out.Entries[i].BlockReason = sharedCheckoutHint(out.Entries[i], sharedWith[0])
+			}
 		}
 	}
 	var reader queryRower = s.db
@@ -559,7 +564,25 @@ func (s *Store) ListTeamQueue(ctx context.Context, task string) (api.TeamQueueLi
 	if err := s.explainQueueStalls(ctx, reader, capacityTx, &out); err != nil {
 		return out, err
 	}
+	// A stall behind an entry that only shares the checkout keeps the move,
+	// which frees the queued entry at once; the stall notice carries it too.
+	for i := range out.Entries {
+		e := &out.Entries[i]
+		if e.Stall == nil {
+			continue
+		}
+		for _, id := range sharedOnly[e.ID] {
+			if id == e.Stall.BlockerEntryID {
+				e.BlockReason += ". Or: " + sharedCheckoutHint(*e, id)
+				break
+			}
+		}
+	}
 	return out, nil
+}
+
+func sharedCheckoutHint(e api.TeamQueueEntry, active string) string {
+	return fmt.Sprintf("Shares checkout %s with active entry %s; move it: tt team queue scope --task %s --entry %s --new-worktree", e.Cwd, active, e.TaskID, e.ID)
 }
 
 func (s *Store) TeamQueuesByHost(ctx context.Context, host string) (api.TeamQueueList, error) {

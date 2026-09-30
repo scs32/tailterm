@@ -598,7 +598,7 @@ each entry's `cwd=`, and when a shared checkout is the only conflict the reason
 is `Shares checkout DIR with active entry tqe_A; move it: tt team queue scope
 --task ID --entry tqe_B --new-worktree`. An ownership overlap keeps its
 ordinary `blocked-by` without that text, and an earlier reason (slots, host,
-handler, unscoped or serial) or a `Stalled:` explanation takes precedence.
+handler, unscoped or serial) takes precedence.
 
 ```sh
 tt team queue scope --entry tqe_ID --new-worktree [--owns PATH...]
@@ -622,9 +622,25 @@ revision or an unreachable hub, removes the new worktree (`git worktree remove
 CLI reads the entry back and keeps the worktree if the hub saved it. A path
 that already exists is refused; remove it with `git worktree remove PATH`
 first. A rerun on an entry that already uses its worktree prints `entry already
-uses its own worktree PATH` and changes nothing. Like one made by `tt team
+uses its own worktree PATH` and changes nothing.
+
+If both the response and the read-back are lost, the CLI reports the error
+and removes the worktree, although the hub may have saved the move. The entry
+then names a missing directory, and its launch would fail. Rerun the same
+command: when the entry's cwd is exactly its missing
+`.build/worktrees/queue-<item8>` path, it recreates that worktree detached at
+the entry's base, prints `worktree PATH recreated at BASE`, and makes no hub
+write. By hand, the equivalent is `git -C <repository root> worktree add
+--detach PATH BASE` (with `git worktree prune` first if Git still lists the
+path). A missing cwd that is not the entry's queue worktree is refused. Like one made by `tt team
 queue add --new-worktree`, the worktree stays after the entry finishes; remove
 it with `git worktree remove PATH` once its candidate is integrated.
 
 Release the hub before the CLI: a CLI that sends the move to an older hub
-refuses when the saved entry lacks the new `cwd` and removes the worktree.
+refuses when the saved entry lacks the new `cwd` and removes the worktree. The
+older hub has still saved any `--owns` change and incremented the revision.
+
+When a queued entry that only shares a checkout waits behind a stalled active
+entry, its `Stalled:` reason, and the stall notice posted to the Board, ends
+with `Or: Shares checkout DIR with active entry tqe_A; move it: ...`, since
+moving frees it at once.

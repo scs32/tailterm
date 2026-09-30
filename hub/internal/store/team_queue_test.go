@@ -734,3 +734,47 @@ func TestTeamQueueScopeWorktreeNeedsARepository(t *testing.T) {
 		t.Fatalf("legacy entry changed %+v %v", got, err)
 	}
 }
+
+// A stalled active entry that only shares a queued entry's checkout keeps the
+// move hint in the Stalled reason, which the stall notice carries.
+func TestTeamQueueStalledSharedCheckoutKeepsMoveHint(t *testing.T) {
+	s, task, items, orders := sharedCheckoutFixture(t, 4)
+	ctx := context.Background()
+	s.queueStallGrace = time.Nanosecond // A has had no runs for the whole grace
+	a := addCheckoutEntry(t, s, task, items[0], orders[0], "/main", "src/a")
+	b := addCheckoutEntry(t, s, task, items[1], orders[1], "/main", "src/b")
+	c := addCheckoutEntry(t, s, task, items[2], orders[2], "/other", "src/a/child")
+	d := addCheckoutEntry(t, s, task, items[3], orders[3], "/main", "src/a/other")
+	a, err := s.TeamQueueAction(ctx, task.ID, api.TeamQueueRequest{RequestID: "claim-a", Operation: "claim", EntryID: a.ID, ExpectedRevision: a.Revision, Host: "mini"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(time.Millisecond)
+	got := listedEntry(t, s, task.ID, b.ID)
+	if got.Stall == nil || got.Stall.BlockerEntryID != a.ID || !strings.HasPrefix(got.BlockReason, "Stalled: "+a.ID) || !strings.Contains(got.BlockReason, "Or: Shares checkout /main with active entry "+a.ID+"; move it: tt team queue scope --task "+task.ID+" --entry "+b.ID+" --new-worktree") {
+		t.Fatalf("stalled shared checkout: %+v reason %q", got.Stall, got.BlockReason)
+	}
+	for _, id := range []string{c.ID, d.ID} {
+		got := listedEntry(t, s, task.ID, id)
+		if got.Stall == nil || strings.Contains(got.BlockReason, "Shares checkout") {
+			t.Fatalf("ownership overlap %s: %+v reason %q", id, got.Stall, got.BlockReason)
+		}
+	}
+	// The notice posted for B's stall names the move too.
+	if _, err := s.TeamQueueAction(ctx, task.ID, api.TeamQueueRequest{RequestID: got.Stall.NoticeRequestID(b.ID), Operation: "stall_notice", EntryID: b.ID}); err != nil {
+		t.Fatal(err)
+	}
+	messages, err := s.ListMessages(ctx, task.ID, 0, "", 200)
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, m := range messages {
+		if m.Envelope != nil && m.Envelope.Refs["entry"] == b.ID && strings.Contains(m.Envelope.Body.Text, "--entry "+b.ID+" --new-worktree") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("stall notice lacks the move hint")
+	}
+}

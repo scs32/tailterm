@@ -15,6 +15,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -759,4 +760,78 @@ func TestTeamQueueCLIScopeNewWorktreeRefusalsLeaveNoWorktree(t *testing.T) {
 	if sha, err := queueGitCommit(want); err != nil || sha != head {
 		t.Fatalf("kept worktree HEAD %s %v", sha, err)
 	}
+}
+
+// When the hub saved a move but both its response and the read-back were
+// lost, the CLI removed the worktree the entry names; a rerun recreates it
+// at the entry's base without another hub write.
+func TestTeamQueueCLIScopeNewWorktreeRepairsLostMove(t *testing.T) {
+	f := newTeamFixture(t, true)
+	ctx := context.Background()
+	repo, head := queueGitRepo(t)
+	parallelCLIProject(t, f, "none")
+	q, err := f.c.TeamQueueAction(ctx, f.task.ID, api.TeamQueueRequest{RequestID: "shared", Operation: "add", ItemID: f.item.ID, OrderMessageSeq: f.order, Host: spawn.Host(), Cwd: repo, Repository: filepath.Join(repo, ".git"), BaseCommit: head, Ownership: []string{"docs"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	target, err := url.Parse(f.e.hub)
+	if err != nil {
+		t.Fatal(err)
+	}
+	forward := httputil.NewSingleHostReverseProxy(target)
+	var saved atomic.Bool
+	lost := f.e
+	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == "POST" && strings.HasSuffix(r.URL.Path, "/team-queue/actions"):
+			forward.ServeHTTP(httptest.NewRecorder(), r)
+			saved.Store(true)
+			dropQueueResponse(w)
+		case saved.Load() && r.Method == "GET" && strings.HasSuffix(r.URL.Path, "/team-queue/"+q.ID):
+			dropQueueResponse(w)
+		default:
+			forward.ServeHTTP(w, r)
+		}
+	}))
+	t.Cleanup(proxy.Close)
+	lost.hub = proxy.URL
+	want := queueWorktreeFor(repo, f.item.ID)
+	if _, err := captureCLIOutput(t, func() error { return cmdTeamQueue(lost, []string{"scope", "--entry", q.ID, "--new-worktree"}) }); err == nil {
+		t.Fatal("double loss reported success")
+	}
+	requireNoQueueWorktree(t, repo, want, "double loss")
+	moved, err := f.c.GetTeamQueueEntry(ctx, f.task.ID, q.ID)
+	if err != nil || moved.Cwd != want || moved.Revision != q.Revision+1 {
+		t.Fatalf("hub did not save the move %+v %v", moved, err)
+	}
+	if output, err := exec.Command("git", "-C", repo, "-c", "user.email=fixture@example.invalid", "-c", "user.name=fixture", "commit", "-q", "--allow-empty", "-m", "newer").CombinedOutput(); err != nil {
+		t.Fatalf("commit: %v %s", err, output)
+	}
+	out, err := captureCLIOutput(t, func() error { return cmdTeamQueue(f.e, []string{"scope", "--entry", q.ID, "--new-worktree"}) })
+	if err != nil || !strings.Contains(out, "worktree "+want+" recreated at "+head) {
+		t.Fatalf("repair %q %v", out, err)
+	}
+	if sha, err := queueGitCommit(want); err != nil || sha != head {
+		t.Fatalf("recreated worktree HEAD %s %v, want base %s", sha, err, head)
+	}
+	if branch, err := exec.Command("git", "-C", want, "rev-parse", "--abbrev-ref", "HEAD").Output(); err != nil || strings.TrimSpace(string(branch)) != "HEAD" {
+		t.Fatalf("recreated worktree is not detached: %q %v", branch, err)
+	}
+	if again, err := f.c.GetTeamQueueEntry(ctx, f.task.ID, q.ID); err != nil || again.Revision != moved.Revision || again.Cwd != want {
+		t.Fatalf("repair wrote to the hub %+v %v", again, err)
+	}
+	if out, err := captureCLIOutput(t, func() error { return cmdTeamQueue(f.e, []string{"scope", "--entry", q.ID, "--new-worktree"}) }); err != nil || !strings.Contains(out, "entry already uses its own worktree "+want) {
+		t.Fatalf("rerun after repair %q %v", out, err)
+	}
+	// A missing checkout that is not the entry's queue worktree is refused.
+	other, order := queueFixtureItem(t, f, "missing")
+	gone := filepath.Join(t.TempDir(), "gone")
+	missing, err := f.c.TeamQueueAction(ctx, f.task.ID, api.TeamQueueRequest{RequestID: "missing", Operation: "add", ItemID: other.ID, OrderMessageSeq: order, Host: spawn.Host(), Cwd: gone, Repository: filepath.Join(repo, ".git"), BaseCommit: head, Ownership: []string{"client"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := captureCLIOutput(t, func() error { return cmdTeamQueue(f.e, []string{"scope", "--entry", missing.ID, "--new-worktree"}) }); err == nil || !strings.Contains(err.Error(), "names a missing checkout") {
+		t.Fatalf("missing unrelated checkout: %v", err)
+	}
+	requireNoQueueWorktree(t, repo, queueWorktreeFor(repo, other.ID), "missing unrelated checkout")
 }

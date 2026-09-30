@@ -52,7 +52,7 @@ func queueLimitText(limit int) string {
 func queueWorktreePath(checkout, item string) (string, error) {
 	top, err := exec.Command("git", "-C", checkout, "rev-parse", "--show-toplevel").Output()
 	if err != nil {
-		return "", errors.New("--new-worktree must run from a Git worktree root")
+		return "", fmt.Errorf("--new-worktree needs a Git worktree root; %s is not one", checkout)
 	}
 	realTop, err := filepath.EvalSymlinks(strings.TrimSpace(string(top)))
 	if err != nil {
@@ -60,7 +60,7 @@ func queueWorktreePath(checkout, item string) (string, error) {
 	}
 	realCheckout, err := filepath.EvalSymlinks(checkout)
 	if err != nil || realCheckout != realTop {
-		return "", errors.New("--new-worktree must run from a Git worktree root")
+		return "", fmt.Errorf("--new-worktree needs a Git worktree root; %s is not one", checkout)
 	}
 	common, err := exec.Command("git", "-C", checkout, "rev-parse", "--path-format=absolute", "--git-common-dir").Output()
 	if err != nil {
@@ -84,6 +84,28 @@ func addQueueWorktree(checkout, item, commit string) (string, error) {
 		return "", fmt.Errorf("git worktree add: %v: %s", err, strings.TrimSpace(string(output)))
 	}
 	return path, nil
+}
+
+// repairQueueWorktree recreates an entry's missing queue worktree, detached at
+// its frozen base, when the entry's cwd is exactly that worktree's path.
+func repairQueueWorktree(q api.TeamQueueEntry, ownership []string) (string, error) {
+	root := filepath.Dir(q.Repository)
+	target := filepath.Join(root, ".build", "worktrees", "queue-"+strings.TrimPrefix(q.ItemID, "wi_")[:8])
+	if filepath.Clean(q.Cwd) != target {
+		return "", fmt.Errorf("entry %s names a missing checkout %s that is not its queue worktree %s", q.ID, q.Cwd, target)
+	}
+	if output, err := exec.Command("git", "-C", root, "worktree", "add", "--detach", target, q.BaseCommit).CombinedOutput(); err != nil {
+		return "", fmt.Errorf("git worktree add: %v: %s", err, strings.TrimSpace(string(output)))
+	}
+	repository, err := queueRepositoryScope(target, ownership)
+	if err == nil && repository != q.Repository {
+		err = fmt.Errorf("the recreated worktree is in repository %s, not the entry's %s", repository, q.Repository)
+	}
+	if err != nil {
+		_ = exec.Command("git", "-C", root, "worktree", "remove", "--force", target).Run()
+		return "", err
+	}
+	return target, nil
 }
 
 // sameQueueDir reports whether two paths name one directory.
@@ -418,11 +440,20 @@ func cmdTeamQueue(e env, args []string) error {
 				if q.Host != spawn.Host() {
 					return fmt.Errorf("entry %s launches on %s; move it from that host", q.ID, q.Host)
 				}
-				target, pathErr := queueWorktreePath(q.Cwd, q.ItemID)
-				if pathErr != nil {
+				if _, statErr := os.Stat(q.Cwd); errors.Is(statErr, os.ErrNotExist) {
+					// The hub saved a move whose worktree the CLI then removed:
+					// recreate it; the entry already names it.
+					path, repairErr := repairQueueWorktree(q, ownership)
+					if repairErr != nil {
+						return repairErr
+					}
+					fmt.Printf("worktree %s recreated at %s\n", path, q.BaseCommit)
+					if !ownsGiven {
+						return nil
+					}
+				} else if target, pathErr := queueWorktreePath(q.Cwd, q.ItemID); pathErr != nil {
 					return pathErr
-				}
-				if sameQueueDir(q.Cwd, target) {
+				} else if sameQueueDir(q.Cwd, target) {
 					fmt.Printf("entry already uses its own worktree %s\n", q.Cwd)
 					if !ownsGiven {
 						return nil
