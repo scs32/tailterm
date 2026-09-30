@@ -265,6 +265,8 @@ func (s *Store) explainQueueStalls(ctx context.Context, q queryRower, capacity *
 			} else {
 				candidates := overlapping
 				if len(candidates) == 0 {
+					// Full slots: any stall blocker holds one. No free
+					// handler: only a blocker that holds a lease frees one.
 					for _, a := range active {
 						if blockers[a.ID] != nil && (freeAll.ID != "" || a.HandlerID != "") {
 							candidates = append(candidates, a)
