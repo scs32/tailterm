@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -79,7 +80,23 @@ CREATE TABLE IF NOT EXISTS project_stalls (
   task_id TEXT PRIMARY KEY,
   observed_change TEXT NOT NULL,
   notified_at TEXT NOT NULL DEFAULT ''
+);
+CREATE TABLE IF NOT EXISTS obligation_postponements (
+  obligation_id TEXT PRIMARY KEY,
+  base_due_at TEXT NOT NULL,
+  postponed_to TEXT NOT NULL,
+  last_message_seq INTEGER NOT NULL,
+  count INTEGER NOT NULL DEFAULT 0,
+  updated_at TEXT NOT NULL
 );`
+
+// A progress message (wi_e76872a6abc6d78e) moves its obligation's due time to
+// at most ObligationProgressGrace from the message, and never more than
+// ObligationProgressCap past the due time it started from.
+const (
+	ObligationProgressGrace = 30 * time.Minute
+	ObligationProgressCap   = 2 * time.Hour
+)
 
 const (
 	wakePending   = "pending"
@@ -185,6 +202,9 @@ func insertWakeJob(ctx context.Context, tx *sql.Tx, taskID, obligationID, agentI
 // or pause the obligation its reply-to message created, when the reply kind
 // fits what the obligation needs. It runs in the reply's transaction.
 func (s *Store) applyReplyOutcome(ctx context.Context, tx *sql.Tx, m api.Message, req api.PostMessageRequest) error {
+	if err := applyMessageProgress(ctx, tx, m, req); err != nil {
+		return err
+	}
 	if req.ReplyTo <= 0 || req.AgentID == "" || req.Envelope == nil {
 		return nil
 	}
@@ -219,6 +239,111 @@ func (s *Store) applyReplyOutcome(ctx context.Context, tx *sql.Tx, m api.Message
 			api.ObligationClosed, outcome, m.Seq, req.Envelope.Body.Reason, now, now, req.ReplyTo, req.AgentID, api.ObligationClosed)
 		return err
 	}
+}
+
+var progressSeqRef = regexp.MustCompile(`^#?[0-9]+$`)
+
+// applyMessageProgress records a NOTICE or RESULT from an obligation's holder
+// (its current run) as progress on each obligation the message references:
+// by reply-to, by a refs value naming its message ("#SEQ" or "SEQ"), or by
+// refs obligation=ID. Progress restarts the silence timer and postpones the
+// due time. The postponement is capped against the due time it started from,
+// so past the cap progress no longer resets an escalation. It runs in the
+// message's transaction, before any reply outcome closes the obligation.
+func applyMessageProgress(ctx context.Context, tx *sql.Tx, m api.Message, req api.PostMessageRequest) error {
+	e := req.Envelope
+	if req.AgentID == "" || req.RunID == "" || e == nil || (e.Kind != api.EnvelopeKindNotice && e.Kind != api.EnvelopeKindResult) {
+		return nil
+	}
+	var current string
+	if err := tx.QueryRowContext(ctx, `SELECT run_id FROM agents WHERE id=?`, req.AgentID).Scan(&current); err != nil || current != req.RunID {
+		return nil // a stale run's message is kept but records no progress
+	}
+	var seqs []any
+	if req.ReplyTo > 0 {
+		seqs = append(seqs, req.ReplyTo)
+	}
+	for _, v := range e.Refs {
+		if progressSeqRef.MatchString(v) {
+			if n, err := strconv.ParseInt(strings.TrimPrefix(v, "#"), 10, 64); err == nil && n > 0 {
+				seqs = append(seqs, n)
+			}
+		}
+	}
+	match := []string{}
+	args := []any{m.TaskID, req.AgentID, api.ObligationRecipientAgent, api.ObligationNeedsDelivery, api.ObligationAcknowledged, api.ObligationWorking, api.ObligationBlocked}
+	if len(seqs) > 0 {
+		match = append(match, `o.message_seq IN (?`+strings.Repeat(",?", len(seqs)-1)+`)`)
+		args = append(args, seqs...)
+	}
+	if id := e.Refs["obligation"]; id != "" {
+		match = append(match, `o.id=?`)
+		args = append(args, id)
+	}
+	if len(match) == 0 {
+		return nil
+	}
+	rows, err := tx.QueryContext(ctx, `SELECT o.id,o.due_at,COALESCE(p.base_due_at,''),COALESCE(p.postponed_to,'') FROM obligations o LEFT JOIN obligation_postponements p ON p.obligation_id=o.id
+WHERE o.task_id=? AND o.agent_id=? AND o.recipient_kind=? AND o.needs<>? AND o.state IN (?,?,?) AND (`+strings.Join(match, " OR ")+`)`, args...)
+	if err != nil {
+		return err
+	}
+	type target struct {
+		id              string
+		due, base, upTo time.Time
+		tracked         bool
+	}
+	var targets []target
+	for rows.Next() {
+		var id, due, base, upTo string
+		if err := rows.Scan(&id, &due, &base, &upTo); err != nil {
+			rows.Close()
+			return err
+		}
+		t := target{id: id, due: parseTS(due)}
+		// The cap counts from the tracked base only while this postponement
+		// still owns the due time; an owner extension re-bases it.
+		if base != "" && parseTS(upTo).Equal(t.due) {
+			t.base, t.tracked = parseTS(base), true
+		} else {
+			t.base = t.due
+		}
+		targets = append(targets, t)
+	}
+	err = rows.Err()
+	rows.Close()
+	if err != nil {
+		return err
+	}
+	now := m.CreatedAt
+	for _, t := range targets {
+		due := t.due
+		if next := minTime(now.Add(ObligationProgressGrace), t.base.Add(ObligationProgressCap)); next.After(due) {
+			due = next
+			if _, err := tx.ExecContext(ctx, `INSERT INTO obligation_postponements (obligation_id,base_due_at,postponed_to,last_message_seq,count,updated_at) VALUES (?,?,?,?,1,?)
+ON CONFLICT(obligation_id) DO UPDATE SET base_due_at=excluded.base_due_at,postponed_to=excluded.postponed_to,last_message_seq=excluded.last_message_seq,count=CASE WHEN ? THEN obligation_postponements.count+1 ELSE 1 END,updated_at=excluded.updated_at`,
+				t.id, ts(t.base), ts(due), m.Seq, ts(now), t.tracked); err != nil {
+				return err
+			}
+		}
+		// Progress restarts the escalation ladder only while the obligation
+		// is inside its (postponed) due time; past the cap it would only
+		// re-notify the lead.
+		inTime := !now.After(due)
+		if _, err := tx.ExecContext(ctx, `UPDATE obligations SET due_at=?,state=CASE WHEN state=? THEN ? ELSE state END,last_progress_at=?,nudges=0,nudged_at='',
+escalation=CASE WHEN ? THEN 0 ELSE escalation END,escalated_at=CASE WHEN ? THEN '' ELSE escalated_at END,changed_at=? WHERE id=?`,
+			ts(due), api.ObligationAcknowledged, api.ObligationWorking, ts(now), inTime, inTime, ts(now), t.id); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func minTime(a, b time.Time) time.Time {
+	if b.Before(a) {
+		return b
+	}
+	return a
 }
 
 func truncateRunes(s string, n int) string {

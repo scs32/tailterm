@@ -104,7 +104,8 @@ var ErrBrokerQueuedFix = errors.New("obligation is blocked on a queued fix")
 // related) whose team queue entry is queued, launching or running and not
 // released. The owner has nothing to decide there, so no owner escalation
 // is posted until that entry finishes, is removed, fails or is released.
-// Progress-aware escalation (wi_e76872a6abc6d78e) extends this one predicate.
+// Progress messages (wi_e76872a6abc6d78e) postpone the due time instead;
+// see applyMessageProgress.
 func blockedOnQueuedFix(ctx context.Context, q queryRower, o BrokerObligation) (bool, error) {
 	if o.State != api.ObligationBlocked {
 		return false, nil
@@ -278,9 +279,9 @@ func (s *Store) BrokerEscalate(ctx context.Context, o BrokerObligation, level in
 		if who == "" {
 			who = "an agent"
 		}
-		text := fmt.Sprintf("Message #%d (%s) to %s is overdue: %s. Sent %s; state %s. "+
+		text := fmt.Sprintf("Message #%d (%s) to %s is overdue: %s. Sent %s; state %s; %s. "+
 			"Options: nudge the recipient, reassign the obligation (tt obligations --overdue lists it), or answer for them.",
-			o.MessageSeq, o.Subject, who, reason, o.CreatedAt.UTC().Format(time.RFC3339), o.State)
+			o.MessageSeq, o.Subject, who, reason, o.CreatedAt.UTC().Format(time.RFC3339), o.State, progressAge(o.Obligation, now))
 		subject := fmt.Sprintf("Overdue: %s on %s", who, obligationNoun(o.SourceKind))
 		if level == 2 {
 			subject = fmt.Sprintf("Owner attention: %s is overdue on %s", who, obligationNoun(o.SourceKind))
@@ -298,6 +299,46 @@ func (s *Store) BrokerEscalate(ctx context.Context, o BrokerObligation, level in
 	})
 }
 
+// progressAge says how long ago the obligation last recorded progress
+// (acknowledgement, tt progress, a progress message or an owner extension).
+func progressAge(o api.Obligation, now time.Time) string {
+	if o.LastProgressAt == nil || o.LastProgressAt.IsZero() {
+		return "no progress recorded"
+	}
+	return fmt.Sprintf("last progress %dm ago", int(max(0, now.Sub(*o.LastProgressAt)).Round(time.Minute)/time.Minute))
+}
+
+// latestTeamProgress is the latest progress in the project since the given
+// time by an agent that is not closed or exited: recorded progress on any
+// obligation it holds, or a result, answer or decline that closed one.
+func (s *Store) latestTeamProgress(ctx context.Context, taskID string, since time.Time) (time.Time, error) {
+	// Stored times trim trailing zeros, so they compare as strings only to
+	// the second; the exact latest is taken after parsing.
+	bound := ts(since.Truncate(time.Second))[:19]
+	rows, err := s.db.QueryContext(ctx, `SELECT o.last_progress_at FROM obligations o JOIN agents a ON a.id=o.agent_id
+ WHERE o.task_id=? AND o.last_progress_at<>'' AND substr(o.last_progress_at,1,19)>=? AND a.status NOT IN (?,?)
+UNION ALL
+SELECT o.closed_at FROM obligations o JOIN agents a ON a.id=o.agent_id
+ WHERE o.task_id=? AND o.outcome IN (?,?,?) AND o.closed_at<>'' AND substr(o.closed_at,1,19)>=? AND a.status NOT IN (?,?)`,
+		taskID, bound, api.AgentClosed, api.AgentExited,
+		taskID, api.OutcomeResult, api.OutcomeAnswered, api.OutcomeDeclined, bound, api.AgentClosed, api.AgentExited)
+	if err != nil {
+		return time.Time{}, err
+	}
+	defer rows.Close()
+	var latest time.Time
+	for rows.Next() {
+		var raw string
+		if err := rows.Scan(&raw); err != nil {
+			return time.Time{}, err
+		}
+		if at := parseTS(raw); !at.Before(since) && at.After(latest) {
+			latest = at
+		}
+	}
+	return latest, rows.Err()
+}
+
 // maxStallLines keeps the stall notice under the envelope body limit.
 const (
 	maxStallLines     = 10
@@ -306,9 +347,24 @@ const (
 
 // BrokerProjectStall raises one board notice per stall. lastChange is the
 // latest recipient-driven change (never the broker's own escalations), so
-// only real activity re-arms it. quietFrom is when the quiet period starts.
-// A pass with nothing to record takes no write lock and wakes no waiters.
+// only real activity re-arms it; it also counts recent progress by any
+// running agent in the project, including results that closed their
+// obligations. quietFrom is when the quiet period starts, and moves with
+// that progress. A pass with nothing to record takes no write lock and
+// wakes no waiters.
 func (s *Store) BrokerProjectStall(ctx context.Context, taskID string, lastChange, quietFrom time.Time, overdue []BrokerObligation, now time.Time) (bool, error) {
+	if len(overdue) > 0 {
+		latest, err := s.latestTeamProgress(ctx, taskID, now.Add(-api.ObligationProjectStallQuiet))
+		if err != nil {
+			return false, err
+		}
+		if latest.After(lastChange) {
+			lastChange = latest
+		}
+		if latest.After(quietFrom) {
+			quietFrom = latest
+		}
+	}
 	var observed, notifiedAt string
 	err := s.db.QueryRowContext(ctx, `SELECT observed_change,notified_at FROM project_stalls WHERE task_id=?`, taskID).Scan(&observed, &notifiedAt)
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
@@ -334,7 +390,7 @@ func (s *Store) BrokerProjectStall(ctx context.Context, taskID string, lastChang
 		var lines []string
 		size := 0
 		for i, o := range overdue {
-			line := fmt.Sprintf("#%d %s → %s (%s)", o.MessageSeq, truncateRunes(o.Subject, 80), o.AgentName, ObligationOverdue(o.Obligation, now))
+			line := fmt.Sprintf("#%d %s → %s (%s; %s)", o.MessageSeq, truncateRunes(o.Subject, 80), o.AgentName, ObligationOverdue(o.Obligation, now), progressAge(o.Obligation, now))
 			if i == maxStallLines || size+len(line) > stallListingBytes {
 				lines = append(lines, fmt.Sprintf("and %d more", len(overdue)-i))
 				break

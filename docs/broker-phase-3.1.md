@@ -115,6 +115,17 @@ Out of scope:
     first.
   - A reply that names a stale run is refused. A reply with no run passes the gate but
     acknowledges nothing.
+- **Progress messages** (`wi_e76872a6abc6d78e`, added after 3.1):
+  - A NOTICE or RESULT from the holder's current run that references an acknowledged,
+    working or blocked obligation records progress on it. References are a reply to its
+    message, a `refs` value `#SEQ` or `SEQ`, or `refs obligation=ID`.
+  - Progress postpones the due time to 30 minutes after the message (the grace), capped at
+    2 hours past the due time it started from (the cap). An owner extension re-bases the cap.
+    Past the cap, progress no longer resets the escalation.
+  - `tt progress` still does not move `due_at`; it only restarts the silence timer.
+  - Recent progress by any running agent in the project holds off the project-stall notice
+    for 15 quiet minutes. Escalations and stall lines state the time since the last progress.
+  - Full rules: `docs/owner-obligations.md`, "Surfaces and escalation".
 - **Turn end:** the stop hook blocks on unacknowledged work every time, including a continued
   turn (`stop_hook_active`), since `tt ack` always clears it. Unread directed free text blocks
   only once. A blocked stop does not report the agent done.
