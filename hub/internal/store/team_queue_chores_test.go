@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"path/filepath"
 	"reflect"
 	"strings"
@@ -200,5 +201,286 @@ func TestQueueChoresMigrationIsAdditiveAndIdempotent(t *testing.T) {
 	confirmation, err := s.GetWorkOrderScopeConfirmation(ctx, task.ID, item.ID, item.Revision, order.Seq)
 	if err != nil || confirmation.Ownership != nil || confirmation.RequestID != "legacy-intake" {
 		t.Fatalf("legacy confirmation %+v %v", confirmation, err)
+	}
+}
+
+// choresQueue is a parallel project with bug items, one online handler per
+// requested count, a fresh host census and a no-cap limit.
+type choresQueue struct {
+	s        *Store
+	task     api.Task
+	items    []api.WorkItem
+	orders   []api.Message
+	handlers []api.Agent
+	by       api.Caller
+}
+
+func newChoresQueue(t *testing.T, n, h, limit int) *choresQueue {
+	t.Helper()
+	s, task, _, _, handlers := uncappedFixture(t, 0, h)
+	f := &choresQueue{s: s, task: task, handlers: handlers, by: api.Caller{Node: "fixture", User: "owner"}}
+	for i := 0; i < n; i++ {
+		item, err := s.CreateWorkItem(context.Background(), task.ID, api.CreateWorkItemRequest{Kind: "bug", Title: "Chores item", Priority: "normal", RequestID: api.NewID("req")}, f.by)
+		if err != nil {
+			t.Fatal(err)
+		}
+		f.items = append(f.items, item)
+		f.orders = append(f.orders, contextLinkedMessage(t, s, task, item, "bounded order", api.NewID("req"), nil))
+	}
+	setQueueLimit(t, s, task.ID, limit)
+	return f
+}
+
+func (f *choresQueue) add(t *testing.T, i int, owns ...string) api.TeamQueueEntry {
+	t.Helper()
+	return addScopedEntry(t, f.s, f.task, f.items[i], f.orders[i], owns...)
+}
+
+// run drives an entry from queued to running through the hub's launch steps.
+func (f *choresQueue) run(t *testing.T, q api.TeamQueueEntry) api.TeamQueueEntry {
+	t.Helper()
+	ctx := context.Background()
+	q, err := claimEntry(f.s, f.task, q)
+	if err != nil {
+		t.Fatal(err)
+	}
+	step := func(req api.TeamQueueRequest) {
+		t.Helper()
+		req.RequestID, req.EntryID, req.ExpectedRevision = api.NewID("tqr"), q.ID, q.Revision
+		if q, err = f.s.TeamQueueAction(ctx, f.task.ID, req); err != nil {
+			t.Fatalf("%s: %v", req.Operation, err)
+		}
+	}
+	run := api.NewID("run")
+	plan := fmt.Sprintf(`{"task":%q,"item":%q,"revision":%d,"order":%d,"handlerId":%q,"handlerRunId":%q,"handlerLeaseGeneration":%d,"context":{"version":1},"members":[{"state":"unstarted","runId":%q,"fields":{"agentId":%q,"name":"lead-%s","cwd":%q}}]}`,
+		f.task.ID, q.ItemID, q.ItemRevision, q.OrderMessageSeq, q.HandlerID, q.HandlerRunID, q.HandlerLeaseGeneration, run, api.NewID("agt"), q.ID[4:12], q.Cwd)
+	step(api.TeamQueueRequest{Operation: "freeze", LaunchJSON: []byte(plan)})
+	step(api.TeamQueueRequest{Operation: "attempt", MemberIndex: 0})
+	step(api.TeamQueueRequest{Operation: "started", MemberIndex: 0, MemberRunID: run})
+	step(api.TeamQueueRequest{Operation: "running"})
+	return q
+}
+
+// member registers a live agent bound to item i.
+func (f *choresQueue) member(t *testing.T, i int, name string) api.Agent {
+	t.Helper()
+	a, err := f.s.AddAgent(context.Background(), f.task.ID, api.AddAgentRequest{Name: name, AgentID: api.NewID("agt"), Host: "mini", Session: name}, f.by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.s.db.Exec(`INSERT INTO agent_work_item_bindings(agent_id,run_id,item_task_id,item_id,item_revision,work_order_task_id,work_order_message_seq,context_through_message_seq,context_digest,context_json,created_at) VALUES(?,?,?,?,?,?,?,0,?,?,?)`, a.ID, a.RunID, f.task.ID, f.items[i].ID, f.items[i].Revision, f.task.ID, f.orders[i].Seq, "digest", []byte("{}"), ts(f.s.now())); err != nil {
+		t.Fatal(err)
+	}
+	return a
+}
+
+func (f *choresQueue) integrated(q api.TeamQueueEntry, key, commit string, changed ...string) (api.TeamQueueEntry, error) {
+	return f.s.TeamQueueAction(context.Background(), f.task.ID, api.TeamQueueRequest{RequestID: key, Operation: "owner_integrated", EntryID: q.ID, ExpectedRevision: q.Revision, OwnerIntegrationCommit: commit, OwnerIntegrationEvidence: "owner release record", ChangedFiles: changed})
+}
+
+func (f *choresQueue) holding(t *testing.T) int {
+	t.Helper()
+	var n int
+	if err := f.s.db.QueryRow(`SELECT count(*) FROM team_queue_entries WHERE task_id=? AND `+queueHoldsSQL, f.task.ID).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	return n
+}
+
+// a4 (c2): the owner's integration record releases a running entry's slot,
+// handler lease and ownership while its item, bindings and lead stay; the
+// item's role:database_handler messages still reach the handler that served
+// it. Refusals cover every other state, agent callers and live release jobs.
+func TestOwnerIntegratedReleasesRunningEntry(t *testing.T) {
+	f := newChoresQueue(t, 3, 1, 0)
+	ctx := context.Background()
+	a := f.run(t, f.add(t, 0, "src"))
+	f.member(t, 0, "member-a")
+	b := f.add(t, 1, "src/b")
+	c := f.add(t, 2, "docs")
+	if got := listedEntry(t, f.s, f.task.ID, b.ID); len(got.BlockedBy) != 1 || got.BlockedBy[0] != a.ID {
+		t.Fatalf("B before integration: %+v", got.BlockedBy)
+	}
+	if _, err := claimEntry(f.s, f.task, c); err == nil || !strings.Contains(err.Error(), "no available database handler lease") {
+		t.Fatalf("C claimed without a free handler: %v", err)
+	}
+	commit := strings.Repeat("b", 40)
+
+	// Refusals before the record: bad SHA, an agent caller, live release jobs.
+	if _, err := f.integrated(a, "bad-sha", "abc1234"); !errors.Is(err, api.ErrInvalid) {
+		t.Fatalf("short SHA: %v", err)
+	}
+	asHandler := api.TeamQueueRequest{RequestID: "as-handler", Operation: "owner_integrated", EntryID: a.ID, ExpectedRevision: a.Revision, OwnerIntegrationCommit: commit, HandlerAgentID: f.handlers[0].ID, HandlerRunID: f.handlers[0].RunID}
+	if _, err := f.s.TeamQueueAction(ctx, f.task.ID, asHandler); !errors.Is(err, api.ErrConflict) {
+		t.Fatalf("agent caller: %v", err)
+	}
+	if _, err := f.s.db.Exec(`INSERT INTO release_jobs VALUES(?,?,?,?,?,?)`, f.task.ID, "rel_fixture", a.ID, "verified", 1, "{}"); err != nil {
+		t.Fatal(err)
+	}
+	for _, state := range []string{"verified", "claimed", "merged", "blocked"} {
+		if _, err := f.s.db.Exec(`UPDATE release_jobs SET state=? WHERE id='rel_fixture'`, state); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := f.integrated(a, "live-job-"+state, commit); !errors.Is(err, api.ErrConflict) || !strings.Contains(err.Error(), "release job rel_fixture is "+state) {
+			t.Fatalf("live %s release job: %v", state, err)
+		}
+	}
+	if _, err := f.s.db.Exec(`DELETE FROM release_jobs WHERE id='rel_fixture'`); err != nil {
+		t.Fatal(err)
+	}
+	for _, q := range []api.TeamQueueEntry{b} {
+		if _, err := f.integrated(q, "queued-"+q.ID, commit); !errors.Is(err, api.ErrConflict) {
+			t.Fatalf("queued entry: %v", err)
+		}
+	}
+
+	itemBefore, err := f.s.GetWorkItem(ctx, f.task.ID, f.items[0].ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	released, err := f.integrated(a, "integrated-a", commit, "src/a.go", "src/b/z.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if released.State != "running" || released.ReleasedAt == "" || released.OwnerIntegration == nil || released.OwnerIntegration.Commit != commit || strings.Join(released.OwnerIntegration.ChangedFiles, ",") != "src/a.go,src/b/z.go" || strings.Join(released.Ownership, ",") != "src/a.go,src/b/z.go" {
+		t.Fatalf("integrated entry %+v", released)
+	}
+	if replay, err := f.integrated(a, "integrated-a", commit, "src/a.go", "src/b/z.go"); err != nil || replay.Revision != released.Revision {
+		t.Fatalf("lost-response replay %+v %v", replay, err)
+	}
+	if _, err := f.integrated(released, "integrated-again", commit); !errors.Is(err, api.ErrConflict) {
+		t.Fatalf("already released: %v", err)
+	}
+	if n := f.holding(t); n != 0 {
+		t.Fatalf("%d entries still hold slots", n)
+	}
+	var reservations int
+	if err := f.s.db.QueryRow(`SELECT count(*) FROM team_launch_reservations WHERE task_id=? AND entry_id=?`, f.task.ID, a.ID).Scan(&reservations); err != nil || reservations != 0 {
+		t.Fatalf("reservation left %d %v", reservations, err)
+	}
+	if got := listedEntry(t, f.s, f.task.ID, b.ID); len(got.BlockedBy) != 0 || got.BlockReason != "" {
+		t.Fatalf("B after integration: %q %v", got.BlockReason, got.BlockedBy)
+	}
+	if free, err := freeQueueHandler(ctx, f.s.db, f.task.ID, []api.TeamQueueEntry{}); err != nil || free.ID != a.HandlerID {
+		t.Fatalf("lease not free: %+v %v", free, err)
+	}
+	itemAfter, err := f.s.GetWorkItem(ctx, f.task.ID, f.items[0].ID)
+	if err != nil || itemAfter.Status != itemBefore.Status || itemAfter.Revision != itemBefore.Revision {
+		t.Fatalf("item changed: %+v %v", itemAfter, err)
+	}
+	var bound, leads int
+	if err := f.s.db.QueryRow(`SELECT count(*) FROM agent_work_item_bindings WHERE item_task_id=? AND item_id=?`, f.task.ID, f.items[0].ID).Scan(&bound); err != nil || bound != 1 {
+		t.Fatalf("bindings %d %v", bound, err)
+	}
+	if err := f.s.db.QueryRow(`SELECT count(*) FROM item_team_leads WHERE task_id=? AND item_id=? AND state<>'closed'`, f.task.ID, f.items[0].ID).Scan(&leads); err != nil || leads != 1 {
+		t.Fatalf("item lead %d %v", leads, err)
+	}
+	message, err := f.s.PostMessage(ctx, f.task.ID, api.PostMessageRequest{RequestID: "post-release-a13", WorkItems: []api.MessageWorkItem{{ItemTaskID: f.task.ID, ItemID: f.items[0].ID, ItemRevision: f.items[0].Revision, Relationship: "primary"}}, WorkOrderMessage: &api.MessageReference{TaskID: f.task.ID, Seq: f.orders[0].Seq}, Envelope: &api.Envelope{Kind: api.EnvelopeKindRequest, To: "role:database_handler", Subject: "Record the post-release check", Body: api.EnvelopeBody{Ask: "Record a13."}}}, f.by)
+	if err != nil || message.To != a.HandlerID {
+		t.Fatalf("role routing after integration %q want %q: %v", message.To, a.HandlerID, err)
+	}
+	claimedB, err := claimEntry(f.s, f.task, b)
+	if err != nil || claimedB.HandlerID != a.HandlerID {
+		t.Fatalf("B did not take the released slot and lease: %+v %v", claimedB, err)
+	}
+	if _, err := f.integrated(claimedB, "launching-b", commit); !errors.Is(err, api.ErrConflict) {
+		t.Fatalf("launching entry: %v", err)
+	}
+}
+
+// a4 (c2): a failed, unreleased entry with live runs is released by the
+// owner's record; one with an uncertain spawn is refused.
+func TestOwnerIntegratedReleasesFailedEntry(t *testing.T) {
+	f := newChoresQueue(t, 2, 2, 0)
+	ctx := context.Background()
+	a := f.run(t, f.add(t, 0, "src/a"))
+	f.member(t, 0, "member-a")
+	failed, err := f.s.TeamQueueAction(ctx, f.task.ID, api.TeamQueueRequest{RequestID: "fail-a", Operation: "fail", EntryID: a.ID, ExpectedRevision: a.Revision, Failure: "owner integrated abc1234"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	released, err := f.integrated(failed, "integrated-failed-a", strings.Repeat("c", 40))
+	if err != nil || released.State != "failed" || released.ReleasedAt == "" || strings.Join(released.Ownership, ",") != "src/a" {
+		t.Fatalf("failed entry %+v %v", released, err)
+	}
+	b, err := claimEntry(f.s, f.task, f.add(t, 1, "src/b"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	uncertain, err := f.s.TeamQueueAction(ctx, f.task.ID, api.TeamQueueRequest{RequestID: "freeze-b", Operation: "freeze", EntryID: b.ID, ExpectedRevision: b.Revision, LaunchJSON: []byte(fmt.Sprintf(`{"task":%q,"item":%q,"revision":%d,"order":%d,"handlerId":%q,"handlerRunId":%q,"handlerLeaseGeneration":%d,"context":{"version":1},"members":[{"state":"unstarted","runId":%q,"fields":{"agentId":%q,"name":"lead-b","cwd":"/b"}}]}`, f.task.ID, b.ItemID, b.ItemRevision, b.OrderMessageSeq, b.HandlerID, b.HandlerRunID, b.HandlerLeaseGeneration, api.NewID("run"), api.NewID("agt")))})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if uncertain, err = f.s.TeamQueueAction(ctx, f.task.ID, api.TeamQueueRequest{RequestID: "attempt-b", Operation: "attempt", EntryID: b.ID, ExpectedRevision: uncertain.Revision, MemberIndex: 0}); err != nil {
+		t.Fatal(err)
+	}
+	if uncertain, err = f.s.TeamQueueAction(ctx, f.task.ID, api.TeamQueueRequest{RequestID: "fail-b", Operation: "fail", EntryID: b.ID, ExpectedRevision: uncertain.Revision, Failure: "spawn crashed"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.integrated(uncertain, "integrated-uncertain", strings.Repeat("c", 40)); !errors.Is(err, api.ErrConflict) || !strings.Contains(err.Error(), "uncertain spawn") {
+		t.Fatalf("uncertain spawn: %v", err)
+	}
+}
+
+// a5 (c2): after the owner's record the handler saves a plain done; a save
+// that carries an acceptance tuple is refused naming the integration. An
+// owner scope narrows a failed, unreleased entry and refuses a widening.
+func TestOwnerIntegratedDoneSaveAndFailedScope(t *testing.T) {
+	f := newChoresQueue(t, 2, 2, 0)
+	ctx := context.Background()
+	a := f.run(t, f.add(t, 0, "src/a"))
+	// The entry needs a repository for a pending acceptance; the fixture has
+	// one, so a handler's plain done save is refused before the record.
+	handler := f.handlers[1]
+	for _, h := range f.handlers {
+		if h.ID != a.HandlerID {
+			handler = h
+		}
+	}
+	done := "done"
+	save := func(key string, accept *api.WorkItemQueueAcceptance) error {
+		item, err := f.s.GetWorkItem(ctx, f.task.ID, f.items[0].ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, _, err = f.s.CreateWorkItemUpdate(ctx, f.task.ID, item.ID, api.CreateWorkItemUpdate{ExpectedRevision: item.Revision, Status: &done, AgentID: handler.ID, RunID: handler.RunID, RequestID: key, QueueAcceptance: accept}, f.by)
+		return err
+	}
+	if err := save("plain-before", nil); !errors.Is(err, api.ErrConflict) {
+		t.Fatalf("plain save before the record: %v", err)
+	}
+	commit := strings.Repeat("d", 40)
+	if _, err := f.integrated(a, "integrated-a", commit, "src/a/x.go"); err != nil {
+		t.Fatal(err)
+	}
+	tuple := &api.WorkItemQueueAcceptance{EntryID: a.ID, Worktree: "/worktrees/a", Branch: "feature/a", Commit: commit}
+	if err := save("tuple-after", tuple); !errors.Is(err, api.ErrConflict) || !strings.Contains(err.Error(), "integrated by the owner at "+commit) || !strings.Contains(err.Error(), "without --worktree/--branch/--commit") {
+		t.Fatalf("tuple save after the record: %v", err)
+	}
+	if err := save("plain-after", nil); err != nil {
+		t.Fatalf("plain save after the record: %v", err)
+	}
+	if item, _ := f.s.GetWorkItem(ctx, f.task.ID, f.items[0].ID); item.Status != "done" {
+		t.Fatalf("item not done: %+v", item)
+	}
+
+	b := f.run(t, f.add(t, 1, "src/b", "docs/b"))
+	failed, err := f.s.TeamQueueAction(ctx, f.task.ID, api.TeamQueueRequest{RequestID: "fail-b", Operation: "fail", EntryID: b.ID, ExpectedRevision: b.Revision, Failure: "stuck"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	scope := func(key string, owns ...string) (api.TeamQueueEntry, error) {
+		return f.s.TeamQueueAction(ctx, f.task.ID, api.TeamQueueRequest{RequestID: key, Operation: "scope", EntryID: failed.ID, ExpectedRevision: failed.Revision, Ownership: owns})
+	}
+	if _, err := scope("widen-b", "src/b", "hub"); !errors.Is(err, api.ErrConflict) || !strings.Contains(err.Error(), "only be narrowed") {
+		t.Fatalf("widening a failed entry: %v", err)
+	}
+	narrowed, err := scope("narrow-b", "src/b/one.go")
+	if err != nil || strings.Join(narrowed.Ownership, ",") != "src/b/one.go" || narrowed.State != "failed" || narrowed.ReleasedAt != "" {
+		t.Fatalf("narrowed failed entry %+v %v", narrowed, err)
+	}
+	asHandler := api.TeamQueueRequest{RequestID: "handler-narrow-b", Operation: "scope", EntryID: narrowed.ID, ExpectedRevision: narrowed.Revision, Ownership: []string{"src/b/one.go"}, HandlerAgentID: narrowed.HandlerID, HandlerRunID: narrowed.HandlerRunID}
+	if _, err := f.s.TeamQueueAction(ctx, f.task.ID, asHandler); !errors.Is(err, api.ErrConflict) {
+		t.Fatalf("handler scoping a failed entry: %v", err)
 	}
 }

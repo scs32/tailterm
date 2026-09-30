@@ -165,6 +165,15 @@ func (r teamRunner) tick(ctx context.Context, e env, c *api.Client, host string)
 			if parallel && (hostBudgetErr != nil || list.HostPolicy == nil) && (q.State == "queued" || q.State == "launching") {
 				continue
 			}
+			if q.State == "failed" && q.OwnerIntegration != nil {
+				// The owner integrated it; the runner still closes and
+				// cleans its team once the item is terminal. It holds no
+				// slot, so it does not take a serial project's turn.
+				if err := r.finish(ctx, e, c, q, host); err != nil {
+					projectErrors = append(projectErrors, fmt.Errorf("team queue %s: %w", q.ID, err))
+				}
+				continue
+			}
 			if q.State == "failed" && q.ReleasedAt == "" {
 				// A serial queue halts until the owner reconciles. A parallel
 				// one frees the slot and handler lease once the failed team
@@ -651,7 +660,7 @@ func (r teamRunner) finish(ctx context.Context, e env, c *api.Client, q api.Team
 		}
 	}
 	var integration *api.TeamIntegrationReady
-	if item.Status == "done" && q.Repository != "" {
+	if item.Status == "done" && q.Repository != "" && q.OwnerIntegration == nil {
 		if q.Acceptance == nil {
 			return nil // The assigned handler has not saved exact Git acceptance yet.
 		}

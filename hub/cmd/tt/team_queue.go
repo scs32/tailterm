@@ -29,7 +29,7 @@ func validTeamQueueEntryID(id string) bool {
 	return err == nil
 }
 
-const teamQueueUsage = "usage: tt team queue add|list|policy|limit|scope|fail|accept|replace-lead|remove|reorder|release|abandon"
+const teamQueueUsage = "usage: tt team queue add|list|policy|limit|scope|fail|accept|integrated|replace-lead|remove|reorder|release|abandon"
 
 // parseQueueLimit reads --limit: none (no fixed cap, stored as 0) or N >= 1.
 func parseQueueLimit(raw string) (int, bool) {
@@ -148,7 +148,9 @@ func cmdTeamQueue(e env, args []string) error {
 			} else if owns == "" {
 				owns = "unscoped (legacy)"
 			}
-			if q.State == "failed" && q.ReleasedAt != "" {
+			if q.OwnerIntegration != nil {
+				state += " (owner-integrated)"
+			} else if q.State == "failed" && q.ReleasedAt != "" {
 				state += " (released)"
 			}
 			fmt.Printf("%d %s %s %s order=#%d revision=%d repository=%s owns=%s blocked-by=%s reason=%s handler=%s/%s lease=%d\n", q.Position, state, q.ID, q.ItemID, q.OrderMessageSeq, q.Revision, q.Repository, owns, strings.Join(q.BlockedBy, ","), q.BlockReason, q.HandlerID, q.HandlerRunID, q.HandlerLeaseGeneration)
@@ -159,6 +161,9 @@ func cmdTeamQueue(e env, args []string) error {
 					state = member.Activity.State
 				}
 				fmt.Printf("  %s activity=%s\n", member.Name, state)
+			}
+			if q.OwnerIntegration != nil {
+				fmt.Printf("  Owner-integrated at %s: commit=%s changed=%s; slot, lease and ownership released, team closes when the item is terminal\n", q.OwnerIntegration.At, q.OwnerIntegration.Commit, strings.Join(q.OwnerIntegration.ChangedFiles, ","))
 			}
 			if q.Integration != nil {
 				fmt.Printf("  Ready to integrate: base=%s worktree=%s branch=%s commit=%s evidence=%s\n", q.Integration.BaseCommit, q.Integration.Worktree, q.Integration.Branch, q.Integration.Commit, q.Integration.Evidence)
@@ -282,7 +287,7 @@ func cmdTeamQueue(e env, args []string) error {
 				return err
 			}
 		}
-	case "remove", "reorder", "release", "replace-lead", "accept", "scope", "fail":
+	case "remove", "reorder", "release", "replace-lead", "accept", "scope", "fail", "integrated":
 		if !validTeamQueueEntryID(*entry) {
 			return errors.New(sub + " requires --entry tqe_ID")
 		}
@@ -379,6 +384,22 @@ func cmdTeamQueue(e env, args []string) error {
 			req.Failure = "Owner failed this entry: " + strings.TrimSpace(*reason)
 			req.RequestID = fmt.Sprintf("queue-owner-fail-%s-%d", q.ID, q.Revision)
 		}
+		if sub == "integrated" {
+			if *commit == "" {
+				return errors.New("usage: tt team queue integrated --entry tqe_ID --commit SHA [--evidence TEXT]")
+			}
+			base := q.BaseCommit
+			if q.Acceptance != nil {
+				base = q.Acceptance.BaseCommit
+			}
+			changed, err := ownerIntegratedChanges(ctx, q.Repository, base, *commit)
+			if err != nil {
+				return err
+			}
+			req.Operation, req.RequestID = "owner_integrated", "queue-integrated-"+q.ID
+			req.OwnerIntegrationCommit, req.OwnerIntegrationEvidence = *commit, *acceptanceEvidence
+			req.ChangedFiles = ownedChanges(changed, q.Ownership)
+		}
 		if sub == "release" {
 			var unlock func()
 			req, unlock, err = queueReleaseRequest(ctx, c, *hub, *task, q, false)
@@ -468,6 +489,25 @@ func cmdTeamQueue(e env, args []string) error {
 		}
 	}
 	return nil
+}
+
+// ownerIntegratedChanges checks that an owner-integrated commit is in the
+// entry's frozen repository and descends from its base, then lists the files
+// it changed against their merge base.
+func ownerIntegratedChanges(ctx context.Context, repository, base, commit string) ([]string, error) {
+	if repository == "" || base == "" {
+		return nil, errors.New("the entry has no frozen repository and base; release it with tt team queue release instead")
+	}
+	if len(commit) != 40 && len(commit) != 64 {
+		return nil, errors.New("--commit must be a full commit SHA")
+	}
+	if err := exec.CommandContext(ctx, "git", "--git-dir="+repository, "cat-file", "-e", commit+"^{commit}").Run(); err != nil {
+		return nil, fmt.Errorf("commit %s is not in the entry's repository %s", commit, repository)
+	}
+	if err := exec.CommandContext(ctx, "git", "--git-dir="+repository, "merge-base", "--is-ancestor", base, commit).Run(); err != nil {
+		return nil, fmt.Errorf("commit %s does not descend from the entry base %s", commit, base)
+	}
+	return queueChangedFiles(ctx, repository, base, commit)
 }
 
 // intakeOwnership reads the ownership the database handler recorded at scope

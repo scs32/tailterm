@@ -68,3 +68,32 @@ const queueHoldsSQL = `(state IN ('launching','running','failed') AND released_a
 func queueEntryHoldsResources(e api.TeamQueueEntry) bool {
 	return (e.State == "launching" || e.State == "running" || e.State == "failed") && e.ReleasedAt == ""
 }
+
+// queueClosable reports whether the runner may close and finish an entry's
+// team: a running entry, or a failed one the owner recorded as integrated.
+func queueClosable(e api.TeamQueueEntry) bool {
+	return e.State == "running" || (e.State == "failed" && e.OwnerIntegration != nil)
+}
+
+// queueNarrows reports whether every path in next lies under a path in
+// current, so a new declaration can only give way.
+func queueNarrows(next, current []string) bool {
+	if len(current) == 0 {
+		return true // an unscoped or serial entry held everything
+	}
+	for _, p := range next {
+		p = strings.ToLower(p)
+		inside := false
+		for _, held := range current {
+			held = strings.ToLower(held)
+			if p == held || strings.HasPrefix(p, held+"/") {
+				inside = true
+				break
+			}
+		}
+		if !inside {
+			return false
+		}
+	}
+	return true
+}

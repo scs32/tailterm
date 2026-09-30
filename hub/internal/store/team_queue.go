@@ -524,7 +524,9 @@ func (s *Store) TeamQueuesByHost(ctx context.Context, host string) (api.TeamQueu
 	if host == "" {
 		return api.TeamQueueList{}, api.ErrInvalid
 	}
-	rows, err := s.db.QueryContext(ctx, `SELECT `+teamQueueCols+` FROM team_queue_entries WHERE host=? AND state IN ('queued','launching','running') ORDER BY task_id,position LIMIT 200`, host)
+	// A failed entry the owner recorded as integrated still needs the
+	// runner's team close, cleanup and finish.
+	rows, err := s.db.QueryContext(ctx, `SELECT `+teamQueueCols+` FROM team_queue_entries WHERE host=? AND (state IN ('queued','launching','running') OR (state='failed' AND owner_integration_json<>'')) ORDER BY task_id,position LIMIT 200`, host)
 	if err != nil {
 		return api.TeamQueueList{}, err
 	}
@@ -595,7 +597,7 @@ func (s *Store) TeamQueueAction(ctx context.Context, task string, req api.TeamQu
 		return zero, api.ErrInvalid
 	}
 	identity := req
-	if identity.Operation == "release" || identity.Operation == "accept" {
+	if identity.Operation == "release" || identity.Operation == "accept" || identity.Operation == "owner_integrated" {
 		// A lost response is replayable after the release increments revision.
 		identity.ExpectedRevision = 0
 	}
@@ -896,7 +898,7 @@ func (s *Store) TeamQueueAction(ctx context.Context, task string, req api.TeamQu
 		if err != nil {
 			return zero, fmt.Errorf("%w: duplicate item or queue entry: %v", api.ErrConflict, err)
 		}
-	case "remove", "reorder", "claim", "freeze", "attempt", "started", "running", "replace_lead", "close", "close_refresh", "accept", "finish", "fail", "release", "scope":
+	case "remove", "reorder", "claim", "freeze", "attempt", "started", "running", "replace_lead", "close", "close_refresh", "accept", "finish", "fail", "release", "scope", "owner_integrated":
 		if !validTeamQueueID(req.EntryID) {
 			return zero, api.ErrInvalid
 		}
@@ -919,11 +921,22 @@ func (s *Store) TeamQueueAction(ctx context.Context, task string, req api.TeamQu
 			if len(ownership) == 0 {
 				return zero, fmt.Errorf("%w: scope needs at least one owned path", api.ErrInvalid)
 			}
-			if e.State != "queued" && e.State != "launching" && e.State != "running" {
-				return zero, fmt.Errorf("%w: only a queued, launching or running entry can be scoped", api.ErrConflict)
+			failedHold := e.State == "failed" && e.ReleasedAt == ""
+			if e.State != "queued" && e.State != "launching" && e.State != "running" && !failedHold {
+				return zero, fmt.Errorf("%w: only a queued, launching, running or unreleased failed entry can be scoped", api.ErrConflict)
 			}
 			if err := queueScopeAuthority(ctx, tx, task, e, req); err != nil {
 				return zero, err
+			}
+			if failedHold {
+				// A failed entry may give way, never take more: the owner
+				// narrows it while its team is still being reconciled.
+				if req.HandlerAgentID != "" || req.LeadAgentID != "" {
+					return zero, fmt.Errorf("%w: only the owner may scope a failed entry", api.ErrConflict)
+				}
+				if !queueNarrows(ownership, e.Ownership) {
+					return zero, fmt.Errorf("%w: a failed entry can only be narrowed; each path must lie under its current ownership", api.ErrConflict)
+				}
 			}
 			if e.State != "queued" {
 				// An admitted team may narrow its declaration, but it may not
@@ -956,6 +969,61 @@ func (s *Store) TeamQueueAction(ctx context.Context, task string, req api.TeamQu
 			}
 			e.Ownership = ownership
 			e.Serial = false
+		case "owner_integrated":
+			if req.HandlerAgentID != "" || req.HandlerRunID != "" || req.LeadAgentID != "" || req.LeadRunID != "" {
+				return zero, fmt.Errorf("%w: only the owner records an integration", api.ErrConflict)
+			}
+			if !validGitCommit(req.OwnerIntegrationCommit) || len(req.OwnerIntegrationEvidence) > 2000 || strings.ContainsRune(req.OwnerIntegrationEvidence, '\x00') || len(req.ChangedFiles) > 4096 {
+				return zero, api.ErrInvalid
+			}
+			if e.ReleasedAt != "" || (e.State != "running" && e.State != "failed") {
+				return zero, fmt.Errorf("%w: only a running or unreleased failed entry can be marked integrated", api.ErrConflict)
+			}
+			if e.State == "failed" {
+				var plan struct {
+					Members []struct {
+						State string `json:"state"`
+					} `json:"members"`
+				}
+				if len(e.LaunchJSON) != 0 && json.Unmarshal(e.LaunchJSON, &plan) != nil {
+					return zero, api.ErrConflict
+				}
+				for _, m := range plan.Members {
+					if m.State == "uncertain" {
+						return zero, fmt.Errorf("%w: the failed launch has an uncertain spawn; release it with tt team queue release", api.ErrConflict)
+					}
+				}
+			}
+			var jobID, jobState string
+			jobErr := tx.QueryRowContext(ctx, `SELECT id,state FROM release_jobs WHERE task_id=? AND entry_id=? AND state NOT IN ('released','rolled_back')`, task, e.ID).Scan(&jobID, &jobState)
+			if jobErr == nil {
+				return zero, fmt.Errorf("%w: release job %s is %s; the deployment path owns this candidate", api.ErrConflict, jobID, jobState)
+			}
+			if !errors.Is(jobErr, sql.ErrNoRows) {
+				return zero, jobErr
+			}
+			changed := make([]string, 0, len(req.ChangedFiles))
+			for _, file := range req.ChangedFiles {
+				if file == "" || len(file) > 1024 || strings.ContainsRune(file, '\x00') {
+					return zero, api.ErrInvalid
+				}
+				changed = append(changed, file)
+			}
+			base := e.BaseCommit
+			if e.Acceptance != nil {
+				base = e.Acceptance.BaseCommit
+			}
+			e.OwnerIntegration = &api.TeamQueueOwnerIntegration{Commit: req.OwnerIntegrationCommit, BaseCommit: base, Evidence: req.OwnerIntegrationEvidence, ChangedFiles: changed, At: now}
+			// The released entry no longer holds ownership; recording the
+			// changed files keeps its list truthful where they are valid.
+			if narrowed, err := canonicalQueueOwnership(changed); err == nil && len(narrowed) > 0 {
+				e.Ownership = narrowed
+				e.Serial = false
+			}
+			e.ReleasedAt = now
+			if _, err = tx.ExecContext(ctx, `DELETE FROM team_launch_reservations WHERE task_id=? AND entry_id=?`, task, e.ID); err != nil {
+				return zero, err
+			}
 		case "release":
 			limit, err := queueConcurrencyLimit(ctx, tx, task)
 			if err != nil {
@@ -1296,12 +1364,12 @@ func (s *Store) TeamQueueAction(ctx context.Context, task string, req api.TeamQu
 				}
 			}
 		case "close":
-			if e.State != "running" || len(e.CloseJSON) != 0 || !json.Valid(req.CloseJSON) || len(req.CloseJSON) == 0 {
+			if !queueClosable(e) || len(e.CloseJSON) != 0 || !json.Valid(req.CloseJSON) || len(req.CloseJSON) == 0 {
 				return zero, api.ErrConflict
 			}
 			e.CloseJSON = req.CloseJSON
 		case "close_refresh":
-			if e.State != "running" || len(e.CloseJSON) == 0 {
+			if !queueClosable(e) || len(e.CloseJSON) == 0 {
 				return zero, api.ErrConflict
 			}
 			var previous api.TeamCloseRequest
@@ -1330,11 +1398,14 @@ func (s *Store) TeamQueueAction(ctx context.Context, task string, req api.TeamQu
 				return zero, err
 			}
 		case "finish":
-			if e.State != "running" || len(e.CloseJSON) == 0 {
+			if !queueClosable(e) || len(e.CloseJSON) == 0 {
 				return zero, api.ErrConflict
 			}
+			// An owner-integrated entry gave up its reservation when it was
+			// released; its close and cleanup receipts are still required.
+			ownerIntegrated := e.OwnerIntegration != nil
 			var reserved string
-			if err := tx.QueryRowContext(ctx, `SELECT entry_id FROM team_launch_reservations WHERE task_id=? AND entry_id=?`, task, e.ID).Scan(&reserved); err != nil || reserved != e.ID {
+			if err := tx.QueryRowContext(ctx, `SELECT entry_id FROM team_launch_reservations WHERE task_id=? AND entry_id=?`, task, e.ID).Scan(&reserved); !ownerIntegrated && (err != nil || reserved != e.ID) {
 				return zero, fmt.Errorf("%w: exact queue reservation is missing", api.ErrConflict)
 			}
 			var closeReq api.TeamCloseRequest
@@ -1379,7 +1450,10 @@ func (s *Store) TeamQueueAction(ctx context.Context, task string, req api.TeamQu
 			if item.Status != "done" && item.Status != "dismissed" {
 				return zero, fmt.Errorf("%w: item is not terminal", api.ErrConflict)
 			}
-			if item.Status == "done" && e.Repository != "" && (req.Integration == nil || e.Acceptance == nil) {
+			if ownerIntegrated && req.Integration != nil {
+				return zero, fmt.Errorf("%w: the owner integrated this entry; finish it without an integration snapshot", api.ErrInvalid)
+			}
+			if !ownerIntegrated && item.Status == "done" && e.Repository != "" && (req.Integration == nil || e.Acceptance == nil) {
 				return zero, fmt.Errorf("%w: exact handler acceptance receipt is required", api.ErrConflict)
 			}
 			if req.Integration != nil {
@@ -1608,7 +1682,7 @@ func sameTeamAcceptance(saved, submitted api.TeamIntegrationAcceptance) bool {
 // pendingTeamQueueAcceptance returns the item's running, repository-backed team
 // queue entry that still waits on handler acceptance, or nil.
 func pendingTeamQueueAcceptance(ctx context.Context, tx *sql.Tx, task, item string) (*api.TeamQueueEntry, error) {
-	e, err := scanTeamQueue(tx.QueryRowContext(ctx, `SELECT `+teamQueueCols+` FROM team_queue_entries WHERE task_id=? AND item_id=? AND state='running' AND repository<>'' AND acceptance_json='' ORDER BY position LIMIT 1`, task, item))
+	e, err := scanTeamQueue(tx.QueryRowContext(ctx, `SELECT `+teamQueueCols+` FROM team_queue_entries WHERE task_id=? AND item_id=? AND state='running' AND released_at='' AND repository<>'' AND acceptance_json='' ORDER BY position LIMIT 1`, task, item))
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}
@@ -1629,6 +1703,16 @@ func doneSaveQueueGate(ctx context.Context, tx *sql.Tx, task, item, agentID stri
 		return nil, err
 	}
 	if accept != nil {
+		var integratedID, integratedJSON string
+		lookupErr := tx.QueryRowContext(ctx, `SELECT id,owner_integration_json FROM team_queue_entries WHERE task_id=? AND item_id=? AND owner_integration_json<>'' ORDER BY position DESC LIMIT 1`, task, item).Scan(&integratedID, &integratedJSON)
+		if lookupErr != nil && !errors.Is(lookupErr, sql.ErrNoRows) {
+			return nil, lookupErr
+		}
+		if lookupErr == nil {
+			var record api.TeamQueueOwnerIntegration
+			_ = json.Unmarshal([]byte(integratedJSON), &record)
+			return nil, fmt.Errorf("%w: entry %s was integrated by the owner at %s; save done without --worktree/--branch/--commit", api.ErrConflict, integratedID, record.Commit)
+		}
 		if pending == nil || pending.ID != accept.EntryID {
 			return nil, fmt.Errorf("%w: no running team queue entry waits on this acceptance", api.ErrConflict)
 		}

@@ -246,7 +246,10 @@ func resolveRole(ctx context.Context, tx *sql.Tx, task api.Task, role, itemID st
 		if role == api.RoleLead {
 			err = tx.QueryRowContext(ctx, `SELECT agent_id,run_id FROM item_team_leads WHERE task_id=? AND item_id=? AND state<>'closed'`, task.ID, itemID).Scan(&id, &run)
 		} else {
-			err = tx.QueryRowContext(ctx, `SELECT handler_id,handler_run_id FROM team_queue_entries WHERE task_id=? AND item_id=? AND (state IN ('launching','running') OR (state='failed' AND released_at=''))`, task.ID, itemID).Scan(&id, &run)
+			// An owner-integrated entry is released but its team may still be
+			// live for post-release checks, so it keeps routing to the handler
+			// that served it. A plainly released entry's team is closed.
+			err = tx.QueryRowContext(ctx, `SELECT handler_id,handler_run_id FROM team_queue_entries WHERE task_id=? AND item_id=? AND state IN ('launching','running','failed') AND (released_at='' OR owner_integration_json<>'') ORDER BY position DESC LIMIT 1`, task.ID, itemID).Scan(&id, &run)
 		}
 		if err != nil && !errors.Is(err, sql.ErrNoRows) {
 			return api.Agent{}, err
