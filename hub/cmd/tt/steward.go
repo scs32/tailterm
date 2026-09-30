@@ -236,8 +236,32 @@ func setupSteward(ctx context.Context, d stewardDeps, e env, c *api.Client, task
 
 // launchStewardBriefing reads what a launch's briefing says about the
 // project's backlog steward.
-func launchStewardBriefing(ctx context.Context, c *api.Client, task, role string) (stewardBriefing, error) {
-	return stewardBriefing{}, nil
+// A project whose roster has no open steward needs no request, so its
+// briefings and requests stay exactly as before; a hub without the steward
+// route has no steward.
+func launchStewardBriefing(ctx context.Context, c *api.Client, task, role string, agents []api.Agent) (stewardBriefing, error) {
+	var out stewardBriefing
+	present := role == api.AgentRoleBacklogSteward
+	for _, a := range agents {
+		if a.Role == api.AgentRoleBacklogSteward && a.Status != api.AgentClosed {
+			present = true
+		}
+	}
+	if !present {
+		return out, nil
+	}
+	status, err := c.BacklogSteward(ctx, task)
+	var httpErr *api.HTTPError
+	if errors.As(err, &httpErr) && httpErr.Status == 404 {
+		return out, nil
+	}
+	if err != nil {
+		return out, fmt.Errorf("read the project's backlog steward: %w", err)
+	}
+	if status.Steward != nil {
+		out.Active = status.Steward.Name
+	}
+	return out, nil
 }
 
 func cmdSteward(e env, args []string) error {

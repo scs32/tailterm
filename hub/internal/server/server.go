@@ -48,6 +48,7 @@ func New(st *store.Store, identity Identity) *Server {
 	m.HandleFunc("POST /v1/tasks/{id}/handler-rotations", s.handlerRotationAction)
 	m.HandleFunc("GET /v1/tasks/{id}/handler-rotations/{rid}", s.getHandlerRotation)
 	m.HandleFunc("GET /v1/handler-rotations/due", s.handlerRotationsDue)
+	m.HandleFunc("GET /v1/tasks/{id}/backlog-steward", s.getBacklogSteward)
 	m.HandleFunc("DELETE /v1/tasks/{id}", s.closeTask)
 	m.HandleFunc("GET /v1/tasks/{id}/pause", s.getProjectPause)
 	m.HandleFunc("POST /v1/tasks/{id}/pause", s.pauseProject)

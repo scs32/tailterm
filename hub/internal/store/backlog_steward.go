@@ -114,3 +114,28 @@ func stewardPendingSuccessor(ctx context.Context, q queryRower, task, agentID st
 func stewardRotationOpenRefusal(ctx context.Context, q queryRower, task string) error {
 	return nil
 }
+
+// BacklogStewardStatus reads the project's steward for launches and briefings.
+func (s *Store) BacklogStewardStatus(ctx context.Context, task string) (api.BacklogStewardStatus, error) {
+	out := api.BacklogStewardStatus{TaskID: task}
+	if _, err := s.GetTask(ctx, task); err != nil {
+		return out, err
+	}
+	holder, held, err := stewardSlotHolder(ctx, s.db, task)
+	if err != nil {
+		return out, err
+	}
+	if held {
+		out.Holder = &holder
+		if holder.Status != api.AgentExited {
+			active := holder
+			out.Steward = &active
+		}
+	}
+	err = s.db.QueryRowContext(ctx, `SELECT id FROM agents WHERE task_id=? AND role=? AND status<>? AND steward_pending=1 ORDER BY created_at,id LIMIT 1`,
+		task, api.AgentRoleBacklogSteward, api.AgentClosed).Scan(&out.PendingSuccessorID)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return out, err
+	}
+	return out, nil
+}

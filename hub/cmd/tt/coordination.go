@@ -248,7 +248,7 @@ func agentTaskBriefingWithSteward(t api.Task, name, role, selfPath string, agent
 		return backlogStewardBriefing(briefing, agents, steward)
 	}
 	if role == api.AgentRoleDatabaseHandler && successor {
-		return briefing + queueHandlerAcceptanceBriefing() + primaryHandlerGuidance + handlerSuccessorBriefing
+		return briefing + queueHandlerAcceptanceBriefing() + primaryHandlerGuidance + steward.handlerLine() + handlerSuccessorBriefing
 	}
 	if role == api.AgentRoleDatabaseHandler {
 		briefing += queueHandlerAcceptanceBriefing()
@@ -261,15 +261,34 @@ func agentTaskBriefingWithSteward(t api.Task, name, role, selfPath string, agent
 			}
 			break
 		}
-		return briefing + primaryHandlerGuidance
+		return briefing + primaryHandlerGuidance + steward.handlerLine()
 	}
 	briefing += "\nALL agent work-item database reads and writes, including list/get/create/update/dispatch, must go through the Database handler. Do not use tt work-items, direct API calls, or database files yourself, even if the handler is unavailable. Send requests with the work-item ID (when known), original source context, work-order and result links. Coordinate through board/inbox/roster normally."
 	for _, agent := range agents {
 		if agent.Role == api.AgentRoleDatabaseHandler && agent.Status != api.AgentClosed && agent.Status != api.AgentExited {
-			return briefing + fmt.Sprintf("\nThis project's Database handler is %s. Send work-item requests to that exact agent name. Check its roster status and availability: retired/offline/unavailable is not permission to bypass the handler. Arrange authorized setup/resume or report a concrete dependency and pause dependent work until its verified work order arrives. Respect explicit owner retirement; never silently unretire it.", agent.Name)
+			return briefing + fmt.Sprintf("\nThis project's Database handler is %s. Send work-item requests to that exact agent name. Check its roster status and availability: retired/offline/unavailable is not permission to bypass the handler. Arrange authorized setup/resume or report a concrete dependency and pause dependent work until its verified work order arrives. Respect explicit owner retirement; never silently unretire it.", agent.Name) + steward.agentLine()
 		}
 	}
-	return briefing + "\nNo active Database handler is registered yet. Arrange handler setup/recovery through the orchestrator or owner, or report that concrete dependency. Pause dependent work until the handler supplies a verified work order; there is no direct database-access fallback."
+	return briefing + "\nNo active Database handler is registered yet. Arrange handler setup/recovery through the orchestrator or owner, or report that concrete dependency. Pause dependent work until the handler supplies a verified work order; there is no direct database-access fallback." + steward.agentLine()
+}
+
+// agentLine routes an ordinary agent's intake to the active steward. Without
+// one the briefing is unchanged.
+func (s stewardBriefing) agentLine() string {
+	if s.Active == "" {
+		return ""
+	}
+	return fmt.Sprintf("\nThis project's Backlog steward is %s. Send new bug/feature intake and follow-ups you find outside your bound item to it with tt send --to role:backlog_steward. Scope changes to your bound item stay with your handler.", s.Active)
+}
+
+// handlerLine tells the primary handler how intake flows through the active
+// steward. It is outside the handler template digest, so a steward's arrival
+// never rotates live handlers.
+func (s stewardBriefing) handlerLine() string {
+	if s.Active == "" {
+		return ""
+	}
+	return fmt.Sprintf("\nThis project's Backlog steward is %s. Forward raw bug/feature intake to it with tt send --to role:backlog_steward. Record the steward's drafted items as normal intake, with the original owner message as --source-seq and a stable --request-id, and accept its refine and dismiss requests for held follow-ups as ordinary updates.", s.Active)
 }
 
 func cmdBrief(e env) error {
@@ -307,7 +326,11 @@ func cmdBrief(e env) error {
 			}
 		}
 	}
-	fmt.Print(agentTaskBriefing(d.Task, e.agentName, role, selfPath(), d.Agents))
+	steward, err := launchStewardBriefing(ctx, c, e.task, role, d.Agents)
+	if err != nil {
+		return err
+	}
+	fmt.Print(agentTaskBriefingWithSteward(d.Task, e.agentName, role, selfPath(), d.Agents, 0, false, steward))
 	return nil
 }
 

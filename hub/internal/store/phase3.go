@@ -240,6 +240,18 @@ func deliveryIDs(open []ref) []string {
 // resolveRole finds the agent a role recipient means right now.
 func resolveRole(ctx context.Context, tx *sql.Tx, task api.Task, role, itemID string) (api.Agent, error) {
 	var row *sql.Row
+	// The backlog steward is project-wide in serial and parallel mode, with
+	// or without an item link. A pending rotation successor never holds it.
+	if role == api.RoleBacklogSteward {
+		a, ok, err := activeSteward(ctx, tx, task.ID)
+		if err != nil {
+			return api.Agent{}, err
+		}
+		if !ok {
+			return api.Agent{}, fmt.Errorf("%w: role:%s cannot be resolved: no running agent holds it", api.ErrConflict, role)
+		}
+		return a, nil
+	}
 	if itemID != "" && (role == api.RoleLead || role == api.RoleDatabaseHandler) {
 		var id, run string
 		var err error
@@ -286,7 +298,7 @@ func resolveRole(ctx context.Context, tx *sql.Tx, task api.Task, role, itemID st
 		}
 		row = tx.QueryRowContext(ctx, `SELECT `+agentCols+` FROM agents WHERE task_id=? AND role=? AND status NOT IN (?,?) AND id NOT IN (SELECT successor_agent_id FROM handler_rotations WHERE task_id=? AND state='prepared') ORDER BY created_at DESC LIMIT 1`, task.ID, api.AgentRoleDatabaseHandler, api.AgentClosed, api.AgentExited, task.ID)
 	default:
-		return api.Agent{}, fmt.Errorf("%w: unknown role %q; use role:lead or role:database_handler", api.ErrConflict, role)
+		return api.Agent{}, fmt.Errorf("%w: unknown role %q; use role:lead, role:database_handler or role:backlog_steward", api.ErrConflict, role)
 	}
 	a, err := scanAgent(row)
 	if errors.Is(err, sql.ErrNoRows) {

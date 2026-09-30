@@ -364,3 +364,126 @@ func TestStewardSetupRefusedInsideAgentSession(t *testing.T) {
 		t.Fatalf("agent-session setup: %v", err)
 	}
 }
+
+func (f *stewardCLI) agent(t *testing.T, name, role string) api.Agent {
+	t.Helper()
+	req := api.AddAgentRequest{Name: name, Host: "fixture", Session: name, Runtime: "claude", Cwd: f.dir}
+	if role != "" {
+		req.Role, req.AgentID = role, api.NewID("agt")
+	}
+	a, err := f.c.AddAgent(context.Background(), f.task.ID, req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.live(t, a)
+	return a
+}
+
+func (f *stewardCLI) steward(t *testing.T) api.Agent {
+	t.Helper()
+	a, err := setupSteward(context.Background(), f.deps(), f.e, f.c, f.task.ID, f.dir, "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.live(t, a)
+	return a
+}
+
+func TestStewardRoleRecipientThroughTTSend(t *testing.T) {
+	f := newStewardCLI(t)
+	ctx := context.Background()
+	// A parallel project (no fixed cap) needs a host policy first.
+	if _, err := f.c.TeamQueueAction(ctx, f.task.ID, api.TeamQueueRequest{RequestID: api.NewID("tqr"), Operation: "set_host_policy", Host: "fixture", HostPolicyVersion: 1,
+		HostPolicyExpires: time.Now().Add(time.Hour).UTC().Format(time.RFC3339), HostMaxSessions: 100, HostMaxPolling: 10, LimiterDomain: "https://fixture.invalid",
+		HostMaxRelayBindings: 100, HostMaxRequestsPerMinute: 100000, HostMaxBurst: 10000, HostHeadroomPercent: 20}); err != nil {
+		t.Fatal(err)
+	}
+	free := int64(1 << 20)
+	if _, err := f.c.TeamQueueAction(ctx, f.task.ID, api.TeamQueueRequest{RequestID: api.NewID("tqr"), Operation: "observe_host", Host: "fixture", HostUsage: &api.TeamHostUsage{Host: "fixture",
+		LimiterDomain: "https://fixture.invalid", PolicyVersion: 1, ObservedAt: time.Now().UTC().Format(time.RFC3339Nano), RelayBindings: 1, Complete: true,
+		SourceDigest: strings.Repeat("a", 64), FreeDiskMiB: &free}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.c.TeamQueueAction(ctx, f.task.ID, api.TeamQueueRequest{RequestID: api.NewID("tqr"), Operation: "set_limit", Host: "fixture", ConcurrencyLimit: 0}); err != nil {
+		t.Fatal(err)
+	}
+	if list, err := f.c.ListTeamQueue(ctx, f.task.ID); err != nil || list.ConcurrencyLimit != 0 {
+		t.Fatalf("fixture is not parallel: %+v %v", list.ConcurrencyLimit, err)
+	}
+	worker := f.agent(t, "builder", "")
+	e := env{hub: f.c.Base, task: f.task.ID, agent: worker.ID, agentName: worker.Name, runID: worker.RunID}
+	send := func(subject string) error {
+		return cmdSend(e, []string{"--kind", "request", "--to", "role:backlog_steward", "--subject", subject, "--ask", "Please research and draft this synthetic intake."})
+	}
+	if err := send("Intake before the steward exists"); err == nil || !strings.Contains(err.Error(), "no running agent holds it") {
+		t.Fatalf("send without a steward: %v", err)
+	}
+	steward := f.steward(t)
+	if _, err := captureStdout(t, func() error { return send("Intake outside the bound item") }); err != nil {
+		t.Fatal(err)
+	}
+	open, err := f.c.ListObligations(ctx, f.task.ID, steward.ID, "", true, false)
+	if err != nil || len(open) != 1 || open[0].AgentID != steward.ID {
+		t.Fatalf("steward obligations: %+v %v", open, err)
+	}
+}
+
+func TestStewardBriefingNamesStewardForAgentsAndHandler(t *testing.T) {
+	f := newStewardCLI(t)
+	handler := f.agent(t, "db-handler", api.AgentRoleDatabaseHandler)
+	worker := f.agent(t, "builder", "")
+	brief := func(a api.Agent) string {
+		t.Helper()
+		out, err := captureStdout(t, func() error {
+			return cmdBrief(env{hub: f.c.Base, task: f.task.ID, agent: a.ID, agentName: a.Name})
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return out
+	}
+	baseWorker, baseHandler := brief(worker), brief(handler)
+	// Without a steward, both briefings are byte-identical to the base emitter.
+	detail, err := f.c.GetTask(context.Background(), f.task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	agents := primaryHandlerFirst(detail.Task, detail.Agents)
+	if baseWorker != agentTaskBriefingForHandler(detail.Task, worker.Name, "", selfPath(), agents, 0, false) ||
+		baseHandler != agentTaskBriefingForHandler(detail.Task, handler.Name, api.AgentRoleDatabaseHandler, selfPath(), agents, 0, false) {
+		t.Fatal("briefings without a steward differ from the base")
+	}
+	if strings.Contains(baseWorker, "Backlog steward") || strings.Contains(baseHandler, "Backlog steward") {
+		t.Fatal("a briefing names a steward that does not exist")
+	}
+	digestBefore := handlerTemplateDigest("handler assignment")
+	steward := f.steward(t)
+	withWorker, withHandler := brief(worker), brief(handler)
+	sb := stewardBriefing{Active: steward.Name}
+	if withWorker != baseWorker+sb.agentLine() {
+		t.Fatalf("worker briefing with a steward:\n%s", strings.TrimPrefix(withWorker, baseWorker))
+	}
+	if !strings.Contains(withWorker, "Send new bug/feature intake and follow-ups you find outside your bound item to it with tt send --to role:backlog_steward") ||
+		!strings.Contains(withWorker, "Scope changes to your bound item stay with your handler") {
+		t.Fatal("worker briefing does not route intake to the steward")
+	}
+	if withHandler != baseHandler+sb.handlerLine() || !strings.Contains(withHandler, "with the original owner message as --source-seq") {
+		t.Fatalf("handler briefing with a steward:\n%s", strings.TrimPrefix(withHandler, baseHandler))
+	}
+	// The steward text sits outside the handler template: its digest and the
+	// runner's template check do not change.
+	if handlerTemplateDigest("handler assignment") != digestBefore || !strings.Contains(withHandler, primaryHandlerGuidance+sb.handlerLine()) {
+		t.Fatal("the steward changed the handler template")
+	}
+	due := api.HandlerRotationDue{RecordedDigest: digestBefore, Policy: api.HandlerRotationPolicy{OnTemplateChange: true}}
+	spec := handlerSpec{Args: []string{"--prompt", "handler assignment"}}
+	if reasons := rotationDueReasons(due, &spec); len(reasons) != 0 {
+		t.Fatalf("a steward's arrival made handler rotation due: %v", reasons)
+	}
+	// The steward's own briefing is its branch: direct reads, handler writes.
+	own := brief(steward)
+	if !strings.Contains(own, backlogStewardGuidance) || !strings.Contains(own, "This project's primary Database handler is db-handler") ||
+		strings.Contains(own, "Do not use tt work-items") || strings.Contains(own, "ALL agent work-item database reads and writes") {
+		t.Fatalf("steward briefing branch:\n%s", own)
+	}
+}

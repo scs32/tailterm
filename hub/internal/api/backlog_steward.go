@@ -1,6 +1,10 @@
 package api
 
-import "fmt"
+import (
+	"context"
+	"fmt"
+	"net/url"
+)
 
 // Backlog steward (docs/backlog-steward.md): one persistent agent per
 // project whose context is the backlog. It takes intake, researches it and
@@ -34,4 +38,21 @@ func (e *StewardRefusal) Unwrap() error { return ErrConflict }
 // parent or work item under a stable agent ID, and restart by expected run.
 func PersistentAgentRole(role string) bool {
 	return role == AgentRoleDatabaseHandler || role == AgentRoleDeployment || role == AgentRoleBacklogSteward
+}
+
+// BacklogStewardStatus is what launches and briefings need to know about a
+// project's steward.
+type BacklogStewardStatus struct {
+	TaskID string `json:"taskId"`
+	// Steward is the active steward, the one role:backlog_steward reaches.
+	Steward *Agent `json:"steward,omitempty"`
+	// Holder is the slot holder, which may be exited and awaiting a restart.
+	Holder *Agent `json:"holder,omitempty"`
+	// PendingSuccessorID is a prepared rotation's registered successor.
+	PendingSuccessorID string `json:"pendingSuccessorId,omitempty"`
+}
+
+func (c *Client) BacklogSteward(ctx context.Context, task string) (BacklogStewardStatus, error) {
+	var out BacklogStewardStatus
+	return out, c.do(ctx, "GET", "/v1/tasks/"+url.PathEscape(task)+"/backlog-steward", nil, &out)
 }

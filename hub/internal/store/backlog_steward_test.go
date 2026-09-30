@@ -252,3 +252,62 @@ func TestStewardPauseClosesSteward(t *testing.T) {
 		t.Fatalf("pause left a slot holder: %v %v", held, err)
 	}
 }
+
+// stewardRequestMessage sends a typed REQUEST from an agent to role:backlog_steward.
+func stewardRequestMessage(s *Store, task string, from api.Agent, subject string) (api.Message, error) {
+	env := api.Envelope{Kind: api.EnvelopeKindRequest, To: "role:" + api.RoleBacklogSteward, Subject: subject, Body: api.EnvelopeBody{Ask: "Please research and draft this synthetic intake."}}
+	return s.PostMessage(context.Background(), task, api.PostMessageRequest{Envelope: &env, Text: api.RenderText(env), AgentID: from.ID, RunID: from.RunID}, stewardBy)
+}
+
+func TestStewardRoleRecipient(t *testing.T) {
+	f := newChoresQueue(t, 1, 1, 0) // parallel mode: no fixed cap
+	ctx := context.Background()
+	if parallel, err := projectQueueParallel(ctx, f.s.db, f.task.ID); err != nil || !parallel {
+		t.Fatalf("fixture is not parallel: %v %v", parallel, err)
+	}
+	worker, err := f.s.AddAgent(ctx, f.task.ID, api.AddAgentRequest{Name: "worker", Host: "mini", Session: "worker", Runtime: "claude"}, stewardBy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// No steward: the role cannot be resolved.
+	if _, err = stewardRequestMessage(f.s, f.task.ID, worker, "Intake before any steward exists"); !errors.Is(err, api.ErrConflict) || !strings.Contains(err.Error(), "role:backlog_steward cannot be resolved: no running agent holds it") {
+		t.Fatalf("no steward: %v", err)
+	}
+	steward := liveSteward(t, f.s, f.task.ID, "backlog-steward")
+	// A pending rotation successor exists beside the holder.
+	pending := api.NewID("agt")
+	if _, err = f.s.db.Exec(`INSERT INTO agents (`+agentCols+`,steward_pending) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,1)`,
+		pending, f.task.ID, "backlog-steward-r2", "mini", "tt-steward-pending", "claude", "/tmp", "", api.AgentRoleBacklogSteward, api.AgentRunning, "", ts(f.s.now()), ts(f.s.now()), api.NewID("run"), ts(f.s.now()), "", "", false, ""); err != nil {
+		t.Fatal(err)
+	}
+	// An item-less request in a parallel project lands on the steward.
+	m, err := stewardRequestMessage(f.s, f.task.ID, worker, "Intake outside the bound item")
+	if err != nil || m.To != steward.ID {
+		t.Fatalf("role:backlog_steward: %+v %v", m, err)
+	}
+	obligations, err := f.s.ListObligations(ctx, f.task.ID, ObligationFilter{AgentID: steward.ID, OpenOnly: true}, f.s.now())
+	if err != nil || len(obligations) != 1 || obligations[0].MessageSeq != m.Seq {
+		t.Fatalf("steward obligations: %+v %v", obligations, err)
+	}
+	// An item link does not change the recipient.
+	env := api.Envelope{Kind: api.EnvelopeKindRequest, To: "role:" + api.RoleBacklogSteward, Subject: "Follow-up found while delivering an item", Body: api.EnvelopeBody{Ask: "Please research this synthetic follow-up."}}
+	linked, err := f.s.PostMessage(ctx, f.task.ID, api.PostMessageRequest{Envelope: &env, Text: api.RenderText(env), AgentID: worker.ID, RunID: worker.RunID,
+		WorkItems:        []api.MessageWorkItem{{ItemTaskID: f.task.ID, ItemID: f.items[0].ID, ItemRevision: f.items[0].Revision, Relationship: "primary"}},
+		WorkOrderMessage: &api.MessageReference{TaskID: f.task.ID, Seq: f.orders[0].Seq}, RequestID: api.NewID("req")}, stewardBy)
+	if err != nil || linked.To != steward.ID {
+		t.Fatalf("item-linked role:backlog_steward: %+v %v", linked, err)
+	}
+	if pendingObligations, _ := f.s.ListObligations(ctx, f.task.ID, ObligationFilter{AgentID: pending}, f.s.now()); len(pendingObligations) != 0 {
+		t.Fatalf("pending successor received role work: %+v", pendingObligations)
+	}
+	// An exited holder keeps the slot but receives nothing; the pending
+	// successor is never chosen instead.
+	setAgentStatus(t, f.s, steward.ID, api.AgentExited)
+	if _, err = stewardRequestMessage(f.s, f.task.ID, worker, "Intake while the steward is exited"); !errors.Is(err, api.ErrConflict) {
+		t.Fatalf("exited steward: %v", err)
+	}
+	status, err := f.s.BacklogStewardStatus(ctx, f.task.ID)
+	if err != nil || status.Steward != nil || status.Holder == nil || status.Holder.ID != steward.ID || status.PendingSuccessorID != pending {
+		t.Fatalf("status with an exited holder: %+v %v", status, err)
+	}
+}

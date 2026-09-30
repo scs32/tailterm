@@ -1124,7 +1124,7 @@ func cmdSpawn(e env, args []string) error {
 	if *handlerSuccessor && *role != api.AgentRoleDatabaseHandler {
 		return errors.New("--handler-successor requires --role database_handler")
 	}
-	steward, err := launchStewardBriefing(ctx, c, *task, *role)
+	steward, err := launchStewardBriefing(ctx, c, *task, *role, detail.Agents)
 	if err != nil {
 		return err
 	}
