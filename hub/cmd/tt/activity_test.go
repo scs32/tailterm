@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -1127,6 +1128,9 @@ func TestOwnerHelperOfflineActivity(t *testing.T) {
 		if got.State != "unknown" || got.Reason != "owner session offline" {
 			t.Fatalf("helper absent at %s: %+v", at, got)
 		}
+	}
+	if got := activityState(&c, helper, 0, true, true, errors.New("runtime discovery unavailable"), now, threshold); got.State != "unknown" || got.Reason != "owner session offline" {
+		t.Fatalf("helper unverified: %+v", got)
 	}
 	// The same absence is a crash for an ordinary agent.
 	var ordinary activityCursor

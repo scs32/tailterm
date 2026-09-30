@@ -27,19 +27,17 @@ var runIDPattern = regexp.MustCompile(`^run_[0-9a-f]{16}$`)
 var threadIDPattern = regexp.MustCompile(`^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$`)
 
 type runtimeBinding struct {
-	Hub       string `json:"hub"`
-	Task      string `json:"task"`
-	Agent     string `json:"agent"`
-	Run       string `json:"run"`
-	Thread    string `json:"thread"`
-	Codex     string `json:"codex"`
-	CodexHome string `json:"codexHome,omitempty"`
-	Runtime   string `json:"runtime,omitempty"`
-	Session   string `json:"session,omitempty"`
-	Cwd       string `json:"cwd,omitempty"`
-	// Role is set for the owner helper (api.AgentRoleOwnerHelper), whose
-	// binding is written by tt helper register and never rebound by the relay.
-	Role      string    `json:"role,omitempty"`
+	Hub       string    `json:"hub"`
+	Task      string    `json:"task"`
+	Agent     string    `json:"agent"`
+	Run       string    `json:"run"`
+	Thread    string    `json:"thread"`
+	Codex     string    `json:"codex"`
+	CodexHome string    `json:"codexHome,omitempty"`
+	Runtime   string    `json:"runtime,omitempty"`
+	Session   string    `json:"session,omitempty"`
+	Cwd       string    `json:"cwd,omitempty"`
+	Role      string    `json:"role,omitempty"` // owner_helper only: bound by tt helper register, never rebound
 	CreatedAt time.Time `json:"createdAt,omitempty"`
 }
 type relayProgress struct {

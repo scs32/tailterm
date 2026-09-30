@@ -8,7 +8,7 @@ import (
 	"github.com/scs32/tailterm/hub/internal/api"
 )
 
-func TestOwnerHelperRegisterHTTP(t *testing.T) {
+func TestOwnerHelperRegisterAndDelegateHTTP(t *testing.T) {
 	h := newTokenHub(t)
 	task, builder, _ := h.project()
 	base := "/v1/tasks/" + task.ID

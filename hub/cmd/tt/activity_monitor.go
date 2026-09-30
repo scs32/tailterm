@@ -83,15 +83,15 @@ func oldestPending(c *activityCursor) pendingActivityCall {
 
 func activityState(c *activityCursor, a api.Agent, openObligations int, tmuxAlive, processAlive bool, probeErr error, now time.Time, threshold activityThresholds) api.AgentActivity {
 	result := api.AgentActivity{State: "unknown", ObservedAt: now, LastEventAt: c.LastEventAt, Tokens: c.Tokens}
+	if a.Role == api.AgentRoleOwnerHelper && (probeErr != nil || !tmuxAlive || !processAlive) {
+		// The owner's own session: unverified or absent means offline, never crashed.
+		c.MissingSince = time.Time{}
+		result.Reason = "owner session offline"
+		return result
+	}
 	if probeErr != nil {
 		c.MissingSince = time.Time{}
 		result.Reason = "process probe unavailable"
-		return result
-	}
-	if a.Role == api.AgentRoleOwnerHelper && (!tmuxAlive || !processAlive) {
-		// The owner's own session: absent means offline, never crashed.
-		c.MissingSince = time.Time{}
-		result.Reason = "owner session offline"
 		return result
 	}
 	if a.Status == api.AgentRunning {
