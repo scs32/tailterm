@@ -88,3 +88,26 @@ func TestBacklogSummaryHTTPLimit(t *testing.T) {
 		t.Fatalf("revisions = %d %+v", code, list)
 	}
 }
+
+func TestStewardRefusedWorkItemWritesOverHTTP(t *testing.T) {
+	c := newClient(t)
+	task := c.task("steward-refused")
+	steward := c.steward(task, "backlog-steward")
+	var refusal api.ErrorResponse
+	if code := c.do("POST", "/v1/tasks/"+task.ID+"/work-items", api.CreateWorkItemRequest{Kind: "bug", Title: "Drafted by the steward", AgentID: steward.ID, RequestID: "steward-create"}, &refusal); code != 409 || refusal.Code != api.StewardRefusedWrite {
+		t.Fatalf("steward create = %d %+v", code, refusal)
+	}
+	var item api.WorkItem
+	if code := c.do("POST", "/v1/tasks/"+task.ID+"/work-items", api.CreateWorkItemRequest{Kind: "bug", Title: "Filed by the owner", RequestID: "owner-create"}, &item); code != 201 {
+		t.Fatalf("owner create = %d", code)
+	}
+	title := "Retitled by the steward"
+	refusal = api.ErrorResponse{}
+	if code := c.do("POST", "/v1/tasks/"+task.ID+"/work-items/"+item.ID+"/updates", api.CreateWorkItemUpdate{ExpectedRevision: item.Revision, Title: &title, AgentID: steward.ID, RunID: steward.RunID, RequestID: "steward-update"}, &refusal); code != 409 || refusal.Code != api.StewardRefusedWrite {
+		t.Fatalf("steward update = %d %+v", code, refusal)
+	}
+	env := api.Envelope{Kind: api.EnvelopeKindNotice, Subject: "Backlog summary revision one is saved", Body: api.EnvelopeBody{Text: "Themes grouped."}}
+	if code := c.do("POST", "/v1/tasks/"+task.ID+"/messages", api.PostMessageRequest{Envelope: &env, Text: api.RenderText(env), AgentID: steward.ID, RunID: steward.RunID}, nil); code != 201 {
+		t.Fatalf("steward notice = %d", code)
+	}
+}

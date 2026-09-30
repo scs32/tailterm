@@ -149,6 +149,9 @@ func (s *Store) CorrectMessageAudit(ctx context.Context, taskID string, seq int6
 	if err := basicAuditMutationScope(taskID, seq, req.RequestID, req.AgentID, req.RunID, req.ExpectedRevision); err != nil {
 		return api.MessageAuditMutationResult{}, false, err
 	}
+	if err := refuseStewardWrite(s.db, ctx, taskID, req.AgentID); err != nil {
+		return api.MessageAuditMutationResult{}, false, err
+	}
 	req.Desired.WorkItems = orderAuditLinks(req.Desired.WorkItems)
 	req.Sources = normalizeAuditSources(req.Sources)
 	payload := messageAuditMutationHash(taskID, seq, "correct", req)
@@ -225,6 +228,9 @@ func (s *Store) ResolveMessageAudit(ctx context.Context, taskID string, seq int6
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
 	if err := basicAuditMutationScope(taskID, seq, req.RequestID, req.AgentID, req.RunID, req.ExpectedRevision); err != nil {
+		return api.MessageAuditMutationResult{}, false, err
+	}
+	if err := refuseStewardWrite(s.db, ctx, taskID, req.AgentID); err != nil {
 		return api.MessageAuditMutationResult{}, false, err
 	}
 	if req.NewItem != nil && req.NewItem.Priority == "" {

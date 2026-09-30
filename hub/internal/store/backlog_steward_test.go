@@ -532,3 +532,92 @@ func TestBacklogSummaryRevisionsReplayAndWriters(t *testing.T) {
 		t.Fatalf("empty summary: %v", err)
 	}
 }
+
+func TestStewardRefusedRecordsWritesWhileHandlerSucceeds(t *testing.T) {
+	s, task := stewardStore(t)
+	ctx := context.Background()
+	handler, err := s.AddAgent(ctx, task.ID, api.AddAgentRequest{AgentID: api.NewID("agt"), Name: "db-handler", Role: api.AgentRoleDatabaseHandler, Host: "mini", Session: "handler"}, stewardBy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = s.PostEvent(ctx, task.ID, api.PostEventRequest{AgentID: handler.ID, RunID: handler.RunID, Kind: api.EventRunning}, stewardBy); err != nil {
+		t.Fatal(err)
+	}
+	steward := liveSteward(t, s, task.ID, "backlog-steward")
+	other, err := s.CreateTask(ctx, api.CreateTaskRequest{Name: "Dispatch target"}, stewardBy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	item, err := s.CreateWorkItem(ctx, task.ID, api.CreateWorkItemRequest{Kind: "bug", Title: "Filed by the owner", Description: "owner acceptance and files", Priority: "normal", RequestID: "owner-item"}, stewardBy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	source, err := s.PostMessage(ctx, task.ID, api.PostMessageRequest{Text: "Owner intake evidence", RequestID: "source"}, stewardBy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	link := []api.MessageWorkItem{{ItemTaskID: task.ID, ItemID: item.ID, ItemRevision: item.Revision, Relationship: "primary"}}
+	order, err := s.PostMessage(ctx, task.ID, api.PostMessageRequest{Text: "bounded owner order", AuditKind: api.MessageAuditWork, RequestID: "order", WorkItems: link}, stewardBy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantWrite := func(name string, err error) {
+		t.Helper()
+		if stewardCode(err) != api.StewardRefusedWrite || !strings.Contains(err.Error(), "files through the database handler") {
+			t.Fatalf("%s by the steward: %v", name, err)
+		}
+	}
+	title := "Retitled by the steward"
+	_, err = s.CreateWorkItem(ctx, task.ID, api.CreateWorkItemRequest{Kind: "bug", Title: "Drafted by the steward", Priority: "normal", AgentID: steward.ID, RequestID: "steward-create"}, stewardBy)
+	wantWrite("create", err)
+	_, err = s.UpdateWorkItem(ctx, task.ID, item.ID, api.UpdateWorkItemRequest{Revision: item.Revision, Title: &title, AgentID: steward.ID}, stewardBy)
+	wantWrite("update", err)
+	_, _, err = s.CreateWorkItemUpdate(ctx, task.ID, item.ID, api.CreateWorkItemUpdate{ExpectedRevision: item.Revision, Title: &title, AgentID: steward.ID, RunID: steward.RunID, RequestID: "steward-keyed-update"}, stewardBy)
+	wantWrite("keyed update", err)
+	_, err = s.DispatchWorkItem(ctx, task.ID, item.ID, api.DispatchWorkItemRequest{Revision: item.Revision, TargetTaskID: other.ID, AgentID: steward.ID, RequestID: "steward-dispatch"}, stewardBy)
+	wantWrite("dispatch", err)
+	correct := api.CorrectMessageAuditRequest{RequestID: "steward-correct", ExpectedRevision: 1, Reason: "steward correction",
+		Sources: []api.MessageReference{{TaskID: task.ID, Seq: source.Seq}}, Desired: api.MessageAuditDesiredState{Classification: api.MessageAuditIntake}, AgentID: steward.ID, RunID: steward.RunID}
+	_, _, err = s.CorrectMessageAudit(ctx, task.ID, order.Seq, correct, stewardBy)
+	wantWrite("message-audit correction", err)
+	_, _, err = s.ResolveMessageAudit(ctx, task.ID, order.Seq, api.ResolveMessageAuditRequest{RequestID: "steward-resolve", ExpectedRevision: 1, Reason: "steward resolve",
+		ExistingItem: &link[0], Sources: []api.MessageReference{{TaskID: task.ID, Seq: source.Seq}}, AgentID: steward.ID, RunID: steward.RunID}, stewardBy)
+	wantWrite("message-audit resolution", err)
+	// Handler-run records already require the exact handler run.
+	if _, _, err = s.CreateMessageAuditAssociation(ctx, task.ID, api.CreateMessageAuditAssociationRequest{RequestID: "steward-associate", Item: api.MessageAuditItemReference{ItemTaskID: task.ID, ItemID: item.ID, ItemRevision: item.Revision},
+		Source: api.MessageReference{TaskID: task.ID, Seq: source.Seq}, Reason: "steward association", AgentID: steward.ID, RunID: steward.RunID}, stewardBy); err == nil {
+		t.Fatal("message-audit association by the steward")
+	}
+	scope := api.ConfirmWorkOrderScopeRequest{RequestID: "steward-scope", AgentID: steward.ID, RunID: steward.RunID, ExpectedRevision: item.Revision, ScopeRevision: item.ScopeRevision, OrderMessageSeq: order.Seq, Complete: true}
+	if _, err = s.ConfirmWorkOrderScope(ctx, task.ID, item.ID, scope); !errors.Is(err, api.ErrConflict) {
+		t.Fatalf("scope confirm by the steward: %v", err)
+	}
+	if _, err = s.SaveVerification(ctx, task.ID, item.ID, api.VerificationRequest{RequestID: "steward-plan", AgentID: steward.ID, RunID: steward.RunID, Plan: &api.VerificationPlan{}}); !errors.Is(err, api.ErrConflict) {
+		t.Fatalf("verification plan by the steward: %v", err)
+	}
+	if _, err = s.ReleaseAction(ctx, task.ID, api.ReleaseRequest{RequestID: "steward-release", Operation: "enqueue", AgentID: steward.ID, RunID: steward.RunID, EntryID: api.NewID("tqe")}); !errors.Is(err, api.ErrConflict) {
+		t.Fatalf("release enqueue by the steward: %v", err)
+	}
+	if got, _ := s.GetWorkItem(ctx, task.ID, item.ID); got.Revision != item.Revision || got.Title != item.Title {
+		t.Fatalf("a refused steward write changed the item: %+v", got)
+	}
+	// The same calls from the handler still succeed.
+	if _, err = s.CreateWorkItem(ctx, task.ID, api.CreateWorkItemRequest{Kind: "bug", Title: "Drafted by the steward, filed by the handler", Priority: "normal", AgentID: handler.ID, SourceMessageSeq: source.Seq, RequestID: "handler-create"}, stewardBy); err != nil {
+		t.Fatalf("handler create: %v", err)
+	}
+	if _, err = s.ConfirmWorkOrderScope(ctx, task.ID, item.ID, api.ConfirmWorkOrderScopeRequest{RequestID: "handler-scope", AgentID: handler.ID, RunID: handler.RunID, ExpectedRevision: item.Revision, ScopeRevision: item.ScopeRevision, OrderMessageSeq: order.Seq, Complete: true}); err != nil {
+		t.Fatalf("handler scope confirm: %v", err)
+	}
+	correct.RequestID, correct.AgentID, correct.RunID = "handler-correct", handler.ID, handler.RunID
+	if _, _, err = s.CorrectMessageAudit(ctx, task.ID, order.Seq, correct, stewardBy); err != nil {
+		t.Fatalf("handler message-audit correction: %v", err)
+	}
+	if updated, err := s.UpdateWorkItem(ctx, task.ID, item.ID, api.UpdateWorkItemRequest{Revision: item.Revision, Title: &title, AgentID: handler.ID}, stewardBy); err != nil || updated.Title != title {
+		t.Fatalf("handler update: %+v %v", updated, err)
+	}
+	// The steward still posts ordinary messages.
+	env := api.Envelope{Kind: api.EnvelopeKindNotice, Subject: "Backlog summary revision two is saved", Body: api.EnvelopeBody{Text: "Themes regrouped."}}
+	if _, err = s.PostMessage(ctx, task.ID, api.PostMessageRequest{Envelope: &env, Text: api.RenderText(env), AgentID: steward.ID, RunID: steward.RunID}, stewardBy); err != nil {
+		t.Fatalf("steward notice: %v", err)
+	}
+}

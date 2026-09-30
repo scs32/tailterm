@@ -259,6 +259,9 @@ func (s *Store) CreateWorkItem(ctx context.Context, taskID string, req api.Creat
 	if err = validateWorkItemAgent(tx, ctx, taskID, req.AgentID); err != nil {
 		return api.WorkItem{}, err
 	}
+	if err = refuseStewardWrite(tx, ctx, taskID, req.AgentID); err != nil {
+		return api.WorkItem{}, err
+	}
 	if err = validateSourceMessage(tx, ctx, taskID, req.SourceMessageSeq); err != nil {
 		return api.WorkItem{}, err
 	}
@@ -358,6 +361,9 @@ func (s *Store) UpdateWorkItem(ctx context.Context, taskID, itemID string, req a
 		}
 	}
 	if err = validateWorkItemAgent(tx, ctx, taskID, req.AgentID); err != nil {
+		return api.WorkItem{}, err
+	}
+	if err = refuseStewardWrite(tx, ctx, taskID, req.AgentID); err != nil {
 		return api.WorkItem{}, err
 	}
 	changed := map[string]any{}
@@ -582,6 +588,9 @@ func (s *Store) CreateWorkItemUpdate(ctx context.Context, taskID, itemID string,
 	if err = validateWorkItemAgent(tx, ctx, taskID, req.AgentID); err != nil {
 		return api.WorkItemUpdateResult{}, false, err
 	}
+	if err = refuseStewardWrite(tx, ctx, taskID, req.AgentID); err != nil {
+		return api.WorkItemUpdateResult{}, false, err
+	}
 	if req.RunID != "" {
 		var currentRun string
 		if err := tx.QueryRowContext(ctx, `SELECT run_id FROM agents WHERE task_id=? AND id=?`, taskID, req.AgentID).Scan(&currentRun); err != nil {
@@ -760,6 +769,9 @@ func (s *Store) DispatchWorkItem(ctx context.Context, taskID, itemID string, req
 		return api.WorkItemDispatchResult{}, workItemConflict("Queue dispatch is blocked while either project is paused")
 	}
 	if err = validateWorkItemAgent(tx, ctx, taskID, req.AgentID); err != nil {
+		return api.WorkItemDispatchResult{}, err
+	}
+	if err = refuseStewardWrite(tx, ctx, taskID, req.AgentID); err != nil {
 		return api.WorkItemDispatchResult{}, err
 	}
 	if req.AgentID != "" && req.TargetTaskID != taskID {

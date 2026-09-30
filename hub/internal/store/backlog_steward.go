@@ -933,3 +933,25 @@ func (s *Store) StewardRotationsDue(ctx context.Context, host, templateDigest st
 	}
 	return out, nil
 }
+
+// refuseStewardWrite refuses a records write that declares the backlog
+// steward's identity: the steward files through the database handler. Like
+// the handler rule, it is an audit guard for tt-CLI writes, not access
+// control: an owner caller with no agent identity is not checked.
+func refuseStewardWrite(q queryRower, ctx context.Context, task, agentID string) error {
+	if agentID == "" {
+		return nil
+	}
+	var role string
+	err := q.QueryRowContext(ctx, `SELECT role FROM agents WHERE task_id=? AND id=?`, task, agentID).Scan(&role)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if role == api.AgentRoleBacklogSteward {
+		return &api.StewardRefusal{Code: api.StewardRefusedWrite, Detail: "the backlog steward files through the database handler; send it a REQUEST"}
+	}
+	return nil
+}
