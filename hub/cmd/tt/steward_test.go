@@ -487,3 +487,35 @@ func TestStewardBriefingNamesStewardForAgentsAndHandler(t *testing.T) {
 		t.Fatalf("steward briefing branch:\n%s", own)
 	}
 }
+
+// The store test files a real review follow-up; here an item with the same
+// hub-written description checks the CLI's steward access and printer.
+func TestTriageHeldForTriageCLIAsSteward(t *testing.T) {
+	f := newStewardCLI(t)
+	ctx := context.Background()
+	steward := f.steward(t)
+	held, err := f.c.CreateWorkItem(ctx, f.task.ID, api.CreateWorkItemRequest{Kind: "bug", Title: "Refuse an empty recipient in the review fixture", Priority: "normal",
+		Description: "Review follow-up from wi_0000000000000001, message #7. Held for triage.\n{\"id\":\"f1\"}", RequestID: api.NewID("req")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = f.c.CreateWorkItem(ctx, f.task.ID, api.CreateWorkItemRequest{Kind: "bug", Title: "An ordinary open item", Priority: "normal", RequestID: api.NewID("req")}); err != nil {
+		t.Fatal(err)
+	}
+	e := env{hub: f.c.Base, task: f.task.ID, agent: steward.ID, agentName: steward.Name, runID: steward.RunID}
+	out, err := captureStdout(t, func() error { return cmdWorkItems(e, []string{"triage", "--project", f.task.ID}) })
+	if err != nil || !strings.Contains(out, "Review follow-ups held for triage (1):") || !strings.Contains(out, held.ID) {
+		t.Fatalf("steward triage text: %q %v", out, err)
+	}
+	out, err = captureStdout(t, func() error { return cmdWorkItems(e, []string{"triage", "--project", f.task.ID, "--json"}) })
+	var got api.WorkItemTriage
+	if err != nil || json.Unmarshal([]byte(out), &got) != nil || len(got.HeldForTriage) != 1 || got.HeldForTriage[0].Item.ID != held.ID {
+		t.Fatalf("steward triage JSON: %q %v", out, err)
+	}
+	// A stale steward run is refused.
+	stale := e
+	stale.runID = api.NewID("run")
+	if _, err = captureStdout(t, func() error { return cmdWorkItems(stale, []string{"triage", "--project", f.task.ID}) }); err == nil {
+		t.Fatal("a stale steward run read triage")
+	}
+}

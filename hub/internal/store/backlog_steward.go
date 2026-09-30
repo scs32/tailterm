@@ -139,3 +139,19 @@ func (s *Store) BacklogStewardStatus(ctx context.Context, task string) (api.Back
 	}
 	return out, nil
 }
+
+// requireActiveStewardRun admits only the exact run of the project's active
+// steward: not pending, retired, closed or exited.
+func requireActiveStewardRun(ctx context.Context, q queryRower, task, agentID, runID string) error {
+	if agentID == "" || runID == "" {
+		return api.ErrConflict
+	}
+	a, ok, err := activeSteward(ctx, q, task)
+	if err != nil {
+		return err
+	}
+	if !ok || a.ID != agentID || a.RunID != runID || a.Status == api.AgentRetired {
+		return fmt.Errorf("%w: not the active backlog steward's exact run", api.ErrConflict)
+	}
+	return nil
+}

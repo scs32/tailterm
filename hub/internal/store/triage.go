@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/scs32/tailterm/hub/internal/api"
@@ -14,8 +15,9 @@ import (
 // WorkItemTriage computes backlog suggestions for the owner to confirm:
 // likely duplicate open items, open items a done item appears to have
 // delivered, and open items with no activity for staleDays. It only reads.
-// The owner's unbound session (no agent) or an available database handler's
-// exact run may read it; other agent sessions are refused.
+// The owner's unbound session (no agent), an available database handler's
+// exact run or the active backlog steward's exact run may read it; other
+// agent sessions are refused.
 func (s *Store) WorkItemTriage(ctx context.Context, task string, staleDays int, agentID, runID string) (api.WorkItemTriage, error) {
 	var zero api.WorkItemTriage
 	if !api.ValidID(task, "tsk") || staleDays < 0 || staleDays > 3650 {
@@ -26,7 +28,9 @@ func (s *Store) WorkItemTriage(ctx context.Context, task string, staleDays int, 
 	}
 	if agentID != "" || runID != "" {
 		if err := requireScopeHandler(s.db, ctx, task, agentID, runID); err != nil {
-			return zero, fmt.Errorf("%w: only the owner or a database handler may run triage", api.ErrConflict)
+			if stewardErr := requireActiveStewardRun(ctx, s.db, task, agentID, runID); stewardErr != nil {
+				return zero, fmt.Errorf("%w: only the owner or a database handler (or the active backlog steward's exact run) may run triage", api.ErrConflict)
+			}
 		}
 	}
 	if _, err := s.GetTask(ctx, task); err != nil {
@@ -57,7 +61,7 @@ func (s *Store) WorkItemTriage(ctx context.Context, task string, staleDays int, 
 		return zero, err
 	}
 	now := s.now()
-	out := api.WorkItemTriage{TaskID: task, StaleDays: staleDays, GeneratedAt: ts(now), Duplicates: []api.TriageDuplicate{}, AlreadyReleased: []api.TriageAlreadyDone{}, Stale: []api.TriageStale{}}
+	out := api.WorkItemTriage{TaskID: task, StaleDays: staleDays, GeneratedAt: ts(now), Duplicates: []api.TriageDuplicate{}, AlreadyReleased: []api.TriageAlreadyDone{}, Stale: []api.TriageStale{}, HeldForTriage: []api.TriageHeld{}}
 	ref := func(item api.WorkItem) api.TriageItem {
 		return api.TriageItem{ID: item.ID, Title: item.Title, Status: item.Status}
 	}
@@ -78,6 +82,11 @@ func (s *Store) WorkItemTriage(ctx context.Context, task string, staleDays int, 
 				match := ref(d)
 				out.AlreadyReleased = append(out.AlreadyReleased, api.TriageAlreadyDone{Item: ref(item), Done: &match, TitleSimilarity: title, CriteriaSimilarity: criteria})
 			}
+		}
+	}
+	for _, item := range open {
+		if heldReviewFollowUp(item) {
+			out.HeldForTriage = append(out.HeldForTriage, api.TriageHeld{Item: ref(item), SourceMessageSeq: item.SourceMessageSeq})
 		}
 	}
 	cutoff := now.Add(-time.Duration(staleDays) * 24 * time.Hour)
@@ -116,4 +125,10 @@ func itemLastActivity(ctx context.Context, q queryRower, task string, item api.W
 		}
 	}
 	return last, nil
+}
+
+// heldReviewFollowUp matches the description fileReviewFollowUp writes. Once
+// the handler refines the item its revision rises and it leaves the list.
+func heldReviewFollowUp(item api.WorkItem) bool {
+	return item.Revision == 1 && strings.HasPrefix(item.Description, "Review follow-up from ") && strings.Contains(item.Description, "Held for triage.")
 }

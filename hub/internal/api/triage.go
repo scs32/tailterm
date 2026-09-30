@@ -15,6 +15,9 @@ type WorkItemTriage struct {
 	Duplicates      []TriageDuplicate   `json:"duplicates"`
 	AlreadyReleased []TriageAlreadyDone `json:"alreadyReleased"`
 	Stale           []TriageStale       `json:"stale"`
+	// HeldForTriage lists review follow-ups the hub filed and held that no
+	// one has refined yet (still at revision 1).
+	HeldForTriage []TriageHeld `json:"heldForTriage"`
 }
 
 type TriageItem struct {
@@ -41,6 +44,13 @@ type TriageAlreadyDone struct {
 	NamedInRelease     bool        `json:"namedInRelease,omitempty"`
 }
 
+// TriageHeld is an open review follow-up, filed by the hub and held for
+// triage, that has not been refined.
+type TriageHeld struct {
+	Item             TriageItem `json:"item"`
+	SourceMessageSeq int64      `json:"sourceMessageSeq"`
+}
+
 // TriageStale is an open item with no activity for the stale period.
 type TriageStale struct {
 	Item         TriageItem `json:"item"`
@@ -49,7 +59,8 @@ type TriageStale struct {
 }
 
 // WorkItemTriage reads the suggestions. An agent session names its exact run;
-// only the owner's unbound session or a database handler may read them.
+// only the owner's unbound session, a database handler or the project's
+// active backlog steward may read them.
 func (c *Client) WorkItemTriage(ctx context.Context, task string, staleDays int, agentID, runID string) (WorkItemTriage, error) {
 	q := url.Values{}
 	if staleDays > 0 {

@@ -2,11 +2,13 @@ package store
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/scs32/tailterm/hub/internal/api"
 )
@@ -181,7 +183,8 @@ func TestStewardOnePerProjectConcurrentAdmission(t *testing.T) {
 func liveSteward(t *testing.T, s *Store, task, name string) api.Agent {
 	t.Helper()
 	a := addSteward(t, s, task, name)
-	if _, err := s.db.Exec(`UPDATE agents SET last_seen_at=?,status='running' WHERE id=?`, ts(s.now()), a.ID); err != nil {
+	// Online compares with the wall clock, even under a fixture clock.
+	if _, err := s.db.Exec(`UPDATE agents SET last_seen_at=?,status='running' WHERE id=?`, ts(time.Now().UTC()), a.ID); err != nil {
 		t.Fatal(err)
 	}
 	now := s.now()
@@ -309,5 +312,160 @@ func TestStewardRoleRecipient(t *testing.T) {
 	status, err := f.s.BacklogStewardStatus(ctx, f.task.ID)
 	if err != nil || status.Steward != nil || status.Holder == nil || status.Holder.ID != steward.ID || status.PendingSuccessorID != pending {
 		t.Fatalf("status with an exited holder: %+v %v", status, err)
+	}
+}
+
+func TestStewardDecisionRoutedToDelegate(t *testing.T) {
+	f := newDelegationFixture(t)
+	ctx := context.Background()
+	steward := liveSteward(t, f.s, f.task.ID, "backlog-steward")
+	propose := func(key string) api.Message {
+		t.Helper()
+		m, err := f.s.CreateDecision(ctx, f.task.ID, api.CreateDecisionRequest{AgentID: steward.ID, RequestID: key,
+			WorkItems: []api.MessageWorkItem{{ItemTaskID: f.item.TaskID, ItemID: f.item.ID, ItemRevision: f.item.Revision, Relationship: "primary"}},
+			DecisionRequest: api.DecisionRequest{Question: "Should these two small items ship as one batch?", Category: "decision", RecommendedOptionID: "batch",
+				RecommendationReason: "They touch the same files.", Options: []api.DecisionOption{{ID: "batch", Label: "Batch", Description: "One team delivers both."},
+					{ID: "separate", Label: "Separate", Description: "Queue them apart."}}}}, f.by)
+		if err != nil {
+			t.Fatalf("steward decision %s: %v", key, err)
+		}
+		return m
+	}
+	// A steward-authored decision with item refs is stored.
+	first := propose("steward-batch-1")
+	if first.DecisionRequest == nil || first.From.AgentID != steward.ID || len(first.WorkItems) != 1 || first.WorkItems[0].ItemID != f.item.ID {
+		t.Fatalf("stored decision: %+v", first)
+	}
+	// An open decisions window routes it to the delegate.
+	w := f.open(t, "window-to-lead", api.DelegationScopeDecisions, time.Hour)
+	if routed(f.window(t), api.DelegationRouteDecision, first.Seq) == nil {
+		t.Fatalf("steward decision not routed: %+v", f.window(t).Routes)
+	}
+	answer, err := f.s.AnswerDecision(ctx, f.task.ID, first.Seq, api.AnswerDecisionRequest{RequestID: "delegate-answer", AgentID: f.lead.ID, RunID: f.lead.RunID, OptionID: "batch", Rationale: "Same files; one team."}, f.by)
+	if err != nil || answer.To != steward.ID || answer.From.AgentID != f.lead.ID {
+		t.Fatalf("delegate answer: %+v %v", answer, err)
+	}
+	// A window whose delegate is the steward never routes the steward's own decision.
+	if _, err = f.s.CloseDelegationWindow(ctx, f.task.ID, w.ID, api.CloseDelegationWindowRequest{RequestID: "close-lead-window"}, f.by); err != nil {
+		t.Fatal(err)
+	}
+	out, err := f.s.OpenDelegationWindow(ctx, f.task.ID, api.OpenDelegationWindowRequest{Delegate: steward.Name, EndsAt: f.s.now().Add(time.Hour), Scope: api.DelegationScopeDecisions,
+		Source: &api.DelegationSource{Kind: api.DelegationSourceTT}, RequestID: "window-to-steward"}, f.by)
+	if err != nil || out.Window == nil || out.Window.DelegateAgentID != steward.ID {
+		t.Fatalf("steward window: %+v %v", out, err)
+	}
+	own := propose("steward-batch-2")
+	list, err := f.s.ListDelegationWindows(ctx, f.task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, win := range list.Windows {
+		if routed(win, api.DelegationRouteDecision, own.Seq) != nil {
+			t.Fatalf("the steward's own decision was routed to itself: %+v", win.Routes)
+		}
+	}
+}
+
+func TestTriageStewardAccess(t *testing.T) {
+	s, task := stewardStore(t)
+	ctx := context.Background()
+	steward := liveSteward(t, s, task.ID, "backlog-steward")
+	if _, err := s.WorkItemTriage(ctx, task.ID, 0, steward.ID, steward.RunID); err != nil {
+		t.Fatalf("active steward triage: %v", err)
+	}
+	worker, err := s.AddAgent(ctx, task.ID, api.AddAgentRequest{Name: "worker", Host: "mini", Session: "worker", Runtime: "claude"}, stewardBy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pending := api.NewID("agt")
+	pendingRun := api.NewID("run")
+	if _, err = s.db.Exec(`INSERT INTO agents (`+agentCols+`,steward_pending) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,1)`,
+		pending, task.ID, "backlog-steward-r2", "mini", "tt-steward-pending", "claude", "/tmp", "", api.AgentRoleBacklogSteward, api.AgentRunning, "", ts(s.now()), ts(s.now()), pendingRun, ts(time.Now().UTC()), "", "", false, ""); err != nil {
+		t.Fatal(err)
+	}
+	for name, who := range map[string][2]string{
+		"stale steward run": {steward.ID, api.NewID("run")},
+		"pending successor": {pending, pendingRun},
+		"ordinary agent":    {worker.ID, worker.RunID},
+		"missing run":       {steward.ID, ""},
+	} {
+		if _, err := s.WorkItemTriage(ctx, task.ID, 0, who[0], who[1]); !errors.Is(err, api.ErrConflict) {
+			t.Fatalf("%s triage: %v", name, err)
+		}
+	}
+	setAgentStatus(t, s, steward.ID, api.AgentRetired)
+	if _, err := s.WorkItemTriage(ctx, task.ID, 0, steward.ID, steward.RunID); !errors.Is(err, api.ErrConflict) {
+		t.Fatalf("retired steward triage: %v", err)
+	}
+	// The owner's unbound session is unaffected.
+	if _, err := s.WorkItemTriage(ctx, task.ID, 0, "", ""); err != nil {
+		t.Fatalf("owner triage: %v", err)
+	}
+}
+
+// fileHeldFollowUp files a review follow-up the way review convergence does.
+func fileHeldFollowUp(t *testing.T, s *Store, task api.Task, title string) api.WorkItem {
+	t.Helper()
+	ctx := context.Background()
+	parent, err := s.CreateWorkItem(ctx, task.ID, api.CreateWorkItemRequest{Kind: "feature", Title: "Reviewed parent " + title, Priority: "normal", RequestID: api.NewID("req")}, stewardBy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m, err := s.PostMessage(ctx, task.ID, api.PostMessageRequest{Text: "synthetic review result for " + title}, stewardBy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback()
+	out, err := s.fileReviewFollowUp(ctx, tx, parent, api.ReviewFinding{ID: "f1", Kind: "bug", Title: title}, m, stewardBy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	item, err := s.GetWorkItem(ctx, task.ID, out.ItemID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return item
+}
+
+func TestTriageHeldForTriageListsUnrefinedFollowUps(t *testing.T) {
+	s, task := stewardStore(t)
+	ctx := context.Background()
+	held := fileHeldFollowUp(t, s, task, "Refuse an empty recipient in the review fixture")
+	refined := fileHeldFollowUp(t, s, task, "Keep the scroll position after a new message")
+	ordinary, err := s.CreateWorkItem(ctx, task.ID, api.CreateWorkItemRequest{Kind: "bug", Title: "An ordinary open item", Priority: "normal", RequestID: api.NewID("req")}, stewardBy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	title := "Keep the scroll position after new messages arrive"
+	if _, err = s.UpdateWorkItem(ctx, task.ID, refined.ID, api.UpdateWorkItemRequest{Revision: refined.Revision, Title: &title}, stewardBy); err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.WorkItemTriage(ctx, task.ID, 0, "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.HeldForTriage) != 1 || got.HeldForTriage[0].Item.ID != held.ID || got.HeldForTriage[0].SourceMessageSeq != held.SourceMessageSeq {
+		t.Fatalf("held for triage: %+v (ordinary %s, refined %s)", got.HeldForTriage, ordinary.ID, refined.ID)
+	}
+	// The existing fields keep their names and shapes.
+	raw, err := json.Marshal(got)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var fields map[string]json.RawMessage
+	if err = json.Unmarshal(raw, &fields); err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range []string{"taskId", "staleDays", "generatedAt", "duplicates", "alreadyReleased", "stale", "heldForTriage"} {
+		if _, ok := fields[key]; !ok {
+			t.Fatalf("triage JSON lacks %s: %s", key, raw)
+		}
 	}
 }
