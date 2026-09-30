@@ -172,6 +172,23 @@ test("documented project role prompts exactly include every generated template",
   }
 });
 
+// wi_2c46d9d964b335da: nobody reads an agent's terminal, so every template
+// routes questions to the Board and still fits the 8192-character prompt cap.
+test("every template asks through the Board, never an interactive terminal prompt", () => {
+  const sentence =
+    "Never ask through an interactive terminal prompt: ask the owner with tt ask, a teammate with tt send --kind question.";
+  const prompts = [
+    ...TEAM_EXAMPLES.flatMap((team) => team.members.map((m) => [`${team.id}/${m.name}`, m.prompt])),
+    ...Object.entries(PROJECT_ROLE_TEMPLATES).map(([role, t]) => [role, t.prompt]),
+  ];
+  for (const [name, prompt] of prompts) {
+    assert.ok(prompt.includes(sentence), `${name} lacks the Board question rule`);
+    assert.ok(prompt.length <= 8192, `${name} prompt is ${prompt.length} characters`);
+  }
+  const bundle = readFileSync(new URL("../hub/internal/teamplan/plan.mjs", import.meta.url), "utf8");
+  assert.ok(bundle.split(sentence).length - 1 >= 2, "generated plan.mjs lacks the Board question rule");
+});
+
 // Broker phase 3.1 round one (B1): every member is taught tt ack first, and
 // no prompt tells an agent not to acknowledge.
 test("every member prompt teaches tt ack and none says not to acknowledge", () => {

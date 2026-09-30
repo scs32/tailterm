@@ -39,6 +39,25 @@ roles (September 29), and the backlog steward (`wi_5b4b94dbc9a11e8b`, order
   feature. A bug team has no plan reviewer. Each session serves exactly one item; a new item
   gets fresh identities. See [Team examples](team-examples.md).
 
+## Questions
+
+Nobody reads an agent's terminal, so an agent must never wait on a question
+there (wi_2c46d9d964b335da).
+
+- Every Claude Code agent that `tt spawn` starts (item team members, database
+  handlers, the backlog steward, the deployment agent and helpers) runs with
+  AskUserQuestion disallowed (`--disallowedTools=AskUserQuestion`).
+- Agents ask the owner with `tt ask` (a Board decision) and a teammate with
+  `tt send --kind question`. Every role template says so.
+- The owner session helper is the owner's own session. `tt` does not spawn it,
+  so its tools are unchanged.
+- If a Claude selection dialog still appears in an agent's pane, the relay's
+  runtime-prompt escalation posts a notice to the owner, with the item in its
+  refs, and sends a directed copy to the item lead unless the lead is the one
+  waiting.
+- Sessions that are already running keep their launch flags and briefing until
+  they are relaunched.
+
 ## Intake flow
 
 1. The owner asks for something: in the owner session, helper chat, or Discord

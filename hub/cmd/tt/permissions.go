@@ -8,6 +8,11 @@ import (
 	"strings"
 )
 
+// Nobody reads a spawned agent's terminal, so agents ask the owner with tt ask
+// and teammates with tt send --kind question (wi_2c46d9d964b335da). The single
+// token keeps Claude's variadic flag from consuming the positional briefing.
+const claudeDisallowQuestions = "--disallowedTools=AskUserQuestion"
+
 var permissionFlag = regexp.MustCompile(`(^|\s)(--sandbox|--ask-for-approval|--permission-mode|--dangerously-bypass-approvals-and-sandbox|--dangerously-skip-permissions|-s|-a)(=|\s|$)`)
 
 // The owner can still use host configuration or a custom wrapper. Explicit UI
@@ -93,6 +98,7 @@ func permissionCommand(command, runtime, mode, cwd string, allowed []string, ind
 		for _, rule := range allowed {
 			args = append(args, "--allowedTools", rule)
 		}
+		args = append(args, claudeDisallowQuestions)
 	default:
 		if mode != "" || approvalMode != "" || sandboxMode != "" {
 			return "", fmt.Errorf("permission presets are supported for Codex and Claude Code only")

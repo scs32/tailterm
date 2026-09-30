@@ -35,3 +35,21 @@ func TestPermissionModesPreserveDefaultsAndBoundExplicitModes(t *testing.T) {
 		t.Fatal("Claude rules on Codex")
 	}
 }
+
+func TestClaudeLaunchesDisallowInteractiveQuestions(t *testing.T) {
+	const rule = "'--disallowedTools=AskUserQuestion'"
+	for _, mode := range []string{"", "acceptEdits", "auto", "dontAsk", "bypassPermissions"} {
+		for _, allowed := range [][]string{nil, {"Read", "Bash(tt *)"}} {
+			got, e := permissionCommand("claude", "claude", mode, "/work", allowed)
+			if e != nil || strings.Count(got, rule) != 1 {
+				t.Fatalf("mode %q allowed %v: %q %v", mode, allowed, got, e)
+			}
+		}
+	}
+	for _, c := range []struct{ runtime, mode, cwd string }{{"codex", "", ""}, {"codex", "workspace-auto", "/work"}, {"aider", "", ""}} {
+		got, e := permissionCommand(c.runtime, c.runtime, c.mode, c.cwd, nil)
+		if e != nil || strings.Contains(got, "disallowedTools") {
+			t.Fatalf("%s %q: %q %v", c.runtime, c.mode, got, e)
+		}
+	}
+}
