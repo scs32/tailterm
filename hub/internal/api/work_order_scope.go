@@ -20,6 +20,9 @@ type WorkOrderScopeConfirmation struct {
 	AgentID          string `json:"agentId"`
 	RunID            string `json:"runId"`
 	CreatedAt        string `json:"createdAt"`
+	// Ownership is the repository-relative files and directories the handler
+	// recorded from the plan or intake; a queue add without --owns uses it.
+	Ownership []string `json:"ownership,omitempty"`
 }
 
 type ConfirmWorkOrderScopeRequest struct {
@@ -31,6 +34,8 @@ type ConfirmWorkOrderScopeRequest struct {
 	OrderMessageSeq  int64  `json:"orderMessageSeq"`
 	// Complete is an explicit handler assertion after reading the owner filing.
 	Complete bool `json:"complete"`
+	// Ownership is optional; it is part of the retry identity.
+	Ownership []string `json:"ownership,omitempty"`
 }
 
 type WorkOrderBookkeepingRequest struct {

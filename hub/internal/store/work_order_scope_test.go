@@ -61,7 +61,7 @@ func TestWorkOrderScopeHandlerIntakeAndBookkeepingKeepsQueueAndStarts(t *testing
 	if err != nil {
 		t.Fatal(err)
 	}
-	if replay, err := s.ConfirmWorkOrderScope(ctx, task.ID, item.ID, confirm); err != nil || replay != filed {
+	if replay, err := s.ConfirmWorkOrderScope(ctx, task.ID, item.ID, confirm); err != nil || !reflect.DeepEqual(replay, filed) {
 		t.Fatalf("confirmation retry %+v %v", replay, err)
 	}
 	changed := confirm

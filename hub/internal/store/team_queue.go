@@ -72,6 +72,8 @@ func migrateTeamQueue(db *sql.DB) error {
 		{"base_commit", "TEXT NOT NULL DEFAULT ''"},
 		{"integration_json", "TEXT NOT NULL DEFAULT ''"},
 		{"acceptance_json", "TEXT NOT NULL DEFAULT ''"},
+		{"serial", "INTEGER NOT NULL DEFAULT 0"},
+		{"owner_integration_json", "TEXT NOT NULL DEFAULT ''"},
 	} {
 		var count int
 		if err := tx.QueryRow(`SELECT count(*) FROM pragma_table_info('team_queue_entries') WHERE name=?`, column.name).Scan(&count); err != nil {
@@ -346,15 +348,21 @@ func recordedTeamOrder(ctx context.Context, tx *sql.Tx, task, item string, revis
 	return nil
 }
 
-const teamQueueCols = `id,task_id,item_id,item_revision,order_seq,template,position,state,revision,host,cwd,pause_generation,launch_json,close_json,failure,escalation_seq,released_at,repository,ownership_json,handler_id,handler_run_id,handler_lease_generation,base_commit,acceptance_json,integration_json`
+const teamQueueCols = `id,task_id,item_id,item_revision,order_seq,template,position,state,revision,host,cwd,pause_generation,launch_json,close_json,failure,escalation_seq,released_at,repository,ownership_json,handler_id,handler_run_id,handler_lease_generation,base_commit,acceptance_json,integration_json,serial,owner_integration_json,updated_at`
 
 func scanTeamQueue(row interface{ Scan(...any) error }) (api.TeamQueueEntry, error) {
 	var e api.TeamQueueEntry
 	var launch, close []byte
-	var ownership, acceptance, integration string
-	err := row.Scan(&e.ID, &e.TaskID, &e.ItemID, &e.ItemRevision, &e.OrderMessageSeq, &e.Template, &e.Position, &e.State, &e.Revision, &e.Host, &e.Cwd, &e.PauseGeneration, &launch, &close, &e.Failure, &e.EscalationSeq, &e.ReleasedAt, &e.Repository, &ownership, &e.HandlerID, &e.HandlerRunID, &e.HandlerLeaseGeneration, &e.BaseCommit, &acceptance, &integration)
+	var ownership, acceptance, integration, ownerIntegration string
+	err := row.Scan(&e.ID, &e.TaskID, &e.ItemID, &e.ItemRevision, &e.OrderMessageSeq, &e.Template, &e.Position, &e.State, &e.Revision, &e.Host, &e.Cwd, &e.PauseGeneration, &launch, &close, &e.Failure, &e.EscalationSeq, &e.ReleasedAt, &e.Repository, &ownership, &e.HandlerID, &e.HandlerRunID, &e.HandlerLeaseGeneration, &e.BaseCommit, &acceptance, &integration, &e.Serial, &ownerIntegration, &e.UpdatedAt)
 	if err != nil {
 		return e, err
+	}
+	if ownerIntegration != "" {
+		e.OwnerIntegration = new(api.TeamQueueOwnerIntegration)
+		if err := json.Unmarshal([]byte(ownerIntegration), e.OwnerIntegration); err != nil {
+			return e, err
+		}
 	}
 	if len(launch) > 0 {
 		e.LaunchJSON = append([]byte(nil), launch...)
@@ -489,7 +497,11 @@ func (s *Store) ListTeamQueue(ctx context.Context, task string) (api.TeamQueueLi
 			} else if freeHandler.ID == "" {
 				out.Entries[i].BlockReason = "No free database handler"
 			} else if len(out.Entries[i].Ownership) == 0 && len(active) > 0 {
-				out.Entries[i].BlockReason = "Unscoped: declare ownership to run beside other teams"
+				if out.Entries[i].Serial {
+					out.Entries[i].BlockReason = "Serial: runs alone once the active teams finish"
+				} else {
+					out.Entries[i].BlockReason = "Unscoped: declare ownership to run beside other teams"
+				}
 			}
 		}
 		for j := range out.Entries {
@@ -847,6 +859,15 @@ func (s *Store) TeamQueueAction(ctx context.Context, task string, req api.TeamQu
 		if queueParallel(limit) && (req.Repository == "" || req.BaseCommit == "") {
 			return zero, fmt.Errorf("%w: parallel queue entry needs a frozen repository and base", api.ErrConflict)
 		}
+		// An entry either declares what it will change or runs alone. A
+		// serial project's unscoped entries are serial by definition.
+		if req.Serial && len(ownership) != 0 {
+			return zero, fmt.Errorf("%w: a serial entry declares no ownership", api.ErrInvalid)
+		}
+		serial := req.Serial || (!queueParallel(limit) && len(ownership) == 0)
+		if len(ownership) == 0 && !serial {
+			return zero, fmt.Errorf("%w: a parallel queue entry needs ownership: pass --owns, have the handler record --owns at scope confirmation, or mark it --serial", api.ErrConflict)
+		}
 		item, err := getWorkItem(tx, ctx, task, req.ItemID)
 		if err != nil {
 			return zero, err
@@ -869,9 +890,9 @@ func (s *Store) TeamQueueAction(ctx context.Context, task string, req api.TeamQu
 		}
 		var maxPos int64
 		_ = tx.QueryRowContext(ctx, `SELECT COALESCE(MAX(position),0) FROM team_queue_entries WHERE task_id=?`, task).Scan(&maxPos)
-		e = api.TeamQueueEntry{ID: api.NewID("tqe"), TaskID: task, ItemID: req.ItemID, ItemRevision: item.Revision, OrderMessageSeq: req.OrderMessageSeq, Template: "planned", Position: maxPos + 1, State: "queued", Revision: 1, Host: req.Host, Cwd: req.Cwd, Repository: req.Repository, Ownership: ownership, BaseCommit: req.BaseCommit}
+		e = api.TeamQueueEntry{ID: api.NewID("tqe"), TaskID: task, ItemID: req.ItemID, ItemRevision: item.Revision, OrderMessageSeq: req.OrderMessageSeq, Template: "planned", Position: maxPos + 1, State: "queued", Revision: 1, Host: req.Host, Cwd: req.Cwd, Repository: req.Repository, Ownership: ownership, BaseCommit: req.BaseCommit, Serial: serial, UpdatedAt: now}
 		ownedJSON, _ := json.Marshal(ownership)
-		_, err = tx.ExecContext(ctx, `INSERT INTO team_queue_entries(id,task_id,item_id,item_revision,order_seq,template,position,state,revision,host,cwd,repository,ownership_json,base_commit,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, e.ID, task, e.ItemID, e.ItemRevision, e.OrderMessageSeq, e.Template, e.Position, e.State, e.Revision, e.Host, e.Cwd, e.Repository, string(ownedJSON), e.BaseCommit, now, now)
+		_, err = tx.ExecContext(ctx, `INSERT INTO team_queue_entries(id,task_id,item_id,item_revision,order_seq,template,position,state,revision,host,cwd,repository,ownership_json,base_commit,serial,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, e.ID, task, e.ItemID, e.ItemRevision, e.OrderMessageSeq, e.Template, e.Position, e.State, e.Revision, e.Host, e.Cwd, e.Repository, string(ownedJSON), e.BaseCommit, serial, now, now)
 		if err != nil {
 			return zero, fmt.Errorf("%w: duplicate item or queue entry: %v", api.ErrConflict, err)
 		}
@@ -934,6 +955,7 @@ func (s *Store) TeamQueueAction(ctx context.Context, task string, req api.TeamQu
 				}
 			}
 			e.Ownership = ownership
+			e.Serial = false
 		case "release":
 			limit, err := queueConcurrencyLimit(ctx, tx, task)
 			if err != nil {
@@ -1402,11 +1424,17 @@ func (s *Store) TeamQueueAction(ctx context.Context, task string, req api.TeamQu
 				data, _ := json.Marshal(e.Integration)
 				integrationJSON = string(data)
 			}
+			ownerIntegrationJSON := ""
+			if e.OwnerIntegration != nil {
+				data, _ := json.Marshal(e.OwnerIntegration)
+				ownerIntegrationJSON = string(data)
+			}
 			ownedJSON, _ := json.Marshal(e.Ownership)
-			_, err = tx.ExecContext(ctx, `UPDATE team_queue_entries SET state=?,revision=?,pause_generation=?,launch_json=?,close_json=?,failure=?,escalation_seq=?,released_at=?,handler_id=?,handler_run_id=?,handler_lease_generation=?,acceptance_json=?,integration_json=?,base_commit=?,ownership_json=?,updated_at=? WHERE id=?`, e.State, e.Revision, e.PauseGeneration, string(e.LaunchJSON), string(e.CloseJSON), e.Failure, e.EscalationSeq, e.ReleasedAt, e.HandlerID, e.HandlerRunID, e.HandlerLeaseGeneration, acceptanceJSON, integrationJSON, e.BaseCommit, string(ownedJSON), now, e.ID)
+			_, err = tx.ExecContext(ctx, `UPDATE team_queue_entries SET state=?,revision=?,pause_generation=?,launch_json=?,close_json=?,failure=?,escalation_seq=?,released_at=?,handler_id=?,handler_run_id=?,handler_lease_generation=?,acceptance_json=?,integration_json=?,base_commit=?,ownership_json=?,owner_integration_json=?,serial=?,updated_at=? WHERE id=?`, e.State, e.Revision, e.PauseGeneration, string(e.LaunchJSON), string(e.CloseJSON), e.Failure, e.EscalationSeq, e.ReleasedAt, e.HandlerID, e.HandlerRunID, e.HandlerLeaseGeneration, acceptanceJSON, integrationJSON, e.BaseCommit, string(ownedJSON), ownerIntegrationJSON, e.Serial, now, e.ID)
 			if err != nil {
 				return zero, err
 			}
+			e.UpdatedAt = now
 		}
 	default:
 		return zero, api.ErrInvalid

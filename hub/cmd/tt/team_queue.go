@@ -102,6 +102,7 @@ func cmdTeamQueue(e env, args []string) error {
 	minFreeDisk := fs.Int64("min-free-disk-mib", 0, "free-disk reserve for new parallel teams in MiB (0: default 8192)")
 	newWorktree := fs.Bool("new-worktree", false, "add: create the entry's own detached worktree under .build/worktrees")
 	noNewWorktree := fs.Bool("no-new-worktree", false, "add: use the current checkout in a parallel project")
+	serial := fs.Bool("serial", false, "add: declare no ownership; the entry runs alone")
 	reason := fs.String("reason", "", "fail: why the owner is failing this entry")
 	policyVersion := fs.Int64("policy-version", 0, "owner host policy version")
 	policyExpires := fs.String("expires", "", "host policy expiry in RFC3339")
@@ -142,8 +143,10 @@ func cmdTeamQueue(e env, args []string) error {
 		for _, q := range list.Entries {
 			state := q.State
 			owns := strings.Join(q.Ownership, ",")
-			if owns == "" {
-				owns = "unscoped (conflicts with all)"
+			if owns == "" && q.Serial {
+				owns = "serial (runs alone)"
+			} else if owns == "" {
+				owns = "unscoped (legacy)"
 			}
 			if q.State == "failed" && q.ReleasedAt != "" {
 				state += " (released)"
@@ -201,15 +204,34 @@ func cmdTeamQueue(e env, args []string) error {
 		}
 	case "add":
 		if !api.ValidID(*item, "wi") || *order < 1 || *template != "planned" || (*newWorktree && (*noNewWorktree || *cwd != "")) {
-			return errors.New("usage: tt team queue add --item wi_ID --order SEQ [--template planned] [--owns PATH...] [--cwd DIR | --new-worktree | --no-new-worktree]")
+			return errors.New("usage: tt team queue add --item wi_ID --order SEQ [--template planned] [--owns PATH... | --serial] [--cwd DIR | --new-worktree | --no-new-worktree]")
+		}
+		if *serial && len(ownership) > 0 {
+			return errors.New("--serial declares no ownership; pass either --owns or --serial")
+		}
+		list, listErr := c.ListTeamQueue(ctx, *task)
+		if listErr != nil {
+			return listErr
+		}
+		parallel := queueParallel(list.ConcurrencyLimit)
+		if len(ownership) == 0 && !*serial {
+			// Ownership comes from the handler's intake record for the
+			// item's current revision and this order.
+			intake, intakeErr := intakeOwnership(ctx, c, *task, *item, *order)
+			if intakeErr != nil {
+				return intakeErr
+			}
+			ownership = intake
+			if len(ownership) > 0 {
+				fmt.Printf("owns %s (from the scope confirmation)\n", strings.Join(ownership, ","))
+			}
+		}
+		if parallel && len(ownership) == 0 && !*serial {
+			return errors.New("a parallel queue entry needs ownership: pass --owns PATH, ask the database handler to record it with tt work-items scope confirm --owns PATH, or mark the entry --serial to run it alone")
 		}
 		if *cwd == "" && !*noNewWorktree && !*newWorktree {
 			// A parallel project gives each entry its own worktree by default.
-			list, listErr := c.ListTeamQueue(ctx, *task)
-			if listErr != nil {
-				return listErr
-			}
-			*newWorktree = queueParallel(list.ConcurrencyLimit)
+			*newWorktree = parallel
 		}
 		if *newWorktree {
 			checkout, wdErr := os.Getwd()
@@ -253,7 +275,7 @@ func cmdTeamQueue(e env, args []string) error {
 		if scopeErr != nil {
 			return scopeErr
 		}
-		req.ItemID, req.OrderMessageSeq, req.Template, req.Host, req.Cwd, req.Repository, req.Ownership = *item, *order, *template, spawn.Host(), *cwd, repository, ownership
+		req.ItemID, req.OrderMessageSeq, req.Template, req.Host, req.Cwd, req.Repository, req.Ownership, req.Serial = *item, *order, *template, spawn.Host(), *cwd, repository, ownership, *serial
 		if repository != "" {
 			req.BaseCommit, err = queueGitCommit(*cwd)
 			if err != nil {
@@ -446,6 +468,24 @@ func cmdTeamQueue(e env, args []string) error {
 		}
 	}
 	return nil
+}
+
+// intakeOwnership reads the ownership the database handler recorded at scope
+// confirmation for the item's current revision and the order. None is nil.
+func intakeOwnership(ctx context.Context, c *api.Client, task, item string, order int64) ([]string, error) {
+	current, err := c.GetWorkItem(ctx, task, item)
+	if err != nil {
+		return nil, err
+	}
+	confirmation, err := c.GetWorkOrderScopeConfirmation(ctx, task, item, current.Revision, order)
+	var response *api.HTTPError
+	if errors.As(err, &response) && response.Status == 404 {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return confirmation.Ownership, nil
 }
 
 // queueReleaseRequest builds the release of a failed entry for the owner's

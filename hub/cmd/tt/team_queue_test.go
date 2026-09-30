@@ -299,7 +299,7 @@ func TestTeamQueueCLIScopeAndOwnerFail(t *testing.T) {
 	ctx := context.Background()
 	repo, head := queueGitRepo(t)
 	parallelCLIProject(t, f, "none")
-	q, err := f.c.TeamQueueAction(ctx, f.task.ID, api.TeamQueueRequest{RequestID: "scope-add", Operation: "add", ItemID: f.item.ID, OrderMessageSeq: f.order, Host: spawn.Host(), Cwd: repo, Repository: filepath.Join(repo, ".git"), BaseCommit: head})
+	q, err := f.c.TeamQueueAction(ctx, f.task.ID, api.TeamQueueRequest{RequestID: "scope-add", Operation: "add", ItemID: f.item.ID, OrderMessageSeq: f.order, Host: spawn.Host(), Cwd: repo, Repository: filepath.Join(repo, ".git"), BaseCommit: head, Serial: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -389,4 +389,76 @@ func runQueueEntry(t *testing.T, f teamFixture, id string) api.TeamQueueEntry {
 	step(api.TeamQueueRequest{RequestID: "run-started-" + id, Operation: "started", MemberIndex: 0, MemberRunID: run})
 	step(api.TeamQueueRequest{RequestID: "run-running-" + id, Operation: "running"})
 	return q
+}
+
+// a1 (c1): with no --owns, a parallel add takes the ownership the handler
+// recorded at scope confirmation for the current revision and order.
+func TestTeamQueueCLIAddUsesIntakeOwnership(t *testing.T) {
+	f := newTeamFixture(t, true)
+	ctx := context.Background()
+	repo, _ := queueGitRepo(t)
+	parallelCLIProject(t, f, "none")
+	item, err := f.c.CreateWorkItem(ctx, f.task.ID, api.CreateWorkItemRequest{Kind: "feature", Title: "intake owned", RequestID: "intake-owned"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	order, err := f.c.PostMessage(ctx, f.task.ID, api.PostMessageRequest{Text: "intake owned order", RequestID: "intake-owned-order", WorkItems: []api.MessageWorkItem{{ItemTaskID: f.task.ID, ItemID: item.ID, ItemRevision: item.Revision, Relationship: "primary"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.c.ConfirmWorkOrderScope(ctx, f.task.ID, item.ID, api.ConfirmWorkOrderScopeRequest{RequestID: "intake-owned-scope", AgentID: f.handler.ID, RunID: f.handler.RunID, ExpectedRevision: item.Revision, ScopeRevision: item.ScopeRevision, OrderMessageSeq: order.Seq, Complete: true, Ownership: []string{"hub/x.go", "docs/y.md"}}); err != nil {
+		t.Fatal(err)
+	}
+	out, err := captureCLIOutput(t, func() error {
+		return cmdTeamQueue(f.e, []string{"add", "--item", item.ID, "--order", fmt.Sprint(order.Seq), "--cwd", repo})
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out, "owns hub/x.go,docs/y.md (from the scope confirmation)") {
+		t.Fatalf("add output %q", out)
+	}
+	list, err := f.c.ListTeamQueue(ctx, f.task.ID)
+	if err != nil || len(list.Entries) != 1 || strings.Join(list.Entries[0].Ownership, ",") != "hub/x.go,docs/y.md" || list.Entries[0].Serial {
+		t.Fatalf("saved entry %+v %v", list, err)
+	}
+	if printed, err := captureCLIOutput(t, func() error { return cmdTeamQueue(f.e, []string{"list"}) }); err != nil || !strings.Contains(printed, "owns=hub/x.go,docs/y.md") {
+		t.Fatalf("list %q %v", printed, err)
+	}
+}
+
+// a2 (c1): a parallel add with no ownership anywhere is refused before any
+// worktree exists; --serial saves a serial entry that lists as running alone.
+func TestTeamQueueCLIParallelAddNeedsOwnershipOrSerial(t *testing.T) {
+	f := newTeamFixture(t, true)
+	repo, _ := queueGitRepo(t)
+	parallelCLIProject(t, f, "none")
+	t.Chdir(repo)
+	want := filepath.Join(repo, ".build", "worktrees", "queue-"+strings.TrimPrefix(f.item.ID, "wi_")[:8])
+	_, err := captureCLIOutput(t, func() error {
+		return cmdTeamQueue(f.e, []string{"add", "--item", f.item.ID, "--order", fmt.Sprint(f.order)})
+	})
+	if err == nil || !strings.Contains(err.Error(), "--owns PATH") || !strings.Contains(err.Error(), "scope confirm --owns") || !strings.Contains(err.Error(), "--serial") {
+		t.Fatalf("unscoped parallel add: %v", err)
+	}
+	if _, statErr := os.Lstat(want); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("refused add left a worktree: %v", statErr)
+	}
+	if _, err := captureCLIOutput(t, func() error {
+		return cmdTeamQueue(f.e, []string{"add", "--item", f.item.ID, "--order", fmt.Sprint(f.order), "--serial", "--owns", "client"})
+	}); err == nil || !strings.Contains(err.Error(), "either --owns or --serial") {
+		t.Fatalf("--serial with --owns: %v", err)
+	}
+	if _, err := captureCLIOutput(t, func() error {
+		return cmdTeamQueue(f.e, []string{"add", "--item", f.item.ID, "--order", fmt.Sprint(f.order), "--serial"})
+	}); err != nil {
+		t.Fatal(err)
+	}
+	list, err := f.c.ListTeamQueue(context.Background(), f.task.ID)
+	if err != nil || len(list.Entries) != 1 || !list.Entries[0].Serial || len(list.Entries[0].Ownership) != 0 {
+		t.Fatalf("serial entry %+v %v", list, err)
+	}
+	if printed, err := captureCLIOutput(t, func() error { return cmdTeamQueue(f.e, []string{"list"}) }); err != nil || !strings.Contains(printed, "owns=serial (runs alone)") {
+		t.Fatalf("list %q %v", printed, err)
+	}
 }

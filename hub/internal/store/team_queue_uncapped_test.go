@@ -173,7 +173,15 @@ func TestUncappedQueueListNamesUnscopedEntry(t *testing.T) {
 	s, task, items, orders, _ := uncappedFixture(t, 2, 2)
 	setQueueLimit(t, s, task.ID, 0)
 	a := addScopedEntry(t, s, task, items[0], orders[0], "src/a")
-	b := addScopedEntry(t, s, task, items[1], orders[1])
+	// A parallel add must now declare ownership or be serial; seed the legacy
+	// unscoped row this display covers.
+	b, err := s.TeamQueueAction(context.Background(), task.ID, api.TeamQueueRequest{RequestID: api.NewID("tqr"), Operation: "add", ItemID: items[1].ID, OrderMessageSeq: orders[1].Seq, Host: "mini", Cwd: "/worktrees/" + items[1].ID, Repository: "repo", BaseCommit: strings.Repeat("a", 40), Serial: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.db.Exec(`UPDATE team_queue_entries SET serial=0 WHERE id=?`, b.ID); err != nil {
+		t.Fatal(err)
+	}
 	if got := listedEntry(t, s, task.ID, b.ID); got.BlockReason != "" {
 		t.Fatalf("unscoped entry with nothing active: %q", got.BlockReason)
 	}
@@ -379,7 +387,10 @@ func TestQueueScopeAuthorityOverlapAndUnblock(t *testing.T) {
 	setQueueLimit(t, s, task.ID, 0)
 	a := addScopedEntry(t, s, task, items[0], orders[0], "src/a")
 	b := addScopedEntry(t, s, task, items[1], orders[1], "src/a/child")
-	c := addScopedEntry(t, s, task, items[2], orders[2])
+	c, err := s.TeamQueueAction(ctx, task.ID, api.TeamQueueRequest{RequestID: api.NewID("tqr"), Operation: "add", ItemID: items[2].ID, OrderMessageSeq: orders[2].Seq, Host: "mini", Cwd: "/worktrees/" + items[2].ID, Repository: "repo", BaseCommit: strings.Repeat("a", 40), Serial: true})
+	if err != nil {
+		t.Fatal(err)
+	}
 	scope := func(key string, q api.TeamQueueEntry, owns []string, mutate func(*api.TeamQueueRequest)) (api.TeamQueueEntry, error) {
 		req := api.TeamQueueRequest{RequestID: key, Operation: "scope", EntryID: q.ID, ExpectedRevision: q.Revision, Ownership: owns}
 		if mutate != nil {

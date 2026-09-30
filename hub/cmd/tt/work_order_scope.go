@@ -27,6 +27,8 @@ func cmdWorkOrderScope(e env, args []string) error {
 	admissionsFile := fs.String("admissions-file", "", "JSON array of exact admitted agent/run/digest bindings")
 	requestID := fs.String("request-id", "", "stable retry id")
 	complete := fs.Bool("complete", false, "handler verified complete owner-filed scope")
+	var owns ownershipFlags
+	fs.Var(&owns, "owns", "confirm: repository-relative file or directory the plan or intake will change (repeatable); a queue add without --owns uses it")
 	if err := fs.Parse(args[1:]); err != nil {
 		return err
 	}
@@ -49,7 +51,7 @@ func cmdWorkOrderScope(e env, args []string) error {
 		if e.agent == "" || e.runID == "" || !*complete || !validScopeArgs(*requestID, *revision, *order) || *scope < 1 {
 			return errors.New("confirm requires handler agent, --complete, --request-id, --revision, --scope-revision and --order")
 		}
-		out, err := c.ConfirmWorkOrderScope(ctx, task, item, api.ConfirmWorkOrderScopeRequest{RequestID: *requestID, AgentID: e.agent, RunID: e.runID, ExpectedRevision: *revision, ScopeRevision: *scope, OrderMessageSeq: *order, Complete: true})
+		out, err := c.ConfirmWorkOrderScope(ctx, task, item, api.ConfirmWorkOrderScopeRequest{RequestID: *requestID, AgentID: e.agent, RunID: e.runID, ExpectedRevision: *revision, ScopeRevision: *scope, OrderMessageSeq: *order, Complete: true, Ownership: owns})
 		if err != nil {
 			return err
 		}

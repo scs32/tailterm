@@ -23,6 +23,16 @@ func migrateWorkOrderScope(db *sql.DB) error {
 		request_id TEXT NOT NULL, payload_hash TEXT NOT NULL, receipt_json TEXT NOT NULL,
 		created_at TEXT NOT NULL, UNIQUE(task_id,request_id),
 		FOREIGN KEY(task_id,item_id) REFERENCES work_items(task_id,id));`)
+	if err != nil {
+		return err
+	}
+	var n int
+	if err := db.QueryRow(`SELECT count(*) FROM pragma_table_info('work_order_scope_confirmations') WHERE name='ownership_json'`).Scan(&n); err != nil {
+		return err
+	}
+	if n == 0 {
+		_, err = db.Exec(`ALTER TABLE work_order_scope_confirmations ADD COLUMN ownership_json TEXT NOT NULL DEFAULT '[]'`)
+	}
 	return err
 }
 
@@ -85,6 +95,10 @@ func (s *Store) ConfirmWorkOrderScope(ctx context.Context, task, itemID string, 
 	if !req.Complete {
 		return api.WorkOrderScopeConfirmation{}, workItemConflict("owner filing is incomplete; record acceptance and owned files in the item before confirming scope")
 	}
+	ownership, err := canonicalQueueOwnership(req.Ownership)
+	if err != nil {
+		return api.WorkOrderScopeConfirmation{}, err
+	}
 	hash := requestHash(struct {
 		Task, Item string
 		Request    api.ConfirmWorkOrderScopeRequest
@@ -97,13 +111,16 @@ func (s *Store) ConfirmWorkOrderScope(ctx context.Context, task, itemID string, 
 	}
 	defer tx.Rollback()
 	var prior api.WorkOrderScopeConfirmation
-	var priorHash string
-	err = tx.QueryRowContext(ctx, `SELECT item_id,item_revision,scope_revision,order_seq,source_message_seq,agent_id,run_id,created_at,payload_hash FROM work_order_scope_confirmations WHERE task_id=? AND request_id=?`, task, req.RequestID).Scan(&prior.ItemID, &prior.ItemRevision, &prior.ScopeRevision, &prior.OrderSeq, &prior.SourceMessageSeq, &prior.AgentID, &prior.RunID, &prior.CreatedAt, &priorHash)
+	var priorHash, priorOwnership string
+	err = tx.QueryRowContext(ctx, `SELECT item_id,item_revision,scope_revision,order_seq,source_message_seq,agent_id,run_id,created_at,payload_hash,ownership_json FROM work_order_scope_confirmations WHERE task_id=? AND request_id=?`, task, req.RequestID).Scan(&prior.ItemID, &prior.ItemRevision, &prior.ScopeRevision, &prior.OrderSeq, &prior.SourceMessageSeq, &prior.AgentID, &prior.RunID, &prior.CreatedAt, &priorHash, &priorOwnership)
 	if err == nil {
 		if priorHash != hash {
 			return api.WorkOrderScopeConfirmation{}, workItemConflict("confirmation retry payload changed")
 		}
 		prior.TaskID, prior.RequestID = task, req.RequestID
+		if prior.Ownership, err = scopeOwnership(priorOwnership); err != nil {
+			return api.WorkOrderScopeConfirmation{}, err
+		}
 		return prior, nil
 	}
 	if !errors.Is(err, sql.ErrNoRows) {
@@ -132,7 +149,11 @@ func (s *Store) ConfirmWorkOrderScope(ctx context.Context, task, itemID string, 
 		return api.WorkOrderScopeConfirmation{}, err
 	}
 	out := api.WorkOrderScopeConfirmation{TaskID: task, ItemID: itemID, ItemRevision: item.Revision, ScopeRevision: item.ScopeRevision, OrderSeq: req.OrderMessageSeq, SourceMessageSeq: item.SourceMessageSeq, RequestID: req.RequestID, AgentID: req.AgentID, RunID: req.RunID, CreatedAt: ts(s.now())}
-	_, err = tx.ExecContext(ctx, `INSERT INTO work_order_scope_confirmations(task_id,item_id,item_revision,scope_revision,order_seq,source_message_seq,request_id,payload_hash,agent_id,run_id,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)`, task, itemID, out.ItemRevision, out.ScopeRevision, out.OrderSeq, out.SourceMessageSeq, out.RequestID, hash, out.AgentID, out.RunID, out.CreatedAt)
+	if len(ownership) > 0 {
+		out.Ownership = ownership
+	}
+	ownedJSON, _ := json.Marshal(ownership)
+	_, err = tx.ExecContext(ctx, `INSERT INTO work_order_scope_confirmations(task_id,item_id,item_revision,scope_revision,order_seq,source_message_seq,request_id,payload_hash,agent_id,run_id,created_at,ownership_json) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`, task, itemID, out.ItemRevision, out.ScopeRevision, out.OrderSeq, out.SourceMessageSeq, out.RequestID, hash, out.AgentID, out.RunID, out.CreatedAt, string(ownedJSON))
 	if err != nil {
 		return api.WorkOrderScopeConfirmation{}, err
 	}
@@ -148,12 +169,31 @@ func (s *Store) GetWorkOrderScopeConfirmation(ctx context.Context, task, item st
 		return api.WorkOrderScopeConfirmation{}, api.ErrInvalid
 	}
 	var out api.WorkOrderScopeConfirmation
-	err := s.db.QueryRowContext(ctx, `SELECT scope_revision,source_message_seq,request_id,agent_id,run_id,created_at FROM work_order_scope_confirmations WHERE task_id=? AND item_id=? AND item_revision=? AND order_seq=?`, task, item, revision, order).Scan(&out.ScopeRevision, &out.SourceMessageSeq, &out.RequestID, &out.AgentID, &out.RunID, &out.CreatedAt)
+	var ownership string
+	err := s.db.QueryRowContext(ctx, `SELECT scope_revision,source_message_seq,request_id,agent_id,run_id,created_at,ownership_json FROM work_order_scope_confirmations WHERE task_id=? AND item_id=? AND item_revision=? AND order_seq=?`, task, item, revision, order).Scan(&out.ScopeRevision, &out.SourceMessageSeq, &out.RequestID, &out.AgentID, &out.RunID, &out.CreatedAt, &ownership)
 	if errors.Is(err, sql.ErrNoRows) {
 		return out, api.ErrNotFound
 	}
+	if err != nil {
+		return out, err
+	}
 	out.TaskID, out.ItemID, out.ItemRevision, out.OrderSeq = task, item, revision, order
+	out.Ownership, err = scopeOwnership(ownership)
 	return out, err
+}
+
+// scopeOwnership decodes a confirmation's saved ownership; none is nil.
+func scopeOwnership(raw string) ([]string, error) {
+	var owned []string
+	if raw != "" {
+		if err := json.Unmarshal([]byte(raw), &owned); err != nil {
+			return nil, err
+		}
+	}
+	if len(owned) == 0 {
+		return nil, nil
+	}
+	return owned, nil
 }
 
 func sameAdmissions(a, b []api.WorkOrderAdmission) bool {

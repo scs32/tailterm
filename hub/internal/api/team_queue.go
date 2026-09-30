@@ -52,7 +52,47 @@ type TeamQueueEntry struct {
 	Failure                string                     `json:"failure,omitempty"`
 	EscalationSeq          int64                      `json:"escalationSeq,omitempty"`
 	ReleasedAt             string                     `json:"releasedAt,omitempty"`
+	// Serial marks an entry that runs alone: it conflicts with every other
+	// team instead of declaring ownership.
+	Serial bool `json:"serial,omitempty"`
+	// OwnerIntegration is the owner's record that this entry's candidate was
+	// integrated outside the handler acceptance path. It releases the entry's
+	// slot, handler lease and ownership while its item stays open.
+	OwnerIntegration *TeamQueueOwnerIntegration `json:"ownerIntegration,omitempty"`
+	// Stall explains a queued entry that waits only on something nothing will
+	// clear by itself, with the supported fix. It is computed on read.
+	Stall     *TeamQueueStall `json:"stall,omitempty"`
+	UpdatedAt string          `json:"updatedAt,omitempty"`
 }
+
+// TeamQueueOwnerIntegration is kept distinct from TeamIntegrationReady, the
+// "Ready to integrate" snapshot of a handler-accepted team.
+type TeamQueueOwnerIntegration struct {
+	Commit       string   `json:"commit"`
+	BaseCommit   string   `json:"baseCommit"`
+	Evidence     string   `json:"evidence,omitempty"`
+	ChangedFiles []string `json:"changedFiles"`
+	At           string   `json:"at"`
+}
+
+// TeamQueueStall names the one entry (or missing handler) a queued entry is
+// stuck behind, the supported fix command and since when it has held.
+type TeamQueueStall struct {
+	Cause           string `json:"cause"`
+	BlockerEntryID  string `json:"blockerEntryId,omitempty"`
+	BlockerRevision int64  `json:"blockerRevision,omitempty"`
+	Fix             string `json:"fix"`
+	Since           string `json:"since"`
+}
+
+// Stall causes.
+const (
+	StallFailedEntry    = "failed-entry"
+	StallNothingRunning = "nothing-running"
+	StallIdleEntry      = "idle-entry"
+	StallNoHandler      = "no-handler"
+	StallSerialHalted   = "serial-halted"
+)
 
 type TeamAgentActivity struct {
 	AgentID  string         `json:"agentId"`
@@ -153,6 +193,10 @@ type TeamQueueRequest struct {
 	LeadAgentID              string                     `json:"leadAgentId,omitempty"`
 	LeadRunID                string                     `json:"leadRunId,omitempty"`
 	ExpectedLeadRevision     int64                      `json:"expectedLeadRevision,omitempty"`
+	Serial                   bool                       `json:"serial,omitempty"`
+	OwnerIntegrationCommit   string                     `json:"ownerIntegrationCommit,omitempty"`
+	OwnerIntegrationEvidence string                     `json:"ownerIntegrationEvidence,omitempty"`
+	ChangedFiles             []string                   `json:"changedFiles,omitempty"`
 }
 
 type TeamIntegrationReady struct {
