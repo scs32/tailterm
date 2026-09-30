@@ -47,9 +47,9 @@ func queueLimitText(limit int) string {
 	return strconv.Itoa(limit)
 }
 
-// addQueueWorktree gives an entry its own detached worktree at the current
-// HEAD, under the repository root's .build/worktrees, named for the item.
-func addQueueWorktree(checkout, item string) (string, error) {
+// queueWorktreePath is an entry's own worktree path: the repository root's
+// .build/worktrees/queue-<item8>. checkout must be a worktree root.
+func queueWorktreePath(checkout, item string) (string, error) {
 	top, err := exec.Command("git", "-C", checkout, "rev-parse", "--show-toplevel").Output()
 	if err != nil {
 		return "", errors.New("--new-worktree must run from a Git worktree root")
@@ -67,14 +67,33 @@ func addQueueWorktree(checkout, item string) (string, error) {
 		return "", err
 	}
 	root := filepath.Dir(strings.TrimSpace(string(common)))
-	path := filepath.Join(root, ".build", "worktrees", "queue-"+strings.TrimPrefix(item, "wi_")[:8])
+	return filepath.Join(root, ".build", "worktrees", "queue-"+strings.TrimPrefix(item, "wi_")[:8]), nil
+}
+
+// addQueueWorktree gives an entry its own detached worktree at commit, under
+// the repository root's .build/worktrees, named for the item.
+func addQueueWorktree(checkout, item, commit string) (string, error) {
+	path, err := queueWorktreePath(checkout, item)
+	if err != nil {
+		return "", err
+	}
 	if _, err := os.Lstat(path); err == nil || !errors.Is(err, os.ErrNotExist) {
 		return "", fmt.Errorf("queue worktree already exists: %s; queue from it with --cwd %s", path, path)
 	}
-	if output, err := exec.Command("git", "-C", checkout, "worktree", "add", "--detach", path, "HEAD").CombinedOutput(); err != nil {
+	if output, err := exec.Command("git", "-C", checkout, "worktree", "add", "--detach", path, commit).CombinedOutput(); err != nil {
 		return "", fmt.Errorf("git worktree add: %v: %s", err, strings.TrimSpace(string(output)))
 	}
 	return path, nil
+}
+
+// sameQueueDir reports whether two paths name one directory.
+func sameQueueDir(a, b string) bool {
+	if filepath.Clean(a) == filepath.Clean(b) {
+		return true
+	}
+	realA, errA := filepath.EvalSymlinks(a)
+	realB, errB := filepath.EvalSymlinks(b)
+	return errA == nil && errB == nil && realA == realB
 }
 
 func cmdTeamQueue(e env, args []string) error {
@@ -100,7 +119,7 @@ func cmdTeamQueue(e env, args []string) error {
 	fs.Var(&ownership, "owns", "repository-relative owned file or directory (repeatable)")
 	limit := fs.String("limit", "", "project concurrency limit: none (no fixed cap), 1 (serial) or N")
 	minFreeDisk := fs.Int64("min-free-disk-mib", 0, "free-disk reserve for new parallel teams in MiB (0: default 8192)")
-	newWorktree := fs.Bool("new-worktree", false, "add: create the entry's own detached worktree under .build/worktrees")
+	newWorktree := fs.Bool("new-worktree", false, "add, scope: create the entry's own detached worktree under .build/worktrees (scope: at its frozen base)")
 	noNewWorktree := fs.Bool("no-new-worktree", false, "add: use the current checkout in a parallel project")
 	serial := fs.Bool("serial", false, "add: declare no ownership; the entry runs alone")
 	reason := fs.String("reason", "", "fail: why the owner is failing this entry")
@@ -153,7 +172,7 @@ func cmdTeamQueue(e env, args []string) error {
 			} else if q.State == "failed" && q.ReleasedAt != "" {
 				state += " (released)"
 			}
-			fmt.Printf("%d %s %s %s order=#%d revision=%d repository=%s owns=%s blocked-by=%s reason=%s handler=%s/%s lease=%d%s\n", q.Position, state, q.ID, q.ItemID, q.OrderMessageSeq, q.Revision, q.Repository, owns, strings.Join(q.BlockedBy, ","), q.BlockReason, q.HandlerID, q.HandlerRunID, q.HandlerLeaseGeneration, queueArmText(q.HandlerArm))
+			fmt.Printf("%d %s %s %s order=#%d revision=%d repository=%s cwd=%s owns=%s blocked-by=%s reason=%s handler=%s/%s lease=%d%s\n", q.Position, state, q.ID, q.ItemID, q.OrderMessageSeq, q.Revision, q.Repository, q.Cwd, owns, strings.Join(q.BlockedBy, ","), q.BlockReason, q.HandlerID, q.HandlerRunID, q.HandlerLeaseGeneration, queueArmText(q.HandlerArm))
 			fmt.Printf("  team last-transition tokens=%d\n", q.Tokens.Total)
 			for _, member := range q.Activities {
 				state := "unknown"
@@ -248,7 +267,7 @@ func cmdTeamQueue(e env, args []string) error {
 			if _, scopeErr := queueRepositoryScope(checkout, ownership); scopeErr != nil {
 				return scopeErr
 			}
-			*cwd, err = addQueueWorktree(checkout, *item)
+			*cwd, err = addQueueWorktree(checkout, *item, "HEAD")
 			if err != nil {
 				return err
 			}
@@ -290,6 +309,9 @@ func cmdTeamQueue(e env, args []string) error {
 	case "remove", "reorder", "release", "replace-lead", "accept", "scope", "fail", "integrated":
 		if !validTeamQueueEntryID(*entry) {
 			return errors.New(sub + " requires --entry tqe_ID")
+		}
+		if sub == "scope" && *newWorktree && (*cwd != "" || *noNewWorktree) {
+			return errors.New("usage: tt team queue scope --entry tqe_ID [--owns PATH...] --new-worktree")
 		}
 		q, err := c.GetTeamQueueEntry(ctx, *task, *entry)
 		if err != nil {
@@ -349,8 +371,16 @@ func cmdTeamQueue(e env, args []string) error {
 			req.Operation, req.LeadAgentID, req.LeadRunID = "replace_lead", candidate.ID, candidate.RunID
 		}
 		if sub == "scope" {
+			ownsGiven := len(ownership) > 0
+			if *newWorktree && !ownsGiven {
+				// Moving keeps the entry's declaration unless --owns replaces it.
+				ownership = q.Ownership
+				if len(ownership) == 0 {
+					return fmt.Errorf("entry %s declares no ownership; pass --owns PATH to move it to its own worktree", q.ID)
+				}
+			}
 			if len(ownership) == 0 {
-				return errors.New("usage: tt team queue scope --entry tqe_ID --owns PATH [--owns PATH...]")
+				return errors.New("usage: tt team queue scope --entry tqe_ID --owns PATH [--owns PATH...] [--new-worktree]")
 			}
 			req.Ownership = ownership
 			if q.Repository != "" && q.Cwd != "" {
@@ -374,6 +404,55 @@ func cmdTeamQueue(e env, args []string) error {
 					req.HandlerAgentID, req.HandlerRunID = e.agent, e.runID
 				} else {
 					req.LeadAgentID, req.LeadRunID = e.agent, e.runID
+				}
+			}
+			if *newWorktree {
+				// A queued entry moves off a shared checkout into its own
+				// worktree at its frozen base, keeping its place and history.
+				if q.State != "queued" {
+					return fmt.Errorf("only a queued entry can move to its own worktree; %s is %s", q.ID, q.State)
+				}
+				if q.Repository == "" || q.BaseCommit == "" {
+					return fmt.Errorf("entry %s has no frozen repository and base; queue a new entry with tt team queue add --new-worktree", q.ID)
+				}
+				if q.Host != spawn.Host() {
+					return fmt.Errorf("entry %s launches on %s; move it from that host", q.ID, q.Host)
+				}
+				target, pathErr := queueWorktreePath(q.Cwd, q.ItemID)
+				if pathErr != nil {
+					return pathErr
+				}
+				if sameQueueDir(q.Cwd, target) {
+					fmt.Printf("entry already uses its own worktree %s\n", q.Cwd)
+					if !ownsGiven {
+						return nil
+					}
+				} else {
+					if _, statErr := os.Lstat(target); statErr == nil || !errors.Is(statErr, os.ErrNotExist) {
+						return fmt.Errorf("queue worktree already exists: %s; remove it with git worktree remove %s, then rerun", target, target)
+					}
+					checkout := q.Cwd
+					path, addErr := addQueueWorktree(checkout, q.ItemID, q.BaseCommit)
+					if addErr != nil {
+						return addErr
+					}
+					createdWorktree = path
+					// Until the hub saves the move, any failure removes the
+					// new worktree so a retry can create it again.
+					defer func() {
+						if createdWorktree != "" {
+							_ = exec.Command("git", "-C", checkout, "worktree", "remove", "--force", createdWorktree).Run()
+						}
+					}()
+					fmt.Printf("worktree %s\n", path)
+					repository, scopeErr := queueRepositoryScope(path, ownership)
+					if scopeErr != nil {
+						return scopeErr
+					}
+					if repository != q.Repository {
+						return fmt.Errorf("the new worktree is in repository %s, not the entry's %s", repository, q.Repository)
+					}
+					req.Cwd, req.Repository = path, repository
 				}
 			}
 		}
@@ -475,8 +554,18 @@ func cmdTeamQueue(e env, args []string) error {
 		return errors.New(teamQueueUsage)
 	}
 	result, err := c.TeamQueueAction(ctx, *task, req)
+	if err != nil && sub == "scope" && req.Cwd != "" {
+		// A lost response may follow a saved move: keep the worktree the
+		// entry now names.
+		if saved, getErr := c.GetTeamQueueEntry(ctx, *task, req.EntryID); getErr == nil && saved.Cwd == req.Cwd {
+			result, err = saved, nil
+		}
+	}
 	if err != nil {
 		return err
+	}
+	if sub == "scope" && req.Cwd != "" && result.Cwd != req.Cwd {
+		return errors.New("the hub did not save the new worktree; update the hub before moving entries")
 	}
 	createdWorktree = "" // The saved entry now names it.
 	if *jsonOut {

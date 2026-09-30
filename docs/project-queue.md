@@ -587,3 +587,44 @@ of arm S` or `Every handler arm is at a provider limit`, and the claim returns a
 409 ending in `no free handler in the drawn arm`, which the runner treats as an
 ordinary wait. With no policy, or a disabled one, entries lease the first free
 handler as before.
+
+## Team queue shared checkouts
+
+Two teams never edit one working tree, so a queued entry whose `cwd` equals an
+active entry's waits for it even when their ownership is disjoint. Entries
+queued before parallel projects, or with `--cwd` or `--no-new-worktree`, often
+use the main checkout and so run one at a time. `tt team queue list` prints
+each entry's `cwd=`, and when a shared checkout is the only conflict the reason
+is `Shares checkout DIR with active entry tqe_A; move it: tt team queue scope
+--task ID --entry tqe_B --new-worktree`. An ownership overlap keeps its
+ordinary `blocked-by` without that text, and an earlier reason (slots, host,
+handler, unscoped or serial) or a `Stalled:` explanation takes precedence.
+
+```sh
+tt team queue scope --entry tqe_ID --new-worktree [--owns PATH...]
+```
+
+moves a queued entry into its own detached worktree,
+`<repository root>/.build/worktrees/queue-<item8>`, created from the entry's
+current checkout at its frozen base commit, not the checkout's newer `HEAD`.
+The owner or any live database handler may move it, the same authority as
+`scope`. It needs a `queued` entry, a frozen repository and base, ownership
+(the entry's own unless `--owns` replaces it), and must run on the entry's
+launch host. `--cwd` and `--no-new-worktree` are refused with it. The hub keeps
+the entry's ID, position, item, revision, order, repository, base and history;
+it saves the new `cwd` and ownership and increments the entry revision. It
+refuses a launching, running or failed entry, a relative or unclean path, a
+different repository, and a path another queued or active entry uses.
+
+Until the hub confirms the move, any failure, including a refusal, a stale
+revision or an unreachable hub, removes the new worktree (`git worktree remove
+--force`), so the command can be rerun. When the write's response is lost, the
+CLI reads the entry back and keeps the worktree if the hub saved it. A path
+that already exists is refused; remove it with `git worktree remove PATH`
+first. A rerun on an entry that already uses its worktree prints `entry already
+uses its own worktree PATH` and changes nothing. Like one made by `tt team
+queue add --new-worktree`, the worktree stays after the entry finishes; remove
+it with `git worktree remove PATH` once its candidate is integrated.
+
+Release the hub before the CLI: a CLI that sends the move to an older hub
+refuses when the saved entry lacks the new `cwd` and removes the worktree.

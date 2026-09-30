@@ -1,10 +1,16 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"net/http/httputil"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -500,5 +506,257 @@ func TestTeamQueueListArmAssignment(t *testing.T) {
 	}
 	if queueArmText(nil) != "" {
 		t.Fatal("unassigned entry printed an arm")
+	}
+}
+
+// queueMoveProxy fronts the fixture hub; move handles each scope request
+// that moves an entry to a new worktree, with the real hub as forward.
+func queueMoveProxy(t *testing.T, hub string, move func(w http.ResponseWriter, r *http.Request, forward http.Handler)) string {
+	t.Helper()
+	target, err := url.Parse(hub)
+	if err != nil {
+		t.Fatal(err)
+	}
+	forward := httputil.NewSingleHostReverseProxy(target)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == "POST" && strings.HasSuffix(r.URL.Path, "/team-queue/actions") {
+			body, _ := io.ReadAll(r.Body)
+			r.Body, r.ContentLength = io.NopCloser(bytes.NewReader(body)), int64(len(body))
+			var req api.TeamQueueRequest
+			if json.Unmarshal(body, &req) == nil && req.Operation == "scope" && req.Cwd != "" {
+				move(w, r, forward)
+				return
+			}
+		}
+		forward.ServeHTTP(w, r)
+	}))
+	t.Cleanup(srv.Close)
+	return srv.URL
+}
+
+func dropQueueResponse(w http.ResponseWriter) {
+	if conn, _, err := w.(http.Hijacker).Hijack(); err == nil {
+		conn.Close()
+	}
+}
+
+// liveQueueHandler adds a second available database handler, so two
+// entries can hold leases at once.
+func liveQueueHandler(t *testing.T, f teamFixture) {
+	t.Helper()
+	ctx := context.Background()
+	h, err := f.c.AddAgent(ctx, f.task.ID, api.AddAgentRequest{AgentID: api.NewID("agt"), Name: "db-handler-2", Role: api.AgentRoleDatabaseHandler, Host: "fixture", Session: "fixture-handler-2", Runtime: "codex"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.c.PostEvent(ctx, f.task.ID, api.PostEventRequest{AgentID: h.ID, RunID: h.RunID, Kind: api.EventRunning}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func claimQueueEntry(t *testing.T, f teamFixture, q api.TeamQueueEntry, key string) (api.TeamQueueEntry, error) {
+	t.Helper()
+	detail, err := f.c.GetTask(context.Background(), f.task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return f.c.TeamQueueAction(context.Background(), f.task.ID, api.TeamQueueRequest{RequestID: key, Operation: "claim", EntryID: q.ID, ExpectedRevision: q.Revision, Host: q.Host, PauseGeneration: detail.Task.PauseGeneration})
+}
+
+func queueWorktreeFor(repo, item string) string {
+	return filepath.Join(repo, ".build", "worktrees", "queue-"+strings.TrimPrefix(item, "wi_")[:8])
+}
+
+func requireNoQueueWorktree(t *testing.T, repo, path, why string) {
+	t.Helper()
+	if _, err := os.Lstat(path); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("%s: left worktree %s: %v", why, path, err)
+	}
+	if list, err := exec.Command("git", "-C", repo, "worktree", "list", "--porcelain").Output(); err != nil || strings.Contains(string(list), path) {
+		t.Fatalf("%s: git still lists the worktree: %s %v", why, list, err)
+	}
+}
+
+// q1-q3: a legacy entry on the main checkout, blocked only because a running
+// entry shares that checkout, moves to its own worktree at its frozen base and
+// launches beside it.
+func TestTeamQueueCLIScopeNewWorktreeMovesSharedCheckoutEntry(t *testing.T) {
+	f := newTeamFixture(t, true)
+	ctx := context.Background()
+	repo, head := queueGitRepo(t)
+	parallelCLIProject(t, f, "none")
+	liveQueueHandler(t, f)
+	second, secondOrder := queueFixtureItem(t, f, "shared-checkout")
+	for _, args := range [][]string{
+		{"add", "--item", f.item.ID, "--order", fmt.Sprint(f.order), "--cwd", repo, "--owns", "client"},
+		{"add", "--item", second.ID, "--order", fmt.Sprint(secondOrder), "--cwd", repo, "--owns", "docs"},
+	} {
+		if _, err := captureCLIOutput(t, func() error { return cmdTeamQueue(f.e, args) }); err != nil {
+			t.Fatal(err)
+		}
+	}
+	list, err := f.c.ListTeamQueue(ctx, f.task.ID)
+	if err != nil || len(list.Entries) != 2 {
+		t.Fatalf("queue %+v %v", list, err)
+	}
+	a, b := list.Entries[0], list.Entries[1]
+	if a, err = claimQueueEntry(t, f, a, "claim-a"); err != nil {
+		t.Fatal(err)
+	}
+	printed, err := captureCLIOutput(t, func() error { return cmdTeamQueue(f.e, []string{"list"}) })
+	if err != nil || !strings.Contains(printed, "cwd="+b.Cwd+" owns=docs blocked-by="+a.ID+" reason=Shares checkout "+b.Cwd+" with active entry "+a.ID) || !strings.Contains(printed, "--entry "+b.ID+" --new-worktree") {
+		t.Fatalf("shared checkout list: %s %v", printed, err)
+	}
+	if _, err := claimQueueEntry(t, f, b, "claim-b-shared"); err == nil {
+		t.Fatal("B launched in A's checkout")
+	}
+	// The main checkout moves on; the new worktree still starts at B's base.
+	if output, err := exec.Command("git", "-C", repo, "-c", "user.email=fixture@example.invalid", "-c", "user.name=fixture", "commit", "-q", "--allow-empty", "-m", "newer").CombinedOutput(); err != nil {
+		t.Fatalf("commit: %v %s", err, output)
+	}
+	if newer, _ := queueGitCommit(repo); newer == head {
+		t.Fatal("main checkout did not advance")
+	}
+	want := queueWorktreeFor(repo, second.ID)
+	out, err := captureCLIOutput(t, func() error { return cmdTeamQueue(f.e, []string{"scope", "--entry", b.ID, "--new-worktree"}) })
+	if err != nil || !strings.Contains(out, "worktree "+want) {
+		t.Fatalf("move %q %v", out, err)
+	}
+	moved, err := f.c.GetTeamQueueEntry(ctx, f.task.ID, b.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if real, _ := filepath.EvalSymlinks(moved.Cwd); real != want || moved.Position != b.Position || moved.Revision != b.Revision+1 || moved.State != "queued" || moved.BaseCommit != head || moved.Repository != b.Repository || moved.ItemID != b.ItemID || moved.OrderMessageSeq != b.OrderMessageSeq || strings.Join(moved.Ownership, ",") != "docs" {
+		t.Fatalf("moved %+v, was %+v", moved, b)
+	}
+	if branch, err := exec.Command("git", "-C", want, "rev-parse", "--abbrev-ref", "HEAD").Output(); err != nil || strings.TrimSpace(string(branch)) != "HEAD" {
+		t.Fatalf("worktree is not detached: %q %v", branch, err)
+	}
+	if sha, err := queueGitCommit(want); err != nil || sha != head {
+		t.Fatalf("worktree HEAD %s %v, want base %s", sha, err, head)
+	}
+	if printed, err := captureCLIOutput(t, func() error { return cmdTeamQueue(f.e, []string{"list"}) }); err != nil || !strings.Contains(printed, "cwd="+moved.Cwd+" owns=docs blocked-by= reason= ") {
+		t.Fatalf("moved list: %s %v", printed, err)
+	}
+	// A rerun changes nothing.
+	out, err = captureCLIOutput(t, func() error { return cmdTeamQueue(f.e, []string{"scope", "--entry", b.ID, "--new-worktree"}) })
+	if err != nil || !strings.Contains(out, "entry already uses its own worktree "+moved.Cwd) {
+		t.Fatalf("rerun %q %v", out, err)
+	}
+	if again, err := f.c.GetTeamQueueEntry(ctx, f.task.ID, b.ID); err != nil || again.Revision != moved.Revision || again.Cwd != moved.Cwd {
+		t.Fatalf("rerun changed the entry %+v %v", again, err)
+	}
+	claimed, err := claimQueueEntry(t, f, moved, "claim-b-own")
+	if err != nil {
+		t.Fatalf("moved B did not launch beside A: %v", err)
+	}
+	if still, err := f.c.GetTeamQueueEntry(ctx, f.task.ID, a.ID); err != nil || still.State != "launching" || still.HandlerID == claimed.HandlerID {
+		t.Fatalf("A beside B %+v %v (B handler %s)", still, err, claimed.HandlerID)
+	}
+}
+
+// A legacy entry without a frozen repository, or one no longer queued, is
+// refused before any worktree exists.
+func TestTeamQueueCLIScopeNewWorktreeRefusesLegacyAndAdmittedEntries(t *testing.T) {
+	f := newTeamFixture(t, true)
+	ctx := context.Background()
+	repo, _ := queueGitRepo(t)
+	q, err := f.c.TeamQueueAction(ctx, f.task.ID, api.TeamQueueRequest{RequestID: "legacy", Operation: "add", ItemID: f.item.ID, OrderMessageSeq: f.order, Host: spawn.Host(), Cwd: repo, Ownership: []string{"client"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := queueWorktreeFor(repo, f.item.ID)
+	if _, err := captureCLIOutput(t, func() error { return cmdTeamQueue(f.e, []string{"scope", "--entry", q.ID, "--new-worktree"}) }); err == nil || !strings.Contains(err.Error(), "no frozen repository and base") {
+		t.Fatalf("legacy entry: %v", err)
+	}
+	requireNoQueueWorktree(t, repo, want, "legacy entry")
+	if _, err := claimQueueEntry(t, f, q, "claim-legacy"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := captureCLIOutput(t, func() error { return cmdTeamQueue(f.e, []string{"scope", "--entry", q.ID, "--new-worktree"}) }); err == nil || !strings.Contains(err.Error(), "only a queued entry") {
+		t.Fatalf("launching entry: %v", err)
+	}
+	requireNoQueueWorktree(t, repo, want, "launching entry")
+}
+
+// Every refusal leaves no worktree, so the move can be retried; a saved
+// move whose response was lost keeps its worktree.
+func TestTeamQueueCLIScopeNewWorktreeRefusalsLeaveNoWorktree(t *testing.T) {
+	f := newTeamFixture(t, true)
+	ctx := context.Background()
+	repo, head := queueGitRepo(t)
+	parallelCLIProject(t, f, "none")
+	liveQueueHandler(t, f)
+	serialItem, serialOrder := queueFixtureItem(t, f, "serial")
+	serial, err := f.c.TeamQueueAction(ctx, f.task.ID, api.TeamQueueRequest{RequestID: "serial", Operation: "add", ItemID: serialItem.ID, OrderMessageSeq: serialOrder, Host: spawn.Host(), Cwd: repo, Repository: filepath.Join(repo, ".git"), BaseCommit: head, Serial: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	scopedItem, scopedOrder := queueFixtureItem(t, f, "scoped")
+	scoped, err := f.c.TeamQueueAction(ctx, f.task.ID, api.TeamQueueRequest{RequestID: "scoped", Operation: "add", ItemID: scopedItem.ID, OrderMessageSeq: scopedOrder, Host: spawn.Host(), Cwd: repo, Repository: filepath.Join(repo, ".git"), BaseCommit: head, Ownership: []string{"docs"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	offline := f.e
+	offline.hub = "http://127.0.0.1:1"
+	stale := f.e
+	stale.hub = queueMoveProxy(t, f.e.hub, func(w http.ResponseWriter, r *http.Request, forward http.Handler) {
+		// Another writer changes the entry between the CLI's read and write.
+		current, err := f.c.GetTeamQueueEntry(ctx, f.task.ID, scoped.ID)
+		if err == nil {
+			_, err = f.c.TeamQueueAction(ctx, f.task.ID, api.TeamQueueRequest{RequestID: api.NewID("tqr"), Operation: "scope", EntryID: current.ID, ExpectedRevision: current.Revision, Ownership: current.Ownership})
+		}
+		if err != nil {
+			t.Errorf("concurrent scope: %v", err)
+		}
+		forward.ServeHTTP(w, r)
+	})
+	dropped := f.e
+	dropped.hub = queueMoveProxy(t, f.e.hub, func(w http.ResponseWriter, _ *http.Request, _ http.Handler) { dropQueueResponse(w) })
+	for _, attempt := range []struct {
+		name, want string
+		e          env
+		q          api.TeamQueueEntry
+		args       []string
+	}{
+		{"--cwd", "usage:", f.e, scoped, []string{"--cwd", repo}},
+		{"--no-new-worktree", "usage:", f.e, scoped, []string{"--no-new-worktree"}},
+		{"no ownership", "declares no ownership", f.e, serial, nil},
+		{"hub unreachable", "", offline, scoped, nil},
+		{"stale revision", "revision changed", stale, scoped, nil},
+		{"response dropped before the hub", "", dropped, scoped, nil},
+	} {
+		args := append([]string{"scope", "--entry", attempt.q.ID, "--new-worktree"}, attempt.args...)
+		before, _ := f.c.GetTeamQueueEntry(ctx, f.task.ID, attempt.q.ID)
+		out, err := captureCLIOutput(t, func() error { return cmdTeamQueue(attempt.e, args) })
+		if err == nil || !strings.Contains(err.Error(), attempt.want) {
+			t.Fatalf("%s: %v", attempt.name, err)
+		}
+		path := queueWorktreeFor(repo, attempt.q.ItemID)
+		if created := strings.Contains(out, "worktree "+path); created != (attempt.e.hub != f.e.hub && attempt.e.hub != offline.hub) {
+			t.Fatalf("%s: worktree created=%v: %q", attempt.name, created, out)
+		}
+		requireNoQueueWorktree(t, repo, path, attempt.name)
+		if after, err := f.c.GetTeamQueueEntry(ctx, f.task.ID, attempt.q.ID); err != nil || after.Cwd != before.Cwd {
+			t.Fatalf("%s: cwd changed %+v %v", attempt.name, after, err)
+		}
+	}
+	// The hub saves the move but its response is lost: the CLI reads the
+	// saved entry back and keeps the worktree it names.
+	lost := f.e
+	lost.hub = queueMoveProxy(t, f.e.hub, func(w http.ResponseWriter, r *http.Request, forward http.Handler) {
+		forward.ServeHTTP(httptest.NewRecorder(), r)
+		dropQueueResponse(w)
+	})
+	want := queueWorktreeFor(repo, scopedItem.ID)
+	if out, err := captureCLIOutput(t, func() error { return cmdTeamQueue(lost, []string{"scope", "--entry", scoped.ID, "--new-worktree"}) }); err != nil || !strings.Contains(out, "worktree "+want) {
+		t.Fatalf("lost response %q %v", out, err)
+	}
+	saved, err := f.c.GetTeamQueueEntry(ctx, f.task.ID, scoped.ID)
+	if real, _ := filepath.EvalSymlinks(saved.Cwd); err != nil || real != want {
+		t.Fatalf("saved %+v %v", saved, err)
+	}
+	if sha, err := queueGitCommit(want); err != nil || sha != head {
+		t.Fatalf("kept worktree HEAD %s %v", sha, err)
 	}
 }

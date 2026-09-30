@@ -517,6 +517,7 @@ func (s *Store) ListTeamQueue(ctx context.Context, task string) (api.TeamQueueLi
 				}
 			}
 		}
+		sharedWith, overlaps := "", false
 		for j := range out.Entries {
 			if i == j {
 				continue
@@ -525,9 +526,21 @@ func (s *Store) ListTeamQueue(ctx context.Context, task string) (api.TeamQueueLi
 			if !queueEntryHoldsResources(other) {
 				continue
 			}
-			if queueEntryConflicts(out.Entries[i], other) || (out.Entries[i].Cwd != "" && out.Entries[i].Cwd == other.Cwd) {
+			sameCwd := out.Entries[i].Cwd != "" && out.Entries[i].Cwd == other.Cwd
+			if queueEntryConflicts(out.Entries[i], other) {
 				out.Entries[i].BlockedBy = append(out.Entries[i].BlockedBy, other.ID)
+				overlaps = true
+			} else if sameCwd {
+				out.Entries[i].BlockedBy = append(out.Entries[i].BlockedBy, other.ID)
+				if sharedWith == "" {
+					sharedWith = other.ID
+				}
 			}
+		}
+		if sharedWith != "" && !overlaps && out.Entries[i].BlockReason == "" {
+			// Two teams never edit one checkout; a scoped entry that
+			// conflicts only by cwd can move to its own worktree.
+			out.Entries[i].BlockReason = fmt.Sprintf("Shares checkout %s with active entry %s; move it: tt team queue scope --task %s --entry %s --new-worktree", out.Entries[i].Cwd, sharedWith, task, out.Entries[i].ID)
 		}
 	}
 	var reader queryRower = s.db
@@ -987,6 +1000,27 @@ func (s *Store) TeamQueueAction(ctx context.Context, task string, req api.TeamQu
 			if len(ownership) == 0 {
 				return zero, fmt.Errorf("%w: scope needs at least one owned path", api.ErrInvalid)
 			}
+			if req.Cwd != "" {
+				// A queued entry may move off a shared checkout into its own
+				// worktree of the same repository; its base stays frozen.
+				if e.State != "queued" {
+					return zero, fmt.Errorf("%w: only a queued entry can move to its own worktree", api.ErrConflict)
+				}
+				if !filepath.IsAbs(req.Cwd) || filepath.Clean(req.Cwd) != req.Cwd || strings.Contains(req.Cwd, "\x00") || len(req.Cwd) > 4096 {
+					return zero, fmt.Errorf("%w: the new worktree must be a clean absolute path", api.ErrInvalid)
+				}
+				if e.Repository == "" || req.Repository != e.Repository {
+					return zero, fmt.Errorf("%w: the new worktree must be in the entry's repository", api.ErrConflict)
+				}
+				var user string
+				err := tx.QueryRowContext(ctx, `SELECT id FROM team_queue_entries WHERE task_id=? AND id<>? AND cwd=? AND (state='queued' OR `+queueHoldsSQL+`) ORDER BY position LIMIT 1`, task, e.ID, req.Cwd).Scan(&user)
+				if err == nil {
+					return zero, fmt.Errorf("%w: entry %s already uses %s", api.ErrConflict, user, req.Cwd)
+				}
+				if !errors.Is(err, sql.ErrNoRows) {
+					return zero, err
+				}
+			}
 			failedHold := e.State == "failed" && e.ReleasedAt == ""
 			if e.State != "queued" && e.State != "launching" && e.State != "running" && !failedHold {
 				return zero, fmt.Errorf("%w: only a queued, launching, running or unreleased failed entry can be scoped", api.ErrConflict)
@@ -1035,6 +1069,9 @@ func (s *Store) TeamQueueAction(ctx context.Context, task string, req api.TeamQu
 			}
 			e.Ownership = ownership
 			e.Serial = false
+			if req.Cwd != "" {
+				e.Cwd = req.Cwd
+			}
 		case "owner_integrated":
 			if req.HandlerAgentID != "" || req.HandlerRunID != "" || req.LeadAgentID != "" || req.LeadRunID != "" {
 				return zero, fmt.Errorf("%w: only the owner records an integration", api.ErrConflict)
@@ -1582,7 +1619,7 @@ func (s *Store) TeamQueueAction(ctx context.Context, task string, req api.TeamQu
 				ownerIntegrationJSON = string(data)
 			}
 			ownedJSON, _ := json.Marshal(e.Ownership)
-			_, err = tx.ExecContext(ctx, `UPDATE team_queue_entries SET state=?,revision=?,pause_generation=?,launch_json=?,close_json=?,failure=?,escalation_seq=?,released_at=?,handler_id=?,handler_run_id=?,handler_lease_generation=?,acceptance_json=?,integration_json=?,base_commit=?,ownership_json=?,owner_integration_json=?,serial=?,updated_at=? WHERE id=?`, e.State, e.Revision, e.PauseGeneration, string(e.LaunchJSON), string(e.CloseJSON), e.Failure, e.EscalationSeq, e.ReleasedAt, e.HandlerID, e.HandlerRunID, e.HandlerLeaseGeneration, acceptanceJSON, integrationJSON, e.BaseCommit, string(ownedJSON), ownerIntegrationJSON, e.Serial, now, e.ID)
+			_, err = tx.ExecContext(ctx, `UPDATE team_queue_entries SET state=?,revision=?,pause_generation=?,launch_json=?,close_json=?,failure=?,escalation_seq=?,released_at=?,handler_id=?,handler_run_id=?,handler_lease_generation=?,acceptance_json=?,integration_json=?,base_commit=?,ownership_json=?,owner_integration_json=?,serial=?,cwd=?,updated_at=? WHERE id=?`, e.State, e.Revision, e.PauseGeneration, string(e.LaunchJSON), string(e.CloseJSON), e.Failure, e.EscalationSeq, e.ReleasedAt, e.HandlerID, e.HandlerRunID, e.HandlerLeaseGeneration, acceptanceJSON, integrationJSON, e.BaseCommit, string(ownedJSON), ownerIntegrationJSON, e.Serial, e.Cwd, now, e.ID)
 			if err != nil {
 				return zero, err
 			}

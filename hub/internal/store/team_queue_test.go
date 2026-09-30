@@ -8,8 +8,10 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/scs32/tailterm/hub/internal/api"
 )
@@ -556,5 +558,179 @@ func TestVerificationDeliverySummaryAndNewPlanClearing(t *testing.T) {
 	entry, err = f.s.GetTeamQueueEntry(f.ctx, f.task.ID, q.ID)
 	if err != nil || entry.Verification.State != "stale" || len(entry.Verification.Checks) != 0 {
 		t.Fatal("stale summary", entry.Verification, err)
+	}
+}
+
+// sharedCheckoutFixture is a parallel project with two live handlers and n
+// items, each with a bounded order.
+func sharedCheckoutFixture(t *testing.T, n int) (*Store, api.Task, []api.WorkItem, []api.Message) {
+	t.Helper()
+	s, task, items, orders := queueFixture(t)
+	ctx := context.Background()
+	by := api.Caller{Node: "fixture", User: "owner"}
+	for i := len(items); i < n; i++ {
+		item, err := s.CreateWorkItem(ctx, task.ID, api.CreateWorkItemRequest{Kind: "feature", Title: "Queued work", Priority: "normal", RequestID: api.NewID("req")}, by)
+		if err != nil {
+			t.Fatal(err)
+		}
+		items = append(items, item)
+		orders = append(orders, contextLinkedMessage(t, s, task, item, "bounded order", api.NewID("req"), nil))
+	}
+	aux, err := s.AddAgent(ctx, task.ID, api.AddAgentRequest{Name: "aux-handler", Role: api.AgentRoleDatabaseHandler, AgentID: api.NewID("agt"), Host: "mini", Session: "aux-handler"}, by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.db.Exec(`UPDATE agents SET last_seen_at=?,status='running' WHERE id=?`, ts(s.now()), aux.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.TeamQueueAction(ctx, task.ID, api.TeamQueueRequest{RequestID: "checkout-policy", Operation: "set_host_policy", Host: "mini", HostPolicyVersion: 1, HostPolicyExpires: s.now().Add(time.Hour).Format(time.RFC3339), HostMaxSessions: 100, HostMaxPolling: 10, LimiterDomain: "https://fixture.invalid", HostMaxRelayBindings: 100, HostMaxRequestsPerMinute: 100000, HostMaxBurst: 10000, HostHeadroomPercent: 20}); err != nil {
+		t.Fatal(err)
+	}
+	syntheticHostUsage(t, s, task.ID, "mini")
+	if _, err := s.TeamQueueAction(ctx, task.ID, api.TeamQueueRequest{RequestID: "checkout-limit", Operation: "set_limit", Host: "mini", ConcurrencyLimit: 2}); err != nil {
+		t.Fatal(err)
+	}
+	return s, task, items, orders
+}
+
+const checkoutBase = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+
+func addCheckoutEntry(t *testing.T, s *Store, task api.Task, item api.WorkItem, order api.Message, cwd string, owns ...string) api.TeamQueueEntry {
+	t.Helper()
+	q, err := s.TeamQueueAction(context.Background(), task.ID, api.TeamQueueRequest{RequestID: "add-" + item.ID, Operation: "add", ItemID: item.ID, OrderMessageSeq: order.Seq, Host: "mini", Cwd: cwd, Repository: "repo", BaseCommit: checkoutBase, Ownership: owns})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return q
+}
+
+func TestTeamQueueScopeMovesSharedCheckoutEntryToItsOwnWorktree(t *testing.T) {
+	s, task, items, orders := sharedCheckoutFixture(t, 4)
+	ctx := context.Background()
+	a := addCheckoutEntry(t, s, task, items[0], orders[0], "/main", "src/a")
+	b := addCheckoutEntry(t, s, task, items[1], orders[1], "/main", "src/b")
+	c := addCheckoutEntry(t, s, task, items[2], orders[2], "/other", "src/a/child")
+	d := addCheckoutEntry(t, s, task, items[3], orders[3], "/main", "src/a/other")
+	a, err := s.TeamQueueAction(ctx, task.ID, api.TeamQueueRequest{RequestID: "claim-a", Operation: "claim", EntryID: a.ID, ExpectedRevision: a.Revision, Host: "mini"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// B conflicts with A only by its checkout; C by its ownership; D by both.
+	got := listedEntry(t, s, task.ID, b.ID)
+	if len(got.BlockedBy) != 1 || got.BlockedBy[0] != a.ID || !strings.Contains(got.BlockReason, "Shares checkout /main") || !strings.Contains(got.BlockReason, a.ID) || !strings.Contains(got.BlockReason, "--entry "+b.ID+" --new-worktree") {
+		t.Fatalf("shared checkout reason %q blocked by %v", got.BlockReason, got.BlockedBy)
+	}
+	if got := listedEntry(t, s, task.ID, c.ID); len(got.BlockedBy) != 1 || got.BlockedBy[0] != a.ID || strings.Contains(got.BlockReason, "Shares checkout") {
+		t.Fatalf("ownership overlap reason %q blocked by %v", got.BlockReason, got.BlockedBy)
+	}
+	// Moving D would not free it: it overlaps A too.
+	if got := listedEntry(t, s, task.ID, d.ID); len(got.BlockedBy) != 1 || got.BlockedBy[0] != a.ID || strings.Contains(got.BlockReason, "Shares checkout") {
+		t.Fatalf("overlap and shared checkout reason %q blocked by %v", got.BlockReason, got.BlockedBy)
+	}
+	if _, err := s.TeamQueueAction(ctx, task.ID, api.TeamQueueRequest{RequestID: "claim-b-shared", Operation: "claim", EntryID: b.ID, ExpectedRevision: b.Revision, Host: "mini"}); err == nil {
+		t.Fatal("B launched in A's checkout")
+	}
+	move := api.TeamQueueRequest{RequestID: "move-b", Operation: "scope", EntryID: b.ID, ExpectedRevision: b.Revision, Ownership: b.Ownership, Cwd: "/main/.build/worktrees/queue-b", Repository: "repo"}
+	moved, err := s.TeamQueueAction(ctx, task.ID, move)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := b
+	want.Cwd, want.Revision, want.UpdatedAt = move.Cwd, b.Revision+1, moved.UpdatedAt
+	if moved.ID != want.ID || moved.Position != want.Position || moved.ItemID != want.ItemID || moved.ItemRevision != want.ItemRevision || moved.OrderMessageSeq != want.OrderMessageSeq || moved.Repository != want.Repository || moved.BaseCommit != want.BaseCommit || moved.Cwd != want.Cwd || moved.Revision != want.Revision || moved.State != "queued" || moved.Serial || strings.Join(moved.Ownership, ",") != "src/b" {
+		t.Fatalf("moved entry %+v, want %+v", moved, want)
+	}
+	if replay, err := s.TeamQueueAction(ctx, task.ID, move); err != nil || replay.Revision != moved.Revision || replay.Cwd != moved.Cwd {
+		t.Fatalf("replay %+v %v", replay, err)
+	}
+	if saved, err := s.GetTeamQueueEntry(ctx, task.ID, b.ID); err != nil || saved.Cwd != move.Cwd || saved.Revision != moved.Revision || saved.Position != b.Position {
+		t.Fatalf("saved %+v %v", saved, err)
+	}
+	if got := listedEntry(t, s, task.ID, b.ID); len(got.BlockedBy) != 0 || strings.Contains(got.BlockReason, "Shares checkout") {
+		t.Fatalf("moved B still blocked: %q %v", got.BlockReason, got.BlockedBy)
+	}
+	claimed, err := s.TeamQueueAction(ctx, task.ID, api.TeamQueueRequest{RequestID: "claim-b-own", Operation: "claim", EntryID: b.ID, ExpectedRevision: moved.Revision, Host: "mini"})
+	if err != nil {
+		t.Fatalf("moved B did not launch beside A: %v", err)
+	}
+	if claimed.Cwd != move.Cwd || claimed.State != "launching" {
+		t.Fatalf("claimed B %+v", claimed)
+	}
+	if still, err := s.GetTeamQueueEntry(ctx, task.ID, a.ID); err != nil || still.State != "launching" || still.Cwd != "/main" || still.HandlerID == claimed.HandlerID {
+		t.Fatalf("A beside B: %+v %v (B handler %s)", still, err, claimed.HandlerID)
+	}
+}
+
+func TestTeamQueueScopeWorktreeRefusalsLeaveEntryUnchanged(t *testing.T) {
+	s, task, items, orders := sharedCheckoutFixture(t, 4)
+	ctx := context.Background()
+	a := addCheckoutEntry(t, s, task, items[0], orders[0], "/main", "src/a")
+	b := addCheckoutEntry(t, s, task, items[1], orders[1], "/main", "src/b")
+	d := addCheckoutEntry(t, s, task, items[2], orders[2], "/d", "src/d")
+	addCheckoutEntry(t, s, task, items[3], orders[3], "/e", "src/e")
+	// Claims go in queue order: A, then D (B shares A's checkout).
+	if _, err := s.TeamQueueAction(ctx, task.ID, api.TeamQueueRequest{RequestID: "claim-a", Operation: "claim", EntryID: a.ID, ExpectedRevision: a.Revision, Host: "mini"}); err != nil {
+		t.Fatal(err)
+	}
+	d, err := s.TeamQueueAction(ctx, task.ID, api.TeamQueueRequest{RequestID: "claim-d", Operation: "claim", EntryID: d.ID, ExpectedRevision: d.Revision, Host: "mini"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	move := func(q api.TeamQueueEntry, key, cwd, repository string) error {
+		_, err := s.TeamQueueAction(ctx, task.ID, api.TeamQueueRequest{RequestID: key, Operation: "scope", EntryID: q.ID, ExpectedRevision: q.Revision, Ownership: q.Ownership, Cwd: cwd, Repository: repository})
+		return err
+	}
+	for _, c := range []struct{ name, cwd, repository string }{
+		{"relative", "main/.build/worktrees/queue-b", "repo"},
+		{"unclean", "/main/../worktrees/queue-b", "repo"},
+		{"trailing-slash", "/main/worktrees/queue-b/", "repo"},
+		{"nul", "/main/worktrees/queue\x00b", "repo"},
+		{"other-repository", "/main/worktrees/queue-b", "other"},
+		{"no-repository", "/main/worktrees/queue-b", ""},
+		{"active-cwd", "/d", "repo"},
+		{"queued-cwd", "/e", "repo"},
+	} {
+		if err := move(b, "move-b-"+c.name, c.cwd, c.repository); err == nil {
+			t.Fatalf("%s: move accepted", c.name)
+		}
+		if got, err := s.GetTeamQueueEntry(ctx, task.ID, b.ID); err != nil || got.Cwd != "/main" || got.Revision != b.Revision {
+			t.Fatalf("%s: entry changed %+v %v", c.name, got, err)
+		}
+	}
+	if err := move(d, "move-launching-d", "/d-own", "repo"); err == nil || !strings.Contains(err.Error(), "only a queued entry") {
+		t.Fatalf("launching entry moved: %v", err)
+	}
+	failed, err := s.TeamQueueAction(ctx, task.ID, api.TeamQueueRequest{RequestID: "fail-d", Operation: "fail", EntryID: d.ID, ExpectedRevision: d.Revision, Failure: "synthetic failure"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := move(failed, "move-failed-d", "/d-own", "repo"); err == nil || !strings.Contains(err.Error(), "only a queued entry") {
+		t.Fatalf("failed entry moved: %v", err)
+	}
+	if got, err := s.GetTeamQueueEntry(ctx, task.ID, d.ID); err != nil || got.Cwd != "/d" || got.Revision != failed.Revision {
+		t.Fatalf("failed entry changed %+v %v", got, err)
+	}
+	// A plain scope keeps the checkout.
+	scoped, err := s.TeamQueueAction(ctx, task.ID, api.TeamQueueRequest{RequestID: "narrow-b", Operation: "scope", EntryID: b.ID, ExpectedRevision: b.Revision, Ownership: []string{"src/b/only"}})
+	if err != nil || scoped.Cwd != "/main" || strings.Join(scoped.Ownership, ",") != "src/b/only" {
+		t.Fatalf("plain scope %+v %v", scoped, err)
+	}
+}
+
+func TestTeamQueueScopeWorktreeNeedsARepository(t *testing.T) {
+	s, task, items, orders := queueFixture(t)
+	ctx := context.Background()
+	// A serial project admits a legacy entry without a frozen repository.
+	q, err := s.TeamQueueAction(ctx, task.ID, api.TeamQueueRequest{RequestID: "add-legacy", Operation: "add", ItemID: items[0].ID, OrderMessageSeq: orders[0].Seq, Host: "mini", Cwd: "/main", Ownership: []string{"src/a"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, repository := range []string{"", "repo"} {
+		if _, err := s.TeamQueueAction(ctx, task.ID, api.TeamQueueRequest{RequestID: "move-legacy-" + repository, Operation: "scope", EntryID: q.ID, ExpectedRevision: q.Revision, Ownership: q.Ownership, Cwd: "/main/worktrees/queue-a", Repository: repository}); err == nil || !strings.Contains(err.Error(), "entry's repository") {
+			t.Fatalf("repository %q: %v", repository, err)
+		}
+	}
+	if got, err := s.GetTeamQueueEntry(ctx, task.ID, q.ID); err != nil || got.Cwd != "/main" || got.Revision != q.Revision {
+		t.Fatalf("legacy entry changed %+v %v", got, err)
 	}
 }
