@@ -277,12 +277,33 @@ standing order to supersede.
   `relayRunning` from `launchctl print gui/UID/LABEL`, and `newErrors` counted
   in the relay log after the offset the runner saves at deploy
   (`journalDirectory/mini-relay-offset.json`).
-- `live tailos`: the public `release.json` commit.
+- `live tailos`: the public `release.json` commit, from one read.
 - `rollback hub|bridge --expect-release NAME --expect-sha SHA`,
   `rollback mini [--expect-sha SHA]`, `rollback tailos --expect-commit SHA`:
   `{restored, databaseWritesPreserved}`. Hub/bridge are restored when the live
   release and hash equal the expected prior values; database writes are preserved
-  when the state mount is unchanged and the hub responds.
+  when the state mount is unchanged and the hub responds. `rollback tailos` adds
+  `lastCommit` (the last 40-hex commit read, or null) and `waitedMs`.
+
+**TailOS switch window.** After `wrangler pages deploy`, Cloudflare's custom
+domain keeps serving the previous deployment for a few seconds, so one read
+right after a deploy or rollback can see the old commit. The runner's TailOS
+live check and `rollback tailos` therefore poll `release.json` (`cache:
+"no-store"`, 3 s apart, 10 s timeout per fetch) until it shows the expected
+commit or `targets.tailos.switchWindowMs` ends (default 90000; an integer from 0
+to 300000, where 0 means one read). Only then does a mismatch fail: the live
+check fails as an identity mismatch, which `liveCheck` does not retry again, and
+the rollback probe reports `restored: false`. A read that fails, is not OK or
+has no 40-hex `commit` counts as no read; nothing else from `release.json`
+reaches output, the journal or a message. An invalid `switchWindowMs` stops the
+deployer at start, before any `tt deployment list` or claim. The last commit
+seen and the wait go into the journal effect for TailOS (`liveCheck`,
+`rollbackCheck`: `{lastCommit, waitedMs}`) and into the failure escalation text
+(for example "TailOS live check last saw COMMIT after 90 s."). The hub receipt
+does not carry them: `tt deployment finish` keeps only the known receipt fields,
+and the pending-receipt recovery compares the journal's receipt with the hub's.
+The pinned rollback probe argv from `release-inputs.mjs` has no `--config`, so
+the automated TailOS rollback uses the default 90 s window.
 
 A probe failure prints nothing and exits 1. When a target step fails, the
 journal's `failure` field keeps the first one as `{step, target, reason}`: step
@@ -316,7 +337,7 @@ baselines        {hub, bridge, mini, tailos}: probed live commits at provisionin
 targets.hub      {host: "truenas", liveProbe: [...]}
 targets.bridge   {host: "truenas", liveProbe: [...]}
 targets.mini     {installPath, relayRestart: [...], relayLog, relayLabel, liveProbe: [...]}
-targets.tailos   {url (optional)}
+targets.tailos   {url (optional), switchWindowMs (optional, 0-300000, default 90000)}
 inputs.planTemplate  path to the handler's last TrueNAS preflight plan (template)
 ```
 
@@ -384,7 +405,9 @@ journal or lock by hand.
   configured command.
 - TailOS: `npx wrangler pages deploy journalDirectory/tailos-dist-PRIOR
   --project-name tailos --branch main --commit-hash PRIOR --commit-dirty=false`,
-  then `node scripts/release-probe.mjs rollback tailos --expect-commit PRIOR`.
+  then `node scripts/release-probe.mjs rollback tailos --expect-commit PRIOR
+  --config PRIVATE`. The probe polls for up to the switch window (above; the
+  default 90 s without `--config`) before it reports `restored: false`.
 - tasks-hub: if the D1 revert failed, commit the revert by hand in the dedicated
   checkout and move the ref with `git update-ref refs/heads/tasks-hub REVERT
   INTEGRATED` (never force).

@@ -6,6 +6,7 @@
 //   node scripts/release-probe.mjs rollback <hub|bridge> --expect-release NAME --expect-sha SHA --config PRIVATE
 //   node scripts/release-probe.mjs rollback mini [--expect-sha SHA] --config PRIVATE
 //   node scripts/release-probe.mjs rollback tailos --expect-commit SHA [--config PRIVATE]
+//     (polls release.json up to targets.tailos.switchWindowMs, default 90 s)
 import { createHash } from "node:crypto";
 import { spawnSync } from "node:child_process";
 import { existsSync, mkdtempSync, openSync, readFileSync, readSync, closeSync, rmSync, statSync, writeFileSync } from "node:fs";
@@ -19,12 +20,18 @@ const MOUNTS = { hub: ["hub", "/opt/tailterm-hub", "tailterm-hub"], bridge: ["di
 const sha256 = b => createHash("sha256").update(b).digest("hex");
 const hex = (s, n) => new RegExp(`^[a-f0-9]{${n}}$`).test(s || "");
 
+// Cloudflare's custom domain takes a few seconds to switch to a new Pages
+// deployment, so an expected TailOS commit is polled for a bounded window.
+export const TAILOS_SWITCH_WINDOW_MS = 90000, TAILOS_POLL_INTERVAL_MS = 3000, TAILOS_FETCH_TIMEOUT_MS = 10000;
+
 export const hostDeps = {
   run: (argv, { buffer = false } = {}) => {
     const r = spawnSync(argv[0], argv.slice(1), { encoding: buffer ? "buffer" : "utf8", stdio: ["ignore", "pipe", "pipe"], maxBuffer: 256 * 1024 * 1024, timeout: 120000 });
     return { status: r.status, stdout: r.stdout };
   },
-  fetchJSON: async url => { const r = await fetch(url, { signal: AbortSignal.timeout(10000), cache: "no-store" }); if (!r.ok) throw new Error("fetch"); return r.json(); },
+  fetchJSON: async (url, timeoutMs = TAILOS_FETCH_TIMEOUT_MS) => { const r = await fetch(url, { signal: AbortSignal.timeout(timeoutMs), cache: "no-store" }); if (!r.ok) throw new Error("fetch"); return r.json(); },
+  sleep: ms => new Promise(r => setTimeout(r, ms)),
+  now: () => Date.now(),
   uid: () => process.getuid(),
 };
 
@@ -87,7 +94,33 @@ function liveMini(config, t, deps) {
   return { commit: info.commit, artifactSHA256: sha256(bytes), integrity: info.integrity, relayRunning: relay.status === 0 && /^\s*state = running$/m.test(relay.stdout || ""), newErrors: relayErrors(config, t) };
 }
 
-const tailosURL = config => config?.targets?.tailos?.url || "https://tailos.tailarr.com/release.json";
+export const tailosURL = config => config?.targets?.tailos?.url || "https://tailos.tailarr.com/release.json";
+// targets.tailos.switchWindowMs: 0 means one read. The 300 s cap keeps the
+// rollback probe inside the runner's 600 s command timeout.
+export function tailosWindow(config) {
+  const w = config?.targets?.tailos?.switchWindowMs;
+  if (w === undefined) return TAILOS_SWITCH_WINDOW_MS;
+  if (!Number.isSafeInteger(w) || w < 0 || w > 300000) throw new Error("invalid TailOS switch window");
+  return w;
+}
+
+// Polls release.json until it shows the expected commit or the window ends.
+// Only a 40-hex commit counts as a read; any other content is never returned.
+export async function waitForTailOSCommit(url, expected, { windowMs = TAILOS_SWITCH_WINDOW_MS, intervalMs = TAILOS_POLL_INTERVAL_MS, timeoutMs = TAILOS_FETCH_TIMEOUT_MS, deps = hostDeps } = {}) {
+  if (!hex(expected, 40)) throw new Error("expected commit required");
+  const start = deps.now();
+  let lastCommit = null, polls = 0;
+  for (;;) {
+    let commit = null;
+    try { const r = await deps.fetchJSON(url, timeoutMs); if (hex(r?.commit, 40)) commit = r.commit; } catch {}
+    polls++;
+    if (commit) lastCommit = commit;
+    const waitedMs = deps.now() - start;
+    if (commit === expected) return { matched: true, lastCommit, waitedMs, polls };
+    if (waitedMs >= windowMs) return { matched: false, lastCommit, waitedMs, polls };
+    await deps.sleep(Math.min(intervalMs, windowMs - waitedMs));
+  }
+}
 
 export async function probe(argv, config, deps = hostDeps) {
   const [mode, target] = argv, flag = name => { const i = argv.indexOf(name); return i < 0 ? undefined : argv[i + 1]; };
@@ -113,8 +146,8 @@ export async function probe(argv, config, deps = hostDeps) {
     if (target === "tailos") {
       const expected = flag("--expect-commit");
       if (!hex(expected, 40)) throw new Error("expected commit required");
-      const r = await deps.fetchJSON(tailosURL(config));
-      return { restored: r?.commit === expected, databaseWritesPreserved: true };
+      const w = await waitForTailOSCommit(tailosURL(config), expected, { windowMs: tailosWindow(config), deps });
+      return { restored: w.matched, databaseWritesPreserved: true, lastCommit: w.lastCommit, waitedMs: w.waitedMs };
     }
   }
   throw new Error("usage: release-probe.mjs live|rollback TARGET");

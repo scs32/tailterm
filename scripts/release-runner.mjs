@@ -6,7 +6,7 @@ import { openSync, closeSync, fsyncSync, writeFileSync, readFileSync, renameSync
 import { join, resolve, dirname, isAbsolute } from "node:path";
 import { digest, diffPaths, receiptEligible } from "./verify-matrix.mjs";
 import { selectReleaseTargets, releaseBaselines, schemaChanged } from "./release-targets.mjs";
-import { buildInfo } from "./release-probe.mjs";
+import { buildInfo, waitForTailOSCommit, tailosWindow, tailosURL, hostDeps } from "./release-probe.mjs";
 
 const fileDigest = p => createHash("sha256").update(readFileSync(p)).digest("hex");
 const TRUENAS_BASE = "/mnt/deepfreeze/tailterm-hub", PAIR = ["hub", "bridge"];
@@ -250,7 +250,9 @@ export async function runRelease(config, adapter) {
       group.forEach(([t,a],i)=>{if(a.deployment)records[i].deployment=a.deployment;if(a.version)records[i].version=a.version;state.effects.find(e=>e.target===t).state="deployed";});checkpoint();
       for(const [i,[t,a]] of group.entries()){
         step={step:"live-check",target:t};
-        if(!await liveCheck(adapter,t,policy,config.sleep,config.now))throw releaseError("live verification failed");
+        const live=await liveCheck(adapter,t,policy,config.sleep,config.now),wait=adapter.probeWait?.(t,"live");
+        if(wait){state.effects.find(e=>e.target===t).liveCheck=wait;checkpoint();}
+        if(!live)throw releaseError("live verification failed");
         records[i].outcome="released";state.effects.find(e=>e.target===t).state="verified";checkpoint();
         // A retained copy makes this target's next rollback possible; losing it
         // only makes that later rollback unsafe, never this release.
@@ -283,7 +285,9 @@ export async function runRelease(config, adapter) {
       effect.rollbackAttempted=true;checkpoint();
       let restored=false;
       try{await fence();restored=await adapter.rollback(effect.target,effect.release)===true;}catch{}
-      blocked ||= !restored;effect.rollback=restored?"restored":"blocked";checkpoint();
+      blocked ||= !restored;effect.rollback=restored?"restored":"blocked";
+      const wait=adapter.probeWait?.(effect.target,"rollback");if(wait)effect.rollbackCheck=wait;
+      checkpoint();
     }
     state.phase="blocked";state.outcome=blocked?"blocked":"rolled_back";checkpoint();
     if(state.published && !state.revert){
@@ -292,7 +296,8 @@ export async function runRelease(config, adapter) {
       checkpoint();
     }
     // One attempt; a failed post must not stop the bug request or the receipt.
-    if(!state.escalationAttempted){state.escalationAttempted=true;checkpoint();try{await adapter.escalate({jobId:job.id,outcome:state.outcome,...(state.revert?{revert:state.revert.outcome}:{}),...(state.effects.some(e=>e.rollback==="blocked")?{rollbackBlocked:true}:{})});}catch{}}
+    const probeWaits=state.effects.flatMap(e=>[["live",e.liveCheck],["rollback",e.rollbackCheck]].filter(([,w])=>w).map(([probe,w])=>({target:e.target,probe,lastCommit:w.lastCommit,waitedMs:w.waitedMs})));
+    if(!state.escalationAttempted){state.escalationAttempted=true;checkpoint();try{await adapter.escalate({jobId:job.id,outcome:state.outcome,...(state.revert?{revert:state.revert.outcome}:{}),...(state.effects.some(e=>e.rollback==="blocked")?{rollbackBlocked:true}:{}),...(probeWaits.length?{probeWaits}:{})});}catch{}}
     if(state.revert && !state.bugRequestAttempted){
       state.bugRequestAttempted=true;checkpoint();
       try{state.revert.bugRequestId=await adapter.requestBug({jobId:job.id,commit:state.revert.commit,outcome:state.revert.outcome});}catch{}
@@ -316,7 +321,9 @@ export async function runRelease(config, adapter) {
 // handler-produced preflight files. Probe/rollback programs are pinned host
 // programs, never commands received from Board text.
 export class HostAdapter {
-  constructor(config,job){this.config=config;this.job=job;this.artifacts=new Map();this.serial=0;this.now=()=>Date.now();}
+  constructor(config,job){this.config=config;this.job=job;this.artifacts=new Map();this.serial=0;this.now=()=>Date.now();
+    // The TailOS poller's fetch and clock; tests replace them.
+    this.probeDeps={fetchJSON:hostDeps.fetchJSON,sleep:hostDeps.sleep,now:hostDeps.now};this.probeWaits=new Map();}
   command(argv,cwd=this.config.cwd,{timeout=600000}={}){
     if(!Array.isArray(argv)||!argv.length||argv.some(a=>typeof a!=="string"||/[\0\r\n]/.test(a)))throw new Error("Invalid host operation argv");
     try{return execFileSync(argv[0],argv.slice(1),{cwd,encoding:"utf8",stdio:["ignore","pipe","pipe"],maxBuffer:8*1024*1024,timeout});}
@@ -484,8 +491,11 @@ export class HostAdapter {
   }
   async check(target){
     const a=this.artifacts.get(target);if(!a)return "identity";
+    // The poller owns the whole switch window, so a mismatch after it is an
+    // identity failure and liveCheck's generic retry never stretches it.
     if(target==="tailos"){
-      try{const response=await fetch("https://tailos.tailarr.com/release.json",{signal:AbortSignal.timeout(10000),cache:"no-store"});if(!response.ok)return false;const r=await response.json();return r.commit===a.commit?true:"identity";}catch{return false;}
+      try{const w=await waitForTailOSCommit(tailosURL(this.config),a.commit,{windowMs:tailosWindow(this.config),deps:this.probeDeps});this.probeWaits.set("tailos:live",{lastCommit:w.lastCommit,waitedMs:w.waitedMs});return w.matched?true:"identity";}
+      catch{return "identity";}
     }
     try{
       const r=JSON.parse(this.command(a.liveProbe));
@@ -501,8 +511,11 @@ export class HostAdapter {
       if(!a.rollbackCaptured || fileDigest(a.rollbackPath)!==a.priorArtifactSHA256)return false;
       const {copyFileSync}=await import("node:fs");copyFileSync(a.rollbackPath,a.installPath+".rollback");renameSync(a.installPath+".rollback",a.installPath);this.command(a.relayRestart);
     }else{this.command(a.rollbackProgram);}
-    const r=JSON.parse(this.command(a.rollbackProbe));return r.restored===true && r.databaseWritesPreserved===true;
+    const r=JSON.parse(this.command(a.rollbackProbe));
+    if(target==="tailos")this.probeWaits.set("tailos:rollback",{lastCommit:sha(r.lastCommit)?r.lastCommit:null,waitedMs:Number.isSafeInteger(r.waitedMs)&&r.waitedMs>=0?r.waitedMs:null});
+    return r.restored===true && r.databaseWritesPreserved===true;
   }
+  probeWait(target,kind){return this.probeWaits.get(target+":"+kind);}
   // B10: the verified TailOS build stays on the host so the next release can
   // roll back to it; release-inputs names it in that job's rollback program.
   async retain(target,a){
@@ -514,12 +527,14 @@ export class HostAdapter {
   async block(){this.native("block");}
   async refuse(){this.native("refuse");}
   async escalate(details={}){
+    // Only a re-validated 40-hex commit and whole seconds reach the text.
+    const waits=(Array.isArray(details.probeWaits)?details.probeWaits:[]).filter(w=>w?.target==="tailos" && ["live","rollback"].includes(w.probe)).map(w=>` TailOS ${w.probe==="live"?"live check":"rollback probe"} last saw ${sha(w.lastCommit)?w.lastCommit:"no readable release.json"}${Number.isSafeInteger(w.waitedMs)&&w.waitedMs>=0?` after ${Math.round(w.waitedMs/1000)} s`:""}.`).join("");
     if(details.outcome==="refused"){
       const reason=typeof details.reason==="string"&&REASON.test(details.reason)?details.reason:"unclassified";
       return this.command([this.config.tt||"tt","send","--kind","notice","--subject","Release refused before publication","--text",`Release ${this.job.id} was refused before publication; nothing was published or deployed. Reason: ${reason}. Handler reconciliation required.`,"--request-id",`${this.job.id}-release-failure`,"--ref",`release-job=${this.job.id}`]);
     }
     if(details.push==="failed")return this.command([this.config.tt||"tt","send","--kind","notice","--subject","Release is live but the tasks-hub push failed","--text",`Release ${this.job.id} is live and verified, but the fast-forward push of tasks-hub to origin failed. Live targets were not rolled back; inspect the remote and push tasks-hub by hand.`,"--request-id",`${this.job.id}-push-failure`,"--ref",`release-job=${this.job.id}`]);
-    return this.command([this.config.tt||"tt","send","--kind","notice","--subject","Release failed and requires recovery","--text",`Release failed for ${this.job.id}; inspect the private host journal. Automatic rollback attempted once; handler reconciliation required.${details.revert==="failed"?" The tasks-hub revert failed, so the rolled-back change is still on tasks-hub.":""}${details.rollbackBlocked===true&&details.revert==="committed"?" tasks-hub was reverted, but at least one target could not be rolled back and still runs the released code; roll it back by hand before the next release.":""}`,"--request-id",`${this.job.id}-release-failure`,"--ref",`release-job=${this.job.id}`]);
+    return this.command([this.config.tt||"tt","send","--kind","notice","--subject","Release failed and requires recovery","--text",`Release failed for ${this.job.id}; inspect the private host journal. Automatic rollback attempted once; handler reconciliation required.${details.revert==="failed"?" The tasks-hub revert failed, so the rolled-back change is still on tasks-hub.":""}${details.rollbackBlocked===true&&details.revert==="committed"?" tasks-hub was reverted, but at least one target could not be rolled back and still runs the released code; roll it back by hand before the next release.":""}${waits}`,"--request-id",`${this.job.id}-release-failure`,"--ref",`release-job=${this.job.id}`]);
   }
 }
 
@@ -558,6 +573,7 @@ export function readBaselines(configPath){
 }
 export async function serveDeployment(config,{once=false,signal,configPath,release=runRelease}={}) {
   if(config.version!==1 || config.enabled!==true || !config.cwd || !config.journalDirectory)throw new Error("Explicit private activation config required");
+  tailosWindow(config);
   while(!signal?.aborted){
     try {
     // An unreadable or invalid edit holds the whole poll, before any claim.

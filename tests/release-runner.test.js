@@ -546,3 +546,57 @@ test("p2 a requeue never reuses an earlier attempt's receipt, for the same or a 
  assert.equal(JSON.parse(readFileSync(join(attemptDir(h.home,moved,2),"context.json"),"utf8")).commit,moved);
  await assert.rejects(h.adapter.verifyIntegrated({...h.integrated,integratedCommit:"../escape"}),/Exact integrated commit/);
 });
+// TailOS switch window: fake release.json reads and a fake clock whose sleep
+// only advances time. No network and no real wait.
+function fakeTailOS(responses){let t=0;const fetches=[];return {fetches,now:()=>t,sleep:async ms=>{t+=ms;},fetchJSON:async(url,timeoutMs)=>{const r=responses[Math.min(fetches.length,responses.length-1)];fetches.push({url,timeoutMs});if(r instanceof Error)throw r;return r;}};}
+function tailosAdapter(responses,tailos={}){
+ const home=mkdtempSync(join(tmpdir(),"tailos-wait-")),a=new HostAdapter({cwd:home,journalDirectory:home,targets:{tailos:{url:"https://tailos.test/release.json",...tailos}}},{id:"rel_fixture"});
+ a.probeDeps=fakeTailOS(responses);a.artifacts.set("tailos",{commit:"d".repeat(40)});return a;
+}
+test("R1 the TailOS live check waits through the domain switch and fails as identity only after the window",async()=>{
+ const stale={commit:"c".repeat(40)},fresh={commit:"d".repeat(40)};
+ const a=tailosAdapter([stale,stale,stale,fresh]);assert.equal(await a.check("tailos"),true);
+ assert.deepEqual(a.probeWait("tailos","live"),{lastCommit:"d".repeat(40),waitedMs:9000});assert.equal(a.probeDeps.fetches.length,4);
+ assert.ok(a.probeDeps.fetches.every(f=>f.url==="https://tailos.test/release.json"&&f.timeoutMs===10000));
+ const never=tailosAdapter([stale]);assert.equal(await never.check("tailos"),"identity");
+ assert.deepEqual(never.probeWait("tailos","live"),{lastCommit:"c".repeat(40),waitedMs:90000});assert.equal(never.probeDeps.fetches.length,31);
+ const six=tailosAdapter([stale],{switchWindowMs:6000});assert.equal(await six.check("tailos"),"identity");assert.equal(six.probeWait("tailos","live").waitedMs,6000);
+ assert.equal(await tailosAdapter([stale],{switchWindowMs:-1}).check("tailos"),"identity");
+});
+test("R2 liveCheck does not repeat the TailOS switch window",async()=>{
+ const a=tailosAdapter([{commit:"c".repeat(40)}]);let checks=0;const check=a.check.bind(a);a.check=async t=>{checks++;return check(t);};
+ assert.equal(await liveCheck(a,"tailos",{startupMs:60000,failures:3,intervalMs:5000,relayCleanMs:0},async()=>{throw new Error("unexpected sleep");},()=>0),false);
+ assert.equal(checks,1);assert.equal(a.probeDeps.fetches.length,31);
+});
+test("R3 the TailOS rollback records the probe's last commit and wait, dropping anything else",async()=>{
+ const probe=out=>[process.execPath,"-e",`console.log(${JSON.stringify(JSON.stringify(out))})`];
+ const a=tailosAdapter([]);a.artifacts.set("tailos",{rollbackSafe:true,rollbackProgram:[process.execPath,"-e","0"],rollbackProbe:probe({restored:false,databaseWritesPreserved:true,lastCommit:"d".repeat(40),waitedMs:90000})});
+ assert.equal(await a.rollback("tailos"),false);assert.deepEqual(a.probeWait("tailos","rollback"),{lastCommit:"d".repeat(40),waitedMs:90000});
+ const junk=tailosAdapter([]);junk.artifacts.set("tailos",{rollbackSafe:true,rollbackProgram:[process.execPath,"-e","0"],rollbackProbe:probe({restored:true,databaseWritesPreserved:true,lastCommit:"<b>SYNTHETIC_PRIVATE_TOKEN</b>",waitedMs:-3})});
+ assert.equal(await junk.rollback("tailos"),true);assert.deepEqual(junk.probeWait("tailos","rollback"),{lastCommit:null,waitedMs:null});
+});
+test("R4 a failed TailOS release journals both waits and escalates them without changing the receipt",async()=>{
+ const f=fixture(),j=job(f,change(f,"client/a.js","a")),a=fake(),c=config(f,j);let receipt,escalation;
+ const live={lastCommit:"c".repeat(40),waitedMs:90000},back={lastCommit:null,waitedMs:90000};
+ a.check=async()=>"identity";a.probeWait=(t,kind)=>t==="tailos"?(kind==="live"?live:back):undefined;a.finish=async r=>{receipt=r;a.calls.push("finish");};a.escalate=async d=>{escalation=d;a.calls.push("escalate");};
+ await assert.rejects(runRelease(c,a),/inspect saved journal/);
+ const effect=JSON.parse(readFileSync(c.journalPath,"utf8")).effects.find(e=>e.target==="tailos");
+ assert.deepEqual(effect.liveCheck,live);assert.deepEqual(effect.rollbackCheck,back);
+ assert.deepEqual(escalation.probeWaits,[{target:"tailos",probe:"live",...live},{target:"tailos",probe:"rollback",...back}]);
+ assert.deepEqual(Object.keys(receipt).sort(),["commit","jobId","outcome","revert","targets","verificationDigest","version"]);
+ assert.deepEqual(receipt.targets.map(t=>Object.keys(t).sort()),[["artifactSHA256","outcome","release","rollback","target"]]);
+});
+test("R5 the escalation names the TailOS waits and never echoes release.json content",async()=>{
+ const cwd=mkdtempSync(join(tmpdir(),"escalate-tailos-")),calls=[];const adapter=new HostAdapter({cwd,journalDirectory:cwd},{id:"rel_fixture"});adapter.command=argv=>{calls.push(argv);return "";};
+ await adapter.escalate({outcome:"rolled_back",probeWaits:[{target:"tailos",probe:"live",lastCommit:"c".repeat(40),waitedMs:90000},{target:"tailos",probe:"rollback",lastCommit:null,waitedMs:89600},{target:"tailos",probe:"rollback",lastCommit:"<b>SYNTHETIC_PRIVATE_TOKEN</b>",waitedMs:"90 s; rm"}]});
+ const text=calls[0][calls[0].indexOf("--text")+1];
+ assert.ok(text.includes(`TailOS live check last saw ${"c".repeat(40)} after 90 s.`));assert.ok(text.includes("TailOS rollback probe last saw no readable release.json after 90 s."));
+ assert.ok(!text.includes("SYNTHETIC")&&!text.includes("90 s; rm"),text);
+});
+test("R6 an invalid TailOS switch window stops the daemon before any command",async()=>{
+ const cwd=mkdtempSync(join(tmpdir(),"tailos-window-")),log=join(cwd,"calls.log"),fakeTT=join(cwd,"tt");
+ writeFileSync(fakeTT,`#!/bin/sh\necho "$@" >> ${JSON.stringify(log)}\necho '[]'\n`);chmodSync(fakeTT,0o755);
+ for(const bad of [-1,300001,"90000",1.5])await assert.rejects(serveDeployment({version:1,enabled:true,cwd,journalDirectory:cwd,tt:fakeTT,targets:{tailos:{switchWindowMs:bad}}},{once:true}),/switch window/);
+ assert.equal(existsSync(log),false);
+ await serveDeployment({version:1,enabled:true,cwd,journalDirectory:cwd,tt:fakeTT,targets:{tailos:{switchWindowMs:120000}}},{once:true});assert.equal(readFileSync(log,"utf8"),"deployment list\n");
+});
