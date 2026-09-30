@@ -233,6 +233,29 @@ unavailable`, `Invalid matrix check timeout`, `Integrated matrix receipt is not
 eligible`, `verify-matrix.mjs timeout` or `exit N`, or `unclassified` for an
 untagged error. It never claims a rollback was attempted.
 
+The handler's import (`verification` release operation) binds the integrated
+plan to the approved one and requires every approved check in it. Every check
+must match exactly except `go-race`: the runner builds the integrated plan with
+only the commit changed, so `verify-matrix.mjs` derives go-race packages from
+every path changed since the approved base, which includes the tasks-hub
+commits a cherry-pick lands on. An approved `go-race` is covered by an
+integrated one with the same id, cwd, environment and flags (every argv element
+before the first `./` package) whose packages are a superset of the approved
+list, or `./...`. Each approved check covered that way is recorded on the job
+as `integratedCoverage` (`checkId`, `approvedDigest`, `integratedDigest`,
+`relation: "superset"`); exact matches are not listed, and a requeue clears it
+with the rest of the integrated verification. Anything else is refused as
+`integrated matrix omitted approved check ID`, naming the check. An approved
+`./...` is covered only by `./...`, so an item approved on all packages whose
+integrated run narrows to a list is refused; that needs a runner-side union, not
+a retry. A request body the hub cannot decode answers 400 `invalid scope
+metadata request: REASON` with a matching `code`: `body exceeds N bytes`
+(`body-too-large`; 1048576 for release and item verification requests, 65536
+for other scope metadata), `unknown field "NAME"` (`unknown-field`, the name
+bounded to 64 bytes), `wrong type for field "NAME"` (`wrong-type`), `malformed
+JSON` (`malformed-json`) or `trailing data after the JSON object`
+(`trailing-data`).
+
 ### Handler requests and gating
 
 - **Project handler (f5).** `tt deployment handler` (hub release operation
