@@ -101,6 +101,7 @@ func (b *Bridge) renderMessage(task api.Task, r roster, m api.Message) []OutboxR
 	if m.From.Node == api.BridgeNode || m.SystemNotice != nil {
 		return nil
 	}
+	m = redactHelperMessage(r, m)
 	row := func(key, kind string, part int, p outboxPayload) OutboxRow {
 		return OutboxRow{Key: fmt.Sprintf("%s:%s:%d:%d", key, m.TaskID, m.Seq, part), TaskID: m.TaskID, Seq: m.Seq, AgentID: m.From.AgentID, Kind: kind, Payload: payloadJSON(p)}
 	}

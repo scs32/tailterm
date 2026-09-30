@@ -757,12 +757,22 @@ func TestHelperRedaction(t *testing.T) {
 	asked := h.helperPosts()[0]
 	sha := "8a99f36b92cd1ed16931635d44930a6999a9bdd1"
 	digest := "84b4ddbf41c0685498c618ff1ecfc55499cdc63bd3ecd89b058d14bb64bf6dda"
+	hexSecret := "9f8e7d6c5b4a39281706f5e4d3c2b1a09f8e7d6c5b4a39281706f5e4d3c2b1a0"
 	secrets := []string{
 		"MTIzNDU2Nzg5MDEyMzQ1Njc4OTA.GAbCdE.abcdefghijklmnopqrstuvwxyz0123456789",
 		"sk-ant-api03-abcdefghijklmnop",
 		"ghp_abcdefghijklmnopqrstuvwxyz0123456789",
 		"hunter2secret",
 		"bearer-value-123",
+		// Review round one f5: env-var names and JSON keys.
+		"abcDEF123456789xyzQWE",
+		"Zq3x_9kLm-token-urlsafe-value",
+		"dbpass-4242",
+		"openai-abc123def456",
+		"wJalrXUtnFEMI-K7MDENG-bPxRfiCY",
+		"json-token-abc123",
+		// f2: a secret whose value is hex.
+		hexSecret,
 	}
 	text := strings.Join([]string{
 		"bot token " + secrets[0],
@@ -770,17 +780,38 @@ func TestHelperRedaction(t *testing.T) {
 		"key " + secrets[1] + " and " + secrets[2],
 		"password=" + secrets[3],
 		"Authorization: Bearer " + secrets[4],
-		"commit " + sha + " digest " + digest + " token=" + sha,
+		"GITHUB_TOKEN=" + secrets[5],
+		"export TAILTERM_TOKEN=" + secrets[6],
+		"DB_PASSWORD=" + secrets[7],
+		"OPENAI_API_KEY=" + secrets[8],
+		"AWS_SECRET_ACCESS_KEY=" + secrets[9],
+		`{"token": "` + secrets[10] + `", "tokens": 12}`,
+		"secret=" + secrets[11],
+		"commit " + sha + " digest " + digest + " tokens=1704433706",
 	}, "\n")
 	reply := h.replyAs(helper, asked.Seq, text)
 	h.flush()
+	h.cycle() // the project channel mirror (f6)
 	got := h.botIn(h.dm)[0].Content
-	for _, s := range append(secrets, "b3BlbnNzaC1rZXktdjEAAAAA") {
-		if strings.Contains(got, s) {
-			t.Errorf("secret %q reached Discord:\n%s", s, got)
+	var mirrored strings.Builder
+	for _, l := range h.lines() {
+		mirrored.WriteString(l.Content)
+		for _, e := range l.Embeds {
+			mirrored.WriteString(e.Description)
 		}
 	}
-	if strings.Count(got, redacted) < 6 || !strings.Contains(got, "commit "+sha) || !strings.Contains(got, "digest "+digest) || !strings.Contains(got, "token="+sha) {
+	if !strings.Contains(mirrored.String(), "commit "+sha) {
+		t.Fatalf("the helper's reply was not mirrored to the project channel: %q", mirrored.String())
+	}
+	for _, s := range append(secrets, "b3BlbnNzaC1rZXktdjEAAAAA") {
+		if strings.Contains(got, s) {
+			t.Errorf("secret %q reached the DM:\n%s", s, got)
+		}
+		if strings.Contains(mirrored.String(), s) {
+			t.Errorf("secret %q reached the project channel:\n%s", s, mirrored.String())
+		}
+	}
+	if strings.Count(got, redacted) < 13 || !strings.Contains(got, "commit "+sha) || !strings.Contains(got, "digest "+digest) || !strings.Contains(got, "tokens=1704433706") || !strings.Contains(got, `"tokens": 12`) {
 		t.Fatalf("redaction = %s", got)
 	}
 	for _, m := range h.boardMessages() {
@@ -788,7 +819,7 @@ func TestHelperRedaction(t *testing.T) {
 			t.Fatal("the board text was changed")
 		}
 	}
-	for _, keep := range []string{"tokens=1704433706", "the secret sauce", "sk-short", "AKIA"} {
+	for _, keep := range []string{"tokens=1704433706", "max_tokens: 100", "token_count=5", "the secret sauce", "sk-short", "AKIA", "commit " + sha, "digest: " + digest} {
 		if redactSecrets(keep) != keep {
 			t.Errorf("%q was redacted", keep)
 		}
@@ -979,5 +1010,92 @@ func TestHelperReplyToOneOfTwoPending(t *testing.T) {
 	h.flush()
 	if bot := h.botIn(h.dm); len(bot) != 1 || !strings.Contains(bot[0].Content, "answering the second") {
 		t.Fatalf("DM = %+v", bot)
+	}
+}
+
+// Review round one f6: only an owner helper's messages are redacted in the
+// project channel mirror; other agents' messages mirror as before.
+func TestHelperMirrorRedactsOnlyTheHelper(t *testing.T) {
+	h := newHelperHarness(t)
+	helper := h.register()
+	h.post(api.PostMessageRequest{AgentID: helper.ID, RunID: helper.RunID, Text: "helper says GITHUB_TOKEN=abcDEF123456789xyzQWE"})
+	h.post(api.PostMessageRequest{AgentID: h.builder.ID, RunID: h.builder.RunID, Text: "builder says GITHUB_TOKEN=builderVisible123"})
+	h.post(api.PostMessageRequest{AgentID: helper.ID, RunID: helper.RunID, Envelope: &api.Envelope{Kind: api.EnvelopeKindNotice, Subject: "password=subjectSecret1", Body: api.EnvelopeBody{Text: "api_key=bodySecret22"}}})
+	h.cycle()
+	var all strings.Builder
+	for _, l := range h.lines() {
+		all.WriteString(l.Content + "\n")
+		for _, e := range l.Embeds {
+			all.WriteString(e.Description + "\n")
+		}
+	}
+	for _, leaked := range []string{"abcDEF123456789xyzQWE", "subjectSecret1", "bodySecret22"} {
+		if strings.Contains(all.String(), leaked) {
+			t.Errorf("%q reached the project channel:\n%s", leaked, all.String())
+		}
+	}
+	if !strings.Contains(all.String(), "GITHUB_TOKEN=builderVisible123") {
+		t.Fatalf("another agent's mirrored text changed:\n%s", all.String())
+	}
+	for _, m := range h.boardMessages() {
+		if m.From.AgentID == helper.ID && m.Envelope == nil && !strings.Contains(m.Text, "abcDEF123456789xyzQWE") {
+			t.Fatal("the board text was changed")
+		}
+	}
+}
+
+// Review round one f3: free text in /status and the digest is redacted.
+func TestHelperSummaryRedactsFreeText(t *testing.T) {
+	h := newHelperHarness(t)
+	h.askOwner("secret-ask", "Rotate it: GITHUB_TOKEN=summaryLeak123")
+	now := time.Now().UTC()
+	h.b.rememberSnapshot(h.task, nil, mustObligations(t, h), api.TeamQueueList{Entries: []api.TeamQueueEntry{
+		{ID: "tqe_q", ItemID: "wi_0000000000000009", Position: 1, State: "queued", BlockReason: "blocked: password=blockLeak456",
+			Stall: &api.TeamQueueStall{Cause: "api_key=stallLeak789", Since: now.Format(time.RFC3339)}},
+	}})
+	embed, err := h.b.summary(h.ctx, time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	events := h.b.digestEvents(h.ctx, []projectSnapshot{{Task: h.task, Obligations: mustObligations(t, h)}})
+	var all strings.Builder
+	all.WriteString(embed.Description)
+	for _, line := range events {
+		all.WriteString("\n" + line)
+	}
+	for _, leaked := range []string{"summaryLeak123", "blockLeak456", "stallLeak789"} {
+		if strings.Contains(all.String(), leaked) {
+			t.Errorf("%q reached the summary or digest:\n%s", leaked, all.String())
+		}
+	}
+	if !strings.Contains(all.String(), "Rotate it") || !strings.Contains(all.String(), redacted) {
+		t.Fatalf("summary = %s", all.String())
+	}
+}
+
+// Review round one f1: the rate limit follows when the owner wrote, so a
+// backfill of messages written minutes apart is not throttled.
+func TestHelperRateLimitUsesMessageTime(t *testing.T) {
+	h := newHelperHarness(t)
+	h.register()
+	start := time.Now().Add(-30 * time.Minute)
+	if _, err := h.state.db.ExecContext(h.ctx, `UPDATE helper_conversations SET ingest_after=? WHERE id=?`, snowflakeAt(start.Add(-time.Minute)), h.dm); err != nil {
+		t.Fatal(err)
+	}
+	h.fake.mu.Lock()
+	for i := 0; i < 12; i++ {
+		id := snowflakeAt(start.Add(time.Duration(i) * 2 * time.Minute))
+		h.fake.messages[h.dm] = append(h.fake.messages[h.dm], &fakeMessage{Message: discord.Message{ID: id, ChannelID: h.dm, Author: discord.User{ID: ownerID}, Content: fmt.Sprintf("written at minute %d", 2*i)}})
+	}
+	h.fake.mu.Unlock()
+	h.b.backfill(h.ctx)
+	h.flush()
+	if n := len(h.helperPosts()); n != 12 {
+		t.Fatalf("%d of 12 backfilled messages posted", n)
+	}
+	for _, m := range h.botIn(h.dm) {
+		if strings.Contains(m.Content, "Slow down") {
+			t.Fatal("a backfill of messages written minutes apart was throttled")
+		}
 	}
 }

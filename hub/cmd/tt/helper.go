@@ -455,6 +455,13 @@ func helperMessageLine(m api.Message, names map[string]string, task string) stri
 	return line + fmt.Sprintf("\n  From the owner on Discord. Answer with tt helper reply --task %s %d --text \"your reply\" (it goes back to their DM or thread), or tt ack %d. Until you reply or ack, the hub holds your other posts.", task, m.Seq, m.Seq)
 }
 
+// helperReplyRequestID names one exact reply, so a rerun after a timeout
+// returns the original post instead of sending the owner a second copy.
+func helperReplyRequestID(task string, seq int64, text string) string {
+	sum := sha256.Sum256([]byte(fmt.Sprintf("%s\x00%d\x00%s", task, seq, text)))
+	return "helper-reply-" + hex.EncodeToString(sum[:12])
+}
+
 // helperReply posts the helper's answer to one message. The Discord bridge
 // sends a helper reply to a Discord message back to the owner's DM or
 // thread (docs/discord-helper-chat.md).
@@ -462,7 +469,7 @@ func helperReply(e env, args []string) error {
 	fs := flag.NewFlagSet("helper reply", flag.ContinueOnError)
 	task := fs.String("task", e.task, "project id")
 	text := fs.String("text", "", "the reply")
-	requestID := fs.String("request-id", "", "stable retry identity for this exact reply")
+	requestID := fs.String("request-id", "", "stable retry identity (default: derived from the project, SEQ and text, so running the same reply again posts once)")
 	// SEQ may come before or after the flags.
 	var positional []string
 	for {
@@ -495,6 +502,9 @@ func helperReply(e env, args []string) error {
 	}
 	ctx, cancel := ctxTimeout(10 * time.Second)
 	defer cancel()
+	if *requestID == "" {
+		*requestID = helperReplyRequestID(helper.task, seq, *text)
+	}
 	m, err := c.PostMessage(ctx, helper.task, api.PostMessageRequest{AgentID: helper.agent, RunID: helper.runID, ReplyTo: seq, Text: *text, RequestID: *requestID})
 	if err != nil {
 		return err

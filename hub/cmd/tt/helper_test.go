@@ -644,6 +644,18 @@ func TestHelperReply(t *testing.T) {
 			t.Fatalf("reply %d = %+v, want from %s replying to %d", i, m, a.ID, want.replyTo)
 		}
 	}
+	// Review round one f4: running the same reply again (a retry after a
+	// timeout) returns the original post; a different text is a new reply.
+	again, err := reply("--task", f.task.ID, fmt.Sprint(asked[1].Seq), "--text", "answer to the second")
+	if err != nil || again != out {
+		t.Fatalf("retried reply = %q %v, want the original %q", again, err, out)
+	}
+	if n, _ := f.c.ListMessages(ctx, f.task.ID, asked[1].Seq, "", 10); len(n) != 2 {
+		t.Fatalf("a retried reply posted again: %d messages", len(n))
+	}
+	if helperReplyRequestID(f.task.ID, 5, "a") == helperReplyRequestID(f.task.ID, 5, "b") || helperReplyRequestID(f.task.ID, 5, "a") == helperReplyRequestID(f.task.ID, 6, "a") {
+		t.Fatal("different replies share a request ID")
+	}
 	for _, bad := range [][]string{{"--task", f.task.ID, "--text", "no seq"}, {"--task", f.task.ID, "x", "--text", "t"}, {"--task", f.task.ID, "5"}, {"--task", f.task.ID, "5", "6", "--text", "t"}} {
 		if _, err := reply(bad...); err == nil {
 			t.Errorf("reply %v was accepted", bad)

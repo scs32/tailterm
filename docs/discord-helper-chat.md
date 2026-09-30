@@ -105,7 +105,9 @@ tt helper reply --task tsk_... SEQ --text "your answer"     # goes back to Disco
 `tt helper inbox` shows a `tt helper reply` hint on each message the owner sent
 from Discord. `tt helper reply` posts as the verified helper (the registered agent
 and its current run) with `replyTo=SEQ`. It refuses when this host's helper
-registration is missing, closed or replaced.
+registration is missing, closed or replaced. Its default request ID comes from the
+project, SEQ and text, so running the same reply again after a timeout posts once.
+Pass `--request-id` to choose one.
 
 What reaches Discord:
 
@@ -128,7 +130,7 @@ writes. Replies to any pending message and delegated answers still pass.
 The owner's Discord messages are board messages in the helper project. TailOS
 shows them with their Discord source. The bridge does not mirror its own posts, so
 they do not appear again in that project's Discord channel. The helper's replies
-are mirrored there as ordinary board lines, as well as going to the DM or thread.
+are mirrored there as ordinary board lines, redacted like their DM or thread copy.
 
 ## Long replies and safety
 
@@ -136,13 +138,23 @@ are mirrored there as ordinary board lines, as well as going to the DM or thread
   code fences balanced and `-# #SEQ · part i/n` markers, sent in order. Each
   conversation (and the digest) has its own outbox lane, so a DM that fails never
   holds back a project channel.
-- **Redaction.** Before a reply is sent to Discord, credential-shaped text becomes
-  `[redacted]`: Discord bot tokens, PEM private key blocks, `sk-ant-…` and `sk-…`
-  keys, GitHub tokens, Slack tokens, AWS access keys, `Authorization: Bearer`
-  values, and `token=`, `password=`, `secret=` and `api_key=` values. 40- and
-  64-character hex strings (commit SHAs, digests) are kept. The board text is
-  never changed. `/status` and the digest render only names, IDs, titles, states
-  and durations.
+- **Redaction.** Before a helper reply is sent to Discord, credential-shaped text
+  becomes `[redacted]`:
+  - Discord bot tokens, PEM private key blocks, `sk-ant-…` and `sk-…` keys,
+    GitHub tokens, Slack tokens, AWS access keys and `Authorization: Bearer`
+    values;
+  - the value of any key ending in `token`, `password`, `passwd`, `secret`,
+    `api_key` or `access_key` followed by `=` or `:`. That includes environment
+    variables such as `GITHUB_TOKEN=`, `DB_PASSWORD=` or `AWS_SECRET_ACCESS_KEY=`,
+    and JSON keys such as `"token": "…"`. The word must end the key, so
+    `tokens=12` and `max_tokens: 100` are kept.
+
+  A bare 40- or 64-character hex string (a commit SHA or digest) is kept, but the
+  same hex as a secret key's value is redacted. The same redaction applies when an
+  owner helper's messages are mirrored to the project channel; other agents'
+  lines mirror as before. The board text is never changed. `/status` and the
+  digest render only names, IDs, titles, states and durations, and redact the free
+  text they show (titles, request subjects, block reasons, stall causes).
 - **Owners only.**
   - Only configured owner IDs reach the helper.
   - Anyone else gets one polite refusal per 10 minutes and nothing is posted.
@@ -151,8 +163,9 @@ are mirrored there as ordinary board lines, as well as going to the DM or thread
 - **Text is data.** Message text is trimmed and posted verbatim. It is never
   parsed for commands or routed on its content, and every send uses
   `allowed_mentions.parse=[]`.
-- **Rate limit.** Each owner may send 10 helper messages a minute. Extra ones are
-  not posted, with one "slow down" note a minute.
+- **Rate limit.** Each owner may send 10 helper messages a minute, measured by
+  when each message was written (its Discord ID), so a backfill after an outage is
+  not throttled. Extra ones are not posted, with one "slow down" note a minute.
 - **Idempotent.** The Discord message ID is the request ID (`discord-msg-<id>`).
   - A redelivered event, a backfilled copy or a retry after a crash gives one
     board message and one note or reaction.

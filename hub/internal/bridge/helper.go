@@ -216,13 +216,26 @@ func (s *State) helperMessageConversation(ctx context.Context, taskID string, se
 	return id, err == nil, err
 }
 
-// helperMessagesSince counts an owner's helper messages taken on since t,
-// apart from the ones already refused for the rate limit.
-func (s *State) helperMessagesSince(ctx context.Context, owner string, t time.Time) (int, error) {
+// helperMessagesWritten counts an owner's helper messages written (by their
+// Discord ID's time) in the window ending with message upTo, apart from the
+// ones already refused for the rate limit. Message time, not the time the
+// bridge took a message on, so a backfill after an outage is not throttled.
+func (s *State) helperMessagesWritten(ctx context.Context, owner, upTo string, window time.Duration) (int, error) {
+	last, err := strconv.ParseInt(upTo, 10, 64)
+	if err != nil {
+		return 0, err
+	}
+	first, _ := strconv.ParseInt(snowflakeAt(snowflakeTime(upTo).Add(-window)), 10, 64)
 	var n int
-	err := s.db.QueryRowContext(ctx, `SELECT count(*) FROM inbound WHERE kind=? AND created_at>=? AND result NOT LIKE 'rate limited%' AND json_extract(payload,'$.message.author.id')=?`,
-		kindHelperMessage, ts(t), owner).Scan(&n)
+	err = s.db.QueryRowContext(ctx, `SELECT count(*) FROM inbound WHERE kind=? AND CAST(source_id AS INTEGER) BETWEEN ? AND ? AND result NOT LIKE 'rate limited%' AND json_extract(payload,'$.message.author.id')=?`,
+		kindHelperMessage, first, last, owner).Scan(&n)
 	return n, err
+}
+
+// snowflakeTime is when a Discord ID was created.
+func snowflakeTime(id string) time.Time {
+	n, _ := strconv.ParseInt(id, 10, 64)
+	return time.UnixMilli((n >> 22) + discordEpoch)
 }
 
 func (s *State) getJSON(ctx context.Context, key string, v any) (bool, error) {
@@ -277,7 +290,7 @@ func (b *Bridge) startHelper(ctx context.Context) error {
 		if have, err := b.cfg.State.Get(ctx, "helper:channel-after"); err != nil {
 			return err
 		} else if have == "" {
-			if err := b.cfg.State.Set(ctx, "helper:channel-after", snowflakeAt(b.now())); err != nil {
+			if err := b.cfg.State.Set(ctx, "helper:channel-after", snowflakeAt(time.Now())); err != nil {
 				return err
 			}
 		}
@@ -313,7 +326,7 @@ func (b *Bridge) openOwnerDMs(ctx context.Context) {
 			b.logf("discord bridge: open DM with owner: %v", err)
 			continue
 		}
-		if err := b.cfg.State.addConversation(ctx, conversation{ID: c.ID, Kind: convDM, ChannelID: c.ID, OwnerID: owner, IngestAfter: snowflakeAt(b.now())}); err != nil {
+		if err := b.cfg.State.addConversation(ctx, conversation{ID: c.ID, Kind: convDM, ChannelID: c.ID, OwnerID: owner, IngestAfter: snowflakeAt(time.Now())}); err != nil {
 			b.logf("discord bridge: record DM: %v", err)
 			continue
 		}
@@ -388,7 +401,7 @@ func (b *Bridge) handleHelperMessage(ctx context.Context, route helperRoute, msg
 	if err != nil || !claimed {
 		return err // a redelivery does nothing
 	}
-	n, err := b.cfg.State.helperMessagesSince(ctx, msg.Author.ID, time.Now().Add(-helperRateWindow))
+	n, err := b.cfg.State.helperMessagesWritten(ctx, msg.Author.ID, msg.ID, helperRateWindow)
 	if err != nil {
 		return err
 	}
@@ -779,9 +792,12 @@ func renderHelperReply(name string, c conversation, msg api.Message) []OutboxRow
 // ---- redaction ----
 
 var (
-	pemBlock   = regexp.MustCompile(`(?s)-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----.*?(-----END [A-Z0-9 ]*PRIVATE KEY-----|\z)`)
-	bearer     = regexp.MustCompile(`(?i)(authorization:\s*bearer\s+)[^\s"']+`)
-	keyValue   = regexp.MustCompile(`(?i)\b(token|password|passwd|secret|api[_-]?key)(\s*[=:]\s*)("[^"\n]*"|'[^'\n]*'|[^\s"',;]+)`)
+	pemBlock = regexp.MustCompile(`(?s)-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----.*?(-----END [A-Z0-9 ]*PRIVATE KEY-----|\z)`)
+	bearer   = regexp.MustCompile(`(?i)(authorization:\s*bearer\s+)[^\s"']+`)
+	// A key ending in a secret word (GITHUB_TOKEN, DB_PASSWORD,
+	// OPENAI_API_KEY, AWS_SECRET_ACCESS_KEY, a JSON "token"), then = or :
+	// and a value. The word must end the key, so tokens=N is not a secret.
+	keyValue   = regexp.MustCompile(`(?i)([A-Za-z0-9_.-]*(?:token|passw(?:or)?d|secret|api[_-]?key|access[_-]?key)["']?)(\s*[=:]\s*)("[^"\n]*"|'[^'\n]*'|[^\s"',;}]+)`)
 	secretLike = []*regexp.Regexp{
 		regexp.MustCompile(`\b[A-Za-z0-9_-]{24,28}\.[A-Za-z0-9_-]{6,7}\.[A-Za-z0-9_-]{27,40}\b`), // Discord bot token
 		regexp.MustCompile(`\bsk-ant-[A-Za-z0-9_-]{10,}`),
@@ -791,24 +807,18 @@ var (
 		regexp.MustCompile(`\bxox[abprs]-[A-Za-z0-9-]{10,}`),
 		regexp.MustCompile(`\bAKIA[0-9A-Z]{16}\b`),
 	}
-	hexID = regexp.MustCompile(`^([0-9a-fA-F]{40}|[0-9a-fA-F]{64})$`)
 )
 
 const redacted = "[redacted]"
 
 // redactSecrets hides credential-shaped text in what the helper sends to
-// Discord. Commit SHAs and digests (40 or 64 hex characters) are kept. The
+// Discord. A bare commit SHA or digest (40 or 64 hex characters) matches no
+// pattern and is kept; the same hex as a secret key's value is redacted. The
 // board text itself is never changed.
 func redactSecrets(s string) string {
 	s = pemBlock.ReplaceAllString(s, redacted)
 	s = bearer.ReplaceAllString(s, "${1}"+redacted)
-	s = keyValue.ReplaceAllStringFunc(s, func(m string) string {
-		parts := keyValue.FindStringSubmatch(m)
-		if hexID.MatchString(strings.Trim(parts[3], `"'`)) {
-			return m
-		}
-		return parts[1] + parts[2] + redacted
-	})
+	s = keyValue.ReplaceAllString(s, "${1}${2}"+redacted)
 	for _, re := range secretLike {
 		s = re.ReplaceAllString(s, redacted)
 	}
@@ -921,7 +931,7 @@ func (b *Bridge) itemTitle(ctx context.Context, taskID, itemID string) string {
 		}
 		return itemID
 	}
-	title = truncate(clean(item.Title), 80)
+	title = truncate(clean(redactSecrets(item.Title)), 80)
 	b.mu.Lock()
 	if b.titles == nil {
 		b.titles = map[string]string{}
@@ -996,13 +1006,13 @@ func (b *Bridge) renderSummary(ctx context.Context, snaps []projectSnapshot, hel
 				queued = &s.Queue.Entries[i]
 			}
 			if e.Stall != nil {
-				stuck = append(stuck, fmt.Sprintf("**%s** queue: %s for %s", project, clean(e.Stall.Cause), since(now, parseRFC3339(e.Stall.Since))))
+				stuck = append(stuck, fmt.Sprintf("**%s** queue: %s for %s", project, clean(redactSecrets(e.Stall.Cause)), since(now, parseRFC3339(e.Stall.Since))))
 			}
 		}
 		if queued != nil {
 			line := fmt.Sprintf("**%s** · %s", project, b.itemTitle(ctx, s.Task.ID, queued.ItemID))
 			if queued.BlockReason != "" {
-				line += " · " + truncate(clean(queued.BlockReason), 80)
+				line += " · " + truncate(clean(redactSecrets(queued.BlockReason)), 80)
 			}
 			next = append(next, line)
 		}
@@ -1010,9 +1020,9 @@ func (b *Bridge) renderSummary(ctx context.Context, snaps []projectSnapshot, hel
 		sort.Slice(obligations, func(i, j int) bool { return obligations[i].CreatedAt.Before(obligations[j].CreatedAt) })
 		for _, o := range obligations {
 			if o.RecipientKind == api.ObligationRecipientOwner {
-				waiting = append(waiting, fmt.Sprintf("#%d %s · **%s** · %s", o.MessageSeq, truncate(clean(o.Subject), 70), project, since(now, o.CreatedAt)))
+				waiting = append(waiting, fmt.Sprintf("#%d %s · **%s** · %s", o.MessageSeq, truncate(clean(redactSecrets(o.Subject)), 70), project, since(now, o.CreatedAt)))
 			} else if o.Overdue != "" {
-				stuck = append(stuck, fmt.Sprintf("#%d %s → %s · %s overdue · open %s", o.MessageSeq, truncate(clean(o.Subject), 60), clean(names.name(o.AgentID)), o.Overdue, since(now, o.CreatedAt)))
+				stuck = append(stuck, fmt.Sprintf("#%d %s → %s · %s overdue · open %s", o.MessageSeq, truncate(clean(redactSecrets(o.Subject)), 60), clean(names.name(o.AgentID)), o.Overdue, since(now, o.CreatedAt)))
 			}
 		}
 		for _, a := range s.Agents {
@@ -1229,7 +1239,7 @@ func (b *Bridge) digestEvents(ctx context.Context, snaps []projectSnapshot) map[
 		}
 		for _, o := range s.Obligations {
 			if o.RecipientKind == api.ObligationRecipientOwner && o.State != api.ObligationClosed {
-				out["owner:"+o.ID] = fmt.Sprintf("🙋 **%s** needs you: #%d %s", project, o.MessageSeq, truncate(clean(o.Subject), 80))
+				out["owner:"+o.ID] = fmt.Sprintf("🙋 **%s** needs you: #%d %s", project, o.MessageSeq, truncate(clean(redactSecrets(o.Subject)), 80))
 			}
 		}
 	}
@@ -1314,4 +1324,21 @@ func (b *Bridge) digestTick(ctx context.Context) error {
 		st.Seen[key] = true
 	}
 	return b.cfg.State.setJSON(ctx, digestKey, st)
+}
+
+// redactHelperMessage is a board message as the project channel mirrors it:
+// an owner helper's text passes through redactSecrets, like its DM copy.
+// Other agents' messages are unchanged, and so is the board.
+func redactHelperMessage(r roster, m api.Message) api.Message {
+	if a, ok := r[m.From.AgentID]; !ok || m.From.AgentID == "" || a.Role != api.AgentRoleOwnerHelper {
+		return m
+	}
+	m.Text = redactSecrets(m.Text)
+	if m.Envelope != nil {
+		env := *m.Envelope
+		env.Subject = redactSecrets(env.Subject)
+		env.Body.Text = redactSecrets(env.Body.Text)
+		m.Envelope = &env
+	}
+	return m
 }
