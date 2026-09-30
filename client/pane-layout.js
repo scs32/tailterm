@@ -171,9 +171,20 @@ const prependTabs = (tree, ids) =>
       );
 const appendTab = (tree, id) =>
   split("x", tree, { tab: id }, 1 - 1 / (leaves(tree).length + 1));
+const appendBelow = (tree, id) =>
+  split("y", tree, { tab: id }, 1 - 1 / (leaves(tree).length + 1));
+
+// The home area's default share of the body width.
+export const HOME_RATIO = 0.4;
+export const clampHomeRatio = (value) =>
+  Number.isFinite(value) ? Math.min(0.8, Math.max(0.2, value)) : HOME_RATIO;
 
 export class PaneGroups {
   groups = [];
+  // The pinned home area: {tree, active, ratio}, or null when empty. Its panes
+  // are never in groups, so every group operation refuses them.
+  home = null;
+  boundTabs = new Set();
   tabOrder = [];
   limit = DEFAULT_PANE_LIMIT;
   taskOrchestrators = new Map();
@@ -205,6 +216,10 @@ export class PaneGroups {
     if (layout) this.#reconcileMembers(layout);
   }
   rememberActive(tab) {
+    if (this.inHome(tab)) {
+      this.home.active = tab;
+      return;
+    }
     const group = this.group(tab);
     if (!group?.taskId || this.taskMembers.get(group.taskId)?.length === 0)
       return;
@@ -243,7 +258,18 @@ export class PaneGroups {
   }
   // taskOf(tabId) supplies the task a newly grouped tab belongs to, so a
   // singleton group created for an agent pane inherits its task binding.
-  sync(ids, taskOf = () => undefined, agentOf = () => undefined) {
+  // homeOf(tabId) says whether a tab belongs in the home area; home tabs are
+  // kept out of every group before the group rules run.
+  sync(
+    ids,
+    taskOf = () => undefined,
+    agentOf = () => undefined,
+    homeOf = () => false,
+  ) {
+    this.boundTabs = new Set(ids.filter((id) => agentOf(id)));
+    const homeIds = ids.filter((id) => homeOf(id));
+    this.#syncHome(homeIds);
+    ids = ids.filter((id) => !homeIds.includes(id));
     this.tabOrder = [...ids];
     this.tabTasks = new Map(ids.map((id) => [id, taskOf(id)]));
     this.tabAgents = new Map(ids.map((id) => [id, agentOf(id)]));
@@ -591,6 +617,126 @@ export class PaneGroups {
     if (!next) return false;
     this.groups = next;
     return true;
+  }
+
+  inHome(tab) {
+    return !!this.home && leaves(this.home.tree).includes(tab);
+  }
+  // Only an unbound terminal may move into home; agent panes never do.
+  canHome(tab) {
+    return !!this.group(tab) && !this.boundTabs.has(tab);
+  }
+  // Moves a plain terminal from its group into home: next to target when a
+  // placement is given, otherwise at the bottom.
+  toHome(tab, target, placement) {
+    if (!this.canHome(tab)) return false;
+    const group = this.group(tab),
+      count = leaves(group.tree).length;
+    if (group.guests) group.guests = group.guests.filter((id) => id !== tab);
+    this.#remove(group, tab);
+    if (group.tree) {
+      if (group.tree.tab) delete group.decoration;
+      this.#leaveSeries(group, count);
+    }
+    this.#normalizeSeries();
+    if (group.taskId && this.groups.includes(group)) this.#capture(group);
+    if (!this.home)
+      this.home = { tree: { tab }, active: tab, ratio: HOME_RATIO };
+    else if (
+      this.inHome(target) &&
+      ["right", "left", "above", "below"].includes(placement)
+    )
+      this.home.tree = replace(
+        this.home.tree,
+        target,
+        this.#placed(tab, target, placement),
+      );
+    else this.home.tree = appendBelow(this.home.tree, tab);
+    this.home.active = tab;
+    return true;
+  }
+  // A plain home terminal becomes its own tab; the helper never leaves.
+  leaveHome(tab) {
+    if (!this.inHome(tab) || this.boundTabs.has(tab)) return false;
+    const tree = prune(
+      this.home.tree,
+      new Set(leaves(this.home.tree).filter((id) => id !== tab)),
+    );
+    if (!tree) this.home = null;
+    else {
+      this.home.tree = tree;
+      if (this.home.active === tab) this.home.active = leaves(tree)[0];
+    }
+    this.groups.push({ tree: { tab }, active: tab });
+    return true;
+  }
+  homeSwap(source, target) {
+    if (source === target || !this.inHome(source) || !this.inHome(target))
+      return false;
+    const exchange = (tree) =>
+      tree.tab
+        ? {
+            ...tree,
+            tab:
+              tree.tab === source
+                ? target
+                : tree.tab === target
+                  ? source
+                  : tree.tab,
+          }
+        : { ...tree, a: exchange(tree.a), b: exchange(tree.b) };
+    this.home.tree = exchange(this.home.tree);
+    return true;
+  }
+  homePlace(source, target, placement) {
+    if (
+      source === target ||
+      !this.inHome(source) ||
+      !this.inHome(target) ||
+      !["right", "left", "above", "below"].includes(placement)
+    )
+      return false;
+    const remaining = prune(
+      this.home.tree,
+      new Set(leaves(this.home.tree).filter((id) => id !== source)),
+    );
+    this.home.tree = replace(
+      remaining,
+      target,
+      this.#placed(source, target, placement),
+    );
+    this.home.active = source;
+    return true;
+  }
+  #placed(source, target, placement) {
+    const before = placement === "above" || placement === "left";
+    return {
+      id: crypto.randomUUID(),
+      axis: placement === "right" || placement === "left" ? "x" : "y",
+      ratio: 0.5,
+      a: before ? { tab: source } : { tab: target },
+      b: before ? { tab: target } : { tab: source },
+    };
+  }
+  // Home keeps its arrangement for the tabs still there and adds new ones at
+  // the bottom, each row sharing the height.
+  #syncHome(ids) {
+    if (!ids.length) {
+      this.home = null;
+      return;
+    }
+    let tree = this.home?.tree ? prune(this.home.tree, new Set(ids)) : null;
+    for (const id of ids)
+      if (!tree || !leaves(tree).includes(id))
+        tree = tree ? appendBelow(tree, id) : { tab: id };
+    const present = leaves(tree);
+    this.home = {
+      tree,
+      active: present.includes(this.home?.active)
+        ? this.home.active
+        : present[0],
+      ratio: clampHomeRatio(this.home?.ratio),
+    };
   }
 
   #guestIn(source, from, to) {

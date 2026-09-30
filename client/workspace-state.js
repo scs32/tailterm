@@ -1,4 +1,4 @@
-import { leaves } from "./pane-layout.js";
+import { leaves, clampHomeRatio } from "./pane-layout.js";
 import { normalizeTabDecoration } from "./tab-decoration.js";
 import { AGENT_ID_RE, normalizeTaskRef, normalizeTaskId } from "./task-ref.js";
 const MAX_PROJECT_LAYOUTS = 30;
@@ -168,6 +168,7 @@ export function workspaceSnapshot(
   tasks = [],
   hiddenAgents = [],
   projectLayouts,
+  home = null,
 ) {
   return {
     hiddenAgents: hiddenAgents
@@ -192,6 +193,15 @@ export function workspaceSnapshot(
       })),
     serverFilter: serverFilter === null ? null : [...serverFilter],
     groups: structuredClone(groups),
+    ...(home?.tree
+      ? {
+          home: {
+            tree: structuredClone(home.tree),
+            active: home.active,
+            ratio: clampHomeRatio(home.ratio),
+          },
+        }
+      : {}),
     projectLayouts: normalizeProjectLayouts(
       projectLayouts || projectLayoutsFromGroups(tabs, groups),
     ),
@@ -249,6 +259,18 @@ export function normalizeWorkspace(value) {
       b,
     };
   }
+  // Home is read first and shares the used set, so a tab saved in both home
+  // and a group stays in home only.
+  const homeTree = tree(value.home?.tree);
+  const home = homeTree
+    ? {
+        tree: homeTree,
+        active: leaves(homeTree).includes(value.home.active)
+          ? value.home.active
+          : leaves(homeTree)[0],
+        ratio: clampHomeRatio(value.home.ratio),
+      }
+    : null;
   const groups = (Array.isArray(value.groups) ? value.groups : [])
     .slice(0, 30)
     .map((g) => ({
@@ -295,6 +317,7 @@ export function normalizeWorkspace(value) {
         ].slice(0, 200)
       : null,
     groups,
+    ...(home ? { home } : {}),
     projectLayouts: normalizeProjectLayouts(
       value.projectLayouts || projectLayoutsFromGroups(tabs, groups),
     ),

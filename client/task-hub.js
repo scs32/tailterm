@@ -42,6 +42,7 @@ import {
   openAgent,
   liveProject,
   sessionCheckNeeded,
+  taskMemberIds,
 } from "./tasks.js";
 import {
   agentCleanupCommand,
@@ -470,9 +471,7 @@ export function createTaskHub(host) {
       .paneGroups()
       ?.model.setTaskMembers?.(
         feed.taskId,
-        feed.task?.status === "closed"
-          ? []
-          : feed.agents.filter(openAgent).map((agent) => agent.id),
+        taskMemberIds(feed.task, feed.agents),
       );
     const syncLayout = () => {
       const groups = host.paneGroups();

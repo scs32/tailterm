@@ -10,8 +10,21 @@ import {
   runChanged,
   sessionCheckNeeded,
   MAX_TASK_PANES,
+  homeAgent,
+  bindingOf,
+  taskBinding,
+  taskMemberIds,
+  homePlacement,
+  attachOptions,
+  helperReattach,
+  reattachOptions,
 } from "../client/tasks.js";
 import { normalizeTaskRef } from "../client/task-ref.js";
+import { tmuxCommand } from "../shared/tmux-command.js";
+import { execFileSync } from "node:child_process";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 const servers = [
   {
@@ -271,4 +284,339 @@ test("sessionCheckNeeded covers finished agents only", () => {
   assert.equal(sessionCheckNeeded({ status: "exited" }), true);
   for (const status of ["running", "starting", "needs_input", "retired"])
     assert.equal(sessionCheckNeeded({ status }), false, status);
+});
+
+// A synthetic owner helper: never the live owner session.
+const helperFixture = agent(90, {
+  name: "owner-helper-fx",
+  session: "helper-fx",
+  role: "owner_helper",
+});
+
+test("taskBinding keeps the helper role only, and homeAgent reads it", () => {
+  const plain = agent(3, { runId: "run_0000000000000003" });
+  assert.deepEqual(taskBinding(TASK, plain), {
+    taskId: TASK,
+    runId: "run_0000000000000003",
+    agentId: plain.id,
+    agentName: "a3",
+  });
+  assert.deepEqual(taskBinding(TASK, agent(4, { role: "database_handler" })), {
+    taskId: TASK,
+    runId: undefined,
+    agentId: agent(4).id,
+    agentName: "a4",
+  });
+  const helper = taskBinding(TASK, helperFixture);
+  assert.equal(helper.role, "owner_helper");
+  assert.equal(helper.agentId, helperFixture.id);
+  assert.deepEqual(
+    bindingOf(helper),
+    helper,
+    "the role survives renormalizing",
+  );
+  assert.equal(bindingOf(null), null);
+  assert.equal(homeAgent(helperFixture), true);
+  assert.equal(homeAgent(plain), false);
+  assert.equal(homeAgent(undefined), false);
+});
+
+test("homePlacement: helper and new owner terminals in home, agents never", () => {
+  const helper = taskBinding(TASK, helperFixture);
+  const plain = taskBinding(TASK, agent(5));
+  const rows = [
+    // [case, input, expected]
+    ["helper pane", { binding: helper }, true],
+    [
+      "helper pane, restored out of home",
+      { binding: helper, saved: false },
+      true,
+    ],
+    ["helper by hub role", { binding: plain, role: "owner_helper" }, true],
+    ["other agent", { binding: plain }, false],
+    [
+      "other agent saved in home, roster known",
+      { binding: plain, role: "", saved: true },
+      false,
+    ],
+    [
+      "adopted home shell becomes an agent",
+      { binding: plain, role: "", explicit: true },
+      false,
+    ],
+    [
+      "bound pane, roster unknown, saved in home",
+      { binding: plain, saved: true },
+      true,
+    ],
+    ["new owner terminal, home empty", {}, true],
+    ["new owner terminal", undefined, true],
+    ["restored owner terminal in home", { saved: true }, true],
+    ["restored owner terminal as a tab", { saved: false }, false],
+    [
+      "owner moves a shell out of home",
+      { saved: true, explicit: false },
+      false,
+    ],
+    ["owner moves a shell into home", { saved: false, explicit: true }, true],
+    [
+      "agent cannot be moved into home",
+      { binding: plain, explicit: true },
+      false,
+    ],
+    ["helper cannot be moved out", { binding: helper, explicit: false }, true],
+  ];
+  for (const [name, input, expected] of rows)
+    assert.equal(homePlacement(input), expected, name);
+});
+
+test("reconcileTask opens and adopts the helper like any agent", () => {
+  const tabs = [
+    { id: "launcher", server: servers[0], tmux: true, session: "helper-fx" },
+  ];
+  const r = reconcileTask({
+    taskId: TASK,
+    agents: [helperFixture, agent(6)],
+    tabs,
+    servers,
+  });
+  assert.deepEqual(
+    r.adopt.map((x) => [x.tab.id, x.agent.id]),
+    [["launcher", helperFixture.id]],
+  );
+  assert.deepEqual(
+    r.open.map((x) => x.agent.id),
+    [agent(6).id],
+  );
+});
+
+test("taskMemberIds excludes the helper in every state", () => {
+  const eight = Array.from({ length: 8 }, (_, i) => agent(i + 1));
+  const ids = eight.map((a) => a.id);
+  for (const extra of [
+    { host: "nowhere" }, // no pane: unknown host
+    {}, // hidden by the owner: still running on the hub
+    { status: "starting", runId: "run_0000000000000090" }, // opening
+    { status: "exited" },
+    { status: "retired" },
+    { online: false },
+  ]) {
+    const helper = { ...helperFixture, ...extra };
+    assert.deepEqual(
+      taskMemberIds({ status: "open" }, [helper, ...eight]),
+      ids,
+      JSON.stringify(extra),
+    );
+    assert.deepEqual(
+      taskMemberIds({ status: "open" }, [...eight, helper]),
+      ids,
+    );
+  }
+  assert.deepEqual(taskMemberIds({ status: "closed" }, eight), []);
+  assert.deepEqual(
+    taskMemberIds({ status: "open" }, [
+      ...eight,
+      agent(9, { status: "closed" }),
+    ]),
+    ids,
+    "closed agents stay out as before",
+  );
+});
+
+test("helperReattach and reattachOptions force an ignore-size attach", () => {
+  const task = taskBinding(TASK, helperFixture);
+  const target = { id: "$4", created: "1700000000" };
+  const tab = (extra) => ({
+    id: "t",
+    tmux: true,
+    session: "helper-fx",
+    target,
+    task,
+    ...extra,
+  });
+  for (const status of ["Connecting", "Connected"])
+    assert.equal(
+      helperReattach(tab({ status, attachIgnoresSize: false })),
+      true,
+      status,
+    );
+  assert.equal(helperReattach(tab({ attachIgnoresSize: true })), false);
+  assert.equal(helperReattach(tab({ attachIgnoresSize: undefined })), false);
+  assert.equal(
+    helperReattach(tab({ attachIgnoresSize: false, tmux: false })),
+    false,
+  );
+  assert.equal(
+    helperReattach(
+      tab({ attachIgnoresSize: false, task: taskBinding(TASK, agent(7)) }),
+    ),
+    false,
+    "an ordinary agent is not reattached",
+  );
+  assert.equal(helperReattach(null), false);
+  const original = tab({ status: "Connecting", attachIgnoresSize: false });
+  const options = reattachOptions(original);
+  assert.equal(options.replace, original);
+  assert.equal(options.resumeOnly, true);
+  assert.equal(options.task, task);
+  assert.equal(options.target, target);
+  assert.equal(options.home, true);
+  assert.deepEqual(attachOptions(task), { ignoreSize: true });
+  assert.deepEqual(attachOptions(undefined), { ignoreSize: false });
+  const command = tmuxCommand(
+    original.session,
+    "",
+    options.resumeOnly,
+    undefined,
+    "",
+    attachOptions(options.task),
+  );
+  assert.match(command, /tailterm_tmux_attach_flags='\\''-f ignore-size'/);
+  assert.match(command, /attach-session \$tailterm_tmux_attach_flags -t/);
+  assert.doesNotMatch(command, /new-session/);
+  // The attach mode and the size flag are separate facts.
+  const plainCommand = tmuxCommand(
+    "helper-fx",
+    "",
+    true,
+    undefined,
+    "",
+    attachOptions(undefined),
+  );
+  assert.match(plainCommand, /attach-session -t/);
+  assert.doesNotMatch(plainCommand, /ignore-size/);
+});
+
+// Real tmux on private sockets: the helper's attach never resizes the owner's
+// terminal. Both servers live under a private TMUX_TMPDIR.
+test("the helper attach does not change the session's window size", (t) => {
+  let version = "";
+  try {
+    version = execFileSync("tmux", ["-V"], { encoding: "utf8" }).trim();
+  } catch {
+    t.skip("tmux is not installed");
+    return;
+  }
+  const [major, minor] = (version.match(/(\d+)\.(\d+)/) || [])
+    .slice(1)
+    .map(Number);
+  if (!(major > 3 || (major === 3 && minor >= 2))) {
+    t.skip(`tmux 3.2+ is required for ignore-size (found ${version})`);
+    return;
+  }
+  const dir = mkdtempSync(join(tmpdir(), "tt-home-"));
+  const env = { ...process.env, TMUX_TMPDIR: dir };
+  delete env.TMUX;
+  delete env.TMUX_PANE;
+  const target = (...args) =>
+    execFileSync("tmux", ["-f", "/dev/null", ...args], {
+      env,
+      encoding: "utf8",
+    }).trim();
+  const viewer = (...args) =>
+    execFileSync("tmux", ["-L", "viewer", "-f", "/dev/null", ...args], {
+      env,
+      encoding: "utf8",
+    }).trim();
+  const size = () =>
+    target(
+      "display-message",
+      "-p",
+      "-t",
+      "helper-fx:",
+      "#{window_width}x#{window_height}",
+    );
+  const waitClient = (want) => {
+    const deadline = Date.now() + 5000;
+    while (Date.now() < deadline) {
+      if (
+        target(
+          "list-clients",
+          "-F",
+          "#{client_width}x#{client_height} #{session_name}",
+        ).includes(want)
+      )
+        return execFileSync("sleep", ["0.2"]);
+      execFileSync("sleep", ["0.05"]);
+    }
+    assert.fail(`no ${want} client attached`);
+  };
+  t.after(() => {
+    for (const run of [target, viewer])
+      try {
+        run("kill-server");
+      } catch {}
+    rmSync(dir, { recursive: true, force: true });
+  });
+  target(
+    "new-session",
+    "-d",
+    "-s",
+    helperFixture.session,
+    "-x",
+    "200",
+    "-y",
+    "50",
+    "sleep 120",
+  );
+  target("set-option", "-w", "-t", "helper-fx:", "window-size", "latest");
+  // The owner's own terminal: a normal 120x40 client.
+  viewer(
+    "new-session",
+    "-d",
+    "-s",
+    "owner",
+    "-x",
+    "120",
+    "-y",
+    "40",
+    "env -u TMUX tmux attach-session -t '=helper-fx'",
+  );
+  waitClient("120x40 helper-fx");
+  assert.equal(size(), "120x39", "the owner's client sizes the window");
+  const helperAttach = tmuxCommand(
+    helperFixture.session,
+    "",
+    true,
+    undefined,
+    "",
+    attachOptions(taskBinding(TASK, helperFixture)),
+  );
+  assert.match(helperAttach, /ignore-size/);
+  viewer(
+    "new-session",
+    "-d",
+    "-s",
+    "tile",
+    "-x",
+    "16",
+    "-y",
+    "2",
+    "env -u TMUX " + helperAttach,
+  );
+  waitClient("16x2 helper-fx");
+  assert.equal(size(), "120x39", "the home pane attach left the window alone");
+  // Control: the same tile without the flag does resize the window.
+  viewer("kill-session", "-t", "tile");
+  const plainAttach = tmuxCommand(
+    helperFixture.session,
+    "",
+    true,
+    undefined,
+    "",
+    attachOptions(undefined),
+  );
+  viewer(
+    "new-session",
+    "-d",
+    "-s",
+    "plain",
+    "-x",
+    "16",
+    "-y",
+    "2",
+    "env -u TMUX " + plainAttach,
+  );
+  waitClient("16x2 helper-fx");
+  assert.notEqual(size(), "120x39", "the control attach must change the size");
 });
