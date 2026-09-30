@@ -10,7 +10,9 @@ or integrity failures immediately; Mini relay must remain clean for 30 seconds).
 
 `tt deployment template` emits the persistent generic-runtime role template.
 An authorized project provisioning order uses `tt deployment setup` with a stable
-`--agent-id`, explicit host checkout and generic command. The handler launch
+`--agent-id`, explicit host checkout (`--cwd`), `--prerequisites-from` and generic
+command; setup provisions the matrix prerequisites in that checkout before it
+spawns (see "Integrated-commit verification" below). The handler launch
 journal preserves exact process/run identity across response loss and retries;
 rotation of an exited role requires its exact predecessor run. Only one unclosed
 deployment identity exists per project. Item cleanup does not include this unbound
@@ -169,6 +171,63 @@ and the first release are separate operational steps.
   success receipt: its generation is saved and the journal waits in
   `receipt_pending`, so a lost response retries the identical receipt and
   generation with no second rollback, escalation or bug request.
+
+### Integrated-commit verification (wi_5b03fe47520b7c4f)
+
+A cherry-picked candidate is verified by the runner itself: `verify-matrix.mjs
+plan` then `run` in the deployer's checkout, then an import request to the
+handler. Three things make that run succeed or fail for a named reason
+(incident #15749).
+
+- **Prerequisites.** The five files `verify-matrix.mjs` requires are
+  `node_modules/.package-lock.json`, `wasm/tailserve.wasm`, `.build/test.wasm`,
+  `.build/speech-fixture.wav` and `.build/go-modules.txt`; the deployer needs
+  them as much as a verifier does. `tt deployment setup --cwd CHECKOUT
+  --prerequisites-from SOURCE ...` runs `node scripts/release-runner.mjs
+  --provision-prerequisites --from SOURCE` in the checkout before any spawn:
+  `npm ci` when the install marker is missing, then each other missing file
+  copied from `SOURCE` (the owner's root checkout,
+  `/Users/stephenspeicher/projects/tailterm`), never overwriting an existing
+  file. All five are gitignored, and a checkout left dirty is refused. It prints
+  each path with its sha256 and `present`, `copied` or `installed`, and fails,
+  spawning nothing, with `Missing matrix prerequisites: PATHS` naming every file
+  missing from both checkouts. It is idempotent. The Playwright engines stay a
+  host prerequisite, and `.build/go-modules.txt` names module directories in the
+  source checkout's `.build/go`, which must remain there. Rebuild the source's
+  WASM files (`npm run build:wasm -- --test`) when WASM source changes; the
+  matrix's `wasm-test-build` check rebuilds them anyway when that group is
+  selected. For an existing deployer checkout, run the provisioning command
+  above in it (deployer retired between releases). Before the matrix runs, the
+  runner checks the same five files and refuses a missing one by name.
+- **Timeout.** The `run` call gets its own bound from the plan: the sum over
+  its checks of `VERIFICATION_TIMEOUT_MS` times `maxAttempts`, plus 30 minutes
+  for test-binary builds, with no further cap (the worked example: go-race
+  1800000 and npm-unit 120000 at 3 attempts is 7560000 ms). The per-check timers
+  inside the matrix remain the real limit. Every other host command keeps the
+  600-second limit. A check limit that is missing or above 1800000 refuses.
+- **Other matrix runs.** Verifiers run the matrix alone, so the runner waits
+  while `pgrep -f '^[^ ]*node[^ ]* ([^ ]*/)?scripts/verify-matrix\.mjs
+  (run|targeted) '` counts any process. The pattern is anchored at the node
+  program, because agent processes whose prompt quotes the matrix command would
+  otherwise count. Only the count is used: no other process's argv,
+  environment, files or output is read, and nothing is signalled. While busy the
+  job stays `waiting_matrix`, no plan, run or import request is made, and the
+  next poll (about 30 seconds) retries. The first busy time is kept in
+  `ID-integrated-verification/host-wait.json`; after 2 hours (private config key
+  `matrixHostWaitMs`) the job is refused. The probe narrows, but does not close,
+  the race with a verifier starting at the same moment; the matrix still refuses
+  an occupied port.
+
+The journal is saved as `waiting_matrix` before the run starts and returns to
+`integrated` once the imported receipt is found, so a runner stopped during a
+long run resumes the same job (its host lock still needs the usual inspection).
+A receipt such a run leaves behind is imported only when eligible. A refusal
+before publication records `refusalReason` in the journal and posts "Release
+refused before publication" with that reason: `Missing matrix prerequisites:
+PATHS`, `Host busy with another verify-matrix run`, `Matrix host probe
+unavailable`, `Invalid matrix check timeout`, `Integrated matrix receipt is not
+eligible`, `verify-matrix.mjs timeout` or `exit N`, or `unclassified` for an
+untagged error. It never claims a rollback was attempted.
 
 ### Handler requests and gating
 

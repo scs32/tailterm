@@ -1,10 +1,10 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import {mkdtempSync,mkdirSync,writeFileSync,readFileSync,chmodSync,existsSync,statSync,readdirSync} from "node:fs";
+import {mkdtempSync,mkdirSync,writeFileSync,readFileSync,chmodSync,existsSync,statSync,readdirSync,rmSync} from "node:fs";
 import {tmpdir} from "node:os";
-import {join} from "node:path";
-import {execFileSync} from "node:child_process";
-import {integrateCandidate,publishIntegration,runRelease,liveCheck,runnableJob,HostAdapter,serveDeployment,reconcileHostLocks,revertCommit,moveReleaseRef,tasksHubCheckedOut,releaseError,failureReason} from "../scripts/release-runner.mjs";
+import {join,dirname} from "node:path";
+import {execFileSync,spawn} from "node:child_process";
+import {integrateCandidate,publishIntegration,runRelease,liveCheck,runnableJob,HostAdapter,serveDeployment,reconcileHostLocks,revertCommit,moveReleaseRef,tasksHubCheckedOut,releaseError,failureReason,MATRIX_PREREQUISITES,MATRIX_RUN_PATTERN,MATRIX_HOST_WAIT_MS,missingPrerequisites,provisionPrerequisites,matrixRunTimeout} from "../scripts/release-runner.mjs";
 import {createHash} from "node:crypto";
 import {renderTeamDelivery} from "../client/team-delivery-view.js";
 import {targetsForPaths,selectReleaseTargets} from "../scripts/release-targets.mjs";
@@ -381,4 +381,142 @@ test("a3 a paired plan deploys once with the shared plan and refuses a stale or 
  assert.deepEqual(h.calls,[["python3","scripts/deploy-truenas-hub.py",h.shared.release,"--plan",h.planPath,"--preflight-receipt",h.shared.preflightReceipt,"--preflight-receipt-sha256",h.shared.preflightReceiptSHA256,"--update"]]);
  writeFileSync(bridge.artifactPath,"changed");await assert.rejects(h.adapter.deploy("hub",hub),/Paired artifact changed/);
  const one=pairedHost();one.importTargets({hub:{...one.shared,planTargets:["hub"]}});await assert.rejects(one.adapter.prepare("hub",one.commit),/release identity/,"a single-target plan keeps its per-target release name");
+});
+
+// wi_5b03fe47520b7c4f: the deployer verifies an integrated commit in its own
+// checkout, so the matrix prerequisites, the run's timeout and other matrix
+// runs on the host are the runner's concern.
+const RUNNER=new URL("../scripts/release-runner.mjs",import.meta.url).pathname;
+const ignorePrerequisites=cwd=>writeFileSync(join(cwd,".git/info/exclude"),"node_modules/\n.build/\nwasm/*.wasm\n");
+function placePrerequisites(dir,skip=[]){for(const p of MATRIX_PREREQUISITES.filter(p=>!skip.includes(p))){mkdirSync(join(dir,dirname(p)),{recursive:true});writeFileSync(join(dir,p),"fixture "+p);}}
+const workedPlan={maxAttempts:3,checks:[{id:"go-race",environment:{VERIFICATION_TIMEOUT_MS:"1800000"}},{id:"npm-unit",environment:{VERIFICATION_TIMEOUT_MS:"120000"}}]};
+function matrixHost({plan=workedPlan,receipt={environment:{},checks:[{exitCode:0}]}}={}){
+ const f=fixture(),home=mkdtempSync(join(tmpdir(),"matrix-host-"));ignorePrerequisites(f.cwd);placePrerequisites(f.cwd);
+ const adapter=new HostAdapter({cwd:f.cwd,journalDirectory:home},{id:"rel_fixture",agentId:"agt_fixture",runId:"run_fixture",generation:1});
+ const calls=[];adapter.matrixRunsActive=()=>0;
+ adapter.command=(argv,cwd,options)=>{calls.push({argv,timeout:options?.timeout??600000});
+  if(argv[1]==="deployment"&&argv[2]==="list")return "[]";
+  if(argv[1]==="deployment"&&argv[2]==="handler")return JSON.stringify({id:"agt_0123abcd"});
+  if(argv[1]==="scripts/verify-matrix.mjs"&&argv[2]==="plan"){writeFileSync(argv[4],JSON.stringify(plan));return "";}
+  if(argv[1]==="scripts/verify-matrix.mjs"&&argv[2]==="run"){writeFileSync(join(argv[4],"receipt.json"),JSON.stringify(receipt));return "";}
+  return "";};
+ const integrated={id:"rel_fixture",integratedCommit:"c".repeat(40),plan:{commit:"a".repeat(40)}};
+ return {f,home,adapter,calls,integrated,matrix:()=>calls.filter(c=>c.argv[1]==="scripts/verify-matrix.mjs"),sends:()=>calls.filter(c=>c.argv[1]==="send")};
+}
+test("p1 a missing matrix prerequisite refuses the release by name before any matrix run",async()=>{
+ const f=fixture(),j=job(f,change(f,"client/a.js","a"));git(f.cwd,"checkout","tasks-hub");change(f,"client/c.js","c");
+ ignorePrerequisites(f.cwd);placePrerequisites(f.cwd,[".build/test.wasm"]);
+ const c=config(f,j),a=fake(),argvs=[];let escalation;
+ const host=new HostAdapter({cwd:f.cwd,journalDirectory:dirname(c.journalPath)},{id:"rel_fixture"});host.command=argv=>{argvs.push(argv);return argv[2]==="list"?"[]":"";};host.matrixRunsActive=()=>0;
+ a.verifyIntegrated=x=>host.verifyIntegrated(x);a.escalate=async d=>{escalation=d;a.calls.push("escalate");};
+ await assert.rejects(runRelease(c,a),/refused/);
+ assert.deepEqual(a.calls,["refuse","escalate"]);assert.ok(!argvs.some(x=>x.includes("scripts/verify-matrix.mjs")),"no matrix argv");
+ assert.deepEqual(escalation,{jobId:"rel_fixture",outcome:"refused",reason:"Missing matrix prerequisites: .build/test.wasm"});
+ const journal=JSON.parse(readFileSync(c.journalPath,"utf8"));assert.equal(journal.refusalReason,"Missing matrix prerequisites: .build/test.wasm");assert.equal(journal.phase,"refused");
+ const calls=[];const notice=new HostAdapter({cwd:f.cwd,journalDirectory:f.cwd},{id:"rel_fixture"});notice.command=argv=>{calls.push(argv);return "";};
+ await notice.escalate(escalation);const text=calls[0][calls[0].indexOf("--text")+1];
+ assert.match(text,/Reason: Missing matrix prerequisites: \.build\/test\.wasm\./);assert.doesNotMatch(text,/Automatic rollback attempted once/);
+ assert.equal(calls[0][calls[0].indexOf("--subject")+1],"Release refused before publication");
+ await notice.escalate({jobId:"rel_fixture",outcome:"refused",reason:"token=secret\nleak"});assert.match(calls[1][calls[1].indexOf("--text")+1],/Reason: unclassified\./);
+ assert.deepEqual(missingPrerequisites(f.cwd),[".build/test.wasm"]);
+});
+test("p1 the prerequisite list matches the one verify-matrix.mjs checks",()=>{
+ const source=readFileSync(new URL("../scripts/verify-matrix.mjs",import.meta.url),"utf8"),at=source.indexOf('"Missing prerequisite: "');
+ const start=source.lastIndexOf("for (const p of [",at),end=source.indexOf("])",start);assert.ok(at>0&&start>0&&end<at);
+ assert.deepEqual([...source.slice(start,end).matchAll(/"([^"]+)"/g)].map(m=>m[1]),MATRIX_PREREQUISITES);
+});
+function provisionFixture(){
+ const cwd=mkdtempSync(join(tmpdir(),"provision-checkout-")),from=mkdtempSync(join(tmpdir(),"provision-source-"));
+ git(cwd,"init","-q","-b","tasks-hub");writeFileSync(join(cwd,".gitignore"),"node_modules/\n.build/\nwasm/*.wasm\n");git(cwd,"add",".");git(cwd,"-c","user.email=f@example.invalid","-c","user.name=F","commit","-q","-m","base");
+ placePrerequisites(from);const installs=[];
+ const run=(argv,dir)=>{installs.push([argv,dir]);mkdirSync(join(dir,"node_modules"),{recursive:true});writeFileSync(join(dir,"node_modules/.package-lock.json"),"installed");};
+ return {cwd,from,installs,run};
+}
+test("p1 provisioning installs and copies each missing prerequisite, never overwrites and is idempotent",()=>{
+ const p=provisionFixture();mkdirSync(join(p.cwd,".build"));writeFileSync(join(p.cwd,".build/test.wasm"),"local build");
+ const first=provisionPrerequisites(p.cwd,{from:p.from,run:p.run});
+ assert.deepEqual(p.installs,[[["npm","ci"],p.cwd]]);
+ assert.deepEqual(first.prerequisites.map(x=>[x.path,x.action]),[["node_modules/.package-lock.json","installed"],["wasm/tailserve.wasm","copied"],[".build/test.wasm","present"],[".build/speech-fixture.wav","copied"],[".build/go-modules.txt","copied"]]);
+ assert.equal(readFileSync(join(p.cwd,".build/test.wasm"),"utf8"),"local build");assert.equal(readFileSync(join(p.cwd,"wasm/tailserve.wasm"),"utf8"),"fixture wasm/tailserve.wasm");
+ for(const x of first.prerequisites)assert.equal(x.sha256,hash(readFileSync(join(p.cwd,x.path))));
+ assert.equal(git(p.cwd,"status","--porcelain"),"");
+ const again=provisionPrerequisites(p.cwd,{from:p.from,run:p.run});assert.equal(p.installs.length,1);assert.ok(again.prerequisites.every(x=>x.action==="present"));
+ assert.deepEqual(again.prerequisites.map(x=>x.sha256),first.prerequisites.map(x=>x.sha256));
+});
+test("p1 provisioning names every prerequisite missing from both checkouts and refuses a bad source or a dirtied checkout",()=>{
+ const p=provisionFixture();for(const x of [".build/test.wasm",".build/speech-fixture.wav"])rmSync(join(p.from,x));
+ assert.throws(()=>provisionPrerequisites(p.cwd,{from:p.from,run:p.run}),e=>failureReason(e)==="Missing matrix prerequisites: .build/test.wasm, .build/speech-fixture.wav");
+ const q=provisionFixture();assert.throws(()=>provisionPrerequisites(q.cwd,{from:q.from,run:()=>{}}),e=>failureReason(e)==="Missing matrix prerequisites: node_modules/.package-lock.json");
+ assert.throws(()=>provisionPrerequisites(q.cwd,{from:q.from,run:()=>{throw new Error("network down");}}),e=>failureReason(e)==="Prerequisite install failed: npm ci");
+ for(const from of [undefined,"relative/path",q.cwd,join(q.from,"missing")])assert.throws(()=>provisionPrerequisites(q.cwd,{from,run:q.run}),e=>failureReason(e)==="Prerequisite source must be another absolute checkout");
+ const d=provisionFixture();writeFileSync(join(d.cwd,".gitignore"),"node_modules/\n.build/\n");git(d.cwd,"-c","user.email=f@example.invalid","-c","user.name=F","commit","-q","-am","track wasm");
+ assert.throws(()=>provisionPrerequisites(d.cwd,{from:d.from,run:d.run}),e=>failureReason(e)==="Prerequisite provisioning changed the checkout");
+});
+test("p1 the provisioning command prints the prerequisites, or only the named reason",()=>{
+ const p=provisionFixture();mkdirSync(join(p.cwd,"node_modules"));writeFileSync(join(p.cwd,"node_modules/.package-lock.json"),"{}");
+ const out=JSON.parse(execFileSync(process.execPath,[RUNNER,"--provision-prerequisites","--from",p.from],{cwd:p.cwd,encoding:"utf8"}));
+ assert.equal(out.version,1);assert.deepEqual(out.prerequisites.map(x=>x.action),["present","copied","copied","copied","copied"]);assert.equal(git(p.cwd,"status","--porcelain"),"");
+ const q=provisionFixture();mkdirSync(join(q.cwd,"node_modules"));writeFileSync(join(q.cwd,"node_modules/.package-lock.json"),"{}");rmSync(join(q.from,".build/go-modules.txt"));
+ const r=execFileSync(process.execPath,["-e",`const r=require("child_process").spawnSync(process.execPath,${JSON.stringify([RUNNER,"--provision-prerequisites","--from",q.from])},{cwd:${JSON.stringify(q.cwd)},encoding:"utf8"});console.log(JSON.stringify({status:r.status,stdout:r.stdout,stderr:r.stderr}))`],{encoding:"utf8"});
+ assert.deepEqual(JSON.parse(r),{status:1,stdout:"",stderr:"Missing matrix prerequisites: .build/go-modules.txt\n"});
+});
+test("p2 the matrix run gets a timeout derived from the plan and other commands keep the command limit",async()=>{
+ assert.equal(matrixRunTimeout(workedPlan),7560000);
+ assert.equal(matrixRunTimeout({checks:[{environment:{VERIFICATION_TIMEOUT_MS:"600000"}}]}),2400000,"a plan without maxAttempts runs each check once");
+ for(const bad of [{...workedPlan,checks:[]},{checks:[{environment:{}}]},{checks:[{environment:{VERIFICATION_TIMEOUT_MS:"1800001"}}]},{checks:[{environment:{VERIFICATION_TIMEOUT_MS:"0"}}]},{checks:[{environment:{VERIFICATION_TIMEOUT_MS:1800000}}]},{maxAttempts:0,checks:workedPlan.checks}])
+  assert.throws(()=>matrixRunTimeout(bad),e=>/^(Matrix plan has no checks|Invalid matrix check timeout|Invalid matrix attempt limit)$/.test(failureReason(e)));
+ const h=matrixHost();assert.equal(await h.adapter.verifyIntegrated(h.integrated),false);
+ const matrix=h.matrix();assert.deepEqual(matrix.map(c=>[c.argv[2],c.timeout]),[["plan",600000],["run",7560000]]);
+ assert.ok(h.calls.filter(c=>c.argv[2]!=="run").every(c=>c.timeout===600000));assert.equal(h.sends().length,1);
+ const bad=matrixHost({plan:{maxAttempts:3,checks:[{environment:{VERIFICATION_TIMEOUT_MS:"3600000"}}]}});
+ await assert.rejects(bad.adapter.verifyIntegrated(bad.integrated),e=>failureReason(e)==="Invalid matrix check timeout");assert.deepEqual(bad.matrix().map(c=>c.argv[2]),["plan"]);
+ const failing=matrixHost({receipt:{environment:{},checks:[{exitCode:1}]}});
+ await assert.rejects(failing.adapter.verifyIntegrated(failing.integrated),e=>failureReason(e)==="Integrated matrix receipt is not eligible");assert.equal(failing.sends().length,0);
+ const real=new HostAdapter({cwd:tmpdir()},{});assert.throws(()=>real.command([process.execPath,"-e","setTimeout(()=>{},5000)"],tmpdir(),{timeout:200}),e=>/ timeout$/.test(failureReason(e)));
+ assert.equal(real.command([process.execPath,"-e","console.log('ok')"]).trim(),"ok");
+});
+test("p2 the host probe counts only real node matrix runs",async()=>{
+ const re=new RegExp(MATRIX_RUN_PATTERN);
+ for(const line of ["node scripts/verify-matrix.mjs run p d","/opt/homebrew/bin/node /abs/scripts/verify-matrix.mjs targeted c d","node /Users/x/tailterm/scripts/verify-matrix.mjs run /tmp/plan.json /tmp/out --jobs 4"])assert.match(line,re,line);
+ for(const line of ["claude --model opus --append-system-prompt Run node scripts/verify-matrix.mjs run PLAN_JSON LOG_DIR","node scripts/verify-matrix.mjs plan c p","codex exec node scripts/verify-matrix.mjs run p d","node -e x node scripts/verify-matrix.mjs run p d","node scripts/release-runner.mjs --config /private/c.json"])assert.doesNotMatch(line,re,line);
+ // The same pattern through the real pgrep, limited to this test's children.
+ const dir=mkdtempSync(join(tmpdir(),"matrix-probe-"));mkdirSync(join(dir,"scripts"));writeFileSync(join(dir,"scripts/verify-matrix.mjs"),"console.log('ready');setTimeout(()=>{},20000);");
+ const start=argv=>new Promise((resolveStart,reject)=>{const child=spawn(argv[0],argv.slice(1),{stdio:["ignore","pipe","ignore"]});child.on("error",reject);child.stdout.once("data",()=>resolveStart(child));});
+ const own=(file,args,options)=>execFileSync(file,["-P",String(process.pid),...args],options);
+ const adapter=new HostAdapter({cwd:dir},{}),children=[];
+ try{
+  children.push(await start([process.execPath,"-e","console.log('ready');setTimeout(()=>{},20000)","node scripts/verify-matrix.mjs run PLAN_JSON LOG_DIR"]));
+  children.push(await start([process.execPath,join(dir,"scripts/verify-matrix.mjs"),"plan","c","p"]));
+  assert.equal(adapter.matrixRunsActive(own),0,"prompt text and plan mode are not runs");
+  children.push(await start([process.execPath,join(dir,"scripts/verify-matrix.mjs"),"run","p","d"]));
+  assert.equal(adapter.matrixRunsActive(own),1);
+ }finally{for(const child of children)child.kill();}
+ assert.throws(()=>adapter.matrixRunsActive(()=>{const e=new Error("pgrep");e.status=2;throw e;}),e=>failureReason(e)==="Matrix host probe unavailable");
+ assert.equal(adapter.matrixRunsActive(()=>{const e=new Error("none");e.status=1;throw e;}),0);
+ const source=readFileSync(RUNNER,"utf8");assert.doesNotMatch(source,/process\.kill|pkill|"kill"/);
+});
+test("p2 the integrated run waits for other matrix runs and refuses by name after the bound",async()=>{
+ const h=matrixHost();let busy=1,now=1000;h.adapter.matrixRunsActive=()=>busy;h.adapter.now=()=>now;
+ const wait=join(h.home,"rel_fixture-integrated-verification","host-wait.json");
+ assert.equal(await h.adapter.verifyIntegrated(h.integrated),false);assert.equal(h.matrix().length,0);assert.equal(h.sends().length,0);
+ assert.deepEqual(JSON.parse(readFileSync(wait,"utf8")),{since:1000});assert.equal(statSync(wait).mode&0o777,0o600);
+ now+=MATRIX_HOST_WAIT_MS-1;assert.equal(await h.adapter.verifyIntegrated(h.integrated),false);assert.equal(h.matrix().length,0);
+ busy=0;assert.equal(await h.adapter.verifyIntegrated(h.integrated),false);assert.deepEqual(h.matrix().map(c=>c.argv[2]),["plan","run"]);assert.equal(h.sends().length,1);assert.ok(!existsSync(wait));
+ const late=matrixHost();late.adapter.matrixRunsActive=()=>1;let t=0;late.adapter.now=()=>t;
+ assert.equal(await late.adapter.verifyIntegrated(late.integrated),false);t=MATRIX_HOST_WAIT_MS;
+ await assert.rejects(late.adapter.verifyIntegrated(late.integrated),e=>failureReason(e)==="Host busy with another verify-matrix run");assert.equal(late.matrix().length,0);
+ const short=matrixHost();short.adapter.config.matrixHostWaitMs=50;short.adapter.matrixRunsActive=()=>1;let s=0;short.adapter.now=()=>s;
+ assert.equal(await short.adapter.verifyIntegrated(short.integrated),false);s=50;await assert.rejects(short.adapter.verifyIntegrated(short.integrated),/Host busy/);
+});
+test("p2 the journal is waiting_matrix during the integrated run, so a stopped runner resumes the same job",async()=>{
+ const f=fixture(),j=job(f,change(f,"client/a.js","a"));git(f.cwd,"checkout","tasks-hub");change(f,"client/c.js","c");
+ const c=config(f,j),a=fake();let during,phaseAtMerge;
+ a.verifyIntegrated=async x=>{during=readFileSync(c.journalPath,"utf8");return false;};
+ assert.equal((await runRelease(c,a)).outcome,"waiting_matrix");
+ const saved=JSON.parse(during);assert.equal(saved.phase,"waiting_matrix");assert.equal(saved.integrated,git(f.cwd,"rev-parse","HEAD"));
+ // The journal as a runner stopped mid-run left it.
+ writeFileSync(c.journalPath,during);let integratedCommits=[];
+ a.verifyIntegrated=async x=>{integratedCommits.push(x.integratedCommit);return true;};a.merged=async()=>{phaseAtMerge=JSON.parse(readFileSync(c.journalPath,"utf8")).phase;a.calls.push("merged");};
+ const receipt=await runRelease(c,a);assert.equal(receipt.outcome,"released");assert.deepEqual(integratedCommits,[saved.integrated]);assert.equal(receipt.commit,saved.integrated);
+ assert.equal(phaseAtMerge,"integrated","a verified run leaves waiting_matrix before publication");
 });

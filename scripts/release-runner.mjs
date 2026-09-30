@@ -2,9 +2,9 @@ import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { execFileSync } from "node:child_process";
-import { openSync, closeSync, fsyncSync, writeFileSync, readFileSync, renameSync, mkdirSync, mkdtempSync, existsSync, rmSync, copyFileSync, cpSync, chmodSync, statSync, constants } from "node:fs";
-import { join, resolve, dirname } from "node:path";
-import { digest, diffPaths } from "./verify-matrix.mjs";
+import { openSync, closeSync, fsyncSync, writeFileSync, readFileSync, renameSync, mkdirSync, mkdtempSync, existsSync, rmSync, copyFileSync, cpSync, chmodSync, statSync, realpathSync, constants } from "node:fs";
+import { join, resolve, dirname, isAbsolute } from "node:path";
+import { digest, diffPaths, receiptEligible } from "./verify-matrix.mjs";
 import { selectReleaseTargets, releaseBaselines, schemaChanged } from "./release-targets.mjs";
 import { buildInfo } from "./release-probe.mjs";
 
@@ -32,6 +32,56 @@ function childReason(argv, error) {
   } catch {}
   return `${name} ${how}${fields}`;
 }
+// The files verify-matrix.mjs requires before a browser check runs, in its
+// order (a drift test pins the list). All are gitignored, so provisioning
+// them never dirties the deployer's checkout.
+export const MATRIX_PREREQUISITES = ["node_modules/.package-lock.json", "wasm/tailserve.wasm", ".build/test.wasm", ".build/speech-fixture.wav", ".build/go-modules.txt"];
+export const missingPrerequisites = cwd => MATRIX_PREREQUISITES.filter(p => !existsSync(join(cwd, p)));
+const prerequisiteError = names => releaseError("Missing matrix prerequisites: " + names.join(", "));
+// Provisioning (tt deployment setup): npm ci when the install marker is
+// missing, then every other missing file is copied from the source checkout.
+// An existing file is never overwritten.
+export function provisionPrerequisites(cwd, {from, run = (argv, dir) => execFileSync(argv[0], argv.slice(1), {cwd: dir, stdio: "ignore", timeout: 900000})} = {}) {
+  let source;
+  try { source = isAbsolute(from) && statSync(from).isDirectory() ? realpathSync(from) : null; } catch { source = null; }
+  if (!source || source === realpathSync(cwd)) throw releaseError("Prerequisite source must be another absolute checkout");
+  const [marker] = MATRIX_PREREQUISITES, actions = new Map(), missing = [];
+  if (!existsSync(join(cwd, marker))) {
+    try { run(["npm", "ci"], cwd); } catch { throw releaseError("Prerequisite install failed: npm ci"); }
+    if (existsSync(join(cwd, marker))) actions.set(marker, "installed");
+  }
+  for (const p of MATRIX_PREREQUISITES) {
+    if (actions.has(p)) continue;
+    const target = join(cwd, p);
+    if (existsSync(target)) { actions.set(p, "present"); continue; }
+    if (p === marker || !existsSync(join(source, p))) { missing.push(p); continue; }
+    mkdirSync(dirname(target), {recursive: true});
+    copyFileSync(join(source, p), target, constants.COPYFILE_EXCL);
+    actions.set(p, "copied");
+  }
+  if (missing.length) throw prerequisiteError(missing);
+  if (git(cwd, "status", "--porcelain")) throw releaseError("Prerequisite provisioning changed the checkout");
+  return {version: 1, prerequisites: MATRIX_PREREQUISITES.map(p => ({path: p, sha256: fileDigest(join(cwd, p)), action: actions.get(p)}))};
+}
+// The in-release run is bounded by the plan's own limits: every check's
+// timeout times its attempts, plus the test-binary build allowance. The
+// per-check timers inside verify-matrix remain the real limit.
+export const MATRIX_BUILD_ALLOWANCE_MS = 1800000;
+export function matrixRunTimeout(plan) {
+  const attempts = plan?.maxAttempts ?? 1;
+  if (!Array.isArray(plan?.checks) || !plan.checks.length) throw releaseError("Matrix plan has no checks");
+  if (!Number.isSafeInteger(attempts) || attempts < 1) throw releaseError("Invalid matrix attempt limit");
+  return plan.checks.reduce((total, check) => {
+    const raw = check?.environment?.VERIFICATION_TIMEOUT_MS, ms = Number(raw);
+    if (typeof raw !== "string" || !/^[1-9][0-9]*$/.test(raw) || !Number.isSafeInteger(ms) || ms > 1800000) throw releaseError("Invalid matrix check timeout");
+    return total + ms * attempts;
+  }, MATRIX_BUILD_ALLOWANCE_MS);
+}
+// Other verifiers run the matrix alone, so the in-release run waits for them.
+// Anchored at the node program: agent processes whose prompt merely quotes
+// "node scripts/verify-matrix.mjs run" must not count. Only the count is used.
+export const MATRIX_RUN_PATTERN = "^[^ ]*node[^ ]* ([^ ]*/)?scripts/verify-matrix\\.mjs (run|targeted) ";
+export const MATRIX_HOST_WAIT_MS = 7200000;
 const sha = s => /^[a-f0-9]{40}$/.test(s || "");
 const git = (cwd,...argv) => execFileSync("git",argv,{cwd,encoding:"utf8",stdio:["ignore","pipe","pipe"]}).trim();
 export function integrateCandidate(cwd, job, branch="tasks-hub") {
@@ -157,7 +207,11 @@ export async function runRelease(config, adapter) {
     checkpoint();await fence();
     const integration=["waiting_matrix","waiting_inputs"].includes(state.phase)?{expected:state.expected,integrated:state.integrated}:integrateCandidate(cwd,job);state.integrated=integration.integrated;state.expected=integration.expected;state.phase="integrated";checkpoint();
     if(integration.integrated!==job.commit){
-      await fence();if(await adapter.verifyIntegrated({...job,integratedCommit:integration.integrated})!==true){state.phase="waiting_matrix";checkpoint();return {jobId:job.id,outcome:"waiting_matrix"};}
+      // Saved before the matrix runs, so a runner stopped during a long run
+      // resumes this job instead of leaving an ambiguous journal.
+      state.phase="waiting_matrix";checkpoint();
+      await fence();if(await adapter.verifyIntegrated({...job,integratedCommit:integration.integrated})!==true)return {jobId:job.id,outcome:"waiting_matrix"};
+      state.phase="integrated";checkpoint();
     }
     if(adapter.verifyInputs && !await adapter.verifyInputs(integration.integrated)){state.phase="waiting_inputs";checkpoint();return {jobId:job.id,outcome:"waiting_inputs"};}
     await fence();publishIntegration(cwd,integration.integrated,integration.expected);state.published=true;checkpoint();
@@ -216,7 +270,7 @@ export async function runRelease(config, adapter) {
     // An uncertain side effect cannot be replayed. Rollback uses only retained
     // target artifacts; the adapter must never restore an old live database.
     if(!state.published && state.effects.length===0){
-      state.phase="refusing";checkpoint();await adapter.refuse();state.phase="refused";checkpoint();await adapter.escalate({jobId:job.id,outcome:"refused"});throw new Error("Release refused before publication");
+      state.phase="refusing";state.refusalReason=failureReason(error);checkpoint();await adapter.refuse();state.phase="refused";checkpoint();await adapter.escalate({jobId:job.id,outcome:"refused",reason:state.refusalReason});throw new Error("Release refused before publication");
     }
     let blocked=state.effects.length===0;
     // Newest effect first, except that a paired hub is restored before its
@@ -262,10 +316,10 @@ export async function runRelease(config, adapter) {
 // handler-produced preflight files. Probe/rollback programs are pinned host
 // programs, never commands received from Board text.
 export class HostAdapter {
-  constructor(config,job){this.config=config;this.job=job;this.artifacts=new Map();this.serial=0;}
-  command(argv,cwd=this.config.cwd){
+  constructor(config,job){this.config=config;this.job=job;this.artifacts=new Map();this.serial=0;this.now=()=>Date.now();}
+  command(argv,cwd=this.config.cwd,{timeout=600000}={}){
     if(!Array.isArray(argv)||!argv.length||argv.some(a=>typeof a!=="string"||/[\0\r\n]/.test(a)))throw new Error("Invalid host operation argv");
-    try{return execFileSync(argv[0],argv.slice(1),{cwd,encoding:"utf8",stdio:["ignore","pipe","pipe"],maxBuffer:8*1024*1024,timeout:600000});}
+    try{return execFileSync(argv[0],argv.slice(1),{cwd,encoding:"utf8",stdio:["ignore","pipe","pipe"],maxBuffer:8*1024*1024,timeout});}
     catch(error){const failed=new Error("Host operation failed");failed.releaseReason=childReason(argv,error);throw failed;}
   }
   native(operation,extra=[],expectedGeneration=this.job.generation){
@@ -290,11 +344,34 @@ export class HostAdapter {
     const dir=join(this.config.journalDirectory,job.id+"-integrated-verification");mkdirSync(dir,{recursive:true,mode:0o700});
     const contextPath=join(dir,"context.json"),planPath=join(dir,"plan.json"),receiptPath=join(dir,"receipt.json");
     if(!existsSync(receiptPath)){
+      const missing=missingPrerequisites(this.config.cwd);if(missing.length)throw prerequisiteError(missing);
+      if(!this.matrixHostFree(dir))return false;
       save(contextPath,{...job.plan,commit:job.integratedCommit,verifierAgentId:this.job.agentId,verifierRunId:this.job.runId});
       this.command(["node","scripts/verify-matrix.mjs","plan",contextPath,planPath]);
-      this.command(["node","scripts/verify-matrix.mjs","run",planPath,dir]);
+      const timeout=matrixRunTimeout(JSON.parse(readFileSync(planPath,"utf8")));
+      this.command(["node","scripts/verify-matrix.mjs","run",planPath,dir],this.config.cwd,{timeout});
     }
+    // A receipt left by a run that outlived its runner is imported only when eligible.
+    if(!receiptEligible(JSON.parse(readFileSync(receiptPath,"utf8"))))throw releaseError("Integrated matrix receipt is not eligible");
     this.command([this.config.tt||"tt","send","--kind","request","--to",this.handler(),"--subject","Import verification for the integrated release commit","--ask",`Import release verification plan and receipt for job ${job.id} integrated commit ${job.integratedCommit} through tt deployment verification --plan-file and --file. Preserve exact job generation and inspect logs; release publication waits for saved import.`,"--request-id",`${job.id}-integrated-matrix-${job.integratedCommit}`,"--ref",`release-job=${job.id}`,"--ref",`integrated-commit=${job.integratedCommit}`,"--attachment",planPath,"--attachment",receiptPath]);
+    return false;
+  }
+  // Count only: no process's argv, environment, files or output is read, and
+  // nothing is signalled. pgrep exits 1 when no process matches.
+  matrixRunsActive(exec=execFileSync){
+    let out;try{out=exec("pgrep",["-f",MATRIX_RUN_PATTERN],{encoding:"utf8",stdio:["ignore","pipe","ignore"],timeout:5000});}
+    catch(error){if(error?.status===1)return 0;throw releaseError("Matrix host probe unavailable");}
+    return String(out).split("\n").filter(l=>/^[0-9]+$/.test(l.trim())).length;
+  }
+  // While another matrix run is active the job keeps waiting_matrix and the
+  // daemon's next poll retries; the first busy time bounds the wait.
+  matrixHostFree(dir){
+    const path=join(dir,"host-wait.json"),bound=this.config.matrixHostWaitMs??MATRIX_HOST_WAIT_MS;
+    if(!Number.isSafeInteger(bound)||bound<=0)throw releaseError("Invalid matrix host wait");
+    if(this.matrixRunsActive()===0){rmSync(path,{force:true});return true;}
+    let since;try{since=JSON.parse(readFileSync(path,"utf8")).since;}catch{}
+    if(!Number.isSafeInteger(since)){since=this.now();save(path,{since});}
+    if(this.now()-since>=bound)throw releaseError("Host busy with another verify-matrix run");
     return false;
   }
   async verifyInputs(commit){
@@ -433,6 +510,10 @@ export class HostAdapter {
   async block(){this.native("block");}
   async refuse(){this.native("refuse");}
   async escalate(details={}){
+    if(details.outcome==="refused"){
+      const reason=typeof details.reason==="string"&&REASON.test(details.reason)?details.reason:"unclassified";
+      return this.command([this.config.tt||"tt","send","--kind","notice","--subject","Release refused before publication","--text",`Release ${this.job.id} was refused before publication; nothing was published or deployed. Reason: ${reason}. Handler reconciliation required.`,"--request-id",`${this.job.id}-release-failure`,"--ref",`release-job=${this.job.id}`]);
+    }
     if(details.push==="failed")return this.command([this.config.tt||"tt","send","--kind","notice","--subject","Release is live but the tasks-hub push failed","--text",`Release ${this.job.id} is live and verified, but the fast-forward push of tasks-hub to origin failed. Live targets were not rolled back; inspect the remote and push tasks-hub by hand.`,"--request-id",`${this.job.id}-push-failure`,"--ref",`release-job=${this.job.id}`]);
     return this.command([this.config.tt||"tt","send","--kind","notice","--subject","Release failed and requires recovery","--text",`Release failed for ${this.job.id}; inspect the private host journal. Automatic rollback attempted once; handler reconciliation required.${details.revert==="failed"?" The tasks-hub revert failed, so the rolled-back change is still on tasks-hub.":""}${details.rollbackBlocked===true&&details.revert==="committed"?" tasks-hub was reverted, but at least one target could not be rolled back and still runs the released code; roll it back by hand before the next release.":""}`,"--request-id",`${this.job.id}-release-failure`,"--ref",`release-job=${this.job.id}`]);
   }
@@ -497,7 +578,13 @@ export async function serveDeployment(config,{once=false,signal,configPath,relea
     await new Promise(r=>setTimeout(r,30000));
   }
 }
-if(process.argv[1] && resolve(process.argv[1])===fileURLToPath(import.meta.url)){
+if(process.argv[1] && resolve(process.argv[1])===fileURLToPath(import.meta.url) && process.argv.includes("--provision-prerequisites")){
+  // tt deployment setup runs this in the deployer's checkout. Only the tagged
+  // reason is printed on failure.
+  const index=process.argv.indexOf("--from");
+  try{process.stdout.write(JSON.stringify(provisionPrerequisites(process.cwd(),{from:index<0?undefined:process.argv[index+1]}))+"\n");}
+  catch(error){process.stderr.write(failureReason(error)+"\n");process.exitCode=1;}
+}else if(process.argv[1] && resolve(process.argv[1])===fileURLToPath(import.meta.url)){
   const index=process.argv.indexOf("--config");
   try{
     if(index<0)throw new Error("Private config required");

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/json"
 	"errors"
@@ -9,6 +10,7 @@ import (
 	"github.com/scs32/tailterm/hub/internal/api"
 	"os"
 	"os/exec"
+	"strings"
 	"time"
 )
 
@@ -34,7 +36,7 @@ func cmdDeployment(e env, args []string) error {
 		return nil
 	}
 	if args[0] == "setup" {
-		return cmdSpawn(e, append([]string{"--role", api.AgentRoleDeployment}, args[1:]...))
+		return deploymentSetup(e, args[1:])
 	}
 	fs := flag.NewFlagSet("deployment "+args[0], flag.ContinueOnError)
 	entry := fs.String("entry", "", "accepted queue entry (handler enqueue)")
@@ -133,6 +135,71 @@ func cmdDeployment(e env, args []string) error {
 		printJSON(out)
 	}
 	return err
+}
+
+// Seams for tests: provisioning runs the checkout's own runner, and setup
+// spawns the role only after provisioning succeeded.
+var (
+	provisionDeploymentPrerequisites = provisionPrerequisites
+	spawnDeploymentAgent             = cmdSpawn
+)
+
+// deploymentSetup provisions the matrix prerequisites the runner needs to
+// verify an integrated commit in the deployer's checkout (--cwd), copying
+// them from --prerequisites-from, before it spawns the role. Nothing is
+// spawned when either flag is missing or provisioning fails.
+func deploymentSetup(e env, args []string) error {
+	var source, checkout string
+	rest := make([]string, 0, len(args))
+	for i := 0; i < len(args); i++ {
+		name, value, inline := strings.Cut(args[i], "=")
+		switch strings.TrimLeft(name, "-") {
+		case "prerequisites-from", "cwd":
+			if !strings.HasPrefix(name, "-") {
+				break
+			}
+			if !inline {
+				if i+1 >= len(args) {
+					return fmt.Errorf("%s needs a value", name)
+				}
+				i++
+				value = args[i]
+			}
+			if strings.TrimLeft(name, "-") == "cwd" {
+				checkout = value
+				rest = append(rest, "--cwd", value)
+			} else {
+				source = value
+			}
+			continue
+		}
+		rest = append(rest, args[i])
+	}
+	if checkout == "" || source == "" {
+		return errors.New("usage: tt deployment setup --cwd DEPLOYER_CHECKOUT --prerequisites-from SOURCE_CHECKOUT [spawn flags]")
+	}
+	if err := provisionDeploymentPrerequisites(checkout, source); err != nil {
+		return err
+	}
+	return spawnDeploymentAgent(e, append([]string{"--role", api.AgentRoleDeployment}, rest...))
+}
+
+// provisionPrerequisites runs the checkout's release runner, which prints the
+// provisioned files as JSON, or only a named reason on failure.
+func provisionPrerequisites(checkout, source string) error {
+	cmd := exec.Command("node", "scripts/release-runner.mjs", "--provision-prerequisites", "--from", source)
+	cmd.Dir = checkout
+	var stderr bytes.Buffer
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		lines := strings.Split(strings.TrimSpace(stderr.String()), "\n")
+		if reason := strings.TrimSpace(lines[len(lines)-1]); reason != "" {
+			return fmt.Errorf("deployment prerequisites: %s", reason)
+		}
+		return fmt.Errorf("deployment prerequisites: %w", err)
+	}
+	return nil
 }
 
 // supersedeAncestry proves the job's accepted commit shipped by hand: it is
