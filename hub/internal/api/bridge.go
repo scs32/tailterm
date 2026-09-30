@@ -45,4 +45,7 @@ var BridgeRoutes = map[string]bool{
 	"GET /v1/tasks/{id}/delegation-windows":              true,
 	"POST /v1/tasks/{id}/delegation-windows":             true,
 	"POST /v1/tasks/{id}/delegation-windows/{wid}/close": true,
+	// Create only: /bug and /feature file an owner item; the bridge can
+	// never update, dispatch or queue one.
+	"POST /v1/tasks/{id}/work-items": true,
 }

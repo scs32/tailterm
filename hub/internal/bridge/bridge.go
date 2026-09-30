@@ -140,6 +140,10 @@ var Commands = []discord.Command{
 		{Type: discord.OptionString, Name: "reason", Description: "Why (the delegate is told)"}}},
 	{Name: "delegate-end", Description: "End the open delegation window now; open requests return to you", Options: []discord.CommandOption{
 		{Type: discord.OptionString, Name: "reason", Description: "Why (optional)"}}},
+	{Name: "bug", Description: "File a bug in this project", Options: []discord.CommandOption{
+		{Type: discord.OptionString, Name: "text", Description: "Title on the first line or first sentence, then the details", Required: true}}},
+	{Name: "feature", Description: "File a feature request in this project", Options: []discord.CommandOption{
+		{Type: discord.OptionString, Name: "text", Description: "Title on the first line or first sentence, then the details", Required: true}}},
 }
 
 // Run starts every loop and blocks until ctx ends or the Gateway fails for

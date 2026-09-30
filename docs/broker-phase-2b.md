@@ -95,6 +95,11 @@ In scope:
     - `/say [agent] text` posts a human message.
     - `/reassign obligation agent` reassigns.
 
+    Added later (wi_88d921fdf8ab454e): `/bug text` and `/feature text` post an owner intake
+    message and file an open work item of that kind from it, keyed by the interaction ID.
+    For them the bridge credential gains one route, `POST /v1/tasks/{id}/work-items`
+    (create only, never as an agent); updating, dispatching and queueing stay 403.
+
 Out of scope:
 
 - `/extend`, `/answer`, `/cancel`, `/resume`, `/pause` and `/unpause` (phase 3).

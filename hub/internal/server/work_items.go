@@ -158,6 +158,10 @@ func (s *Server) createWorkItem(w http.ResponseWriter, r *http.Request) {
 	if !decode(w, r, &req) {
 		return
 	}
+	if caller.Node == api.BridgeNode && req.AgentID != "" {
+		writeError(w, http.StatusBadRequest, "the bridge files work items only for the owner, never as an agent")
+		return
+	}
 	item, err := s.store.CreateWorkItem(r.Context(), task, req, caller)
 	if err != nil {
 		fail(w, err)

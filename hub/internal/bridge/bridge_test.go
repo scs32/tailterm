@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -42,6 +43,12 @@ type harness struct {
 	lead    api.Agent
 	builder api.Agent
 	channel string
+
+	// hubFail answers one route ("METHOD path-suffix") 503, once or always.
+	hubFail atomic.Pointer[hubFault]
+	// hubPosts records the path of every POST the hub received.
+	hubMu    sync.Mutex
+	hubPosts []string
 }
 
 func newHarness(t *testing.T) *harness {
@@ -58,9 +65,24 @@ func newHarness(t *testing.T) *harness {
 	}
 	hubHandler := server.New(h.st, identity)
 	hubSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == "POST" {
+			h.hubMu.Lock()
+			h.hubPosts = append(h.hubPosts, r.URL.Path)
+			h.hubMu.Unlock()
+		}
 		if h.hubDown.Load() {
 			http.Error(w, "down", http.StatusServiceUnavailable)
 			return
+		}
+		if f := h.hubFail.Load(); f != nil {
+			method, suffix, _ := strings.Cut(f.Route, " ")
+			if r.Method == method && strings.HasSuffix(r.URL.Path, suffix) {
+				if f.Once {
+					h.hubFail.CompareAndSwap(f, nil)
+				}
+				http.Error(w, "unavailable", http.StatusServiceUnavailable)
+				return
+			}
 		}
 		hubHandler.ServeHTTP(w, r)
 	}))
@@ -92,6 +114,11 @@ func newHarness(t *testing.T) *harness {
 	}
 	h.channel = m.ChannelID
 	return h
+}
+
+type hubFault struct {
+	Route string // "METHOD path-suffix", such as "POST /work-items"
+	Once  bool
 }
 
 func (h *harness) agent(name string) api.Agent {

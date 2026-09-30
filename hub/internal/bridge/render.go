@@ -196,9 +196,18 @@ func (b *Bridge) tailosLink(m api.Message) string {
 		return ""
 	}
 	if len(m.WorkItems) > 0 {
-		return fmt.Sprintf("%s/#feature-history/%s/%s", base, m.WorkItems[0].ItemTaskID, m.WorkItems[0].ItemID)
+		return b.itemLink(m.WorkItems[0].ItemTaskID, m.WorkItems[0].ItemID)
 	}
 	return base + "/"
+}
+
+// itemLink is a work item's history page in TailOS, or "" without a TailOS URL.
+func (b *Bridge) itemLink(taskID, itemID string) string {
+	base := strings.TrimRight(b.cfg.TailOSURL, "/")
+	if base == "" {
+		return ""
+	}
+	return fmt.Sprintf("%s/#feature-history/%s/%s", base, taskID, itemID)
 }
 
 // typedBody drops the first line (it is the header) and the To line.

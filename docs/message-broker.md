@@ -262,6 +262,8 @@ All of these are deterministic hub operations with request IDs. None is an LLM a
 | `/answer <obligation> <text>` | Owner closes a question or block on the agent's behalf |
 | `/cancel <obligation> [reason]` | Terminal cancellation with provenance |
 | `/say [agent] <text>` or plain message | Owner `human` message (creates obligation if directed) |
+| `/bug <text>` | Owner intake message, then an open bug filed from it; replies with the item ID and TailOS link. Only filed, never queued |
+| `/feature <text>` | Same as `/bug` for a feature |
 | `/pause`, `/unpause` | Existing project pause lifecycle |
 
 Only allowlisted Discord user IDs can issue commands, and only in the mapped

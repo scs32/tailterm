@@ -114,10 +114,17 @@ func TestBridgeTokenIsRouteLimited(t *testing.T) {
 			t.Errorf("bridge %s %s = %d, want 200", ok.method, ok.path, code)
 		}
 	}
+	// Filing an item (/bug, /feature) reaches the handler, which refuses an
+	// empty body; nothing else about work items is open to the bridge.
+	if code, _ := h.do(bridgeToken, "POST", base+"/work-items", map[string]any{}, nil); code != http.StatusBadRequest {
+		t.Errorf("bridge POST work-items with an empty body = %d, want 400", code)
+	}
+	item := base + "/work-items/wi_0123456789abcdef"
 	for _, denied := range []struct{ method, path string }{
 		{"POST", "/v1/tasks"}, {"PATCH", base}, {"DELETE", base}, {"POST", base + "/pause"},
 		{"POST", base + "/agents"}, {"PATCH", base + "/agents/" + builder.ID}, {"DELETE", base + "/agents/" + builder.ID},
-		{"POST", base + "/messages/read"}, {"POST", base + "/work-items"}, {"GET", base + "/queue"},
+		{"POST", base + "/messages/read"}, {"GET", base + "/queue"},
+		{"PATCH", item}, {"POST", item + "/dispatch"}, {"POST", item + "/updates"},
 		{"POST", base + "/decisions"}, {"GET", "/v1/nonexistent"},
 	} {
 		if code, _ := h.do(bridgeToken, denied.method, denied.path, map[string]any{}, nil); code != http.StatusForbidden {
@@ -140,6 +147,50 @@ func TestBridgeTokenIsRouteLimited(t *testing.T) {
 	}
 	if _, err := TokenIdentities(map[string]api.Caller{"short": {}}); err == nil {
 		t.Error("a short token was accepted")
+	}
+}
+
+// wi_88d921fdf8ab454e: the bridge files work items only for the owner, never
+// as an agent; the owner token keeps filing for an agent.
+func TestBridgeCannotFileAsAnAgent(t *testing.T) {
+	h := newTokenHub(t)
+	task, _, _ := h.project()
+	path := "/v1/tasks/" + task.ID + "/work-items"
+	agents, err := h.st.ListAgents(context.Background(), task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var lead api.Agent
+	for _, a := range agents {
+		if a.Name == "lead" {
+			lead = a
+		}
+	}
+	if lead.ID == "" {
+		t.Fatalf("no lead in %+v", agents)
+	}
+	count := func() int {
+		list, err := h.st.ListWorkItems(context.Background(), task.ID, "", "", 0, 100)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return len(list.Items)
+	}
+	req := api.CreateWorkItemRequest{Kind: "bug", Title: "Login button is dead", AgentID: lead.ID, RequestID: "bridge-as-agent"}
+	if code, _ := h.do(bridgeToken, "POST", path, req, nil); code != http.StatusBadRequest {
+		t.Errorf("bridge create as an agent = %d, want 400", code)
+	}
+	if n := count(); n != 0 {
+		t.Fatalf("a refused bridge create left %d items", n)
+	}
+	var item api.WorkItem
+	req.AgentID, req.RequestID = "", "bridge-for-owner"
+	if code, _ := h.do(bridgeToken, "POST", path, req, &item); code != http.StatusCreated || item.CreatedBy.Node != api.BridgeNode || item.CreatedBy.User != "owner" || item.CreatedBy.AgentID != "" {
+		t.Fatalf("bridge create for the owner = %d %+v, want 201 by the bridge", code, item.CreatedBy)
+	}
+	req.AgentID, req.RequestID = lead.ID, "owner-for-agent"
+	if code, _ := h.do(ownerToken, "POST", path, req, &item); code != http.StatusCreated || item.CreatedBy.AgentID != lead.ID {
+		t.Fatalf("owner create for an agent = %d %+v, want 201", code, item.CreatedBy)
 	}
 }
 

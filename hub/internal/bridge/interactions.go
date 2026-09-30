@@ -10,6 +10,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/scs32/tailterm/hub/internal/api"
 	"github.com/scs32/tailterm/hub/internal/discord"
@@ -74,7 +76,7 @@ func (b *Bridge) runInteraction(ctx context.Context, m Mapping, in discord.Inter
 		return
 	}
 	flags := discord.FlagEphemeral
-	if in.Type == discord.InteractionCommand && in.Data.Name == "say" {
+	if in.Type == discord.InteractionCommand && (in.Data.Name == "say" || in.Data.Name == "bug" || in.Data.Name == "feature") {
 		flags = 0
 	}
 	// Defer first: hub calls can take longer than Discord's 3-second limit.
@@ -132,6 +134,8 @@ func (b *Bridge) act(ctx context.Context, taskID string, in discord.Interaction)
 			return b.delegate(ctx, taskID, in, option("agent"), option("until"), option("scope"), option("reason"))
 		case "delegate-end":
 			return b.delegateEnd(ctx, taskID, in, option("reason"))
+		case "bug", "feature":
+			return b.fileItem(ctx, taskID, in, in.Data.Name, option("text"))
 		}
 		return ephemeral("Unknown command.")
 	}
@@ -559,4 +563,108 @@ func (b *Bridge) delegateEnd(ctx context.Context, taskID string, in discord.Inte
 		return ephemeral("✅ Ended the delegation window to %s; %d open requests are yours again.", out.Window.DelegateName, returned)
 	}
 	return ephemeral("No delegation window is open in this project.")
+}
+
+// ---- Filing work items (wi_88d921fdf8ab454e) ----
+
+// maxTitleRunes is the hub's work item title limit (api.ValidTaskName).
+const maxTitleRunes = 120
+
+// fileItem posts the owner's text as an intake message, then files a work
+// item of kind "bug" or "feature" sourced from it. Both calls use the
+// interaction ID as their request ID, so a retried interaction returns the
+// same message and item. The item is only filed, never dispatched or queued.
+func (b *Bridge) fileItem(ctx context.Context, taskID string, in discord.Interaction, kind, text string) reply {
+	text = strings.TrimSpace(strings.ReplaceAll(text, "\r\n", "\n"))
+	title, description := splitTitle(text)
+	if title == "" || !api.ValidTaskName(title) {
+		return ephemeral("Describe the %s: /%s <title>. <details>. Nothing was filed.", kind, kind)
+	}
+	requestID := "discord-interaction-" + in.ID
+	m, err := b.cfg.Hub.PostMessage(ctx, taskID, api.PostMessageRequest{
+		Text:      fmt.Sprintf("Owner intake from Discord (/%s): %s", kind, text),
+		RequestID: requestID,
+		Source:    &api.MessageSource{Kind: api.SourceDiscord, ID: in.ID, UserID: in.UserID()},
+	})
+	if err != nil {
+		b.logf("discord bridge: /%s intake for interaction %s: %v", kind, in.ID, err)
+		return ephemeral("⛔ Tailterm refused this %s: %s. Nothing was filed.", kind, hubMessage(err))
+	}
+	item, err := b.cfg.Hub.CreateWorkItem(ctx, taskID, api.CreateWorkItemRequest{
+		Kind: kind, Title: title, Description: description, SourceMessageSeq: m.Seq, RequestID: requestID,
+	})
+	if err != nil {
+		b.logf("discord bridge: /%s item for interaction %s (intake #%d): %v", kind, in.ID, m.Seq, err)
+		return ephemeral("⚠️ Your text was saved as board message #%d, but Tailterm refused the %s: %s. No item was filed; run /%s again or file it in TailOS.", m.Seq, kind, hubMessage(err), kind)
+	}
+	icon := "🐞"
+	if kind == "feature" {
+		icon = "✨"
+	}
+	lines := []string{truncate(fmt.Sprintf("%s Filed %s **%s**: %s", icon, kind, item.ID, clean(item.Title)), contentLimit-400)}
+	if link := b.itemLink(taskID, item.ID); link != "" {
+		lines = append(lines, link)
+	}
+	lines = append(lines, marker(m.Seq, 1, 1, ""))
+	return reply{Public: true, Content: strings.Join(lines, "\n")}
+}
+
+// splitTitle takes the title from the first line, or else the first
+// sentence (ended by ".", "?" or "!" and whitespace; a closing "." is
+// dropped), and the rest as the description. Control characters become
+// spaces in the title. A title too long for the hub is cut at a word and the
+// description keeps the full text, so nothing is lost. An empty title means
+// there is nothing to file.
+//
+// A known limitation: an abbreviation such as "e.g. foo" ends the first
+// sentence early; the full text is still in the intake message.
+func splitTitle(text string) (title, description string) {
+	text = strings.TrimSpace(strings.ReplaceAll(text, "\r\n", "\n"))
+	if text == "" {
+		return "", ""
+	}
+	if first, rest, ok := strings.Cut(text, "\n"); ok {
+		title, description = strings.TrimSpace(first), strings.TrimSpace(rest)
+	} else {
+		title = text
+		runes := []rune(text)
+		for i, r := range runes {
+			if (r == '.' || r == '?' || r == '!') && i+1 < len(runes) && unicode.IsSpace(runes[i+1]) {
+				title = strings.TrimSuffix(string(runes[:i+1]), ".")
+				description = strings.TrimSpace(string(runes[i+1:]))
+				break
+			}
+		}
+	}
+	title = titleText(title)
+	if title == "" {
+		// Nothing usable before the split (". x", a line of control
+		// characters): the whole text is the title.
+		title, description = titleText(text), text
+		if title == "" {
+			return "", ""
+		}
+	}
+	if utf8.RuneCountInString(title) > maxTitleRunes {
+		runes := []rune(title)
+		cut := maxTitleRunes - 1
+		for i := maxTitleRunes - 1; i > 0; i-- {
+			if runes[i] == ' ' {
+				cut = i
+				break
+			}
+		}
+		title, description = string(runes[:cut])+"…", text
+	}
+	return title, description
+}
+
+// titleText turns control characters into spaces and collapses whitespace.
+func titleText(s string) string {
+	return clean(strings.Map(func(r rune) rune {
+		if r < 0x20 || r == 0x7f {
+			return ' '
+		}
+		return r
+	}, s))
 }
