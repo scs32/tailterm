@@ -49,6 +49,10 @@ the bookkeeping path cannot edit item fields.
 
 Agent tmux sessions keep a fixed 200x50 window whatever attaches to them (bug `wi_b6b79229c8fec99d`, order #14836). `tt spawn` sets the session's `default-size` and its window's `window-size manual` in the same tmux command that creates it. The relay restores that policy on older Tailterm sessions. TailOS also attaches agent tiles with `-f ignore-size` and never sizes a hidden tile, but the manual window size is what protects agents. Global tmux options are not required or changed. Details are in [claude-wake.md](claude-wake.md).
 
+What a launch host needs (tmux, `tt`, runtimes and logins, hooks, the relay) is
+listed in [host-requirements.md](host-requirements.md); `tt doctor --role agent`
+checks a machine against it read-only.
+
 ## Project team queue
 
 On the launch host, the owner can save a sequence of recorded item orders:

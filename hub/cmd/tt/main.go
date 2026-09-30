@@ -179,7 +179,7 @@ func main() {
 	case "bind":
 		err = cmdBind(e, args)
 	case "doctor":
-		err = cmdDoctor(e)
+		err = cmdDoctorRole(e, args)
 	case "brief":
 		err = cmdBrief(e)
 	case "status":
