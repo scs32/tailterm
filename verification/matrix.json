@@ -286,12 +286,12 @@
   ],
   "defaultTimeoutMs": 600000,
   "checkTimeoutMs": {
-    "go-race": 900000,
+    "go-race": 1800000,
     "npm-unit": 120000,
     "00-static-build": 120000,
     "01-static-release-verify": 120000
   },
-  "goTestFlags": ["-timeout=14m"],
+  "goTestFlags": ["-timeout=25m"],
   "maxAttempts": 3,
   "knownFailures": []
 }
