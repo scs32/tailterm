@@ -280,7 +280,12 @@ test("Planned delivery reviews a feature plan once before the builder and skips 
   assert.match(lead, /Bug: assign builder from the plan directly/);
   assert.match(lead, /Plan and plan review use REQUEST, never ASSIGN \(it freezes a1…aN\) or REVIEW/);
   assert.match(planner, /plan-review blockers, send one revised RESULT that maps each blocker ID/);
-  assert.match(reviewer, /Send lead exactly one RESULT\. Its outcome is pass, or numbered plan blockers p1…pN/);
+  // A RESULT envelope accepts only outcome done or partial (hub/internal/api/envelope.go).
+  assert.match(reviewer, /Answer each REQUEST with one RESULT to lead using --outcome done; a RESULT outcome is done or partial, never pass\./);
+  assert.match(reviewer, /The text gives the verdict: pass, or numbered plan blockers p1…pN/);
+  assert.match(reviewer, /--status for each planned criterion a1…aN .* at least one --evidence entry/);
+  assert.match(reviewer, /one focused check of your blocker IDs only, answered by its own RESULT/);
+  assert.doesNotMatch(reviewer, /exactly one RESULT|outcome is pass/);
   assert.match(reviewer, /missing acceptance coverage, wrong file ownership, unsafe step or unverifiable step/);
   assert.match(reviewer, /its reason, and evidence/);
   assert.match(reviewer, /never review code/);

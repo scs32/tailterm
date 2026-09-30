@@ -390,11 +390,13 @@ five without it. A context without an item kind is refused, so refresh it
 before launch.
 
 For a feature, the lead sends the planner's plan to the plan reviewer in a
-REQUEST before any builder ASSIGN. The plan reviewer returns one RESULT: pass,
-or numbered blockers p1…pN (missing acceptance coverage, wrong file ownership,
-unsafe step or unverifiable step), each with its reason and evidence. The
-planner gets one revision round; the lead may ask for one focused check of those
-blocker IDs, then decides. There is no plan-review loop. Plan and plan review
+REQUEST before any builder ASSIGN. The plan reviewer answers each REQUEST with
+one RESULT whose outcome is `done` (a RESULT outcome is `done` or `partial`,
+never `pass`). Its text gives the verdict: pass, or numbered blockers p1…pN
+(missing acceptance coverage, wrong file ownership, unsafe step or unverifiable
+step), each with its reason and evidence. The planner gets one revision round;
+the lead may send one focused-check REQUEST for those blocker IDs, answered by
+its own RESULT, then decides. There is no plan-review loop. Plan and plan review
 use REQUEST, never ASSIGN or REVIEW: an ASSIGN freezes the acceptance criteria,
 and plan review is not a code-review round. For a bug, the lead assigns the
 builder from the plan directly.
@@ -403,8 +405,15 @@ The Projects Delivery panel shows **Plan review team** or **Plan-only team**
 once a queued team's launch is frozen; a queued entry without a launch shows
 neither. A TailOS team saved before this rule has no plan-reviewer seat and
 launches five members for either kind; re-add Planned delivery from the example
-to get it. Retrying a launch journal frozen before the change keeps its saved
-members.
+to get it. TailOS launch recovery and a queued entry's frozen `launch_json`
+keep their saved members. `tt team launch` does not: a retry of a CLI journal
+frozen before the change is refused, because its member count or fields differ
+from the current plan ("saved launch journal conflicts with current item or
+plan" or "saved launch fields differ from the current template"). Do not delete
+the journal to force a launch. Reconcile it like any stopped manual launch:
+close and clean up any registered members, then `tt team queue abandon --item
+--order` to release the reservation, and queue the still-active item with
+`tt team queue add` for a fresh team (see the manual launch section above).
 
 Owner decision #11866 places mandatory verification at new item-team admission.
 The admission transaction saves an immutable exact agent/run enrollment marker;

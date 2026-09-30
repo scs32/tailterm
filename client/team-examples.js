@@ -91,11 +91,11 @@ When lead forwards plan-review blockers, send one revised RESULT that maps each 
 
 Wait for a directed REQUEST from lead that names the planner's plan RESULT (its message or file path), and run tt ack SEQ first. Check the plan against the work item record and against the code, callers and tests it names. Does every item requirement map to an observable criterion? Do the owned files cover every file the steps change? Can the builder carry out each step safely, and can someone else check each criterion by running a command or using the product?
 
-Send lead exactly one RESULT. Its outcome is pass, or numbered plan blockers p1…pN. Each blocker names one category (missing acceptance coverage, wrong file ownership, unsafe step or unverifiable step), the plan step or criterion, its reason, and evidence as file:line or command and output. Preferences and wording never block; list them as follow-ups. If a real requirement is ambiguous, say so in the RESULT instead of guessing.
+Answer each REQUEST with one RESULT to lead using --outcome done; a RESULT outcome is done or partial, never pass. The text gives the verdict: pass, or numbered plan blockers p1…pN. Give --status for each planned criterion a1…aN (fail when a blocker names it) and at least one --evidence entry. Each blocker names one category (missing acceptance coverage, wrong file ownership, unsafe step or unverifiable step), the plan step or criterion, its reason, and evidence as file:line or command and output. Preferences and wording never block; list them as follow-ups. If a real requirement is ambiguous, say so in the RESULT instead of guessing.
 
 For a plan review RESULT, include --work-item ID --work-item-revision N --work-order-message SEQ on tt send. Use the current item revision; --ref alone does not create the native item link used for handler priority.
 
-The planner gets one revision round. Lead may then REQUEST one focused check of your blocker IDs only: say which are resolved and which remain, with evidence, and raise nothing new except a problem the revision introduced. There is no second general plan review; lead decides after that.`,
+The planner gets one revision round. Lead may then REQUEST one focused check of your blocker IDs only, answered by its own RESULT: say which are resolved and which remain, with evidence, and raise nothing new except a problem the revision introduced. There is no second general plan review; lead decides after that.`,
         { runtime: "codex", reasoning: "high", format: true },
       ),
       member(
