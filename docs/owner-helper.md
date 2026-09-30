@@ -153,6 +153,36 @@ owner-only commands there refuse, and `tt post` there is authored as the helper.
 A second pane also stops wake-ups. Keep one pane in that session; re-registering
 from another session moves the tags.
 
+## Queue chores: product vs owner helper
+
+Feature `wi_de078c0ecd9c846b` (order #14809) moved the recurring queue chores the
+owner session did by hand on 2026-09-28/29 (#14646–#14798) into the product. See
+[team launch](team-launch.md#queue-chores-the-product-handles) for the details.
+
+| Chore the helper did by hand | Now |
+|---|---|
+| Scoping each queued entry with `tt team queue scope --owns …` (5+ times) | Automatic: the handler records `--owns` at `tt work-items scope confirm`, and `tt team queue add` takes it. An entry with no ownership must be `--serial`. |
+| Narrowing a finished team's coarse ownership so queued work could start | Automatic: the runner narrows an accepted entry to the files its candidate changed. |
+| Freeing a released item's slot, handler lease and ownership while post-release checks kept it open, which needed item dismissal or owner team-close surgery | Supported command: `tt team queue integrated --entry E --commit SHA`. The item, its team and its records stay; the runner closes, cleans and finishes the entry once the item is terminal. |
+| Noticing that queued work was stuck behind a failed, dead or idle entry, or a missing handler, and working out the fix | Automatic: the queue list explains the stall and its fix command, and the runner posts one Board NOTICE per stall. |
+| Answering owner escalations for obligations blocked on a fix that was already queued | Automatic: the broker holds the owner escalation while the fix is queued, launching or running. |
+| Scanning the backlog for duplicates, already-released items and stale items | Supported command: `tt work-items triage [--release-record FILE]` lists suggestions only; nothing changes until the owner confirms. |
+
+Still the owner session's:
+
+- owner decisions, and relaying the owner's words verbatim;
+- diagnosis of unexpected behavior, and judgment calls the product cannot make;
+- releases, until the deployment agent (`wi_93629e4ce61658cb`) is activated,
+  including running `tt team queue integrated` for a candidate the owner
+  released;
+- verification matrix approvals (never delegated);
+- disk cleanup, until closeout cleanup (`wi_b39698a5238560d3`) ships;
+- confirming or rejecting triage suggestions.
+
+After `integrated` an entry no longer protects its files. A fix found by the
+post-release checks is filed as a new item and queued; the still-live team does
+not make it.
+
 ## Limits and accounting
 
 - The helper counts toward the project's open-agent cap (`MaxAgents`, 32) and the

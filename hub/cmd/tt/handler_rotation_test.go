@@ -818,15 +818,27 @@ func TestHandlerRotationRunnerNoSpecCurrentTemplateIsNotDue(t *testing.T) {
 	}
 }
 
-// The queue handler briefing tells the handler to scope an unscoped queued
-// entry in a parallel project. The briefing is part of the handler template
-// digest, so this release rotates handlers where prompt-change rotation is on.
-func TestQueueHandlerBriefingScopesUnscopedEntries(t *testing.T) {
-	if !strings.Contains(queueHandlerAcceptanceBriefing(), "tt team queue scope --task TASK --entry ENTRY --owns PATH") {
-		t.Fatal("queue handler briefing lacks the scoping instruction")
+// a10 (c5): the queue handler briefing records ownership at scope
+// confirmation, saves a plain done for an owner-integrated entry, mentions
+// triage, and no longer asks the handler to scope unscoped entries by hand.
+// The briefing is part of the handler template digest, so this release makes
+// handlers with prompt-change rotation due for a template rotation.
+func TestQueueHandlerBriefingIntakeOwnershipAndPlainDone(t *testing.T) {
+	briefing := queueHandlerAcceptanceBriefing()
+	for _, want := range []string{
+		"`tt work-items scope confirm ... --owns PATH`",
+		"If the item's entry shows an owner integration (`tt team queue list`: `owner-integrated`), save done with a plain `tt work-items update … --status done`; do not pass `--worktree`, `--branch` or `--commit`, and no leased run is required.",
+		"tt work-items triage --project TASK",
+	} {
+		if !strings.Contains(briefing, want) {
+			t.Fatalf("queue handler briefing lacks %q", want)
+		}
 	}
-	const before = "1a50d74558964f3f03cb5a67d76fb11abee6700d677e482f5f3d22fb2394b025" // 66fd525
-	const current = "4556752233b1d6c05364c7b689d2485781534d3411a2493738e467619a70d0bf"
+	if strings.Contains(briefing, "an unscoped queued entry waits until nothing else runs") {
+		t.Fatal("queue handler briefing still asks for hand scoping")
+	}
+	const before = "4556752233b1d6c05364c7b689d2485781534d3411a2493738e467619a70d0bf" // c6a8ec1
+	const current = "6c6a04d9ad079693a01253aad7f9bb0ce1e6738f95e0a329b59e3283d20a93d9"
 	if got := handlerTemplateDigest("handler assignment"); got != current || got == before {
 		t.Fatalf("handler template digest %s, want %s", got, current)
 	}

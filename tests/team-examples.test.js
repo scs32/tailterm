@@ -242,3 +242,9 @@ test("Planned delivery verifies alongside review and verifies exactly what merge
   for (const member of planned.members)
     assert.ok(Buffer.byteLength(member.prompt) < 8192, member.name);
 });
+
+test("Planned delivery lead narrows the queue entry once the plan freezes", () => {
+  const lead = exampleTeam("planned").members.find((m) => m.name === "lead");
+  assert.match(lead.prompt, /Once the plan freezes, narrow the queue entry to its owned files: tt team queue scope --entry ENTRY --owns PATH \(repeat\); widening may wait\./);
+  assert.doesNotMatch(lead.prompt, /Scope a queued item with/);
+});

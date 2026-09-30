@@ -41,7 +41,7 @@ Commands
   prompt-policy <get|set>      runtime prompt policy per prompt kind (set: owner)
   deployment <list|enqueue|claim|check|verification|merged|finish|block>  release ledger
   verification <plan|receipt|history|enrollment>  handler-owned native verification records
-  work-items <command>         list/get/create/update/dispatch/history/evidence for bugs and features
+  work-items <command>         list/get/create/update/dispatch/history/evidence/triage for bugs and features
   queue <command>              list/get/history/changes/action/receipt for deliberate Queue work
   usage [--item ID] [--project ID] [--from TIME] [--to TIME] [--json]  token/cost ledger
   agents [--json]              list agents on this task
@@ -98,7 +98,7 @@ Commands
   new-project --name N [--goal G] create a project (new-task is an alias)
   team launch --item ID --order SEQ [--template planned] [--dry-run]
                                launch an item-bound Planned delivery team locally
-  team queue add|list|policy|limit|scope|fail|accept|replace-lead|remove|reorder|release|abandon
+  team queue add|list|policy|limit|scope|fail|accept|integrated|replace-lead|remove|reorder|release|abandon
                                manage a project's durable delivery queue
 `
 

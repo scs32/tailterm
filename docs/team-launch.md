@@ -7,9 +7,17 @@ order. If the item already states the ordered acceptance and owned files, the
 handler confirms that exact item revision, scope revision and order:
 
 ```sh
-tt work-items scope confirm --project tsk_... --revision 2 --scope-revision 2 --order 123 --request-id intake-123 --complete wi_...
+tt work-items scope confirm --project tsk_... --revision 2 --scope-revision 2 --order 123 --request-id intake-123 --complete --owns hub/internal/store --owns docs/team-launch.md wi_...
 tt work-items scope get --project tsk_... --revision 2 --order 123 wi_...
 ```
+
+`--owns` (repeatable) records the repository-relative files and directories the
+plan or intake says the item will change. The hub saves them canonically with
+the confirmation and returns them from `scope get`; they are part of the retry
+identity, so a retry with different paths is refused. `tt team queue add`
+without `--owns` then takes exactly these paths, so nobody scopes the entry by
+hand. `--owns` is optional for older handlers; without it the add needs its own
+`--owns` or `--serial`.
 
 The handler runs these commands from its own agent session. The `--complete`
 flag is its explicit semantic assertion; the hub checks the handler's exact
@@ -49,10 +57,13 @@ On the launch host, the owner can save a sequence of recorded item orders:
 tt team queue add --task tsk_... --item wi_... --order 123 --template planned
 tt team queue add --task tsk_... --item wi_... --order 124 --cwd /absolute/worktree --owns client --owns hub/internal/store
 tt team queue add --task tsk_... --item wi_... --order 125 --new-worktree --owns docs/team-launch.md
+tt team queue add --task tsk_... --item wi_... --order 126   # ownership from the handler's scope confirmation
+tt team queue add --task tsk_... --item wi_... --order 127 --serial   # declares nothing; runs alone
 tt team queue policy --task tsk_... --policy-version 1 --expires RFC3339 --sessions N --polling N --bindings N --requests-per-minute N --burst N --headroom-percent N [--min-free-disk-mib N]
 tt team queue limit --task tsk_... --limit none   # or --limit N; --limit 1 is serial
 tt team queue scope --task tsk_... --entry tqe_... --owns client/team-delivery-view.js --owns tests/parallel-team-browser.mjs
-tt team queue fail --task tsk_... --entry tqe_... --reason 'owner integrated abc1234'
+tt team queue fail --task tsk_... --entry tqe_... --reason 'stuck launch'
+tt team queue integrated --task tsk_... --entry tqe_... --commit FULL_SHA [--evidence 'release record']
 tt team queue list --task tsk_...
 tt team queue replace-lead --task tsk_... --entry tqe_... --lead-agent agt_...
 tt team queue accept --task tsk_... --entry tqe_... --worktree /absolute/builder/worktree --branch feature/name --commit FULL_SHA --evidence 'handler-saved acceptance receipt'  # recovery only
@@ -120,7 +131,14 @@ ownership checks apply unchanged. It checks ownership first, refuses an existing
 failure before the hub saves the entry, so the add can be retried. `--new-worktree` does the
 same in a serial project; `--no-new-worktree` keeps the current checkout.
 `--owns` accepts repository relative files and directories; an ancestor directory overlaps its descendants,
-while sibling directories do not. Missing ownership conflicts with every item.
+while sibling directories do not. An entry either declares ownership or is
+serial: in a parallel project an add with no `--owns`, no ownership in the
+handler's scope confirmation and no `--serial` is refused before any worktree
+is created, and the hub refuses an unscoped add that is not serial. A serial
+project's unscoped adds are serial implicitly, so they behave as before. A
+serial entry conflicts with every other team; `list` shows it as
+`owns=serial (runs alone)`, and an entry saved before serial existed as
+`owns=unscoped (legacy)`.
 The queue command rejects traversal, absolute or dot segments, symlink paths,
 and case aliases. It records the shared repository identity and starting commit
 across worktrees. `list` and the Projects Delivery panel show ownership,
@@ -128,8 +146,10 @@ blockers, item lead, handler, and limit. When slots are available, the
 runner takes queued items in order and skips one blocked by active ownership
 before trying the next. It keeps distinct worktree and handler leases. A
 queued entry's reason names the first real limit it waits for: slots, host
-capacity or disk, `No free database handler`, or `Unscoped: declare ownership
-to run beside other teams`.
+capacity or disk, `No free database handler`, `Serial: runs alone once the
+active teams finish`, or, for a legacy entry, `Unscoped: declare ownership to
+run beside other teams`. When the wait is a stall, the reason starts with
+`Stalled:` (see below).
 
 `scope` replaces an entry's declared ownership with a non-empty canonical
 list and increments its revision; a retried request returns the saved result.
@@ -139,8 +159,11 @@ entry, and the leased handler or the item's current lead may scope its own
 launching or running entry; the hub checks the exact agent and run like
 `accept`. An admitted entry may narrow its paths, but widening into another
 active entry's paths is refused with `ownership overlaps active entry tqe_…`.
-The planned lead declares its frozen ownership this way, and the handler
-scopes an unscoped queued entry from its item and intake before launch.
+The planned lead narrows its entry to the plan's owned files once the plan
+freezes, and the handler records intake ownership with `scope confirm --owns`.
+Scoping a serial entry makes it an ordinary scoped entry. The owner may also
+scope a failed entry that still holds its slot, but only to narrow it: every
+new path must lie under a path it already holds.
 
 The hub stores queue state and retry receipts. The supervised Mini relay checks
 the queue on each tick, including when no Codex thread is bound. It records a
@@ -199,10 +222,11 @@ host, under the same launch lock and checks as `release`, once every run bound
 to its item is closed and cleaned; it checks the roster first, so an entry
 that cannot be released costs no hub write. The failure and escalation stay.
 Until then its list reason counts the item-bound runs still live or uncleaned.
-A serial queue still halts until the owner reconciles. For an entry the owner
-integrated outside the queue, or one otherwise stuck, `fail --entry --reason`
-(owner only, unbound CLI) fails a queued, launching or running entry with the
-owner escalation; after its team is closed, the release follows.
+A serial queue still halts until the owner reconciles. For an entry that is
+otherwise stuck, `fail --entry --reason` (owner only, unbound CLI) fails a
+queued, launching or running entry with the owner escalation; after its team is
+closed, the release follows. For an entry whose candidate the owner integrated
+or released outside the queue, use `integrated` instead (next section).
 
 After inspecting a failed entry, use `release --entry` to clear its reservation
 and let the next queued item run. The failed entry and escalation remain in
@@ -254,6 +278,86 @@ The command launches on the host where it runs. It does not select remote saved
 servers or read an encrypted browser profile. Tests use local test hubs, isolated
 home directories and private tmux sockets. This feature does not merge, deploy
 or release the source.
+
+## Queue chores the product handles
+
+**Narrowing after acceptance.** Once the handler's acceptance is saved on a
+running entry, the runner narrows the entry's ownership, in one `scope` write,
+to the files the candidate changed that lie under its declared ownership (a
+serial entry keeps them all). It uses the merge-base diff
+`git diff --name-only <acceptance base>...<commit>`, so a branch is charged only
+with its own files even when the base moved on. Queued work that overlapped only
+unchanged files can then start while the team closes. A Git error or an empty
+result is logged and skipped; it never fails the entry.
+
+**Owner integration.** `tt team queue integrated --entry E --commit SHA
+[--evidence TEXT]` records that the owner integrated or released the entry's
+candidate. It runs from an unbound CLI only. The CLI checks that the commit is
+in the entry's repository and descends from its base, and lists the files it
+changed (merge-base diff, under the entry's ownership). The hub accepts a
+running entry or a failed entry that still holds its slot, and in one
+transaction saves the owner-integration record, sets the entry's ownership to
+the changed files, marks it released and deletes its launch reservation. The
+entry's slot, handler lease and ownership are free at once: queued work that
+overlapped it claims on the next tick. The item, its revision, its bound
+members and its lead stay as they are, so post-release checks continue and
+`role:database_handler` messages linked to the item still reach the handler
+that served it. `list` shows the entry as `(owner-integrated)` with the commit.
+It is refused for queued, launching, finished or already released entries, for
+agent sessions, for a failed entry with an uncertain spawn (use `release`), and
+while a release job for the entry is `verified`, `claimed`, `merged` or
+`blocked`: the deployment path owns that candidate.
+
+After it, the handler saves the item done with a plain
+`tt work-items update … --status done`; a save that carries
+`--worktree/--branch/--commit` is refused and names the integration, and no
+leased run is needed. Once the item is terminal the runner closes the team (or
+uses the lead's own `tt close --team` receipt), cleans up every member on the
+host and marks the entry `finished`, running or failed, with `releasedAt` and
+`ownerIntegration` kept and no integration snapshot. After `integrated` the
+entry no longer protects its files, so a post-release fix is filed as a new
+item and queued, not made by the still-live team. In a serial project
+`integrated` records the integration and frees the reservation and ownership,
+but the next serial launch still waits for the project lead slot, which frees
+at the lead's team close once the item is terminal.
+
+**Stalls.** The queue list explains a queued entry that waits only on
+something nothing will clear by itself. Its `stall` field names the cause, the
+blocking entry, the supported fix command and since when it has held (a
+durable time from saved records, so a hub restart does not reset it), and its
+reason starts with `Stalled:`. Causes:
+
+| Cause | Blocker |
+|---|---|
+| `failed-entry` | a failed entry that still holds its slot; in a parallel project only while its item still has live runs (with none, the runner releases it) |
+| `nothing-running` | a launching or running entry with no live item-bound run for the 5-minute grace |
+| `idle-entry` | a running entry whose live members are all idle, silent-finished or done, with no open work held or sent by them, for 30 minutes |
+| `no-handler` | no online, non-retired database handler exists |
+| `serial-halted` | a failed entry halts a serial queue |
+
+A stall also covers slots or handler leases that are full only because stall
+blockers hold them. Waiting on a working team (an ownership overlap, full slots
+or every handler leased), host capacity or disk is ordinary queueing, never a
+stall. After a stall has held for five minutes, the runner posts one Board
+NOTICE from `team_queue/runner` naming the queued entry, its item, the blocker,
+the cause and the fix. It has no recipient, no escalation ref and no
+obligation. The hub recomputes the stall and refuses a stale or cleared one;
+one notice covers every entry behind the same blocker, and retries, later ticks
+and restarts add none. A new blocker revision may post once more if the stall
+persists.
+
+**Blocks on a queued fix.** The broker does not escalate to the owner an
+obligation that is blocked on work already in the queue; see
+[message-broker.md](message-broker.md).
+
+**Rollback.** The hub adds three columns (`team_queue_entries.serial`,
+`team_queue_entries.owner_integration_json`,
+`work_order_scope_confirmations.ownership_json`); existing rows read as not
+serial, with no owner integration and no intake ownership. An older hub
+ignores the new columns. It counts an owner-integrated
+running entry as active again (more conservative) and ignores an
+owner-integrated failed entry, which stays failed and released until the new
+hub returns. Unscoped parallel adds become possible again under the old hub.
 
 ## Independent verification
 
