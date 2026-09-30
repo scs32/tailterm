@@ -337,6 +337,14 @@ only for intentional temporary retention of the same item context. The
 orchestrator and active database handler stay available while the project remains
 open.
 
+**Owner helper.** The owner's own Claude Code session can join a project as its one
+`owner_helper` agent with `tt helper register --task T`, so it can be a delegation
+window delegate and be woken like other Claude agents. It is never leased to a queue
+entry, counted as a team member or handler, or closed with an item team, and the
+relay never stops, resizes or rebinds its session; when that session is not running
+it shows offline, not stuck. It counts toward the open-agent cap. See
+[owner helper](owner-helper.md).
+
 **Allow agents to add other agents** controls agent-originated extra-helper
 launches specifically; it does not gate a genuine regular team member bound to
 a work item (see below).

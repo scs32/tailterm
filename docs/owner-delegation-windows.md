@@ -64,6 +64,11 @@ The owner request stays an owner obligation: the owner can still answer it first
 it is never reassigned to an agent, and its overdue escalation still reaches the
 owner.
 
+**The owner's own session as delegate.** Register it as the project's owner helper
+(`tt helper register --task T`, see [owner helper](owner-helper.md)) and open a window
+with `--delegate owner-helper`. It answers through `eval "$(tt helper env --task T)"`
+followed by the commands below; matrix approvals still stay with the owner.
+
 ## Answering as the delegate
 
 ```sh

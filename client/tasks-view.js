@@ -29,6 +29,19 @@ const STATUS_DOT = {
   done: "done",
 };
 
+// Roster labels. The owner helper is the owner's own Claude Code session
+// (docs/owner-helper.md): when it is not running it is offline, not stuck.
+export function rosterRole(a) {
+  if (a.role === "database_handler") return " · Database handler";
+  if (a.role === "owner_helper") return " · Owner helper";
+  return "";
+}
+
+export function rosterActivity(a) {
+  if (a.role === "owner_helper" && !a.online) return "Offline";
+  return activityLabel(a.activity);
+}
+
 export function createTasksView({
   client,
   taskHub,
@@ -333,7 +346,7 @@ export function createTasksView({
         .filter((a) => a.status !== "closed")
         .map(
           (a) =>
-            `<button class="board-agent" data-task-agent="${esc(a.id)}" title="${esc((a.blockedText || a.host + " · " + a.session) + " · " + activityDetail(a.activity))}"><span class="status-dot ${STATUS_DOT[a.status] || ""}"></span><span>${esc(a.name)}${a.role === "database_handler" ? " · Database handler" : ""}</span><span class="fine">${esc(agentState(a))} · ${esc(activityLabel(a.activity))} · ${esc(a.host)}</span></button>`,
+            `<button class="board-agent" data-task-agent="${esc(a.id)}" title="${esc((a.blockedText || a.host + " · " + a.session) + " · " + activityDetail(a.activity))}"><span class="status-dot ${STATUS_DOT[a.status] || ""}"></span><span>${esc(a.name)}${esc(rosterRole(a))}</span><span class="fine">${esc(agentState(a))} · ${esc(rosterActivity(a))} · ${esc(a.host)}</span></button>`,
         )
         .join(
           "",
