@@ -21,7 +21,9 @@ func (s *Server) releaseAction(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req api.ReleaseRequest
-	if !decodeScope(w, r, &req) {
+	// A verification import carries the full plan and receipt, like an item's
+	// verification save: a 72-check integrated receipt is about 106 KB.
+	if !decodeScopeLimited(w, r, &req, api.MaxVerificationBody) {
 		return
 	}
 	if req.Operation == "handler" {
