@@ -390,6 +390,7 @@ const RUNNER=new URL("../scripts/release-runner.mjs",import.meta.url).pathname;
 const ignorePrerequisites=cwd=>writeFileSync(join(cwd,".git/info/exclude"),"node_modules/\n.build/\nwasm/*.wasm\n");
 function placePrerequisites(dir,skip=[]){for(const p of MATRIX_PREREQUISITES.filter(p=>!skip.includes(p))){mkdirSync(join(dir,dirname(p)),{recursive:true});writeFileSync(join(dir,p),"fixture "+p);}}
 const workedPlan={maxAttempts:3,checks:[{id:"go-race",environment:{VERIFICATION_TIMEOUT_MS:"1800000"}},{id:"npm-unit",environment:{VERIFICATION_TIMEOUT_MS:"120000"}}]};
+const attemptDir=(home,commit,n)=>join(home,"rel_fixture-integrated-verification",`${commit}-r${n}`);
 function matrixHost({plan=workedPlan,receipt={environment:{},checks:[{exitCode:0}]}}={}){
  const f=fixture(),home=mkdtempSync(join(tmpdir(),"matrix-host-"));ignorePrerequisites(f.cwd);placePrerequisites(f.cwd);
  const adapter=new HostAdapter({cwd:f.cwd,journalDirectory:home},{id:"rel_fixture",agentId:"agt_fixture",runId:"run_fixture",generation:1});
@@ -497,7 +498,7 @@ test("p2 the host probe counts only real node matrix runs",async()=>{
 });
 test("p2 the integrated run waits for other matrix runs and refuses by name after the bound",async()=>{
  const h=matrixHost();let busy=1,now=1000;h.adapter.matrixRunsActive=()=>busy;h.adapter.now=()=>now;
- const wait=join(h.home,"rel_fixture-integrated-verification","host-wait.json");
+ const wait=join(attemptDir(h.home,h.integrated.integratedCommit,0),"host-wait.json");
  assert.equal(await h.adapter.verifyIntegrated(h.integrated),false);assert.equal(h.matrix().length,0);assert.equal(h.sends().length,0);
  assert.deepEqual(JSON.parse(readFileSync(wait,"utf8")),{since:1000});assert.equal(statSync(wait).mode&0o777,0o600);
  now+=MATRIX_HOST_WAIT_MS-1;assert.equal(await h.adapter.verifyIntegrated(h.integrated),false);assert.equal(h.matrix().length,0);
@@ -519,4 +520,29 @@ test("p2 the journal is waiting_matrix during the integrated run, so a stopped r
  a.verifyIntegrated=async x=>{integratedCommits.push(x.integratedCommit);return true;};a.merged=async()=>{phaseAtMerge=JSON.parse(readFileSync(c.journalPath,"utf8")).phase;a.calls.push("merged");};
  const receipt=await runRelease(c,a);assert.equal(receipt.outcome,"released");assert.deepEqual(integratedCommits,[saved.integrated]);assert.equal(receipt.commit,saved.integrated);
  assert.equal(phaseAtMerge,"integrated","a verified run leaves waiting_matrix before publication");
+});
+test("p2 a requeued job starts a fresh host wait, and a busy refusal leaves no wait record",async()=>{
+ const h=matrixHost();let now=10*MATRIX_HOST_WAIT_MS;h.adapter.now=()=>now;h.adapter.matrixRunsActive=()=>1;
+ const first=attemptDir(h.home,h.integrated.integratedCommit,0),requeued={...h.integrated,reconciliations:[{disposition:"requeue"}]};
+ mkdirSync(first,{recursive:true});writeFileSync(join(first,"host-wait.json"),JSON.stringify({since:now-3*3600000}));
+ assert.equal(await h.adapter.verifyIntegrated(requeued),false,"a leftover start does not refuse the requeued job's first busy probe");
+ assert.deepEqual(JSON.parse(readFileSync(join(attemptDir(h.home,h.integrated.integratedCommit,1),"host-wait.json"),"utf8")),{since:now});
+ await assert.rejects(h.adapter.verifyIntegrated(h.integrated),e=>failureReason(e)==="Host busy with another verify-matrix run");
+ assert.ok(!existsSync(join(first,"host-wait.json")),"the refusal removes its wait record");
+ assert.equal(await h.adapter.verifyIntegrated(h.integrated),false,"a later probe starts a fresh wait");assert.equal(h.matrix().length,0);
+});
+test("p2 a requeue never reuses an earlier attempt's receipt, for the same or a new integrated commit",async()=>{
+ const receipt={environment:{},checks:[{exitCode:1}]},h=matrixHost({receipt}),old=h.integrated.integratedCommit,moved="d".repeat(40);
+ await assert.rejects(h.adapter.verifyIntegrated(h.integrated),e=>failureReason(e)==="Integrated matrix receipt is not eligible");
+ await assert.rejects(h.adapter.verifyIntegrated(h.integrated),/not eligible/);assert.equal(h.matrix().filter(c=>c.argv[2]==="run").length,1,"the same attempt does not rerun");
+ receipt.checks=[{exitCode:0}];h.calls.length=0;
+ assert.equal(await h.adapter.verifyIntegrated({...h.integrated,reconciliations:[{}]}),false);
+ assert.deepEqual(h.matrix().map(c=>c.argv[2]),["plan","run"],"a requeue of the same commit reruns");
+ assert.ok(h.sends()[0].argv.includes(join(attemptDir(h.home,old,1),"receipt.json")));
+ h.calls.length=0;
+ assert.equal(await h.adapter.verifyIntegrated({...h.integrated,integratedCommit:moved,reconciliations:[{},{}]}),false);
+ assert.deepEqual(h.matrix().map(c=>c.argv[2]),["plan","run"],"a new integrated commit reruns");
+ const send=h.sends()[0].argv;assert.ok(send.includes(`integrated-commit=${moved}`));assert.ok(send.includes(join(attemptDir(h.home,moved,2),"receipt.json")));
+ assert.equal(JSON.parse(readFileSync(join(attemptDir(h.home,moved,2),"context.json"),"utf8")).commit,moved);
+ await assert.rejects(h.adapter.verifyIntegrated({...h.integrated,integratedCommit:"../escape"}),/Exact integrated commit/);
 });

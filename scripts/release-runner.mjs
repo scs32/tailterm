@@ -341,7 +341,11 @@ export class HostAdapter {
     // satisfied by deployer self-certification or a candidate-SHA receipt.
     const current=JSON.parse(this.command([this.config.tt||"tt","deployment","list"])).find(j=>j.id===job.id);
     if(current?.integratedCommit===job.integratedCommit && current.integratedVerification?.commit===job.integratedCommit){this.job=current;return true;}
-    const dir=join(this.config.journalDirectory,job.id+"-integrated-verification");mkdirSync(dir,{recursive:true,mode:0o700});
+    // One directory per integrated commit and requeue attempt: a handler
+    // requeue (a new reconciliation) never reuses an earlier attempt's host
+    // wait or receipt, while a runner resumed within an attempt does.
+    if(!sha(job.integratedCommit))throw new Error("Exact integrated commit required");
+    const dir=join(this.config.journalDirectory,job.id+"-integrated-verification",`${job.integratedCommit}-r${job.reconciliations?.length||0}`);mkdirSync(dir,{recursive:true,mode:0o700});
     const contextPath=join(dir,"context.json"),planPath=join(dir,"plan.json"),receiptPath=join(dir,"receipt.json");
     if(!existsSync(receiptPath)){
       const missing=missingPrerequisites(this.config.cwd);if(missing.length)throw prerequisiteError(missing);
@@ -371,7 +375,7 @@ export class HostAdapter {
     if(this.matrixRunsActive()===0){rmSync(path,{force:true});return true;}
     let since;try{since=JSON.parse(readFileSync(path,"utf8")).since;}catch{}
     if(!Number.isSafeInteger(since)){since=this.now();save(path,{since});}
-    if(this.now()-since>=bound)throw releaseError("Host busy with another verify-matrix run");
+    if(this.now()-since>=bound){rmSync(path,{force:true});throw releaseError("Host busy with another verify-matrix run");}
     return false;
   }
   async verifyInputs(commit){

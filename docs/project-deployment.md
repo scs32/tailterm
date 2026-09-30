@@ -213,11 +213,15 @@ handler. Three things make that run succeed or fail for a named reason
   environment, files or output is read, and nothing is signalled. While busy the
   job stays `waiting_matrix`, no plan, run or import request is made, and the
   next poll (about 30 seconds) retries. The first busy time is kept in
-  `ID-integrated-verification/host-wait.json`; after 2 hours (private config key
-  `matrixHostWaitMs`) the job is refused. The probe narrows, but does not close,
+  `host-wait.json` in the attempt directory (below); after 2 hours (private
+  config key `matrixHostWaitMs`) the job is refused and the record removed. The probe narrows, but does not close,
   the race with a verifier starting at the same moment; the matrix still refuses
   an occupied port.
 
+The context, plan, receipt, logs and host wait live in
+`journalDirectory/ID-integrated-verification/COMMIT-rN`, keyed by the integrated
+commit and the job's reconciliation count, so a handler requeue starts a fresh
+wait and a fresh run instead of reusing an earlier attempt's receipt.
 The journal is saved as `waiting_matrix` before the run starts and returns to
 `integrated` once the imported receipt is found, so a runner stopped during a
 long run resumes the same job (its host lock still needs the usual inspection).
