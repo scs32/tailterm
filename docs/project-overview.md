@@ -97,6 +97,15 @@ The deployed frontend uses `npm run build:static` instead.
   workers across two columns on the right, stacking the fourth/fifth agents
   beneath the second/third. Later workers extend those columns. Manual divider
   resizing, swaps and guest layouts are retained; narrow screens still stack.
+- A group holds at most eight panes (Appearance → Panes per group: 4–16).
+  Further panes continue in an adjacent "‹group› (continued)", then
+  "(continued 2)" group with the same project binding, hub mirror and restore.
+  A closed pane frees its slot; the next pane fills the earliest part with room,
+  the orchestrator stays in the first part and empty parts disappear. Dropping
+  onto a full group offers Send to the continuation or Make room; a group and its
+  continuations reorder together. Lowering the limit moves extra panes on;
+  raising it never merges parts. Plain groups over the limit continue the same
+  way, and a plain part left with one pane becomes an ordinary tab.
 - Closing or hiding a browser pane is distinct from terminating a remote session.
   Closing the page disconnects SSH but leaves ordinary remote tmux sessions alive.
 - Closing a task explicitly terminates its owned agent sessions. Guest sessions

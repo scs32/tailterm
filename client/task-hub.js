@@ -76,6 +76,16 @@ export function addTeamOrchestrator(task, agents, plan) {
   return lead;
 }
 
+// Unbinds a project from every one of its groups, "(continued)" parts included.
+export function unbindGroups(groups, taskId) {
+  for (const group of groups)
+    if (group.taskId === taskId) {
+      delete group.taskId;
+      delete group.guests;
+      delete group.part;
+    }
+}
+
 export function createTaskHub(host) {
   // host: {getIPN, getData, api, getTabs, getServers, currentTab, currentServer,
   //   connect, closeTab, activate, paneGroups, dialog, closeDialog, notice,
@@ -344,12 +354,7 @@ export function createTaskHub(host) {
     feeds.delete(taskId);
     bound.delete(taskId);
     cache.delete(taskId);
-    for (const group of host.paneGroups()?.model.groups || []) {
-      if (group.taskId === taskId) {
-        delete group.taskId;
-        delete group.guests;
-      }
-    }
+    unbindGroups(host.paneGroups()?.model.groups || [], taskId);
     for (const tab of host.getTabs()) {
       if (tab.task?.taskId !== taskId) continue;
       hidden.delete(tab.task.agentId);
@@ -513,13 +518,8 @@ export function createTaskHub(host) {
       host.clearAgentBookmark?.(feed.taskId, tab.task.agentId, tab.task.runId);
       host.closeTab(tab.id, { fromHub: true });
     }
-    if (feed.task?.status === "closed") {
-      const group = host.paneGroups()?.model.taskGroup(feed.taskId);
-      if (group) {
-        delete group.taskId;
-        delete group.guests;
-      }
-    }
+    if (feed.task?.status === "closed")
+      unbindGroups(host.paneGroups()?.model.groups || [], feed.taskId);
     const probe = sessionProbe();
     for (const { agent, server } of r.open) {
       if (feed.stopped) return;
@@ -667,13 +667,14 @@ export function createTaskHub(host) {
   }
 
   // Put a pane into the project's tab, or make its own tab carry the project.
+  // A full project tab never prompts: the pane joins the earliest part with room.
   function place(taskId, tab) {
     const groups = host.paneGroups();
     groups.sync();
     const target = groups.model.taskGroup(taskId);
     const own = groups.model.group(tab.id);
-    if (target && own !== target) {
-      groups.merge(tab.id, target.active, false);
+    if (target && own?.taskId !== taskId) {
+      groups.send(tab.id, target.active, false);
     } else if (!target && own) own.taskId = taskId;
     groups.sync();
     host.render();
@@ -690,8 +691,7 @@ export function createTaskHub(host) {
     const group = groups.model.group(tabId);
     if (!group?.taskId) return;
     const taskId = group.taskId;
-    delete group.taskId;
-    delete group.guests;
+    unbindGroups(groups.model.groups, taskId);
     if (!groups.model.groups.some((g) => g.taskId === taskId)) {
       bound.delete(taskId);
       feeds.get(taskId)?.stop();

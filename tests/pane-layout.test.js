@@ -449,3 +449,323 @@ test("directional placement supports left and below", () => {
   assert.equal(model.group("d"), model.group("b"));
   assert.equal(relation(model.group("b").tree, "d", "b"), "x");
 });
+
+// Continued groups: a group holds at most model.limit panes (default 8).
+const project = (count, { limit, lead = "p1", taskId = "task" } = {}) => {
+  const model = new PaneGroups();
+  if (limit) model.limit = limit;
+  const ids = [];
+  const add = (id) => {
+    ids.push(id);
+    model.sync(
+      ids,
+      () => taskId,
+      (x) => x,
+    );
+    model.setTaskOrchestrator(taskId, lead);
+    model.isolateTasks(
+      () => taskId,
+      (x) => x,
+    );
+  };
+  for (let i = 1; i <= count; i++) add(`p${i}`);
+  const close = (id) => {
+    ids.splice(ids.indexOf(id), 1);
+    model.sync(
+      ids,
+      () => taskId,
+      (x) => x,
+    );
+    model.isolateTasks(
+      () => taskId,
+      (x) => x,
+    );
+  };
+  const parts = () =>
+    model.series(model.taskGroup(taskId)).map((g) => leaves(g.tree).sort());
+  return { model, ids, add, close, parts };
+};
+const sorted = (...ids) => ids.sort();
+const range = (from, to) =>
+  sorted(...Array.from({ length: to - from + 1 }, (_, i) => `p${from + i}`));
+
+test("pane cap rules: limits, suffixes, cascade, arrival and series reorder", async () => {
+  const cap = await import("../client/pane-cap.js");
+  assert.equal(cap.normalizePaneLimit(undefined), 8);
+  assert.equal(cap.normalizePaneLimit("12"), 12);
+  assert.equal(cap.normalizePaneLimit(7), 8);
+  assert.equal(cap.normalizePaneLimit(100), 8);
+  assert.deepEqual(cap.PANE_LIMITS, [4, 6, 8, 10, 12, 16]);
+  assert.equal(cap.continuedSuffix(0), "");
+  assert.equal(cap.continuedSuffix(1), " (continued)");
+  assert.equal(cap.continuedSuffix(2), " (continued 2)");
+  assert.deepEqual(cap.cascade([[1, 2, 3, 4, 5], [6]], 2), [
+    [1, 2],
+    [3, 4],
+    [5, 6],
+  ]);
+  assert.equal(cap.arrivalPart([8, 5], 8), 1);
+  assert.equal(cap.arrivalPart([7, 5], 8, 1), 1);
+  assert.equal(cap.arrivalPart([7, 8], 8, 1), 0);
+  assert.equal(cap.arrivalPart([8, 8], 8), -1);
+  assert.deepEqual(leaves(cap.continuationTree(["a"])), ["a"]);
+  const tree = cap.continuationTree(["a", "b", "c", "d", "e"]);
+  assert.equal(tree.axis, "x");
+  assert.deepEqual(leaves(tree.a), ["a", "c", "e"]);
+  assert.deepEqual(leaves(tree.b), ["b", "d"]);
+  // Absent keys past the limit move on; fresh (just added) keys stay put.
+  const plan = cap.planTemplate({
+    template: [["a", "b", "x"], ["c"]],
+    live: [["a", "b"], ["c"]],
+    limit: 3,
+    added: ["y"],
+  });
+  assert.deepEqual(plan.parts, [
+    ["a", "b", "y"],
+    ["x", "c"],
+  ]);
+  assert.deepEqual(plan.liveIndex, [0, 1]);
+  const [a, p, pc, b] = ["A", "P", "Pc", "B"];
+  assert.deepEqual(cap.reorderSeries([a, p, pc, b], [p, pc], [b], true), [
+    a,
+    b,
+    p,
+    pc,
+  ]);
+  assert.equal(cap.reorderSeries([a, p, pc], [p, pc], [pc]), null);
+});
+
+test("a project continues past eight panes in arrival order with the orchestrator first", () => {
+  const twelve = project(12);
+  assert.deepEqual(twelve.parts(), [range(1, 8), range(9, 12)]);
+  const [first, second] = twelve.model.series(twelve.model.taskGroup("task"));
+  assert.equal(first.part, undefined);
+  assert.equal(second.part, 1);
+  assert.equal(second.taskId, "task", "continuations keep the project");
+  assert.equal(twelve.model.groups.length, 2);
+  const twenty = project(20);
+  assert.deepEqual(twenty.parts(), [range(1, 8), range(9, 16), range(17, 20)]);
+  assert.deepEqual(
+    twenty.model.series(twenty.model.taskGroup("task")).map((g) => g.part),
+    [undefined, 1, 2],
+  );
+  const saved = structuredClone(twenty.model.groups);
+  twenty.model.sync(
+    twenty.ids,
+    () => "task",
+    (x) => x,
+  );
+  twenty.model.isolateTasks(
+    () => "task",
+    (x) => x,
+  );
+  assert.deepEqual(twenty.model.groups, saved, "repeated sync is stable");
+  // The orchestrator arriving ninth still lands in the first part.
+  const late = project(12, { lead: "p9" });
+  assert.deepEqual(late.parts(), [
+    sorted(...range(1, 7), "p9"),
+    sorted("p8", ...range(10, 12)),
+  ]);
+  const lead = late.model.taskGroup("task");
+  assert.equal(
+    tileLayout(lead.tree, 1200, 800).panes.find((p) => p.id === "p9").height,
+    800,
+  );
+});
+
+test("the pane limit is a setting; lowering it cascades and raising never merges", () => {
+  const { model, ids, parts } = project(10, { limit: 4 });
+  assert.deepEqual(parts(), [range(1, 4), range(5, 8), range(9, 10)]);
+  model.limit = 8;
+  model.sync(
+    ids,
+    () => "task",
+    (x) => x,
+  );
+  model.isolateTasks(
+    () => "task",
+    (x) => x,
+  );
+  assert.deepEqual(parts(), [range(1, 4), range(5, 8), range(9, 10)]);
+  const standard = project(10);
+  standard.model.limit = 4;
+  standard.model.sync(
+    standard.ids,
+    () => "task",
+    (x) => x,
+  );
+  standard.model.isolateTasks(
+    () => "task",
+    (x) => x,
+  );
+  assert.deepEqual(standard.parts(), [range(1, 4), range(5, 8), range(9, 10)]);
+});
+
+test("closing frees a slot that the next pane fills, and empty parts disappear", () => {
+  const { model, add, close, parts } = project(20);
+  close("p3");
+  assert.deepEqual(parts(), [
+    sorted(...range(1, 8).filter((id) => id !== "p3")),
+    range(9, 16),
+    range(17, 20),
+  ]);
+  add("p21");
+  assert.deepEqual(
+    parts()[0],
+    sorted(...range(1, 8).filter((id) => id !== "p3"), "p21"),
+  );
+  assert.deepEqual(parts().slice(1), [range(9, 16), range(17, 20)]);
+  for (const id of ["p17", "p18", "p19", "p20"]) close(id);
+  assert.equal(parts().length, 2);
+  for (const id of range(9, 16)) close(id);
+  assert.equal(parts().length, 1);
+  const again = project(20);
+  for (const id of range(9, 16)) again.close(id);
+  const series = again.model.series(again.model.taskGroup("task"));
+  assert.deepEqual(
+    series.map((g) => g.part),
+    [undefined, 1],
+  );
+  assert.deepEqual(leaves(series[1].tree).sort(), range(17, 20));
+  assert.ok(model.groups.every((g) => g.taskId === "task"));
+});
+
+test("a manual project layout over the limit keeps its arrangement in the first part", () => {
+  const { model, ids, parts } = project(8);
+  model.customize("p1");
+  model.swap("p2", "p5");
+  const before = structuredClone(model.taskGroup("task").tree);
+  ids.push("p9", "p10");
+  model.sync(
+    ids,
+    () => "task",
+    (x) => x,
+  );
+  model.isolateTasks(
+    () => "task",
+    (x) => x,
+  );
+  assert.deepEqual(model.taskGroup("task").tree, before);
+  assert.deepEqual(parts()[1], range(9, 10));
+  assert.equal(model.series(model.taskGroup("task"))[1].taskLayout, "manual");
+});
+
+test("moves respect the cap: send, make room, own-project parts and other projects", () => {
+  const owner = (id) =>
+    id.startsWith("q") ? "other" : id.startsWith("p") ? "task" : undefined;
+  const { model, ids } = project(12);
+  ids.push("q1", "shell");
+  model.sync(ids, owner, (x) => x);
+  model.isolateTasks(owner, (x) => x);
+  const task = () => model.series(model.taskGroup("task"));
+  // A project pane moves from "(continued)" into the first part once it has room.
+  assert.equal(model.canMerge("p9", "p1", false), true);
+  assert.equal(model.canFit("p9", "p1", false), false);
+  assert.equal(model.merge("p9", "p1", { whole: false }), false, "full");
+  assert.equal(model.canMerge("p9", "q1", false), false, "other project");
+  ids.splice(ids.indexOf("p2"), 1);
+  model.sync(ids, owner, (x) => x);
+  model.isolateTasks(owner, (x) => x);
+  assert.equal(model.merge("p9", "p1", { whole: false }), true);
+  assert.ok(leaves(task()[0].tree).includes("p9"));
+  assert.equal(task()[0].guests.includes("p9"), false, "agents are not guests");
+  // A plain pane sent to a full project joins the earliest part with room.
+  ids.push("p2");
+  model.sync(ids, owner, (x) => x);
+  model.isolateTasks(owner, (x) => x);
+  assert.equal(leaves(task()[0].tree).length, 8);
+  assert.equal(model.send("shell", "p1"), true);
+  assert.ok(leaves(task()[1].tree).includes("shell"));
+  assert.deepEqual(task()[1].guests, ["shell"]);
+  // Make room: the dragged pane takes the target's slot; the target moves on.
+  model.detach("shell");
+  assert.equal(model.makeRoom("shell", "p4"), true);
+  assert.ok(leaves(task()[0].tree).includes("shell"));
+  assert.ok(leaves(task()[1].tree).includes("p4"));
+  assert.equal(leaves(task()[0].tree).length, 8);
+});
+
+test("plain groups continue through Send and leave the series at one pane", () => {
+  const model = new PaneGroups();
+  const ids = Array.from({ length: 10 }, (_, i) => `s${i}`);
+  model.sync(ids);
+  for (const id of ids.slice(1, 8)) model.merge(id, "s0");
+  model.merge("s9", "s8");
+  assert.equal(model.canFit("s8", "s0"), false);
+  assert.equal(model.merge("s8", "s0"), false);
+  assert.equal(model.send("s8", "s0", true), true);
+  const series = () => model.series(model.group("s0"));
+  assert.equal(series().length, 2);
+  assert.ok(series()[0].series && series()[0].series === series()[1].series);
+  assert.deepEqual(leaves(series()[1].tree).sort(), ["s8", "s9"]);
+  // A continuation that drops to one pane becomes an ordinary tab.
+  model.sync(ids.filter((id) => id !== "s9"));
+  assert.equal(model.group("s8").series, undefined);
+  assert.equal(model.group("s8").part, undefined);
+  assert.equal(model.group("s0").series, undefined, "one part left: no series");
+  // The original dropping to one pane hands the name to its continuation.
+  const other = new PaneGroups();
+  const more = ["a", "b", "c", "d", "e", "f"];
+  other.sync(more);
+  for (const id of more.slice(1)) other.merge(id, "a");
+  other.limit = 4;
+  other.sync(more);
+  const parts = other.series(other.group("a"));
+  assert.equal(parts.length, 2);
+  const [first, second] = parts.map((g) => leaves(g.tree));
+  const keep = first[0];
+  other.sync([keep, ...second]);
+  assert.equal(other.group(keep).series, undefined);
+  assert.equal(other.group(second[0]).series, undefined);
+  assert.equal(other.group(second[0]).part, undefined);
+  assert.deepEqual(leaves(other.group(second[0]).tree).sort(), second.sort());
+});
+
+test("a standalone plain group over the limit continues on the next sync", () => {
+  const model = new PaneGroups();
+  model.limit = 16;
+  const ids = Array.from({ length: 10 }, (_, i) => `s${i}`);
+  model.sync(ids);
+  for (const id of ids.slice(1)) model.merge(id, "s0");
+  const order = leaves(model.group("s0").tree);
+  model.limit = 8;
+  model.sync(ids);
+  const parts = model.series(model.group("s0"));
+  assert.equal(parts.length, 2);
+  assert.deepEqual(leaves(parts[0].tree), order.slice(0, 8));
+  assert.deepEqual(leaves(parts[1].tree), order.slice(8));
+  assert.equal(parts[1].part, 1);
+  assert.equal(parts[0].series, parts[1].series);
+});
+
+test("a series reorders as one unit and tab moves step over whole series", () => {
+  const owner = (id) => (id.startsWith("p") ? "task" : undefined);
+  const { model, ids } = project(10);
+  ids.unshift("a");
+  ids.push("b");
+  model.sync(ids, owner, (x) => x);
+  model.isolateTasks(owner, (x) => x);
+  model.groups = [
+    model.group("a"),
+    ...model.series(model.taskGroup("task")),
+    model.group("b"),
+  ];
+  const names = () =>
+    model.groups.map((g) =>
+      g.taskId ? (g.part ? `P${g.part}` : "P") : leaves(g.tree)[0],
+    );
+  assert.deepEqual(names(), ["a", "P", "P1", "b"]);
+  assert.equal(model.reorder("p9", "b", true), true);
+  assert.deepEqual(names(), ["a", "b", "P", "P1"]);
+  assert.equal(model.reorder("p9", "p1", false), false);
+  assert.deepEqual(names(), ["a", "b", "P", "P1"]);
+  assert.equal(model.reorder("a", "p9", true), true);
+  assert.deepEqual(names(), ["b", "P", "P1", "a"]);
+});
+
+test("closing a project unbinds every part", async () => {
+  const { unbindGroups } = await import("../client/task-hub.js");
+  const { model } = project(12);
+  unbindGroups(model.groups, "task");
+  assert.ok(model.groups.every((g) => !g.taskId && !g.part && !g.guests));
+});

@@ -85,6 +85,14 @@ test("font shortcuts preserve plain shell plus/minus and preference validation c
   assert.equal(p.padding, 16);
   assert.equal(p.cursorStyle, "block");
   assert.equal(p.remoteClipboard, true);
+  assert.equal(p.paneGroupLimit, 8, "panes per group defaults to 8");
+  for (const value of [7, 0, -8, 100, "lots", null])
+    assert.equal(
+      normalizeAppearance({ paneGroupLimit: value }).paneGroupLimit,
+      8,
+    );
+  assert.equal(normalizeAppearance({ paneGroupLimit: 12 }).paneGroupLimit, 12);
+  assert.equal(normalizeAppearance({ paneGroupLimit: "4" }).paneGroupLimit, 4);
 });
 
 test("paste preserves Unicode and line structure but cannot inject an early bracketed-paste terminator", () => {

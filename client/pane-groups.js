@@ -8,6 +8,16 @@ import {
   prune,
 } from "./pane-layout.js";
 import { setupPaneDrag } from "./pane-drag.js";
+import { continuedSuffix, normalizePaneLimit } from "./pane-cap.js";
+
+const escapeHTML = (value) =>
+  String(value ?? "").replace(
+    /[&<>"']/g,
+    (c) =>
+      ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[
+        c
+      ],
+  );
 
 export function setupPaneGroups({
   getTabs,
@@ -20,6 +30,7 @@ export function setupPaneGroups({
   closeDialog,
   preferences,
   label,
+  groupName = (group) => group.taskId || "Group",
   changed = () => {},
 }) {
   const model = new PaneGroups();
@@ -42,6 +53,7 @@ export function setupPaneGroups({
     signature = "",
     resizing = false;
   const sync = () => {
+    model.limit = normalizePaneLimit(preferences().paneGroupLimit);
     const tab = (id) => getTabs().find((t) => t.id === id),
       taskOf = (id) => tab(id)?.task?.taskId,
       agentOf = (id) => tab(id)?.task?.agentId;
@@ -85,10 +97,60 @@ export function setupPaneGroups({
       ? tileLayout(visible.tree, body.clientWidth, body.clientHeight)
       : { panes: [], dividers: [] };
   }
+  // Name of a series part: its base name plus "(continued k)".
+  const partName = (group, rank = model.series(group).indexOf(group)) => {
+    const parts = model.series(group);
+    const own = !group.taskId && rank > 0 && group.decoration?.label;
+    return (
+      (own ? groupName(group) : groupName(parts[0] || group)) +
+      continuedSuffix(Math.max(0, rank))
+    );
+  };
+  // A full target offers to send the pane on, or to move a pane out.
+  function full(source, target, whole) {
+    if (!dialog) return;
+    const from = model.group(source),
+      to = model.group(target),
+      parts = model.series(to);
+    const count = whole ? leaves(from.tree).length : 1;
+    const sendable = !parts.includes(from);
+    const sendRank = parts.findIndex(
+      (part) => leaves(part.tree).length + count <= model.limit,
+    );
+    const roomRank = parts.findIndex(
+      (part) =>
+        part !== to &&
+        leaves(part.tree).length - (part === from ? 1 : 0) < model.limit,
+    );
+    const moved = getTabs().find((t) => t.id === target);
+    const name = partName(to);
+    dialog(
+      `${name} is full`,
+      `<p>${escapeHTML(name)} is full (${leaves(to.tree).length} of ${model.limit} panes).</p><div class="dialog-menu">${sendable ? `<button data-pane-full="send">Send to ${escapeHTML(partName(to, sendRank < 0 ? parts.length : sendRank))}</button>` : ""}${whole ? "" : `<button data-pane-full="room">Make room: move ${escapeHTML(moved ? label(moved) : target)} to ${escapeHTML(partName(to, roomRank < 0 ? parts.length : roomRank))}</button>`}<button data-pane-full="cancel">Cancel</button></div>`,
+    );
+    for (const button of document.querySelectorAll("[data-pane-full]"))
+      button.onclick = () => {
+        const action = button.dataset.paneFull;
+        closeDialog();
+        sync();
+        if (
+          action === "send"
+            ? model.send(source, target, whole)
+            : action === "room" && model.makeRoom(source, target)
+        ) {
+          changed();
+          activate(source);
+        }
+      };
+  }
+  const refused = (source, target, whole) =>
+    model.canMerge(source, target, whole) &&
+    !model.canFit(source, target, whole);
   function merge(source, target, whole = true) {
     sync();
     const g = model.group(target);
     if (!g) return;
+    if (refused(source, target, whole)) return full(source, target, whole);
     const boxes = geometry(g).panes;
     // Dropping on the tab splits its largest pane; a pane drop targets that pane.
     const box = boxes.find((p) => p.id === target);
@@ -104,6 +166,7 @@ export function setupPaneGroups({
   }
   function place(source, target, placement) {
     sync();
+    if (refused(source, target, false)) return full(source, target, false);
     if (model.place(source, target, placement)) {
       changed();
       activate(source);
@@ -537,6 +600,15 @@ export function setupPaneGroups({
         };
       select.focus();
     },
+    // Programmatic placement never prompts: the earliest part with room.
+    send(source, target, whole = false) {
+      sync();
+      if (model.send(source, target, whole)) {
+        changed();
+        activate(source);
+      }
+    },
+    partName,
     navigate(direction) {
       const group = current();
       if (!group) return;

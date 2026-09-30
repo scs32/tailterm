@@ -1,4 +1,5 @@
 import { IDLE_MINUTES } from "./inactivity.js";
+import { DEFAULT_PANE_LIMIT, normalizePaneLimit } from "./pane-cap.js";
 const palette = (name, background, foreground, accent, colors) => ({
   name,
   background,
@@ -253,6 +254,7 @@ const defaults = {
   remoteClipboard: true,
   attentionSound: false,
   gpuRendering: true,
+  paneGroupLimit: DEFAULT_PANE_LIMIT,
 };
 export function normalizeAppearance(value = {}) {
   const p = { ...defaults, ...value };
@@ -268,6 +270,7 @@ export function normalizeAppearance(value = {}) {
     p[key] = Number.isFinite(Number(p[key]))
       ? Math.min(max, Math.max(min, Number(p[key])))
       : defaults[key];
+  p.paneGroupLimit = normalizePaneLimit(p.paneGroupLimit);
   if (!["block", "bar", "underline"].includes(p.cursorStyle))
     p.cursorStyle = "block";
   for (const key of [

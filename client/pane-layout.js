@@ -1,3 +1,13 @@
+import {
+  DEFAULT_PANE_LIMIT,
+  arrivalPart,
+  cascade,
+  continuationTree,
+  planTemplate,
+  reorderSeries,
+  seriesKey,
+  seriesParts,
+} from "./pane-cap.js";
 export const leaves = (tree) =>
   tree.tab ? [tree.tab] : [...leaves(tree.a), ...leaves(tree.b)];
 export function paneNeighbor(panes, id, direction) {
@@ -121,9 +131,51 @@ const stableTree = (tree, taskId, taskOf, agentOf) => {
 const appendStable = (tree, leaf) =>
   tree ? split("x", tree, leaf) : structuredClone(leaf);
 
+const stableKeys = (tree) => stableLeaves(tree).map(stableKey);
+const stableLeaf = (key) =>
+  key.startsWith("agent:")
+    ? { agentId: key.slice(6) }
+    : { tabId: key.slice(4) };
+const templateTrees = (layout) =>
+  layout ? [layout.tree, ...(layout.continued || [])].filter(Boolean) : [];
+// Keeps base's shape for the keys it holds; other keys join before or after.
+function shapeKeys(base, keys) {
+  let tree = base ? stablePrune(base, new Set(keys)) : null;
+  const held = new Set(stableKeys(tree));
+  const first = keys.findIndex((key) => held.has(key));
+  const front = keys.filter(
+    (key, i) => !held.has(key) && (first < 0 || i < first),
+  );
+  for (const key of keys.filter((key, i) => !held.has(key) && i > first))
+    if (first >= 0) tree = appendStable(tree, stableLeaf(key));
+  for (const key of front.reverse())
+    tree = tree ? split("x", stableLeaf(key), tree) : stableLeaf(key);
+  return tree;
+}
+const stableContinuation = (agentIds) => {
+  const convert = (tree) =>
+    tree.tab
+      ? { agentId: tree.tab }
+      : { ...tree, a: convert(tree.a), b: convert(tree.b) };
+  return convert(continuationTree(agentIds));
+};
+// New panes share the width with the panes already there.
+const prependTabs = (tree, ids) =>
+  !tree
+    ? continuationTree(ids)
+    : split(
+        "x",
+        continuationTree(ids),
+        tree,
+        ids.length / (ids.length + leaves(tree).length),
+      );
+const appendTab = (tree, id) =>
+  split("x", tree, { tab: id }, 1 - 1 / (leaves(tree).length + 1));
+
 export class PaneGroups {
   groups = [];
   tabOrder = [];
+  limit = DEFAULT_PANE_LIMIT;
   taskOrchestrators = new Map();
   projectLayouts = new Map();
   taskMembers = new Map();
@@ -150,7 +202,7 @@ export class PaneGroups {
       return;
     }
     const layout = this.projectLayouts.get(taskId);
-    if (layout) this.#reconcileMembers(layout, members);
+    if (layout) this.#reconcileMembers(layout);
   }
   rememberActive(tab) {
     const group = this.group(tab);
@@ -176,12 +228,18 @@ export class PaneGroups {
     if (tabId) this.taskOrchestrators.set(taskId, tabId);
     else this.taskOrchestrators.delete(taskId);
   }
+  // A project layout is one arrangement across every part of the project.
   customize(tab) {
     const group = this.group(tab);
-    if (group?.taskId) group.taskLayout = "manual";
+    if (group?.taskId)
+      for (const part of this.series(group)) part.taskLayout = "manual";
   }
   group(tab) {
     return this.groups.find((g) => leaves(g.tree).includes(tab));
+  }
+  // The original group first, then its "(continued)" parts.
+  series(group) {
+    return group ? seriesParts(this.groups, group) : [];
   }
   // taskOf(tabId) supplies the task a newly grouped tab belongs to, so a
   // singleton group created for an agent pane inherits its task binding.
@@ -200,14 +258,14 @@ export class PaneGroups {
     this.groups = this.groups.flatMap((g) => {
       const tree = prune(g.tree, valid);
       if (!tree) return [];
-      return [
-        {
-          ...g,
-          decoration: tree.tab ? undefined : g.decoration,
-          tree,
-          active: leaves(tree).includes(g.active) ? g.active : leaves(tree)[0],
-        },
-      ];
+      const next = {
+        ...g,
+        decoration: tree.tab ? undefined : g.decoration,
+        tree,
+        active: leaves(tree).includes(g.active) ? g.active : leaves(tree)[0],
+      };
+      this.#leaveSeries(next, leaves(g.tree).length);
+      return [next];
     });
     for (const id of ids)
       if (!this.group(id)) {
@@ -217,11 +275,13 @@ export class PaneGroups {
           group.taskId = taskId;
         this.groups.push(group);
       }
+    this.#normalizeSeries();
   }
-  // Split legacy mixed groups and gather each task's panes into one group.
+  // Split legacy mixed groups and gather each task's panes into its parts.
   isolateTasks(taskOf, agentOf = (id) => this.tabAgents.get(id)) {
-    const result = [],
-      tasks = new Map();
+    this.tabAgents = new Map(this.tabOrder.map((id) => [id, agentOf(id)]));
+    this.tabTasks = new Map(this.tabOrder.map((id) => [id, taskOf(id)]));
+    const pieces = [];
     for (const group of this.groups) {
       const ids = leaves(group.tree);
       const membership = (id) =>
@@ -244,10 +304,12 @@ export class PaneGroups {
           delete part.taskName;
           delete part.guests;
           delete part.taskLayout;
-          result.push(part);
+          if (group.taskId) delete part.part;
+          pieces.push({ part });
           continue;
         }
         part.taskId = taskId;
+        delete part.series;
         part.guests = leaves(tree).filter((id) => !taskOf(id));
         const ordered = this.tabOrder.filter((id) => leaves(tree).includes(id));
         const originalOrder = leaves(tree).every((id, i) => id === ordered[i]);
@@ -256,49 +318,87 @@ export class PaneGroups {
           (!part.guests.length && originalOrder && legacyTaskTree(tree)
             ? "auto"
             : "manual");
-        const target = tasks.get(taskId);
-        if (target) {
-          if (part.taskLayout === "manual") target.taskLayout = "manual";
-          target.guests = [...(target.guests || []), ...part.guests];
-          target.tree = {
-            id: crypto.randomUUID(),
-            axis: "x",
-            ratio: 0.5,
-            a: target.tree,
-            b: tree,
-          };
-        } else {
-          tasks.set(taskId, part);
-          result.push(part);
-        }
+        // Panes already in one of the task's groups stay in that part.
+        const existing = group.taskId === taskId;
+        if (!existing) delete part.part;
+        pieces.push({ part, taskId, existing });
+      }
+    }
+    const seen = new Set(pieces.filter((p) => p.existing).map((p) => p.taskId));
+    for (const piece of pieces)
+      if (piece.taskId && !seen.has(piece.taskId)) {
+        piece.existing = true;
+        seen.add(piece.taskId);
+      }
+    const result = [],
+      parts = new Map(),
+      arrivals = new Map();
+    for (const { part, taskId, existing } of pieces) {
+      if (!taskId) {
+        result.push(part);
+        continue;
+      }
+      if (!existing) {
+        if (!arrivals.has(taskId)) arrivals.set(taskId, []);
+        arrivals.get(taskId).push(part);
+        continue;
+      }
+      const key = `${taskId}#${part.part || 0}`;
+      const target = parts.get(key);
+      if (target) {
+        if (part.taskLayout === "manual") target.taskLayout = "manual";
+        target.guests = [...(target.guests || []), ...part.guests];
+        target.tree = {
+          id: crypto.randomUUID(),
+          axis: "x",
+          ratio: 0.5,
+          a: target.tree,
+          b: part.tree,
+        };
+      } else {
+        parts.set(key, part);
+        result.push(part);
       }
     }
     this.groups = result;
-    for (const group of tasks.values()) {
-      if (group.taskLayout !== "auto" || group.guests.length) continue;
-      const members = leaves(group.tree);
-      const ids = [
-        ...this.tabOrder.filter((id) => members.includes(id)),
-        ...members.filter((id) => !this.tabOrder.includes(id)),
-      ];
-      const anchor = this.taskOrchestrators.get(group.taskId);
-      if (ids.includes(anchor))
-        ids.unshift(...ids.splice(ids.indexOf(anchor), 1));
-      const tree = taskTree(ids);
+    for (const [taskId, incoming] of arrivals) this.#arrive(taskId, incoming);
+    this.#pinOrchestrators();
+    this.#normalizeSeries();
+    for (const group of this.groups) {
+      if (!group.taskId || group.taskLayout !== "auto" || group.guests?.length)
+        continue;
+      const ids = this.#memberOrder(group);
+      const tree = group.part ? continuationTree(ids) : taskTree(ids);
       // Stable membership preserves divider IDs/ratios and focused terminals.
       if (!sameShape(group.tree, tree)) group.tree = tree;
     }
     this.#applyProjectLayouts(taskOf, agentOf);
   }
   taskGroup(taskId) {
-    return this.groups.find((g) => g.taskId === taskId);
+    return (
+      this.groups.find((g) => g.taskId === taskId && !g.part) ||
+      this.groups.find((g) => g.taskId === taskId)
+    );
   }
   canMerge(source, target, whole = true) {
     const from = this.group(source),
       to = this.group(target);
     if (!from || !to || from === to) return false;
     if (whole) return !from.taskId && !to.taskId;
+    // Project agents may move between the parts of their own project.
+    if (from.taskId && from.taskId === to.taskId) return true;
     return !from.taskId || !!from.guests?.includes(source);
+  }
+  // Whether the target group has room for the incoming pane or group.
+  canFit(source, target, whole = true) {
+    const from = this.group(source),
+      to = this.group(target);
+    if (!from || !to) return false;
+    if (from === to) return true;
+    return (
+      leaves(to.tree).length + (whole ? leaves(from.tree).length : 1) <=
+      this.limit
+    );
   }
   canDetach(tab) {
     const group = this.group(tab);
@@ -311,22 +411,20 @@ export class PaneGroups {
   merge(source, target, { whole = true, axis = "x", before = false } = {}) {
     const from = this.group(source),
       to = this.group(target);
-    if (!this.canMerge(source, target, whole)) return false;
-    if (to.taskId) {
+    if (
+      !this.canMerge(source, target, whole) ||
+      !this.canFit(source, target, whole)
+    )
+      return false;
+    if (to.taskId && this.#guestIn(source, from, to)) {
       to.guests = [...(to.guests || []), source];
       to.taskLayout = "manual";
     }
     if (from.guests) from.guests = from.guests.filter((id) => id !== source);
+    const count = leaves(from.tree).length;
     const incoming = whole ? from.tree : { tab: source };
     if (whole) this.groups = this.groups.filter((g) => g !== from);
-    else {
-      from.tree = prune(
-        from.tree,
-        new Set(leaves(from.tree).filter((id) => id !== source)),
-      );
-      if (!from.tree) this.groups = this.groups.filter((g) => g !== from);
-      else if (from.active === source) from.active = leaves(from.tree)[0];
-    }
+    else this.#remove(from, source);
     if (to.tree.tab) delete to.decoration;
     if (from.tree?.tab) delete from.decoration;
     to.tree = replace(to.tree, target, {
@@ -337,8 +435,71 @@ export class PaneGroups {
       b: before ? { tab: target } : incoming,
     });
     to.active = source;
+    if (!whole) this.#leaveSeries(from, count);
+    this.#normalizeSeries();
     if (to.taskId) this.#capture(to);
-    if (from.taskId && from !== to && this.groups.includes(from))
+    if (from.taskId && from.taskId !== to.taskId && this.groups.includes(from))
+      this.#capture(from);
+    return true;
+  }
+  // Puts a pane (or a whole plain group) into the earliest part of the
+  // target's series with room, starting a "(continued)" part when none has.
+  send(source, target, whole = false) {
+    const from = this.group(source),
+      to = this.group(target);
+    if (!this.canMerge(source, target, whole)) return false;
+    const count = whole ? leaves(from.tree).length : 1;
+    const dest = this.series(to).find(
+      (part) => part !== from && leaves(part.tree).length + count <= this.limit,
+    );
+    if (dest)
+      return this.merge(source, leaves(dest.tree).at(-1), { whole, axis: "x" });
+    const guest = this.#guestIn(source, from, to);
+    const before = leaves(from.tree).length;
+    const incoming = whole ? from.tree : { tab: source };
+    if (from.guests) from.guests = from.guests.filter((id) => id !== source);
+    if (whole) this.groups = this.groups.filter((g) => g !== from);
+    else this.#remove(from, source);
+    this.#continue(to, incoming, source, guest ? [source] : []);
+    if (!whole) this.#leaveSeries(from, before);
+    this.#normalizeSeries();
+    if (to.taskId) this.#capture(to);
+    if (from.taskId && from.taskId !== to.taskId && this.groups.includes(from))
+      this.#capture(from);
+    return true;
+  }
+  // The dragged pane takes the target pane's place; the target pane moves to
+  // the earliest other part of its series with room, or a new continuation.
+  makeRoom(source, target) {
+    const from = this.group(source),
+      to = this.group(target);
+    if (!this.canMerge(source, target, false)) return false;
+    const guest = this.#guestIn(source, from, to),
+      targetGuest = !!to.guests?.includes(target);
+    const before = leaves(from.tree).length;
+    if (from.guests) from.guests = from.guests.filter((id) => id !== source);
+    this.#remove(from, source);
+    to.tree = replace(to.tree, target, { tab: source });
+    to.guests = (to.guests || []).filter((id) => id !== target);
+    if (to.taskId && guest) {
+      to.guests.push(source);
+      to.taskLayout = "manual";
+    }
+    if (!to.taskId) delete to.guests;
+    to.active = source;
+    const dest = this.series(to).find(
+      (part) => part !== to && leaves(part.tree).length < this.limit,
+    );
+    if (dest) {
+      dest.tree = appendTab(dest.tree, target);
+      if (dest.taskId && targetGuest)
+        dest.guests = [...(dest.guests || []), target];
+    } else
+      this.#continue(to, { tab: target }, target, targetGuest ? [target] : []);
+    this.#leaveSeries(from, before);
+    this.#normalizeSeries();
+    if (to.taskId) this.#capture(to);
+    if (from.taskId && from.taskId !== to.taskId && this.groups.includes(from))
       this.#capture(from);
     return true;
   }
@@ -397,6 +558,7 @@ export class PaneGroups {
   detach(tab) {
     const group = this.group(tab);
     if (!this.canDetach(tab)) return false;
+    const count = leaves(group.tree).length;
     if (group.guests) group.guests = group.guests.filter((id) => id !== tab);
     group.tree = prune(
       group.tree,
@@ -404,20 +566,245 @@ export class PaneGroups {
     );
     if (group.tree.tab) delete group.decoration;
     if (group.active === tab) group.active = leaves(group.tree)[0];
-    this.groups.splice(this.groups.indexOf(group) + 1, 0, {
+    // The separated tab follows the whole series, never splits it.
+    const last = this.series(group).at(-1);
+    this.groups.splice(this.groups.indexOf(last) + 1, 0, {
       tree: { tab },
       active: tab,
     });
+    this.#leaveSeries(group, count);
+    this.#normalizeSeries();
     if (group.taskId) this.#capture(group);
     return true;
   }
+  // A series moves as one unit and keeps its parts in order.
   reorder(source, target, after = false) {
     const from = this.group(source),
       to = this.group(target);
     if (!from || !to || from === to) return false;
-    this.groups.splice(this.groups.indexOf(from), 1);
-    this.groups.splice(this.groups.indexOf(to) + (after ? 1 : 0), 0, from);
+    const next = reorderSeries(
+      this.groups,
+      this.series(from),
+      this.series(to),
+      after,
+    );
+    if (!next) return false;
+    this.groups = next;
     return true;
+  }
+
+  #guestIn(source, from, to) {
+    return !(
+      from.taskId &&
+      from.taskId === to.taskId &&
+      !from.guests?.includes(source)
+    );
+  }
+  #remove(group, tab) {
+    group.tree = prune(
+      group.tree,
+      new Set(leaves(group.tree).filter((id) => id !== tab)),
+    );
+    if (!group.tree) this.groups = this.groups.filter((g) => g !== group);
+    else if (group.active === tab) group.active = leaves(group.tree)[0];
+  }
+  // Appends a new continuation part holding tree to the series of group.
+  #continue(group, tree, active, guests = []) {
+    const parts = this.series(group);
+    if (!group.taskId && !group.series) group.series = crypto.randomUUID();
+    const part = { tree, active, part: parts.length };
+    if (group.taskId) {
+      part.taskId = group.taskId;
+      part.taskLayout = guests.length ? "manual" : group.taskLayout || "auto";
+      part.guests = guests;
+    } else part.series = group.series;
+    this.groups.splice(this.groups.indexOf(parts.at(-1)) + 1, 0, part);
+    return part;
+  }
+  // A plain part that drops to one pane becomes an ordinary tab again.
+  #leaveSeries(group, before) {
+    if (
+      group?.tree &&
+      !group.taskId &&
+      group.series &&
+      before > 1 &&
+      leaves(group.tree).length === 1
+    ) {
+      delete group.series;
+      delete group.part;
+    }
+  }
+  // Auto project parts order panes by arrival with the orchestrator first.
+  #memberOrder(group) {
+    const ids = leaves(group.tree);
+    if (!group.taskId || group.taskLayout !== "auto" || group.guests?.length)
+      return ids;
+    const ordered = [
+      ...this.tabOrder.filter((id) => ids.includes(id)),
+      ...ids.filter((id) => !this.tabOrder.includes(id)),
+    ];
+    const anchor = this.taskOrchestrators.get(group.taskId);
+    if (!group.part && ordered.includes(anchor))
+      ordered.unshift(...ordered.splice(ordered.indexOf(anchor), 1));
+    return ordered;
+  }
+  #liveKey(taskId, id) {
+    const agentId = this.tabTasks.get(id) === taskId && this.tabAgents.get(id);
+    return agentId ? `agent:${agentId}` : `tab:${id}`;
+  }
+  // The template part holding most of a live part's panes.
+  #templateIndex(group, template) {
+    const counts = new Map();
+    for (const id of leaves(group.tree)) {
+      const index = template.findIndex((keys) =>
+        keys.includes(this.#liveKey(group.taskId, id)),
+      );
+      if (index >= 0) counts.set(index, (counts.get(index) || 0) + 1);
+    }
+    return [...counts].sort((a, b) => b[1] - a[1] || a[0] - b[0])[0]?.[0] ?? -1;
+  }
+  // New panes go to their recorded part if it has room, else the earliest
+  // part with room, else a new part. Existing panes never move.
+  #arrive(taskId, pieces) {
+    const template = templateTrees(this.projectLayouts.get(taskId)).map(
+      stableKeys,
+    );
+    if (pieces.some((piece) => piece.taskLayout === "manual"))
+      for (const part of this.series(this.taskGroup(taskId)))
+        part.taskLayout = "manual";
+    const position = (id) =>
+      this.tabOrder.includes(id) ? this.tabOrder.indexOf(id) : Infinity;
+    const ids = pieces
+      .flatMap((piece) => leaves(piece.tree))
+      .sort((a, b) => position(a) - position(b));
+    for (const id of ids) {
+      const original = this.taskGroup(taskId);
+      let parts = this.series(original);
+      const recorded = template.findIndex((keys) =>
+        keys.includes(this.#liveKey(taskId, id)),
+      );
+      let preferred = -1;
+      if (recorded >= 0) {
+        const indexes = parts.map((part) =>
+          this.#templateIndex(part, template),
+        );
+        preferred = indexes.indexOf(recorded);
+        if (preferred < 0) {
+          // Restore the recorded part in its template position.
+          const at = indexes.findIndex((index) => index > recorded);
+          const part = {
+            tree: { tab: id },
+            active: id,
+            taskId,
+            taskLayout: original.taskLayout || "auto",
+            guests: [],
+          };
+          const anchor = at < 0 ? parts.at(-1) : parts[at];
+          this.groups.splice(
+            this.groups.indexOf(anchor) + (at < 0 ? 1 : 0),
+            0,
+            part,
+          );
+          parts.splice(at < 0 ? parts.length : at, 0, part);
+          this.#number(parts);
+          continue;
+        }
+      }
+      const index = arrivalPart(
+        parts.map((part) => leaves(part.tree).length),
+        this.limit,
+        preferred,
+      );
+      if (index < 0) this.#continue(original, { tab: id }, id);
+      else parts[index].tree = appendTab(parts[index].tree, id);
+    }
+  }
+  #number(parts) {
+    parts.forEach((part, index) => {
+      if (index) part.part = index;
+      else delete part.part;
+    });
+  }
+  // In auto layout the orchestrator always sits in the project's first part.
+  #pinOrchestrators() {
+    for (const [taskId, anchor] of this.taskOrchestrators) {
+      const original = this.taskGroup(taskId),
+        group = this.group(anchor);
+      if (
+        !original ||
+        !group ||
+        group === original ||
+        group.taskId !== taskId ||
+        original.taskLayout === "manual" ||
+        group.guests?.includes(anchor)
+      )
+        continue;
+      this.#remove(group, anchor);
+      original.tree = prependTabs(original.tree, [anchor]);
+    }
+  }
+  // Keeps every series within the limit, numbered, adjacent and non-trivial.
+  #normalizeSeries() {
+    for (const group of this.groups) {
+      if (group.taskId) delete group.series;
+      else if (!group.series && leaves(group.tree).length > this.limit)
+        group.series = crypto.randomUUID();
+    }
+    const done = new Set();
+    for (const group of [...this.groups]) {
+      const key = seriesKey(group);
+      if (!key) {
+        delete group.part;
+        continue;
+      }
+      if (done.has(key)) continue;
+      done.add(key);
+      let parts = this.series(group);
+      const lists = parts.map((part) => this.#memberOrder(part));
+      if (lists.some((list) => list.length > this.limit)) {
+        const next = cascade(lists, this.limit);
+        next.forEach((ids, i) => {
+          let part = parts[i];
+          const incoming = ids.filter((id) => !lists[i]?.includes(id));
+          const guests = incoming.filter((id) =>
+            parts.some((p) => p.guests?.includes(id)),
+          );
+          for (const p of parts)
+            if (p.guests)
+              p.guests = p.guests.filter((id) => !incoming.includes(id));
+          if (!part) {
+            part = this.#continue(
+              parts[0],
+              continuationTree(ids),
+              ids[0],
+              guests,
+            );
+            parts = this.series(group);
+            return;
+          }
+          const keep = new Set(ids.filter((id) => lists[i].includes(id)));
+          part.tree = prune(part.tree, keep);
+          if (incoming.length) part.tree = prependTabs(part.tree, incoming);
+          if (!leaves(part.tree).includes(part.active))
+            part.active = leaves(part.tree)[0];
+          if (part.taskId && guests.length)
+            part.guests = [...(part.guests || []), ...guests];
+        });
+        parts = this.series(group);
+      }
+      if (!group.taskId && parts.length === 1) {
+        delete parts[0].series;
+        delete parts[0].part;
+        continue;
+      }
+      this.#number(parts);
+      const first = this.groups.findIndex((g) => parts.includes(g));
+      this.groups = [
+        ...this.groups.slice(0, first),
+        ...parts,
+        ...this.groups.slice(first).filter((g) => !parts.includes(g)),
+      ];
+    }
   }
 
   #capture(group) {
@@ -427,27 +814,28 @@ export class PaneGroups {
       this.taskMembers.get(group.taskId)?.length === 0
     )
       return;
-    let tree = stableTree(
-      group.tree,
-      group.taskId,
-      (id) => this.tabTasks.get(id),
-      (id) => this.tabAgents.get(id),
-    );
-    const previous = this.projectLayouts.get(group.taskId);
-    if (!previous && !this.taskMembers.has(group.taskId)) return;
+    const taskId = group.taskId;
+    const previous = this.projectLayouts.get(taskId);
+    if (!previous && !this.taskMembers.has(taskId)) return;
     // Legacy task groups without stable agent bindings continue to use the
     // existing auto-layout path; tab IDs alone cannot provide resume identity.
-    if (!previous && !stableLeaves(tree).some((leaf) => leaf.agentId)) return;
-    const present = new Set(stableLeaves(tree).map(stableKey));
-    for (const leaf of stableLeaves(previous?.tree))
-      if (!present.has(stableKey(leaf))) tree = appendStable(tree, leaf);
+    if (
+      !previous &&
+      !this.series(this.taskGroup(taskId)).some((part) =>
+        leaves(part.tree).some(
+          (id) => this.tabTasks.get(id) === taskId && this.tabAgents.get(id),
+        ),
+      )
+    )
+      return;
     const activeAgentId =
-      this.tabTasks.get(group.active) === group.taskId
+      this.tabTasks.get(group.active) === taskId
         ? this.tabAgents.get(group.active)
         : undefined;
     const layout = {
-      taskId: group.taskId,
-      tree,
+      taskId,
+      tree: previous?.tree,
+      ...(previous?.continued ? { continued: previous.continued } : {}),
       taskLayout: group.taskLayout === "manual" ? "manual" : "auto",
       ...(activeAgentId
         ? { activeAgentId }
@@ -455,94 +843,147 @@ export class PaneGroups {
           ? { activeTabId: group.active }
           : {}),
     };
-    this.projectLayouts.set(group.taskId, layout);
-    const members = this.taskMembers.get(group.taskId);
-    if (members) this.#reconcileMembers(layout, members);
+    this.#reconcileMembers(layout, true);
+    if (layout.tree) this.projectLayouts.set(taskId, layout);
   }
-  #reconcileMembers(layout, members) {
-    const memberSet = new Set(members);
-    const guestKeys = stableLeaves(layout.tree)
-      .filter((leaf) => leaf.tabId)
-      .map(stableKey);
-    if (layout.taskLayout === "auto" && !guestKeys.length) {
-      const anchor = this.tabAgents.get(
-        this.taskOrchestrators.get(layout.taskId),
-      );
-      const ordered = [...members];
-      if (ordered.includes(anchor))
-        ordered.unshift(...ordered.splice(ordered.indexOf(anchor), 1));
-      const current = stableLeaves(layout.tree)
-        .filter((leaf) => leaf.agentId)
-        .map((leaf) => leaf.agentId);
-      if (
-        current.length !== ordered.length ||
-        current.some((id, index) => id !== ordered[index])
-      )
-        layout.tree = stableTaskTree(ordered);
-    } else {
-      const keep = new Set([
-        ...guestKeys,
-        ...members.map((id) => `agent:${id}`),
-      ]);
-      layout.tree = stablePrune(layout.tree, keep);
-      const present = new Set(stableLeaves(layout.tree).map(stableKey));
-      for (const agentId of members)
-        if (!present.has(`agent:${agentId}`))
-          layout.tree = appendStable(layout.tree, { agentId });
+  // Brings the template in line with the roster and the live parts: live
+  // panes are recorded in their live part, absent members keep theirs within
+  // the limit, removed members go and new members join the earliest part with
+  // room. fromLive takes each live part's shape; otherwise the template's.
+  #reconcileMembers(layout, fromLive = false) {
+    const taskId = layout.taskId;
+    const members = this.taskMembers.get(taskId);
+    const parts = this.series(this.taskGroup(taskId));
+    const previous = templateTrees(layout);
+    const removed = new Set(),
+      memberKeys = (members || []).map((id) => `agent:${id}`);
+    if (members) {
+      const memberSet = new Set(memberKeys);
+      for (const key of previous.flatMap(stableKeys))
+        if (key.startsWith("agent:") && !memberSet.has(key)) removed.add(key);
+      for (const part of parts)
+        for (const id of leaves(part.tree)) {
+          const key = this.#liveKey(taskId, id);
+          if (key.startsWith("agent:") && !memberSet.has(key)) removed.add(key);
+        }
     }
-    if (layout.activeAgentId && !memberSet.has(layout.activeAgentId))
+    const plan = planTemplate({
+      template: previous.map(stableKeys),
+      live: parts.map((part) =>
+        leaves(part.tree).map((id) => this.#liveKey(taskId, id)),
+      ),
+      limit: this.limit,
+      removed,
+      added: memberKeys,
+    });
+    let trees = plan.parts.map((keys, i) => {
+      const live = plan.liveIndex.indexOf(i);
+      let base = null;
+      if (fromLive && live >= 0)
+        base = stableTree(
+          parts[live].tree,
+          taskId,
+          (id) => this.tabTasks.get(id),
+          (id) => this.tabAgents.get(id),
+        );
+      else {
+        let overlap = 0;
+        for (const tree of previous) {
+          const count = stableKeys(tree).filter((key) =>
+            keys.includes(key),
+          ).length;
+          if (count > overlap) [overlap, base] = [count, tree];
+        }
+      }
+      return shapeKeys(base, keys);
+    });
+    const guests = plan.parts.flat().some((key) => key.startsWith("tab:"));
+    // Without a roster the auto order is unknown; keep the recorded shapes.
+    if (members && layout.taskLayout === "auto" && !guests) {
+      const anchor = this.tabAgents.get(this.taskOrchestrators.get(taskId));
+      const rank = (key) => {
+        const index = memberKeys.indexOf(key);
+        return index < 0 ? Infinity : index;
+      };
+      trees = trees.map((tree, i) => {
+        const ordered = [...plan.parts[i]]
+          .sort((a, b) => rank(a) - rank(b))
+          .map((key) => key.slice(6));
+        if (i === 0 && ordered.includes(anchor))
+          ordered.unshift(...ordered.splice(ordered.indexOf(anchor), 1));
+        const next =
+          i === 0 ? stableTaskTree(ordered) : stableContinuation(ordered);
+        const same = (a, b) =>
+          a.length === b.length && a.every((key, j) => key === b[j]);
+        return same(stableKeys(tree), stableKeys(next)) ? tree : next;
+      });
+    }
+    layout.tree = trees[0] || null;
+    if (trees.length > 1) layout.continued = trees.slice(1);
+    else delete layout.continued;
+    if (
+      members?.length &&
+      layout.activeAgentId &&
+      !members.includes(layout.activeAgentId)
+    )
       layout.activeAgentId = members[0];
+    return plan;
   }
   #applyProjectLayouts(taskOf, agentOf) {
-    for (const group of this.groups) {
-      if (!group.taskId || this.taskMembers.get(group.taskId)?.length === 0)
+    const tasks = [
+      ...new Set(this.groups.map((g) => g.taskId).filter(Boolean)),
+    ];
+    for (const taskId of tasks) {
+      if (this.taskMembers.get(taskId)?.length === 0) continue;
+      if (!this.projectLayouts.has(taskId) && !this.taskMembers.has(taskId))
         continue;
-      if (
-        !this.projectLayouts.has(group.taskId) &&
-        !this.taskMembers.has(group.taskId)
-      )
-        continue;
-      if (!this.projectLayouts.has(group.taskId)) this.#capture(group);
-      const layout = this.projectLayouts.get(group.taskId);
+      if (!this.projectLayouts.has(taskId))
+        this.#capture(this.taskGroup(taskId));
+      const layout = this.projectLayouts.get(taskId);
       if (!layout) continue;
-      const members = this.taskMembers.get(group.taskId);
-      if (members) this.#reconcileMembers(layout, members);
-      const byKey = new Map();
-      for (const id of leaves(group.tree)) {
-        const agentId = taskOf(id) === group.taskId && agentOf(id);
-        byKey.set(agentId ? `agent:${agentId}` : `tab:${id}`, id);
+      const plan = this.#reconcileMembers(layout);
+      if (!layout.tree) {
+        this.projectLayouts.delete(taskId);
+        continue;
       }
-      const keep = new Set(byKey.keys());
-      const projected = stablePrune(layout.tree, keep);
-      const materialize = (tree) => {
-        if (tree.agentId || tree.tabId)
-          return { tab: byKey.get(stableKey(tree)) };
-        return {
-          id: tree.id,
-          axis: tree.axis,
-          ratio: tree.ratio,
-          a: materialize(tree.a),
-          b: materialize(tree.b),
+      const trees = templateTrees(layout);
+      this.series(this.taskGroup(taskId)).forEach((group, index) => {
+        const template = trees[plan.liveIndex[index]];
+        if (!template) return;
+        const byKey = new Map();
+        for (const id of leaves(group.tree)) {
+          const agentId = taskOf(id) === taskId && agentOf(id);
+          byKey.set(agentId ? `agent:${agentId}` : `tab:${id}`, id);
+        }
+        const projected =
+          template && stablePrune(template, new Set(byKey.keys()));
+        const materialize = (tree) => {
+          if (tree.agentId || tree.tabId)
+            return { tab: byKey.get(stableKey(tree)) };
+          return {
+            id: tree.id,
+            axis: tree.axis,
+            ratio: tree.ratio,
+            a: materialize(tree.a),
+            b: materialize(tree.b),
+          };
         };
-      };
-      let tree = projected && materialize(projected);
-      const represented = new Set(stableLeaves(layout.tree).map(stableKey));
-      for (const id of leaves(group.tree)) {
-        const agentId = taskOf(id) === group.taskId && agentOf(id);
-        const key = agentId ? `agent:${agentId}` : `tab:${id}`;
-        if (!represented.has(key))
-          tree = tree ? split("x", tree, { tab: id }) : { tab: id };
-      }
-      if (!tree) continue;
-      group.tree = tree;
-      group.taskLayout = layout.taskLayout;
-      const preferred = layout.activeAgentId
-        ? byKey.get(`agent:${layout.activeAgentId}`)
-        : byKey.get(`tab:${layout.activeTabId}`);
-      const ids = leaves(tree);
-      group.active =
-        preferred || (ids.includes(group.active) ? group.active : ids[0]);
-      group.guests = (group.guests || []).filter((id) => ids.includes(id));
+        let tree = projected && materialize(projected);
+        const represented = new Set(template ? stableKeys(template) : []);
+        for (const [key, id] of byKey)
+          if (!represented.has(key))
+            tree = tree ? split("x", tree, { tab: id }) : { tab: id };
+        if (!tree) return;
+        group.tree = tree;
+        group.taskLayout = layout.taskLayout;
+        const preferred = layout.activeAgentId
+          ? byKey.get(`agent:${layout.activeAgentId}`)
+          : byKey.get(`tab:${layout.activeTabId}`);
+        const ids = leaves(tree);
+        group.active =
+          preferred || (ids.includes(group.active) ? group.active : ids[0]);
+        group.guests = (group.guests || []).filter((id) => ids.includes(id));
+      });
     }
   }
 }

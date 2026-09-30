@@ -181,3 +181,193 @@ test("project layout validation is bounded and rejects unsafe geometry", () => {
     "one stable identity cannot occupy two project slots",
   );
 });
+
+// Continued project groups: the template keeps one tree per part.
+const agent = (n) => `agt_${String(n).padStart(16, "0")}`;
+const member = (n, generation) => ({
+  id: `${generation}-pane-${n}`,
+  server,
+  tmux: true,
+  session: `agent-${n}`,
+  wasConnected: true,
+  task: { taskId: TASK, agentId: agent(n) },
+});
+const partsOf = (model, tabs) =>
+  model
+    .series(model.taskGroup(TASK))
+    .map((group) =>
+      leaves(group.tree).map(
+        (id) => tabs.find((item) => item.id === id).task.agentId,
+      ),
+    );
+const templateParts = (layout) =>
+  [layout.tree, ...(layout.continued || [])].map((tree) =>
+    JSON.stringify(tree).match(/agt_[0-9a-f]{16}/g),
+  );
+function arrive(order, members, layouts, generation) {
+  const model = new PaneGroups(),
+    tabs = [];
+  if (layouts) model.loadProjectLayouts(layouts);
+  model.setTaskMembers(TASK, members);
+  for (const n of order) {
+    tabs.push(member(n, generation));
+    model.setTaskOrchestrator(
+      TASK,
+      tabs.find((item) => item.task.agentId === agent(1))?.id,
+    );
+    synchronize(model, tabs);
+  }
+  return { model, tabs };
+}
+const numbers = (from, to) =>
+  Array.from({ length: to - from + 1 }, (_, i) => from + i);
+
+test("closing a pane then adding an agent bounds every template part", () => {
+  const members = numbers(1, 20).map(agent);
+  const { model, tabs } = arrive(numbers(1, 20), members, null, "old");
+  assert.deepEqual(
+    partsOf(model, tabs).map((part) => part.length),
+    [8, 8, 4],
+  );
+  const closed = tabs.splice(
+    tabs.findIndex((item) => item.task.agentId === agent(3)),
+    1,
+  );
+  synchronize(model, tabs);
+  assert.deepEqual(
+    partsOf(model, tabs).map((part) => part.length),
+    [7, 8, 4],
+  );
+  model.setTaskMembers(TASK, [...members, agent(21)]);
+  tabs.push(member(21, "old"));
+  synchronize(model, tabs);
+  const live = partsOf(model, tabs);
+  assert.deepEqual(
+    live.map((part) => part.length),
+    [8, 8, 4],
+  );
+  assert.ok(live[0].includes(agent(21)), "the new agent fills the freed slot");
+  const template = templateParts(model.projectLayoutSnapshot()[0]);
+  assert.equal(template[0].length, 8);
+  assert.ok(!template[0].includes(agent(3)));
+  assert.ok(template.every((part) => part.length <= 8));
+  // Part 1 holds eight live agents, so the closed agent moves one part further.
+  const holder = template.findIndex((part) => part.includes(agent(3)));
+  assert.equal(template[holder][0], agent(3));
+  assert.equal(holder, 2);
+  assert.equal(closed.length, 1);
+});
+
+test("continued project parts restore identically in any reconnect order", () => {
+  const members = numbers(1, 14).map(agent);
+  const { model, tabs } = arrive(numbers(1, 14), members, null, "old");
+  assert.deepEqual(
+    partsOf(model, tabs).map((part) => part.length),
+    [8, 6],
+  );
+  // Close a first-part pane (still a member) and add a new agent.
+  tabs.splice(
+    tabs.findIndex((item) => item.task.agentId === agent(3)),
+    1,
+  );
+  synchronize(model, tabs);
+  const roster = [...members, agent(15)];
+  model.setTaskMembers(TASK, roster);
+  tabs.push(member(15, "old"));
+  synchronize(model, tabs);
+  const expected = partsOf(model, tabs).map((part) => [...part].sort());
+  assert.ok(expected[0].includes(agent(15)));
+  const saved = normalizeWorkspace(
+    workspaceSnapshot(
+      tabs,
+      model.groups,
+      tabs[0].id,
+      null,
+      [TASK],
+      [],
+      model.projectLayoutSnapshot(),
+    ),
+  );
+  const template = templateParts(saved.projectLayouts[0]);
+  assert.equal(template[0].length, 8);
+  assert.equal(template[1][0], agent(3));
+  for (const [generation, order] of [
+    ["a", [15, 14, 2, 9, 1, 12, 5, 7, 11, 4, 13, 6, 10, 8]],
+    ["b", [8, 10, 6, 13, 4, 11, 7, 5, 12, 1, 9, 2, 14, 15]],
+  ]) {
+    const restored = arrive(order, roster, saved.projectLayouts, generation);
+    assert.deepEqual(
+      partsOf(restored.model, restored.tabs).map((part) => [...part].sort()),
+      expected,
+      `reconnect order ${generation}`,
+    );
+    restored.tabs.push(member(3, generation));
+    synchronize(restored.model, restored.tabs);
+    assert.ok(
+      partsOf(restored.model, restored.tabs)[1].includes(agent(3)),
+      "the closed agent returns to its recorded part",
+    );
+  }
+});
+
+test("snapshots keep continued parts and validate them", () => {
+  const members = numbers(1, 12).map(agent);
+  const { model, tabs } = arrive(numbers(1, 12), members, null, "old");
+  const groups = structuredClone(model.groups);
+  // A legacy snapshot without projectLayouts derives one layout per task.
+  const legacy = normalizeWorkspace({
+    ...workspaceSnapshot(tabs, groups, tabs[0].id),
+    projectLayouts: undefined,
+  });
+  assert.equal(legacy.projectLayouts.length, 1);
+  assert.equal(templateParts(legacy.projectLayouts[0])[0].length, 8);
+  assert.equal(legacy.projectLayouts[0].continued.length, 1);
+  assert.equal(templateParts(legacy.projectLayouts[0])[1].length, 4);
+  assert.deepEqual(
+    legacy.groups.map((group) => group.part),
+    [undefined, 1],
+  );
+  // Plain series and part numbers survive; malformed values are dropped.
+  const plain = normalizeWorkspace({
+    tabs: workspaceSnapshot(tabs, groups, tabs[0].id).tabs,
+    groups: [
+      { tree: { tab: tabs[0].id }, series: "abc-123", part: 2 },
+      { tree: { tab: tabs[1].id }, series: "bad series!", part: 0 },
+      { tree: { tab: tabs[2].id }, part: 1.5 },
+    ],
+  });
+  assert.deepEqual(
+    plain.groups.map(({ series, part }) => ({ series, part })),
+    [
+      { series: "abc-123", part: 2 },
+      { series: undefined, part: undefined },
+      { series: undefined, part: undefined },
+    ],
+  );
+  const layout = model.projectLayoutSnapshot()[0];
+  assert.equal(
+    normalizeProjectLayouts([layout])[0].continued.length,
+    1,
+    "continued parts round-trip",
+  );
+  const duplicate = {
+    ...layout,
+    continued: [{ agentId: agent(1) }, { agentId: agent(20) }],
+  };
+  assert.deepEqual(
+    normalizeProjectLayouts([duplicate])[0].continued,
+    [{ agentId: agent(20) }],
+    "a leaf duplicated across parts is rejected",
+  );
+  const crowded = {
+    taskId: TASK,
+    tree: { agentId: agent(100) },
+    continued: numbers(1, 40).map((n) => ({ agentId: agent(n) })),
+  };
+  const bounded = normalizeProjectLayouts([crowded])[0];
+  assert.equal(
+    1 + bounded.continued.length,
+    32,
+    "all parts share the 32-member budget",
+  );
+});

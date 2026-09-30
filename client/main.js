@@ -54,6 +54,8 @@ import "@fontsource/source-code-pro/latin-400.css";
 import "@fontsource/source-code-pro/latin-700.css";
 import "./fonts.css";
 import { setupTabStrip } from "./tab-strip.js";
+import { PANE_LIMITS, seriesKey } from "./pane-cap.js";
+import { leaves } from "./pane-layout.js";
 import { setupPaneGroups } from "./pane-groups.js";
 import { setupTerminalView } from "./terminal-view.js";
 import { sidebarIcon } from "./sidebar-icons.js";
@@ -315,6 +317,7 @@ async function restoreWorkspace(value) {
         if (dropped.has(group.taskId)) {
           delete group.taskId;
           delete group.guests;
+          delete group.part;
         }
       paneGroups.model.groups = snapshot.groups;
       paneGroups.sync();
@@ -479,6 +482,7 @@ function mount() {
     closeDialog,
     preferences: () => appearance,
     label: (t) => tabName(t, true),
+    groupName,
     changed: scheduleWorkspaceSave,
   });
   selected = data.servers[0]?.id;
@@ -1077,15 +1081,25 @@ function renderTabs() {
       ]
         .filter(Boolean)
         .join(" ");
+      // Continuations carry the original's name plus "(continued k)".
+      const continued =
+        group && paneGroups.model.series(group).indexOf(group) > 0;
+      const label = continued
+        ? paneGroups.partName(group)
+        : group?.taskId
+          ? taskHub?.name(group.taskId) || groupName
+          : grouped
+            ? groupName
+            : tabName(t, true);
       const taskLine = group?.taskId
         ? `\n${taskHub?.rollup(group.taskId) || "Project " + group.taskId}`
         : "";
       const title =
         (grouped
-          ? `${groupName}\n${ids.length} panes: ${names.join(", ")}\nFocused: ${tabName(t)} · ${t.status}\nDrag onto another tab to merge groups. × closes the focused pane.`
+          ? `${continued ? label : groupName}\n${ids.length} panes: ${names.join(", ")}\nFocused: ${tabName(t)} · ${t.status}\nDrag onto another tab to merge groups. × closes the focused pane.`
           : `${tabName(t, true)}\n${t.server.username}@${t.server.host}:${t.server.port}\n${t.status}${t.tmux ? " · tmux launch: " + t.session + (t.tmuxVerified ? "" : " (unverified)") : ""}\nDrop at a tab edge to reorder; drop in its center to group.`) +
         taskLine;
-      return `<div class="tab ${ids.includes(active) ? "active" : ""} ${grouped ? "group-tab" : ""} ${newOutput ? "has-new-output" : ""} ${group?.taskId ? "task-tab" : ""}" data-tab-color="${decoration.color}" data-tab-fill="${decoration.fill}" style='--tab-font:${esc(fonts[decoration.font]?.family || "var(--terminal-font)")}' draggable="false"><button data-tab="${t.id}" role="tab" aria-selected="${ids.includes(active)}" title="${esc(activities.length ? title + "\n" + [...new Set(activities)].join(", ") : title)}"><span class="node-dot ${t.status === "Connected" ? "online" : ""}"></span><span class="tab-copy"><span class="tab-name">${esc(group?.taskId ? taskHub?.name(group.taskId) || groupName : grouped ? groupName : tabName(t, true))}</span></span></button>${staticMode ? `<button data-session-menu="${t.id}" aria-label="Session actions for ${esc(t.session)}" title="Session actions and tab order">...</button>` : ""}<button data-close="${t.id}" aria-label="Close ${esc(t.server.name)} ${grouped ? "focused pane" : "terminal"}">×</button></div>`;
+      return `<div class="tab ${ids.includes(active) ? "active" : ""} ${grouped ? "group-tab" : ""} ${newOutput ? "has-new-output" : ""} ${group?.taskId ? "task-tab" : ""}" data-tab-color="${decoration.color}" data-tab-fill="${decoration.fill}" style='--tab-font:${esc(fonts[decoration.font]?.family || "var(--terminal-font)")}' draggable="false"><button data-tab="${t.id}" role="tab" aria-selected="${ids.includes(active)}" title="${esc(activities.length ? title + "\n" + [...new Set(activities)].join(", ") : title)}"><span class="node-dot ${t.status === "Connected" ? "online" : ""}"></span><span class="tab-copy"><span class="tab-name">${esc(label)}</span></span></button>${staticMode ? `<button data-session-menu="${t.id}" aria-label="Session actions for ${esc(t.session)}" title="Session actions and tab order">...</button>` : ""}<button data-close="${t.id}" aria-label="Close ${esc(t.server.name)} ${grouped ? "focused pane" : "terminal"}">×</button></div>`;
     })
     .join("");
   $$("[data-tab]").forEach((b) => (b.onclick = () => activate(b.dataset.tab)));
@@ -1136,17 +1150,30 @@ function renderTabs() {
         $("#decorate-tab").onclick = () => decorate(grouped);
         if ($("#decorate-pane"))
           $("#decorate-pane").onclick = () => decorate(false);
-        const entries = paneGroups.entries(),
-          index = entries.findIndex((entry) => entry.ids.includes(t.id));
+        // A group and its "(continued)" parts move and are stepped over together.
+        const units = [];
+        for (const entry of paneGroups.entries()) {
+          const key = seriesKey(entry.group);
+          if (key && units.at(-1)?.key === key)
+            units.at(-1).entries.push(entry);
+          else units.push({ key, entries: [entry] });
+        }
+        const index = units.findIndex((unit) =>
+          unit.entries.some((entry) => entry.ids.includes(t.id)),
+        );
         $("#move-tab-left").disabled = index <= 0;
-        $("#move-tab-right").disabled = index === entries.length - 1;
+        $("#move-tab-right").disabled = index === units.length - 1;
         $("#move-tab-left").onclick = () => {
           closeDialog();
-          paneGroups.reorder(t.id, entries[index - 1].tab.id, false);
+          paneGroups.reorder(t.id, units[index - 1].entries[0].tab.id, false);
         };
         $("#move-tab-right").onclick = () => {
           closeDialog();
-          paneGroups.reorder(t.id, entries[index + 1].tab.id, true);
+          paneGroups.reorder(
+            t.id,
+            units[index + 1].entries.at(-1).tab.id,
+            true,
+          );
         };
       }),
   );
@@ -1188,6 +1215,19 @@ function tabName(t, numbered = false) {
       (data.servers.find((s) => s.id === t.server.id)?.name || t.server.name) +
         (numbered ? ` #${t.number}` : ""),
   ]
+    .filter(Boolean)
+    .join(" ");
+}
+// A group's own display name, without any "(continued)" suffix.
+function groupName(group) {
+  if (group.taskId && taskHub?.name(group.taskId))
+    return taskHub.name(group.taskId);
+  const members = leaves(group.tree)
+    .map((id) => tabs.find((t) => t.id === id))
+    .filter(Boolean);
+  if (members.length === 1) return tabName(members[0], true);
+  const d = normalizeTabDecoration(group.decoration);
+  return [d.emoji, d.label || members.map((m) => tabName(m, true)).join(" + ")]
     .filter(Boolean)
     .join(" ");
 }
@@ -1639,6 +1679,7 @@ function appearanceDialog() {
           `<label><input type="checkbox" data-preference="${k}" ${appearance[k] ? "checked" : ""}>${label}</label>`,
       )
       .join("")}</div>
+    <h3>Terminal groups</h3><label>Panes per group<select id="pane-group-limit">${PANE_LIMITS.map((n) => `<option value="${n}" ${appearance.paneGroupLimit === n ? "selected" : ""}>${n} panes</option>`).join("")}</select></label><p class="fine">When a group is full, more panes continue in a “(continued)” group next to it. Lowering the limit moves extra panes on; raising it does not merge groups.</p>
     <h3>Rendering</h3><div class="appearance-toggles"><label><input type="checkbox" data-preference="gpuRendering" ${appearance.gpuRendering ? "checked" : ""} ${webglSupported() ? "" : "disabled"}>GPU rendering (WebGL)</label></div><p class="fine">${webglSupported() ? "Faster scrolling and output for large histories and grouped panes. Font ligatures such as -> and => only render with GPU rendering off." : "WebGL is unavailable in this browser; the standard renderer is in use."}</p>
     <h3>Attention sound</h3><div class="appearance-toggles"><label><input type="checkbox" data-preference="attentionSound" ${appearance.attentionSound ? "checked" : ""}>Play a gentle chime</label></div><button id="preview-attention-sound">Preview sound</button><p class="fine">Off by default. Chimes for bells, command completion, and connection problems in unattended tabs, at most once every five seconds. Ordinary output stays silent. Keep Tailterm open and interact once after loading to enable browser audio.</p>
     <details class="dialog-details"><summary>Keyboard & selection tips</summary><p class="fine">Switch grouped panes with Option + Shift + arrow keys on Mac, or Ctrl + Alt + arrow keys on Windows/Linux.</p>
@@ -1680,6 +1721,11 @@ function appearanceDialog() {
       updateAppearance();
       inactivity.check();
     };
+  $("#pane-group-limit").onchange = (e) => {
+    appearance.paneGroupLimit = Number(e.target.value);
+    updateAppearance();
+    renderTabs();
+  };
   $("#appearance-smaller").onclick = () => setDefaultFont(-1);
   $("#appearance-larger").onclick = () => setDefaultFont(1);
   $("#appearance-reset").onclick = () => setDefaultFont(0);

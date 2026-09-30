@@ -31,9 +31,22 @@ function projectLayoutsFromGroups(tabs, groups) {
       b: convert(tree.b, taskId),
     };
   };
-  return groups
-    .filter((group) => normalizeTaskId(group.taskId) && group.tree)
-    .map((group) => {
+  // One layout per task: the original group's tree, then its continuations.
+  const parts = new Map();
+  for (const group of groups)
+    if (normalizeTaskId(group.taskId) && group.tree)
+      parts.set(group.taskId, [...(parts.get(group.taskId) || []), group]);
+  return [...parts.values()]
+    .map((series) =>
+      series
+        .map((group, index) => ({ group, index }))
+        .sort(
+          (a, b) =>
+            (a.group.part || 0) - (b.group.part || 0) || a.index - b.index,
+        )
+        .map(({ group }) => group),
+    )
+    .map(([group, ...continued]) => {
       const active = byId.get(group.active),
         activeAgentId =
           active?.task?.taskId === group.taskId
@@ -42,6 +55,13 @@ function projectLayoutsFromGroups(tabs, groups) {
       return {
         taskId: group.taskId,
         tree: convert(group.tree, group.taskId),
+        ...(continued.length
+          ? {
+              continued: continued.map((part) =>
+                convert(part.tree, group.taskId),
+              ),
+            }
+          : {}),
         taskLayout: group.taskLayout === "manual" ? "manual" : "auto",
         ...(activeAgentId
           ? { activeAgentId }
@@ -100,6 +120,22 @@ export function normalizeProjectLayouts(value) {
       };
       const normalizedTree = tree(layout.tree);
       if (!normalizedTree) return null;
+      // Continuations share the member budget; a duplicated or invalid part is dropped.
+      const continued = (
+        Array.isArray(layout.continued) ? layout.continued : []
+      )
+        .slice(0, MAX_PROJECT_MEMBERS)
+        .map((part) => {
+          const before = new Set(used),
+            count = members,
+            normalized = tree(part);
+          if (normalized) return normalized;
+          used.clear();
+          before.forEach((key) => used.add(key));
+          members = count;
+          return null;
+        })
+        .filter(Boolean);
       tasks.add(taskId);
       const activeAgentId = AGENT_ID_RE.test(layout.activeAgentId || "")
           ? layout.activeAgentId
@@ -112,6 +148,7 @@ export function normalizeProjectLayouts(value) {
       return {
         taskId,
         tree: normalizedTree,
+        ...(continued.length ? { continued } : {}),
         taskLayout: layout.taskLayout === "manual" ? "manual" : "auto",
         ...(activeAgentId && used.has(`agent:${activeAgentId}`)
           ? { activeAgentId }
@@ -225,6 +262,15 @@ export function normalizeWorkspace(value) {
       guests: Array.isArray(g?.guests)
         ? g.guests.filter((id) => ids.has(id)).slice(0, 30)
         : [],
+      // "(continued)" parts: a part number, and a series for plain groups.
+      ...(Number.isInteger(g?.part) && g.part >= 1 && g.part <= 30
+        ? { part: g.part }
+        : {}),
+      ...(!g?.taskId &&
+      typeof g?.series === "string" &&
+      /^[A-Za-z0-9_-]{1,64}$/.test(g.series)
+        ? { series: g.series }
+        : {}),
     }))
     .filter((g) => g.tree)
     .map((g) => ({
