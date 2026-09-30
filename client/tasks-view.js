@@ -31,9 +31,12 @@ const STATUS_DOT = {
 
 // Roster labels. The owner helper is the owner's own Claude Code session
 // (docs/owner-helper.md): when it is not running it is offline, not stuck.
+// The backlog steward is the project's one persistent backlog role
+// (docs/backlog-steward.md).
 export function rosterRole(a) {
   if (a.role === "database_handler") return " · Database handler";
   if (a.role === "owner_helper") return " · Owner helper";
+  if (a.role === "backlog_steward") return " · Backlog steward";
   return "";
 }
 

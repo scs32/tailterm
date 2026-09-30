@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
-import { TEAM_EXAMPLES, exampleTeam } from "../client/team-examples.js";
+import { PROJECT_ROLE_TEMPLATES, TEAM_EXAMPLES, exampleTeam } from "../client/team-examples.js";
 import { normalizeTeam, teamLaunches } from "../client/teams.js";
 import { MODEL_OPTIONS } from "../client/model-picker.js";
 test("ten complete examples are portable, launchable, bounded and independently editable", () => {
@@ -158,6 +158,18 @@ test("documented team prompts exactly include every generated template", () => {
         documentation.includes(member.prompt),
         `missing exact ${team.id}/${member.name} prompt`,
       );
+});
+
+test("documented project role prompts exactly include every generated template", () => {
+  const documentation = readFileSync(
+    new URL("../docs/team-examples.md", import.meta.url),
+    "utf8",
+  );
+  for (const [role, template] of Object.entries(PROJECT_ROLE_TEMPLATES)) {
+    assert.equal(template.role, role);
+    assert.ok(documentation.includes(template.prompt), `missing exact ${role} prompt`);
+    assert.match(template.prompt, /run tt ack SEQ before you start/, role);
+  }
 });
 
 // Broker phase 3.1 round one (B1): every member is taught tt ack first, and

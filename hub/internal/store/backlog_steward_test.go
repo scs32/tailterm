@@ -176,3 +176,79 @@ func TestStewardOnePerProjectConcurrentAdmission(t *testing.T) {
 		t.Fatalf("concurrent admissions: %d succeeded, %d stewards", ok, holders)
 	}
 }
+
+// liveSteward registers a steward that is online, running and idle.
+func liveSteward(t *testing.T, s *Store, task, name string) api.Agent {
+	t.Helper()
+	a := addSteward(t, s, task, name)
+	if _, err := s.db.Exec(`UPDATE agents SET last_seen_at=?,status='running' WHERE id=?`, ts(s.now()), a.ID); err != nil {
+		t.Fatal(err)
+	}
+	now := s.now()
+	if _, err := s.ReportActivity(context.Background(), task, a.ID, api.ActivityReport{RequestID: api.NewID("act"), RunID: a.RunID, Activity: api.AgentActivity{State: "idle", ObservedAt: now, LastEventAt: now}}); err != nil {
+		t.Fatal(err)
+	}
+	a, err := s.GetAgent(context.Background(), a.ID)
+	if err != nil || !a.Online {
+		t.Fatalf("live steward: %+v %v", a, err)
+	}
+	return a
+}
+
+func TestStewardNeverLeased(t *testing.T) {
+	f := newChoresQueue(t, 1, 1, 0)
+	// The fixture's only database handler closes: an idle steward remains.
+	for _, h := range f.handlers {
+		setAgentStatus(t, f.s, h.ID, api.AgentClosed)
+	}
+	steward := liveSteward(t, f.s, f.task.ID, "backlog-steward")
+	q := f.add(t, 0, "src")
+	// The queue reports the missing handler (the stall check names it).
+	if got := listedEntry(t, f.s, f.task.ID, q.ID); !strings.Contains(got.BlockReason, "no available database handler") {
+		t.Fatalf("queued entry with only a steward: %+v", got)
+	}
+	if _, err := claimEntry(f.s, f.task, q); err == nil || !strings.Contains(err.Error(), "no available database handler lease") {
+		t.Fatalf("claim leased without a handler: %v", err)
+	}
+	if got := listedEntry(t, f.s, f.task.ID, q.ID); got.State != "queued" || got.HandlerID != "" {
+		t.Fatalf("entry after refused claim: %+v", got)
+	}
+	if a, _ := f.s.GetAgent(context.Background(), steward.ID); a.Status != api.AgentRunning {
+		t.Fatalf("steward after refused claim: %+v", a)
+	}
+}
+
+func TestStewardNeverTeamClosed(t *testing.T) {
+	s, task, item, _, _, _, req := teamCloseFixture(t)
+	ctx := context.Background()
+	steward := liveSteward(t, s, task.ID, "backlog-steward")
+	teamCloseTerminal(t, s, task, item, "dismissed")
+	result, err := s.CloseItemTeam(ctx, task.ID, req, stewardBy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, m := range result.Members {
+		if m.AgentID == steward.ID {
+			t.Fatalf("team close included the steward: %+v", result.Members)
+		}
+	}
+	if a, err := s.GetAgent(ctx, steward.ID); err != nil || a.Status == api.AgentClosed {
+		t.Fatalf("steward after team close: %+v %v", a, err)
+	}
+}
+
+func TestStewardPauseClosesSteward(t *testing.T) {
+	f := newPauseFixture(t, false)
+	steward := liveSteward(t, f.s, f.task.ID, "backlog-steward")
+	f.agents = append(f.agents, steward)
+	if _, err := f.s.PauseProject(f.ctx, f.task.ID, f.pauseRequest("pause-with-steward"), f.by); err != nil {
+		t.Fatal(err)
+	}
+	a, err := f.s.GetAgent(f.ctx, steward.ID)
+	if err != nil || a.Status != api.AgentClosed || a.RunID != steward.RunID {
+		t.Fatalf("steward after pause: %+v %v", a, err)
+	}
+	if _, held, err := stewardSlotHolder(f.ctx, f.s.db, f.task.ID); err != nil || held {
+		t.Fatalf("pause left a slot holder: %v %v", held, err)
+	}
+}

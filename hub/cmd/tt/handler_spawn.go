@@ -117,9 +117,12 @@ func handlerOwned(ctx context.Context, hub, task, agent, run, name string, recei
 	return found, nil
 }
 
+// ensurePersistent launches a persistent project role; tests substitute it.
+var ensurePersistent = ensureHandler
+
 func ensureHandler(ctx context.Context, c *api.Client, taskID string, req api.AddAgentRequest, opts spawn.Options) (api.Agent, error) {
 	var empty api.Agent
-	if c == nil || !api.ValidID(taskID, "tsk") || !api.ValidID(req.AgentID, "agt") || (req.Role != api.AgentRoleDatabaseHandler && req.Role != api.AgentRoleDeployment) || (req.ExpectedRunID != "" && !runIDPattern.MatchString(req.ExpectedRunID)) {
+	if c == nil || !api.ValidID(taskID, "tsk") || !api.ValidID(req.AgentID, "agt") || !api.PersistentAgentRole(req.Role) || (req.ExpectedRunID != "" && !runIDPattern.MatchString(req.ExpectedRunID)) {
 		return empty, errors.New("handler launch requires a project, stable agent identity and database_handler role")
 	}
 	if !api.ValidName(req.Name) || req.Host == "" || req.Runtime == "" || opts.Cwd != req.Cwd || opts.Self == "" || strings.TrimSpace(opts.Command) == "" || req.ParentAgentID != "" {
@@ -151,6 +154,9 @@ func ensureHandler(ctx context.Context, c *api.Client, taskID string, req api.Ad
 	req.Session = "tt-handler-" + strings.TrimPrefix(req.AgentID, "agt_")
 	if req.Role == api.AgentRoleDeployment {
 		req.Session = "tt-deployer-" + strings.TrimPrefix(req.AgentID, "agt_")
+	}
+	if req.Role == api.AgentRoleBacklogSteward {
+		req.Session = "tt-steward-" + strings.TrimPrefix(req.AgentID, "agt_")
 	}
 	payload := handlerPayload(req, opts)
 	current, getErr := c.GetAgent(ctx, taskID, req.AgentID)
@@ -213,6 +219,10 @@ func ensureHandler(ctx context.Context, c *api.Client, taskID string, req api.Ad
 	}
 	if !found || restart {
 		current, err = c.AddAgent(ctx, taskID, req)
+		var refused *api.HTTPError
+		if errors.As(err, &refused) && refused.Status == 409 && refused.Code == api.StewardRefusedActive {
+			return empty, fmt.Errorf("backlog steward refused: %w", err)
+		}
 		if err != nil {
 			return empty, fmt.Errorf("handler registration unconfirmed; retry the same saved plan: %w", err)
 		}

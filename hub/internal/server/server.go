@@ -222,7 +222,10 @@ func fail(w http.ResponseWriter, err error) {
 	var envelopeErr *api.EnvelopeError
 	var unacked *api.UnacknowledgedError
 	var closeWait *api.TeamCloseWaitError
+	var steward *api.StewardRefusal
 	switch {
+	case errors.As(err, &steward):
+		writeJSON(w, http.StatusConflict, api.ErrorResponse{Error: steward.Error(), Code: steward.Code})
 	case errors.As(err, &unacked):
 		writeJSON(w, http.StatusConflict, api.ErrorResponse{Error: unacked.Error(), Code: "unacknowledged"})
 	case errors.As(err, &closeWait):

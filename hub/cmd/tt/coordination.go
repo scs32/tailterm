@@ -56,7 +56,7 @@ func postArgs(args []string) []string {
 func ordinaryTeamMemberCount(agents []api.Agent, currentName string) int {
 	members := map[string]struct{}{}
 	for _, agent := range agents {
-		if agent.Role == api.AgentRoleDatabaseHandler || agent.Role == api.AgentRoleOwnerHelper || agent.Name == "" {
+		if agent.Role == api.AgentRoleDatabaseHandler || agent.Role == api.AgentRoleOwnerHelper || agent.Role == api.AgentRoleBacklogSteward || agent.Name == "" {
 			continue
 		}
 		members[strings.ToLower(agent.Name)] = struct{}{}
@@ -189,12 +189,63 @@ func agentTaskBriefingForLaunch(t api.Task, name, role, selfPath string, agents 
 	return agentTaskBriefingForHandler(t, name, role, selfPath, agents, plannedTeamMembers, false)
 }
 
+// backlogStewardGuidance is the static prompt of a project's backlog steward
+// (docs/backlog-steward.md). Its digest, with the template's model,
+// reasoning and prompt, is the steward template version rotation checks.
+// Owner decision #15466: the steward reads the backlog directly; every write
+// goes through the database handler.
+const backlogStewardGuidance = "\nYou are this project's Backlog steward, a persistent project role whose context is the backlog. You may read work items, their history, the queue and triage directly (tt work-items list/get/history/triage, tt team queue list; owner decision #15466). Every write goes through the primary Database handler: item create, update and dispatch, scope confirmation, refinements and dismissals, and message-audit corrections. The hub refuses steward writes. You do no per-item records, merges, releases or acceptance; you never add, reorder or remove queue entries; you are never leased to a queue entry or an item lead. Turn intake into well-formed drafts (evidence or reproduction, likely files and ownership, acceptance criteria, related and duplicate links) that the handler files with the owner's original source message, and ask the owner only when intent is unclear. Research the review follow-ups triage lists under heldForTriage and send the handler a refinement or a dismissal proposal. Propose batches, queue order, ownership scopes and triage outcomes as tt ask decisions; send queue reorder requests only to the owner, or to the delegate of an open delegation window. The owner session is the owner's conversation partner and relays owner decisions. Your durable context is the backlog summary, not chat history: read the latest revision first (tt steward summary get) and save a new revision after each meaningful change."
+
+// stewardTemplateDigest identifies the prompt a backlog steward run starts with.
+func stewardTemplateDigest(model, reasoning, prompt string) string {
+	sum := sha256.Sum256([]byte(backlogStewardGuidance + "\x00" + model + "\x00" + reasoning + "\x00" + prompt))
+	return hex.EncodeToString(sum[:])
+}
+
+// stewardBriefing is what a launch knows about the project's backlog steward.
+type stewardBriefing struct {
+	// Active is the active steward's name, for other agents' briefings.
+	Active string
+	// SummaryRevision is the latest backlog summary revision; 0 means none.
+	SummaryRevision int64
+	// Successor marks a steward rotation successor's own launch.
+	Successor bool
+}
+
+// activeDatabaseHandler is the first open handler in a roster the caller
+// already ordered with primaryHandlerFirst.
+func activeDatabaseHandler(agents []api.Agent) string {
+	for _, agent := range agents {
+		if agent.Role == api.AgentRoleDatabaseHandler && agent.Status != api.AgentClosed && agent.Status != api.AgentExited {
+			return agent.Name
+		}
+	}
+	return ""
+}
+
+func backlogStewardBriefing(briefing string, agents []api.Agent, steward stewardBriefing) string {
+	briefing += backlogStewardGuidance
+	if handler := activeDatabaseHandler(agents); handler != "" {
+		briefing += fmt.Sprintf("\nThis project's primary Database handler is %s. Send it every work-item write, scope confirmation, refinement and dismissal request as a typed REQUEST.", handler)
+	} else {
+		briefing += "\nNo active Database handler is registered yet. Keep drafts in the backlog summary and tell the owner that filing waits for a handler; there is no direct write fallback."
+	}
+	return briefing
+}
+
 // A rotation successor is briefed as the primary handler it is about to
 // become, although the old handler is still primary when it launches.
 func agentTaskBriefingForHandler(t api.Task, name, role, selfPath string, agents []api.Agent, plannedTeamMembers int, successor bool) string {
+	return agentTaskBriefingWithSteward(t, name, role, selfPath, agents, plannedTeamMembers, successor, stewardBriefing{})
+}
+
+func agentTaskBriefingWithSteward(t api.Task, name, role, selfPath string, agents []api.Agent, plannedTeamMembers int, successor bool, steward stewardBriefing) string {
 	briefing := taskBriefingForRoster(t, name, selfPath, agents, plannedTeamMembers)
 	if role == api.AgentRoleDeployment {
 		return briefing + deploymentBriefing()
+	}
+	if role == api.AgentRoleBacklogSteward {
+		return backlogStewardBriefing(briefing, agents, steward)
 	}
 	if role == api.AgentRoleDatabaseHandler && successor {
 		return briefing + queueHandlerAcceptanceBriefing() + primaryHandlerGuidance + handlerSuccessorBriefing

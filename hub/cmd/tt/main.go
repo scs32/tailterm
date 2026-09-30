@@ -38,6 +38,7 @@ Commands
   project-pause <get|pause|handoff|resume>  explicit project team lifecycle
   helper register|env|inbox --task ID  the owner's Claude Code session as the project's owner helper
   handler <rotate|rotation|policy|spec>  rotate a project's database handler (owner)
+  steward <template|setup|summary|rotate|rotation|policy>  the project's backlog steward (setup, rotate: owner)
   prompt-policy <get|set>      runtime prompt policy per prompt kind (set: owner)
   deployment <list|enqueue|claim|check|verification|merged|finish|block>  release ledger
   verification <plan|receipt|history|enrollment>  handler-owned native verification records
@@ -187,6 +188,8 @@ func main() {
 		err = cmdTasks(e, args)
 	case "handler":
 		err = cmdHandler(e, args)
+	case "steward":
+		err = cmdSteward(e, args)
 	case "prompt-policy":
 		err = cmdPromptPolicy(e, args)
 	case "project-pause":
@@ -880,7 +883,7 @@ func cmdSpawn(e env, args []string) error {
 	queueRevision := fs.Int64("queue-revision", 0, "exact claimed Queue entry revision")
 	queueClaimantAgent := fs.String("queue-claimant-agent", "", "exact current orchestrator claimant identity")
 	queueClaimantRun := fs.String("queue-claimant-run", "", "exact current orchestrator claimant run")
-	role := fs.String("role", "", "project role (database_handler)")
+	role := fs.String("role", "", "project role (database_handler, deployment_agent or backlog_steward)")
 	plannedTeamMembers := fs.Int("planned-team-members", 0, "planned non-database team members for this launch (1-32)")
 	teamLeadName := fs.String("team-lead-name", "", "frozen item-team lead for this launch briefing")
 	teamHandlerID := fs.String("team-handler-id", "", "exact leased item-team handler for this launch briefing")
@@ -905,11 +908,14 @@ func cmdSpawn(e env, args []string) error {
 	if !api.ValidName(*name) {
 		return errors.New("name must match [A-Za-z0-9_-]{1,64}")
 	}
-	if *role != "" && *role != api.AgentRoleDatabaseHandler && *role != api.AgentRoleDeployment {
-		return errors.New("role must be database_handler or deployment_agent when set")
+	if *role != "" && !api.PersistentAgentRole(*role) {
+		return errors.New("role must be database_handler, deployment_agent or backlog_steward when set")
 	}
-	if (*role == api.AgentRoleDatabaseHandler || *role == api.AgentRoleDeployment) && !api.ValidID(*agentID, "agt") {
+	if api.PersistentAgentRole(*role) && !api.ValidID(*agentID, "agt") {
 		return errors.New("database_handler requires a stable --agent-id")
+	}
+	if *role == api.AgentRoleBacklogSteward && e.agent != "" {
+		return errors.New("tt spawn --role backlog_steward is an owner command; run it outside an agent session")
 	}
 	if *agentID != "" && !api.ValidID(*agentID, "agt") {
 		return errors.New("invalid --agent-id")
@@ -1118,7 +1124,11 @@ func cmdSpawn(e env, args []string) error {
 	if *handlerSuccessor && *role != api.AgentRoleDatabaseHandler {
 		return errors.New("--handler-successor requires --role database_handler")
 	}
-	briefing := agentTaskBriefingForHandler(detail.Task, *name, *role, launcherSelfPath, detail.Agents, *plannedTeamMembers, *handlerSuccessor)
+	steward, err := launchStewardBriefing(ctx, c, *task, *role)
+	if err != nil {
+		return err
+	}
+	briefing := agentTaskBriefingWithSteward(detail.Task, *name, *role, launcherSelfPath, detail.Agents, *plannedTeamMembers, *handlerSuccessor, steward)
 	if *permissionMode != "" {
 		briefing += "\nRequested launch permission mode: " + *permissionMode + ". Permission denials are real failures, not approvals. Do not repeat an unchanged denied action. Report a precise Permission blocked status to the orchestrator and continue independent permitted work."
 	}
@@ -1132,7 +1142,7 @@ func cmdSpawn(e env, args []string) error {
 		briefing += "\nAssignment: " + *prompt
 	}
 	if *runtime != "generic" {
-		if *role == api.AgentRoleDatabaseHandler || *role == api.AgentRoleDeployment {
+		if api.PersistentAgentRole(*role) {
 			command, err = freshRuntimeCommand(baseCommand, *runtime, *agentID, briefing)
 			if err != nil {
 				return err
@@ -1142,7 +1152,7 @@ func cmdSpawn(e env, args []string) error {
 		}
 	}
 	parent := e.agent
-	if *role == api.AgentRoleDatabaseHandler || *role == api.AgentRoleDeployment {
+	if api.PersistentAgentRole(*role) {
 		parent = ""
 	}
 	req := api.AddAgentRequest{
@@ -1153,6 +1163,9 @@ func cmdSpawn(e env, args []string) error {
 	}
 	if *role == api.AgentRoleDatabaseHandler {
 		req.TemplateDigest = handlerTemplateDigest(*prompt)
+	}
+	if *role == api.AgentRoleBacklogSteward {
+		req.TemplateDigest = stewardTemplateDigest(*model, *reasoning, *prompt)
 	}
 	if itemFlagCount > 0 {
 		contextData, readErr := readPreparedWorkContext(*workContextJSON, *workContextFile)
@@ -1187,8 +1200,8 @@ func cmdSpawn(e env, args []string) error {
 		opts.Env["CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION"] = "0"
 	}
 	var agent api.Agent
-	if *role == api.AgentRoleDatabaseHandler || *role == api.AgentRoleDeployment {
-		agent, err = ensureHandler(ctx, c, *task, req, opts)
+	if api.PersistentAgentRole(*role) {
+		agent, err = ensurePersistent(ctx, c, *task, req, opts)
 		if err != nil {
 			return err
 		}
@@ -1326,6 +1339,9 @@ func cmdClose(e env, args []string) error {
 	}
 	if a.Role == api.AgentRoleDatabaseHandler || a.Role == api.AgentRoleDeployment {
 		return errors.New("the active database handler remains available while the project is open")
+	}
+	if a.Role == api.AgentRoleBacklogSteward {
+		return errors.New("the backlog steward remains available while the project is open; rotate it with tt steward rotate")
 	}
 	if detail.Task.Status == api.TaskOpen && detail.Task.Orchestrator != "" && strings.EqualFold(a.Name, detail.Task.Orchestrator) {
 		return errors.New("the project orchestrator remains available while the project is open")

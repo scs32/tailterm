@@ -6,7 +6,7 @@ import { resolve, dirname } from "node:path";
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const output = resolve(root, "hub/internal/teamplan/plan.mjs");
 const entry = `
-import { exampleTeam } from "./client/team-examples.js";
+import { exampleTeam, PROJECT_ROLE_TEMPLATES } from "./client/team-examples.js";
 import { teamLaunchPlan } from "./client/team-launch-plan.js";
 import { prepareWorkItemContext } from "./client/work-item-context.js";
 import { createHubClient } from "./client/hub-client.js";
@@ -14,6 +14,12 @@ async function main() {
   let raw = "";
   for await (const chunk of process.stdin) raw += chunk;
   const input = JSON.parse(raw);
+  if (input.action === "project-role") {
+    const template = PROJECT_ROLE_TEMPLATES[input.role];
+    if (!template) throw new Error("Unknown project role template.");
+    process.stdout.write(JSON.stringify(template) + "\\n");
+    return;
+  }
   const client = createHubClient({ baseURL: input.hub, token: input.token,
     fetchImpl: (url, init) => fetch(url, init) });
   if (input.action === "set-orchestrator") {
