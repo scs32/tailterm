@@ -9,6 +9,29 @@ import { selectReleaseTargets, releaseBaselines, schemaChanged } from "./release
 import { buildInfo } from "./release-probe.mjs";
 
 const fileDigest = p => createHash("sha256").update(readFileSync(p)).digest("hex");
+const TRUENAS_BASE = "/mnt/deepfreeze/tailterm-hub", PAIR = ["hub", "bridge"];
+const DESTINATION = { hub: ["binaryDestination", "tailterm-hub"], bridge: ["bridgeBinaryDestination", "tailterm-discord"] };
+const same = (a, b) => JSON.stringify(a) === JSON.stringify(b);
+// b4: a failed target step journals {step, target, reason}. The reason is
+// only ever a fixed message this runner or its adapter tagged, or the facts
+// HostAdapter.command derives from a child (program name, exit status and the
+// classification/stage fields of its last JSON line); anything else is
+// "unclassified". Child stderr, messages, paths and tokens never reach it.
+const REASON = /^[A-Za-z0-9 ,.:;()_\/-]{1,160}$/;
+export function releaseError(reason) { const error = new Error(reason); error.releaseReason = reason; return error; }
+export function failureReason(error) { const r = error?.releaseReason; return typeof r === "string" && REASON.test(r) ? r : "unclassified"; }
+function childReason(argv, error) {
+  const base = p => String(p).split("/").pop(), program = /\.(py|mjs)$/.test(argv[1] || "") ? base(argv[1]) : base(argv[0]);
+  const name = /^[A-Za-z0-9._-]{1,64}$/.test(program) ? program : "program";
+  const how = error.code === "ETIMEDOUT" ? "timeout" : /^SIG[A-Z0-9]{1,12}$/.test(error.signal || "") ? `signal ${error.signal}` : Number.isInteger(error.status) ? `exit ${error.status}` : "not started";
+  let fields = "";
+  try {
+    const last = JSON.parse(String(error.stdout || "").trim().split("\n").at(-1)), token = v => typeof v === "string" && /^[a-z][a-z0-9-]{0,47}$/.test(v) ? v : null;
+    const classification = token(last?.classification), stage = token(last?.stage);
+    if (classification) fields = `: ${classification}${stage ? ` at ${stage}` : ""}`;
+  } catch {}
+  return `${name} ${how}${fields}`;
+}
 const sha = s => /^[a-f0-9]{40}$/.test(s || "");
 const git = (cwd,...argv) => execFileSync("git",argv,{cwd,encoding:"utf8",stdio:["ignore","pipe","pipe"]}).trim();
 export function integrateCandidate(cwd, job, branch="tasks-hub") {
@@ -94,7 +117,8 @@ export async function liveCheck(adapter, target, policy, sleep=ms=>new Promise(r
   }
 }
 // Adapter operations receive nonsecret job/artifact references. Neither captured
-// subprocess output nor arbitrary error strings are put into journal/receipt.
+// subprocess output nor arbitrary error strings are put into journal/receipt;
+// a failed target step records only the tagged reason failureReason allows.
 export async function runRelease(config, adapter) {
   const {cwd,job,baselines,journalPath}=config;
   const policy={startupMs:60000,failures:3,intervalMs:5000,relayCleanMs:30000,...config.testPolicy};
@@ -115,8 +139,8 @@ export async function runRelease(config, adapter) {
       throw new Error("Ambiguous journal requires handler reconciliation");
     }
   }
-  const checkpoint=()=>save(journalPath,state);
-  const fence=async()=>{if(await adapter.fence(job)!==true)throw new Error("Exact release fence lost");};
+  const checkpoint=()=>save(journalPath,state);let step=null;
+  const fence=async()=>{if(await adapter.fence(job)!==true)throw releaseError("release fence lost");};
   // Every selected target is live-verified before this runs, so nothing here
   // rolls back: a failed push is escalated once and the release stands.
   const pushAndFinish=async receipt=>{
@@ -141,24 +165,50 @@ export async function runRelease(config, adapter) {
     const selected=selectReleaseTargets(cwd,baselines,integration.integrated);
     const receipt={version:1,jobId:job.id,commit:integration.integrated,verificationDigest:job.verificationDigest,targets:[],outcome:"released"};
     state.receipt=receipt;checkpoint();
+    // Targets sharing one TrueNAS plan (hub and bridge together) deploy as a
+    // group: both effects are journaled before the single deploy, so any
+    // failure rolls both back to the prior pair.
+    const done=new Set(),pinned=(t,a)=>{
+      if(!a || !/^[a-f0-9]{64}$/.test(a.artifactSHA256||"") || !a.release)throw releaseError("Pinned artifact required");
+      if(PAIR.includes(t) && (!a.backup || !/^[a-f0-9]{64}$/.test(a.backupSHA256||"") || !/^[a-f0-9]{64}$/.test(a.preflightReceiptSHA256||"")))throw releaseError("Handler backup and external pin required");
+    };
     for(const target of selected){
-      await fence();const artifact=await adapter.prepare(target,integration.integrated);
-      if(!artifact || !/^[a-f0-9]{64}$/.test(artifact.artifactSHA256||"") || !artifact.release)throw new Error("Pinned artifact required");
-      if(["hub","bridge"].includes(target)){
-        if(!artifact.backup || !/^[a-f0-9]{64}$/.test(artifact.backupSHA256||"") || !/^[a-f0-9]{64}$/.test(artifact.preflightReceiptSHA256||""))throw new Error("Handler backup and external pin required");
-        if(artifact.schemaChanged){await fence();if(await adapter.rehearse(artifact)!==true)throw new Error("Backup-copy migration rehearsal failed");}
+      if(done.has(target))continue;
+      step={step:"prepare",target};
+      await fence();const artifact=await adapter.prepare(target,integration.integrated);pinned(target,artifact);
+      const group=[[target,artifact]];
+      for(const partner of (artifact.planTargets||[target]).filter(t=>t!==target)){
+        if(!selected.includes(partner))throw releaseError("Paired plan partner is not selected");
+        step={step:"prepare",target:partner};
+        await fence();const other=await adapter.prepare(partner,integration.integrated);pinned(partner,other);
+        if(["planPath","release","backup","backupSHA256","preflightReceiptSHA256"].some(k=>other[k]!==artifact[k]) || !same(other.planTargets,artifact.planTargets))throw releaseError("Paired plan members disagree");
+        group.push([partner,other]);
       }
-      const record={target,release:artifact.release,artifactSHA256:artifact.artifactSHA256,...(artifact.backup?{backup:artifact.backup,backupSHA256:artifact.backupSHA256,preflightReceiptSHA256:artifact.preflightReceiptSHA256}:{}),...(artifact.version?{version:artifact.version}:{}),...(artifact.deployment?{deployment:artifact.deployment}:{}),outcome:"failed"};
-      receipt.targets.push(record);state.effects.push({target,release:artifact.release,state:"attempting"});checkpoint();
-      await fence();await adapter.deploy(target,artifact);if(artifact.deployment)record.deployment=artifact.deployment;if(artifact.version)record.version=artifact.version;state.effects.at(-1).state="deployed";checkpoint();
-      if(!await liveCheck(adapter,target,policy,config.sleep,config.now))throw new Error("Live verification failed");
-      record.outcome="released";state.effects.at(-1).state="verified";checkpoint();
-      // A retained copy makes this target's next rollback possible; losing it
-      // only makes that later rollback unsafe, never this release.
-      try{await adapter.retain?.(target,artifact);}catch{}
+      // A shared backup copy is rehearsed once; the last build pinned the migration binary.
+      if(group.some(([,a])=>a.schemaChanged)){step={step:"rehearse",target};await fence();if(await adapter.rehearse(group.at(-1)[1])!==true)throw releaseError("Backup-copy migration rehearsal failed");}
+      const records=group.map(([t,a])=>{
+        const record={target:t,release:a.release,artifactSHA256:a.artifactSHA256,...(a.backup?{backup:a.backup,backupSHA256:a.backupSHA256,preflightReceiptSHA256:a.preflightReceiptSHA256}:{}),...(a.version?{version:a.version}:{}),...(a.deployment?{deployment:a.deployment}:{}),outcome:"failed"};
+        receipt.targets.push(record);state.effects.push({target:t,release:a.release,state:"attempting"});return record;
+      });
+      checkpoint();
+      step={step:"deploy",target};
+      await fence();await adapter.deploy(target,artifact);
+      group.forEach(([t,a],i)=>{if(a.deployment)records[i].deployment=a.deployment;if(a.version)records[i].version=a.version;state.effects.find(e=>e.target===t).state="deployed";});checkpoint();
+      for(const [i,[t,a]] of group.entries()){
+        step={step:"live-check",target:t};
+        if(!await liveCheck(adapter,t,policy,config.sleep,config.now))throw releaseError("live verification failed");
+        records[i].outcome="released";state.effects.find(e=>e.target===t).state="verified";checkpoint();
+        // A retained copy makes this target's next rollback possible; losing it
+        // only makes that later rollback unsafe, never this release.
+        try{await adapter.retain?.(t,a);}catch{}
+        done.add(t);
+      }
     }
+    step=null;
     return await pushAndFinish(receipt);
-  } catch {
+  } catch (error) {
+    // The first failed target step is kept; a resumed run never rewrites it.
+    if(step && !state.failure){state.failure={...step,reason:failureReason(error)};checkpoint();}
     if(state.phase==="pushing")return {jobId:job.id,outcome:"pushing"};
     if(state.phase==="finishing" || state.phase==="receipt_pending"){
       state.phase="receipt_pending";checkpoint();return {jobId:job.id,outcome:"receipt_pending"};
@@ -210,7 +260,8 @@ export class HostAdapter {
   constructor(config,job){this.config=config;this.job=job;this.artifacts=new Map();this.serial=0;}
   command(argv,cwd=this.config.cwd){
     if(!Array.isArray(argv)||!argv.length||argv.some(a=>typeof a!=="string"||/[\0\r\n]/.test(a)))throw new Error("Invalid host operation argv");
-    try{return execFileSync(argv[0],argv.slice(1),{cwd,encoding:"utf8",stdio:["ignore","pipe","pipe"],maxBuffer:8*1024*1024,timeout:600000});}catch{throw new Error("Host operation failed");}
+    try{return execFileSync(argv[0],argv.slice(1),{cwd,encoding:"utf8",stdio:["ignore","pipe","pipe"],maxBuffer:8*1024*1024,timeout:600000});}
+    catch(error){const failed=new Error("Host operation failed");failed.releaseReason=childReason(argv,error);throw failed;}
   }
   native(operation,extra=[],expectedGeneration=this.job.generation){
     const args=[this.config.tt||"tt","deployment",operation,"--job",this.job.id,"--generation",String(expectedGeneration),"--request-id",`${this.job.id}-${operation}-${expectedGeneration}`,...extra];
@@ -251,6 +302,10 @@ export class HostAdapter {
     if(fileDigest(path)!==this.job.inputsDigest || this.job.inputsCommit!==commit)throw new Error("Handler input digest binding required");
     const input=JSON.parse(raw);
     if(input.version!==1 || input.jobId!==this.job.id || input.commit!==commit || input.acceptedCommit!==this.job.commit || input.verificationDigest!==this.job.verificationDigest)throw new Error("Exact job input binding required");
+    // Two TrueNAS plans made before either deploy would each pin the other's
+    // pre-release mount, so hub and bridge together must share one plan.
+    const {hub,bridge}=input.targets||{};
+    if(hub && bridge && (!same(hub.planTargets,PAIR) || !same(bridge.planTargets,PAIR) || ["release","planPath","preflightReceipt","preflightReceiptSHA256","backup","backupSHA256"].some(k=>hub[k]!==bridge[k])))throw releaseError("Hub and bridge need one paired plan");
     return input;
   }
   captureMiniRollback(artifact){
@@ -262,11 +317,12 @@ export class HostAdapter {
     if(git(this.config.cwd,"rev-parse","HEAD")!==commit)throw new Error("Candidate build checkout mismatch");
     const t=this.config.targets[target];if(!t)throw new Error("Target host config required");
     const input=this.jobInputs(commit),perJob=input.targets?.[target];if(!perJob)throw new Error("Exact job target input required");
-    const release=this.job.id+"-"+commit.slice(0,12)+"-"+target;
-    if(perJob.release!==release)throw new Error("Unique job release identity required");
+    const planTargets=PAIR.includes(target)?perJob.planTargets||[target]:undefined,paired=same(planTargets,PAIR);
+    const release=this.job.id+"-"+commit.slice(0,12)+"-"+(paired?"truenas":target);
+    if(perJob.release!==release)throw releaseError("Unique job release identity required");
     // Stable config contains private probe/host references only. Backup, release,
     // compatibility and rollback inputs come from the handler-pinned job manifest.
-    const artifact={installPath:t.installPath,relayRestart:t.relayRestart,liveProbe:t.liveProbe,rollbackProbe:t.rollbackProbe,...perJob,release,commit,rollbackSafe:perJob.rollbackSafe===true};
+    const artifact={installPath:t.installPath,relayRestart:t.relayRestart,liveProbe:t.liveProbe,rollbackProbe:t.rollbackProbe,...perJob,release,commit,rollbackSafe:perJob.rollbackSafe===true,...(planTargets?{planTargets}:{})};
     const baselines=this.baselines||this.config.baselines;
     artifact.schemaChanged=["hub","bridge"].includes(target) && schemaChanged(this.config.cwd,baselines.hub,commit);
     if(target==="tailos"){
@@ -294,7 +350,10 @@ export class HostAdapter {
     if(["hub","bridge"].includes(target)){
       if(perJob.backupJobId!==this.job.id || !perJob.backup?.includes(this.job.id))throw new Error("Fresh job backup identity required");
       const plan=JSON.parse(readFileSync(perJob.planPath,"utf8"));
-      if(plan.deployment.releaseName!==release || plan.backupDestination!==perJob.backup || fileDigest(perJob.preflightReceipt)!==perJob.preflightReceiptSHA256)throw new Error("Exact job preflight binding required");
+      if(plan.deployment.releaseName!==release || plan.backupDestination!==perJob.backup || fileDigest(perJob.preflightReceipt)!==perJob.preflightReceiptSHA256)throw releaseError("Exact job preflight binding required");
+      // Every target the plan changes mounts this release; a partner pinned
+      // anywhere else would put an older binary back.
+      if(!planTargets.includes(target) || !same(plan.deployment.targets,planTargets) || planTargets.some(p=>plan.deployment[DESTINATION[p][0]]!==`${TRUENAS_BASE}/releases/${release}/${DESTINATION[p][1]}`))throw releaseError("Plan must mount this release for every target it changes");
     }
     if(target==="mini")this.captureMiniRollback(artifact);
     this.artifacts.set(target,artifact);return artifact;
@@ -315,10 +374,13 @@ export class HostAdapter {
     return true;
   }
   async deploy(target,a){
-    if(a.artifactPath && fileDigest(a.artifactPath)!==a.artifactSHA256)throw new Error("Pinned candidate artifact changed");
+    if(a.artifactPath && fileDigest(a.artifactPath)!==a.artifactSHA256)throw releaseError("Pinned candidate artifact changed");
     if(target==="hub" || target==="bridge"){
-      const plan=JSON.parse(readFileSync(a.planPath,"utf8"));
-      if(JSON.stringify(plan.deployment.targets)!==JSON.stringify([target]))throw new Error("Exact per-target middleware plan required");
+      const plan=JSON.parse(readFileSync(a.planPath,"utf8")),planTargets=a.planTargets||[target];
+      if(!planTargets.includes(target) || !same(plan.deployment.targets,planTargets))throw releaseError("Exact middleware plan required");
+      // One run deploys every member of a paired plan, so each partner must be
+      // prepared from the same plan with its pinned artifact unchanged.
+      for(const p of planTargets.filter(t=>t!==target)){const other=this.artifacts.get(p);if(!other || other.planPath!==a.planPath || other.release!==a.release || !other.artifactPath || fileDigest(other.artifactPath)!==other.artifactSHA256)throw releaseError("Paired artifact changed");}
       this.command(["python3","scripts/deploy-truenas-hub.py",a.release,"--plan",a.planPath,"--preflight-receipt",a.preflightReceipt,"--preflight-receipt-sha256",a.preflightReceiptSHA256,"--update"]);
     }else if(target==="mini"){
       const {copyFileSync,chmodSync}=await import("node:fs");

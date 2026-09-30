@@ -2,9 +2,10 @@
 //
 //   node scripts/release-inputs.mjs --config PRIVATE --job ID [--dry-run]
 //
-// It selects targets exactly as the deployer does, creates each hub/bridge
-// backup through the handler-owned preflight, pins its receipt, and names
-// rollback programs for the probed live releases. It writes
+// It selects targets exactly as the deployer does, creates each TrueNAS
+// backup through the handler-owned preflight (one plan for hub and bridge
+// together, else one per target), pins its receipt, and names rollback
+// programs for the probed live releases. It writes
 // journalDirectory/ID-inputs.json (0600) once and prints the exact
 // `tt deployment inputs` command to import its digest. --dry-run reads the job
 // and prints the planned bindings without host calls or writes. Nothing
@@ -55,9 +56,15 @@ export async function buildInputs(config, jobId, { dryRun = false, deps }) {
   const dir = config.journalDirectory, manifestPath = join(dir, `${job.id}-inputs.json`);
   const command = [config.tt || "tt", "deployment", "inputs", "--job", job.id, "--generation", String(job.generation), "--commit", commit, "--file", manifestPath, "--request-id", `${job.id}-inputs-${commit.slice(0, 12)}`];
   const binding = { version: 1, jobId: job.id, commit, acceptedCommit: job.commit, verificationDigest: job.verificationDigest };
-  const plannedTrueNAS = target => ({ backupJobId: job.id, backup: `${BASE}/backups/before-${job.id}-${target}.sqlite`, planPath: join(dir, `${job.id}-${target}-plan.json`), preflightReceipt: join(dir, `${job.id}-${target}-preflight.json`), ...(schema ? { backupCopy: join(dir, `${job.id}-${target}-backup.sqlite`) } : {}) });
+  // Hub and bridge selected together share ONE plan, release and backup:
+  // two plans made before either deploy would each pin the other's
+  // pre-release mount, and the second would put the old partner back.
+  const pair = ["hub", "bridge"].filter(t => selected.includes(t));
+  const planTargets = t => pair.length === 2 ? pair : [t], planName = t => pair.length === 2 ? "truenas" : t;
+  const releaseOf = t => `${job.id}-${commit.slice(0, 12)}-${BINARY[t] ? planName(t) : t}`;
+  const plannedTrueNAS = t => { const name = planName(t); return { backupJobId: job.id, backup: `${BASE}/backups/before-${job.id}-${name}.sqlite`, planPath: join(dir, `${job.id}-${name}-plan.json`), preflightReceipt: join(dir, `${job.id}-${name}-preflight.json`), ...(schema ? { backupCopy: join(dir, `${job.id}-${name}-backup.sqlite`) } : {}), planTargets: planTargets(t) }; };
   if (dryRun) {
-    const targets = Object.fromEntries(selected.map(t => [t, { release: `${job.id}-${commit.slice(0, 12)}-${t}`, ...(BINARY[t] ? plannedTrueNAS(t) : {}) }]));
+    const targets = Object.fromEntries(selected.map(t => [t, { release: releaseOf(t), ...(BINARY[t] ? plannedTrueNAS(t) : {}) }]));
     return { dryRun: true, ...binding, generation: job.generation, schemaChanged: schema, targets, manifest: manifestPath, command };
   }
   if (existsSync(manifestPath)) throw new Error("Job manifest already written; the imported digest is immutable");
@@ -67,27 +74,33 @@ export async function buildInputs(config, jobId, { dryRun = false, deps }) {
     else live[t] = await deps.probe(["live", t]);
   }
   const probeArgv = ["node", "scripts/release-probe.mjs", "rollback"], cfg = ["--config", deps.configPath];
-  const targets = {};
+  const targets = {}, plans = {};
   for (const t of selected) {
-    const release = `${job.id}-${commit.slice(0, 12)}-${t}`, prior = live[t];
+    const release = releaseOf(t), prior = live[t];
     if (BINARY[t]) {
-      const template = JSON.parse(readFileSync(config.inputs.planTemplate, "utf8")), planned = plannedTrueNAS(t);
-      const deployment = { ...template.deployment, releaseName: release, targets: [t] };
-      for (const [s, [field, binary]] of Object.entries(BINARY)) {
-        if (!(field in deployment) && s !== t) continue;
-        // The other target keeps its live retained mount.
-        deployment[field] = s === t ? `${BASE}/releases/${release}/${binary}` : `${BASE}/releases/${live[s].release}/${binary}`;
-      }
-      writePrivate(planned.planPath, JSON.stringify({ ...template, requestId: `${job.id}-${t}-backup`, backupDestination: planned.backup, deployment }));
-      deps.preflight(planned.planPath, planned.preflightReceipt);
-      const receipt = JSON.parse(readFileSync(planned.preflightReceipt, "utf8"));
-      if (!["success", "already-satisfied"].includes(receipt.status) || receipt.backupDestination !== planned.backup || !/^[a-f0-9]{64}$/.test(receipt.sha256 || "")) throw new Error("Verified job backup receipt required");
-      if (planned.backupCopy) {
-        deps.copyBackup(planned.backup, planned.backupCopy);
-        if (fileSHA(planned.backupCopy) !== receipt.sha256) { rmSync(planned.backupCopy); throw new Error("Backup copy hash mismatch"); }
-      }
+      const planned = plannedTrueNAS(t);
+      plans[planned.planPath] ??= (() => {
+        const template = JSON.parse(readFileSync(config.inputs.planTemplate, "utf8"));
+        const deployment = { ...template.deployment, releaseName: release, targets: planned.planTargets };
+        for (const [s, [field, binary]] of Object.entries(BINARY)) {
+          const changing = planned.planTargets.includes(s);
+          if (!(field in deployment) && !changing) continue;
+          // A target this job does not change keeps its live retained mount.
+          deployment[field] = changing ? `${BASE}/releases/${release}/${binary}` : `${BASE}/releases/${live[s].release}/${binary}`;
+        }
+        writePrivate(planned.planPath, JSON.stringify({ ...template, requestId: `${job.id}-${planName(t)}-backup`, backupDestination: planned.backup, deployment }));
+        deps.preflight(planned.planPath, planned.preflightReceipt);
+        const receipt = JSON.parse(readFileSync(planned.preflightReceipt, "utf8"));
+        if (!["success", "already-satisfied"].includes(receipt.status) || receipt.backupDestination !== planned.backup || !/^[a-f0-9]{64}$/.test(receipt.sha256 || "")) throw new Error("Verified job backup receipt required");
+        if (planned.backupCopy) {
+          deps.copyBackup(planned.backup, planned.backupCopy);
+          if (fileSHA(planned.backupCopy) !== receipt.sha256) { rmSync(planned.backupCopy); throw new Error("Backup copy hash mismatch"); }
+        }
+        return { backupSHA256: receipt.sha256, preflightReceiptSHA256: fileSHA(planned.preflightReceipt) };
+      })();
+      const { backupSHA256, preflightReceiptSHA256 } = plans[planned.planPath];
       const safe = /^[A-Za-z0-9._-]+$/.test(prior.release || "") && /^[a-f0-9]{64}$/.test(prior.artifactSHA256 || "") && prior.integrity === true;
-      targets[t] = { release, ...planned, backupSHA256: receipt.sha256, preflightReceiptSHA256: fileSHA(planned.preflightReceipt), rollbackSafe: safe,
+      targets[t] = { release, ...planned, backupSHA256, preflightReceiptSHA256, rollbackSafe: safe,
         ...(safe ? { rollbackProgram: ["python3", "scripts/deploy-truenas-hub.py", "--rollback-to", prior.release, "--target", t, "--expect-sha256", prior.artifactSHA256],
           rollbackProbe: [...probeArgv, t, "--expect-release", prior.release, "--expect-sha", prior.artifactSHA256, ...cfg] } : {}) };
     } else if (t === "mini") {

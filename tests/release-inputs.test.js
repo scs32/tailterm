@@ -35,34 +35,53 @@ function setup(file, { state = "claimed", released = [] } = {}) {
     git: argv => git(r.cwd, ...argv),
     probe: async argv => { calls.push(["probe", ...argv]); return LIVE[argv[1]]; },
     preflight: (plan, receipt) => { calls.push(["preflight", plan]); const p = JSON.parse(readFileSync(plan, "utf8")); writeFileSync(receipt, JSON.stringify({ status: "success", backupDestination: p.backupDestination, sha256: hash("backup-" + p.requestId), secret: SECRET })); },
-    copyBackup: (remote, local) => { calls.push(["copy", remote]); writeFileSync(local, "backup-" + job.id + "-" + (remote.includes("-hub.") ? "hub" : "bridge") + "-backup"); },
+    copyBackup: (remote, local) => { calls.push(["copy", remote]); writeFileSync(local, "backup-" + job.id + "-" + remote.match(/before-rel_0123abcd-(\w+)\.sqlite$/)[1] + "-backup"); },
   };
   return { r, commit, home, config, job, deps, calls };
 }
 
-test("a store change selects hub, bridge and Mini with exact per-job bindings, pinned backups and live rollback programs", async () => {
+test("a store change deploys hub and bridge from ONE plan and backup with each target's own live rollback", async () => {
   const f = setup("hub/internal/store/x.go");
   const out = await buildInputs(f.config, f.job.id, { deps: f.deps });
   const path = join(f.home, "rel_0123abcd-inputs.json"), raw = readFileSync(path, "utf8"), m = JSON.parse(raw), sha12 = f.commit.slice(0, 12);
   assert.equal(statSync(path).mode & 0o777, 0o600);
   assert.deepEqual(out, { manifest: path, sha256: hash(raw), targets: ["hub", "bridge", "mini"], command: ["tt", "deployment", "inputs", "--job", "rel_0123abcd", "--generation", "4", "--commit", f.commit, "--file", path, "--request-id", `rel_0123abcd-inputs-${sha12}`] });
   assert.deepEqual({ version: m.version, jobId: m.jobId, commit: m.commit, acceptedCommit: m.acceptedCommit, verificationDigest: m.verificationDigest }, { version: 1, jobId: "rel_0123abcd", commit: f.commit, acceptedCommit: f.commit, verificationDigest: "d".repeat(64) });
-  const hub = m.targets.hub;
-  assert.equal(hub.release, `rel_0123abcd-${sha12}-hub`); assert.equal(hub.backupJobId, "rel_0123abcd"); assert.equal(hub.backup, `${BASE}/backups/before-rel_0123abcd-hub.sqlite`);
-  assert.equal(hub.preflightReceiptSHA256, hash(readFileSync(hub.preflightReceipt))); assert.equal(hub.backupSHA256, hash("backup-rel_0123abcd-hub-backup"));
-  assert.equal(hub.backupCopy, join(f.home, "rel_0123abcd-hub-backup.sqlite")); assert.equal(hash(readFileSync(hub.backupCopy)), hub.backupSHA256);
+  const hub = m.targets.hub, bridge = m.targets.bridge, release = `rel_0123abcd-${sha12}-truenas`;
+  assert.equal(hub.release, release); assert.equal(hub.backupJobId, "rel_0123abcd"); assert.equal(hub.backup, `${BASE}/backups/before-rel_0123abcd-truenas.sqlite`);
+  assert.deepEqual(hub.planTargets, ["hub", "bridge"]); assert.equal(hub.planPath, join(f.home, "rel_0123abcd-truenas-plan.json"));
+  assert.equal(hub.preflightReceiptSHA256, hash(readFileSync(hub.preflightReceipt))); assert.equal(hub.backupSHA256, hash("backup-rel_0123abcd-truenas-backup"));
+  assert.equal(hub.backupCopy, join(f.home, "rel_0123abcd-truenas-backup.sqlite")); assert.equal(hash(readFileSync(hub.backupCopy)), hub.backupSHA256);
+  for (const k of ["release", "planTargets", "backupJobId", "backup", "planPath", "preflightReceipt", "preflightReceiptSHA256", "backupSHA256", "backupCopy"]) assert.deepEqual(bridge[k], hub[k], k);
+  assert.deepEqual(f.calls.filter(c => c[0] === "preflight"), [["preflight", hub.planPath]]);
+  assert.deepEqual(f.calls.filter(c => c[0] === "copy"), [["copy", hub.backup]]);
+  assert.deepEqual(readdirSync(f.home).filter(n => n.endsWith("-plan.json")), ["rel_0123abcd-truenas-plan.json"]);
   assert.deepEqual(hub.rollbackProgram, ["python3", "scripts/deploy-truenas-hub.py", "--rollback-to", "rel_prev-111111111111-hub", "--target", "hub", "--expect-sha256", "2".repeat(64)]);
   assert.deepEqual(hub.rollbackProbe, ["node", "scripts/release-probe.mjs", "rollback", "hub", "--expect-release", "rel_prev-111111111111-hub", "--expect-sha", "2".repeat(64), "--config", f.deps.configPath]);
-  assert.equal(hub.rollbackSafe, true);
-  const plan = JSON.parse(readFileSync(hub.planPath, "utf8"));
+  assert.deepEqual(bridge.rollbackProgram, ["python3", "scripts/deploy-truenas-hub.py", "--rollback-to", "20260929-live", "--target", "bridge", "--expect-sha256", "3".repeat(64)]);
+  assert.deepEqual(bridge.rollbackProbe, ["node", "scripts/release-probe.mjs", "rollback", "bridge", "--expect-release", "20260929-live", "--expect-sha", "3".repeat(64), "--config", f.deps.configPath]);
+  assert.equal(hub.rollbackSafe, true); assert.equal(bridge.rollbackSafe, true);
+  const planText = readFileSync(hub.planPath, "utf8"), plan = JSON.parse(planText);
   assert.equal(statSync(hub.planPath).mode & 0o777, 0o600);
-  assert.deepEqual(plan.deployment.targets, ["hub"]); assert.equal(plan.deployment.releaseName, hub.release); assert.equal(plan.backupDestination, hub.backup); assert.equal(plan.requestId, "rel_0123abcd-hub-backup");
-  assert.equal(plan.deployment.binaryDestination, `${BASE}/releases/${hub.release}/tailterm-hub`); assert.equal(plan.deployment.bridgeBinaryDestination, `${BASE}/releases/20260929-live/tailterm-discord`);
-  const bridgePlan = JSON.parse(readFileSync(m.targets.bridge.planPath, "utf8"));
-  assert.equal(bridgePlan.deployment.binaryDestination, `${BASE}/releases/rel_prev-111111111111-hub/tailterm-hub`); assert.equal(bridgePlan.deployment.bridgeBinaryDestination, `${BASE}/releases/rel_0123abcd-${sha12}-bridge/tailterm-discord`);
+  assert.deepEqual(plan.deployment.targets, ["hub", "bridge"]); assert.equal(plan.deployment.releaseName, release); assert.equal(plan.backupDestination, hub.backup); assert.equal(plan.requestId, "rel_0123abcd-truenas-backup");
+  assert.equal(plan.deployment.binaryDestination, `${BASE}/releases/${release}/tailterm-hub`); assert.equal(plan.deployment.bridgeBinaryDestination, `${BASE}/releases/${release}/tailterm-discord`);
+  assert.ok(!planText.includes("rel_prev-111111111111-hub") && !planText.includes("20260929-live"), "no live release is pinned");
   assert.deepEqual(m.targets.mini, { release: `rel_0123abcd-${sha12}-mini`, rollbackSafe: true, rollbackProbe: ["node", "scripts/release-probe.mjs", "rollback", "mini", "--expect-sha", "4".repeat(64), "--config", f.deps.configPath] });
   assert.ok(!raw.includes(SECRET) && !JSON.stringify(out).includes(SECRET));
   await assert.rejects(buildInputs(f.config, f.job.id, { deps: f.deps }), /already written/);
+});
+
+test("a single changed TrueNAS target gets its own plan pinning the live partner", async () => {
+  for (const [file, t, partner, field, mount] of [["hub/internal/broker/x.go", "hub", "bridge", "bridgeBinaryDestination", "20260929-live/tailterm-discord"], ["hub/internal/bridge/x.go", "bridge", "hub", "binaryDestination", "rel_prev-111111111111-hub/tailterm-hub"]]) {
+    const f = setup(file), m = JSON.parse(readFileSync((await buildInputs(f.config, f.job.id, { deps: f.deps })).manifest, "utf8")), sha12 = f.commit.slice(0, 12);
+    assert.deepEqual(Object.keys(m.targets), [t]);
+    const target = m.targets[t], plan = JSON.parse(readFileSync(target.planPath, "utf8"));
+    assert.equal(target.release, `rel_0123abcd-${sha12}-${t}`); assert.deepEqual(target.planTargets, [t]); assert.equal(target.backup, `${BASE}/backups/before-rel_0123abcd-${t}.sqlite`);
+    assert.deepEqual(plan.deployment.targets, [t]); assert.equal(plan.deployment[field], `${BASE}/releases/${mount}`, `${partner} keeps its live mount`);
+    const own = t === "hub" ? ["binaryDestination", "tailterm-hub"] : ["bridgeBinaryDestination", "tailterm-discord"];
+    assert.equal(plan.deployment[own[0]], `${BASE}/releases/${target.release}/${own[1]}`);
+    assert.equal(f.calls.filter(c => c[0] === "preflight").length, 1);
+  }
 });
 
 test("the manifest satisfies the deployer's exact job input binding", async () => {
@@ -98,7 +117,8 @@ test("dry run prints the planned bindings with no host call or write", async () 
   const out = await buildInputs(f.config, f.job.id, { dryRun: true, deps: f.deps }), sha12 = f.commit.slice(0, 12);
   assert.equal(out.dryRun, true); assert.equal(out.generation, 4); assert.equal(out.schemaChanged, false); assert.equal(out.commit, f.commit); assert.equal(out.acceptedCommit, f.commit);
   assert.deepEqual(Object.keys(out.targets), ["hub", "bridge", "mini"]);
-  assert.deepEqual(out.targets.bridge, { release: `rel_0123abcd-${sha12}-bridge`, backupJobId: "rel_0123abcd", backup: `${BASE}/backups/before-rel_0123abcd-bridge.sqlite`, planPath: join(f.home, "rel_0123abcd-bridge-plan.json"), preflightReceipt: join(f.home, "rel_0123abcd-bridge-preflight.json") });
+  const shared = { release: `rel_0123abcd-${sha12}-truenas`, backupJobId: "rel_0123abcd", backup: `${BASE}/backups/before-rel_0123abcd-truenas.sqlite`, planPath: join(f.home, "rel_0123abcd-truenas-plan.json"), preflightReceipt: join(f.home, "rel_0123abcd-truenas-preflight.json"), planTargets: ["hub", "bridge"] };
+  assert.deepEqual(out.targets.hub, shared); assert.deepEqual(out.targets.bridge, shared);
   assert.deepEqual(f.calls.map(c => c[0]), ["tt"]); assert.deepEqual(readdirSync(f.home), ["plan-template.json"]);
 });
 

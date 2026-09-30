@@ -343,6 +343,44 @@ ROLLBACK_MOUNTS = {
     "hub": ("hub", "/opt/tailterm-hub", "tailterm-hub"),
     "bridge": ("discord-bridge", "/opt/tailterm-discord", "tailterm-discord"),
 }
+DESTINATIONS = {"hub": "binaryDestination", "bridge": "bridgeBinaryDestination"}
+
+
+def _configured(deployment: dict[str, Any]) -> list[str]:
+    return ["hub", "bridge"] if deployment.get("discordTokenPath") else ["hub"]
+
+
+def release_directories(deployment: dict[str, Any]) -> list[str]:
+    """The new release directory of every selected target, once each.
+
+    A bridge-only plan retains the hub's mount, so its own release directory
+    comes from the bridge destination, not the hub's.
+    """
+    selected = deployment.get("targets", ["hub", "bridge"])
+    directories: list[str] = []
+    for target in _configured(deployment):
+        if target in selected:
+            directory = str(pathlib.PurePosixPath(deployment[DESTINATIONS[target]]).parent)
+            if directory not in directories:
+                directories.append(directory)
+    return directories
+
+
+def stale_partner(deployment: dict[str, Any], compose: Any) -> bool:
+    """True when a single-target plan's retained partner is not what runs now.
+
+    Such a plan would put an older partner back. A paired plan (or a hub
+    without a bridge) has no partner, so nothing can be stale.
+    """
+    selected = deployment.get("targets", ["hub", "bridge"])
+    partners = [t for t in _configured(deployment) if t not in selected]
+    for partner in partners:
+        service, mount, _ = ROLLBACK_MOUNTS[partner]
+        volumes = compose.get("services", {}).get(service, {}).get("volumes") if isinstance(compose, dict) else None
+        live = [v for v in volumes or [] if isinstance(v, str) and v.split(":")[1:2] == [mount]]
+        if live != [f"{deployment[DESTINATIONS[partner]]}:{mount}:ro"]:
+            return True
+    return False
 
 
 def rollback(argv: list[str]) -> int:
@@ -487,6 +525,30 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     last_completed_stage = "remote-identity"
+    if arguments.update and len(_configured(deployment)) > len(deployment.get("targets", ["hub", "bridge"])):
+        # A single-target plan names its partner's retained mount; refuse it
+        # unless that is the mount live now, before any mutation.
+        try:
+            live = json.loads(_remote(plan, actual_host, f"midclt call app.config {APP_NAME}",
+                                      stage="partner-mount", last_completed_stage=last_completed_stage, preflight=preflight))
+            stale = stale_partner(deployment, live)
+        except (PreflightFailure, ValueError, AttributeError, TypeError):
+            stale = True
+        if stale:
+            _emit(
+                PreflightFailure(
+                    "verification-failed",
+                    "the plan's retained partner mount is not the live one",
+                    phase="deployment",
+                    stage="partner-mount",
+                    mutationStarted=False,
+                    backupAlreadyVerified=True,
+                    backupDestination=preflight["backupDestination"],
+                    backupSha256=preflight["sha256"],
+                ).result(plan)
+            )
+            return 2
+        last_completed_stage = "partner-mount"
     stage = "token"
     try:
         token_path = shlex.quote(deployment["tokenPath"])
@@ -503,13 +565,10 @@ def main(argv: list[str] | None = None) -> int:
 
         stage = "release-directory"
         binary_destination = deployment["binaryDestination"]
-        release_directory = shlex.quote(
-            str(pathlib.PurePosixPath(binary_destination).parent)
-        )
         _remote(
             plan,
             actual_host,
-            f"mkdir -p {release_directory}",
+            "mkdir -p " + " ".join(shlex.quote(d) for d in release_directories(deployment)),
             stage=stage,
             last_completed_stage=last_completed_stage,
             preflight=preflight,

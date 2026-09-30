@@ -53,8 +53,19 @@ and retained rollback artifacts before activation. Hub/bridge consume
 handler-created online backups and externally saved receipt pins; the deployer
 never manufactures a backup pin from its input. Schema changes require
 `tailterm-hub --migrate-only BACKUP_COPY`; this path opens only the supplied copy
-and starts no listener, broker, relay or Tailscale node. Per-target middleware
-plans retain unchanged executable mounts. Mini builds then installs atomically,
+and starts no listener, broker, relay or Tailscale node. A release that selects
+both hub and bridge deploys them from ONE TrueNAS plan (`deployment.targets
+["hub","bridge"]`, one release directory `ID-SHA12-truenas`, one backup and
+preflight): two plans made before either deploy would each pin the other's
+pre-release mount, and the second deploy would put the old partner back. The
+runner prepares both, journals both effects as attempting, runs
+`deploy-truenas-hub.py` once, then live-checks hub and then bridge; any failure
+from the deploy on rolls back bridge, then hub, each with its own rollback
+program, so both return to the prior pair. A plan for one target retains the
+other target's live mount, and `deploy-truenas-hub.py --update` refuses it (stage
+`partner-mount`, before any mutation) when that mount is not the one live now.
+The runner refuses unpaired hub and bridge inputs before publication, and a plan
+that does not mount the new release for every target it changes. Mini builds then installs atomically,
 retains a rollback binary and restarts only its configured user relay. TailOS
 builds, verifies and invokes Wrangler explicitly for project `tailos`.
 
@@ -209,7 +220,15 @@ standing order to supersede.
   release and hash equal the expected prior values; database writes are preserved
   when the state mount is unchanged and the hub responds.
 
-A probe failure prints nothing and exits 1. `scripts/deploy-truenas-hub.py
+A probe failure prints nothing and exits 1. When a target step fails, the
+journal's `failure` field keeps the first one as `{step, target, reason}`: step
+is `prepare`, `rehearse`, `deploy` or `live-check`. The reason is at most 160
+characters and is only a fixed message the runner or adapter tagged (for example
+`live verification failed` or `release fence lost`) or, for a host program, its
+name, exit status and the `classification`/`stage` of its last JSON line (for
+example `deploy-truenas-hub.py exit 2: remote-operation-failed at
+bridge-binary-upload`); anything else is `unclassified`. Program stderr,
+messages, paths and credentials never reach it. `scripts/deploy-truenas-hub.py
 --rollback-to RELEASE --target hub|bridge --expect-sha256 SHA` verifies the
 retained binary at `BASE/releases/RELEASE/` over SSH, then changes only that
 target's executable mount in the live app definition (`app.update`, `app.start`).
@@ -248,14 +267,18 @@ release job"), the project handler, on the Mini in the dedicated checkout:
 
 1. `node scripts/release-inputs.mjs --config PRIVATE --job ID --dry-run` and check
    the job, generation, commit, selected targets and release names.
-2. `node scripts/release-inputs.mjs --config PRIVATE --job ID`. For each selected
-   hub/bridge target it writes a per-target plan from `inputs.planTemplate`
-   (`deployment.targets = [TARGET]`, release `ID-SHA12-TARGET`, backup
-   `before-ID-TARGET.sqlite`, the other target's live mount retained), runs
-   `truenas_release_preflight.py --plan --receipt-output` to create the backup,
-   pins the receipt hash, copies the backup locally when the store schema changed,
-   and names `--rollback-to` and rollback probe commands for the probed live
-   release. Mini and TailOS get their rollback probe and retained-dist program.
+2. `node scripts/release-inputs.mjs --config PRIVATE --job ID`. It writes one
+   TrueNAS plan from `inputs.planTemplate`: when hub and bridge are both
+   selected, `ID-truenas-plan.json` with `deployment.targets = ["hub","bridge"]`,
+   release `ID-SHA12-truenas` for both binaries and backup
+   `before-ID-truenas.sqlite`; when only one is selected, `ID-TARGET-plan.json`
+   with `deployment.targets = [TARGET]`, release `ID-SHA12-TARGET`, backup
+   `before-ID-TARGET.sqlite` and the other target's live mount retained. For
+   each plan it runs `truenas_release_preflight.py --plan --receipt-output` once
+   to create the backup, pins the receipt hash and copies the backup locally when
+   the store schema changed. Each hub/bridge manifest entry records its
+   `planTargets` and names `--rollback-to` and rollback probe commands for that
+   target's own probed live release. Mini and TailOS get their rollback probe and retained-dist program.
    The manifest `journalDirectory/ID-inputs.json` is written once, mode 0600.
 3. Run the printed `tt deployment inputs --job ID --generation N --commit SHA
    --file PATH --request-id KEY` and reply to the deployer's request with the
@@ -280,7 +303,8 @@ with a pending receipt for reconciliation. `tt project-pause pause` closes the
 deployer with the rest of the project; resuming then needs provisioning again.
 
 **Reconcile.** A `blocked` job, an ambiguous journal or a stale host lock needs
-`tt deployment reconcile` with a typed inspection (above). Never delete the
+`tt deployment reconcile` with a typed inspection (above). The journal's
+`failure` field says which step failed and why. Never delete the
 journal or lock by hand.
 
 **Manual rollback, per target.**
@@ -288,7 +312,8 @@ journal or lock by hand.
   --target hub|bridge --expect-sha256 PRIOR_SHA`, then `node
   scripts/release-probe.mjs rollback TARGET --expect-release PRIOR_RELEASE
   --expect-sha PRIOR_SHA --config PRIVATE`. The prior release and hash are in the
-  job's manifest (`rollbackProgram`) or a previous receipt.
+  job's manifest (`rollbackProgram`) or a previous receipt. After a paired
+  release roll back both, bridge first, each to its own prior release.
 - Mini: copy `journalDirectory/ID-mini-before` over the installed `tt`
   atomically (copy to `tt.rollback`, then rename) and restart the relay with the
   configured command.

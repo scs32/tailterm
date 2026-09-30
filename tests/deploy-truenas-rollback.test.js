@@ -75,3 +75,82 @@ test("rollback refuses bad input and an unrecognized live definition without mut
   const r = run(args(), { fail: "midclt call -j app.update" });
   assert.equal(r.status, 2); assert.equal(r.result.stage, "middleware-update"); assert.equal(r.result.mutationStarted, true); assert.ok(!r.out.includes(SECRET));
 });
+
+// Deploy mode with the remote route, receipt and identity replaced in-process:
+// stdin carries the deployment and the live compose, stdout the emitted result
+// plus every remote stage and command.
+function deployRun(deployment, live = compose()) {
+  const dir = mkdtempSync(join(tmpdir(), "tailterm-deploy-"));
+  mkdirSync(join(dir, ".build/ttbin"), { recursive: true });
+  for (const f of ["tailterm-hub-linux-amd64", "tailterm-discord-linux-amd64"]) writeFileSync(join(dir, ".build/ttbin", f), "artifact");
+  const py = [
+    "import json, sys, pathlib, importlib.util as u",
+    "sys.path.insert(0, 'scripts')",
+    "spec = u.spec_from_file_location('dep', 'scripts/deploy-truenas-hub.py'); dep = u.module_from_spec(spec); spec.loader.exec_module(dep)",
+    "inp = json.loads(sys.stdin.read()); calls = []",
+    "plan = {'requestId': 'r', 'targetHost': 'truenas', 'targetExecutable': '/usr/bin/sqlite3', 'route': {}, 'sourceDatabase': '/s', 'deployment': inp['deployment']}",
+    "dep.ROOT = pathlib.Path(sys.argv[1])",
+    "dep.load_plan = lambda p: plan",
+    "dep._deployment_plan = lambda p, r: p['deployment']",
+    "dep._read_receipt = lambda p, s: ({}, 'f' * 64)",
+    "dep.validate_receipt = lambda p, r: {'backupDestination': '/b', 'sha256': 'e' * 64, 'resolvedExecutable': '/usr/bin/sqlite3'}",
+    "dep.probe_remote_identity = lambda p: {'status': 'verified', 'actualHost': 'truenas', 'resolvedExecutable': '/usr/bin/sqlite3'}",
+    "def remote(plan, host, command, *, stage, last_completed_stage, preflight, data=None):",
+    "    calls.append([stage, command])",
+    "    return json.dumps(inp['live']).encode() if command.startswith('midclt call app.config') else b''",
+    "dep._remote = remote",
+    "code = dep.main(['rel', '--plan', 'p', '--preflight-receipt', 'r', '--preflight-receipt-sha256', 'f' * 64, '--update'])",
+    "print(json.dumps({'code': code, 'calls': calls}))",
+  ].join("\n");
+  const p = spawnSync("python3", ["-c", py, dir], { cwd: root, input: JSON.stringify({ deployment, live }), encoding: "utf8" });
+  const lines = p.stdout.trim().split("\n").map(l => JSON.parse(l));
+  return { ...lines.at(-1), result: lines[0] };
+}
+const DISCORD = { discordTokenPath: `${BASE}/discord-token`, bridgeTokenPath: `${BASE}/bridge-token`, bridgeStateDirectory: `${BASE}/bridge-state`, discordGuildId: "g", discordApplicationId: "a", discordOwnerIds: "o", tailosUrl: "https://example.invalid" };
+const deployment = (targets, hub, bridge) => ({ releaseName: "rel", stateDirectory: `${BASE}/state`, tokenPath: `${BASE}/hub-token`, tcpListener: "100.64.0.1:18765", ...DISCORD, targets,
+  binaryDestination: `${BASE}/releases/${hub}/tailterm-hub`, bridgeBinaryDestination: `${BASE}/releases/${bridge}/tailterm-discord` });
+function helpers(expr, input) {
+  const py = ["import json, sys, importlib.util as u", "sys.path.insert(0, 'scripts')",
+    "spec = u.spec_from_file_location('dep', 'scripts/deploy-truenas-hub.py'); dep = u.module_from_spec(spec); spec.loader.exec_module(dep)",
+    "d, c = json.loads(sys.stdin.read())", `print(json.dumps(${expr}))`].join("\n");
+  return JSON.parse(spawnSync("python3", ["-c", py], { cwd: root, input: JSON.stringify(input), encoding: "utf8" }).stdout);
+}
+
+test("every selected target gets its own new release directory, a pair shares one", () => {
+  assert.deepEqual(helpers("dep.release_directories(d)", [deployment(["bridge"], "rel_old-hub", "rel_new-bridge"), null]), [`${BASE}/releases/rel_new-bridge`]);
+  assert.deepEqual(helpers("dep.release_directories(d)", [deployment(["hub"], "rel_new-hub", "20260929-live"), null]), [`${BASE}/releases/rel_new-hub`]);
+  assert.deepEqual(helpers("dep.release_directories(d)", [deployment(["hub", "bridge"], "rel_pair", "rel_pair"), null]), [`${BASE}/releases/rel_pair`]);
+});
+
+test("a single-target plan whose retained partner is not the live mount is stale; a pair has no partner", () => {
+  const live = compose();
+  assert.equal(helpers("dep.stale_partner(d, c)", [deployment(["hub"], "rel_x", "20260929-live"), live]), false);
+  assert.equal(helpers("dep.stale_partner(d, c)", [deployment(["hub"], "rel_x", "20260928-older"), live]), true);
+  assert.equal(helpers("dep.stale_partner(d, c)", [deployment(["bridge"], "rel_new-cccccccccccc-hub", "rel_x"), live]), false);
+  assert.equal(helpers("dep.stale_partner(d, c)", [deployment(["bridge"], "rel_old-bbbbbbbbbbbb-hub", "rel_x"), live]), true);
+  assert.equal(helpers("dep.stale_partner(d, c)", [deployment(["hub", "bridge"], "rel_p", "rel_p"), { services: {} }]), false);
+  assert.equal(helpers("dep.stale_partner(d, c)", [deployment(["hub"], "rel_x", "20260929-live"), "not json"]), true);
+});
+
+test("deploy refuses a stale partner mount before any mutation and creates the bridge's own release directory", () => {
+  const stale = deployRun(deployment(["bridge"], "rel_old-bbbbbbbbbbbb-hub", "rel_new-bridge"));
+  assert.equal(stale.code, 2);
+  assert.equal(stale.result.stage, "partner-mount"); assert.equal(stale.result.classification, "verification-failed"); assert.equal(stale.result.mutationStarted, false);
+  assert.deepEqual(stale.calls.map(c => c[0]), ["partner-mount"]);
+  for (const live of [{ services: {} }, "not json"]) {
+    const r = deployRun(deployment(["bridge"], "rel_new-cccccccccccc-hub", "rel_new-bridge"), live);
+    assert.equal(r.result.stage, "partner-mount"); assert.equal(r.result.mutationStarted, false); assert.equal(r.calls.length, 1);
+  }
+  const ok = deployRun(deployment(["bridge"], "rel_new-cccccccccccc-hub", "rel_new-bridge"));
+  assert.equal(ok.code, 0, JSON.stringify(ok.result));
+  assert.deepEqual(ok.calls.find(c => c[0] === "release-directory")[1], `mkdir -p ${BASE}/releases/rel_new-bridge`);
+  assert.ok(ok.calls.some(c => c[0] === "bridge-binary-upload" && c[1].includes(`${BASE}/releases/rel_new-bridge/tailterm-discord`)));
+  assert.ok(!ok.calls.some(c => c[0] === "binary-upload"));
+  const pair = deployRun(deployment(["hub", "bridge"], "rel_pair", "rel_pair"), { services: {} });
+  assert.equal(pair.code, 0, JSON.stringify(pair.result));
+  assert.equal(pair.calls[0][0], "token", "a paired plan has no partner to read");
+  assert.equal(pair.calls.find(c => c[0] === "release-directory")[1], `mkdir -p ${BASE}/releases/rel_pair`);
+  const sent = JSON.parse(pair.calls.find(c => c[0] === "middleware-update")[1].slice("midclt call -j app.update tailterm-hub ".length).replace(/^'|'$/g, "")).custom_compose_config;
+  assert.equal(sent.services.hub.volumes[0], `${BASE}/releases/rel_pair/tailterm-hub:/opt/tailterm-hub:ro`);
+  assert.equal(sent.services["discord-bridge"].volumes[0], `${BASE}/releases/rel_pair/tailterm-discord:/opt/tailterm-discord:ro`);
+});
