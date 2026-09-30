@@ -137,6 +137,7 @@ func New(st *store.Store, identity Identity) *Server {
 	m.HandleFunc("POST /v1/tasks/{id}/events", s.postEvent)
 	m.HandleFunc("GET /v1/tasks/{id}/events", s.taskEvents)
 	m.HandleFunc("GET /v1/tasks/{id}/work-items", s.listTaskWorkItems)
+	m.HandleFunc("GET /v1/tasks/{id}/work-items/triage", s.workItemTriage)
 	m.HandleFunc("POST /v1/tasks/{id}/work-items", s.createWorkItem)
 	m.HandleFunc("GET /v1/tasks/{id}/work-items/{wid}", s.getWorkItem)
 	m.HandleFunc("GET /v1/tasks/{id}/work-items/{wid}/order-scope", s.getWorkOrderScopeConfirmation)

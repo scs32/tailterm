@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/scs32/tailterm/hub/internal/api"
+	"github.com/scs32/tailterm/hub/internal/triage"
 )
 
 func workItemProject(e env, project string) (string, error) {
@@ -59,7 +60,7 @@ func bodyFile(path string) (string, error) {
 
 func cmdWorkItems(e env, args []string) error {
 	if len(args) == 0 {
-		return errors.New("usage: tt work-items <list|get|create|update|receipt|dispatch|revisions|messages|scope|evidence|narrative>")
+		return errors.New("usage: tt work-items <list|get|create|update|receipt|dispatch|revisions|messages|scope|evidence|narrative|triage>")
 	}
 	switch args[0] {
 	case "list":
@@ -84,6 +85,8 @@ func cmdWorkItems(e env, args []string) error {
 		return cmdWorkItemEvidence(e, args[1:])
 	case "narrative":
 		return cmdWorkItemNarrative(e, args[1:])
+	case "triage":
+		return cmdWorkItemTriage(e, args[1:])
 	default:
 		return fmt.Errorf("unknown work-items command %q", args[0])
 	}
@@ -507,4 +510,114 @@ func cmdWorkItemDispatch(e env, args []string) error {
 		fmt.Printf("dispatched %s as %s in message #%d\n", result.Item.ID, result.Dispatch.ID, result.Dispatch.MessageSeq)
 	}
 	return nil
+}
+
+// cmdWorkItemTriage prints backlog suggestions for the owner to confirm. It
+// changes nothing. --release-record adds open items that a markdown release
+// record names or describes.
+func cmdWorkItemTriage(e env, args []string) error {
+	fs := flag.NewFlagSet("work-items triage", flag.ContinueOnError)
+	project := fs.String("project", e.task, "project id")
+	staleDays := fs.Int("stale-days", triage.DefaultStaleDays, "days without activity before an open item is listed as stale")
+	var records stringListFlag
+	fs.Var(&records, "release-record", "markdown release record to match open items against (repeatable)")
+	asJSON := fs.Bool("json", false, "JSON output")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if fs.NArg() != 0 || *staleDays < 1 {
+		return errors.New("usage: tt work-items triage --project tsk_ID [--stale-days N] [--release-record FILE ...] [--json]")
+	}
+	task, err := workItemProject(e, *project)
+	if err != nil {
+		return err
+	}
+	c, err := e.client(20 * time.Second)
+	if err != nil {
+		return err
+	}
+	ctx, cancel := ctxTimeout(30 * time.Second)
+	defer cancel()
+	out, err := c.WorkItemTriage(ctx, task, *staleDays, e.agent, e.runID)
+	if err != nil {
+		return err
+	}
+	if len(records) > 0 {
+		var open []api.WorkItem
+		var after int64
+		for {
+			page, err := c.ListWorkItems(ctx, task, "", "", after, api.MaxLimit)
+			if err != nil {
+				return err
+			}
+			for _, item := range page.Items {
+				if item.Status != "done" && item.Status != "dismissed" {
+					open = append(open, item)
+				}
+			}
+			if page.Next == 0 || len(page.Items) == 0 {
+				break
+			}
+			after = page.Next
+		}
+		for _, path := range records {
+			data, err := os.ReadFile(path)
+			if err != nil {
+				return err
+			}
+			out.AlreadyReleased = append(out.AlreadyReleased, releaseRecordMatches(open, triage.ReleaseRows(string(data)))...)
+		}
+	}
+	if *asJSON {
+		printJSON(out)
+		return nil
+	}
+	fmt.Println("Suggestions only — nothing was changed; confirm with the owner.")
+	fmt.Printf("Likely duplicates (%d):\n", len(out.Duplicates))
+	for _, d := range out.Duplicates {
+		fmt.Printf("  %s %q ~ %s %q (title %.2f, criteria %.2f)\n", d.Items[0].ID, d.Items[0].Title, d.Items[1].ID, d.Items[1].Title, d.TitleSimilarity, d.CriteriaSimilarity)
+	}
+	fmt.Printf("Possibly already delivered (%d):\n", len(out.AlreadyReleased))
+	for _, r := range out.AlreadyReleased {
+		switch {
+		case r.Done != nil:
+			fmt.Printf("  %s %q ~ done %s %q (title %.2f, criteria %.2f)\n", r.Item.ID, r.Item.Title, r.Done.ID, r.Done.Title, r.TitleSimilarity, r.CriteriaSimilarity)
+		case r.NamedInRelease:
+			fmt.Printf("  %s %q is named in release row: %s\n", r.Item.ID, r.Item.Title, r.Release)
+		default:
+			fmt.Printf("  %s %q ~ release row (title %.2f): %s\n", r.Item.ID, r.Item.Title, r.TitleSimilarity, r.Release)
+		}
+	}
+	fmt.Printf("No activity for %d days (%d):\n", out.StaleDays, len(out.Stale))
+	for _, st := range out.Stale {
+		fmt.Printf("  %s %q last activity %s (%d days)\n", st.Item.ID, st.Item.Title, st.LastActivity, st.IdleDays)
+	}
+	return nil
+}
+
+// releaseRecordMatches lists open items a release row names by ID, or whose
+// title matches one of the row's cells.
+func releaseRecordMatches(open []api.WorkItem, rows []triage.ReleaseRow) []api.TriageAlreadyDone {
+	var out []api.TriageAlreadyDone
+	for _, item := range open {
+		ref := api.TriageItem{ID: item.ID, Title: item.Title, Status: item.Status}
+		for _, row := range rows {
+			named := false
+			for _, id := range row.ItemIDs {
+				if id == item.ID {
+					named = true
+				}
+			}
+			best := 0.0
+			for _, cell := range row.Cells {
+				if score := triage.Similarity(item.Title, strings.ReplaceAll(cell, "`", "")); score > best {
+					best = score
+				}
+			}
+			if named || best >= triage.TitleThreshold {
+				out = append(out, api.TriageAlreadyDone{Item: ref, Release: row.Text, TitleSimilarity: best, NamedInRelease: named})
+			}
+		}
+	}
+	return out
 }
