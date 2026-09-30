@@ -10,7 +10,7 @@ import {
   readdirSync,
   chmodSync,
 } from "node:fs";
-import { tmpdir } from "node:os";
+import { tmpdir, getPriority } from "node:os";
 import { join } from "node:path";
 import { execFileSync, spawn, spawnSync } from "node:child_process";
 import { prepareTestBinary, sourceIdentity, fileHash } from "./test-binaries.mjs";
@@ -1486,8 +1486,11 @@ test("non-Go check process groups run at the lower priority and Go checks do not
   try {
     const nonGo = await runCheck(probe("."), dir, { PATH: process.env.PATH });
     const goRun = await runCheck(probe("hub"), dir, { PATH: process.env.PATH });
-    assert.equal(nonGo.stdout.trim(), String(NON_GO_NICE));
-    assert.equal(goRun.stdout.trim(), "0");
+    // Relative to the runner's priority, which is itself raised when this
+    // file runs inside a niced npm-unit check.
+    const own = getPriority();
+    assert.equal(nonGo.stdout.trim(), String(Math.min(19, own + NON_GO_NICE)));
+    assert.equal(goRun.stdout.trim(), String(own));
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

@@ -12,7 +12,13 @@ import {
   rmSync,
 } from "node:fs";
 import { resolve, relative, join, isAbsolute } from "node:path";
-import { tmpdir, availableParallelism, totalmem, setPriority } from "node:os";
+import {
+  tmpdir,
+  availableParallelism,
+  totalmem,
+  getPriority,
+  setPriority,
+} from "node:os";
 import { createHash } from "node:crypto";
 import { execFileSync, spawn, spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
@@ -440,11 +446,11 @@ export async function runCheck(check, cwd, environment, abortSignal) {
       });
       return;
     }
-    // Descendants inherit the priority; the child sets up its runtime before
-    // it can spawn any, so this runs first.
+    // Relative to the runner's own priority. Descendants inherit it; the
+    // child sets up its runtime before it can spawn any, so this runs first.
     if (!isGoCheck(check) && child.pid)
       try {
-        setPriority(child.pid, NON_GO_NICE);
+        setPriority(child.pid, Math.min(19, getPriority() + NON_GO_NICE));
       } catch (error) {
         stderr.push(Buffer.from("verification priority: " + error.message + "\n"));
       }
