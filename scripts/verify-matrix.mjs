@@ -12,7 +12,7 @@ import {
   rmSync,
 } from "node:fs";
 import { resolve, relative, join, isAbsolute } from "node:path";
-import { tmpdir, availableParallelism, totalmem } from "node:os";
+import { tmpdir, availableParallelism, totalmem, setPriority } from "node:os";
 import { createHash } from "node:crypto";
 import { execFileSync, spawn, spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
@@ -440,6 +440,14 @@ export async function runCheck(check, cwd, environment, abortSignal) {
       });
       return;
     }
+    // Descendants inherit the priority; the child sets up its runtime before
+    // it can spawn any, so this runs first.
+    if (!isGoCheck(check) && child.pid)
+      try {
+        setPriority(child.pid, NON_GO_NICE);
+      } catch (error) {
+        stderr.push(Buffer.from("verification priority: " + error.message + "\n"));
+      }
     abortSignal?.addEventListener("abort", onAbort, { once: true });
     child.stdout.on("data", capture(stdout));
     child.stderr.on("data", capture(stderr));
@@ -496,9 +504,11 @@ export function removeVerifierHome(home) {
   rmSync(home, { recursive: true, force: true });
 }
 
-// Checks that rewrite inputs every later check reads (dist-static, the wasm
-// fixtures and their prerequisite digests) run alone, and act as barriers: no
-// later check starts until an earlier exclusive check has finished.
+// Checks that rewrite inputs later checks read (dist-static, the wasm fixtures
+// and their prerequisite digests) run alone among non-Go checks and act as
+// barriers: no later non-Go check starts until an earlier exclusive check has
+// finished. Go checks read only the hub/ module, so they neither wait for nor
+// block an exclusive check.
 export const EXCLUSIVE_CHECKS = new Set([
   "00-static-build",
   "01-static-release-verify",
@@ -509,10 +519,24 @@ export const EXCLUSIVE_CHECKS = new Set([
 // shared resource that was found by running the suite in parallel.
 export const SERIAL_SUITES = new Map([]);
 
+// Receipt evidence for the Go rules below (wi_82ed4c6924930bad, #15093):
+// go-race is the longest check (625 s alone; no other attempt exceeded 171 s)
+// and its hub/internal/store package takes 570-573 s against go test's 600 s
+// package timeout, so it timed out when four browser lanes ran beside it.
+// Go checks therefore start first, go-race holds two job slots, and non-Go
+// checks run at a lower CPU priority. go-vet took 3 s and only type-checks,
+// so it runs outside the Go lane.
+export const isGoCheck = (check) => check.cwd === "hub";
+export const GO_LANE_EXEMPT = new Set(["go-vet"]);
+export const CHECK_WEIGHTS = new Map([["go-race", 2]]);
+export const NON_GO_NICE = 10;
+export const checkWeight = (check, jobs) =>
+  Math.min(jobs, CHECK_WEIGHTS.get(check.id) ?? 1);
+
 // Locks a check holds while it runs; two checks sharing any lock never
 // overlap. Fixed ports come from the approved matrix, identical argv+cwd
 // covers engine splits of one script (same screenshots and build output), and
-// every Go check shares one lane because each can saturate the CPU.
+// the heavy Go checks share one lane because each can saturate the CPU.
 export function executionLocks(check) {
   const locks = [];
   for (const port of (check.environment?.VERIFICATION_REQUIRED_PORTS || "")
@@ -520,7 +544,7 @@ export function executionLocks(check) {
     .filter(Boolean))
     locks.push("port:" + Number(port));
   locks.push("argv:" + canonical({ argv: check.argv, cwd: check.cwd }));
-  if (check.cwd === "hub") locks.push("go");
+  if (isGoCheck(check) && !GO_LANE_EXEMPT.has(check.id)) locks.push("go");
   if (check.argv.some((arg) => SERIAL_SUITES.has(arg)))
     locks.push("serial-suites");
   return locks;
@@ -542,10 +566,15 @@ function validJobs(jobs) {
   return jobs;
 }
 
-// Greedy list scheduling in plan order. Results keep plan positions, so a
-// receipt lists checks exactly as the plan does. On the first error, or when
-// the caller aborts, nothing new starts, every running check is stopped
-// through the shared signal, and the error is thrown once all have settled.
+// Greedy list scheduling. With more than one job, Go checks are offered first
+// and the rest follow in plan order; with one job every check runs in plan
+// order. A check starts when its weight fits the free job slots, it shares no
+// held lock, and (for a non-Go check) no exclusive check is running or earlier
+// in the plan and unfinished; an exclusive check also waits for every earlier
+// non-Go check. Results keep plan positions, so a receipt lists checks exactly
+// as the plan does. On the first error, or when the caller aborts, nothing new
+// starts, every running check is stopped through the shared signal, and the
+// error is thrown once all have settled.
 export async function runScheduled(checks, options, runOne) {
   const jobs = validJobs(options.jobs);
   const outer = options.abortSignal;
@@ -555,31 +584,38 @@ export async function runScheduled(checks, options, runOne) {
   else outer?.addEventListener("abort", forward, { once: true });
   const results = new Array(checks.length);
   const locks = checks.map(executionLocks);
+  const weights = checks.map((check) => checkWeight(check, jobs));
+  const go = checks.map(isGoCheck);
+  const exclusive = checks.map((check) => EXCLUSIVE_CHECKS.has(check.id));
+  const order = checks.map((_, i) => i);
+  if (jobs > 1) order.sort((a, b) => go[b] - go[a] || a - b);
   const state = checks.map(() => "pending");
-  const held = new Map();
-  let running = 0,
+  const held = new Set();
+  let load = 0,
+    nonGoRunning = 0,
     exclusiveRunning = false,
     failure;
-  const eligible = (i) =>
-    EXCLUSIVE_CHECKS.has(checks[i].id)
-      ? running === 0 && state.slice(0, i).every((s) => s === "done")
-      : locks[i].every((lock) => !held.has(lock));
+  const eligible = (i) => {
+    if (load + weights[i] > jobs || locks[i].some((lock) => held.has(lock)))
+      return false;
+    if (go[i]) return true;
+    if (exclusiveRunning) return false;
+    for (let k = 0; k < i; k++)
+      if (!go[k] && state[k] !== "done" && (exclusive[k] || exclusive[i]))
+        return false;
+    return !exclusive[i] || nonGoRunning === 0;
+  };
   try {
     await new Promise((resolveAll) => {
       const launch = () => {
         if (!failure && !stop.signal.aborted)
-          for (let i = 0; i < checks.length && running < jobs; i++) {
-            if (exclusiveRunning) break;
-            if (state[i] !== "pending") continue;
-            const exclusive = EXCLUSIVE_CHECKS.has(checks[i].id);
-            if (!eligible(i)) {
-              if (exclusive) break;
-              continue;
-            }
+          for (const i of order) {
+            if (state[i] !== "pending" || !eligible(i)) continue;
             state[i] = "running";
-            running++;
-            exclusiveRunning = exclusive;
-            for (const lock of locks[i]) held.set(lock, i);
+            load += weights[i];
+            if (!go[i]) nonGoRunning++;
+            if (exclusive[i]) exclusiveRunning = true;
+            for (const lock of locks[i]) held.add(lock);
             Promise.resolve()
               .then(() => runOne(checks[i], i, stop.signal))
               .then(
@@ -593,14 +629,14 @@ export async function runScheduled(checks, options, runOne) {
               )
               .finally(() => {
                 state[i] = "done";
-                running--;
-                if (exclusive) exclusiveRunning = false;
+                load -= weights[i];
+                if (!go[i]) nonGoRunning--;
+                if (exclusive[i]) exclusiveRunning = false;
                 for (const lock of locks[i]) held.delete(lock);
                 launch();
               });
-            if (exclusive) break;
           }
-        if (running === 0) resolveAll();
+        if (load === 0) resolveAll();
       };
       launch();
     });
@@ -614,15 +650,16 @@ export async function runScheduled(checks, options, runOne) {
 }
 
 // Scans receipt checks (plan order, with recorded attempt times) for runs
-// that broke the scheduling rules: an overlap of two checks sharing a lock, an
-// overlap with an exclusive check, or a later check starting before an earlier
-// exclusive check ended. The verifier runs this over a real receipt.
+// that broke the scheduling rules: an overlap of two checks sharing a lock, a
+// non-Go overlap with an exclusive check, or a later non-Go check starting
+// before an earlier exclusive check ended. The verifier runs this over a real receipt.
 export function overlapViolations(checks) {
   const spans = checks.map((check) => {
     const attempts = check.attempts?.length ? check.attempts : [check];
     return {
       id: check.id,
       locks: executionLocks(check),
+      go: isGoCheck(check),
       exclusive: EXCLUSIVE_CHECKS.has(check.id),
       start: Date.parse(attempts[0].startedAt),
       end: Date.parse(attempts.at(-1).endedAt),
@@ -634,11 +671,12 @@ export function overlapViolations(checks) {
       const a = spans[i],
         b = spans[j],
         overlap = a.start < b.end && b.start < a.end,
-        shared = a.locks.filter((lock) => b.locks.includes(lock));
+        shared = a.locks.filter((lock) => b.locks.includes(lock)),
+        exempt = a.go || b.go;
       const reason =
-        a.exclusive && b.start < a.end
+        !exempt && a.exclusive && b.start < a.end
           ? "barrier"
-          : b.exclusive && a.end > b.start
+          : !exempt && b.exclusive && a.end > b.start
             ? "exclusive"
             : overlap && shared.length
               ? shared.join(" ")

@@ -33,6 +33,7 @@ import {
   overlapViolations,
   defaultJobs,
   SERIAL_SUITES,
+  NON_GO_NICE,
   makeTargetedPlan,
   runTargeted,
 } from "../scripts/verify-matrix.mjs";
@@ -1105,7 +1106,6 @@ test("shared ports, engine splits, Go checks and serial suites never overlap", a
   assert(overlaps("tests/free-1.mjs", "tests/free-2.mjs"));
   for (const [a, b] of [
     ["go-race", "go-test"],
-    ["go-test", "go-vet"],
     ["tests/a.mjs", "tests/b.mjs"],
     ["tests/c.mjs:chromium", "tests/c.mjs:webkit"],
     ["tests/serial-a.mjs", "tests/serial-b.mjs"],
@@ -1382,4 +1382,113 @@ test("plans and targeted runs refuse a base the candidate does not contain", asy
   );
   assert.equal(makePlan({ ...context, baseCommit: f.commit }, f.cwd).changed.length, 0);
   assert.deepEqual(linear.changed, ["docs/old.md", "docs/new.md"]);
+});
+
+// #15095: the Go lane is the critical path. Go checks start first, go-race
+// holds two slots, go-vet leaves the lane, Go checks bypass the exclusive
+// barriers, and non-Go checks run at a lower CPU priority.
+async function simulateLoad(checks, jobs, duration) {
+  let load = 0,
+    peak = 0;
+  const starts = [];
+  const results = await runScheduled(checks, { jobs }, async (check) => {
+    starts.push(check.id);
+    const weight = check.id === "go-race" ? Math.min(jobs, 2) : 1;
+    peak = Math.max(peak, (load += weight));
+    const startedAt = new Date().toISOString();
+    await new Promise((resolve) => setTimeout(resolve, duration(check)));
+    load -= weight;
+    return { ...check, startedAt, endedAt: new Date().toISOString() };
+  });
+  return { results, starts, peak };
+}
+const goFixture = (id, argv) => fakeCheck(id, { argv, cwd: "hub" });
+const criticalPathPlan = () => [
+  fakeCheck("00-static-build", { argv: ["npm", "run", "build:static"] }),
+  fakeCheck("01-static-release-verify", { argv: ["npm", "run", "verify:release"] }),
+  goFixture("go-race", ["go", "test", "-race", "./..."]),
+  goFixture("go-test", ["go", "test", "./..."]),
+  goFixture("go-vet", ["go", "vet", "./..."]),
+  fakeCheck("npm-unit", { argv: ["npm", "test"] }),
+  ...Array.from({ length: 8 }, (_, i) => fakeCheck(`tests/s${i}.mjs`)),
+  fakeCheck("wasm-test-build", { argv: ["bash", "scripts/build-wasm.sh", "--test"] }),
+];
+test("Go checks start first and bypass exclusive barriers while one job keeps plan order", async () => {
+  const checks = criticalPathPlan();
+  const duration = (c) => (c.id === "go-race" ? 120 : c.id === "go-test" ? 20 : 10);
+  const { results, starts } = await simulateLoad(checks, 5, duration);
+  assert.equal(starts[0], "go-race", "the longest check starts at once");
+  assert.deepEqual(overlapViolations(results), []);
+  const span = (id) => results.find((r) => r.id === id);
+  const overlaps = (a, b) =>
+    span(a).startedAt < span(b).endedAt && span(b).startedAt < span(a).endedAt;
+  assert(overlaps("go-race", "00-static-build"), "Go does not wait for the static build");
+  assert(overlaps("go-race", "go-vet"), "go-vet runs beside go-race");
+  assert(!overlaps("go-race", "go-test"), "go-test stays in the Go lane");
+  assert(overlaps("go-race", "wasm-test-build"), "wasm-test-build is off the Go tail");
+  assert(span("wasm-test-build").endedAt <= span("go-race").endedAt);
+  for (let i = 0; i < 8; i++)
+    assert(span(`tests/s${i}.mjs`).startedAt >= span("01-static-release-verify").endedAt);
+  const serial = await simulateLoad(checks, 1, () => 2);
+  assert.deepEqual(serial.starts, checks.map((c) => c.id), "one job runs in plan order");
+});
+test("go-race holds two job slots so fewer checks run beside it", async () => {
+  const checks = criticalPathPlan();
+  let besideRace = 0;
+  const { peak, results } = await simulateLoad(checks, 5, (c) =>
+    c.id === "go-race" ? 80 : 10,
+  );
+  assert.equal(peak, 5, "slots are fully used and never exceeded");
+  const race = results.find((r) => r.id === "go-race");
+  const times = results.flatMap((r) => [r.startedAt, r.endedAt]).filter((t) => t > race.startedAt && t < race.endedAt);
+  for (const t of times) {
+    const running = results.filter((r) => r.id !== "go-race" && r.startedAt <= t && t < r.endedAt).length;
+    besideRace = Math.max(besideRace, running);
+  }
+  assert(besideRace <= 3, `at most three checks beside go-race, saw ${besideRace}`);
+  assert.equal(
+    (await simulateLoad([goFixture("go-race", ["go"]), fakeCheck("x")], 2, () => 5)).peak,
+    2,
+    "a weight never exceeds the job count",
+  );
+});
+test("overlap scan exempts Go checks from barriers but not from the Go lane", () => {
+  const at = (s) => new Date(Date.UTC(2026, 8, 29, 0, 0, s)).toISOString();
+  const run = (check, start, end) => ({ ...check, startedAt: at(start), endedAt: at(end) });
+  const checks = criticalPathPlan();
+  const byId = Object.fromEntries(checks.map((c) => [c.id, c]));
+  assert.deepEqual(
+    overlapViolations([
+      run(byId["00-static-build"], 0, 10),
+      run(byId["go-race"], 0, 100),
+      run(byId["go-vet"], 1, 2),
+      run(byId["wasm-test-build"], 50, 60),
+    ]),
+    [],
+  );
+  assert.deepEqual(
+    overlapViolations([run(byId["go-race"], 0, 100), run(byId["go-test"], 50, 60)]).map((v) => v.reason),
+    ["go"],
+  );
+  assert.deepEqual(
+    overlapViolations([run(byId["00-static-build"], 0, 10), run(byId["npm-unit"], 5, 20)]).map((v) => v.reason),
+    ["barrier"],
+  );
+});
+test("non-Go check process groups run at the lower priority and Go checks do not", async () => {
+  const probe = (cwd) => ({
+    id: "probe-" + cwd,
+    argv: [process.execPath, "-e", "console.log(require('node:os').getPriority())"],
+    cwd,
+    environment: { VERIFICATION_TIMEOUT_MS: "10000" },
+  });
+  const dir = mkdtempSync(join(tmpdir(), "verification-priority-"));
+  try {
+    const nonGo = await runCheck(probe("."), dir, { PATH: process.env.PATH });
+    const goRun = await runCheck(probe("hub"), dir, { PATH: process.env.PATH });
+    assert.equal(nonGo.stdout.trim(), String(NON_GO_NICE));
+    assert.equal(goRun.stdout.trim(), "0");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
