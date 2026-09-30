@@ -9,6 +9,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/scs32/tailterm/hub/internal/api"
 )
@@ -482,5 +483,312 @@ func TestOwnerIntegratedDoneSaveAndFailedScope(t *testing.T) {
 	asHandler := api.TeamQueueRequest{RequestID: "handler-narrow-b", Operation: "scope", EntryID: narrowed.ID, ExpectedRevision: narrowed.Revision, Ownership: []string{"src/b/one.go"}, HandlerAgentID: narrowed.HandlerID, HandlerRunID: narrowed.HandlerRunID}
 	if _, err := f.s.TeamQueueAction(ctx, f.task.ID, asHandler); !errors.Is(err, api.ErrConflict) {
 		t.Fatalf("handler scoping a failed entry: %v", err)
+	}
+}
+
+// clock pins the store's time and returns a function that advances it; the
+// host census is refreshed so admission stays fresh at the new time.
+func (f *choresQueue) clock(t *testing.T) func(time.Duration) {
+	t.Helper()
+	now := f.s.now()
+	f.s.now = func() time.Time { return now }
+	return func(d time.Duration) {
+		now = now.Add(d)
+		observeFixtureHost(t, f.s, f.task.ID, 0, freeDiskMiB(1<<20))
+	}
+}
+
+// activity records a member's reported activity state at the store's now.
+func (f *choresQueue) activity(t *testing.T, a api.Agent, state string) {
+	t.Helper()
+	if _, err := f.s.db.Exec(`INSERT INTO agent_activity(task_id,agent_id,run_id,state,observed_at,payload,request_id) VALUES(?,?,?,?,?,?,?) ON CONFLICT(agent_id,run_id) DO UPDATE SET state=excluded.state,observed_at=excluded.observed_at,payload=excluded.payload`,
+		f.task.ID, a.ID, a.RunID, state, ts(f.s.now()), fmt.Sprintf(`{"state":%q}`, state), api.NewID("req")); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func (f *choresQueue) fail(t *testing.T, q api.TeamQueueEntry) api.TeamQueueEntry {
+	t.Helper()
+	failed, err := f.s.TeamQueueAction(context.Background(), f.task.ID, api.TeamQueueRequest{RequestID: api.NewID("tqr"), Operation: "fail", EntryID: q.ID, ExpectedRevision: q.Revision, Failure: "fixture failure"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return failed
+}
+
+func (f *choresQueue) stall(t *testing.T, id string) *api.TeamQueueStall {
+	t.Helper()
+	return listedEntry(t, f.s, f.task.ID, id).Stall
+}
+
+func assertStall(t *testing.T, f *choresQueue, id, cause, blocker string, fix ...string) {
+	t.Helper()
+	got := listedEntry(t, f.s, f.task.ID, id)
+	if got.Stall == nil || got.Stall.Cause != cause || got.Stall.BlockerEntryID != blocker || got.Stall.Since == "" {
+		t.Fatalf("stall on %s: %+v reason %q", id, got.Stall, got.BlockReason)
+	}
+	if !strings.HasPrefix(got.BlockReason, "Stalled: ") || !strings.Contains(got.BlockReason, "Fix: "+got.Stall.Fix) {
+		t.Fatalf("block reason %q", got.BlockReason)
+	}
+	for _, want := range fix {
+		if !strings.Contains(got.Stall.Fix, want) {
+			t.Fatalf("fix %q lacks %q", got.Stall.Fix, want)
+		}
+	}
+}
+
+func assertNoStall(t *testing.T, f *choresQueue, id, why string) {
+	t.Helper()
+	if got := listedEntry(t, f.s, f.task.ID, id); got.Stall != nil || strings.HasPrefix(got.BlockReason, "Stalled") {
+		t.Fatalf("%s: unexpected stall %+v reason %q", why, got.Stall, got.BlockReason)
+	}
+}
+
+// a6 (c3): failed-entry. A failed parallel entry with live runs stalls the
+// work behind it at once; one with no live runs is released by the runner,
+// so it is not a stall.
+func TestQueueStallFailedEntry(t *testing.T) {
+	f := newChoresQueue(t, 2, 2, 0)
+	a := f.run(t, f.add(t, 0, "src"))
+	b := f.add(t, 1, "src/b")
+	failed := f.fail(t, a)
+	assertNoStall(t, f, b.ID, "failed entry without live runs")
+	f.member(t, 0, "member-a")
+	assertStall(t, f, b.ID, api.StallFailedEntry, failed.ID, "tt team queue integrated --task "+f.task.ID+" --entry "+failed.ID, "tt close --team")
+}
+
+// a6 (c3): nothing-running, once the durable time has passed the grace.
+func TestQueueStallNothingRunning(t *testing.T) {
+	f := newChoresQueue(t, 2, 2, 0)
+	advance := f.clock(t)
+	a := f.run(t, f.add(t, 0, "src"))
+	b := f.add(t, 1, "src/b")
+	assertNoStall(t, f, b.ID, "launch just finished")
+	advance(6 * time.Minute)
+	assertStall(t, f, b.ID, api.StallNothingRunning, a.ID, "tt team queue fail --task "+f.task.ID+" --entry "+a.ID)
+}
+
+// a6 (c3): idle-entry needs every live member idle or done, no open work and
+// the idle threshold; below it, or with an open obligation, it is not a
+// stall.
+func TestQueueStallIdleEntry(t *testing.T) {
+	f := newChoresQueue(t, 2, 2, 0)
+	f.s.queueIdleThreshold = 30 * time.Minute
+	advance := f.clock(t)
+	a := f.run(t, f.add(t, 0, "src"))
+	lead := f.member(t, 0, "lead-a")
+	worker := f.member(t, 0, "worker-a")
+	b := f.add(t, 1, "src/b")
+	f.activity(t, lead, "idle")
+	f.activity(t, worker, "working")
+	advance(40 * time.Minute)
+	assertNoStall(t, f, b.ID, "a member is working")
+	f.activity(t, worker, "finished_silent")
+	advance(10 * time.Minute)
+	assertNoStall(t, f, b.ID, "idle below the threshold")
+	advance(25 * time.Minute)
+	assertStall(t, f, b.ID, api.StallIdleEntry, a.ID, "tt team queue integrated", "tt team queue scope --task "+f.task.ID+" --entry "+a.ID)
+	if _, err := f.s.PostMessage(context.Background(), f.task.ID, api.PostMessageRequest{RequestID: "open-work", AgentID: worker.ID, RunID: worker.RunID, To: "owner", WorkItems: []api.MessageWorkItem{{ItemTaskID: f.task.ID, ItemID: f.items[0].ID, ItemRevision: f.items[0].Revision, Relationship: "primary"}}, WorkOrderMessage: &api.MessageReference{TaskID: f.task.ID, Seq: f.orders[0].Seq}, Envelope: &api.Envelope{Kind: api.EnvelopeKindRequest, To: "owner", Subject: "Choose whether to check the release once more", Body: api.EnvelopeBody{Ask: "Check it?"}}}, f.by); err != nil {
+		t.Fatal(err)
+	}
+	advance(40 * time.Minute)
+	assertNoStall(t, f, b.ID, "an open obligation")
+}
+
+// a6 (c3): no-handler only when no online, non-retired handler exists.
+func TestQueueStallNoHandler(t *testing.T) {
+	f := newChoresQueue(t, 2, 1, 0)
+	a := f.add(t, 0, "src/a")
+	assertNoStall(t, f, a.ID, "a handler is online")
+	if _, err := f.s.db.Exec(`UPDATE agents SET status='retired' WHERE task_id=? AND role=?`, f.task.ID, api.AgentRoleDatabaseHandler); err != nil {
+		t.Fatal(err)
+	}
+	assertStall(t, f, a.ID, api.StallNoHandler, "", "Set up database handler", "tt resume")
+}
+
+// a6 (c3): a failed entry halts a serial queue.
+func TestQueueStallSerialHalted(t *testing.T) {
+	f := newChoresQueue(t, 2, 1, 1)
+	a := f.run(t, f.add(t, 0))
+	b := f.add(t, 1)
+	assertNoStall(t, f, b.ID, "serial queue with a working team")
+	failed := f.fail(t, a)
+	assertStall(t, f, b.ID, api.StallSerialHalted, failed.ID, "tt team queue release --task "+f.task.ID+" --entry "+failed.ID, "tt team queue integrated")
+}
+
+// a6 (c3): with limit 2 held by one failed and one idle entry, the queued
+// entry shows a stall, not "All team slots are reserved"; slots full of
+// working teams, an overlap with a working team, a host or disk block and
+// handlers all leased by working teams are not stalls.
+func TestQueueStallSlotsAndNonStalls(t *testing.T) {
+	f := newChoresQueue(t, 3, 3, 2)
+	f.s.queueIdleThreshold = 30 * time.Minute
+	advance := f.clock(t)
+	a := f.run(t, f.add(t, 0, "src/a"))
+	b := f.run(t, f.add(t, 1, "src/b"))
+	leadA, leadB := f.member(t, 0, "lead-a"), f.member(t, 1, "lead-b")
+	f.activity(t, leadA, "working")
+	f.activity(t, leadB, "working")
+	c := f.add(t, 2, "src/c")
+	advance(time.Hour)
+	if got := listedEntry(t, f.s, f.task.ID, c.ID); got.Stall != nil || got.BlockReason != "All team slots are reserved" {
+		t.Fatalf("slots full of working teams: %+v %q", got.Stall, got.BlockReason)
+	}
+	f.fail(t, a)
+	f.activity(t, leadB, "idle")
+	advance(time.Hour)
+	got := listedEntry(t, f.s, f.task.ID, c.ID)
+	if got.Stall == nil || got.Stall.BlockerEntryID != a.ID || got.Stall.Cause != api.StallFailedEntry || got.BlockReason == "All team slots are reserved" {
+		t.Fatalf("slots held by stall blockers: %+v %q", got.Stall, got.BlockReason)
+	}
+	// A host or disk block is ordinary waiting.
+	observeFixtureHost(t, f.s, f.task.ID, 1<<30, freeDiskMiB(1))
+	assertNoStall(t, f, c.ID, "disk reserve")
+	observeFixtureHost(t, f.s, f.task.ID, 0, freeDiskMiB(1<<20))
+	assertStall(t, f, c.ID, api.StallFailedEntry, a.ID)
+	_ = b
+}
+
+// a6 (c3): an overlap with a working team, and every handler leased by
+// working teams, are not stalls.
+func TestQueueStallNotForWorkingTeams(t *testing.T) {
+	f := newChoresQueue(t, 3, 1, 0)
+	advance := f.clock(t)
+	a := f.run(t, f.add(t, 0, "src"))
+	lead := f.member(t, 0, "lead-a")
+	f.activity(t, lead, "working")
+	b := f.add(t, 1, "src/b")
+	c := f.add(t, 2, "docs")
+	advance(time.Hour)
+	assertNoStall(t, f, b.ID, "overlap with a working team")
+	if got := listedEntry(t, f.s, f.task.ID, c.ID); got.Stall != nil || got.BlockReason != "No free database handler" {
+		t.Fatalf("handlers leased by working teams: %+v %q", got.Stall, got.BlockReason)
+	}
+	_ = a
+}
+
+// a7 (c3): a stall posts exactly one Board NOTICE once its durable time has
+// held past the grace period: no recipient, no escalation ref, no obligation.
+// Retries, other entries behind the same blocker and a hub restart add
+// nothing; a new blocker revision may post once more; a stale or cleared
+// stall is refused.
+func TestQueueStallNoticeOncePerStall(t *testing.T) {
+	f := newChoresQueue(t, 3, 2, 0)
+	ctx := context.Background()
+	advance := f.clock(t)
+	a := f.run(t, f.add(t, 0, "src"))
+	f.member(t, 0, "member-a")
+	b := f.add(t, 1, "src/b")
+	c := f.add(t, 2, "src/c")
+	failed := f.fail(t, a)
+	messages := func() int {
+		t.Helper()
+		var n int
+		if err := f.s.db.QueryRow(`SELECT count(*) FROM messages WHERE task_id=?`, f.task.ID).Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+		return n
+	}
+	notice := func(q api.TeamQueueEntry, id string) error {
+		_, err := f.s.TeamQueueAction(ctx, f.task.ID, api.TeamQueueRequest{RequestID: id, Operation: "stall_notice", EntryID: q.ID, ExpectedRevision: q.Revision})
+		return err
+	}
+	stall := f.stall(t, b.ID)
+	if stall == nil || stall.BlockerEntryID != failed.ID {
+		t.Fatalf("stall %+v", stall)
+	}
+	id := stall.NoticeRequestID(b.ID)
+	before := messages()
+	advance(time.Minute)
+	if err := notice(b, id); !errors.Is(err, api.ErrConflict) || !strings.Contains(err.Error(), "grace") {
+		t.Fatalf("notice inside the grace period: %v", err)
+	}
+	if err := notice(b, "queue-stall-"+failed.ID+"-idle-entry-1"); !errors.Is(err, api.ErrConflict) || !strings.Contains(err.Error(), "stale") {
+		t.Fatalf("stale notice: %v", err)
+	}
+	advance(5 * time.Minute)
+	if err := notice(b, id); err != nil {
+		t.Fatal(err)
+	}
+	if messages() != before+1 {
+		t.Fatalf("notice posted %d messages", messages()-before)
+	}
+	var seq int64
+	var from, to, raw string
+	if err := f.s.db.QueryRow(`SELECT seq,from_node||'/'||from_user,to_agent,envelope FROM messages WHERE task_id=? ORDER BY seq DESC LIMIT 1`, f.task.ID).Scan(&seq, &from, &to, &raw); err != nil {
+		t.Fatal(err)
+	}
+	if from != "team_queue/runner" || to != "" || !strings.Contains(raw, `"entry":"`+b.ID+`"`) || !strings.Contains(raw, `"blocker":"`+failed.ID+`"`) || !strings.Contains(raw, `"cause":"failed-entry"`) || !strings.Contains(raw, `"item":"`+b.ItemID+`"`) || strings.Contains(raw, "escalation") || !strings.Contains(raw, "Fix: ") {
+		t.Fatalf("notice from=%s to=%q envelope=%s", from, to, raw)
+	}
+	var obligations int
+	if err := f.s.db.QueryRow(`SELECT count(*) FROM obligations WHERE message_seq=?`, seq).Scan(&obligations); err != nil || obligations != 0 {
+		t.Fatalf("notice created %d obligations %v", obligations, err)
+	}
+	if err := notice(b, id); err != nil {
+		t.Fatalf("retry: %v", err)
+	}
+	if cStall := f.stall(t, c.ID); cStall == nil || cStall.NoticeRequestID(c.ID) != id {
+		t.Fatalf("C behind the same blocker %+v", cStall)
+	}
+	if err := notice(c, id); err != nil {
+		t.Fatalf("second entry behind the same blocker: %v", err)
+	}
+	if messages() != before+1 {
+		t.Fatalf("retries posted %d messages", messages()-before)
+	}
+
+	// A hub restart keeps the durable time and the saved notice.
+	var path string
+	if err := f.s.db.QueryRow(`SELECT file FROM pragma_database_list WHERE name='main'`).Scan(&path); err != nil {
+		t.Fatal(err)
+	}
+	now := f.s.now()
+	if err := f.s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { reopened.Close() })
+	reopened.now = func() time.Time { return now }
+	f.s = reopened
+	if again := f.stall(t, b.ID); again == nil || again.Since != stall.Since {
+		t.Fatalf("restart moved the stall: %+v was %+v", again, stall)
+	}
+	if err := notice(b, id); err != nil || messages() != before+1 {
+		t.Fatalf("notice after restart: %v, %d new messages", err, messages()-before)
+	}
+	advance = f.clock(t)
+
+	// A new blocker revision is a new stall once it has held for the grace.
+	narrowed, err := f.s.TeamQueueAction(ctx, f.task.ID, api.TeamQueueRequest{RequestID: "narrow-a", Operation: "scope", EntryID: failed.ID, ExpectedRevision: failed.Revision, Ownership: []string{"src/b"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	next := f.stall(t, b.ID)
+	if next == nil || next.BlockerRevision != narrowed.Revision || next.NoticeRequestID(b.ID) == id {
+		t.Fatalf("stall after the blocker changed %+v", next)
+	}
+	assertNoStall(t, f, c.ID, "C no longer overlaps the narrowed blocker")
+	if err := notice(b, next.NoticeRequestID(b.ID)); !errors.Is(err, api.ErrConflict) {
+		t.Fatalf("new revision inside the grace period: %v", err)
+	}
+	advance(6 * time.Minute)
+	if err := notice(b, next.NoticeRequestID(b.ID)); err != nil || messages() != before+2 {
+		t.Fatalf("new revision notice: %v, %d new messages", err, messages()-before)
+	}
+
+	// Once the stall clears its notice is refused.
+	if _, err := f.integrated(narrowed, "integrated-a", strings.Repeat("a", 40)); err != nil {
+		t.Fatal(err)
+	}
+	assertNoStall(t, f, b.ID, "blocker integrated")
+	if err := notice(b, next.NoticeRequestID(b.ID)+"-cleared"); !errors.Is(err, api.ErrConflict) {
+		t.Fatalf("cleared stall notice: %v", err)
+	}
+	if messages() != before+2 {
+		t.Fatalf("cleared stall posted %d messages", messages()-before)
 	}
 }

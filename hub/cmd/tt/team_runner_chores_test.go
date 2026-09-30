@@ -508,3 +508,71 @@ func TestTeamQueueIntegratedCLIRefusals(t *testing.T) {
 		t.Fatalf("integrated entry: %+v", got)
 	}
 }
+
+// a7 (runner): the runner posts one notice for a stall past the grace, adds
+// nothing on later ticks, and after a relay restart the hub replays the
+// saved notice instead of posting another.
+func TestTeamRunnerPostsOneStallNotice(t *testing.T) {
+	f := newTeamFixture(t, true)
+	ctx := context.Background()
+	f.st.SetQueueStallTiming(0, time.Millisecond)
+	observeRunnerHost(t, f, "fixture", 1)
+	if _, err := f.c.TeamQueueAction(ctx, f.task.ID, api.TeamQueueRequest{RequestID: "notice-limit", Operation: "set_limit", Host: "fixture", ConcurrencyLimit: 0}); err != nil {
+		t.Fatal(err)
+	}
+	a, err := f.c.TeamQueueAction(ctx, f.task.ID, api.TeamQueueRequest{RequestID: "notice-add-a", Operation: "add", ItemID: f.item.ID, OrderMessageSeq: f.order, Host: "fixture", Cwd: t.TempDir(), Repository: "fixture-repo", BaseCommit: strings.Repeat("a", 40), Ownership: []string{"src"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	a = runQueueEntry(t, f, a.ID)
+	if _, err := f.c.AddAgent(ctx, f.task.ID, api.AddAgentRequest{AgentID: api.NewID("agt"), Name: "member-a", Host: "fixture", Session: "member-a", Runtime: "codex", WorkItem: &api.AgentWorkItemRequest{ItemTaskID: f.task.ID, ItemID: f.item.ID, ItemRevision: f.item.Revision, WorkOrderMessage: api.MessageReference{TaskID: f.task.ID, Seq: f.order}, ContextBundle: teamCloseCLIContext(t, f.item, api.Message{TaskID: f.task.ID, Seq: f.order, Text: "bounded fixture order"})}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.c.TeamQueueAction(ctx, f.task.ID, api.TeamQueueRequest{RequestID: "notice-fail-a", Operation: "fail", EntryID: a.ID, ExpectedRevision: a.Revision, Failure: "fixture failure"}); err != nil {
+		t.Fatal(err)
+	}
+	other, otherOrder := queueFixtureItem(t, f, "notice-b")
+	if _, err := f.c.TeamQueueAction(ctx, f.task.ID, api.TeamQueueRequest{RequestID: "notice-add-b", Operation: "add", ItemID: other.ID, OrderMessageSeq: otherOrder, Host: "fixture", Cwd: t.TempDir(), Repository: "fixture-repo", BaseCommit: strings.Repeat("a", 40), Ownership: []string{"src/b"}}); err != nil {
+		t.Fatal(err)
+	}
+	notices := func() int {
+		t.Helper()
+		messages, err := f.c.ListMessages(ctx, f.task.ID, 0, "", 500)
+		if err != nil {
+			t.Fatal(err)
+		}
+		n := 0
+		for _, m := range messages {
+			if m.From.Node == "team_queue" && m.Envelope != nil && m.Envelope.Kind == api.EnvelopeKindNotice && m.Envelope.Refs["cause"] == api.StallFailedEntry {
+				if m.Envelope.Refs["blocker"] != a.ID || m.Envelope.Refs["escalation"] != "" || m.To != "" {
+					t.Fatalf("stall notice %+v", m)
+				}
+				n++
+			}
+		}
+		return n
+	}
+	runner := teamRunner{stallGrace: time.Millisecond, plan: func(context.Context, map[string]any, *teamLaunchResolved) error {
+		t.Fatal("runner launched blocked work")
+		return nil
+	}}
+	postedStallNotices.Range(func(k, _ any) bool { postedStallNotices.Delete(k); return true })
+	for i := 0; i < 2; i++ {
+		time.Sleep(2 * time.Second) // isolated test hub's write bucket refills
+		if err := runner.tick(ctx, f.e, f.c, "fixture"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if n := notices(); n != 1 {
+		t.Fatalf("%d stall notices after two ticks", n)
+	}
+	// A relay restart forgets what it posted; the hub replays the notice.
+	postedStallNotices.Range(func(k, _ any) bool { postedStallNotices.Delete(k); return true })
+	time.Sleep(2 * time.Second)
+	if err := runner.tick(ctx, f.e, f.c, "fixture"); err != nil {
+		t.Fatal(err)
+	}
+	if n := notices(); n != 1 {
+		t.Fatalf("%d stall notices after a relay restart", n)
+	}
+}

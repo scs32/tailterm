@@ -517,6 +517,13 @@ func (s *Store) ListTeamQueue(ctx context.Context, task string) (api.TeamQueueLi
 			}
 		}
 	}
+	var reader queryRower = s.db
+	if capacityTx != nil {
+		reader = capacityTx
+	}
+	if err := s.explainQueueStalls(ctx, reader, capacityTx, &out); err != nil {
+		return out, err
+	}
 	return out, nil
 }
 
@@ -601,6 +608,11 @@ func (s *Store) TeamQueueAction(ctx context.Context, task string, req api.TeamQu
 		// A lost response is replayable after the release increments revision.
 		identity.ExpectedRevision = 0
 	}
+	if identity.Operation == "stall_notice" {
+		// One notice per stall: every queued entry behind the same blocker
+		// replays the first one.
+		identity = api.TeamQueueRequest{RequestID: req.RequestID, Operation: req.Operation}
+	}
 	b, _ := json.Marshal(identity)
 	h := sha256.Sum256(b)
 	hash := hex.EncodeToString(h[:])
@@ -648,6 +660,15 @@ func (s *Store) TeamQueueAction(ctx context.Context, task string, req api.TeamQu
 			return zero, fmt.Errorf("%w: exactly one available database handler is required", api.ErrConflict)
 		}
 	}
+	var stalled api.TeamQueueEntry
+	var stallEnvelope api.Envelope
+	if req.Operation == "stall_notice" {
+		// The list reads through the single connection, so the stall is
+		// recomputed before the write transaction opens.
+		if stalled, stallEnvelope, err = s.stallNotice(ctx, task, req); err != nil {
+			return zero, err
+		}
+	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return zero, err
@@ -656,6 +677,13 @@ func (s *Store) TeamQueueAction(ctx context.Context, task string, req api.TeamQu
 	now := ts(s.now())
 	var e api.TeamQueueEntry
 	switch req.Operation {
+	case "stall_notice":
+		// A notice from the queue runner to the Board: no recipient, no
+		// escalation ref and no obligation.
+		if _, err := s.insertMessage(ctx, tx, t, api.PostMessageRequest{Envelope: &stallEnvelope}, api.Agent{}, api.Caller{Node: "team_queue", User: "runner"}, false, false); err != nil {
+			return zero, err
+		}
+		e = stalled
 	case "set_host_policy":
 		if req.Host == "" || !validLimiterDomain(req.LimiterDomain) || len(req.LimiterDomain) > 255 || req.HostPolicyVersion < 1 || req.HostMaxSessions < 1 || req.HostMaxPolling < 1 || req.HostMaxRelayBindings < 1 || req.HostMaxRequestsPerMinute < 1 || req.HostMaxBurst < 1 || req.HostHeadroomPercent < 1 || req.HostHeadroomPercent >= 100 || req.HostMaxRequestsPerMinute > 1000000 || req.HostMaxBurst > 100000 || req.HostMinFreeDiskMiB < 0 {
 			return zero, api.ErrInvalid

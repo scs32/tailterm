@@ -31,6 +31,9 @@ type Store struct {
 	mu         sync.Mutex
 	waiters    map[string]chan struct{}
 	now        func() time.Time
+	// Stall explainer thresholds; zero uses the defaults. Tests inject them.
+	queueIdleThreshold time.Duration
+	queueStallGrace    time.Duration
 }
 
 const schema = `

@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/url"
 	"strconv"
 )
@@ -83,6 +84,18 @@ type TeamQueueStall struct {
 	BlockerRevision int64  `json:"blockerRevision,omitempty"`
 	Fix             string `json:"fix"`
 	Since           string `json:"since"`
+}
+
+// NoticeRequestID names one stall for its Board notice: its blocker (or,
+// with none, the queued entry), its cause and the blocker's revision. The
+// runner sends it as the notice's retry identity, so a stall is announced
+// once; the hub refuses any other identity as stale.
+func (s TeamQueueStall) NoticeRequestID(entryID string) string {
+	subject := s.BlockerEntryID
+	if subject == "" {
+		subject = entryID
+	}
+	return fmt.Sprintf("queue-stall-%s-%s-%d", subject, s.Cause, s.BlockerRevision)
 }
 
 // Stall causes.

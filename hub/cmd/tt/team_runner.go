@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -30,9 +31,17 @@ type teamRunner struct {
 	integration func(context.Context, api.TeamQueueEntry, api.WorkItem, api.TeamCloseRequest) (*api.TeamIntegrationReady, error)
 	census      func(ctx context.Context, c *api.Client, task, host string, policy api.TeamHostPolicy, prior *api.TeamHostUsage, cwds []string) error
 	// changed lists the files a candidate changed; nil uses Git.
-	changed    func(ctx context.Context, repository, base, commit string) ([]string, error)
+	changed func(ctx context.Context, repository, base, commit string) ([]string, error)
+	// stallGrace is how long a stall holds before its Board notice; zero
+	// uses the hub's five minutes.
+	stallGrace time.Duration
 	roundRobin bool
 }
+
+// postedStallNotices remembers the stall notices this relay process has
+// saved, so a persisting stall costs no hub write per tick. After a restart
+// the hub replays the saved notice instead of posting another.
+var postedStallNotices sync.Map
 
 var teamQueueProjectCursor atomic.Uint64
 var teamHostBudgetLastLog atomic.Int64
@@ -196,6 +205,7 @@ func (r teamRunner) tick(ctx context.Context, e env, c *api.Client, host string)
 				break
 			}
 		}
+		r.noticeStalls(ctx, c, queue, host)
 	}
 	if r.roundRobin {
 		// A host census fault is local to new parallel launch effects. Returning
@@ -277,6 +287,36 @@ func (r teamRunner) narrow(ctx context.Context, c *api.Client, q api.TeamQueueEn
 		return q
 	}
 	return narrowed
+}
+
+// noticeStalls posts one Board notice for each stall the hub explains on this
+// host's queued entries once it has held past the grace period. The hub
+// recomputes the stall and refuses a stale one; a refusal is not an error.
+func (r teamRunner) noticeStalls(ctx context.Context, c *api.Client, queue api.TeamQueueList, host string) {
+	grace := r.stallGrace
+	if grace <= 0 {
+		grace = 5 * time.Minute
+	}
+	for _, q := range queue.Entries {
+		if q.State != "queued" || q.Stall == nil || q.Host != host {
+			continue
+		}
+		since, err := time.Parse(time.RFC3339Nano, q.Stall.Since)
+		if err != nil || time.Since(since) < grace {
+			continue
+		}
+		id := q.Stall.NoticeRequestID(q.ID)
+		if _, posted := postedStallNotices.Load(id); posted {
+			continue
+		}
+		_, err = c.TeamQueueAction(ctx, q.TaskID, api.TeamQueueRequest{RequestID: id, Operation: "stall_notice", EntryID: q.ID, ExpectedRevision: q.Revision})
+		var response *api.HTTPError
+		if err == nil {
+			postedStallNotices.Store(id, true)
+		} else if !errors.As(err, &response) || response.Status != 409 {
+			fmt.Fprintf(os.Stderr, "[tt relay] team queue %s: stall notice: %v\n", q.ID, err)
+		}
+	}
 }
 
 // queueParallel mirrors the hub: 1 is the serial queue, 0 has no fixed cap
