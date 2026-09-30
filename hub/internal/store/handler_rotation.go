@@ -272,7 +272,7 @@ type handlerBusy struct {
 func loadHandlerBusy(ctx context.Context, q queryRower, task string, a api.Agent) (handlerBusy, error) {
 	var b handlerBusy
 	rows, err := q.QueryContext(ctx, `SELECT id,item_id,state,handler_lease_generation FROM team_queue_entries WHERE task_id=? AND handler_id=? AND handler_run_id=?
- AND (state IN ('launching','running') OR (state='failed' AND released_at='')) ORDER BY position,id`, task, a.ID, a.RunID)
+ AND `+queueHoldsSQL+` ORDER BY position,id`, task, a.ID, a.RunID)
 	if err != nil {
 		return b, err
 	}

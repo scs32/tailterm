@@ -58,3 +58,13 @@ func queueScopesConflict(a, b []string) bool {
 func queueEntryConflicts(a, b api.TeamQueueEntry) bool {
 	return a.Repository == "" || b.Repository == "" || len(a.Ownership) == 0 || len(b.Ownership) == 0 || (a.Repository == b.Repository && queueScopesConflict(a.Ownership, b.Ownership))
 }
+
+// queueHoldsSQL is the SQL form of queueEntryHoldsResources.
+const queueHoldsSQL = `(state IN ('launching','running','failed') AND released_at='')`
+
+// queueEntryHoldsResources reports whether an entry holds a team slot, a
+// handler lease and its ownership. A released entry holds none of them, even
+// while an owner-integrated team is still live for post-release checks.
+func queueEntryHoldsResources(e api.TeamQueueEntry) bool {
+	return (e.State == "launching" || e.State == "running" || e.State == "failed") && e.ReleasedAt == ""
+}

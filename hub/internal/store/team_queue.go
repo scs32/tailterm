@@ -434,7 +434,7 @@ func (s *Store) ListTeamQueue(ctx context.Context, task string) (api.TeamQueueLi
 		if err := s.loadTeamActivities(ctx, &out.Entries[i]); err != nil {
 			return out, err
 		}
-		if entry.State == "launching" || entry.State == "running" || (entry.State == "failed" && entry.ReleasedAt == "") {
+		if queueEntryHoldsResources(entry) {
 			activeCount++
 		}
 		if entry.State == "running" && entry.Repository != "" && entry.Acceptance == nil {
@@ -458,7 +458,7 @@ func (s *Store) ListTeamQueue(ctx context.Context, task string) (api.TeamQueueLi
 		}
 		defer capacityTx.Rollback()
 		for _, entry := range out.Entries {
-			if entry.State == "launching" || entry.State == "running" || (entry.State == "failed" && entry.ReleasedAt == "") {
+			if queueEntryHoldsResources(entry) {
 				active = append(active, entry)
 			}
 		}
@@ -497,7 +497,7 @@ func (s *Store) ListTeamQueue(ctx context.Context, task string) (api.TeamQueueLi
 				continue
 			}
 			other := out.Entries[j]
-			if other.State != "launching" && other.State != "running" && !(other.State == "failed" && other.ReleasedAt == "") {
+			if !queueEntryHoldsResources(other) {
 				continue
 			}
 			if queueEntryConflicts(out.Entries[i], other) || (out.Entries[i].Cwd != "" && out.Entries[i].Cwd == other.Cwd) {
@@ -708,7 +708,7 @@ func (s *Store) TeamQueueAction(ctx context.Context, task string, req api.TeamQu
 				return zero, err
 			}
 			var unverified int
-			if err := tx.QueryRowContext(ctx, `SELECT count(*) FROM team_queue_entries WHERE task_id=? AND (state IN ('queued','launching','running') OR (state='failed' AND released_at='')) AND (repository='' OR base_commit='')`, task).Scan(&unverified); err != nil {
+			if err := tx.QueryRowContext(ctx, `SELECT count(*) FROM team_queue_entries WHERE task_id=? AND (state='queued' OR `+queueHoldsSQL+`) AND (repository='' OR base_commit='')`, task).Scan(&unverified); err != nil {
 				return zero, err
 			}
 			if unverified != 0 {
@@ -716,7 +716,7 @@ func (s *Store) TeamQueueAction(ctx context.Context, task string, req api.TeamQu
 			}
 		}
 		var active int
-		if err := tx.QueryRowContext(ctx, `SELECT count(*) FROM team_queue_entries WHERE task_id=? AND (state IN ('launching','running') OR (state='failed' AND released_at=''))`, task).Scan(&active); err != nil {
+		if err := tx.QueryRowContext(ctx, `SELECT count(*) FROM team_queue_entries WHERE task_id=? AND `+queueHoldsSQL, task).Scan(&active); err != nil {
 			return zero, err
 		}
 		if req.ConcurrencyLimit > 0 && active > req.ConcurrencyLimit {
@@ -909,7 +909,7 @@ func (s *Store) TeamQueueAction(ctx context.Context, task string, req api.TeamQu
 				// widen into paths another active team holds.
 				scoped := e
 				scoped.Ownership = ownership
-				rows, err := tx.QueryContext(ctx, `SELECT `+teamQueueCols+` FROM team_queue_entries WHERE task_id=? AND id<>? AND (state IN ('launching','running') OR (state='failed' AND released_at='')) ORDER BY position`, task, e.ID)
+				rows, err := tx.QueryContext(ctx, `SELECT `+teamQueueCols+` FROM team_queue_entries WHERE task_id=? AND id<>? AND `+queueHoldsSQL+` ORDER BY position`, task, e.ID)
 				if err != nil {
 					return zero, err
 				}
@@ -1046,7 +1046,7 @@ func (s *Store) TeamQueueAction(ctx context.Context, task string, req api.TeamQu
 			if manual != 0 {
 				return zero, fmt.Errorf("%w: manual launch is reserved", api.ErrConflict)
 			}
-			rows, err := tx.QueryContext(ctx, `SELECT `+teamQueueCols+` FROM team_queue_entries WHERE task_id=? AND (state='queued' OR state IN ('launching','running') OR (state='failed' AND released_at='')) ORDER BY position`, task)
+			rows, err := tx.QueryContext(ctx, `SELECT `+teamQueueCols+` FROM team_queue_entries WHERE task_id=? AND (state='queued' OR `+queueHoldsSQL+`) ORDER BY position`, task)
 			if err != nil {
 				return zero, err
 			}
