@@ -186,7 +186,7 @@ func resolveUsage(ctx context.Context, tx *sql.Tx, task, agent, run string, t ap
 			return out, err
 		}
 	}
-	persistent := p.Role == "database_handler" || p.Role == "project_lead" || p.Role == "deployment_agent"
+	persistent := p.Role == "database_handler" || p.Role == "project_lead" || p.Role == "deployment_agent" || p.Role == "backlog_steward"
 	if len(items) == 0 && !persistent && p.Binding != nil {
 		b := p.Binding
 		items[b.ItemTaskID+"/"+b.ItemID] = api.UsageAttribution{TaskID: b.ItemTaskID, ItemID: b.ItemID, Reason: "exact admitted binding " + b.ContextDigest}

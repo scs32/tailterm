@@ -470,7 +470,7 @@ func scanAgent(row interface{ Scan(...any) error }) (api.Agent, error) {
 }
 
 func (s *Store) AddAgent(ctx context.Context, taskID string, req api.AddAgentRequest, by api.Caller) (api.Agent, error) {
-	if req.TemplateDigest != "" && req.Role != api.AgentRoleDatabaseHandler {
+	if req.TemplateDigest != "" && req.Role != api.AgentRoleDatabaseHandler && req.Role != api.AgentRoleBacklogSteward {
 		return api.Agent{}, api.ErrInvalid
 	}
 	priorRun := ""
@@ -488,6 +488,9 @@ func (s *Store) AddAgent(ctx context.Context, taskID string, req api.AddAgentReq
 	// legacy run must not mark its older prompt current.
 	if a.RunID != priorRun {
 		if err = s.recordHandlerRun(ctx, a, req.TemplateDigest); err != nil {
+			return a, err
+		}
+		if err = s.recordStewardRun(ctx, a, req.TemplateDigest); err != nil {
 			return a, err
 		}
 	}
@@ -534,16 +537,16 @@ func (s *Store) addAgent(ctx context.Context, taskID string, req api.AddAgentReq
 	if t.LifecycleGeneration != req.ExpectedLifecycleGeneration {
 		return api.Agent{}, fmt.Errorf("%w: project lifecycle generation changed; refresh before admission", api.ErrConflict)
 	}
-	if req.Role != "" && req.Role != api.AgentRoleDatabaseHandler && req.Role != api.AgentRoleDeployment {
+	if req.Role != "" && !api.PersistentAgentRole(req.Role) {
 		return api.Agent{}, api.ErrInvalid
 	}
-	if (req.Role == api.AgentRoleDatabaseHandler || req.Role == api.AgentRoleDeployment) && req.ParentAgentID != "" {
+	if api.PersistentAgentRole(req.Role) && req.ParentAgentID != "" {
 		return api.Agent{}, api.ErrInvalid
 	}
-	if (req.Role == api.AgentRoleDatabaseHandler || req.Role == api.AgentRoleDeployment) && req.WorkItem != nil {
+	if api.PersistentAgentRole(req.Role) && req.WorkItem != nil {
 		return api.Agent{}, api.ErrInvalid
 	}
-	if (req.Role == api.AgentRoleDatabaseHandler || req.Role == api.AgentRoleDeployment) && !api.ValidID(req.AgentID, "agt") {
+	if api.PersistentAgentRole(req.Role) && !api.ValidID(req.AgentID, "agt") {
 		return api.Agent{}, api.ErrInvalid
 	}
 	if req.ExpectedRunID != "" && (!api.ValidID(req.AgentID, "agt") || !validRunID(req.ExpectedRunID)) {
@@ -614,7 +617,7 @@ func (s *Store) addAgent(ctx context.Context, taskID string, req api.AddAgentReq
 			}
 		}
 	}
-	if req.ExpectedRunID != "" && req.Role != api.AgentRoleDatabaseHandler && req.Role != api.AgentRoleDeployment && resumeAdmission == nil && !queuePreallocated {
+	if req.ExpectedRunID != "" && !api.PersistentAgentRole(req.Role) && resumeAdmission == nil && !queuePreallocated {
 		return api.Agent{}, api.ErrInvalid
 	}
 	if req.AgentID != "" {
@@ -633,11 +636,11 @@ func (s *Store) addAgent(ctx context.Context, taskID string, req api.AddAgentReq
 			if existing.WorkItem != nil || (req.WorkItem != nil && req.Role == "") {
 				return api.Agent{}, fmt.Errorf("%w: item-bound agents require a fresh name and identity", api.ErrConflict)
 			}
-			if ((existing.Role == api.AgentRoleDatabaseHandler || existing.Role == api.AgentRoleDeployment) || (req.Role == api.AgentRoleDatabaseHandler || req.Role == api.AgentRoleDeployment)) &&
+			if (api.PersistentAgentRole(existing.Role) || api.PersistentAgentRole(req.Role)) &&
 				(existing.Name != req.Name || existing.Host != req.Host || existing.Session != req.Session || existing.Runtime != req.Runtime || existing.Cwd != req.Cwd || existing.ParentAgentID != req.ParentAgentID || existing.Role != req.Role) {
 				return api.Agent{}, fmt.Errorf("%w: database handler launch settings changed", api.ErrConflict)
 			}
-			if existing.Role == api.AgentRoleDatabaseHandler || existing.Role == api.AgentRoleDeployment {
+			if api.PersistentAgentRole(existing.Role) {
 				if existing.Status == api.AgentClosed {
 					return api.Agent{}, api.ErrClosed
 				}
@@ -707,7 +710,7 @@ func (s *Store) addAgent(ctx context.Context, taskID string, req api.AddAgentReq
 		if e != nil {
 			return api.Agent{}, e
 		}
-		if req.Role == api.AgentRoleDatabaseHandler || req.Role == api.AgentRoleDeployment {
+		if api.PersistentAgentRole(req.Role) {
 			return api.Agent{}, fmt.Errorf("%w: database handler restart requires its stable agentId and expectedRunId", api.ErrConflict)
 		}
 		if req.WorkItem != nil {
@@ -889,10 +892,16 @@ AND NOT EXISTS (SELECT 1 FROM agent_work_item_bindings r JOIN agents ra ON ra.id
 			return a, api.ErrAgentSpawnLimit
 		}
 	}
-	_, err = tx.ExecContext(ctx, `INSERT INTO agents (`+agentCols+`) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-		a.ID, a.TaskID, a.Name, a.Host, a.Session, a.Runtime, a.Cwd, a.ParentAgentID, a.Role, a.Status, a.Title, ts(now), ts(now), a.RunID, "", "", "", false, "")
+	stewardPending := false
+	if a.Role == api.AgentRoleBacklogSteward {
+		if stewardPending, err = admitStewardTx(ctx, tx, taskID, a.ID); err != nil {
+			return a, err
+		}
+	}
+	_, err = tx.ExecContext(ctx, `INSERT INTO agents (`+agentCols+`,steward_pending) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		a.ID, a.TaskID, a.Name, a.Host, a.Session, a.Runtime, a.Cwd, a.ParentAgentID, a.Role, a.Status, a.Title, ts(now), ts(now), a.RunID, "", "", "", false, "", stewardPending)
 	if err != nil {
-		return a, err
+		return a, stewardUniqueViolation(ctx, tx, taskID, err)
 	}
 	if a.WorkItem, err = insertAgentWorkItemBinding(ctx, tx, a, req.WorkItem, contextThrough, resolvedTeamRole); err != nil {
 		return a, err

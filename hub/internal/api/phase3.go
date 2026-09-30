@@ -4,10 +4,12 @@ package api
 // remaining controls over obligations.
 
 // Role recipients an envelope may address: "role:lead" is the project's
-// orchestrator, "role:database_handler" its database handler.
+// orchestrator, "role:database_handler" its database handler and
+// "role:backlog_steward" its backlog steward.
 const (
 	RoleLead            = "lead"
 	RoleDatabaseHandler = "database_handler"
+	RoleBacklogSteward  = "backlog_steward"
 )
 
 // ObligationExtendRequest moves an open obligation's deadlines to now + For.

@@ -452,6 +452,9 @@ CREATE INDEX IF NOT EXISTS agent_allocation_intents_item ON agent_allocation_int
 	if err := migrateHandlerRotation(db); err != nil {
 		return err
 	}
+	if err := migrateBacklogSteward(db); err != nil {
+		return err
+	}
 	if err := migrateRuntimePrompt(db); err != nil {
 		return err
 	}
