@@ -11,11 +11,24 @@ export function targetsForPaths(paths) {
     else if (/^hub\/(cmd\/tailterm-hub\/|internal\/(broker|monitor|jev)\/)/.test(p)) out.add("hub");
     else if (/^hub\/(cmd\/tailterm-discord\/|internal\/bridge\/)/.test(p)) out.add("bridge");
     else if (/^hub\/(cmd\/tt\/|internal\/(spawn|adapters)\/)/.test(p)) out.add("mini");
+    else if (/^hub\/internal\/triage\//.test(p)) { out.add("hub"); out.add("mini"); } // imported by tailterm-hub and tt
+    else if (/^hub\/internal\/discord\//.test(p)) out.add("bridge"); // only tailterm-discord imports it
+    else if (/^hub\/internal\/teamplan\//.test(p)) out.add("mini"); // only tt imports teamplan; plan.mjs is go:embed'ed into tt
     else if (/^(client\/|wasm\/|public\/|package(-lock)?\.json$|index\.html$|vite.*\.js$)/.test(p)) out.add("tailos");
     else if (/^scripts\/(deploy-truenas-hub\.py|truenas_release_preflight\.py)$/.test(p)) {out.add("hub");out.add("bridge");}
     else if (/^scripts\/(release-|verify-|install-relay|build-tt)/.test(p)) {for(const t of targets)out.add(t);}
     else if (/^scripts\/(package-static|build-wasm|download-|prepare-|preview-static)/.test(p)) out.add("tailos");
+    else if (/^shared\//.test(p)) out.add("tailos"); // bundled into the static client through client/ imports
+    else if (/^scripts\/package-speech-model\.mjs$/.test(p)) out.add("tailos"); // imported by package-static during build:static
+    else if (/^deploy\/(_headers|LICENSE\.(onnxruntime|whisper)\.txt)$/.test(p)) out.add("tailos"); // copied into dist-static by package-static
     else if (/^(LICENSE|README\.md|\.gitignore|\.npmrc|\.prettierrc.*)$/.test(p)) continue;
+    else if (/^hub\/internal\/testverification\//.test(p)) continue; // test fixture; imported only by _test.go files
+    else if (/^scripts\/build-team-plan\.mjs$/.test(p)) continue; // generator; its committed output plan.mjs maps to mini and npm test --check keeps them in sync
+    else if (/^(server\/|scripts\/export-server-vault\.mjs$)/.test(p)) continue; // old Node server for tailterm.tailarr.com and its vault export, not a release target
+    else if (/^scripts\/(deploy-static\.mjs|deploy-remote-static\.py|deploy-apple-web\.py|cloudflare-domain\.mjs|container-dev\.sh)$/.test(p)) continue; // manual, old-site and local container tooling; release deploys tailos with wrangler
+    else if (/^((hub\/)?(Dockerfile|\.dockerignore)|Dockerfile\.static|deploy\/(Caddyfile(\.container)?|compose\.yaml))$/.test(p)) continue; // container images and example deployments; hub/bridge ship binaries via deploy-truenas-hub.py
+    else if (/^tools\/jev-kit\//.test(p)) continue; // separate evaluation kit module; nothing ships from it
+    else if (/^(\.github\/workflows\/[^/]+\.ya?ml|hub\/README\.md)$/.test(p)) continue; // CI configuration and documentation
     else throw new Error("Unknown release path");
   }
   return targets.filter(t => out.has(t));
