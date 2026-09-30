@@ -2,9 +2,11 @@ package server
 
 import (
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"strconv"
+	"strings"
 
 	"github.com/scs32/tailterm/hub/internal/api"
 )
@@ -19,15 +21,54 @@ func decodeScopeLimited(w http.ResponseWriter, r *http.Request, v any, maxBytes 
 	d := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxBytes))
 	d.DisallowUnknownFields()
 	if err := d.Decode(v); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid scope metadata request")
+		refuseScopeDecode(w, err)
 		return false
 	}
+	// Padding after a valid object reaches the size limit here, not above:
+	// the first Decode returns as soon as the object is buffered.
 	var extra any
 	if err := d.Decode(&extra); err != io.EOF {
-		writeError(w, http.StatusBadRequest, "invalid scope metadata request")
+		var tooLarge *http.MaxBytesError
+		if !errors.As(err, &tooLarge) {
+			err = errTrailingData
+		}
+		refuseScopeDecode(w, err)
 		return false
 	}
 	return true
+}
+
+var errTrailingData = errors.New("trailing data")
+
+// A refusal names its reason: callers only see the message text, and "too
+// large" and "unknown field" need different fixes.
+func refuseScopeDecode(w http.ResponseWriter, err error) {
+	const prefix = "invalid scope metadata request: "
+	var tooLarge *http.MaxBytesError
+	var wrongType *json.UnmarshalTypeError
+	reason, code := "malformed JSON", "malformed-json"
+	switch {
+	case errors.As(err, &tooLarge):
+		reason, code = "body exceeds "+strconv.FormatInt(tooLarge.Limit, 10)+" bytes", "body-too-large"
+	case errors.Is(err, errTrailingData):
+		reason, code = "trailing data after the JSON object", "trailing-data"
+	case strings.HasPrefix(err.Error(), `json: unknown field "`):
+		// encoding/json has no typed error for an unknown field.
+		name := strings.TrimSuffix(strings.TrimPrefix(err.Error(), `json: unknown field "`), `"`)
+		reason, code = "unknown field "+boundedFieldName(name), "unknown-field"
+	case errors.As(err, &wrongType):
+		reason, code = "wrong type for field "+boundedFieldName(wrongType.Field), "wrong-type"
+	}
+	writeJSON(w, http.StatusBadRequest, api.ErrorResponse{Error: prefix + reason, Code: code})
+}
+
+// The name comes from the caller's body, so the echo is bounded and quoted.
+func boundedFieldName(name string) string {
+	const max = 64
+	if len(name) > max {
+		name = strings.ToValidUTF8(name[:max], "") + "..."
+	}
+	return strconv.Quote(name)
 }
 
 func (s *Server) confirmWorkOrderScope(w http.ResponseWriter, r *http.Request) {

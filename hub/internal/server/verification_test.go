@@ -162,31 +162,31 @@ func TestVerificationHTTPAcceptsFullMatrixReceiptOnly(t *testing.T) {
 	}
 
 	path := "/v1/tasks/" + task.ID + "/work-items/" + item.ID
-	post := func(route, body string) string {
-		var out struct {
-			Error string `json:"error"`
-		}
-		c.do("POST", path+route, body, &out)
-		return out.Error
+	post := func(route, body string) (int, api.ErrorResponse) {
+		var out api.ErrorResponse
+		status := c.do("POST", path+route, body, &out)
+		return status, out
 	}
 	const invalid = "invalid scope metadata request"
 	pad := func(n int) string {
 		body := `{"requestId":"pad"}`
 		return body + strings.Repeat(" ", n-len(body))
 	}
-	if got := post("/verification", pad(api.MaxVerificationBody)); got == invalid {
-		t.Fatal("verification body at the limit was not decoded")
+	if _, got := post("/verification", pad(api.MaxVerificationBody)); strings.HasPrefix(got.Error, invalid) {
+		t.Fatal("verification body at the limit was not decoded", got)
 	}
-	if got := post("/verification", pad(api.MaxVerificationBody+1)); got != invalid {
-		t.Fatal("oversize verification body", got)
-	}
-	if got := post("/verification", `{"requestId":"unknown","bogus":1}`); got != invalid {
-		t.Fatal("unknown verification field", got)
-	}
-	if got := post("/verification", `{"requestId":"trailing"} {}`); got != invalid {
-		t.Fatal("trailing verification data", got)
-	}
-	if got := post("/order-scope/confirm", pad(api.MaxBody+1)); got != invalid {
-		t.Fatal("shared limit changed for scope metadata", got)
+	// Each refusal names its reason in the text the CLI prints, and its code.
+	for _, tc := range []struct{ route, body, want, code string }{
+		{"/verification", pad(api.MaxVerificationBody + 1), invalid + ": body exceeds 1048576 bytes", "body-too-large"},
+		{"/verification", `{"requestId":"unknown","bogus":1}`, invalid + `: unknown field "bogus"`, "unknown-field"},
+		{"/verification", `{"requestId":"trailing"} {}`, invalid + ": trailing data after the JSON object", "trailing-data"},
+		{"/verification", `{"requestId":7}`, invalid + `: wrong type for field "requestId"`, "wrong-type"},
+		{"/verification", `{"requestId":`, invalid + ": malformed JSON", "malformed-json"},
+		{"/verification", `{"requestId":"long","` + strings.Repeat("x", 4096) + `":1}`, invalid + `: unknown field "` + strings.Repeat("x", 64) + `..."`, "unknown-field"},
+		{"/order-scope/confirm", pad(api.MaxBody + 1), invalid + ": body exceeds 65536 bytes", "body-too-large"},
+	} {
+		if status, got := post(tc.route, tc.body); status != 400 || got.Error != tc.want || got.Code != tc.code {
+			t.Fatalf("%s %.40q: %d %+v, want %q %q", tc.route, tc.body, status, got, tc.want, tc.code)
+		}
 	}
 }
