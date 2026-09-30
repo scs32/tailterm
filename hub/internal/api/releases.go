@@ -28,6 +28,7 @@ type ReleaseJob struct {
 	PauseGeneration        int64                   `json:"pauseGeneration"`
 	IntegratedCommit       string                  `json:"integratedCommit,omitempty"`
 	IntegratedPlan         *VerificationPlan       `json:"integratedPlan,omitempty"`
+	IntegratedCoverage     []ReleaseCheckCoverage  `json:"integratedCoverage,omitempty"`
 	IntegratedVerification *VerificationReceipt    `json:"integratedVerification,omitempty"`
 	InputsCommit           string                  `json:"inputsCommit,omitempty"`
 	InputsDigest           string                  `json:"inputsDigest,omitempty"`
@@ -36,6 +37,17 @@ type ReleaseJob struct {
 	// Published survives a later block: tasks-hub already carries the release.
 	Published    bool                 `json:"published,omitempty"`
 	Supersession *ReleaseSupersession `json:"supersession,omitempty"`
+}
+
+// ReleaseCheckCoverage records an approved check that the integrated plan
+// covered with a wider check instead of the exact one (exact matches are not
+// listed). Relation "superset": the integrated go-race tested every approved
+// package and more.
+type ReleaseCheckCoverage struct {
+	CheckID          string `json:"checkId"`
+	ApprovedDigest   string `json:"approvedDigest"`
+	IntegratedDigest string `json:"integratedDigest"`
+	Relation         string `json:"relation"`
 }
 
 // ReleaseSupersession closes a verified, never-claimed job whose change the

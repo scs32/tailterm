@@ -7,6 +7,8 @@ import (
 	"errors"
 	"fmt"
 	"github.com/scs32/tailterm/hub/internal/api"
+	"maps"
+	"slices"
 	"strings"
 	"time"
 )
@@ -214,15 +216,24 @@ func (s *Store) ReleaseAction(ctx context.Context, task string, req api.ReleaseR
 			if err = releaseDeployer(ctx, tx, task, j.AgentID, j.RunID); err != nil {
 				return zero, err
 			}
+			var coverage []api.ReleaseCheckCoverage
 			for _, required := range j.Plan.Checks {
+				want := verificationDigest(required)
 				found := false
-				for _, check := range p.Checks {
-					if verificationDigest(check) == verificationDigest(required) {
+				var wider *api.VerificationCheck
+				for i, check := range p.Checks {
+					if verificationDigest(check) == want {
 						found = true
+					} else if wider == nil && goRaceCovers(required, check) {
+						wider = &p.Checks[i]
 					}
 				}
+				if !found && wider != nil {
+					found = true
+					coverage = append(coverage, api.ReleaseCheckCoverage{CheckID: required.ID, ApprovedDigest: want, IntegratedDigest: verificationDigest(*wider), Relation: "superset"})
+				}
 				if !found {
-					return zero, releaseConflict("integrated matrix omitted approved check")
+					return zero, releaseConflict("integrated matrix omitted approved check " + required.ID)
 				}
 			}
 			if err = verificationEligible(p, *req.Verification); err != nil {
@@ -240,6 +251,7 @@ func (s *Store) ReleaseAction(ctx context.Context, task string, req api.ReleaseR
 			j.IntegratedCommit = req.IntegratedCommit
 			j.IntegratedVerification = req.Verification
 			j.IntegratedPlan = req.Plan
+			j.IntegratedCoverage = coverage
 		} else {
 			if err = releaseDeployer(ctx, tx, task, req.AgentID, req.RunID); err != nil {
 				return zero, err
@@ -389,6 +401,47 @@ func (s *Store) ValidateReleaseDatabase(ctx context.Context) error {
 	return rows.Err()
 }
 
+// An integrated go-race covers the approved one when it differs only by
+// testing more packages: the runner derives go-race packages from the paths
+// changed since the approved base, so a cherry-pick onto a moved tasks-hub
+// adds the intervening commits' packages. Same id, cwd, environment and flags
+// (every argv element before the first package); every approved package, or
+// "./..." for any list. An approved "./..." is covered only by "./...".
+func goRaceCovers(approved, integrated api.VerificationCheck) bool {
+	if approved.ID != "go-race" || integrated.ID != approved.ID || integrated.Cwd != approved.Cwd || !maps.Equal(integrated.Environment, approved.Environment) {
+		return false
+	}
+	flags, want, ok := goRaceArgv(approved.Argv)
+	integratedFlags, have, integratedOK := goRaceArgv(integrated.Argv)
+	if !ok || !integratedOK || !slices.Equal(flags, integratedFlags) {
+		return false
+	}
+	if slices.Contains(have, "./...") {
+		return true
+	}
+	for _, pkg := range want {
+		if !slices.Contains(have, pkg) {
+			return false
+		}
+	}
+	return true
+}
+
+// goRaceArgv splits argv at its first package; every later element must be a
+// package too, so a flag after the packages never passes as one.
+func goRaceArgv(argv []string) (flags, packages []string, ok bool) {
+	i := slices.IndexFunc(argv, func(a string) bool { return strings.HasPrefix(a, "./") })
+	if i < 1 {
+		return nil, nil, false
+	}
+	for _, a := range argv[i:] {
+		if !strings.HasPrefix(a, "./") {
+			return nil, nil, false
+		}
+	}
+	return argv[:i], argv[i:], true
+}
+
 // Reconciliation refuses unknown/active execution. Exited-run rotation and a
 // handler's hashed host inspection are both required before releasing a fence.
 func reconcileRelease(ctx context.Context, tx *sql.Tx, task string, j *api.ReleaseJob, r *api.ReleaseReconciliation, generation int64) error {
@@ -447,6 +500,7 @@ func reconcileRelease(ctx context.Context, tx *sql.Tx, task string, j *api.Relea
 		j.RunID = ""
 		j.IntegratedCommit = ""
 		j.IntegratedPlan = nil
+		j.IntegratedCoverage = nil
 		j.IntegratedVerification = nil
 		j.InputsCommit = ""
 		j.InputsDigest = ""

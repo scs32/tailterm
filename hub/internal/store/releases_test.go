@@ -4,8 +4,10 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"github.com/scs32/tailterm/hub/internal/api"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -187,12 +189,146 @@ func TestReleaseUnavailableHeartbeatPauseAndImportedMatrix(t *testing.T) {
 	p.ApprovedMatrixDigest = p.MatrixDigest
 	r := passingVerification(p)
 	imported, err := s.ReleaseAction(ctx, task.ID, api.ReleaseRequest{RequestID: "import", Operation: "verification", AgentID: h.ID, RunID: h.RunID, JobID: j.ID, ExpectedGeneration: j.Generation, IntegratedCommit: p.Commit, Plan: &p, Verification: &r})
-	if err != nil {
-		t.Fatal(err)
+	if err != nil || imported.IntegratedCoverage != nil {
+		t.Fatal(imported.IntegratedCoverage, err)
 	}
 	req = api.ReleaseRequest{RequestID: "merged", Operation: "merged", AgentID: d.ID, RunID: d.RunID, JobID: j.ID, ExpectedGeneration: imported.Generation, IntegratedCommit: p.Commit}
 	if _, err = s.ReleaseAction(ctx, task.ID, req); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// goRaceMatrix is a 72-check matrix like the approved one: 71 fixed checks
+// and a go-race whose packages come from the changed paths.
+func goRaceMatrix(race api.VerificationCheck) []api.VerificationCheck {
+	checks := make([]api.VerificationCheck, 0, 72)
+	for i := range 71 {
+		script := fmt.Sprintf("tests/fixture-%03d-browser.mjs", i)
+		checks = append(checks, api.VerificationCheck{ID: fmt.Sprintf("%03d-%s", i, script), Argv: []string{"node", script, "--profile=/tmp/tailterm-verification-fixture-matrix/profiles/" + script, "--output=/tmp/tailterm-verification-fixture-matrix/artifacts/" + script}, Cwd: ".", Environment: map[string]string{"VERIFICATION_BASE_COMMIT": candidateA, "VERIFICATION_TIMEOUT_MS": "600000"}})
+	}
+	return append(checks, race)
+}
+func goRace(flags []string, packages ...string) api.VerificationCheck {
+	return api.VerificationCheck{ID: "go-race", Argv: append(append([]string{"go", "test"}, flags...), packages...), Cwd: "hub", Environment: map[string]string{"VERIFICATION_BASE_COMMIT": candidateA, "VERIFICATION_TIMEOUT_MS": "1800000"}}
+}
+
+var raceFlags = []string{"-race", "-timeout=25m"}
+
+// claimGoRaceJob enqueues and claims the fixture job, then gives it an
+// approved plan with the given checks (test-only rewrite of the snapshot).
+func claimGoRaceJob(t *testing.T, s *Store, task api.Task, h, d api.Agent, entry string, approved []api.VerificationCheck) api.ReleaseJob {
+	t.Helper()
+	ctx := context.Background()
+	j, err := s.ReleaseAction(ctx, task.ID, api.ReleaseRequest{RequestID: "race-enqueue", Operation: "enqueue", AgentID: h.ID, RunID: h.RunID, EntryID: entry})
+	if err != nil {
+		t.Fatal(err)
+	}
+	j, err = s.ReleaseAction(ctx, task.ID, api.ReleaseRequest{RequestID: "race-claim", Operation: "claim", AgentID: d.ID, RunID: d.RunID, JobID: j.ID, ExpectedGeneration: j.Generation})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return approveChecks(t, s, j, approved)
+}
+func approveChecks(t *testing.T, s *Store, j api.ReleaseJob, approved []api.VerificationCheck) api.ReleaseJob {
+	t.Helper()
+	j.Plan.Checks = approved
+	j.Plan.ChecksDigest = verificationDigest(approved)
+	raw, _ := json.Marshal(j)
+	if _, err := s.db.Exec(`UPDATE release_jobs SET record_json=? WHERE task_id=? AND id=?`, string(raw), j.TaskID, j.ID); err != nil {
+		t.Fatal(err)
+	}
+	return j
+}
+
+// integratedImport is the handler's import of the deployer's integrated run.
+func integratedImport(j api.ReleaseJob, h, d api.Agent, requestID string, checks []api.VerificationCheck) api.ReleaseRequest {
+	p := j.Plan
+	p.Commit = candidateA
+	p.VerifierAgentID = d.ID
+	p.VerifierRunID = d.RunID
+	p.ApprovedMatrixDigest = p.MatrixDigest
+	p.Checks = checks
+	p.ChecksDigest = verificationDigest(checks)
+	r := passingVerification(p)
+	return api.ReleaseRequest{RequestID: requestID, Operation: "verification", AgentID: h.ID, RunID: h.RunID, JobID: j.ID, ExpectedGeneration: j.Generation, IntegratedCommit: p.Commit, Plan: &p, Verification: &r}
+}
+
+var widerPackages = []string{"./cmd/tt", "./internal/api", "./internal/server", "./internal/spawn", "./internal/store"}
+
+// A cherry-pick onto a moved tasks-hub widens go-race to the intervening
+// commits' packages; that import is accepted and recorded, not refused.
+func TestReleaseImportAcceptsGoRacePackageSuperset(t *testing.T) {
+	s, task, h, d, entry := releaseFixture(t)
+	ctx := context.Background()
+	approved := goRaceMatrix(goRace(raceFlags, "./cmd/tt"))
+	j := claimGoRaceJob(t, s, task, h, d, entry, approved)
+	refuse := func(name, want string, checks []api.VerificationCheck) {
+		t.Helper()
+		_, err := s.ReleaseAction(ctx, task.ID, integratedImport(j, h, d, "race-"+name, checks))
+		if !errors.Is(err, api.ErrConflict) || !strings.HasSuffix(err.Error(), "integrated matrix omitted approved check "+want) {
+			t.Fatalf("%s: %v", name, err)
+		}
+		saved, err := releaseLoad(ctx, s.db, task.ID, j.ID)
+		if err != nil || saved.Generation != j.Generation || saved.IntegratedPlan != nil || saved.IntegratedCoverage != nil {
+			t.Fatal(name, "changed the job", saved.Generation, saved.IntegratedCoverage, err)
+		}
+	}
+	refuse("missing", "go-race", goRaceMatrix(goRace(raceFlags, widerPackages[1:]...)))
+	refuse("timeout", "go-race", goRaceMatrix(goRace([]string{"-race", "-timeout=14m"}, widerPackages...)))
+	refuse("no-race", "go-race", goRaceMatrix(goRace([]string{"-timeout=25m"}, widerPackages...)))
+	refuse("flag-after", "go-race", goRaceMatrix(goRace(raceFlags, append(slices.Clone(widerPackages), "-run", "TestX")...)))
+	moved := goRace(raceFlags, widerPackages...)
+	moved.Cwd = "."
+	refuse("cwd", "go-race", goRaceMatrix(moved))
+	env := goRace(raceFlags, widerPackages...)
+	env.Environment["VERIFICATION_TIMEOUT_MS"] = "900000"
+	refuse("environment", "go-race", goRaceMatrix(env))
+	changed := goRaceMatrix(goRace(raceFlags, "./cmd/tt"))
+	changed[7].Argv = append(slices.Clone(changed[7].Argv), "--headed")
+	refuse("other-check", changed[7].ID, changed)
+	// An approved "./..." is covered only by "./...", never by a list.
+	j = approveChecks(t, s, j, goRaceMatrix(goRace(raceFlags, "./...")))
+	refuse("all-vs-list", "go-race", goRaceMatrix(goRace(raceFlags, widerPackages...)))
+	j = approveChecks(t, s, j, approved)
+
+	integrated := goRaceMatrix(goRace(raceFlags, widerPackages...))
+	req := integratedImport(j, h, d, "race-import", integrated)
+	if raw, _ := json.Marshal(req); len(raw) <= api.MaxBody {
+		t.Fatalf("import is %d bytes, not over the shared %d-byte limit", len(raw), api.MaxBody)
+	}
+	imported, err := s.ReleaseAction(ctx, task.ID, req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []api.ReleaseCheckCoverage{{CheckID: "go-race", ApprovedDigest: verificationDigest(approved[71]), IntegratedDigest: verificationDigest(integrated[71]), Relation: "superset"}}
+	if !slices.Equal(imported.IntegratedCoverage, want) || imported.Generation != j.Generation+1 || imported.IntegratedCommit != candidateA {
+		t.Fatalf("coverage %+v generation %d", imported.IntegratedCoverage, imported.Generation)
+	}
+	retry, err := s.ReleaseAction(ctx, task.ID, req)
+	if err != nil || retry.Generation != imported.Generation || !slices.Equal(retry.IntegratedCoverage, want) {
+		t.Fatal("same request id did not replay the saved import", retry.Generation, err)
+	}
+	merged, err := s.ReleaseAction(ctx, task.ID, api.ReleaseRequest{RequestID: "race-merged", Operation: "merged", AgentID: d.ID, RunID: d.RunID, JobID: j.ID, ExpectedGeneration: imported.Generation, IntegratedCommit: candidateA})
+	if err != nil || merged.State != "merged" || !slices.Equal(merged.IntegratedCoverage, want) {
+		t.Fatal(merged.State, err)
+	}
+}
+
+// A requeued job starts its integrated verification from scratch, coverage
+// included.
+func TestReleaseRequeueClearsIntegratedCoverage(t *testing.T) {
+	s, task, h, d, entry := releaseFixture(t)
+	ctx := context.Background()
+	j := claimGoRaceJob(t, s, task, h, d, entry, goRaceMatrix(goRace(raceFlags, "./cmd/tt")))
+	imported, err := s.ReleaseAction(ctx, task.ID, integratedImport(j, h, d, "race-import", goRaceMatrix(goRace(raceFlags, widerPackages...))))
+	if err != nil || len(imported.IntegratedCoverage) != 1 {
+		t.Fatal(imported.IntegratedCoverage, err)
+	}
+	s.db.Exec(`UPDATE agents SET status='exited' WHERE id=?`, d.ID)
+	evidence := recoveryEvidence(t, s, task, h, imported)
+	requeued, err := s.ReleaseAction(ctx, task.ID, api.ReleaseRequest{RequestID: "race-requeue", Operation: "reconcile", AgentID: h.ID, RunID: h.RunID, JobID: j.ID, ExpectedGeneration: imported.Generation, Reconciliation: &evidence})
+	if err != nil || requeued.State != "verified" || requeued.IntegratedCoverage != nil || requeued.IntegratedPlan != nil || requeued.IntegratedVerification != nil {
+		t.Fatal(requeued.State, requeued.IntegratedCoverage, requeued.IntegratedPlan != nil, requeued.IntegratedVerification != nil, err)
 	}
 }
 
