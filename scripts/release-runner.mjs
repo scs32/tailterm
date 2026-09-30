@@ -544,6 +544,30 @@ export function runnableJob(jobs,agent,run,skipped=new Set()){
   if(jobs.some(j=>["claimed","merged","blocked"].includes(j.state)))return null;
   return jobs.find(j=>j.state==="verified" && !skipped.has(j.id))||null;
 }
+// A job the handler set aside (tt deployment set-aside) left the fence with
+// its claim's journal still on the host. Before the job is claimed again, a
+// journal of exactly that claim with no effects is archived so the re-planned
+// run starts fresh on the current tasks-hub; any other journal is held for
+// handler reconciliation. "none" leaves the journal to runRelease.
+export function setAsideJournal(journalPath,job){
+  const r=job?.reconciliations?.at(-1);
+  if(job?.state!=="verified" || r?.disposition!=="set_aside" || !existsSync(journalPath))return "none";
+  let prior;try{prior=JSON.parse(readFileSync(journalPath,"utf8"));}catch{return "held";}
+  if(prior?.jobId!==job.id || prior.commit!==job.commit || prior.agentId!==r.agentId || prior.runId!==r.runId || !Array.isArray(prior.effects) || prior.effects.length || prior.published===true)return "held";
+  renameSync(journalPath,`${journalPath}.set-aside-g${job.generation}`);return "archived";
+}
+const FENCE_REASONS={waiting_matrix:"is waiting for the handler to import integrated verification",waiting_inputs:"is waiting for the handler to bind release inputs",blocked:"is blocked",merged:"is merged and not yet finished",claimed:"is claimed by another deployer run"};
+// The notice for a job that holds the project fence while a later job waits:
+// null when nothing waits. Only a claim with no effects (unpublished, no
+// receipt, no inputs binding) can be set aside; any other holder keeps the
+// fence. The request id omits generations, which every fence check bumps.
+export function fenceWaitNotice(jobs,holder,reason){
+  const waiting=jobs.find(j=>j.id!==holder?.id && j.state==="verified");
+  if(!holder || !waiting || !FENCE_REASONS[reason])return null;
+  const noEffects=holder.state==="claimed" && holder.published!==true && !holder.receipt && !holder.inputsDigest;
+  return {requestId:`${holder.id}-fence-wait-${waiting.id}-${reason}`,waitingJobId:waiting.id,subject:"A release job is waiting behind a held project fence",
+    text:`Release ${holder.id} holds the project release fence and ${FENCE_REASONS[reason]}; release ${waiting.id} is queued behind it. ${noEffects?"It has no release effects; the handler can move it aside with tt deployment set-aside so the waiting job claims the fence.":"It keeps the fence until handler reconciliation."}`};
+}
 export function reconcileHostLocks(config,jobs){
   for(const job of jobs){
     const r=job.reconciliations?.at(-1);
@@ -574,6 +598,15 @@ export function readBaselines(configPath){
 export async function serveDeployment(config,{once=false,signal,configPath,release=runRelease}={}) {
   if(config.version!==1 || config.enabled!==true || !config.cwd || !config.journalDirectory)throw new Error("Explicit private activation config required");
   tailosWindow(config);
+  // One fence-wait notice per holder, waiting job and reason per process; the
+  // hub returns the original for a restart's identical resend.
+  const posted=new Set();
+  const notify=(reader,jobs,holder,reason)=>{
+    const notice=fenceWaitNotice(jobs,holder,reason);
+    if(!notice || posted.has(notice.requestId))return;
+    try{reader.command([config.tt||"tt","send","--kind","notice","--subject",notice.subject,"--text",notice.text,"--request-id",notice.requestId,"--ref",`release-job=${holder.id}`,"--ref",`waiting-job=${notice.waitingJobId}`]);posted.add(notice.requestId);}
+    catch{process.stderr.write("Fence wait notice not posted; the next poll retries.\n");}
+  };
   while(!signal?.aborted){
     try {
     // An unreadable or invalid edit holds the whole poll, before any claim.
@@ -584,13 +617,25 @@ export async function serveDeployment(config,{once=false,signal,configPath,relea
     const skipped=new Set();
     for (;;) {
       const job=runnableJob(jobs,process.env.TAILTERM_AGENT,process.env.TAILTERM_RUN,skipped);
-      if(!job)break;
+      if(!job){
+        const holder=jobs.find(j=>["claimed","merged","blocked"].includes(j.state));
+        if(holder)notify(reader,jobs,holder,holder.state);
+        break;
+      }
+      // Archived only while unclaimed, so a later crash of the new claim
+      // leaves its own journal alone.
+      if(job.state==="verified"){
+        let journal;try{journal=setAsideJournal(join(config.journalDirectory,job.id+".json"),job);}catch{journal="held";}
+        if(journal==="held"){skipped.add(job.id);process.stderr.write("Set-aside release journal held; handler reconciliation required.\n");continue;}
+      }
       const adapter=new HostAdapter(config,job);
       try{if(job.state==="verified")adapter.native("claim");}
       catch{skipped.add(job.id);process.stderr.write("Release claim held; handler reconciliation required.\n");continue;}
       const current=adapter.job,baselines=releaseBaselines(configured,jobs);adapter.baselines=baselines;
       const {testPolicy,sleep,now,...activation}=config;
-      try{await release({...activation,baselines,job:current,journalPath:join(config.journalDirectory,current.id+".json")},adapter);}catch{process.stderr.write("Release held; inspect handler fence and private journal.\n");}
+      let result;
+      try{result=await release({...activation,baselines,job:current,journalPath:join(config.journalDirectory,current.id+".json")},adapter);}catch{process.stderr.write("Release held; inspect handler fence and private journal.\n");}
+      if(["waiting_matrix","waiting_inputs"].includes(result?.outcome))notify(reader,jobs,adapter.job||current,result.outcome);
       break;
     }
     } catch {process.stderr.write("Deployment poll held; inspect native input or recovery evidence.\n");}

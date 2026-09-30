@@ -38,7 +38,16 @@ func releaseFixture(t *testing.T) (*Store, api.Task, api.Agent, api.Agent, strin
 	if err != nil {
 		t.Fatal(err)
 	}
-	item, err := s.CreateWorkItem(ctx, task.ID, api.CreateWorkItemRequest{Kind: "bug", Title: "release item", RequestID: "item"}, by)
+	return s, task, h, d, releaseEntry(t, s, task, "release item", "item")
+}
+
+// releaseEntry adds a done item with a passing verification and its finished,
+// handler-accepted queue entry, ready for a release enqueue.
+func releaseEntry(t *testing.T, s *Store, task api.Task, title, requestID string) string {
+	t.Helper()
+	ctx := context.Background()
+	by := api.Caller{Node: "fixture", User: "owner"}
+	item, err := s.CreateWorkItem(ctx, task.ID, api.CreateWorkItemRequest{Kind: "bug", Title: title, RequestID: requestID}, by)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -54,7 +63,7 @@ func releaseFixture(t *testing.T) (*Store, api.Task, api.Agent, api.Agent, strin
 	if err != nil {
 		t.Fatal(err)
 	}
-	return s, task, h, d, entry
+	return entry
 }
 func TestReleaseEligibilityFencingRetryAndReceipt(t *testing.T) {
 	s, task, h, d, entry := releaseFixture(t)
@@ -822,5 +831,198 @@ func TestReleaseSupersedeIsHandlerOnlyForUnclaimedJobs(t *testing.T) {
 	}
 	if _, err = s2.ReleaseAction(ctx, task2.ID, api.ReleaseRequest{RequestID: "supersede", Operation: "supersede", AgentID: h2.ID, RunID: h2.RunID, JobID: k.ID, ExpectedGeneration: k.Generation, Supersession: record}); !errors.Is(err, api.ErrConflict) {
 		t.Fatal("claimed job superseded", err)
+	}
+}
+
+// setAsideEvidence is the handler's typed record for setting aside claimed j.
+func setAsideEvidence(t *testing.T, s *Store, task api.Task, h api.Agent, j api.ReleaseJob) api.ReleaseReconciliation {
+	t.Helper()
+	r := recoveryEvidence(t, s, task, h, j)
+	r.Disposition = "set_aside"
+	r.StopReason = "Integrated import refused; the fix is the next queued job"
+	r.JournalState = ""
+	r.JournalDigest = ""
+	r.NoActiveExecution = false
+	r.NoPublication = false
+	r.RefResolved = false
+	return r
+}
+
+// A claimed job whose integrated import is refused would wait forever; the
+// fix for that refusal, queued behind it, claims once the handler sets the
+// stuck job aside, and the stuck job is claimed afresh after the fix ships.
+func TestReleaseSetAsideLetsQueuedJobClaimFence(t *testing.T) {
+	s, task, h, d, entryA := releaseFixture(t)
+	ctx := context.Background()
+	a := claimGoRaceJob(t, s, task, h, d, entryA, goRaceMatrix(goRace(raceFlags, "./cmd/tt")))
+	if _, err := s.ReleaseAction(ctx, task.ID, integratedImport(a, h, d, "refused-import", goRaceMatrix(goRace(raceFlags, widerPackages[1:]...)))); !errors.Is(err, api.ErrConflict) {
+		t.Fatal("import", err)
+	}
+	if saved, err := releaseLoad(ctx, s.db, task.ID, a.ID); err != nil || saved.State != "claimed" || saved.Generation != a.Generation {
+		t.Fatal("refused import changed the job", saved.State, err)
+	}
+	b, err := s.ReleaseAction(ctx, task.ID, api.ReleaseRequest{RequestID: "fix-enqueue", Operation: "enqueue", AgentID: h.ID, RunID: h.RunID, EntryID: releaseEntry(t, s, task, "fix for the refusal", "fix")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	claimB := api.ReleaseRequest{RequestID: "fix-claim-fenced", Operation: "claim", AgentID: d.ID, RunID: d.RunID, JobID: b.ID, ExpectedGeneration: b.Generation}
+	if _, err = s.ReleaseAction(ctx, task.ID, claimB); !errors.Is(err, api.ErrConflict) {
+		t.Fatal("claimed behind a held fence", err)
+	}
+	evidence := setAsideEvidence(t, s, task, h, a)
+	req := api.ReleaseRequest{RequestID: "set-aside", Operation: "set-aside", AgentID: h.ID, RunID: h.RunID, JobID: a.ID, ExpectedGeneration: a.Generation, Reconciliation: &evidence}
+	aside, err := s.ReleaseAction(ctx, task.ID, req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if aside.State != "verified" || aside.Generation != a.Generation+1 || aside.AgentID != "" || aside.RunID != "" || aside.IntegratedCommit != "" || aside.IntegratedPlan != nil || aside.IntegratedCoverage != nil || aside.IntegratedVerification != nil || aside.InputsCommit != "" || aside.InputsDigest != "" {
+		t.Fatalf("set aside %+v", aside)
+	}
+	if n := len(aside.Reconciliations); n != 1 || aside.Reconciliations[0].Disposition != "set_aside" || aside.Reconciliations[0].StopReason != evidence.StopReason || aside.Reconciliations[0].RunID != d.RunID {
+		t.Fatalf("history %+v", aside.Reconciliations)
+	}
+	jobs, err := s.Releases(ctx, task.ID)
+	if err != nil || len(jobs) != 2 || jobs[0].ID != b.ID || jobs[1].ID != a.ID {
+		t.Fatal("queue order", jobs, err)
+	}
+	retry, err := s.ReleaseAction(ctx, task.ID, req)
+	if err != nil || retry.Generation != aside.Generation || retry.State != "verified" {
+		t.Fatal("replay", retry.Generation, err)
+	}
+	changed := evidence
+	changed.StopReason = "A different account of the stop"
+	mutated := req
+	mutated.Reconciliation = &changed
+	if _, err = s.ReleaseAction(ctx, task.ID, mutated); !errors.Is(err, api.ErrConflict) {
+		t.Fatal("changed record replayed", err)
+	}
+	claimB.RequestID = "fix-claim"
+	b, err = s.ReleaseAction(ctx, task.ID, claimB)
+	if err != nil || b.State != "claimed" {
+		t.Fatal("fix did not claim the fence", err)
+	}
+
+	// Re-planned on the new tip: claimed again only after the fix clears.
+	claimA := api.ReleaseRequest{RequestID: "reclaim-fenced", Operation: "claim", AgentID: d.ID, RunID: d.RunID, JobID: a.ID, ExpectedGeneration: aside.Generation}
+	if _, err = s.ReleaseAction(ctx, task.ID, claimA); !errors.Is(err, api.ErrConflict) {
+		t.Fatal("set-aside job took the fence from the fix", err)
+	}
+	b, err = s.ReleaseAction(ctx, task.ID, api.ReleaseRequest{RequestID: "fix-merged", Operation: "merged", AgentID: d.ID, RunID: d.RunID, JobID: b.ID, ExpectedGeneration: b.Generation, IntegratedCommit: b.Commit})
+	if err != nil {
+		t.Fatal(err)
+	}
+	finish := api.ReleaseRequest{RequestID: "fix-finish", Operation: "finish", AgentID: d.ID, RunID: d.RunID, JobID: b.ID, ExpectedGeneration: b.Generation}
+	finish.Receipt = &api.ReleaseReceipt{Version: 1, JobID: b.ID, Commit: b.Commit, VerificationDigest: b.VerificationDigest, Outcome: "released", Targets: []api.ReleaseTargetReceipt{{Target: "tailos", Release: "fixture", ArtifactSHA256: strings.Repeat("a", 64), Outcome: "released"}}}
+	if b, err = s.ReleaseAction(ctx, task.ID, finish); err != nil || b.State != "released" {
+		t.Fatal(b.State, err)
+	}
+	claimA.RequestID = "reclaim"
+	again, err := s.ReleaseAction(ctx, task.ID, claimA)
+	if err != nil || again.State != "claimed" || again.RunID != d.RunID || again.IntegratedCommit != "" || again.IntegratedPlan != nil || again.InputsDigest != "" || again.Commit != a.Commit || again.VerificationDigest != a.VerificationDigest {
+		t.Fatalf("reclaim %+v %v", again, err)
+	}
+}
+
+// Only a claimed job with no effects moves aside, and only on an exact typed
+// record from the handler while a later job waits; anything else keeps the
+// fence and the job exactly as it was.
+func TestReleaseSetAsideKeepsFenceForJobsWithEffects(t *testing.T) {
+	ctx := context.Background()
+	type fixture struct {
+		s    *Store
+		task api.Task
+		h, d api.Agent
+		a, b api.ReleaseJob
+	}
+	// setup claims job A with job B queued behind it; alone leaves B out.
+	setup := func(t *testing.T, alone bool) fixture {
+		s, task, h, d, entry := releaseFixture(t)
+		a, err := s.ReleaseAction(ctx, task.ID, api.ReleaseRequest{RequestID: "a-enqueue", Operation: "enqueue", AgentID: h.ID, RunID: h.RunID, EntryID: entry})
+		if err != nil {
+			t.Fatal(err)
+		}
+		a, err = s.ReleaseAction(ctx, task.ID, api.ReleaseRequest{RequestID: "a-claim", Operation: "claim", AgentID: d.ID, RunID: d.RunID, JobID: a.ID, ExpectedGeneration: a.Generation})
+		if err != nil {
+			t.Fatal(err)
+		}
+		f := fixture{s: s, task: task, h: h, d: d, a: a}
+		if !alone {
+			if f.b, err = s.ReleaseAction(ctx, task.ID, api.ReleaseRequest{RequestID: "b-enqueue", Operation: "enqueue", AgentID: h.ID, RunID: h.RunID, EntryID: releaseEntry(t, s, task, "queued behind", "b")}); err != nil {
+				t.Fatal(err)
+			}
+		}
+		return f
+	}
+	deployer := func(t *testing.T, f fixture, op string, j api.ReleaseJob, change func(*api.ReleaseRequest)) api.ReleaseJob {
+		t.Helper()
+		req := api.ReleaseRequest{RequestID: "a-" + op, Operation: op, AgentID: f.d.ID, RunID: f.d.RunID, JobID: j.ID, ExpectedGeneration: j.Generation}
+		if change != nil {
+			change(&req)
+		}
+		out, err := f.s.ReleaseAction(ctx, f.task.ID, req)
+		if err != nil {
+			t.Fatal(op, err)
+		}
+		return out
+	}
+	// refused asserts a conflict that leaves the fence and the job unchanged.
+	refused := func(t *testing.T, f fixture, j api.ReleaseJob, change func(*api.ReleaseRequest)) {
+		t.Helper()
+		evidence := setAsideEvidence(t, f.s, f.task, f.h, j)
+		req := api.ReleaseRequest{RequestID: "set-aside", Operation: "set-aside", AgentID: f.h.ID, RunID: f.h.RunID, JobID: j.ID, ExpectedGeneration: j.Generation, Reconciliation: &evidence}
+		if change != nil {
+			change(&req)
+		}
+		var fenced int
+		f.s.db.QueryRow(`SELECT count(*) FROM release_jobs WHERE task_id=? AND state IN ('claimed','merged','blocked')`, f.task.ID).Scan(&fenced)
+		if _, err := f.s.ReleaseAction(ctx, f.task.ID, req); !errors.Is(err, api.ErrConflict) {
+			t.Fatal("set aside", err)
+		}
+		saved, err := releaseLoad(ctx, f.s.db, f.task.ID, j.ID)
+		var after int
+		f.s.db.QueryRow(`SELECT count(*) FROM release_jobs WHERE task_id=? AND state IN ('claimed','merged','blocked')`, f.task.ID).Scan(&after)
+		if err != nil || saved.Generation != j.Generation || saved.State != j.State || len(saved.Reconciliations) != 0 || after != fenced {
+			t.Fatal("refusal changed the ledger", saved.State, saved.Generation, after, fenced, err)
+		}
+	}
+	t.Run("merged", func(t *testing.T) {
+		f := setup(t, false)
+		refused(t, f, deployer(t, f, "merged", f.a, func(r *api.ReleaseRequest) { r.IntegratedCommit = f.a.Commit }), nil)
+	})
+	t.Run("blocked", func(t *testing.T) {
+		f := setup(t, false)
+		refused(t, f, deployer(t, f, "block", f.a, nil), nil)
+	})
+	t.Run("inputs bound", func(t *testing.T) {
+		f := setup(t, false)
+		bound, err := f.s.ReleaseAction(ctx, f.task.ID, api.ReleaseRequest{RequestID: "a-inputs", Operation: "inputs", AgentID: f.h.ID, RunID: f.h.RunID, JobID: f.a.ID, ExpectedGeneration: f.a.Generation, IntegratedCommit: f.a.Commit, InputsDigest: strings.Repeat("e", 64)})
+		if err != nil {
+			t.Fatal(err)
+		}
+		refused(t, f, bound, nil)
+	})
+	t.Run("verified", func(t *testing.T) {
+		f := setup(t, false)
+		refused(t, f, f.b, nil)
+	})
+	t.Run("nothing waiting", func(t *testing.T) {
+		f := setup(t, true)
+		refused(t, f, f.a, nil)
+	})
+	for name, change := range map[string]func(*api.ReleaseRequest){
+		"deployer caller":              func(r *api.ReleaseRequest) { r.AgentID, r.RunID = r.Reconciliation.AgentID, r.Reconciliation.RunID },
+		"wrong generation":             func(r *api.ReleaseRequest) { r.ExpectedGeneration++ },
+		"other agent":                  func(r *api.ReleaseRequest) { r.Reconciliation.AgentID = api.NewID("agt") },
+		"other run":                    func(r *api.ReleaseRequest) { r.Reconciliation.RunID = api.NewID("run") },
+		"other pause generation":       func(r *api.ReleaseRequest) { r.Reconciliation.PauseGeneration++ },
+		"requeue disposition":          func(r *api.ReleaseRequest) { r.Reconciliation.Disposition = "requeue" },
+		"missing incident bug":         func(r *api.ReleaseRequest) { r.Reconciliation.IncidentBugID = api.NewID("wi") },
+		"lock digest":                  func(r *api.ReleaseRequest) { r.Reconciliation.LockDigest = strings.Repeat("f", 64) },
+		"unconfirmed prevention order": func(r *api.ReleaseRequest) { r.Reconciliation.PreventionOrderMessage++ },
+	} {
+		t.Run(name, func(t *testing.T) {
+			f := setup(t, false)
+			refused(t, f, f.a, change)
+		})
 	}
 }

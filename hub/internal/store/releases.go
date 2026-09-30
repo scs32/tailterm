@@ -105,7 +105,8 @@ func releaseCandidate(ctx context.Context, tx *sql.Tx, task, entry string) (api.
 }
 
 // Claims have no time based expiry: a disconnected runner may still execute.
-// A blocked or ambiguous job retains the project fence until explicit recovery.
+// A blocked or ambiguous job retains the project fence until explicit recovery;
+// a claimed job with no effects can instead be set aside for a later job.
 func (s *Store) ReleaseAction(ctx context.Context, task string, req api.ReleaseRequest) (api.ReleaseJob, error) {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
@@ -171,6 +172,13 @@ func (s *Store) ReleaseAction(ctx context.Context, task string, req api.ReleaseR
 				return zero, err
 			}
 			if err = reconcileRelease(ctx, tx, task, &j, req.Reconciliation, generation); err != nil {
+				return zero, err
+			}
+		} else if req.Operation == "set-aside" {
+			if err = requireScopeHandler(tx, ctx, task, req.AgentID, req.RunID); err != nil {
+				return zero, err
+			}
+			if err = setAsideRelease(ctx, tx, task, &j, req.Reconciliation, generation); err != nil {
 				return zero, err
 			}
 		} else if req.Operation == "inputs" {
@@ -354,6 +362,12 @@ func (s *Store) ReleaseAction(ctx context.Context, task string, req api.ReleaseR
 	if err != nil {
 		return zero, releaseConflict("project already fenced or ledger conflict")
 	}
+	if req.Operation == "set-aside" {
+		// Behind every queued job: the runner and Releases follow rowid order.
+		if _, err = tx.ExecContext(ctx, `UPDATE release_jobs SET rowid=(SELECT MAX(rowid)+1 FROM release_jobs) WHERE task_id=? AND id=?`, task, j.ID); err != nil {
+			return zero, err
+		}
+	}
 	if _, err = tx.ExecContext(ctx, `INSERT INTO release_action_receipts VALUES(?,?,?,?)`, task, req.RequestID, hash, string(b)); err != nil {
 		return zero, err
 	}
@@ -451,28 +465,8 @@ func reconcileRelease(ctx context.Context, tx *sql.Tx, task string, j *api.Relea
 	if j.State != "verified" && j.State != "claimed" && j.State != "merged" && j.State != "blocked" {
 		return releaseConflict("job is not held")
 	}
-	for _, stamp := range []string{r.ObservedAt, r.LastActionAt, r.StoppedAt} {
-		if _, err := time.Parse(time.RFC3339Nano, stamp); err != nil {
-			return api.ErrInvalid
-		}
-	}
-	if r.LockDigest != "" && !validContextDigest(r.LockDigest) {
-		return api.ErrInvalid
-	}
-	for _, value := range []string{r.StopReason, r.LastAction, r.CausalEvidence, r.PreventionOwner, r.PreventionCriterion, r.ExpectedNextAction, r.ContributingConditions, r.UnresolvedQuestions} {
-		if value == "" || len(value) > 512 || strings.ContainsAny(value, "\x00\n\r") {
-			return api.ErrInvalid
-		}
-	}
-	incident, err := getWorkItem(tx, ctx, task, r.IncidentBugID)
-	if err != nil || incident.Kind != "bug" {
-		return releaseConflict("recorded incident bug required")
-	}
-	prevention, err := getWorkItem(tx, ctx, task, r.PreventionItemID)
+	err := releaseIncident(ctx, tx, task, r)
 	if err != nil {
-		return err
-	}
-	if err = requireConfirmedTeamOrder(ctx, tx, task, prevention.ID, prevention.Revision, r.PreventionOrderMessage); err != nil {
 		return err
 	}
 	if j.AgentID != "" {
@@ -507,6 +501,71 @@ func reconcileRelease(ctx context.Context, tx *sql.Tx, task string, j *api.Relea
 	} else {
 		j.State = "refused"
 	}
+	j.PauseGeneration = generation
+	j.Reconciliations = append(j.Reconciliations, *r)
+	return nil
+}
+
+// releaseIncident checks the typed incident a reconcile or set-aside carries:
+// its timestamps and text, a recorded incident bug, and a prevention item with
+// a handler-confirmed order.
+func releaseIncident(ctx context.Context, tx *sql.Tx, task string, r *api.ReleaseReconciliation) error {
+	for _, stamp := range []string{r.ObservedAt, r.LastActionAt, r.StoppedAt} {
+		if _, err := time.Parse(time.RFC3339Nano, stamp); err != nil {
+			return api.ErrInvalid
+		}
+	}
+	if r.LockDigest != "" && !validContextDigest(r.LockDigest) {
+		return api.ErrInvalid
+	}
+	for _, value := range []string{r.StopReason, r.LastAction, r.CausalEvidence, r.PreventionOwner, r.PreventionCriterion, r.ExpectedNextAction, r.ContributingConditions, r.UnresolvedQuestions} {
+		if value == "" || len(value) > 512 || strings.ContainsAny(value, "\x00\n\r") {
+			return api.ErrInvalid
+		}
+	}
+	incident, err := getWorkItem(tx, ctx, task, r.IncidentBugID)
+	if err != nil || incident.Kind != "bug" {
+		return releaseConflict("recorded incident bug required")
+	}
+	prevention, err := getWorkItem(tx, ctx, task, r.PreventionItemID)
+	if err != nil {
+		return err
+	}
+	return requireConfirmedTeamOrder(ctx, tx, task, prevention.ID, prevention.Revision, r.PreventionOrderMessage)
+}
+
+// setAsideRelease frees the fence held by a claimed job that has no effects,
+// so a later verified job, often the fix for why this one cannot finish, can
+// claim. A claimed job with no inputs binding cannot have published or
+// deployed: the runner publishes only after the handler binds inputs. The
+// claim's run need not have exited. The job stays verified and is claimed
+// again, on the tasks-hub tip of that time, once the jobs ahead of it clear.
+func setAsideRelease(ctx context.Context, tx *sql.Tx, task string, j *api.ReleaseJob, r *api.ReleaseReconciliation, generation int64) error {
+	if r == nil || r.Disposition != "set_aside" || r.JobID != j.ID || r.AgentID != j.AgentID || r.RunID != j.RunID || r.PauseGeneration != j.PauseGeneration || !validContextDigest(r.IncidentDigest) || r.LockDigest != "" {
+		return releaseConflict("exact set-aside record required")
+	}
+	if j.State != "claimed" || j.Published || j.Receipt != nil || j.InputsDigest != "" {
+		return releaseConflict("only a claimed job with no effects can be set aside")
+	}
+	var waiting int
+	if err := tx.QueryRowContext(ctx, `SELECT count(*) FROM release_jobs WHERE task_id=? AND state='verified' AND rowid>(SELECT rowid FROM release_jobs WHERE task_id=? AND id=?)`, task, task, j.ID).Scan(&waiting); err != nil {
+		return err
+	}
+	if waiting == 0 {
+		return releaseConflict("no later verified job is waiting on the fence")
+	}
+	if err := releaseIncident(ctx, tx, task, r); err != nil {
+		return err
+	}
+	j.State = "verified"
+	j.AgentID = ""
+	j.RunID = ""
+	j.IntegratedCommit = ""
+	j.IntegratedPlan = nil
+	j.IntegratedCoverage = nil
+	j.IntegratedVerification = nil
+	j.InputsCommit = ""
+	j.InputsDigest = ""
 	j.PauseGeneration = generation
 	j.Reconciliations = append(j.Reconciliations, *r)
 	return nil

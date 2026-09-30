@@ -43,7 +43,7 @@ bases, conflicts, verification mismatches and release-ref races. A changed SHA
 waits before publication for a separate handler-imported release verification
 receipt covering the approved matrix on that exact integrated commit. The
 waiting-matrix journal can resume only with the same clean detached commit;
-other unfinished journals require reconciliation. Exact-job host inputs also wait before publication for a handler-imported digest (`tt deployment inputs --job ID --generation N --commit SHA --file PRIVATE_MANIFEST`). The manifest at `journalDirectory/ID-inputs.json` binds version 1, jobId, acceptedCommit, integrated commit, verificationDigest and per-target inputs; its raw-byte SHA is immutable for that job. A reused manifest or different SHA is refused. A lost final-receipt response retains receipt_pending and retries the same write-once receipt without rolling back live-verified targets; saved hub receipts reconcile that local pending state. The daemon prioritizes its own waiting claim and refuses a later release while another claim or blocked fence remains. The release branch update
+other unfinished journals require reconciliation. Exact-job host inputs also wait before publication for a handler-imported digest (`tt deployment inputs --job ID --generation N --commit SHA --file PRIVATE_MANIFEST`). The manifest at `journalDirectory/ID-inputs.json` binds version 1, jobId, acceptedCommit, integrated commit, verificationDigest and per-target inputs; its raw-byte SHA is immutable for that job. A reused manifest or different SHA is refused. A lost final-receipt response retains receipt_pending and retries the same write-once receipt without rolling back live-verified targets; saved hub receipts reconcile that local pending state. The daemon prioritizes its own waiting claim and refuses a later release while another claim or blocked fence remains; when a later job is waiting it posts a fence-wait notice, and a waiting claim with no effects can be set aside (see "Setting aside a job that holds the fence"). The release branch update
 uses Git compare-and-swap, and after every selected target is live-verified the
 runner fast-forward pushes `tasks-hub` to `origin` (see "Effects on tasks-hub").
 
@@ -117,7 +117,9 @@ hash match a handler inspection with no active execution and resolved effects/re
 Conflict or ref race before publication is refused without a blocked project
 fence; post-publication failures still retain the existing rollback/recovery gates.
 The daemon skips an unclaimable verified job and continues to later jobs rather
-than exiting; it never skips a real claimed/merged/blocked project fence.
+than exiting; it never skips a real claimed/merged/blocked project fence. It
+names such a fence in a notice when a later job waits behind it, and only the
+handler's set-aside frees a claimed fence without a reconcile.
 
 The live probe contract checks exact commit/artifact identity, integrity,
 containers, hub response and completed migrations; Mini adds relay status and new
@@ -286,6 +288,47 @@ state `superseded`, shown as "superseded (released by hand)". Claim, the runner
 and the project fence skip it. Each use needs its own recorded order; there is no
 standing order to supersede.
 
+### Setting aside a job that holds the fence
+
+A claimed job that cannot progress (for example its integrated import was
+refused and the fix is the next queued job) would hold the project fence
+forever, because the runner resumes its own claim first. `tt deployment
+set-aside --job ID --generation N --file RECORD --request-id KEY` is
+handler-only and moves it aside:
+
+- The job must be `claimed` with no effects, proven from the hub record: not
+  published, no receipt and no inputs binding. The runner publishes only after
+  the handler binds inputs, so such a claim has not changed tasks-hub or any
+  target. `merged`, `blocked`, inputs-bound, `verified` and terminal jobs keep the
+  fence and use `reconcile`.
+- At least one `verified` job must be queued after it; otherwise it would only
+  claim the same job again.
+- `RECORD` is the typed reconcile record with `disposition: "set_aside"`. It binds
+  the job id, the claim's exact agent/run and pause generation, the incident bug,
+  incident digest, stop and last-action times, stop reason, cause, contributing
+  conditions, unresolved questions, and a prevention item whose order has a
+  handler-confirmed scope (usually the waiting fix). `lockDigest` must be empty.
+  The claim's run need not have exited.
+
+The hub clears the claim and integrated/inputs fields, keeps the job `verified`,
+appends the record to its reconciliation history, bumps its generation and moves
+it behind every queued job. The waiting job claims the fence next. The set-aside
+job is claimed again once the jobs ahead of it clear, so it is re-planned: it
+integrates on the tasks-hub tip of that time (which by then carries the fix) and
+runs a fresh integrated matrix. It may wait behind every job queued before the
+move. Before that claim the runner archives its old journal as
+`ID.json.set-aside-gN` (N is the set-aside job's generation) when the journal
+belongs to exactly that claim and shows no effects and no publication; any other
+journal is held and the job skipped for handler reconciliation.
+
+When a job holds the fence and a later job is `verified`, the deployer posts one
+notice per holder, waiting job and reason: it names the holding job, why it holds
+the fence (waiting for an integrated verification import, waiting for inputs,
+blocked, merged, or claimed by another deployer run) and the waiting job. For a
+claim with no effects it says the handler can set it aside; otherwise it says the
+job keeps the fence until handler reconciliation. Its request id is
+`HOLDER-fence-wait-WAITING-REASON`, so a restart's resend returns the original.
+
 ### Probes and rollback programs
 
 `scripts/release-probe.mjs` prints only the fields the runner reads:
@@ -414,6 +457,11 @@ deployer with the rest of the project; resuming then needs provisioning again.
 `tt deployment reconcile` with a typed inspection (above). The journal's
 `failure` field says which step failed and why. Never delete the
 journal or lock by hand.
+
+**Set aside.** When a fence-wait notice says a claim with no effects blocks a
+later job, the handler, under a recorded order, sets it aside with `tt deployment
+set-aside` and a typed record (above); no deployer stop, hand release or
+supersede is needed. The deployer claims the waiting job at its next poll.
 
 **Manual rollback, per target.**
 - hub or bridge: `python3 scripts/deploy-truenas-hub.py --rollback-to PRIOR_RELEASE

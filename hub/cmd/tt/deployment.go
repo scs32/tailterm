@@ -19,7 +19,7 @@ func deploymentBriefing() string {
 }
 func cmdDeployment(e env, args []string) error {
 	if len(args) == 0 {
-		return errors.New("usage: tt deployment setup|list|handler|enqueue|claim|check|verification|merged|finish|block|inputs|reconcile|refuse|supersede")
+		return errors.New("usage: tt deployment setup|list|handler|enqueue|claim|check|verification|merged|finish|block|inputs|reconcile|set-aside|refuse|supersede")
 	}
 	if args[0] == "serve" {
 		if len(args) != 3 || args[1] != "--config" {
@@ -45,7 +45,7 @@ func cmdDeployment(e env, args []string) error {
 	generation := fs.Int64("generation", 0, "expected job generation")
 	commit := fs.String("commit", "", "exact integrated commit")
 	planFile := fs.String("plan-file", "", "integrated matrix plan JSON (handler import)")
-	file := fs.String("file", "", "receipt JSON file")
+	file := fs.String("file", "", "receipt, reconcile or set-aside record JSON file")
 	released := fs.String("released-commit", "", "tasks-hub commit that carried a hand release (supersede)")
 	releaseName := fs.String("release", "", "hand release record, such as its release name (supersede)")
 	repo := fs.String("repo", ".", "repository whose tasks-hub must contain the hand release (supersede)")
@@ -87,7 +87,7 @@ func cmdDeployment(e env, args []string) error {
 		}
 		req.Supersession = &api.ReleaseSupersession{ReleasedCommit: *released, Release: *releaseName}
 	}
-	if args[0] == "finish" || args[0] == "verification" || args[0] == "inputs" || args[0] == "reconcile" {
+	if args[0] == "finish" || args[0] == "verification" || args[0] == "inputs" || args[0] == "reconcile" || args[0] == "set-aside" {
 		b, err := os.ReadFile(*file)
 		if err != nil {
 			return err
@@ -105,7 +105,8 @@ func cmdDeployment(e env, args []string) error {
 				return errors.New("exact job manifest binding required")
 			}
 			req.InputsDigest = fmt.Sprintf("%x", sha256.Sum256(b))
-		} else if args[0] == "reconcile" {
+		} else if args[0] == "reconcile" || args[0] == "set-aside" {
+			// set-aside carries the same typed incident, disposition set_aside.
 			req.Reconciliation = &api.ReleaseReconciliation{}
 			err = json.Unmarshal(b, req.Reconciliation)
 		} else if args[0] == "finish" {
