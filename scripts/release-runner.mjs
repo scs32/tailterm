@@ -2,10 +2,11 @@ import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { execFileSync } from "node:child_process";
-import { openSync, closeSync, fsyncSync, writeFileSync, readFileSync, renameSync, mkdirSync, existsSync, rmSync, copyFileSync, cpSync, chmodSync, statSync, constants } from "node:fs";
+import { openSync, closeSync, fsyncSync, writeFileSync, readFileSync, renameSync, mkdirSync, mkdtempSync, existsSync, rmSync, copyFileSync, cpSync, chmodSync, statSync, constants } from "node:fs";
 import { join, resolve, dirname } from "node:path";
 import { digest, diffPaths } from "./verify-matrix.mjs";
 import { selectReleaseTargets, releaseBaselines, schemaChanged } from "./release-targets.mjs";
+import { buildInfo } from "./release-probe.mjs";
 
 const fileDigest = p => createHash("sha256").update(readFileSync(p)).digest("hex");
 const sha = s => /^[a-f0-9]{40}$/.test(s || "");
@@ -63,6 +64,19 @@ export function pushRelease(cwd, commit, remote="origin") {
   if (!sha(commit)) return false;
   try {execFileSync("git",["push","--quiet",remote,`${commit}:refs/heads/tasks-hub`],{cwd,stdio:["ignore","pipe","pipe"],timeout:120000,env:{...process.env,GIT_TERMINAL_PROMPT:"0"}});return true;}
   catch {return false;}
+}
+// Go stamps vcs.revision only when .git is a directory, and the deployer's
+// checkout is a worktree whose .git is a file (a nested checkout would even
+// stamp its parent's revision). Go artifacts are therefore built in a
+// temporary shared clone detached at the exact commit, removed afterwards.
+export function withBuildCheckout(cwd, commit, build) {
+  if (!sha(commit)) throw new Error("Exact build commit required");
+  const dir=mkdtempSync(join(tmpdir(),"tailterm-release-build-")),src=join(dir,"src");
+  try {
+    git(dir,"clone","--quiet","--shared","--no-checkout",resolve(cwd),src);git(src,"checkout","--quiet","--detach",commit);
+    if(git(src,"rev-parse","HEAD")!==commit||git(src,"status","--porcelain"))throw new Error("Build checkout mismatch");
+    return build(src);
+  } finally {rmSync(dir,{recursive:true,force:true});}
 }
 function save(path,value) {
   mkdirSync(dirname(path),{recursive:true,mode:0o700});const tmp=path+".tmp";
@@ -266,13 +280,15 @@ export class HostAdapter {
       const output=join(this.config.cwd,".build/ttbin",filename);mkdirSync(dirname(output),{recursive:true,mode:0o700});
       const pkg={hub:"tailterm-hub",bridge:"tailterm-discord",mini:"tt"}[target];
       const os=target==="mini"?"darwin":"linux",arch=target==="mini"?"arm64":"amd64";
-      this.command(["env","CGO_ENABLED=0",`GOOS=${os}`,`GOARCH=${arch}`,"go","build","-trimpath","-ldflags=-s -w","-o",output,`./cmd/${pkg}`],join(this.config.cwd,"hub"));
+      withBuildCheckout(this.config.cwd,commit,src=>this.command(["env","CGO_ENABLED=0",`GOOS=${os}`,`GOARCH=${arch}`,"go","build","-trimpath","-ldflags=-s -w","-o",output,`./cmd/${pkg}`],join(src,"hub")));
+      this.requireStamp(output,commit);
       artifact.artifactPath=output;artifact.artifactSHA256=fileDigest(output);if(target==="mini")artifact.version=commit;
     }
     if(artifact.schemaChanged){
       if(perJob.backupJobId!==this.job.id || !perJob.backup || !perJob.backup.includes(this.job.id))throw new Error("Fresh job backup identity required");
       artifact.migrationBinary=join(this.config.journalDirectory,this.job.id+"-migration");
-      this.command(["env","CGO_ENABLED=0",`GOOS=${process.platform}`,`GOARCH=${process.arch==="arm64"?"arm64":"amd64"}`,"go","build","-trimpath","-o",artifact.migrationBinary,"./cmd/tailterm-hub"],join(this.config.cwd,"hub"));
+      withBuildCheckout(this.config.cwd,commit,src=>this.command(["env","CGO_ENABLED=0",`GOOS=${process.platform}`,`GOARCH=${process.arch==="arm64"?"arm64":"amd64"}`,"go","build","-trimpath","-o",artifact.migrationBinary,"./cmd/tailterm-hub"],join(src,"hub")));
+      this.requireStamp(artifact.migrationBinary,commit);
       artifact.migrationBinarySHA256=fileDigest(artifact.migrationBinary);
     }
     if(["hub","bridge"].includes(target)){
@@ -282,6 +298,12 @@ export class HostAdapter {
     }
     if(target==="mini")this.captureMiniRollback(artifact);
     this.artifacts.set(target,artifact);return artifact;
+  }
+  // The live probe identifies a release by this stamp, so an artifact
+  // without it is refused here, before any deploy.
+  requireStamp(path,commit){
+    let info;try{info=buildInfo({run:argv=>({status:0,stdout:this.command(argv)})},path);}catch{throw new Error("Go artifact has no build revision");}
+    if(info.commit!==commit || info.integrity!==true)throw new Error("Go artifact revision does not match the integrated commit");
   }
   async rehearse(a){
     if(!a.backupCopy || !a.migrationBinary)throw new Error("Handler backup-copy import required");

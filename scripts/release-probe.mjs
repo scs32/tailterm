@@ -36,7 +36,7 @@ function ok(deps, argv, opts) {
 const ssh = (deps, host, command, opts) => ok(deps, ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", host, command], opts);
 
 // vcs.revision and vcs.modified from the Go build info embedded in a binary.
-function buildInfo(deps, path) {
+export function buildInfo(deps, path) {
   const out = ok(deps, ["go", "version", "-m", path]);
   const field = k => out.match(new RegExp(`^\\s*build\\s+${k.replace(".", "\\.")}=(\\S+)$`, "m"))?.[1];
   const commit = field("vcs.revision");
