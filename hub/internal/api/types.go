@@ -32,6 +32,11 @@ const (
 	// (69 checks, up to three attempts each, with log references) is about
 	// 76 KB, over the shared MaxBody.
 	MaxVerificationBody = 1024 * 1024
+
+	// One team queue action. A freeze carries the frozen launch plan: every
+	// member's prompt plus one prepared work-item context, which outgrows the
+	// shared MaxBody once the role prompts pass about 64 KB.
+	MaxTeamQueueActionBody = MaxAgentRegistrationBody + 1<<20
 )
 
 var nameRE = regexp.MustCompile(`^[a-zA-Z0-9_-]{1,64}$`)

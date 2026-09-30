@@ -94,7 +94,7 @@ func (s *Server) teamQueueAction(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req api.TeamQueueRequest
-	if !decode(w, r, &req) {
+	if !decodeLimited(w, r, &req, api.MaxTeamQueueActionBody) {
 		return
 	}
 	v, err := s.store.TeamQueueAction(r.Context(), task, req)
