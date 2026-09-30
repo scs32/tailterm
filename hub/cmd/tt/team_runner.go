@@ -29,7 +29,9 @@ type teamRunner struct {
 	cleanup     func(context.Context, env, string, string) error
 	integration func(context.Context, api.TeamQueueEntry, api.WorkItem, api.TeamCloseRequest) (*api.TeamIntegrationReady, error)
 	census      func(ctx context.Context, c *api.Client, task, host string, policy api.TeamHostPolicy, prior *api.TeamHostUsage, cwds []string) error
-	roundRobin  bool
+	// changed lists the files a candidate changed; nil uses Git.
+	changed    func(ctx context.Context, repository, base, commit string) ([]string, error)
+	roundRobin bool
 }
 
 var teamQueueProjectCursor atomic.Uint64
@@ -233,9 +235,39 @@ func (r teamRunner) advance(ctx context.Context, e env, c *api.Client, q api.Tea
 		return r.launch(ctx, e, c, q, host)
 	}
 	if q.State == "running" {
+		q = r.narrow(ctx, c, q)
 		return r.finish(ctx, e, c, q, host)
 	}
 	return nil
+}
+
+// narrow shrinks an accepted running entry's ownership to the files its
+// candidate actually changed, so queued work that overlapped only unchanged
+// paths can start while the team closes. It is an optimization: a Git error,
+// an empty result or a refused write leaves the entry as it was.
+func (r teamRunner) narrow(ctx context.Context, c *api.Client, q api.TeamQueueEntry) api.TeamQueueEntry {
+	if q.Acceptance == nil || q.Repository == "" || q.ReleasedAt != "" {
+		return q
+	}
+	changed := r.changed
+	if changed == nil {
+		changed = queueChangedFiles
+	}
+	files, err := changed(ctx, q.Repository, q.Acceptance.BaseCommit, q.Acceptance.Commit)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "[tt relay] team queue %s: narrowing skipped: %v\n", q.ID, err)
+		return q
+	}
+	owned := ownedChanges(files, q.Ownership)
+	if len(owned) == 0 || len(owned) > 256 || sameOwnership(owned, q.Ownership) {
+		return q
+	}
+	narrowed, err := c.TeamQueueAction(ctx, q.TaskID, api.TeamQueueRequest{RequestID: fmt.Sprintf("queue-narrow-%s-%d", q.ID, q.Revision), Operation: "scope", EntryID: q.ID, ExpectedRevision: q.Revision, Ownership: owned})
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "[tt relay] team queue %s: narrowing skipped: %v\n", q.ID, err)
+		return q
+	}
+	return narrowed
 }
 
 // queueParallel mirrors the hub: 1 is the serial queue, 0 has no fixed cap

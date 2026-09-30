@@ -212,3 +212,58 @@ func acceptedWorktree(worktree, repository string) (string, error) {
 	}
 	return realWorktree, nil
 }
+
+// queueChangedFiles lists the files a candidate changed against the merge
+// base of base and commit, so a branch that merged a later base is charged
+// only with its own files. Paths are repository-relative, renames split.
+func queueChangedFiles(ctx context.Context, repository, base, commit string) ([]string, error) {
+	if repository == "" || base == "" || commit == "" {
+		return nil, errors.New("repository, base and commit are required")
+	}
+	output, err := exec.CommandContext(ctx, "git", "--git-dir="+repository, "diff", "--name-only", "--no-renames", "-z", base+"..."+commit, "--").Output()
+	if err != nil {
+		return nil, fmt.Errorf("git diff %s...%s: %w", base, commit, err)
+	}
+	var files []string
+	for _, name := range strings.Split(string(output), "\x00") {
+		if name != "" {
+			files = append(files, name)
+		}
+	}
+	return files, nil
+}
+
+// ownedChanges keeps the changed files under the declared ownership. An entry
+// that declared none (serial or legacy) keeps them all.
+func ownedChanges(changed, ownership []string) []string {
+	var out []string
+	for _, file := range changed {
+		keep := len(ownership) == 0
+		for _, owned := range ownership {
+			if strings.EqualFold(file, owned) || (len(file) > len(owned) && strings.EqualFold(file[:len(owned)+1], owned+"/")) {
+				keep = true
+				break
+			}
+		}
+		if keep {
+			out = append(out, file)
+		}
+	}
+	return out
+}
+
+func sameOwnership(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	seen := map[string]bool{}
+	for _, p := range a {
+		seen[p] = true
+	}
+	for _, p := range b {
+		if !seen[p] {
+			return false
+		}
+	}
+	return true
+}
