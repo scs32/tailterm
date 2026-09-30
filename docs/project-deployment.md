@@ -303,7 +303,9 @@ journal or lock by hand.
 did not restore a target (for example the fence was lost), the receipt outcome is
 `blocked`, that target shows `rollback: blocked`, and `revert.outcome` may still be
 `committed`. Then `tasks-hub` no longer contains the release while that target
-still runs the released code; the escalation says so. Roll the blocked targets
+still runs the released code; the escalation says so only in this case. A
+`blocked` outcome with no target rollback blocked (for example a failure right
+after publication, before any deploy) has no live code to restore. Roll the blocked targets
 back by hand (above) and confirm with their rollback probes before reconciling
 the job, so live code and `tasks-hub` agree again.
 
@@ -313,7 +315,11 @@ the released commit and release name. A hand release writes no deployer receipt,
 so the deployer's baselines do not move by themselves: for each target released
 by hand, run `node scripts/release-probe.mjs live TARGET --config PRIVATE`
 (`live tailos` for TailOS) and set `baselines.TARGET` in the private config to the
-printed `commit`. Only then resume the deployer.
+printed `commit`. The running deployer re-reads `baselines` from the private
+config at every poll (about every 30 seconds), so the edit applies to its next pass with
+no restart; an unreadable file or a baseline that is not a full commit holds the
+poll before any claim. Other config keys are read only when the process starts.
+Then resume the deployer.
 
 **Detached main checkout (#15223).** The deployer's checkout is a detached
 worktree (`git worktree add --detach PATH tasks-hub`) that shares objects with the

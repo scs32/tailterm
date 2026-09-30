@@ -169,7 +169,7 @@ export async function runRelease(config, adapter) {
       checkpoint();
     }
     // One attempt; a failed post must not stop the bug request or the receipt.
-    if(!state.escalationAttempted){state.escalationAttempted=true;checkpoint();try{await adapter.escalate({jobId:job.id,outcome:state.outcome,...(state.revert?{revert:state.revert.outcome}:{})});}catch{}}
+    if(!state.escalationAttempted){state.escalationAttempted=true;checkpoint();try{await adapter.escalate({jobId:job.id,outcome:state.outcome,...(state.revert?{revert:state.revert.outcome}:{}),...(state.effects.some(e=>e.rollback==="blocked")?{rollbackBlocked:true}:{})});}catch{}}
     if(state.revert && !state.bugRequestAttempted){
       state.bugRequestAttempted=true;checkpoint();
       try{state.revert.bugRequestId=await adapter.requestBug({jobId:job.id,commit:state.revert.commit,outcome:state.revert.outcome});}catch{}
@@ -345,7 +345,7 @@ export class HostAdapter {
   async refuse(){this.native("refuse");}
   async escalate(details={}){
     if(details.push==="failed")return this.command([this.config.tt||"tt","send","--kind","notice","--subject","Release is live but the tasks-hub push failed","--text",`Release ${this.job.id} is live and verified, but the fast-forward push of tasks-hub to origin failed. Live targets were not rolled back; inspect the remote and push tasks-hub by hand.`,"--request-id",`${this.job.id}-push-failure`,"--ref",`release-job=${this.job.id}`]);
-    return this.command([this.config.tt||"tt","send","--kind","notice","--subject","Release failed and requires recovery","--text",`Release failed for ${this.job.id}; inspect the private host journal. Automatic rollback attempted once; handler reconciliation required.${details.revert==="failed"?" The tasks-hub revert failed, so the rolled-back change is still on tasks-hub.":""}${details.outcome==="blocked"&&details.revert==="committed"?" tasks-hub was reverted, but at least one target could not be rolled back and still runs the released code; roll it back by hand before the next release.":""}`,"--request-id",`${this.job.id}-release-failure`,"--ref",`release-job=${this.job.id}`]);
+    return this.command([this.config.tt||"tt","send","--kind","notice","--subject","Release failed and requires recovery","--text",`Release failed for ${this.job.id}; inspect the private host journal. Automatic rollback attempted once; handler reconciliation required.${details.revert==="failed"?" The tasks-hub revert failed, so the rolled-back change is still on tasks-hub.":""}${details.rollbackBlocked===true&&details.revert==="committed"?" tasks-hub was reverted, but at least one target could not be rolled back and still runs the released code; roll it back by hand before the next release.":""}`,"--request-id",`${this.job.id}-release-failure`,"--ref",`release-job=${this.job.id}`]);
   }
 }
 
@@ -373,10 +373,21 @@ export function reconcileReceipts(config,jobs){
     if(["finishing","receipt_pending"].includes(journal.phase) && journal.jobId===job.id && digest(journal.receipt)===digest(job.receipt)){journal.phase="complete";save(path,journal);}
   }
 }
-export async function serveDeployment(config,{once=false,signal}={}) {
+// The four last-successful baselines, read from the private config at every
+// poll so an operator's edit after a hand release applies to the next pass
+// without restarting the daemon. Only baselines are re-read: cwd, journal and
+// host references stay those the daemon started with.
+export function readBaselines(configPath){
+  const b=JSON.parse(readFileSync(configPath,"utf8")).baselines,targets=["hub","bridge","mini","tailos"];
+  if(!targets.every(t=>sha(b?.[t])))throw new Error("Four last-successful baselines required");
+  return Object.fromEntries(targets.map(t=>[t,b[t]]));
+}
+export async function serveDeployment(config,{once=false,signal,configPath,release=runRelease}={}) {
   if(config.version!==1 || config.enabled!==true || !config.cwd || !config.journalDirectory)throw new Error("Explicit private activation config required");
   while(!signal?.aborted){
     try {
+    // An unreadable or invalid edit holds the whole poll, before any claim.
+    const configured=configPath?readBaselines(configPath):config.baselines;
     const reader=new HostAdapter(config,{});
     const jobs=JSON.parse(reader.command([config.tt||"tt","deployment","list"]));
     reconcileReceipts(config,jobs);reconcileHostLocks(config,jobs);
@@ -387,9 +398,9 @@ export async function serveDeployment(config,{once=false,signal}={}) {
       const adapter=new HostAdapter(config,job);
       try{if(job.state==="verified")adapter.native("claim");}
       catch{skipped.add(job.id);process.stderr.write("Release claim held; handler reconciliation required.\n");continue;}
-      const current=adapter.job,baselines=releaseBaselines(config.baselines,jobs);adapter.baselines=baselines;
+      const current=adapter.job,baselines=releaseBaselines(configured,jobs);adapter.baselines=baselines;
       const {testPolicy,sleep,now,...activation}=config;
-      try{await runRelease({...activation,baselines,job:current,journalPath:join(config.journalDirectory,current.id+".json")},adapter);}catch{process.stderr.write("Release held; inspect handler fence and private journal.\n");}
+      try{await release({...activation,baselines,job:current,journalPath:join(config.journalDirectory,current.id+".json")},adapter);}catch{process.stderr.write("Release held; inspect handler fence and private journal.\n");}
       break;
     }
     } catch {process.stderr.write("Deployment poll held; inspect native input or recovery evidence.\n");}
@@ -403,6 +414,6 @@ if(process.argv[1] && resolve(process.argv[1])===fileURLToPath(import.meta.url))
     if(index<0)throw new Error("Private config required");
     const config=JSON.parse(readFileSync(process.argv[index+1],"utf8"));
     const controller=new AbortController();process.on("SIGTERM",()=>controller.abort());process.on("SIGINT",()=>controller.abort());
-    await serveDeployment(config,{once:process.argv.includes("--once"),signal:controller.signal});
+    await serveDeployment(config,{once:process.argv.includes("--once"),signal:controller.signal,configPath:process.argv[index+1]});
   }catch{process.stderr.write("Deployment blocked; inspect private host journal and handler release gate.\n");process.exitCode=1;}
 }
