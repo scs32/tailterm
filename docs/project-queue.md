@@ -708,3 +708,68 @@ rows. A newer client on an older hub gets every entry in full, since the hub
 ignores the parameters; every caller still filters by state or item, so the
 results are correct, and the client's 64 MiB listing cap
 (`api.MaxTeamQueueListResponse`) remains the backstop.
+
+## Team queue launch errors
+
+A launch writes its progress to the hub in five steps: `freeze`, `attempt`,
+`started` (after a spawn, or after an uncertain spawn is found registered) and
+`running`. Before wi_a3ca8b64d12365c2 the runner returned any refusal of those
+writes and repeated the same write on the next relay tick, with no failure and
+no Board signal; on 2026-09-30 one entry repeated a 413 `freeze` 154 times in
+about 45 minutes while holding a slot.
+
+The runner now classifies a refused launch write:
+
+- **Permanent**: status 400, 404, 413 or 422, or a 409 ending in `team queue
+  retry differs` (the same request ID with a different payload). Repeating the
+  write cannot change these.
+- **Transient**: everything else, including a 409 `entry revision changed` (a
+  stale snapshot), other 409s, 401 and 403 (a relay credential fault, not the
+  entry's), 408, 429, 5xx and network errors or timeouts. Other launch errors
+  (reads, the host lock, or a failure the launch has already recorded) count as
+  transient.
+
+After any launch error the entry waits before its next launch on this relay:
+15 seconds after the first consecutive error, then 30 seconds, 1, 2 and 4
+minutes, and 5 minutes from then on. While it waits, the runner makes no hub
+call for it; other entries and projects continue, and a serial queue stays at
+that entry as before. A launch that returns without error clears the count.
+
+When the hub refuses the same step, at the same entry revision and with the
+same status, three times in a row, the runner fails the entry with `launch
+<step> refused permanently by the hub after 3 attempts: hub: <status>
+<message>`. With the backoff that is about 45 seconds to a minute after the
+first refusal. Any other outcome in between restarts the count. Transient
+errors never fail an entry. The hub posts the usual `Team queue failed and
+requires owner action` notice once, with refs entry, item and escalation, and
+`tt team queue list` shows `failed` with the ordinary failed reason (`--json`
+carries `failure`). A parallel failed entry with no live runs is released on
+the runner's next pass; a serial one halts the queue with the `serial-halted`
+stall on the entries behind it.
+
+A launching entry with no live run whose last write (or its last run's exit)
+is older than the stall grace (5 minutes) is now a `nothing-running` stall of
+its own. The list shows
+it on the entry: `reason=Stalled: tqe_ID (wi_ID): an entry holds its slot,
+handler lease and ownership with nothing running for it. Fix: ...`, and
+`--json` has `stall` with the entry as its blocker. Entries queued behind it
+show the same stall as before. At the first tick after the grace, even while
+the entry is backing off, the runner posts one Board NOTICE, `A team queue
+launch has made no progress`, with refs entry, item, cause and blocker. Its
+text ends with `Last launch error on the runner: <step>: <error>.` from this
+relay, on one line, without control characters and at most 500 characters (the
+runner sends at most 300).
+
+The notice's retry identity is the stall's
+`queue-stall-<entry>-nothing-running-<revision>`, which ignores the error text,
+so later ticks, a queued entry behind the same launch, and a relay restart
+replay it rather than post another. A launch that was already stalled when a
+permanent refusal began gets both the stall notice and, later, the failure
+notice: two events, each posted once.
+
+The backoff and the refusal count live in the relay's memory. A relay restart
+retries at once and allows at most three more permanent refusals before the
+same fail, whose notice the hub still posts only once. Not covered: a launch
+whose earlier members are live while a later member's write keeps failing
+backs off but is not a stall, and the claim step and the close path keep their
+own handling.

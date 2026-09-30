@@ -5,7 +5,9 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
+	"unicode"
 
 	"github.com/scs32/tailterm/hub/internal/api"
 )
@@ -189,6 +191,15 @@ func (s *Store) explainQueueStalls(ctx context.Context, q queryRower, capacity *
 			blockers[e.ID] = b
 		}
 	}
+	// A launch with nothing running past the grace is a stall of its own,
+	// shown even when no queued entry waits behind it.
+	for i := range out.Entries {
+		e := &out.Entries[i]
+		if b := blockers[e.ID]; e.State == "launching" && b != nil {
+			self := *e
+			setQueueStall(e, &self, b.cause, b.fix, b.since)
+		}
+	}
 	var working []api.TeamQueueEntry
 	for _, e := range active {
 		if blockers[e.ID] == nil {
@@ -289,16 +300,21 @@ func (s *Store) explainQueueStalls(ctx context.Context, q queryRower, capacity *
 				cause, since, fix = b.cause, b.since, b.fix
 			}
 		}
-		stall := &api.TeamQueueStall{Cause: cause, Fix: fix, Since: since.UTC().Format(time.RFC3339Nano)}
-		name := "the project"
-		if blocker != nil {
-			stall.BlockerEntryID, stall.BlockerRevision = blocker.ID, blocker.Revision
-			name = blocker.ID + " (" + blocker.ItemID + ")"
-		}
-		e.Stall = stall
-		e.BlockReason = fmt.Sprintf("Stalled: %s: %s. Fix: %s", name, stallCauseText[cause], fix)
+		setQueueStall(e, blocker, cause, fix, since)
 	}
 	return nil
+}
+
+// setQueueStall names the entry's stall and its blocker (nil: the project).
+func setQueueStall(e, blocker *api.TeamQueueEntry, cause, fix string, since time.Time) {
+	stall := &api.TeamQueueStall{Cause: cause, Fix: fix, Since: since.UTC().Format(time.RFC3339Nano)}
+	name := "the project"
+	if blocker != nil {
+		stall.BlockerEntryID, stall.BlockerRevision = blocker.ID, blocker.Revision
+		name = blocker.ID + " (" + blocker.ItemID + ")"
+	}
+	e.Stall = stall
+	e.BlockReason = fmt.Sprintf("Stalled: %s: %s. Fix: %s", name, stallCauseText[cause], fix)
 }
 
 // lastHandlerChange is the latest event time among the project's handlers,
@@ -356,6 +372,34 @@ func (s *Store) stallNotice(ctx context.Context, task string, req api.TeamQueueR
 	if e.Stall.BlockerEntryID != "" {
 		refs["blocker"] = e.Stall.BlockerEntryID
 	}
-	notice := api.Envelope{Kind: api.EnvelopeKindNotice, Subject: stallNoticeSubjects[e.Stall.Cause], Refs: refs, Body: api.EnvelopeBody{Text: e.BlockReason}}
+	subject := stallNoticeSubjects[e.Stall.Cause]
+	if e.Stall.BlockerEntryID == e.ID {
+		subject = "A team queue launch has made no progress"
+	}
+	text := e.BlockReason
+	if detail := stallNoticeDetail(req.Failure); detail != "" {
+		// The runner's last launch error for the blocker. The notice's
+		// identity ignores it, so a retry with other text replays the first.
+		text += ". Last launch error on the runner: " + detail + "."
+	}
+	notice := api.Envelope{Kind: api.EnvelopeKindNotice, Subject: subject, Refs: refs, Body: api.EnvelopeBody{Text: text}}
 	return *e, notice, nil
+}
+
+// stallNoticeMaxDetail caps the runner's error text in a stall notice.
+const stallNoticeMaxDetail = 500
+
+// stallNoticeDetail is the runner's error text on one line, without control
+// characters (envelopes refuse them), capped at stallNoticeMaxDetail runes.
+func stallNoticeDetail(text string) string {
+	text = strings.Join(strings.Fields(strings.Map(func(r rune) rune {
+		if unicode.IsControl(r) {
+			return ' '
+		}
+		return r
+	}, text)), " ")
+	if runes := []rune(text); len(runes) > stallNoticeMaxDetail {
+		text = string(runes[:stallNoticeMaxDetail])
+	}
+	return text
 }

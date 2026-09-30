@@ -1106,3 +1106,105 @@ func TestTeamQueuePageMatchesFullListingBlockers(t *testing.T) {
 		t.Fatal("the fixture has no stall to compare")
 	}
 }
+
+// wi_a3ca8b64d12365c2 a5: a launching entry with no live run is its own
+// nothing-running stall once the grace has passed, so the list shows it with
+// nothing queued behind it. A live member, a paused project or a running
+// entry is not.
+func TestQueueStallLaunchingEntryWithNothingRunning(t *testing.T) {
+	f := newChoresQueue(t, 3, 3, 0)
+	advance := f.clock(t)
+	a, err := claimEntry(f.s, f.task, f.add(t, 0, "src/a"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := claimEntry(f.s, f.task, f.add(t, 1, "src/b"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := f.run(t, f.add(t, 2, "docs"))
+	assertNoStall(t, f, a.ID, "launch inside the grace")
+	advance(6 * time.Minute)
+	for _, q := range []api.TeamQueueEntry{a, b} {
+		assertStall(t, f, q.ID, api.StallNothingRunning, q.ID, "tt team queue fail --task "+f.task.ID+" --entry "+q.ID)
+		if got := listedEntry(t, f.s, f.task.ID, q.ID); got.State != "launching" || got.Stall.BlockerRevision != q.Revision || !strings.HasPrefix(got.BlockReason, "Stalled: "+q.ID+" ("+q.ItemID+"): ") {
+			t.Fatalf("launch self-stall %+v %+v %q", got.State, got.Stall, got.BlockReason)
+		}
+	}
+	assertNoStall(t, f, c.ID, "a running entry is only a blocker for queued work")
+	f.member(t, 0, "lead-a")
+	assertNoStall(t, f, a.ID, "a live member")
+	assertStall(t, f, b.ID, api.StallNothingRunning, b.ID)
+	if _, err := f.s.db.Exec(`UPDATE tasks SET pause_state=? WHERE id=?`, api.ProjectPausePaused, f.task.ID); err != nil {
+		t.Fatal(err)
+	}
+	assertNoStall(t, f, b.ID, "a paused project")
+}
+
+// wi_a3ca8b64d12365c2 a6: a launch self-stall posts one Board notice with the
+// launch subject and the runner's last error, one line and capped. A retry
+// with other error text and a queued entry behind the same launch replay it.
+func TestQueueStallLaunchNoticeOnce(t *testing.T) {
+	f := newChoresQueue(t, 2, 2, 0)
+	ctx := context.Background()
+	advance := f.clock(t)
+	a, err := claimEntry(f.s, f.task, f.add(t, 0, "src"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	b := f.add(t, 1, "src/b")
+	advance(6 * time.Minute)
+	stall := f.stall(t, a.ID)
+	if stall == nil || stall.BlockerEntryID != a.ID {
+		t.Fatalf("launch stall %+v", stall)
+	}
+	id := stall.NoticeRequestID(a.ID)
+	if behind := f.stall(t, b.ID); behind == nil || behind.NoticeRequestID(b.ID) != id {
+		t.Fatalf("queued entry behind the launch %+v", behind)
+	}
+	messages := func() []api.Message {
+		t.Helper()
+		list, err := f.s.ListMessages(ctx, f.task.ID, 0, "", 1000)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return list
+	}
+	before := len(messages())
+	notice := func(q api.TeamQueueEntry, failure string) error {
+		_, err := f.s.TeamQueueAction(ctx, f.task.ID, api.TeamQueueRequest{RequestID: id, Operation: "stall_notice", EntryID: q.ID, ExpectedRevision: q.Revision, Failure: failure})
+		return err
+	}
+	failure := "freeze: hub: 503 service\x1b[0m\nunavailable\t" + strings.Repeat("é", 600)
+	if err := notice(a, failure); err != nil {
+		t.Fatal(err)
+	}
+	all := messages()
+	if len(all) != before+1 {
+		t.Fatalf("notice posted %d messages", len(all)-before)
+	}
+	posted := all[len(all)-1]
+	env := posted.Envelope
+	if env == nil || env.Subject != "A team queue launch has made no progress" || env.Refs["entry"] != a.ID || env.Refs["item"] != a.ItemID || env.Refs["cause"] != api.StallNothingRunning || env.Refs["blocker"] != a.ID || env.Refs["escalation"] != "" {
+		t.Fatalf("launch notice %+v", env)
+	}
+	text := env.Body.Text
+	const marker = ". Last launch error on the runner: "
+	at := strings.Index(text, marker)
+	if !strings.HasPrefix(text, "Stalled: "+a.ID) || at < 0 || !strings.HasSuffix(text, ".") {
+		t.Fatalf("launch notice text %q", text)
+	}
+	detail := strings.TrimSuffix(text[at+len(marker):], ".")
+	if !strings.HasPrefix(detail, "freeze: hub: 503 service [0m unavailable é") || strings.ContainsFunc(text, func(r rune) bool { return r < 0x20 || r == 0x7f }) || len([]rune(detail)) != 500 {
+		t.Fatalf("detail %d runes %q", len([]rune(detail)), detail)
+	}
+	if err := notice(a, "attempt: hub: 502 bad gateway"); err != nil {
+		t.Fatalf("retry with other text: %v", err)
+	}
+	if err := notice(b, ""); err != nil {
+		t.Fatalf("queued entry behind the launch: %v", err)
+	}
+	if n := len(messages()); n != before+1 {
+		t.Fatalf("replays posted %d more messages", n-before-1)
+	}
+}

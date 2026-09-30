@@ -36,6 +36,149 @@ type teamRunner struct {
 	// uses the hub's five minutes.
 	stallGrace time.Duration
 	roundRobin bool
+	// retries bounds and paces launch errors per entry; nil retries every
+	// tick, as before.
+	retries *launchRetryBook
+	// now is the retry clock; nil uses time.Now.
+	now func() time.Time
+}
+
+func (r teamRunner) clock() time.Time {
+	if r.now != nil {
+		return r.now()
+	}
+	return time.Now()
+}
+
+// Launch error bounds (docs/project-queue.md, "Team queue launch errors").
+const (
+	launchPermanentAttempts = 3
+	launchRetryFirstDelay   = 15 * time.Second
+	launchRetryMaxDelay     = 5 * time.Minute
+	launchErrorNoticeRunes  = 300
+)
+
+// launchStepError is a refused hub write inside a launch: the operation and
+// the entry revision it expected.
+type launchStepError struct {
+	op       string
+	revision int64
+	err      error
+}
+
+func (e *launchStepError) Error() string { return e.op + ": " + e.err.Error() }
+func (e *launchStepError) Unwrap() error { return e.err }
+
+// launchErrorPermanent reports a hub refusal that repeating the same write
+// cannot change: a malformed, missing or oversized request, or the same
+// retry identity with a different payload. A stale revision, a credential
+// fault, rate limits, server errors and network faults can clear.
+func launchErrorPermanent(err error) bool {
+	var response *api.HTTPError
+	if !errors.As(err, &response) {
+		return false
+	}
+	switch response.Status {
+	case 400, 404, 413, 422:
+		return true
+	case 409:
+		return strings.HasSuffix(response.Msg, "team queue retry differs")
+	}
+	return false
+}
+
+// launchRetryDelay is the wait after the nth consecutive launch error.
+func launchRetryDelay(n int) time.Duration {
+	delay := launchRetryFirstDelay
+	for i := 1; i < n && delay < launchRetryMaxDelay; i++ {
+		delay *= 2
+	}
+	return min(delay, launchRetryMaxDelay)
+}
+
+// launchRetryBook holds each launching entry's consecutive errors on this
+// relay. It lives only in memory: a restart allows at most one more bounded
+// round, and the hub keeps the failure and its notice exactly once.
+type launchRetryBook struct {
+	mu      sync.Mutex
+	entries map[string]*launchRetryState
+}
+
+type launchRetryState struct {
+	signature string
+	permanent int
+	failures  int
+	next      time.Time
+	lastErr   string
+}
+
+var productionLaunchRetries = &launchRetryBook{}
+
+func launchRetryKey(hub, task, entry string) string {
+	return strings.TrimRight(hub, "/") + "\x00" + task + "\x00" + entry
+}
+
+// waiting reports whether the entry is inside its backoff window.
+func (b *launchRetryBook) waiting(key string, now time.Time) bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	state := b.entries[key]
+	return state != nil && now.Before(state.next)
+}
+
+// record notes one launch error and returns the permanent refusal once the
+// same one has repeated launchPermanentAttempts times in a row.
+func (b *launchRetryBook) record(key string, err error, now time.Time) *launchStepError {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.entries == nil {
+		b.entries = map[string]*launchRetryState{}
+	}
+	state := b.entries[key]
+	if state == nil {
+		state = &launchRetryState{}
+		b.entries[key] = state
+	}
+	state.failures++
+	state.next = now.Add(launchRetryDelay(state.failures))
+	state.lastErr = err.Error()
+	var step *launchStepError
+	var response *api.HTTPError
+	if !errors.As(err, &step) || !launchErrorPermanent(step.err) || !errors.As(step.err, &response) {
+		state.signature, state.permanent = "", 0
+		return nil
+	}
+	signature := fmt.Sprintf("%s\x00%d\x00%d", step.op, step.revision, response.Status)
+	if signature != state.signature {
+		state.signature, state.permanent = signature, 0
+	}
+	state.permanent++
+	if state.permanent < launchPermanentAttempts {
+		return nil
+	}
+	return step
+}
+
+// lastError is the entry's latest launch error on this relay, if any.
+func (b *launchRetryBook) lastError(key string) string {
+	if b == nil {
+		return ""
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if state := b.entries[key]; state != nil {
+		return state.lastErr
+	}
+	return ""
+}
+
+func (b *launchRetryBook) drop(key string) {
+	if b == nil {
+		return
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	delete(b.entries, key)
 }
 
 // postedStallNotices remembers the stall notices this relay process has
@@ -125,6 +268,7 @@ func productionTeamRunner() teamRunner {
 			return saveHostRelayCensus(ctx, c, task, host, policy, prior, cwds, time.Now())
 		},
 		roundRobin: true,
+		retries:    productionLaunchRetries,
 	}
 }
 
@@ -167,6 +311,9 @@ func (r teamRunner) tick(ctx context.Context, e env, c *api.Client, host string)
 		for _, q := range queue.Entries {
 			if q.Host != host {
 				continue
+			}
+			if q.State != "launching" {
+				r.retries.drop(launchRetryKey(c.Base, q.TaskID, q.ID))
 			}
 			// An unsafe host observation cannot start or continue a parallel
 			// launch. Serial teams and already-running parallel teams still
@@ -217,6 +364,9 @@ func (r teamRunner) tick(ctx context.Context, e env, c *api.Client, host string)
 }
 
 func (r teamRunner) advance(ctx context.Context, e env, c *api.Client, q api.TeamQueueEntry, host string) error {
+	if q.State == "launching" && r.retries != nil && r.retries.waiting(launchRetryKey(c.Base, q.TaskID, q.ID), r.clock()) {
+		return nil
+	}
 	detail, err := c.GetTask(ctx, q.TaskID)
 	if err != nil {
 		return err
@@ -251,7 +401,7 @@ func (r teamRunner) advance(ctx context.Context, e env, c *api.Client, q api.Tea
 		}
 	}
 	if q.State == "launching" {
-		return r.launch(ctx, e, c, q, host)
+		return r.boundedLaunch(ctx, e, c, q, host)
 	}
 	if q.State == "running" {
 		q = r.narrow(ctx, c, q)
@@ -290,15 +440,16 @@ func (r teamRunner) narrow(ctx context.Context, c *api.Client, q api.TeamQueueEn
 }
 
 // noticeStalls posts one Board notice for each stall the hub explains on this
-// host's queued entries once it has held past the grace period. The hub
-// recomputes the stall and refuses a stale one; a refusal is not an error.
+// host's queued or launching entries once it has held past the grace period.
+// The hub recomputes the stall and refuses a stale one; a refusal is not an
+// error. A launch's notice carries this relay's last error for it.
 func (r teamRunner) noticeStalls(ctx context.Context, c *api.Client, queue api.TeamQueueList, host string) {
 	grace := r.stallGrace
 	if grace <= 0 {
 		grace = 5 * time.Minute
 	}
 	for _, q := range queue.Entries {
-		if q.State != "queued" || q.Stall == nil || q.Host != host {
+		if (q.State != "queued" && q.State != "launching") || q.Stall == nil || q.Host != host {
 			continue
 		}
 		since, err := time.Parse(time.RFC3339Nano, q.Stall.Since)
@@ -309,7 +460,14 @@ func (r teamRunner) noticeStalls(ctx context.Context, c *api.Client, queue api.T
 		if _, posted := postedStallNotices.Load(id); posted {
 			continue
 		}
-		_, err = c.TeamQueueAction(ctx, q.TaskID, api.TeamQueueRequest{RequestID: id, Operation: "stall_notice", EntryID: q.ID, ExpectedRevision: q.Revision})
+		var lastErr string
+		if q.Stall.BlockerEntryID != "" {
+			lastErr = r.retries.lastError(launchRetryKey(c.Base, q.TaskID, q.Stall.BlockerEntryID))
+			if runes := []rune(lastErr); len(runes) > launchErrorNoticeRunes {
+				lastErr = string(runes[:launchErrorNoticeRunes])
+			}
+		}
+		_, err = c.TeamQueueAction(ctx, q.TaskID, api.TeamQueueRequest{RequestID: id, Operation: "stall_notice", EntryID: q.ID, ExpectedRevision: q.Revision, Failure: lastErr})
 		var response *api.HTTPError
 		if err == nil {
 			postedStallNotices.Store(id, true)
@@ -415,6 +573,33 @@ func (r teamRunner) verifyMember(ctx context.Context, e env, c *api.Client, q ap
 	return a, nil
 }
 
+// boundedLaunch paces a launch that keeps failing and fails the entry once
+// the hub has refused the same write launchPermanentAttempts times.
+func (r teamRunner) boundedLaunch(ctx context.Context, e env, c *api.Client, q api.TeamQueueEntry, host string) error {
+	err := r.launch(ctx, e, c, q, host)
+	if r.retries == nil {
+		return err
+	}
+	key := launchRetryKey(c.Base, q.TaskID, q.ID)
+	if err == nil {
+		r.retries.drop(key)
+		return nil
+	}
+	refused := r.retries.record(key, err, r.clock())
+	if refused == nil {
+		return err
+	}
+	// The text names the constant bound, so a retried fail sends the same
+	// payload.
+	q.Revision = refused.revision
+	cause := fmt.Errorf("launch %s refused permanently by the hub after %d attempts: %v", refused.op, launchPermanentAttempts, refused.err)
+	failErr := r.fail(ctx, c, q, cause)
+	if failErr == cause {
+		r.retries.drop(key)
+	}
+	return failErr
+}
+
 func (r teamRunner) launch(ctx context.Context, e env, c *api.Client, q api.TeamQueueEntry, host string) error {
 	lock, lockErr := queueLaunchLock(e.hub, q.TaskID, q.ID)
 	if lockErr != nil {
@@ -470,9 +655,10 @@ func (r teamRunner) launch(ctx context.Context, e env, c *api.Client, q api.Team
 			journal.Members = append(journal.Members, teamLaunchMember{Fields: f, State: "unstarted", RunID: api.NewID("run")})
 		}
 		frozen, _ := json.Marshal(journal)
+		revision := q.Revision
 		q, err = c.TeamQueueAction(ctx, q.TaskID, api.TeamQueueRequest{RequestID: "queue-freeze-" + q.ID, Operation: "freeze", EntryID: q.ID, ExpectedRevision: q.Revision, LaunchJSON: frozen})
 		if err != nil {
-			return err
+			return &launchStepError{op: "freeze", revision: revision, err: err}
 		}
 	} else if err := json.Unmarshal(q.LaunchJSON, &journal); err != nil {
 		return r.fail(ctx, c, q, err)
@@ -528,18 +714,20 @@ func (r teamRunner) launch(ctx context.Context, e env, c *api.Client, q api.Team
 			if err != nil {
 				return r.fail(ctx, c, q, fmt.Errorf("uncertain spawn %s has no exact registration; never respawn: %w", member.Fields.AgentID, err))
 			}
+			revision := q.Revision
 			q, err = c.TeamQueueAction(ctx, q.TaskID, api.TeamQueueRequest{RequestID: fmt.Sprintf("queue-started-%s-%d", q.ID, i), Operation: "started", EntryID: q.ID, ExpectedRevision: q.Revision, MemberIndex: i, MemberRunID: a.RunID})
 			if err != nil {
-				return err
+				return &launchStepError{op: "started", revision: revision, err: err}
 			}
 			continue
 		}
 		if member.State != "unstarted" {
 			return r.fail(ctx, c, q, errors.New("invalid frozen member state"))
 		}
+		revision := q.Revision
 		q, err = c.TeamQueueAction(ctx, q.TaskID, api.TeamQueueRequest{RequestID: fmt.Sprintf("queue-attempt-%s-%d", q.ID, i), Operation: "attempt", EntryID: q.ID, ExpectedRevision: q.Revision, MemberIndex: i})
 		if err != nil {
-			return err
+			return &launchStepError{op: "attempt", revision: revision, err: err}
 		}
 		contextFile, err := os.CreateTemp("", "tt-team-context-*.json")
 		if err != nil {
@@ -572,13 +760,16 @@ func (r teamRunner) launch(ctx context.Context, e env, c *api.Client, q api.Team
 		if err != nil {
 			return r.fail(ctx, c, q, fmt.Errorf("spawn registration %s: %w", f.Name, err))
 		}
+		revision = q.Revision
 		q, err = c.TeamQueueAction(ctx, q.TaskID, api.TeamQueueRequest{RequestID: fmt.Sprintf("queue-started-%s-%d", q.ID, i), Operation: "started", EntryID: q.ID, ExpectedRevision: q.Revision, MemberIndex: i, MemberRunID: a.RunID})
 		if err != nil {
-			return err
+			return &launchStepError{op: "started", revision: revision, err: err}
 		}
 	}
-	_, err = c.TeamQueueAction(ctx, q.TaskID, api.TeamQueueRequest{RequestID: "queue-running-" + q.ID, Operation: "running", EntryID: q.ID, ExpectedRevision: q.Revision})
-	return err
+	if _, err = c.TeamQueueAction(ctx, q.TaskID, api.TeamQueueRequest{RequestID: "queue-running-" + q.ID, Operation: "running", EntryID: q.ID, ExpectedRevision: q.Revision}); err != nil {
+		return &launchStepError{op: "running", revision: q.Revision, err: err}
+	}
+	return nil
 }
 
 func (r teamRunner) finish(ctx context.Context, e env, c *api.Client, q api.TeamQueueEntry, host string) error {
