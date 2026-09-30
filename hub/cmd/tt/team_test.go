@@ -33,6 +33,13 @@ type teamFixture struct {
 
 func newTeamFixture(t *testing.T, withHandler bool) teamFixture {
 	t.Helper()
+	return newTeamFixtureKind(t, withHandler, "feature")
+}
+
+// newTeamFixtureKind files the fixture item as a bug or a feature; the shared
+// launch plan picks the Planned roster by that kind (wi_ade4aa60c5d9b55e).
+func newTeamFixtureKind(t *testing.T, withHandler bool, kind string) teamFixture {
+	t.Helper()
 	t.Setenv("HOME", t.TempDir())
 	t.Setenv("TAILTERM_RELAY_STATE", t.TempDir())
 	t.Setenv("TT_TMUX_SOCKET", "tt-team-"+strings.TrimPrefix(api.NewID("agt"), "agt_"))
@@ -78,7 +85,7 @@ func newTeamFixture(t *testing.T, withHandler bool) teamFixture {
 			t.Fatal(err)
 		}
 	}
-	f.item, err = c.CreateWorkItem(ctx, task.ID, api.CreateWorkItemRequest{Kind: "feature", Title: "fixture feature", RequestID: "team-item"})
+	f.item, err = c.CreateWorkItem(ctx, task.ID, api.CreateWorkItemRequest{Kind: kind, Title: "fixture " + kind, RequestID: "team-item"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -138,7 +145,8 @@ func TestTeamLaunchDryRunPrintsFullPlanAndChangesNothing(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, want := range []string{"lead-", "planner-", "builder-", "reviewer-", "claude-opus-5-5", "reasoning=high", "promptBytes="} {
+	for _, want := range []string{"Planned delivery (feature: plan review) for ", "lead-", "planner-", "builder-", "reviewer-", "claude-opus-5-5", "reasoning=high", "promptBytes=",
+		"plan-reviewer-" + f.item.ID[len(f.item.ID)-8:] + " runtime=codex model=gpt-6-astra reasoning=high "} {
 		if !strings.Contains(out, want) {
 			t.Fatalf("dry plan lacks %q: %s", want, out)
 		}
@@ -226,11 +234,26 @@ func setFixtureOrchestrator(c *api.Client, task, name string) error {
 	return teamplan.Run(ctx, map[string]any{"action": "set-orchestrator", "hub": c.Base, "task": task, "orchestrator": name}, &updated)
 }
 
-func TestTeamLaunchStartsFourMembersOnPrivateTmux(t *testing.T) {
-	if _, err := exec.LookPath("tmux"); err != nil {
-		t.Skip("tmux unavailable")
+func TestTeamLaunchBugDryRunIsPlanOnly(t *testing.T) {
+	f := newTeamFixtureKind(t, true, "bug")
+	out, err := captureCLIOutput(t, func() error { return cmdTeam(f.e, f.args("--dry-run")) })
+	if err != nil {
+		t.Fatal(err)
 	}
-	f := newTeamFixture(t, true)
+	if !strings.Contains(out, "Planned delivery (bug: plan only) for ") || strings.Contains(out, "plan-reviewer-") {
+		t.Fatalf("bug dry plan shape: %s", out)
+	}
+	for _, role := range []string{"lead-", "planner-", "builder-", "verifier-", "reviewer-"} {
+		if !strings.Contains(out, "\n"+role) {
+			t.Fatalf("bug dry plan lacks %q: %s", role, out)
+		}
+	}
+}
+
+// launchTeamOnPrivateTmux launches the fixture team with stub runtimes and
+// checks the members bound to the item, the reused handler and admission order.
+func launchTeamOnPrivateTmux(t *testing.T, f teamFixture, members int) []api.Agent {
+	t.Helper()
 	t.Cleanup(func() { _, _ = startupTmux(context.Background(), "kill-server") })
 	bin := t.TempDir()
 	for _, runtime := range []string{"codex", "claude"} {
@@ -247,8 +270,8 @@ func TestTeamLaunchStartsFourMembersOnPrivateTmux(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(detail.Agents) != 6 || detail.Task.Orchestrator != "lead-"+f.item.ID[len(f.item.ID)-8:] {
-		t.Fatalf("launch state: %+v %s", detail.Task, out)
+	if len(detail.Agents) != members+1 || detail.Task.Orchestrator != "lead-"+f.item.ID[len(f.item.ID)-8:] {
+		t.Fatalf("launch state: %d agents %+v %s", len(detail.Agents), detail.Task, out)
 	}
 	for _, a := range detail.Agents {
 		if a.Role == api.AgentRoleDatabaseHandler {
@@ -282,8 +305,39 @@ func TestTeamLaunchStartsFourMembersOnPrivateTmux(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if strings.Count(out, "(reconciled)") != 5 {
+	if strings.Count(out, "(reconciled)") != members {
 		t.Fatal(out)
+	}
+	return detail.Agents
+}
+
+func TestTeamLaunchStartsFeatureMembersWithPlanReviewerOnPrivateTmux(t *testing.T) {
+	if _, err := exec.LookPath("tmux"); err != nil {
+		t.Skip("tmux unavailable")
+	}
+	f := newTeamFixture(t, true)
+	agents := launchTeamOnPrivateTmux(t, f, 6)
+	reviewer := "plan-reviewer-" + f.item.ID[len(f.item.ID)-8:]
+	for _, a := range agents {
+		if a.Name == reviewer {
+			if a.Runtime != "codex" {
+				t.Fatalf("plan reviewer runtime %q", a.Runtime)
+			}
+			return
+		}
+	}
+	t.Fatalf("feature team lacks %s: %+v", reviewer, agents)
+}
+
+func TestTeamLaunchStartsBugMembersWithoutPlanReviewerOnPrivateTmux(t *testing.T) {
+	if _, err := exec.LookPath("tmux"); err != nil {
+		t.Skip("tmux unavailable")
+	}
+	f := newTeamFixtureKind(t, true, "bug")
+	for _, a := range launchTeamOnPrivateTmux(t, f, 5) {
+		if strings.HasPrefix(a.Name, "plan-reviewer-") {
+			t.Fatalf("bug team launched %s", a.Name)
+		}
 	}
 }
 

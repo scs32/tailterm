@@ -9,6 +9,9 @@ export function renderTeamDelivery(queue, agents = [], ownerRequests = [], taskI
   const byId = new Map(agents.map((agent) => [agent.id, agent]));
   const rows = queue.entries.map((entry) => {
     const lead = agents.find((agent) => agent.itemLead && agent.workItem?.itemId === entry.itemId)?.name || (entry.state === "launching" ? entry.launch?.members?.[0]?.fields?.name : "") || "";
+    // Features get a plan review; bugs get a plan only (wi_ade4aa60c5d9b55e).
+    // The frozen launch shows which shape the team has; a queued entry has none.
+    const shape = entry.launch?.members?.length ? (entry.launch.members.some((member) => member.fields?.role === "Plan review") ? " · Plan review team" : " · Plan-only team") : "";
     const handlerName = byId.get(entry.handlerId)?.name || entry.handlerId || "";
     const handler = handlerName ? `${handlerName}${entry.handlerLeaseGeneration ? ` · lease ${entry.handlerLeaseGeneration}` : ""}${handlerArmText(entry.handlerArm)}` : "";
     const owns = entry.ownership?.length ? entry.ownership.join(", ") : "Unscoped · conflicts with all work";
@@ -28,7 +31,7 @@ export function renderTeamDelivery(queue, agents = [], ownerRequests = [], taskI
     const notableChecks = verification?.checks?.filter(c => c.status !== "pass" || c.knownFailure || c.nowPassing) || [];
     const verificationText = verification ? `<span class="fine" style="overflow-wrap:anywhere" data-testid="verification-summary">Verification ${esc(verification.state)}${notableChecks.length ? " · " + notableChecks.map(c => `${esc(c.id)}: ${esc(c.status)}${c.knownFailure ? " · known failure" : ""}${c.nowPassing ? " · now passing; remove from known failures" : ""}`).join("; ") : ""}</span>` : "";
     const activity = entry.activities?.map((member) => `${member.name}: ${activityLabel(member.activity)}`).join(" · ") || "";
-    return `<div class="team-delivery-row" data-testid="team-delivery-entry"><strong>${esc(entry.itemId)}</strong><span class="fine">${esc(entry.state)}${blocked ? ` · ${esc(blocked)}` : ""}</span><span class="fine">Owns ${esc(owns)}</span>${lead || handler ? `<span class="fine">${lead ? `Lead ${esc(lead)}` : ""}${lead && handler ? " · " : ""}${handler ? `Handler ${esc(handler)}` : ""}</span>` : ""}${activity ? `<span class="fine">${esc(activity)}</span>` : ""}<span class="fine">${esc(tokenSnapshot(entry.tokens))}</span><span class="fine" data-testid="review-convergence-summary">${esc(reviewText)}</span>${ownerWaitSummary(ownerRequests, taskId || entry.taskId, entry.itemId)}${followUps}${verificationText}${ready}${releaseText}</div>`;
+    return `<div class="team-delivery-row" data-testid="team-delivery-entry"><strong>${esc(entry.itemId)}</strong><span class="fine">${esc(entry.state)}${shape}${blocked ? ` · ${esc(blocked)}` : ""}</span><span class="fine">Owns ${esc(owns)}</span>${lead || handler ? `<span class="fine">${lead ? `Lead ${esc(lead)}` : ""}${lead && handler ? " · " : ""}${handler ? `Handler ${esc(handler)}` : ""}</span>` : ""}${activity ? `<span class="fine">${esc(activity)}</span>` : ""}<span class="fine">${esc(tokenSnapshot(entry.tokens))}</span><span class="fine" data-testid="review-convergence-summary">${esc(reviewText)}</span>${ownerWaitSummary(ownerRequests, taskId || entry.taskId, entry.itemId)}${followUps}${verificationText}${ready}${releaseText}</div>`;
   }).join("");
   return `<article class="task-card task-detail-card team-delivery-panel" data-testid="team-delivery-panel"><header><h3>Delivery</h3><span class="fine">${queue.concurrencyLimit === 0 ? "No fixed limit" : `Limit ${esc(queue.concurrencyLimit ?? 1)}`}</span></header><div class="team-delivery-rows">${rows}</div></article>`;
 }

@@ -92,8 +92,10 @@ minute for the host queue scan and up to six effects per polled project. This
 bounded worst-case estimate must fit both the total cap and its reserved
 queue/binding shares (one quarter and three quarters); the transport bucket
 enforces actual rate and burst. Reservations include every uncleaned agent run,
-uncertain and pending members, extras and manual launches (five slots before
-a manual plan is known).
+uncertain and pending members, extras and manual launches. Before its plan is
+frozen, a reservation charges its item's team size: six slots for a feature and
+five for a bug. The next admission has no item yet, so it charges six. Once a
+plan freezes, it charges its actual unstarted members.
 
 Without a fixed cap, admission is governed by real constraints only:
 non-overlapping declared ownership and worktrees, a free database handler for
@@ -247,8 +249,12 @@ An abandoned manual attempt cannot replay its old launch identity; queue the
 still-active item with `team queue add` if it needs a fresh team.
 
 `tt team launch --item wi_… --order N [--template planned] [--dry-run]`
-starts the four non-database members of the Planned delivery template for an
-existing project. `TAILTERM_HUB` and `TAILTERM_TASK` select the hub and project;
+starts the non-database members of the Planned delivery template for an
+existing project: six for a feature (lead, planner, plan-reviewer, builder,
+verifier and reviewer) and five for a bug, without the plan reviewer. The kind
+comes from the exact item revision in the prepared launch context, and the dry
+run header names the shape, for example `Planned delivery (feature: plan
+review)` or `Planned delivery (bug: plan only)`. `TAILTERM_HUB` and `TAILTERM_TASK` select the hub and project;
 `--hub` and `--task` can supply them explicitly. The current directory is the
 members' project folder, or pass `--cwd` for an absolute local directory.
 
@@ -361,14 +367,44 @@ hub returns. Unscoped parallel adds become possible again under the old hub.
 
 ## Independent verification
 
-New Planned delivery templates include a fifth item member, `verifier`, distinct
+New Planned delivery templates include a `verifier` item member, distinct
 from builder and reviewer; the project database handler remains shared. Host
-capacity conservatively reserves five sessions/bindings per pending team. Saved
+capacity conservatively reserves six sessions/bindings per pending feature team
+and five per pending bug team (see below). Saved
 older launch plans retain their frozen members and retry identities. A frozen
 candidate needs a handler-approved full matrix plan and independent receipt before
 lead acceptance, handler completion and queue integration acceptance. See
 [objective verification](objective-verification.md). These template changes apply
 to new briefings; they do not rewrite running threads or saved launch plans.
+
+## Plan review for features
+
+Owner rule (September 28, 2026; `wi_ade4aa60c5d9b55e`): features get a plan and
+a plan review; bugs get a plan only. The Planned delivery template has a
+`plan-reviewer` seat on GPT-6 Astra (`gpt-6-astra`, app `codex`, reasoning
+`high`), a separate session on another model than the Claude Opus planner. The
+shared launch plan used by TailOS **Add team**, `tt team launch` and the queue
+runner reads the item kind from the exact item revision in the prepared context.
+A feature team launches six members with the plan reviewer; a bug team launches
+five without it. A context without an item kind is refused, so refresh it
+before launch.
+
+For a feature, the lead sends the planner's plan to the plan reviewer in a
+REQUEST before any builder ASSIGN. The plan reviewer returns one RESULT: pass,
+or numbered blockers p1…pN (missing acceptance coverage, wrong file ownership,
+unsafe step or unverifiable step), each with its reason and evidence. The
+planner gets one revision round; the lead may ask for one focused check of those
+blocker IDs, then decides. There is no plan-review loop. Plan and plan review
+use REQUEST, never ASSIGN or REVIEW: an ASSIGN freezes the acceptance criteria,
+and plan review is not a code-review round. For a bug, the lead assigns the
+builder from the plan directly.
+
+The Projects Delivery panel shows **Plan review team** or **Plan-only team**
+once a queued team's launch is frozen; a queued entry without a launch shows
+neither. A TailOS team saved before this rule has no plan-reviewer seat and
+launches five members for either kind; re-add Planned delivery from the example
+to get it. Retrying a launch journal frozen before the change keeps its saved
+members.
 
 Owner decision #11866 places mandatory verification at new item-team admission.
 The admission transaction saves an immutable exact agent/run enrollment marker;

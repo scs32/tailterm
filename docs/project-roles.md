@@ -35,7 +35,8 @@ roles (September 29), and the backlog steward (`wi_5b4b94dbc9a11e8b`, order
   enqueues. It does not accept items or change records. See
   [Project deployment](project-deployment.md).
 - **Item team.** A lead, a planner, a builder, a reviewer and a verifier (the
-  Planned delivery template). Each session serves exactly one item; a new item
+  Planned delivery template), plus a plan reviewer on another model for a
+  feature. A bug team has no plan reviewer. Each session serves exactly one item; a new item
   gets fresh identities. See [Team examples](team-examples.md).
 
 ## Intake flow

@@ -61,7 +61,7 @@ test("Add team can pass the shared Planned delivery plan to its lead selector", 
       workItemRevision: 1,
       workOrderTaskId: "tsk_1111111111111111",
       workOrderMessageSeq: 7,
-      workContextBundle: { version: 1 },
+      workContextBundle: { version: 1, history: { revision: { kind: "feature" } } },
     },
     handler: { role: "database_handler", status: "running" },
   });

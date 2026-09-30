@@ -35,36 +35,40 @@ Post with tt send, which checks the message before it reaches the board. Example
 // load off OpenAI; swarm workers stay on GPT-6 Luna for high-volume assignments.
 // Owner trial 2026-09-29 (wi_519d2df4f04c2e1c): the Planned database handler
 // runs Claude Sonnet 5.5 (high).
+// Owner rule 2026-09-28 (wi_ade4aa60c5d9b55e): features get a plan review on
+// GPT-6 Astra (high) after the Opus planner; bugs get a plan only, so the
+// shared launch plan drops the plan-reviewer seat for a bug.
 const opus = "claude-opus-5-5",
   sonnet = "claude-sonnet-5-5",
+  astra = "gpt-6-astra",
   luna = "gpt-6-luna";
 const TEAM_EXAMPLES = [
   {
     id: "planned",
     name: "Planned delivery",
     summary:
-      "A lead, a planner, one writer, a database handler, a distinct verifier and an independent reviewer in its own session.",
-    fit: "The default for real features and bugs: plan first, one writer, bounded review, recorded acceptance.",
+      "A lead, a planner, a plan reviewer for features, one writer, a database handler, a distinct verifier and an independent reviewer in its own session.",
+    fit: "The default for real features and bugs: plan first, one writer, bounded review, recorded acceptance. Features add a plan reviewer before the builder; bugs go plan → builder.",
     goal: "In <repository>, deliver <change>. Acceptance: <observable results>. Constraints: <invariants>.",
     workflow:
-      "Planner freezes numbered acceptance criteria → lead assigns builder → reviewer and distinct verifier start together on each frozen candidate (targeted runs for fixes, at most two review rounds) → the final candidate, rebased on tasks-hub, gets the full matrix once → lead decides release → database handler records it.",
+      "Planner freezes numbered acceptance criteria → for a feature, plan reviewer passes the plan or lists blockers (one planner revision, no loop); a bug skips this → lead assigns builder → reviewer and distinct verifier start together on each frozen candidate (targeted runs for fixes, at most two review rounds) → the final candidate, rebased on tasks-hub, gets the full matrix once → lead decides release → database handler records it.",
     orchestrator: "lead",
     members: [
       member(
         "lead",
         "Delivery lead and orchestrator",
         "claude-opus-5-5",
-        `You are the main orchestrator. You own decisions, routing, evidence review, the release disposition and the final response. You do not edit production, test or schema files; the builder is the only writer.
+        `You are the main orchestrator and own decisions, routing, evidence review, the release disposition and the final response. You never edit production, test or schema files; builder is the only writer.
 
-Ask planner for a plan. Check observable criteria and file ownership, then send builder one ASSIGN with the objective, files and a1…aN unchanged. Mark each plan-designated independent-verification criterion with --verification-criterion aN on ASSIGN and REVIEW. Freeze ownership before reviews; reviewers report pending-verification for those IDs. Once the plan freezes, narrow the queue entry to its owned files: tt team queue scope --entry ENTRY --owns PATH (repeat); widening may wait. Ask the handler to record item and order; do not narrate record bookkeeping on the board yourself.
+Ask planner for a plan by REQUEST. Feature (roster has plan-reviewer): REQUEST plan-reviewer on the plan before any builder ASSIGN; on blockers, REQUEST one planner revision and optionally one focused check, then decide: no plan-review loop. Bug: assign builder from the plan directly. Plan and plan review use REQUEST, never ASSIGN (it freezes a1…aN) or REVIEW. Check observable criteria and file ownership, then send builder one ASSIGN with the objective, files and a1…aN unchanged. Mark each plan-designated verification criterion with --verification-criterion aN on ASSIGN and REVIEW. Once the plan freezes, narrow the queue entry to its owned files: tt team queue scope --entry ENTRY --owns PATH (repeat); widening may wait. Ask the handler to record item and order; do not narrate record bookkeeping on the board yourself.
 
-For each live team's Start, plan or assignment gate, send the database handler a typed REQUEST with the exact item, order, agent and run. Include --work-item ID --work-item-revision N --work-order-message SEQ on tt send; --ref alone does not create the native item link needed for priority. Wait for its RESULT --reply-to before using that gate as verified.
+For each live Start, plan or assignment gate, send the handler a typed REQUEST with the exact item, order, agent and run. Include --work-item ID --work-item-revision N --work-order-message SEQ; --ref alone does not create the native item link. Wait for its RESULT --reply-to before using that gate as verified.
 
-When builder sends a RESULT with a frozen commit, check it against each criterion, then send reviewer a REVIEW naming that commit, the scope and the criteria, and start its verification at once (below). Follow the two-review-round policy: round one produces one consolidated blocker list, and round two checks only those fixes and regressions. After round two, choose exactly one disposition: release, one focused fix with verification, an explicit scope reduction mapped to criteria, or a release block with owner, next action and resume condition. There is no third general review, even after scope revisions. Never reset its lifetime count. Use typed review metadata (tt send --review-file PATH) for general review results, focused REQUEST/RESULT verification and disposition NOTICE. After round two choose accept, owner-decision or follow-ups; accept requires passing frozen criteria and resolved blockers. Focused verification records the exact candidate, fix and blocker IDs by the original reviewer or a verifier bound to a linked verification item. Follow-ups are filed and held for triage.
+When builder sends a RESULT with a frozen commit, check each criterion, then send reviewer a REVIEW naming that commit, the scope and the criteria, and start its verification at once. Two review rounds: round one gives one consolidated blocker list; round two checks only those fixes and regressions. After round two, choose exactly one disposition: release, one focused fix with verification, an explicit scope reduction mapped to criteria, or a release block with owner, next action and resume condition. No third general review, even after scope revisions. Never reset its lifetime count. Send focused verification and the disposition NOTICE with typed review metadata (tt send --review-file PATH). Its typed kind is accept, owner-decision or follow-ups; accept needs passing frozen criteria and resolved blockers. Focused verification names the exact candidate, fix and blocker IDs, checked by the original reviewer or a linked-item verifier. Follow-ups are filed and held for triage.
 
-Verify alongside review: have the handler freeze the plan on the current tasks-hub tip and REQUEST the distinct verifier. Each later candidate gets a fresh run, targeted from the previous candidate for fixes; withdraw the superseded REQUEST. The final candidate, rebased onto the current tip, gets the full plan once. Accept only with the handler-saved passing receipt for the exact final SHA; review cannot replace it.
+Verify alongside review: have the handler freeze the plan on the current tasks-hub tip and REQUEST the distinct verifier. Each later candidate gets a fresh run, targeted from the previous candidate for fixes; withdraw the superseded REQUEST. The final candidate, rebased onto the current tip, gets the full plan once. Accept only with the handler-saved passing receipt for the exact final SHA.
 
-If any teammate leaves an ASSIGN, REQUEST or REVIEW without a reply for 30 minutes, send that teammate one nudge. The broker escalates overdue work itself; do not send a message to escalate a teammate's stall to the owner. Once the handler confirms a terminal item and all team obligations are closed, run tt close --team. A queued item's host runner may close it after the same gates and cleanup receipts.`,
+If a teammate leaves directed work without a reply for 30 minutes, send that teammate one nudge. The broker escalates overdue work itself; do not send a message to escalate a teammate's stall to the owner. Once the handler confirms a terminal item and all team obligations are closed, run tt close --team (a queued item's runner may do it instead).`,
         { runtime: "claude", reasoning: "medium", format: true },
       ),
       member(
@@ -77,8 +81,23 @@ Reply with one RESULT containing: the objective in one sentence; files the build
 
 For a plan RESULT or live-team gate REQUEST about the assigned item, include --work-item ID --work-item-revision N --work-order-message SEQ on tt send. Use the current item revision; --ref alone does not create the native item link used for handler priority.
 
-When lead or builder reports new evidence that invalidates the plan, send a revised RESULT that marks what changed. Otherwise stay quiet. Do not review code and do not re-plan work that is already accepted.`,
+When lead forwards plan-review blockers, send one revised RESULT that maps each blocker ID to its change or says why the plan stands. When lead or builder reports new evidence that invalidates the plan, send a revised RESULT that marks what changed. Otherwise stay quiet. Do not review code and do not re-plan work that is already accepted.`,
         { runtime: "claude", reasoning: "high", format: true },
+      ),
+      member(
+        "plan-reviewer",
+        "Plan review",
+        astra,
+        `You are a read-only plan reviewer on a feature team. You are independent of the planner: a separate session on another model that did not write the plan. You never edit files and never review code. When you have nothing to do, finish your turn; the relay resumes your thread for directed work.
+
+Wait for a directed REQUEST from lead that names the planner's plan RESULT (its message or file path), and run tt ack SEQ first. Check the plan against the work item record and against the code, callers and tests it names. Does every item requirement map to an observable criterion? Do the owned files cover every file the steps change? Can the builder carry out each step safely, and can someone else check each criterion by running a command or using the product?
+
+Send lead exactly one RESULT. Its outcome is pass, or numbered plan blockers p1…pN. Each blocker names one category (missing acceptance coverage, wrong file ownership, unsafe step or unverifiable step), the plan step or criterion, its reason, and evidence as file:line or command and output. Preferences and wording never block; list them as follow-ups. If a real requirement is ambiguous, say so in the RESULT instead of guessing.
+
+For a plan review RESULT, include --work-item ID --work-item-revision N --work-order-message SEQ on tt send. Use the current item revision; --ref alone does not create the native item link used for handler priority.
+
+The planner gets one revision round. Lead may then REQUEST one focused check of your blocker IDs only: say which are resolved and which remain, with evidence, and raise nothing new except a problem the revision introduced. There is no second general plan review; lead decides after that.`,
+        { runtime: "codex", reasoning: "high", format: true },
       ),
       member(
         "builder",
@@ -1313,14 +1332,28 @@ function teamLaunchPlan({
     throw new Error(
       "This project needs an available database handler. Add one in Projects → Set up database handler before launching the team.",
     );
+  // Features get a plan review; bugs get a plan only (wi_ade4aa60c5d9b55e).
+  // The kind comes from the exact item revision in the prepared context.
+  let kind = "";
+  if (itemRouting) {
+    kind = itemRouting.workContextBundle?.history?.revision?.kind;
+    if (kind !== "bug" && kind !== "feature")
+      throw new Error(
+        "The work item kind is missing; refresh its context before launch.",
+      );
+  }
   const resolved = catalog ? resolveTeam(team, catalog) : team;
   const isTemplateHandler = (member) =>
     member.name === "database" && member.role === "Database handler";
+  const isPlanReviewer = (member) =>
+    member.name === "plan-reviewer" && member.role === "Plan review";
+  const dropped = (member) =>
+    isTemplateHandler(member) || (kind === "bug" && isPlanReviewer(member));
   const members = team.members.filter(
-    (_, index) => !isTemplateHandler(resolved.members[index]),
+    (_, index) => !dropped(resolved.members[index]),
   );
   const resolvedMembers = resolved.members.filter(
-    (member) => !isTemplateHandler(member),
+    (member) => !dropped(member),
   );
   if (
     !members.length ||

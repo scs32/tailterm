@@ -158,7 +158,16 @@ func cmdTeam(e env, args []string) error {
 		return errors.New("team plan is empty or lacks prepared item context")
 	}
 	if *dryRun {
-		fmt.Printf("Planned delivery for %s@%d, order #%d; database handler %s reused\n", *item, workItem.Revision, *order, handler.Name)
+		// Features get a plan review; bugs get a plan only (wi_ade4aa60c5d9b55e).
+		// The shape comes from the resolved roster, so a template without the
+		// seat never claims a plan review.
+		shape := "plan only"
+		for _, member := range resolved.Plan {
+			if member.Fields.Role == "Plan review" {
+				shape = "plan review"
+			}
+		}
+		fmt.Printf("Planned delivery (%s: %s) for %s@%d, order #%d; database handler %s reused\n", workItem.Kind, shape, *item, workItem.Revision, *order, handler.Name)
 		for _, member := range resolved.Plan {
 			f := member.Fields
 			fmt.Printf("%s runtime=%s model=%s reasoning=%s promptBytes=%d cwd=%s\n", f.Name, f.Runtime, f.Model, f.Reasoning, len([]byte(f.Prompt)), f.Cwd)

@@ -19,14 +19,28 @@ export function teamLaunchPlan({
     throw new Error(
       "This project needs an available database handler. Add one in Projects → Set up database handler before launching the team.",
     );
+  // Features get a plan review; bugs get a plan only (wi_ade4aa60c5d9b55e).
+  // The kind comes from the exact item revision in the prepared context.
+  let kind = "";
+  if (itemRouting) {
+    kind = itemRouting.workContextBundle?.history?.revision?.kind;
+    if (kind !== "bug" && kind !== "feature")
+      throw new Error(
+        "The work item kind is missing; refresh its context before launch.",
+      );
+  }
   const resolved = catalog ? resolveTeam(team, catalog) : team;
   const isTemplateHandler = (member) =>
     member.name === "database" && member.role === "Database handler";
+  const isPlanReviewer = (member) =>
+    member.name === "plan-reviewer" && member.role === "Plan review";
+  const dropped = (member) =>
+    isTemplateHandler(member) || (kind === "bug" && isPlanReviewer(member));
   const members = team.members.filter(
-    (_, index) => !isTemplateHandler(resolved.members[index]),
+    (_, index) => !dropped(resolved.members[index]),
   );
   const resolvedMembers = resolved.members.filter(
-    (member) => !isTemplateHandler(member),
+    (member) => !dropped(member),
   );
   if (
     !members.length ||

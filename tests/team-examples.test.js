@@ -8,7 +8,7 @@ test("ten complete examples are portable, launchable, bounded and independently 
   assert.equal(TEAM_EXAMPLES.length, 10);
   for (const e of TEAM_EXAMPLES) {
     const team = normalizeTeam(exampleTeam(e.id));
-    assert.ok(team.members.length >= 1 && team.members.length <= 6);
+    assert.ok(team.members.length >= 1 && team.members.length <= 7);
     assert.ok(e.fit && e.goal && e.workflow);
     for (const m of team.members) {
       assert.equal(m.serverId, "");
@@ -107,7 +107,7 @@ test("Planned delivery teaches live gate priority without changing inbox order",
   const lead = team.members.find((member) => member.name === "lead").prompt;
   const handler = team.members.find((member) => member.name === "database").prompt;
   assert.match(lead, /typed REQUEST.*RESULT --reply-to/s);
-  for (const role of ["lead", "planner", "builder", "reviewer"]) {
+  for (const role of ["lead", "planner", "plan-reviewer", "builder", "reviewer"]) {
     const prompt = team.members.find((member) => member.name === role).prompt;
     assert.match(prompt, /--work-item ID --work-item-revision N --work-order-message SEQ/, role);
     assert.match(prompt, /--ref alone does not (create )?(the native item )?link/, role);
@@ -133,7 +133,7 @@ test("typed team prompts use notices for waits and self-blocks for dependencies"
       assert.match(member.prompt, /Use NOTICE to tell someone to wait or share status/, `${team.id}/${member.name}`);
       assert.match(member.prompt, /Use BLOCK only when you yourself are blocked; address it to whoever can unblock you, state what you need, and give the condition for resuming/, `${team.id}/${member.name}`);
     }
-  assert.equal(typedPrompts, 6);
+  assert.equal(typedPrompts, 7);
 });
 
 test("team prompts leave overdue escalation to the broker after one teammate nudge", () => {
@@ -206,7 +206,8 @@ test("Planned delivery marks verification-owned criteria pending for the reviewe
 
 // Owner trial wi_519d2df4f04c2e1c: only the Planned database handler moves to
 // Claude Sonnet 5.5; every other seat keeps its runtime, model and effort.
-test("Planned delivery runs only the database handler on Sonnet 5.5", () => {
+// wi_ade4aa60c5d9b55e adds the feature plan reviewer on GPT-6 Astra (high).
+test("Planned delivery runs the database handler on Sonnet 5.5 and the plan reviewer on Astra", () => {
   const planned = TEAM_EXAMPLES.find((example) => example.id === "planned");
   const seats = Object.fromEntries(
     planned.members.map((m) => [m.name, [m.runtime, m.model, m.reasoning]]),
@@ -214,6 +215,7 @@ test("Planned delivery runs only the database handler on Sonnet 5.5", () => {
   assert.deepEqual(seats, {
     lead: ["claude", "claude-opus-5-5", "medium"],
     planner: ["claude", "claude-opus-5-5", "high"],
+    "plan-reviewer": ["codex", "gpt-6-astra", "high"],
     builder: ["claude", "claude-opus-5-5", "high"],
     database: ["claude", "claude-sonnet-5-5", "high"],
     verifier: ["claude", "claude-opus-5-5", "high"],
@@ -259,4 +261,33 @@ test("Planned delivery lead narrows the queue entry once the plan freezes", () =
   const lead = exampleTeam("planned").members.find((m) => m.name === "lead");
   assert.match(lead.prompt, /Once the plan freezes, narrow the queue entry to its owned files: tt team queue scope --entry ENTRY --owns PATH \(repeat\); widening may wait\./);
   assert.doesNotMatch(lead.prompt, /Scope a queued item with/);
+});
+
+// wi_ade4aa60c5d9b55e / order #14014: features get a plan review before the
+// builder; bugs go from the plan straight to the builder.
+test("Planned delivery reviews a feature plan once before the builder and skips it for a bug", () => {
+  const planned = TEAM_EXAMPLES.find((example) => example.id === "planned");
+  const members = exampleTeam("planned").members;
+  const prompt = (name) => members.find((member) => member.name === name).prompt;
+  const lead = prompt("lead"),
+    planner = prompt("planner"),
+    reviewer = prompt("plan-reviewer");
+  const planReview = lead.indexOf("REQUEST plan-reviewer on the plan before any builder ASSIGN");
+  assert.ok(planReview > 0, "lead requests the plan review");
+  assert.ok(planReview < lead.indexOf("send builder one ASSIGN"), "plan review comes before the builder ASSIGN");
+  assert.match(lead, /on blockers, REQUEST one planner revision/);
+  assert.match(lead, /then decide: no plan-review loop/);
+  assert.match(lead, /Bug: assign builder from the plan directly/);
+  assert.match(lead, /Plan and plan review use REQUEST, never ASSIGN \(it freezes a1…aN\) or REVIEW/);
+  assert.match(planner, /plan-review blockers, send one revised RESULT that maps each blocker ID/);
+  assert.match(reviewer, /Send lead exactly one RESULT\. Its outcome is pass, or numbered plan blockers p1…pN/);
+  assert.match(reviewer, /missing acceptance coverage, wrong file ownership, unsafe step or unverifiable step/);
+  assert.match(reviewer, /its reason, and evidence/);
+  assert.match(reviewer, /never review code/);
+  assert.match(reviewer, /There is no second general plan review/);
+  assert.match(planned.fit, /Features add a plan reviewer before the builder; bugs go plan → builder/);
+  assert.match(planned.workflow, /for a feature, plan reviewer passes the plan or lists blockers/);
+  // The spawn command caps "Role: ROLE\n\nPROMPT" at 8192 characters.
+  for (const member of members)
+    assert.ok(`Role: ${member.role}\n\n${member.prompt}`.length <= 8192, member.name);
 });

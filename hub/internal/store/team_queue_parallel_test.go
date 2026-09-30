@@ -494,6 +494,44 @@ func TestParallelHostBudgetCountsManualLaunchReservation(t *testing.T) {
 	}
 }
 
+// wi_ade4aa60c5d9b55e: an unfrozen reservation charges its item's team size,
+// five for a bug and six for a feature, and the next admission charges six.
+func TestParallelHostBudgetChargesBugFiveAndFeatureSix(t *testing.T) {
+	for _, tc := range []struct {
+		kind  string
+		admit bool
+	}{{"bug", true}, {"feature", false}} {
+		t.Run(tc.kind, func(t *testing.T) {
+			s, task, items, orders := queueFixture(t)
+			ctx := context.Background()
+			if _, err := s.db.Exec(`UPDATE work_items SET kind=? WHERE id=?`, tc.kind, items[0].ID); err != nil {
+				t.Fatal(err)
+			}
+			var agents int
+			if err := s.db.QueryRow(`SELECT count(*) FROM agents WHERE host='mini' AND (status<>'closed' OR cleanup_done=0)`).Scan(&agents); err != nil {
+				t.Fatal(err)
+			}
+			// Room for 11 more sessions: a bug reservation (5) plus the next
+			// admission (6) fits; a feature reservation (6) plus 6 does not.
+			if _, err := s.TeamQueueAction(ctx, task.ID, api.TeamQueueRequest{RequestID: "kind-budget-policy", Operation: "set_host_policy", Host: "mini", HostPolicyVersion: 1, HostPolicyExpires: s.now().Add(time.Hour).Format(time.RFC3339), HostMaxSessions: agents + 11, HostMaxPolling: 10, LimiterDomain: "https://fixture.invalid", HostMaxRelayBindings: 100, HostMaxRequestsPerMinute: 100000, HostMaxBurst: 10000, HostHeadroomPercent: 20}); err != nil {
+				t.Fatal(err)
+			}
+			syntheticHostUsage(t, s, task.ID, "mini")
+			token := fmt.Sprintf("manual-%s-%s-%d", task.ID, items[0].ID, orders[0].Seq)
+			if _, err := s.TeamQueueAction(ctx, task.ID, api.TeamQueueRequest{RequestID: token, Operation: "manual", ItemID: items[0].ID, OrderMessageSeq: orders[0].Seq, PauseGeneration: 0, Host: "mini"}); err != nil {
+				t.Fatal(err)
+			}
+			_, err := s.TeamQueueAction(ctx, task.ID, api.TeamQueueRequest{RequestID: "kind-budget-limit", Operation: "set_limit", Host: "mini", ConcurrencyLimit: 2})
+			if tc.admit && err != nil {
+				t.Fatalf("bug reservation charged more than five slots: %v", err)
+			}
+			if !tc.admit && (err == nil || !strings.Contains(err.Error(), "host session or polling budget exhausted")) {
+				t.Fatalf("feature reservation charged fewer than six slots: %v", err)
+			}
+		})
+	}
+}
+
 func TestParallelPolicyExpiryStopsFrozenMemberAttempt(t *testing.T) {
 	s, task, items, orders := queueFixture(t)
 	ctx := context.Background()

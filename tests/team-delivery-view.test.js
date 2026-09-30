@@ -23,3 +23,17 @@ test("the receipt's push and tasks-hub revert are shown", () => {
   assert.match(summary({ state: "released", receipt: { commit, outcome: "released", targets: [], push: { remote: "origin", commit, outcome: "pushed" } } }), /→ merged → released · released .* · push pushed/);
   assert.match(summary({ state: "rolled_back", published: true, receipt: { commit, outcome: "rolled_back", targets: [], revert: { commit: "f".repeat(40), outcome: "committed" } } }), /tasks-hub revert committed f{40}/);
 });
+
+// wi_ade4aa60c5d9b55e: the Delivery panel shows whether a team has a plan review.
+test("the frozen launch shows a plan review team or a plan-only team", () => {
+  const member = (name, role) => ({ fields: { name, role } });
+  const row = (entry) => renderTeamDelivery({ entries: [{ itemId: "wi_fixture", ...entry }] });
+  const feature = row({ state: "running", launch: { members: [member("lead-1", "Delivery lead and orchestrator"), member("plan-reviewer-1", "Plan review"), member("builder-1", "Implementation")] } });
+  assert.match(feature, /running · Plan review team/);
+  assert.ok(!feature.includes("Plan-only team"));
+  const bug = row({ state: "running", launch: { members: [member("lead-1", "Delivery lead and orchestrator"), member("builder-1", "Implementation")] } });
+  assert.match(bug, /running · Plan-only team/);
+  assert.ok(!bug.includes("Plan review team"));
+  const queued = row({ state: "queued" });
+  assert.ok(!queued.includes("Plan review team") && !queued.includes("Plan-only team"));
+});

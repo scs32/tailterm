@@ -67,8 +67,18 @@ func checkTeamHostAdmission(ctx context.Context, tx *sql.Tx, host string, now ti
 	return nil
 }
 
+// Planned delivery team sizes: features get a plan reviewer; bugs get a plan
+// only (wi_ade4aa60c5d9b55e). The database seat is never launched.
+const (
+	featureTeamSlots = 6
+	bugTeamSlots     = 5
+)
+
 // Capacity is owner supplied and expires. Conservative reservations include
-// uncertain launches and every non-cleaned exact agent run on the host.
+// uncertain launches and every non-cleaned exact agent run on the host. A
+// reservation without a frozen plan charges its item's team size (a feature
+// when the kind is unknown); the next admission has no item yet, so it charges
+// the larger feature team.
 func checkTeamHostCapacity(ctx context.Context, tx *sql.Tx, host string, now time.Time, additionalReservations int) error {
 	policy, err := readTeamHostPolicy(ctx, tx, host)
 	if err != nil {
@@ -96,18 +106,22 @@ func checkTeamHostCapacity(ctx context.Context, tx *sql.Tx, host string, now tim
 	if err := tx.QueryRowContext(ctx, `SELECT count(*) FROM agents WHERE host=? AND (status<>'closed' OR cleanup_done=0)`, host).Scan(&agents); err != nil {
 		return err
 	}
-	rows, err := tx.QueryContext(ctx, `SELECT COALESCE(q.launch_json,'') FROM team_launch_reservations r LEFT JOIN team_queue_entries q ON q.id=r.entry_id WHERE r.state IN ('reserved','launching') AND ((r.entry_id='' AND (r.host=? OR r.host='')) OR (r.entry_id<>'' AND q.host=?))`, host, host)
+	rows, err := tx.QueryContext(ctx, `SELECT COALESCE(q.launch_json,''),COALESCE(w.kind,'') FROM team_launch_reservations r LEFT JOIN team_queue_entries q ON q.id=r.entry_id LEFT JOIN work_items w ON w.id=r.item_id WHERE r.state IN ('reserved','launching') AND ((r.entry_id='' AND (r.host=? OR r.host='')) OR (r.entry_id<>'' AND q.host=?))`, host, host)
 	if err != nil {
 		return err
 	}
 	for rows.Next() {
-		var frozen string
-		if err := rows.Scan(&frozen); err != nil {
+		var frozen, kind string
+		if err := rows.Scan(&frozen, &kind); err != nil {
 			rows.Close()
 			return err
 		}
 		if frozen == "" {
-			pendingSlots += 5
+			if kind == "bug" {
+				pendingSlots += bugTeamSlots
+			} else {
+				pendingSlots += featureTeamSlots
+			}
 			continue
 		}
 		var plan struct {
@@ -135,8 +149,8 @@ func checkTeamHostCapacity(ctx context.Context, tx *sql.Tx, host string, now tim
 		UNION SELECT task_id FROM team_queue_entries WHERE host=? AND state IN ('queued','launching','running'))`, host, host).Scan(&polls); err != nil {
 		return err
 	}
-	projectedSessions := agents + pendingSlots + 5*additionalReservations
-	projectedBindings := max(usage.RelayBindings, agents) + pendingSlots + 5*additionalReservations
+	projectedSessions := agents + pendingSlots + featureTeamSlots*additionalReservations
+	projectedBindings := max(usage.RelayBindings, agents) + pendingSlots + featureTeamSlots*additionalReservations
 	// relayOne reads project and agent every three seconds; the broker path
 	// adds up to three reads/writes per ten-second check; message pages and
 	// queue effects add bounded slack. These are admission costs, while the
