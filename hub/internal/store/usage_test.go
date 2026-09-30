@@ -95,6 +95,10 @@ func TestUsageSharedConservationOverheadReceiptsAndClosure(t *testing.T) {
 	if err != nil || len(itemReport.Items) != 1 || itemReport.Summary.Tokens["input"] != "21/2" {
 		t.Fatal(itemReport, err)
 	}
+	// A second handler keeps the handler floor satisfied while this one closes.
+	if _, err = s.AddAgent(ctx, task.ID, api.AddAgentRequest{Name: "shared-spare", AgentID: api.NewID("agt"), Runtime: "codex", Role: api.AgentRoleDatabaseHandler, Host: "fixture", Session: "synthetic-spare"}, api.Caller{Node: "fixture", User: "owner"}); err != nil {
+		t.Fatal(err)
+	}
 	if _, err = s.CloseAgent(ctx, a.ID, api.Caller{Node: "fixture", User: "owner"}); err != nil {
 		t.Fatal(err)
 	}

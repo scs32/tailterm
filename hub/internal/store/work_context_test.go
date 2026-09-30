@@ -1251,6 +1251,10 @@ func TestAllocationIntentRequiredMatchedAndConsumedOnce(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// A second handler keeps the handler floor satisfied while this one retires.
+	if _, err = s.AddAgent(ctx, task.ID, api.AddAgentRequest{AgentID: api.NewID("agt"), Name: "retired-handler-spare", Host: "fixture", Session: "retired-handler-spare", Runtime: "codex", Role: api.AgentRoleDatabaseHandler}, by); err != nil {
+		t.Fatal(err)
+	}
 	retiredStatus := api.AgentRetired
 	if _, err = s.UpdateAgent(ctx, retiredLead.ID, api.UpdateAgentRequest{Status: &retiredStatus}, by); err != nil {
 		t.Fatal(err)

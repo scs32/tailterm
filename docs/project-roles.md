@@ -31,6 +31,11 @@ roles (September 29), and the backlog steward (`wi_5b4b94dbc9a11e8b`, order
   primary takes unallocated intake and project-level records; a lane handler
   works only on the item leased to its exact run. See
   [Handler allocation](handler-allocation.md).
+- **Handler floor.** While the project is open and active, the hub keeps at
+  least one database handler available. It refuses to retire or close the
+  recorded primary or the last available handler without a ready successor, and
+  alerts the owner once if an exit leaves none. See
+  [Handler floor](handler-rotation.md#handler-floor).
 - **Deployment agent.** Consumes release jobs the handler's saved acceptance
   enqueues. It does not accept items or change records. See
   [Project deployment](project-deployment.md).

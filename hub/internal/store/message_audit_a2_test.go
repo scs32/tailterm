@@ -417,6 +417,10 @@ func TestMessageAuditA2ExplicitAndDispatchForeignAuthority(t *testing.T) {
 	}
 	base := api.CreateMessageAuditAssociationRequest{RequestID: "foreign-explicit", Item: api.MessageAuditItemReference{ItemTaskID: sourceTask.ID, ItemID: foreign.ID, ItemRevision: foreign.Revision},
 		Source: api.MessageReference{TaskID: destination.ID, Seq: handlerSource.Seq}, Reason: "The handler verified this shared-workspace relationship.", AgentID: handler.ID, RunID: handler.RunID}
+	// A second handler keeps the handler floor satisfied while this one retires and closes.
+	if _, err = s.AddAgent(ctx, destination.ID, api.AddAgentRequest{AgentID: api.NewID("agt"), Name: "db-handler-a2-spare", Host: "host", Session: "db-handler-a2-spare", Runtime: "codex", Role: api.AgentRoleDatabaseHandler}, by); err != nil {
+		t.Fatal(err)
+	}
 	retiredStatus := api.AgentRetired
 	if _, err := s.UpdateAgent(ctx, handler.ID, api.UpdateAgentRequest{Status: &retiredStatus}, by); err != nil {
 		t.Fatal(err)

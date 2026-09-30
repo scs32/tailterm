@@ -28,6 +28,39 @@ to it, even when an auxiliary handler is newer. A successor of a prepared
 rotation never holds the role and never counts as the legacy primary. Item-leased
 role resolution is unchanged.
 
+## Handler floor
+
+While a project is open and active, the hub keeps at least one database handler
+available (`wi_96295d2375d72618`). An available handler is one whose status is
+not closed, exited or retired; a handler that is still starting counts. The
+check runs in the store for every retire or close, whether it comes from
+`tt retire` (`PATCH .../agents/{aid}`), `tt close` (`DELETE .../agents/{aid}`) or a
+`closed` event. It refuses two changes with HTTP 409:
+
+- Retiring or closing the recorded primary:
+  `<name> is the project's primary database handler; rotate it with tt handler rotate before retiring or closing it`.
+  This holds even when the primary is already retired.
+- Retiring or closing the last available handler:
+  `<name> is the project's last available database handler; start or resume another handler first`.
+
+A ready successor lifts both refusals: a prepared rotation away from that
+handler, or a committed rotation chain that ends at an open handler.
+
+Closing a retired handler that is not the primary is always allowed, since it is
+no longer available. The hub does not check its leases or obligations; rotation
+and the queue own those.
+
+An `exited` report is never refused. When it (or a retire or close with a ready
+successor) takes the available count to zero, the hub posts one board-wide owner
+NOTICE, `Owner attention: the project has no available database handler`, with
+refs `escalation=owner` and `cause=no-database-handler`. The text names the
+project and the handler that left. Changes to handlers that are already
+unavailable add no notice, so each drop to zero posts exactly one.
+
+Exempt, because the owner or a rotation deliberately ends the handler: project
+pause, closing the project (`CloseTask`), a rotation commit or abort, and
+`tt close --team`, which never closes handlers.
+
 ## Commands (owner only)
 
 These commands refuse to run inside an agent session. The hub also refuses any
@@ -228,3 +261,12 @@ directory are inert without the new CLI.
   resume of retired handlers are out of scope.
 - The owner notice for a missing spec is posted board-wide. The hub has no
   directed owner NOTICE.
+- The handler floor learns of a crash only from an `exited` report. A handler
+  that dies without one still counts as available, and no notice is posted.
+- The hub does not reprovision a handler when the count reaches zero; that is
+  follow-up `wi_42be87739d7bbfc9`.
+- `tt close` still refuses every database handler on the client side, including
+  a retired non-primary one the hub would accept, until follow-up
+  `wi_67fb6b7716a5c1b4`.
+- Team launch cleanup cannot close a failed launch that is the project's only
+  handler; the handler stays starting and the owner sees it.

@@ -416,7 +416,7 @@ func (s *Store) CloseTask(ctx context.Context, id string, by api.Caller) (api.Ta
 	}
 	for _, a := range agents {
 		if a.Status != api.AgentClosed {
-			if _, err := s.setAgentStatus(ctx, a.ID, api.AgentClosed, by, true); err != nil {
+			if _, err := s.writeAgentStatus(ctx, a.ID, api.AgentClosed, by, true); err != nil {
 				return t, err
 			}
 		}
@@ -1064,7 +1064,34 @@ func (s *Store) CloseAgent(ctx context.Context, id string, by api.Caller) (api.A
 	return s.setAgentStatus(ctx, id, api.AgentClosed, by, true)
 }
 
+// setAgentStatus applies the handler floor (handler_floor.go) and then writes
+// the status. The caller holds s.writeMu.
 func (s *Store) setAgentStatus(ctx context.Context, id, status string, by api.Caller, emit bool) (api.Agent, error) {
+	a, err := s.GetAgent(ctx, id)
+	if err != nil {
+		return a, err
+	}
+	if a.Role == api.AgentRoleDatabaseHandler {
+		task, err := s.GetTask(ctx, a.TaskID)
+		if err != nil {
+			return a, err
+		}
+		crossesZero, err := handlerFloorCheck(ctx, s.db, task, a, status)
+		if err != nil {
+			return a, err
+		}
+		if crossesZero {
+			if err = s.escalateNoHandler(ctx, task, a, status); err != nil {
+				return a, err
+			}
+		}
+	}
+	return s.writeAgentStatus(ctx, id, status, by, emit)
+}
+
+// writeAgentStatus writes the status without the handler floor; only
+// CloseTask, which closes the whole project, calls it directly.
+func (s *Store) writeAgentStatus(ctx context.Context, id, status string, by api.Caller, emit bool) (api.Agent, error) {
 	a, err := s.GetAgent(ctx, id)
 	if err != nil {
 		return a, err

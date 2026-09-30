@@ -328,6 +328,9 @@ func TestMessageAuditAcceptanceReplaySurvivesEditRetirementClosureAndReopen(t *t
 	registration := api.AddAgentRequest{AgentID: api.NewID("agt"), Name: "synthetic-handler", Host: "fixture", Session: "fixture-only", Runtime: "codex", Role: api.AgentRoleDatabaseHandler}
 	var target api.Agent
 	auditMust(c, 201, "POST", "/v1/tasks/"+task.ID+"/agents", registration, &target)
+	// A second handler keeps the handler floor satisfied while this one retires and closes.
+	spare := api.AddAgentRequest{AgentID: api.NewID("agt"), Name: "synthetic-handler-spare", Host: "fixture", Session: "fixture-only-spare", Runtime: "codex", Role: api.AgentRoleDatabaseHandler}
+	auditMust(c, 201, "POST", "/v1/tasks/"+task.ID+"/agents", spare, nil)
 	auditRetire(c, task, target)
 	req := auditLinked(item, "durable-replay")
 	req.To = target.ID
