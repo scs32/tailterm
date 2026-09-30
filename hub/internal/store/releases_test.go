@@ -528,3 +528,163 @@ func verifiedAcceptance(t *testing.T, planRepository string) {
 		t.Fatal("verified base not persisted", reread.BaseCommit, err)
 	}
 }
+
+// f7: publication survives a later block so Delivery keeps showing merged.
+func TestReleasePublishedMarkerSurvivesBlock(t *testing.T) {
+	s, task, h, d, entry := releaseFixture(t)
+	ctx := context.Background()
+	j, err := s.ReleaseAction(ctx, task.ID, api.ReleaseRequest{RequestID: "enqueue", Operation: "enqueue", AgentID: h.ID, RunID: h.RunID, EntryID: entry})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, op := range []string{"claim", "merged", "block"} {
+		req := api.ReleaseRequest{RequestID: op, Operation: op, AgentID: d.ID, RunID: d.RunID, JobID: j.ID, ExpectedGeneration: j.Generation, IntegratedCommit: j.Commit}
+		if j, err = s.ReleaseAction(ctx, task.ID, req); err != nil {
+			t.Fatal(op, err)
+		}
+		if j.Published != (op != "claim") {
+			t.Fatalf("%s published=%v", op, j.Published)
+		}
+	}
+	if j.State != "blocked" {
+		t.Fatal(j.State)
+	}
+}
+
+// D1/D2: finish accepts a well-formed revert or push and rejects malformed ones.
+func TestReleaseReceiptRevertAndPushValidation(t *testing.T) {
+	sha := strings.Repeat("c", 40)
+	receipt := func(outcome string) *api.ReleaseReceipt {
+		return &api.ReleaseReceipt{Version: 1, Commit: candidateB, Outcome: outcome}
+	}
+	cases := []struct {
+		name string
+		r    *api.ReleaseReceipt
+		ok   bool
+	}{
+		{"revert committed", func() *api.ReleaseReceipt {
+			r := receipt("rolled_back")
+			r.Revert = &api.ReleaseRevert{Commit: sha, Outcome: "committed", BugRequestID: "rel_x-rollback-bug"}
+			return r
+		}(), true},
+		{"revert failed", func() *api.ReleaseReceipt {
+			r := receipt("blocked")
+			r.Revert = &api.ReleaseRevert{Outcome: "failed"}
+			return r
+		}(), true},
+		{"revert on release", func() *api.ReleaseReceipt {
+			r := receipt("released")
+			r.Revert = &api.ReleaseRevert{Commit: sha, Outcome: "committed"}
+			return r
+		}(), false},
+		{"revert committed without commit", func() *api.ReleaseReceipt {
+			r := receipt("blocked")
+			r.Revert = &api.ReleaseRevert{Outcome: "committed"}
+			return r
+		}(), false},
+		{"revert newline", func() *api.ReleaseReceipt {
+			r := receipt("blocked")
+			r.Revert = &api.ReleaseRevert{Commit: sha, Outcome: "committed", BugRequestID: "a\nb"}
+			return r
+		}(), false},
+		{"push pushed", func() *api.ReleaseReceipt {
+			r := receipt("released")
+			r.Push = &api.ReleasePush{Remote: "origin", Commit: candidateB, Outcome: "pushed"}
+			return r
+		}(), true},
+		{"push failed", func() *api.ReleaseReceipt {
+			r := receipt("released")
+			r.Push = &api.ReleasePush{Remote: "origin", Commit: candidateB, Outcome: "failed"}
+			return r
+		}(), true},
+		{"push after rollback", func() *api.ReleaseReceipt {
+			r := receipt("rolled_back")
+			r.Push = &api.ReleasePush{Remote: "origin", Commit: candidateB, Outcome: "pushed"}
+			return r
+		}(), false},
+		{"push other commit", func() *api.ReleaseReceipt {
+			r := receipt("released")
+			r.Push = &api.ReleasePush{Remote: "origin", Commit: sha, Outcome: "pushed"}
+			return r
+		}(), false},
+		{"push remote url", func() *api.ReleaseReceipt {
+			r := receipt("released")
+			r.Push = &api.ReleasePush{Remote: "https://token@example/x", Commit: candidateB, Outcome: "pushed"}
+			return r
+		}(), false},
+	}
+	for _, c := range cases {
+		if err := validateReleaseRefEffects(c.r); (err == nil) != c.ok {
+			t.Fatalf("%s: %v", c.name, err)
+		}
+	}
+	// Round trip through finish: the runner's rollback receipt shape is saved.
+	s, task, h, d, entry := releaseFixture(t)
+	ctx := context.Background()
+	j, err := s.ReleaseAction(ctx, task.ID, api.ReleaseRequest{RequestID: "enqueue", Operation: "enqueue", AgentID: h.ID, RunID: h.RunID, EntryID: entry})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, op := range []string{"claim", "merged"} {
+		if j, err = s.ReleaseAction(ctx, task.ID, api.ReleaseRequest{RequestID: op, Operation: op, AgentID: d.ID, RunID: d.RunID, JobID: j.ID, ExpectedGeneration: j.Generation, IntegratedCommit: j.Commit}); err != nil {
+			t.Fatal(op, err)
+		}
+	}
+	bad := &api.ReleaseReceipt{Version: 1, JobID: j.ID, Commit: j.Commit, VerificationDigest: j.VerificationDigest, Outcome: "rolled_back", Targets: []api.ReleaseTargetReceipt{}, Revert: &api.ReleaseRevert{Outcome: "committed"}}
+	if _, err = s.ReleaseAction(ctx, task.ID, api.ReleaseRequest{RequestID: "finish-bad", Operation: "finish", AgentID: d.ID, RunID: d.RunID, JobID: j.ID, ExpectedGeneration: j.Generation, Receipt: bad}); !errors.Is(err, api.ErrInvalid) {
+		t.Fatal("malformed revert", err)
+	}
+	good := *bad
+	good.Revert = &api.ReleaseRevert{Commit: sha, Outcome: "committed", BugRequestID: j.ID + "-rollback-bug"}
+	final, err := s.ReleaseAction(ctx, task.ID, api.ReleaseRequest{RequestID: "finish", Operation: "finish", AgentID: d.ID, RunID: d.RunID, JobID: j.ID, ExpectedGeneration: j.Generation, Receipt: &good})
+	if err != nil || final.State != "rolled_back" || final.Receipt.Revert.Commit != sha {
+		t.Fatal(final, err)
+	}
+}
+
+// Q2: only the handler supersedes, only a verified never-claimed job, and a
+// superseded job is terminal: never claimed and outside the project fence.
+func TestReleaseSupersedeIsHandlerOnlyForUnclaimedJobs(t *testing.T) {
+	s, task, h, d, entry := releaseFixture(t)
+	ctx := context.Background()
+	j, err := s.ReleaseAction(ctx, task.ID, api.ReleaseRequest{RequestID: "enqueue", Operation: "enqueue", AgentID: h.ID, RunID: h.RunID, EntryID: entry})
+	if err != nil {
+		t.Fatal(err)
+	}
+	record := &api.ReleaseSupersession{ReleasedCommit: candidateB, Release: "20260929-owner-helper-c6a8ec1"}
+	req := func(key string, a api.Agent, gen int64, sup *api.ReleaseSupersession) api.ReleaseRequest {
+		return api.ReleaseRequest{RequestID: key, Operation: "supersede", AgentID: a.ID, RunID: a.RunID, JobID: j.ID, ExpectedGeneration: gen, Supersession: sup}
+	}
+	if _, err = s.ReleaseAction(ctx, task.ID, req("by-deployer", d, j.Generation, record)); !errors.Is(err, api.ErrConflict) {
+		t.Fatal("deployer superseded", err)
+	}
+	if _, err = s.ReleaseAction(ctx, task.ID, req("no-record", h, j.Generation, &api.ReleaseSupersession{ReleasedCommit: "abc", Release: "x"})); !errors.Is(err, api.ErrInvalid) {
+		t.Fatal("malformed supersession", err)
+	}
+	done, err := s.ReleaseAction(ctx, task.ID, req("supersede", h, j.Generation, record))
+	if err != nil || done.State != "superseded" || done.Supersession.ReleasedCommit != candidateB || done.Supersession.Release != record.Release || done.Supersession.AgentID != h.ID {
+		t.Fatal(done, err)
+	}
+	if again, err := s.ReleaseAction(ctx, task.ID, req("supersede", h, j.Generation, record)); err != nil || again.Generation != done.Generation {
+		t.Fatal("retry", err)
+	}
+	if _, err = s.ReleaseAction(ctx, task.ID, api.ReleaseRequest{RequestID: "claim", Operation: "claim", AgentID: d.ID, RunID: d.RunID, JobID: j.ID, ExpectedGeneration: done.Generation}); !errors.Is(err, api.ErrConflict) {
+		t.Fatal("superseded job claimed", err)
+	}
+	var fenced int
+	if err = s.db.QueryRow(`SELECT COUNT(*) FROM release_jobs WHERE task_id=? AND state IN ('claimed','merged','blocked')`, task.ID).Scan(&fenced); err != nil || fenced != 0 {
+		t.Fatal("fence", fenced, err)
+	}
+	// A claimed job is never superseded.
+	s2, task2, h2, d2, entry2 := releaseFixture(t)
+	k, err := s2.ReleaseAction(ctx, task2.ID, api.ReleaseRequest{RequestID: "enqueue", Operation: "enqueue", AgentID: h2.ID, RunID: h2.RunID, EntryID: entry2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if k, err = s2.ReleaseAction(ctx, task2.ID, api.ReleaseRequest{RequestID: "claim", Operation: "claim", AgentID: d2.ID, RunID: d2.RunID, JobID: k.ID, ExpectedGeneration: k.Generation}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = s2.ReleaseAction(ctx, task2.ID, api.ReleaseRequest{RequestID: "supersede", Operation: "supersede", AgentID: h2.ID, RunID: h2.RunID, JobID: k.ID, ExpectedGeneration: k.Generation, Supersession: record}); !errors.Is(err, api.ErrConflict) {
+		t.Fatal("claimed job superseded", err)
+	}
+}

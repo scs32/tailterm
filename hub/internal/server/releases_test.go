@@ -18,3 +18,13 @@ func TestReleaseHTTPHandlerBoundaryAndEmptyRead(t *testing.T) {
 		t.Fatal("nonhandler enqueue", code)
 	}
 }
+
+// f5: the read-only handler operation refuses anyone but the exact deployer.
+func TestReleaseHTTPHandlerResolutionRequiresDeployer(t *testing.T) {
+	c := newClient(t)
+	task := c.task("release-handler-http")
+	req := api.ReleaseRequest{Operation: "handler", AgentID: api.NewID("agt"), RunID: api.NewID("run")}
+	if code := c.do("POST", "/v1/tasks/"+task.ID+"/releases/actions", req, nil); code != 409 {
+		t.Fatal("nondeployer handler resolution", code)
+	}
+}

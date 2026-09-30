@@ -5,6 +5,8 @@ Usage:
   scripts/deploy-truenas-hub.py RELEASE --plan PLAN.json \
       --preflight-receipt RECEIPT.json \
       --preflight-receipt-sha256 SHA256 [--update]
+  scripts/deploy-truenas-hub.py --rollback-to RELEASE --target hub|bridge \
+      --expect-sha256 SHA256
 
 This lead-side command never opens, queries, or backs up SQLite. The database
 handler runs ``truenas_release_preflight.py`` first and supplies its immutable
@@ -337,7 +339,75 @@ def hub_compose(deployment: dict[str, Any], binary_destination: str) -> dict[str
         }
     }
 
+ROLLBACK_MOUNTS = {
+    "hub": ("hub", "/opt/tailterm-hub", "tailterm-hub"),
+    "bridge": ("discord-bridge", "/opt/tailterm-discord", "tailterm-discord"),
+}
+
+
+def rollback(argv: list[str]) -> int:
+    """Point one target back at a retained release binary.
+
+    The retained binary's hash is verified over the established SSH route,
+    then only that target's executable mount changes in the live app
+    definition; the other target's mount and everything else are kept. No
+    backup, token, SQLite or Tailscale change: live database writes remain.
+    Remote output is never echoed.
+    """
+    parser = argparse.ArgumentParser(description=rollback.__doc__)
+    parser.add_argument("--rollback-to", required=True)
+    parser.add_argument("--target", required=True, choices=sorted(ROLLBACK_MOUNTS))
+    parser.add_argument("--expect-sha256", required=True)
+    arguments = parser.parse_args(argv)
+    release, target = arguments.rollback_to, arguments.target
+    if not re.fullmatch(r"[A-Za-z0-9._-]+", release) or not re.fullmatch(r"[0-9a-f]{64}", arguments.expect_sha256):
+        _emit(PreflightFailure("invalid-input", "invalid release name or expected hash", phase="rollback").result())
+        return 2
+    service, mount, binary = ROLLBACK_MOUNTS[target]
+    retained = f"{BASE}/releases/{release}/{binary}"
+    ssh = ["ssh", "-o", "BatchMode=yes", "-o", f"ConnectTimeout={SSH_ROUTE['connectTimeoutSeconds']}", SSH_ROUTE["host"]]
+    stage, mutation = "retained-binary", False
+
+    def remote(command: str) -> bytes:
+        try:
+            completed = subprocess.run(ssh + [command], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, check=False)
+        except OSError as error:
+            raise PreflightFailure("route-unavailable", "could not start the declared SSH route", phase="rollback", stage=stage, mutationStarted=mutation) from error
+        if completed.returncode != 0:
+            classification = "route-unavailable" if completed.returncode == 255 else "remote-operation-failed"
+            raise PreflightFailure(classification, "remote rollback step failed", phase="rollback", stage=stage, remoteExitCode=completed.returncode, mutationStarted=mutation)
+        return completed.stdout
+
+    try:
+        digest = remote(f"sha256sum {shlex.quote(retained)}").split(b" ", 1)[0].decode("ascii", "replace")
+        if digest != arguments.expect_sha256:
+            raise PreflightFailure("verification-failed", "retained binary does not match the expected hash", phase="rollback", stage=stage, mutationStarted=False)
+        stage = "app-config"
+        compose = json.loads(remote(f"midclt call app.config {APP_NAME}"))
+        volumes = compose.get("services", {}).get(service, {}).get("volumes")
+        live = [i for i, v in enumerate(volumes or []) if isinstance(v, str) and v.split(":")[1:2] == [mount]]
+        pattern = re.escape(BASE) + r"/releases/[A-Za-z0-9._-]+/" + binary + ":" + re.escape(mount) + ":ro"
+        if len(live) != 1 or not re.fullmatch(pattern, volumes[live[0]]):
+            raise PreflightFailure("verification-failed", "live app definition has no single retained release mount", phase="rollback", stage=stage, mutationStarted=False)
+        volumes[live[0]] = f"{retained}:{mount}:ro"
+        stage, mutation = "middleware-update", True
+        remote(f"midclt call -j app.update {APP_NAME} " + shlex.quote(json.dumps({"custom_compose_config": compose})))
+        stage = "middleware-start"
+        remote(f"midclt call -j app.start {APP_NAME}")
+    except (PreflightFailure, ValueError, AttributeError, TypeError) as error:
+        if not isinstance(error, PreflightFailure):
+            error = PreflightFailure("verification-failed", "live app definition is not readable", phase="rollback", stage=stage, mutationStarted=mutation)
+        _emit(error.result())
+        return 2
+    _emit({"version": 1, "status": "rolled-back", "phase": "complete", "target": target, "release": release,
+           "binaryDestination": retained, "sha256": arguments.expect_sha256, "appName": APP_NAME, "databaseTouched": False})
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
+    argv = sys.argv[1:] if argv is None else argv
+    if any(a == "--rollback-to" or a.startswith("--rollback-to=") for a in argv):
+        return rollback(argv)
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("release")
     parser.add_argument("--plan", required=True, type=pathlib.Path)

@@ -17,7 +17,7 @@ func deploymentBriefing() string {
 }
 func cmdDeployment(e env, args []string) error {
 	if len(args) == 0 {
-		return errors.New("usage: tt deployment setup|list|enqueue|claim|check|verification|merged|finish|block|inputs|reconcile|refuse")
+		return errors.New("usage: tt deployment setup|list|handler|enqueue|claim|check|verification|merged|finish|block|inputs|reconcile|refuse|supersede")
 	}
 	if args[0] == "serve" {
 		if len(args) != 3 || args[1] != "--config" {
@@ -44,6 +44,9 @@ func cmdDeployment(e env, args []string) error {
 	commit := fs.String("commit", "", "exact integrated commit")
 	planFile := fs.String("plan-file", "", "integrated matrix plan JSON (handler import)")
 	file := fs.String("file", "", "receipt JSON file")
+	released := fs.String("released-commit", "", "tasks-hub commit that carried a hand release (supersede)")
+	releaseName := fs.String("release", "", "hand release record, such as its release name (supersede)")
+	repo := fs.String("repo", ".", "repository whose tasks-hub must contain the hand release (supersede)")
 	if err := fs.Parse(args[1:]); err != nil {
 		return err
 	}
@@ -60,10 +63,28 @@ func cmdDeployment(e env, args []string) error {
 		}
 		return err
 	}
+	if args[0] == "handler" {
+		// The deployer addresses its handler requests to this exact agent.
+		out, err := c.ReleaseHandler(ctx, e.task, e.agent, e.runID)
+		if err == nil {
+			printJSON(map[string]string{"id": out.ID, "name": out.Name})
+		}
+		return err
+	}
 	if *key == "" || e.agent == "" || e.runID == "" {
 		return errors.New("exact agent/run and request-id required")
 	}
 	req := api.ReleaseRequest{RequestID: *key, Operation: args[0], AgentID: e.agent, RunID: e.runID, EntryID: *entry, JobID: *job, ExpectedGeneration: *generation, IntegratedCommit: *commit}
+	if args[0] == "supersede" {
+		jobs, err := c.Releases(ctx, e.task)
+		if err != nil {
+			return err
+		}
+		if err = supersedeAncestry(*repo, jobs, *job, *released); err != nil {
+			return err
+		}
+		req.Supersession = &api.ReleaseSupersession{ReleasedCommit: *released, Release: *releaseName}
+	}
 	if args[0] == "finish" || args[0] == "verification" || args[0] == "inputs" || args[0] == "reconcile" {
 		b, err := os.ReadFile(*file)
 		if err != nil {
@@ -112,4 +133,21 @@ func cmdDeployment(e env, args []string) error {
 		printJSON(out)
 	}
 	return err
+}
+
+// supersedeAncestry proves the job's accepted commit shipped by hand: it is
+// an ancestor of the released commit, which is on the current local tasks-hub.
+func supersedeAncestry(repo string, jobs []api.ReleaseJob, id, released string) error {
+	for _, j := range jobs {
+		if j.ID != id {
+			continue
+		}
+		for _, pair := range [][2]string{{j.Commit, released}, {released, "refs/heads/tasks-hub"}} {
+			if err := exec.Command("git", "-C", repo, "merge-base", "--is-ancestor", pair[0], pair[1]).Run(); err != nil {
+				return fmt.Errorf("supersede needs %s to be an ancestor of %s in %s", pair[0], pair[1], repo)
+			}
+		}
+		return nil
+	}
+	return errors.New("release job not found")
 }

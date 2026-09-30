@@ -33,6 +33,18 @@ type ReleaseJob struct {
 	InputsDigest           string                  `json:"inputsDigest,omitempty"`
 	Reconciliations        []ReleaseReconciliation `json:"reconciliations,omitempty"`
 	Receipt                *ReleaseReceipt         `json:"receipt,omitempty"`
+	// Published survives a later block: tasks-hub already carries the release.
+	Published    bool                 `json:"published,omitempty"`
+	Supersession *ReleaseSupersession `json:"supersession,omitempty"`
+}
+
+// ReleaseSupersession closes a verified, never-claimed job whose change the
+// owner session already released by hand, so the deployer never replays it.
+type ReleaseSupersession struct {
+	ReleasedCommit string `json:"releasedCommit"`
+	Release        string `json:"release"`
+	AgentID        string `json:"agentId"`
+	RunID          string `json:"runId"`
 }
 
 // Only nonsecret identities and hashes belong in receipts; arbitrary output
@@ -57,6 +69,23 @@ type ReleaseReceipt struct {
 	Targets            []ReleaseTargetReceipt `json:"targets"`
 	Outcome            string                 `json:"outcome"`
 	EscalationSeq      int64                  `json:"escalationSeq,omitempty"`
+	Revert             *ReleaseRevert         `json:"revert,omitempty"`
+	Push               *ReleasePush           `json:"push,omitempty"`
+}
+
+// ReleaseRevert records the compare-and-swap revert of a rolled-back release
+// on tasks-hub and the handler request filing its bug.
+type ReleaseRevert struct {
+	Commit       string `json:"commit,omitempty"`
+	Outcome      string `json:"outcome"`
+	BugRequestID string `json:"bugRequestId,omitempty"`
+}
+
+// ReleasePush records the fast-forward push of a live-verified release.
+type ReleasePush struct {
+	Remote  string `json:"remote"`
+	Commit  string `json:"commit"`
+	Outcome string `json:"outcome"`
 }
 
 // Recovery is a handler inspection record, never a timeout-based takeover.
@@ -104,11 +133,19 @@ type ReleaseRequest struct {
 	Plan               *VerificationPlan      `json:"plan,omitempty"`
 	Verification       *VerificationReceipt   `json:"verification,omitempty"`
 	Receipt            *ReleaseReceipt        `json:"receipt,omitempty"`
+	Supersession       *ReleaseSupersession   `json:"supersession,omitempty"`
 }
 
 func (c *Client) ReleaseAction(ctx context.Context, task string, req ReleaseRequest) (ReleaseJob, error) {
 	var out ReleaseJob
 	err := c.do(ctx, "POST", "/v1/tasks/"+url.PathEscape(task)+"/releases/actions", req, &out)
+	return out, err
+}
+
+// ReleaseHandler resolves the project database handler for the exact deployer run.
+func (c *Client) ReleaseHandler(ctx context.Context, task, agent, run string) (Agent, error) {
+	var out Agent
+	err := c.do(ctx, "POST", "/v1/tasks/"+url.PathEscape(task)+"/releases/actions", ReleaseRequest{Operation: "handler", AgentID: agent, RunID: run}, &out)
 	return out, err
 }
 func (c *Client) Releases(ctx context.Context, task string) ([]ReleaseJob, error) {

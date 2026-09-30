@@ -20,6 +20,16 @@ func ackGate(ctx context.Context, q queryRower, agentID, runID string, replyTo i
 	if agentID == "" {
 		return nil // people and the hub are never gated
 	}
+	// The deployment daemon cannot acknowledge messages, and its release
+	// actions are fenced by exact run and job generation instead, so a
+	// directed request must not stall its fence checks or escalations.
+	var role string
+	if err := q.QueryRowContext(ctx, `SELECT role FROM agents WHERE id=?`, agentID).Scan(&role); err != nil && err != sql.ErrNoRows {
+		return err
+	}
+	if role == api.AgentRoleDeployment {
+		return nil
+	}
 	rows, err := q.QueryContext(ctx, `SELECT o.message_seq,o.subject,COALESCE(a.name,''),m.from_node,m.from_user FROM obligations o
 JOIN messages m ON m.seq=o.message_seq LEFT JOIN agents a ON a.id=m.from_agent
 WHERE o.agent_id=? AND o.state IN (?,?) AND o.needs IN (?,?) AND o.created_at<=? ORDER BY o.message_seq`,

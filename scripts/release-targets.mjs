@@ -26,3 +26,19 @@ export function selectReleaseTargets(cwd, baselines, commit) {
     return targetsForPaths(diffPaths(cwd, baselines[t], commit)).includes(t);
   });
 }
+// The last successful commit per target: the configured baselines overlaid
+// with every released receipt, so the deployer and the handler's input
+// builder select the same targets for a job.
+export function releaseBaselines(baselines, jobs) {
+  const out = { ...baselines };
+  for (const job of jobs) {
+    if (job.receipt?.outcome !== "released") continue;
+    for (const t of job.receipt.targets) if (t.outcome === "released") out[t.target] = job.receipt.commit;
+  }
+  return out;
+}
+// Conservative: any non-test store source change since the live hub needs a
+// backup-copy migration rehearsal.
+export function schemaChanged(cwd, hubBaseline, commit) {
+  return diffPaths(cwd, hubBaseline, commit).some(p => /^hub\/internal\/store\/.*\.go$/.test(p) && !p.endsWith("_test.go"));
+}

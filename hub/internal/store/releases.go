@@ -183,6 +183,20 @@ func (s *Store) ReleaseAction(ctx context.Context, task string, req api.ReleaseR
 			}
 			j.InputsCommit = req.IntegratedCommit
 			j.InputsDigest = req.InputsDigest
+		} else if req.Operation == "supersede" {
+			if err = requireScopeHandler(tx, ctx, task, req.AgentID, req.RunID); err != nil {
+				return zero, err
+			}
+			// Only a job no deployer ever touched: a claimed or reconciled
+			// job has host history that needs reconcile, not supersession.
+			if j.State != "verified" || j.AgentID != "" || j.IntegratedCommit != "" || j.Receipt != nil || len(j.Reconciliations) > 0 {
+				return zero, releaseConflict("only a verified, never-claimed job can be superseded")
+			}
+			if req.Supersession == nil || !validGitCommit(req.Supersession.ReleasedCommit) || req.Supersession.Release == "" || len(req.Supersession.Release) > 512 || strings.ContainsAny(req.Supersession.Release, "\x00\n\r") {
+				return zero, api.ErrInvalid
+			}
+			j.Supersession = &api.ReleaseSupersession{ReleasedCommit: req.Supersession.ReleasedCommit, Release: req.Supersession.Release, AgentID: req.AgentID, RunID: req.RunID}
+			j.State = "superseded"
 		} else if req.Operation == "verification" {
 			if err = requireScopeHandler(tx, ctx, task, req.AgentID, req.RunID); err != nil {
 				return zero, err
@@ -263,6 +277,7 @@ func (s *Store) ReleaseAction(ctx context.Context, task string, req api.ReleaseR
 					return zero, releaseConflict("changed integrated SHA requires handler imported matrix receipt")
 				}
 				j.IntegratedCommit = req.IntegratedCommit
+				j.Published = true
 				j.State = "merged"
 			case "finish":
 				if j.State != "merged" || j.Receipt != nil || req.Receipt == nil {
@@ -293,6 +308,9 @@ func (s *Store) ReleaseAction(ctx context.Context, task string, req api.ReleaseR
 					if t.Backup != "" && !validContextDigest(t.BackupSHA256) {
 						return zero, api.ErrInvalid
 					}
+				}
+				if err = validateReleaseRefEffects(r); err != nil {
+					return zero, err
 				}
 				j.Receipt = r
 				j.State = r.Outcome
@@ -332,6 +350,23 @@ func (s *Store) ReleaseAction(ctx context.Context, task string, req api.ReleaseR
 	}
 	s.notify(task)
 	return j, nil
+}
+
+// validateReleaseRefEffects checks the tasks-hub effects a receipt reports: a
+// revert only after a rollback or block, and a push only for a live release
+// of the receipt's own commit. Neither carries captured output.
+func validateReleaseRefEffects(r *api.ReleaseReceipt) error {
+	if v := r.Revert; v != nil {
+		if r.Outcome == "released" || (v.Outcome != "committed" && v.Outcome != "failed") || (v.Outcome == "committed" && !validGitCommit(v.Commit)) || (v.Commit != "" && !validGitCommit(v.Commit)) || len(v.BugRequestID) > 128 || strings.ContainsAny(v.BugRequestID, "\x00\n\r ") {
+			return api.ErrInvalid
+		}
+	}
+	if p := r.Push; p != nil {
+		if r.Outcome != "released" || p.Commit != r.Commit || (p.Outcome != "pushed" && p.Outcome != "failed") || p.Remote == "" || len(p.Remote) > 128 || strings.ContainsAny(p.Remote, "\x00\n\r /:@") {
+			return api.ErrInvalid
+		}
+	}
+	return nil
 }
 
 // ValidateReleaseDatabase checks a rehearsal copy without returning user data.
