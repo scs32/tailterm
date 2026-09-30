@@ -90,6 +90,15 @@ export function selectChecks(
 ) {
   if (matrix.version !== 1 || (!owned.length && !targeted))
     throw new Error("Versioned matrix and ownership required");
+  // Approved go test flags for go-test and go-race. Only a package timeout
+  // is allowed: hub/internal/store's race suite runs 556-574 s against go
+  // test's default 600 s (owner decision #15114).
+  const goTestFlags = matrix.goTestFlags ?? [];
+  if (
+    !Array.isArray(goTestFlags) ||
+    goTestFlags.some((flag) => !/^-timeout=[1-9][0-9]*m$/.test(flag))
+  )
+    throw new Error("Invalid matrix goTestFlags");
   const paths = [...new Set([...owned, ...changed])].sort(),
     groups = new Set();
   for (const p of paths) {
@@ -141,7 +150,7 @@ export function selectChecks(
     }
   if (groups.has("go")) {
     add("go-vet", ["go", "vet", "./..."], "hub");
-    add("go-test", ["go", "test", "./..."], "hub");
+    add("go-test", ["go", "test", ...goTestFlags, "./..."], "hub");
     const packages = [
       ...new Set(
         paths
@@ -157,7 +166,13 @@ export function selectChecks(
     ].sort();
     add(
       "go-race",
-      ["go", "test", "-race", ...(packages.length ? packages : ["./..."])],
+      [
+        "go",
+        "test",
+        "-race",
+        ...goTestFlags,
+        ...(packages.length ? packages : ["./..."]),
+      ],
       "hub",
     );
   }

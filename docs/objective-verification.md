@@ -194,15 +194,24 @@ block these barriers.
 
 The Go rules come from receipt data. go-race is the longest check: 625 s alone,
 while no other single attempt exceeded 171 s. Its `hub/internal/store` package
-takes 570–573 s against go test's 600 s package timeout. With four browser lanes
-beside it, that package timed out and the retried Go lane set a 23.4 min wall.
-So go-race starts at once and holds two job slots, which leaves three for other
-checks while it runs. That is still enough to finish the roughly 19 minutes of
-browser work inside go-race's window. Non-Go check process groups also run at
-`nice` 10, so the CPU favors the Go lane when it is saturated.
+takes 556–574 s against go test's default 600 s package timeout. With browser
+lanes beside it, that package timed out in both measured parallel runs. Each
+time, the retried Go lane set a wall of more than 21 minutes. So go-race starts
+at once and holds two job slots, which leaves three for other checks while it
+runs. That is still enough to finish the roughly 19 minutes of browser work
+inside go-race's window. Non-Go check process groups also run at `nice` 10
+relative to the runner, so the CPU favors the Go lane when it is saturated.
 
-The serialization rules live in runner code and derive from the plan, so
-`verification/matrix.json` and its approval are unchanged. Attempts stay
+Scheduling alone cannot keep the store package under 600 s beside other work.
+The owner therefore chose (#15114) to put the package timeout in the matrix.
+`"goTestFlags": ["-timeout=14m"]` is inserted into only the `go-test` and
+`go-race` argv, before their packages. Only a `-timeout=Nm` flag is accepted,
+and a matrix without the key keeps the previous argv. 14 minutes stays below
+go-race's approved 15-minute check timeout. This changed the matrix bytes, so
+it needed one new owner approval of the digest.
+
+The serialization rules live in runner code and derive from the plan, so they
+never change `verification/matrix.json` or its approval. Attempts stay
 sequential within a check. Receipts list checks in plan order with the same
 fields, attempts, log names and status semantics as before.
 `overlapViolations(receipt.checks)` in the runner reports any lock, exclusive or

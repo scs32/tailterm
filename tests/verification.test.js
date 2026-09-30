@@ -108,6 +108,7 @@ test("ownership union diff selects all engines, migration and touched race packa
     "go",
     "test",
     "-race",
+    "-timeout=14m",
     "./internal/store",
   ]);
   for (const suite of matrix.browserSuites)
@@ -666,6 +667,7 @@ test("removed Go package is excluded from candidate race targets", () => {
     "go",
     "test",
     "-race",
+    "-timeout=14m",
     "./...",
   ]);
 });
@@ -1494,4 +1496,27 @@ test("non-Go check process groups run at the lower priority and Go checks do not
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+// Owner decision #15114: the approved matrix carries go test's package
+// timeout for go-test and go-race only.
+test("approved goTestFlags reach only go-test and go-race, and only as a timeout", () => {
+  assert.deepEqual(matrix.goTestFlags, ["-timeout=14m"]);
+  const checks = selectChecks(matrix, ["hub/internal/store/migrate.go"], []);
+  const argv = (id) => checks.find((c) => c.id === id).argv;
+  assert.deepEqual(argv("go-test"), ["go", "test", "-timeout=14m", "./..."]);
+  assert.deepEqual(argv("go-race"), ["go", "test", "-race", "-timeout=14m", "./internal/store"]);
+  assert.deepEqual(argv("go-vet"), ["go", "vet", "./..."]);
+  assert(!argv("migration-rehearsal").includes("-timeout=14m"));
+  const { goTestFlags, ...legacy } = matrix;
+  assert.deepEqual(
+    selectChecks(legacy, ["hub/cmd/tt/main.go"], []).find((c) => c.id === "go-test").argv,
+    ["go", "test", "./..."],
+    "a matrix without the key keeps the previous argv",
+  );
+  for (const flags of ["-timeout=14m", ["-run=X"], ["-timeout=0m"], ["-timeout=14m", "-count=1"]])
+    assert.throws(
+      () => selectChecks({ ...matrix, goTestFlags: flags }, ["hub/cmd/tt/main.go"], []),
+      /Invalid matrix goTestFlags/,
+    );
 });

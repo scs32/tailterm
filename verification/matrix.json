@@ -291,6 +291,7 @@
     "00-static-build": 120000,
     "01-static-release-verify": 120000
   },
+  "goTestFlags": ["-timeout=14m"],
   "maxAttempts": 3,
   "knownFailures": []
 }
