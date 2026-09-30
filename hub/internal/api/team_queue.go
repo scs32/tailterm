@@ -268,9 +268,15 @@ type TeamQueueReleaseMember struct {
 	Name    string `json:"name"`
 }
 
+// MaxTeamQueueListResponse bounds a team queue listing. The queue keeps every
+// entry with its launch context, so a busy project's list outgrows the
+// client's default 4 MiB response cap; a truncated body then fails to parse and
+// stalls both tt team queue list and the queue runner.
+const MaxTeamQueueListResponse = 64 << 20
+
 func (c *Client) ListTeamQueue(ctx context.Context, task string) (TeamQueueList, error) {
 	var out TeamQueueList
-	return out, c.do(ctx, "GET", "/v1/tasks/"+url.PathEscape(task)+"/team-queue", nil, &out)
+	return out, c.doLimited(ctx, "GET", "/v1/tasks/"+url.PathEscape(task)+"/team-queue", nil, &out, MaxTeamQueueListResponse)
 }
 
 func (c *Client) TeamQueueAction(ctx context.Context, task string, req TeamQueueRequest) (TeamQueueEntry, error) {
@@ -285,5 +291,5 @@ func (c *Client) GetTeamQueueEntry(ctx context.Context, task, entry string) (Tea
 
 func (c *Client) TeamQueueByHost(ctx context.Context, host string) (TeamQueueList, error) {
 	var out TeamQueueList
-	return out, c.do(ctx, "GET", "/v1/team-queues?host="+url.QueryEscape(host)+"&limit="+strconv.Itoa(MaxLimit), nil, &out)
+	return out, c.doLimited(ctx, "GET", "/v1/team-queues?host="+url.QueryEscape(host)+"&limit="+strconv.Itoa(MaxLimit), nil, &out, MaxTeamQueueListResponse)
 }
