@@ -91,10 +91,9 @@ func (s *Store) classifyStallBlocker(ctx context.Context, q queryRower, e api.Te
 		if err := q.QueryRowContext(ctx, `SELECT MAX(a.last_event_at) FROM agent_work_item_bindings b JOIN agents a ON a.id=b.agent_id AND a.run_id=b.run_id WHERE b.item_task_id=? AND b.item_id=? AND a.status IN ('closed','exited')`, e.TaskID, e.ItemID).Scan(&last); err != nil {
 			return nil, err
 		}
-		since := parseStallTime(last.String)
-		if since.IsZero() {
-			since = parseStallTime(e.UpdatedAt)
-		}
+		// Held since the later of the item's last run and the entry's own
+		// last write: a relaunch is not dated from an earlier team's exit.
+		since := parseStallTime(last.String, e.UpdatedAt)
 		// A launch in progress has no runs yet; only an entry that has had
 		// none for the whole grace period is stuck.
 		if s.now().Sub(since) < s.queueNoticeGrace() {

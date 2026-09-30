@@ -1208,3 +1208,49 @@ func TestQueueStallLaunchNoticeOnce(t *testing.T) {
 		t.Fatalf("replays posted %d more messages", n-before-1)
 	}
 }
+
+// wi_a3ca8b64d12365c2 a5, review b1: a relaunched item whose earlier team
+// closed long ago is dated from its own claim, so it is neither stalled nor
+// announced inside the grace, and is both once past it.
+func TestQueueStallLaunchingEntryAfterClosedTeam(t *testing.T) {
+	f := newChoresQueue(t, 1, 1, 0)
+	ctx := context.Background()
+	advance := f.clock(t)
+	old := f.member(t, 0, "old-lead")
+	if _, err := f.s.db.Exec(`UPDATE agents SET status='closed', last_event_at=? WHERE id=?`, ts(f.s.now()), old.ID); err != nil {
+		t.Fatal(err)
+	}
+	advance(2 * time.Hour)
+	q, err := claimEntry(f.s, f.task, f.add(t, 0, "src"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertNoStall(t, f, q.ID, "a relaunch just claimed")
+	id := api.TeamQueueStall{Cause: api.StallNothingRunning, BlockerEntryID: q.ID, BlockerRevision: q.Revision}.NoticeRequestID(q.ID)
+	notice := func() error {
+		_, err := f.s.TeamQueueAction(ctx, f.task.ID, api.TeamQueueRequest{RequestID: id, Operation: "stall_notice", EntryID: q.ID, ExpectedRevision: q.Revision, Failure: "freeze: hub: 503 unavailable"})
+		return err
+	}
+	messages := func() int {
+		t.Helper()
+		list, err := f.s.ListMessages(ctx, f.task.ID, 0, "", 1000)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return len(list)
+	}
+	before := messages()
+	if err := notice(); !errors.Is(err, api.ErrConflict) || messages() != before {
+		t.Fatalf("notice inside the grace: %v", err)
+	}
+	advance(4 * time.Minute)
+	assertNoStall(t, f, q.ID, "a relaunch inside the grace")
+	advance(2 * time.Minute)
+	assertStall(t, f, q.ID, api.StallNothingRunning, q.ID)
+	if got := f.stall(t, q.ID); got.Since != q.UpdatedAt {
+		t.Fatalf("relaunch stall since %s, want the claim %s", got.Since, q.UpdatedAt)
+	}
+	if err := notice(); err != nil || messages() != before+1 {
+		t.Fatalf("notice past the grace: %v, %d messages", err, messages()-before)
+	}
+}

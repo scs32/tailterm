@@ -1282,3 +1282,62 @@ func TestLaunchRetryClassificationAndDelay(t *testing.T) {
 		t.Fatalf("third refusal in a row %+v", got)
 	}
 }
+
+// wi_a3ca8b64d12365c2 a3, review b1: a relaunch of an item whose earlier team
+// closed hours ago posts no stall notice inside the grace after its claim,
+// and one once the grace has passed.
+func TestTeamRunnerTransientLaunchErrorRelaunch(t *testing.T) {
+	f, hub, q, runner, now, _ := launchRetryFixture(t)
+	ctx := context.Background()
+	const grace = 3 * time.Second
+	f.st.SetQueueStallTiming(0, grace)
+	runner.stallGrace = grace
+	messages, err := f.c.ListMessages(ctx, f.task.ID, 0, "", 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var order api.Message
+	for _, m := range messages {
+		if m.Seq == f.order {
+			order = m
+		}
+	}
+	old, err := f.c.AddAgent(ctx, f.task.ID, api.AddAgentRequest{AgentID: api.NewID("agt"), Name: "old-lead", Host: "fixture", Session: "old-lead", Runtime: "codex", WorkItem: &api.AgentWorkItemRequest{ItemTaskID: f.task.ID, ItemID: f.item.ID, ItemRevision: f.item.Revision, WorkOrderMessage: api.MessageReference{TaskID: f.task.ID, Seq: f.order}, ContextBundle: teamCloseCLIContext(t, f.item, order)}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	db, err := sql.Open("sqlite", f.dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if _, err := db.Exec(`UPDATE agents SET status='closed', last_event_at=? WHERE id=?`, time.Now().Add(-2*time.Hour).UTC().Format(time.RFC3339Nano), old.ID); err != nil {
+		t.Fatal(err)
+	}
+	hub.refuse("freeze", 503, "service unavailable")
+	const stallSubject = "A team queue launch has made no progress"
+	for i := 0; i < 3; i++ {
+		_ = runner.tick(ctx, hub.e, hub.c, "fixture")
+		*now = now.Add(5 * time.Minute)
+	}
+	got, err := hub.c.GetTeamQueueEntry(ctx, f.task.ID, q.ID)
+	if err != nil || got.State != "launching" || hub.count("freeze") != 3 {
+		t.Fatalf("relaunch: state=%s freezes=%d %v", got.State, hub.count("freeze"), err)
+	}
+	claimed, err := time.Parse(time.RFC3339Nano, got.UpdatedAt)
+	if err != nil || time.Since(claimed) >= grace {
+		t.Skipf("host too slow to observe inside the %s grace (%v)", grace, err)
+	}
+	list, err := hub.c.ListTeamQueuePage(ctx, f.task.ID, api.TeamQueueListOptions{View: api.TeamQueueViewActive})
+	if err != nil || len(list.Entries) != 1 || list.Entries[0].Stall != nil || hub.count("stall_notice") != 0 || len(launchNotices(t, f, stallSubject, q.ID)) != 0 {
+		t.Fatalf("relaunch stalled inside the grace: stall=%+v notices=%d %v", list.Entries[0].Stall, hub.count("stall_notice"), err)
+	}
+	time.Sleep(time.Until(claimed.Add(grace + 100*time.Millisecond)))
+	for i := 0; i < 3; i++ {
+		*now = now.Add(5 * time.Minute)
+		_ = runner.tick(ctx, hub.e, hub.c, "fixture")
+	}
+	if notices := launchNotices(t, f, stallSubject, q.ID); len(notices) != 1 || !strings.Contains(notices[0].Envelope.Body.Text, "freeze: hub: 503 service unavailable") {
+		t.Fatalf("relaunch stall notices past the grace: %+v", notices)
+	}
+}

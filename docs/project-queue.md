@@ -711,9 +711,9 @@ results are correct, and the client's 64 MiB listing cap
 
 ## Team queue launch errors
 
-A launch writes its progress to the hub in five steps: `freeze`, `attempt`,
-`started` (after a spawn, or after an uncertain spawn is found registered) and
-`running`. Before wi_a3ca8b64d12365c2 the runner returned any refusal of those
+A launch writes its progress to the hub with four operations: `freeze`,
+`attempt`, `started` (after a spawn, or after an uncertain spawn is found
+registered) and `running`. Before wi_a3ca8b64d12365c2 the runner returned any refusal of those
 writes and repeated the same write on the next relay tick, with no failure and
 no Board signal; on 2026-09-30 one entry repeated a 413 `freeze` 154 times in
 about 45 minutes while holding a slot.
@@ -747,9 +747,10 @@ carries `failure`). A parallel failed entry with no live runs is released on
 the runner's next pass; a serial one halts the queue with the `serial-halted`
 stall on the entries behind it.
 
-A launching entry with no live run whose last write (or its last run's exit)
-is older than the stall grace (5 minutes) is now a `nothing-running` stall of
-its own. The list shows
+A launching entry with no live run whose last write, and the item's last run
+exit if later, is older than the stall grace (5 minutes) is now a
+`nothing-running` stall of its own. An earlier team's exit alone never dates
+it, so a relaunched item is not stalled at its claim. The list shows
 it on the entry: `reason=Stalled: tqe_ID (wi_ID): an entry holds its slot,
 handler lease and ownership with nothing running for it. Fix: ...`, and
 `--json` has `stall` with the entry as its blocker. Entries queued behind it
