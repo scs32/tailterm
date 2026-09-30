@@ -209,11 +209,19 @@ def validate_plan(plan: Any) -> dict[str, Any]:
         "discordOwnerIds",
         "tailosUrl",
     }
-    if not deployment_fields <= set(deployment) <= deployment_fields | optional_fields | bridge_fields:
+    # Optional, only with the Discord bridge: the owner helper conversation
+    # (docs/discord-helper-chat.md).
+    helper_fields = {"discordHelperTask", "discordHelperChannelId"}
+    allowed_fields = deployment_fields | optional_fields | bridge_fields | helper_fields
+    if not deployment_fields <= set(deployment) <= allowed_fields:
         raise PreflightFailure("invalid-input", "deployment fields do not match schema v1")
     if bridge_fields & set(deployment) and not bridge_fields <= set(deployment):
         raise PreflightFailure(
             "invalid-input", "deployment Discord bridge fields must be given together: " + ", ".join(sorted(bridge_fields))
+        )
+    if helper_fields & set(deployment) and "discordTokenPath" not in deployment:
+        raise PreflightFailure(
+            "invalid-input", "deployment Discord helper fields need the Discord bridge fields"
         )
     normalized_deployment = {
         field: _string(deployment.get(field), f"deployment.{field}")
@@ -243,7 +251,7 @@ def validate_plan(plan: Any) -> dict[str, Any]:
             raise PreflightFailure(
                 "invalid-input", f"deployment.{field} must be a plain path under /mnt/deepfreeze/tailterm-hub/"
             )
-    for field in ("discordGuildId", "discordApplicationId"):
+    for field in ("discordGuildId", "discordApplicationId", "discordHelperChannelId"):
         value = normalized_deployment.get(field)
         if value is not None and re.fullmatch(r"[0-9]{1,20}", value) is None:
             raise PreflightFailure("invalid-input", f"deployment.{field} must be a Discord ID")
@@ -255,6 +263,9 @@ def validate_plan(plan: Any) -> dict[str, Any]:
     tailos = normalized_deployment.get("tailosUrl")
     if tailos is not None and re.fullmatch(r"https://[A-Za-z0-9.-]+(:[0-9]{1,5})?/?", tailos) is None:
         raise PreflightFailure("invalid-input", "deployment.tailosUrl must be an https origin")
+    helper_task = normalized_deployment.get("discordHelperTask")
+    if helper_task is not None and re.fullmatch(r"tsk_[0-9a-f]{16}", helper_task) is None:
+        raise PreflightFailure("invalid-input", "deployment.discordHelperTask must be a project ID")
 
     normalized = dict(plan)
     normalized.update(

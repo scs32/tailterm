@@ -187,6 +187,25 @@ Exit: for the rest of the shadow week, every owner-level escalation reaches Disc
 one minute of its board notice, and the owner can nudge or reassign from the phone
 without opening TailOS.
 
+### Plan fields
+
+The bridge takes eight deployment plan fields, given all together or not at all:
+`discordTokenPath`, `bridgeTokenPath`, `bridgeBinaryDestination`, `bridgeStateDirectory`,
+`discordGuildId`, `discordApplicationId`, `discordOwnerIds` and `tailosUrl`.
+
+Two more optional fields turn on the owner helper conversation
+([discord-helper-chat.md](discord-helper-chat.md)):
+
+| Field | Sets | Value | When absent |
+| --- | --- | --- | --- |
+| `discordHelperTask` | `DISCORD_HELPER_TASK` | A `tsk_` project ID | The helper is off |
+| `discordHelperChannelId` | `DISCORD_HELPER_CHANNEL` | A 1–20 digit Discord channel ID | Only the DM works |
+
+Both need the eight bridge fields. When neither is given, the bridge environment and the
+rendered app definition are unchanged. The preflight receipt covers these fields, so turning the helper
+on takes a new plan and a fresh preflight. The helper stays off in production until the live
+redaction check passes on the deployed bridge (owner decision #16023, answer #16027).
+
 ## Open decisions (defaults stated)
 
 1. **Channel or thread per project.** Default: a channel per project, which fits under the

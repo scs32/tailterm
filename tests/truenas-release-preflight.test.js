@@ -665,6 +665,111 @@ test("the optional Discord bridge is validated all-or-none and runs beside the h
   }
 });
 
+test("optional Discord helper fields need the bridge and reach the bridge environment", () => {
+  const directory = workspace("discord-helper");
+  const base = "/mnt/deepfreeze/tailterm-hub";
+  const bridge = {
+    discordTokenPath: `${base}/discord-token`,
+    bridgeTokenPath: `${base}/bridge-token`,
+    bridgeBinaryDestination: `${base}/releases/synthetic-release/tailterm-discord`,
+    bridgeStateDirectory: `${base}/bridge-state`,
+    discordGuildId: "111111111111111111",
+    discordApplicationId: "222222222222222222",
+    discordOwnerIds: "333333333333333333",
+    tailosUrl: "https://tailos.tailarr.com",
+  };
+  // Made-up IDs only; never a real helper channel.
+  const helper = { discordHelperTask: "tsk_0123456789abcdef", discordHelperChannelId: "444444444444444444" };
+  // The same path as main: validate_plan -> _deployment_plan -> hub_compose.
+  const probe = (plan) =>
+    spawnSync(
+      "python3",
+      [
+        "-c",
+        [
+          "import json, sys, importlib.util as u",
+          "sys.path.insert(0, 'scripts')",
+          "def load(name, path):",
+          "    spec = u.spec_from_file_location(name, path); m = u.module_from_spec(spec); spec.loader.exec_module(m); return m",
+          "pre = load('pre', 'scripts/truenas_release_preflight.py')",
+          "dep = load('dep', 'scripts/deploy-truenas-hub.py')",
+          "plan = json.loads(sys.stdin.read())",
+          "try:",
+          "    n = pre.validate_plan(plan)",
+          "    e = dep._deployment_plan(n, n['deployment']['releaseName'])",
+          "except pre.PreflightFailure as f:",
+          "    print(json.dumps({'error': f.message, 'classification': f.classification})); sys.exit(0)",
+          "print(json.dumps({'expected': e, 'compose': dep.hub_compose(e, e['binaryDestination'])}))",
+        ].join("\n"),
+      ],
+      { cwd: root, input: JSON.stringify(plan), encoding: "utf8" },
+    );
+  const planWith = (fields) => {
+    const plan = planFor(directory, {
+      sourceDatabase: `${base}/state/hub.sqlite`,
+      allowedBackupRoot: `${base}/backups`,
+      backupDestination: `${base}/backups/before-release.sqlite`,
+      backupOwner: { uid: 950, gid: 950 },
+    });
+    Object.assign(plan.deployment, fields);
+    return plan;
+  };
+  const run = (fields) => {
+    const result = probe(planWith(fields));
+    assert.equal(result.status, 0, result.stderr);
+    return JSON.parse(result.stdout);
+  };
+
+  const both = run({ ...bridge, ...helper });
+  assert.equal(both.error, undefined);
+  assert.equal(both.expected.discordHelperTask, helper.discordHelperTask);
+  assert.equal(both.expected.discordHelperChannelId, helper.discordHelperChannelId);
+  const env = both.compose.services["discord-bridge"].environment;
+  assert.equal(env.DISCORD_HELPER_TASK, helper.discordHelperTask);
+  assert.equal(env.DISCORD_HELPER_CHANNEL, helper.discordHelperChannelId);
+
+  const absent = run(bridge);
+  const bridgeKeys = [
+    "TAILTERM_HUB_URL",
+    "TAILTERM_BRIDGE_TOKEN_FILE",
+    "TAILTERM_BRIDGE_STATE",
+    "DISCORD_TOKEN_FILE",
+    "DISCORD_GUILD_ID",
+    "DISCORD_APPLICATION_ID",
+    "DISCORD_OWNER_IDS",
+    "TAILOS_URL",
+  ];
+  assert.deepEqual(Object.keys(absent.compose.services["discord-bridge"].environment), bridgeKeys);
+  assert.equal("discordHelperTask" in absent.expected, false);
+  assert.equal("discordHelperChannelId" in absent.expected, false);
+  assert.deepEqual(absent.compose.services.hub, both.compose.services.hub, "the hub service does not change");
+
+  const taskAlone = run({ ...bridge, discordHelperTask: helper.discordHelperTask });
+  const aloneEnv = taskAlone.compose.services["discord-bridge"].environment;
+  assert.equal(aloneEnv.DISCORD_HELPER_TASK, helper.discordHelperTask);
+  assert.equal(aloneEnv.DISCORD_HELPER_CHANNEL, undefined);
+  assert.deepEqual(Object.keys(aloneEnv), [...bridgeKeys, "DISCORD_HELPER_TASK"]);
+
+  const rejects = (fields, pattern) => {
+    const result = run(fields);
+    assert.equal(result.classification, "invalid-input", JSON.stringify(fields));
+    assert.match(result.error, pattern);
+  };
+  for (const bad of ["tsk_XYZ", "agt_0123456789abcdef", "tsk_0123456789ABCDEF", ""]) {
+    rejects({ ...bridge, ...helper, discordHelperTask: bad }, /discordHelperTask/);
+  }
+  for (const bad of ["12ab", "123456789012345678901", ""]) {
+    rejects({ ...bridge, ...helper, discordHelperChannelId: bad }, /discordHelperChannelId/);
+  }
+  for (const fields of [
+    helper,
+    { discordHelperTask: helper.discordHelperTask },
+    { discordHelperChannelId: helper.discordHelperChannelId },
+  ]) {
+    rejects(fields, /bridge fields/);
+  }
+});
+
 test("selected targets validate immutable retained mounts before remote effects", () => {
   const directory=workspace("target-selection"),base="/mnt/deepfreeze/tailterm-hub";
   const plan=planFor(directory,{});

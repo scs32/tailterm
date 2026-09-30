@@ -96,6 +96,9 @@ def _deployment_plan(plan: dict[str, Any], release: str) -> dict[str, str]:
         )
         for field in ("discordGuildId", "discordApplicationId", "discordOwnerIds", "tailosUrl"):
             expected[field] = deployment[field]
+        for field in ("discordHelperTask", "discordHelperChannelId"):
+            if field in deployment:
+                expected[field] = deployment[field]
     targets = deployment.get("targets", ["hub", "bridge"])
     if (not isinstance(targets, list) or not targets or
             any(not isinstance(t, str) or t not in ("hub", "bridge") for t in targets) or len(targets) != len(set(targets))):
@@ -319,6 +322,13 @@ def hub_compose(deployment: dict[str, Any], binary_destination: str) -> dict[str
             "mem_limit": "256m",
             "cpus": "0.5",
         }
+        # The owner helper conversation (docs/discord-helper-chat.md) stays off
+        # unless the plan names its project; absent fields add nothing.
+        bridge_environment = services["discord-bridge"]["environment"]
+        if "discordHelperTask" in deployment:
+            bridge_environment["DISCORD_HELPER_TASK"] = deployment["discordHelperTask"]
+        if "discordHelperChannelId" in deployment:
+            bridge_environment["DISCORD_HELPER_CHANNEL"] = deployment["discordHelperChannelId"]
     return {
         "services": {
             **services,
