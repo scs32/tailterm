@@ -65,11 +65,14 @@ type teamLaunchJournal struct {
 }
 
 func cmdTeam(e env, args []string) error {
+	if len(args) > 1 && args[0] == "queue" && args[1] == "sweep-worktrees" {
+		return cmdTeamQueueSweepWorktrees(e, args[2:])
+	}
 	if len(args) > 0 && args[0] == "queue" {
 		return cmdTeamQueue(e, args[1:])
 	}
 	if len(args) == 0 || args[0] != "launch" {
-		return errors.New("usage: tt team launch --item ID --order SEQ [--template planned] [--dry-run] | tt team queue add|list|policy|limit|scope|fail|accept|replace-lead|remove|reorder|release|abandon")
+		return errors.New("usage: tt team launch --item ID --order SEQ [--template planned] [--dry-run] | tt team queue add|list|policy|limit|scope|fail|accept|replace-lead|remove|reorder|release|abandon|sweep-worktrees")
 	}
 	if len(args) == 2 && (args[1] == "--help" || args[1] == "-h") {
 		fmt.Println("usage: tt team launch --item ID --order SEQ [--template planned] [--dry-run] [--task ID] [--hub URL] [--cwd DIR]")

@@ -32,6 +32,9 @@ type teamRunner struct {
 	census      func(ctx context.Context, c *api.Client, task, host string, policy api.TeamHostPolicy, prior *api.TeamHostUsage, cwds []string) error
 	// changed lists the files a candidate changed; nil uses Git.
 	changed func(ctx context.Context, repository, base, commit string) ([]string, error)
+	// worktrees removes a finished entry's worktrees once their work is
+	// integrated (docs/team-launch.md); nil leaves them in place.
+	worktrees func(ctx context.Context, c *api.Client, host string, active, project api.TeamQueueList, q api.TeamQueueEntry) error
 	// stallGrace is how long a stall holds before its Board notice; zero
 	// uses the hub's five minutes.
 	stallGrace time.Duration
@@ -267,6 +270,7 @@ func productionTeamRunner() teamRunner {
 		census: func(ctx context.Context, c *api.Client, task, host string, policy api.TeamHostPolicy, prior *api.TeamHostUsage, cwds []string) error {
 			return saveHostRelayCensus(ctx, c, task, host, policy, prior, cwds, time.Now())
 		},
+		worktrees:  closeoutWorktrees,
 		roundRobin: true,
 		retries:    productionLaunchRetries,
 	}
@@ -350,6 +354,18 @@ func (r teamRunner) tick(ctx context.Context, e env, c *api.Client, host string)
 			}
 			if !parallel {
 				break
+			}
+		}
+		if r.worktrees != nil {
+			// Finished teams' worktrees go once their release lands. The
+			// cleanup is local: it logs and never fails the tick or entry.
+			for _, q := range queue.Entries {
+				if q.Host != host || q.State != "finished" || q.Acceptance == nil {
+					continue
+				}
+				if err := r.worktrees(ctx, c, host, list, queue, q); err != nil {
+					fmt.Fprintf(os.Stderr, "[tt relay] worktree cleanup %s: %v\n", q.ID, err)
+				}
 			}
 		}
 		r.noticeStalls(ctx, c, queue, host)

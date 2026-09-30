@@ -213,7 +213,8 @@ and a clean tree; a later HEAD cannot replace the accepted SHA. Then the item
 becomes **Ready to integrate**. The saved tuple and evidence appear in the
 queue and Projects Delivery panel. The
 owner performs any merge, push or deployment separately. Dismissed items have
-no integration record.
+no integration record. Once the release lands, the runner removes the finished
+entry's worktrees ([worktree cleanup](#worktree-cleanup)).
 
 Both primary and auxiliary handler briefings include the done save with its
 acceptance tuple and the recovery command. A done repository-backed entry without its receipt remains running and
@@ -288,6 +289,89 @@ The command launches on the host where it runs. It does not select remote saved
 servers or read an encrypted browser profile. Tests use local test hubs, isolated
 home directories and private tmux sockets. This feature does not merge, deploy
 or release the source.
+
+## Worktree cleanup
+
+A finished team's Git worktrees, and the caches inside them such as the Go
+module cache under `.build/go`, are removed on the launch host once the
+accepted work is safe elsewhere. Team closeout and the one-time sweep use the
+same rules. A worktree is removed only when no keep reason applies; the first
+matching reason is reported:
+
+- `locked`: `git worktree lock` is set.
+- `missing`: the directory is gone; applying runs `git worktree prune` and
+  reports it as `pruned`. A gone worktree whose HEAD is not integrated (see
+  `unpushed`) is kept `unpushed`, and while one exists nothing is pruned: Git
+  prunes every gone worktree at once, and a worktree HEAD keeps its commit
+  from garbage collection.
+- `in-use`: the worktree holds, or a linked worktree holds it within, the cwd
+  of a queued, launching, running or unreleased failed entry, that entry's
+  accepted worktree, or the cwd of a non-closed agent on this host; or it lies
+  in a Claude scratchpad (`<temp>/claude-<uid>/<cwd key>/<session>/scratchpad`)
+  of a session started in one of those paths.
+- `nested`: it contains a kept worktree. Deepest worktrees are handled first,
+  so removable children go before their parent.
+- `recent` (sweep only): its Git `HEAD`, `index` or `logs/HEAD` changed within
+  `--min-idle`.
+- `evidence`: its path, absolute, repository-relative or `~/`-relative, is
+  cited by a tracked `docs/` file on `tasks-hub` or by a queue entry's
+  acceptance or integration evidence.
+- `operation`: a rebase, merge, cherry-pick, revert or bisect is in progress.
+- `dirty`: `git status` shows tracked changes or untracked files that are not
+  ignored. Ignored caches do not count.
+- `unpushed`: HEAD is neither an ancestor of `tasks-hub` or
+  `origin/tasks-hub`, nor contained in any remote-tracking ref, nor on a local
+  branch whose commits `git cherry` finds patch-equivalent on `tasks-hub`
+  (releases integrate by cherry-pick). A detached commit on no ref is always
+  kept, so garbage collection cannot drop a receipt's SHA.
+
+Removal re-checks the lock, operation, status and HEAD immediately before it,
+adds owner write permission to read-only directories inside the worktree, and
+then runs `git worktree remove` without `--force`, so Git's own check is the
+last guard. A change found by the re-check keeps the worktree with that reason
+(or `moved` for a new HEAD), and a failed removal is kept as `remove-failed`. Branches are never deleted: an accepted branch and commit still
+resolve after their worktree is gone. Closeout and sweep share a host lock in
+the relay state directory.
+
+**Closeout timing.** On each tick the runner looks at the project's finished
+entries on its host that have a saved acceptance. If none of the entry's cwd,
+accepted worktree or integration worktree exists, that costs only `os.Stat`.
+Otherwise it reads the project's roster, at most once per 15 minutes per entry,
+and considers the entry's recorded worktrees plus, when a team cwd is a linked
+worktree, the worktrees nested in it and in scratchpads of sessions started
+there. A shared main-checkout cwd attributes nothing further. The cleanup makes
+no hub write. Because integration happens after the entry finishes, a worktree
+is usually kept `unpushed` at first and removed on a later tick once its
+release lands on `tasks-hub`. A finished entry is examined only while its
+project still has an active entry on the host; dismissed items, owner-integrated
+failed entries and anything left over go to the sweep.
+
+**Receipts.** Every outcome is appended as one JSON line to
+`worktree-cleanup.jsonl` in the relay state directory
+(`~/.local/state/tailterm/relay`, or `TAILTERM_RELAY_STATE`):
+`{at, source, taskId, entryId, itemId, path, branch, head, action, reason,
+detail}` with `source` `closeout` or `sweep` and `action` `removed`, `kept` or
+`pruned`. A kept outcome is written once per path, reason and HEAD per process,
+and closeout also logs new outcomes to the relay's stderr as
+`[tt relay] worktree cleanup <entry>: ...`.
+
+**One-time sweep.** For worktrees that predate closeout cleanup:
+
+```sh
+tt team queue sweep-worktrees [--apply] [--json] [--min-idle 24h] [--cwd DIR]
+```
+
+Run it from any worktree of the repository (or pass `--cwd`). It first reads
+every project's roster and team queue from the hub and exits non-zero, having
+touched nothing, if any read fails. The default is a dry run that changes
+nothing and prints each linked worktree as `would-remove` (with its size),
+`would-prune` or `kept <reason>: <detail>`, then totals per action and keep
+reason and the reclaimable bytes. `--apply` removes exactly the removable
+worktrees, prunes missing ones, writes receipts and prints `removed`, `kept`
+and `pruned` lines with totals. `--json` prints
+`{"worktrees":[{"path","branch","head","action","reason","detail","bytes"}],
+"totals":{"actions":{},"kept":{},"bytes":0}}`. Review the dry run's kept and
+would-remove lists, especially `.build/releases/*`, before applying.
 
 ## Queue chores the product handles
 
