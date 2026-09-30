@@ -22,6 +22,7 @@ const (
 	EnvAgent     = "TAILTERM_AGENT"
 	EnvAgentName = "TAILTERM_AGENT_NAME"
 	EnvSession   = "TAILTERM_SESSION"
+	EnvGoFlags   = "GOFLAGS"
 	AgentWindow  = "agent"
 	WatchWindow  = "tt-watch"
 )
@@ -140,6 +141,9 @@ func Create(o Options) error {
 		args = append(args, "-c", o.Cwd)
 	}
 	for k, val := range o.Env {
+		if k == EnvGoFlags {
+			continue
+		}
 		// The full briefing is already present in the private one-shot command
 		// file below. Repeating it as a tmux -e argument can exceed tmux's
 		// command limit and is unnecessary after the model process starts.
@@ -148,6 +152,10 @@ func Create(o Options) error {
 		}
 		args = append(args, "-e", k+"="+val)
 	}
+	// Agents build in many worktree paths. Without -trimpath, Go keys each
+	// package's cache entries on its directory, so every path fills the shared
+	// build cache again (docs/go-build-cache.md).
+	args = append(args, "-e", EnvGoFlags+"="+sessionGoFlags(o.Env))
 	launch, err := os.CreateTemp("", ".tailterm-agent-command-*")
 	if err != nil {
 		return fmt.Errorf("create private agent command: %w", err)
@@ -186,6 +194,24 @@ func Create(o Options) error {
 	removeLaunch = false
 
 	return nil
+}
+
+// sessionGoFlags returns the session's GOFLAGS: the caller's value (the host's
+// when the caller sets none) plus -trimpath, unless it already names
+// -trimpath; -trimpath=false opts out.
+func sessionGoFlags(env map[string]string) string {
+	base, ok := env[EnvGoFlags]
+	if !ok {
+		base = os.Getenv(EnvGoFlags)
+	}
+	base = strings.TrimSpace(base)
+	for _, f := range strings.Fields(base) {
+		name, _, _ := strings.Cut(strings.TrimPrefix(strings.TrimPrefix(f, "-"), "-"), "=")
+		if name == "trimpath" {
+			return base
+		}
+	}
+	return strings.TrimSpace(base + " -trimpath")
 }
 
 func forwardSessionEnv(command, key, value string) bool {

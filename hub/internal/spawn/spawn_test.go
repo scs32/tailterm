@@ -294,3 +294,56 @@ func TestSpawnFromInsideTmuxTargetsOnlyTheAgent(t *testing.T) {
 		t.Fatalf("agent window behind a 16x2 viewer = %q, want 200x50 manual", got)
 	}
 }
+
+func TestSessionGoFlagsAddsTrimpath(t *testing.T) {
+	cases := []struct {
+		name string
+		host string
+		env  map[string]string
+		want string
+	}{
+		{"no key and empty host", "", nil, "-trimpath"},
+		{"host value merged when key absent", "-mod=mod", map[string]string{}, "-mod=mod -trimpath"},
+		{"key merged", "", map[string]string{"GOFLAGS": "-mod=mod"}, "-mod=mod -trimpath"},
+		{"key wins over host", "-race", map[string]string{"GOFLAGS": "-mod=mod"}, "-mod=mod -trimpath"},
+		{"empty key ignores host", "-race", map[string]string{"GOFLAGS": ""}, "-trimpath"},
+		{"already set", "", map[string]string{"GOFLAGS": "-mod=mod -trimpath"}, "-mod=mod -trimpath"},
+		{"double dash", "", map[string]string{"GOFLAGS": "--trimpath"}, "--trimpath"},
+		{"explicit opt-out", "", map[string]string{"GOFLAGS": "-trimpath=false"}, "-trimpath=false"},
+		{"host opt-out", "--trimpath=false", nil, "--trimpath=false"},
+		{"host already set", "-trimpath", nil, "-trimpath"},
+		{"extra spaces", "", map[string]string{"GOFLAGS": "  -mod=mod  "}, "-mod=mod -trimpath"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			// The test process may itself run under a spawned session's GOFLAGS.
+			t.Setenv("GOFLAGS", c.host)
+			if got := sessionGoFlags(c.env); got != c.want {
+				t.Fatalf("sessionGoFlags(%v) with host %q = %q, want %q", c.env, c.host, got, c.want)
+			}
+		})
+	}
+}
+
+func TestSpawnCreateSetsTrimpathGoFlags(t *testing.T) {
+	run := privateTmux(t)
+	t.Setenv("GOFLAGS", "")
+	env := map[string]string{"GOFLAGS": "-mod=mod", EnvAgentName: "agent-a"}
+	if err := Create(Options{Session: "agent-a", Cwd: t.TempDir(), Env: env, Command: "true", Self: sleeperSelf(t)}); err != nil {
+		t.Fatal(err)
+	}
+	if got := run("show-environment", "-t", "=agent-a", "GOFLAGS"); got != "GOFLAGS=-mod=mod -trimpath" {
+		t.Fatalf("session GOFLAGS = %q, want GOFLAGS=-mod=mod -trimpath", got)
+	}
+	if got := run("show-environment", "-t", "=agent-a", EnvAgentName); got != EnvAgentName+"=agent-a" {
+		t.Fatalf("session %s = %q", EnvAgentName, got)
+	}
+	if env["GOFLAGS"] != "-mod=mod" {
+		t.Fatalf("Create changed the caller's Env: GOFLAGS = %q", env["GOFLAGS"])
+	}
+	// A session with no GOFLAGS of its own still gets -trimpath.
+	createAgent(t, "agent-b")
+	if got := run("show-environment", "-t", "=agent-b", "GOFLAGS"); got != "GOFLAGS=-trimpath" {
+		t.Fatalf("session GOFLAGS = %q, want GOFLAGS=-trimpath", got)
+	}
+}
