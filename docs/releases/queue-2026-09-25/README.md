@@ -64,6 +64,7 @@ SHA-256 is of the unredacted receipt.
 | `abfd0dc` | Split above with Shift + Left Option (`wi_7cab0b4cbf3232c8`, merge of `14ecf6e`) | Dropping a pane with Shift + Left Option splits above; Left Option alone splits right; Right Option no longer selects a placement | TailOS (`abfd0dc` build) |
 | `77738db` | 8-pane cap with continued groups (`wi_1edb2e33e90a684e`, fast-forward) | A terminal group holds at most 8 panes; further windows open in a "continued" group, and layouts persist across reloads | TailOS (`77738db` build) |
 | `16075ee` | Fast verification (`wi_82ed4c6924930bad`, fast-forward; owner-accept #15155) | The verification matrix runs checks in parallel (`--jobs`, Go lane first, no shared-resource overlap) plus a targeted mode; full 72-check run 30.75 → 12.3 min; matrix gains `goTestFlags: ["-timeout=14m"]` (owner-approved digest `cce62b97…`) | Mini tt (rollback `tt.prev-77738db`), TailOS (`16075ee` build); runner in repo |
+| `c6a8ec1` | Owner helper registration (`wi_8d912169e30db643`, fast-forward) | The owner's Claude Code session registers as the project's `owner_helper` agent (`tt helper register/env/inbox`) so it can be a delegation-window delegate and be woken by the relay; schema: `owner_helper_registrations` + one-open-helper index | Hub `20260929-owner-helper-c6a8ec1`, Mini tt (rollback `tt.prev-16075ee`), TailOS (`c6a8ec1` build) |
 
 ## Hub releases
 
@@ -92,6 +93,7 @@ SHA-256 is of the unredacted receipt.
 | `20260929-parallel-teams-4f59982` | `before-parallel-teams-4f59982.sqlite` | 329,560,064 | `158812b0…` | ok, 0 FK | `team_queue_settings` rebuilt without the 1-2 cap; new `team_host_usage` columns |
 | `20260929-window-size-fe56621` | `before-window-size-fe56621.sqlite` | 368,881,664 | `0ddaea58…` | ok, 0 FK | none |
 | `20260929-delegation-ee47773` | `before-delegation-ee47773.sqlite` | 370,860,032 | `cae97f92…` | ok, 0 FK | new `owner_delegation_windows`, `owner_delegation_routes`, `decision_request_categories` |
+| `20260929-owner-helper-c6a8ec1` | `before-owner-helper-c6a8ec1.sqlite` | 395,325,440 | `09e15107…` | ok, 0 FK | new `owner_helper_registrations`, index `agents_one_owner_helper`; rehearsed on `before-delegation-ee47773` (previous hub opens the migrated copy); rollback `.build/prev-ee47773` |
 
 Before `6235924`, the combined migration was rehearsed on a copy of the `33d3ab7` backup: the new
 hub migrated it (integrity ok, no FK violations, 14 projects, queue at limit 1), and the
