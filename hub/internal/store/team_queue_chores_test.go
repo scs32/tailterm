@@ -792,3 +792,81 @@ func TestQueueStallNoticeOncePerStall(t *testing.T) {
 		t.Fatalf("cleared stall posted %d messages", messages()-before)
 	}
 }
+
+// Review f0: after the owner's integration and the handler's plain done save,
+// the recovery accept (and a done save carrying a tuple) is refused naming
+// the integration, so no acceptance or second release job is recorded.
+func TestOwnerIntegratedEntryTakesNoHandlerAcceptance(t *testing.T) {
+	f := newChoresQueue(t, 1, 2, 0)
+	ctx := context.Background()
+	a := f.run(t, f.add(t, 0, "src/a"))
+	commit := strings.Repeat("d", 40)
+	a, err := f.integrated(a, "integrated-a", commit, "src/a/x.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var leased api.Agent
+	for _, h := range f.handlers {
+		if h.ID == a.HandlerID {
+			leased = h
+		}
+	}
+	done := "done"
+	item, err := f.s.GetWorkItem(ctx, f.task.ID, f.items[0].ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := f.s.CreateWorkItemUpdate(ctx, f.task.ID, item.ID, api.CreateWorkItemUpdate{ExpectedRevision: item.Revision, Status: &done, AgentID: leased.ID, RunID: leased.RunID, RequestID: "plain"}, f.by); err != nil {
+		t.Fatal(err)
+	}
+	if item, err = f.s.GetWorkItem(ctx, f.task.ID, f.items[0].ID); err != nil {
+		t.Fatal(err)
+	}
+	acc := api.TeamIntegrationAcceptance{Repository: a.Repository, BaseCommit: a.BaseCommit, Worktree: "/worktrees/a", Branch: "feature/a", Commit: commit, ItemRevision: item.Revision, CompletionReport: item.CompletionReport, Evidence: "recovery accept"}
+	_, err = f.s.TeamQueueAction(ctx, f.task.ID, api.TeamQueueRequest{RequestID: "recover-accept", Operation: "accept", EntryID: a.ID, ExpectedRevision: a.Revision, HandlerAgentID: leased.ID, HandlerRunID: leased.RunID, Acceptance: &acc})
+	if !errors.Is(err, api.ErrConflict) || !strings.Contains(err.Error(), "integrated by the owner at "+commit) {
+		t.Fatalf("recovery accept on an owner-integrated entry: %v", err)
+	}
+	got, err := f.s.GetTeamQueueEntry(ctx, f.task.ID, a.ID)
+	if err != nil || got.Acceptance != nil || got.Revision != a.Revision || got.OwnerIntegration == nil {
+		t.Fatalf("entry after refused accept %+v %v", got, err)
+	}
+	var jobs int
+	if err := f.s.db.QueryRow(`SELECT count(*) FROM release_jobs WHERE task_id=? AND entry_id=?`, f.task.ID, a.ID).Scan(&jobs); err != nil || jobs != 0 {
+		t.Fatalf("release jobs %d %v", jobs, err)
+	}
+}
+
+// Review f1: an owner-paused project shows no stall and refuses a stall
+// notice; resuming brings the stall back.
+func TestQueueStallSkipsPausedProject(t *testing.T) {
+	f := newChoresQueue(t, 2, 2, 0)
+	ctx := context.Background()
+	a := f.run(t, f.add(t, 0, "src"))
+	f.member(t, 0, "member-a")
+	b := f.add(t, 1, "src/b")
+	failed := f.fail(t, a)
+	stall := f.stall(t, b.ID)
+	if stall == nil || stall.BlockerEntryID != failed.ID {
+		t.Fatalf("active project stall %+v", stall)
+	}
+	id := stall.NoticeRequestID(b.ID)
+	if _, err := f.s.db.Exec(`UPDATE tasks SET pause_state=? WHERE id=?`, api.ProjectPausePaused, f.task.ID); err != nil {
+		t.Fatal(err)
+	}
+	assertNoStall(t, f, b.ID, "paused project")
+	f.s.queueStallGrace = time.Nanosecond
+	if _, err := f.s.TeamQueueAction(ctx, f.task.ID, api.TeamQueueRequest{RequestID: id, Operation: "stall_notice", EntryID: b.ID, ExpectedRevision: b.Revision}); !errors.Is(err, api.ErrConflict) || !strings.Contains(err.Error(), "paused") {
+		t.Fatalf("stall notice in a paused project: %v", err)
+	}
+	var notices int
+	if err := f.s.db.QueryRow(`SELECT count(*) FROM messages WHERE task_id=? AND from_node='team_queue' AND from_user='runner' AND envelope LIKE '%"cause":%'`, f.task.ID).Scan(&notices); err != nil || notices != 0 {
+		t.Fatalf("paused project posted %d stall notices %v", notices, err)
+	}
+	if _, err := f.s.db.Exec(`UPDATE tasks SET pause_state=? WHERE id=?`, api.ProjectPauseActive, f.task.ID); err != nil {
+		t.Fatal(err)
+	}
+	if again := f.stall(t, b.ID); again == nil || again.NoticeRequestID(b.ID) != id {
+		t.Fatalf("stall after resume %+v", again)
+	}
+}

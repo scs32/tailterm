@@ -166,6 +166,14 @@ func (s *Store) explainQueueStalls(ctx context.Context, q queryRower, capacity *
 	if len(out.Entries) == 0 {
 		return nil
 	}
+	// An owner-paused project launches nothing, so nothing in it is stalled.
+	var pauseState string
+	if err := q.QueryRowContext(ctx, `SELECT pause_state FROM tasks WHERE id=?`, out.Entries[0].TaskID).Scan(&pauseState); err != nil {
+		return err
+	}
+	if pauseState != api.ProjectPauseActive {
+		return nil
+	}
 	blockers := map[string]*stallBlocker{}
 	var active []api.TeamQueueEntry
 	for _, e := range out.Entries {

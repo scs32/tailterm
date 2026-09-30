@@ -662,6 +662,9 @@ func (s *Store) TeamQueueAction(ctx context.Context, task string, req api.TeamQu
 	}
 	var stalled api.TeamQueueEntry
 	var stallEnvelope api.Envelope
+	if req.Operation == "stall_notice" && t.PauseState != api.ProjectPauseActive {
+		return zero, fmt.Errorf("%w: the project is paused; its queue has no stalls", api.ErrConflict)
+	}
 	if req.Operation == "stall_notice" {
 		// The list reads through the single connection, so the stall is
 		// recomputed before the write transaction opens.
@@ -1620,6 +1623,15 @@ func verifiedRepository(planRepository string, a api.TeamIntegrationAcceptance) 
 // running, repository-backed entry. Both the queue accept operation and the
 // handler's done save use it, so they refuse exactly the same candidates.
 func acceptTeamQueueEntry(ctx context.Context, tx *sql.Tx, task string, e *api.TeamQueueEntry, candidate api.TeamIntegrationAcceptance, handlerAgent, handlerRun, now string) error {
+	// The owner's integration record replaces handler acceptance: accepting
+	// the released entry would record a second candidate and could enqueue a
+	// second release job.
+	if e.OwnerIntegration != nil {
+		return fmt.Errorf("%w: entry %s was integrated by the owner at %s; it takes no handler acceptance", api.ErrConflict, e.ID, e.OwnerIntegration.Commit)
+	}
+	if e.ReleasedAt != "" {
+		return fmt.Errorf("%w: entry %s was released; it takes no handler acceptance", api.ErrConflict, e.ID)
+	}
 	if e.State != "running" || e.Acceptance != nil || e.Repository == "" || handlerAgent != e.HandlerID || handlerRun != e.HandlerRunID {
 		return fmt.Errorf("%w: exact active handler and unaccepted team are required", api.ErrConflict)
 	}
