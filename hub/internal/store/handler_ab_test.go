@@ -235,11 +235,12 @@ func TestHandlerArmPolicyValidation(t *testing.T) {
 				r.Arms = append(r.Arms, arm)
 			}
 		},
-		"hold too short": func(r *api.HandlerArmPolicyRequest) { r.LimitHoldMinutes = 4 },
-		"hold too long":  func(r *api.HandlerArmPolicyRequest) { r.LimitHoldMinutes = 1441 },
-		"empty seed":     func(r *api.HandlerArmPolicyRequest) { r.Seed = " " },
-		"missing model":  func(r *api.HandlerArmPolicyRequest) { r.Arms[0].Model = "" },
-		"bad digest":     func(r *api.HandlerArmPolicyRequest) { r.TemplateDigest = "abc" },
+		"hold too short":         func(r *api.HandlerArmPolicyRequest) { r.LimitHoldMinutes = 4 },
+		"hold too long":          func(r *api.HandlerArmPolicyRequest) { r.LimitHoldMinutes = 1441 },
+		"empty seed":             func(r *api.HandlerArmPolicyRequest) { r.Seed = " " },
+		"missing model":          func(r *api.HandlerArmPolicyRequest) { r.Arms[0].Model = "" },
+		"bad digest":             func(r *api.HandlerArmPolicyRequest) { r.TemplateDigest = "abc" },
+		"enabled without digest": func(r *api.HandlerArmPolicyRequest) { r.Enabled, r.TemplateDigest = true, "" },
 	}
 	for name, change := range cases {
 		req := base()
@@ -251,7 +252,15 @@ func TestHandlerArmPolicyValidation(t *testing.T) {
 	if n := countRows(t, f.s, `SELECT count(*) FROM handler_arm_policy`); n != 0 {
 		t.Fatalf("invalid policies wrote %d rows", n)
 	}
+	// Disabling needs no template digest.
+	disabled := base()
+	disabled.TemplateDigest = ""
+	saved, err := f.s.SetHandlerArmPolicy(context.Background(), f.task.ID, disabled)
+	if err != nil || saved.Revision != 1 || saved.TemplateDigest != "" {
+		t.Fatalf("disabled without a digest %+v %v", saved, err)
+	}
 	ok := base()
+	ok.ExpectedRevision = 1
 	ok.LimitHoldMinutes, ok.Fallback = 5, true
 	ok.Arms = append(ok.Arms, third)
 	ok.Arms[0].Weight, ok.Arms[1].Weight = 1000, 1
@@ -486,16 +495,30 @@ func TestHandlerArmTemplateMismatchBlocksEnabling(t *testing.T) {
 	}
 }
 
-func TestHandlerRotationArmChangedRefusedAndSameArmCommits(t *testing.T) {
-	f := newRotationFixture(t)
-	if _, err := f.s.db.Exec(`INSERT OR REPLACE INTO handler_runs(task_id,agent_id,run_id,template_digest,model,reasoning,created_at) VALUES(?,?,?,?,?,?,?)`,
-		f.task.ID, f.old.ID, f.old.RunID, digestP, "claude-sonnet-5-5", "high", ts(time.Now())); err != nil {
-		t.Fatal(err)
-	}
+func TestHandlerRotationArmChangedOnlyUnderAPolicy(t *testing.T) {
 	ctx := context.Background()
+	// setup gives the old primary a Claude runtime and a recorded model, and
+	// saves a (disabled) arm policy when armed is set.
+	setup := func(t *testing.T, armed bool, oldModel string) *rotationFixture {
+		f := newRotationFixture(t)
+		if _, err := f.s.db.Exec(`UPDATE agents SET runtime='claude' WHERE id=?`, f.old.ID); err != nil {
+			t.Fatal(err)
+		}
+		f.old.Runtime = "claude"
+		if _, err := f.s.db.Exec(`INSERT OR REPLACE INTO handler_runs(task_id,agent_id,run_id,template_digest,model,reasoning,created_at) VALUES(?,?,?,?,?,?,?)`,
+			f.task.ID, f.old.ID, f.old.RunID, digestP, oldModel, "high", ts(time.Now())); err != nil {
+			t.Fatal(err)
+		}
+		if armed {
+			if _, err := f.s.SetHandlerArmPolicy(ctx, f.task.ID, api.HandlerArmPolicyRequest{RequestID: "arms", Seed: "K", Arms: []api.HandlerArm{armS, armO}}); err != nil {
+				t.Fatal(err)
+			}
+		}
+		return f
+	}
 	// prepare names the successor; it then registers with its model, as
 	// tt spawn --role database_handler --model M --reasoning R records it.
-	rotate := func(key, model, reasoning string) (api.HandlerRotation, api.Agent) {
+	rotate := func(t *testing.T, f *rotationFixture, key, model, reasoning string) (api.HandlerRotation, api.Agent) {
 		t.Helper()
 		r, err := f.prepare(t, "prepare-"+key, api.Agent{}, "")
 		if err != nil {
@@ -511,32 +534,44 @@ func TestHandlerRotationArmChangedRefusedAndSameArmCommits(t *testing.T) {
 		}
 		return r, a
 	}
-	abandon := func(key string, r api.HandlerRotation, a api.Agent) {
-		t.Helper()
-		if _, err := f.s.HandlerRotationAction(ctx, f.task.ID, api.HandlerRotationRequest{Operation: api.HandlerRotationAbort, RequestID: "abort-" + key, RotationID: r.ID}, f.by); err != nil {
-			t.Fatal(err)
+	t.Run("no policy keeps today's rotation", func(t *testing.T) {
+		f := setup(t, false, "claude-sonnet-5-5")
+		r, _ := rotate(t, f, "no-policy", "claude-opus-5-5", "max")
+		if committed, err := f.commit(r, "commit-no-policy"); err != nil || committed.State != api.HandlerRotationCommitted {
+			t.Fatalf("rotation without a policy %+v %v", committed, err)
 		}
-		if _, err := f.s.CloseAgent(ctx, a.ID, f.by); err != nil {
-			t.Fatal(err)
+	})
+	t.Run("a run of no arm rotates freely", func(t *testing.T) {
+		f := setup(t, true, "claude-haiku-4-5")
+		r, _ := rotate(t, f, "no-arm", "claude-opus-5-5", "max")
+		if committed, err := f.commit(r, "commit-no-arm"); err != nil || committed.State != api.HandlerRotationCommitted {
+			t.Fatalf("rotation of a run in no arm %+v %v", committed, err)
 		}
-	}
-	for _, change := range []struct{ key, model, reasoning string }{{"model", "claude-opus-5-5", "high"}, {"reasoning", "claude-sonnet-5-5", "max"}, {"unrecorded", "", ""}} {
-		r, a := rotate(change.key, change.model, change.reasoning)
-		before := openObligations(t, f.s, f.task.ID)
-		if _, err := f.commit(r, "commit-"+change.key); refusalCode(err) != api.HandlerRotationRefusedArmChanged {
-			t.Fatalf("%s change: %v", change.key, err)
+	})
+	t.Run("a saved policy keeps an arm's run in its arm", func(t *testing.T) {
+		f := setup(t, true, "claude-sonnet-5-5")
+		for _, change := range []struct{ key, model, reasoning string }{{"model", "claude-opus-5-5", "high"}, {"reasoning", "claude-sonnet-5-5", "max"}, {"unrecorded", "", ""}} {
+			r, a := rotate(t, f, change.key, change.model, change.reasoning)
+			before := openObligations(t, f.s, f.task.ID)
+			if _, err := f.commit(r, "commit-"+change.key); refusalCode(err) != api.HandlerRotationRefusedArmChanged {
+				t.Fatalf("%s change: %v", change.key, err)
+			}
+			task, _ := f.s.GetTask(ctx, f.task.ID)
+			if task.PrimaryHandlerID == a.ID || task.HandlerRevision != 1 || !reflect.DeepEqual(before, openObligations(t, f.s, f.task.ID)) {
+				t.Fatalf("a refused %s commit moved something", change.key)
+			}
+			if _, err := f.s.HandlerRotationAction(ctx, f.task.ID, api.HandlerRotationRequest{Operation: api.HandlerRotationAbort, RequestID: "abort-" + change.key, RotationID: r.ID}, f.by); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := f.s.CloseAgent(ctx, a.ID, f.by); err != nil {
+				t.Fatal(err)
+			}
 		}
-		task, _ := f.s.GetTask(ctx, f.task.ID)
-		if task.PrimaryHandlerID == a.ID || task.HandlerRevision != 1 || !reflect.DeepEqual(before, openObligations(t, f.s, f.task.ID)) {
-			t.Fatalf("a refused %s commit moved something", change.key)
+		r, _ := rotate(t, f, "same", "claude-sonnet-5-5", "high")
+		if committed, err := f.commit(r, "commit-same"); err != nil || committed.State != api.HandlerRotationCommitted {
+			t.Fatalf("same-arm rotation %+v %v", committed, err)
 		}
-		abandon(change.key, r, a)
-	}
-	r, _ := rotate("same", "claude-sonnet-5-5", "high")
-	committed, err := f.commit(r, "commit-same")
-	if err != nil || committed.State != api.HandlerRotationCommitted {
-		t.Fatalf("same-arm rotation %+v %v", committed, err)
-	}
+	})
 }
 
 func TestHandlerArmLimitCodexEpisodes(t *testing.T) {
@@ -848,11 +883,17 @@ func (r *reportFixture) entry(t *testing.T, item api.WorkItem, handler api.Agent
 
 func (r *reportFixture) revision(t *testing.T, item api.WorkItem, rev int64, status string, by api.Agent, minutes int, fields ...string) {
 	t.Helper()
+	r.writtenBy(t, item, rev, status, by, "fixture", "native", minutes, fields...)
+}
+
+// writtenBy inserts a revision with an explicit caller node and provenance.
+func (r *reportFixture) writtenBy(t *testing.T, item api.WorkItem, rev int64, status string, by api.Agent, node, provenance string, minutes int, fields ...string) {
+	t.Helper()
 	r.changeSeq++
 	changed := `["` + strings.Join(fields, `","`) + `"]`
 	r.raw(t, `INSERT INTO work_item_revisions(item_task_id,item_id,revision,item_seq,item_kind,title,description,status,priority,created_node,created_user,created_at,updated_agent,updated_run_id,updated_node,updated_user,updated_at,attribution_kind,change_kind,changed_fields,source_change_seq,provenance)
  VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, r.task.ID, item.ID, rev, item.Seq, item.Kind, item.Title, "", status, "normal", "fixture", "owner", ts(r.t0),
-		by.ID, by.RunID, "fixture", "owner", ts(r.at(minutes)), "shared_workspace_claim", "updated", changed, 900000+r.changeSeq, "native")
+		by.ID, by.RunID, node, "owner", ts(r.at(minutes)), "shared_workspace_claim", "updated", changed, 900000+r.changeSeq, provenance)
 }
 
 // message inserts a typed message linked to an item and returns its seq.
@@ -954,6 +995,16 @@ func TestHandlerABReportSyntheticFixture(t *testing.T) {
 	r.revision(t, o1, 3, "open", owner, 20, "priority", "title")
 	r.revision(t, o1, 4, "done", f.hO, 40, "status")
 	r.revision(t, o2, 2, "done", f.hO, 90, "status") // done before its lease
+	// Only owner-attributed writes correct a handler: a hub system write and
+	// reconstructed history do not; the owner's helper session does.
+	r.revision(t, o2, 3, "open", f.hO, 110, "description")
+	r.writtenBy(t, o2, 4, "open", owner, "system", "native", 120, "description")
+	r.writtenBy(t, o2, 5, "open", owner, "fixture", "reconstructed_change_log", 125, "description")
+	helper, err := f.s.RegisterOwnerHelper(ctx, f.task.ID, api.RegisterOwnerHelperRequest{Host: "owner-host", Session: "owner", Runtime: "claude", Cwd: "/work/tailterm", RequestID: "helper"}, f.by)
+	if err != nil || helper.Agent == nil {
+		t.Fatalf("owner helper %+v %v", helper, err)
+	}
+	r.revision(t, s2, 5, "open", *helper.Agent, 240, "status")
 	r.revision(t, f1, 2, "done", r.hO2, 420, "status")
 	// Blocks addressed to and written by the handler.
 	r.message(t, "", f.hS.ID, "block", s1)
@@ -1020,7 +1071,7 @@ func TestHandlerABReportSyntheticFixture(t *testing.T) {
 	}
 	wants := map[string]itemWant{
 		s1.ID: {[]int64{1000, 3000}, ms(3_600_000), 220, 1, 0, 1, 0, 1, 1, 1, 0, map[string]int{"gate-fix": 1, "nudge": 1}, false, []string{}},
-		s2.ID: {[]int64{2000, 5000, 9000}, ms(1_800_000), 110, 0, 1, 0, 1, 0, 1, 0, 0, map[string]int{}, false, []string{}},
+		s2.ID: {[]int64{2000, 5000, 9000}, ms(1_800_000), 110, 0, 1, 0, 2, 0, 2, 0, 0, map[string]int{}, false, []string{}},
 		o1.ID: {[]int64{4000}, ms(2_400_000), 110, 0, 0, 1, 1, 0, 1, 0, 1, map[string]int{}, false, []string{}},
 		o2.ID: {[]int64{6000, 8000}, nil, 110, 0, 0, 0, 0, 1, 1, 1, 2, map[string]int{"gate-fix": 1}, false, []string{}},
 		f1.ID: {[]int64{7000}, ms(1_200_000), 110, 0, 0, 0, 0, 0, 0, 0, 0, map[string]int{}, true, []string{"policy", "other_arm"}},
@@ -1083,8 +1134,8 @@ func TestHandlerABReportSyntheticFixture(t *testing.T) {
 		}
 		return out
 	}
-	check("S counts", counts(s), map[string]string{"handlerBlocks": "1:1/2", "handlerAuthoredBlocks": "1:1/2", "refusedSaves": "1:1/2", "incorrectSaves": "2:1",
-		"ownerCorrections": "1:1/2", "gateFixes": "1:1/2", "linkCorrections": "1:1/2", "interventions": "2:1", "limitEvents": "0:0"})
+	check("S counts", counts(s), map[string]string{"handlerBlocks": "1:1/2", "handlerAuthoredBlocks": "1:1/2", "refusedSaves": "1:1/2", "incorrectSaves": "3:3/2",
+		"ownerCorrections": "2:1", "gateFixes": "1:1/2", "linkCorrections": "1:1/2", "interventions": "2:1", "limitEvents": "0:0"})
 	check("O counts", counts(o), map[string]string{"handlerBlocks": "0:0", "handlerAuthoredBlocks": "0:0", "refusedSaves": "1:1/3", "incorrectSaves": "2:2/3",
 		"ownerCorrections": "1:1/3", "gateFixes": "1:1/3", "linkCorrections": "1:1/3", "interventions": "1:1/3", "limitEvents": "3:1"})
 	if len(report.Comparisons) != 12 {

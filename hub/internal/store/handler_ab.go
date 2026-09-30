@@ -114,8 +114,10 @@ func validateHandlerArmPolicy(req api.HandlerArmPolicyRequest) error {
 	if strings.TrimSpace(req.Seed) == "" || !api.ValidText(req.Seed, 128) || strings.ContainsAny(req.Seed, "\r\n") {
 		return invalidArmPolicy("the seed must be non-empty text of at most 128 characters")
 	}
-	if len(req.TemplateDigest) != 64 || strings.Trim(req.TemplateDigest, "0123456789abcdef") != "" {
-		return invalidArmPolicy("the template digest must be 64 lowercase hex characters")
+	// Only an enabled policy needs the reference template; disabling one
+	// never depends on a digest or a saved spec.
+	if (req.Enabled || req.TemplateDigest != "") && (len(req.TemplateDigest) != 64 || strings.Trim(req.TemplateDigest, "0123456789abcdef") != "") {
+		return invalidArmPolicy("an enabled policy needs a template digest of 64 lowercase hex characters")
 	}
 	ids := map[string]bool{}
 	triples := map[string]bool{}
@@ -900,21 +902,30 @@ func (s *Store) HandlerWriteRefusals(ctx context.Context, task string) ([]api.Ha
 	return out, rows.Err()
 }
 
-// handlerRotationArmRefusal keeps rotation inside an arm: once the old run
-// has a recorded model, the successor must record the same runtime, model
-// and reasoning.
+// handlerRotationArmRefusal keeps rotation inside an arm: when the project
+// has a saved arm policy and the old run belongs to one of its arms, the
+// successor must belong to the same arm. Without a policy, or for a run of
+// no arm, rotation is unchanged.
 func handlerRotationArmRefusal(ctx context.Context, tx *sql.Tx, old, successor api.Agent) (*api.HandlerRotationRefusal, error) {
-	oldRec, err := loadHandlerRunRecord(ctx, tx, old.ID, old.RunID)
-	if err != nil || oldRec.model == "" {
+	p, err := loadHandlerArmPolicy(ctx, tx, old.TaskID)
+	if err != nil || p.Revision == 0 {
 		return nil, err
+	}
+	oldRec, err := loadHandlerRunRecord(ctx, tx, old.ID, old.RunID)
+	if err != nil {
+		return nil, err
+	}
+	arm := handlerArmFor(p, old.Runtime, oldRec.model, oldRec.reasoning)
+	if arm == "" {
+		return nil, nil
 	}
 	next, err := loadHandlerRunRecord(ctx, tx, successor.ID, successor.RunID)
 	if err != nil {
 		return nil, err
 	}
-	if successor.Runtime != old.Runtime || next.model != oldRec.model || next.reasoning != oldRec.reasoning {
-		return &api.HandlerRotationRefusal{Code: api.HandlerRotationRefusedArmChanged, Detail: fmt.Sprintf("the successor runs %s/%s/%s but the old handler ran %s/%s/%s; rotation stays within the handler arm",
-			successor.Runtime, or(next.model, "-"), or(next.reasoning, "-"), old.Runtime, oldRec.model, or(oldRec.reasoning, "-"))}, nil
+	if handlerArmFor(p, successor.Runtime, next.model, next.reasoning) != arm {
+		return &api.HandlerRotationRefusal{Code: api.HandlerRotationRefusedArmChanged, Detail: fmt.Sprintf("the successor runs %s/%s/%s but the old handler is in arm %s (%s/%s/%s); rotation stays within the handler arm",
+			successor.Runtime, or(next.model, "-"), or(next.reasoning, "-"), arm, old.Runtime, oldRec.model, oldRec.reasoning)}, nil
 	}
 	return nil, nil
 }
@@ -1238,22 +1249,21 @@ func (s *Store) handlerABItem(ctx context.Context, task string, a armAssignmentR
 	}
 	// Launch to done ends at the item's first done revision after the lease.
 	type revision struct {
-		number        int64
-		status, agent string
-		run           string
-		at            time.Time
-		changed       map[string]bool
-		checkpoint    bool
+		number                         int64
+		status, agent, run, node, prov string
+		at                             time.Time
+		changed                        map[string]bool
+		checkpoint                     bool
 	}
 	var revisions []revision
-	rows, err = s.db.QueryContext(ctx, `SELECT revision,status,updated_agent,updated_run_id,updated_at,COALESCE(changed_fields,'') FROM work_item_revisions WHERE item_task_id=? AND item_id=? ORDER BY revision`, task, a.itemID)
+	rows, err = s.db.QueryContext(ctx, `SELECT revision,status,updated_agent,updated_run_id,updated_node,provenance,updated_at,COALESCE(changed_fields,'') FROM work_item_revisions WHERE item_task_id=? AND item_id=? ORDER BY revision`, task, a.itemID)
 	if err != nil {
 		return it, err
 	}
 	for rows.Next() {
 		var r revision
 		var at, changed string
-		if err := rows.Scan(&r.number, &r.status, &r.agent, &r.run, &at, &changed); err != nil {
+		if err := rows.Scan(&r.number, &r.status, &r.agent, &r.run, &r.node, &r.prov, &at, &changed); err != nil {
 			rows.Close()
 			return it, err
 		}
@@ -1283,10 +1293,26 @@ func (s *Store) handlerABItem(ctx context.Context, task string, a armAssignmentR
 		}
 	}
 	// Owner corrections: a handler revision in the lease window whose fields
-	// a later owner revision (no agent) changes again. Each counts once.
+	// a later owner-attributed revision changes again. Each counts once.
 	inChain := map[string]bool{}
 	for _, id := range chain {
 		inChain[id] = true
+	}
+	helpers, err := ownerHelperAgents(ctx, s.db, task)
+	if err != nil {
+		return it, err
+	}
+	// Owner-attributed: a native write by the owner's own session (the owner
+	// helper) or by a person with no agent. Hub-internal system callers,
+	// reconstructed history and checkpoints are not owner writes.
+	owner := func(r revision) bool {
+		if r.checkpoint || r.prov != "native" {
+			return false
+		}
+		if r.agent == "" {
+			return !handlerABSystemNodes[r.node]
+		}
+		return helpers[r.agent]
 	}
 	for i, h := range revisions {
 		if h.checkpoint || !inChain[h.agent] || !inWindow(h.at) {
@@ -1294,7 +1320,7 @@ func (s *Store) handlerABItem(ctx context.Context, task string, a armAssignmentR
 		}
 	later:
 		for _, o := range revisions[i+1:] {
-			if o.checkpoint || o.agent != "" {
+			if !owner(o) {
 				continue
 			}
 			for f := range h.changed {
@@ -1395,6 +1421,27 @@ func (s *Store) handlerABItem(ctx context.Context, task string, a armAssignmentR
 	}
 	it.LimitEvents.Total = it.LimitEvents.Episodes + it.LimitEvents.CodexUsageLimit + it.LimitEvents.CodexRateLimit
 	return it, nil
+}
+
+// handlerABSystemNodes are the caller nodes hub-internal writers use; their
+// agentless writes are not the owner's.
+var handlerABSystemNodes = map[string]bool{"system": true, "team_queue": true, "handler_arms": true}
+
+func ownerHelperAgents(ctx context.Context, q queryRower, task string) (map[string]bool, error) {
+	rows, err := q.QueryContext(ctx, `SELECT id FROM agents WHERE task_id=? AND role=?`, task, api.AgentRoleOwnerHelper)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[string]bool{}
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		out[id] = true
+	}
+	return out, rows.Err()
 }
 
 // armRotations counts committed rotations whose old run matched each arm.

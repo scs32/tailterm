@@ -1427,3 +1427,75 @@ func TestActivityReportReasonChangeReachesHub(t *testing.T) {
 		t.Fatalf("repeat reported %+v", h.reports)
 	}
 }
+
+// Review f3 (#15848): after an upgrade, a cursor an older relay saved (its key
+// has no reason) must not make every idle binding send one extra report; the
+// 09-24 relay 429 incident came from such a burst. The key upgrades in place,
+// and a later rate-limit turn end is still reported.
+func TestActivityReportKeyUpgradeSendsNoBurst(t *testing.T) {
+	for _, first := range []string{"end_turn", "server_error"} {
+		t.Run(first, func(t *testing.T) {
+			cols, rows := 200, 50
+			stubPaneSize(t, &cols, &rows)
+			b, h, _, tick := stuckFixture(t, "claude")
+			transcript := filepath.Join(os.Getenv("HOME"), ".claude", "projects", "p", b.Thread+".jsonl")
+			records := []string{claudeAPIErrorPrompt, claudeAPIErrorEndTurn}
+			if first == "server_error" {
+				records = append(records, claudeAPIErrorRecord, claudeAPIErrorTurnDuration)
+			}
+			text := strings.Join(records, "\n") + "\n"
+			if err := os.WriteFile(transcript, []byte(text), 0600); err != nil {
+				t.Fatal(err)
+			}
+			now := time.Date(2026, 9, 25, 20, 0, 0, 0, time.UTC)
+			if err := tick(now); err != nil {
+				t.Fatal(err)
+			}
+			if len(h.reports) != 1 || h.reports[0].State != "idle" {
+				t.Fatalf("first report %+v", h.reports)
+			}
+			// Rewrite the cursor as the previous relay saved it.
+			cursorPath := filepath.Join(relayDir(), bindingKey(b)+".activity.json")
+			data, err := os.ReadFile(cursorPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var cursor map[string]any
+			if err = json.Unmarshal(data, &cursor); err != nil {
+				t.Fatal(err)
+			}
+			if legacy := legacyActivityKey(h.reports[0]); legacy == "" {
+				delete(cursor, "lastWakeKey")
+			} else {
+				cursor["lastWakeKey"] = legacy
+			}
+			if data, err = json.Marshal(cursor); err != nil {
+				t.Fatal(err)
+			}
+			if err = os.WriteFile(cursorPath, data, 0600); err != nil {
+				t.Fatal(err)
+			}
+			if err = tick(now.Add(30 * time.Second)); err != nil {
+				t.Fatal(err)
+			}
+			if len(h.reports) != 1 {
+				t.Fatalf("upgrade sent an extra report %+v", h.reports)
+			}
+			var upgraded activityCursor
+			if data, err = os.ReadFile(cursorPath); err != nil || json.Unmarshal(data, &upgraded) != nil || !strings.HasPrefix(upgraded.LastWakeKey, activityKeyVersion) {
+				t.Fatalf("key not upgraded in place: %q %v", upgraded.LastWakeKey, err)
+			}
+			record := strings.Replace(claudeAPIErrorRecord, `"error":"server_error"`, `"error":"rate_limit"`, 1)
+			text += strings.Join([]string{claudeAPIErrorPrompt, record, claudeAPIErrorTurnDuration}, "\n") + "\n"
+			if err = os.WriteFile(transcript, []byte(text), 0600); err != nil {
+				t.Fatal(err)
+			}
+			if err = tick(now.Add(60 * time.Second)); err != nil {
+				t.Fatal(err)
+			}
+			if len(h.reports) != 2 || h.reports[1].Reason != "turn ended by API error (rate_limit)" {
+				t.Fatalf("rate limit after upgrade %+v", h.reports)
+			}
+		})
+	}
+}

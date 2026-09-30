@@ -400,7 +400,15 @@ func relayActivityTick(ctx context.Context, b runtimeBinding, client *api.Client
 		downgradeStuck(&state)
 	}
 	key := activityReportKey(state)
-	if (state.State == c.LastState && key == c.LastWakeKey) || (state.State == c.RejectedState && key == c.RejectedWakeKey) {
+	sameLast := state.State == c.LastState && sameActivityKey(c.LastWakeKey, state)
+	if sameLast || (state.State == c.RejectedState && sameActivityKey(c.RejectedWakeKey, state)) {
+		// A key an older relay saved upgrades in place, without a report, so
+		// an upgrade sends no burst of reports from idle bindings.
+		if sameLast {
+			c.LastWakeKey = key
+		} else {
+			c.RejectedWakeKey = key
+		}
 		return save()
 	}
 	c.RejectedState, c.RejectedWakeKey = "", ""
@@ -534,13 +542,29 @@ func stuckFallback(b runtimeBinding, c *activityCursor, err error) (*api.Activit
 // activityReportKey is what, besides the state, makes a new activity report.
 // An idle or finished_silent reason is part of it, so a turn that ends by an
 // API rate limit reaches the hub (docs/handler-ab.md); stuck reasons change
-// too often and are left out.
+// too often and are left out. The version prefix tells it from the key an
+// older relay saved, which had no reason.
 func activityReportKey(a api.AgentActivity) string {
-	key := wakeKey(a.Wake) + runtimePromptKey(a.Prompt)
+	key := activityKeyVersion + legacyActivityKey(a)
 	if a.State == "idle" || a.State == "finished_silent" {
 		key += "\x00reason=" + a.Reason
 	}
 	return key
+}
+
+const activityKeyVersion = "k2\x00"
+
+func legacyActivityKey(a api.AgentActivity) string {
+	return wakeKey(a.Wake) + runtimePromptKey(a.Prompt)
+}
+
+// sameActivityKey compares a saved key with an observation. An older relay's
+// key cannot show the reason, so it is compared without one.
+func sameActivityKey(saved string, a api.AgentActivity) bool {
+	if strings.HasPrefix(saved, activityKeyVersion) {
+		return saved == activityReportKey(a)
+	}
+	return saved == legacyActivityKey(a)
 }
 
 func wakeKey(w *api.WakeOutcome) string {

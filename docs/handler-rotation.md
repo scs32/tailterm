@@ -112,7 +112,7 @@ The rotation row, successor and obligations stay as they were.
 | `name_taken` | The successor name is wrong or already used by an open agent. |
 | `successor_unavailable` | At commit, the successor is not a registered, online handler on the old handler's host, runtime and directory. |
 | `agent_caller` | The request carries an agent identity. |
-| `arm_changed` | At commit, the old run has a recorded model and the successor's runtime, model or reasoning differs: rotation stays within the handler arm ([handler arms](handler-ab.md)). `tt handler rotate` refuses before spawning when the saved spec's `--model` or `--reasoning` differs from the old run's. |
+| `arm_changed` | At commit, the project has a saved [handler arm policy](handler-ab.md), the old run belongs to one of its arms and the successor does not belong to the same arm. `tt handler rotate` refuses before spawning in that case when the saved spec's `--model` or `--reasoning` differs from the old run's. Without a policy nothing changes. |
 
 Commit repeats the idle checks. A handler that became busy after prepare gets a
 409, and the rotation stays prepared until a later attempt finds it idle.

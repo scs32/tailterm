@@ -111,6 +111,27 @@ func TestHandlerArmCommandSetGetReplayAndRefusals(t *testing.T) {
 	}
 }
 
+// Disabling, or saving a disabled policy, needs no saved spec or digest.
+func TestHandlerArmCommandDisableNeedsNoSpec(t *testing.T) {
+	f, _ := armCLIFixture(t)
+	if err := os.Remove(handlerSpecPath(f.e.hub, f.task.ID)); err != nil {
+		t.Fatal(err)
+	}
+	arms := []string{"--arm", "S=claude-sonnet-5-5/claude/high:1", "--arm", "O=gpt-6.1-sol/codex/high:1", "--seed", "K"}
+	if _, err := captureCLIOutput(t, func() error {
+		return cmdHandlerArms(f.e, append([]string{"set", "--task", f.task.ID, "--revision", "0", "--enabled=false"}, arms...))
+	}); err != nil {
+		t.Fatalf("disabled save without a spec: %v", err)
+	}
+	if err := cmdHandlerArms(f.e, []string{"set", "--task", f.task.ID, "--revision", "1", "--enabled"}); err == nil || !strings.Contains(err.Error(), "no handler launch spec") {
+		t.Fatalf("enabling without a spec: %v", err)
+	}
+	view, err := f.c.HandlerArmPolicy(context.Background(), f.task.ID)
+	if err != nil || view.Policy.Revision != 1 || view.Policy.Enabled || view.Policy.TemplateDigest != "" {
+		t.Fatalf("policy %+v %v", view.Policy, err)
+	}
+}
+
 func TestHandlerABReportCommandPrintsArms(t *testing.T) {
 	f, _ := armCLIFixture(t)
 	if _, err := captureCLIOutput(t, func() error {

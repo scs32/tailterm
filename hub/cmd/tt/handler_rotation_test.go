@@ -844,23 +844,38 @@ func TestQueueHandlerBriefingIntakeOwnershipAndPlainDone(t *testing.T) {
 	}
 }
 
-// Handler arms (wi_fc1396aef8a72a06): rotation stays within the old run's
-// arm. A saved spec with another model or reasoning is refused before any
-// spawn or prepare; a matching spec rotates and records the same model.
-func TestHandlerRotationSpecArmPrecheck(t *testing.T) {
+// Handler arms (wi_fc1396aef8a72a06): under a saved arm policy, rotation stays
+// within the old run's arm. A saved spec with another model or reasoning is
+// refused before any spawn or prepare; a matching spec rotates and records the
+// same model. Without a policy, rotation is unchanged.
+func armedRotationCLI(t *testing.T, armed bool) *rotationCLI {
+	t.Helper()
 	f := newRotationCLI(t, "")
 	if _, err := f.db(t).Exec(`INSERT OR REPLACE INTO handler_runs(task_id,agent_id,run_id,template_digest,model,reasoning,created_at) VALUES(?,?,?,?,?,?,?)`,
 		f.task.ID, f.old.ID, f.old.RunID, handlerTemplateDigest("handler assignment"), "claude-sonnet-5-5", "high", time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
 		t.Fatal(err)
 	}
-	spec := func(extra ...string) handlerSpec {
-		s, err := newHandlerSpec(f.c.Base, f.task.ID, append([]string{"--run", "sleep 300", "--runtime", "generic", "--cwd", f.dir, "--prompt", "handler assignment"}, extra...))
-		if err != nil {
+	if armed {
+		if _, err := f.c.SetHandlerArmPolicy(context.Background(), f.task.ID, api.HandlerArmPolicyRequest{RequestID: "arms", Seed: "K", Arms: []api.HandlerArm{
+			{ID: "S", Runtime: "generic", Model: "claude-sonnet-5-5", Reasoning: "high", Weight: 1}, {ID: "O", Runtime: "codex", Model: "gpt-6.1-sol", Reasoning: "high", Weight: 1}}}); err != nil {
 			t.Fatal(err)
 		}
-		return s
 	}
-	for _, s := range []handlerSpec{spec("--model", "claude-opus-5-5", "--reasoning", "high"), spec("--model", "claude-sonnet-5-5", "--reasoning", "max"), spec()} {
+	return f
+}
+
+func (f *rotationCLI) armSpec(t *testing.T, extra ...string) handlerSpec {
+	t.Helper()
+	s, err := newHandlerSpec(f.c.Base, f.task.ID, append([]string{"--run", "sleep 300", "--runtime", "generic", "--cwd", f.dir, "--prompt", "handler assignment"}, extra...))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return s
+}
+
+func TestHandlerRotationSpecArmPrecheck(t *testing.T) {
+	f := armedRotationCLI(t, true)
+	for _, s := range []handlerSpec{f.armSpec(t, "--model", "claude-opus-5-5", "--reasoning", "high"), f.armSpec(t, "--model", "claude-sonnet-5-5", "--reasoning", "max"), f.armSpec(t)} {
 		f.spec = s
 		if _, err := f.rotate(t); err == nil || !strings.Contains(err.Error(), api.HandlerRotationRefusedArmChanged) {
 			t.Fatalf("spec %v: %v", s.Args, err)
@@ -869,7 +884,7 @@ func TestHandlerRotationSpecArmPrecheck(t *testing.T) {
 	if f.spawns != 0 || f.actions.Load() != 0 {
 		t.Fatalf("refused rotation spawned %d and sent %d actions", f.spawns, f.actions.Load())
 	}
-	f.spec = spec("--model", "claude-sonnet-5-5", "--reasoning", "high")
+	f.spec = f.armSpec(t, "--model", "claude-sonnet-5-5", "--reasoning", "high")
 	r, err := f.rotate(t)
 	if err != nil {
 		t.Fatal(err)
@@ -880,8 +895,18 @@ func TestHandlerRotationSpecArmPrecheck(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, h := range view.Handlers {
-		if h.AgentID == successor.ID && (h.Model != "claude-sonnet-5-5" || h.Reasoning != "high") {
+		if h.AgentID == successor.ID && (h.Model != "claude-sonnet-5-5" || h.Reasoning != "high" || h.Arm != "S") {
 			t.Fatalf("successor recorded %+v", h)
 		}
 	}
+}
+
+func TestHandlerRotationWithoutArmPolicyIgnoresSpecModel(t *testing.T) {
+	f := armedRotationCLI(t, false)
+	f.spec = f.armSpec(t, "--model", "claude-opus-5-5", "--reasoning", "max")
+	r, err := f.rotate(t)
+	if err != nil {
+		t.Fatalf("rotation without an arm policy: %v", err)
+	}
+	f.assertRotated(t, r, 0)
 }

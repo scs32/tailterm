@@ -38,7 +38,9 @@ tt handler ab-report --task T [--json]  # the comparison
 
 `--arm` is `ID=MODEL/RUNTIME/REASONING:WEIGHT`; the model may contain slashes.
 Giving any `--arm` replaces every arm; other flags keep their saved values when
-omitted. `--hold-minutes` sets the Claude limit hold. `--prompt-file` gives the
+omitted. Only enabling reads the template: disabling, or saving a disabled
+policy, keeps the saved digest and needs no saved spec unless `--prompt-file`
+is given. `--hold-minutes` sets the Claude limit hold. `--prompt-file` gives the
 handler assignment prompt; by default it is the saved handler spec's
 `--prompt` (`tt handler spec`), which must hold the Planned database-role text
 so rotation successors match. The policy is revision-checked and keyed: the
@@ -59,7 +61,8 @@ Each of these is a 400 and writes nothing:
 - each arm has a runtime, model and reasoning, and no two arms share all three;
 - `limitHoldMinutes` is 5 to 1440 (0 means the default, 60);
 - the seed is non-empty text of at most 128 characters;
-- the template digest is 64 lowercase hex characters.
+- an enabled policy has a template digest of 64 lowercase hex characters (a
+  disabled one may have none).
 
 ## Arm identity and template parity
 
@@ -122,11 +125,13 @@ TailOS the Delivery row reads `Handler NAME · lease N · arm S`, plus
 
 ## Rotation within an arm
 
-Handler rotation stays primary-only and inside the arm. Commit returns 409
-`arm_changed`, and moves nothing, when the old run has a recorded model and the
-successor's runtime, model or reasoning differs. `tt handler rotate` refuses
-before spawning when the saved spec's `--model` or `--reasoning` differs from
-the old run's recorded values. An arm that does not rotate grows context; the
+Handler rotation stays primary-only and, under a saved arm policy, inside the
+arm. When the project has a saved policy (enabled or not) and the old run
+belongs to one of its arms, commit returns 409 `arm_changed`, and moves
+nothing, if the successor is not in the same arm. `tt handler rotate` refuses
+before spawning in the same case when the saved spec's `--model` or
+`--reasoning` differs from the old run's recorded values. Without a policy, or
+for a run of no arm, rotation is unchanged. An arm that does not rotate grows context; the
 report shows rotations and mean input tokens per request per arm.
 
 ## Provider limits
@@ -164,9 +169,13 @@ expired episodes in its own transaction just before the draw, so a claim that
 then waits does not undo the clearing. Replayed activity reports and replayed
 claims return their stored results and post nothing.
 
-The hub's same-state check and the relay's report dedupe both include the
-reason for `idle` and `finished_silent`, so a turn that ends by the rate limit
-reaches the hub. Stuck reasons change often and are left out of the relay key.
+The hub stores a report whose state is unchanged when its reason differs, for
+every state. The relay sends one only for `idle` and `finished_silent`: its
+report key includes the reason for those two states, so a turn that ends by the
+rate limit reaches the hub, while stuck reasons, which change often, stay out
+of the key. The new key carries a version prefix. A key an older relay saved
+has no reason and is compared without one, then upgraded in place, so an
+upgrade sends no extra report from idle bindings.
 
 Entries already leased to a limited arm keep their handler. There is no
 automatic handoff; the owner path `tt team queue fail` is unchanged.
@@ -196,7 +205,11 @@ Per item:
 - `incorrectSaves = ownerCorrections + gateFixes`. `ownerCorrections` counts
   each handler revision written within the lease window whose changed fields a
   later owner revision (no agent) of the same item changes again. `gateFixes`
-  counts `gate-fix` owner interventions on the item.
+  counts `gate-fix` owner interventions on the item. An owner-attributed
+  revision is a native write by the owner's own helper session, or with no
+  agent by a caller other than the hub's system writers (`system`,
+  `team_queue`, `handler_arms`); reconstructed history and checkpoints never
+  count.
 - `linkCorrections`: message-audit `correct` events on handler-authored
   messages linked to the item. Context only, not a quality count.
 - `interventions`: owner interventions on the item by kind.

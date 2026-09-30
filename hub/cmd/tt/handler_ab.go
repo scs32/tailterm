@@ -143,8 +143,13 @@ func cmdHandlerArms(e env, args []string) error {
 		if flagPresent(args, "hold-minutes") {
 			req.LimitHoldMinutes = *hold
 		}
-		if req.TemplateDigest, err = armTemplateDigest(e, *task, *promptFile); err != nil {
-			return err
+		// Only enabling needs the reference template; a disabled save keeps
+		// the saved digest unless a prompt file is given.
+		req.TemplateDigest = current.TemplateDigest
+		if req.Enabled || *promptFile != "" {
+			if req.TemplateDigest, err = armTemplateDigest(e, *task, *promptFile); err != nil {
+				return err
+			}
 		}
 		req.RequestID = *requestID
 		if req.RequestID == "" {
@@ -286,9 +291,10 @@ func derefString(v *string) string {
 	return *v
 }
 
-// checkRotationArm refuses a rotation before any spawn when the saved spec's
-// model or reasoning differs from the old run's recorded values: rotation
-// stays within a handler arm. A hub without handler arms skips the check.
+// checkRotationArm refuses a rotation before any spawn when the project has a
+// saved arm policy, the old run belongs to one of its arms, and the saved
+// spec's model or reasoning differs from the old run's: rotation stays within
+// the arm. Without a policy, or on a hub without handler arms, it passes.
 func checkRotationArm(ctx context.Context, c *api.Client, task string, old api.Agent, spec handlerSpec) error {
 	view, err := c.HandlerArmPolicy(ctx, task)
 	var httpErr *api.HTTPError
@@ -298,8 +304,11 @@ func checkRotationArm(ctx context.Context, c *api.Client, task string, old api.A
 	if err != nil {
 		return err
 	}
+	if view.Policy.Revision == 0 {
+		return nil
+	}
 	for _, h := range view.Handlers {
-		if h.AgentID != old.ID || h.RunID != old.RunID || h.Model == "" {
+		if h.AgentID != old.ID || h.RunID != old.RunID || h.Arm == "" {
 			continue
 		}
 		if spec.value("model") != h.Model || spec.value("reasoning") != h.Reasoning {
