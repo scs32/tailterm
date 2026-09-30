@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -128,10 +129,15 @@ func freeStewardName(agents []api.Agent, base, self string) string {
 	}
 }
 
-// stewardLaunchArgs are the tt spawn flags for the steward template.
-func stewardLaunchArgs(t stewardTemplate, hub, task, agentID, name, cwd, permissionMode string) []string {
+// stewardLaunchArgs are the tt spawn flags for the steward template. The
+// project's lifecycle generation rises with each pause and resume, and
+// admission requires the current one.
+func stewardLaunchArgs(t stewardTemplate, hub, task, agentID, name, cwd, permissionMode string, lifecycle int64) []string {
 	args := []string{"--role", api.AgentRoleBacklogSteward, "--agent-id", agentID, "--name", name, "--task", task, "--hub", hub,
 		"--run", t.Runtime, "--runtime", t.Runtime, "--cwd", cwd, "--prompt", t.Prompt}
+	if lifecycle > 0 {
+		args = append(args, "--expected-lifecycle-generation", strconv.FormatInt(lifecycle, 10))
+	}
 	if t.Model != "" {
 		args = append(args, "--model", t.Model)
 	}
@@ -222,7 +228,7 @@ func setupSteward(ctx context.Context, d stewardDeps, e env, c *api.Client, task
 	if err = saveStewardIdentity(id); err != nil {
 		return zero, err
 	}
-	args := stewardLaunchArgs(tmpl, hub, task, id.AgentID, id.Name, id.Cwd, id.PermissionMode)
+	args := stewardLaunchArgs(tmpl, hub, task, id.AgentID, id.Name, id.Cwd, id.PermissionMode, detail.Task.LifecycleGeneration)
 	if expectedRun != "" {
 		args = append(args, "--expected-run-id", expectedRun)
 	}
@@ -261,11 +267,12 @@ func launchStewardBriefing(ctx context.Context, c *api.Client, task, role string
 	if status.Steward != nil {
 		out.Active = status.Steward.Name
 	}
+	out.SummaryRevision = status.SummaryRevision
 	return out, nil
 }
 
 func cmdSteward(e env, args []string) error {
-	usage := errors.New("usage: tt steward template|setup (see tt steward SUBCOMMAND --help)")
+	usage := errors.New("usage: tt steward template|setup|summary (see tt steward SUBCOMMAND --help)")
 	if len(args) == 0 {
 		return usage
 	}
@@ -274,6 +281,8 @@ func cmdSteward(e env, args []string) error {
 		return cmdStewardTemplate(e, args[1:])
 	case "setup":
 		return cmdStewardSetup(e, args[1:], productionStewardDeps())
+	case "summary":
+		return cmdStewardSummary(e, args[1:])
 	}
 	return usage
 }
@@ -342,5 +351,90 @@ func cmdStewardSetup(e env, args []string, d stewardDeps) error {
 		return nil
 	}
 	fmt.Printf("Backlog steward %s (%s / %s) is %s on %s.\n", a.Name, a.ID, a.RunID, a.Status, a.Host)
+	return nil
+}
+
+// cmdStewardSummary reads and saves the backlog summary. Any session reads
+// it; only the active steward's exact run or the owner saves it.
+func cmdStewardSummary(e env, args []string) error {
+	usage := errors.New("usage: tt steward summary get [--revision N] | set --revision N --body-file F --request-id KEY | history [--task ID] [--json]")
+	if len(args) == 0 || (args[0] != "get" && args[0] != "set" && args[0] != "history") {
+		return usage
+	}
+	operation := args[0]
+	fs := flag.NewFlagSet("steward summary", flag.ContinueOnError)
+	task := fs.String("task", e.task, "project ID")
+	revision := fs.Int64("revision", -1, "get: the revision to read (default latest); set: the current revision you read")
+	bodyFile := fs.String("body-file", "", "set: file holding the new summary (at most 64 KiB)")
+	requestID := fs.String("request-id", "", "set: stable retry key")
+	jsonOut := fs.Bool("json", false, "JSON output")
+	if err := fs.Parse(args[1:]); err != nil {
+		return err
+	}
+	if !api.ValidID(*task, "tsk") || fs.NArg() != 0 {
+		return usage
+	}
+	c, err := e.client(20 * time.Second)
+	if err != nil {
+		return err
+	}
+	ctx, cancel := ctxTimeout(20 * time.Second)
+	defer cancel()
+	switch operation {
+	case "get":
+		rev := *revision
+		if rev < 0 {
+			rev = 0
+		}
+		b, err := c.BacklogSummary(ctx, *task, rev)
+		var httpErr *api.HTTPError
+		if errors.As(err, &httpErr) && httpErr.Status == 404 && rev == 0 {
+			return errors.New("no backlog summary is saved yet; save revision 1 with tt steward summary set --revision 0 --body-file F --request-id KEY")
+		}
+		if err != nil {
+			return err
+		}
+		if *jsonOut {
+			printJSON(b)
+			return nil
+		}
+		fmt.Printf("Backlog summary revision %d (%d bytes, digest %s, saved %s)\n\n%s\n", b.Revision, b.Bytes, b.Digest, b.CreatedAt.Format(time.RFC3339), b.Body)
+	case "set":
+		if *revision < 0 || *bodyFile == "" || *requestID == "" {
+			return errors.New("tt steward summary set needs --revision (the current revision, 0 for the first), --body-file and --request-id")
+		}
+		body, err := os.ReadFile(*bodyFile)
+		if err != nil {
+			return err
+		}
+		if len(body) > api.MaxBacklogSummaryLen {
+			return fmt.Errorf("the summary is %d bytes; the limit is %d", len(body), api.MaxBacklogSummaryLen)
+		}
+		b, err := c.SaveBacklogSummary(ctx, *task, api.SaveBacklogSummaryRequest{ExpectedRevision: *revision, Body: string(body), RequestID: *requestID, AgentID: e.agent, RunID: e.runID})
+		if err != nil {
+			return err
+		}
+		if *jsonOut {
+			printJSON(b)
+			return nil
+		}
+		fmt.Printf("Saved backlog summary revision %d (%d bytes, digest %s).\n", b.Revision, b.Bytes, b.Digest)
+	case "history":
+		revisions, err := c.BacklogSummaryRevisions(ctx, *task)
+		if err != nil {
+			return err
+		}
+		if *jsonOut {
+			printJSON(revisions)
+			return nil
+		}
+		for _, b := range revisions {
+			by := b.AgentID
+			if by == "" {
+				by = "owner"
+			}
+			fmt.Printf("r%d  %s  %6d bytes  %s  by %s\n", b.Revision, b.CreatedAt.Format(time.RFC3339), b.Bytes, b.Digest[:12], by)
+		}
+	}
 	return nil
 }

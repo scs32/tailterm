@@ -230,6 +230,11 @@ func backlogStewardBriefing(briefing string, agents []api.Agent, steward steward
 	} else {
 		briefing += "\nNo active Database handler is registered yet. Keep drafts in the backlog summary and tell the owner that filing waits for a handler; there is no direct write fallback."
 	}
+	if steward.SummaryRevision > 0 {
+		briefing += fmt.Sprintf("\nThe latest backlog summary is revision %d. Read it first with tt steward summary get; it, not chat history, is your context.", steward.SummaryRevision)
+	} else {
+		briefing += "\nNo backlog summary is saved yet. Build one from the backlog (tt work-items list, tt work-items triage, tt team queue list) and save revision 1 with tt steward summary set --revision 0 --body-file F --request-id KEY."
+	}
 	return briefing
 }
 

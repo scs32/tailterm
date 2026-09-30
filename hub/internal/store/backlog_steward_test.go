@@ -469,3 +469,66 @@ func TestTriageHeldForTriageListsUnrefinedFollowUps(t *testing.T) {
 		}
 	}
 }
+
+func TestBacklogSummaryRevisionsReplayAndWriters(t *testing.T) {
+	s, task := stewardStore(t)
+	ctx := context.Background()
+	steward := liveSteward(t, s, task.ID, "backlog-steward")
+	save := func(key string, expected int64, body string, who api.Agent) (api.BacklogSummary, error) {
+		return s.SaveBacklogSummary(ctx, task.ID, api.SaveBacklogSummaryRequest{ExpectedRevision: expected, Body: body, RequestID: key, AgentID: who.ID, RunID: who.RunID}, stewardBy)
+	}
+	if _, err := s.BacklogSummary(ctx, task.ID, 0); !errors.Is(err, api.ErrNotFound) {
+		t.Fatalf("summary before any save: %v", err)
+	}
+	r1, err := save("summary-1", 0, "## Themes\nsynthetic theme one", steward)
+	if err != nil || r1.Revision != 1 || r1.AgentID != steward.ID || r1.RunID != steward.RunID || r1.Digest != summaryDigest(r1.Body) {
+		t.Fatalf("revision 1: %+v %v", r1, err)
+	}
+	r2, err := save("summary-2", 1, "## Themes\nsynthetic theme two", steward)
+	if err != nil || r2.Revision != 2 {
+		t.Fatalf("revision 2: %+v %v", r2, err)
+	}
+	if _, err = save("summary-stale", 1, "stale edit", steward); !errors.Is(err, api.ErrConflict) {
+		t.Fatalf("stale revision: %v", err)
+	}
+	if replay, err := save("summary-1", 0, "## Themes\nsynthetic theme one", steward); err != nil || replay.Revision != 1 || replay.Digest != r1.Digest {
+		t.Fatalf("replay: %+v %v", replay, err)
+	}
+	if _, err = save("summary-1", 0, "a changed payload", steward); !errors.Is(err, api.ErrConflict) {
+		t.Fatalf("changed payload under a used request ID: %v", err)
+	}
+	worker, err := s.AddAgent(ctx, task.ID, api.AddAgentRequest{Name: "worker", Host: "mini", Session: "worker", Runtime: "claude"}, stewardBy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = save("summary-worker", 2, "not the steward", worker); !errors.Is(err, api.ErrConflict) {
+		t.Fatalf("ordinary agent save: %v", err)
+	}
+	// The owner may save; a retired steward may not.
+	if r3, err := save("summary-owner", 2, "owner correction", api.Agent{}); err != nil || r3.Revision != 3 || r3.AgentID != "" {
+		t.Fatalf("owner save: %+v %v", r3, err)
+	}
+	setAgentStatus(t, s, steward.ID, api.AgentRetired)
+	if _, err = save("summary-retired", 3, "retired steward", steward); !errors.Is(err, api.ErrConflict) {
+		t.Fatalf("retired steward save: %v", err)
+	}
+	latest, err := s.BacklogSummary(ctx, task.ID, 0)
+	if err != nil || latest.Revision != 3 || latest.Body != "owner correction" {
+		t.Fatalf("latest: %+v %v", latest, err)
+	}
+	named, err := s.BacklogSummary(ctx, task.ID, 2)
+	if err != nil || named.Body != r2.Body {
+		t.Fatalf("named revision: %+v %v", named, err)
+	}
+	list, err := s.BacklogSummaryRevisions(ctx, task.ID)
+	if err != nil || len(list) != 3 || list[0].Revision != 1 || list[2].Revision != 3 || list[0].Body != "" || list[1].Bytes != len(r2.Body) {
+		t.Fatalf("revisions: %+v %v", list, err)
+	}
+	status, err := s.BacklogStewardStatus(ctx, task.ID)
+	if err != nil || status.SummaryRevision != 3 || status.SummaryDigest != latest.Digest {
+		t.Fatalf("status summary pointer: %+v %v", status, err)
+	}
+	if _, err = save("summary-empty", 3, "   ", api.Agent{}); !errors.Is(err, api.ErrInvalid) {
+		t.Fatalf("empty summary: %v", err)
+	}
+}

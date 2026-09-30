@@ -2,10 +2,13 @@ package store
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/scs32/tailterm/hub/internal/api"
 )
@@ -25,7 +28,12 @@ func migrateBacklogSteward(db *sql.DB) error {
 	}
 	_, err := db.Exec(`CREATE UNIQUE INDEX IF NOT EXISTS agents_one_backlog_steward ON agents(task_id) WHERE role='backlog_steward' AND status<>'closed' AND steward_pending=0;
 CREATE TABLE IF NOT EXISTS steward_runs (
- task_id TEXT NOT NULL, agent_id TEXT NOT NULL, run_id TEXT PRIMARY KEY, template_digest TEXT NOT NULL, created_at TEXT NOT NULL);`)
+ task_id TEXT NOT NULL, agent_id TEXT NOT NULL, run_id TEXT PRIMARY KEY, template_digest TEXT NOT NULL, created_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS backlog_summaries (
+ task_id TEXT NOT NULL REFERENCES tasks(id), revision INTEGER NOT NULL, body TEXT NOT NULL, digest TEXT NOT NULL,
+ agent_id TEXT NOT NULL, run_id TEXT NOT NULL, request_id TEXT NOT NULL, payload_hash TEXT NOT NULL,
+ created_node TEXT NOT NULL, created_user TEXT NOT NULL, created_at TEXT NOT NULL,
+ PRIMARY KEY(task_id,revision), UNIQUE(task_id,request_id));`)
 	return err
 }
 
@@ -137,6 +145,141 @@ func (s *Store) BacklogStewardStatus(ctx context.Context, task string) (api.Back
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return out, err
 	}
+	err = s.db.QueryRowContext(ctx, `SELECT revision,digest FROM backlog_summaries WHERE task_id=? ORDER BY revision DESC LIMIT 1`, task).Scan(&out.SummaryRevision, &out.SummaryDigest)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return out, err
+	}
+	return out, nil
+}
+
+// ---- Backlog summary ----
+
+const backlogSummaryCols = `task_id,revision,body,digest,agent_id,run_id,request_id,created_node,created_user,created_at`
+
+func scanBacklogSummary(row interface{ Scan(...any) error }) (api.BacklogSummary, error) {
+	var b api.BacklogSummary
+	var created string
+	err := row.Scan(&b.TaskID, &b.Revision, &b.Body, &b.Digest, &b.AgentID, &b.RunID, &b.RequestID, &b.CreatedBy.Node, &b.CreatedBy.User, &created)
+	b.CreatedAt, b.Bytes = parseTS(created), len(b.Body)
+	return b, err
+}
+
+func summaryDigest(body string) string {
+	sum := sha256.Sum256([]byte(body))
+	return hex.EncodeToString(sum[:])
+}
+
+// BacklogSummary reads the latest revision, or rev when rev > 0. Any caller
+// may read it.
+func (s *Store) BacklogSummary(ctx context.Context, task string, rev int64) (api.BacklogSummary, error) {
+	if !api.ValidID(task, "tsk") || rev < 0 {
+		return api.BacklogSummary{}, api.ErrInvalid
+	}
+	if _, err := s.GetTask(ctx, task); err != nil {
+		return api.BacklogSummary{}, err
+	}
+	var row *sql.Row
+	if rev > 0 {
+		row = s.db.QueryRowContext(ctx, `SELECT `+backlogSummaryCols+` FROM backlog_summaries WHERE task_id=? AND revision=?`, task, rev)
+	} else {
+		row = s.db.QueryRowContext(ctx, `SELECT `+backlogSummaryCols+` FROM backlog_summaries WHERE task_id=? ORDER BY revision DESC LIMIT 1`, task)
+	}
+	b, err := scanBacklogSummary(row)
+	if errors.Is(err, sql.ErrNoRows) {
+		return b, api.ErrNotFound
+	}
+	return b, err
+}
+
+// BacklogSummaryRevisions lists every revision, oldest first, without bodies.
+func (s *Store) BacklogSummaryRevisions(ctx context.Context, task string) ([]api.BacklogSummary, error) {
+	if _, err := s.GetTask(ctx, task); err != nil {
+		return nil, err
+	}
+	rows, err := s.db.QueryContext(ctx, `SELECT `+backlogSummaryCols+` FROM backlog_summaries WHERE task_id=? ORDER BY revision`, task)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []api.BacklogSummary{}
+	for rows.Next() {
+		b, err := scanBacklogSummary(rows)
+		if err != nil {
+			return nil, err
+		}
+		b.Body = ""
+		out = append(out, b)
+	}
+	return out, rows.Err()
+}
+
+// SaveBacklogSummary appends the next revision. Only the exact run of the
+// project's active steward, or the owner, may save; a stale expected
+// revision is refused, and a replayed request ID returns the saved row.
+func (s *Store) SaveBacklogSummary(ctx context.Context, task string, req api.SaveBacklogSummaryRequest, by api.Caller) (api.BacklogSummary, error) {
+	var zero api.BacklogSummary
+	if !api.ValidID(task, "tsk") || !validRequestID(req.RequestID) || req.ExpectedRevision < 0 || strings.TrimSpace(req.Body) == "" ||
+		len(req.Body) > api.MaxBacklogSummaryLen || !utf8.ValidString(req.Body) || strings.ContainsRune(req.Body, 0) {
+		return zero, api.ErrInvalid
+	}
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return zero, err
+	}
+	defer tx.Rollback()
+	hash := requestHash(req)
+	prior, err := scanBacklogSummary(tx.QueryRowContext(ctx, `SELECT `+backlogSummaryCols+` FROM backlog_summaries WHERE task_id=? AND request_id=?`, task, req.RequestID))
+	if err == nil {
+		var priorHash string
+		if err = tx.QueryRowContext(ctx, `SELECT payload_hash FROM backlog_summaries WHERE task_id=? AND request_id=?`, task, req.RequestID).Scan(&priorHash); err != nil {
+			return zero, err
+		}
+		if priorHash != hash {
+			return zero, workItemConflict("backlog summary request ID was already used with different input")
+		}
+		return prior, nil
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return zero, err
+	}
+	t, err := scanTask(tx.QueryRowContext(ctx, `SELECT `+taskCols+` FROM tasks WHERE id=?`, task))
+	if errors.Is(err, sql.ErrNoRows) {
+		return zero, api.ErrNotFound
+	}
+	if err != nil {
+		return zero, err
+	}
+	if t.Status != api.TaskOpen {
+		return zero, api.ErrClosed
+	}
+	if req.AgentID != "" || req.RunID != "" {
+		if err = requireActiveStewardRun(ctx, tx, task, req.AgentID, req.RunID); err != nil {
+			return zero, fmt.Errorf("%w: only the owner or the active backlog steward's exact run may save the backlog summary", api.ErrConflict)
+		}
+	}
+	var current int64
+	if err = tx.QueryRowContext(ctx, `SELECT COALESCE(MAX(revision),0) FROM backlog_summaries WHERE task_id=?`, task).Scan(&current); err != nil {
+		return zero, err
+	}
+	if current != req.ExpectedRevision {
+		return zero, workItemConflict(fmt.Sprintf("the backlog summary is at revision %d; read it and save against that revision", current))
+	}
+	now := s.now()
+	out := api.BacklogSummary{TaskID: task, Revision: current + 1, Body: req.Body, Digest: summaryDigest(req.Body), Bytes: len(req.Body), AgentID: req.AgentID, RunID: req.RunID,
+		RequestID: req.RequestID, CreatedBy: by, CreatedAt: now}
+	if _, err = tx.ExecContext(ctx, `INSERT INTO backlog_summaries(`+backlogSummaryCols+`,payload_hash) VALUES(?,?,?,?,?,?,?,?,?,?,?)`,
+		out.TaskID, out.Revision, out.Body, out.Digest, out.AgentID, out.RunID, out.RequestID, by.Node, by.User, ts(now), hash); err != nil {
+		return zero, err
+	}
+	if _, err = s.insertEvent(ctx, tx, task, "task_updated", req.AgentID, "Backlog summary saved", map[string]any{"backlogSummaryRevision": out.Revision, "digest": out.Digest, "bytes": out.Bytes}, by); err != nil {
+		return zero, err
+	}
+	if err = tx.Commit(); err != nil {
+		return zero, err
+	}
+	s.notify(task)
 	return out, nil
 }
 

@@ -54,3 +54,37 @@ func TestTriageStewardRoute(t *testing.T) {
 		t.Fatalf("steward status = %d %+v", code, status)
 	}
 }
+
+func TestBacklogSummaryHTTPLimit(t *testing.T) {
+	c := newClient(t)
+	task := c.task("steward-summary")
+	steward := c.steward(task, "backlog-steward")
+	path := "/v1/tasks/" + task.ID + "/backlog-summary"
+	// A 64 KiB body of a character JSON escapes as \u0001 (six bytes each)
+	// fits the request limit; the summary limit is on the decoded body.
+	escaped := strings.Repeat("\x01", api.MaxBacklogSummaryLen)
+	var saved api.BacklogSummary
+	if code := c.do("POST", path, api.SaveBacklogSummaryRequest{ExpectedRevision: 0, Body: escaped, RequestID: "escaped", AgentID: steward.ID, RunID: steward.RunID}, &saved); code != 201 || saved.Revision != 1 || saved.Bytes != api.MaxBacklogSummaryLen {
+		t.Fatalf("64 KiB escaped summary = %d %+v", code, saved)
+	}
+	plain := strings.Repeat("s", api.MaxBacklogSummaryLen)
+	if code := c.do("POST", path, api.SaveBacklogSummaryRequest{ExpectedRevision: 1, Body: plain, RequestID: "plain", AgentID: steward.ID, RunID: steward.RunID}, &saved); code != 201 || saved.Revision != 2 {
+		t.Fatalf("64 KiB summary = %d %+v", code, saved)
+	}
+	if code := c.do("POST", path, api.SaveBacklogSummaryRequest{ExpectedRevision: 2, Body: plain + "s", RequestID: "over", AgentID: steward.ID, RunID: steward.RunID}, nil); code != 400 {
+		t.Fatalf("64 KiB + 1 summary = %d", code)
+	}
+	if code := c.do("POST", path, api.SaveBacklogSummaryRequest{ExpectedRevision: 1, Body: "stale", RequestID: "stale", AgentID: steward.ID, RunID: steward.RunID}, nil); code != 409 {
+		t.Fatalf("stale revision = %d", code)
+	}
+	var got api.BacklogSummary
+	if code := c.do("GET", path+"?revision=1", nil, &got); code != 200 || got.Body != escaped {
+		t.Fatalf("read revision 1 = %d (%d bytes)", code, len(got.Body))
+	}
+	var list struct {
+		Revisions []api.BacklogSummary `json:"revisions"`
+	}
+	if code := c.do("GET", path+"/revisions", nil, &list); code != 200 || len(list.Revisions) != 2 {
+		t.Fatalf("revisions = %d %+v", code, list)
+	}
+}

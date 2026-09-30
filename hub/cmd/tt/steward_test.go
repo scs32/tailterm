@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -517,5 +518,125 @@ func TestTriageHeldForTriageCLIAsSteward(t *testing.T) {
 	stale.runID = api.NewID("run")
 	if _, err = captureStdout(t, func() error { return cmdWorkItems(stale, []string{"triage", "--project", f.task.ID}) }); err == nil {
 		t.Fatal("a stale steward run read triage")
+	}
+}
+
+func (f *stewardCLI) saveSummary(t *testing.T, as api.Agent, revision int64, body, key string) {
+	t.Helper()
+	file := filepath.Join(t.TempDir(), "summary.md")
+	if err := os.WriteFile(file, []byte(body), 0600); err != nil {
+		t.Fatal(err)
+	}
+	e := env{hub: f.c.Base, task: f.task.ID, agent: as.ID, agentName: as.Name, runID: as.RunID}
+	if _, err := captureStdout(t, func() error {
+		return cmdStewardSummary(e, []string{"set", "--revision", strconv.FormatInt(revision, 10), "--body-file", file, "--request-id", key})
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func (f *stewardCLI) brief(t *testing.T, a api.Agent) string {
+	t.Helper()
+	out, err := captureStdout(t, func() error {
+		return cmdBrief(env{hub: f.c.Base, task: f.task.ID, agent: a.ID, agentName: a.Name})
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return out
+}
+
+func TestStewardSummaryBriefingNamesLatestRevision(t *testing.T) {
+	f := newStewardCLI(t)
+	steward := f.steward(t)
+	if own := f.brief(t, steward); !strings.Contains(own, "No backlog summary is saved yet") {
+		t.Fatalf("briefing without a summary:\n%s", own)
+	}
+	f.saveSummary(t, steward, 0, "## Themes\nsynthetic", "summary-r1")
+	f.saveSummary(t, steward, 1, "## Themes\nsynthetic, revised", "summary-r2")
+	if own := f.brief(t, steward); !strings.Contains(own, "The latest backlog summary is revision 2. Read it first with tt steward summary get") {
+		t.Fatalf("briefing with a summary:\n%s", own)
+	}
+	out, err := captureStdout(t, func() error {
+		return cmdStewardSummary(env{hub: f.c.Base, task: f.task.ID}, []string{"get", "--revision", "1"})
+	})
+	if err != nil || !strings.Contains(out, "Backlog summary revision 1") || !strings.Contains(out, "## Themes\nsynthetic\n") {
+		t.Fatalf("summary get: %q %v", out, err)
+	}
+	out, err = captureStdout(t, func() error { return cmdStewardSummary(env{hub: f.c.Base, task: f.task.ID}, []string{"history"}) })
+	if err != nil || !strings.Contains(out, "r1 ") || !strings.Contains(out, "r2 ") || !strings.Contains(out, "by "+steward.ID) {
+		t.Fatalf("summary history: %q %v", out, err)
+	}
+}
+
+// pauseAndResume pauses the project with every open agent as a target,
+// confirms cleanup, resumes it with a fresh planned lead and confirms that
+// lead's launch, as project_pause_test.go does.
+func (f *stewardCLI) pauseAndResume(t *testing.T) {
+	t.Helper()
+	ctx := context.Background()
+	by := api.Caller{Node: "fixture", User: "owner"}
+	agents, err := f.c.ListAgents(ctx, f.task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var targets []api.ProjectPauseTargetRequest
+	for _, a := range agents {
+		if a.Status != api.AgentClosed {
+			targets = append(targets, api.ProjectPauseTargetRequest{AgentID: a.ID, RunID: a.RunID, ServiceDisposition: api.PauseServiceNone})
+		}
+	}
+	task, err := f.st.GetTask(ctx, f.task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = f.st.PauseProject(ctx, f.task.ID, api.PauseProjectRequest{Version: 1, RequestID: "pause-" + api.NewID("req"), ExpectedLifecycleGeneration: task.LifecycleGeneration, Targets: targets}, by); err != nil {
+		t.Fatal(err)
+	}
+	for _, target := range targets {
+		if _, err = f.st.ReportCleanup(ctx, target.AgentID, api.CleanupRequest{RunID: target.RunID}, by); err != nil {
+			t.Fatal(err)
+		}
+	}
+	status, err := f.st.ProjectPauseStatus(ctx, f.task.ID)
+	if err != nil || status.State != api.ProjectPausePaused {
+		t.Fatalf("pause status: %+v %v", status, err)
+	}
+	lead := api.ProjectResumeOrchestrator{AgentID: api.NewID("agt"), RunID: api.NewID("run"), Name: "fresh-lead"}
+	resumed, err := f.st.ResumeProject(ctx, f.task.ID, api.ResumeProjectRequest{Version: 1, RequestID: "resume-" + api.NewID("req"), ExpectedPauseGeneration: status.PauseGeneration,
+		ExpectedLifecycleGeneration: status.LifecycleGeneration, RetainedHandoffDigest: status.RetainedHandoffDigest, SelectedTeamID: "synthetic-team", Orchestrator: lead}, by)
+	if err != nil || resumed.Receipt == nil {
+		t.Fatalf("resume: %+v %v", resumed, err)
+	}
+	fresh, err := f.st.AddAgent(ctx, f.task.ID, api.AddAgentRequest{AgentID: lead.AgentID, ExpectedRunID: lead.RunID, ResumeReceiptID: resumed.Receipt.ID, Name: lead.Name,
+		Host: "fixture", Session: "fresh-lead", Runtime: "claude", ExpectedLifecycleGeneration: resumed.LifecycleGeneration}, by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = f.st.ConfirmProjectResume(ctx, f.task.ID, api.ConfirmProjectResumeRequest{Version: 1, RequestID: "confirm-" + api.NewID("req"), ExpectedLifecycleGeneration: resumed.LifecycleGeneration,
+		ResumeReceiptID: resumed.Receipt.ID, AgentID: fresh.ID, RunID: fresh.RunID}, by); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestStewardSummaryPauseResumeSetupAdmitsFreshIdentity(t *testing.T) {
+	f := newStewardCLI(t)
+	ctx := context.Background()
+	first := f.steward(t)
+	f.saveSummary(t, first, 0, "## Themes\nkept across the pause", "summary-before-pause")
+	f.pauseAndResume(t)
+	if a, err := f.c.GetAgent(ctx, f.task.ID, first.ID); err != nil || a.Status != api.AgentClosed {
+		t.Fatalf("steward after pause: %+v %v", a, err)
+	}
+	second, err := setupSteward(ctx, f.deps(), f.e, f.c, f.task.ID, "", "", "")
+	if err != nil {
+		t.Fatalf("setup after resume: %v", err)
+	}
+	if second.ID == first.ID || second.Name != first.Name || second.Role != api.AgentRoleBacklogSteward {
+		t.Fatalf("setup after resume reused the closed identity: %+v", second)
+	}
+	f.live(t, second)
+	if own := f.brief(t, second); !strings.Contains(own, "The latest backlog summary is revision 1.") {
+		t.Fatalf("resumed steward briefing:\n%s", own)
 	}
 }

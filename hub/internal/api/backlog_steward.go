@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"net/url"
+	"strconv"
+	"time"
 )
 
 // Backlog steward (docs/backlog-steward.md): one persistent agent per
@@ -50,9 +52,72 @@ type BacklogStewardStatus struct {
 	Holder *Agent `json:"holder,omitempty"`
 	// PendingSuccessorID is a prepared rotation's registered successor.
 	PendingSuccessorID string `json:"pendingSuccessorId,omitempty"`
+	// SummaryRevision and SummaryDigest name the latest backlog summary; 0
+	// means none has been saved.
+	SummaryRevision int64  `json:"summaryRevision"`
+	SummaryDigest   string `json:"summaryDigest,omitempty"`
 }
 
 func (c *Client) BacklogSteward(ctx context.Context, task string) (BacklogStewardStatus, error) {
 	var out BacklogStewardStatus
 	return out, c.do(ctx, "GET", "/v1/tasks/"+url.PathEscape(task)+"/backlog-steward", nil, &out)
+}
+
+// The backlog summary is the steward's durable state: an append-only list of
+// revisions that rotation hands to a fresh session instead of chat history.
+const (
+	// MaxBacklogSummaryLen bounds a summary body in bytes.
+	MaxBacklogSummaryLen = 64 * 1024
+	// MaxBacklogSummaryRequest bounds the POST body: a maximal summary of
+	// characters JSON escapes as \uXXXX, plus the other fields.
+	MaxBacklogSummaryRequest = 6*MaxBacklogSummaryLen + 4*1024
+)
+
+// BacklogSummary is one saved revision.
+type BacklogSummary struct {
+	TaskID    string    `json:"taskId"`
+	Revision  int64     `json:"revision"`
+	Body      string    `json:"body,omitempty"`
+	Digest    string    `json:"digest"`
+	Bytes     int       `json:"bytes"`
+	AgentID   string    `json:"agentId,omitempty"`
+	RunID     string    `json:"runId,omitempty"`
+	RequestID string    `json:"requestId"`
+	CreatedBy Caller    `json:"createdBy"`
+	CreatedAt time.Time `json:"createdAt"`
+}
+
+// SaveBacklogSummaryRequest appends revision ExpectedRevision+1. Only the
+// exact run of the project's active steward, or the owner (no agent), may
+// save. A replayed RequestID with the same input returns the saved row.
+type SaveBacklogSummaryRequest struct {
+	ExpectedRevision int64  `json:"expectedRevision"`
+	Body             string `json:"body"`
+	RequestID        string `json:"requestId"`
+	AgentID          string `json:"agentId,omitempty"`
+	RunID            string `json:"runId,omitempty"`
+}
+
+// BacklogSummary reads the latest revision, or revision rev when rev > 0.
+func (c *Client) BacklogSummary(ctx context.Context, task string, rev int64) (BacklogSummary, error) {
+	var out BacklogSummary
+	path := "/v1/tasks/" + url.PathEscape(task) + "/backlog-summary"
+	if rev > 0 {
+		path += "?revision=" + strconv.FormatInt(rev, 10)
+	}
+	return out, c.do(ctx, "GET", path, nil, &out)
+}
+
+// BacklogSummaryRevisions lists every revision without bodies.
+func (c *Client) BacklogSummaryRevisions(ctx context.Context, task string) ([]BacklogSummary, error) {
+	var out struct {
+		Revisions []BacklogSummary `json:"revisions"`
+	}
+	err := c.do(ctx, "GET", "/v1/tasks/"+url.PathEscape(task)+"/backlog-summary/revisions", nil, &out)
+	return out.Revisions, err
+}
+
+func (c *Client) SaveBacklogSummary(ctx context.Context, task string, req SaveBacklogSummaryRequest) (BacklogSummary, error) {
+	var out BacklogSummary
+	return out, c.do(ctx, "POST", "/v1/tasks/"+url.PathEscape(task)+"/backlog-summary", req, &out)
 }
