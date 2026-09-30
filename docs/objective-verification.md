@@ -171,24 +171,42 @@ half the CPU cores or one job per 3 GiB of memory, whichever is lower, between 1
 and 8. That gives 5 on the Mini. The receipt's allowlisted environment records
 `VERIFICATION_JOBS`. `--jobs 1` runs strictly serially in plan order.
 
-Scheduling is greedy in plan order. Each check holds locks while it runs, and two
-checks that share a lock never overlap:
+Scheduling is greedy. With more than one job, Go checks are offered first and
+the rest follow in plan order. With one job, every check runs in plan order.
+Each check holds locks while it runs, and two checks that share a lock never
+overlap:
 
 - `port:N` for each approved `requiredPorts` entry
 - identical argv and cwd, so the Chromium and WebKit runs of one script (which
   share build output and screenshots) take turns
-- one Go lane: vet, test, race and migration rehearsal each saturate the CPU
+- the Go lane: go-race, go-test and migration rehearsal each saturate the CPU.
+  `go-vet` (3 s, type checks only) runs outside it.
 - the `SERIAL_SUITES` table in `scripts/verify-matrix.mjs`, for suites found to
   share a resource the rules above cannot see. Each entry names that resource.
+  A three-run audit found none (item-message-compose and a 140 ms unit test
+  flaked once each under load; that is test timing, not shared state).
 
 `00-static-build`, `01-static-release-verify` and `wasm-test-build` rewrite inputs
-that later checks read. Each runs alone, only after every earlier check has
-finished, and no later check starts until it ends. The serialization rules live
-in runner code and derive from the plan, so `verification/matrix.json` and its
-approval are unchanged. Attempts stay sequential within a check. Receipts list
-checks in plan order with the same fields, attempts, log names and status
-semantics as before. `overlapViolations(receipt.checks)` in the runner reports
-any lock, exclusive or barrier breach in a real receipt.
+that later non-Go checks read. Each runs alone among non-Go checks, only after
+every earlier non-Go check has finished, and no later non-Go check starts until
+it ends. Go checks read only the `hub/` module, so they neither wait for nor
+block these barriers.
+
+The Go rules come from receipt data. go-race is the longest check: 625 s alone,
+while no other single attempt exceeded 171 s. Its `hub/internal/store` package
+takes 570–573 s against go test's 600 s package timeout. With four browser lanes
+beside it, that package timed out and the retried Go lane set a 23.4 min wall.
+So go-race starts at once and holds two job slots, which leaves three for other
+checks while it runs. That is still enough to finish the roughly 19 minutes of
+browser work inside go-race's window. Non-Go check process groups also run at
+`nice` 10, so the CPU favors the Go lane when it is saturated.
+
+The serialization rules live in runner code and derive from the plan, so
+`verification/matrix.json` and its approval are unchanged. Attempts stay
+sequential within a check. Receipts list checks in plan order with the same
+fields, attempts, log names and status semantics as before.
+`overlapViolations(receipt.checks)` in the runner reports any lock, exclusive or
+barrier breach in a real receipt.
 
 For a fix between two frozen candidates, run a targeted check set instead of the
 full matrix:
