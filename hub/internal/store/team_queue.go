@@ -1025,8 +1025,10 @@ func (s *Store) TeamQueueAction(ctx context.Context, task string, req api.TeamQu
 					}
 				}
 			}
+			// A job still in the deployment path owns the candidate. Released,
+			// rolled back, refused and superseded jobs are finished.
 			var jobID, jobState string
-			jobErr := tx.QueryRowContext(ctx, `SELECT id,state FROM release_jobs WHERE task_id=? AND entry_id=? AND state NOT IN ('released','rolled_back')`, task, e.ID).Scan(&jobID, &jobState)
+			jobErr := tx.QueryRowContext(ctx, `SELECT id,state FROM release_jobs WHERE task_id=? AND entry_id=? AND state IN ('verified','claimed','merged','blocked')`, task, e.ID).Scan(&jobID, &jobState)
 			if jobErr == nil {
 				return zero, fmt.Errorf("%w: release job %s is %s; the deployment path owns this candidate", api.ErrConflict, jobID, jobState)
 			}

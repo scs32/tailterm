@@ -326,7 +326,9 @@ func TestOwnerIntegratedReleasesRunningEntry(t *testing.T) {
 			t.Fatalf("live %s release job: %v", state, err)
 		}
 	}
-	if _, err := f.s.db.Exec(`DELETE FROM release_jobs WHERE id='rel_fixture'`); err != nil {
+	// A finished job does not hold the candidate: refused here, superseded
+	// on a second entry below.
+	if _, err := f.s.db.Exec(`UPDATE release_jobs SET state='refused' WHERE id='rel_fixture'`); err != nil {
 		t.Fatal(err)
 	}
 	for _, q := range []api.TeamQueueEntry{b} {
@@ -386,6 +388,14 @@ func TestOwnerIntegratedReleasesRunningEntry(t *testing.T) {
 	}
 	if _, err := f.integrated(claimedB, "launching-b", commit); !errors.Is(err, api.ErrConflict) {
 		t.Fatalf("launching entry: %v", err)
+	}
+	g := newChoresQueue(t, 1, 1, 0)
+	d := g.run(t, g.add(t, 0, "src/d"))
+	if _, err := g.s.db.Exec(`INSERT INTO release_jobs VALUES(?,?,?,?,?,?)`, g.task.ID, "rel_superseded", d.ID, "superseded", 1, "{}"); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := g.integrated(d, "integrated-superseded", commit); err != nil || got.ReleasedAt == "" {
+		t.Fatalf("superseded release job: %+v %v", got, err)
 	}
 }
 
