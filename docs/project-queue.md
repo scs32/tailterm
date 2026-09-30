@@ -571,3 +571,19 @@ The complete machine-readable receipt is
 builder-verified, not self-accepted. Lead actual-release acceptance and
 db-handler revision-checked storage/readback of this complete report remain
 required before item completion or agent closure.
+
+## Team queue handler arms
+
+Under an enabled [handler arm policy](handler-ab.md), a team queue claim draws
+an arm for the entry from the policy seed and the entry ID and leases a free
+handler of that arm. The entry's `handlerArm` field records the current lease's
+policy revision, draw, drawn arm, leased arm, fallback and reason, skipped
+limited arms, handler agent and run, the run's and the policy's template
+digests, and the lease and finish times. `tt team queue list` prints
+`arm=S drawn=S fallback=no|busy`.
+
+While a queued entry waits for an arm, its reason is `Waiting for a free handler
+of arm S` or `Every handler arm is at a provider limit`, and the claim returns a
+409 ending in `no free handler in the drawn arm`, which the runner treats as an
+ordinary wait. With no policy, or a disabled one, entries lease the first free
+handler as before.

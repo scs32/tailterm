@@ -109,7 +109,9 @@ func (s *Store) ReportActivity(ctx context.Context, task, agent string, report a
 	if oldPayload != "" && json.Unmarshal([]byte(oldPayload), &oldActivity) != nil {
 		return zero, api.ErrConflict
 	}
-	if oldState == report.Activity.State && sameWakeOutcome(oldActivity.Wake, report.Activity.Wake) && sameRuntimePrompt(oldActivity.Prompt, report.Activity.Prompt) {
+	// The reason is compared too, so an idle report whose reason becomes an
+	// API-error rate limit is stored and reaches the handler arm hook.
+	if oldState == report.Activity.State && oldActivity.Reason == report.Activity.Reason && sameWakeOutcome(oldActivity.Wake, report.Activity.Wake) && sameRuntimePrompt(oldActivity.Prompt, report.Activity.Prompt) {
 		var saved api.AgentActivity
 		if json.Unmarshal([]byte(oldPayload), &saved) != nil {
 			return zero, api.ErrConflict
@@ -130,6 +132,9 @@ func (s *Store) ReportActivity(ctx context.Context, task, agent string, report a
 		}
 	}
 	if err := s.postRuntimePromptEscalation(ctx, tx, task, agent, run, report.Activity); err != nil {
+		return zero, err
+	}
+	if err := s.armLimitHook(ctx, tx, task, agent, run, report.Activity); err != nil {
 		return zero, err
 	}
 	if err = tx.Commit(); err != nil {

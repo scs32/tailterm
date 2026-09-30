@@ -299,6 +299,11 @@ type AddAgentRequest struct {
 
 	// TemplateDigest records a database handler run's prompt template.
 	TemplateDigest string `json:"templateDigest,omitempty"`
+	// HandlerModel and HandlerReasoning record the model and reasoning a
+	// database handler run was spawned with, for handler arms
+	// (docs/handler-ab.md). They are refused on any other role.
+	HandlerModel     string `json:"handlerModel,omitempty"`
+	HandlerReasoning string `json:"handlerReasoning,omitempty"`
 }
 
 type UpdateAgentRequest struct {

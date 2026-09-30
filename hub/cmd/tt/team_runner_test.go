@@ -906,3 +906,37 @@ func TestTeamRunnerUnregisteredCrashReleaseRequiresSynchronizedHostProof(t *test
 		t.Fatalf("released history %+v spawns=%d err=%v", q, spawns, err)
 	}
 }
+
+// Handler arm waits (wi_fc1396aef8a72a06): a drawn arm with no free handler
+// and every arm at a provider limit are ordinary waits, not failures.
+func TestTeamRunnerClaimRaceConflictArmWaits(t *testing.T) {
+	for _, message := range []string{
+		"conflict: arm S: no free handler in the drawn arm",
+		"conflict: every handler arm is at a provider limit, so there is no free handler in the drawn arm",
+	} {
+		if !claimRaceConflict(message) {
+			t.Fatalf("not a wait: %s", message)
+		}
+	}
+	if claimRaceConflict("conflict: handler arm policy refused (template_mismatch): x") {
+		t.Fatal("a policy refusal is not a wait")
+	}
+	f := newTeamFixture(t, true)
+	ctx := context.Background()
+	if _, err := f.c.SetHandlerArmPolicy(ctx, f.task.ID, api.HandlerArmPolicyRequest{RequestID: "arms", Enabled: true, Seed: "K", TemplateDigest: strings.Repeat("a", 64),
+		Arms: []api.HandlerArm{{ID: "S", Runtime: "claude", Model: "claude-sonnet-5-5", Reasoning: "high", Weight: 1}, {ID: "O", Runtime: "codex", Model: "gpt-6.1-sol", Reasoning: "high", Weight: 1}}}); err != nil {
+		t.Fatal(err)
+	}
+	q, err := f.c.TeamQueueAction(ctx, f.task.ID, api.TeamQueueRequest{RequestID: "arm-queue", Operation: "add", ItemID: f.item.ID, OrderMessageSeq: f.order, Host: "fixture", Cwd: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	spawns := 0
+	runner := teamRunner{spawn: func(env, []string) error { spawns++; return nil }}
+	if err := runner.advance(ctx, f.e, f.c, q, "fixture"); err != nil || spawns != 0 {
+		t.Fatalf("arm wait should retry silently: err=%v spawns=%d", err, spawns)
+	}
+	if after, err := f.c.GetTeamQueueEntry(ctx, f.task.ID, q.ID); err != nil || after.State != "queued" || after.Failure != "" {
+		t.Fatalf("arm wait changed the entry %+v %v", after, err)
+	}
+}

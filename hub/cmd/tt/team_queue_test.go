@@ -462,3 +462,43 @@ func TestTeamQueueCLIParallelAddNeedsOwnershipOrSerial(t *testing.T) {
 		t.Fatalf("list %q %v", printed, err)
 	}
 }
+
+// The list shows a leased entry's handler arm (wi_fc1396aef8a72a06).
+func TestTeamQueueListArmAssignment(t *testing.T) {
+	f := newTeamFixture(t, true)
+	ctx := context.Background()
+	digest := strings.Repeat("a", 64)
+	arms := []api.HandlerArm{{ID: "S", Runtime: "claude", Model: "claude-sonnet-5-5", Reasoning: "high", Weight: 1}, {ID: "O", Runtime: "codex", Model: "gpt-6.1-sol", Reasoning: "high", Weight: 1}}
+	for _, arm := range arms {
+		h, err := f.c.AddAgent(ctx, f.task.ID, api.AddAgentRequest{AgentID: api.NewID("agt"), Name: "db-handler-" + strings.ToLower(arm.ID), Role: api.AgentRoleDatabaseHandler, Host: "fixture",
+			Session: "fixture-" + arm.ID, Runtime: arm.Runtime, TemplateDigest: digest, HandlerModel: arm.Model, HandlerReasoning: arm.Reasoning})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err = f.c.PostEvent(ctx, f.task.ID, api.PostEventRequest{AgentID: h.ID, RunID: h.RunID, Kind: api.EventRunning}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := f.c.SetHandlerArmPolicy(ctx, f.task.ID, api.HandlerArmPolicyRequest{RequestID: "arms", Enabled: true, Seed: "K", TemplateDigest: digest, Arms: arms}); err != nil {
+		t.Fatal(err)
+	}
+	q, err := f.c.TeamQueueAction(ctx, f.task.ID, api.TeamQueueRequest{RequestID: "arm-list-add", Operation: "add", ItemID: f.item.ID, OrderMessageSeq: f.order, Host: "fixture", Cwd: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	claimed, err := f.c.TeamQueueAction(ctx, f.task.ID, api.TeamQueueRequest{RequestID: "arm-list-claim", Operation: "claim", EntryID: q.ID, ExpectedRevision: q.Revision, Host: "fixture"})
+	if err != nil || claimed.HandlerArm == nil {
+		t.Fatalf("claim %+v %v", claimed, err)
+	}
+	out, err := captureCLIOutput(t, func() error { return cmdTeamQueue(f.e, []string{"list"}) })
+	want := fmt.Sprintf("arm=%s drawn=%s fallback=no", claimed.HandlerArm.Arm, claimed.HandlerArm.Arm)
+	if err != nil || !strings.Contains(out, want) {
+		t.Fatalf("list lacks %q: %s %v", want, out, err)
+	}
+	if got := queueArmText(&api.TeamQueueHandlerArm{Arm: "O", DrawnArm: "S", Fallback: true, FallbackReason: "busy"}); got != " arm=O drawn=S fallback=busy" {
+		t.Fatalf("fallback text %q", got)
+	}
+	if queueArmText(nil) != "" {
+		t.Fatal("unassigned entry printed an arm")
+	}
+}

@@ -473,8 +473,12 @@ func (s *Store) AddAgent(ctx context.Context, taskID string, req api.AddAgentReq
 	if req.TemplateDigest != "" && req.Role != api.AgentRoleDatabaseHandler && req.Role != api.AgentRoleBacklogSteward {
 		return api.Agent{}, api.ErrInvalid
 	}
+	// Handler arms record a database handler run's model and reasoning.
+	if (req.HandlerModel != "" || req.HandlerReasoning != "") && req.Role != api.AgentRoleDatabaseHandler {
+		return api.Agent{}, api.ErrInvalid
+	}
 	priorRun := ""
-	if req.TemplateDigest != "" && req.AgentID != "" {
+	if (req.TemplateDigest != "" || req.HandlerModel != "" || req.HandlerReasoning != "") && req.AgentID != "" {
 		if prior, err := s.GetAgent(ctx, req.AgentID); err == nil {
 			priorRun = prior.RunID
 		}
@@ -487,7 +491,7 @@ func (s *Store) AddAgent(ctx context.Context, taskID string, req api.AddAgentReq
 	// run this call started records one: replaying the launch of an existing
 	// legacy run must not mark its older prompt current.
 	if a.RunID != priorRun {
-		if err = s.recordHandlerRun(ctx, a, req.TemplateDigest); err != nil {
+		if err = s.recordHandlerRun(ctx, a, req.TemplateDigest, req.HandlerModel, req.HandlerReasoning); err != nil {
 			return a, err
 		}
 		if err = s.recordStewardRun(ctx, a, req.TemplateDigest); err != nil {

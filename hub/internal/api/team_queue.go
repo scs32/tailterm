@@ -64,6 +64,10 @@ type TeamQueueEntry struct {
 	// clear by itself, with the supported fix. It is computed on read.
 	Stall     *TeamQueueStall `json:"stall,omitempty"`
 	UpdatedAt string          `json:"updatedAt,omitempty"`
+
+	// HandlerArm is the arm assignment of the current lease under a handler
+	// arm policy (docs/handler-ab.md).
+	HandlerArm *TeamQueueHandlerArm `json:"handlerArm,omitempty"`
 }
 
 // TeamQueueOwnerIntegration is kept distinct from TeamIntegrationReady, the

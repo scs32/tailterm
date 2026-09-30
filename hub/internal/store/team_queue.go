@@ -210,16 +210,26 @@ func projectQueueParallel(ctx context.Context, q queryRower, task string) (bool,
 // entry leases, or a zero agent. Neither side of an open handler rotation
 // takes a new lease.
 func freeQueueHandler(ctx context.Context, q queryRower, task string, active []api.TeamQueueEntry) (api.Agent, error) {
+	free, err := freeQueueHandlers(ctx, q, task, active)
+	if err != nil || len(free) == 0 {
+		return api.Agent{}, err
+	}
+	return free[0], nil
+}
+
+// freeQueueHandlers lists every free handler in lease order.
+func freeQueueHandlers(ctx context.Context, q queryRower, task string, active []api.TeamQueueEntry) ([]api.Agent, error) {
 	rows, err := q.QueryContext(ctx, `SELECT `+agentCols+` FROM agents WHERE task_id=? AND role=? AND status NOT IN ('retired','closed','exited')
  AND id NOT IN (SELECT old_agent_id FROM handler_rotations WHERE task_id=? AND state='prepared' UNION SELECT successor_agent_id FROM handler_rotations WHERE task_id=? AND state='prepared') ORDER BY created_at,id`, task, api.AgentRoleDatabaseHandler, task, task)
 	if err != nil {
-		return api.Agent{}, err
+		return nil, err
 	}
 	defer rows.Close()
+	var out []api.Agent
 	for rows.Next() {
 		a, err := scanAgent(rows)
 		if err != nil {
-			return api.Agent{}, err
+			return nil, err
 		}
 		if !a.Online {
 			continue
@@ -232,10 +242,10 @@ func freeQueueHandler(ctx context.Context, q queryRower, task string, active []a
 			}
 		}
 		if !inUse {
-			return a, nil
+			out = append(out, a)
 		}
 	}
-	return api.Agent{}, rows.Err()
+	return out, rows.Err()
 }
 
 // liveItemRuns counts the item-bound runs that are not yet closed and
@@ -442,6 +452,9 @@ func (s *Store) ListTeamQueue(ctx context.Context, task string) (api.TeamQueueLi
 		if err := s.loadTeamActivities(ctx, &out.Entries[i]); err != nil {
 			return out, err
 		}
+		if err := attachHandlerArm(ctx, s.db, &out.Entries[i]); err != nil {
+			return out, err
+		}
 		if queueEntryHoldsResources(entry) {
 			activeCount++
 		}
@@ -521,6 +534,15 @@ func (s *Store) ListTeamQueue(ctx context.Context, task string) (api.TeamQueueLi
 	if capacityTx != nil {
 		reader = capacityTx
 	}
+	var holding []api.TeamQueueEntry
+	for _, entry := range out.Entries {
+		if queueEntryHoldsResources(entry) {
+			holding = append(holding, entry)
+		}
+	}
+	if err := explainArmWaits(ctx, reader, &out, holding, s.now()); err != nil {
+		return out, err
+	}
 	if err := s.explainQueueStalls(ctx, reader, capacityTx, &out); err != nil {
 		return out, err
 	}
@@ -564,6 +586,9 @@ func (s *Store) TeamQueuesByHost(ctx context.Context, host string) (api.TeamQueu
 		if err := s.loadTeamActivities(ctx, &out.Entries[i]); err != nil {
 			return out, err
 		}
+		if err := attachHandlerArm(ctx, s.db, &out.Entries[i]); err != nil {
+			return out, err
+		}
 	}
 	out.HostPolicy, err = readTeamHostPolicy(ctx, s.db, host)
 	if err != nil {
@@ -592,6 +617,9 @@ func (s *Store) GetTeamQueueEntry(ctx context.Context, task, id string) (api.Tea
 	}
 	if err == nil {
 		err = s.loadTeamVerification(ctx, &e)
+	}
+	if err == nil {
+		err = attachHandlerArm(ctx, s.db, &e)
 	}
 	return e, err
 }
@@ -669,6 +697,13 @@ func (s *Store) TeamQueueAction(ctx context.Context, task string, req api.TeamQu
 		// The list reads through the single connection, so the stall is
 		// recomputed before the write transaction opens.
 		if stalled, stallEnvelope, err = s.stallNotice(ctx, task, req); err != nil {
+			return zero, err
+		}
+	}
+	if req.Operation == "claim" {
+		// Expired provider-limit episodes close before the draw, in their
+		// own transaction, so a claim that waits does not undo the clearing.
+		if err := s.sweepArmLimits(ctx, task); err != nil {
 			return zero, err
 		}
 	}
@@ -1216,7 +1251,7 @@ func (s *Store) TeamQueueAction(ctx context.Context, task string, req api.TeamQu
 			if head != e.ID {
 				return zero, fmt.Errorf("%w: not queue head", api.ErrConflict)
 			}
-			chosen, err := freeQueueHandler(ctx, tx, task, activeEntries)
+			chosen, armLease, err := leaseQueueHandler(ctx, tx, task, e.ID, activeEntries, s.now())
 			if err != nil {
 				return zero, err
 			}
@@ -1231,6 +1266,13 @@ func (s *Store) TeamQueueAction(ctx context.Context, task string, req api.TeamQu
 			e.HandlerID, e.HandlerRunID = chosen.ID, chosen.RunID
 			if err := tx.QueryRowContext(ctx, `SELECT COALESCE(MAX(handler_lease_generation),0)+1 FROM team_queue_entries WHERE handler_id=?`, chosen.ID).Scan(&e.HandlerLeaseGeneration); err != nil {
 				return zero, err
+			}
+			if armLease != nil {
+				armLease.LeaseGeneration = e.HandlerLeaseGeneration
+				if err := insertHandlerArmAssignment(ctx, tx, task, e, *armLease); err != nil {
+					return zero, err
+				}
+				e.HandlerArm = armLease
 			}
 		case "freeze":
 			if e.State != "launching" || len(e.LaunchJSON) != 0 || !json.Valid(req.LaunchJSON) || len(req.LaunchJSON) == 0 {
@@ -1500,6 +1542,9 @@ func (s *Store) TeamQueueAction(ctx context.Context, task string, req api.TeamQu
 			e.State = "finished"
 			_, err = tx.ExecContext(ctx, `DELETE FROM team_launch_reservations WHERE task_id=? AND entry_id=?`, task, e.ID)
 			if err != nil {
+				return zero, err
+			}
+			if err = finishHandlerArmAssignment(ctx, tx, e, now); err != nil {
 				return zero, err
 			}
 		case "fail":

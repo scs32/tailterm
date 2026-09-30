@@ -282,3 +282,20 @@ func TestStuckActivityState(t *testing.T) {
 		}
 	}
 }
+
+// Handler arms (wi_fc1396aef8a72a06): an idle report whose reason changes is
+// stored, so a Claude rate-limit turn end reaches the arm limit hook.
+func TestActivitySameStateReasonIsStored(t *testing.T) {
+	f := newArmFixture(t, 0)
+	f.report(t, f.hS, "idle-1", api.AgentActivity{State: "idle"})
+	f.report(t, f.hS, "idle-2", api.AgentActivity{State: "idle", Reason: api.ClaudeRateLimitReason, ObservedAt: f.clock.Add(time.Second)})
+	var payload string
+	if err := f.s.db.QueryRow(`SELECT payload FROM agent_activity WHERE agent_id=?`, f.hS.ID).Scan(&payload); err != nil || !strings.Contains(payload, "rate_limit") {
+		t.Fatalf("reason change not stored: %s %v", payload, err)
+	}
+	// A repeat with the same state and reason is still not stored.
+	f.report(t, f.hS, "idle-3", api.AgentActivity{State: "idle", Reason: api.ClaudeRateLimitReason, ObservedAt: f.clock.Add(2 * time.Second)})
+	if n := countRows(t, f.s, `SELECT count(*) FROM agent_activity_receipts WHERE agent_id=?`, f.hS.ID); n != 2 {
+		t.Fatalf("receipts %d", n)
+	}
+}

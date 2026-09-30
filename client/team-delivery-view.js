@@ -1,5 +1,6 @@
 import { ownerWaitSummary } from "./owner-obligations.js";
 import { activityLabel, tokenSnapshot } from "./activity-format.js";
+import { handlerArmText } from "./handler-ab-format.js";
 // Read-only project delivery panel with immutable release evidence.
 const esc = (value) => String(value ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]);
 
@@ -9,7 +10,7 @@ export function renderTeamDelivery(queue, agents = [], ownerRequests = [], taskI
   const rows = queue.entries.map((entry) => {
     const lead = agents.find((agent) => agent.itemLead && agent.workItem?.itemId === entry.itemId)?.name || (entry.state === "launching" ? entry.launch?.members?.[0]?.fields?.name : "") || "";
     const handlerName = byId.get(entry.handlerId)?.name || entry.handlerId || "";
-    const handler = handlerName ? `${handlerName}${entry.handlerLeaseGeneration ? ` · lease ${entry.handlerLeaseGeneration}` : ""}` : "";
+    const handler = handlerName ? `${handlerName}${entry.handlerLeaseGeneration ? ` · lease ${entry.handlerLeaseGeneration}` : ""}${handlerArmText(entry.handlerArm)}` : "";
     const owns = entry.ownership?.length ? entry.ownership.join(", ") : "Unscoped · conflicts with all work";
     const blocked = [entry.blockedBy?.length ? `Waiting for ${entry.blockedBy.join(", ")}` : "", entry.blockReason || ""].filter(Boolean).join(" · ");
     const worktree = entry.integration?.worktree ? ` · ${esc(entry.integration.worktree)}` : "";

@@ -37,7 +37,7 @@ Commands
   projects                     list projects on the hub (tasks is an alias)
   project-pause <get|pause|handoff|resume>  explicit project team lifecycle
   helper register|env|inbox --task ID  the owner's Claude Code session as the project's owner helper
-  handler <rotate|rotation|policy|spec>  rotate a project's database handler (owner)
+  handler <rotate|rotation|policy|spec|arms|ab-report>  rotate, arm and compare database handlers (owner)
   steward <template|setup|summary|rotate|rotation|policy>  the project's backlog steward (setup, rotate: owner)
   prompt-policy <get|set>      runtime prompt policy per prompt kind (set: owner)
   deployment <list|enqueue|claim|check|verification|merged|finish|block>  release ledger
@@ -1168,6 +1168,7 @@ func cmdSpawn(e env, args []string) error {
 	}
 	if *role == api.AgentRoleDatabaseHandler {
 		req.TemplateDigest = handlerTemplateDigest(*prompt)
+		req.HandlerModel, req.HandlerReasoning = *model, *reasoning
 	}
 	if *role == api.AgentRoleBacklogSteward {
 		req.TemplateDigest = stewardTemplateDigest(*model, *reasoning, *prompt)

@@ -294,6 +294,7 @@ export function createHubClient({ fetchImpl, baseURL, token = "" }) {
       request(`/v1/tasks/${task}/decisions` + q(params)),
     listInterventions: (task, params = {}) =>
       request(`/v1/tasks/${task}/interventions` + q(params)),
+    handlerABReport: (task) => request(`/v1/tasks/${task}/handler-ab/report`),
     answerDecision: (task, seq, body) =>
       request(`/v1/tasks/${task}/decisions/${seq}/answer`, {
         method: "POST",

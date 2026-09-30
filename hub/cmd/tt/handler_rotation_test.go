@@ -147,7 +147,7 @@ func (f *rotationCLI) spawn(_ env, args []string) error {
 	}
 	f.briefings = append(f.briefings, agentTaskBriefingForHandler(detail.Task, flags["--name"], flags["--role"], "", primaryHandlerFirst(detail.Task, detail.Agents), 0, successor))
 	req := api.AddAgentRequest{AgentID: flags["--agent-id"], Role: flags["--role"], Name: flags["--name"], Host: "fixture", Runtime: flags["--runtime"], Cwd: flags["--cwd"],
-		TemplateDigest: handlerTemplateDigest(flags["--prompt"])}
+		TemplateDigest: handlerTemplateDigest(flags["--prompt"]), HandlerModel: flags["--model"], HandlerReasoning: flags["--reasoning"]}
 	a, err := ensureHandler(ctx, f.c, flags["--task"], req, f.opts)
 	if err != nil {
 		return err
@@ -841,5 +841,47 @@ func TestQueueHandlerBriefingIntakeOwnershipAndPlainDone(t *testing.T) {
 	const current = "6c6a04d9ad079693a01253aad7f9bb0ce1e6738f95e0a329b59e3283d20a93d9"
 	if got := handlerTemplateDigest("handler assignment"); got != current || got == before {
 		t.Fatalf("handler template digest %s, want %s", got, current)
+	}
+}
+
+// Handler arms (wi_fc1396aef8a72a06): rotation stays within the old run's
+// arm. A saved spec with another model or reasoning is refused before any
+// spawn or prepare; a matching spec rotates and records the same model.
+func TestHandlerRotationSpecArmPrecheck(t *testing.T) {
+	f := newRotationCLI(t, "")
+	if _, err := f.db(t).Exec(`INSERT OR REPLACE INTO handler_runs(task_id,agent_id,run_id,template_digest,model,reasoning,created_at) VALUES(?,?,?,?,?,?,?)`,
+		f.task.ID, f.old.ID, f.old.RunID, handlerTemplateDigest("handler assignment"), "claude-sonnet-5-5", "high", time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
+		t.Fatal(err)
+	}
+	spec := func(extra ...string) handlerSpec {
+		s, err := newHandlerSpec(f.c.Base, f.task.ID, append([]string{"--run", "sleep 300", "--runtime", "generic", "--cwd", f.dir, "--prompt", "handler assignment"}, extra...))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return s
+	}
+	for _, s := range []handlerSpec{spec("--model", "claude-opus-5-5", "--reasoning", "high"), spec("--model", "claude-sonnet-5-5", "--reasoning", "max"), spec()} {
+		f.spec = s
+		if _, err := f.rotate(t); err == nil || !strings.Contains(err.Error(), api.HandlerRotationRefusedArmChanged) {
+			t.Fatalf("spec %v: %v", s.Args, err)
+		}
+	}
+	if f.spawns != 0 || f.actions.Load() != 0 {
+		t.Fatalf("refused rotation spawned %d and sent %d actions", f.spawns, f.actions.Load())
+	}
+	f.spec = spec("--model", "claude-sonnet-5-5", "--reasoning", "high")
+	r, err := f.rotate(t)
+	if err != nil {
+		t.Fatal(err)
+	}
+	successor := f.assertRotated(t, r, 0)
+	view, err := f.c.HandlerArmPolicy(context.Background(), f.task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, h := range view.Handlers {
+		if h.AgentID == successor.ID && (h.Model != "claude-sonnet-5-5" || h.Reasoning != "high") {
+			t.Fatalf("successor recorded %+v", h)
+		}
 	}
 }

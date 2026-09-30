@@ -209,7 +209,7 @@ func (s *Server) updateWorkItem(w http.ResponseWriter, r *http.Request) {
 	}
 	item, err := s.store.UpdateWorkItem(r.Context(), task, itemID, req, caller)
 	if err != nil {
-		fail(w, err)
+		s.failHandlerWrite(w, r, err, task, itemID, req.AgentID, "", "update", "")
 		return
 	}
 	writeJSON(w, http.StatusOK, item)
@@ -234,7 +234,7 @@ func (s *Server) dispatchWorkItem(w http.ResponseWriter, r *http.Request) {
 	}
 	result, err := s.store.DispatchWorkItem(r.Context(), task, itemID, req, caller)
 	if err != nil {
-		fail(w, err)
+		s.failHandlerWrite(w, r, err, task, itemID, req.AgentID, "", "dispatch", req.RequestID)
 		return
 	}
 	writeJSON(w, http.StatusCreated, result)
@@ -388,7 +388,7 @@ func (s *Server) createWorkItemUpdate(w http.ResponseWriter, r *http.Request) {
 	}
 	result, replay, err := s.store.CreateWorkItemUpdate(r.Context(), task, item, req, caller)
 	if err != nil {
-		fail(w, err)
+		s.failHandlerWrite(w, r, err, task, item, req.AgentID, req.RunID, "updates", req.RequestID)
 		return
 	}
 	status := http.StatusCreated
@@ -417,4 +417,29 @@ func (s *Server) getWorkItemUpdateReceipt(w http.ResponseWriter, r *http.Request
 		return
 	}
 	writeJSON(w, http.StatusOK, result)
+}
+
+// statusRecorder keeps the status fail wrote.
+type statusRecorder struct {
+	http.ResponseWriter
+	status int
+}
+
+func (w *statusRecorder) WriteHeader(status int) {
+	w.status = status
+	w.ResponseWriter.WriteHeader(status)
+}
+
+// failHandlerWrite answers a refused work-item write, then records the
+// refusal when a database handler made it (docs/handler-ab.md). Only 400,
+// 404 and 409 are recorded, with a fixed code and no request text.
+func (s *Server) failHandlerWrite(w http.ResponseWriter, r *http.Request, err error, task, item, agentID, runID, route, requestID string) {
+	rec := &statusRecorder{ResponseWriter: w}
+	fail(rec, err)
+	if agentID == "" {
+		return
+	}
+	if recordErr := s.store.RecordHandlerWriteRefusal(r.Context(), task, item, agentID, runID, route, requestID, rec.status, err); recordErr != nil {
+		s.logf("record handler write refusal: %v", recordErr)
+	}
 }

@@ -185,13 +185,6 @@ func relayActivityTick(ctx context.Context, b runtimeBinding, client *api.Client
 	if c.Run != b.Run || c.Thread != b.Thread {
 		c = activityCursor{Run: b.Run, Thread: b.Thread}
 	}
-	wakeKey := func(w *api.WakeOutcome) string {
-		if w == nil {
-			return ""
-		}
-		data, _ := json.Marshal(w)
-		return string(data)
-	}
 	var u *usageCursor
 	if enabled, _ := ctx.Value(usageEnabledContextKey{}).(bool); enabled {
 		var usageErr error
@@ -238,14 +231,14 @@ func relayActivityTick(ctx context.Context, b runtimeBinding, client *api.Client
 				return err
 			}
 			c.RejectedState = c.PendingReport.Activity.State
-			c.RejectedWakeKey = wakeKey(c.PendingReport.Activity.Wake) + runtimePromptKey(c.PendingReport.Activity.Prompt)
+			c.RejectedWakeKey = activityReportKey(c.PendingReport.Activity)
 			c.PendingReport = nil
 			if err := save(); err != nil {
 				return err
 			}
 		} else {
 			c.LastState = c.PendingReport.Activity.State
-			c.LastWakeKey = wakeKey(c.PendingReport.Activity.Wake) + runtimePromptKey(c.PendingReport.Activity.Prompt)
+			c.LastWakeKey = activityReportKey(c.PendingReport.Activity)
 			c.PendingReport = nil
 			if err := save(); err != nil {
 				return err
@@ -406,7 +399,7 @@ func relayActivityTick(ctx context.Context, b runtimeBinding, client *api.Client
 	if state.State == "stuck" && c.StuckUnsupported {
 		downgradeStuck(&state)
 	}
-	key := wakeKey(state.Wake) + runtimePromptKey(state.Prompt)
+	key := activityReportKey(state)
 	if (state.State == c.LastState && key == c.LastWakeKey) || (state.State == c.RejectedState && key == c.RejectedWakeKey) {
 		return save()
 	}
@@ -536,4 +529,24 @@ func stuckFallback(b runtimeBinding, c *activityCursor, err error) (*api.Activit
 	report.RequestID = activityRequestID(b, c.Transition)
 	c.PendingReport = &report
 	return c.PendingReport, true
+}
+
+// activityReportKey is what, besides the state, makes a new activity report.
+// An idle or finished_silent reason is part of it, so a turn that ends by an
+// API rate limit reaches the hub (docs/handler-ab.md); stuck reasons change
+// too often and are left out.
+func activityReportKey(a api.AgentActivity) string {
+	key := wakeKey(a.Wake) + runtimePromptKey(a.Prompt)
+	if a.State == "idle" || a.State == "finished_silent" {
+		key += "\x00reason=" + a.Reason
+	}
+	return key
+}
+
+func wakeKey(w *api.WakeOutcome) string {
+	if w == nil {
+		return ""
+	}
+	data, _ := json.Marshal(w)
+	return string(data)
 }

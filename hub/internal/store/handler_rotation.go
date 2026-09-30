@@ -180,18 +180,22 @@ func (s *Store) loadSuccessor(ctx context.Context, a *api.Agent) error {
 	return err
 }
 
-// recordHandlerRun keeps the prompt template digest of an exact handler run.
-// The first digest recorded for a run wins, so a retried launch cannot rewrite it.
-func (s *Store) recordHandlerRun(ctx context.Context, a api.Agent, digest string) error {
-	if a.Role != api.AgentRoleDatabaseHandler || digest == "" || a.RunID == "" {
+// recordHandlerRun keeps the prompt template digest, model and reasoning of
+// an exact handler run. The first record for a run wins, so a retried launch
+// cannot rewrite it.
+func (s *Store) recordHandlerRun(ctx context.Context, a api.Agent, digest, model, reasoning string) error {
+	if a.Role != api.AgentRoleDatabaseHandler || (digest == "" && model == "" && reasoning == "") || a.RunID == "" {
 		return nil
 	}
-	if len(digest) != 64 || strings.Trim(digest, "0123456789abcdef") != "" {
+	if digest != "" && (len(digest) != 64 || strings.Trim(digest, "0123456789abcdef") != "") {
+		return api.ErrInvalid
+	}
+	if !validArmField(model) || !validArmField(reasoning) {
 		return api.ErrInvalid
 	}
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
-	_, err := s.db.ExecContext(ctx, `INSERT OR IGNORE INTO handler_runs(task_id,agent_id,run_id,template_digest,created_at) VALUES(?,?,?,?,?)`, a.TaskID, a.ID, a.RunID, digest, ts(s.now()))
+	_, err := s.db.ExecContext(ctx, `INSERT OR IGNORE INTO handler_runs(task_id,agent_id,run_id,template_digest,model,reasoning,created_at) VALUES(?,?,?,?,?,?,?)`, a.TaskID, a.ID, a.RunID, digest, model, reasoning, ts(s.now()))
 	return err
 }
 
@@ -503,6 +507,11 @@ func (s *Store) commitHandlerRotation(ctx context.Context, tx *sql.Tx, t api.Tas
 	if err != nil || successor.Role != api.AgentRoleDatabaseHandler || successor.Name != r.SuccessorName || !successor.Online ||
 		successor.Status == api.AgentRetired || successor.Host != old.Host || successor.Runtime != old.Runtime || successor.Cwd != old.Cwd {
 		return zero, &api.HandlerRotationRefusal{Code: api.HandlerRotationRefusedSuccessor, Detail: "the successor must be a registered, online database handler on the old handler's host, runtime and directory"}
+	}
+	if refusal, err := handlerRotationArmRefusal(ctx, tx, old, successor); err != nil {
+		return zero, err
+	} else if refusal != nil {
+		return zero, refusal
 	}
 	handoff, err := s.snapshotHandlerHandoff(ctx, tx, t, old, busy)
 	if err != nil {

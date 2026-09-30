@@ -96,3 +96,60 @@
     width: 100%;
   }
 }
+/* Handler A/B (docs/handler-ab.md): a closed, read-only disclosure that
+   follows the Interventions layout. */
+.project-handler-ab {
+  border-top: 1px solid var(--border, #343434);
+  margin-top: 0.7rem;
+  padding-top: 0.6rem;
+  min-width: 0;
+}
+.project-handler-ab summary {
+  cursor: pointer;
+  font-size: 0.85rem;
+}
+.handler-ab-controls {
+  display: flex;
+  gap: 0.4rem;
+  margin: 0.6rem 0;
+}
+.handler-ab-controls button {
+  height: 1.9rem;
+  box-sizing: border-box;
+  padding-block: 0;
+  line-height: 1;
+}
+.handler-ab-headline {
+  margin: 0.35rem 0;
+  font-size: 0.8rem;
+}
+.handler-ab-scroll {
+  max-width: 100%;
+  overflow-x: auto;
+}
+.handler-ab-table {
+  border-collapse: collapse;
+  font-size: 0.75rem;
+  margin: 0.35rem 0;
+}
+.handler-ab-table caption {
+  text-align: left;
+  color: var(--muted, #999);
+  padding: 0.25rem 0;
+}
+.handler-ab-table th,
+.handler-ab-table td {
+  padding: 0.25rem 1.2rem 0.25rem 0.25rem;
+  text-align: left;
+  vertical-align: top;
+  overflow-wrap: anywhere;
+}
+.handler-ab-table th {
+  font-weight: normal;
+  color: var(--muted, #999);
+}
+.handler-ab-flags {
+  margin: 0.35rem 0;
+  padding-left: 1rem;
+  font-size: 0.75rem;
+}

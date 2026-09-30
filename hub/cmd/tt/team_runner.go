@@ -382,6 +382,9 @@ func claimRaceConflict(message string) bool {
 		"all team slots are reserved",
 		"no available database handler lease",
 		"manual launch is reserved",
+		// Handler arm waits (docs/handler-ab.md): the drawn arm is busy, or
+		// every arm is at a provider limit.
+		api.HandlerArmWaitSuffix,
 	} {
 		if strings.HasSuffix(message, cause) {
 			return true

@@ -343,3 +343,74 @@ func TestWorkItemHTTPClosedProjectIsReadOnly(t *testing.T) {
 		t.Fatalf("closed get = %d %+v", code, got)
 	}
 }
+
+// Refused work-item writes by a database handler are recorded with a fixed
+// code (wi_fc1396aef8a72a06, order #14869); other callers are not.
+func TestHandlerWriteRefusalHTTPRecording(t *testing.T) {
+	c := newClient(t)
+	task := c.task("refusals")
+	var handler api.Agent
+	if code := c.do("POST", "/v1/tasks/"+task.ID+"/agents", api.AddAgentRequest{Name: "database", Role: api.AgentRoleDatabaseHandler, AgentID: api.NewID("agt"), Host: "devbox", Session: "tt-database", Runtime: "claude"}, &handler); code != 201 {
+		t.Fatalf("handler %d", code)
+	}
+	builder := c.agent(task, "builder")
+	var item api.WorkItem
+	if code := c.do("POST", "/v1/tasks/"+task.ID+"/work-items", api.CreateWorkItemRequest{Kind: "bug", Title: "Refusal fixture", RequestID: "refusal-create"}, &item); code != 201 {
+		t.Fatalf("create %d", code)
+	}
+	title := "Stale"
+	base := "/v1/tasks/" + task.ID + "/work-items/" + item.ID
+	// PATCH: a stale handler write is recorded each time (no request ID).
+	for i := 0; i < 2; i++ {
+		if code := c.do("PATCH", base, api.UpdateWorkItemRequest{Revision: 9, Title: &title, AgentID: handler.ID}, nil); code != 409 {
+			t.Fatalf("stale patch = %d", code)
+		}
+	}
+	// /updates: a replayed refused request records once.
+	update := api.CreateWorkItemUpdate{ExpectedRevision: 9, Title: &title, AgentID: handler.ID, RunID: handler.RunID, RequestID: "refused-update"}
+	for i := 0; i < 2; i++ {
+		if code := c.do("POST", base+"/updates", update, nil); code != 409 {
+			t.Fatalf("stale update = %d", code)
+		}
+	}
+	// dispatch: an invalid handler dispatch is recorded.
+	if code := c.do("POST", base+"/dispatch", api.DispatchWorkItemRequest{Revision: 9, AgentID: handler.ID, RequestID: "refused-dispatch"}, nil); code < 400 || code >= 500 {
+		t.Fatalf("refused dispatch = %d", code)
+	}
+	// Not recorded: the owner, a builder, and a denied (403) caller.
+	if code := c.do("PATCH", base, api.UpdateWorkItemRequest{Revision: 9, Title: &title}, nil); code != 409 {
+		t.Fatalf("owner stale patch = %d", code)
+	}
+	if code := c.do("PATCH", base, api.UpdateWorkItemRequest{Revision: 9, Title: &title, AgentID: builder.ID}, nil); code != 409 {
+		t.Fatalf("builder stale patch = %d", code)
+	}
+	denied, _ := json.Marshal(api.UpdateWorkItemRequest{Revision: 9, Title: &title, AgentID: handler.ID})
+	req, _ := http.NewRequest("PATCH", c.srv.URL+base, strings.NewReader(string(denied)))
+	req.Header.Set("X-Test-Deny", "1")
+	if res, err := http.DefaultClient.Do(req); err != nil || res.StatusCode != 403 {
+		t.Fatalf("denied patch %v %v", res, err)
+	} else {
+		res.Body.Close()
+	}
+	var good api.WorkItemUpdateResult
+	if code := c.do("POST", base+"/updates", api.CreateWorkItemUpdate{ExpectedRevision: 1, Title: &title, AgentID: handler.ID, RunID: handler.RunID, RequestID: "saved-update"}, &good); code != 201 {
+		t.Fatalf("saved update = %d", code)
+	}
+	if code := c.do("POST", base+"/updates", api.CreateWorkItemUpdate{ExpectedRevision: 1, Title: &title, AgentID: handler.ID, RunID: handler.RunID, RequestID: "saved-update"}, nil); code != 200 {
+		t.Fatalf("replayed saved update = %d", code)
+	}
+	refusals, err := c.st.HandlerWriteRefusals(context.Background(), task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got []string
+	for _, r := range refusals {
+		if r.AgentID != handler.ID || r.RunID != handler.RunID || r.ItemID != item.ID {
+			t.Fatalf("refusal identity %+v", r)
+		}
+		got = append(got, r.Route+"/"+r.Code+"/"+fmt.Sprint(r.Status))
+	}
+	if len(got) != 4 || got[0] != "update/stale_revision/409" || got[1] != "update/stale_revision/409" || got[2] != "updates/stale_revision/409" || !strings.HasPrefix(got[3], "dispatch/") {
+		t.Fatalf("refusals %v", got)
+	}
+}

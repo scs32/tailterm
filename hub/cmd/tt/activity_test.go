@@ -1378,3 +1378,52 @@ func TestActivityAPIErrorTurnReason(t *testing.T) {
 		t.Fatalf("relay reports %+v", h.reports)
 	}
 }
+
+// Handler arms (wi_fc1396aef8a72a06): the relay reports an idle turn whose
+// reason changes to an API rate limit, but not a stuck reason change.
+func TestActivityReportReasonChangeReachesHub(t *testing.T) {
+	idle := api.AgentActivity{State: "idle"}
+	limited := api.AgentActivity{State: "idle", Reason: "turn ended by API error (rate_limit)"}
+	if activityReportKey(idle) == activityReportKey(limited) {
+		t.Fatal("idle reason is not part of the report key")
+	}
+	silent, silentLimited := idle, limited
+	silent.State, silentLimited.State = "finished_silent", "finished_silent"
+	if activityReportKey(silent) == activityReportKey(silentLimited) {
+		t.Fatal("finished_silent reason is not part of the report key")
+	}
+	if activityReportKey(api.AgentActivity{State: "stuck", Reason: "a"}) != activityReportKey(api.AgentActivity{State: "stuck", Reason: "b"}) {
+		t.Fatal("stuck reasons must not make new reports")
+	}
+
+	cols, rows := 200, 50
+	stubPaneSize(t, &cols, &rows)
+	b, h, _, tick := stuckFixture(t, "claude")
+	path := filepath.Join(os.Getenv("HOME"), ".claude", "projects", "p", b.Thread+".jsonl")
+	clean := strings.Join([]string{claudeAPIErrorPrompt, claudeAPIErrorEndTurn}, "\n") + "\n"
+	if err := os.WriteFile(path, []byte(clean), 0600); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 9, 25, 20, 0, 0, 0, time.UTC)
+	if err := tick(now); err != nil {
+		t.Fatal(err)
+	}
+	record := strings.Replace(claudeAPIErrorRecord, `"error":"server_error"`, `"error":"rate_limit"`, 1)
+	limitedTranscript := clean + strings.Join([]string{claudeAPIErrorPrompt, record, claudeAPIErrorTurnDuration}, "\n") + "\n"
+	if err := os.WriteFile(path, []byte(limitedTranscript), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := tick(now.Add(30 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if len(h.reports) != 2 || h.reports[0].State != "idle" || h.reports[0].Reason != "" || h.reports[1].State != "idle" || h.reports[1].Reason != "turn ended by API error (rate_limit)" {
+		t.Fatalf("relay reports %+v", h.reports)
+	}
+	// The same idle reason again is not reported twice.
+	if err := tick(now.Add(60 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if len(h.reports) != 2 {
+		t.Fatalf("repeat reported %+v", h.reports)
+	}
+}

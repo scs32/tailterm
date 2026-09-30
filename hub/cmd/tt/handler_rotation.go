@@ -273,6 +273,9 @@ func rotateHandler(ctx context.Context, d rotationDeps, e env, c *api.Client, ta
 		if spec.runtime() != old.Runtime || spec.value("cwd") != old.Cwd {
 			return zero, fmt.Errorf("the saved launch spec (runtime %q, cwd %q) differs from handler %s (runtime %q, cwd %q); save matching settings with tt handler spec", spec.runtime(), spec.value("cwd"), old.Name, old.Runtime, old.Cwd)
 		}
+		if err := checkRotationArm(ctx, c, task, old, spec); err != nil {
+			return zero, err
+		}
 		if reason == "" {
 			reason = api.HandlerRotationReasonManual
 		}
@@ -403,7 +406,7 @@ func abortHandlerRotation(ctx context.Context, d rotationDeps, e env, c *api.Cli
 }
 
 func cmdHandler(e env, args []string) error {
-	usage := errors.New("usage: tt handler rotate|rotation|policy|spec (see tt handler SUBCOMMAND --help)")
+	usage := errors.New("usage: tt handler rotate|rotation|policy|spec|arms|ab-report (see tt handler SUBCOMMAND --help)")
 	if len(args) == 0 {
 		return usage
 	}
@@ -416,6 +419,10 @@ func cmdHandler(e env, args []string) error {
 		return cmdHandlerPolicy(e, args[1:])
 	case "spec":
 		return cmdHandlerSpec(e, args[1:])
+	case "arms":
+		return cmdHandlerArms(e, args[1:])
+	case "ab-report":
+		return cmdHandlerABReport(e, args[1:])
 	}
 	return usage
 }

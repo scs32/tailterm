@@ -153,7 +153,7 @@ func cmdTeamQueue(e env, args []string) error {
 			} else if q.State == "failed" && q.ReleasedAt != "" {
 				state += " (released)"
 			}
-			fmt.Printf("%d %s %s %s order=#%d revision=%d repository=%s owns=%s blocked-by=%s reason=%s handler=%s/%s lease=%d\n", q.Position, state, q.ID, q.ItemID, q.OrderMessageSeq, q.Revision, q.Repository, owns, strings.Join(q.BlockedBy, ","), q.BlockReason, q.HandlerID, q.HandlerRunID, q.HandlerLeaseGeneration)
+			fmt.Printf("%d %s %s %s order=#%d revision=%d repository=%s owns=%s blocked-by=%s reason=%s handler=%s/%s lease=%d%s\n", q.Position, state, q.ID, q.ItemID, q.OrderMessageSeq, q.Revision, q.Repository, owns, strings.Join(q.BlockedBy, ","), q.BlockReason, q.HandlerID, q.HandlerRunID, q.HandlerLeaseGeneration, queueArmText(q.HandlerArm))
 			fmt.Printf("  team last-transition tokens=%d\n", q.Tokens.Total)
 			for _, member := range q.Activities {
 				state := "unknown"
@@ -602,4 +602,17 @@ func queueReleaseRequest(ctx context.Context, c *api.Client, hub, task string, q
 		req.Host = q.Host
 	}
 	return req, unlock, nil
+}
+
+// queueArmText is the list suffix for an entry leased under a handler arm
+// policy (docs/handler-ab.md).
+func queueArmText(a *api.TeamQueueHandlerArm) string {
+	if a == nil {
+		return ""
+	}
+	fallback := "no"
+	if a.Fallback {
+		fallback = or(a.FallbackReason, "yes")
+	}
+	return fmt.Sprintf(" arm=%s drawn=%s fallback=%s", a.Arm, a.DrawnArm, fallback)
 }
