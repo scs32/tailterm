@@ -308,9 +308,16 @@ matching reason is reported:
   of a queued, launching, running or unreleased failed entry, that entry's
   accepted worktree, or the cwd of a non-closed agent on this host; or it lies
   in a Claude scratchpad (`<temp>/claude-<uid>/<cwd key>/<session>/scratchpad`)
-  of a session started in one of those paths.
-- `nested`: it contains a kept worktree. Deepest worktrees are handled first,
-  so removable children go before their parent.
+  of a session started in one of those paths. The sweep reads every
+  project's roster and queue. Closeout reads less: its own project's roster
+  and queue, plus the host queue list, which holds other projects' queued,
+  launching and running entries but not their failed ones or agents.
+- `nested`: it contains a linked worktree, or any other Git repository (a
+  `.git` entry below its root, such as a separate clone), that is not removed
+  earlier in the same pass. `git worktree remove` would delete such a
+  repository with everything in it when it sits under an ignored path.
+  Deepest worktrees are handled first, so removable children go before their
+  parent.
 - `recent` (sweep only): its Git `HEAD`, `index` or `logs/HEAD` changed within
   `--min-idle`.
 - `evidence`: its path, absolute, repository-relative or `~/`-relative, is
@@ -325,21 +332,23 @@ matching reason is reported:
   (releases integrate by cherry-pick). A detached commit on no ref is always
   kept, so garbage collection cannot drop a receipt's SHA.
 
-Removal re-checks the lock, operation, status and HEAD immediately before it,
-adds owner write permission to read-only directories inside the worktree, and
-then runs `git worktree remove` without `--force`, so Git's own check is the
-last guard. A change found by the re-check keeps the worktree with that reason
-(or `moved` for a new HEAD), and a failed removal is kept as `remove-failed`. Branches are never deleted: an accepted branch and commit still
-resolve after their worktree is gone. Closeout and sweep share a host lock in
+Removal re-checks the lock, operation, status, HEAD and nested repositories
+immediately before it, adds owner write permission to read-only directories
+inside the worktree, and then runs `git worktree remove` without `--force`.
+A change found by the re-check keeps the worktree with that reason (or
+`moved` for a new HEAD). A failed removal is kept as `remove-failed` and the
+directory permissions are restored. Branches are never deleted: an accepted
+branch and commit still resolve after their worktree is gone. Closeout and sweep share a host lock in
 the relay state directory.
 
 **Closeout timing.** On each tick the runner looks at the project's finished
 entries on its host that have a saved acceptance. If none of the entry's cwd,
 accepted worktree or integration worktree exists, that costs only `os.Stat`.
 Otherwise it reads the project's roster, at most once per 15 minutes per entry,
-and considers the entry's recorded worktrees plus, when a team cwd is a linked
-worktree, the worktrees nested in it and in scratchpads of sessions started
-there. A shared main-checkout cwd attributes nothing further. The cleanup makes
+and considers the entry's recorded worktrees plus, when a recorded worktree or
+a team cwd is a linked worktree, the worktrees nested in it and in scratchpads
+of sessions started there. A shared main-checkout cwd attributes nothing
+further; a worktree nested in a considered one still keeps it `nested`. The cleanup makes
 no hub write. Because integration happens after the entry finishes, a worktree
 is usually kept `unpushed` at first and removed on a later tick once its
 release lands on `tasks-hub`. A finished entry is examined only while its

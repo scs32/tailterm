@@ -171,7 +171,7 @@ func TestWorktreeCleanupRemovesFastForwardedWorktreeWithReadOnlyCache(t *testing
 			t.Fatal(err)
 		}
 	}
-	t.Cleanup(func() { _ = makeWorktreeWritable(w) })
+	t.Cleanup(func() { _, _ = makeWorktreeWritable(w) })
 
 	dry := r.sweep(t, false, nil, nil)
 	requireDecision(t, dry, w, "would-remove", "")
@@ -504,7 +504,7 @@ func TestWorktreeCleanupRunnerRemovesFinishedEntryWorktrees(t *testing.T) {
 	if err := os.Chmod(cache, 0555); err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = makeWorktreeWritable(finishedCwd) })
+	t.Cleanup(func() { _, _ = makeWorktreeWritable(finishedCwd) })
 	verifier := filepath.Join(r.root, "tmp", "claude-501", claudeScratchKey(finishedCwd), "5e55-session", "scratchpad", "verify-ffff")
 	cleanupGit(t, r.main, "worktree", "add", "-q", "--detach", verifier, commit)
 	runningCwd := r.queuePath("queue-bbbb0002")
@@ -925,4 +925,124 @@ func TestWorktreeCleanupDefersPruneForUnintegratedGoneWorktree(t *testing.T) {
 	if list := cleanupGit(t, r.main, "worktree", "list", "--porcelain"); !strings.Contains(list, orphanHead) || !strings.Contains(list, gone) {
 		t.Fatalf("pruned despite an unintegrated gone worktree:\n%s", list)
 	}
+}
+
+// Review round 1 b1: git worktree remove deletes whatever sits under an
+// ignored path, including a nested worktree or clone with unpushed work. Both
+// closeout (whose team cwd is the shared main checkout) and the sweep must
+// keep the accepted worktree as nested and leave the nested work intact.
+func TestWorktreeCleanupKeepsWorktreeHoldingNestedWork(t *testing.T) {
+	type nestedCase struct {
+		name  string
+		setup func(t *testing.T, r cleanupRepo, parent string) (nested, marker, childReason string)
+	}
+	cases := []nestedCase{
+		{"dirty nested worktree", func(t *testing.T, r cleanupRepo, parent string) (string, string, string) {
+			nested := filepath.Join(parent, ".build", "verify-x")
+			cleanupGit(t, r.main, "worktree", "add", "-q", "--detach", nested, "tasks-hub")
+			writeFixtureFile(t, filepath.Join(nested, "app.txt"), "uncommitted edit\n")
+			writeFixtureFile(t, filepath.Join(nested, "notes.txt"), "untracked work\n")
+			return nested, filepath.Join(nested, "notes.txt"), keepDirty
+		}},
+		{"detached unreachable nested worktree", func(t *testing.T, r cleanupRepo, parent string) (string, string, string) {
+			nested := filepath.Join(parent, ".build", "verify-y")
+			cleanupGit(t, r.main, "worktree", "add", "-q", "--detach", nested, "tasks-hub")
+			writeFixtureFile(t, filepath.Join(nested, "extra.txt"), "x\n")
+			cleanupGit(t, nested, "add", "extra.txt")
+			cleanupGit(t, nested, "commit", "-q", "-m", "unpushed detached commit")
+			return nested, filepath.Join(nested, "extra.txt"), keepUnpushed
+		}},
+		{"nested separate clone", func(t *testing.T, r cleanupRepo, parent string) (string, string, string) {
+			clone := filepath.Join(parent, ".build", "clone")
+			if err := os.MkdirAll(clone, 0755); err != nil {
+				t.Fatal(err)
+			}
+			cleanupGit(t, clone, "init", "-q", "-b", "main")
+			writeFixtureFile(t, filepath.Join(clone, "work.txt"), "unpushed clone work\n")
+			cleanupGit(t, clone, "add", ".")
+			cleanupGit(t, clone, "commit", "-q", "-m", "clone work")
+			return clone, filepath.Join(clone, "work.txt"), ""
+		}},
+	}
+	for _, tc := range cases {
+		for _, mode := range []string{"closeout", "sweep"} {
+			t.Run(tc.name+" "+mode, func(t *testing.T) {
+				r := newCleanupRepo(t)
+				parent := r.branchWorktree(t, r.queuePath("builder-wt"), "bug/accepted")
+				commit := cleanupGit(t, parent, "rev-parse", "HEAD")
+				cleanupGit(t, r.main, "merge", "-q", "--ff-only", "bug/accepted")
+				nested, marker, childReason := tc.setup(t, r, parent)
+				var got map[string]worktreeDecision
+				if mode == "closeout" {
+					const host = "fixture"
+					task := "tsk_c1ea0c1ea0c1ea09"
+					q := api.TeamQueueEntry{ID: "tqe_nested_" + strings.ReplaceAll(tc.name, " ", "_"), TaskID: task, ItemID: "wi_0101010101010101", State: "finished", Host: host, Cwd: r.main, Repository: r.common,
+						Acceptance: &api.TeamIntegrationAcceptance{Repository: r.common, Worktree: parent, Branch: "bug/accepted", Commit: commit, Evidence: "verification receipt vr_9"}}
+					hub := &cleanupHub{details: map[string]api.TaskDetail{task: {Task: api.Task{ID: task, Status: api.TaskOpen}, Agents: []api.Agent{
+						{ID: "agt_builder", Host: host, Status: api.AgentClosed, Cwd: r.main, WorkItem: &api.AgentWorkItemBinding{ItemTaskID: task, ItemID: q.ItemID}},
+					}}}}
+					server := httptest.NewServer(hub)
+					defer server.Close()
+					c, err := api.NewClient(server.URL, 5*time.Second)
+					if err != nil {
+						t.Fatal(err)
+					}
+					var stderr strings.Builder
+					restore := captureStderr(t, &stderr)
+					err = closeoutWorktrees(context.Background(), c, host, api.TeamQueueList{}, api.TeamQueueList{Entries: []api.TeamQueueEntry{q}}, q)
+					restore()
+					if err != nil {
+						t.Fatal(err)
+					}
+					if !strings.Contains(stderr.String(), "kept nested "+parent) {
+						t.Fatalf("stderr lacks kept nested: %q", stderr.String())
+					}
+					got = map[string]worktreeDecision{}
+					for _, rec := range readCleanupReceipts(t) {
+						got[rec.Path] = worktreeDecision{Path: rec.Path, Action: rec.Action, Reason: rec.Reason, Detail: rec.Detail}
+					}
+				} else {
+					got = r.sweep(t, true, nil, nil)
+				}
+				d := requireDecision(t, got, parent, "kept", keepNested)
+				if !strings.Contains(d.Detail, nested) {
+					t.Fatalf("nested detail %q lacks %s", d.Detail, nested)
+				}
+				if childReason != "" {
+					requireDecision(t, got, nested, "kept", childReason)
+				}
+				requireExists(t, marker, true)
+				requireExists(t, parent, true)
+			})
+		}
+	}
+}
+
+// Review round 1 f4: a removal that fails after the permission walk puts the
+// read-only directories back as they were.
+func TestWorktreeCleanupRestoresPermissionsWhenRemovalFails(t *testing.T) {
+	r := newCleanupRepo(t)
+	w := r.branchWorktree(t, r.queuePath("queue-aaaa0019"), "bug/refused")
+	cleanupGit(t, r.main, "merge", "-q", "--ff-only", "bug/refused")
+	mod := filepath.Join(w, ".build", "go", "pkg", "mod", "example.com")
+	writeFixtureFile(t, filepath.Join(mod, "go.mod"), "module example.com\n")
+	if err := os.Chmod(mod, 0555); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _, _ = makeWorktreeWritable(w) })
+	original := worktreeGit
+	worktreeGit = func(ctx context.Context, dir string, args ...string) (string, error) {
+		if len(args) > 1 && args[0] == "worktree" && args[1] == "remove" {
+			return "", exec.Command("false").Run()
+		}
+		return original(ctx, dir, args...)
+	}
+	t.Cleanup(func() { worktreeGit = original })
+	got := r.sweep(t, true, nil, nil)
+	requireDecision(t, got, w, "kept", keepFailed)
+	info, err := os.Stat(mod)
+	if err != nil || info.Mode().Perm() != 0555 {
+		t.Fatalf("permissions not restored: %v %v", info.Mode(), err)
+	}
+	requireExists(t, w, true)
 }

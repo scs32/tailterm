@@ -23,8 +23,10 @@ import (
 // Worktree cleanup removes finished items' Git worktrees and the caches inside
 // them. Team closeout and the one-time sweep share one classifier: a worktree
 // is removed only when nothing keeps it, and every keep has a reason. Git's
-// own `worktree remove` (never --force) is the last guard, and branches are
-// never deleted, so an accepted commit stays reachable after its worktree goes.
+// own `worktree remove` (never --force) refuses dirty work but deletes ignored
+// content, nested repositories included, so those are checked first. Branches
+// are never deleted, so an accepted commit stays reachable after its worktree
+// goes.
 
 // Keep reasons, in the order they are checked.
 const (
@@ -500,9 +502,20 @@ func worktreeBytes(root string, skip map[string]bool) int64 {
 
 // makeWorktreeWritable adds owner rwx to directories under root that lack it,
 // such as the Go module cache's read-only directories, so git can delete
-// them. It never follows symlinks and never leaves root.
-func makeWorktreeWritable(root string) error {
-	return filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
+// them. It never follows symlinks and never leaves root. The returned
+// function restores the original modes, for a removal that then fails.
+func makeWorktreeWritable(root string) (func(), error) {
+	type change struct {
+		path string
+		perm fs.FileMode
+	}
+	var changed []change
+	restore := func() {
+		for i := len(changed) - 1; i >= 0; i-- {
+			_ = os.Chmod(changed[i].path, changed[i].perm)
+		}
+	}
+	err := filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return err
 		}
@@ -514,15 +527,50 @@ func makeWorktreeWritable(root string) error {
 			return err
 		}
 		if perm := info.Mode().Perm(); perm&0700 != 0700 {
-			return os.Chmod(p, perm|0700)
+			if err := os.Chmod(p, perm|0700); err != nil {
+				return err
+			}
+			changed = append(changed, change{p, perm})
 		}
 		return nil
 	})
+	if err != nil {
+		restore()
+		return nil, err
+	}
+	return restore, nil
+}
+
+// nestedRepository returns the first Git repository or worktree below root:
+// any `.git` entry other than root's own. Git's worktree remove deletes
+// ignored content recursively, including such a repository and its unpushed
+// work. Linked worktrees in cleared go earlier in the same pass and are
+// skipped.
+func nestedRepository(root string, cleared map[string]bool) (string, error) {
+	found := ""
+	own := filepath.Join(root, ".git")
+	err := filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if p == root {
+			return nil
+		}
+		if d.IsDir() && cleared[p] {
+			return filepath.SkipDir
+		}
+		if d.Name() == ".git" && p != own {
+			found = filepath.Dir(p)
+			return filepath.SkipAll
+		}
+		return nil
+	})
+	return found, err
 }
 
 // removeWorktree re-checks a removable worktree immediately before removing
 // it and returns a keep reason when anything changed since classification.
-func removeWorktree(ctx context.Context, common string, w gitWorktree, admin string) (string, string) {
+func removeWorktree(ctx context.Context, common string, w gitWorktree, admin string, cleared map[string]bool) (string, string) {
 	if admin == "" {
 		return keepMoved, "worktree admin directory is unreadable"
 	}
@@ -546,10 +594,19 @@ func removeWorktree(ctx context.Context, common string, w gitWorktree, admin str
 	if strings.TrimSpace(head) != w.Head {
 		return keepMoved, "HEAD moved to " + shortSHA(strings.TrimSpace(head))
 	}
-	if err := makeWorktreeWritable(w.Path); err != nil {
+	nested, err := nestedRepository(w.Path, cleared)
+	if err != nil {
+		return keepFailed, "scan for nested repositories: " + err.Error()
+	}
+	if nested != "" {
+		return keepNested, "contains Git repository " + nested
+	}
+	restore, err := makeWorktreeWritable(w.Path)
+	if err != nil {
 		return keepFailed, "make caches removable: " + err.Error()
 	}
 	if _, err := worktreeGit(ctx, common, "worktree", "remove", w.Path); err != nil {
+		restore()
 		return keepFailed, err.Error()
 	}
 	return "", ""
@@ -611,13 +668,15 @@ func cleanupWorktrees(ctx context.Context, in worktreeCleanupInputs) ([]worktree
 		linkedSet[p] = true
 	}
 	var decisions []worktreeDecision
-	kept := map[string]bool{}
+	// cleared holds worktrees removed or pruned (or, in a dry run, that
+	// would be) earlier in this pass; only they may sit inside a removal.
+	cleared := map[string]bool{}
 	prune := false
 	blockerChecked, blocker := false, ""
 	for _, w := range candidates {
 		d := worktreeDecision{Path: w.Path, Branch: strings.TrimPrefix(w.Branch, "refs/heads/"), Head: w.Head}
 		admin := worktreeAdminDir(w.Path)
-		reason, detail := classifyWorktree(ctx, common, main, w, admin, in, inUse, linked, cited, kept)
+		reason, detail := classifyWorktree(ctx, common, main, w, admin, in, inUse, linked, cited, cleared)
 		if reason == keepMissing && !blockerChecked {
 			blockerChecked = true
 			if blocker, err = pruneBlocker(ctx, common, worktrees); err != nil {
@@ -642,15 +701,15 @@ func cleanupWorktrees(ctx context.Context, in worktreeCleanupInputs) ([]worktree
 			}
 			d.Action, d.Detail = "would-remove", detail
 			if in.Apply {
-				if reason, why := removeWorktree(ctx, common, w, admin); reason != "" {
+				if reason, why := removeWorktree(ctx, common, w, admin, cleared); reason != "" {
 					d.Action, d.Reason, d.Detail, d.Bytes = "kept", reason, why, 0
 				} else {
 					d.Action = "removed"
 				}
 			}
 		}
-		if d.Action == "kept" {
-			kept[w.Path] = true
+		if d.Action != "kept" {
+			cleared[w.Path] = true
 		}
 		decisions = append(decisions, d)
 	}
@@ -704,7 +763,7 @@ func pruneBlocker(ctx context.Context, common string, worktrees []gitWorktree) (
 
 // classifyWorktree returns the first keep reason, or "" with the integration
 // detail when the worktree is removable.
-func classifyWorktree(ctx context.Context, common, main string, w gitWorktree, admin string, in worktreeCleanupInputs, inUse, linked []string, cited map[string]string, kept map[string]bool) (string, string) {
+func classifyWorktree(ctx context.Context, common, main string, w gitWorktree, admin string, in worktreeCleanupInputs, inUse, linked []string, cited map[string]string, cleared map[string]bool) (string, string) {
 	if w.Locked {
 		return keepLocked, "git worktree is locked"
 	}
@@ -736,9 +795,14 @@ func classifyWorktree(ctx context.Context, common, main string, w gitWorktree, a
 			}
 		}
 	}
-	for child := range kept {
-		if child != w.Path && pathWithin(child, w.Path) {
-			return keepNested, "contains kept worktree " + child
+	// Every linked worktree inside it counts, selected or not, unless it
+	// goes first in this pass or is already gone.
+	for _, child := range linked {
+		if child == w.Path || !pathWithin(child, w.Path) || cleared[child] {
+			continue
+		}
+		if info, err := os.Stat(child); err == nil && info.IsDir() {
+			return keepNested, "contains worktree " + child
 		}
 	}
 	if in.MinIdle > 0 {
@@ -776,6 +840,16 @@ func classifyWorktree(ctx context.Context, common, main string, w gitWorktree, a
 	}
 	if !ok {
 		return keepUnpushed, detail
+	}
+	if !in.Apply {
+		// Applying repeats this scan as part of the removal re-check.
+		nested, err := nestedRepository(w.Path, cleared)
+		if err != nil {
+			return keepFailed, "scan for nested repositories: " + err.Error()
+		}
+		if nested != "" {
+			return keepNested, "contains Git repository " + nested
+		}
 	}
 	return "", detail
 }
@@ -851,7 +925,7 @@ func closeoutWorktrees(ctx context.Context, c *api.Client, host string, active, 
 	}
 	entries := append(append([]api.TeamQueueEntry(nil), active.Entries...), project.Entries...)
 	inUse, evidence := worktreeProtection(host, entries, detail.Agents)
-	roots := []string{q.Cwd}
+	roots := append([]string(nil), direct...)
 	for _, a := range detail.Agents {
 		if a.WorkItem != nil && a.WorkItem.ItemTaskID == q.TaskID && a.WorkItem.ItemID == q.ItemID && a.Host == host {
 			roots = append(roots, a.Cwd)
@@ -888,9 +962,9 @@ func closeoutWorktrees(ctx context.Context, c *api.Client, host string, active, 
 	decisions, err := cleanupWorktrees(ctx, worktreeCleanupInputs{
 		Repo: repo,
 		// Only paths attributable to this item: its recorded worktrees and,
-		// when a team cwd is a linked worktree, what is nested in it or in
-		// scratchpads of sessions started there. A main-checkout cwd is
-		// shared, so it attributes nothing further.
+		// when a recorded worktree or team cwd is a linked worktree, what is
+		// nested in it or in scratchpads of sessions started there. A
+		// main-checkout cwd is shared, so it attributes nothing further.
 		Select: func(w gitWorktree, main string, linked []string) bool {
 			for _, p := range directPaths {
 				if w.Path == p {
