@@ -560,3 +560,150 @@ func TestStallNoticeFitsWithMultibyteSubjects(t *testing.T) {
 	}
 	t.Fatal("stall notice with multibyte subjects was not posted")
 }
+
+// queuedFix files an item with a confirmed order and queues it, returning
+// the item and its queue entry.
+func (f *fixture) queuedFix(t *testing.T) (api.WorkItem, api.TeamQueueEntry) {
+	t.Helper()
+	handler, err := f.st.AddAgent(f.ctx, f.task.ID, api.AddAgentRequest{AgentID: api.NewID("agt"), Name: "db-handler", Role: api.AgentRoleDatabaseHandler, Host: "h", Session: "db-handler", Runtime: "codex"}, f.by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.st.PostEvent(f.ctx, f.task.ID, api.PostEventRequest{AgentID: handler.ID, RunID: handler.RunID, Kind: api.EventRunning}, f.by); err != nil {
+		t.Fatal(err)
+	}
+	item, err := f.st.CreateWorkItem(f.ctx, f.task.ID, api.CreateWorkItemRequest{Kind: "bug", Title: "The fix the block waits on", RequestID: "queued-fix"}, f.by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	order, err := f.st.PostMessage(f.ctx, f.task.ID, api.PostMessageRequest{Text: "bounded fix order", RequestID: "queued-fix-order", WorkItems: []api.MessageWorkItem{{ItemTaskID: f.task.ID, ItemID: item.ID, ItemRevision: item.Revision, Relationship: "primary"}}}, f.by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.st.ConfirmWorkOrderScope(f.ctx, f.task.ID, item.ID, api.ConfirmWorkOrderScopeRequest{RequestID: "queued-fix-scope", AgentID: handler.ID, RunID: handler.RunID, ExpectedRevision: item.Revision, ScopeRevision: item.ScopeRevision, OrderMessageSeq: order.Seq, Complete: true}); err != nil {
+		t.Fatal(err)
+	}
+	q, err := f.st.TeamQueueAction(f.ctx, f.task.ID, api.TeamQueueRequest{RequestID: "queued-fix-add", Operation: "add", ItemID: item.ID, OrderMessageSeq: order.Seq, Host: "h", Cwd: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return item, q
+}
+
+// blockOn has the holder acknowledge and then BLOCK the obligation, linking
+// the item as primary or related.
+func (f *fixture) blockOn(t *testing.T, o api.Obligation, holder, to api.Agent, item api.WorkItem, relationship string, at time.Time) {
+	t.Helper()
+	if _, err := f.st.ObligationAction(f.ctx, f.task.ID, o.MessageSeq, "ack", api.ObligationActionRequest{AgentID: holder.ID, RunID: holder.RunID}, at); err != nil {
+		t.Fatalf("ack: %v", err)
+	}
+	links := []api.MessageWorkItem{{ItemTaskID: f.task.ID, ItemID: item.ID, ItemRevision: item.Revision, Relationship: "primary"}}
+	if relationship == "related" {
+		// A related link rides beside the message's own primary item.
+		own, err := f.st.CreateWorkItem(f.ctx, f.task.ID, api.CreateWorkItemRequest{Kind: "bug", Title: "The blocked work itself", RequestID: "blocked-own"}, f.by)
+		if err != nil {
+			t.Fatal(err)
+		}
+		links = []api.MessageWorkItem{{ItemTaskID: f.task.ID, ItemID: own.ID, ItemRevision: own.Revision, Relationship: "primary"}, {ItemTaskID: f.task.ID, ItemID: item.ID, ItemRevision: item.Revision, Relationship: "related"}}
+	}
+	if _, err := f.st.PostMessage(f.ctx, f.task.ID, api.PostMessageRequest{AgentID: holder.ID, RunID: holder.RunID, To: to.ID, ReplyTo: o.MessageSeq,
+		AuditKind: api.MessageAuditWork, RequestID: "block-" + o.ID, WorkItems: links,
+		Envelope: &api.Envelope{Kind: api.EnvelopeKindBlock, To: to.Name, Subject: "Blocked until the queued fix lands", Body: api.EnvelopeBody{Reason: "the fix is queued", Needs: "the queued fix", ResumeWhen: "the fix is released"}}}, f.by); err != nil {
+		t.Fatalf("block: %v", err)
+	}
+}
+
+// ownerEscalations counts owner-level escalation notices for one obligation.
+// The obligation a BLOCK reply creates on its own recipient is a separate
+// obligation (follow-up f4, wi_e76872a6abc6d78e) and is not counted.
+func (f *fixture) ownerEscalations(t *testing.T, o api.Obligation) int {
+	t.Helper()
+	msgs, err := f.st.ListMessages(f.ctx, f.task.ID, 0, "", 500)
+	if err != nil {
+		t.Fatal(err)
+	}
+	n := 0
+	for _, m := range msgs {
+		if m.From.Node == api.BrokerNode && m.Envelope != nil && m.Envelope.Refs["obligation"] == o.ID && m.Envelope.Refs["escalation"] == "owner" {
+			n++
+		}
+	}
+	return n
+}
+
+// a8 (c3): an overdue obligation whose holder's latest BLOCK links an item
+// with an unreleased queued, launching or running entry gets no owner
+// escalation, whether a worker or the lead holds it; once the entry leaves
+// the queue the next tick escalates normally.
+func TestBlockOnQueuedFixIsNotEscalatedToOwner(t *testing.T) {
+	for _, relationship := range []string{"primary", "related"} {
+		t.Run("worker-"+relationship, func(t *testing.T) {
+			f := newFixture(t)
+			item, q := f.queuedFix(t)
+			o := f.assign(t, "")
+			c := o.CreatedAt
+			f.blockOn(t, o, f.builder, f.lead, item, relationship, c.Add(time.Minute))
+			var steps []string
+			for _, at := range []time.Duration{time.Hour, 2 * time.Hour, 5 * time.Hour, 10 * time.Hour} {
+				steps = append(steps, f.tick(t, o, c.Add(at))...)
+			}
+			for _, s := range steps {
+				if s == "escalate-owner" {
+					t.Fatalf("owner escalation for a block on a queued fix: %v", steps)
+				}
+			}
+			if n := f.ownerEscalations(t, o); n != 0 {
+				t.Fatalf("%d owner escalations", n)
+			}
+			if _, err := f.st.TeamQueueAction(f.ctx, f.task.ID, api.TeamQueueRequest{RequestID: "remove-fix", Operation: "remove", EntryID: q.ID, ExpectedRevision: q.Revision}); err != nil {
+				t.Fatal(err)
+			}
+			if got := f.tick(t, o, c.Add(11*time.Hour)); len(got) == 0 || got[0] != "escalate-owner" || f.ownerEscalations(t, o) != 1 {
+				t.Fatalf("after the entry left the queue: %v", got)
+			}
+		})
+	}
+	t.Run("lead", func(t *testing.T) {
+		f := newFixture(t)
+		item, q := f.queuedFix(t)
+		m, err := f.st.PostMessage(f.ctx, f.task.ID, api.PostMessageRequest{AgentID: f.builder.ID, RunID: f.builder.RunID, To: f.lead.ID, Envelope: &api.Envelope{
+			Kind: api.EnvelopeKindRequest, To: f.lead.Name, Subject: "Decide how the release proceeds", Body: api.EnvelopeBody{Ask: "Decide the release."}}}, f.by)
+		if err != nil {
+			t.Fatal(err)
+		}
+		obls, err := f.st.ListObligations(f.ctx, f.task.ID, store.ObligationFilter{AgentID: f.lead.ID}, time.Now())
+		if err != nil {
+			t.Fatal(err)
+		}
+		var o api.Obligation
+		for _, x := range obls {
+			if x.MessageSeq == m.Seq {
+				o = x
+			}
+		}
+		if o.ID == "" {
+			t.Fatal("no lead obligation")
+		}
+		c := o.CreatedAt
+		f.blockOn(t, o, f.lead, f.builder, item, "primary", c.Add(time.Minute))
+		for _, at := range []time.Duration{time.Hour, 3 * time.Hour, 10 * time.Hour} {
+			for _, step := range f.tick(t, o, c.Add(at)) {
+				if step == "escalate-lead" || step == "escalate-owner" {
+					t.Fatalf("lead-held block on a queued fix at %v: %s", at, step)
+				}
+			}
+		}
+		if n := f.ownerEscalations(t, o); n != 0 {
+			t.Fatalf("%d owner escalations", n)
+		}
+		if _, err := f.st.TeamQueueAction(f.ctx, f.task.ID, api.TeamQueueRequest{RequestID: "remove-fix", Operation: "remove", EntryID: q.ID, ExpectedRevision: q.Revision}); err != nil {
+			t.Fatal(err)
+		}
+		if got := f.tick(t, o, c.Add(11*time.Hour)); len(got) == 0 || got[0] != "escalate-lead" {
+			t.Fatalf("after the entry left the queue: %v", got)
+		}
+		if n := f.ownerEscalations(t, o); n != 1 {
+			t.Fatalf("lead-held escalation reached the owner %d times", n)
+		}
+	})
+}

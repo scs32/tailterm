@@ -95,6 +95,36 @@ func (s *Store) brokerTx(ctx context.Context, taskID string, fn func(*sql.Tx, ap
 // scheduler read it; the action is skipped and decided afresh next tick.
 var ErrBrokerStale = errors.New("obligation changed since the broker read it")
 
+// ErrBrokerQueuedFix means an owner escalation was held back because the
+// obligation's block waits on a fix that is already queued.
+var ErrBrokerQueuedFix = errors.New("obligation is blocked on a queued fix")
+
+// blockedOnQueuedFix reports whether a blocked obligation waits on queued
+// work: the holder's latest BLOCK reply to it links an item (primary or
+// related) whose team queue entry is queued, launching or running and not
+// released. The owner has nothing to decide there, so no owner escalation
+// is posted until that entry finishes, is removed, fails or is released.
+// Progress-aware escalation (wi_e76872a6abc6d78e) extends this one predicate.
+func blockedOnQueuedFix(ctx context.Context, q queryRower, o BrokerObligation) (bool, error) {
+	if o.State != api.ObligationBlocked {
+		return false, nil
+	}
+	var block int64
+	err := q.QueryRowContext(ctx, `SELECT seq FROM messages WHERE task_id=? AND reply_to=? AND from_agent=? AND CASE WHEN json_valid(envelope) THEN json_extract(envelope,'$.kind') END=? ORDER BY seq DESC LIMIT 1`, o.TaskID, o.MessageSeq, o.AgentID, api.EnvelopeKindBlock).Scan(&block)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	var queued int
+	err = q.QueryRowContext(ctx, `SELECT count(*) FROM team_queue_entries q WHERE q.released_at='' AND q.state IN ('queued','launching','running') AND EXISTS (
+ SELECT 1 FROM (SELECT item_task_id,item_id FROM message_work_item_links WHERE message_task_id=? AND message_seq=?
+  UNION SELECT item_task_id,item_id FROM message_audit_links WHERE message_task_id=? AND message_seq=?) l
+ WHERE l.item_task_id=q.task_id AND l.item_id=q.item_id)`, o.TaskID, block, o.TaskID, block).Scan(&queued)
+	return queued > 0, err
+}
+
 // brokerAct runs fn only if the obligation is exactly as the scheduler saw it
 // and its project is still open and not paused.
 func (s *Store) brokerAct(ctx context.Context, o BrokerObligation, fn func(*sql.Tx, api.Task) error) error {
@@ -234,6 +264,15 @@ func (s *Store) BrokerEscalate(ctx context.Context, o BrokerObligation, level in
 		}
 		if lead.ID == "" {
 			level = 2
+		}
+		if level == 2 {
+			held, err := blockedOnQueuedFix(ctx, tx, o)
+			if err != nil {
+				return err
+			}
+			if held {
+				return ErrBrokerQueuedFix
+			}
 		}
 		who := o.AgentName
 		if who == "" {

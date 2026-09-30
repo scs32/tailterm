@@ -62,6 +62,9 @@ func (b *Broker) Tick(ctx context.Context, now time.Time) ([]Step, error) {
 		switch {
 		case errors.Is(err, store.ErrBrokerStale):
 			// Changed since read; decided afresh next tick.
+		case errors.Is(err, store.ErrBrokerQueuedFix):
+			// Blocked on a queued fix: the owner has nothing to decide, so
+			// the owner escalation waits until that entry leaves the queue.
 		case err != nil:
 			if firstErr == nil {
 				firstErr = fmt.Errorf("%s obligation %s: %w", action, o.ID, err)

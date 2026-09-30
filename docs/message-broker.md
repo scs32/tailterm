@@ -174,6 +174,17 @@ One obligation per (message, recipient). States:
 | outcome due | `due`, or 2 h for assign/review, 30 min for question | escalate to lead |
 | lead escalation unanswered | 15 min | escalate to owner (Discord) |
 
+- **A block that waits on a queued fix never reaches the owner.** When an
+  obligation is `blocked` and its holder's latest BLOCK reply links an item
+  (primary, or `tt send --related`) whose team queue entry is queued, launching or
+  running and not released, the broker posts no owner escalation for it. The
+  lead escalation still happens when the lead is someone other than the holder;
+  an obligation the lead holds, which would otherwise go straight to the owner,
+  waits too. The owner has nothing to decide while the fix is in the queue. Once
+  that entry finishes, is removed, fails or is released, the next pass escalates
+  normally. The obligation a BLOCK reply creates on its own recipient is a
+  separate obligation and is not covered by this rule.
+
 - **Turn-end enforcement.** The existing `tt hook stop` already blocks a Claude turn
   from ending while unread messages exist. It changes to "while this run holds
   obligations in `delivered` or `overdue_ack`". It deliberately does not block on
