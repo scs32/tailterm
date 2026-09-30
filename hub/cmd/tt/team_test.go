@@ -378,3 +378,14 @@ func TestTeamLaunchLostAdmissionReplyKeepsFrozenIdentityAndStops(t *testing.T) {
 		t.Fatal("retry admitted a duplicate")
 	}
 }
+
+// wi_f8d48780626165cc a4: the small-change lane launches only from the queue.
+func TestTeamLaunchSmallTemplateIsQueueOnly(t *testing.T) {
+	f := newTeamFixtureKind(t, true, "bug")
+	if err := cmdTeam(f.e, f.args("--template", "small", "--dry-run")); err == nil || err.Error() != "the small-change lane is queue-only: use tt team queue add --template small" {
+		t.Fatalf("small launch: %v", err)
+	}
+	if err := cmdTeam(f.e, f.args("--template", "solo", "--dry-run")); err == nil || !strings.Contains(err.Error(), "--template planned") {
+		t.Fatalf("unknown template: %v", err)
+	}
+}

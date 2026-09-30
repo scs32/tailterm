@@ -998,3 +998,51 @@ func TestPendingQueueAcceptanceFindsFinishedEntryByItem(t *testing.T) {
 		t.Fatalf("queries %v", q)
 	}
 }
+
+// wi_f8d48780626165cc a4: the CLI queues an explicitly chosen small bug and
+// shows each entry's template.
+func TestTeamQueueCLISmallTemplateAddListAndUsage(t *testing.T) {
+	f := newTeamFixtureKind(t, true, "bug")
+	ctx := context.Background()
+	repo, _ := queueGitRepo(t)
+	if _, err := captureCLIOutput(t, func() error {
+		return cmdTeamQueue(f.e, []string{"add", "--item", f.item.ID, "--order", fmt.Sprint(f.order), "--template", "bogus", "--cwd", t.TempDir()})
+	}); err == nil || !strings.Contains(err.Error(), "usage: tt team queue add") || !strings.Contains(err.Error(), "[--template planned|small]") {
+		t.Fatalf("bogus template: %v", err)
+	}
+	if q, err := f.c.ListTeamQueue(ctx, f.task.ID); err != nil || len(q.Entries) != 0 {
+		t.Fatalf("usage error queued %+v %v", q, err)
+	}
+	if _, err := captureCLIOutput(t, func() error {
+		return cmdTeamQueue(f.e, []string{"add", "--item", f.item.ID, "--order", fmt.Sprint(f.order), "--template", "small", "--owns", "hub/cmd/tt/fix.go", "--owns", "hub/cmd/tt/fix_test.go", "--cwd", repo})
+	}); err != nil {
+		t.Fatal(err)
+	}
+	q, err := f.c.ListTeamQueue(ctx, f.task.ID)
+	if err != nil || len(q.Entries) != 1 || q.Entries[0].Template != "small" || strings.Join(q.Entries[0].Ownership, ",") != "hub/cmd/tt/fix.go,hub/cmd/tt/fix_test.go" {
+		t.Fatalf("saved small entry %+v %v", q, err)
+	}
+	planned, err := f.c.CreateWorkItem(ctx, f.task.ID, api.CreateWorkItemRequest{Kind: "feature", Title: "planned", RequestID: "planned"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	order, err := f.c.PostMessage(ctx, f.task.ID, api.PostMessageRequest{Text: "planned bounded order", RequestID: "planned-order", WorkItems: []api.MessageWorkItem{{ItemTaskID: f.task.ID, ItemID: planned.ID, ItemRevision: planned.Revision, Relationship: "primary"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.confirmOrder(t, planned, order.Seq)
+	if _, err := captureCLIOutput(t, func() error {
+		return cmdTeamQueue(f.e, []string{"add", "--item", planned.ID, "--order", fmt.Sprint(order.Seq), "--cwd", t.TempDir()})
+	}); err != nil {
+		t.Fatal(err)
+	}
+	out, err := captureCLIOutput(t, func() error { return cmdTeamQueue(f.e, []string{"list"}) })
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{f.item.ID + " order=#" + fmt.Sprint(f.order) + " template=small ", planned.ID + " order=#" + fmt.Sprint(order.Seq) + " template=planned "} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("queue list lacks %q:\n%s", want, out)
+		}
+	}
+}

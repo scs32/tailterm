@@ -1341,3 +1341,101 @@ func TestTeamRunnerTransientLaunchErrorRelaunch(t *testing.T) {
 		t.Fatalf("relaunch stall notices past the grace: %+v", notices)
 	}
 }
+
+// smallLaneSpawner admits each spawned member through the hub like the real
+// spawn, recording its name and roster size.
+func smallLaneSpawner(f teamFixture, names *[]string) func(env, []string) error {
+	return func(_ env, args []string) error {
+		flags := map[string]string{}
+		for i := 0; i+1 < len(args); i += 2 {
+			flags[args[i]] = args[i+1]
+		}
+		if flags["--planned-team-members"] != "3" {
+			return fmt.Errorf("--planned-team-members=%q, want 3", flags["--planned-team-members"])
+		}
+		*names = append(*names, flags["--name"])
+		data, err := os.ReadFile(flags["--work-context-file"])
+		if err != nil {
+			return err
+		}
+		rev, _ := strconv.ParseInt(flags["--work-item-revision"], 10, 64)
+		order, _ := strconv.ParseInt(flags["--work-order-message"], 10, 64)
+		_, err = f.c.AddAgent(context.Background(), f.task.ID, api.AddAgentRequest{AgentID: flags["--agent-id"], ExpectedRunID: flags["--expected-run-id"], Name: flags["--name"], Host: "fixture", Session: flags["--name"], Runtime: flags["--runtime"], Cwd: flags["--cwd"], WorkItem: &api.AgentWorkItemRequest{ItemTaskID: f.task.ID, ItemID: f.item.ID, ItemRevision: rev, WorkOrderMessage: api.MessageReference{TaskID: f.task.ID, Seq: order}, ContextBundle: data}})
+		return err
+	}
+}
+
+// wi_f8d48780626165cc a5: a queued small bug launches the real embedded
+// three-seat plan, lead first, and the lead becomes the orchestrator.
+func TestTeamRunnerLaunchesSmallBugAsThreeSeats(t *testing.T) {
+	f := newTeamFixtureKind(t, true, "bug")
+	ctx := context.Background()
+	q, err := f.c.TeamQueueAction(ctx, f.task.ID, api.TeamQueueRequest{RequestID: "small-add", Operation: "add", ItemID: f.item.ID, OrderMessageSeq: f.order, Template: "small", Host: "fixture", Cwd: t.TempDir(), Ownership: []string{"hub/cmd/tt/fix.go", "hub/cmd/tt/fix_test.go"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var names []string
+	runner := productionTeamRunner()
+	runner.spawn = smallLaneSpawner(f, &names)
+	runner.owned = func(context.Context, env, api.Agent) error { return nil }
+	if err := runner.tick(ctx, f.e, f.c, "fixture"); err != nil {
+		t.Fatal(err)
+	}
+	suffix := f.item.ID[len(f.item.ID)-8:]
+	if want := []string{"lead-" + suffix, "builder-" + suffix, "reviewer-" + suffix}; strings.Join(names, ",") != strings.Join(want, ",") {
+		t.Fatalf("spawned %v, want %v", names, want)
+	}
+	current, err := f.c.GetTeamQueueEntry(ctx, f.task.ID, q.ID)
+	if err != nil || current.State != "running" || current.Template != "small" {
+		t.Fatalf("small entry %+v %v", current, err)
+	}
+	var journal teamLaunchJournal
+	if err := json.Unmarshal(current.LaunchJSON, &journal); err != nil || len(journal.Members) != 3 || journal.Members[0].Fields.Role != "Small-change lead and verifier" {
+		t.Fatalf("frozen small team %+v %v", journal.Members, err)
+	}
+	detail, err := f.c.GetTask(ctx, f.task.ID)
+	if err != nil || detail.Task.Orchestrator != "lead-"+suffix {
+		t.Fatalf("orchestrator %q %v", detail.Task.Orchestrator, err)
+	}
+}
+
+// wi_f8d48780626165cc a5: the runner refuses a small entry whose item is not a
+// bug before it plans or spawns anything.
+func TestTeamRunnerSmallFeatureFailsWithoutSpawn(t *testing.T) {
+	f := newTeamFixture(t, true)
+	ctx := context.Background()
+	q, err := f.c.TeamQueueAction(ctx, f.task.ID, api.TeamQueueRequest{RequestID: "planned-add", Operation: "add", ItemID: f.item.ID, OrderMessageSeq: f.order, Host: "fixture", Cwd: t.TempDir(), Ownership: []string{"hub/cmd/tt/fix.go"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The store refuses this admission; a direct row edit stands in for an
+	// entry saved before the kind rule or by another writer.
+	db, err := sql.Open("sqlite", f.dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if _, err := db.Exec(`UPDATE team_queue_entries SET template='small' WHERE id=?`, q.ID); err != nil {
+		t.Fatal(err)
+	}
+	var names []string
+	planned := false
+	runner := teamRunner{
+		plan: func(context.Context, map[string]any, *teamLaunchResolved) error {
+			planned = true
+			return errors.New("planned a refused entry")
+		},
+		spawn: smallLaneSpawner(f, &names),
+		owned: func(context.Context, env, api.Agent) error { return nil },
+	}
+	if err := runner.tick(ctx, f.e, f.c, "fixture"); err == nil || !strings.Contains(err.Error(), "the small-change lane launches only bugs; this item is a feature: requeue it as Planned delivery") {
+		t.Fatalf("small feature tick: %v", err)
+	}
+	if planned || len(names) != 0 {
+		t.Fatalf("refused entry planned=%v spawned %v", planned, names)
+	}
+	current, err := f.c.GetTeamQueueEntry(ctx, f.task.ID, q.ID)
+	if err != nil || current.State != "failed" || !strings.Contains(current.Failure, "launches only bugs") || current.EscalationSeq == 0 {
+		t.Fatalf("small feature entry %+v %v", current, err)
+	}
+}

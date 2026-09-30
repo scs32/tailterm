@@ -86,6 +86,9 @@ func cmdTeam(e env, args []string) error {
 	if err := fs.Parse(args[1:]); err != nil {
 		return err
 	}
+	if *template == "small" {
+		return errors.New("the small-change lane is queue-only: use tt team queue add --template small")
+	}
 	if fs.NArg() != 0 || !api.ValidID(*item, "wi") || *order < 1 || *template != "planned" || !api.ValidID(*task, "tsk") || *hub == "" {
 		return errors.New("team launch needs --item wi_ID, --order positive SEQ, a project (--task or TAILTERM_TASK), a hub, and --template planned")
 	}

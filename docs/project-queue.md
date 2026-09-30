@@ -774,3 +774,71 @@ same fail, whose notice the hub still posts only once. Not covered: a launch
 whose earlier members are live while a later member's write keeps failing
 backs off but is not a stall, and the claim step and the close path keep their
 own handling.
+
+## Small-change lane
+
+Feature `wi_f8d48780626165cc` (order #16786) adds a queue-only team template,
+`small`, for small mechanical bug fixes. A Planned bug team is five sessions
+(lead, planner, builder, verifier, reviewer); the small-change team is three.
+
+**Who chooses it.** The owner or the owner helper, explicitly, with
+`tt team queue add --item wi_ID --order SEQ --template small --owns PATH...`.
+Nothing selects it automatically, and TailOS **Add team** and
+`tt team launch` do not offer it: `tt team launch --template small` fails with
+`the small-change lane is queue-only: use tt team queue add --template small`.
+The default template stays `planned`. `tt team queue list` shows
+`template=planned` or `template=small` on each entry.
+
+**Eligibility, enforced by the hub.** Queue add refuses `small` with a 409
+naming the rule unless:
+
+- the item is a `bug` (`the small-change lane admits only bugs; queue a feature
+  as Planned delivery`);
+- the entry declares explicit ownership with `--owns`, not `--serial` and not
+  empty (`the small-change lane needs explicit ownership (--owns), not
+  --serial`);
+- it owns at most three paths, the size of a file, its test and a doc (`the
+  small-change lane owns at most 3 paths; requeue the item as Planned
+  delivery`).
+
+Any other template name, including the gallery's `solo` and `pair`, is a 400
+(`unknown queue template "solo"; use planned or small`). A `tt team queue
+scope` on a small entry may narrow it but never widen it past three paths;
+splitting an owned directory into the files under it counts as narrowing, so
+the runner's post-acceptance narrowing still applies. The cap counts paths,
+not size: an owned directory is one path, so the explicit choice is the guard.
+The runner also refuses to launch a small entry whose item is not a bug, before
+it plans or spawns anything, and fails the entry with `the small-change lane
+launches only bugs; this item is a feature: requeue it as Planned delivery`.
+
+**Roster.** Lead (orchestrator and distinct verifier), builder and reviewer,
+launched in that order with item-scoped names. The builder and reviewer are the
+Planned delivery seats, byte for byte. The lead writes the frozen criteria
+itself (no planner or plan reviewer) and runs the approved matrix itself: the
+hub only requires the verifier to be admitted to the exact item and distinct
+from the builder and every review-round reviewer. Review keeps the Planned
+rules: an exact frozen candidate, at most two rounds, one disposition, and
+acceptance only with the handler-saved passing receipt for the exact final SHA
+rebased on tasks-hub. The lead prompt is in [team-launch.md](team-launch.md).
+
+**Records: s1 is bounded.** The lane saves its records through operations that
+already exist: queue freeze, attempt, started and running with the exact
+agent, run and context digest (the Start evidence), the typed ASSIGN with frozen
+criteria and scope, typed REVIEW and RESULT rounds and the typed disposition.
+The lead sends the handler no Start, plan or assignment gate REQUESTs. Three
+handler writes remain, because the hub requires the database handler for them:
+the verification plan freeze, the receipt import, and the done save with queue
+acceptance. Automating those is `wi_26c0698de7d3eef2`; until it lands, the lane
+removes the gate turns but not those three.
+
+**Host capacity.** A small entry without a frozen launch is still charged as a
+five-seat bug team (`team_host_capacity.go`). That is conservative; once the
+launch freezes, its three members are what count.
+
+**Requeue as Planned.** When the fix needs more than three paths, a design
+choice or a plan, the lead asks the owner to requeue. A still-queued small
+entry is removed with `tt team queue remove --entry ENTRY`; a launched team
+first ends through its ordinary disposition and closeout, because queue add
+refuses an item with a live team. Then `tt team queue add --item wi_ID --order
+SEQ` without `--template` queues a Planned delivery team. A new or revised
+order goes through the usual scope confirmation first.

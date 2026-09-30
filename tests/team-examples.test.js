@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
-import { PROJECT_ROLE_TEMPLATES, TEAM_EXAMPLES, exampleTeam } from "../client/team-examples.js";
+import { PROJECT_ROLE_TEMPLATES, QUEUE_TEAM_TEMPLATES, TEAM_EXAMPLES, exampleTeam } from "../client/team-examples.js";
 import { normalizeTeam, teamLaunches } from "../client/teams.js";
 import { MODEL_OPTIONS } from "../client/model-picker.js";
 test("ten complete examples are portable, launchable, bounded and independently editable", () => {
@@ -312,4 +312,40 @@ test("Planned delivery reviews a feature plan once before the builder and skips 
   // The spawn command caps "Role: ROLE\n\nPROMPT" at 8192 characters.
   for (const member of members)
     assert.ok(`Role: ${member.role}\n\n${member.prompt}`.length <= 8192, member.name);
+});
+
+// wi_f8d48780626165cc: the small-change lane is queue-only, reuses the
+// Planned builder and reviewer byte for byte and leaves the gallery alone.
+test("queue-only small change reuses Planned seats and stays out of the gallery", () => {
+  assert.equal(TEAM_EXAMPLES.length, 10);
+  assert.ok(!TEAM_EXAMPLES.some((example) => example.id === "small"));
+  assert.deepEqual(QUEUE_TEAM_TEMPLATES.map((template) => template.id), ["small"]);
+  const small = exampleTeam("small");
+  assert.equal(small.orchestrator, "lead");
+  assert.equal(small.swarm, false);
+  assert.deepEqual(small.members.map((member) => member.name), ["lead", "builder", "reviewer"]);
+  const planned = exampleTeam("planned");
+  for (const name of ["builder", "reviewer"])
+    assert.deepEqual(
+      small.members.find((member) => member.name === name),
+      planned.members.find((member) => member.name === name),
+      name,
+    );
+  const lead = small.members[0];
+  assert.deepEqual([lead.runtime, lead.model, lead.reasoning], ["claude", "claude-opus-5-5", "high"]);
+  assert.match(lead.prompt, /Post with tt send/);
+  assert.match(lead.prompt, /run tt ack SEQ before you start/);
+  assert.match(lead.prompt, /inventory useful long-lived services/);
+  assert.ok(`Role: ${lead.role}\n\n${lead.prompt}`.length <= 8192);
+  const copy = exampleTeam("small");
+  copy.members[1].prompt = "changed";
+  assert.equal(exampleTeam("planned").members.find((member) => member.name === "builder").prompt, planned.members.find((member) => member.name === "builder").prompt);
+  assert.notEqual(exampleTeam("small").members[1].prompt, "changed");
+});
+
+test("documented small-change lead prompt exactly matches the template", () => {
+  const documentation = readFileSync(new URL("../docs/team-launch.md", import.meta.url), "utf8");
+  for (const member of exampleTeam("small").members)
+    if (member.name === "lead")
+      assert.ok(documentation.includes(member.prompt), "missing exact small/lead prompt");
 });

@@ -358,6 +358,23 @@ func recordedTeamOrder(ctx context.Context, tx *sql.Tx, task, item string, revis
 	return nil
 }
 
+// The small-change lane (wi_f8d48780626165cc) is an explicit owner or
+// helper choice for a bug whose fix fits a file, its test and a doc. Anything
+// larger is requeued as Planned delivery.
+const smallChangeMaxOwned = 3
+
+// smallChangeOwnership refuses a small-change entry that does not declare a
+// bounded ownership scope.
+func smallChangeOwnership(ownership []string, serial bool) error {
+	if serial || len(ownership) == 0 {
+		return fmt.Errorf("%w: the small-change lane needs explicit ownership (--owns), not --serial", api.ErrConflict)
+	}
+	if len(ownership) > smallChangeMaxOwned {
+		return fmt.Errorf("%w: the small-change lane owns at most %d paths; requeue the item as Planned delivery", api.ErrConflict, smallChangeMaxOwned)
+	}
+	return nil
+}
+
 const teamQueueCols = `id,task_id,item_id,item_revision,order_seq,template,position,state,revision,host,cwd,pause_generation,launch_json,close_json,failure,escalation_seq,released_at,repository,ownership_json,handler_id,handler_run_id,handler_lease_generation,base_commit,acceptance_json,integration_json,serial,owner_integration_json,updated_at`
 
 func scanTeamQueue(row interface{ Scan(...any) error }) (api.TeamQueueEntry, error) {
@@ -1148,12 +1165,24 @@ func (s *Store) TeamQueueAction(ctx context.Context, task string, req api.TeamQu
 		}
 		e = api.TeamQueueEntry{TaskID: task, ItemID: req.ItemID, OrderMessageSeq: req.OrderMessageSeq, State: "launching", PauseGeneration: t.PauseGeneration}
 	case "add":
-		if !api.ValidID(req.ItemID, "wi") || req.OrderMessageSeq < 1 || (req.Template != "" && req.Template != "planned") || req.Host == "" || req.Cwd == "" {
+		if !api.ValidID(req.ItemID, "wi") || req.OrderMessageSeq < 1 || req.Host == "" || req.Cwd == "" {
 			return zero, api.ErrInvalid
+		}
+		template := req.Template
+		if template == "" {
+			template = "planned"
+		}
+		if template != "planned" && template != "small" {
+			return zero, fmt.Errorf("%w: unknown queue template %q; use planned or small", api.ErrInvalid, req.Template)
 		}
 		ownership, err := canonicalQueueOwnership(req.Ownership)
 		if err != nil {
 			return zero, err
+		}
+		if template == "small" {
+			if err := smallChangeOwnership(ownership, req.Serial); err != nil {
+				return zero, err
+			}
 		}
 		if strings.Contains(req.Repository, "\x00") || len(req.Repository) > 1024 {
 			return zero, api.ErrInvalid
@@ -1184,6 +1213,9 @@ func (s *Store) TeamQueueAction(ctx context.Context, task string, req api.TeamQu
 		if item.Status == "done" || item.Status == "dismissed" {
 			return zero, fmt.Errorf("%w: item is terminal", api.ErrConflict)
 		}
+		if template == "small" && item.Kind != "bug" {
+			return zero, fmt.Errorf("%w: the small-change lane admits only bugs; queue a %s as Planned delivery", api.ErrConflict, item.Kind)
+		}
 		var liveTeam int
 		if err := tx.QueryRowContext(ctx, `SELECT count(*) FROM agent_work_item_bindings b JOIN agents a ON a.id=b.agent_id AND a.run_id=b.run_id WHERE b.item_task_id=? AND b.item_id=? AND a.status NOT IN ('closed','exited')`, task, req.ItemID).Scan(&liveTeam); err != nil {
 			return zero, err
@@ -1199,7 +1231,7 @@ func (s *Store) TeamQueueAction(ctx context.Context, task string, req api.TeamQu
 		}
 		var maxPos int64
 		_ = tx.QueryRowContext(ctx, `SELECT COALESCE(MAX(position),0) FROM team_queue_entries WHERE task_id=?`, task).Scan(&maxPos)
-		e = api.TeamQueueEntry{ID: api.NewID("tqe"), TaskID: task, ItemID: req.ItemID, ItemRevision: item.Revision, OrderMessageSeq: req.OrderMessageSeq, Template: "planned", Position: maxPos + 1, State: "queued", Revision: 1, Host: req.Host, Cwd: req.Cwd, Repository: req.Repository, Ownership: ownership, BaseCommit: req.BaseCommit, Serial: serial, UpdatedAt: now}
+		e = api.TeamQueueEntry{ID: api.NewID("tqe"), TaskID: task, ItemID: req.ItemID, ItemRevision: item.Revision, OrderMessageSeq: req.OrderMessageSeq, Template: template, Position: maxPos + 1, State: "queued", Revision: 1, Host: req.Host, Cwd: req.Cwd, Repository: req.Repository, Ownership: ownership, BaseCommit: req.BaseCommit, Serial: serial, UpdatedAt: now}
 		ownedJSON, _ := json.Marshal(ownership)
 		_, err = tx.ExecContext(ctx, `INSERT INTO team_queue_entries(id,task_id,item_id,item_revision,order_seq,template,position,state,revision,host,cwd,repository,ownership_json,base_commit,serial,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, e.ID, task, e.ItemID, e.ItemRevision, e.OrderMessageSeq, e.Template, e.Position, e.State, e.Revision, e.Host, e.Cwd, e.Repository, string(ownedJSON), e.BaseCommit, serial, now, now)
 		if err != nil {
@@ -1227,6 +1259,11 @@ func (s *Store) TeamQueueAction(ctx context.Context, task string, req api.TeamQu
 			}
 			if len(ownership) == 0 {
 				return zero, fmt.Errorf("%w: scope needs at least one owned path", api.ErrInvalid)
+			}
+			// A small entry never widens past its cap; splitting an owned
+			// directory into the files it changed is still a narrowing.
+			if e.Template == "small" && len(ownership) > smallChangeMaxOwned && !queueNarrows(ownership, e.Ownership) {
+				return zero, fmt.Errorf("%w: the small-change lane owns at most %d paths; requeue the item as Planned delivery", api.ErrConflict, smallChangeMaxOwned)
 			}
 			if req.Cwd != "" {
 				// A queued entry may move off a shared checkout into its own

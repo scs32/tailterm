@@ -1254,3 +1254,134 @@ func TestQueueStallLaunchingEntryAfterClosedTeam(t *testing.T) {
 		t.Fatalf("notice past the grace: %v, %d messages", err, messages()-before)
 	}
 }
+
+// smallBug adds a bug with a bounded order to a queue fixture.
+func smallBug(t *testing.T, s *Store, task api.Task) (api.WorkItem, api.Message) {
+	t.Helper()
+	item, err := s.CreateWorkItem(context.Background(), task.ID, api.CreateWorkItemRequest{Kind: "bug", Title: "Small bug", Priority: "normal", RequestID: api.NewID("req")}, api.Caller{Node: "fixture", User: "owner"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return item, contextLinkedMessage(t, s, task, item, "bounded order", api.NewID("req"), nil)
+}
+
+// wi_f8d48780626165cc a1: the queue admits an explicitly chosen small bug and
+// keeps Planned as the default.
+func TestTeamQueueSmallAdmitsBoundedBug(t *testing.T) {
+	s, task, items, orders := queueFixture(t)
+	ctx := context.Background()
+	for n := 1; n <= smallChangeMaxOwned; n++ {
+		bug, order := smallBug(t, s, task)
+		owns := []string{"src/fix.go", "src/fix_test.go", "docs/fix.md"}[:n]
+		q, err := s.TeamQueueAction(ctx, task.ID, api.TeamQueueRequest{RequestID: fmt.Sprintf("small-%d", n), Operation: "add", ItemID: bug.ID, OrderMessageSeq: order.Seq, Template: "small", Host: "mini", Cwd: "/tmp", Ownership: owns})
+		if err != nil {
+			t.Fatalf("%d paths: %v", n, err)
+		}
+		saved, err := s.GetTeamQueueEntry(ctx, task.ID, q.ID)
+		if err != nil || saved.Template != "small" || len(saved.Ownership) != n || saved.Serial {
+			t.Fatalf("saved small entry %+v %v", saved, err)
+		}
+	}
+	for i, template := range []string{"", "planned"} {
+		q, err := s.TeamQueueAction(ctx, task.ID, api.TeamQueueRequest{RequestID: fmt.Sprintf("planned-%d", i), Operation: "add", ItemID: items[i].ID, OrderMessageSeq: orders[i].Seq, Template: template, Host: "mini", Cwd: "/tmp"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if saved, err := s.GetTeamQueueEntry(ctx, task.ID, q.ID); err != nil || saved.Template != "planned" {
+			t.Fatalf("template %q saved %+v %v", template, saved, err)
+		}
+	}
+}
+
+// wi_f8d48780626165cc a2: eligibility is explicit and each refusal names its
+// rule; a small entry may narrow but never widen past the cap.
+func TestTeamQueueSmallRefusesIneligibleEntries(t *testing.T) {
+	s, task, items, orders := queueFixture(t)
+	ctx := context.Background()
+	bug, order := smallBug(t, s, task)
+	add := func(key string, item api.WorkItem, order api.Message, template string, serial bool, owns ...string) (api.TeamQueueEntry, error) {
+		return s.TeamQueueAction(ctx, task.ID, api.TeamQueueRequest{RequestID: key, Operation: "add", ItemID: item.ID, OrderMessageSeq: order.Seq, Template: template, Host: "mini", Cwd: "/tmp", Serial: serial, Ownership: owns})
+	}
+	for _, c := range []struct {
+		name, template string
+		item           api.WorkItem
+		order          api.Message
+		serial         bool
+		owns           []string
+		want           error
+		rule           string
+	}{
+		{"feature", "small", items[0], orders[0], false, []string{"src/a.go"}, api.ErrConflict, "admits only bugs; queue a feature as Planned delivery"},
+		{"serial", "small", bug, order, true, nil, api.ErrConflict, "needs explicit ownership (--owns), not --serial"},
+		{"unowned", "small", bug, order, false, nil, api.ErrConflict, "needs explicit ownership (--owns), not --serial"},
+		{"four paths", "small", bug, order, false, []string{"a", "b", "c", "d"}, api.ErrConflict, "owns at most 3 paths; requeue the item as Planned delivery"},
+		{"solo", "solo", bug, order, false, []string{"a"}, api.ErrInvalid, `unknown queue template "solo"; use planned or small`},
+		{"pair", "pair", bug, order, false, []string{"a"}, api.ErrInvalid, `unknown queue template "pair"; use planned or small`},
+	} {
+		_, err := add("refuse-"+strings.ReplaceAll(c.name, " ", "-"), c.item, c.order, c.template, c.serial, c.owns...)
+		if !errors.Is(err, c.want) || !strings.Contains(err.Error(), c.rule) {
+			t.Fatalf("%s: got %v, want %v naming %q", c.name, err, c.want, c.rule)
+		}
+	}
+	q, err := add("small", bug, order, "small", false, "src/fix", "src/fix_test.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	scope := func(key string, owns ...string) (api.TeamQueueEntry, error) {
+		return s.TeamQueueAction(ctx, task.ID, api.TeamQueueRequest{RequestID: key, Operation: "scope", EntryID: q.ID, ExpectedRevision: q.Revision, Ownership: owns})
+	}
+	if _, err := scope("widen", "src/fix", "src/fix_test.go", "docs/a.md", "docs/b.md"); !errors.Is(err, api.ErrConflict) || !strings.Contains(err.Error(), "owns at most 3 paths; requeue the item as Planned delivery") {
+		t.Fatalf("widening past the cap: %v", err)
+	}
+	if saved, err := s.GetTeamQueueEntry(ctx, task.ID, q.ID); err != nil || saved.Revision != q.Revision || strings.Join(saved.Ownership, ",") != "src/fix,src/fix_test.go" {
+		t.Fatalf("refused widening changed the entry: %+v %v", saved, err)
+	}
+	// Splitting an owned directory into the files it changed stays a narrowing.
+	split, err := scope("split", "src/fix/a.go", "src/fix/b.go", "src/fix/c.go", "src/fix_test.go")
+	if err != nil || len(split.Ownership) != 4 {
+		t.Fatalf("split narrowing: %+v %v", split, err)
+	}
+	q = split
+	narrowed, err := scope("narrow", "src/fix/a.go")
+	if err != nil || strings.Join(narrowed.Ownership, ",") != "src/fix/a.go" || narrowed.Template != "small" {
+		t.Fatalf("narrowing: %+v %v", narrowed, err)
+	}
+}
+
+// wi_f8d48780626165cc a3: the small team's lead is its distinct verifier; the
+// store requires independence from builder and reviewers, not from the lead.
+func TestTeamQueueSmallLeadMayVerifyReviewerMayNot(t *testing.T) {
+	f, h, p := verificationFixture(t)
+	admitted := func(name string) api.Agent {
+		t.Helper()
+		bundle := preparedContextFromAcceptedHistory(t, f.s, f.item, api.MessageReference{TaskID: f.task.ID, Seq: p.OrderMessageSeq})
+		a, err := f.s.AddAgent(f.ctx, f.task.ID, api.AddAgentRequest{AgentID: api.NewID("agt"), Name: name, Host: "fixture", Session: name, WorkItem: &api.AgentWorkItemRequest{ItemTaskID: f.task.ID, ItemID: f.item.ID, ItemRevision: 1, WorkOrderMessage: api.MessageReference{TaskID: f.task.ID, Seq: p.OrderMessageSeq}, ContextBundle: bundle, TeamRole: api.TeamRoleMember}}, f.by)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return a
+	}
+	lead, reviewer := admitted("lead-small"), admitted("reviewer-small")
+	if _, err := f.s.db.Exec(`INSERT INTO item_team_leads(task_id,item_id,agent_id,run_id,revision,state) VALUES(?,?,?,?,1,'running')`, f.task.ID, f.item.ID, lead.ID, lead.RunID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.post(api.Envelope{Kind: "review", Subject: "Review exact fixture candidate", Body: api.EnvelopeBody{Candidate: candidateA, Scope: "fixture", Acceptance: map[string]string{"a1": "works", "a2": "retries"}}}, reviewer.ID, 0, api.Agent{}); err != nil {
+		t.Fatal(err)
+	}
+	byReviewer := p
+	byReviewer.OperationKey, byReviewer.VerifierAgentID, byReviewer.VerifierRunID = "reviewer-verifies", reviewer.ID, reviewer.RunID
+	if _, err := f.s.SaveVerification(f.ctx, f.task.ID, f.item.ID, api.VerificationRequest{RequestID: "reviewer-plan", AgentID: h.ID, RunID: h.RunID, Plan: &byReviewer}); !errors.Is(err, api.ErrConflict) || !strings.Contains(err.Error(), "distinct from reviewer") {
+		t.Fatalf("reviewer verified: %v", err)
+	}
+	byLead := p
+	byLead.OperationKey, byLead.VerifierAgentID, byLead.VerifierRunID = "lead-verifies", lead.ID, lead.RunID
+	saveFixtureVerification(t, f, h, byLead, 0)
+	tx, err := f.s.db.BeginTx(f.ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback()
+	if err := verificationReady(f.ctx, tx, f.item, byLead.Commit); err != nil {
+		t.Fatalf("lead receipt not ready: %v", err)
+	}
+}

@@ -630,6 +630,9 @@ func (r teamRunner) launch(ctx context.Context, e env, c *api.Client, q api.Team
 		if item.Revision != q.ItemRevision || item.Status == "done" || item.Status == "dismissed" {
 			return r.fail(ctx, c, q, errors.New("item changed before frozen launch"))
 		}
+		if q.Template == "small" && item.Kind != "bug" {
+			return r.fail(ctx, c, q, fmt.Errorf("the small-change lane launches only bugs; this item is a %s: requeue it as Planned delivery", item.Kind))
+		}
 		var handler *api.Agent
 		for i := range detail.Agents {
 			a := &detail.Agents[i]

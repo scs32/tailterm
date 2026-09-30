@@ -128,7 +128,7 @@ func cmdTeamQueue(e env, args []string) error {
 	hub := fs.String("hub", e.hub, "hub URL")
 	item := fs.String("item", "", "work item ID")
 	order := fs.Int64("order", 0, "recorded work-order message sequence")
-	template := fs.String("template", "planned", "team template")
+	template := fs.String("template", "planned", "team template: planned, or small for an eligible small bug")
 	entry := fs.String("entry", "", "queue entry ID")
 	leadAgent := fs.String("lead-agent", "", "exact replacement item team member ID")
 	worktree := fs.String("worktree", "", "accepted builder worktree root")
@@ -213,7 +213,7 @@ func cmdTeamQueue(e env, args []string) error {
 			} else if q.State == "failed" && q.ReleasedAt != "" {
 				state += " (released)"
 			}
-			fmt.Printf("%d %s %s %s order=#%d revision=%d repository=%s cwd=%s owns=%s blocked-by=%s reason=%s handler=%s/%s lease=%d%s\n", q.Position, state, q.ID, q.ItemID, q.OrderMessageSeq, q.Revision, q.Repository, q.Cwd, owns, strings.Join(q.BlockedBy, ","), q.BlockReason, q.HandlerID, q.HandlerRunID, q.HandlerLeaseGeneration, queueArmText(q.HandlerArm))
+			fmt.Printf("%d %s %s %s order=#%d template=%s revision=%d repository=%s cwd=%s owns=%s blocked-by=%s reason=%s handler=%s/%s lease=%d%s\n", q.Position, state, q.ID, q.ItemID, q.OrderMessageSeq, q.Template, q.Revision, q.Repository, q.Cwd, owns, strings.Join(q.BlockedBy, ","), q.BlockReason, q.HandlerID, q.HandlerRunID, q.HandlerLeaseGeneration, queueArmText(q.HandlerArm))
 			fmt.Printf("  team last-transition tokens=%d\n", q.Tokens.Total)
 			for _, member := range q.Activities {
 				state := "unknown"
@@ -280,8 +280,8 @@ func cmdTeamQueue(e env, args []string) error {
 			}
 		}
 	case "add":
-		if !api.ValidID(*item, "wi") || *order < 1 || *template != "planned" || (*newWorktree && (*noNewWorktree || *cwd != "")) {
-			return errors.New("usage: tt team queue add --item wi_ID --order SEQ [--template planned] [--owns PATH... | --serial] [--cwd DIR | --new-worktree | --no-new-worktree]")
+		if !api.ValidID(*item, "wi") || *order < 1 || (*template != "planned" && *template != "small") || (*newWorktree && (*noNewWorktree || *cwd != "")) {
+			return errors.New("usage: tt team queue add --item wi_ID --order SEQ [--template planned|small] [--owns PATH... | --serial] [--cwd DIR | --new-worktree | --no-new-worktree]")
 		}
 		if *serial && len(ownership) > 0 {
 			return errors.New("--serial declares no ownership; pass either --owns or --serial")
