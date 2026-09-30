@@ -592,7 +592,9 @@ func cmdWorkItemTriage(e env, args []string) error {
 	for _, st := range out.Stale {
 		fmt.Printf("  %s %q last activity %s (%d days)\n", st.Item.ID, st.Item.Title, st.LastActivity, st.IdleDays)
 	}
-	fmt.Printf("Review follow-ups held for triage (%d):\n", len(out.HeldForTriage))
+	if len(out.HeldForTriage) > 0 {
+		fmt.Printf("Review follow-ups held for triage (%d):\n", len(out.HeldForTriage))
+	}
 	for _, h := range out.HeldForTriage {
 		fmt.Printf("  %s %q filed from review message #%d\n", h.Item.ID, h.Item.Title, h.SourceMessageSeq)
 	}

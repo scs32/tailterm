@@ -1046,3 +1046,51 @@ func TestStewardRotationDueListReasons(t *testing.T) {
 		t.Fatalf("disabled policy: %+v", got)
 	}
 }
+
+// Review round 1, b1: the deployment agent's own unique index is never
+// reported as a steward refusal.
+func TestStewardRefusalNotUsedForSecondDeploymentAgent(t *testing.T) {
+	s, task := stewardStore(t)
+	ctx := context.Background()
+	deployer := func(name string) (api.Agent, error) {
+		return s.AddAgent(ctx, task.ID, api.AddAgentRequest{Role: api.AgentRoleDeployment, AgentID: api.NewID("agt"), Name: name, Host: "mini", Session: name, Runtime: "claude"}, stewardBy)
+	}
+	if _, err := deployer("deployer"); err != nil {
+		t.Fatal(err)
+	}
+	_, err := deployer("deployer-2")
+	var refusal *api.StewardRefusal
+	if err == nil || errors.As(err, &refusal) {
+		t.Fatalf("second deployment agent: %v", err)
+	}
+	// A steward row still maps the same kind of violation to its named refusal.
+	addSteward(t, s, task.ID, "backlog-steward")
+	_, err = s.AddAgent(ctx, task.ID, stewardRequest(api.NewID("agt"), "backlog-steward-2"), stewardBy)
+	wantStewardRefusal(t, err, api.StewardRefusedActive)
+}
+
+// Review round 1, b2: the successor of a prepared rotation whose old steward
+// closed is never admitted, and a fresh setup still is.
+func TestStewardRotationStaleSuccessorRefused(t *testing.T) {
+	f := newStewardRotationFixture(t, true)
+	ctx := context.Background()
+	r, err := f.prepare("prepare", api.NewID("agt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	setAgentStatus(t, f.s, f.old.ID, api.AgentClosed) // a pause closed it before the successor launched
+	if _, err = f.s.AddAgent(ctx, f.task.ID, stewardRequest(r.SuccessorAgentID, api.StewardSuccessorName(f.old.Name)), stewardBy); stewardCode(err) != api.StewardRefusedRotationStale {
+		t.Fatalf("stale successor admission: %v", err)
+	}
+	if _, err = f.s.GetAgent(ctx, r.SuccessorAgentID); !errors.Is(err, api.ErrNotFound) {
+		t.Fatalf("stale successor registered: %v", err)
+	}
+	fresh, err := f.s.AddAgent(ctx, f.task.ID, stewardRequest(api.NewID("agt"), "backlog-steward"), stewardBy)
+	if err != nil || f.holders(t) != 1 {
+		t.Fatalf("fresh steward beside a stale rotation: %+v %v", fresh, err)
+	}
+	aborted, err := f.act(api.StewardRotationAbort, "abort-stale", r.ID)
+	if err != nil || aborted.State != api.StewardRotationAborted {
+		t.Fatalf("abort stale: %+v %v", aborted, err)
+	}
+}

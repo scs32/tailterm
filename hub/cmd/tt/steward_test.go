@@ -1017,3 +1017,41 @@ func TestStewardRotationTickNeedsLocalStewardSessionAndSpacesRequests(t *testing
 		t.Fatalf("runner rotation: %+v %v", rotations, err)
 	}
 }
+
+// Review round 1, b2: prepare, spawn failure, pause, resume, rerun rotate.
+// The rerun admits no successor and aborts the stale rotation; setup then
+// admits exactly one steward.
+func TestStewardRotationResumeAfterPauseAbortsStaleRotation(t *testing.T) {
+	f := newStewardCLI(t)
+	ctx := context.Background()
+	cleanups := 0
+	old, _ := f.rotationSetup(t, true)
+	d := f.rotationDeps(t, false, &cleanups)
+	d.spawn = func(env, []string) error { return errors.New("synthetic launch failure") }
+	if _, err := f.rotate(t, d); err == nil || !strings.Contains(err.Error(), "stays prepared") {
+		t.Fatalf("failed launch: %v", err)
+	}
+	journal, err := loadStewardRotationJournal(f.c.Base, f.task.ID)
+	if err != nil || journal == nil || journal.Phase != rotationPhasePrepared {
+		t.Fatalf("journal after failed launch: %+v %v", journal, err)
+	}
+	f.pauseAndResume(t)
+	d = f.rotationDeps(t, false, &cleanups)
+	r, err := f.rotate(t, d)
+	if err == nil || !strings.Contains(err.Error(), "was stale") || r.State != api.StewardRotationAborted || r.ID != journal.RotationID {
+		t.Fatalf("rerun after pause: %+v %v", r, err)
+	}
+	if _, err = f.c.GetAgent(ctx, f.task.ID, journal.SuccessorAgentID); err == nil {
+		t.Fatal("the stale rotation's successor was admitted")
+	}
+	if _, err = os.Stat(stewardRotationJournalPath(f.c.Base, f.task.ID)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("journal after the stale abort: %v", err)
+	}
+	steward, err := setupSteward(ctx, f.deps(), f.e, f.c, f.task.ID, "", "", "")
+	if err != nil || steward.ID == old.ID || steward.ID == journal.SuccessorAgentID {
+		t.Fatalf("setup after the stale rotation: %+v %v", steward, err)
+	}
+	if open, _ := f.stewards(t); open != 1 {
+		t.Fatalf("open stewards after setup: %d", open)
+	}
+}

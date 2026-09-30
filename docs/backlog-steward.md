@@ -221,8 +221,21 @@ two minutes, the rotation stays prepared and the old steward stays the one live
 steward, keeping the role and its obligations. Commit refuses
 `successor_unavailable`. `tt steward rotate --abort` closes a registered pending
 successor and stops its session. A new rotation then gets a new successor ID.
-A prepared rotation whose old steward has closed (a project pause) holds
-nothing open. It never blocks a fresh setup, and the next prepare aborts it.
+**Stale rotation.** A prepared rotation whose old steward has closed (a project
+pause, an owner close) can never commit, and it holds nothing open:
+
+- It never blocks a fresh setup. The hub refuses to admit its successor ID with
+  409 `rotation_stale`, so the successor can't take the slot while waiting for a
+  handoff that won't come.
+- Rerunning `tt steward rotate` on the host whose journal names it aborts the
+  rotation, cleans up a registered successor's session and removes the journal.
+  It then reports the abort and says to run `tt steward setup`, which admits one
+  fresh steward.
+- Otherwise the next prepare aborts it.
+
+Recovery after a pause interrupted a rotation: resume the project, rerun
+`tt steward rotate --task ID` (or `--abort`) to clear the stale rotation, then
+`tt steward setup --task ID`.
 
 **Policy and runner.** `steward_rotation_policy` holds `enabled`,
 `max_total_tokens` (default 300M, as for handlers) and `on_template_change`

@@ -901,7 +901,10 @@ AND NOT EXISTS (SELECT 1 FROM agent_work_item_bindings r JOIN agents ra ON ra.id
 	_, err = tx.ExecContext(ctx, `INSERT INTO agents (`+agentCols+`,steward_pending) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		a.ID, a.TaskID, a.Name, a.Host, a.Session, a.Runtime, a.Cwd, a.ParentAgentID, a.Role, a.Status, a.Title, ts(now), ts(now), a.RunID, "", "", "", false, "", stewardPending)
 	if err != nil {
-		return a, stewardUniqueViolation(ctx, tx, taskID, err)
+		if a.Role == api.AgentRoleBacklogSteward {
+			return a, stewardUniqueViolation(ctx, tx, taskID, err)
+		}
+		return a, err
 	}
 	if a.WorkItem, err = insertAgentWorkItemBinding(ctx, tx, a, req.WorkItem, contextThrough, resolvedTeamRole); err != nil {
 		return a, err

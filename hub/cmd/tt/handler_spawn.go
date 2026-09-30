@@ -220,7 +220,7 @@ func ensureHandler(ctx context.Context, c *api.Client, taskID string, req api.Ad
 	if !found || restart {
 		current, err = c.AddAgent(ctx, taskID, req)
 		var refused *api.HTTPError
-		if errors.As(err, &refused) && refused.Status == 409 && refused.Code == api.StewardRefusedActive {
+		if errors.As(err, &refused) && refused.Status == 409 && (refused.Code == api.StewardRefusedActive || refused.Code == api.StewardRefusedRotationStale) {
 			return empty, fmt.Errorf("backlog steward refused: %w", err)
 		}
 		if err != nil {

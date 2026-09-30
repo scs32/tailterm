@@ -21,8 +21,9 @@ roles (September 29), and the backlog steward (`wi_5b4b94dbc9a11e8b`, order
   owner and relays decisions. It is never leased, never a team member and never
   closed with an item team. See [Owner helper](owner-helper.md).
 - **Backlog steward.** Reads the backlog directly (owner decision #15466) and
-  writes nothing. Every record goes through the primary handler, and the hub
-  refuses steward writes as an audit guard. It does no per-item records,
+  writes no work-item records; it saves only its own backlog summary. Every
+  record goes through the primary handler, and the hub refuses steward writes
+  as an audit guard. It does no per-item records,
   merges, releases or acceptance, and never changes the queue itself. It is
   never leased, never a team member or item lead, and `tt team close` leaves it
   open. See [Backlog steward](backlog-steward.md).

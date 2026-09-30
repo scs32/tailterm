@@ -98,6 +98,18 @@ func stewardActiveRefusal(holder api.Agent) error {
 // steward row is inserted. It returns whether the new row is a pending
 // rotation successor.
 func admitStewardTx(ctx context.Context, tx *sql.Tx, task string, agentID string) (bool, error) {
+	// The successor of a prepared rotation whose old steward has closed (a
+	// pause, an owner close) would take the slot while its briefing waits for
+	// a handoff that can never come; rerunning tt steward rotate aborts it.
+	var stale string
+	err := tx.QueryRowContext(ctx, `SELECT r.id FROM steward_rotations r LEFT JOIN agents a ON a.id=r.old_agent_id
+ WHERE r.task_id=? AND r.state='prepared' AND r.successor_agent_id=? AND (a.id IS NULL OR a.status=?)`, task, agentID, api.AgentClosed).Scan(&stale)
+	if err == nil {
+		return false, &api.StewardRefusal{Code: api.StewardRefusedRotationStale, Detail: "steward rotation " + stale + " is stale: its old steward closed before commit; rerun tt steward rotate to abort it, then tt steward setup"}
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return false, err
+	}
 	holder, held, err := stewardSlotHolder(ctx, tx, task)
 	if err != nil {
 		return false, err
@@ -116,7 +128,8 @@ func admitStewardTx(ctx context.Context, tx *sql.Tx, task string, agentID string
 }
 
 // stewardUniqueViolation maps the one-steward index to its named refusal, so
-// no admission path returns a raw constraint error.
+// no steward admission returns a raw constraint error. Callers apply it only
+// to steward rows: the deployment agent's index is also on agents(task_id).
 func stewardUniqueViolation(ctx context.Context, q queryRower, task string, err error) error {
 	if err == nil || !strings.Contains(err.Error(), "UNIQUE") || !strings.Contains(err.Error(), "agents.task_id") {
 		return err

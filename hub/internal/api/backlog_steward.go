@@ -154,6 +154,9 @@ const (
 	StewardRefusedNameTaken      = "name_taken"
 	StewardRefusedAgentCaller    = "agent_caller"
 	StewardRefusedStalePolicy    = "stale_revision"
+	// StewardRefusedRotationStale: the successor of a prepared rotation whose
+	// old steward has closed is never admitted.
+	StewardRefusedRotationStale = "rotation_stale"
 )
 
 var stewardRotatedSuffix = regexp.MustCompile(`-r([0-9]+)$`)

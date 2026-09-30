@@ -601,6 +601,16 @@ func rotateSteward(ctx context.Context, d stewardDeps, e env, c *api.Client, tas
 			return zero, err
 		}
 	}
+	if j.Phase == rotationPhasePrepared || j.Phase == rotationPhaseSpawned {
+		// A pause or owner close may have closed the old steward since this
+		// host prepared: the rotation can never commit. Abort it and clean up
+		// a registered successor instead of launching or committing.
+		if r, stale, err := stewardRotationStale(ctx, c, task, j); err != nil {
+			return zero, err
+		} else if stale {
+			return abortStaleStewardRotation(ctx, d, e, c, task, path, j, r)
+		}
+	}
 	if j.Phase == rotationPhasePrepared {
 		tmpl, err := d.template(ctx)
 		if err != nil {
@@ -658,6 +668,52 @@ func rotateSteward(ctx context.Context, d stewardDeps, e env, c *api.Client, tas
 		return zero, err
 	}
 	return c.GetStewardRotation(ctx, task, j.RotationID)
+}
+
+// stewardRotationStale reports whether the journal's rotation can no longer
+// commit: another path aborted it, or its old steward closed.
+func stewardRotationStale(ctx context.Context, c *api.Client, task string, j *stewardRotationJournal) (api.StewardRotation, bool, error) {
+	r, err := c.GetStewardRotation(ctx, task, j.RotationID)
+	if err != nil {
+		return r, false, err
+	}
+	if r.State == api.StewardRotationAborted {
+		return r, true, nil
+	}
+	if r.State != api.StewardRotationPrepared {
+		return r, false, nil
+	}
+	old, err := c.GetAgent(ctx, task, j.OldAgentID)
+	var httpErr *api.HTTPError
+	if errors.As(err, &httpErr) && httpErr.Status == 404 {
+		return r, true, nil
+	}
+	if err != nil {
+		return r, false, err
+	}
+	return r, old.Status == api.AgentClosed, nil
+}
+
+// abortStaleStewardRotation aborts a stale rotation from its journal (the
+// caller holds the journal lock), cleans up a registered successor and
+// removes the journal. It reports the abort as an error, so the owner knows
+// to provision the steward with tt steward setup.
+func abortStaleStewardRotation(ctx context.Context, d stewardDeps, e env, c *api.Client, task, path string, j *stewardRotationJournal, r api.StewardRotation) (api.StewardRotation, error) {
+	if r.State == api.StewardRotationPrepared {
+		var err error
+		if r, err = c.StewardRotationAction(ctx, task, api.StewardRotationRequest{Operation: api.StewardRotationAbort, RequestID: "steward-rotation-abort-" + j.RotationID, RotationID: j.RotationID}); err != nil {
+			return r, err
+		}
+	}
+	if successor, err := c.GetAgent(ctx, task, j.SuccessorAgentID); err == nil && !successor.CleanupDone {
+		if err = d.cleanup(ctx, e, task, j.SuccessorAgentID); err != nil {
+			return r, fmt.Errorf("stale steward rotation %s aborted; successor session cleanup will retry on rerun: %w", r.ID, err)
+		}
+	}
+	if err := os.Remove(path); err != nil {
+		return r, err
+	}
+	return r, fmt.Errorf("steward rotation %s was stale (steward %s closed before commit) and is now aborted; provision the steward with tt steward setup --task %s", r.ID, j.OldName, task)
 }
 
 // abortStewardRotation aborts the project's prepared rotation, closes and
