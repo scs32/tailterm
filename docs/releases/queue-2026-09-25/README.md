@@ -65,6 +65,7 @@ SHA-256 is of the unredacted receipt.
 | `77738db` | 8-pane cap with continued groups (`wi_1edb2e33e90a684e`, fast-forward) | A terminal group holds at most 8 panes; further windows open in a "continued" group, and layouts persist across reloads | TailOS (`77738db` build) |
 | `16075ee` | Fast verification (`wi_82ed4c6924930bad`, fast-forward; owner-accept #15155) | The verification matrix runs checks in parallel (`--jobs`, Go lane first, no shared-resource overlap) plus a targeted mode; full 72-check run 30.75 → 12.3 min; matrix gains `goTestFlags: ["-timeout=14m"]` (owner-approved digest `cce62b97…`) | Mini tt (rollback `tt.prev-77738db`), TailOS (`16075ee` build); runner in repo |
 | `c6a8ec1` | Owner helper registration (`wi_8d912169e30db643`, fast-forward) | The owner's Claude Code session registers as the project's `owner_helper` agent (`tt helper register/env/inbox`) so it can be a delegation-window delegate and be woken by the relay; schema: `owner_helper_registrations` + one-open-helper index | Hub `20260929-owner-helper-c6a8ec1`, Mini tt (rollback `tt.prev-16075ee`), TailOS (`c6a8ec1` build) |
+| `eca4aee` | Deployment agent activation code (`wi_d7010deecb20211f`, supersedes `wi_93629e4ce61658cb`; fast-forward; owner-accept #15343 under grant #15169) | Handler-only release supersede for verified, never-claimed jobs; live and rollback probes; retained-binary hub/bridge and retained-dist TailOS rollback; publish/revert guard; inputs script; operator runbook. Provisioning, the no-effect dry run and the first agent-run release (d1, d5, d6) follow | Hub `20260929-activation-eca4aee`, Mini tt (rollback `tt.prev-c6a8ec1`), TailOS (`eca4aee` build) |
 
 ## Hub releases
 
@@ -94,6 +95,7 @@ SHA-256 is of the unredacted receipt.
 | `20260929-window-size-fe56621` | `before-window-size-fe56621.sqlite` | 368,881,664 | `0ddaea58…` | ok, 0 FK | none |
 | `20260929-delegation-ee47773` | `before-delegation-ee47773.sqlite` | 370,860,032 | `cae97f92…` | ok, 0 FK | new `owner_delegation_windows`, `owner_delegation_routes`, `decision_request_categories` |
 | `20260929-owner-helper-c6a8ec1` | `before-owner-helper-c6a8ec1.sqlite` | 395,325,440 | `09e15107…` | ok, 0 FK | new `owner_helper_registrations`, index `agents_one_owner_helper`; rehearsed on `before-delegation-ee47773` (previous hub opens the migrated copy); rollback `.build/prev-ee47773` |
+| `20260929-activation-eca4aee` | `before-activation-eca4aee.sqlite` | 428,347,392 | `6590e4f9…` | ok, 0 FK | no schema change (new `superseded` job state is a value); rollback `.build/prev-c6a8ec1` |
 
 Before `6235924`, the combined migration was rehearsed on a copy of the `33d3ab7` backup: the new
 hub migrated it (integrity ok, no FK violations, 14 projects, queue at limit 1), and the
