@@ -10,8 +10,9 @@ import {
   lstatSync,
   chmodSync,
   rmSync,
+  realpathSync,
 } from "node:fs";
-import { resolve, relative, join, isAbsolute } from "node:path";
+import { resolve, relative, join, isAbsolute, dirname, basename } from "node:path";
 import {
   tmpdir,
   availableParallelism,
@@ -525,6 +526,159 @@ export function removeVerifierHome(home) {
   rmSync(home, { recursive: true, force: true });
 }
 
+// A check that reaches codex through PATH gets this failing stub instead: the
+// real CLI starts a setsid'd managed daemon under the verifier home that no
+// process-group signal reaches (wi_39bd40d33a4d8acc). Each call is logged to
+// the output directory as audit evidence of which check reached codex.
+export function installCodexStub(home, output) {
+  const bin = join(home, ".verifier-bin"),
+    log = "'" + join(output, "codex-stub-calls.log").replaceAll("'", "'\\''") + "'";
+  mkdirSync(bin, { mode: 0o700 });
+  writeFileSync(
+    join(bin, "codex"),
+    `#!/bin/sh
+args=$(printf '%s ' "$@" | tr '\\n\\t' '  ' | cut -c1-500)
+printf '%s\\t%s\\t%s\\t%s\\t%s\\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$$" "$PPID" "$PWD" "\${args% }" >> ${log}
+echo 'tailterm verifier: codex is disabled during matrix checks' >&2
+exit 1
+`,
+    { mode: 0o700 },
+  );
+  return bin;
+}
+
+// The spellings a process may use for the verifier home: the path mkdtemp
+// returned and its realpath (/var links to /private/var, and lsof reports the
+// realpath). Resolving the parent keeps this valid after the home is removed.
+function homeRoots(home) {
+  return [...new Set([home, join(realpathSync(dirname(home)), basename(home))])];
+}
+const underRoots = (roots, path) =>
+  roots.some((root) => path === root || path.startsWith(root + "/"));
+
+// HOME, TMPDIR or PWD values of each listed process. Raw environments hold
+// other processes' credentials, so they are matched here and never kept.
+function environmentMatches(run, table, roots) {
+  const matches = new Set(),
+    variable = /(?:^|\s)(?:HOME|TMPDIR|PWD)=(\S+)/g;
+  if (process.platform === "darwin") {
+    for (const line of run("ps", ["-axww", "-E", "-o", "pid=,command="]).split("\n")) {
+      const found = /^\s*(\d+)\s(.*)$/.exec(line);
+      if (found && table.has(Number(found[1])))
+        for (const [, value] of found[2].matchAll(variable))
+          if (underRoots(roots, value)) matches.add(Number(found[1]));
+    }
+  } else if (process.platform === "linux") {
+    for (const pid of table.keys()) {
+      let environ;
+      try {
+        environ = readFileSync(`/proc/${pid}/environ`, "utf8");
+      } catch (error) {
+        if (error.code === "ENOENT" || error.code === "ESRCH") continue;
+        throw error;
+      }
+      for (const entry of environ.split("\0")) {
+        const found = /^(?:HOME|TMPDIR|PWD)=(.*)$/.exec(entry);
+        if (found && underRoots(roots, found[1])) matches.add(pid);
+      }
+    }
+  } else throw new Error("Unsupported platform for the verifier home sweep");
+  return matches;
+}
+
+// Processes of this user that still live in or hold files under the verifier
+// home, found by environment, argv[0], cwd or any open file. The caller and
+// its ancestors are never listed. ps or lsof failure throws (fail closed).
+export function verifierHomeProcesses(home) {
+  const roots = homeRoots(home),
+    uid = process.getuid();
+  const run = (command, args) =>
+    execFileSync(command, args, {
+      encoding: "utf8",
+      timeout: 60_000,
+      maxBuffer: 512 * 1024 * 1024,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+  const all = new Map();
+  for (const line of run("ps", ["-axww", "-o", "pid=,ppid=,uid=,command="]).split("\n")) {
+    const found = /^\s*(\d+)\s+(\d+)\s+(\d+)\s(.*)$/.exec(line);
+    if (found)
+      all.set(Number(found[1]), {
+        ppid: Number(found[2]),
+        uid: Number(found[3]),
+        command: found[4].trim(),
+      });
+  }
+  const excluded = new Set([0, 1]);
+  for (let pid = process.pid; pid > 1 && !excluded.has(pid); pid = all.get(pid)?.ppid ?? 0)
+    excluded.add(pid);
+  const table = new Map(
+    [...all].filter(([pid, entry]) => entry.uid === uid && !excluded.has(pid)),
+  );
+  const found = new Map();
+  const add = (pid, reason) => {
+    const entry = table.get(pid);
+    if (!entry) return;
+    const hit = found.get(pid) ?? { pid, reasons: [], command: entry.command.slice(0, 300) };
+    if (!hit.reasons.includes(reason)) hit.reasons.push(reason);
+    found.set(pid, hit);
+  };
+  for (const pid of environmentMatches(run, table, roots)) add(pid, "env");
+  for (const [pid, entry] of table)
+    if (underRoots(roots, entry.command.split(" ")[0])) add(pid, "argv");
+  let pid = 0;
+  for (const line of run("lsof", ["-nP", "-w", "-u", String(uid), "-F", "pn"]).split("\n")) {
+    if (line[0] === "p") pid = Number(line.slice(1));
+    else if (line[0] === "n" && underRoots(roots, line.slice(1))) add(pid, "file");
+  }
+  return [...found.values()].sort((a, b) => a.pid - b.pid);
+}
+
+const processAlive = (pid) => {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return error.code !== "ESRCH";
+  }
+};
+
+// Stops every process verifierHomeProcesses finds: SIGTERM, then SIGKILL for
+// survivors, rescanning for children that appear later. Throws if any
+// remains, so the home is kept and no receipt stands.
+export async function stopVerifierHomeProcesses(home, find = verifierHomeProcesses) {
+  const stopped = new Map();
+  const signal = (pids, kind) => {
+    for (const pid of pids)
+      try {
+        process.kill(pid, kind);
+      } catch (error) {
+        if (error.code !== "ESRCH") throw error;
+      }
+  };
+  const settle = async (pids) => {
+    for (let i = 0; i < 40 && pids.some(processAlive); i++)
+      await new Promise((resolveWait) => setTimeout(resolveWait, 50));
+  };
+  for (let round = 0; round < 3; round++) {
+    const found = find(home);
+    if (!found.length) return [...stopped.values()];
+    for (const hit of found) stopped.set(hit.pid, hit);
+    const pids = found.map((hit) => hit.pid);
+    signal(pids, "SIGTERM");
+    await settle(pids);
+    const survivors = pids.filter(processAlive);
+    signal(survivors, "SIGKILL");
+    await settle(survivors);
+  }
+  const remaining = find(home);
+  if (remaining.length)
+    throw new Error(
+      "processes survived SIGKILL: " + remaining.map((hit) => hit.pid).join(", "),
+    );
+  return [...stopped.values()];
+}
+
 // Checks that rewrite inputs later checks read (dist-static, the wasm fixtures
 // and their prerequisite digests) run alone among non-Go checks and act as
 // barriers: no later non-Go check starts until an earlier exclusive check has
@@ -834,6 +988,7 @@ async function executePlan(plan, cwd, output, options, receiptName, makeReceipt)
     getAvailableBytes = availableBytes,
     abortSignal,
     removeHome = removeVerifierHome,
+    stopHomeProcesses = stopVerifierHomeProcesses,
     jobs = defaultJobs(),
   } = options;
   if (!isAbsolute(output) || relative(cwd, output).split("/")[0] !== "..")
@@ -845,7 +1000,7 @@ async function executePlan(plan, cwd, output, options, receiptName, makeReceipt)
   try {
     mkdirSync(output, { recursive: true });
     const environment = {
-      PATH: process.env.PATH,
+      PATH: installCodexStub(home, output) + ":" + process.env.PATH,
       HOME: home,
       TMPDIR: home,
       GOPATH: join(home, "go"),
@@ -933,21 +1088,39 @@ async function executePlan(plan, cwd, output, options, receiptName, makeReceipt)
     receiptWritten = true;
     return receipt;
   } finally {
+    const cleanupFailed = (what, error) => {
+      if (receiptWritten) rmSync(receiptPath, { force: true });
+      try {
+        writeFileSync(
+          join(output, "cleanup-error.json"),
+          JSON.stringify({ home, error: error.message }) + "\n",
+          { mode: 0o600 },
+        );
+      } catch {}
+      return new Error(`Failed to ${what} verifier home ${home}: ${error.message}`);
+    };
+    // Kept homes keep their files, not their processes. A process left under
+    // the home (a setsid'd daemon a check started) would otherwise outlive the
+    // run and pin the removed files it holds open.
+    let stopped;
+    try {
+      stopped = await stopHomeProcesses(home);
+    } catch (error) {
+      throw cleanupFailed("stop processes under", error);
+    }
+    if (stopped.length)
+      try {
+        writeFileSync(
+          join(output, "home-processes.json"),
+          JSON.stringify({ home, processes: stopped }, null, 2) + "\n",
+          { mode: 0o600 },
+        );
+      } catch {}
     if (!keepHome) {
       try {
         removeHome(home);
       } catch (error) {
-        if (receiptWritten) rmSync(receiptPath, { force: true });
-        try {
-          writeFileSync(
-            join(output, "cleanup-error.json"),
-            JSON.stringify({ home, error: error.message }) + "\n",
-            { mode: 0o600 },
-          );
-        } catch {}
-        throw new Error(
-          `Failed to remove verifier home ${home}: ${error.message}`,
-        );
+        throw cleanupFailed("remove", error);
       }
     }
   }
