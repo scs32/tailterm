@@ -22,7 +22,12 @@ CREATE TABLE IF NOT EXISTS agent_activity_receipts (
  task_id TEXT NOT NULL, request_id TEXT NOT NULL, agent_id TEXT NOT NULL,
  run_id TEXT NOT NULL, payload TEXT NOT NULL, request_payload TEXT NOT NULL,
  PRIMARY KEY(task_id,request_id));`)
-	return err
+	if err != nil {
+		return err
+	}
+	// Chained here because its index needs the agents.role column, which the
+	// column migrations add after the phase-3 chain runs.
+	return migrateOwnerHelper(db)
 }
 
 func validActivity(a api.AgentActivity) bool {
@@ -159,6 +164,15 @@ func sameRuntimePrompt(a, b *api.RuntimePrompt) bool {
 
 func (s *Store) postActivityAlerts(ctx context.Context, tx *sql.Tx, task, agent, run string, activity api.AgentActivity) error {
 	if activity.State != "hung_tool" && activity.State != "crashed" && activity.State != "looping" {
+		return nil
+	}
+	// The owner helper is the owner's own session: its absence is "offline",
+	// never an alert to the owner or a lead.
+	var role string
+	if err := tx.QueryRowContext(ctx, `SELECT role FROM agents WHERE id=?`, agent).Scan(&role); err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return err
+	}
+	if role == api.AgentRoleOwnerHelper {
 		return nil
 	}
 	var item, leadID, leadRun string

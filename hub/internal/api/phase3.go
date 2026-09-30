@@ -61,5 +61,7 @@ type OwnerActionResult struct {
 	Message      *Message          `json:"message,omitempty"`
 	Agent        *Agent            `json:"agent,omitempty"`
 	Window       *DelegationWindow `json:"window,omitempty"`
-	Replay       bool              `json:"replay,omitempty"`
+	// Registration is the owner helper register receipt.
+	Registration *OwnerHelperRegistration `json:"registration,omitempty"`
+	Replay       bool                     `json:"replay,omitempty"`
 }

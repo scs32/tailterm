@@ -121,6 +121,7 @@ func New(st *store.Store, identity Identity) *Server {
 	m.HandleFunc("GET /v1/tasks/{id}/delegation-windows", s.listDelegationWindows)
 	m.HandleFunc("POST /v1/tasks/{id}/delegation-windows", s.openDelegationWindow)
 	m.HandleFunc("POST /v1/tasks/{id}/delegation-windows/{wid}/close", s.closeDelegationWindow)
+	m.HandleFunc("POST /v1/tasks/{id}/owner-helper", s.registerOwnerHelper)
 	m.HandleFunc("POST /v1/tasks/{id}/interventions", s.createIntervention)
 	m.HandleFunc("GET /v1/tasks/{id}/interventions", s.listInterventions)
 	m.HandleFunc("POST /v1/tasks/{id}/messages/read", s.markRead)
