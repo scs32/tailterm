@@ -1550,3 +1550,86 @@ func TestOwnerHelperWakePromptWraps(t *testing.T) {
 		}
 	}
 }
+
+// p2/p4: a transcript that ends on Claude Code's API-error record, with or
+// without the following turn_duration, is idle; a busy turn still refuses.
+func TestClaudeWakeAPIErrorTurnSnapshot(t *testing.T) {
+	now := time.Date(2026, 9, 25, 19, 1, 0, 0, time.UTC)
+	for name, extra := range map[string][]string{
+		"with turn_duration":    {claudeAPIErrorPrompt, claudeAPIErrorEndTurn, claudeAPIErrorRecord, claudeAPIErrorTurnDuration},
+		"API-error record only": {claudeAPIErrorPrompt, claudeAPIErrorEndTurn, claudeAPIErrorRecord},
+	} {
+		t.Run(name, func(t *testing.T) {
+			b, _ := claudeTranscriptFixture(t, "queue-idle", extra...)
+			snap, err := claudeTranscriptSnapshot(b, now)
+			if err != nil {
+				t.Fatalf("API-error turn refused: %v", err)
+			}
+			if !snap.Cursor.TurnComplete || snap.Cursor.TurnEndReason != "turn ended by API error (server_error)" || !claudeWakeIdle(snap, now) {
+				t.Fatalf("snapshot not idle: complete=%v reason=%q", snap.Cursor.TurnComplete, snap.Cursor.TurnEndReason)
+			}
+		})
+	}
+	t.Run("queue-busy", func(t *testing.T) {
+		b, _ := claudeTranscriptFixture(t, "queue-busy")
+		if _, err := claudeTranscriptSnapshot(b, now); err == nil || !strings.HasSuffix(err.Error(), ": turn in progress") {
+			t.Fatalf("busy turn not refused: %v", err)
+		}
+	})
+}
+
+// p2: the relay's wake reaches an agent stopped by an API error: exactly
+// text then Enter, confirmed by the new user record. A busy turn gets nothing.
+func TestClaudeWakeAPIErrorTurnDelivers(t *testing.T) {
+	now := time.Date(2026, 9, 25, 19, 1, 0, 0, time.UTC)
+	prompt := "Tailterm messages #15583. Run tt inbox --unread --mark-read."
+	wake := func(t *testing.T, fixture string, extra ...string) ([]string, error) {
+		t.Helper()
+		b, transcript := claudeTranscriptFixture(t, fixture, extra...)
+		t.Setenv("TAILTERM_RELAY_STATE", t.TempDir())
+		var sent []string
+		inspect := func(_ context.Context, b runtimeBinding, expected string) (claudeWakeSnapshot, error) {
+			snap, err := claudeTranscriptSnapshot(b, now)
+			if err != nil {
+				return claudeWakeSnapshot{}, err
+			}
+			snap.Pane, snap.SessionID, snap.Created, snap.PanePID = "%1", "$1", "100", 1001
+			if expected == "" {
+				snap.Screen = "Answer\n❯ \n? for shortcuts\n"
+			} else {
+				snap.Screen = "❯ " + expected + "\n"
+			}
+			return snap, nil
+		}
+		send := func(_ context.Context, pane, value string, literal bool) error {
+			if pane != "%1" {
+				t.Fatalf("wrong pane %q", pane)
+			}
+			if literal {
+				sent = append(sent, "text:"+value)
+				return nil
+			}
+			sent = append(sent, "Enter")
+			line, _ := json.Marshal(map[string]any{"type": "user", "timestamp": "2026-09-25T19:01:00.500Z", "message": map[string]any{"role": "user", "content": prompt}})
+			appendClaudeRecords(t, transcript, string(line))
+			return nil
+		}
+		err := claudeWakeWith(context.Background(), b, prompt, claudeWakeOps{inspect: inspect, send: send, sleep: func(d time.Duration) { now = now.Add(d) }, now: func() time.Time { return now }})
+		if err == nil {
+			var saved claudeWakeIntent
+			data, _ := os.ReadFile(claudeWakePath(b))
+			if json.Unmarshal(data, &saved) != nil || saved.Phase != "confirmed" {
+				t.Fatalf("wake not confirmed: %s", data)
+			}
+		}
+		return sent, err
+	}
+	sent, err := wake(t, "queue-idle", claudeAPIErrorPrompt, claudeAPIErrorEndTurn, claudeAPIErrorRecord, claudeAPIErrorTurnDuration)
+	if err != nil || len(sent) != 2 || sent[0] != "text:"+prompt || sent[1] != "Enter" {
+		t.Fatalf("API-error turn wake: sent=%q err=%v", sent, err)
+	}
+	sent, err = wake(t, "queue-busy")
+	if err == nil || !strings.Contains(err.Error(), "turn in progress") || len(sent) != 0 {
+		t.Fatalf("busy turn wake: sent=%q err=%v", sent, err)
+	}
+}

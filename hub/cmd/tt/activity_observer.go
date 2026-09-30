@@ -97,6 +97,10 @@ type activityCursor struct {
 	// unmatched removes and sessions that ended with input still queued.
 	ClaudeQueued   int       `json:"claudeQueued,omitempty"`
 	ClaudeQueuedAt time.Time `json:"claudeQueuedAt,omitempty"`
+	// TurnEndReason explains an unusual completed turn, such as one Claude Code
+	// ended with an API error. It is empty after a normal end_turn and is
+	// cleared when a new turn starts.
+	TurnEndReason string `json:"turnEndReason,omitempty"`
 }
 
 type activityThresholds struct {
@@ -190,7 +194,7 @@ func readActivityAppend(path string, c *activityCursor, parse func([]byte, *acti
 		c.TokensVerified = c.Tokens == (api.TokenTotals{}) && len(c.ClaudeUsage) == 0
 		c.Pending = map[string]pendingActivityCall{}
 		c.Completed = nil
-		c.SeenTurn, c.TurnComplete = false, false
+		c.SeenTurn, c.TurnComplete, c.TurnEndReason = false, false, ""
 		c.ClaudeQueued, c.ClaudeQueuedAt = 0, time.Time{}
 		if c.ClaudeUsage == nil {
 			c.ClaudeUsage = map[string]api.TokenTotals{}
@@ -401,6 +405,46 @@ func (e unknownClaudeRecordError) Error() string {
 	return fmt.Sprintf("unknown Claude record type %q", e.Type)
 }
 
+var claudeAPIErrorCode = regexp.MustCompile(`^[a-z_]{1,40}$`)
+
+// claudeTurnEnd reports whether a Claude transcript record ends a turn, and
+// the reason for an unusual end. A turn ends at assistant end_turn, a result
+// record, a system turn_duration record, or the synthetic assistant record
+// Claude Code writes when an API error ends the response (isApiErrorMessage,
+// stop_reason stop_sequence). Before bug wi_132c8895adfe0886 the last two
+// left the turn "in progress" and every wake was skipped. The reason carries
+// only a fixed phrase and a short error code, never transcript text.
+func claudeTurnEnd(line []byte) (ended bool, reason string) {
+	var rec struct {
+		Type       string `json:"type"`
+		Subtype    string `json:"subtype"`
+		IsAPIError bool   `json:"isApiErrorMessage"`
+		Error      string `json:"error"`
+		Message    struct {
+			StopReason string `json:"stop_reason"`
+		} `json:"message"`
+	}
+	if json.Unmarshal(line, &rec) != nil {
+		return false, ""
+	}
+	switch rec.Type {
+	case "assistant":
+		if rec.IsAPIError {
+			reason = "turn ended by API error"
+			if claudeAPIErrorCode.MatchString(rec.Error) {
+				reason += " (" + rec.Error + ")"
+			}
+			return true, reason
+		}
+		return rec.Message.StopReason == "end_turn", ""
+	case "result":
+		return true, ""
+	case "system":
+		return rec.Subtype == "turn_duration", ""
+	}
+	return false, ""
+}
+
 func parseClaudeActivity(line []byte, c *activityCursor) error {
 	if len(line) == 0 {
 		return nil
@@ -409,12 +453,12 @@ func parseClaudeActivity(line []byte, c *activityCursor) error {
 	if err := json.Unmarshal(line, &rec); err != nil {
 		return err
 	}
+	ended, endReason := claudeTurnEnd(line)
 	now := activityTime(rec.Timestamp, time.Now().UTC())
 	c.LastEventAt = now
 	var msg struct {
-		ID         string `json:"id"`
-		StopReason string `json:"stop_reason"`
-		Content    []struct {
+		ID      string `json:"id"`
+		Content []struct {
 			Type      string          `json:"type"`
 			ID        string          `json:"id"`
 			Name      string          `json:"name"`
@@ -426,7 +470,7 @@ func parseClaudeActivity(line []byte, c *activityCursor) error {
 	_ = json.Unmarshal(rec.Message, &msg)
 	switch rec.Type {
 	case "assistant":
-		c.SeenTurn, c.TurnComplete = true, false
+		c.SeenTurn, c.TurnComplete, c.TurnEndReason = true, false, ""
 		if msg.ID != "" && len(msg.Usage) > 0 {
 			if c.ClaudeUsage == nil {
 				c.ClaudeUsage = map[string]api.TokenTotals{}
@@ -453,14 +497,19 @@ func parseClaudeActivity(line []byte, c *activityCursor) error {
 				c.Pending[part.ID] = pendingActivityCall{Name: safeActivityToolName(part.Name), Since: now, Signature: activitySignature(part.Name, part.Input), WaitUntil: explicitWait(part.Input, now)}
 			}
 		}
-		if msg.StopReason == "end_turn" {
-			c.TurnComplete = true
+		if ended {
+			c.TurnComplete, c.TurnEndReason = true, endReason
+			if endReason != "" {
+				// A response cut short by an API error runs no tool, so a
+				// tool_use it recorded would otherwise stay pending forever.
+				clear(c.Pending)
+			}
 		}
 	case "user":
 		// A real user prompt starts a new turn. Tool results are also encoded as
 		// user records, but they continue the assistant's existing turn.
 		if claudeUserText(line) != "" {
-			c.SeenTurn, c.TurnComplete = true, false
+			c.SeenTurn, c.TurnComplete, c.TurnEndReason = true, false, ""
 			c.ClaudeQueued, c.ClaudeQueuedAt = 0, time.Time{}
 		}
 		for _, part := range msg.Content {
@@ -491,7 +540,15 @@ func parseClaudeActivity(line []byte, c *activityCursor) error {
 		default:
 			return unknownClaudeRecordError{Type: "queue-operation/" + q.Operation}
 		}
-	case "system", "summary", "progress", "file-history-snapshot", "mode", "permission-mode", "ai-title", "atis-latch", "cost-state", "last-prompt", "attachment":
+	case "system":
+		// turn_duration closes every turn, including one an API error ended.
+		// No tool can still run after it. It keeps the reason set by the
+		// record that ended the turn.
+		if ended {
+			c.SeenTurn, c.TurnComplete = true, true
+			clear(c.Pending)
+		}
+	case "summary", "progress", "file-history-snapshot", "mode", "permission-mode", "ai-title", "atis-latch", "cost-state", "last-prompt", "attachment":
 	default:
 		return unknownClaudeRecordError{Type: rec.Type}
 	}

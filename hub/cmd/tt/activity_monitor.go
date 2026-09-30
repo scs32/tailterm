@@ -157,6 +157,7 @@ func activityState(c *activityCursor, a api.Agent, openObligations int, tmuxAliv
 		} else {
 			result.State = "idle"
 		}
+		result.Reason = c.TurnEndReason
 		return result
 	}
 	if now.Sub(c.LastEventAt) <= threshold.Working || now.Sub(c.WorktreeChangedAt) <= threshold.Working {

@@ -376,17 +376,11 @@ func claudeTranscriptSnapshot(b runtimeBinding, now time.Time) (claudeWakeSnapsh
 	return claudeWakeSnapshot{Path: path, FileID: cursor.FileID, Offset: cursor.Offset, Cursor: cursor, UnknownTypes: unknownTypes}, nil
 }
 
+// claudeCompletedRecord reports a record that ends a turn, including an
+// API-error record and system turn_duration (see claudeTurnEnd).
 func claudeCompletedRecord(line []byte) bool {
-	var rec struct {
-		Type    string `json:"type"`
-		Message struct {
-			StopReason string `json:"stop_reason"`
-		} `json:"message"`
-	}
-	if json.Unmarshal(line, &rec) != nil {
-		return false
-	}
-	return rec.Type == "result" || rec.Type == "assistant" && rec.Message.StopReason == "end_turn"
+	ended, _ := claudeTurnEnd(line)
+	return ended
 }
 
 // runtimePane is one exact-identity capture of an owned runtime pane.

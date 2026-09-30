@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -1229,5 +1230,151 @@ func TestOwnerHelperWakeText(t *testing.T) {
 	b.Role = ""
 	if got := claudeWakeFor(b, claudeWakePrompt(messages, "agt_0123456789abcdef")); got != "Tailterm messages #41. Run tt inbox --unread --mark-read." {
 		t.Fatalf("ordinary prompt changed %q", got)
+	}
+}
+
+// Records in the shape Claude Code 2.1.285 wrote when a server error ended a
+// turn mid-response (bug wi_132c8895adfe0886, order #15557): a real prompt,
+// an end_turn text reply, the synthetic API-error record and turn_duration.
+// Keys and values are as recorded; ids, text and times are synthetic.
+var (
+	claudeAPIErrorPrompt       = `{"parentUuid":"00000000-0000-4000-8000-0000000000a0","isSidechain":false,"promptId":"00000000-0000-4000-8000-0000000000af","type":"user","message":{"role":"user","content":"Synthetic fixture prompt before the API error."},"uuid":"00000000-0000-4000-8000-0000000000a1","timestamp":"2026-09-25T19:00:00.000Z","permissionMode":"bypassPermissions","origin":{"kind":"human"},"promptSource":"typed","userType":"external","entrypoint":"cli","sessionId":"11111111-1111-4111-8111-111111111111","version":"2.1.285"}`
+	claudeAPIErrorEndTurn      = `{"parentUuid":"00000000-0000-4000-8000-0000000000a1","isSidechain":false,"type":"assistant","uuid":"00000000-0000-4000-8000-0000000000a2","timestamp":"2026-09-25T19:00:05.000Z","message":{"model":"claude-opus-5-5","id":"msg_fixture00000000000000a2","type":"message","role":"assistant","content":[{"type":"text","text":"Synthetic reply before the error."}],"stop_reason":"end_turn","stop_sequence":null,"usage":{"input_tokens":2,"cache_creation_input_tokens":10,"cache_read_input_tokens":100,"output_tokens":8}},"requestId":"req_fixture00000000000000a2","userType":"external","entrypoint":"cli","sessionId":"11111111-1111-4111-8111-111111111111","version":"2.1.285"}`
+	claudeAPIErrorRecord       = `{"parentUuid":"00000000-0000-4000-8000-0000000000a2","isSidechain":false,"type":"assistant","uuid":"00000000-0000-4000-8000-0000000000a3","timestamp":"2026-09-25T19:00:55.000Z","message":{"diagnostics":null,"id":"00000000-0000-4000-8000-0000000000a4","container":null,"model":"<synthetic>","role":"assistant","stop_details":null,"stop_reason":"stop_sequence","stop_sequence":"","type":"message","usage":{"output_tokens_details":null,"input_tokens":0,"output_tokens":0,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"server_tool_use":{"web_search_requests":0,"web_fetch_requests":0},"service_tier":null,"cache_creation":{"ephemeral_1h_input_tokens":0,"ephemeral_5m_input_tokens":0},"inference_geo":null,"iterations":null,"speed":null,"fallback_credit":null},"content":[{"type":"text","text":"API Error: Server error mid-response. The response above may be incomplete."}],"context_management":null},"error":"server_error","truncatedAfterOutput":true,"isApiErrorMessage":true,"userType":"external","entrypoint":"cli","sessionId":"11111111-1111-4111-8111-111111111111","version":"2.1.285"}`
+	claudeAPIErrorTurnDuration = `{"parentUuid":"00000000-0000-4000-8000-0000000000a3","isSidechain":false,"type":"system","subtype":"turn_duration","durationMs":55000,"messageCount":4,"timestamp":"2026-09-25T19:00:55.014Z","uuid":"00000000-0000-4000-8000-0000000000a5","isMeta":false,"userType":"external","entrypoint":"cli","sessionId":"11111111-1111-4111-8111-111111111111","version":"2.1.285"}`
+	claudeAPIErrorToolUse      = `{"type":"assistant","timestamp":"2026-09-25T19:00:10.000Z","message":{"id":"msg_fixture00000000000000a6","role":"assistant","content":[{"type":"tool_use","id":"toolu_fixture_a6","name":"Bash","input":{"command":"synthetic"}}],"stop_reason":"tool_use","usage":{"input_tokens":1,"output_tokens":1}}}`
+)
+
+// p1: an API-error record or a turn_duration record completes a Claude turn.
+func TestClaudeAPIErrorEndsTurn(t *testing.T) {
+	const reason = "turn ended by API error (server_error)"
+	parse := func(c *activityCursor, records ...string) {
+		t.Helper()
+		for _, record := range records {
+			if err := parseClaudeActivity([]byte(record), c); err != nil {
+				t.Fatalf("parse %s: %v", record[:40], err)
+			}
+		}
+	}
+	t.Run("recorded sequence", func(t *testing.T) {
+		var c activityCursor
+		parse(&c, claudeAPIErrorPrompt, claudeAPIErrorEndTurn)
+		if !c.TurnComplete || c.TurnEndReason != "" {
+			t.Fatalf("end_turn: %+v", c)
+		}
+		tokens := c.Tokens
+		parse(&c, claudeAPIErrorRecord)
+		if !c.SeenTurn || !c.TurnComplete || c.TurnEndReason != reason {
+			t.Fatalf("API-error record alone did not complete the turn: complete=%v reason=%q", c.TurnComplete, c.TurnEndReason)
+		}
+		if c.Tokens != tokens {
+			t.Fatalf("synthetic zero-usage record changed tokens: %+v -> %+v", tokens, c.Tokens)
+		}
+		parse(&c, claudeAPIErrorTurnDuration)
+		if !c.TurnComplete || c.TurnEndReason != reason {
+			t.Fatalf("turn_duration lost completion or reason: complete=%v reason=%q", c.TurnComplete, c.TurnEndReason)
+		}
+		parse(&c, claudeAPIErrorPrompt)
+		if c.TurnComplete || c.TurnEndReason != "" {
+			t.Fatalf("new prompt did not clear completion and reason: complete=%v reason=%q", c.TurnComplete, c.TurnEndReason)
+		}
+		parse(&c, claudeAPIErrorEndTurn)
+		if !c.TurnComplete || c.TurnEndReason != "" {
+			t.Fatalf("normal end_turn kept a reason: %q", c.TurnEndReason)
+		}
+	})
+	t.Run("turn_duration alone completes", func(t *testing.T) {
+		var c activityCursor
+		parse(&c, claudeAPIErrorPrompt, claudeAPIErrorToolUse)
+		if c.TurnComplete || len(c.Pending) != 1 {
+			t.Fatalf("tool use: complete=%v pending=%d", c.TurnComplete, len(c.Pending))
+		}
+		parse(&c, claudeAPIErrorTurnDuration)
+		if !c.SeenTurn || !c.TurnComplete || len(c.Pending) != 0 || c.TurnEndReason != "" {
+			t.Fatalf("turn_duration: complete=%v pending=%d reason=%q", c.TurnComplete, len(c.Pending), c.TurnEndReason)
+		}
+		// A later assistant record means the turn went on after all.
+		parse(&c, claudeAPIErrorToolUse)
+		if c.TurnComplete {
+			t.Fatal("assistant record after turn_duration left the turn complete")
+		}
+	})
+	t.Run("API error clears an orphaned tool call", func(t *testing.T) {
+		var c activityCursor
+		parse(&c, claudeAPIErrorPrompt, claudeAPIErrorToolUse, claudeAPIErrorRecord)
+		if !c.TurnComplete || len(c.Pending) != 0 || c.TurnEndReason != reason {
+			t.Fatalf("complete=%v pending=%d reason=%q", c.TurnComplete, len(c.Pending), c.TurnEndReason)
+		}
+	})
+	t.Run("error code is bounded", func(t *testing.T) {
+		for code, want := range map[string]string{
+			"rate_limit":            "turn ended by API error (rate_limit)",
+			"authentication_failed": "turn ended by API error (authentication_failed)",
+			"Server Error: /secret": "turn ended by API error",
+			strings.Repeat("a", 41): "turn ended by API error",
+			"":                      "turn ended by API error",
+		} {
+			var c activityCursor
+			record := strings.Replace(claudeAPIErrorRecord, `"error":"server_error"`, `"error":`+strconv.Quote(code), 1)
+			parse(&c, record)
+			if !c.TurnComplete || c.TurnEndReason != want {
+				t.Fatalf("code %q: complete=%v reason=%q", code, c.TurnComplete, c.TurnEndReason)
+			}
+		}
+	})
+	t.Run("other system records do not complete", func(t *testing.T) {
+		var c activityCursor
+		parse(&c, claudeAPIErrorPrompt, claudeAPIErrorToolUse, strings.Replace(claudeAPIErrorTurnDuration, `"subtype":"turn_duration"`, `"subtype":"informational"`, 1))
+		if c.TurnComplete || len(c.Pending) != 1 {
+			t.Fatalf("informational: complete=%v pending=%d", c.TurnComplete, len(c.Pending))
+		}
+	})
+}
+
+// p3: after an API-error turn the agent is idle or finished_silent with the
+// API-error reason, and the relay reports that reason to the hub.
+func TestActivityAPIErrorTurnReason(t *testing.T) {
+	const reason = "turn ended by API error (server_error)"
+	now := time.Date(2026, 9, 25, 20, 0, 0, 0, time.UTC)
+	threshold := activityThresholds{Working: 120 * time.Second, Hung: 10 * time.Minute, Loop: 5 * time.Minute, LoopCalls: 5, CrashProbe: 15 * time.Second}
+	a := api.Agent{Status: api.AgentRunning}
+	var c activityCursor
+	for _, record := range []string{claudeAPIErrorPrompt, claudeAPIErrorEndTurn, claudeAPIErrorRecord, claudeAPIErrorTurnDuration} {
+		if err := parseClaudeActivity([]byte(record), &c); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := activityState(&c, a, 0, true, true, nil, now, threshold); got.State != "idle" || got.Reason != reason {
+		t.Fatalf("idle after API error: %+v", got)
+	}
+	if got := activityState(&c, a, 1, true, true, nil, now, threshold); got.State != "finished_silent" || got.Reason != reason {
+		t.Fatalf("finished_silent after API error: %+v", got)
+	}
+	var normal activityCursor
+	for _, record := range []string{claudeAPIErrorPrompt, claudeAPIErrorEndTurn} {
+		if err := parseClaudeActivity([]byte(record), &normal); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := activityState(&normal, a, 0, true, true, nil, now, threshold); got.State != "idle" || got.Reason != "" {
+		t.Fatalf("idle after end_turn: %+v", got)
+	}
+	if got := activityState(&normal, a, 1, true, true, nil, now, threshold); got.State != "finished_silent" || got.Reason != "" {
+		t.Fatalf("finished_silent after end_turn: %+v", got)
+	}
+
+	cols, rows := 200, 50
+	stubPaneSize(t, &cols, &rows)
+	b, h, _, tick := stuckFixture(t, "claude")
+	path := filepath.Join(os.Getenv("HOME"), ".claude", "projects", "p", b.Thread+".jsonl")
+	transcript := strings.Join([]string{claudeAPIErrorPrompt, claudeAPIErrorEndTurn, claudeAPIErrorRecord, claudeAPIErrorTurnDuration}, "\n") + "\n"
+	if err := os.WriteFile(path, []byte(transcript), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := tick(now); err != nil {
+		t.Fatal(err)
+	}
+	if len(h.reports) != 1 || h.reports[0].State != "idle" || h.reports[0].Reason != reason {
+		t.Fatalf("relay reports %+v", h.reports)
 	}
 }
