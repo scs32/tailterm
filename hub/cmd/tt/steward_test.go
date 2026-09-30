@@ -142,7 +142,7 @@ func fixtureTemplate(context.Context) (stewardTemplate, error) {
 }
 
 func (f *stewardCLI) deps() stewardDeps {
-	return stewardDeps{template: fixtureTemplate, spawn: cmdSpawn}
+	return stewardDeps{template: fixtureTemplate, spawn: cmdSpawn, cleanup: productionTeamRunner().cleanup, host: spawn.Host, online: 3 * time.Second, poll: 20 * time.Millisecond}
 }
 
 func (f *stewardCLI) live(t *testing.T, a api.Agent) {

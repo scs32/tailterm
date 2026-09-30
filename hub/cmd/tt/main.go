@@ -888,6 +888,7 @@ func cmdSpawn(e env, args []string) error {
 	teamLeadName := fs.String("team-lead-name", "", "frozen item-team lead for this launch briefing")
 	teamHandlerID := fs.String("team-handler-id", "", "exact leased item-team handler for this launch briefing")
 	handlerSuccessor := fs.Bool("handler-successor", false, "brief this database handler as a rotation successor (set by tt handler rotate)")
+	stewardSuccessor := fs.Bool("steward-successor", false, "brief this backlog steward as a rotation successor (set by tt steward rotate)")
 	run := fs.String("run", "", "command to run in the agent window (required)")
 	cwd := fs.String("cwd", "", "working directory")
 	prompt := fs.String("prompt", "", "appended to the command as a quoted argument")
@@ -1124,10 +1125,14 @@ func cmdSpawn(e env, args []string) error {
 	if *handlerSuccessor && *role != api.AgentRoleDatabaseHandler {
 		return errors.New("--handler-successor requires --role database_handler")
 	}
+	if *stewardSuccessor && *role != api.AgentRoleBacklogSteward {
+		return errors.New("--steward-successor requires --role backlog_steward")
+	}
 	steward, err := launchStewardBriefing(ctx, c, *task, *role, detail.Agents)
 	if err != nil {
 		return err
 	}
+	steward.Successor = *stewardSuccessor
 	briefing := agentTaskBriefingWithSteward(detail.Task, *name, *role, launcherSelfPath, detail.Agents, *plannedTeamMembers, *handlerSuccessor, steward)
 	if *permissionMode != "" {
 		briefing += "\nRequested launch permission mode: " + *permissionMode + ". Permission denials are real failures, not approvals. Do not repeat an unchanged denied action. Report a precise Permission blocked status to the orchestrator and continue independent permitted work."

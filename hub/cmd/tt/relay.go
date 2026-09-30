@@ -740,6 +740,13 @@ func cmdRelay(args []string) error {
 					fmt.Fprintf(os.Stderr, "[tt relay] handler rotation: %v\n", rotationErr)
 				}
 			}
+			if queueBackoff.ready(time.Now()) {
+				stewardErr := relayStewardRotationTick(ctx)
+				queueBackoff.observe(time.Now(), stewardErr)
+				if stewardErr != nil {
+					fmt.Fprintf(os.Stderr, "[tt relay] steward rotation: %v\n", stewardErr)
+				}
+			}
 			cancel()
 			if time.Since(lastClaudeRetry) >= 15*time.Second {
 				lastClaudeRetry = time.Now()

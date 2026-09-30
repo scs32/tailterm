@@ -88,3 +88,106 @@ func (s *Server) saveBacklogSummary(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSON(w, http.StatusCreated, out)
 }
+
+func (s *Server) getStewardRotationPolicy(w http.ResponseWriter, r *http.Request) {
+	if _, ok := s.caller(w, r); !ok {
+		return
+	}
+	id, ok := taskID(w, r)
+	if !ok {
+		return
+	}
+	p, err := s.store.StewardRotationPolicy(r.Context(), id)
+	if err != nil {
+		fail(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, p)
+}
+
+func (s *Server) setStewardRotationPolicy(w http.ResponseWriter, r *http.Request) {
+	caller, ok := s.writer(w, r)
+	if !ok {
+		return
+	}
+	id, ok := taskID(w, r)
+	if !ok {
+		return
+	}
+	var req api.StewardRotationPolicyRequest
+	if !decode(w, r, &req) {
+		return
+	}
+	p, err := s.store.SetStewardRotationPolicy(r.Context(), id, req, caller)
+	if err != nil {
+		fail(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, p)
+}
+
+func (s *Server) stewardRotationAction(w http.ResponseWriter, r *http.Request) {
+	caller, ok := s.writer(w, r)
+	if !ok {
+		return
+	}
+	id, ok := taskID(w, r)
+	if !ok {
+		return
+	}
+	var req api.StewardRotationRequest
+	if !decode(w, r, &req) {
+		return
+	}
+	out, err := s.store.StewardRotationAction(r.Context(), id, req, caller)
+	if err != nil {
+		fail(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, out)
+}
+
+func (s *Server) listStewardRotations(w http.ResponseWriter, r *http.Request) {
+	if _, ok := s.caller(w, r); !ok {
+		return
+	}
+	id, ok := taskID(w, r)
+	if !ok {
+		return
+	}
+	out, err := s.store.ListStewardRotations(r.Context(), id)
+	if err != nil {
+		fail(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"rotations": out})
+}
+
+func (s *Server) getStewardRotation(w http.ResponseWriter, r *http.Request) {
+	if _, ok := s.caller(w, r); !ok {
+		return
+	}
+	id, ok := taskID(w, r)
+	if !ok {
+		return
+	}
+	out, err := s.store.GetStewardRotation(r.Context(), id, r.PathValue("rid"))
+	if err != nil {
+		fail(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, out)
+}
+
+func (s *Server) stewardRotationsDue(w http.ResponseWriter, r *http.Request) {
+	if _, ok := s.caller(w, r); !ok {
+		return
+	}
+	q := r.URL.Query()
+	out, err := s.store.StewardRotationsDue(r.Context(), q.Get("host"), q.Get("templateDigest"))
+	if err != nil {
+		fail(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, out)
+}

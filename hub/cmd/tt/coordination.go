@@ -235,6 +235,9 @@ func backlogStewardBriefing(briefing string, agents []api.Agent, steward steward
 	} else {
 		briefing += "\nNo backlog summary is saved yet. Build one from the backlog (tt work-items list, tt work-items triage, tt team queue list) and save revision 1 with tt steward summary set --revision 0 --body-file F --request-id KEY."
 	}
+	if steward.Successor {
+		briefing += fmt.Sprintf("\nYou are a rotation successor. Read backlog summary revision %d and the rotation handoff first; do not rely on chat history. Until the hub's directed handoff NOTICE arrives, take no intake and make no proposals: the previous steward still holds the role. The NOTICE names the rotation; read its handoff with tt steward rotation get ID.", steward.SummaryRevision)
+	}
 	return briefing
 }
 

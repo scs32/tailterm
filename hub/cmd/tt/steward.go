@@ -8,13 +8,16 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/scs32/tailterm/hub/internal/api"
+	"github.com/scs32/tailterm/hub/internal/spawn"
 	"github.com/scs32/tailterm/hub/internal/teamplan"
 )
 
@@ -54,10 +57,17 @@ func loadStewardTemplate(ctx context.Context) (stewardTemplate, error) {
 type stewardDeps struct {
 	template func(context.Context) (stewardTemplate, error)
 	spawn    func(env, []string) error
+	cleanup  func(context.Context, env, string, string) error
+	host     func() string
+	online   time.Duration
+	poll     time.Duration
+	// after runs once a rotation phase is saved; tests use it to stop the routine.
+	after func(phase string) error
 }
 
 func productionStewardDeps() stewardDeps {
-	return stewardDeps{template: loadStewardTemplate, spawn: cmdSpawn}
+	runner := productionTeamRunner()
+	return stewardDeps{template: loadStewardTemplate, spawn: cmdSpawn, cleanup: runner.cleanup, host: spawn.Host, online: 2 * time.Minute, poll: 2 * time.Second}
 }
 
 // stewardIdentity is this host's record of the project's steward for setup
@@ -272,7 +282,7 @@ func launchStewardBriefing(ctx context.Context, c *api.Client, task, role string
 }
 
 func cmdSteward(e env, args []string) error {
-	usage := errors.New("usage: tt steward template|setup|summary (see tt steward SUBCOMMAND --help)")
+	usage := errors.New("usage: tt steward template|setup|summary|rotate|rotation|policy (see tt steward SUBCOMMAND --help)")
 	if len(args) == 0 {
 		return usage
 	}
@@ -283,6 +293,12 @@ func cmdSteward(e env, args []string) error {
 		return cmdStewardSetup(e, args[1:], productionStewardDeps())
 	case "summary":
 		return cmdStewardSummary(e, args[1:])
+	case "rotate":
+		return cmdStewardRotate(e, args[1:], productionStewardDeps())
+	case "rotation":
+		return cmdStewardRotation(e, args[1:])
+	case "policy":
+		return cmdStewardPolicy(e, args[1:])
 	}
 	return usage
 }
@@ -437,4 +453,539 @@ func cmdStewardSummary(e env, args []string) error {
 		}
 	}
 	return nil
+}
+
+// ---- Steward rotation (docs/backlog-steward.md) ----
+
+// stewardRotationJournal records this host's phase of a steward rotation, so
+// a rerun resumes it: never a second successor, re-issue or cleanup.
+type stewardRotationJournal struct {
+	Version          int    `json:"version"`
+	Hub              string `json:"hub"`
+	Task             string `json:"task"`
+	Phase            string `json:"phase"`
+	PrepareRequestID string `json:"prepareRequestId"`
+	RotationID       string `json:"rotationId,omitempty"`
+	OldAgentID       string `json:"oldAgentId"`
+	OldRunID         string `json:"oldRunId"`
+	OldName          string `json:"oldName"`
+	SuccessorAgentID string `json:"successorAgentId"`
+	SuccessorName    string `json:"successorName"`
+	Reason           string `json:"reason"`
+	Trigger          string `json:"trigger"`
+	Cwd              string `json:"cwd"`
+	PermissionMode   string `json:"permissionMode,omitempty"`
+}
+
+const stewardPhaseCleaned = "cleaned"
+
+func stewardRotationJournalPath(hub, task string) string {
+	return filepath.Join(relayDir(), "steward-rotation-"+rotationStateKey(hub, task)+".json")
+}
+
+func loadStewardRotationJournal(hub, task string) (*stewardRotationJournal, error) {
+	data, err := os.ReadFile(stewardRotationJournalPath(hub, task))
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	var j stewardRotationJournal
+	if err = json.Unmarshal(data, &j); err != nil || j.Version != 1 || j.Hub != strings.TrimRight(hub, "/") || j.Task != task {
+		return nil, errors.New("steward rotation journal is invalid; inspect it before retrying")
+	}
+	switch j.Phase {
+	case rotationPhasePreparing, rotationPhasePrepared, rotationPhaseSpawned, rotationPhaseCommitted, stewardPhaseCleaned:
+	default:
+		return nil, errors.New("steward rotation journal has an unknown phase")
+	}
+	return &j, nil
+}
+
+// stewardRotationRefusal reports a hub refusal that changed nothing.
+func stewardRotationRefusal(err error) (string, bool) {
+	var httpErr *api.HTTPError
+	if errors.As(err, &httpErr) && httpErr.Status == http.StatusConflict {
+		switch httpErr.Code {
+		case api.StewardRefusedWorking, api.StewardRefusedPendingTool, api.StewardRefusedRotationOpen, api.StewardRefusedPaused, api.StewardRefusedNotSteward,
+			api.StewardRefusedSummaryMissing, api.StewardRefusedSuccessor, api.StewardRefusedNameTaken, api.StewardRefusedAgentCaller:
+			return httpErr.Code, true
+		}
+	}
+	return "", false
+}
+
+func stewardRotationBusy(err error) bool {
+	code, ok := stewardRotationRefusal(err)
+	return ok && (code == api.StewardRefusedWorking || code == api.StewardRefusedPendingTool)
+}
+
+// rotateSteward starts a rotation, or resumes the one this host's journal
+// records: preparing, prepared, spawned, committed, cleaned. The journal is
+// removed once the setup identity file names the successor.
+func rotateSteward(ctx context.Context, d stewardDeps, e env, c *api.Client, task, reason, trigger string) (api.StewardRotation, error) {
+	var zero api.StewardRotation
+	hub := strings.TrimRight(c.Base, "/")
+	path := stewardRotationJournalPath(hub, task)
+	unlock, err := handlerLock(ctx, path)
+	if err != nil {
+		return zero, err
+	}
+	defer unlock()
+	j, err := loadStewardRotationJournal(hub, task)
+	if err != nil {
+		return zero, err
+	}
+	save := func(phase string) error {
+		j.Phase = phase
+		if err := writePrivateJSON(path, *j); err != nil {
+			return err
+		}
+		if d.after != nil {
+			return d.after(phase)
+		}
+		return nil
+	}
+	if j == nil {
+		rotations, err := c.ListStewardRotations(ctx, task)
+		if err != nil {
+			return zero, err
+		}
+		status, err := c.BacklogSteward(ctx, task)
+		if err != nil {
+			return zero, err
+		}
+		if status.Steward == nil {
+			return zero, errors.New("the project has no active backlog steward to rotate")
+		}
+		old := *status.Steward
+		for _, r := range rotations {
+			if r.State == api.StewardRotationPrepared && r.OldAgentID == old.ID {
+				return zero, fmt.Errorf("steward rotation %s is prepared without this host's journal; run tt steward rotate --abort --task %s", r.ID, task)
+			}
+		}
+		if old.Host != d.host() {
+			return zero, fmt.Errorf("steward %s runs on %s; rotate it from that host", old.Name, old.Host)
+		}
+		if reason == "" {
+			reason = api.StewardRotationReasonManual
+		}
+		permissionMode := ""
+		if id, err := loadStewardIdentity(hub, task); err != nil {
+			return zero, err
+		} else if id != nil && id.AgentID == old.ID {
+			permissionMode = id.PermissionMode
+		}
+		j = &stewardRotationJournal{Version: 1, Hub: hub, Task: task, PrepareRequestID: newRotationKey("steward-rotation-prepare"), OldAgentID: old.ID, OldRunID: old.RunID,
+			OldName: old.Name, SuccessorAgentID: api.NewID("agt"), SuccessorName: api.StewardSuccessorName(old.Name), Reason: reason, Trigger: trigger, Cwd: old.Cwd, PermissionMode: permissionMode}
+		if err = save(rotationPhasePreparing); err != nil {
+			return zero, err
+		}
+	}
+	if j.Phase == rotationPhasePreparing {
+		r, err := c.StewardRotationAction(ctx, task, api.StewardRotationRequest{Operation: api.StewardRotationPrepare, RequestID: j.PrepareRequestID,
+			OldAgentID: j.OldAgentID, OldRunID: j.OldRunID, SuccessorAgentID: j.SuccessorAgentID, SuccessorName: j.SuccessorName, Reason: j.Reason, Trigger: j.Trigger})
+		if _, refused := stewardRotationRefusal(err); refused {
+			// A refused prepare changed nothing; the next attempt starts fresh.
+			if removeErr := os.Remove(path); removeErr != nil {
+				return zero, removeErr
+			}
+			return zero, err
+		}
+		if err != nil {
+			return zero, fmt.Errorf("prepare unconfirmed; rerun to replay it: %w", err)
+		}
+		j.RotationID = r.ID
+		if err = save(rotationPhasePrepared); err != nil {
+			return zero, err
+		}
+	}
+	if j.Phase == rotationPhasePrepared {
+		tmpl, err := d.template(ctx)
+		if err != nil {
+			return zero, err
+		}
+		detail, err := c.GetTask(ctx, task)
+		if err != nil {
+			return zero, err
+		}
+		args := append(stewardLaunchArgs(tmpl, hub, task, j.SuccessorAgentID, j.SuccessorName, j.Cwd, j.PermissionMode, detail.Task.LifecycleGeneration), "--steward-successor")
+		launch := e
+		launch.hub, launch.task, launch.agent, launch.agentName, launch.runID = hub, task, "", "", ""
+		if err := d.spawn(launch, args); err != nil {
+			return zero, fmt.Errorf("successor launch unconfirmed; the rotation stays prepared and %s stays the steward: rerun to resume or abort with tt steward rotate --abort: %w", j.OldName, err)
+		}
+		if err = save(rotationPhaseSpawned); err != nil {
+			return zero, err
+		}
+	}
+	if j.Phase == rotationPhaseSpawned {
+		deadline := time.Now().Add(d.online)
+		for {
+			a, err := c.GetAgent(ctx, task, j.SuccessorAgentID)
+			if err == nil && a.Online && a.Status != api.AgentClosed && a.Status != api.AgentExited {
+				break
+			}
+			if !time.Now().Before(deadline) {
+				return zero, fmt.Errorf("successor %s did not come online within %s; the rotation stays prepared and %s stays the steward: rerun to resume or abort with tt steward rotate --abort", j.SuccessorName, d.online, j.OldName)
+			}
+			select {
+			case <-ctx.Done():
+				return zero, ctx.Err()
+			case <-time.After(d.poll):
+			}
+		}
+		if _, err := c.StewardRotationAction(ctx, task, api.StewardRotationRequest{Operation: api.StewardRotationCommit, RequestID: "steward-rotation-commit-" + j.RotationID, RotationID: j.RotationID}); err != nil {
+			return zero, err
+		}
+		if err = save(rotationPhaseCommitted); err != nil {
+			return zero, err
+		}
+	}
+	if j.Phase == rotationPhaseCommitted {
+		if err := d.cleanup(ctx, e, task, j.OldAgentID); err != nil {
+			return zero, fmt.Errorf("rotation committed; old session cleanup will retry on rerun: %w", err)
+		}
+		if err = save(stewardPhaseCleaned); err != nil {
+			return zero, err
+		}
+	}
+	if err := saveStewardIdentity(stewardIdentity{Version: 1, Hub: hub, Task: task, AgentID: j.SuccessorAgentID, Name: j.SuccessorName, Cwd: j.Cwd, PermissionMode: j.PermissionMode, RotationID: j.RotationID}); err != nil {
+		return zero, err
+	}
+	if err := os.Remove(path); err != nil {
+		return zero, err
+	}
+	return c.GetStewardRotation(ctx, task, j.RotationID)
+}
+
+// abortStewardRotation aborts the project's prepared rotation, closes and
+// cleans up a registered successor, and leaves the old steward in place.
+func abortStewardRotation(ctx context.Context, d stewardDeps, e env, c *api.Client, task string) (api.StewardRotation, error) {
+	var zero api.StewardRotation
+	hub := strings.TrimRight(c.Base, "/")
+	path := stewardRotationJournalPath(hub, task)
+	unlock, err := handlerLock(ctx, path)
+	if err != nil {
+		return zero, err
+	}
+	defer unlock()
+	j, err := loadStewardRotationJournal(hub, task)
+	if err != nil {
+		return zero, err
+	}
+	if j != nil && (j.Phase == rotationPhaseCommitted || j.Phase == stewardPhaseCleaned) {
+		return zero, errors.New("the rotation is committed; rerun tt steward rotate to finish the old session's cleanup")
+	}
+	rotations, err := c.ListStewardRotations(ctx, task)
+	if err != nil {
+		return zero, err
+	}
+	var open *api.StewardRotation
+	for i := range rotations {
+		if rotations[i].State == api.StewardRotationPrepared {
+			open = &rotations[i]
+		}
+	}
+	if open == nil {
+		if j != nil {
+			if err = os.Remove(path); err != nil {
+				return zero, err
+			}
+		}
+		return zero, errors.New("no prepared steward rotation to abort")
+	}
+	if j != nil && j.RotationID != "" && j.RotationID != open.ID {
+		return zero, errors.New("this host's rotation journal names a different rotation; inspect it before aborting")
+	}
+	r, err := c.StewardRotationAction(ctx, task, api.StewardRotationRequest{Operation: api.StewardRotationAbort, RequestID: "steward-rotation-abort-" + open.ID, RotationID: open.ID})
+	if err != nil {
+		return zero, err
+	}
+	if _, err = c.GetAgent(ctx, task, r.SuccessorAgentID); err == nil {
+		if err = d.cleanup(ctx, e, task, r.SuccessorAgentID); err != nil {
+			return r, fmt.Errorf("rotation aborted; successor session cleanup will retry: %w", err)
+		}
+	}
+	if j != nil {
+		if err = os.Remove(path); err != nil {
+			return r, err
+		}
+	}
+	return r, nil
+}
+
+func cmdStewardRotate(e env, args []string, d stewardDeps) error {
+	fs := flag.NewFlagSet("steward rotate", flag.ContinueOnError)
+	task := fs.String("task", "", "project ID (required)")
+	reason := fs.String("reason", api.StewardRotationReasonManual, "manual, tokens or template")
+	abort := fs.Bool("abort", false, "abort the project's prepared rotation")
+	jsonOut := fs.Bool("json", false, "JSON output")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if !api.ValidID(*task, "tsk") || fs.NArg() != 0 {
+		return errors.New("usage: tt steward rotate --task ID [--reason manual|tokens|template] [--abort] [--json]")
+	}
+	if err := requireOwnerSession(e, "tt steward rotate"); err != nil {
+		return err
+	}
+	c, err := e.client(30 * time.Second)
+	if err != nil {
+		return err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	defer cancel()
+	var r api.StewardRotation
+	if *abort {
+		r, err = abortStewardRotation(ctx, d, e, c, *task)
+	} else {
+		r, err = rotateSteward(ctx, d, e, c, *task, *reason, api.StewardRotationTriggerOwner)
+	}
+	if err != nil {
+		return err
+	}
+	if *jsonOut {
+		printJSON(r)
+		return nil
+	}
+	if r.State == api.StewardRotationAborted {
+		fmt.Printf("Aborted steward rotation %s; %s stays the steward.\n", r.ID, r.OldName)
+		return nil
+	}
+	moved := 0
+	if r.Receipt != nil {
+		moved = r.Receipt.Reissued
+	}
+	fmt.Printf("Rotated backlog steward %s to %s (%s) with summary revision %d; %d open obligation(s) moved; old session cleanup confirmed.\n", r.OldName, r.SuccessorName, r.ID, r.SummaryRevision, moved)
+	return nil
+}
+
+func cmdStewardRotation(e env, args []string) error {
+	if len(args) == 0 || (args[0] != "get" && args[0] != "list") {
+		return errors.New("usage: tt steward rotation get ID | list [--task ID] [--json]")
+	}
+	operation := args[0]
+	fs := flag.NewFlagSet("steward rotation", flag.ContinueOnError)
+	task := fs.String("task", e.task, "project ID")
+	jsonOut := fs.Bool("json", false, "JSON output")
+	rest := args[1:]
+	id := ""
+	if operation == "get" && len(rest) > 0 && !strings.HasPrefix(rest[0], "-") {
+		id, rest = rest[0], rest[1:]
+	}
+	if err := fs.Parse(rest); err != nil {
+		return err
+	}
+	if !api.ValidID(*task, "tsk") || (operation == "get" && id == "") || fs.NArg() != 0 {
+		return errors.New("usage: tt steward rotation get ID | list [--task ID] [--json]")
+	}
+	c, err := e.client(10 * time.Second)
+	if err != nil {
+		return err
+	}
+	ctx, cancel := ctxTimeout(10 * time.Second)
+	defer cancel()
+	if operation == "list" {
+		rotations, err := c.ListStewardRotations(ctx, *task)
+		if err != nil {
+			return err
+		}
+		if *jsonOut {
+			printJSON(rotations)
+			return nil
+		}
+		for _, r := range rotations {
+			fmt.Printf("%s  %-9s  %s -> %s  summary r%d  reason=%s trigger=%s\n", r.ID, r.State, r.OldName, r.SuccessorName, r.SummaryRevision, r.Reason, r.Trigger)
+		}
+		return nil
+	}
+	r, err := c.GetStewardRotation(ctx, *task, id)
+	if err != nil {
+		return err
+	}
+	if *jsonOut {
+		printJSON(r)
+		return nil
+	}
+	fmt.Printf("Rotation %s: %s, %s (%s) -> %s (%s), summary revision %d, reason %s, trigger %s\n", r.ID, r.State, r.OldName, r.OldAgentID, r.SuccessorName, r.SuccessorAgentID, r.SummaryRevision, r.Reason, r.Trigger)
+	if h := r.Handoff; h != nil {
+		fmt.Printf("Backlog summary: revision %d, digest %s, saved by the old run: %t\n", h.SummaryRevision, h.SummaryDigest, h.SummaryFromOldRun)
+		fmt.Printf("Moved obligations: %d\n", len(h.Reissued))
+		for _, p := range h.Reissued {
+			fmt.Printf("  #%d -> #%d  %s (was %s)\n", p.OldMessageSeq, p.NewMessageSeq, p.Subject, p.OldState)
+		}
+		fmt.Printf("Unanswered decisions the old steward proposed: %d\n", len(h.OpenDecisions))
+		for _, d := range h.OpenDecisions {
+			fmt.Printf("  #%d %s\n", d.MessageSeq, d.Question)
+		}
+	}
+	return nil
+}
+
+func cmdStewardPolicy(e env, args []string) error {
+	if len(args) == 0 || (args[0] != "get" && args[0] != "set") {
+		return errors.New("usage: tt steward policy get|set --task ID [--revision N --enabled=BOOL --max-total-tokens N --on-template-change=BOOL] [--json]")
+	}
+	operation := args[0]
+	fs := flag.NewFlagSet("steward policy", flag.ContinueOnError)
+	task := fs.String("task", e.task, "project ID")
+	revision := fs.Int64("revision", -1, "expected policy revision (required for set)")
+	enabled := fs.Bool("enabled", true, "rotate when a limit is reached")
+	maxTokens := fs.Int64("max-total-tokens", 0, "total tokens per steward run; 0 turns the limit off")
+	onTemplate := fs.Bool("on-template-change", true, "rotate when the steward template changes")
+	jsonOut := fs.Bool("json", false, "JSON output")
+	if err := fs.Parse(args[1:]); err != nil {
+		return err
+	}
+	if !api.ValidID(*task, "tsk") || fs.NArg() != 0 {
+		return errors.New("a valid --task project ID is required")
+	}
+	if operation == "set" {
+		if err := requireOwnerSession(e, "tt steward policy set"); err != nil {
+			return err
+		}
+	}
+	c, err := e.client(10 * time.Second)
+	if err != nil {
+		return err
+	}
+	ctx, cancel := ctxTimeout(10 * time.Second)
+	defer cancel()
+	current, err := c.StewardRotationPolicy(ctx, *task)
+	if err != nil {
+		return err
+	}
+	out := current
+	if operation == "set" {
+		if *revision < 0 {
+			return errors.New("tt steward policy set needs --revision, the revision shown by tt steward policy get")
+		}
+		req := api.StewardRotationPolicyRequest{ExpectedRevision: *revision, Enabled: current.Enabled, MaxTotalTokens: current.MaxTotalTokens, OnTemplateChange: current.OnTemplateChange}
+		if flagPresent(args, "enabled") {
+			req.Enabled = *enabled
+		}
+		if flagPresent(args, "max-total-tokens") {
+			req.MaxTotalTokens = *maxTokens
+		}
+		if flagPresent(args, "on-template-change") {
+			req.OnTemplateChange = *onTemplate
+		}
+		if out, err = c.SetStewardRotationPolicy(ctx, *task, req); err != nil {
+			return err
+		}
+	}
+	if *jsonOut {
+		printJSON(out)
+		return nil
+	}
+	limit := "off"
+	if out.MaxTotalTokens > 0 {
+		limit = strconv.FormatInt(out.MaxTotalTokens, 10)
+	}
+	fmt.Printf("Steward rotation policy for %s (revision %d): enabled=%t max-total-tokens=%s on-template-change=%t\n", out.TaskID, out.Revision, out.Enabled, limit, out.OnTemplateChange)
+	return nil
+}
+
+// stewardRotationRunner is the relay's steward rotation tick. It asks the hub
+// nothing unless a steward session for the hub runs on this host, at most one
+// due request a minute while one does, and caches an empty answer.
+type stewardRotationRunner struct {
+	deps     stewardDeps
+	now      func() time.Time
+	interval time.Duration
+	mu       sync.Mutex
+	quietTil time.Time
+	digest   string
+}
+
+var hostStewardRunner = &stewardRotationRunner{deps: productionStewardDeps(), now: time.Now, interval: time.Minute}
+
+func relayStewardRotationTick(ctx context.Context) error {
+	e := env{hub: os.Getenv(spawn.EnvHub), token: os.Getenv("TAILTERM_TOKEN")}
+	e.loadConfig()
+	if e.hub == "" {
+		return nil
+	}
+	return hostStewardRunner.hostTick(ctx, e, func() (*api.Client, error) {
+		c, err := e.client(20 * time.Second)
+		if err == nil {
+			attachRelayBudget(c, activeRelayBudget)
+		}
+		return c, err
+	}, spawn.Host())
+}
+
+// hostRunsSteward reports whether a backlog steward session for hub runs in
+// this host's tmux server. It reads local state only.
+func hostRunsSteward(ctx context.Context, hub string) (bool, error) {
+	sessions, err := localSessions(ctx)
+	if err != nil {
+		return false, err
+	}
+	for _, s := range sessions {
+		if s.valid() && strings.TrimRight(s.Hub, "/") == strings.TrimRight(hub, "/") && strings.HasPrefix(s.Name, "tt-steward-") {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+func (r *stewardRotationRunner) hostTick(ctx context.Context, e env, client func() (*api.Client, error), host string) error {
+	if runs, err := hostRunsSteward(ctx, e.hub); err != nil || !runs {
+		return err
+	}
+	c, err := client()
+	if err != nil {
+		return err
+	}
+	return r.tick(ctx, e, c, host)
+}
+
+func (r *stewardRotationRunner) tick(ctx context.Context, e env, c *api.Client, host string) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	now := r.now()
+	if now.Before(r.quietTil) {
+		return nil
+	}
+	if r.digest == "" {
+		// The template is fixed for this binary; without it the runner still
+		// rotates on tokens and simply cannot detect a template change.
+		if t, err := r.deps.template(ctx); err == nil {
+			r.digest = t.digest()
+		}
+	}
+	list, err := c.StewardRotationsDue(ctx, host, r.digest)
+	if err != nil {
+		return err
+	}
+	if len(list.Entries) == 0 {
+		r.quietTil = now.Add(rotationQuietCache)
+		return nil
+	}
+	r.quietTil = now.Add(r.interval)
+	hub := strings.TrimRight(c.Base, "/")
+	var errs []error
+	for _, d := range list.Entries {
+		journal, err := loadStewardRotationJournal(hub, d.TaskID)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("steward rotation %s: %w", d.TaskID, err))
+			continue
+		}
+		if journal != nil {
+			if _, err := rotateSteward(ctx, r.deps, e, c, d.TaskID, journal.Reason, journal.Trigger); err != nil && !stewardRotationBusy(err) {
+				errs = append(errs, fmt.Errorf("steward rotation %s: %w", d.TaskID, err))
+			}
+			continue
+		}
+		if d.OpenRotation != nil || len(d.DueReasons) == 0 || !d.Idle {
+			continue
+		}
+		if _, err := rotateSteward(ctx, r.deps, e, c, d.TaskID, d.DueReasons[0], api.StewardRotationTriggerRunner); err != nil && !stewardRotationBusy(err) {
+			errs = append(errs, fmt.Errorf("steward rotation %s: %w", d.TaskID, err))
+		}
+	}
+	return errors.Join(errs...)
 }
