@@ -37,6 +37,8 @@ import {
   makeTargetedPlan,
   runTargeted,
 } from "../scripts/verify-matrix.mjs";
+// Named separately so the red tests load on a runner that lacks these exports.
+import * as matrixRunner from "../scripts/verify-matrix.mjs";
 const makePlan = (context, cwd) =>
   rawMakePlan(
     {
@@ -478,6 +480,156 @@ test("cleanup failure removes eligible receipt and reports retained home", async
     retained,
   );
   assert(existsSync(join(output, digest("npm-unit") + ".attempt-1.log")));
+});
+// Processes a fixture check leaves behind record their pids outside the
+// verifier home, and t.after SIGKILLs every recorded pid, so a failing test
+// cannot leak the processes it exercises.
+function fixturePids(t) {
+  const directory = mkdtempSync(join(tmpdir(), "verification-pids-"));
+  t.after(() => {
+    for (const name of readdirSync(directory)) {
+      if (name.endsWith(".pid"))
+        try {
+          process.kill(Number(readFileSync(join(directory, name), "utf8")), "SIGKILL");
+        } catch {}
+      if (name.endsWith(".path"))
+        rmSync(readFileSync(join(directory, name), "utf8"), { recursive: true, force: true });
+    }
+    rmSync(directory, { recursive: true, force: true });
+  });
+  // argv: name, optional file to hold open. IGNORE_TERM forces the SIGKILL path.
+  writeFileSync(
+    join(directory, "child.cjs"),
+    `const fs=require('node:fs'),path=require('node:path');const [name,held]=process.argv.slice(2);if(process.env.IGNORE_TERM)process.on('SIGTERM',()=>{});if(held)fs.openSync(held,'w');fs.writeFileSync(path.join(__dirname,name+'.pid'),String(process.pid));setInterval(()=>{},1000);`,
+  );
+  return directory;
+}
+// A check that starts setsid'd children (detached, as the codex daemon does)
+// and exits once each has recorded its pid. starts is check source calling
+// start(name, spawnOptions, heldFile) with pids, home and elsewhere in scope.
+function leakingCheck(pids, names, starts) {
+  return `import {spawn} from 'node:child_process';import fs from 'node:fs';
+const pids=${JSON.stringify(pids)},home=process.env.HOME,elsewhere={...process.env,HOME:pids,TMPDIR:pids,PWD:pids};
+const start=(name,options,held='')=>spawn(process.execPath,[pids+'/child.cjs',name,held],{detached:true,stdio:'ignore',...options}).unref();
+${starts}
+const names=${JSON.stringify(names)},deadline=Date.now()+10000;
+while(!names.every((name)=>fs.existsSync(pids+'/'+name+'.pid'))){if(Date.now()>deadline){console.error('children did not start');process.exit(1)}await new Promise((resolve)=>setTimeout(resolve,20))}
+console.log('leaked '+names.join(','));`;
+}
+const pidOf = (pids, name) => Number(readFileSync(join(pids, name + ".pid"), "utf8"));
+const alive = (pid) => {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return error.code !== "ESRCH";
+  }
+};
+test("codex stub shadows any real codex on the check PATH and logs each call", async (t) => {
+  const f = fixture(t),
+    plan = commandPlan(
+      f,
+      `import {spawnSync} from 'node:child_process';const r=spawnSync('sh',['-c','command -v codex; codex app-server --listen unix:// --managed-daemon; echo status=$?'],{encoding:'utf8'});process.stdout.write(r.stdout);process.stderr.write(r.stderr);`,
+    );
+  const output = tempDir(t, "verification-codex-stub-logs-");
+  const receipt = await runPlan(plan, f.cwd, output);
+  const home = receipt.environment.HOME,
+    log = readFileSync(receipt.checks[0].logURI, "utf8");
+  assert(receiptEligible(receipt));
+  assert(receipt.environment.PATH.startsWith(home + "/.verifier-bin:"));
+  assert(log.split("\n").includes(home + "/.verifier-bin/codex"), log);
+  assert.match(log, /tailterm verifier: codex is disabled during matrix checks/);
+  assert.match(log, /^status=1$/m, "a real codex would exit 0");
+  const calls = readFileSync(join(output, "codex-stub-calls.log"), "utf8")
+    .split("\n")
+    .filter(Boolean);
+  assert.equal(calls.length, 1);
+  assert.match(calls[0], /\tapp-server --listen unix:\/\/ --managed-daemon$/);
+  assert.deepEqual(matrixRunner.verifierHomeProcesses(home), []);
+  assert(!existsSync(home));
+});
+test("home sweep stops setsid'd, TERM-ignoring, env-only and realpath-cwd leftovers", async (t) => {
+  const f = fixture(t),
+    pids = fixturePids(t),
+    names = ["held", "env", "cwd"];
+  const plan = commandPlan(
+    f,
+    leakingCheck(
+      pids,
+      names,
+      `start('held',{cwd:pids,env:{...elsewhere,IGNORE_TERM:'1'}},home+'/held');start('env',{cwd:pids});start('cwd',{cwd:fs.realpathSync(home),env:elsewhere});`,
+    ),
+  );
+  const output = tempDir(t, "verification-home-sweep-logs-");
+  const receipt = await runPlan(plan, f.cwd, output);
+  assert(receiptEligible(receipt));
+  assert(!existsSync(receipt.environment.HOME));
+  for (const name of names)
+    assert(!alive(pidOf(pids, name)), name + " outlived the verifier home");
+  const stopped = JSON.parse(readFileSync(join(output, "home-processes.json"), "utf8"));
+  const reasons = Object.fromEntries(stopped.processes.map((p) => [p.pid, p.reasons]));
+  assert.equal(stopped.home, receipt.environment.HOME);
+  assert.deepEqual(reasons[pidOf(pids, "held")], ["file"]);
+  assert.deepEqual(reasons[pidOf(pids, "env")], ["env"]);
+  assert.deepEqual(reasons[pidOf(pids, "cwd")], ["file"]);
+});
+test("home sweep spares a sibling-prefix home and never signals the runner", async (t) => {
+  const f = fixture(t),
+    pids = fixturePids(t);
+  const plan = commandPlan(
+    f,
+    leakingCheck(
+      pids,
+      ["sibling", "leak"],
+      `const sibling=home+'-sibling';fs.mkdirSync(sibling);fs.writeFileSync(pids+'/sibling.path',sibling);start('sibling',{cwd:sibling,env:{...process.env,HOME:sibling,TMPDIR:sibling,PWD:sibling}},sibling+'/held');start('leak',{cwd:pids});`,
+    ),
+  );
+  let signalled = "";
+  const onTerm = () => (signalled = "SIGTERM");
+  process.on("SIGTERM", onTerm);
+  t.after(() => process.off("SIGTERM", onTerm));
+  const receipt = await runPlan(plan, f.cwd, tempDir(t, "verification-sibling-logs-"));
+  assert(receiptEligible(receipt));
+  assert(!alive(pidOf(pids, "leak")));
+  assert(alive(pidOf(pids, "sibling")), "sibling-prefix process was stopped");
+  assert(existsSync(readFileSync(join(pids, "sibling.path"), "utf8")));
+  assert.equal(signalled, "", "runner process was signalled");
+});
+test("home process stop failure leaves no receipt and retains the home", async (t) => {
+  const f = fixture(t),
+    plan = commandPlan(f, "console.log('check passed');");
+  const output = tempDir(t, "verification-stop-failure-logs-");
+  let retained = "";
+  await assert.rejects(
+    () =>
+      runPlan(plan, f.cwd, output, {
+        stopHomeProcesses: async (home) => {
+          retained = home;
+          throw new Error("synthetic survivor pid 1234");
+        },
+      }),
+    /Failed to stop processes under verifier home .*synthetic survivor pid 1234/,
+  );
+  t.after(() => {
+    if (retained && existsSync(retained)) removeVerifierHome(retained);
+  });
+  assert(existsSync(retained));
+  assert(!existsSync(join(output, "receipt.json")));
+  const failure = JSON.parse(readFileSync(join(output, "cleanup-error.json")));
+  assert.equal(failure.home, retained);
+  assert.match(failure.error, /synthetic survivor pid 1234/);
+  assert(existsSync(join(output, digest("npm-unit") + ".attempt-1.log")));
+});
+test("keep-home still stops processes left under the home", async (t) => {
+  const f = fixture(t),
+    pids = fixturePids(t);
+  const plan = commandPlan(f, leakingCheck(pids, ["env"], `start('env',{cwd:pids});`));
+  const receipt = await runPlan(plan, f.cwd, tempDir(t, "verification-kept-sweep-logs-"), {
+    keepHome: true,
+  });
+  t.after(() => removeVerifierHome(receipt.environment.HOME));
+  assert(existsSync(receipt.environment.HOME));
+  assert(!alive(pidOf(pids, "env")));
 });
 test("immutable cache entry cannot leave a passing receipt", async (t) => {
   if (process.platform !== "darwin")
