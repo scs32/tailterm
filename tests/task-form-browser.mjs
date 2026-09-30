@@ -20,6 +20,15 @@ const fixtureEnv = Object.fromEntries(
 const hubBinary = await prepareTestBinary({ root, target: "hub", output: path.join(root, ".build/ttbin/tailterm-hub-test") });
 const ttBinary = await prepareTestBinary({ root, target: "tt", output: path.join(state, "tt") });
 if (ttBinary !== path.join(state, "tt")) await symlink(ttBinary, path.join(state, "tt"));
+// Each project's database handler launches with run `codex`
+// (client/project-handler.js). This stub, first on the /exec PATH, keeps that
+// run alive like the catalog's sleep command without reaching a real CLI.
+await writeFile(path.join(state, "codex"), "#!/bin/sh\nexec sleep 300\n");
+await chmod(path.join(state, "codex"), 0o755);
+// Stop sessions a crashed earlier run left on this socket, as teardown does.
+await exec("tmux", ["-L", "tailterm-form-check", "kill-server"]).catch(
+  () => {},
+);
 const reserve = createServer();
 reserve.listen(0, "127.0.0.1");
 await once(reserve, "listening");
