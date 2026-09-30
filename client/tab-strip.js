@@ -12,8 +12,11 @@ export function setupTabStrip() {
     viewport.style.maxWidth = style
       ? `${viewport.children.length * parseFloat(style.maxWidth)}px`
       : "0px";
-    const plus = strip.querySelector("#new-tab");
-    const available = strip.clientWidth - (plus?.offsetWidth || 0);
+    const plus = strip.querySelector("#new-tab"),
+      home = strip.querySelector(".home-tab");
+    // The pinned Home tab sits outside the scrolling viewport.
+    const available =
+      strip.clientWidth - (plus?.offsetWidth || 0) - (home?.offsetWidth || 0);
     const overflow =
       !!tab && viewport.children.length * minimum > available + 1;
     left.hidden = right.hidden = !overflow;

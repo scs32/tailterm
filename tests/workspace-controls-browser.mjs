@@ -46,7 +46,8 @@ export async function exerciseWorkspaceControls(page) {
         mobile ? { width: 390, height: 650 } : original,
       );
       const plus = await page.locator("#new-tab").boundingBox();
-      const tab = await page.locator("#tabs .tab").first().boundingBox();
+      // The first tab in the strip: the pinned Home tab in TailOS.
+      const tab = await page.locator(".tab-strip .tab").first().boundingBox();
       assert.ok(
         Math.abs(plus.y - tab.y) < 1 && Math.abs(plus.height - tab.height) < 1,
         "Plus matches the tab frame",

@@ -1484,6 +1484,59 @@ dialog:modal {
   overflow: hidden;
   box-sizing: border-box;
 }
+/* The pinned Home tab: a tab outside the scrolling strip, same height. */
+.tab-strip > .home-tab {
+  flex: 0 1 200px;
+  min-width: 110px;
+  max-width: 200px;
+  height: 100%;
+  overflow: hidden;
+  box-sizing: border-box;
+  position: relative;
+}
+.tab-strip > .home-tab button:is([data-tab], [data-home-empty]) {
+  flex: 1;
+  min-width: 0;
+  height: 100%;
+  flex-wrap: nowrap;
+  padding: 5px 8px;
+  gap: 6px;
+  text-align: left;
+}
+.home-mark {
+  flex: 0 0 auto;
+  font-size: 13px;
+  line-height: 1;
+  color: var(--accent);
+}
+.tab-strip > .home-tab .tab-copy {
+  display: flex;
+  min-width: 0;
+  flex: 1;
+  overflow: hidden;
+}
+.tab-strip > .home-tab .tab-name {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  width: 100%;
+  font-size: 11px;
+}
+.tab-strip > .home-tab button:is([data-close], [data-session-menu]) {
+  flex: 0 0 24px;
+  padding: 4px;
+  justify-content: center;
+  height: 100%;
+}
+.tab-strip > .home-tab button[data-session-menu] {
+  flex-basis: 26px;
+}
+.tab-strip
+  > .home-tab:not(.active):not(:hover):not(:focus-within)
+  > :is([data-close], [data-session-menu]) {
+  display: none;
+}
 #tabs .tab button[data-tab] {
   flex: 1;
   min-width: 0;
@@ -3284,7 +3337,8 @@ dialog .primary:hover {
 
 /* A decorated tab owns its entire outline, including the buttons inside it.
    Scope the shared hover colors to that tab so the base theme cannot overwrite it. */
-#tabs .tab[data-tab-color]:not([data-tab-color="default"]) {
+#tabs .tab[data-tab-color]:not([data-tab-color="default"]),
+.tab-strip > .home-tab[data-tab-color]:not([data-tab-color="default"]) {
   --line: var(--tab-marker);
   --accent: var(--tab-marker);
   border-color: var(--tab-marker);
@@ -3305,13 +3359,15 @@ dialog .primary:hover {
   --tab-fill-color: #d97091;
 }
 #tabs .tab[data-tab-fill]:not([data-tab-fill="default"]),
+.tab-strip > .home-tab[data-tab-fill]:not([data-tab-fill="default"]),
 #tab-decoration-sample[data-tab-fill]:not([data-tab-fill="default"]),
 .pane-header[data-tab-fill]:not([data-tab-fill="default"]) {
   --surface: color-mix(in srgb, var(--tab-fill-color) 18%, var(--terminal-bg));
   --raised: color-mix(in srgb, var(--tab-fill-color) 28%, var(--terminal-bg));
   background: var(--surface);
 }
-#tabs .tab.active[data-tab-fill]:not([data-tab-fill="default"]) {
+#tabs .tab.active[data-tab-fill]:not([data-tab-fill="default"]),
+.tab-strip > .home-tab.active[data-tab-fill]:not([data-tab-fill="default"]) {
   background: var(--raised);
 }
 #emoji-options {
@@ -3345,14 +3401,24 @@ dialog .primary:hover {
     [data-tab-color]:not([data-tab-color="default"]),
     [data-tab-fill]:not([data-tab-fill="default"])
   )
+  > button,
+.tab-strip
+  > .home-tab.active:is(
+    [data-tab-color]:not([data-tab-color="default"]),
+    [data-tab-fill]:not([data-tab-fill="default"])
+  )
   > button {
   background: var(--raised);
 }
-#tabs .tab.active .tab-name {
+#tabs .tab.active .tab-name,
+.tab-strip > .home-tab.active .tab-name {
   font-weight: 600;
 }
 
-#tabs .tab[data-tab-color]:not([data-tab-color="default"]) .tab-activity {
+#tabs .tab[data-tab-color]:not([data-tab-color="default"]) .tab-activity,
+.tab-strip
+  > .home-tab[data-tab-color]:not([data-tab-color="default"])
+  .tab-activity {
   color: var(--ink);
 }
 /* The focus frame and each session's identity stripe are separate lines. */
@@ -3530,10 +3596,12 @@ dialog .primary:hover {
 }
 
 /* Unread output tints the existing fill; labels and outlines remain steady. */
-#tabs .tab.has-new-output {
+#tabs .tab.has-new-output,
+.tab-strip > .home-tab.has-new-output {
   --output-tint: var(--tab-fill-color, var(--accent));
 }
-#tabs .tab.has-new-output > button {
+#tabs .tab.has-new-output > button,
+.tab-strip > .home-tab.has-new-output > button {
   animation: tab-output-pulse 2.8s ease-in-out infinite;
 }
 @keyframes tab-output-pulse {
@@ -3548,7 +3616,8 @@ dialog .primary:hover {
   }
 }
 @media (prefers-reduced-motion: reduce) {
-  #workspace #tabs .tab.has-new-output > button {
+  #workspace #tabs .tab.has-new-output > button,
+  #workspace .tab-strip > .home-tab.has-new-output > button {
     animation: none;
     box-shadow: inset 0 0 0 100vmax
       color-mix(in srgb, var(--output-tint) 18%, transparent);
@@ -5843,7 +5912,11 @@ body:is(
     flex-wrap: wrap;
     white-space: normal;
   }
-  #mode-view .tasks-view [data-team-roster] .board-agent > span:not(.status-dot) {
+  #mode-view
+    .tasks-view
+    [data-team-roster]
+    .board-agent
+    > span:not(.status-dot) {
     min-width: 0;
     overflow-wrap: anywhere;
     flex: 1;
@@ -5985,4 +6058,36 @@ body:is(
 }
 .delegated-tag {
   color: var(--ink);
+}
+
+/* Home: selection is fill (as any active tab); hover is an outline. */
+.tab-strip > .home-tab:not(.active):hover {
+  outline: 1px solid var(--accent);
+  outline-offset: -1px;
+}
+.tab-strip > .home-tab.group-drop-target {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+/* The divider between home and the group beside it. */
+.home-divider {
+  position: absolute;
+  pointer-events: auto;
+  touch-action: none;
+  cursor: col-resize;
+  background: var(--terminal-bg);
+}
+.home-divider::after {
+  content: "";
+  position: absolute;
+  inset: 0 3px;
+  background: color-mix(in srgb, var(--muted) 30%, transparent);
+}
+.home-divider:hover::after,
+.home-divider:focus-visible::after {
+  background: var(--accent);
+}
+.home-divider:focus-visible {
+  outline: 1px solid var(--accent);
+  outline-offset: -1px;
 }

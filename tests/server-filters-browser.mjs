@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { finishRestoration } from "./restore-browser.mjs";
+import { homeShellsToTabs } from "./pane-groups-browser.mjs";
 
 export async function exerciseServerFilters(page) {
   await page.locator("#all-servers").click();
@@ -37,6 +38,8 @@ export async function exerciseServerFilters(page) {
     }
     await page.waitForTimeout(100);
   }
+  // TailOS opens the shell in Home; give Home shells tabs for these checks.
+  await homeShellsToTabs(page);
   const dev = await page
     .locator(".tab.active [data-tab]")
     .getAttribute("data-tab");

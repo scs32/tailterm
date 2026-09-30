@@ -2,6 +2,8 @@ import { normalizeTabDecoration } from "./tab-decoration.js";
 import { fonts } from "./appearance.js";
 import {
   PaneGroups,
+  HOME_RATIO,
+  clampHomeRatio,
   leaves,
   tileLayout,
   paneNeighbor,
@@ -51,20 +53,65 @@ export function setupPaneGroups({
   let drag,
     layout,
     signature = "",
-    resizing = false;
+    resizing = false,
+    // The tab whose group shows beside home while a home pane is focused.
+    lastGroup = null,
+    shownGroup = null;
+  // Home shows beside the active group only on a wide body.
+  const HOME_BREAK = 900,
+    HOME_MIN = 320,
+    GAP = 8;
+  const tab = (id) => getTabs().find((t) => t.id === id);
   const sync = () => {
     model.limit = normalizePaneLimit(preferences().paneGroupLimit);
-    const tab = (id) => getTabs().find((t) => t.id === id),
-      taskOf = (id) => tab(id)?.task?.taskId,
-      agentOf = (id) => tab(id)?.task?.agentId;
+    const taskOf = (id) => tab(id)?.task?.taskId,
+      agentOf = (id) => tab(id)?.task?.agentId,
+      homeOf = (id) => !!tab(id)?.home;
     model.sync(
       getTabs().map((t) => t.id),
       taskOf,
       agentOf,
+      homeOf,
     );
     model.isolateTasks(taskOf, agentOf);
   };
+  // Membership lives on the tab; the model follows it on every sync.
+  function toHome(id, target, placement) {
+    const t = tab(id);
+    if (!t || !model.canHome(id)) return false;
+    t.home = true;
+    model.toHome(id, target, placement);
+    return true;
+  }
+  function fromHome(id) {
+    const t = tab(id);
+    if (!t || !model.inHome(id) || model.boundTabs.has(id)) return false;
+    t.home = false;
+    model.leaveHome(id);
+    return true;
+  }
+  const visibleIds = () =>
+    new Set(
+      getTabs()
+        .filter(isVisible)
+        .map((t) => t.id),
+    );
+  const projectHome = () => {
+    if (!model.home) return null;
+    const tree = prune(model.home.tree, visibleIds());
+    if (!tree) return null;
+    const ids = leaves(tree);
+    return {
+      ...model.home,
+      tree,
+      active: ids.includes(model.home.active) ? model.home.active : ids[0],
+    };
+  };
   const members = (id) => {
+    if (model.inHome(id)) {
+      const home = projectHome();
+      return home ? leaves(home.tree) : [];
+    }
     const g = model.group(id);
     return g
       ? leaves(g.tree).filter((id) =>
@@ -91,6 +138,82 @@ export function setupPaneGroups({
     };
   };
   const current = () => project(model.group(getActive()));
+  // Which regions show: the active pane's region, plus home beside a group
+  // (or the last group beside home) on a wide body. No active pane: neither.
+  function regions() {
+    const active = getActive();
+    if (!model.inHome(active)) {
+      const group = current();
+      if (group) lastGroup = active;
+      shownGroup = group ? active : null;
+      const home =
+        group && body.clientWidth >= HOME_BREAK ? projectHome() : null;
+      return { home, group, focus: group ? "group" : null };
+    }
+    const home = projectHome();
+    if (!home) return { home: null, group: null, focus: null };
+    let group = null;
+    if (body.clientWidth >= HOME_BREAK) {
+      group = project(model.group(lastGroup));
+      shownGroup = group ? lastGroup : null;
+      if (!group)
+        for (const candidate of model.groups) {
+          group = project(candidate);
+          if (group) {
+            shownGroup = group.active;
+            break;
+          }
+        }
+    } else shownGroup = null;
+    return { home, group, focus: "home" };
+  }
+  const offset = (box, dx) => ({ ...box, x: box.x + dx });
+  function arrangement(r = regions()) {
+    const width = body.clientWidth,
+      height = body.clientHeight;
+    const empty = { panes: [], dividers: [], width: 0, height: 0 };
+    if (!r.home) {
+      const group = r.group ? tileLayout(r.group.tree, width, height) : empty;
+      return { ...group, split: null };
+    }
+    let homeWidth = r.group
+      ? Math.round(
+          Math.max(
+            HOME_MIN,
+            Math.min(
+              width - HOME_MIN - GAP,
+              width * clampHomeRatio(r.home.ratio),
+            ),
+          ),
+        )
+      : width;
+    const home = tileLayout(r.home.tree, homeWidth, height);
+    homeWidth = Math.max(homeWidth, home.width);
+    const homeDividers = home.dividers.map((d) => ({ ...d, home: true }));
+    if (!r.group)
+      return { ...home, dividers: homeDividers, split: null, homeWidth };
+    const x = homeWidth + GAP;
+    const group = tileLayout(r.group.tree, Math.max(0, width - x), height);
+    return {
+      panes: [...home.panes, ...group.panes.map((p) => offset(p, x))],
+      dividers: [
+        ...homeDividers,
+        ...group.dividers.map((d) => ({
+          ...offset(d, x),
+          box: offset(d.box, x),
+        })),
+      ],
+      width: x + group.width,
+      height: Math.max(home.height, group.height),
+      split: {
+        x: homeWidth,
+        y: 0,
+        width: GAP,
+        height: Math.max(home.height, group.height),
+      },
+      homeWidth,
+    };
+  }
   function geometry(group) {
     const visible = project(group);
     return visible
@@ -148,6 +271,18 @@ export function setupPaneGroups({
     !model.canFit(source, target, whole);
   function merge(source, target, whole = true) {
     sync();
+    if (model.inHome(target)) {
+      if (toHome(source, target, "right")) {
+        changed();
+        activate(source);
+      }
+      return;
+    }
+    if (model.inHome(source)) {
+      if (!fromHome(source)) return;
+      whole = false;
+      sync();
+    }
     const g = model.group(target);
     if (!g) return;
     if (refused(source, target, whole)) return full(source, target, whole);
@@ -166,6 +301,21 @@ export function setupPaneGroups({
   }
   function place(source, target, placement) {
     sync();
+    if (model.inHome(target)) {
+      if (
+        model.inHome(source)
+          ? model.homePlace(source, target, placement)
+          : toHome(source, target, placement)
+      ) {
+        changed();
+        activate(source);
+      }
+      return;
+    }
+    if (model.inHome(source)) {
+      if (!fromHome(source)) return;
+      sync();
+    }
     if (refused(source, target, false)) return full(source, target, false);
     if (model.place(source, target, placement)) {
       changed();
@@ -173,7 +323,7 @@ export function setupPaneGroups({
     }
   }
   function detach(id) {
-    if (model.detach(id)) {
+    if (model.inHome(id) ? fromHome(id) : model.detach(id)) {
       changed();
       activate(id);
     }
@@ -195,24 +345,34 @@ export function setupPaneGroups({
         : tree.id === d.node.id
           ? tree
           : find(tree.a) || find(tree.b);
-    const original = find(model.group(getActive())?.tree);
+    const owner = d.home ? null : shownGroup;
+    const original = find(d.home ? model.home?.tree : model.group(owner)?.tree);
     if (original) {
-      model.customize(getActive());
+      if (owner) model.customize(owner);
       original.ratio = Math.max(
         d.low / d.span,
         Math.min(d.high / d.span, value),
       );
-      model.remember(getActive());
+      if (owner) model.remember(owner);
       changed();
     }
     render();
   }
+  function resizeHome(value) {
+    if (!model.home) return;
+    model.home.ratio = clampHomeRatio(value);
+    changed();
+    render();
+  }
   function render() {
-    const group = current(),
-      ids = group ? leaves(group.tree) : [];
-    if (group && !model.projectLayouts.has(group.taskId))
+    const r = regions(),
+      group = r.group,
+      homeIds = r.home ? leaves(r.home.tree) : [],
+      ids = [...homeIds, ...(group ? leaves(group.tree) : [])];
+    if (r.focus === "group" && !model.projectLayouts.has(group.taskId))
       model.group(getActive()).active = getActive();
-    const grouped = group && leaves(model.group(getActive()).tree).length > 1;
+    if (r.focus === "home") model.home.active = getActive();
+    const grouped = !!group && leaves(model.group(shownGroup).tree).length > 1;
     body.classList.toggle("has-panes", ids.length > 0);
     chrome.hidden = !ids.length;
     for (const t of getTabs()) {
@@ -225,28 +385,36 @@ export function setupPaneGroups({
       chrome.replaceChildren();
       return;
     }
-    layout = geometry(group);
+    layout = arrangement(r);
     const next = [
       grouped,
       group?.taskId || "",
       ...(group?.guests || []),
       ...ids,
       ...layout.dividers.map((d) => d.node.id),
+      ...homeIds.map((id) => "home:" + id),
+      ...(layout.split ? ["home-split"] : []),
     ].join("|");
     if (next !== signature) {
       signature = next;
       chrome.replaceChildren();
       for (const id of ids) {
+        const inHome = homeIds.includes(id),
+          helper = inHome && model.boundTabs.has(id);
         const header = document.createElement("div");
         header.className = "pane-header";
         header.dataset.pane = id;
+        if (inHome) header.dataset.home = "";
         header.draggable = false;
-        header.title =
-          group?.taskId && !group.guests?.includes(id)
-            ? "Drag to rearrange within this project. Project agents stay in their project group.\nLeft Option: split right · Shift + Left Option: split above."
-            : grouped
-              ? "Drag to rearrange\nDrop onto another pane in this group to swap positions, or onto the tab bar to ungroup.\nLeft Option: split right · Shift + Left Option: split above."
-              : "Drag to group\nDrop onto another session tab to group these terminals.";
+        header.title = helper
+          ? "Home: the owner helper stays here.\nDrag onto another Home pane to swap positions."
+          : inHome
+            ? "Home: your own terminal.\nDrag within Home to rearrange, onto a tab or pane to group it, or onto the tab bar to give it its own tab."
+            : group?.taskId && !group.guests?.includes(id)
+              ? "Drag to rearrange within this project. Project agents stay in their project group.\nLeft Option: split right · Shift + Left Option: split above."
+              : grouped
+                ? "Drag to rearrange\nDrop onto another pane in this group to swap positions, or onto the tab bar to ungroup.\nLeft Option: split right · Shift + Left Option: split above."
+                : "Drag to group\nDrop onto another session tab to group these terminals.";
         const focus = document.createElement("button");
         focus.className = "pane-label";
         focus.onclick = () => {
@@ -256,9 +424,13 @@ export function setupPaneGroups({
         };
         const detachButton = document.createElement("button");
         detachButton.textContent = "↗";
-        detachButton.title =
-          "Move to its own tab\nOr drag this pane’s header to the tab bar.";
-        detachButton.setAttribute("aria-label", "Ungroup pane");
+        detachButton.title = inHome
+          ? "Move out of Home\nGive this terminal its own tab."
+          : "Move to its own tab\nOr drag this pane’s header to the tab bar.";
+        detachButton.setAttribute(
+          "aria-label",
+          inHome ? "Move out of Home" : "Ungroup pane",
+        );
         detachButton.dataset.detach = id;
         detachButton.onclick = () => detach(id);
         const closeButton = document.createElement("button");
@@ -280,7 +452,8 @@ export function setupPaneGroups({
           uploadButton.onclick = () => upload(id);
           header.append(uploadButton);
         }
-        if (grouped && model.canDetach(id)) header.append(detachButton);
+        if (inHome ? !helper : grouped && model.canDetach(id))
+          header.append(detachButton);
         header.append(closeButton);
         chrome.append(header);
       }
@@ -346,6 +519,7 @@ export function setupPaneGroups({
         };
         chrome.append(divider);
       }
+      if (layout.split) chrome.append(homeDivider());
       chrome.append(placementPreview);
     }
     chrome.style.width = layout.width + "px";
@@ -370,6 +544,14 @@ export function setupPaneGroups({
       position(header, { ...box, height: 30 });
       position(t.el, { ...box, y: box.y + 30, height: box.height - 30 });
     }
+    const split = chrome.querySelector(".home-divider");
+    if (split && layout.split) {
+      position(split, layout.split);
+      split.setAttribute(
+        "aria-valuenow",
+        Math.round(clampHomeRatio(model.home?.ratio) * 100),
+      );
+    }
     for (const d of layout.dividers) {
       const el = chrome.querySelector(`[data-divider="${d.node.id}"]`);
       position(el, d);
@@ -382,6 +564,113 @@ export function setupPaneGroups({
       el.setAttribute("aria-valuemax", Math.round((d.high / d.span) * 100));
       el.setAttribute("aria-valuenow", Math.round(d.ratio * 100));
     }
+  }
+  // The divider between home and the group beside it.
+  function homeDivider() {
+    const divider = document.createElement("div");
+    divider.className = "home-divider";
+    divider.tabIndex = 0;
+    divider.setAttribute("role", "separator");
+    divider.setAttribute("aria-label", "Resize Home");
+    divider.setAttribute("aria-orientation", "vertical");
+    divider.setAttribute("aria-valuemin", "20");
+    divider.setAttribute("aria-valuemax", "80");
+    divider.title =
+      "Resize Home\nDrag, or focus and use arrow keys. Double-click or press Enter to reset.";
+    divider.onpointerdown = (e) => {
+      if (e.button !== 0) return;
+      e.preventDefault();
+      resizing = true;
+      divider.setPointerCapture(e.pointerId);
+      divider.focus();
+    };
+    divider.onpointermove = (e) => {
+      if (!divider.hasPointerCapture(e.pointerId)) return;
+      const rect = body.getBoundingClientRect();
+      resizeHome(
+        (e.clientX - rect.left + body.scrollLeft - GAP / 2) / body.clientWidth,
+      );
+    };
+    divider.onpointerup = (e) => {
+      if (divider.hasPointerCapture(e.pointerId))
+        divider.releasePointerCapture(e.pointerId);
+      resizing = false;
+    };
+    divider.onlostpointercapture = () => {
+      resizing = false;
+    };
+    divider.ondblclick = () => resizeHome(HOME_RATIO);
+    divider.onkeydown = (e) => {
+      if (!["ArrowLeft", "ArrowRight", "Enter", "Home", "End"].includes(e.key))
+        return;
+      e.preventDefault();
+      e.stopPropagation();
+      const ratio = clampHomeRatio(model.home?.ratio);
+      resizeHome(
+        e.key === "Enter"
+          ? HOME_RATIO
+          : e.key === "Home"
+            ? 0.2
+            : e.key === "End"
+              ? 0.8
+              : ratio +
+                (e.key === "ArrowLeft" ? -1 : 1) * (e.shiftKey ? 0.1 : 0.02),
+      );
+    };
+    return divider;
+  }
+  const homeTarget = (target) =>
+    !!target &&
+    (target.matches(".home-tab") ||
+      (!!target.dataset.pane && model.inHome(target.dataset.pane)));
+  // Whether a drag may end on target: home rules first, then the group rules.
+  function homeDrop(source, target, targetId) {
+    const toHome = homeTarget(target);
+    if (source.home) {
+      if (model.boundTabs.has(source.id))
+        return toHome && !!target.dataset.pane && targetId !== source.id;
+      if (toHome) return !!target.dataset.pane && targetId !== source.id;
+      return !!targetId && !!model.group(targetId);
+    }
+    if (!toHome) return null;
+    const ids = source.whole ? members(source.id) : [source.id];
+    return ids.length > 0 && ids.every((id) => model.canHome(id));
+  }
+  function homeDropped(source, target, targetId, element, gesture) {
+    const intoHome = homeTarget(target);
+    const placement = gesture?.placement;
+    if (source.home && intoHome) {
+      if (!target.dataset.pane || targetId === source.id) return;
+      if (
+        placement
+          ? model.homePlace(source.id, targetId, placement)
+          : model.homeSwap(source.id, targetId)
+      ) {
+        changed();
+        activate(source.id);
+      }
+      return;
+    }
+    if (source.home) {
+      if (model.boundTabs.has(source.id)) return;
+      if (targetId && model.group(targetId)) {
+        if (target.dataset.pane && placement)
+          place(source.id, targetId, placement);
+        else merge(source.id, targetId, false);
+      } else if (!targetId && element?.closest(".terminal-tabs")) {
+        if (fromHome(source.id)) {
+          changed();
+          activate(source.id);
+        }
+      }
+      return;
+    }
+    const ids = source.whole ? members(source.id) : [source.id];
+    if (!ids.length || !ids.every((id) => model.canHome(id))) return;
+    const at = target.dataset.pane ? targetId : undefined;
+    for (const id of ids) toHome(id, at, at ? placement || "below" : undefined);
+    changed();
+    activate(source.id);
   }
   function dragTarget(element) {
     const direct = element?.closest("[data-pane], .tab, .pane-release");
@@ -442,10 +731,17 @@ export function setupPaneGroups({
   }
   setupPaneDrag(document.querySelector(".terminal-shell"), {
     start(source) {
+      // Home is not a group: its tab never drags.
+      if (source.matches(".home-tab")) {
+        drag = null;
+        return;
+      }
       const id =
         source.dataset.pane || source.querySelector("[data-tab]")?.dataset.tab;
-      drag = { id, whole: !source.dataset.pane };
-      release.hidden = !source.dataset.pane || !model.canDetach(id);
+      drag = { id, whole: !source.dataset.pane, home: model.inHome(id) };
+      release.hidden =
+        !source.dataset.pane ||
+        !(drag.home ? !model.boundTabs.has(id) : model.canDetach(id));
     },
     move(element, x, _y, gesture) {
       clearDropFeedback();
@@ -457,7 +753,15 @@ export function setupPaneGroups({
         drag.reorder = null;
         drag.placement = null;
       }
-      if (drag?.whole && target?.matches(".tab")) {
+      const home = drag && homeDrop(drag, target, targetId);
+      if (drag && home !== null && (drag.home || homeTarget(target))) {
+        if (home && target) {
+          if (target.dataset.pane && gesture?.placement) {
+            drag.placement = gesture.placement;
+            showPlacement(targetId, drag.placement);
+          } else target.classList.add("group-drop-target");
+        }
+      } else if (drag?.whole && target?.matches(".tab")) {
         const box = target.getBoundingClientRect(),
           position = (x - box.left) / box.width;
         drag.reorder =
@@ -501,7 +805,7 @@ export function setupPaneGroups({
       let id =
         target?.dataset.pane ||
         target?.querySelector("[data-tab]")?.dataset.tab;
-      if (id && !target.dataset.pane) {
+      if (id && !target.dataset.pane && model.group(id)) {
         const group = model.group(id);
         id = geometry(group).panes.sort(
           (a, b) => b.width * b.height - a.width * a.height,
@@ -509,6 +813,10 @@ export function setupPaneGroups({
       }
       const source = drag;
       clearDrag();
+      if (source.home || homeTarget(target)) {
+        homeDropped(source, target, id, element, gesture);
+        return;
+      }
       if (
         id &&
         !source.whole &&
@@ -610,15 +918,36 @@ export function setupPaneGroups({
     },
     partName,
     navigate(direction) {
-      const group = current();
-      if (!group) return;
-      const next = paneNeighbor(geometry(group).panes, getActive(), direction);
+      const next = paneNeighbor(arrangement().panes, getActive(), direction);
       if (next) activate(next);
     },
     reorder(source, target, after) {
       model.reorder(source, target, after);
       changed();
       activate(getActive());
+    },
+    toHome(id) {
+      sync();
+      if (toHome(id)) {
+        changed();
+        activate(id);
+      }
+    },
+    fromHome(id) {
+      if (fromHome(id)) {
+        changed();
+        activate(id);
+      }
+    },
+    inHome: (id) => model.inHome(id),
+    canHome: (id) => model.canHome(id),
+    canLeaveHome: (id) => model.inHome(id) && !model.boundTabs.has(id),
+    // The pinned Home tab: home's focused visible pane and its members.
+    homeEntry() {
+      const home = projectHome();
+      return home
+        ? { tab: tab(home.active), ids: leaves(home.tree), home: true }
+        : null;
     },
     entries: () =>
       model.groups

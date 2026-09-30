@@ -178,9 +178,9 @@ export async function exerciseTasks(page, hub, origin, ssh) {
   await page.locator("#tabs .tab button[role=tab]").nth(originalIndex).click();
   await waitFor(
     async () =>
-      !(await page.locator("#tabs .tab.task-tab").getAttribute("class")).includes(
-        "active",
-      ),
+      !(
+        await page.locator("#tabs .tab.task-tab").getAttribute("class")
+      ).includes("active"),
     "project group hidden",
   );
   const ordinaryPanes = await panes();
@@ -284,23 +284,40 @@ export async function exerciseTaskRestore(page, hub, ssh) {
       .click();
   };
   // Every tab and the tmux session of each of its panes, read from the UI.
+  // Home panes show beside every group, so they are read once, as Home.
   async function inventory() {
     await page.locator(".mode-switch [data-mode=terminals]").click();
     const out = [];
+    const sessions = (labels) =>
+      labels.map((text) => {
+        const parts = text.split(" · ");
+        return { session: parts.at(-2), status: parts.at(-1) };
+      });
     const count = await page.locator("#tabs .tab button[role=tab]").count();
     for (let i = 0; i < count; i++) {
       const tab = page.locator("#tabs .tab").nth(i);
       await tab.locator("button[role=tab]").click();
       const labels = await page
-        .locator(".pane-header .pane-label")
+        .locator(".pane-header:not([data-home]) .pane-label")
         .allInnerTexts();
       out.push({
         name: await tab.locator(".tab-name").innerText(),
         project: (await tab.getAttribute("class")).includes("task-tab"),
-        panes: labels.map((text) => {
-          const parts = text.split(" · ");
-          return { session: parts.at(-2), status: parts.at(-1) };
-        }),
+        panes: sessions(labels),
+      });
+    }
+    const home = page.locator(".tab-strip > .home-tab [data-tab]");
+    if (await home.count()) {
+      await home.click();
+      out.push({
+        name: "Home",
+        project: false,
+        home: true,
+        panes: sessions(
+          await page
+            .locator(".pane-header[data-home] .pane-label")
+            .allInnerTexts(),
+        ),
       });
     }
     return out;
@@ -523,6 +540,17 @@ export async function exerciseTaskRestore(page, hub, ssh) {
     has: page.locator(".tab-name", { hasText: /^marker$/ }),
   });
   if (await marker.count()) await marker.locator("[data-close]").click();
+  // In TailOS the marker opened in Home.
+  const homeMarker = page.locator(".pane-header[data-home]", {
+    has: page.locator(".pane-label", { hasText: / · marker · / }),
+  });
+  if (await page.locator(".tab-strip > .home-tab [data-tab]").count()) {
+    await page.locator(".tab-strip > .home-tab [data-tab]").click();
+    if (await homeMarker.count())
+      await homeMarker
+        .getByRole("button", { name: "Close pane", exact: true })
+        .click();
+  }
   for (const name of ["l3", "n2"]) ssh.gone.delete(name);
   console.log(
     `Task restore passed: stuck restore finished ${finishedIn} ms after the hub closed a connecting pane, no flash, paused/closed projects dropped, live projects bound, finished sessions checked, bookmarks unbound.`,

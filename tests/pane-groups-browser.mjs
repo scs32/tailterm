@@ -4,11 +4,113 @@ import { assertTerminalBounds } from "./terminal-bounds.mjs";
 // Pane image upload (fa356b7) and the tab session menu with its decoration
 // (f9be48d) are static-mode controls. Server mode must not show them; every
 // other layout, drag, keyboard and close check runs in both modes.
+// TailOS (static mode) opens every owner terminal in the pinned Home area.
+async function groupsDialog(page) {
+  await page.locator("#commands").click();
+  await page.locator("#command-query").fill("Manage terminal groups");
+  await page
+    .locator("#command-results button")
+    .filter({ hasText: "Manage terminal groups" })
+    .click();
+}
+const homeIds = (page) =>
+  page
+    .locator(".pane-header[data-home]")
+    .evaluateAll((nodes) => nodes.map((n) => n.dataset.pane));
+async function focusHome(page) {
+  await page.locator(".tab-strip > .home-tab [data-tab]").click();
+  await page.locator(".tab-strip > .home-tab.active").waitFor();
+}
+async function openShell(page) {
+  const before = await page.locator(".terminal-instance").count();
+  await page.locator("#new-tab").click();
+  await page.locator("#launcher-shell").click();
+  await page.waitForFunction(
+    (count) =>
+      document.querySelectorAll(".terminal-instance").length > count &&
+      document
+        .querySelector("#terminal-status")
+        .textContent.includes("Connected"),
+    before,
+  );
+}
+// Gives every Home shell its own tab through the Terminal groups dialog, the
+// focused one last so it stays focused. Returns the ids in Home order.
+export async function homeShellsToTabs(page) {
+  const homeTab = page.locator(".tab-strip > .home-tab");
+  if (!(await homeTab.locator("[data-close]").count())) return [];
+  const focused = await page
+    .locator(".tab.active [data-tab]")
+    .getAttribute("data-tab")
+    .catch(() => null);
+  await focusHome(page);
+  const homed = await homeIds(page);
+  const order = [
+    ...homed.filter((id) => id !== focused),
+    ...homed.filter((id) => id === focused),
+  ];
+  for (const id of order) {
+    if (!(await page.locator(`.pane-header[data-pane="${id}"]`).isVisible()))
+      await focusHome(page);
+    await page.locator(`.pane-header[data-pane="${id}"] .pane-label`).click();
+    await groupsDialog(page);
+    await page.locator('[data-home-move="out"]').click();
+    await page.locator(`#tabs [data-tab="${id}"]`).waitFor();
+  }
+  return homed;
+}
+// Home shells leave through the Terminal groups dialog, so the per-tab checks
+// below run on ordinary tabs; they return to Home afterwards.
+async function leaveHome(page) {
+  const homeTab = page.locator(".tab-strip > .home-tab");
+  if (!(await homeTab.count())) return [];
+  await focusHome(page);
+  const before = await homeIds(page);
+  assert.ok(before.length >= 3, "the launcher shells opened in Home");
+  for (const id of before)
+    assert.equal(
+      await page.locator(`#tabs [data-tab="${id}"]`).count(),
+      0,
+      "a Home shell has no tab of its own",
+    );
+  const homed = await homeShellsToTabs(page);
+  // An empty Home renders only its tab: no region, divider or close control.
+  assert.equal(await page.locator(".pane-header[data-home]").count(), 0);
+  assert.equal(await page.locator(".home-divider").count(), 0);
+  assert.equal(await homeTab.locator("[data-close]").count(), 0);
+  assert.equal(await homeTab.locator(".tab-name").innerText(), "Home");
+  return homed;
+}
+async function returnHome(page, homed) {
+  if (!homed.length) return;
+  const tabCount = () => page.locator("#tabs .tab").count();
+  // With Home empty, a new launcher shell lands in Home, as does a second.
+  for (const expected of [1, 2]) {
+    const before = await tabCount();
+    await openShell(page);
+    assert.equal(await tabCount(), before, "no tab is added for a Home shell");
+    await page.locator(".tab-strip > .home-tab.active").waitFor();
+    assert.equal((await homeIds(page)).length, expected);
+  }
+  for (const id of homed) {
+    const tab = page.locator(`#tabs [data-tab="${id}"]`);
+    if (!(await tab.count())) continue;
+    await tab.click();
+    await groupsDialog(page);
+    await page.locator('[data-home-move="in"]').click();
+    await page
+      .locator(`#tabs [data-tab="${id}"]`)
+      .waitFor({ state: "detached" });
+  }
+  await focusHome(page);
+}
+
 export async function exercisePaneGroups(
   page,
   getInput = () => undefined,
   { staticControls = true } = {},
 ) {
+  const homed = staticControls ? await leaveHome(page) : [];
   const originalCount = await page.locator("#tabs .tab").count();
   const ids = await page
     .locator("#tabs [data-tab]")
@@ -543,4 +645,5 @@ export async function exercisePaneGroups(
     for (const id of ids.slice(0, 2))
       assert.equal(await tab(id).getAttribute("data-tab-color"), "default");
   }
+  await returnHome(page, homed);
 }

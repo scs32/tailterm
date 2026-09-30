@@ -28,7 +28,10 @@ import { generateKeyPairSync } from "node:crypto";
 import ssh2 from "ssh2";
 import { WebSocketServer } from "ws";
 import { gzipSync } from "node:zlib";
-import { exercisePaneGroups } from "./pane-groups-browser.mjs";
+import {
+  exercisePaneGroups,
+  homeShellsToTabs,
+} from "./pane-groups-browser.mjs";
 import { assertTerminalBounds } from "./terminal-bounds.mjs";
 import { exerciseVaultReset } from "./vault-reset-browser.mjs";
 import { openVault } from "../client/vault-crypto.js";
@@ -615,9 +618,13 @@ try {
   } finally {
     page.keyboard.press = press;
   }
-  while ((await page.locator("[data-close]").count()) > 1) {
-    await page.locator("#tabs .tab").last().hover();
-    await page.locator("[data-close]").last().click();
+  // Close down to one terminal; Home shells close through the Home tab.
+  while ((await page.locator(".terminal-instance").count()) > 1) {
+    const last = (await page.locator("#tabs .tab").count())
+      ? page.locator("#tabs .tab").last()
+      : page.locator(".tab-strip > .home-tab");
+    await last.hover();
+    await last.locator("[data-close]").click();
   }
   // Themes/fonts/cursor affect existing terminals and persist on reload.
   await page.locator("#appearance").click();
@@ -779,6 +786,9 @@ try {
     );
     throw error;
   }
+  // TailOS opens owner shells in Home; the checks below expect each shell in
+  // its own tab with only the focused one visible, as before Home.
+  await homeShellsToTabs(page);
   await exerciseImageUpload(page, uploadedFiles, () => input, uploadControl);
   await page.locator("#connection-diagnostics").click();
   await page.getByText("SSH connection", { exact: true }).count();

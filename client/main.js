@@ -15,7 +15,17 @@ import "./work-items.css";
 import "./queue.css";
 import { createFilesView } from "./files-view.js";
 import { normalizeTaskRef } from "./task-ref.js";
-import { liveProject, restoreVerdict, sessionCheckNeeded } from "./tasks.js";
+import {
+  liveProject,
+  restoreVerdict,
+  sessionCheckNeeded,
+  bindingOf,
+  homeAgent,
+  homePlacement,
+  attachOptions,
+  helperReattach,
+  reattachOptions,
+} from "./tasks.js";
 import { createInactivityLock, IDLE_MINUTES } from "./inactivity.js";
 import { createAppearancePreview } from "./appearance-preview.js";
 import { normalizeTabDecoration, showTabDecoration } from "./tab-decoration.js";
@@ -231,6 +241,7 @@ async function flushWorkspace() {
       taskHub?.bound() || [],
       taskHub?.hidden() || [],
       paneGroups.model.projectLayoutSnapshot(),
+      paneGroups.model.home,
     ),
     serialized = JSON.stringify(snapshot);
   if (serialized === savedWorkspace) return;
@@ -279,13 +290,17 @@ async function restoreWorkspace(value) {
         (layout) => !dropped.has(layout.taskId),
       ),
     );
+    const savedHome = new Set(snapshot?.home ? leaves(snapshot.home.tree) : []);
     if (snapshot?.tabs.length) {
       notice("Restoring your terminal workspace...");
       for (const { item, server, task } of saved) {
+        let role;
         if (task) {
           const detail = hub.get(task.taskId);
           const verdict = restoreVerdict(task, detail);
           const agent = detail?.agents?.find((a) => a.id === task.agentId);
+          // A known roster decides home by role; otherwise the saved place.
+          if (agent) role = homeAgent(agent) ? "owner_helper" : "";
           if (
             !["keep", "unknown"].includes(verdict) ||
             (verdict === "keep" &&
@@ -303,7 +318,9 @@ async function restoreWorkspace(value) {
           target: item.target,
           decoration: item.decoration,
           fontSize: item.fontSize,
-          task: task || undefined,
+          task: task ? bindingOf({ ...task, role }) : undefined,
+          role,
+          home: savedHome.has(item.id),
         });
         if (t) await t.initialReady;
       }
@@ -320,6 +337,9 @@ async function restoreWorkspace(value) {
           delete group.part;
         }
       paneGroups.model.groups = snapshot.groups;
+      paneGroups.model.home = snapshot.home
+        ? structuredClone(snapshot.home)
+        : null;
       paneGroups.sync();
       activate(
         tabs.some((t) => t.id === snapshot.active)
@@ -450,7 +470,7 @@ function mount() {
   $("#lockscreen")?.remove();
   $("#app").insertAdjacentHTML(
     "beforeend",
-    `<div id="workspace"><aside><div class="brand">${icon}<strong>tailterm</strong></div><div class="sidebar-section"><span>SERVERS</span><button id="all-servers" aria-label="All servers" aria-pressed="true" title="Show sessions from all servers">All</button></div><input id="filter" class="filter" placeholder="⌕  Find a server…" aria-label="Find a server"><nav id="server-list"></nav><button id="discover" class="sidebar-discover">⌕ Discover devices</button><div class="sidebar-bottom"><button id="keys">♧ <span>SSH key vault</span><span id="key-count">0</span></button><button id="lock">↪ <span>Lock workspace</span><kbd>⇧⌘L</kbd></button></div></aside><main><header><div class="header-right"><button id="tailscale-login"><span class="status-dot" id="tail-dot" aria-hidden="true"></span><span id="tail-status">Connect Tailscale ↗</span></button></div></header><section class="terminal-shell"><div class="terminal-tabs"><div class="tab-strip"><button id="tabs-left" class="tab-scroll" aria-label="Scroll tabs left" title="Scroll tabs left" hidden>‹</button><div id="tabs" role="tablist" aria-label="SSH connections"></div><button id="tabs-right" class="tab-scroll" aria-label="Scroll tabs right" title="Scroll tabs right" hidden>›</button><button id="new-tab" class="icon-button" title="Start or resume a session">+</button></div><div class="terminal-tools"><button id="search-toggle" title="Find in terminal">⌕</button><button id="font-down" title="Smaller text">A−</button><button id="font-up" title="Larger text">A+</button><button id="appearance" title="Appearance\nThemes, fonts, cursor and spacing" aria-label="Appearance">◐</button><button id="fullscreen" title="Fullscreen">⛶</button></div></div><div id="search-bar" hidden><input id="terminal-search" placeholder="Find in scrollback" aria-label="Find in terminal"><button id="find-next">Next ↓</button><button id="search-close">×</button></div><div id="terminal-body"><div id="empty-terminal"><div class="session-launcher"><p id="server-filter-empty" class="fine" hidden></p><span class="eyebrow">YOUR REMOTE WORKSPACE</span><h2>Pick up where you left off.</h2><p class="launcher-intro">Choose a server, then open a fresh workspace or return to a running session.</p><div id="launcher-server" class="server-grid" role="group" aria-label="Session server"></div><div class="launch-section"><div class="launch-section-title"><span class="step-dot">＋</span><div><h3>Start fresh</h3><p>A persistent tmux workspace on <strong id="launch-target"></strong></p></div></div><div class="launch-new"><input id="launcher-name" placeholder="Optional name · leave blank for an automatic ID" aria-label="New tmux session name" maxlength="64"><button id="start-session" class="primary">＋ Start session</button></div></div><div class="resume-heading"><strong>Pick up a session</strong><button id="launcher-refresh" title="Refresh sessions\nQuery this server now; no sessions are changed.">↻ Refresh</button></div><p id="launcher-note"></p><div id="launcher-sessions"></div><div class="launcher-secondary"><button id="launcher-shell">Open plain SSH shell</button><button id="launcher-discover">⌕ Discover devices</button></div></div></div></div><div class="terminal-footer"><span id="terminal-status">○ No active connection</span><div><button id="copy">Copy</button><button id="paste">Paste</button><button id="clear">Clear</button><button id="reconnect">Reconnect</button><span id="dimensions">— × —</span></div></div></section></main></div><dialog id="dialog"></dialog>`,
+    `<div id="workspace"><aside><div class="brand">${icon}<strong>tailterm</strong></div><div class="sidebar-section"><span>SERVERS</span><button id="all-servers" aria-label="All servers" aria-pressed="true" title="Show sessions from all servers">All</button></div><input id="filter" class="filter" placeholder="⌕  Find a server…" aria-label="Find a server"><nav id="server-list"></nav><button id="discover" class="sidebar-discover">⌕ Discover devices</button><div class="sidebar-bottom"><button id="keys">♧ <span>SSH key vault</span><span id="key-count">0</span></button><button id="lock">↪ <span>Lock workspace</span><kbd>⇧⌘L</kbd></button></div></aside><main><header><div class="header-right"><button id="tailscale-login"><span class="status-dot" id="tail-dot" aria-hidden="true"></span><span id="tail-status">Connect Tailscale ↗</span></button></div></header><section class="terminal-shell"><div class="terminal-tabs"><div class="tab-strip">${staticMode ? '<div id="home-tab" class="tab home-tab" draggable="false"></div>' : ""}<button id="tabs-left" class="tab-scroll" aria-label="Scroll tabs left" title="Scroll tabs left" hidden>‹</button><div id="tabs" role="tablist" aria-label="SSH connections"></div><button id="tabs-right" class="tab-scroll" aria-label="Scroll tabs right" title="Scroll tabs right" hidden>›</button><button id="new-tab" class="icon-button" title="Start or resume a session">+</button></div><div class="terminal-tools"><button id="search-toggle" title="Find in terminal">⌕</button><button id="font-down" title="Smaller text">A−</button><button id="font-up" title="Larger text">A+</button><button id="appearance" title="Appearance\nThemes, fonts, cursor and spacing" aria-label="Appearance">◐</button><button id="fullscreen" title="Fullscreen">⛶</button></div></div><div id="search-bar" hidden><input id="terminal-search" placeholder="Find in scrollback" aria-label="Find in terminal"><button id="find-next">Next ↓</button><button id="search-close">×</button></div><div id="terminal-body"><div id="empty-terminal"><div class="session-launcher"><p id="server-filter-empty" class="fine" hidden></p><span class="eyebrow">YOUR REMOTE WORKSPACE</span><h2>Pick up where you left off.</h2><p class="launcher-intro">Choose a server, then open a fresh workspace or return to a running session.</p><div id="launcher-server" class="server-grid" role="group" aria-label="Session server"></div><div class="launch-section"><div class="launch-section-title"><span class="step-dot">＋</span><div><h3>Start fresh</h3><p>A persistent tmux workspace on <strong id="launch-target"></strong></p></div></div><div class="launch-new"><input id="launcher-name" placeholder="Optional name · leave blank for an automatic ID" aria-label="New tmux session name" maxlength="64"><button id="start-session" class="primary">＋ Start session</button></div></div><div class="resume-heading"><strong>Pick up a session</strong><button id="launcher-refresh" title="Refresh sessions\nQuery this server now; no sessions are changed.">↻ Refresh</button></div><p id="launcher-note"></p><div id="launcher-sessions"></div><div class="launcher-secondary"><button id="launcher-shell">Open plain SSH shell</button><button id="launcher-discover">⌕ Discover devices</button></div></div></div></div><div class="terminal-footer"><span id="terminal-status">○ No active connection</span><div><button id="copy">Copy</button><button id="paste">Paste</button><button id="clear">Clear</button><button id="reconnect">Reconnect</button><span id="dimensions">— × —</span></div></div></section></main></div><dialog id="dialog"></dialog>`,
   );
   if (staticMode) {
     $("#keys").insertAdjacentHTML(
@@ -662,8 +682,26 @@ function mount() {
             data.sessions = updated.sessions;
           })
           .catch(() => {}),
-      bookmark: (t) =>
-        api("/sessions", "POST", {
+      bookmark: (t) => {
+        // Adoption binds a live tab: the helper moves into home, any other
+        // agent out of it. A helper attach built without ignore-size is
+        // replaced by an attach that ignores size, connected or not.
+        if (staticMode && t.task) {
+          t.home = homePlacement({
+            binding: t.task,
+            role: t.task.role || "",
+          });
+          if (helperReattach(t))
+            void connect(
+              data.servers.find((s) => s.id === t.server.id) || t.server,
+              true,
+              t.session,
+              { ...reattachOptions(t), quiet: active !== t.id },
+            ).catch((e) =>
+              notice("Could not reattach the helper: " + e.message),
+            );
+        }
+        return api("/sessions", "POST", {
           serverId: t.server.id,
           name: t.session,
           target: t.target,
@@ -672,7 +710,8 @@ function mount() {
           .then((updated) => {
             data.sessions = updated.sessions;
           })
-          .catch(() => {}),
+          .catch(() => {});
+      },
     });
   if (staticMode) {
     taskHub.refresh();
@@ -1102,13 +1141,15 @@ function renderTabs() {
       return `<div class="tab ${ids.includes(active) ? "active" : ""} ${grouped ? "group-tab" : ""} ${newOutput ? "has-new-output" : ""} ${group?.taskId ? "task-tab" : ""}" data-tab-color="${decoration.color}" data-tab-fill="${decoration.fill}" style='--tab-font:${esc(fonts[decoration.font]?.family || "var(--terminal-font)")}' draggable="false"><button data-tab="${t.id}" role="tab" aria-selected="${ids.includes(active)}" title="${esc(activities.length ? title + "\n" + [...new Set(activities)].join(", ") : title)}"><span class="node-dot ${t.status === "Connected" ? "online" : ""}"></span><span class="tab-copy"><span class="tab-name">${esc(label)}</span></span></button>${staticMode ? `<button data-session-menu="${t.id}" aria-label="Session actions for ${esc(t.session)}" title="Session actions and tab order">...</button>` : ""}<button data-close="${t.id}" aria-label="Close ${esc(t.server.name)} ${grouped ? "focused pane" : "terminal"}">×</button></div>`;
     })
     .join("");
+  if ($("#home-tab")) renderHomeTab($("#home-tab"));
   $$("[data-tab]").forEach((b) => (b.onclick = () => activate(b.dataset.tab)));
   $$("[data-session-menu]").forEach(
     (b) =>
       (b.onclick = () => {
         const t = tabs.find((t) => t.id === b.dataset.sessionMenu);
         if (!t) return;
-        const grouped = !paneGroups.model.group(t.id)?.tree.tab;
+        const inHome = !!paneGroups.inHome(t.id);
+        const grouped = !inHome && !paneGroups.model.group(t.id)?.tree.tab;
         dialog(
           "Session actions",
           `<div class="dialog-menu">${t.tmux ? '<button id="rename-tab-session">Rename session</button>' : ""}<button id="decorate-tab">${grouped ? "Group appearance" : "Tab appearance"}</button>${grouped ? '<button id="decorate-pane">Focused session appearance</button>' : ""}<button id="move-tab-left">Move left</button><button id="move-tab-right">Move right</button></div>`,
@@ -1161,8 +1202,9 @@ function renderTabs() {
         const index = units.findIndex((unit) =>
           unit.entries.some((entry) => entry.ids.includes(t.id)),
         );
-        $("#move-tab-left").disabled = index <= 0;
-        $("#move-tab-right").disabled = index === units.length - 1;
+        // Home is pinned: its panes never move along the strip.
+        $("#move-tab-left").disabled = inHome || index <= 0;
+        $("#move-tab-right").disabled = inHome || index === units.length - 1;
         $("#move-tab-left").onclick = () => {
           closeDialog();
           paneGroups.reorder(t.id, units[index - 1].entries[0].tab.id, false);
@@ -1197,6 +1239,43 @@ function renderTabs() {
     : "○ No active connection";
   if (t?.retryMessage)
     $("#terminal-status").textContent += " · " + t.retryMessage;
+}
+// The pinned Home tab mirrors home's focused pane, so tab actions (select,
+// session menu, close) work on home panes; empty, it opens the launcher.
+function renderHomeTab(el) {
+  const entry = paneGroups?.homeEntry();
+  const focused = !!entry && entry.ids.includes(active);
+  const t = entry && (focused ? currentTab() : entry.tab);
+  el.classList.toggle("active", focused);
+  if (!t) {
+    el.dataset.tabColor = el.dataset.tabFill = "default";
+    el.classList.remove("has-new-output");
+    el.innerHTML =
+      '<button data-home-empty role="tab" aria-selected="false" title="Home\nThe owner helper and the terminals you open land here. Click to open a terminal."><span class="home-mark" aria-hidden="true">⌂</span><span class="tab-copy"><span class="tab-name">Home</span></span></button>';
+    el.querySelector("[data-home-empty]").onclick = () => $("#new-tab").click();
+    return;
+  }
+  const decoration = normalizeTabDecoration(t.decoration);
+  const activities = entry.ids
+    .map((id) => tabs.find((tab) => tab.id === id)?.activity)
+    .filter(Boolean);
+  const names = entry.ids.map((id) =>
+    tabName(
+      tabs.find((tab) => tab.id === id),
+      true,
+    ),
+  );
+  const label = tabName(t, true);
+  // The focused pane's own tab details, then the Home summary.
+  const title = `${tabName(t, true)}\n${t.server.username}@${t.server.host}:${t.server.port}\n${t.status}${t.tmux ? " · tmux launch: " + t.session + (t.tmuxVerified ? "" : " (unverified)") : ""}\nHome · ${entry.ids.length} pane${entry.ids.length === 1 ? "" : "s"}: ${names.join(", ")}\nHome stays pinned beside your groups. × closes the focused pane.${activities.length ? "\n" + [...new Set(activities)].join(", ") : ""}`;
+  el.dataset.tabColor = decoration.color;
+  el.dataset.tabFill = decoration.fill;
+  el.style.setProperty(
+    "--tab-font",
+    fonts[decoration.font]?.family || "var(--terminal-font)",
+  );
+  el.classList.toggle("has-new-output", activities.includes("New output"));
+  el.innerHTML = `<button data-tab="${t.id}" role="tab" aria-selected="${focused}" title="${esc(title)}"><span class="home-mark" role="img" aria-label="Home: ${esc(label)}">⌂</span><span class="node-dot ${t.status === "Connected" ? "online" : ""}"></span><span class="tab-copy"><span class="tab-name" aria-hidden="true">${esc(label)}</span></span></button><button data-session-menu="${t.id}" aria-label="Session actions for ${esc(t.session)}" title="Session actions">...</button><button data-close="${t.id}" aria-label="Close ${esc(t.server.name)} focused pane">×</button>`;
 }
 function renderClipboard() {
   const t = currentTab();
@@ -1239,11 +1318,21 @@ function groupDialog() {
     );
     return;
   }
-  const ids = paneGroups.members(t.id);
+  const inHome = paneGroups.inHome(t.id);
+  const ids = inHome ? [] : paneGroups.members(t.id);
   const others = paneGroups.entries().filter((g) => !g.ids.includes(t.id));
+  const homeAction = paneGroups.canLeaveHome(t.id)
+    ? '<button data-home-move="out">↗ Move out of Home</button>'
+    : staticMode && paneGroups.canHome(t.id)
+      ? '<button data-home-move="in">⌂ Move to Home</button>'
+      : "";
   dialog(
     "Terminal groups",
     `<p>Choose terminals to group, or drag one tab onto another.</p>${
+      homeAction
+        ? `<h3>Home</h3><div class="group-choices">${homeAction}</div>`
+        : ""
+    }${
       ids.length > 1
         ? `<h3>This group · ${ids.length} panes</h3><div class="group-choices">${ids
             .map((id) => {
@@ -1259,6 +1348,14 @@ function groupDialog() {
       (b.onclick = () => {
         $("#dialog").close();
         paneGroups.detach(b.dataset.separate);
+      }),
+  );
+  $$("[data-home-move]").forEach(
+    (b) =>
+      (b.onclick = () => {
+        $("#dialog").close();
+        if (b.dataset.homeMove === "in") paneGroups.toHome(t.id);
+        else paneGroups.fromHome(t.id);
       }),
   );
   $$("[data-merge]").forEach(
@@ -1747,6 +1844,13 @@ function appearanceDialog() {
       }),
   );
 }
+// Records, as the attach command is built, whether it ignores size: only a
+// task-bound attach-session does (new-session never carries the flag).
+function attachFlags(t, resumeOnly) {
+  const options = attachOptions(t.task);
+  t.attachIgnoresSize = options.ignoreSize && !!resumeOnly;
+  return options;
+}
 function tmuxCommand(name, path, resumeOnly = false, cwd = "", options = {}) {
   return (
     "exec " +
@@ -1839,7 +1943,8 @@ async function connect(
       session,
       resumeOnly: !!options.resumeOnly,
       target: options.target,
-      task: normalizeTaskRef(options.task) || undefined,
+      // A replacement keeps its binding (and the helper role) and its place.
+      task: bindingOf(options.task ?? options.replace?.task) || undefined,
       wasConnected: false,
       retryCount: 0,
       lastError: "",
@@ -1850,6 +1955,14 @@ async function connect(
       status: "Connecting",
       send: null,
     };
+    // TailOS only: the helper and new owner terminals land in home.
+    t.home =
+      staticMode &&
+      homePlacement({
+        binding: t.task,
+        role: options.role,
+        saved: options.home ?? options.replace?.home,
+      });
     let initialDone;
     t.initialReady = new Promise((resolve) => {
       initialDone = resolve;
@@ -2007,7 +2120,7 @@ async function connect(
                 t.wasConnected || options.resumeOnly,
                 t.target,
                 "",
-                { ignoreSize: !!t.task },
+                attachFlags(t, t.wasConnected || options.resumeOnly),
               )
             : "",
           onData: (d) => {
@@ -2098,7 +2211,7 @@ async function connect(
                     server.tmuxPath,
                     options.resumeOnly,
                     options.cwd || "",
-                    { ignoreSize: !!t.task },
+                    attachFlags(t, options.resumeOnly),
                   ),
                 ),
               );
@@ -2121,7 +2234,7 @@ async function connect(
                     server.tmuxPath,
                     options.resumeOnly,
                     options.cwd || "",
-                    { ignoreSize: !!t.task },
+                    attachFlags(t, options.resumeOnly),
                   ),
                 ),
               );
@@ -2177,7 +2290,7 @@ function openStandardSSH(t, ready, error, update) {
       tmux,
       session,
       resumeOnly: t.resumeOnly,
-      ignoreSize: !!t.task,
+      ignoreSize: attachFlags(t, t.resumeOnly).ignoreSize,
       rows: term.rows,
       cols: term.cols,
     });
