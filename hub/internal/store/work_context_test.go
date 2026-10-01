@@ -308,16 +308,22 @@ func TestAgentWorkItemContextAdmissionRestorationAndReplacement(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err = s.PostMessage(ctx, task.ID, api.PostMessageRequest{Text: "UNRELATED DIRECT MESSAGE", To: worker.ID}, by); err != nil {
+	// A message addressed to the worker reaches it whether or not it links
+	// the item (#11759); unlinked board-wide traffic stays out of its inbox.
+	direct, err := s.PostMessage(ctx, task.ID, api.PostMessageRequest{Text: "UNRELATED DIRECT MESSAGE", To: worker.ID}, by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = s.PostMessage(ctx, task.ID, api.PostMessageRequest{Text: "UNRELATED BOARD MESSAGE"}, by); err != nil {
 		t.Fatal(err)
 	}
 	inbox, err := s.ListMessages(ctx, task.ID, worker.ReadUpTo, worker.ID, 50)
-	if err != nil || len(inbox) != 1 || inbox[0].Seq != relevant.Seq {
+	if err != nil || len(inbox) != 2 || inbox[0].Seq != relevant.Seq || inbox[1].Seq != direct.Seq {
 		t.Fatalf("bound inbox leaked or lost messages: %+v %v", inbox, err)
 	}
 	workerNow, err := s.GetAgent(ctx, worker.ID)
-	if err != nil || workerNow.Unread != 0 {
-		t.Fatalf("bound unread count included unrelated traffic: %+v %v", workerNow, err)
+	if err != nil || workerNow.Unread != 1 {
+		t.Fatalf("bound unread count missed the direct message or included board traffic: %+v %v", workerNow, err)
 	}
 	if err = s.MarkRead(ctx, task.ID, api.MarkReadRequest{AgentID: worker.ID, UpTo: relevant.Seq}); err != nil {
 		t.Fatal(err)
@@ -352,20 +358,22 @@ func TestAgentWorkItemContextAdmissionRestorationAndReplacement(t *testing.T) {
 		len(answer.WorkItems) != 1 || answer.WorkItems[0].ItemID != item.ID || answer.WorkOrderMessage == nil || *answer.WorkOrderMessage != *orderRef {
 		t.Fatalf("typed answer/replay changed: answer=%+v replay=%+v err=%v", answer, replayedAnswer, err)
 	}
-	if _, err = s.PostMessage(ctx, task.ID, api.PostMessageRequest{Text: "UNRELATED AFTER DECISION", To: worker.ID}, by); err != nil {
+	afterDecision, err := s.PostMessage(ctx, task.ID, api.PostMessageRequest{Text: "UNRELATED AFTER DECISION", To: worker.ID}, by)
+	if err != nil {
 		t.Fatal(err)
 	}
 	allScoped, err := s.ListMessages(ctx, task.ID, worker.ReadUpTo, worker.ID, 50)
-	if err != nil || len(allScoped) != 3 || allScoped[0].Seq != relevant.Seq || allScoped[1].Seq != decision.Seq || allScoped[2].Seq != answer.Seq {
-		t.Fatalf("bound inbox did not retain exact progress/ask/answer evidence: %+v %v", allScoped, err)
+	if err != nil || len(allScoped) != 5 || allScoped[0].Seq != relevant.Seq || allScoped[1].Seq != direct.Seq || allScoped[2].Seq != decision.Seq ||
+		allScoped[3].Seq != answer.Seq || allScoped[4].Seq != afterDecision.Seq {
+		t.Fatalf("bound inbox did not retain exact progress/direct/ask/answer evidence: %+v %v", allScoped, err)
 	}
 	decisionInbox, err := s.ListMessages(ctx, task.ID, decision.Seq, worker.ID, 50)
-	if err != nil || len(decisionInbox) != 1 || decisionInbox[0].Seq != answer.Seq || decisionInbox[0].DecisionAnswer == nil {
+	if err != nil || len(decisionInbox) != 2 || decisionInbox[0].Seq != answer.Seq || decisionInbox[0].DecisionAnswer == nil || decisionInbox[1].Seq != afterDecision.Seq {
 		t.Fatalf("bound decision inbox leaked or lost answer: %+v %v", decisionInbox, err)
 	}
 	workerNow, err = s.GetAgent(ctx, worker.ID)
-	if err != nil || workerNow.Unread != 1 {
-		t.Fatalf("bound decision unread lost answer or counted unrelated: %+v %v", workerNow, err)
+	if err != nil || workerNow.Unread != 2 {
+		t.Fatalf("bound decision unread lost answer or the direct message: %+v %v", workerNow, err)
 	}
 	historyLinks, err := s.ListWorkItemMessages(ctx, task.ID, item.ID, 0, 0, 64)
 	if err != nil {

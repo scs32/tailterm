@@ -1439,47 +1439,75 @@ func (s *Store) insertMessageNormalized(ctx context.Context, tx *sql.Tx, task ap
 	return m, nil
 }
 
-// ListMessages returns messages after seq. When agentID is set, only broadcast
-// messages and messages addressed to that agent are returned.
+// ListMessages returns messages after seq, or the newest page when after is
+// negative. When agentID is set, only what that agent's inbox shows is
+// returned (inboxVisibility).
 func (s *Store) ListMessages(ctx context.Context, taskID string, after int64, agentID string, limit int) ([]api.Message, error) {
+	page := api.MessagePageQuery{After: after, To: agentID, Limit: limit}
+	if after < 0 {
+		page.After, page.Newest = 0, true
+	}
+	return s.ListMessagesPage(ctx, taskID, page)
+}
+
+// inboxVisibility is the one predicate for what an agent's inbox shows, so
+// ListMessages and Unread cannot drift. A message addressed to the agent is
+// always visible, whether or not it links a work item. Board-wide and
+// broadcast messages are visible to an unbound agent, and to an agent bound
+// to a work item only when they link that item.
+func inboxVisibility(agentID string, binding *api.AgentWorkItemBinding) (string, []any) {
+	if binding == nil {
+		return `(m.broadcast=1 OR m.to_agent='' OR m.to_agent=?)`, []any{agentID}
+	}
+	return `(m.to_agent=? OR ((m.broadcast=1 OR m.to_agent='') AND EXISTS (SELECT 1 FROM message_work_item_links item_scope
+WHERE item_scope.message_seq=m.seq AND item_scope.item_task_id=? AND item_scope.item_id=?)))`, []any{agentID, binding.ItemTaskID, binding.ItemID}
+}
+
+// ListMessagesPage returns one page of a task's messages, oldest first:
+// seq in (After, Before) when Before is set, limited to what page.To's inbox
+// shows, and to messages addressed to it when DirectedOnly. Newest selects the
+// newest matching page rather than the oldest.
+func (s *Store) ListMessagesPage(ctx context.Context, taskID string, page api.MessagePageQuery) ([]api.Message, error) {
+	limit := page.Limit
 	if limit <= 0 || limit > api.MaxLimit {
 		limit = api.MaxLimit
 	}
+	if page.After < 0 || page.Before < 0 || (page.DirectedOnly && page.To == "") {
+		return nil, api.ErrInvalid
+	}
 	var binding *api.AgentWorkItemBinding
-	if agentID != "" {
+	if page.To != "" {
 		var runID, agentTaskID string
-		if err := s.db.QueryRowContext(ctx, `SELECT run_id,task_id FROM agents WHERE id=?`, agentID).Scan(&runID, &agentTaskID); err != nil || agentTaskID != taskID {
+		if err := s.db.QueryRowContext(ctx, `SELECT run_id,task_id FROM agents WHERE id=?`, page.To).Scan(&runID, &agentTaskID); err != nil || agentTaskID != taskID {
 			return nil, api.ErrInvalid
 		}
 		var err error
-		binding, err = loadAgentWorkItemBinding(s.db, ctx, agentID, runID)
+		binding, err = loadAgentWorkItemBinding(s.db, ctx, page.To, runID)
 		if err != nil {
 			return nil, err
 		}
 	}
 	q := `SELECT ` + messageSelectCols + ` FROM messages m
-` + messageSelectJoins
-	args := []any{}
-	if binding != nil {
-		q += `
-LEFT JOIN message_work_item_links item_scope ON item_scope.message_seq=m.seq AND item_scope.item_task_id=? AND item_scope.item_id=?`
-		args = append(args, binding.ItemTaskID, binding.ItemID)
-	}
-	q += `
+` + messageSelectJoins + `
 WHERE m.task_id=? AND m.seq>?`
-	args = append(args, taskID, after)
-	if agentID != "" {
-		q += ` AND (broadcast=1 OR to_agent='' OR to_agent=?)`
-		args = append(args, agentID)
+	args := []any{taskID, page.After}
+	if page.Before > 0 {
+		q += ` AND m.seq<?`
+		args = append(args, page.Before)
 	}
-	if binding != nil {
-		q += ` AND (item_scope.message_seq IS NOT NULL OR (m.system_notice_kind='queue_changed' AND m.to_agent=?))`
-		args = append(args, agentID)
+	if page.To != "" {
+		visible, visibleArgs := inboxVisibility(page.To, binding)
+		q += ` AND ` + visible
+		args = append(args, visibleArgs...)
 	}
-	if after < 0 {
-		q += ` ORDER BY seq DESC LIMIT ?`
+	if page.DirectedOnly {
+		q += ` AND m.to_agent=?`
+		args = append(args, page.To)
+	}
+	if page.Newest {
+		q += ` ORDER BY m.seq DESC LIMIT ?`
 	} else {
-		q += ` ORDER BY seq LIMIT ?`
+		q += ` ORDER BY m.seq LIMIT ?`
 	}
 	args = append(args, limit)
 	rows, err := s.db.QueryContext(ctx, q, args...)
@@ -1513,7 +1541,7 @@ WHERE m.task_id=? AND m.seq>?`
 			out[index].WorkOrderMessage = original.WorkOrderMessage
 		}
 	}
-	if after < 0 {
+	if page.Newest {
 		for i, j := 0, len(out)-1; i < j; i, j = i+1, j-1 {
 			out[i], out[j] = out[j], out[i]
 		}
@@ -1556,14 +1584,9 @@ func (s *Store) Unread(ctx context.Context, taskID, agentID string) (int, error)
 	if err != nil {
 		return 0, err
 	}
-	query := `SELECT COUNT(*) FROM messages m`
-	args := []any{}
-	if binding != nil {
-		query += ` JOIN message_work_item_links scope ON scope.message_seq=m.seq AND scope.item_task_id=? AND scope.item_id=?`
-		args = append(args, binding.ItemTaskID, binding.ItemID)
-	}
-	query += ` WHERE m.task_id=? AND m.seq>? AND m.from_agent<>? AND (m.broadcast=1 OR m.to_agent='' OR m.to_agent=?)`
-	args = append(args, taskID, cursor, agentID, agentID)
+	visible, visibleArgs := inboxVisibility(agentID, binding)
+	query := `SELECT COUNT(*) FROM messages m WHERE m.task_id=? AND m.seq>? AND m.from_agent<>? AND ` + visible
+	args := append([]any{taskID, cursor, agentID}, visibleArgs...)
 	var n int
 	err = s.db.QueryRowContext(ctx, query, args...).Scan(&n)
 	return n, err
