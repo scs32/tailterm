@@ -61,7 +61,7 @@ const summary=(n,cost,complete=true)=>({state:n?'measured':'not measured',reques
 const item=(id,title,cost,n=1,complete=true)=>({taskId:open.id,itemId:id,title,summary:summary(n,cost,complete),phases:[{key:'a minor',label:'a minor',summary:summary(n,cost===null?null:1,complete)},{key:'z dominant',label:'z dominant',summary:summary(n,cost===null?null:2,complete)}],roles:[{key:'builder',label:'builder',summary:summary(n,cost,complete)}],models:[{key:'unknown',label:'<img src=x onerror=alert(1)>unknown',summary:summary(n,cost,complete)}],phaseRoles:[]});
 const split=(key,model,tool,waiting)=>({key,modelMs:String(model),toolMs:String(tool),waitingMs:String(waiting)});
 const time={wallMs:'3600000',from:'2026-01-01T10:00:00Z',to:'2026-01-01T11:00:00Z',unmeasuredMs:'0',modelMs:'1920000',toolMs:'1020000',waitingMs:'11460000',agents:[{agentId:'agt_1111111111111111',name:'builder',role:'builder',modelMs:'480000',toolMs:'600000',waitingMs:'2520000',unmeasuredMs:'0',polls:2,pollMs:'3000'}],phases:[split('a minor',480000,120000,3000000),split('z dominant',480000,600000,2520000)],roles:[split('builder',480000,600000,2520000)],phaseRoles:[],timeline:{modelMs:'1680000',toolsOnlyMs:'900000',idleMs:'1020000',unmeasuredMs:'0'},waits:[{cause:'owner',messageSeq:12620,subject:'<b>Approve</b> the matrix <img src=x onerror=alert(1)>',awaitedBy:'builder, reviewer',ms:'5760000'},{cause:'unknown',awaitedBy:'builder',ms:'305000'}],causes:{owner:'5760000',handler:'0',teammate:'0',unknown:'305000'},polls:2,pollMs:'3000'};
-const waitingOnly={...time,wallMs:'600000',modelMs:'0',toolMs:'0',waitingMs:'600000',phases:[split('waiting only',0,0,600000)],roles:[],waits:[],polls:0,pollMs:'0'};
+const waitingOnly={...time,wallMs:'600000',modelMs:'0',toolMs:'0',waitingMs:'600000',phases:[split('waiting only',0,0,600000)],roles:[],timeline:{modelMs:'0',toolsOnlyMs:'0',idleMs:'600000',unmeasuredMs:'0'},waits:[],polls:0,pollMs:'0'};
 const report={version:1,timeVersion:1,projectId:open.id,priceRevision:0,summary:summary(4,3),items:[{...item('wi_1111111111111111','Low',1),time:waitingOnly},{...item('wi_2222222222222222','High',2),time},item('wi_3333333333333333','Not measured',null,0),item('wi_4444444444444444','<b>Unknown model</b>',10,1,false)],overhead:item('','Project overhead',null)};
 let prices={revision:0,rows:[]};window.calls=[];window.pending=[];window.delay=false;window.offline=false;window.oldHub=false;
 const client={listTasks:async()=>[open,closed],getTask:async id=>({task:id===open.id?open:closed,agents:[]}),listTeamDelivery:async()=>({entries:[],concurrencyLimit:1}),listOwnerObligations:async()=>[],capabilities:async()=>({}),subscribe:()=>({stop(){}}),cacheStatus:()=>({label:window.offline?'Saved data · offline':''}),getUsage:async(id,filters)=>{window.calls.push({id,filters});if(window.oldHub){const error=new Error('missing');error.status=404;throw error;}const data=structuredClone({...report,projectId:id});if(window.delay)return await new Promise(resolve=>window.pending.push(()=>resolve(data)));return data;},getUsagePrices:async()=>structuredClone(prices),setUsagePrices:async(id,body)=>{if(body.expectedRevision!==prices.revision){const e=new Error('conflict');e.status=409;throw e;}prices={revision:prices.revision+1,rows:body.rows};return structuredClone(prices);}};
@@ -197,6 +197,14 @@ try {
         "Time not measured",
       );
       assert.equal(await page.locator("[data-usage-time]").count(), 5);
+      if (process.env.USAGE_SCREENSHOT_DIR)
+        await page.screenshot({
+          path: join(
+            process.env.USAGE_SCREENSHOT_DIR,
+            `usage-time-${engine.name()}.png`,
+          ),
+          fullPage: true,
+        });
       // No new control and no new disclosure.
       assert.equal(await page.locator(".project-usage button").count(), 2);
       assert.equal(await high.locator("details").count(), 4);

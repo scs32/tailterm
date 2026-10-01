@@ -43,7 +43,10 @@ type usageTimeMark struct {
 }
 
 type usageTimeTurn struct {
-	Turn    string                   `json:"turn"`
+	Turn string `json:"turn"`
+	// First is the id the turn had before it took its token turns' activation
+	// id. Both are remembered, so a transcript read again emits nothing twice.
+	First   string                   `json:"first,omitempty"`
 	Start   time.Time                `json:"start"`
 	Last    time.Time                `json:"last"`
 	Calls   map[string]usageTimeCall `json:"calls,omitempty"`
@@ -156,8 +159,8 @@ func (u *usageCursor) timeMark(note *usageTimeNote, at time.Time) {
 	if note == nil || t == nil || t.full(at) {
 		return
 	}
-	if len(t.Marks) == 0 && note.Activation != "" && !u.SpanFinished[note.Activation] {
-		t.Turn = note.Activation
+	if len(t.Marks) == 0 && note.Activation != "" && note.Activation != t.Turn && !u.SpanFinished[note.Activation] {
+		t.First, t.Turn = t.Turn, note.Activation
 	}
 	t.Marks = append(t.Marks, usageTimeMark{At: at, ID: note.ID})
 }
@@ -338,7 +341,7 @@ func (u *usageCursor) timeClose(end time.Time, gap string) {
 	if gap != "" {
 		t.addGap(gap)
 	}
-	if !end.After(t.Start) || u.SpanFinished[t.Turn] {
+	if !end.After(t.Start) || u.SpanFinished[t.Turn] || (t.First != "" && u.SpanFinished[t.First]) {
 		return
 	}
 	handled, partial := usageHandled(u.Binding, t.Start, end)
@@ -363,10 +366,13 @@ func (u *usageCursor) timeClose(end time.Time, gap string) {
 		u.Spans[chunk.ID] = chunk
 		u.SpanDirty[chunk.ID] = true
 	}
-	u.SpanFinished[t.Turn] = true
 	if len(u.SpanFinished) > 4096 {
 		u.Coverage = "partial: old turn deduplication retention exhausted"
-		u.SpanFinished = map[string]bool{t.Turn: true}
+		u.SpanFinished = map[string]bool{}
+	}
+	u.SpanFinished[t.Turn] = true
+	if t.First != "" {
+		u.SpanFinished[t.First] = true
 	}
 }
 

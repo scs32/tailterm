@@ -404,6 +404,31 @@ func TestUsageTimeTurnBoundaries(t *testing.T) {
 			t.Fatal(u.Coverage)
 		}
 	})
+	t.Run("a transcript read again emits no turn twice", func(t *testing.T) {
+		u := newSyntheticUsage(t, "claude")
+		// The prompt is a list of text parts: the token ledger names this
+		// activation after its first request, the tracker after the prompt.
+		lines := []string{
+			`{"type":"user","timestamp":"2026-01-01T10:00:00.000Z","message":{"content":[{"type":"text","text":"fixture prompt"}]}}`,
+			`{"type":"assistant","timestamp":"2026-01-01T10:00:02.000Z","message":{"id":"msg_again","model":"fixture-claude-model","stop_reason":"tool_use","content":[{"type":"tool_use","id":"again","name":"Bash","input":{"command":"ls"}}],"usage":{"input_tokens":3,"cache_read_input_tokens":80,"cache_creation_input_tokens":12,"output_tokens":7,"output_tokens_details":{"thinking_tokens":2}}}}`,
+			`{"type":"user","timestamp":"2026-01-01T10:00:05.000Z","message":{"content":[{"type":"tool_result","tool_use_id":"again"}]}}`,
+			`{"type":"assistant","timestamp":"2026-01-01T10:00:09.000Z","message":{"id":"msg_done","model":"fixture-claude-model","stop_reason":"end_turn","usage":{"input_tokens":3,"cache_read_input_tokens":80,"cache_creation_input_tokens":12,"output_tokens":7,"output_tokens_details":{"thinking_tokens":2}}}}`,
+		}
+		parseUsageLines(t, u, lines...)
+		chunks := chunksOf(t, u, "claude-msg_again")
+		if len(u.Spans) != 1 || len(chunks) != 1 || u.Turns["claude-msg_again"].Activation != "claude-msg_again" {
+			t.Fatalf("turn id does not match its token turns: %+v", u.Spans)
+		}
+		if got := totalsOf(chunks); got.tool != 3000 || got.model != 6000 {
+			t.Fatalf("totals %+v", got)
+		}
+		// Uploaded and forgotten, then the file is read from the start again.
+		u.Spans, u.SpanDirty = map[string]api.UsageSpan{}, map[string]bool{}
+		parseUsageLines(t, u, lines...)
+		if len(u.Spans) != 0 {
+			t.Fatalf("turn emitted again: %+v", u.Spans)
+		}
+	})
 	t.Run("open turn is not emitted and survives a restart", func(t *testing.T) {
 		u := newSyntheticUsage(t, "claude")
 		lines := usageTimeFixture(t, "claude-owner-wait.jsonl")
