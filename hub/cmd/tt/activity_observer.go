@@ -101,6 +101,23 @@ type activityCursor struct {
 	// ended with an API error. It is empty after a normal end_turn and is
 	// cleared when a new turn starts.
 	TurnEndReason string `json:"turnEndReason,omitempty"`
+	// Model is the last real model the transcript named. ProviderBlock is the
+	// current run of consecutive provider failures (docs/provider-blocked.md).
+	// ProviderUnsupported records that this hub rejected the provider_blocked
+	// state; later blocks are reported in the legacy form.
+	Model               string               `json:"model,omitempty"`
+	ProviderBlock       *providerBlockCursor `json:"providerBlock,omitempty"`
+	ProviderUnsupported bool                 `json:"providerUnsupported,omitempty"`
+}
+
+// providerBlockCursor holds typed fields only: no provider or transcript text.
+type providerBlockCursor struct {
+	Runtime string    `json:"runtime"`
+	Class   string    `json:"class"`
+	Code    string    `json:"code,omitempty"`
+	Status  int       `json:"status,omitempty"`
+	Since   time.Time `json:"since"`
+	Count   int       `json:"count"`
 }
 
 type activityThresholds struct {
@@ -112,6 +129,9 @@ type activityThresholds struct {
 	// WakeStuck is how long a Claude wake may stay unconfirmed, with unread
 	// input, before the agent is reported stuck.
 	WakeStuck time.Duration
+	// ProviderRepeat is how many failed turns in a row make a rate-limited or
+	// server-error provider failure a block. Values below 2 mean 2.
+	ProviderRepeat int
 }
 
 func activityDefaults() activityThresholds {
@@ -126,7 +146,11 @@ func activityDefaults() activityThresholds {
 	if err != nil || calls < 2 || calls > 100 {
 		calls = 5
 	}
-	return activityThresholds{seconds("TAILTERM_ACTIVITY_WORKING_SECONDS", 120), seconds("TAILTERM_ACTIVITY_HUNG_SECONDS", 600), seconds("TAILTERM_ACTIVITY_LOOP_SECONDS", 300), calls, seconds("TAILTERM_ACTIVITY_CRASH_PROBE_SECONDS", 15), seconds("TAILTERM_ACTIVITY_WAKE_STUCK_SECONDS", 180)}
+	repeat, err := strconv.Atoi(os.Getenv("TAILTERM_ACTIVITY_PROVIDER_REPEAT"))
+	if err != nil || repeat < 2 || repeat > 20 {
+		repeat = 2
+	}
+	return activityThresholds{seconds("TAILTERM_ACTIVITY_WORKING_SECONDS", 120), seconds("TAILTERM_ACTIVITY_HUNG_SECONDS", 600), seconds("TAILTERM_ACTIVITY_LOOP_SECONDS", 300), calls, seconds("TAILTERM_ACTIVITY_CRASH_PROBE_SECONDS", 15), seconds("TAILTERM_ACTIVITY_WAKE_STUCK_SECONDS", 180), repeat}
 }
 
 func activityTranscript(b runtimeBinding) (string, error) {
@@ -196,6 +220,7 @@ func readActivityAppend(path string, c *activityCursor, parse func([]byte, *acti
 		c.Completed = nil
 		c.SeenTurn, c.TurnComplete, c.TurnEndReason = false, false, ""
 		c.ClaudeQueued, c.ClaudeQueuedAt = 0, time.Time{}
+		c.Model, c.ProviderBlock = "", nil
 		if c.ClaudeUsage == nil {
 			c.ClaudeUsage = map[string]api.TokenTotals{}
 		}
@@ -332,6 +357,98 @@ func finishActivityCall(c *activityCursor, id string, now time.Time) {
 	}
 }
 
+var (
+	providerModelName   = regexp.MustCompile(`^[A-Za-z0-9._:-]{1,64}$`)
+	codexProviderStatus = regexp.MustCompile(`^unexpected status ([0-9]{3})\b`)
+)
+
+// noteProviderModel keeps the last well-formed model name. Claude Code's
+// "<synthetic>" API-error records and anything malformed are ignored.
+func noteProviderModel(c *activityCursor, model string) {
+	if providerModelName.MatchString(model) {
+		c.Model = model
+	}
+}
+
+// providerStatusClass maps an HTTP status to a provider block class, or "".
+func providerStatusClass(status int) string {
+	switch {
+	case status == 401 || status == 403:
+		return api.ProviderBlockAuth
+	case status == 429:
+		return api.ProviderBlockRateLimited
+	case status >= 500 && status <= 599:
+		return api.ProviderBlockServerError
+	}
+	return ""
+}
+
+// claudeProviderClass classifies a Claude Code API-error record from its typed
+// fields. The text is only compared with fixed prefixes: a rate_limit error
+// that starts with one of them is an account usage limit, not a passing 429.
+func claudeProviderClass(code string, status int, text string) string {
+	switch code {
+	case "authentication_failed":
+		return api.ProviderBlockAuth
+	case "rate_limit":
+		for _, prefix := range []string{"You've reached your", "You've hit your", "You\u2019ve reached your", "You\u2019ve hit your"} {
+			if strings.HasPrefix(text, prefix) {
+				return api.ProviderBlockUsageLimit
+			}
+		}
+		return api.ProviderBlockRateLimited
+	case "server_error", "overloaded", "overloaded_error":
+		return api.ProviderBlockServerError
+	}
+	return providerStatusClass(status)
+}
+
+// codexProviderClass classifies a Codex task_complete error message of the
+// form "unexpected status NNN ...". Only the status is taken from it.
+func codexProviderClass(message string) (string, int) {
+	m := codexProviderStatus.FindStringSubmatch(message)
+	if m == nil {
+		return "", 0
+	}
+	status, _ := strconv.Atoi(m[1])
+	return providerStatusClass(status), status
+}
+
+// noteProviderFailure records one failed turn. The same class again extends
+// the block and keeps its since; a different class starts a new one.
+func noteProviderFailure(c *activityCursor, runtime, class, code string, status int, at time.Time) {
+	if !claudeAPIErrorCode.MatchString(code) {
+		code = ""
+	}
+	if status < 400 || status > 599 {
+		status = 0
+	}
+	if b := c.ProviderBlock; b != nil && b.Class == class {
+		b.Count++
+		b.Code, b.Status = code, status
+		return
+	}
+	c.ProviderBlock = &providerBlockCursor{Runtime: runtime, Class: class, Code: code, Status: status, Since: at, Count: 1}
+}
+
+// reportableProviderBlock is the block to report, or nil. A usage limit or an
+// authentication failure blocks at once; a rate limit or server error only
+// after the repeat threshold of failed turns in a row.
+func reportableProviderBlock(c *activityCursor, threshold activityThresholds) *api.ProviderBlock {
+	b := c.ProviderBlock
+	if b == nil {
+		return nil
+	}
+	if b.Class != api.ProviderBlockUsageLimit && b.Class != api.ProviderBlockAuth && b.Count < max(threshold.ProviderRepeat, 2) {
+		return nil
+	}
+	model := c.Model
+	if model == "" {
+		model = "unknown"
+	}
+	return &api.ProviderBlock{Provider: api.ProviderForRuntime(b.Runtime), Runtime: b.Runtime, Model: model, Class: b.Class, Code: b.Code, Status: b.Status, Since: b.Since}
+}
+
 func parseCodexActivity(line []byte, c *activityCursor) error {
 	if len(line) == 0 {
 		return nil
@@ -348,18 +465,32 @@ func parseCodexActivity(line []byte, c *activityCursor) error {
 		CallID    string          `json:"call_id"`
 		Arguments json.RawMessage `json:"arguments"`
 		Input     json.RawMessage `json:"input"`
+		Role      string          `json:"role"`
+		Model     string          `json:"model"`
 		Info      struct {
 			Total json.RawMessage `json:"total_token_usage"`
 		} `json:"info"`
+		Error *struct {
+			Info    json.RawMessage `json:"codex_error_info"`
+			Message string          `json:"message"`
+		} `json:"error"`
 	}
 	_ = json.Unmarshal(rec.Payload, &p)
 	switch rec.Type {
 	case "event_msg":
 		switch p.Type {
 		case "task_started":
-			c.SeenTurn, c.TurnComplete = true, false
+			c.SeenTurn, c.TurnComplete, c.TurnEndReason = true, false, ""
 		case "task_complete":
-			c.SeenTurn, c.TurnComplete = true, true
+			c.SeenTurn, c.TurnComplete, c.TurnEndReason = true, true, ""
+			if p.Error == nil {
+				c.ProviderBlock = nil
+			} else if class, status := codexProviderClass(p.Error.Message); class != "" {
+				var code string
+				_ = json.Unmarshal(p.Error.Info, &code)
+				noteProviderFailure(c, "codex", class, code, status, now)
+				c.TurnEndReason = "turn ended by provider error (" + class + ")"
+			}
 		case "token_count":
 			u := p.Info.Total
 			c.TokensVerified = true
@@ -369,6 +500,11 @@ func parseCodexActivity(line []byte, c *activityCursor) error {
 			}
 		}
 	case "response_item":
+		// Model output is evidence the provider answered. Prompts are recorded
+		// as response items too, and a new prompt alone clears nothing.
+		if p.Role != "user" && p.Role != "developer" && p.Role != "system" {
+			c.ProviderBlock = nil
+		}
 		switch p.Type {
 		case "function_call", "custom_tool_call":
 			if p.CallID == "" {
@@ -386,10 +522,13 @@ func parseCodexActivity(line []byte, c *activityCursor) error {
 			finishActivityCall(c, p.CallID, now)
 		}
 	case "task_started":
-		c.SeenTurn, c.TurnComplete = true, false
+		c.SeenTurn, c.TurnComplete, c.TurnEndReason = true, false, ""
 	case "task_complete":
-		c.SeenTurn, c.TurnComplete = true, true
-	case "session_meta", "turn_context":
+		c.SeenTurn, c.TurnComplete, c.TurnEndReason = true, true, ""
+		c.ProviderBlock = nil
+	case "turn_context":
+		noteProviderModel(c, p.Model)
+	case "session_meta":
 	default:
 		return fmt.Errorf("unknown Codex record type %q", rec.Type)
 	}
@@ -458,10 +597,12 @@ func parseClaudeActivity(line []byte, c *activityCursor) error {
 	c.LastEventAt = now
 	var msg struct {
 		ID      string `json:"id"`
+		Model   string `json:"model"`
 		Content []struct {
 			Type      string          `json:"type"`
 			ID        string          `json:"id"`
 			Name      string          `json:"name"`
+			Text      string          `json:"text"`
 			Input     json.RawMessage `json:"input"`
 			ToolUseID string          `json:"tool_use_id"`
 		} `json:"content"`
@@ -471,6 +612,28 @@ func parseClaudeActivity(line []byte, c *activityCursor) error {
 	switch rec.Type {
 	case "assistant":
 		c.SeenTurn, c.TurnComplete, c.TurnEndReason = true, false, ""
+		var apiError struct {
+			IsAPIError bool   `json:"isApiErrorMessage"`
+			Error      string `json:"error"`
+			Status     int    `json:"apiErrorStatus"`
+		}
+		_ = json.Unmarshal(line, &apiError)
+		if !apiError.IsAPIError {
+			// An ordinary assistant record is evidence the provider answered.
+			c.ProviderBlock = nil
+			noteProviderModel(c, msg.Model)
+		} else {
+			var text string
+			for _, part := range msg.Content {
+				if part.Type == "text" {
+					text = part.Text
+					break
+				}
+			}
+			if class := claudeProviderClass(apiError.Error, apiError.Status, text); class != "" {
+				noteProviderFailure(c, "claude", class, apiError.Error, apiError.Status, now)
+			}
+		}
 		if msg.ID != "" && len(msg.Usage) > 0 {
 			if c.ClaudeUsage == nil {
 				c.ClaudeUsage = map[string]api.TokenTotals{}

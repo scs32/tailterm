@@ -27,17 +27,24 @@ CREATE TABLE IF NOT EXISTS agent_activity_receipts (
 	}
 	// Chained here because its index needs the agents.role column, which the
 	// column migrations add after the phase-3 chain runs.
-	return migrateOwnerHelper(db)
+	if err := migrateOwnerHelper(db); err != nil {
+		return err
+	}
+	return migrateProviderBlock(db)
 }
 
 func validActivity(a api.AgentActivity) bool {
 	switch a.State {
-	case "working", "hung_tool", "finished_silent", "crashed", "looping", "idle", "unknown", "runtime_prompt", "stuck":
+	case "working", "hung_tool", "finished_silent", "crashed", "looping", "idle", "unknown", "runtime_prompt", "stuck", "provider_blocked":
 	default:
 		return false
 	}
 	// A prompt belongs to runtime_prompt and nowhere else.
 	if (a.State == "runtime_prompt") != (a.Prompt != nil) || (a.Prompt != nil && !a.Prompt.Valid()) {
+		return false
+	}
+	// A provider block belongs to provider_blocked and nowhere else.
+	if (a.State == "provider_blocked") != (a.Provider != nil) || (a.Provider != nil && !a.Provider.Valid()) {
 		return false
 	}
 	if a.ObservedAt.IsZero() || len(a.PendingTool) > 120 || len(a.Reason) > 240 || strings.ContainsAny(a.PendingTool+a.Reason, "\n\r") {
@@ -111,7 +118,7 @@ func (s *Store) ReportActivity(ctx context.Context, task, agent string, report a
 	}
 	// The reason is compared too, so an idle report whose reason becomes an
 	// API-error rate limit is stored and reaches the handler arm hook.
-	if oldState == report.Activity.State && oldActivity.Reason == report.Activity.Reason && sameWakeOutcome(oldActivity.Wake, report.Activity.Wake) && sameRuntimePrompt(oldActivity.Prompt, report.Activity.Prompt) {
+	if oldState == report.Activity.State && oldActivity.Reason == report.Activity.Reason && sameWakeOutcome(oldActivity.Wake, report.Activity.Wake) && sameRuntimePrompt(oldActivity.Prompt, report.Activity.Prompt) && api.SameProviderBlock(oldActivity.Provider, report.Activity.Provider) {
 		var saved api.AgentActivity
 		if json.Unmarshal([]byte(oldPayload), &saved) != nil {
 			return zero, api.ErrConflict
@@ -135,6 +142,9 @@ func (s *Store) ReportActivity(ctx context.Context, task, agent string, report a
 		return zero, err
 	}
 	if err := s.armLimitHook(ctx, tx, task, agent, run, report.Activity); err != nil {
+		return zero, err
+	}
+	if err := s.providerBlockHook(ctx, tx, task, agent, run, report.Activity); err != nil {
 		return zero, err
 	}
 	if err = tx.Commit(); err != nil {

@@ -707,3 +707,51 @@ func TestBlockOnQueuedFixIsNotEscalatedToOwner(t *testing.T) {
 		}
 	})
 }
+
+// Provider blocks (wi_72f41bd375032cf0): Tick runs the owner-notice sweep,
+// in a paused project too, and a second tick posts nothing more.
+func TestBrokerProviderBlockSweep(t *testing.T) {
+	for _, paused := range []bool{false, true} {
+		t.Run(fmt.Sprintf("paused=%v", paused), func(t *testing.T) {
+			f := newFixture(t)
+			since := time.Now().UTC().Add(-time.Minute)
+			block := api.AgentActivity{State: "provider_blocked", ObservedAt: time.Now().UTC(),
+				Provider: &api.ProviderBlock{Provider: "openai", Runtime: "codex", Model: "gpt-6-astra", Class: "auth", Code: "other", Status: 401, Since: since}}
+			if _, err := f.st.ReportActivity(f.ctx, f.task.ID, f.builder.ID, api.ActivityReport{RequestID: "blocked-1", RunID: f.builder.RunID, Activity: block}); err != nil {
+				t.Fatal(err)
+			}
+			if paused {
+				targets := []api.ProjectPauseTargetRequest{{AgentID: f.lead.ID, RunID: f.lead.RunID, ServiceDisposition: api.PauseServiceNone}, {AgentID: f.builder.ID, RunID: f.builder.RunID, ServiceDisposition: api.PauseServiceNone}}
+				if _, err := f.st.PauseProject(f.ctx, f.task.ID, api.PauseProjectRequest{Version: 1, RequestID: "pause-for-sweep", Targets: targets}, f.by); err != nil {
+					t.Fatal(err)
+				}
+			}
+			b := &Broker{Store: f.st}
+			owner := func() (n int) {
+				t.Helper()
+				msgs, err := f.st.ListMessages(f.ctx, f.task.ID, 0, "", 500)
+				if err != nil {
+					t.Fatal(err)
+				}
+				for _, m := range msgs {
+					if m.From.Node == api.BrokerNode && m.To == "" && m.Envelope != nil && m.Envelope.Subject == "An agent is blocked by its provider and needs the owner" {
+						if !strings.Contains(m.Envelope.Body.Text, "openai auth") {
+							t.Fatalf("notice text %q", m.Envelope.Body.Text)
+						}
+						n++
+					}
+				}
+				return n
+			}
+			if _, err := b.Tick(f.ctx, time.Now().Add(10*time.Second)); err != nil || owner() != 0 {
+				t.Fatalf("inside the grace period: %v notices=%d", err, owner())
+			}
+			if _, err := b.Tick(f.ctx, time.Now().Add(2*time.Minute)); err != nil || owner() != 1 {
+				t.Fatalf("after the grace period: %v notices=%d", err, owner())
+			}
+			if _, err := b.Tick(f.ctx, time.Now().Add(3*time.Minute)); err != nil || owner() != 1 {
+				t.Fatalf("second tick: %v notices=%d", err, owner())
+			}
+		})
+	}
+}

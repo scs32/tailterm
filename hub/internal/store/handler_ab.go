@@ -603,8 +603,8 @@ func loadArmLimits(ctx context.Context, q queryRower, task string, openOnly bool
 
 // armActivity is a run's latest stored activity.
 type armActivity struct {
-	state, reason, promptKind, promptOutcome string
-	observedAt                               time.Time
+	state, reason, promptKind, promptOutcome, providerClass string
+	observedAt                                              time.Time
 }
 
 func loadArmActivity(ctx context.Context, q queryRower, agentID, runID string) (*armActivity, bool, error) {
@@ -634,6 +634,9 @@ func activityForArm(a api.AgentActivity) *armActivity {
 	if a.Prompt != nil {
 		out.promptKind, out.promptOutcome = a.Prompt.Kind, a.Prompt.Outcome
 	}
+	if a.Provider != nil {
+		out.providerClass = a.Provider.Class
+	}
 	return out
 }
 
@@ -650,6 +653,11 @@ func armLimitSignal(runtime string, a *armActivity) string {
 			return api.HandlerArmSourceCodexUsageLimit
 		}
 	case "claude":
+		// The provider_blocked form (docs/provider-blocked.md), or the turn-end
+		// reason an older relay sends and a single rate-limited turn still has.
+		if a.state == "provider_blocked" && (a.providerClass == api.ProviderBlockUsageLimit || a.providerClass == api.ProviderBlockRateLimited) {
+			return api.HandlerArmSourceClaudeRateLimit
+		}
 		if (a.state == "idle" || a.state == "finished_silent") && a.reason == api.ClaudeRateLimitReason {
 			return api.HandlerArmSourceClaudeRateLimit
 		}
@@ -683,7 +691,7 @@ func episodeClears(ep api.HandlerArmLimit, latest *armActivity, runOpen bool, no
 	if latest == nil || !latest.observedAt.After(ep.LastSignalAt) {
 		return true, api.HandlerArmClearHoldExpiredNoReport
 	}
-	if (latest.state == "idle" || latest.state == "finished_silent") && latest.reason != api.ClaudeRateLimitReason {
+	if (latest.state == "idle" || latest.state == "finished_silent") && armLimitSignal("claude", latest) == "" {
 		return true, api.HandlerArmClearHoldExpiredClean
 	}
 	return false, ""

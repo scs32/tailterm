@@ -5,10 +5,10 @@ import { createServer } from "vite";
 
 const html = `<!doctype html><html><head><link rel="stylesheet" href="/client/style.css"><link rel="stylesheet" href="/client/work-items.css"></head><body><main id="projects"></main><script type="module">
 import {createTasksView} from '/client/tasks-view.js';
-const states=['working','hung_tool','finished_silent','crashed','looping','idle','unknown','runtime_prompt','runtime_prompt','stuck'];
+const states=['working','hung_tool','finished_silent','crashed','looping','idle','unknown','runtime_prompt','runtime_prompt','stuck','provider_blocked'];
 const prompts={7:{kind:'claude_permission',runtime:'claude',action:'escalate',outcome:'escalated'},8:{kind:'codex_rate_limit_switch',runtime:'codex',action:'keep_current_never_show',outcome:'confirmed',reason:'selected the policy option'}};
 const task={id:'tsk_1111111111111111',name:'Synthetic activity project',goal:'Synthetic only',status:'open',createdAt:'2026-09-25T20:00:00Z'};
-const agents=states.map((state,i)=>({id:'agt_'+String(i+1).padStart(16,'0'),name:'member-'+i,host:'fixture.invalid',session:'fake',status:'running',runId:'run_'+String(i+1).padStart(16,'0'),lastSeenAt:'2026-09-25T20:00:00Z',createdAt:'2026-09-25T20:00:00Z',activity:{state,observedAt:new Date().toISOString(),pendingTool:state==='hung_tool'?'exec_command':'',reason:state==='stuck'?'pane 16x1 below minimum 80x24':undefined,wake:state==='idle'?{status:'skipped',reason:'Claude input is occupied',messageSeqs:[41]}:undefined,prompt:prompts[i],tokens:{total:100+i}}}));
+const agents=states.map((state,i)=>({id:'agt_'+String(i+1).padStart(16,'0'),name:'member-'+i,host:'fixture.invalid',session:'fake',status:'running',runId:'run_'+String(i+1).padStart(16,'0'),lastSeenAt:'2026-09-25T20:00:00Z',createdAt:'2026-09-25T20:00:00Z',activity:{state,observedAt:new Date().toISOString(),pendingTool:state==='hung_tool'?'exec_command':'',reason:state==='stuck'?'pane 16x1 below minimum 80x24':undefined,wake:state==='idle'?{status:'skipped',reason:'Claude input is occupied',messageSeqs:[41]}:undefined,prompt:prompts[i],provider:state==='provider_blocked'?{provider:'anthropic',runtime:'claude',model:'claude-fable-5-1',class:'usage_limit',code:'rate_limit',status:429,since:'2026-09-26T18:53:10Z'}:undefined,tokens:{total:100+i}}}));
 const queue={concurrencyLimit:1,entries:[{itemId:'wi_1111111111111111',state:'running',ownership:['synthetic'],activities:agents.map(a=>({agentId:a.id,name:a.name,activity:a.activity})),tokens:{total:721}}]};
 const client={listTasks:async()=>[task],getTask:async()=>({task,agents}),listTeamDelivery:async()=>queue,capabilities:async()=>({}),subscribe:()=>({stop(){}})};
 const view=createTasksView({client:()=>client,taskHub:{hasPendingResume:()=>false,groupOf:()=>null},getTabs:()=>[],activate:()=>{},notice:()=>{},confirm:async()=>true,openBoard:()=>{},openWorkItems:()=>{},configure:()=>{}});
@@ -31,7 +31,13 @@ try {
       await page.evaluate(()=>window.ready);
       await page.locator('[data-team-toggle]').click();
       const roster=await page.locator('[data-team-roster]').innerText();
-      for(const state of ["Working","Hung tool","Finished silently","Crashed","Looping","Idle","Unknown","Runtime prompt","Stuck"]) assert.match(roster,new RegExp(state));
+      for(const state of ["Working","Hung tool","Finished silently","Crashed","Looping","Idle","Unknown","Runtime prompt","Stuck","Provider blocked"]) assert.match(roster,new RegExp(state));
+      const blocked=await page.locator('[data-task-agent]').nth(10).getAttribute('title');
+      assert.match(blocked,/ · Provider blocked: Anthropic usage limit · claude-fable-5-1 · since \d\d:\d\d · observed/);
+      assert.doesNotMatch(blocked,/Stuck|Hung tool/);
+      assert.match(await page.locator('[data-task-agent]').nth(10).innerText(),/Provider blocked/);
+      for(const stalled of [1,9]) assert.doesNotMatch(await page.locator('[data-task-agent]').nth(stalled).getAttribute('title'),/Provider blocked|Anthropic/);
+      assert.match(await page.locator('[data-task-agent]').nth(1).getAttribute('title'),/ · Hung tool · exec_command/);
       assert.match(await page.locator('[data-task-agent]').nth(9).getAttribute('title'),/Stuck: pane 16x1 below minimum 80x24 · observed/);
       assert.match(await page.locator('[data-task-agent]').nth(7).getAttribute('title'),/Runtime prompt · Claude permission dialog: ask the owner · escalated/);
       assert.match(await page.locator('[data-task-agent]').nth(8).getAttribute('title'),/Runtime prompt · Codex rate-limit menu: keep current model, never show again · confirmed \(selected the policy option\)/);

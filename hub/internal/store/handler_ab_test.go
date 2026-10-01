@@ -1150,3 +1150,68 @@ func TestHandlerABReportSyntheticFixture(t *testing.T) {
 		t.Fatalf("limits %d policy %d", len(report.Limits), report.Policy.Revision)
 	}
 }
+
+// Provider blocks (wi_72f41bd375032cf0): a Claude handler's provider_blocked
+// usage limit is the same arm limit signal as the turn-end reason an older
+// relay sends, and other block classes are not.
+func TestHandlerArmLimitProviderBlockedSignal(t *testing.T) {
+	block := func(class string, since time.Time) api.AgentActivity {
+		return api.AgentActivity{State: "provider_blocked", Provider: &api.ProviderBlock{Provider: "anthropic", Runtime: "claude", Model: armS.Model, Class: class, Code: "rate_limit", Status: 429, Since: since}}
+	}
+	limited := func(f *armFixture) bool {
+		t.Helper()
+		set, err := limitedArms(context.Background(), f.s.db, f.task.ID, f.clock)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return set["S"]
+	}
+	for _, class := range []string{api.ProviderBlockUsageLimit, api.ProviderBlockRateLimited} {
+		f := newArmFixture(t, 0)
+		f.policy(t, "enable", 0, true, false, "K")
+		start := f.clock
+		f.report(t, f.hS, "idle", api.AgentActivity{State: "idle"})
+		f.report(t, f.hS, "blocked-1", block(class, start))
+		if !limited(f) || f.notices(t, limitSubject) != 1 {
+			t.Fatalf("%s did not open an episode", class)
+		}
+		var source string
+		if err := f.s.db.QueryRow(`SELECT source FROM handler_arm_limit_episodes`).Scan(&source); err != nil || source != api.HandlerArmSourceClaudeRateLimit {
+			t.Fatalf("source %q %v", source, err)
+		}
+		// The existing hold rules apply unchanged: a working report does not
+		// clear the limit, in the hold or after it.
+		f.clock = start.Add(5 * time.Minute)
+		f.report(t, f.hS, "working", api.AgentActivity{State: "working"})
+		f.clock = start.Add(61 * time.Minute)
+		if !limited(f) {
+			t.Fatalf("%s cleared by a working report", class)
+		}
+		// A clean completed turn after the hold clears it.
+		f.report(t, f.hS, "clean", api.AgentActivity{State: "idle"})
+		if limited(f) || f.notices(t, availableSubject) != 1 {
+			t.Fatalf("%s did not clear after a clean turn", class)
+		}
+		// The legacy reason form still opens an episode.
+		f.clock = start.Add(3 * time.Hour)
+		f.report(t, f.hS, "legacy", api.AgentActivity{State: "idle", Reason: api.ClaudeRateLimitReason})
+		if !limited(f) || f.notices(t, limitSubject) != 2 {
+			t.Fatalf("legacy reason form did not open an episode")
+		}
+	}
+	// An authentication or server-error block is not a provider limit.
+	f := newArmFixture(t, 0)
+	f.policy(t, "enable", 0, true, false, "K")
+	for _, class := range []string{api.ProviderBlockAuth, api.ProviderBlockServerError} {
+		f.report(t, f.hS, "blocked-"+class, block(class, f.clock))
+		if limited(f) || f.notices(t, limitSubject) != 0 {
+			t.Fatalf("%s opened a limit episode", class)
+		}
+	}
+	// A Codex handler's provider block is not the Codex usage-limit prompt.
+	codexBlock := api.AgentActivity{State: "provider_blocked", Provider: &api.ProviderBlock{Provider: "openai", Runtime: "codex", Model: armO.Model, Class: api.ProviderBlockRateLimited, Status: 429, Since: f.clock}}
+	f.report(t, f.hO, "codex-blocked", codexBlock)
+	if n := countRows(t, f.s, `SELECT count(*) FROM handler_arm_limit_episodes`); n != 0 {
+		t.Fatalf("codex block opened %d episodes", n)
+	}
+}

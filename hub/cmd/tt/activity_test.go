@@ -940,6 +940,9 @@ type stuckHub struct {
 	t           *testing.T
 	agent       api.Agent
 	rejectStuck bool
+	// rejectState answers 400 to one more state; rejected counts those.
+	rejectState string
+	rejected    int
 	reports     []api.AgentActivity
 	seen        map[string]bool
 }
@@ -958,6 +961,11 @@ func (h *stuckHub) serve() *httptest.Server {
 				h.t.Error("invalid report")
 			}
 			if h.rejectStuck && req.Activity.State == "stuck" {
+				http.Error(w, "invalid activity", http.StatusBadRequest)
+				return
+			}
+			if h.rejectState != "" && req.Activity.State == h.rejectState {
+				h.rejected++
 				http.Error(w, "invalid activity", http.StatusBadRequest)
 				return
 			}
@@ -1497,5 +1505,405 @@ func TestActivityReportKeyUpgradeSendsNoBurst(t *testing.T) {
 				t.Fatalf("rate limit after upgrade %+v", h.reports)
 			}
 		})
+	}
+}
+
+// Provider blocks (wi_72f41bd375032cf0, docs/provider-blocked.md).
+
+func providerFixture(t *testing.T, name string) string {
+	t.Helper()
+	data, err := os.ReadFile(filepath.Join("testdata", "provider-blocked", name+".jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(data)
+}
+
+// providerCursor parses the first n records of a fixture (all when n < 0).
+func providerCursor(t *testing.T, runtime, name string, n int) *activityCursor {
+	t.Helper()
+	parse := parseCodexActivity
+	if runtime == "claude" {
+		parse = parseClaudeActivity
+	}
+	c := &activityCursor{}
+	for i, line := range strings.Split(strings.TrimSpace(providerFixture(t, name)), "\n") {
+		if n >= 0 && i >= n {
+			break
+		}
+		if err := parse([]byte(line), c); err != nil {
+			t.Fatalf("%s record %d: %v", name, i, err)
+		}
+	}
+	return c
+}
+
+func providerState(c *activityCursor) api.AgentActivity {
+	return activityState(c, api.Agent{Status: api.AgentRunning}, 0, true, true, nil, time.Date(2026, 9, 26, 20, 0, 0, 0, time.UTC), activityDefaults())
+}
+
+func providerTime(t *testing.T, value string) time.Time {
+	t.Helper()
+	at, err := time.Parse(time.RFC3339Nano, value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return at
+}
+
+func TestActivityProviderBlockedClaude(t *testing.T) {
+	for _, tc := range []struct {
+		fixture, text, class, code string
+		status                     int
+		since                      string
+	}{
+		{"claude-fable-limit", "You've reached your Fable limit. Run /usage-credits to continue or switch models with /model.", "usage_limit", "rate_limit", 429, "2026-09-26T18:53:10Z"},
+		{"claude-session-limit", "You've hit your session limit · resets 3pm (America/Los_Angeles)", "usage_limit", "rate_limit", 429, "2026-09-26T18:53:10Z"},
+		{"claude-login-expired", "Login expired · Please run /login", "auth", "authentication_failed", 0, "2026-09-26T18:53:10Z"},
+	} {
+		t.Run(tc.fixture, func(t *testing.T) {
+			if !strings.Contains(providerFixture(t, tc.fixture), `"text":"`+tc.text+`"`) {
+				t.Fatal("fixture does not carry the exact observed text")
+			}
+			got := providerState(providerCursor(t, "claude", tc.fixture, -1))
+			p := got.Provider
+			if got.State != "provider_blocked" || p == nil {
+				t.Fatalf("state %+v", got)
+			}
+			want := api.ProviderBlock{Provider: "anthropic", Runtime: "claude", Model: "claude-fable-5-1", Class: tc.class, Code: tc.code, Status: tc.status, Since: providerTime(t, tc.since)}
+			if !api.SameProviderBlock(p, &want) || !p.Valid() {
+				t.Fatalf("block %+v, want %+v", *p, want)
+			}
+			if got.Reason != "" {
+				t.Fatalf("reason %q", got.Reason)
+			}
+		})
+	}
+	// The first failed prompt alone already blocks for a usage limit, and the
+	// block ranks above a planned wait and below a crash.
+	c := providerCursor(t, "claude", "claude-fable-limit", 4)
+	if got := providerState(c); got.State != "provider_blocked" || got.Provider.Class != "usage_limit" {
+		t.Fatalf("first record %+v", got)
+	}
+	now := time.Date(2026, 9, 26, 20, 0, 0, 0, time.UTC)
+	if got := activityState(c, api.Agent{Status: api.AgentNeedsInput}, 0, true, true, nil, now, activityDefaults()); got.State != "provider_blocked" {
+		t.Fatalf("needs_input hid the block: %+v", got)
+	}
+	c.MissingSince = now.Add(-time.Minute)
+	if got := activityState(c, api.Agent{Status: api.AgentRunning}, 0, false, false, nil, now, activityDefaults()); got.State != "crashed" || got.Provider != nil {
+		t.Fatalf("crash must outrank the block: %+v", got)
+	}
+	// The server-error text is the fourth observed message; one such turn is
+	// not a block (TestActivityProviderBlockedRepeat covers the rule).
+	if !strings.Contains(providerFixture(t, "claude-server-error"), `"text":"API Error: Server error mid-response. The response above may be incomplete."`) {
+		t.Fatal("server error fixture does not carry the exact observed text")
+	}
+	// Other API errors are not provider blocks and keep idle with a reason.
+	other := strings.Replace(strings.Split(providerFixture(t, "claude-login-expired"), "\n")[3], `"error":"authentication_failed"`, `"error":"invalid_request"`, 1)
+	var plain activityCursor
+	if err := parseClaudeActivity([]byte(other), &plain); err != nil {
+		t.Fatal(err)
+	}
+	if got := providerState(&plain); got.State != "idle" || got.Reason != "turn ended by API error (invalid_request)" || got.Provider != nil {
+		t.Fatalf("invalid_request %+v", got)
+	}
+	// A malformed model name is never forwarded.
+	var bad activityCursor
+	for _, line := range strings.Split(strings.TrimSpace(strings.Replace(providerFixture(t, "claude-login-expired"), `"model":"claude-fable-5-1"`, `"model":"bad model/name"`, 1)), "\n") {
+		if err := parseClaudeActivity([]byte(line), &bad); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := providerState(&bad); got.Provider == nil || got.Provider.Model != "unknown" {
+		t.Fatalf("malformed model %+v", got.Provider)
+	}
+}
+
+func TestActivityProviderBlockedCodex(t *testing.T) {
+	const observed = `unexpected status 401 Unauthorized: Incorrect API key provided: sk-fake-EXAMPLE-not-a-key. You can find your API key at https://platform.openai.com/account/api-keys., url: https://chatgpt.com/backend-api/codex/responses, cf-ray: 0000000000000000-SJC, request id: 00000000-0000-4000-8000-00000000f401`
+	fixture := providerFixture(t, "codex-401")
+	if !strings.Contains(fixture, `"message":"`+observed+`"`) {
+		t.Fatal("fixture does not carry the observed 401 message")
+	}
+	cols, rows := 200, 50
+	stubPaneSize(t, &cols, &rows)
+	b, h, _, tick := stuckFixture(t, "codex")
+	path := filepath.Join(os.Getenv("HOME"), ".codex", "sessions", "2026", "09", "29", "rollout-test-"+b.Thread+".jsonl")
+	if err := os.WriteFile(path, []byte(fixture), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := tick(time.Date(2026, 9, 25, 22, 45, 0, 0, time.UTC)); err != nil {
+		t.Fatal(err)
+	}
+	if len(h.reports) != 1 || h.reports[0].State != "provider_blocked" || h.reports[0].Provider == nil {
+		t.Fatalf("reports %+v", h.reports)
+	}
+	want := api.ProviderBlock{Provider: "openai", Runtime: "codex", Model: "gpt-6-astra", Class: "auth", Code: "other", Status: 401, Since: providerTime(t, "2026-09-25T22:40:03Z")}
+	if p := h.reports[0].Provider; !api.SameProviderBlock(p, &want) || !p.Valid() {
+		t.Fatalf("block %+v, want %+v", *p, want)
+	}
+	report, err := json.Marshal(h.reports[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	cursor, err := os.ReadFile(filepath.Join(relayDir(), bindingKey(b)+".activity.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, data := range map[string][]byte{"report": report, "cursor": cursor} {
+		for _, secret := range []string{"sk-", "Incorrect API key", "cf-ray", "request id", "Unauthorized", "platform.openai.com"} {
+			if strings.Contains(string(data), secret) {
+				t.Fatalf("%s contains %q: %s", name, secret, data)
+			}
+		}
+	}
+	if !strings.Contains(string(cursor), `"providerBlock"`) {
+		t.Fatalf("cursor lost the block: %s", cursor)
+	}
+	// A 403 is the same class.
+	var c activityCursor
+	for _, line := range strings.Split(strings.TrimSpace(strings.ReplaceAll(fixture, "unexpected status 401 Unauthorized", "unexpected status 403 Forbidden")), "\n") {
+		if err := parseCodexActivity([]byte(line), &c); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := providerState(&c); got.State != "provider_blocked" || got.Provider.Class != "auth" || got.Provider.Status != 403 {
+		t.Fatalf("403 %+v", got)
+	}
+}
+
+func TestActivityProviderBlockedRepeat(t *testing.T) {
+	// Claude: prompt, reply, then (prompt, error, turn_duration) twice, then a
+	// prompt and an ordinary reply.
+	one := providerCursor(t, "claude", "claude-server-error", 5)
+	if got := providerState(one); got.State != "idle" || got.Reason != "turn ended by API error (server_error)" || got.Provider != nil {
+		t.Fatalf("one server error %+v", got)
+	}
+	two := providerCursor(t, "claude", "claude-server-error", 8)
+	got := providerState(two)
+	if got.State != "provider_blocked" || got.Provider.Class != "server_error" || got.Provider.Code != "server_error" || got.Provider.Status != 0 || !got.Provider.Since.Equal(providerTime(t, "2026-09-26T18:53:10Z")) || got.Provider.Model != "claude-fable-5-1" {
+		t.Fatalf("second server error %+v %+v", got, got.Provider)
+	}
+	// A new prompt alone does not clear it; an ordinary reply does.
+	if got := providerState(providerCursor(t, "claude", "claude-server-error", 9)); got.State != "provider_blocked" {
+		t.Fatalf("prompt cleared the block: %+v", got)
+	}
+	if got := providerState(providerCursor(t, "claude", "claude-server-error", -1)); got.State != "idle" || got.Reason != "" || got.Provider != nil {
+		t.Fatalf("after recovery %+v", got)
+	}
+	// Codex: two header records, then (task_started, prompt, task_complete
+	// with error) per failed turn.
+	for _, tc := range []struct {
+		fixture, class string
+		status         int
+	}{{"codex-503", "server_error", 503}, {"codex-429", "rate_limited", 429}} {
+		if got := providerState(providerCursor(t, "codex", tc.fixture, 5)); got.State != "idle" || got.Reason != "turn ended by provider error ("+tc.class+")" || got.Provider != nil {
+			t.Fatalf("%s one failure %+v", tc.fixture, got)
+		}
+		got := providerState(providerCursor(t, "codex", tc.fixture, 8))
+		if got.State != "provider_blocked" || got.Provider.Class != tc.class || got.Provider.Status != tc.status || got.Provider.Provider != "openai" || got.Provider.Model != "gpt-6-astra" || !got.Provider.Since.Equal(providerTime(t, "2026-09-25T22:40:03Z")) {
+			t.Fatalf("%s second failure %+v %+v", tc.fixture, got, got.Provider)
+		}
+	}
+	// A prompt in the next turn keeps the block; model output clears it, and
+	// so does an error-free task_complete.
+	if got := providerState(providerCursor(t, "codex", "codex-503", 10)); got.State != "provider_blocked" {
+		t.Fatalf("codex prompt cleared the block: %+v", got)
+	}
+	if c := providerCursor(t, "codex", "codex-503", 11); c.ProviderBlock != nil {
+		t.Fatalf("codex model output kept the block: %+v", c.ProviderBlock)
+	}
+	if got := providerState(providerCursor(t, "codex", "codex-503", -1)); got.State != "idle" || got.Reason != "" || got.Provider != nil {
+		t.Fatalf("codex after recovery %+v", got)
+	}
+	blocked := providerCursor(t, "codex", "codex-429", -1)
+	if err := parseCodexActivity([]byte(`{"type":"event_msg","timestamp":"2026-09-25T23:00:00Z","payload":{"type":"task_complete","last_agent_message":"Synthetic fixture reply."}}`), blocked); err != nil || blocked.ProviderBlock != nil {
+		t.Fatalf("error-free task_complete kept the block: %+v %v", blocked.ProviderBlock, err)
+	}
+	// A different class starts a new block with its own since.
+	mixed := providerCursor(t, "codex", "codex-503", 5)
+	if err := parseCodexActivity([]byte(`{"type":"event_msg","timestamp":"2026-09-25T22:50:00Z","payload":{"type":"task_complete","error":{"codex_error_info":"other","message":"unexpected status 429 Too Many Requests"}}}`), mixed); err != nil {
+		t.Fatal(err)
+	}
+	if b := mixed.ProviderBlock; b == nil || b.Class != "rate_limited" || b.Count != 1 || !b.Since.Equal(providerTime(t, "2026-09-25T22:50:00Z")) {
+		t.Fatalf("class change %+v", b)
+	}
+	if got := providerState(mixed); got.State != "idle" {
+		t.Fatalf("class change counted the earlier class: %+v", got)
+	}
+	// The threshold is configurable and bounded.
+	t.Setenv("TAILTERM_ACTIVITY_PROVIDER_REPEAT", "3")
+	if got := providerState(two); got.State != "idle" {
+		t.Fatalf("threshold 3 after two failures %+v", got)
+	}
+	three := providerCursor(t, "claude", "claude-server-error", 8)
+	lines := strings.Split(providerFixture(t, "claude-server-error"), "\n")
+	if err := parseClaudeActivity([]byte(lines[6]), three); err != nil {
+		t.Fatal(err)
+	}
+	if got := providerState(three); got.State != "provider_blocked" || !got.Provider.Since.Equal(providerTime(t, "2026-09-26T18:53:10Z")) {
+		t.Fatalf("threshold 3 after three failures %+v", got)
+	}
+	for _, value := range []string{"1", "21", "x"} {
+		t.Setenv("TAILTERM_ACTIVITY_PROVIDER_REPEAT", value)
+		if activityDefaults().ProviderRepeat != 2 {
+			t.Fatalf("override %q not bounded", value)
+		}
+	}
+}
+
+func TestActivityProviderBlockedTick(t *testing.T) {
+	cols, rows := 200, 50
+	stubPaneSize(t, &cols, &rows)
+	lines := strings.Split(strings.TrimSpace(providerFixture(t, "claude-fable-limit")), "\n")
+	write := func(t *testing.T, b runtimeBinding, records ...string) {
+		t.Helper()
+		path := filepath.Join(os.Getenv("HOME"), ".claude", "projects", "p", b.Thread+".jsonl")
+		if err := os.WriteFile(path, []byte(strings.Join(records, "\n")+"\n"), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	now := time.Date(2026, 9, 26, 19, 0, 0, 0, time.UTC)
+	recovery := `{"type":"assistant","timestamp":"2026-09-26T20:21:00.000Z","message":{"model":"claude-opus-5-5","id":"msg_fixture_recovered","role":"assistant","content":[{"type":"text","text":"Synthetic fixture reply."}],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}}`
+
+	t.Run("one report per transition", func(t *testing.T) {
+		b, h, _, tick := stuckFixture(t, "claude")
+		write(t, b, lines[:5]...)
+		if err := tick(now); err != nil {
+			t.Fatal(err)
+		}
+		if len(h.reports) != 1 || h.reports[0].State != "provider_blocked" || h.reports[0].Provider.Class != "usage_limit" {
+			t.Fatalf("entering %+v", h.reports)
+		}
+		// More failed prompts: the block is steady and is not reported again.
+		write(t, b, lines...)
+		for i := 1; i <= 3; i++ {
+			if err := tick(now.Add(time.Duration(i) * 16 * time.Second)); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if len(h.reports) != 1 {
+			t.Fatalf("steady block reported again %+v", h.reports)
+		}
+		// A tiny pane does not hide the block behind stuck.
+		cols, rows = 16, 1
+		if err := tick(now.Add(80 * time.Second)); err != nil || len(h.reports) != 1 {
+			t.Fatalf("stuck replaced the block: %v %+v", err, h.reports)
+		}
+		cols, rows = 200, 50
+		write(t, b, append(append([]string{}, lines...), recovery)...)
+		if err := tick(now.Add(100 * time.Second)); err != nil {
+			t.Fatal(err)
+		}
+		if len(h.reports) != 2 || h.reports[1].State != "idle" || h.reports[1].Provider != nil || h.reports[1].Reason != "" {
+			t.Fatalf("leaving %+v", h.reports)
+		}
+	})
+
+	// A real test hub: it stores provider_blocked, and a runtime prompt on the
+	// agent's pane then takes precedence.
+	t.Run("runtime prompt overrides", func(t *testing.T) {
+		r := newPromptRig(t, "claude")
+		path := filepath.Join(os.Getenv("HOME"), ".claude", "projects", "rig", r.b.Thread+".jsonl")
+		if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte(strings.Join(lines, "\n")+"\n"), 0600); err != nil {
+			t.Fatal(err)
+		}
+		got := r.tick()
+		if got.State != "provider_blocked" || got.Provider == nil || got.Provider.Class != "usage_limit" || got.Provider.Model != "claude-fable-5-1" {
+			t.Fatalf("hub snapshot %+v %+v", got, got.Provider)
+		}
+		r.screen = r.fixture("claude-pane/permission-dialog.ansi")
+		if got = r.tick(); got.State != "runtime_prompt" || got.Prompt == nil || got.Provider != nil {
+			t.Fatalf("runtime prompt did not override %+v", got)
+		}
+		r.screen = ""
+		if got = r.tick(); got.State != "provider_blocked" || got.Provider == nil || got.Prompt != nil {
+			t.Fatalf("block not restored after the prompt %+v", got)
+		}
+	})
+
+	t.Run("older hub gets the legacy form", func(t *testing.T) {
+		for _, runtime := range []string{"claude", "codex"} {
+			b, h, _, tick := stuckFixture(t, runtime)
+			h.rejectState = "provider_blocked"
+			wantState, wantReason := "idle", "turn ended by API error (rate_limit)"
+			at := now
+			if runtime == "claude" {
+				write(t, b, lines...)
+			} else {
+				path := filepath.Join(os.Getenv("HOME"), ".codex", "sessions", "2026", "09", "29", "rollout-test-"+b.Thread+".jsonl")
+				if err := os.WriteFile(path, []byte(providerFixture(t, "codex-401")), 0600); err != nil {
+					t.Fatal(err)
+				}
+				wantState, wantReason = "unknown", "provider_blocked: auth"
+			}
+			// The 400 is remembered; the next tick sends the legacy form.
+			if err := tick(at); err != nil || len(h.reports) != 0 {
+				t.Fatalf("%s rejected tick %v %+v", runtime, err, h.reports)
+			}
+			if err := tick(at.Add(time.Second)); err != nil {
+				t.Fatal(err)
+			}
+			if len(h.reports) != 1 || h.reports[0].State != wantState || h.reports[0].Reason != wantReason || h.reports[0].Provider != nil {
+				t.Fatalf("%s legacy form %+v", runtime, h.reports)
+			}
+			if err := tick(at.Add(20 * time.Second)); err != nil || len(h.reports) != 1 || h.rejected != 1 {
+				t.Fatalf("%s repeat %v reports=%+v rejected=%d", runtime, err, h.reports, h.rejected)
+			}
+			// Later transitions still report.
+			if runtime == "claude" {
+				write(t, b, append(append([]string{}, lines...), recovery)...)
+				if err := tick(at.Add(40 * time.Second)); err != nil {
+					t.Fatal(err)
+				}
+				if len(h.reports) != 2 || h.reports[1].State != "idle" || h.reports[1].Reason != "" {
+					t.Fatalf("claude later transition %+v", h.reports)
+				}
+			} else {
+				cols, rows = 16, 1
+				if err := tick(at.Add(40 * time.Second)); err != nil {
+					t.Fatal(err)
+				}
+				cols, rows = 200, 50
+				if len(h.reports) != 2 || h.reports[1].State != "stuck" {
+					t.Fatalf("codex later transition %+v", h.reports)
+				}
+			}
+		}
+	})
+
+	if activityReportKey(api.AgentActivity{State: "provider_blocked", Provider: &api.ProviderBlock{Class: "auth", Since: now}}) == activityReportKey(api.AgentActivity{State: "provider_blocked", Provider: &api.ProviderBlock{Class: "server_error", Since: now}}) {
+		t.Fatal("a class change must be a new report")
+	}
+}
+
+func TestActivityCLIShowsProviderBlocked(t *testing.T) {
+	task := "tsk_0123456789abcdef"
+	blocked := &api.AgentActivity{State: "provider_blocked", ObservedAt: time.Date(2026, 9, 26, 19, 0, 0, 0, time.UTC),
+		Provider: &api.ProviderBlock{Provider: "anthropic", Runtime: "claude", Model: "claude-fable-5-1", Class: "usage_limit", Code: "rate_limit", Status: 429, Since: time.Date(2026, 9, 26, 18, 53, 10, 0, time.UTC)}}
+	hub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if strings.HasSuffix(r.URL.Path, "/agents") {
+			_ = json.NewEncoder(w).Encode(api.AgentList{Agents: []api.Agent{{ID: "agt_0123456789abcdef", TaskID: task, Name: "reviewer", Session: "fake", Host: "mini", Status: api.AgentRunning, Activity: blocked}}})
+		} else {
+			http.NotFound(w, r)
+		}
+	}))
+	defer hub.Close()
+	agents, err := captureRelayOutput(t, false, func() error { return cmdAgents(env{hub: hub.URL, task: task}, nil) })
+	if err != nil || !strings.Contains(agents, "activity=provider_blocked") || !strings.Contains(agents, "  provider-blocked provider=anthropic model=claude-fable-5-1 class=usage_limit status=429 since=2026-09-26T18:53:10Z\n") {
+		t.Fatalf("agents output %q %v", agents, err)
+	}
+	if got := queueMemberActivity(blocked); got != "activity=provider_blocked provider=anthropic class=usage_limit" {
+		t.Fatalf("queue member %q", got)
+	}
+	if got := queueMemberActivity(&api.AgentActivity{State: "stuck"}); got != "activity=stuck" {
+		t.Fatalf("queue member stuck %q", got)
+	}
+	if got := queueMemberActivity(nil); got != "activity=unknown" {
+		t.Fatalf("queue member nil %q", got)
 	}
 }

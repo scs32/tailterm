@@ -107,6 +107,20 @@ func activityState(c *activityCursor, a api.Agent, openObligations int, tmuxAliv
 		}
 	}
 	c.MissingSince = time.Time{}
+	// A provider block ranks below crashed and above everything else: the
+	// agent's turns fail whatever its lifecycle status says.
+	if block := reportableProviderBlock(c, threshold); block != nil {
+		if !c.ProviderUnsupported {
+			result.State, result.Provider = "provider_blocked", block
+			return result
+		}
+		// An older hub: Claude keeps its idle or finished_silent turn-end
+		// reason below; Codex has no such form.
+		if block.Runtime != "claude" {
+			result.Reason = "provider_blocked: " + block.Class
+			return result
+		}
+	}
 	if a.Status == api.AgentNeedsInput {
 		result.Reason = "planned wait or input required"
 		return result
@@ -168,6 +182,18 @@ func activityState(c *activityCursor, a api.Agent, openObligations int, tmuxAliv
 	return result
 }
 
+// queueMemberActivity is a team member's activity as `tt team queue list`
+// prints it: the state and, for a provider block, its provider and class.
+func queueMemberActivity(a *api.AgentActivity) string {
+	if a == nil {
+		return "activity=unknown"
+	}
+	if p := a.Provider; a.State == "provider_blocked" && p != nil {
+		return fmt.Sprintf("activity=%s provider=%s class=%s", a.State, p.Provider, p.Class)
+	}
+	return "activity=" + a.State
+}
+
 func activityRequestID(b runtimeBinding, n int64) string {
 	digest := sha256.Sum256([]byte(b.Agent + "\x00" + b.Run + "\x00" + fmt.Sprint(n)))
 	return "activity-" + hex.EncodeToString(digest[:12])
@@ -225,7 +251,11 @@ func relayActivityTick(ctx context.Context, b runtimeBinding, client *api.Client
 			}
 			_, err = client.ReportActivity(ctx, b.Task, b.Agent, *retry)
 		}
-		if err != nil {
+		if providerFallback(&c, err) {
+			if err := save(); err != nil {
+				return err
+			}
+		} else if err != nil {
 			var httpErr *api.HTTPError
 			if !errors.As(err, &httpErr) || httpErr.Status != http.StatusConflict {
 				return err
@@ -382,7 +412,7 @@ func relayActivityTick(ctx context.Context, b runtimeBinding, client *api.Client
 			fmt.Fprintf(os.Stderr, "[tt relay] %s runtime prompt: %v\n", b.Agent, promptErr)
 		}
 		if prompt != nil {
-			state.State, state.Prompt, state.Reason = "runtime_prompt", prompt, ""
+			state.State, state.Prompt, state.Reason, state.Provider = "runtime_prompt", prompt, "", nil
 		}
 	}
 	if b.Runtime == "claude" {
@@ -391,7 +421,7 @@ func relayActivityTick(ctx context.Context, b runtimeBinding, client *api.Client
 			state.Wake = progress.Wake
 		}
 	}
-	if state.State != "runtime_prompt" && probeErr == nil && tmuxAlive && processAlive {
+	if state.State != "runtime_prompt" && state.State != "provider_blocked" && probeErr == nil && tmuxAlive && processAlive {
 		if reason := activityStuckReason(ctx, b, a, state.State, now, activityDefaults()); reason != "" {
 			state.State, state.Reason = "stuck", reason
 		}
@@ -426,6 +456,10 @@ func relayActivityTick(ctx context.Context, b runtimeBinding, client *api.Client
 		// A failure leaves the downgraded report pending; it replays.
 		_, err = client.ReportActivity(ctx, b.Task, b.Agent, *retry)
 		state = retry.Activity
+	}
+	if providerFallback(&c, err) {
+		// The next tick observes again and reports the legacy form.
+		return save()
 	}
 	if err != nil {
 		var httpErr *api.HTTPError
@@ -539,6 +573,22 @@ func stuckFallback(b runtimeBinding, c *activityCursor, err error) (*api.Activit
 	return c.PendingReport, true
 }
 
+// providerFallback handles a hub that rejects the provider_blocked state
+// (HTTP 400). It remembers that, drops the rejected report and lets the next
+// observation send the legacy form: for Claude the idle or finished_silent
+// turn-end reason, for Codex unknown with a "provider_blocked:" reason. Later
+// transitions are never blocked.
+func providerFallback(c *activityCursor, err error) bool {
+	var httpErr *api.HTTPError
+	if c.PendingReport == nil || c.PendingReport.Activity.State != "provider_blocked" || !errors.As(err, &httpErr) || httpErr.Status != http.StatusBadRequest {
+		return false
+	}
+	c.ProviderUnsupported = true
+	c.PendingReport = nil
+	c.LastCheck = time.Time{}
+	return true
+}
+
 // activityReportKey is what, besides the state, makes a new activity report.
 // An idle or finished_silent reason is part of it, so a turn that ends by an
 // API rate limit reaches the hub (docs/handler-ab.md); stuck reasons change
@@ -548,6 +598,10 @@ func activityReportKey(a api.AgentActivity) string {
 	key := activityKeyVersion + legacyActivityKey(a)
 	if a.State == "idle" || a.State == "finished_silent" {
 		key += "\x00reason=" + a.Reason
+	}
+	// A class change is a new report; a steady block is not.
+	if p := a.Provider; a.State == "provider_blocked" && p != nil {
+		key += "\x00provider=" + p.Class + "\x00" + p.Since.UTC().Format(time.RFC3339Nano)
 	}
 	return key
 }

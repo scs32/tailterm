@@ -147,7 +147,9 @@ that matches an arm opens the arm's episode, and posts one Board notice
 - Codex: `state=runtime_prompt` with prompt kind `codex_usage_limit` that no
   action has answered;
 - Claude: `state` is `idle` or `finished_silent` with reason `turn ended by API
-  error (rate_limit)`.
+  error (rate_limit)`, or `state=provider_blocked` with class `usage_limit` or
+  `rate_limited` ([provider-blocked.md](provider-blocked.md)); a newer relay
+  sends the second form and the hold and clearing rules are the same for both.
 
 A repeat signal updates the episode's last signal and run and, for Claude,
 extends the hold to now plus `limitHoldMinutes`; it posts nothing.

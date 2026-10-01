@@ -400,6 +400,9 @@ func cmdAgents(e env, args []string) error {
 				}
 				fmt.Println()
 			}
+			if p := a.Activity.Provider; p != nil {
+				fmt.Printf("  provider-blocked provider=%s model=%s class=%s status=%d since=%s\n", p.Provider, p.Model, p.Class, p.Status, p.Since.Format(time.RFC3339))
+			}
 		}
 	}
 	return nil

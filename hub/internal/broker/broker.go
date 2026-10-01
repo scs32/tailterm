@@ -54,6 +54,11 @@ func (b *Broker) Tick(ctx context.Context, now time.Time) ([]Step, error) {
 	if err != nil {
 		firstErr = err
 	}
+	// Owner notices for provider-blocked agents wait out a grace period so a
+	// runtime-wide outage is one notice; paused projects are swept too.
+	if _, err := b.Store.ProviderBlockSweep(ctx, now); err != nil && firstErr == nil {
+		firstErr = err
+	}
 	open, err := b.Store.BrokerOpenObligations(ctx)
 	if err != nil {
 		return steps, err

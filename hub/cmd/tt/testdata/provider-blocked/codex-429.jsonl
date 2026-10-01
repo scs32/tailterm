@@ -1,0 +1,8 @@
+{"type":"session_meta","timestamp":"2026-09-25T22:40:00.000Z","payload":{"id":"33333333-3333-4333-8333-333333333333","originator":"codex_cli_rs"}}
+{"type":"turn_context","timestamp":"2026-09-25T22:40:00.100Z","payload":{"model":"gpt-6-astra","approval_policy":"never"}}
+{"type":"event_msg","timestamp":"2026-09-25T22:40:01.000Z","payload":{"type":"task_started"}}
+{"type":"response_item","timestamp":"2026-09-25T22:40:01.100Z","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Synthetic fixture prompt."}]}}
+{"type":"event_msg","timestamp":"2026-09-25T22:40:03.000Z","payload":{"type":"task_complete","last_agent_message":null,"error":{"codex_error_info":"other","message":"unexpected status 429 Too Many Requests: synthetic fixture body, url: https://chatgpt.com/backend-api/codex/responses, cf-ray: 0000000000000000-SJC, request id: 00000000-0000-4000-8000-00000000f429"}}}
+{"type":"event_msg","timestamp":"2026-09-25T22:41:01.000Z","payload":{"type":"task_started"}}
+{"type":"response_item","timestamp":"2026-09-25T22:41:01.100Z","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Synthetic fixture prompt."}]}}
+{"type":"event_msg","timestamp":"2026-09-25T22:41:03.000Z","payload":{"type":"task_complete","last_agent_message":null,"error":{"codex_error_info":"other","message":"unexpected status 429 Too Many Requests: synthetic fixture body, url: https://chatgpt.com/backend-api/codex/responses, cf-ray: 0000000000000000-SJC, request id: 00000000-0000-4000-8000-00000000f429"}}}

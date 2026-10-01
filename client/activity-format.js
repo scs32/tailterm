@@ -1,8 +1,21 @@
 const labels = {
   working: "Working", hung_tool: "Hung tool", finished_silent: "Finished silently",
   crashed: "Crashed", looping: "Looping", idle: "Idle", unknown: "Unknown",
-  runtime_prompt: "Runtime prompt", stuck: "Stuck",
+  runtime_prompt: "Runtime prompt", stuck: "Stuck", provider_blocked: "Provider blocked",
 };
+
+// Provider blocks (docs/provider-blocked.md).
+const providerNames = { anthropic: "Anthropic", openai: "OpenAI" };
+const providerClasses = {
+  usage_limit: "usage limit", auth: "authentication failure", rate_limited: "rate limit", server_error: "server error",
+};
+
+export function providerBlockDetail(block) {
+  if (!block) return "";
+  const since = new Date(block.since || "");
+  const at = Number.isNaN(since.getTime()) ? "" : ` · since ${String(since.getHours()).padStart(2, "0")}:${String(since.getMinutes()).padStart(2, "0")}`;
+  return `${providerNames[block.provider] || "Provider"} ${providerClasses[block.class] || "failure"} · ${block.model || "unknown"}${at}`;
+}
 
 // Runtime prompt kinds and policy actions (docs/runtime-prompts.md).
 const promptKinds = {
@@ -41,6 +54,7 @@ export function activityDetail(activity, now = Date.now()) {
     ? ` · Claude wake ${activity.wake.status}${activity.wake.messageSeqs?.length ? ` #${activity.wake.messageSeqs.join(", #")}` : ""}${activity.wake.reason ? `: ${activity.wake.reason}` : ""}`
     : "";
   const prompt = activity.prompt ? ` · ${runtimePromptDetail(activity.prompt)}` : "";
-  const reason = activity.state === "stuck" && activity.reason ? `: ${activity.reason}` : "";
+  const blocked = activity.state === "provider_blocked" && activity.provider ? `: ${providerBlockDetail(activity.provider)}` : "";
+  const reason = blocked || (activity.state === "stuck" && activity.reason ? `: ${activity.reason}` : "");
   return `${activityLabel(activity)}${reason}${prompt}${tool}${wake}${evidence} · ${tokenSnapshot(activity.tokens)}`;
 }
