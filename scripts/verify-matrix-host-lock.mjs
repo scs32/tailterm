@@ -23,6 +23,10 @@ import { fileURLToPath } from "node:url";
 export const PRIORITIES = ["urgent", "high", "normal"];
 export const DEFAULT_HOST_WAIT_MS = 240 * 60000;
 export const DEFAULT_POLL_MS = 2000;
+// No holder keeps the host longer than this, whatever its plan asks for
+// (wi_c5cb667695c3614c). A plan's serial sum is far above what parallel lanes
+// take, so the cap is what bounds a hung run.
+export const DEFAULT_HOLDER_CAP_MS = 120 * 60000;
 // After a holder's run timeout, how long a waiter still defers to whatever of
 // that run is alive before it takes the lock as a recorded overlap.
 export const RUN_TIMEOUT_GRACE_MS = 120000;
@@ -78,6 +82,12 @@ export function resolvePriority(flag, environment = process.env) {
       prioritySource: "environment",
     };
   return { priority: "normal", prioritySource: "default" };
+}
+// TAILTERM_MATRIX_HOLDER_CAP_MINUTES in whole minutes, else the default.
+export function holderCapMs(environment = process.env) {
+  const raw = environment.TAILTERM_MATRIX_HOLDER_CAP_MINUTES;
+  if (raw === undefined || raw === "") return DEFAULT_HOLDER_CAP_MS;
+  return minutesFlag("TAILTERM_MATRIX_HOLDER_CAP_MINUTES", raw, 1440);
 }
 const rank = (priority) =>
   priority === "urgent" ? 0 : priority === "high" ? 1 : 2;
@@ -361,13 +371,16 @@ function hookExit() {
 // path, priority, prioritySource, kind (run|targeted|exec), item, agent,
 // commit, output (logged in the file), recordDirectory (host-lock.log and the
 // host-lock.json sidecar), runTimeoutMs, maxWaitMs, pollMs, graceMs, signal,
-// print, now, extra (copied into the sidecar).
+// print, now, extra (copied into the sidecar), environment (the holder cap).
+// The requester clamps its own run timeout to the holder cap, so the deadline
+// it records in the file is the one it stops itself at. A waiter never
+// shortens the deadline another holder recorded.
 export async function acquireHostLock(options = {}) {
   const {
     kind = "run",
     item = "unknown",
     agent = "unknown",
-    runTimeoutMs,
+    runTimeoutMs: requestedRunTimeoutMs,
     maxWaitMs = DEFAULT_HOST_WAIT_MS,
     pollMs = DEFAULT_POLL_MS,
     graceMs = RUN_TIMEOUT_GRACE_MS,
@@ -381,8 +394,9 @@ export async function acquireHostLock(options = {}) {
     options.priority && options.prioritySource
       ? { priority: resolvePriority(options.priority).priority, prioritySource: options.prioritySource }
       : resolvePriority(options.priority);
-  if (!Number.isSafeInteger(runTimeoutMs) || runTimeoutMs <= 0)
+  if (!Number.isSafeInteger(requestedRunTimeoutMs) || requestedRunTimeoutMs <= 0)
     throw new Error("Host lock needs the run timeout in milliseconds");
+  const runTimeoutMs = Math.min(requestedRunTimeoutMs, holderCapMs(options.environment ?? process.env));
   if (!Number.isSafeInteger(maxWaitMs) || maxWaitMs <= 0)
     throw new Error("Invalid host wait bound");
   const paths = lockPaths(options.path ?? lockPath());
@@ -425,6 +439,7 @@ export async function acquireHostLock(options = {}) {
     overtakenBy: 0,
     overlap: 0,
     runTimeoutMs,
+    requestedRunTimeoutMs,
     cpuCount: availableParallelism(),
     loadSamples: [],
     ...(options.extra || {}),
@@ -524,6 +539,8 @@ export async function acquireHostLock(options = {}) {
     saveRecord();
   };
 
+  if (runTimeoutMs < requestedRunTimeoutMs)
+    say(`matrix host: run timeout ${requestedRunTimeoutMs} ms clamped to the holder cap of ${runTimeoutMs} ms`);
   hookExit();
   let first = true,
     last = null;

@@ -1046,3 +1046,179 @@ func TestTeamQueueCLISmallTemplateAddListAndUsage(t *testing.T) {
 		}
 	}
 }
+
+// No test in this package may read the host's own verification lock file
+// through an inherited override; fixtures set HOME to a temporary directory.
+func init() { os.Unsetenv("TAILTERM_MATRIX_HOST_LOCK") }
+
+// a6, a7 (wi_c5cb667695c3614c): tt team queue list shows each entry whose item
+// waits for the verification host, from the host lock file.
+func TestTeamQueueListMatrixWait(t *testing.T) {
+	f := newTeamFixture(t, true)
+	ctx := context.Background()
+	remote, remoteOrder := queueFixtureItem(t, f, "matrix-remote")
+	idle := f.item
+	add := func(key, item string, order int64, host string) {
+		t.Helper()
+		if _, err := f.c.TeamQueueAction(ctx, f.task.ID, api.TeamQueueRequest{RequestID: key, Operation: "add", ItemID: item, OrderMessageSeq: order, Host: host, Cwd: t.TempDir()}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	add("matrix-add-idle", idle.ID, f.order, "Stephens-Mini")
+	waitingItem, waitingSeq := queueFixtureItem(t, f, "matrix-waiting")
+	add("matrix-add-waiting", waitingItem.ID, waitingSeq, "stephens-mini")
+	add("matrix-add-remote", remote.ID, remoteOrder, "truenas")
+	list := func() string {
+		t.Helper()
+		out, err := captureCLIOutput(t, func() error { return cmdTeamQueue(f.e, []string{"list"}) })
+		if err != nil {
+			t.Fatalf("list must exit 0: %v\n%s", err, out)
+		}
+		for _, id := range []string{idle.ID, waitingItem.ID, remote.ID} {
+			if !strings.Contains(out, id) {
+				t.Fatalf("entries must stay intact, missing %s:\n%s", id, out)
+			}
+		}
+		return out
+	}
+	listJSON := func() string {
+		t.Helper()
+		out, err := captureCLIOutput(t, func() error { return cmdTeamQueue(f.e, []string{"list", "--json"}) })
+		if err != nil {
+			t.Fatal(err)
+		}
+		return out
+	}
+	old := matrixLocalHost
+	matrixLocalHost = func() (string, error) { return "Stephens-Mini.local", nil }
+	t.Cleanup(func() { matrixLocalHost = old })
+
+	// Absent file: today's output, in the default path under HOME and under an override.
+	plain, plainJSON := list(), listJSON()
+	if strings.Contains(plain, "matrix host") || strings.Contains(plain, "waiting-for-matrix") {
+		t.Fatalf("an absent lock file must add nothing:\n%s", plain)
+	}
+	path := filepath.Join(t.TempDir(), "host.json")
+	t.Setenv("TAILTERM_MATRIX_HOST_LOCK", path)
+	if out := list(); out != plain {
+		t.Fatalf("an absent override file must add nothing:\n%s", out)
+	}
+	write := func(host string, version int, holder any, waiters ...map[string]any) {
+		t.Helper()
+		if waiters == nil {
+			waiters = []map[string]any{}
+		}
+		raw, err := json.Marshal(map[string]any{"version": version, "host": host, "requestSeq": 9, "grantSeq": 3, "holder": holder, "waiters": waiters})
+		if err != nil || os.WriteFile(path, raw, 0o600) != nil {
+			t.Fatal("write lock file")
+		}
+	}
+	waiter := func(item, priority, kind, agent string) map[string]any {
+		return map[string]any{"id": "w-" + item, "pid": 4242, "kind": kind, "item": item, "agent": agent, "priority": priority, "requestedAt": "2026-10-01T14:05:00.000Z"}
+	}
+	holder := map[string]any{"id": "h", "pid": 777, "kind": "run", "item": "wi_holder", "agent": "verifier-1", "priority": "high", "startedAt": "2026-10-01T14:00:00.000Z", "groups": []int{}}
+	lines := func(out string) []string {
+		var got []string
+		for _, line := range strings.Split(out, "\n") {
+			if strings.HasPrefix(line, "matrix host:") || strings.Contains(line, "waiting-for-matrix") {
+				got = append(got, line)
+			}
+		}
+		return got
+	}
+
+	// a6: one line under the waiting entry only, with position, holder and priority.
+	write("Stephens-Mini.local", 1, holder, waiter("wi_someone_else", "urgent", "run", "verifier-2"), waiter(waitingItem.ID, "high", "run", "deployer"), waiter(remote.ID, "normal", "targeted", "verifier-3"))
+	out := list()
+	want := "  waiting-for-matrix position=2 of 3 holder=wi_holder/verifier-1/pid 777 priority=high kind=run agent=deployer since=2026-10-01T14:05:00.000Z"
+	if got := lines(out); len(got) != 1 || got[0] != want {
+		t.Fatalf("waiting lines %q, want only %q:\n%s", got, want, out)
+	}
+	entryAt := strings.Index(out, waitingItem.ID)
+	if next := strings.Index(out[entryAt:], "\n"); !strings.Contains(out[entryAt+next:], want) || strings.Index(out, want) < entryAt {
+		t.Fatalf("the line must follow its entry:\n%s", out)
+	}
+	if strings.Index(out, want) < strings.Index(out, idle.ID) && strings.Index(out, idle.ID) > entryAt {
+		t.Fatalf("the line must be under the waiting entry, not another:\n%s", out)
+	}
+	if got := listJSON(); got != plainJSON {
+		t.Fatalf("--json must be unchanged:\n%s", got)
+	}
+	// A free host, and two runs of one item.
+	write("stephens-mini", 1, nil, waiter(waitingItem.ID, "high", "run", "deployer"), waiter(waitingItem.ID, "normal", "targeted", "verifier-9"))
+	if got := lines(list()); len(got) != 2 || !strings.Contains(got[0], "position=1 of 2 holder=none priority=high kind=run agent=deployer") || !strings.Contains(got[1], "position=2 of 2 holder=none priority=normal kind=targeted agent=verifier-9") {
+		t.Fatalf("free host lines %q", got)
+	}
+	// Only a holder: nothing waits.
+	write("Stephens-Mini", 1, holder)
+	if out := list(); out != plain {
+		t.Fatalf("no waiter must add nothing:\n%s", out)
+	}
+
+	// a7: each no-waitlist case is one named line, exit 0, entries intact.
+	oneLine := func(what, want string) {
+		t.Helper()
+		out := list()
+		if got := lines(out); len(got) != 1 || got[0] != want {
+			t.Fatalf("%s: lines %q, want %q", what, got, want)
+		}
+		if strings.Replace(out, want+"\n", "", 1) != plain {
+			t.Fatalf("%s: the rest of the output must be unchanged:\n%s", what, out)
+		}
+		if got := listJSON(); got != plainJSON {
+			t.Fatalf("%s: --json must be unchanged", what)
+		}
+	}
+	write("TrueNAS.local", 1, holder, waiter(waitingItem.ID, "high", "run", "deployer"))
+	oneLine("other host", "matrix host: lock file "+path+" belongs to host TrueNAS.local; waitlist not shown")
+	write("Stephens-Mini.local", 2, holder, waiter(waitingItem.ID, "high", "run", "deployer"))
+	oneLine("unknown version", "matrix host: lock file "+path+" unusable (unknown version); waitlist not shown")
+	if os.WriteFile(path, []byte("{not json"), 0o600) != nil {
+		t.Fatal("write")
+	}
+	oneLine("not JSON", "matrix host: lock file "+path+" unusable (not JSON); waitlist not shown")
+	if os.Remove(path) != nil || os.Mkdir(path, 0o700) != nil {
+		t.Fatal("directory in place of the file")
+	}
+	oneLine("unreadable", "matrix host: lock file "+path+" unusable (unreadable); waitlist not shown")
+	// A relative override is named and the default path is not used instead.
+	home, _ := os.UserHomeDir()
+	fallback := filepath.Join(home, ".local/state/tailterm-matrix/host.json")
+	if os.MkdirAll(filepath.Dir(fallback), 0o700) != nil {
+		t.Fatal("default directory")
+	}
+	path = fallback
+	write("Stephens-Mini.local", 1, holder, waiter(waitingItem.ID, "high", "run", "deployer"))
+	t.Setenv("TAILTERM_MATRIX_HOST_LOCK", "relative/host.json")
+	oneLine("relative override", "matrix host: TAILTERM_MATRIX_HOST_LOCK must be an absolute path; waitlist not shown")
+	// With no override the default path under HOME is read.
+	t.Setenv("TAILTERM_MATRIX_HOST_LOCK", "")
+	if got := lines(list()); len(got) != 1 || !strings.HasPrefix(got[0], "  waiting-for-matrix position=1 of 1 holder=wi_holder/verifier-1/pid 777 priority=high") {
+		t.Fatalf("default path lines %q", got)
+	}
+
+	// Host names: first DNS label, case-insensitive.
+	for _, pair := range [][2]string{{"Stephens-Mini", "Stephens-Mini.local"}, {"stephens-mini", "STEPHENS-MINI.tail1234.ts.net"}} {
+		if matrixHostLabel(pair[0]) != matrixHostLabel(pair[1]) {
+			t.Fatalf("%q and %q must match", pair[0], pair[1])
+		}
+	}
+	if matrixHostLabel("Stephens-Mini") == matrixHostLabel("Stephens-Mini-2.local") {
+		t.Fatal("different machines must not match")
+	}
+	// A failed entry and an entry on another host get no line.
+	m := &matrixWaitlist{Version: 1, Host: "Stephens-Mini.local", Waiters: []matrixHostEntry{{PID: 1, Item: "wi_x", Kind: "run", Agent: "a", Priority: "high", RequestedAt: "t"}}}
+	if got := m.waitLines(api.TeamQueueEntry{ItemID: "wi_x", Host: "stephens-mini", State: "running"}); len(got) != 1 {
+		t.Fatalf("matching entry lines %q", got)
+	}
+	for _, q := range []api.TeamQueueEntry{{ItemID: "wi_x", Host: "stephens-mini", State: "failed"}, {ItemID: "wi_x", Host: "truenas", State: "running"}, {ItemID: "wi_y", Host: "stephens-mini", State: "running"}} {
+		if got := m.waitLines(q); got != nil {
+			t.Fatalf("entry %+v printed %q", q, got)
+		}
+	}
+	// A value from the file never breaks the line.
+	m.Waiters[0].Agent = "two words\nnext"
+	if got := m.waitLines(api.TeamQueueEntry{ItemID: "wi_x", Host: "stephens-mini", State: "running"}); len(got) != 1 || !strings.Contains(got[0], "agent=two_words_next ") {
+		t.Fatalf("sanitized line %q", got)
+	}
+}

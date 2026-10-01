@@ -27,13 +27,19 @@ import {
   groupGone,
   EXIT_WAIT_EXPIRED,
   EXIT_LOCK_UNUSABLE,
+  DEFAULT_HOLDER_CAP_MS,
+  DEFAULT_HOST_WAIT_MS,
+  RUN_TIMEOUT_GRACE_MS,
+  holderCapMs,
+  updateHostState,
 } from "../scripts/verify-matrix-host-lock.mjs";
-import { makePlan, runPlan, digest } from "../scripts/verify-matrix.mjs";
+import { makePlan, runPlan, digest, runScheduled, planRunTimeout } from "../scripts/verify-matrix.mjs";
 
 // No test here may fall back to the host's own lock file.
 const isolated = mkdtempSync(join(tmpdir(), "matrix-host-lock-default-"));
 process.env.TAILTERM_MATRIX_HOST_LOCK = join(isolated, "host.json");
 delete process.env.TAILTERM_MATRIX_PRIORITY;
+delete process.env.TAILTERM_MATRIX_HOLDER_CAP_MINUTES;
 process.on("exit", () => rmSync(isolated, { recursive: true, force: true }));
 
 const moduleFile = fileURLToPath(new URL("../scripts/verify-matrix-host-lock.mjs", import.meta.url));
@@ -723,4 +729,198 @@ test("exec refuses bad options before joining the list", (t) => {
     assert.match(result.stderr, message);
   }
   assert(!existsSync(path), "no request reached the lock file");
+});
+
+// Holder bound (wi_c5cb667695c3614c, d5). Plan shapes for the scheduler: the
+// ids, cwd, argv and ports are what its lock, lane and barrier rules read.
+const planCheck = (id, minutes, extra = {}) => ({
+  id,
+  cwd: ".",
+  argv: ["node", id],
+  ...extra,
+  environment: { VERIFICATION_TIMEOUT_MS: String(minutes * 60000), ...(extra.environment || {}) },
+});
+const goCheck = (id, minutes) => planCheck(id, minutes, { cwd: "hub", argv: ["go", "test", id] });
+const portCheck = (id, minutes, port) => planCheck(id, minutes, { environment: { VERIFICATION_REQUIRED_PORTS: String(port) } });
+function fullPlan() {
+  const checks = [
+    planCheck("00-static-build", 10),
+    planCheck("01-static-release-verify", 10),
+    planCheck("wasm-test-build", 10),
+    goCheck("go-vet", 10),
+    goCheck("go-test", 20),
+    goCheck("go-race", 30),
+  ];
+  for (let i = 0; checks.length < 68; i++)
+    checks.push(i % 4 === 0 ? portCheck("browser-" + i, 10, 4300 + (i % 3)) : planCheck("unit-" + i, 10));
+  return { maxAttempts: 3, checks };
+}
+const SHAPES = {
+  "the 68-check fixture": fullPlan(),
+  "three exclusive 30-minute checks": {
+    maxAttempts: 1,
+    checks: ["00-static-build", "01-static-release-verify", "wasm-test-build"].map((id) => planCheck(id, 30)),
+  },
+  "a chain sharing one port": { maxAttempts: 3, checks: [1, 2, 3, 4, 5, 6].map((i) => portCheck("browser-" + i, 15, 4173)) },
+  "a Go lane with go-race": {
+    maxAttempts: 3,
+    checks: [goCheck("go-test", 20), goCheck("go-race", 30), goCheck("go-vet", 5), goCheck("go-build", 10), planCheck("unit", 10)],
+  },
+};
+// The real scheduler on a virtual clock: every check takes its whole timeout
+// on every attempt, and the clock jumps to the next finish once the scheduler
+// has started everything it can.
+async function makespan(plan, jobs) {
+  let clock = 0;
+  const running = [];
+  const done = runScheduled(plan.checks, { jobs }, (check) =>
+    new Promise((finish) =>
+      running.push({ at: clock + Number(check.environment.VERIFICATION_TIMEOUT_MS) * (plan.maxAttempts || 1), finish }),
+    ),
+  );
+  let settled = false;
+  done.then(
+    () => (settled = true),
+    () => (settled = true),
+  );
+  for (;;) {
+    await new Promise((resolve) => setImmediate(resolve));
+    if (settled) break;
+    assert(running.length, "the scheduler is idle with checks left");
+    running.sort((a, b) => a.at - b.at);
+    const next = running.shift();
+    clock = next.at;
+    next.finish({});
+  }
+  await done;
+  return clock;
+}
+
+test("a8 (i) a 68-check plan's holder bound is the 120-minute cap, at most half the waiters' bound", async (t) => {
+  const plan = fullPlan();
+  assert.equal(plan.checks.length, 68);
+  const old = planRunTimeout(plan);
+  assert(old > 24 * 3600000, "the serial sum is above 24 hours: " + old);
+  const directory = tempDir(t);
+  const lines = [];
+  const lease = await acquireHostLock(request(lockFile(t), { runTimeoutMs: old, recordDirectory: directory, print: (line) => lines.push(line) }));
+  assert.equal(lease.record.runTimeoutMs, 7200000);
+  assert.equal(lease.record.runTimeoutMs, DEFAULT_HOLDER_CAP_MS);
+  assert.equal(lease.record.requestedRunTimeoutMs, old);
+  assert(lease.record.runTimeoutMs <= DEFAULT_HOST_WAIT_MS / 2);
+  assert.equal(readHostState(lease.path).holder.runTimeoutMs, 7200000, "the lock file carries the clamped deadline");
+  assert.deepEqual(lines.filter((line) => line.includes("clamped")), [`matrix host: run timeout ${old} ms clamped to the holder cap of 7200000 ms`]);
+  await lease.release();
+  assert.equal(JSON.parse(readFileSync(join(directory, "host-lock.json"), "utf8")).requestedRunTimeoutMs, old);
+});
+
+test("a8 (ii) the requested, uncapped timeout is never below the real scheduler's all-timeouts makespan", async () => {
+  for (const [name, plan] of Object.entries(SHAPES))
+    for (const jobs of [1, 2, 5, 8]) {
+      const requested = planRunTimeout(plan);
+      const took = await makespan(plan, jobs);
+      assert(took > 0 && requested >= took, `${name} at ${jobs} jobs: requested ${requested} ms, makespan ${took} ms`);
+    }
+  assert.equal(await makespan(SHAPES["three exclusive 30-minute checks"], 5), 90 * 60000, "exclusive checks run one after another whatever the job count");
+  assert.equal(await makespan(SHAPES["a chain sharing one port"], 8), 6 * 15 * 3 * 60000, "a shared port is a chain");
+});
+
+test("a9 (i) a request above the cap is recorded clamped and stops itself at the cap, for exec too", async (t) => {
+  const path = lockFile(t);
+  const environment = { TAILTERM_MATRIX_HOLDER_CAP_MINUTES: "1" };
+  const directory = tempDir(t);
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const lease = await acquireHostLock(request(path, { runTimeoutMs: 600000, environment, recordDirectory: directory }));
+  assert.equal(readHostState(path).holder.runTimeoutMs, 60000);
+  assert.deepEqual([lease.record.runTimeoutMs, lease.record.requestedRunTimeoutMs], [60000, 600000]);
+  t.mock.timers.tick(59999);
+  assert.equal(lease.signal.aborted, false, "not before the cap");
+  t.mock.timers.tick(1);
+  assert.equal(lease.signal.aborted, true, "the holder stops itself at the cap, not at the requested timeout");
+  assert.equal(lease.signal.reason, "run-timeout");
+  await lease.release();
+  const sidecar = JSON.parse(readFileSync(join(directory, "host-lock.json"), "utf8"));
+  assert.deepEqual([sidecar.runTimeoutMs, sidecar.requestedRunTimeoutMs, sidecar.runTimeoutAbort], [60000, 600000, true]);
+
+  const record = tempDir(t);
+  const running = execWithHostLock([process.execPath, "-e", "setInterval(()=>{},1000)"], {
+    path,
+    item: "wi_exec",
+    agent: "tester",
+    runTimeoutMs: 600000,
+    environment,
+    recordDirectory: record,
+    stdio: "ignore",
+    handleSignals: false,
+  });
+  // Timers stay mocked, so this waits on the event loop rather than a timer.
+  let holder;
+  for (let i = 0; i < 200000 && !(holder = readHostState(path)?.holder)?.groups?.length; i++)
+    await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(holder?.kind, "exec", "the exec command is on file");
+  assert.equal(holder.runTimeoutMs, 60000);
+  t.mock.timers.tick(59999);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert(!readJournal(path).some((line) => line.event === "run-timeout-abort" && line.item === "wi_exec"), "not before the cap");
+  t.mock.timers.tick(1);
+  assert.equal(await running, 124);
+  const execSidecar = JSON.parse(readFileSync(join(record, "host-lock.json"), "utf8"));
+  assert.deepEqual([execSidecar.kind, execSidecar.runTimeoutMs, execSidecar.requestedRunTimeoutMs], ["exec", 60000, 600000]);
+});
+
+test("a9 (ii) the cap comes from TAILTERM_MATRIX_HOLDER_CAP_MINUTES, and an invalid value refuses before joining", async (t) => {
+  assert.equal(holderCapMs({}), 7200000);
+  assert.equal(holderCapMs({ TAILTERM_MATRIX_HOLDER_CAP_MINUTES: "" }), 7200000);
+  assert.equal(holderCapMs({ TAILTERM_MATRIX_HOLDER_CAP_MINUTES: "1" }), 60000);
+  assert.equal(holderCapMs({ TAILTERM_MATRIX_HOLDER_CAP_MINUTES: "1440" }), 86400000);
+  const path = lockFile(t);
+  for (const bad of ["0", "x", "1441"]) {
+    await assert.rejects(
+      acquireHostLock(request(path, { environment: { TAILTERM_MATRIX_HOLDER_CAP_MINUTES: bad } })),
+      /TAILTERM_MATRIX_HOLDER_CAP_MINUTES requires a whole number of minutes from 1 to 1440/,
+    );
+    assert.equal(readHostState(path), null, "nothing joined the list for " + bad);
+    assert.deepEqual(readJournal(path), []);
+  }
+  const lease = await acquireHostLock(request(path, { runTimeoutMs: 60001, environment: { TAILTERM_MATRIX_HOLDER_CAP_MINUTES: "1" } }));
+  assert.equal(lease.record.runTimeoutMs, 60000);
+  await lease.release();
+  const under = await acquireHostLock(request(path, { runTimeoutMs: 59000, environment: { TAILTERM_MATRIX_HOLDER_CAP_MINUTES: "1" } }));
+  assert.deepEqual([under.record.runTimeoutMs, under.record.requestedRunTimeoutMs], [59000, 59000], "a request under the cap is kept");
+  await under.release();
+});
+
+test("a9 (iii) a waiter under a smaller cap never shortens the deadline a living holder recorded", async (t) => {
+  const cases = { "an older checkout's unclamped 33-hour deadline": 2000 * 60000, "a deadline recorded under a larger cap": 240 * 60000 };
+  for (const [name, recorded] of Object.entries(cases)) {
+    const path = lockFile(t);
+    const holder = await acquireHostLock(request(path, { item: "wi_holder", runTimeoutMs: 60000 }));
+    assert(updateHostState(path, (state) => void (state.holder.runTimeoutMs = recorded)).done);
+    const started = Date.parse(readHostState(path).holder.startedAt);
+    // First the waiter's clock is far past its own one-minute cap, yet inside
+    // the holder's recorded deadline plus grace.
+    let clock = started + recorded + RUN_TIMEOUT_GRACE_MS - 1000,
+      polls = 0,
+      granted = false;
+    const waiting = acquireHostLock(
+      request(path, {
+        item: "wi_waiter",
+        priority: "urgent",
+        prioritySource: "flag",
+        maxWaitMs: 400 * 86400000,
+        environment: { TAILTERM_MATRIX_HOLDER_CAP_MINUTES: "1" },
+        now: () => (polls++, clock),
+      }),
+    ).then((lease) => ((granted = true), lease));
+    await until(() => polls > 40, "many polls");
+    assert.equal(granted, false, name + ": not taken over inside the recorded deadline");
+    assert.equal(readHostState(path).holder.id, holder.id);
+    assert.equal(readHostState(path).holder.runTimeoutMs, recorded, "the recorded deadline is left as written");
+    clock = started + recorded + RUN_TIMEOUT_GRACE_MS + 1000;
+    const lease = await waiting;
+    assert.equal(lease.record.overlap, 1, name + ": taken only past the holder's own timeout plus grace");
+    assert.equal(lease.record.runTimeoutMs, 60000, "the waiter clamps only itself");
+    await lease.release();
+    await holder.release();
+  }
 });

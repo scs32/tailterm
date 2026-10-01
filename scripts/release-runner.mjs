@@ -1,10 +1,11 @@
 import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
-import { execFileSync } from "node:child_process";
-import { openSync, closeSync, fsyncSync, writeFileSync, readFileSync, renameSync, mkdirSync, mkdtempSync, existsSync, rmSync, copyFileSync, cpSync, chmodSync, statSync, lstatSync, realpathSync, constants } from "node:fs";
-import { join, resolve, dirname, isAbsolute } from "node:path";
+import { execFileSync, spawn } from "node:child_process";
+import { openSync, closeSync, fsyncSync, writeFileSync, readFileSync, renameSync, mkdirSync, mkdtempSync, existsSync, rmSync, copyFileSync, cpSync, chmodSync, statSync, lstatSync, realpathSync, readdirSync, constants } from "node:fs";
+import { join, resolve, dirname, basename, isAbsolute } from "node:path";
 import { digest, diffPaths, receiptEligible } from "./verify-matrix.mjs";
+import { PRIORITIES, RUN_TIMEOUT_GRACE_MS, holderCapMs, lockPath, readHostState, pidGone, groupGone } from "./verify-matrix-host-lock.mjs";
 import { selectReleaseTargets, releaseBaselines, schemaChanged } from "./release-targets.mjs";
 import { buildInfo, waitForTailOSCommit, tailosWindow, tailosURL, hostDeps, readyWindow, sanitizeCapture } from "./release-probe.mjs";
 
@@ -63,25 +64,53 @@ export function provisionPrerequisites(cwd, {from, run = (argv, dir) => execFile
   if (git(cwd, "status", "--porcelain")) throw releaseError("Prerequisite provisioning changed the checkout");
   return {version: 1, prerequisites: MATRIX_PREREQUISITES.map(p => ({path: p, sha256: fileDigest(join(cwd, p)), action: actions.get(p)}))};
 }
-// The in-release run is bounded by the plan's own limits: every check's
-// timeout times its attempts, plus the test-binary build allowance. The
-// per-check timers inside verify-matrix remain the real limit.
+// The in-release run is bounded like every other holder of the verification
+// host: every check's timeout times its attempts plus the test-binary build
+// allowance (the serial sum, an upper bound under every scheduler rule),
+// clamped to the holder cap. It is the number the run itself records in the
+// host lock; the per-check timers inside verify-matrix remain the real limit.
 export const MATRIX_BUILD_ALLOWANCE_MS = 1800000;
 export function matrixRunTimeout(plan) {
   const attempts = plan?.maxAttempts ?? 1;
   if (!Array.isArray(plan?.checks) || !plan.checks.length) throw releaseError("Matrix plan has no checks");
   if (!Number.isSafeInteger(attempts) || attempts < 1) throw releaseError("Invalid matrix attempt limit");
-  return plan.checks.reduce((total, check) => {
+  return Math.min(holderCapMs(), plan.checks.reduce((total, check) => {
     const raw = check?.environment?.VERIFICATION_TIMEOUT_MS, ms = Number(raw);
     if (typeof raw !== "string" || !/^[1-9][0-9]*$/.test(raw) || !Number.isSafeInteger(ms) || ms > 1800000) throw releaseError("Invalid matrix check timeout");
     return total + ms * attempts;
-  }, MATRIX_BUILD_ALLOWANCE_MS);
+  }, MATRIX_BUILD_ALLOWANCE_MS));
 }
-// Other verifiers run the matrix alone, so the in-release run waits for them.
-// Anchored at the node program: agent processes whose prompt merely quotes
-// "node scripts/verify-matrix.mjs run" must not count. Only the count is used.
-export const MATRIX_RUN_PATTERN = "^[^ ]*node[^ ]* ([^ ]*/)?scripts/verify-matrix\\.mjs (run|targeted) ";
+// The in-release run is a member of the verification host's ordered waitlist
+// (scripts/verify-matrix-host-lock.mjs) like any verifier's run: nothing here
+// counts processes. It waits at most this long for its turn.
 export const MATRIX_HOST_WAIT_MS = 7200000;
+// How long a launched run may take to appear in the lock file, how long a
+// stopped run gets before its group is killed, and the slack added to the
+// run's own wait and bound before the runner stops it.
+export const MATRIX_LAUNCH_GRACE_MS = 60000, MATRIX_STOP_GRACE_MS = 30000, MATRIX_DEADLINE_SLACK_MS = 60000;
+// The job's priority if the hub ever carries one, else the private config
+// key matrixPriority, else high.
+export function matrixPriority(job, config) {
+  const value = job?.priority ?? config?.matrixPriority ?? "high";
+  if (!PRIORITIES.includes(value)) throw releaseError("Invalid matrix priority");
+  return value;
+}
+const NAME = v => typeof v === "string" && /^[A-Za-z0-9_.-]{1,64}$/.test(v) ? v : "unknown";
+const ATTEMPT = /^[a-f0-9]{40}-r[0-9]{1,6}$/;
+// One wait notice per position, list length and holder. Only fixed-shape
+// names from the lock file reach the text.
+export function matrixWaitNotice(job, wait) {
+  if (!job?.id || !wait || !ATTEMPT.test(wait.attempt || "") || !Number.isSafeInteger(wait.position) || !Number.isSafeInteger(wait.length)) return null;
+  const h = wait.holder, pid = Number.isSafeInteger(h?.pid) ? h.pid : "unknown";
+  return {requestId: `${job.id}-matrix-wait-${wait.attempt}-p${wait.position}-of${wait.length}-${h ? NAME(h.id) : "none"}`, subject: "A release job is waiting for the verification host",
+    text: `Release ${job.id} waits for the verification host at position ${wait.position} of ${wait.length} at priority ${NAME(wait.priority)} ${h ? `behind ${NAME(h.item)}/${NAME(h.agent)}/pid ${pid}` : "with no holder"}`};
+}
+export function matrixHeldNotice(job, held) {
+  if (!job?.id || !held || !ATTEMPT.test(held.attempt || "")) return null;
+  const groups = (held.groups || []).filter(Number.isSafeInteger);
+  return {requestId: `${job.id}-matrix-held-${held.attempt}`, subject: "A release job is held until its matrix run is confirmed stopped",
+    text: `Release ${job.id} is held: its matrix run could not be confirmed stopped (pid ${Number.isSafeInteger(held.pid) ? held.pid : "unknown"}; check groups still alive: ${groups.join(",") || "none"}; ${REASON.test(held.reason || "") ? held.reason : "unclassified"}). It keeps the project release fence and no other job integrates. Confirm nothing of that run is alive, then follow the held matrix run step in docs/project-deployment.md.`};
+}
 const sha = s => /^[a-f0-9]{40}$/.test(s || "");
 const git = (cwd,...argv) => execFileSync("git",argv,{cwd,encoding:"utf8",stdio:["ignore","pipe","pipe"]}).trim();
 export function integrateCandidate(cwd, job, branch="tasks-hub") {
@@ -206,11 +235,15 @@ export async function runRelease(config, adapter) {
       await adapter.finish(state.receipt,state.finishGeneration);state.phase=state.receipt.outcome==="released"?"complete":"blocked";checkpoint();return state.receipt;
     }
     if(state.phase==="pushing")return await pushAndFinish(state.receipt);
+    // A job with no resumable journal (a requeue) first settles the matrix
+    // runs of its earlier attempts: until each is confirmed stopped, ended or
+    // set aside, nothing here touches the checkout, starts a run or refuses.
+    if(state.phase==="prepared" && adapter.settleMatrixRuns && await adapter.settleMatrixRuns(job)!==true)return {jobId:job.id,outcome:"waiting_matrix"};
     checkpoint();await fence();
     const integration=["waiting_matrix","waiting_inputs"].includes(state.phase)?{expected:state.expected,integrated:state.integrated}:integrateCandidate(cwd,job);state.integrated=integration.integrated;state.expected=integration.expected;state.phase="integrated";checkpoint();
     if(integration.integrated!==job.commit){
-      // Saved before the matrix runs, so a runner stopped during a long run
-      // resumes this job instead of leaving an ambiguous journal.
+      // Saved before the matrix run is started, so a runner stopped while
+      // the run waits or runs resumes this job from its attempt record.
       state.phase="waiting_matrix";checkpoint();
       await fence();if(await adapter.verifyIntegrated({...job,integratedCommit:integration.integrated})!==true)return {jobId:job.id,outcome:"waiting_matrix"};
       state.phase="integrated";checkpoint();
@@ -325,7 +358,10 @@ export async function runRelease(config, adapter) {
 export class HostAdapter {
   constructor(config,job){this.config=config;this.job=job;this.artifacts=new Map();this.serial=0;this.now=()=>Date.now();
     // The TailOS poller's fetch and clock; tests replace them.
-    this.probeDeps={fetchJSON:hostDeps.fetchJSON,sleep:hostDeps.sleep,now:hostDeps.now};this.probeWaits=new Map();}
+    this.probeDeps={fetchJSON:hostDeps.fetchJSON,sleep:hostDeps.sleep,now:hostDeps.now};this.probeWaits=new Map();
+    // Matrix runs this process started (attempt directory -> child), and what
+    // the last poll saw: a wait on the host list, or a held run.
+    this.matrixChildren=new Map();this.matrixWait=null;this.matrixHeld=null;}
   command(argv,cwd=this.config.cwd,{timeout=600000}={}){
     if(!Array.isArray(argv)||!argv.length||argv.some(a=>typeof a!=="string"||/[\0\r\n]/.test(a)))throw new Error("Invalid host operation argv");
     try{return execFileSync(argv[0],argv.slice(1),{cwd,encoding:"utf8",stdio:["ignore","pipe","pipe"],maxBuffer:8*1024*1024,timeout});}
@@ -356,16 +392,16 @@ export class HostAdapter {
     if(!sha(job.integratedCommit))throw new Error("Exact integrated commit required");
     const dir=join(this.config.journalDirectory,job.id+"-integrated-verification",`${job.integratedCommit}-r${job.reconciliations?.length||0}`);mkdirSync(dir,{recursive:true,mode:0o700});
     const contextPath=join(dir,"context.json"),planPath=join(dir,"plan.json"),receiptPath=join(dir,"receipt.json");
-    if(!existsSync(receiptPath)){
-      const missing=missingPrerequisites(this.config.cwd);if(missing.length)throw prerequisiteError(missing);
-      const matrix=this.integratedMatrix(job,current);
-      if(!this.matrixHostFree(dir))return false;
-      save(contextPath,{...job.plan,...matrix,commit:job.integratedCommit,verifierAgentId:this.job.agentId,verifierRunId:this.job.runId});
-      this.command(["node","scripts/verify-matrix.mjs","plan",contextPath,planPath]);
-      const timeout=matrixRunTimeout(JSON.parse(readFileSync(planPath,"utf8")));
-      this.command(["node","scripts/verify-matrix.mjs","run",planPath,dir],this.config.cwd,{timeout});
+    this.matrixWait=null;this.matrixHeld=null;
+    let run=this.readRun(dir);
+    if(!run && !existsSync(receiptPath))return this.launchMatrixRun(job,current,dir,{contextPath,planPath});
+    if(run && run.state!=="ended"){
+      if(this.resolveMatrixRun(dir,run)!=="ended")return false;
+      run=this.readRun(dir);
     }
-    // A receipt left by a run that outlived its runner is imported only when eligible.
+    if(run?.refusal)throw releaseError(run.refusal);
+    if(!existsSync(receiptPath))throw releaseError("Integrated matrix run ended without a receipt");
+    // The receipt is read only once its run is gone, and imported only when eligible.
     if(!receiptEligible(JSON.parse(readFileSync(receiptPath,"utf8"))))throw releaseError("Integrated matrix receipt is not eligible");
     this.command([this.config.tt||"tt","send","--kind","request","--to",this.handler(),"--subject","Import verification for the integrated release commit","--ask",`Import release verification plan and receipt for job ${job.id} integrated commit ${job.integratedCommit} through tt deployment verification --plan-file and --file. Preserve exact job generation and inspect logs; release publication waits for saved import.`,"--request-id",`${job.id}-integrated-matrix-${job.integratedCommit}`,"--ref",`release-job=${job.id}`,"--ref",`integrated-commit=${job.integratedCommit}`,"--attachment",planPath,"--attachment",receiptPath]);
     return false;
@@ -386,23 +422,146 @@ export class HostAdapter {
     if(!(seq>0))throw releaseError(`Matrix digest changed ${approved.slice(0,8)} to ${integrated.slice(0,8)}; no owner approval covers it`);
     return {approvedMatrixDigest:integrated,matrixApprovalMessageSeq:seq};
   }
-  // Count only: no process's argv, environment, files or output is read, and
-  // nothing is signalled. pgrep exits 1 when no process matches.
-  matrixRunsActive(exec=execFileSync){
-    let out;try{out=exec("pgrep",["-f",MATRIX_RUN_PATTERN],{encoding:"utf8",stdio:["ignore","pipe","ignore"],timeout:5000});}
-    catch(error){if(error?.status===1)return 0;throw releaseError("Matrix host probe unavailable");}
-    return String(out).split("\n").filter(l=>/^[0-9]+$/.test(l.trim())).length;
-  }
-  // While another matrix run is active the job keeps waiting_matrix and the
-  // daemon's next poll retries; the first busy time bounds the wait.
-  matrixHostFree(dir){
-    const path=join(dir,"host-wait.json"),bound=this.config.matrixHostWaitMs??MATRIX_HOST_WAIT_MS;
-    if(!Number.isSafeInteger(bound)||bound<=0)throw releaseError("Invalid matrix host wait");
-    if(this.matrixRunsActive()===0){rmSync(path,{force:true});return true;}
-    let since;try{since=JSON.parse(readFileSync(path,"utf8")).since;}catch{}
-    if(!Number.isSafeInteger(since)){since=this.now();save(path,{since});}
-    if(this.now()-since>=bound){rmSync(path,{force:true});throw releaseError("Host busy with another verify-matrix run");}
+  // The attempt record DIR/run.json: "starting" is saved before the run is
+  // spawned, "started" names its pid and process start time, "ended" is final.
+  // A launch is never replayed: whatever the record says, no second run is
+  // started in the same directory.
+  launchMatrixRun(job,current,dir,{contextPath,planPath}){
+    const missing=missingPrerequisites(this.config.cwd);if(missing.length)throw prerequisiteError(missing);
+    const matrix=this.integratedMatrix(job,current),priority=matrixPriority(job,this.config);
+    const wait=this.config.matrixHostWaitMs??MATRIX_HOST_WAIT_MS;
+    if(!Number.isSafeInteger(wait)||wait<=0)throw releaseError("Invalid matrix host wait");
+    const minutes=Math.min(1440,Math.max(1,Math.floor(wait/60000)));
+    save(contextPath,{...job.plan,...matrix,commit:job.integratedCommit,verifierAgentId:this.job.agentId,verifierRunId:this.job.runId});
+    this.command(["node","scripts/verify-matrix.mjs","plan",contextPath,planPath]);
+    const boundMs=matrixRunTimeout(JSON.parse(readFileSync(planPath,"utf8")));
+    const run={version:1,state:"starting",launchedAt:this.now(),priority,hostWaitMs:minutes*60000,boundMs};
+    // A failed intent save starts nothing and takes the ordinary refusal path.
+    this.saveRun(dir,run);
+    let pid;
+    try{pid=this.startMatrixRun(["node","scripts/verify-matrix.mjs","run",planPath,dir,"--priority",priority,"--item",NAME(job.itemId??this.job.itemId),"--host-wait-minutes",String(minutes)],dir);if(!Number.isSafeInteger(pid)||pid<=0)throw new Error("No matrix run pid");}
+    catch{
+      // Nothing was started, so this attempt is over.
+      try{this.saveRun(dir,{...run,state:"ended",reason:"spawn-failed",refusal:"Integrated matrix run could not start"});}catch{}
+      throw releaseError("Integrated matrix run could not start");
+    }
+    // A run now exists, so a failed save must not refuse: the job keeps the
+    // fence and the next poll adopts the run from the lock file.
+    try{this.saveRun(dir,{...run,state:"started",pid,processStartedAt:this.processStartTime(pid),groups:[]});}catch{}
     return false;
+  }
+  // Detached, so the run outlives a stopped runner; it is its own group leader.
+  startMatrixRun(argv,dir){
+    const out=openSync(join(dir,"run.out"),"a",0o600),err=openSync(join(dir,"run.err"),"a",0o600);
+    try{
+      const child=spawn(argv[0],argv.slice(1),{cwd:this.config.cwd,detached:true,stdio:["ignore",out,err]});
+      child.on("error",()=>{});
+      if(!Number.isSafeInteger(child.pid))throw new Error("Matrix run not started");
+      child.unref();this.matrixChildren.set(dir,child);return child.pid;
+    }finally{closeSync(out);closeSync(err);}
+  }
+  saveRun(dir,run){save(join(dir,"run.json"),run);}
+  // null: no record. A record moved to run.json.set-aside counts as ended.
+  readRun(dir){
+    const path=join(dir,"run.json");let raw;
+    try{raw=readFileSync(path,"utf8");}catch(error){return error.code!=="ENOENT"?{state:"unreadable"}:existsSync(path+".set-aside")?{state:"ended",reason:"set-aside"}:null;}
+    try{const run=JSON.parse(raw);return ["starting","started","ended"].includes(run?.state)?run:{state:"unreadable"};}catch{return {state:"unreadable"};}
+  }
+  // One pid only; the text is compared, never parsed for anything but order.
+  processStartTime(pid){
+    try{return execFileSync("ps",["-o","lstart=","-p",String(pid)],{encoding:"utf8",stdio:["ignore","pipe","ignore"],timeout:5000}).trim()||null;}catch{return null;}
+  }
+  signalProcess(target,name){process.kill(target,name);}
+  pidGone(pid){return pidGone(pid);}
+  groupGone(pgid){return groupGone(pgid);}
+  hostState(){return readHostState(lockPath());}
+  // The run's entry in the host lock file, found by its output directory:
+  // null when it has none, undefined when the file cannot be read.
+  matrixEntry(dir){
+    let state;try{state=this.hostState();}catch{return undefined;}
+    if(!state)return null;
+    const output=resolve(dir);
+    if(state.holder?.output===output)return {state,role:"holder",entry:state.holder};
+    const index=state.waiters.findIndex(w=>w?.output===output);
+    return index<0?null:{state,role:"waiter",index,entry:state.waiters[index]};
+  }
+  // The outcome the run itself recorded on leaving the list (released,
+  // wait-expired, withdrawn, or a failure while waiting); null until then.
+  matrixSidecar(dir){
+    try{const outcome=JSON.parse(readFileSync(join(dir,"host-lock.json"),"utf8"))?.outcome;return typeof outcome==="string" && !["waiting","holding"].includes(outcome)?outcome:null;}catch{return null;}
+  }
+  // One non-blocking step for an attempt that is not ended: "waiting",
+  // "held" or "ended" (saved). With stop, the run is stopped now instead of at
+  // its deadline (an earlier attempt of a requeued job). A pid is signalled
+  // only with process-instance proof: this process holds the live child, or
+  // the pid's process start time is the one recorded at launch. A matching
+  // pid and directory in the lock file is not proof. Check groups are never
+  // signalled. Held means the run could not be confirmed stopped; the job
+  // then keeps the fence until it can.
+  resolveMatrixRun(dir,run,stop=false){
+    const now=this.now(),child=this.matrixChildren.get(dir),found=this.matrixEntry(dir),sidecar=this.matrixSidecar(dir);
+    const persist=()=>{try{this.saveRun(dir,run);return true;}catch{return false;}};
+    const alive=()=>[...new Set([...(run.snapshot?.groups||[]),...(run.groups||[])])].filter(g=>!this.groupGone(g));
+    const held=reason=>{persist();this.matrixHeld={attempt:basename(dir),pid:run.pid??null,groups:run.state==="started"?alive():[],reason};return "held";};
+    const end=(reason,refusal)=>{Object.assign(run,{state:"ended",reason,endedAt:now,...(refusal?{refusal}:{})});return persist()?"ended":"waiting";};
+    const ending=()=>run.stopRequestedAt?end("stopped","Integrated matrix run exceeded its bound"):sidecar==="wait-expired"?end("wait-expired","Verification host wait expired"):end("no-receipt","Integrated matrix run ended without a receipt");
+    if(run.state==="unreadable"){this.matrixHeld={attempt:basename(dir),pid:null,groups:[],reason:"attempt record unreadable"};return "held";}
+    if(run.state==="starting"){
+      // An unconfirmed launch: adopt the run from this process's child or
+      // from the lock file. No timer refuses it.
+      const pid=child?.pid??found?.entry.pid;
+      if(Number.isSafeInteger(pid) && pid>0){
+        // A lock-file pid is ours only if that process began before it joined.
+        const started=this.processStartTime(pid),ours=child || (started && Date.parse(started)<=Date.parse(found.entry.requestedAt)+1000);
+        Object.assign(run,{state:"started",pid,processStartedAt:ours?started:null,groups:[]});
+        if(!persist())return "waiting";
+      }
+      else if(sidecar)return ending();
+      else if(!stop && now-run.launchedAt<(this.config.matrixLaunchGraceMs??MATRIX_LAUNCH_GRACE_MS))return "waiting";
+      else return held("matrix run launch unconfirmed");
+    }
+    const mine=found && found.entry.pid===run.pid?found:null;
+    if(mine?.role==="holder")run.groups=[...new Set([...(run.groups||[]),...(mine.entry.groups||[]).filter(Number.isSafeInteger)])];
+    const exited=child?child.exitCode!==null||child.signalCode!==null:this.pidGone(run.pid);
+    if(!exited){
+      if(!stop && now<run.launchedAt+run.hostWaitMs+run.boundMs+RUN_TIMEOUT_GRACE_MS+MATRIX_DEADLINE_SLACK_MS){
+        const h=mine?.state.holder;
+        if(mine?.role==="waiter")this.matrixWait={attempt:basename(dir),position:mine.index+1,length:mine.state.waiters.length,priority:run.priority,holder:h?{id:h.id,item:h.item,agent:h.agent,pid:h.pid}:null};
+        persist();return "waiting";
+      }
+      if(!(run.pid>1) || (!child && !(run.processStartedAt && this.processStartTime(run.pid)===run.processStartedAt)))return held("no process-instance proof for the matrix run pid");
+      const grace=this.config.matrixStopGraceMs??MATRIX_STOP_GRACE_MS;
+      // SIGTERM takes the run's own interruption path: it stops its checks,
+      // removes its home and releases the host lock.
+      if(!run.stopRequestedAt){run.stopRequestedAt=now;persist();try{this.signalProcess(run.pid,"SIGTERM");}catch{}return "waiting";}
+      if(!run.killedAt && now-run.stopRequestedAt>=grace){run.killedAt=now;persist();try{this.signalProcess(-run.pid,"SIGKILL");}catch{}return "waiting";}
+      if(run.killedAt && now-run.killedAt>=grace)return held("matrix run pid still alive after SIGKILL");
+      persist();return "waiting";
+    }
+    run.goneAt??=now;
+    if(existsSync(join(dir,"receipt.json")) && !run.stopRequestedAt)return end("receipt");
+    if(!sidecar){
+      // Without the run's own release record, its check groups are known only
+      // from its lock entry as read after it was gone, which it can no longer
+      // change. Another waiter may have replaced that entry first.
+      if(mine)run.snapshot={at:now,role:mine.role,groups:(mine.entry.groups||[]).filter(Number.isSafeInteger)};
+      if(!run.snapshot)return held(found===undefined?"host lock file unreadable":"check group state cannot be shown");
+      if(alive().length)return held("a check group of the matrix run is still alive");
+    }
+    return ending();
+  }
+  // Every attempt of this job that is neither ended nor set aside is stopped
+  // and confirmed before the job integrates again. True when none remains.
+  async settleMatrixRuns(job){
+    this.matrixWait=null;this.matrixHeld=null;
+    const base=join(this.config.journalDirectory,job.id+"-integrated-verification");let names;
+    try{names=readdirSync(base).sort();}catch(error){if(error.code==="ENOENT")return true;this.matrixHeld={attempt:"",pid:null,groups:[],reason:"attempt records unreadable"};return false;}
+    let settled=true;
+    for(const name of names){
+      const dir=join(base,name),run=this.readRun(dir);
+      if(run && run.state!=="ended" && this.resolveMatrixRun(dir,run,true)!=="ended")settled=false;
+    }
+    return settled;
   }
   async verifyInputs(commit){
     const current=JSON.parse(this.command([this.config.tt||"tt","deployment","list"])).find(j=>j.id===this.job.id);
@@ -725,6 +884,15 @@ export async function serveDeployment(config,{once=false,signal,configPath,relea
     try{reader.command([config.tt||"tt","send","--kind","notice","--subject",notice.subject,"--text",notice.text,"--request-id",notice.requestId,"--ref",`release-job=${holder.id}`,"--ref",`waiting-job=${notice.waitingJobId}`]);posted.add(notice.requestId);}
     catch{process.stderr.write("Fence wait notice not posted; the next poll retries.\n");}
   };
+  // One notice per place on the verification host's waitlist (position, list
+  // length and holder), and one per held matrix run.
+  const matrixNotify=(reader,job,adapter)=>{
+    for(const notice of [matrixWaitNotice(job,adapter.matrixWait),matrixHeldNotice(job,adapter.matrixHeld)]){
+      if(!notice || posted.has(notice.requestId))continue;
+      try{reader.command([config.tt||"tt","send","--kind","notice","--subject",notice.subject,"--text",notice.text,"--request-id",notice.requestId,"--ref",`release-job=${job.id}`]);posted.add(notice.requestId);}
+      catch{process.stderr.write("Matrix host notice not posted; the next poll retries.\n");}
+    }
+  };
   while(!signal?.aborted){
     try {
     // An unreadable or invalid edit holds the whole poll, before any claim.
@@ -755,6 +923,7 @@ export async function serveDeployment(config,{once=false,signal,configPath,relea
       let result;
       try{result=await release({...activation,baselines,job:current,journalPath:join(config.journalDirectory,current.id+".json")},adapter);}catch{process.stderr.write("Release held; inspect handler fence and private journal.\n");}
       if(["waiting_matrix","waiting_inputs"].includes(result?.outcome))notify(reader,jobs,adapter.job||current,result.outcome);
+      matrixNotify(reader,adapter.job||current,adapter);
       break;
     }
     } catch {process.stderr.write("Deployment poll held; inspect native input or recovery evidence.\n");}

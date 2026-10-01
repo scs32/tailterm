@@ -201,6 +201,10 @@ func cmdTeamQueue(e env, args []string) error {
 			return nil
 		}
 		fmt.Printf("concurrency limit=%s\n", queueLimitText(list.ConcurrencyLimit))
+		matrix, matrixNotice := readMatrixWaitlist()
+		if matrixNotice != "" {
+			fmt.Println(matrixNotice)
+		}
 		for _, q := range list.Entries {
 			state := q.State
 			owns := strings.Join(q.Ownership, ",")
@@ -230,6 +234,9 @@ func cmdTeamQueue(e env, args []string) error {
 				fmt.Printf("  Ready to integrate: base=%s worktree=%s branch=%s commit=%s evidence=%s\n", q.Integration.BaseCommit, q.Integration.Worktree, q.Integration.Branch, q.Integration.Commit, q.Integration.Evidence)
 			} else if q.Acceptance != nil {
 				fmt.Printf("  Accepted for integration: worktree=%s branch=%s commit=%s; waiting for exact cleanup\n", q.Acceptance.Worktree, q.Acceptance.Branch, q.Acceptance.Commit)
+			}
+			for _, line := range matrix.waitLines(q) {
+				fmt.Println(line)
 			}
 		}
 		if h := list.History; h != nil {
@@ -844,6 +851,104 @@ func queueReleaseRequest(ctx context.Context, c *api.Client, hub, task string, q
 
 // queueAttemptText is the list suffix for an entry that is a later attempt of
 // its item or was rebound to an amended item revision.
+// The verification host's lock and waitlist: the JSON file
+// scripts/verify-matrix-host-lock.mjs keeps on the machine that runs the
+// matrix (docs/objective-verification.md, "Host lock and waitlist"). The list
+// reads it without the file's mutex; updates land by rename.
+type matrixHostEntry struct {
+	PID         int64  `json:"pid"`
+	Kind        string `json:"kind"`
+	Item        string `json:"item"`
+	Agent       string `json:"agent"`
+	Priority    string `json:"priority"`
+	RequestedAt string `json:"requestedAt"`
+}
+
+type matrixWaitlist struct {
+	Version int               `json:"version"`
+	Host    string            `json:"host"`
+	Holder  *matrixHostEntry  `json:"holder"`
+	Waiters []matrixHostEntry `json:"waiters"`
+}
+
+var matrixLocalHost = os.Hostname
+
+// matrixHostLabel is the first DNS label in lower case, so Stephens-Mini,
+// stephens-mini and Stephens-Mini.local name one machine.
+func matrixHostLabel(host string) string {
+	return strings.ToLower(strings.SplitN(strings.TrimSpace(host), ".", 2)[0])
+}
+
+// matrixName keeps a value from the file on one line.
+func matrixName(value string) string {
+	if value == "" {
+		return "unknown"
+	}
+	return strings.Map(func(r rune) rune {
+		if r <= ' ' || r == 0x7f {
+			return '_'
+		}
+		return r
+	}, value)
+}
+
+// readMatrixWaitlist returns this machine's waitlist, or nil with one line
+// saying why none is shown. An absent file is a free host: nil and no line.
+func readMatrixWaitlist() (*matrixWaitlist, string) {
+	path := os.Getenv("TAILTERM_MATRIX_HOST_LOCK")
+	if path != "" && !filepath.IsAbs(path) {
+		return nil, "matrix host: TAILTERM_MATRIX_HOST_LOCK must be an absolute path; waitlist not shown"
+	}
+	if path == "" {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return nil, ""
+		}
+		path = filepath.Join(home, ".local/state/tailterm-matrix/host.json")
+	}
+	unusable := func(reason string) (*matrixWaitlist, string) {
+		return nil, fmt.Sprintf("matrix host: lock file %s unusable (%s); waitlist not shown", path, reason)
+	}
+	raw, err := os.ReadFile(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, ""
+	}
+	if err != nil {
+		return unusable("unreadable")
+	}
+	var list matrixWaitlist
+	if json.Unmarshal(raw, &list) != nil {
+		return unusable("not JSON")
+	}
+	if list.Version != 1 {
+		return unusable("unknown version")
+	}
+	local, _ := matrixLocalHost()
+	if matrixHostLabel(list.Host) != matrixHostLabel(local) {
+		return nil, fmt.Sprintf("matrix host: lock file %s belongs to host %s; waitlist not shown", path, matrixName(list.Host))
+	}
+	return &list, ""
+}
+
+// waitLines is one line per run of the entry's item that waits for the
+// verification host, with its place in the file's order.
+func (m *matrixWaitlist) waitLines(q api.TeamQueueEntry) []string {
+	if m == nil || q.State == "failed" || q.ItemID == "" || matrixHostLabel(q.Host) != matrixHostLabel(m.Host) {
+		return nil
+	}
+	holder := "none"
+	if h := m.Holder; h != nil {
+		holder = fmt.Sprintf("%s/%s/pid %d", matrixName(h.Item), matrixName(h.Agent), h.PID)
+	}
+	var lines []string
+	for i, w := range m.Waiters {
+		if w.Item == q.ItemID {
+			lines = append(lines, fmt.Sprintf("  waiting-for-matrix position=%d of %d holder=%s priority=%s kind=%s agent=%s since=%s", i+1, len(m.Waiters), holder, matrixName(w.Priority), matrixName(w.Kind), matrixName(w.Agent), matrixName(w.RequestedAt)))
+		}
+	}
+	return lines
+}
+
 func queueAttemptText(q api.TeamQueueEntry) string {
 	text := ""
 	if q.Attempt > 1 {

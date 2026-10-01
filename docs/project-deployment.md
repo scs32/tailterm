@@ -180,7 +180,7 @@ and the first release are separate operational steps.
 A cherry-picked candidate is verified by the runner itself: `verify-matrix.mjs
 plan` then `run` in the deployer's checkout, then an import request to the
 handler. Three things make that run succeed or fail for a named reason
-(incident #15749).
+(incident #15749; the host waitlist is `wi_c5cb667695c3614c`).
 
 - **Prerequisites.** The five files `verify-matrix.mjs` requires are
   `node_modules/.package-lock.json`, `wasm/tailserve.wasm`, `.build/test.wasm`,
@@ -202,39 +202,124 @@ handler. Three things make that run succeed or fail for a named reason
   selected. For an existing deployer checkout, run the provisioning command
   above in it (deployer retired between releases). Before the matrix runs, the
   runner checks the same five files and refuses a missing one by name.
-- **Timeout.** The `run` call gets its own bound from the plan: the sum over
-  its checks of `VERIFICATION_TIMEOUT_MS` times `maxAttempts`, plus 30 minutes
-  for test-binary builds, with no further cap (the worked example: go-race
-  1800000 and npm-unit 120000 at 3 attempts is 7560000 ms). The per-check timers
-  inside the matrix remain the real limit. Every other host command keeps the
-  600-second limit. A check limit that is missing or above 1800000 refuses.
-- **Other matrix runs.** Verifiers run the matrix alone, so the runner waits
-  while `pgrep -f '^[^ ]*node[^ ]* ([^ ]*/)?scripts/verify-matrix\.mjs
-  (run|targeted) '` counts any process. The pattern is anchored at the node
-  program, because agent processes whose prompt quotes the matrix command would
-  otherwise count. Only the count is used: no other process's argv,
-  environment, files or output is read, and nothing is signalled. While busy the
-  job stays `waiting_matrix`, no plan, run or import request is made, and the
-  next poll (about 30 seconds) retries. The first busy time is kept in
-  `host-wait.json` in the attempt directory (below); after 2 hours (private
-  config key `matrixHostWaitMs`) the job is refused and the record removed. The probe narrows, but does not close,
-  the race with a verifier starting at the same moment; the matrix still refuses
-  an occupied port.
+- **Bound.** The run's bound is the one every holder of the verification host
+  records: the sum over its checks of `VERIFICATION_TIMEOUT_MS` times
+  `maxAttempts`, plus 30 minutes for test-binary builds, clamped to the holder
+  cap (`TAILTERM_MATRIX_HOLDER_CAP_MINUTES`, default 120 minutes; see
+  [objective verification](objective-verification.md), "Host lock and
+  waitlist"). The worked example, go-race 1800000 and npm-unit 120000 at 3
+  attempts, sums to 7560000 ms and is bounded at 7200000. The run stops itself
+  at that bound; the per-check timers inside the matrix remain the real limit.
+  Every other host command keeps the 600-second limit. A check limit that is
+  missing or above 1800000 refuses.
+- **The shared order.** The run is a member of the verification host's ordered
+  waitlist, exactly like a verifier's run: urgent first, then high, then
+  normal, first come first served within a priority. The runner counts no
+  processes and never waits for a quiet host. It starts the run detached as
+  `node scripts/verify-matrix.mjs run PLAN DIR --priority P --item ITEM
+  --host-wait-minutes N`, and that run takes its turn on the list.
+  - `P` is the job's `priority` if the hub ever carries one, else the private
+    config key `matrixPriority`, else `high`. Any value other than `urgent`,
+    `high` or `normal` refuses the job as `Invalid matrix priority` before a
+    plan or run is made.
+  - `N` is `matrixHostWaitMs` in whole minutes (default 2 hours, at least 1).
+    A run still waiting then leaves the list and the job is refused as
+    `Verification host wait expired`.
+  - While the run waits, the deployer posts one notice per change of its place:
+    "A release job is waiting for the verification host", with `Release JOB
+    waits for the verification host at position P of N at priority X behind
+    ITEM/AGENT/pid PID` (or `with no holder`). The request id is
+    `JOB-matrix-wait-COMMIT-rN-pP-ofN-HOLDERID`, so an unchanged poll posts
+    nothing. `tt team queue list` and `node scripts/verify-matrix-host-lock.mjs
+    status` show the same place.
 
-The context, plan, receipt, logs and host wait live in
+The context, plan, receipt, logs and the attempt record live in
 `journalDirectory/ID-integrated-verification/COMMIT-rN`, keyed by the integrated
 commit and the job's reconciliation count, so a handler requeue starts a fresh
-wait and a fresh run instead of reusing an earlier attempt's receipt.
-The journal is saved as `waiting_matrix` before the run starts and returns to
-`integrated` once the imported receipt is found, so a runner stopped during a
-long run resumes the same job (its host lock still needs the usual inspection).
-A receipt such a run leaves behind is imported only when eligible. A refusal
-before publication records `refusalReason` in the journal and posts "Release
-refused before publication" with that reason: `Missing matrix prerequisites:
-PATHS`, `Host busy with another verify-matrix run`, `Matrix host probe
-unavailable`, `Invalid matrix check timeout`, `Integrated matrix receipt is not
-eligible`, `Matrix digest changed OLD8 to NEW8; no owner approval covers it`
-(below), `verify-matrix.mjs timeout` or `exit N`, or `unclassified` for an
+run instead of reusing an earlier attempt's receipt. The run's output is in
+`run.out` and `run.err` there, with its `host-lock.log` and `host-lock.json`.
+
+**The attempt record.** `run.json` in that directory says what the runner knows
+about the attempt's one run. A run is never started twice in one directory.
+
+| `state` | Meaning |
+|---|---|
+| `starting` | Saved before the run is spawned, with `launchedAt`, `priority`, `hostWaitMs` and `boundMs`. If this save fails nothing is started. |
+| `started` | The run exists: `pid`, `processStartedAt` (its process start time, or null when it could not be read) and `groups`, every check group the runner has seen it record in the lock file. |
+| `ended` | Final, with `reason` (`receipt`, `stopped`, `wait-expired`, `no-receipt` or `spawn-failed`) and, for a refusal, its name. |
+
+The journal is saved as `waiting_matrix` before the run is started, and every
+poll returns at once, so the host release lock is not held while the run waits
+or runs. A runner restarted between polls finds the journal and `run.json` and
+resumes the same run without starting another. A `starting` record with no pid
+(the save after the spawn failed, or the runner stopped in between) is resolved
+from the lock file: the entry whose `output` is the attempt directory is
+adopted. The receipt is read only once the run is gone, and imported only when
+eligible; the journal returns to `integrated` once the imported receipt is
+found.
+
+**Stopping a run.** The runner stops its own run only past
+`launchedAt + hostWaitMs + boundMs + 120 s + 60 s`, or when a requeued job finds
+an earlier attempt's run still alive. It takes one step per poll:
+
+1. Process-instance proof first: this runner process started the run and still
+   holds it, or the pid's current process start time equals `processStartedAt`.
+   A matching pid and directory in the lock file is not proof. Without proof
+   nothing is signalled.
+2. SIGTERM to the run. The run's own interruption path stops its checks,
+   removes its home and releases the host lock.
+3. After 30 seconds, with the same proof, SIGKILL to the run's own process
+   group. Check groups are separate groups and the runner never signals them.
+4. The run is confirmed stopped when its pid is gone and either its own
+   `host-lock.json` records that it left the list, or its lock entry, read
+   after the pid was gone, shows no check group still alive (nor any group in
+   `run.json`). Only then is the job refused, as `Integrated matrix run
+   exceeded its bound`.
+
+**Held.** When a run cannot be confirmed stopped, the job is held, not
+refused: it stays `waiting_matrix` with the project fence, the deployer keeps
+choosing it first so no other job integrates, and one notice is posted, "A
+release job is held until its matrix run is confirmed stopped" (`Release JOB is
+held: its matrix run could not be confirmed stopped`, with the pid, the check
+groups still alive and the reason; request id `JOB-matrix-held-COMMIT-rN`). The
+reasons:
+
+- `matrix run launch unconfirmed`: a `starting` record whose run has not
+  appeared in the lock file within 60 seconds. No timer refuses it: it is held
+  until the run appears (and is adopted) or its `host-lock.json` shows it
+  left the list.
+- `no process-instance proof for the matrix run pid`: the pid is alive but may
+  be another process.
+- `matrix run pid still alive after SIGKILL`.
+- `a check group of the matrix run is still alive`: the notice names the groups.
+- `check group state cannot be shown`: the run is gone without a release record
+  and another waiter replaced its lock entry before the runner read it.
+- `host lock file unreadable`, `attempt record unreadable`.
+
+A held job resumes by itself once the evidence is complete (the group ends, the
+run appears). Otherwise a person acts: the handler or owner confirms that no
+process of that run exists (`ps -p PID`, `pgrep -g GROUP`, and `status` for the
+host lock), then moves the attempt's `run.json` to `run.json.set-aside`. The
+runner treats a set-aside record as ended. Never delete it.
+
+**Requeue.** Before a job with no resumable journal touches the checkout, the
+runner settles every earlier attempt of that job whose `run.json` is neither
+ended nor set aside: a `started` run still alive is stopped as above, and an
+unconfirmed `starting` record is held. Until all are settled the job stays
+`waiting_matrix`: no checkpoint, no integration, no new run, no refusal. For the
+handler, `noActiveExecution` in a reconcile or set-aside record therefore
+includes "no live run named in the attempt's `run.json`" as well as no runner
+holding the host release lock.
+
+A refusal before publication records `refusalReason` in the journal and posts
+"Release refused before publication" with that reason. The six names from the
+integrated run are `Integrated matrix run could not start`, `Verification host
+wait expired`, `Integrated matrix run ended without a receipt`, `Integrated
+matrix run exceeded its bound`, `Invalid matrix priority` and `Invalid matrix
+host wait`. The others are `Missing matrix prerequisites: PATHS`, `Invalid
+matrix check timeout`, `Integrated matrix receipt is not eligible`, `Matrix
+digest changed OLD8 to NEW8; no owner approval covers it` (below),
+`verify-matrix.mjs timeout` or `exit N` from the plan command, or `unclassified` for an
 untagged error. It never claims a rollback was attempted.
 
 **A matrix changed after approval (wi_715ea343cc605b1c).** A job is approved
@@ -565,6 +650,8 @@ targets.mini     {installPath, relayRestart: [...], relayLog, relayLabel, livePr
 targets.tailos   {url (optional), switchWindowMs (optional, 0-300000, default 90000)}
 inputs.planTemplate  path to the handler's last TrueNAS preflight plan (template)
 retention        {releasedBackups (optional, integer >= 0, default 3), backupBudgetBytes (optional, integer >= 0, default 4294967296; 0 = no budget)}
+matrixPriority   optional: urgent, high or normal; the integrated run's place class on the verification host (default high)
+matrixHostWaitMs optional: how long the integrated run waits for the verification host (default 7200000)
 ```
 
 `liveProbe` is `["node","scripts/release-probe.mjs","live",TARGET,"--config",PATH]`.
@@ -682,7 +769,14 @@ deployer with the rest of the project; resuming then needs provisioning again.
 **Reconcile.** A `blocked` job, an ambiguous journal or a stale host lock needs
 `tt deployment reconcile` with a typed inspection (above). The journal's
 `failure` field says which step failed and why. Never delete the
-journal or lock by hand.
+journal or lock by hand. The inspection's "no active execution" covers the
+integrated matrix run as well: read `run.json` in each attempt directory of the
+job and confirm the pid it names is gone (above, "Requeue").
+
+**Held matrix run.** A notice "A release job is held until its matrix run is
+confirmed stopped" means the deployer will not refuse or move on by itself.
+Follow "Held" under integrated-commit verification: confirm nothing of that
+run is alive, then move that attempt's `run.json` to `run.json.set-aside`.
 
 **Set aside.** When a fence-wait notice says a claim with no effects blocks a
 later job, the handler, under a recorded order, first confirms no host release

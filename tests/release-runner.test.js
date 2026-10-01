@@ -1,13 +1,18 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import {mkdtempSync,mkdirSync,writeFileSync,readFileSync,chmodSync,existsSync,statSync,readdirSync,rmSync,symlinkSync} from "node:fs";
+import {mkdtempSync,mkdirSync,writeFileSync,readFileSync,chmodSync,existsSync,statSync,readdirSync,rmSync,symlinkSync,renameSync} from "node:fs";
 import {tmpdir} from "node:os";
 import {join,dirname} from "node:path";
-import {execFileSync,spawn} from "node:child_process";
-import {integrateCandidate,publishIntegration,runRelease,liveCheck,runnableJob,HostAdapter,serveDeployment,retentionPolicy,pruneJournal,reconcileHostLocks,revertCommit,moveReleaseRef,tasksHubCheckedOut,releaseError,failureReason,MATRIX_PREREQUISITES,MATRIX_RUN_PATTERN,MATRIX_HOST_WAIT_MS,missingPrerequisites,provisionPrerequisites,matrixRunTimeout} from "../scripts/release-runner.mjs";
+import {execFileSync,spawn,spawnSync} from "node:child_process";
+import {integrateCandidate,publishIntegration,runRelease,liveCheck,runnableJob,HostAdapter,serveDeployment,hostLockNames,retentionPolicy,pruneJournal,reconcileHostLocks,revertCommit,moveReleaseRef,tasksHubCheckedOut,releaseError,failureReason,MATRIX_PREREQUISITES,MATRIX_HOST_WAIT_MS,MATRIX_LAUNCH_GRACE_MS,MATRIX_STOP_GRACE_MS,MATRIX_DEADLINE_SLACK_MS,missingPrerequisites,provisionPrerequisites,matrixRunTimeout,matrixPriority,matrixWaitNotice,matrixHeldNotice} from "../scripts/release-runner.mjs";
+import {acquireHostLock,readHostState,readJournal,updateHostState,pidGone,groupGone,RUN_TIMEOUT_GRACE_MS,DEFAULT_HOLDER_CAP_MS} from "../scripts/verify-matrix-host-lock.mjs";
+import {planRunTimeout} from "../scripts/verify-matrix.mjs";
 import {createHash} from "node:crypto";
 import {renderTeamDelivery} from "../client/team-delivery-view.js";
 import {targetsForPaths,selectReleaseTargets} from "../scripts/release-targets.mjs";
+// No test here may fall back to the host's own verification lock file.
+process.env.TAILTERM_MATRIX_HOST_LOCK=join(mkdtempSync(join(tmpdir(),"release-matrix-lock-")),"host.json");
+delete process.env.TAILTERM_MATRIX_PRIORITY;delete process.env.TAILTERM_MATRIX_HOLDER_CAP_MINUTES;
 const git=(cwd,...args)=>execFileSync("git",args,{cwd,encoding:"utf8",stdio:["ignore","pipe","pipe"]}).trim();
 function fixture(){const cwd=mkdtempSync(join(tmpdir(),"release-git-")),origin=mkdtempSync(join(tmpdir(),"release-origin-"));git(origin,"init","--bare","-b","tasks-hub");git(cwd,"init","-b","tasks-hub");git(cwd,"config","user.email","fixture@example.invalid");git(cwd,"config","user.name","Fixture");mkdirSync(join(cwd,"client"));writeFileSync(join(cwd,"client/base.js"),"base");git(cwd,"add",".");git(cwd,"commit","-m","base");const base=git(cwd,"rev-parse","HEAD");git(cwd,"remote","add","origin",origin);git(cwd,"push","--quiet","origin","tasks-hub");git(cwd,"checkout","-b","candidate");return {cwd,base,origin};}
 function change(f,file,text){writeFileSync(join(f.cwd,file),text);git(f.cwd,"add",".");git(f.cwd,"commit","-m","candidate");return git(f.cwd,"rev-parse","HEAD");}
@@ -527,25 +532,29 @@ const RUNNER=new URL("../scripts/release-runner.mjs",import.meta.url).pathname;
 const ignorePrerequisites=cwd=>writeFileSync(join(cwd,".git/info/exclude"),"node_modules/\n.build/\nwasm/*.wasm\n");
 function placePrerequisites(dir,skip=[]){for(const p of MATRIX_PREREQUISITES.filter(p=>!skip.includes(p))){mkdirSync(join(dir,dirname(p)),{recursive:true});writeFileSync(join(dir,p),"fixture "+p);}}
 const workedPlan={maxAttempts:3,checks:[{id:"go-race",environment:{VERIFICATION_TIMEOUT_MS:"1800000"}},{id:"npm-unit",environment:{VERIFICATION_TIMEOUT_MS:"120000"}}]};
+const exitedPid=()=>spawnSync(process.execPath,["-e",""]).pid;
 const attemptDir=(home,commit,n)=>join(home,"rel_fixture-integrated-verification",`${commit}-r${n}`);
 function matrixHost({plan=workedPlan,receipt={environment:{},checks:[{exitCode:0}]},jobs=[]}={}){
  const f=fixture(),home=mkdtempSync(join(tmpdir(),"matrix-host-"));ignorePrerequisites(f.cwd);placePrerequisites(f.cwd);
  const adapter=new HostAdapter({cwd:f.cwd,journalDirectory:home},{id:"rel_fixture",agentId:"agt_fixture",runId:"run_fixture",generation:1});
- const calls=[];adapter.matrixRunsActive=()=>0;
+ // The stub run has already ended with this receipt when the next poll looks.
+ const calls=[];adapter.processStartTime=()=>null;
+ adapter.startMatrixRun=(argv,dir)=>{calls.push({argv,dir});writeFileSync(join(dir,"receipt.json"),JSON.stringify(receipt));return exitedPid();};
  adapter.command=(argv,cwd,options)=>{calls.push({argv,timeout:options?.timeout??600000});
   if(argv[1]==="deployment"&&argv[2]==="list")return JSON.stringify(jobs);
   if(argv[1]==="deployment"&&argv[2]==="handler")return JSON.stringify({id:"agt_0123abcd"});
   if(argv[1]==="scripts/verify-matrix.mjs"&&argv[2]==="plan"){writeFileSync(argv[4],JSON.stringify(plan));return "";}
-  if(argv[1]==="scripts/verify-matrix.mjs"&&argv[2]==="run"){writeFileSync(join(argv[4],"receipt.json"),JSON.stringify(receipt));return "";}
   return "";};
  const integrated={id:"rel_fixture",integratedCommit:"c".repeat(40),plan:{commit:"a".repeat(40)}};
- return {f,home,adapter,calls,integrated,matrix:()=>calls.filter(c=>c.argv[1]==="scripts/verify-matrix.mjs"),sends:()=>calls.filter(c=>c.argv[1]==="send")};
+ // One poll starts the run, the next finds it ended.
+ const verify=async j=>{await adapter.verifyIntegrated(j);return adapter.verifyIntegrated(j);};
+ return {f,home,adapter,calls,integrated,verify,run:(n=0,commit=integrated.integratedCommit)=>JSON.parse(readFileSync(join(attemptDir(home,commit,n),"run.json"),"utf8")),matrix:()=>calls.filter(c=>c.argv[1]==="scripts/verify-matrix.mjs"),sends:()=>calls.filter(c=>c.argv[1]==="send")};
 }
 test("p1 a missing matrix prerequisite refuses the release by name before any matrix run",async()=>{
  const f=fixture(),j=job(f,change(f,"client/a.js","a"));git(f.cwd,"checkout","tasks-hub");change(f,"client/c.js","c");
  ignorePrerequisites(f.cwd);placePrerequisites(f.cwd,[".build/test.wasm"]);
  const c=config(f,j),a=fake(),argvs=[];let escalation;
- const host=new HostAdapter({cwd:f.cwd,journalDirectory:dirname(c.journalPath)},{id:"rel_fixture"});host.command=argv=>{argvs.push(argv);return argv[2]==="list"?"[]":"";};host.matrixRunsActive=()=>0;
+ const host=new HostAdapter({cwd:f.cwd,journalDirectory:dirname(c.journalPath)},{id:"rel_fixture"});host.command=argv=>{argvs.push(argv);return argv[2]==="list"?"[]":"";};
  a.verifyIntegrated=x=>host.verifyIntegrated(x);a.escalate=async d=>{escalation=d;a.calls.push("escalate");};
  await assert.rejects(runRelease(c,a),/refused/);
  assert.deepEqual(a.calls,["refuse","escalate"]);assert.ok(!argvs.some(x=>x.includes("scripts/verify-matrix.mjs")),"no matrix argv");
@@ -598,53 +607,343 @@ test("p1 the provisioning command prints the prerequisites, or only the named re
  const r=execFileSync(process.execPath,["-e",`const r=require("child_process").spawnSync(process.execPath,${JSON.stringify([RUNNER,"--provision-prerequisites","--from",q.from])},{cwd:${JSON.stringify(q.cwd)},encoding:"utf8"});console.log(JSON.stringify({status:r.status,stdout:r.stdout,stderr:r.stderr}))`],{encoding:"utf8"});
  assert.deepEqual(JSON.parse(r),{status:1,stdout:"",stderr:"Missing matrix prerequisites: .build/go-modules.txt\n"});
 });
-test("p2 the matrix run gets a timeout derived from the plan and other commands keep the command limit",async()=>{
- assert.equal(matrixRunTimeout(workedPlan),7560000);
- assert.equal(matrixRunTimeout({checks:[{environment:{VERIFICATION_TIMEOUT_MS:"600000"}}]}),2400000,"a plan without maxAttempts runs each check once");
+// The integrated matrix run as a member of the verification host's ordered
+// waitlist (wi_c5cb667695c3614c). Each test uses its own lock file; the child
+// below is a real second process joining it the way a matrix run does.
+const LOCK_MODULE=new URL("../scripts/verify-matrix-host-lock.mjs",import.meta.url).href;
+const RUN_CHILD=`
+import fs from 'node:fs';
+import {spawn} from 'node:child_process';
+import {acquireHostLock} from ${JSON.stringify(LOCK_MODULE)};
+const o=JSON.parse(process.argv[2]);
+if(o.resist)process.on('SIGTERM',()=>{});
+const lease=await acquireHostLock({path:o.path,priority:o.priority,prioritySource:'flag',item:o.item,agent:'deployer',output:o.dir,recordDirectory:o.dir,runTimeoutMs:600000,pollMs:20});
+let group=null;
+if(o.group){const c=spawn(process.execPath,['-e','setInterval(()=>{},1000)'],{detached:true,stdio:'ignore'});await new Promise(r=>c.on('spawn',r));c.unref();group=c.pid;lease.addGroup(group);}
+if(o.mode==='receipt'){fs.writeFileSync(o.dir+'/receipt.json',JSON.stringify({environment:{},checks:[{exitCode:0}]}));await lease.release();process.exit(0);}
+if(!o.resist)process.on('SIGTERM',async()=>{await lease.release();process.exit(143);});
+fs.writeFileSync(o.marker,JSON.stringify({pid:process.pid,group}));
+setInterval(()=>{},1000);
+`;
+async function until(condition,what,ms=20000){const end=Date.now()+ms;for(;;){const v=condition();if(v)return v;if(Date.now()>end)assert.fail("timed out waiting for "+what);await new Promise(r=>setTimeout(r,10));}}
+const ended=c=>c.exitCode!==null||c.signalCode!==null?Promise.resolve():new Promise(r=>c.once("exit",r));
+function idle(t){const c=spawn(process.execPath,["-e","setInterval(()=>{},1000)"],{detached:true,stdio:"ignore"});t.after(()=>{try{process.kill(c.pid,"SIGKILL");}catch{}});return c;}
+function lockHost(t,child={}){
+ const h=matrixHost(),script=join(h.home,"run-child.mjs");writeFileSync(script,RUN_CHILD);
+ h.path=join(mkdtempSync(join(tmpdir(),"runner-host-lock-")),"host.json");h.children=[];h.signals=[];h.dir=attemptDir(h.home,h.integrated.integratedCommit,0);
+ delete h.adapter.processStartTime;h.adapter.hostState=()=>readHostState(h.path);
+ h.adapter.signalProcess=(target,name)=>{h.signals.push([target,name]);process.kill(target,name);};
+ h.adapter.startMatrixRun=(argv,dir)=>{
+  const flag=name=>argv[argv.indexOf(name)+1];
+  const c=spawn(process.execPath,[script,JSON.stringify({path:h.path,dir,marker:join(dir,"marker"),priority:flag("--priority"),item:flag("--item"),mode:"hold",...child})],{detached:true,stdio:"ignore"});
+  h.calls.push({argv,dir});h.children.push(c);return c.pid;};
+ t.after(()=>{for(const c of h.children){try{process.kill(-c.pid,"SIGKILL");}catch{}}});
+ h.marker=()=>until(()=>existsSync(join(h.dir,"marker"))&&JSON.parse(readFileSync(join(h.dir,"marker"),"utf8")),"the run to hold the host");
+ h.starts=()=>h.matrix().filter(c=>c.argv[2]==="run").length;
+ h.deadline=()=>{const r=h.run();return r.launchedAt+r.hostWaitMs+r.boundMs+RUN_TIMEOUT_GRACE_MS+MATRIX_DEADLINE_SLACK_MS;};
+ return h;
+}
+const holderEntry=(pid,dir,extra={})=>({id:"00000000-0000-4000-8000-000000000001",seq:1,pid,kind:"run",item:"wi_fixture",agent:"deployer",priority:"high",prioritySource:"flag",requestedAt:new Date().toISOString(),runTimeoutMs:600000,output:dir,startedAt:new Date().toISOString(),groups:[],...extra});
+const otherHolder=()=>holderEntry(process.pid,"/elsewhere",{id:"00000000-0000-4000-8000-000000000002",item:"wi_other",agent:"verifier"});
+const reasonIs=text=>e=>failureReason(e)===text;
+test("a8 a10 the deployer's run bound is the serial sum under the holder cap, the number the run itself records",async t=>{
+ assert.equal(7560000>DEFAULT_HOLDER_CAP_MS,true);assert.equal(matrixRunTimeout(workedPlan),7200000,"the serial sum of 126 minutes is clamped to the cap");
+ assert.equal(matrixRunTimeout({checks:[{environment:{VERIFICATION_TIMEOUT_MS:"600000"}}]}),2400000,"a plan under the cap keeps its serial sum; without maxAttempts each check runs once");
+ process.env.TAILTERM_MATRIX_HOLDER_CAP_MINUTES="30";
+ try{assert.equal(matrixRunTimeout(workedPlan),1800000,"the cap is configurable");}finally{delete process.env.TAILTERM_MATRIX_HOLDER_CAP_MINUTES;}
  for(const bad of [{...workedPlan,checks:[]},{checks:[{environment:{}}]},{checks:[{environment:{VERIFICATION_TIMEOUT_MS:"1800001"}}]},{checks:[{environment:{VERIFICATION_TIMEOUT_MS:"0"}}]},{checks:[{environment:{VERIFICATION_TIMEOUT_MS:1800000}}]},{maxAttempts:0,checks:workedPlan.checks}])
   assert.throws(()=>matrixRunTimeout(bad),e=>/^(Matrix plan has no checks|Invalid matrix check timeout|Invalid matrix attempt limit)$/.test(failureReason(e)));
+ // The run passes planRunTimeout to the host lock, which records the clamped value.
+ for(const plan of [workedPlan,{checks:[{environment:{VERIFICATION_TIMEOUT_MS:"600000"}}]}]){
+  const lease=await acquireHostLock({path:join(mkdtempSync(join(tmpdir(),"runner-bound-")),"host.json"),runTimeoutMs:planRunTimeout(plan),item:"wi_fixture",agent:"deployer"});
+  assert.equal(lease.record.runTimeoutMs,matrixRunTimeout(plan));await lease.release();
+ }
  const h=matrixHost();assert.equal(await h.adapter.verifyIntegrated(h.integrated),false);
- const matrix=h.matrix();assert.deepEqual(matrix.map(c=>[c.argv[2],c.timeout]),[["plan",600000],["run",7560000]]);
- assert.ok(h.calls.filter(c=>c.argv[2]!=="run").every(c=>c.timeout===600000));assert.equal(h.sends().length,1);
+ assert.deepEqual(h.matrix().map(c=>[c.argv[2],c.timeout]),[["plan",600000],["run",undefined]],"the run is started, not waited on, so it has no command timeout");
+ assert.equal(h.run().boundMs,7200000);assert.equal(h.sends().length,0);
+ assert.equal(await h.adapter.verifyIntegrated(h.integrated),false);assert.equal(h.sends().length,1);assert.equal(h.run().reason,"receipt");
  const bad=matrixHost({plan:{maxAttempts:3,checks:[{environment:{VERIFICATION_TIMEOUT_MS:"3600000"}}]}});
- await assert.rejects(bad.adapter.verifyIntegrated(bad.integrated),e=>failureReason(e)==="Invalid matrix check timeout");assert.deepEqual(bad.matrix().map(c=>c.argv[2]),["plan"]);
+ await assert.rejects(bad.adapter.verifyIntegrated(bad.integrated),reasonIs("Invalid matrix check timeout"));assert.deepEqual(bad.matrix().map(c=>c.argv[2]),["plan"]);
+ assert.ok(!existsSync(join(attemptDir(bad.home,bad.integrated.integratedCommit,0),"run.json")));
  const failing=matrixHost({receipt:{environment:{},checks:[{exitCode:1}]}});
- await assert.rejects(failing.adapter.verifyIntegrated(failing.integrated),e=>failureReason(e)==="Integrated matrix receipt is not eligible");assert.equal(failing.sends().length,0);
+ await assert.rejects(failing.verify(failing.integrated),reasonIs("Integrated matrix receipt is not eligible"));assert.equal(failing.sends().length,0);
  const real=new HostAdapter({cwd:tmpdir()},{});assert.throws(()=>real.command([process.execPath,"-e","setTimeout(()=>{},5000)"],tmpdir(),{timeout:200}),e=>/ timeout$/.test(failureReason(e)));
  assert.equal(real.command([process.execPath,"-e","console.log('ok')"]).trim(),"ok");
 });
-test("p2 the host probe counts only real node matrix runs",async()=>{
- const re=new RegExp(MATRIX_RUN_PATTERN);
- for(const line of ["node scripts/verify-matrix.mjs run p d","/opt/homebrew/bin/node /abs/scripts/verify-matrix.mjs targeted c d","node /Users/x/tailterm/scripts/verify-matrix.mjs run /tmp/plan.json /tmp/out --jobs 4"])assert.match(line,re,line);
- for(const line of ["claude --model opus --append-system-prompt Run node scripts/verify-matrix.mjs run PLAN_JSON LOG_DIR","node scripts/verify-matrix.mjs plan c p","codex exec node scripts/verify-matrix.mjs run p d","node -e x node scripts/verify-matrix.mjs run p d","node scripts/release-runner.mjs --config /private/c.json"])assert.doesNotMatch(line,re,line);
- // The same pattern through the real pgrep, limited to this test's children.
- const dir=mkdtempSync(join(tmpdir(),"matrix-probe-"));mkdirSync(join(dir,"scripts"));writeFileSync(join(dir,"scripts/verify-matrix.mjs"),"console.log('ready');setTimeout(()=>{},20000);");
- const start=argv=>new Promise((resolveStart,reject)=>{const child=spawn(argv[0],argv.slice(1),{stdio:["ignore","pipe","ignore"]});child.on("error",reject);child.stdout.once("data",()=>resolveStart(child));});
- const own=(file,args,options)=>execFileSync(file,["-P",String(process.pid),...args],options);
- const adapter=new HostAdapter({cwd:dir},{}),children=[];
- try{
-  children.push(await start([process.execPath,"-e","console.log('ready');setTimeout(()=>{},20000)","node scripts/verify-matrix.mjs run PLAN_JSON LOG_DIR"]));
-  children.push(await start([process.execPath,join(dir,"scripts/verify-matrix.mjs"),"plan","c","p"]));
-  assert.equal(adapter.matrixRunsActive(own),0,"prompt text and plan mode are not runs");
-  children.push(await start([process.execPath,join(dir,"scripts/verify-matrix.mjs"),"run","p","d"]));
-  assert.equal(adapter.matrixRunsActive(own),1);
- }finally{for(const child of children)child.kill();}
- assert.throws(()=>adapter.matrixRunsActive(()=>{const e=new Error("pgrep");e.status=2;throw e;}),e=>failureReason(e)==="Matrix host probe unavailable");
- assert.equal(adapter.matrixRunsActive(()=>{const e=new Error("none");e.status=1;throw e;}),0);
- const source=readFileSync(RUNNER,"utf8");assert.doesNotMatch(source,/process\.kill|pkill|"kill"/);
+test("a1 the runner has no process-count gate",()=>{
+ const source=readFileSync(RUNNER,"utf8");assert.doesNotMatch(source,/pgrep|matrixRunsActive|matrixHostFree|MATRIX_RUN_PATTERN|host-wait\.json/);
+ const adapter=new HostAdapter({cwd:tmpdir()},{});assert.equal(adapter.matrixRunsActive,undefined);assert.equal(adapter.matrixHostFree,undefined);
 });
-test("p2 the integrated run waits for other matrix runs and refuses by name after the bound",async()=>{
- const h=matrixHost();let busy=1,now=1000;h.adapter.matrixRunsActive=()=>busy;h.adapter.now=()=>now;
- const wait=join(attemptDir(h.home,h.integrated.integratedCommit,0),"host-wait.json");
- assert.equal(await h.adapter.verifyIntegrated(h.integrated),false);assert.equal(h.matrix().length,0);assert.equal(h.sends().length,0);
- assert.deepEqual(JSON.parse(readFileSync(wait,"utf8")),{since:1000});assert.equal(statSync(wait).mode&0o777,0o600);
- now+=MATRIX_HOST_WAIT_MS-1;assert.equal(await h.adapter.verifyIntegrated(h.integrated),false);assert.equal(h.matrix().length,0);
- busy=0;assert.equal(await h.adapter.verifyIntegrated(h.integrated),false);assert.deepEqual(h.matrix().map(c=>c.argv[2]),["plan","run"]);assert.equal(h.sends().length,1);assert.ok(!existsSync(wait));
- const late=matrixHost();late.adapter.matrixRunsActive=()=>1;let t=0;late.adapter.now=()=>t;
- assert.equal(await late.adapter.verifyIntegrated(late.integrated),false);t=MATRIX_HOST_WAIT_MS;
- await assert.rejects(late.adapter.verifyIntegrated(late.integrated),e=>failureReason(e)==="Host busy with another verify-matrix run");assert.equal(late.matrix().length,0);
- const short=matrixHost();short.adapter.config.matrixHostWaitMs=50;short.adapter.matrixRunsActive=()=>1;let s=0;short.adapter.now=()=>s;
- assert.equal(await short.adapter.verifyIntegrated(short.integrated),false);s=50;await assert.rejects(short.adapter.verifyIntegrated(short.integrated),/Host busy/);
+test("a2 the run's argv carries priority, item and host wait; priority is the job's, else matrixPriority, else high; an invalid value refuses before any run",async()=>{
+ const argvOf=async(configure=()=>{},job={})=>{const h=matrixHost();configure(h.adapter.config);assert.equal(await h.adapter.verifyIntegrated({...h.integrated,itemId:"wi_0123456789abcdef",...job}),false);return {h,argv:h.matrix().find(c=>c.argv[2]==="run").argv};};
+ const first=await argvOf(),dir=attemptDir(first.h.home,first.h.integrated.integratedCommit,0);
+ assert.deepEqual(first.argv,["node","scripts/verify-matrix.mjs","run",join(dir,"plan.json"),dir,"--priority","high","--item","wi_0123456789abcdef","--host-wait-minutes","120"]);
+ assert.deepEqual([first.h.run().priority,first.h.run().hostWaitMs],["high",MATRIX_HOST_WAIT_MS]);
+ const configured=(await argvOf(c=>{c.matrixPriority="normal";c.matrixHostWaitMs=1800000;})).argv;
+ assert.deepEqual(configured.slice(5),["--priority","normal","--item","wi_0123456789abcdef","--host-wait-minutes","30"]);
+ assert.equal((await argvOf(c=>{c.matrixPriority="normal";},{priority:"urgent"})).argv[6],"urgent","the job's own priority wins");
+ assert.equal((await argvOf(c=>{c.matrixHostWaitMs=50;})).argv.at(-1),"1","the host wait is at least one minute");
+ assert.equal(matrixPriority({},{}),"high");assert.equal(matrixPriority({priority:"normal"},{matrixPriority:"urgent"}),"normal");
+ for(const [configure,job] of [[c=>{c.matrixPriority="low";},{}],[c=>{c.matrixPriority="";},{}],[()=>{},{priority:"critical"}],[c=>{c.matrixPriority=1;},{}]]){
+  const h=matrixHost();configure(h.adapter.config);
+  await assert.rejects(h.adapter.verifyIntegrated({...h.integrated,...job}),reasonIs("Invalid matrix priority"));
+  assert.equal(h.matrix().length,0,"no plan and no run");assert.ok(!existsSync(join(attemptDir(h.home,h.integrated.integratedCommit,0),"run.json")));
+ }
+ const wait=matrixHost();wait.adapter.config.matrixHostWaitMs=0;await assert.rejects(wait.adapter.verifyIntegrated(wait.integrated),reasonIs("Invalid matrix host wait"));assert.equal(wait.matrix().length,0);
+});
+test("a3 behind a live holder and an earlier normal waiter, the deployer's run at high is position 1 of 2, is granted first, and the import is then requested",async t=>{
+ const h=lockHost(t,{mode:"receipt"}),lock={path:h.path,agent:"verifier",runTimeoutMs:60000,pollMs:20};
+ const holder=await acquireHostLock({...lock,item:"wi_holder"});
+ const earlier=acquireHostLock({...lock,item:"wi_earlier",priority:"normal",prioritySource:"flag"});
+ await until(()=>readHostState(h.path).waiters.length===1,"the earlier waiter");
+ assert.equal(await h.adapter.verifyIntegrated({...h.integrated,itemId:"wi_deployed"}),false);
+ await until(()=>readHostState(h.path).waiters.length===2,"the deployer's run to join the list");
+ assert.equal(await h.adapter.verifyIntegrated(h.integrated),false);
+ assert.deepEqual(h.adapter.matrixWait,{attempt:h.integrated.integratedCommit+"-r0",position:1,length:2,priority:"high",holder:{id:holder.id,item:"wi_holder",agent:"verifier",pid:process.pid}});
+ assert.deepEqual(readHostState(h.path).waiters.map(w=>[w.item,w.priority]),[["wi_deployed","high"],["wi_earlier","normal"]]);
+ assert.equal(h.sends().length,0);assert.equal(h.starts(),1);
+ await holder.release();
+ const second=await earlier;await ended(h.children[0]);
+ assert.deepEqual(readJournal(h.path).filter(l=>l.event==="acquire").map(l=>l.item),["wi_holder","wi_deployed","wi_earlier"],"the deployer's run is granted before the earlier normal waiter");
+ assert.equal(await h.adapter.verifyIntegrated(h.integrated),false);assert.equal(h.adapter.matrixWait,null);
+ const sends=h.sends();assert.equal(sends.length,1);assert.equal(sends[0].argv[sends[0].argv.indexOf("--subject")+1],"Import verification for the integrated release commit");
+ assert.ok(sends[0].argv.includes(join(h.dir,"receipt.json")));assert.equal(h.starts(),1);
+ await second.release();
+ // A run that only waits (here a normal waiter that never takes its turn)
+ // does not hold the deployer back: no process is counted, and high goes first.
+ const alone=lockHost(t,{mode:"receipt"});
+ assert(updateHostState(alone.path,state=>{state.requestSeq=1;state.waiters.push({id:"00000000-0000-4000-8000-000000000003",seq:1,pid:process.pid,kind:"run",item:"wi_waiting",agent:"verifier",priority:"normal",prioritySource:"default",requestedAt:new Date().toISOString(),grantSeqAtRequest:0,overtakenBy:0,runTimeoutMs:60000});}).done);
+ assert.equal(await alone.adapter.verifyIntegrated(alone.integrated),false);await ended(alone.children[0]);
+ assert.equal(readHostState(alone.path).waiters.length,1,"the other run is still only waiting");
+ assert.equal(await alone.adapter.verifyIntegrated(alone.integrated),false);assert.equal(alone.sends().length,1);
+});
+test("a4 one wait notice per change of position, list length or holder, and none on an unchanged poll",async t=>{
+ const cwd=mkdtempSync(join(tmpdir(),"release-wait-notice-")),log=join(cwd,"log"),fakeTT=join(cwd,"tt"),commit="c".repeat(40),attempt=commit+"-r0";
+ const verified={id:"rel_0123456789abcdef",state:"verified",generation:1,commit:"a".repeat(40)};
+ writeFileSync(fakeTT,"#!"+process.execPath+"\n"+`const a=process.argv.slice(2);if(a[1]==='list')console.log(JSON.stringify(${JSON.stringify([verified])}));else if(a[1]==='claim')console.log(JSON.stringify(${JSON.stringify({...verified,state:"claimed",generation:2})}));else if(a[0]==='send')require('fs').appendFileSync(${JSON.stringify(log)},JSON.stringify(a)+'\\n');else process.exit(2);`);chmodSync(fakeTT,0o755);
+ const A={id:"11111111-1111-4111-8111-111111111111",item:"wi_holder",agent:"verifier-1",pid:4242},B={id:"22222222-2222-4222-8222-222222222222",item:"wi_next",agent:"verifier-2",pid:4343};
+ const at=(position,length,holder)=>({attempt,position,length,priority:"high",holder});
+ const heldRun={attempt,pid:777,groups:[888,999],reason:"a check group of the matrix run is still alive"};
+ const polls=[{wait:at(2,3,A)},{wait:at(2,3,A)},{wait:at(1,3,A)},{wait:at(1,2,A)},{wait:at(1,2,B)},{wait:at(1,2,null)},{},{held:heldRun},{held:heldRun}];
+ let polled=0;const release=async(c,adapter)=>{const p=polls[polled++];adapter.matrixWait=p.wait??null;adapter.matrixHeld=p.held??null;return {jobId:verified.id,outcome:"waiting_matrix"};};
+ const controller=new AbortController();t.mock.timers.enable({apis:["setTimeout"]});
+ const serving=serveDeployment({version:1,enabled:true,cwd,journalDirectory:cwd,tt:fakeTT},{signal:controller.signal,release});
+ const settle=async()=>{for(let i=0;i<20;i++)await new Promise(r=>setImmediate(r));};
+ for(let n=1;n<=polls.length;n++){while(polled<n)await settle();await settle();if(n===polls.length)controller.abort();t.mock.timers.tick(30000);}
+ await serving;
+ const sends=readFileSync(log,"utf8").trim().split("\n").map(l=>JSON.parse(l)),field=(a,name)=>a[a.indexOf(name)+1];
+ assert.deepEqual(sends.map(a=>field(a,"--request-id")),[
+  `rel_0123456789abcdef-matrix-wait-${attempt}-p2-of3-${A.id}`,`rel_0123456789abcdef-matrix-wait-${attempt}-p1-of3-${A.id}`,`rel_0123456789abcdef-matrix-wait-${attempt}-p1-of2-${A.id}`,
+  `rel_0123456789abcdef-matrix-wait-${attempt}-p1-of2-${B.id}`,`rel_0123456789abcdef-matrix-wait-${attempt}-p1-of2-none`,`rel_0123456789abcdef-matrix-held-${attempt}`]);
+ assert.ok(sends.every(a=>field(a,"--request-id").length<=128 && field(a,"--kind")==="notice" && a.includes("release-job=rel_0123456789abcdef")));
+ assert.equal(field(sends[0],"--subject"),"A release job is waiting for the verification host");
+ assert.equal(field(sends[0],"--text"),"Release rel_0123456789abcdef waits for the verification host at position 2 of 3 at priority high behind wi_holder/verifier-1/pid 4242");
+ assert.equal(field(sends[4],"--text"),"Release rel_0123456789abcdef waits for the verification host at position 1 of 2 at priority high with no holder");
+ assert.match(field(sends[5],"--text"),/^Release rel_0123456789abcdef is held: its matrix run could not be confirmed stopped \(pid 777; check groups still alive: 888,999; a check group of the matrix run is still alive\)\./);
+ // Only fixed-shape names from the lock file reach a notice.
+ assert.match(matrixWaitNotice(verified,at(1,1,{id:"x y",item:"token=secret\nleak",agent:"a/b",pid:"1"})).text,/behind unknown\/unknown\/pid unknown$/);
+ assert.equal(matrixWaitNotice(verified,null),null);assert.equal(matrixHeldNotice(verified,null),null);assert.equal(matrixWaitNotice(verified,{...at(1,1,null),attempt:"../x"}),null);
+});
+test("a5 (i) a failed intent save starts no run, and a spawn that fails at once refuses by name",async()=>{
+ const h=matrixHost();h.adapter.saveRun=()=>{throw new Error("disk full");};
+ await assert.rejects(h.adapter.verifyIntegrated(h.integrated),reasonIs("unclassified"));assert.deepEqual(h.matrix().map(c=>c.argv[2]),["plan"],"no run was started");
+ const s=matrixHost();let starts=0;s.adapter.startMatrixRun=()=>{starts++;throw new Error("spawn EAGAIN");};
+ await assert.rejects(s.adapter.verifyIntegrated(s.integrated),reasonIs("Integrated matrix run could not start"));
+ assert.deepEqual([s.run().state,s.run().reason],["ended","spawn-failed"]);
+ await assert.rejects(s.adapter.verifyIntegrated(s.integrated),reasonIs("Integrated matrix run could not start"));assert.equal(starts,1,"never replayed");
+ const real=matrixHost();delete real.adapter.startMatrixRun;const start=real.adapter.startMatrixRun.bind(real.adapter);
+ real.adapter.startMatrixRun=(argv,dir)=>start(["/nonexistent/tailterm-node",...argv.slice(1)],dir);
+ await assert.rejects(real.adapter.verifyIntegrated(real.integrated),reasonIs("Integrated matrix run could not start"));assert.equal(real.adapter.matrixChildren.size,0);
+});
+test("a5 (ii) when the save after the spawn fails the poll waits, and the next poll adopts the run from the lock file",async t=>{
+ const h=lockHost(t),save=h.adapter.saveRun.bind(h.adapter);let saves=0;
+ h.adapter.saveRun=(dir,run)=>{if(++saves===2)throw new Error("disk full");save(dir,run);};
+ assert.equal(await h.adapter.verifyIntegrated(h.integrated),false,"a run exists, so the job is not refused");
+ assert.equal(h.run().state,"starting");assert.equal(h.run().pid,undefined);
+ const {pid}=await h.marker();assert.equal(pid,h.children[0].pid);
+ assert.equal(await h.adapter.verifyIntegrated(h.integrated),false);
+ const run=h.run();assert.deepEqual([run.state,run.pid],["started",pid]);assert.equal(typeof run.processStartedAt,"string","adopted with its process start time");
+ assert.equal(h.starts(),1);assert.equal(h.adapter.matrixHeld,null);
+});
+test("a5 (iii) a launch unconfirmed beyond the grace is held with the fence, never refused or replayed, then adopted or ended by name",async t=>{
+ const launch=t=>{const h=lockHost(t),child=idle(t);let clock=1000000;h.adapter.now=()=>clock;h.tick=ms=>{clock+=ms;};
+  h.adapter.startMatrixRun=(argv,dir)=>{h.calls.push({argv,dir});return child.pid;};
+  // The run never registers and the confirming save is lost: the record stays "starting".
+  const save=h.adapter.saveRun.bind(h.adapter);let saves=0;h.adapter.saveRun=(dir,run)=>{if(++saves===2)throw new Error("lost");save(dir,run);};
+  return Object.assign(h,{child});};
+ const h=launch(t);assert.equal(await h.adapter.verifyIntegrated(h.integrated),false);assert.equal(h.run().state,"starting");
+ h.tick(MATRIX_LAUNCH_GRACE_MS-1);assert.equal(await h.adapter.verifyIntegrated(h.integrated),false);assert.equal(h.adapter.matrixHeld,null,"inside the grace it only waits");
+ h.tick(1);
+ for(let poll=0;poll<3;poll++){h.tick(3600000);assert.equal(await h.adapter.verifyIntegrated(h.integrated),false,"held, not refused, however long");}
+ assert.deepEqual(h.adapter.matrixHeld,{attempt:h.integrated.integratedCommit+"-r0",pid:null,groups:[],reason:"matrix run launch unconfirmed"});
+ assert.equal(matrixHeldNotice({id:"rel_fixture"},h.adapter.matrixHeld).requestId,`rel_fixture-matrix-held-${h.integrated.integratedCommit}-r0`);
+ assert.equal(h.starts(),1,"no second run in the same directory");assert.equal(h.run().state,"starting");assert.deepEqual(h.signals,[]);
+ // The held job is still this runner's claimed job, so the queued one is not chosen.
+ const claimed={id:"rel_fixture",state:"claimed",agentId:"agt_fixture",runId:"run_fixture"},queued={id:"rel_queued",state:"verified"};
+ assert.equal(runnableJob([queued,claimed],"agt_fixture","run_fixture"),claimed);assert.equal(runnableJob([queued,claimed],"agt_other","run_other"),null);
+ // The run appears late: it is adopted, not restarted.
+ assert(updateHostState(h.path,state=>{state.waiters.push({...holderEntry(h.child.pid,h.dir),grantSeqAtRequest:0,overtakenBy:0});}).done);
+ assert.equal(await h.adapter.verifyIntegrated(h.integrated),false);
+ assert.deepEqual([h.run().state,h.run().pid,h.adapter.matrixHeld,h.starts()],["started",h.child.pid,null,1]);assert.equal(typeof h.run().processStartedAt,"string");
+ // Or its own sidecar shows it joined and left: the job ends by name.
+ for(const [outcome,reason] of [["wait-expired","Verification host wait expired"],["released","Integrated matrix run ended without a receipt"]]){
+  const e=launch(t);assert.equal(await e.adapter.verifyIntegrated(e.integrated),false);e.tick(MATRIX_LAUNCH_GRACE_MS+1);
+  assert.equal(await e.adapter.verifyIntegrated(e.integrated),false);assert.equal(e.adapter.matrixHeld.reason,"matrix run launch unconfirmed");
+  writeFileSync(join(e.dir,"host-lock.json"),JSON.stringify({outcome}));
+  await assert.rejects(e.adapter.verifyIntegrated(e.integrated),reasonIs(reason));assert.equal(e.run().state,"ended");assert.equal(e.starts(),1);
+ }
+ // A pid in the lock file that began after it joined is not proof of our run.
+ const reused=launch(t);assert.equal(await reused.adapter.verifyIntegrated(reused.integrated),false);
+ assert(updateHostState(reused.path,state=>{state.waiters.push({...holderEntry(reused.child.pid,reused.dir,{requestedAt:"2020-01-01T00:00:00.000Z"}),grantSeqAtRequest:0,overtakenBy:0});}).done);
+ assert.equal(await reused.adapter.verifyIntegrated(reused.integrated),false);assert.deepEqual([reused.run().state,reused.run().processStartedAt],["started",null]);
+});
+function releaseHost(t,child){
+ const h=lockHost(t,child),j=job(h.f,change(h.f,"client/a.js","a"));git(h.f.cwd,"checkout","tasks-hub");change(h.f,"client/c.js","c");
+ Object.assign(j,{agentId:"agt_fixture",runId:"run_fixture",generation:1});
+ const c={...config(h.f,j),journalPath:join(h.home,"rel_fixture.json")};
+ const through=host=>{const a=fake();a.verifyIntegrated=x=>host.verifyIntegrated(x);a.settleMatrixRuns=x=>host.settleMatrixRuns(x);return a;};
+ // A second runner process: a fresh adapter with no child handle.
+ const restarted=()=>{const host=new HostAdapter(h.adapter.config,{id:"rel_fixture",agentId:"agt_fixture",runId:"run_fixture",generation:1});
+  for(const key of ["command","hostState","signalProcess","startMatrixRun"])host[key]=h.adapter[key];return host;};
+ return Object.assign(h,{j,c,through,restarted});
+}
+test("a5 (iv) a new runner process resumes a started record without starting a run and with no release lock in its way",async t=>{
+ const h=releaseHost(t),first=h.through(h.adapter);
+ assert.equal((await runRelease(h.c,first)).outcome,"waiting_matrix");
+ const integrated=git(h.f.cwd,"rev-parse","HEAD");h.dir=attemptDir(h.home,integrated,0);const {pid}=await h.marker();
+ assert.equal(hostLockNames(h.f.cwd,h.j),false,"the release lock is not held while the run waits or runs");
+ const host=h.restarted(),second=h.through(host);
+ assert.equal((await runRelease(h.c,second)).outcome,"waiting_matrix");assert.equal((await runRelease(h.c,second)).outcome,"waiting_matrix");
+ assert.equal(h.starts(),1);assert.deepEqual(h.signals,[]);assert.deepEqual(second.calls,[]);
+ const run=JSON.parse(readFileSync(join(h.dir,"run.json"),"utf8"));assert.deepEqual([run.state,run.pid],["started",pid]);
+ // The run finishes; the resumed runner asks for the import.
+ writeFileSync(join(h.dir,"receipt.json"),JSON.stringify({environment:{},checks:[{exitCode:0}]}));process.kill(pid,"SIGTERM");await ended(h.children[0]);
+ assert.equal((await runRelease(h.c,second)).outcome,"waiting_matrix");assert.equal(h.sends().length,1);assert.equal(h.starts(),1);
+});
+test("a5 (v) a run that left on its wait bound refuses as Verification host wait expired, any other ending without a receipt by its own name",async()=>{
+ for(const [sidecar,reason] of [[{outcome:"wait-expired"},"Verification host wait expired"],[{outcome:"released"},"Integrated matrix run ended without a receipt"],[{outcome:"withdrawn"},"Integrated matrix run ended without a receipt"]]){
+  const h=matrixHost(),dir=attemptDir(h.home,h.integrated.integratedCommit,0);
+  h.adapter.startMatrixRun=(argv,d)=>{h.calls.push({argv,dir:d});writeFileSync(join(d,"host-lock.json"),JSON.stringify(sidecar));return exitedPid();};
+  assert.equal(await h.adapter.verifyIntegrated(h.integrated),false);
+  await assert.rejects(h.adapter.verifyIntegrated(h.integrated),reasonIs(reason));
+  await assert.rejects(h.adapter.verifyIntegrated(h.integrated),reasonIs(reason),"the saved ending is final");
+  assert.equal(h.matrix().filter(c=>c.argv[2]==="run").length,1);assert.equal(h.sends().length,0);assert.equal(JSON.parse(readFileSync(join(dir,"run.json"),"utf8")).state,"ended");
+ }
+ // A record the handler set aside counts as ended.
+ const h=matrixHost(),dir=attemptDir(h.home,h.integrated.integratedCommit,0);mkdirSync(dir,{recursive:true});writeFileSync(join(dir,"run.json.set-aside"),JSON.stringify({state:"starting"}));
+ await assert.rejects(h.adapter.verifyIntegrated(h.integrated),reasonIs("Integrated matrix run ended without a receipt"));assert.equal(h.matrix().length,0);
+});
+test("a10 (i) past the deadline a run that exits on SIGTERM is refused as exceeded only once it is confirmed stopped",async t=>{
+ const h=lockHost(t);let clock=Date.now();h.adapter.now=()=>clock;
+ assert.equal(await h.adapter.verifyIntegrated(h.integrated),false);const {pid}=await h.marker();
+ clock=h.deadline()-1;assert.equal(await h.adapter.verifyIntegrated(h.integrated),false);assert.deepEqual(h.signals,[],"not before the deadline");
+ assert.equal(h.deadline(),h.run().launchedAt+MATRIX_HOST_WAIT_MS+7200000+RUN_TIMEOUT_GRACE_MS+60000);
+ clock=h.deadline();assert.equal(await h.adapter.verifyIntegrated(h.integrated),false,"stopping is not yet refusal");
+ assert.deepEqual(h.signals,[[pid,"SIGTERM"]]);assert.equal(h.run().stopRequestedAt,clock);
+ await ended(h.children[0]);assert.equal(JSON.parse(readFileSync(join(h.dir,"host-lock.json"),"utf8")).outcome,"released");
+ await assert.rejects(h.adapter.verifyIntegrated(h.integrated),reasonIs("Integrated matrix run exceeded its bound"));
+ assert.deepEqual(h.signals,[[pid,"SIGTERM"]]);assert.deepEqual([h.run().state,h.run().reason],["ended","stopped"]);assert.equal(readHostState(h.path).holder,null);
+});
+test("a10 (ii) a run that ignores SIGTERM gets its own group killed after the grace, and is refused only once confirmed stopped",async t=>{
+ const h=lockHost(t,{resist:true});let clock=Date.now();h.adapter.now=()=>clock;
+ assert.equal(await h.adapter.verifyIntegrated(h.integrated),false);const {pid}=await h.marker();
+ clock=h.deadline();assert.equal(await h.adapter.verifyIntegrated(h.integrated),false);
+ clock+=MATRIX_STOP_GRACE_MS-1;assert.equal(await h.adapter.verifyIntegrated(h.integrated),false);assert.deepEqual(h.signals,[[pid,"SIGTERM"]],"no kill inside the grace");assert.equal(pidGone(pid),false);
+ clock+=1;assert.equal(await h.adapter.verifyIntegrated(h.integrated),false,"killing is not yet refusal");assert.deepEqual(h.signals,[[pid,"SIGTERM"],[-pid,"SIGKILL"]]);
+ await ended(h.children[0]);
+ // No release record of its own: its lock entry, read after it was gone, shows no check group.
+ await assert.rejects(h.adapter.verifyIntegrated(h.integrated),reasonIs("Integrated matrix run exceeded its bound"));
+ assert.deepEqual(h.run().snapshot.groups,[]);assert.equal(h.run().snapshot.role,"holder");assert.equal(h.signals.length,2);
+});
+test("a10 (iii) a stale lock entry matching a reused pid is never signalled, and the job is held",async t=>{
+ const h=lockHost(t),other=idle(t);let clock=5000000;h.adapter.now=()=>clock;h.adapter.startMatrixRun=(argv,dir)=>{h.calls.push({argv,dir});return other.pid;};
+ h.adapter.processStartTime=()=>"Thu Jan  1 00:00:00 2026";
+ assert.equal(await h.adapter.verifyIntegrated(h.integrated),false);assert.equal(h.run().processStartedAt,"Thu Jan  1 00:00:00 2026");
+ // The pid now belongs to an unrelated live process; the lock file still names it for this directory.
+ delete h.adapter.processStartTime;assert.notEqual(h.adapter.processStartTime(other.pid),"Thu Jan  1 00:00:00 2026");
+ assert(updateHostState(h.path,state=>{state.holder=holderEntry(other.pid,h.dir);}).done);
+ clock=h.deadline()+3600000;
+ for(let poll=0;poll<3;poll++){clock+=MATRIX_STOP_GRACE_MS;assert.equal(await h.adapter.verifyIntegrated(h.integrated),false);}
+ assert.deepEqual(h.signals,[]);assert.equal(pidGone(other.pid),false);
+ assert.deepEqual(h.adapter.matrixHeld,{attempt:h.integrated.integratedCommit+"-r0",pid:other.pid,groups:[],reason:"no process-instance proof for the matrix run pid"});
+ assert.equal(h.run().state,"started");assert.equal(h.run().stopRequestedAt,undefined);
+});
+test("a10 (iv) after a takeover while a recorded check group survives, the group is not signalled and the job is held with one notice naming it",async t=>{
+ const h=lockHost(t,{group:true});
+ assert.equal(await h.adapter.verifyIntegrated(h.integrated),false);const {pid,group}=await h.marker();t.after(()=>{try{process.kill(-group,"SIGKILL");}catch{}});
+ await until(()=>readHostState(h.path).holder?.groups?.includes(group),"the check group on file");
+ assert.equal(await h.adapter.verifyIntegrated(h.integrated),false);assert.deepEqual(h.run().groups,[group],"seen groups are persisted");
+ process.kill(pid,"SIGKILL");await ended(h.children[0]);
+ const requestIds=new Set();
+ for(const takeover of [false,true,true]){
+  if(takeover)assert(updateHostState(h.path,state=>{state.holder=otherHolder();}).done);
+  assert.equal(await h.adapter.verifyIntegrated(h.integrated),false,"held, never refused");
+  assert.deepEqual(h.adapter.matrixHeld,{attempt:h.integrated.integratedCommit+"-r0",pid,groups:[group],reason:"a check group of the matrix run is still alive"});
+  const notice=matrixHeldNotice({id:"rel_fixture"},h.adapter.matrixHeld);requestIds.add(notice.requestId);assert.ok(notice.text.includes(`check groups still alive: ${group};`));
+ }
+ assert.equal(requestIds.size,1,"one held notice");assert.deepEqual(h.signals,[]);assert.equal(groupGone(group),false,"the check group was never signalled");
+ assert.deepEqual(h.run().snapshot.groups,[group]);assert.equal(h.run().state,"started");assert.equal(h.sends().length,0);
+ // Once the group is gone the persisted evidence is complete.
+ process.kill(-group,"SIGKILL");await until(()=>groupGone(group),"the group to end");
+ await assert.rejects(h.adapter.verifyIntegrated(h.integrated),reasonIs("Integrated matrix run ended without a receipt"));
+});
+test("a10 (v) a killed run with no release record whose holder entry was replaced before any snapshot after its exit is held",async t=>{
+ const h=lockHost(t);
+ assert.equal(await h.adapter.verifyIntegrated(h.integrated),false);const {pid}=await h.marker();
+ assert.equal(await h.adapter.verifyIntegrated(h.integrated),false);
+ process.kill(pid,"SIGKILL");await ended(h.children[0]);
+ assert(updateHostState(h.path,state=>{state.holder=otherHolder();}).done);
+ for(let poll=0;poll<3;poll++)assert.equal(await h.adapter.verifyIntegrated(h.integrated),false);
+ assert.deepEqual(h.adapter.matrixHeld,{attempt:h.integrated.integratedCommit+"-r0",pid,groups:[],reason:"check group state cannot be shown"});
+ assert.equal(h.run().snapshot,undefined);assert.equal(h.run().state,"started");assert.deepEqual(h.signals,[]);
+});
+test("a10 the default launch is detached with its output on file, and this process's live child handle is proof for stopping it",async t=>{
+ const h=matrixHost(),dir=attemptDir(h.home,h.integrated.integratedCommit,0),signals=[];let clock=Date.now();h.adapter.now=()=>clock;
+ delete h.adapter.startMatrixRun;const start=h.adapter.startMatrixRun.bind(h.adapter);
+ h.adapter.startMatrixRun=(argv,d)=>start([process.execPath,"-e","console.log(process.argv.length);setInterval(()=>{},1000)",...argv.slice(1)],d);
+ h.adapter.hostState=()=>null;h.adapter.signalProcess=(target,name)=>{signals.push([target,name]);process.kill(target,name);};
+ assert.equal(await h.adapter.verifyIntegrated(h.integrated),false);
+ const child=h.adapter.matrixChildren.get(dir),run=h.run();t.after(()=>{try{process.kill(-child.pid,"SIGKILL");}catch{}});
+ assert.deepEqual([run.state,run.pid,run.processStartedAt],["started",child.pid,null]);
+ await until(()=>readFileSync(join(dir,"run.out"),"utf8").trim()==="11","the run's output on file");
+ assert.equal(statSync(join(dir,"run.out")).mode&0o777,0o600);assert.equal(execFileSync("ps",["-o","pgid=","-p",String(child.pid)],{encoding:"utf8"}).trim(),String(child.pid),"its own group leader");
+ clock=run.launchedAt+run.hostWaitMs+run.boundMs+RUN_TIMEOUT_GRACE_MS+MATRIX_DEADLINE_SLACK_MS;
+ assert.equal(await h.adapter.verifyIntegrated(h.integrated),false);assert.deepEqual(signals,[[child.pid,"SIGTERM"]],"no start time was recorded, the handle is the proof");
+ await ended(child);
+ // It never joined the host list and left no record of its own: held, not refused.
+ assert.equal(await h.adapter.verifyIntegrated(h.integrated),false);assert.equal(h.adapter.matrixHeld.reason,"check group state cannot be shown");
+});
+test("a14 a requeued job with an unresolved earlier attempt does not touch the checkout until that attempt is stopped, ended or set aside",async t=>{
+ const requeue=h=>{const digestOf=createHash("sha256").update(readFileSync(h.c.journalPath)).digest("hex");
+  return {...h.c,job:{...h.j,generation:3,reconciliations:[{disposition:"requeue",noActiveExecution:true,noPublication:true,journalState:"no_effects",jobId:"rel_fixture",journalDigest:digestOf,agentId:"agt_fixture",runId:"run_fixture"}]}};};
+ const attempts=h=>readdirSync(join(h.home,"rel_fixture-integrated-verification")).sort();
+ // An earlier attempt whose run is still alive is stopped first.
+ const h=releaseHost(t);assert.equal((await runRelease(h.c,h.through(h.adapter))).outcome,"waiting_matrix");
+ const integrated=git(h.f.cwd,"rev-parse","HEAD");h.dir=attemptDir(h.home,integrated,0);const {pid}=await h.marker();
+ // tasks-hub moves on, so a fresh integration would move the checkout.
+ git(h.f.cwd,"update-ref","refs/heads/tasks-hub",git(h.f.cwd,"commit-tree",git(h.f.cwd,"rev-parse","tasks-hub^{tree}"),"-p","tasks-hub","-m","later"));
+ const c=requeue(h),host=h.restarted(),a=h.through(host);
+ assert.equal((await runRelease(c,a)).outcome,"waiting_matrix");
+ assert.deepEqual(h.signals,[[pid,"SIGTERM"]],"the earlier run is stopped with process-instance proof");
+ assert.equal(git(h.f.cwd,"rev-parse","HEAD"),integrated,"the checkout is untouched");assert.ok(!existsSync(c.journalPath),"no checkpoint");
+ assert.deepEqual(attempts(h),[integrated+"-r0"]);assert.equal(h.starts(),1);assert.deepEqual(a.calls,[]);assert.equal(hostLockNames(h.f.cwd,c.job),false);
+ await ended(h.children[0]);
+ assert.equal((await runRelease(c,a)).outcome,"waiting_matrix");
+ const next=git(h.f.cwd,"rev-parse","HEAD");assert.notEqual(next,integrated);assert.deepEqual(attempts(h),[integrated+"-r0",next+"-r1"].sort());assert.equal(h.starts(),2,"only now is a new run started");
+ assert.equal(JSON.parse(readFileSync(join(h.dir,"run.json"),"utf8")).state,"ended");assert.deepEqual(a.calls,[]);
+ // An unconfirmed launch in an earlier attempt holds the job until it is set aside.
+ const u=releaseHost(t);u.adapter.startMatrixRun=()=>{throw new Error("unused");};
+ const a0=u.through(u.adapter);a0.verifyIntegrated=async()=>false;assert.equal((await runRelease(u.c,a0)).outcome,"waiting_matrix");
+ const head=git(u.f.cwd,"rev-parse","HEAD"),dir=attemptDir(u.home,head,0);mkdirSync(dir,{recursive:true});
+ writeFileSync(join(dir,"run.json"),JSON.stringify({version:1,state:"starting",launchedAt:Date.now(),priority:"high",hostWaitMs:7200000,boundMs:7200000}));
+ const uc=requeue(u),ua=u.through(u.restarted());let started=0;
+ for(let poll=0;poll<3;poll++)assert.equal((await runRelease(uc,ua)).outcome,"waiting_matrix");
+ assert.equal(git(u.f.cwd,"rev-parse","HEAD"),head);assert.ok(!existsSync(uc.journalPath));assert.deepEqual(ua.calls,[],"no refusal");assert.deepEqual(attempts(u),[head+"-r0"]);assert.deepEqual(u.signals,[]);
+ assert.equal(JSON.parse(readFileSync(join(dir,"run.json"),"utf8")).state,"starting");
+ const claimed={...uc.job,state:"claimed"};assert.equal(runnableJob([{id:"rel_queued",state:"verified"},claimed],"agt_fixture","run_fixture"),claimed,"no other job integrates");
+ renameSync(join(dir,"run.json"),join(dir,"run.json.set-aside"));
+ const settled=u.restarted();settled.startMatrixRun=(argv,d)=>{started++;return exitedPid();};settled.processStartTime=()=>null;
+ assert.equal((await runRelease(uc,u.through(settled))).outcome,"waiting_matrix");assert.equal(started,1,"the set-aside record no longer holds the job");assert.ok(existsSync(uc.journalPath));
 });
 test("p2 the journal is waiting_matrix during the integrated run, so a stopped runner resumes the same job",async()=>{
  const f=fixture(),j=job(f,change(f,"client/a.js","a"));git(f.cwd,"checkout","tasks-hub");change(f,"client/c.js","c");
@@ -658,26 +957,16 @@ test("p2 the journal is waiting_matrix during the integrated run, so a stopped r
  const receipt=await runRelease(c,a);assert.equal(receipt.outcome,"released");assert.deepEqual(integratedCommits,[saved.integrated]);assert.equal(receipt.commit,saved.integrated);
  assert.equal(phaseAtMerge,"integrated","a verified run leaves waiting_matrix before publication");
 });
-test("p2 a requeued job starts a fresh host wait, and a busy refusal leaves no wait record",async()=>{
- const h=matrixHost();let now=10*MATRIX_HOST_WAIT_MS;h.adapter.now=()=>now;h.adapter.matrixRunsActive=()=>1;
- const first=attemptDir(h.home,h.integrated.integratedCommit,0),requeued={...h.integrated,reconciliations:[{disposition:"requeue"}]};
- mkdirSync(first,{recursive:true});writeFileSync(join(first,"host-wait.json"),JSON.stringify({since:now-3*3600000}));
- assert.equal(await h.adapter.verifyIntegrated(requeued),false,"a leftover start does not refuse the requeued job's first busy probe");
- assert.deepEqual(JSON.parse(readFileSync(join(attemptDir(h.home,h.integrated.integratedCommit,1),"host-wait.json"),"utf8")),{since:now});
- await assert.rejects(h.adapter.verifyIntegrated(h.integrated),e=>failureReason(e)==="Host busy with another verify-matrix run");
- assert.ok(!existsSync(join(first,"host-wait.json")),"the refusal removes its wait record");
- assert.equal(await h.adapter.verifyIntegrated(h.integrated),false,"a later probe starts a fresh wait");assert.equal(h.matrix().length,0);
-});
 test("p2 a requeue never reuses an earlier attempt's receipt, for the same or a new integrated commit",async()=>{
  const receipt={environment:{},checks:[{exitCode:1}]},h=matrixHost({receipt}),old=h.integrated.integratedCommit,moved="d".repeat(40);
- await assert.rejects(h.adapter.verifyIntegrated(h.integrated),e=>failureReason(e)==="Integrated matrix receipt is not eligible");
+ await assert.rejects(h.verify(h.integrated),e=>failureReason(e)==="Integrated matrix receipt is not eligible");
  await assert.rejects(h.adapter.verifyIntegrated(h.integrated),/not eligible/);assert.equal(h.matrix().filter(c=>c.argv[2]==="run").length,1,"the same attempt does not rerun");
  receipt.checks=[{exitCode:0}];h.calls.length=0;
- assert.equal(await h.adapter.verifyIntegrated({...h.integrated,reconciliations:[{}]}),false);
+ assert.equal(await h.verify({...h.integrated,reconciliations:[{}]}),false);
  assert.deepEqual(h.matrix().map(c=>c.argv[2]),["plan","run"],"a requeue of the same commit reruns");
  assert.ok(h.sends()[0].argv.includes(join(attemptDir(h.home,old,1),"receipt.json")));
  h.calls.length=0;
- assert.equal(await h.adapter.verifyIntegrated({...h.integrated,integratedCommit:moved,reconciliations:[{},{}]}),false);
+ assert.equal(await h.verify({...h.integrated,integratedCommit:moved,reconciliations:[{},{}]}),false);
  assert.deepEqual(h.matrix().map(c=>c.argv[2]),["plan","run"],"a new integrated commit reruns");
  const send=h.sends()[0].argv;assert.ok(send.includes(`integrated-commit=${moved}`));assert.ok(send.includes(join(attemptDir(h.home,moved,2),"receipt.json")));
  assert.equal(JSON.parse(readFileSync(join(attemptDir(h.home,moved,2),"context.json"),"utf8")).commit,moved);
@@ -749,7 +1038,7 @@ function changedMatrixHost(approvals){
 }
 test("m1 a changed matrix binds the integrated plan to its own digest and the newest owner approval of it",async()=>{
  const h=changedMatrixHost([{digest:hash(MATRIX_B),messageSeq:40},{digest:hash(MATRIX_A),messageSeq:99},{digest:hash(MATRIX_B),messageSeq:55},{digest:hash(MATRIX_B),messageSeq:"77"}]);
- assert.equal(await h.adapter.verifyIntegrated(h.integrated),false);
+ assert.equal(await h.verify(h.integrated),false);
  const context=h.context();
  assert.equal(context.approvedMatrixDigest,hash(MATRIX_B));assert.equal(context.matrixApprovalMessageSeq,55);
  assert.equal(context.commit,h.integrated.integratedCommit);assert.equal(context.verifierAgentId,"agt_fixture");assert.equal(context.verifierRunId,"run_fixture");
@@ -769,7 +1058,7 @@ test("m2 a changed matrix with no covering owner approval is refused by name bef
 test("m3 an unchanged matrix keeps the job's digest and approval, whatever other approvals exist",async()=>{
  const h=changedMatrixHost([{digest:hash(MATRIX_B),messageSeq:55},{digest:hash(MATRIX_A),messageSeq:99}]);
  writeFileSync(join(h.f.cwd,"verification/matrix.json"),MATRIX_A);
- assert.equal(await h.adapter.verifyIntegrated(h.integrated),false);
+ assert.equal(await h.verify(h.integrated),false);
  const context=h.context();
  assert.equal(context.approvedMatrixDigest,hash(MATRIX_A));assert.equal(context.matrixApprovalMessageSeq,11);assert.equal(context.matrixDigest,hash(MATRIX_A));
  assert.deepEqual(h.matrix().map(c=>c.argv[2]),["plan","run"]);
@@ -784,18 +1073,19 @@ function matrixChangeRelease(approvals){
  git(f.cwd,"checkout","tasks-hub");const tip=change(f,"verification/matrix.json",MATRIX_B);
  ignorePrerequisites(f.cwd);placePrerequisites(f.cwd);
  const c=config(f,j),a=fake(),argvs=[],home=dirname(c.journalPath);
- const host=new HostAdapter({cwd:f.cwd,journalDirectory:home},{id:"rel_fixture",agentId:"agt_fixture",runId:"run_fixture",generation:1});host.matrixRunsActive=()=>0;
+ const host=new HostAdapter({cwd:f.cwd,journalDirectory:home},{id:"rel_fixture",agentId:"agt_fixture",runId:"run_fixture",generation:1});host.processStartTime=()=>null;
+ host.startMatrixRun=(argv,dir)=>{argvs.push(argv);writeFileSync(join(dir,"receipt.json"),JSON.stringify({environment:{},checks:[{exitCode:0}]}));return exitedPid();};
  host.command=argv=>{argvs.push(argv);
   if(argv[1]==="deployment"&&argv[2]==="list")return JSON.stringify([{id:"rel_fixture",state:"claimed",matrixApprovals:approvals}]);
   if(argv[1]==="deployment"&&argv[2]==="handler")return JSON.stringify({id:"agt_0123abcd"});
   if(argv[1]==="scripts/verify-matrix.mjs"&&argv[2]==="plan"){writeFileSync(argv[4],JSON.stringify(workedPlan));return "";}
-  if(argv[1]==="scripts/verify-matrix.mjs"&&argv[2]==="run"){writeFileSync(join(argv[4],"receipt.json"),JSON.stringify({environment:{},checks:[{exitCode:0}]}));return "";}
   return "";};
  a.verifyIntegrated=x=>host.verifyIntegrated(x);a.escalate=async d=>{a.calls.push("escalate");await host.escalate(d);};
  return {f,j,c,a,argvs,home,tip,originHead,sends:()=>argvs.filter(x=>x[1]==="send"),matrix:()=>argvs.filter(x=>x[1]==="scripts/verify-matrix.mjs")};
 }
 test("m4 end to end: a matrix change on tasks-hub after acceptance verifies under the owner approval of the new digest",async()=>{
  const r=matrixChangeRelease([{digest:hash(MATRIX_A),messageSeq:11},{digest:hash(MATRIX_B),messageSeq:40}]);
+ assert.equal((await runRelease(r.c,r.a)).outcome,"waiting_matrix");assert.equal(r.sends().length,0,"the first poll starts the run");
  assert.equal((await runRelease(r.c,r.a)).outcome,"waiting_matrix");
  const integrated=git(r.f.cwd,"rev-parse","HEAD");assert.notEqual(integrated,r.j.commit);assert.equal(git(r.f.cwd,"rev-parse","HEAD^"),r.tip);
  const context=JSON.parse(readFileSync(join(attemptDir(r.home,integrated,0),"context.json"),"utf8"));

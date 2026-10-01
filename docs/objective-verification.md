@@ -247,8 +247,10 @@ the final plan, so the verified commit is exactly what merges.
 
 ## Host lock and waitlist
 
-Feature `wi_6b4af2fb034ec36e`, order #18569 (phase 1). One host runs one
-verification at a time. Every `verify-matrix.mjs run` and `targeted`, and every
+Features `wi_6b4af2fb034ec36e`, order #18569 (phase 1) and
+`wi_c5cb667695c3614c`, order #19197 (phase 2: the deployer, the queue list and
+the holder cap). One host runs one verification at a time. Every
+`verify-matrix.mjs run` and `targeted`, the deployer's integrated run, and every
 supplemental run started through the `exec` wrapper below, takes one host lock
 before it starts and releases it when it ends. A run that finds the lock held
 joins an ordered waitlist. Nobody checks `ps` or waits for a quiet period any
@@ -284,7 +286,7 @@ files 0600. Beside it are `host.journal.jsonl` (append-only history),
     "id": "…", "seq": 38, "pid": 4242, "kind": "run",
     "item": "wi_…", "agent": "verifier-…",
     "priority": "high", "prioritySource": "flag",
-    "requestedAt": "…", "startedAt": "…", "runTimeoutMs": 5400000,
+    "requestedAt": "…", "startedAt": "…", "runTimeoutMs": 7200000,
     "groups": [4250, 4263], "commit": "…", "output": "/abs/logs"
   },
   "waiters": [
@@ -332,11 +334,30 @@ check group it recorded are gone. The second case is journaled as
 `stale-recovered` with reason `pid-gone`. A killed runner whose checks are
 still running therefore keeps the lock until they end.
 
-Each holder also stops itself. Its run timeout is every planned check's timeout
-times the attempt limit plus a 30-minute build allowance (the bound the
-deployer already puts on its in-release run); for `exec` it is
-`--timeout-minutes`. At that time the holder aborts through the normal
-interruption path: checks are stopped, the home is removed, no receipt is
+**Holder bound.** Each holder also stops itself. The timeout it asks for is
+every planned check's timeout times the attempt limit plus a 30-minute build
+allowance; for `exec` it is `--timeout-minutes`. That serial sum is the only
+closed form that is an upper bound under every scheduling rule (exclusive
+checks, shared ports, the Go lane), but it is far above what parallel lanes
+take: about 36 hours for the full plan, whose runs take about seven minutes.
+So every holder clamps its own timeout to the holder cap before it joins the
+list: `TAILTERM_MATRIX_HOLDER_CAP_MINUTES` in whole minutes from 1 to 1440,
+default 120. The clamp applies to `run`, `targeted` and `exec` alike, and the
+deployer uses the same number for its integrated run. An invalid value is
+refused before the run joins the list. The clamped value is what the lock file
+shows as `runTimeoutMs` and what the holder stops itself at; the run prints
+`matrix host: run timeout N ms clamped to the holder cap of M ms`, and the
+sidecar keeps the asked-for value as `requestedRunTimeoutMs`. With the default
+cap a full run is bounded at 7200000 ms, half the waiters' 240-minute bound. A
+run that legitimately needs longer is stopped without a receipt
+(`runTimeoutAbort` in the sidecar, `run-timeout-abort` in the journal); raise
+the variable for that run.
+
+Only a holder clamps itself. A waiter never shortens the deadline another
+holder recorded, so a holder started from an older checkout, or under a larger
+cap, keeps the deadline it wrote in the lock file and stops itself then.
+
+At its run timeout the holder aborts through the normal interruption path: checks are stopped, the home is removed, no receipt is
 written, the lock is released and `run-timeout-abort` is journaled. A
 preparatory test-binary build blocks the runner, so the stop happens when that
 build returns.
@@ -390,7 +411,7 @@ They are added to the receipt only; checks do not see them.
 
 `host-lock.json` in the output directory holds the same values as numbers,
 with the request id, sequence, pid, item, agent, request, acquire and release
-times, CPU count, timestamped 1- and 5-minute load samples and any recovery or
+times, the run timeout (`runTimeoutMs`, clamped, and `requestedRunTimeoutMs`), CPU count, timestamped 1- and 5-minute load samples and any recovery or
 overlap details. It is written on every release, including failed, interrupted
 and withdrawn runs, so the output directory always contains `host-lock.json`
 and `host-lock.log`. The hub does not import these keys or the sidecar in this
@@ -406,33 +427,60 @@ node scripts/verify-matrix-host-lock.mjs exec --item ITEM --timeout-minutes N --
 
 It prints the same waiting lines, runs the command in its own process group
 (recorded in `groups`), forwards SIGINT and SIGTERM to that group, stops the
-command at `--timeout-minutes` (exit 124), and otherwise exits with the
+command at `--timeout-minutes` or the holder cap, whichever is sooner (exit 124), and otherwise exits with the
 command's own code. It writes `host-lock.json` (check set `supplemental`, plus
 the argv and exit code) and `host-lock.log` to the record directory.
 
-**The deployer.** The release runner is unchanged in this phase. Its in-release
-`node scripts/verify-matrix.mjs run PLAN DIR` passes no priority, so it joins
-the same list at `normal` with source `default` until phase 2
-(`wi_c5cb667695c3614c`) gives it an explicit priority. Two effects follow:
+**The deployer.** The release runner's integrated run is a member of the same
+list. The runner starts it detached with `--priority`, `--item` and
+`--host-wait-minutes`, counts no processes, and polls. Its priority is the
+release job's if the hub carries one, else the private config key
+`matrixPriority`, else `high`; its wait bound is `matrixHostWaitMs` (default 2
+hours); its holder bound is the clamped value above. While it waits, the
+deployer posts a notice with its position, the list length and the holder each
+time one of them changes. If it must stop its own run it signals only that run,
+never a check group, and holds the job when it cannot confirm the run stopped.
+[Project deployment](project-deployment.md), "Integrated-commit verification",
+has the attempt record, the notices and the held state.
 
-- Its existing process-count gate also counts verifier runs that are only
-  waiting, so it starts when no verifier is running or waiting and can reach
-  its two-hour "Host busy" bound sooner.
-- If a verifier joins between that gate and the lock request, the deployer's
-  run waits behind it, and that wait spends the deployer's own command timeout.
-  When the timeout ends the wait, the run receives SIGTERM, leaves the list and
-  writes no receipt, and the release job fails with a command `timeout` reason
-  rather than "Host busy".
-
-The deployer captures its run's output, so the waiting lines are not on its
-terminal. To see where a slow release stands, read `status` (the deployer's run
-is listed with its position and the holder), then
+To see where a slow release stands, read `status` or `tt team queue list`, then
 `<job journal>/<job>-integrated-verification/<commit>-rN/host-lock.log` for the
-timestamped waiting lines, and `host-lock.json` there and `host.journal.jsonl`
-for `request` and `withdrawn` with the wait time.
+timestamped waiting lines, `run.out` and `run.err` there for the run's output,
+and `host-lock.json` and `host.journal.jsonl` for `request` and `withdrawn`
+with the wait time.
 
-**Limits.** A runner in a checkout older than this change takes no lock until
-it is rebased. Builders' ad hoc test runs take no lock. A process or group id
+**The queue list.** `tt team queue list` (text output) reads the same file and
+prints, under each entry whose work item has a run waiting, one line per
+waiting run:
+
+```text
+  waiting-for-matrix position=2 of 3 holder=wi_…/verifier-…/pid 4242 priority=high kind=run agent=verifier-… since=2026-10-01T14:05:00.000Z
+```
+
+The position is the run's place in the file's order, as `status` prints it, and
+`holder=none` means the host is free. A line is printed only for an entry on
+this machine (the entry's host and the file's `host` compared by first DNS
+label, ignoring case, so `Stephens-Mini` and `Stephens-Mini.local` match) that
+has not failed. An entry on another host gets no line. The file is read from
+`TAILTERM_MATRIX_HOST_LOCK`, else the default path. The list always prints and
+exits 0, and `--json` is unchanged. Four cases show no waitlist:
+
+- No file: nothing extra is printed (a free host).
+- `TAILTERM_MATRIX_HOST_LOCK` is set but relative: `matrix host:
+  TAILTERM_MATRIX_HOST_LOCK must be an absolute path; waitlist not shown`. The
+  default path is not read instead.
+- The file is unreadable, not JSON or not version 1: `matrix host: lock file
+  PATH unusable (REASON); waitlist not shown`.
+- The file's `host` is another machine: `matrix host: lock file PATH belongs to
+  host X; waitlist not shown`.
+
+The lock file lives on the machine that runs the matrix, so the list shows the
+waitlist only when it is run there. The hub's idle-entry stall check does not
+read it (`wi_772e88d71e5cd0e5`).
+
+**Limits.** A runner in a checkout older than phase 1 takes no lock until
+it is rebased, and one older than phase 2 records an unclamped run timeout,
+which waiters honour. Builders' ad hoc test runs take no lock. A process or group id
 reused by an unrelated process makes a dead run look alive; that only delays
 the next run, up to the run timeout plus grace. There is a short window
 between a check starting and its group reaching the file, and the children of
