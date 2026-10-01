@@ -58,14 +58,49 @@ test("uncertain final receipt storage retries the receipt and never rolls back v
  const result=await runRelease(c,a);assert.equal(result.outcome,"released");assert.equal(finishes,2);assert.equal(a.calls.filter(x=>x==="deploy:tailos").length,1);
 });
 
-test("host Mini adapter uses atomic install and retained rollback without changing fixture database",async()=>{
- const cwd=mkdtempSync(join(tmpdir(),"mini-adapter-")),install=join(cwd,"tt"),artifact=join(cwd,"next"),backup=join(cwd,"before"),db=join(cwd,"fixture.sqlite");
+// The Mini tests always supply host setup stubs, so no test runs a real
+// tt host setup; the artifact is a text file, so an omitted stub fails.
+function miniFixture(over={}){
+ const cwd=mkdtempSync(join(tmpdir(),"mini-adapter-")),install=join(cwd,"tt"),artifact=join(cwd,"next"),previous=join(cwd,"tt.previous"),db=join(cwd,"fixture.sqlite"),restarts=join(cwd,"restarts"),probes=join(cwd,"probes");
  writeFileSync(install,"old CLI");writeFileSync(artifact,"new CLI");writeFileSync(db,"newer writes");
- const a={installPath:install,artifactPath:artifact,rollbackPath:backup,rollbackSafe:true,artifactSHA256:hash(readFileSync(artifact)),relayRestart:[process.execPath,"-e","process.exit(0)"],rollbackProbe:[process.execPath,"-e","console.log(JSON.stringify({restored:true,databaseWritesPreserved:true}))"]};
- const adapter=new HostAdapter({cwd,journalDirectory:cwd},{id:"rel_fixture"});adapter.artifacts.set("mini",a);
- adapter.captureMiniRollback(a);adapter.artifacts.set("mini",a);
+ const node=(script,...args)=>[process.execPath,"-e",script,...args];
+ const a={installPath:install,artifactPath:artifact,rollbackSafe:true,artifactSHA256:hash(readFileSync(artifact)),
+  hostSetup:node("const fs=require('fs'),[i,a,p]=process.argv.slice(1);fs.copyFileSync(i,p);fs.copyFileSync(a,i)",install,artifact,previous),
+  hostRollback:node("const fs=require('fs'),[i,p]=process.argv.slice(1);fs.copyFileSync(p,i)",install,previous),
+  relayRestart:node("require('fs').appendFileSync(process.argv[1],'restart\\n')",restarts),
+  rollbackProbe:node("require('fs').appendFileSync(process.argv[1],'probe\\n');console.log(JSON.stringify({restored:true,databaseWritesPreserved:true}))",probes),...over(node,{install,artifact,previous})};
+ const adapter=new HostAdapter({cwd,journalDirectory:cwd},{id:"rel_fixture"});adapter.captureMiniRollback(a);adapter.artifacts.set("mini",a);
+ return {adapter,a,install,artifact,db,restarts,probes};
+}
+test("host Mini adapter installs through host setup and restores the prior binary without changing fixture database",async()=>{
+ const {adapter,a,install,db,restarts,probes}=miniFixture(()=>({}));
  await adapter.deploy("mini",a);assert.equal(readFileSync(install,"utf8"),"new CLI");assert.equal(readFileSync(a.rollbackPath,"utf8"),"old CLI");
  assert.equal(await adapter.rollback("mini"),true);assert.equal(readFileSync(install,"utf8"),"old CLI");assert.equal(readFileSync(db,"utf8"),"newer writes");
+ assert.equal(existsSync(restarts),false,"a host rollback that restored the prior binary needs no separate relay restart");assert.equal(readFileSync(probes,"utf8"),"probe\n");
+});
+test("host Mini rollback restores the journal copy when the host rollback command fails or leaves other bytes",async()=>{
+ for(const [name,hostRollback] of [["exits non-zero",node=>node("process.exit(1)")],["leaves a wrong tt.previous",(node,f)=>node("require('fs').writeFileSync(process.argv[1],'some other CLI')",f.install)]]){
+  const {adapter,a,install,db,restarts,probes}=miniFixture((node,f)=>({hostRollback:hostRollback(node,f)}));
+  await adapter.deploy("mini",a);assert.equal(readFileSync(install,"utf8"),"new CLI",name);
+  assert.equal(await adapter.rollback("mini"),true,name);assert.equal(readFileSync(install,"utf8"),"old CLI",name);assert.equal(hash(readFileSync(install)),a.priorArtifactSHA256,name);
+  assert.equal(readFileSync(restarts,"utf8"),"restart\n",name+": the journal restore restarts the relay");assert.equal(readFileSync(probes,"utf8"),"probe\n",name);assert.equal(readFileSync(db,"utf8"),"newer writes",name);
+ }
+ // A changed journal copy is still refused before any host command runs.
+ const {adapter,a,install,probes}=miniFixture(()=>({}));await adapter.deploy("mini",a);writeFileSync(a.rollbackPath,"tampered");
+ assert.equal(await adapter.rollback("mini"),false);assert.equal(readFileSync(install,"utf8"),"new CLI");assert.equal(existsSync(probes),false);
+});
+test("host Mini deploy that fails in host setup rolls back to the prior digest",async()=>{
+ const failing=miniFixture((node,f)=>({hostSetup:node("const fs=require('fs');fs.copyFileSync(process.argv[2],process.argv[1]);process.exit(1)",f.install,f.artifact)}));
+ await assert.rejects(failing.adapter.deploy("mini",failing.a),/Host operation failed/);assert.equal(readFileSync(failing.install,"utf8"),"new CLI","host setup failed after installing");
+ assert.equal(await failing.adapter.rollback("mini"),true);assert.equal(hash(readFileSync(failing.install)),failing.a.priorArtifactSHA256);assert.equal(readFileSync(failing.restarts,"utf8"),"restart\n");assert.equal(readFileSync(failing.db,"utf8"),"newer writes");
+ const idle=miniFixture(node=>({hostSetup:node("process.exit(0)")}));
+ await assert.rejects(idle.adapter.deploy("mini",idle.a),/does not match the pinned artifact/);assert.equal(readFileSync(idle.install,"utf8"),"old CLI");
+ // With no configured stub the runner runs the candidate's own host setup,
+ // and the installed tt's rollback.
+ const bare=miniFixture(()=>({hostSetup:undefined,hostRollback:undefined}));const argvs=[],real=bare.adapter.command.bind(bare.adapter);
+ bare.adapter.command=(argv,cwd)=>{argvs.push(argv);if(argv.includes("host"))throw new Error("Host operation failed");return real(argv,cwd);};
+ await assert.rejects(bare.adapter.deploy("mini",bare.a),/Host operation failed/);assert.equal(await bare.adapter.rollback("mini"),true);
+ assert.deepEqual(argvs.slice(0,2),[[bare.artifact,"host","setup","--from",bare.artifact],[bare.install,"host","setup","--rollback"]]);assert.equal(readFileSync(bare.install,"utf8"),"old CLI");
 });
 test("host receipt adapter writes its receipt beneath the provisioned journal directory",async()=>{
  const cwd=mkdtempSync(join(tmpdir(),"receipt-adapter-")),adapter=new HostAdapter({cwd,journalDirectory:cwd},{id:"rel_fixture",generation:5});let args;
@@ -84,7 +119,7 @@ function importInputs(adapter,commit,targets){
 function hostFixture(){
  const f=fixture();mkdirSync(join(f.cwd,"hub/cmd/tt"),{recursive:true});mkdirSync(join(f.cwd,"hub/internal/store"),{recursive:true});
  const commit=change(f,"hub/cmd/tt/main.go","fixture");const home=mkdtempSync(join(tmpdir(),"release-host-inputs-")),install=join(home,"tt");writeFileSync(install,"v1");
- const config={cwd:f.cwd,journalDirectory:home,baselines:Object.fromEntries(["hub","bridge","mini","tailos"].map(t=>[t,f.base])),targets:{mini:{installPath:install,rollbackPath:join(home,"stale-before"),release:"stale-release",relayRestart:[process.execPath,"-e","process.exit(0)"],rollbackProbe:[process.execPath,"-e","console.log(JSON.stringify({restored:true,databaseWritesPreserved:true}))"]}}};
+ const config={cwd:f.cwd,journalDirectory:home,baselines:Object.fromEntries(["hub","bridge","mini","tailos"].map(t=>[t,f.base])),targets:{mini:{installPath:install,rollbackPath:join(home,"stale-before"),release:"stale-release",hostSetup:["host-setup-stub"],hostRollback:["host-rollback-stub"],relayRestart:[process.execPath,"-e","process.exit(0)"],rollbackProbe:[process.execPath,"-e","console.log(JSON.stringify({restored:true,databaseWritesPreserved:true}))"]}}};
  return {f,commit,home,install,config};
 }
 test("b1 two consecutive jobs share stable config and restore the exact prior-live Mini",async()=>{
@@ -93,11 +128,11 @@ test("b1 two consecutive jobs share stable config and restore the exact prior-li
   const adapter=new HostAdapter(config,{...job(f,commit),id});const release=id+"-"+commit.slice(0,12)+"-mini";
   const manifest=importInputs(adapter,commit,{mini:{release,rollbackSafe:true}});
   let restarts=0;
-  adapter.command=(argv)=>{if(argv[1]==="version")return stamped(commit);if(argv.includes("build")){writeFileSync(argv[argv.indexOf("-o")+1],version);return "";}if(id==="rel_second" && argv.includes("process.exit(0)") && ++restarts===1)throw new Error("Synthetic second relay restart failure");return JSON.stringify({restored:true,databaseWritesPreserved:true});};
+  adapter.command=(argv)=>{if(argv[1]==="version")return stamped(commit);if(argv.includes("build")){writeFileSync(argv[argv.indexOf("-o")+1],version);return "";}if(argv[0]==="host-setup-stub"){writeFileSync(install,version);if(id==="rel_second")throw new Error("Synthetic second host setup failure");return "";}if(argv[0]==="host-rollback-stub")throw new Error("Synthetic missing rollback copy");if(argv.includes("process.exit(0)"))restarts++;return JSON.stringify({restored:true,databaseWritesPreserved:true});};
   const artifact=await adapter.prepare("mini",commit);
   if(id==="rel_second")await assert.rejects(adapter.deploy("mini",artifact),/Synthetic second/);else await adapter.deploy("mini",artifact);
   assert.equal(readFileSync(install,"utf8"),version);
-  if(id==="rel_second"){assert.equal(readFileSync(artifact.rollbackPath,"utf8"),"v2");assert.equal(await adapter.rollback("mini"),true);assert.equal(readFileSync(install,"utf8"),"v2");}
+  if(id==="rel_second"){assert.equal(readFileSync(artifact.rollbackPath,"utf8"),"v2");assert.equal(await adapter.rollback("mini"),true);assert.equal(readFileSync(install,"utf8"),"v2");assert.equal(restarts,1,"the journal restore restarts the relay");}
   writeFileSync(manifest,"{}");assert.throws(()=>adapter.jobInputs(commit),/digest/);
  }
 });

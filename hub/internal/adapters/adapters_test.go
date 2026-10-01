@@ -24,3 +24,43 @@ func TestClaudeHooksIsValidJSON(t *testing.T) {
 		t.Error("codex config wrong")
 	}
 }
+
+func TestHookCommandQuotesOnlyUnusualPaths(t *testing.T) {
+	for _, c := range []struct{ tt, want string }{
+		{"tt", "tt hook stop"},
+		{"/usr/local/bin/tt", "/usr/local/bin/tt hook stop"},
+		{"/opt/tt-1.2+x/_bin/tt", "/opt/tt-1.2+x/_bin/tt hook stop"},
+		{"/Users/a b/.local/bin/tt", "'/Users/a b/.local/bin/tt' hook stop"},
+		{"/Users/o'brien/tt", `'/Users/o'\''brien/tt' hook stop`},
+		{"/tmp/$HOME/tt", "'/tmp/$HOME/tt' hook stop"},
+	} {
+		if got := HookCommand(c.tt, "stop"); got != c.want {
+			t.Errorf("HookCommand(%q) = %q, want %q", c.tt, got, c.want)
+		}
+	}
+	if got := CodexStopHook("/a b/tt")["hooks"].([]any)[0].(map[string]any)["command"]; got != "'/a b/tt' hook stop" {
+		t.Errorf("CodexStopHook did not quote: %q", got)
+	}
+	if !strings.Contains(ClaudeHooks("/a b/tt"), `"'/a b/tt' hook session-start"`) {
+		t.Errorf("ClaudeHooks did not quote: %s", ClaudeHooks("/a b/tt"))
+	}
+}
+
+func TestParseHookCommandRoundTrip(t *testing.T) {
+	for _, tt := range []string{"tt", "/usr/local/bin/tt", "/Users/a b/.local/bin/tt", "/Users/o'brien/tt", "/tmp/$HOME/tt", `/tmp/"q"/tt`, "/tmp/tab\there/tt"} {
+		for _, name := range []string{"stop", "session-start", "prompt", "notification"} {
+			exe, got, ok := ParseHookCommand(HookCommand(tt, name))
+			if !ok || exe != tt || got != name {
+				t.Errorf("round trip of %q %q = %q %q %v", tt, name, exe, got, ok)
+			}
+		}
+	}
+	if exe, name, ok := ParseHookCommand("  /opt/my\\ tools/tt   hook   stop "); !ok || exe != "/opt/my tools/tt" || name != "stop" {
+		t.Errorf("backslash-escaped space = %q %q %v", exe, name, ok)
+	}
+	for _, cmd := range []string{"", "tt", "tt hook", "tt hook stop now", "echo hook stop now", "tt hooks stop", "'/a b/tt hook stop", `"/a b/tt" hook stop`, "$HOME/tt hook stop", "tt hook Stop", "tt hook stop;rm", "tt\\"} {
+		if exe, name, ok := ParseHookCommand(cmd); ok {
+			t.Errorf("ParseHookCommand(%q) accepted as %q %q", cmd, exe, name)
+		}
+	}
+}

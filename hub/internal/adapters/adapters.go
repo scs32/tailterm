@@ -4,12 +4,80 @@ package adapters
 import (
 	"encoding/json"
 	"fmt"
+	"strings"
 )
+
+// HookCommand is the shell command a runtime runs for one tt hook. A tt path
+// made only of ordinary path characters stays bare; any other path (a home
+// directory with a space, for example) is single-quoted so a shell reads it
+// as one word.
+func HookCommand(tt, name string) string {
+	return quoteHookPath(tt) + " hook " + name
+}
+
+func plainHookPathByte(c byte) bool {
+	return c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || strings.IndexByte("_/.+-", c) >= 0
+}
+
+func quoteHookPath(tt string) string {
+	plain := tt != ""
+	for i := 0; i < len(tt); i++ {
+		if !plainHookPathByte(tt[i]) {
+			plain = false
+			break
+		}
+	}
+	if plain {
+		return tt
+	}
+	return "'" + strings.ReplaceAll(tt, "'", `'\''`) + "'"
+}
+
+// ParseHookCommand reads a command written by HookCommand: a first word that
+// is bare or single-quoted, then exactly "hook <name>". It reports the
+// executable and the hook name; any other command is not ok.
+func ParseHookCommand(cmd string) (exe, name string, ok bool) {
+	s := strings.TrimSpace(cmd)
+	var word strings.Builder
+	i := 0
+	for i < len(s) && s[i] != ' ' && s[i] != '\t' {
+		switch c := s[i]; {
+		case c == '\'':
+			end := strings.IndexByte(s[i+1:], '\'')
+			if end < 0 {
+				return "", "", false
+			}
+			word.WriteString(s[i+1 : i+1+end])
+			i += end + 2
+		case c == '\\':
+			if i+1 >= len(s) {
+				return "", "", false
+			}
+			word.WriteByte(s[i+1])
+			i += 2
+		case c == '"' || c == '$' || c == '`':
+			return "", "", false
+		default:
+			word.WriteByte(c)
+			i++
+		}
+	}
+	rest := strings.Fields(s[i:])
+	if word.Len() == 0 || len(rest) != 2 || rest[0] != "hook" {
+		return "", "", false
+	}
+	for j := 0; j < len(rest[1]); j++ {
+		if c := rest[1][j]; (c < 'a' || c > 'z') && c != '-' {
+			return "", "", false
+		}
+	}
+	return word.String(), rest[1], true
+}
 
 // ClaudeHooks returns a Claude Code settings.json fragment wiring tt hooks.
 func ClaudeHooks(tt string) string {
 	hook := func(name string) map[string]any {
-		return map[string]any{"hooks": []map[string]any{{"type": "command", "command": tt + " hook " + name}}}
+		return map[string]any{"hooks": []map[string]any{{"type": "command", "command": HookCommand(tt, name)}}}
 	}
 	settings := map[string]any{"hooks": map[string]any{
 		"SessionStart":     []map[string]any{hook("session-start")},
@@ -34,7 +102,7 @@ const CodexStopMarker = "hook stop"
 // CodexStopHook is the Stop hook entry Tailterm adds to Codex's hooks.json.
 // Outside a Tailterm agent session, tt hook stop does nothing.
 func CodexStopHook(tt string) map[string]any {
-	return map[string]any{"hooks": []any{map[string]any{"type": "command", "command": tt + " " + CodexStopMarker}}}
+	return map[string]any{"hooks": []any{map[string]any{"type": "command", "command": HookCommand(tt, "stop")}}}
 }
 
 func CodexHooksJSON(tt string) string {

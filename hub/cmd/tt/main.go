@@ -29,7 +29,9 @@ Identity comes from the environment tailterm sets on agent sessions:
   TAILTERM_HUB   TAILTERM_TASK   TAILTERM_AGENT   TAILTERM_AGENT_NAME
 
 Commands
-  doctor                       check hub, tmux, and installed runtimes
+  doctor                       check tmux, installed runtimes, the hub and the relay
+  host setup [--hub URL] [--service agent|daemon] [--check|--rollback] [--json]
+                               install or update tt, the runtime hooks and the relay service on this host
   relay [--status]             resume Codex agents for unread directed messages
   bind [--thread UUID]        bind this agent to its exact Codex thread
   brief                        print the shared task briefing
@@ -266,6 +268,8 @@ func main() {
 		err = cmdRuntimes(args)
 	case "hooks":
 		err = cmdHooks(args)
+	case "host":
+		err = cmdHost(args)
 	case "hook":
 		err = cmdHook(e, args)
 	case "new-task", "new-project":
@@ -289,11 +293,13 @@ func printJSON(v any) {
 	_ = enc.Encode(v)
 }
 
-func cmdStatus(e env) error {
-	fmt.Printf("hub      %s\n", or(e.hub, "(unset)"))
-	fmt.Printf("task     %s\n", or(e.task, "(unset)"))
-	fmt.Printf("agent    %s %s\n", or(e.agent, "(unset)"), e.agentName)
-	fmt.Printf("host     %s\n", spawn.Host())
+func cmdStatus(e env) error { return writeStatus(os.Stdout, e) }
+
+func writeStatus(w io.Writer, e env) error {
+	fmt.Fprintf(w, "hub      %s\n", or(e.hub, "(unset)"))
+	fmt.Fprintf(w, "task     %s\n", or(e.task, "(unset)"))
+	fmt.Fprintf(w, "agent    %s %s\n", or(e.agent, "(unset)"), e.agentName)
+	fmt.Fprintf(w, "host     %s\n", spawn.Host())
 	c, err := e.client(5 * time.Second)
 	if err != nil {
 		return err
@@ -304,13 +310,13 @@ func cmdStatus(e env) error {
 	if err != nil {
 		return fmt.Errorf("hub unreachable: %w", err)
 	}
-	fmt.Printf("caller   %s (%s)\n", who.Node, who.User)
+	fmt.Fprintf(w, "caller   %s (%s)\n", who.Node, who.User)
 	if e.task != "" && e.agent != "" {
 		a, err := c.GetAgent(ctx, e.task, e.agent)
 		if err != nil {
 			return err
 		}
-		fmt.Printf("status   %s\nunread   %d\n", a.Status, a.Unread)
+		fmt.Fprintf(w, "status   %s\nunread   %d\n", a.Status, a.Unread)
 	}
 	return nil
 }

@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"github.com/scs32/tailterm/hub/internal/api"
 	"github.com/scs32/tailterm/hub/internal/spawn"
+	"io"
+	"os"
 	"strings"
 	"time"
 )
@@ -343,17 +345,43 @@ func cmdBrief(e env) error {
 }
 
 func cmdDoctor(e env) error {
-	v, err := spawn.Version()
-	if err != nil {
-		return err
+	if failed := runDoctor(os.Stdout, e, 0); len(failed) > 0 {
+		return &exitError{code: 1, err: fmt.Errorf("doctor: failed: %s", strings.Join(failed, ", "))}
 	}
-	if v < 3.02 {
-		return fmt.Errorf("tmux 3.2 or newer required")
-	}
-	fmt.Printf("OK tmux %.2f\nInstalled runtimes: %s\n", v, strings.Join(spawn.Runtimes(), ", "))
-	if err := cmdStatus(e); err != nil {
-		return err
-	}
-	fmt.Println("OK hub reachable. Runtime hooks are opt-in: tt hooks claude or tt hooks codex. The host inbox relay can resume registered Codex threads; messages remain queued until read, with no terminal injection.")
 	return nil
+}
+
+// runDoctor runs every check (tmux, runtimes, hub, relay) even after one
+// fails, writes one or more lines per check and returns the failed names.
+// relayWait is how long to wait for a just-restarted relay to take its lock.
+func runDoctor(w io.Writer, e env, relayWait time.Duration) []string {
+	failed := []string{}
+	if v, err := spawn.Version(); err != nil {
+		fmt.Fprintf(w, "FAIL tmux: %v\n", err)
+		failed = append(failed, "tmux")
+	} else if v < 3.02 {
+		fmt.Fprintf(w, "FAIL tmux %.2f: tmux 3.2 or newer required\n", v)
+		failed = append(failed, "tmux")
+	} else {
+		fmt.Fprintf(w, "OK tmux %.2f\n", v)
+	}
+	fmt.Fprintf(w, "Installed runtimes: %s\n", or(strings.Join(hostSetupRuntimes(), ", "), "none"))
+	if err := writeStatus(w, e); err != nil {
+		fmt.Fprintf(w, "FAIL hub: %v\n", err)
+		failed = append(failed, "hub")
+	} else {
+		fmt.Fprintln(w, "OK hub reachable")
+	}
+	running := relayRunning()
+	for deadline := time.Now().Add(relayWait); !running && time.Now().Before(deadline); running = relayRunning() {
+		time.Sleep(hostSetupPoll)
+	}
+	if running {
+		fmt.Fprintln(w, "OK relay running")
+	} else {
+		fmt.Fprintln(w, "FAIL relay: not running (nothing holds the relay lock); run tt host setup, see docs/host-setup.md")
+		failed = append(failed, "relay")
+	}
+	fmt.Fprintln(w, "tt host setup installs tt, the runtime hooks and the relay service on this machine. The host inbox relay can resume registered Codex threads; messages remain queued until read, with no terminal injection.")
+	return failed
 }

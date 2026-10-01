@@ -619,7 +619,7 @@ export class HostAdapter {
     if(perJob.release!==release)throw releaseError("Unique job release identity required");
     // Stable config contains private probe/host references only. Backup, release,
     // compatibility and rollback inputs come from the handler-pinned job manifest.
-    const artifact={installPath:t.installPath,relayRestart:t.relayRestart,liveProbe:t.liveProbe,rollbackProbe:t.rollbackProbe,...perJob,release,commit,rollbackSafe:perJob.rollbackSafe===true,...(planTargets?{planTargets}:{})};
+    const artifact={installPath:t.installPath,relayRestart:t.relayRestart,hostSetup:t.hostSetup,hostRollback:t.hostRollback,liveProbe:t.liveProbe,rollbackProbe:t.rollbackProbe,...perJob,release,commit,rollbackSafe:perJob.rollbackSafe===true,...(planTargets?{planTargets}:{})};
     const baselines=this.baselines||this.config.baselines;
     artifact.schemaChanged=["hub","bridge"].includes(target) && schemaChanged(this.config.cwd,baselines.hub,commit);
     if(target==="tailos"){
@@ -696,12 +696,13 @@ export class HostAdapter {
       for(const p of planTargets.filter(t=>t!==target)){const other=this.artifacts.get(p);if(!other || other.planPath!==a.planPath || other.release!==a.release || !other.artifactPath || fileDigest(other.artifactPath)!==other.artifactSHA256)throw releaseError("Paired artifact changed");}
       this.command(["python3","scripts/deploy-truenas-hub.py",a.release,"--plan",a.planPath,"--preflight-receipt",a.preflightReceipt,"--preflight-receipt-sha256",a.preflightReceiptSHA256,"--update"]);
     }else if(target==="mini"){
-      const {copyFileSync,chmodSync}=await import("node:fs");
       if(!a.rollbackCaptured || fileDigest(a.rollbackPath)!==a.priorArtifactSHA256 || fileDigest(a.installPath)!==a.priorArtifactSHA256)throw new Error("Exact prior-live Mini rollback required");
-      copyFileSync(a.artifactPath,a.installPath+".next");chmodSync(a.installPath+".next",0o755);renameSync(a.installPath+".next",a.installPath);
       // The live probe counts relay errors only after this deploy.
       const log=this.config.targets?.mini?.relayLog;if(log)save(join(this.config.journalDirectory,"mini-relay-offset.json"),{jobId:this.job.id,offset:existsSync(log)?statSync(log).size:0});
-      this.command(a.relayRestart);
+      // tt host setup installs the binary with its own rollback copy, updates
+      // the hooks, restarts the relay and runs doctor (docs/host-setup.md).
+      this.command(a.hostSetup||[a.artifactPath,"host","setup","--from",a.artifactPath]);
+      if(fileDigest(a.installPath)!==a.artifactSHA256)throw new Error("Mini install does not match the pinned artifact");
     }else{
       const output=this.command(["npx","wrangler","pages","deploy","dist-static","--project-name","tailos","--branch","main","--commit-hash",a.commit,"--commit-dirty=false"]);
       // Output is kept out of messages/receipts; a host probe supplies the
@@ -744,7 +745,15 @@ export class HostAdapter {
     const a=this.artifacts.get(target);if(!a || a.rollbackSafe!==true)return false;
     if(target==="mini"){
       if(!a.rollbackCaptured || fileDigest(a.rollbackPath)!==a.priorArtifactSHA256)return false;
-      const {copyFileSync}=await import("node:fs");copyFileSync(a.rollbackPath,a.installPath+".rollback");renameSync(a.installPath+".rollback",a.installPath);this.command(a.relayRestart);
+      // The host command is never trusted alone: it may be missing in an old
+      // CLI, lack its rollback copy, restore other bytes or fail doctor. Unless
+      // it left exactly the prior binary, restore this job's journal copy.
+      let hostRestored=true;
+      try{this.command(a.hostRollback||[a.installPath,"host","setup","--rollback"]);}catch{hostRestored=false;}
+      if(!hostRestored || fileDigest(a.installPath)!==a.priorArtifactSHA256){
+        copyFileSync(a.rollbackPath,a.installPath+".rollback");chmodSync(a.installPath+".rollback",0o755);renameSync(a.installPath+".rollback",a.installPath);this.command(a.relayRestart);
+      }
+      if(fileDigest(a.installPath)!==a.priorArtifactSHA256)return false;
     }else if(PAIR.includes(target)){
       // A failed rollback program is already "not restored"; the probe still
       // runs once so the journal shows the app state it left behind.

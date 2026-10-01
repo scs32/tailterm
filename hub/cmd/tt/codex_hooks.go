@@ -7,7 +7,6 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/scs32/tailterm/hub/internal/adapters"
 	"github.com/scs32/tailterm/hub/internal/spawn"
 )
 
@@ -47,7 +46,7 @@ func codexStopHookInstalled() bool {
 	}
 	for _, entry := range doc.Hooks.Stop {
 		for _, h := range entry.Hooks {
-			if fields := strings.Fields(h.Command); len(fields) == 3 && filepath.Base(fields[0]) == "tt" && fields[1]+" "+fields[2] == adapters.CodexStopMarker {
+			if isTTHook(h.Command, "stop") {
 				return true
 			}
 		}
@@ -66,37 +65,21 @@ func codexHookCommand(command, runtime, run string) string {
 	return command + " " + spawn.ShellQuote("--dangerously-bypass-hook-trust")
 }
 
-// installCodexStopHook merges the Tailterm Stop hook into hooks.json,
-// keeping every other hook, and is idempotent.
+// installCodexStopHook merges the Tailterm Stop hook into hooks.json with
+// the same validation and merge rule as tt host setup, keeping every other
+// hook, and is idempotent. A bare tt name leaves an installed hook as it is,
+// so it never replaces the absolute path host setup wrote.
 func installCodexStopHook(tt string) error {
 	path := filepath.Join(codexHome(), "hooks.json")
-	doc := map[string]any{}
-	if b, err := os.ReadFile(path); err == nil && len(strings.TrimSpace(string(b))) > 0 {
-		if err := json.Unmarshal(b, &doc); err != nil {
-			return fmt.Errorf("%s is not valid JSON; fix it before installing: %w", path, err)
-		}
+	out, err := mergeJSONFile(path, true, func(doc map[string]any) (bool, error) {
+		return mergeTTHooks(doc, codexHookEvents, tt, !filepath.IsAbs(tt))
+	})
+	if err != nil {
+		return fmt.Errorf("%w; nothing was changed", err)
 	}
-	if codexStopHookInstalled() {
+	if !out.changed {
 		fmt.Println("The Tailterm Stop hook is already installed in", path)
 		return nil
-	}
-	hooks, _ := doc["hooks"].(map[string]any)
-	if hooks == nil {
-		hooks = map[string]any{}
-	}
-	stop, _ := hooks["Stop"].([]any)
-	hooks["Stop"] = append(stop, adapters.CodexStopHook(tt))
-	doc["hooks"] = hooks
-	out, _ := json.MarshalIndent(doc, "", "  ")
-	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
-		return err
-	}
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, append(out, '\n'), 0o600); err != nil {
-		return err
-	}
-	if err := os.Rename(tmp, path); err != nil {
-		return err
 	}
 	fmt.Println("Installed the Tailterm Stop hook in", path)
 	return nil
