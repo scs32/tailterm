@@ -8,7 +8,6 @@ import (
 	"math/big"
 	"regexp"
 	"sort"
-	"strconv"
 	"time"
 
 	"github.com/scs32/tailterm/hub/internal/api"
@@ -232,14 +231,7 @@ func newUsageItem(task, item, title string) *usageItemAccumulator {
 }
 func (a *usageItemAccumulator) add(key string, p api.UsageProjection, d int64, prices api.UsagePrices) {
 	a.all.add(key, p.Turn, d, prices)
-	phase := p.Phase
-	if phase == "review" {
-		if p.ReviewRound > 0 {
-			phase += " round " + strconv.Itoa(p.ReviewRound)
-		} else {
-			phase += " round unavailable"
-		}
-	}
+	phase := usagePhaseKey(p.Phase, p.ReviewRound)
 	model := p.Turn.Runtime + "/" + p.Turn.Model
 	if p.Turn.Model == "" {
 		model = p.Turn.Runtime + "/unknown"
@@ -378,15 +370,28 @@ func (s *Store) Usage(ctx context.Context, task string, q api.UsageQuery) (api.U
 	if err != nil {
 		return out, err
 	}
+	// Time sits next to tokens: per item and for project overhead.
+	times, err := usageTimeReports(ctx, tx, task, q)
+	if err != nil {
+		return out, err
+	}
+	for item := range times {
+		if item != "" && items[task+"/"+item] == nil {
+			items[task+"/"+item] = newUsageItem(task, item, item)
+		}
+	}
 	out.Summary = total.finish()
 	out.Overhead = overhead.finish()
+	out.Overhead.Time = times[""]
 	keys := make([]string, 0, len(items))
 	for k := range items {
 		keys = append(keys, k)
 	}
 	sort.Strings(keys)
 	for _, k := range keys {
-		out.Items = append(out.Items, items[k].finish())
+		report := items[k].finish()
+		report.Time = times[report.ItemID]
+		out.Items = append(out.Items, report)
 	}
 	return out, nil
 }

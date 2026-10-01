@@ -131,6 +131,80 @@ type UsageItemReport struct {
 	Roles      []UsageGroup `json:"roles"`
 	Models     []UsageGroup `json:"models"`
 	PhaseRoles []UsageGroup `json:"phaseRoles"`
+	// Time is absent when the item has no spans: its time was not measured.
+	Time *UsageTime `json:"time,omitempty"`
+}
+
+// UsageTime says where an item's wall time went. Every duration is exact
+// milliseconds as a rational string, like token quantities: an integer, or
+// "n/d" when a request served several items. The window runs from the
+// earliest to the latest segment attributed to the item. For each agent,
+// model + tool + waiting + unmeasured equals the window, so each of Phases,
+// Roles and PhaseRoles sums to the same total as Agents.
+type UsageTime struct {
+	WallMs string    `json:"wallMs"`
+	From   time.Time `json:"from"`
+	To     time.Time `json:"to"`
+	// UnmeasuredMs is time with no model/tool/waiting split: a turn past the
+	// interval bound, or a tool call that mixed an inbox wait with other work.
+	UnmeasuredMs string           `json:"unmeasuredMs"`
+	ModelMs      string           `json:"modelMs"`
+	ToolMs       string           `json:"toolMs"`
+	WaitingMs    string           `json:"waitingMs"`
+	Agents       []UsageTimeAgent `json:"agents"`
+	Phases       []UsageTimeSplit `json:"phases"`
+	Roles        []UsageTimeSplit `json:"roles"`
+	PhaseRoles   []UsageTimeSplit `json:"phaseRoles"`
+	Timeline     UsageTimeline    `json:"timeline"`
+	// Waits are the five longest waits by cause and awaited Board message.
+	Waits  []UsageTimeWait `json:"waits"`
+	Causes UsageTimeCauses `json:"causes"`
+	// Polls counts model requests that only re-checked the inbox; PollMs is
+	// the model time inside their segments.
+	Polls  int    `json:"polls"`
+	PollMs string `json:"pollMs"`
+}
+type UsageTimeAgent struct {
+	AgentID      string `json:"agentId"`
+	Name         string `json:"name"`
+	Role         string `json:"role"`
+	ModelMs      string `json:"modelMs"`
+	ToolMs       string `json:"toolMs"`
+	WaitingMs    string `json:"waitingMs"`
+	UnmeasuredMs string `json:"unmeasuredMs"`
+	Polls        int    `json:"polls"`
+	PollMs       string `json:"pollMs"`
+}
+type UsageTimeSplit struct {
+	Key       string `json:"key"`
+	ModelMs   string `json:"modelMs"`
+	ToolMs    string `json:"toolMs"`
+	WaitingMs string `json:"waitingMs"`
+}
+
+// UsageTimeline is the team's wall clock: some model working, only tools
+// running, nobody active. With UnmeasuredMs the four sum to the window.
+type UsageTimeline struct {
+	ModelMs      string `json:"modelMs"`
+	ToolsOnlyMs  string `json:"toolsOnlyMs"`
+	IdleMs       string `json:"idleMs"`
+	UnmeasuredMs string `json:"unmeasuredMs"`
+}
+
+// UsageTimeWait is waiting attributed to what was awaited. Cause is owner,
+// handler, teammate or unknown; AwaitedBy names the agents that waited.
+type UsageTimeWait struct {
+	Cause      string `json:"cause"`
+	MessageSeq int64  `json:"messageSeq,omitempty"`
+	Subject    string `json:"subject,omitempty"`
+	AwaitedBy  string `json:"awaitedBy"`
+	Ms         string `json:"ms"`
+}
+type UsageTimeCauses struct {
+	Owner    string `json:"owner"`
+	Handler  string `json:"handler"`
+	Teammate string `json:"teammate"`
+	Unknown  string `json:"unknown"`
 }
 type UsageQuery struct {
 	Item     string
