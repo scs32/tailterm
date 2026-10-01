@@ -835,27 +835,25 @@ func playwrightCheck(d *doctorRun, browser string) doctorResult {
 	if json.Unmarshal(b, &doc) != nil {
 		return checkMissing("browsers.json unreadable", "npm ci")
 	}
-	var accepted []string
+	// Playwright installs one revision per browser: the override for this
+	// host's platform when browsers.json has one, otherwise the default.
+	var want string
 	for _, entry := range doc.Browsers {
 		if entry.Name != browser {
 			continue
 		}
-		accepted = append(accepted, entry.Revision)
-		if browser == "webkit" {
-			for _, rev := range entry.RevisionOverrides {
-				accepted = append(accepted, rev)
-			}
+		want = entry.Revision
+		if rev := entry.RevisionOverrides[d.playwrightPlatform()]; rev != "" {
+			want = rev
 		}
 	}
-	if len(accepted) == 0 {
+	if want == "" {
 		return checkMissing(browser+" is not in browsers.json", "npm ci")
 	}
 	dir := d.playwrightDir()
 	prefix := strings.ReplaceAll(browser, "-", "_") + "-"
-	for _, rev := range accepted {
-		if info, err := d.p.stat(filepath.Join(dir, prefix+rev)); err == nil && info.IsDir() {
-			return checkOK(prefix + rev)
-		}
+	if info, err := d.p.stat(filepath.Join(dir, prefix+want)); err == nil && info.IsDir() {
+		return checkOK(prefix + want)
 	}
 	found, _ := d.p.glob(filepath.Join(dir, prefix+"*"))
 	var others []string
@@ -867,9 +865,44 @@ func playwrightCheck(d *doctorRun, browser string) doctorResult {
 	}
 	sort.Strings(others)
 	if len(others) > 0 {
-		return checkWrong("found "+strings.Join(others, ", ")+"; need "+prefix+accepted[0], fix)
+		return checkWrong("found "+strings.Join(others, ", ")+"; need "+prefix+want, fix)
 	}
-	return checkMissing(prefix+accepted[0]+" not installed", fix)
+	return checkMissing(prefix+want+" not installed", fix)
+}
+
+// playwrightPlatform is the key Playwright looks up in revisionOverrides on
+// this host, or "" when it is not a Mac or the kernel version cannot be read;
+// the default revision then applies.
+func (d *doctorRun) playwrightPlatform() string {
+	if d.p.goos != "darwin" {
+		return ""
+	}
+	r := d.command("", nil, "uname", "-r")
+	if !r.found || r.code != 0 || r.err != nil {
+		return ""
+	}
+	cpu := d.command("", nil, "sysctl", "-n", "machdep.cpu.brand_string")
+	return playwrightMacPlatform(string(r.out), cpu.found && cpu.code == 0 && cpu.err == nil && strings.Contains(string(cpu.out), "Apple"))
+}
+
+// playwrightMacPlatform maps a Darwin kernel release to Playwright's platform
+// key as playwright-core 1.63 does: kernel 20 to 24 are macOS 11 to 15, and
+// later kernels are macOS major+1, capped at 26, the last one Playwright
+// knows. Kernels before 20 have no overrides and return "".
+func playwrightMacPlatform(release string, appleSilicon bool) string {
+	major, err := strconv.Atoi(strings.SplitN(strings.TrimSpace(release), ".", 2)[0])
+	if err != nil || major < 20 {
+		return ""
+	}
+	mac := major - 9
+	if major >= 25 {
+		mac = min(major+1, 26)
+	}
+	key := "mac" + strconv.Itoa(mac)
+	if appleSilicon {
+		key += "-arm64"
+	}
+	return key
 }
 
 func (d *doctorRun) playwrightDir() string {

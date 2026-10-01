@@ -52,6 +52,7 @@ func newDoctorHost(t *testing.T) *doctorHost {
 	h.fake("node", "echo v26.5.1")
 	h.fake("gh", "exit 0")
 	h.fakeGo("1.26.6")
+	h.fakeMac("25.5.0", "Apple M4")
 	// Client files.
 	h.file(".config/tailterm/hub.json", `{"url":"http://hub.invalid:1","token":"SECRET-TOKEN-123"}`, 0o600)
 	// Agent files.
@@ -108,6 +109,13 @@ func (h *doctorHost) fakeGo(version string) {
 "env GOROOT") echo `+shellWord(root)+` ;;
 *) exit 2 ;;
 esac`)
+}
+
+// fakeMac answers uname -r with a Darwin kernel release and sysctl with a
+// CPU brand string; together they select Playwright's platform key.
+func (h *doctorHost) fakeMac(release, cpu string) {
+	h.fake("uname", "echo "+shellWord(release))
+	h.fake("sysctl", "echo "+shellWord(cpu))
 }
 
 func shellWord(s string) string { return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'" }
@@ -545,11 +553,70 @@ func TestDoctorRoleTest(t *testing.T) {
 			t.Fatalf("package-lock vite engines %q; update doctorTestNodeRange and docs/host-requirements.md", got)
 		}
 	})
-	t.Run("webkit override revision", func(t *testing.T) {
+	// The mac14 overrides in browsers.json are not for macOS 26.
+	t.Run("webkit override for another platform", func(t *testing.T) {
 		h := newDoctorHost(t)
 		os.RemoveAll(filepath.Join(h.home, "Library", "Caches", "ms-playwright", "webkit-2359"))
 		h.dir("Library/Caches/ms-playwright/webkit-2251")
-		expectLine(t, h.run("test"), "playwright webkit", "ok", "webkit-2251", 0)
+		o := h.run("test")
+		expectLine(t, o, "playwright webkit", "wrong version", "found webkit-2251; need webkit-2359", 1)
+		expectLine(t, o, "playwright chromium", "ok", "chromium-1243", 1)
+		expectLine(t, o, "playwright chromium-headless-shell", "ok", "chromium_headless_shell-1243", 1)
+	})
+	t.Run("webkit override for this platform", func(t *testing.T) {
+		for _, cpu := range []string{"Apple M1", "Intel(R) Core(TM) i7-9750H CPU @ 2.60GHz"} {
+			h := newDoctorHost(t)
+			h.fakeMac("23.6.0", cpu)
+			o := h.run("test")
+			expectLine(t, o, "playwright webkit", "wrong version", "found webkit-2359; need webkit-2251", 1)
+			expectLine(t, o, "playwright chromium", "ok", "chromium-1243", 1)
+			expectLine(t, o, "playwright chromium-headless-shell", "ok", "chromium_headless_shell-1243", 1)
+			os.RemoveAll(filepath.Join(h.home, "Library", "Caches", "ms-playwright", "webkit-2359"))
+			h.dir("Library/Caches/ms-playwright/webkit-2251")
+			expectLine(t, h.run("test"), "playwright webkit", "ok", "webkit-2251", 0)
+		}
+	})
+	t.Run("webkit default revision without a platform key", func(t *testing.T) {
+		unreadable := newDoctorHost(t)
+		unreadable.fake("uname", "echo unknown")
+		missing := newDoctorHost(t)
+		missing.unfake("uname")
+		failing := newDoctorHost(t)
+		failing.fake("uname", "echo 23.6.0; exit 1")
+		for name, h := range map[string]*doctorHost{"unreadable": unreadable, "missing": missing, "failing": failing} {
+			expectLine(t, h.run("test"), "playwright webkit", "ok", "webkit-2359", 0)
+			os.RemoveAll(filepath.Join(h.home, "Library", "Caches", "ms-playwright", "webkit-2359"))
+			h.dir("Library/Caches/ms-playwright/webkit-2251")
+			if status, detail := h.run("test").line(t, "playwright webkit"); status != "wrong version" || !strings.Contains(detail, "need webkit-2359") {
+				t.Fatalf("%s uname: %q %q", name, status, detail)
+			}
+		}
+	})
+	t.Run("playwright platform key", func(t *testing.T) {
+		for _, c := range []struct {
+			release string
+			apple   bool
+			want    string
+		}{
+			{"23.6.0", false, "mac14"}, {"23.6.0", true, "mac14-arm64"},
+			{"24.6.0", false, "mac15"}, {"24.6.0", true, "mac15-arm64"},
+			{"25.5.0", false, "mac26"}, {"25.5.0", true, "mac26-arm64"},
+			{"26.0.0", false, "mac26"}, {"26.0.0", true, "mac26-arm64"},
+			{"20.1.0\n", true, "mac11-arm64"}, {"19.6.0", false, ""},
+			{"", true, ""}, {"unknown", true, ""},
+		} {
+			if got := playwrightMacPlatform(c.release, c.apple); got != c.want {
+				t.Errorf("playwrightMacPlatform(%q, %v) = %q, want %q", c.release, c.apple, got, c.want)
+			}
+		}
+		// Linux never has a key, even where uname would answer like a mac14 host.
+		h := newDoctorHost(t)
+		h.goos = "linux"
+		h.fakeMac("23.6.0", "Apple M1")
+		d := &doctorRun{p: h.probe(), memo: map[string]any{}}
+		if got := d.playwrightPlatform(); got != "" {
+			t.Fatalf("linux platform key %q", got)
+		}
 	})
 	t.Run("chromium other revision", func(t *testing.T) {
 		h := newDoctorHost(t)
@@ -573,7 +640,9 @@ func TestDoctorRoleTest(t *testing.T) {
 		for _, b := range []string{"chromium-1243", "chromium_headless_shell-1243", "webkit-2359"} {
 			h.dir(".cache/ms-playwright/" + b)
 		}
-		expectLine(t, h.run("test"), "playwright webkit", "ok", "", 0)
+		h.dir(".cache/ms-playwright/webkit-2251")
+		h.fakeMac("23.6.0", "Apple M1")
+		expectLine(t, h.run("test"), "playwright webkit", "ok", "webkit-2359", 0)
 	})
 }
 
