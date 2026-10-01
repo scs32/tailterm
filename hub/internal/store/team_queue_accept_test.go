@@ -2,8 +2,10 @@ package store
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -326,5 +328,300 @@ func TestDoneSaveRefusesWhatQueueAcceptRefuses(t *testing.T) {
 				t.Errorf("refusals differ: save %q, accept %q", saveErr, acceptErr)
 			}
 		})
+	}
+}
+
+// Queue acceptance recorded by the item lead's done save
+// (wi_26c0698de7d3eef2). The lead's save is validated against the entry
+// before the item revision increments and is then refused wherever the
+// handler's save is.
+
+// leadSaveFixture is a running, repository-backed entry with a live lead and
+// builder, an enrolled feature item and a passing receipt for candidateB.
+type leadSaveFixture struct {
+	*rebindFixture
+}
+
+func newLeadSaveFixture(t *testing.T) *leadSaveFixture {
+	t.Helper()
+	f := &leadSaveFixture{newRebindFixture(t, true)}
+	if _, err := f.s.db.Exec(`INSERT INTO verification_enrollments(task_id,item_id,agent_id,run_id,required,provenance,created_at) VALUES(?,?,?,?,1,'fixture',?)`, f.task.ID, f.item.ID, api.NewID("agt"), api.NewID("run"), ts(time.Now())); err != nil {
+		t.Fatal(err)
+	}
+	seedPassingVerificationAt(t, f.s, f.item, candidateB, autoWorktree)
+	return f
+}
+
+func (f *leadSaveFixture) current(t *testing.T) api.WorkItem {
+	t.Helper()
+	item, err := f.s.GetWorkItem(f.ctx, f.task.ID, f.item.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return item
+}
+
+func (f *leadSaveFixture) queueEntry(t *testing.T) api.TeamQueueEntry {
+	t.Helper()
+	q, err := f.s.GetTeamQueueEntry(f.ctx, f.task.ID, f.entry.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return q
+}
+
+func (f *leadSaveFixture) releaseJobs(t *testing.T) int {
+	t.Helper()
+	var n int
+	if err := f.s.db.QueryRow(`SELECT count(*) FROM release_jobs WHERE task_id=? AND entry_id=?`, f.task.ID, f.entry.ID).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	return n
+}
+
+// request is a done save of the item at its current revision by the agent,
+// with the feature's completion report and, for a commit, the acceptance.
+func (f *leadSaveFixture) request(t *testing.T, key string, by api.Agent, commit string) api.CreateWorkItemUpdate {
+	t.Helper()
+	item := f.current(t)
+	report, _, err := f.s.PutNarrativeReport(f.ctx, f.task.ID, f.item.ID, completeReportRequest(item, "report-"+key, 5), f.by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := "done"
+	req := api.CreateWorkItemUpdate{ExpectedRevision: item.Revision, Status: &done, AgentID: by.ID, RunID: by.RunID, RequestID: key,
+		CompletionReport: &api.NarrativeReportPin{ReportID: report.ReportID, Version: report.Version, Digest: report.Digest, ScopeRevision: report.ScopeRevision}}
+	if commit != "" {
+		req.QueueAcceptance = &api.WorkItemQueueAcceptance{EntryID: f.entry.ID, Worktree: autoWorktree, Branch: autoBranch, Commit: commit}
+	}
+	return req
+}
+
+func (f *leadSaveFixture) save(req api.CreateWorkItemUpdate) (api.WorkItemUpdateResult, error) {
+	res, _, err := f.s.CreateWorkItemUpdate(f.ctx, f.task.ID, f.item.ID, req, f.by)
+	return res, err
+}
+
+// assertOpen checks that a refused save left the item open at the given
+// revision with no update receipt for key, and the entry unaccepted with no
+// release job.
+func (f *leadSaveFixture) assertOpen(t *testing.T, revision int64, key string, by api.Agent) {
+	t.Helper()
+	if item := f.current(t); item.Status == "done" || item.Revision != revision {
+		t.Fatalf("refused save changed the item: status %s revision %d, want open at %d", item.Status, item.Revision, revision)
+	}
+	if _, err := f.s.GetWorkItemUpdateReceipt(f.ctx, f.task.ID, f.item.ID, key, by.ID, f.by); !errors.Is(err, api.ErrNotFound) {
+		t.Fatalf("refused save left an update receipt: %v", err)
+	}
+	if q := f.queueEntry(t); q.Acceptance != nil {
+		t.Fatalf("refused save accepted the entry: %+v", q.Acceptance)
+	}
+	if n := f.releaseJobs(t); n != 0 {
+		t.Fatalf("refused save enqueued %d release jobs", n)
+	}
+}
+
+// a5 completion N -> N+1: the lead's save marks the item done and records the
+// acceptance with its release job in one transaction; a retry replays.
+func TestLeadDoneSaveRecordsAcceptanceAtNextRevision(t *testing.T) {
+	f := newLeadSaveFixture(t)
+	n := f.item.Revision
+	if entryRevision := f.queueEntry(t).ItemRevision; entryRevision != n {
+		t.Fatalf("entry at %d, item at %d", entryRevision, n)
+	}
+	req := f.request(t, "lead-done", f.lead, candidateB)
+	res, err := f.save(req)
+	if err != nil {
+		t.Fatal("lead done save with acceptance", err)
+	}
+	item := f.current(t)
+	if item.Status != "done" || item.Revision != n+1 || res.Revision.Revision != n+1 {
+		t.Fatalf("item %+v, want done at %d", item, n+1)
+	}
+	q := f.queueEntry(t)
+	a := q.Acceptance
+	if a == nil || q.State != "running" || q.ItemRevision != n || a.ItemRevision != n+1 || a.Commit != candidateB || a.Worktree != autoWorktree || a.Branch != autoBranch || a.Repository != rebindRepository || a.AcceptedAt == "" {
+		t.Fatalf("entry after the lead's save: %+v acceptance %+v", q, a)
+	}
+	if !strings.HasPrefix(a.Evidence, "lead-saved completion receipt "+res.Receipt.ID) {
+		t.Fatalf("default evidence %q", a.Evidence)
+	}
+	if jobs := f.releaseJobs(t); jobs != 1 {
+		t.Fatalf("release jobs = %d, want 1", jobs)
+	}
+
+	again, err := f.save(req)
+	if err != nil || again.Receipt.ID != res.Receipt.ID || again.Revision.Revision != res.Revision.Revision {
+		t.Fatal("retried lead save did not replay", again, err)
+	}
+	if q2 := f.queueEntry(t); q2.Revision != q.Revision || q2.Acceptance.AcceptedAt != a.AcceptedAt || f.releaseJobs(t) != 1 {
+		t.Fatalf("retry changed the entry or enqueued a second job: %+v jobs %d", q2, f.releaseJobs(t))
+	}
+}
+
+// a5 stale refusal and rebound success: an amended item is refused before any
+// write, naming the entry and the rebind; after the rebind the same save
+// succeeds.
+func TestLeadDoneSaveStaleEntryRefusedThenRebound(t *testing.T) {
+	f := newLeadSaveFixture(t)
+	n := f.item.Revision
+	updated, source := f.amend(t, "one")
+	if updated.Revision != n+1 {
+		t.Fatalf("amended revision %d, want %d", updated.Revision, n+1)
+	}
+	seedPassingVerificationAt(t, f.s, updated, candidateB, autoWorktree)
+	_, err := f.save(f.request(t, "stale-done", f.lead, candidateB))
+	if !errors.Is(err, api.ErrConflict) {
+		t.Fatalf("stale entry: %v", err)
+	}
+	for _, want := range []string{"entry " + f.entry.ID, "bound to revision " + strconv.FormatInt(n, 10), "the item is at revision " + strconv.FormatInt(n+1, 10), "tt team queue rebind"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("stale refusal %q lacks %q", err, want)
+		}
+	}
+	f.assertOpen(t, n+1, "stale-done", f.lead)
+
+	f.confirm(t, updated)
+	f.entry = f.action(t, f.rebind(updated, source))
+	res, err := f.save(f.request(t, "rebound-done", f.lead, candidateB))
+	if err != nil {
+		t.Fatal("lead done save after the rebind", err)
+	}
+	item := f.current(t)
+	q := f.queueEntry(t)
+	if item.Status != "done" || item.Revision != n+2 || res.Revision.Revision != n+2 || q.ItemRevision != n+1 || q.Acceptance == nil || q.Acceptance.ItemRevision != n+2 || f.releaseJobs(t) != 1 {
+		t.Fatalf("rebound save: item %+v entry %+v", item, q)
+	}
+}
+
+// a5 parity: the lead is refused what the handler is refused, with the same
+// error, and nothing is written.
+func TestLeadDoneSaveRefusedWhereHandlerIs(t *testing.T) {
+	for _, row := range []struct {
+		name   string
+		commit string
+		setup  func(t *testing.T, f *leadSaveFixture)
+		want   string
+	}{
+		{name: "mismatched candidate", commit: candidateC, want: "exact accepted candidate required"},
+		{name: "missing accept disposition", commit: candidateB, want: "exact accepted candidate required", setup: func(t *testing.T, f *leadSaveFixture) {
+			tx, err := f.s.db.BeginTx(f.ctx, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer tx.Rollback()
+			state, err := reviewState(f.ctx, tx, f.task.ID, f.item.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			state.Disposition = nil
+			if err = saveReviewState(f.ctx, tx, f.task.ID, state); err != nil {
+				t.Fatal(err)
+			}
+			if err = tx.Commit(); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{name: "non-passing receipt", commit: candidateB, want: "unlisted exhausted failure blocks completion", setup: func(t *testing.T, f *leadSaveFixture) {
+			records, err := verificationRecords(f.ctx, f.s.db, f.task.ID, f.item.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			seeded, _ := currentVerification(records)
+			p := *seeded
+			p.OperationKey, p.MaxAttempts = api.NewID("req"), 3
+			r := retryVerification(p, 1, 1, 1)
+			for i, record := range []api.VerificationRecord{{Generation: int64(len(records)) + 1, Kind: "plan", Plan: &p}, {Generation: int64(len(records)) + 2, Kind: "receipt", Receipt: &r}} {
+				b, _ := json.Marshal(record)
+				if _, err = f.s.db.Exec(`INSERT INTO verification_records VALUES(?,?,?,?,?,?,?)`, f.task.ID, f.item.ID, record.Generation, record.Kind, api.NewID("req"), "failing-fixture-"+strconv.Itoa(i), string(b)); err != nil {
+					t.Fatal(err)
+				}
+			}
+		}},
+	} {
+		t.Run(row.name, func(t *testing.T) {
+			refusal := func(lead bool) error {
+				f := newLeadSaveFixture(t)
+				if row.setup != nil {
+					row.setup(t, f)
+				}
+				by := f.handler
+				if lead {
+					by = f.lead
+				}
+				_, err := f.save(f.request(t, "parity", by, row.commit))
+				if !errors.Is(err, api.ErrConflict) || !strings.Contains(err.Error(), row.want) {
+					t.Fatalf("lead=%v: got %v, want a conflict containing %q", lead, err, row.want)
+				}
+				f.assertOpen(t, f.item.Revision, "parity", by)
+				return err
+			}
+			asHandler, asLead := refusal(false), refusal(true)
+			if asHandler.Error() != asLead.Error() {
+				t.Errorf("refusals differ: handler %q, lead %q", asHandler, asLead)
+			}
+		})
+	}
+}
+
+// a5: who may not, and what a lead may not skip.
+func TestLeadDoneSaveAuthority(t *testing.T) {
+	t.Run("lead save without acceptance is refused while the entry waits", func(t *testing.T) {
+		f := newLeadSaveFixture(t)
+		_, err := f.save(f.request(t, "no-tuple", f.lead, ""))
+		if !errors.Is(err, api.ErrConflict) || !strings.Contains(err.Error(), "team queue entry "+f.entry.ID+" waits on acceptance; save done with the accepted --worktree, --branch and --commit") {
+			t.Fatalf("lead save without acceptance: %v", err)
+		}
+		f.assertOpen(t, f.item.Revision, "no-tuple", f.lead)
+	})
+	t.Run("builder save with acceptance is refused", func(t *testing.T) {
+		f := newLeadSaveFixture(t)
+		_, err := f.save(f.request(t, "builder-done", f.worker, candidateB))
+		if !errors.Is(err, api.ErrConflict) || !strings.Contains(err.Error(), leadMayAcceptRefusal) {
+			t.Fatalf("builder save with acceptance: %v", err)
+		}
+		f.assertOpen(t, f.item.Revision, "builder-done", f.worker)
+	})
+	t.Run("lead on a replaced run is refused", func(t *testing.T) {
+		f := newLeadSaveFixture(t)
+		req := f.request(t, "old-run", f.lead, candidateB)
+		if _, err := f.s.db.Exec(`UPDATE agents SET run_id=? WHERE id=?`, api.NewID("run"), f.lead.ID); err != nil {
+			t.Fatal(err)
+		}
+		_, err := f.save(req)
+		if !errors.Is(err, api.ErrConflict) || !strings.Contains(err.Error(), leadMayAcceptRefusal) {
+			t.Fatalf("lead on a replaced run: %v", err)
+		}
+		f.assertOpen(t, f.item.Revision, "old-run", f.lead)
+	})
+	t.Run("the accept queue operation still refuses a lead", func(t *testing.T) {
+		f := newLeadSaveFixture(t)
+		q := f.queueEntry(t)
+		_, err := f.s.TeamQueueAction(f.ctx, f.task.ID, api.TeamQueueRequest{RequestID: "lead-accept", Operation: "accept", EntryID: f.entry.ID, ExpectedRevision: q.Revision, HandlerAgentID: f.lead.ID, HandlerRunID: f.lead.RunID,
+			Acceptance: &api.TeamIntegrationAcceptance{Repository: rebindRepository, BaseCommit: q.BaseCommit, Worktree: autoWorktree, Branch: autoBranch, Commit: candidateB, ItemRevision: f.item.Revision, Evidence: "lead acceptance"}})
+		if !errors.Is(err, api.ErrConflict) || !strings.Contains(err.Error(), "exact active handler and unaccepted team are required") {
+			t.Fatalf("lead queue accept: %v", err)
+		}
+		if got := f.queueEntry(t); got.Acceptance != nil {
+			t.Fatal("lead queue accept recorded an acceptance")
+		}
+	})
+}
+
+// a5 handler path unchanged: on an entry left behind by an amendment the
+// handler's save does what it did before this change. The lead's checks are
+// not applied to it.
+func TestLeadDoneSaveLeavesHandlerStaleEntryBehavior(t *testing.T) {
+	f := newLeadSaveFixture(t)
+	n := f.item.Revision
+	updated, _ := f.amend(t, "one")
+	seedPassingVerificationAt(t, f.s, updated, candidateB, autoWorktree)
+	res, err := f.save(f.request(t, "handler-stale", f.handler, candidateB))
+	if err != nil {
+		t.Fatalf("handler done save on a stale entry: %v", err)
+	}
+	item, q := f.current(t), f.queueEntry(t)
+	if item.Status != "done" || item.Revision != n+2 || res.Revision.Revision != n+2 || q.ItemRevision != n || q.Acceptance == nil || q.Acceptance.ItemRevision != n+2 || f.releaseJobs(t) != 1 {
+		t.Fatalf("handler save on a stale entry: item %+v entry %+v", item, q)
 	}
 }

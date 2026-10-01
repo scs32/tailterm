@@ -1974,7 +1974,7 @@ func (s *Store) TeamQueueAction(ctx context.Context, task string, req api.TeamQu
 				// new revision and no second release job.
 				return e, nil
 			}
-			if err = acceptTeamQueueEntry(ctx, tx, task, &e, *req.Acceptance, req.HandlerAgentID, req.HandlerRunID, now); err != nil {
+			if err = acceptTeamQueueEntry(ctx, tx, task, &e, *req.Acceptance, req.HandlerAgentID, req.HandlerRunID, false, now); err != nil {
 				return zero, err
 			}
 		case "finish":
@@ -2569,10 +2569,26 @@ func verifiedRepository(planRepository string, a api.TeamIntegrationAcceptance) 
 	return filepath.Base(repository) == ".git" && plan == filepath.Dir(repository)
 }
 
-// acceptTeamQueueEntry records the exact handler's integration acceptance on a
-// running, repository-backed entry. Both the queue accept operation and the
-// handler's done save use it, so they refuse exactly the same candidates.
-func acceptTeamQueueEntry(ctx context.Context, tx *sql.Tx, task string, e *api.TeamQueueEntry, candidate api.TeamIntegrationAcceptance, handlerAgent, handlerRun, now string) error {
+// leadMayAcceptRefusal is the refusal for an agent that is neither the item's
+// lead nor the entry's leased handler.
+const leadMayAcceptRefusal = "only the item lead or the leased database handler may accept this entry"
+
+// itemLeadRun reports whether item_team_leads names this exact agent and run
+// as the item's running lead.
+func itemLeadRun(ctx context.Context, q queryRower, task, item, agent, run string) (bool, error) {
+	var n int
+	err := q.QueryRowContext(ctx, `SELECT count(*) FROM item_team_leads WHERE task_id=? AND item_id=? AND agent_id=? AND run_id=? AND state='running'`, task, item, agent, run).Scan(&n)
+	return n == 1, err
+}
+
+// acceptTeamQueueEntry records an integration acceptance on a running,
+// repository-backed entry. The queue accept operation and the done save both
+// use it, so they refuse exactly the same candidates. The actor is the
+// entry's exact leased handler, or with allowLead (the done save) the item's
+// exact running lead, which the pre-save gate already checked against the
+// entry's revision. The entry's revision is not compared with the item's
+// here: a done save has just moved the item one revision past the entry.
+func acceptTeamQueueEntry(ctx context.Context, tx *sql.Tx, task string, e *api.TeamQueueEntry, candidate api.TeamIntegrationAcceptance, handlerAgent, handlerRun string, allowLead bool, now string) error {
 	// The owner's integration record replaces handler acceptance: accepting
 	// the released entry would record a second candidate and could enqueue a
 	// second release job.
@@ -2582,12 +2598,30 @@ func acceptTeamQueueEntry(ctx context.Context, tx *sql.Tx, task string, e *api.T
 	if e.ReleasedAt != "" {
 		return fmt.Errorf("%w: entry %s was released; it takes no handler acceptance", api.ErrConflict, e.ID)
 	}
-	if e.State != "running" || e.Acceptance != nil || e.Repository == "" || handlerAgent != e.HandlerID || handlerRun != e.HandlerRunID {
+	if e.State != "running" || e.Acceptance != nil || e.Repository == "" {
 		return fmt.Errorf("%w: exact active handler and unaccepted team are required", api.ErrConflict)
 	}
 	var handlerRole, handlerStatus, handlerRunID string
-	if err := tx.QueryRowContext(ctx, `SELECT role,status,run_id FROM agents WHERE task_id=? AND id=?`, task, handlerAgent).Scan(&handlerRole, &handlerStatus, &handlerRunID); err != nil || handlerRole != api.AgentRoleDatabaseHandler || handlerRunID != handlerRun || handlerStatus == api.AgentClosed || handlerStatus == api.AgentExited || handlerStatus == api.AgentRetired {
-		return fmt.Errorf("%w: assigned handler run is unavailable", api.ErrConflict)
+	lookupErr := tx.QueryRowContext(ctx, `SELECT role,status,run_id FROM agents WHERE task_id=? AND id=?`, task, handlerAgent).Scan(&handlerRole, &handlerStatus, &handlerRunID)
+	if lookupErr != nil && !errors.Is(lookupErr, sql.ErrNoRows) {
+		return lookupErr
+	}
+	leased := handlerAgent == e.HandlerID && handlerRun == e.HandlerRunID
+	if allowLead && !leased && lookupErr == nil && handlerRole != api.AgentRoleDatabaseHandler {
+		lead, err := itemLeadRun(ctx, tx, task, e.ItemID, handlerAgent, handlerRun)
+		if err != nil {
+			return err
+		}
+		if !lead || handlerRunID != handlerRun || unavailableAgentStatus(handlerStatus) {
+			return fmt.Errorf("%w: %s", api.ErrConflict, leadMayAcceptRefusal)
+		}
+	} else {
+		if !leased {
+			return fmt.Errorf("%w: exact active handler and unaccepted team are required", api.ErrConflict)
+		}
+		if lookupErr != nil || handlerRole != api.AgentRoleDatabaseHandler || handlerRunID != handlerRun || unavailableAgentStatus(handlerStatus) {
+			return fmt.Errorf("%w: assigned handler run is unavailable", api.ErrConflict)
+		}
 	}
 	item, err := getWorkItem(tx, ctx, task, e.ItemID)
 	if err != nil {
@@ -2684,9 +2718,17 @@ func pendingTeamQueueAcceptance(ctx context.Context, tx *sql.Tx, task, item stri
 
 // doneSaveQueueGate checks a done save against the item's team queue before
 // any write. A save that carries an acceptance must name the entry waiting on
-// it. A database handler's save without one is refused while an entry waits,
-// so the queue can no longer stall on a separate remembered accept. Owner and
-// UI saves are unchanged; tt team queue accept stays their recovery path.
+// it. A database handler's or the item lead's save without one is refused
+// while an entry waits, so the queue can no longer stall on a separate
+// remembered accept. Owner and UI saves are unchanged; tt team queue accept
+// stays their recovery path.
+//
+// An acceptance from an agent that is not a database handler is validated
+// here, while the item is still at the revision the caller expects: the entry
+// is at the item's current revision with confirmed scope, the agent is the
+// item's running lead on its current run, and that run is admitted to the
+// item under the entry's order at the entry's revision. A handler's save gets
+// none of these checks and behaves as before.
 func doneSaveQueueGate(ctx context.Context, tx *sql.Tx, task, item, agentID string, accept *api.WorkItemQueueAcceptance) (*api.TeamQueueEntry, error) {
 	pending, err := pendingTeamQueueAcceptance(ctx, tx, task, item)
 	if err != nil {
@@ -2706,24 +2748,60 @@ func doneSaveQueueGate(ctx context.Context, tx *sql.Tx, task, item, agentID stri
 		if pending == nil || pending.ID != accept.EntryID {
 			return nil, fmt.Errorf("%w: no running team queue entry waits on this acceptance", api.ErrConflict)
 		}
+		if agentID == "" {
+			return pending, nil
+		}
+		var role, status, run string
+		if err = tx.QueryRowContext(ctx, `SELECT role,status,run_id FROM agents WHERE task_id=? AND id=?`, task, agentID).Scan(&role, &status, &run); err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return pending, nil
+			}
+			return nil, err
+		}
+		if role == api.AgentRoleDatabaseHandler {
+			return pending, nil
+		}
+		if err = requireCurrentConfirmedTeamOrder(ctx, tx, *pending); err != nil {
+			return nil, err
+		}
+		lead, err := itemLeadRun(ctx, tx, task, item, agentID, run)
+		if err != nil {
+			return nil, err
+		}
+		if !lead || unavailableAgentStatus(status) {
+			return nil, fmt.Errorf("%w: %s", api.ErrConflict, leadMayAcceptRefusal)
+		}
+		var bound int
+		if err = tx.QueryRowContext(ctx, `SELECT count(*) FROM agent_work_item_bindings WHERE agent_id=? AND run_id=? AND item_task_id=? AND item_id=? AND item_revision=? AND work_order_task_id=? AND work_order_message_seq=?`, agentID, run, task, item, pending.ItemRevision, task, pending.OrderMessageSeq).Scan(&bound); err != nil {
+			return nil, err
+		}
+		if bound != 1 {
+			return nil, workItemConflict(fmt.Sprintf("this run is not admitted to the item under order #%d at revision %d", pending.OrderMessageSeq, pending.ItemRevision))
+		}
 		return pending, nil
 	}
 	if pending == nil || agentID == "" {
 		return nil, nil
 	}
-	var role string
-	if err = tx.QueryRowContext(ctx, `SELECT role FROM agents WHERE task_id=? AND id=?`, task, agentID).Scan(&role); err != nil && !errors.Is(err, sql.ErrNoRows) {
+	var role, run string
+	if err = tx.QueryRowContext(ctx, `SELECT role,run_id FROM agents WHERE task_id=? AND id=?`, task, agentID).Scan(&role, &run); err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return nil, err
 	}
-	if role == api.AgentRoleDatabaseHandler {
+	lead := false
+	if role != api.AgentRoleDatabaseHandler && run != "" {
+		if lead, err = itemLeadRun(ctx, tx, task, item, agentID, run); err != nil {
+			return nil, err
+		}
+	}
+	if role == api.AgentRoleDatabaseHandler || lead {
 		return nil, fmt.Errorf("%w: team queue entry %s waits on acceptance; save done with the accepted --worktree, --branch and --commit", api.ErrConflict, pending.ID)
 	}
 	return nil, nil
 }
 
 // acceptTeamQueueOnDoneSave records the queue acceptance inside the handler's
-// done save, after the item row and its update receipt are written. Any
-// refusal rolls back the whole save, so the item stays open.
+// or the item lead's done save, after the item row and its update receipt are
+// written. Any refusal rolls back the whole save, so the item stays open.
 func acceptTeamQueueOnDoneSave(ctx context.Context, tx *sql.Tx, t api.Task, e *api.TeamQueueEntry, accept api.WorkItemQueueAcceptance, agentID, runID, receiptID, now string) error {
 	item, err := getWorkItem(tx, ctx, t.ID, e.ItemID)
 	if err != nil {
@@ -2731,11 +2809,15 @@ func acceptTeamQueueOnDoneSave(ctx context.Context, tx *sql.Tx, t api.Task, e *a
 	}
 	evidence := accept.Evidence
 	if evidence == "" {
-		evidence = fmt.Sprintf("handler-saved completion receipt %s revision %d", receiptID, item.Revision)
+		author := "handler"
+		if agentID != e.HandlerID {
+			author = "lead"
+		}
+		evidence = fmt.Sprintf("%s-saved completion receipt %s revision %d", author, receiptID, item.Revision)
 	}
 	candidate := api.TeamIntegrationAcceptance{Repository: e.Repository, BaseCommit: e.BaseCommit, Worktree: accept.Worktree, Branch: accept.Branch, Commit: accept.Commit, ItemRevision: item.Revision, CompletionReport: item.CompletionReport, Evidence: evidence}
 	prior := e.Revision
-	if err = acceptTeamQueueEntry(ctx, tx, t.ID, e, candidate, agentID, runID, now); err != nil {
+	if err = acceptTeamQueueEntry(ctx, tx, t.ID, e, candidate, agentID, runID, true, now); err != nil {
 		return err
 	}
 	e.Revision++
