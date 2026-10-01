@@ -1,9 +1,12 @@
 // Live and rollback probes for the deployment agent. Each prints exactly the
-// fields HostAdapter.check or rollback reads. Host output, tokens and
-// environment never reach stdout; any failure prints nothing and exits 1.
+// fields HostAdapter.check or rollback reads. Tokens and environment never
+// reach stdout, and host output only as the capture below; any failure prints
+// nothing and exits 1.
 // The hub and bridge probes poll the app until its containers run and the hub
 // answers, for up to targets.hub.readyWindowMs / targets.bridge.readyWindowMs
-// (default 240 s, 0 means one read), and report waitedMs and polls.
+// (default 240 s, 0 means one read), and report waitedMs and polls. When that
+// ends not ready they add `capture`: allowlisted app state and redacted recent
+// container log lines, or "unavailable" where a read failed.
 //
 //   node scripts/release-probe.mjs live <hub|bridge|mini|tailos> --config PRIVATE
 //   node scripts/release-probe.mjs rollback <hub|bridge> --expect-release NAME --expect-sha SHA --config PRIVATE
@@ -30,6 +33,10 @@ export const TAILOS_SWITCH_WINDOW_MS = 90000, TAILOS_POLL_INTERVAL_MS = 3000, TA
 // A TrueNAS app restart plus the hub's migrations takes longer than one read,
 // so hub and bridge readiness is polled for a bounded window as well.
 export const TRUENAS_READY_WINDOW_MS = 240000, TRUENAS_READY_POLL_MS = 5000, TRUENAS_READY_RUN_TIMEOUT_MS = 20000;
+// The capture after a not-ready end: per-command timeout, total budget, and
+// the bounds on what is kept.
+export const CAPTURE_RUN_TIMEOUT_MS = 15000, CAPTURE_BUDGET_MS = 45000, CAPTURE_LOG_LINES = 40, CAPTURE_LINE_LENGTH = 300, CAPTURE_LOG_CONTAINERS = 4, CAPTURE_CONTAINERS = 8;
+export const CAPTURE_UNAVAILABLE = ["log read failed", "no log lines", "invalid container id", "time budget"];
 
 export const hostDeps = {
   run: (argv, { buffer = false, timeout = 120000 } = {}) => {
@@ -104,9 +111,81 @@ function readReady(config, host, service, deps) {
   return { instance, containersRunning, hubResponds };
 }
 
+const REDACTED = "[redacted]", NAME = /^[A-Za-z0-9._-]{1,64}$/;
+// Control characters go first; then known environment values, labelled
+// credentials, and any long opaque run with both a letter and a digit (which
+// also hides commit hashes and container ids); then the line is cut.
+function redactLine(line, secrets) {
+  let s = String(line).replace(/[\u0000-\u001f\u007f-\u009f]/g, "");
+  for (const v of secrets) s = s.split(v).join(REDACTED);
+  s = s.replace(/Bearer\s+\S+/gi, REDACTED)
+    .replace(/(token|secret|password|passwd|authorization|api[_-]?key)["']?\s*[=:]\s*\S+/gi, REDACTED)
+    .replace(/[A-Za-z0-9+\/_=.-]{24,}/g, m => /[A-Za-z]/.test(m) && /[0-9]/.test(m) ? REDACTED : m);
+  return s.slice(0, CAPTURE_LINE_LENGTH);
+}
+
+// The only shape a capture may have, whatever it was built from:
+//   { app: {state, containers: [{service, state, id}]} | "unavailable",
+//     logs: [{service, lines: [...]} | {service, unavailable: REASON}] }
+// Unknown keys are dropped, names and ids are pattern-checked, log lines are
+// redacted and bounded. The runner applies it again before journaling.
+export function sanitizeCapture(raw, secrets = []) {
+  const name = v => typeof v === "string" && NAME.test(v) ? v : null;
+  const known = (Array.isArray(secrets) ? secrets : []).filter(v => typeof v === "string" && v.length >= 6).sort((a, b) => b.length - a.length);
+  const list = v => Array.isArray(v) ? v : [];
+  const app = raw?.app && typeof raw.app === "object" ? {
+    state: typeof raw.app.state === "string" && /^[A-Z_]{1,32}$/.test(raw.app.state) ? raw.app.state : null,
+    containers: list(raw.app.containers).slice(0, CAPTURE_CONTAINERS).map(c => ({ service: name(c?.service), state: name(c?.state), id: typeof c?.id === "string" && /^[a-f0-9]{12,64}$/.test(c.id) ? c.id.slice(0, 12) : null })),
+  } : "unavailable";
+  const logs = list(raw?.logs).slice(0, CAPTURE_LOG_CONTAINERS).map(l => Array.isArray(l?.lines)
+    ? { service: name(l.service), lines: l.lines.filter(x => typeof x === "string").slice(-CAPTURE_LOG_LINES).map(x => redactLine(x, known)) }
+    : { service: name(l?.service), unavailable: CAPTURE_UNAVAILABLE.includes(l?.unavailable) ? l.unavailable : CAPTURE_UNAVAILABLE[0] });
+  return { app, logs };
+}
+
+// Every literal environment value of every compose service (map or K=V list).
+function composeSecrets(compose) {
+  return Object.values(compose?.services || {}).flatMap(service => {
+    const env = service?.environment;
+    if (Array.isArray(env)) return env.map(e => String(e).split("=").slice(1).join("="));
+    return env && typeof env === "object" ? Object.values(env).map(v => String(v)) : [];
+  });
+}
+
+// App state and recent container logs after a not-ready end, read through the
+// middleware as the probe's SSH user (docker logs would need sudo). Best
+// effort: it runs after the verdict is fixed and never throws; a read that
+// fails, hangs or runs past the budget is recorded as unavailable.
+function captureTrueNAS(host, compose, instance, deps) {
+  try {
+    const start = deps.now();
+    if (!instance) {
+      try { const r = deps.run(sshArgv(host, `midclt call app.get_instance ${APP}`), { timeout: CAPTURE_RUN_TIMEOUT_MS }); if (r.status === 0) instance = JSON.parse(r.stdout); } catch {}
+    }
+    if (!instance || typeof instance !== "object") return { app: "unavailable", logs: [] };
+    const details = Array.isArray(instance.active_workloads?.container_details) ? instance.active_workloads.container_details.slice(0, CAPTURE_CONTAINERS) : [];
+    const logs = details.slice(0, CAPTURE_LOG_CONTAINERS).map(c => {
+      const service = c?.service_name;
+      try {
+        // Only a 64-hex id is ever placed in a command.
+        if (typeof c?.id !== "string" || !/^[a-f0-9]{64}$/.test(c.id)) return { service, unavailable: "invalid container id" };
+        if (deps.now() - start >= CAPTURE_BUDGET_MS) return { service, unavailable: "time budget" };
+        const r = deps.run(sshArgv(host, `midclt subscribe -n ${CAPTURE_LOG_LINES} -t 8 'app.container_log_follow:{"app_name":"${APP}","container_id":"${c.id}","tail_lines":${CAPTURE_LOG_LINES}}'`), { timeout: CAPTURE_RUN_TIMEOUT_MS });
+        // The exit status is ignored when lines arrived: a quiet stream ends
+        // by timeout after printing what it had.
+        const lines = String(r.stdout || "").split("\n").flatMap(l => { try { const d = JSON.parse(l)?.fields?.data; return typeof d === "string" ? [d] : []; } catch { return []; } });
+        if (lines.length) return { service, lines };
+        return { service, unavailable: r.status === 0 ? "no log lines" : "log read failed" };
+      } catch { return { service, unavailable: "log read failed" }; }
+    });
+    return sanitizeCapture({ app: { state: instance.state, containers: details.map(c => ({ service: c?.service_name, state: c?.state, id: c?.id })) }, logs }, composeSecrets(compose));
+  } catch { return { app: "unavailable", logs: [] }; }
+}
+
 // Polls readiness until the containers run and the hub responds, or the window
 // ends. With `expect`, an identity that does not match is read once and not
-// waited on: no wait can make the wrong release the right one.
+// waited on: no wait can make the wrong release the right one. A not-ready end
+// adds the capture, which cannot change the verdict fields or waitedMs.
 export async function waitForTrueNASReady(target, config, deps = hostDeps, { expect, intervalMs = TRUENAS_READY_POLL_MS } = {}) {
   const window = readyWindow(config, target);
   const { host, service, compose, ...identity } = readIdentity(target, config, deps);
@@ -120,7 +199,8 @@ export async function waitForTrueNASReady(target, config, deps = hostDeps, { exp
     if ((ready.containersRunning && ready.hubResponds) || waitedMs >= windowMs) break;
     await deps.sleep(Math.min(intervalMs, windowMs - waitedMs));
   }
-  return { ...identity, hubResponds: ready.hubResponds, migrationsApplied: ready.hubResponds, containersRunning: ready.containersRunning, identityMatched, waitedMs, polls };
+  const out = { ...identity, hubResponds: ready.hubResponds, migrationsApplied: ready.hubResponds, containersRunning: ready.containersRunning, identityMatched, waitedMs, polls };
+  return ready.containersRunning && ready.hubResponds ? out : { ...out, capture: captureTrueNAS(host, compose, ready.instance, deps) };
 }
 
 function relayErrors(config, t) {
@@ -183,7 +263,7 @@ export async function probe(argv, config, deps = hostDeps) {
       const release = flag("--expect-release"), expected = flag("--expect-sha");
       if (!/^[A-Za-z0-9._-]+$/.test(release || "") || !hex(expected, 64)) throw new Error("expected release and hash required");
       const live = await waitForTrueNASReady(target, config, deps, { expect: { release, artifactSHA256: expected } });
-      return { restored: live.release === release && live.artifactSHA256 === expected && live.integrity && live.containersRunning, databaseWritesPreserved: live.stateMounted && live.hubResponds, waitedMs: live.waitedMs, polls: live.polls };
+      return { restored: live.release === release && live.artifactSHA256 === expected && live.integrity && live.containersRunning, databaseWritesPreserved: live.stateMounted && live.hubResponds, waitedMs: live.waitedMs, polls: live.polls, ...(live.capture ? { capture: live.capture } : {}) };
     }
     if (target === "mini") {
       const expected = flag("--expect-sha"), live = liveMini(config, t, deps);

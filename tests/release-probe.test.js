@@ -1,12 +1,12 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
 import { probe, hostDeps, waitForTailOSCommit } from "../scripts/release-probe.mjs";
-import { readyWindow, waitForTrueNASReady, TRUENAS_READY_WINDOW_MS } from "../scripts/release-probe.mjs";
+import { readyWindow, waitForTrueNASReady, sanitizeCapture, TRUENAS_READY_WINDOW_MS } from "../scripts/release-probe.mjs";
 
 const BASE = "/mnt/deepfreeze/tailterm-hub", SECRET = "SYNTHETIC_PRIVATE_TOKEN";
 const commit = "a".repeat(40), bytes = Buffer.from("hub binary"), sha = createHash("sha256").update(bytes).digest("hex");
@@ -18,10 +18,14 @@ const ids = { hub: "1".repeat(64), "discord-bridge": "2".repeat(64) };
 const up = [{ service_name: "hub", state: "running", id: ids.hub }, { service_name: "discord-bridge", state: "running", id: ids["discord-bridge"] }];
 // `polls` scripts each readiness read in turn (the last entry repeats): an
 // entry overrides state, containers, hub (the tt exit status) or instance
-// (the app.get_instance answer). sleep only advances the fake clock.
-function fakeHost({ config = compose(), modified = "false", state = "RUNNING", containers = up, hub = 0, relay = "\tstate = running", polls = [{}] } = {}) {
+// (the app.get_instance answer). sleep only advances the fake clock. `logs`
+// answers each `midclt subscribe` log read and may advance the clock.
+const logLine = data => JSON.stringify({ msg: "added", collection: "app.container_log_follow", fields: { data, timestamp: "2026-10-01T00:00:00Z" } });
+const subscribe = id => `midclt subscribe -n 40 -t 8 'app.container_log_follow:{"app_name":"tailterm-hub","container_id":"${id}","tail_lines":40}'`;
+const logReads = deps => deps.runs.filter(r => String(r.argv.at(-1)).startsWith("midclt subscribe "));
+function fakeHost({ config = compose(), modified = "false", state = "RUNNING", containers = up, hub = 0, relay = "\tstate = running", polls = [{}], logs = () => ({ status: 0, stdout: logLine("listening on :8080") + "\n" }) } = {}) {
   const calls = [], runs = [], sleeps = [];
-  let t = 0, instanceReads = 0, hubReads = 0;
+  let t = 0, instanceReads = 0, hubReads = 0, logReadCount = 0;
   const poll = n => ({ state, containers, hub, ...polls[Math.min(n, polls.length - 1)] });
   return { calls, runs, sleeps, uid: () => 501, fetchJSON: async () => ({ commit }), now: () => t, sleep: async ms => { sleeps.push(ms); t += ms; }, run: (argv, opts = {}) => {
     calls.push(argv); runs.push({ argv, opts });
@@ -31,6 +35,7 @@ function fakeHost({ config = compose(), modified = "false", state = "RUNNING", c
       if (cmd === "midclt call app.config tailterm-hub") return { status: 0, stdout: JSON.stringify(config) };
       if (cmd === "midclt call app.get_instance tailterm-hub") { const p = poll(instanceReads++); return p.instance || { status: 0, stdout: JSON.stringify({ state: p.state, active_workloads: { container_details: p.containers } }) }; }
       if (cmd.startsWith("cat ")) { assert.ok(opts.buffer); return { status: 0, stdout: bytes }; }
+      if (cmd.startsWith("midclt subscribe ")) { const id = Object.values(ids).find(i => cmd === subscribe(i)); assert.ok(id, "log read for a known 64-hex id only"); return logs({ id, n: logReadCount++, advance: ms => { t += ms; } }); }
     }
     if (argv[0] === "go") return { status: 0, stdout: `${argv[3]}: go1.25\n\tbuild\tvcs.revision=${commit}\n\tbuild\tvcs.modified=${modified}\n\tbuild\t${SECRET}=1\n` };
     if (argv[1] === "projects") return { status: poll(hubReads++).hub, stdout: SECRET };
@@ -101,6 +106,7 @@ test("H2 a hub that never comes up fails only when the default window ends", asy
   assert.equal(deps.sleeps.length, 48); assert.ok(deps.sleeps.every(ms => ms === 5000));
   assert.equal(deps.sleeps.reduce((a, b) => a + b, 0), 240000);
   assert.deepEqual(identityReads(deps), [1, 1, 1]);
+  assert.deepEqual(out.capture, { app: { state: "RUNNING", containers: [{ service: "hub", state: "running", id: "1".repeat(12) }, { service: "discord-bridge", state: "running", id: "2".repeat(12) }] }, logs: [{ service: "hub", lines: ["listening on :8080"] }, { service: "discord-bridge", lines: ["listening on :8080"] }] });
   // An app.get_instance read that fails, times out, is not JSON or throws is
   // "not ready", not a probe failure.
   const thrower = { get status() { throw new Error(SECRET); } };
@@ -109,6 +115,7 @@ test("H2 a hub that never comes up fails only when the default window ends", asy
   assert.equal(late.containersRunning, true); assert.equal(late.hubResponds, true); assert.equal(late.polls, 5); assert.equal(late.waitedMs, 20000);
   const never = await probe(["live", "bridge"], windowed(10000), fakeHost({ polls: [{ instance: { status: 1, stdout: "" } }] }));
   assert.equal(never.containersRunning, false); assert.equal(never.hubResponds, true); assert.equal(never.waitedMs, 10000);
+  assert.deepEqual(never.capture, { app: "unavailable", logs: [] });
   assert.ok(!JSON.stringify([out, late, never]).includes("SYNTHETIC"));
 });
 
@@ -136,6 +143,116 @@ test("H3 the readiness window is configurable per target and validated", async (
     }
     await assert.rejects(waitForTrueNASReady("hub", windowed(bad), fakeHost()), /readiness window/);
   }
+});
+
+test("H4 the rollback probe waits the same window before it reports not restored", async () => {
+  const good = ["rollback", "hub", "--expect-release", "rel_x-aaaaaaaaaaaa-hub", "--expect-sha", sha];
+  const late = fakeHost({ polls: [starting, down, down, {}] });
+  assert.deepEqual(await probe(good, config(), late), { restored: true, databaseWritesPreserved: true, waitedMs: 15000, polls: 4 });
+  assert.deepEqual(late.sleeps, [5000, 5000, 5000]); assert.deepEqual(identityReads(late), [1, 1, 1]); assert.equal(logReads(late).length, 0);
+  const bridge = ["rollback", "bridge", "--expect-release", "20260929-live", "--expect-sha", sha];
+  assert.deepEqual(await probe(bridge, config(), fakeHost({ polls: [starting, down, down, {}] })), { restored: true, databaseWritesPreserved: true, waitedMs: 15000, polls: 4 });
+  // Never up: both verdict shapes end false only after the whole window.
+  const hubDown = fakeHost({ hub: 1 }), noHub = await probe(good, config(), hubDown);
+  assert.equal(noHub.databaseWritesPreserved, false); assert.equal(noHub.waitedMs, 240000); assert.equal(noHub.polls, 49);
+  assert.equal(hubDown.sleeps.reduce((a, b) => a + b, 0), 240000);
+  assert.deepEqual(Object.keys(noHub.capture), ["app", "logs"]); assert.equal(noHub.capture.app.state, "RUNNING");
+  const stopped = await probe(good, config(), fakeHost({ state: "STOPPED", containers: [], hub: 1 }));
+  assert.deepEqual({ restored: stopped.restored, databaseWritesPreserved: stopped.databaseWritesPreserved, waitedMs: stopped.waitedMs }, { restored: false, databaseWritesPreserved: false, waitedMs: 240000 });
+  assert.deepEqual(stopped.capture, { app: { state: "STOPPED", containers: [] }, logs: [] });
+  // A wrong release, hash, build or state mount cannot be waited into place:
+  // one readiness read, no sleep, even while the app is still down.
+  const moved = compose(); moved.services.hub.volumes[1] = "/tmp/elsewhere:/state";
+  for (const [argv, host] of [[["rollback", "hub", "--expect-release", "other", "--expect-sha", sha], {}], [[...good.slice(0, 4), "--expect-sha", "b".repeat(64)], {}], [good, { modified: "true" }], [good, { config: moved }]]) {
+    const deps = fakeHost({ ...host, hub: 1 }), out = await probe(argv, config(), deps);
+    assert.equal(out.restored && out.databaseWritesPreserved, false); assert.equal(out.waitedMs, 0); assert.equal(out.polls, 1);
+    assert.deepEqual(deps.sleeps, []); assert.deepEqual(readyReads(deps), [1, 1]);
+    const healthy = fakeHost(host), wrong = await probe(argv, config(), healthy);
+    assert.equal(wrong.restored && wrong.databaseWritesPreserved, false); assert.ok(!("capture" in wrong)); assert.deepEqual(healthy.sleeps, []);
+  }
+});
+
+test("H5 a not-ready end captures allowlisted app state and redacted log lines, and no capture failure changes the verdict", async () => {
+  const opaque = "SYNTHETICa1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6", listSecret = "SYNTHETIC_LIST_VALUE";
+  const secretCompose = compose(); secretCompose.services["discord-bridge"].environment = [`DISCORD_TOKEN=${listSecret}`, "MODE=prod"];
+  const noisy = { status: 0, stdout: JSON.stringify({ state: "RUNNING", config: { hubToken: SECRET }, notes: `notes ${SECRET}`, portals: { web: `http://x/?t=${SECRET}` }, metadata: { [SECRET]: 1 },
+    active_workloads: { container_details: [{ service_name: "hub", state: "running", id: ids.hub, image: SECRET, volume_mounts: [SECRET], port_config: [{ secret: SECRET }] }, { service_name: "discord-bridge", state: "exited", id: ids["discord-bridge"] }], volumes: [SECRET] } }) };
+  const hubLines = [...Array.from({ length: 30 }, (_, i) => `old line ${i}`), `env value ${SECRET} and ${listSecret} here`, "token=SYNTHETIC-short", "Authorization: Bearer SYNTHETIC.bearer", `id ${opaque} end`, JSON.stringify({ level: "error", token: "SYNTHETIC-json" }), "\u001b[31mpanic: SYNTHETIC_PRIVATE_TOKEN\u001b[0m\r", "x".repeat(5000), "migration 41 applied", ...Array.from({ length: 21 }, (_, i) => `new line ${i}`)];
+  const answer = ({ id }) => id === ids.hub ? { status: 0, stdout: hubLines.map(logLine).join("\n") + "\nnot json\n" + JSON.stringify({ fields: { data: 7 } }) + "\n" } : { status: 0, stdout: "" };
+  const deps = fakeHost({ config: secretCompose, hub: 1, polls: [{ instance: noisy }], logs: answer });
+  const out = await probe(["live", "hub"], once, deps), text = JSON.stringify(out);
+  assert.ok(!text.includes("SYNTHETIC")); assert.ok(!text.includes(opaque)); assert.ok(!text.includes("\\u001b"));
+  assert.deepEqual(Object.keys(out.capture), ["app", "logs"]);
+  assert.deepEqual(out.capture.app, { state: "RUNNING", containers: [{ service: "hub", state: "running", id: "1".repeat(12) }, { service: "discord-bridge", state: "exited", id: "2".repeat(12) }] });
+  const [hubLog, bridgeLog] = out.capture.logs;
+  assert.deepEqual(bridgeLog, { service: "discord-bridge", unavailable: "no log lines" });
+  assert.deepEqual(Object.keys(hubLog), ["service", "lines"]);
+  // 59 lines were read: the newest 40 are kept, each at most 300 characters.
+  assert.equal(hubLog.lines.length, 40); assert.ok(hubLog.lines.every(l => typeof l === "string" && l.length <= 300));
+  assert.equal(hubLog.lines.at(-1), "new line 20"); assert.ok(!hubLog.lines.includes("old line 0"));
+  assert.ok(hubLog.lines.includes("env value [redacted] and [redacted] here")); assert.ok(hubLog.lines.includes("[redacted]"));
+  assert.ok(hubLog.lines.includes("id [redacted] end")); assert.ok(hubLog.lines.includes("[31mpanic: [redacted][0m"));
+  assert.ok(hubLog.lines.includes("x".repeat(300))); assert.ok(hubLog.lines.includes("migration 41 applied"));
+  assert.ok(logReads(deps).every(r => r.opts.timeout === 15000));
+  // The same answers through the rollback probe.
+  const rolled = await probe(["rollback", "hub", "--expect-release", "rel_x-aaaaaaaaaaaa-hub", "--expect-sha", sha], once, fakeHost({ config: secretCompose, hub: 1, polls: [{ instance: noisy }], logs: answer }));
+  assert.deepEqual(rolled.capture, out.capture); assert.ok(!JSON.stringify(rolled).includes("SYNTHETIC"));
+
+  // Log reads that fail, in every way, are recorded and change nothing else.
+  const verdict = o => { const { capture, ...rest } = o; return rest; };
+  const working = await probe(["live", "hub"], once, fakeHost({ hub: 1 }));
+  const failing = async (logs, expected) => {
+    const host = fakeHost({ hub: 1, logs }), result = await probe(["live", "hub"], once, host);
+    assert.deepEqual(verdict(result), verdict(working));
+    assert.deepEqual(result.capture.logs, expected);
+    assert.equal(result.capture.app.state, "RUNNING");
+    return host;
+  };
+  const both = reason => [{ service: "hub", unavailable: reason }, { service: "discord-bridge", unavailable: reason }];
+  await failing(() => ({ status: 1, stdout: "" }), both("log read failed"));
+  const timedOut = await failing(() => ({ status: null, stdout: "" }), both("log read failed"));
+  assert.equal(logReads(timedOut).length, 2); assert.ok(logReads(timedOut).every(r => r.opts.timeout === 15000));
+  await failing(() => ({ status: 0, stdout: "" }), both("no log lines"));
+  await failing(() => ({ status: 0, stdout: `${SECRET}\n{"fields":{}}\n` }), both("no log lines"));
+  await failing(() => { throw new Error(SECRET); }, both("log read failed"));
+  // Lines followed by a non-zero status (a quiet stream that timed out) are kept.
+  await failing(() => ({ status: 1, stdout: logLine("partial") + "\n" }), [{ service: "hub", lines: ["partial"] }, { service: "discord-bridge", lines: ["partial"] }]);
+  // The first log read uses up the 45 s budget: the next is skipped, not run.
+  const slow = await failing(({ advance }) => { advance(50000); return { status: 0, stdout: logLine("slow") + "\n" }; }, [{ service: "hub", lines: ["slow"] }, { service: "discord-bridge", unavailable: "time budget" }]);
+  assert.equal(logReads(slow).length, 1);
+
+  // An id that is not 64 hex is never placed in a command.
+  const hostile = [{ service_name: "hub", state: "running", id: "abc'; rm -rf / #" }, { service_name: "discord-bridge", state: "running", id: "A".repeat(64) }, { service_name: "bad name!", state: "x y", id: ["1".repeat(64)] }];
+  const odd = fakeHost({ hub: 1, containers: hostile }), oddOut = await probe(["live", "hub"], once, odd);
+  assert.equal(logReads(odd).length, 0); assert.ok(!odd.calls.some(a => String(a.at(-1)).includes("rm -rf")));
+  assert.deepEqual(oddOut.capture, { app: { state: "RUNNING", containers: [{ service: "hub", state: "running", id: null }, { service: "discord-bridge", state: "running", id: null }, { service: null, state: null, id: null }] }, logs: [{ service: "hub", unavailable: "invalid container id" }, { service: "discord-bridge", unavailable: "invalid container id" }, { service: null, unavailable: "invalid container id" }] });
+
+  // app.get_instance failing on every poll and again in the capture.
+  const dead = fakeHost({ hub: 1, polls: [{ instance: { status: 1, stdout: SECRET } }] }), deadOut = await probe(["live", "hub"], windowed(10000), dead);
+  assert.deepEqual(deadOut.capture, { app: "unavailable", logs: [] }); assert.equal(deadOut.waitedMs, 10000); assert.equal(deadOut.polls, 3);
+  assert.equal(readyReads(dead)[0], 4); assert.equal(dead.runs.filter(r => r.argv.at(-1) === "midclt call app.get_instance tailterm-hub").at(-1).opts.timeout, 15000);
+  assert.deepEqual((await probe(["live", "hub"], once, fakeHost({ hub: 1, polls: [{ instance: { get status() { throw new Error(SECRET); } } }] }))).capture, { app: "unavailable", logs: [] });
+
+  // sanitizeCapture alone: any input becomes the fixed shape.
+  assert.deepEqual(sanitizeCapture(undefined), { app: "unavailable", logs: [] });
+  assert.deepEqual(sanitizeCapture({ app: "anything", logs: "x", extra: SECRET }), { app: "unavailable", logs: [] });
+  assert.deepEqual(sanitizeCapture({ app: { state: "running", containers: Array.from({ length: 12 }, () => null), config: SECRET }, logs: Array.from({ length: 6 }, () => ({ service: "hub", unavailable: SECRET })) }),
+    { app: { state: null, containers: Array.from({ length: 8 }, () => ({ service: null, state: null, id: null })) }, logs: Array.from({ length: 4 }, () => ({ service: "hub", unavailable: "log read failed" })) });
+  assert.deepEqual(sanitizeCapture(out.capture), out.capture);
+});
+
+test("H5 the probe command exits 0 with an unavailable log capture when the log read is refused", () => {
+  const dir = mkdtempSync(join(tmpdir(), "probe-capture-cli-")), cfg = join(dir, "config.json"), node = "#!" + process.execPath + "\n";
+  const exe = (name, body) => { writeFileSync(join(dir, name), node + body); chmodSync(join(dir, name), 0o755); };
+  exe("ssh", `const c=process.argv.at(-1);if(c==="midclt call app.config tailterm-hub")console.log(${JSON.stringify(JSON.stringify(compose()))});else if(c.startsWith("cat "))process.stdout.write("hub binary");else if(c==="midclt call app.get_instance tailterm-hub")console.log(${JSON.stringify(JSON.stringify({ state: "RUNNING", notes: SECRET, active_workloads: { container_details: up } }))});else{console.error("sudo: a password is required ${SECRET}");process.exit(1);}`);
+  exe("go", `console.log("x: go1.25\\n\\tbuild\\tvcs.revision=${commit}\\n\\tbuild\\tvcs.modified=false");`);
+  exe("tt", `console.error("${SECRET}");process.exit(1);`);
+  writeFileSync(cfg, JSON.stringify({ tt: join(dir, "tt"), targets: { hub: { host: "truenas", readyWindowMs: 0 } } }));
+  const r = spawnSync(process.execPath, ["scripts/release-probe.mjs", "live", "hub", "--config", cfg], { encoding: "utf8", env: { ...process.env, PATH: dir + ":" + process.env.PATH } });
+  assert.equal(r.status, 0); assert.equal(r.stderr, ""); assert.ok(!r.stdout.includes("SYNTHETIC"));
+  const out = JSON.parse(r.stdout);
+  assert.equal(out.hubResponds, false); assert.equal(out.containersRunning, true); assert.equal(out.commit, commit); assert.equal(out.polls, 1);
+  assert.deepEqual(out.capture.logs, [{ service: "hub", unavailable: "log read failed" }, { service: "discord-bridge", unavailable: "log read failed" }]);
 });
 
 test("Mini probe hashes the installed tt, checks the relay and counts only errors written after the deploy marker", async () => {
