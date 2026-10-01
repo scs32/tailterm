@@ -83,11 +83,16 @@ type exactRunFixture struct {
 	// loseAgentReply drops the next POST .../agents response after the hub
 	// has committed it.
 	loseAgentReply *atomic.Bool
+	// reportInvalidated makes intent readbacks carry an invalidation time, as
+	// the hub reports after a project pause. A real pause would also close
+	// the launcher, so the readback alone is altered; the stored intent stays
+	// unconsumed and admission is never reached.
+	reportInvalidated *atomic.Bool
 }
 
 func newExactRunFixture(t *testing.T) *exactRunFixture {
 	t.Helper()
-	f := &exactRunFixture{tmuxLog: exactRunTmux(t), loseAgentReply: new(atomic.Bool), agentID: api.NewID("agt"), runID: api.NewID("run")}
+	f := &exactRunFixture{tmuxLog: exactRunTmux(t), loseAgentReply: new(atomic.Bool), reportInvalidated: new(atomic.Bool), agentID: api.NewID("agt"), runID: api.NewID("run")}
 	st, err := store.Open(filepath.Join(t.TempDir(), "hub.sqlite"))
 	if err != nil {
 		t.Fatal(err)
@@ -107,6 +112,20 @@ func newExactRunFixture(t *testing.T) *exactRunFixture {
 				return
 			}
 			connection.Close()
+			return
+		}
+		if r.Method == http.MethodGet && strings.Contains(r.URL.Path, "/allocation-intents/") && f.reportInvalidated.Load() {
+			recorded := httptest.NewRecorder()
+			handler.ServeHTTP(recorded, r)
+			var intent api.AllocationIntent
+			if recorded.Code != http.StatusOK || json.Unmarshal(recorded.Body.Bytes(), &intent) != nil {
+				t.Errorf("intent readback before invalidation: %d %s", recorded.Code, recorded.Body.String())
+				return
+			}
+			now := time.Now().UTC()
+			intent.InvalidatedAt, intent.InvalidatedPauseGeneration = &now, 1
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(intent)
 			return
 		}
 		handler.ServeHTTP(w, r)
@@ -167,7 +186,8 @@ func (f *exactRunFixture) spawnFlags(teamRole string) map[string]string {
 
 func exactRunArgs(flags map[string]string) []string {
 	var args []string
-	for _, name := range []string{"--name", "--run", "--task", "--agent-id", "--expected-run-id", "--work-item", "--work-item-revision", "--work-order-message", "--team-role", "--work-context-json", "--replaces-agent"} {
+	for _, name := range []string{"--name", "--run", "--task", "--agent-id", "--expected-run-id", "--work-item", "--work-item-revision", "--work-order-message", "--team-role", "--work-context-json", "--replaces-agent",
+		"--work-item-task", "--queue-entry", "--queue-cycle", "--queue-revision", "--queue-claimant-agent", "--queue-claimant-run"} {
 		if value, ok := flags[name]; ok {
 			args = append(args, name, value)
 		}
@@ -234,10 +254,11 @@ func TestAgentSessionExactRunSpawnRejectsWithoutExactIntent(t *testing.T) {
 		name string
 		// noIntent skips recording one; orchestratorAuthored records one
 		// authored by the task orchestrator for itself instead of by the handler.
-		noIntent, orchestratorAuthored bool
-		env                            func(f *exactRunFixture) env
-		flags                          func(f *exactRunFixture, flags map[string]string)
-		want                           string
+		// invalidated has the hub report the recorded intent as invalidated.
+		noIntent, orchestratorAuthored, invalidated bool
+		env                                         func(f *exactRunFixture) env
+		flags                                       func(f *exactRunFixture, flags map[string]string)
+		want                                        string
 	}{
 		{name: "no intent recorded", noIntent: true, want: "requires a recorded allocation intent"},
 		{name: "wrong expected run", flags: func(f *exactRunFixture, flags map[string]string) { flags["--expected-run-id"] = api.NewID("run") }, want: "expected run does not match"},
@@ -265,6 +286,15 @@ func TestAgentSessionExactRunSpawnRejectsWithoutExactIntent(t *testing.T) {
 		}, want: "work-order message does not match"},
 		{name: "wrong item revision", flags: func(f *exactRunFixture, flags map[string]string) { flags["--work-item-revision"] = "2" }, want: "work-item revision does not match"},
 		{name: "intent authored by the orchestrator", orchestratorAuthored: true, want: "was not authored by this project's database handler"},
+		{name: "intent invalidated", invalidated: true, want: "was invalidated and cannot authorize this launch"},
+		// A complete cross-project Queue claim passes the existing Queue flag
+		// checks, so the refusal is the agent-session one.
+		{name: "queue claim flags set", flags: func(f *exactRunFixture, flags map[string]string) {
+			flags["--work-item-task"] = api.NewID("tsk")
+			flags["--queue-entry"] = "que_" + strings.TrimPrefix(api.NewID("agt"), "agt_")
+			flags["--queue-cycle"], flags["--queue-revision"] = "1", "1"
+			flags["--queue-claimant-agent"], flags["--queue-claimant-run"] = f.launcher.ID, f.launcher.RunID
+		}, want: shape},
 		{name: "replaces-agent set", flags: func(f *exactRunFixture, flags map[string]string) { flags["--replaces-agent"] = f.handler.ID }, want: shape},
 		{name: "missing agent id", flags: func(f *exactRunFixture, flags map[string]string) { delete(flags, "--agent-id") }, want: ownerSide},
 		{name: "missing work item", flags: func(f *exactRunFixture, flags map[string]string) { delete(flags, "--work-item") }, want: ownerSide},
@@ -287,6 +317,7 @@ func TestAgentSessionExactRunSpawnRejectsWithoutExactIntent(t *testing.T) {
 				tc.flags(f, flags)
 			}
 			before := len(f.roster(t))
+			f.reportInvalidated.Store(tc.invalidated)
 			err := cmdSpawn(e, exactRunArgs(flags))
 			if err == nil || !strings.Contains(err.Error(), tc.want) {
 				t.Fatalf("error = %v, want one containing %q", err, tc.want)
