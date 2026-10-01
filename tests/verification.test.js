@@ -1397,11 +1397,17 @@ test("concurrent checks keep plan-ordered receipts and record the job count", as
 });
 test("CLI SIGINT stops every concurrent check group, keeps partial logs and leaves no receipt", async (t) => {
   const root = tempDir(t, "verification-concurrent-signal-");
+  // The runner writes an attempt log only when its check ends, so the pid file
+  // is the readiness event: each suite first puts its partial line in the
+  // runner's pipe with a synchronous write, then publishes the complete pid
+  // file by rename.
   const suite = (name) =>
     `import {spawn} from 'node:child_process';import fs from 'node:fs';` +
     `const c=spawn(process.execPath,['-e','process.on("SIGTERM",()=>{});setInterval(()=>{},1000)'],{stdio:'ignore'});` +
-    `fs.writeFileSync(${JSON.stringify(join(root, name))},JSON.stringify([process.pid,c.pid]));` +
-    `console.log('partial ${name}');setInterval(()=>{},1000);`;
+    `fs.writeSync(1,'partial ${name}\\n');` +
+    `fs.writeFileSync(${JSON.stringify(join(root, name + ".tmp"))},JSON.stringify([process.pid,c.pid]));` +
+    `fs.renameSync(${JSON.stringify(join(root, name + ".tmp"))},${JSON.stringify(join(root, name))});` +
+    `setInterval(()=>{},1000);`;
   const f = browserFixture(t, {
     "one-browser.mjs": suite("one"),
     "two-browser.mjs": suite("two"),
@@ -1421,8 +1427,19 @@ test("CLI SIGINT stops every concurrent check group, keeps partial logs and leav
   );
   const pids = [];
   try {
-    for (let i = 0; !(existsSync(join(root, "one")) && existsSync(join(root, "two"))) && i < 250; i++)
+    const waiting = () =>
+      ["one", "two"].filter((name) => !existsSync(join(root, name)));
+    for (const deadline = Date.now() + 30_000; waiting().length; ) {
+      assert(
+        runner.exitCode === null && runner.signalCode === null,
+        `the runner exited before these check groups published a pid file: ${waiting()}`,
+      );
+      assert(
+        Date.now() < deadline,
+        `timed out waiting for these check groups to publish a pid file: ${waiting()}`,
+      );
       await new Promise((resolve) => setTimeout(resolve, 20));
+    }
     for (const name of ["one", "two"])
       pids.push(...JSON.parse(readFileSync(join(root, name), "utf8")));
     runner.kill("SIGINT");
@@ -1436,7 +1453,7 @@ test("CLI SIGINT stops every concurrent check group, keeps partial logs and leav
         return false;
       }
     };
-    for (let i = 0; pids.some(alive) && i < 100; i++)
+    for (const deadline = Date.now() + 10_000; pids.some(alive) && Date.now() < deadline; )
       await new Promise((resolve) => setTimeout(resolve, 20));
     assert.deepEqual(pids.filter(alive), [], "every check group was stopped");
     assert(!existsSync(join(output, "receipt.json")));

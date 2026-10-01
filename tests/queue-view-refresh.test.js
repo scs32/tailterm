@@ -19,6 +19,31 @@ function deferred() {
   return { promise, resolve, reject };
 }
 
+// The view hashes its connection scope on the thread pool, so how many event
+// loop turns a step takes depends on host load. Each step therefore waits for
+// the thing it needs (a recorded call, a render); the deadline only bounds a
+// failure.
+async function until(read, what) {
+  const deadline = Date.now() + 10_000;
+  for (;;) {
+    const value = read();
+    if (value) return value;
+    if (Date.now() > deadline) assert.fail(`Timed out waiting for ${what}`);
+    await new Promise((r) => setImmediate(r));
+  }
+}
+const nextList = (client) =>
+  until(() => client.lists.shift(), "the view to request the queue list");
+const nextAction = (client) =>
+  until(() => client.actions.shift(), "the view to send the queue action");
+// Runs a step that must end in a render and waits for that render.
+async function rendered(root, step) {
+  const before = root.renders;
+  step();
+  await until(() => root.renders > before, "the view to render");
+}
+// Only for asserting that nothing happens: a dropped result never leaves the
+// microtask queue, so there is no event to wait for.
 const settle = async () => {
   for (let i = 0; i < 20; i++) await new Promise((r) => setImmediate(r));
 };
@@ -46,11 +71,20 @@ function entry(revision, queuePriority = "normal") {
   };
 }
 
-// A minimal root: render writes innerHTML; the view binds its priority select and
-// retry buttons through querySelector/querySelectorAll, which the test drives.
+// A minimal root: render writes innerHTML, counted in renders; the view binds its
+// priority select and retry buttons through querySelector/querySelectorAll,
+// which the test drives.
 function fakeRoot() {
+  let html = "";
   const root = {
-    innerHTML: "",
+    renders: 0,
+    get innerHTML() {
+      return html;
+    },
+    set innerHTML(value) {
+      html = value;
+      root.renders++;
+    },
     priority: null,
     retry: [],
     querySelector(selector) {
@@ -113,28 +147,27 @@ async function mountedView() {
   views.push(view);
   view.mount(root);
   const shown = view.show(TASK);
-  await settle();
-  client.lists.shift().resolve({ entries: [entry(1)] });
+  (await nextList(client)).resolve({ entries: [entry(1)] });
   await shown;
   return { client, root, view, notices };
 }
 
-async function changePriority(root, value) {
+// Changes the priority and returns the action request the view sent for it.
+function changePriority(client, root, value) {
   root.priority({ target: { value } });
-  await settle();
+  return nextAction(client);
 }
 
 test("a refresh during an action keeps its lost-response error and retry", async () => {
   const { client, root, view } = await mountedView();
-  await changePriority(root, "high");
-  const action = client.actions.shift();
+  const action = await changePriority(client, root, "high");
   // The hub committed the change and its event refreshed the view first.
   client.subscriber();
-  await settle();
-  client.lists.shift().resolve({ entries: [entry(2, "high")] });
-  await settle();
-  action.reject(new Error("Synthetic lost Queue response"));
-  await settle();
+  const list = await nextList(client);
+  await rendered(root, () => list.resolve({ entries: [entry(2, "high")] }));
+  await rendered(root, () =>
+    action.reject(new Error("Synthetic lost Queue response")),
+  );
   assert.match(root.innerHTML, /Synthetic lost Queue response/);
   assert.match(root.innerHTML, /Retry exact request/);
   view.hide();
@@ -142,14 +175,11 @@ test("a refresh during an action keeps its lost-response error and retry", async
 
 test("a refresh during a successful action keeps its result notice", async () => {
   const { client, root, view, notices } = await mountedView();
-  await changePriority(root, "urgent");
-  const action = client.actions.shift();
+  const action = await changePriority(client, root, "urgent");
   client.subscriber();
-  await settle();
-  action.resolve({ entry: entry(2, "urgent") });
-  await settle();
-  client.lists.shift().resolve({ entries: [entry(2, "urgent")] });
-  await settle();
+  const list = await nextList(client);
+  await rendered(root, () => action.resolve({ entry: entry(2, "urgent") }));
+  await rendered(root, () => list.resolve({ entries: [entry(2, "urgent")] }));
   assert.match(
     notices.at(-1) || "",
     /Queue revision 2\. No agent was started\./,
@@ -160,28 +190,24 @@ test("a refresh during a successful action keeps its result notice", async () =>
 test("a refresh read before an action commits cannot restore the older entry", async () => {
   const { client, root, view } = await mountedView();
   client.subscriber();
-  await settle();
-  const staleList = client.lists.shift();
-  await changePriority(root, "urgent");
-  client.actions.shift().resolve({ entry: entry(2, "urgent") });
-  await settle();
-  staleList.resolve({ entries: [entry(1)] });
-  await settle();
-  await changePriority(root, "high");
-  assert.equal(client.actions.shift().payload.expectedRevision, 2);
+  const staleList = await nextList(client);
+  const action = await changePriority(client, root, "urgent");
+  await rendered(root, () => action.resolve({ entry: entry(2, "urgent") }));
+  await rendered(root, () => staleList.resolve({ entries: [entry(1)] }));
+  const next = await changePriority(client, root, "high");
+  assert.equal(next.payload.expectedRevision, 2);
   view.hide();
 });
 
 test("a refresh snapshot cannot drop an intent saved after it", async () => {
   const { client, root, view } = await mountedView();
   client.subscriber();
-  await settle();
-  const list = client.lists.shift(); // this refresh already read the intents
-  await changePriority(root, "high");
-  client.actions.shift().reject(new Error("Synthetic lost Queue response"));
-  await settle();
-  list.resolve({ entries: [entry(2, "high")] });
-  await settle();
+  const list = await nextList(client); // this refresh already read the intents
+  const action = await changePriority(client, root, "high");
+  await rendered(root, () =>
+    action.reject(new Error("Synthetic lost Queue response")),
+  );
+  await rendered(root, () => list.resolve({ entries: [entry(2, "high")] }));
   assert.match(root.innerHTML, /Retry exact request/);
   assert.match(root.innerHTML, /Synthetic lost Queue response/);
   view.hide();
@@ -189,30 +215,26 @@ test("a refresh snapshot cannot drop an intent saved after it", async () => {
 
 test("a refresh snapshot cannot resurrect an intent settled after it", async () => {
   const { client, root, view } = await mountedView();
-  await changePriority(root, "high");
-  client.actions.shift().reject(new Error("Synthetic lost Queue response"));
-  await settle();
+  const action = await changePriority(client, root, "high");
+  await rendered(root, () =>
+    action.reject(new Error("Synthetic lost Queue response")),
+  );
   assert.equal(root.retry.length, 1);
   client.subscriber();
-  await settle();
-  const list = client.lists.shift(); // this refresh read the uncertain intent
+  const list = await nextList(client); // this refresh read the uncertain intent
   const retry = root.retry[0];
   root.retry = [];
   retry.onclick();
-  await settle();
-  const replay = client.actions.shift();
-  replay.resolve({ entry: entry(2, "high") });
-  await settle();
-  list.resolve({ entries: [entry(2, "high")] });
-  await settle();
+  const replay = await nextAction(client);
+  await rendered(root, () => replay.resolve({ entry: entry(2, "high") }));
+  await rendered(root, () => list.resolve({ entries: [entry(2, "high")] }));
   assert.doesNotMatch(root.innerHTML, /Retry exact request/);
   view.hide();
 });
 
 test("hiding the view still drops a late action result", async () => {
   const { client, root, view, notices } = await mountedView();
-  await changePriority(root, "urgent");
-  const action = client.actions.shift();
+  const action = await changePriority(client, root, "urgent");
   const before = notices.length;
   view.hide();
   action.resolve({ entry: entry(2, "urgent") });
@@ -226,11 +248,9 @@ test("switching project before a lost response keeps its error off the new proje
     { id: TASK, name: "Target", status: "open" },
     { id: "tsk_other", name: "Other", status: "open" },
   ];
-  await changePriority(root, "high");
-  const action = client.actions.shift();
+  const action = await changePriority(client, root, "high");
   const shown = view.show("tsk_other");
-  await settle();
-  client.lists.shift().resolve({ entries: [] });
+  (await nextList(client)).resolve({ entries: [] });
   await shown;
   action.reject(new Error("Synthetic lost Queue response"));
   await settle();
