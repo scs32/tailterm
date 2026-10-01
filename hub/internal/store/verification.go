@@ -317,23 +317,147 @@ func absVerificationDuration(n int64) int64 {
 
 // verificationAuthor admits the author of a plan freeze or receipt import and
 // returns the role saved on its record: empty for a database handler, lead
-// for the item lead. A handler is admitted as before. The item lead may
-// freeze a plan; receipts stay with the handler.
+// for the item lead, verifier for the current plan's verifier. A handler is
+// admitted as before. Only the lead may freeze a plan besides the handler;
+// the lead or the current plan's exact verifier run may import its receipt.
 func verificationAuthor(ctx context.Context, q queryRower, task, item string, req api.VerificationRequest, records []api.VerificationRecord) (string, error) {
-	if req.Receipt != nil {
-		return "", requireScopeHandler(q, ctx, task, req.AgentID, req.RunID)
+	plan, _ := currentVerification(records)
+	var order int64
+	if req.Plan != nil {
+		order = req.Plan.OrderMessageSeq
+	} else if plan != nil {
+		order = plan.OrderMessageSeq
 	}
-	role, _, err := requireItemOperator(ctx, q, task, item, req.AgentID, req.RunID, req.ContextDigest, req.Plan.OrderMessageSeq)
+	role, _, err := requireItemOperator(ctx, q, task, item, req.AgentID, req.RunID, req.ContextDigest, order)
 	if err != nil {
 		return "", err
 	}
-	switch role {
-	case itemOperatorHandler:
+	switch {
+	case role == itemOperatorHandler:
 		return "", nil
-	case itemOperatorLead:
+	case role == itemOperatorLead:
 		return itemOperatorLead, nil
+	case req.Plan != nil:
+		return "", verificationConflict("only the item lead or the database handler may freeze a verification plan")
+	case plan != nil && plan.VerifierAgentID == req.AgentID && plan.VerifierRunID == req.RunID:
+		return "verifier", nil
 	}
-	return "", verificationConflict("only the item lead or the database handler may freeze a verification plan")
+	return "", verificationConflict("only the plan's verifier, the item lead or the database handler may import a receipt")
+}
+
+// receiptNoticeTargets lists who depends on an item's receipt, in order: the
+// item lead, each distinct reviewer of the item's current scope, then the
+// handler (the running entry's leased handler, or with no running entry every
+// available database handler in the project). The importing agent is left
+// out and an agent is listed once, under its first role.
+func receiptNoticeTargets(ctx context.Context, tx *sql.Tx, item api.WorkItem, author string) ([]api.VerificationNotice, error) {
+	seen := map[string]bool{author: true, "": true}
+	var out []api.VerificationNotice
+	add := func(role, agent string) {
+		if !seen[agent] {
+			seen[agent] = true
+			out = append(out, api.VerificationNotice{Role: role, AgentID: agent})
+		}
+	}
+	var lead string
+	err := tx.QueryRowContext(ctx, `SELECT agent_id FROM item_team_leads WHERE task_id=? AND item_id=? AND state<>'closed'`, item.TaskID, item.ID).Scan(&lead)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return nil, err
+	}
+	add("lead", lead)
+	state, err := reviewState(ctx, tx, item.TaskID, item.ID)
+	if err != nil {
+		return nil, err
+	}
+	for _, round := range state.Rounds {
+		if round.ScopeRevision == item.ScopeRevision {
+			add("reviewer", round.ReviewerID)
+		}
+	}
+	var handler string
+	err = tx.QueryRowContext(ctx, `SELECT handler_id FROM team_queue_entries WHERE task_id=? AND item_id=? AND state='running' ORDER BY attempt DESC LIMIT 1`, item.TaskID, item.ID).Scan(&handler)
+	if err == nil {
+		add("handler", handler)
+		return out, nil
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return nil, err
+	}
+	rows, err := tx.QueryContext(ctx, `SELECT id FROM agents WHERE task_id=? AND role=? AND status NOT IN (?,?,?) ORDER BY created_at,id`, item.TaskID, api.AgentRoleDatabaseHandler, api.AgentClosed, api.AgentExited, api.AgentRetired)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		if err = rows.Scan(&handler); err != nil {
+			return nil, err
+		}
+		add("handler", handler)
+	}
+	return out, rows.Err()
+}
+
+// postReceiptNotices tells every dependent actor that a receipt was imported,
+// inside the importing transaction and before the record is written, and
+// returns what the record saves: each notice's message, or why a recipient
+// was not told. A closed, exited or retired recipient is skipped. Any insert
+// failure refuses the whole import, so no notice exists without its record.
+func (s *Store) postReceiptNotices(ctx context.Context, tx *sql.Tx, item api.WorkItem, p api.VerificationPlan, r api.VerificationReceipt, generation int64, author string) ([]api.VerificationNotice, error) {
+	notices, err := receiptNoticeTargets(ctx, tx, item, author)
+	if err != nil || len(notices) == 0 {
+		return nil, err
+	}
+	t, err := scanTask(tx.QueryRowContext(ctx, `SELECT `+taskCols+` FROM tasks WHERE id=?`, item.TaskID))
+	if err != nil {
+		return nil, err
+	}
+	state := "blocked"
+	if verificationEligible(p, r) == nil {
+		if _, err := validateVerificationKnownFailures(ctx, tx, p, item, &r); err == nil {
+			state = "passing"
+		}
+	}
+	text := fmt.Sprintf("The verification receipt for commit %s was imported as generation %d and is %s.", p.Commit, generation, state)
+	if state == "blocked" {
+		var failed []string
+		for _, c := range r.Checks {
+			if c.ExitCode != 0 {
+				failed = append(failed, c.ID)
+			}
+		}
+		if len(failed) == 0 {
+			text += " No check failed; a known failure's bug no longer covers it."
+		} else {
+			text += " Failed checks: " + strings.Join(failed, ", ") + "."
+		}
+	}
+	text += " No reply is needed."
+	for i := range notices {
+		n := &notices[i]
+		target, err := scanAgent(tx.QueryRowContext(ctx, `SELECT `+agentCols+` FROM agents WHERE task_id=? AND id=?`, item.TaskID, n.AgentID))
+		if errors.Is(err, sql.ErrNoRows) {
+			n.Skipped = api.AgentClosed
+			continue
+		}
+		if err != nil {
+			return nil, err
+		}
+		if unavailableAgentStatus(target.Status) {
+			n.Skipped = target.Status
+			continue
+		}
+		envelope := api.Envelope{Kind: api.EnvelopeKindNotice, To: target.Name, Subject: "Verification receipt imported: " + state,
+			Refs: map[string]string{"item": item.ID, "commit": p.Commit, "generation": fmt.Sprint(generation), "state": state},
+			Body: api.EnvelopeBody{Text: text}}
+		post := api.PostMessageRequest{Envelope: &envelope, To: target.ID, RequestID: fmt.Sprintf("verification-receipt-%s-%d-%s", item.ID, generation, target.ID), WorkOrderMessage: &api.MessageReference{TaskID: item.TaskID, Seq: p.OrderMessageSeq},
+			WorkItems: []api.MessageWorkItem{{ItemTaskID: item.TaskID, ItemID: item.ID, ItemRevision: item.Revision, Relationship: "primary"}}}
+		m, err := s.insertMessageWithResume(ctx, tx, t, post, target, api.Caller{Node: "verification", User: "hub"}, false, false, false)
+		if err != nil {
+			return nil, fmt.Errorf("%w: verification: receipt notice to %s %s failed: %v; nothing was saved, retry with the same request id", api.ErrConflict, n.Role, n.AgentID, err)
+		}
+		n.MessageSeq = m.Seq
+	}
+	return notices, nil
 }
 
 func (s *Store) SaveVerification(ctx context.Context, task, itemID string, req api.VerificationRequest) (api.VerificationRecord, error) {
@@ -391,6 +515,7 @@ func (s *Store) SaveVerification(ctx context.Context, task, itemID string, req a
 		return zero, verificationConflict("generation changed")
 	}
 	kind := "plan"
+	var notices []api.VerificationNotice
 	if req.Plan != nil {
 		if err = validateVerificationPlan(ctx, tx, item, *req.Plan); err != nil {
 			return zero, err
@@ -422,8 +547,11 @@ func (s *Store) SaveVerification(ctx context.Context, task, itemID string, req a
 		if err = validateVerificationReceipt(*p, *req.Receipt); err != nil {
 			return zero, err
 		}
+		if notices, err = s.postReceiptNotices(ctx, tx, item, *p, *req.Receipt, generation+1, req.AgentID); err != nil {
+			return zero, err
+		}
 	}
-	record := api.VerificationRecord{ItemID: itemID, ItemTaskID: task, Generation: generation + 1, Kind: kind, RequestID: req.RequestID, Digest: hash, HandlerAgentID: req.AgentID, HandlerRunID: req.RunID, CreatedAt: ts(s.now()), Plan: req.Plan, Receipt: req.Receipt, AuthorRole: authorRole}
+	record := api.VerificationRecord{ItemID: itemID, ItemTaskID: task, Generation: generation + 1, Kind: kind, RequestID: req.RequestID, Digest: hash, HandlerAgentID: req.AgentID, HandlerRunID: req.RunID, CreatedAt: ts(s.now()), Plan: req.Plan, Receipt: req.Receipt, AuthorRole: authorRole, Notices: notices}
 	b, err := json.Marshal(record)
 	if err != nil {
 		return zero, err
@@ -433,6 +561,9 @@ func (s *Store) SaveVerification(ctx context.Context, task, itemID string, req a
 	}
 	if err = tx.Commit(); err != nil {
 		return zero, err
+	}
+	if len(notices) > 0 {
+		s.notify(task)
 	}
 	return record, nil
 }

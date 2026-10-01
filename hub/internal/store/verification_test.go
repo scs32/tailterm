@@ -1064,3 +1064,235 @@ func TestItemOperatorRefusals(t *testing.T) {
 		}
 	})
 }
+
+// reviewRound has the lead send the reviewer a REVIEW of the plan's
+// candidate, which records the reviewer on the item's current scope.
+func (f *operatorFixture) reviewRound(t *testing.T) {
+	t.Helper()
+	env := api.Envelope{Kind: "review", Subject: "Review frozen fixture candidate", Body: api.EnvelopeBody{Candidate: f.plan.Commit, Scope: "Fixture", Acceptance: map[string]string{"a1": "works", "a2": "retries"}}}
+	if _, err := f.post(env, f.reviewer.ID, f.lead); err != nil {
+		t.Fatal("review", err)
+	}
+}
+
+// freeze has the lead freeze the fixture's plan as generation 1.
+func (f *operatorFixture) freeze(t *testing.T) {
+	t.Helper()
+	if _, err := f.s.SaveVerification(f.ctx, f.task.ID, f.item.ID, f.leadPlan(t, "plan")); err != nil {
+		t.Fatal("plan freeze", err)
+	}
+}
+
+// receipt is an import request for the frozen plan from the given author.
+func (f *operatorFixture) receipt(t *testing.T, key string, from api.Agent, r api.VerificationReceipt) api.VerificationRequest {
+	t.Helper()
+	req := api.VerificationRequest{RequestID: key, AgentID: from.ID, RunID: from.RunID, ExpectedGeneration: 1, Receipt: &r}
+	if from.Role != api.AgentRoleDatabaseHandler {
+		req.ContextDigest = f.digest(t, from)
+	}
+	return req
+}
+
+// messages counts the project's messages.
+func (f *operatorFixture) messages(t *testing.T) int {
+	t.Helper()
+	return f.count(t, `SELECT count(*) FROM messages WHERE task_id=?`, f.task.ID)
+}
+
+// assertNotice checks one delivered notice: its recipient, hub author, state,
+// refs and item link.
+func (f *operatorFixture) assertNotice(t *testing.T, n api.VerificationNotice, role string, to api.Agent, generation int64, state string) {
+	t.Helper()
+	if n.Role != role || n.AgentID != to.ID || n.MessageSeq == 0 || n.Skipped != "" {
+		t.Fatalf("notice %+v, want %s to %s", n, role, to.ID)
+	}
+	var target, from, node, raw string
+	if err := f.s.db.QueryRow(`SELECT to_agent,from_agent,from_node,envelope FROM messages WHERE task_id=? AND seq=?`, f.task.ID, n.MessageSeq).Scan(&target, &from, &node, &raw); err != nil {
+		t.Fatal(err)
+	}
+	var e api.Envelope
+	if err := json.Unmarshal([]byte(raw), &e); err != nil {
+		t.Fatal(err)
+	}
+	if target != to.ID || from != "" || node != "verification" || e.Kind != "notice" || e.Subject != "Verification receipt imported: "+state ||
+		e.Refs["item"] != f.item.ID || e.Refs["commit"] != f.plan.Commit || e.Refs["generation"] != fmt.Sprint(generation) || e.Refs["state"] != state || !strings.HasSuffix(e.Body.Text, "No reply is needed.") {
+		t.Fatalf("notice #%d to %s from %q/%q: %s", n.MessageSeq, target, from, node, raw)
+	}
+	if linked := f.count(t, `SELECT count(*) FROM message_work_item_links WHERE message_task_id=? AND message_seq=? AND item_task_id=? AND item_id=? AND relationship='primary'`, f.task.ID, n.MessageSeq, f.task.ID, f.item.ID); linked != 1 {
+		t.Fatalf("notice #%d is not linked to the item", n.MessageSeq)
+	}
+	if owed := f.count(t, `SELECT count(*) FROM obligations WHERE task_id=? AND message_seq=?`, f.task.ID, n.MessageSeq); owed != 0 {
+		t.Fatalf("notice #%d created %d obligations", n.MessageSeq, owed)
+	}
+}
+
+// a3: the plan's verifier imports its receipt; the hub tells the lead, the
+// reviewer and the leased handler once each, in the importing transaction.
+func TestReceiptImportNotifiesDependents(t *testing.T) {
+	t.Run("verifier import notifies lead, reviewer and handler once", func(t *testing.T) {
+		f := newOperatorFixture(t)
+		f.freeze(t)
+		f.reviewRound(t)
+		records, messages := f.records(t), f.messages(t)
+		req := f.receipt(t, "receipt", f.verifier, passingVerification(f.plan))
+		saved, err := f.s.SaveVerification(f.ctx, f.task.ID, f.item.ID, req)
+		if err != nil {
+			t.Fatal("verifier import", err)
+		}
+		if saved.Generation != 2 || saved.AuthorRole != "verifier" || saved.HandlerAgentID != f.verifier.ID || len(saved.Notices) != 3 {
+			t.Fatalf("receipt record %+v", saved)
+		}
+		f.assertNotice(t, saved.Notices[0], "lead", f.lead, 2, "passing")
+		f.assertNotice(t, saved.Notices[1], "reviewer", f.reviewer, 2, "passing")
+		f.assertNotice(t, saved.Notices[2], "handler", f.handler, 2, "passing")
+		if got := f.records(t); got != records+1 {
+			t.Fatalf("records %d -> %d, want one more", records, got)
+		}
+		if got := f.messages(t); got != messages+3 {
+			t.Fatalf("messages %d -> %d, want three notices", messages, got)
+		}
+		history, err := f.s.VerificationHistory(f.ctx, f.task.ID, f.item.ID, f.verifier.ID, f.verifier.RunID)
+		if err != nil || len(history) != 2 || !reflect.DeepEqual(history[1], saved) || !reflect.DeepEqual(history[1].Notices, saved.Notices) {
+			t.Fatalf("history %+v %v", history, err)
+		}
+		// A replay returns the stored record and posts nothing.
+		again, err := f.s.SaveVerification(f.ctx, f.task.ID, f.item.ID, req)
+		if err != nil || !reflect.DeepEqual(again, saved) {
+			t.Fatalf("replay %+v %v", again, err)
+		}
+		if f.records(t) != records+1 || f.messages(t) != messages+3 {
+			t.Fatalf("replay wrote: records %d messages %d", f.records(t), f.messages(t))
+		}
+	})
+
+	t.Run("lead import notifies reviewer and handler only", func(t *testing.T) {
+		f := newOperatorFixture(t)
+		// Small lane: the lead is the plan's verifier.
+		f.plan.VerifierAgentID, f.plan.VerifierRunID = f.lead.ID, f.lead.RunID
+		f.freeze(t)
+		f.reviewRound(t)
+		saved, err := f.s.SaveVerification(f.ctx, f.task.ID, f.item.ID, f.receipt(t, "receipt", f.lead, passingVerification(f.plan)))
+		if err != nil {
+			t.Fatal("lead import", err)
+		}
+		if saved.AuthorRole != "lead" || len(saved.Notices) != 2 {
+			t.Fatalf("lead receipt record %+v", saved)
+		}
+		f.assertNotice(t, saved.Notices[0], "reviewer", f.reviewer, 2, "passing")
+		f.assertNotice(t, saved.Notices[1], "handler", f.handler, 2, "passing")
+	})
+
+	t.Run("closed reviewer is recorded as skipped", func(t *testing.T) {
+		f := newOperatorFixture(t)
+		f.freeze(t)
+		f.reviewRound(t)
+		if _, err := f.s.db.Exec(`UPDATE agents SET status='closed' WHERE id=?`, f.reviewer.ID); err != nil {
+			t.Fatal(err)
+		}
+		messages := f.messages(t)
+		saved, err := f.s.SaveVerification(f.ctx, f.task.ID, f.item.ID, f.receipt(t, "receipt", f.verifier, passingVerification(f.plan)))
+		if err != nil {
+			t.Fatal("import with a closed reviewer", err)
+		}
+		if len(saved.Notices) != 3 || !reflect.DeepEqual(saved.Notices[1], api.VerificationNotice{Role: "reviewer", AgentID: f.reviewer.ID, Skipped: "closed"}) {
+			t.Fatalf("notices %+v", saved.Notices)
+		}
+		f.assertNotice(t, saved.Notices[0], "lead", f.lead, 2, "passing")
+		f.assertNotice(t, saved.Notices[2], "handler", f.handler, 2, "passing")
+		if got := f.messages(t); got != messages+2 {
+			t.Fatalf("messages %d -> %d, want two notices", messages, got)
+		}
+	})
+
+	t.Run("failing receipt posts blocked", func(t *testing.T) {
+		f := newOperatorFixture(t)
+		f.plan.MaxAttempts = 3
+		f.freeze(t)
+		f.reviewRound(t)
+		saved, err := f.s.SaveVerification(f.ctx, f.task.ID, f.item.ID, f.receipt(t, "receipt", f.verifier, retryVerification(f.plan, 1, 1, 1)))
+		if err != nil {
+			t.Fatal("failing import", err)
+		}
+		if len(saved.Notices) != 3 {
+			t.Fatalf("notices %+v", saved.Notices)
+		}
+		f.assertNotice(t, saved.Notices[0], "lead", f.lead, 2, "blocked")
+		f.assertNotice(t, saved.Notices[1], "reviewer", f.reviewer, 2, "blocked")
+		f.assertNotice(t, saved.Notices[2], "handler", f.handler, 2, "blocked")
+		var text string
+		if err = f.s.db.QueryRow(`SELECT text FROM messages WHERE task_id=? AND seq=?`, f.task.ID, saved.Notices[0].MessageSeq).Scan(&text); err != nil || !strings.Contains(text, "Failed checks: fixture-check.") {
+			t.Fatalf("blocked notice text %q %v", text, err)
+		}
+	})
+
+	t.Run("a notice failure refuses the whole import", func(t *testing.T) {
+		f := newOperatorFixture(t)
+		f.freeze(t)
+		f.reviewRound(t)
+		// The message row is written before its check row, so this fails each
+		// notice part-way, after its message insert.
+		if _, err := f.s.db.Exec(`CREATE TRIGGER fixture_notice_failure BEFORE INSERT ON message_checks BEGIN SELECT RAISE(ABORT,'fixture notice failure'); END`); err != nil {
+			t.Fatal(err)
+		}
+		records, messages := f.records(t), f.messages(t)
+		req := f.receipt(t, "receipt", f.verifier, passingVerification(f.plan))
+		_, err := f.s.SaveVerification(f.ctx, f.task.ID, f.item.ID, req)
+		if !errors.Is(err, api.ErrConflict) || !strings.Contains(err.Error(), "receipt notice to lead "+f.lead.ID+" failed") || !strings.Contains(err.Error(), "nothing was saved, retry with the same request id") {
+			t.Fatalf("notice failure: %v", err)
+		}
+		if f.records(t) != records || f.messages(t) != messages {
+			t.Fatalf("failed import left rows: records %d -> %d, messages %d -> %d", records, f.records(t), messages, f.messages(t))
+		}
+		if _, err = f.s.db.Exec(`DROP TRIGGER fixture_notice_failure`); err != nil {
+			t.Fatal(err)
+		}
+		saved, err := f.s.SaveVerification(f.ctx, f.task.ID, f.item.ID, req)
+		if err != nil || len(saved.Notices) != 3 || f.records(t) != records+1 || f.messages(t) != messages+3 {
+			t.Fatalf("retry after the fault: %+v %v", saved, err)
+		}
+	})
+
+	t.Run("only the plan's verifier, the lead or the handler may import", func(t *testing.T) {
+		f := newOperatorFixture(t)
+		f.freeze(t)
+		records, messages := f.records(t), f.messages(t)
+		_, err := f.s.SaveVerification(f.ctx, f.task.ID, f.item.ID, f.receipt(t, "builder-receipt", f.builder, passingVerification(f.plan)))
+		if !errors.Is(err, api.ErrConflict) || !strings.Contains(err.Error(), "only the plan's verifier, the item lead or the database handler may import a receipt") {
+			t.Fatalf("builder import: %v", err)
+		}
+		if f.records(t) != records || f.messages(t) != messages {
+			t.Fatal("refused import wrote rows")
+		}
+	})
+}
+
+// a4: a handler-authored import posts the same notices to the lead and the
+// reviewer; its record has notices and no authorRole.
+func TestHandlerReceiptImportNotifiesLeadAndReviewer(t *testing.T) {
+	f := newOperatorFixture(t)
+	p := f.plan
+	if _, err := f.s.SaveVerification(f.ctx, f.task.ID, f.item.ID, api.VerificationRequest{RequestID: "plan", AgentID: f.handler.ID, RunID: f.handler.RunID, Plan: &p}); err != nil {
+		t.Fatal("handler plan freeze", err)
+	}
+	f.reviewRound(t)
+	messages := f.messages(t)
+	saved, err := f.s.SaveVerification(f.ctx, f.task.ID, f.item.ID, f.receipt(t, "receipt", f.handler, passingVerification(f.plan)))
+	if err != nil {
+		t.Fatal("handler import", err)
+	}
+	if saved.AuthorRole != "" || saved.HandlerAgentID != f.handler.ID || len(saved.Notices) != 2 {
+		t.Fatalf("handler receipt record %+v", saved)
+	}
+	f.assertNotice(t, saved.Notices[0], "lead", f.lead, 2, "passing")
+	f.assertNotice(t, saved.Notices[1], "reviewer", f.reviewer, 2, "passing")
+	if got := f.messages(t); got != messages+2 {
+		t.Fatalf("messages %d -> %d, want two notices", messages, got)
+	}
+	var raw string
+	if err = f.s.db.QueryRow(`SELECT record_json FROM verification_records WHERE task_id=? AND item_id=? AND generation=2`, f.task.ID, f.item.ID).Scan(&raw); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(raw, "authorRole") || !strings.Contains(raw, `"notices":[`) {
+		t.Fatalf("handler receipt record %s", raw)
+	}
+}
