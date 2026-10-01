@@ -48,7 +48,17 @@ input text replaced, to show that an idle input box is never read as a dialog.
 | `claude-typed-allow.derived` | `typed.ansi`, typed `hello there` → `please allow this change` (holds the dialog phrase `allow this`) | no prompt |
 | `claude-suggestion-numbered.derived` | `suggestion.ansi`, faint suggestion `only test files` → `1. rename the helper` | no prompt |
 
-The classifier needs the exact title and option labels for a known kind, and a
-key-hint footer as the last row for any Codex prompt, so a reconstruction
-error in the footer or column spacing does not change the result. A label
-change in a future Codex release makes the menu `unknown`, which escalates.
+A Codex prompt is recognised only when the last non-blank row is a key hint
+matching `codexPromptFooter` (it starts with `press enter`, `enter WORD`,
+`enter/esc WORD` or `esc WORD`, in any letter case). A footer that does not
+match reads as no prompt, so the guessed footer of the reconstructed
+rate-limit menu decides whether that fixture is seen at all. A footer that
+differs but still matches leaves the kind unchanged and changes only the
+fingerprint, which hashes the footer row with the rest of the menu.
+
+A known kind also needs its exact title text, option labels or both. A label
+ends at the first run of two or more spaces, so column spacing does not change
+the result while that gap stays at least two spaces wide; a single space joins
+the description to the label, which then no longer matches. A menu with a
+matching footer whose title or labels do not match, as after a label change in
+a future Codex release, is `unknown`, which escalates.
