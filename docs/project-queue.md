@@ -910,8 +910,10 @@ dependent actor once with a directed NOTICE from the hub (`verification`):
 
 - the item lead;
 - each distinct reviewer of the item's current scope;
-- the handler: the running entry's leased handler, or with no running entry
-  every available database handler in the project.
+- the handler: the running entry's leased handler. With no running entry, or
+  when that handler is closed, exited or retired, every available database
+  handler in the project is told instead, and the record still lists the
+  gone lease as `skipped`.
 
 The importing agent is left out. The subject is `Verification receipt
 imported: passing` or `Verification receipt imported: blocked`; the refs name

@@ -347,9 +347,10 @@ func verificationAuthor(ctx context.Context, q queryRower, task, item string, re
 
 // receiptNoticeTargets lists who depends on an item's receipt, in order: the
 // item lead, each distinct reviewer of the item's current scope, then the
-// handler (the running entry's leased handler, or with no running entry every
-// available database handler in the project). The importing agent is left
-// out and an agent is listed once, under its first role.
+// handler: the running entry's leased handler, or, with no running entry or
+// a leased handler that is closed, exited or retired, every available
+// database handler in the project. The importing agent is left out and an
+// agent is listed once, under its first role.
 func receiptNoticeTargets(ctx context.Context, tx *sql.Tx, item api.WorkItem, author string) ([]api.VerificationNotice, error) {
 	seen := map[string]bool{author: true, "": true}
 	var out []api.VerificationNotice
@@ -376,12 +377,21 @@ func receiptNoticeTargets(ctx context.Context, tx *sql.Tx, item api.WorkItem, au
 	}
 	var handler string
 	err = tx.QueryRowContext(ctx, `SELECT handler_id FROM team_queue_entries WHERE task_id=? AND item_id=? AND state='running' ORDER BY attempt DESC LIMIT 1`, item.TaskID, item.ID).Scan(&handler)
-	if err == nil {
-		add("handler", handler)
-		return out, nil
-	}
-	if !errors.Is(err, sql.ErrNoRows) {
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return nil, err
+	}
+	if err == nil && handler != "" {
+		// The lease is listed even when its handler is gone, so the record
+		// shows it skipped; an available lease is the only handler told.
+		add("handler", handler)
+		var status string
+		err = tx.QueryRowContext(ctx, `SELECT status FROM agents WHERE task_id=? AND id=?`, item.TaskID, handler).Scan(&status)
+		if err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return nil, err
+		}
+		if err == nil && !unavailableAgentStatus(status) {
+			return out, nil
+		}
 	}
 	rows, err := tx.QueryContext(ctx, `SELECT id FROM agents WHERE task_id=? AND role=? AND status NOT IN (?,?,?) ORDER BY created_at,id`, item.TaskID, api.AgentRoleDatabaseHandler, api.AgentClosed, api.AgentExited, api.AgentRetired)
 	if err != nil {

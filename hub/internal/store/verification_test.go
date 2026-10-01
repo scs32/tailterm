@@ -1204,6 +1204,40 @@ func TestReceiptImportNotifiesDependents(t *testing.T) {
 		}
 	})
 
+	t.Run("a gone leased handler is skipped and every available handler is told", func(t *testing.T) {
+		for _, status := range []string{api.AgentRetired, api.AgentClosed, api.AgentExited} {
+			f := newOperatorFixture(t)
+			f.freeze(t)
+			f.reviewRound(t)
+			var others []api.Agent
+			for _, name := range []string{"handler-two", "handler-three"} {
+				other, err := f.s.AddAgent(f.ctx, f.task.ID, api.AddAgentRequest{Name: name, Role: api.AgentRoleDatabaseHandler, AgentID: api.NewID("agt"), Host: "mini", Session: name}, f.by)
+				if err != nil {
+					t.Fatal(err)
+				}
+				others = append(others, other)
+			}
+			// A gone handler that is not the lease is never told.
+			if _, err := f.s.db.Exec(`UPDATE agents SET status=? WHERE id IN (?,?)`, status, f.handler.ID, others[1].ID); err != nil {
+				t.Fatal(err)
+			}
+			messages := f.messages(t)
+			saved, err := f.s.SaveVerification(f.ctx, f.task.ID, f.item.ID, f.receipt(t, "receipt", f.verifier, passingVerification(f.plan)))
+			if err != nil {
+				t.Fatalf("%s lease: %v", status, err)
+			}
+			if len(saved.Notices) != 4 || !reflect.DeepEqual(saved.Notices[2], api.VerificationNotice{Role: "handler", AgentID: f.handler.ID, Skipped: status}) {
+				t.Fatalf("%s lease: notices %+v", status, saved.Notices)
+			}
+			f.assertNotice(t, saved.Notices[0], "lead", f.lead, 2, "passing")
+			f.assertNotice(t, saved.Notices[1], "reviewer", f.reviewer, 2, "passing")
+			f.assertNotice(t, saved.Notices[3], "handler", others[0], 2, "passing")
+			if got := f.messages(t); got != messages+3 {
+				t.Fatalf("%s lease: messages %d -> %d, want three notices", status, messages, got)
+			}
+		}
+	})
+
 	t.Run("failing receipt posts blocked", func(t *testing.T) {
 		f := newOperatorFixture(t)
 		f.plan.MaxAttempts = 3
