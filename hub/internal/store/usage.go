@@ -35,7 +35,8 @@ func migrateUsage(db *sql.DB) error {
  PRIMARY KEY(task_id,revision));
  CREATE TABLE IF NOT EXISTS usage_price_receipts(
  task_id TEXT NOT NULL,request_id TEXT NOT NULL,payload TEXT NOT NULL,result TEXT NOT NULL,
- PRIMARY KEY(task_id,request_id));`)
+ PRIMARY KEY(task_id,request_id));
+ ` + usageSpansSchema)
 	return err
 }
 func validUsageTurn(t api.UsageTurn) bool {
@@ -107,8 +108,13 @@ func usageUpdate(old, t api.UsageTurn) bool {
 func (s *Store) ReportUsage(ctx context.Context, task, agent string, b api.UsageBatch) (api.UsageReceipt, error) {
 	zero := api.UsageReceipt{}
 	raw, _ := json.Marshal(b)
-	if !api.ValidID(task, "tsk") || !api.ValidID(agent, "agt") || b.Version != api.UsageVersion || !validRequestID(b.RequestID) || b.RunID == "" || b.Session == "" || b.StartedAt.IsZero() || len(b.Turns) > 64 || len(raw) > 60<<10 || len(b.Coverage) > 240 {
+	if !api.ValidID(task, "tsk") || !api.ValidID(agent, "agt") || b.Version != api.UsageVersion || !validRequestID(b.RequestID) || b.RunID == "" || b.Session == "" || b.StartedAt.IsZero() || len(b.Turns)+len(b.Spans) > 64 || len(raw) > 60<<10 || len(b.Coverage) > 240 {
 		return zero, api.ErrInvalid
+	}
+	for _, span := range b.Spans {
+		if !validUsageSpan(span) {
+			return zero, api.ErrInvalid
+		}
 	}
 	for _, t := range b.Turns {
 		if !validUsageTurn(t) || t.Session != b.Session {
@@ -204,11 +210,14 @@ func (s *Store) ReportUsage(ctx context.Context, task, agent string, b api.Usage
 			return zero, err
 		}
 	}
+	if err = storeUsageSpans(ctx, tx, task, agent, b.RunID, b.Spans, provenance); err != nil {
+		return zero, err
+	}
 	_, err = tx.ExecContext(ctx, `UPDATE usage_runs SET coverage=? WHERE task_id=? AND agent_id=? AND run_id=?`, b.Coverage, task, agent, b.RunID)
 	if err != nil {
 		return zero, err
 	}
-	zero = api.UsageReceipt{RequestID: b.RequestID, Turns: len(b.Turns)}
+	zero = api.UsageReceipt{RequestID: b.RequestID, Turns: len(b.Turns), Spans: len(b.Spans)}
 	encoded, _ := json.Marshal(zero)
 	_, err = tx.ExecContext(ctx, `INSERT INTO usage_receipts VALUES(?,?,?,?,?,?)`, task, b.RequestID, agent, b.RunID, string(raw), string(encoded))
 	if err != nil {
