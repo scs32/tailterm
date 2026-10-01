@@ -801,6 +801,7 @@ func TestHostSetupServiceFailures(t *testing.T) {
 	t.Run("bootout fails while the service is still leaving", func(t *testing.T) {
 		s, v1 := agentUp(t)
 		s.state("bootout-mode", "fail-slow")
+		hostSetupStopWait = time.Hour // ends when the service is gone, however slow the host
 		out := s.mustRun("--from", v1, "--service", "daemon")
 		calls := s.calls()
 		bootout, bootstrap := callIndex(calls, "bootout "+s.agentTarget()), callIndex(calls, "sudo "+hostSetupLaunchctl+" bootstrap system")
@@ -1097,48 +1098,62 @@ func TestHostSetupRefusesRoot(t *testing.T) {
 func TestHostSetupRelayProbeSchedule(t *testing.T) {
 	s := newHostSandbox(t, "home")
 	s.holdRelayLock()
-	var probes []time.Duration
+	// Nothing here depends on how fast the host is: the checks are probe
+	// counts and lower bounds on pauses, and a sleep never returns early.
+	const pause = 20 * time.Millisecond
+	hostSetupRelayProbe = pause
+	var probes []time.Time
 	var start time.Time
-	answer := false
-	relayRunningProbe = func() bool { probes = append(probes, time.Since(start)); return answer }
+	answer := func(nth int) bool { return false }
+	relayRunningProbe = func() bool { probes = append(probes, time.Now()); return answer(len(probes)) }
 	reset := func() { probes, start = nil, time.Now() }
-	hostSetupRelayProbe = 60 * time.Millisecond
 
 	reset()
-	if waitForRelay(0) || len(probes) != 1 || probes[0] > 30*time.Millisecond {
-		t.Fatalf("no wait: probes %v", probes)
+	if waitForRelay(0) || len(probes) != 1 {
+		t.Fatalf("no wait: %d probes", len(probes))
 	}
 	reset()
-	if waitForRelay(150*time.Millisecond) || len(probes) != 3 || probes[0] < 60*time.Millisecond || probes[1]-probes[0] < 60*time.Millisecond {
-		t.Fatalf("a relay that never starts: probes %v", probes)
+	if waitForRelay(5*pause) || len(probes) == 0 || probes[0].Sub(start) < pause {
+		t.Fatalf("a relay that never starts: %d probes, first after %v", len(probes), probes[0].Sub(start))
 	}
-	answer = true
-	reset()
-	if !waitForRelay(10*time.Second) || len(probes) != 1 || probes[0] < 60*time.Millisecond {
-		t.Fatalf("a relay that started: probes %v", probes)
-	}
-
-	// Through host setup: a run that restarts the relay waits before its one
-	// probe; a run that restarts nothing probes once, at once.
-	hostSetupRelayWait = 10 * time.Second
-	v1, v2 := s.artifact("tt-v1"), s.artifact("tt-v2")
-	for _, c := range []struct {
-		name, from string
-		waits      bool
-	}{{"fresh install", v1, true}, {"current", v1, false}, {"update", v2, true}, {"current again", v2, false}} {
-		reset()
-		s.mustRun("--from", c.from)
-		if len(probes) != 1 || (probes[0] >= 60*time.Millisecond) != c.waits {
-			t.Fatalf("%s: probes %v, want a delayed probe: %v", c.name, probes, c.waits)
+	for i := 1; i < len(probes)-1; i++ { // the last pause may be cut short by the deadline
+		if gap := probes[i].Sub(probes[i-1]); gap < pause {
+			t.Fatalf("probes %d and %d are only %v apart", i-1, i, gap)
 		}
 	}
+	answer = func(nth int) bool { return true }
 	reset()
-	s.mustRun("--rollback")
-	if len(probes) != 1 || probes[0] < 60*time.Millisecond {
-		t.Fatalf("rollback: probes %v", probes)
+	if !waitForRelay(time.Hour) || len(probes) != 1 || probes[0].Sub(start) < pause {
+		t.Fatalf("a relay that started: %d probes", len(probes))
 	}
-	reset()
-	if _, code := s.run("--check", "--from", v2); code != 1 || len(probes) != 1 {
-		t.Fatalf("--check: exit %d, probes %v", code, probes)
+
+	// Through host setup. The fake relay is "running" only from the second
+	// probe of a run, so a run that waits for a restarted relay makes two
+	// probes and passes, while a run that restarts nothing makes exactly one
+	// and reports the relay down. The wait is far longer than any run.
+	hostSetupRelayWait = time.Hour
+	answer = func(nth int) bool { return nth >= 2 }
+	v1, v2 := s.artifact("tt-v1"), s.artifact("tt-v2")
+	for _, c := range []struct {
+		name  string
+		args  []string
+		waits bool
+	}{
+		{"fresh install", []string{"--from", v1}, true},
+		{"current", []string{"--from", v1}, false},
+		{"update", []string{"--from", v2}, true},
+		{"current again", []string{"--from", v2}, false},
+		{"rollback", []string{"--rollback"}, true},
+		{"check", []string{"--check", "--from", v1}, false},
+	} {
+		reset()
+		out, code := s.run(c.args...)
+		if c.waits {
+			if code != 0 || len(probes) != 2 || probes[0].Sub(start) < pause || probes[1].Sub(probes[0]) < pause {
+				t.Fatalf("%s: exit %d, %d probes; want a wait and two spaced probes:\n%s", c.name, code, len(probes), out)
+			}
+		} else if code != 1 || len(probes) != 1 || !strings.Contains(out, "failed: relay") {
+			t.Fatalf("%s: exit %d, %d probes; want one immediate probe and no wait:\n%s", c.name, code, len(probes), out)
+		}
 	}
 }
