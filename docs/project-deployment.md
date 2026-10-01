@@ -118,8 +118,9 @@ Conflict or ref race before publication is refused without a blocked project
 fence; post-publication failures still retain the existing rollback/recovery gates.
 The daemon skips an unclaimable verified job and continues to later jobs rather
 than exiting; it never skips a real claimed/merged/blocked project fence. It
-names such a fence in a notice when a later job waits behind it, and only the
-handler's set-aside frees a claimed fence without a reconcile.
+names such a fence in a notice when a later job waits behind it. Besides
+reconcile, a claimed fence is freed only by its own run's refusal before
+publication or by the handler's set-aside.
 
 The live probe contract checks exact commit/artifact identity, integrity,
 containers, hub response and completed migrations; Mini adds relay status and new
@@ -303,6 +304,12 @@ handler-only and moves it aside:
   fence and use `reconcile`.
 - At least one `verified` job must be queued after it; otherwise it would only
   claim the same job again.
+- No host release lock names the job's claim (its job id, agent and run). The
+  hub cannot see the host, so the handler checks this when it inspects the host.
+  Set-aside clears the job's run, after which no reconcile record matches that
+  lock and the next job's release would find the host locked. Such a holder (for
+  example a deployer stopped mid-run) keeps the fence and uses `reconcile` with
+  the lock digest once its run has stopped.
 - `RECORD` is the typed reconcile record with `disposition: "set_aside"`. It binds
   the job id, the claim's exact agent/run and pause generation, the incident bug,
   incident digest, stop and last-action times, stop reason, cause, contributing
@@ -325,9 +332,12 @@ When a job holds the fence and a later job is `verified`, the deployer posts one
 notice per holder, waiting job and reason: it names the holding job, why it holds
 the fence (waiting for an integrated verification import, waiting for inputs,
 blocked, merged, or claimed by another deployer run) and the waiting job. For a
-claim with no effects it says the handler can set it aside; otherwise it says the
-job keeps the fence until handler reconciliation. Its request id is
-`HOLDER-fence-wait-WAITING-REASON`, so a restart's resend returns the original.
+claim with no effects it says the handler can set it aside, unless the host
+release lock names that claim's run (or cannot be read): then it says the job
+keeps the fence and needs reconcile with the lock digest after that run stops,
+and its request id ends in `-locked`. Any other holder keeps the fence until
+handler reconciliation. Its request id is `HOLDER-fence-wait-WAITING-REASON`, so
+a restart's resend returns the original.
 
 ### Probes and rollback programs
 
@@ -459,9 +469,10 @@ deployer with the rest of the project; resuming then needs provisioning again.
 journal or lock by hand.
 
 **Set aside.** When a fence-wait notice says a claim with no effects blocks a
-later job, the handler, under a recorded order, sets it aside with `tt deployment
-set-aside` and a typed record (above); no deployer stop, hand release or
-supersede is needed. The deployer claims the waiting job at its next poll.
+later job, the handler, under a recorded order, first confirms no host release
+lock names that claim, then sets it aside with `tt deployment set-aside` and a
+typed record (above); no deployer stop, hand release or supersede is needed. A
+locked claim goes through **Reconcile** instead. The deployer claims the waiting job at its next poll.
 
 **Manual rollback, per target.**
 - hub or bridge: `python3 scripts/deploy-truenas-hub.py --rollback-to PRIOR_RELEASE

@@ -169,11 +169,13 @@ export async function liveCheck(adapter, target, policy, sleep=ms=>new Promise(r
 // Adapter operations receive nonsecret job/artifact references. Neither captured
 // subprocess output nor arbitrary error strings are put into journal/receipt;
 // a failed target step records only the tagged reason failureReason allows.
+// One host release lock per deployment checkout and project.
+const hostLockPath=(cwd,job)=>join(tmpdir(),"tailterm-release-locks",digest(cwd+"\0"+(job.taskId||"fixture"))+".lock");
 export async function runRelease(config, adapter) {
   const {cwd,job,baselines,journalPath}=config;
   const policy={startupMs:60000,failures:3,intervalMs:5000,relayCleanMs:30000,...config.testPolicy};
   if(!job || !(["claimed","merged"].includes(job.state)) || !sha(job.commit) || !/^[a-f0-9]{64}$/.test(job.verificationDigest||""))throw new Error("Claimed verified job required");
-  const lock=join(tmpdir(),"tailterm-release-locks",digest(cwd+"\0"+(job.taskId||"fixture"))+".lock");mkdirSync(dirname(lock),{recursive:true,mode:0o700});
+  const lock=hostLockPath(cwd,job);mkdirSync(dirname(lock),{recursive:true,mode:0o700});
   let fd;try{fd=openSync(lock,"wx",0o600);}catch{throw new Error("Release host locked; inspect prior execution");}
   writeFileSync(fd,JSON.stringify({jobId:job.id,agentId:job.agentId,runId:job.runId}));fsyncSync(fd);
   let state={version:1,jobId:job.id,commit:job.commit,agentId:job.agentId,runId:job.runId,phase:"prepared",effects:[]};
@@ -560,19 +562,31 @@ const FENCE_REASONS={waiting_matrix:"is waiting for the handler to import integr
 // The notice for a job that holds the project fence while a later job waits:
 // null when nothing waits. Only a claim with no effects (unpublished, no
 // receipt, no inputs binding) can be set aside; any other holder keeps the
-// fence. The request id omits generations, which every fence check bumps.
-export function fenceWaitNotice(jobs,holder,reason){
+// fence. A claim whose run still names the host release lock (locked) keeps it
+// too: set-aside clears the job's run, after which no reconcile record can
+// match the lock, and the next job would find the host locked. The request id
+// omits generations, which every fence check bumps.
+export function fenceWaitNotice(jobs,holder,reason,locked=false){
   const waiting=jobs.find(j=>j.id!==holder?.id && j.state==="verified");
   if(!holder || !waiting || !FENCE_REASONS[reason])return null;
   const noEffects=holder.state==="claimed" && holder.published!==true && !holder.receipt && !holder.inputsDigest;
-  return {requestId:`${holder.id}-fence-wait-${waiting.id}-${reason}`,waitingJobId:waiting.id,subject:"A release job is waiting behind a held project fence",
-    text:`Release ${holder.id} holds the project release fence and ${FENCE_REASONS[reason]}; release ${waiting.id} is queued behind it. ${noEffects?"It has no release effects; the handler can move it aside with tt deployment set-aside so the waiting job claims the fence.":"It keeps the fence until handler reconciliation."}`};
+  const advice=!noEffects?"It keeps the fence until handler reconciliation.":locked?"It keeps the fence: the host release lock names its run, so the handler reconciles it with the lock digest after that run stops.":"It has no release effects; the handler can move it aside with tt deployment set-aside so the waiting job claims the fence.";
+  return {requestId:`${holder.id}-fence-wait-${waiting.id}-${reason}${noEffects&&locked?"-locked":""}`,waitingJobId:waiting.id,subject:"A release job is waiting behind a held project fence",
+    text:`Release ${holder.id} holds the project release fence and ${FENCE_REASONS[reason]}; release ${waiting.id} is queued behind it. ${advice}`};
+}
+// Whether the host release lock names this job's exact claim. An unreadable
+// lock counts as naming it: set-aside is never suggested on doubt.
+export function hostLockNames(cwd,job){
+  const lock=hostLockPath(cwd,job);
+  if(!existsSync(lock))return false;
+  try{const record=JSON.parse(readFileSync(lock,"utf8"));return record?.jobId===job.id && record.agentId===job.agentId && record.runId===job.runId;}
+  catch{return true;}
 }
 export function reconcileHostLocks(config,jobs){
   for(const job of jobs){
     const r=job.reconciliations?.at(-1);
     if(!r?.lockDigest || !r.noActiveExecution || !r.refResolved || !["no_effects","restored"].includes(r.journalState) || !["verified","refused"].includes(job.state))continue;
-    const lock=join(tmpdir(),"tailterm-release-locks",digest(config.cwd+"\0"+(job.taskId||"fixture"))+".lock");
+    const lock=hostLockPath(config.cwd,job);
     if(!existsSync(lock) || fileDigest(lock)!==r.lockDigest)continue;
     const record=JSON.parse(readFileSync(lock,"utf8"));
     if(record.jobId===job.id && record.agentId===r.agentId && record.runId===r.runId)rmSync(lock);
@@ -602,7 +616,8 @@ export async function serveDeployment(config,{once=false,signal,configPath,relea
   // hub returns the original for a restart's identical resend.
   const posted=new Set();
   const notify=(reader,jobs,holder,reason)=>{
-    const notice=fenceWaitNotice(jobs,holder,reason);
+    let locked=true;try{locked=hostLockNames(config.cwd,holder);}catch{}
+    const notice=fenceWaitNotice(jobs,holder,reason,locked);
     if(!notice || posted.has(notice.requestId))return;
     try{reader.command([config.tt||"tt","send","--kind","notice","--subject",notice.subject,"--text",notice.text,"--request-id",notice.requestId,"--ref",`release-job=${holder.id}`,"--ref",`waiting-job=${notice.waitingJobId}`]);posted.add(notice.requestId);}
     catch{process.stderr.write("Fence wait notice not posted; the next poll retries.\n");}
