@@ -277,6 +277,9 @@ def hub_compose(deployment: dict[str, Any], binary_destination: str) -> dict[str
     environment = {
         "TAILTERM_TCP_LISTEN": "0.0.0.0:18765",
         "TAILTERM_STATE": "/state",
+        # The container is read-only with no tmpfs, so SQLite keeps its temp
+        # files (a table-rebuild migration needs one) on the writable mount.
+        "SQLITE_TMPDIR": "/state",
         "TAILTERM_TOKEN_FILE": "/run/hub-token",
         "TAILTERM_MAX_AGENTS": "32",
     }
@@ -307,6 +310,7 @@ def hub_compose(deployment: dict[str, Any], binary_destination: str) -> dict[str
                 "TAILTERM_HUB_URL": "http://hub:18765",
                 "TAILTERM_BRIDGE_TOKEN_FILE": "/run/bridge-token",
                 "TAILTERM_BRIDGE_STATE": "/state",
+                "SQLITE_TMPDIR": "/state",
                 "DISCORD_TOKEN_FILE": "/run/discord-token",
                 "DISCORD_GUILD_ID": deployment["discordGuildId"],
                 "DISCORD_APPLICATION_ID": deployment["discordApplicationId"],

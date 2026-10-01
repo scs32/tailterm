@@ -733,6 +733,7 @@ test("optional Discord helper fields need the bridge and reach the bridge enviro
     "TAILTERM_HUB_URL",
     "TAILTERM_BRIDGE_TOKEN_FILE",
     "TAILTERM_BRIDGE_STATE",
+    "SQLITE_TMPDIR",
     "DISCORD_TOKEN_FILE",
     "DISCORD_GUILD_ID",
     "DISCORD_APPLICATION_ID",
@@ -743,6 +744,22 @@ test("optional Discord helper fields need the bridge and reach the bridge enviro
   assert.equal("discordHelperTask" in absent.expected, false);
   assert.equal("discordHelperChannelId" in absent.expected, false);
   assert.deepEqual(absent.compose.services.hub, both.compose.services.hub, "the hub service does not change");
+
+  // The containers are read-only with no tmpfs, so SQLite's temp files (a
+  // table-rebuild migration needs one) go to each service's writable /state.
+  const alone = run({});
+  assert.equal(alone.error, undefined);
+  assert.equal(alone.compose.services["discord-bridge"], undefined);
+  for (const compose of [alone.compose, absent.compose, both.compose]) {
+    for (const service of Object.values(compose.services)) {
+      assert.equal(service.environment.SQLITE_TMPDIR, "/state");
+      assert.ok(service.volumes.some((volume) => /:\/state$/.test(volume)), "/state is a writable mount");
+      assert.equal(service.read_only, true);
+      assert.equal(service.tmpfs, undefined);
+    }
+  }
+  assert.equal(alone.compose.services.hub.mem_limit, "512m");
+  assert.equal(both.compose.services["discord-bridge"].mem_limit, "256m");
 
   const taskAlone = run({ ...bridge, discordHelperTask: helper.discordHelperTask });
   const aloneEnv = taskAlone.compose.services["discord-bridge"].environment;
