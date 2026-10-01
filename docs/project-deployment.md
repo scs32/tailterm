@@ -433,7 +433,9 @@ a restart's resend returns the original.
   binary, whose bytes give `artifactSHA256` and whose Go build info gives
   `commit` and `integrity` (`vcs.modified=false`). `containersRunning` comes from
   `app.get_instance`; `hubResponds` (and `migrationsApplied`, since the hub
-  listens only after migrating) from `tt projects`. Output adds `release`.
+  listens only after migrating) from `tt projects`. Output adds `release`,
+  `waitedMs` and `polls`, and `capture` when the readiness window (below) ends
+  not ready.
 - `live mini --config PRIVATE`: the installed `tt` hash and build info,
   `relayRunning` from `launchctl print gui/UID/LABEL`, and `newErrors` counted
   in the relay log after the offset the runner saves at deploy
@@ -443,8 +445,9 @@ a restart's resend returns the original.
   `rollback mini [--expect-sha SHA]`, `rollback tailos --expect-commit SHA`:
   `{restored, databaseWritesPreserved}`. Hub/bridge are restored when the live
   release and hash equal the expected prior values; database writes are preserved
-  when the state mount is unchanged and the hub responds. `rollback tailos` adds
-  `lastCommit` (the last 40-hex commit read, or null) and `waitedMs`.
+  when the state mount is unchanged and the hub responds. `rollback hub|bridge`
+  adds `waitedMs` and `polls`, and `capture` when it ends not ready. `rollback
+  tailos` adds `lastCommit` (the last 40-hex commit read, or null) and `waitedMs`.
 
 **TailOS switch window.** After `wrangler pages deploy`, Cloudflare's custom
 domain keeps serving the previous deployment for a few seconds, so one read
@@ -465,6 +468,61 @@ does not carry them: `tt deployment finish` keeps only the known receipt fields,
 and the pending-receipt recovery compares the journal's receipt with the hub's.
 The pinned rollback probe argv from `release-inputs.mjs` has no `--config`, so
 the automated TailOS rollback uses the default 90 s window.
+
+**Hub and bridge readiness window.** A TrueNAS app restart, and the hub's
+migrations on a large database, take longer than one read, so the hub and bridge
+live and rollback probes wait for the app. The mounted release, its hash and
+build info are read once and still fail the probe if unreadable. Then
+`containersRunning` (`app.get_instance`) and `hubResponds` (`tt projects`) are
+polled 5 s apart, 20 s timeout per command, until both hold or
+`targets.hub.readyWindowMs` / `targets.bridge.readyWindowMs` ends (default
+240000; an integer from 0 to 300000, where 0 means one read). A readiness read
+that fails counts as not ready. The probe reports `waitedMs` and `polls`. An
+invalid `readyWindowMs` makes the probe exit 1 and stops the deployer at start,
+before any `tt deployment list` or claim. Both pinned probe commands carry
+`--config`, so the configured window applies to the automated rollback too, and
+a rollback probe run by hand waits the same window.
+
+- Budget: a probe is one runner command with a 600 s timeout. At the 300 s cap
+  the worst case is the window, one last poll (2 x 20 s) and the capture (45 s),
+  about 385 s plus the identity reads; at the default it is about 325 s.
+- Live check: a probe that waited and is still not ready fails the live check
+  once (`check` returns `readiness`, which `liveCheck` does not retry), so a
+  failed hub takes one window before rollback starts, not three. A probe that
+  exits 1 keeps the generic `liveCheck` retry.
+- Rollback: the rollback probe waits the same window before it reports
+  `restored: false`, so a hub that comes up late is `restored`, not `blocked`.
+  A wrong release, hash, build or state mount is not waited on: it is read once.
+- Journal: the effect's `liveCheck` and `rollbackCheck` hold `{waitedMs, polls}`
+  for hub and bridge, plus `capture` when the probe ended not ready. If the
+  rollback program itself fails, the target is not restored, and the rollback
+  probe still runs once so `rollbackCheck` records what the app looked like.
+
+**What is captured.** When a hub or bridge probe ends not ready, `capture` holds:
+
+- `app`: the `state` and, for up to 8 containers, `{service, state, id}` (id cut
+  to 12 hex) from `app.get_instance`, or `"unavailable"` when it cannot be read.
+  Nothing else from that call is kept (no `config`, `portals`, `notes`, volumes
+  or ports).
+- `logs`: for up to 4 containers, `{service, lines}` with the newest 40 lines
+  from `midclt subscribe -n 40 -t 8 app.container_log_follow` (read as the
+  probe's SSH user; `docker logs` would need sudo), or `{service, unavailable}`
+  with one of `log read failed`, `no log lines`, `invalid container id` (only a
+  64-hex id is placed in a command) or `time budget` (the capture has used 45 s).
+  Each log command has a 15 s timeout.
+- Each line has control characters removed, then is redacted and cut to 300
+  characters. Redacted, in order: every environment value of 6 or more
+  characters from `app.config`; `Bearer` values and `token`, `secret`,
+  `password`, `passwd`, `authorization` or `api key` followed by `=` or `:` and
+  a value; and any run of 24 or more of `A-Za-z0-9+/_=.-` with both a letter and
+  a digit (this also hides commit hashes and container ids).
+
+The capture is best effort: it runs after the verdict is fixed and cannot change
+it, the exit status or `waitedMs`. The runner reduces whatever the probe printed
+to this shape and redacts it again before saving it, only in the private job
+journal (`effects[].liveCheck.capture`, `effects[].rollbackCheck.capture`). It
+reaches neither the hub receipt nor any message. Limitation: a container that
+has already exited may return no log lines.
 
 A probe failure prints nothing and exits 1. When a target step fails, the
 journal's `failure` field keeps the first one as `{step, target, reason}`: step
@@ -495,8 +553,8 @@ cwd              dedicated detached tasks-hub worktree
 journalDirectory 0700 directory for journals, manifests, receipts, retained artifacts
 tt               installed tt path
 baselines        {hub, bridge, mini, tailos}: probed live commits at provisioning
-targets.hub      {host: "truenas", liveProbe: [...]}
-targets.bridge   {host: "truenas", liveProbe: [...]}
+targets.hub      {host: "truenas", liveProbe: [...], readyWindowMs (optional, 0-300000, default 240000)}
+targets.bridge   {host: "truenas", liveProbe: [...], readyWindowMs (optional, 0-300000, default 240000)}
 targets.mini     {installPath, relayRestart: [...], relayLog, relayLabel, liveProbe: [...]}
 targets.tailos   {url (optional), switchWindowMs (optional, 0-300000, default 90000)}
 inputs.planTemplate  path to the handler's last TrueNAS preflight plan (template)
