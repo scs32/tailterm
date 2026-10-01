@@ -1,0 +1,26 @@
+Mutation f4: restores the behaviour before f3b1c19 ("fix(hub): let the owner resolve a follow-ups review disposition"),
+whose parent, the pre-fix commit, is dbe99b6.
+owner-accept resolved only an owner-decision disposition, so a follow-ups disposition recorded before verification left no acceptance path.
+Evidence only: TestDeliveryLifecycle must fail with this applied (see ../fails-before.md).
+Apply from the repository root with git apply; never commit it applied.
+
+diff --git a/hub/internal/store/review_convergence.go b/hub/internal/store/review_convergence.go
+index 960fad5..2294c3e 100644
+--- a/hub/internal/store/review_convergence.go
++++ b/hub/internal/store/review_convergence.go
+@@ -507,13 +507,8 @@ func (s *Store) applyReviewConvergence(ctx context.Context, tx *sql.Tx, m api.Me
+ 		if len(state.Rounds) == 0 || state.Rounds[len(state.Rounds)-1].ResultSeq == 0 {
+ 			return reviewConflict("completed review required for disposition")
+ 		}
+-		if ownerAccept && (state.Disposition == nil || (state.Disposition.Kind != "owner-decision" && state.Disposition.Kind != "follow-ups")) {
+-			return reviewConflict("owner-accept resolves an owner-decision or follow-ups disposition")
+-		}
+-		if ownerAccept && state.Disposition.Kind == "follow-ups" {
+-			if err = verificationReady(ctx, tx, item, meta.Candidate); err != nil {
+-				return err
+-			}
++		if ownerAccept && (state.Disposition == nil || state.Disposition.Kind != "owner-decision") {
++			return reviewConflict("owner-accept resolves an owner-decision disposition")
+ 		}
+ 		if state.Disposition != nil && !ownerAccept {
+ 			return reviewConflict("disposition already recorded")

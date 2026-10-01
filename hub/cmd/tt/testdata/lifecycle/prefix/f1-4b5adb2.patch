@@ -1,0 +1,64 @@
+Mutation f1: restores the behaviour before 4b5adb2 ("fix(hub): let the owner resolve an owner-decision review disposition"),
+whose parent, the pre-fix commit, is 7ab5100.
+An owner-decision disposition had no owner resolution: owner-accept was an unknown disposition and completion took only a lead accept.
+Evidence only: TestDeliveryLifecycle must fail with this applied (see ../fails-before.md).
+Apply from the repository root with git apply; never commit it applied.
+
+diff --git a/hub/internal/store/review_convergence.go b/hub/internal/store/review_convergence.go
+index 960fad5..a9f0557 100644
+--- a/hub/internal/store/review_convergence.go
++++ b/hub/internal/store/review_convergence.go
+@@ -327,15 +327,12 @@ func reviewCompletion(ctx context.Context, tx *sql.Tx, item api.WorkItem, candid
+ 		}
+ 		return nil
+ 	}
+-	if state.Disposition == nil || (state.Disposition.Kind != "accept" && state.Disposition.Kind != "owner-accept") {
++	if state.Disposition == nil || state.Disposition.Kind != "accept" {
+ 		return reviewConflict("saved lead acceptance required")
+ 	}
+ 	if candidate != "" && candidate != state.Disposition.Candidate {
+ 		return reviewConflict("acceptance candidate mismatch")
+ 	}
+-	if state.Disposition.Kind == "owner-accept" {
+-		return nil // the owner explicitly accepted this exact candidate
+-	}
+ 	return reviewReady(state, item.ScopeRevision, state.Disposition.Candidate)
+ }
+ 
+@@ -489,33 +486,16 @@ func (s *Store) applyReviewConvergence(ctx context.Context, tx *sql.Tx, m api.Me
+ 		if e.Kind != "notice" {
+ 			return reviewConflict("disposition requires NOTICE")
+ 		}
+-		// owner-accept is the owner's own resolution of an owner-decision or
+-		// follow-ups disposition: it binds one exact candidate and never comes
+-		// from an agent. Resolving follow-ups also requires the candidate's
+-		// independent verification to be ready, as an ordinary accept does.
+-		ownerAccept := meta.Disposition == "owner-accept"
+-		if ownerAccept {
+-			if req.AgentID != "" || req.RunID != "" {
+-				return reviewConflict("owner-accept requires an owner-authored notice")
+-			}
+-		} else if err = reviewLead(ctx, tx, m.TaskID, item.ID, req.AgentID, req.RunID); err != nil {
++		if err = reviewLead(ctx, tx, m.TaskID, item.ID, req.AgentID, req.RunID); err != nil {
+ 			return err
+ 		}
+-		if meta.Disposition != "accept" && meta.Disposition != "owner-decision" && meta.Disposition != "follow-ups" && !ownerAccept {
++		if meta.Disposition != "accept" && meta.Disposition != "owner-decision" && meta.Disposition != "follow-ups" {
+ 			return reviewConflict("unknown disposition")
+ 		}
+ 		if len(state.Rounds) == 0 || state.Rounds[len(state.Rounds)-1].ResultSeq == 0 {
+ 			return reviewConflict("completed review required for disposition")
+ 		}
+-		if ownerAccept && (state.Disposition == nil || (state.Disposition.Kind != "owner-decision" && state.Disposition.Kind != "follow-ups")) {
+-			return reviewConflict("owner-accept resolves an owner-decision or follow-ups disposition")
+-		}
+-		if ownerAccept && state.Disposition.Kind == "follow-ups" {
+-			if err = verificationReady(ctx, tx, item, meta.Candidate); err != nil {
+-				return err
+-			}
+-		}
+-		if state.Disposition != nil && !ownerAccept {
++		if state.Disposition != nil {
+ 			return reviewConflict("disposition already recorded")
+ 		}
+ 		if meta.Disposition == "accept" {

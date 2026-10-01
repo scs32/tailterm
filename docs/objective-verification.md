@@ -560,6 +560,55 @@ between a check starting and its group reaching the file, and the children of
 a preparatory test-binary build are not recorded, so a runner killed during
 that build is recovered while a build child may still be running.
 
+## Delivery lifecycle test
+
+`TestDeliveryLifecycle` in `hub/cmd/tt/lifecycle_e2e_test.go` drives one
+synthetic item through the real store, the real HTTP server and the `tt`
+command entry points, from queue add to its release job. It exists so a hub
+change that breaks the delivery path fails `go test` before a team meets it
+live.
+
+```sh
+cd hub && go test ./cmd/tt -run '^TestDeliveryLifecycle' -count=1 -v
+```
+
+Each of its two subtests logs its steps in order: queue add (refused until the
+handler confirms the scope), launch after `tasks-hub` moved, review round one
+with a blocker, the one-line fix, round two resolving that blocker and filing a
+follow-up, the lead's disposition while verification is pending, a full-size
+receipt (69 checks, three attempts each, over the shared 64 KiB request limit),
+the owner's `owner-accept`, the done save, queue acceptance on the newer base,
+and the release job. Between them the subtests cover a plan that names the
+builder worktree and one that names the repository root, a `follow-ups` and an
+`owner-decision` disposition, and both acceptance paths: the handler's done
+save carrying the acceptance, and the owner's done save followed by
+`tt team queue accept`.
+
+Acceptance creates the release job in the same transaction. The test therefore
+expects exactly one verified job for the accepted commit, and expects a later
+`tt deployment enqueue` of that entry to be refused because the entry already
+has a release job, with a refusal that says to recover the original request
+receipt.
+
+It runs with no check of its own. The matrix rule for `hub/` selects the `go`
+group, whose `go-test` check runs `go test ./...` in `hub`, so any change under
+`hub/internal/store`, `hub/internal/server` or `hub/cmd/tt` runs it.
+`TestDeliveryLifecycleIsInTheVerificationMatrix` fails if that rule goes away.
+`go-race` runs it only when `hub/cmd/tt` itself changed.
+
+Limits:
+
+- The team is launched by a stub spawn that registers each member with its
+  bound context. No agent runtime or tmux session starts.
+- It stops at the enqueued release job. The deployer's claim, the matrix on the
+  integrated commit and the deploy are not covered.
+- The hub, repository, logs and matrix digest are fixtures under the test's
+  temporary directories. Nothing reads a live hub, task or token.
+
+`hub/cmd/tt/testdata/lifecycle/fails-before.md` records, once, that the test
+fails when each of the five fixes it guards is taken out again. The patches
+beside it are that evidence; no test applies them.
+
 ## AIV mapping boundary
 
 `verification/receipt.schema.json` documents native v1. `operationKey` survives

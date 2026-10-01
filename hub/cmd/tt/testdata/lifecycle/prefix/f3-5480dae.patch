@@ -1,0 +1,39 @@
+Mutation f3: restores the behaviour before 5480dae ("Accept verified queue teams on their verified base and worktree"),
+whose parent, the pre-fix commit, is 9c99ddc.
+Queue acceptance required the plan to name the entry's .git directory and bound the queue-time base, so a team verified on the moved base, or whose plan named the builder worktree, was refused.
+Evidence only: TestDeliveryLifecycle must fail with this applied (see ../fails-before.md).
+Apply from the repository root with git apply; never commit it applied.
+
+diff --git a/hub/internal/store/releases.go b/hub/internal/store/releases.go
+index 61b6340..152eedc 100644
+--- a/hub/internal/store/releases.go
++++ b/hub/internal/store/releases.go
+@@ -304,7 +304,7 @@ func releaseCandidate(ctx context.Context, tx *sql.Tx, task, entry string) (api.
+ 		return e, p, r, err
+ 	}
+ 	plan, receipt := currentVerification(records)
+-	if plan == nil || receipt == nil || plan.Commit != e.Acceptance.Commit || !verifiedRepository(plan.Repository, *e.Acceptance) || plan.BaseCommit != e.Acceptance.BaseCommit || plan.ScopeRevision != item.ScopeRevision || e.Acceptance.ItemRevision != item.Revision || item.Status != "done" {
++	if plan == nil || receipt == nil || plan.Commit != e.Acceptance.Commit || plan.Repository != e.Acceptance.Repository || plan.BaseCommit != e.Acceptance.BaseCommit || plan.ScopeRevision != item.ScopeRevision || e.Acceptance.ItemRevision != item.Revision || item.Status != "done" {
+ 		return e, p, r, releaseConflict("exact accepted SHA and current verification required")
+ 	}
+ 	if err = verificationEligible(*plan, *receipt); err != nil {
+diff --git a/hub/internal/store/team_queue.go b/hub/internal/store/team_queue.go
+index 143037c..279fe3b 100644
+--- a/hub/internal/store/team_queue.go
++++ b/hub/internal/store/team_queue.go
+@@ -2607,14 +2607,10 @@ func acceptTeamQueueEntry(ctx context.Context, tx *sql.Tx, task string, e *api.T
+ 	// may name the repository (its .git directory or its root) or the
+ 	// exact candidate worktree, which tt has already resolved to this
+ 	// entry's repository.
+-	if required && (verificationPlan == nil || !verifiedRepository(verificationPlan.Repository, candidate) || (candidate.BaseCommit != e.BaseCommit && candidate.BaseCommit != verificationPlan.BaseCommit)) {
++	if required && (verificationPlan == nil || verificationPlan.Repository != candidate.Repository || verificationPlan.BaseCommit != candidate.BaseCommit) {
+ 		return verificationConflict("acceptance repository/base mismatch")
+ 	}
+ 	base := e.BaseCommit
+-	if required {
+-		base = verificationPlan.BaseCommit
+-		candidate.BaseCommit = base
+-	}
+ 	if err = reviewCompletion(ctx, tx, item, candidate.Commit); err != nil {
+ 		return err
+ 	}

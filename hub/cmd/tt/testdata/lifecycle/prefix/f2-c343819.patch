@@ -1,0 +1,19 @@
+Mutation f2: restores the behaviour before c343819 ("Allow full verification receipts on the verification route"),
+whose parent, the pre-fix commit, is 8b1f4d4.
+The verification route used the shared 64 KiB request limit, so a full matrix receipt was refused.
+Evidence only: TestDeliveryLifecycle must fail with this applied (see ../fails-before.md).
+Apply from the repository root with git apply; never commit it applied.
+
+diff --git a/hub/internal/server/verification.go b/hub/internal/server/verification.go
+index 7c420a2..0741954 100644
+--- a/hub/internal/server/verification.go
++++ b/hub/internal/server/verification.go
+@@ -11,7 +11,7 @@ func (s *Server) saveVerification(w http.ResponseWriter, r *http.Request) {
+ 		return
+ 	}
+ 	var req api.VerificationRequest
+-	if !decodeScopeLimited(w, r, &req, api.MaxVerificationBody) {
++	if !decodeScope(w, r, &req) {
+ 		return
+ 	}
+ 	out, err := s.store.SaveVerification(r.Context(), r.PathValue("id"), r.PathValue("wid"), req)

@@ -1,0 +1,22 @@
+Mutation f5: restores the behaviour before 0ce60c0 ("fix(hub): treat a repository root and its .git directory as one repository"),
+whose parent, the pre-fix commit, is f3b1c19.
+A plan naming the repository root (the directory holding .git) was not the entry's repository.
+Evidence only: TestDeliveryLifecycle must fail with this applied (see ../fails-before.md).
+Apply from the repository root with git apply; never commit it applied.
+
+diff --git a/hub/internal/store/team_queue.go b/hub/internal/store/team_queue.go
+index 143037c..728b3b4 100644
+--- a/hub/internal/store/team_queue.go
++++ b/hub/internal/store/team_queue.go
+@@ -2563,10 +2563,7 @@ func queueScopeAuthority(ctx context.Context, tx *sql.Tx, task string, e api.Tea
+ func verifiedRepository(planRepository string, a api.TeamIntegrationAcceptance) bool {
+ 	plan := filepath.Clean(planRepository)
+ 	repository := filepath.Clean(a.Repository)
+-	if plan == repository || plan == filepath.Clean(a.Worktree) {
+-		return true
+-	}
+-	return filepath.Base(repository) == ".git" && plan == filepath.Dir(repository)
++	return plan == repository || plan == filepath.Clean(a.Worktree)
+ }
+ 
+ // acceptTeamQueueEntry records the exact handler's integration acceptance on a
