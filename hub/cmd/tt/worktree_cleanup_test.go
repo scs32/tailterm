@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -55,10 +56,16 @@ func newCleanupRepo(t *testing.T) cleanupRepo {
 	t.Setenv("GIT_CONFIG_GLOBAL", os.DevNull)
 	t.Setenv("GIT_CONFIG_NOSYSTEM", "1")
 	t.Setenv("TAILTERM_RELAY_STATE", t.TempDir())
+	t.Setenv("TAILTERM_ARTIFACTS", "")
+	t.Setenv("TAILTERM_ARTIFACT_ACCEPTED_AFTER", "")
 	root, err := filepath.EvalSymlinks(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
 	}
+	// Session temp is a fake tree too; the host's real one is never read.
+	realTempRoot := claudeTempRoot
+	claudeTempRoot = func() string { return filepath.Join(root, "tmp", "claude-501") }
+	t.Cleanup(func() { claudeTempRoot = realTempRoot })
 	main := filepath.Join(root, "repo")
 	if err := os.MkdirAll(main, 0755); err != nil {
 		t.Fatal(err)
@@ -1045,4 +1052,1066 @@ func TestWorktreeCleanupRestoresPermissionsWhenRemovalFails(t *testing.T) {
 		t.Fatalf("permissions not restored: %v %v", info.Mode(), err)
 	}
 	requireExists(t, w, true)
+}
+
+// Verifier checkouts under the artifacts tree and session temp folders. The
+// artifacts root is the fixture repository's sibling, <repo>-artifacts, and
+// the temp root is <fixture>/tmp/claude-501.
+
+const (
+	artifactItemA = "wi_a1a1a1a1a1a1a1a1"
+	artifactItemB = "wi_b2b2b2b2b2b2b2b2"
+	artifactItemC = "wi_c3c3c3c3c3c3c3c3"
+)
+
+func (r cleanupRepo) artifacts() string { return r.main + "-artifacts" }
+
+func (r cleanupRepo) tempRoot() string { return filepath.Join(r.root, "tmp", "claude-501") }
+
+// ignoreBuildOutput makes node_modules, dist and test-results ignored on
+// tasks-hub, as they are in the real repository.
+func (r cleanupRepo) ignoreBuildOutput(t *testing.T) {
+	t.Helper()
+	writeFixtureFile(t, filepath.Join(r.main, ".gitignore"), ".build/\nnode_modules/\ndist/\ntest-results/\n")
+	cleanupGit(t, r.main, "add", ".gitignore")
+	cleanupGit(t, r.main, "commit", "-q", "-m", "ignore build output")
+}
+
+// verifierCheckout adds a detached checkout of tasks-hub under the item's
+// artifact folder, with ignored build output inside it.
+func (r cleanupRepo) verifierCheckout(t *testing.T, item, name string) string {
+	t.Helper()
+	path := filepath.Join(r.artifacts(), item, name)
+	cleanupGit(t, r.main, "worktree", "add", "-q", "--detach", path, "tasks-hub")
+	writeFixtureFile(t, filepath.Join(path, "node_modules", "left-pad", "index.js"), "module.exports = 1\n")
+	writeFixtureFile(t, filepath.Join(path, "dist", "app.js"), "built\n")
+	return path
+}
+
+func releasedArtifactEntry(item string) api.TeamQueueEntry {
+	return api.TeamQueueEntry{ID: "tqe_rel_" + item[3:7], ItemID: item, State: "finished", Position: 1, UpdatedAt: "2026-10-01T10:00:00Z",
+		Acceptance: &api.TeamIntegrationAcceptance{AcceptedAt: "2026-10-01T09:00:00Z"}, Release: &api.ReleaseJob{State: "released"}}
+}
+
+func acceptedArtifactEntry(item string, at time.Time) api.TeamQueueEntry {
+	return api.TeamQueueEntry{ID: "tqe_acc_" + item[3:7], ItemID: item, State: "finished", Position: 1,
+		Acceptance: &api.TeamIntegrationAcceptance{AcceptedAt: at.UTC().Format(time.RFC3339Nano)}}
+}
+
+// artifactSweep runs one cleanup pass with the artifact rules on.
+func (r cleanupRepo) artifactSweep(t *testing.T, in worktreeCleanupInputs) map[string]worktreeDecision {
+	t.Helper()
+	in.Repo = r.main
+	if in.Now.IsZero() {
+		in.Now = time.Now()
+	}
+	if in.Items == nil {
+		in.Items = map[string]artifactItemState{}
+	}
+	in.MeasureBytes = true
+	in.Receipt = worktreeCleanupReceipt{Source: "sweep"}
+	decisions, err := cleanupWorktrees(context.Background(), in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := map[string]worktreeDecision{}
+	for _, d := range decisions {
+		out[d.Path] = d
+	}
+	return out
+}
+
+func readFixtureFiles(t *testing.T, paths ...string) map[string]string {
+	t.Helper()
+	out := map[string]string{}
+	for _, p := range paths {
+		data, err := os.ReadFile(p)
+		if err != nil {
+			t.Fatalf("%s should still exist: %v", p, err)
+		}
+		out[p] = string(data)
+	}
+	return out
+}
+
+func readArtifactManifest(t *testing.T, path string) artifactManifest {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var m artifactManifest
+	if err := json.Unmarshal(data, &m); err != nil {
+		t.Fatalf("manifest %q: %v", data, err)
+	}
+	return m
+}
+
+// fixtureTree lists every file below the roots with its size and mode, so a
+// dry run can be shown to change nothing.
+func fixtureTree(t *testing.T, roots ...string) string {
+	t.Helper()
+	var lines []string
+	for _, root := range roots {
+		_ = filepath.WalkDir(root, func(p string, d os.DirEntry, err error) error {
+			if err != nil {
+				return nil
+			}
+			info, err := os.Lstat(p)
+			if err != nil {
+				return nil
+			}
+			size := info.Size()
+			if d.IsDir() {
+				size = 0
+			}
+			lines = append(lines, p+" "+info.Mode().String()+" "+strconv.FormatInt(size, 10))
+			return nil
+		})
+	}
+	sort.Strings(lines)
+	return strings.Join(lines, "\n")
+}
+
+// Item state table: running wins, then the newest finished entry decides,
+// and an item with no usable record has no state.
+func TestWorktreeCleanupArtifactItemStates(t *testing.T) {
+	at := time.Date(2026, 10, 1, 9, 0, 0, 0, time.UTC)
+	accepted := func(id, item string, pos int64) api.TeamQueueEntry {
+		q := acceptedArtifactEntry(item, at)
+		q.ID, q.Position = id, pos
+		return q
+	}
+	entries := []api.TeamQueueEntry{
+		{ID: "tqe_run", ItemID: "wi_0000000000000001", State: "running"},
+		{ID: "tqe_fail", ItemID: "wi_0000000000000002", State: "failed"},
+		{ID: "tqe_released", ItemID: "wi_0000000000000003", State: "finished", Release: &api.ReleaseJob{State: "released"}},
+		{ID: "tqe_published", ItemID: "wi_0000000000000004", State: "finished", Release: &api.ReleaseJob{State: "blocked", Published: true}},
+		{ID: "tqe_owner", ItemID: "wi_0000000000000005", State: "finished", OwnerIntegration: &api.TeamQueueOwnerIntegration{At: "2026-10-01T08:00:00Z"}},
+		accepted("tqe_accepted", "wi_0000000000000006", 1),
+		{ID: "tqe_verified", ItemID: "wi_0000000000000007", State: "finished", Release: &api.ReleaseJob{State: "verified"}},
+		{ID: "tqe_dismissed", ItemID: "wi_0000000000000008", State: "failed", ReleasedAt: "2026-10-01T08:00:00Z"},
+		// A retry: the first try was released, the second is still running.
+		{ID: "tqe_retry_old", ItemID: "wi_0000000000000009", State: "finished", Position: 1, Release: &api.ReleaseJob{State: "released"}},
+		{ID: "tqe_retry_new", ItemID: "wi_0000000000000009", State: "queued", Position: 2},
+		// A retry whose newer try is accepted only: the newest decides, in
+		// either listing order.
+		accepted("tqe_again_new", "wi_000000000000000a", 2),
+		{ID: "tqe_again_old", ItemID: "wi_000000000000000a", State: "finished", Position: 1, Release: &api.ReleaseJob{State: "released"}},
+		{ID: "tqe_bad_time", ItemID: "wi_000000000000000b", State: "finished", Acceptance: &api.TeamIntegrationAcceptance{AcceptedAt: "yesterday"}},
+		accepted("tqe_agent", "wi_000000000000000c", 1),
+	}
+	agents := []api.Agent{
+		{ID: "agt_closed", Name: "verifier", Status: api.AgentClosed, WorkItem: &api.AgentWorkItemBinding{ItemID: "wi_0000000000000006"}},
+		{ID: "agt_open", Name: "reviewer", Status: "done", WorkItem: &api.AgentWorkItemBinding{ItemID: "wi_000000000000000c"}},
+		{ID: "agt_unbound", Name: "handler", Status: "running"},
+	}
+	got := artifactItemStates(entries, agents)
+	want := map[string]string{
+		"wi_0000000000000001": artifactItemRunning,
+		"wi_0000000000000002": artifactItemRunning,
+		"wi_0000000000000003": artifactItemReleased,
+		"wi_0000000000000004": artifactItemReleased,
+		"wi_0000000000000005": artifactItemReleased,
+		"wi_0000000000000006": artifactItemAccepted,
+		"wi_0000000000000009": artifactItemRunning,
+		"wi_000000000000000a": artifactItemAccepted,
+		"wi_000000000000000c": artifactItemRunning,
+	}
+	if len(got) != len(want) {
+		t.Fatalf("states %+v", got)
+	}
+	for item, state := range want {
+		if got[item].State != state {
+			t.Fatalf("%s: got %+v, want %s", item, got[item], state)
+		}
+	}
+	if st := got["wi_0000000000000006"]; !st.At.Equal(at) || st.EntryID != "tqe_accepted" {
+		t.Fatalf("accepted state %+v", st)
+	}
+	if st := got["wi_0000000000000005"]; st.BasisAt != "2026-10-01T08:00:00Z" {
+		t.Fatalf("owner-integrated state %+v", st)
+	}
+	if st := got["wi_000000000000000c"]; !strings.Contains(st.Detail, "agent reviewer is done") {
+		t.Fatalf("agent detail %+v", st)
+	}
+}
+
+// T1: a released item's detached checkout is deleted whole; the receipts,
+// logs and plan file beside it are byte-identical and a manifest joins them.
+func TestWorktreeCleanupArtifactCheckoutRemovedAfterRelease(t *testing.T) {
+	r := newCleanupRepo(t)
+	r.ignoreBuildOutput(t)
+	checkout := r.verifierCheckout(t, artifactItemA, "verifier-abc1234")
+	head := cleanupGit(t, checkout, "rev-parse", "HEAD")
+	itemDir := filepath.Dir(checkout)
+	receipt := filepath.Join(itemDir, "verifier-abc1234-logs", "receipt.json")
+	plan := filepath.Join(itemDir, "plan-abc1234.json")
+	setup := filepath.Join(itemDir, "setup-abc1234.out")
+	// A sibling's path and the bare checkout directory are not citations.
+	writeFixtureFile(t, receipt, `{"log":"`+checkout+`-logs/matrix.log","checkout":"`+checkout+`"}`+"\n")
+	writeFixtureFile(t, plan, `{"cwd":"`+checkout+`"}`+"\n")
+	writeFixtureFile(t, setup, "npm ci in "+checkout+"/node_modules\n")
+	before := readFixtureFiles(t, receipt, plan, setup)
+	items := artifactItemStates([]api.TeamQueueEntry{releasedArtifactEntry(artifactItemA)}, nil)
+	manifest := checkout + ".removed.json"
+
+	dry := r.artifactSweep(t, worktreeCleanupInputs{Items: items})
+	d := requireDecision(t, dry, checkout, "would-remove", "")
+	if d.Kind != kindArtifactCheckout || d.Bytes <= 0 || d.Detail != "item "+artifactItemA+" released" {
+		t.Fatalf("dry decision %+v", d)
+	}
+	requireExists(t, checkout, true)
+	requireExists(t, manifest, false)
+	if receipts := readCleanupReceipts(t); len(receipts) != 0 {
+		t.Fatalf("dry run wrote receipts %+v", receipts)
+	}
+
+	got := r.artifactSweep(t, worktreeCleanupInputs{Items: items, Apply: true})
+	d = requireDecision(t, got, checkout, "removed", "")
+	if d.Kind != kindArtifactCheckout || d.Manifest != manifest || d.Bytes <= 0 {
+		t.Fatalf("removed decision %+v", d)
+	}
+	requireExists(t, checkout, false)
+	if strings.Contains(cleanupGit(t, r.main, "worktree", "list"), checkout) {
+		t.Fatal("git still lists the removed checkout")
+	}
+	after := readFixtureFiles(t, receipt, plan, setup)
+	for p, content := range before {
+		if after[p] != content {
+			t.Fatalf("%s changed: %q", p, after[p])
+		}
+	}
+	info, err := os.Stat(manifest)
+	if err != nil || info.Mode().Perm() != 0600 {
+		t.Fatalf("manifest mode %v %v", info, err)
+	}
+	m := readArtifactManifest(t, manifest)
+	if m.Version != 1 || m.At == "" || m.Source != "sweep" || m.ItemID != artifactItemA || m.EntryID != "tqe_rel_a1a1" || m.Path != checkout || m.Head != head ||
+		m.PinnedRef != "" || m.Basis != artifactItemReleased || m.BasisAt != "2026-10-01T10:00:00Z" || m.Bytes != d.Bytes || m.Files < 4 {
+		t.Fatalf("manifest %+v", m)
+	}
+	entries := map[string]artifactManifestEntry{}
+	for _, e := range m.Entries {
+		entries[e.Name] = e
+	}
+	if e := entries["node_modules"]; e.Tracked || e.Files != 1 || e.Bytes <= 0 {
+		t.Fatalf("node_modules entry %+v", e)
+	}
+	if e := entries["dist"]; e.Tracked || e.Bytes <= 0 {
+		t.Fatalf("dist entry %+v", e)
+	}
+	if e := entries["app.txt"]; !e.Tracked || e.Files != 1 {
+		t.Fatalf("app.txt entry %+v", e)
+	}
+	var lines []worktreeCleanupReceipt
+	for _, rec := range readCleanupReceipts(t) {
+		if rec.Kind == kindArtifactCheckout {
+			lines = append(lines, rec)
+		}
+	}
+	if len(lines) != 1 || lines[0].Path != checkout || lines[0].Action != "removed" || lines[0].Manifest != manifest || lines[0].Bytes != d.Bytes || lines[0].Head != head {
+		t.Fatalf("artifact receipts %+v", lines)
+	}
+	// The commit is on tasks-hub, so nothing was pinned.
+	if refs := cleanupGit(t, r.main, "for-each-ref", "refs/tailterm/"); refs != "" {
+		t.Fatalf("unexpected pinned refs: %s", refs)
+	}
+}
+
+// T2: an accepted item keeps its checkout until the acceptance is N old.
+func TestWorktreeCleanupArtifactCheckoutAcceptedWaitsForRetention(t *testing.T) {
+	r := newCleanupRepo(t)
+	r.ignoreBuildOutput(t)
+	checkout := r.verifierCheckout(t, artifactItemA, "verifier-abc1234")
+	now := time.Now()
+	items := artifactItemStates([]api.TeamQueueEntry{acceptedArtifactEntry(artifactItemA, now.Add(-time.Hour))}, nil)
+	before := fixtureTree(t, r.artifacts())
+
+	got := r.artifactSweep(t, worktreeCleanupInputs{Items: items, Apply: true, AcceptedAfter: 24 * time.Hour, Now: now})
+	d := requireDecision(t, got, checkout, "kept", keepRetention)
+	if d.Detail != "accepted 1h ago; eligible after 24h" || d.Kind != kindArtifactCheckout {
+		t.Fatalf("retention decision %+v", d)
+	}
+	if after := fixtureTree(t, r.artifacts()); after != before {
+		t.Fatalf("a kept checkout changed the artifacts tree:\n%s", after)
+	}
+	// A shorter N makes the same acceptance old enough.
+	short := r.artifactSweep(t, worktreeCleanupInputs{Items: items, AcceptedAfter: 30 * time.Minute, Now: now})
+	requireDecision(t, short, checkout, "would-remove", "")
+
+	got = r.artifactSweep(t, worktreeCleanupInputs{Items: items, Apply: true, AcceptedAfter: 24 * time.Hour, Now: now.Add(25 * time.Hour)})
+	requireDecision(t, got, checkout, "removed", "")
+	requireExists(t, checkout, false)
+	if m := readArtifactManifest(t, checkout+".removed.json"); m.Basis != artifactItemAccepted || m.BasisAt == "" || m.Bytes <= 0 {
+		t.Fatalf("manifest %+v", m)
+	}
+}
+
+// T3: a running item's checkout is kept although its commit is on tasks-hub,
+// whether an entry is active or a bound agent is not closed.
+func TestWorktreeCleanupArtifactCheckoutRunningItemKept(t *testing.T) {
+	r := newCleanupRepo(t)
+	r.ignoreBuildOutput(t)
+	byEntry := r.verifierCheckout(t, artifactItemA, "verifier-abc1234")
+	byAgent := r.verifierCheckout(t, artifactItemB, "verifier-def5678")
+	running := api.TeamQueueEntry{ID: "tqe_running_t3", ItemID: artifactItemA, State: "running", Position: 2}
+	items := artifactItemStates(
+		[]api.TeamQueueEntry{releasedArtifactEntry(artifactItemA), running, releasedArtifactEntry(artifactItemB)},
+		[]api.Agent{{ID: "agt_t3", Name: "verifier-t3", Status: "running", Host: "elsewhere", WorkItem: &api.AgentWorkItemBinding{ItemID: artifactItemB}}})
+	got := r.artifactSweep(t, worktreeCleanupInputs{Items: items, Apply: true})
+	d := requireDecision(t, got, byEntry, "kept", keepItemActive)
+	if !strings.Contains(d.Detail, "tqe_running_t3 is running") {
+		t.Fatalf("entry detail %q", d.Detail)
+	}
+	d = requireDecision(t, got, byAgent, "kept", keepItemActive)
+	if !strings.Contains(d.Detail, "agent verifier-t3 is running") {
+		t.Fatalf("agent detail %q", d.Detail)
+	}
+	for _, p := range []string{byEntry, byAgent} {
+		requireExists(t, filepath.Join(p, "node_modules", "left-pad", "index.js"), true)
+		requireExists(t, p+".removed.json", false)
+	}
+}
+
+// T4: a checkout holding a file that queue evidence, a receipt file, a plan
+// file or a tracked document refers to is kept whole, in every spelling the
+// evidence patterns produce; a mention of the directory or a sibling is not
+// a reference.
+func TestWorktreeCleanupArtifactCheckoutReferencedEvidenceKept(t *testing.T) {
+	r := newCleanupRepo(t)
+	r.ignoreBuildOutput(t)
+	// The fixture root stands in for the home directory, so "~" spellings
+	// reach the artifacts tree.
+	t.Setenv("HOME", r.root)
+	type citedCase struct {
+		name   string
+		item   string
+		source string
+		cite   func(t *testing.T, checkout string) []api.TeamQueueEntry
+	}
+	home := func(p string) string { return "~" + strings.TrimPrefix(p, r.root) }
+	short := func(p string) string { return strings.TrimPrefix(p, "/private") }
+	cases := []citedCase{
+		{"queue acceptance evidence, absolute", "wi_e000000000000001", "queue entry tqe_cite_1 acceptance evidence", func(t *testing.T, checkout string) []api.TeamQueueEntry {
+			return []api.TeamQueueEntry{{ID: "tqe_cite_1", Acceptance: &api.TeamIntegrationAcceptance{Evidence: "report: " + checkout + "/test-results/out.txt."}}}
+		}},
+		{"owner integration evidence, home", "wi_e000000000000002", "queue entry tqe_cite_2 owner integration evidence", func(t *testing.T, checkout string) []api.TeamQueueEntry {
+			return []api.TeamQueueEntry{{ID: "tqe_cite_2", OwnerIntegration: &api.TeamQueueOwnerIntegration{Evidence: "see " + home(checkout) + "/test-results/out.txt"}}}
+		}},
+		{"receipt file, without /private", "wi_e000000000000003", "receipt.json", func(t *testing.T, checkout string) []api.TeamQueueEntry {
+			writeFixtureFile(t, filepath.Join(filepath.Dir(checkout), "verifier-abc1234-logs", "receipt.json"), `{"output":"`+short(checkout)+`/test-results/out.txt"}`)
+			return nil
+		}},
+		{"plan file, home", "wi_e000000000000004", "plan-abc1234.json", func(t *testing.T, checkout string) []api.TeamQueueEntry {
+			writeFixtureFile(t, filepath.Join(filepath.Dir(checkout), "plan-abc1234.json"), `{"checks":[{"output":"`+home(checkout)+`/test-results/out.txt"}]}`)
+			return nil
+		}},
+		{"verification plan file, missing tail", "wi_e000000000000005", "verification-plan-abc1234.json", func(t *testing.T, checkout string) []api.TeamQueueEntry {
+			writeFixtureFile(t, filepath.Join(filepath.Dir(checkout), "verification-plan-abc1234.json"), `{"dir":"`+checkout+`/test-results/later run/trace.zip"}`)
+			return nil
+		}},
+		{"tracked document", "wi_e000000000000006", "docs/release.md", func(t *testing.T, checkout string) []api.TeamQueueEntry {
+			writeFixtureFile(t, filepath.Join(r.main, "docs", "release.md"), "Evidence: `"+checkout+"/test-results/out.txt`.\n")
+			cleanupGit(t, r.main, "add", "docs/release.md")
+			cleanupGit(t, r.main, "commit", "-q", "-m", "cite a checkout file")
+			return nil
+		}},
+	}
+	var entries []api.TeamQueueEntry
+	checkouts := map[string]string{}
+	for _, tc := range cases {
+		checkout := r.verifierCheckout(t, tc.item, "verifier-abc1234")
+		writeFixtureFile(t, filepath.Join(checkout, "test-results", "out.txt"), "kept output\n")
+		entries = append(entries, releasedArtifactEntry(tc.item))
+		entries = append(entries, tc.cite(t, checkout)...)
+		checkouts[tc.name] = checkout
+	}
+	// Cited only by a sibling's path, by the bare directory and by a file
+	// that is not in the checkout: removed.
+	uncited := r.verifierCheckout(t, artifactItemA, "verifier-abc1234")
+	writeFixtureFile(t, filepath.Join(filepath.Dir(uncited), "verifier-abc1234-logs", "receipt.json"), `{"log":"`+uncited+`-logs/x.log","cwd":"`+uncited+`","gone":"`+uncited+`/coverage/none.txt"}`)
+	entries = append(entries, releasedArtifactEntry(artifactItemA),
+		api.TeamQueueEntry{ID: "tqe_cite_dir", Acceptance: &api.TeamIntegrationAcceptance{Evidence: "matrix ran in " + uncited + " with logs in " + uncited + "-logs/x.log"}})
+	_, evidence := worktreeProtection("fixture", entries, nil)
+
+	got := r.artifactSweep(t, worktreeCleanupInputs{Items: artifactItemStates(entries, nil), Evidence: evidence, Apply: true})
+	for _, tc := range cases {
+		checkout := checkouts[tc.name]
+		d := requireDecision(t, got, checkout, "kept", keepEvidence)
+		if !strings.Contains(d.Detail, tc.source) || !strings.Contains(d.Detail, "test-results") {
+			t.Fatalf("%s: detail %q lacks source %q or the cited path", tc.name, d.Detail, tc.source)
+		}
+		if data, err := os.ReadFile(filepath.Join(checkout, "test-results", "out.txt")); err != nil || string(data) != "kept output\n" {
+			t.Fatalf("%s: referenced file lost: %q %v", tc.name, data, err)
+		}
+		requireExists(t, filepath.Join(checkout, "node_modules", "left-pad", "index.js"), true)
+		requireExists(t, checkout+".removed.json", false)
+	}
+	requireDecision(t, got, uncited, "removed", "")
+	requireExists(t, uncited, false)
+	requireExists(t, uncited+".removed.json", true)
+}
+
+// T5: an untracked, non-ignored file keeps a released item's checkout.
+func TestWorktreeCleanupDirtyArtifactCheckoutKept(t *testing.T) {
+	r := newCleanupRepo(t)
+	r.ignoreBuildOutput(t)
+	checkout := r.verifierCheckout(t, artifactItemA, "verifier-abc1234")
+	writeFixtureFile(t, filepath.Join(checkout, "notes.txt"), "verifier notes\n")
+	items := artifactItemStates([]api.TeamQueueEntry{releasedArtifactEntry(artifactItemA)}, nil)
+	got := r.artifactSweep(t, worktreeCleanupInputs{Items: items, Apply: true})
+	requireDecision(t, got, checkout, "kept", keepDirty)
+	requireExists(t, filepath.Join(checkout, "notes.txt"), true)
+	requireExists(t, checkout+".removed.json", false)
+}
+
+// T6: a superseded candidate's checkout, whose commit no branch or remote
+// holds, is removed and its commit pinned so no receipt SHA can be collected.
+func TestWorktreeCleanupSupersededCandidatePinned(t *testing.T) {
+	r := newCleanupRepo(t)
+	r.ignoreBuildOutput(t)
+	checkout := r.verifierCheckout(t, artifactItemA, "verifier-abc1234")
+	writeFixtureFile(t, filepath.Join(checkout, "candidate.txt"), "superseded\n")
+	cleanupGit(t, checkout, "add", "candidate.txt")
+	cleanupGit(t, checkout, "commit", "-q", "-m", "superseded candidate")
+	head := cleanupGit(t, checkout, "rev-parse", "HEAD")
+	items := artifactItemStates([]api.TeamQueueEntry{releasedArtifactEntry(artifactItemA)}, nil)
+	ref := "refs/tailterm/retired/" + artifactItemA + "/verifier-abc1234"
+
+	requireDecision(t, r.artifactSweep(t, worktreeCleanupInputs{Items: items}), checkout, "would-remove", "")
+	if refs := cleanupGit(t, r.main, "for-each-ref", "refs/tailterm/"); refs != "" {
+		t.Fatalf("dry run pinned a ref: %s", refs)
+	}
+	got := r.artifactSweep(t, worktreeCleanupInputs{Items: items, Apply: true})
+	requireDecision(t, got, checkout, "removed", "")
+	requireExists(t, checkout, false)
+	if sha := cleanupGit(t, r.main, "rev-parse", ref); sha != head {
+		t.Fatalf("pinned ref %s, want %s", sha, head)
+	}
+	if m := readArtifactManifest(t, checkout+".removed.json"); m.PinnedRef != ref || m.Head != head {
+		t.Fatalf("manifest %+v", m)
+	}
+	cleanupGit(t, r.main, "worktree", "prune")
+	cleanupGit(t, r.main, "gc", "-q", "--prune=now")
+	cleanupGit(t, r.main, "cat-file", "-e", head+"^{commit}")
+
+	// A removal that then fails takes its manifest and its ref back.
+	second := r.verifierCheckout(t, artifactItemB, "verifier-def5678")
+	writeFixtureFile(t, filepath.Join(second, "candidate.txt"), "second\n")
+	cleanupGit(t, second, "add", "candidate.txt")
+	cleanupGit(t, second, "commit", "-q", "-m", "second superseded candidate")
+	original := worktreeGit
+	worktreeGit = func(ctx context.Context, dir string, args ...string) (string, error) {
+		if len(args) > 1 && args[0] == "worktree" && args[1] == "remove" {
+			return "", exec.Command("false").Run()
+		}
+		return original(ctx, dir, args...)
+	}
+	t.Cleanup(func() { worktreeGit = original })
+	got = r.artifactSweep(t, worktreeCleanupInputs{Items: artifactItemStates([]api.TeamQueueEntry{releasedArtifactEntry(artifactItemB)}, nil), Apply: true})
+	requireDecision(t, got, second, "kept", keepFailed)
+	requireExists(t, second, true)
+	requireExists(t, second+".removed.json", false)
+	if refs := cleanupGit(t, r.main, "for-each-ref", "--format=%(refname)", "refs/tailterm/"); refs != ref {
+		t.Fatalf("refs after a failed removal: %q", refs)
+	}
+}
+
+// T7: a worktree under the artifacts tree with a branch checked out is a
+// working checkout: the ordinary rules decide, even for a released item.
+func TestWorktreeCleanupBranchCheckoutUnderArtifactsUnchanged(t *testing.T) {
+	r := newCleanupRepo(t)
+	builder := r.branchWorktree(t, filepath.Join(r.artifacts(), artifactItemA, "builder"), "feat/artifact-builder")
+	items := artifactItemStates([]api.TeamQueueEntry{releasedArtifactEntry(artifactItemA)}, nil)
+	got := r.artifactSweep(t, worktreeCleanupInputs{Items: items, Apply: true})
+	d := requireDecision(t, got, builder, "kept", keepUnpushed)
+	if d.Kind != "" {
+		t.Fatalf("branch checkout treated as %q", d.Kind)
+	}
+	requireExists(t, builder, true)
+	// A detached worktree in a folder not named for an item is ordinary too.
+	other := filepath.Join(r.artifacts(), "verifier-75d72618", "checkout")
+	cleanupGit(t, r.main, "worktree", "add", "-q", "--detach", other, "tasks-hub")
+	got = r.artifactSweep(t, worktreeCleanupInputs{Items: items})
+	if d := requireDecision(t, got, other, "would-remove", ""); d.Kind != "" || !strings.Contains(d.Detail, "tasks-hub") {
+		t.Fatalf("non-item folder decision %+v", d)
+	}
+}
+
+// T8: an item with no queue record is never treated as released.
+func TestWorktreeCleanupArtifactCheckoutUnknownItemKept(t *testing.T) {
+	r := newCleanupRepo(t)
+	r.ignoreBuildOutput(t)
+	checkout := r.verifierCheckout(t, artifactItemA, "verifier-abc1234")
+	items := artifactItemStates([]api.TeamQueueEntry{releasedArtifactEntry(artifactItemB)}, nil)
+	got := r.artifactSweep(t, worktreeCleanupInputs{Items: items, Apply: true})
+	d := requireDecision(t, got, checkout, "kept", keepRetention)
+	if !strings.Contains(d.Detail, "no queue record") {
+		t.Fatalf("detail %q", d.Detail)
+	}
+	requireExists(t, checkout, true)
+	// With the artifact rules off it is an ordinary worktree, as before.
+	requireDecision(t, r.sweep(t, false, nil, nil), checkout, "would-remove", "")
+}
+
+// T9: when the manifest cannot be written nothing is removed.
+func TestWorktreeCleanupArtifactCheckoutManifestFailureKeepsCheckout(t *testing.T) {
+	r := newCleanupRepo(t)
+	r.ignoreBuildOutput(t)
+	checkout := r.verifierCheckout(t, artifactItemA, "verifier-abc1234")
+	writeFixtureFile(t, filepath.Join(checkout, "candidate.txt"), "superseded\n")
+	cleanupGit(t, checkout, "add", "candidate.txt")
+	cleanupGit(t, checkout, "commit", "-q", "-m", "superseded candidate")
+	itemDir := filepath.Dir(checkout)
+	if err := os.Chmod(itemDir, 0555); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(itemDir, 0755) })
+	items := artifactItemStates([]api.TeamQueueEntry{releasedArtifactEntry(artifactItemA)}, nil)
+	got := r.artifactSweep(t, worktreeCleanupInputs{Items: items, Apply: true})
+	d := requireDecision(t, got, checkout, "kept", keepFailed)
+	if !strings.Contains(d.Detail, "write manifest") {
+		t.Fatalf("detail %q", d.Detail)
+	}
+	requireExists(t, filepath.Join(checkout, "node_modules", "left-pad", "index.js"), true)
+	requireExists(t, filepath.Join(checkout, "app.txt"), true)
+	if !strings.Contains(cleanupGit(t, r.main, "worktree", "list"), checkout) {
+		t.Fatal("git no longer lists the kept checkout")
+	}
+	if refs := cleanupGit(t, r.main, "for-each-ref", "refs/tailterm/"); refs != "" {
+		t.Fatalf("a kept checkout left a pinned ref: %s", refs)
+	}
+}
+
+// T10: a closed team's session temp folder is removed with a receipt; a
+// folder in use, one sharing a key with a directory in use, the main
+// checkout's, one holding a kept worktree, a cited one, a recent one and a
+// symlink in the temp root all survive.
+func TestWorktreeCleanupSessionTemp(t *testing.T) {
+	r := newCleanupRepo(t)
+	root := r.tempRoot()
+	folder := func(cwd string) string { return filepath.Join(root, claudeScratchKey(cwd)) }
+	session := func(cwd string) string {
+		dir := folder(cwd)
+		writeFixtureFile(t, filepath.Join(dir, "0f6c-session", "scratchpad", "notes.md"), "scratch\n")
+		writeFixtureFile(t, filepath.Join(dir, "0f6c-session", "tasks", "b1.output"), strings.Repeat("x", 4096))
+		return dir
+	}
+	// The closed team's queue worktree is already gone.
+	closed := r.queuePath("queue-eeee0001")
+	closedTemp := session(closed)
+	live := r.queuePath("queue-eeee0002")
+	cleanupGit(t, r.main, "worktree", "add", "-q", "--detach", live, "tasks-hub")
+	liveTemp := session(live)
+	// "queue-eeee.0003" and "queue-eeee-0003" share one key.
+	sameKey := r.queuePath("queue-eeee.0003")
+	sameKeyInUse := r.queuePath("queue-eeee-0003")
+	sameKeyTemp := session(sameKey)
+	mainTemp := session(r.main)
+	nestedCwd := r.queuePath("queue-eeee0004")
+	nestedTemp := session(nestedCwd)
+	dirty := filepath.Join(nestedTemp, "0f6c-session", "scratchpad", "verify-dirty")
+	cleanupGit(t, r.main, "worktree", "add", "-q", "--detach", dirty, "tasks-hub")
+	writeFixtureFile(t, filepath.Join(dirty, "notes.txt"), "unsaved\n")
+	// A scratchpad worktree that goes in the same pass does not hold its folder.
+	clearedCwd := r.queuePath("queue-eeee0005")
+	clearedTemp := session(clearedCwd)
+	clean := filepath.Join(clearedTemp, "0f6c-session", "scratchpad", "verify-clean")
+	cleanupGit(t, r.main, "worktree", "add", "-q", "--detach", clean, "tasks-hub")
+	citedCwd := r.queuePath("queue-eeee0006")
+	citedTemp := session(citedCwd)
+	receiptCitedCwd := r.queuePath("queue-eeee0007")
+	receiptCitedTemp := session(receiptCitedCwd)
+	writeFixtureFile(t, filepath.Join(r.artifacts(), artifactItemB, "receipt.json"), `{"report":"`+receiptCitedTemp+`/0f6c-session/scratchpad/notes.md"}`)
+	// A symlink in the temp root that points outside it.
+	outside := filepath.Join(r.root, "outside")
+	writeFixtureFile(t, filepath.Join(outside, "keep.txt"), "outside the temp root\n")
+	linkCwd := r.queuePath("queue-eeee0008")
+	if err := os.Symlink(outside, folder(linkCwd)); err != nil {
+		t.Fatal(err)
+	}
+	// A directory that still exists outside every linked worktree is shared.
+	shared := filepath.Join(r.root, "other-project")
+	if err := os.MkdirAll(shared, 0755); err != nil {
+		t.Fatal(err)
+	}
+	sharedTemp := session(shared)
+	unlisted := session(r.queuePath("queue-eeee0009"))
+	// A gone directory whose key equals the main checkout's names the main
+	// checkout's shared folder, which is never attributed to a team.
+	mainAlias := filepath.Join(r.root, "repo.")
+	if claudeScratchKey(mainAlias+"x") == claudeScratchKey(r.main+"x") || sessionTempFolder(root, r.main, r.main) != "" || sessionTempFolder(root, r.main, "") != mainTemp {
+		t.Fatal("main checkout temp folder guard")
+	}
+	mainAlias = filepath.Join(filepath.Dir(r.root), filepath.Base(r.root)+".repo")
+	if claudeScratchKey(mainAlias) != claudeScratchKey(r.main) || sessionTempFolder(root, mainAlias, r.main) != "" {
+		t.Fatalf("a directory sharing the main checkout's key is not guarded: %s", mainAlias)
+	}
+
+	in := worktreeCleanupInputs{
+		TempRoot: root,
+		InUse:    []string{live, sameKeyInUse},
+		Evidence: []worktreeEvidence{{Source: "queue entry tqe_temp acceptance evidence", Text: "report at " + citedTemp + "/0f6c-session/scratchpad/notes.md"}},
+		TempCwds: []sessionTempCwd{{Path: closed, ItemID: artifactItemA}, {Path: closed, ItemID: artifactItemA}, {Path: live, ItemID: artifactItemA}, {Path: sameKey, ItemID: artifactItemA},
+			{Path: r.main, ItemID: artifactItemA}, {Path: nestedCwd, ItemID: artifactItemA}, {Path: clearedCwd, ItemID: artifactItemA}, {Path: citedCwd, ItemID: artifactItemA},
+			{Path: receiptCitedCwd, ItemID: artifactItemB}, {Path: linkCwd, ItemID: artifactItemA}, {Path: shared, ItemID: artifactItemA}, {Path: mainAlias, ItemID: artifactItemA}, {Path: "relative/cwd"}},
+	}
+	// The sweep's recent rule keeps a folder that changed within --min-idle.
+	recent := in
+	recent.MinIdle = time.Hour
+	d := requireDecision(t, r.artifactSweep(t, recent), closedTemp, "kept", keepRecent)
+	if d.Kind != kindSessionTemp {
+		t.Fatalf("recent decision %+v", d)
+	}
+
+	before := fixtureTree(t, root, outside)
+	dry := r.artifactSweep(t, in)
+	if d := requireDecision(t, dry, closedTemp, "would-remove", ""); d.Kind != kindSessionTemp || d.Bytes < 4096 {
+		t.Fatalf("dry decision %+v", d)
+	}
+	requireDecision(t, dry, clearedTemp, "would-remove", "")
+	if after := fixtureTree(t, root, outside); after != before {
+		t.Fatalf("dry run changed the temp tree:\n%s", after)
+	}
+	if receipts := readCleanupReceipts(t); len(receipts) != 0 {
+		t.Fatalf("dry run wrote receipts %+v", receipts)
+	}
+
+	in.Apply = true
+	got := r.artifactSweep(t, in)
+	d = requireDecision(t, got, closedTemp, "removed", "")
+	if d.Kind != kindSessionTemp || d.Bytes < 4096 {
+		t.Fatalf("removed decision %+v", d)
+	}
+	requireExists(t, closedTemp, false)
+	requireDecision(t, got, clean, "removed", "")
+	requireDecision(t, got, clearedTemp, "removed", "")
+	requireExists(t, clearedTemp, false)
+	requireDecision(t, got, liveTemp, "kept", keepInUse)
+	d = requireDecision(t, got, sameKeyTemp, "kept", keepInUse)
+	if !strings.Contains(d.Detail, sameKeyInUse) {
+		t.Fatalf("same-key detail %q", d.Detail)
+	}
+	requireDecision(t, got, dirty, "kept", keepDirty)
+	d = requireDecision(t, got, nestedTemp, "kept", keepNested)
+	if !strings.Contains(d.Detail, dirty) {
+		t.Fatalf("nested detail %q", d.Detail)
+	}
+	d = requireDecision(t, got, citedTemp, "kept", keepEvidence)
+	if !strings.Contains(d.Detail, "tqe_temp") {
+		t.Fatalf("evidence detail %q", d.Detail)
+	}
+	d = requireDecision(t, got, receiptCitedTemp, "kept", keepEvidence)
+	if !strings.Contains(d.Detail, "receipt.json") {
+		t.Fatalf("receipt evidence detail %q", d.Detail)
+	}
+	for _, p := range []string{mainTemp, folder(linkCwd), sharedTemp, unlisted} {
+		if d, ok := got[p]; ok {
+			t.Fatalf("%s should not be listed: %+v", p, d)
+		}
+	}
+	for _, p := range []string{liveTemp, sameKeyTemp, mainTemp, nestedTemp, citedTemp, receiptCitedTemp, sharedTemp, unlisted, filepath.Join(dirty, "notes.txt"), filepath.Join(outside, "keep.txt"), root} {
+		requireExists(t, p, true)
+	}
+	if info, err := os.Lstat(folder(linkCwd)); err != nil || info.Mode()&os.ModeSymlink == 0 {
+		t.Fatalf("symlink in the temp root changed: %v %v", info, err)
+	}
+	receipts := readCleanupReceipts(t)
+	rec, ok := receiptFor(receipts, closedTemp)
+	if !ok || rec.Kind != kindSessionTemp || rec.Action != "removed" || rec.Source != "sweep" || rec.Bytes < 4096 || rec.At == "" {
+		t.Fatalf("session temp receipt %+v %v", rec, ok)
+	}
+	if rec, ok := receiptFor(receipts, liveTemp); !ok || rec.Kind != kindSessionTemp || rec.Action != "kept" || rec.Reason != keepInUse {
+		t.Fatalf("kept session temp receipt %+v %v", rec, ok)
+	}
+	// The removal itself refuses anything that is not a real directory
+	// directly under the root.
+	for _, p := range []string{folder(linkCwd), outside, root, filepath.Join(liveTemp, "0f6c-session")} {
+		if err := removeSessionTemp(root, p); err == nil {
+			t.Fatalf("removeSessionTemp accepted %s", p)
+		}
+	}
+	requireExists(t, filepath.Join(outside, "keep.txt"), true)
+	requireExists(t, filepath.Join(liveTemp, "0f6c-session", "scratchpad", "notes.md"), true)
+}
+
+// T11: one runner tick removes a finished, released entry's verifier checkout
+// and its closed team's session temp folder, although its queue worktree is
+// already gone; an accepted, unreleased item keeps its checkout, a team with
+// an open agent keeps both, and the hub is never written.
+func TestWorktreeCleanupRunnerPrunesArtifactsAndTemp(t *testing.T) {
+	r := newCleanupRepo(t)
+	r.ignoreBuildOutput(t)
+	const host = "fixture"
+	const task = "tsk_c1ea0c1ea0c1ea0a"
+	head := cleanupGit(t, r.main, "rev-parse", "HEAD")
+	session := func(cwd string) string {
+		dir := filepath.Join(r.tempRoot(), claudeScratchKey(cwd))
+		writeFixtureFile(t, filepath.Join(dir, "5e55-session", "scratchpad", "notes.md"), "scratch\n")
+		return dir
+	}
+	entry := func(id, item, name string, acceptedAt time.Time) (api.TeamQueueEntry, string, string) {
+		cwd := r.queuePath(name)
+		q := api.TeamQueueEntry{ID: id, TaskID: task, ItemID: item, State: "finished", Host: host, Cwd: cwd, Repository: r.common, Position: 1,
+			Acceptance: &api.TeamIntegrationAcceptance{Repository: r.common, Worktree: cwd, Commit: head, AcceptedAt: acceptedAt.UTC().Format(time.RFC3339Nano)}}
+		return q, r.verifierCheckout(t, item, "verifier-abc1234"), session(cwd)
+	}
+	young := time.Now().Add(-time.Hour)
+	released, releasedCheckout, releasedTemp := entry("tqe_t11_released", artifactItemA, "queue-ffff0001", young)
+	released.Release = &api.ReleaseJob{State: "released"}
+	accepted, acceptedCheckout, acceptedTemp := entry("tqe_t11_accepted", artifactItemB, "queue-ffff0002", young)
+	open, openCheckout, openTemp := entry("tqe_t11_open", artifactItemC, "queue-ffff0003", young)
+	open.Release = &api.ReleaseJob{State: "released"}
+	runningCwd := r.queuePath("queue-ffff0004")
+	cleanupGit(t, r.main, "worktree", "add", "-q", "--detach", runningCwd, "tasks-hub")
+	running := api.TeamQueueEntry{ID: "tqe_t11_running", TaskID: task, ItemID: "wi_d4d4d4d4d4d4d4d4", State: "running", Host: host, Cwd: runningCwd}
+	runningTemp := session(runningCwd)
+	bound := func(id string, q api.TeamQueueEntry, status string) api.Agent {
+		return api.Agent{ID: id, Name: id, Host: host, Status: status, Cwd: q.Cwd, WorkItem: &api.AgentWorkItemBinding{ItemTaskID: task, ItemID: q.ItemID}}
+	}
+	hub := &cleanupHub{
+		byHost: api.TeamQueueList{Entries: []api.TeamQueueEntry{running}},
+		queues: map[string]api.TeamQueueList{task: {Entries: []api.TeamQueueEntry{released, accepted, open, running}}},
+		details: map[string]api.TaskDetail{task: {Task: api.Task{ID: task, Status: api.TaskOpen, PauseState: api.ProjectPausePaused}, Agents: []api.Agent{
+			bound("agt_t11_released", released, api.AgentClosed),
+			bound("agt_t11_accepted", accepted, api.AgentClosed),
+			bound("agt_t11_open", open, "done"),
+			bound("agt_t11_running", running, "running"),
+		}}},
+	}
+	server := httptest.NewServer(hub)
+	defer server.Close()
+	c, err := api.NewClient(server.URL, 5*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var stderr strings.Builder
+	restore := captureStderr(t, &stderr)
+	runner := teamRunner{worktrees: closeoutWorktrees}
+	err = runner.tick(context.Background(), env{hub: server.URL}, c, host)
+	restore()
+	if err != nil {
+		t.Fatal(err)
+	}
+	requireExists(t, releasedCheckout, false)
+	requireExists(t, releasedTemp, false)
+	manifest := releasedCheckout + ".removed.json"
+	if m := readArtifactManifest(t, manifest); m.Source != "closeout" || m.ItemID != artifactItemA || m.EntryID != released.ID || m.Basis != artifactItemReleased || m.Bytes <= 0 {
+		t.Fatalf("closeout manifest %+v", m)
+	}
+	// Accepted an hour ago: the checkout waits; the closed team's temp goes.
+	requireExists(t, acceptedCheckout, true)
+	requireExists(t, acceptedTemp, false)
+	// A bound agent is not closed: the item is active and its temp in use.
+	requireExists(t, openCheckout, true)
+	requireExists(t, openTemp, true)
+	requireExists(t, runningCwd, true)
+	requireExists(t, runningTemp, true)
+	receipts := readCleanupReceipts(t)
+	want := []struct {
+		path, entry, kind, action, reason string
+	}{
+		{releasedCheckout, released.ID, kindArtifactCheckout, "removed", ""},
+		{releasedTemp, released.ID, kindSessionTemp, "removed", ""},
+		{acceptedCheckout, accepted.ID, kindArtifactCheckout, "kept", keepRetention},
+		{acceptedTemp, accepted.ID, kindSessionTemp, "removed", ""},
+		{openCheckout, open.ID, kindArtifactCheckout, "kept", keepItemActive},
+		{openTemp, open.ID, kindSessionTemp, "kept", keepInUse},
+	}
+	for _, w := range want {
+		rec, ok := receiptFor(receipts, w.path)
+		if !ok || rec.Source != "closeout" || rec.EntryID != w.entry || rec.TaskID != task || rec.Kind != w.kind || rec.Action != w.action || rec.Reason != w.reason {
+			t.Fatalf("closeout receipt for %s: %+v %v", w.path, rec, ok)
+		}
+	}
+	if rec, _ := receiptFor(receipts, releasedCheckout); rec.Manifest != manifest || rec.Bytes <= 0 {
+		t.Fatalf("checkout receipt %+v", rec)
+	}
+	if rec, _ := receiptFor(receipts, releasedTemp); rec.Bytes <= 0 {
+		t.Fatalf("session temp receipt %+v", rec)
+	}
+	for _, p := range []string{runningCwd, runningTemp} {
+		if _, ok := receiptFor(receipts, p); ok {
+			t.Fatalf("closeout examined the running entry's %s", p)
+		}
+	}
+	for _, line := range []string{"removed " + releasedCheckout, "removed " + releasedTemp, "kept retention " + acceptedCheckout, "kept item-active " + openCheckout} {
+		if !strings.Contains(stderr.String(), line) {
+			t.Fatalf("stderr lacks %q: %q", line, stderr.String())
+		}
+	}
+	// Nothing of the released entry is left, so later looks cost no hub read
+	// and no Git call, even past the re-check interval.
+	closeoutWorktreeChecks.Delete(released.ID)
+	calls := countWorktreeGit(t)
+	requests, _ := hub.snapshot()
+	if err := closeoutWorktrees(context.Background(), c, host, hub.byHost, hub.queues[task], released); err != nil {
+		t.Fatal(err)
+	}
+	after, writes := hub.snapshot()
+	if len(after) != len(requests) || calls.Load() != 0 || len(writes) != 0 {
+		t.Fatalf("finished closeout still read: requests %v, git calls %d, writes %v", after[len(requests):], calls.Load(), writes)
+	}
+}
+
+// T12: the sweep command reports artifact checkouts and session temp with
+// sizes and changes nothing in a dry run; --apply removes exactly the dry
+// run's would-remove set; --json rows carry kind; a negative
+// --accepted-after is a usage error.
+func TestWorktreeCleanupSweepCommandArtifactsAndTemp(t *testing.T) {
+	r := newCleanupRepo(t)
+	r.ignoreBuildOutput(t)
+	host := spawn.Host()
+	const task = "tsk_c1ea0c1ea0c1ea0b"
+	head := cleanupGit(t, r.main, "rev-parse", "HEAD")
+	session := func(cwd string) string {
+		dir := filepath.Join(r.tempRoot(), claudeScratchKey(cwd))
+		writeFixtureFile(t, filepath.Join(dir, "5e55-session", "tasks", "b1.output"), strings.Repeat("y", 2048))
+		return dir
+	}
+	entry := func(id, item, name string) api.TeamQueueEntry {
+		cwd := r.queuePath(name)
+		return api.TeamQueueEntry{ID: id, TaskID: task, ItemID: item, State: "finished", Host: host, Cwd: cwd, Position: 1,
+			Acceptance: &api.TeamIntegrationAcceptance{Worktree: cwd, Commit: head, AcceptedAt: time.Now().Add(-2 * time.Hour).UTC().Format(time.RFC3339Nano)}}
+	}
+	released := entry("tqe_t12_released", artifactItemA, "queue-9999aaa1")
+	released.Release = &api.ReleaseJob{State: "blocked", Published: true}
+	accepted := entry("tqe_t12_accepted", artifactItemB, "queue-9999aaa2")
+	running := entry("tqe_t12_running", artifactItemC, "queue-9999aaa3")
+	running.State, running.Acceptance = "running", nil
+	releasedCheckout := r.verifierCheckout(t, artifactItemA, "verifier-abc1234")
+	acceptedCheckout := r.verifierCheckout(t, artifactItemB, "verifier-abc1234")
+	runningCheckout := r.verifierCheckout(t, artifactItemC, "verifier-abc1234")
+	writeFixtureFile(t, filepath.Join(r.artifacts(), artifactItemA, "verifier-abc1234-logs", "receipt.json"), `{"ok":true}`)
+	releasedTemp, acceptedTemp, runningTemp := session(released.Cwd), session(accepted.Cwd), session(running.Cwd)
+	hub := &cleanupHub{
+		tasks:   []api.Task{{ID: task, Status: api.TaskOpen}},
+		details: map[string]api.TaskDetail{task: {Task: api.Task{ID: task, Status: api.TaskOpen}}},
+		queues:  map[string]api.TeamQueueList{task: {Entries: []api.TeamQueueEntry{released, accepted, running}}},
+	}
+	server := httptest.NewServer(hub)
+	defer server.Close()
+	e := env{hub: server.URL}
+	state := func() string {
+		return fixtureTree(t, r.artifacts(), r.tempRoot(), relayDir()) + "\n" + cleanupGit(t, r.main, "worktree", "list", "--porcelain") + "\n" + cleanupGit(t, r.main, "for-each-ref")
+	}
+	before := state()
+
+	_, err := captureSweepStdout(t, func() error {
+		return cmdTeamQueueSweepWorktrees(e, []string{"--cwd", r.main, "--min-idle", "0s", "--accepted-after", "-1h"})
+	})
+	if err == nil || !strings.Contains(err.Error(), "usage: tt team queue sweep-worktrees") || !strings.Contains(err.Error(), "--accepted-after") || !strings.Contains(err.Error(), "--artifacts") {
+		t.Fatalf("negative --accepted-after error %v", err)
+	}
+
+	text, err := captureSweepStdout(t, func() error {
+		return cmdTeamQueueSweepWorktrees(e, []string{"--cwd", r.main, "--min-idle", "0s"})
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{
+		"would-remove " + releasedCheckout + " (artifact checkout; item " + artifactItemA + " released; ",
+		"would-remove " + releasedTemp + " (session temp; 2.0 KiB)",
+		"would-remove " + acceptedTemp + " (session temp; 2.0 KiB)",
+		"kept retention " + acceptedCheckout + ": accepted 2h ago; eligible after 24h",
+		"kept item-active " + runningCheckout + ": queue entry tqe_t12_running is running",
+		"kept in-use " + runningTemp,
+		"dry run: nothing changed",
+	} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("dry run output lacks %q:\n%s", want, text)
+		}
+	}
+	var dry worktreeSweepReport
+	out, err := captureSweepStdout(t, func() error {
+		return cmdTeamQueueSweepWorktrees(e, []string{"--cwd", r.main, "--min-idle", "0s", "--json", "--artifacts", r.artifacts()})
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal([]byte(out), &dry); err != nil {
+		t.Fatalf("json %q: %v", out, err)
+	}
+	if after := state(); after != before {
+		t.Fatalf("dry runs changed the fixture:\nbefore:\n%s\nafter:\n%s", before, after)
+	}
+	kinds := map[string]string{}
+	var wouldRemove []string
+	for _, d := range dry.Worktrees {
+		kinds[d.Path] = d.Kind
+		if d.Action == "would-remove" {
+			wouldRemove = append(wouldRemove, d.Path)
+			if d.Bytes <= 0 {
+				t.Fatalf("would-remove without size %+v", d)
+			}
+		}
+	}
+	for path, kind := range map[string]string{releasedCheckout: kindArtifactCheckout, acceptedCheckout: kindArtifactCheckout, runningCheckout: kindArtifactCheckout,
+		releasedTemp: kindSessionTemp, acceptedTemp: kindSessionTemp, runningTemp: kindSessionTemp} {
+		if kinds[path] != kind {
+			t.Fatalf("%s: kind %q, want %q in %s", path, kinds[path], kind, out)
+		}
+	}
+	sort.Strings(wouldRemove)
+	wantRemove := []string{releasedCheckout, releasedTemp, acceptedTemp}
+	sort.Strings(wantRemove)
+	if strings.Join(wouldRemove, ",") != strings.Join(wantRemove, ",") {
+		t.Fatalf("would-remove %v, want %v", wouldRemove, wantRemove)
+	}
+	if dry.Totals.Actions["would-remove"] != 3 || dry.Totals.Kept[keepRetention] != 1 || dry.Totals.Kept[keepItemActive] != 1 || dry.Totals.Kept[keepInUse] != 1 || dry.Totals.Bytes <= 4096 {
+		t.Fatalf("dry totals %+v", dry.Totals)
+	}
+	// --accepted-after shortens the wait for an accepted item.
+	out, err = captureSweepStdout(t, func() error {
+		return cmdTeamQueueSweepWorktrees(e, []string{"--cwd", r.main, "--min-idle", "0s", "--accepted-after", "1h"})
+	})
+	if err != nil || !strings.Contains(out, "would-remove "+acceptedCheckout+" (artifact checkout; item "+artifactItemB+" accepted 2h ago; ") {
+		t.Fatalf("--accepted-after 1h output %v:\n%s", err, out)
+	}
+	// An explicit zero means no wait, not the default.
+	out, err = captureSweepStdout(t, func() error {
+		return cmdTeamQueueSweepWorktrees(e, []string{"--cwd", r.main, "--min-idle", "0s", "--accepted-after", "0s"})
+	})
+	if err != nil || !strings.Contains(out, "would-remove "+acceptedCheckout+" (artifact checkout; ") {
+		t.Fatalf("--accepted-after 0s output %v:\n%s", err, out)
+	}
+	// An artifacts root elsewhere leaves these checkouts under the ordinary rules.
+	out, err = captureSweepStdout(t, func() error {
+		return cmdTeamQueueSweepWorktrees(e, []string{"--cwd", r.main, "--min-idle", "0s", "--artifacts", filepath.Join(r.root, "elsewhere")})
+	})
+	if err != nil || strings.Contains(out, "artifact checkout") || !strings.Contains(out, "would-remove "+runningCheckout+" (detached ") {
+		t.Fatalf("--artifacts elsewhere output %v:\n%s", err, out)
+	}
+	if after := state(); after != before {
+		t.Fatal("dry runs with flags changed the fixture")
+	}
+
+	text, err = captureSweepStdout(t, func() error {
+		return cmdTeamQueueSweepWorktrees(e, []string{"--cwd", r.main, "--min-idle", "0s", "--apply"})
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"removed " + releasedCheckout + " (artifact checkout; ", "removed " + releasedTemp + " (session temp; ", "removed " + acceptedTemp, "totals: removed=3 kept=3"} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("apply output lacks %q:\n%s", want, text)
+		}
+	}
+	for _, p := range wantRemove {
+		requireExists(t, p, false)
+	}
+	for _, p := range []string{acceptedCheckout, runningCheckout, runningTemp, filepath.Join(r.artifacts(), artifactItemA, "verifier-abc1234-logs", "receipt.json")} {
+		requireExists(t, p, true)
+	}
+	requireExists(t, releasedCheckout+".removed.json", true)
+	if _, writes := hub.snapshot(); len(writes) != 0 {
+		t.Fatalf("sweep wrote to the hub: %v", writes)
+	}
+}
+
+// The sweep reads every page of a project's queue history, so an old item
+// still has a queue record.
+func TestWorktreeCleanupSweepCommandReadsQueueHistoryPages(t *testing.T) {
+	r := newCleanupRepo(t)
+	r.ignoreBuildOutput(t)
+	const task = "tsk_c1ea0c1ea0c1ea0c"
+	checkout := r.verifierCheckout(t, artifactItemA, "verifier-abc1234")
+	old := releasedArtifactEntry(artifactItemA)
+	old.TaskID = task
+	var queries []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		var body any
+		switch req.URL.Path {
+		case "/v1/tasks":
+			body = api.TaskList{Tasks: []api.Task{{ID: task, Status: api.TaskOpen}}}
+		case "/v1/tasks/" + task:
+			body = api.TaskDetail{Task: api.Task{ID: task, Status: api.TaskOpen}}
+		case "/v1/tasks/" + task + "/team-queue":
+			queries = append(queries, req.URL.RawQuery)
+			page := api.TeamQueueList{Entries: []api.TeamQueueEntry{{ID: "tqe_newer", TaskID: task, ItemID: artifactItemB, State: "finished", Position: 9}}, History: &api.TeamQueueHistoryPage{Total: 2, Limit: 1, NextAfter: 9}}
+			if req.URL.Query().Get("after") == "9" {
+				page = api.TeamQueueList{Entries: []api.TeamQueueEntry{old}, History: &api.TeamQueueHistoryPage{Total: 2, Limit: 1}}
+			}
+			body = page
+		default:
+			http.NotFound(w, req)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(body)
+	}))
+	defer server.Close()
+	out, err := captureSweepStdout(t, func() error {
+		return cmdTeamQueueSweepWorktrees(env{hub: server.URL}, []string{"--cwd", r.main, "--min-idle", "0s"})
+	})
+	if err != nil || !strings.Contains(out, "would-remove "+checkout+" (artifact checkout; item "+artifactItemA+" released; ") {
+		t.Fatalf("paged sweep %v:\n%s", err, out)
+	}
+	if len(queries) != 2 || !strings.Contains(queries[1], "after=9") {
+		t.Fatalf("queue queries %v", queries)
+	}
+}
+
+func TestWorktreeCleanupArtifactHelpers(t *testing.T) {
+	r := newCleanupRepo(t)
+	checkout := filepath.Join(r.artifacts(), artifactItemA, "verifier-abc1234")
+	writeFixtureFile(t, filepath.Join(checkout, "test-results", "out.txt"), "x\n")
+	for text, want := range map[string]string{
+		"at " + checkout + "/test-results/out.txt":                          "test-results/out.txt",
+		"(" + checkout + "/test-results/out.txt).":                          "test-results/out.txt",
+		`{"p":"` + checkout + `/test-results/out.txt"}`:                     "test-results/out.txt",
+		checkout + "/test-results/missing.txt":                              "test-results",
+		checkout + "/test-results/":                                         "test-results",
+		checkout + "/../verifier-abc1234-logs/x.log":                        "",
+		checkout + "-logs/test-results/out.txt":                             "",
+		checkout + "/coverage/out.txt":                                      "",
+		checkout + " and " + checkout + "/":                                 "",
+		"dir " + checkout:                                                   "",
+		checkout + "/coverage/a then " + checkout + "/test-results/out.txt": "test-results/out.txt",
+	} {
+		if got := artifactCitation(checkout, r.main, text); got != want {
+			t.Fatalf("citation in %q: got %q, want %q", text, got, want)
+		}
+	}
+	for d, want := range map[time.Duration]string{24 * time.Hour: "24h", 90 * time.Minute: "1h30m", 25 * time.Minute: "25m", 10 * time.Second: "0m", 3*time.Hour + 20*time.Second: "3h"} {
+		if got := shortDuration(d); got != want {
+			t.Fatalf("shortDuration(%v) = %q, want %q", d, got, want)
+		}
+	}
+	linked := r.queuePath("queue-aaaa0020")
+	cleanupGit(t, r.main, "worktree", "add", "-q", "--detach", linked, "tasks-hub")
+	for repo, want := range map[string]string{r.common: r.main, r.main: r.main, linked: r.main, filepath.Join(r.root, "nowhere"): "", "": ""} {
+		if got := mainCheckoutGuess(repo); got != want {
+			t.Fatalf("mainCheckoutGuess(%q) = %q, want %q", repo, got, want)
+		}
+	}
+	if got := artifactsRootFor(r.main); got != r.artifacts() {
+		t.Fatalf("default artifacts root %q", got)
+	}
+	t.Setenv("TAILTERM_ARTIFACTS", filepath.Join(r.root, "elsewhere"))
+	if got := artifactsRootFor(r.main); got != filepath.Join(r.root, "elsewhere") {
+		t.Fatalf("overridden artifacts root %q", got)
+	}
+	t.Setenv("TAILTERM_ARTIFACT_ACCEPTED_AFTER", "90m")
+	if got := artifactAcceptedAfter(); got != 90*time.Minute {
+		t.Fatalf("accepted-after override %v", got)
+	}
+	t.Setenv("TAILTERM_ARTIFACT_ACCEPTED_AFTER", "0")
+	if got := artifactAcceptedAfter(); got != time.Nanosecond {
+		t.Fatalf("accepted-after zero %v", got)
+	}
+	var stderr strings.Builder
+	restore := captureStderr(t, &stderr)
+	t.Setenv("TAILTERM_ARTIFACT_ACCEPTED_AFTER", "-1h")
+	negative := artifactAcceptedAfter()
+	t.Setenv("TAILTERM_ARTIFACT_ACCEPTED_AFTER", "soon")
+	unparseable := artifactAcceptedAfter()
+	restore()
+	if negative != defaultArtifactAcceptedAfter || unparseable != defaultArtifactAcceptedAfter || strings.Count(stderr.String(), "TAILTERM_ARTIFACT_ACCEPTED_AFTER") != 1 {
+		t.Fatalf("bad accepted-after values gave %v %v, stderr %q", negative, unparseable, stderr.String())
+	}
+	if !holdsDetachedCheckout(filepath.Dir(linked)) || holdsDetachedCheckout(filepath.Join(r.artifacts(), artifactItemA)) {
+		t.Fatal("holdsDetachedCheckout")
+	}
 }

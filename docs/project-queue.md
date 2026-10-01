@@ -1227,3 +1227,141 @@ silently (it does not fail the entry), and a new runner on an older hub has no
 Not covered here: showing the cap in `tt team queue policy` and a per-project
 cap setting (`wi_c8119b78f9045698`), reserving seats against registrations
 made outside the queue, and letting a smaller team pass a held head.
+
+## Team queue artifact and session temp retention
+
+Closeout and `tt team queue sweep-worktrees` (described in
+`docs/team-launch.md`) also retire two things a finished team leaves outside
+its worktree: the verifier's clean checkouts under the artifacts tree, and
+Claude Code's per-directory session temp folders. Receipts, logs and plan
+files are never removed.
+
+```sh
+tt team queue sweep-worktrees [--apply] [--json] [--min-idle 24h] [--accepted-after 24h] [--artifacts DIR] [--cwd DIR]
+```
+
+Without `--apply` it is a dry run that writes nothing: no manifest, no
+receipt, no ref. It lists each verifier checkout and session temp folder with
+what it would do and, for a `would-remove` row, its size. `--apply` removes
+exactly what the dry run under the same rules reports. Never run `--apply`
+as a check; it deletes.
+
+### Verifier checkouts
+
+- A verifier checkout is a linked Git worktree with a detached `HEAD` under
+  `<artifacts>/<itemId>/`, where the item folder is named `wi_` and 16 hex
+  digits. A worktree there with a branch checked out (for example
+  `<itemId>/builder`) is a working checkout and keeps the ordinary worktree
+  rules. Folders not named for an item are never touched.
+- The artifacts root is `<main checkout>-artifacts`, the sibling of the
+  repository's main worktree. `TAILTERM_ARTIFACTS` overrides it, and on the
+  sweep `--artifacts DIR` overrides both.
+- An item's checkouts go once the item is released, or once its acceptance is
+  N old. Released means its newest finished queue entry has a release job in
+  state `released`, a published release, or an owner integration. Accepted
+  means that entry has a saved acceptance; its `acceptedAt` starts the wait.
+  N defaults to 24 hours: `--accepted-after` on the sweep, and
+  `TAILTERM_ARTIFACT_ACCEPTED_AFTER` (a Go duration such as `12h`) for
+  closeout. Zero means no wait. A negative `--accepted-after` is a usage
+  error; a negative or unreadable environment value prints one line to stderr
+  and uses 24 hours.
+- The checkout directory is the unit. Everything inside an eligible, clean
+  checkout is deleted: tracked sources, `node_modules` and build output.
+  Everything beside it in the item folder stays as it is: receipts, logs,
+  plan files, summaries and the manifest.
+- Referenced files are never removed. A checkout is kept whole, as
+  `evidence`, when a receipt text names a path inside it that exists there.
+  Receipt texts are queue acceptance, integration and owner-integration
+  evidence, tracked files under `docs/` on `tasks-hub`, and the JSON files in
+  the item's artifact folder, outside any checkout, whose name contains
+  `receipt` or `plan`. A path is matched absolute, without the macOS
+  `/private` prefix, and relative to the home directory (`~/...`). A reference
+  whose tail is missing still counts through its longest existing leading
+  part. A mention of the checkout directory alone, or of a sibling such as
+  `<checkout>-logs/`, does not keep it. Logs are not read: they name every
+  file a build touched. A receipt or plan file that cannot be read, or is
+  larger than 4 MiB, keeps the item's checkouts as `remove-failed`.
+- The commit need not be on `tasks-hub`: the checkout is a clean copy, and the
+  candidate's own branch and worktree stay under the ordinary rules. When no
+  branch or remote holds the commit, removal first points
+  `refs/tailterm/retired/<itemId>/<checkout name>` at it, so a SHA a receipt
+  names cannot be garbage-collected. These refs are not pruned.
+- The removal is Git's `worktree remove`, never `--force`, re-checked
+  immediately before it runs.
+
+Before a checkout is removed, its manifest is written beside it as
+`<artifacts>/<itemId>/<checkout name>.removed.json`, mode 0600 (a timestamped
+`.removed-<time>.json` when that name is taken). If the manifest cannot be
+written, nothing is removed; if the removal then keeps the checkout, the
+manifest and a ref made for it are taken back. Fields: `version` (1), `at`,
+`source` (`closeout` or `sweep`), `itemId`, `entryId`, `path`, `head`,
+`pinnedRef` when one was needed, `basis` (`released` or `accepted`),
+`basisAt`, `bytes`, `files`, and `entries`: one `{name, bytes, files,
+tracked}` for each top-level entry of the checkout.
+
+### Session temp folders
+
+Claude Code keeps one folder per session directory:
+`<temp>/claude-<uid>/<key>/`, where `<temp>` is `/tmp` (`/private/tmp` on
+macOS) or `CLAUDE_CODE_TMPDIR`, and `<key>` is the directory with every
+character that is not a letter or digit replaced by `-`. Codex and other
+runtimes have no such folder, so there is nothing to remove for them.
+
+Candidates are the folders of a team's directories on this host: its queue
+entry's `cwd`, accepted worktree and integration worktree, and the cwds of its
+item's agents. Closeout looks only at its own entry and that item's agents;
+the sweep looks at every entry and item-bound agent. A folder is removed only
+when all of these hold:
+
+- It is a real directory directly under the temp root. A symlink there is not
+  followed and not listed.
+- Its directory is not the main checkout, and does not share the main
+  checkout's key: that folder is shared by owner, handler and steward
+  sessions and is never removed. A directory that still exists outside every
+  linked worktree is treated as shared too.
+- No directory in use has the same key (`in-use`). In use means the cwd or
+  worktree of a queued, launching, running or unreleased failed entry, or the
+  cwd of an agent that is not closed. The key is lossy, so two directories
+  that differ only in punctuation share a folder and protect each other.
+- Sweep only: the folder and its direct children are older than `--min-idle`
+  (`recent`). This covers a session that is not on the roster.
+- No receipt text names it (`evidence`): queue evidence, tracked docs, and the
+  receipt and plan files of the items it belongs to.
+- No Git repository or kept worktree remains inside it (`nested`). Scratchpad
+  worktrees removed earlier in the same pass do not count.
+
+### Receipts and report
+
+Both kinds are recorded in `worktree-cleanup.jsonl` with the ordinary worktree
+receipts, one line per decision, and kept outcomes once. Their lines add
+`kind` (`artifact-checkout` or `session-temp`), `bytes`, and for a removed
+checkout `manifest`. `--json` rows add the same `kind`; existing keys and
+totals keep their meaning. The text report prints
+`would-remove PATH (artifact checkout; item wi_x released; 1.7 GiB)` and
+`would-remove PATH (session temp; 78.0 MiB)`. A folder that holds only empty
+directories reports `0 B`.
+
+Keep reasons, in the order checked for a verifier checkout: `locked`,
+`missing`, `in-use`, `item-active` (an entry of the item is queued, launching,
+running or failed and not released, or an agent bound to the item is not
+closed), `retention` (accepted less than N ago, or the item has no queue
+record: unknown is never treated as released), `nested`, `recent` (sweep
+only), `evidence`, `operation`, `dirty`, and `remove-failed`. `unpushed`
+applies only to ordinary worktrees and branch checkouts.
+
+### Limits
+
+- Closeout runs for finished, accepted entries on their launch host while the
+  project has an active entry there. It re-reads the project at most every 15
+  minutes for an entry that still has a worktree, a session temp folder or a
+  detached checkout one level under its item folder. Failed, dismissed or
+  older teams' folders, and checkouts nested deeper, go to the sweep.
+- Closeout has no idle rule. It removes a temp folder only for a finished,
+  accepted entry whose directories no live agent uses, so a manual Claude
+  session started in a finished team's worktree, and not on the roster, can
+  lose its temp folder. The sweep's `--min-idle` protects such a session.
+- The sweep reads every page of each project's queue history, so an old item
+  keeps its record. An item whose entries were never queued has none and its
+  checkouts are kept as `retention`.
+- The main checkout's session temp folder, artifact folders not named for an
+  item, and build output that is not inside a checkout are out of scope.

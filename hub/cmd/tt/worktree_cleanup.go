@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 	"sync"
@@ -41,7 +42,24 @@ const (
 	keepUnpushed  = "unpushed"
 	keepMoved     = "moved"
 	keepFailed    = "remove-failed"
+	// Artifact checkouts only: the item still runs, or it is neither
+	// released nor accepted long enough.
+	keepItemActive = "item-active"
+	keepRetention  = "retention"
 )
+
+// Decision and receipt kinds; an ordinary worktree has none.
+const (
+	kindArtifactCheckout = "artifact-checkout"
+	kindSessionTemp      = "session-temp"
+)
+
+// defaultArtifactAcceptedAfter is how long an accepted, unreleased item keeps
+// its verifier checkouts.
+const defaultArtifactAcceptedAfter = 24 * time.Hour
+
+// maxArtifactTextBytes bounds one receipt or plan file read for citations.
+const maxArtifactTextBytes = 4 << 20
 
 // closeoutWorktreeInterval bounds how often closeout re-examines a finished
 // entry whose worktree was kept, such as one waiting for its release.
@@ -66,6 +84,10 @@ type worktreeDecision struct {
 	Reason string `json:"reason"`
 	Detail string `json:"detail"`
 	Bytes  int64  `json:"bytes"`
+	// Kind is "artifact-checkout" or "session-temp"; an ordinary worktree
+	// has none.
+	Kind     string `json:"kind,omitempty"`
+	Manifest string `json:"manifest,omitempty"`
 	// recorded marks a decision whose receipt this call wrote.
 	recorded bool
 }
@@ -73,6 +95,16 @@ type worktreeDecision struct {
 type worktreeEvidence struct {
 	Source string
 	Text   string
+	// artifactOnly evidence is read for artifact checkouts and session temp
+	// only; ordinary worktrees keep the sources they always had.
+	artifactOnly bool
+}
+
+// sessionTempCwd is a directory a team session may have started in, with the
+// item whose receipt and plan files may cite its temp folder.
+type sessionTempCwd struct {
+	Path   string
+	ItemID string
 }
 
 type worktreeCleanupInputs struct {
@@ -88,6 +120,17 @@ type worktreeCleanupInputs struct {
 	Apply        bool
 	MeasureBytes bool
 	Receipt      worktreeCleanupReceipt
+	// Items turns on the artifact checkout rules: the state of every item
+	// with a queue record. Nil leaves every worktree under the ordinary rules.
+	Items map[string]artifactItemState
+	// Artifacts overrides the artifacts root (default: artifactsRootFor).
+	Artifacts string
+	// AcceptedAfter is how long an accepted, unreleased item keeps its
+	// checkouts; zero means the default (see acceptedAfterInput).
+	AcceptedAfter time.Duration
+	// TempRoot is the Claude session temp root; "" skips session temp.
+	TempRoot string
+	TempCwds []sessionTempCwd
 }
 
 type worktreeCleanupReceipt struct {
@@ -102,6 +145,11 @@ type worktreeCleanupReceipt struct {
 	Action  string `json:"action"`
 	Reason  string `json:"reason,omitempty"`
 	Detail  string `json:"detail,omitempty"`
+	// Kind, Bytes and Manifest are set for artifact checkouts and session
+	// temp folders.
+	Kind     string `json:"kind,omitempty"`
+	Bytes    int64  `json:"bytes,omitempty"`
+	Manifest string `json:"manifest,omitempty"`
 }
 
 // worktreeGit runs one Git command; tests wrap it to count calls. Optional
@@ -180,6 +228,9 @@ func recordWorktreeDecision(base worktreeCleanupReceipt, d worktreeDecision, now
 	}
 	r := base
 	r.At, r.Path, r.Branch, r.Head, r.Action, r.Reason, r.Detail = now.UTC().Format(time.RFC3339Nano), d.Path, d.Branch, d.Head, d.Action, d.Reason, d.Detail
+	if d.Kind != "" {
+		r.Kind, r.Bytes, r.Manifest = d.Kind, d.Bytes, d.Manifest
+	}
 	return true, appendWorktreeReceipt(r)
 }
 
@@ -437,8 +488,9 @@ func worktreeEvidencePatterns(path, main string) []string {
 }
 
 // docsCitations maps each candidate path to the first tracked docs/ file on
-// tasks-hub that cites it, using one git grep over all candidates.
-func docsCitations(ctx context.Context, common, main string, paths []string) (map[string]string, error) {
+// tasks-hub that cites it, using one git grep over all candidates. A strict
+// path is an artifact checkout: only a citation of something inside it counts.
+func docsCitations(ctx context.Context, common, main string, paths []string, strict map[string]bool) (map[string]string, error) {
 	out := map[string]string{}
 	if len(paths) == 0 || !gitRefExists(ctx, common, "refs/heads/tasks-hub") {
 		return out, nil
@@ -468,6 +520,12 @@ func docsCitations(ctx context.Context, common, main string, paths []string) (ma
 		file := strings.TrimPrefix(line, "refs/heads/tasks-hub:")
 		for _, p := range paths {
 			if out[p] != "" {
+				continue
+			}
+			if strict[p] {
+				if rel := artifactCitation(p, main, content); rel != "" {
+					out[p] = file + ": " + rel
+				}
 				continue
 			}
 			for _, pattern := range worktreeEvidencePatterns(p, main) {
@@ -613,8 +671,9 @@ func removeWorktree(ctx context.Context, common string, w gitWorktree, admin str
 }
 
 // cleanupWorktrees classifies the selected worktrees deepest first and, when
-// applying, removes the removable ones and prunes missing ones. Every
-// decision is returned; applied decisions are also recorded as receipts.
+// applying, removes the removable ones and prunes missing ones, then does the
+// same for the session temp folders of in.TempCwds. Every decision is
+// returned; applied decisions are also recorded as receipts.
 func cleanupWorktrees(ctx context.Context, in worktreeCleanupInputs) ([]worktreeDecision, error) {
 	common, worktrees, err := resolveWorktreeRepo(ctx, in.Repo)
 	if err != nil {
@@ -649,11 +708,24 @@ func cleanupWorktrees(ctx context.Context, in worktreeCleanupInputs) ([]worktree
 		}
 		return candidates[i].Path < candidates[j].Path
 	})
-	paths := make([]string, len(candidates))
+	now := in.Now
+	if now.IsZero() {
+		now = time.Now()
+	}
+	art := newArtifactPass(in, main, linked)
+	temp := sessionTempCandidates(in, main, linked)
+	paths := make([]string, len(candidates), len(candidates)+len(temp))
+	strict := map[string]bool{}
 	for i, w := range candidates {
 		paths[i] = w.Path
+		if art.checkoutItem(w) != "" {
+			strict[w.Path] = true
+		}
 	}
-	cited, err := docsCitations(ctx, common, main, paths)
+	for _, t := range temp {
+		paths = append(paths, t.Folder)
+	}
+	cited, err := docsCitations(ctx, common, main, paths, strict)
 	if err != nil {
 		return nil, fmt.Errorf("evidence lookup: %w", err)
 	}
@@ -676,7 +748,11 @@ func cleanupWorktrees(ctx context.Context, in worktreeCleanupInputs) ([]worktree
 	for _, w := range candidates {
 		d := worktreeDecision{Path: w.Path, Branch: strings.TrimPrefix(w.Branch, "refs/heads/"), Head: w.Head}
 		admin := worktreeAdminDir(w.Path)
-		reason, detail := classifyWorktree(ctx, common, main, w, admin, in, inUse, linked, cited, cleared)
+		item := art.checkoutItem(w)
+		if item != "" {
+			d.Kind = kindArtifactCheckout
+		}
+		reason, detail := classifyWorktree(ctx, common, main, w, admin, in, inUse, linked, cited, cleared, art)
 		if reason == keepMissing && !blockerChecked {
 			blockerChecked = true
 			if blocker, err = pruneBlocker(ctx, common, worktrees); err != nil {
@@ -700,7 +776,16 @@ func cleanupWorktrees(ctx context.Context, in worktreeCleanupInputs) ([]worktree
 				d.Bytes = worktreeBytes(w.Path, linkedSet)
 			}
 			d.Action, d.Detail = "would-remove", detail
-			if in.Apply {
+			switch {
+			case !in.Apply:
+			case item != "":
+				// A verifier checkout leaves a manifest beside its receipts.
+				if reason, why, manifest, bytes := removeArtifactCheckout(ctx, common, w, admin, cleared, item, art.items[item], in.Receipt, now); reason != "" {
+					d.Action, d.Reason, d.Detail, d.Bytes = "kept", reason, why, 0
+				} else {
+					d.Action, d.Manifest, d.Bytes = "removed", manifest, bytes
+				}
+			default:
 				if reason, why := removeWorktree(ctx, common, w, admin, cleared); reason != "" {
 					d.Action, d.Reason, d.Detail, d.Bytes = "kept", reason, why, 0
 				} else {
@@ -722,11 +807,8 @@ func cleanupWorktrees(ctx context.Context, in worktreeCleanupInputs) ([]worktree
 			}
 		}
 	}
+	decisions = append(decisions, cleanupSessionTemp(in, main, temp, inUse, cited, cleared, art, now)...)
 	if in.Apply {
-		now := in.Now
-		if now.IsZero() {
-			now = time.Now()
-		}
 		for i := range decisions {
 			recorded, err := recordWorktreeDecision(in.Receipt, decisions[i], now)
 			if err != nil {
@@ -763,7 +845,7 @@ func pruneBlocker(ctx context.Context, common string, worktrees []gitWorktree) (
 
 // classifyWorktree returns the first keep reason, or "" with the integration
 // detail when the worktree is removable.
-func classifyWorktree(ctx context.Context, common, main string, w gitWorktree, admin string, in worktreeCleanupInputs, inUse, linked []string, cited map[string]string, cleared map[string]bool) (string, string) {
+func classifyWorktree(ctx context.Context, common, main string, w gitWorktree, admin string, in worktreeCleanupInputs, inUse, linked []string, cited map[string]string, cleared map[string]bool, art *artifactPass) (string, string) {
 	if w.Locked {
 		return keepLocked, "git worktree is locked"
 	}
@@ -795,6 +877,17 @@ func classifyWorktree(ctx context.Context, common, main string, w gitWorktree, a
 			}
 		}
 	}
+	// A verifier checkout under the artifacts tree waits for its item: it
+	// goes only after the release, or once the acceptance is old enough.
+	item := art.checkoutItem(w)
+	eligible := ""
+	if item != "" {
+		reason, detail := art.gate(item)
+		if reason != "" {
+			return reason, detail
+		}
+		eligible = detail
+	}
 	// Every linked worktree inside it counts, selected or not, unless it
 	// goes first in this pass or is already gone.
 	for _, child := range linked {
@@ -817,10 +910,21 @@ func classifyWorktree(ctx context.Context, common, main string, w gitWorktree, a
 	if file := cited[w.Path]; file != "" {
 		return keepEvidence, "cited by " + file
 	}
-	for _, ev := range in.Evidence {
-		for _, pattern := range worktreeEvidencePatterns(w.Path, main) {
-			if strings.Contains(ev.Text, pattern) {
-				return keepEvidence, "cited by " + ev.Source
+	if item != "" {
+		// Its receipts, logs and plan files sit beside it, so only a
+		// citation of something inside the checkout keeps it.
+		if reason, detail := art.cited(w.Path, main, item, in.Evidence); reason != "" {
+			return reason, detail
+		}
+	} else {
+		for _, ev := range in.Evidence {
+			if ev.artifactOnly {
+				continue
+			}
+			for _, pattern := range worktreeEvidencePatterns(w.Path, main) {
+				if strings.Contains(ev.Text, pattern) {
+					return keepEvidence, "cited by " + ev.Source
+				}
 			}
 		}
 	}
@@ -834,12 +938,19 @@ func classifyWorktree(ctx context.Context, common, main string, w gitWorktree, a
 	if dirty != "" {
 		return keepDirty, dirty
 	}
-	ok, detail, err := worktreeIntegrated(ctx, common, w.Head)
-	if err != nil {
-		return keepFailed, err.Error()
-	}
-	if !ok {
-		return keepUnpushed, detail
+	// A verifier checkout is a clean detached copy of a candidate whose own
+	// branch stays under the ordinary rules, so it need not be integrated;
+	// removal pins a HEAD that no branch or remote holds.
+	detail := eligible
+	if item == "" {
+		ok, why, err := worktreeIntegrated(ctx, common, w.Head)
+		if err != nil {
+			return keepFailed, err.Error()
+		}
+		if !ok {
+			return keepUnpushed, why
+		}
+		detail = why
 	}
 	if !in.Apply {
 		// Applying repeats this scan as part of the removal re-check.
@@ -852,6 +963,753 @@ func classifyWorktree(ctx context.Context, common, main string, w gitWorktree, a
 		}
 	}
 	return "", detail
+}
+
+// Verifier checkouts and session temp.
+//
+// A verifier checkout is a detached linked worktree under
+// <artifacts>/<itemId>/. Its receipts, logs and plan files sit beside it, so
+// the checkout directory is the unit: once its item is released, or accepted
+// long enough, a clean checkout is removed whole and a manifest of what went
+// is written next to it. A session temp folder is Claude Code's per-directory
+// folder under its temp root, removed once no session can still be using it.
+
+var artifactItemIDPattern = regexp.MustCompile(`^wi_[0-9a-f]{16}$`)
+
+// artifactsRootFor names the artifacts tree of the repository whose main
+// checkout is main: TAILTERM_ARTIFACTS, else the sibling <main>-artifacts.
+// Tests replace it.
+var artifactsRootFor = func(main string) string {
+	if dir := os.Getenv("TAILTERM_ARTIFACTS"); dir != "" {
+		return dir
+	}
+	if main == "" {
+		return ""
+	}
+	return main + "-artifacts"
+}
+
+// claudeTempRoot is where Claude Code keeps one folder per session
+// directory: <temp>/claude-<uid>, with /tmp (or CLAUDE_CODE_TMPDIR) as temp.
+// Tests replace it.
+var claudeTempRoot = func() string {
+	base := os.Getenv("CLAUDE_CODE_TMPDIR")
+	if base == "" {
+		base = "/tmp"
+	}
+	return canonicalPath(filepath.Join(base, fmt.Sprintf("claude-%d", os.Getuid())))
+}
+
+var artifactAcceptedAfterWarning sync.Once
+
+// artifactAcceptedAfter is closeout's acceptance age, from
+// TAILTERM_ARTIFACT_ACCEPTED_AFTER (a Go duration) or the default.
+func artifactAcceptedAfter() time.Duration {
+	raw := os.Getenv("TAILTERM_ARTIFACT_ACCEPTED_AFTER")
+	if raw == "" {
+		return defaultArtifactAcceptedAfter
+	}
+	d, err := time.ParseDuration(raw)
+	if err != nil || d < 0 {
+		artifactAcceptedAfterWarning.Do(func() {
+			fmt.Fprintf(os.Stderr, "[tt relay] TAILTERM_ARTIFACT_ACCEPTED_AFTER=%q is not a non-negative duration; using %s\n", raw, shortDuration(defaultArtifactAcceptedAfter))
+		})
+		return defaultArtifactAcceptedAfter
+	}
+	return acceptedAfterInput(d)
+}
+
+// acceptedAfterInput turns an explicit duration into the cleanup input, where
+// an unset (zero) field means the default: an explicit zero, "no wait",
+// becomes the smallest positive duration.
+func acceptedAfterInput(d time.Duration) time.Duration {
+	if d == 0 {
+		return time.Nanosecond
+	}
+	return d
+}
+
+// shortDuration prints whole minutes without trailing zero units: 24h, 1h30m.
+func shortDuration(d time.Duration) string {
+	s := strings.TrimSuffix(d.Round(time.Minute).String(), "0s")
+	if strings.HasSuffix(s, "h0m") {
+		s = strings.TrimSuffix(s, "0m")
+	}
+	if s == "" {
+		return "0m"
+	}
+	return s
+}
+
+// Item states for artifact checkouts.
+const (
+	artifactItemRunning  = "running"
+	artifactItemReleased = "released"
+	artifactItemAccepted = "accepted"
+)
+
+// artifactItemState is what the queue records say about one item. An item
+// with no record has no state and is never treated as released.
+type artifactItemState struct {
+	State string
+	// At is the acceptance time of an accepted item.
+	At time.Time
+	// BasisAt is the recorded time of the release or acceptance.
+	BasisAt string
+	EntryID string
+	Detail  string
+	// position orders finished entries; the newest decides.
+	position int64
+}
+
+func releasedQueueEntry(q api.TeamQueueEntry) bool {
+	return q.OwnerIntegration != nil || (q.Release != nil && (q.Release.State == "released" || q.Release.Published))
+}
+
+// artifactItemStates derives each item's state from every queue entry and
+// agent, on any host: running while an entry is active or a bound agent is
+// not closed; otherwise what its newest finished entry says, released or
+// accepted.
+func artifactItemStates(entries []api.TeamQueueEntry, agents []api.Agent) map[string]artifactItemState {
+	out := map[string]artifactItemState{}
+	for _, q := range entries {
+		if q.ItemID == "" {
+			continue
+		}
+		cur, known := out[q.ItemID]
+		if activeQueueEntry(q) {
+			out[q.ItemID] = artifactItemState{State: artifactItemRunning, EntryID: q.ID, Detail: "queue entry " + q.ID + " is " + q.State}
+			continue
+		}
+		if cur.State == artifactItemRunning || q.State != "finished" {
+			continue
+		}
+		var next artifactItemState
+		switch {
+		case releasedQueueEntry(q):
+			next = artifactItemState{State: artifactItemReleased, BasisAt: q.UpdatedAt, EntryID: q.ID, position: q.Position}
+			if q.OwnerIntegration != nil && q.OwnerIntegration.At != "" {
+				next.BasisAt = q.OwnerIntegration.At
+			}
+		case q.Acceptance != nil:
+			at, err := time.Parse(time.RFC3339Nano, q.Acceptance.AcceptedAt)
+			if err != nil {
+				continue
+			}
+			next = artifactItemState{State: artifactItemAccepted, At: at, BasisAt: q.Acceptance.AcceptedAt, EntryID: q.ID, position: q.Position}
+		default:
+			continue
+		}
+		// The newest finished entry decides; on a tie the accepted one, which
+		// waits longer.
+		if !known || next.position > cur.position || (next.position == cur.position && next.State == artifactItemAccepted) {
+			out[q.ItemID] = next
+		}
+	}
+	for _, a := range agents {
+		if a.WorkItem == nil || a.WorkItem.ItemID == "" || a.Status == api.AgentClosed {
+			continue
+		}
+		name := a.Name
+		if name == "" {
+			name = a.ID
+		}
+		out[a.WorkItem.ItemID] = artifactItemState{State: artifactItemRunning, Detail: "agent " + name + " is " + string(a.Status)}
+	}
+	return out
+}
+
+// artifactPass holds one cleanup pass's artifact rules. A nil pass means the
+// rules are off and every worktree is an ordinary one.
+type artifactPass struct {
+	root          string
+	items         map[string]artifactItemState
+	acceptedAfter time.Duration
+	now           time.Time
+	linked        map[string]bool
+	texts         map[string][]worktreeEvidence
+	textFault     map[string]string
+}
+
+func newArtifactPass(in worktreeCleanupInputs, main string, linked []string) *artifactPass {
+	if in.Items == nil {
+		return nil
+	}
+	root := in.Artifacts
+	if root == "" {
+		root = artifactsRootFor(main)
+	}
+	if root == "" || !filepath.IsAbs(root) {
+		return nil
+	}
+	a := &artifactPass{root: canonicalPath(root), items: in.Items, acceptedAfter: in.AcceptedAfter, now: in.Now, linked: map[string]bool{}, texts: map[string][]worktreeEvidence{}, textFault: map[string]string{}}
+	if a.acceptedAfter <= 0 {
+		a.acceptedAfter = defaultArtifactAcceptedAfter
+	}
+	if a.now.IsZero() {
+		a.now = time.Now()
+	}
+	for _, p := range linked {
+		a.linked[p] = true
+	}
+	return a
+}
+
+// checkoutItem returns the item whose verifier checkout w is, or "": a
+// detached worktree below <artifacts>/<itemId>/. A worktree there with a
+// branch checked out is a working checkout under the ordinary rules.
+func (a *artifactPass) checkoutItem(w gitWorktree) string {
+	if a == nil || !w.Detached || !pathWithin(w.Path, a.root) || w.Path == a.root {
+		return ""
+	}
+	item, rest, nested := strings.Cut(strings.TrimPrefix(w.Path, strings.TrimSuffix(a.root, "/")+"/"), "/")
+	if !nested || rest == "" || !artifactItemIDPattern.MatchString(item) {
+		return ""
+	}
+	return item
+}
+
+// gate returns the keep reason while the item holds its checkouts, or "" with
+// the basis for removing them.
+func (a *artifactPass) gate(item string) (string, string) {
+	st, ok := a.items[item]
+	switch {
+	case !ok:
+		return keepRetention, "no queue record for " + item
+	case st.State == artifactItemRunning:
+		return keepItemActive, st.Detail
+	case st.State == artifactItemReleased:
+		return "", "item " + item + " released"
+	}
+	age := a.now.Sub(st.At)
+	if age < a.acceptedAfter {
+		return keepRetention, fmt.Sprintf("accepted %s ago; eligible after %s", shortDuration(age), shortDuration(a.acceptedAfter))
+	}
+	return "", fmt.Sprintf("item %s accepted %s ago", item, shortDuration(age))
+}
+
+// artifactCitation returns the path inside the checkout that text refers to,
+// or "". Only <checkout>/<rel> with <rel> present in the checkout counts: a
+// mention of the checkout directory itself, or of a sibling such as
+// <checkout>-logs, does not. A reference whose tail is absent or cut short
+// still counts through its longest existing leading part, so a referenced
+// file is never judged unreferenced by how the text spells or ends it.
+func artifactCitation(path, main, text string) string {
+	for _, pattern := range worktreeEvidencePatterns(path, main) {
+		prefix := pattern + "/"
+		for rest := text; ; {
+			i := strings.Index(rest, prefix)
+			if i < 0 {
+				break
+			}
+			rest = rest[i+len(prefix):]
+			token := rest
+			if end := strings.IndexFunc(token, func(r rune) bool {
+				return r <= ' ' || strings.ContainsRune("\"'`<>|*?\\", r)
+			}); end >= 0 {
+				token = token[:end]
+			}
+			rel := filepath.Clean(strings.TrimRight(token, ".,;:)]}"))
+			for rel != "." && rel != "/" && rel != "" && !strings.HasPrefix(rel, "..") {
+				if _, err := os.Lstat(filepath.Join(path, rel)); err == nil {
+					return rel
+				}
+				rel = filepath.Dir(rel)
+			}
+		}
+	}
+	return ""
+}
+
+// itemTexts reads the receipt and plan files of an item's artifact folder
+// that lie outside any checkout: JSON files whose name contains "receipt" or
+// "plan". Logs are not read; they name every file a build touched. A file
+// that cannot be read, or is larger than maxArtifactTextBytes, is a fault
+// that keeps the item's checkouts.
+func (a *artifactPass) itemTexts(item string) ([]worktreeEvidence, string) {
+	if a == nil || !artifactItemIDPattern.MatchString(item) {
+		return nil, ""
+	}
+	if texts, ok := a.texts[item]; ok {
+		return texts, a.textFault[item]
+	}
+	root := filepath.Join(a.root, item)
+	var texts []worktreeEvidence
+	fault := ""
+	_ = filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
+		if err != nil {
+			if fault == "" && !os.IsNotExist(err) {
+				fault = "cannot read " + p + ": " + err.Error()
+			}
+			if d != nil && d.IsDir() {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if d.IsDir() {
+			if p == root {
+				return nil
+			}
+			if _, err := os.Lstat(filepath.Join(p, ".git")); a.linked[p] || err == nil {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		name := strings.ToLower(d.Name())
+		if !d.Type().IsRegular() || !strings.HasSuffix(name, ".json") || !(strings.Contains(name, "receipt") || strings.Contains(name, "plan")) {
+			return nil
+		}
+		info, err := d.Info()
+		if err == nil && info.Size() > maxArtifactTextBytes {
+			err = fmt.Errorf("larger than %d bytes", maxArtifactTextBytes)
+		}
+		var data []byte
+		if err == nil {
+			data, err = os.ReadFile(p)
+		}
+		if err != nil {
+			if fault == "" {
+				fault = "cannot read " + p + ": " + err.Error()
+			}
+			return nil
+		}
+		texts = append(texts, worktreeEvidence{Source: p, Text: string(data)})
+		return nil
+	})
+	a.texts[item], a.textFault[item] = texts, fault
+	return texts, fault
+}
+
+// cited applies the referenced-file rule to a verifier checkout: queue
+// evidence and the item's receipt and plan files (tracked docs are checked
+// with the candidates). It names the source and the path inside the checkout.
+func (a *artifactPass) cited(path, main, item string, evidence []worktreeEvidence) (string, string) {
+	texts, fault := a.itemTexts(item)
+	for _, ev := range append(append([]worktreeEvidence(nil), evidence...), texts...) {
+		if rel := artifactCitation(path, main, ev.Text); rel != "" {
+			return keepEvidence, "cited by " + ev.Source + ": " + rel
+		}
+	}
+	if fault != "" {
+		return keepFailed, "receipt scan: " + fault
+	}
+	return "", ""
+}
+
+// artifactManifest records what removing a verifier checkout deleted. It is
+// written beside the checkout before the removal.
+type artifactManifest struct {
+	Version   int                     `json:"version"`
+	At        string                  `json:"at"`
+	Source    string                  `json:"source"`
+	ItemID    string                  `json:"itemId"`
+	EntryID   string                  `json:"entryId,omitempty"`
+	Path      string                  `json:"path"`
+	Head      string                  `json:"head"`
+	PinnedRef string                  `json:"pinnedRef,omitempty"`
+	Basis     string                  `json:"basis"`
+	BasisAt   string                  `json:"basisAt,omitempty"`
+	Bytes     int64                   `json:"bytes"`
+	Files     int64                   `json:"files"`
+	Entries   []artifactManifestEntry `json:"entries"`
+}
+
+// artifactManifestEntry is one top-level entry of the removed checkout.
+type artifactManifestEntry struct {
+	Name    string `json:"name"`
+	Bytes   int64  `json:"bytes"`
+	Files   int64  `json:"files"`
+	Tracked bool   `json:"tracked"`
+}
+
+// treeUsage sums regular-file bytes and counts non-directory entries below
+// root without following symlinks.
+func treeUsage(root string) (int64, int64, error) {
+	var bytes, files int64
+	err := filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.IsDir() {
+			return nil
+		}
+		files++
+		if d.Type().IsRegular() {
+			info, err := d.Info()
+			if err != nil {
+				return err
+			}
+			bytes += info.Size()
+		}
+		return nil
+	})
+	return bytes, files, err
+}
+
+func buildArtifactManifest(ctx context.Context, w gitWorktree, item string, st artifactItemState, base worktreeCleanupReceipt, now time.Time) (artifactManifest, error) {
+	m := artifactManifest{Version: 1, At: now.UTC().Format(time.RFC3339Nano), Source: base.Source, ItemID: item, EntryID: st.EntryID, Path: w.Path, Head: w.Head, Basis: st.State, BasisAt: st.BasisAt, Entries: []artifactManifestEntry{}}
+	listed, err := worktreeGit(ctx, w.Path, "ls-tree", "--name-only", "-z", "HEAD")
+	if err != nil {
+		return m, err
+	}
+	tracked := map[string]bool{}
+	for _, name := range strings.Split(listed, "\x00") {
+		if name != "" {
+			tracked[name] = true
+		}
+	}
+	top, err := os.ReadDir(w.Path)
+	if err != nil {
+		return m, err
+	}
+	for _, d := range top {
+		bytes, files, err := treeUsage(filepath.Join(w.Path, d.Name()))
+		if err != nil {
+			return m, err
+		}
+		m.Entries = append(m.Entries, artifactManifestEntry{Name: d.Name(), Bytes: bytes, Files: files, Tracked: tracked[d.Name()]})
+		m.Bytes += bytes
+		m.Files += files
+	}
+	return m, nil
+}
+
+// writeArtifactManifest creates <checkout>.removed.json, or a timestamped
+// name when an earlier checkout of that name already left one. It never
+// replaces a file.
+func writeArtifactManifest(checkout string, m artifactManifest, now time.Time) (string, error) {
+	data, err := json.MarshalIndent(m, "", "  ")
+	if err != nil {
+		return "", err
+	}
+	for _, path := range []string{checkout + ".removed.json", checkout + ".removed-" + now.UTC().Format("20060102T150405.000000000Z") + ".json"} {
+		file, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
+		if os.IsExist(err) {
+			continue
+		}
+		if err != nil {
+			return "", err
+		}
+		_, err = file.Write(append(data, '\n'))
+		if closeErr := file.Close(); err == nil {
+			err = closeErr
+		}
+		if err != nil {
+			_ = os.Remove(path)
+			return "", err
+		}
+		return path, nil
+	}
+	return "", errors.New("a manifest already exists at " + checkout + ".removed.json")
+}
+
+var retiredRefUnsafe = regexp.MustCompile(`[^A-Za-z0-9_-]+`)
+
+// pinArtifactHead keeps a checkout's commit reachable once its worktree is
+// gone: when no branch or remote holds head it points
+// refs/tailterm/retired/<itemId>/<checkout name> at it. It returns the ref
+// and whether this call created it.
+func pinArtifactHead(ctx context.Context, common, item string, w gitWorktree) (string, bool, error) {
+	held, err := worktreeGit(ctx, common, "for-each-ref", "--count=1", "--format=%(refname)", "--contains", w.Head, "refs/heads/", "refs/remotes/")
+	if err != nil {
+		return "", false, err
+	}
+	if strings.TrimSpace(held) != "" {
+		return "", false, nil
+	}
+	name := strings.Trim(retiredRefUnsafe.ReplaceAllString(filepath.Base(w.Path), "-"), "-")
+	if name == "" {
+		name = "checkout"
+	}
+	for _, ref := range []string{"refs/tailterm/retired/" + item + "/" + name, "refs/tailterm/retired/" + item + "/" + name + "-" + shortSHA(w.Head)} {
+		at, err := worktreeGit(ctx, common, "rev-parse", "--verify", "--quiet", ref+"^{commit}")
+		if err == nil {
+			if strings.TrimSpace(at) == w.Head {
+				return ref, false, nil
+			}
+			continue
+		}
+		if _, err := worktreeGit(ctx, common, "update-ref", ref, w.Head, ""); err != nil {
+			return "", false, err
+		}
+		return ref, true, nil
+	}
+	return "", false, errors.New("retired refs for " + name + " hold other commits")
+}
+
+// removeArtifactCheckout pins the checkout's commit when nothing else holds
+// it, writes the manifest, then removes the worktree through the ordinary
+// re-checked path. A removal that keeps the checkout takes the manifest and
+// a ref made here back, so a manifest always means a removed checkout.
+func removeArtifactCheckout(ctx context.Context, common string, w gitWorktree, admin string, cleared map[string]bool, item string, st artifactItemState, base worktreeCleanupReceipt, now time.Time) (string, string, string, int64) {
+	m, err := buildArtifactManifest(ctx, w, item, st, base, now)
+	if err != nil {
+		return keepFailed, "manifest: " + err.Error(), "", 0
+	}
+	ref, created, err := pinArtifactHead(ctx, common, item, w)
+	if err != nil {
+		return keepFailed, "pin " + shortSHA(w.Head) + ": " + err.Error(), "", 0
+	}
+	unpin := func() {
+		if created {
+			_, _ = worktreeGit(ctx, common, "update-ref", "-d", ref, w.Head)
+		}
+	}
+	m.PinnedRef = ref
+	manifest, err := writeArtifactManifest(w.Path, m, now)
+	if err != nil {
+		unpin()
+		return keepFailed, "write manifest: " + err.Error(), "", 0
+	}
+	if reason, why := removeWorktree(ctx, common, w, admin, cleared); reason != "" {
+		_ = os.Remove(manifest)
+		unpin()
+		return reason, why, "", 0
+	}
+	return "", "", manifest, m.Bytes
+}
+
+// mainCheckoutGuess names the main checkout from a repository path without
+// asking Git: the common directory's parent, the path itself, or the main
+// checkout a linked worktree points back to. "" when it cannot tell.
+func mainCheckoutGuess(repo string) string {
+	if repo == "" || !filepath.IsAbs(repo) {
+		return ""
+	}
+	repo = canonicalPath(repo)
+	if filepath.Base(repo) == ".git" {
+		return filepath.Dir(repo)
+	}
+	info, err := os.Lstat(filepath.Join(repo, ".git"))
+	if err != nil {
+		return ""
+	}
+	if info.IsDir() {
+		return repo
+	}
+	admin := worktreeAdminDir(repo)
+	if common := filepath.Dir(filepath.Dir(admin)); admin != "" && filepath.Base(filepath.Dir(admin)) == "worktrees" && filepath.Base(common) == ".git" {
+		return canonicalPath(filepath.Dir(common))
+	}
+	return ""
+}
+
+// holdsDetachedCheckout reports whether a directory one level below dir is a
+// detached linked worktree, reading only its .git link and HEAD.
+func holdsDetachedCheckout(dir string) bool {
+	children, err := os.ReadDir(dir)
+	if err != nil {
+		return false
+	}
+	for _, d := range children {
+		if !d.IsDir() {
+			continue
+		}
+		admin := worktreeAdminDir(filepath.Join(dir, d.Name()))
+		if admin == "" {
+			continue
+		}
+		if head, err := os.ReadFile(filepath.Join(admin, "HEAD")); err == nil && len(head) > 0 && !strings.HasPrefix(string(head), "ref:") {
+			return true
+		}
+	}
+	return false
+}
+
+// sessionTempFolder returns the temp folder of sessions started in cwd, or ""
+// when there is none to remove: no root, no such real directory directly
+// under the root (a symlink is not one), or cwd is the shared main checkout
+// or shares its key.
+func sessionTempFolder(root, cwd, main string) string {
+	if root == "" || cwd == "" || !filepath.IsAbs(cwd) {
+		return ""
+	}
+	key := claudeScratchKey(cwd)
+	if main != "" && (cwd == main || key == claudeScratchKey(main)) {
+		return ""
+	}
+	folder := filepath.Join(root, key)
+	if info, err := os.Lstat(folder); err != nil || !info.IsDir() || filepath.Dir(folder) != filepath.Clean(root) {
+		return ""
+	}
+	return folder
+}
+
+type sessionTempCandidate struct {
+	Folder string
+	Cwd    string
+	Items  []string
+}
+
+// sessionTempCandidates lists the existing temp folders of in.TempCwds, one
+// per folder. A directory that still exists outside every linked worktree is
+// shared (the main checkout's subdirectories, another project), so its
+// sessions are not attributed to a team and its folder is not listed.
+func sessionTempCandidates(in worktreeCleanupInputs, main string, linked []string) []sessionTempCandidate {
+	if in.TempRoot == "" {
+		return nil
+	}
+	root := canonicalPath(in.TempRoot)
+	byFolder := map[string]*sessionTempCandidate{}
+	var order []string
+	for _, c := range in.TempCwds {
+		if c.Path == "" || !filepath.IsAbs(c.Path) {
+			continue
+		}
+		real := canonicalPath(c.Path)
+		if _, err := os.Stat(real); err == nil && linkedRoot(real, linked) == "" {
+			continue
+		}
+		for _, cwd := range []string{filepath.Clean(c.Path), real} {
+			folder := sessionTempFolder(root, cwd, main)
+			if folder == "" {
+				continue
+			}
+			t := byFolder[folder]
+			if t == nil {
+				t = &sessionTempCandidate{Folder: folder, Cwd: cwd}
+				byFolder[folder] = t
+				order = append(order, folder)
+			}
+			known := c.ItemID == ""
+			for _, item := range t.Items {
+				known = known || item == c.ItemID
+			}
+			if !known {
+				t.Items = append(t.Items, c.ItemID)
+			}
+		}
+	}
+	sort.Strings(order)
+	out := make([]sessionTempCandidate, 0, len(order))
+	for _, folder := range order {
+		out = append(out, *byFolder[folder])
+	}
+	return out
+}
+
+// sessionTempIdle is the time since the folder or one of its direct children
+// last changed.
+func sessionTempIdle(folder string, now time.Time) time.Duration {
+	newest := time.Time{}
+	if info, err := os.Lstat(folder); err == nil {
+		newest = info.ModTime()
+	}
+	children, _ := os.ReadDir(folder)
+	for _, d := range children {
+		if info, err := d.Info(); err == nil && info.ModTime().After(newest) {
+			newest = info.ModTime()
+		}
+	}
+	if newest.IsZero() {
+		return 0
+	}
+	return now.Sub(newest)
+}
+
+// classifySessionTemp returns the first keep reason for a temp folder, or "".
+func classifySessionTemp(in worktreeCleanupInputs, main string, t sessionTempCandidate, inUse []string, cited map[string]string, cleared map[string]bool, art *artifactPass, now time.Time) (string, string) {
+	key := filepath.Base(t.Folder)
+	// The key is lossy: directories that differ only in punctuation share a
+	// folder, so an equal key counts as in use.
+	for _, p := range append(append([]string(nil), inUse...), in.InUse...) {
+		if p == "" {
+			continue
+		}
+		if claudeScratchKey(p) == key {
+			return keepInUse, "a session directory in use has this key: " + p
+		}
+		if pathWithin(p, t.Folder) {
+			return keepInUse, "in use at " + p
+		}
+	}
+	if in.MinIdle > 0 {
+		if idle := sessionTempIdle(t.Folder, now); idle < in.MinIdle {
+			return keepRecent, fmt.Sprintf("changed %s ago", idle.Round(time.Minute))
+		}
+	}
+	if file := cited[t.Folder]; file != "" {
+		return keepEvidence, "cited by " + file
+	}
+	evidence := append([]worktreeEvidence(nil), in.Evidence...)
+	for _, item := range t.Items {
+		texts, fault := art.itemTexts(item)
+		if fault != "" {
+			return keepFailed, "receipt scan: " + fault
+		}
+		evidence = append(evidence, texts...)
+	}
+	for _, ev := range evidence {
+		for _, pattern := range worktreeEvidencePatterns(t.Folder, main) {
+			if strings.Contains(ev.Text, pattern) {
+				return keepEvidence, "cited by " + ev.Source
+			}
+		}
+	}
+	nested, err := nestedRepository(t.Folder, cleared)
+	if err != nil {
+		return keepFailed, "scan for nested repositories: " + err.Error()
+	}
+	if nested != "" {
+		return keepNested, "contains Git repository " + nested
+	}
+	return "", ""
+}
+
+// removeSessionTemp deletes one folder directly under the temp root. It
+// refuses anything that is not a real directory there, so a symlink in the
+// root is never followed out of it.
+func removeSessionTemp(root, folder string) error {
+	info, err := os.Lstat(folder)
+	if err != nil {
+		return err
+	}
+	real, err := filepath.EvalSymlinks(folder)
+	if err != nil {
+		return err
+	}
+	if !info.IsDir() || real != folder || filepath.Dir(folder) != root || folder == root {
+		return errors.New("not a directory directly under " + root)
+	}
+	restore, err := makeWorktreeWritable(folder)
+	if err != nil {
+		return err
+	}
+	if err := os.RemoveAll(folder); err != nil {
+		restore()
+		return err
+	}
+	return nil
+}
+
+// cleanupSessionTemp decides each candidate temp folder and, when applying,
+// removes the removable ones. It runs after the worktree pass, so worktrees
+// that pass removed from a scratchpad no longer hold their folder.
+func cleanupSessionTemp(in worktreeCleanupInputs, main string, temp []sessionTempCandidate, inUse []string, cited map[string]string, cleared map[string]bool, art *artifactPass, now time.Time) []worktreeDecision {
+	if len(temp) == 0 {
+		return nil
+	}
+	root := canonicalPath(in.TempRoot)
+	decisions := make([]worktreeDecision, 0, len(temp))
+	for _, t := range temp {
+		d := worktreeDecision{Path: t.Folder, Kind: kindSessionTemp}
+		reason, detail := classifySessionTemp(in, main, t, inUse, cited, cleared, art, now)
+		if reason != "" {
+			d.Action, d.Reason, d.Detail = "kept", reason, detail
+			decisions = append(decisions, d)
+			continue
+		}
+		d.Action, d.Detail, d.Bytes = "would-remove", "sessions started in "+t.Cwd, worktreeBytes(t.Folder, nil)
+		if in.Apply {
+			if err := removeSessionTemp(root, t.Folder); err != nil {
+				d.Action, d.Reason, d.Detail, d.Bytes = "kept", keepFailed, err.Error(), 0
+			} else {
+				d.Action = "removed"
+			}
+		}
+		decisions = append(decisions, d)
+	}
+	return decisions
 }
 
 // activeQueueEntry reports whether an entry still holds its worktree: it is
@@ -884,6 +1742,9 @@ func worktreeProtection(host string, entries []api.TeamQueueEntry, agents []api.
 		if q.Integration != nil && q.Integration.Evidence != "" {
 			evidence = append(evidence, worktreeEvidence{Source: "queue entry " + q.ID + " integration evidence", Text: q.Integration.Evidence})
 		}
+		if q.OwnerIntegration != nil && q.OwnerIntegration.Evidence != "" {
+			evidence = append(evidence, worktreeEvidence{Source: "queue entry " + q.ID + " owner integration evidence", Text: q.OwnerIntegration.Evidence, artifactOnly: true})
+		}
 	}
 	for _, a := range agents {
 		if a.Host == host && a.Status != api.AgentClosed && a.Cwd != "" {
@@ -894,14 +1755,36 @@ func worktreeProtection(host string, entries []api.TeamQueueEntry, agents []api.
 }
 
 // closeoutWorktrees removes a finished entry's worktrees once their work is
-// on tasks-hub or pushed. It reads the hub only when one of the entry's
-// worktrees still exists, at most once per closeoutWorktreeInterval, and
-// never writes to the hub.
+// on tasks-hub or pushed, its item's verifier checkouts under the artifacts
+// tree once the item is released or accepted long enough, and its closed
+// team's session temp folders. It reads the hub only when one of the entry's
+// worktrees, temp folders or verifier checkouts still exists, at most once
+// per closeoutWorktreeInterval, and never writes to the hub.
 func closeoutWorktrees(ctx context.Context, c *api.Client, host string, active, project api.TeamQueueList, q api.TeamQueueEntry) error {
 	direct := []string{q.Cwd, q.Acceptance.Worktree}
 	if q.Integration != nil {
 		direct = append(direct, q.Integration.Worktree)
 	}
+	repo := q.Repository
+	if repo == "" {
+		repo = q.Acceptance.Repository
+	}
+	if repo == "" {
+		for _, p := range direct {
+			if _, err := os.Stat(p); p != "" && err == nil {
+				repo = p
+				break
+			}
+		}
+	}
+	if repo == "" {
+		return nil
+	}
+	// This look runs every tick, so it only stats: the main checkout is
+	// read from the repository path, not asked of Git.
+	main := mainCheckoutGuess(repo)
+	artifacts := artifactsRootFor(main)
+	tempRoot := claudeTempRoot()
 	exists := false
 	for _, p := range direct {
 		if p == "" {
@@ -910,6 +1793,12 @@ func closeoutWorktrees(ctx context.Context, c *api.Client, host string, active, 
 		if _, err := os.Stat(p); err == nil {
 			exists = true
 		}
+		if sessionTempFolder(tempRoot, p, main) != "" {
+			exists = true
+		}
+	}
+	if !exists && artifacts != "" && artifactItemIDPattern.MatchString(q.ItemID) {
+		exists = holdsDetachedCheckout(filepath.Join(artifacts, q.ItemID))
 	}
 	if !exists {
 		return nil
@@ -931,6 +1820,14 @@ func closeoutWorktrees(ctx context.Context, c *api.Client, host string, active, 
 			roots = append(roots, a.Cwd)
 		}
 	}
+	// Only this entry's own directories and its item's agents name session
+	// temp folders here; other teams' folders go at their own closeout.
+	var tempCwds []sessionTempCwd
+	for _, p := range roots {
+		if p != "" {
+			tempCwds = append(tempCwds, sessionTempCwd{Path: p, ItemID: q.ItemID})
+		}
+	}
 	var directPaths []string
 	for _, p := range direct {
 		if p != "" {
@@ -940,18 +1837,6 @@ func closeoutWorktrees(ctx context.Context, c *api.Client, host string, active, 
 	for i := range roots {
 		if roots[i] != "" {
 			roots[i] = canonicalPath(roots[i])
-		}
-	}
-	repo := q.Repository
-	if repo == "" {
-		repo = q.Acceptance.Repository
-	}
-	if repo == "" {
-		for _, p := range direct {
-			if _, err := os.Stat(p); p != "" && err == nil {
-				repo = p
-				break
-			}
 		}
 	}
 	lock, err := worktreeCleanupLock()
@@ -964,12 +1849,17 @@ func closeoutWorktrees(ctx context.Context, c *api.Client, host string, active, 
 		// Only paths attributable to this item: its recorded worktrees and,
 		// when a recorded worktree or team cwd is a linked worktree, what is
 		// nested in it or in scratchpads of sessions started there. A
-		// main-checkout cwd is shared, so it attributes nothing further.
+		// main-checkout cwd is shared, so it attributes nothing further. The
+		// item's detached verifier checkouts under the artifacts tree are its
+		// own too.
 		Select: func(w gitWorktree, main string, linked []string) bool {
 			for _, p := range directPaths {
 				if w.Path == p {
 					return true
 				}
+			}
+			if root := artifactsRootFor(main); root != "" && w.Detached && artifactItemIDPattern.MatchString(q.ItemID) && w.Path != filepath.Join(canonicalPath(root), q.ItemID) && pathWithin(w.Path, filepath.Join(canonicalPath(root), q.ItemID)) {
+				return true
 			}
 			for _, root := range roots {
 				if root == "" {
@@ -985,11 +1875,15 @@ func closeoutWorktrees(ctx context.Context, c *api.Client, host string, active, 
 			}
 			return false
 		},
-		InUse:    inUse,
-		Evidence: evidence,
-		Now:      now,
-		Apply:    true,
-		Receipt:  worktreeCleanupReceipt{Source: "closeout", TaskID: q.TaskID, EntryID: q.ID, ItemID: q.ItemID},
+		InUse:         inUse,
+		Evidence:      evidence,
+		Now:           now,
+		Apply:         true,
+		Receipt:       worktreeCleanupReceipt{Source: "closeout", TaskID: q.TaskID, EntryID: q.ID, ItemID: q.ItemID},
+		Items:         artifactItemStates(entries, detail.Agents),
+		AcceptedAfter: artifactAcceptedAfter(),
+		TempRoot:      tempRoot,
+		TempCwds:      tempCwds,
 	})
 	for _, d := range decisions {
 		if !d.recorded {
@@ -1016,20 +1910,23 @@ type worktreeSweepReport struct {
 }
 
 // cmdTeamQueueSweepWorktrees applies the closeout rules to every existing
-// linked worktree of the repository. It is a dry run unless --apply is set,
-// and reads the hub before touching anything.
+// linked worktree of the repository, verifier checkouts under the artifacts
+// tree included, and to the session temp folders of this host's teams. It is
+// a dry run unless --apply is set, and reads the hub before touching anything.
 func cmdTeamQueueSweepWorktrees(e env, args []string) error {
 	fs := flag.NewFlagSet("team queue sweep-worktrees", flag.ContinueOnError)
 	hub := fs.String("hub", e.hub, "hub URL")
 	cwd := fs.String("cwd", "", "any worktree of the repository (default: current directory)")
-	apply := fs.Bool("apply", false, "remove the would-remove worktrees and prune missing ones")
+	apply := fs.Bool("apply", false, "remove the would-remove worktrees and session temp folders and prune missing ones")
 	jsonOut := fs.Bool("json", false, "print JSON")
-	minIdle := fs.Duration("min-idle", 24*time.Hour, "keep worktrees whose Git state changed more recently")
+	minIdle := fs.Duration("min-idle", 24*time.Hour, "keep worktrees whose Git state changed more recently, and session temp folders changed more recently")
+	acceptedAfter := fs.Duration("accepted-after", defaultArtifactAcceptedAfter, "remove an accepted, unreleased item's verifier checkouts once its acceptance is this old")
+	artifacts := fs.String("artifacts", "", "artifacts root (default: TAILTERM_ARTIFACTS, else <main checkout>-artifacts)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	if fs.NArg() != 0 || *hub == "" || *minIdle < 0 {
-		return errors.New("usage: tt team queue sweep-worktrees [--apply] [--json] [--min-idle 24h] [--cwd DIR] [--hub URL]")
+	if fs.NArg() != 0 || *hub == "" || *minIdle < 0 || *acceptedAfter < 0 {
+		return errors.New("usage: tt team queue sweep-worktrees [--apply] [--json] [--min-idle 24h] [--accepted-after 24h] [--artifacts DIR] [--cwd DIR] [--hub URL]")
 	}
 	repo := *cwd
 	if repo == "" {
@@ -1060,13 +1957,57 @@ func cmdTeamQueueSweepWorktrees(e env, args []string) error {
 			return fmt.Errorf("sweep needs the hub: project %s: %w", task.ID, err)
 		}
 		agents = append(agents, detail.Agents...)
-		queue, err := c.ListTeamQueue(ctx, task.ID)
-		if err != nil {
-			return fmt.Errorf("sweep needs the hub: project %s queue: %w", task.ID, err)
+		// The listing pages its history; an item's state needs every page.
+		for after, pages := int64(0), 0; ; pages++ {
+			queue, err := c.ListTeamQueuePage(ctx, task.ID, api.TeamQueueListOptions{Limit: api.MaxLimit, After: after})
+			if err != nil {
+				return fmt.Errorf("sweep needs the hub: project %s queue: %w", task.ID, err)
+			}
+			if after == 0 {
+				entries = append(entries, queue.Entries...)
+			} else {
+				// A later page repeats the active entries; keep its history.
+				for _, q := range queue.Entries {
+					if !activeQueueEntry(q) {
+						entries = append(entries, q)
+					}
+				}
+			}
+			if queue.History == nil || queue.History.NextAfter == 0 || queue.History.NextAfter == after {
+				break
+			}
+			if pages >= 1000 {
+				return fmt.Errorf("sweep needs the hub: project %s queue history does not end", task.ID)
+			}
+			after = queue.History.NextAfter
 		}
-		entries = append(entries, queue.Entries...)
 	}
 	inUse, evidence := worktreeProtection(host, entries, agents)
+	// Session temp folders are named for the directories this host's teams
+	// worked in: their entries' worktrees and their item-bound agents' cwds.
+	var tempCwds []sessionTempCwd
+	for _, q := range entries {
+		if q.Host != host {
+			continue
+		}
+		paths := []string{q.Cwd}
+		if q.Acceptance != nil {
+			paths = append(paths, q.Acceptance.Worktree)
+		}
+		if q.Integration != nil {
+			paths = append(paths, q.Integration.Worktree)
+		}
+		for _, p := range paths {
+			if p != "" {
+				tempCwds = append(tempCwds, sessionTempCwd{Path: p, ItemID: q.ItemID})
+			}
+		}
+	}
+	for _, a := range agents {
+		if a.Host == host && a.WorkItem != nil && a.Cwd != "" {
+			tempCwds = append(tempCwds, sessionTempCwd{Path: a.Cwd, ItemID: a.WorkItem.ItemID})
+		}
+	}
 	if *apply {
 		lock, err := worktreeCleanupLock()
 		if err != nil {
@@ -1077,6 +2018,8 @@ func cmdTeamQueueSweepWorktrees(e env, args []string) error {
 	decisions, err := cleanupWorktrees(ctx, worktreeCleanupInputs{
 		Repo: repo, InUse: inUse, Evidence: evidence, MinIdle: *minIdle, Now: time.Now(),
 		Apply: *apply, MeasureBytes: true, Receipt: worktreeCleanupReceipt{Source: "sweep"},
+		Items: artifactItemStates(entries, agents), Artifacts: *artifacts, AcceptedAfter: acceptedAfterInput(*acceptedAfter),
+		TempRoot: claudeTempRoot(), TempCwds: tempCwds,
 	})
 	if decisions == nil && err != nil {
 		return err
@@ -1101,6 +2044,10 @@ func cmdTeamQueueSweepWorktrees(e env, args []string) error {
 		case "kept":
 			fmt.Printf("kept %s %s: %s\n", d.Reason, d.Path, d.Detail)
 		case "removed", "would-remove":
+			if d.Kind != "" {
+				fmt.Printf("%s %s (%s; %s)\n", d.Action, d.Path, worktreeLabel(d), humanBytes(d.Bytes))
+				continue
+			}
 			fmt.Printf("%s %s (%s, %s)\n", d.Action, d.Path, worktreeLabel(d), humanBytes(d.Bytes))
 		default:
 			fmt.Printf("%s %s\n", d.Action, d.Path)
@@ -1119,12 +2066,18 @@ func cmdTeamQueueSweepWorktrees(e env, args []string) error {
 	sort.Strings(reasons)
 	fmt.Printf("totals: %s; kept by reason: %s; %s %s\n", strings.Join(parts, " "), strings.Join(reasons, " "), map[bool]string{true: "removed", false: "reclaimable"}[*apply], humanBytes(report.Totals.Bytes))
 	if !*apply {
-		fmt.Println("dry run: nothing changed; rerun with --apply to remove the would-remove worktrees")
+		fmt.Println("dry run: nothing changed; rerun with --apply to remove the would-remove worktrees and session temp folders")
 	}
 	return err
 }
 
 func worktreeLabel(d worktreeDecision) string {
+	switch d.Kind {
+	case kindArtifactCheckout:
+		return "artifact checkout; " + d.Detail
+	case kindSessionTemp:
+		return "session temp"
+	}
 	label := "detached " + shortSHA(d.Head)
 	if d.Branch != "" {
 		label = "branch " + d.Branch
