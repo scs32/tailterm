@@ -230,7 +230,9 @@ handler. Three things make that run succeed or fail for a named reason
     waits for the verification host at position P of N at priority X behind
     ITEM/AGENT/pid PID` (or `with no holder`). The request id is
     `JOB-matrix-wait-COMMIT-rN-pP-ofN-HOLDERID`, so an unchanged poll posts
-    nothing. `tt team queue list` and `node scripts/verify-matrix-host-lock.mjs
+    nothing. `run.json` counts the places the run has had; from the second
+    place on the id ends in `-nK`, so a return to an earlier place is posted
+    again while a restarted runner's resend is not. `tt team queue list` and `node scripts/verify-matrix-host-lock.mjs
     status` show the same place.
 
 The context, plan, receipt, logs and the attempt record live in
@@ -245,7 +247,7 @@ about the attempt's one run. A run is never started twice in one directory.
 | `state` | Meaning |
 |---|---|
 | `starting` | Saved before the run is spawned, with `launchedAt`, `priority`, `hostWaitMs` and `boundMs`. If this save fails nothing is started. |
-| `started` | The run exists: `pid`, `processStartedAt` (its process start time, or null when it could not be read) and `groups`, every check group the runner has seen it record in the lock file. |
+| `started` | The run exists: `pid`, `processStartedAt` (its process start time, or null when it could not be read), `groups`, every check group the runner has seen it record in the lock file, and `waitPlace` with `waitChange`, its last place on the waitlist and how many places it has had. |
 | `ended` | Final, with `reason` (`receipt`, `stopped`, `wait-expired`, `no-receipt` or `spawn-failed`) and, for a refusal, its name. |
 
 The journal is saved as `waiting_matrix` before the run is started, and every
@@ -294,7 +296,9 @@ reasons:
 - `a check group of the matrix run is still alive`: the notice names the groups.
 - `check group state cannot be shown`: the run is gone without a release record
   and another waiter replaced its lock entry before the runner read it.
-- `host lock file unreadable`, `attempt record unreadable`.
+- `host lock file unreadable`, `attempt record unreadable`, and `attempt
+  records unreadable` when a requeued job's attempt directories cannot be
+  listed (request id `JOB-matrix-held-attempts`).
 
 A held job resumes by itself once the evidence is complete (the group ends, the
 run appears). Otherwise a person acts: the handler or owner confirms that no
@@ -474,6 +478,14 @@ handler-only and moves it aside:
   fence and use `reconcile`.
 - At least one `verified` job must be queued after it; otherwise it would only
   claim the same job again.
+- No integrated matrix run of the job is alive. The host release lock is not
+  held while that run waits or runs, so the lock check below does not cover it.
+  On the host, every `run.json` under
+  `journalDirectory/ID-integrated-verification/` must say `ended` (or have been
+  moved to `run.json.set-aside` by the held-run step); a `starting` or `started`
+  record means the run may be using the checkout, and setting the job aside
+  would let the next job move the checkout under it. Such a holder keeps the
+  fence until its run ends or the runner refuses it.
 - No host release lock names the job's claim (its job id, agent and run). The
   hub cannot see the host, so the handler checks this when it inspects the host.
   Set-aside clears the job's run, after which no reconcile record matches that
@@ -502,10 +514,14 @@ When a job holds the fence and a later job is `verified`, the deployer posts one
 notice per holder, waiting job and reason: it names the holding job, why it holds
 the fence (waiting for an integrated verification import, waiting for inputs,
 blocked, merged, or claimed by another deployer run) and the waiting job. For a
-claim with no effects it says the handler can set it aside, unless the host
-release lock names that claim's run (or cannot be read): then it says the job
-keeps the fence and needs reconcile with the lock digest after that run stops,
-and its request id ends in `-locked`. Any other holder keeps the fence until
+claim with no effects it says the handler can set it aside, with two
+exceptions. If any attempt record of the job (`run.json`) is not `ended`, or
+cannot be read, it says the job keeps the fence because its integrated matrix
+run has not ended and may be using the checkout, and its request id ends in
+`-matrix`; this covers a run that is starting, waiting, running or held.
+Otherwise, if the host release lock names that claim's run (or cannot be read),
+it says the job keeps the fence and needs reconcile with the lock digest after
+that run stops, and its request id ends in `-locked`. Any other holder keeps the fence until
 handler reconciliation. Its request id is `HOLDER-fence-wait-WAITING-REASON`, so
 a restart's resend returns the original.
 
@@ -779,10 +795,14 @@ Follow "Held" under integrated-commit verification: confirm nothing of that
 run is alive, then move that attempt's `run.json` to `run.json.set-aside`.
 
 **Set aside.** When a fence-wait notice says a claim with no effects blocks a
-later job, the handler, under a recorded order, first confirms no host release
-lock names that claim, then sets it aside with `tt deployment set-aside` and a
-typed record (above); no deployer stop, hand release or supersede is needed. A
-locked claim goes through **Reconcile** instead. The deployer claims the waiting job at its next poll.
+later job, the handler, under a recorded order, first confirms that every
+`run.json` in the job's attempt directories says `ended` (no integrated matrix
+run is starting, waiting, running or held) and that no host release lock names
+that claim, then sets it aside with `tt deployment set-aside` and a typed record
+(above); no deployer stop, hand release or supersede is needed. A notice whose
+request id ends in `-matrix` means the run has not ended: do not set the job
+aside; wait for the run, or follow **Held matrix run** below. A locked claim
+goes through **Reconcile** instead. The deployer claims the waiting job at its next poll.
 
 **Manual rollback, per target.**
 - hub or bridge: `python3 scripts/deploy-truenas-hub.py --rollback-to PRIOR_RELEASE

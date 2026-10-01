@@ -849,8 +849,6 @@ func queueReleaseRequest(ctx context.Context, c *api.Client, hub, task string, q
 	return req, unlock, nil
 }
 
-// queueAttemptText is the list suffix for an entry that is a later attempt of
-// its item or was rebound to an amended item revision.
 // The verification host's lock and waitlist: the JSON file
 // scripts/verify-matrix-host-lock.mjs keeps on the machine that runs the
 // matrix (docs/objective-verification.md, "Host lock and waitlist"). The list
@@ -949,6 +947,8 @@ func (m *matrixWaitlist) waitLines(q api.TeamQueueEntry) []string {
 	return lines
 }
 
+// queueAttemptText is the list suffix for an entry that is a later attempt of
+// its item or was rebound to an amended item revision.
 func queueAttemptText(q api.TeamQueueEntry) string {
 	text := ""
 	if q.Attempt > 1 {
