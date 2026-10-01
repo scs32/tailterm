@@ -667,8 +667,9 @@ and verdicts, without findings, blockers or criteria; `scopes` and `focused`
 are empty; follow-ups keep their item, message and finding ID and a title of
 at most 200 bytes. `verification` keeps its state, commit and only the checks
 that did not pass, are known failures or now pass. `release` keeps its ID,
-state, commits, digest, receipt, supersession and `published`, and drops
-`integratedPlan`, `integratedVerification` and `reconciliations`; `plan` is
+state, commits, digest, receipt, supersession, `published` and
+`integratedCoverage`, and drops `integratedPlan`, `integratedVerification`
+and `reconciliations`; `plan` is
 emitted as a zero object because the release type always carries it (read the
 full job from `GET /v1/tasks/{id}/releases`). Acceptance, integration and
 owner-integration evidence is cut to 500 bytes, owner-integration
