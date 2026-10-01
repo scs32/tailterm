@@ -197,6 +197,48 @@ One obligation per (message, recipient). States:
   or agent event has changed for 15 minutes, the broker raises one
   `project_stalled` alert. It fires once per stall, not once per timer.
 
+### Item lead copies
+
+A message has one recipient, so a reply a teammate receives does not reach the
+item's lead. A lead waiting on that reply, for example a handler gate its
+verifier asked for, would sit idle. When such a reply is posted, the hub posts
+one NOTICE to the item's lead in the same transaction. The notice carries a
+delivery-only obligation, so one wake job wakes the lead once, and it never
+gates the lead's own posts.
+
+The hub posts the copy only when all of these hold:
+
+1. The message is a typed RESULT, BLOCK or DECLINE.
+2. It replies to another message.
+3. It is not a broadcast. On a swarm task the lead already receives it.
+4. It has a primary link to a work item of this project.
+5. That item has a lead: a running item-team lead mapping whose agent and run
+   are live (not closed, exited or retired).
+6. The lead is neither the reply's recipient nor its sender.
+
+The copy keeps the reply's item links and has refs `message` (the reply),
+`replyTo` (what it answers) and `copy=lead`. Its text names the sender, the
+recipient, the kind and the subject, and the command that prints the reply in
+full: `tt inbox --seq N`. It needs no answer.
+
+The reply's own recipient gets no extra message, obligation or wake job, and a
+retried post returns the stored reply without posting a second copy. An
+unlinked reply is copied to nobody, so a handler that is not bound to the item
+must link its reply (`--work-item`, `--work-item-revision`,
+`--work-order-message`) for the lead to hear of it. The copy goes to the lead
+at the time of the post; a later replacement lead is not sent it again.
+
+A handler therefore replies to the requester only. It does not post a second
+message for the lead; the hub tells the lead.
+
+**What a lead can read.** The inbox page of an item's lead shows every message
+linked to its item, including those addressed to its teammates. A member sees
+linked messages only when they are board-wide, broadcast or addressed to it.
+The unread count is not changed by this: it counts what is addressed to the
+agent and the board-wide or broadcast messages linked to its item, so teammate
+traffic never holds a lead's count above zero. A lead's `tt status` can
+therefore show fewer unread messages than `tt inbox --unread` lists.
+
 ### What is *not* evidence (unchanged)
 
 Wake acceptance, heartbeat, Working status, inbox retrieval and a turn ending are

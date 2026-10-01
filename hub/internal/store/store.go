@@ -1336,6 +1336,9 @@ func (s *Store) PostMessage(ctx context.Context, taskID string, req api.PostMess
 	if err = s.applyReplyOutcome(ctx, tx, m, req); err != nil {
 		return m, err
 	}
+	if err = s.copyReplyToItemLead(ctx, tx, t, m, req, target); err != nil {
+		return m, err
+	}
 	if req.RequestID != "" {
 		if err = insertMessagePostReceipt(ctx, tx, &m, req.RequestID, payload, by); err != nil {
 			return m, err
@@ -1346,6 +1349,70 @@ func (s *Store) PostMessage(ctx context.Context, taskID string, req api.PostMess
 	}
 	s.notify(taskID)
 	return m, nil
+}
+
+// copyReplyToItemLead tells an item's lead about a typed RESULT, BLOCK or
+// DECLINE reply on its item that went to someone else, so a lead waiting on a
+// teammate's gate is not left idle (wi_85bfbdaa5e09fb64). It runs in the
+// reply's transaction and posts one hub notice to the lead with a
+// delivery-only obligation, whose wake job wakes the lead once. The reply's
+// own recipient gets nothing more, and a retried post returns before this
+// point, so neither is told twice.
+func (s *Store) copyReplyToItemLead(ctx context.Context, tx *sql.Tx, task api.Task, m api.Message, req api.PostMessageRequest, target api.Agent) error {
+	e := req.Envelope
+	// On a swarm task the reply is broadcast and already reaches the lead.
+	if e == nil || req.ReplyTo <= 0 || m.Broadcast {
+		return nil
+	}
+	if e.Kind != api.EnvelopeKindResult && e.Kind != api.EnvelopeKindBlock && e.Kind != api.EnvelopeKindDecline {
+		return nil
+	}
+	itemID := ""
+	for _, link := range m.WorkItems {
+		if link.Relationship == "primary" && link.ItemTaskID == task.ID {
+			itemID = link.ItemID
+			break
+		}
+	}
+	if itemID == "" {
+		return nil
+	}
+	// The exact running lead of the item, as BrokerEscalate resolves it.
+	lead, err := scanAgent(tx.QueryRowContext(ctx, `SELECT `+agentCols+` FROM agents WHERE task_id=? AND status NOT IN ('closed','exited','retired') AND EXISTS (SELECT 1 FROM item_team_leads l WHERE l.task_id=? AND l.item_id=? AND l.state='running' AND l.agent_id=agents.id AND l.run_id=agents.run_id)`, task.ID, task.ID, itemID))
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if lead.ID == req.To || lead.ID == req.AgentID {
+		return nil
+	}
+	sender := m.From.User
+	if req.AgentID != "" {
+		if err := tx.QueryRowContext(ctx, `SELECT name FROM agents WHERE id=?`, req.AgentID).Scan(&sender); err != nil {
+			return err
+		}
+	}
+	const fallback = "A teammate received a reply on your item"
+	subject, recipient := fallback, "the board"
+	if target.ID != "" {
+		subject, recipient = "Reply to "+target.Name+" on your item", target.Name
+	}
+	text := fmt.Sprintf("%s sent %s a %s on your item: %s. Read it with `tt inbox --seq %d`. No reply is needed.", sender, recipient, strings.ToUpper(e.Kind), e.Subject, m.Seq)
+	env := &api.Envelope{Kind: api.EnvelopeKindNotice, To: lead.Name, Subject: subject, Body: api.EnvelopeBody{Text: text},
+		Refs: map[string]string{"message": fmt.Sprint(m.Seq), "replyTo": fmt.Sprint(req.ReplyTo), "copy": "lead"}}
+	// Only the trusted recipient name may pass the subject's hash rule.
+	if err := api.NormalizeBrokerPost(&api.PostMessageRequest{Envelope: env}, target.Name); err != nil {
+		env.Subject = fallback
+	}
+	// The copy keeps the reply's item links; a linked post needs a request ID.
+	notice := api.PostMessageRequest{Envelope: env, To: lead.ID, WorkItems: m.WorkItems, WorkOrderMessage: m.WorkOrderMessage, RequestID: fmt.Sprintf("lead-copy-%d", m.Seq)}
+	posted, err := s.insertBrokerMessage(ctx, tx, task, notice, lead, target.Name)
+	if err != nil {
+		return err
+	}
+	return s.createObligations(ctx, tx, posted, notice, false) // a directed notice needs delivery only
 }
 
 func (s *Store) insertMessage(ctx context.Context, tx *sql.Tx, task api.Task, req api.PostMessageRequest, target api.Agent, by api.Caller, allowCrossProject, allowHistoricalRevision bool) (api.Message, error) {
@@ -1462,6 +1529,12 @@ func (s *Store) ListMessages(ctx context.Context, taskID string, after int64, ag
 // item. Board-wide and broadcast messages are visible to an unbound agent, and
 // to an agent bound to a work item only when they link that item.
 //
+// The page and the count differ in one case: the page of an item's lead also
+// shows messages that link its item and are addressed to its teammates, so the
+// lead can read a reply a teammate received (wi_85bfbdaa5e09fb64). Those are
+// never counted as unread: the count drives the roster and the relay's inbox
+// pass, and teammate traffic must not hold a lead's count above zero.
+//
 // For a bound agent the two cases are separate index searches, never one OR
 // predicate: messages_task_to finds what is addressed to the agent and
 // message_work_item_links_item finds what links its item. One predicate over
@@ -1470,6 +1543,12 @@ func (s *Store) ListMessages(ctx context.Context, taskID string, after int64, ag
 
 // inboxPageQuery returns the statement for one page of taskID's messages.
 func inboxPageQuery(taskID string, page api.MessagePageQuery, binding *api.AgentWorkItemBinding, limit int) (string, []any) {
+	return inboxPageQueryFor(taskID, page, binding, false, limit)
+}
+
+// inboxPageQueryFor is inboxPageQuery for a reader that may be the lead of
+// the item it is bound to (itemLead).
+func inboxPageQueryFor(taskID string, page api.MessagePageQuery, binding *api.AgentWorkItemBinding, itemLead bool, limit int) (string, []any) {
 	q := `SELECT ` + messageSelectCols + ` FROM messages m
 ` + messageSelectJoins + `
 WHERE m.task_id=?`
@@ -1497,8 +1576,13 @@ UNION
 SELECT message_seq FROM message_work_item_links WHERE item_task_id=? AND item_id=?`
 		args = append(args, binding.ItemTaskID, binding.ItemID)
 		seqRange("message_seq")
-		q += `) AND (m.to_agent=? OR m.broadcast=1 OR m.to_agent='')`
-		args = append(args, page.To)
+		q += `)`
+		// Of what links its item, a member sees only what is not addressed
+		// to someone else; the item's lead sees all of it.
+		if !itemLead {
+			q += ` AND (m.to_agent=? OR m.broadcast=1 OR m.to_agent='')`
+			args = append(args, page.To)
+		}
 	default:
 		seqRange("m.seq")
 		if page.To != "" {
@@ -1547,6 +1631,7 @@ func (s *Store) ListMessagesPage(ctx context.Context, taskID string, page api.Me
 		return nil, api.ErrInvalid
 	}
 	var binding *api.AgentWorkItemBinding
+	itemLead := false
 	if page.To != "" {
 		var runID, agentTaskID string
 		if err := s.db.QueryRowContext(ctx, `SELECT run_id,task_id FROM agents WHERE id=?`, page.To).Scan(&runID, &agentTaskID); err != nil || agentTaskID != taskID {
@@ -1557,8 +1642,16 @@ func (s *Store) ListMessagesPage(ctx context.Context, taskID string, page api.Me
 		if err != nil {
 			return nil, err
 		}
+		if binding != nil {
+			var one int
+			err = s.db.QueryRowContext(ctx, `SELECT 1 FROM item_team_leads WHERE task_id=? AND item_id=? AND agent_id=? AND run_id=? AND state<>'closed'`, binding.ItemTaskID, binding.ItemID, page.To, runID).Scan(&one)
+			if err != nil && !errors.Is(err, sql.ErrNoRows) {
+				return nil, err
+			}
+			itemLead = err == nil
+		}
 	}
-	q, args := inboxPageQuery(taskID, page, binding, limit)
+	q, args := inboxPageQueryFor(taskID, page, binding, itemLead, limit)
 	rows, err := s.db.QueryContext(ctx, q, args...)
 	if err != nil {
 		return nil, err
