@@ -564,6 +564,7 @@ targets.bridge   {host: "truenas", liveProbe: [...], readyWindowMs (optional, 0-
 targets.mini     {installPath, relayRestart: [...], relayLog, relayLabel, liveProbe: [...]}
 targets.tailos   {url (optional), switchWindowMs (optional, 0-300000, default 90000)}
 inputs.planTemplate  path to the handler's last TrueNAS preflight plan (template)
+retention        {releasedBackups (optional, integer >= 0, default 3), backupBudgetBytes (optional, integer >= 0, default 4294967296; 0 = no budget)}
 ```
 
 `liveProbe` is `["node","scripts/release-probe.mjs","live",TARGET,"--config",PATH]`.
@@ -596,6 +597,71 @@ release job"), the project handler, on the Mini in the dedicated checkout:
 
 A refused run prints only its own reason. A manifest that already exists is
 never rewritten; a changed job needs handler reconciliation.
+
+### Journal retention (wi_e83171b4c215f626)
+
+**Where backups live.** The authoritative pre-release backup is on TrueNAS at
+`/mnt/deepfreeze/tailterm-hub/backups/before-ID-NAME.sqlite` (NAME is `truenas`
+for a paired plan, otherwise `hub` or `bridge`). The deployer has no code path
+to it and never removes it. When the store schema changed, the handler's inputs
+run also copies it to the Mini as `journalDirectory/ID-NAME-backup.sqlite`. That
+local copy is read only by its own job's migration rehearsal; no rollback reads
+it.
+
+**Rehearsal copy.** The rehearsal migrates
+`ID-NAME-backup.sqlite.rehearsal-ID`, a copy of the local copy, and removes it
+and its SQLite sidecars (`-wal`, `-shm`, `-journal`) when the rehearsal ends,
+pass or fail. A failed cleanup never changes the rehearsal's result. Before
+copying it saves the marker `ID-NAME-backup.sqlite.rehearsal-ID.json` (0600):
+
+```
+{version: 1, jobId, backupSHA256, startedAt, outcome: "started"}
+{... outcome: "passed" | "failed", endedAt, copyRemoved: true | false}   when it ends
+```
+
+The marker holds no path, output or error text. A job whose marker exists is
+never rehearsed again ("Rehearsal already attempted; inspect prior attempt"),
+whatever the outcome, including `started` left by a run stopped mid-rehearsal.
+A rehearsal copy with no marker does not refuse; it is replaced.
+
+**Retention rule.** At every poll, after reconciliation and before any claim,
+the daemon sweeps the journal directory. It considers only jobs in
+`tt deployment list` and only the exact names `ID-truenas-backup.sqlite`,
+`ID-hub-backup.sqlite`, `ID-bridge-backup.sqlite` and their rehearsal copies,
+as regular files directly in `journalDirectory`:
+
+1. A job that is `verified`, `claimed`, `merged` or `blocked`, or in any state
+   the runner does not know as terminal, keeps everything, whatever the policy.
+2. A terminal job (`released`, `rolled_back`, `refused`, `superseded`) loses any
+   leftover rehearsal copy and sidecars (reason `terminal`).
+3. A terminal job that is not `released` loses its backup copy (reason
+   `not-released`).
+4. Released jobs are ordered newest first by `settledAt` compared as time; a job
+   without one is the oldest, in list order. The newest
+   `retention.releasedBackups` (default 3) keep their copies; older ones are
+   removed (reason `count`).
+5. While the bytes of all remaining listed backup copies, non-terminal jobs
+   included, exceed `retention.backupBudgetBytes` (default 4294967296, 4 GiB;
+   0 means no budget), the oldest kept released copy is removed (reason
+   `budget`). A non-terminal job's copy is never removed, even over budget.
+
+Files of a job not in the list, markers, journals, manifests, receipts, plans,
+`ID-migration`, `ID-mini-before`, `tailos-dist-COMMIT` and anything that is not a
+regular file are never touched. Both keys are optional; a value that is not a
+non-negative integer stops the daemon at startup.
+
+**Removal record.** Before each file is removed, one JSON line is appended and
+synced to `journalDirectory/retention.jsonl` (0600):
+
+```
+{version: 1, at, jobId, file, kind: "backup" | "rehearsal", bytes, reason: "terminal" | "not-released" | "count" | "budget"}
+```
+
+`file` is the name inside the journal directory. A sweep with nothing to remove
+writes nothing. A sweep that fails (for example the record cannot be written)
+removes nothing further, prints "Journal retention sweep failed; remaining
+backup copies kept." and the poll continues. The first poll after this change
+is deployed removes the existing backlog under the same rule.
 
 ## Operator runbook (d7)
 

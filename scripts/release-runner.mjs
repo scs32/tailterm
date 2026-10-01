@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { execFileSync } from "node:child_process";
-import { openSync, closeSync, fsyncSync, writeFileSync, readFileSync, renameSync, mkdirSync, mkdtempSync, existsSync, rmSync, copyFileSync, cpSync, chmodSync, statSync, realpathSync, constants } from "node:fs";
+import { openSync, closeSync, fsyncSync, writeFileSync, readFileSync, renameSync, mkdirSync, mkdtempSync, existsSync, rmSync, copyFileSync, cpSync, chmodSync, statSync, lstatSync, realpathSync, constants } from "node:fs";
 import { join, resolve, dirname, isAbsolute } from "node:path";
 import { digest, diffPaths, receiptEligible } from "./verify-matrix.mjs";
 import { selectReleaseTargets, releaseBaselines, schemaChanged } from "./release-targets.mjs";
@@ -479,10 +479,26 @@ export class HostAdapter {
   async rehearse(a){
     if(!a.backupCopy || !a.migrationBinary)throw new Error("Handler backup-copy import required");
     if(fileDigest(a.backupCopy)!==a.backupSHA256)throw new Error("Imported backup hash mismatch");
-    const {copyFileSync}=await import("node:fs");const copy=a.backupCopy+".rehearsal-"+this.job.id;
-    if(existsSync(copy))throw new Error("Rehearsal copy already exists; inspect prior attempt");copyFileSync(a.backupCopy,copy);
-    if(fileDigest(a.migrationBinary)!==a.migrationBinarySHA256)throw new Error("Candidate migration binary changed");
-    this.command([a.migrationBinary,"--migrate-only",copy]);
+    // The migrated copy is removed when the rehearsal ends, pass or fail. The
+    // marker beside it, not the copy, refuses a second attempt; it is saved
+    // before the copy exists and holds no path, output or error text.
+    const copy=a.backupCopy+".rehearsal-"+this.job.id,marker=copy+".json";
+    if(existsSync(marker))throw new Error("Rehearsal already attempted; inspect prior attempt");
+    const record={version:1,jobId:this.job.id,backupSHA256:a.backupSHA256,startedAt:new Date(this.now()).toISOString(),outcome:"started"};
+    save(marker,record);
+    const clear=()=>{let gone=true;for(const suffix of COPY_FILES){try{rmSync(copy+suffix,{force:true});}catch{gone=false;}}return gone;};
+    let outcome="failed";
+    try{
+      // A copy an earlier run left behind is replaced, sidecars included.
+      clear();copyFileSync(a.backupCopy,copy);
+      if(fileDigest(a.migrationBinary)!==a.migrationBinarySHA256)throw new Error("Candidate migration binary changed");
+      this.command([a.migrationBinary,"--migrate-only",copy]);outcome="passed";
+    }finally{
+      // Cleanup never changes the rehearsal's result; a copy left here is
+      // removed by the retention sweep once the job is terminal.
+      const copyRemoved=clear();
+      try{save(marker,{...record,outcome,endedAt:new Date(this.now()).toISOString(),copyRemoved});}catch{}
+    }
     return true;
   }
   async deploy(target,a){
@@ -638,6 +654,53 @@ export function reconcileReceipts(config,jobs){
     if(["finishing","receipt_pending"].includes(journal.phase) && journal.jobId===job.id && digest(journal.receipt)===digest(job.receipt)){journal.phase="complete";save(path,journal);}
   }
 }
+// Journal retention. The imported backup copy is read only by its job's
+// rehearsal (the authoritative backup stays on TrueNAS), so the journal keeps
+// it for every job that is not terminal and for the newest released jobs.
+const COPY_FILES=["","-wal","-shm","-journal"],BACKUP_NAMES=["truenas","hub","bridge"],TERMINAL=["released","rolled_back","refused","superseded"];
+export function retentionPolicy(config){
+  const retention=config?.retention??{};
+  if(typeof retention!=="object" || Array.isArray(retention))throw new Error("Invalid journal retention");
+  const value=(key,fallback)=>{const v=retention[key]===undefined?fallback:retention[key];if(!Number.isSafeInteger(v) || v<0)throw new Error("Invalid journal retention "+key);return v;};
+  return {releasedBackups:value("releasedBackups",3),backupBudgetBytes:value("backupBudgetBytes",4294967296)};
+}
+// Removes only the exact backup and rehearsal copy names of jobs in the
+// deployment list, each a regular file directly in the journal directory. A
+// job in any state not known to be terminal keeps everything; a terminal job
+// loses its leftover rehearsal copy, and its backup copy unless it is one of
+// the newest released jobs within the size budget. Every removal is appended
+// to retention.jsonl before the file goes. Returns the records written.
+export function pruneJournal(config,jobs,{now=()=>Date.now()}={}){
+  const policy=retentionPolicy(config),dir=config.journalDirectory,records=[];
+  const size=file=>{try{const s=lstatSync(join(dir,file));return s.isFile()?s.size:null;}catch{return null;}};
+  const remove=(jobId,file,kind,reason)=>{
+    const bytes=size(file);if(bytes===null)return 0;
+    const record={version:1,at:new Date(now()).toISOString(),jobId,file,kind,bytes,reason};
+    const fd=openSync(join(dir,"retention.jsonl"),"a",0o600);try{writeFileSync(fd,JSON.stringify(record)+"\n");fsyncSync(fd);}finally{closeSync(fd);}
+    rmSync(join(dir,file));records.push(record);return bytes;
+  };
+  let total=0;const released=[];
+  jobs.forEach((job,index)=>{
+    if(typeof job?.id!=="string" || !/^[A-Za-z0-9_-]+$/.test(job.id))return;
+    const backups=BACKUP_NAMES.map(name=>`${job.id}-${name}-backup.sqlite`);
+    const held=()=>backups.reduce((sum,file)=>sum+(size(file)??0),0);
+    if(!TERMINAL.includes(job.state)){total+=held();return;}
+    for(const file of backups)for(const suffix of COPY_FILES)remove(job.id,`${file}.rehearsal-${job.id}${suffix}`,"rehearsal","terminal");
+    if(job.state!=="released"){for(const file of backups)remove(job.id,file,"backup","not-released");return;}
+    // settledAt is RFC3339Nano with trimmed zeros, so it is compared as time;
+    // a job without a usable one is the oldest, in list order.
+    const at=Date.parse(job.settledAt??"");
+    released.push({id:job.id,backups,index,at:Number.isNaN(at)?-Infinity:at,bytes:held()});
+  });
+  released.sort((a,b)=>a.at===b.at?b.index-a.index:b.at-a.at);
+  const drop=(entry,reason)=>{for(const file of entry.backups)remove(entry.id,file,"backup",reason);};
+  const kept=released.slice(0,policy.releasedBackups);
+  for(const entry of released.slice(policy.releasedBackups))drop(entry,"count");
+  total+=kept.reduce((sum,entry)=>sum+entry.bytes,0);
+  // Oldest kept released copy first; a non-terminal job's copy stays even over budget.
+  while(policy.backupBudgetBytes>0 && total>policy.backupBudgetBytes && kept.length){const entry=kept.pop();total-=entry.bytes;drop(entry,"budget");}
+  return records;
+}
 // The four configured baselines, read from the private config at every poll
 // without restarting the daemon. A recorded hand release advances baselines
 // by itself through its superseded job (releaseBaselines); a config edit is
@@ -651,6 +714,7 @@ export function readBaselines(configPath){
 export async function serveDeployment(config,{once=false,signal,configPath,release=runRelease}={}) {
   if(config.version!==1 || config.enabled!==true || !config.cwd || !config.journalDirectory)throw new Error("Explicit private activation config required");
   tailosWindow(config);readyWindow(config,"hub");readyWindow(config,"bridge");
+  retentionPolicy(config);
   // One fence-wait notice per holder, waiting job and reason per process; the
   // hub returns the original for a restart's identical resend.
   const posted=new Set();
@@ -668,6 +732,7 @@ export async function serveDeployment(config,{once=false,signal,configPath,relea
     const reader=new HostAdapter(config,{});
     const jobs=JSON.parse(reader.command([config.tt||"tt","deployment","list"]));
     reconcileReceipts(config,jobs);reconcileHostLocks(config,jobs);
+    try{pruneJournal(config,jobs);}catch{process.stderr.write("Journal retention sweep failed; remaining backup copies kept.\n");}
     const skipped=new Set();
     for (;;) {
       const job=runnableJob(jobs,process.env.TAILTERM_AGENT,process.env.TAILTERM_RUN,skipped);

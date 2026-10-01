@@ -1,10 +1,10 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import {mkdtempSync,mkdirSync,writeFileSync,readFileSync,chmodSync,existsSync,statSync,readdirSync,rmSync} from "node:fs";
+import {mkdtempSync,mkdirSync,writeFileSync,readFileSync,chmodSync,existsSync,statSync,readdirSync,rmSync,symlinkSync} from "node:fs";
 import {tmpdir} from "node:os";
 import {join,dirname} from "node:path";
 import {execFileSync,spawn} from "node:child_process";
-import {integrateCandidate,publishIntegration,runRelease,liveCheck,runnableJob,HostAdapter,serveDeployment,reconcileHostLocks,revertCommit,moveReleaseRef,tasksHubCheckedOut,releaseError,failureReason,MATRIX_PREREQUISITES,MATRIX_RUN_PATTERN,MATRIX_HOST_WAIT_MS,missingPrerequisites,provisionPrerequisites,matrixRunTimeout} from "../scripts/release-runner.mjs";
+import {integrateCandidate,publishIntegration,runRelease,liveCheck,runnableJob,HostAdapter,serveDeployment,retentionPolicy,pruneJournal,reconcileHostLocks,revertCommit,moveReleaseRef,tasksHubCheckedOut,releaseError,failureReason,MATRIX_PREREQUISITES,MATRIX_RUN_PATTERN,MATRIX_HOST_WAIT_MS,missingPrerequisites,provisionPrerequisites,matrixRunTimeout} from "../scripts/release-runner.mjs";
 import {createHash} from "node:crypto";
 import {renderTeamDelivery} from "../client/team-delivery-view.js";
 import {targetsForPaths,selectReleaseTargets} from "../scripts/release-targets.mjs";
@@ -107,6 +107,122 @@ test("b1 schema rehearsal builds the exact candidate host binary and rejects sta
  const artifact=await adapter.prepare("hub",commit);assert.equal(artifact.schemaChanged,true);assert.equal(buildHeads.length,2);assert.deepEqual(buildHeads,[commit,commit]);assert.notEqual(artifact.migrationBinary,config.targets.hub.migrationBinary);
  await adapter.rehearse(artifact);assert.equal(migrationArgs[0],artifact.migrationBinary);assert.notEqual(migrationArgs[2],backup);assert.equal(readFileSync(backup,"utf8"),"backup");
  importInputs(adapter,commit,{hub:{...input,backupJobId:"rel_previous"}});await assert.rejects(adapter.prepare("hub",commit),/backup identity/);
+});
+
+// Journal retention (j1-j3). A rehearsal fixture: an imported backup copy and a
+// migration binary in a private journal directory, with the migration command
+// replaced by one that writes the copy and SQLite sidecars as a real one does.
+const SIDECARS=["","-wal","-shm","-journal"];
+function rehearsalFixture(id="rel_rehearse"){
+ const home=mkdtempSync(join(tmpdir(),"release-rehearsal-")),backup=join(home,id+"-truenas-backup.sqlite"),binary=join(home,id+"-migration");
+ writeFileSync(backup,"imported backup");writeFileSync(binary,"migration binary");
+ const adapter=new HostAdapter({cwd:home,journalDirectory:home},{id});let clock=Date.parse("2026-10-01T09:00:00Z");adapter.now=()=>clock+=1000;
+ const artifact={backupCopy:backup,backupSHA256:hash("imported backup"),migrationBinary:binary,migrationBinarySHA256:hash("migration binary")};
+ const copy=backup+".rehearsal-"+id,seen=[];
+ adapter.command=argv=>{seen.push({argv,copy:readFileSync(argv[2],"utf8"),wal:existsSync(argv[2]+"-wal")});for(const s of SIDECARS)writeFileSync(argv[2]+s,"migrated");return "";};
+ return {home,backup,binary,adapter,artifact,copy,marker:copy+".json",seen,left:()=>SIDECARS.filter(s=>existsSync(copy+s))};
+}
+test("a1 a passing rehearsal removes its copy and sidecars, marks passed and leaves the imported backup unchanged",async()=>{
+ const r=rehearsalFixture();assert.equal(await r.adapter.rehearse(r.artifact),true);
+ assert.deepEqual(r.seen.map(c=>c.argv),[[r.binary,"--migrate-only",r.copy]]);assert.equal(r.seen[0].copy,"imported backup");
+ assert.deepEqual(r.left(),[]);assert.equal(readFileSync(r.backup,"utf8"),"imported backup");
+ assert.deepEqual(JSON.parse(readFileSync(r.marker,"utf8")),{version:1,jobId:"rel_rehearse",backupSHA256:hash("imported backup"),startedAt:"2026-10-01T09:00:01.000Z",outcome:"passed",endedAt:"2026-10-01T09:00:02.000Z",copyRemoved:true});
+ assert.equal(statSync(r.marker).mode&0o777,0o600);
+});
+test("a2 a failing rehearsal rejects with the original error, removes its copy and marks failed",async()=>{
+ const r=rehearsalFixture(),failure=new Error("synthetic migration failure"),migrate=r.adapter.command;
+ r.adapter.command=argv=>{migrate(argv);throw failure;};
+ await assert.rejects(r.adapter.rehearse(r.artifact),error=>error===failure);
+ assert.deepEqual(r.left(),[]);assert.equal(readFileSync(r.backup,"utf8"),"imported backup");
+ const marker=JSON.parse(readFileSync(r.marker,"utf8"));assert.equal(marker.outcome,"failed");assert.equal(marker.copyRemoved,true);assert.ok(!readFileSync(r.marker,"utf8").includes("synthetic"));
+ // A migration binary changed after the build fails the same way, before any migration runs.
+ const b=rehearsalFixture("rel_binary");writeFileSync(b.binary,"another binary");
+ await assert.rejects(b.adapter.rehearse(b.artifact),/migration binary changed/);assert.equal(b.seen.length,0);assert.deepEqual(b.left(),[]);assert.equal(JSON.parse(readFileSync(b.marker,"utf8")).outcome,"failed");
+ // The runner journals the failed step exactly as before.
+ const f=fixture();mkdirSync(join(f.cwd,"hub/internal/api"),{recursive:true});const j=job(f,change(f,"hub/internal/api/fixture.go","fixture")),c=config(f,j),a=fake(),e=rehearsalFixture("rel_fixture");
+ a.prepare=async()=>({release:"fixture",artifactSHA256:"b".repeat(64),backup:"copy",backupSHA256:"c".repeat(64),preflightReceiptSHA256:"d".repeat(64),schemaChanged:true});
+ e.adapter.command=()=>{throw failure;};a.rehearse=artifact=>e.adapter.rehearse(e.artifact);
+ await assert.rejects(runRelease(c,a));assert.equal(JSON.parse(readFileSync(c.journalPath,"utf8")).failure.step,"rehearse");assert.ok(!a.calls.some(x=>x.startsWith("deploy:")));assert.deepEqual(e.left(),[]);
+});
+test("a3 the marker, not the copy, refuses a second rehearsal",async()=>{
+ for(const fail of [false,true]){
+  const r=rehearsalFixture(),migrate=r.adapter.command;if(fail)r.adapter.command=argv=>{migrate(argv);throw new Error("synthetic migration failure");};
+  await r.adapter.rehearse(r.artifact).catch(()=>{});assert.deepEqual(r.left(),[]);const before=readFileSync(r.marker,"utf8");
+  await assert.rejects(r.adapter.rehearse(r.artifact),/Rehearsal already attempted; inspect prior attempt/);
+  assert.equal(r.seen.length,1,"the migration is not run again");assert.deepEqual(r.left(),[]);assert.equal(readFileSync(r.marker,"utf8"),before);
+ }
+ // A run stopped mid-rehearsal leaves a started marker, which refuses too and keeps the copy for inspection.
+ const stopped=rehearsalFixture("rel_stopped");writeFileSync(stopped.marker,JSON.stringify({version:1,jobId:"rel_stopped",outcome:"started"}));writeFileSync(stopped.copy,"half migrated");
+ await assert.rejects(stopped.adapter.rehearse(stopped.artifact),/already attempted/);assert.equal(stopped.seen.length,0);assert.equal(readFileSync(stopped.copy,"utf8"),"half migrated");
+ // A copy with no marker does not refuse: it and its sidecars are replaced by a fresh copy.
+ const stale=rehearsalFixture("rel_stale");writeFileSync(stale.copy,"stale copy");writeFileSync(stale.copy+"-wal","stale wal");
+ assert.equal(await stale.adapter.rehearse(stale.artifact),true);assert.deepEqual(stale.seen.map(c=>[c.copy,c.wal]),[["imported backup",false]]);
+ assert.deepEqual(stale.left(),[]);assert.equal(JSON.parse(readFileSync(stale.marker,"utf8")).outcome,"passed");
+});
+// A fake journal: files maps a name to its size in bytes.
+function journalFixture(files){
+ const dir=mkdtempSync(join(tmpdir(),"release-retention-"));for(const [name,bytes] of Object.entries(files))writeFileSync(join(dir,name),"x".repeat(bytes));
+ return {dir,names:()=>readdirSync(dir).filter(n=>n!=="retention.jsonl").sort(),lines:()=>existsSync(join(dir,"retention.jsonl"))?readFileSync(join(dir,"retention.jsonl"),"utf8").split("\n").filter(Boolean).map(l=>JSON.parse(l)):[]};
+}
+const copyOf=id=>id+"-truenas-backup.sqlite",sweep=(j,jobs,retention)=>pruneJournal({journalDirectory:j.dir,retention},jobs,{now:()=>Date.parse("2026-10-01T09:30:00Z")});
+test("a4 retention by count keeps the newest released jobs by settled time and no copy of a rolled back job",()=>{
+ // Newest by time is d then c. Text order would pick a and c; list order would pick b and c.
+ const jobs=[{id:"rel_d",state:"released",settledAt:"2026-09-30T10:00:00.95Z"},{id:"rel_a",state:"released",settledAt:"2026-09-30T10:00:00Z"},{id:"rel_e",state:"rolled_back",settledAt:"2026-09-30T11:00:00Z"},{id:"rel_c",state:"released",settledAt:"2026-09-30T10:00:00.9Z"},{id:"rel_b",state:"released",settledAt:"2026-09-30T10:00:00.1Z"}];
+ const j=journalFixture(Object.fromEntries(jobs.map(x=>[copyOf(x.id),10])));
+ const removed=sweep(j,jobs,{releasedBackups:2,backupBudgetBytes:0});
+ assert.deepEqual(j.names(),[copyOf("rel_c"),copyOf("rel_d")]);
+ assert.deepEqual(removed.map(r=>[r.jobId,r.reason]).sort(),[["rel_a","count"],["rel_b","count"],["rel_e","not-released"]]);
+});
+test("a5 retention by budget removes the oldest released copies until the total fits",()=>{
+ // rel_legacy has no settledAt, so it is the oldest; the claimed job's copy counts but is never removed.
+ const jobs=[{id:"rel_new",state:"released",settledAt:"2026-09-30T12:00:00Z"},{id:"rel_legacy",state:"released"},{id:"rel_mid",state:"released",settledAt:"2026-09-30T11:00:00Z"},{id:"rel_live",state:"claimed"}];
+ const j=journalFixture(Object.fromEntries(jobs.map(x=>[copyOf(x.id),100])));
+ const removed=sweep(j,jobs,{releasedBackups:10,backupBudgetBytes:250});
+ assert.deepEqual(removed.map(r=>[r.jobId,r.reason,r.bytes]),[["rel_legacy","budget",100],["rel_mid","budget",100]]);
+ assert.deepEqual(j.names(),[copyOf("rel_live"),copyOf("rel_new")]);
+ // Within budget nothing goes, and zero means no budget.
+ for(const budget of [300,0]){const k=journalFixture({[copyOf("rel_new")]:100,[copyOf("rel_mid")]:100,[copyOf("rel_live")]:100});assert.deepEqual(sweep(k,jobs,{releasedBackups:10,backupBudgetBytes:budget}),[]);assert.equal(k.names().length,3);}
+});
+test("a6 a job that is not terminal keeps its backup and rehearsal copies under any policy",()=>{
+ const live=["verified","claimed","merged","blocked","some_future_state"].map(state=>({id:"rel_"+state,state})),done={id:"rel_done",state:"released",settledAt:"2026-09-30T12:00:00Z"};
+ const blocked=copyOf("rel_blocked")+".rehearsal-rel_blocked",leftover=copyOf("rel_done")+".rehearsal-rel_done";
+ const j=journalFixture({...Object.fromEntries([...live,done].map(x=>[copyOf(x.id),50])),[blocked]:50,[blocked+"-wal"]:5,[blocked+".json"]:5,[leftover]:50,[leftover+"-shm"]:5,[leftover+".json"]:5});
+ const removed=sweep(j,[...live,done],{releasedBackups:0,backupBudgetBytes:1});
+ assert.deepEqual(removed.map(r=>[r.file,r.kind,r.reason]),[[leftover,"rehearsal","terminal"],[leftover+"-shm","rehearsal","terminal"],[copyOf("rel_done"),"backup","count"]]);
+ assert.deepEqual(j.names(),[...live.map(x=>copyOf(x.id)),blocked,blocked+"-wal",blocked+".json",leftover+".json"].sort());
+});
+test("a7 every removal is recorded once and nothing but listed backup and rehearsal copies is touched",()=>{
+ const jobs=[{id:"rel_old",state:"released",settledAt:"2026-09-29T12:00:00Z"},{id:"rel_new",state:"released",settledAt:"2026-09-30T12:00:00Z"},{id:"rel_refused",state:"refused"},{id:"../rel_escape",state:"refused"}];
+ const others=["rel_old.json","rel_old-inputs.json","rel_old-receipt.json","rel_old-truenas-plan.json","rel_old-migration","rel_old-mini-before","rel_old-truenas-backup.sqlite.rehearsal-rel_old.json","rel_old-truenas-backup.sqlite.tmp","rel_unlisted-truenas-backup.sqlite","rel_unlisted-truenas-backup.sqlite.rehearsal-rel_unlisted","mini-relay-offset.json"];
+ const j=journalFixture({[copyOf("rel_old")]:30,"rel_old-hub-backup.sqlite":20,[copyOf("rel_old")+".rehearsal-rel_old"]:7,[copyOf("rel_new")]:30,"rel_refused-bridge-backup.sqlite":11,...Object.fromEntries(others.map(n=>[n,3]))});
+ // Only a regular file directly in the journal directory is a copy: a directory or link of that name stays.
+ mkdirSync(join(j.dir,"tailos-dist-fixture"));mkdirSync(join(j.dir,"rel_refused-hub-backup.sqlite"));symlinkSync(join(j.dir,"rel_old.json"),join(j.dir,copyOf("rel_refused")));
+ const escape=join(dirname(j.dir),"rel_escape-truenas-backup.sqlite");writeFileSync(escape,"outside");
+ try{
+  const removed=sweep(j,jobs,{releasedBackups:1,backupBudgetBytes:0}),expected=[
+   {jobId:"rel_old",file:copyOf("rel_old")+".rehearsal-rel_old",kind:"rehearsal",bytes:7,reason:"terminal"},{jobId:"rel_refused",file:"rel_refused-bridge-backup.sqlite",kind:"backup",bytes:11,reason:"not-released"},
+   {jobId:"rel_old",file:copyOf("rel_old"),kind:"backup",bytes:30,reason:"count"},{jobId:"rel_old",file:"rel_old-hub-backup.sqlite",kind:"backup",bytes:20,reason:"count"}].map(r=>({version:1,at:"2026-10-01T09:30:00.000Z",...r}));
+  assert.deepEqual(removed,expected);assert.deepEqual(j.lines(),expected);assert.equal(statSync(join(j.dir,"retention.jsonl")).mode&0o777,0o600);
+  assert.deepEqual(j.names(),[...others,copyOf("rel_new"),copyOf("rel_refused"),"rel_refused-hub-backup.sqlite","tailos-dist-fixture"].sort());
+  assert.equal(readFileSync(escape,"utf8"),"outside");
+  assert.deepEqual(sweep(j,jobs,{releasedBackups:1,backupBudgetBytes:0}),[],"a second sweep removes nothing");assert.deepEqual(j.lines(),expected);
+ }finally{rmSync(escape,{force:true});}
+});
+test("a8 retention defaults apply, an invalid value stops the daemon before any command, and a failed sweep does not hold the poll",async()=>{
+ assert.deepEqual(retentionPolicy({}),{releasedBackups:3,backupBudgetBytes:4294967296});assert.deepEqual(retentionPolicy({retention:{releasedBackups:0}}),{releasedBackups:0,backupBudgetBytes:4294967296});
+ const cwd=mkdtempSync(join(tmpdir(),"release-retention-daemon-")),log=join(cwd,"calls"),fakeTT=join(cwd,"tt");
+ const jobs=[...["rel_1","rel_2","rel_3","rel_4"].map((id,i)=>({id,state:"released",settledAt:`2026-09-30T1${i}:00:00Z`})),{id:"next",state:"verified",generation:1}];
+ writeFileSync(fakeTT,"#!"+process.execPath+"\n"+`const fs=require('fs');const a=process.argv.slice(2);fs.appendFileSync(${JSON.stringify(log)},a.join(' ')+'\\n');if(a[1]==='list')console.log(${JSON.stringify(JSON.stringify(jobs))});else process.exit(2);`);chmodSync(fakeTT,0o755);
+ const base={version:1,enabled:true,cwd,journalDirectory:cwd,tt:fakeTT};
+ for(const retention of [{releasedBackups:-1},{releasedBackups:1.5},{releasedBackups:"3"},{backupBudgetBytes:-1},{backupBudgetBytes:0.5},{backupBudgetBytes:null},"3",[3]])await assert.rejects(serveDeployment({...base,retention},{once:true}),/Invalid journal retention/);
+ assert.ok(!existsSync(log),"no command ran");
+ // The default policy keeps three released copies: the poll removes the oldest and still tries the waiting job.
+ for(const x of jobs.slice(0,4))writeFileSync(join(cwd,copyOf(x.id)),"copy");
+ await serveDeployment(base,{once:true});assert.ok(!existsSync(join(cwd,copyOf("rel_1"))));assert.deepEqual(["rel_2","rel_3","rel_4"].filter(id=>existsSync(join(cwd,copyOf(id)))),["rel_2","rel_3","rel_4"]);
+ assert.match(readFileSync(log,"utf8"),/^deployment list\ndeployment claim --job next /);
+ // A removal record that cannot be written fails the sweep: the copy stays and the poll goes on to the claim.
+ rmSync(log);rmSync(join(cwd,"retention.jsonl"));mkdirSync(join(cwd,"retention.jsonl"));
+ await serveDeployment({...base,retention:{releasedBackups:0}},{once:true});assert.ok(existsSync(join(cwd,copyOf("rel_4"))));assert.match(readFileSync(log,"utf8"),/^deployment list\ndeployment claim --job next /);
 });
 test("b2 independently records restored Mini after failed TailOS rollback",async()=>{
  const f=fixture();mkdirSync(join(f.cwd,"hub/cmd/tt"),{recursive:true});change(f,"hub/cmd/tt/main.go","fixture");const j=job(f,change(f,"client/a.js","a")),a=fake();let receipt;
