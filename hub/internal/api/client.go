@@ -362,6 +362,29 @@ func (c *Client) LatestMessages(ctx context.Context, task string, limit int) ([]
 	return out.Messages, c.do(ctx, "GET", "/v1/tasks/"+task+"/messages?"+q.Encode(), nil, &out)
 }
 
+// ListMessagesPage returns one page of a task's messages, oldest first.
+func (c *Client) ListMessagesPage(ctx context.Context, task string, page MessagePageQuery) ([]Message, error) {
+	q := url.Values{}
+	q.Set("after", strconv.FormatInt(page.After, 10))
+	if page.Before > 0 {
+		q.Set("before", strconv.FormatInt(page.Before, 10))
+	}
+	if page.To != "" {
+		q.Set("to", page.To)
+	}
+	if page.DirectedOnly {
+		q.Set("directed", "1")
+	}
+	if page.Newest {
+		q.Set("latest", "1")
+	}
+	if page.Limit > 0 {
+		q.Set("limit", strconv.Itoa(page.Limit))
+	}
+	var out MessageList
+	return out.Messages, c.do(ctx, "GET", "/v1/tasks/"+task+"/messages?"+q.Encode(), nil, &out)
+}
+
 func (c *Client) MarkRead(ctx context.Context, task string, req MarkReadRequest) error {
 	return c.do(ctx, "POST", "/v1/tasks/"+task+"/messages/read", req, nil)
 }

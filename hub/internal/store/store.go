@@ -59,6 +59,7 @@ CREATE TABLE IF NOT EXISTS messages (
   to_agent TEXT NOT NULL DEFAULT '', text TEXT NOT NULL, created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS messages_task ON messages(task_id, seq);
+CREATE INDEX IF NOT EXISTS messages_task_to ON messages(task_id, to_agent, seq);
 CREATE TABLE IF NOT EXISTS events (
   seq INTEGER PRIMARY KEY AUTOINCREMENT, task_id TEXT NOT NULL,
   kind TEXT NOT NULL, agent_id TEXT NOT NULL DEFAULT '', text TEXT NOT NULL DEFAULT '',
@@ -1009,6 +1010,11 @@ func (s *Store) ListAgents(ctx context.Context, taskID string) ([]api.Agent, err
 		if out[i].ReadUpTo, err = s.ReadCursor(ctx, taskID, out[i].ID); err != nil {
 			return nil, err
 		}
+		// A closed or exited agent no longer reads, so the roster does not
+		// count for it; GetAgent still returns its exact count.
+		if out[i].Status == api.AgentClosed || out[i].Status == api.AgentExited {
+			continue
+		}
 		if out[i].Unread, err = s.Unread(ctx, taskID, out[i].ID); err != nil {
 			return nil, err
 		}
@@ -1439,49 +1445,120 @@ func (s *Store) insertMessageNormalized(ctx context.Context, tx *sql.Tx, task ap
 	return m, nil
 }
 
-// ListMessages returns messages after seq. When agentID is set, only broadcast
-// messages and messages addressed to that agent are returned.
+// ListMessages returns messages after seq, or the newest page when after is
+// negative. When agentID is set, only what that agent's inbox shows is
+// returned (inboxPageQuery).
 func (s *Store) ListMessages(ctx context.Context, taskID string, after int64, agentID string, limit int) ([]api.Message, error) {
+	page := api.MessagePageQuery{After: after, To: agentID, Limit: limit}
+	if after < 0 {
+		page.After, page.Newest = 0, true
+	}
+	return s.ListMessagesPage(ctx, taskID, page)
+}
+
+// Inbox visibility is defined here once, for the page (inboxPageQuery) and
+// the unread count (inboxUnreadQuery), so the two cannot drift. A message
+// addressed to the agent is always visible, whether or not it links a work
+// item. Board-wide and broadcast messages are visible to an unbound agent, and
+// to an agent bound to a work item only when they link that item.
+//
+// For a bound agent the two cases are separate index searches, never one OR
+// predicate: messages_task_to finds what is addressed to the agent and
+// message_work_item_links_item finds what links its item. One predicate over
+// both made every roster call scan the task's messages for each agent
+// (wi_e1b6ca74b7e58414).
+
+// inboxPageQuery returns the statement for one page of taskID's messages.
+func inboxPageQuery(taskID string, page api.MessagePageQuery, binding *api.AgentWorkItemBinding, limit int) (string, []any) {
+	q := `SELECT ` + messageSelectCols + ` FROM messages m
+` + messageSelectJoins + `
+WHERE m.task_id=?`
+	args := []any{taskID}
+	seqRange := func(col string) {
+		q += ` AND ` + col + `>?`
+		args = append(args, page.After)
+		if page.Before > 0 {
+			q += ` AND ` + col + `<?`
+			args = append(args, page.Before)
+		}
+	}
+	switch {
+	case page.DirectedOnly:
+		q += ` AND m.to_agent=?`
+		args = append(args, page.To)
+		seqRange("m.seq")
+	case page.To != "" && binding != nil:
+		q += ` AND m.seq IN (
+SELECT seq FROM messages WHERE task_id=? AND to_agent=?`
+		args = append(args, taskID, page.To)
+		seqRange("seq")
+		q += `
+UNION
+SELECT message_seq FROM message_work_item_links WHERE item_task_id=? AND item_id=?`
+		args = append(args, binding.ItemTaskID, binding.ItemID)
+		seqRange("message_seq")
+		q += `) AND (m.to_agent=? OR m.broadcast=1 OR m.to_agent='')`
+		args = append(args, page.To)
+	default:
+		seqRange("m.seq")
+		if page.To != "" {
+			q += ` AND (m.broadcast=1 OR m.to_agent='' OR m.to_agent=?)`
+			args = append(args, page.To)
+		}
+	}
+	if page.Newest {
+		q += ` ORDER BY m.seq DESC LIMIT ?`
+	} else {
+		q += ` ORDER BY m.seq LIMIT ?`
+	}
+	return q, append(args, limit)
+}
+
+// inboxUnreadQuery returns the statement counting what agentID's inbox shows
+// after cursor that it did not send.
+func inboxUnreadQuery(taskID, agentID string, cursor int64, binding *api.AgentWorkItemBinding) (string, []any) {
+	if binding == nil {
+		return `SELECT COUNT(*) FROM messages m WHERE m.task_id=? AND m.seq>? AND m.from_agent<>? AND (m.broadcast=1 OR m.to_agent='' OR m.to_agent=?)`,
+			[]any{taskID, cursor, agentID, agentID}
+	}
+	// The second count excludes what is addressed to the agent, so a linked
+	// broadcast addressed to it is counted once. CROSS JOIN fixes the join
+	// order: SQLite otherwise walks every message after the cursor and
+	// probes the links, rather than starting from the item's links.
+	return `SELECT
+(SELECT COUNT(*) FROM messages m WHERE m.task_id=? AND m.to_agent=? AND m.seq>? AND m.from_agent<>?)
++
+(SELECT COUNT(*) FROM message_work_item_links l CROSS JOIN messages m ON m.seq=l.message_seq
+WHERE l.item_task_id=? AND l.item_id=? AND l.message_seq>?
+AND m.task_id=? AND m.from_agent<>? AND m.to_agent<>? AND (m.broadcast=1 OR m.to_agent=''))`,
+		[]any{taskID, agentID, cursor, agentID, binding.ItemTaskID, binding.ItemID, cursor, taskID, agentID, agentID}
+}
+
+// ListMessagesPage returns one page of a task's messages, oldest first:
+// seq in (After, Before) when Before is set, limited to what page.To's inbox
+// shows, and to messages addressed to it when DirectedOnly. Newest selects the
+// newest matching page rather than the oldest.
+func (s *Store) ListMessagesPage(ctx context.Context, taskID string, page api.MessagePageQuery) ([]api.Message, error) {
+	limit := page.Limit
 	if limit <= 0 || limit > api.MaxLimit {
 		limit = api.MaxLimit
 	}
+	if page.After < 0 || page.Before < 0 || (page.DirectedOnly && page.To == "") {
+		return nil, api.ErrInvalid
+	}
 	var binding *api.AgentWorkItemBinding
-	if agentID != "" {
+	if page.To != "" {
 		var runID, agentTaskID string
-		if err := s.db.QueryRowContext(ctx, `SELECT run_id,task_id FROM agents WHERE id=?`, agentID).Scan(&runID, &agentTaskID); err != nil || agentTaskID != taskID {
+		if err := s.db.QueryRowContext(ctx, `SELECT run_id,task_id FROM agents WHERE id=?`, page.To).Scan(&runID, &agentTaskID); err != nil || agentTaskID != taskID {
 			return nil, api.ErrInvalid
 		}
 		var err error
-		binding, err = loadAgentWorkItemBinding(s.db, ctx, agentID, runID)
+		binding, err = loadAgentWorkItemBinding(s.db, ctx, page.To, runID)
 		if err != nil {
 			return nil, err
 		}
 	}
-	q := `SELECT ` + messageSelectCols + ` FROM messages m
-` + messageSelectJoins
-	args := []any{}
-	if binding != nil {
-		q += `
-LEFT JOIN message_work_item_links item_scope ON item_scope.message_seq=m.seq AND item_scope.item_task_id=? AND item_scope.item_id=?`
-		args = append(args, binding.ItemTaskID, binding.ItemID)
-	}
-	q += `
-WHERE m.task_id=? AND m.seq>?`
-	args = append(args, taskID, after)
-	if agentID != "" {
-		q += ` AND (broadcast=1 OR to_agent='' OR to_agent=?)`
-		args = append(args, agentID)
-	}
-	if binding != nil {
-		q += ` AND (item_scope.message_seq IS NOT NULL OR (m.system_notice_kind='queue_changed' AND m.to_agent=?))`
-		args = append(args, agentID)
-	}
-	if after < 0 {
-		q += ` ORDER BY seq DESC LIMIT ?`
-	} else {
-		q += ` ORDER BY seq LIMIT ?`
-	}
-	args = append(args, limit)
+	q, args := inboxPageQuery(taskID, page, binding, limit)
 	rows, err := s.db.QueryContext(ctx, q, args...)
 	if err != nil {
 		return nil, err
@@ -1513,7 +1590,7 @@ WHERE m.task_id=? AND m.seq>?`
 			out[index].WorkOrderMessage = original.WorkOrderMessage
 		}
 	}
-	if after < 0 {
+	if page.Newest {
 		for i, j := 0, len(out)-1; i < j; i, j = i+1, j-1 {
 			out[i], out[j] = out[j], out[i]
 		}
@@ -1556,14 +1633,7 @@ func (s *Store) Unread(ctx context.Context, taskID, agentID string) (int, error)
 	if err != nil {
 		return 0, err
 	}
-	query := `SELECT COUNT(*) FROM messages m`
-	args := []any{}
-	if binding != nil {
-		query += ` JOIN message_work_item_links scope ON scope.message_seq=m.seq AND scope.item_task_id=? AND scope.item_id=?`
-		args = append(args, binding.ItemTaskID, binding.ItemID)
-	}
-	query += ` WHERE m.task_id=? AND m.seq>? AND m.from_agent<>? AND (m.broadcast=1 OR m.to_agent='' OR m.to_agent=?)`
-	args = append(args, taskID, cursor, agentID, agentID)
+	query, args := inboxUnreadQuery(taskID, agentID, cursor, binding)
 	var n int
 	err = s.db.QueryRowContext(ctx, query, args...).Scan(&n)
 	return n, err

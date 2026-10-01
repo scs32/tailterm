@@ -363,6 +363,19 @@ type MessageList struct {
 	Messages []Message `json:"messages"`
 }
 
+// MessagePageQuery selects one page of a task's messages. To limits the page
+// to what that agent's inbox shows; DirectedOnly further keeps only messages
+// addressed to it. Newest returns the newest matching page instead of the
+// oldest; pages are always returned oldest first.
+type MessagePageQuery struct {
+	After        int64
+	Before       int64
+	To           string
+	DirectedOnly bool
+	Newest       bool
+	Limit        int
+}
+
 type EventList struct {
 	Events []Event `json:"events"`
 	Next   int64   `json:"next"`
