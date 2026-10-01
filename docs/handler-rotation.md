@@ -50,6 +50,20 @@ Closing a retired handler that is not the primary is always allowed, since it is
 no longer available. The hub does not check its leases or obligations; rotation
 and the queue own those.
 
+`tt close` applies this rule in two steps (`wi_67fb6b7716a5c1b4`):
+
+- A retired handler: `tt close` sends the close to the hub with the handler's
+  exact run. A non-primary one closes and its session is cleaned up. If the hub
+  refuses, for example a retired primary, `tt close` prints the hub's reason
+  (`hub: 409 conflict: <name> is the project's primary database handler; ...`)
+  and leaves the session alone.
+- A handler in any other status: `tt close` refuses before contacting the hub,
+  with `the active database handler remains available while the project is open`.
+  Retire it first (`tt retire`, which the floor checks) or rotate it.
+
+Its other checks still run first for a retired handler: the session must be on
+this host, and the project orchestrator and an item lead are not closed this way.
+
 An `exited` report is never refused. When it (or a retire or close with a ready
 successor) takes the available count to zero, the hub posts one board-wide owner
 NOTICE, `Owner attention: the project has no available database handler`, with
@@ -265,8 +279,8 @@ directory are inert without the new CLI.
   that dies without one still counts as available, and no notice is posted.
 - The hub does not reprovision a handler when the count reaches zero; that is
   follow-up `wi_42be87739d7bbfc9`.
-- `tt close` still refuses every database handler on the client side, including
-  a retired non-primary one the hub would accept, until follow-up
-  `wi_67fb6b7716a5c1b4`.
+- `tt close` still refuses a database handler that is not retired on the client
+  side, including a non-primary one the hub would accept while another handler
+  is available. Retire it first, then close it.
 - Team launch cleanup cannot close a failed launch that is the project's only
   handler; the handler stays starting and the owner sees it.
