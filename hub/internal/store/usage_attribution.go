@@ -8,6 +8,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/scs32/tailterm/hub/internal/api"
 )
@@ -88,10 +89,9 @@ func freezeUsageRole(ctx context.Context, tx *sql.Tx, p *usageRunProvenance) err
 	return rows.Err()
 }
 func resolveUsage(ctx context.Context, tx *sql.Tx, task, agent, run string, t api.UsageTurn, p usageRunProvenance) (api.UsageProjection, error) {
-	out := api.UsageProjection{Turn: t, AgentID: agent, RunID: run, Role: p.Role, RoleSource: p.RoleSource, Phase: "hand-offs", PhaseReason: "no applicable handled order"}
+	out := api.UsageProjection{Turn: t, AgentID: agent, RunID: run, Role: p.Role, RoleSource: p.RoleSource, Phase: "hand-offs", PhaseReason: usageNoOpenOrder}
 	items := map[string]api.UsageAttribution{}
 	seen := map[string]bool{}
-	var messages []api.Message
 	invalid := false
 	var visit func(api.MessageReference, int) error
 	visit = func(ref api.MessageReference, depth int) error {
@@ -112,7 +112,6 @@ func resolveUsage(ctx context.Context, tx *sql.Tx, task, agent, run string, t ap
 			return err
 		}
 		out.Evidence = append(out.Evidence, ref)
-		messages = append(messages, m)
 		add := func(project, item string) {
 			if project == "" {
 				project = m.TaskID
@@ -215,93 +214,230 @@ func resolveUsage(ctx context.Context, tx *sql.Tx, task, agent, run string, t ap
 			out.Shares = append(out.Shares, x)
 		}
 	}
-	if p.Role == "database_handler" {
-		out.Phase = "handler bookkeeping"
-		out.PhaseReason = "authoritative handler role"
-		return out, nil
+	phase, reason, round, err := classifyUsagePhase(ctx, tx, out, newUsagePhaseCache())
+	if err != nil {
+		return out, err
 	}
-	// Results do not replace the phase of the applicable active request. Opening
-	// request inherits the first handled request; later requests use latest <= At.
-	sort.Slice(messages, func(i, j int) bool {
-		if messages[i].CreatedAt.Equal(messages[j].CreatedAt) {
-			return messages[i].Seq < messages[j].Seq
+	out.Phase, out.ReviewRound = phase, round
+	if !invalid || reason != usageNoOpenOrder {
+		out.PhaseReason = reason
+	}
+	return out, nil
+}
+
+const usageNoOpenOrder = "no open order at request time"
+
+// usageOrder is an assign, review or request an agent owed an outcome for, and
+// the window it stayed open. A zero closed time means it is still open.
+type usageOrder struct {
+	ref            api.MessageReference
+	kind           string
+	opened, closed time.Time
+}
+
+// usagePhaseCache holds the lookups of one report or one ingest, so that
+// classifying a request costs no query once its agent's orders are loaded.
+type usagePhaseCache struct {
+	orders       map[string][]usageOrder
+	messages     map[string]*api.Message
+	reviews      map[string]api.ReviewConvergence
+	orderQueries int
+}
+
+func newUsagePhaseCache() *usagePhaseCache {
+	return &usagePhaseCache{orders: map[string][]usageOrder{}, messages: map[string]*api.Message{}, reviews: map[string]api.ReviewConvergence{}}
+}
+func (c *usagePhaseCache) agentOrders(ctx context.Context, q queryRower, agent string) ([]usageOrder, error) {
+	if orders, ok := c.orders[agent]; ok {
+		return orders, nil
+	}
+	c.orderQueries++
+	rows, err := q.QueryContext(ctx, `SELECT task_id,message_seq,source_kind,created_at,closed_at FROM obligations WHERE agent_id=? AND needs=? AND source_kind IN ('assign','review','request')`, agent, api.ObligationNeedsOutcome)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	orders := []usageOrder{}
+	for rows.Next() {
+		var o usageOrder
+		var opened, closed string
+		if err = rows.Scan(&o.ref.TaskID, &o.ref.Seq, &o.kind, &opened, &closed); err != nil {
+			return nil, err
 		}
-		return messages[i].CreatedAt.Before(messages[j].CreatedAt)
+		o.opened, o.closed = parseTS(opened), parseTS(closed)
+		orders = append(orders, o)
+	}
+	if err = rows.Err(); err != nil {
+		return nil, err
+	}
+	sort.Slice(orders, func(i, j int) bool {
+		if orders[i].opened.Equal(orders[j].opened) {
+			return orders[i].ref.Seq < orders[j].ref.Seq
+		}
+		return orders[i].opened.Before(orders[j].opened)
 	})
+	c.orders[agent] = orders
+	return orders, nil
+}
+
+// message returns nil for a reference that no longer resolves.
+func (c *usagePhaseCache) message(ctx context.Context, q queryRower, ref api.MessageReference) (*api.Message, error) {
+	key := ref.TaskID + "/" + stringID(ref.Seq)
+	if m, ok := c.messages[key]; ok {
+		return m, nil
+	}
+	m, err := loadMessage(q, ctx, ref.TaskID, ref.Seq)
+	if errors.Is(err, api.ErrNotFound) {
+		c.messages[key] = nil
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	c.messages[key] = &m
+	return &m, nil
+}
+func (c *usagePhaseCache) review(ctx context.Context, q queryRower, task, item string) (api.ReviewConvergence, error) {
+	key := task + "/" + item
+	if state, ok := c.reviews[key]; ok {
+		return state, nil
+	}
+	state, err := reviewState(ctx, q, task, item)
+	if err == nil {
+		c.reviews[key] = state
+	}
+	return state, err
+}
+func usageOrderKind(m *api.Message) bool {
+	if m == nil || m.Envelope == nil {
+		return false
+	}
+	k := m.Envelope.Kind
+	return k == "assign" || k == "request" || k == "review"
+}
+
+// classifyUsagePhase names what the agent was doing when it made the request:
+// the order addressed to it that was open at the request time governs, from
+// the moment it was posted until the agent's outcome closed it. Messages the
+// agent wrote never govern. It reads only fields a stored projection keeps, so
+// ingest and every report apply the same rule.
+func classifyUsagePhase(ctx context.Context, q queryRower, p api.UsageProjection, c *usagePhaseCache) (string, string, int, error) {
+	if p.Role == "database_handler" {
+		return "handler bookkeeping", "authoritative handler role", 0, nil
+	}
+	orders, err := c.agentOrders(ctx, q, p.AgentID)
+	if err != nil {
+		return "", "", 0, err
+	}
+	at := p.Turn.At
+	strong := func(o *usageOrder) bool { return o.kind == "assign" || o.kind == "review" }
+	var open *usageOrder
+	// An order posted by the request time is settled by its own window; handled
+	// evidence can no longer vouch for it.
+	windowed := map[string]bool{}
+	for i := range orders {
+		o := &orders[i]
+		if o.opened.After(at) {
+			continue
+		}
+		windowed[o.ref.TaskID+"/"+stringID(o.ref.Seq)] = true
+		if !o.closed.IsZero() && !o.closed.After(at) {
+			continue
+		}
+		// Orders arrive oldest first: a later one wins unless it is a plain
+		// request and an assign or review is already open.
+		if open == nil || strong(o) || !strong(open) {
+			open = o
+		}
+	}
 	var selected *api.Message
-	for i := range messages {
-		m := &messages[i]
-		if m.Envelope == nil {
-			continue
+	reason := usageNoOpenOrder
+	if open != nil {
+		if selected, err = c.message(ctx, q, open.ref); err != nil {
+			return "", "", 0, err
 		}
-		k := m.Envelope.Kind
-		if k != "assign" && k != "request" && k != "review" {
-			continue
-		}
-		if selected == nil || !m.CreatedAt.After(t.At) {
-			selected = m
+		if !usageOrderKind(selected) {
+			selected = nil
+		} else {
+			reason = "open order " + stringID(selected.Seq) + " at request time"
 		}
 	}
 	if selected == nil {
-		return out, nil
+		// No obligation window covers this request: the order predates
+		// obligations, or a skewed host clock put the request before the order
+		// it acknowledged. Use the handled order addressed to this agent; the
+		// opening request inherits the first one, later requests the latest.
+		handled := []*api.Message{}
+		for _, ref := range p.Evidence {
+			m, err := c.message(ctx, q, ref)
+			if err != nil {
+				return "", "", 0, err
+			}
+			if !usageOrderKind(m) || m.To != p.AgentID || windowed[ref.TaskID+"/"+stringID(ref.Seq)] {
+				continue
+			}
+			handled = append(handled, m)
+		}
+		sort.Slice(handled, func(i, j int) bool {
+			if handled[i].CreatedAt.Equal(handled[j].CreatedAt) {
+				return handled[i].Seq < handled[j].Seq
+			}
+			return handled[i].CreatedAt.Before(handled[j].CreatedAt)
+		})
+		for _, m := range handled {
+			if selected == nil || !m.CreatedAt.After(at) {
+				selected = m
+			}
+		}
+		if selected == nil {
+			return "hand-offs", reason, 0, nil
+		}
+		reason = "handled request " + stringID(selected.Seq)
 	}
-	m := *selected
-	e := m.Envelope
-	out.PhaseReason = "handled request " + stringID(m.Seq)
-	if e.Review != nil && e.Review.Mode == "focused" {
-		out.Phase = "verification"
-		return out, nil
-	}
-	if e.Kind == "review" || (e.Review != nil && e.Review.Mode == "general") {
-		out.Phase = "review"
-		for _, share := range out.Shares {
+	e := selected.Envelope
+	focused := e.Review != nil && e.Review.Mode == "focused"
+	general := e.Review != nil && e.Review.Mode == "general"
+	switch {
+	case focused || p.Role == "verifier":
+		return "verification", reason, 0, nil
+	case e.Kind == "review" || general || p.Role == "reviewer":
+		round := 0
+		for _, share := range p.Shares {
 			if share.ItemID == "" {
 				continue
 			}
-			state, err := reviewState(ctx, tx, share.TaskID, share.ItemID)
+			state, err := c.review(ctx, q, share.TaskID, share.ItemID)
 			if err != nil {
-				return out, err
-			}
-			for _, round := range state.Rounds {
-				if round.RequestSeq == m.Seq || round.ActiveRequestSeq == m.Seq {
-					out.ReviewRound = round.Number
-				}
-			}
-		}
-		if out.ReviewRound == 0 {
-			out.PhaseReason += "; review round unavailable"
-		}
-		return out, nil
-	}
-	if (e.Review != nil && e.Review.Mode == "focused") || p.Role == "verifier" {
-		out.Phase = "verification"
-		return out, nil
-	}
-	if e.Kind == "assign" {
-		for _, share := range out.Shares {
-			if share.ItemID == "" {
-				continue
-			}
-			state, err := reviewState(ctx, tx, share.TaskID, share.ItemID)
-			if err != nil {
-				return out, err
+				return "", "", 0, err
 			}
 			for _, r := range state.Rounds {
-				if r.ResultSeq > 0 && r.ResultSeq < m.Seq && len(r.Blockers) > 0 {
-					out.Phase = "corrections"
-					return out, nil
+				if r.RequestSeq == selected.Seq || r.ActiveRequestSeq == selected.Seq {
+					round = r.Number
 				}
 			}
 		}
-		if p.Role == "planner" || e.Refs["phase"] == "planning" {
-			out.Phase = "intake and planning"
-		} else {
-			out.Phase = "build"
+		if round == 0 {
+			reason += "; review round unavailable"
 		}
-		return out, nil
+		return "review", reason, round, nil
+	case p.Role == "planner" || e.Refs["phase"] == "planning" || e.Refs["phase"] == "intake":
+		return "intake and planning", reason, 0, nil
+	case e.Kind == "assign":
+		for _, share := range p.Shares {
+			if share.ItemID == "" {
+				continue
+			}
+			state, err := c.review(ctx, q, share.TaskID, share.ItemID)
+			if err != nil {
+				return "", "", 0, err
+			}
+			for _, r := range state.Rounds {
+				if r.ResultSeq > 0 && r.ResultSeq < selected.Seq && len(r.Blockers) > 0 {
+					return "corrections", reason, 0, nil
+				}
+			}
+		}
+		return "build", reason, 0, nil
 	}
-	if p.Role == "planner" || e.Refs["phase"] == "planning" || e.Refs["phase"] == "intake" {
-		out.Phase = "intake and planning"
-	}
-	return out, nil
+	return "hand-offs", reason, 0, nil
 }

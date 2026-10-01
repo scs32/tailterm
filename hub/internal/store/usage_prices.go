@@ -268,6 +268,9 @@ func (a *usageItemAccumulator) finish() api.UsageItemReport {
 	return out
 }
 func (s *Store) Usage(ctx context.Context, task string, q api.UsageQuery) (api.UsageReport, error) {
+	return s.usageReport(ctx, task, q, newUsagePhaseCache())
+}
+func (s *Store) usageReport(ctx context.Context, task string, q api.UsageQuery, cache *usagePhaseCache) (api.UsageReport, error) {
 	out := api.UsageReport{Version: api.UsageVersion, ProjectID: task, Items: []api.UsageItemReport{}}
 	if !api.ValidID(task, "tsk") || (q.Item != "" && !api.ValidID(q.Item, "wi")) || (!q.From.IsZero() && !q.To.IsZero() && !q.From.Before(q.To)) {
 		return out, api.ErrInvalid
@@ -347,6 +350,18 @@ func (s *Store) Usage(ctx context.Context, task string, q api.UsageQuery) (api.U
 			continue
 		}
 		key := p.AgentID + "/" + p.RunID + "/" + t.ID
+		reported := false
+		for _, share := range p.Shares {
+			reported = reported || (share.TaskID == task && (q.Item == "" || share.ItemID == q.Item))
+		}
+		if !reported {
+			continue
+		}
+		// The stored phase is the ingest-time snapshot. Reports apply the current
+		// rule to every recorded request; the stored row is never rewritten.
+		if p.Phase, p.PhaseReason, p.ReviewRound, err = classifyUsagePhase(ctx, tx, p, cache); err != nil {
+			break
+		}
 		for _, share := range p.Shares {
 			if share.TaskID != task || (q.Item != "" && share.ItemID != q.Item) {
 				continue

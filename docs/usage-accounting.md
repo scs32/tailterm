@@ -15,7 +15,7 @@ Request timestamps use UTC and half-open intervals: From is inclusive, To is exc
 
 An item with no measured requests says **not measured**. Missing token classes remain unavailable, rather than measured zero. Reports distinguish unique participating requests from allocated turn equivalents. A request serving two items contributes one participating request and one-half allocated turn to each. Project totals count the request once. Average context is allocated uncached input plus cached input divided by allocated turns; it is unavailable when a contributing request lacks either input class. Cache-write tokens are reported separately. Cached-input share uses cached divided by uncached-plus-cached input.
 
-JSON quantities and costs are exact rational strings, such as `11/2`; display formatting happens only at the UI edge. Reports include measured-class counts, source coverage by enrolled run and explicit partial states. Historical work completed before collection cannot be reconstructed from lifetime totals.
+JSON quantities and costs are exact rational strings, such as `11/2`; display formatting happens only at the UI edge and in `tt usage` text, which prints token counts in units (`950`, `12.1k`, `6.71M`), the average context in tokens, the cached-input share as a percentage and an absent token class as `unavailable`. Reports include measured-class counts, source coverage by enrolled run and explicit partial states. Historical work completed before collection cannot be reconstructed from lifetime totals.
 
 ## Owner prices
 
@@ -39,7 +39,26 @@ The host relay fans usage parsing out from the existing bounded transcript appen
 
 Successful CLI ack/progress and authored post/send operations record a small private local journal. Inbox reads alone do not establish handling. Activation boundaries collect handled evidence, including the opening model request preceding the first acknowledgement. The hub resolves actual Board links and exact refs, retains provenance, splits several valid items evenly, and sends unattributable work to project overhead. Persistent handler/project lead/deployment roles do not inherit an unrelated bound item. Worker roles may use their exact admitted item binding when no handled item exists.
 
-Each projection has one phase: intake/planning, build, numbered review round (or explicitly unavailable round), corrections, verification, handler bookkeeping, or hand-offs. Handler bookkeeping takes precedence for handlers. Otherwise the latest applicable handled request/order at or before the request determines phase; an opening request can inherit the activation's first handled request. Message sequence breaks ties. Authoritative Planned member role text is normalized to planner/builder/reviewer/verifier while retaining its original source. Bounded ancestry stops without discarding already validated item links; a bad evidence entry cannot erase other valid links or a worker’s exact admitted binding. A result does not overwrite the request phase. Review rounds come from retained native review state; corrections require preceding blocker evidence.
+Each projection has one phase: intake/planning, build, numbered review round (or explicitly unavailable round), corrections, verification, handler bookkeeping, or hand-offs. Handler bookkeeping takes precedence for handlers. Otherwise a request is classified by what its agent was doing when it made the request, the **open-order rule**: the governing order is the assign, review or request addressed to that agent whose obligation was open at the request time, from the moment it was posted until the agent's typed result, a decline, a withdrawal or a reassignment closed it. Everything inside that window belongs to the order, including activations that only exchanged messages with the database handler or handled no Board message at all. An agent's own messages never govern: a builder's Start request to the handler does not change the builder's phase. When several orders are open, an assign or review outranks a plain request; then the latest wins, and message sequence breaks ties.
+
+| Role and governing order | Phase |
+| --- | --- |
+| database handler | handler bookkeeping |
+| no open order | hand-offs |
+| focused review, or any order held by a verifier | verification |
+| review, or any order held by a reviewer | review round N from retained native review state, else round unavailable |
+| any order held by a planner, or refs `phase` of `planning` or `intake` | intake and planning |
+| assign after a review round whose result had blockers | corrections |
+| assign | build |
+| plain request (lead, builder, other roles) | hand-offs |
+
+When no obligation window covers the request, the handled order addressed to the agent is used instead: the opening request inherits the activation's first handled order, later requests the latest at or before the request. This covers orders older than obligations and a host clock slightly behind the hub, where the opening request precedes the order it acknowledged. An order whose window has already ended is not revived by handled evidence.
+
+Phases are recomputed on read. Ingest stores the phase it computed as a snapshot, and every report applies the current rule to each recorded request, so requests recorded under an earlier rule move with it. A report never rewrites or drops a stored row, and request counts, token totals and item attribution are unchanged; only the phase label can differ from the stored snapshot. Anything reading `usage_turns.projection` directly sees the ingest-time value.
+
+Known limit: an order that was never closed (for example a result posted without a reply to its order, in older history) stays open until its team closes, so the agent's later requests keep that order's phase.
+
+Authoritative Planned member role text is normalized to planner/builder/reviewer/verifier while retaining its original source. Bounded ancestry stops without discarding already validated item links; a bad evidence entry cannot erase other valid links or a worker’s exact admitted binding.
 
 A batch is frozen to private disk before upload, replayed unchanged until its matching receipt, and revision-checked by the ledger. Enrolled run provenance and request/revision/receipt records survive lifecycle closure and binding archival. Retirement freezes any pending outbox without rescanning archived transcripts or polling archived agents. Capability discovery is cached per host. Collection shares the relay request budget after delivery, adds no prompts or agent turns, and caps append records, batch bytes and local outbox size. Capacity, parse and partial-tail gaps remain explicit. A fresh activation with a reconciled first request records measured coverage. Historical run gaps stay in run coverage; they do not relabel later fully measured requests. Permanent 400/404/409 upload rejection preserves the immutable numeric batch and status in a private local quarantine with explicit partial coverage. It is never called an uploaded receipt. Later live requests may continue; frozen delivery rotates past errors or throttle, and drained cursor files are removed. Quarantine files remain for diagnosis/recovery; a rejected batch is not included in hub totals until it is successfully ingested. No owner Claude session is enrolled.
 

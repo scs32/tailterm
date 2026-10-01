@@ -461,3 +461,462 @@ func TestUsageClaudeInclusiveOutputReportAndPricing(t *testing.T) {
 		})
 	}
 }
+
+// usagePhaseFixture is a synthetic Planned team on one item: real typed
+// messages (so real obligations), a controllable clock and bound members.
+type usagePhaseFixture struct {
+	t      *testing.T
+	s      *Store
+	ctx    context.Context
+	by     api.Caller
+	task   api.Task
+	item   api.WorkItem
+	order  api.Message
+	base   time.Time
+	clock  time.Time
+	agents map[string]api.Agent
+	serial int
+}
+
+var usagePhaseTeam = []struct{ name, role string }{{"lead", "lead"}, {"planner", "Planning and acceptance criteria"}, {"builder", "Implementation"}, {"reviewer", "Independent code review"}, {"verifier", "Independent matrix verification"}}
+
+func newUsagePhaseFixture(t *testing.T) *usagePhaseFixture {
+	t.Helper()
+	f := &usagePhaseFixture{t: t, ctx: context.Background(), by: api.Caller{Node: "fixture", User: "owner"}, base: time.Date(2026, 9, 27, 10, 0, 0, 0, time.UTC), agents: map[string]api.Agent{}}
+	f.clock = f.base.Add(-time.Hour)
+	var err error
+	if f.s, err = Open(filepath.Join(t.TempDir(), "usage-phase.sqlite")); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { f.s.Close() })
+	f.s.SetClockForTest(func() time.Time { return f.clock })
+	if f.task, err = f.s.CreateTask(f.ctx, api.CreateTaskRequest{Name: "Synthetic usage phases", Swarm: true}, f.by); err != nil {
+		t.Fatal(err)
+	}
+	if f.item, err = f.s.CreateWorkItem(f.ctx, f.task.ID, api.CreateWorkItemRequest{Kind: "bug", Title: "Synthetic phase item", RequestID: "phase-item"}, f.by); err != nil {
+		t.Fatal(err)
+	}
+	if f.order, err = f.s.PostMessage(f.ctx, f.task.ID, api.PostMessageRequest{Text: "Synthetic work order", RequestID: "phase-order", WorkItems: f.links()}, f.by); err != nil {
+		t.Fatal(err)
+	}
+	members := []any{}
+	for _, m := range usagePhaseTeam {
+		a, err := f.s.AddAgent(f.ctx, f.task.ID, api.AddAgentRequest{Name: m.name, Host: "fixture", Session: m.name, Runtime: "codex"}, f.by)
+		if err != nil {
+			t.Fatal(err)
+		}
+		f.agents[m.name] = a
+		members = append(members, map[string]any{"fields": map[string]any{"agentId": a.ID, "role": m.role}, "runId": a.RunID})
+		if _, err = f.s.db.Exec(`INSERT INTO agent_work_item_bindings(agent_id,run_id,item_task_id,item_id,item_revision,work_order_task_id,work_order_message_seq,context_through_message_seq,context_digest,context_json,created_at) VALUES(?,?,?,?,1,?,?,0,'synthetic-binding','{}',?)`, a.ID, a.RunID, f.task.ID, f.item.ID, f.task.ID, f.order.Seq, ts(f.clock)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err = f.s.db.Exec(`INSERT INTO item_team_leads(task_id,item_id,agent_id,run_id,revision,state) VALUES(?,?,?,?,1,'running')`, f.task.ID, f.item.ID, f.agents["lead"].ID, f.agents["lead"].RunID); err != nil {
+		t.Fatal(err)
+	}
+	plan, _ := json.Marshal(map[string]any{"members": members})
+	if _, err = f.s.db.Exec(`INSERT INTO team_queue_entries(id,task_id,item_id,item_revision,order_seq,template,position,state,revision,host,cwd,pause_generation,launch_json,created_at,updated_at) VALUES(?,?,?,1,1,'planned',1,'running',1,'fixture','/tmp',0,?,?,?)`, api.NewID("tqe"), f.task.ID, f.item.ID, string(plan), ts(f.clock), ts(f.clock)); err != nil {
+		t.Fatal(err)
+	}
+	if f.agents["handler"], err = f.s.AddAgent(f.ctx, f.task.ID, api.AddAgentRequest{Name: "handler", AgentID: api.NewID("agt"), Runtime: "codex", Role: api.AgentRoleDatabaseHandler, Host: "fixture", Session: "handler"}, f.by); err != nil {
+		t.Fatal(err)
+	}
+	return f
+}
+func (f *usagePhaseFixture) links() []api.MessageWorkItem {
+	return []api.MessageWorkItem{{ItemTaskID: f.task.ID, ItemID: f.item.ID, ItemRevision: f.item.Revision, Relationship: "primary"}}
+}
+
+// send posts a typed message at base+d, linked to the item.
+func (f *usagePhaseFixture) send(d time.Duration, from, to string, replyTo int64, env api.Envelope) api.Message {
+	f.t.Helper()
+	f.clock = f.base.Add(d)
+	f.serial++
+	sender, recipient := f.agents[from], f.agents[to]
+	env.To = recipient.Name
+	m, err := f.s.PostMessage(f.ctx, f.task.ID, api.PostMessageRequest{AgentID: sender.ID, RunID: sender.RunID, To: recipient.ID, ReplyTo: replyTo, Envelope: &env, WorkItems: f.links(), RequestID: fmt.Sprintf("phase-message-%d", f.serial)}, f.by)
+	if err != nil {
+		f.t.Fatal(env.Kind, from, to, err)
+	}
+	return m
+}
+
+// ack acknowledges an order at base+d, as tt ack does; the order stays open.
+func (f *usagePhaseFixture) ack(d time.Duration, agent string, m api.Message) {
+	f.t.Helper()
+	a := f.agents[agent]
+	if _, err := f.s.ObligationAction(f.ctx, f.task.ID, m.Seq, "ack", api.ObligationActionRequest{AgentID: a.ID, RunID: a.RunID}, f.base.Add(d)); err != nil {
+		f.t.Fatal(agent, err)
+	}
+}
+
+var usagePhaseCriteria = map[string]string{"a1": "works"}
+
+func usagePhaseAssign() api.Envelope {
+	return api.Envelope{Kind: "assign", Subject: "Implement the synthetic phase fixture", Body: api.EnvelopeBody{Objective: "Fixture", Owns: []string{"fixture"}, Acceptance: usagePhaseCriteria}}
+}
+func usagePhaseRequest() api.Envelope {
+	return api.Envelope{Kind: "request", Subject: "Record the synthetic phase fixture", Body: api.EnvelopeBody{Ask: "Record synthetic data."}}
+}
+func usagePhaseReview() api.Envelope {
+	return api.Envelope{Kind: "review", Subject: "Review the synthetic phase candidate", Body: api.EnvelopeBody{Candidate: candidateA, Scope: "Fixture", Acceptance: usagePhaseCriteria}}
+}
+func usagePhaseResult(review *api.ReviewMetadata) api.Envelope {
+	return api.Envelope{Kind: "result", Subject: "The synthetic phase fixture is recorded", Review: review, Body: api.EnvelopeBody{Outcome: "done", Status: map[string]string{"a1": "pass"}}, Evidence: map[string]api.Evidence{"e1": {Type: "command", Value: "fixture check -> ok"}}}
+}
+
+// handled builds one activation's evidence: "ack" for a message addressed to
+// the agent, "post" or "reply" for one it wrote.
+func (f *usagePhaseFixture) handled(operation string, m api.Message) api.UsageEvidence {
+	return api.UsageEvidence{TaskID: f.task.ID, Seq: m.Seq, Operation: operation, At: m.CreatedAt}
+}
+
+// requests reports n metered requests by agent at base+d, in batches.
+func (f *usagePhaseFixture) requests(agent string, d time.Duration, n int, handled ...api.UsageEvidence) {
+	f.t.Helper()
+	a := f.agents[agent]
+	for n > 0 {
+		turns := []api.UsageTurn{}
+		for ; n > 0 && len(turns) < 50; n-- {
+			f.serial++
+			turn := syntheticUsageTurn(fmt.Sprintf("%s-%d", agent, f.serial))
+			turn.At = f.base.Add(d)
+			turn.Handled = handled
+			turns = append(turns, turn)
+		}
+		f.serial++
+		if _, err := f.s.ReportUsage(f.ctx, f.task.ID, a.ID, usageBatch(a, fmt.Sprintf("%s-batch-%d", agent, f.serial), turns...)); err != nil {
+			f.t.Fatal(agent, d, err)
+		}
+	}
+}
+
+// phaseRoles returns requests per "phase / role" over the item and overhead.
+func usagePhaseRoles(report api.UsageReport) map[string]int {
+	out := map[string]int{}
+	for _, row := range append(append([]api.UsageItemReport{}, report.Items...), report.Overhead) {
+		for _, g := range row.PhaseRoles {
+			out[g.Key] += g.Summary.Requests
+		}
+	}
+	return out
+}
+
+// at returns the single "phase / role" of the requests made at base+d.
+func (f *usagePhaseFixture) at(d time.Duration) string {
+	f.t.Helper()
+	report, err := f.s.Usage(f.ctx, f.task.ID, api.UsageQuery{From: f.base.Add(d), To: f.base.Add(d + time.Nanosecond)})
+	if err != nil {
+		f.t.Fatal(err)
+	}
+	got := usagePhaseRoles(report)
+	if len(got) != 1 {
+		f.t.Fatalf("requests at +%s: want one phase/role, got %v", d, got)
+	}
+	for k := range got {
+		return k
+	}
+	return ""
+}
+func (f *usagePhaseFixture) want(d time.Duration, phaseRole, why string) {
+	f.t.Helper()
+	if got := f.at(d); got != phaseRole {
+		f.t.Fatalf("+%s (%s): got %q, want %q", d, why, got, phaseRole)
+	}
+}
+
+func TestUsagePhaseFollowsOpenOrder(t *testing.T) {
+	f := newUsagePhaseFixture(t)
+	const m, sec = time.Minute, time.Second
+	f.requests("builder", 1*m, 1)
+	assign := f.send(2*m, "lead", "builder", 0, usagePhaseAssign())
+	// A host clock 1 s behind the hub: the opening request precedes the ASSIGN it acknowledged.
+	f.ack(2*m+sec, "builder", assign)
+	f.requests("builder", 2*m-sec, 1, f.handled("ack", assign))
+	// Three activations: own Start REQUEST, the handler's RESULT, nothing handled.
+	start := f.send(3*m, "builder", "handler", 0, usagePhaseRequest())
+	f.requests("builder", 3*m+sec, 2, f.handled("post", start))
+	started := f.send(4*m, "handler", "builder", start.Seq, usagePhaseResult(nil))
+	f.requests("builder", 4*m+sec, 2, f.handled("ack", started))
+	f.requests("builder", 5*m, 2)
+	// Two orders open at once: a plain REQUEST from lead during the build.
+	side := f.send(6*m, "lead", "builder", 0, usagePhaseRequest())
+	f.ack(6*m+sec, "builder", side)
+	f.requests("builder", 6*m+sec, 1, f.handled("ack", side))
+	sideDone := f.send(7*m, "builder", "lead", side.Seq, usagePhaseResult(nil))
+	f.requests("builder", 7*m+sec, 1, f.handled("reply", sideDone))
+	// The frozen candidate RESULT closes the ASSIGN.
+	result := f.send(8*m, "builder", "lead", assign.Seq, usagePhaseResult(nil))
+	f.requests("builder", 8*m+sec, 1, f.handled("reply", result))
+	f.requests("builder", 9*m, 1)
+	// A lone plain REQUEST after the build is coordination, not build.
+	late := f.send(10*m, "lead", "builder", 0, usagePhaseRequest())
+	f.requests("builder", 10*m+sec, 1, f.handled("ack", late))
+
+	const build, handoffs = "build / builder", "hand-offs / builder"
+	for _, c := range []struct {
+		d         time.Duration
+		want, why string
+	}{
+		{1 * m, handoffs, "before the ASSIGN, nothing handled"},
+		{2*m - sec, build, "opening request 1 s before the ASSIGN it acknowledged"},
+		{3*m + sec, build, "activation that posted its own Start REQUEST"},
+		{4*m + sec, build, "activation that acknowledged the handler RESULT"},
+		{5 * m, build, "activation that handled nothing"},
+		{6*m + sec, build, "ASSIGN and a plain REQUEST both open"},
+		{7*m + sec, build, "after the plain REQUEST closed, ASSIGN still open"},
+		{8*m + sec, handoffs, "activation that posted the RESULT closing the ASSIGN"},
+		{9 * m, handoffs, "after the RESULT, nothing handled"},
+		{10*m + sec, handoffs, "lone plain REQUEST after the build"},
+	} {
+		f.want(c.d, c.want, c.why)
+	}
+	report, err := f.s.Usage(f.ctx, f.task.ID, api.UsageQuery{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := usagePhaseRoles(report); got[build] != 9 || got[handoffs] != 4 || len(got) != 2 {
+		t.Fatalf("builder phases: %v", got)
+	}
+}
+
+func TestUsageVerifierAndReviewerWindows(t *testing.T) {
+	f := newUsagePhaseFixture(t)
+	const m, sec = time.Minute, time.Second
+	f.send(0, "lead", "builder", 0, usagePhaseAssign()) // freezes the item's criteria for the review
+	for _, c := range []struct {
+		agent, phase string
+		order        api.Envelope
+		result       *api.ReviewMetadata
+	}{
+		{"verifier", "verification / verifier", usagePhaseRequest(), nil},
+		{"reviewer", "review round 1 / reviewer", usagePhaseReview(), &api.ReviewMetadata{Mode: "general", Candidate: candidateA}},
+	} {
+		handoffs := "hand-offs / " + c.agent
+		f.requests(c.agent, 1*m, 1)
+		order := f.send(2*m, "lead", c.agent, 0, c.order)
+		f.requests(c.agent, 2*m+sec, 1, f.handled("ack", order))
+		own := f.send(3*m, c.agent, "handler", 0, usagePhaseRequest())
+		f.requests(c.agent, 3*m+sec, 1, f.handled("post", own))
+		answered := f.send(4*m, "handler", c.agent, own.Seq, usagePhaseResult(nil))
+		f.requests(c.agent, 4*m+sec, 1, f.handled("ack", answered))
+		f.requests(c.agent, 5*m, 1)
+		result := f.send(6*m, c.agent, "lead", order.Seq, usagePhaseResult(c.result))
+		f.requests(c.agent, 6*m+sec, 1, f.handled("reply", result))
+		f.requests(c.agent, 7*m, 1)
+		report, err := f.s.Usage(f.ctx, f.task.ID, api.UsageQuery{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		got := usagePhaseRoles(report)
+		if got[c.phase] != 4 || got[handoffs] != 3 {
+			t.Fatalf("%s window: %v", c.agent, got)
+		}
+		// Reports of several agents share a request time; check this agent's requests by its own groups.
+		for key, n := range got {
+			if strings.HasSuffix(key, " / "+c.agent) && key != c.phase && key != handoffs {
+				t.Fatalf("%s: unexpected group %q (%d)", c.agent, key, n)
+			}
+		}
+	}
+}
+
+// usageReportedItemHistory records a history shaped like the reported item:
+// per role, the request counts tt usage showed for it, with the builder's
+// requests spread over many activations and its Start exchange with the handler.
+func usageReportedItemHistory(f *usagePhaseFixture) {
+	const m = time.Minute
+	f.requests("lead", 0, 100)
+	plan := f.send(1*m, "lead", "planner", 0, usagePhaseRequest())
+	f.requests("planner", 2*m, 45, f.handled("ack", plan))
+	f.send(3*m, "planner", "lead", plan.Seq, usagePhaseResult(nil))
+	f.requests("builder", 4*m, 10)
+	assign := f.send(5*m, "lead", "builder", 0, usagePhaseAssign())
+	f.requests("builder", 5*m+time.Second, 20, f.handled("ack", assign))
+	start := f.send(6*m, "builder", "handler", 0, usagePhaseRequest())
+	f.requests("builder", 6*m+time.Second, 30, f.handled("post", start))
+	started := f.send(7*m, "handler", "builder", start.Seq, usagePhaseResult(nil))
+	f.requests("builder", 7*m+time.Second, 40, f.handled("ack", started))
+	for i := 0; i < 26; i++ { // later activations that handled no Board message
+		f.requests("builder", time.Duration(8+i)*m, 10)
+	}
+	f.requests("handler", 20*m, 147, f.handled("ack", start))
+	result := f.send(40*m, "builder", "lead", assign.Seq, usagePhaseResult(nil))
+	f.requests("builder", 40*m+time.Second, 27, f.handled("reply", result))
+	review := f.send(41*m, "lead", "reviewer", 0, usagePhaseReview())
+	f.requests("reviewer", 42*m, 30, f.handled("ack", review))
+	verify := f.send(43*m, "lead", "verifier", 0, usagePhaseRequest())
+	f.requests("verifier", 44*m, 13, f.handled("ack", verify))
+}
+
+func TestUsageBuilderDominantPhaseIsBuild(t *testing.T) {
+	f := newUsagePhaseFixture(t)
+	usageReportedItemHistory(f)
+	report, err := f.s.Usage(f.ctx, f.task.ID, api.UsageQuery{Item: f.item.ID})
+	if err != nil || len(report.Items) != 1 {
+		t.Fatal(report, err)
+	}
+	item := report.Items[0]
+	roles := map[string]int{}
+	for _, g := range item.Roles {
+		roles[g.Key] = g.Summary.Requests
+	}
+	if roles["builder"] != 387 || roles["database_handler"] != 147 || roles["lead"] != 100 || roles["planner"] != 45 || roles["reviewer"] != 30 || roles["verifier"] != 13 || item.Summary.Requests != 722 {
+		t.Fatalf("role totals: %v, %d requests", roles, item.Summary.Requests)
+	}
+	builder, top, topKey := 0, 0, ""
+	got := map[string]int{}
+	for _, g := range item.PhaseRoles {
+		got[g.Key] = g.Summary.Requests
+		if strings.HasSuffix(g.Key, " / builder") {
+			builder += g.Summary.Requests
+			if g.Summary.Requests > top {
+				top, topKey = g.Summary.Requests, g.Key
+			}
+		}
+	}
+	if topKey != "build / builder" || builder != 387 || top*100 < builder*80 {
+		t.Fatalf("builder dominant phase %q with %d of %d: %v", topKey, top, builder, got)
+	}
+	if got["handler bookkeeping / database_handler"] != 147 || got["intake and planning / planner"] != 45 || got["review round 1 / reviewer"] != 30 || got["verification / verifier"] != 13 || got["hand-offs / lead"] != 100 {
+		t.Fatalf("other roles: %v", got)
+	}
+}
+
+// usageLedgerRows returns every stored usage row, in a stable order.
+func usageLedgerRows(t *testing.T, s *Store) []string {
+	t.Helper()
+	out := []string{}
+	for _, query := range []string{
+		`SELECT task_id||'|'||agent_id||'|'||run_id||'|'||request_id||'|'||revision||'|'||at||'|'||payload||'|'||projection FROM usage_turns ORDER BY 1`,
+		`SELECT task_id||'|'||agent_id||'|'||run_id||'|'||request_id||'|'||revision||'|'||payload||'|'||projection FROM usage_turn_revisions ORDER BY 1`,
+	} {
+		rows, err := s.db.Query(query)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for rows.Next() {
+			var row string
+			if err = rows.Scan(&row); err != nil {
+				t.Fatal(err)
+			}
+			out = append(out, row)
+		}
+		if err = rows.Err(); err != nil {
+			t.Fatal(err)
+		}
+		rows.Close()
+	}
+	return out
+}
+
+func TestUsageRecordedTurnsReclassifiedOnRead(t *testing.T) {
+	f := newUsagePhaseFixture(t)
+	const m = time.Minute
+	f.requests("builder", 1*m, 3)
+	assign := f.send(2*m, "lead", "builder", 0, usagePhaseAssign())
+	start := f.send(3*m, "builder", "handler", 0, usagePhaseRequest())
+	f.requests("builder", 3*m+time.Second, 20, f.handled("post", start))
+	f.requests("builder", 4*m, 30)
+	f.send(5*m, "builder", "lead", assign.Seq, usagePhaseResult(nil))
+	f.requests("builder", 6*m, 2)
+	// Rewrite every stored projection the way the previous classifier recorded
+	// these requests: hand-offs, whatever the builder was doing.
+	for _, table := range []string{"usage_turns", "usage_turn_revisions"} {
+		rows, err := f.s.db.Query(`SELECT rowid,projection FROM ` + table)
+		if err != nil {
+			t.Fatal(err)
+		}
+		stored := map[int64]string{}
+		for rows.Next() {
+			var id int64
+			var raw string
+			if err = rows.Scan(&id, &raw); err != nil {
+				t.Fatal(err)
+			}
+			var p api.UsageProjection
+			if err = json.Unmarshal([]byte(raw), &p); err != nil {
+				t.Fatal(err)
+			}
+			p.Phase, p.PhaseReason, p.ReviewRound = "hand-offs", "handled request "+fmt.Sprint(start.Seq), 0
+			old, _ := json.Marshal(p)
+			stored[id] = string(old)
+		}
+		rows.Close()
+		if len(stored) != 55 {
+			t.Fatalf("%s: %d rows", table, len(stored))
+		}
+		for id, raw := range stored {
+			if _, err = f.s.db.Exec(`UPDATE `+table+` SET projection=? WHERE rowid=?`, raw, id); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	before := usageLedgerRows(t, f.s)
+	if len(before) != 110 || strings.Contains(strings.Join(before, "\n"), `"phase":"build"`) {
+		t.Fatal("fixture rows must all be stored as hand-offs", len(before))
+	}
+	report, err := f.s.Usage(f.ctx, f.task.ID, api.UsageQuery{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := usagePhaseRoles(report)
+	if got["build / builder"] != 50 || got["hand-offs / builder"] != 5 || len(got) != 2 {
+		t.Fatalf("reclassified phases: %v", got)
+	}
+	// Nothing dropped: 55 requests of the synthetic turn (input 21, cached 80, cache write 0, output 7, reasoning 2).
+	want := map[string]string{"input": "1155", "cached": "4400", "cacheWrite": "0", "output": "385", "reasoning": "110"}
+	if report.Summary.Requests != 55 || report.Summary.AllocatedTurns != "55" || fmt.Sprint(report.Summary.Tokens) != fmt.Sprint(want) {
+		t.Fatalf("totals not conserved: %+v", report.Summary)
+	}
+	after := usageLedgerRows(t, f.s)
+	if strings.Join(before, "\n") != strings.Join(after, "\n") {
+		t.Fatal("a report read rewrote stored usage rows")
+	}
+}
+
+func TestUsageReportReadCostBounded(t *testing.T) {
+	f := newUsagePhaseFixture(t)
+	const m = time.Minute
+	agents := []string{"lead", "planner", "builder", "reviewer", "verifier", "handler"}
+	assign := f.send(1*m, "lead", "builder", 0, usagePhaseAssign())
+	plan := f.send(1*m, "lead", "planner", 0, usagePhaseRequest())
+	verify := f.send(1*m, "lead", "verifier", 0, usagePhaseRequest())
+	start := f.send(2*m, "builder", "handler", 0, usagePhaseRequest())
+	record := func(each int) {
+		for _, agent := range agents {
+			f.requests(agent, 3*m, each/2)
+		}
+		f.requests("lead", 4*m, each/2, f.handled("post", assign), f.handled("post", plan), f.handled("post", verify))
+		f.requests("planner", 4*m, each/2, f.handled("ack", plan))
+		f.requests("builder", 4*m, each/2, f.handled("ack", assign), f.handled("post", start))
+		f.requests("reviewer", 4*m, each/2)
+		f.requests("verifier", 4*m, each/2, f.handled("ack", verify))
+		f.requests("handler", 4*m, each/2, f.handled("ack", start))
+	}
+	read := func(turns int) (int, time.Duration) {
+		cache := newUsagePhaseCache()
+		began := time.Now()
+		report, err := f.s.usageReport(f.ctx, f.task.ID, api.UsageQuery{}, cache)
+		took := time.Since(began)
+		if err != nil || report.Summary.Requests != turns {
+			t.Fatal(report.Summary, err)
+		}
+		if got := usagePhaseRoles(report); got["build / builder"] != turns/6 || got["hand-offs / lead"] != turns/6 {
+			t.Fatalf("%d turns: %v", turns, got)
+		}
+		return cache.orderQueries, took
+	}
+	record(100)
+	small, _ := read(600)
+	record(400)
+	large, took := read(3000)
+	// One obligation query per non-handler agent, however many requests each made.
+	if small != 5 || large != small {
+		t.Fatalf("obligation queries grew with the turn count: %d for 600 turns, %d for 3000", small, large)
+	}
+	if took > 2*time.Second {
+		t.Fatalf("report over 3000 turns took %s", took)
+	}
+	t.Logf("3000 turns: %s, %d obligation queries", took, large)
+}

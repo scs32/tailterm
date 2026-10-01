@@ -6,8 +6,12 @@ import (
 	"flag"
 	"fmt"
 	"github.com/scs32/tailterm/hub/internal/api"
+	"math"
 	"math/big"
 	"os"
+	"sort"
+	"strconv"
+	"strings"
 	"time"
 )
 
@@ -83,19 +87,111 @@ func cmdUsage(e env, args []string) error {
 	return nil
 }
 func printUsageRow(label string, s api.UsageSummary) {
-	fmt.Printf("%s: %s · requests %d · allocated %s · tokens %v", label, s.State, s.Requests, s.AllocatedTurns, s.Tokens)
+	fmt.Println(formatUsageRow(label, s))
+}
+
+var usageClassLabels = map[string]string{"input": "input", "cached": "cached", "cacheWrite": "cache write", "output": "output", "reasoning": "reasoning"}
+
+// formatUsageRow renders one summary for people. The report keeps exact
+// rational strings; text rounds them for display and --json is unchanged.
+func formatUsageRow(label string, s api.UsageSummary) string {
+	total, classes := new(big.Rat), []string{}
+	reported := false
+	for _, class := range api.UsageClasses {
+		value := "unavailable" // an absent class was not measured; it is not zero
+		if raw, ok := s.Tokens[class]; ok {
+			if n, valid := new(big.Rat).SetString(raw); valid {
+				total.Add(total, n)
+				reported = true
+				value = formatTokenCount(raw)
+			}
+		}
+		classes = append(classes, usageClassLabels[class]+" "+value)
+	}
+	tokens := "unavailable"
+	if reported {
+		tokens = formatTokenCount(total.RatString())
+	}
+	row := fmt.Sprintf("%s: %s · requests %d · allocated %s · tokens %s (%s)", label, s.State, s.Requests, formatRatDecimal(s.AllocatedTurns, 1), tokens, strings.Join(classes, ", "))
 	if s.AverageContext != nil {
-		fmt.Printf(" · average context %s", *s.AverageContext)
+		row += " · average context " + formatTokenCount(*s.AverageContext) + " tokens"
 	} else {
-		fmt.Print(" · average context unavailable")
+		row += " · average context unavailable"
 	}
 	if s.CachedShare != nil {
-		fmt.Printf(" · cached-input share %s", *s.CachedShare)
+		row += " · cached-input share " + formatPercent(*s.CachedShare)
 	}
 	if len(s.PricedSubtotal) > 0 {
-		fmt.Printf(" · estimated subtotal %v (complete=%t)", s.PricedSubtotal, s.CostComplete)
+		currencies := make([]string, 0, len(s.PricedSubtotal))
+		for currency := range s.PricedSubtotal {
+			currencies = append(currencies, currency)
+		}
+		sort.Strings(currencies)
+		for i, currency := range currencies {
+			amount := "unavailable"
+			if n, ok := new(big.Rat).SetString(s.PricedSubtotal[currency]); ok {
+				amount = n.FloatString(2)
+			}
+			currencies[i] = currency + " " + amount
+		}
+		row += " · estimated subtotal " + strings.Join(currencies, ", ")
+		if !s.CostComplete {
+			row += " (partial)"
+		}
 	}
-	fmt.Println()
+	return row
+}
+
+// formatTokenCount prints an exact count ("4207361/31", "6710000") in units:
+// plain below 1,000, then 12.1k, 6.71M, 1.23B.
+func formatTokenCount(exact string) string {
+	n, ok := new(big.Rat).SetString(exact)
+	if !ok {
+		return "unavailable"
+	}
+	v, _ := n.Float64()
+	units := []struct {
+		size   float64
+		suffix string
+		digits int
+	}{{1e3, "k", 1}, {1e6, "M", 2}, {1e9, "B", 2}}
+	for i := len(units) - 1; i >= 0; i-- {
+		u := units[i]
+		// Rounding may reach the next unit: 999,960 is 1.00M, not 1000.0k.
+		if math.Abs(v) < u.size {
+			continue
+		}
+		text := strconv.FormatFloat(v/u.size, 'f', u.digits, 64)
+		if i < len(units)-1 && strings.HasPrefix(strings.TrimPrefix(text, "-"), "1000") {
+			next := units[i+1]
+			text, u = strconv.FormatFloat(v/next.size, 'f', next.digits, 64), next
+		}
+		return text + u.suffix
+	}
+	return formatRatDecimal(exact, 1)
+}
+
+// formatRatDecimal prints an exact quantity as a decimal with at most digits
+// fraction digits and no trailing zeros: "11/2" is 5.5.
+func formatRatDecimal(exact string, digits int) string {
+	n, ok := new(big.Rat).SetString(exact)
+	if !ok {
+		return "unavailable"
+	}
+	text := n.FloatString(digits)
+	if strings.Contains(text, ".") {
+		text = strings.TrimRight(strings.TrimRight(text, "0"), ".")
+	}
+	return text
+}
+
+// formatPercent prints an exact share ("39/40") as a percentage with one decimal.
+func formatPercent(exact string) string {
+	n, ok := new(big.Rat).SetString(exact)
+	if !ok {
+		return "unavailable"
+	}
+	return n.Mul(n, big.NewRat(100, 1)).FloatString(1) + "%"
 }
 
 // usageMillis reads an exact millisecond quantity ("1500" or "3001/2").
