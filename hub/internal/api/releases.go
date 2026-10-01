@@ -29,6 +29,7 @@ type ReleaseJob struct {
 	IntegratedCommit       string                  `json:"integratedCommit,omitempty"`
 	IntegratedPlan         *VerificationPlan       `json:"integratedPlan,omitempty"`
 	IntegratedCoverage     []ReleaseCheckCoverage  `json:"integratedCoverage,omitempty"`
+	IntegratedMatrix       *ReleaseMatrixChange    `json:"integratedMatrix,omitempty"`
 	IntegratedVerification *VerificationReceipt    `json:"integratedVerification,omitempty"`
 	InputsCommit           string                  `json:"inputsCommit,omitempty"`
 	InputsDigest           string                  `json:"inputsDigest,omitempty"`
@@ -37,12 +38,33 @@ type ReleaseJob struct {
 	// Published survives a later block: tasks-hub already carries the release.
 	Published    bool                 `json:"published,omitempty"`
 	Supersession *ReleaseSupersession `json:"supersession,omitempty"`
+	// MatrixApprovals is derived when jobs are listed and never saved: the
+	// project's owner matrix approvals, for a claimed job only. It is a hint
+	// for the runner; the verification import proves the one it cites.
+	MatrixApprovals []ReleaseMatrixApproval `json:"matrixApprovals,omitempty"`
+}
+
+// ReleaseMatrixChange records an integrated verification bound to a matrix
+// digest other than the job's approved one, and the owner approval message
+// that covers it. The job's own plan is unchanged.
+type ReleaseMatrixChange struct {
+	ApprovedDigest     string `json:"approvedDigest"`
+	IntegratedDigest   string `json:"integratedDigest"`
+	ApprovalMessageSeq int64  `json:"approvalMessageSeq"`
+}
+
+// ReleaseMatrixApproval is one owner approval message of a matrix digest.
+type ReleaseMatrixApproval struct {
+	Digest     string `json:"digest"`
+	MessageSeq int64  `json:"messageSeq"`
 }
 
 // ReleaseCheckCoverage records an approved check that the integrated plan
 // covered with a wider check instead of the exact one (exact matches are not
 // listed). Relation "superset": the integrated go-race tested every approved
-// package and more.
+// package and more. Relation "matrix_changed": under an owner-approved matrix
+// change, the integrated check with the same ID (for go-race, still testing
+// every approved package).
 type ReleaseCheckCoverage struct {
 	CheckID          string `json:"checkId"`
 	ApprovedDigest   string `json:"approvedDigest"`

@@ -358,8 +358,9 @@ export class HostAdapter {
     const contextPath=join(dir,"context.json"),planPath=join(dir,"plan.json"),receiptPath=join(dir,"receipt.json");
     if(!existsSync(receiptPath)){
       const missing=missingPrerequisites(this.config.cwd);if(missing.length)throw prerequisiteError(missing);
+      const matrix=this.integratedMatrix(job,current);
       if(!this.matrixHostFree(dir))return false;
-      save(contextPath,{...job.plan,commit:job.integratedCommit,verifierAgentId:this.job.agentId,verifierRunId:this.job.runId});
+      save(contextPath,{...job.plan,...matrix,commit:job.integratedCommit,verifierAgentId:this.job.agentId,verifierRunId:this.job.runId});
       this.command(["node","scripts/verify-matrix.mjs","plan",contextPath,planPath]);
       const timeout=matrixRunTimeout(JSON.parse(readFileSync(planPath,"utf8")));
       this.command(["node","scripts/verify-matrix.mjs","run",planPath,dir],this.config.cwd,{timeout});
@@ -368,6 +369,22 @@ export class HostAdapter {
     if(!receiptEligible(JSON.parse(readFileSync(receiptPath,"utf8"))))throw releaseError("Integrated matrix receipt is not eligible");
     this.command([this.config.tt||"tt","send","--kind","request","--to",this.handler(),"--subject","Import verification for the integrated release commit","--ask",`Import release verification plan and receipt for job ${job.id} integrated commit ${job.integratedCommit} through tt deployment verification --plan-file and --file. Preserve exact job generation and inspect logs; release publication waits for saved import.`,"--request-id",`${job.id}-integrated-matrix-${job.integratedCommit}`,"--ref",`release-job=${job.id}`,"--ref",`integrated-commit=${job.integratedCommit}`,"--attachment",planPath,"--attachment",receiptPath]);
     return false;
+  }
+  // The integrated checkout's matrix file can differ from the one the job was
+  // approved under (tasks-hub gained a matrix change). The integrated plan
+  // then binds that digest and the newest owner approval of exactly it, taken
+  // from the job list as a hint the hub proves at import; the job's own
+  // approval is never reused. With none the job is refused by name, before
+  // any matrix run. An unchanged digest adds nothing to the job's plan, and an
+  // unreadable matrix file or a plan with no digest is left for the plan
+  // command to refuse.
+  integratedMatrix(job,current){
+    let integrated;try{integrated=digest(readFileSync(join(this.config.cwd,"verification/matrix.json"),"utf8"));}catch{return {};}
+    const approved=job.plan?.matrixDigest;
+    if(integrated===approved || !/^[a-f0-9]{64}$/.test(approved||""))return {};
+    const seq=Math.max(0,...(current?.matrixApprovals||[]).filter(a=>a?.digest===integrated && Number.isSafeInteger(a.messageSeq)).map(a=>a.messageSeq));
+    if(!(seq>0))throw releaseError(`Matrix digest changed ${approved.slice(0,8)} to ${integrated.slice(0,8)}; no owner approval covers it`);
+    return {approvedMatrixDigest:integrated,matrixApprovalMessageSeq:seq};
   }
   // Count only: no process's argv, environment, files or output is read, and
   // nothing is signalled. pgrep exits 1 when no process matches.

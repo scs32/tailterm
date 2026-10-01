@@ -391,12 +391,12 @@ const ignorePrerequisites=cwd=>writeFileSync(join(cwd,".git/info/exclude"),"node
 function placePrerequisites(dir,skip=[]){for(const p of MATRIX_PREREQUISITES.filter(p=>!skip.includes(p))){mkdirSync(join(dir,dirname(p)),{recursive:true});writeFileSync(join(dir,p),"fixture "+p);}}
 const workedPlan={maxAttempts:3,checks:[{id:"go-race",environment:{VERIFICATION_TIMEOUT_MS:"1800000"}},{id:"npm-unit",environment:{VERIFICATION_TIMEOUT_MS:"120000"}}]};
 const attemptDir=(home,commit,n)=>join(home,"rel_fixture-integrated-verification",`${commit}-r${n}`);
-function matrixHost({plan=workedPlan,receipt={environment:{},checks:[{exitCode:0}]}}={}){
+function matrixHost({plan=workedPlan,receipt={environment:{},checks:[{exitCode:0}]},jobs=[]}={}){
  const f=fixture(),home=mkdtempSync(join(tmpdir(),"matrix-host-"));ignorePrerequisites(f.cwd);placePrerequisites(f.cwd);
  const adapter=new HostAdapter({cwd:f.cwd,journalDirectory:home},{id:"rel_fixture",agentId:"agt_fixture",runId:"run_fixture",generation:1});
  const calls=[];adapter.matrixRunsActive=()=>0;
  adapter.command=(argv,cwd,options)=>{calls.push({argv,timeout:options?.timeout??600000});
-  if(argv[1]==="deployment"&&argv[2]==="list")return "[]";
+  if(argv[1]==="deployment"&&argv[2]==="list")return JSON.stringify(jobs);
   if(argv[1]==="deployment"&&argv[2]==="handler")return JSON.stringify({id:"agt_0123abcd"});
   if(argv[1]==="scripts/verify-matrix.mjs"&&argv[2]==="plan"){writeFileSync(argv[4],JSON.stringify(plan));return "";}
   if(argv[1]==="scripts/verify-matrix.mjs"&&argv[2]==="run"){writeFileSync(join(argv[4],"receipt.json"),JSON.stringify(receipt));return "";}
@@ -599,4 +599,83 @@ test("R6 an invalid TailOS switch window stops the daemon before any command",as
  for(const bad of [-1,300001,"90000",1.5])await assert.rejects(serveDeployment({version:1,enabled:true,cwd,journalDirectory:cwd,tt:fakeTT,targets:{tailos:{switchWindowMs:bad}}},{once:true}),/switch window/);
  assert.equal(existsSync(log),false);
  await serveDeployment({version:1,enabled:true,cwd,journalDirectory:cwd,tt:fakeTT,targets:{tailos:{switchWindowMs:120000}}},{once:true});assert.equal(readFileSync(log,"utf8"),"deployment list\n");
+});
+const MATRIX_A='{"matrix":"approved"}\n',MATRIX_B='{"matrix":"changed"}\n';
+const uncoveredReason=`Matrix digest changed ${hash(MATRIX_A).slice(0,8)} to ${hash(MATRIX_B).slice(0,8)}; no owner approval covers it`;
+// The integrated checkout's matrix file is MATRIX_B; the job was approved under MATRIX_A by message 11.
+function changedMatrixHost(approvals){
+ const h=matrixHost({jobs:[{id:"rel_fixture",state:"claimed",...(approvals?{matrixApprovals:approvals}:{})}]});
+ mkdirSync(join(h.f.cwd,"verification"));writeFileSync(join(h.f.cwd,"verification/matrix.json"),MATRIX_B);
+ h.integrated.plan={commit:"a".repeat(40),matrixDigest:hash(MATRIX_A),approvedMatrixDigest:hash(MATRIX_A),matrixApprovalMessageSeq:11};
+ h.context=()=>JSON.parse(readFileSync(join(attemptDir(h.home,h.integrated.integratedCommit,0),"context.json"),"utf8"));
+ return h;
+}
+test("m1 a changed matrix binds the integrated plan to its own digest and the newest owner approval of it",async()=>{
+ const h=changedMatrixHost([{digest:hash(MATRIX_B),messageSeq:40},{digest:hash(MATRIX_A),messageSeq:99},{digest:hash(MATRIX_B),messageSeq:55},{digest:hash(MATRIX_B),messageSeq:"77"}]);
+ assert.equal(await h.adapter.verifyIntegrated(h.integrated),false);
+ const context=h.context();
+ assert.equal(context.approvedMatrixDigest,hash(MATRIX_B));assert.equal(context.matrixApprovalMessageSeq,55);
+ assert.equal(context.commit,h.integrated.integratedCommit);assert.equal(context.verifierAgentId,"agt_fixture");assert.equal(context.verifierRunId,"run_fixture");
+ assert.deepEqual(h.matrix().map(c=>c.argv[2]),["plan","run"]);assert.equal(h.sends().length,1);
+ // The job's own plan is not rewritten.
+ assert.equal(h.integrated.plan.approvedMatrixDigest,hash(MATRIX_A));assert.equal(h.integrated.plan.matrixApprovalMessageSeq,11);
+});
+test("m2 a changed matrix with no covering owner approval is refused by name before any matrix run",async()=>{
+ for(const approvals of [undefined,[],[{digest:hash(MATRIX_A),messageSeq:11}],[{digest:hash(MATRIX_B),messageSeq:0}],[{digest:hash(MATRIX_B)}]]){
+  const h=changedMatrixHost(approvals);
+  await assert.rejects(h.adapter.verifyIntegrated(h.integrated),e=>failureReason(e)===uncoveredReason);
+  assert.equal(h.matrix().length,0);assert.equal(h.sends().length,0);
+  assert.ok(!existsSync(join(attemptDir(h.home,h.integrated.integratedCommit,0),"context.json")));
+ }
+ assert.match(uncoveredReason,/^Matrix digest changed [a-f0-9]{8} to [a-f0-9]{8}; no owner approval covers it$/);
+});
+test("m3 an unchanged matrix keeps the job's digest and approval, whatever other approvals exist",async()=>{
+ const h=changedMatrixHost([{digest:hash(MATRIX_B),messageSeq:55},{digest:hash(MATRIX_A),messageSeq:99}]);
+ writeFileSync(join(h.f.cwd,"verification/matrix.json"),MATRIX_A);
+ assert.equal(await h.adapter.verifyIntegrated(h.integrated),false);
+ const context=h.context();
+ assert.equal(context.approvedMatrixDigest,hash(MATRIX_A));assert.equal(context.matrixApprovalMessageSeq,11);assert.equal(context.matrixDigest,hash(MATRIX_A));
+ assert.deepEqual(h.matrix().map(c=>c.argv[2]),["plan","run"]);
+});
+// tasks-hub gains a matrix change after the candidate was accepted: the real
+// integration cherry-picks the candidate onto it, and the real host adapter
+// verifies, refuses and escalates through stubbed host commands.
+function matrixChangeRelease(approvals){
+ const f=fixture(),originHead=remoteHead(f);git(f.cwd,"checkout","tasks-hub");mkdirSync(join(f.cwd,"verification"));f.base=change(f,"verification/matrix.json",MATRIX_A);
+ git(f.cwd,"checkout","-B","candidate");const j=job(f,change(f,"client/a.js","a"));
+ Object.assign(j.plan,{matrixDigest:hash(MATRIX_A),approvedMatrixDigest:hash(MATRIX_A),matrixApprovalMessageSeq:11});
+ git(f.cwd,"checkout","tasks-hub");const tip=change(f,"verification/matrix.json",MATRIX_B);
+ ignorePrerequisites(f.cwd);placePrerequisites(f.cwd);
+ const c=config(f,j),a=fake(),argvs=[],home=dirname(c.journalPath);
+ const host=new HostAdapter({cwd:f.cwd,journalDirectory:home},{id:"rel_fixture",agentId:"agt_fixture",runId:"run_fixture",generation:1});host.matrixRunsActive=()=>0;
+ host.command=argv=>{argvs.push(argv);
+  if(argv[1]==="deployment"&&argv[2]==="list")return JSON.stringify([{id:"rel_fixture",state:"claimed",matrixApprovals:approvals}]);
+  if(argv[1]==="deployment"&&argv[2]==="handler")return JSON.stringify({id:"agt_0123abcd"});
+  if(argv[1]==="scripts/verify-matrix.mjs"&&argv[2]==="plan"){writeFileSync(argv[4],JSON.stringify(workedPlan));return "";}
+  if(argv[1]==="scripts/verify-matrix.mjs"&&argv[2]==="run"){writeFileSync(join(argv[4],"receipt.json"),JSON.stringify({environment:{},checks:[{exitCode:0}]}));return "";}
+  return "";};
+ a.verifyIntegrated=x=>host.verifyIntegrated(x);a.escalate=async d=>{a.calls.push("escalate");await host.escalate(d);};
+ return {f,j,c,a,argvs,home,tip,originHead,sends:()=>argvs.filter(x=>x[1]==="send"),matrix:()=>argvs.filter(x=>x[1]==="scripts/verify-matrix.mjs")};
+}
+test("m4 end to end: a matrix change on tasks-hub after acceptance verifies under the owner approval of the new digest",async()=>{
+ const r=matrixChangeRelease([{digest:hash(MATRIX_A),messageSeq:11},{digest:hash(MATRIX_B),messageSeq:40}]);
+ assert.equal((await runRelease(r.c,r.a)).outcome,"waiting_matrix");
+ const integrated=git(r.f.cwd,"rev-parse","HEAD");assert.notEqual(integrated,r.j.commit);assert.equal(git(r.f.cwd,"rev-parse","HEAD^"),r.tip);
+ const context=JSON.parse(readFileSync(join(attemptDir(r.home,integrated,0),"context.json"),"utf8"));
+ // What verify-matrix.mjs plan requires: the approved digest is the integrated file's.
+ assert.equal(context.approvedMatrixDigest,hash(readFileSync(join(r.f.cwd,"verification/matrix.json"),"utf8")));assert.equal(context.approvedMatrixDigest,hash(MATRIX_B));
+ assert.equal(context.matrixApprovalMessageSeq,40);assert.equal(context.commit,integrated);
+ assert.deepEqual(r.matrix().map(x=>x[2]),["plan","run"]);
+ const sends=r.sends();assert.equal(sends.length,1);assert.equal(sends[0][sends[0].indexOf("--subject")+1],"Import verification for the integrated release commit");
+ assert.deepEqual(r.a.calls,[]);assert.equal(git(r.f.cwd,"rev-parse","refs/heads/tasks-hub"),r.tip);
+ assert.equal(r.j.plan.approvedMatrixDigest,hash(MATRIX_A));
+});
+test("m5 end to end: a matrix change no owner approval covers refuses the job by name and leaves tasks-hub alone",async()=>{
+ const r=matrixChangeRelease([{digest:hash(MATRIX_A),messageSeq:11}]);
+ await assert.rejects(runRelease(r.c,r.a),/Release refused before publication/);
+ assert.deepEqual(r.a.calls,["refuse","escalate"]);assert.equal(r.matrix().length,0);
+ const journal=JSON.parse(readFileSync(r.c.journalPath,"utf8"));assert.equal(journal.phase,"refused");assert.equal(journal.refusalReason,uncoveredReason);assert.notEqual(journal.published,true);assert.deepEqual(journal.effects,[]);
+ const sends=r.sends();assert.equal(sends.length,1);assert.equal(sends[0][sends[0].indexOf("--subject")+1],"Release refused before publication");
+ const text=sends[0][sends[0].indexOf("--text")+1];assert.ok(text.includes(`Reason: ${uncoveredReason}.`));assert.doesNotMatch(text,/verify-matrix\.mjs exit/);
+ assert.equal(git(r.f.cwd,"rev-parse","refs/heads/tasks-hub"),r.tip);assert.equal(remoteHead(r.f),r.originHead);
 });

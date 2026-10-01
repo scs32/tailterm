@@ -57,6 +57,60 @@ func (s *Store) Releases(ctx context.Context, task string) ([]api.ReleaseJob, er
 		}
 		out = append(out, j)
 	}
+	if err = rows.Err(); err != nil {
+		return nil, err
+	}
+	if slices.ContainsFunc(out, func(j api.ReleaseJob) bool { return j.State == "claimed" }) {
+		approvals, err := releaseMatrixApprovals(ctx, s.db, task)
+		if err != nil {
+			return nil, err
+		}
+		for i := range out {
+			if out[i].State == "claimed" {
+				out[i].MatrixApprovals = approvals
+			}
+		}
+	}
+	return out, nil
+}
+
+const matrixApprovalPrefix = "verification-matrix-approval:"
+
+// releaseMatrixApproval reports whether the message at seq is an owner
+// approval of exactly this matrix digest: owner-authored, not a system
+// message, and its whole trimmed text the approval token (the rule
+// validateVerificationPlan applies to a candidate plan).
+func releaseMatrixApproval(ctx context.Context, q queryRower, task string, seq int64, digest string) bool {
+	var approver, node, text string
+	if seq <= 0 || !validContextDigest(digest) {
+		return false
+	}
+	err := q.QueryRowContext(ctx, `SELECT from_agent,from_node,text FROM messages WHERE task_id=? AND seq=?`, task, seq).Scan(&approver, &node, &text)
+	return err == nil && approver == "" && node != "system" && strings.TrimSpace(text) == matrixApprovalPrefix+digest
+}
+
+// releaseMatrixApprovals lists the project's owner matrix approvals, the
+// newest message per digest, in message order.
+func releaseMatrixApprovals(ctx context.Context, db *sql.DB, task string) ([]api.ReleaseMatrixApproval, error) {
+	rows, err := db.QueryContext(ctx, `SELECT seq,text FROM messages WHERE task_id=? AND from_agent='' AND from_node<>'system' AND text LIKE ? ORDER BY seq`, task, "%"+matrixApprovalPrefix+"%")
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []api.ReleaseMatrixApproval
+	for rows.Next() {
+		var seq int64
+		var text string
+		if err = rows.Scan(&seq, &text); err != nil {
+			return nil, err
+		}
+		digest, ok := strings.CutPrefix(strings.TrimSpace(text), matrixApprovalPrefix)
+		if !ok || !validContextDigest(digest) {
+			continue
+		}
+		out = slices.DeleteFunc(out, func(a api.ReleaseMatrixApproval) bool { return a.Digest == digest })
+		out = append(out, api.ReleaseMatrixApproval{Digest: digest, MessageSeq: seq})
+	}
 	return out, rows.Err()
 }
 func releaseDeployer(ctx context.Context, q queryRower, task, agent, run string) error {
@@ -218,8 +272,19 @@ func (s *Store) ReleaseAction(ctx context.Context, task string, req api.ReleaseR
 				return zero, releaseConflict("integrated matrix plan required")
 			}
 			p := *req.Plan
-			if p.Commit != req.IntegratedCommit || p.BaseCommit != j.BaseCommit || p.Repository != j.Repository || p.MatrixDigest != j.Plan.MatrixDigest || p.ApprovedMatrixDigest != p.MatrixDigest || p.MatrixApprovalMessageSeq != j.Plan.MatrixApprovalMessageSeq || p.VerifierAgentID != j.AgentID || p.VerifierRunID != j.RunID || p.ChecksDigest != verificationDigest(p.Checks) || p.ScopeRevision != j.ScopeRevision {
+			if p.Commit != req.IntegratedCommit || p.BaseCommit != j.BaseCommit || p.Repository != j.Repository || p.ApprovedMatrixDigest != p.MatrixDigest || p.VerifierAgentID != j.AgentID || p.VerifierRunID != j.RunID || p.ChecksDigest != verificationDigest(p.Checks) || p.ScopeRevision != j.ScopeRevision {
 				return zero, releaseConflict("integrated plan binding mismatch")
+			}
+			// The integrated commit may carry a matrix changed since the job
+			// was approved. Its plan then binds that digest only under an
+			// owner approval of exactly it; the job's approval never carries
+			// over, and the job's own plan is left as approved.
+			matrixChanged := p.MatrixDigest != j.Plan.MatrixDigest
+			if !matrixChanged && p.MatrixApprovalMessageSeq != j.Plan.MatrixApprovalMessageSeq {
+				return zero, releaseConflict("integrated plan binding mismatch")
+			}
+			if matrixChanged && !releaseMatrixApproval(ctx, tx, task, p.MatrixApprovalMessageSeq, p.MatrixDigest) {
+				return zero, releaseConflict(fmt.Sprintf("matrix digest changed %.8s -> %.8s; no approval", j.Plan.MatrixDigest, p.MatrixDigest))
 			}
 			if err = releaseDeployer(ctx, tx, task, j.AgentID, j.RunID); err != nil {
 				return zero, err
@@ -228,17 +293,23 @@ func (s *Store) ReleaseAction(ctx context.Context, task string, req api.ReleaseR
 			for _, required := range j.Plan.Checks {
 				want := verificationDigest(required)
 				found := false
-				var wider *api.VerificationCheck
+				var wider, rebuilt *api.VerificationCheck
 				for i, check := range p.Checks {
 					if verificationDigest(check) == want {
 						found = true
 					} else if wider == nil && goRaceCovers(required, check) {
 						wider = &p.Checks[i]
+					} else if matrixChanged && rebuilt == nil && matrixChangeCovers(required, check) {
+						rebuilt = &p.Checks[i]
 					}
 				}
 				if !found && wider != nil {
 					found = true
 					coverage = append(coverage, api.ReleaseCheckCoverage{CheckID: required.ID, ApprovedDigest: want, IntegratedDigest: verificationDigest(*wider), Relation: "superset"})
+				}
+				if !found && rebuilt != nil {
+					found = true
+					coverage = append(coverage, api.ReleaseCheckCoverage{CheckID: required.ID, ApprovedDigest: want, IntegratedDigest: verificationDigest(*rebuilt), Relation: "matrix_changed"})
 				}
 				if !found {
 					return zero, releaseConflict("integrated matrix omitted approved check " + required.ID)
@@ -260,6 +331,10 @@ func (s *Store) ReleaseAction(ctx context.Context, task string, req api.ReleaseR
 			j.IntegratedVerification = req.Verification
 			j.IntegratedPlan = req.Plan
 			j.IntegratedCoverage = coverage
+			j.IntegratedMatrix = nil
+			if matrixChanged {
+				j.IntegratedMatrix = &api.ReleaseMatrixChange{ApprovedDigest: j.Plan.MatrixDigest, IntegratedDigest: p.MatrixDigest, ApprovalMessageSeq: p.MatrixApprovalMessageSeq}
+			}
 		} else {
 			if err = releaseDeployer(ctx, tx, task, req.AgentID, req.RunID); err != nil {
 				return zero, err
@@ -441,6 +516,25 @@ func goRaceCovers(approved, integrated api.VerificationCheck) bool {
 	return true
 }
 
+// Under an owner-approved matrix change the new matrix may rebuild any check
+// (timeouts, flags, environment), so an approved check is covered by the
+// integrated check with the same ID. A go-race must still test every approved
+// package, or "./...".
+func matrixChangeCovers(approved, integrated api.VerificationCheck) bool {
+	if integrated.ID != approved.ID {
+		return false
+	}
+	if approved.ID != "go-race" {
+		return true
+	}
+	_, want, ok := goRaceArgv(approved.Argv)
+	_, have, integratedOK := goRaceArgv(integrated.Argv)
+	if !ok || !integratedOK {
+		return false
+	}
+	return slices.Contains(have, "./...") || !slices.ContainsFunc(want, func(pkg string) bool { return !slices.Contains(have, pkg) })
+}
+
 // goRaceArgv splits argv at its first package; every later element must be a
 // package too, so a flag after the packages never passes as one.
 func goRaceArgv(argv []string) (flags, packages []string, ok bool) {
@@ -495,6 +589,7 @@ func reconcileRelease(ctx context.Context, tx *sql.Tx, task string, j *api.Relea
 		j.IntegratedCommit = ""
 		j.IntegratedPlan = nil
 		j.IntegratedCoverage = nil
+		j.IntegratedMatrix = nil
 		j.IntegratedVerification = nil
 		j.InputsCommit = ""
 		j.InputsDigest = ""
@@ -563,6 +658,7 @@ func setAsideRelease(ctx context.Context, tx *sql.Tx, task string, j *api.Releas
 	j.IntegratedCommit = ""
 	j.IntegratedPlan = nil
 	j.IntegratedCoverage = nil
+	j.IntegratedMatrix = nil
 	j.IntegratedVerification = nil
 	j.InputsCommit = ""
 	j.InputsDigest = ""

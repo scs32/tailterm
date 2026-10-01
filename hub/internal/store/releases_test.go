@@ -341,6 +341,160 @@ func TestReleaseRequeueClearsIntegratedCoverage(t *testing.T) {
 	}
 }
 
+var (
+	matrixA = strings.Repeat("a", 64)
+	matrixB = strings.Repeat("b", 64)
+	// A changed matrix rebuilds go-race: other flags and another time limit.
+	changedRaceFlags = []string{"-race", "-timeout=40m", "-shuffle=on"}
+)
+
+func changedRace(packages ...string) api.VerificationCheck {
+	race := goRace(changedRaceFlags, packages...)
+	race.Environment["VERIFICATION_TIMEOUT_MS"] = "2700000"
+	return race
+}
+
+// matrixImport is integratedImport for an integrated commit whose matrix has
+// this digest, citing the approval message at seq.
+func matrixImport(j api.ReleaseJob, h, d api.Agent, requestID, digest string, seq int64, checks []api.VerificationCheck) api.ReleaseRequest {
+	req := integratedImport(j, h, d, requestID, checks)
+	p := *req.Plan
+	p.MatrixDigest = digest
+	p.ApprovedMatrixDigest = digest
+	p.MatrixApprovalMessageSeq = seq
+	r := passingVerification(p)
+	req.Plan = &p
+	req.Verification = &r
+	return req
+}
+func ownerApproval(t *testing.T, s *Store, task api.Task, text string) int64 {
+	t.Helper()
+	m, err := s.PostMessage(context.Background(), task.ID, api.PostMessageRequest{Text: text, RequestID: api.NewID("req")}, api.Caller{Node: "fixture", User: "owner"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return m.Seq
+}
+
+// tasks-hub gained a matrix change after the job was approved, so the
+// integrated commit has another matrix digest. The import binds that digest
+// only under an owner approval of exactly it, records the change beside the
+// unchanged approved plan, and otherwise names both digests.
+func TestReleaseImportBindsOwnerApprovedMatrixChange(t *testing.T) {
+	s, task, h, d, entry := releaseFixture(t)
+	ctx := context.Background()
+	approved := goRaceMatrix(goRace(raceFlags, "./cmd/tt"))
+	j := claimGoRaceJob(t, s, task, h, d, entry, approved)
+	if j.Plan.MatrixDigest != matrixA {
+		t.Fatal("fixture digest", j.Plan.MatrixDigest)
+	}
+	integrated := goRaceMatrix(changedRace(widerPackages...))
+	refuse := func(name, want string, req api.ReleaseRequest) {
+		t.Helper()
+		_, err := s.ReleaseAction(ctx, task.ID, req)
+		if !errors.Is(err, api.ErrConflict) || !strings.HasSuffix(err.Error(), want) {
+			t.Fatalf("%s: %v", name, err)
+		}
+		saved, err := releaseLoad(ctx, s.db, task.ID, j.ID)
+		if err != nil || saved.Generation != j.Generation || saved.IntegratedPlan != nil || saved.IntegratedMatrix != nil || saved.IntegratedCoverage != nil {
+			t.Fatal(name, "changed the job", saved.Generation, saved.IntegratedMatrix, err)
+		}
+	}
+	const uncovered = "release: matrix digest changed aaaaaaaa -> bbbbbbbb; no approval"
+	old := ownerApproval(t, s, task, "verification-matrix-approval:"+matrixA)
+	agent, err := s.PostMessage(ctx, task.ID, api.PostMessageRequest{Text: "verification-matrix-approval:" + matrixB, RequestID: "agent-token", AgentID: h.ID}, api.Caller{Node: "fixture", User: "owner"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	wordy := ownerApproval(t, s, task, "I approve verification-matrix-approval:"+matrixB)
+	refuse("no-seq", uncovered, matrixImport(j, h, d, "matrix-no-seq", matrixB, 0, integrated))
+	refuse("old-approval", uncovered, matrixImport(j, h, d, "matrix-old", matrixB, old, integrated))
+	refuse("agent-token", uncovered, matrixImport(j, h, d, "matrix-agent", matrixB, agent.Seq, integrated))
+	refuse("extra-words", uncovered, matrixImport(j, h, d, "matrix-wordy", matrixB, wordy, integrated))
+	refuse("missing-seq", uncovered, matrixImport(j, h, d, "matrix-missing", matrixB, wordy+1000, integrated))
+	covering := ownerApproval(t, s, task, " verification-matrix-approval:"+matrixB+"\n")
+	// The approved digest and the plan's own digest must still agree.
+	split := matrixImport(j, h, d, "matrix-split", matrixB, covering, integrated)
+	split.Plan.ApprovedMatrixDigest = matrixA
+	refuse("split-digest", "integrated plan binding mismatch", split)
+	// An approved matrix change still may not drop a check or narrow go-race.
+	refuse("dropped-check", "integrated matrix omitted approved check "+approved[7].ID, matrixImport(j, h, d, "matrix-dropped", matrixB, covering, slices.Delete(slices.Clone(integrated), 7, 8)))
+	refuse("narrower-race", "integrated matrix omitted approved check go-race", matrixImport(j, h, d, "matrix-narrow", matrixB, covering, goRaceMatrix(changedRace(widerPackages[1:]...))))
+	// An unchanged digest keeps the job's own approval, whatever else exists.
+	refuse("same-digest-other-seq", "integrated plan binding mismatch", matrixImport(j, h, d, "matrix-same", matrixA, old, approved))
+
+	// The list gives the claimed job the owner approvals as a hint: newest
+	// message per digest, nothing agent-authored or inexact, nothing saved.
+	jobs, err := s.Releases(ctx, task.ID)
+	wantApprovals := []api.ReleaseMatrixApproval{{Digest: matrixA, MessageSeq: old}, {Digest: matrixB, MessageSeq: covering}}
+	if err != nil || len(jobs) != 1 || !slices.Equal(jobs[0].MatrixApprovals, wantApprovals) {
+		t.Fatalf("approvals %+v %v", jobs, err)
+	}
+
+	req := matrixImport(j, h, d, "matrix-import", matrixB, covering, integrated)
+	imported, err := s.ReleaseAction(ctx, task.ID, req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantMatrix := api.ReleaseMatrixChange{ApprovedDigest: matrixA, IntegratedDigest: matrixB, ApprovalMessageSeq: covering}
+	wantCoverage := []api.ReleaseCheckCoverage{{CheckID: "go-race", ApprovedDigest: verificationDigest(approved[71]), IntegratedDigest: verificationDigest(integrated[71]), Relation: "matrix_changed"}}
+	if imported.IntegratedMatrix == nil || *imported.IntegratedMatrix != wantMatrix || !slices.Equal(imported.IntegratedCoverage, wantCoverage) || imported.Generation != j.Generation+1 {
+		t.Fatalf("matrix %+v coverage %+v", imported.IntegratedMatrix, imported.IntegratedCoverage)
+	}
+	if imported.Plan.MatrixDigest != matrixA || imported.Plan.MatrixApprovalMessageSeq != j.Plan.MatrixApprovalMessageSeq || verificationDigest(imported.Plan) != verificationDigest(j.Plan) || imported.IntegratedPlan.MatrixDigest != matrixB {
+		t.Fatal("approved plan changed", imported.Plan.MatrixDigest)
+	}
+	if imported.MatrixApprovals != nil {
+		t.Fatal("action returned the derived approvals")
+	}
+	var raw string
+	if err = s.db.QueryRow(`SELECT record_json FROM release_jobs WHERE task_id=? AND id=?`, task.ID, j.ID).Scan(&raw); err != nil || strings.Contains(raw, "matrixApprovals") || !strings.Contains(raw, `"integratedMatrix"`) {
+		t.Fatal("saved record", err, strings.Contains(raw, "matrixApprovals"))
+	}
+	merged, err := s.ReleaseAction(ctx, task.ID, api.ReleaseRequest{RequestID: "matrix-merged", Operation: "merged", AgentID: d.ID, RunID: d.RunID, JobID: j.ID, ExpectedGeneration: imported.Generation, IntegratedCommit: candidateA})
+	if err != nil || merged.State != "merged" || merged.IntegratedMatrix == nil || *merged.IntegratedMatrix != wantMatrix {
+		t.Fatal(merged.State, err)
+	}
+	// Only a claimed job carries the hint.
+	if jobs, err = s.Releases(ctx, task.ID); err != nil || len(jobs) != 1 || jobs[0].MatrixApprovals != nil {
+		t.Fatalf("merged job approvals %+v %v", jobs, err)
+	}
+}
+
+// A requeued or set-aside job starts its integrated verification from
+// scratch, the recorded matrix change included.
+func TestReleaseRequeueAndSetAsideClearIntegratedMatrix(t *testing.T) {
+	for _, disposition := range []string{"requeue", "set_aside"} {
+		t.Run(disposition, func(t *testing.T) {
+			s, task, h, d, entry := releaseFixture(t)
+			ctx := context.Background()
+			j := claimGoRaceJob(t, s, task, h, d, entry, goRaceMatrix(goRace(raceFlags, "./cmd/tt")))
+			seq := ownerApproval(t, s, task, "verification-matrix-approval:"+matrixB)
+			imported, err := s.ReleaseAction(ctx, task.ID, matrixImport(j, h, d, "matrix-import", matrixB, seq, goRaceMatrix(changedRace("./cmd/tt"))))
+			if err != nil || imported.IntegratedMatrix == nil || len(imported.IntegratedCoverage) != 1 {
+				t.Fatal(imported.IntegratedMatrix, imported.IntegratedCoverage, err)
+			}
+			req := api.ReleaseRequest{RequestID: "matrix-" + disposition, Operation: "reconcile", AgentID: h.ID, RunID: h.RunID, JobID: j.ID, ExpectedGeneration: imported.Generation}
+			if disposition == "requeue" {
+				s.db.Exec(`UPDATE agents SET status='exited' WHERE id=?`, d.ID)
+				evidence := recoveryEvidence(t, s, task, h, imported)
+				req.Reconciliation = &evidence
+			} else {
+				if _, err = s.ReleaseAction(ctx, task.ID, api.ReleaseRequest{RequestID: "later-enqueue", Operation: "enqueue", AgentID: h.ID, RunID: h.RunID, EntryID: releaseEntry(t, s, task, "later job", "later")}); err != nil {
+					t.Fatal(err)
+				}
+				evidence := setAsideEvidence(t, s, task, h, imported)
+				req.Operation = "set-aside"
+				req.Reconciliation = &evidence
+			}
+			cleared, err := s.ReleaseAction(ctx, task.ID, req)
+			if err != nil || cleared.State != "verified" || cleared.IntegratedMatrix != nil || cleared.IntegratedCoverage != nil || cleared.IntegratedPlan != nil || cleared.Plan.MatrixDigest != matrixA {
+				t.Fatal(cleared.State, cleared.IntegratedMatrix, cleared.IntegratedCoverage, err)
+			}
+		})
+	}
+}
+
 func TestReleaseRehearsalRejectsForeignKeyDamage(t *testing.T) {
 	s, _, _, _, _ := releaseFixture(t)
 	ctx := context.Background()

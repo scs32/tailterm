@@ -233,8 +233,42 @@ before publication records `refusalReason` in the journal and posts "Release
 refused before publication" with that reason: `Missing matrix prerequisites:
 PATHS`, `Host busy with another verify-matrix run`, `Matrix host probe
 unavailable`, `Invalid matrix check timeout`, `Integrated matrix receipt is not
-eligible`, `verify-matrix.mjs timeout` or `exit N`, or `unclassified` for an
+eligible`, `Matrix digest changed OLD8 to NEW8; no owner approval covers it`
+(below), `verify-matrix.mjs timeout` or `exit N`, or `unclassified` for an
 untagged error. It never claims a rollback was attempted.
+
+**A matrix changed after approval (wi_715ea343cc605b1c).** A job is approved
+under one `verification/matrix.json` digest. When tasks-hub gains a matrix
+change before the job is released, the integrated commit carries another digest,
+and the job's own approval does not cover it.
+
+- **Which digest the integrated plan binds.** Always the integrated commit's.
+  The runner hashes the matrix file in its checkout before the plan. Unchanged:
+  the context is the job's plan with only the commit and verifier changed, as
+  before. Changed: the context's `approvedMatrixDigest` is the integrated digest
+  and its `matrixApprovalMessageSeq` is the owner approval of that digest.
+- **What covers a digest.** An owner-authored Board message, not from an agent
+  or the system, whose whole trimmed text is
+  `verification-matrix-approval:SHA256` for exactly that digest (the candidate
+  plan rule in [objective verification](objective-verification.md)). The
+  approval of another digest, the job's included, never carries over, and
+  nothing is inferred.
+- **Hint, then proof.** `tt deployment list` gives each `claimed` job
+  `matrixApprovals` (`digest`, `messageSeq`; the newest message per digest),
+  derived on each read and never saved. The runner takes the seq from there.
+  The handler's import does not trust it: for a changed digest the hub re-reads
+  the cited message and applies the same rule.
+- **No covering approval.** The runner refuses the job before any matrix run,
+  with `Matrix digest changed OLD8 to NEW8; no owner approval covers it` (the
+  first eight hex digits of each) instead of `verify-matrix.mjs exit 1`. An
+  import citing no covering approval is refused as `matrix digest changed OLD8
+  -> NEW8; no approval`. A refused job is terminal: after the owner approves the
+  new digest, release it by hand or from a new entry. The runner does not wait
+  for an approval or ask for one.
+- **What the job records.** An accepted import saves `integratedMatrix`
+  (`approvedDigest`, `integratedDigest`, `approvalMessageSeq`) on the job. The
+  job's approved `plan` is never rewritten. A requeue or set-aside clears
+  `integratedMatrix` with the rest of the integrated verification.
 
 The handler's import (`verification` release operation) binds the integrated
 plan to the approved one and requires every approved check in it. Every check
@@ -247,7 +281,12 @@ before the first `./` package) whose packages are a superset of the approved
 list, or `./...`. Each approved check covered that way is recorded on the job
 as `integratedCoverage` (`checkId`, `approvedDigest`, `integratedDigest`,
 `relation: "superset"`); exact matches are not listed, and a requeue clears it
-with the rest of the integrated verification. Anything else is refused as
+with the rest of the integrated verification. Under an owner-approved matrix
+change (above) the new matrix may rebuild any check (timeouts, flags,
+environment), so an approved check with no exact match is covered by the
+integrated check with the same ID and recorded with `relation:
+"matrix_changed"`; a `go-race` must still test every approved package, or
+`./...`. Anything else is refused as
 `integrated matrix omitted approved check ID`, naming the check. An approved
 `./...` is covered only by `./...`, so an item approved on all packages whose
 integrated run narrows to a list is refused; that needs a runner-side union, not
