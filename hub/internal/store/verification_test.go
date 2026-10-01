@@ -906,3 +906,161 @@ func TestRequireItemOperatorRoles(t *testing.T) {
 		t.Fatal("reader of another item", err)
 	}
 }
+
+// leadPlan is the lead's plan freeze request for the fixture's plan.
+func (f *operatorFixture) leadPlan(t *testing.T, key string) api.VerificationRequest {
+	t.Helper()
+	p := f.plan
+	return api.VerificationRequest{RequestID: key, AgentID: f.lead.ID, RunID: f.lead.RunID, ContextDigest: f.digest(t, f.lead), Plan: &p}
+}
+
+// records counts the fixture item's verification records.
+func (f *operatorFixture) records(t *testing.T) int {
+	t.Helper()
+	return f.count(t, `SELECT count(*) FROM verification_records WHERE task_id=?`, f.task.ID)
+}
+
+// a1: the item lead freezes a plan with its own agent, run and context
+// digest. The handler makes no call.
+func TestLeadFreezesVerificationPlan(t *testing.T) {
+	f := newOperatorFixture(t)
+	req := f.leadPlan(t, "lead-plan")
+	first, err := f.s.SaveVerification(f.ctx, f.task.ID, f.item.ID, req)
+	if err != nil {
+		t.Fatal("lead plan freeze", err)
+	}
+	if first.Generation != 1 || first.Kind != "plan" || first.AuthorRole != "lead" || first.HandlerAgentID != f.lead.ID || first.HandlerRunID != f.lead.RunID || len(first.Notices) != 0 {
+		t.Fatalf("lead plan record %+v", first)
+	}
+	var raw string
+	if err = f.s.db.QueryRow(`SELECT record_json FROM verification_records WHERE task_id=? AND item_id=? AND generation=1`, f.task.ID, f.item.ID).Scan(&raw); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(raw, `"authorRole":"lead"`) || strings.Contains(raw, `"notices"`) {
+		t.Fatalf("saved lead plan record %s", raw)
+	}
+	again, err := f.s.SaveVerification(f.ctx, f.task.ID, f.item.ID, req)
+	if err != nil || !reflect.DeepEqual(again, first) || f.records(t) != 1 {
+		t.Fatalf("replay %+v %v records %d", again, err, f.records(t))
+	}
+	// The lead reads its own record back without a handler.
+	history, err := f.s.VerificationHistory(f.ctx, f.task.ID, f.item.ID, f.lead.ID, f.lead.RunID)
+	if err != nil || len(history) != 1 || !reflect.DeepEqual(history[0], first) {
+		t.Fatalf("lead history %+v %v", history, err)
+	}
+	if _, err = f.s.VerificationEnrollment(f.ctx, f.task.ID, f.item.ID, f.lead.ID, f.lead.RunID); err != nil {
+		t.Fatal("lead enrollment read", err)
+	}
+	// A handler-written plan record keeps today's bytes: no new field.
+	h := newOperatorFixture(t)
+	hp := h.plan
+	if _, err = h.s.SaveVerification(h.ctx, h.task.ID, h.item.ID, api.VerificationRequest{RequestID: "handler-plan", AgentID: h.handler.ID, RunID: h.handler.RunID, Plan: &hp}); err != nil {
+		t.Fatal("handler plan freeze", err)
+	}
+	if err = h.s.db.QueryRow(`SELECT record_json FROM verification_records WHERE task_id=? AND item_id=? AND generation=1`, h.task.ID, h.item.ID).Scan(&raw); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(raw, "authorRole") || strings.Contains(raw, "notices") || strings.Contains(raw, "contextDigest") {
+		t.Fatalf("handler plan record gained a field: %s", raw)
+	}
+}
+
+// a2: every mismatch has its own reason and writes nothing; a rebound entry
+// then admits the same lead, run and digest.
+func TestItemOperatorRefusals(t *testing.T) {
+	for _, row := range []struct {
+		name string
+		req  func(t *testing.T, f *operatorFixture) (item string, req api.VerificationRequest)
+		want string
+	}{
+		{"wrong order", func(t *testing.T, f *operatorFixture) (string, api.VerificationRequest) {
+			req := f.leadPlan(t, "wrong-order")
+			req.Plan.OrderMessageSeq = f.otherOrder.Seq
+			return f.item.ID, req
+		}, "runs under order #"},
+		{"replaced run", func(t *testing.T, f *operatorFixture) (string, api.VerificationRequest) {
+			req := f.leadPlan(t, "replaced-run")
+			req.RunID = api.NewID("run")
+			return f.item.ID, req
+		}, "agent run changed; refresh identity"},
+		{"wrong context digest", func(t *testing.T, f *operatorFixture) (string, api.VerificationRequest) {
+			req := f.leadPlan(t, "wrong-digest")
+			req.ContextDigest = f.digest(t, f.verifier)
+			if req.ContextDigest == f.digest(t, f.lead) {
+				req.ContextDigest = strings.Repeat("0", 64)
+			}
+			return f.item.ID, req
+		}, "context digest differs from this run's admitted context"},
+		{"no running entry", func(t *testing.T, f *operatorFixture) (string, api.VerificationRequest) {
+			req := f.leadPlan(t, "no-entry")
+			req.Plan.ItemID, req.Plan.OrderMessageSeq = f.other.ID, f.otherOrder.Seq
+			return f.other.ID, req
+		}, "no running team queue entry for this item; ask the database handler"},
+		{"bound member who is not the lead", func(t *testing.T, f *operatorFixture) (string, api.VerificationRequest) {
+			req := f.leadPlan(t, "member-plan")
+			req.AgentID, req.RunID, req.ContextDigest = f.verifier.ID, f.verifier.RunID, f.digest(t, f.verifier)
+			return f.item.ID, req
+		}, "only the item lead or the database handler may freeze a verification plan"},
+		{"agent not bound to the item", func(t *testing.T, f *operatorFixture) (string, api.VerificationRequest) {
+			outsider, err := f.s.AddAgent(f.ctx, f.task.ID, api.AddAgentRequest{Name: "outsider", AgentID: api.NewID("agt"), Host: "mini", Session: "outsider"}, f.by)
+			if err != nil {
+				t.Fatal(err)
+			}
+			req := f.leadPlan(t, "outsider-plan")
+			req.AgentID, req.RunID = outsider.ID, outsider.RunID
+			return f.item.ID, req
+		}, "this run is not admitted to the item under order #"},
+	} {
+		t.Run(row.name, func(t *testing.T) {
+			f := newOperatorFixture(t)
+			item, req := row.req(t, f)
+			before := f.records(t)
+			_, err := f.s.SaveVerification(f.ctx, f.task.ID, item, req)
+			if !errors.Is(err, api.ErrConflict) || !strings.Contains(err.Error(), row.want) {
+				t.Fatalf("got %v, want a refusal containing %q", err, row.want)
+			}
+			if after := f.records(t); after != before {
+				t.Fatalf("refused call wrote a record: %d -> %d", before, after)
+			}
+		})
+	}
+
+	t.Run("item revision moved past the entry, then rebound", func(t *testing.T) {
+		f := newOperatorFixture(t)
+		digest := f.digest(t, f.lead)
+		updated, source := f.amend(t, "one")
+		f.confirm(t, updated)
+		stale := f.leadPlan(t, "stale-plan")
+		stale.Plan.ItemRevision, stale.Plan.ScopeRevision = updated.Revision, updated.ScopeRevision
+		_, err := f.s.SaveVerification(f.ctx, f.task.ID, f.item.ID, stale)
+		if !errors.Is(err, api.ErrConflict) {
+			t.Fatalf("stale entry: %v", err)
+		}
+		for _, want := range []string{"entry " + f.entry.ID, fmt.Sprintf("bound to revision %d", f.item.Revision), fmt.Sprintf("the item is at revision %d", updated.Revision), "tt team queue rebind"} {
+			if !strings.Contains(err.Error(), want) {
+				t.Fatalf("stale refusal %q lacks %q", err, want)
+			}
+		}
+		if n := f.records(t); n != 0 {
+			t.Fatalf("stale refusal wrote %d records", n)
+		}
+
+		f.entry = f.action(t, f.rebind(updated, source))
+		if after := f.digest(t, f.lead); after != digest {
+			t.Fatalf("rebind changed the lead's digest %s -> %s", digest, after)
+		}
+		// The amended scope needs its own saved assignment.
+		env := api.Envelope{Kind: "assign", Subject: "Implement amended fixture criteria", Body: api.EnvelopeBody{Objective: "Fixture", Owns: []string{"fixture"}, Acceptance: map[string]string{"a1": "works", "a2": "retries"}}}
+		assign, err := f.post(env, f.builder.ID, f.lead)
+		if err != nil {
+			t.Fatal("assign after rebind", err)
+		}
+		rebound := f.leadPlan(t, "rebound-plan")
+		rebound.ContextDigest = digest
+		rebound.Plan.ItemRevision, rebound.Plan.ScopeRevision, rebound.Plan.AssignmentSeq = updated.Revision, updated.ScopeRevision, assign.Seq
+		saved, err := f.s.SaveVerification(f.ctx, f.task.ID, f.item.ID, rebound)
+		if err != nil || saved.AuthorRole != "lead" || saved.HandlerRunID != f.lead.RunID || f.records(t) != 1 {
+			t.Fatalf("rebound entry: %+v %v", saved, err)
+		}
+	})
+}

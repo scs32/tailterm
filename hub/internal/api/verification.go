@@ -108,6 +108,19 @@ type VerificationRequest struct {
 	ExpectedGeneration int64                `json:"expectedGeneration"`
 	Plan               *VerificationPlan    `json:"plan,omitempty"`
 	Receipt            *VerificationReceipt `json:"receipt,omitempty"`
+	// ContextDigest is the caller run's admitted context digest. An item
+	// lead or verifier must send it; a database handler has no binding and
+	// sends none.
+	ContextDigest string `json:"contextDigest,omitempty"`
+}
+
+// VerificationNotice names one dependent actor a receipt import told, or the
+// reason it was not told.
+type VerificationNotice struct {
+	Role       string `json:"role"`
+	AgentID    string `json:"agentId"`
+	MessageSeq int64  `json:"messageSeq,omitempty"`
+	Skipped    string `json:"skipped,omitempty"`
 }
 type VerificationRecord struct {
 	ItemID         string               `json:"itemId"`
@@ -121,6 +134,11 @@ type VerificationRecord struct {
 	CreatedAt      string               `json:"createdAt"`
 	Plan           *VerificationPlan    `json:"plan,omitempty"`
 	Receipt        *VerificationReceipt `json:"receipt,omitempty"`
+	// HandlerAgentID and HandlerRunID hold the author. AuthorRole is lead or
+	// verifier when the author is not a database handler. Notices lists who
+	// a receipt import told.
+	AuthorRole string               `json:"authorRole,omitempty"`
+	Notices    []VerificationNotice `json:"notices,omitempty"`
 }
 
 func (c *Client) SaveVerification(ctx context.Context, task, item string, req VerificationRequest) (VerificationRecord, error) {

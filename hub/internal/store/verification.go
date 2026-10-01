@@ -77,7 +77,7 @@ func currentVerification(records []api.VerificationRecord) (*api.VerificationPla
 	return p, r
 }
 func (s *Store) VerificationHistory(ctx context.Context, task, item, agent, run string) ([]api.VerificationRecord, error) {
-	if err := requireScopeHandler(s.db, ctx, task, agent, run); err != nil {
+	if err := requireItemReader(ctx, s.db, task, item, agent, run); err != nil {
 		return nil, err
 	}
 	return verificationRecords(ctx, s.db, task, item)
@@ -314,6 +314,28 @@ func absVerificationDuration(n int64) int64 {
 	}
 	return n
 }
+
+// verificationAuthor admits the author of a plan freeze or receipt import and
+// returns the role saved on its record: empty for a database handler, lead
+// for the item lead. A handler is admitted as before. The item lead may
+// freeze a plan; receipts stay with the handler.
+func verificationAuthor(ctx context.Context, q queryRower, task, item string, req api.VerificationRequest, records []api.VerificationRecord) (string, error) {
+	if req.Receipt != nil {
+		return "", requireScopeHandler(q, ctx, task, req.AgentID, req.RunID)
+	}
+	role, _, err := requireItemOperator(ctx, q, task, item, req.AgentID, req.RunID, req.ContextDigest, req.Plan.OrderMessageSeq)
+	if err != nil {
+		return "", err
+	}
+	switch role {
+	case itemOperatorHandler:
+		return "", nil
+	case itemOperatorLead:
+		return itemOperatorLead, nil
+	}
+	return "", verificationConflict("only the item lead or the database handler may freeze a verification plan")
+}
+
 func (s *Store) SaveVerification(ctx context.Context, task, itemID string, req api.VerificationRequest) (api.VerificationRecord, error) {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
@@ -342,7 +364,12 @@ func (s *Store) SaveVerification(ctx context.Context, task, itemID string, req a
 	if !errors.Is(err, sql.ErrNoRows) {
 		return zero, err
 	}
-	if err = requireScopeHandler(tx, ctx, task, req.AgentID, req.RunID); err != nil {
+	records, err := verificationRecords(ctx, tx, task, itemID)
+	if err != nil {
+		return zero, err
+	}
+	authorRole, err := verificationAuthor(ctx, tx, task, itemID, req, records)
+	if err != nil {
 		return zero, err
 	}
 	if err = ackGate(ctx, tx, req.AgentID, req.RunID, 0, s.now()); err != nil {
@@ -358,10 +385,6 @@ func (s *Store) SaveVerification(ctx context.Context, task, itemID string, req a
 	}
 	if status != api.TaskOpen {
 		return zero, api.ErrClosed
-	}
-	records, err := verificationRecords(ctx, tx, task, itemID)
-	if err != nil {
-		return zero, err
 	}
 	generation := int64(len(records))
 	if req.ExpectedGeneration != generation {
@@ -400,7 +423,7 @@ func (s *Store) SaveVerification(ctx context.Context, task, itemID string, req a
 			return zero, err
 		}
 	}
-	record := api.VerificationRecord{ItemID: itemID, ItemTaskID: task, Generation: generation + 1, Kind: kind, RequestID: req.RequestID, Digest: hash, HandlerAgentID: req.AgentID, HandlerRunID: req.RunID, CreatedAt: ts(s.now()), Plan: req.Plan, Receipt: req.Receipt}
+	record := api.VerificationRecord{ItemID: itemID, ItemTaskID: task, Generation: generation + 1, Kind: kind, RequestID: req.RequestID, Digest: hash, HandlerAgentID: req.AgentID, HandlerRunID: req.RunID, CreatedAt: ts(s.now()), Plan: req.Plan, Receipt: req.Receipt, AuthorRole: authorRole}
 	b, err := json.Marshal(record)
 	if err != nil {
 		return zero, err
@@ -520,7 +543,7 @@ func verificationRequired(ctx context.Context, q queryRower, task, item string) 
 	return count > 0, err
 }
 func (s *Store) VerificationEnrollment(ctx context.Context, task, item, agent, run string) ([]api.VerificationEnrollment, error) {
-	if err := requireScopeHandler(s.db, ctx, task, agent, run); err != nil {
+	if err := requireItemReader(ctx, s.db, task, item, agent, run); err != nil {
 		return nil, err
 	}
 	rows, err := s.db.QueryContext(ctx, `SELECT agent_id,run_id,required,provenance,created_at FROM verification_enrollments WHERE task_id=? AND item_id=? ORDER BY created_at,agent_id,run_id`, task, item)
