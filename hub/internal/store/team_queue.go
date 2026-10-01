@@ -620,6 +620,9 @@ func (s *Store) enrichTeamQueueEntry(ctx context.Context, e *api.TeamQueueEntry)
 	if err := s.loadTeamActivities(ctx, e); err != nil {
 		return err
 	}
+	if e.Rebinds, err = teamQueueRebinds(ctx, s.db, e.TaskID, e.ID); err != nil {
+		return err
+	}
 	return attachHandlerArm(ctx, s.db, e)
 }
 
@@ -929,7 +932,7 @@ func teamShape(launch json.RawMessage) string {
 func summarizeTeamQueueEntry(e api.TeamQueueEntry) api.TeamQueueEntry {
 	e.Summary = true
 	e.TeamShape = teamShape(e.LaunchJSON)
-	e.LaunchJSON, e.CloseJSON, e.Activities = nil, nil, nil
+	e.LaunchJSON, e.CloseJSON, e.Activities, e.Rebinds = nil, nil, nil, nil
 	if r := e.Reviews; r != nil {
 		sum := api.ReviewConvergence{ItemID: r.ItemID, History: r.History, Disposition: r.Disposition, Scopes: []api.ReviewScope{}, Rounds: make([]api.ReviewRound, 0, len(r.Rounds)), FollowUps: make([]api.ReviewFollowUp, 0, len(r.FollowUps)), Focused: []api.FocusedReview{}}
 		for _, round := range r.Rounds {
@@ -1007,6 +1010,9 @@ func (s *Store) GetTeamQueueEntry(ctx context.Context, task, id string) (api.Tea
 	}
 	if err == nil {
 		err = s.loadTeamActivities(ctx, &e)
+	}
+	if err == nil {
+		e.Rebinds, err = teamQueueRebinds(ctx, s.db, task, e.ID)
 	}
 	return e, err
 }
@@ -1366,7 +1372,7 @@ func (s *Store) TeamQueueAction(ctx context.Context, task string, req api.TeamQu
 		if err != nil {
 			return zero, fmt.Errorf("%w: duplicate item or queue entry: %v", api.ErrConflict, err)
 		}
-	case "remove", "reorder", "claim", "freeze", "attempt", "started", "running", "replace_lead", "close", "close_refresh", "accept", "finish", "fail", "release", "scope", "owner_integrated":
+	case "remove", "reorder", "claim", "freeze", "attempt", "started", "running", "replace_lead", "close", "close_refresh", "accept", "finish", "fail", "release", "scope", "owner_integrated", "rebind":
 		if !validTeamQueueID(req.EntryID) {
 			return zero, api.ErrInvalid
 		}
@@ -1381,6 +1387,10 @@ func (s *Store) TeamQueueAction(ctx context.Context, task string, req api.TeamQu
 			return zero, fmt.Errorf("%w: entry revision changed", api.ErrConflict)
 		}
 		switch req.Operation {
+		case "rebind":
+			if err := s.rebindTeamQueueEntry(ctx, tx, t, &e, req, now); err != nil {
+				return zero, err
+			}
 		case "scope":
 			ownership, err := canonicalQueueOwnership(req.Ownership)
 			if err != nil {
@@ -2013,11 +2023,16 @@ func (s *Store) TeamQueueAction(ctx context.Context, task string, req api.TeamQu
 				ownerIntegrationJSON = string(data)
 			}
 			ownedJSON, _ := json.Marshal(e.Ownership)
-			_, err = tx.ExecContext(ctx, `UPDATE team_queue_entries SET state=?,revision=?,pause_generation=?,launch_json=?,close_json=?,failure=?,escalation_seq=?,released_at=?,handler_id=?,handler_run_id=?,handler_lease_generation=?,acceptance_json=?,integration_json=?,base_commit=?,ownership_json=?,owner_integration_json=?,serial=?,cwd=?,updated_at=? WHERE id=?`, e.State, e.Revision, e.PauseGeneration, string(e.LaunchJSON), string(e.CloseJSON), e.Failure, e.EscalationSeq, e.ReleasedAt, e.HandlerID, e.HandlerRunID, e.HandlerLeaseGeneration, acceptanceJSON, integrationJSON, e.BaseCommit, string(ownedJSON), ownerIntegrationJSON, e.Serial, e.Cwd, now, e.ID)
+			_, err = tx.ExecContext(ctx, `UPDATE team_queue_entries SET item_revision=?,state=?,revision=?,pause_generation=?,launch_json=?,close_json=?,failure=?,escalation_seq=?,released_at=?,handler_id=?,handler_run_id=?,handler_lease_generation=?,acceptance_json=?,integration_json=?,base_commit=?,ownership_json=?,owner_integration_json=?,serial=?,cwd=?,updated_at=? WHERE id=?`, e.ItemRevision, e.State, e.Revision, e.PauseGeneration, string(e.LaunchJSON), string(e.CloseJSON), e.Failure, e.EscalationSeq, e.ReleasedAt, e.HandlerID, e.HandlerRunID, e.HandlerLeaseGeneration, acceptanceJSON, integrationJSON, e.BaseCommit, string(ownedJSON), ownerIntegrationJSON, e.Serial, e.Cwd, now, e.ID)
 			if err != nil {
 				return zero, err
 			}
 			e.UpdatedAt = now
+		}
+		if req.Operation == "rebind" {
+			if e.Rebinds, err = teamQueueRebinds(ctx, tx, task, e.ID); err != nil {
+				return zero, err
+			}
 		}
 	default:
 		return zero, api.ErrInvalid
@@ -2044,6 +2059,231 @@ func (s *Store) TeamQueueAction(ctx context.Context, task string, req api.TeamQu
 	}
 	s.notify(task)
 	return e, nil
+}
+
+// queueRebindCommand is the supported fix for an entry whose item moved on.
+// SEQ stands for the amendment's message number, which only the caller knows.
+func queueRebindCommand(task, entry string) string {
+	return fmt.Sprintf("tt team queue rebind --task %s --entry %s --source SEQ", task, entry)
+}
+
+// queueRequeueCommand is the supported retry of a released failed entry.
+func queueRequeueCommand(task, entry string) string {
+	return fmt.Sprintf("tt team queue requeue --task %s --entry %s", task, entry)
+}
+
+// staleQueueEntry is the refusal for a queued or running entry whose item is
+// at a later revision than the entry: it names the entry and the rebind.
+func staleQueueEntry(e api.TeamQueueEntry, current int64) error {
+	return fmt.Errorf("%w: entry %s is bound to revision %d; the item is at revision %d. Rebind it: %s", api.ErrConflict, e.ID, e.ItemRevision, current, queueRebindCommand(e.TaskID, e.ID))
+}
+
+// queueRebindAuthority checks who may rebind an entry: the owner's unbound
+// CLI, or a database handler naming its exact live run. Any live handler may
+// rebind a queued entry; only the leased handler a running one. The item
+// lead and team members may not: a team does not move its own scope.
+func queueRebindAuthority(ctx context.Context, tx *sql.Tx, task string, e api.TeamQueueEntry, req api.TeamQueueRequest) error {
+	refused := fmt.Errorf("%w: entry %s: only the owner or a database handler may rebind it; a running entry needs its leased handler", api.ErrConflict, e.ID)
+	if req.LeadAgentID != "" || req.LeadRunID != "" {
+		return refused
+	}
+	if req.HandlerAgentID == "" && req.HandlerRunID == "" {
+		return nil
+	}
+	var role, run, status string
+	err := tx.QueryRowContext(ctx, `SELECT role,run_id,status FROM agents WHERE task_id=? AND id=?`, task, req.HandlerAgentID).Scan(&role, &run, &status)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return err
+	}
+	if err != nil || role != api.AgentRoleDatabaseHandler || run != req.HandlerRunID || status == api.AgentClosed || status == api.AgentExited || status == api.AgentRetired {
+		return refused
+	}
+	// Other states are refused by state, whoever asks.
+	if e.State == "running" && (req.HandlerAgentID != e.HandlerID || req.HandlerRunID != e.HandlerRunID) {
+		return refused
+	}
+	return nil
+}
+
+// queueEntryLead returns the live lead of a running entry's team: the item
+// lead of a parallel queue, else the serial project lead. A zero agent means
+// there is none to notify.
+func queueEntryLead(ctx context.Context, tx *sql.Tx, t api.Task, item string) (api.Agent, error) {
+	var lead api.Agent
+	var agentID, runID string
+	err := tx.QueryRowContext(ctx, `SELECT agent_id,run_id FROM item_team_leads WHERE task_id=? AND item_id=? AND state<>'closed'`, t.ID, item).Scan(&agentID, &runID)
+	switch {
+	case err == nil:
+		lead, err = scanAgent(tx.QueryRowContext(ctx, `SELECT `+agentCols+` FROM agents WHERE task_id=? AND id=? AND run_id=?`, t.ID, agentID, runID))
+	case errors.Is(err, sql.ErrNoRows) && t.Orchestrator != "":
+		lead, err = scanAgent(tx.QueryRowContext(ctx, `SELECT `+agentCols+` FROM agents WHERE task_id=? AND name=? COLLATE NOCASE ORDER BY created_at DESC LIMIT 1`, t.ID, t.Orchestrator))
+	}
+	if errors.Is(err, sql.ErrNoRows) || (err == nil && (lead.Status == api.AgentClosed || lead.Status == api.AgentExited)) {
+		return api.Agent{}, nil
+	}
+	return lead, err
+}
+
+// rebindTeamQueueEntry moves a queued or unaccepted running entry to the
+// item's current revision after an amendment, under the same item and entry
+// identity. For a running entry the live team bindings of the entry's order
+// move with it, so every check that compares the two stays true. Only
+// item_revision moves: each binding's run, context digest, stored context and
+// creation time, the frozen launch, scope confirmations and bookkeeping
+// receipts are never rewritten, and the old revisions are kept in history
+// rows. Every refusal names the entry and the supported path.
+func (s *Store) rebindTeamQueueEntry(ctx context.Context, tx *sql.Tx, t api.Task, e *api.TeamQueueEntry, req api.TeamQueueRequest, now string) error {
+	task := t.ID
+	if req.ItemRevision < 1 || req.SourceMessageSeq < 1 {
+		return fmt.Errorf("%w: entry %s: a rebind names the item's current revision and the amendment's message: %s", api.ErrInvalid, e.ID, queueRebindCommand(task, e.ID))
+	}
+	if err := queueRebindAuthority(ctx, tx, task, *e, req); err != nil {
+		return err
+	}
+	switch {
+	case e.State == "queued":
+	case e.State == "launching":
+		return fmt.Errorf("%w: entry %s is launching; it cannot be rebound. Let the launch fail, then %s", api.ErrConflict, e.ID, queueRequeueCommand(task, e.ID))
+	case e.State == "failed" && e.ReleasedAt == "":
+		return fmt.Errorf("%w: entry %s is failed; it cannot be rebound. Release it, then %s", api.ErrConflict, e.ID, queueRequeueCommand(task, e.ID))
+	case e.State == "failed":
+		return fmt.Errorf("%w: entry %s is failed; it cannot be rebound. Retry it: %s", api.ErrConflict, e.ID, queueRequeueCommand(task, e.ID))
+	case e.State != "running":
+		return fmt.Errorf("%w: entry %s is %s; only a queued or running entry can be rebound", api.ErrConflict, e.ID, e.State)
+	case e.Acceptance != nil:
+		return fmt.Errorf("%w: entry %s has a saved acceptance pinned to item revision %d; it cannot be rebound", api.ErrConflict, e.ID, e.Acceptance.ItemRevision)
+	case e.ReleasedAt != "":
+		return fmt.Errorf("%w: entry %s was released; it cannot be rebound", api.ErrConflict, e.ID)
+	}
+	item, err := getWorkItem(tx, ctx, task, e.ItemID)
+	if err != nil {
+		return err
+	}
+	if item.Status == "done" || item.Status == "dismissed" {
+		return fmt.Errorf("%w: entry %s: its item is %s; a terminal item is not rebound", api.ErrConflict, e.ID, item.Status)
+	}
+	if req.ItemRevision != item.Revision {
+		return fmt.Errorf("%w: entry %s: the item is at revision %d, not %d; rebind to the current revision", api.ErrConflict, e.ID, item.Revision, req.ItemRevision)
+	}
+	if e.ItemRevision == item.Revision {
+		return fmt.Errorf("%w: entry %s is already bound to revision %d", api.ErrConflict, e.ID, item.Revision)
+	}
+	if err := requireConfirmedTeamOrder(ctx, tx, task, e.ItemID, item.Revision, e.OrderMessageSeq); err != nil {
+		if !errors.Is(err, api.ErrConflict) {
+			return err
+		}
+		return fmt.Errorf("%w: entry %s: scope is not confirmed for item revision %d; confirm scope for revision %d and order #%d, then %s", api.ErrConflict, e.ID, item.Revision, item.Revision, e.OrderMessageSeq, queueRebindCommand(task, e.ID))
+	}
+	var linked int
+	if err := tx.QueryRowContext(ctx, `SELECT count(*) FROM message_work_item_links WHERE message_task_id=? AND message_seq=? AND item_task_id=? AND item_id=? AND item_revision<=? AND relationship='primary'`, task, req.SourceMessageSeq, task, e.ItemID, item.Revision).Scan(&linked); err != nil {
+		return err
+	}
+	if linked != 1 {
+		return fmt.Errorf("%w: entry %s: message #%d is not linked to its item; name the amendment's message with --source", api.ErrConflict, e.ID, req.SourceMessageSeq)
+	}
+	var fromScope int64
+	if err := tx.QueryRowContext(ctx, `SELECT scope_revision FROM work_order_scope_confirmations WHERE task_id=? AND item_id=? AND item_revision=? AND order_seq=?`, task, e.ItemID, e.ItemRevision, e.OrderMessageSeq).Scan(&fromScope); err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return err
+	}
+	rebind := api.TeamQueueRebind{ID: api.NewID("tqr"), EntryID: e.ID, FromItemRevision: e.ItemRevision, ToItemRevision: item.Revision, FromScopeRevision: fromScope, ToScopeRevision: item.ScopeRevision,
+		OrderMessageSeq: e.OrderMessageSeq, SourceMessageSeq: req.SourceMessageSeq, AmendedBy: item.UpdatedBy,
+		ApprovedBy: api.Sender{AgentID: req.HandlerAgentID, Node: req.Caller.Node, User: req.Caller.User}, ApprovedRunID: req.HandlerRunID, EntryState: e.State, CreatedAt: now}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO team_queue_rebinds(id,task_id,entry_id,item_id,from_item_revision,to_item_revision,from_scope_revision,to_scope_revision,order_seq,source_message_seq,amended_agent,amended_node,amended_user,approved_agent,approved_run,approved_node,approved_user,entry_state,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		rebind.ID, task, e.ID, e.ItemID, rebind.FromItemRevision, rebind.ToItemRevision, rebind.FromScopeRevision, rebind.ToScopeRevision, rebind.OrderMessageSeq, rebind.SourceMessageSeq,
+		rebind.AmendedBy.AgentID, rebind.AmendedBy.Node, rebind.AmendedBy.User, rebind.ApprovedBy.AgentID, rebind.ApprovedRunID, rebind.ApprovedBy.Node, rebind.ApprovedBy.User, rebind.EntryState, now); err != nil {
+		return err
+	}
+	if e.State == "running" {
+		rows, err := tx.QueryContext(ctx, `SELECT b.agent_id,b.run_id,b.context_digest FROM agent_work_item_bindings b JOIN agents a ON a.id=b.agent_id AND a.run_id=b.run_id WHERE b.item_task_id=? AND b.item_id=? AND b.item_revision=? AND b.work_order_task_id=? AND b.work_order_message_seq=? AND a.status NOT IN ('closed','exited') ORDER BY b.agent_id`, task, e.ItemID, e.ItemRevision, task, e.OrderMessageSeq)
+		if err != nil {
+			return err
+		}
+		var moved []api.TeamQueueRebindBinding
+		for rows.Next() {
+			b := api.TeamQueueRebindBinding{FromItemRevision: e.ItemRevision, ToItemRevision: item.Revision}
+			if err := rows.Scan(&b.AgentID, &b.RunID, &b.ContextDigest); err != nil {
+				rows.Close()
+				return err
+			}
+			moved = append(moved, b)
+		}
+		err = rows.Err()
+		rows.Close()
+		if err != nil {
+			return err
+		}
+		for _, b := range moved {
+			if _, err := tx.ExecContext(ctx, `INSERT INTO team_queue_rebind_bindings(rebind_id,agent_id,run_id,from_item_revision,to_item_revision,context_digest) VALUES(?,?,?,?,?,?)`, rebind.ID, b.AgentID, b.RunID, b.FromItemRevision, b.ToItemRevision, b.ContextDigest); err != nil {
+				return err
+			}
+			result, err := tx.ExecContext(ctx, `UPDATE agent_work_item_bindings SET item_revision=? WHERE agent_id=? AND run_id=? AND item_task_id=? AND item_id=? AND item_revision=?`, item.Revision, b.AgentID, b.RunID, task, e.ItemID, e.ItemRevision)
+			if err != nil {
+				return err
+			}
+			if n, _ := result.RowsAffected(); n != 1 {
+				return fmt.Errorf("%w: entry %s: a team binding changed during the rebind", api.ErrConflict, e.ID)
+			}
+		}
+		lead, err := queueEntryLead(ctx, tx, t, e.ItemID)
+		if err != nil {
+			return err
+		}
+		notice := api.Envelope{Kind: api.EnvelopeKindNotice, Subject: "Your team queue entry moved to the amended item revision",
+			Refs: map[string]string{"item": e.ItemID, "entry": e.ID, "fromRevision": fmt.Sprint(e.ItemRevision), "toRevision": fmt.Sprint(item.Revision), "source": fmt.Sprint(req.SourceMessageSeq)},
+			Body: api.EnvelopeBody{Text: fmt.Sprintf("The item was amended (message #%d). This entry and the team's %d live bindings moved from item revision %d to %d; your run and admitted context are unchanged. Re-run tt context, read the amendment and link new posts at revision %d.", req.SourceMessageSeq, len(moved), e.ItemRevision, item.Revision, item.Revision)}}
+		post := api.PostMessageRequest{Envelope: &notice, RequestID: "queue-rebind-" + rebind.ID, WorkOrderMessage: &api.MessageReference{TaskID: task, Seq: e.OrderMessageSeq}, WorkItems: []api.MessageWorkItem{{ItemTaskID: task, ItemID: e.ItemID, ItemRevision: item.Revision, Relationship: "primary"}}}
+		if lead.ID != "" {
+			notice.To, post.To = lead.Name, lead.ID
+		}
+		if _, err := s.insertMessage(ctx, tx, t, post, lead, api.Caller{Node: "team_queue", User: "rebind"}, false, false); err != nil {
+			return err
+		}
+	}
+	e.ItemRevision = item.Revision
+	return nil
+}
+
+// teamQueueRebinds reads an entry's rebind history, oldest first, with the
+// bindings each rebind moved.
+func teamQueueRebinds(ctx context.Context, q queryRower, task, entry string) ([]api.TeamQueueRebind, error) {
+	rows, err := q.QueryContext(ctx, `SELECT id,from_item_revision,to_item_revision,from_scope_revision,to_scope_revision,order_seq,source_message_seq,amended_agent,amended_node,amended_user,approved_agent,approved_run,approved_node,approved_user,entry_state,created_at FROM team_queue_rebinds WHERE task_id=? AND entry_id=? ORDER BY created_at,rowid`, task, entry)
+	if err != nil {
+		return nil, err
+	}
+	var out []api.TeamQueueRebind
+	for rows.Next() {
+		r := api.TeamQueueRebind{EntryID: entry}
+		if err := rows.Scan(&r.ID, &r.FromItemRevision, &r.ToItemRevision, &r.FromScopeRevision, &r.ToScopeRevision, &r.OrderMessageSeq, &r.SourceMessageSeq, &r.AmendedBy.AgentID, &r.AmendedBy.Node, &r.AmendedBy.User, &r.ApprovedBy.AgentID, &r.ApprovedRunID, &r.ApprovedBy.Node, &r.ApprovedBy.User, &r.EntryState, &r.CreatedAt); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		out = append(out, r)
+	}
+	err = rows.Err()
+	rows.Close()
+	if err != nil {
+		return nil, err
+	}
+	for i := range out {
+		bindings, err := q.QueryContext(ctx, `SELECT agent_id,run_id,from_item_revision,to_item_revision,context_digest FROM team_queue_rebind_bindings WHERE rebind_id=? ORDER BY agent_id,run_id`, out[i].ID)
+		if err != nil {
+			return nil, err
+		}
+		for bindings.Next() {
+			var b api.TeamQueueRebindBinding
+			if err := bindings.Scan(&b.AgentID, &b.RunID, &b.FromItemRevision, &b.ToItemRevision, &b.ContextDigest); err != nil {
+				bindings.Close()
+				return nil, err
+			}
+			out[i].Bindings = append(out[i].Bindings, b)
+		}
+		err = bindings.Err()
+		bindings.Close()
+		if err != nil {
+			return nil, err
+		}
+	}
+	return out, nil
 }
 
 // queueScopeAuthority checks who may declare an entry's ownership. A request

@@ -57,6 +57,9 @@ type TeamQueueEntry struct {
 	// entry is a new entry; RetryOf names the entry it retries.
 	Attempt int64  `json:"attempt,omitempty"`
 	RetryOf string `json:"retryOf,omitempty"`
+	// Rebinds is the entry's history of moves to a later item revision,
+	// oldest first. Summaries leave it out.
+	Rebinds []TeamQueueRebind `json:"rebinds,omitempty"`
 	// Serial marks an entry that runs alone: it conflicts with every other
 	// team instead of declaring ownership.
 	Serial bool `json:"serial,omitempty"`
@@ -80,6 +83,37 @@ type TeamQueueEntry struct {
 	// TeamShape is "plan-review" or "plan-only", derived from the launch a
 	// summary entry no longer carries.
 	TeamShape string `json:"teamShape,omitempty"`
+}
+
+// TeamQueueRebind records one move of a queued or running entry, and of a
+// running team's live bindings, to a later revision of the same item after an
+// amendment. AmendedBy saved the item's new revision; ApprovedBy asked for
+// the rebind. Nothing a rebind records is rewritten later.
+type TeamQueueRebind struct {
+	ID                string                   `json:"id"`
+	EntryID           string                   `json:"entryId"`
+	FromItemRevision  int64                    `json:"fromItemRevision"`
+	ToItemRevision    int64                    `json:"toItemRevision"`
+	FromScopeRevision int64                    `json:"fromScopeRevision,omitempty"`
+	ToScopeRevision   int64                    `json:"toScopeRevision"`
+	OrderMessageSeq   int64                    `json:"orderMessageSeq"`
+	SourceMessageSeq  int64                    `json:"sourceMessageSeq"`
+	AmendedBy         Sender                   `json:"amendedBy"`
+	ApprovedBy        Sender                   `json:"approvedBy"`
+	ApprovedRunID     string                   `json:"approvedRunId,omitempty"`
+	EntryState        string                   `json:"entryState"`
+	CreatedAt         string                   `json:"createdAt"`
+	Bindings          []TeamQueueRebindBinding `json:"bindings,omitempty"`
+}
+
+// TeamQueueRebindBinding is one live team binding a rebind moved. Its run and
+// context digest are the admission's and do not change.
+type TeamQueueRebindBinding struct {
+	AgentID          string `json:"agentId"`
+	RunID            string `json:"runId"`
+	FromItemRevision int64  `json:"fromItemRevision"`
+	ToItemRevision   int64  `json:"toItemRevision"`
+	ContextDigest    string `json:"contextDigest"`
 }
 
 // TeamQueueOwnerIntegration is kept distinct from TeamIntegrationReady, the
@@ -277,6 +311,13 @@ type TeamQueueRequest struct {
 	OwnerIntegrationCommit   string                     `json:"ownerIntegrationCommit,omitempty"`
 	OwnerIntegrationEvidence string                     `json:"ownerIntegrationEvidence,omitempty"`
 	ChangedFiles             []string                   `json:"changedFiles,omitempty"`
+	// ItemRevision is the item revision a rebind moves the entry to; it must
+	// be the item's current one. SourceMessageSeq is the amendment's message.
+	ItemRevision     int64 `json:"itemRevision,omitempty"`
+	SourceMessageSeq int64 `json:"sourceMessageSeq,omitempty"`
+	// Caller is the authenticated caller, set by the hub's HTTP layer and
+	// never read from the wire. A rebind records it as the approver.
+	Caller Caller `json:"-"`
 }
 
 type TeamIntegrationReady struct {

@@ -86,7 +86,8 @@ func (s *Server) getTeamQueueEntry(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, v)
 }
 func (s *Server) teamQueueAction(w http.ResponseWriter, r *http.Request) {
-	if _, ok := s.writer(w, r); !ok {
+	by, ok := s.writer(w, r)
+	if !ok {
 		return
 	}
 	task, ok := taskID(w, r)
@@ -97,6 +98,9 @@ func (s *Server) teamQueueAction(w http.ResponseWriter, r *http.Request) {
 	if !decodeLimited(w, r, &req, api.MaxTeamQueueActionBody) {
 		return
 	}
+	// The store records who approved a rebind; that is the authenticated
+	// caller, never a field of the request body.
+	req.Caller = by
 	v, err := s.store.TeamQueueAction(r.Context(), task, req)
 	if err != nil {
 		fail(w, err)

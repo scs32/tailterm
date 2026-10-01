@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -1578,5 +1579,396 @@ func TestTeamQueueMigrationDropsItemUniqueness(t *testing.T) {
 	}
 	if again := dumpTeamQueueRows(t, s, legacyTeamQueueColumns+`,attempt,retry_of`); fmt.Sprint(again) != fmt.Sprint(rows) {
 		t.Fatalf("second open changed rows\nbefore %v\nafter  %v", rows, again)
+	}
+}
+
+// rebindFixture is one item with a confirmed order and a repository-backed
+// queue entry: queued, or running with a lead, a worker and a closed member
+// admitted through the real binding path.
+type rebindFixture struct {
+	s                  *Store
+	ctx                context.Context
+	by                 api.Caller
+	task               api.Task
+	item               api.WorkItem
+	order              api.Message
+	handler            api.Agent
+	entry              api.TeamQueueEntry
+	lead, worker, gone api.Agent
+}
+
+const rebindRepository = "/fixture/repo/.git"
+
+func newRebindFixture(t *testing.T, running bool) *rebindFixture {
+	t.Helper()
+	s, task, items, orders := queueFixture(t)
+	f := &rebindFixture{s: s, ctx: context.Background(), by: api.Caller{Node: "fixture", User: "owner"}, task: task, item: items[0], order: orders[0]}
+	agents, err := s.ListAgents(f.ctx, task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, a := range agents {
+		if a.Role == api.AgentRoleDatabaseHandler {
+			f.handler = a
+		}
+	}
+	f.entry = f.action(t, api.TeamQueueRequest{Operation: "add", ItemID: f.item.ID, OrderMessageSeq: f.order.Seq, Host: "mini", Cwd: "/worktrees/rebind", Repository: rebindRepository, BaseCommit: strings.Repeat("a", 40), Ownership: []string{"hub/internal/store"}})
+	if !running {
+		return f
+	}
+	f.entry = f.action(t, api.TeamQueueRequest{Operation: "claim", EntryID: f.entry.ID, ExpectedRevision: f.entry.Revision, Host: "mini"})
+	f.lead, f.worker, f.gone = f.member(t, "lead"), f.member(t, "worker"), f.member(t, "gone")
+	if _, err := s.db.Exec(`UPDATE agents SET status='closed',cleanup_done=1 WHERE id=?`, f.gone.ID); err != nil {
+		t.Fatal(err)
+	}
+	plan, _ := json.Marshal(map[string]any{"task": task.ID, "item": f.item.ID, "revision": f.item.Revision, "order": f.order.Seq, "context": map[string]any{"version": 1}, "members": []any{map[string]any{"state": "unstarted", "runId": f.lead.RunID, "fields": map[string]any{"agentId": f.lead.ID, "name": f.lead.Name, "cwd": "/worktrees/rebind"}}}})
+	for _, step := range []api.TeamQueueRequest{{Operation: "freeze", LaunchJSON: plan}, {Operation: "attempt"}, {Operation: "started", MemberRunID: f.lead.RunID}, {Operation: "running"}} {
+		step.EntryID, step.ExpectedRevision = f.entry.ID, f.entry.Revision
+		f.entry = f.action(t, step)
+	}
+	return f
+}
+
+// action runs one queue operation that must succeed.
+func (f *rebindFixture) action(t *testing.T, req api.TeamQueueRequest) api.TeamQueueEntry {
+	t.Helper()
+	if req.RequestID == "" {
+		req.RequestID = api.NewID("req")
+	}
+	q, err := f.s.TeamQueueAction(f.ctx, f.task.ID, req)
+	if err != nil {
+		t.Fatalf("%s: %v", req.Operation, err)
+	}
+	return q
+}
+
+// member admits a live agent bound to the item at its current revision.
+func (f *rebindFixture) member(t *testing.T, name string) api.Agent {
+	t.Helper()
+	item, err := f.s.GetWorkItem(f.ctx, f.task.ID, f.item.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ref := api.MessageReference{TaskID: f.task.ID, Seq: f.order.Seq}
+	a, err := f.s.AddAgent(f.ctx, f.task.ID, api.AddAgentRequest{Name: name, AgentID: api.NewID("agt"), Host: "mini", Session: name,
+		WorkItem: &api.AgentWorkItemRequest{ItemTaskID: f.task.ID, ItemID: item.ID, ItemRevision: item.Revision, WorkOrderMessage: ref, ContextBundle: syntheticPreparedContext(t, item, ref, syntheticHistory(item, f.order))}}, f.by)
+	if err != nil {
+		t.Fatalf("admit %s: %v", name, err)
+	}
+	if _, err := f.s.db.Exec(`UPDATE agents SET status='running',last_seen_at=? WHERE id=?`, ts(f.s.now()), a.ID); err != nil {
+		t.Fatal(err)
+	}
+	return a
+}
+
+// amend saves a scope amendment and posts its message; the item moves on.
+func (f *rebindFixture) amend(t *testing.T, key string) (api.WorkItem, api.Message) {
+	t.Helper()
+	current, err := f.s.GetWorkItem(f.ctx, f.task.ID, f.item.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	description := "amended scope " + key
+	updated, err := f.s.UpdateWorkItem(f.ctx, f.task.ID, f.item.ID, api.UpdateWorkItemRequest{Revision: current.Revision, Description: &description}, api.Caller{Node: "fixture", User: "amender"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if updated.Revision == current.Revision {
+		t.Fatalf("amendment kept revision %d", updated.Revision)
+	}
+	source, err := f.s.PostMessage(f.ctx, f.task.ID, api.PostMessageRequest{Text: "scope amendment " + key, RequestID: "amend-" + key, WorkItems: []api.MessageWorkItem{{ItemTaskID: f.task.ID, ItemID: f.item.ID, ItemRevision: updated.Revision, Relationship: "primary"}}}, f.by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return updated, source
+}
+
+// confirm files the handler's scope confirmation of the entry's order at the
+// item's amended revision, which a rebind requires.
+func (f *rebindFixture) confirm(t *testing.T, item api.WorkItem) {
+	t.Helper()
+	if _, err := f.s.ConfirmWorkOrderScope(f.ctx, f.task.ID, item.ID, api.ConfirmWorkOrderScopeRequest{RequestID: api.NewID("req"), AgentID: f.handler.ID, RunID: f.handler.RunID, ExpectedRevision: item.Revision, ScopeRevision: item.ScopeRevision, OrderMessageSeq: f.order.Seq, Complete: true}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// rebind is the leased handler's rebind request to the given revision.
+func (f *rebindFixture) rebind(item api.WorkItem, source api.Message) api.TeamQueueRequest {
+	return api.TeamQueueRequest{RequestID: api.NewID("req"), Operation: "rebind", EntryID: f.entry.ID, ExpectedRevision: f.entry.Revision, ItemRevision: item.Revision, SourceMessageSeq: source.Seq,
+		HandlerAgentID: f.handler.ID, HandlerRunID: f.handler.RunID, Caller: api.Caller{Node: "handler-node", User: "approver"}}
+}
+
+// bindings reads the item's binding rows as text, by agent.
+func (f *rebindFixture) bindings(t *testing.T) map[string][]string {
+	t.Helper()
+	rows, err := f.s.db.Query(`SELECT agent_id,run_id,item_revision,context_digest,created_at,context_through_message_seq,hex(context_json) FROM agent_work_item_bindings WHERE item_task_id=? AND item_id=?`, f.task.ID, f.item.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	out := map[string][]string{}
+	for rows.Next() {
+		row := make([]string, 7)
+		if err := rows.Scan(&row[0], &row[1], &row[2], &row[3], &row[4], &row[5], &row[6]); err != nil {
+			t.Fatal(err)
+		}
+		out[row[0]] = row
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	return out
+}
+
+// a1: an amendment after queueing no longer strands a queued entry. The
+// rebind moves it to the new revision under the same identity, keeps who
+// amended and who approved, and the entry then claims.
+func TestTeamQueueRebindQueuedEntry(t *testing.T) {
+	f := newRebindFixture(t, false)
+	updated, source := f.amend(t, "one")
+	f.confirm(t, updated)
+	req := f.rebind(updated, source)
+	rebound, err := f.s.TeamQueueAction(f.ctx, f.task.ID, req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rebound.ID != f.entry.ID || rebound.ItemID != f.item.ID || rebound.State != "queued" || rebound.ItemRevision != updated.Revision || rebound.Revision != f.entry.Revision+1 || rebound.Position != f.entry.Position || rebound.OrderMessageSeq != f.order.Seq {
+		t.Fatalf("rebound entry %+v", rebound)
+	}
+	if replay, err := f.s.TeamQueueAction(f.ctx, f.task.ID, req); err != nil || replay.Revision != rebound.Revision || len(replay.Rebinds) != 1 {
+		t.Fatalf("rebind replay %+v %v", replay, err)
+	}
+	stored, err := f.s.GetTeamQueueEntry(f.ctx, f.task.ID, f.entry.ID)
+	if err != nil || stored.ItemRevision != updated.Revision || len(stored.Rebinds) != 1 {
+		t.Fatalf("stored entry %+v %v", stored, err)
+	}
+	history := stored.Rebinds[0]
+	want := api.TeamQueueRebind{ID: history.ID, EntryID: f.entry.ID, FromItemRevision: f.item.Revision, ToItemRevision: updated.Revision, FromScopeRevision: f.item.ScopeRevision, ToScopeRevision: updated.ScopeRevision,
+		OrderMessageSeq: f.order.Seq, SourceMessageSeq: source.Seq, AmendedBy: api.Sender{Node: "fixture", User: "amender"},
+		ApprovedBy: api.Sender{AgentID: f.handler.ID, Node: "handler-node", User: "approver"}, ApprovedRunID: f.handler.RunID, EntryState: "queued", CreatedAt: history.CreatedAt}
+	if !reflect.DeepEqual(history, want) || history.ID == "" || history.CreatedAt == "" || updated.ScopeRevision == f.item.ScopeRevision {
+		t.Fatalf("rebind history\n got %+v\nwant %+v", history, want)
+	}
+	if len(rebound.Rebinds) != 1 || !reflect.DeepEqual(rebound.Rebinds[0], history) {
+		t.Fatalf("rebind result history %+v", rebound.Rebinds)
+	}
+	byItem, err := f.s.TeamQueuePage(f.ctx, f.task.ID, api.TeamQueueListOptions{Item: f.item.ID})
+	if err != nil || len(byItem.Entries) != 1 || len(byItem.Entries[0].Rebinds) != 1 || byItem.Entries[0].BlockReason != "" {
+		t.Fatalf("item listing %+v %v", byItem, err)
+	}
+	claimed, err := f.s.TeamQueueAction(f.ctx, f.task.ID, api.TeamQueueRequest{RequestID: "claim-rebound", Operation: "claim", EntryID: rebound.ID, ExpectedRevision: rebound.Revision, Host: "mini"})
+	if err != nil || claimed.State != "launching" || claimed.ItemRevision != updated.Revision {
+		t.Fatalf("claim after rebind %+v %v", claimed, err)
+	}
+}
+
+// a2: a running team is no longer stranded. Its entry and live bindings move
+// together; each binding keeps its run, digest, stored context and creation
+// time; a closed member is left alone; the lead is told once.
+func TestTeamQueueRebindRunningEntryMovesBindings(t *testing.T) {
+	f := newRebindFixture(t, true)
+	before := f.bindings(t)
+	updated, source := f.amend(t, "one")
+	f.confirm(t, updated)
+	rebound, err := f.s.TeamQueueAction(f.ctx, f.task.ID, f.rebind(updated, source))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rebound.ID != f.entry.ID || rebound.State != "running" || rebound.ItemRevision != updated.Revision || string(rebound.LaunchJSON) != string(f.entry.LaunchJSON) || rebound.HandlerRunID != f.entry.HandlerRunID {
+		t.Fatalf("rebound entry %+v", rebound)
+	}
+	after := f.bindings(t)
+	if len(after) != 3 {
+		t.Fatalf("bindings %d", len(after))
+	}
+	old, moved := fmt.Sprint(f.item.Revision), fmt.Sprint(updated.Revision)
+	for _, a := range []api.Agent{f.lead, f.worker} {
+		was, now := before[a.ID], after[a.ID]
+		if was[2] != old || now[2] != moved {
+			t.Fatalf("%s binding revision %s -> %s", a.Name, was[2], now[2])
+		}
+		was[2] = now[2]
+		if !reflect.DeepEqual(was, now) || now[1] != a.RunID || now[3] != a.WorkItem.ContextDigest {
+			t.Fatalf("%s binding identity changed\nbefore %v\nafter  %v", a.Name, was, now)
+		}
+	}
+	if !reflect.DeepEqual(before[f.gone.ID], after[f.gone.ID]) || after[f.gone.ID][2] != old {
+		t.Fatalf("closed binding changed %v", after[f.gone.ID])
+	}
+	if len(rebound.Rebinds) != 1 || rebound.Rebinds[0].EntryState != "running" || len(rebound.Rebinds[0].Bindings) != 2 {
+		t.Fatalf("rebind history %+v", rebound.Rebinds)
+	}
+	seen := map[string]bool{}
+	for _, b := range rebound.Rebinds[0].Bindings {
+		if b.FromItemRevision != f.item.Revision || b.ToItemRevision != updated.Revision || b.RunID != after[b.AgentID][1] || b.ContextDigest != after[b.AgentID][3] {
+			t.Fatalf("binding history %+v", b)
+		}
+		seen[b.AgentID] = true
+	}
+	if !seen[f.lead.ID] || !seen[f.worker.ID] {
+		t.Fatalf("binding history names %v", seen)
+	}
+	var rows int
+	if err := f.s.db.QueryRow(`SELECT count(*) FROM team_queue_rebind_bindings`).Scan(&rows); err != nil || rows != 2 {
+		t.Fatalf("binding history rows %d %v", rows, err)
+	}
+	messages, err := f.s.ListMessages(f.ctx, f.task.ID, source.Seq, "", 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	notices := 0
+	for _, m := range messages {
+		if m.Envelope == nil || m.Envelope.Refs["entry"] != f.entry.ID {
+			continue
+		}
+		notices++
+		if m.Envelope.Kind != api.EnvelopeKindNotice || m.To != f.lead.ID || len(m.WorkItems) != 1 || m.WorkItems[0].ItemID != f.item.ID || m.WorkItems[0].ItemRevision != updated.Revision || m.Envelope.Refs["fromRevision"] != old || m.Envelope.Refs["toRevision"] != moved {
+			t.Fatalf("lead notice %+v", m)
+		}
+	}
+	if notices != 1 {
+		t.Fatalf("lead notices %d", notices)
+	}
+	// The lead's own context still reads at its admitted bundle.
+	context, err := f.s.GetAgentWorkItemContext(f.ctx, f.task.ID, f.lead.ID, f.lead.RunID)
+	if err != nil || context.Binding.ItemRevision != updated.Revision || context.Binding.ContextDigest != f.lead.WorkItem.ContextDigest {
+		t.Fatalf("lead context %+v %v", context.Binding, err)
+	}
+}
+
+// a5: every case a rebind does not support is refused naming the entry, and
+// neither the entry nor a binding changes.
+func TestTeamQueueRebindRefusals(t *testing.T) {
+	cases := []struct {
+		name    string
+		running bool
+		invalid bool
+		want    string
+		prepare func(t *testing.T, f *rebindFixture) api.TeamQueueRequest
+	}{
+		{name: "launching", want: "is launching", prepare: func(t *testing.T, f *rebindFixture) api.TeamQueueRequest {
+			f.entry = f.action(t, api.TeamQueueRequest{Operation: "claim", EntryID: f.entry.ID, ExpectedRevision: f.entry.Revision, Host: "mini"})
+			updated, source := f.amend(t, "x")
+			f.confirm(t, updated)
+			return f.rebind(updated, source)
+		}},
+		{name: "failed", want: "tt team queue requeue", prepare: func(t *testing.T, f *rebindFixture) api.TeamQueueRequest {
+			f.entry = f.action(t, api.TeamQueueRequest{Operation: "fail", EntryID: f.entry.ID, ExpectedRevision: f.entry.Revision, Failure: "fixture failure"})
+			updated, source := f.amend(t, "x")
+			f.confirm(t, updated)
+			return f.rebind(updated, source)
+		}},
+		{name: "finished", want: "is finished", prepare: func(t *testing.T, f *rebindFixture) api.TeamQueueRequest {
+			if _, err := f.s.db.Exec(`UPDATE team_queue_entries SET state='finished' WHERE id=?`, f.entry.ID); err != nil {
+				t.Fatal(err)
+			}
+			updated, source := f.amend(t, "x")
+			f.confirm(t, updated)
+			return f.rebind(updated, source)
+		}},
+		{name: "accepted running", running: true, want: "saved acceptance", prepare: func(t *testing.T, f *rebindFixture) api.TeamQueueRequest {
+			if _, err := f.s.db.Exec(`UPDATE team_queue_entries SET acceptance_json=? WHERE id=?`, `{"repository":"`+rebindRepository+`","itemRevision":1}`, f.entry.ID); err != nil {
+				t.Fatal(err)
+			}
+			updated, source := f.amend(t, "x")
+			f.confirm(t, updated)
+			return f.rebind(updated, source)
+		}},
+		{name: "terminal item", want: "terminal item", prepare: func(t *testing.T, f *rebindFixture) api.TeamQueueRequest {
+			updated, source := f.amend(t, "x")
+			status := "dismissed"
+			dismissed, err := f.s.UpdateWorkItem(f.ctx, f.task.ID, f.item.ID, api.UpdateWorkItemRequest{Revision: updated.Revision, Status: &status}, f.by)
+			if err != nil {
+				t.Fatal(err)
+			}
+			return f.rebind(dismissed, source)
+		}},
+		{name: "wrong item revision", want: "rebind to the current revision", prepare: func(t *testing.T, f *rebindFixture) api.TeamQueueRequest {
+			updated, source := f.amend(t, "x")
+			f.confirm(t, updated)
+			return f.rebind(f.item, source)
+		}},
+		{name: "not amended", want: "already bound", prepare: func(t *testing.T, f *rebindFixture) api.TeamQueueRequest {
+			return f.rebind(f.item, f.order)
+		}},
+		{name: "no scope confirmation", want: "confirm scope for revision", prepare: func(t *testing.T, f *rebindFixture) api.TeamQueueRequest {
+			updated, source := f.amend(t, "x")
+			return f.rebind(updated, source)
+		}},
+		{name: "unlinked source", want: "is not linked to its item", prepare: func(t *testing.T, f *rebindFixture) api.TeamQueueRequest {
+			updated, _ := f.amend(t, "x")
+			f.confirm(t, updated)
+			other, err := f.s.PostMessage(f.ctx, f.task.ID, api.PostMessageRequest{Text: "unrelated board message", RequestID: "unrelated"}, f.by)
+			if err != nil {
+				t.Fatal(err)
+			}
+			return f.rebind(updated, other)
+		}},
+		{name: "lead as caller", running: true, want: "only the owner or a database handler", prepare: func(t *testing.T, f *rebindFixture) api.TeamQueueRequest {
+			updated, source := f.amend(t, "x")
+			f.confirm(t, updated)
+			req := f.rebind(updated, source)
+			req.HandlerAgentID, req.HandlerRunID, req.LeadAgentID, req.LeadRunID = "", "", f.lead.ID, f.lead.RunID
+			return req
+		}},
+		{name: "non-leased handler on a running entry", running: true, want: "leased handler", prepare: func(t *testing.T, f *rebindFixture) api.TeamQueueRequest {
+			other, err := f.s.AddAgent(f.ctx, f.task.ID, api.AddAgentRequest{Name: "database-two", Role: api.AgentRoleDatabaseHandler, AgentID: api.NewID("agt"), Host: "mini", Session: "database-two"}, f.by)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := f.s.db.Exec(`UPDATE agents SET status='running',last_seen_at=? WHERE id=?`, ts(f.s.now()), other.ID); err != nil {
+				t.Fatal(err)
+			}
+			updated, source := f.amend(t, "x")
+			f.confirm(t, updated)
+			req := f.rebind(updated, source)
+			req.HandlerAgentID, req.HandlerRunID = other.ID, other.RunID
+			return req
+		}},
+		{name: "stale handler run", want: "only the owner or a database handler", prepare: func(t *testing.T, f *rebindFixture) api.TeamQueueRequest {
+			updated, source := f.amend(t, "x")
+			f.confirm(t, updated)
+			req := f.rebind(updated, source)
+			req.HandlerRunID = api.NewID("run")
+			return req
+		}},
+		{name: "no source", invalid: true, want: "--source", prepare: func(t *testing.T, f *rebindFixture) api.TeamQueueRequest {
+			updated, source := f.amend(t, "x")
+			f.confirm(t, updated)
+			req := f.rebind(updated, source)
+			req.SourceMessageSeq = 0
+			return req
+		}},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			f := newRebindFixture(t, c.running)
+			req := c.prepare(t, f)
+			req.ExpectedRevision = f.entry.Revision
+			entry, err := f.s.GetTeamQueueEntry(f.ctx, f.task.ID, f.entry.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			req.ExpectedRevision = entry.Revision
+			bindings := f.bindings(t)
+			_, err = f.s.TeamQueueAction(f.ctx, f.task.ID, req)
+			sentinel := api.ErrConflict
+			if c.invalid {
+				sentinel = api.ErrInvalid
+			}
+			if !errors.Is(err, sentinel) || !strings.Contains(err.Error(), f.entry.ID) || !strings.Contains(err.Error(), c.want) {
+				t.Fatalf("refusal = %v, want %v naming %s with %q", err, sentinel, f.entry.ID, c.want)
+			}
+			if same, err := f.s.GetTeamQueueEntry(f.ctx, f.task.ID, f.entry.ID); err != nil || !reflect.DeepEqual(same, entry) {
+				t.Fatalf("refused rebind changed the entry\nbefore %+v\nafter  %+v %v", entry, same, err)
+			}
+			if after := f.bindings(t); !reflect.DeepEqual(after, bindings) {
+				t.Fatalf("refused rebind changed bindings\nbefore %v\nafter  %v", bindings, after)
+			}
+			var history int
+			if err := f.s.db.QueryRow(`SELECT (SELECT count(*) FROM team_queue_rebinds)+(SELECT count(*) FROM team_queue_rebind_bindings)`).Scan(&history); err != nil || history != 0 {
+				t.Fatalf("refused rebind left history rows: %d %v", history, err)
+			}
+		})
 	}
 }
