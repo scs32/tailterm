@@ -954,24 +954,11 @@ func (s *Server) listMessages(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid agent id")
 		return
 	}
-	page := api.MessagePageQuery{After: queryInt(r, "after", 0), To: to, Limit: int(queryInt(r, "limit", 50))}
-	if v := r.URL.Query().Get("before"); v != "" {
-		before, err := strconv.ParseInt(v, 10, 64)
-		if err != nil || before < 0 {
-			writeError(w, http.StatusBadRequest, "invalid before")
-			return
-		}
-		page.Before = before
+	after := queryInt(r, "after", 0)
+	if r.URL.Query().Get("latest") == "1" {
+		after = -1
 	}
-	page.Newest = r.URL.Query().Get("latest") == "1"
-	if r.URL.Query().Get("directed") == "1" {
-		if to == "" {
-			writeError(w, http.StatusBadRequest, "directed requires to")
-			return
-		}
-		page.DirectedOnly = true
-	}
-	msgs, err := s.store.ListMessagesPage(r.Context(), id, page)
+	msgs, err := s.store.ListMessages(r.Context(), id, after, to, int(queryInt(r, "limit", 50)))
 	if err != nil {
 		fail(w, err)
 		return

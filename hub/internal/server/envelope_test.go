@@ -250,9 +250,7 @@ func TestTypedMessageReachesBoundRecipient(t *testing.T) {
 	for _, m := range inbox {
 		seen[m.Seq] = true
 	}
-	// A message addressed to a bound agent reaches it whether or not it links
-	// the item (wi_a31c079e98518efc, #11759).
-	if !seen[linked.Seq] || !seen[unlinked.Seq] {
-		t.Fatalf("bound inbox: linked %v (want true), unlinked %v (want true)", seen[linked.Seq], seen[unlinked.Seq])
+	if !seen[linked.Seq] || seen[unlinked.Seq] {
+		t.Fatalf("bound inbox: linked %v (want true), unlinked %v (want false)", seen[linked.Seq], seen[unlinked.Seq])
 	}
 }

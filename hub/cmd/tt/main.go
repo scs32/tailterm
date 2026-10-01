@@ -58,7 +58,7 @@ Commands
   withdraw SEQ --reason T | --obligation ID --reason T  withdraw your own open request
   ack SEQ | progress SEQ [--text T]  acknowledge or record progress on an obligation
   reassign OBLIGATION_ID --to AGENT [--reason T]  move an open obligation (lead or owner)
-  inbox [--unread [--mark-read] [--wait 9m]] [--before N|--after N] [--seq N] [--limit N] [--json]
+  inbox [--unread] [--mark-read] [--wait 9m] [--json]
   context [--json]             print this exact run's bound work-item context
   owner extend|answer|cancel OBLIGATION_ID ...  the owner's controls over an obligation
   owner intervene --task ID --kind K --item ID [--product-item ID] --text T  record an owner intervention
@@ -578,40 +578,18 @@ func isTerminal(f *os.File) bool {
 }
 
 func cmdInbox(e env, args []string) error {
-	fs := flag.NewFlagSet("inbox", flag.ContinueOnError)
+	fs := flag.NewFlagSet("inbox", flag.ExitOnError)
 	unread := fs.Bool("unread", false, "only messages after this agent's read cursor")
-	mark := fs.Bool("mark-read", false, "with --unread, advance the read cursor past the fetched page")
+	mark := fs.Bool("mark-read", false, "advance the read cursor past the shown messages")
 	asJSON := fs.Bool("json", false, "JSON output")
-	limit := fs.Int("limit", 50, "maximum messages per page (at most 200)")
+	limit := fs.Int("limit", 50, "maximum messages")
 	wait := fs.Duration("wait", 0, "with --unread, block up to this long (max 9m) until an unread message arrives")
-	seq := fs.Int64("seq", 0, "print message N in full")
-	before := fs.Int64("before", 0, "only messages older than N")
-	after := fs.Int64("after", 0, "only messages newer than N, oldest first")
-	if err := fs.Parse(args); err != nil {
-		if errors.Is(err, flag.ErrHelp) {
-			return nil
-		}
-		return &exitError{2, err}
-	}
-	switch {
-	case *seq < 0 || *before < 0 || *after < 0 || *limit < 1:
-		return &exitError{2, errors.New("--seq, --before and --after must not be negative, and --limit must be positive")}
-	case *seq > 0 && (*unread || *mark || *wait > 0 || *before > 0 || *after > 0):
-		return &exitError{2, errors.New("--seq prints one message; it takes only --json")}
-	case *unread && (*before > 0 || *after > 0):
-		return &exitError{2, errors.New("--unread pages from the read cursor; use --before/--after without --unread")}
-	case *mark && !*unread:
-		return &exitError{2, errors.New("--mark-read requires --unread")}
-	}
+	_ = fs.Parse(args)
 	if *wait > 0 && (!*unread || e.agent == "") {
 		return errors.New("--wait requires --unread and an agent identity")
 	}
 	if *wait > maxInboxWait {
 		*wait = maxInboxWait
-	}
-	if *limit > api.MaxLimit {
-		fmt.Fprintf(os.Stderr, "tt: --limit capped at %d per page; page with --before/--after\n", api.MaxLimit)
-		*limit = api.MaxLimit
 	}
 	task, err := e.requireTask()
 	if err != nil {
@@ -620,9 +598,6 @@ func cmdInbox(e env, args []string) error {
 	c, err := e.client(10 * time.Second)
 	if err != nil {
 		return err
-	}
-	if *seq > 0 {
-		return printInboxMessage(c, task, *seq, *asJSON)
 	}
 	if *wait > 0 {
 		// Park cheaply: runtimes without relay wake-up (Claude) run this as one
@@ -646,125 +621,45 @@ func cmdInbox(e env, args []string) error {
 		return err
 	}
 	names := map[string]string{}
+	var after int64
 	for _, a := range agents {
 		names[a.ID] = a.Name
 	}
-	if !*unread {
-		// Without --unread the newest page is shown, so recent messages are
-		// always reachable; --before/--after page from there.
-		page := api.MessagePageQuery{After: *after, Before: *before, To: e.agent, Newest: *after == 0 || *before > 0, Limit: *limit}
-		msgs, err := c.ListMessagesPage(ctx, task, page)
+	if *unread && e.agent != "" {
+		after, err = readCursor(ctx, c, task, e.agent)
 		if err != nil {
 			return err
 		}
-		if *asJSON {
-			printJSON(msgs)
-			return nil
-		}
-		for _, m := range msgs {
-			fmt.Println(formatMessage(m, names))
-		}
-		switch {
-		case len(msgs) == 0:
-			fmt.Println("(no messages)")
-		case len(msgs) < *limit:
-		case page.Newest:
-			fmt.Printf("(older: tt inbox --before %d)\n", msgs[0].Seq)
-		default:
-			fmt.Printf("(newer: tt inbox --after %d)\n", msgs[len(msgs)-1].Seq)
-		}
-		return nil
 	}
-	var cursor int64
-	if e.agent != "" {
-		if cursor, err = readCursor(ctx, c, task, e.agent); err != nil {
-			return err
-		}
-	}
-	fetched, err := c.ListMessagesPage(ctx, task, api.MessagePageQuery{After: cursor, To: e.agent, Limit: *limit})
+	msgs, err := c.ListMessages(ctx, task, after, e.agent, *limit)
 	if err != nil {
 		return err
 	}
-	var last int64
-	if len(fetched) > 0 {
-		last = fetched[len(fetched)-1].Seq
-	}
-	full := len(fetched) == *limit
-	msgs := notFrom(fetched, e.agent)
-	// A full page may stop short of newer messages addressed to this agent;
-	// show them too, so a backlog never hides a directed message. The read
-	// cursor still only covers the page, so they reappear on a later page.
-	var extras []api.Message
-	if full && e.agent != "" {
-		newer, err := c.ListMessagesPage(ctx, task, api.MessagePageQuery{After: last, To: e.agent, DirectedOnly: true, Newest: true, Limit: api.MaxLimit})
-		if err != nil {
-			return err
+	if *unread {
+		filtered := msgs[:0]
+		for _, m := range msgs {
+			if m.From.AgentID != e.agent {
+				filtered = append(filtered, m)
+			}
 		}
-		extras = notFrom(newer, e.agent)
+		msgs = filtered
+	}
+	for _, m := range msgs {
+		recordUsageContext(e, task, "inbox", m.Seq)
 	}
 	if *asJSON {
-		printJSON(append(msgs, extras...))
+		printJSON(msgs)
 	} else {
 		for _, m := range msgs {
 			fmt.Println(formatMessage(m, names))
 		}
-		if len(extras) > 0 {
-			fmt.Printf("-- %d newer message(s) addressed to you beyond this page --\n", len(extras))
-			for _, m := range extras {
-				fmt.Println(formatMessage(m, names))
-			}
-		}
-		switch {
-		case len(msgs) == 0 && len(extras) == 0 && !full:
+		if len(msgs) == 0 {
 			fmt.Println("(no messages)")
-		case full && *mark:
-			fmt.Printf("More unread after #%d: run tt inbox --unread --mark-read again.\n", last)
-		case full:
-			fmt.Printf("More unread after #%d: run tt inbox --unread --mark-read to advance, or tt inbox --after %d.\n", last, last)
 		}
 	}
-	if *mark && e.agent != "" && last > 0 {
-		// Mark the whole fetched page, including this agent's own messages,
-		// so a page of self-sent messages still advances the cursor.
-		return c.MarkRead(ctx, task, api.MarkReadRequest{AgentID: e.agent, UpTo: last})
+	if *mark && e.agent != "" && len(msgs) > 0 {
+		return c.MarkRead(ctx, task, api.MarkReadRequest{AgentID: e.agent, UpTo: msgs[len(msgs)-1].Seq})
 	}
-	return nil
-}
-
-// notFrom drops the messages agent sent itself.
-func notFrom(msgs []api.Message, agent string) []api.Message {
-	out := []api.Message{}
-	for _, m := range msgs {
-		if agent == "" || m.From.AgentID != agent {
-			out = append(out, m)
-		}
-	}
-	return out
-}
-
-// printInboxMessage prints one message of the task in full, whoever sent or
-// received it: obligations and wake prompts show only a short subject.
-func printInboxMessage(c *api.Client, task string, seq int64, asJSON bool) error {
-	ctx, cancel := ctxTimeout(10 * time.Second)
-	defer cancel()
-	msgs, err := c.ListMessagesPage(ctx, task, api.MessagePageQuery{After: seq - 1, Limit: 1})
-	if err != nil {
-		return err
-	}
-	if len(msgs) == 0 || msgs[0].Seq != seq {
-		return fmt.Errorf("no message #%d in this task", seq)
-	}
-	if asJSON {
-		printJSON(msgs[0])
-		return nil
-	}
-	names := map[string]string{}
-	if agents, err := c.ListAgents(ctx, task); err == nil {
-		for _, a := range agents {
-			names[a.ID] = a.Name
-		}
-	}
-	fmt.Println(formatMessage(msgs[0], names))
 	return nil
 }
 

@@ -1048,29 +1048,3 @@ func TestRelaySkipNotRecordedForBrokerDeferral(t *testing.T) {
 		t.Fatalf("unsafe broker wake skip: %+v log=%q", p.Skip, out)
 	}
 }
-
-// wi_a31c079e98518efc (i1): an unlinked free-text message addressed to a
-// work-item-bound agent counts as unread and wakes it through the relay, on a
-// real test hub.
-func TestRelayWakesBoundAgentForUnlinkedDirected(t *testing.T) {
-	h := newInboxHub(t)
-	ctx := context.Background()
-	be, bound, _, _ := h.bind(t, "worker-bound")
-	if _, err := h.st.PostEvent(ctx, h.task.ID, api.PostEventRequest{Kind: api.EventHeartbeat, AgentID: bound.ID, RunID: bound.RunID}, h.by); err != nil {
-		t.Fatal(err)
-	}
-	directed := h.post(t, api.PostMessageRequest{Text: "unlinked lead note", AgentID: h.lead.ID, To: bound.ID}, 1)[0]
-	b := runtimeBinding{Hub: be.hub, Task: be.task, Agent: bound.ID, Run: bound.RunID, Thread: "00000000-0000-4000-8000-000000000001", Codex: "/usr/local/bin/codex"}
-	p := relayProgress{Run: b.Run, Thread: b.Thread}
-	var prompts []string
-	queue := func(_ context.Context, got runtimeBinding, prompt string) error {
-		prompts = append(prompts, prompt)
-		return nil
-	}
-	if err := relayOne(ctx, b, &p, h.c, time.Now(), queue); err != nil {
-		t.Fatal(err)
-	}
-	if len(prompts) != 1 || p.Through != directed.Seq || !strings.Contains(prompts[0], fmt.Sprintf("through message #%d", directed.Seq)) {
-		t.Fatalf("relay did not wake the bound agent for #%d: prompts=%q progress=%+v", directed.Seq, prompts, p)
-	}
-}
