@@ -326,6 +326,12 @@ func queueConcurrencyLimit(ctx context.Context, q queryRower, task string) (int,
 // item-scoped leads instead of the project lead slot.
 func queueParallel(limit int) bool { return limit != 1 }
 
+// queueLimitLowers reports whether next admits fewer teams than previous.
+// Zero has no cap, so none to N lowers and N to none raises.
+func queueLimitLowers(previous, next int) bool {
+	return next > 0 && (previous == 0 || next < previous)
+}
+
 // queueSlotsFull reports whether a positive limit is reached. Zero has no cap.
 func queueSlotsFull(limit, active int) bool { return limit > 0 && active >= limit }
 
@@ -1240,8 +1246,15 @@ func (s *Store) TeamQueueAction(ctx context.Context, task string, req api.TeamQu
 			if req.Host == "" {
 				return zero, api.ErrInvalid
 			}
-			if err := checkTeamHostAdmission(ctx, tx, req.Host, s.now()); err != nil {
+			// A decrease never adds load, so it skips the host admission gates.
+			previous, err := queueConcurrencyLimit(ctx, tx, task)
+			if err != nil {
 				return zero, err
+			}
+			if !queueLimitLowers(previous, req.ConcurrencyLimit) {
+				if err := checkTeamHostAdmission(ctx, tx, req.Host, s.now()); err != nil {
+					return zero, err
+				}
 			}
 			var unverified int
 			if err := tx.QueryRowContext(ctx, `SELECT count(*) FROM team_queue_entries WHERE task_id=? AND (state='queued' OR `+queueHoldsSQL+`) AND (repository='' OR base_commit='')`, task).Scan(&unverified); err != nil {

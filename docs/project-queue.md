@@ -785,6 +785,31 @@ whose earlier members are live while a later member's write keeps failing
 backs off but is not a stall, and the claim step and the close path keep their
 own handling.
 
+## Team queue limit changes
+
+`tt team queue limit` runs the host admission gates only when the change can
+add load (`wi_4a11a0c0e2a23c08`). The gates are the host's session, polling,
+relay binding and request budgets, a fresh complete census, and the free-disk
+reserve.
+
+| Change | Example | Host admission gates |
+|---|---|---|
+| Decrease | 4 to 3, `none` to 3 | skipped |
+| Unchanged | 3 to 3, `none` to `none` | run |
+| Raise | 3 to 4, 3 to `none` | run |
+| To 1 (serial) | any to 1 | never ran |
+
+`none` has no cap, so `none` to N is a decrease and N to `none` is a raise. A
+decrease never adds load, so it is saved even when the host is over budget,
+below the disk reserve, or has an expired policy or a stale census. The next
+claim is still gated. A change to 1 (serial) was never gated: the gates apply
+to parallel limits only.
+
+Every other refusal still applies to a decrease. It is refused with `active
+safety reservations exceed requested limit` while more entries than N are
+active, and a parallel limit still needs a frozen repository and base for every
+outstanding entry.
+
 ## Small-change lane
 
 Feature `wi_f8d48780626165cc` (order #16786) adds a queue-only team template,

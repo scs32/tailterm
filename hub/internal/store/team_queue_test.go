@@ -2636,3 +2636,65 @@ func TestTeamQueueUnattemptOnlyWithoutRegistration(t *testing.T) {
 		t.Fatalf("registered member after refusal %+v %v", saved, err)
 	}
 }
+
+// A set_limit that lowers the queue limit never adds load, so it skips the
+// host admission gates (wi_4a11a0c0e2a23c08). An unchanged or raised limit,
+// including N to none, stays gated.
+func TestQueueLimitDecreaseSkipsHostAdmissionGates(t *testing.T) {
+	limit := func(s *Store, task string, n int) error {
+		_, err := s.TeamQueueAction(context.Background(), task, api.TeamQueueRequest{RequestID: api.NewID("tqr"), Operation: "set_limit", Host: "mini", ConcurrencyLimit: n})
+		return err
+	}
+	listed := func(t *testing.T, s *Store, task string) int {
+		t.Helper()
+		list, err := s.ListTeamQueue(context.Background(), task)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return list.ConcurrencyLimit
+	}
+	// gated runs an unchanged limit, a larger N and none; each must be
+	// refused with the gate's own message and leave the saved limit alone.
+	gated := func(t *testing.T, s *Store, task string, saved int, refusal string) {
+		t.Helper()
+		for _, next := range []int{saved, saved + 1, 0} {
+			if err := limit(s, task, next); err == nil || !strings.Contains(err.Error(), refusal) {
+				t.Fatalf("limit %d to %d: %v", saved, next, err)
+			}
+			if got := listed(t, s, task); got != saved {
+				t.Fatalf("refused limit %d to %d saved %d", saved, next, got)
+			}
+		}
+	}
+
+	t.Run("disk reserve", func(t *testing.T) {
+		s, task, _, _, _ := uncappedFixture(t, 2, 2)
+		setQueueLimit(t, s, task.ID, 0)
+		observeFixtureHost(t, s, task.ID, 0, freeDiskMiB(4000))
+		for _, next := range []int{3, 2} {
+			if err := limit(s, task.ID, next); err != nil {
+				t.Fatalf("lower to %d below the disk reserve: %v", next, err)
+			}
+			if got := listed(t, s, task.ID); got != next {
+				t.Fatalf("lowered to %d, listed %d", next, got)
+			}
+		}
+		gated(t, s, task.ID, 2, "host free disk 4000 MiB is below the 8192 MiB reserve")
+	})
+
+	t.Run("host budget", func(t *testing.T) {
+		s, task, _, _, _ := uncappedFixture(t, 2, 2)
+		setQueueLimit(t, s, task.ID, 4)
+		if _, err := s.TeamQueueAction(context.Background(), task.ID, api.TeamQueueRequest{RequestID: api.NewID("tqr"), Operation: "set_host_policy", Host: "mini", HostPolicyVersion: 2, HostPolicyExpires: s.now().Add(time.Hour).Format(time.RFC3339), HostMaxSessions: 1, HostMaxPolling: 10, LimiterDomain: "https://fixture.invalid", HostMaxRelayBindings: 100, HostMaxRequestsPerMinute: 100000, HostMaxBurst: 10000, HostHeadroomPercent: 20}); err != nil {
+			t.Fatal(err)
+		}
+		syntheticHostUsage(t, s, task.ID, "mini")
+		if err := limit(s, task.ID, 3); err != nil {
+			t.Fatalf("lower to 3 with the session budget exhausted: %v", err)
+		}
+		if got := listed(t, s, task.ID); got != 3 {
+			t.Fatalf("lowered to 3, listed %d", got)
+		}
+		gated(t, s, task.ID, 3, "host session or polling budget exhausted")
+	})
+}

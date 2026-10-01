@@ -214,9 +214,6 @@ func TestQueueDiskReserveGatesAdmissionOnly(t *testing.T) {
 	if got := listedEntry(t, s, task.ID, a.ID); !strings.Contains(got.BlockReason, defaultBelow) {
 		t.Fatalf("list reason %q", got.BlockReason)
 	}
-	if _, err := s.TeamQueueAction(ctx, task.ID, api.TeamQueueRequest{RequestID: "raise-low-disk", Operation: "set_limit", Host: "mini", ConcurrencyLimit: 3}); err == nil || !strings.Contains(err.Error(), defaultBelow) {
-		t.Fatalf("limit change below reserve: %v", err)
-	}
 
 	observeFixtureHost(t, s, task.ID, 5000, freeDiskMiB(4000))
 	const policyBelow = "host free disk 4000 MiB is below the 5000 MiB reserve"
