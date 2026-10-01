@@ -971,7 +971,7 @@ func cmdSpawn(e env, args []string) error {
 	fs := flag.NewFlagSet("spawn", flag.ExitOnError)
 	name := fs.String("name", "", "agent name (required)")
 	agentID := fs.String("agent-id", "", "stable preallocated agent identity for launch/retry")
-	expectedRunID := fs.String("expected-run-id", "", "exact preallocated resume, database handler, or reserved team queue run")
+	expectedRunID := fs.String("expected-run-id", "", "exact preallocated resume, database handler, or reserved team queue run; inside an agent session, the run a handler-authored allocation intent recorded for this exact launcher, --agent-id, context and --team-role")
 	expectedLifecycleGeneration := fs.Int64("expected-lifecycle-generation", 0, "exact project lifecycle generation required for admission")
 	resumeReceiptID := fs.String("resume-receipt-id", "", "durable project Resume receipt authorizing the exact fresh orchestrator")
 	workItemTask := fs.String("work-item-task", "", "project owning the bound bug or feature (default: --task)")
@@ -1026,9 +1026,14 @@ func cmdSpawn(e env, args []string) error {
 	if *agentID != "" && !api.ValidID(*agentID, "agt") {
 		return errors.New("invalid --agent-id")
 	}
-	if *role == "" && *expectedRunID != "" && *resumeReceiptID == "" && (*workItemID == "" || *agentID == "" || e.agent != "") {
+	if *role == "" && *expectedRunID != "" && *resumeReceiptID == "" && (*workItemID == "" || *agentID == "") {
 		return errors.New("--expected-run-id requires a reserved owner-side item team launch with --agent-id")
 	}
+	// Inside an agent session the exact run is permitted only for a fresh
+	// item-bound launch whose handler-authored allocation intent names this
+	// launcher, agent, run, context and team role (wi_f6c8f47f98ce427a). The
+	// intent itself is checked below, before any hub write or tmux call.
+	agentExactRun := *role == "" && *expectedRunID != "" && *resumeReceiptID == "" && e.agent != ""
 	if *expectedLifecycleGeneration < 0 {
 		return errors.New("--expected-lifecycle-generation must be non-negative")
 	}
@@ -1084,6 +1089,10 @@ func cmdSpawn(e env, args []string) error {
 	}
 	if itemFlagCount > 0 && *workItemTask != *task && queueFlagCount == 0 {
 		return errors.New("cross-project item admission requires an exact current Queue claim")
+	}
+	if agentExactRun && (e.runID == "" || !runIDPattern.MatchString(*expectedRunID) || *replacesAgent != "" || queueFlagCount > 0 ||
+		(*teamRole != api.TeamRoleMember && *teamRole != api.TeamRoleExtra)) {
+		return errors.New("--expected-run-id in an agent session requires a fresh item-bound launch with --agent-id, --team-role and this session's run identity")
 	}
 	if *task == "" || *hub == "" {
 		return errors.New("task and hub are required (TAILTERM_TASK/TAILTERM_HUB or --task/--hub)")
@@ -1219,6 +1228,65 @@ func cmdSpawn(e env, args []string) error {
 			return fmt.Errorf("hub does not support a compatible allocation-intent version (required for a fresh parented item-bound launch); upgrade the hub before this CLI can launch parented item-bound work here: %v", capErr)
 		}
 	}
+	var exactRunContext []byte
+	if agentExactRun {
+		// The hub takes a parented admission's run from the recorded intent
+		// and refuses the field on the request, so it cannot tie the caller's
+		// --expected-run-id to that intent. This readback does: every bound
+		// field must match exactly before anything is written or launched.
+		// The hub still matches and consumes the intent atomically at
+		// admission, and the admitted run is compared again afterwards.
+		raw, readErr := readPreparedWorkContext(*workContextJSON, *workContextFile)
+		if readErr != nil {
+			return readErr
+		}
+		if exactRunContext, err = compactPreparedWorkContext(raw); err != nil {
+			return fmt.Errorf("prepared work-item context is not valid JSON: %w", err)
+		}
+		digest := sha256.Sum256(exactRunContext)
+		intent, intentErr := c.GetAllocationIntent(ctx, *task, *agentID)
+		if intentErr != nil {
+			return fmt.Errorf("--expected-run-id in an agent session requires a recorded allocation intent for %s: %w", *agentID, intentErr)
+		}
+		refuse := func(field string) error {
+			return fmt.Errorf("allocation intent for %s does not authorize this launch: %s does not match", *agentID, field)
+		}
+		handlerAuthored := false
+		for _, a := range detail.Agents {
+			if a.ID == intent.AuthorAgentID && a.Role == api.AgentRoleDatabaseHandler {
+				handlerAuthored = true
+				break
+			}
+		}
+		switch {
+		case intent.ConsumedAt != nil:
+			return fmt.Errorf("allocation intent for %s was already consumed by run %s; this launch is not repeated", *agentID, intent.ConsumedByRunID)
+		case intent.InvalidatedAt != nil:
+			return fmt.Errorf("allocation intent for %s was invalidated and cannot authorize this launch", *agentID)
+		case intent.AgentID != *agentID:
+			return refuse("agent identity")
+		case intent.TargetTaskID != *task:
+			return refuse("target task")
+		case intent.ItemTaskID != *workItemTask || intent.ItemID != *workItemID:
+			return refuse("work item")
+		case intent.ItemRevision != *workItemRevision:
+			return refuse("work-item revision")
+		case intent.WorkOrderMessage.TaskID != *workOrderTask || intent.WorkOrderMessage.Seq != *workOrderMessage:
+			return refuse("work-order message")
+		case intent.TeamRole != *teamRole:
+			return refuse("team role")
+		case intent.ContextDigest != hex.EncodeToString(digest[:]):
+			return refuse("prepared context digest")
+		case intent.ExpectedRunID != *expectedRunID:
+			return refuse("expected run")
+		case intent.ExpectedLauncherAgentID != e.agent:
+			return refuse("launcher agent")
+		case intent.ExpectedLauncherRunID != e.runID:
+			return refuse("launcher run")
+		case !handlerAuthored:
+			return fmt.Errorf("allocation intent for %s was not authored by this project's database handler and cannot authorize --expected-run-id in an agent session", *agentID)
+		}
+	}
 	launcherSelfPath := selfPath()
 	if *teamLeadName != "" && *workItemID != "" {
 		detail.Task.Orchestrator = *teamLeadName
@@ -1265,8 +1333,14 @@ func cmdSpawn(e env, args []string) error {
 	if api.PersistentAgentRole(*role) {
 		parent = ""
 	}
+	requestRunID := *expectedRunID
+	if agentExactRun {
+		// The hub refuses this field on a parented admission and assigns the
+		// intent's recorded run instead.
+		requestRunID = ""
+	}
 	req := api.AddAgentRequest{
-		ExpectedRunID: *expectedRunID, ExpectedLifecycleGeneration: *expectedLifecycleGeneration,
+		ExpectedRunID: requestRunID, ExpectedLifecycleGeneration: *expectedLifecycleGeneration,
 		ResumeReceiptID: *resumeReceiptID, Role: *role, AgentID: *agentID,
 		Name: *name, Host: spawn.Host(), Session: session,
 		Runtime: *runtime, Cwd: *cwd, ParentAgentID: parent,
@@ -1279,9 +1353,12 @@ func cmdSpawn(e env, args []string) error {
 		req.TemplateDigest = stewardTemplateDigest(*model, *reasoning, *prompt)
 	}
 	if itemFlagCount > 0 {
-		contextData, readErr := readPreparedWorkContext(*workContextJSON, *workContextFile)
-		if readErr != nil {
-			return readErr
+		contextData := exactRunContext
+		if !agentExactRun {
+			var readErr error
+			if contextData, readErr = readPreparedWorkContext(*workContextJSON, *workContextFile); readErr != nil {
+				return readErr
+			}
 		}
 		req.WorkItem = &api.AgentWorkItemRequest{
 			ItemTaskID: *workItemTask, ItemID: *workItemID, ItemRevision: *workItemRevision,
@@ -1320,6 +1397,10 @@ func cmdSpawn(e env, args []string) error {
 		agent, err = c.AddAgent(ctx, *task, req)
 		if err != nil {
 			return fmt.Errorf("register agent: %w", err)
+		}
+		if agentExactRun && (agent.ID != *agentID || agent.RunID != *expectedRunID) {
+			_, _ = c.CloseAgent(ctx, *task, agent.ID, agent.RunID)
+			return fmt.Errorf("hub admitted %s with an agent or run other than the expected %s/%s; the agent was closed and nothing was launched", agent.ID, *agentID, *expectedRunID)
 		}
 		if agent.WorkItem != nil {
 			workContext, contextErr := c.GetAgentWorkItemContext(ctx, *task, agent.ID, agent.RunID)
