@@ -38,6 +38,9 @@ type ReleaseJob struct {
 	// Published survives a later block: tasks-hub already carries the release.
 	Published    bool                 `json:"published,omitempty"`
 	Supersession *ReleaseSupersession `json:"supersession,omitempty"`
+	// RetryOf links a job the handler created by retry to the refused or
+	// rolled-back job of the same entry it follows; that job is never rewritten.
+	RetryOf *ReleaseRetry `json:"retryOf,omitempty"`
 	// SettledAt orders released and superseded jobs for target baselines:
 	// the hub time of the final receipt, or the hand release's record time.
 	SettledAt string `json:"settledAt,omitempty"`
@@ -75,10 +78,12 @@ type ReleaseCheckCoverage struct {
 	Relation         string `json:"relation"`
 }
 
-// ReleaseSupersession closes a verified, never-claimed job (or a refused one
-// without a receipt) whose change the owner session already released by hand,
-// so the deployer never replays it. It cites the recorded hand release; the
-// hub copies that record's release name and targets.
+// ReleaseSupersession closes a job whose change the owner session already
+// released by hand, so the deployer never replays it: a verified job no
+// deployer holds (never claimed, or only set aside), or a refused or
+// rolled-back job with no effects left live. It cites the recorded hand
+// release; the hub copies that record's release name and targets. A receipt
+// and reconciliations the job already carries stay in its record.
 type ReleaseSupersession struct {
 	ReleasedCommit string   `json:"releasedCommit"`
 	Release        string   `json:"release"`
@@ -86,6 +91,31 @@ type ReleaseSupersession struct {
 	Targets        []string `json:"targets,omitempty"`
 	AgentID        string   `json:"agentId"`
 	RunID          string   `json:"runId"`
+}
+
+// ReleaseRestoredTarget is the handler's statement that a target the earlier
+// job touched runs this release again.
+type ReleaseRestoredTarget struct {
+	Target  string `json:"target"`
+	Release string `json:"release"`
+}
+
+// ReleaseRetry is the handler's retry of an accepted entry whose latest job
+// ended refused or rolled back with nothing left live. A request supplies
+// Reason and Restored (one entry per target in the earlier job's receipt);
+// the hub fills the rest when it saves the new job's RetryOf: the earlier
+// job, its generation and state, the retrying handler run and the attempt
+// number among the entry's jobs.
+type ReleaseRetry struct {
+	JobID      string                  `json:"jobId,omitempty"`
+	Generation int64                   `json:"generation,omitempty"`
+	State      string                  `json:"state,omitempty"`
+	Reason     string                  `json:"reason"`
+	Restored   []ReleaseRestoredTarget `json:"restored,omitempty"`
+	AgentID    string                  `json:"agentId,omitempty"`
+	RunID      string                  `json:"runId,omitempty"`
+	Attempt    int64                   `json:"attempt,omitempty"`
+	CreatedAt  string                  `json:"createdAt,omitempty"`
 }
 
 // HandRelease is the owner's immutable record of a release made by hand. It
@@ -192,6 +222,7 @@ type ReleaseRequest struct {
 	Receipt            *ReleaseReceipt        `json:"receipt,omitempty"`
 	Supersession       *ReleaseSupersession   `json:"supersession,omitempty"`
 	HandRelease        *HandRelease           `json:"handRelease,omitempty"`
+	Retry              *ReleaseRetry          `json:"retry,omitempty"`
 }
 
 func (c *Client) ReleaseAction(ctx context.Context, task string, req ReleaseRequest) (ReleaseJob, error) {

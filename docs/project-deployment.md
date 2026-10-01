@@ -111,7 +111,9 @@ resolved release ref. Unknown outcomes or live predecessor processes refuse.
 An inspected unpublished no-effect job may requeue against the unchanged eligible
 candidate and current pause generation. A held job may instead be refused
 terminally after effects/ref are resolved, releasing the project fence without
-pretending it released. Recovery history and exact retry receipts stay immutable.
+pretending it released. A refused job is terminal for that job ID; the handler
+can give its entry a new job by retry (Retrying a refused release, below).
+Recovery history and exact retry receipts stay immutable.
 The runner archives a no-effect predecessor journal only when its bytes, job and
 old exact run match the handler inspection; a changed or published journal does
 not qualify. A stale host lock is removed only when its saved job/run and raw
@@ -354,8 +356,9 @@ and the job's own approval does not cover it.
   first eight hex digits of each) instead of `verify-matrix.mjs exit 1`. An
   import citing no covering approval is refused as `matrix digest changed OLD8
   -> NEW8; no approval`. A refused job is terminal: after the owner approves the
-  new digest, release it by hand or from a new entry. The runner does not wait
-  for an approval or ask for one.
+  new digest, the handler retries the entry (Retrying a refused release, below)
+  or the owner releases it by hand. The runner does not wait for an approval or
+  ask for one.
 - **What the job records.** An accepted import saves `integratedMatrix`
   (`approvedDigest`, `integratedDigest`, `approvalMessageSeq`) on the job. The
   job's approved `plan` is never rewritten. A requeue or set-aside clears
@@ -442,20 +445,43 @@ missing patch is refused and named. A range that contains a merge needs ancestry
 because `git cherry` skips merge commits. Patch equivalence does not see a patch
 that a later tasks-hub commit reverted.
 
-**What the hub checks.** Supersede is handler-only and applies to a `verified`
-job that no deployer ever claimed, reconciled or finished, or to a `refused` job
-with no receipt; a `claimed`, `merged` or `blocked` job needs reconcile instead.
-A job the handler set aside (below) is not supersedable: it is `verified` again
-but keeps its `set_aside` record, so the deployer claims it again; use the
-config baseline fallback in the runbook for the targets its hand release shipped.
-The hub refuses unless the cited record exists in the project, its released
-commit equals `--released-commit`, its covered commits include the job's commit,
-and any `--release` equals the record's. It saves `supersession: {releasedCommit,
-release, handReleaseId, targets, agentId, runId}` and `settledAt` (the record's
-time), keeps the job's history and retry identity, and sets the terminal state
-`superseded`, shown as "superseded (released by hand)". Claim, the runner and the
-project fence skip it. Each use needs its own recorded order; there is no
-standing order to supersede.
+**What the hub checks.** Supersede is handler-only and applies to two kinds of
+job:
+
+- A `verified` job that no deployer holds: never claimed, or set aside by the
+  handler (below) and not claimed since. Its `set_aside` records prove it had no
+  release effects, and they stay in its history.
+- A `refused` or `rolled_back` job with nothing left live: no receipt and never
+  published; or rolled back (its receipt shows every target restored); or
+  refused by a handler reconcile whose record has the release ref resolved and
+  the journal `restored`, or `no_effects` while no receipt target is `released`
+  or has `rollback: blocked`. A failed receipt and the reconciliation stay in
+  the job's record.
+
+Anything else is refused with a reason that names the job:
+
+| Job | Refusal |
+|---|---|
+| `claimed`, `merged` or `blocked` (including a set-aside job claimed again) | `job ID is STATE; reconcile it first` |
+| `verified` with a requeue reconciliation or bound inputs | `verified job ID has deployer history (DETAIL)` |
+| `refused` with effects that are not restored | `job ID has release effects that are not restored (DETAIL)`, where DETAIL names the first target still released or whose rollback is blocked |
+| `released` or `superseded` | `job ID is already STATE` |
+
+The hub also refuses unless the cited record exists in the project (`recorded
+hand release required`), its released commit equals `--released-commit`, its
+covered commits include the job's commit (`hand release does not cover the
+job's commit`), and any `--release` equals the record's. It saves
+`supersession: {releasedCommit, release, handReleaseId, targets, agentId,
+runId}` and `settledAt` (the record's time, replacing a rolled-back receipt's),
+keeps the job's history and retry identity, and sets the terminal state
+`superseded`, shown as "superseded (released by hand)". The targets the record
+shipped advance to its released commit in the baselines. Claim, the runner and
+the project fence skip the job. Each use needs its own recorded order; there is
+no standing order to supersede.
+
+Restoration is the handler's inspection, not something the hub can observe: the
+hub has no view of the hosts, so a reconcile that records `restored` is trusted
+as every reconcile is.
 
 **Trust model.** The hub has no repository, so it cannot check git facts: it
 trusts the commits and targets in the owner's record, and the CLI's local proof
@@ -464,6 +490,77 @@ owner interventions use, not an authentication boundary; a request that carries
 an agent identity is refused. What the hub adds is that a handler or a direct
 API caller can no longer supersede against an arbitrary commit: it needs a prior,
 immutable, audited owner record that names that commit and covers that job.
+
+### Retrying a refused release
+
+A job that ends `refused` or `rolled_back` is terminal, and its queue entry
+still points at it. `tt deployment enqueue --entry ENTRY` on that entry answers
+`entry already has release job ID (refused); retry it with tt deployment retry
+--entry ENTRY --job ID --generation N --reason TEXT`. For an entry whose latest
+job is in any other state it answers `entry already has release job ID (STATE);
+recover the original request receipt`.
+
+The database handler, and only the handler, gives the entry a new job:
+
+```
+tt deployment retry --entry ENTRY --job ID --generation N --reason TEXT \
+  [--restored TARGET=RELEASE ...] --request-id KEY
+```
+
+`--reason` is one line saying why a new attempt is expected to pass (for
+example, the environment fault that refused the first one and the item that
+fixed it). The CLI refuses a missing reason or a malformed, unknown or repeated
+`--restored` before it calls the hub. The item is not copied and nothing is
+released by hand.
+
+**Conditions.** The hub checks, in this order, and names the job in each
+refusal:
+
+1. The job is the entry's latest job and `--generation` is its generation.
+   Otherwise `entry's latest release job is ID (STATE)` or `generation changed`.
+2. The job is `refused` or `rolled_back`. A `verified`, `claimed`, `merged` or
+   `blocked` job answers `job ID is STATE; reconcile it first`. A `released` or
+   `superseded` job answers `job ID already released`: its change shipped, and a
+   retry would ship it twice.
+3. Nothing of the job is still live, by the same rule as supersede (above): no
+   receipt and never published, or rolled back, or refused by a reconcile that
+   records the restoration. Otherwise `job ID has release effects that are not
+   restored (DETAIL); roll back, reconcile, or supersede with a hand release`.
+   There is no automatic retry of a job with effects. While such a job is still
+   held (`merged` or `blocked`), roll its targets back by hand and reconcile it
+   with the restoration recorded; it is then retryable. A job already refused
+   with a record that shows live effects can be neither retried nor superseded:
+   its change ships by hand, with the config baseline fallback in the runbook.
+4. `--restored` names the release each target in the job's receipt runs again,
+   once per target and for no other target. A job without a receipt takes no
+   `--restored`.
+5. The candidate is unchanged: the entry is still accepted, its item is done,
+   the current verification, known failures and review acceptance still pass,
+   and the item revision, commit, base commit and verification are the ones the
+   refused job had. Otherwise `candidate changed since ID`.
+6. The project pause generation is the one the job had. Otherwise `project
+   generation changed since ID`: after a project pause the entry needs the
+   owner's decision, not a retry.
+
+**What it creates.** A new job with a new ID for the same entry, item and
+commit: `verified`, generation 1, queued behind every waiting job. Its
+`retryOf: {jobId, generation, state, reason, restored, agentId, runId, attempt,
+createdAt}` links to the job it follows; `attempt` counts the entry's jobs. The
+earlier job's record is not written at all: its state, receipt, reconciliations,
+generation and request receipts stay as they were, and it stays in `tt
+deployment list` ahead of the new job. The queue entry shows the new job. The
+new job gets its own host journal, inputs manifest and receipt, because the
+runner keys all three by job ID; the earlier job's journal is untouched.
+
+The same `--request-id` with the same arguments returns the same new job; a
+changed request under that ID is refused as `retry changed`; a second retry of
+the same refused job under another ID is refused and names the newer job. A new
+job that is refused in turn can be retried the same way.
+
+A retried job is integrated like any other. If the earlier attempt published
+the change and `tasks-hub` still carries it, the runner's cherry-pick is empty
+and the new job is refused before publication; revert the change on `tasks-hub`
+first, or supersede the job with a hand release instead.
 
 ### Setting aside a job that holds the fence
 
@@ -738,7 +835,9 @@ as regular files directly in `journalDirectory`:
 1. A job that is `verified`, `claimed`, `merged` or `blocked`, or in any state
    the runner does not know as terminal, keeps everything, whatever the policy.
 2. A terminal job (`released`, `rolled_back`, `refused`, `superseded`) loses any
-   leftover rehearsal copy and sidecars (reason `terminal`).
+   leftover rehearsal copy and sidecars (reason `terminal`). A refused job is
+   terminal for that job ID even when the handler retries its entry: the retry
+   is a new job with its own journal files.
 3. A terminal job that is not `released` loses its backup copy (reason
    `not-released`).
 4. Released jobs are ordered newest first by `settledAt` compared as time; a job
@@ -854,7 +953,8 @@ redeploys the hand-released targets; and a record made after a newer deployer
 receipt settles later, so its older commit would win that target's baseline.
 
 *Fallback: a config baseline edit.* Only for a hand release that no job carries,
-or whose job was set aside (so nothing can be superseded): for each target
+or whose job cannot be superseded (requeued after a claim, or refused with
+effects that are not restored): for each target
 released by hand, run `node scripts/release-probe.mjs live TARGET --config
 PRIVATE` (`live tailos` for TailOS) and set `baselines.TARGET` in the private
 config to the printed `commit`. The running deployer re-reads `baselines` from

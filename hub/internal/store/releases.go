@@ -16,8 +16,9 @@ import (
 const releasesSchema = `CREATE TABLE IF NOT EXISTS release_jobs (
  task_id TEXT NOT NULL REFERENCES tasks(id),id TEXT NOT NULL,entry_id TEXT NOT NULL,
  state TEXT NOT NULL,generation INTEGER NOT NULL,record_json TEXT NOT NULL,
- PRIMARY KEY(task_id,id),UNIQUE(task_id,entry_id));
+ PRIMARY KEY(task_id,id));
  CREATE UNIQUE INDEX IF NOT EXISTS release_project_fence ON release_jobs(task_id) WHERE state IN ('claimed','merged','blocked');
+ CREATE INDEX IF NOT EXISTS release_jobs_entry ON release_jobs(task_id,entry_id);
  CREATE TABLE IF NOT EXISTS release_action_receipts (
  task_id TEXT NOT NULL,request_id TEXT NOT NULL,payload_hash TEXT NOT NULL,record_json TEXT NOT NULL,
  PRIMARY KEY(task_id,request_id));
@@ -31,6 +32,60 @@ const releasesSchema = `CREATE TABLE IF NOT EXISTS release_jobs (
  CREATE TRIGGER IF NOT EXISTS release_hand_release_no_delete BEFORE DELETE ON release_hand_releases BEGIN SELECT RAISE(ABORT,'immutable hand release'); END;`
 
 var releaseTargetNames = []string{"hub", "bridge", "mini", "tailos"}
+
+// migrateReleaseJobs creates the release tables and rebuilds a release_jobs
+// table from before an entry could have several jobs: a retry adds a job for
+// an entry that already has one, which the old UNIQUE(task_id,entry_id)
+// refused, and SQLite cannot drop a table constraint in place. Rows keep
+// their rowid (queue and list order) and column order (inserts are
+// positional). A table without the constraint is left alone.
+func migrateReleaseJobs(db *sql.DB) error {
+	if _, err := db.Exec(releasesSchema); err != nil {
+		return err
+	}
+	var ddl string
+	if err := db.QueryRow(`SELECT sql FROM sqlite_master WHERE type='table' AND name='release_jobs'`).Scan(&ddl); err != nil {
+		return err
+	}
+	if !strings.Contains(strings.ReplaceAll(ddl, " ", ""), "UNIQUE(task_id,entry_id)") {
+		return nil
+	}
+	// One connection, so the pragma and the transaction share it. The
+	// rebuild keeps SQLite's temporary storage (the statement journal of the
+	// copy, the index sorter) in memory: the hub container is read-only and
+	// a rebuild that needed a temp file once failed the store open.
+	ctx := context.Background()
+	conn, err := db.Conn(ctx)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+	var tempStore int
+	if err = conn.QueryRowContext(ctx, `PRAGMA temp_store`).Scan(&tempStore); err != nil {
+		return err
+	}
+	if _, err = conn.ExecContext(ctx, `PRAGMA temp_store=MEMORY`); err != nil {
+		return err
+	}
+	defer conn.ExecContext(ctx, fmt.Sprintf(`PRAGMA temp_store=%d`, tempStore))
+	tx, err := conn.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	if _, err = tx.Exec(`CREATE TABLE release_jobs_v2 (
+ task_id TEXT NOT NULL REFERENCES tasks(id),id TEXT NOT NULL,entry_id TEXT NOT NULL,
+ state TEXT NOT NULL,generation INTEGER NOT NULL,record_json TEXT NOT NULL,
+ PRIMARY KEY(task_id,id));
+ INSERT INTO release_jobs_v2(rowid,task_id,id,entry_id,state,generation,record_json) SELECT rowid,task_id,id,entry_id,state,generation,record_json FROM release_jobs ORDER BY rowid;
+ DROP TABLE release_jobs;
+ ALTER TABLE release_jobs_v2 RENAME TO release_jobs;
+ CREATE UNIQUE INDEX release_project_fence ON release_jobs(task_id) WHERE state IN ('claimed','merged','blocked');
+ CREATE INDEX release_jobs_entry ON release_jobs(task_id,entry_id);`); err != nil {
+		tx.Rollback()
+		return err
+	}
+	return tx.Commit()
+}
 
 func releaseConflict(reason string) error {
 	return fmt.Errorf("%w: release: %s", api.ErrConflict, reason)
@@ -319,6 +374,183 @@ func releaseCandidate(ctx context.Context, tx *sql.Tx, task, entry string) (api.
 	return e, *plan, *receipt, nil
 }
 
+// releaseEffects classifies what a job left live, for a retry or a
+// supersession of a refused or rolled-back job. "none": no receipt and never
+// published. "restored": a rolled-back job (finish accepts that outcome only
+// when every target was restored), or a job the handler refused by reconcile
+// with the release ref resolved and the journal inspected as restored, or as
+// no_effects while no receipt target was released or failed to roll back.
+// Anything else is "unrestored", with the first reason. The hub cannot see
+// the host: the reconciliation is the handler's inspection record.
+func releaseEffects(j api.ReleaseJob) (kind, detail string) {
+	if j.Receipt == nil && !j.Published {
+		return "none", ""
+	}
+	if j.State == "rolled_back" {
+		return "restored", ""
+	}
+	live := func() string {
+		if j.Receipt != nil {
+			for _, t := range j.Receipt.Targets {
+				if t.Outcome == "released" {
+					return "target " + t.Target + " is released"
+				}
+				if t.Rollback == "blocked" {
+					return "target " + t.Target + " rollback is blocked"
+				}
+			}
+		}
+		return ""
+	}
+	if n := len(j.Reconciliations); n > 0 {
+		last := j.Reconciliations[n-1]
+		if last.Disposition == "refuse" && last.RefResolved {
+			if last.JournalState == "restored" {
+				return "restored", ""
+			}
+			if last.JournalState == "no_effects" && live() == "" {
+				return "restored", ""
+			}
+		}
+	}
+	if detail = live(); detail == "" {
+		detail = "published, with no reconciliation recording a restoration"
+		if j.Receipt != nil {
+			detail = "receipt outcome " + j.Receipt.Outcome + ", with no reconciliation recording a restoration"
+		}
+	}
+	return "unrestored", detail
+}
+
+// releaseSupersedable names why a covering hand release cannot supersede j,
+// or returns "". Supersedable: a verified job no deployer holds, whose only
+// history is being set aside; and a refused or rolled-back job with no
+// effects left live, whose receipt and reconciliations stay in its record. A
+// held job still needs reconcile, and a requeued job carries host history.
+func releaseSupersedable(j api.ReleaseJob) string {
+	switch j.State {
+	case "verified":
+		detail := ""
+		switch {
+		case j.AgentID != "":
+			detail = "claimed by " + j.AgentID
+		case j.IntegratedCommit != "" || j.InputsDigest != "":
+			detail = "integrated inputs bound"
+		case j.Published || j.Receipt != nil:
+			detail = "published"
+		}
+		for _, r := range j.Reconciliations {
+			if detail == "" && r.Disposition != "set_aside" {
+				detail = r.Disposition + " reconciliation"
+			}
+		}
+		if detail != "" {
+			return "verified job " + j.ID + " has deployer history (" + detail + ")"
+		}
+	case "refused", "rolled_back":
+		if kind, detail := releaseEffects(j); kind == "unrestored" {
+			return "job " + j.ID + " has release effects that are not restored (" + detail + ")"
+		}
+	case "claimed", "merged", "blocked":
+		return "job " + j.ID + " is " + j.State + "; reconcile it first"
+	default:
+		return "job " + j.ID + " is already " + j.State
+	}
+	return ""
+}
+
+// retryRelease builds a new verified job for an accepted entry whose latest
+// job ended refused or rolled back with nothing left live. The earlier job's
+// row is never written: its record, receipt, reconciliations and request
+// receipts stay as they were, and the new job's RetryOf links to it. The
+// candidate and the project pause generation must be what that job had.
+func retryRelease(ctx context.Context, tx *sql.Tx, task string, req api.ReleaseRequest, generation int64, now time.Time) (api.ReleaseJob, error) {
+	zero := api.ReleaseJob{}
+	if err := requireScopeHandler(tx, ctx, task, req.AgentID, req.RunID); err != nil {
+		return zero, err
+	}
+	retry := req.Retry
+	if retry == nil || !releaseText(retry.Reason) || len(retry.Restored) > len(releaseTargetNames) {
+		return zero, api.ErrInvalid
+	}
+	restored := map[string]string{}
+	for _, r := range retry.Restored {
+		if _, dup := restored[r.Target]; dup || !slices.Contains(releaseTargetNames, r.Target) || !releaseText(r.Release) {
+			return zero, api.ErrInvalid
+		}
+		restored[r.Target] = r.Release
+	}
+	j, err := releaseLoad(ctx, tx, task, req.JobID)
+	if err != nil {
+		return zero, err
+	}
+	if j.EntryID != req.EntryID {
+		return zero, releaseConflict("job " + j.ID + " belongs to another entry")
+	}
+	if j.Generation != req.ExpectedGeneration {
+		return zero, releaseConflict("generation changed")
+	}
+	var latest, latestState string
+	var attempts int64
+	if err = tx.QueryRowContext(ctx, `SELECT id,state FROM release_jobs WHERE task_id=? AND entry_id=? ORDER BY rowid DESC LIMIT 1`, task, j.EntryID).Scan(&latest, &latestState); err != nil {
+		return zero, err
+	}
+	if latest != j.ID {
+		return zero, releaseConflict("entry's latest release job is " + latest + " (" + latestState + ")")
+	}
+	switch j.State {
+	case "refused", "rolled_back":
+	case "verified", "claimed", "merged", "blocked":
+		return zero, releaseConflict("job " + j.ID + " is " + j.State + "; reconcile it first")
+	case "superseded":
+		return zero, releaseConflict("job " + j.ID + " already released (superseded by a hand release)")
+	default:
+		return zero, releaseConflict("job " + j.ID + " already " + j.State)
+	}
+	if kind, detail := releaseEffects(j); kind == "unrestored" {
+		return zero, releaseConflict("job " + j.ID + " has release effects that are not restored (" + detail + "); roll back, reconcile, or supersede with a hand release")
+	}
+	// Every target the earlier job's receipt names needs the release it runs
+	// again, and nothing else may be named.
+	link := api.ReleaseRetry{JobID: j.ID, Generation: j.Generation, State: j.State, Reason: retry.Reason, AgentID: req.AgentID, RunID: req.RunID, CreatedAt: ts(now)}
+	touched := map[string]bool{}
+	if j.Receipt != nil {
+		for _, t := range j.Receipt.Targets {
+			touched[t.Target] = true
+		}
+	}
+	for _, name := range releaseTargetNames {
+		release, named := restored[name]
+		if touched[name] && !named {
+			return zero, releaseConflict("job " + j.ID + " has a receipt for target " + name + "; the retry must name the release restored on it")
+		}
+		if named && !touched[name] {
+			return zero, releaseConflict("job " + j.ID + " has no receipt for target " + name + "; the retry names a restoration it cannot check")
+		}
+		if named {
+			link.Restored = append(link.Restored, api.ReleaseRestoredTarget{Target: name, Release: release})
+		}
+	}
+	e, p, r, err := releaseCandidate(ctx, tx, task, j.EntryID)
+	if errors.Is(err, api.ErrConflict) {
+		return zero, fmt.Errorf("%w; candidate changed since %s", err, j.ID)
+	}
+	if err != nil {
+		return zero, err
+	}
+	if e.Acceptance.ItemRevision != j.ItemRevision || p.Commit != j.Commit || p.BaseCommit != j.BaseCommit || verificationDigest(r) != j.VerificationDigest {
+		return zero, releaseConflict("candidate changed since " + j.ID)
+	}
+	if j.PauseGeneration != generation {
+		return zero, releaseConflict("project generation changed since " + j.ID)
+	}
+	if err = tx.QueryRowContext(ctx, `SELECT count(*) FROM release_jobs WHERE task_id=? AND entry_id=?`, task, j.EntryID).Scan(&attempts); err != nil {
+		return zero, err
+	}
+	link.Attempt = attempts + 1
+	return api.ReleaseJob{ID: api.NewID("rel"), TaskID: task, EntryID: e.ID, ItemID: e.ItemID, ItemRevision: e.Acceptance.ItemRevision, ScopeRevision: p.ScopeRevision, OrderMessageSeq: p.OrderMessageSeq, Repository: p.Repository, BaseCommit: p.BaseCommit, Commit: p.Commit, VerificationDigest: verificationDigest(r), Plan: p, State: "verified", Generation: 1, PauseGeneration: generation, RetryOf: &link}, nil
+}
+
 // Claims have no time based expiry: a disconnected runner may still execute.
 // A blocked or ambiguous job retains the project fence until explicit recovery;
 // a claimed job with no effects can instead be set aside for a later job.
@@ -367,13 +599,22 @@ func (s *Store) ReleaseAction(ctx context.Context, task string, req api.ReleaseR
 		if eerr != nil {
 			return zero, eerr
 		}
-		var existing string
-		if err = tx.QueryRowContext(ctx, `SELECT id FROM release_jobs WHERE task_id=? AND entry_id=?`, task, req.EntryID).Scan(&existing); err == nil {
-			return zero, releaseConflict("entry already enqueued; recover original request receipt")
+		// The entry's latest job: a retry adds later ones.
+		var existing, existingState string
+		var existingGeneration int64
+		if err = tx.QueryRowContext(ctx, `SELECT id,state,generation FROM release_jobs WHERE task_id=? AND entry_id=? ORDER BY rowid DESC LIMIT 1`, task, req.EntryID).Scan(&existing, &existingState, &existingGeneration); err == nil {
+			if existingState == "refused" || existingState == "rolled_back" {
+				return zero, releaseConflict(fmt.Sprintf("entry already has release job %s (%s); retry it with tt deployment retry --entry %s --job %s --generation %d --reason TEXT", existing, existingState, req.EntryID, existing, existingGeneration))
+			}
+			return zero, releaseConflict(fmt.Sprintf("entry already has release job %s (%s); recover the original request receipt", existing, existingState))
 		} else if !errors.Is(err, sql.ErrNoRows) {
 			return zero, err
 		}
 		j = api.ReleaseJob{ID: api.NewID("rel"), TaskID: task, EntryID: e.ID, ItemID: e.ItemID, ItemRevision: e.Acceptance.ItemRevision, ScopeRevision: p.ScopeRevision, OrderMessageSeq: p.OrderMessageSeq, Repository: p.Repository, BaseCommit: p.BaseCommit, Commit: p.Commit, VerificationDigest: verificationDigest(r), Plan: p, State: "verified", Generation: 1, PauseGeneration: generation}
+	} else if req.Operation == "retry" {
+		if j, err = retryRelease(ctx, tx, task, req, generation, s.now()); err != nil {
+			return zero, err
+		}
 	} else {
 		j, err = releaseLoad(ctx, tx, task, req.JobID)
 		if err != nil {
@@ -412,16 +653,8 @@ func (s *Store) ReleaseAction(ctx context.Context, task string, req api.ReleaseR
 			if err = requireScopeHandler(tx, ctx, task, req.AgentID, req.RunID); err != nil {
 				return zero, err
 			}
-			// Only a job no deployer ever touched, or a terminal refused job
-			// without a receipt: the deployer refuses before publication, but
-			// a handler reconcile may refuse a published (merged or blocked)
-			// job, which the covering hand release then settles. A claimed,
-			// merged or blocked job still holds host history that needs
-			// reconcile, not supersession; so does a job the handler set
-			// aside, which is verified again but carries its reconciliation.
-			untouched := j.State == "verified" && j.AgentID == "" && j.IntegratedCommit == "" && len(j.Reconciliations) == 0
-			if (!untouched && j.State != "refused") || j.Receipt != nil {
-				return zero, releaseConflict("only a verified never-claimed job or a refused unreceipted job can be superseded")
+			if reason := releaseSupersedable(j); reason != "" {
+				return zero, releaseConflict(reason)
 			}
 			sup := req.Supersession
 			if sup == nil || !validGitCommit(sup.ReleasedCommit) || (sup.Release != "" && !releaseText(sup.Release)) || sup.HandReleaseID == "" || len(sup.HandReleaseID) > 64 || len(sup.Targets) > 0 {
@@ -612,7 +845,7 @@ func (s *Store) ReleaseAction(ctx context.Context, task string, req api.ReleaseR
 	if err != nil {
 		return zero, err
 	}
-	if req.Operation == "enqueue" {
+	if req.Operation == "enqueue" || req.Operation == "retry" {
 		_, err = tx.ExecContext(ctx, `INSERT INTO release_jobs VALUES(?,?,?,?,?,?)`, task, j.ID, j.EntryID, j.State, j.Generation, string(b))
 	} else {
 		_, err = tx.ExecContext(ctx, `UPDATE release_jobs SET state=?,generation=?,record_json=? WHERE task_id=? AND id=?`, j.State, j.Generation, string(b), task, j.ID)

@@ -237,6 +237,76 @@ func TestSupersedeAndHandReleaseGuardBeforeHub(t *testing.T) {
 	}
 }
 
+// a13: tt deployment retry refuses a missing reason, entry or job and a
+// malformed, unknown or repeated --restored before any hub call, then sends
+// the handler's retry with the reason and the restored releases. The usage
+// line lists retry.
+func TestDeploymentRetryGuardsBeforeHub(t *testing.T) {
+	var requests []string
+	var posts []api.ReleaseRequest
+	hub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests = append(requests, r.Method+" "+r.URL.Path)
+		var req api.ReleaseRequest
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		posts = append(posts, req)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusCreated)
+		_ = json.NewEncoder(w).Encode(api.ReleaseJob{ID: "rel_new", State: "verified", Generation: 1, RetryOf: &api.ReleaseRetry{JobID: "rel_refused"}})
+	}))
+	defer hub.Close()
+	e := env{hub: hub.URL, task: "tsk_0123456789abcdef", agent: "agt_0123456789abcdef", runID: "run_0123456789abcdef"}
+	retry := func(args ...string) error {
+		_, err := captureRelayOutput(t, false, func() error { return cmdDeployment(e, append([]string{"retry"}, args...)) })
+		return err
+	}
+	base := []string{"--entry", "tqe_0123456789abcdef", "--job", "rel_refused", "--generation", "4", "--request-id", "retry-1"}
+	with := func(extra ...string) []string { return append(append([]string{}, base...), extra...) }
+	for name, c := range map[string]struct {
+		args []string
+		want string
+	}{
+		"no reason":         {base, "--reason"},
+		"blank reason":      {with("--reason", "  "), "--reason"},
+		"two line reason":   {with("--reason", "fixed\nreally"), "--reason"},
+		"no entry":          {[]string{"--job", "rel_refused", "--generation", "4", "--request-id", "retry-1", "--reason", "fixed"}, "--entry and --job"},
+		"no job":            {[]string{"--entry", "tqe_0123456789abcdef", "--generation", "4", "--request-id", "retry-1", "--reason", "fixed"}, "--entry and --job"},
+		"restored no value": {with("--reason", "fixed", "--restored", "hub"), "TARGET=RELEASE"},
+		"restored empty":    {with("--reason", "fixed", "--restored", "hub="), "TARGET=RELEASE"},
+		"unknown target":    {with("--reason", "fixed", "--restored", "nas=20260930-old"), "unknown target"},
+		"repeated target":   {with("--reason", "fixed", "--restored", "hub=20260930-old", "--restored", "hub=20260929-old"), "target hub twice"},
+		"no request id":     {[]string{"--entry", "tqe_0123456789abcdef", "--job", "rel_refused", "--generation", "4", "--reason", "fixed"}, "request-id"},
+	} {
+		if err := retry(c.args...); err == nil || !strings.Contains(err.Error(), c.want) {
+			t.Fatalf("%s: %v", name, err)
+		}
+	}
+	if len(requests) != 0 {
+		t.Fatalf("refused retries reached the hub: %v", requests)
+	}
+	if err := retry(with("--reason", "Temp dir fixed; both targets restored", "--restored", "hub=20260930-old", "--restored", "bridge=20260929-old")...); err != nil {
+		t.Fatal(err)
+	}
+	if len(requests) != 1 || len(posts) != 1 {
+		t.Fatalf("requests %v", requests)
+	}
+	got := posts[0]
+	if got.Operation != "retry" || got.RequestID != "retry-1" || got.AgentID != e.agent || got.RunID != e.runID || got.EntryID != "tqe_0123456789abcdef" || got.JobID != "rel_refused" || got.ExpectedGeneration != 4 || got.Retry == nil || got.Retry.Reason != "Temp dir fixed; both targets restored" {
+		t.Fatalf("retry request %+v", got)
+	}
+	if r := got.Retry.Restored; len(r) != 2 || r[0] != (api.ReleaseRestoredTarget{Target: "hub", Release: "20260930-old"}) || r[1] != (api.ReleaseRestoredTarget{Target: "bridge", Release: "20260929-old"}) {
+		t.Fatalf("restored %+v", got.Retry.Restored)
+	}
+	if err := cmdDeployment(e, nil); err == nil || !strings.Contains(err.Error(), "|supersede|retry|") {
+		t.Fatal("usage does not list retry", err)
+	}
+	// Other operations never carry a retry record.
+	if _, err := captureRelayOutput(t, false, func() error {
+		return cmdDeployment(e, []string{"claim", "--job", "rel_new", "--generation", "1", "--request-id", "claim-1"})
+	}); err != nil || len(posts) != 2 || posts[1].Operation != "claim" || posts[1].Retry != nil {
+		t.Fatalf("claim %+v %v", posts, err)
+	}
+}
+
 // wi_5b03fe47520b7c4f p1: setup provisions the matrix prerequisites in the
 // deployer's checkout before it spawns the role, and spawns nothing otherwise.
 func TestDeploymentSetupProvisionsPrerequisitesBeforeSpawn(t *testing.T) {

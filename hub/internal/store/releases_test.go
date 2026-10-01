@@ -1211,29 +1211,98 @@ func TestSupersedePublishedReconcileRefusedJob(t *testing.T) {
 	}
 }
 
-// O1: a job the handler set aside is verified and unclaimed again but keeps
-// its set_aside reconciliation, so it is not "never claimed": a covering
-// hand release does not supersede it.
-func TestSupersedeRefusesSetAsideJob(t *testing.T) {
-	s, task, h, d, entryA := releaseFixture(t)
+// a10/a11 (s1-s3): a job the handler set aside is verified and unclaimed again
+// with only its set_aside reconciliation, which proves no release effects, so
+// a covering hand release supersedes it and the reconciliation stays in its
+// history. Claimed again, requeued after a claim, or published, it is refused
+// with a reason naming the job.
+func TestSupersedeSetAsideJob(t *testing.T) {
 	ctx := context.Background()
-	a := claimGoRaceJob(t, s, task, h, d, entryA, goRaceMatrix(goRace(raceFlags, "./cmd/tt")))
-	if _, err := s.ReleaseAction(ctx, task.ID, api.ReleaseRequest{RequestID: "fix-enqueue", Operation: "enqueue", AgentID: h.ID, RunID: h.RunID, EntryID: releaseEntry(t, s, task, "fix for the refusal", "fix")}); err != nil {
-		t.Fatal(err)
+	type fixture struct {
+		s     *Store
+		task  api.Task
+		h, d  api.Agent
+		aside api.ReleaseJob
 	}
-	evidence := setAsideEvidence(t, s, task, h, a)
-	aside, err := s.ReleaseAction(ctx, task.ID, api.ReleaseRequest{RequestID: "set-aside", Operation: "set-aside", AgentID: h.ID, RunID: h.RunID, JobID: a.ID, ExpectedGeneration: a.Generation, Reconciliation: &evidence})
-	if err != nil || aside.State != "verified" || aside.AgentID != "" || len(aside.Reconciliations) != 1 {
-		t.Fatalf("set aside %+v %v", aside, err)
+	setup := func(t *testing.T) fixture {
+		s, task, h, d, entryA := releaseFixture(t)
+		a := claimGoRaceJob(t, s, task, h, d, entryA, goRaceMatrix(goRace(raceFlags, "./cmd/tt")))
+		if _, err := s.ReleaseAction(ctx, task.ID, api.ReleaseRequest{RequestID: "fix-enqueue", Operation: "enqueue", AgentID: h.ID, RunID: h.RunID, EntryID: releaseEntry(t, s, task, "fix for the refusal", "fix")}); err != nil {
+			t.Fatal(err)
+		}
+		evidence := setAsideEvidence(t, s, task, h, a)
+		aside, err := s.ReleaseAction(ctx, task.ID, api.ReleaseRequest{RequestID: "set-aside", Operation: "set-aside", AgentID: h.ID, RunID: h.RunID, JobID: a.ID, ExpectedGeneration: a.Generation, Reconciliation: &evidence})
+		if err != nil || aside.State != "verified" || aside.AgentID != "" || len(aside.Reconciliations) != 1 {
+			t.Fatalf("set aside %+v %v", aside, err)
+		}
+		return fixture{s, task, h, d, aside}
 	}
-	hand := recordHandRelease(t, s, task, "hand", aside.Commit, []string{aside.Commit})
-	_, err = s.ReleaseAction(ctx, task.ID, api.ReleaseRequest{RequestID: "supersede", Operation: "supersede", AgentID: h.ID, RunID: h.RunID, JobID: aside.ID, ExpectedGeneration: aside.Generation, Supersession: &api.ReleaseSupersession{ReleasedCommit: aside.Commit, HandReleaseID: hand.ID}})
-	if !errors.Is(err, api.ErrConflict) || !strings.Contains(err.Error(), "only a verified never-claimed job or a refused unreceipted job can be superseded") {
-		t.Fatal("set-aside job superseded", err)
+	supersede := func(t *testing.T, f fixture, j api.ReleaseJob) (api.ReleaseJob, error) {
+		t.Helper()
+		hand := recordHandRelease(t, f.s, f.task, "hand", j.Commit, []string{j.Commit})
+		return f.s.ReleaseAction(ctx, f.task.ID, api.ReleaseRequest{RequestID: "supersede", Operation: "supersede", AgentID: f.h.ID, RunID: f.h.RunID, JobID: j.ID, ExpectedGeneration: j.Generation, Supersession: &api.ReleaseSupersession{ReleasedCommit: j.Commit, HandReleaseID: hand.ID}})
 	}
-	if saved, err := releaseLoad(ctx, s.db, task.ID, aside.ID); err != nil || saved.State != "verified" || saved.Supersession != nil {
-		t.Fatal("refused supersede changed the job", saved.State, err)
+	// refused asserts a conflict naming the job and the reason that leaves
+	// the job as it was.
+	refused := func(t *testing.T, f fixture, j api.ReleaseJob, want string) {
+		t.Helper()
+		_, err := supersede(t, f, j)
+		if !errors.Is(err, api.ErrConflict) || !strings.Contains(err.Error(), j.ID) || !strings.Contains(err.Error(), want) {
+			t.Fatalf("want %q naming %s, got %v", want, j.ID, err)
+		}
+		if saved, err := releaseLoad(ctx, f.s.db, f.task.ID, j.ID); err != nil || saved.State != j.State || saved.Generation != j.Generation || saved.Supersession != nil {
+			t.Fatal("refused supersede changed the job", saved.State, err)
+		}
 	}
+	t.Run("set aside only", func(t *testing.T) {
+		f := setup(t)
+		uncovering := recordHandRelease(t, f.s, f.task, "uncovering", candidateC, []string{candidateC})
+		if _, err := f.s.ReleaseAction(ctx, f.task.ID, api.ReleaseRequest{RequestID: "uncovered", Operation: "supersede", AgentID: f.h.ID, RunID: f.h.RunID, JobID: f.aside.ID, ExpectedGeneration: f.aside.Generation, Supersession: &api.ReleaseSupersession{ReleasedCommit: candidateC, HandReleaseID: uncovering.ID}}); !errors.Is(err, api.ErrConflict) || !strings.Contains(err.Error(), "does not cover") {
+			t.Fatal("uncovering record superseded a set-aside job", err)
+		}
+		done, err := supersede(t, f, f.aside)
+		if err != nil || done.State != "superseded" || done.Supersession == nil || strings.Join(done.Supersession.Targets, ",") != "hub" || done.SettledAt == "" {
+			t.Fatalf("%+v %v", done, err)
+		}
+		if len(done.Reconciliations) != 1 || done.Reconciliations[0] != f.aside.Reconciliations[0] {
+			t.Fatalf("set-aside history changed %+v", done.Reconciliations)
+		}
+	})
+	t.Run("claimed again", func(t *testing.T) {
+		f := setup(t)
+		again, err := f.s.ReleaseAction(ctx, f.task.ID, api.ReleaseRequest{RequestID: "reclaim", Operation: "claim", AgentID: f.d.ID, RunID: f.d.RunID, JobID: f.aside.ID, ExpectedGeneration: f.aside.Generation})
+		if err != nil || again.State != "claimed" {
+			t.Fatal(again.State, err)
+		}
+		refused(t, f, again, "is claimed; reconcile it first")
+	})
+	t.Run("requeued after a claim", func(t *testing.T) {
+		f := setup(t)
+		again, err := f.s.ReleaseAction(ctx, f.task.ID, api.ReleaseRequest{RequestID: "reclaim", Operation: "claim", AgentID: f.d.ID, RunID: f.d.RunID, JobID: f.aside.ID, ExpectedGeneration: f.aside.Generation})
+		if err != nil {
+			t.Fatal(err)
+		}
+		evidence := recoveryEvidence(t, f.s, f.task, f.h, again)
+		if _, err = f.s.db.Exec(`UPDATE agents SET status='exited' WHERE id=?`, f.d.ID); err != nil {
+			t.Fatal(err)
+		}
+		requeued, err := f.s.ReleaseAction(ctx, f.task.ID, api.ReleaseRequest{RequestID: "requeue", Operation: "reconcile", AgentID: f.h.ID, RunID: f.h.RunID, JobID: again.ID, ExpectedGeneration: again.Generation, Reconciliation: &evidence})
+		if err != nil || requeued.State != "verified" || len(requeued.Reconciliations) != 2 {
+			t.Fatalf("%+v %v", requeued, err)
+		}
+		refused(t, f, requeued, "has deployer history (requeue reconciliation)")
+	})
+	t.Run("published", func(t *testing.T) {
+		f := setup(t)
+		j := f.aside
+		for _, op := range []string{"claim", "merged"} {
+			var err error
+			if j, err = f.s.ReleaseAction(ctx, f.task.ID, api.ReleaseRequest{RequestID: "again-" + op, Operation: op, AgentID: f.d.ID, RunID: f.d.RunID, JobID: j.ID, ExpectedGeneration: j.Generation, IntegratedCommit: j.Commit}); err != nil {
+				t.Fatal(op, err)
+			}
+		}
+		refused(t, f, j, "is merged; reconcile it first")
+	})
 }
 
 // setAsideEvidence is the handler's typed record for setting aside claimed j.
@@ -1426,5 +1495,663 @@ func TestReleaseSetAsideKeepsFenceForJobsWithEffects(t *testing.T) {
 			f := setup(t, false)
 			refused(t, f, f.a, change)
 		})
+	}
+}
+
+// refusedJob enqueues the entry's first job and has the deployer claim and
+// refuse it before publication: refused, no receipt, never published.
+func refusedJob(t *testing.T, s *Store, task api.Task, h, d api.Agent, entry string) api.ReleaseJob {
+	t.Helper()
+	ctx := context.Background()
+	j, err := s.ReleaseAction(ctx, task.ID, api.ReleaseRequest{RequestID: "first-enqueue", Operation: "enqueue", AgentID: h.ID, RunID: h.RunID, EntryID: entry})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, op := range []string{"claim", "refuse"} {
+		if j, err = s.ReleaseAction(ctx, task.ID, api.ReleaseRequest{RequestID: "first-" + op, Operation: op, AgentID: d.ID, RunID: d.RunID, JobID: j.ID, ExpectedGeneration: j.Generation}); err != nil {
+			t.Fatal(op, err)
+		}
+	}
+	return j
+}
+
+// failedReceiptJob publishes the entry's first job, finishes it blocked with
+// the given target receipts, and has the handler refuse it by reconcile with
+// the given journal state: refused, published, with a receipt. The deployer
+// run is exited, as reconcile requires.
+func failedReceiptJob(t *testing.T, s *Store, task api.Task, h, d api.Agent, entry, journalState string, targets []api.ReleaseTargetReceipt) api.ReleaseJob {
+	t.Helper()
+	ctx := context.Background()
+	j, err := s.ReleaseAction(ctx, task.ID, api.ReleaseRequest{RequestID: "first-enqueue", Operation: "enqueue", AgentID: h.ID, RunID: h.RunID, EntryID: entry})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, op := range []string{"claim", "merged", "finish"} {
+		req := api.ReleaseRequest{RequestID: "first-" + op, Operation: op, AgentID: d.ID, RunID: d.RunID, JobID: j.ID, ExpectedGeneration: j.Generation, IntegratedCommit: j.Commit}
+		if op == "finish" {
+			req.IntegratedCommit = ""
+			req.Receipt = &api.ReleaseReceipt{Version: 1, JobID: j.ID, Commit: j.Commit, VerificationDigest: j.VerificationDigest, Outcome: "blocked", Targets: targets}
+		}
+		if j, err = s.ReleaseAction(ctx, task.ID, req); err != nil {
+			t.Fatal(op, err)
+		}
+	}
+	evidence := recoveryEvidence(t, s, task, h, j)
+	evidence.Disposition, evidence.NoPublication, evidence.JournalState = "refuse", false, journalState
+	if _, err = s.db.Exec(`UPDATE agents SET status='exited' WHERE id=?`, d.ID); err != nil {
+		t.Fatal(err)
+	}
+	j, err = s.ReleaseAction(ctx, task.ID, api.ReleaseRequest{RequestID: "first-reconcile", Operation: "reconcile", AgentID: h.ID, RunID: h.RunID, JobID: j.ID, ExpectedGeneration: j.Generation, Reconciliation: &evidence})
+	if err != nil || j.State != "refused" || j.Receipt == nil || !j.Published {
+		t.Fatalf("%+v %v", j, err)
+	}
+	return j
+}
+
+// restoredTargets is a blocked receipt whose two targets failed and were
+// rolled back; unrestoredTargets leaves tailos released.
+func restoredTargets() []api.ReleaseTargetReceipt {
+	return []api.ReleaseTargetReceipt{
+		{Target: "tailos", Release: "fixture-new", ArtifactSHA256: strings.Repeat("a", 64), Outcome: "failed", Rollback: "restored"},
+		{Target: "mini", Release: "fixture-new", ArtifactSHA256: strings.Repeat("a", 64), Outcome: "rolled_back", Rollback: "restored"},
+	}
+}
+func unrestoredTargets() []api.ReleaseTargetReceipt {
+	return []api.ReleaseTargetReceipt{
+		{Target: "mini", Release: "fixture-new", ArtifactSHA256: strings.Repeat("a", 64), Outcome: "failed"},
+		{Target: "tailos", Release: "fixture-new", ArtifactSHA256: strings.Repeat("a", 64), Outcome: "released"},
+	}
+}
+
+// releaseRow is a job's stored row exactly as saved, with its queue position.
+func releaseRow(t *testing.T, s *Store, task api.Task, id string) string {
+	t.Helper()
+	var rowid, generation int64
+	var entry, state, raw string
+	if err := s.db.QueryRow(`SELECT rowid,entry_id,state,generation,record_json FROM release_jobs WHERE task_id=? AND id=?`, task.ID, id).Scan(&rowid, &entry, &state, &generation, &raw); err != nil {
+		t.Fatal(err)
+	}
+	return fmt.Sprintf("%d|%s|%s|%d|%s", rowid, entry, state, generation, raw)
+}
+
+func retryRequest(key string, h api.Agent, entry string, j api.ReleaseJob, restored ...api.ReleaseRestoredTarget) api.ReleaseRequest {
+	return api.ReleaseRequest{RequestID: key, Operation: "retry", AgentID: h.ID, RunID: h.RunID, EntryID: entry, JobID: j.ID, ExpectedGeneration: j.Generation, Retry: &api.ReleaseRetry{Reason: "Environment fixed; nothing of the first attempt is live", Restored: restored}}
+}
+
+// a1/a2 (r1, r3, r4, j1): the handler retries a job refused before
+// publication. The entry gets a new verified job linked to the refused one,
+// the refused job's row is byte-identical, both are listed in order, the
+// entry shows the new job and a deployer can claim it. A second refusal can
+// be retried again, keeping every prior job.
+func TestReleaseRetryCreatesNewJobForRefusedEntry(t *testing.T) {
+	s, task, h, d, entry := releaseFixture(t)
+	ctx := context.Background()
+	first := refusedJob(t, s, task, h, d, entry)
+	before := releaseRow(t, s, task, first.ID)
+	var receipts int
+	if err := s.db.QueryRow(`SELECT count(*) FROM release_action_receipts WHERE task_id=?`, task.ID).Scan(&receipts); err != nil {
+		t.Fatal(err)
+	}
+	second, err := s.ReleaseAction(ctx, task.ID, retryRequest("retry", h, entry, first))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second.ID == first.ID || !strings.HasPrefix(second.ID, "rel_") || second.State != "verified" || second.Generation != 1 || second.EntryID != entry || second.ItemID != first.ItemID || second.ItemRevision != first.ItemRevision || second.Commit != first.Commit || second.BaseCommit != first.BaseCommit || second.VerificationDigest != first.VerificationDigest || second.PauseGeneration != first.PauseGeneration || second.AgentID != "" || second.Receipt != nil || len(second.Reconciliations) != 0 {
+		t.Fatalf("new job %+v", second)
+	}
+	link := second.RetryOf
+	if link == nil || link.JobID != first.ID || link.Generation != first.Generation || link.State != "refused" || link.Reason == "" || link.AgentID != h.ID || link.RunID != h.RunID || link.Attempt != 2 || link.CreatedAt == "" || len(link.Restored) != 0 {
+		t.Fatalf("link %+v", link)
+	}
+	if after := releaseRow(t, s, task, first.ID); after != before {
+		t.Fatalf("refused job changed\nbefore %s\nafter  %s", before, after)
+	}
+	var after int
+	if err = s.db.QueryRow(`SELECT count(*) FROM release_action_receipts WHERE task_id=?`, task.ID).Scan(&after); err != nil || after != receipts+1 {
+		t.Fatal("request receipts", receipts, after, err)
+	}
+	jobs, err := s.Releases(ctx, task.ID)
+	if err != nil || len(jobs) != 2 || jobs[0].ID != first.ID || jobs[0].State != "refused" || jobs[0].RetryOf != nil || jobs[1].ID != second.ID {
+		t.Fatal("history", jobs, err)
+	}
+	queued, err := s.GetTeamQueueEntry(ctx, task.ID, entry)
+	if err != nil || queued.Release == nil || queued.Release.ID != second.ID {
+		t.Fatalf("entry release %+v %v", queued.Release, err)
+	}
+	claimed, err := s.ReleaseAction(ctx, task.ID, api.ReleaseRequest{RequestID: "second-claim", Operation: "claim", AgentID: d.ID, RunID: d.RunID, JobID: second.ID, ExpectedGeneration: second.Generation})
+	if err != nil || claimed.State != "claimed" || claimed.RetryOf == nil || claimed.RetryOf.JobID != first.ID {
+		t.Fatalf("claim %+v %v", claimed, err)
+	}
+	refusedAgain, err := s.ReleaseAction(ctx, task.ID, api.ReleaseRequest{RequestID: "second-refuse", Operation: "refuse", AgentID: d.ID, RunID: d.RunID, JobID: second.ID, ExpectedGeneration: claimed.Generation})
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondRow := releaseRow(t, s, task, second.ID)
+	third, err := s.ReleaseAction(ctx, task.ID, retryRequest("retry-again", h, entry, refusedAgain))
+	if err != nil || third.RetryOf == nil || third.RetryOf.JobID != second.ID || third.RetryOf.Attempt != 3 {
+		t.Fatalf("third %+v %v", third, err)
+	}
+	if releaseRow(t, s, task, first.ID) != before || releaseRow(t, s, task, second.ID) != secondRow {
+		t.Fatal("an earlier job changed on the second retry")
+	}
+	if jobs, err = s.Releases(ctx, task.ID); err != nil || len(jobs) != 3 || jobs[0].ID != first.ID || jobs[1].ID != second.ID || jobs[2].ID != third.ID {
+		t.Fatal("history after second retry", jobs, err)
+	}
+}
+
+// a3 (r4): a job the handler refused by reconcile with a receipt and a
+// restored journal is retried only when the retry names the restored release
+// on exactly the receipt's targets.
+func TestReleaseRetryNeedsRestorationForEveryTarget(t *testing.T) {
+	s, task, h, d, entry := releaseFixture(t)
+	ctx := context.Background()
+	first := failedReceiptJob(t, s, task, h, d, entry, "restored", restoredTargets())
+	before := releaseRow(t, s, task, first.ID)
+	tailos := api.ReleaseRestoredTarget{Target: "tailos", Release: "fixture-old"}
+	mini := api.ReleaseRestoredTarget{Target: "mini", Release: "fixture-old"}
+	for name, c := range map[string]struct {
+		restored []api.ReleaseRestoredTarget
+		want     error
+		text     string
+	}{
+		"none named":      {nil, api.ErrConflict, "has a receipt for target mini"},
+		"one missing":     {[]api.ReleaseRestoredTarget{mini}, api.ErrConflict, "has a receipt for target tailos"},
+		"extra target":    {[]api.ReleaseRestoredTarget{tailos, mini, {Target: "hub", Release: "fixture-old"}}, api.ErrConflict, "has no receipt for target hub"},
+		"unknown target":  {[]api.ReleaseRestoredTarget{tailos, {Target: "nas", Release: "x"}}, api.ErrInvalid, ""},
+		"duplicate":       {[]api.ReleaseRestoredTarget{tailos, tailos}, api.ErrInvalid, ""},
+		"no release name": {[]api.ReleaseRestoredTarget{tailos, {Target: "mini"}}, api.ErrInvalid, ""},
+		"newline in name": {[]api.ReleaseRestoredTarget{tailos, {Target: "mini", Release: "a\nb"}}, api.ErrInvalid, ""},
+	} {
+		_, err := s.ReleaseAction(ctx, task.ID, retryRequest("refused-"+strings.ReplaceAll(name, " ", "-"), h, entry, first, c.restored...))
+		if !errors.Is(err, c.want) || !strings.Contains(err.Error(), c.text) || (c.text != "" && !strings.Contains(err.Error(), first.ID)) {
+			t.Fatalf("%s: %v", name, err)
+		}
+	}
+	noReason := retryRequest("no-reason", h, entry, first, tailos, mini)
+	noReason.Retry.Reason = ""
+	if _, err := s.ReleaseAction(ctx, task.ID, noReason); !errors.Is(err, api.ErrInvalid) {
+		t.Fatal("retry without a reason", err)
+	}
+	if jobs, err := s.Releases(ctx, task.ID); err != nil || len(jobs) != 1 {
+		t.Fatal("a refused retry added a job", jobs, err)
+	}
+	second, err := s.ReleaseAction(ctx, task.ID, retryRequest("retry", h, entry, first, tailos, mini))
+	if err != nil || second.State != "verified" || second.RetryOf == nil || second.RetryOf.JobID != first.ID || second.Receipt != nil || second.Published {
+		t.Fatalf("%+v %v", second, err)
+	}
+	// Saved in the fixed target order, whatever order the request used.
+	if got := second.RetryOf.Restored; len(got) != 2 || got[0] != mini || got[1] != tailos {
+		t.Fatalf("restored %+v", got)
+	}
+	if releaseRow(t, s, task, first.ID) != before {
+		t.Fatal("refused job changed")
+	}
+	// A job with no receipt has no target a restoration could be checked on.
+	s2, task2, h2, d2, entry2 := releaseFixture(t)
+	plain := refusedJob(t, s2, task2, h2, d2, entry2)
+	if _, err = s2.ReleaseAction(ctx, task2.ID, retryRequest("unreceipted", h2, entry2, plain, tailos)); !errors.Is(err, api.ErrConflict) || !strings.Contains(err.Error(), "has no receipt for target tailos") {
+		t.Fatal("restoration named for an unreceipted job", err)
+	}
+}
+
+// The effects classification retry and supersede share.
+func TestReleaseEffectsClassification(t *testing.T) {
+	refuse := func(journal string, resolved bool) []api.ReleaseReconciliation {
+		return []api.ReleaseReconciliation{{Disposition: "requeue", JournalState: "no_effects", RefResolved: true}, {Disposition: "refuse", JournalState: journal, RefResolved: resolved}}
+	}
+	receipt := func(targets ...api.ReleaseTargetReceipt) *api.ReleaseReceipt {
+		return &api.ReleaseReceipt{Outcome: "blocked", Targets: targets}
+	}
+	for name, c := range map[string]struct {
+		j      api.ReleaseJob
+		kind   string
+		detail string
+	}{
+		"refused before publication":       {api.ReleaseJob{State: "refused"}, "none", ""},
+		"requeued then refused":            {api.ReleaseJob{State: "refused", Reconciliations: refuse("no_effects", true)[:1]}, "none", ""},
+		"rolled back":                      {api.ReleaseJob{State: "rolled_back", Published: true, Receipt: &api.ReleaseReceipt{Outcome: "rolled_back", Targets: restoredTargets()[1:]}}, "restored", ""},
+		"published, journal restored":      {api.ReleaseJob{State: "refused", Published: true, Reconciliations: refuse("restored", true)}, "restored", ""},
+		"receipt, journal restored":        {api.ReleaseJob{State: "refused", Published: true, Receipt: receipt(unrestoredTargets()...), Reconciliations: refuse("restored", true)}, "restored", ""},
+		"failed targets, no effects":       {api.ReleaseJob{State: "refused", Published: true, Receipt: receipt(unrestoredTargets()[:1]...), Reconciliations: refuse("no_effects", true)}, "restored", ""},
+		"released target, no effects":      {api.ReleaseJob{State: "refused", Published: true, Receipt: receipt(unrestoredTargets()...), Reconciliations: refuse("no_effects", true)}, "unrestored", "target tailos is released"},
+		"blocked rollback, no effects":     {api.ReleaseJob{State: "refused", Published: true, Receipt: receipt(api.ReleaseTargetReceipt{Target: "hub", Outcome: "failed", Rollback: "blocked"}), Reconciliations: refuse("no_effects", true)}, "unrestored", "target hub rollback is blocked"},
+		"restored but ref unresolved":      {api.ReleaseJob{State: "refused", Published: true, Reconciliations: refuse("restored", false)}, "unrestored", "published"},
+		"published, no reconciliation":     {api.ReleaseJob{State: "refused", Published: true}, "unrestored", "published"},
+		"published, last is a requeue":     {api.ReleaseJob{State: "refused", Published: true, Reconciliations: refuse("restored", true)[:1]}, "unrestored", "published"},
+		"receipt, no reconciliation":       {api.ReleaseJob{State: "refused", Receipt: receipt(unrestoredTargets()[:1]...)}, "unrestored", "receipt outcome blocked"},
+		"released target, unknown journal": {api.ReleaseJob{State: "refused", Receipt: receipt(unrestoredTargets()...), Reconciliations: refuse("unknown", true)}, "unrestored", "target tailos is released"},
+	} {
+		if kind, detail := releaseEffects(c.j); kind != c.kind || !strings.Contains(detail, c.detail) || (c.detail == "" && detail != "") {
+			t.Fatalf("%s: %s %q", name, kind, detail)
+		}
+	}
+}
+
+// a4 (r2, j2): a retry is refused, naming the job and the reason, for a job
+// with effects that are not restored, a job that is still held, and a job
+// that released or was superseded. Nothing is added to the ledger.
+func TestReleaseRetryRefusesEffectsAndHeldJobs(t *testing.T) {
+	ctx := context.Background()
+	refused := func(t *testing.T, s *Store, task api.Task, h api.Agent, entry string, j api.ReleaseJob, want string, restored ...api.ReleaseRestoredTarget) {
+		t.Helper()
+		before := releaseRow(t, s, task, j.ID)
+		_, err := s.ReleaseAction(ctx, task.ID, retryRequest("retry", h, entry, j, restored...))
+		if !errors.Is(err, api.ErrConflict) || !strings.Contains(err.Error(), j.ID) || !strings.Contains(err.Error(), want) {
+			t.Fatalf("want %q naming %s, got %v", want, j.ID, err)
+		}
+		if jobs, err := s.Releases(ctx, task.ID); err != nil || len(jobs) != 1 || releaseRow(t, s, task, j.ID) != before {
+			t.Fatal("refused retry changed the ledger", jobs, err)
+		}
+	}
+	both := []api.ReleaseRestoredTarget{{Target: "tailos", Release: "fixture-old"}, {Target: "mini", Release: "fixture-old"}}
+	t.Run("released target", func(t *testing.T) {
+		s, task, h, d, entry := releaseFixture(t)
+		j := failedReceiptJob(t, s, task, h, d, entry, "no_effects", unrestoredTargets())
+		refused(t, s, task, h, entry, j, "has release effects that are not restored (target tailos is released); roll back, reconcile, or supersede with a hand release", both...)
+	})
+	t.Run("blocked rollback", func(t *testing.T) {
+		s, task, h, d, entry := releaseFixture(t)
+		targets := restoredTargets()
+		targets[1].Outcome, targets[1].Rollback = "failed", "blocked"
+		j := failedReceiptJob(t, s, task, h, d, entry, "no_effects", targets)
+		refused(t, s, task, h, entry, j, "has release effects that are not restored (target mini rollback is blocked)", both...)
+	})
+	step := func(t *testing.T, s *Store, task api.Task, d api.Agent, j api.ReleaseJob, ops ...string) api.ReleaseJob {
+		t.Helper()
+		for _, op := range ops {
+			req := api.ReleaseRequest{RequestID: "held-" + op, Operation: op, AgentID: d.ID, RunID: d.RunID, JobID: j.ID, ExpectedGeneration: j.Generation}
+			if op == "merged" {
+				req.IntegratedCommit = j.Commit
+			}
+			if op == "finish" {
+				req.Receipt = &api.ReleaseReceipt{Version: 1, JobID: j.ID, Commit: j.Commit, VerificationDigest: j.VerificationDigest, Outcome: "released", Targets: []api.ReleaseTargetReceipt{{Target: "tailos", Release: "fixture", ArtifactSHA256: strings.Repeat("a", 64), Outcome: "released"}}}
+			}
+			var err error
+			if j, err = s.ReleaseAction(ctx, task.ID, req); err != nil {
+				t.Fatal(op, err)
+			}
+		}
+		return j
+	}
+	for name, c := range map[string]struct {
+		ops  []string
+		want string
+	}{
+		"verified": {nil, "is verified; reconcile it first"},
+		"claimed":  {[]string{"claim"}, "is claimed; reconcile it first"},
+		"merged":   {[]string{"claim", "merged"}, "is merged; reconcile it first"},
+		"blocked":  {[]string{"claim", "block"}, "is blocked; reconcile it first"},
+		"released": {[]string{"claim", "merged", "finish"}, "already released"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			s, task, h, d, entry := releaseFixture(t)
+			j, err := s.ReleaseAction(ctx, task.ID, api.ReleaseRequest{RequestID: "first-enqueue", Operation: "enqueue", AgentID: h.ID, RunID: h.RunID, EntryID: entry})
+			if err != nil {
+				t.Fatal(err)
+			}
+			j = step(t, s, task, d, j, c.ops...)
+			var restored []api.ReleaseRestoredTarget
+			if j.Receipt != nil {
+				restored = both[:1]
+			}
+			refused(t, s, task, h, entry, j, c.want, restored...)
+		})
+	}
+	t.Run("superseded", func(t *testing.T) {
+		s, task, h, d, entry := releaseFixture(t)
+		j := refusedJob(t, s, task, h, d, entry)
+		hand := recordHandRelease(t, s, task, "hand", candidateB, []string{candidateB})
+		j, err := s.ReleaseAction(ctx, task.ID, api.ReleaseRequest{RequestID: "supersede", Operation: "supersede", AgentID: h.ID, RunID: h.RunID, JobID: j.ID, ExpectedGeneration: j.Generation, Supersession: &api.ReleaseSupersession{ReleasedCommit: candidateB, HandReleaseID: hand.ID}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		refused(t, s, task, h, entry, j, "already released (superseded by a hand release)")
+	})
+}
+
+// a5 (r1, j1): the retry re-checks the candidate and the project pause
+// generation; a new verification, another accepted commit or a pause since
+// the refused job each refuse it by name.
+func TestReleaseRetryRequiresUnchangedCandidate(t *testing.T) {
+	ctx := context.Background()
+	for name, c := range map[string]struct {
+		change func(t *testing.T, s *Store, task api.Task, entry string, j api.ReleaseJob)
+		want   string
+	}{
+		"new verification": {func(t *testing.T, s *Store, task api.Task, entry string, j api.ReleaseJob) {
+			item, err := s.GetWorkItem(ctx, task.ID, j.ItemID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			seedPassingVerification(t, s, item, candidateB)
+		}, "candidate changed since "},
+		"new accepted commit": {func(t *testing.T, s *Store, task api.Task, entry string, j api.ReleaseJob) {
+			raw, _ := json.Marshal(api.TeamIntegrationAcceptance{Repository: "fixture", BaseCommit: candidateA, Commit: candidateC, ItemRevision: j.ItemRevision})
+			if _, err := s.db.Exec(`UPDATE team_queue_entries SET acceptance_json=? WHERE id=?`, string(raw), entry); err != nil {
+				t.Fatal(err)
+			}
+		}, "candidate changed since "},
+		"item reopened": {func(t *testing.T, s *Store, task api.Task, entry string, j api.ReleaseJob) {
+			if _, err := s.db.Exec(`UPDATE work_items SET status='open' WHERE id=?`, j.ItemID); err != nil {
+				t.Fatal(err)
+			}
+		}, "candidate changed since "},
+		"pause generation": {func(t *testing.T, s *Store, task api.Task, entry string, j api.ReleaseJob) {
+			if _, err := s.db.Exec(`UPDATE tasks SET pause_generation=pause_generation+1 WHERE id=?`, task.ID); err != nil {
+				t.Fatal(err)
+			}
+		}, "project generation changed since "},
+	} {
+		t.Run(name, func(t *testing.T) {
+			s, task, h, d, entry := releaseFixture(t)
+			j := refusedJob(t, s, task, h, d, entry)
+			c.change(t, s, task, entry, j)
+			_, err := s.ReleaseAction(ctx, task.ID, retryRequest("retry", h, entry, j))
+			if !errors.Is(err, api.ErrConflict) || !strings.Contains(err.Error(), c.want+j.ID) {
+				t.Fatalf("want %q, got %v", c.want+j.ID, err)
+			}
+			if jobs, err := s.Releases(ctx, task.ID); err != nil || len(jobs) != 1 {
+				t.Fatal("refused retry added a job", jobs, err)
+			}
+		})
+	}
+}
+
+// a6 (r4): only the handler retries; the same request replays the same job,
+// a changed one is refused, and a retry of a job that is no longer the
+// entry's latest names the newer job.
+func TestReleaseRetryIsHandlerOnlyAndIdempotent(t *testing.T) {
+	s, task, h, d, entry := releaseFixture(t)
+	ctx := context.Background()
+	by := api.Caller{Node: "fixture", User: "owner"}
+	first := refusedJob(t, s, task, h, d, entry)
+	member, err := s.AddAgent(ctx, task.ID, api.AddAgentRequest{AgentID: api.NewID("agt"), Name: "builder", Host: "fixture", Session: "builder"}, by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, a := range map[string]api.Agent{"deployer": d, "member": member, "stale handler run": {ID: h.ID, RunID: api.NewID("run")}} {
+		if _, err = s.ReleaseAction(ctx, task.ID, retryRequest("by-"+strings.ReplaceAll(name, " ", "-"), a, entry, first)); !errors.Is(err, api.ErrConflict) {
+			t.Fatalf("%s retried: %v", name, err)
+		}
+	}
+	// A request with no agent identity (the owner's shell) is refused too.
+	if _, err = s.ReleaseAction(ctx, task.ID, retryRequest("by-owner", api.Agent{}, entry, first)); err == nil {
+		t.Fatal("a request without an agent identity retried")
+	}
+	wrongGeneration := retryRequest("wrong-generation", h, entry, first)
+	wrongGeneration.ExpectedGeneration++
+	if _, err = s.ReleaseAction(ctx, task.ID, wrongGeneration); !errors.Is(err, api.ErrConflict) || !strings.Contains(err.Error(), "generation changed") {
+		t.Fatal("wrong generation", err)
+	}
+	other := releaseEntry(t, s, task, "another entry", "other")
+	if _, err = s.ReleaseAction(ctx, task.ID, retryRequest("wrong-entry", h, other, first)); !errors.Is(err, api.ErrConflict) || !strings.Contains(err.Error(), "belongs to another entry") {
+		t.Fatal("wrong entry", err)
+	}
+	unknown := retryRequest("unknown-job", h, entry, first)
+	unknown.JobID = api.NewID("rel")
+	if _, err = s.ReleaseAction(ctx, task.ID, unknown); !errors.Is(err, api.ErrNotFound) {
+		t.Fatal("unknown job", err)
+	}
+	if jobs, err := s.Releases(ctx, task.ID); err != nil || len(jobs) != 1 {
+		t.Fatal("a refused retry added a job", jobs, err)
+	}
+	req := retryRequest("retry", h, entry, first)
+	second, err := s.ReleaseAction(ctx, task.ID, req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	again, err := s.ReleaseAction(ctx, task.ID, req)
+	if err != nil || again.ID != second.ID || again.RetryOf == nil || again.RetryOf.CreatedAt != second.RetryOf.CreatedAt {
+		t.Fatal("replay", again, err)
+	}
+	changed := retryRequest("retry", h, entry, first)
+	changed.Retry.Reason = "A different reason"
+	if _, err = s.ReleaseAction(ctx, task.ID, changed); !errors.Is(err, api.ErrConflict) || !strings.Contains(err.Error(), "retry changed") {
+		t.Fatal("changed replay", err)
+	}
+	_, err = s.ReleaseAction(ctx, task.ID, retryRequest("second-retry", h, entry, first))
+	if !errors.Is(err, api.ErrConflict) || !strings.Contains(err.Error(), "entry's latest release job is "+second.ID+" (verified)") {
+		t.Fatal("second retry of the same refused job", err)
+	}
+	if jobs, err := s.Releases(ctx, task.ID); err != nil || len(jobs) != 2 {
+		t.Fatal("job count", jobs, err)
+	}
+}
+
+// a7 (r5): enqueue on an entry that already has a job names it; for a refused
+// job it gives the retry command with the job's generation.
+func TestReleaseEnqueueNamesRefusedJobAndRetry(t *testing.T) {
+	s, task, h, d, entry := releaseFixture(t)
+	ctx := context.Background()
+	enqueue := func(key string) error {
+		_, err := s.ReleaseAction(ctx, task.ID, api.ReleaseRequest{RequestID: key, Operation: "enqueue", AgentID: h.ID, RunID: h.RunID, EntryID: entry})
+		return err
+	}
+	if err := enqueue("first-enqueue"); err != nil {
+		t.Fatal(err)
+	}
+	jobs, err := s.Releases(ctx, task.ID)
+	if err != nil || len(jobs) != 1 {
+		t.Fatal(jobs, err)
+	}
+	if err = enqueue("again-verified"); !errors.Is(err, api.ErrConflict) || !strings.Contains(err.Error(), "entry already has release job "+jobs[0].ID+" (verified); recover the original request receipt") || strings.Contains(err.Error(), "tt deployment retry") {
+		t.Fatal("enqueue over a verified job", err)
+	}
+	j := jobs[0]
+	for _, op := range []string{"claim", "refuse"} {
+		if j, err = s.ReleaseAction(ctx, task.ID, api.ReleaseRequest{RequestID: "first-" + op, Operation: op, AgentID: d.ID, RunID: d.RunID, JobID: j.ID, ExpectedGeneration: j.Generation}); err != nil {
+			t.Fatal(op, err)
+		}
+	}
+	want := fmt.Sprintf("entry already has release job %s (refused); retry it with tt deployment retry --entry %s --job %s --generation %d --reason TEXT", j.ID, entry, j.ID, j.Generation)
+	if err = enqueue("again-refused"); !errors.Is(err, api.ErrConflict) || !strings.Contains(err.Error(), want) {
+		t.Fatalf("enqueue over a refused job: %v", err)
+	}
+	second, err := s.ReleaseAction(ctx, task.ID, retryRequest("retry", h, entry, j))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = enqueue("again-retried"); !errors.Is(err, api.ErrConflict) || !strings.Contains(err.Error(), "entry already has release job "+second.ID+" (verified)") {
+		t.Fatal("enqueue names the entry's latest job", err)
+	}
+}
+
+// a8/a9 (r6): a refused job whose receipt shows a failed deploy that was
+// restored is superseded by a covering hand release; its receipt and
+// reconciliation stay, and the supersession carries the record's targets and
+// time for the target baselines. Without a covering record, or with effects
+// that are not restored, it is refused by name. A rolled-back job is
+// supersedable the same way.
+func TestSupersedeRefusedJobWithFailedReceipt(t *testing.T) {
+	ctx := context.Background()
+	supersede := func(s *Store, task api.Task, h api.Agent, j api.ReleaseJob, key, released, record string) (api.ReleaseJob, error) {
+		return s.ReleaseAction(ctx, task.ID, api.ReleaseRequest{RequestID: key, Operation: "supersede", AgentID: h.ID, RunID: h.RunID, JobID: j.ID, ExpectedGeneration: j.Generation, Supersession: &api.ReleaseSupersession{ReleasedCommit: released, HandReleaseID: record}})
+	}
+	t.Run("restored", func(t *testing.T) {
+		s, task, h, d, entry := releaseFixture(t)
+		j := failedReceiptJob(t, s, task, h, d, entry, "restored", restoredTargets())
+		before := releaseRow(t, s, task, j.ID)
+		if _, err := supersede(s, task, h, j, "unknown", candidateC, "hrl_0123456789abcdef"); !errors.Is(err, api.ErrConflict) || !strings.Contains(err.Error(), "recorded hand release required") {
+			t.Fatal("no record", err)
+		}
+		uncovering := recordHandRelease(t, s, task, "uncovering", candidateC, []string{candidateA})
+		if _, err := supersede(s, task, h, j, "uncovered", candidateC, uncovering.ID); !errors.Is(err, api.ErrConflict) || !strings.Contains(err.Error(), "hand release does not cover the job's commit") {
+			t.Fatal("uncovering record", err)
+		}
+		if releaseRow(t, s, task, j.ID) != before {
+			t.Fatal("refused supersede changed the job")
+		}
+		hand := recordHandRelease(t, s, task, "hand", candidateC, []string{j.Commit})
+		done, err := supersede(s, task, h, j, "supersede", candidateC, hand.ID)
+		if err != nil || done.State != "superseded" || done.Supersession == nil || done.Supersession.HandReleaseID != hand.ID || strings.Join(done.Supersession.Targets, ",") != "hub" || done.SettledAt != hand.CreatedAt || !done.Published {
+			t.Fatalf("%+v %v", done, err)
+		}
+		was, _ := json.Marshal(j.Receipt)
+		kept, _ := json.Marshal(done.Receipt)
+		if done.Receipt == nil || string(was) != string(kept) || len(done.Reconciliations) != 1 || done.Reconciliations[0] != j.Reconciliations[0] {
+			t.Fatalf("history changed: receipt %s reconciliations %+v", kept, done.Reconciliations)
+		}
+	})
+	t.Run("unrestored", func(t *testing.T) {
+		s, task, h, d, entry := releaseFixture(t)
+		j := failedReceiptJob(t, s, task, h, d, entry, "no_effects", unrestoredTargets())
+		before := releaseRow(t, s, task, j.ID)
+		hand := recordHandRelease(t, s, task, "hand", candidateC, []string{j.Commit})
+		_, err := supersede(s, task, h, j, "supersede", candidateC, hand.ID)
+		if !errors.Is(err, api.ErrConflict) || !strings.Contains(err.Error(), "job "+j.ID+" has release effects that are not restored (target tailos is released)") {
+			t.Fatal("unrestored job superseded", err)
+		}
+		if releaseRow(t, s, task, j.ID) != before {
+			t.Fatal("refused supersede changed the job")
+		}
+	})
+	t.Run("rolled back", func(t *testing.T) {
+		s, task, h, d, entry := releaseFixture(t)
+		j, err := s.ReleaseAction(ctx, task.ID, api.ReleaseRequest{RequestID: "enqueue", Operation: "enqueue", AgentID: h.ID, RunID: h.RunID, EntryID: entry})
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, op := range []string{"claim", "merged", "finish"} {
+			req := api.ReleaseRequest{RequestID: op, Operation: op, AgentID: d.ID, RunID: d.RunID, JobID: j.ID, ExpectedGeneration: j.Generation, IntegratedCommit: j.Commit}
+			if op == "finish" {
+				req.IntegratedCommit = ""
+				req.Receipt = &api.ReleaseReceipt{Version: 1, JobID: j.ID, Commit: j.Commit, VerificationDigest: j.VerificationDigest, Outcome: "rolled_back", Targets: restoredTargets()[1:]}
+			}
+			if j, err = s.ReleaseAction(ctx, task.ID, req); err != nil {
+				t.Fatal(op, err)
+			}
+		}
+		hand := recordHandRelease(t, s, task, "hand", candidateC, []string{j.Commit})
+		done, err := supersede(s, task, h, j, "supersede", candidateC, hand.ID)
+		if err != nil || done.State != "superseded" || done.Receipt == nil || done.Receipt.Outcome != "rolled_back" || done.SettledAt != hand.CreatedAt {
+			t.Fatalf("%+v %v", done, err)
+		}
+	})
+}
+
+const releaseJobsSchemaBeforeRetry = `CREATE TABLE release_jobs (
+ task_id TEXT NOT NULL REFERENCES tasks(id),id TEXT NOT NULL,entry_id TEXT NOT NULL,
+ state TEXT NOT NULL,generation INTEGER NOT NULL,record_json TEXT NOT NULL,
+ PRIMARY KEY(task_id,id),UNIQUE(task_id,entry_id));
+ CREATE UNIQUE INDEX release_project_fence ON release_jobs(task_id) WHERE state IN ('claimed','merged','blocked');`
+
+// a12: a database from before a retry could add a job opens with every job
+// row, its order and the one-holder fence kept, then accepts a second job for
+// one entry; opening it again changes nothing.
+func TestReleaseJobsMigrationAllowsSeveralJobsPerEntry(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "hub.sqlite")
+	s, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	task, err := s.CreateTask(ctx, api.CreateTaskRequest{Name: "old ledger"}, api.Caller{Node: "fixture", User: "owner"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The table as shipped before, with rows whose rowids are out of
+	// insertion order and have gaps, as set-aside leaves them.
+	if _, err = s.db.Exec(`DROP TABLE release_jobs;` + releaseJobsSchemaBeforeRetry); err != nil {
+		t.Fatal(err)
+	}
+	entries := []string{api.NewID("tqe"), api.NewID("tqe"), api.NewID("tqe")}
+	for i, row := range []struct {
+		rowid int64
+		state string
+	}{{7, "refused"}, {2, "claimed"}, {11, "verified"}} {
+		j := api.ReleaseJob{ID: api.NewID("rel"), TaskID: task.ID, EntryID: entries[i], Commit: candidateB, State: row.state, Generation: int64(i + 3)}
+		raw, _ := json.Marshal(j)
+		if _, err = s.db.Exec(`INSERT INTO release_jobs(rowid,task_id,id,entry_id,state,generation,record_json) VALUES(?,?,?,?,?,?,?)`, row.rowid, task.ID, j.ID, j.EntryID, j.State, j.Generation, string(raw)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err = s.db.Exec(`INSERT INTO release_jobs VALUES(?,?,?,'verified',1,'{}')`, task.ID, api.NewID("rel"), entries[0]); err == nil {
+		t.Fatal("the old table accepted a second job for one entry")
+	}
+	dump := func(s *Store) string {
+		t.Helper()
+		rows, err := s.db.Query(`SELECT rowid,task_id,id,entry_id,state,generation,record_json FROM release_jobs ORDER BY rowid`)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer rows.Close()
+		var out []string
+		for rows.Next() {
+			var rowid, generation int64
+			var taskID, id, entry, state, raw string
+			if err = rows.Scan(&rowid, &taskID, &id, &entry, &state, &generation, &raw); err != nil {
+				t.Fatal(err)
+			}
+			out = append(out, fmt.Sprintf("%d|%s|%s|%s|%s|%d|%s", rowid, taskID, id, entry, state, generation, raw))
+		}
+		if err = rows.Err(); err != nil {
+			t.Fatal(err)
+		}
+		return strings.Join(out, "\n")
+	}
+	shape := func(s *Store) string {
+		t.Helper()
+		rows, err := s.db.Query(`SELECT type||' '||name||' '||coalesce(sql,'') FROM sqlite_master WHERE tbl_name LIKE 'release_jobs%' ORDER BY name`)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer rows.Close()
+		var out []string
+		for rows.Next() {
+			var line string
+			if err = rows.Scan(&line); err != nil {
+				t.Fatal(err)
+			}
+			out = append(out, line)
+		}
+		return strings.Join(out, "\n")
+	}
+	before := dump(s)
+	if strings.Count(before, "\n") != 2 {
+		t.Fatal(before)
+	}
+	if err = s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if s, err = Open(path); err != nil {
+		t.Fatal(err)
+	}
+	if after := dump(s); after != before {
+		t.Fatalf("rows changed\nbefore\n%s\nafter\n%s", before, after)
+	}
+	// The rebuild holds its temporary storage in memory and then restores
+	// the connection's setting.
+	var tempStore int
+	if err = s.db.QueryRow(`PRAGMA temp_store`).Scan(&tempStore); err != nil || tempStore != 0 {
+		t.Fatal("temp_store after the rebuild", tempStore, err)
+	}
+	migrated := shape(s)
+	if strings.Contains(migrated, "UNIQUE(task_id,entry_id)") || strings.Contains(migrated, "release_jobs_v2") || !strings.Contains(migrated, "index release_project_fence") || !strings.Contains(migrated, "index release_jobs_entry") {
+		t.Fatal(migrated)
+	}
+	jobs, err := s.Releases(ctx, task.ID)
+	if err != nil || len(jobs) != 3 || jobs[0].State != "claimed" || jobs[1].State != "refused" || jobs[2].State != "verified" {
+		t.Fatal("list order", jobs, err)
+	}
+	if err = s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if s, err = Open(path); err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	if dump(s) != before || shape(s) != migrated {
+		t.Fatal("a second open changed the ledger")
+	}
+	second := api.NewID("rel")
+	if _, err = s.db.Exec(`INSERT INTO release_jobs VALUES(?,?,?,'verified',1,'{}')`, task.ID, second, entries[0]); err != nil {
+		t.Fatal("second job for one entry", err)
+	}
+	var rowid int64
+	if err = s.db.QueryRow(`SELECT rowid FROM release_jobs WHERE id=?`, second).Scan(&rowid); err != nil || rowid != 12 {
+		t.Fatal("a new job must queue behind every row", rowid, err)
+	}
+	if _, err = s.db.Exec(`UPDATE release_jobs SET state='claimed' WHERE id=?`, second); err == nil || !strings.Contains(err.Error(), "UNIQUE") {
+		t.Fatal("the fence allowed a second holder", err)
 	}
 }

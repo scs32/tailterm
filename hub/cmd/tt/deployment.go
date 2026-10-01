@@ -19,7 +19,7 @@ func deploymentBriefing() string {
 }
 func cmdDeployment(e env, args []string) error {
 	if len(args) == 0 {
-		return errors.New("usage: tt deployment setup|list|handler|enqueue|claim|check|verification|merged|finish|block|inputs|reconcile|set-aside|refuse|supersede|hand-release|hand-releases")
+		return errors.New("usage: tt deployment setup|list|handler|enqueue|claim|check|verification|merged|finish|block|inputs|reconcile|set-aside|refuse|supersede|retry|hand-release|hand-releases")
 	}
 	if args[0] == "hand-release" || args[0] == "hand-releases" {
 		return cmdHandRelease(e, args)
@@ -42,7 +42,7 @@ func cmdDeployment(e env, args []string) error {
 		return deploymentSetup(e, args[1:])
 	}
 	fs := flag.NewFlagSet("deployment "+args[0], flag.ContinueOnError)
-	entry := fs.String("entry", "", "accepted queue entry (handler enqueue)")
+	entry := fs.String("entry", "", "accepted queue entry (handler enqueue, retry)")
 	job := fs.String("job", "", "saved release job")
 	key := fs.String("request-id", "", "stable retry identity")
 	generation := fs.Int64("generation", 0, "expected job generation")
@@ -53,8 +53,19 @@ func cmdDeployment(e env, args []string) error {
 	releaseName := fs.String("release", "", "optional release name; must equal the hand release record's (supersede)")
 	handRelease := fs.String("hand-release", "", "recorded hand release ID from tt deployment hand-release (supersede)")
 	repo := fs.String("repo", ".", "repository whose tasks-hub must contain the hand release (supersede)")
+	reason := fs.String("reason", "", "why a new job is expected to pass (retry)")
+	var restored stringListFlag
+	fs.Var(&restored, "restored", "TARGET=RELEASE the refused job's target runs again; one per target in its receipt (retry, repeatable)")
 	if err := fs.Parse(args[1:]); err != nil {
 		return err
+	}
+	var retry *api.ReleaseRetry
+	if args[0] == "retry" {
+		// Checked before any hub call, like supersede's coverage.
+		var err error
+		if retry, err = deploymentRetry(*entry, *job, *reason, restored); err != nil {
+			return err
+		}
 	}
 	c, err := e.client(20 * time.Second)
 	if err != nil {
@@ -80,7 +91,7 @@ func cmdDeployment(e env, args []string) error {
 	if *key == "" || e.agent == "" || e.runID == "" {
 		return errors.New("exact agent/run and request-id required")
 	}
-	req := api.ReleaseRequest{RequestID: *key, Operation: args[0], AgentID: e.agent, RunID: e.runID, EntryID: *entry, JobID: *job, ExpectedGeneration: *generation, IntegratedCommit: *commit}
+	req := api.ReleaseRequest{RequestID: *key, Operation: args[0], AgentID: e.agent, RunID: e.runID, EntryID: *entry, JobID: *job, ExpectedGeneration: *generation, IntegratedCommit: *commit, Retry: retry}
 	if args[0] == "supersede" {
 		jobs, err := c.Releases(ctx, e.task)
 		if err != nil {
@@ -147,6 +158,35 @@ func cmdDeployment(e env, args []string) error {
 		printJSON(out)
 	}
 	return err
+}
+
+// deploymentRetry builds the handler's retry of a refused or rolled-back job:
+// a one-line reason, and for each target in that job's receipt the release it
+// runs again. The hub checks the list against the receipt.
+func deploymentRetry(entry, job, reason string, restored []string) (*api.ReleaseRetry, error) {
+	if entry == "" || job == "" {
+		return nil, errors.New("retry needs --entry and --job naming the entry's refused release job")
+	}
+	if strings.TrimSpace(reason) == "" || len(reason) > 512 || strings.ContainsAny(reason, "\x00\n\r") {
+		return nil, errors.New("retry needs --reason: one line, at most 512 characters, saying why a new job is expected to pass")
+	}
+	out := &api.ReleaseRetry{Reason: reason}
+	seen := map[string]bool{}
+	for _, value := range restored {
+		target, release, ok := strings.Cut(value, "=")
+		if !ok || release == "" || len(release) > 512 || strings.ContainsAny(release, "\x00\n\r") {
+			return nil, fmt.Errorf("retry needs --restored as TARGET=RELEASE, got %q", value)
+		}
+		if target != "hub" && target != "bridge" && target != "mini" && target != "tailos" {
+			return nil, fmt.Errorf("retry --restored names unknown target %q: use hub, bridge, mini or tailos", target)
+		}
+		if seen[target] {
+			return nil, fmt.Errorf("retry --restored names target %s twice", target)
+		}
+		seen[target] = true
+		out.Restored = append(out.Restored, api.ReleaseRestoredTarget{Target: target, Release: release})
+	}
+	return out, nil
 }
 
 // Seams for tests: provisioning runs the checkout's own runner, and setup
