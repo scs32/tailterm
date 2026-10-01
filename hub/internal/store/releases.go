@@ -22,7 +22,15 @@ const releasesSchema = `CREATE TABLE IF NOT EXISTS release_jobs (
  task_id TEXT NOT NULL,request_id TEXT NOT NULL,payload_hash TEXT NOT NULL,record_json TEXT NOT NULL,
  PRIMARY KEY(task_id,request_id));
  CREATE TRIGGER IF NOT EXISTS release_receipt_no_update BEFORE UPDATE ON release_action_receipts BEGIN SELECT RAISE(ABORT,'immutable release receipt'); END;
- CREATE TRIGGER IF NOT EXISTS release_receipt_no_delete BEFORE DELETE ON release_action_receipts BEGIN SELECT RAISE(ABORT,'immutable release receipt'); END;`
+ CREATE TRIGGER IF NOT EXISTS release_receipt_no_delete BEFORE DELETE ON release_action_receipts BEGIN SELECT RAISE(ABORT,'immutable release receipt'); END;
+ CREATE TABLE IF NOT EXISTS release_hand_releases (
+ task_id TEXT NOT NULL REFERENCES tasks(id),id TEXT NOT NULL,intervention_seq INTEGER NOT NULL,
+ released_commit TEXT NOT NULL,record_json TEXT NOT NULL,
+ PRIMARY KEY(task_id,id),UNIQUE(task_id,intervention_seq));
+ CREATE TRIGGER IF NOT EXISTS release_hand_release_no_update BEFORE UPDATE ON release_hand_releases BEGIN SELECT RAISE(ABORT,'immutable hand release'); END;
+ CREATE TRIGGER IF NOT EXISTS release_hand_release_no_delete BEFORE DELETE ON release_hand_releases BEGIN SELECT RAISE(ABORT,'immutable hand release'); END;`
+
+var releaseTargetNames = []string{"hub", "bridge", "mini", "tailos"}
 
 func releaseConflict(reason string) error {
 	return fmt.Errorf("%w: release: %s", api.ErrConflict, reason)
@@ -112,6 +120,159 @@ func releaseMatrixApprovals(ctx context.Context, db *sql.DB, task string) ([]api
 		out = append(out, api.ReleaseMatrixApproval{Digest: digest, MessageSeq: seq})
 	}
 	return out, rows.Err()
+}
+
+// handReleaseCommit is a full lowercase 40-hex commit, the form the CLI
+// proves in git before it records or cites a hand release.
+func handReleaseCommit(s string) bool {
+	if len(s) != 40 {
+		return false
+	}
+	for _, c := range s {
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
+			return false
+		}
+	}
+	return true
+}
+func releaseText(s string) bool {
+	return s != "" && len(s) <= 512 && !strings.ContainsAny(s, "\x00\n\r")
+}
+
+// validHandRelease checks the owner-supplied fields and returns the record
+// with its targets in the fixed target order.
+func validHandRelease(h *api.HandRelease) (api.HandRelease, error) {
+	if h == nil || h.InterventionSeq <= 0 || !handReleaseCommit(h.ReleasedCommit) || !releaseText(h.Release) || len(h.Targets) == 0 || len(h.Commits) == 0 || len(h.Commits) > 64 {
+		return api.HandRelease{}, api.ErrInvalid
+	}
+	seen := map[string]bool{}
+	for _, t := range h.Targets {
+		if !slices.Contains(releaseTargetNames, t) || seen[t] {
+			return api.HandRelease{}, api.ErrInvalid
+		}
+		seen[t] = true
+	}
+	out := api.HandRelease{InterventionSeq: h.InterventionSeq, ReleasedCommit: h.ReleasedCommit, Release: h.Release}
+	for _, name := range releaseTargetNames {
+		if seen[name] {
+			out.Targets = append(out.Targets, name)
+		}
+	}
+	commits := map[string]bool{}
+	for _, c := range h.Commits {
+		if !handReleaseCommit(c) || commits[c] {
+			return api.HandRelease{}, api.ErrInvalid
+		}
+		commits[c] = true
+	}
+	out.Commits = append([]string(nil), h.Commits...)
+	return out, nil
+}
+
+// RecordHandRelease stores the owner's immutable record of a hand release.
+// Owner-only means a request without an agent identity, the rule owner
+// interventions use; the hub trusts the owner's commits and targets, which
+// the CLI proves in a local checkout before sending them.
+func (s *Store) RecordHandRelease(ctx context.Context, task string, req api.ReleaseRequest, by api.Caller) (api.HandRelease, error) {
+	zero := api.HandRelease{}
+	if req.AgentID != "" || req.RunID != "" {
+		return zero, releaseConflict("only the owner records a hand release")
+	}
+	if !api.ValidID(task, "tsk") || !validRequestID(req.RequestID) {
+		return zero, api.ErrInvalid
+	}
+	record, err := validHandRelease(req.HandRelease)
+	if err != nil {
+		return zero, err
+	}
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return zero, err
+	}
+	defer tx.Rollback()
+	hash := verificationDigest(req)
+	var prior, raw string
+	err = tx.QueryRowContext(ctx, `SELECT payload_hash,record_json FROM release_action_receipts WHERE task_id=? AND request_id=?`, task, req.RequestID).Scan(&prior, &raw)
+	if err == nil {
+		if hash != prior {
+			return zero, releaseConflict("retry changed")
+		}
+		err = json.Unmarshal([]byte(raw), &zero)
+		return zero, err
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return zero, err
+	}
+	var state string
+	if err = tx.QueryRowContext(ctx, `SELECT status FROM tasks WHERE id=?`, task).Scan(&state); errors.Is(err, sql.ErrNoRows) {
+		return zero, api.ErrNotFound
+	} else if err != nil {
+		return zero, err
+	}
+	if state != api.TaskOpen {
+		return zero, api.ErrClosed
+	}
+	var kind string
+	err = tx.QueryRowContext(ctx, `SELECT kind FROM owner_interventions WHERE task_id=? AND message_seq=?`, task, record.InterventionSeq).Scan(&kind)
+	if errors.Is(err, sql.ErrNoRows) || (err == nil && kind != "release") {
+		return zero, releaseConflict("owner release intervention required")
+	}
+	if err != nil {
+		return zero, err
+	}
+	record.ID = api.NewID("hrl")
+	record.TaskID = task
+	caller := by
+	record.RecordedBy = &caller
+	record.CreatedAt = ts(s.now())
+	b, err := json.Marshal(record)
+	if err != nil {
+		return zero, err
+	}
+	if _, err = tx.ExecContext(ctx, `INSERT INTO release_hand_releases VALUES(?,?,?,?,?)`, task, record.ID, record.InterventionSeq, record.ReleasedCommit, string(b)); err != nil {
+		return zero, releaseConflict("intervention already has a hand release")
+	}
+	if _, err = tx.ExecContext(ctx, `INSERT INTO release_action_receipts VALUES(?,?,?,?)`, task, req.RequestID, hash, string(b)); err != nil {
+		return zero, err
+	}
+	if err = tx.Commit(); err != nil {
+		return zero, err
+	}
+	s.notify(task)
+	return record, nil
+}
+
+// HandReleases lists the project's hand release records in record order.
+func (s *Store) HandReleases(ctx context.Context, task string) ([]api.HandRelease, error) {
+	out := []api.HandRelease{}
+	rows, err := s.db.QueryContext(ctx, `SELECT record_json FROM release_hand_releases WHERE task_id=? ORDER BY rowid`, task)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var raw string
+		var h api.HandRelease
+		if err = rows.Scan(&raw); err != nil {
+			return nil, err
+		}
+		if err = json.Unmarshal([]byte(raw), &h); err != nil {
+			return nil, err
+		}
+		out = append(out, h)
+	}
+	return out, rows.Err()
+}
+func handReleaseLoad(ctx context.Context, q queryRower, task, id string) (api.HandRelease, error) {
+	var h api.HandRelease
+	var raw string
+	err := q.QueryRowContext(ctx, `SELECT record_json FROM release_hand_releases WHERE task_id=? AND id=?`, task, id).Scan(&raw)
+	if err == nil {
+		err = json.Unmarshal([]byte(raw), &h)
+	}
+	return h, err
 }
 func releaseDeployer(ctx context.Context, q queryRower, task, agent, run string) error {
 	var role, status, current, seen string
@@ -251,15 +412,36 @@ func (s *Store) ReleaseAction(ctx context.Context, task string, req api.ReleaseR
 			if err = requireScopeHandler(tx, ctx, task, req.AgentID, req.RunID); err != nil {
 				return zero, err
 			}
-			// Only a job no deployer ever touched: a claimed or reconciled
-			// job has host history that needs reconcile, not supersession.
-			if j.State != "verified" || j.AgentID != "" || j.IntegratedCommit != "" || j.Receipt != nil || len(j.Reconciliations) > 0 {
-				return zero, releaseConflict("only a verified, never-claimed job can be superseded")
+			// Only a job no deployer ever touched, or a terminal refused job
+			// without a receipt: the deployer refuses before publication, but
+			// a handler reconcile may refuse a published (merged or blocked)
+			// job, which the covering hand release then settles. A claimed,
+			// merged or blocked job still holds host history that needs
+			// reconcile, not supersession; so does a job the handler set
+			// aside, which is verified again but carries its reconciliation.
+			untouched := j.State == "verified" && j.AgentID == "" && j.IntegratedCommit == "" && len(j.Reconciliations) == 0
+			if (!untouched && j.State != "refused") || j.Receipt != nil {
+				return zero, releaseConflict("only a verified never-claimed job or a refused unreceipted job can be superseded")
 			}
-			if req.Supersession == nil || !validGitCommit(req.Supersession.ReleasedCommit) || req.Supersession.Release == "" || len(req.Supersession.Release) > 512 || strings.ContainsAny(req.Supersession.Release, "\x00\n\r") {
+			sup := req.Supersession
+			if sup == nil || !validGitCommit(sup.ReleasedCommit) || (sup.Release != "" && !releaseText(sup.Release)) || sup.HandReleaseID == "" || len(sup.HandReleaseID) > 64 || len(sup.Targets) > 0 {
 				return zero, api.ErrInvalid
 			}
-			j.Supersession = &api.ReleaseSupersession{ReleasedCommit: req.Supersession.ReleasedCommit, Release: req.Supersession.Release, AgentID: req.AgentID, RunID: req.RunID}
+			hand, herr := handReleaseLoad(ctx, tx, task, sup.HandReleaseID)
+			if errors.Is(herr, sql.ErrNoRows) {
+				return zero, releaseConflict("recorded hand release required")
+			}
+			if herr != nil {
+				return zero, herr
+			}
+			if hand.ReleasedCommit != sup.ReleasedCommit || (sup.Release != "" && sup.Release != hand.Release) {
+				return zero, releaseConflict("hand release record names another release")
+			}
+			if !slices.Contains(hand.Commits, j.Commit) {
+				return zero, releaseConflict("hand release does not cover the job's commit")
+			}
+			j.Supersession = &api.ReleaseSupersession{ReleasedCommit: hand.ReleasedCommit, Release: hand.Release, HandReleaseID: hand.ID, Targets: hand.Targets, AgentID: req.AgentID, RunID: req.RunID}
+			j.SettledAt = hand.CreatedAt
 			j.State = "superseded"
 		} else if req.Operation == "verification" {
 			if err = requireScopeHandler(tx, ctx, task, req.AgentID, req.RunID); err != nil {
@@ -409,6 +591,7 @@ func (s *Store) ReleaseAction(ctx context.Context, task string, req api.ReleaseR
 				}
 				j.Receipt = r
 				j.State = r.Outcome
+				j.SettledAt = ts(s.now())
 			case "refuse":
 				if j.State != "claimed" || j.Receipt != nil {
 					return zero, releaseConflict("only an unpublished claim may refuse")

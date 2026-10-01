@@ -19,7 +19,10 @@ func deploymentBriefing() string {
 }
 func cmdDeployment(e env, args []string) error {
 	if len(args) == 0 {
-		return errors.New("usage: tt deployment setup|list|handler|enqueue|claim|check|verification|merged|finish|block|inputs|reconcile|set-aside|refuse|supersede")
+		return errors.New("usage: tt deployment setup|list|handler|enqueue|claim|check|verification|merged|finish|block|inputs|reconcile|set-aside|refuse|supersede|hand-release|hand-releases")
+	}
+	if args[0] == "hand-release" || args[0] == "hand-releases" {
+		return cmdHandRelease(e, args)
 	}
 	if args[0] == "serve" {
 		if len(args) != 3 || args[1] != "--config" {
@@ -47,7 +50,8 @@ func cmdDeployment(e env, args []string) error {
 	planFile := fs.String("plan-file", "", "integrated matrix plan JSON (handler import)")
 	file := fs.String("file", "", "receipt, reconcile or set-aside record JSON file")
 	released := fs.String("released-commit", "", "tasks-hub commit that carried a hand release (supersede)")
-	releaseName := fs.String("release", "", "hand release record, such as its release name (supersede)")
+	releaseName := fs.String("release", "", "optional release name; must equal the hand release record's (supersede)")
+	handRelease := fs.String("hand-release", "", "recorded hand release ID from tt deployment hand-release (supersede)")
 	repo := fs.String("repo", ".", "repository whose tasks-hub must contain the hand release (supersede)")
 	if err := fs.Parse(args[1:]); err != nil {
 		return err
@@ -82,10 +86,17 @@ func cmdDeployment(e env, args []string) error {
 		if err != nil {
 			return err
 		}
-		if err = supersedeAncestry(*repo, jobs, *job, *released); err != nil {
+		if *handRelease == "" {
+			return errors.New("supersede needs --hand-release naming a recorded hand release")
+		}
+		j, err := findReleaseJob(jobs, *job)
+		if err != nil {
 			return err
 		}
-		req.Supersession = &api.ReleaseSupersession{ReleasedCommit: *released, Release: *releaseName}
+		if err = supersedeCoverage(*repo, j, *released); err != nil {
+			return err
+		}
+		req.Supersession = &api.ReleaseSupersession{ReleasedCommit: *released, Release: *releaseName, HandReleaseID: *handRelease}
 	}
 	if args[0] == "finish" || args[0] == "verification" || args[0] == "inputs" || args[0] == "reconcile" || args[0] == "set-aside" {
 		b, err := os.ReadFile(*file)
@@ -203,29 +214,116 @@ func provisionPrerequisites(checkout, source string) error {
 	return nil
 }
 
-// supersedeAncestry proves the job's accepted commit shipped by hand: it is
-// an ancestor of the released commit, which is on the current local tasks-hub.
-func supersedeAncestry(repo string, jobs []api.ReleaseJob, id, released string) error {
+// cmdHandRelease records the owner's hand release, or lists the records.
+// Recording proves every covered job in a local checkout first; the hub
+// refuses a request that carries an agent identity.
+func cmdHandRelease(e env, args []string) error {
+	fs := flag.NewFlagSet("deployment "+args[0], flag.ContinueOnError)
+	intervention := fs.Int64("intervention", 0, "owner release intervention message sequence")
+	released := fs.String("released-commit", "", "tasks-hub commit that carried the hand release")
+	releaseName := fs.String("release", "", "release name, such as the hand release's release ID")
+	repo := fs.String("repo", ".", "repository whose tasks-hub must contain the hand release")
+	key := fs.String("request-id", "", "stable retry identity")
+	var targets, jobIDs stringListFlag
+	fs.Var(&targets, "target", "target the hand release shipped: hub, bridge, mini or tailos (repeatable)")
+	fs.Var(&jobIDs, "job", "release job whose accepted commit the hand release carries (repeatable)")
+	if err := fs.Parse(args[1:]); err != nil {
+		return err
+	}
+	c, err := e.client(20 * time.Second)
+	if err != nil {
+		return err
+	}
+	ctx, cancel := ctxTimeout(20 * time.Second)
+	defer cancel()
+	if args[0] == "hand-releases" {
+		out, err := c.HandReleases(ctx, e.task)
+		if err == nil {
+			printJSON(out)
+		}
+		return err
+	}
+	if *key == "" || len(jobIDs) == 0 {
+		return errors.New("hand-release needs --request-id and at least one --job")
+	}
+	jobs, err := c.Releases(ctx, e.task)
+	if err != nil {
+		return err
+	}
+	commits := []string{}
+	for _, id := range jobIDs {
+		j, err := findReleaseJob(jobs, id)
+		if err != nil {
+			return err
+		}
+		if err = supersedeCoverage(*repo, j, *released); err != nil {
+			return err
+		}
+		commits = append(commits, j.Commit)
+	}
+	record := &api.HandRelease{InterventionSeq: *intervention, ReleasedCommit: *released, Release: *releaseName, Targets: targets, Commits: commits}
+	out, err := c.RecordHandRelease(ctx, e.task, api.ReleaseRequest{RequestID: *key, AgentID: e.agent, RunID: e.runID, HandRelease: record})
+	if err == nil {
+		printJSON(out)
+	} else if e.agent != "" || e.runID != "" {
+		// The identity is still sent so the hub, not the CLI, decides.
+		err = fmt.Errorf("%w; this shell carries an agent identity: record the hand release as the owner from a shell without it, e.g. env -u TAILTERM_AGENT -u TAILTERM_RUN tt deployment hand-release ...", err)
+	}
+	return err
+}
+
+func findReleaseJob(jobs []api.ReleaseJob, id string) (api.ReleaseJob, error) {
+	for _, j := range jobs {
+		if j.ID == id {
+			return j, nil
+		}
+	}
+	return api.ReleaseJob{}, errors.New("release job not found")
+}
+
+// supersedeCoverage proves the job's accepted change shipped by hand. The
+// released commit must be on the current local tasks-hub, and every patch of
+// the job's range base..commit must be in it: by ancestry, or else by patch
+// equivalence (git cherry), which a merge in the range cannot use.
+func supersedeCoverage(repo string, job api.ReleaseJob, released string) error {
 	// Validated before any git call: an argument such as --output=PATH must
 	// never reach git as an option.
 	if !fullCommit(released) {
 		return errors.New("supersede needs --released-commit as a full 40-hex commit")
 	}
-	for _, j := range jobs {
-		if j.ID != id {
-			continue
-		}
-		if !fullCommit(j.Commit) {
-			return errors.New("release job has no full commit")
-		}
-		for _, pair := range [][2]string{{j.Commit, released}, {released, "refs/heads/tasks-hub"}} {
-			if err := exec.Command("git", "-C", repo, "merge-base", "--is-ancestor", pair[0], pair[1]).Run(); err != nil {
-				return fmt.Errorf("supersede needs %s to be an ancestor of %s in %s", pair[0], pair[1], repo)
-			}
-		}
+	if !fullCommit(job.Commit) || !fullCommit(job.BaseCommit) {
+		return errors.New("release job has no full commit and base commit")
+	}
+	git := func(args ...string) ([]byte, error) {
+		return exec.Command("git", append([]string{"-C", repo}, args...)...).Output()
+	}
+	if _, err := git("merge-base", "--is-ancestor", released, "refs/heads/tasks-hub"); err != nil {
+		return fmt.Errorf("supersede needs %s to be an ancestor of refs/heads/tasks-hub in %s", released, repo)
+	}
+	if _, err := git("merge-base", "--is-ancestor", job.Commit, released); err == nil {
 		return nil
 	}
-	return errors.New("release job not found")
+	merges, err := git("rev-list", "--merges", job.BaseCommit+".."+job.Commit)
+	if err != nil {
+		return fmt.Errorf("cannot list %s..%s in %s", job.BaseCommit, job.Commit, repo)
+	}
+	if len(strings.TrimSpace(string(merges))) > 0 {
+		return fmt.Errorf("supersede needs %s to be an ancestor of %s: its range has a merge, which patch equivalence cannot check", job.Commit, released)
+	}
+	out, err := git("cherry", released, job.Commit, job.BaseCommit)
+	if err != nil {
+		return fmt.Errorf("git cherry %s %s %s failed in %s", released, job.Commit, job.BaseCommit, repo)
+	}
+	missing := []string{}
+	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+		if strings.HasPrefix(line, "+ ") {
+			missing = append(missing, strings.TrimPrefix(line, "+ "))
+		}
+	}
+	if len(missing) > 0 {
+		return fmt.Errorf("hand release %s is missing patches of %s: %s", released, job.ID, strings.Join(missing, ", "))
+	}
+	return nil
 }
 
 func fullCommit(s string) bool {

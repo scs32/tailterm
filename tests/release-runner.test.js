@@ -222,11 +222,32 @@ test("b10 TailOS keeps the verified dist for the next rollback and reinstalls pa
  git(f.cwd,"checkout","--detach",next);importInputs(t,next,{tailos:{release:"rel_fixture-"+next.slice(0,12)+"-tailos"}});t.command=argv=>{cmds.push(argv.join(" "));return "";};await assert.rejects(t.prepare("tailos",next));assert.deepEqual(cmds.slice(0,2),["npm ci","npm run build:static"]);
 });
 test("a10 a superseded job is never selected, claimed or treated as a fence",async()=>{
- const superseded={id:"old",state:"superseded",supersession:{releasedCommit:"c".repeat(40),release:"20260929-owner-helper-c6a8ec1"}},next={id:"next",state:"verified"};
+ const superseded={id:"old",state:"superseded",settledAt:"2026-09-30T12:00:00Z",supersession:{releasedCommit:"c".repeat(40),release:"20260929-owner-helper-c6a8ec1",handReleaseId:"hrl_0123456789abcdef",targets:["hub"]}},next={id:"next",state:"verified"};
  assert.equal(runnableJob([superseded],"agent","run"),null);assert.equal(runnableJob([superseded,next],"agent","run"),next);
  const cwd=mkdtempSync(join(tmpdir(),"release-superseded-")),log=join(cwd,"calls"),fakeTT=join(cwd,"tt");
  writeFileSync(fakeTT,"#!"+process.execPath+"\n"+`const fs=require('fs');const a=process.argv.slice(2);fs.appendFileSync(${JSON.stringify(log)},a.join(' ')+'\\n');if(a[1]==='list')console.log(JSON.stringify([${JSON.stringify(superseded)}]));else process.exit(2);`);chmodSync(fakeTT,0o755);
  await serveDeployment({version:1,enabled:true,cwd,journalDirectory:cwd,tt:fakeTT},{once:true});assert.equal(readFileSync(log,"utf8"),"deployment list\n");
+});
+test("b1 a recorded hand release advances the next poll's baselines with no config edit",async()=>{
+ const f=fixture();mkdirSync(join(f.cwd,"hub/cmd/tt"),{recursive:true});const tt=change(f,"hub/cmd/tt/main.go","cli"),commit=change(f,"client/a.js","a");
+ const home=mkdtempSync(join(tmpdir(),"release-hand-baselines-")),configPath=join(home,"deploy.json"),fakeTT=join(home,"tt");
+ const all=b=>Object.fromEntries(["hub","bridge","mini","tailos"].map(t=>[t,b]));
+ writeFileSync(configPath,JSON.stringify({version:1,enabled:true,cwd:f.cwd,journalDirectory:home,tt:fakeTT,baselines:all(f.base)}));
+ const superseded={id:"rel_hand",state:"superseded",settledAt:"2026-09-30T12:00:00.5Z",supersession:{releasedCommit:tt,release:"20260930-hand",handReleaseId:"hrl_0123456789abcdef",targets:["mini"]}};
+ const verified={id:"rel_next",state:"verified",generation:1,commit};
+ writeFileSync(fakeTT,"#!"+process.execPath+"\n"+`const a=process.argv.slice(2);if(a[1]==='list')console.log(JSON.stringify(${JSON.stringify([superseded,verified])}));else if(a[1]==='claim')console.log(JSON.stringify(${JSON.stringify({...verified,state:"claimed",generation:2})}));else process.exit(2);`);chmodSync(fakeTT,0o755);
+ const seen=[];const release=async c=>{seen.push(c.baselines);};
+ const config=JSON.parse(readFileSync(configPath,"utf8"));const before=readFileSync(configPath,"utf8");
+ await serveDeployment(config,{once:true,configPath,release});
+ assert.deepEqual(seen,[{...all(f.base),mini:tt}]);assert.equal(readFileSync(configPath,"utf8"),before);
+ assert.deepEqual(selectReleaseTargets(f.cwd,seen[0],commit),["tailos"]);
+});
+test("D1 a superseded formerly refused job releases its handler-inspected host lock",()=>{
+ const cwd=mkdtempSync(join(tmpdir(),"release-lock-superseded-")),taskId="tsk_fixture",id="rel_fixture";
+ const lock=join(tmpdir(),"tailterm-release-locks",hash(cwd+"\0"+taskId)+".lock");mkdirSync(join(tmpdir(),"tailterm-release-locks"),{recursive:true});const raw=JSON.stringify({jobId:id,agentId:"old-agent",runId:"old-run"});writeFileSync(lock,raw);
+ const j={id,taskId,state:"blocked",reconciliations:[{jobId:id,agentId:"old-agent",runId:"old-run",lockDigest:hash(raw),noActiveExecution:true,refResolved:true,journalState:"no_effects"}]};
+ reconcileHostLocks({cwd},[j]);assert.equal(existsSync(lock),true,"a held job keeps its lock");
+ j.state="superseded";reconcileHostLocks({cwd},[j]);assert.equal(existsSync(lock),false);
 });
 test("f3 a failed escalation post still sends the bug request and the final receipt",async()=>{
  const f=fixture(),j=job(f,change(f,"client/a.js","a")),a=fake(),c=config(f,j);let receipt;a.check=async()=>"identity";a.escalate=async()=>{a.calls.push("escalate");throw new Error("post refused");};a.finish=async r=>{receipt=r;a.calls.push("finish");};

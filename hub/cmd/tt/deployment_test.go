@@ -1,8 +1,11 @@
 package main
 
 import (
+	"encoding/json"
 	"errors"
 	"github.com/scs32/tailterm/hub/internal/api"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -37,47 +40,200 @@ func TestDeploymentBriefingPreservesHandlerBoundary(t *testing.T) {
 	}
 }
 
-// Q2: supersede proves the job's commit shipped on the local tasks-hub.
-func TestSupersedeAncestryRequiresHandReleaseOnTasksHub(t *testing.T) {
+// coverageFixture builds a repository whose tasks-hub moved on and then
+// carried a candidate branch by cherry-pick, plus a range with a merge.
+func coverageFixture(t *testing.T) (string, map[string]string) {
+	t.Helper()
 	dir := t.TempDir()
 	run := func(args ...string) string {
-		out, err := exec.Command("git", append([]string{"-C", dir}, args...)...).CombinedOutput()
+		cmd := exec.Command("git", append([]string{"-C", dir}, args...)...)
+		cmd.Env = append(os.Environ(), "GIT_CONFIG_GLOBAL=/dev/null", "GIT_CONFIG_NOSYSTEM=1", "GIT_AUTHOR_NAME=F", "GIT_AUTHOR_EMAIL=f@example.invalid", "GIT_COMMITTER_NAME=F", "GIT_COMMITTER_EMAIL=f@example.invalid")
+		out, err := cmd.CombinedOutput()
 		if err != nil {
 			t.Fatal(args, string(out))
 		}
 		return strings.TrimSpace(string(out))
 	}
+	commit := func(file, text string) string {
+		if err := os.WriteFile(filepath.Join(dir, file), []byte(text), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		run("add", file)
+		run("commit", "-m", file+" "+text)
+		return run("rev-parse", "HEAD")
+	}
+	c := map[string]string{}
 	run("init", "-b", "tasks-hub")
-	run("-c", "user.email=f@example.invalid", "-c", "user.name=F", "commit", "--allow-empty", "-m", "base")
-	base := run("rev-parse", "HEAD")
-	run("-c", "user.email=f@example.invalid", "-c", "user.name=F", "commit", "--allow-empty", "-m", "candidate")
-	candidate := run("rev-parse", "HEAD")
-	run("checkout", "-b", "side", base)
-	run("-c", "user.email=f@example.invalid", "-c", "user.name=F", "commit", "--allow-empty", "-m", "unreleased")
-	unreleased := run("rev-parse", "HEAD")
-	jobs := []api.ReleaseJob{{ID: "rel_hand", Commit: candidate}, {ID: "rel_side", Commit: unreleased}}
-	if err := supersedeAncestry(dir, jobs, "rel_hand", candidate); err != nil {
-		t.Fatal(err)
+	c["base"] = commit("base.txt", "base")
+	run("checkout", "-b", "feat")
+	c["c1"] = commit("one.txt", "one")
+	c["c2"] = commit("two.txt", "two")
+	run("checkout", "-b", "side", c["base"])
+	y1 := commit("side.txt", "side")
+	run("checkout", "-b", "merged", c["base"])
+	x1 := commit("three.txt", "three")
+	run("merge", "--no-ff", "-m", "merge side", "side")
+	c["merge"] = run("rev-parse", "HEAD")
+	// tasks-hub moves on, then carries the candidate by cherry-pick.
+	run("checkout", "tasks-hub")
+	c["moved"] = commit("other.txt", "moved")
+	run("cherry-pick", c["c1"])
+	c["partial"] = run("rev-parse", "HEAD")
+	run("cherry-pick", c["c2"])
+	c["picked"] = run("rev-parse", "HEAD")
+	run("cherry-pick", x1, y1)
+	c["pickedMerge"] = run("rev-parse", "HEAD")
+	return dir, c
+}
+
+// s4: supersede and hand-release prove every patch of the job's range is in
+// the released commit on the local tasks-hub: by ancestry, or by patch
+// equivalence for a cherry-picked hand release. Every commit changes a file.
+func TestSupersedeCoverage(t *testing.T) {
+	dir, c := coverageFixture(t)
+	base, c1, c2, merge, moved, partial, picked, pickedMerge := c["base"], c["c1"], c["c2"], c["merge"], c["moved"], c["partial"], c["picked"], c["pickedMerge"]
+	jobs := []api.ReleaseJob{
+		{ID: "rel_plain", BaseCommit: base, Commit: moved},
+		{ID: "rel_picked", BaseCommit: base, Commit: c2},
+		{ID: "rel_merge", BaseCommit: base, Commit: merge},
 	}
-	if err := supersedeAncestry(dir, jobs, "rel_side", unreleased); err == nil {
-		t.Fatal("released commit not on tasks-hub was accepted")
+	job := func(id string) api.ReleaseJob {
+		j, err := findReleaseJob(jobs, id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return j
 	}
-	if err := supersedeAncestry(dir, jobs, "rel_side", candidate); err == nil {
-		t.Fatal("job commit not contained in the hand release was accepted")
-	}
-	if err := supersedeAncestry(dir, jobs, "rel_missing", candidate); err == nil {
+	t.Run("ancestor accepted", func(t *testing.T) {
+		if err := supersedeCoverage(dir, job("rel_plain"), picked); err != nil {
+			t.Fatal(err)
+		}
+	})
+	// Cherry-picked onto a moved tasks-hub: ancestry fails, all patches present.
+	t.Run("cherry-picked release accepted", func(t *testing.T) {
+		if exec.Command("git", "-C", dir, "merge-base", "--is-ancestor", c2, picked).Run() == nil {
+			t.Fatal("fixture: candidate must not be an ancestor of the hand release")
+		}
+		if err := supersedeCoverage(dir, job("rel_picked"), picked); err != nil {
+			t.Fatal(err)
+		}
+	})
+	t.Run("missing patch refused and named", func(t *testing.T) {
+		if err := supersedeCoverage(dir, job("rel_picked"), partial); err == nil || !strings.Contains(err.Error(), c2) || strings.Contains(err.Error(), c1) {
+			t.Fatal(err)
+		}
+	})
+	t.Run("released commit not on tasks-hub refused", func(t *testing.T) {
+		if err := supersedeCoverage(dir, job("rel_picked"), c2); err == nil || !strings.Contains(err.Error(), "refs/heads/tasks-hub") {
+			t.Fatal(err)
+		}
+	})
+	// A merge in the range needs ancestry: git cherry skips merges.
+	t.Run("merge in range without ancestry refused", func(t *testing.T) {
+		if err := supersedeCoverage(dir, job("rel_merge"), pickedMerge); err == nil || !strings.Contains(err.Error(), "merge") {
+			t.Fatal(err)
+		}
+	})
+	if _, err := findReleaseJob(jobs, "rel_missing"); err == nil {
 		t.Fatal("missing job accepted")
 	}
-	// f5: a malformed released commit is refused before git runs, so an
-	// option-shaped value cannot write a file.
+	// f5: a malformed released or job commit is refused before git runs, so
+	// an option-shaped value cannot write a file.
 	marker := filepath.Join(t.TempDir(), "written")
-	for _, bad := range []string{"--output=" + marker, candidate[:12], strings.ToUpper(candidate), ""} {
-		if err := supersedeAncestry(filepath.Join(t.TempDir(), "no-repo"), jobs, "rel_hand", bad); err == nil || !strings.Contains(err.Error(), "40-hex") {
+	noRepo := filepath.Join(t.TempDir(), "no-repo")
+	for _, bad := range []string{"--output=" + marker, picked[:12], strings.ToUpper(picked), ""} {
+		if err := supersedeCoverage(noRepo, job("rel_picked"), bad); err == nil || !strings.Contains(err.Error(), "40-hex") {
 			t.Fatalf("%q: %v", bad, err)
+		}
+		if err := supersedeCoverage(noRepo, api.ReleaseJob{ID: "rel_bad", BaseCommit: bad, Commit: c2}, picked); err == nil || !strings.Contains(err.Error(), "full commit") {
+			t.Fatalf("base %q: %v", bad, err)
 		}
 	}
 	if _, err := os.Stat(marker); !errors.Is(err, os.ErrNotExist) {
 		t.Fatal("git ran with an option-shaped commit", err)
+	}
+}
+
+// s2: the CLI's coverage guard runs before any hub write, for supersede and
+// for recording a hand release; a covered job reaches the hub citing the
+// record, and a hand release sends the proven job commits and the session's
+// agent identity so the hub can refuse agents.
+func TestSupersedeAndHandReleaseGuardBeforeHub(t *testing.T) {
+	dir, c := coverageFixture(t)
+	task := "tsk_0123456789abcdef"
+	jobs := []api.ReleaseJob{{ID: "rel_picked", BaseCommit: c["base"], Commit: c["c2"], State: "refused", Generation: 3}}
+	var posts []api.ReleaseRequest
+	hub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.Method == "GET" && strings.HasSuffix(r.URL.Path, "/releases") {
+			_ = json.NewEncoder(w).Encode(jobs)
+			return
+		}
+		var req api.ReleaseRequest
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		posts = append(posts, req)
+		if req.Operation == "hand_release" && req.AgentID != "" {
+			w.WriteHeader(http.StatusConflict)
+			_ = json.NewEncoder(w).Encode(api.ErrorResponse{Error: "conflict: release: only the owner records a hand release"})
+			return
+		}
+		if req.Operation == "hand_release" {
+			w.WriteHeader(http.StatusCreated)
+			_ = json.NewEncoder(w).Encode(api.HandRelease{ID: "hrl_0123456789abcdef"})
+			return
+		}
+		w.WriteHeader(http.StatusCreated)
+		_ = json.NewEncoder(w).Encode(jobs[0])
+	}))
+	defer hub.Close()
+	e := env{hub: hub.URL, task: task, agent: "agt_0123456789abcdef", runID: "run_0123456789abcdef"}
+	supersede := func(released string, extra ...string) error {
+		args := append([]string{"supersede", "--job", "rel_picked", "--generation", "3", "--request-id", "sup-" + released[:8], "--released-commit", released, "--repo", dir}, extra...)
+		_, err := captureRelayOutput(t, false, func() error { return cmdDeployment(e, args) })
+		return err
+	}
+	if err := supersede(c["picked"]); err == nil || !strings.Contains(err.Error(), "--hand-release") {
+		t.Fatal("supersede without a record", err)
+	}
+	if err := supersede(c["partial"], "--hand-release", "hrl_0123456789abcdef"); err == nil || !strings.Contains(err.Error(), c["c2"]) {
+		t.Fatal("partial supersede", err)
+	}
+	owner := env{hub: hub.URL, task: task}
+	record := func(as env, released string) error {
+		args := []string{"hand-release", "--intervention", "7", "--released-commit", released, "--release", "20260930-hand", "--target", "hub", "--job", "rel_picked", "--repo", dir, "--request-id", "hand-" + released[:8]}
+		_, err := captureRelayOutput(t, false, func() error { return cmdDeployment(as, args) })
+		return err
+	}
+	if err := record(owner, c["partial"]); err == nil || !strings.Contains(err.Error(), c["c2"]) {
+		t.Fatal("partial hand release", err)
+	}
+	if len(posts) != 0 {
+		t.Fatalf("refused commands reached the hub: %+v", posts)
+	}
+	// An agent shell sends its identity; the hub refuses and the CLI says how
+	// to record it as the owner.
+	if err := record(e, c["picked"]); err == nil || !strings.Contains(err.Error(), "env -u TAILTERM_AGENT -u TAILTERM_RUN") {
+		t.Fatal("agent shell hand release", err)
+	}
+	if err := record(owner, c["picked"]); err != nil {
+		t.Fatal(err)
+	}
+	if err := supersede(c["picked"], "--hand-release", "hrl_0123456789abcdef"); err != nil {
+		t.Fatal(err)
+	}
+	if len(posts) != 3 {
+		t.Fatalf("posts %+v", posts)
+	}
+	if posts[0].AgentID != e.agent || posts[0].RunID != e.runID {
+		t.Fatalf("agent identity not sent %+v", posts[0])
+	}
+	h := posts[1].HandRelease
+	if posts[1].Operation != "hand_release" || posts[1].AgentID != "" || posts[1].RunID != "" || h == nil || h.InterventionSeq != 7 || h.ReleasedCommit != c["picked"] || len(h.Commits) != 1 || h.Commits[0] != c["c2"] || len(h.Targets) != 1 || h.Targets[0] != "hub" {
+		t.Fatalf("hand release request %+v", posts[1])
+	}
+	sup := posts[2].Supersession
+	if posts[2].Operation != "supersede" || sup == nil || sup.HandReleaseID != "hrl_0123456789abcdef" || sup.ReleasedCommit != c["picked"] {
+		t.Fatalf("supersede request %+v", posts[2])
 	}
 }
 

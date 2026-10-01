@@ -602,7 +602,7 @@ export function hostLockNames(cwd,job){
 export function reconcileHostLocks(config,jobs){
   for(const job of jobs){
     const r=job.reconciliations?.at(-1);
-    if(!r?.lockDigest || !r.noActiveExecution || !r.refResolved || !["no_effects","restored"].includes(r.journalState) || !["verified","refused"].includes(job.state))continue;
+    if(!r?.lockDigest || !r.noActiveExecution || !r.refResolved || !["no_effects","restored"].includes(r.journalState) || !["verified","refused","superseded"].includes(job.state))continue;
     const lock=hostLockPath(config.cwd,job);
     if(!existsSync(lock) || fileDigest(lock)!==r.lockDigest)continue;
     const record=JSON.parse(readFileSync(lock,"utf8"));
@@ -617,10 +617,11 @@ export function reconcileReceipts(config,jobs){
     if(["finishing","receipt_pending"].includes(journal.phase) && journal.jobId===job.id && digest(journal.receipt)===digest(job.receipt)){journal.phase="complete";save(path,journal);}
   }
 }
-// The four last-successful baselines, read from the private config at every
-// poll so an operator's edit after a hand release applies to the next pass
-// without restarting the daemon. Only baselines are re-read: cwd, journal and
-// host references stay those the daemon started with.
+// The four configured baselines, read from the private config at every poll
+// without restarting the daemon. A recorded hand release advances baselines
+// by itself through its superseded job (releaseBaselines); a config edit is
+// the fallback for a hand release no job carries. Only baselines are re-read:
+// cwd, journal and host references stay those the daemon started with.
 export function readBaselines(configPath){
   const b=JSON.parse(readFileSync(configPath,"utf8")).baselines,targets=["hub","bridge","mini","tailos"];
   if(!targets.every(t=>sha(b?.[t])))throw new Error("Four last-successful baselines required");

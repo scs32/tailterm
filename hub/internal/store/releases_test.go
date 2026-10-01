@@ -102,8 +102,8 @@ func TestReleaseEligibilityFencingRetryAndReceipt(t *testing.T) {
 	req = action("finish", "finish")
 	req.Receipt = &api.ReleaseReceipt{Version: 1, JobID: j.ID, Commit: j.Commit, VerificationDigest: j.VerificationDigest, Outcome: "released", Targets: []api.ReleaseTargetReceipt{{Target: "tailos", Release: "fixture", ArtifactSHA256: strings.Repeat("a", 64), Outcome: "released"}}}
 	final, err := s.ReleaseAction(ctx, task.ID, req)
-	if err != nil {
-		t.Fatal(err)
+	if err != nil || final.SettledAt == "" {
+		t.Fatal(final.SettledAt, err)
 	}
 	again, err = s.ReleaseAction(ctx, task.ID, req)
 	if err != nil || again.Generation != final.Generation {
@@ -950,7 +950,8 @@ func TestReleaseSupersedeIsHandlerOnlyForUnclaimedJobs(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	record := &api.ReleaseSupersession{ReleasedCommit: candidateB, Release: "20260929-owner-helper-c6a8ec1"}
+	hand := recordHandRelease(t, s, task, "hand", candidateB, []string{candidateB})
+	record := &api.ReleaseSupersession{ReleasedCommit: candidateB, Release: hand.Release, HandReleaseID: hand.ID}
 	req := func(key string, a api.Agent, gen int64, sup *api.ReleaseSupersession) api.ReleaseRequest {
 		return api.ReleaseRequest{RequestID: key, Operation: "supersede", AgentID: a.ID, RunID: a.RunID, JobID: j.ID, ExpectedGeneration: gen, Supersession: sup}
 	}
@@ -976,6 +977,7 @@ func TestReleaseSupersedeIsHandlerOnlyForUnclaimedJobs(t *testing.T) {
 	}
 	// A claimed job is never superseded.
 	s2, task2, h2, d2, entry2 := releaseFixture(t)
+	record = &api.ReleaseSupersession{ReleasedCommit: candidateB, HandReleaseID: recordHandRelease(t, s2, task2, "hand", candidateB, []string{candidateB}).ID}
 	k, err := s2.ReleaseAction(ctx, task2.ID, api.ReleaseRequest{RequestID: "enqueue", Operation: "enqueue", AgentID: h2.ID, RunID: h2.RunID, EntryID: entry2})
 	if err != nil {
 		t.Fatal(err)
@@ -985,6 +987,252 @@ func TestReleaseSupersedeIsHandlerOnlyForUnclaimedJobs(t *testing.T) {
 	}
 	if _, err = s2.ReleaseAction(ctx, task2.ID, api.ReleaseRequest{RequestID: "supersede", Operation: "supersede", AgentID: h2.ID, RunID: h2.RunID, JobID: k.ID, ExpectedGeneration: k.Generation, Supersession: record}); !errors.Is(err, api.ErrConflict) {
 		t.Fatal("claimed job superseded", err)
+	}
+}
+
+// releaseIntervention records an owner intervention of the given kind on a
+// fresh item in the task and returns its message sequence.
+func releaseIntervention(t *testing.T, s *Store, task api.Task, key, kind string) int64 {
+	t.Helper()
+	ctx := context.Background()
+	by := api.Caller{Node: "fixture", User: "owner"}
+	item, err := s.CreateWorkItem(ctx, task.ID, api.CreateWorkItemRequest{Kind: "bug", Title: "hand release " + key, RequestID: "item-" + key}, by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m, err := s.CreateIntervention(ctx, task.ID, api.CreateInterventionRequest{Kind: kind, ItemID: item.ID, Text: "released by hand", RequestID: "intervention-" + key}, by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return m.Seq
+}
+
+// secondTask is another project in the same store, so its records share the
+// store's sequence and ID space with the fixture's.
+func secondTask(t *testing.T, s *Store) api.Task {
+	t.Helper()
+	task, err := s.CreateTask(context.Background(), api.CreateTaskRequest{Name: "other project"}, api.Caller{Node: "fixture", User: "owner"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return task
+}
+
+// recordHandRelease records an owner hand release of the hub target that
+// cites a fresh release intervention.
+func recordHandRelease(t *testing.T, s *Store, task api.Task, key, released string, commits []string) api.HandRelease {
+	t.Helper()
+	seq := releaseIntervention(t, s, task, key, "release")
+	h, err := s.RecordHandRelease(context.Background(), task.ID, api.ReleaseRequest{RequestID: "hand-release-" + key, HandRelease: &api.HandRelease{InterventionSeq: seq, ReleasedCommit: released, Release: "20260930-" + key, Targets: []string{"hub"}, Commits: commits}}, api.Caller{Node: "fixture", User: "owner"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return h
+}
+
+// a8: the hand release record is owner-only, cites a release intervention in
+// its own project, validates its fields, replays exactly and is immutable.
+func TestHandReleaseRecord(t *testing.T) {
+	s, task, h, _, _ := releaseFixture(t)
+	ctx := context.Background()
+	by := api.Caller{Node: "fixture", User: "owner"}
+	seq := releaseIntervention(t, s, task, "ok", "release")
+	nudge := releaseIntervention(t, s, task, "nudge", "nudge")
+	foreign := releaseIntervention(t, s, secondTask(t, s), "foreign", "release")
+	valid := func() *api.HandRelease {
+		return &api.HandRelease{InterventionSeq: seq, ReleasedCommit: candidateB, Release: "20260930-hand", Targets: []string{"tailos", "hub"}, Commits: []string{candidateA, candidateB}}
+	}
+	record := func(key string, mutate func(*api.ReleaseRequest)) (api.HandRelease, error) {
+		req := api.ReleaseRequest{RequestID: key, HandRelease: valid()}
+		if mutate != nil {
+			mutate(&req)
+		}
+		return s.RecordHandRelease(ctx, task.ID, req, by)
+	}
+	refusals := map[string]struct {
+		mutate func(*api.ReleaseRequest)
+		want   error
+	}{
+		"agent":             {func(r *api.ReleaseRequest) { r.AgentID, r.RunID = h.ID, h.RunID }, api.ErrConflict},
+		"run only":          {func(r *api.ReleaseRequest) { r.RunID = h.RunID }, api.ErrConflict},
+		"no record":         {func(r *api.ReleaseRequest) { r.HandRelease = nil }, api.ErrInvalid},
+		"no intervention":   {func(r *api.ReleaseRequest) { r.HandRelease.InterventionSeq = 999999 }, api.ErrConflict},
+		"other kind":        {func(r *api.ReleaseRequest) { r.HandRelease.InterventionSeq = nudge }, api.ErrConflict},
+		"other task":        {func(r *api.ReleaseRequest) { r.HandRelease.InterventionSeq = foreign }, api.ErrConflict},
+		"short commit":      {func(r *api.ReleaseRequest) { r.HandRelease.ReleasedCommit = candidateB[:12] }, api.ErrInvalid},
+		"upper commit":      {func(r *api.ReleaseRequest) { r.HandRelease.ReleasedCommit = strings.ToUpper(candidateB) }, api.ErrInvalid},
+		"covered commit":    {func(r *api.ReleaseRequest) { r.HandRelease.Commits = []string{"--output=x"} }, api.ErrInvalid},
+		"duplicate commit":  {func(r *api.ReleaseRequest) { r.HandRelease.Commits = []string{candidateA, candidateA} }, api.ErrInvalid},
+		"no commits":        {func(r *api.ReleaseRequest) { r.HandRelease.Commits = nil }, api.ErrInvalid},
+		"too many commits":  {func(r *api.ReleaseRequest) { r.HandRelease.Commits = make([]string, 65) }, api.ErrInvalid},
+		"unknown target":    {func(r *api.ReleaseRequest) { r.HandRelease.Targets = []string{"nas"} }, api.ErrInvalid},
+		"duplicate target":  {func(r *api.ReleaseRequest) { r.HandRelease.Targets = []string{"hub", "hub"} }, api.ErrInvalid},
+		"no targets":        {func(r *api.ReleaseRequest) { r.HandRelease.Targets = nil }, api.ErrInvalid},
+		"no release name":   {func(r *api.ReleaseRequest) { r.HandRelease.Release = "" }, api.ErrInvalid},
+		"newline in name":   {func(r *api.ReleaseRequest) { r.HandRelease.Release = "a\nb" }, api.ErrInvalid},
+		"no intervention 0": {func(r *api.ReleaseRequest) { r.HandRelease.InterventionSeq = 0 }, api.ErrInvalid},
+	}
+	for name, c := range refusals {
+		if _, err := record("refused-"+strings.ReplaceAll(name, " ", "-"), c.mutate); !errors.Is(err, c.want) {
+			t.Fatalf("%s: %v", name, err)
+		}
+	}
+	got, err := record("record", nil)
+	if err != nil || !strings.HasPrefix(got.ID, "hrl_") || got.TaskID != task.ID || got.CreatedAt == "" || got.RecordedBy == nil || *got.RecordedBy != by || strings.Join(got.Targets, ",") != "hub,tailos" {
+		t.Fatal(got, err)
+	}
+	if again, err := record("record", nil); err != nil || again.ID != got.ID || again.CreatedAt != got.CreatedAt {
+		t.Fatal("replay", again, err)
+	}
+	if _, err = record("record", func(r *api.ReleaseRequest) { r.HandRelease.Release = "changed" }); !errors.Is(err, api.ErrConflict) {
+		t.Fatal("changed replay", err)
+	}
+	if _, err = record("second", nil); !errors.Is(err, api.ErrConflict) {
+		t.Fatal("second record for one intervention", err)
+	}
+	list, err := s.HandReleases(ctx, task.ID)
+	if err != nil || len(list) != 1 || list[0].ID != got.ID {
+		t.Fatal(list, err)
+	}
+	if _, err = s.db.Exec(`UPDATE release_hand_releases SET released_commit=? WHERE id=?`, candidateA, got.ID); err == nil || !strings.Contains(err.Error(), "immutable hand release") {
+		t.Fatal("update", err)
+	}
+	if _, err = s.db.Exec(`DELETE FROM release_hand_releases WHERE id=?`, got.ID); err == nil || !strings.Contains(err.Error(), "immutable hand release") {
+		t.Fatal("delete", err)
+	}
+}
+
+// a1 (s1): supersede must cite a recorded hand release in the project whose
+// released commit matches and whose covered commits include the job's.
+func TestSupersedeRequiresRecordedHandRelease(t *testing.T) {
+	s, task, h, _, entry := releaseFixture(t)
+	ctx := context.Background()
+	j, err := s.ReleaseAction(ctx, task.ID, api.ReleaseRequest{RequestID: "enqueue", Operation: "enqueue", AgentID: h.ID, RunID: h.RunID, EntryID: entry})
+	if err != nil {
+		t.Fatal(err)
+	}
+	released := strings.Repeat("c", 40)
+	covering := recordHandRelease(t, s, task, "covering", released, []string{candidateA, candidateB})
+	uncovering := recordHandRelease(t, s, task, "uncovering", released, []string{candidateA})
+	foreign := recordHandRelease(t, s, secondTask(t, s), "foreign", released, []string{candidateB})
+	supersede := func(key string, sup *api.ReleaseSupersession) (api.ReleaseJob, error) {
+		return s.ReleaseAction(ctx, task.ID, api.ReleaseRequest{RequestID: key, Operation: "supersede", AgentID: h.ID, RunID: h.RunID, JobID: j.ID, ExpectedGeneration: j.Generation, Supersession: sup})
+	}
+	refusals := map[string]struct {
+		sup  *api.ReleaseSupersession
+		want error
+	}{
+		"no record id":        {&api.ReleaseSupersession{ReleasedCommit: released}, api.ErrInvalid},
+		"unknown record":      {&api.ReleaseSupersession{ReleasedCommit: released, HandReleaseID: "hrl_0123456789abcdef"}, api.ErrConflict},
+		"other task record":   {&api.ReleaseSupersession{ReleasedCommit: released, HandReleaseID: foreign.ID}, api.ErrConflict},
+		"commit differs":      {&api.ReleaseSupersession{ReleasedCommit: candidateB, HandReleaseID: covering.ID}, api.ErrConflict},
+		"release differs":     {&api.ReleaseSupersession{ReleasedCommit: released, Release: "other", HandReleaseID: covering.ID}, api.ErrConflict},
+		"does not cover":      {&api.ReleaseSupersession{ReleasedCommit: released, HandReleaseID: uncovering.ID}, api.ErrConflict},
+		"caller sets targets": {&api.ReleaseSupersession{ReleasedCommit: released, HandReleaseID: covering.ID, Targets: []string{"mini"}}, api.ErrInvalid},
+	}
+	for name, c := range refusals {
+		if _, err = supersede("refused-"+strings.ReplaceAll(name, " ", "-"), c.sup); !errors.Is(err, c.want) {
+			t.Fatalf("%s: %v", name, err)
+		}
+	}
+	if _, err = supersede("uncovered-message", &api.ReleaseSupersession{ReleasedCommit: released, HandReleaseID: uncovering.ID}); err == nil || !strings.Contains(err.Error(), "does not cover") {
+		t.Fatal(err)
+	}
+	done, err := supersede("supersede", &api.ReleaseSupersession{ReleasedCommit: released, HandReleaseID: covering.ID})
+	if err != nil || done.State != "superseded" || done.Supersession.HandReleaseID != covering.ID || done.Supersession.Release != covering.Release || strings.Join(done.Supersession.Targets, ",") != "hub" || done.SettledAt != covering.CreatedAt {
+		t.Fatal(done, err)
+	}
+}
+
+// a10 (D1): a refused job without a receipt may be superseded by a covering
+// record; a claimed, merged or blocked job may not.
+func TestSupersedeRefusedJob(t *testing.T) {
+	ctx := context.Background()
+	for _, final := range []string{"refused", "claimed", "merged", "blocked"} {
+		s, task, h, d, entry := releaseFixture(t)
+		j, err := s.ReleaseAction(ctx, task.ID, api.ReleaseRequest{RequestID: "enqueue", Operation: "enqueue", AgentID: h.ID, RunID: h.RunID, EntryID: entry})
+		if err != nil {
+			t.Fatal(err)
+		}
+		step := func(op string) {
+			req := api.ReleaseRequest{RequestID: op, Operation: op, AgentID: d.ID, RunID: d.RunID, JobID: j.ID, ExpectedGeneration: j.Generation, IntegratedCommit: j.Commit}
+			if j, err = s.ReleaseAction(ctx, task.ID, req); err != nil {
+				t.Fatal(final, op, err)
+			}
+		}
+		step("claim")
+		switch final {
+		case "refused":
+			step("refuse")
+		case "merged":
+			step("merged")
+		case "blocked":
+			step("block")
+		}
+		hand := recordHandRelease(t, s, task, "hand", candidateB, []string{candidateB})
+		done, err := s.ReleaseAction(ctx, task.ID, api.ReleaseRequest{RequestID: "supersede", Operation: "supersede", AgentID: h.ID, RunID: h.RunID, JobID: j.ID, ExpectedGeneration: j.Generation, Supersession: &api.ReleaseSupersession{ReleasedCommit: candidateB, HandReleaseID: hand.ID}})
+		if final == "refused" {
+			if err != nil || done.State != "superseded" || done.Supersession.HandReleaseID != hand.ID {
+				t.Fatal(final, done, err)
+			}
+		} else if !errors.Is(err, api.ErrConflict) {
+			t.Fatal(final, "superseded", err)
+		}
+	}
+}
+
+// f2: a handler reconcile may refuse a published job; with no receipt it is
+// supersedable once a hand release covers it.
+func TestSupersedePublishedReconcileRefusedJob(t *testing.T) {
+	s, task, h, d, entry := releaseFixture(t)
+	ctx := context.Background()
+	j, err := s.ReleaseAction(ctx, task.ID, api.ReleaseRequest{RequestID: "enqueue", Operation: "enqueue", AgentID: h.ID, RunID: h.RunID, EntryID: entry})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, op := range []string{"claim", "merged", "block"} {
+		if j, err = s.ReleaseAction(ctx, task.ID, api.ReleaseRequest{RequestID: op, Operation: op, AgentID: d.ID, RunID: d.RunID, JobID: j.ID, ExpectedGeneration: j.Generation, IntegratedCommit: j.Commit}); err != nil {
+			t.Fatal(op, err)
+		}
+	}
+	evidence := recoveryEvidence(t, s, task, h, j)
+	evidence.Disposition, evidence.NoPublication, evidence.JournalState = "refuse", false, "restored"
+	if _, err = s.db.Exec(`UPDATE agents SET status='exited' WHERE id=?`, d.ID); err != nil {
+		t.Fatal(err)
+	}
+	j, err = s.ReleaseAction(ctx, task.ID, api.ReleaseRequest{RequestID: "reconcile", Operation: "reconcile", AgentID: h.ID, RunID: h.RunID, JobID: j.ID, ExpectedGeneration: j.Generation, Reconciliation: &evidence})
+	if err != nil || j.State != "refused" || !j.Published || j.Receipt != nil {
+		t.Fatal(j, err)
+	}
+	hand := recordHandRelease(t, s, task, "hand", candidateB, []string{candidateB})
+	done, err := s.ReleaseAction(ctx, task.ID, api.ReleaseRequest{RequestID: "supersede", Operation: "supersede", AgentID: h.ID, RunID: h.RunID, JobID: j.ID, ExpectedGeneration: j.Generation, Supersession: &api.ReleaseSupersession{ReleasedCommit: candidateB, HandReleaseID: hand.ID}})
+	if err != nil || done.State != "superseded" || !done.Published || done.Supersession.HandReleaseID != hand.ID || done.SettledAt != hand.CreatedAt {
+		t.Fatal(done, err)
+	}
+}
+
+// O1: a job the handler set aside is verified and unclaimed again but keeps
+// its set_aside reconciliation, so it is not "never claimed": a covering
+// hand release does not supersede it.
+func TestSupersedeRefusesSetAsideJob(t *testing.T) {
+	s, task, h, d, entryA := releaseFixture(t)
+	ctx := context.Background()
+	a := claimGoRaceJob(t, s, task, h, d, entryA, goRaceMatrix(goRace(raceFlags, "./cmd/tt")))
+	if _, err := s.ReleaseAction(ctx, task.ID, api.ReleaseRequest{RequestID: "fix-enqueue", Operation: "enqueue", AgentID: h.ID, RunID: h.RunID, EntryID: releaseEntry(t, s, task, "fix for the refusal", "fix")}); err != nil {
+		t.Fatal(err)
+	}
+	evidence := setAsideEvidence(t, s, task, h, a)
+	aside, err := s.ReleaseAction(ctx, task.ID, api.ReleaseRequest{RequestID: "set-aside", Operation: "set-aside", AgentID: h.ID, RunID: h.RunID, JobID: a.ID, ExpectedGeneration: a.Generation, Reconciliation: &evidence})
+	if err != nil || aside.State != "verified" || aside.AgentID != "" || len(aside.Reconciliations) != 1 {
+		t.Fatalf("set aside %+v %v", aside, err)
+	}
+	hand := recordHandRelease(t, s, task, "hand", aside.Commit, []string{aside.Commit})
+	_, err = s.ReleaseAction(ctx, task.ID, api.ReleaseRequest{RequestID: "supersede", Operation: "supersede", AgentID: h.ID, RunID: h.RunID, JobID: aside.ID, ExpectedGeneration: aside.Generation, Supersession: &api.ReleaseSupersession{ReleasedCommit: aside.Commit, HandReleaseID: hand.ID}})
+	if !errors.Is(err, api.ErrConflict) || !strings.Contains(err.Error(), "only a verified never-claimed job or a refused unreceipted job can be superseded") {
+		t.Fatal("set-aside job superseded", err)
+	}
+	if saved, err := releaseLoad(ctx, s.db, task.ID, aside.ID); err != nil || saved.State != "verified" || saved.Supersession != nil {
+		t.Fatal("refused supersede changed the job", saved.State, err)
 	}
 }
 

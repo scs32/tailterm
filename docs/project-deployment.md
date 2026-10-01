@@ -316,17 +316,63 @@ JSON` (`malformed-json`) or `trailing data after the JSON object`
 
 ### Superseding jobs released by hand
 
-`tt deployment supersede --job ID --generation N --released-commit SHA --release
-NAME --repo CHECKOUT --request-id KEY` is handler-only. It applies only to a
-`verified` job that no deployer ever claimed, reconciled or finished. The CLI first
-checks, in `CHECKOUT`, that the job's commit is an ancestor of the released commit
-and that the released commit is an ancestor of the local `refs/heads/tasks-hub`;
-run it from a checkout whose `tasks-hub` is current. The hub saves
-`supersession: {releasedCommit, release, agentId, runId}` as the job's receipt of
-the hand release, keeps its history and retry identity, and sets the terminal
-state `superseded`, shown as "superseded (released by hand)". Claim, the runner
-and the project fence skip it. Each use needs its own recorded order; there is no
+A supersede must cite a **hand release record** (`handReleaseId`, `hrl_…`) that
+the owner recorded in the hub. The record cites an owner `release` intervention
+(`tt owner intervene --kind release`) in the same project and names the released
+tasks-hub commit, the targets the hand release shipped and the accepted job
+commits it carries. One record per intervention; records are immutable.
+
+The owner records it, from a checkout whose `tasks-hub` is current:
+
+```
+tt deployment hand-release --intervention SEQ --released-commit SHA \
+  --release NAME --target hub --target bridge --job REL [--job REL ...] \
+  --repo CHECKOUT --request-id KEY
+```
+
+Run it as the owner from a shell without an agent identity: the CLI sends
+`TAILTERM_AGENT`/`TAILTERM_RUN` when they are set and the hub then refuses (409),
+so from an agent or owner-helper session use
+`env -u TAILTERM_AGENT -u TAILTERM_RUN tt deployment hand-release ...`.
+`tt deployment hand-releases` lists the records. The handler, with its own agent
+identity, then supersedes each covered job:
+
+```
+tt deployment supersede --job ID --generation N --hand-release HRL \
+  --released-commit SHA [--release NAME] --repo CHECKOUT --request-id KEY
+```
+
+**Coverage.** Both commands first prove, in `CHECKOUT`, that the released commit
+is an ancestor of the local `refs/heads/tasks-hub`, and that every patch of the
+job's range `baseCommit..commit` is in the released commit: by ancestry, or else
+by patch equivalence (`git cherry RELEASED COMMIT BASE` with no `+` line), so a
+hand release integrated by cherry-pick onto a moved tasks-hub qualifies. A
+missing patch is refused and named. A range that contains a merge needs ancestry,
+because `git cherry` skips merge commits. Patch equivalence does not see a patch
+that a later tasks-hub commit reverted.
+
+**What the hub checks.** Supersede is handler-only and applies to a `verified`
+job that no deployer ever claimed, reconciled or finished, or to a `refused` job
+with no receipt; a `claimed`, `merged` or `blocked` job needs reconcile instead.
+A job the handler set aside (below) is not supersedable: it is `verified` again
+but keeps its `set_aside` record, so the deployer claims it again; use the
+config baseline fallback in the runbook for the targets its hand release shipped.
+The hub refuses unless the cited record exists in the project, its released
+commit equals `--released-commit`, its covered commits include the job's commit,
+and any `--release` equals the record's. It saves `supersession: {releasedCommit,
+release, handReleaseId, targets, agentId, runId}` and `settledAt` (the record's
+time), keeps the job's history and retry identity, and sets the terminal state
+`superseded`, shown as "superseded (released by hand)". Claim, the runner and the
+project fence skip it. Each use needs its own recorded order; there is no
 standing order to supersede.
+
+**Trust model.** The hub has no repository, so it cannot check git facts: it
+trusts the commits and targets in the owner's record, and the CLI's local proof
+is the git check. "Owner" means a request without an agent identity, the rule
+owner interventions use, not an authentication boundary; a request that carries
+an agent identity is refused. What the hub adds is that a handler or a direct
+API caller can no longer supersede against an arbitrary commit: it needs a prior,
+immutable, audited owner record that names that commit and covers that job.
 
 ### Setting aside a job that holds the fence
 
@@ -492,8 +538,9 @@ never rewritten; a changed job needs handler reconciliation.
 **Who is releasing.** A deployer release has a job with the deployer's
 `agentId`/`runId`, a journal at `journalDirectory/ID.json` and a final receipt
 from `tt deployment finish`. A hand release has an owner `release` intervention
-and, once the agent is provisioned, a job the handler superseded naming that
-release. `tt deployment list` shows which.
+and, once the agent is provisioned, a hand release record
+(`tt deployment hand-releases`) and a job the handler superseded citing it.
+`tt deployment list` shows which.
 
 **Pause.** Only between releases: confirm `tt deployment list` has no `claimed`
 or `merged` job, then `tt retire DEPLOYER`; every release action is refused while
@@ -544,16 +591,31 @@ back by hand (above) and confirm with their rollback probes before reconciling
 the job, so live code and `tasks-hub` agree again.
 
 **Hand release while the agent is provisioned.** Retire the deployer (pause
-above), release by hand, then order the handler to supersede that item's job with
-the released commit and release name. A hand release writes no deployer receipt,
-so the deployer's baselines do not move by themselves: for each target released
-by hand, run `node scripts/release-probe.mjs live TARGET --config PRIVATE`
-(`live tailos` for TailOS) and set `baselines.TARGET` in the private config to the
-printed `commit`. The running deployer re-reads `baselines` from the private
-config at every poll (about every 30 seconds), so the edit applies to its next pass with
-no restart; an unreadable file or a baseline that is not a full commit holds the
-poll before any claim. Other config keys are read only when the process starts.
-Then resume the deployer.
+above) and release by hand. Before resuming the deployer, record the owner
+`release` intervention, then the hand release record with every target it
+shipped and every job it carries (`tt deployment hand-release`, above), then
+order the handler to supersede each of those jobs citing the record. The
+baselines then advance by themselves: the deployer and the handler's input
+builder overlay each superseded job's released commit on the targets its record
+shipped, and each released receipt, in `settledAt` order, so the next job selects
+no target the hand release already shipped. Only then resume the deployer.
+
+The order matters because a superseded job settles at its record's time. Resumed
+before the record exists, the deployer selects against the old baselines and
+redeploys the hand-released targets; and a record made after a newer deployer
+receipt settles later, so its older commit would win that target's baseline.
+
+*Fallback: a config baseline edit.* Only for a hand release that no job carries,
+or whose job was set aside (so nothing can be superseded): for each target
+released by hand, run `node scripts/release-probe.mjs live TARGET --config
+PRIVATE` (`live tailos` for TailOS) and set `baselines.TARGET` in the private
+config to the printed `commit`. The running deployer re-reads `baselines` from
+the private config at every poll (about every 30 seconds), so the edit applies to
+its next pass with no restart; an unreadable file or a baseline that is not a full
+commit holds the poll before any claim. Other config keys are read only when the
+process starts. Limit: config baselines carry no time, and every released receipt
+or superseded job overlays them, so a target that has any deployer receipt keeps
+that receipt's commit and the edit has no effect for it.
 
 **Detached main checkout (#15223).** The deployer's checkout is a detached
 worktree (`git worktree add --detach PATH tasks-hub`) that shares objects with the

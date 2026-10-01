@@ -40,14 +40,31 @@ export function selectReleaseTargets(cwd, baselines, commit) {
   });
 }
 // The last successful commit per target: the configured baselines overlaid
-// with every released receipt, so the deployer and the handler's input
-// builder select the same targets for a job.
+// with every released receipt and every superseded job that cites a recorded
+// hand release (its released commit, for the targets that record shipped), so
+// the deployer and the handler's input builder select the same targets for a
+// job. Events apply in settledAt order, later winning; legacy events without
+// settledAt apply first, in list order, and a legacy superseded job without
+// targets is ignored. settledAt is RFC3339Nano with trimmed zeros, which does
+// not sort as text, so it is compared as time.
 export function releaseBaselines(baselines, jobs) {
   const out = { ...baselines };
-  for (const job of jobs) {
-    if (job.receipt?.outcome !== "released") continue;
-    for (const t of job.receipt.targets) if (t.outcome === "released") out[t.target] = job.receipt.commit;
-  }
+  const events = [];
+  jobs.forEach((job, index) => {
+    const at = job.settledAt ? Date.parse(job.settledAt) : null;
+    if (job.settledAt && Number.isNaN(at)) throw new Error("Invalid release settledAt");
+    if (job.receipt?.outcome === "released") {
+      const shipped = job.receipt.targets.filter(t => t.outcome === "released").map(t => t.target);
+      events.push({at, index, commit: job.receipt.commit, targets: shipped});
+    } else if (job.state === "superseded" && job.supersession?.targets?.length) {
+      events.push({at, index, commit: job.supersession.releasedCommit, targets: job.supersession.targets});
+    }
+  });
+  events.sort((a, b) => {
+    if ((a.at === null) !== (b.at === null)) return a.at === null ? -1 : 1;
+    return (a.at ?? 0) - (b.at ?? 0) || a.index - b.index;
+  });
+  for (const e of events) for (const t of e.targets) out[t] = e.commit;
   return out;
 }
 // Conservative: any non-test store source change since the live hub needs a

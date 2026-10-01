@@ -38,6 +38,9 @@ type ReleaseJob struct {
 	// Published survives a later block: tasks-hub already carries the release.
 	Published    bool                 `json:"published,omitempty"`
 	Supersession *ReleaseSupersession `json:"supersession,omitempty"`
+	// SettledAt orders released and superseded jobs for target baselines:
+	// the hub time of the final receipt, or the hand release's record time.
+	SettledAt string `json:"settledAt,omitempty"`
 	// MatrixApprovals is derived when jobs are listed and never saved: the
 	// project's owner matrix approvals, for a claimed job only. It is a hint
 	// for the runner; the verification import proves the one it cites.
@@ -72,13 +75,33 @@ type ReleaseCheckCoverage struct {
 	Relation         string `json:"relation"`
 }
 
-// ReleaseSupersession closes a verified, never-claimed job whose change the
-// owner session already released by hand, so the deployer never replays it.
+// ReleaseSupersession closes a verified, never-claimed job (or a refused one
+// without a receipt) whose change the owner session already released by hand,
+// so the deployer never replays it. It cites the recorded hand release; the
+// hub copies that record's release name and targets.
 type ReleaseSupersession struct {
-	ReleasedCommit string `json:"releasedCommit"`
-	Release        string `json:"release"`
-	AgentID        string `json:"agentId"`
-	RunID          string `json:"runId"`
+	ReleasedCommit string   `json:"releasedCommit"`
+	Release        string   `json:"release"`
+	HandReleaseID  string   `json:"handReleaseId,omitempty"`
+	Targets        []string `json:"targets,omitempty"`
+	AgentID        string   `json:"agentId"`
+	RunID          string   `json:"runId"`
+}
+
+// HandRelease is the owner's immutable record of a release made by hand. It
+// cites an owner release intervention and names the released tasks-hub
+// commit, the targets it shipped and the accepted job commits it carries.
+// The hub checks its structure only: the CLI proves the git facts locally.
+type HandRelease struct {
+	ID              string   `json:"id,omitempty"`
+	TaskID          string   `json:"taskId,omitempty"`
+	InterventionSeq int64    `json:"interventionSeq"`
+	ReleasedCommit  string   `json:"releasedCommit"`
+	Release         string   `json:"release"`
+	Targets         []string `json:"targets"`
+	Commits         []string `json:"commits"`
+	RecordedBy      *Caller  `json:"recordedBy,omitempty"`
+	CreatedAt       string   `json:"createdAt,omitempty"`
 }
 
 // Only nonsecret identities and hashes belong in receipts; arbitrary output
@@ -168,6 +191,7 @@ type ReleaseRequest struct {
 	Verification       *VerificationReceipt   `json:"verification,omitempty"`
 	Receipt            *ReleaseReceipt        `json:"receipt,omitempty"`
 	Supersession       *ReleaseSupersession   `json:"supersession,omitempty"`
+	HandRelease        *HandRelease           `json:"handRelease,omitempty"`
 }
 
 func (c *Client) ReleaseAction(ctx context.Context, task string, req ReleaseRequest) (ReleaseJob, error) {
@@ -180,6 +204,22 @@ func (c *Client) ReleaseAction(ctx context.Context, task string, req ReleaseRequ
 func (c *Client) ReleaseHandler(ctx context.Context, task, agent, run string) (Agent, error) {
 	var out Agent
 	err := c.do(ctx, "POST", "/v1/tasks/"+url.PathEscape(task)+"/releases/actions", ReleaseRequest{Operation: "handler", AgentID: agent, RunID: run}, &out)
+	return out, err
+}
+
+// RecordHandRelease stores the owner's hand release record (operation
+// hand_release); a request carrying an agent identity is refused.
+func (c *Client) RecordHandRelease(ctx context.Context, task string, req ReleaseRequest) (HandRelease, error) {
+	var out HandRelease
+	req.Operation = "hand_release"
+	err := c.do(ctx, "POST", "/v1/tasks/"+url.PathEscape(task)+"/releases/actions", req, &out)
+	return out, err
+}
+
+// HandReleases lists the project's recorded hand releases (read-only).
+func (c *Client) HandReleases(ctx context.Context, task string) ([]HandRelease, error) {
+	out := []HandRelease{}
+	err := c.do(ctx, "POST", "/v1/tasks/"+url.PathEscape(task)+"/releases/actions", ReleaseRequest{Operation: "hand_releases"}, &out)
 	return out, err
 }
 func (c *Client) Releases(ctx context.Context, task string) ([]ReleaseJob, error) {
