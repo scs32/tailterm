@@ -381,3 +381,88 @@ func TestProviderBlockOutage(t *testing.T) {
 		t.Fatalf("working peer: outage=%d per-agent=%d", outage, agent)
 	}
 }
+
+// Review b1 (#19948): an outage must not stay open after one of its agents
+// recovers. Two Codex agents block (one outage notice); one recovers and the
+// other is never prompted again; six hours later a third blocks. The owner
+// hears about it once.
+func TestProviderBlockOutageEndsOnRecovery(t *testing.T) {
+	f := newProviderFixture(t)
+	first := f.agent("codex-0", "codex", 0)
+	second := f.agent("codex-1", "codex", 0)
+	third := f.agent("codex-2", "codex", 1)
+	owner := func() int {
+		return f.notices(providerBlockOutageSubject, "") + f.notices(providerBlockOwnerSubject, "")
+	}
+	f.block(first, "codex", "auth")
+	f.block(second, "codex", "auth")
+	f.advance(91 * time.Second)
+	if n := f.sweep(); n != 1 || f.notices(providerBlockOutageSubject, "") != 1 {
+		t.Fatalf("outage sweep posted %d", n)
+	}
+	// One recovers; the other stays blocked and is never prompted again.
+	f.advance(10 * time.Minute)
+	f.state(first, "idle")
+	f.advance(30 * time.Second)
+	if n := f.sweep(); n != 0 || countRows(t, f.s, `SELECT count(*) FROM provider_outages WHERE closed_at=''`) != 0 {
+		t.Fatalf("outage still open after a recovery (posted %d)", n)
+	}
+	f.advance(6 * time.Hour)
+	f.block(third, "codex", "auth")
+	f.advance(30 * time.Second)
+	if n := f.sweep(); n != 0 || owner() != 1 {
+		t.Fatalf("notice inside the grace period: posted %d, owner notices %d", n, owner())
+	}
+	f.advance(61 * time.Second)
+	if n := f.sweep(); n != 1 || owner() != 2 {
+		t.Fatalf("third agent: posted %d, owner notices %d", n, owner())
+	}
+	// Two are blocked again and none is working, so it is one outage notice
+	// naming the runtime and both agents, not a silent attach.
+	text := f.lastText(providerBlockOutageSubject)
+	if f.notices(providerBlockOutageSubject, "") != 2 || !strings.Contains(text, "runtime codex") || !strings.Contains(text, "codex-1, codex-2") {
+		t.Fatalf("third agent's notice: %s", text)
+	}
+	f.advance(time.Hour)
+	if n := f.sweep(); n != 0 || owner() != 2 {
+		t.Fatalf("repeat sweep posted %d", n)
+	}
+
+	// The same when the first agent is working rather than idle: the outage
+	// ends, and the later block gets its own per-agent notice because a peer
+	// of the runtime is working.
+	g := newProviderFixture(t)
+	a, b, c := g.agent("codex-0", "codex", 0), g.agent("codex-1", "codex", 0), g.agent("codex-2", "codex", 1)
+	g.block(a, "codex", "auth")
+	g.block(b, "codex", "auth")
+	g.advance(91 * time.Second)
+	if n := g.sweep(); n != 1 {
+		t.Fatalf("outage sweep posted %d", n)
+	}
+	g.state(a, "working")
+	g.advance(6 * time.Hour)
+	g.block(c, "codex", "auth")
+	g.advance(91 * time.Second)
+	if n := g.sweep(); n != 1 || g.notices(providerBlockOwnerSubject, "") != 1 || g.notices(providerBlockOutageSubject, "") != 1 || !strings.Contains(g.lastText(providerBlockOwnerSubject), "codex-2") {
+		t.Fatalf("working peer: posted %d owner=%d outage=%d", n, g.notices(providerBlockOwnerSubject, ""), g.notices(providerBlockOutageSubject, ""))
+	}
+	if open := countRows(t, g.s, `SELECT count(*) FROM provider_outages WHERE closed_at=''`); open != 0 {
+		t.Fatalf("outage open beside a working peer: %d", open)
+	}
+	// A runtime prompt on a blocked agent is not recovery: the outage holds
+	// and a later block still joins it silently.
+	h := newProviderFixture(t)
+	x, y, z := h.agent("codex-0", "codex", 0), h.agent("codex-1", "codex", 0), h.agent("codex-2", "codex", 1)
+	h.block(x, "codex", "auth")
+	h.block(y, "codex", "auth")
+	h.advance(91 * time.Second)
+	h.sweep()
+	h.state(x, "unknown")
+	h.advance(time.Minute)
+	h.block(x, "codex", "auth")
+	h.block(z, "codex", "auth")
+	h.advance(5 * time.Minute)
+	if n := h.sweep(); n != 0 || h.notices(providerBlockOutageSubject, "") != 1 || h.notices(providerBlockOwnerSubject, "") != 0 {
+		t.Fatalf("non-recovery ended the outage: posted %d", n)
+	}
+}

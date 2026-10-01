@@ -177,6 +177,7 @@ type providerEpisode struct {
 // ProviderBlockSweep sends the owner notices that waited for the grace
 // period: one per project and runtime when it is an outage (two or more live
 // agents of the runtime blocked and none working), otherwise one per episode.
+// An open outage ends as soon as that condition stops holding.
 // It runs for paused projects too and returns the number of notices posted.
 func (s *Store) ProviderBlockSweep(ctx context.Context, now time.Time) (int, error) {
 	rows, err := s.db.QueryContext(ctx, `SELECT DISTINCT e.task_id,e.runtime FROM provider_block_episodes e JOIN tasks t ON t.id=e.task_id WHERE e.owner_state=? AND t.status=?
@@ -268,17 +269,33 @@ func (s *Store) sweepProviderScope(ctx context.Context, task, runtime string, no
 			due++
 		}
 	}
-	switch {
-	case outage != "":
-		// Agents that block during an open outage join it without a notice.
-		if err := attach(outage); err != nil {
+	if outage != "" {
+		// An outage lasts only while its condition holds. It ends when no live
+		// agent of the runtime is blocked, when one of the runtime is working,
+		// or when an agent in it has recovered (a completed or running turn; a
+		// runtime prompt, an unknown probe or a crash is not recovery). Blocks
+		// that open afterwards are judged afresh below, so a stale outage never
+		// swallows a later owner notice.
+		var recovered int
+		if err := tx.QueryRowContext(ctx, `SELECT count(*) FROM provider_block_episodes e JOIN agents a ON a.id=e.agent_id AND a.run_id=e.run_id
+ JOIN agent_activity x ON x.agent_id=a.id AND x.run_id=a.run_id
+ WHERE e.outage_id=? AND x.state IN ('working','idle','finished_silent') AND `+liveAgentFilter, outage).Scan(&recovered); err != nil {
 			return 0, err
 		}
-		if blocked == 0 {
+		if blocked == 0 || working > 0 || recovered > 0 {
 			if _, err := tx.ExecContext(ctx, `UPDATE provider_outages SET closed_at=? WHERE id=?`, ts(now), outage); err != nil {
 				return 0, err
 			}
-		} else if _, err := tx.ExecContext(ctx, `UPDATE provider_outages SET agent_count=max(agent_count,?) WHERE id=?`, blocked, outage); err != nil {
+			outage = ""
+		}
+	}
+	switch {
+	case outage != "":
+		// Agents that block while the outage holds join it without a notice.
+		if err := attach(outage); err != nil {
+			return 0, err
+		}
+		if _, err := tx.ExecContext(ctx, `UPDATE provider_outages SET agent_count=max(agent_count,?) WHERE id=?`, blocked, outage); err != nil {
 			return 0, err
 		}
 	case due == 0:
