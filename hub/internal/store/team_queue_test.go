@@ -1385,3 +1385,198 @@ func TestTeamQueueSmallLeadMayVerifyReviewerMayNot(t *testing.T) {
 		t.Fatalf("lead receipt not ready: %v", err)
 	}
 }
+
+// legacyTeamQueueEntriesSQL is the table as hubs created it before an item
+// could have more than one entry: the inline one-entry-per-item constraint,
+// then the columns later versions added one by one.
+const legacyTeamQueueEntriesSQL = `CREATE TABLE team_queue_entries (
+ id TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks(id), item_id TEXT NOT NULL REFERENCES work_items(id),
+ item_revision INTEGER NOT NULL, order_seq INTEGER NOT NULL, template TEXT NOT NULL,
+ position INTEGER NOT NULL, state TEXT NOT NULL CHECK(state IN ('queued','launching','running','finished','failed')),
+ revision INTEGER NOT NULL DEFAULT 1, host TEXT NOT NULL DEFAULT '', cwd TEXT NOT NULL DEFAULT '',
+ pause_generation INTEGER NOT NULL DEFAULT 0, launch_json BLOB NOT NULL DEFAULT '', close_json BLOB NOT NULL DEFAULT '',
+ failure TEXT NOT NULL DEFAULT '', escalation_seq INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+ UNIQUE(task_id,item_id));
+ ALTER TABLE team_queue_entries ADD COLUMN released_at TEXT NOT NULL DEFAULT '';
+ ALTER TABLE team_queue_entries ADD COLUMN repository TEXT NOT NULL DEFAULT '';
+ ALTER TABLE team_queue_entries ADD COLUMN ownership_json TEXT NOT NULL DEFAULT '[]';
+ ALTER TABLE team_queue_entries ADD COLUMN handler_id TEXT NOT NULL DEFAULT '';
+ ALTER TABLE team_queue_entries ADD COLUMN handler_run_id TEXT NOT NULL DEFAULT '';
+ ALTER TABLE team_queue_entries ADD COLUMN handler_lease_generation INTEGER NOT NULL DEFAULT 0;
+ ALTER TABLE team_queue_entries ADD COLUMN base_commit TEXT NOT NULL DEFAULT '';
+ ALTER TABLE team_queue_entries ADD COLUMN integration_json TEXT NOT NULL DEFAULT '';
+ ALTER TABLE team_queue_entries ADD COLUMN acceptance_json TEXT NOT NULL DEFAULT '';
+ ALTER TABLE team_queue_entries ADD COLUMN serial INTEGER NOT NULL DEFAULT 0;
+ ALTER TABLE team_queue_entries ADD COLUMN owner_integration_json TEXT NOT NULL DEFAULT '';
+ CREATE INDEX team_queue_order ON team_queue_entries(task_id,position);
+ CREATE INDEX team_queue_active ON team_queue_entries(task_id,state) WHERE state IN ('launching','running');`
+
+// legacyTeamQueueColumns are the columns of that table, in its order.
+const legacyTeamQueueColumns = `id,task_id,item_id,item_revision,order_seq,template,position,state,revision,host,cwd,pause_generation,launch_json,close_json,failure,escalation_seq,created_at,updated_at,released_at,repository,ownership_json,handler_id,handler_run_id,handler_lease_generation,base_commit,integration_json,acceptance_json,serial,owner_integration_json`
+
+// dumpTeamQueueRows reads the named columns of every entry as text, by id.
+func dumpTeamQueueRows(t *testing.T, s *Store, columns string) map[string][]string {
+	t.Helper()
+	rows, err := s.db.Query(`SELECT ` + columns + ` FROM team_queue_entries ORDER BY id`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	names, err := rows.Columns()
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := map[string][]string{}
+	for rows.Next() {
+		values := make([]any, len(names))
+		for i := range values {
+			values[i] = new([]byte)
+		}
+		if err := rows.Scan(values...); err != nil {
+			t.Fatal(err)
+		}
+		row := make([]string, len(names))
+		for i := range values {
+			row[i] = string(*values[i].(*[]byte))
+		}
+		out[row[0]] = row
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	return out
+}
+
+// a9: an older database keeps every entry row and column through the rebuild
+// that drops the one-entry-per-item constraint; a second open changes nothing.
+func TestTeamQueueMigrationDropsItemUniqueness(t *testing.T) {
+	ctx := context.Background()
+	by := api.Caller{Node: "fixture", User: "owner"}
+	path := filepath.Join(t.TempDir(), "hub.sqlite")
+	s, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	task, err := s.CreateTask(ctx, api.CreateTaskRequest{Name: "Migration fixture"}, by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.db.Exec(`DROP TABLE team_queue_entries`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.db.Exec(legacyTeamQueueEntriesSQL); err != nil {
+		t.Fatal(err)
+	}
+	launch := `{"members":[{"state":"started","runId":"run_1"}]}`
+	acceptance := `{"repository":"/repo/.git","commit":"` + strings.Repeat("a", 40) + `","itemRevision":3}`
+	var ids, items []string
+	for i, state := range []string{"queued", "finished", "failed"} {
+		item, err := s.CreateWorkItem(ctx, task.ID, api.CreateWorkItemRequest{Kind: "bug", Title: "Migrated " + state, RequestID: "item-" + state}, by)
+		if err != nil {
+			t.Fatal(err)
+		}
+		id := api.NewID("tqe")
+		released := ""
+		if state == "failed" {
+			released = "2026-09-29T10:00:00Z"
+		}
+		if _, err := s.db.Exec(`INSERT INTO team_queue_entries(`+legacyTeamQueueColumns+`) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+			id, task.ID, item.ID, 3+i, 40+i, "planned", i+1, state, 7+i, "mini", "/work/"+state, 2, []byte(launch), []byte(`{"requestId":"close"}`), "cause "+state, 90+i, "2026-09-28T10:00:00Z", "2026-09-29T09:00:00Z",
+			released, "/repo/.git", `["hub/a.go"]`, "agt_handler", "run_handler", 4+i, strings.Repeat("b", 40), `{"commit":"c"}`, acceptance, i%2, `{"commit":"d"}`); err != nil {
+			t.Fatal(err)
+		}
+		ids, items = append(ids, id), append(items, item.ID)
+	}
+	before := dumpTeamQueueRows(t, s, legacyTeamQueueColumns)
+	if len(before) != 3 {
+		t.Fatalf("fixture rows %d", len(before))
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	schema := func(s *Store) string {
+		t.Helper()
+		rows, err := s.db.Query(`SELECT type,name,COALESCE(sql,''),rootpage FROM sqlite_master WHERE tbl_name='team_queue_entries' ORDER BY type,name`)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer rows.Close()
+		var out []string
+		for rows.Next() {
+			var kind, name, sqlText string
+			var root int
+			if err := rows.Scan(&kind, &name, &sqlText, &root); err != nil {
+				t.Fatal(err)
+			}
+			if kind != "table" {
+				// Only the table's page shows whether it was rebuilt again.
+				root = 0
+			}
+			out = append(out, fmt.Sprintf("%s %s %d %s", kind, name, root, sqlText))
+		}
+		return strings.Join(out, "\n")
+	}
+	if s, err = Open(path); err != nil {
+		t.Fatal(err)
+	}
+	if after := dumpTeamQueueRows(t, s, legacyTeamQueueColumns); fmt.Sprint(after) != fmt.Sprint(before) {
+		t.Fatalf("rebuild changed rows\nbefore %v\nafter  %v", before, after)
+	}
+	for id, row := range dumpTeamQueueRows(t, s, `id,attempt,retry_of`) {
+		if row[1] != "1" || row[2] != "" {
+			t.Fatalf("entry %s attempt %q retry_of %q", id, row[1], row[2])
+		}
+	}
+	first := schema(s)
+	var tableSQL string
+	if err := s.db.QueryRow(`SELECT sql FROM sqlite_master WHERE type='table' AND name='team_queue_entries'`).Scan(&tableSQL); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(strings.Join(strings.Fields(tableSQL), ""), "UNIQUE(task_id,item_id)") {
+		t.Fatalf("inline uniqueness survived: %s", tableSQL)
+	}
+	for _, index := range []string{"team_queue_order", "team_queue_active", "team_queue_item_attempt", "team_queue_item_live"} {
+		if !strings.Contains(first, "index "+index+" ") {
+			t.Fatalf("index %s is missing:\n%s", index, first)
+		}
+	}
+	var leftover int
+	if err := s.db.QueryRow(`SELECT count(*) FROM sqlite_master WHERE name='team_queue_entries_v2'`).Scan(&leftover); err != nil || leftover != 0 {
+		t.Fatalf("rebuild left its staging table: %d %v", leftover, err)
+	}
+	// The migrated rows read through the store, and the indexes now carry the
+	// rules: attempts of one item are distinct and at most one is live.
+	finished, err := s.GetTeamQueueEntry(ctx, task.ID, ids[1])
+	if err != nil || finished.State != "finished" || finished.Attempt != 1 || finished.Acceptance == nil || finished.Acceptance.ItemRevision != 3 || finished.HandlerLeaseGeneration != 5 || !finished.Serial {
+		t.Fatalf("migrated entry %+v %v", finished, err)
+	}
+	insert := func(item, state string, attempt int) error {
+		_, err := s.db.Exec(`INSERT INTO team_queue_entries(id,task_id,item_id,item_revision,order_seq,template,position,state,attempt,created_at,updated_at) VALUES(?,?,?,1,1,'planned',9,?,?,'now','now')`, api.NewID("tqe"), task.ID, item, state, attempt)
+		return err
+	}
+	if err := insert(items[2], "queued", 1); err == nil {
+		t.Fatal("a second attempt 1 was stored")
+	}
+	if err := insert(items[0], "queued", 2); err == nil {
+		t.Fatal("a second live entry was stored")
+	}
+	if err := insert(items[2], "queued", 2); err != nil {
+		t.Fatalf("a retry of a released failed entry was refused: %v", err)
+	}
+	rows := dumpTeamQueueRows(t, s, legacyTeamQueueColumns+`,attempt,retry_of`)
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	if s, err = Open(path); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { s.Close() })
+	if second := schema(s); second != first {
+		t.Fatalf("second open changed the schema\nfirst  %s\nsecond %s", first, second)
+	}
+	if again := dumpTeamQueueRows(t, s, legacyTeamQueueColumns+`,attempt,retry_of`); fmt.Sprint(again) != fmt.Sprint(rows) {
+		t.Fatalf("second open changed rows\nbefore %v\nafter  %v", rows, again)
+	}
+}

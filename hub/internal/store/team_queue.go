@@ -16,6 +16,120 @@ import (
 	"github.com/scs32/tailterm/hub/internal/api"
 )
 
+// teamQueueEntryColumns lists every column of team_queue_entries in table
+// order. An item may have several entries, one per attempt, so the table has
+// no uniqueness on the item; the indexes below keep attempts distinct and at
+// most one of them live.
+var teamQueueEntryColumns = []struct{ name, definition string }{
+	{"id", "TEXT PRIMARY KEY"},
+	{"task_id", "TEXT NOT NULL REFERENCES tasks(id)"},
+	{"item_id", "TEXT NOT NULL REFERENCES work_items(id)"},
+	{"item_revision", "INTEGER NOT NULL"},
+	{"order_seq", "INTEGER NOT NULL"},
+	{"template", "TEXT NOT NULL"},
+	{"position", "INTEGER NOT NULL"},
+	{"state", "TEXT NOT NULL CHECK(state IN ('queued','launching','running','finished','failed'))"},
+	{"revision", "INTEGER NOT NULL DEFAULT 1"},
+	{"host", "TEXT NOT NULL DEFAULT ''"},
+	{"cwd", "TEXT NOT NULL DEFAULT ''"},
+	{"pause_generation", "INTEGER NOT NULL DEFAULT 0"},
+	{"launch_json", "BLOB NOT NULL DEFAULT ''"},
+	{"close_json", "BLOB NOT NULL DEFAULT ''"},
+	{"failure", "TEXT NOT NULL DEFAULT ''"},
+	{"escalation_seq", "INTEGER NOT NULL DEFAULT 0"},
+	{"created_at", "TEXT NOT NULL"},
+	{"updated_at", "TEXT NOT NULL"},
+	{"released_at", "TEXT NOT NULL DEFAULT ''"},
+	{"repository", "TEXT NOT NULL DEFAULT ''"},
+	{"ownership_json", "TEXT NOT NULL DEFAULT '[]'"},
+	{"handler_id", "TEXT NOT NULL DEFAULT ''"},
+	{"handler_run_id", "TEXT NOT NULL DEFAULT ''"},
+	{"handler_lease_generation", "INTEGER NOT NULL DEFAULT 0"},
+	{"base_commit", "TEXT NOT NULL DEFAULT ''"},
+	{"integration_json", "TEXT NOT NULL DEFAULT ''"},
+	{"acceptance_json", "TEXT NOT NULL DEFAULT ''"},
+	{"serial", "INTEGER NOT NULL DEFAULT 0"},
+	{"owner_integration_json", "TEXT NOT NULL DEFAULT ''"},
+	{"attempt", "INTEGER NOT NULL DEFAULT 1"},
+	{"retry_of", "TEXT NOT NULL DEFAULT ''"},
+}
+
+// teamQueueEntryColumnsSQL is the column list of a new team_queue_entries
+// table; teamQueueEntryColumnNames is the same list for an explicit copy.
+var teamQueueEntryColumnsSQL, teamQueueEntryColumnNames = func() (string, string) {
+	var definitions, names []string
+	for _, column := range teamQueueEntryColumns {
+		definitions = append(definitions, column.name+" "+column.definition)
+		names = append(names, column.name)
+	}
+	return strings.Join(definitions, ", "), strings.Join(names, ",")
+}()
+
+// teamQueueItemUnique is the inline constraint of the first queue, which
+// allowed one entry per item, ever.
+const teamQueueItemUnique = "UNIQUE(task_id,item_id)"
+
+// rebuildTeamQueueEntries drops the one-entry-per-item constraint from an
+// older table. SQLite cannot drop an inline constraint, so the rows are
+// copied, column by column, into a table without it. A column this version
+// does not know stops the migration instead of being dropped.
+func rebuildTeamQueueEntries(tx *sql.Tx) error {
+	var tableSQL string
+	if err := tx.QueryRow(`SELECT sql FROM sqlite_master WHERE type='table' AND name='team_queue_entries'`).Scan(&tableSQL); err != nil {
+		return err
+	}
+	if !strings.Contains(strings.Join(strings.Fields(tableSQL), ""), teamQueueItemUnique) {
+		return nil
+	}
+	known := map[string]bool{}
+	for _, column := range teamQueueEntryColumns {
+		known[column.name] = true
+	}
+	rows, err := tx.Query(`SELECT name FROM pragma_table_info('team_queue_entries')`)
+	if err != nil {
+		return err
+	}
+	present := 0
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			rows.Close()
+			return err
+		}
+		if !known[name] {
+			rows.Close()
+			return fmt.Errorf("team_queue_entries has unknown column %q; refusing to rebuild it", name)
+		}
+		present++
+	}
+	err = rows.Err()
+	rows.Close()
+	if err != nil {
+		return err
+	}
+	if present != len(teamQueueEntryColumns) {
+		return fmt.Errorf("team_queue_entries has %d of %d columns; refusing to rebuild it", present, len(teamQueueEntryColumns))
+	}
+	var before, after int
+	if err := tx.QueryRow(`SELECT count(*) FROM team_queue_entries`).Scan(&before); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`DROP TABLE IF EXISTS team_queue_entries_v2;
+		CREATE TABLE team_queue_entries_v2 (` + teamQueueEntryColumnsSQL + `);
+		INSERT INTO team_queue_entries_v2(` + teamQueueEntryColumnNames + `) SELECT ` + teamQueueEntryColumnNames + ` FROM team_queue_entries;`); err != nil {
+		return err
+	}
+	if err := tx.QueryRow(`SELECT count(*) FROM team_queue_entries_v2`).Scan(&after); err != nil {
+		return err
+	}
+	if after != before {
+		return fmt.Errorf("team_queue_entries rebuild copied %d of %d rows", after, before)
+	}
+	_, err = tx.Exec(`DROP TABLE team_queue_entries;
+		ALTER TABLE team_queue_entries_v2 RENAME TO team_queue_entries;`)
+	return err
+}
+
 func migrateTeamQueue(db *sql.DB) error {
 	tx, err := db.Begin()
 	if err != nil {
@@ -38,15 +152,7 @@ func migrateTeamQueue(db *sql.DB) error {
 			return err
 		}
 	}
-	_, err = tx.Exec(`CREATE TABLE IF NOT EXISTS team_queue_entries (
- id TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks(id), item_id TEXT NOT NULL REFERENCES work_items(id),
- item_revision INTEGER NOT NULL, order_seq INTEGER NOT NULL, template TEXT NOT NULL,
- position INTEGER NOT NULL, state TEXT NOT NULL CHECK(state IN ('queued','launching','running','finished','failed')),
- revision INTEGER NOT NULL DEFAULT 1, host TEXT NOT NULL DEFAULT '', cwd TEXT NOT NULL DEFAULT '',
- pause_generation INTEGER NOT NULL DEFAULT 0, launch_json BLOB NOT NULL DEFAULT '', close_json BLOB NOT NULL DEFAULT '',
- failure TEXT NOT NULL DEFAULT '', escalation_seq INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
- UNIQUE(task_id,item_id));
- CREATE INDEX IF NOT EXISTS team_queue_order ON team_queue_entries(task_id,position);
+	_, err = tx.Exec(`CREATE TABLE IF NOT EXISTS team_queue_entries (` + teamQueueEntryColumnsSQL + `);
  CREATE TABLE IF NOT EXISTS team_queue_requests(task_id TEXT NOT NULL,request_id TEXT NOT NULL,payload_hash TEXT NOT NULL,result_json BLOB NOT NULL,PRIMARY KEY(task_id,request_id));
  CREATE TABLE IF NOT EXISTS team_launch_reservations(task_id TEXT NOT NULL REFERENCES tasks(id),entry_id TEXT NOT NULL DEFAULT '',item_id TEXT NOT NULL, token TEXT NOT NULL,
  pause_generation INTEGER NOT NULL, state TEXT NOT NULL CHECK(state IN ('reserved','launching','running')), created_at TEXT NOT NULL,PRIMARY KEY(task_id,entry_id));`)
@@ -74,6 +180,8 @@ func migrateTeamQueue(db *sql.DB) error {
 		{"acceptance_json", "TEXT NOT NULL DEFAULT ''"},
 		{"serial", "INTEGER NOT NULL DEFAULT 0"},
 		{"owner_integration_json", "TEXT NOT NULL DEFAULT ''"},
+		{"attempt", "INTEGER NOT NULL DEFAULT 1"},
+		{"retry_of", "TEXT NOT NULL DEFAULT ''"},
 	} {
 		var count int
 		if err := tx.QueryRow(`SELECT count(*) FROM pragma_table_info('team_queue_entries') WHERE name=?`, column.name).Scan(&count); err != nil {
@@ -84,6 +192,27 @@ func migrateTeamQueue(db *sql.DB) error {
 				return err
 			}
 		}
+	}
+	// Every column exists now, so the copy below is complete.
+	if err := rebuildTeamQueueEntries(tx); err != nil {
+		return err
+	}
+	// One row per attempt of an item, and at most one attempt that is live:
+	// queued, launching, running, or failed and not yet released.
+	if _, err := tx.Exec(`CREATE INDEX IF NOT EXISTS team_queue_order ON team_queue_entries(task_id,position);
+		CREATE UNIQUE INDEX IF NOT EXISTS team_queue_item_attempt ON team_queue_entries(task_id,item_id,attempt);
+		CREATE UNIQUE INDEX IF NOT EXISTS team_queue_item_live ON team_queue_entries(task_id,item_id) WHERE state IN ('queued','launching','running') OR (state='failed' AND released_at='');
+		CREATE TABLE IF NOT EXISTS team_queue_rebinds(id TEXT PRIMARY KEY, task_id TEXT NOT NULL, entry_id TEXT NOT NULL, item_id TEXT NOT NULL,
+			from_item_revision INTEGER NOT NULL, to_item_revision INTEGER NOT NULL, from_scope_revision INTEGER NOT NULL, to_scope_revision INTEGER NOT NULL,
+			order_seq INTEGER NOT NULL, source_message_seq INTEGER NOT NULL,
+			amended_agent TEXT NOT NULL DEFAULT '', amended_node TEXT NOT NULL DEFAULT '', amended_user TEXT NOT NULL DEFAULT '',
+			approved_agent TEXT NOT NULL DEFAULT '', approved_run TEXT NOT NULL DEFAULT '', approved_node TEXT NOT NULL DEFAULT '', approved_user TEXT NOT NULL DEFAULT '',
+			entry_state TEXT NOT NULL, created_at TEXT NOT NULL);
+		CREATE INDEX IF NOT EXISTS team_queue_rebinds_entry ON team_queue_rebinds(task_id,entry_id,created_at);
+		CREATE TABLE IF NOT EXISTS team_queue_rebind_bindings(rebind_id TEXT NOT NULL REFERENCES team_queue_rebinds(id), agent_id TEXT NOT NULL, run_id TEXT NOT NULL,
+			from_item_revision INTEGER NOT NULL, to_item_revision INTEGER NOT NULL, context_digest TEXT NOT NULL, PRIMARY KEY(rebind_id,agent_id,run_id));
+		CREATE INDEX IF NOT EXISTS team_queue_rebind_bindings_run ON team_queue_rebind_bindings(agent_id,run_id);`); err != nil {
+		return err
 	}
 	_, err = tx.Exec(`CREATE TABLE IF NOT EXISTS team_queue_settings(task_id TEXT PRIMARY KEY REFERENCES tasks(id), concurrency_limit INTEGER NOT NULL DEFAULT 1 CHECK(concurrency_limit >= 0));
 		CREATE TABLE IF NOT EXISTS team_host_policies(host TEXT PRIMARY KEY,version INTEGER NOT NULL,expires_at TEXT NOT NULL,max_sessions INTEGER NOT NULL,max_polling INTEGER NOT NULL);
@@ -375,13 +504,13 @@ func smallChangeOwnership(ownership []string, serial bool) error {
 	return nil
 }
 
-const teamQueueCols = `id,task_id,item_id,item_revision,order_seq,template,position,state,revision,host,cwd,pause_generation,launch_json,close_json,failure,escalation_seq,released_at,repository,ownership_json,handler_id,handler_run_id,handler_lease_generation,base_commit,acceptance_json,integration_json,serial,owner_integration_json,updated_at`
+const teamQueueCols = `id,task_id,item_id,item_revision,order_seq,template,position,state,revision,host,cwd,pause_generation,launch_json,close_json,failure,escalation_seq,released_at,repository,ownership_json,handler_id,handler_run_id,handler_lease_generation,base_commit,acceptance_json,integration_json,serial,owner_integration_json,attempt,retry_of,updated_at`
 
 func scanTeamQueue(row interface{ Scan(...any) error }) (api.TeamQueueEntry, error) {
 	var e api.TeamQueueEntry
 	var launch, close []byte
 	var ownership, acceptance, integration, ownerIntegration string
-	err := row.Scan(&e.ID, &e.TaskID, &e.ItemID, &e.ItemRevision, &e.OrderMessageSeq, &e.Template, &e.Position, &e.State, &e.Revision, &e.Host, &e.Cwd, &e.PauseGeneration, &launch, &close, &e.Failure, &e.EscalationSeq, &e.ReleasedAt, &e.Repository, &ownership, &e.HandlerID, &e.HandlerRunID, &e.HandlerLeaseGeneration, &e.BaseCommit, &acceptance, &integration, &e.Serial, &ownerIntegration, &e.UpdatedAt)
+	err := row.Scan(&e.ID, &e.TaskID, &e.ItemID, &e.ItemRevision, &e.OrderMessageSeq, &e.Template, &e.Position, &e.State, &e.Revision, &e.Host, &e.Cwd, &e.PauseGeneration, &launch, &close, &e.Failure, &e.EscalationSeq, &e.ReleasedAt, &e.Repository, &ownership, &e.HandlerID, &e.HandlerRunID, &e.HandlerLeaseGeneration, &e.BaseCommit, &acceptance, &integration, &e.Serial, &ownerIntegration, &e.Attempt, &e.RetryOf, &e.UpdatedAt)
 	if err != nil {
 		return e, err
 	}
@@ -1231,7 +1360,7 @@ func (s *Store) TeamQueueAction(ctx context.Context, task string, req api.TeamQu
 		}
 		var maxPos int64
 		_ = tx.QueryRowContext(ctx, `SELECT COALESCE(MAX(position),0) FROM team_queue_entries WHERE task_id=?`, task).Scan(&maxPos)
-		e = api.TeamQueueEntry{ID: api.NewID("tqe"), TaskID: task, ItemID: req.ItemID, ItemRevision: item.Revision, OrderMessageSeq: req.OrderMessageSeq, Template: template, Position: maxPos + 1, State: "queued", Revision: 1, Host: req.Host, Cwd: req.Cwd, Repository: req.Repository, Ownership: ownership, BaseCommit: req.BaseCommit, Serial: serial, UpdatedAt: now}
+		e = api.TeamQueueEntry{ID: api.NewID("tqe"), TaskID: task, ItemID: req.ItemID, ItemRevision: item.Revision, OrderMessageSeq: req.OrderMessageSeq, Template: template, Position: maxPos + 1, State: "queued", Revision: 1, Host: req.Host, Cwd: req.Cwd, Repository: req.Repository, Ownership: ownership, BaseCommit: req.BaseCommit, Serial: serial, Attempt: 1, UpdatedAt: now}
 		ownedJSON, _ := json.Marshal(ownership)
 		_, err = tx.ExecContext(ctx, `INSERT INTO team_queue_entries(id,task_id,item_id,item_revision,order_seq,template,position,state,revision,host,cwd,repository,ownership_json,base_commit,serial,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, e.ID, task, e.ItemID, e.ItemRevision, e.OrderMessageSeq, e.Template, e.Position, e.State, e.Revision, e.Host, e.Cwd, e.Repository, string(ownedJSON), e.BaseCommit, serial, now, now)
 		if err != nil {

@@ -53,6 +53,10 @@ type TeamQueueEntry struct {
 	Failure                string                     `json:"failure,omitempty"`
 	EscalationSeq          int64                      `json:"escalationSeq,omitempty"`
 	ReleasedAt             string                     `json:"releasedAt,omitempty"`
+	// Attempt numbers the item's entries from 1. A retry of a released failed
+	// entry is a new entry; RetryOf names the entry it retries.
+	Attempt int64  `json:"attempt,omitempty"`
+	RetryOf string `json:"retryOf,omitempty"`
 	// Serial marks an entry that runs alone: it conflicts with every other
 	// team instead of declaring ownership.
 	Serial bool `json:"serial,omitempty"`
