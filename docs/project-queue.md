@@ -681,7 +681,7 @@ Query parameters, all optional; anything else is a 400:
 | Parameter | Meaning |
 |---|---|
 | `view=active` | active entries only; no history and no `history` object |
-| `item=wi_ID` | only that item's entry (0 or 1), in any state and in full |
+| `item=wi_ID` | only that item's entries, one per attempt, newest first, in any state and in full |
 | `limit=N` | history page size, 1 to 200; default 50 |
 | `after=P` | history entries below position `P` |
 
@@ -842,4 +842,154 @@ entry is removed with `tt team queue remove --entry ENTRY`; a launched team
 first ends through its ordinary disposition and closeout, because queue add
 refuses an item with a live team. Then `tt team queue add --item wi_ID --order
 SEQ` without `--template` queues a Planned delivery team. A new or revised
-order goes through the usual scope confirmation first.
+order goes through the usual scope confirmation first. An item whose small
+entry failed and was released keeps its entry as history: retry it as Planned
+with `tt team queue requeue --entry ENTRY --template planned [--owns PATH...]`
+(see [Team queue amendments and retries](#team-queue-amendments-and-retries)).
+
+## Team queue amendments and retries
+
+Bug `wi_4f66c2a118639128` (order #17395). A queue entry freezes the item
+revision it was queued at, and a team's bindings freeze the revision they were
+admitted at. Any item update moves the item to a new revision, so before this
+change an amendment after queueing stranded the work: the runner failed a
+queued entry (`queued item changed before launch`), a running team's handler
+calls were all 409, and because an item could have only one entry, ever, the
+way out was a replacement item. Two queue operations now keep the work under
+the same item.
+
+### Rebind after an amendment
+
+`tt team queue rebind --entry tqe_ID --source SEQ` moves an entry to the item's
+current revision. `SEQ` is the message that records the amendment; it must be
+linked to the item. The entry keeps its ID, position, order message, handler
+lease, ownership and frozen launch.
+
+| Entry state | Rebind | Why |
+|---|---|---|
+| `queued` | yes | No team exists; only the entry's item revision moves. |
+| `running`, no acceptance saved | yes, with the team's live bindings | Entry and bindings move together, so bookkeeping, replace-lead and team close keep agreeing. |
+| `launching` | refused | The frozen launch plan, host journal and spawn attempts carry the old revision. Let the launch fail, then requeue. |
+| `running`, acceptance saved | refused | The accepted candidate is pinned to an item revision and completion report. |
+| `running`, released by an owner integration | refused | The entry no longer holds its work. |
+| `failed` | refused | Not live. Release it, then requeue. |
+| `finished` | refused | Not live. |
+
+Every refusal is a 409 that names the entry and, where one exists, the
+supported command.
+
+Who may rebind: the owner's unbound CLI, or a database handler session. Any
+available handler may rebind a queued entry; only the entry's leased handler
+may rebind a running one. The item lead and team members may not. Amending the
+item itself is unchanged and is not refused: the item update does not know
+about the queue.
+
+The handler's sequence after an owner-approved amendment:
+
+1. Save the amendment to the item (a new item revision) and post or identify
+   its message.
+2. Confirm scope for the entry's order at the new revision
+   (`tt work-items scope confirm`). A rebind without it is refused with
+   `confirm scope for revision N and order #SEQ, then tt team queue rebind ...`.
+3. `tt team queue rebind --entry tqe_ID --source SEQ`.
+4. Carry on at the new revision: bookkeeping, new admissions, allocation
+   intents, acceptance, team close and finish all use it.
+
+Until step 3, the entry is not failed. A queued entry stays queued, is skipped
+when the hub picks the queue head (so later entries still launch), and lists
+`reason=Item is at revision M; entry is bound to N. tt team queue rebind
+--task T --entry tqe_ID --source SEQ`; claiming it is refused with the same
+command. For a running entry, bookkeeping is refused with `entry tqe_ID is
+bound to revision N; the item is at revision M. Rebind it: ...`.
+
+What a rebind records, and returns as `rebinds` on `GET
+/v1/tasks/{id}/team-queue/{entry}` and the `item=` listing (history summaries
+leave it out): the old and new item revision, the old and new scope revision,
+the order, the amendment's message, who saved the amended revision
+(`amendedBy`), who approved the rebind (`approvedBy`, the authenticated caller,
+plus the handler agent and run when a handler asked), the entry's state and
+the time. For a running entry it also records each moved binding with its
+agent, run, context digest and both revisions, and posts one NOTICE to the
+item lead, linked to the item at the new revision, telling the team to re-run
+`tt context` and link new posts at the new revision. `tt team queue list`
+shows `rebound N→M`.
+
+What a rebind never rewrites: a binding's agent, run, context digest, stored
+context and creation time; the entry's frozen launch; scope confirmations;
+bookkeeping receipts; and the bindings of closed or exited members, which stay
+at the revision they were admitted at. Only `item_revision` moves, on the
+entry and on live bindings of the entry's order. A bound agent may still link
+a post at any revision its binding held, the admitted one included; a revision
+it never held is refused as before.
+
+A rebind does not change the entry's work order or ownership. Use `tt team
+queue scope` for ownership; a different order needs a new entry.
+
+### Requeue a failed entry
+
+`tt team queue requeue --entry tqe_ID [--order SEQ] [--template planned|small]
+[--owns PATH...] [--cwd DIR]` retries an item whose entry failed. It adds a
+new entry for the same item: a new entry ID at the end of the queue, `attempt`
+one higher than the failed entry's, `retryOf` naming it, bound to the item's
+current revision. The failed entry is not modified and stays as history with
+its failure, launch and notice. A new row, not a reset, because the runner's
+request IDs, launch lock and journal are per entry ID and would replay the old
+attempt.
+
+Preconditions, each refused with a 409 naming the entry:
+
+- the entry is `failed` and released (`entry tqe_ID is failed and not released;
+  release it first: tt team queue release --task T --entry tqe_ID`), and was
+  not integrated by the owner;
+- it is the item's latest attempt, and the item has no live entry;
+- no item-bound run is still live or uncleaned;
+- the item is not done or dismissed;
+- the order is recorded for the item and its scope is confirmed at the item's
+  current revision.
+
+The attempt copies the failed entry's order, template, host, checkout,
+repository, ownership and base commit unless a flag overrides them. `--cwd DIR`
+names another checkout of the same repository on the launch host and takes its
+HEAD as the base. The attempt passes the same checks as `add`: a `small`
+attempt needs a bug and at most three owned paths, and `--template planned`
+retries a failed small entry as Planned delivery. The owner's unbound CLI or
+any available database handler may requeue.
+
+`tt team queue add` and a manual team launch still take only an item's first
+entry. For an item that already has one they are refused naming it, for
+example `item already has entry tqe_ID (failed); retry it with tt team queue
+requeue --task T --entry tqe_ID`. `tt team queue list --item wi_ID` prints
+every attempt, newest first, and the list shows `attempt N retry-of=tqe_ID`.
+When the new attempt launches it takes over the item's lead record, which the
+released attempt closed.
+
+### Schema, compatibility and rollback
+
+`team_queue_entries` loses its inline `UNIQUE(task_id,item_id)` and gains
+`attempt` (default 1) and `retry_of`. SQLite cannot drop an inline constraint,
+so the first start of the new hub rebuilds the table in one transaction: it
+copies every row, column by column, into a table without the constraint,
+checks the row count, and stops the migration instead of dropping data if the
+old table has a column it does not know. Two indexes replace the constraint:
+attempts of an item are distinct (`task_id,item_id,attempt`), and an item has
+at most one live entry (queued, launching, running, or failed and not
+released). `team_queue_rebinds` and `team_queue_rebind_bindings` are new. A
+second start changes nothing.
+
+An older hub binary runs on the rebuilt table; it only lost a constraint. Do
+not roll back to it once any item has two entries, because it assumes one.
+Check first, and expect no rows:
+
+```sql
+SELECT item_id FROM team_queue_entries GROUP BY task_id,item_id HAVING count(*)>1;
+```
+
+An older tt on the new hub lacks the two commands, and an older queue runner
+still fails a queued entry whose item changed; update the relay hosts' tt with
+the hub. Entries in JSON now carry `attempt`, and `retryOf` and `rebinds` when
+set; older clients ignore them. The audit export does not yet include the two
+rebind tables, and the Board does not yet show attempts or rebinds.
+
+Not covered: release follow-through for a done item with a pending or failed
+release (`wi_1a0349b7bf5dce22`), rebinding a launching entry in place, and
+changing the work order of a live entry.
