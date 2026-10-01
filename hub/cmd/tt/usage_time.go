@@ -25,6 +25,9 @@ const (
 	usageSpanOutbox       = 256  // chunks kept locally awaiting upload
 )
 
+// usageSpanChunkSize is lowered only by tests, to force small chunks.
+var usageSpanChunkSize = usageSpanChunkEntries
+
 type usageTimeCall struct {
 	Since time.Time `json:"since"`
 	Class string    `json:"class"`
@@ -342,7 +345,7 @@ func (u *usageCursor) timeClose(end time.Time, gap string) {
 	if partial {
 		u.Coverage = "partial: handled context retention exceeded"
 	}
-	chunks := usageSpanChunks(t, end, handled, usageSpanChunkEntries)
+	chunks := usageSpanChunks(t, end, handled, usageSpanChunkSize)
 	if len(u.Spans)+len(chunks) > usageSpanOutbox {
 		u.Coverage = "partial: time span outbox capacity exceeded"
 		return

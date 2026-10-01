@@ -380,6 +380,7 @@ func (s *Store) Usage(ctx context.Context, task string, q api.UsageQuery) (api.U
 			items[task+"/"+item] = newUsageItem(task, item, item)
 		}
 	}
+	out.TimeVersion = 1
 	out.Summary = total.finish()
 	out.Overhead = overhead.finish()
 	out.Overhead.Time = times[""]

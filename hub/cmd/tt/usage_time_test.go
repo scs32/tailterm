@@ -884,3 +884,211 @@ func TestUsageTimeFrozenSpanOnlyDrain(t *testing.T) {
 		t.Fatalf("drained run polled: %d %v", len(batches), err)
 	}
 }
+
+// boardRow writes one synthetic Board row through a second database handle,
+// so the test controls its recorded time.
+func (h *usageTimeHub) boardRow(query string, args ...any) int64 {
+	h.t.Helper()
+	db, err := sql.Open("sqlite", h.dbPath)
+	if err != nil {
+		h.t.Fatal(err)
+	}
+	defer db.Close()
+	if _, err = db.Exec(`PRAGMA busy_timeout=5000`); err != nil {
+		h.t.Fatal(err)
+	}
+	r, err := db.Exec(query, args...)
+	if err != nil {
+		h.t.Fatal(err)
+	}
+	id, _ := r.LastInsertId()
+	return id
+}
+func (h *usageTimeHub) message(from, to, hms string, envelope api.Envelope, item string) int64 {
+	h.t.Helper()
+	if item != "" {
+		envelope.Refs = map[string]string{"item": item}
+	}
+	raw, _ := json.Marshal(envelope)
+	return h.boardRow(`INSERT INTO messages(task_id,from_agent,from_node,from_user,to_agent,text,created_at,envelope) VALUES(?,?,'fixture','owner',?,'synthetic',?,?)`, h.task.ID, from, to, fixtureTime(hms).Format(time.RFC3339Nano), string(raw))
+}
+func (h *usageTimeHub) item(title string) api.WorkItem {
+	h.t.Helper()
+	item, err := h.st.CreateWorkItem(context.Background(), h.task.ID, api.CreateWorkItemRequest{Kind: "feature", Title: title, RequestID: "item-" + api.NewID("req")}, h.by)
+	if err != nil {
+		h.t.Fatal(err)
+	}
+	return item
+}
+
+// journal records which Board messages the agent handled, and when.
+func (h *usageTimeHub) journal(b runtimeBinding, entries ...api.UsageEvidence) {
+	h.t.Helper()
+	if err := writePrivateJSON(usageContextPath(env{agent: b.Agent, runID: b.Run}), entries); err != nil {
+		h.t.Fatal(err)
+	}
+}
+
+func TestUsageTimeCLIReport(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	h := newUsageTimeHub(t)
+	item := h.item("Synthetic time report")
+	_, b := h.agent("builder", "claude", "")
+	setUsageTimeCapability(t, b.Hub, true)
+	assign := h.message("", b.Agent, "09:59:00", api.Envelope{Kind: "assign", Subject: "Build the synthetic item"}, item.ID)
+	// The builder asked the owner before its first turn; the answer came at 11:15.
+	question := h.message(b.Agent, "", "09:59:30", api.Envelope{}, "")
+	answer := h.message("", "", "11:15:00", api.Envelope{}, "")
+	h.boardRow(`INSERT INTO decision_requests(message_seq,task_id,question,options,recommended_option_id,recommendation_reason,created_at) VALUES(?,?,?,?,?,?,?)`, question, h.task.ID, "Approve the <matrix> plan?", "[]", "yes", "synthetic", fixtureTime("09:59:30").Format(time.RFC3339Nano))
+	h.boardRow(`INSERT INTO decision_answers(message_seq,task_id,request_seq,option_id,created_at) VALUES(?,?,?,?,?)`, answer, h.task.ID, question, "yes", fixtureTime("11:15:00").Format(time.RFC3339Nano))
+	var acks []api.UsageEvidence
+	for _, at := range []string{"10:00:30", "10:30:30", "10:40:30", "10:50:05", "11:00:01"} {
+		acks = append(acks, api.UsageEvidence{TaskID: h.task.ID, Seq: assign, Operation: "ack", At: fixtureTime(at)})
+	}
+	h.journal(b, acks...)
+	u := h.cursor(b)
+	parseUsageLines(t, u, usageTimeFixture(t, "claude-poll.jsonl")...)
+	parseUsageLines(t, u, usageTimeFixture(t, "claude-owner-wait.jsonl")...)
+	h.drain(u)
+
+	e := env{hub: h.srv.URL, task: h.task.ID}
+	raw, err := captureStdout(t, func() error {
+		return cmdUsage(e, []string{"--project", h.task.ID, "--item", item.ID, "--json"})
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The JSON carries the hub's time section verbatim.
+	var report struct {
+		TimeVersion int `json:"timeVersion"`
+		Items       []struct {
+			Time map[string]json.RawMessage `json:"time"`
+		} `json:"items"`
+	}
+	if err = json.Unmarshal([]byte(raw), &report); err != nil || report.TimeVersion != 1 || len(report.Items) != 1 {
+		t.Fatalf("report %s %v", raw, err)
+	}
+	section := report.Items[0].Time
+	text := func(key string) string {
+		var v string
+		if json.Unmarshal(section[key], &v) != nil {
+			t.Fatalf("%s missing in %s", key, raw)
+		}
+		return v
+	}
+	// Five turns from 10:00:00 to 11:20:12: model 38 s, tool 32 s, the rest waiting.
+	if text("wallMs") != "4812000" || text("modelMs") != "38000" || text("toolMs") != "32000" || text("waitingMs") != "4742000" || text("unmeasuredMs") != "0" || text("pollMs") != "11000" {
+		t.Fatalf("time %s", raw)
+	}
+	var polls int
+	var phases []api.UsageTimeSplit
+	var waits []api.UsageTimeWait
+	if json.Unmarshal(section["polls"], &polls) != nil || json.Unmarshal(section["phases"], &phases) != nil || json.Unmarshal(section["waits"], &waits) != nil {
+		t.Fatal(raw)
+	}
+	// Polls: two of the three waits before the ack, the single blocking wait,
+	// the non-blocking check, and the wait for the owner.
+	if polls != 5 || len(phases) != 1 || phases[0].Key != "build" || phases[0].WaitingMs != "4742000" {
+		t.Fatalf("polls %d phases %+v", polls, phases)
+	}
+	// Waiting while the owner decision was open is the owner's, with its message.
+	if len(waits) != 2 || waits[0].Cause != "owner" || waits[0].MessageSeq != question || waits[0].Ms != "4437000" || waits[1].Cause != "unknown" || waits[1].Ms != "305000" {
+		t.Fatalf("waits %+v", waits)
+	}
+	out, err := captureStdout(t, func() error { return cmdUsage(e, []string{"--project", h.task.ID, "--item", item.ID}) })
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{
+		"  time: wall 1h20m12s · model 0.8% · tool 0.7% · waiting 98.5% · polls 5 (11s)",
+		"  timeline: some model working 0.8% · only tools running 0.7% · nobody active 98.5%",
+		"  time agent builder (unknown): model 38s · tool 32s · waiting 1h19m2s · polls 5",
+		"  time phase build: model 38s · tool 32s · waiting 1h19m2s",
+		"  time role unknown: model 38s · tool 32s · waiting 1h19m2s",
+		fmt.Sprintf("  wait owner: #%d \"Approve the <matrix> plan?\" · 1h13m57s · awaited by builder", question),
+		"  wait unknown: nothing the Board shows · 5m5s · awaited by builder",
+		"Project overhead: not measured",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("text output lacks %q:\n%s", want, out)
+		}
+	}
+	// An item with no spans says so; a hub that reports no time prints nothing.
+	other := h.item("Synthetic unmeasured item")
+	out, err = captureStdout(t, func() error { return cmdUsage(e, []string{"--project", h.task.ID, "--item", other.ID}) })
+	if err != nil || !strings.Contains(out, "  time: not measured") {
+		t.Fatalf("unmeasured item: %s %v", out, err)
+	}
+	old := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(api.UsageReport{Version: 1, ProjectID: h.task.ID, Items: []api.UsageItemReport{{Title: "Older hub item"}}})
+	}))
+	defer old.Close()
+	out, err = captureStdout(t, func() error { return cmdUsage(env{hub: old.URL, task: h.task.ID}, nil) })
+	if err != nil || strings.Contains(out, "  time") || !strings.Contains(out, "Older hub item") {
+		t.Fatalf("older hub output: %s %v", out, err)
+	}
+	// The browser test renders this real report.
+	if path := os.Getenv("USAGE_TIME_REPORT_FIXTURE"); path != "" {
+		if err = os.WriteFile(path, []byte(raw), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+// The order-change turn, through the real parser, chunking, HTTP and store:
+// the report is the same whether the turn went up whole or in chunks of two
+// entries, several of which hold no request of their own.
+func TestUsageTimeChunkSizeIndependence(t *testing.T) {
+	for _, runtime := range []string{"codex", "claude"} {
+		t.Run(runtime, func(t *testing.T) {
+			run := func(size int) (*api.UsageTime, int) {
+				usageSpanChunkSize = size
+				defer func() { usageSpanChunkSize = usageSpanChunkEntries }()
+				h := newUsageTimeHub(t)
+				item := h.item("Synthetic order change")
+				_, b := h.agent("builder", runtime, "")
+				setUsageTimeCapability(t, b.Hub, true)
+				assign := h.message("", b.Agent, "09:59:00", api.Envelope{Kind: "assign", Subject: "Build the synthetic item"}, item.ID)
+				review := h.message("", b.Agent, "10:09:00", api.Envelope{Kind: "review", Subject: "Review a teammate's change", Review: &api.ReviewMetadata{Mode: "general"}}, item.ID)
+				h.journal(b, api.UsageEvidence{TaskID: h.task.ID, Seq: assign, Operation: "ack", At: fixtureTime("09:59:55")}, api.UsageEvidence{TaskID: h.task.ID, Seq: review, Operation: "ack", At: fixtureTime("10:10:00")})
+				u := h.cursor(b)
+				parseUsageLines(t, u, usageTimeFixture(t, runtime+"-order-change.jsonl")...)
+				chunks := len(u.SpanDirty)
+				h.drain(u)
+				report, err := h.client.Usage(context.Background(), h.task.ID, api.UsageQuery{Item: item.ID})
+				if err != nil || len(report.Items) != 1 || report.Items[0].Time == nil {
+					t.Fatal(report, err)
+				}
+				// Tokens and time of each request share a phase.
+				tokens := map[string]int{}
+				for _, phase := range report.Items[0].Phases {
+					tokens[phase.Key] = phase.Summary.Requests
+				}
+				if tokens["build"] != 1 || tokens["review round unavailable"] != len(u.Turns)-1 {
+					t.Fatalf("token phases %+v", tokens)
+				}
+				return report.Items[0].Time, chunks
+			}
+			whole, one := run(usageSpanChunkEntries)
+			small, many := run(2)
+			if one != 1 || many < 4 {
+				t.Fatalf("chunks: whole %d, forced %d", one, many)
+			}
+			if len(whole.Phases) != 2 || whole.Phases[0].Key != "build" || whole.Phases[1].Key != "review round unavailable" {
+				t.Fatalf("phases %+v", whole.Phases)
+			}
+			// The first segment, 09:59:50 to 10:00:00, is build; the rest is review.
+			build, rest := whole.Phases[0], whole.Phases[1]
+			if usageMillis(build.ModelMs)+usageMillis(build.ToolMs) != 10000 || usageMillis(rest.ModelMs)+usageMillis(rest.ToolMs) != 1230000 {
+				t.Fatalf("phase split %+v", whole.Phases)
+			}
+			// The two runs are separate hubs; only the agent id may differ.
+			whole.Agents[0].AgentID, small.Agents[0].AgentID = "", ""
+			wholeJSON, _ := json.Marshal(whole)
+			smallJSON, _ := json.Marshal(small)
+			if string(wholeJSON) != string(smallJSON) {
+				t.Fatalf("chunk size changed the report:\nwhole %s\nsmall %s", wholeJSON, smallJSON)
+			}
+		})
+	}
+}

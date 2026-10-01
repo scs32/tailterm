@@ -226,6 +226,9 @@ type UsageReport struct {
 	Summary       UsageSummary      `json:"summary"`
 	Items         []UsageItemReport `json:"items"`
 	Overhead      UsageItemReport   `json:"overhead"`
+	// TimeVersion is 1 when this hub reports time. It tells an item whose
+	// time was not measured from a hub that does not report time at all.
+	TimeVersion int `json:"timeVersion,omitempty"`
 }
 type UsagePrice struct {
 	Runtime     string            `json:"runtime"`
