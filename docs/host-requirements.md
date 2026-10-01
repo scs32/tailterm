@@ -207,7 +207,7 @@ the role. Source: the item's inventory at 476eacc, rechecked at 10bc367.
 | Relay LaunchAgent PATH | `scripts/install-relay-macos.py:17` | macOS-only |
 | Old static-site deploy calls `/opt/homebrew/bin/container` | `scripts/deploy-remote-static.py:44,105` | macOS-only (old site tooling) |
 | Relay service is a LaunchAgent; no Linux service | `scripts/install-relay-macos.py` | to fix |
-| Release probe restarts the relay with `launchctl` | `scripts/release-probe.mjs:86` | macOS-only |
+| Release probe reads the relay status with `launchctl print` | `scripts/release-probe.mjs:93` | macOS-only |
 | Relay LaunchAgent environment is only PATH | `wi_ec4c3154f55bf5db` | to fix |
 | Test fixtures are hand-made files (`.build/test.wasm`, `.build/speech-fixture.wav`, `.build/go-modules.txt`, `wasm/tailserve.wasm`); the deployer's checkout lacked them | `scripts/verify-matrix.mjs`, `wi_5b03fe47520b7c4f` | to fix (doctor now names each) |
 | Go version implicit | `hub/go.mod` `go 1.26.6`, no `toolchain` line | portable (documented above) |
