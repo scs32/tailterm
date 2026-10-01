@@ -192,6 +192,16 @@ When the context carries `checks`, the plan step selects as usual and then:
   when the carried checks do not match their `checksDigest`. With an unchanged
   matrix digest and owned list neither difference has an approved cause.
 
+One difference does have an approved cause: the matrix-change case. When
+tasks-hub gained an owner-approved matrix change after acceptance, the release
+runner passes the accepted plan with the newer approval, so the carried
+`matrixDigest` differs from the current matrix file's. The new matrix may
+rebuild any check (timeouts, flags, environment), so for a differing id the
+rebuilt check stands. A rebuilt go-race still names every accepted package, or
+`./...` when the accepted one ran `./...`: the hub's matrix-change coverage
+rule. An accepted go-race whose packages cannot be read, and an accepted check
+the new matrix no longer selects, are still refused by name.
+
 `checksDigest` and the matrix policy fields describe the final check list. The
 plan gains no field: the hub binds a receipt to the digest of the plan fields
 it knows. Plan mode instead writes a record beside the plan output,
@@ -203,6 +213,7 @@ it knows. Plan mode instead writes a record beside the plan output,
   "acceptedChecksDigest": "<checksDigest of the carried checks>",
   "kept": ["go-race", "go-test", "go-vet"],
   "widened": [],
+  "rebuilt": [],
   "added": [],
   "narrowerSelection": ["go-race"],
   "checksDigest": "<checksDigest of the plan>"
@@ -210,8 +221,11 @@ it knows. Plan mode instead writes a record beside the plan output,
 ```
 
 `kept` checks equal the accepted ones, `widened` are a go-race with more
-packages than accepted, `added` are new, and `narrowerSelection` names the
-checks this commit alone would have run on less. A context without `checks`
+packages than accepted, `rebuilt` are checks the newer approved matrix changed,
+`added` are new, and `narrowerSelection` names the checks this commit alone
+would have run on less. Every accepted id is in exactly one of `kept`,
+`widened` and `rebuilt`. After a matrix change the record also carries
+`acceptedMatrixDigest` and `matrixDigest`. A context without `checks`
 plans exactly as before and writes no record; a stale record is removed.
 Targeted plans ignore carried checks.
 

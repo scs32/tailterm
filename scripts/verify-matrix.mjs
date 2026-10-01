@@ -287,10 +287,19 @@ function goRacePackages(argv) {
 // selected from the integrated diff alone it would name only those items'
 // packages, which the hub refuses. Only go-race depends on the diff, so it is
 // the one check that may differ: its packages are the union of both lists,
-// and ./... wins. Any other difference, or an accepted check this selection
-// lacks, has no approved explanation and fails here rather than at the import.
+// and ./... wins. Any other difference has one approved cause: the owner
+// approved a new matrix after acceptance, which may rebuild any check
+// (timeouts, flags, environment). Then the rebuilt check stands, and a rebuilt
+// go-race still names every accepted package, the hub's matrix-change rule.
+// Under an unchanged matrix such a difference, and under either an accepted
+// check this selection lacks, fails here rather than at the import.
 // Returns the checks and a record of what was kept.
-export function keepAcceptedChecks(selected, accepted, acceptedDigest) {
+export function keepAcceptedChecks(
+  selected,
+  accepted,
+  acceptedDigest,
+  { matrixChanged = false } = {},
+) {
   const refuse = (message) =>
     Object.assign(new Error(message), { acceptedChecks: true });
   const wellFormed = (c) =>
@@ -316,6 +325,7 @@ export function keepAcceptedChecks(selected, accepted, acceptedDigest) {
       throw refuse("Accepted check is not selected for this commit: " + check.id);
   const kept = [],
     widened = [],
+    rebuilt = [],
     added = [],
     narrowerSelection = [];
   const checks = selected.map((check) => {
@@ -328,21 +338,27 @@ export function keepAcceptedChecks(selected, accepted, acceptedDigest) {
       kept.push(check.id);
       return check;
     }
-    const want = check.id === "go-race" && goRacePackages(prior.argv),
+    const race = check.id === "go-race",
+      want = race && goRacePackages(prior.argv),
       have = want && goRacePackages(check.argv);
-    if (
-      !want ||
-      !have ||
-      canonical(want.flags) !== canonical(have.flags) ||
-      canonical({ ...prior, argv: [] }) !== canonical({ ...check, argv: [] })
-    )
+    const samePolicy =
+      want &&
+      have &&
+      canonical(want.flags) === canonical(have.flags) &&
+      canonical({ ...prior, argv: [] }) === canonical({ ...check, argv: [] });
+    if ((race && !(want && have)) || (!samePolicy && !matrixChanged))
       throw refuse("Accepted check differs from the selected one: " + check.id);
+    if (!race) {
+      rebuilt.push(check.id);
+      return check;
+    }
     const all = [want, have].some((p) => p.packages.includes("./..."));
     const packages = all
       ? ["./..."]
       : [...new Set([...want.packages, ...have.packages])].sort();
     const merged = { ...check, argv: [...have.flags, ...packages] };
-    if (canonical(merged) === canonical(prior)) kept.push(check.id);
+    if (!samePolicy) rebuilt.push(check.id);
+    else if (canonical(merged) === canonical(prior)) kept.push(check.id);
     else widened.push(check.id);
     if (canonical(merged) !== canonical(check)) narrowerSelection.push(check.id);
     return merged;
@@ -354,6 +370,7 @@ export function keepAcceptedChecks(selected, accepted, acceptedDigest) {
       acceptedChecksDigest: digest(accepted),
       kept,
       widened,
+      rebuilt,
       added,
       narrowerSelection,
     },
@@ -390,13 +407,21 @@ export function planWithPreservation(context, cwd) {
   for (const check of checks)
     if (check.argv[0] === "go")
       check.environment.VERIFICATION_BASE_COMMIT = context.baseCommit;
+  // The carried matrixDigest is the accepted plan's; the release runner swaps
+  // only the approval fields when the integrated checkout's matrix is newer.
+  const matrixChanged =
+    /^[a-f0-9]{64}$/.test(context.matrixDigest || "") &&
+    context.matrixDigest !== digest(raw);
   let preserved = null;
-  if (context.checks !== undefined)
+  if (context.checks !== undefined) {
     ({ checks, preserved } = keepAcceptedChecks(
       checks,
       context.checks,
       context.checksDigest,
+      { matrixChanged },
     ));
+    if (matrixChanged) preserved.acceptedMatrixDigest = context.matrixDigest;
+  }
   const { maxAttempts, knownFailures, ...inputContext } = context;
   const plan = {
     ...inputContext,
@@ -407,7 +432,10 @@ export function planWithPreservation(context, cwd) {
     changed,
     checks,
   };
-  if (preserved) preserved.checksDigest = plan.checksDigest;
+  if (preserved) {
+    if (matrixChanged) preserved.matrixDigest = plan.matrixDigest;
+    preserved.checksDigest = plan.checksDigest;
+  }
   return { plan, preserved };
 }
 export function makePlan(context, cwd) {
@@ -1417,6 +1445,9 @@ if (
         );
         console.error(
           `Kept ${preserved.kept.length + preserved.widened.length} accepted checks (accepted checksDigest ${preserved.acceptedChecksDigest})` +
+            (preserved.rebuilt.length
+              ? `; rebuilt under the newer approved matrix: ${preserved.rebuilt.join(", ")}`
+              : "") +
             (preserved.narrowerSelection.length
               ? "; this commit alone selected less for: " +
                 preserved.narrowerSelection.join(", ")

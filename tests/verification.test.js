@@ -2055,6 +2055,7 @@ test("integrated plan of a docs-only item under hub/cmd/tt keeps the accepted go
     acceptedChecksDigest: f.accepted.checksDigest,
     kept: ["go-race", "go-test", "go-vet"],
     widened: [],
+    rebuilt: [],
     added: [],
     narrowerSelection: ["go-race"],
     checksDigest: integrated.checksDigest,
@@ -2091,6 +2092,7 @@ test("integrated plan keeps every accepted check, adds newly selected ones and u
     acceptedChecksDigest: digest(accepted.checks),
     kept: ["go-test", "go-vet"],
     widened: ["go-race"],
+    rebuilt: [],
     added: ["npm-unit"],
     narrowerSelection: ["go-race"],
     checksDigest: plan.checksDigest,
@@ -2226,6 +2228,7 @@ test("a context without checks plans as before, and only plan mode writes the ke
     acceptedChecksDigest: before.checksDigest,
     kept: ["go-race", "go-test", "go-vet"],
     widened: [],
+    rebuilt: [],
     added: [],
     narrowerSelection: ["go-race"],
     checksDigest: written.checksDigest,
@@ -2240,4 +2243,93 @@ test("a context without checks plans as before, and only plan mode writes the ke
     makeTargetedPlan({ ...targeted, checks: [{ id: "x" }] }, f.cwd),
     makeTargetedPlan(targeted, f.cwd),
   );
+});
+
+test("after an approved matrix change the rebuilt checks stand and go-race still covers accepted packages", async (t) => {
+  // The item changes a non-Go file under hub/, so its accepted go-race is ./...
+  const f = integratedFixture(t);
+  const oldRaw = readFileSync(join(f.cwd, "verification/matrix.json"), "utf8");
+  assert.equal(f.accepted.matrixDigest, digest(oldRaw));
+  writeFileSync(
+    join(f.cwd, "verification/matrix.json"),
+    JSON.stringify({
+      ...JSON.parse(oldRaw),
+      goTestFlags: ["-timeout=30m"],
+      checkTimeoutMs: { "go-vet": 120000 },
+      rules: [
+        ...JSON.parse(oldRaw).rules,
+        { prefixes: ["verification/"], groups: ["go"] },
+      ],
+    }),
+  );
+  // What the release runner builds: the accepted plan, the newer approval and
+  // the integrated commit; matrixDigest still names the accepted matrix.
+  const carried = f.integrate();
+  const newRaw = readFileSync(join(f.cwd, "verification/matrix.json"), "utf8");
+  const context = {
+    ...carried,
+    approvedMatrixDigest: digest(newRaw),
+    matrixApprovalMessageSeq: 2,
+  };
+  const { plan, preserved } = matrixRunner.planWithPreservation(context, f.cwd);
+  // Flags and timeouts come from the new matrix; the packages stay ./...,
+  // where the integrated diff alone selects only another item's package.
+  assert.deepEqual(raceArgv(plan), ["go", "test", "-race", "-timeout=30m", "./..."]);
+  assert.deepEqual(plan.checks.find((c) => c.id === "go-test").argv, [
+    "go", "test", "-timeout=30m", "./...",
+  ]);
+  const vet = plan.checks.find((c) => c.id === "go-vet");
+  assert.equal(vet.environment.VERIFICATION_TIMEOUT_MS, "120000");
+  assert.equal(plan.matrixDigest, digest(newRaw));
+  assert.equal(plan.checksDigest, digest(plan.checks));
+  assert.deepEqual(Object.keys(plan).sort(), Object.keys(f.accepted).sort());
+  assert.deepEqual(preserved, {
+    version: 1,
+    acceptedChecksDigest: f.accepted.checksDigest,
+    kept: [],
+    widened: [],
+    rebuilt: ["go-race", "go-test", "go-vet"],
+    added: [],
+    narrowerSelection: ["go-race"],
+    acceptedMatrixDigest: digest(oldRaw),
+    matrixDigest: digest(newRaw),
+    checksDigest: plan.checksDigest,
+  });
+  // A rebuilt go-race unions an accepted package list too.
+  const race = plan.checks.find((c) => c.id === "go-race");
+  const listed = matrixRunner.keepAcceptedChecks(
+    [{ ...race, argv: ["go", "test", "-race", "-timeout=30m", "./internal/store"] }],
+    [{ ...race, argv: ["go", "test", "-race", "./cmd/tt"] }],
+    undefined,
+    { matrixChanged: true },
+  );
+  assert.deepEqual(listed.checks[0].argv, [
+    "go", "test", "-race", "-timeout=30m", "./cmd/tt", "./internal/store",
+  ]);
+  assert.deepEqual(listed.preserved.rebuilt, ["go-race"]);
+  // Still refused by name under a changed matrix: an accepted go-race whose
+  // packages cannot be read, and an accepted check the new matrix drops.
+  assert.throws(
+    () => makePlan(withChecks(context, (checks) => {
+      checks.find((c) => c.id === "go-race").argv.push("-run=None");
+    }), f.cwd),
+    /^Error: Accepted check differs from the selected one: go-race$/,
+  );
+  assert.throws(
+    () => makePlan(withChecks(context, (checks) => {
+      checks.push({ id: "npm-unit", argv: ["npm", "test"], cwd: ".", environment: {} });
+    }), f.cwd),
+    /^Error: Accepted check is not selected for this commit: npm-unit$/,
+  );
+  // With the accepted matrix digest the same differences are refused: only a
+  // digest the owner approved again explains a rebuilt check.
+  assert.throws(
+    () => makePlan({ ...context, matrixDigest: digest(newRaw) }, f.cwd),
+    /^Error: Accepted check differs from the selected one: go-race$/,
+  );
+  // The plan names the new matrix, so run re-derives it as unchanged.
+  const receipt = await runPlan(plan, f.cwd, tempDir(t, "verification-logs-"), { jobs: 1 });
+  assert.equal(receipt.planDigest, digest(plan));
+  assert.deepEqual(receipt.checks[0].argv, ["go", "test", "-race", "-timeout=30m", "./..."]);
+  assert.deepEqual(receipt.checks.map((c) => c.exitCode), [0, 0, 0]);
 });
