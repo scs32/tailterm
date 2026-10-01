@@ -400,11 +400,34 @@ blocker IDs in Status. The original exact reviewer run is eligible; another
 verifier must be bound to `verificationItemId`, which is also a native related
 item link on the lead's request. Focused verification never allocates a round.
 
+A candidate rebased after a converged review has no blocker to name. The lead
+sends the same focused REQUEST with `blockerIds` omitted or empty, the rebased
+commit as `candidate`, and a `fix` that contains the full round-two candidate:
+
+```json
+{"mode":"focused","candidate":"cccccccccccccccccccccccccccccccccccccccc",
+ "fix":"Rebase of bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb onto tasks-hub; tree identical"}
+```
+
+The hub refuses it unless the round-two candidate itself could be accepted
+(every criterion passed, no unresolved blocker) and no blocker is unresolved on
+the rebased commit; a real finding still uses named `blockerIds`. The same
+verifiers are eligible. The RESULT repeats the metadata, reports exactly
+`equivalence=pass` or `equivalence=fail` in Status, and includes at least one
+`command` evidence entry naming both full commits: tree identity
+(`git diff --quiet <reviewed> <rebased> -> exit 0`) or series equivalence
+(`git range-diff <old base>..<reviewed> <new base>..<rebased>` with every pair
+`=`). The hub checks the form of the proof; the verifier attests the git fact.
+
 A lead NOTICE records `mode:"disposition"`, exact `candidate` and `disposition`
 of `accept`, `owner-decision` or `follow-ups`. Completion and team acceptance
 require recorded acceptance, passing criteria and resolved blockers. A changed
-candidate requires passing exact focused verification. Receipt replay precedes
-all enforcement; refusals roll back the message, obligations, follow-ups and
+candidate requires passing exact focused verification as the latest focused
+record: of its named blockers, or of its equivalence to the reviewed candidate.
+Where independent verification is required, the passing receipt must also be for
+that exact changed commit; a receipt for the pre-rebase commit does not count.
+Receipt replay precedes all enforcement; refusals roll back the message,
+obligations, follow-ups and
 ledger atomically. Reassignment preserves a round's original request and changes
 its active request/reviewer run; it never refunds a round.
 

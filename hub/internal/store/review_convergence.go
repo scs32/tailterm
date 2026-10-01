@@ -540,9 +540,14 @@ func (s *Store) applyReviewConvergence(ctx context.Context, tx *sql.Tx, m api.Me
 		if len(state.Rounds) != 2 || state.Rounds[1].ResultSeq == 0 {
 			return reviewConflict("focused path requires two completed general reviews")
 		}
-		if !validGitCommit(meta.Candidate) || strings.TrimSpace(meta.Fix) == "" || len(meta.BlockerIDs) == 0 {
-			return reviewConflict("focused verification needs exact fix, candidate and blocker IDs")
+		if !validGitCommit(meta.Candidate) || strings.TrimSpace(meta.Fix) == "" {
+			return reviewConflict("focused verification needs exact fix and candidate")
 		}
+		// No blocker IDs: a rebase equivalence verification of the round-two
+		// candidate. The hub checks identity and shape; the verifier attests the
+		// git fact.
+		rebase := len(meta.BlockerIDs) == 0
+		reviewed := state.Rounds[1].Candidate
 		if e.Kind == "request" {
 			if err = reviewLead(ctx, tx, m.TaskID, item.ID, req.AgentID, req.RunID); err != nil {
 				return err
@@ -575,6 +580,20 @@ func (s *Store) applyReviewConvergence(ctx context.Context, tx *sql.Tx, m api.Me
 				return reviewConflict("verifier must be original exact reviewer or bound to linked verification item")
 			}
 			open := outstandingOnCandidate(state, meta.Candidate)
+			if rebase {
+				if meta.Candidate == reviewed {
+					return reviewConflict("rebase verification needs a candidate other than the reviewed one")
+				}
+				if !strings.Contains(meta.Fix, reviewed) {
+					return reviewConflict("rebase verification fix must name the exact reviewed candidate")
+				}
+				if err = reviewReady(state, item.ScopeRevision, reviewed); err != nil {
+					return reviewConflict("rebase verification needs a converged review; name unresolved blocker IDs instead")
+				}
+				if len(open) != 0 {
+					return reviewConflict("unresolved blockers on rebased candidate; name them for focused verification")
+				}
+			}
 			seen := map[string]bool{}
 			for _, id := range meta.BlockerIDs {
 				if _, ok := open[id]; !ok || seen[id] {
@@ -585,7 +604,11 @@ func (s *Store) applyReviewConvergence(ctx context.Context, tx *sql.Tx, m api.Me
 			if len(state.Focused) > 0 && state.Focused[len(state.Focused)-1].ResultSeq == 0 {
 				return reviewConflict("focused verification pending")
 			}
-			state.Focused = append(state.Focused, api.FocusedReview{RequestSeq: m.Seq, Candidate: meta.Candidate, Fix: meta.Fix, BlockerIDs: meta.BlockerIDs, ReviewerID: target.ID, ReviewerRun: target.RunID, VerificationItemID: meta.VerificationItemID})
+			ids := meta.BlockerIDs
+			if rebase {
+				ids = []string{} // stored as [], never null
+			}
+			state.Focused = append(state.Focused, api.FocusedReview{RequestSeq: m.Seq, Candidate: meta.Candidate, Fix: meta.Fix, BlockerIDs: ids, ReviewerID: target.ID, ReviewerRun: target.RunID, VerificationItemID: meta.VerificationItemID})
 			state.Disposition = nil
 		} else if e.Kind == "result" {
 			found := false
@@ -595,8 +618,24 @@ func (s *Store) applyReviewConvergence(ctx context.Context, tx *sql.Tx, m api.Me
 					continue
 				}
 				found = true
-				if f.ResultSeq != 0 || f.ReviewerID != req.AgentID || f.ReviewerRun != req.RunID || f.Candidate != meta.Candidate || f.Fix != meta.Fix || !reflect.DeepEqual(f.BlockerIDs, meta.BlockerIDs) || f.VerificationItemID != meta.VerificationItemID {
+				if f.ResultSeq != 0 || f.ReviewerID != req.AgentID || f.ReviewerRun != req.RunID || f.Candidate != meta.Candidate || f.Fix != meta.Fix || (len(f.BlockerIDs)+len(meta.BlockerIDs) != 0 && !reflect.DeepEqual(f.BlockerIDs, meta.BlockerIDs)) || f.VerificationItemID != meta.VerificationItemID {
 					return reviewConflict("focused result identity, fix or candidate mismatch")
+				}
+				if len(f.BlockerIDs) == 0 {
+					verdict := e.Body.Status["equivalence"]
+					if len(meta.Blockers) > 0 || len(meta.Findings) > 0 || len(e.Body.Status) != 1 || (verdict != "pass" && verdict != "fail") {
+						return reviewConflict("rebase result reports exactly equivalence pass or fail")
+					}
+					proven := false
+					for _, ev := range e.Evidence {
+						proven = proven || (ev.Type == "command" && strings.Contains(ev.Value, reviewed) && strings.Contains(ev.Value, f.Candidate))
+					}
+					if !proven {
+						return reviewConflict("rebase result needs command evidence naming the reviewed and rebased candidates")
+					}
+					f.Passed = verdict == "pass"
+					f.ResultSeq = m.Seq
+					continue
 				}
 				if len(meta.Blockers) > 0 || len(meta.Findings) > 0 || len(e.Evidence) == 0 || len(e.Body.Status) != len(f.BlockerIDs) {
 					return reviewConflict("focused result verifies exactly the named fixes with evidence")

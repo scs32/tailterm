@@ -2,10 +2,12 @@ package store
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"github.com/scs32/tailterm/hub/internal/api"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -1297,5 +1299,405 @@ func TestReviewConvergenceOwnerAcceptResolvesFollowUpsAfterVerification(t *testi
 	defer tx.Rollback()
 	if err = reviewCompletion(f.ctx, tx, f.item, candidateB); err != nil {
 		t.Fatal("owner-accepted exact commit", err)
+	}
+}
+
+// Rebase equivalence: a focused REQUEST/RESULT pair with no blocker IDs lets a
+// candidate rebased after two converged general rounds be accepted.
+const candidateD = "dddddddddddddddddddddddddddddddddddddddd"
+
+func rebaseFix(reviewed string) string {
+	return "Rebase of " + reviewed + " onto current base; tree identical"
+}
+func rebaseProof(reviewed, rebased string) map[string]api.Evidence {
+	return map[string]api.Evidence{"e1": {Type: "command", Value: "git diff --quiet " + reviewed + " " + rebased + " -> exit 0"}}
+}
+func rebaseRequestEnv(meta api.ReviewMetadata) api.Envelope {
+	meta.Mode = "focused"
+	return api.Envelope{Kind: "request", Subject: "Verify the rebased candidate is equivalent", Review: &meta, Body: api.EnvelopeBody{Ask: "Verify the rebased candidate matches the reviewed one"}}
+}
+func rebaseResultEnv(meta api.ReviewMetadata, status map[string]string, evidence map[string]api.Evidence) api.Envelope {
+	meta.Mode = "focused"
+	return api.Envelope{Kind: "result", Subject: "Rebase equivalence verdict recorded", Review: &meta, Body: api.EnvelopeBody{Outcome: "done", Status: status}, Evidence: evidence}
+}
+func (f *convergenceFixture) rebaseRequest(candidate, fix string, from api.Agent) (api.Message, error) {
+	return f.post(rebaseRequestEnv(api.ReviewMetadata{Candidate: candidate, Fix: fix}), f.reviewer.ID, 0, from)
+}
+func (f *convergenceFixture) rebaseResult(reply int64, candidate, fix, verdict string, evidence map[string]api.Evidence) error {
+	_, err := f.post(rebaseResultEnv(api.ReviewMetadata{Candidate: candidate, Fix: fix}, map[string]string{"equivalence": verdict}, evidence), "", reply, f.reviewer)
+	return err
+}
+func (f *convergenceFixture) acceptCandidate(candidate string, from api.Agent) error {
+	_, err := f.post(api.Envelope{Kind: "notice", Subject: "Accept the exact verified candidate", Review: &api.ReviewMetadata{Mode: "disposition", Disposition: "accept", Candidate: candidate}, Body: api.EnvelopeBody{Text: "Accept"}}, "", 0, from)
+	return err
+}
+func (f *convergenceFixture) generalRound(t *testing.T, candidate string, status map[string]string, meta api.ReviewMetadata) {
+	t.Helper()
+	meta.Mode = "general"
+	r := f.review(t, candidate)
+	if _, err := f.post(f.resultEnv(candidate, status, meta), "", r.Seq, f.reviewer); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestReviewConvergenceCleanRebaseEquivalenceAcceptance(t *testing.T) {
+	f := newConvergenceFixture(t)
+	f.generalRound(t, candidateA, passConvergence, api.ReviewMetadata{})
+	f.generalRound(t, candidateB, passConvergence, api.ReviewMetadata{})
+	seedPassingVerification(t, f.s, f.item, candidateC)
+	if err := f.acceptCandidate(candidateC, api.Agent{}); !errors.Is(err, api.ErrConflict) {
+		t.Fatal("rebased candidate accepted without equivalence verification", err)
+	}
+	fix := rebaseFix(candidateB)
+	requestEnv := rebaseRequestEnv(api.ReviewMetadata{Candidate: candidateC, Fix: fix})
+	if problems := api.ValidateEnvelope(requestEnv); len(problems) != 0 {
+		t.Fatal("request envelope invalid", problems)
+	}
+	request, err := f.post(requestEnv, f.reviewer.ID, 0, api.Agent{})
+	if err != nil {
+		t.Fatal("empty-blocker rebase request refused", err)
+	}
+	st := f.state(t)
+	if len(st.Focused) != 1 || st.Focused[0].Candidate != candidateC || st.Focused[0].Passed || st.Focused[0].ResultSeq != 0 {
+		t.Fatal("pending rebase verification", st)
+	}
+	if raw, _ := json.Marshal(st.Focused[0]); !strings.Contains(string(raw), `"blockerIds":[]`) {
+		t.Fatal("stored blocker list is not an empty array", string(raw))
+	}
+	if err = f.acceptCandidate(candidateC, api.Agent{}); !errors.Is(err, api.ErrConflict) {
+		t.Fatal("accepted before the equivalence verdict", err)
+	}
+	resultEnv := rebaseResultEnv(api.ReviewMetadata{Candidate: candidateC, Fix: fix}, map[string]string{"equivalence": "pass"}, rebaseProof(candidateB, candidateC))
+	if problems := api.ValidateEnvelope(resultEnv); len(problems) != 0 {
+		t.Fatal("result envelope invalid", problems)
+	}
+	if _, err = f.post(resultEnv, "", request.Seq, f.reviewer); err != nil {
+		t.Fatal("equivalence result refused", err)
+	}
+	if err = f.acceptCandidate(candidateC, api.Agent{}); err != nil {
+		t.Fatal("clean rebase not accepted", err)
+	}
+	st = f.state(t)
+	if len(st.Rounds) != 2 || len(st.Focused) != 1 || !st.Focused[0].Passed || st.Disposition == nil || st.Disposition.Kind != "accept" || st.Disposition.Candidate != candidateC {
+		t.Fatal("accepted state", st)
+	}
+	done := "done"
+	if _, err = f.s.UpdateWorkItem(f.ctx, f.task.ID, f.item.ID, api.UpdateWorkItemRequest{Revision: 1, Status: &done}, f.by); err != nil {
+		t.Fatal("item completion", err)
+	}
+	tx, err := f.s.db.BeginTx(f.ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback()
+	if err = reviewCompletion(f.ctx, tx, f.item, candidateB); !errors.Is(err, api.ErrConflict) {
+		t.Fatal("team acceptance of the pre-rebase commit", err)
+	}
+	if err = reviewCompletion(f.ctx, tx, f.item, candidateC); err != nil {
+		t.Fatal("team acceptance of the rebased commit", err)
+	}
+}
+
+func TestReviewConvergenceCleanRebaseNeedsExactReceipt(t *testing.T) {
+	f := newConvergenceFixtureWithCriteria(t, map[string]string{"a1": "code", "a2": "matrix"}, []string{"a2"})
+	status := map[string]string{"a1": "pass", "a2": "pending-verification"}
+	f.generalRound(t, candidateA, status, api.ReviewMetadata{})
+	f.generalRound(t, candidateB, status, api.ReviewMetadata{})
+	fix := rebaseFix(candidateB)
+	request, err := f.rebaseRequest(candidateC, fix, f.lead)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = f.rebaseResult(request.Seq, candidateC, fix, "pass", rebaseProof(candidateB, candidateC)); err != nil {
+		t.Fatal(err)
+	}
+	if err = f.acceptCandidate(candidateC, f.lead); !errors.Is(err, api.ErrConflict) {
+		t.Fatal("accepted without any receipt", err)
+	}
+	seedPassingVerification(t, f.s, f.item, candidateB)
+	if err = f.acceptCandidate(candidateC, f.lead); !errors.Is(err, api.ErrConflict) {
+		t.Fatal("pre-rebase receipt covered the rebased commit", err)
+	}
+	seedPassingVerification(t, f.s, f.item, candidateC)
+	if err = f.acceptCandidate(candidateC, f.lead); err != nil {
+		t.Fatal("exact receipt and equivalence refused", err)
+	}
+	if st := f.state(t); len(st.Rounds) != 2 || st.Rounds[1].Verdicts["a2"] != "pending-verification" || st.Disposition == nil || st.Disposition.Candidate != candidateC {
+		t.Fatal("accepted state", st)
+	}
+}
+
+func TestReviewConvergenceRebaseNonEquivalentRefused(t *testing.T) {
+	f := newConvergenceFixture(t)
+	f.generalRound(t, candidateA, passConvergence, api.ReviewMetadata{})
+	f.generalRound(t, candidateB, passConvergence, api.ReviewMetadata{})
+	for _, c := range []string{candidateB, candidateC, candidateD} {
+		seedPassingVerification(t, f.s, f.item, c)
+	}
+	fix := rebaseFix(candidateB)
+	for name, bad := range map[string][2]string{
+		"fix names no commit":         {candidateC, "Rebase onto current base; tree identical"},
+		"fix names round one":         {candidateC, rebaseFix(candidateA)},
+		"fix names a short commit":    {candidateC, rebaseFix(candidateB[:12])},
+		"candidate is the reviewed":   {candidateB, fix},
+		"candidate is not a commit":   {"cccccc", fix},
+		"fix is empty":                {candidateC, " "},
+		"fix names only the rebased":  {candidateC, rebaseFix(candidateC)},
+		"candidate reviewed, no base": {candidateB, rebaseFix(candidateA)},
+	} {
+		if _, err := f.rebaseRequest(bad[0], bad[1], api.Agent{}); !errors.Is(err, api.ErrConflict) {
+			t.Fatal(name, err)
+		}
+	}
+	if len(f.state(t).Focused) != 0 {
+		t.Fatal("refused request was stored", f.state(t))
+	}
+	request, err := f.rebaseRequest(candidateC, fix, api.Agent{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	meta := api.ReviewMetadata{Candidate: candidateC, Fix: fix}
+	proof := rebaseProof(candidateB, candidateC)
+	pass := map[string]string{"equivalence": "pass"}
+	command := func(value string) map[string]api.Evidence {
+		return map[string]api.Evidence{"e1": {Type: "command", Value: value}}
+	}
+	for name, bad := range map[string]api.Envelope{
+		"criterion status":       rebaseResultEnv(meta, map[string]string{"a1": "pass"}, proof),
+		"two status keys":        rebaseResultEnv(meta, map[string]string{"equivalence": "pass", "a1": "pass"}, proof),
+		"unknown verdict":        rebaseResultEnv(meta, map[string]string{"equivalence": "partial"}, proof),
+		"record evidence only":   rebaseResultEnv(meta, pass, map[string]api.Evidence{"e1": {Type: "record", Value: "tree of " + candidateB + " equals tree of " + candidateC}}),
+		"only the rebased":       rebaseResultEnv(meta, pass, command("git rev-parse "+candidateC+"^{tree} -> same tree")),
+		"only the reviewed":      rebaseResultEnv(meta, pass, command("git rev-parse "+candidateB+"^{tree} -> same tree")),
+		"commits split":          rebaseResultEnv(meta, pass, map[string]api.Evidence{"e1": {Type: "command", Value: "git rev-parse " + candidateB + "^{tree}"}, "e2": {Type: "command", Value: "git rev-parse " + candidateC + "^{tree}"}}),
+		"short commits":          rebaseResultEnv(meta, pass, command("git diff --quiet "+candidateB[:12]+" "+candidateC[:12]+" -> exit 0")),
+		"different candidate":    rebaseResultEnv(api.ReviewMetadata{Candidate: candidateD, Fix: fix}, pass, rebaseProof(candidateB, candidateD)),
+		"different fix":          rebaseResultEnv(api.ReviewMetadata{Candidate: candidateC, Fix: fix + " again"}, pass, proof),
+		"named blocker":          rebaseResultEnv(api.ReviewMetadata{Candidate: candidateC, Fix: fix, BlockerIDs: []string{"b1"}}, map[string]string{"b1": "pass"}, proof),
+		"new blocker in verdict": rebaseResultEnv(api.ReviewMetadata{Candidate: candidateC, Fix: fix, Blockers: []api.ReviewFinding{{ID: "b1", Criterion: "a1", Title: "Changed", File: "fixture.go", Line: 1}}}, pass, proof),
+	} {
+		if _, err = f.post(bad, "", request.Seq, f.reviewer); !errors.Is(err, api.ErrConflict) {
+			t.Fatal(name, err)
+		}
+	}
+	if st := f.state(t); len(st.Focused) != 1 || st.Focused[0].ResultSeq != 0 {
+		t.Fatal("refused result was stored", st)
+	}
+	if err = f.acceptCandidate(candidateC, api.Agent{}); !errors.Is(err, api.ErrConflict) {
+		t.Fatal("accepted with no equivalence verdict", err)
+	}
+	if err = f.rebaseResult(request.Seq, candidateC, fix, "fail", proof); err != nil {
+		t.Fatal("failed verdict must be recordable", err)
+	}
+	if st := f.state(t); st.Focused[0].Passed || st.Focused[0].ResultSeq == 0 {
+		t.Fatal("failed verdict recorded as passed", st)
+	}
+	if err = f.acceptCandidate(candidateC, api.Agent{}); !errors.Is(err, api.ErrConflict) {
+		t.Fatal("non-equivalent candidate accepted", err)
+	}
+	if err = f.rebaseResult(request.Seq, candidateC, fix, "pass", proof); !errors.Is(err, api.ErrConflict) {
+		t.Fatal("verdict replaced", err)
+	}
+	// A later pass on C covers C only, and only while it is the latest verification.
+	request, err = f.rebaseRequest(candidateC, fix, api.Agent{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = f.rebaseResult(request.Seq, candidateC, fix, "pass", proof); err != nil {
+		t.Fatal(err)
+	}
+	if err = f.acceptCandidate(candidateD, api.Agent{}); !errors.Is(err, api.ErrConflict) {
+		t.Fatal("equivalence of C accepted D", err)
+	}
+	request, err = f.rebaseRequest(candidateD, fix, api.Agent{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = f.acceptCandidate(candidateC, api.Agent{}); !errors.Is(err, api.ErrConflict) {
+		t.Fatal("superseded candidate accepted while a later one is pending", err)
+	}
+	if err = f.rebaseResult(request.Seq, candidateD, fix, "fail", rebaseProof(candidateB, candidateD)); err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range []string{candidateC, candidateD} {
+		if err = f.acceptCandidate(c, api.Agent{}); !errors.Is(err, api.ErrConflict) {
+			t.Fatal("accepted after a later failed equivalence", c, err)
+		}
+	}
+	if err = f.acceptCandidate(candidateB, api.Agent{}); err != nil {
+		t.Fatal("reviewed candidate itself remains acceptable", err)
+	}
+	if st := f.state(t); len(st.Rounds) != 2 || len(st.Focused) != 3 {
+		t.Fatal("history", st)
+	}
+}
+
+func TestReviewConvergenceRebaseCannotBypassBlocker(t *testing.T) {
+	named := func(t *testing.T, f *convergenceFixture, candidate string) {
+		t.Helper()
+		meta := api.ReviewMetadata{Mode: "focused", Candidate: candidate, Fix: "Restore durable retry receipt", BlockerIDs: []string{"b1"}}
+		request, err := f.post(api.Envelope{Kind: "request", Subject: "Verify precise retry receipt fix", Review: &meta, Body: api.EnvelopeBody{Ask: "Verify the receipt fix"}}, f.reviewer.ID, 0, api.Agent{})
+		if err != nil {
+			t.Fatal("named blocker request", err)
+		}
+		if _, err = f.post(f.resultEnv(candidate, map[string]string{"b1": "pass"}, meta), "", request.Seq, f.reviewer); err != nil {
+			t.Fatal("named blocker result", err)
+		}
+	}
+	refused := func(t *testing.T, f *convergenceFixture, candidate, reason string) {
+		t.Helper()
+		_, err := f.rebaseRequest(candidate, rebaseFix(candidateB), api.Agent{})
+		if !errors.Is(err, api.ErrConflict) || !strings.Contains(err.Error(), reason) {
+			t.Fatal("empty-blocker request", candidate, err)
+		}
+		if err = f.acceptCandidate(candidate, api.Agent{}); !errors.Is(err, api.ErrConflict) {
+			t.Fatal("accept", candidate, err)
+		}
+	}
+	seed := func(t *testing.T, f *convergenceFixture) {
+		t.Helper()
+		for _, c := range []string{candidateB, candidateC, candidateD} {
+			seedPassingVerification(t, f.s, f.item, c)
+		}
+	}
+	t.Run("retained criterion blocker", func(t *testing.T) {
+		f := newConvergenceFixture(t)
+		b := api.ReviewFinding{ID: "b1", Criterion: "a1", Title: "Retry failure", File: "fixture.go", Line: 7}
+		failed := map[string]string{"a1": "fail", "a2": "pass"}
+		f.generalRound(t, candidateA, failed, api.ReviewMetadata{Blockers: []api.ReviewFinding{b}})
+		f.generalRound(t, candidateB, failed, api.ReviewMetadata{Blockers: []api.ReviewFinding{b}})
+		seed(t, f)
+		refused(t, f, candidateC, "rebase verification needs a converged review")
+		if len(f.state(t).Focused) != 0 {
+			t.Fatal("refused request was stored", f.state(t))
+		}
+		// The blocker is fix-verified on C; a later rebase to D is not covered.
+		named(t, f, candidateC)
+		refused(t, f, candidateD, "rebase verification needs a converged review")
+		named(t, f, candidateD)
+		if err := f.acceptCandidate(candidateD, api.Agent{}); err != nil {
+			t.Fatal("named-blocker path on the rebased commit", err)
+		}
+	})
+	t.Run("blocker verified on the reviewed commit only", func(t *testing.T) {
+		f := newConvergenceFixture(t)
+		b := api.ReviewFinding{ID: "b1", Regression: true, Baseline: candidateC, Candidate: candidateA, Title: "Regression", File: "fixture.go", Line: 1}
+		f.generalRound(t, candidateA, passConvergence, api.ReviewMetadata{Blockers: []api.ReviewFinding{b}})
+		b.Candidate = candidateB
+		f.generalRound(t, candidateB, passConvergence, api.ReviewMetadata{Blockers: []api.ReviewFinding{b}})
+		seed(t, f)
+		refused(t, f, candidateD, "rebase verification needs a converged review")
+		named(t, f, candidateB)
+		// The reviewed commit now converges, but b1 is still open on D.
+		refused(t, f, candidateD, "unresolved blockers on rebased candidate")
+		named(t, f, candidateD)
+		if err := f.acceptCandidate(candidateD, api.Agent{}); err != nil {
+			t.Fatal("named-blocker path on the rebased commit", err)
+		}
+	})
+	t.Run("partial criterion without blocker", func(t *testing.T) {
+		f := newConvergenceFixture(t)
+		partial := map[string]string{"a1": "pass", "a2": "partial"}
+		f.generalRound(t, candidateA, partial, api.ReviewMetadata{})
+		f.generalRound(t, candidateB, partial, api.ReviewMetadata{})
+		seed(t, f)
+		refused(t, f, candidateC, "rebase verification needs a converged review")
+		if st := f.state(t); len(st.Focused) != 0 || len(st.Rounds) != 2 {
+			t.Fatal("refused request changed state", st)
+		}
+	})
+}
+
+func TestReviewConvergenceRebaseLifecycle(t *testing.T) {
+	f := newConvergenceFixture(t)
+	lead, err := f.s.AddAgent(f.ctx, f.task.ID, api.AddAgentRequest{Name: "lead", Host: "fixture", Session: "lead"}, f.by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	name := "lead"
+	if _, err = f.s.UpdateTask(f.ctx, f.task.ID, api.UpdateTaskRequest{Orchestrator: &name}, f.by); err != nil {
+		t.Fatal(err)
+	}
+	fix := rebaseFix(candidateB)
+	request := func(candidate string, ids []string, to string, from api.Agent) (api.Message, error) {
+		return f.post(rebaseRequestEnv(api.ReviewMetadata{Candidate: candidate, Fix: fix, BlockerIDs: ids}), to, 0, from)
+	}
+	result := func(reply int64, candidate string, ids []string, from api.Agent) error {
+		_, err := f.post(rebaseResultEnv(api.ReviewMetadata{Candidate: candidate, Fix: fix, BlockerIDs: ids}, map[string]string{"equivalence": "pass"}, rebaseProof(candidateB, candidate)), "", reply, from)
+		return err
+	}
+	f.generalRound(t, candidateA, passConvergence, api.ReviewMetadata{})
+	if _, err = request(candidateC, nil, f.reviewer.ID, lead); !errors.Is(err, api.ErrConflict) {
+		t.Fatal("rebase verification after one round", err)
+	}
+	r2 := f.review(t, candidateB)
+	if _, err = request(candidateC, nil, f.reviewer.ID, lead); !errors.Is(err, api.ErrConflict) {
+		t.Fatal("rebase verification during round two", err)
+	}
+	if _, err = f.post(f.resultEnv(candidateB, passConvergence, api.ReviewMetadata{Mode: "general"}), "", r2.Seq, f.reviewer); err != nil {
+		t.Fatal(err)
+	}
+	seedPassingVerification(t, f.s, f.item, candidateD)
+	stale := lead
+	stale.RunID = "run_bbbbbbbbbbbbbbbb"
+	for name, attempt := range map[string]struct {
+		to   string
+		from api.Agent
+	}{
+		"non-lead author":       {f.reviewer.ID, f.reviewer},
+		"stale lead run":        {f.reviewer.ID, stale},
+		"verifier not reviewer": {lead.ID, lead},
+	} {
+		if _, err = request(candidateC, nil, attempt.to, attempt.from); !errors.Is(err, api.ErrConflict) {
+			t.Fatal(name, err)
+		}
+	}
+	// Explicit empty list on the request, omitted field on the result.
+	first, err := request(candidateC, []string{}, f.reviewer.ID, lead)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = request(candidateD, nil, f.reviewer.ID, lead); !errors.Is(err, api.ErrConflict) {
+		t.Fatal("second focused request while one is pending", err)
+	}
+	staleReviewer := f.reviewer
+	staleReviewer.RunID = "run_dddddddddddddddd"
+	if err = result(first.Seq, candidateC, nil, staleReviewer); !errors.Is(err, api.ErrConflict) {
+		t.Fatal("stale verifier run", err)
+	}
+	if err = result(first.Seq, candidateC, nil, lead); !errors.Is(err, api.ErrConflict) {
+		t.Fatal("lead verified its own request", err)
+	}
+	if err = result(first.Seq, candidateC, nil, f.reviewer); err != nil {
+		t.Fatal("omitted list did not match the empty list", err)
+	}
+	if err = result(first.Seq, candidateC, nil, f.reviewer); !errors.Is(err, api.ErrConflict) {
+		t.Fatal("second verdict on one request", err)
+	}
+	if _, err = f.post(api.Envelope{Kind: "review", Subject: "Review frozen fixture candidate", Body: api.EnvelopeBody{Candidate: candidateC, Scope: "Fixture", Acceptance: f.criteria}}, f.reviewer.ID, 0, lead); !errors.Is(err, api.ErrConflict) {
+		t.Fatal("third general round", err)
+	}
+	// Omitted field on the request, explicit empty list on the result.
+	second, err := request(candidateD, nil, f.reviewer.ID, lead)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = result(second.Seq, candidateD, []string{}, f.reviewer); err != nil {
+		t.Fatal("empty list did not match the omitted list", err)
+	}
+	if err = f.acceptCandidate(candidateD, f.reviewer); !errors.Is(err, api.ErrConflict) {
+		t.Fatal("non-lead accepted", err)
+	}
+	if err = f.acceptCandidate(candidateD, lead); err != nil {
+		t.Fatal(err)
+	}
+	st := f.state(t)
+	if len(st.Rounds) != 2 || len(st.Focused) != 2 || !st.Focused[0].Passed || !st.Focused[1].Passed || st.Disposition == nil || st.Disposition.Candidate != candidateD {
+		t.Fatal("lifecycle state", st)
+	}
+	for _, focused := range st.Focused {
+		if focused.BlockerIDs == nil || len(focused.BlockerIDs) != 0 || focused.ReviewerID != f.reviewer.ID || focused.ReviewerRun != f.reviewer.RunID {
+			t.Fatal("stored rebase verification", focused)
+		}
 	}
 }
