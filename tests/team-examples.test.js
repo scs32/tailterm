@@ -106,7 +106,8 @@ test("Planned delivery teaches live gate priority without changing inbox order",
   const team = exampleTeam("planned");
   const lead = team.members.find((member) => member.name === "lead").prompt;
   const handler = team.members.find((member) => member.name === "database").prompt;
-  assert.match(lead, /typed REQUEST.*RESULT --reply-to/s);
+  assert.match(lead, /send no Start, plan or assignment gate REQUESTs/);
+  assert.doesNotMatch(lead, /For each live Start, plan or assignment gate/);
   for (const role of ["lead", "planner", "plan-reviewer", "builder", "reviewer"]) {
     const prompt = team.members.find((member) => member.name === role).prompt;
     assert.match(prompt, /--work-item ID --work-item-revision N --work-order-message SEQ/, role);
@@ -119,7 +120,7 @@ test("Planned delivery teaches live gate priority without changing inbox order",
 
 test("Planned delivery lead has exact terminal team closeout", () => {
   const lead = exampleTeam("planned").members.find((member) => member.name === "lead").prompt;
-  assert.match(lead, /handler confirms a terminal item and all team obligations are closed, run tt close --team/);
+  assert.match(lead, /Once it returns its receipt and all team obligations are closed, run tt close --team/);
   assert.match(lead, /item workers before the lead, clears the project orchestrator and preserves the database handler/);
   assert.match(lead, /owner may use tt close --team --task ID/);
 });
@@ -218,7 +219,7 @@ test("Planned delivery marks verification-owned criteria pending for the reviewe
   assert.match(lead, /send builder one ASSIGN/);
   assert.match(lead, /do not narrate record bookkeeping on the board yourself/);
   assert.match(reviewer, /Mark verification-owned criteria pending-verification/);
-  assert.match(reviewer, /handler-imported eligible receipt judges those criteria/);
+  assert.match(reviewer, /hub-saved eligible receipt judges those criteria/);
 });
 
 // Owner trial wi_519d2df4f04c2e1c: only the Planned database handler moves to
@@ -255,10 +256,10 @@ test("Planned delivery verifies alongside review and verifies exactly what merge
     handler = prompt("database"),
     builder = prompt("builder");
   assert.match(lead, /send reviewer a REVIEW naming that commit, the scope and the criteria, and start its verification at once/);
-  assert.match(lead, /Verify alongside review: have the handler freeze the plan on the current tasks-hub tip and REQUEST the distinct verifier/);
+  assert.match(lead, /Verify alongside review: freeze the plan on the current tasks-hub tip with tt verification plan and REQUEST the distinct verifier/);
   assert.match(lead, /Each later candidate gets a fresh run, targeted from the previous candidate for fixes; withdraw the superseded REQUEST/);
   assert.match(lead, /final candidate, rebased onto the current tip, gets the full plan once/);
-  assert.match(lead, /handler-saved passing receipt for the exact final SHA/);
+  assert.match(lead, /hub-saved passing receipt for the exact final SHA/);
   assert.doesNotMatch(lead, /Before acceptance, REQUEST the distinct verifier/);
   assert.match(verifier, /verify-matrix\.mjs targeted CONTEXT_JSON/);
   assert.match(verifier, /never imported and never gates acceptance/);
@@ -348,4 +349,62 @@ test("documented small-change lead prompt exactly matches the template", () => {
   for (const member of exampleTeam("small").members)
     if (member.name === "lead")
       assert.ok(documentation.includes(member.prompt), "missing exact small/lead prompt");
+});
+
+// wi_26c0698de7d3eef2: the plan freeze, the receipt import and the done save
+// with queue acceptance are validated hub operations the lead and the
+// verifier call themselves; the handler keeps intake, scope confirmation,
+// completion reports and every case the hub refuses.
+test("lead and verifier run the validated hub operations without a handler turn", () => {
+  const planned = exampleTeam("planned").members;
+  const prompt = (name) => planned.find((member) => member.name === name).prompt;
+  const lead = prompt("lead"),
+    builder = prompt("builder"),
+    verifier = prompt("verifier"),
+    handler = prompt("database"),
+    small = exampleTeam("small").members[0].prompt;
+
+  for (const [name, text] of [["planned lead", lead], ["small lead", small]]) {
+    assert.match(text, /tt verification plan/, name);
+    assert.match(text, /tt work-items update --status done/, name);
+    assert.match(text, /--worktree/, name);
+    assert.match(text, /hub-saved passing receipt for the exact final SHA/, name);
+  }
+  assert.match(small, /tt verification plan --item ID --file plan\.json --request-id KEY --generation N/);
+  assert.match(small, /tt verification receipt --item ID --file receipt\.json --request-id KEY --generation N/);
+  assert.match(small, /tt work-items update --status done --worktree DIR --branch B --commit SHA/);
+  assert.match(small, /Ask the handler only when the hub refuses, quoting its reason/);
+  assert.match(small, /at once freeze the verification plan on the current tasks-hub tip/);
+  assert.match(small, /Once your done save returns its receipt and all team obligations are closed, run tt close --team/);
+  assert.match(verifier, /Import the receipt yourself: tt verification receipt --item ID --file receipt\.json --request-id KEY --generation N/);
+  assert.match(verifier, /notifies lead, reviewer and handler/);
+  assert.match(verifier, /Never import a targeted-receipt\.json/);
+  assert.match(builder, /Queue admission is your Start evidence: begin on lead's ASSIGN/);
+
+  // No lead, builder or verifier prompt asks the handler for a Start, plan,
+  // assignment, freeze, import or done-save turn.
+  for (const [name, text] of [["planned lead", lead], ["small lead", small], ["builder", builder], ["verifier", verifier]])
+    for (const handlerTurn of [
+      /For each live Start, plan or assignment gate/,
+      /When requesting a Start or assignment gate/,
+      /have the handler freeze/,
+      /REQUEST the verification plan/,
+      /Send the database handler a typed REQUEST/,
+      /to the database handler through a typed REQUEST/,
+      /The handler imports/,
+      /handler-saved|handler-approved|handler-imported/,
+      /handler confirms a terminal item/,
+      /Wait for its RESULT --reply-to/,
+    ])
+      assert.doesNotMatch(text, handlerTurn, name);
+
+  assert.match(handler, /intake, scope confirmation, work items, revisions, orders, completion reports and release receipts/);
+  assert.match(handler, /write a feature's completion report/);
+  assert.match(handler, /For a queued team the hub validates three operations without you/);
+  assert.match(handler, /Do one of them only when lead asks after the hub refused it, quoting the reason, or for a team with no queue entry/);
+
+  for (const member of [...planned, ...exampleTeam("small").members])
+    assert.ok(`Role: ${member.role}\n\n${member.prompt}`.length <= 8192, `${member.name} is ${member.prompt.length} characters`);
+  const bundle = readFileSync(new URL("../hub/internal/teamplan/plan.mjs", import.meta.url), "utf8");
+  assert.ok(bundle.includes("Import the receipt yourself: tt verification receipt"), "generated plan.mjs lacks the verifier's import");
 });
