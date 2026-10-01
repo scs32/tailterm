@@ -23,8 +23,6 @@ import { normalizeTaskRef } from "../client/task-ref.js";
 import { tmuxCommand } from "../shared/tmux-command.js";
 import { execFileSync } from "node:child_process";
 import { mkdtempSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
 
 const servers = [
   {
@@ -504,7 +502,9 @@ test("the helper attach does not change the session's window size", (t) => {
     t.skip(`tmux 3.2+ is required for ignore-size (found ${version})`);
     return;
   }
-  const dir = mkdtempSync(join(tmpdir(), "tt-home-"));
+  // Unix socket paths are limited (104 bytes on macOS), so the private
+  // sockets live in a short 0700 directory, not under a possibly long TMPDIR.
+  const dir = mkdtempSync("/tmp/tt-");
   const env = { ...process.env, TMUX_TMPDIR: dir };
   delete env.TMUX;
   delete env.TMUX_PANE;
