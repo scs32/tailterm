@@ -275,8 +275,9 @@ func cmdWorkItemUpdate(e env, args []string) error {
 	acceptFlags := *worktree != "" || *branch != "" || *commit != "" || *acceptanceEvidence != ""
 	var entry *api.TeamQueueEntry
 	if req.Status != nil && *req.Status == "done" && e.agent != "" {
-		// A leased handler's done save carries the queue acceptance, so the
-		// team never waits on a separate remembered accept.
+		// The item lead's or leased handler's done save carries the queue
+		// acceptance, so the team never waits on a separate remembered
+		// accept. The hub decides who may record it.
 		entry, err = pendingQueueAcceptance(ctx, c, project, fs.Arg(0), e.agent, e.runID)
 		if err != nil {
 			return err
@@ -286,7 +287,7 @@ func cmdWorkItemUpdate(e env, args []string) error {
 		entry = nil // already accepted; nothing to carry
 	}
 	if entry == nil && acceptFlags {
-		return errors.New("--worktree, --branch, --commit and --evidence apply only to the leased handler's done save of an item whose running team waits on acceptance")
+		return errors.New("--worktree, --branch, --commit and --evidence apply only to a done save, by the item lead or the leased handler, of an item whose running team waits on acceptance")
 	}
 	if entry != nil {
 		if *worktree == "" || *branch == "" || *commit == "" {
@@ -341,10 +342,12 @@ func cmdWorkItemUpdate(e env, args []string) error {
 	return nil
 }
 
-// pendingQueueAcceptance returns the item's repository-backed team queue entry
-// leased to this exact handler run: the running entry that waits on its
-// acceptance, else one it has already accepted (a retried save), else nil.
-func pendingQueueAcceptance(ctx context.Context, c *api.Client, project, item, agent, run string) (*api.TeamQueueEntry, error) {
+// pendingQueueAcceptance returns the item's repository-backed team queue
+// entry: the running entry that waits on its acceptance, else one already
+// accepted (a retried save), else nil. The calling agent and run no longer
+// select the entry: any agent caller gets it, and the hub admits only the
+// item lead or the leased handler.
+func pendingQueueAcceptance(ctx context.Context, c *api.Client, project, item, _, _ string) (*api.TeamQueueEntry, error) {
 	// The item's own entry in any state; an older hub returns every entry.
 	list, err := c.ListTeamQueuePage(ctx, project, api.TeamQueueListOptions{Item: item})
 	if err != nil {
@@ -353,7 +356,7 @@ func pendingQueueAcceptance(ctx context.Context, c *api.Client, project, item, a
 	var accepted *api.TeamQueueEntry
 	for i := range list.Entries {
 		q := list.Entries[i]
-		if q.ItemID != item || q.Repository == "" || q.HandlerID != agent || q.HandlerRunID != run {
+		if q.ItemID != item || q.Repository == "" {
 			continue
 		}
 		if q.State == "running" && q.Acceptance == nil {

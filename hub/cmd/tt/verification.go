@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -8,6 +9,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"time"
 
@@ -27,7 +29,7 @@ func cmdVerification(e env, args []string) error {
 		return err
 	}
 	if !api.ValidID(*item, "wi") || e.agent == "" || e.runID == "" {
-		return errors.New("exact handler agent/run and item required")
+		return errors.New("exact agent/run and item required: the database handler, the item lead or the plan's verifier")
 	}
 	c, err := e.client(20 * time.Second)
 	if err != nil {
@@ -58,7 +60,11 @@ func cmdVerification(e env, args []string) error {
 	if err != nil {
 		return err
 	}
-	req := api.VerificationRequest{RequestID: *key, AgentID: e.agent, RunID: e.runID, ExpectedGeneration: *generation}
+	digest, err := runContextDigest(ctx, c, e)
+	if err != nil {
+		return err
+	}
+	req := api.VerificationRequest{RequestID: *key, AgentID: e.agent, RunID: e.runID, ExpectedGeneration: *generation, ContextDigest: digest}
 	switch args[0] {
 	case "plan":
 		req.Plan = &api.VerificationPlan{}
@@ -83,6 +89,21 @@ func cmdVerification(e env, args []string) error {
 	}
 	printJSON(out)
 	return nil
+}
+
+// runContextDigest is the context digest this exact run was admitted with, as
+// tt context --json shows it. A run with no item binding, such as a database
+// handler, has none and sends none.
+func runContextDigest(ctx context.Context, c *api.Client, e env) (string, error) {
+	bound, err := c.GetAgentWorkItemContext(ctx, e.task, e.agent, e.runID)
+	if err != nil {
+		var httpErr *api.HTTPError
+		if errors.As(err, &httpErr) && httpErr.Status == http.StatusNotFound {
+			return "", nil
+		}
+		return "", fmt.Errorf("read this run's work-item context: %w", err)
+	}
+	return bound.Binding.ContextDigest, nil
 }
 
 func verifyReceiptLogs(r api.VerificationReceipt) error {

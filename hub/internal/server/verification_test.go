@@ -190,3 +190,230 @@ func TestVerificationHTTPAcceptsFullMatrixReceiptOnly(t *testing.T) {
 		}
 	}
 }
+
+// Validated verification operations over HTTP for the item lead and the
+// plan's verifier (wi_26c0698de7d3eef2 a7).
+
+func httpDigest(v any) string {
+	raw, _ := json.Marshal(v)
+	var generic any
+	_ = json.Unmarshal(raw, &generic)
+	raw, _ = json.Marshal(generic)
+	sum := sha256.Sum256(raw)
+	return hex.EncodeToString(sum[:])
+}
+
+// operatorHTTP is a running team queue entry with an admitted lead, builder,
+// verifier and reviewer, the lead's ASSIGN and REVIEW, and an owner-approved
+// plan. The handler leases the entry.
+type operatorHTTP struct {
+	c                                        *client
+	hub                                      *api.Client
+	task                                     api.Task
+	item                                     api.WorkItem
+	handler, lead, builder, verifier, review api.Agent
+	plan                                     api.VerificationPlan
+	path                                     string
+}
+
+func newOperatorHTTP(t *testing.T) *operatorHTTP {
+	t.Helper()
+	c := newClient(t)
+	st, ctx := c.st, context.Background()
+	f := &operatorHTTP{c: c, task: c.task("verification-operators")}
+	var err error
+	if f.hub, err = api.NewClient(c.srv.URL, 20*time.Second); err != nil {
+		t.Fatal(err)
+	}
+	live := func(a api.Agent) {
+		t.Helper()
+		if _, err := st.PostEvent(ctx, f.task.ID, api.PostEventRequest{AgentID: a.ID, RunID: a.RunID, Kind: api.EventRunning}, c.who); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if f.handler, err = st.AddAgent(ctx, f.task.ID, api.AddAgentRequest{AgentID: api.NewID("agt"), Name: "handler", Role: api.AgentRoleDatabaseHandler, Host: "fixture", Session: "handler"}, c.who); err != nil {
+		t.Fatal(err)
+	}
+	live(f.handler)
+	if code := c.do("POST", "/v1/tasks/"+f.task.ID+"/work-items", api.CreateWorkItemRequest{Kind: "bug", Title: "Operator fixture", RequestID: "item"}, &f.item); code != 201 {
+		t.Fatalf("item = %d", code)
+	}
+	links := []api.MessageWorkItem{{ItemTaskID: f.task.ID, ItemID: f.item.ID, ItemRevision: f.item.Revision, Relationship: "primary"}}
+	order, err := st.PostMessage(ctx, f.task.ID, api.PostMessageRequest{Text: "bounded order", RequestID: "order", WorkItems: links}, c.who)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = st.ConfirmWorkOrderScope(ctx, f.task.ID, f.item.ID, api.ConfirmWorkOrderScopeRequest{RequestID: "scope", AgentID: f.handler.ID, RunID: f.handler.RunID, ExpectedRevision: f.item.Revision, ScopeRevision: f.item.ScopeRevision, OrderMessageSeq: order.Seq, Complete: true}); err != nil {
+		t.Fatal(err)
+	}
+	action := func(req api.TeamQueueRequest) api.TeamQueueEntry {
+		t.Helper()
+		req.RequestID = api.NewID("req")
+		q, err := f.hub.TeamQueueAction(ctx, f.task.ID, req)
+		if err != nil {
+			t.Fatalf("%s: %v", req.Operation, err)
+		}
+		return q
+	}
+	entry := action(api.TeamQueueRequest{Operation: "add", ItemID: f.item.ID, OrderMessageSeq: order.Seq, Host: "fixture", Cwd: t.TempDir()})
+	entry = action(api.TeamQueueRequest{Operation: "claim", EntryID: entry.ID, ExpectedRevision: entry.Revision, Host: "fixture"})
+	ref := api.MessageReference{TaskID: f.task.ID, Seq: order.Seq}
+	member := func(name string) api.Agent {
+		t.Helper()
+		a, err := st.AddAgent(ctx, f.task.ID, api.AddAgentRequest{AgentID: api.NewID("agt"), Name: name, Host: "fixture", Session: name,
+			WorkItem: &api.AgentWorkItemRequest{ItemTaskID: f.task.ID, ItemID: f.item.ID, ItemRevision: f.item.Revision, WorkOrderMessage: ref, ContextBundle: syntheticServerTestContext(t, f.item, ref, order)}}, c.who)
+		if err != nil {
+			t.Fatalf("admit %s: %v", name, err)
+		}
+		live(a)
+		return a
+	}
+	f.lead, f.builder, f.verifier, f.review = member("lead"), member("builder"), member("verifier"), member("reviewer")
+	launch, _ := json.Marshal(map[string]any{"task": f.task.ID, "item": f.item.ID, "revision": f.item.Revision, "order": order.Seq, "context": map[string]any{"version": 1},
+		"members": []any{map[string]any{"state": "unstarted", "runId": f.lead.RunID, "fields": map[string]any{"agentId": f.lead.ID, "name": f.lead.Name, "cwd": entry.Cwd}}}})
+	for _, step := range []api.TeamQueueRequest{{Operation: "freeze", LaunchJSON: launch}, {Operation: "attempt"}, {Operation: "started", MemberRunID: f.lead.RunID}, {Operation: "running"}} {
+		step.EntryID, step.ExpectedRevision = entry.ID, entry.Revision
+		entry = action(step)
+	}
+	asLead := func(env api.Envelope, to api.Agent) api.Message {
+		t.Helper()
+		m, err := st.PostMessage(ctx, f.task.ID, api.PostMessageRequest{Envelope: &env, To: to.ID, AgentID: f.lead.ID, RunID: f.lead.RunID, RequestID: api.NewID("req"), WorkItems: links}, c.who)
+		if err != nil {
+			t.Fatalf("%s: %v", env.Kind, err)
+		}
+		return m
+	}
+	criteria := map[string]string{"a1": "works"}
+	assign := asLead(api.Envelope{Kind: "assign", Subject: "Implement frozen fixture criteria", Body: api.EnvelopeBody{Objective: "Fixture", Owns: []string{"fixture"}, Acceptance: criteria}}, f.builder)
+	checks := []api.VerificationCheck{{ID: "fixture-check", Argv: []string{"node", "fixture.js"}, Cwd: ".", Environment: map[string]string{}}}
+	commit, base := strings.Repeat("a", 40), strings.Repeat("b", 40)
+	f.plan = api.VerificationPlan{ItemID: f.item.ID, ItemTaskID: f.task.ID, AssignmentOwnershipDigest: httpDigest([]string{"fixture"}), Version: 1, OperationKey: "http-operators", Repository: "fixture", BaseCommit: base, Commit: commit,
+		ItemRevision: f.item.Revision, ScopeRevision: f.item.ScopeRevision, OrderMessageSeq: order.Seq, AssignmentSeq: assign.Seq, BuilderAgentID: f.builder.ID, BuilderRunID: f.builder.RunID, VerifierAgentID: f.verifier.ID, VerifierRunID: f.verifier.RunID,
+		MatrixDigest: strings.Repeat("a", 64), ChecksDigest: httpDigest(checks), Owned: []string{"fixture"}, Changed: []string{}, Checks: checks}
+	approval, err := st.PostMessage(ctx, f.task.ID, api.PostMessageRequest{Text: "verification-matrix-approval:" + f.plan.MatrixDigest}, c.who)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.plan.ApprovedMatrixDigest, f.plan.MatrixApprovalMessageSeq = f.plan.MatrixDigest, approval.Seq
+	asLead(api.Envelope{Kind: "review", Subject: "Review frozen fixture candidate", Body: api.EnvelopeBody{Candidate: commit, Scope: "Fixture", Acceptance: criteria}}, f.review)
+	f.path = "/v1/tasks/" + f.task.ID + "/work-items/" + f.item.ID + "/verification"
+	return f
+}
+
+// digest is the context digest the agent's run was admitted with.
+func (f *operatorHTTP) digest(t *testing.T, a api.Agent) string {
+	t.Helper()
+	bound, err := f.hub.GetAgentWorkItemContext(context.Background(), f.task.ID, a.ID, a.RunID)
+	if err != nil || bound.Binding.ContextDigest == "" {
+		t.Fatalf("context of %s: %+v %v", a.Name, bound.Binding, err)
+	}
+	return bound.Binding.ContextDigest
+}
+
+func (f *operatorHTTP) planRequest(t *testing.T, key string) api.VerificationRequest {
+	t.Helper()
+	p := f.plan
+	return api.VerificationRequest{RequestID: key, AgentID: f.lead.ID, RunID: f.lead.RunID, ContextDigest: f.digest(t, f.lead), Plan: &p}
+}
+
+func (f *operatorHTTP) receipt() api.VerificationReceipt {
+	p := f.plan
+	return api.VerificationReceipt{Worktree: "/tmp/fixture", Version: 1, OperationKey: p.OperationKey, PlanDigest: httpDigest(p), Repository: p.Repository, BaseCommit: p.BaseCommit, Commit: p.Commit, MatrixDigest: p.MatrixDigest, ChecksDigest: p.ChecksDigest,
+		VerifierAgentID: p.VerifierAgentID, VerifierRunID: p.VerifierRunID, Detached: true, CleanBefore: true, CleanAfter: true, Environment: map[string]string{"HOME": "/tmp/fixture"}, Prerequisites: []api.VerificationPrerequisite{}, AIV: api.AIVBinding{State: "unsubmitted"},
+		Checks: []api.VerificationResult{{VerificationCheck: p.Checks[0], StartedAt: "2026-09-26T00:00:00Z", EndedAt: "2026-09-26T00:00:01Z", DurationMs: 1000, LogURI: "/tmp/fixture.log", LogDigest: strings.Repeat("b", 64)}}}
+}
+
+// counts reads the item's record count as the handler and the project's
+// message count.
+func (f *operatorHTTP) counts(t *testing.T) (records, messages int) {
+	t.Helper()
+	ctx := context.Background()
+	history, err := f.hub.VerificationHistory(ctx, f.task.ID, f.item.ID, f.handler.ID, f.handler.RunID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	list, err := f.hub.ListMessages(ctx, f.task.ID, 0, "", 1000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return len(history), len(list)
+}
+
+func TestVerificationHTTPLeadAndVerifier(t *testing.T) {
+	f := newOperatorHTTP(t)
+	var plan, receipt api.VerificationRecord
+	if code := f.c.do("POST", f.path, f.planRequest(t, "lead-plan"), &plan); code != 201 || plan.Generation != 1 || plan.AuthorRole != "lead" || plan.HandlerAgentID != f.lead.ID || len(plan.Notices) != 0 {
+		t.Fatalf("lead plan = %d %+v", code, plan)
+	}
+	r := f.receipt()
+	req := api.VerificationRequest{RequestID: "verifier-receipt", AgentID: f.verifier.ID, RunID: f.verifier.RunID, ContextDigest: f.digest(t, f.verifier), ExpectedGeneration: 1, Receipt: &r}
+	if code := f.c.do("POST", f.path, req, &receipt); code != 201 || receipt.Generation != 2 || receipt.AuthorRole != "verifier" || len(receipt.Notices) != 3 {
+		t.Fatalf("verifier receipt = %d %+v", code, receipt)
+	}
+	for i, want := range []struct {
+		role  string
+		agent api.Agent
+	}{{"lead", f.lead}, {"reviewer", f.review}, {"handler", f.handler}} {
+		if n := receipt.Notices[i]; n.Role != want.role || n.AgentID != want.agent.ID || n.MessageSeq == 0 || n.Skipped != "" {
+			t.Fatalf("notice %d = %+v, want %s to %s", i, n, want.role, want.agent.ID)
+		}
+	}
+	var history []api.VerificationRecord
+	if code := f.c.do("GET", f.path+"?agent="+f.lead.ID+"&run="+f.lead.RunID, nil, &history); code != 200 || len(history) != 2 || history[0].AuthorRole != "lead" || len(history[1].Notices) != 3 || history[1].Notices[0].MessageSeq != receipt.Notices[0].MessageSeq {
+		t.Fatalf("lead history = %d %+v", code, history)
+	}
+	// A member without the lead's role cannot freeze a plan, and says why.
+	var refused api.ErrorResponse
+	builder := f.planRequest(t, "builder-plan")
+	builder.AgentID, builder.RunID, builder.ContextDigest, builder.ExpectedGeneration = f.builder.ID, f.builder.RunID, f.digest(t, f.builder), 2
+	if code := f.c.do("POST", f.path, builder, &refused); code != 409 || !strings.Contains(refused.Error, "only the item lead or the database handler may freeze a verification plan") {
+		t.Fatalf("builder plan = %d %+v", code, refused)
+	}
+}
+
+func TestVerificationHTTPChangedCallerRefused(t *testing.T) {
+	f := newOperatorHTTP(t)
+	stored := f.planRequest(t, "stored-plan")
+	if code := f.c.do("POST", f.path, stored, nil); code != 201 {
+		t.Fatalf("plan = %d", code)
+	}
+	records, messages := f.counts(t)
+	otherAgent, otherRun := stored, stored
+	otherAgent.AgentID, otherAgent.RunID, otherAgent.ContextDigest = f.handler.ID, f.handler.RunID, ""
+	otherRun.RunID = api.NewID("run")
+	for name, req := range map[string]api.VerificationRequest{"agentId": otherAgent, "runId": otherRun} {
+		var refused api.ErrorResponse
+		if code := f.c.do("POST", f.path, req, &refused); code != 409 || !strings.Contains(refused.Error, "retry payload changed") {
+			t.Fatalf("changed %s = %d %+v", name, code, refused)
+		}
+		if r, m := f.counts(t); r != records || m != messages {
+			t.Fatalf("changed %s wrote: records %d -> %d, messages %d -> %d", name, records, r, messages, m)
+		}
+	}
+}
+
+func TestVerificationHTTPRetiredRunExactReplay(t *testing.T) {
+	f := newOperatorHTTP(t)
+	stored := f.planRequest(t, "stored-plan")
+	var first, replay api.VerificationRecord
+	if code := f.c.do("POST", f.path, stored, &first); code != 201 {
+		t.Fatalf("plan = %d", code)
+	}
+	retired := api.AgentRetired
+	if _, err := f.c.st.UpdateAgent(context.Background(), f.lead.ID, api.UpdateAgentRequest{Status: &retired}, f.c.who); err != nil {
+		t.Fatal(err)
+	}
+	raw, _ := json.Marshal(stored)
+	if code := f.c.do("POST", f.path, string(raw), &replay); code != 201 || replay.Generation != first.Generation || replay.Digest != first.Digest || replay.CreatedAt != first.CreatedAt || replay.AuthorRole != "lead" {
+		t.Fatalf("exact replay after retirement = %d %+v, want %+v", code, replay, first)
+	}
+	fresh := f.planRequest(t, "new-plan-after-retirement")
+	fresh.ExpectedGeneration = 1
+	var refused api.ErrorResponse
+	if code := f.c.do("POST", f.path, fresh, &refused); code != 409 || !strings.Contains(refused.Error, "agent run changed; refresh identity") {
+		t.Fatalf("new request from the retired run = %d %+v", code, refused)
+	}
+	if records, _ := f.counts(t); records != 1 {
+		t.Fatalf("records = %d, want 1", records)
+	}
+}

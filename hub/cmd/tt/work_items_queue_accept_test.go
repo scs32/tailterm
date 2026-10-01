@@ -206,3 +206,242 @@ func TestHandlerDoneSaveRecordsQueueAcceptanceAndRunnerFinishes(t *testing.T) {
 		t.Fatalf("identical manual accept changed the entry: %+v %v", after, err)
 	}
 }
+
+// leadDoneSave is a launched team queue entry in a temporary Git repository,
+// with a verified candidate commit and the feature's completion report, ready
+// for the item lead's done save (wi_26c0698de7d3eef2 a7).
+type leadDoneSave struct {
+	teamFixture
+	runner                         teamRunner
+	lead                           api.Agent
+	queued                         api.TeamQueueEntry
+	current                        api.WorkItem
+	report                         api.NarrativeReportVersion
+	worktree, commit, base, branch string
+}
+
+func newLeadDoneSave(t *testing.T) *leadDoneSave {
+	t.Helper()
+	f := &leadDoneSave{teamFixture: newTeamFixture(t, true), branch: "feature/item"}
+	ctx := context.Background()
+
+	root := t.TempDir()
+	repo := filepath.Join(root, "repo")
+	worktree := filepath.Join(root, "builder")
+	if err := os.MkdirAll(filepath.Join(repo, "src"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	gitFixtureCommand(t, repo, "init", "-q", "-b", "tasks-hub")
+	if err := os.WriteFile(filepath.Join(repo, "src", "a.txt"), []byte("base\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	gitFixtureCommand(t, repo, "add", ".")
+	gitFixtureCommand(t, repo, "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "commit", "-q", "-m", "base")
+	f.base = gitFixtureCommand(t, repo, "rev-parse", "HEAD")
+	gitFixtureCommand(t, repo, "worktree", "add", "-q", "-b", f.branch, worktree)
+	if err := os.WriteFile(filepath.Join(worktree, "src", "a.txt"), []byte("fixed\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	gitFixtureCommand(t, worktree, "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "commit", "-q", "-am", "fix")
+	f.commit = gitFixtureCommand(t, worktree, "rev-parse", "HEAD")
+	var err error
+	if f.worktree, err = filepath.EvalSymlinks(worktree); err != nil {
+		t.Fatal(err)
+	}
+	repository, err := queueRepositoryScope(f.worktree, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if f.queued, err = f.c.TeamQueueAction(ctx, f.task.ID, api.TeamQueueRequest{RequestID: "lead-accept-add", Operation: "add", ItemID: f.item.ID, OrderMessageSeq: f.order, Host: "fixture", Cwd: f.worktree, Repository: repository, BaseCommit: f.base, Ownership: []string{"src"}}); err != nil {
+		t.Fatal(err)
+	}
+	f.runner = teamRunner{
+		plan: func(ctx context.Context, in map[string]any, out *teamLaunchResolved) error {
+			messages, err := f.c.ListMessages(ctx, f.task.ID, 0, "", 100)
+			if err != nil {
+				return err
+			}
+			for _, m := range messages {
+				if m.Seq == f.order {
+					out.ItemRouting.WorkContextBundle = teamCloseCLIContext(t, f.item, m)
+					out.Plan = []teamLaunchEntry{{Fields: teamLaunchFields{Name: "lead-auto", Role: "lead", Runtime: "codex", Run: "codex", Cwd: in["cwd"].(string), Prompt: "fixture"}}}
+					return nil
+				}
+			}
+			return fmt.Errorf("order missing")
+		},
+		spawn: func(_ env, args []string) error {
+			flags := map[string]string{}
+			for i := 0; i+1 < len(args); i += 2 {
+				flags[args[i]] = args[i+1]
+			}
+			data, err := os.ReadFile(flags["--work-context-file"])
+			if err != nil {
+				return err
+			}
+			revision, err := strconv.ParseInt(flags["--work-item-revision"], 10, 64)
+			if err != nil {
+				return err
+			}
+			order, err := strconv.ParseInt(flags["--work-order-message"], 10, 64)
+			if err != nil {
+				return err
+			}
+			_, err = f.c.AddAgent(ctx, f.task.ID, api.AddAgentRequest{AgentID: flags["--agent-id"], ExpectedRunID: flags["--expected-run-id"], Name: flags["--name"], Host: "fixture", Session: flags["--name"], Runtime: "codex", Cwd: flags["--cwd"], WorkItem: &api.AgentWorkItemRequest{ItemTaskID: f.task.ID, ItemID: flags["--work-item"], ItemRevision: revision, WorkOrderMessage: api.MessageReference{TaskID: f.task.ID, Seq: order}, ContextBundle: data}})
+			return err
+		},
+		owned: func(context.Context, env, api.Agent) error { return nil },
+		cleanup: func(ctx context.Context, _ env, task, id string) error {
+			agent, err := f.c.GetAgent(ctx, task, id)
+			if err != nil {
+				return err
+			}
+			_, err = f.c.ReportCleanup(ctx, task, id, api.CleanupRequest{RunID: agent.RunID})
+			return err
+		},
+		integration: queueIntegrationSnapshot, // the real Git check, as in production
+	}
+	if err := f.runner.tick(ctx, f.e, f.c, "fixture"); err != nil {
+		t.Fatal(err)
+	}
+	q, err := f.c.GetTeamQueueEntry(ctx, f.task.ID, f.queued.ID)
+	if err != nil || q.State != "running" {
+		t.Fatalf("launch: %+v %v", q, err)
+	}
+	agents, err := f.c.ListAgents(ctx, f.task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, a := range agents {
+		if a.Name == "lead-auto" {
+			f.lead = a
+		}
+	}
+	if f.lead.ID == "" || f.lead.ID == f.handler.ID {
+		t.Fatalf("the launched lead is missing: %+v", agents)
+	}
+
+	current, err := f.c.GetWorkItem(ctx, f.task.ID, f.item.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := testverification.Prepare(f.c, f.task.ID, current, f.commit, repository, f.base); err != nil {
+		t.Fatal(err)
+	}
+	if f.report, _, err = f.st.PutNarrativeReport(ctx, f.task.ID, current.ID, api.PutNarrativeReportRequest{RequestID: "lead-accept-report", ScopeRevision: current.ScopeRevision,
+		Sections:   api.NarrativeReportSections{RequestedOutcome: "Deliver the fix.", DeliveredWork: "Synthetic fix complete.", Verification: "Isolated fixture.", Limitations: "Fixture only.", RemainingWork: "Owner integration."},
+		References: []api.NarrativeReference{{Kind: "work-item-revision", TaskID: f.task.ID, ItemID: current.ID, Revision: current.Revision, Label: "bounded scope"}}}, api.Caller{Node: "fixture", User: "owner"}); err != nil {
+		t.Fatal(err)
+	}
+	if f.current, err = f.c.GetWorkItem(ctx, f.task.ID, f.item.ID); err != nil {
+		t.Fatal(err)
+	}
+	return f
+}
+
+// save runs tt work-items update --status done as the given agent's run, with
+// the completion report pin and any extra flags.
+func (f *leadDoneSave) save(t *testing.T, by api.Agent, extra ...string) (string, error) {
+	t.Helper()
+	e := f.e
+	e.agent, e.runID = by.ID, by.RunID
+	args := append([]string{"update", "--revision", fmt.Sprint(f.current.Revision), "--request-id", "lead-done", "--status", "done",
+		"--report-id", f.report.ReportID, "--report-version", fmt.Sprint(f.report.Version), "--report-digest", f.report.Digest, "--report-scope-revision", fmt.Sprint(f.report.ScopeRevision)}, extra...)
+	return captureCLIOutput(t, func() error { return cmdWorkItems(e, append(args, f.item.ID)) })
+}
+
+func (f *leadDoneSave) tuple() []string {
+	return []string{"--worktree", f.worktree, "--branch", f.branch, "--commit", f.commit}
+}
+
+func (f *leadDoneSave) releaseJobs(t *testing.T) int {
+	t.Helper()
+	jobs, err := f.c.Releases(context.Background(), f.task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	n := 0
+	for _, j := range jobs {
+		if j.EntryID == f.queued.ID {
+			n++
+		}
+	}
+	return n
+}
+
+// The item lead's done save records queue acceptance with no handler call,
+// and the runner reaches Ready to integrate.
+func TestLeadDoneSaveRecordsQueueAcceptance(t *testing.T) {
+	f := newLeadDoneSave(t)
+	ctx := context.Background()
+
+	// Forcing function: without the tuple the lead's save fails locally.
+	if _, err := f.save(t, f.lead); err == nil || !strings.Contains(err.Error(), "waits on acceptance") {
+		t.Fatalf("lead done save without the tuple: %v", err)
+	}
+	out, err := f.save(t, f.lead, f.tuple()...)
+	if err != nil {
+		t.Fatalf("lead done save with acceptance: %v\n%s", err, out)
+	}
+	if !strings.Contains(out, "queue acceptance recorded: entry "+f.queued.ID) || !strings.Contains(out, f.commit) {
+		t.Fatalf("save output lacks the acceptance readback: %q", out)
+	}
+	item, err := f.c.GetWorkItem(ctx, f.task.ID, f.item.ID)
+	if err != nil || item.Status != "done" || item.Revision != f.current.Revision+1 || item.UpdatedBy.AgentID != f.lead.ID {
+		t.Fatalf("item after the lead's save: %+v %v", item, err)
+	}
+	accepted, err := f.c.GetTeamQueueEntry(ctx, f.task.ID, f.queued.ID)
+	if err != nil || accepted.Acceptance == nil || accepted.Acceptance.Commit != f.commit || accepted.Acceptance.Worktree != f.worktree || accepted.Acceptance.Branch != f.branch || !strings.Contains(accepted.Acceptance.Evidence, "lead-saved completion receipt") {
+		t.Fatalf("entry acceptance after the save: %+v %v", accepted.Acceptance, err)
+	}
+	if accepted.Acceptance.BaseCommit != f.base || accepted.Acceptance.ItemRevision != f.current.Revision+1 || accepted.Acceptance.CompletionReport == nil || accepted.Acceptance.CompletionReport.ReportID != f.report.ReportID {
+		t.Fatalf("acceptance not bound to the verified base and saved completion: %+v", accepted.Acceptance)
+	}
+	if accepted.HandlerID != f.handler.ID || f.lead.ID == accepted.HandlerID {
+		t.Fatalf("entry lease changed: %+v", accepted)
+	}
+
+	// The runner closes the team and reaches Ready to integrate.
+	q := accepted
+	for i := 0; i < 3; i++ {
+		if err = f.runner.tick(ctx, f.e, f.c, "fixture"); err != nil {
+			t.Fatal(err)
+		}
+		if q, err = f.c.GetTeamQueueEntry(ctx, f.task.ID, f.queued.ID); err != nil || q.State == "finished" {
+			break
+		}
+	}
+	if err != nil || q.State != "finished" || q.Integration == nil || q.Integration.Commit != f.commit || q.Integration.Worktree != f.worktree || q.Integration.Evidence != accepted.Acceptance.Evidence {
+		t.Fatalf("runner did not reach Ready to integrate: %+v %v", q, err)
+	}
+}
+
+// The same command again replays the saved receipt and enqueues nothing.
+func TestLeadDoneSaveReplay(t *testing.T) {
+	f := newLeadDoneSave(t)
+	ctx := context.Background()
+	out, err := f.save(t, f.lead, f.tuple()...)
+	if err != nil {
+		t.Fatalf("lead done save with acceptance: %v\n%s", err, out)
+	}
+	accepted, err := f.c.GetTeamQueueEntry(ctx, f.task.ID, f.queued.ID)
+	if err != nil || accepted.Acceptance == nil {
+		t.Fatalf("entry %+v %v", accepted, err)
+	}
+	jobs := f.releaseJobs(t)
+	if jobs != 1 {
+		t.Fatalf("release jobs after the save = %d, want 1", jobs)
+	}
+	again, err := f.save(t, f.lead, f.tuple()...)
+	if err != nil || again != out {
+		t.Fatalf("retried save: %q vs %q: %v", again, out, err)
+	}
+	replay, err := f.c.GetTeamQueueEntry(ctx, f.task.ID, f.queued.ID)
+	if err != nil || replay.Revision != accepted.Revision || replay.Acceptance.AcceptedAt != accepted.Acceptance.AcceptedAt {
+		t.Fatalf("retried save changed the entry: %+v %v", replay, err)
+	}
+	if n := f.releaseJobs(t); n != jobs {
+		t.Fatalf("retried save enqueued a second release job: %d -> %d", jobs, n)
+	}
+}
