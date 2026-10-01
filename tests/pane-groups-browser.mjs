@@ -180,6 +180,12 @@ export async function exercisePaneGroups(
   getInput = () => undefined,
   { staticControls = true } = {},
 ) {
+  if (!staticControls)
+    assert.equal(
+      await page.locator(".home-tab, .pane-header[data-home]").count(),
+      0,
+      "server mode has no Home area",
+    );
   const homed = staticControls ? await leaveHome(page) : [];
   const originalCount = await page.locator("#tabs .tab").count();
   const ids = await page
