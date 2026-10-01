@@ -2,9 +2,12 @@ package main
 
 import (
 	"context"
+	"flag"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -87,5 +90,31 @@ func TestParallelQueueWorktreeScopeAndIntegrationSnapshot(t *testing.T) {
 	item.Status = "dismissed"
 	if _, err := queueIntegrationSnapshot(context.Background(), entry, item, closeReq); err == nil {
 		t.Fatal("dismissed item was marked ready")
+	}
+}
+
+// ownershipFlags backs --owns on tt team queue add/scope and tt work-items
+// scope, so one flag set covers them all.
+func TestOwnershipFlagRefusesCommaJoinedPaths(t *testing.T) {
+	parse := func(args ...string) (ownershipFlags, error) {
+		var owns ownershipFlags
+		fs := flag.NewFlagSet("owns", flag.ContinueOnError)
+		fs.SetOutput(io.Discard)
+		fs.Var(&owns, "owns", "repository-relative owned file or directory (repeatable)")
+		return owns, fs.Parse(args)
+	}
+	owns, err := parse("--owns", "hub/a.go", "--owns", "docs", "--owns", "hub/b.go")
+	if err != nil || !reflect.DeepEqual([]string(owns), []string{"hub/a.go", "docs", "hub/b.go"}) {
+		t.Fatalf("repeated --owns = %q, %v", owns, err)
+	}
+	owns, err = parse("--owns", "hub/a.go", "--owns", "a,b")
+	if err == nil {
+		t.Fatalf("comma-joined --owns was accepted: %q", owns)
+	}
+	if !strings.Contains(err.Error(), `"a,b"`) || !strings.Contains(err.Error(), "repeat --owns once per path") {
+		t.Fatalf("comma refusal lacks the value or the hint: %v", err)
+	}
+	if !reflect.DeepEqual([]string(owns), []string{"hub/a.go"}) {
+		t.Fatalf("refused value was stored: %q", owns)
 	}
 }

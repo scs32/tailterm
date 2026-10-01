@@ -15,8 +15,17 @@ import (
 
 type ownershipFlags []string
 
-func (f *ownershipFlags) String() string         { return strings.Join(*f, ",") }
-func (f *ownershipFlags) Set(value string) error { *f = append(*f, value); return nil }
+func (f *ownershipFlags) String() string { return strings.Join(*f, ",") }
+
+// Set takes one path per flag. A comma-joined list would be stored as a
+// single path that matches no file, so it is refused rather than split.
+func (f *ownershipFlags) Set(value string) error {
+	if strings.Contains(value, ",") {
+		return fmt.Errorf("ownership path %q contains a comma; repeat --owns once per path", value)
+	}
+	*f = append(*f, value)
+	return nil
+}
 
 // A queue entry with declared ownership must name one canonical worktree and
 // one logical repository. Generated descendants may be absent, but no existing

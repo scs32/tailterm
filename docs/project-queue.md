@@ -616,6 +616,13 @@ it saves the new `cwd` and ownership and increments the entry revision. It
 refuses a launching, running or failed entry, a relative or unclean path, a
 different repository, and a path another queued or active entry uses.
 
+`--owns` takes one repository-relative path per flag: repeat it for each path
+(`--owns hub/a.go --owns docs`). This holds for `tt team queue add`, `scope`
+and `requeue` and for `tt work-items scope confirm`. A value containing a comma
+is refused by the CLI before any request is sent (`ownership path "a,b"
+contains a comma; repeat --owns once per path`); it is never split, because a
+comma-joined list stored as one path matches no file and hides real overlaps.
+
 Until the hub confirms the move, any failure, including a refusal, a stale
 revision or an unreachable hub, removes the new worktree (`git worktree remove
 --force`), so the command can be rerun. When the write's response is lost, the
