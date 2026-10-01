@@ -31,7 +31,6 @@ command has a 10 second limit.
 
 | Requirement | Version or file | macOS | Linux | Doctor line |
 |---|---|---|---|---|
-| tt on PATH | any | copy the release `tt` to `~/.local/bin/tt` | same | `tt` |
 | Hub configured | `TAILTERM_HUB`, or `~/.config/tailterm/hub.json` with `url` and `token` | write the file | same | `hub configured` |
 | hub.json private | not group/other readable | `chmod 600` | same | `hub.json private` |
 | Hub reachable | `GET /v1/whoami` answers within 5 s | tailnet route to the hub | same | `hub reachable` |

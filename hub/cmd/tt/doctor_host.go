@@ -38,7 +38,7 @@ one line per requirement (ok, missing, wrong version or warn) with a fix hint,
 and exits 1 when any required piece is missing or the wrong version.
 
 Roles:
-  client   tt, hub configuration and reachability (TailOS or tt read-only)
+  client   hub configuration and reachability (TailOS or tt read-only)
   agent    client + tmux 3.2, ~/.local/bin/tt, claude and codex with logins, hooks, inbox relay
   test     client + Go, Node, npm, python3, Playwright browsers, the four fixtures, free disk
   release  client + gh login, Node, wrangler and its credential, the truenas SSH route, deployer config
@@ -328,7 +328,6 @@ func doctorOnPath(name, fix string) doctorCheck {
 func clientChecks() []doctorCheck {
 	hubJSON := func(d *doctorRun) string { return d.home(".config", "tailterm", "hub.json") }
 	return []doctorCheck{
-		doctorOnPath("tt", "install tt to ~/.local/bin/tt (docs/host-requirements.md)"),
 		{name: "hub configured", required: true, run: func(d *doctorRun) doctorResult {
 			if d.p.env(spawn.EnvHub) != "" {
 				return checkOK("TAILTERM_HUB set")

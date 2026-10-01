@@ -42,7 +42,6 @@ func newDoctorHost(t *testing.T) *doctorHost {
 		}
 	}
 	// Tools. Each fake logs its name, GOTOOLCHAIN and argv.
-	h.fake("tt", "exit 0")
 	h.fake("tmux", `echo "tmux 3.7b"`)
 	h.fake("git", "exit 0")
 	h.fake("claude", "exit 0")
@@ -254,6 +253,14 @@ func TestDoctorRoleClient(t *testing.T) {
 			t.Fatalf("summary:\n%s", o.text)
 		}
 	})
+	// tt adds its own directory to PATH, so a tt on-PATH line could never fail.
+	t.Run("no tt line", func(t *testing.T) {
+		for _, role := range []string{"client", "agent", "test", "release"} {
+			if o := newDoctorHost(t).run(role); o.has("tt") {
+				t.Fatalf("role %s prints a tt line:\n%s", role, o.text)
+			}
+		}
+	})
 	t.Run("hub unreachable", func(t *testing.T) {
 		h := newDoctorHost(t)
 		h.whoamiErr = errors.New("dial tcp http://hub.invalid:1 SECRET-TOKEN-123: refused")
@@ -296,6 +303,16 @@ func TestDoctorRoleAgent(t *testing.T) {
 		}
 		// Client checks are part of every role.
 		expectLine(t, o, "hub reachable", "ok", "", 0)
+	})
+	t.Run("tt not installed", func(t *testing.T) {
+		h := newDoctorHost(t)
+		os.Remove(filepath.Join(h.home, ".local", "bin", "tt"))
+		expectLine(t, h.run("agent"), "tt in ~/.local/bin", "missing", "not found", 1)
+	})
+	t.Run("tt not executable", func(t *testing.T) {
+		h := newDoctorHost(t)
+		h.file(".local/bin/tt", "#!/bin/sh\n", 0o644)
+		expectLine(t, h.run("agent"), "tt in ~/.local/bin", "missing", "not executable", 1)
 	})
 	t.Run("tmux 3.1", func(t *testing.T) {
 		h := newDoctorHost(t)
