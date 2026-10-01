@@ -1,10 +1,10 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { chmodSync, mkdtempSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { probe, hostDeps, waitForTailOSCommit } from "../scripts/release-probe.mjs";
 import { readyWindow, waitForTrueNASReady, sanitizeCapture, TRUENAS_READY_WINDOW_MS } from "../scripts/release-probe.mjs";
 
@@ -241,18 +241,38 @@ test("H5 a not-ready end captures allowlisted app state and redacted log lines, 
   assert.deepEqual(sanitizeCapture(out.capture), out.capture);
 });
 
-test("H5 the probe command exits 0 with an unavailable log capture when the log read is refused", () => {
-  const dir = mkdtempSync(join(tmpdir(), "probe-capture-cli-")), cfg = join(dir, "config.json"), node = "#!" + process.execPath + "\n";
-  const exe = (name, body) => { writeFileSync(join(dir, name), node + body); chmodSync(join(dir, name), 0o755); };
+// The real command with fake ssh, go and tt executables first on PATH: no
+// production host is contacted. The poll interval is the real 5 s, so the two
+// waiting runs go side by side.
+test("H6 the probe command waits for a late hub, captures a hub that never comes up and prints nothing for an unreadable config", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "probe-ready-cli-")), bin = join(dir, "bin"), node = "#!" + process.execPath + "\n";
+  mkdirSync(bin);
+  const exe = (name, body) => { writeFileSync(join(bin, name), node + body); chmodSync(join(bin, name), 0o755); };
   exe("ssh", `const c=process.argv.at(-1);if(c==="midclt call app.config tailterm-hub")console.log(${JSON.stringify(JSON.stringify(compose()))});else if(c.startsWith("cat "))process.stdout.write("hub binary");else if(c==="midclt call app.get_instance tailterm-hub")console.log(${JSON.stringify(JSON.stringify({ state: "RUNNING", notes: SECRET, active_workloads: { container_details: up } }))});else{console.error("sudo: a password is required ${SECRET}");process.exit(1);}`);
   exe("go", `console.log("x: go1.25\\n\\tbuild\\tvcs.revision=${commit}\\n\\tbuild\\tvcs.modified=false");`);
-  exe("tt", `console.error("${SECRET}");process.exit(1);`);
-  writeFileSync(cfg, JSON.stringify({ tt: join(dir, "tt"), targets: { hub: { host: "truenas", readyWindowMs: 0 } } }));
-  const r = spawnSync(process.execPath, ["scripts/release-probe.mjs", "live", "hub", "--config", cfg], { encoding: "utf8", env: { ...process.env, PATH: dir + ":" + process.env.PATH } });
-  assert.equal(r.status, 0); assert.equal(r.stderr, ""); assert.ok(!r.stdout.includes("SYNTHETIC"));
-  const out = JSON.parse(r.stdout);
-  assert.equal(out.hubResponds, false); assert.equal(out.containersRunning, true); assert.equal(out.commit, commit); assert.equal(out.polls, 1);
-  assert.deepEqual(out.capture.logs, [{ service: "hub", unavailable: "log read failed" }, { service: "discord-bridge", unavailable: "log read failed" }]);
+  // Fails PROBE_TT_FAILS times, counting its calls in PROBE_TT_COUNT, then succeeds.
+  exe("tt", `const fs=require("fs"),f=process.env.PROBE_TT_COUNT,n=Number(fs.existsSync(f)?fs.readFileSync(f,"utf8"):0)+1;fs.writeFileSync(f,String(n));console.error("${SECRET}");process.exit(n>Number(process.env.PROBE_TT_FAILS)?0:1);`);
+  const run = (name, windowMs, fails) => new Promise((done, fail) => {
+    const cfg = join(dir, name + ".json"); writeFileSync(cfg, JSON.stringify({ tt: join(bin, "tt"), targets: { hub: { host: "truenas", readyWindowMs: windowMs } }, secret: SECRET }));
+    const child = spawn(process.execPath, ["scripts/release-probe.mjs", "live", "hub", "--config", cfg], { stdio: ["ignore", "pipe", "pipe"], env: { ...process.env, PATH: bin + ":" + process.env.PATH, PROBE_TT_COUNT: join(dir, name + ".count"), PROBE_TT_FAILS: String(fails) } });
+    let stdout = "", stderr = ""; child.stdout.on("data", d => { stdout += d; }); child.stderr.on("data", d => { stderr += d; });
+    child.on("error", fail); child.on("close", status => done({ status, stdout, stderr }));
+  });
+  const [late, never] = await Promise.all([run("late", 12000, 2), run("never", 1000, 1e9)]);
+  for (const r of [late, never]) { assert.equal(r.status, 0); assert.equal(r.stderr, ""); assert.equal(r.stdout.trim().split("\n").length, 1); assert.ok(!r.stdout.includes("SYNTHETIC")); }
+  const up3 = JSON.parse(late.stdout);
+  assert.equal(up3.hubResponds, true); assert.equal(up3.containersRunning, true); assert.equal(up3.commit, commit); assert.equal(up3.polls, 3);
+  // Two real 5 s sleeps plus three polls: just over 10 s here. The upper bound
+  // leaves room for slow process starts on a busy host.
+  assert.ok(up3.waitedMs >= 10000 && up3.waitedMs < 20000, `waitedMs ${up3.waitedMs}`); assert.ok(!("capture" in up3));
+  const down = JSON.parse(never.stdout);
+  assert.equal(down.hubResponds, false); assert.equal(down.containersRunning, true); assert.equal(down.polls, 2); assert.ok(down.waitedMs >= 1000);
+  assert.deepEqual(down.capture, { app: { state: "RUNNING", containers: [{ service: "hub", state: "running", id: "1".repeat(12) }, { service: "discord-bridge", state: "running", id: "2".repeat(12) }] }, logs: [{ service: "hub", unavailable: "log read failed" }, { service: "discord-bridge", unavailable: "log read failed" }] });
+  writeFileSync(join(dir, "broken.json"), "{ not json " + SECRET);
+  for (const cfg of [join(dir, "missing.json"), join(dir, "broken.json")]) {
+    const r = spawnSync(process.execPath, ["scripts/release-probe.mjs", "live", "hub", "--config", cfg], { encoding: "utf8", env: { ...process.env, PATH: bin + ":" + process.env.PATH } });
+    assert.equal(r.status, 1); assert.equal(r.stdout, ""); assert.equal(r.stderr, "");
+  }
 });
 
 test("Mini probe hashes the installed tt, checks the relay and counts only errors written after the deploy marker", async () => {
