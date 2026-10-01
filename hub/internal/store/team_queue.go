@@ -1722,7 +1722,7 @@ func (s *Store) TeamQueueAction(ctx context.Context, task string, req api.TeamQu
 			if e.HandlerID == "" || e.HandlerRunID == "" || e.HandlerLeaseGeneration < 1 {
 				return zero, fmt.Errorf("%w: exact handler lease missing", api.ErrConflict)
 			}
-			if err := requireCurrentConfirmedTeamOrder(ctx, tx, task, e.ItemID, e.ItemRevision, e.OrderMessageSeq); err != nil {
+			if err := requireCurrentConfirmedTeamOrder(ctx, tx, e); err != nil {
 				return zero, err
 			}
 			var plan struct {
@@ -1784,7 +1784,7 @@ func (s *Store) TeamQueueAction(ctx context.Context, task string, req api.TeamQu
 				return zero, api.ErrConflict
 			}
 			if req.Operation == "attempt" {
-				if err := requireCurrentConfirmedTeamOrder(ctx, tx, task, e.ItemID, e.ItemRevision, e.OrderMessageSeq); err != nil {
+				if err := requireCurrentConfirmedTeamOrder(ctx, tx, e); err != nil {
 					return zero, err
 				}
 				limit, err := queueConcurrencyLimit(ctx, tx, task)
@@ -2072,9 +2072,14 @@ func queueRequeueCommand(task, entry string) string {
 	return fmt.Sprintf("tt team queue requeue --task %s --entry %s", task, entry)
 }
 
-// staleQueueEntry is the refusal for a queued or running entry whose item is
-// at a later revision than the entry: it names the entry and the rebind.
+// staleQueueEntry is the refusal for a live entry whose item is at a later
+// revision than the entry: it names the entry and the supported path, a
+// rebind for a queued or running entry and a requeue for a launching one.
 func staleQueueEntry(e api.TeamQueueEntry, current int64) error {
+	if e.State == "launching" {
+		// A launch is frozen at its revision and cannot be rebound in place.
+		return fmt.Errorf("%w: entry %s is launching at revision %d; the item is at revision %d. A launching entry cannot be rebound: let the launch fail, then %s", api.ErrConflict, e.ID, e.ItemRevision, current, queueRequeueCommand(e.TaskID, e.ID))
+	}
 	return fmt.Errorf("%w: entry %s is bound to revision %d; the item is at revision %d. Rebind it: %s", api.ErrConflict, e.ID, e.ItemRevision, current, queueRebindCommand(e.TaskID, e.ID))
 }
 

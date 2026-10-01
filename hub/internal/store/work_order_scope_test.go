@@ -2,9 +2,14 @@ package store
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
+	"fmt"
 	"path/filepath"
 	"reflect"
+	"sort"
+	"strings"
 	"testing"
 
 	"github.com/scs32/tailterm/hub/internal/api"
@@ -236,5 +241,97 @@ func TestWorkOrderScopeHandlerIntakeAndBookkeepingKeepsQueueAndStarts(t *testing
 	newContext := syntheticPreparedContext(t, updated, api.MessageReference{TaskID: task.ID, Seq: order.Seq}, syntheticHistory(updated, order))
 	if _, err := s.AddAgent(ctx, task.ID, api.AddAgentRequest{Name: "stale-scope-worker", Host: "fixture", Session: "stale-scope-worker", WorkItem: &api.AgentWorkItemRequest{ItemTaskID: task.ID, ItemID: item.ID, ItemRevision: updated.Revision, WorkOrderMessage: api.MessageReference{TaskID: task.ID, Seq: order.Seq}, ContextBundle: newContext}}, by); !errors.Is(err, api.ErrConflict) {
 		t.Fatalf("scope edit kept admission valid: %v", err)
+	}
+}
+
+// a3: bookkeeping, a new admission and receipts work at the amended revision
+// once the running entry is rebound; before that the refusal names the entry
+// and the rebind. The item, its entry and the earlier receipt are untouched.
+func TestWorkOrderBookkeepingAfterRebind(t *testing.T) {
+	f := newRebindFixture(t, true)
+	admissions := func() []api.WorkOrderAdmission {
+		var out []api.WorkOrderAdmission
+		for id, row := range f.bindings(t) {
+			if id != f.gone.ID {
+				out = append(out, api.WorkOrderAdmission{AgentID: row[0], RunID: row[1], ContextDigest: row[3]})
+			}
+		}
+		sort.Slice(out, func(i, j int) bool { return out[i].AgentID < out[j].AgentID })
+		return out
+	}
+	rawReceipt := func(requestID string) string {
+		t.Helper()
+		var raw string
+		if err := f.s.db.QueryRow(`SELECT receipt_json FROM work_order_bookkeeping WHERE task_id=? AND request_id=?`, f.task.ID, requestID).Scan(&raw); err != nil {
+			t.Fatal(err)
+		}
+		return raw
+	}
+	decision := contextLinkedMessage(t, f.s, f.task, f.item, "decision before the amendment", "decision-before", &api.MessageReference{TaskID: f.task.ID, Seq: f.order.Seq})
+	before := api.WorkOrderBookkeepingRequest{RequestID: "save-before", AgentID: f.handler.ID, RunID: f.handler.RunID, ExpectedRevision: f.item.Revision, OrderMessageSeq: f.order.Seq, SourceMessageSeq: decision.Seq, Kind: "decision", QueueEntryID: f.entry.ID, Admissions: admissions()}
+	old, err := f.s.SaveWorkOrderBookkeeping(f.ctx, f.task.ID, f.item.ID, before)
+	if err != nil || old.ItemRevision != f.item.Revision || len(old.Admissions) != 2 {
+		t.Fatalf("receipt before the amendment %+v %v", old, err)
+	}
+	oldRaw := rawReceipt(before.RequestID)
+
+	updated, source := f.amend(t, "one")
+	f.confirm(t, updated)
+	after := api.WorkOrderBookkeepingRequest{RequestID: "save-after", AgentID: f.handler.ID, RunID: f.handler.RunID, ExpectedRevision: updated.Revision, OrderMessageSeq: f.order.Seq, SourceMessageSeq: source.Seq, Kind: "decision", QueueEntryID: f.entry.ID, Admissions: admissions()}
+	_, err = f.s.SaveWorkOrderBookkeeping(f.ctx, f.task.ID, f.item.ID, after)
+	if !errors.Is(err, api.ErrConflict) || !strings.Contains(err.Error(), f.entry.ID) || !strings.Contains(err.Error(), "tt team queue rebind") {
+		t.Fatalf("bookkeeping before the rebind = %v, want a conflict naming %s and the rebind command", err, f.entry.ID)
+	}
+	want := fmt.Sprintf("entry %s is bound to revision %d; the item is at revision %d", f.entry.ID, f.item.Revision, updated.Revision)
+	if !strings.Contains(err.Error(), want) {
+		t.Fatalf("refusal %q lacks %q", err, want)
+	}
+
+	rebound, err := f.s.TeamQueueAction(f.ctx, f.task.ID, f.rebind(updated, source))
+	if err != nil {
+		t.Fatal(err)
+	}
+	after.Admissions = admissions()
+	receipt, err := f.s.SaveWorkOrderBookkeeping(f.ctx, f.task.ID, f.item.ID, after)
+	if err != nil {
+		t.Fatalf("bookkeeping after the rebind: %v", err)
+	}
+	if receipt.ItemID != f.item.ID || receipt.ItemRevision != updated.Revision || receipt.ScopeRevision != updated.ScopeRevision || receipt.QueueEntryID != f.entry.ID || rebound.ID != f.entry.ID || !reflect.DeepEqual(receipt.Admissions, after.Admissions) || len(receipt.Admissions) != 2 {
+		t.Fatalf("receipt after the rebind %+v", receipt)
+	}
+	for i, a := range receipt.Admissions {
+		if a != old.Admissions[i] {
+			t.Fatalf("admission identity changed: %+v was %+v", a, old.Admissions[i])
+		}
+	}
+	// Start: a new member is admitted at the amended revision and counted.
+	late := f.member(t, "late")
+	if late.WorkItem == nil || late.WorkItem.ItemRevision != updated.Revision {
+		t.Fatalf("late admission %+v", late.WorkItem)
+	}
+	next := after
+	next.RequestID, next.Kind, next.Admissions = "save-after-start", "sequencing_note", admissions()
+	if started, err := f.s.SaveWorkOrderBookkeeping(f.ctx, f.task.ID, f.item.ID, next); err != nil || len(started.Admissions) != 3 || started.ItemRevision != updated.Revision {
+		t.Fatalf("receipt after a new admission %+v %v", started, err)
+	}
+	// A fresh allocation intent at the amended revision is accepted as well.
+	digest := sha256.Sum256([]byte("prepared context"))
+	if _, err := f.s.CreateAllocationIntent(f.ctx, f.task.ID, api.CreateAllocationIntentRequest{AgentID: api.NewID("agt"), TargetTaskID: f.task.ID, ItemTaskID: f.task.ID, ItemID: f.item.ID, ItemRevision: updated.Revision,
+		WorkOrderMessage: api.MessageReference{TaskID: f.task.ID, Seq: f.order.Seq}, ContextDigest: hex.EncodeToString(digest[:]), TeamRole: api.TeamRoleMember, AuthorAgentID: f.handler.ID, AuthorRunID: f.handler.RunID, ExpectedRunID: api.NewID("run")}, f.by); err != nil {
+		t.Fatalf("allocation intent at the amended revision: %v", err)
+	}
+
+	if saved, err := f.s.GetWorkOrderBookkeepingReceipt(f.ctx, f.task.ID, f.item.ID, before.RequestID); err != nil || !reflect.DeepEqual(saved, old) {
+		t.Fatalf("earlier receipt %+v %v", saved, err)
+	}
+	if raw := rawReceipt(before.RequestID); raw != oldRaw {
+		t.Fatalf("earlier receipt bytes changed\nbefore %s\nafter  %s", oldRaw, raw)
+	}
+	if replay, err := f.s.SaveWorkOrderBookkeeping(f.ctx, f.task.ID, f.item.ID, before); err != nil || !reflect.DeepEqual(replay, old) {
+		t.Fatalf("earlier receipt replay %+v %v", replay, err)
+	}
+	var entries int
+	if err := f.s.db.QueryRow(`SELECT count(*) FROM team_queue_entries WHERE task_id=?`, f.task.ID).Scan(&entries); err != nil || entries != 1 {
+		t.Fatalf("entries %d %v: a rebind needs no replacement", entries, err)
 	}
 }

@@ -336,10 +336,13 @@ func exactExistingQueueAdmission(q queryRower, ctx context.Context, targetTaskID
 }
 
 // validatedBoundHistoricalMessage reports whether a stale message revision is
-// the immutable launch revision for the author's exact current run. Merely
+// one the author's exact current run was bound at: its binding's revision, or
+// a revision that binding held before a team queue rebind moved it. Merely
 // naming a bound agent or an old item revision is insufficient: the item/order
 // coordinates must match the binding, and its stored prepared history must
-// still pass the same validation and digest check used at admission.
+// still pass the same validation and digest check used at admission. A rebind
+// moves only the binding's revision, so the stored history is validated at
+// the revision it was admitted at.
 func validatedBoundHistoricalMessage(q queryRower, ctx context.Context, messageTaskID string, req api.PostMessageRequest) (bool, error) {
 	if req.AgentID == "" || len(req.WorkItems) != 1 || req.WorkOrderMessage == nil {
 		return false, nil
@@ -362,8 +365,15 @@ WHERE a.id=? AND a.task_id=?`, req.AgentID, messageTaskID).Scan(
 		return false, err
 	}
 	link := req.WorkItems[0]
-	if link.ItemTaskID != binding.ItemTaskID || link.ItemID != binding.ItemID || link.ItemRevision != binding.ItemRevision ||
+	if link.ItemTaskID != binding.ItemTaskID || link.ItemID != binding.ItemID ||
 		link.Relationship != "primary" || *req.WorkOrderMessage != binding.WorkOrderMessage {
+		return false, nil
+	}
+	admitted, held, err := reboundBindingRevisions(q, ctx, binding)
+	if err != nil {
+		return false, err
+	}
+	if !held[link.ItemRevision] {
 		return false, nil
 	}
 	digestBytes := sha256.Sum256(contextBundle)
@@ -371,13 +381,38 @@ WHERE a.id=? AND a.task_id=?`, req.AgentID, messageTaskID).Scan(
 		return false, errors.New("stored work-item context digest mismatch")
 	}
 	stored := &api.AgentWorkItemRequest{
-		ItemTaskID: binding.ItemTaskID, ItemID: binding.ItemID, ItemRevision: binding.ItemRevision,
+		ItemTaskID: binding.ItemTaskID, ItemID: binding.ItemID, ItemRevision: admitted,
 		WorkOrderMessage: binding.WorkOrderMessage, ContextBundle: json.RawMessage(contextBundle),
 	}
 	if err := validatePreparedContextBundle(stored); err != nil {
 		return false, fmt.Errorf("stored work-item context is invalid: %w", err)
 	}
 	return true, nil
+}
+
+// reboundBindingRevisions returns the item revision a binding was admitted
+// at and every revision it has held. Without a rebind both are its current
+// revision; each rebind of this exact run adds the revision it moved from,
+// and the earliest of those is the admitted one.
+func reboundBindingRevisions(q queryRower, ctx context.Context, binding api.AgentWorkItemBinding) (int64, map[int64]bool, error) {
+	admitted := binding.ItemRevision
+	held := map[int64]bool{binding.ItemRevision: true}
+	rows, err := q.QueryContext(ctx, `SELECT from_item_revision FROM team_queue_rebind_bindings WHERE agent_id=? AND run_id=?`, binding.AgentID, binding.RunID)
+	if err != nil {
+		return 0, nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var from int64
+		if err := rows.Scan(&from); err != nil {
+			return 0, nil, err
+		}
+		held[from] = true
+		if from < admitted {
+			admitted = from
+		}
+	}
+	return admitted, held, rows.Err()
 }
 
 func insertAgentWorkItemBinding(ctx context.Context, tx *sql.Tx, agent api.Agent, req *api.AgentWorkItemRequest, through int64, resolvedTeamRole string) (*api.AgentWorkItemBinding, error) {

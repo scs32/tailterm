@@ -1972,3 +1972,109 @@ func TestTeamQueueRebindRefusals(t *testing.T) {
 		})
 	}
 }
+
+// a6: a bound agent keeps posting across a rebind. After the item moves on
+// again, its posts linked at the revision it was admitted at and at the
+// revision it was rebound to are both accepted; a revision its binding never
+// held is still refused.
+func TestBoundAgentPostsAcrossRebind(t *testing.T) {
+	f := newRebindFixture(t, true)
+	first, source := f.amend(t, "one")
+	f.confirm(t, first)
+	f.entry = f.action(t, f.rebind(first, source))
+	skipped, _ := f.amend(t, "two")
+	current, _ := f.amend(t, "three")
+	post := func(key string, revision int64) error {
+		_, err := f.s.PostMessage(f.ctx, f.task.ID, api.PostMessageRequest{Text: "progress " + key, RequestID: "post-" + key, AgentID: f.worker.ID,
+			WorkItems:        []api.MessageWorkItem{{ItemTaskID: f.task.ID, ItemID: f.item.ID, ItemRevision: revision, Relationship: "primary"}},
+			WorkOrderMessage: &api.MessageReference{TaskID: f.task.ID, Seq: f.order.Seq}}, f.by)
+		return err
+	}
+	if err := post("admitted", f.item.Revision); err != nil {
+		t.Fatalf("post at the admitted revision %d: %v", f.item.Revision, err)
+	}
+	if err := post("rebound", first.Revision); err != nil {
+		t.Fatalf("post at the rebound revision %d: %v", first.Revision, err)
+	}
+	if err := post("never-held", skipped.Revision); !errors.Is(err, api.ErrConflict) {
+		t.Fatalf("post at revision %d the binding never held = %v", skipped.Revision, err)
+	}
+	if current.Revision <= skipped.Revision || skipped.Revision <= first.Revision {
+		t.Fatalf("fixture revisions %d %d %d", first.Revision, skipped.Revision, current.Revision)
+	}
+	// The closed member was not rebound: only its admitted revision is held.
+	if _, err := f.s.db.Exec(`UPDATE agents SET status='running' WHERE id=?`, f.gone.ID); err != nil {
+		t.Fatal(err)
+	}
+	_, err := f.s.PostMessage(f.ctx, f.task.ID, api.PostMessageRequest{Text: "stale member", RequestID: "post-unmoved", AgentID: f.gone.ID,
+		WorkItems:        []api.MessageWorkItem{{ItemTaskID: f.task.ID, ItemID: f.item.ID, ItemRevision: first.Revision, Relationship: "primary"}},
+		WorkOrderMessage: &api.MessageReference{TaskID: f.task.ID, Seq: f.order.Seq}}, f.by)
+	if !errors.Is(err, api.ErrConflict) {
+		t.Fatalf("unmoved binding posted at the rebound revision: %v", err)
+	}
+}
+
+// a4: after a running rebind the same entry and item go on to handler
+// acceptance, team close at the rebound revision and finish.
+func TestTeamQueueRebindThenAcceptAndFinish(t *testing.T) {
+	f := newRebindFixture(t, true)
+	updated, source := f.amend(t, "one")
+	f.confirm(t, updated)
+	f.entry = f.action(t, f.rebind(updated, source))
+
+	seedPassingVerificationAt(t, f.s, updated, candidateB, autoWorktree)
+	report, _, err := f.s.PutNarrativeReport(f.ctx, f.task.ID, f.item.ID, completeReportRequest(updated, "rebound-report", 5), f.by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := "done"
+	if _, _, err := f.s.CreateWorkItemUpdate(f.ctx, f.task.ID, f.item.ID, api.CreateWorkItemUpdate{ExpectedRevision: updated.Revision, Status: &done, AgentID: f.handler.ID, RunID: f.handler.RunID, RequestID: "done-save",
+		CompletionReport: &api.NarrativeReportPin{ReportID: report.ReportID, Version: report.Version, Digest: report.Digest, ScopeRevision: report.ScopeRevision},
+		QueueAcceptance: &api.WorkItemQueueAcceptance{EntryID: f.entry.ID, Worktree: autoWorktree, Branch: autoBranch, Commit: candidateB}}, f.by); err != nil {
+		t.Fatalf("done save with acceptance: %v", err)
+	}
+	item, err := f.s.GetWorkItem(f.ctx, f.task.ID, f.item.ID)
+	if err != nil || item.ID != f.item.ID || item.Status != "done" {
+		t.Fatalf("item %+v %v", item, err)
+	}
+	accepted, err := f.s.GetTeamQueueEntry(f.ctx, f.task.ID, f.entry.ID)
+	if err != nil || accepted.State != "running" || accepted.Acceptance == nil || accepted.Acceptance.Commit != candidateB || accepted.Acceptance.ItemRevision != item.Revision || accepted.ItemRevision != updated.Revision || len(accepted.Rebinds) != 1 {
+		t.Fatalf("accepted entry %+v %v", accepted, err)
+	}
+
+	closeReq := api.TeamCloseRequest{RequestID: "close-rebound", ActorAgentID: f.lead.ID, ActorRunID: f.lead.RunID, LeadAgentID: f.lead.ID, LeadRunID: f.lead.RunID, LeadRevision: 1, ItemID: f.item.ID, ItemRevision: accepted.ItemRevision}
+	for _, a := range []api.Agent{f.lead, f.worker} {
+		live, err := f.s.GetAgent(f.ctx, a.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		closeReq.Members = append(closeReq.Members, api.TeamCloseMember{AgentID: live.ID, RunID: live.RunID, Host: live.Host, Status: live.Status})
+	}
+	if closeReq.Members[0].AgentID > closeReq.Members[1].AgentID {
+		closeReq.Members[0], closeReq.Members[1] = closeReq.Members[1], closeReq.Members[0]
+	}
+	stale := closeReq
+	stale.RequestID, stale.ItemRevision = "close-old-revision", f.item.Revision
+	if _, err := f.s.CloseItemTeam(f.ctx, f.task.ID, stale, f.by); !errors.Is(err, api.ErrConflict) {
+		t.Fatalf("team close at the pre-rebind revision = %v", err)
+	}
+	closed, err := f.s.CloseItemTeam(f.ctx, f.task.ID, closeReq, f.by)
+	if err != nil || closed.ItemID != f.item.ID || closed.LeadAgentID != f.lead.ID || len(closed.Members) != 2 {
+		t.Fatalf("team close at the rebound revision %+v %v", closed, err)
+	}
+	if _, err := f.s.db.Exec(`UPDATE agents SET cleanup_done=1 WHERE id IN (?,?)`, f.lead.ID, f.worker.ID); err != nil {
+		t.Fatal(err)
+	}
+	closeJSON, _ := json.Marshal(closeReq)
+	f.entry = f.action(t, api.TeamQueueRequest{Operation: "close", EntryID: f.entry.ID, ExpectedRevision: accepted.Revision, CloseJSON: closeJSON})
+	a := accepted.Acceptance
+	finished := f.action(t, api.TeamQueueRequest{Operation: "finish", EntryID: f.entry.ID, ExpectedRevision: f.entry.Revision,
+		Integration: &api.TeamIntegrationReady{Repository: a.Repository, BaseCommit: a.BaseCommit, Worktree: a.Worktree, Branch: a.Branch, Commit: a.Commit, Evidence: a.Evidence}})
+	if finished.ID != accepted.ID || finished.ItemID != f.item.ID || finished.State != "finished" || finished.Integration == nil || finished.ItemRevision != updated.Revision || finished.Attempt != 1 {
+		t.Fatalf("finished entry %+v", finished)
+	}
+	var entries int
+	if err := f.s.db.QueryRow(`SELECT count(*) FROM team_queue_entries WHERE task_id=?`, f.task.ID).Scan(&entries); err != nil || entries != 1 {
+		t.Fatalf("entries %d %v: the rebound entry finished without a replacement", entries, err)
+	}
+}
