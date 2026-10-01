@@ -6,7 +6,7 @@ import { openSync, closeSync, fsyncSync, writeFileSync, readFileSync, renameSync
 import { join, resolve, dirname, isAbsolute } from "node:path";
 import { digest, diffPaths, receiptEligible } from "./verify-matrix.mjs";
 import { selectReleaseTargets, releaseBaselines, schemaChanged } from "./release-targets.mjs";
-import { buildInfo, waitForTailOSCommit, tailosWindow, tailosURL, hostDeps } from "./release-probe.mjs";
+import { buildInfo, waitForTailOSCommit, tailosWindow, tailosURL, hostDeps, readyWindow, sanitizeCapture } from "./release-probe.mjs";
 
 const fileDigest = p => createHash("sha256").update(readFileSync(p)).digest("hex");
 const TRUENAS_BASE = "/mnt/deepfreeze/tailterm-hub", PAIR = ["hub", "bridge"];
@@ -161,7 +161,7 @@ export async function liveCheck(adapter, target, policy, sleep=ms=>new Promise(r
   for (;;) {
     const r=await adapter.check(target);
     if (r===true) {if(target==="mini") {await sleep(policy.relayCleanMs);if(await adapter.check(target)!==true) return false;}return true;}
-    if (r==="identity" || r==="integrity") return false;
+    if (r==="identity" || r==="integrity" || r==="readiness") return false;
     if(now()>=until && ++failures>=policy.failures)return false;
     await sleep(policy.intervalMs);
   }
@@ -516,21 +516,42 @@ export class HostAdapter {
       try{const w=await waitForTailOSCommit(tailosURL(this.config),a.commit,{windowMs:tailosWindow(this.config),deps:this.probeDeps});this.probeWaits.set("tailos:live",{lastCommit:w.lastCommit,waitedMs:w.waitedMs});return w.matched?true:"identity";}
       catch{return "identity";}
     }
+    if(PAIR.includes(target))this.probeWaits.delete(target+":live");
     try{
       const r=JSON.parse(this.command(a.liveProbe));
+      const waited=PAIR.includes(target) && this.readyWait(target,"live",r);
       if(r.commit!==a.commit || r.artifactSHA256!==a.artifactSHA256)return "identity";
       if(r.integrity!==true)return "integrity";
       if(target==="mini")return r.relayRunning===true && r.newErrors===0;
-      return r.hubResponds===true && r.migrationsApplied===true && r.containersRunning===true;
+      const ready=r.hubResponds===true && r.migrationsApplied===true && r.containersRunning===true;
+      // The hub and bridge probes own the whole readiness window, so a probe
+      // that waited and is still not ready fails once; liveCheck's generic
+      // retry stays for a probe that could not report at all.
+      return ready || !waited?ready:"readiness";
     }catch{return false;}
+  }
+  // A hub or bridge probe reports its own wait. Its capture is reduced to the
+  // fixed, redacted shape again here, so nothing else a probe prints can reach
+  // the journal.
+  readyWait(target,kind,r){
+    const count=v=>Number.isSafeInteger(v) && v>=0;
+    if(!count(r?.waitedMs))return false;
+    this.probeWaits.set(target+":"+kind,{waitedMs:r.waitedMs,polls:count(r.polls)?r.polls:null,...(r.capture?{capture:sanitizeCapture(r.capture)}:{})});
+    return true;
   }
   async rollback(target){
     const a=this.artifacts.get(target);if(!a || a.rollbackSafe!==true)return false;
     if(target==="mini"){
       if(!a.rollbackCaptured || fileDigest(a.rollbackPath)!==a.priorArtifactSHA256)return false;
       const {copyFileSync}=await import("node:fs");copyFileSync(a.rollbackPath,a.installPath+".rollback");renameSync(a.installPath+".rollback",a.installPath);this.command(a.relayRestart);
+    }else if(PAIR.includes(target)){
+      // A failed rollback program is already "not restored"; the probe still
+      // runs once so the journal shows the app state it left behind.
+      try{this.command(a.rollbackProgram);}
+      catch{try{this.readyWait(target,"rollback",JSON.parse(this.command(a.rollbackProbe)));}catch{}return false;}
     }else{this.command(a.rollbackProgram);}
     const r=JSON.parse(this.command(a.rollbackProbe));
+    if(PAIR.includes(target))this.readyWait(target,"rollback",r);
     if(target==="tailos")this.probeWaits.set("tailos:rollback",{lastCommit:sha(r.lastCommit)?r.lastCommit:null,waitedMs:Number.isSafeInteger(r.waitedMs)&&r.waitedMs>=0?r.waitedMs:null});
     return r.restored===true && r.databaseWritesPreserved===true;
   }
@@ -629,7 +650,7 @@ export function readBaselines(configPath){
 }
 export async function serveDeployment(config,{once=false,signal,configPath,release=runRelease}={}) {
   if(config.version!==1 || config.enabled!==true || !config.cwd || !config.journalDirectory)throw new Error("Explicit private activation config required");
-  tailosWindow(config);
+  tailosWindow(config);readyWindow(config,"hub");readyWindow(config,"bridge");
   // One fence-wait notice per holder, waiting job and reason per process; the
   // hub returns the original for a restart's identical resend.
   const posted=new Set();

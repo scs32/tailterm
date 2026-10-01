@@ -700,3 +700,111 @@ test("m5 end to end: a matrix change no owner approval covers refuses the job by
  const text=sends[0][sends[0].indexOf("--text")+1];assert.ok(text.includes(`Reason: ${uncoveredReason}.`));assert.doesNotMatch(text,/verify-matrix\.mjs exit/);
  assert.equal(git(r.f.cwd,"rev-parse","refs/heads/tasks-hub"),r.tip);assert.equal(remoteHead(r.f),r.originHead);
 });
+// Hub and bridge readiness window: each probe argv prints one fixed JSON line,
+// as the real probe does after its own wait. No host is contacted.
+const printJSON=v=>[process.execPath,"-e",`console.log(${JSON.stringify(JSON.stringify(v))})`];
+const READY_ID={commit:"d".repeat(40),artifactSHA256:"e".repeat(64)},READY_UP={...READY_ID,integrity:true,hubResponds:true,migrationsApplied:true,containersRunning:true,release:"rel_fixture-hub"};
+const READY_CAPTURE={app:{state:"RUNNING",containers:[{service:"hub",state:"running",id:"1".repeat(12)}]},logs:[{service:"hub",lines:["migration 41 started"]},{service:"discord-bridge",unavailable:"no log lines"}]};
+const READY_DOWN={...READY_UP,hubResponds:false,migrationsApplied:false,waitedMs:240000,polls:49,capture:READY_CAPTURE};
+function readyAdapter(target,{live=READY_UP,rollback={restored:true,databaseWritesPreserved:true},program=[process.execPath,"-e","0"]}={}){
+ const home=mkdtempSync(join(tmpdir(),"ready-wait-")),a=new HostAdapter({cwd:home,journalDirectory:home},{id:"rel_fixture"}),ran=[],command=a.command.bind(a);
+ a.command=(...args)=>{ran.push(args[0]);return command(...args);};
+ const artifact={...READY_ID,liveProbe:Array.isArray(live)?live:printJSON(live),rollbackSafe:true,rollbackProgram:program,rollbackProbe:Array.isArray(rollback)?rollback:printJSON(rollback)};
+ a.artifacts.set(target,artifact);return Object.assign(a,{ran,artifact});
+}
+const READY_POLICY={startupMs:60000,failures:3,intervalMs:5000,relayCleanMs:0},EXIT1=[process.execPath,"-e","process.exit(1)"];
+async function countedLiveCheck(a,target){let now=0;const sleeps=[];const out=await liveCheck(a,target,READY_POLICY,async ms=>{sleeps.push(ms);now+=ms;},()=>now);return {out,sleeps,checks:a.ran.length};}
+test("T1 a hub or bridge probe that waited and is still not ready fails the live check once",async()=>{
+ for(const target of ["hub","bridge"]){
+  const a=readyAdapter(target,{live:READY_DOWN});assert.equal(await a.check(target),"readiness");
+  assert.deepEqual(a.probeWait(target,"live"),{waitedMs:240000,polls:49,capture:READY_CAPTURE});
+  const once=readyAdapter(target,{live:READY_DOWN});assert.deepEqual(await countedLiveCheck(once,target),{out:false,sleeps:[],checks:1});
+  const stopped=readyAdapter(target,{live:{...READY_UP,containersRunning:false,waitedMs:240000,polls:49}});assert.equal(await stopped.check(target),"readiness");assert.deepEqual(stopped.probeWait(target,"live"),{waitedMs:240000,polls:49});
+  // Ready after a wait passes and still records the wait, with no capture.
+  const late=readyAdapter(target,{live:{...READY_UP,waitedMs:15000,polls:4}});assert.deepEqual(await countedLiveCheck(late,target),{out:true,sleeps:[],checks:1});
+  assert.deepEqual(late.probeWait(target,"live"),{waitedMs:15000,polls:4});
+  // Identity and integrity still win over readiness.
+  assert.equal(await readyAdapter(target,{live:{...READY_DOWN,commit:"c".repeat(40)}}).check(target),"identity");
+  assert.equal(await readyAdapter(target,{live:{...READY_DOWN,integrity:false}}).check(target),"integrity");
+  // A probe that reports no wait, or cannot report at all, keeps the generic retry.
+  const old=readyAdapter(target,{live:{...READY_UP,hubResponds:false}});assert.equal(await old.check(target),false);assert.equal(old.probeWait(target,"live"),undefined);
+  const silent=readyAdapter(target,{live:EXIT1});assert.deepEqual(await countedLiveCheck(silent,target),{out:false,sleeps:Array.from({length:14},()=>5000),checks:15});
+  // A later probe that cannot report drops the earlier wait record.
+  const stale=readyAdapter(target,{live:READY_DOWN});await stale.check(target);stale.artifact.liveProbe=EXIT1;assert.equal(await stale.check(target),false);assert.equal(stale.probeWait(target,"live"),undefined);
+  for(const junk of [{waitedMs:-1},{waitedMs:"240000"},{waitedMs:1.5}]){const j=readyAdapter(target,{live:{...READY_DOWN,...junk}});assert.equal(await j.check(target),false);assert.equal(j.probeWait(target,"live"),undefined);}
+ }
+ // Mini is untouched: a waitedMs field there means nothing.
+ const mini=readyAdapter("mini",{live:{...READY_ID,integrity:true,relayRunning:false,newErrors:0,waitedMs:5}});assert.equal(await mini.check("mini"),false);assert.equal(mini.probeWait("mini","live"),undefined);
+ // An invalid window stops the daemon before any command, like the TailOS one.
+ const cwd=mkdtempSync(join(tmpdir(),"ready-window-")),log=join(cwd,"calls.log"),fakeTT=join(cwd,"tt");
+ writeFileSync(fakeTT,`#!/bin/sh\necho "$@" >> ${JSON.stringify(log)}\necho '[]'\n`);chmodSync(fakeTT,0o755);
+ for(const target of ["hub","bridge"])for(const bad of [-1,300001,"240000",1.5])await assert.rejects(serveDeployment({version:1,enabled:true,cwd,journalDirectory:cwd,tt:fakeTT,targets:{[target]:{host:"truenas",readyWindowMs:bad}}},{once:true}),/readiness window/);
+ assert.equal(existsSync(log),false);
+ await serveDeployment({version:1,enabled:true,cwd,journalDirectory:cwd,tt:fakeTT,targets:{hub:{host:"truenas",readyWindowMs:120000},bridge:{host:"truenas"}}},{once:true});assert.equal(readFileSync(log,"utf8"),"deployment list\n");
+});
+test("T2 a rollback that comes up late is restored, and a failed rollback still records what the probe saw",async()=>{
+ for(const target of ["hub","bridge"]){
+  const late=readyAdapter(target,{rollback:{restored:true,databaseWritesPreserved:true,waitedMs:15000,polls:4}});assert.equal(await late.rollback(target),true);
+  assert.deepEqual(late.probeWait(target,"rollback"),{waitedMs:15000,polls:4});assert.deepEqual(late.ran,[late.artifact.rollbackProgram,late.artifact.rollbackProbe]);
+  const down={restored:false,databaseWritesPreserved:false,waitedMs:240000,polls:49,capture:READY_CAPTURE};
+  const never=readyAdapter(target,{rollback:down});assert.equal(await never.rollback(target),false);
+  assert.deepEqual(never.probeWait(target,"rollback"),{waitedMs:240000,polls:49,capture:READY_CAPTURE});
+  // The rollback program itself fails: still false, and the probe runs once for the record.
+  const broken=readyAdapter(target,{rollback:down,program:[process.execPath,"-e","process.exit(3)"]});assert.equal(await broken.rollback(target),false);
+  assert.deepEqual(broken.probeWait(target,"rollback"),{waitedMs:240000,polls:49,capture:READY_CAPTURE});assert.deepEqual(broken.ran,[broken.artifact.rollbackProgram,broken.artifact.rollbackProbe]);
+  // A probe that says restored cannot overturn a failed rollback program.
+  const lucky=readyAdapter(target,{rollback:{restored:true,databaseWritesPreserved:true,waitedMs:0,polls:1},program:[process.execPath,"-e","process.exit(3)"]});assert.equal(await lucky.rollback(target),false);
+  const silent=readyAdapter(target,{rollback:EXIT1,program:[process.execPath,"-e","process.exit(3)"]});assert.equal(await silent.rollback(target),false);assert.equal(silent.probeWait(target,"rollback"),undefined);
+  await assert.rejects(readyAdapter(target,{rollback:EXIT1}).rollback(target),/Host operation failed/);
+ }
+ // TailOS keeps its own path: a failed rollback program still throws and no probe runs.
+ const tailos=readyAdapter("tailos",{rollback:{restored:true,databaseWritesPreserved:true,lastCommit:"c".repeat(40),waitedMs:0},program:[process.execPath,"-e","process.exit(3)"]});
+ await assert.rejects(tailos.rollback("tailos"),/Host operation failed/);assert.equal(tailos.ran.length,1);assert.equal(tailos.probeWait("tailos","rollback"),undefined);
+});
+// A paired release driven by the fake adapter, with check, rollback and
+// probeWait handed to a real HostAdapter whose probes print fixed output.
+function readyRelease(liveHub,rollbackHub={restored:true,databaseWritesPreserved:true,waitedMs:15000,polls:4}){
+ const p=pairedRelease(),h=readyAdapter("hub",{live:liveHub,rollback:rollbackHub});let details;
+ h.artifacts.set("bridge",{...h.artifact,liveProbe:printJSON(READY_UP),rollbackProbe:printJSON({restored:true,databaseWritesPreserved:true,waitedMs:0,polls:1})});
+ p.a.check=t=>h.check(t);p.a.rollback=t=>{p.a.calls.push("rollback:"+t);return h.rollback(t);};p.a.probeWait=(t,kind)=>h.probeWait(t,kind);p.a.escalate=async d=>{details=d;p.a.calls.push("escalate");};
+ return {...p,h,details:()=>details};
+}
+test("T3 a hub that ends not ready journals its capture on the effect and keeps it out of the receipt and escalation",async()=>{
+ const p=readyRelease(READY_DOWN);await assert.rejects(runRelease(p.c,p.a),/failed/);
+ const journal=p.journal(),hub=journal.effects.find(e=>e.target==="hub"),bridge=journal.effects.find(e=>e.target==="bridge");
+ assert.deepEqual(journal.failure,{step:"live-check",target:"hub",reason:"live verification failed"});
+ assert.deepEqual(hub.liveCheck,{waitedMs:240000,polls:49,capture:READY_CAPTURE});
+ assert.deepEqual(hub.rollbackCheck,{waitedMs:15000,polls:4});assert.equal(hub.rollback,"restored");
+ assert.deepEqual(bridge.rollbackCheck,{waitedMs:0,polls:1});assert.equal(bridge.liveCheck,undefined);
+ assert.equal(journal.outcome,"rolled_back");assert.equal(p.receipt().outcome,"rolled_back");
+ assert.deepEqual(p.receipt().targets.map(t=>[t.target,t.outcome,t.rollback]),[["hub","rolled_back","restored"],["bridge","rolled_back","restored"]]);
+ for(const text of [JSON.stringify(p.receipt()),JSON.stringify(p.details())]){assert.ok(!text.includes("capture"));assert.ok(!text.includes("migration 41"));assert.ok(!text.includes("polls"));}
+ assert.deepEqual(p.details().probeWaits.find(w=>w.target==="hub"&&w.probe==="live"),{target:"hub",probe:"live",lastCommit:undefined,waitedMs:240000});
+ // The live probe ran once for the hub, not once per generic retry.
+ assert.equal(p.h.ran.filter(argv=>argv===p.h.artifact.liveProbe).length,1);
+ // The Board text names TailOS waits only, whatever the details carry.
+ const calls=[],notice=new HostAdapter({cwd:p.f.cwd,journalDirectory:p.f.cwd},{id:"rel_fixture"});notice.command=argv=>{calls.push(argv);return "";};
+ await notice.escalate({jobId:"rel_fixture",outcome:"rolled_back",probeWaits:[{target:"hub",probe:"live",waitedMs:240000,capture:READY_CAPTURE}]});
+ assert.ok(!calls[0].join(" ").includes("migration 41"));assert.ok(!calls[0].join(" ").includes("240"));
+ // A rollback that never comes up is blocked, with its own capture journaled.
+ const b=readyRelease(READY_DOWN,{restored:false,databaseWritesPreserved:false,waitedMs:240000,polls:49,capture:READY_CAPTURE});await assert.rejects(runRelease(b.c,b.a),/failed/);
+ const blocked=b.journal().effects.find(e=>e.target==="hub");assert.equal(blocked.rollback,"blocked");assert.deepEqual(blocked.rollbackCheck,{waitedMs:240000,polls:49,capture:READY_CAPTURE});
+ assert.equal(b.receipt().outcome,"blocked");assert.ok(!JSON.stringify([b.receipt(),b.details()]).includes("migration 41"));
+});
+test("T4 a probe's capture is reduced to the fixed, redacted shape before it reaches the journal",async()=>{
+ const SECRET="SYNTHETIC_PRIVATE_TOKEN",opaque="SYNTHETICa1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6";
+ const hostile={app:{state:"RUNNING",config:{token:SECRET},notes:SECRET,containers:[{service:"hub",state:"running",id:"1".repeat(64),environment:{TOKEN:SECRET}},{service:SECRET+" x",state:"running; rm",id:SECRET}]},notes:SECRET,
+  logs:[{service:"hub",lines:["x".repeat(5000),"token="+SECRET,"Authorization: Bearer SYNTHETIC.bearer","id "+opaque,"ok line",{nested:SECRET}],extra:SECRET},{service:"discord-bridge",unavailable:"no log lines",detail:SECRET},{service:"hub",unavailable:SECRET},{service:"hub",unavailable:"time budget"},{service:"hub",lines:[SECRET]}]};
+ const expected={app:{state:"RUNNING",containers:[{service:"hub",state:"running",id:"1".repeat(12)},{service:null,state:null,id:null}]},
+  logs:[{service:"hub",lines:["x".repeat(300),"[redacted]","[redacted]","id [redacted]","ok line"]},{service:"discord-bridge",unavailable:"no log lines"},{service:"hub",unavailable:"log read failed"},{service:"hub",unavailable:"time budget"}]};
+ const p=readyRelease({...READY_DOWN,capture:hostile,[SECRET]:SECRET,notes:SECRET},{restored:false,databaseWritesPreserved:false,waitedMs:240000,polls:49,capture:hostile,notes:SECRET});
+ await assert.rejects(runRelease(p.c,p.a),/failed/);
+ const text=readFileSync(p.c.journalPath,"utf8"),hub=JSON.parse(text).effects.find(e=>e.target==="hub");
+ assert.ok(!text.includes("SYNTHETIC"));assert.ok(!text.includes("running; rm"));
+ assert.deepEqual(hub.liveCheck,{waitedMs:240000,polls:49,capture:expected});assert.deepEqual(hub.rollbackCheck,{waitedMs:240000,polls:49,capture:expected});
+ assert.ok(!JSON.stringify([p.receipt(),p.details()]).includes("SYNTHETIC"));
+ // An unavailable capture passes unchanged; a capture that is not an object becomes one.
+ const unavailable={app:"unavailable",logs:[{service:"hub",unavailable:"log read failed"},{service:"discord-bridge",unavailable:"invalid container id"}]};
+ const u=readyAdapter("hub",{live:{...READY_DOWN,capture:unavailable}});assert.equal(await u.check("hub"),"readiness");assert.deepEqual(u.probeWait("hub","live").capture,unavailable);
+ const s=readyAdapter("hub",{live:{...READY_DOWN,capture:SECRET}});assert.equal(await s.check("hub"),"readiness");assert.deepEqual(s.probeWait("hub","live"),{waitedMs:240000,polls:49,capture:{app:"unavailable",logs:[]}});
+});
