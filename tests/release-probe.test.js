@@ -14,26 +14,29 @@ const compose = (hubRelease = "rel_x-aaaaaaaaaaaa-hub", bridgeRelease = "2026092
   hub: { volumes: [`${BASE}/releases/${hubRelease}/tailterm-hub:/opt/tailterm-hub:ro`, `${BASE}/state:/state`, `${BASE}/hub-token:/run/hub-token:ro`], environment: { TOKEN: SECRET } },
   "discord-bridge": { volumes: [`${BASE}/releases/${bridgeRelease}/tailterm-discord:/opt/tailterm-discord:ro`, `${BASE}/discord-token:/run/discord-token:ro`] },
 } });
-const ids = { hub: "1".repeat(64), "discord-bridge": "2".repeat(64) };
+const ids = { hub: "1".repeat(64), "discord-bridge": "2".repeat(64), worker: "3".repeat(64), cron: "4".repeat(64) };
 const up = [{ service_name: "hub", state: "running", id: ids.hub }, { service_name: "discord-bridge", state: "running", id: ids["discord-bridge"] }];
 // `polls` scripts each readiness read in turn (the last entry repeats): an
 // entry overrides state, containers, hub (the tt exit status) or instance
 // (the app.get_instance answer). sleep only advances the fake clock. `logs`
-// answers each `midclt subscribe` log read and may advance the clock.
+// answers each `midclt subscribe` log read and may advance the clock. With
+// `slow`, every command takes 1 ms less than the run timeout it was given
+// (120 s, the default, when it was given none).
 const logLine = data => JSON.stringify({ msg: "added", collection: "app.container_log_follow", fields: { data, timestamp: "2026-10-01T00:00:00Z" } });
 const subscribe = id => `midclt subscribe -n 40 -t 8 'app.container_log_follow:{"app_name":"tailterm-hub","container_id":"${id}","tail_lines":40}'`;
 const logReads = deps => deps.runs.filter(r => String(r.argv.at(-1)).startsWith("midclt subscribe "));
-function fakeHost({ config = compose(), modified = "false", state = "RUNNING", containers = up, hub = 0, relay = "\tstate = running", polls = [{}], logs = () => ({ status: 0, stdout: logLine("listening on :8080") + "\n" }) } = {}) {
+function fakeHost({ config = compose(), modified = "false", state = "RUNNING", containers = up, hub = 0, relay = "\tstate = running", polls = [{}], logs = () => ({ status: 0, stdout: logLine("listening on :8080") + "\n" }), slow = false } = {}) {
   const calls = [], runs = [], sleeps = [];
   let t = 0, instanceReads = 0, hubReads = 0, logReadCount = 0;
   const poll = n => ({ state, containers, hub, ...polls[Math.min(n, polls.length - 1)] });
-  return { calls, runs, sleeps, uid: () => 501, fetchJSON: async () => ({ commit }), now: () => t, sleep: async ms => { sleeps.push(ms); t += ms; }, run: (argv, opts = {}) => {
+  return { calls, runs, sleeps, clock: () => t, uid: () => 501, fetchJSON: async () => ({ commit }), now: () => t, sleep: async ms => { sleeps.push(ms); t += ms; }, run: (argv, opts = {}) => {
     calls.push(argv); runs.push({ argv, opts });
+    if (slow) t += (opts.timeout ?? 120000) - 1;
     const cmd = argv.at(-1);
     if (argv[0] === "ssh") {
       assert.deepEqual(argv.slice(0, 6), ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "truenas"]);
       if (cmd === "midclt call app.config tailterm-hub") return { status: 0, stdout: JSON.stringify(config) };
-      if (cmd === "midclt call app.get_instance tailterm-hub") { const p = poll(instanceReads++); return p.instance || { status: 0, stdout: JSON.stringify({ state: p.state, active_workloads: { container_details: p.containers } }) }; }
+      if (cmd === "midclt call app.get_instance tailterm-hub") { const p = poll(instanceReads++); if (p.instance) return typeof p.instance === "function" ? p.instance(opts) : p.instance; return { status: 0, stdout: JSON.stringify({ state: p.state, active_workloads: { container_details: p.containers } }) }; }
       if (cmd.startsWith("cat ")) { assert.ok(opts.buffer); return { status: 0, stdout: bytes }; }
       if (cmd.startsWith("midclt subscribe ")) { const id = Object.values(ids).find(i => cmd === subscribe(i)); assert.ok(id, "log read for a known 64-hex id only"); return logs({ id, n: logReadCount++, advance: ms => { t += ms; } }); }
     }
@@ -220,6 +223,9 @@ test("H5 a not-ready end captures allowlisted app state and redacted log lines, 
   // The first log read uses up the 45 s budget: the next is skipped, not run.
   const slow = await failing(({ advance }) => { advance(50000); return { status: 0, stdout: logLine("slow") + "\n" }; }, [{ service: "hub", lines: ["slow"] }, { service: "discord-bridge", unavailable: "time budget" }]);
   assert.equal(logReads(slow).length, 1);
+  // A later read's timeout is cut to what is left of the budget.
+  const cut = await failing(({ advance, n }) => { if (n === 0) advance(35000); return { status: 0, stdout: logLine("slow") + "\n" }; }, [{ service: "hub", lines: ["slow"] }, { service: "discord-bridge", lines: ["slow"] }]);
+  assert.deepEqual(logReads(cut).map(r => r.opts.timeout), [15000, 10000]);
 
   // An id that is not 64 hex is never placed in a command.
   const hostile = [{ service_name: "hub", state: "running", id: "abc'; rm -rf / #" }, { service_name: "discord-bridge", state: "running", id: "A".repeat(64) }, { service_name: "bad name!", state: "x y", id: ["1".repeat(64)] }];
@@ -239,6 +245,36 @@ test("H5 a not-ready end captures allowlisted app state and redacted log lines, 
   assert.deepEqual(sanitizeCapture({ app: { state: "running", containers: Array.from({ length: 12 }, () => null), config: SECRET }, logs: Array.from({ length: 6 }, () => ({ service: "hub", unavailable: SECRET })) }),
     { app: { state: null, containers: Array.from({ length: 8 }, () => ({ service: null, state: null, id: null })) }, logs: Array.from({ length: 4 }, () => ({ service: "hub", unavailable: "log read failed" })) });
   assert.deepEqual(sanitizeCapture(out.capture), out.capture);
+});
+
+test("H7 every hub and bridge probe command has a run timeout and the worst case stays inside the runner's command timeout", async () => {
+  const RUNNER_COMMAND_TIMEOUT_MS = 600000, good = ["rollback", "hub", "--expect-release", "rel_x-aaaaaaaaaaaa-hub", "--expect-sha", sha];
+  const four = Object.entries(ids).map(([service_name, id]) => ({ service_name, state: "starting", id }));
+  const isIdentity = r => ["midclt call app.config tailterm-hub"].includes(r.argv.at(-1)) || String(r.argv.at(-1)).startsWith("cat ") || r.argv[0] === "go";
+  const isReady = r => r.opts.timeout === 20000 && (r.argv.at(-1) === "midclt call app.get_instance tailterm-hub" || r.argv[1] === "projects");
+  // The fastest machine gives every command its full timeout.
+  const healthy = fakeHost(); await probe(["live", "hub"], config(), healthy);
+  assert.deepEqual(healthy.runs.filter(isIdentity).map(r => r.opts.timeout), [30000, 30000, 30000]);
+  assert.ok(healthy.runs.every(r => Number.isSafeInteger(r.opts.timeout) && r.opts.timeout > 0 && r.opts.timeout <= 30000));
+  // Worst cases: every command hangs until 1 ms before its timeout, at the cap
+  // and at the default, with app.get_instance readable (four containers, so
+  // four log reads are wanted) and with it readable only by the capture.
+  const answer = JSON.stringify({ state: "DEPLOYING", active_workloads: { container_details: four } });
+  for (const windowMs of [300000, 240000]) for (const argv of [["live", "hub"], ["live", "bridge"], good]) for (const instance of [() => ({ status: 0, stdout: answer }), opts => opts.timeout === 20000 ? { status: null, stdout: "" } : { status: 0, stdout: answer }]) {
+    const deps = fakeHost({ hub: 1, slow: true, polls: [{ instance }] }), out = await probe(argv, windowed(windowMs), deps), label = `${argv.join(" ")} window ${windowMs}`;
+    assert.ok(deps.clock() < RUNNER_COMMAND_TIMEOUT_MS - 120000, `${label}: ${deps.clock()} ms`);
+    assert.ok(deps.runs.every(r => Number.isSafeInteger(r.opts.timeout) && r.opts.timeout > 0), label);
+    const identity = deps.runs.filter(isIdentity), ready = deps.runs.filter(isReady), capture = deps.runs.slice(identity.length + ready.length);
+    assert.deepEqual(identity.map(r => r.opts.timeout), [30000, 30000, 30000], label);
+    assert.equal(ready.length, out.polls * 2, label);
+    // The window is overrun by at most one poll.
+    assert.ok(out.waitedMs >= windowMs && out.waitedMs < windowMs + 40000, `${label}: waited ${out.waitedMs}`);
+    // The capture's commands fit its 45 s budget together, 15 s at most each.
+    assert.ok(capture.length >= 3 && capture.every(r => r.opts.timeout <= 15000), label);
+    assert.ok(capture.reduce((a, r) => a + r.opts.timeout, 0) <= 45000, label);
+    assert.equal(out.capture.logs.length, 4, label); assert.equal(out.capture.logs.at(-1).unavailable, "time budget", label);
+    assert.ok(out.capture.logs.every(l => l.lines || l.unavailable === "time budget"), label);
+  }
 });
 
 // The real command with fake ssh, go and tt executables first on PATH: no

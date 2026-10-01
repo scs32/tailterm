@@ -33,6 +33,11 @@ export const TAILOS_SWITCH_WINDOW_MS = 90000, TAILOS_POLL_INTERVAL_MS = 3000, TA
 // A TrueNAS app restart plus the hub's migrations takes longer than one read,
 // so hub and bridge readiness is polled for a bounded window as well.
 export const TRUENAS_READY_WINDOW_MS = 240000, TRUENAS_READY_POLL_MS = 5000, TRUENAS_READY_RUN_TIMEOUT_MS = 20000;
+// Each of the three identity reads (app.config, the binary, its build info).
+// With the 300 s window cap this keeps a whole probe under the runner's 600 s
+// command timeout: 3 x 30 s, the window, one last poll (2 x 20 s) and the
+// 45 s capture are at most 475 s.
+export const TRUENAS_IDENTITY_RUN_TIMEOUT_MS = 30000;
 // The capture after a not-ready end: per-command timeout, total budget, and
 // the bounds on what is kept.
 export const CAPTURE_RUN_TIMEOUT_MS = 15000, CAPTURE_BUDGET_MS = 45000, CAPTURE_LOG_LINES = 40, CAPTURE_LINE_LENGTH = 300, CAPTURE_LOG_CONTAINERS = 4, CAPTURE_CONTAINERS = 8;
@@ -58,8 +63,8 @@ const sshArgv = (host, command) => ["ssh", "-o", "BatchMode=yes", "-o", "Connect
 const ssh = (deps, host, command, opts) => ok(deps, sshArgv(host, command), opts);
 
 // vcs.revision and vcs.modified from the Go build info embedded in a binary.
-export function buildInfo(deps, path) {
-  const out = ok(deps, ["go", "version", "-m", path]);
+export function buildInfo(deps, path, opts) {
+  const out = ok(deps, ["go", "version", "-m", path], opts);
   const field = k => out.match(new RegExp(`^\\s*build\\s+${k.replace(".", "\\.")}=(\\S+)$`, "m"))?.[1];
   const commit = field("vcs.revision");
   if (!hex(commit, 40)) throw new Error("no build revision");
@@ -80,16 +85,16 @@ export function readyWindow(config, target) {
 function readIdentity(target, config, deps) {
   const t = config?.targets?.[target];
   if (!/^[A-Za-z0-9._-]+$/.test(t?.host || "")) throw new Error("host reference required");
-  const [service, mount, binary] = MOUNTS[target];
-  const compose = JSON.parse(ssh(deps, t.host, `midclt call app.config ${APP}`));
+  const [service, mount, binary] = MOUNTS[target], timeout = TRUENAS_IDENTITY_RUN_TIMEOUT_MS;
+  const compose = JSON.parse(ssh(deps, t.host, `midclt call app.config ${APP}`, { timeout }));
   const volumes = compose?.services?.[service]?.volumes || [];
   const path = volumes.map(v => String(v).split(":")).find(p => p[1] === mount)?.[0];
   const release = path?.match(new RegExp(`^${BASE}/releases/([A-Za-z0-9._-]+)/${binary}$`))?.[1];
   if (!release) throw new Error("no retained release mount");
-  const bytes = ssh(deps, t.host, `cat ${path}`, { buffer: true });
+  const bytes = ssh(deps, t.host, `cat ${path}`, { buffer: true, timeout });
   const dir = mkdtempSync(join(tmpdir(), "release-probe-"));
   let info;
-  try { writeFileSync(join(dir, binary), bytes, { mode: 0o600 }); info = buildInfo(deps, join(dir, binary)); }
+  try { writeFileSync(join(dir, binary), bytes, { mode: 0o600 }); info = buildInfo(deps, join(dir, binary), { timeout }); }
   finally { rmSync(dir, { recursive: true, force: true }); }
   const stateMounted = (compose?.services?.hub?.volumes || []).includes(`${BASE}/state:/state`);
   return { host: t.host, service, compose, commit: info.commit, artifactSHA256: sha256(bytes), integrity: info.integrity, release, stateMounted };
@@ -155,12 +160,14 @@ function composeSecrets(compose) {
 // App state and recent container logs after a not-ready end, read through the
 // middleware as the probe's SSH user (docker logs would need sudo). Best
 // effort: it runs after the verdict is fixed and never throws; a read that
-// fails, hangs or runs past the budget is recorded as unavailable.
+// fails, hangs or runs past the budget is recorded as unavailable. Each
+// command's timeout is cut to what is left of the budget, so the whole capture
+// stays inside it.
 function captureTrueNAS(host, compose, instance, deps) {
   try {
-    const start = deps.now();
+    const start = deps.now(), left = () => CAPTURE_BUDGET_MS - (deps.now() - start), timeout = () => Math.min(CAPTURE_RUN_TIMEOUT_MS, left());
     if (!instance) {
-      try { const r = deps.run(sshArgv(host, `midclt call app.get_instance ${APP}`), { timeout: CAPTURE_RUN_TIMEOUT_MS }); if (r.status === 0) instance = JSON.parse(r.stdout); } catch {}
+      try { const r = deps.run(sshArgv(host, `midclt call app.get_instance ${APP}`), { timeout: timeout() }); if (r.status === 0) instance = JSON.parse(r.stdout); } catch {}
     }
     if (!instance || typeof instance !== "object") return { app: "unavailable", logs: [] };
     const details = Array.isArray(instance.active_workloads?.container_details) ? instance.active_workloads.container_details.slice(0, CAPTURE_CONTAINERS) : [];
@@ -169,8 +176,9 @@ function captureTrueNAS(host, compose, instance, deps) {
       try {
         // Only a 64-hex id is ever placed in a command.
         if (typeof c?.id !== "string" || !/^[a-f0-9]{64}$/.test(c.id)) return { service, unavailable: "invalid container id" };
-        if (deps.now() - start >= CAPTURE_BUDGET_MS) return { service, unavailable: "time budget" };
-        const r = deps.run(sshArgv(host, `midclt subscribe -n ${CAPTURE_LOG_LINES} -t 8 'app.container_log_follow:{"app_name":"${APP}","container_id":"${c.id}","tail_lines":${CAPTURE_LOG_LINES}}'`), { timeout: CAPTURE_RUN_TIMEOUT_MS });
+        // Under a second left is not worth a read.
+        if (left() < 1000) return { service, unavailable: "time budget" };
+        const r = deps.run(sshArgv(host, `midclt subscribe -n ${CAPTURE_LOG_LINES} -t 8 'app.container_log_follow:{"app_name":"${APP}","container_id":"${c.id}","tail_lines":${CAPTURE_LOG_LINES}}'`), { timeout: timeout() });
         // The exit status is ignored when lines arrived: a quiet stream ends
         // by timeout after printing what it had.
         const lines = String(r.stdout || "").split("\n").flatMap(l => { try { const d = JSON.parse(l)?.fields?.data; return typeof d === "string" ? [d] : []; } catch { return []; } });

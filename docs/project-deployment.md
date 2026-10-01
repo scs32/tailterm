@@ -472,20 +472,25 @@ the automated TailOS rollback uses the default 90 s window.
 **Hub and bridge readiness window.** A TrueNAS app restart, and the hub's
 migrations on a large database, take longer than one read, so the hub and bridge
 live and rollback probes wait for the app. The mounted release, its hash and
-build info are read once and still fail the probe if unreadable. Then
+build info are read once (30 s timeout per read) and still fail the probe if
+unreadable. Then
 `containersRunning` (`app.get_instance`) and `hubResponds` (`tt projects`) are
 polled 5 s apart, 20 s timeout per command, until both hold or
 `targets.hub.readyWindowMs` / `targets.bridge.readyWindowMs` ends (default
-240000; an integer from 0 to 300000, where 0 means one read). A readiness read
+240000; an integer from 0 to 300000, where 0 means one read). With 0 the live
+check is a true single read: the runner's own startup retry does not apply to a
+probe that reports its wait, so nothing waits for a slow start. A readiness read
 that fails counts as not ready. The probe reports `waitedMs` and `polls`. An
 invalid `readyWindowMs` makes the probe exit 1 and stops the deployer at start,
 before any `tt deployment list` or claim. Both pinned probe commands carry
 `--config`, so the configured window applies to the automated rollback too, and
 a rollback probe run by hand waits the same window.
 
-- Budget: a probe is one runner command with a 600 s timeout. At the 300 s cap
-  the worst case is the window, one last poll (2 x 20 s) and the capture (45 s),
-  about 385 s plus the identity reads; at the default it is about 325 s.
+- Budget: a probe is one runner command with a 600 s timeout, and every command
+  the probe runs has its own timeout. At the 300 s cap the worst case is the
+  identity reads (3 x 30 s), the window, one last poll that starts as the window
+  ends (2 x 20 s) and the capture (45 s): at most 475 s. At the default it is at
+  most 415 s.
 - Live check: a probe that waited and is still not ready fails the live check
   once (`check` returns `readiness`, which `liveCheck` does not retry), so a
   failed hub takes one window before rollback starts, not three. A probe that
@@ -508,8 +513,9 @@ a rollback probe run by hand waits the same window.
   from `midclt subscribe -n 40 -t 8 app.container_log_follow` (read as the
   probe's SSH user; `docker logs` would need sudo), or `{service, unavailable}`
   with one of `log read failed`, `no log lines`, `invalid container id` (only a
-  64-hex id is placed in a command) or `time budget` (the capture has used 45 s).
-  Each log command has a 15 s timeout.
+  64-hex id is placed in a command) or `time budget` (the capture's 45 s are
+  used up). Each capture command has a 15 s timeout, cut to what is left of the
+  45 s, so the whole capture stays inside that budget.
 - Each line has control characters removed, then is redacted and cut to 300
   characters. Redacted, in order: every environment value of 6 or more
   characters from `app.config`; `Bearer` values and `token`, `secret`,
