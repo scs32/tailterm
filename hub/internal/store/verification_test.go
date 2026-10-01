@@ -812,3 +812,97 @@ func TestVerificationRetainsRawFailureAfterBugCloses(t *testing.T) {
 		t.Fatal("closed link allowed completion", err)
 	}
 }
+
+// operatorFixture is a running team queue entry with an admitted lead,
+// builder, verifier and reviewer, the lead's saved ASSIGN and an owner-approved
+// plan for it. The handler leases the entry and takes no part unless a test
+// calls it.
+type operatorFixture struct {
+	*rebindFixture
+	builder, verifier, reviewer api.Agent
+	assign                      api.Message
+	plan                        api.VerificationPlan
+}
+
+func newOperatorFixture(t *testing.T) *operatorFixture {
+	t.Helper()
+	f := &operatorFixture{rebindFixture: newRebindFixture(t, true)}
+	f.builder = f.worker
+	f.verifier, f.reviewer = f.member(t, "verifier"), f.member(t, "reviewer")
+	var err error
+	env := api.Envelope{Kind: "assign", Subject: "Implement frozen fixture criteria", Body: api.EnvelopeBody{Objective: "Fixture", Owns: []string{"fixture"}, Acceptance: map[string]string{"a1": "works", "a2": "retries"}}}
+	if f.assign, err = f.post(env, f.builder.ID, f.lead); err != nil {
+		t.Fatal("assign", err)
+	}
+	checks := []api.VerificationCheck{{ID: "fixture-check", Argv: []string{"node", "fixture.js"}, Cwd: ".", Environment: map[string]string{}}}
+	f.plan = api.VerificationPlan{ItemID: f.item.ID, ItemTaskID: f.task.ID, AssignmentOwnershipDigest: verificationDigest([]string{"fixture"}), Version: 1, OperationKey: "fixture-verification", Repository: autoWorktree, BaseCommit: candidateB, Commit: candidateA, ItemRevision: f.item.Revision, ScopeRevision: f.item.ScopeRevision, OrderMessageSeq: f.order.Seq, AssignmentSeq: f.assign.Seq, BuilderAgentID: f.builder.ID, BuilderRunID: f.builder.RunID, VerifierAgentID: f.verifier.ID, VerifierRunID: f.verifier.RunID, MatrixDigest: strings.Repeat("a", 64), ChecksDigest: verificationDigest(checks), Owned: []string{"fixture"}, Changed: []string{}, Checks: checks}
+	approval, err := f.s.PostMessage(f.ctx, f.task.ID, api.PostMessageRequest{Text: "verification-matrix-approval:" + f.plan.MatrixDigest}, f.by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.plan.ApprovedMatrixDigest, f.plan.MatrixApprovalMessageSeq = f.plan.MatrixDigest, approval.Seq
+	return f
+}
+
+// post sends a typed message from a team member, linked to the item at its
+// current revision.
+func (f *operatorFixture) post(env api.Envelope, to string, from api.Agent) (api.Message, error) {
+	item, err := f.s.GetWorkItem(f.ctx, f.task.ID, f.item.ID)
+	if err != nil {
+		return api.Message{}, err
+	}
+	return f.s.PostMessage(f.ctx, f.task.ID, api.PostMessageRequest{Envelope: &env, To: to, AgentID: from.ID, RunID: from.RunID, RequestID: api.NewID("req"),
+		WorkItems: []api.MessageWorkItem{{ItemTaskID: f.task.ID, ItemID: f.item.ID, ItemRevision: item.Revision, Relationship: "primary"}}}, f.by)
+}
+
+// digest is the context digest the agent's run was admitted with.
+func (f *operatorFixture) digest(t *testing.T, a api.Agent) string {
+	t.Helper()
+	var digest string
+	if err := f.s.db.QueryRow(`SELECT context_digest FROM agent_work_item_bindings WHERE agent_id=? AND run_id=?`, a.ID, a.RunID).Scan(&digest); err != nil {
+		t.Fatal(err)
+	}
+	return digest
+}
+
+// count reads one integer.
+func (f *operatorFixture) count(t *testing.T, query string, args ...any) int {
+	t.Helper()
+	var n int
+	if err := f.s.db.QueryRow(query, args...).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	return n
+}
+
+// Step 1: the shared authority rule names the role of each admitted caller.
+func TestRequireItemOperatorRoles(t *testing.T) {
+	f := newOperatorFixture(t)
+	for _, row := range []struct {
+		name   string
+		agent  api.Agent
+		digest string
+		order  int64
+		role   string
+		entry  bool
+	}{
+		{"handler without binding or digest", f.handler, "", 0, itemOperatorHandler, false},
+		{"lead", f.lead, f.digest(t, f.lead), f.order.Seq, itemOperatorLead, true},
+		{"member", f.verifier, f.digest(t, f.verifier), f.order.Seq, itemOperatorMember, true},
+		{"member with the order comparison skipped", f.builder, f.digest(t, f.builder), 0, itemOperatorMember, true},
+	} {
+		role, entry, err := requireItemOperator(f.ctx, f.s.db, f.task.ID, f.item.ID, row.agent.ID, row.agent.RunID, row.digest, row.order)
+		if err != nil || role != row.role || (entry != nil) != row.entry || (entry != nil && entry.ID != f.entry.ID) {
+			t.Fatalf("%s: role %q entry %v err %v", row.name, role, entry, err)
+		}
+	}
+	if _, _, err := requireItemOperator(f.ctx, f.s.db, f.task.ID, f.item.ID, f.lead.ID, f.lead.RunID, strings.Repeat("0", 64), f.order.Seq); !errors.Is(err, api.ErrConflict) || !strings.Contains(err.Error(), "context digest differs") {
+		t.Fatal("wrong digest", err)
+	}
+	if err := requireItemReader(f.ctx, f.s.db, f.task.ID, f.item.ID, f.reviewer.ID, f.reviewer.RunID); err != nil {
+		t.Fatal("bound reader", err)
+	}
+	if err := requireItemReader(f.ctx, f.s.db, f.task.ID, f.other.ID, f.reviewer.ID, f.reviewer.RunID); !errors.Is(err, api.ErrConflict) {
+		t.Fatal("reader of another item", err)
+	}
+}

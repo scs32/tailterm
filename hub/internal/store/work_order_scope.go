@@ -53,6 +53,110 @@ func requireScopeHandler(q queryRower, ctx context.Context, task, agent, run str
 	return nil
 }
 
+// The roles requireItemOperator returns.
+const (
+	itemOperatorHandler = "handler"
+	itemOperatorLead    = "lead"
+	itemOperatorMember  = "member"
+)
+
+// unavailableAgentStatus reports a status whose run can no longer act.
+func unavailableAgentStatus(status string) bool {
+	return status == api.AgentClosed || status == api.AgentExited || status == api.AgentRetired
+}
+
+// requireItemOperator admits the caller of a validated item operation. The
+// exact available database handler run passes as today, with no entry, order
+// or digest. Any other caller must be a live run admitted to the item's
+// running team queue entry: the entry is at the item's current revision with
+// confirmed scope and runs under order (0 skips only that comparison), the
+// run is the agent's current one, its binding names this item, the entry's
+// order and the entry's revision, and contextDigest is the binding's. Each
+// mismatch has its own reason. The role is lead when item_team_leads names
+// this exact running agent and run, otherwise member; the operation decides
+// what a member may do. The entry is nil for a handler.
+func requireItemOperator(ctx context.Context, q queryRower, task, item, agent, run, contextDigest string, order int64) (string, *api.TeamQueueEntry, error) {
+	if !api.ValidID(agent, "agt") || !validRunID(run) {
+		return "", nil, api.ErrInvalid
+	}
+	var actualRun, role, status string
+	if err := q.QueryRowContext(ctx, `SELECT run_id,role,status FROM agents WHERE task_id=? AND id=?`, task, agent).Scan(&actualRun, &role, &status); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return "", nil, workItemConflict("an available database handler is required")
+		}
+		return "", nil, err
+	}
+	if role == api.AgentRoleDatabaseHandler {
+		if actualRun != run || unavailableAgentStatus(status) {
+			return "", nil, workItemConflict("the exact available database handler run must file scope evidence")
+		}
+		return itemOperatorHandler, nil, nil
+	}
+	e, err := scanTeamQueue(q.QueryRowContext(ctx, `SELECT `+teamQueueCols+` FROM team_queue_entries WHERE task_id=? AND item_id=? AND state='running' ORDER BY attempt DESC LIMIT 1`, task, item))
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", nil, workItemConflict("no running team queue entry for this item; ask the database handler")
+	}
+	if err != nil {
+		return "", nil, err
+	}
+	if err := requireCurrentConfirmedTeamOrder(ctx, q, e); err != nil {
+		return "", nil, err
+	}
+	if order != 0 && order != e.OrderMessageSeq {
+		return "", nil, workItemConflict(fmt.Sprintf("entry %s runs under order #%d, not #%d", e.ID, e.OrderMessageSeq, order))
+	}
+	if actualRun != run || unavailableAgentStatus(status) {
+		return "", nil, workItemConflict("agent run changed; refresh identity")
+	}
+	var boundRevision, boundOrder int64
+	var boundDigest string
+	err = q.QueryRowContext(ctx, `SELECT item_revision,work_order_message_seq,context_digest FROM agent_work_item_bindings WHERE agent_id=? AND run_id=? AND item_task_id=? AND item_id=? AND work_order_task_id=?`, agent, run, task, item, task).Scan(&boundRevision, &boundOrder, &boundDigest)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return "", nil, err
+	}
+	if err != nil || boundRevision != e.ItemRevision || boundOrder != e.OrderMessageSeq {
+		return "", nil, workItemConflict(fmt.Sprintf("this run is not admitted to the item under order #%d at revision %d", e.OrderMessageSeq, e.ItemRevision))
+	}
+	if contextDigest != boundDigest {
+		return "", nil, workItemConflict("context digest differs from this run's admitted context")
+	}
+	var leads int
+	if err := q.QueryRowContext(ctx, `SELECT count(*) FROM item_team_leads WHERE task_id=? AND item_id=? AND agent_id=? AND run_id=? AND state='running'`, task, item, agent, run).Scan(&leads); err != nil {
+		return "", nil, err
+	}
+	if leads == 1 {
+		return itemOperatorLead, &e, nil
+	}
+	return itemOperatorMember, &e, nil
+}
+
+// requireItemReader admits a read of an item's verification records: the
+// exact available database handler run, or a live run bound to the item. A
+// read takes no context digest.
+func requireItemReader(ctx context.Context, q queryRower, task, item, agent, run string) error {
+	if !api.ValidID(agent, "agt") || !validRunID(run) {
+		return api.ErrInvalid
+	}
+	var actualRun, role, status string
+	if err := q.QueryRowContext(ctx, `SELECT run_id,role,status FROM agents WHERE task_id=? AND id=?`, task, agent).Scan(&actualRun, &role, &status); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return workItemConflict("an available database handler is required")
+		}
+		return err
+	}
+	if role == api.AgentRoleDatabaseHandler {
+		return requireScopeHandler(q, ctx, task, agent, run)
+	}
+	var bound int
+	if err := q.QueryRowContext(ctx, `SELECT count(*) FROM agent_work_item_bindings WHERE agent_id=? AND run_id=? AND item_task_id=? AND item_id=?`, agent, run, task, item).Scan(&bound); err != nil {
+		return err
+	}
+	if actualRun != run || unavailableAgentStatus(status) || bound != 1 {
+		return workItemConflict("the exact available database handler run or a live run admitted to this item must read verification records")
+	}
+	return nil
+}
+
 func requireConfirmedTeamOrder(ctx context.Context, q queryRower, task, item string, revision, order int64) error {
 	var scope, currentScope int64
 	err := q.QueryRowContext(ctx, `SELECT scope_revision FROM work_order_scope_confirmations WHERE task_id=? AND item_id=? AND item_revision=? AND order_seq=?`, task, item, revision, order).Scan(&scope)
