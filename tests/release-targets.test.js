@@ -43,11 +43,38 @@ test("an unknown path still refuses release", () => {
     assert.throws(() => targetsForPaths([p]), /Unknown release path/, p);
 });
 
+// -z gives each path exactly as stored: without it git quotes and escapes a
+// path holding non-ASCII bytes, so a mapped path would look unknown.
+const trackedPaths = cwd => execFileSync("git", ["ls-files", "-z"], {cwd, encoding: "utf8"}).split("\0").filter(Boolean);
+const refusedPaths = paths => paths.filter(p => { try { targetsForPaths([p]); return false; } catch { return true; } });
+
 test("every tracked path maps to a target or to none", () => {
-  const paths = execFileSync("git", ["ls-files"], {cwd: root, encoding: "utf8"}).split("\n").filter(Boolean);
+  const paths = trackedPaths(root);
   assert.ok(paths.length > 0, "git ls-files returned no paths");
-  const refused = paths.filter(p => { try { targetsForPaths([p]); return false; } catch { return true; } });
+  const refused = refusedPaths(paths);
   assert.deepEqual(refused, [], `unmapped tracked paths:\n${refused.join("\n")}`);
+});
+
+test("non-ASCII and spaced paths map or refuse by the same rules as ASCII paths", () => {
+  const table = {
+    "client/caf\u00e9.js": ["tailos"],
+    "client/my file.js": ["tailos"],
+    "hub/cmd/tt/\u65e5\u672c main.go": ["mini"],
+    "docs/r\u00e9sum\u00e9 notes.md": [],
+  };
+  const unknown = ["unknown/caf\u00e9.xyz", "unknown/my file.xyz", "hub/internal/new pkg/\u00fc.go"];
+  for (const [p, want] of Object.entries(table)) assert.deepEqual(targetsForPaths([p]), want, p);
+  for (const p of unknown) assert.throws(() => targetsForPaths([p]), /Unknown release path/, p);
+
+  // The same paths, tracked in a real repository and read back the way the tree test reads them.
+  const cwd = mkdtempSync(join(tmpdir(), "release-targets-paths-"));
+  execFileSync("git", ["init", "-q"], {cwd});
+  const all = [...Object.keys(table), ...unknown];
+  for (const p of all) { mkdirSync(join(cwd, p, ".."), {recursive: true}); writeFileSync(join(cwd, p), p); }
+  execFileSync("git", ["add", "."], {cwd});
+  const tracked = trackedPaths(cwd);
+  assert.deepEqual(tracked.toSorted(), all.toSorted());
+  assert.deepEqual(refusedPaths(tracked).toSorted(), unknown.toSorted());
 });
 
 const all = commit => Object.fromEntries(["hub", "bridge", "mini", "tailos"].map(t => [t, commit]));
