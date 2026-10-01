@@ -7,7 +7,17 @@ import {
   shouldReleaseViewPointer,
 } from "../client/view-refresh-presentation.js";
 
-const tick = () => new Promise((resolve) => setTimeout(resolve, 5));
+// Mirrors TEXT_INTERACTION_IDLE_MS in the presentation.
+const TEXT_IDLE_MS = 120;
+
+// The presentation defers repaints with setTimeout. Mocked timers let each test
+// advance that clock itself, so no assertion depends on host scheduling. The
+// returned function runs every timer due within ms, including timers queued by
+// the ones it runs; with no argument it drains the zero-delay chain.
+function fakeTimers(t) {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  return (ms = 0) => t.mock.timers.tick(ms);
+}
 
 function fakeRoot(details = []) {
   const listeners = new Map();
@@ -97,7 +107,8 @@ test("manual disclosure state is retained per view context", () => {
   );
 });
 
-test("a native select queues one repaint until its choice is committed", async () => {
+test("a native select queues one repaint until its choice is committed", (t) => {
+  const advance = fakeTimers(t);
   let renders = 0;
   const root = fakeRoot();
   const presentation = createViewRefreshPresentation({
@@ -117,11 +128,13 @@ test("a native select queues one repaint until its choice is committed", async (
   assert.equal(presentation.beforeRender("project-a"), false);
   assert.equal(presentation.beforeRender("project-a"), false);
   root.dispatch("change", { target: select });
-  await tick();
+  assert.equal(renders, 0);
+  advance();
   assert.equal(renders, 1);
 });
 
-test("a native select commit releases a pointer consumed by the platform picker", async () => {
+test("a native select commit releases a pointer consumed by the platform picker", (t) => {
+  const advance = fakeTimers(t);
   let renders = 0;
   const root = fakeRoot();
   const presentation = createViewRefreshPresentation({
@@ -147,11 +160,13 @@ test("a native select commit releases a pointer consumed by the platform picker"
   });
   assert.equal(presentation.beforeRender("project-a"), false);
   root.dispatch("change", { target: select });
-  await tick();
+  assert.equal(renders, 0);
+  advance();
   assert.equal(renders, 1);
 });
 
-test("a matching pointerup and commit release an ordinary select gesture", async () => {
+test("a matching pointerup and commit release an ordinary select gesture", (t) => {
+  const advance = fakeTimers(t);
   const previousAddEventListener = globalThis.addEventListener;
   const listeners = new Map();
   globalThis.addEventListener = (type, listener) => listeners.set(type, listener);
@@ -182,7 +197,8 @@ test("a matching pointerup and commit release an ordinary select gesture", async
     assert.equal(presentation.beforeRender("project-a"), false);
     listeners.get("pointerup")({ type: "pointerup", pointerId: 7 });
     root.dispatch("change", { target: select });
-    await tick();
+    assert.equal(renders, 0);
+    advance();
     assert.equal(renders, 1);
   } finally {
     if (previousAddEventListener)
@@ -224,7 +240,8 @@ test("focused controls are restored without moving their scroll container", () =
   }
 });
 
-test("a keyboard disclosure press finishes before its queued repaint", async () => {
+test("a keyboard disclosure press finishes before its queued repaint", (t) => {
+  const advance = fakeTimers(t);
   let renders = 0;
   const root = fakeRoot();
   const presentation = createViewRefreshPresentation({
@@ -242,12 +259,17 @@ test("a keyboard disclosure press finishes before its queued repaint", async () 
   presentation.mount(root);
   root.dispatch("keydown", { target: summary, key: " " });
   assert.equal(presentation.beforeRender("project-a"), false);
+  presentation.settle();
+  advance();
+  assert.equal(renders, 0);
   root.dispatch("keyup", { target: summary, key: " " });
-  await tick();
+  assert.equal(renders, 0);
+  advance();
   assert.equal(renders, 1);
 });
 
-test("open-state observation releases a same-value native selection", async () => {
+test("open-state observation releases a same-value native selection", (t) => {
+  const advance = fakeTimers(t);
   const previousCSS = globalThis.CSS;
   const previousFrame = globalThis.requestAnimationFrame;
   const frames = [];
@@ -278,7 +300,8 @@ test("open-state observation releases a same-value native selection", async () =
     frames.shift()();
     open = false;
     frames.shift()();
-    await tick();
+    assert.equal(renders, 0);
+    advance();
     assert.equal(renders, 1);
   } finally {
     globalThis.CSS = previousCSS;
@@ -286,7 +309,8 @@ test("open-state observation releases a same-value native selection", async () =
   }
 });
 
-test("an explicit filter commit discards a queued stale repaint", async () => {
+test("an explicit filter commit discards a queued stale repaint", (t) => {
+  const advance = fakeTimers(t);
   let renders = 0;
   const root = fakeRoot();
   const presentation = createViewRefreshPresentation({
@@ -305,11 +329,13 @@ test("an explicit filter commit discards a queued stale repaint", async () => {
   root.dispatch("keydown", { target: select, key: "ArrowDown" });
   assert.equal(presentation.beforeRender("project-a"), false);
   presentation.commit(select, { flush: false });
-  await tick();
+  presentation.settle();
+  advance(TEXT_IDLE_MS * 10);
   assert.equal(renders, 0);
 });
 
-test("typing holds a repaint until a short idle boundary", async () => {
+test("typing holds a repaint until a short idle boundary", (t) => {
+  const advance = fakeTimers(t);
   let renders = 0;
   const root = fakeRoot();
   const presentation = createViewRefreshPresentation({
@@ -326,11 +352,14 @@ test("typing holds a repaint until a short idle boundary", async () => {
   presentation.mount(root);
   root.dispatch("input", { target: text });
   assert.equal(presentation.beforeRender("project-a"), false);
-  await new Promise((resolve) => setTimeout(resolve, 140));
+  advance(TEXT_IDLE_MS - 1);
+  assert.equal(renders, 0);
+  advance(1);
   assert.equal(renders, 1);
 });
 
-test("composition holds a repaint until the composition finishes", async () => {
+test("composition holds a repaint until the composition finishes", (t) => {
+  const advance = fakeTimers(t);
   let renders = 0;
   const root = fakeRoot();
   const presentation = createViewRefreshPresentation({
@@ -347,14 +376,18 @@ test("composition holds a repaint until the composition finishes", async () => {
   presentation.mount(root);
   root.dispatch("compositionstart", { target: text });
   assert.equal(presentation.beforeRender("project-a"), false);
-  await new Promise((resolve) => setTimeout(resolve, 140));
+  presentation.settle();
+  advance(TEXT_IDLE_MS * 10);
   assert.equal(renders, 0);
   root.dispatch("compositionend", { target: text });
-  await new Promise((resolve) => setTimeout(resolve, 140));
+  advance(TEXT_IDLE_MS - 1);
+  assert.equal(renders, 0);
+  advance(1);
   assert.equal(renders, 1);
 });
 
-test("interrupt clears a queued composition before hide and remount", async () => {
+test("interrupt clears a queued composition before hide and remount", (t) => {
+  const advance = fakeTimers(t);
   let renders = 0;
   const oldRoot = fakeRoot();
   const nextRoot = fakeRoot();
@@ -376,6 +409,6 @@ test("interrupt clears a queued composition before hide and remount", async () =
   presentation.mount(nextRoot);
   assert.equal(presentation.beforeRender("project-a"), true);
   presentation.settle();
-  await new Promise((resolve) => setTimeout(resolve, 140));
+  advance(TEXT_IDLE_MS * 10);
   assert.equal(renders, 0);
 });
