@@ -1965,3 +1965,279 @@ test("V6 receipts record position, grants and overtakes after an urgent run goes
   assert.equal(matrixRunner.checkSet([unit]), "unit");
   assert.equal(matrixRunner.checkSet([go, unit]), "unit");
 });
+
+// A docs-only item under hub/cmd/tt changes no Go file, so its accepted plan
+// runs go-race on ./...; by integration other items' changes sit between the
+// accepted base and the integrated commit.
+const integratedKnownFailure = {
+  checkId: "npm-unit",
+  bugTaskId: "tsk_0123456789abcdef",
+  bugId: "wi_0123456789abcdef",
+};
+function integratedFixture(t, itemPath = "hub/cmd/tt/testdata/README.md") {
+  const f = fixture(t);
+  writeFileSync(
+    join(f.cwd, "verification/matrix.json"),
+    JSON.stringify({
+      maxAttempts: 3,
+      knownFailures: [integratedKnownFailure],
+      version: 1,
+      browserSuites: [],
+      excludedBrowserSuites: [],
+      rules: [
+        { prefixes: ["hub/"], groups: ["go"] },
+        { prefixes: ["docs/"], groups: ["unit"] },
+      ],
+    }),
+  );
+  for (const p of ["cmd/tt/testdata", "internal/store", "internal/api"])
+    mkdirSync(join(f.cwd, "hub", p), { recursive: true });
+  writeFileSync(join(f.cwd, "hub/go.mod"), "module fixture\n\ngo 1.24.0\n");
+  writeFileSync(join(f.cwd, "hub/cmd/tt/main.go"), "package main\n\nfunc main() {}\n");
+  writeFileSync(join(f.cwd, "hub/cmd/tt/testdata/README.md"), "old\n");
+  writeFileSync(join(f.cwd, "hub/internal/store/store.go"), "package store\n");
+  writeFileSync(join(f.cwd, "hub/internal/api/api.go"), "package api\n");
+  f.git("add", ".");
+  f.git("commit", "-qm", "base packages");
+  const base = f.git("rev-parse", "HEAD");
+  writeFileSync(join(f.cwd, itemPath), "// the item's change\n" + readFileSync(join(f.cwd, itemPath), "utf8"));
+  f.git("commit", "-qam", "the item");
+  const context = {
+    operationKey: "fixture",
+    repository: "fixture",
+    baseCommit: base,
+    commit: f.git("rev-parse", "HEAD"),
+    owned: [itemPath],
+    verifierAgentId: "fixture",
+    verifierRunId: "fixture",
+  };
+  const accepted = makePlan(context, f.cwd);
+  // What the release runner builds: the accepted plan with the integrated
+  // commit, here after other items changed the given paths.
+  const integrate = (paths = ["hub/internal/store/store.go"], plan = accepted) => {
+    for (const p of paths) writeFileSync(join(f.cwd, p), "package store\n\nvar Other = 1\n");
+    f.git("add", ".");
+    f.git("commit", "-qm", "other items");
+    return { ...plan, commit: f.git("rev-parse", "HEAD") };
+  };
+  return { ...f, base, context, accepted, integrate };
+}
+const raceArgv = (plan) => plan.checks.find((c) => c.id === "go-race").argv;
+// An accepted plan whose checks were changed and whose digest still binds them.
+const withChecks = (plan, change) => {
+  const checks = structuredClone(plan.checks);
+  return { ...plan, checks: change(checks) ?? checks, checksDigest: undefined };
+};
+
+test("integrated plan of a docs-only item under hub/cmd/tt keeps the accepted go-race on every package", (t) => {
+  const f = integratedFixture(t);
+  assert.deepEqual(raceArgv(f.accepted), ["go", "test", "-race", "./..."]);
+  const context = f.integrate();
+  // Selected from the integrated diff alone, go-race names only the package
+  // another item changed: narrower than the accepted check.
+  const { checks, checksDigest, ...withoutAccepted } = context;
+  assert.deepEqual(raceArgv(makePlan(withoutAccepted, f.cwd)), [
+    "go", "test", "-race", "./internal/store",
+  ]);
+  const integrated = makePlan(context, f.cwd);
+  assert.deepEqual(raceArgv(integrated), ["go", "test", "-race", "./..."]);
+  assert.deepEqual(integrated.checks, f.accepted.checks);
+  assert.equal(integrated.checksDigest, f.accepted.checksDigest);
+  assert.deepEqual(integrated.changed, [
+    "hub/cmd/tt/testdata/README.md",
+    "hub/internal/store/store.go",
+  ]);
+  // The hub binds a receipt to the plan fields it knows: no new plan field.
+  assert.deepEqual(Object.keys(integrated).sort(), Object.keys(f.accepted).sort());
+  const { preserved } = matrixRunner.planWithPreservation(context, f.cwd);
+  assert.deepEqual(preserved, {
+    version: 1,
+    acceptedChecksDigest: f.accepted.checksDigest,
+    kept: ["go-race", "go-test", "go-vet"],
+    widened: [],
+    added: [],
+    narrowerSelection: ["go-race"],
+    checksDigest: integrated.checksDigest,
+  });
+});
+
+test("integrated plan keeps every accepted check, adds newly selected ones and unions go-race packages", (t) => {
+  const f = integratedFixture(t, "hub/internal/api/api.go");
+  assert.deepEqual(raceArgv(f.accepted), ["go", "test", "-race", "./internal/api"]);
+  assert.equal(f.accepted.knownFailures, undefined);
+  // The accepted go-race also named a package the integrated diff does not.
+  const accepted = withChecks(f.accepted, (checks) => {
+    checks.find((c) => c.id === "go-race").argv.push("./cmd/tt");
+  });
+  const context = f.integrate(["hub/internal/store/store.go", "docs/other.md"], accepted);
+  const { plan, preserved } = matrixRunner.planWithPreservation(context, f.cwd);
+  assert.deepEqual(raceArgv(plan), [
+    "go", "test", "-race", "./cmd/tt", "./internal/api", "./internal/store",
+  ]);
+  for (const check of accepted.checks) {
+    const kept = plan.checks.find((c) => c.id === check.id);
+    if (check.id === "go-race")
+      assert.deepEqual({ ...kept, argv: [] }, { ...check, argv: [] });
+    else assert.deepEqual(kept, check);
+    for (const argument of check.argv) assert(kept.argv.includes(argument), argument);
+  }
+  assert.deepEqual(plan.checks.map((c) => c.id), ["go-race", "go-test", "go-vet", "npm-unit"]);
+  // Digest and matrix policy describe the final list, npm-unit included.
+  assert.equal(plan.checksDigest, digest(plan.checks));
+  assert.equal(plan.maxAttempts, 3);
+  assert.deepEqual(plan.knownFailures, [integratedKnownFailure]);
+  assert.deepEqual(preserved, {
+    version: 1,
+    acceptedChecksDigest: digest(accepted.checks),
+    kept: ["go-test", "go-vet"],
+    widened: ["go-race"],
+    added: ["npm-unit"],
+    narrowerSelection: ["go-race"],
+    checksDigest: plan.checksDigest,
+  });
+  // An accepted package list under a selection of every package: ./... wins.
+  const race = plan.checks.find((c) => c.id === "go-race");
+  const every = matrixRunner.keepAcceptedChecks(
+    [{ ...race, argv: ["go", "test", "-race", "./..."] }],
+    [{ ...race, argv: ["go", "test", "-race", "./internal/api"] }],
+  );
+  assert.deepEqual(every.checks[0].argv, ["go", "test", "-race", "./..."]);
+  assert.deepEqual(every.preserved.widened, ["go-race"]);
+  assert.deepEqual(every.preserved.narrowerSelection, []);
+});
+
+test("an accepted check that differs any other way, or is not selected, refuses the plan by name", async (t) => {
+  const f = integratedFixture(t);
+  const context = f.integrate(["hub/internal/store/store.go", "docs/other.md"]);
+  const refused = (change, pattern) =>
+    assert.throws(() => makePlan(withChecks(context, change), f.cwd), pattern);
+  refused((checks) => {
+    checks.find((c) => c.id === "go-vet").argv = ["true"];
+  }, /^Error: Accepted check differs from the selected one: go-vet$/);
+  refused((checks) => {
+    checks.find((c) => c.id === "go-race").argv.splice(3, 0, "-timeout=25m");
+  }, /^Error: Accepted check differs from the selected one: go-race$/);
+  refused((checks) => {
+    checks.find((c) => c.id === "go-race").environment.VERIFICATION_TIMEOUT_MS = "1";
+  }, /^Error: Accepted check differs from the selected one: go-race$/);
+  refused((checks) => {
+    checks.find((c) => c.id === "go-race").argv.push("-run=None");
+  }, /^Error: Accepted check differs from the selected one: go-race$/);
+  refused((checks) => {
+    checks.push({ id: "wasm-test-build", argv: ["true"], cwd: ".", environment: {} });
+  }, /^Error: Accepted check is not selected for this commit: wasm-test-build$/);
+  refused((checks) => [...checks, checks[0]], /^Error: Invalid accepted checks$/);
+  assert.throws(
+    () => makePlan({ ...context, checks: context.checks.slice(1) }, f.cwd),
+    /^Error: Accepted checks do not match their checksDigest$/,
+  );
+  // The run guard reads the plan's own checks as accepted ones, so the same
+  // rule refuses an edited plan, and the comparison one that drops a check or
+  // a package this commit selects. A go-race cut back to exactly this commit's
+  // selection is the plan the hub refuses.
+  const plan = makePlan(context, f.cwd);
+  const edited = (change) => {
+    const checks = structuredClone(plan.checks);
+    change(checks);
+    return { ...plan, checks, checksDigest: digest(checks) };
+  };
+  const out = tempDir(t, "verification-logs-");
+  for (const change of [
+    (checks) => (checks.find((c) => c.id === "npm-unit").argv = ["true"]),
+    (checks) => checks.push({ id: "extra", argv: ["true"], cwd: ".", environment: {} }),
+    (checks) => (checks.find((c) => c.id === "go-race").argv[3] = "./cmd/tt"),
+    (checks) => checks.pop(),
+  ])
+    await assert.rejects(
+      () => runPlan(edited(change), f.cwd, out),
+      /^Error: Altered or omitted required checks/,
+    );
+  assert.equal(existsSync(join(out, "receipt.json")), false);
+});
+
+test("run re-derives an integrated plan that kept go-race on every package and executes it", async (t) => {
+  const f = integratedFixture(t);
+  const plan = makePlan(f.integrate(), f.cwd);
+  assert.deepEqual(raceArgv(plan), ["go", "test", "-race", "./..."]);
+  const receipt = await runPlan(plan, f.cwd, tempDir(t, "verification-logs-"), { jobs: 1 });
+  assert.equal(receipt.planDigest, digest(plan));
+  assert.equal(receipt.checksDigest, f.accepted.checksDigest);
+  assert.deepEqual(
+    receipt.checks.map((c) => [c.id, c.exitCode]),
+    [["go-race", 0], ["go-test", 0], ["go-vet", 0]],
+  );
+  assert.deepEqual(receipt.checks[0].argv, ["go", "test", "-race", "./..."]);
+});
+
+test("a context without checks plans as before, and only plan mode writes the kept-checks record", (t) => {
+  const f = integratedFixture(t);
+  const matrixRaw = readFileSync(join(f.cwd, "verification/matrix.json"), "utf8");
+  const context = {
+    approvedMatrixDigest: digest(matrixRaw),
+    matrixApprovalMessageSeq: 1,
+    ...f.context,
+  };
+  const checks = selectChecks(
+    JSON.parse(matrixRaw),
+    context.owned,
+    ["hub/cmd/tt/testdata/README.md"],
+    new Set(["./cmd/tt", "./internal/api", "./internal/store"]),
+  );
+  for (const check of checks) check.environment.VERIFICATION_BASE_COMMIT = f.base;
+  const before = {
+    ...context,
+    version: 1,
+    maxAttempts: 3,
+    matrixDigest: digest(matrixRaw),
+    checksDigest: digest(checks),
+    changed: ["hub/cmd/tt/testdata/README.md"],
+    checks,
+  };
+  assert.equal(JSON.stringify(rawMakePlan(context, f.cwd)), JSON.stringify(before));
+  assert.equal(matrixRunner.planWithPreservation(context, f.cwd).preserved, null);
+  const directory = tempDir(t, "verification-plan-");
+  const contextFile = join(directory, "context.json"),
+    planFile = join(directory, "plan.json"),
+    recordFile = join(directory, "plan.preserved.json");
+  assert.equal(matrixRunner.preservationPath(planFile), recordFile);
+  const planMode = (input) => {
+    writeFileSync(contextFile, JSON.stringify(input));
+    const result = spawnSync(
+      process.execPath,
+      [new URL("../scripts/verify-matrix.mjs", import.meta.url).pathname, "plan", contextFile, planFile],
+      { cwd: f.cwd, encoding: "utf8" },
+    );
+    assert.equal(result.status, 0, result.stderr);
+    return result.stderr;
+  };
+  assert.equal(planMode(context), "");
+  assert.equal(readFileSync(planFile, "utf8"), JSON.stringify(before, null, 2) + "\n");
+  assert.equal(existsSync(recordFile), false);
+  const integrated = f.integrate(undefined, before);
+  assert.equal(
+    planMode(integrated),
+    `Kept 3 accepted checks (accepted checksDigest ${before.checksDigest}); this commit alone selected less for: go-race\n`,
+  );
+  const written = JSON.parse(readFileSync(planFile, "utf8"));
+  assert.deepEqual(Object.keys(written).sort(), Object.keys(before).sort());
+  assert.deepEqual(raceArgv(written), ["go", "test", "-race", "./..."]);
+  assert.deepEqual(JSON.parse(readFileSync(recordFile, "utf8")), {
+    version: 1,
+    acceptedChecksDigest: before.checksDigest,
+    kept: ["go-race", "go-test", "go-vet"],
+    widened: [],
+    added: [],
+    narrowerSelection: ["go-race"],
+    checksDigest: written.checksDigest,
+  });
+  // A later plan without accepted checks leaves no stale record behind.
+  const { checks: accepted, checksDigest, ...plain } = integrated;
+  assert.equal(planMode(plain), "");
+  assert.equal(existsSync(recordFile), false);
+  // Targeted plans select from the fix's paths alone and ignore carried checks.
+  const targeted = { baseCommit: f.base, commit: integrated.commit };
+  assert.deepEqual(
+    makeTargetedPlan({ ...targeted, checks: [{ id: "x" }] }, f.cwd),
+    makeTargetedPlan(targeted, f.cwd),
+  );
+});

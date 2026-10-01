@@ -272,7 +272,97 @@ const candidateGoPackages = (cwd, commit) =>
       .filter((p) => p.endsWith(".go"))
       .map((p) => "./" + p.slice(4, p.lastIndexOf("/"))),
   );
-export function makePlan(context, cwd) {
+// go-race argv splits at its first package; every later element is a package
+// too, the same shape the hub's coverage rule reads.
+function goRacePackages(argv) {
+  const first = argv.findIndex((a) => a.startsWith("./"));
+  if (first < 1 || argv.slice(first).some((a) => !a.startsWith("./")))
+    return null;
+  return { flags: argv.slice(0, first), packages: argv.slice(first) };
+}
+// A plan built from a context that carries an accepted plan's checks never
+// runs less than that plan. The release runner builds the integrated plan from
+// the accepted plan and the integrated commit, whose diff from the accepted
+// base holds other items' changes: a docs-only item's go-race ran ./..., and
+// selected from the integrated diff alone it would name only those items'
+// packages, which the hub refuses. Only go-race depends on the diff, so it is
+// the one check that may differ: its packages are the union of both lists,
+// and ./... wins. Any other difference, or an accepted check this selection
+// lacks, has no approved explanation and fails here rather than at the import.
+// Returns the checks and a record of what was kept.
+export function keepAcceptedChecks(selected, accepted, acceptedDigest) {
+  const refuse = (message) =>
+    Object.assign(new Error(message), { acceptedChecks: true });
+  const wellFormed = (c) =>
+    c &&
+    typeof c.id === "string" &&
+    typeof c.cwd === "string" &&
+    Array.isArray(c.argv) &&
+    c.argv.every((a) => typeof a === "string") &&
+    c.environment &&
+    typeof c.environment === "object" &&
+    Object.values(c.environment).every((v) => typeof v === "string");
+  if (
+    !Array.isArray(accepted) ||
+    !accepted.every(wellFormed) ||
+    new Set(accepted.map((c) => c.id)).size !== accepted.length
+  )
+    throw refuse("Invalid accepted checks");
+  if (acceptedDigest !== undefined && acceptedDigest !== digest(accepted))
+    throw refuse("Accepted checks do not match their checksDigest");
+  const byId = new Map(accepted.map((c) => [c.id, c]));
+  for (const check of accepted)
+    if (!selected.some((c) => c.id === check.id))
+      throw refuse("Accepted check is not selected for this commit: " + check.id);
+  const kept = [],
+    widened = [],
+    added = [],
+    narrowerSelection = [];
+  const checks = selected.map((check) => {
+    const prior = byId.get(check.id);
+    if (!prior) {
+      added.push(check.id);
+      return check;
+    }
+    if (canonical(prior) === canonical(check)) {
+      kept.push(check.id);
+      return check;
+    }
+    const want = check.id === "go-race" && goRacePackages(prior.argv),
+      have = want && goRacePackages(check.argv);
+    if (
+      !want ||
+      !have ||
+      canonical(want.flags) !== canonical(have.flags) ||
+      canonical({ ...prior, argv: [] }) !== canonical({ ...check, argv: [] })
+    )
+      throw refuse("Accepted check differs from the selected one: " + check.id);
+    const all = [want, have].some((p) => p.packages.includes("./..."));
+    const packages = all
+      ? ["./..."]
+      : [...new Set([...want.packages, ...have.packages])].sort();
+    const merged = { ...check, argv: [...have.flags, ...packages] };
+    if (canonical(merged) === canonical(prior)) kept.push(check.id);
+    else widened.push(check.id);
+    if (canonical(merged) !== canonical(check)) narrowerSelection.push(check.id);
+    return merged;
+  });
+  return {
+    checks,
+    preserved: {
+      version: 1,
+      acceptedChecksDigest: digest(accepted),
+      kept,
+      widened,
+      added,
+      narrowerSelection,
+    },
+  };
+}
+// The plan, and for a context that carries accepted checks the record of what
+// was kept. The record stays outside the plan: the hub binds a receipt to the
+// digest of the plan fields it knows, so a plan carries no others.
+export function planWithPreservation(context, cwd) {
   if (
     !/^[a-f0-9]{40}$/.test(context.commit) ||
     !/^[a-f0-9]{40}$/.test(context.baseCommit)
@@ -291,7 +381,7 @@ export function makePlan(context, cwd) {
   assertInventory(matrix, cwd);
   assertFastForward(cwd, context.baseCommit, context.commit);
   const changed = diffPaths(cwd, context.baseCommit, context.commit);
-  const checks = selectChecks(
+  let checks = selectChecks(
     matrix,
     context.owned,
     changed,
@@ -300,8 +390,15 @@ export function makePlan(context, cwd) {
   for (const check of checks)
     if (check.argv[0] === "go")
       check.environment.VERIFICATION_BASE_COMMIT = context.baseCommit;
+  let preserved = null;
+  if (context.checks !== undefined)
+    ({ checks, preserved } = keepAcceptedChecks(
+      checks,
+      context.checks,
+      context.checksDigest,
+    ));
   const { maxAttempts, knownFailures, ...inputContext } = context;
-  return {
+  const plan = {
     ...inputContext,
     version: 1,
     ...matrixPolicy(matrix, checks),
@@ -310,6 +407,15 @@ export function makePlan(context, cwd) {
     changed,
     checks,
   };
+  if (preserved) preserved.checksDigest = plan.checksDigest;
+  return { plan, preserved };
+}
+export function makePlan(context, cwd) {
+  return planWithPreservation(context, cwd).plan;
+}
+// Where plan mode writes the record of kept accepted checks for a plan file.
+export function preservationPath(planPath) {
+  return planPath.replace(/\.json$/, "") + ".preserved.json";
 }
 export function checkClean(cwd, commit) {
   if (git(cwd, "rev-parse", "HEAD") !== commit)
@@ -952,7 +1058,16 @@ function validRunOptions({ keepHome = false, jobs = defaultJobs() }) {
 export async function runPlan(plan, cwd, output, options = {}) {
   validRunOptions(options);
   checkClean(cwd, plan.commit);
-  const expected = makePlan(plan, cwd);
+  // The plan's own checks are read as accepted checks, so a plan that kept an
+  // accepted go-race re-derives to itself. A check edited any other way is
+  // refused by that rule, and one dropped or narrowed by the comparison below.
+  let expected;
+  try {
+    expected = makePlan(plan, cwd);
+  } catch (error) {
+    if (!error.acceptedChecks) throw error;
+    throw new Error("Altered or omitted required checks: " + error.message);
+  }
   if (
     expected.matrixDigest !== plan.matrixDigest ||
     expected.checksDigest !== plan.checksDigest ||
@@ -1291,12 +1406,24 @@ if (
   try {
     const [mode, file, output, ...flags] = process.argv.slice(2),
       input = JSON.parse(readFileSync(file, "utf8"));
-    if (mode === "plan")
-      writeFileSync(
-        output,
-        JSON.stringify(makePlan(input, process.cwd()), null, 2) + "\n",
-      );
-    else if (mode === "run" || mode === "targeted") {
+    if (mode === "plan") {
+      const { plan, preserved } = planWithPreservation(input, process.cwd());
+      writeFileSync(output, JSON.stringify(plan, null, 2) + "\n");
+      rmSync(preservationPath(output), { force: true });
+      if (preserved) {
+        writeFileSync(
+          preservationPath(output),
+          JSON.stringify(preserved, null, 2) + "\n",
+        );
+        console.error(
+          `Kept ${preserved.kept.length + preserved.widened.length} accepted checks (accepted checksDigest ${preserved.acceptedChecksDigest})` +
+            (preserved.narrowerSelection.length
+              ? "; this commit alone selected less for: " +
+                preserved.narrowerSelection.join(", ")
+              : ""),
+        );
+      }
+    } else if (mode === "run" || mode === "targeted") {
       let keepHome = false;
       let minFreeBytes = DEFAULT_MIN_FREE_BYTES;
       let jobs = defaultJobs();

@@ -163,6 +163,65 @@ Enrolled unknown review history cannot bypass the receipt requirement. Existing
 saved historical completion remains readable. This changes completion after new admission;
 it does not certify historical records or deploy a hub/CLI.
 
+## Integrated plans keep accepted checks
+
+An integrated plan never runs less than the accepted plan. A superset is
+allowed; a narrower check never is. The hub contract stays strict: its release
+import still refuses an integrated plan that omits or narrows an approved check.
+The rule is applied where the plan is built, in `verify-matrix.mjs plan`.
+
+The release runner builds the integrated plan from the accepted plan with the
+integrated commit in place of the candidate, so the context carries the accepted
+plan's `checks` and `checksDigest`. go-race is the one check selected from the
+diff: it names the Go packages changed since the base, or `./...` when no Go
+file changed. An item that changes only a non-Go file under `hub/` is accepted
+on `./...`, and by integration the diff from its base also holds other items'
+Go changes, so selection from that diff alone names only their packages. The
+hub refused that plan (`integrated matrix omitted approved check go-race`).
+
+When the context carries `checks`, the plan step selects as usual and then:
+
+- keeps every accepted check that the selection reproduces exactly;
+- merges go-race by package: the union of the accepted and the selected
+  packages, and `./...` if either names it. Every other argument, the working
+  directory and the environment must be identical;
+- adds selected checks the accepted plan lacks;
+- fails closed, naming the check, when an accepted check differs in any other
+  way (`Accepted check differs from the selected one: ID`) or is not selected
+  for this commit (`Accepted check is not selected for this commit: ID`), and
+  when the carried checks do not match their `checksDigest`. With an unchanged
+  matrix digest and owned list neither difference has an approved cause.
+
+`checksDigest` and the matrix policy fields describe the final check list. The
+plan gains no field: the hub binds a receipt to the digest of the plan fields
+it knows. Plan mode instead writes a record beside the plan output,
+`plan.preserved.json` for `plan.json`, and prints one line on stderr:
+
+```json
+{
+  "version": 1,
+  "acceptedChecksDigest": "<checksDigest of the carried checks>",
+  "kept": ["go-race", "go-test", "go-vet"],
+  "widened": [],
+  "added": [],
+  "narrowerSelection": ["go-race"],
+  "checksDigest": "<checksDigest of the plan>"
+}
+```
+
+`kept` checks equal the accepted ones, `widened` are a go-race with more
+packages than accepted, `added` are new, and `narrowerSelection` names the
+checks this commit alone would have run on less. A context without `checks`
+plans exactly as before and writes no record; a stale record is removed.
+Targeted plans ignore carried checks.
+
+`run` re-derives its plan the same way and reads the plan's own checks as the
+accepted ones, so an integrated plan that kept `./...` runs. A plan edited to
+change, add or drop a check, or to drop a package this commit selects, is still
+refused with `Altered or omitted required checks`. The run step cannot tell an
+accepted `./...` from a go-race cut back to exactly this commit's selection;
+the hub's import refuses that plan.
+
 ## Parallel scheduling and targeted runs
 
 Feature `wi_82ed4c6924930bad`, order #13844. The runner executes independent
