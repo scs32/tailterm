@@ -819,18 +819,17 @@ itself (no planner or plan reviewer) and runs the approved matrix itself: the
 hub only requires the verifier to be admitted to the exact item and distinct
 from the builder and every review-round reviewer. Review keeps the Planned
 rules: an exact frozen candidate, at most two rounds, one disposition, and
-acceptance only with the handler-saved passing receipt for the exact final SHA
+acceptance only with the hub-saved passing receipt for the exact final SHA
 rebased on tasks-hub. The lead prompt is in [team-launch.md](team-launch.md).
 
 **Records: s1 is bounded.** The lane saves its records through operations that
 already exist: queue freeze, attempt, started and running with the exact
 agent, run and context digest (the Start evidence), the typed ASSIGN with frozen
 criteria and scope, typed REVIEW and RESULT rounds and the typed disposition.
-The lead sends the handler no Start, plan or assignment gate REQUESTs. Three
-handler writes remain, because the hub requires the database handler for them:
-the verification plan freeze, the receipt import, and the done save with queue
-acceptance. Automating those is `wi_26c0698de7d3eef2`; until it lands, the lane
-removes the gate turns but not those three.
+The lead sends the handler no Start, plan or assignment gate REQUESTs. The
+verification plan freeze, the receipt import and the done save with queue
+acceptance are validated hub operations the lead calls itself; see
+[Validated team operations](#validated-team-operations).
 
 **Host capacity.** A small entry without a frozen launch is still charged as a
 five-seat bug team (`team_host_capacity.go`). That is conservative; once the
@@ -846,6 +845,141 @@ order goes through the usual scope confirmation first. An item whose small
 entry failed and was released keeps its entry as history: retry it as Planned
 with `tt team queue requeue --entry ENTRY --template planned [--owns PATH...]`
 (see [Team queue amendments and retries](#team-queue-amendments-and-retries)).
+
+## Validated team operations
+
+A queued team (Planned delivery or small change) freezes its verification
+plan, imports its receipt and saves done with queue acceptance by calling the
+hub directly (`wi_26c0698de7d3eef2`). The hub validates each call against the
+item's confirmed scope, its saved assignment and its running queue entry, and
+refuses any mismatch with a named reason. A valid call needs no database
+handler turn. The handler keeps intake, scope confirmation, item and order
+records, a feature's completion report and every case the hub refuses.
+
+| Operation | Command | Who may call it |
+| --- | --- | --- |
+| Plan freeze | `tt verification plan --item ID --file plan.json --request-id KEY --generation N` | the item lead, or the database handler |
+| Receipt import | `tt verification receipt --item ID --file receipt.json --request-id KEY --generation N` | the current plan's exact verifier run, the item lead, or the database handler |
+| Done save with queue acceptance | `tt work-items update --revision N --request-id KEY --status done --worktree DIR --branch B --commit SHA WI_ID` | the item lead, or the entry's leased database handler |
+
+`plan.json` comes from `node scripts/verify-matrix.mjs plan context.json
+plan.json` and `receipt.json` from the matrix run, as in
+[objective-verification.md](objective-verification.md). `--generation` is the
+number of verification records the item already has: 0 for its first plan, and
+the plan's generation for its receipt. A feature's done save also carries its
+completion report pin (`--report-id`, `--report-version`, `--report-digest`,
+`--report-scope-revision`); the handler writes that report.
+
+**Authority.** One rule admits the caller of the plan freeze and the receipt
+import. The exact available database handler run passes as before, with no
+queue entry, binding or digest, so a manually launched team (`tt team launch`,
+no queue entry) keeps the handler path. Any other caller is checked in this
+order, and each failure is a 409 with its own reason:
+
+| Check | Refusal |
+| --- | --- |
+| the item has a running team queue entry | `no running team queue entry for this item; ask the database handler` |
+| the entry is at the item's current revision with confirmed scope | `entry ENTRY is bound to revision N; the item is at revision M. Rebind it: tt team queue rebind ...` |
+| the call names the entry's order | `entry ENTRY runs under order #N, not #M` |
+| the run is the agent's current live run | `agent run changed; refresh identity` |
+| the run's binding names this item, the entry's order and the entry's revision | `this run is not admitted to the item under order #N at revision R` |
+| the request's context digest is the binding's | `context digest differs from this run's admitted context` |
+| a plan freeze comes from the lead | `only the item lead or the database handler may freeze a verification plan` |
+| a receipt import comes from the plan's verifier or the lead | `only the plan's verifier, the item lead or the database handler may import a receipt` |
+
+`tt verification` reads the calling run's context digest the way `tt context
+--json` shows it (`binding.contextDigest`) and sends it; a run with no item
+binding, such as a handler, sends none. A rebind moves the entry and every
+live team binding to the amended revision together and changes no run or
+digest, so the same lead and verifier pass again after it. `tt verification
+history` and `enrollment` admit the handler or any live run bound to the item,
+with no digest.
+
+**What is unchanged.** `verification_records` stays append-only: one insert
+per record, the generation check and one record per request ID. An exact retry
+is looked up before any authority check, so it returns the stored record even
+after its author's run was rotated, retired or closed; the same request ID
+with a different agent, run, digest or payload is refused (`retry payload
+changed`). Every plan and receipt check is the one the handler path already
+ran. A record written by a lead or verifier has `authorRole` (`lead` or
+`verifier`); a handler's has none. `handlerAgentId` and `handlerRunId` hold
+the author. There is no schema change.
+
+**Receipt notices.** Every receipt import, including a handler's, tells each
+dependent actor once with a directed NOTICE from the hub (`verification`):
+
+- the item lead;
+- each distinct reviewer of the item's current scope;
+- the handler: the running entry's leased handler, or with no running entry
+  every available database handler in the project.
+
+The importing agent is left out. The subject is `Verification receipt
+imported: passing` or `Verification receipt imported: blocked`; the refs name
+the `item`, `commit`, `generation` and `state`, and a blocked notice lists the
+failed checks. A notice is linked to the item, creates no obligation and ends
+`No reply is needed.` The record lists what was sent as `notices`: each
+entry's `role`, `agentId` and `messageSeq`, or for a closed, exited or retired
+recipient `skipped` with that status and no message. `tt verification history`
+prints them.
+
+**Failure rule.** The notices are inserted in the importing transaction,
+before the single record insert. If any notice cannot be saved the import is
+refused (`receipt notice to ROLE AGENT failed: ...; nothing was saved, retry
+with the same request id`) and the transaction rolls back, so no notice exists
+without its record and no record without its notices. A replay of a saved
+import posts nothing.
+
+**Done save.** A done save that carries an acceptance from an agent that is
+not a database handler is validated before any write, while the item is still
+at the revision the caller expects: the named entry waits on acceptance, it is
+at the item's current revision with confirmed scope (otherwise the rebind
+refusal above), the agent is the item's running lead on its current run (`only
+the item lead or the leased database handler may accept this entry`), and
+that run is admitted under the entry's order and revision. The acceptance is
+then recorded in the same transaction as the item save, with every check the
+handler's save gets (review disposition, the passing receipt for the exact
+candidate, the verified repository and base), and any refusal rolls the whole
+save back. The entry stays at its revision and the acceptance names the
+item's new one. A lead's done save without `--worktree`, `--branch` and
+`--commit` is refused while its entry waits. `tt team queue accept` stays
+handler-only as the recovery path, and a handler's save is unchanged.
+
+**Order of release.** A new `tt` against an older hub gets the older hub's
+handler-only refusal, so release the hub before the Mini's `tt` and the team
+templates.
+
+### Measuring handler token share
+
+The item's fourth criterion is a reading taken after release, by the owner
+helper, on the held follow-up item `wi_13988ac5fe352ceb`. It is not part of
+the build's acceptance.
+
+- **Release point T.** The time the deployment record shows this feature's hub
+  build live and the Mini's `tt` and templates updated. Both are needed: an
+  old `tt` or prompt still routes through the handler.
+- **Eligible item.** A bug or feature in this project delivered by a queued
+  Planned or small team: its queue entry reached `finished` with the item
+  `done`. Owner-integrated, failed, released-failed and manually launched
+  items are excluded.
+- **Before cohort.** The 10 eligible items whose entries finished most
+  recently before T.
+- **After cohort.** The first 10 eligible items whose entries were claimed
+  after T, in claim order, so the whole team ran on the new prompts. This
+  feature itself is excluded.
+- **Per item.** Run `tt usage --item WI_ID --json`. Token units of a row are
+  `input + cached + cacheWrite + output + reasoning`. The share is the
+  `database_handler` role row's units divided by the item total row's units.
+  Record each row's coverage state; an item whose handler or total row is not
+  `measured` is listed and flagged, and the cohort share is reported with and
+  without flagged items.
+- **Cohort result.** The pooled share (handler units over total units across
+  the cohort), the median per-item share and the handler requests per item,
+  before and after side by side, with each cohort's Planned and small mix.
+  The 26.0% in the system review is context, not the baseline.
+- **Record.** The owner helper writes the table to
+  `tailterm-artifacts/wi_26c0698de7d3eef2/a4-handler-token-share.md` and asks
+  the database handler to save it on the follow-up item. No threshold is set:
+  the result is the two numbers and the owner judges them.
 
 ## Team queue amendments and retries
 
