@@ -939,9 +939,11 @@ test("a4 the attempt record counts each place the run has had, so a returned pla
  assert.equal(first,`${base}-p1-of1-${holder.id}`);assert.equal(await poll(h.adapter),first,"an unchanged poll is the same notice");
  // A more urgent run joins, then leaves: the place returns to the earlier one.
  const urgent={id:"00000000-0000-4000-8000-000000000009",seq:99,pid:process.pid,kind:"run",item:"wi_urgent",agent:"verifier",priority:"urgent",prioritySource:"flag",requestedAt:new Date().toISOString(),grantSeqAtRequest:0,overtakenBy:0,runTimeoutMs:60000};
- assert(updateHostState(h.path,state=>{state.waiters.unshift(urgent);}).done);
+ // One attempt at the file mutex can lose to the waiting run's own poll, so the edit is retried.
+ const edit=change=>until(()=>updateHostState(h.path,change).done,"the lock file edit");
+ await edit(state=>{state.waiters.unshift(urgent);});
  assert.equal(await poll(h.adapter),`${base}-p2-of2-${holder.id}-n2`);
- assert(updateHostState(h.path,state=>{state.waiters=state.waiters.filter(w=>w.id!==urgent.id);}).done);
+ await edit(state=>{state.waiters=state.waiters.filter(w=>w.id!==urgent.id);});
  const back=await poll(h.adapter);assert.equal(back,`${base}-p1-of1-${holder.id}-n3`);assert.notEqual(back,first);
  // A restarted runner resends the same place under the same id.
  const restarted=new HostAdapter(h.adapter.config,{id:"rel_fixture",agentId:"agt_fixture",runId:"run_fixture",generation:1});restarted.command=h.adapter.command;restarted.hostState=h.adapter.hostState;
