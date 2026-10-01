@@ -2030,7 +2030,7 @@ func TestTeamQueueRebindThenAcceptAndFinish(t *testing.T) {
 	done := "done"
 	if _, _, err := f.s.CreateWorkItemUpdate(f.ctx, f.task.ID, f.item.ID, api.CreateWorkItemUpdate{ExpectedRevision: updated.Revision, Status: &done, AgentID: f.handler.ID, RunID: f.handler.RunID, RequestID: "done-save",
 		CompletionReport: &api.NarrativeReportPin{ReportID: report.ReportID, Version: report.Version, Digest: report.Digest, ScopeRevision: report.ScopeRevision},
-		QueueAcceptance: &api.WorkItemQueueAcceptance{EntryID: f.entry.ID, Worktree: autoWorktree, Branch: autoBranch, Commit: candidateB}}, f.by); err != nil {
+		QueueAcceptance:  &api.WorkItemQueueAcceptance{EntryID: f.entry.ID, Worktree: autoWorktree, Branch: autoBranch, Commit: candidateB}}, f.by); err != nil {
 		t.Fatalf("done save with acceptance: %v", err)
 	}
 	item, err := f.s.GetWorkItem(f.ctx, f.task.ID, f.item.ID)
@@ -2077,4 +2077,198 @@ func TestTeamQueueRebindThenAcceptAndFinish(t *testing.T) {
 	if err := f.s.db.QueryRow(`SELECT count(*) FROM team_queue_entries WHERE task_id=?`, f.task.ID).Scan(&entries); err != nil || entries != 1 {
 		t.Fatalf("entries %d %v: the rebound entry finished without a replacement", entries, err)
 	}
+}
+
+// failAndRelease fails the fixture's entry, closes and cleans its team and
+// releases it, as the owner or runner would.
+func (f *rebindFixture) failAndRelease(t *testing.T) {
+	t.Helper()
+	f.entry = f.action(t, api.TeamQueueRequest{Operation: "fail", EntryID: f.entry.ID, ExpectedRevision: f.entry.Revision, Failure: "fixture failure"})
+	if _, err := f.s.db.Exec(`UPDATE agents SET status='closed',cleanup_done=1 WHERE task_id=? AND role=''`, f.task.ID); err != nil {
+		t.Fatal(err)
+	}
+	f.entry = f.action(t, api.TeamQueueRequest{Operation: "release", EntryID: f.entry.ID, ExpectedRevision: f.entry.Revision})
+}
+
+// requeue is the owner's retry request for the fixture's failed entry.
+func (f *rebindFixture) requeue() api.TeamQueueRequest {
+	return api.TeamQueueRequest{RequestID: api.NewID("req"), Operation: "requeue", EntryID: f.entry.ID, ExpectedRevision: f.entry.Revision}
+}
+
+// a7: an item whose entry failed is retried as a new attempt under the same
+// item, at its current revision, with the failed entry kept as history. The
+// new attempt claims, freezes over the released lead row and runs.
+func TestTeamQueueRequeueFailedEntryAsNewAttempt(t *testing.T) {
+	f := newRebindFixture(t, true)
+	f.failAndRelease(t)
+	// The owner corrects the scope after the failure; the retry picks it up.
+	updated, _ := f.amend(t, "after-failure")
+	f.confirm(t, updated)
+	failed, err := f.s.GetTeamQueueEntry(f.ctx, f.task.ID, f.entry.ID)
+	if err != nil || failed.State != "failed" || failed.ReleasedAt == "" || failed.Attempt != 1 {
+		t.Fatalf("failed entry %+v %v", failed, err)
+	}
+	req := f.requeue()
+	retry, err := f.s.TeamQueueAction(f.ctx, f.task.ID, req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if retry.ID == failed.ID || !validTeamQueueID(retry.ID) || retry.ItemID != f.item.ID || retry.Attempt != 2 || retry.RetryOf != failed.ID || retry.State != "queued" || retry.Revision != 1 ||
+		retry.ItemRevision != updated.Revision || retry.OrderMessageSeq != failed.OrderMessageSeq || retry.Template != failed.Template || retry.Host != failed.Host || retry.Cwd != failed.Cwd || retry.Repository != failed.Repository ||
+		retry.BaseCommit != failed.BaseCommit || !reflect.DeepEqual(retry.Ownership, failed.Ownership) || retry.Position <= failed.Position || len(retry.LaunchJSON) != 0 || retry.HandlerID != "" || retry.Failure != "" {
+		t.Fatalf("retry %+v\nof    %+v", retry, failed)
+	}
+	if replay, err := f.s.TeamQueueAction(f.ctx, f.task.ID, req); err != nil || replay.ID != retry.ID {
+		t.Fatalf("requeue replay %+v %v", replay, err)
+	}
+	if same, err := f.s.GetTeamQueueEntry(f.ctx, f.task.ID, failed.ID); err != nil || !reflect.DeepEqual(same, failed) {
+		t.Fatalf("requeue changed the failed entry\nbefore %+v\nafter  %+v %v", failed, same, err)
+	}
+
+	q := f.action(t, api.TeamQueueRequest{Operation: "claim", EntryID: retry.ID, ExpectedRevision: retry.Revision, Host: "mini"})
+	lead := f.member(t, "lead-two")
+	plan, _ := json.Marshal(map[string]any{"task": f.task.ID, "item": f.item.ID, "revision": updated.Revision, "order": f.order.Seq, "context": map[string]any{"version": 1}, "members": []any{map[string]any{"state": "unstarted", "runId": lead.RunID, "fields": map[string]any{"agentId": lead.ID, "name": lead.Name, "cwd": "/worktrees/rebind"}}}})
+	for _, step := range []api.TeamQueueRequest{{Operation: "freeze", LaunchJSON: plan}, {Operation: "attempt"}, {Operation: "started", MemberRunID: lead.RunID}, {Operation: "running"}} {
+		step.EntryID, step.ExpectedRevision = q.ID, q.Revision
+		q = f.action(t, step)
+	}
+	if q.State != "running" || q.Attempt != 2 || q.ID != retry.ID {
+		t.Fatalf("running retry %+v", q)
+	}
+	var leadAgent, leadRun, leadState string
+	var leadRows, leadRevision int
+	if err := f.s.db.QueryRow(`SELECT count(*),agent_id,run_id,state,revision FROM item_team_leads WHERE task_id=? AND item_id=?`, f.task.ID, f.item.ID).Scan(&leadRows, &leadAgent, &leadRun, &leadState, &leadRevision); err != nil {
+		t.Fatal(err)
+	}
+	if leadRows != 1 || leadAgent != lead.ID || leadRun != lead.RunID || leadState != "running" || leadRevision != 3 {
+		t.Fatalf("lead row count=%d %s/%s %s revision=%d", leadRows, leadAgent, leadRun, leadState, leadRevision)
+	}
+
+	byItem, err := f.s.TeamQueuePage(f.ctx, f.task.ID, api.TeamQueueListOptions{Item: f.item.ID})
+	if err != nil || len(byItem.Entries) != 2 || byItem.History != nil {
+		t.Fatalf("item listing %+v %v", byItem, err)
+	}
+	newest, oldest := byItem.Entries[0], byItem.Entries[1]
+	if newest.ID != retry.ID || newest.Attempt != 2 || newest.Summary || len(newest.LaunchJSON) == 0 || oldest.ID != failed.ID || oldest.Attempt != 1 || oldest.Summary || string(oldest.LaunchJSON) != string(failed.LaunchJSON) || oldest.Failure != failed.Failure {
+		t.Fatalf("item listing order\nnewest %+v\noldest %+v", newest, oldest)
+	}
+	// Both attempts appear in the project's queue: one active, one history.
+	list, err := f.s.TeamQueuePage(f.ctx, f.task.ID, api.TeamQueueListOptions{})
+	if err != nil || len(list.Entries) != 2 || list.Entries[0].ID != retry.ID || list.Entries[1].ID != failed.ID || !list.Entries[1].Summary || list.Entries[1].Attempt != 1 {
+		t.Fatalf("queue listing %+v %v", list, err)
+	}
+	var items int
+	if err := f.s.db.QueryRow(`SELECT count(DISTINCT item_id) FROM team_queue_entries WHERE task_id=?`, f.task.ID).Scan(&items); err != nil || items != 1 {
+		t.Fatalf("items with entries %d %v: the retry kept the item identity", items, err)
+	}
+}
+
+// a8: a requeue is refused, naming the entry and the supported path, unless
+// it retries the item's released failed latest attempt with nothing live.
+func TestTeamQueueRequeueRefusals(t *testing.T) {
+	refused := func(t *testing.T, f *rebindFixture, req api.TeamQueueRequest, id string, want ...string) {
+		t.Helper()
+		var before int
+		if err := f.s.db.QueryRow(`SELECT count(*) FROM team_queue_entries WHERE task_id=?`, f.task.ID).Scan(&before); err != nil {
+			t.Fatal(err)
+		}
+		if req.RequestID == "" {
+			req.RequestID = api.NewID("req")
+		}
+		_, err := f.s.TeamQueueAction(f.ctx, f.task.ID, req)
+		if !errors.Is(err, api.ErrConflict) || !strings.Contains(err.Error(), id) {
+			t.Fatalf("refusal = %v, want a conflict naming %s", err, id)
+		}
+		for _, text := range want {
+			if !strings.Contains(err.Error(), text) {
+				t.Fatalf("refusal %q lacks %q", err, text)
+			}
+		}
+		var after int
+		if err := f.s.db.QueryRow(`SELECT count(*) FROM team_queue_entries WHERE task_id=?`, f.task.ID).Scan(&after); err != nil || after != before {
+			t.Fatalf("refused requeue changed entries %d -> %d %v", before, after, err)
+		}
+	}
+	t.Run("live entry", func(t *testing.T) {
+		f := newRebindFixture(t, false)
+		refused(t, f, f.requeue(), f.entry.ID, "is queued", "only a released failed entry")
+	})
+	t.Run("unreleased failed entry", func(t *testing.T) {
+		f := newRebindFixture(t, false)
+		f.entry = f.action(t, api.TeamQueueRequest{Operation: "fail", EntryID: f.entry.ID, ExpectedRevision: f.entry.Revision, Failure: "fixture failure"})
+		refused(t, f, f.requeue(), f.entry.ID, "not released", "tt team queue release --task "+f.task.ID+" --entry "+f.entry.ID)
+		// A plain add is pointed at the same path.
+		refused(t, f, api.TeamQueueRequest{Operation: "add", ItemID: f.item.ID, OrderMessageSeq: f.order.Seq, Host: "mini", Cwd: "/tmp"}, f.entry.ID, "tt team queue requeue")
+	})
+	t.Run("live item-bound run", func(t *testing.T) {
+		f := newRebindFixture(t, true)
+		f.failAndRelease(t)
+		if _, err := f.s.db.Exec(`UPDATE agents SET status='running',cleanup_done=0 WHERE id=?`, f.worker.ID); err != nil {
+			t.Fatal(err)
+		}
+		refused(t, f, f.requeue(), f.entry.ID, "1 item-bound runs are still live or uncleaned")
+	})
+	t.Run("terminal item", func(t *testing.T) {
+		f := newRebindFixture(t, false)
+		f.failAndRelease(t)
+		status := "dismissed"
+		if _, err := f.s.UpdateWorkItem(f.ctx, f.task.ID, f.item.ID, api.UpdateWorkItemRequest{Revision: f.item.Revision, Status: &status}, f.by); err != nil {
+			t.Fatal(err)
+		}
+		refused(t, f, f.requeue(), f.entry.ID, "its item is dismissed")
+	})
+	t.Run("amended item without confirmed scope", func(t *testing.T) {
+		f := newRebindFixture(t, false)
+		f.failAndRelease(t)
+		f.amend(t, "x")
+		refused(t, f, f.requeue(), f.entry.ID, "scope is not confirmed", "tt team queue requeue")
+	})
+	t.Run("lead as caller", func(t *testing.T) {
+		f := newRebindFixture(t, true)
+		f.failAndRelease(t)
+		req := f.requeue()
+		req.LeadAgentID, req.LeadRunID = f.lead.ID, f.lead.RunID
+		refused(t, f, req, f.entry.ID, "only by the owner or a database handler")
+	})
+	t.Run("second requeue and plain add while attempt two is live", func(t *testing.T) {
+		f := newRebindFixture(t, false)
+		f.failAndRelease(t)
+		// A plain add for an item with a failed entry names the retry.
+		refused(t, f, api.TeamQueueRequest{Operation: "add", ItemID: f.item.ID, OrderMessageSeq: f.order.Seq, Host: "mini", Cwd: "/tmp"}, f.entry.ID, "(failed)", "tt team queue requeue --task "+f.task.ID+" --entry "+f.entry.ID)
+		req := f.requeue()
+		req.HandlerAgentID, req.HandlerRunID = f.handler.ID, f.handler.RunID
+		retry := f.action(t, req)
+		if retry.Attempt != 2 || retry.RetryOf != f.entry.ID {
+			t.Fatalf("handler requeue %+v", retry)
+		}
+		refused(t, f, f.requeue(), f.entry.ID, "not the item's latest attempt", retry.ID)
+		refused(t, f, api.TeamQueueRequest{Operation: "add", ItemID: f.item.ID, OrderMessageSeq: f.order.Seq, Host: "mini", Cwd: "/tmp"}, retry.ID, "already in team queue")
+	})
+	t.Run("small attempt", func(t *testing.T) {
+		f := newRebindFixture(t, false)
+		bug, order := smallBug(t, f.s, f.task)
+		f.item, f.order = bug, order
+		f.entry = f.action(t, api.TeamQueueRequest{Operation: "add", ItemID: bug.ID, OrderMessageSeq: order.Seq, Template: "small", Host: "mini", Cwd: "/tmp", Ownership: []string{"src/fix.go", "src/fix_test.go"}})
+		f.failAndRelease(t)
+		over := f.requeue()
+		over.Ownership = []string{"src/a.go", "src/b.go", "src/c.go", "src/d.go"}
+		refused(t, f, over, f.entry.ID, "owns at most 3 paths", "--template planned")
+		// Requeue as Planned: the fix outgrew the lane.
+		planned := f.requeue()
+		planned.Template, planned.Ownership = "planned", over.Ownership
+		retry := f.action(t, planned)
+		if retry.Template != "planned" || retry.State != "queued" || retry.Attempt != 2 || retry.RetryOf != f.entry.ID || len(retry.Ownership) != 4 || retry.ItemID != bug.ID {
+			t.Fatalf("planned retry of a small entry %+v", retry)
+		}
+		if failed, err := f.s.GetTeamQueueEntry(f.ctx, f.task.ID, f.entry.ID); err != nil || failed.Template != "small" || len(failed.Ownership) != 2 {
+			t.Fatalf("failed small entry %+v %v", failed, err)
+		}
+	})
+	t.Run("small attempt of a feature", func(t *testing.T) {
+		f := newRebindFixture(t, false)
+		f.failAndRelease(t)
+		req := f.requeue()
+		req.Template, req.Ownership = "small", []string{"src/fix.go"}
+		refused(t, f, req, f.entry.ID, "admits only bugs", "--template planned")
+	})
 }

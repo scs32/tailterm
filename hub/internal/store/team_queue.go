@@ -827,7 +827,8 @@ func queueEntryIsHistory(e api.TeamQueueEntry) bool {
 
 // TeamQueuePage is the team queue listing: active entries in full, in
 // position order, then one newest-first page of history summaries. View
-// active leaves history out; Item returns only that item's entry in full.
+// active leaves history out; Item returns only that item's entries, one per
+// attempt, newest first and in full.
 func (s *Store) TeamQueuePage(ctx context.Context, task string, opts api.TeamQueueListOptions) (api.TeamQueueList, error) {
 	if !api.ValidID(task, "tsk") || (opts.View != "" && opts.View != api.TeamQueueViewActive) || (opts.Item != "" && !api.ValidID(opts.Item, "wi")) || opts.Limit < 0 || opts.Limit > api.MaxLimit || opts.After < 0 {
 		return api.TeamQueueList{}, api.ErrInvalid
@@ -837,14 +838,26 @@ func (s *Store) TeamQueuePage(ctx context.Context, task string, opts api.TeamQue
 	if out.ConcurrencyLimit, err = queueConcurrencyLimit(ctx, s.db, task); err != nil {
 		return out, err
 	}
+	var attempts []api.TeamQueueEntry
 	if opts.Item != "" {
-		rows, err := s.teamQueueRows(ctx, `SELECT `+teamQueueCols+` FROM team_queue_entries WHERE task_id=? AND item_id=?`, task, opts.Item)
-		if err != nil || len(rows) == 0 {
+		// Every attempt of the item, newest first, each in full.
+		attempts, err = s.teamQueueRows(ctx, `SELECT `+teamQueueCols+` FROM team_queue_entries WHERE task_id=? AND item_id=? ORDER BY position DESC`, task, opts.Item)
+		if err != nil || len(attempts) == 0 {
 			return out, err
 		}
-		if queueEntryIsHistory(rows[0]) {
-			out.Entries = rows[:1]
-			return out, s.enrichTeamQueueEntry(ctx, &out.Entries[0])
+		live := false
+		for i := range attempts {
+			if !queueEntryIsHistory(attempts[i]) {
+				live = true
+				continue
+			}
+			if err := s.enrichTeamQueueEntry(ctx, &attempts[i]); err != nil {
+				return out, err
+			}
+		}
+		if !live {
+			out.Entries = attempts
+			return out, nil
 		}
 	}
 	if out.Entries, err = s.teamQueueRows(ctx, `SELECT `+teamQueueCols+` FROM team_queue_entries WHERE task_id=? AND NOT `+queueHistorySQL+` ORDER BY position`, task); err != nil {
@@ -854,14 +867,18 @@ func (s *Store) TeamQueuePage(ctx context.Context, task string, opts api.TeamQue
 		return out, err
 	}
 	if opts.Item != "" {
-		// The whole active queue explains the entry's blockers; return only it.
-		kept := []api.TeamQueueEntry{}
+		// The whole active queue explains the live attempt's blockers; return
+		// only the item's attempts.
+		explained := map[string]api.TeamQueueEntry{}
 		for _, e := range out.Entries {
-			if e.ItemID == opts.Item {
-				kept = append(kept, e)
+			explained[e.ID] = e
+		}
+		for i := range attempts {
+			if e, ok := explained[attempts[i].ID]; ok {
+				attempts[i] = e
 			}
 		}
-		out.Entries = kept
+		out.Entries = attempts
 		return out, nil
 	}
 	if opts.View == api.TeamQueueViewActive {
@@ -1271,10 +1288,8 @@ func (s *Store) TeamQueueAction(ctx context.Context, task string, req api.TeamQu
 		if activeReservations != 0 {
 			return zero, fmt.Errorf("%w: another team launch is reserved", api.ErrConflict)
 		}
-		var queued int
-		_ = tx.QueryRowContext(ctx, `SELECT count(*) FROM team_queue_entries WHERE task_id=? AND item_id=?`, task, req.ItemID).Scan(&queued)
-		if queued > 0 {
-			return zero, fmt.Errorf("%w: item is already in team queue", api.ErrConflict)
+		if err := queueItemHasNoEntry(ctx, tx, task, req.ItemID); err != nil {
+			return zero, err
 		}
 		var blocked int
 		_ = tx.QueryRowContext(ctx, `SELECT count(*) FROM team_queue_entries WHERE task_id=? AND state='failed' AND released_at=''`, task).Scan(&blocked)
@@ -1351,6 +1366,11 @@ func (s *Store) TeamQueueAction(ctx context.Context, task string, req api.TeamQu
 		if template == "small" && item.Kind != "bug" {
 			return zero, fmt.Errorf("%w: the small-change lane admits only bugs; queue a %s as Planned delivery", api.ErrConflict, item.Kind)
 		}
+		// A first entry only: a later attempt is a requeue of the failed one.
+		// The indexes are the backstop, not the message.
+		if err := queueItemHasNoEntry(ctx, tx, task, req.ItemID); err != nil {
+			return zero, err
+		}
 		var liveTeam int
 		if err := tx.QueryRowContext(ctx, `SELECT count(*) FROM agent_work_item_bindings b JOIN agents a ON a.id=b.agent_id AND a.run_id=b.run_id WHERE b.item_task_id=? AND b.item_id=? AND a.status NOT IN ('closed','exited')`, task, req.ItemID).Scan(&liveTeam); err != nil {
 			return zero, err
@@ -1372,7 +1392,7 @@ func (s *Store) TeamQueueAction(ctx context.Context, task string, req api.TeamQu
 		if err != nil {
 			return zero, fmt.Errorf("%w: duplicate item or queue entry: %v", api.ErrConflict, err)
 		}
-	case "remove", "reorder", "claim", "freeze", "attempt", "started", "running", "replace_lead", "close", "close_refresh", "accept", "finish", "fail", "release", "scope", "owner_integrated", "rebind":
+	case "remove", "reorder", "claim", "freeze", "attempt", "started", "running", "replace_lead", "close", "close_refresh", "accept", "finish", "fail", "release", "scope", "owner_integrated", "rebind", "requeue":
 		if !validTeamQueueID(req.EntryID) {
 			return zero, api.ErrInvalid
 		}
@@ -1387,6 +1407,11 @@ func (s *Store) TeamQueueAction(ctx context.Context, task string, req api.TeamQu
 			return zero, fmt.Errorf("%w: entry revision changed", api.ErrConflict)
 		}
 		switch req.Operation {
+		case "requeue":
+			// The failed entry stays as history; e becomes the new attempt.
+			if e, err = requeueTeamQueueEntry(ctx, tx, task, e, req, now); err != nil {
+				return zero, err
+			}
 		case "rebind":
 			if err := s.rebindTeamQueueEntry(ctx, tx, t, &e, req, now); err != nil {
 				return zero, err
@@ -1763,7 +1788,14 @@ func (s *Store) TeamQueueAction(ctx context.Context, task string, req api.TeamQu
 				seenAgents[member.Fields.AgentID] = true
 				seenRuns[member.RunID] = true
 			}
-			if _, err := tx.ExecContext(ctx, `INSERT INTO item_team_leads(task_id,item_id,agent_id,run_id,state) VALUES(?,?,?,?,'launching')`, task, e.ItemID, plan.Members[0].Fields.AgentID, plan.Members[0].RunID); err != nil {
+			// An item has one lead row. A later attempt takes over the row its
+			// released predecessor closed; a live lead is never replaced here.
+			reserved, err := tx.ExecContext(ctx, `INSERT INTO item_team_leads(task_id,item_id,agent_id,run_id,state) VALUES(?,?,?,?,'launching')
+ ON CONFLICT(task_id,item_id) DO UPDATE SET agent_id=excluded.agent_id,run_id=excluded.run_id,state='launching',revision=revision+1 WHERE state='closed'`, task, e.ItemID, plan.Members[0].Fields.AgentID, plan.Members[0].RunID)
+			if err != nil {
+				return zero, fmt.Errorf("%w: item lead is already reserved", api.ErrConflict)
+			}
+			if n, _ := reserved.RowsAffected(); n != 1 {
 				return zero, fmt.Errorf("%w: item lead is already reserved", api.ErrConflict)
 			}
 			e.LaunchJSON = req.LaunchJSON
@@ -2005,7 +2037,7 @@ func (s *Store) TeamQueueAction(ctx context.Context, task string, req api.TeamQu
 			}
 			e.EscalationSeq = message.Seq
 		}
-		if req.Operation != "remove" && req.Operation != "reorder" {
+		if req.Operation != "remove" && req.Operation != "reorder" && req.Operation != "requeue" {
 			e.Revision++
 			acceptanceJSON := ""
 			if e.Acceptance != nil {
@@ -2081,6 +2113,162 @@ func staleQueueEntry(e api.TeamQueueEntry, current int64) error {
 		return fmt.Errorf("%w: entry %s is launching at revision %d; the item is at revision %d. A launching entry cannot be rebound: let the launch fail, then %s", api.ErrConflict, e.ID, e.ItemRevision, current, queueRequeueCommand(e.TaskID, e.ID))
 	}
 	return fmt.Errorf("%w: entry %s is bound to revision %d; the item is at revision %d. Rebind it: %s", api.ErrConflict, e.ID, e.ItemRevision, current, queueRebindCommand(e.TaskID, e.ID))
+}
+
+// queueItemHasNoEntry refuses a first entry (add or a manual launch) for an
+// item that already has one, naming it and, when it can be retried, the
+// requeue that makes the next attempt.
+func queueItemHasNoEntry(ctx context.Context, tx *sql.Tx, task, item string) error {
+	var id, state, released, integrated string
+	err := tx.QueryRowContext(ctx, `SELECT id,state,released_at,owner_integration_json FROM team_queue_entries WHERE task_id=? AND item_id=? ORDER BY attempt DESC LIMIT 1`, task, item).Scan(&id, &state, &released, &integrated)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	switch {
+	case state == "failed" && released != "" && integrated == "":
+		return fmt.Errorf("%w: item already has entry %s (failed); retry it with %s", api.ErrConflict, id, queueRequeueCommand(task, id))
+	case state == "failed" && released == "":
+		return fmt.Errorf("%w: item already has entry %s (failed, not released); release it, then retry it with %s", api.ErrConflict, id, queueRequeueCommand(task, id))
+	}
+	return fmt.Errorf("%w: item is already in team queue as entry %s (%s)", api.ErrConflict, id, state)
+}
+
+// requeueTeamQueueEntry queues a new attempt of an item whose latest entry
+// failed and was released. The retry is a new row with a new entry ID: the
+// failed row, its cached runner requests, launch lock and journal stay as
+// history and are not modified. The attempt copies the failed entry's
+// template, host, checkout, repository, ownership and base unless the request
+// overrides them, binds to the item's current revision and passes the same
+// template checks as add. The owner or any live database handler may ask.
+func requeueTeamQueueEntry(ctx context.Context, tx *sql.Tx, task string, failed api.TeamQueueEntry, req api.TeamQueueRequest, now string) (api.TeamQueueEntry, error) {
+	var zero api.TeamQueueEntry
+	refuse := func(format string, args ...any) (api.TeamQueueEntry, error) {
+		return zero, fmt.Errorf("%w: entry %s %s", api.ErrConflict, failed.ID, fmt.Sprintf(format, args...))
+	}
+	if req.LeadAgentID != "" || req.LeadRunID != "" {
+		return refuse("can be requeued only by the owner or a database handler")
+	}
+	if req.HandlerAgentID != "" || req.HandlerRunID != "" {
+		var role, run, status string
+		err := tx.QueryRowContext(ctx, `SELECT role,run_id,status FROM agents WHERE task_id=? AND id=?`, task, req.HandlerAgentID).Scan(&role, &run, &status)
+		if err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return zero, err
+		}
+		if err != nil || role != api.AgentRoleDatabaseHandler || run != req.HandlerRunID || status == api.AgentClosed || status == api.AgentExited || status == api.AgentRetired {
+			return refuse("can be requeued only by the owner or a database handler")
+		}
+	}
+	switch {
+	case failed.State != "failed":
+		return refuse("is %s; only a released failed entry is requeued", failed.State)
+	case failed.OwnerIntegration != nil:
+		return refuse("was integrated by the owner at %s; it is not retried", failed.OwnerIntegration.Commit)
+	case failed.ReleasedAt == "":
+		return refuse("is failed and not released; release it first: tt team queue release --task %s --entry %s", task, failed.ID)
+	}
+	var latest, latestState string
+	var attempt int64
+	if err := tx.QueryRowContext(ctx, `SELECT id,state,attempt FROM team_queue_entries WHERE task_id=? AND item_id=? ORDER BY attempt DESC LIMIT 1`, task, failed.ItemID).Scan(&latest, &latestState, &attempt); err != nil {
+		return zero, err
+	}
+	if latest != failed.ID {
+		return refuse("is not the item's latest attempt; attempt %d is entry %s (%s)", attempt, latest, latestState)
+	}
+	live, err := liveItemRuns(ctx, tx, task, failed.ItemID)
+	if err != nil {
+		return zero, err
+	}
+	if live > 0 {
+		return refuse("cannot be requeued: %d item-bound runs are still live or uncleaned; close them first", live)
+	}
+	item, err := getWorkItem(tx, ctx, task, failed.ItemID)
+	if err != nil {
+		return zero, err
+	}
+	if item.Status == "done" || item.Status == "dismissed" {
+		return refuse("cannot be requeued: its item is %s", item.Status)
+	}
+	order := req.OrderMessageSeq
+	if order == 0 {
+		order = failed.OrderMessageSeq
+	}
+	if order < 1 {
+		return zero, fmt.Errorf("%w: entry %s: the retry needs a recorded work order", api.ErrInvalid, failed.ID)
+	}
+	template := req.Template
+	if template == "" {
+		template = failed.Template
+	}
+	if template != "planned" && template != "small" {
+		return zero, fmt.Errorf("%w: entry %s: unknown queue template %q; use planned or small", api.ErrInvalid, failed.ID, template)
+	}
+	ownership, serial := failed.Ownership, failed.Serial
+	if len(req.Ownership) > 0 {
+		if ownership, err = canonicalQueueOwnership(req.Ownership); err != nil {
+			return zero, err
+		}
+		serial = false
+	}
+	limit, err := queueConcurrencyLimit(ctx, tx, task)
+	if err != nil {
+		return zero, err
+	}
+	serial = serial || (!queueParallel(limit) && len(ownership) == 0)
+	if len(ownership) == 0 && !serial {
+		return refuse("declares no ownership; a parallel retry needs it: add --owns PATH")
+	}
+	if template == "small" {
+		if err := smallChangeOwnership(ownership, serial); err != nil {
+			return zero, fmt.Errorf("%w (entry %s; requeue it with --template planned)", err, failed.ID)
+		}
+		if item.Kind != "bug" {
+			return refuse("cannot retry in the small-change lane: it admits only bugs; requeue the %s with --template planned", item.Kind)
+		}
+	}
+	cwd := failed.Cwd
+	if req.Cwd != "" {
+		if !filepath.IsAbs(req.Cwd) || filepath.Clean(req.Cwd) != req.Cwd || strings.Contains(req.Cwd, "\x00") || len(req.Cwd) > 4096 {
+			return zero, fmt.Errorf("%w: entry %s: the retry's checkout must be a clean absolute path", api.ErrInvalid, failed.ID)
+		}
+		cwd = req.Cwd
+	}
+	base := failed.BaseCommit
+	if req.BaseCommit != "" {
+		if failed.Repository == "" || !validGitCommit(req.BaseCommit) {
+			return zero, fmt.Errorf("%w: entry %s: a new base needs the entry's repository and a full commit", api.ErrInvalid, failed.ID)
+		}
+		base = req.BaseCommit
+	}
+	if queueParallel(limit) && (failed.Repository == "" || base == "") {
+		return refuse("has no frozen repository and base; a parallel retry needs them: queue the retry from its checkout with --cwd DIR")
+	}
+	if err := recordedTeamOrder(ctx, tx, task, failed.ItemID, item.Revision, order); err != nil {
+		return zero, fmt.Errorf("%w (entry %s, order #%d)", err, failed.ID, order)
+	}
+	if err := requireConfirmedTeamOrder(ctx, tx, task, failed.ItemID, item.Revision, order); err != nil {
+		if !errors.Is(err, api.ErrConflict) {
+			return zero, err
+		}
+		return refuse("cannot be requeued: scope is not confirmed for item revision %d and order #%d; confirm it, then %s", item.Revision, order, queueRequeueCommand(task, failed.ID))
+	}
+	var maxPos int64
+	if err := tx.QueryRowContext(ctx, `SELECT COALESCE(MAX(position),0) FROM team_queue_entries WHERE task_id=?`, task).Scan(&maxPos); err != nil {
+		return zero, err
+	}
+	e := api.TeamQueueEntry{ID: api.NewID("tqe"), TaskID: task, ItemID: failed.ItemID, ItemRevision: item.Revision, OrderMessageSeq: order, Template: template, Position: maxPos + 1, State: "queued", Revision: 1,
+		Host: failed.Host, Cwd: cwd, Repository: failed.Repository, Ownership: ownership, BaseCommit: base, Serial: serial, Attempt: attempt + 1, RetryOf: failed.ID, UpdatedAt: now}
+	if e.Ownership == nil {
+		e.Ownership = []string{}
+	}
+	ownedJSON, _ := json.Marshal(e.Ownership)
+	if _, err := tx.ExecContext(ctx, `INSERT INTO team_queue_entries(id,task_id,item_id,item_revision,order_seq,template,position,state,revision,host,cwd,repository,ownership_json,base_commit,serial,attempt,retry_of,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		e.ID, task, e.ItemID, e.ItemRevision, e.OrderMessageSeq, e.Template, e.Position, e.State, e.Revision, e.Host, e.Cwd, e.Repository, string(ownedJSON), e.BaseCommit, e.Serial, e.Attempt, e.RetryOf, now, now); err != nil {
+		return refuse("cannot be requeued: its item already has a live entry: %v", err)
+	}
+	return e, nil
 }
 
 // queueRebindAuthority checks who may rebind an entry: the owner's unbound
