@@ -349,7 +349,13 @@ func (r teamRunner) tick(ctx context.Context, e env, c *api.Client, host string)
 			if q.State != "queued" && q.State != "launching" && q.State != "running" {
 				continue
 			}
-			if err := r.advance(ctx, e, c, q, host); err != nil {
+			err := r.advance(ctx, e, c, q, host)
+			if errors.Is(err, errQueuedAwaitsRebind) {
+				// Nothing was done for this entry, so it does not take a
+				// serial project's turn: the next entry is tried.
+				continue
+			}
+			if err != nil {
 				projectErrors = append(projectErrors, fmt.Errorf("team queue %s: %w", q.ID, err))
 			}
 			if !parallel {
@@ -378,6 +384,10 @@ func (r teamRunner) tick(ctx context.Context, e env, c *api.Client, host string)
 	}
 	return errors.Join(projectErrors...)
 }
+
+// errQueuedAwaitsRebind is advance's report that a queued entry was left in
+// place because its item was amended. It is not a failure.
+var errQueuedAwaitsRebind = errors.New("queued entry waits for a rebind to its amended item")
 
 func (r teamRunner) advance(ctx context.Context, e env, c *api.Client, q api.TeamQueueEntry, host string) error {
 	if q.State == "launching" && r.retries != nil && r.retries.waiting(launchRetryKey(c.Base, q.TaskID, q.ID), r.clock()) {
@@ -409,7 +419,7 @@ func (r teamRunner) advance(ctx context.Context, e env, c *api.Client, q api.Tea
 			// An amended item leaves its entry queued for tt team queue
 			// rebind. The hub skips it at the head and lists the reason, so
 			// later entries still launch; failing it would strand the item.
-			return nil
+			return errQueuedAwaitsRebind
 		}
 		q, err = c.TeamQueueAction(ctx, q.TaskID, api.TeamQueueRequest{RequestID: "queue-claim-" + q.ID, Operation: "claim", EntryID: q.ID, ExpectedRevision: q.Revision, Host: host, PauseGeneration: detail.Task.PauseGeneration})
 		if err != nil {
