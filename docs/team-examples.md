@@ -46,21 +46,26 @@ and the comparison plan below includes human interventions and regressions.
 sequential change, and **Feature delivery** only when UI and API work can be
 partitioned. These recommendations are design judgments, not measured rankings.
 
-All templates use the GPT-6 family (owner decision, September 23, 2026). Astra
-is assigned to uncertain synthesis and coordination, and Sol to implementation,
-evidence gathering, review and QA. Luna runs swarm workers' focused, high-volume
-assignments. GPT-6 has no mid-size model, so the former Terra roles moved up to
-Sol, except swarm workers, which moved to Luna. GPT-6 Sol and Luna need `codex-cli`
-0.156.1 or later on the launching host.
-The model names and IDs follow the [documented Codex catalog](https://learn.chatgpt.com/docs/models)
+Template seats default to Claude Opus 5.5 (`claude-opus-5-5`, app `claude`;
+owner decision, September 28, 2026). There are three exceptions. The **Planned
+delivery** database handler uses Claude Sonnet 5.5 (`claude-sonnet-5-5`, app
+`claude`), an owner trial against the Opus handler (September 29, 2026). The
+**Planned delivery** plan reviewer uses GPT-6 Astra (`gpt-6-astra`, app `codex`),
+so a feature's plan is checked on another model than the Opus planner. The four
+**Coordinated swarm** workers use GPT-6 Luna (`gpt-6-luna`, app `codex`) for
+focused, high-volume assignments. GPT-6 Luna needs `codex-cli` 0.156.1 or later
+on the launching host.
+The GPT-6 model names and IDs follow the [documented Codex catalog](https://learn.chatgpt.com/docs/models)
 and the installed CLI's visible catalog. Account availability can differ. Model
 roles reflect capability positioning, not a benchmark of these exact teams.
-You can change each model, app and prompt before saving. Only **Planned delivery**
-sets explicit reasoning effort; the others inherit the agent app's configuration.
+You can change each model, app and prompt before saving. Every seat sets explicit
+reasoning effort (`high`, or `medium` for the **Planned delivery** lead) except
+the swarm workers, which inherit the agent app's configuration.
 
-The defaults use Codex because Tailterm currently has an exact-thread Codex inbox
-relay for resuming idle participants. Mixing providers can be useful, but changing
-a member to another app does not automatically provide the same wake-up support.
+The inbox relay resumes an idle Codex member on its exact thread and wakes an
+idle Claude session only after verifying its exact owned pane and empty prompt.
+Mixing providers can be useful, but changing a member to another app does not
+automatically provide the same wake-up support.
 The examples do not install tools or authenticate agent apps. Research members
 need browsing tools; UI members need a way to inspect the application.
 
@@ -141,8 +146,8 @@ rate limits and deduplication. This does not extend automatic wake support to
 other runtimes. Prompts discourage acknowledgement loops, redundant findings and
 taking over assignments addressed to someone else.
 
-The **Coordinated swarm** example starts with one Astra orchestrator and four
-Luna workers. Templates support up to 32 members, so one orchestrator plus ten
+The **Coordinated swarm** example starts with one Claude Opus 5.5 orchestrator
+and four GPT-6 Luna workers. Templates support up to 32 members, so one orchestrator plus ten
 workers can be saved, but this is an experiment to measure, not a claimed optimum.
 The active-agent cap and Max new agents allowance remain separate. A larger
 roster increases the number of recipients for each message and can add substantial
