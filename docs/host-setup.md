@@ -18,7 +18,9 @@ tt host setup [--hub URL] [--from PATH] [--service agent|daemon]
               [--check | --rollback] [--json]
 ```
 
-Run it as the user the agents run as, never as root.
+Run it as the user the agents run as, never as root and never through `sudo`:
+as root it refuses before changing anything, in every mode, because the binary
+and hook files it writes would become root-owned.
 
 ## What it does
 
@@ -155,6 +157,18 @@ reports that as `conflict`.
 When the binary changes and the service definition does not, the relay is
 restarted with `launchctl kickstart -k`. When the definition changes, the
 service is booted out and bootstrapped again.
+
+A restart that fails is still owed. From the moment a new binary is installed
+until the relay has been restarted on it, the file
+`~/.local/state/tailterm/host-setup-restart-pending` exists. While it does,
+`--check` reports `relay-service` as `outdated`, and the next run restarts the
+relay even though the binary is already current. The same applies after a
+rollback whose restart failed.
+
+After a run starts or restarts the relay, doctor gives it up to ten seconds to
+come up. It first looks two seconds after the restart and then every two
+seconds, never sooner, so its look at the relay's lock cannot collide with a
+relay that is still starting. A run that restarts nothing looks once, at once.
 
 On Linux or any other system the step does nothing: supervise `tt relay` with
 that host's own service manager.

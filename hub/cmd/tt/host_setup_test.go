@@ -37,6 +37,11 @@ key() { printf '%s' "$1" | tr '/' '_'; }
 case "$1" in
 print)
 	[ -f "$dir/print-exit" ] && exit "$(cat "$dir/print-exit")"
+	# A boot-out still in progress: the service goes after a few more probes.
+	if [ -f "$dir/leaving-$(key "$2")" ]; then
+		n=$(cat "$dir/leaving-$(key "$2")")
+		if [ "$n" -le 1 ]; then rm -f "$dir/leaving-$(key "$2")" "$dir/loaded-$(key "$2")"; else echo $((n - 1)) > "$dir/leaving-$(key "$2")"; fi
+	fi
 	[ -f "$dir/loaded-$(key "$2")" ] && exit 0
 	exit 113;;
 bootstrap)
@@ -47,11 +52,14 @@ bootout)
 	case "$(cat "$dir/bootout-mode" 2>/dev/null)" in
 	fail-loaded) exit 5;;
 	fail-absent) rm -f "$dir/loaded-$(key "$2")"; exit 5;;
+	fail-slow) echo 3 > "$dir/leaving-$(key "$2")"; exit 5;;
 	stuck) exit 0;;
 	esac
 	rm -f "$dir/loaded-$(key "$2")"
 	exit 0;;
-kickstart) exit 0;;
+kickstart)
+	[ -f "$dir/kickstart-exit" ] && exit "$(cat "$dir/kickstart-exit")"
+	exit 0;;
 esac
 exit 64
 `
@@ -112,11 +120,15 @@ func newHostSandbox(t *testing.T, homeName string) *hostSandbox {
 	old := struct {
 		launchctl, sudo, goos, tmux string
 		runtimes                    func() []string
+		uid                         func() int
+		probe                       func() bool
 		relayWait, stopWait, poll   time.Duration
-	}{hostSetupLaunchctl, hostSetupSudo, hostSetupGOOS, spawn.Tmux, hostSetupRuntimes, hostSetupRelayWait, hostSetupStopWait, hostSetupPoll}
+		relayProbe                  time.Duration
+	}{hostSetupLaunchctl, hostSetupSudo, hostSetupGOOS, spawn.Tmux, hostSetupRuntimes, hostSetupUID, relayRunningProbe, hostSetupRelayWait, hostSetupStopWait, hostSetupPoll, hostSetupRelayProbe}
 	t.Cleanup(func() {
 		hostSetupLaunchctl, hostSetupSudo, hostSetupGOOS, spawn.Tmux, hostSetupRuntimes = old.launchctl, old.sudo, old.goos, old.tmux, old.runtimes
-		hostSetupRelayWait, hostSetupStopWait, hostSetupPoll = old.relayWait, old.stopWait, old.poll
+		hostSetupUID, relayRunningProbe = old.uid, old.probe
+		hostSetupRelayWait, hostSetupStopWait, hostSetupPoll, hostSetupRelayProbe = old.relayWait, old.stopWait, old.poll, old.relayProbe
 	})
 	hostSetupLaunchctl, hostSetupSudo, hostSetupGOOS, spawn.Tmux = filepath.Join(fake, "launchctl"), filepath.Join(fake, "sudo"), "darwin", filepath.Join(fake, "tmux")
 	hostSetupRuntimes = func() []string { return []string{"claude", "codex"} }
@@ -786,6 +798,16 @@ func TestHostSetupServiceFailures(t *testing.T) {
 		s.calls()
 		return s, v1
 	}
+	t.Run("bootout fails while the service is still leaving", func(t *testing.T) {
+		s, v1 := agentUp(t)
+		s.state("bootout-mode", "fail-slow")
+		out := s.mustRun("--from", v1, "--service", "daemon")
+		calls := s.calls()
+		bootout, bootstrap := callIndex(calls, "bootout "+s.agentTarget()), callIndex(calls, "sudo "+hostSetupLaunchctl+" bootstrap system")
+		if bootout < 0 || bootstrap < bootout+3 || !onlyPrint(calls[bootout+1:bootout+4]) || !exists(s.p.daemonPlist) || exists(s.p.agentPlist) {
+			t.Fatalf("the switch did not wait for the boot-out to finish: %q\n%s", calls, out)
+		}
+	})
 	t.Run("bootout fails but the service is already absent", func(t *testing.T) {
 		s, v1 := agentUp(t)
 		s.state("bootout-mode", "fail-absent")
@@ -996,5 +1018,127 @@ func TestHostSetupHubConfig(t *testing.T) {
 	}
 	if raw, _ := os.ReadFile(s.p.hubConfig); string(raw) != stored || !reflect.DeepEqual(before, s.tree()) {
 		t.Fatalf("a refused hub URL changed hub.json: %s", raw)
+	}
+}
+
+// Review f1: a relay restart that failed is still owed on the next run.
+func TestHostSetupRestartPending(t *testing.T) {
+	s := newHostSandbox(t, "home")
+	s.holdRelayLock()
+	v1, v2 := s.artifact("tt-v1"), s.artifact("tt-v2")
+	s.mustRun("--from", v1)
+	if exists(s.p.restartPending) {
+		t.Fatal("a successful first setup left a pending restart")
+	}
+	s.state("kickstart-exit", "1")
+	s.calls()
+	out, code := s.run("--from", v2)
+	if code != 1 || !strings.Contains(out, "updated    binary") || !strings.Contains(out, "failed     relay-service") || s.hash(s.p.install) != s.hash(v2) {
+		t.Fatalf("update with a failing kickstart exited %d:\n%s", code, out)
+	}
+	s.calls()
+	before := s.tree()
+	out, code = s.run("--check", "--from", v2)
+	if code != 1 || !strings.Contains(out, "current    binary") || !strings.Contains(out, "outdated   relay-service") || !strings.Contains(out, "still runs the previous binary") {
+		t.Fatalf("--check after a failed restart exited %d:\n%s", code, out)
+	}
+	if calls := s.calls(); !onlyPrint(calls) || !reflect.DeepEqual(before, s.tree()) {
+		t.Fatalf("--check changed something: %q", calls)
+	}
+	// Still failing: the restart stays owed.
+	if out, code := s.run("--from", v2); code != 1 || !strings.Contains(out, "failed     relay-service") {
+		t.Fatalf("a second failing restart exited %d:\n%s", code, out)
+	}
+	s.clearState("kickstart-exit")
+	s.calls()
+	out = s.mustRun("--from", v2)
+	if calls := s.calls(); !hasCall(calls, "kickstart -k "+s.agentTarget()) || !strings.Contains(out, "current    binary") || !strings.Contains(out, "updated    relay-service") {
+		t.Fatalf("the re-run did not restart the relay: %q\n%s", calls, out)
+	}
+	if exists(s.p.restartPending) || s.hash(s.p.rollback) != s.hash(v1) {
+		t.Fatal("the pending restart was not cleared, or the rollback copy changed")
+	}
+	if out := s.mustRun("--check", "--from", v2); !strings.Contains(out, "current    relay-service") || !onlyPrint(s.calls()) {
+		t.Fatalf("after the restart --check is not current:\n%s", out)
+	}
+
+	// The same holds for a rollback whose restart failed.
+	s.state("kickstart-exit", "1")
+	if out, code := s.run("--rollback"); code != 1 || s.hash(s.p.install) != s.hash(v1) || !strings.Contains(out, "failed     relay-service") {
+		t.Fatalf("rollback with a failing kickstart exited %d:\n%s", code, out)
+	}
+	s.clearState("kickstart-exit")
+	s.calls()
+	out = s.mustRun("--from", s.p.install)
+	if calls := s.calls(); !hasCall(calls, "kickstart -k "+s.agentTarget()) || exists(s.p.restartPending) {
+		t.Fatalf("setup after a rollback with a failed restart did not restart the relay: %q\n%s", calls, out)
+	}
+}
+
+// Review f2: as root nothing is written, in any mode.
+func TestHostSetupRefusesRoot(t *testing.T) {
+	s := newHostSandbox(t, "home")
+	s.holdRelayLock()
+	v1 := s.artifact("tt-v1")
+	hostSetupUID = func() int { return 0 }
+	before := s.tree()
+	for _, args := range [][]string{{"--from", v1}, {"--from", v1, "--service", "agent"}, {"--from", v1, "--service", "daemon"}, {"--check", "--from", v1}, {"--rollback"}, {"--from", v1, "--hub", s.hubURL, "--json"}} {
+		out, code := s.run(args...)
+		if code != 1 || !strings.Contains(out, "not root") {
+			t.Fatalf("%v as root exited %d:\n%s", args, code, out)
+		}
+		if calls := s.calls(); len(calls) != 0 || exists(s.home) || !reflect.DeepEqual(before, s.tree()) {
+			t.Fatalf("%v as root wrote or called something: %q", args, calls)
+		}
+	}
+}
+
+// Review f3: the relay lock is not probed while a restarted relay starts.
+func TestHostSetupRelayProbeSchedule(t *testing.T) {
+	s := newHostSandbox(t, "home")
+	s.holdRelayLock()
+	var probes []time.Duration
+	var start time.Time
+	answer := false
+	relayRunningProbe = func() bool { probes = append(probes, time.Since(start)); return answer }
+	reset := func() { probes, start = nil, time.Now() }
+	hostSetupRelayProbe = 60 * time.Millisecond
+
+	reset()
+	if waitForRelay(0) || len(probes) != 1 || probes[0] > 30*time.Millisecond {
+		t.Fatalf("no wait: probes %v", probes)
+	}
+	reset()
+	if waitForRelay(150*time.Millisecond) || len(probes) != 3 || probes[0] < 60*time.Millisecond || probes[1]-probes[0] < 60*time.Millisecond {
+		t.Fatalf("a relay that never starts: probes %v", probes)
+	}
+	answer = true
+	reset()
+	if !waitForRelay(10*time.Second) || len(probes) != 1 || probes[0] < 60*time.Millisecond {
+		t.Fatalf("a relay that started: probes %v", probes)
+	}
+
+	// Through host setup: a run that restarts the relay waits before its one
+	// probe; a run that restarts nothing probes once, at once.
+	hostSetupRelayWait = 10 * time.Second
+	v1, v2 := s.artifact("tt-v1"), s.artifact("tt-v2")
+	for _, c := range []struct {
+		name, from string
+		waits      bool
+	}{{"fresh install", v1, true}, {"current", v1, false}, {"update", v2, true}, {"current again", v2, false}} {
+		reset()
+		s.mustRun("--from", c.from)
+		if len(probes) != 1 || (probes[0] >= 60*time.Millisecond) != c.waits {
+			t.Fatalf("%s: probes %v, want a delayed probe: %v", c.name, probes, c.waits)
+		}
+	}
+	reset()
+	s.mustRun("--rollback")
+	if len(probes) != 1 || probes[0] < 60*time.Millisecond {
+		t.Fatalf("rollback: probes %v", probes)
+	}
+	reset()
+	if _, code := s.run("--check", "--from", v2); code != 1 || len(probes) != 1 {
+		t.Fatalf("--check: exit %d, probes %v", code, probes)
 	}
 }

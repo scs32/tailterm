@@ -372,11 +372,7 @@ func runDoctor(w io.Writer, e env, relayWait time.Duration) []string {
 	} else {
 		fmt.Fprintln(w, "OK hub reachable")
 	}
-	running := relayRunning()
-	for deadline := time.Now().Add(relayWait); !running && time.Now().Before(deadline); running = relayRunning() {
-		time.Sleep(hostSetupPoll)
-	}
-	if running {
+	if waitForRelay(relayWait) {
 		fmt.Fprintln(w, "OK relay running")
 	} else {
 		fmt.Fprintln(w, "FAIL relay: not running (nothing holds the relay lock); run tt host setup, see docs/host-setup.md")

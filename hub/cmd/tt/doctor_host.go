@@ -32,7 +32,7 @@ import (
 
 const doctorRoleUsage = `usage: tt doctor [--role client|agent|test|release] [--repo DIR] [--deploy-config PATH]
 
-With no arguments, tt doctor runs the original tmux, runtime and hub checks.
+With no arguments, tt doctor checks tmux, the installed runtimes, the hub and the relay.
 With --role it checks this machine against docs/host-requirements.md, prints
 one line per requirement (ok, missing, wrong version or warn) with a fix hint,
 and exits 1 when any required piece is missing or the wrong version.

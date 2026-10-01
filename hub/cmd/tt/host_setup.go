@@ -57,6 +57,10 @@ var (
 	hostSetupRelayWait = 10 * time.Second
 	hostSetupStopWait  = 5 * time.Second
 	hostSetupPoll      = 100 * time.Millisecond
+	// After a restart the relay lock is first probed after this delay, then
+	// at this interval (see waitForRelay).
+	hostSetupRelayProbe = 2 * time.Second
+	relayRunningProbe   = relayRunning
 )
 
 const (
@@ -89,6 +93,9 @@ type hostPaths struct {
 	home, install, staged, rollback, rollbackTmp string
 	codexHooks, claudeSettings, hubConfig        string
 	agentPlist, daemonPlist, logDir, relayLock   string
+	// restartPending exists from the moment a new binary is installed until
+	// the relay has been restarted on it, so a later run finishes the job.
+	restartPending, daemonStaged string
 }
 
 func newHostPaths() (hostPaths, error) {
@@ -115,6 +122,8 @@ func newHostPaths() (hostPaths, error) {
 		daemonPlist:    filepath.Join(root, "Library", "LaunchDaemons", hostRelayLabel+".plist"),
 		logDir:         filepath.Join(home, "Library", "Logs", "Tailterm"),
 		relayLock:      filepath.Join(relayDir(), "relay.lock"),
+		restartPending: filepath.Join(home, ".local", "state", "tailterm", "host-setup-restart-pending"),
+		daemonStaged:   filepath.Join(home, ".local", "state", "tailterm", hostRelayLabel+".daemon.plist.staged"),
 	}, nil
 }
 
@@ -153,6 +162,8 @@ func (p hostPaths) resolved() map[string]string {
 		"hubConfig":            resolvePath(p.hubConfig),
 		"agentPlist":           resolvePath(p.agentPlist),
 		"daemonPlist":          resolvePath(p.daemonPlist),
+		"daemonPlistStaged":    resolvePath(p.daemonStaged),
+		"restartPending":       resolvePath(p.restartPending),
 		"logDirectory":         resolvePath(p.logDir),
 	}
 }
@@ -163,7 +174,10 @@ type hostSetup struct {
 	from, hub     string
 	service       string // requested: "", agent or daemon
 	binaryChanged bool
-	steps         []hostStep
+	// relayRestarted: this run started or restarted the relay, so doctor
+	// waits for it to come up.
+	relayRestarted bool
+	steps          []hostStep
 }
 
 func (h *hostSetup) add(name, state, detail string) {
@@ -203,6 +217,12 @@ func cmdHost(args []string) error {
 	case *rollback && (*hub != "" || *from != "" || *service != ""):
 		return hostUsageError("--rollback takes no --hub, --from or --service")
 	}
+	// As root every file written would be root-owned in the agent user's
+	// home, so refuse before any step. Only the daemon's plist and launchctl
+	// calls ever need privilege, and those go through sudo.
+	if hostSetupUID() == 0 {
+		return &exitError{code: 1, err: errors.New("host setup: run as the agent user, not root (do not use sudo); nothing was changed")}
+	}
 	p, err := newHostPaths()
 	if err != nil {
 		return err
@@ -217,7 +237,7 @@ func cmdHost(args []string) error {
 			return &exitError{code: 1, err: fmt.Errorf("host setup --rollback: %w", err)}
 		}
 		h.restartRelay()
-		h.doctor(&doctor, hostSetupRelayWait)
+		h.doctor(&doctor)
 	default:
 		if *check {
 			report.Mode = "check"
@@ -227,11 +247,7 @@ func cmdHost(args []string) error {
 		h.hooks("codex-hooks", "codex", p.codexHooks, codexHookEvents)
 		h.hooks("claude-hooks", "claude", p.claudeSettings, claudeHookEvents)
 		report.Service = h.relayService()
-		wait := time.Duration(0)
-		if h.apply {
-			wait = hostSetupRelayWait
-		}
-		h.doctor(&doctor, wait)
+		h.doctor(&doctor)
 	}
 	report.Steps = h.steps
 	bad := 0
@@ -360,8 +376,17 @@ func (h *hostSetup) binary() {
 		h.add(name, hostFailed, "cannot stage the new binary: "+err.Error())
 		return
 	}
+	wasPending := h.restartIsPending()
+	if err := h.markRestartPending(); err != nil {
+		os.Remove(h.p.staged)
+		h.add(name, hostFailed, err.Error())
+		return
+	}
 	if err := os.Rename(h.p.staged, h.p.install); err != nil {
 		os.Remove(h.p.staged)
+		if !wasPending {
+			os.Remove(h.p.restartPending)
+		}
 		h.add(name, hostFailed, "cannot install the new binary: "+err.Error())
 		return
 	}
@@ -371,6 +396,31 @@ func (h *hostSetup) binary() {
 		return
 	}
 	h.add(name, hostUpdated, fmt.Sprintf("%s sha256 %s; previous sha256 %s kept at %s", h.p.install, want, have, h.p.rollback))
+}
+
+// markRestartPending records, before the installed binary changes, that the
+// relay still runs the old one. The record outlives a run whose restart
+// failed, so the next run restarts the relay and --check reports it.
+func (h *hostSetup) markRestartPending() error {
+	if hostSetupGOOS != "darwin" {
+		return nil // no relay service is managed here
+	}
+	if err := writeFileAtomic(h.p.restartPending, []byte("the relay must be restarted on the installed tt\n"), 0o600, 0o700); err != nil {
+		return fmt.Errorf("cannot record the pending relay restart: %w", err)
+	}
+	return nil
+}
+
+func (h *hostSetup) restartIsPending() bool { return plistPresent(h.p.restartPending) }
+
+// relayStarted clears the pending restart once the relay runs the installed
+// binary.
+func (h *hostSetup) relayStarted() error {
+	h.relayRestarted = true
+	if err := os.Remove(h.p.restartPending); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("the relay was restarted but the pending-restart record could not be removed: %w", err)
+	}
+	return nil
 }
 
 // rollbackBinary swaps tt and tt.previous, so a second rollback undoes the
@@ -394,9 +444,18 @@ func (h *hostSetup) rollbackBinary() error {
 		os.Remove(h.p.staged)
 		return fmt.Errorf("cannot keep the current binary: %w", err)
 	}
+	wasPending := h.restartIsPending()
+	if err := h.markRestartPending(); err != nil {
+		os.Remove(h.p.staged)
+		os.Remove(h.p.rollbackTmp)
+		return err
+	}
 	if err := os.Rename(h.p.staged, h.p.install); err != nil {
 		os.Remove(h.p.staged)
 		os.Remove(h.p.rollbackTmp)
+		if !wasPending {
+			os.Remove(h.p.restartPending)
+		}
 		return fmt.Errorf("cannot restore the previous binary: %w", err)
 	}
 	h.binaryChanged = true
@@ -793,10 +852,12 @@ func stopRelay(d relayDomain, state string, removePlist bool) error {
 			if now == relayAbsent {
 				break
 			}
-			if code != 0 {
-				return fmt.Errorf("launchctl bootout %s exited %d and the %s service is still loaded", d.target(), code, d.mode)
-			}
+			// launchctl can exit non-zero while the boot-out is still in
+			// progress, so a failed bootout gets the same wait.
 			if !time.Now().Before(deadline) {
+				if code != 0 {
+					return fmt.Errorf("launchctl bootout %s exited %d and the %s service is still loaded", d.target(), code, d.mode)
+				}
 				return fmt.Errorf("the %s service %s is still loaded after bootout", d.mode, d.target())
 			}
 			time.Sleep(hostSetupPoll)
@@ -855,27 +916,20 @@ func relayPlist(d relayDomain, p hostPaths) ([]byte, error) {
 	return b.Bytes(), nil
 }
 
-func writeRelayPlist(d relayDomain, data []byte) error {
+func writeRelayPlist(d relayDomain, data []byte, staged string) error {
 	if !d.sudo {
 		return writeFileAtomic(d.plist, data, 0o600, 0o755)
 	}
-	staged, err := os.CreateTemp("", "tailterm-relay-*.plist")
-	if err != nil {
+	if err := writeFileAtomic(staged, data, 0o600, 0o700); err != nil {
 		return err
 	}
-	defer os.Remove(staged.Name())
-	if _, err = staged.Write(data); err == nil {
-		err = staged.Close()
-	}
-	if err != nil {
-		return err
-	}
+	defer os.Remove(staged)
 	if _, err := os.Stat(filepath.Dir(d.plist)); err != nil {
 		if code, err := hostRun(true, "mkdir", "-p", filepath.Dir(d.plist)); err != nil || code != 0 {
 			return fmt.Errorf("could not create %s through sudo (exit %d)", filepath.Dir(d.plist), code)
 		}
 	}
-	if code, err := hostRun(true, "install", "-o", "root", "-g", "wheel", "-m", "0644", staged.Name(), d.plist); err != nil || code != 0 {
+	if code, err := hostRun(true, "install", "-o", "root", "-g", "wheel", "-m", "0644", staged, d.plist); err != nil || code != 0 {
 		return fmt.Errorf("could not install %s through sudo (exit %d)", d.plist, code)
 	}
 	return nil
@@ -921,10 +975,6 @@ func (h *hostSetup) relayService() string {
 	if mode == "daemon" {
 		sel, other, selState, otherState, otherHere = daemon, agent, daemonState, agentState, agentHere
 	}
-	if mode == "daemon" && hostSetupUID() == 0 {
-		h.add(name, hostFailed, "run tt host setup as the agent user, not root; only the daemon plist and launchctl calls use sudo")
-		return mode
-	}
 	want, err := relayPlist(sel, h.p)
 	if err != nil {
 		h.add(name, hostFailed, err.Error())
@@ -950,6 +1000,8 @@ func (h *hostSetup) relayService() string {
 			h.add(name, hostOutdated, "would rewrite "+sel.plist+" and reload the "+mode+" relay")
 		case selState != relayLoaded:
 			h.add(name, hostOutdated, "the "+mode+" relay is installed but not loaded; would start it")
+		case h.restartIsPending():
+			h.add(name, hostOutdated, "the "+mode+" relay still runs the previous binary; would restart it")
 		default:
 			h.add(name, hostCurrent, mode+" relay "+sel.target())
 		}
@@ -975,7 +1027,7 @@ func (h *hostSetup) relayService() string {
 		} else if now != relayLoaded {
 			return fmt.Errorf("the %s relay is not loaded after bootstrap", mode)
 		}
-		return nil
+		return h.relayStarted()
 	}
 	switch {
 	case !same:
@@ -985,7 +1037,7 @@ func (h *hostSetup) relayService() string {
 		if err := os.MkdirAll(h.p.logDir, 0o755); err != nil {
 			return fail(err)
 		}
-		if err := writeRelayPlist(sel, want); err != nil {
+		if err := writeRelayPlist(sel, want, h.p.daemonStaged); err != nil {
 			return fail(err)
 		}
 		if err := bootstrap(); err != nil {
@@ -1000,9 +1052,12 @@ func (h *hostSetup) relayService() string {
 			return fail(err)
 		}
 		state, detail = hostUpdated, mode+" relay was not loaded; started "+sel.target()
-	case h.binaryChanged:
+	case h.binaryChanged || h.restartIsPending():
 		if code, err := hostRun(sel.sudo, hostSetupLaunchctl, "kickstart", "-k", sel.target()); err != nil || code != 0 {
 			return fail(fmt.Errorf("launchctl kickstart -k %s failed (exit %d)", sel.target(), code))
+		}
+		if err := h.relayStarted(); err != nil {
+			return fail(err)
 		}
 		state, detail = hostUpdated, mode+" relay restarted on the new binary: "+sel.target()
 	case otherHere:
@@ -1051,6 +1106,10 @@ func (h *hostSetup) restartRelay() {
 		h.add(name, hostFailed, "no relay service is loaded, so none was restarted; run tt host setup")
 		return
 	}
+	if err := h.relayStarted(); err != nil {
+		h.add(name, hostFailed, err.Error())
+		return
+	}
 	h.add(name, hostUpdated, "restarted "+strings.Join(restarted, ", "))
 }
 
@@ -1071,7 +1130,41 @@ func relayRunning() bool {
 	return false
 }
 
-func (h *hostSetup) doctor(w io.Writer, relayWait time.Duration) {
+// waitForRelay reports whether the relay is running, waiting up to wait for
+// one that was just restarted. The probe takes the relay's own lock when it
+// is free, and a relay that finds the lock taken exits as "already running"
+// and is not retried by launchd for 15 seconds. So the probe never runs while
+// a restarted relay is still starting: the first probe comes only after
+// hostSetupRelayProbe, long after a starting relay has locked, and later
+// probes are that far apart. A probe of a running relay takes no lock at all.
+// launchctl's own state is not used because it says a process exists, not
+// that the relay holds its lock, and it is absent off macOS.
+func waitForRelay(wait time.Duration) bool {
+	if wait <= 0 {
+		return relayRunningProbe()
+	}
+	deadline := time.Now().Add(wait)
+	for {
+		pause := hostSetupRelayProbe
+		if left := time.Until(deadline); left < pause {
+			pause = left
+		}
+		time.Sleep(pause)
+		if relayRunningProbe() {
+			return true
+		}
+		if !time.Now().Before(deadline) {
+			return false
+		}
+	}
+}
+
+func (h *hostSetup) doctor(w io.Writer) {
+	// Only a relay this run restarted is given time to come up.
+	relayWait := time.Duration(0)
+	if h.relayRestarted {
+		relayWait = hostSetupRelayWait
+	}
 	// The hub configuration may have been written by this run.
 	if failed := runDoctor(w, readEnv(), relayWait); len(failed) > 0 {
 		h.add("doctor", hostFailed, "failed: "+strings.Join(failed, ", "))
