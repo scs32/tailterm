@@ -43,11 +43,58 @@ Each projection has one phase: intake/planning, build, numbered review round (or
 
 A batch is frozen to private disk before upload, replayed unchanged until its matching receipt, and revision-checked by the ledger. Enrolled run provenance and request/revision/receipt records survive lifecycle closure and binding archival. Retirement freezes any pending outbox without rescanning archived transcripts or polling archived agents. Capability discovery is cached per host. Collection shares the relay request budget after delivery, adds no prompts or agent turns, and caps append records, batch bytes and local outbox size. Capacity, parse and partial-tail gaps remain explicit. A fresh activation with a reconciled first request records measured coverage. Historical run gaps stay in run coverage; they do not relabel later fully measured requests. Permanent 400/404/409 upload rejection preserves the immutable numeric batch and status in a private local quarantine with explicit partial coverage. It is never called an uploaded receipt. Later live requests may continue; frozen delivery rotates past errors or throttle, and drained cursor files are removed. Quarantine files remain for diagnosis/recovery; a rejected batch is not included in hub totals until it is successfully ingested. No owner Claude session is enrolled.
 
+## Time
+
+Feature `wi_95335cabc56442f5`, revision 1, owner order #13091; builder assignment #19086, Start #19088 and handler release #19100. Next to an item's tokens, the report says where its wall time went, what the waiting was for, and how many model requests only re-checked the inbox. It reads the same transcripts as the token ledger and adds no agent turn.
+
+```
+tt usage --project PROJECT_ID --item ITEM_ID
+tt usage --project PROJECT_ID --item ITEM_ID --json | jq '.items[0].time'
+```
+
+The text form prints one `time:` line per item (wall time, the model, tool and waiting shares, poll requests), a `timeline:` line, one `time agent`, `time phase` and `time role` line each, and the longest waits with their Board message number. In Projects, the Usage disclosure shows the same inside each item: wall time and shares, the team timeline, the top waits, and a `Time:` line in each phase and role row. An item with no spans says **Time not measured**. A hub that does not report time (`timeVersion` absent) is shown as before.
+
+### What is measured
+
+All times are transcript record timestamps, UTC, as half-open intervals.
+
+- **Turn.** Codex: `task_started` to `task_complete`. Claude: a real user prompt to the turn end (`end_turn`, `result`, `turn_duration` or an API error). A turn with no end record closes at the next turn start or at retirement, at the last record seen, and says so in its gap.
+- **Tool time.** From a tool call record to its output record. Overlapping or touching calls are merged into their exact union; a gap is never bridged. A call with no output closes at the turn end.
+- **Waiting.** Everything outside turns, plus a blocking inbox wait inside a turn (`tt wait`, `tt inbox --wait`). Codex `sleep` and shell `sleep N` are tool time.
+- **Model time.** The turn minus tool, waiting and unmeasured intervals.
+- **Unmeasured.** A tool call that runs a blocking inbox wait together with other work (`tt inbox --wait 9m && go test ./...`, or a wait piped into another command) cannot be split by timestamps. It is reported as unmeasured, never as tool or waiting. So is the remainder of a turn with more than 64 chunks of intervals.
+
+A tool call is classified by the commands it executes, never by a pattern over its text. The relay decodes the call into shell strings (a Claude `Bash` command, a Codex `function_call` `cmd`/`command`, or each `tools.exec_command({cmd: "…"})` in a Codex `exec` snippet), splits each into simple commands, skips `VAR=value` words and the wrappers `env`, `command`, `exec`, `nohup`, `time` and `timeout N`, and looks one level into `bash|sh|zsh -c`. Only a command word whose basename is exactly `tt` counts. Quoted text is only ever an argument, so `echo tt wait` is ordinary tool time. Anything it cannot decode (command substitution, a heredoc, a `cmd` that is not a plain string literal, another `tools.NAME(` call) stays ordinary tool time. A wait beside only `cd` and other `tt` commands is still waiting. Only the class is kept: command text never enters the cursor, the upload or the database.
+
+### Requests, segments and polls
+
+Each metered model request is marked at the timestamp the token ledger gives it. A request's **segment** is the time after the previous request (or the turn start) up to its mark; the last one runs to the turn end. A segment is attributed exactly as its request's tokens are: same item shares, phase, review round and role, resolved at the same timestamp from the same handled Board evidence. A request and the time in its segment therefore never land in different phases, and an order handled in the middle of a turn moves later time to the new phase just as it moves later tokens.
+
+A request is a **poll** when every tool call it issued is an inbox command (blocking or not) and the next request in the turn that issued any tool call is the same. A check that leads to other work is not a poll. `polls` counts them; `pollMs` is the model time inside their segments.
+
+### Collection
+
+A completed turn is uploaded once, as chunks of at most 32 intervals and segment pieces that together cover it exactly. Nothing is merged to fit; an interval crossing a cut is split there, and every segment piece names its own request, so the result does not depend on where the turn was cut. An open turn is absent from the report until it ends. Chunks ride the usage batch, so the frozen outbox, receipts, replay, retirement freeze and quarantine apply to them unchanged. A stored chunk is immutable: an identical replay is a no-op and a different payload under the same id is a conflict. The relay sends chunks only to a hub that advertises `usage.time`; until then they stay in the local outbox (at most 256, with explicit partial coverage beyond that), and a frozen run keeps its state file until its chunks have a receipt.
+
+### The report
+
+`time` is absent for an item with no spans. Durations are exact milliseconds as strings, a rational such as `60000` or `3001/2`.
+
+- **Window.** From the earliest to the latest segment attributed to the item, clipped to `--from`/`--to`. `wallMs` is its length.
+- **Per agent.** Model and tool time from its segments attributed to the item; the rest of the window is waiting. Model, tool, waiting and unmeasured sum to the window. A request that served several items gives each its share of model and tool time, and the remainder is waiting for that item. So a shared handler's work on other items is waiting here, as in the owner's own measurement.
+- **Per phase and role.** The same keys as tokens. Model and tool time take the phase and role of their segment, and so does a blocking wait inside it. Waiting outside the agent's item work takes the phase and role of its latest item segment that ended before it, or of its first one. Each breakdown sums to the agents' total.
+- **Team timeline.** A sweep over the window: some model working, only tools running, nobody active. A stretch some agent could not split is left out as `unmeasuredMs`; the four sum to the window.
+- **Waits.** Each waiting stretch is split wherever something relevant opened or closed and labelled by the first rule that matches: `owner` (an owner obligation or decision request the agent authored), `handler` (the agent's request to a database handler: save, read-back, Start release), `teammate` (its request to anyone else), `owner` again (an owner request or decision linked to the item by any author), otherwise `unknown`. Open means the recorded interval: an obligation from creation to close, a decision from its request to its answer. Current state is never consulted, so the report is the same after a hub restart and long after the answer. `waits` lists the five largest by cause and Board message, with the agents that waited; `causes` totals all of them.
+
+Known limits: a long open turn is invisible until it ends; a transitive wait (a builder idle while its lead waits for the owner) is `owner` only through the item link, otherwise `unknown`; work done before collection started is not reconstructed.
+
 ## Verification boundary
 
 Synthetic tests cover both runtimes, normalization, streaming/deduplication, resets, two-item persistent-role attribution, overhead conservation, phase/role averages, prices, receipt loss/restart/archive and relay budget. A loopback fixture exercises the real relay append path through HTTP into the store. Chromium and WebKit exercise Usage through Projects, including stale/offline/older-hub behavior, filters, prices, escaping, narrow layout and focus continuity.
 
 The migration rehearsal builds a production-shaped **synthetic** database using the approved base binary, then opens candidate/base/candidate and checks retained records, ledger/prices, integrity and foreign keys. Its execution, and the full independent matrix, require their separate frozen-plan gate. Targeted builder checks do not imply independent matrix acceptance. No live task/profile data is a test fixture, and no deployment is part of this work order.
+
+Time accounting adds synthetic Codex and Claude transcripts under `hub/cmd/tt/testdata/usage-time`, covering overlapping tool calls, blocking and non-blocking inbox checks, a turn ended by `turn_duration`, a turn spanning an owner wait and an order handled in the middle of a turn. Relay tests cover exact intervals past the chunk limit, the classification table, poll requests, turn boundaries, outbox restart, retirement, the capability gate and the span-only drain. Store tests cover the phase and role split with waiting, the team timeline, wait causes before and after reopening the database, the additive `usage_spans` table and chunk immutability. Chromium and WebKit render a report produced by that real path. The migration rehearsal with `usage_spans` remains a verifier matrix step.
 
 Round-one correction provenance: REQUEST #12757 / disposition #12758, renewed own Start #12763, handler release #12764; fixes b1–b5 plus existing c6 top-phase finding `wi_687271d49143fe15`. Other review findings remain held and do not widen this implementation.
 

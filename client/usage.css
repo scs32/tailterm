@@ -63,6 +63,13 @@
   vertical-align: top;
   overflow-wrap: anywhere;
 }
+.usage-waits {
+  margin: 0.35rem 0;
+}
+.usage-waits td:first-child {
+  width: 9rem;
+  color: var(--muted, #999);
+}
 .usage-price-row {
   display: flex;
   flex-wrap: wrap;

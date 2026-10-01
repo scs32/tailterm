@@ -5,6 +5,10 @@ import {
   sortUsageItems,
   sortUsagePhases,
   usageClasses,
+  usageTimeSummary,
+  usageTimeline,
+  usageTimeSplit,
+  usageWait,
 } from "./usage-format.js";
 
 // Optional disclosure owns its own requests. Slow usage reads never hold core
@@ -52,10 +56,30 @@ export function createUsageView({ client, notice = () => {} }) {
     const key = active?.dataset?.usageField;
     const start = active?.selectionStart,
       end = active?.selectionEnd;
-    const groups = (label, rows = []) =>
-      `<details data-usage-group="${esc(label)}" ${s.expanded.has(label) ? "open" : ""}><summary>${esc(label)}</summary><table class="usage-breakdown"><tbody>${rows.map((g) => `<tr><td>${esc(g.label)}</td><td>${esc(usageSummary(g.summary))}<br>${esc(formatUsageCost(g.summary))}</td></tr>`).join("")}</tbody></table></details>`;
+    // Time sits in the same rows as tokens. A key with time and no metered
+    // request (an agent only waited in that phase) gets a row of its own.
+    const groups = (label, rows = [], times = []) => {
+      const time = new Map(times.map((t) => [t.key, t]));
+      const seen = new Set(rows.map((g) => g.key));
+      const line = (key) =>
+        time.has(key) ? `<br>${esc(usageTimeSplit(time.get(key)))}` : "";
+      return `<details data-usage-group="${esc(label)}" ${s.expanded.has(label) ? "open" : ""}><summary>${esc(label)}</summary><table class="usage-breakdown"><tbody>${rows.map((g) => `<tr><td>${esc(g.label)}</td><td>${esc(usageSummary(g.summary))}<br>${esc(formatUsageCost(g.summary))}${line(g.key)}</td></tr>`).join("")}${times
+        .filter((t) => !seen.has(t.key))
+        .map(
+          (t) =>
+            `<tr><td>${esc(t.key)}</td><td>${esc(usageTimeSplit(t))}</td></tr>`,
+        )
+        .join("")}</tbody></table></details>`;
+    };
+    // A hub that reports no time at all renders as before.
+    const time = (row) => {
+      if (!s.report?.timeVersion) return "";
+      if (!row.time) return `<p data-usage-time>Time not measured</p>`;
+      const waits = (row.time.waits || []).map(usageWait);
+      return `<p data-usage-time>${esc(usageTimeSummary(row.time))}<br>${esc(usageTimeline(row.time))}</p>${waits.length ? `<table class="usage-breakdown usage-waits" data-usage-waits><tbody>${waits.map((w) => `<tr><td>${esc(w.cause)}</td><td>${esc(w.target)}<br>${esc(w.detail)}</td></tr>`).join("")}</tbody></table>` : ""}`;
+    };
     const item = (row) =>
-      `<details class="usage-item" data-usage-item="${esc(row.itemId || "overhead")}" ${s.expanded.has(row.itemId || "overhead") ? "open" : ""}><summary>${esc(row.title)} · ${esc(formatUsageCost(row.summary))}</summary><p>${esc(usageSummary(row.summary))}</p>${groups("Phases · " + (row.itemId || "overhead"), sortUsagePhases(row.phases))}${groups("Roles · " + (row.itemId || "overhead"), row.roles)}${groups("Models · " + (row.itemId || "overhead"), row.models)}${groups("Phase and role · " + (row.itemId || "overhead"), row.phaseRoles)}</details>`;
+      `<details class="usage-item" data-usage-item="${esc(row.itemId || "overhead")}" ${s.expanded.has(row.itemId || "overhead") ? "open" : ""}><summary>${esc(row.title)} · ${esc(formatUsageCost(row.summary))}</summary><p>${esc(usageSummary(row.summary))}</p>${time(row)}${groups("Phases · " + (row.itemId || "overhead"), sortUsagePhases(row.phases), row.time?.phases)}${groups("Roles · " + (row.itemId || "overhead"), row.roles, row.time?.roles)}${groups("Models · " + (row.itemId || "overhead"), row.models)}${groups("Phase and role · " + (row.itemId || "overhead"), row.phaseRoles, row.time?.phaseRoles)}</details>`;
     const coverage = [
       ...new Set(
         (s.report?.coverage || [])

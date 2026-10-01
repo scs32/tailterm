@@ -8,6 +8,11 @@ import {
   sortUsageItems,
   sortUsagePhases,
   usageSummary,
+  formatUsageDuration,
+  usageTimeSummary,
+  usageTimeline,
+  usageTimeSplit,
+  usageWait,
 } from "../client/usage-format.js";
 
 test("Usage client sends exact paths, methods, filters and price body", async () => {
@@ -107,4 +112,74 @@ test("top phases use exact estimated costs or measured tokens with stable ties",
     ]).map((p) => p.key),
     ["Z high", "A low", "B low"],
   );
+});
+
+test("time: wall, shares, timeline, phase split and waits", () => {
+  assert.equal(formatUsageDuration("4812000"), "1h 20m");
+  assert.equal(formatUsageDuration("305000"), "5m 5s");
+  assert.equal(formatUsageDuration("38000"), "38s");
+  assert.equal(formatUsageDuration("1001/2"), "501ms");
+  assert.equal(formatUsageDuration("0"), "0s");
+  assert.equal(formatUsageDuration(undefined), "unavailable");
+  const time = {
+    wallMs: "4812000",
+    modelMs: "38000",
+    toolMs: "32000",
+    waitingMs: "4742000",
+    unmeasuredMs: "0",
+    polls: 5,
+    pollMs: "11000",
+    timeline: {
+      modelMs: "38000",
+      toolsOnlyMs: "32000",
+      idleMs: "4742000",
+      unmeasuredMs: "0",
+    },
+  };
+  assert.equal(
+    usageTimeSummary(time),
+    "Wall time 1h 20m · model 0.8% · tool 0.7% · waiting 98.5% · 5 poll requests (11s)",
+  );
+  assert.equal(
+    usageTimeline(time),
+    "Team timeline: some model working 0.8% · only tools running 0.7% · nobody active 98.5%",
+  );
+  assert.equal(usageTimeSummary(null), "Time not measured");
+  assert.equal(usageTimeSummary(undefined), "Time not measured");
+  // Shares are of four agents' time in the window, not of the wall clock.
+  assert.match(
+    usageTimeSummary({
+      wallMs: "3600000",
+      modelMs: "1920000",
+      toolMs: "1020000",
+      waitingMs: "10860000",
+      unmeasuredMs: "600000",
+      polls: 1,
+      pollMs: "1000",
+    }),
+    /^Wall time 1h 0m · model 13\.3% · tool 7\.1% · waiting 75\.4% · unmeasured 4\.2% · 1 poll request \(1s\)$/,
+  );
+  assert.equal(
+    usageTimeSplit({ modelMs: "480000", toolMs: "120000", waitingMs: "3000000" }),
+    "Time: model 8m 0s · tool 2m 0s · waiting 50m 0s",
+  );
+  assert.deepEqual(
+    usageWait({
+      cause: "owner",
+      messageSeq: 12620,
+      subject: "Approve the matrix",
+      awaitedBy: "builder, reviewer",
+      ms: "5760000",
+    }),
+    {
+      cause: "Waiting on owner",
+      target: "Approve the matrix #12620",
+      detail: "1h 36m · builder, reviewer",
+    },
+  );
+  assert.deepEqual(usageWait({ cause: "unknown", ms: "305000", awaitedBy: "builder" }), {
+    cause: "Waiting on unknown",
+    target: "Nothing the Board shows",
+    detail: "5m 5s · builder",
+  });
 });

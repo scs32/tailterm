@@ -113,3 +113,58 @@ export function sortUsagePhases(phases = []) {
     return String(a.key || a.label).localeCompare(String(b.key || b.label));
   });
 }
+
+// Time accounting. Durations arrive as exact millisecond rationals, like
+// token quantities; formatting to a number happens only here.
+export function usageMillis(value) {
+  const r = rational(value);
+  return r ? Number(r[0]) / Number(r[1]) : null;
+}
+export function formatUsageDuration(value) {
+  const ms = usageMillis(value);
+  if (ms === null) return "unavailable";
+  if (ms === 0) return "0s";
+  if (ms < 1000) return `${Math.round(ms)}ms`;
+  let seconds = Math.round(ms / 1000);
+  const hours = Math.floor(seconds / 3600),
+    minutes = Math.floor((seconds % 3600) / 60);
+  seconds %= 60;
+  if (hours) return `${hours}h ${minutes}m`;
+  return minutes ? `${minutes}m ${seconds}s` : `${seconds}s`;
+}
+const share = (part, whole) =>
+  `${whole > 0 ? ((part / whole) * 100).toFixed(1) : "0.0"}%`;
+// Wall time and where it went. The shares are of the agents' time in the
+// item's window: model, tool, waiting and, when present, unmeasured.
+export function usageTimeSummary(time) {
+  if (!time) return "Time not measured";
+  const model = usageMillis(time.modelMs) || 0,
+    tool = usageMillis(time.toolMs) || 0,
+    waiting = usageMillis(time.waitingMs) || 0,
+    unmeasured = usageMillis(time.unmeasuredMs) || 0,
+    whole = model + tool + waiting + unmeasured,
+    polls = time.polls || 0;
+  return `Wall time ${formatUsageDuration(time.wallMs)} · model ${share(model, whole)} · tool ${share(tool, whole)} · waiting ${share(waiting, whole)}${unmeasured ? ` · unmeasured ${share(unmeasured, whole)}` : ""} · ${polls} poll ${polls === 1 ? "request" : "requests"}${polls ? ` (${formatUsageDuration(time.pollMs)})` : ""}`;
+}
+export function usageTimeline(time) {
+  const line = time?.timeline;
+  if (!line) return "";
+  const wall = usageMillis(time.wallMs) || 0,
+    unmeasured = usageMillis(line.unmeasuredMs) || 0;
+  return `Team timeline: some model working ${share(usageMillis(line.modelMs) || 0, wall)} · only tools running ${share(usageMillis(line.toolsOnlyMs) || 0, wall)} · nobody active ${share(usageMillis(line.idleMs) || 0, wall)}${unmeasured ? ` · unmeasured ${share(unmeasured, wall)}` : ""}`;
+}
+export function usageTimeSplit(row) {
+  if (!row) return "";
+  return `Time: model ${formatUsageDuration(row.modelMs)} · tool ${formatUsageDuration(row.toolMs)} · waiting ${formatUsageDuration(row.waitingMs)}`;
+}
+// One wait: what was awaited (with its Board message number), how long,
+// and which agents waited.
+export function usageWait(wait = {}) {
+  return {
+    cause: `Waiting on ${wait.cause || "unknown"}`,
+    target: wait.messageSeq
+      ? `${wait.subject || "Board message"} #${wait.messageSeq}`
+      : "Nothing the Board shows",
+    detail: `${formatUsageDuration(wait.ms)}${wait.awaitedBy ? ` · ${wait.awaitedBy}` : ""}`,
+  };
+}
