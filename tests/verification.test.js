@@ -39,6 +39,13 @@ import {
 } from "../scripts/verify-matrix.mjs";
 // Named separately so the red tests load on a runner that lacks these exports.
 import * as matrixRunner from "../scripts/verify-matrix.mjs";
+import { acquireHostLock, readHostState, readJournal } from "../scripts/verify-matrix-host-lock.mjs";
+// Every run in this file, in process or through the CLI, takes its host lock
+// in a private directory and never the host's own lock file.
+const hostLockDirectory = mkdtempSync(join(tmpdir(), "matrix-host-lock-"));
+process.env.TAILTERM_MATRIX_HOST_LOCK = join(hostLockDirectory, "host.json");
+delete process.env.TAILTERM_MATRIX_PRIORITY;
+process.on("exit", () => rmSync(hostLockDirectory, { recursive: true, force: true }));
 const makePlan = (context, cwd) =>
   rawMakePlan(
     {
@@ -763,7 +770,7 @@ test("test binary build failure starts no matrix check", async (t) => {
   process.env.TMPDIR = homeParent;
   try {
     await assert.rejects(() => runPlan(plan, f.cwd, output), /ENOENT.*hub|no such file.*hub/i);
-    assert.deepEqual(readdirSync(output), []);
+    assert.deepEqual(readdirSync(output).sort(), ["host-lock.json", "host-lock.log"]);
     assert.deepEqual(readdirSync(homeParent), [], "failed binary preparation removed its runner home");
   } finally {
     if (previousTmpdir === undefined) delete process.env.TMPDIR;
@@ -1688,4 +1695,273 @@ test("approved goTestFlags reach only go-test and go-race, and only as a timeout
       () => selectChecks({ ...matrix, goTestFlags: flags }, ["hub/cmd/tt/main.go"], []),
       /Invalid matrix goTestFlags/,
     );
+});
+
+// Host lock and waitlist (wi_6b4af2fb034ec36e, order #18569). V1-V6 of the plan.
+const HOST_KEYS = [
+  "VERIFICATION_HOST_LOCK",
+  "VERIFICATION_HOST_PRIORITY",
+  "VERIFICATION_HOST_PRIORITY_SOURCE",
+  "VERIFICATION_HOST_WAIT_MS",
+  "VERIFICATION_HOST_QUEUE_POSITION",
+  "VERIFICATION_HOST_QUEUE_LENGTH",
+  "VERIFICATION_HOST_GRANTS_BEFORE_START",
+  "VERIFICATION_HOST_OVERTAKEN_BY",
+  "VERIFICATION_HOST_OVERLAP",
+  "VERIFICATION_CHECK_SET",
+  "VERIFICATION_RUN_DURATION_MS",
+  "VERIFICATION_HOST_LOAD",
+];
+const hostLockFile = () => process.env.TAILTERM_MATRIX_HOST_LOCK;
+const matrixScript = new URL("../scripts/verify-matrix.mjs", import.meta.url).pathname;
+const sleepingCheck = (ms) => `await new Promise((resolve)=>setTimeout(resolve,${ms}));`;
+async function untilHost(condition, what) {
+  const deadline = Date.now() + 20000;
+  for (;;) {
+    const value = condition();
+    if (value) return value;
+    if (Date.now() > deadline) assert.fail("timed out waiting for " + what);
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+}
+function matrixCLI(t, f, args, environment = {}) {
+  const child = spawn(process.execPath, [matrixScript, ...args], {
+    cwd: f.cwd,
+    env: { ...process.env, ...environment },
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  child.text = "";
+  child.stdout.on("data", (data) => (child.text += data));
+  child.stderr.on("data", (data) => (child.text += data));
+  t.after(() => {
+    if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+  });
+  return child;
+}
+function plannedFixture(t, source) {
+  const f = fixture(t),
+    plan = commandPlan(f, source),
+    planFile = join(tempDir(t, "verification-host-plan-"), "plan.json");
+  writeFileSync(planFile, JSON.stringify(plan));
+  return { f, plan, planFile };
+}
+const holdHost = (item) =>
+  acquireHostLock({ item, agent: "holder", runTimeoutMs: 60000, pollMs: 20 });
+
+test("V1 an uncontended run records the twelve host keys in its receipt, matching the sidecar, inside the receipt schema", async (t) => {
+  assert(hostLockFile().startsWith(tmpdir() + "/") || hostLockFile().startsWith("/private" + tmpdir() + "/"));
+  const f = fixture(t),
+    plan = commandPlan(f, sleepingCheck(300)),
+    output = tempDir(t, "verification-host-logs-");
+  const started = Date.now();
+  const receipt = await runPlan(plan, f.cwd, output, { minFreeBytes: 0 });
+  const elapsed = Date.now() - started;
+  const e = receipt.environment;
+  for (const key of HOST_KEYS) assert.equal(typeof e[key], "string", key);
+  assert.equal(HOST_KEYS.length, 12);
+  assert.equal(e.VERIFICATION_HOST_LOCK, hostLockFile());
+  assert.equal(e.VERIFICATION_HOST_PRIORITY, "normal");
+  assert.equal(e.VERIFICATION_HOST_PRIORITY_SOURCE, "default");
+  assert.equal(e.VERIFICATION_HOST_QUEUE_POSITION, "0");
+  assert.equal(e.VERIFICATION_HOST_QUEUE_LENGTH, "0");
+  assert.equal(e.VERIFICATION_HOST_GRANTS_BEFORE_START, "0");
+  assert.equal(e.VERIFICATION_HOST_OVERTAKEN_BY, "0");
+  assert.equal(e.VERIFICATION_HOST_OVERLAP, "0");
+  assert.equal(e.VERIFICATION_CHECK_SET, "unit");
+  assert.match(e.VERIFICATION_HOST_WAIT_MS, /^\d+$/);
+  assert(Number(e.VERIFICATION_HOST_WAIT_MS) <= elapsed);
+  const duration = Number(e.VERIFICATION_RUN_DURATION_MS);
+  assert(duration >= 300 && duration <= elapsed, `duration ${duration} within 300..${elapsed}`);
+  const loads = e.VERIFICATION_HOST_LOAD.split(",");
+  assert(loads.length >= 2 && loads.length <= 64, "sampled at acquire and at the end");
+  for (const load of loads) assert(/^\d+(\.\d+)?$/.test(load), load);
+  const sidecar = JSON.parse(readFileSync(join(output, "host-lock.json"), "utf8"));
+  assert.deepEqual(
+    {
+      VERIFICATION_HOST_LOCK: sidecar.lockPath,
+      VERIFICATION_HOST_PRIORITY: sidecar.priority,
+      VERIFICATION_HOST_PRIORITY_SOURCE: sidecar.prioritySource,
+      VERIFICATION_HOST_WAIT_MS: String(sidecar.waitMs),
+      VERIFICATION_HOST_QUEUE_POSITION: String(sidecar.queuePosition),
+      VERIFICATION_HOST_QUEUE_LENGTH: String(sidecar.queueLength),
+      VERIFICATION_HOST_GRANTS_BEFORE_START: String(sidecar.grantsBeforeStart),
+      VERIFICATION_HOST_OVERTAKEN_BY: String(sidecar.overtakenBy),
+      VERIFICATION_HOST_OVERLAP: String(sidecar.overlap),
+      VERIFICATION_CHECK_SET: sidecar.checkSet,
+      VERIFICATION_RUN_DURATION_MS: String(sidecar.durationMs),
+      VERIFICATION_HOST_LOAD: sidecar.loadSamples.map((s) => String(s.load1)).join(","),
+    },
+    Object.fromEntries(HOST_KEYS.map((key) => [key, e[key]])),
+  );
+  for (const value of [sidecar.waitMs, sidecar.queuePosition, sidecar.durationMs, sidecar.cpuCount])
+    assert.equal(typeof value, "number");
+  assert.equal(sidecar.kind, "run");
+  assert.equal(sidecar.outcome, "released");
+  assert.equal(sidecar.pid, process.pid);
+  assert(Date.parse(sidecar.releasedAt) >= Date.parse(sidecar.acquiredAt));
+  const schema = JSON.parse(
+    readFileSync(new URL("../verification/receipt.schema.json", import.meta.url)),
+  );
+  const saved = JSON.parse(readFileSync(join(output, "receipt.json"), "utf8"));
+  assert.deepEqual(saved, JSON.parse(JSON.stringify(receipt)));
+  for (const key of Object.keys(saved)) assert(key in schema.properties, "top-level " + key);
+  for (const check of saved.checks)
+    for (const key of Object.keys(check))
+      assert(key in schema.properties.checks.items.properties, "check " + key);
+  assert.equal(readHostState(hostLockFile()).holder, null, "released after the run");
+});
+
+test("V2 a CLI run with no flags, as the deployer calls it, waits visibly behind a holder and then runs at normal", async (t) => {
+  const { f, planFile } = plannedFixture(t, "console.log('ran');"),
+    output = tempDir(t, "verification-host-logs-");
+  const holder = await holdHost("wi_v2_holder");
+  const child = matrixCLI(t, f, ["run", planFile, output]);
+  const line = `matrix host: waiting 1 of 1, holder wi_v2_holder/holder/pid ${process.pid}\n`;
+  await untilHost(() => child.text.includes(line), "the waiting line; saw " + child.text);
+  assert(!existsSync(join(output, "receipt.json")), "no check ran while waiting");
+  const waiter = readHostState(hostLockFile()).waiters[0];
+  assert.deepEqual([waiter.kind, waiter.priority, waiter.prioritySource, waiter.pid], ["run", "normal", "default", child.pid]);
+  await holder.release();
+  const [code] = await once(child, "close");
+  assert.equal(code, 0, child.text);
+  assert.match(child.text, /matrix host: acquired after \d+ ms\n/);
+  const e = JSON.parse(readFileSync(join(output, "receipt.json"), "utf8")).environment;
+  assert.equal(e.VERIFICATION_HOST_PRIORITY, "normal");
+  assert.equal(e.VERIFICATION_HOST_PRIORITY_SOURCE, "default");
+  assert.equal(e.VERIFICATION_HOST_QUEUE_POSITION, "1");
+  assert.equal(e.VERIFICATION_HOST_QUEUE_LENGTH, "1");
+  assert(Number(e.VERIFICATION_HOST_WAIT_MS) > 0);
+  assert(readFileSync(join(output, "host-lock.log"), "utf8").includes(line.trim()));
+});
+
+test("V3 SIGTERM while a CLI run waits leaves the list, exits 143, and records the wait without a receipt", async (t) => {
+  const { f, planFile } = plannedFixture(t, "console.log('ran');"),
+    output = tempDir(t, "verification-host-logs-");
+  const holder = await holdHost("wi_v3_holder");
+  try {
+    const child = matrixCLI(t, f, ["run", planFile, output]);
+    const line = `matrix host: waiting 1 of 1, holder wi_v3_holder/holder/pid ${process.pid}`;
+    await untilHost(() => child.text.includes(line), "the waiting line; saw " + child.text);
+    const waiter = readHostState(hostLockFile()).waiters[0];
+    child.kill("SIGTERM");
+    const [code] = await once(child, "close");
+    assert.equal(code, 143, child.text);
+    assert(!existsSync(join(output, "receipt.json")), "no receipt");
+    const state = readHostState(hostLockFile());
+    assert.deepEqual(state.waiters, [], "the waiter left the list");
+    assert.equal(state.holder.id, holder.id, "the holder was not disturbed");
+    const log = readFileSync(join(output, "host-lock.log"), "utf8");
+    assert.match(log, new RegExp("^\\S+Z " + line.replace(/[/]/g, "\\/") + "$", "m"));
+    const sidecar = JSON.parse(readFileSync(join(output, "host-lock.json"), "utf8"));
+    assert.equal(sidecar.id, waiter.id);
+    assert.equal(sidecar.outcome, "withdrawn");
+    assert.equal(sidecar.acquiredAt, null);
+    assert.equal(sidecar.queuePosition, 1);
+    assert(sidecar.waitMs > 0);
+    const withdrawn = readJournal(hostLockFile()).filter((entry) => entry.id === waiter.id).map((entry) => [entry.event, entry.waitMs, entry.reason, entry.removed]);
+    assert.deepEqual(withdrawn, [["request", undefined, undefined, undefined], ["withdrawn", sidecar.waitMs, "SIGTERM", true]]);
+  } finally {
+    await holder.release();
+  }
+});
+
+test("V4 priority comes from the flag, then the environment, then normal, and bad values are refused before joining", (t) => {
+  const { f, plan, planFile } = plannedFixture(t, "console.log('ran');");
+  const planBytes = readFileSync(planFile, "utf8");
+  for (const key of Object.keys(plan)) assert.doesNotMatch(key, /priority/i, "the plan gains no priority field");
+  const run = (flags, environment = {}) => {
+    const output = tempDir(t, "verification-host-logs-");
+    const result = spawnSync(process.execPath, [matrixScript, "run", planFile, output, "--min-free-bytes", "0", ...flags], {
+      cwd: f.cwd,
+      env: { ...process.env, ...environment },
+      encoding: "utf8",
+    });
+    return { ...result, output };
+  };
+  const recorded = (result) => {
+    assert.equal(result.status, 0, result.stderr);
+    const e = JSON.parse(readFileSync(join(result.output, "receipt.json"), "utf8")).environment;
+    return [e.VERIFICATION_HOST_PRIORITY, e.VERIFICATION_HOST_PRIORITY_SOURCE];
+  };
+  assert.deepEqual(recorded(run([])), ["normal", "default"]);
+  assert.deepEqual(recorded(run([], { TAILTERM_MATRIX_PRIORITY: "high" })), ["high", "environment"]);
+  assert.deepEqual(recorded(run(["--priority", "urgent"], { TAILTERM_MATRIX_PRIORITY: "high" })), ["urgent", "flag"]);
+  assert.deepEqual(recorded(run(["--priority", "high", "--host-wait-minutes", "5", "--item", "wi_named"])), ["high", "flag"]);
+  assert.equal(readJournal(hostLockFile()).at(-1).item, "wi_named", "--item names a run whose plan has no item");
+  const requests = readHostState(hostLockFile()).requestSeq;
+  for (const [flags, environment, message] of [
+    [["--priority", "soon"], {}, /--priority must be urgent, high or normal/],
+    [["--priority"], {}, /--priority must be urgent, high or normal/],
+    [[], { TAILTERM_MATRIX_PRIORITY: "asap" }, /TAILTERM_MATRIX_PRIORITY must be urgent, high or normal/],
+    [["--host-wait-minutes", "0"], {}, /--host-wait-minutes requires a whole number of minutes from 1 to 1440/],
+    [["--host-wait-minutes", "1441"], {}, /--host-wait-minutes requires/],
+    [["--host-wait-minutes"], {}, /--host-wait-minutes requires/],
+  ]) {
+    const result = run(flags, environment);
+    assert.equal(result.status, 1, flags.join(" "));
+    assert.match(result.stderr, message);
+    assert.deepEqual(readdirSync(result.output), [], "refused before any record");
+  }
+  assert.equal(readHostState(hostLockFile()).requestSeq, requests, "no refused run joined the list");
+  assert.equal(readFileSync(planFile, "utf8"), planBytes);
+});
+
+test("V5 a check sees none of the host lock keys in its environment", async (t) => {
+  const f = fixture(t),
+    plan = commandPlan(f, "console.log('ENV '+JSON.stringify(Object.keys(process.env)));"),
+    output = tempDir(t, "verification-host-logs-");
+  const receipt = await runPlan(plan, f.cwd, output, { minFreeBytes: 0, hostLock: { priority: "high", prioritySource: "flag" } });
+  assert.equal(receipt.environment.VERIFICATION_HOST_PRIORITY, "high");
+  const seen = JSON.parse(
+    readFileSync(receipt.checks[0].logURI, "utf8").split("\n").find((line) => line.startsWith("ENV ")).slice(4),
+  );
+  assert(seen.includes("HOME") && seen.includes("VERIFICATION_JOBS"), "the check printed its environment");
+  for (const key of [...HOST_KEYS, "TAILTERM_MATRIX_HOST_LOCK", "TAILTERM_MATRIX_PRIORITY"])
+    assert(!seen.includes(key), key + " reached a check");
+});
+
+test("V6 receipts record position, grants and overtakes after an urgent run goes ahead of a normal one", async (t) => {
+  const { f, planFile } = plannedFixture(t, sleepingCheck(400));
+  const outputA = tempDir(t, "verification-host-a-"),
+    outputB = tempDir(t, "verification-host-b-");
+  const holder = await holdHost("wi_v6_holder");
+  const waiting = () => readHostState(hostLockFile()).waiters.map((w) => w.pid);
+  const a = matrixCLI(t, f, ["run", planFile, outputA, "--min-free-bytes", "0"]);
+  await untilHost(() => waiting().includes(a.pid), "A to queue");
+  const b = matrixCLI(t, f, ["run", planFile, outputB, "--min-free-bytes", "0", "--priority", "urgent"]);
+  await untilHost(() => waiting().length === 2, "B to queue");
+  assert.deepEqual(waiting(), [b.pid, a.pid], "the urgent run is listed first");
+  await untilHost(() => a.text.includes("matrix host: waiting 2 of 2, holder wi_v6_holder/"), "A to print its new position");
+  await holder.release();
+  const [[codeA], [codeB]] = await Promise.all([once(a, "close"), once(b, "close")]);
+  assert.equal(codeA, 0, a.text);
+  assert.equal(codeB, 0, b.text);
+  const environment = (output) => JSON.parse(readFileSync(join(output, "receipt.json"), "utf8")).environment;
+  const ea = environment(outputA),
+    eb = environment(outputB);
+  const values = (e) => [
+    e.VERIFICATION_HOST_PRIORITY,
+    e.VERIFICATION_HOST_QUEUE_POSITION,
+    e.VERIFICATION_HOST_QUEUE_LENGTH,
+    e.VERIFICATION_HOST_GRANTS_BEFORE_START,
+    e.VERIFICATION_HOST_OVERTAKEN_BY,
+    e.VERIFICATION_HOST_OVERLAP,
+  ];
+  assert.deepEqual(values(eb), ["urgent", "1", "2", "0", "0", "0"]);
+  assert.deepEqual(values(ea), ["normal", "1", "1", "1", "1", "0"]);
+  assert(Number(eb.VERIFICATION_RUN_DURATION_MS) >= 400);
+  assert(
+    Number(ea.VERIFICATION_HOST_WAIT_MS) >= Number(eb.VERIFICATION_RUN_DURATION_MS),
+    `A waited ${ea.VERIFICATION_HOST_WAIT_MS} ms, at least B's ${eb.VERIFICATION_RUN_DURATION_MS} ms`,
+  );
+
+  const go = { id: "go-test", cwd: "hub", environment: {} },
+    browser = { id: "tests/a-browser.mjs:chromium", cwd: ".", environment: { TEST_BROWSER: "chromium" } },
+    unit = { id: "npm-unit", cwd: ".", environment: {} };
+  assert.equal(matrixRunner.checkSet([go, { ...go, id: "go-vet" }]), "go-only");
+  assert.equal(matrixRunner.checkSet([go, browser, unit]), "full");
+  assert.equal(matrixRunner.checkSet([browser, unit]), "browser");
+  assert.equal(matrixRunner.checkSet([{ ...unit, id: "tests/static-browser.mjs" }]), "browser");
+  assert.equal(matrixRunner.checkSet([unit]), "unit");
+  assert.equal(matrixRunner.checkSet([go, unit]), "unit");
 });

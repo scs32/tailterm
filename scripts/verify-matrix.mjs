@@ -24,6 +24,13 @@ import { createHash } from "node:crypto";
 import { execFileSync, spawn, spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { buildHistoricalHub, buildMatrixBinaries, fileHash } from "../tests/test-binaries.mjs";
+import {
+  acquireHostLock,
+  resolvePriority,
+  receiptKeys,
+  minutesFlag,
+  DEFAULT_HOST_WAIT_MS,
+} from "./verify-matrix-host-lock.mjs";
 
 const binarySuites = new Set([
   "profile-sync", "task-form", "lead-replacement", "project-work-items",
@@ -343,7 +350,9 @@ export function occupiedPorts(check) {
     return [{ port, pids: [...new Set(pids)] }];
   });
 }
-export async function runCheck(check, cwd, environment, abortSignal) {
+// onGroup(pgid, running) reports the check's process group as it starts and
+// ends, so the host lock holder can record what is still running.
+export async function runCheck(check, cwd, environment, abortSignal, onGroup) {
   const timeout = Number(check.environment.VERIFICATION_TIMEOUT_MS);
   if (!Number.isSafeInteger(timeout) || timeout <= 0 || timeout > 1800000)
     throw new Error("Invalid approved check timeout");
@@ -470,6 +479,7 @@ export async function runCheck(check, cwd, environment, abortSignal) {
       } catch (error) {
         stderr.push(Buffer.from("verification priority: " + error.message + "\n"));
       }
+    if (child.pid) onGroup?.(child.pid, true);
     abortSignal?.addEventListener("abort", onAbort, { once: true });
     child.stdout.on("data", capture(stdout));
     child.stderr.on("data", capture(stderr));
@@ -484,6 +494,7 @@ export async function runCheck(check, cwd, environment, abortSignal) {
       code = status ?? -1;
       whichSignal = signal || "";
       closed = true;
+      if (child.pid) onGroup?.(child.pid, false);
       finish();
     });
     timer = setTimeout(() => stop("timeout"), timeout);
@@ -862,7 +873,7 @@ export function overlapViolations(checks) {
 }
 
 async function runCheckWithAttempts(check, plan, cwd, output, environment, options) {
-  const { abortSignal, minFreeBytes, getAvailableBytes } = options;
+  const { abortSignal, minFreeBytes, getAvailableBytes, onGroup } = options;
   const attempts = [];
   for (let attempt = 1; attempt <= (plan.maxAttempts || 1); attempt++) {
     if (abortSignal?.aborted)
@@ -875,6 +886,7 @@ async function runCheckWithAttempts(check, plan, cwd, output, environment, optio
       resolve(cwd, check.cwd),
       environment,
       abortSignal,
+      onGroup,
     );
     const log =
       (run.stdout || "") +
@@ -979,9 +991,78 @@ export async function runPlan(plan, cwd, output, options = {}) {
   }));
 }
 
+// What a run exercised, recorded with its host wait and load so later
+// concurrency decisions can compare like with like.
+export function checkSet(checks) {
+  const go = checks.some(isGoCheck),
+    browser = checks.some((c) => c.id.includes("browser") || c.environment?.TEST_BROWSER);
+  if (checks.length && checks.every(isGoCheck)) return "go-only";
+  return go && browser ? "full" : browser ? "browser" : "unit";
+}
+// The run stops itself after every check's timeout times its attempts, plus
+// the test-binary build allowance: the bound the deployer puts on its own
+// in-release run (matrixRunTimeout in scripts/release-runner.mjs).
+export const RUN_BUILD_ALLOWANCE_MS = 1800000;
+export function planRunTimeout(plan) {
+  return plan.checks.reduce(
+    (total, check) =>
+      total + Number(check.environment.VERIFICATION_TIMEOUT_MS) * (plan.maxAttempts || 1),
+    RUN_BUILD_ALLOWANCE_MS,
+  );
+}
+
+// Holds the host lock around one run: waits its turn on the ordered waitlist,
+// re-checks the candidate, runs, and releases after the home is cleaned up.
+// options.hostLock carries the priority, wait bound and test overrides.
+async function executePlan(plan, cwd, output, options, receiptName, makeReceipt) {
+  if (!isAbsolute(output) || relative(cwd, output).split("/")[0] !== "..")
+    throw new Error("Logs/receipt must be outside worktree");
+  mkdirSync(output, { recursive: true });
+  const hostLock = options.hostLock || {};
+  const lease = await acquireHostLock({
+    runTimeoutMs: planRunTimeout(plan),
+    ...hostLock,
+    kind: plan.targeted ? "targeted" : "run",
+    item: plan.itemId || hostLock.item || "unknown",
+    agent: process.env.TAILTERM_AGENT_NAME || plan.verifierAgentId || "unknown",
+    commit: plan.commit,
+    output,
+    recordDirectory: output,
+    signal: options.abortSignal,
+  });
+  try {
+    checkClean(cwd, plan.commit);
+    return await executeHeldPlan(
+      plan,
+      cwd,
+      output,
+      {
+        ...options,
+        abortSignal: options.abortSignal
+          ? AbortSignal.any([options.abortSignal, lease.signal])
+          : lease.signal,
+        onGroup: (pgid, running) =>
+          running ? lease.addGroup(pgid) : lease.removeGroup(pgid),
+      },
+      receiptName,
+      // Host keys go only in the receipt's copy; checks never see them.
+      (run) =>
+        makeReceipt({
+          ...run,
+          environment: {
+            ...run.environment,
+            ...receiptKeys(lease.finish({ checkSet: checkSet(plan.checks) })),
+          },
+        }),
+    );
+  } finally {
+    await lease.release({ checkSet: checkSet(plan.checks) });
+  }
+}
+
 // Runs a validated plan in a fresh verifier home and writes receiptName only
 // when every check ran to completion on the unchanged clean candidate.
-async function executePlan(plan, cwd, output, options, receiptName, makeReceipt) {
+async function executeHeldPlan(plan, cwd, output, options, receiptName, makeReceipt) {
   const {
     keepHome = false,
     minFreeBytes = DEFAULT_MIN_FREE_BYTES,
@@ -990,9 +1071,8 @@ async function executePlan(plan, cwd, output, options, receiptName, makeReceipt)
     removeHome = removeVerifierHome,
     stopHomeProcesses = stopVerifierHomeProcesses,
     jobs = defaultJobs(),
+    onGroup,
   } = options;
-  if (!isAbsolute(output) || relative(cwd, output).split("/")[0] !== "..")
-    throw new Error("Logs/receipt must be outside worktree");
   requireFreeSpace(minFreeBytes, getAvailableBytes);
   const home = mkdtempSync(join(tmpdir(), "tailterm-verifier-"));
   const receiptPath = join(output, receiptName);
@@ -1068,6 +1148,7 @@ async function executePlan(plan, cwd, output, options, receiptName, makeReceipt)
           abortSignal: signal,
           minFreeBytes,
           getAvailableBytes,
+          onGroup,
         }),
     );
     if (abortSignal?.aborted)
@@ -1219,8 +1300,16 @@ if (
       let keepHome = false;
       let minFreeBytes = DEFAULT_MIN_FREE_BYTES;
       let jobs = defaultJobs();
+      let priority, item;
+      let maxWaitMs = DEFAULT_HOST_WAIT_MS;
       for (let i = 0; i < flags.length; i++) {
         if (flags[i] === "--keep-home") keepHome = true;
+        else if (flags[i] === "--priority") priority = flags[++i] ?? "";
+        else if (flags[i] === "--item") {
+          item = flags[++i];
+          if (!item) throw new Error("--item requires an item ID");
+        } else if (flags[i] === "--host-wait-minutes")
+          maxWaitMs = minutesFlag("--host-wait-minutes", flags[++i], 1440);
         else if (flags[i] === "--jobs") {
           const value = flags[++i];
           if (!/^[1-9][0-9]?$/.test(value || ""))
@@ -1244,7 +1333,18 @@ if (
         input,
         process.cwd(),
         resolve(output),
-        { keepHome, minFreeBytes, jobs, abortSignal: interruption.signal },
+        {
+          keepHome,
+          minFreeBytes,
+          jobs,
+          abortSignal: interruption.signal,
+          hostLock: {
+            ...resolvePriority(priority),
+            maxWaitMs,
+            item,
+            print: (line) => console.log(line),
+          },
+        },
       );
       await new Promise((resolve) => setImmediate(resolve));
       if (interruptedBy)
@@ -1264,11 +1364,11 @@ if (
           : 1;
     } else
       throw new Error(
-        "Usage: node scripts/verify-matrix.mjs plan|run|targeted INPUT OUTPUT [--keep-home] [--min-free-bytes N] [--jobs N]",
+        "Usage: node scripts/verify-matrix.mjs plan|run|targeted INPUT OUTPUT [--keep-home] [--min-free-bytes N] [--jobs N] [--priority urgent|high|normal] [--host-wait-minutes N] [--item ID]",
       );
   } catch (e) {
     console.error(e.message);
     process.exitCode =
-      interruptedBy === "SIGINT" ? 130 : interruptedBy === "SIGTERM" ? 143 : 1;
+      interruptedBy === "SIGINT" ? 130 : interruptedBy === "SIGTERM" ? 143 : (e.exitCode ?? 1);
   }
 }

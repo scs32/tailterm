@@ -245,6 +245,200 @@ fast-forward of the recorded base". Items without a plan keep the queue entry's
 base. The team rebases onto the current tasks-hub tip before the handler freezes
 the final plan, so the verified commit is exactly what merges.
 
+## Host lock and waitlist
+
+Feature `wi_6b4af2fb034ec36e`, order #18569 (phase 1). One host runs one
+verification at a time. Every `verify-matrix.mjs run` and `targeted`, and every
+supplemental run started through the `exec` wrapper below, takes one host lock
+before it starts and releases it when it ends. A run that finds the lock held
+joins an ordered waitlist. Nobody checks `ps` or waits for a quiet period any
+more: the lock file is the only thing a waiting run reads.
+
+**Order.** Urgent first, then high, then everything else, and first come first
+served within a priority. Arrival order is a sequence number assigned when the
+request joins, so two requests with the same timestamp keep their order. A run
+that holds the lock is never interrupted for a more urgent one.
+
+**Priority.** `--priority urgent|high|normal` on `run`, `targeted` and `exec`.
+Without the flag, `TAILTERM_MATRIX_PRIORITY` with the same values. Without
+either, `normal` (owner answer #18706). Any other value is refused before the
+run joins the list. Priority is self-declared and is not a plan field; the lock
+file, journal, sidecar and receipt record it with its source (`flag`,
+`environment` or `default`). Use the priority of the work item being verified.
+
+**Files.** The lock and waitlist are one file,
+`~/.local/state/tailterm-matrix/host.json`. Set `TAILTERM_MATRIX_HOST_LOCK` to
+an absolute path to use another (tests do). The directory is mode 0700 and the
+files 0600. Beside it are `host.journal.jsonl` (append-only history),
+`host.json.lock` (a short-lived mutex for updates) and
+`host.json.lock.reclaim` (a guard used while recovering a dead owner's mutex).
+
+```json
+{
+  "version": 1,
+  "host": "Stephens-Mini",
+  "updatedAt": "2026-10-01T10:00:00.000Z",
+  "requestSeq": 41,
+  "grantSeq": 37,
+  "holder": {
+    "id": "…", "seq": 38, "pid": 4242, "kind": "run",
+    "item": "wi_…", "agent": "verifier-…",
+    "priority": "high", "prioritySource": "flag",
+    "requestedAt": "…", "startedAt": "…", "runTimeoutMs": 5400000,
+    "groups": [4250, 4263], "commit": "…", "output": "/abs/logs"
+  },
+  "waiters": [
+    { "id": "…", "seq": 40, "pid": 4300, "kind": "targeted", "item": "…",
+      "agent": "…", "priority": "normal", "prioritySource": "default",
+      "requestedAt": "…", "grantSeqAtRequest": 37, "overtakenBy": 1,
+      "runTimeoutMs": 2400000, "commit": "…", "output": "…" }
+  ]
+}
+```
+
+`holder` is `null` when the host is free. `waiters` is stored in the order the
+runs will be granted, so a waiter's position is its index plus one. `kind` is
+`run`, `targeted` or `exec`. `groups` lists the process groups of the holder's
+checks that are running now. `item` is the plan's `itemId`, else `--item ID`,
+else `unknown`; `agent` is `TAILTERM_AGENT_NAME`, else the plan's
+`verifierAgentId`, else `unknown`. Updates land by rename, so the file can be
+read at any time without taking anything.
+
+**Reading the waitlist.**
+
+```sh
+node scripts/verify-matrix-host-lock.mjs status          # path, holder, live groups, ordered waiters
+node scripts/verify-matrix-host-lock.mjs status --json   # the same file content with its path
+```
+
+A waiting run prints, and appends with a timestamp to `host-lock.log` in its
+output directory, when it joins, whenever its position or the holder changes,
+and at least once a minute:
+
+```text
+matrix host: waiting 2 of 3, holder wi_…/verifier-…/pid 4242
+matrix host: waiting 1 of 1, holder wi_…/verifier-…/pid 4242 gone, check group 4250 still running
+matrix host: acquired after 184213 ms
+```
+
+**Wait bound.** `--host-wait-minutes N` (1–1440, default 240). At the bound the
+run leaves the list, writes no receipt, names its position and the holder, and
+exits 75. SIGINT or SIGTERM while waiting also leaves the list, with the usual
+exit 130 or 143.
+
+**When the lock moves on.** A waiter is granted the lock when it is first in
+the list and either there is no holder, or the holder's process and every
+check group it recorded are gone. The second case is journaled as
+`stale-recovered` with reason `pid-gone`. A killed runner whose checks are
+still running therefore keeps the lock until they end.
+
+Each holder also stops itself. Its run timeout is every planned check's timeout
+times the attempt limit plus a 30-minute build allowance (the bound the
+deployer already puts on its in-release run); for `exec` it is
+`--timeout-minutes`. At that time the holder aborts through the normal
+interruption path: checks are stopped, the home is removed, no receipt is
+written, the lock is released and `run-timeout-abort` is journaled. A
+preparatory test-binary build blocks the runner, so the stop happens when that
+build returns.
+
+One exception allows two runs at once. If a holder is still alive 120 seconds
+after its run timeout, the first waiter takes the lock anyway. This is printed
+as a warning, journaled as `overlap` with the process and groups that were
+still alive, and recorded in the new run's sidecar and receipt
+(`VERIFICATION_HOST_OVERLAP=1`). No run ever signals another run.
+
+A waiter whose process is gone is dropped (`waiter-dropped`). The journal
+events are `request`, `acquire`, `release`, `withdrawn`, `wait-expired`,
+`run-timeout-abort`, `stale-recovered`, `overlap`, `waiter-dropped`,
+`mutex-recovered`, `guard-stale`, `corrupt-file` and `holder-update-failed`.
+Each line has the time, the request id, pid, item and agent. The journal is
+not rotated yet.
+
+**Cases that stop and need an operator.**
+
+- `host.json` is unreadable, not JSON or not version 1: every request refuses
+  with the file named and exits 78, journals `corrupt-file`, and leaves the
+  file untouched. Read the file and `status`, confirm no verification is
+  running, then move the file aside (`mv host.json host.json.bad`). A holder
+  that meets this when it releases prints a warning; its receipt stands.
+- `host.json.lock.reclaim` was left by a process that died while recovering a
+  mutex: requests refuse with that file named (exit 78, `guard-stale`).
+  Confirm no verification is running, then remove that file.
+- A mutex whose owner is alive is never taken away, however long it is held.
+  Waiters print `matrix host: lock file busy, mutex owner pid N` once a minute
+  inside their wait bound. A holder that cannot update the file for 30 seconds
+  stops its run. A mutex whose owner is gone is removed by exactly one process
+  (`mutex-recovered`).
+
+**What a run records.** The receipt's `environment` gains twelve string keys.
+They are added to the receipt only; checks do not see them.
+
+| Key | Value |
+|---|---|
+| `VERIFICATION_HOST_LOCK` | lock file path |
+| `VERIFICATION_HOST_PRIORITY` | `urgent`, `high` or `normal` |
+| `VERIFICATION_HOST_PRIORITY_SOURCE` | `flag`, `environment` or `default` |
+| `VERIFICATION_HOST_WAIT_MS` | request to acquire |
+| `VERIFICATION_HOST_QUEUE_POSITION` | position when queued; `0` when acquired at once |
+| `VERIFICATION_HOST_QUEUE_LENGTH` | waitlist length when queued, this run included; `0` when acquired at once |
+| `VERIFICATION_HOST_GRANTS_BEFORE_START` | runs granted between queueing and this run's start |
+| `VERIFICATION_HOST_OVERTAKEN_BY` | of those, runs that queued later |
+| `VERIFICATION_HOST_OVERLAP` | `1` when the lock was taken by the timeout exception, else `0` |
+| `VERIFICATION_CHECK_SET` | `go-only`, `full` (Go and browser checks), `browser` or `unit` |
+| `VERIFICATION_RUN_DURATION_MS` | acquire to receipt creation |
+| `VERIFICATION_HOST_LOAD` | 1-minute load averages at acquire, every 60 s and at the end; newest 64 |
+
+`host-lock.json` in the output directory holds the same values as numbers,
+with the request id, sequence, pid, item, agent, request, acquire and release
+times, CPU count, timestamped 1- and 5-minute load samples and any recovery or
+overlap details. It is written on every release, including failed, interrupted
+and withdrawn runs, so the output directory always contains `host-lock.json`
+and `host-lock.log`. The hub does not import these keys or the sidecar in this
+phase; they are data for deciding later whether small runs can share the host.
+
+**Supplemental runs.** Run a race suite or any other "run alone" command
+through the wrapper so it joins the same list:
+
+```sh
+node scripts/verify-matrix-host-lock.mjs exec --item ITEM --timeout-minutes N --record /absolute/dir \
+  [--priority urgent|high|normal] [--agent NAME] [--host-wait-minutes N] -- COMMAND [ARGS…]
+```
+
+It prints the same waiting lines, runs the command in its own process group
+(recorded in `groups`), forwards SIGINT and SIGTERM to that group, stops the
+command at `--timeout-minutes` (exit 124), and otherwise exits with the
+command's own code. It writes `host-lock.json` (check set `supplemental`, plus
+the argv and exit code) and `host-lock.log` to the record directory.
+
+**The deployer.** The release runner is unchanged in this phase. Its in-release
+`node scripts/verify-matrix.mjs run PLAN DIR` passes no priority, so it joins
+the same list at `normal` with source `default` until phase 2
+(`wi_c5cb667695c3614c`) gives it an explicit priority. Two effects follow:
+
+- Its existing process-count gate also counts verifier runs that are only
+  waiting, so it starts when no verifier is running or waiting and can reach
+  its two-hour "Host busy" bound sooner.
+- If a verifier joins between that gate and the lock request, the deployer's
+  run waits behind it, and that wait spends the deployer's own command timeout.
+  When the timeout ends the wait, the run receives SIGTERM, leaves the list and
+  writes no receipt, and the release job fails with a command `timeout` reason
+  rather than "Host busy".
+
+The deployer captures its run's output, so the waiting lines are not on its
+terminal. To see where a slow release stands, read `status` (the deployer's run
+is listed with its position and the holder), then
+`<job journal>/<job>-integrated-verification/<commit>-rN/host-lock.log` for the
+timestamped waiting lines, and `host-lock.json` there and `host.journal.jsonl`
+for `request` and `withdrawn` with the wait time.
+
+**Limits.** A runner in a checkout older than this change takes no lock until
+it is rebased. Builders' ad hoc test runs take no lock. A process or group id
+reused by an unrelated process makes a dead run look alive; that only delays
+the next run, up to the run timeout plus grace. There is a short window
+between a check starting and its group reaching the file, and the children of
+a preparatory test-binary build are not recorded, so a runner killed during
+that build is recovered while a build child may still be running.
+
 ## AIV mapping boundary
 
 `verification/receipt.schema.json` documents native v1. `operationKey` survives

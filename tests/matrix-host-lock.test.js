@@ -1,0 +1,726 @@
+import test from "node:test";
+import assert from "node:assert/strict";
+import {
+  mkdtempSync,
+  mkdirSync,
+  writeFileSync,
+  readFileSync,
+  rmSync,
+  existsSync,
+  statSync,
+} from "node:fs";
+import { tmpdir } from "node:os";
+import { join, dirname } from "node:path";
+import { execFileSync, spawn, spawnSync } from "node:child_process";
+import { once } from "node:events";
+import { fileURLToPath } from "node:url";
+import {
+  acquireHostLock,
+  execWithHostLock,
+  lockPath,
+  lockPaths,
+  readHostState,
+  readJournal,
+  resolvePriority,
+  statusText,
+  pidGone,
+  groupGone,
+  EXIT_WAIT_EXPIRED,
+  EXIT_LOCK_UNUSABLE,
+} from "../scripts/verify-matrix-host-lock.mjs";
+import { makePlan, runPlan, digest } from "../scripts/verify-matrix.mjs";
+
+// No test here may fall back to the host's own lock file.
+const isolated = mkdtempSync(join(tmpdir(), "matrix-host-lock-default-"));
+process.env.TAILTERM_MATRIX_HOST_LOCK = join(isolated, "host.json");
+delete process.env.TAILTERM_MATRIX_PRIORITY;
+process.on("exit", () => rmSync(isolated, { recursive: true, force: true }));
+
+const moduleFile = fileURLToPath(new URL("../scripts/verify-matrix-host-lock.mjs", import.meta.url));
+const moduleURL = new URL("../scripts/verify-matrix-host-lock.mjs", import.meta.url).href;
+
+function tempDir(t, prefix = "matrix-host-lock-") {
+  const directory = mkdtempSync(join(tmpdir(), prefix));
+  t.after(() => rmSync(directory, { recursive: true, force: true }));
+  return directory;
+}
+const lockFile = (t) => join(tempDir(t), "host.json");
+const request = (path, extra = {}) => ({
+  path,
+  runTimeoutMs: 60000,
+  pollMs: 20,
+  item: "wi_test",
+  agent: "tester",
+  ...extra,
+});
+async function until(condition, what, ms = 15000) {
+  const deadline = Date.now() + ms;
+  for (;;) {
+    const value = condition();
+    if (value) return value;
+    if (Date.now() > deadline) assert.fail("timed out waiting for " + what);
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+}
+const waitersOf = (path) => readHostState(path)?.waiters || [];
+const events = (path) => readJournal(path).map((line) => line.event);
+const RECOVERY = ["stale-recovered", "overlap", "waiter-dropped", "mutex-recovered", "guard-stale", "corrupt-file"];
+function exitedPid() {
+  return spawnSync(process.execPath, ["-e", ""]).pid;
+}
+const kill = (target, signal = "SIGKILL") => {
+  try {
+    process.kill(target, signal);
+  } catch {}
+};
+
+// A real second process using the module. Modes:
+//   hold    acquire, optionally start a detached long-running group and record
+//           it, write the marker, then finish as `after` says
+//   cycle   acquire and release `count` times, logging enter/leave while held
+//   pause   take the file mutex inside an update and stay in it until `go`
+const CHILD = `
+import fs from 'node:fs';
+import { spawn } from 'node:child_process';
+import { acquireHostLock, updateHostState } from ${JSON.stringify(moduleURL)};
+const o = JSON.parse(process.argv[2]);
+const nap = (ms) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+if (o.mode === 'hold') {
+  const lease = await acquireHostLock(o.request);
+  let group = null;
+  if (o.group) {
+    const child = spawn(process.execPath, ['-e', 'setInterval(()=>{},1000)'], { detached: true, stdio: 'ignore' });
+    await new Promise((resolve) => child.on('spawn', resolve));
+    child.unref();
+    group = child.pid;
+    lease.addGroup(group);
+  }
+  fs.writeFileSync(o.marker, JSON.stringify({ pid: process.pid, id: lease.id, group }));
+  if (o.after === 'exit') process.exit(0);
+  if (o.after === 'throw') throw new Error('fixture failure while holding');
+  setInterval(() => {}, 1000);
+} else if (o.mode === 'cycle') {
+  for (let i = 0; i < o.count; i++) {
+    const lease = await acquireHostLock(o.request);
+    fs.appendFileSync(o.log, 'enter ' + process.pid + '\\n');
+    await new Promise((resolve) => setTimeout(resolve, 3));
+    fs.appendFileSync(o.log, 'leave ' + process.pid + '\\n');
+    await lease.release();
+  }
+} else if (o.mode === 'pause') {
+  const result = updateHostState(o.request.path, (state) => {
+    fs.writeFileSync(o.marker, String(process.pid));
+    while (!fs.existsSync(o.go)) nap(10);
+    state.requestSeq += 1000;
+  });
+  process.exit(result.done ? 0 : 9);
+}
+`;
+function childScript(t) {
+  const file = join(tempDir(t, "matrix-host-lock-child-"), "child.mjs");
+  writeFileSync(file, CHILD);
+  return file;
+}
+function startChild(t, script, options) {
+  const child = spawn(process.execPath, [script, JSON.stringify(options)], { stdio: ["ignore", "pipe", "pipe"] });
+  let output = "";
+  child.stdout.on("data", (data) => (output += data));
+  child.stderr.on("data", (data) => (output += data));
+  child.output = () => output;
+  t.after(() => {
+    if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+  });
+  return child;
+}
+async function heldByChild(t, path, { request: extra, ...options } = {}) {
+  const marker = join(tempDir(t), "marker");
+  const child = startChild(t, childScript(t), { mode: "hold", marker, ...options, request: request(path, { item: "wi_child", ...extra }) });
+  await until(() => existsSync(marker), "the child to hold the lock");
+  const info = JSON.parse(readFileSync(marker, "utf8"));
+  if (info.group) t.after(() => kill(-info.group));
+  if (info.group) await until(() => readHostState(path)?.holder?.groups?.includes(info.group), "the group to be on file");
+  return { child, ...info };
+}
+const exited = (child) => (child.exitCode !== null || child.signalCode !== null ? Promise.resolve() : once(child, "close"));
+
+test("a1 a11 the lock path is the documented home path unless the override names another", (t) => {
+  assert.equal(lockPath({ HOME: "/home/someone" }), "/home/someone/.local/state/tailterm-matrix/host.json");
+  assert.equal(lockPath({ HOME: "/home/someone", TAILTERM_MATRIX_HOST_LOCK: "/x/host.json" }), "/x/host.json");
+  assert.throws(() => lockPath({ TAILTERM_MATRIX_HOST_LOCK: "relative/host.json" }), /absolute/);
+  assert(lockPath().startsWith(isolated + "/"), "this test file resolves a path under its temp directory");
+  const home = tempDir(t, "matrix-host-lock-home-");
+  const { TAILTERM_MATRIX_HOST_LOCK, ...environment } = process.env;
+  const text = execFileSync(process.execPath, [moduleFile, "status"], { env: { ...environment, HOME: home }, encoding: "utf8" });
+  assert.match(text, new RegExp("^matrix host lock: " + home + "/\\.local/state/tailterm-matrix/host\\.json\\nholder: none\\nwaiters: none"));
+  assert(!existsSync(join(home, ".local")), "status creates nothing");
+});
+
+test("a1 the lock file is version 1 JSON with the holder, its groups and the waitlist, and status prints the same", async (t) => {
+  const path = lockFile(t),
+    record = tempDir(t);
+  const run = execWithHostLock([process.execPath, "-e", "setTimeout(()=>{},600)"], {
+    ...request(path, { item: "wi_exec", priority: "high", prioritySource: "flag" }),
+    recordDirectory: record,
+    stdio: "ignore",
+    handleSignals: false,
+  });
+  const state = await until(() => {
+    const s = readHostState(path);
+    return s?.holder?.groups?.length ? s : null;
+  }, "the exec holder and its group");
+  const waiting = acquireHostLock(request(path, { item: "wi_waiter" }));
+  await until(() => waitersOf(path).length === 1, "the waiter");
+  const now = JSON.parse(readFileSync(path, "utf8"));
+  assert.equal(now.version, 1);
+  assert.equal(now.holder.kind, "exec");
+  assert.equal(now.holder.item, "wi_exec");
+  assert.equal(now.holder.priority, "high");
+  assert.equal(now.holder.pid, process.pid);
+  assert.deepEqual(now.holder.groups, state.holder.groups);
+  assert(!groupGone(now.holder.groups[0]), "the recorded group is the running command");
+  assert.deepEqual(now.waiters.map((w) => [w.item, w.priority, w.prioritySource]), [["wi_waiter", "normal", "default"]]);
+  assert.equal(statSync(path).mode & 0o777, 0o600);
+  assert.equal(statSync(dirname(path)).mode & 0o777, 0o700);
+  const text = statusText(path);
+  assert.match(text, new RegExp(`holder: wi_exec/tester/pid ${process.pid} \\(exec, high/flag\\).*check groups ${now.holder.groups[0]} \\(alive: ${now.holder.groups[0]}\\)`));
+  assert.match(text, /\n {2}1 of 1: wi_waiter\/tester\/pid \d+ \(run, normal\/default\)/);
+  const json = JSON.parse(execFileSync(process.execPath, [moduleFile, "status", "--json"], { env: { ...process.env, TAILTERM_MATRIX_HOST_LOCK: path }, encoding: "utf8" }));
+  assert.equal(json.path, path);
+  assert.equal(json.state.holder.id, now.holder.id);
+  assert.equal(await run, 0);
+  await (await waiting).release();
+  assert.equal(readHostState(path).holder, null);
+});
+
+test("priority comes from the flag, then the environment variable, then normal", () => {
+  assert.deepEqual(resolvePriority(undefined, {}), { priority: "normal", prioritySource: "default" });
+  assert.deepEqual(resolvePriority(undefined, { TAILTERM_MATRIX_PRIORITY: "high" }), { priority: "high", prioritySource: "environment" });
+  assert.deepEqual(resolvePriority("urgent", { TAILTERM_MATRIX_PRIORITY: "high" }), { priority: "urgent", prioritySource: "flag" });
+  assert.throws(() => resolvePriority("soon", {}), /--priority must be urgent, high or normal/);
+  assert.throws(() => resolvePriority("", {}), /--priority must be/);
+  assert.throws(() => resolvePriority(undefined, { TAILTERM_MATRIX_PRIORITY: "asap" }), /TAILTERM_MATRIX_PRIORITY must be/);
+});
+
+test("L1 behind a holder, requests are granted urgent, then high, then normal, FIFO within a priority", async (t) => {
+  const path = lockFile(t);
+  const holder = await acquireHostLock(request(path, { item: "wi_holder" }));
+  const granted = [],
+    runs = [];
+  for (const [name, priority] of [["normal", "normal"], ["high-1", "high"], ["urgent", "urgent"], ["high-2", "high"]]) {
+    runs.push(
+      acquireHostLock(request(path, { item: name, priority, prioritySource: "flag" })).then(async (lease) => {
+        granted.push(name);
+        assert.equal(readHostState(path).holder.id, lease.id);
+        await lease.release();
+        return lease.record;
+      }),
+    );
+    await until(() => waitersOf(path).some((w) => w.item === name), name + " to join");
+  }
+  assert.deepEqual(waitersOf(path).map((w) => w.item), ["urgent", "high-1", "high-2", "normal"], "the file lists the waitlist in grant order");
+  assert.equal(granted.length, 0, "nobody is granted while the holder runs");
+  await holder.release();
+  const records = await Promise.all(runs);
+  assert.deepEqual(granted, ["urgent", "high-1", "high-2", "normal"]);
+  // normal queued first and watched three later requests go ahead of it.
+  assert.deepEqual(records.map((r) => [r.item, r.queuePosition, r.queueLength, r.grantsBeforeStart, r.overtakenBy]), [
+    ["normal", 1, 1, 3, 3],
+    ["high-1", 1, 2, 1, 1],
+    ["urgent", 1, 3, 0, 0],
+    ["high-2", 3, 4, 2, 0],
+  ]);
+});
+
+test("L2 same-priority requests with one identical timestamp are granted in arrival order", async (t) => {
+  const path = lockFile(t),
+    fixed = Date.parse("2026-10-01T00:00:00.000Z");
+  const now = () => fixed;
+  const holder = await acquireHostLock(request(path, { now }));
+  const granted = [],
+    runs = [];
+  for (const name of ["first", "second", "third"]) {
+    runs.push(
+      acquireHostLock(request(path, { item: name, now })).then(async (lease) => {
+        granted.push(name);
+        await lease.release();
+      }),
+    );
+    await until(() => waitersOf(path).some((w) => w.item === name), name + " to join");
+  }
+  const waiters = waitersOf(path);
+  assert.deepEqual(new Set(waiters.map((w) => w.requestedAt)), new Set(["2026-10-01T00:00:00.000Z"]));
+  assert.deepEqual(waiters.map((w) => w.seq), [2, 3, 4]);
+  await holder.release();
+  await Promise.all(runs);
+  assert.deepEqual(granted, ["first", "second", "third"]);
+});
+
+test("L3 a killed runner whose check group still runs keeps the lock until the group is gone", async (t) => {
+  const path = lockFile(t);
+  const held = await heldByChild(t, path, { group: true });
+  held.child.kill("SIGKILL");
+  await exited(held.child);
+  await until(() => pidGone(held.pid), "the killed runner to be gone");
+  const lines = [];
+  let granted = false;
+  const waiting = acquireHostLock(request(path, { item: "wi_next", print: (line) => lines.push(line) })).then((lease) => {
+    granted = true;
+    return lease;
+  });
+  const expected = `matrix host: waiting 1 of 1, holder wi_child/tester/pid ${held.pid} gone, check group ${held.group} still running`;
+  await until(() => lines.includes(expected), "the still-running line; saw " + lines.join(" | "));
+  // Several more polls pass while the group lives.
+  const polls = readJournal(path).length;
+  await new Promise((resolve) => setTimeout(resolve, 200));
+  assert.equal(granted, false, "not granted while the recorded group is alive");
+  assert.equal(readHostState(path).holder.id, held.id);
+  assert.equal(readJournal(path).length, polls, "no recovery was journaled yet");
+  assert(!groupGone(held.group));
+  kill(-held.group);
+  const lease = await waiting;
+  const recovery = readJournal(path).find((line) => line.event === "stale-recovered");
+  assert.equal(recovery.reason, "pid-gone");
+  assert.equal(recovery.holder, held.id);
+  assert.equal(recovery.holderPid, held.pid);
+  assert.equal(lease.record.overlap, 0);
+  await lease.release();
+});
+
+test("L4 a holder past its run timeout stops its own command and releases", async (t) => {
+  const path = lockFile(t),
+    record = tempDir(t);
+  let group;
+  const run = execWithHostLock([process.execPath, "-e", "process.on('SIGTERM',()=>{});setInterval(()=>{},1000)"], {
+    ...request(path, { runTimeoutMs: 400 }),
+    recordDirectory: record,
+    stdio: "ignore",
+    handleSignals: false,
+    killAfterMs: 100,
+  });
+  group = await until(() => readHostState(path)?.holder?.groups?.[0], "the command's group");
+  t.after(() => kill(-group));
+  assert.equal(await run, 124);
+  assert(groupGone(group), "the command's group was stopped");
+  assert.equal(readHostState(path).holder, null);
+  assert.deepEqual(events(path), ["request", "acquire", "run-timeout-abort", "release"]);
+  const sidecar = JSON.parse(readFileSync(join(record, "host-lock.json"), "utf8"));
+  assert.equal(sidecar.runTimeoutAbort, true);
+  assert.equal(sidecar.exitCode, 124);
+});
+
+// A one-check plan in a throwaway repository, run by the real matrix runner.
+function runnerFixture(t, source) {
+  const cwd = tempDir(t, "matrix-host-lock-repo-");
+  const git = (...args) => execFileSync("git", args, { cwd, encoding: "utf8" }).trim();
+  mkdirSync(join(cwd, "verification"));
+  mkdirSync(join(cwd, "tests"));
+  mkdirSync(join(cwd, "docs"));
+  const matrix = JSON.stringify({ version: 1, browserSuites: [], excludedBrowserSuites: [], rules: [{ prefixes: ["docs/"], groups: ["unit"] }] });
+  writeFileSync(join(cwd, "verification/matrix.json"), matrix);
+  writeFileSync(join(cwd, "docs/a.md"), "a\n");
+  writeFileSync(join(cwd, "check.mjs"), source);
+  writeFileSync(join(cwd, "package.json"), JSON.stringify({ scripts: { test: "node check.mjs" } }));
+  git("init", "-q");
+  git("config", "user.name", "Fixture");
+  git("config", "user.email", "fixture@example.invalid");
+  git("add", ".");
+  git("commit", "-qm", "fixture");
+  const commit = git("rev-parse", "HEAD");
+  git("checkout", "-q", "--detach", commit);
+  const plan = makePlan({ baseCommit: commit, commit, owned: ["docs/"], approvedMatrixDigest: digest(matrix), matrixApprovalMessageSeq: 1 }, cwd);
+  return { cwd, plan };
+}
+test("L4 a matrix run past its run timeout stops its check, writes no receipt and releases", async (t) => {
+  const path = lockFile(t),
+    output = tempDir(t, "matrix-host-lock-logs-"),
+    pidFile = join(tempDir(t), "check.pid");
+  const { cwd, plan } = runnerFixture(
+    t,
+    `import fs from 'node:fs';fs.writeFileSync(${JSON.stringify(pidFile)},String(process.pid));setInterval(()=>{},1000);`,
+  );
+  await assert.rejects(
+    () => runPlan(plan, cwd, output, { minFreeBytes: 0, hostLock: { path, runTimeoutMs: 1500, pollMs: 20 } }),
+    /Verification interrupted by run-timeout/,
+  );
+  assert(!existsSync(join(output, "receipt.json")), "no receipt");
+  assert(existsSync(pidFile), "the check had started");
+  assert(pidGone(Number(readFileSync(pidFile, "utf8"))), "the check was stopped");
+  assert.equal(readHostState(path).holder, null);
+  assert.deepEqual(events(path), ["request", "acquire", "run-timeout-abort", "release"]);
+  assert.match(readFileSync(join(output, "host-lock.log"), "utf8"), /run timeout of 1500 ms reached, stopping this run/);
+});
+
+test("L5 past the run timeout plus grace a waiter takes the lock as a recorded overlap and signals nothing", async (t) => {
+  const path = lockFile(t);
+  const held = await heldByChild(t, path, { group: true, request: { runTimeoutMs: 300 } });
+  held.child.kill("SIGKILL");
+  await exited(held.child);
+  const lines = [];
+  const lease = await acquireHostLock(request(path, { item: "wi_next", graceMs: 300, print: (line) => lines.push(line) }));
+  const heldSince = Date.parse(readJournal(path).find((line) => line.event === "acquire").at);
+  assert(Date.parse(lease.record.acquiredAt) >= heldSince + 300 + 300 - 5, "not before the run timeout plus grace");
+  assert.equal(lease.record.overlap, 1);
+  assert.deepEqual(lease.record.overlapDetails.groups, [held.group]);
+  const overlap = readJournal(path).find((line) => line.event === "overlap");
+  assert.equal(overlap.reason, "run-timeout");
+  assert.equal(overlap.holder, held.id);
+  assert.deepEqual(overlap.groups, [held.group]);
+  assert(lines.some((line) => /WARNING overlap, lock taken after run timeout from wi_child\/tester/.test(line) && line.includes(String(held.group))), lines.join(" | "));
+  assert(lines.some((line) => line.includes(`pid ${held.pid} gone, check group ${held.group} still running`)), "it waited visibly first");
+  assert(!groupGone(held.group), "the old run's group was never signalled");
+  await lease.release();
+});
+
+test("L6 inside its run timeout a live holder is never taken over, whatever the waiter's priority or age", async (t) => {
+  const path = lockFile(t);
+  const holder = await acquireHostLock(request(path, { item: "wi_holder", runTimeoutMs: 60000 }));
+  // The waiter's clock is just inside the holder's timeout plus grace.
+  let polls = 0;
+  const inside = Date.now() + 60000 - 2000;
+  const lines = [];
+  let granted = false;
+  const waiting = acquireHostLock(
+    request(path, { item: "wi_urgent", priority: "urgent", prioritySource: "flag", graceMs: 0, maxWaitMs: 86400000, now: () => (polls++, inside), print: (line) => lines.push(line) }),
+  ).then((lease) => {
+    granted = true;
+    return lease;
+  });
+  await until(() => polls > 40, "many polls");
+  assert.equal(granted, false);
+  assert.equal(readHostState(path).holder.id, holder.id);
+  assert.deepEqual(lines, [`matrix host: waiting 1 of 1, holder wi_holder/tester/pid ${process.pid}`]);
+  await holder.release();
+  const lease = await waiting;
+  assert.equal(lease.record.overlap, 0);
+  await lease.release();
+  assert(!events(path).some((event) => RECOVERY.includes(event)));
+});
+
+test("L7 the lock is released on normal exit, an uncaught error, SIGTERM and SIGINT with no recovery", async (t) => {
+  for (const after of ["exit", "throw"]) {
+    const path = lockFile(t);
+    const held = await heldByChild(t, path, { after });
+    await exited(held.child);
+    assert.equal(held.child.exitCode, after === "exit" ? 0 : 1, held.child.output());
+    assert.equal(readHostState(path).holder, null, after);
+    assert.deepEqual(events(path), ["request", "acquire", "release"], after);
+    assert.equal(readJournal(path).at(-1).fallback, true);
+  }
+  for (const signal of ["SIGTERM", "SIGINT"]) {
+    const path = lockFile(t),
+      record = tempDir(t);
+    const child = spawn(
+      process.execPath,
+      [moduleFile, "exec", "--item", "wi_signal", "--timeout-minutes", "5", "--record", record, "--", process.execPath, "-e", "setInterval(()=>{},1000)"],
+      { env: { ...process.env, TAILTERM_MATRIX_HOST_LOCK: path }, stdio: "ignore" },
+    );
+    t.after(() => child.exitCode === null && child.signalCode === null && child.kill("SIGKILL"));
+    const group = await until(() => readHostState(path)?.holder?.groups?.[0], "the exec command's group");
+    t.after(() => kill(-group));
+    child.kill(signal);
+    const [code] = await once(child, "close");
+    assert.equal(code, signal === "SIGINT" ? 130 : 143);
+    assert(groupGone(group), "the signal reached the command's group");
+    assert.equal(readHostState(path).holder, null, signal);
+    assert.deepEqual(events(path), ["request", "acquire", "release"], signal);
+  }
+});
+
+test("L8 a holder killed with no live group is recovered by the next request", async (t) => {
+  const path = lockFile(t);
+  const held = await heldByChild(t, path);
+  held.child.kill("SIGKILL");
+  await exited(held.child);
+  const lease = await acquireHostLock(request(path, { item: "wi_next" }));
+  const journal = readJournal(path);
+  assert.deepEqual(journal.map((l) => l.event), ["request", "acquire", "request", "stale-recovered", "acquire"]);
+  assert.equal(journal[3].reason, "pid-gone");
+  assert.equal(journal[3].holderPid, held.pid);
+  assert.deepEqual(lease.record.recovered, { reason: "pid-gone", holder: held.id, pid: held.pid });
+  await lease.release();
+});
+
+function assertExclusive(log) {
+  const lines = readFileSync(log, "utf8").trim().split("\n");
+  for (let i = 0; i < lines.length; i += 2) {
+    assert.match(lines[i], /^enter \d+$/, "line " + i);
+    assert.equal(lines[i + 1], lines[i].replace("enter", "leave"), "two holders overlapped near line " + i);
+  }
+  return lines.length / 2;
+}
+async function race(t, path, children, count) {
+  const script = childScript(t),
+    log = join(tempDir(t), "holds.log");
+  const running = Array.from({ length: children }, () =>
+    startChild(t, script, { mode: "cycle", count, log, request: request(path, { pollMs: 5 }) }),
+  );
+  await Promise.all(running.map(exited));
+  for (const child of running) assert.equal(child.exitCode, 0, child.output());
+  return log;
+}
+test("L9 concurrent requests from several processes never hold together and none is lost", async (t) => {
+  const path = lockFile(t);
+  const log = await race(t, path, 5, 6);
+  assert.equal(assertExclusive(log), 30);
+  const state = readHostState(path);
+  // Both counters change only under the file mutex.
+  assert.equal(state.requestSeq, 30);
+  assert.equal(state.grantSeq, 30);
+  assert.equal(state.holder, null);
+  assert.deepEqual(state.waiters, []);
+  assert(!events(path).some((event) => RECOVERY.includes(event)));
+});
+
+test("L10 a waiter prints and logs its position and the holder, updates on change, and leaves at its wait bound", async (t) => {
+  const path = lockFile(t),
+    record = tempDir(t);
+  const holder = await acquireHostLock(request(path, { item: "wi_holder", agent: "verifier-a" }));
+  const lines = [];
+  const first = acquireHostLock(request(path, { item: "wi_first", recordDirectory: record, print: (line) => lines.push(line) }));
+  const holderText = `holder wi_holder/verifier-a/pid ${process.pid}`;
+  await until(() => lines.length === 1, "the first waiting line");
+  assert.deepEqual(lines, [`matrix host: waiting 1 of 1, ${holderText}`]);
+  const urgent = acquireHostLock(request(path, { item: "wi_urgent", priority: "urgent", prioritySource: "flag" }));
+  await until(() => lines.length === 2, "the line after being overtaken");
+  assert.equal(lines[1], `matrix host: waiting 2 of 2, ${holderText}`);
+
+  // A waiter whose process is gone is dropped by the others.
+  const dead = startChild(t, childScript(t), { mode: "hold", marker: join(tempDir(t), "never"), request: request(path, { item: "wi_dead" }) });
+  await until(() => waitersOf(path).some((w) => w.item === "wi_dead"), "the doomed waiter");
+  await until(() => lines.length === 3, "the line counting three waiters");
+  assert.equal(lines[2], `matrix host: waiting 2 of 3, ${holderText}`);
+  dead.kill("SIGKILL");
+  await until(() => !waitersOf(path).some((w) => w.item === "wi_dead"), "the dead waiter to be dropped");
+  const dropped = readJournal(path).find((line) => line.event === "waiter-dropped");
+  assert.equal(dropped.item, "wi_dead");
+  assert.equal(dropped.pid, dead.pid);
+
+  // The wait bound: the waiter removes itself and names where it stood.
+  const expiredRecord = tempDir(t);
+  await assert.rejects(
+    () => acquireHostLock(request(path, { item: "wi_bounded", maxWaitMs: 150, recordDirectory: expiredRecord })),
+    (error) => {
+      assert.equal(error.code, "wait-expired");
+      assert.equal(error.exitCode, EXIT_WAIT_EXPIRED);
+      assert.equal(error.exitCode, 75);
+      assert.match(error.message, new RegExp(`^Host lock wait expired after 150 ms at position 3 of 3, ${holderText}$`));
+      return true;
+    },
+  );
+  assert(!waitersOf(path).some((w) => w.item === "wi_bounded"));
+  const expired = readJournal(path).find((line) => line.event === "wait-expired");
+  assert.equal(expired.item, "wi_bounded");
+  assert.equal(expired.position, 3);
+  assert.equal(expired.removed, true);
+  const sidecar = JSON.parse(readFileSync(join(expiredRecord, "host-lock.json"), "utf8"));
+  assert.equal(sidecar.outcome, "wait-expired");
+  assert(sidecar.waitMs >= 150);
+  assert.equal(readHostState(path).holder.id, holder.id, "the holder was not disturbed");
+
+  await holder.release();
+  const urgentLease = await urgent;
+  await until(() => lines.some((line) => line.startsWith("matrix host: waiting 1 of 1, holder wi_urgent/")), "the first waiter to see the new holder");
+  await urgentLease.release();
+  const lease = await first;
+  assert.match(lines.at(-1), /^matrix host: acquired after \d+ ms$/);
+  const logged = readFileSync(join(record, "host-lock.log"), "utf8").trim().split("\n");
+  assert.deepEqual(logged.map((line) => line.replace(/^\S+ /, "")), lines, "host-lock.log carries the same lines");
+  for (const line of logged) assert.match(line, /^\d{4}-\d\d-\d\dT[\d:.]+Z matrix host: /);
+  await lease.release();
+});
+
+test("L11 a paused writer's mutex is never reclaimed, and its update lands intact when it resumes", async (t) => {
+  const path = lockFile(t),
+    directory = tempDir(t);
+  const seed = await acquireHostLock(request(path, { item: "wi_seed" }));
+  await seed.release();
+  const marker = join(directory, "in-update"),
+    go = join(directory, "go");
+  const writer = startChild(t, childScript(t), { mode: "pause", marker, go, request: { path } });
+  await until(() => existsSync(marker), "the writer to hold the mutex");
+  writer.kill("SIGSTOP");
+  t.after(() => kill(writer.pid, "SIGCONT"));
+  const before = readFileSync(path, "utf8"),
+    journalBefore = readJournal(path).length;
+  const lines = [];
+  let granted = false;
+  const waiting = acquireHostLock(request(path, { item: "wi_requester", print: (line) => lines.push(line) })).then((lease) => {
+    granted = true;
+    return lease;
+  });
+  await until(() => lines.length, "the busy line");
+  assert.deepEqual(lines, [`matrix host: lock file busy, mutex owner pid ${writer.pid}`]);
+  await new Promise((resolve) => setTimeout(resolve, 150));
+  assert.equal(granted, false);
+  assert.equal(readFileSync(path, "utf8"), before, "the lock file is unchanged");
+  assert.equal(JSON.parse(readFileSync(lockPaths(path).mutex, "utf8")).pid, writer.pid, "the mutex is still the writer's");
+  assert.equal(readJournal(path).length, journalBefore, "nothing was reclaimed or journaled");
+  writeFileSync(go, "");
+  writer.kill("SIGCONT");
+  await exited(writer);
+  assert.equal(writer.exitCode, 0, writer.output());
+  const lease = await waiting;
+  assert.equal(readHostState(path).requestSeq, 1002, "the paused update and the request both landed");
+  assert.equal(lease.record.seq, 1002);
+  assert(!events(path).includes("mutex-recovered"));
+  await lease.release();
+});
+
+test("L12 a dead owner's mutex is reclaimed exactly once while several processes race", async (t) => {
+  const path = lockFile(t);
+  mkdirSync(dirname(path), { recursive: true });
+  const deadPid = exitedPid();
+  assert(pidGone(deadPid));
+  writeFileSync(lockPaths(path).mutex, JSON.stringify({ pid: deadPid, token: "left-behind", at: new Date().toISOString() }));
+  const log = await race(t, path, 5, 6);
+  assert.equal(assertExclusive(log), 30);
+  const recovered = readJournal(path).filter((line) => line.event === "mutex-recovered");
+  assert.equal(recovered.length, 1);
+  assert.equal(recovered[0].deadPid, deadPid);
+  assert.equal(recovered[0].token, "left-behind");
+  const state = readHostState(path);
+  assert.equal(state.requestSeq, 30);
+  assert.equal(state.grantSeq, 30);
+  assert.equal(state.holder, null);
+  assert(!existsSync(lockPaths(path).guard), "the reclaim guard was removed");
+});
+
+test("L13 a corrupt lock file refuses requests and is left unchanged, even with a live holder", async (t) => {
+  const path = lockFile(t);
+  const lines = [];
+  const holder = await acquireHostLock(request(path, { item: "wi_holder", print: (line) => lines.push(line) }));
+  for (const bytes of ["{ not json", "", JSON.stringify({ version: 2, requestSeq: 1, grantSeq: 1, holder: null, waiters: [] })]) {
+    writeFileSync(path, bytes);
+    await assert.rejects(
+      () => acquireHostLock(request(path, { item: "wi_refused" })),
+      (error) => {
+        assert.equal(error.code, "corrupt-file");
+        assert.equal(error.exitCode, EXIT_LOCK_UNUSABLE);
+        assert.equal(error.exitCode, 78);
+        assert(error.message.includes(path), error.message);
+        return true;
+      },
+    );
+    assert.equal(readFileSync(path, "utf8"), bytes, "the file bytes are unchanged");
+    const refusal = readJournal(path).at(-1);
+    assert.equal(refusal.event, "corrupt-file");
+    assert.equal(refusal.item, "wi_refused");
+    assert.equal(refusal.file, path);
+  }
+  assert(!existsSync(lockPaths(path).mutex), "the mutex was released after each refusal");
+  const bytes = readFileSync(path, "utf8");
+  await holder.release();
+  assert.equal(readFileSync(path, "utf8"), bytes, "the holder's release did not overwrite it either");
+  assert(lines.some((line) => line.startsWith("matrix host: WARNING Host lock file " + path)), lines.join(" | "));
+  assert.equal(readJournal(path).at(-1).event, "corrupt-file");
+});
+
+test("L14 a reclaim guard left by a dead process fails closed and names the file", async (t) => {
+  const path = lockFile(t),
+    paths = lockPaths(path);
+  mkdirSync(dirname(path), { recursive: true });
+  const deadPid = exitedPid();
+  writeFileSync(paths.mutex, JSON.stringify({ pid: deadPid, token: "left-behind", at: new Date().toISOString() }));
+  writeFileSync(paths.guard, JSON.stringify({ pid: deadPid, token: "guard", at: new Date().toISOString() }));
+  await assert.rejects(
+    () => acquireHostLock(request(path)),
+    (error) => {
+      assert.equal(error.code, "guard-stale");
+      assert.equal(error.exitCode, 78);
+      assert(error.message.includes(paths.guard), error.message);
+      return true;
+    },
+  );
+  assert(existsSync(paths.mutex) && existsSync(paths.guard), "neither file was removed");
+  assert(!existsSync(path), "no lock was granted");
+  const stale = readJournal(path).at(-1);
+  assert.equal(stale.event, "guard-stale");
+  assert.equal(stale.file, paths.guard);
+  assert.equal(stale.guardPid, deadPid);
+});
+
+test("L15 exec records its wait, position, overtakes, duration and load, and passes the exit code through", async (t) => {
+  const path = lockFile(t),
+    records = tempDir(t);
+  const environment = { ...process.env, TAILTERM_MATRIX_HOST_LOCK: path };
+  const exec = (name, sleepMs, code, flags = []) => {
+    const child = spawn(
+      process.execPath,
+      [moduleFile, "exec", "--item", name, "--agent", "racer", "--timeout-minutes", "5", "--record", join(records, name), ...flags, "--", process.execPath, "-e", `setTimeout(()=>process.exit(${code}),${sleepMs})`],
+      { env: environment, stdio: ["ignore", "pipe", "pipe"] },
+    );
+    let output = "";
+    child.stdout.on("data", (data) => (output += data));
+    child.stderr.on("data", (data) => (output += data));
+    child.output = () => output;
+    t.after(() => child.exitCode === null && child.signalCode === null && child.kill("SIGKILL"));
+    return child;
+  };
+  const holder = await acquireHostLock(request(path, { item: "wi_holder" }));
+  const a = exec("wi_a", 700, 3);
+  await until(() => waitersOf(path).some((w) => w.item === "wi_a"), "A to queue");
+  const b = exec("wi_b", 600, 0, ["--priority", "urgent"]);
+  await until(() => waitersOf(path).length === 2, "B to queue");
+  const status = JSON.parse(execFileSync(process.execPath, [moduleFile, "status", "--json"], { env: environment, encoding: "utf8" }));
+  assert.deepEqual(status.state.waiters.map((w) => [w.item, w.priority]), [["wi_b", "urgent"], ["wi_a", "normal"]], "status shows B ahead of A");
+  assert.match(execFileSync(process.execPath, [moduleFile, "status"], { env: environment, encoding: "utf8" }), /1 of 2: wi_b\/racer\/pid \d+ \(exec, urgent\/flag\).*\n {2}2 of 2: wi_a\/racer\/pid \d+ \(exec, normal\/default\)/);
+  await holder.release();
+  const [[codeA], [codeB]] = await Promise.all([once(a, "close"), once(b, "close")]);
+  assert.equal(codeA, 3, a.output());
+  assert.equal(codeB, 0, b.output());
+  const recordOf = (name) => JSON.parse(readFileSync(join(records, name, "host-lock.json"), "utf8"));
+  const ra = recordOf("wi_a"),
+    rb = recordOf("wi_b");
+  assert.deepEqual(
+    [rb.queuePosition, rb.queueLength, rb.overtakenBy, rb.grantsBeforeStart, rb.priority, rb.prioritySource, rb.exitCode],
+    [1, 2, 0, 0, "urgent", "flag", 0],
+  );
+  assert.deepEqual(
+    [ra.queuePosition, ra.queueLength, ra.overtakenBy, ra.grantsBeforeStart, ra.priority, ra.prioritySource, ra.exitCode],
+    [1, 1, 1, 1, "normal", "default", 3],
+  );
+  assert(rb.durationMs >= 600, "B held for its command: " + rb.durationMs);
+  assert(ra.waitMs >= rb.durationMs, `A waited ${ra.waitMs} ms, at least B's hold of ${rb.durationMs} ms`);
+  assert(ra.durationMs >= 700 && ra.durationMs < 60000, "A's duration covers its sleep: " + ra.durationMs);
+  assert(Date.parse(ra.acquiredAt) >= Date.parse(rb.releasedAt) - 5, "A started after B released");
+  for (const record of [ra, rb]) {
+    assert.equal(record.checkSet, "supplemental");
+    assert.equal(record.kind, "exec");
+    assert.equal(record.agent, "racer");
+    assert.equal(record.overlap, 0);
+    assert.equal(record.outcome, "released");
+    assert.equal(record.lockPath, path);
+    assert(record.cpuCount >= 1);
+    assert(record.loadSamples.length >= 2);
+    for (const sample of record.loadSamples) {
+      assert(Number.isFinite(sample.load1) && sample.load1 >= 0);
+      assert(Number.isFinite(sample.load5) && sample.load5 >= 0);
+      assert(!Number.isNaN(Date.parse(sample.at)));
+    }
+  }
+  assert.equal(ra.argv.at(-1), "setTimeout(()=>process.exit(3),700)");
+  assert.match(a.output(), /matrix host: waiting 1 of 1, holder wi_holder\/tester\/pid \d+\n/);
+  assert.match(readFileSync(join(records, "wi_a", "host-lock.log"), "utf8"), /matrix host: acquired after \d+ ms\n$/);
+  assert.equal(readHostState(path).holder, null);
+});
+
+test("exec refuses bad options before joining the list", (t) => {
+  const path = lockFile(t),
+    record = tempDir(t);
+  const run = (...args) => spawnSync(process.execPath, [moduleFile, "exec", ...args], { env: { ...process.env, TAILTERM_MATRIX_HOST_LOCK: path }, encoding: "utf8" });
+  const ok = ["--item", "wi_x", "--timeout-minutes", "1", "--record", record];
+  for (const [args, message] of [
+    [[...ok.slice(2), "--", "true"], /exec requires --item ID/],
+    [[...ok.slice(0, 2), "--record", record, "--", "true"], /exec requires --timeout-minutes N/],
+    [["--item", "wi_x", "--timeout-minutes", "0", "--record", record, "--", "true"], /--timeout-minutes requires a whole number of minutes from 1 to 1440/],
+    [["--item", "wi_x", "--timeout-minutes", "1", "--record", "relative", "--", "true"], /absolute directory/],
+    [[...ok, "--priority", "soon", "--", "true"], /--priority must be urgent, high or normal/],
+    [[...ok, "--host-wait-minutes", "x", "--", "true"], /--host-wait-minutes requires a whole number/],
+    [ok, /Usage:/],
+  ]) {
+    const result = run(...args);
+    assert.equal(result.status, 1, result.stderr);
+    assert.match(result.stderr, message);
+  }
+  assert(!existsSync(path), "no request reached the lock file");
+});
