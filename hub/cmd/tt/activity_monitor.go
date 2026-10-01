@@ -202,7 +202,7 @@ func relayActivityTick(ctx context.Context, b runtimeBinding, client *api.Client
 		return writePrivateJSON(path, c)
 	}
 	// Metering failures never suppress activity transitions or alerts.
-	if u != nil && (len(u.Dirty) > 0 || u.Pending != nil || !u.Enrolled || u.Coverage != u.UploadedCoverage) {
+	if u != nil && u.hasPendingWork() {
 		if err := uploadUsage(ctx, u, client); err != nil {
 			fmt.Fprintln(os.Stderr, "[tt relay] usage upload deferred:", err)
 		}

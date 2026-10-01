@@ -35,6 +35,40 @@ type UsageEvidence struct {
 	Operation string    `json:"operation"`
 	At        time.Time `json:"at"`
 }
+
+// UsageSpanSegment is the part of a turn that belongs to one metered model
+// request. At is the timestamp the token ledger gives that request, so a
+// request and the time in its segment are attributed alike. Poll marks a
+// request that only re-checked the inbox.
+type UsageSpanSegment struct {
+	From time.Time `json:"from"`
+	To   time.Time `json:"to"`
+	At   time.Time `json:"at"`
+	Poll bool      `json:"poll,omitempty"`
+}
+
+// UsageSpan is one bounded chunk of a completed turn's time: half-open UTC
+// intervals taken from transcript record timestamps. Tool, Wait (blocking
+// inbox waits) and Mixed (a wait run together with other work, which no
+// timestamp can split) are disjoint; the rest of the chunk is model time.
+// Segments cover the chunk exactly. An unavailable chunk has a known wall
+// time and no split. Command text never enters a span.
+type UsageSpan struct {
+	ID           string             `json:"id"`
+	Turn         string             `json:"turn"`
+	Chunk        int                `json:"chunk"`
+	Last         bool               `json:"last,omitempty"`
+	Start        time.Time          `json:"start"`
+	End          time.Time          `json:"end"`
+	Tool         [][2]time.Time     `json:"tool,omitempty"`
+	Wait         [][2]time.Time     `json:"wait,omitempty"`
+	Mixed        [][2]time.Time     `json:"mixed,omitempty"`
+	Segments     []UsageSpanSegment `json:"segments"`
+	Handled      []UsageEvidence    `json:"handled,omitempty"`
+	Unavailable  bool               `json:"unavailable,omitempty"`
+	Gap          string             `json:"gap,omitempty"`
+	SourceDigest string             `json:"sourceDigest"`
+}
 type UsageBatch struct {
 	Version   int         `json:"version"`
 	RequestID string      `json:"requestId"`
@@ -43,10 +77,14 @@ type UsageBatch struct {
 	StartedAt time.Time   `json:"startedAt"`
 	Coverage  string      `json:"coverage"`
 	Turns     []UsageTurn `json:"turns"`
+	// Spans are sent only to a hub that advertises usage.time: an older hub
+	// would acknowledge the batch and drop them.
+	Spans []UsageSpan `json:"spans,omitempty"`
 }
 type UsageReceipt struct {
 	RequestID string `json:"requestId"`
 	Turns     int    `json:"turns"`
+	Spans     int    `json:"spans,omitempty"`
 }
 type UsageAttribution struct {
 	TaskID      string `json:"taskId"`

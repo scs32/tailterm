@@ -38,6 +38,13 @@ type usageCursor struct {
 	Finished          map[string]bool          `json:"finished,omitempty"`
 	RejectedCoverage  string                   `json:"rejectedCoverage,omitempty"`
 	Frozen            bool                     `json:"frozen"`
+	// Time accounting (usage_time.go): the open turn, completed chunks awaiting
+	// upload, and the turns already emitted.
+	Time         *usageTimeTurn           `json:"time,omitempty"`
+	Spans        map[string]api.UsageSpan `json:"spans,omitempty"`
+	SpanDirty    map[string]bool          `json:"spanDirty,omitempty"`
+	SpanFinished map[string]bool          `json:"spanFinished,omitempty"`
+	note         *usageTimeNote
 }
 
 func usageStatePath(b runtimeBinding) string {
@@ -146,6 +153,9 @@ func (u *usageCursor) put(id string, at time.Time, model string, raw map[string]
 		t.Revision = u.nextRevision(id)
 		t.SourceDigest = digest
 	}
+	if !exists {
+		u.note = &usageTimeNote{ID: id, Activation: u.Activation, At: at}
+	}
 	if u.Coverage == "partial: awaiting first reconciled request" && !u.Start.IsZero() && !strings.HasPrefix(u.Activation, "unbounded-") && !strings.HasPrefix(u.Activation, "claude-") {
 		u.Coverage = "measured from first reconciled request"
 	}
@@ -174,6 +184,14 @@ func (u *usageCursor) finish(at time.Time) {
 	u.Activation = ""
 }
 func (u *usageCursor) parse(line []byte) error {
+	u.note = nil
+	err := u.parseTokens(line)
+	if err == nil {
+		u.parseTime(line)
+	}
+	return err
+}
+func (u *usageCursor) parseTokens(line []byte) error {
 	var rec activityRecord
 	if err := json.Unmarshal(line, &rec); err != nil {
 		u.Coverage = "partial: malformed transcript record"
@@ -355,7 +373,22 @@ func freezeUsageBatch(u *usageCursor) error {
 			break
 		}
 	}
-	if len(batch.Turns) == 0 && ((u.Enrolled && u.UploadedCoverage == u.Coverage) || u.RejectedCoverage == u.Coverage) {
+	// Chunks count toward the same record and byte caps as token turns; a
+	// turn's chunks may span several batches.
+	if usageTimeSupported(u.Binding) {
+		for _, span := range u.dirtySpans() {
+			if len(batch.Turns)+len(batch.Spans) >= 32 {
+				break
+			}
+			batch.Spans = append(batch.Spans, span)
+			raw, _ := json.Marshal(batch)
+			if len(raw) > 48<<10 {
+				batch.Spans = batch.Spans[:len(batch.Spans)-1]
+				break
+			}
+		}
+	}
+	if len(batch.Turns) == 0 && len(batch.Spans) == 0 && u.coverageSent() {
 		return saveUsageCursor(u)
 	}
 	raw, _ := json.Marshal(batch)
@@ -407,6 +440,10 @@ func uploadUsage(ctx context.Context, u *usageCursor, c *api.Client) error {
 				delete(u.Uploaded, turn.ID)
 				u.Finished[turn.ID] = true
 			}
+			for _, span := range u.Pending.Spans {
+				delete(u.SpanDirty, span.ID)
+				delete(u.Spans, span.ID)
+			}
 			u.Pending = nil
 			u.Coverage = coverage
 			u.RejectedCoverage = coverage
@@ -416,8 +453,13 @@ func uploadUsage(ctx context.Context, u *usageCursor, c *api.Client) error {
 		}
 		return err
 	}
-	if receipt.RequestID != u.Pending.RequestID || receipt.Turns != len(u.Pending.Turns) {
+	if receipt.RequestID != u.Pending.RequestID || receipt.Turns != len(u.Pending.Turns) || receipt.Spans != len(u.Pending.Spans) {
 		return fmt.Errorf("usage receipt mismatch")
+	}
+	// A stored chunk is immutable, so nothing is kept after its receipt.
+	for _, span := range u.Pending.Spans {
+		delete(u.SpanDirty, span.ID)
+		delete(u.Spans, span.ID)
 	}
 	for _, t := range u.Pending.Turns {
 		u.Uploaded[t.ID] = t.Revision
@@ -476,13 +518,18 @@ func flushFrozenUsage(ctx context.Context, dir string, clientFor func(runtimeBin
 		if !u.Frozen {
 			continue
 		}
-		drained := func() bool {
-			return len(u.Dirty) == 0 && u.Pending == nil && (u.Coverage == u.UploadedCoverage || u.Coverage == u.RejectedCoverage)
-		}
+		// Spans count: a run whose token turns are all uploaded but which still
+		// has dirty spans is retried, and its state file is kept until then.
+		drained := func() bool { return !u.hasPendingWork() }
 		if drained() {
 			if e = os.Remove(path); e != nil && !os.IsNotExist(e) {
 				failures = append(failures, e)
 			}
+			continue
+		}
+		if !u.hasSendableWork() {
+			// Only spans are left and this hub cannot store them yet. Keep
+			// them without spending an upload slot.
 			continue
 		}
 		if !u.LastUploadAttempt.IsZero() && time.Since(u.LastUploadAttempt) < 15*time.Second {
@@ -522,6 +569,10 @@ func freezeRetiredUsage(b runtimeBinding) error {
 	}
 	u.Frozen = true
 	u.Coverage = "partial: terminal boundary may omit final transcript tail"
+	if u.Time != nil {
+		// The open turn closes at the last record seen; no transcript is read.
+		u.timeClose(u.Time.Last, "terminal boundary before turn end")
+	}
 	for id, t := range u.Turns {
 		if !t.Complete {
 			t.Gap = "terminal boundary before activation completion"
@@ -575,11 +626,8 @@ func (u *usageCursor) prune() {
 type usageEnabledContextKey struct{}
 
 func prepareUsageContext(ctx context.Context, b runtimeBinding, c *api.Client, now time.Time) context.Context {
-	path := filepath.Join(relayDir(), fmt.Sprintf("%x.usage-capability.json", sha256.Sum256([]byte(b.Hub))))
-	var cached struct {
-		At        time.Time `json:"at"`
-		Supported bool      `json:"supported"`
-	}
+	path := usageCapabilityPath(b.Hub)
+	var cached usageCapabilityCache
 	raw, _ := os.ReadFile(path)
 	_ = json.Unmarshal(raw, &cached)
 	if cached.At.IsZero() || now.Sub(cached.At) > 5*time.Minute {
@@ -592,6 +640,7 @@ func prepareUsageContext(ctx context.Context, b runtimeBinding, c *api.Client, n
 		}
 		cached.At = now
 		cached.Supported = caps.Usage.Supported
+		cached.Time = caps.Usage.Time
 		_ = writePrivateJSON(path, cached)
 	}
 	return context.WithValue(ctx, usageEnabledContextKey{}, cached.Supported)

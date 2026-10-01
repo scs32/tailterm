@@ -21,6 +21,8 @@ type Capabilities struct {
 	Usage struct {
 		Supported bool  `json:"supported"`
 		Versions  []int `json:"versions"`
+		// Time: the hub stores usage spans (time accounting).
+		Time bool `json:"time,omitempty"`
 	} `json:"usage"`
 	ProjectPause struct {
 		Supported bool  `json:"supported"`
@@ -81,6 +83,7 @@ func CurrentCapabilities() Capabilities {
 	out.SchemaVersion = 1
 	out.Usage.Supported = true
 	out.Usage.Versions = []int{UsageVersion}
+	out.Usage.Time = true
 	out.ProjectPause.Supported = true
 	out.ProjectPause.Versions = []int{ProjectPauseCapabilityVersion}
 	out.MessageAudit.Versions = []int{1, 2}

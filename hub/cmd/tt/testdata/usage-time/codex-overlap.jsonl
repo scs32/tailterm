@@ -1,0 +1,13 @@
+{"timestamp":"2026-01-01T09:59:00.000Z","type":"session_meta","payload":{"id":"12345678-1234-1234-1234-123456789abc"}}
+{"timestamp":"2026-01-01T10:00:00.000Z","type":"event_msg","payload":{"type":"task_started","turn_id":"fixture-codex-overlap"}}
+{"timestamp":"2026-01-01T10:00:00.000Z","type":"turn_context","payload":{"model":"fixture-codex-model"}}
+{"timestamp":"2026-01-01T10:00:10.000Z","type":"response_item","payload":{"type":"custom_tool_call","name":"exec","call_id":"c1","input":"text(await tools.exec_command({cmd:\"go test ./... -run FIXTURE-SECRET-ARG\",max_output_tokens:2000}));\n"}}
+{"timestamp":"2026-01-01T10:00:30.000Z","type":"response_item","payload":{"type":"custom_tool_call","name":"exec","call_id":"c2","input":"text(await tools.exec_command({cmd:\"npm test\",max_output_tokens:2000}));\n"}}
+{"timestamp":"2026-01-01T10:00:35.000Z","type":"world_state","payload":{"note":"fixture"}}
+{"timestamp":"2026-01-01T10:00:40.000Z","type":"response_item","payload":{"type":"custom_tool_call_output","call_id":"c1","output":"fixture output"}}
+{"timestamp":"2026-01-01T10:01:00.000Z","type":"response_item","payload":{"type":"custom_tool_call_output","call_id":"c2","output":"fixture output"}}
+{"timestamp":"2026-01-01T10:01:00.000Z","type":"token_usage_record","payload":{"note":"fixture"}}
+{"timestamp":"2026-01-01T10:01:00.000Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":100,"cached_input_tokens":80,"cache_write_input_tokens":0,"output_tokens":10,"reasoning_output_tokens":4,"total_tokens":110},"total_token_usage":{"input_tokens":100,"cached_input_tokens":80,"cache_write_input_tokens":0,"output_tokens":10,"reasoning_output_tokens":4,"total_tokens":110}}}}
+{"timestamp":"2026-01-01T10:01:30.000Z","type":"compacted","payload":{"note":"fixture"}}
+{"timestamp":"2026-01-01T10:02:00.000Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":100,"cached_input_tokens":80,"cache_write_input_tokens":0,"output_tokens":10,"reasoning_output_tokens":4,"total_tokens":110},"total_token_usage":{"input_tokens":200,"cached_input_tokens":160,"cache_write_input_tokens":0,"output_tokens":20,"reasoning_output_tokens":8,"total_tokens":220}}}}
+{"timestamp":"2026-01-01T10:02:00.000Z","type":"event_msg","payload":{"type":"task_complete"}}
