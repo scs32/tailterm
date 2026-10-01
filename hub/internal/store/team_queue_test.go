@@ -1595,6 +1595,9 @@ type rebindFixture struct {
 	handler            api.Agent
 	entry              api.TeamQueueEntry
 	lead, worker, gone api.Agent
+	// other is a second confirmed item with its order, not yet queued.
+	other      api.WorkItem
+	otherOrder api.Message
 }
 
 const rebindRepository = "/fixture/repo/.git"
@@ -1602,7 +1605,7 @@ const rebindRepository = "/fixture/repo/.git"
 func newRebindFixture(t *testing.T, running bool) *rebindFixture {
 	t.Helper()
 	s, task, items, orders := queueFixture(t)
-	f := &rebindFixture{s: s, ctx: context.Background(), by: api.Caller{Node: "fixture", User: "owner"}, task: task, item: items[0], order: orders[0]}
+	f := &rebindFixture{s: s, ctx: context.Background(), by: api.Caller{Node: "fixture", User: "owner"}, task: task, item: items[0], order: orders[0], other: items[1], otherOrder: orders[1]}
 	agents, err := s.ListAgents(f.ctx, task.ID)
 	if err != nil {
 		t.Fatal(err)
@@ -2271,4 +2274,55 @@ func TestTeamQueueRequeueRefusals(t *testing.T) {
 		req.Template, req.Ownership = "small", []string{"src/fix.go"}
 		refused(t, f, req, f.entry.ID, "admits only bugs", "--template planned")
 	})
+}
+
+// a10: a queued entry whose item was amended is not failed and does not hold
+// the head. It stays queued with the rebind as its block reason, its own
+// claim is refused naming the rebind, and the next entry claims.
+func TestTeamQueueClaimSkipsStaleQueuedEntry(t *testing.T) {
+	f := newRebindFixture(t, false)
+	s, ctx := f.s, f.ctx
+	next := f.action(t, api.TeamQueueRequest{Operation: "add", ItemID: f.other.ID, OrderMessageSeq: f.otherOrder.Seq, Host: "mini", Cwd: "/worktrees/next", Repository: rebindRepository, BaseCommit: strings.Repeat("a", 40), Ownership: []string{"docs"}})
+	claim := func(q api.TeamQueueEntry) (api.TeamQueueEntry, error) {
+		return s.TeamQueueAction(ctx, f.task.ID, api.TeamQueueRequest{RequestID: api.NewID("req"), Operation: "claim", EntryID: q.ID, ExpectedRevision: q.Revision, Host: "mini"})
+	}
+	if _, err := claim(next); !errors.Is(err, api.ErrConflict) || !strings.Contains(err.Error(), "not queue head") {
+		t.Fatalf("second entry claimed past a current head: %v", err)
+	}
+
+	updated, source := f.amend(t, "one")
+	_, err := claim(f.entry)
+	if !errors.Is(err, api.ErrConflict) || !strings.Contains(err.Error(), f.entry.ID) || !strings.Contains(err.Error(), "tt team queue rebind") {
+		t.Fatalf("claim of the stale entry = %v, want a conflict naming %s and the rebind", err, f.entry.ID)
+	}
+	stale := listedEntry(t, s, f.task.ID, f.entry.ID)
+	want := fmt.Sprintf("Item is at revision %d; entry is bound to %d. tt team queue rebind --task %s --entry %s --source SEQ", updated.Revision, f.item.Revision, f.task.ID, f.entry.ID)
+	if stale.State != "queued" || stale.Revision != f.entry.Revision || stale.Failure != "" || stale.BlockReason != want {
+		t.Fatalf("stale entry %+v\nwant block reason %q", stale, want)
+	}
+	page, err := s.TeamQueuePage(ctx, f.task.ID, api.TeamQueueListOptions{Item: f.item.ID})
+	if err != nil || len(page.Entries) != 1 || page.Entries[0].BlockReason != want {
+		t.Fatalf("item listing %+v %v", page, err)
+	}
+	if blocked := listedEntry(t, s, f.task.ID, next.ID); blocked.BlockReason != "" {
+		t.Fatalf("next entry is blocked: %q", blocked.BlockReason)
+	}
+	claimed, err := claim(next)
+	if err != nil || claimed.State != "launching" {
+		t.Fatalf("next entry behind a stale head %+v %v", claimed, err)
+	}
+	if still := listedEntry(t, s, f.task.ID, f.entry.ID); still.State != "queued" {
+		t.Fatalf("stale entry left the queue: %+v", still)
+	}
+	// The rebind clears the reason; the entry is an ordinary queued entry again.
+	f.confirm(t, updated)
+	owner := f.rebind(updated, source)
+	owner.HandlerAgentID, owner.HandlerRunID = "", ""
+	rebound := f.action(t, owner)
+	if rebound.Rebinds[0].ApprovedBy.AgentID != "" || rebound.Rebinds[0].ApprovedBy.User != "approver" {
+		t.Fatalf("owner rebind approver %+v", rebound.Rebinds[0].ApprovedBy)
+	}
+	if listed := listedEntry(t, s, f.task.ID, f.entry.ID); strings.Contains(listed.BlockReason, "rebind") || listed.ItemRevision != updated.Revision {
+		t.Fatalf("rebound entry %+v", listed)
+	}
 }

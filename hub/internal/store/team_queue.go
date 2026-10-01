@@ -759,6 +759,24 @@ func (s *Store) explainTeamQueue(ctx context.Context, task string, out *api.Team
 			}
 		}
 	}
+	// A queued entry whose item was amended waits for a rebind whatever else
+	// holds it; it is skipped at the head, so later entries still launch.
+	for i := range out.Entries {
+		e := &out.Entries[i]
+		if e.State != "queued" {
+			continue
+		}
+		current, err := queueItemRevision(ctx, reader, task, e.ItemID)
+		if errors.Is(err, sql.ErrNoRows) {
+			continue
+		}
+		if err != nil {
+			return err
+		}
+		if current != e.ItemRevision {
+			e.BlockReason = fmt.Sprintf("Item is at revision %d; entry is bound to %d. %s", current, e.ItemRevision, queueRebindCommand(task, e.ID))
+		}
+	}
 	return nil
 }
 
@@ -1660,6 +1678,12 @@ func (s *Store) TeamQueueAction(ctx context.Context, task string, req api.TeamQu
 			if e.State != "queued" || t.PauseState != api.ProjectPauseActive || (!queueParallel(limit) && (t.Orchestrator != "" || t.CleanupPending != 0)) || req.Host != e.Host || req.PauseGeneration != t.PauseGeneration {
 				return zero, fmt.Errorf("%w: project is not launchable", api.ErrConflict)
 			}
+			// An amended item leaves its queued entry in place until a rebind.
+			if current, err := queueItemRevision(ctx, tx, task, e.ItemID); err != nil {
+				return zero, err
+			} else if current != e.ItemRevision {
+				return zero, staleQueueEntry(e, current)
+			}
 			if err := requireConfirmedTeamOrder(ctx, tx, task, e.ItemID, e.ItemRevision, e.OrderMessageSeq); err != nil {
 				return zero, err
 			}
@@ -1702,6 +1726,14 @@ func (s *Store) TeamQueueAction(ctx context.Context, task string, req api.TeamQu
 			}
 			var head string
 			for _, candidate := range candidates {
+				// An entry waiting for a rebind does not hold the head.
+				current, err := queueItemRevision(ctx, tx, task, candidate.ItemID)
+				if err != nil {
+					return zero, err
+				}
+				if current != candidate.ItemRevision {
+					continue
+				}
 				conflict := false
 				for _, active := range activeEntries {
 					if candidate.Cwd == active.Cwd || queueEntryConflicts(candidate, active) {
@@ -2091,6 +2123,13 @@ func (s *Store) TeamQueueAction(ctx context.Context, task string, req api.TeamQu
 	}
 	s.notify(task)
 	return e, nil
+}
+
+// queueItemRevision reads an item's current revision.
+func queueItemRevision(ctx context.Context, q queryRower, task, item string) (int64, error) {
+	var revision int64
+	err := q.QueryRowContext(ctx, `SELECT revision FROM work_items WHERE task_id=? AND id=?`, task, item).Scan(&revision)
+	return revision, err
 }
 
 // queueRebindCommand is the supported fix for an entry whose item moved on.

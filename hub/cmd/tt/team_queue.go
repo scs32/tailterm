@@ -29,7 +29,7 @@ func validTeamQueueEntryID(id string) bool {
 	return err == nil
 }
 
-const teamQueueUsage = "usage: tt team queue add|list|policy|limit|scope|fail|accept|integrated|replace-lead|remove|reorder|release|abandon"
+const teamQueueUsage = "usage: tt team queue add|list|policy|limit|scope|rebind|requeue|fail|accept|integrated|replace-lead|remove|reorder|release|abandon"
 
 // parseQueueLimit reads --limit: none (no fixed cap, stored as 0) or N >= 1.
 func parseQueueLimit(raw string) (int, bool) {
@@ -147,6 +147,7 @@ func cmdTeamQueue(e env, args []string) error {
 	noNewWorktree := fs.Bool("no-new-worktree", false, "add: use the current checkout in a parallel project")
 	serial := fs.Bool("serial", false, "add: declare no ownership; the entry runs alone")
 	reason := fs.String("reason", "", "fail: why the owner is failing this entry")
+	source := fs.Int64("source", 0, "rebind: the amendment's message sequence")
 	policyVersion := fs.Int64("policy-version", 0, "owner host policy version")
 	policyExpires := fs.String("expires", "", "host policy expiry in RFC3339")
 	policySessions := fs.Int("sessions", 0, "host session budget")
@@ -213,7 +214,7 @@ func cmdTeamQueue(e env, args []string) error {
 			} else if q.State == "failed" && q.ReleasedAt != "" {
 				state += " (released)"
 			}
-			fmt.Printf("%d %s %s %s order=#%d template=%s revision=%d repository=%s cwd=%s owns=%s blocked-by=%s reason=%s handler=%s/%s lease=%d%s\n", q.Position, state, q.ID, q.ItemID, q.OrderMessageSeq, q.Template, q.Revision, q.Repository, q.Cwd, owns, strings.Join(q.BlockedBy, ","), q.BlockReason, q.HandlerID, q.HandlerRunID, q.HandlerLeaseGeneration, queueArmText(q.HandlerArm))
+			fmt.Printf("%d %s %s %s order=#%d template=%s revision=%d repository=%s cwd=%s owns=%s blocked-by=%s reason=%s handler=%s/%s lease=%d%s%s\n", q.Position, state, q.ID, q.ItemID, q.OrderMessageSeq, q.Template, q.Revision, q.Repository, q.Cwd, owns, strings.Join(q.BlockedBy, ","), q.BlockReason, q.HandlerID, q.HandlerRunID, q.HandlerLeaseGeneration, queueArmText(q.HandlerArm), queueAttemptText(q))
 			fmt.Printf("  team last-transition tokens=%d\n", q.Tokens.Total)
 			for _, member := range q.Activities {
 				state := "unknown"
@@ -245,7 +246,7 @@ func cmdTeamQueue(e env, args []string) error {
 		}
 		return nil
 	}
-	if e.agent != "" && sub != "accept" && sub != "scope" {
+	if e.agent != "" && sub != "accept" && sub != "scope" && sub != "rebind" && sub != "requeue" {
 		return errors.New("owner-side team queue changes require an unbound CLI session")
 	}
 	req := api.TeamQueueRequest{RequestID: api.NewID("tqr"), Operation: sub}
@@ -359,7 +360,7 @@ func cmdTeamQueue(e env, args []string) error {
 				return err
 			}
 		}
-	case "remove", "reorder", "release", "replace-lead", "accept", "scope", "fail", "integrated":
+	case "remove", "reorder", "release", "replace-lead", "accept", "scope", "fail", "integrated", "rebind", "requeue":
 		if !validTeamQueueEntryID(*entry) {
 			return errors.New(sub + " requires --entry tqe_ID")
 		}
@@ -518,6 +519,88 @@ func cmdTeamQueue(e env, args []string) error {
 				}
 			}
 		}
+		if sub == "rebind" || sub == "requeue" {
+			if e.agent != "" {
+				// An agent names its exact run; the hub checks it is an
+				// available database handler (the leased one for a running
+				// entry). A lead or team member may not move its own entry.
+				self, selfErr := c.GetAgent(ctx, *task, e.agent)
+				if selfErr != nil {
+					return selfErr
+				}
+				if e.runID == "" || self.Role != api.AgentRoleDatabaseHandler {
+					return fmt.Errorf("only the owner or a database handler may %s a team queue entry", sub)
+				}
+				req.HandlerAgentID, req.HandlerRunID = e.agent, e.runID
+			}
+		}
+		if sub == "rebind" {
+			// After a scope amendment: move the queued or running entry, and
+			// a running team's bindings, to the item's current revision.
+			if *source < 1 {
+				return errors.New("usage: tt team queue rebind --entry tqe_ID --source SEQ (SEQ: the amendment's message)")
+			}
+			current, itemErr := c.GetWorkItem(ctx, *task, q.ItemID)
+			if itemErr != nil {
+				return itemErr
+			}
+			if current.Revision == q.ItemRevision {
+				return fmt.Errorf("entry %s is already bound to item revision %d", q.ID, q.ItemRevision)
+			}
+			req.ItemRevision, req.SourceMessageSeq = current.Revision, *source
+		}
+		if sub == "requeue" {
+			// Retry a released failed entry as a new attempt of its item. The
+			// attempt copies the failed entry unless a flag overrides it.
+			templateGiven := false
+			fs.Visit(func(f *flag.Flag) { templateGiven = templateGiven || f.Name == "template" })
+			if templateGiven {
+				if *template != "planned" && *template != "small" {
+					return errors.New("usage: tt team queue requeue --entry tqe_ID [--order SEQ] [--template planned|small] [--owns PATH...] [--cwd DIR]")
+				}
+				req.Template = *template
+			}
+			if *order < 0 {
+				return errors.New("usage: tt team queue requeue --entry tqe_ID [--order SEQ] [--template planned|small] [--owns PATH...] [--cwd DIR]")
+			}
+			req.OrderMessageSeq, req.Ownership = *order, ownership
+			if *cwd != "" {
+				// A new checkout of the same repository, at its HEAD.
+				if q.Host != spawn.Host() {
+					return fmt.Errorf("entry %s launches on %s; requeue it with --cwd from that host", q.ID, q.Host)
+				}
+				abs, absErr := filepath.Abs(*cwd)
+				if absErr != nil {
+					return absErr
+				}
+				if info, statErr := os.Stat(abs); statErr != nil || !info.IsDir() {
+					return fmt.Errorf("project cwd is not a directory: %s", abs)
+				}
+				owned := ownership
+				if len(owned) == 0 {
+					owned = q.Ownership
+				}
+				repository, scopeErr := queueRepositoryScope(abs, owned)
+				if scopeErr != nil {
+					return scopeErr
+				}
+				if repository != q.Repository {
+					return fmt.Errorf("%s is in repository %q, not the entry's %q", abs, repository, q.Repository)
+				}
+				req.Cwd = abs
+				if repository != "" {
+					if req.BaseCommit, err = queueGitCommit(abs); err != nil {
+						return err
+					}
+				}
+			} else if len(ownership) > 0 && q.Repository != "" && q.Cwd != "" {
+				if _, statErr := os.Stat(q.Cwd); statErr == nil {
+					if _, scopeErr := queueRepositoryScope(q.Cwd, ownership); scopeErr != nil {
+						return scopeErr
+					}
+				}
+			}
+		}
 		if sub == "fail" {
 			if strings.TrimSpace(*reason) == "" {
 				return errors.New("usage: tt team queue fail --entry tqe_ID --reason TEXT")
@@ -635,6 +718,10 @@ func cmdTeamQueue(e env, args []string) error {
 	} else {
 		if sub == "limit" {
 			fmt.Printf("concurrency limit=%s\n", queueLimitText(int(result.Revision)))
+		} else if sub == "rebind" {
+			fmt.Printf("rebind %s %s%s (%s)\n", result.ID, result.ItemID, queueAttemptText(result), result.State)
+		} else if sub == "requeue" {
+			fmt.Printf("requeue %s %s at %d item-revision=%d%s\n", result.ID, result.ItemID, result.Position, result.ItemRevision, queueAttemptText(result))
 		} else {
 			fmt.Printf("%s %s %s at %d\n", sub, result.ID, result.ItemID, result.Position)
 		}
@@ -753,6 +840,22 @@ func queueReleaseRequest(ctx context.Context, c *api.Client, hub, task string, q
 		req.Host = q.Host
 	}
 	return req, unlock, nil
+}
+
+// queueAttemptText is the list suffix for an entry that is a later attempt of
+// its item or was rebound to an amended item revision.
+func queueAttemptText(q api.TeamQueueEntry) string {
+	text := ""
+	if q.Attempt > 1 {
+		text += fmt.Sprintf(" attempt %d", q.Attempt)
+		if q.RetryOf != "" {
+			text += " retry-of=" + q.RetryOf
+		}
+	}
+	if n := len(q.Rebinds); n > 0 {
+		text += fmt.Sprintf(" rebound %d→%d", q.Rebinds[0].FromItemRevision, q.Rebinds[n-1].ToItemRevision)
+	}
+	return text
 }
 
 // queueArmText is the list suffix for an entry leased under a handler arm

@@ -3,9 +3,11 @@ package server
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -99,5 +101,125 @@ func TestTeamQueueListingHTTPSummariesDetailAndParameters(t *testing.T) {
 	var page api.TeamQueueList
 	if code := c.do("GET", base+"?limit=1&after=2", nil, &page); code != 200 || len(page.Entries) != 2 || page.History == nil || page.History.Limit != 1 || page.History.NextAfter != 0 {
 		t.Fatalf("paged = %d %+v", code, page)
+	}
+}
+
+// a11: rebind and requeue over HTTP. Refusals are 409 and carry the entry
+// ID; a rebind's approver is the authenticated caller, never the body.
+func TestTeamQueueRebindAndRequeueHTTP(t *testing.T) {
+	c := newClient(t)
+	st, ctx := c.st, context.Background()
+	c.who = api.Caller{Node: "owner-laptop", User: "owner@example.com"}
+	task := c.task("team-queue-rebind")
+	handler, err := st.AddAgent(ctx, task.ID, api.AddAgentRequest{AgentID: api.NewID("agt"), Name: "handler", Role: api.AgentRoleDatabaseHandler, Host: "fixture", Session: "handler"}, c.who)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.PostEvent(ctx, task.ID, api.PostEventRequest{AgentID: handler.ID, RunID: handler.RunID, Kind: api.EventRunning}, c.who); err != nil {
+		t.Fatal(err)
+	}
+	var item api.WorkItem
+	if code := c.do("POST", "/v1/tasks/"+task.ID+"/work-items", api.CreateWorkItemRequest{Kind: "bug", Title: "Amended after queueing", Description: "first scope", RequestID: "item"}, &item); code != 201 {
+		t.Fatalf("item = %d", code)
+	}
+	linked := func(key string, revision int64) api.Message {
+		t.Helper()
+		m, err := st.PostMessage(ctx, task.ID, api.PostMessageRequest{Text: key, RequestID: key, WorkItems: []api.MessageWorkItem{{ItemTaskID: task.ID, ItemID: item.ID, ItemRevision: revision, Relationship: "primary"}}}, c.who)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return m
+	}
+	confirm := func(current api.WorkItem, order int64) {
+		t.Helper()
+		if _, err := st.ConfirmWorkOrderScope(ctx, task.ID, item.ID, api.ConfirmWorkOrderScopeRequest{RequestID: api.NewID("req"), AgentID: handler.ID, RunID: handler.RunID, ExpectedRevision: current.Revision, ScopeRevision: current.ScopeRevision, OrderMessageSeq: order, Complete: true}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	order := linked("bounded-order", item.Revision)
+	confirm(item, order.Seq)
+	hub, err := api.NewClient(c.srv.URL, 5*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// conflict runs an action the hub must refuse with 409, naming the entry.
+	conflict := func(req api.TeamQueueRequest, entry string, want string) {
+		t.Helper()
+		req.RequestID = api.NewID("req")
+		_, err := hub.TeamQueueAction(ctx, task.ID, req)
+		var response *api.HTTPError
+		if !errors.As(err, &response) || response.Status != http.StatusConflict || !strings.Contains(response.Msg, entry) || !strings.Contains(response.Msg, want) {
+			t.Fatalf("%s = %v, want 409 naming %s with %q", req.Operation, err, entry, want)
+		}
+	}
+	action := func(req api.TeamQueueRequest) api.TeamQueueEntry {
+		t.Helper()
+		req.RequestID = api.NewID("req")
+		q, err := hub.TeamQueueAction(ctx, task.ID, req)
+		if err != nil {
+			t.Fatalf("%s: %v", req.Operation, err)
+		}
+		return q
+	}
+	queued := action(api.TeamQueueRequest{Operation: "add", ItemID: item.ID, OrderMessageSeq: order.Seq, Host: "fixture", Cwd: t.TempDir()})
+	if queued.Attempt != 1 || queued.ItemRevision != item.Revision {
+		t.Fatalf("queued %+v", queued)
+	}
+
+	description := "amended scope"
+	updated, err := st.UpdateWorkItem(ctx, task.ID, item.ID, api.UpdateWorkItemRequest{Revision: item.Revision, Description: &description}, api.Caller{Node: "owner-laptop", User: "amender@example.com"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	source := linked("scope-amendment", updated.Revision)
+	rebind := api.TeamQueueRequest{Operation: "rebind", EntryID: queued.ID, ExpectedRevision: queued.Revision, ItemRevision: updated.Revision, SourceMessageSeq: source.Seq}
+	conflict(rebind, queued.ID, "confirm scope for revision")
+	confirm(updated, order.Seq)
+
+	// The body cannot name the approver: an unknown approver field is ignored
+	// and the authenticated caller is recorded.
+	c.who = api.Caller{Node: "handler-host", User: "approver@example.com"}
+	var rebound api.TeamQueueEntry
+	body := map[string]any{"requestId": "rebind-http", "operation": "rebind", "entryId": queued.ID, "expectedRevision": queued.Revision, "itemRevision": updated.Revision, "sourceMessageSeq": source.Seq,
+		"caller": map[string]string{"node": "forged", "user": "forged"}, "Caller": map[string]string{"Node": "forged", "User": "forged"}}
+	if code := c.do("POST", "/v1/tasks/"+task.ID+"/team-queue/actions", body, &rebound); code != 200 {
+		t.Fatalf("rebind = %d", code)
+	}
+	if rebound.ID != queued.ID || rebound.ItemRevision != updated.Revision || len(rebound.Rebinds) != 1 {
+		t.Fatalf("rebound %+v", rebound)
+	}
+	history := rebound.Rebinds[0]
+	if history.ApprovedBy != (api.Sender{Node: "handler-host", User: "approver@example.com"}) || history.AmendedBy != (api.Sender{Node: "owner-laptop", User: "amender@example.com"}) ||
+		history.FromItemRevision != item.Revision || history.ToItemRevision != updated.Revision || history.SourceMessageSeq != source.Seq || history.EntryState != "queued" {
+		t.Fatalf("rebind history %+v", history)
+	}
+	c.who = api.Caller{Node: "owner-laptop", User: "owner@example.com"}
+	full, err := hub.GetTeamQueueEntry(ctx, task.ID, queued.ID)
+	if err != nil || len(full.Rebinds) != 1 || !reflect.DeepEqual(full.Rebinds[0], history) {
+		t.Fatalf("entry detail %+v %v", full, err)
+	}
+	conflict(api.TeamQueueRequest{Operation: "rebind", EntryID: queued.ID, ExpectedRevision: rebound.Revision, ItemRevision: updated.Revision, SourceMessageSeq: source.Seq}, queued.ID, "already bound")
+
+	// A live entry is not requeued; a failed one must be released first.
+	conflict(api.TeamQueueRequest{Operation: "requeue", EntryID: queued.ID, ExpectedRevision: rebound.Revision}, queued.ID, "only a released failed entry")
+	failed := action(api.TeamQueueRequest{Operation: "fail", EntryID: queued.ID, ExpectedRevision: rebound.Revision, Failure: "fixture failure"})
+	conflict(api.TeamQueueRequest{Operation: "requeue", EntryID: queued.ID, ExpectedRevision: failed.Revision}, queued.ID, "tt team queue release")
+	conflict(api.TeamQueueRequest{Operation: "rebind", EntryID: queued.ID, ExpectedRevision: failed.Revision, ItemRevision: updated.Revision, SourceMessageSeq: source.Seq}, queued.ID, "tt team queue requeue")
+	released := action(api.TeamQueueRequest{Operation: "release", EntryID: queued.ID, ExpectedRevision: failed.Revision})
+	conflict(api.TeamQueueRequest{Operation: "add", ItemID: item.ID, OrderMessageSeq: order.Seq, Host: "fixture", Cwd: t.TempDir()}, queued.ID, "tt team queue requeue")
+	retry := action(api.TeamQueueRequest{Operation: "requeue", EntryID: queued.ID, ExpectedRevision: released.Revision})
+	if retry.ID == queued.ID || retry.ItemID != item.ID || retry.Attempt != 2 || retry.RetryOf != queued.ID || retry.State != "queued" || retry.ItemRevision != updated.Revision {
+		t.Fatalf("retry %+v", retry)
+	}
+	conflict(api.TeamQueueRequest{Operation: "requeue", EntryID: queued.ID, ExpectedRevision: released.Revision}, queued.ID, retry.ID)
+
+	byItem, err := hub.ListTeamQueuePage(ctx, task.ID, api.TeamQueueListOptions{Item: item.ID})
+	if err != nil || len(byItem.Entries) != 2 || byItem.Entries[0].ID != retry.ID || byItem.Entries[1].ID != queued.ID || byItem.Entries[1].Summary || len(byItem.Entries[1].Rebinds) != 1 || byItem.Entries[1].Attempt != 1 {
+		t.Fatalf("item listing %+v %v", byItem, err)
+	}
+	// A history summary leaves the rebind detail to the entry.
+	list, err := hub.ListTeamQueue(ctx, task.ID)
+	if err != nil || len(list.Entries) != 2 || list.Entries[0].ID != retry.ID || !list.Entries[1].Summary || len(list.Entries[1].Rebinds) != 0 {
+		t.Fatalf("listing %+v %v", list, err)
 	}
 }

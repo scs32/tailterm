@@ -402,8 +402,14 @@ func (r teamRunner) advance(ctx context.Context, e env, c *api.Client, q api.Tea
 		if err != nil {
 			return err
 		}
-		if item.Revision != q.ItemRevision || item.Status == "done" || item.Status == "dismissed" {
+		if item.Status == "done" || item.Status == "dismissed" {
 			return r.fail(ctx, c, q, errors.New("queued item changed before launch"))
+		}
+		if item.Revision != q.ItemRevision {
+			// An amended item leaves its entry queued for tt team queue
+			// rebind. The hub skips it at the head and lists the reason, so
+			// later entries still launch; failing it would strand the item.
+			return nil
 		}
 		q, err = c.TeamQueueAction(ctx, q.TaskID, api.TeamQueueRequest{RequestID: "queue-claim-" + q.ID, Operation: "claim", EntryID: q.ID, ExpectedRevision: q.Revision, Host: host, PauseGeneration: detail.Task.PauseGeneration})
 		if err != nil {
