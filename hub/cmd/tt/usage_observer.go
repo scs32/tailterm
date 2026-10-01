@@ -453,13 +453,21 @@ func uploadUsage(ctx context.Context, u *usageCursor, c *api.Client) error {
 		}
 		return err
 	}
-	if receipt.RequestID != u.Pending.RequestID || receipt.Turns != len(u.Pending.Turns) || receipt.Spans != len(u.Pending.Spans) {
+	if receipt.RequestID != u.Pending.RequestID || receipt.Turns != len(u.Pending.Turns) || (receipt.Spans != 0 && receipt.Spans != len(u.Pending.Spans)) {
 		return fmt.Errorf("usage receipt mismatch")
 	}
-	// A stored chunk is immutable, so nothing is kept after its receipt.
-	for _, span := range u.Pending.Spans {
-		delete(u.SpanDirty, span.ID)
-		delete(u.Spans, span.ID)
+	if receipt.Spans == len(u.Pending.Spans) {
+		// A stored chunk is immutable, so nothing is kept after its receipt.
+		for _, span := range u.Pending.Spans {
+			delete(u.SpanDirty, span.ID)
+			delete(u.Spans, span.ID)
+		}
+	} else {
+		// The hub acknowledged the batch without storing its spans: it was
+		// rolled back to a build without usage.time after the capability was
+		// cached. The token turns are done; the spans stay pending and are
+		// not sent again until the capability is read anew.
+		usageTimeUnsupported(u.Binding)
 	}
 	for _, t := range u.Pending.Turns {
 		u.Uploaded[t.ID] = t.Revision

@@ -46,9 +46,12 @@ type usageTimeTurn struct {
 	Turn string `json:"turn"`
 	// First is the id the turn had before it took its token turns' activation
 	// id. Both are remembered, so a transcript read again emits nothing twice.
-	First   string                   `json:"first,omitempty"`
-	Start   time.Time                `json:"start"`
-	Last    time.Time                `json:"last"`
+	First string    `json:"first,omitempty"`
+	Start time.Time `json:"start"`
+	Last  time.Time `json:"last"`
+	// Busy is the latest time of anything measured: a call, an output, a
+	// request. The turn cannot end before it.
+	Busy    time.Time                `json:"busy,omitempty"`
 	Calls   map[string]usageTimeCall `json:"calls,omitempty"`
 	Tool    [][2]time.Time           `json:"tool,omitempty"`
 	Wait    [][2]time.Time           `json:"wait,omitempty"`
@@ -96,14 +99,32 @@ func (t *usageTimeTurn) full(at time.Time) bool {
 	return false
 }
 
-// clock keeps record time monotonic inside a turn: an earlier timestamp is
-// clamped to the last one seen and the turn says so.
+const usageClockGap = "record timestamps out of order; clamped"
+
+// clock notes the latest record time of the turn. Records are not always
+// written in timestamp order; each keeps its own time, and the turn says so
+// only where that changes a measured number: an output before its call, or
+// a turn end before something measured.
 func (t *usageTimeTurn) clock(at time.Time) time.Time {
-	if at.Before(t.Last) {
-		t.addGap("record timestamps out of order; clamped")
-		return t.Last
+	if at.After(t.Last) {
+		t.Last = at
 	}
-	t.Last = at
+	return at
+}
+
+func (t *usageTimeTurn) measured(at time.Time) {
+	if at.After(t.Busy) {
+		t.Busy = at
+	}
+}
+
+// end is the turn's end: the end record's own time, unless a call, output or
+// request was stamped after it. Other records stamped later do not move it.
+func (t *usageTimeTurn) end(at time.Time) time.Time {
+	if at.Before(t.Busy) {
+		t.addGap(usageClockGap)
+		return t.Busy
+	}
 	return at
 }
 func (t *usageTimeTurn) open(id string, class usageToolClass, at time.Time) {
@@ -113,6 +134,7 @@ func (t *usageTimeTurn) open(id string, class usageToolClass, at time.Time) {
 	if t.Calls == nil {
 		t.Calls = map[string]usageTimeCall{}
 	}
+	t.measured(at)
 	t.Calls[id] = usageTimeCall{Since: at, Class: class.Class}
 }
 func (t *usageTimeTurn) close(id string, at time.Time) {
@@ -125,8 +147,13 @@ func (t *usageTimeTurn) close(id string, at time.Time) {
 		at = t.OverflowAt
 	}
 	if !at.After(call.Since) {
+		if at.Before(call.Since) {
+			// An output timestamped before its call: no time is counted.
+			t.addGap(usageClockGap)
+		}
 		return
 	}
+	t.measured(at)
 	interval := [2]time.Time{call.Since, at}
 	switch call.Class {
 	case usageToolWaiting:
@@ -162,7 +189,10 @@ func (u *usageCursor) timeMark(note *usageTimeNote, at time.Time) {
 	if len(t.Marks) == 0 && note.Activation != "" && note.Activation != t.Turn && !u.SpanFinished[note.Activation] {
 		t.First, t.Turn = t.Turn, note.Activation
 	}
-	t.Marks = append(t.Marks, usageTimeMark{At: at, ID: note.ID})
+	// The mark keeps the timestamp the token ledger gave the request, so the
+	// request's tokens and the time in its segment are resolved alike.
+	t.measured(note.At)
+	t.Marks = append(t.Marks, usageTimeMark{At: note.At.UTC(), ID: note.ID})
 }
 
 // parseTime runs after the token ledger has parsed the same line.
@@ -217,7 +247,7 @@ func (u *usageCursor) parseCodexTime(rec activityRecord, at time.Time, note *usa
 	switch {
 	case rec.Type != "response_item" && (event == "task_complete" || event == "result"):
 		if u.Time != nil {
-			u.timeClose(u.Time.clock(at), "")
+			u.timeClose(u.Time.end(at), "")
 		}
 		return
 	case rec.Type == "response_item" && (event == "function_call" || event == "custom_tool_call"):
@@ -316,7 +346,7 @@ func (u *usageCursor) parseClaudeTime(line []byte, rec activityRecord, at time.T
 			}
 		}
 		if ended {
-			u.timeClose(at, "")
+			u.timeClose(t.end(at), "")
 		}
 	default:
 		t := u.Time
@@ -325,7 +355,7 @@ func (u *usageCursor) parseClaudeTime(line []byte, rec activityRecord, at time.T
 		}
 		at = t.clock(at)
 		if ended {
-			u.timeClose(at, "")
+			u.timeClose(t.end(at), "")
 		}
 	}
 }
@@ -622,6 +652,16 @@ func usageTimeSupported(b runtimeBinding) bool {
 	raw, _ := os.ReadFile(usageCapabilityPath(b.Hub))
 	_ = json.Unmarshal(raw, &cached)
 	return cached.Supported && cached.Time
+}
+
+// usageTimeUnsupported records that this hub did not store spans, until the
+// cached capability expires and is read again.
+func usageTimeUnsupported(b runtimeBinding) {
+	var cached usageCapabilityCache
+	raw, _ := os.ReadFile(usageCapabilityPath(b.Hub))
+	_ = json.Unmarshal(raw, &cached)
+	cached.At, cached.Time = time.Now().UTC(), false
+	_ = writePrivateJSON(usageCapabilityPath(b.Hub), cached)
 }
 
 // dirtySpans returns the unsent chunks in turn and chunk order.

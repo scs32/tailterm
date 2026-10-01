@@ -704,4 +704,77 @@ func TestUsageTimeWaitCauses(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Logf("usage report over %d chunks took %v", 5000+4, time.Since(started))
+
+	// The same report with 8,000 obligations another agent wrote to the
+	// handler: they cannot explain this item's waits and are never walked.
+	before := report.Items[0].Time.Causes
+	tx, err := f.s.db.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 8000; i++ {
+		at := ts(base.Add(time.Duration(i) * time.Second))
+		r, err := tx.Exec(`INSERT INTO messages(task_id,from_agent,from_node,from_user,to_agent,text,created_at,envelope) VALUES(?,?,'fixture','agent',?,'synthetic',?,'{}')`, f.task.ID, reviewer.ID, handler.ID, at)
+		if err != nil {
+			t.Fatal(err)
+		}
+		seq, _ := r.LastInsertId()
+		if _, err = tx.Exec(`INSERT INTO obligations (id,task_id,message_seq,agent_id,subject,source_kind,needs,state,created_at,ack_due_at,due_at,changed_at,closed_at,recipient_kind) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, api.NewID("obl"), f.task.ID, seq, handler.ID, "Synthetic bulk request", api.EnvelopeKindRequest, api.ObligationNeedsAnswer, api.ObligationClosed, at, at, at, at, ts(base.Add(time.Duration(i+30)*time.Second)), api.ObligationRecipientAgent); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err = tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	started = time.Now()
+	report, err = f.s.Usage(context.Background(), f.task.ID, api.UsageQuery{Item: x})
+	if err != nil || report.Items[0].Time == nil {
+		t.Fatal(err)
+	}
+	t.Logf("usage report over %d chunks with 8,000 more obligations took %v", 5000+4, time.Since(started))
+	// The reviewer wrote them, so only its own waits may change cause: the
+	// builder's handler and teammate waits and the owner waits are as before.
+	after := report.Items[0].Time.Causes
+	if after.Owner != before.Owner || msOf(t, after.Handler)+msOf(t, after.Teammate)+msOf(t, after.Unknown) != msOf(t, before.Handler)+msOf(t, before.Teammate)+msOf(t, before.Unknown) || msOf(t, after.Handler) < msOf(t, before.Handler) {
+		t.Fatalf("causes changed: before %+v after %+v", before, after)
+	}
+
+	// The span query reads only this project's rows, through the index.
+	rows, err := f.s.db.Query(`EXPLAIN QUERY PLAN SELECT agent_id,run_id,payload,projection FROM usage_spans WHERE task_id=? ORDER BY start_at`, f.task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan := ""
+	for rows.Next() {
+		var id, parent, unused int
+		var detail string
+		if err = rows.Scan(&id, &parent, &unused, &detail); err != nil {
+			t.Fatal(err)
+		}
+		plan += detail + "\n"
+	}
+	rows.Close()
+	if !strings.Contains(plan, "usage_spans_time") || strings.Contains(plan, "TEMP B-TREE") {
+		t.Fatalf("span query does not use the index:\n%s", plan)
+	}
+	// Another project's spans never enter this project's report.
+	otherTask, err := f.s.CreateTask(context.Background(), api.CreateTaskRequest{Name: "Another synthetic project"}, f.by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stranger, err := f.s.AddAgent(context.Background(), otherTask.ID, api.AddAgentRequest{Name: "stranger", AgentID: api.NewID("agt"), Runtime: "claude", Host: "fixture", Session: "synthetic-stranger"}, f.by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = f.s.ReportUsage(context.Background(), otherTask.ID, stranger.ID, spanBatch(stranger, "other-project", testSpan("turn-other", "09:00:00", "09:30:00"))); err != nil {
+		t.Fatal(err)
+	}
+	again, err := f.s.Usage(context.Background(), f.task.ID, api.UsageQuery{})
+	if err != nil || again.Overhead.Time != nil {
+		t.Fatalf("another project's spans leaked into overhead: %+v %v", again.Overhead.Time, err)
+	}
+	elsewhere, err := f.s.Usage(context.Background(), otherTask.ID, api.UsageQuery{})
+	if err != nil || elsewhere.Overhead.Time == nil || msOf(t, elsewhere.Overhead.Time.WallMs) != 30*minute {
+		t.Fatalf("other project's own report: %+v %v", elsewhere.Overhead.Time, err)
+	}
 }

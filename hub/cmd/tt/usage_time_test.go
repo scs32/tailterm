@@ -346,6 +346,22 @@ func TestUsageTimePollRequests(t *testing.T) {
 	}
 }
 
+// A wait whose output passes through a filter is still a poll request.
+func TestUsageTimePollRequestsThroughFilters(t *testing.T) {
+	start := fixtureTime("14:00:00")
+	for _, runtime := range []string{"codex", "claude"} {
+		for _, command := range []string{"tt inbox --unread --mark-read --wait 9m 2>&1 | tail -5", "tt inbox --wait 9m | head -40 || true"} {
+			u := newSyntheticUsage(t, runtime)
+			from := start.Add(2 * time.Second)
+			parseUsageLines(t, u, syntheticToolTurn(runtime, start, start.Add(545*time.Second), []string{command}, [][2]time.Time{{from, from.Add(9 * time.Minute)}})...)
+			got := totalsOf(chunksOf(t, u, turnsOf(u)[0]))
+			if got.polls != 1 || got.wait != 9*60000 || got.mixed != 0 || got.tool != 0 || got.model != 5000 {
+				t.Errorf("%s %q: %+v", runtime, command, got)
+			}
+		}
+	}
+}
+
 func TestUsageTimeTurnBoundaries(t *testing.T) {
 	t.Run("claude turn ended by turn_duration", func(t *testing.T) {
 		u := newSyntheticUsage(t, "claude")
@@ -402,6 +418,67 @@ func TestUsageTimeTurnBoundaries(t *testing.T) {
 		}
 		if strings.HasPrefix(u.Coverage, "partial: malformed") {
 			t.Fatal(u.Coverage)
+		}
+	})
+	t.Run("records out of timestamp order keep the ledger's request times", func(t *testing.T) {
+		u := newSyntheticUsage(t, "claude")
+		usage := `"usage":{"input_tokens":3,"cache_read_input_tokens":80,"cache_creation_input_tokens":12,"output_tokens":7,"output_tokens_details":{"thinking_tokens":2}}`
+		parseUsageLines(t, u,
+			`{"type":"user","timestamp":"2026-01-01T10:00:00.000Z","message":{"content":"fixture prompt"}}`,
+			// Written after the prompt, stamped before it.
+			`{"type":"file-history-snapshot","timestamp":"2026-01-01T09:59:59.000Z"}`,
+			`{"type":"assistant","timestamp":"2026-01-01T10:00:05.000Z","message":{"id":"msg_first","model":"fixture-claude-model","stop_reason":"tool_use","content":[{"type":"tool_use","id":"late","name":"Bash","input":{"command":"ls"}}],`+usage+`}}`,
+			`{"type":"attachment","timestamp":"2026-01-01T10:00:03.000Z"}`,
+			`{"type":"user","timestamp":"2026-01-01T10:00:10.000Z","message":{"content":[{"type":"tool_result","tool_use_id":"late"}]}}`,
+			// The next request's first record is stamped before the tool result.
+			`{"type":"assistant","timestamp":"2026-01-01T10:00:08.000Z","message":{"id":"msg_second","model":"fixture-claude-model","stop_reason":null,`+usage+`}}`,
+			`{"type":"assistant","timestamp":"2026-01-01T10:00:12.000Z","message":{"id":"msg_second","model":"fixture-claude-model","stop_reason":"end_turn",`+usage+`}}`,
+		)
+		chunks := chunksOf(t, u, turnsOf(u)[0])
+		// No measured number changed, so the turn carries no gap.
+		if got := totalsOf(chunks); len(chunks) != 1 || chunks[0].Gap != "" || got.tool != 5000 || got.model != 7000 || got.wall != 12000 {
+			t.Fatalf("turn %+v totals %+v", chunks, got)
+		}
+		// Each segment names its request at exactly the token ledger's time.
+		want := map[string]bool{}
+		for _, turn := range u.Turns {
+			want[turn.At.UTC().Format(time.RFC3339Nano)] = true
+		}
+		if len(want) != 2 || !want["2026-01-01T10:00:08Z"] {
+			t.Fatalf("token turn times %+v", want)
+		}
+		for _, piece := range chunks[0].Segments {
+			if !want[piece.At.UTC().Format(time.RFC3339Nano)] {
+				t.Fatalf("segment request time %v is not a token turn time %+v", piece.At, want)
+			}
+			delete(want, piece.At.UTC().Format(time.RFC3339Nano))
+		}
+		if len(want) != 0 {
+			t.Fatalf("requests without a segment: %+v", want)
+		}
+		// A bookkeeping record stamped after the end record does not move the end.
+		v := newSyntheticUsage(t, "claude")
+		parseUsageLines(t, v,
+			`{"type":"user","timestamp":"2026-01-01T11:00:00.000Z","message":{"content":"fixture prompt"}}`,
+			`{"type":"attachment","timestamp":"2026-01-01T11:00:09.000Z"}`,
+			`{"type":"assistant","timestamp":"2026-01-01T11:00:07.000Z","message":{"id":"msg_end","model":"fixture-claude-model","stop_reason":"end_turn",`+usage+`}}`,
+		)
+		plain := chunksOf(t, v, turnsOf(v)[0])
+		if !plain[0].End.Equal(fixtureTime("11:00:07")) || plain[0].Gap != "" {
+			t.Fatalf("end moved by an unmeasured record: %+v", plain[0])
+		}
+		// A tool output stamped after the end record does: the turn cannot end
+		// before it, and the turn says so.
+		w := newSyntheticUsage(t, "claude")
+		parseUsageLines(t, w,
+			`{"type":"user","timestamp":"2026-01-01T12:00:00.000Z","message":{"content":"fixture prompt"}}`,
+			`{"type":"assistant","timestamp":"2026-01-01T12:00:02.000Z","message":{"id":"msg_tool","model":"fixture-claude-model","stop_reason":"tool_use","content":[{"type":"tool_use","id":"slow","name":"Bash","input":{"command":"ls"}}],`+usage+`}}`,
+			`{"type":"user","timestamp":"2026-01-01T12:00:09.000Z","message":{"content":[{"type":"tool_result","tool_use_id":"slow"}]}}`,
+			`{"type":"assistant","timestamp":"2026-01-01T12:00:07.000Z","message":{"id":"msg_last","model":"fixture-claude-model","stop_reason":"end_turn",`+usage+`}}`,
+		)
+		late := chunksOf(t, w, turnsOf(w)[0])
+		if got := totalsOf(late); !late[0].End.Equal(fixtureTime("12:00:09")) || !strings.Contains(late[0].Gap, "out of order") || got.tool != 7000 || got.model != 2000 {
+			t.Fatalf("clamped end %+v totals %+v", late[0], got)
 		}
 	})
 	t.Run("a transcript read again emits no turn twice", func(t *testing.T) {
@@ -781,6 +858,76 @@ func TestUsageTimeCapabilityGate(t *testing.T) {
 	}
 	if len(batches) != 2 || len(batches[1].Spans) != 1 || len(batches[1].Turns) != 0 || restarted.hasPendingWork() {
 		t.Fatalf("spans not sent after upgrade: %+v", batches)
+	}
+}
+
+// A hub rolled back to a build without span storage after the capability was
+// cached: it decodes loosely, stores the token turns and answers without a
+// span count. The batch must not strand.
+func TestUsageTimeCapabilityGateRolledBackHub(t *testing.T) {
+	t.Setenv("TAILTERM_RELAY_STATE", t.TempDir())
+	storesSpans := false
+	var batches []api.UsageBatch
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var b api.UsageBatch
+		json.NewDecoder(r.Body).Decode(&b)
+		batches = append(batches, b)
+		receipt := api.UsageReceipt{RequestID: b.RequestID, Turns: len(b.Turns)}
+		if storesSpans {
+			receipt.Spans = len(b.Spans)
+		}
+		json.NewEncoder(w).Encode(receipt)
+	}))
+	defer srv.Close()
+	c, _ := api.NewClient(srv.URL, time.Second)
+	b := runtimeBinding{Hub: srv.URL, Task: "tsk_1111111111111111", Agent: "agt_1111111111111111", Run: "run_1111111111111111", Thread: "12345678-1234-1234-1234-123456789abc", Runtime: "codex"}
+	setUsageTimeCapability(t, b.Hub, true)
+	u, err := loadUsageCursor(b)
+	if err != nil {
+		t.Fatal(err)
+	}
+	parseUsageLines(t, u, usageTimeFixture(t, "codex-overlap.jsonl")...)
+	if err = uploadUsage(context.Background(), u, c); err != nil {
+		t.Fatal("acknowledged batch reported as failed:", err)
+	}
+	if len(batches) != 1 || len(batches[0].Turns) != 2 || len(batches[0].Spans) != 1 {
+		t.Fatalf("first batch %+v", batches)
+	}
+	// Token turns are cleared, the batch is gone, the spans are still owed.
+	if u.Pending != nil || len(u.Dirty) != 0 || len(u.SpanDirty) != 1 || len(u.Spans) != 1 || !u.hasPendingWork() {
+		t.Fatalf("pending=%v dirty=%d spans=%d", u.Pending != nil, len(u.Dirty), len(u.SpanDirty))
+	}
+	// Nothing is sent again while the hub cannot store spans.
+	if usageTimeSupported(b) || u.hasSendableWork() {
+		t.Fatal("spans would be sent again to a hub that drops them")
+	}
+	for i := 0; i < 3; i++ {
+		u.LastUploadAttempt = time.Time{}
+		if err = uploadUsage(context.Background(), u, c); err != nil || len(batches) != 1 {
+			t.Fatalf("resent: batches=%d err=%v", len(batches), err)
+		}
+	}
+	// New token turns still upload on their own.
+	one := map[string]int64{"input_tokens": 100, "cached_input_tokens": 80, "cache_write_input_tokens": 0, "output_tokens": 10, "reasoning_output_tokens": 4, "total_tokens": 110}
+	three := map[string]int64{}
+	for k, v := range one {
+		three[k] = 3 * v
+	}
+	parseUsageLines(t, u, `{"timestamp":"2026-01-01T10:10:00.000Z","type":"event_msg","payload":{"type":"task_started","turn_id":"later-turn"}}`, codexUsageEvent("2026-01-01T10:10:05.000Z", one, three), `{"timestamp":"2026-01-01T10:10:06.000Z","type":"event_msg","payload":{"type":"task_complete"}}`)
+	u.LastUploadAttempt = time.Time{}
+	if err = uploadUsage(context.Background(), u, c); err != nil || len(batches) != 2 || len(batches[1].Turns) != 1 || len(batches[1].Spans) != 0 || len(u.Dirty) != 0 || len(u.SpanDirty) != 2 {
+		t.Fatalf("token-only upload: batches=%d dirty=%d spans=%d err=%v", len(batches), len(u.Dirty), len(u.SpanDirty), err)
+	}
+	// The hub is upgraded again and the capability is read anew: the spans go.
+	storesSpans = true
+	setUsageTimeCapability(t, b.Hub, true)
+	restarted, err := loadUsageCursor(b)
+	if err != nil {
+		t.Fatal(err)
+	}
+	restarted.LastUploadAttempt = time.Time{}
+	if err = uploadUsage(context.Background(), restarted, c); err != nil || len(batches) != 3 || len(batches[2].Spans) != 2 || restarted.hasPendingWork() {
+		t.Fatalf("spans after upgrade: batches=%d err=%v", len(batches), err)
 	}
 }
 

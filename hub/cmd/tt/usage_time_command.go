@@ -333,19 +333,47 @@ const (
 	usageCommandTT
 	usageCommandInbox
 	usageCommandWait
+	usageCommandFilter // a pure output filter such as head or tail
+	usageCommandTrue
 )
+
+// How a simple command is joined to the one before it.
+const (
+	usageJoinSequence = iota // start of the string, ; & or newline
+	usageJoinPipe
+	usageJoinAnd
+	usageJoinOr
+)
+
+type usageSimpleCommand struct{ kind, join int }
 
 func classifyUsageCommands(commands []string) usageToolClass {
 	blocking, other, total := false, false, 0
 	inboxOnly := true
 	for _, command := range commands {
-		kinds, ok := usageShellCommandKinds(command, 0)
+		simple, ok := usageShellCommandKinds(command, 0)
 		if !ok {
 			return usageUnclassified
 		}
 		leading := true
-		for _, kind := range kinds {
+		// inboxPipe: the current pipeline is an inbox command followed only by
+		// output filters. Such a filter only trims what the inbox command
+		// printed, so it changes neither the class nor the inbox-only flag.
+		inboxPipe := false
+		for i, c := range simple {
 			total++
+			kind := c.kind
+			if c.join != usageJoinPipe {
+				inboxPipe = kind == usageCommandWait || kind == usageCommandInbox
+			} else if kind == usageCommandFilter && inboxPipe {
+				continue
+			} else {
+				inboxPipe = false
+			}
+			// A trailing "|| true" only discards the exit status.
+			if kind == usageCommandTrue && c.join == usageJoinOr && i == len(simple)-1 && i > 0 {
+				continue
+			}
 			switch kind {
 			case usageCommandWait:
 				blocking, leading = true, false
@@ -379,32 +407,45 @@ func classifyUsageCommands(commands []string) usageToolClass {
 	return usageUnclassified
 }
 
+// usageShellWord is one shell word. quoted says some part of it was quoted,
+// so it is an argument and never a redirection.
+type usageShellWord struct {
+	text   string
+	quoted bool
+}
+
 // usageShellCommandKinds tokenises one shell string with quote handling and
-// splits it into simple commands at ; && || | & and newline. Command
-// substitution, a heredoc or unbalanced quotes fail the whole string.
-func usageShellCommandKinds(src string, depth int) ([]int, bool) {
-	var kinds []int
-	var words []string
+// splits it into simple commands at ; && || | & and newline, keeping how each
+// is joined to the one before. Command substitution, a heredoc or unbalanced
+// quotes fail the whole string.
+func usageShellCommandKinds(src string, depth int) ([]usageSimpleCommand, bool) {
+	var kinds []usageSimpleCommand
+	var words []usageShellWord
 	var word strings.Builder
-	inWord := false
+	inWord, quoted := false, false
 	flushWord := func() {
 		if inWord {
-			words = append(words, word.String())
+			words = append(words, usageShellWord{word.String(), quoted})
 			word.Reset()
-			inWord = false
+			inWord, quoted = false, false
 		}
 	}
 	ok := true
-	flushCommand := func() {
+	join := usageJoinSequence
+	flushCommand := func(next int) {
 		flushWord()
 		if len(words) > 0 {
 			nested, valid := usageSimpleCommandKinds(words, depth)
 			if !valid {
 				ok = false
 			}
+			if len(nested) > 0 {
+				nested[0].join = join
+			}
 			kinds = append(kinds, nested...)
 		}
 		words = nil
+		join = next
 	}
 	for i := 0; i < len(src); i++ {
 		c := src[i]
@@ -415,7 +456,7 @@ func usageShellCommandKinds(src string, depth int) ([]int, bool) {
 				return nil, false
 			}
 			word.WriteString(src[i+1 : i+1+end])
-			inWord = true
+			inWord, quoted = true, true
 			i += end + 1
 		case '"':
 			closed := false
@@ -437,7 +478,7 @@ func usageShellCommandKinds(src string, depth int) ([]int, bool) {
 			if !closed {
 				return nil, false
 			}
-			inWord = true
+			inWord, quoted = true, true
 		case '\\':
 			if i+1 >= len(src) {
 				return nil, false
@@ -473,15 +514,20 @@ func usageShellCommandKinds(src string, depth int) ([]int, bool) {
 		case ' ', '\t', '\r':
 			flushWord()
 		case '\n', ';':
-			flushCommand()
+			flushCommand(usageJoinSequence)
 		case '|':
-			flushCommand()
-			if i+1 < len(src) && (src[i+1] == '|' || src[i+1] == '&') {
+			if i+1 < len(src) && src[i+1] == '|' {
+				flushCommand(usageJoinOr)
+				i++
+				continue
+			}
+			flushCommand(usageJoinPipe)
+			if i+1 < len(src) && src[i+1] == '&' {
 				i++
 			}
 		case '&':
 			if i+1 < len(src) && src[i+1] == '&' {
-				flushCommand()
+				flushCommand(usageJoinAnd)
 				i++
 				continue
 			}
@@ -491,14 +537,49 @@ func usageShellCommandKinds(src string, depth int) ([]int, bool) {
 				inWord = true
 				continue
 			}
-			flushCommand()
+			flushCommand(usageJoinSequence)
 		default:
 			word.WriteByte(c)
 			inWord = true
 		}
 	}
-	flushCommand()
+	flushCommand(usageJoinSequence)
 	return kinds, ok
+}
+
+// usageOutputFilter reports a filter that only trims its input: head, tail,
+// cut, cat, grep, awk, jq, wc, or sed -n. One that redirects to a file, or a
+// sed that prints everything or edits in place, is ordinary work.
+func usageOutputFilter(base string, args []usageShellWord) bool {
+	switch base {
+	case "head", "tail", "cut", "cat", "grep", "awk", "jq", "wc", "sed":
+	default:
+		return false
+	}
+	quiet := false
+	for _, arg := range args {
+		if arg.quoted {
+			continue
+		}
+		if strings.ContainsAny(arg.text, "<>") {
+			switch arg.text {
+			case "2>&1", "2>/dev/null", ">/dev/null", "&>/dev/null":
+			default:
+				return false
+			}
+			continue
+		}
+		if base == "sed" && strings.HasPrefix(arg.text, "-") {
+			if arg.text == "--quiet" || arg.text == "--silent" {
+				quiet = true
+			} else if strings.HasPrefix(arg.text, "--") || strings.ContainsAny(arg.text, "iw") {
+				return false
+			} else if strings.Contains(arg.text, "n") {
+				quiet = true
+			}
+		}
+	}
+	return base != "sed" || quiet
 }
 
 func usageAssignmentWord(word string) bool {
@@ -517,16 +598,17 @@ func usageAssignmentWord(word string) bool {
 
 // usageSimpleCommandKinds names one simple command. A bash|sh|zsh -c STRING
 // recurses once into STRING and may return several kinds.
-func usageSimpleCommandKinds(words []string, depth int) ([]int, bool) {
+func usageSimpleCommandKinds(words []usageShellWord, depth int) ([]usageSimpleCommand, bool) {
+	one := func(kind int) ([]usageSimpleCommand, bool) { return []usageSimpleCommand{{kind: kind}}, true }
 	for len(words) > 0 {
-		w := words[0]
+		w := words[0].text
 		switch {
 		case usageAssignmentWord(w), w == "env", w == "command", w == "exec", w == "nohup", w == "time":
 			words = words[1:]
 			continue
 		case w == "timeout":
 			if len(words) < 2 {
-				return []int{usageCommandOther}, true
+				return one(usageCommandOther)
 			}
 			words = words[2:]
 			continue
@@ -536,33 +618,38 @@ func usageSimpleCommandKinds(words []string, depth int) ([]int, bool) {
 	if len(words) == 0 {
 		return nil, true
 	}
-	base := filepath.Base(words[0])
+	base := filepath.Base(words[0].text)
 	args := words[1:]
 	switch base {
 	case "bash", "sh", "zsh":
-		if depth == 0 && len(args) == 2 && (args[0] == "-c" || args[0] == "-lc") {
-			return usageShellCommandKinds(args[1], depth+1)
+		if depth == 0 && len(args) == 2 && (args[0].text == "-c" || args[0].text == "-lc") {
+			return usageShellCommandKinds(args[1].text, depth+1)
 		}
-		return []int{usageCommandOther}, true
+		return one(usageCommandOther)
 	case "cd":
-		return []int{usageCommandCD}, true
+		return one(usageCommandCD)
+	case "true":
+		return one(usageCommandTrue)
 	case "tt":
 	default:
-		return []int{usageCommandOther}, true
+		if usageOutputFilter(base, args) {
+			return one(usageCommandFilter)
+		}
+		return one(usageCommandOther)
 	}
 	if len(args) == 0 {
-		return []int{usageCommandTT}, true
+		return one(usageCommandTT)
 	}
-	switch args[0] {
+	switch args[0].text {
 	case "wait":
-		return []int{usageCommandWait}, true
+		return one(usageCommandWait)
 	case "inbox":
 		for _, arg := range args[1:] {
-			if arg == "--wait" || strings.HasPrefix(arg, "--wait=") {
-				return []int{usageCommandWait}, true
+			if arg.text == "--wait" || strings.HasPrefix(arg.text, "--wait=") {
+				return one(usageCommandWait)
 			}
 		}
-		return []int{usageCommandInbox}, true
+		return one(usageCommandInbox)
 	}
-	return []int{usageCommandTT}, true
+	return one(usageCommandTT)
 }

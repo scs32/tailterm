@@ -1,6 +1,7 @@
 package store
 
 import (
+	"container/heap"
 	"context"
 	"database/sql"
 	"encoding/hex"
@@ -272,10 +273,6 @@ type waitCandidate struct {
 	items    map[string]bool
 }
 
-func (c waitCandidate) openOver(from, to time.Time) bool {
-	return !c.from.After(from) && (c.to.IsZero() || !c.to.Before(to))
-}
-
 func loadWaitCandidates(ctx context.Context, tx *sql.Tx, task string) ([]waitCandidate, error) {
 	links := map[int64]map[string]bool{}
 	rows, err := tx.QueryContext(ctx, `SELECT message_seq,item_id FROM message_work_item_links WHERE message_task_id=? AND item_task_id=?`, task, task)
@@ -354,24 +351,57 @@ LEFT JOIN decision_answers a ON a.task_id=r.task_id AND a.request_seq=r.message_
 	return out, nil
 }
 
-// waitCause labels one stretch during which nothing relevant opens or closes
-// by the first rule that matches. Candidates are in creation order, so the
-// earliest created wins inside a rule.
-func waitCause(candidates []waitCandidate, agent, item string, from, to time.Time) (string, *waitCandidate) {
-	rules := []struct {
-		cause string
-		match func(c *waitCandidate) bool
-	}{
-		{"owner", func(c *waitCandidate) bool { return c.owner && c.author == agent }},
-		{"handler", func(c *waitCandidate) bool { return !c.owner && c.handler && c.author == agent }},
-		{"teammate", func(c *waitCandidate) bool { return !c.owner && c.author == agent }},
-		{"owner", func(c *waitCandidate) bool { return c.owner && c.items[item] }},
-	}
-	for _, rule := range rules {
-		for i := range candidates {
-			if c := &candidates[i]; rule.match(c) && c.openOver(from, to) {
-				return rule.cause, c
+// waitRules, in order: the first rule with something open names the cause.
+var waitRules = [4]string{"owner", "handler", "teammate", "owner"}
+
+func waitRuleMatches(c *waitCandidate, agent, item string) [4]bool {
+	mine := c.author == agent
+	return [4]bool{c.owner && mine, !c.owner && c.handler && mine, !c.owner && mine, c.owner && c.items[item]}
+}
+
+type waitHeap []int
+
+func (h waitHeap) Len() int           { return len(h) }
+func (h waitHeap) Less(i, j int) bool { return h[i] < h[j] }
+func (h waitHeap) Swap(i, j int)      { h[i], h[j] = h[j], h[i] }
+func (h *waitHeap) Push(x any)        { *h = append(*h, x.(int)) }
+func (h *waitHeap) Pop() any {
+	old := *h
+	x := old[len(old)-1]
+	*h = old[:len(old)-1]
+	return x
+}
+
+// waitSweep labels the pieces of one waiting stretch in time order. Its
+// candidates are in creation order, and the pieces were cut at every open
+// and close, so whatever is open at a piece's start is open over all of it.
+// Per rule it keeps what is open, earliest created first; each candidate
+// enters and leaves once.
+type waitSweep struct {
+	candidates  []waitCandidate
+	agent, item string
+	next        int
+	open        [4]waitHeap
+}
+
+func (s *waitSweep) cause(from time.Time) (string, *waitCandidate) {
+	for s.next < len(s.candidates) && !s.candidates[s.next].from.After(from) {
+		for rule, ok := range waitRuleMatches(&s.candidates[s.next], s.agent, s.item) {
+			if ok {
+				heap.Push(&s.open[rule], s.next)
 			}
+		}
+		s.next++
+	}
+	for rule := range s.open {
+		h := &s.open[rule]
+		for h.Len() > 0 {
+			c := &s.candidates[(*h)[0]]
+			if !c.to.IsZero() && !c.to.After(from) {
+				heap.Pop(h) // closed before this piece
+				continue
+			}
+			return waitRules[rule], c
 		}
 	}
 	return "unknown", nil
@@ -400,7 +430,8 @@ func usageTimeReports(ctx context.Context, tx *sql.Tx, task string, q api.UsageQ
 		}
 		return items[item][agent]
 	}
-	rows, err := tx.QueryContext(ctx, `SELECT agent_id,run_id,payload,projection FROM usage_spans ORDER BY agent_id,start_at,span_id`)
+	// Only this project's spans, by the (task_id,start_at) index.
+	rows, err := tx.QueryContext(ctx, `SELECT agent_id,run_id,payload,projection FROM usage_spans WHERE task_id=? ORDER BY start_at`, task)
 	if err != nil {
 		return nil, err
 	}
@@ -485,8 +516,41 @@ func usageTimeReports(ctx context.Context, tx *sql.Tx, task string, q api.UsageQ
 	if err != nil {
 		return nil, err
 	}
+	// Index the Board once per report: what each agent authored, and the
+	// owner requests linked to each item. A wait is then compared only with
+	// the few candidates that could explain it.
+	byAuthor, ownerByItem := map[string][]int{}, map[string][]int{}
+	for i, c := range candidates {
+		if c.author != "" {
+			byAuthor[c.author] = append(byAuthor[c.author], i)
+		}
+		if c.owner {
+			for item := range c.items {
+				ownerByItem[item] = append(ownerByItem[item], i)
+			}
+		}
+	}
+	relevant := func(agent, item string) []waitCandidate {
+		a, b := byAuthor[agent], ownerByItem[item]
+		merged := make([]waitCandidate, 0, len(a)+len(b))
+		// Both lists are in creation order; merge them without duplicates.
+		for i, j := 0, 0; i < len(a) || j < len(b); {
+			switch {
+			case j == len(b) || (i < len(a) && a[i] < b[j]):
+				merged = append(merged, candidates[a[i]])
+				i++
+			case i == len(a) || b[j] < a[i]:
+				merged = append(merged, candidates[b[j]])
+				j++
+			default:
+				merged = append(merged, candidates[a[i]])
+				i, j = i+1, j+1
+			}
+		}
+		return merged
+	}
 	for item, agents := range items {
-		if report := assembleUsageTime(item, agents, candidates, names); report != nil {
+		if report := assembleUsageTime(item, agents, relevant, names); report != nil {
 			out[item] = report
 		}
 	}
@@ -503,7 +567,7 @@ func usageMs(ns *big.Rat) string {
 }
 func durationRat(d time.Duration, den int64) *big.Rat { return big.NewRat(int64(d), den) }
 
-func assembleUsageTime(item string, agents map[string]*timeAgent, candidates []waitCandidate, names map[string]string) *api.UsageTime {
+func assembleUsageTime(item string, agents map[string]*timeAgent, relevant func(agent, item string) []waitCandidate, names map[string]string) *api.UsageTime {
 	var from, to time.Time
 	ids := make([]string, 0, len(agents))
 	for id, a := range agents {
@@ -623,12 +687,19 @@ func assembleUsageTime(item string, agents map[string]*timeAgent, candidates []w
 		waiting(at, to, 1, 1, last.phase, last.role)
 
 		// What each wait was for: split at every open and close, then label.
+		awaited := relevant(id, item)
 		for _, w := range stretches {
 			cuts := []time.Time{w.from, w.to}
-			for _, c := range candidates {
-				if c.author != id && !(c.owner && c.items[item]) {
+			// Only what was open at some point of this stretch can explain it.
+			var candidates []waitCandidate
+			for _, c := range awaited {
+				if !c.from.Before(w.to) {
+					break // in creation order: nothing later was open yet
+				}
+				if !c.to.IsZero() && !c.to.After(w.from) {
 					continue
 				}
+				candidates = append(candidates, c)
 				for _, edge := range []time.Time{c.from, c.to} {
 					if edge.After(w.from) && edge.Before(w.to) {
 						cuts = append(cuts, edge)
@@ -636,11 +707,12 @@ func assembleUsageTime(item string, agents map[string]*timeAgent, candidates []w
 				}
 			}
 			sort.Slice(cuts, func(i, j int) bool { return cuts[i].Before(cuts[j]) })
+			sweep := waitSweep{candidates: candidates, agent: id, item: item}
 			for i := 1; i < len(cuts); i++ {
 				if !cuts[i].After(cuts[i-1]) {
 					continue
 				}
-				cause, c := waitCause(candidates, id, item, cuts[i-1], cuts[i])
+				cause, c := sweep.cause(cuts[i-1])
 				amount := big.NewRat(int64(cuts[i].Sub(cuts[i-1]))*w.num, w.den)
 				causes[cause].Add(causes[cause], amount)
 				key := waitKey{cause: cause}

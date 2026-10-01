@@ -51,6 +51,24 @@ func TestUsageTimeCommandClassification(t *testing.T) {
 		{"tt wait", want{usageToolWaiting, true}},
 		{"tt inbox --unread --mark-read --wait 9m 2>&1", want{usageToolWaiting, true}},
 		{"env TAILTERM_X=1 nohup tt wait", want{usageToolWaiting, true}},
+		// Still waiting when the wait's own output only passes through pure
+		// output filters, with or without 2>&1, or ends in "|| true" (lead
+		// decision #19166). The call stays inbox-only, so polls count it.
+		{"tt inbox --unread --mark-read --wait 9m 2>&1 | tail -5", want{usageToolWaiting, true}},
+		{"tt inbox --unread --wait 9m | head -40", want{usageToolWaiting, true}},
+		{"tt inbox --wait 9m 2>&1 | head -c 4000", want{usageToolWaiting, true}},
+		{"tt inbox --wait 9m | cut -c1-2000", want{usageToolWaiting, true}},
+		{"tt inbox --wait 9m 2>&1 | awk 'NR<=60 {print $0}' | tail -20", want{usageToolWaiting, true}},
+		{"tt inbox --wait 9m | grep -v '^$' | cat", want{usageToolWaiting, true}},
+		{"tt inbox --wait 9m |& sed -n '1,40p'", want{usageToolWaiting, true}},
+		{"tt inbox --wait 9m --json | jq -r '.[].text' | wc -l", want{usageToolWaiting, true}},
+		{"tt inbox --wait 9m | tail -5 2>/dev/null", want{usageToolWaiting, true}},
+		{"tt inbox --wait 9m || true", want{usageToolWaiting, true}},
+		{"tt wait 2>&1 | tail -5 || true", want{usageToolWaiting, true}},
+		{"cd /w && tt inbox --wait 9m 2>&1 | tail -5", want{usageToolWaiting, true}},
+		{`bash -lc "tt inbox --wait 9m | tail -5"`, want{usageToolWaiting, true}},
+		{"tt ack 5 && tt inbox --wait 9m | tail -5", want{usageToolWaiting, false}},
+		{"tt progress 5 --text x; tt wait 2>&1 | head -30 || true", want{usageToolWaiting, false}},
 		// Waiting, but not inbox-only (lead decision #19079).
 		{"tt ack 5 && tt inbox --wait 9m", want{usageToolWaiting, false}},
 		{"cd /w && tt progress 5 --text x; tt wait", want{usageToolWaiting, false}},
@@ -58,12 +76,28 @@ func TestUsageTimeCommandClassification(t *testing.T) {
 		// Mixed: timestamps cannot split the call.
 		{"tt inbox --wait 9m && go test ./...", want{usageToolMixed, false}},
 		{"git status; tt wait", want{usageToolMixed, false}},
-		{"tt inbox --wait 9m | tail -5", want{usageToolMixed, false}},
+		{"tt inbox --wait 9m | python3 summarize.py", want{usageToolMixed, false}},
+		{"tt inbox --wait 9m | tee inbox.txt", want{usageToolMixed, false}},
+		{"tt inbox --wait 9m | tee /dev/null", want{usageToolMixed, false}},
+		{"tt inbox --wait 9m | tail -5 > out.txt", want{usageToolMixed, false}},
+		{"tt inbox --wait 9m | sed 's/a/b/'", want{usageToolMixed, false}},
+		{"tt inbox --wait 9m | sed -i -n 1p notes.txt", want{usageToolMixed, false}},
+		{"tt inbox --wait 9m | tail -5 && go test ./...", want{usageToolMixed, false}},
+		{"tt inbox --wait 9m | tail -5; go test ./...", want{usageToolMixed, false}},
+		{"tt inbox --wait 9m || go test ./...", want{usageToolMixed, false}},
+		{"tt wait || true; go test ./...", want{usageToolMixed, false}},
+		{"go test ./... | tail -5; tt wait", want{usageToolMixed, false}},
+		{"tt wait; tail -5 build.log", want{usageToolMixed, false}},
+		{"true && tt wait", want{usageToolMixed, false}},
+		// A filter on a tt command that is not an inbox command is other work.
+		{"tt agents | head -5; tt wait", want{usageToolMixed, false}},
 		{"tt wait & sleep 5", want{usageToolMixed, false}},
 		// Inbox check, not blocking.
 		{"tt inbox --unread --mark-read", want{usageToolInbox, true}},
 		{"cd /w && tt inbox --unread", want{usageToolInbox, true}},
 		{"tt inbox; tt inbox --unread", want{usageToolInbox, true}},
+		{"tt inbox --unread --mark-read 2>&1 | tail -20", want{usageToolInbox, true}},
+		{"tt inbox --unread | head -5 || true", want{usageToolInbox, true}},
 		// Ordinary tool time.
 		{"echo tt wait", want{usageToolOrdinary, false}},
 		{`tt post "please run tt inbox --wait 9m"`, want{usageToolOrdinary, false}},
@@ -80,6 +114,9 @@ func TestUsageTimeCommandClassification(t *testing.T) {
 		{"# tt wait", want{usageToolOrdinary, false}},
 		{"", want{usageToolOrdinary, false}},
 		{"go test ./...", want{usageToolOrdinary, false}},
+		{"go test ./... | tail -5", want{usageToolOrdinary, false}},
+		{"tt inbox --unread | python3 summarize.py", want{usageToolOrdinary, false}},
+		{"tt ack 5 || true", want{usageToolOrdinary, false}},
 	}
 	for _, c := range shell {
 		check(t, "claude Bash: "+c.command, classifyUsageTool("claude", "tool_use", "Bash", claudeBash(c.command)), c.want)
