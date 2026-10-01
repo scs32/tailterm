@@ -98,7 +98,7 @@ test("TailOS rolls back to the retained dist of the live commit", async () => {
   await buildInputs(f.config, f.job.id, { deps: f.deps });
   const t = JSON.parse(readFileSync(join(f.home, "rel_0123abcd-inputs.json"), "utf8")).targets.tailos;
   assert.deepEqual(t.rollbackProgram, ["npx", "wrangler", "pages", "deploy", join(f.home, `tailos-dist-${"5".repeat(40)}`), "--project-name", "tailos", "--branch", "main", "--commit-hash", "5".repeat(40), "--commit-dirty=false"]);
-  assert.deepEqual(t.rollbackProbe, ["node", "scripts/release-probe.mjs", "rollback", "tailos", "--expect-commit", "5".repeat(40)]);
+  assert.deepEqual(t.rollbackProbe, ["node", "scripts/release-probe.mjs", "rollback", "tailos", "--expect-commit", "5".repeat(40), "--config", f.deps.configPath]);
   assert.equal(t.rollbackSafe, true);
   assert.ok(!f.calls.some(c => c[0] === "preflight"));
 });

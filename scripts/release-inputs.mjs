@@ -110,7 +110,7 @@ export async function buildInputs(config, jobId, { dryRun = false, deps }) {
     } else {
       const retained = join(dir, `tailos-dist-${prior.commit}`), safe = sha(prior.commit) && existsSync(retained);
       targets.tailos = { release, rollbackSafe: safe, ...(safe ? { rollbackProgram: ["npx", "wrangler", "pages", "deploy", retained, "--project-name", "tailos", "--branch", "main", "--commit-hash", prior.commit, "--commit-dirty=false"],
-        rollbackProbe: [...probeArgv, "tailos", "--expect-commit", prior.commit] } : {}) };
+        rollbackProbe: [...probeArgv, "tailos", "--expect-commit", prior.commit, ...cfg] } : {}) };
     }
   }
   const raw = JSON.stringify({ ...binding, targets });
