@@ -141,6 +141,30 @@ inbox, and the replaced run is refused (403) like any stale run.
 or rationale containing the token is refused. A delegated answer is agent-authored,
 so it can never satisfy the verification plan's owner approval binding.
 
+## Where the helper's pane opens
+
+In TailOS the helper's pane always opens in the pinned **Home** area, beside the
+agent groups and outside them (see [project overview](project-overview.md)). It
+is identified by its hub role, `owner_helper`, never by name. Home is not counted
+by Panes per group, and the helper is not a project member, so it never takes a
+project slot or creates a "(continued)" group. It cannot be dragged out of Home.
+
+The pane attaches with `attach-session -f ignore-size` (tmux 3.2+; older tmux
+attaches plainly), so it never resizes the owner's own terminal on that session.
+A reconnect keeps the binding and the flag. If the owner opened the helper's
+session from the launcher before the hub reported it, adoption moves that tab
+into Home and replaces its plain attach with an ignore-size attach, whether it is
+still connecting or connected; the tab id and place are kept, and it never runs
+`new-session`.
+
+Caveat: ignore-size only defers to other attached clients. A lone ignore-size
+client can still size a `window-size latest` window, so with the owner's terminal
+detached the window may follow the TailOS pane until the owner attaches again.
+
+A workspace saved before Home kept the helper inside its project group; the login
+restore moves it into Home once the hub roster is read (if the hub is unreachable,
+at the next adoption or reload).
+
 ## Wake and offline
 
 The relay must run on the owner's host (`tt relay`). For the helper it:

@@ -6060,15 +6060,6 @@ body:is(
   color: var(--ink);
 }
 
-/* Home: selection is fill (as any active tab); hover is an outline. */
-.tab-strip > .home-tab:not(.active):hover {
-  outline: 1px solid var(--accent);
-  outline-offset: -1px;
-}
-.tab-strip > .home-tab.group-drop-target {
-  outline: 2px solid var(--accent);
-  outline-offset: -2px;
-}
 /* The divider between home and the group beside it. */
 .home-divider {
   position: absolute;

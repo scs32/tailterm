@@ -79,18 +79,88 @@ async function leaveHome(page) {
   assert.equal(await page.locator(".home-divider").count(), 0);
   assert.equal(await homeTab.locator("[data-close]").count(), 0);
   assert.equal(await homeTab.locator(".tab-name").innerText(), "Home");
+  await checkHomeTab(page);
   return homed;
+}
+// The Home tab: outside the scrolling strip, at every width and while the
+// launcher shows, aligned with the tabs and the + control. Selection is fill.
+async function checkHomeTab(page) {
+  const homeTab = page.locator(".tab-strip > .home-tab");
+  const original = page.viewportSize();
+  assert.equal(await page.locator("#tabs .home-tab").count(), 0);
+  for (const width of [1440, 390]) {
+    await page.setViewportSize({ width, height: original.height });
+    assert.ok(await homeTab.isVisible(), `Home tab visible at ${width}px`);
+    const home = await homeTab.boundingBox(),
+      plus = await page.locator("#new-tab").boundingBox(),
+      tab = await page.locator("#tabs .tab").first().boundingBox();
+    for (const [name, box] of [
+      ["+", plus],
+      ["tab", tab],
+    ])
+      assert.ok(
+        Math.abs(home.y - box.y) < 1 && Math.abs(home.height - box.height) < 1,
+        `Home tab matches the ${name} frame at ${width}px`,
+      );
+  }
+  await page.setViewportSize(original);
+  const activeTab = page.locator("#tabs .tab.active");
+  const fill = await activeTab.evaluate(
+    (el) => getComputedStyle(el).backgroundColor,
+  );
+  const idle = await homeTab.evaluate(
+    (el) => getComputedStyle(el).backgroundColor,
+  );
+  assert.notEqual(fill, idle, "an idle Home tab is not filled");
+  const focused = await activeTab
+    .locator("[data-tab]")
+    .getAttribute("data-tab");
+  await page.locator("#new-tab").click();
+  await page.locator("#empty-terminal").waitFor({ state: "visible" });
+  assert.ok(
+    await homeTab.isVisible(),
+    "Home tab stays while the launcher shows",
+  );
+  assert.equal(await page.locator(".tab-strip > .home-tab.active").count(), 0);
+  await page.locator(`#tabs [data-tab="${focused}"]`).click();
+  return fill;
 }
 async function returnHome(page, homed) {
   if (!homed.length) return;
   const tabCount = () => page.locator("#tabs .tab").count();
   // With Home empty, a new launcher shell lands in Home, as does a second.
+  const fill = await page
+    .locator("#tabs .tab.active")
+    .evaluate((el) => getComputedStyle(el).backgroundColor);
+  const homeTab = page.locator(".tab-strip > .home-tab.active");
   for (const expected of [1, 2]) {
     const before = await tabCount();
     await openShell(page);
     assert.equal(await tabCount(), before, "no tab is added for a Home shell");
-    await page.locator(".tab-strip > .home-tab.active").waitFor();
-    assert.equal((await homeIds(page)).length, expected);
+    await homeTab.waitFor();
+    const ids = await homeIds(page);
+    assert.equal(ids.length, expected);
+    // The Home tab mirrors Home's focused pane.
+    const focused = ids.at(-1);
+    assert.equal(
+      await homeTab.locator("[data-tab]").getAttribute("data-tab"),
+      focused,
+    );
+    const label = (
+      await page
+        .locator(`.pane-header[data-pane="${focused}"] .pane-label`)
+        .innerText()
+    ).split(" · ")[0];
+    assert.equal(await homeTab.locator(".tab-name").innerText(), label);
+    assert.equal(
+      await homeTab.locator(".home-mark").getAttribute("aria-label"),
+      `Home: ${label}`,
+    );
+    assert.equal(
+      await homeTab.evaluate((el) => getComputedStyle(el).backgroundColor),
+      fill,
+      "an active Home tab uses the same fill as an active tab",
+    );
   }
   for (const id of homed) {
     const tab = page.locator(`#tabs [data-tab="${id}"]`);

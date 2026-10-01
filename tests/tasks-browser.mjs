@@ -235,8 +235,146 @@ export async function exerciseTasks(page, hub, origin, ssh) {
       ).includes("active"),
     "original tab reactivated",
   );
+
+  // The owner helper's pane lives in Home (wi_d6327b69ba901602). The owner
+  // resumes a session from the launcher before the hub reports it as the
+  // helper: adoption moves that same tab into Home and replaces its plain
+  // attach with an ignore-size attach-session, whether the first attach has
+  // connected or is still connecting. Size-log entries are recorded only for
+  // attach-session commands (never new-session); each carries its flag.
+  const attaches = (name) =>
+    ssh.sizeLog.filter((e) => e.session === name && e.kind === "open");
+  const homePane = (id) =>
+    page.locator(`.pane-header[data-home][data-pane="${id}"]`);
+  const resume = async (name) => {
+    ssh.sessions.add(name);
+    await page.locator("#new-tab").click();
+    await page.locator("#launcher-refresh").click();
+    await page.locator("[data-resume]").filter({ hasText: name }).click();
+    await waitFor(async () => attaches(name).length > 0, `${name} attach`);
+    const id = await page
+      .locator(".tab.active [data-tab]")
+      .getAttribute("data-tab");
+    await homePane(id).waitFor();
+    assert.equal(
+      await page.locator(`#tabs [data-tab="${id}"]`).count(),
+      0,
+      `${name} opened in Home, not as a tab`,
+    );
+    assert.deepEqual(
+      attaches(name).map((e) => e.ignoreSize),
+      [false],
+      `${name}: the launcher attach does not ignore size`,
+    );
+    return id;
+  };
+  const adopter = hub.api.createTask("home-adopt");
+  const anchor = hub.api.addAgent(adopter.id, { name: "anchor" });
+  ssh.sessions.add("anchor");
+  hub.api.event(adopter.id, "started", anchor.id);
+  await palette("Project: open terminals…");
+  await page.locator(`[data-open-task="${adopter.id}"]`).click();
+  await page.locator("#tabs .tab.task-tab").waitFor();
+  const helperTab = await resume("helper-fx");
+  const helper = hub.api.addAgent(adopter.id, {
+    name: "owner-helper-fx",
+    session: "helper-fx",
+    role: "owner_helper",
+  });
+  hub.api.event(adopter.id, "started", helper.id);
+  await waitFor(
+    async () => attaches("helper-fx").length === 2,
+    "helper reattach after adoption",
+  );
+  assert.deepEqual(
+    attaches("helper-fx").map((e) => e.ignoreSize),
+    [false, true],
+    "the adopted helper reattaches with ignore-size",
+  );
+  await waitFor(
+    async () =>
+      (await homePane(helperTab).count()) === 1 &&
+      (await homePane(helperTab).locator(".pane-label").innerText()).endsWith(
+        "Connected",
+      ),
+    "helper connected in Home with the same tab",
+  );
+  // The same, while the launcher attach is still connecting.
+  ssh.hold("helper-hold");
+  ssh.sessions.add("helper-hold");
+  await page.locator("#new-tab").click();
+  await page.locator("#launcher-refresh").click();
+  await page
+    .locator("[data-resume]")
+    .filter({ hasText: "helper-hold" })
+    .click();
+  await waitFor(() => ssh.held.has("helper-hold"), "held helper attach");
+  const heldTab = await page
+    .locator(".tab.active [data-tab]")
+    .getAttribute("data-tab");
+  await homePane(heldTab).waitFor();
+  assert.match(
+    await homePane(heldTab).locator(".pane-label").innerText(),
+    /Connecting$/,
+  );
+  const held = hub.api.addAgent(adopter.id, {
+    name: "owner-helper-held",
+    session: "helper-hold",
+    role: "owner_helper",
+  });
+  hub.api.event(adopter.id, "started", held.id);
+  await waitFor(
+    async () => attaches("helper-hold").length === 2,
+    "connecting helper reattach",
+  );
+  ssh.release("helper-hold");
+  await waitFor(
+    async () =>
+      (await homePane(heldTab).count()) === 1 &&
+      (await homePane(heldTab).locator(".pane-label").innerText()).endsWith(
+        "Connected",
+      ),
+    "held helper connected in Home",
+  );
+  assert.equal(attaches("helper-hold").at(-1).ignoreSize, true);
+  // An ordinary agent adopted the same way leaves Home for its project group,
+  // and its attach is unchanged.
+  const plainTab = await resume("plain-fx");
+  const plain = hub.api.addAgent(adopter.id, { name: "plain-fx" });
+  hub.api.event(adopter.id, "started", plain.id);
+  await waitFor(
+    async () => (await homePane(plainTab).count()) === 0,
+    "adopted agent left Home",
+  );
+  await page.locator("#tabs .tab.task-tab button[role=tab]").click();
+  await page
+    .locator(`.pane-header:not([data-home])[data-pane="${plainTab}"]`)
+    .waitFor();
+  assert.ok(
+    !(
+      await page
+        .locator(".pane-header:not([data-home]) .pane-label")
+        .allInnerTexts()
+    ).some((text) => text.includes("helper")),
+    "helpers never join the project group",
+  );
+  assert.deepEqual(
+    attaches("plain-fx").map((e) => e.ignoreSize),
+    [false],
+    "an adopted ordinary agent is not reattached",
+  );
+  hub.api.closeTask(adopter.id);
+  await waitFor(
+    async () =>
+      (await page.locator("#tabs .tab.task-tab").count()) === 0 &&
+      (await page.locator(".pane-header[data-home]").count()) === 0,
+    "adoption project closed",
+  );
+  for (const name of ["helper-fx", "helper-hold", "plain-fx", "anchor"])
+    ssh.sessions.delete(name);
+  await page.locator("#tabs .tab button[role=tab]").nth(originalIndex).click();
   console.log(
-    "Tasks passed: dedicated task-named groups, automatic agent membership, hub configuration, spawn over SSH, attention, board, and close.",
+    "Tasks passed: dedicated task-named groups, automatic agent membership, hub configuration, spawn over SSH, attention, board, close, and the helper adopted into Home with an ignore-size reattach.",
   );
 }
 
