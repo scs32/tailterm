@@ -5,7 +5,7 @@ import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
-import { probe, hostDeps } from "../scripts/release-probe.mjs";
+import { probe, hostDeps, waitForTailOSCommit } from "../scripts/release-probe.mjs";
 
 const BASE = "/mnt/deepfreeze/tailterm-hub", SECRET = "SYNTHETIC_PRIVATE_TOKEN";
 const commit = "a".repeat(40), bytes = Buffer.from("hub binary"), sha = createHash("sha256").update(bytes).digest("hex");
@@ -141,6 +141,17 @@ test("P6 hostDeps.fetchJSON asks for an uncached read with a timeout", async t =
   await assert.rejects(hostDeps.fetchJSON(url, 5000), /fetch/);
   assert.equal(inits.length, 2);
   for (const [u, init] of inits) { assert.equal(u, url); assert.equal(init.cache, "no-store"); assert.ok(init.signal instanceof AbortSignal); }
+});
+
+test("P7 only a string release commit counts as a read", async () => {
+  for (const bad of [[prior], [[prior]], { toString: () => prior }]) {
+    const deps = fakeTailOS([{ commit: bad }]);
+    assert.deepEqual(await waitForTailOSCommit(url, prior, { windowMs: 6000, deps }), { matched: false, lastCommit: null, waitedMs: 6000, polls: 3 });
+    assert.deepEqual(await probe(rollbackTailOS, tailosConfig({ switchWindowMs: 6000 }), fakeTailOS([{ commit: bad }])), { restored: false, databaseWritesPreserved: true, lastCommit: null, waitedMs: 6000 });
+    await assert.rejects(probe(["live", "tailos"], tailosConfig(), fakeTailOS([{ commit: bad }])), /no release commit/);
+  }
+  const late = await waitForTailOSCommit(url, prior, { deps: fakeTailOS([{ commit: [next] }, { commit: [prior] }, { commit: prior }]) });
+  assert.deepEqual(late, { matched: true, lastCommit: prior, waitedMs: 6000, polls: 3 });
 });
 
 test("the probe command prints nothing on failure", () => {

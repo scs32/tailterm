@@ -18,7 +18,7 @@ const BASE = "/mnt/deepfreeze/tailterm-hub", APP = "tailterm-hub";
 // target -> compose service, container mount, binary name
 const MOUNTS = { hub: ["hub", "/opt/tailterm-hub", "tailterm-hub"], bridge: ["discord-bridge", "/opt/tailterm-discord", "tailterm-discord"] };
 const sha256 = b => createHash("sha256").update(b).digest("hex");
-const hex = (s, n) => new RegExp(`^[a-f0-9]{${n}}$`).test(s || "");
+const hex = (s, n) => typeof s === "string" && new RegExp(`^[a-f0-9]{${n}}$`).test(s);
 
 // Cloudflare's custom domain takes a few seconds to switch to a new Pages
 // deployment, so an expected TailOS commit is polled for a bounded window.
