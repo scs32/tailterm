@@ -68,8 +68,10 @@ bridge's rollback probe needs a responding hub. A plan for one target retains th
 other target's live mount, and `deploy-truenas-hub.py --update` refuses it (stage
 `partner-mount`, before any mutation) when that mount is not the one live now.
 The runner refuses unpaired hub and bridge inputs before publication, and a plan
-that does not mount the new release for every target it changes. Mini builds then installs atomically,
-retains a rollback binary and restarts only its configured user relay. TailOS
+that does not mount the new release for every target it changes. Mini builds, then runs the candidate's
+own `tt host setup --from ARTIFACT` ([host setup](host-setup.md)), which installs atomically, keeps the
+previous binary as `tt.previous`, updates the hooks, restarts the relay and runs doctor; the runner then
+requires the installed binary to match the pinned artifact. TailOS
 builds, verifies and invokes Wrangler explicitly for project `tailos`.
 
 Private host activation configuration is version 1 with `enabled: true`, dedicated
@@ -662,7 +664,7 @@ tt               installed tt path
 baselines        {hub, bridge, mini, tailos}: probed live commits at provisioning
 targets.hub      {host: "truenas", liveProbe: [...], readyWindowMs (optional, 0-300000, default 240000)}
 targets.bridge   {host: "truenas", liveProbe: [...], readyWindowMs (optional, 0-300000, default 240000)}
-targets.mini     {installPath, relayRestart: [...], relayLog, relayLabel, liveProbe: [...]}
+targets.mini     {installPath, relayRestart: [...], relayLog, relayLabel, liveProbe: [...], hostSetup, hostRollback (both optional argv; default: tt host setup)}
 targets.tailos   {url (optional), switchWindowMs (optional, 0-300000, default 90000)}
 inputs.planTemplate  path to the handler's last TrueNAS preflight plan (template)
 retention        {releasedBackups (optional, integer >= 0, default 3), backupBudgetBytes (optional, integer >= 0, default 4294967296; 0 = no budget)}
@@ -812,9 +814,11 @@ goes through **Reconcile** instead. The deployer claims the waiting job at its n
   job's manifest (`rollbackProgram`) or a previous receipt. After a paired
   release roll back both, hub first (the bridge probe needs a responding hub),
   each to its own prior release.
-- Mini: copy `journalDirectory/ID-mini-before` over the installed `tt`
+- Mini: run `tt host setup --rollback`, then confirm the installed `tt` has the
+  prior SHA-256. If it does not (no `tt.previous`, an older CLI, a failed
+  doctor), copy `journalDirectory/ID-mini-before` over the installed `tt`
   atomically (copy to `tt.rollback`, then rename) and restart the relay with the
-  configured command.
+  configured command. The runner's rollback does the same.
 - TailOS: `npx wrangler pages deploy journalDirectory/tailos-dist-PRIOR
   --project-name tailos --branch main --commit-hash PRIOR --commit-dirty=false`,
   then `node scripts/release-probe.mjs rollback tailos --expect-commit PRIOR

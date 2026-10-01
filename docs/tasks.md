@@ -98,9 +98,8 @@ that was already read. `tt relay --status` shows bindings, queue progress, and
 errors. Unsupported runtimes continue to check the inbox themselves.
 
 On Air and Mini, a per-user LaunchAgent runs the relay independently of the
-browser. Install it with `python3 scripts/install-relay-macos.py` after
-installing `tt`. On another host, run `tt relay` under its normal process
-supervisor. The host’s `~/.config/tailterm/hub.json` must point to the same hub
+browser. Install it with `tt host setup` ([host setup](host-setup.md)). On
+another host, run `tt relay` under its normal process supervisor. The host’s `~/.config/tailterm/hub.json` must point to the same hub
 as its agents. Bindings and queue progress are private files under
 `~/.local/state/tailterm/relay`; credentials stay in the existing host config.
 `tt bind --thread UUID` enrolls an existing agent when run with its task,

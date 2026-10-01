@@ -451,7 +451,7 @@ func agentChecks() []doctorCheck {
 				return checkMissing("no "+d.p.goos+" relay service yet (to fix, see docs/host-requirements.md)", "run tt relay under the host's process supervisor")
 			}
 			if _, err := d.p.stat(d.home("Library", "LaunchAgents", doctorRelayLabel+".plist")); err != nil {
-				return checkMissing("no ~/Library/LaunchAgents/"+doctorRelayLabel+".plist", "python3 scripts/install-relay-macos.py")
+				return checkMissing("no ~/Library/LaunchAgents/"+doctorRelayLabel+".plist", "tt host setup (docs/host-setup.md)")
 			}
 			return checkOK("LaunchAgent " + doctorRelayLabel)
 		}},
@@ -525,7 +525,7 @@ func relayRunningCheck(d *doctorRun) doctorResult {
 		return checkMissing("no "+d.p.goos+" relay service yet (to fix, see docs/host-requirements.md)", "run tt relay under the host's process supervisor")
 	}
 	target := fmt.Sprintf("gui/%d/%s", d.p.uid, doctorRelayLabel)
-	fix := "launchctl kickstart -k " + target + " (or python3 scripts/install-relay-macos.py)"
+	fix := "launchctl kickstart -k " + target + " (or tt host setup)"
 	r := d.command("", nil, "launchctl", "print", target)
 	switch {
 	case !r.found:

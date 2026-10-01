@@ -56,7 +56,7 @@ Client, plus:
 | Codex login | `codex login status` exits 0 | `codex login` | same | `codex login` |
 | Codex Stop hook | `~/.codex/hooks.json` (or `$CODEX_HOME`) has `tt hook stop` | `tt hooks codex --install` | same | `codex Stop hook` |
 | Claude hooks (optional) | the four `tt hook ...` commands in `~/.claude/settings.json` or `settings.local.json` | `tt hooks claude` | same | `claude hooks` (warn) |
-| Relay service installed | `~/Library/LaunchAgents/com.tailterm.inbox-relay.plist` | `python3 scripts/install-relay-macos.py` | none yet (to fix) | `relay service installed` |
+| Relay service installed | `~/Library/LaunchAgents/com.tailterm.inbox-relay.plist` | `tt host setup` ([host setup](host-setup.md)) | none yet (to fix) | `relay service installed` |
 | Relay running | `launchctl print gui/UID/com.tailterm.inbox-relay` shows `state = running` | `launchctl kickstart -k gui/UID/com.tailterm.inbox-relay` | none yet (to fix) | `relay running` |
 
 Mapping notes:
@@ -203,9 +203,9 @@ the role. Source: the item's inventory at 476eacc, rechecked at 10bc367.
 |---|---|---|
 | `tt` appends `/opt/homebrew/bin` and `/usr/local/bin` to PATH | `hub/cmd/tt/main.go` `main` | portable (missing directories are harmless) |
 | Verification fixture PATH is Homebrew and macOS paths | `hub/internal/testverification/fixture.go:47` | macOS-only (test fixture data) |
-| Relay LaunchAgent PATH | `scripts/install-relay-macos.py:17` | macOS-only |
+| Relay LaunchAgent PATH | `hub/cmd/tt/host_setup.go` `relayPlist` | macOS-only |
 | Old static-site deploy calls `/opt/homebrew/bin/container` | `scripts/deploy-remote-static.py:44,105` | macOS-only (old site tooling) |
-| Relay service is a LaunchAgent; no Linux service | `scripts/install-relay-macos.py` | to fix |
+| Relay service is a LaunchAgent or LaunchDaemon; no Linux service | `tt host setup` | to fix |
 | Release probe reads the relay status with `launchctl print` | `scripts/release-probe.mjs:93` | macOS-only |
 | Relay LaunchAgent environment is only PATH | `wi_ec4c3154f55bf5db` | to fix |
 | Test fixtures are hand-made files (`.build/test.wasm`, `.build/speech-fixture.wav`, `.build/go-modules.txt`, `wasm/tailserve.wasm`); the deployer's checkout lacked them | `scripts/verify-matrix.mjs`, `wi_5b03fe47520b7c4f` | to fix (doctor now names each) |
@@ -220,7 +220,7 @@ the role. Source: the item's inventory at 476eacc, rechecked at 10bc367.
 | `tt doctor` checked only tmux, runtimes and the hub | `hub/cmd/tt/coordination.go` `cmdDoctor` | fixed by `tt doctor --role` (plain `tt doctor` is unchanged) |
 | Verifier Playwright path is macOS-only | `scripts/verify-matrix.mjs:881-883` (`~/Library/Caches/ms-playwright`) | to fix |
 | wrangler is not in package.json; it runs from the npx cache | `scripts/deploy-static.mjs`, `~/.npm/_npx` | to fix (pin it) |
-| No Linux relay service | `scripts/install-relay-macos.py` only | to fix |
+| No Linux relay service | `tt host setup` installs launchd services only | to fix |
 
 ## Limits
 

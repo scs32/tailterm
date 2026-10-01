@@ -67,11 +67,14 @@ eligible idle agents. Other runtimes depend on their hooks/checkpoints. See
 [delivery details](../docs/tasks.md). The relay also performs durable cleanup of
 individually closed agents and of all agents belonging to closed tasks.
 
-`tt hooks claude` prints settings for SessionStart, UserPromptSubmit, Stop and
-Notification. Merge these with your existing Claude settings if desired.
-They surface pending messages at prompt/stop boundaries. `tt hooks codex`
-prints the optional notify setting for turn-complete events. Global runtime
-configuration is not changed automatically.
+`tt host setup` makes a machine an agent host in one step: it installs or
+updates `~/.local/bin/tt` with a rollback copy, merges the Claude Code hooks
+(SessionStart, UserPromptSubmit, Stop and Notification) and the Codex Stop hook
+into your existing settings, installs the relay service and runs `tt doctor`.
+The hooks surface pending messages at prompt/stop boundaries. See
+[host setup](../docs/host-setup.md). `tt hooks claude` and `tt hooks codex`
+still print the same settings, and the optional Codex notify setting for
+turn-complete events, for merging by hand.
 
 `tt wrap -- PROGRAM ARG...` preserves argument boundaries.
 `tt wrap --shell 'COMMAND'` explicitly invokes shell syntax (used by spawn).

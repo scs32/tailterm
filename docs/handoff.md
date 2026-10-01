@@ -1875,20 +1875,26 @@ npm run build:tt
 ```
 
 That script creates Linux arm64/amd64 and Darwin arm64 binaries under `.build/tt/`.
-Install the matching binary as `~/.local/bin/tt` with executable permissions.
 For Intel macOS, build `GOOS=darwin GOARCH=amd64` explicitly. Provision
 `~/.config/tailterm/hub.json` privately with the existing hub URL/token and mode 600. Never put the token into source, pasted prompts, logs or the static build.
 
-On macOS, after installing `tt` and its configuration:
+Then run the matching binary's host setup. It installs itself as
+`~/.local/bin/tt` with a rollback copy, merges the Codex and Claude Code hooks,
+installs the relay service and runs `tt doctor`:
 
 ```sh
-python3 scripts/install-relay-macos.py
-tt doctor
+.build/tt/tt-darwin-arm64 host setup --hub URL
 tt relay --status
 ```
 
-The installer uses a logged-in user's GUI launchd domain. For Linux or headless
-hosts, supervise `tt relay` through that host's normal service manager. Confirm
+Run the same command after every later build to update the host
+(`tt host setup --check` reports without changing anything, and
+`tt host setup --rollback` returns to the previous binary). See
+[host setup](host-setup.md) for the hooks it merges and the two service modes.
+
+By default the relay is a LaunchAgent in the logged-in user's GUI launchd
+domain; `--service daemon` installs a LaunchDaemon for an always-on host. For Linux,
+supervise `tt relay` through that host's normal service manager. Confirm
 the installed Codex supports the native `queue` operation before assuming idle
 agents can be resumed automatically.
 
