@@ -57,8 +57,9 @@ While it is on, the bridge:
 - opens each owner's DM channel at startup, so DMs sent while the bridge was down
   are read later.
 
-The TrueNAS deployment plan does not set these variables yet. That follow-up is
-backlog intake #15842 and must land before release.
+The TrueNAS deployment plan sets `DISCORD_HELPER_TASK` and `DISCORD_HELPER_CHANNEL`
+through the optional plan fields `discordHelperTask` and `discordHelperChannelId`; see
+[Plan fields](broker-phase-2b.md#plan-fields) in `docs/broker-phase-2b.md`.
 
 ## Conversations
 
