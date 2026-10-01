@@ -671,6 +671,14 @@ func (s *Store) explainTeamQueue(ctx context.Context, task string, out *api.Team
 	// sharedOnly lists, per queued entry, the active entries that block it
 	// only by sharing its checkout, when nothing blocks it by ownership.
 	sharedOnly := map[string][]string{}
+	// The project's open agents and reserved seats are counted once, and only
+	// when a queued entry has a free slot to be held by them.
+	var capReader queryRower = s.db
+	if capacityTx != nil {
+		capReader = capacityTx
+	}
+	var capOpen, capReserved int
+	capCounted := false
 	for i := range out.Entries {
 		if parallel && out.Entries[i].State == "failed" && out.Entries[i].ReleasedAt == "" {
 			live, liveErr := liveItemRuns(ctx, capacityTx, task, out.Entries[i].ItemID)
@@ -686,11 +694,31 @@ func (s *Store) explainTeamQueue(ctx context.Context, task string, out *api.Team
 		if out.Entries[i].State != "queued" {
 			continue
 		}
+		// The claim's order: slots, host admission, project agent cap, then
+		// the handler lease.
+		capReason := ""
+		if !queueSlotsFull(out.ConcurrencyLimit, activeCount) {
+			if !capCounted {
+				if capOpen, capReserved, err = projectAgentCapUsage(ctx, capReader, task); err != nil {
+					return err
+				}
+				capCounted = true
+			}
+			kind, kindErr := queueItemKind(ctx, capReader, task, out.Entries[i].ItemID)
+			if kindErr != nil {
+				return kindErr
+			}
+			capReason = projectAgentCapReason(capOpen, capReserved, queueTeamSeats(kind, out.Entries[i].Template), s.MaxAgents)
+		}
 		if queueSlotsFull(out.ConcurrencyLimit, activeCount) {
 			out.Entries[i].BlockReason = "All team slots are reserved"
-		} else if parallel {
+		} else if !parallel {
+			out.Entries[i].BlockReason = capReason
+		} else {
 			if capacityErr := checkTeamHostAdmission(ctx, capacityTx, out.Entries[i].Host, s.now()); capacityErr != nil {
 				out.Entries[i].BlockReason = capacityErr.Error()
+			} else if capReason != "" {
+				out.Entries[i].BlockReason = capReason
 			} else if freeHandler.ID == "" {
 				out.Entries[i].BlockReason = "No free database handler"
 			} else if len(out.Entries[i].Ownership) == 0 && len(active) > 0 {
@@ -1223,6 +1251,31 @@ func (s *Store) TeamQueueAction(ctx context.Context, task string, req api.TeamQu
 				return zero, fmt.Errorf("%w: parallel queues need frozen repository and base for every outstanding item", api.ErrConflict)
 			}
 		}
+		// A raise admits another team, so the next team must fit under the
+		// project agent cap: the first queued entry's, or a feature team when
+		// nothing is queued. Lowering or keeping the limit is not checked.
+		current, err := queueConcurrencyLimit(ctx, tx, task)
+		if err != nil {
+			return zero, err
+		}
+		if (req.ConcurrencyLimit == 0 && current != 0) || (current > 0 && req.ConcurrencyLimit > current) {
+			seats := featureTeamSlots
+			var nextItem, nextTemplate string
+			err := tx.QueryRowContext(ctx, `SELECT item_id,template FROM team_queue_entries WHERE task_id=? AND state='queued' ORDER BY position LIMIT 1`, task).Scan(&nextItem, &nextTemplate)
+			if err != nil && !errors.Is(err, sql.ErrNoRows) {
+				return zero, err
+			}
+			if err == nil {
+				kind, err := queueItemKind(ctx, tx, task, nextItem)
+				if err != nil {
+					return zero, err
+				}
+				seats = queueTeamSeats(kind, nextTemplate)
+			}
+			if err := checkProjectAgentCap(ctx, tx, task, s.MaxAgents, seats); err != nil {
+				return zero, err
+			}
+		}
 		var active int
 		if err := tx.QueryRowContext(ctx, `SELECT count(*) FROM team_queue_entries WHERE task_id=? AND `+queueHoldsSQL, task).Scan(&active); err != nil {
 			return zero, err
@@ -1410,7 +1463,7 @@ func (s *Store) TeamQueueAction(ctx context.Context, task string, req api.TeamQu
 		if err != nil {
 			return zero, fmt.Errorf("%w: duplicate item or queue entry: %v", api.ErrConflict, err)
 		}
-	case "remove", "reorder", "claim", "freeze", "attempt", "started", "running", "replace_lead", "close", "close_refresh", "accept", "finish", "fail", "release", "scope", "owner_integrated", "rebind", "requeue":
+	case "remove", "reorder", "claim", "freeze", "attempt", "unattempt", "started", "running", "replace_lead", "close", "close_refresh", "accept", "finish", "fail", "release", "scope", "owner_integrated", "rebind", "requeue":
 		if !validTeamQueueID(req.EntryID) {
 			return zero, api.ErrInvalid
 		}
@@ -1724,6 +1777,15 @@ func (s *Store) TeamQueueAction(ctx context.Context, task string, req api.TeamQu
 					return zero, err
 				}
 			}
+			// Serial or parallel, a team that agent registration would refuse
+			// partway waits queued: nothing is written before this refusal.
+			kind, err := queueItemKind(ctx, tx, task, e.ItemID)
+			if err != nil {
+				return zero, err
+			}
+			if err := checkProjectAgentCap(ctx, tx, task, s.MaxAgents, queueTeamSeats(kind, e.Template)); err != nil {
+				return zero, err
+			}
 			var head string
 			for _, candidate := range candidates {
 				// An entry waiting for a rebind does not hold the head.
@@ -1831,7 +1893,7 @@ func (s *Store) TeamQueueAction(ctx context.Context, task string, req api.TeamQu
 				return zero, fmt.Errorf("%w: item lead is already reserved", api.ErrConflict)
 			}
 			e.LaunchJSON = req.LaunchJSON
-		case "attempt", "started":
+		case "attempt", "unattempt", "started":
 			if e.State != "launching" || len(e.LaunchJSON) == 0 {
 				return zero, api.ErrConflict
 			}
@@ -1866,7 +1928,34 @@ func (s *Store) TeamQueueAction(ctx context.Context, task string, req api.TeamQu
 				if member["state"] != "unstarted" || !validRunID(run) {
 					return zero, api.ErrConflict
 				}
+				// Registration refuses this member at the cap; refusing here
+				// leaves it unstarted instead of uncertain. The member is
+				// itself one of the reserved seats, so only open agents count.
+				var open int
+				if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM agents WHERE task_id=? AND status NOT IN ('closed','exited')`, task).Scan(&open); err != nil {
+					return zero, err
+				}
+				if open >= s.MaxAgents {
+					return zero, fmt.Errorf("%w: %s", api.ErrConflict, projectAgentCapReason(open, 0, 1, s.MaxAgents))
+				}
 				member["state"] = "uncertain"
+			} else if req.Operation == "unattempt" {
+				// The runner takes back an attempt whose registration the hub
+				// refused at the cap. Any agent row with the member's identity
+				// means the spawn may have happened: never respawn it.
+				fields, _ := member["fields"].(map[string]any)
+				agentID, _ := fields["agentId"].(string)
+				if member["state"] != "uncertain" || !api.ValidID(agentID, "agt") {
+					return zero, api.ErrConflict
+				}
+				var registered int
+				if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM agents WHERE id=?`, agentID).Scan(&registered); err != nil {
+					return zero, err
+				}
+				if registered != 0 {
+					return zero, fmt.Errorf("%w: member agent is registered; an attempted spawn is never taken back", api.ErrConflict)
+				}
+				member["state"] = "unstarted"
 			} else {
 				if member["state"] != "uncertain" || !validRunID(req.MemberRunID) || member["runId"] != req.MemberRunID {
 					return zero, api.ErrConflict

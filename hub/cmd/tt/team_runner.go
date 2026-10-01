@@ -563,7 +563,25 @@ func (r teamRunner) releaseFailed(ctx context.Context, e env, c *api.Client, q a
 	return err
 }
 
+// projectAgentCapPrefix starts the hub's reason for holding a team that does
+// not fit under the project's open-agent cap (docs/project-queue.md, "Project
+// agent cap").
+const projectAgentCapPrefix = "project agent cap: "
+
+// registrationAtAgentCap reports a spawn whose agent registration the hub
+// refused because the project is at its open-agent cap. Registration comes
+// before any host session, so nothing was started.
+func registrationAtAgentCap(err error) bool {
+	var response *api.HTTPError
+	return errors.As(err, &response) && response.Status == 409 && strings.HasSuffix(response.Msg, api.ErrLimit.Error())
+}
+
 func claimRaceConflict(message string) bool {
+	// The team does not fit under the project agent cap yet: it waits queued
+	// and the list names the counts.
+	if strings.Contains(message, projectAgentCapPrefix) {
+		return true
+	}
 	for _, cause := range []string{
 		"entry revision changed",
 		"project is not launchable",
@@ -760,7 +778,7 @@ func (r teamRunner) launch(ctx context.Context, e env, c *api.Client, q api.Team
 			return r.fail(ctx, c, q, errors.New("invalid frozen member state"))
 		}
 		revision := q.Revision
-		q, err = c.TeamQueueAction(ctx, q.TaskID, api.TeamQueueRequest{RequestID: fmt.Sprintf("queue-attempt-%s-%d", q.ID, i), Operation: "attempt", EntryID: q.ID, ExpectedRevision: q.Revision, MemberIndex: i})
+		q, err = c.TeamQueueAction(ctx, q.TaskID, api.TeamQueueRequest{RequestID: fmt.Sprintf("queue-attempt-%s-%d-%d", q.ID, i, q.Revision), Operation: "attempt", EntryID: q.ID, ExpectedRevision: q.Revision, MemberIndex: i})
 		if err != nil {
 			return &launchStepError{op: "attempt", revision: revision, err: err}
 		}
@@ -789,6 +807,26 @@ func (r teamRunner) launch(ctx context.Context, e env, c *api.Client, q api.Team
 		spawnErr := r.spawn(e, args)
 		os.Remove(contextFile.Name())
 		if spawnErr != nil {
+			if registrationAtAgentCap(spawnErr) {
+				// The project filled between the attempt and registration.
+				// The member returns to unstarted and the launch backs off;
+				// the entry is not failed and started members stay.
+				revision := q.Revision
+				if _, err := c.TeamQueueAction(ctx, q.TaskID, api.TeamQueueRequest{RequestID: fmt.Sprintf("queue-unattempt-%s-%d-%d", q.ID, i, q.Revision), Operation: "unattempt", EntryID: q.ID, ExpectedRevision: q.Revision, MemberIndex: i}); err != nil {
+					return &launchStepError{op: "unattempt", revision: revision, err: err}
+				}
+				roster, err := c.GetTask(ctx, q.TaskID)
+				if err != nil {
+					return err
+				}
+				open := 0
+				for _, a := range roster.Agents {
+					if a.Status != api.AgentClosed && a.Status != api.AgentExited {
+						open++
+					}
+				}
+				return &launchStepError{op: "spawn " + f.Name, revision: revision, err: fmt.Errorf("%s%d open + 1 seats > %d: %w", projectAgentCapPrefix, open, api.MaxAgentsPerTask, spawnErr)}
+			}
 			return r.fail(ctx, c, q, fmt.Errorf("spawn %s: %w", f.Name, spawnErr))
 		}
 		a, err := r.verifyMember(ctx, e, c, q, *member)

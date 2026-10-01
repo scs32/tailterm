@@ -1439,3 +1439,167 @@ func TestTeamRunnerSmallFeatureFailsWithoutSpawn(t *testing.T) {
 		t.Fatalf("small feature entry %+v %v", current, err)
 	}
 }
+
+// capFillers registers n plain open agents on the fixture project.
+func capFillers(t *testing.T, f teamFixture, prefix string, n int) {
+	t.Helper()
+	for i := 0; i < n; i++ {
+		name := fmt.Sprintf("%s-%d", prefix, i)
+		if _, err := f.c.AddAgent(context.Background(), f.task.ID, api.AddAgentRequest{AgentID: api.NewID("agt"), Name: name, Host: "fixture", Session: name, Runtime: "codex"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+// closeCapFillers closes every agent whose name starts with the prefix.
+func closeCapFillers(t *testing.T, f teamFixture, prefix string) {
+	t.Helper()
+	db, err := sql.Open("sqlite", f.dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if _, err := db.Exec(`UPDATE agents SET status='closed' WHERE task_id=? AND name LIKE ?`, f.task.ID, prefix+"-%"); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// wi_91e0cf6fa1dedbef a7: the runner holds a queued entry the project agent
+// cap refuses, without failing it, and launches it once seats free.
+func TestTeamRunnerHoldsQueuedEntryAtProjectAgentCap(t *testing.T) {
+	f := newTeamFixture(t, true)
+	hub := newLaunchFaultHub(t, f)
+	ctx := context.Background()
+	q, err := hub.c.TeamQueueAction(ctx, f.task.ID, api.TeamQueueRequest{RequestID: "cap-add", Operation: "add", ItemID: f.item.ID, OrderMessageSeq: f.order, Host: "fixture", Cwd: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The handler and one worker are open; a feature team needs six seats.
+	f.st.MaxAgents = 7
+	capFillers(t, f, "cap-worker", 1)
+	spawns := 0
+	runner := queueCorrectionRunner(t, f, 2)
+	spawn := runner.spawn
+	runner.spawn = func(e env, args []string) error {
+		spawns++
+		return spawn(e, args)
+	}
+	runner.retries = &launchRetryBook{}
+	for i := 0; i < 2; i++ {
+		if err := runner.tick(ctx, hub.e, hub.c, "fixture"); err != nil {
+			t.Fatalf("held tick %d: %v", i, err)
+		}
+	}
+	held, err := hub.c.GetTeamQueueEntry(ctx, f.task.ID, q.ID)
+	if err != nil || held.State != "queued" || held.Revision != q.Revision || held.Failure != "" || spawns != 0 || hub.count("claim") != 2 || hub.count("fail") != 0 || len(launchNotices(t, f, launchFailedSubject, q.ID)) != 0 {
+		t.Fatalf("held entry state=%s revision=%d failure=%q spawns=%d claims=%d fails=%d %v", held.State, held.Revision, held.Failure, spawns, hub.count("claim"), hub.count("fail"), err)
+	}
+	list, err := hub.c.ListTeamQueuePage(ctx, f.task.ID, api.TeamQueueListOptions{View: api.TeamQueueViewActive})
+	if err != nil || len(list.Entries) != 1 || list.Entries[0].BlockReason != "project agent cap: 2 open + 6 seats > 7" {
+		t.Fatalf("held reason %+v %v", list.Entries, err)
+	}
+	closeCapFillers(t, f, "cap-worker")
+	if err := runner.tick(ctx, hub.e, hub.c, "fixture"); err != nil {
+		t.Fatal(err)
+	}
+	got, err := hub.c.GetTeamQueueEntry(ctx, f.task.ID, q.ID)
+	if err != nil || got.State != "running" || spawns != 2 || hub.count("fail") != 0 {
+		t.Fatalf("launch after seats freed: state=%s spawns=%d %v", got.State, spawns, err)
+	}
+}
+
+// wi_91e0cf6fa1dedbef a8: a registration the hub refuses at the project agent
+// cap holds the launch. The entry is not failed and no owner notice is posted;
+// the error names the cap with the open count; the launch finishes once a seat
+// frees, without respawning the started member.
+func TestTeamRunnerRegistrationCapHoldsLaunch(t *testing.T) {
+	f := newTeamFixture(t, true)
+	hub := newLaunchFaultHub(t, f)
+	ctx := context.Background()
+	q, err := hub.c.TeamQueueAction(ctx, f.task.ID, api.TeamQueueRequest{RequestID: "cap-add", Operation: "add", ItemID: f.item.ID, OrderMessageSeq: f.order, Host: "fixture", Cwd: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now()
+	runner := queueCorrectionRunner(t, f, 2)
+	runner.retries = &launchRetryBook{}
+	runner.now = func() time.Time { return now }
+	register := runner.spawn
+	attempts := map[string]int{}
+	registered := map[string]int{}
+	filled := false
+	runner.spawn = func(e env, args []string) error {
+		name := ""
+		for i := 0; i+1 < len(args); i += 2 {
+			if args[i] == "--name" {
+				name = args[i+1]
+			}
+		}
+		attempts[name]++
+		if name == "correction-lead-1" && !filled {
+			// Other registrations fill the project after this member's
+			// attempt was recorded: the handler, the first member and 30
+			// more make the 32 the hub allows.
+			filled = true
+			capFillers(t, f, "late-worker", 30)
+		}
+		// cmdSpawn registers before it creates a session and wraps the
+		// hub's refusal the same way.
+		if err := register(e, args); err != nil {
+			return fmt.Errorf("register agent: %w", err)
+		}
+		registered[name]++
+		return nil
+	}
+	const capError = "spawn correction-lead-1: project agent cap: 32 open + 1 seats > 32: register agent: hub: 409 limit reached"
+	if err := runner.tick(ctx, hub.e, hub.c, "fixture"); err == nil || !strings.Contains(err.Error(), capError) {
+		t.Fatalf("refused registration: %v", err)
+	}
+	key := launchRetryKey(hub.c.Base, f.task.ID, q.ID)
+	held := func(step string) api.TeamQueueEntry {
+		t.Helper()
+		got, err := hub.c.GetTeamQueueEntry(ctx, f.task.ID, q.ID)
+		if err != nil || got.State != "launching" || got.Failure != "" || got.EscalationSeq != 0 || hub.count("fail") != 0 || len(launchNotices(t, f, launchFailedSubject, q.ID)) != 0 {
+			t.Fatalf("%s: state=%s failure=%q escalation=%d fails=%d %v", step, got.State, got.Failure, got.EscalationSeq, hub.count("fail"), err)
+		}
+		var journal teamLaunchJournal
+		if err := json.Unmarshal(got.LaunchJSON, &journal); err != nil || len(journal.Members) != 2 || journal.Members[0].State != "started" || journal.Members[1].State != "unstarted" {
+			t.Fatalf("%s: members %+v %v", step, journal.Members, err)
+		}
+		return got
+	}
+	held("after the refusal")
+	if got := runner.retries.lastError(key); got != capError {
+		t.Fatalf("last launch error %q", got)
+	}
+	if hub.count("unattempt") != 1 || attempts["correction-lead-1"] != 1 {
+		t.Fatalf("unattempts=%d spawn attempts=%v", hub.count("unattempt"), attempts)
+	}
+	// Inside the backoff nothing is tried.
+	now = now.Add(launchRetryFirstDelay - time.Second)
+	if err := runner.tick(ctx, hub.e, hub.c, "fixture"); err != nil || hub.count("attempt") != 2 {
+		t.Fatalf("tick inside the backoff: %v attempts=%d", err, hub.count("attempt"))
+	}
+	// Past it the project is still full: the hub refuses the attempt, so
+	// nothing is spawned and the member stays unstarted.
+	now = now.Add(time.Second)
+	if err := runner.tick(ctx, hub.e, hub.c, "fixture"); err == nil || !strings.Contains(err.Error(), "attempt: hub: 409 conflict: project agent cap: 32 open + 1 seats > 32") {
+		t.Fatalf("attempt at a full project: %v", err)
+	}
+	held("after the refused attempt")
+	if attempts["correction-lead-1"] != 1 {
+		t.Fatalf("spawned at a full project: %v", attempts)
+	}
+	closeCapFillers(t, f, "late-worker")
+	now = now.Add(launchRetryMaxDelay)
+	if err := runner.tick(ctx, hub.e, hub.c, "fixture"); err != nil {
+		t.Fatal(err)
+	}
+	got, err := hub.c.GetTeamQueueEntry(ctx, f.task.ID, q.ID)
+	if err != nil || got.State != "running" || got.Failure != "" || hub.count("fail") != 0 || len(launchNotices(t, f, launchFailedSubject, q.ID)) != 0 {
+		t.Fatalf("launch after a seat freed: state=%s failure=%q %v", got.State, got.Failure, err)
+	}
+	if attempts["correction-lead-0"] != 1 || registered["correction-lead-0"] != 1 || attempts["correction-lead-1"] != 2 || registered["correction-lead-1"] != 1 {
+		t.Fatalf("spawn attempts %v registered %v", attempts, registered)
+	}
+}

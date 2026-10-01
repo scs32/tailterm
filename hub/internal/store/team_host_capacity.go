@@ -168,3 +168,103 @@ func checkTeamHostCapacity(ctx context.Context, tx *sql.Tx, host string, now tim
 	}
 	return nil
 }
+
+// smallTeamSlots is the small-change lane's team size. Host capacity keeps
+// charging an unfrozen small team as a bug team; only the project agent cap
+// uses this.
+const smallTeamSlots = 3
+
+// projectAgentCapPrefix starts every project agent cap reason. The queue
+// runner matches on it to hold an entry instead of failing it.
+const projectAgentCapPrefix = "project agent cap: "
+
+// queueTeamSeats is the number of agents an unfrozen entry's team registers.
+func queueTeamSeats(kind, template string) int {
+	if template == "small" {
+		return smallTeamSlots
+	}
+	if kind == "bug" {
+		return bugTeamSlots
+	}
+	return featureTeamSlots
+}
+
+// projectAgentCapUsage counts what already stands against a project's agent
+// cap. Open is exactly what agent registration counts: every agent of the
+// project, persistent roles and done or retired agents included, whose status
+// is not closed or exited. Reserved is the seats admitted launches still have
+// to register: the members of each launching entry's frozen plan that are not
+// started (its team size before the freeze), plus the team of each manual
+// reservation. An uncertain member may already be registered, so reserved can
+// overcount by one per launch.
+func projectAgentCapUsage(ctx context.Context, q queryRower, task string) (open, reserved int, err error) {
+	if err = q.QueryRowContext(ctx, `SELECT COUNT(*) FROM agents WHERE task_id=? AND status NOT IN ('closed','exited')`, task).Scan(&open); err != nil {
+		return 0, 0, err
+	}
+	rows, err := q.QueryContext(ctx, `SELECT COALESCE(e.launch_json,''),e.template,COALESCE(w.kind,'') FROM team_queue_entries e LEFT JOIN work_items w ON w.id=e.item_id WHERE e.task_id=? AND e.state='launching'
+ UNION ALL SELECT '','',COALESCE(w.kind,'') FROM team_launch_reservations r LEFT JOIN work_items w ON w.id=r.item_id WHERE r.task_id=? AND r.entry_id='' AND r.state IN ('reserved','launching')`, task, task)
+	if err != nil {
+		return 0, 0, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var frozen, template, kind string
+		if err = rows.Scan(&frozen, &template, &kind); err != nil {
+			return 0, 0, err
+		}
+		if frozen == "" {
+			reserved += queueTeamSeats(kind, template)
+			continue
+		}
+		var plan struct {
+			Members []struct {
+				State string `json:"state"`
+			} `json:"members"`
+		}
+		if json.Unmarshal([]byte(frozen), &plan) != nil || len(plan.Members) == 0 {
+			return 0, 0, fmt.Errorf("%w: frozen reservation is invalid", api.ErrConflict)
+		}
+		for _, member := range plan.Members {
+			if member.State != "started" {
+				reserved++
+			}
+		}
+	}
+	return open, reserved, rows.Err()
+}
+
+// projectAgentCapReason names why seats more agents do not fit under the cap,
+// or is empty when they fit.
+func projectAgentCapReason(open, reserved, seats, maxAgents int) string {
+	if open+reserved+seats <= maxAgents {
+		return ""
+	}
+	if reserved > 0 {
+		return fmt.Sprintf("%s%d open + %d reserved + %d seats > %d", projectAgentCapPrefix, open, reserved, seats, maxAgents)
+	}
+	return fmt.Sprintf("%s%d open + %d seats > %d", projectAgentCapPrefix, open, seats, maxAgents)
+}
+
+// checkProjectAgentCap refuses a team that agent registration would refuse
+// partway through its launch (docs/project-queue.md, "Project agent cap").
+// maxAgents is the store's enforced cap, not the compiled default.
+func checkProjectAgentCap(ctx context.Context, q queryRower, task string, maxAgents, seats int) error {
+	open, reserved, err := projectAgentCapUsage(ctx, q, task)
+	if err != nil {
+		return err
+	}
+	if reason := projectAgentCapReason(open, reserved, seats, maxAgents); reason != "" {
+		return fmt.Errorf("%w: %s", api.ErrConflict, reason)
+	}
+	return nil
+}
+
+// queueItemKind reads an item's kind; a missing item is an unknown kind.
+func queueItemKind(ctx context.Context, q queryRower, task, item string) (string, error) {
+	var kind string
+	err := q.QueryRowContext(ctx, `SELECT kind FROM work_items WHERE task_id=? AND id=?`, task, item).Scan(&kind)
+	if err == sql.ErrNoRows {
+		return "", nil
+	}
+	return kind, err
+}

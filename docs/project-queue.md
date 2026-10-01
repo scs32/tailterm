@@ -714,7 +714,9 @@ results are correct, and the client's 64 MiB listing cap
 
 A launch writes its progress to the hub with four operations: `freeze`,
 `attempt`, `started` (after a spawn, or after an uncertain spawn is found
-registered) and `running`. Before wi_a3ca8b64d12365c2 the runner returned any refusal of those
+registered) and `running`. A fifth, `unattempt`, takes back an attempt whose
+registration the hub refused at the project agent cap (see "Project agent
+cap"). Before wi_a3ca8b64d12365c2 the runner returned any refusal of those
 writes and repeated the same write on the next relay tick, with no failure and
 no Board signal; on 2026-09-30 one entry repeated a 413 `freeze` 154 times in
 about 45 minutes while holding a slot.
@@ -1129,3 +1131,92 @@ rebind tables, and the Board does not yet show attempts or rebinds.
 Not covered: release follow-through for a done item with a pending or failed
 release (`wi_1a0349b7bf5dce22`), rebinding a launching entry in place, and
 changing the work order of a live entry.
+
+## Project agent cap
+
+A project holds at most 32 open agents (`api.MaxAgentsPerTask`; a hub started
+with `TAILTERM_MAX_AGENTS` enforces that lower value instead). Agent
+registration refuses the next one with 409 `limit reached`. Before
+wi_91e0cf6fa1dedbef the queue never looked at this cap: on 2026-09-30 a raised
+queue limit admitted a fourth team, one member's registration was refused,
+the entry failed with other members already started, and the owner had to
+close them and supersede the item.
+
+**What counts.** Every agent of the project whose status is not `closed` or
+`exited`, whatever its role: team members, and also the persistent roles
+(database handlers, backlog steward, deployer, owner helper) and agents that
+are `done` or `retired`. This is the same count registration uses. Closing
+finished teams and retired handlers frees seats; marking an agent done or
+retired does not.
+
+**Seats.** An entry's team needs 3 seats on the small-change lane, 5 for a
+Planned bug and 6 for a Planned feature. Launches already admitted keep their
+seats reserved until each member registers: the members of a launching entry's
+frozen plan that are not `started` (its whole team before the freeze), and the
+team of a manual launch reservation. A member whose spawn is uncertain may
+already be registered, so the reservation can be one too high per launch for a
+tick; it errs toward waiting.
+
+**Reason.** When open agents, reserved seats and the team's seats exceed the
+cap, the hub answers 409 with
+
+    project agent cap: N open + M seats > CAP
+    project agent cap: N open + R reserved + M seats > CAP
+
+the second form when R is above zero. `tt team queue list` shows the same text
+as the queued entry's reason, and `--json` carries it as `blockReason`.
+
+**Three check points.**
+
+1. **Claim.** After the slot and host checks and before anything is written,
+   in serial and parallel queues. The entry stays queued at the same revision,
+   with no reservation and no handler lease. The runner treats the refusal as
+   a wait, like `all team slots are reserved`: no failure and no notice, and
+   it claims again on a later tick, so the wait ends by itself once agents
+   close.
+2. **Limit raise.** `tt team queue limit` refuses a raise (a larger number, or
+   0 from a fixed number) while the next team does not fit: the first queued
+   entry's seats, or 6 when nothing is queued. The limit is left unchanged.
+   Lowering or keeping the limit is not checked against the cap.
+3. **Attempt.** Agents registered outside the queue (`tt spawn`, a handler
+   rotation) do not honor reserved seats, so a launch can still meet a full
+   project. Each member's `attempt` is refused with `project agent cap: N open
+   + 1 seats > CAP` when the project is full. The member stays `unstarted`,
+   and the launch waits and retries with the launch error backoff.
+
+**A refused registration.** If the project fills between a member's attempt
+and its registration, the hub refuses the registration. Registration comes
+before any host session, so nothing was started. The runner sends `unattempt`,
+which returns the member to `unstarted` only while no agent has that member's
+ID, and then backs off as for any transient launch error with
+
+    spawn NAME: project agent cap: N open + 1 seats > 32: register agent: hub: 409 limit reached
+
+The entry is not failed, no `Team queue failed and requires owner action`
+notice is posted, and members already started are kept and not spawned again.
+N is the runner's own roster count, and its text always says 32 even on a hub
+with a lower cap; the hub's reasons use the enforced value. If the `unattempt`
+write itself is lost, the member stays `uncertain` and the next launch fails
+the entry under the unchanged never-respawn rule.
+
+A partly launched team that is held this way keeps its slot, handler lease
+and ownership until seats free. After the stall grace it shows as the
+`nothing-running` stall only if none of its members is live; the stall notice
+then carries the text above as the last launch error.
+
+**Interaction with the concurrency limit.** The limit is a ceiling on teams,
+the cap is a ceiling on agents in the project, and host capacity is a third,
+per host. Each is checked on its own and the tightest one holds the queue.
+Raising the limit never raises the cap: four Planned feature teams need 24
+seats beside the persistent roles and every agent not yet closed. The queue
+keeps its order, so a head entry that does not fit holds the entries behind it,
+even a smaller team.
+
+Update the hub and the relay hosts' tt together. An older runner on the new
+hub reports the claim refusal as an error on every tick instead of waiting
+silently (it does not fail the entry), and a new runner on an older hub has no
+`unattempt` to call.
+
+Not covered here: showing the cap in `tt team queue policy` and a per-project
+cap setting (`wi_c8119b78f9045698`), reserving seats against registrations
+made outside the queue, and letting a smaller team pass a held head.

@@ -2326,3 +2326,313 @@ func TestTeamQueueClaimSkipsStaleQueuedEntry(t *testing.T) {
 		t.Fatalf("rebound entry %+v", listed)
 	}
 }
+
+// capFiller registers a plain open agent that counts toward the project agent
+// cap.
+func capFiller(t *testing.T, s *Store, task api.Task, name string) api.Agent {
+	t.Helper()
+	a, err := s.AddAgent(context.Background(), task.ID, api.AddAgentRequest{Name: name, AgentID: api.NewID("agt"), Host: "mini", Session: name}, api.Caller{Node: "fixture", User: "owner"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return a
+}
+
+// capLaunchPlan is a frozen launch for a claimed entry with n unstarted
+// members; it returns the plan and the members' agent IDs.
+func capLaunchPlan(task api.Task, item api.WorkItem, order api.Message, q api.TeamQueueEntry, n int) ([]byte, []string) {
+	var members []any
+	var ids []string
+	for i := 0; i < n; i++ {
+		id := api.NewID("agt")
+		ids = append(ids, id)
+		members = append(members, map[string]any{"state": "unstarted", "runId": api.NewID("run"), "fields": map[string]any{"agentId": id, "name": fmt.Sprintf("member-%d", i), "cwd": "/tmp"}})
+	}
+	plan, _ := json.Marshal(map[string]any{"task": task.ID, "item": item.ID, "revision": item.Revision, "order": order.Seq, "handlerId": q.HandlerID, "handlerRunId": q.HandlerRunID, "handlerLeaseGeneration": q.HandlerLeaseGeneration, "context": map[string]any{"version": 1}, "members": members})
+	return plan, ids
+}
+
+func launchMemberStates(t *testing.T, q api.TeamQueueEntry) []string {
+	t.Helper()
+	var plan struct {
+		Members []struct {
+			State string `json:"state"`
+		} `json:"members"`
+	}
+	if err := json.Unmarshal(q.LaunchJSON, &plan); err != nil {
+		t.Fatal(err)
+	}
+	var states []string
+	for _, m := range plan.Members {
+		states = append(states, m.State)
+	}
+	return states
+}
+
+// wi_91e0cf6fa1dedbef a1, a2, a4: a team that does not fit under the project
+// agent cap waits queued with the named reason; persistent-role and done
+// agents count; an exact fit claims once an agent closes.
+func TestTeamQueueClaimWaitsAtProjectAgentCap(t *testing.T) {
+	s, task, items, orders := queueFixture(t)
+	ctx := context.Background()
+	s.MaxAgents = 8
+	// The fixture's database handler is the persistent role; one more agent
+	// is done and one is between turns.
+	done := capFiller(t, s, task, "finished-worker")
+	setAgentStatus(t, s, done.ID, "done")
+	idle := capFiller(t, s, task, "idle-worker")
+	q, err := s.TeamQueueAction(ctx, task.ID, api.TeamQueueRequest{RequestID: "add", Operation: "add", ItemID: items[0].ID, OrderMessageSeq: orders[0].Seq, Host: "mini", Cwd: "/tmp"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	const reason = "project agent cap: 3 open + 6 seats > 8"
+	claim := api.TeamQueueRequest{RequestID: "claim", Operation: "claim", EntryID: q.ID, ExpectedRevision: q.Revision, Host: "mini"}
+	if _, err := s.TeamQueueAction(ctx, task.ID, claim); !errors.Is(err, api.ErrConflict) || err.Error() != "conflict: "+reason {
+		t.Fatalf("claim over the cap: %v", err)
+	}
+	held, err := s.GetTeamQueueEntry(ctx, task.ID, q.ID)
+	if err != nil || held.State != "queued" || held.Revision != q.Revision || held.Failure != "" {
+		t.Fatalf("held entry %+v %v", held, err)
+	}
+	var reservations int
+	if err := s.db.QueryRow(`SELECT count(*) FROM team_launch_reservations WHERE task_id=?`, task.ID).Scan(&reservations); err != nil || reservations != 0 {
+		t.Fatalf("reservations=%d %v", reservations, err)
+	}
+	list, err := s.ListTeamQueue(ctx, task.ID)
+	if err != nil || len(list.Entries) != 1 || list.Entries[0].BlockReason != reason {
+		t.Fatalf("list reason %+v %v", list.Entries, err)
+	}
+	// Closing one agent leaves 2 open + 6 seats = 8: an exact fit claims.
+	setAgentStatus(t, s, idle.ID, "closed")
+	list, err = s.ListTeamQueue(ctx, task.ID)
+	if err != nil || list.Entries[0].BlockReason != "" {
+		t.Fatalf("reason after close %+v %v", list.Entries, err)
+	}
+	claimed, err := s.TeamQueueAction(ctx, task.ID, claim)
+	if err != nil || claimed.State != "launching" {
+		t.Fatalf("claim at exact fit %+v %v", claimed, err)
+	}
+}
+
+// wi_91e0cf6fa1dedbef a3: seats are 3 small, 5 bug and 6 feature, and the
+// seats of launches under way are reserved against the cap.
+func TestTeamQueueAgentCapCountsReservedSeats(t *testing.T) {
+	for _, tc := range []struct {
+		kind, template string
+		seats          int
+	}{{"bug", "small", 3}, {"bug", "planned", 5}, {"feature", "planned", 6}, {"", "", 6}} {
+		if got := queueTeamSeats(tc.kind, tc.template); got != tc.seats {
+			t.Fatalf("seats(%q,%q)=%d, want %d", tc.kind, tc.template, got, tc.seats)
+		}
+	}
+	// Two handlers are open in this parallel project.
+	s, task, items, orders := sharedCheckoutFixture(t, 3)
+	ctx := context.Background()
+	bug, bugOrder := smallBug(t, s, task)
+	small, smallOrder := smallBug(t, s, task)
+	first := addCheckoutEntry(t, s, task, items[0], orders[0], "/a", "src/a")
+	addCheckoutEntry(t, s, task, items[1], orders[1], "/b", "src/b")
+	addCheckoutEntry(t, s, task, bug, bugOrder, "/c", "src/c")
+	if _, err := s.TeamQueueAction(ctx, task.ID, api.TeamQueueRequest{RequestID: "add-small", Operation: "add", ItemID: small.ID, OrderMessageSeq: smallOrder.Seq, Template: "small", Host: "mini", Cwd: "/d", Repository: "repo", BaseCommit: checkoutBase, Ownership: []string{"src/d"}}); err != nil {
+		t.Fatal(err)
+	}
+	reasons := func() []string {
+		t.Helper()
+		syntheticHostUsage(t, s, task.ID, "mini")
+		list, err := s.ListTeamQueue(ctx, task.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var out []string
+		for _, e := range list.Entries {
+			out = append(out, e.BlockReason)
+		}
+		return out
+	}
+	s.MaxAgents = 2
+	if got, want := reasons(), []string{"project agent cap: 2 open + 6 seats > 2", "project agent cap: 2 open + 6 seats > 2", "project agent cap: 2 open + 5 seats > 2", "project agent cap: 2 open + 3 seats > 2"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("seat reasons %q", got)
+	}
+	usage := func() [2]int {
+		t.Helper()
+		open, reserved, err := projectAgentCapUsage(ctx, s.db, task.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return [2]int{open, reserved}
+	}
+	s.MaxAgents = 32
+	q, err := s.TeamQueueAction(ctx, task.ID, api.TeamQueueRequest{RequestID: "claim-first", Operation: "claim", EntryID: first.ID, ExpectedRevision: first.Revision, Host: "mini"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Claimed and not frozen: the whole feature team is reserved.
+	if got := usage(); got != [2]int{2, 6} {
+		t.Fatalf("unfrozen launch usage %v", got)
+	}
+	plan, _ := capLaunchPlan(task, items[0], orders[0], q, 2)
+	if q, err = s.TeamQueueAction(ctx, task.ID, api.TeamQueueRequest{RequestID: "freeze-first", Operation: "freeze", EntryID: q.ID, ExpectedRevision: q.Revision, LaunchJSON: plan}); err != nil {
+		t.Fatal(err)
+	}
+	if got := usage(); got != [2]int{2, 2} {
+		t.Fatalf("frozen launch usage %v", got)
+	}
+	if q, err = s.TeamQueueAction(ctx, task.ID, api.TeamQueueRequest{RequestID: "attempt-first", Operation: "attempt", EntryID: q.ID, ExpectedRevision: q.Revision}); err != nil {
+		t.Fatal(err)
+	}
+	var frozen struct {
+		Members []struct {
+			RunID string `json:"runId"`
+		} `json:"members"`
+	}
+	if err := json.Unmarshal(q.LaunchJSON, &frozen); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = s.TeamQueueAction(ctx, task.ID, api.TeamQueueRequest{RequestID: "started-first", Operation: "started", EntryID: q.ID, ExpectedRevision: q.Revision, MemberRunID: frozen.Members[0].RunID}); err != nil {
+		t.Fatal(err)
+	}
+	// One member started; the other is still to register.
+	if got := usage(); got != [2]int{2, 1} {
+		t.Fatalf("partly started launch usage %v", got)
+	}
+	s.MaxAgents = 8
+	if got := reasons(); got[1] != "project agent cap: 2 open + 1 reserved + 6 seats > 8" {
+		t.Fatalf("reserved reason %q", got)
+	}
+	list, err := s.ListTeamQueue(ctx, task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second := list.Entries[1]
+	claim := api.TeamQueueRequest{RequestID: "claim-second", Operation: "claim", EntryID: second.ID, ExpectedRevision: second.Revision, Host: "mini"}
+	if _, err := s.TeamQueueAction(ctx, task.ID, claim); err == nil || err.Error() != "conflict: project agent cap: 2 open + 1 reserved + 6 seats > 8" {
+		t.Fatalf("claim beside a reserved launch: %v", err)
+	}
+	s.MaxAgents = 9
+	syntheticHostUsage(t, s, task.ID, "mini")
+	if claimed, err := s.TeamQueueAction(ctx, task.ID, claim); err != nil || claimed.State != "launching" {
+		t.Fatalf("claim that fits beside a reserved launch %+v %v", claimed, err)
+	}
+}
+
+// wi_91e0cf6fa1dedbef a5: raising the queue limit is refused while the next
+// team does not fit under the project agent cap; a decrease is not checked.
+func TestTeamQueueLimitRaiseChecksProjectAgentCap(t *testing.T) {
+	s, task, items, orders := sharedCheckoutFixture(t, 2)
+	ctx := context.Background()
+	addCheckoutEntry(t, s, task, items[0], orders[0], "/a", "src/a")
+	filler := capFiller(t, s, task, "idle-worker")
+	s.MaxAgents = 8
+	limit := func() int {
+		t.Helper()
+		list, err := s.ListTeamQueue(ctx, task.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return list.ConcurrencyLimit
+	}
+	raise := func(key string, n int) error {
+		t.Helper()
+		syntheticHostUsage(t, s, task.ID, "mini")
+		_, err := s.TeamQueueAction(ctx, task.ID, api.TeamQueueRequest{RequestID: key, Operation: "set_limit", Host: "mini", ConcurrencyLimit: n})
+		return err
+	}
+	for i, n := range []int{3, 0} {
+		if err := raise(fmt.Sprintf("raise-refused-%d", i), n); !errors.Is(err, api.ErrConflict) || err.Error() != "conflict: project agent cap: 3 open + 6 seats > 8" {
+			t.Fatalf("raise to %d over the cap: %v", n, err)
+		}
+		if got := limit(); got != 2 {
+			t.Fatalf("refused raise changed the limit to %d", got)
+		}
+	}
+	// Keeping the limit is not a raise.
+	if err := raise("keep", 2); err != nil {
+		t.Fatalf("keeping the limit: %v", err)
+	}
+	setAgentStatus(t, s, filler.ID, "closed")
+	if err := raise("raise-fits", 3); err != nil || limit() != 3 {
+		t.Fatalf("raise after a close: %v limit=%d", err, limit())
+	}
+	// Lowering never adds agents, so the cap does not refuse it.
+	s.MaxAgents = 1
+	if err := raise("lower", 2); err != nil || limit() != 2 {
+		t.Fatalf("decrease at a full project: %v limit=%d", err, limit())
+	}
+}
+
+// wi_91e0cf6fa1dedbef a6: an attempt at a full project is refused with the
+// counts; the member stays unstarted and the entry is not failed.
+func TestTeamQueueAttemptHoldsAtProjectAgentCap(t *testing.T) {
+	s, task, items, orders := queueFixture(t)
+	ctx := context.Background()
+	q, err := s.TeamQueueAction(ctx, task.ID, api.TeamQueueRequest{RequestID: "add", Operation: "add", ItemID: items[0].ID, OrderMessageSeq: orders[0].Seq, Host: "mini", Cwd: "/tmp"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if q, err = s.TeamQueueAction(ctx, task.ID, api.TeamQueueRequest{RequestID: "claim", Operation: "claim", EntryID: q.ID, ExpectedRevision: q.Revision, Host: "mini"}); err != nil {
+		t.Fatal(err)
+	}
+	plan, _ := capLaunchPlan(task, items[0], orders[0], api.TeamQueueEntry{}, 1)
+	if q, err = s.TeamQueueAction(ctx, task.ID, api.TeamQueueRequest{RequestID: "freeze", Operation: "freeze", EntryID: q.ID, ExpectedRevision: q.Revision, LaunchJSON: plan}); err != nil {
+		t.Fatal(err)
+	}
+	// Another registration fills the project after the claim.
+	filler := capFiller(t, s, task, "late-worker")
+	s.MaxAgents = 2
+	attempt := api.TeamQueueRequest{RequestID: "attempt", Operation: "attempt", EntryID: q.ID, ExpectedRevision: q.Revision}
+	if _, err := s.TeamQueueAction(ctx, task.ID, attempt); !errors.Is(err, api.ErrConflict) || err.Error() != "conflict: project agent cap: 2 open + 1 seats > 2" {
+		t.Fatalf("attempt at a full project: %v", err)
+	}
+	held, err := s.GetTeamQueueEntry(ctx, task.ID, q.ID)
+	if err != nil || held.State != "launching" || held.Revision != q.Revision || held.Failure != "" || held.EscalationSeq != 0 || !reflect.DeepEqual(launchMemberStates(t, held), []string{"unstarted"}) {
+		t.Fatalf("held launch %+v %v", held, err)
+	}
+	setAgentStatus(t, s, filler.ID, "closed")
+	if q, err = s.TeamQueueAction(ctx, task.ID, attempt); err != nil || !reflect.DeepEqual(launchMemberStates(t, q), []string{"uncertain"}) {
+		t.Fatalf("attempt after a close %+v %v", q, err)
+	}
+}
+
+// wi_91e0cf6fa1dedbef a9: unattempt returns an uncertain member to unstarted
+// only while no agent holds its identity; a registered spawn is never taken
+// back.
+func TestTeamQueueUnattemptOnlyWithoutRegistration(t *testing.T) {
+	s, task, items, orders := queueFixture(t)
+	ctx := context.Background()
+	q, err := s.TeamQueueAction(ctx, task.ID, api.TeamQueueRequest{RequestID: "add", Operation: "add", ItemID: items[0].ID, OrderMessageSeq: orders[0].Seq, Host: "mini", Cwd: "/tmp"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if q, err = s.TeamQueueAction(ctx, task.ID, api.TeamQueueRequest{RequestID: "claim", Operation: "claim", EntryID: q.ID, ExpectedRevision: q.Revision, Host: "mini"}); err != nil {
+		t.Fatal(err)
+	}
+	plan, ids := capLaunchPlan(task, items[0], orders[0], api.TeamQueueEntry{}, 1)
+	if q, err = s.TeamQueueAction(ctx, task.ID, api.TeamQueueRequest{RequestID: "freeze", Operation: "freeze", EntryID: q.ID, ExpectedRevision: q.Revision, LaunchJSON: plan}); err != nil {
+		t.Fatal(err)
+	}
+	step := func(key, operation string) (api.TeamQueueEntry, error) {
+		return s.TeamQueueAction(ctx, task.ID, api.TeamQueueRequest{RequestID: key, Operation: operation, EntryID: q.ID, ExpectedRevision: q.Revision})
+	}
+	if _, err := step("unattempt-unstarted", "unattempt"); !errors.Is(err, api.ErrConflict) {
+		t.Fatalf("unattempt of an unstarted member: %v", err)
+	}
+	if q, err = step("attempt-1", "attempt"); err != nil {
+		t.Fatal(err)
+	}
+	if q, err = step("unattempt-1", "unattempt"); err != nil || !reflect.DeepEqual(launchMemberStates(t, q), []string{"unstarted"}) || q.State != "launching" {
+		t.Fatalf("unattempt without a registration %+v %v", q, err)
+	}
+	if q, err = step("attempt-2", "attempt"); err != nil || !reflect.DeepEqual(launchMemberStates(t, q), []string{"uncertain"}) {
+		t.Fatalf("second attempt %+v %v", q, err)
+	}
+	if _, err := s.AddAgent(ctx, task.ID, api.AddAgentRequest{Name: "member-0", AgentID: ids[0], Host: "mini", Session: "member-0"}, api.Caller{Node: "fixture", User: "owner"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := step("unattempt-2", "unattempt"); !errors.Is(err, api.ErrConflict) || !strings.Contains(err.Error(), "member agent is registered") {
+		t.Fatalf("unattempt of a registered member: %v", err)
+	}
+	saved, err := s.GetTeamQueueEntry(ctx, task.ID, q.ID)
+	if err != nil || saved.Revision != q.Revision || !reflect.DeepEqual(launchMemberStates(t, saved), []string{"uncertain"}) {
+		t.Fatalf("registered member after refusal %+v %v", saved, err)
+	}
+}
