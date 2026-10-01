@@ -751,3 +751,31 @@ func TestAllocationIntentCreateLostResponseRetryReplaysIdentically(t *testing.T)
 		t.Fatalf("readback should show the one frozen record: %+v %v", got, err)
 	}
 }
+
+// wi_26c0698de7d3eef2 review finding f1: the standing briefing names the one
+// narrow exception for an item lead and the plan's verifier, and keeps the
+// handler rule and the no-bypass rule around it. A handler's own briefing
+// does not carry the rule or its exception.
+func TestBriefingNamesLeadAndVerifierOperationException(t *testing.T) {
+	task := api.Task{Name: "Project", Orchestrator: "lead"}
+	roster := []api.Agent{{Name: "lead", Status: api.AgentRunning}, {Name: "handler", Role: api.AgentRoleDatabaseHandler, Status: api.AgentRunning}}
+	exception := "One exception, only for your own running team queue entry: its item lead may run tt verification plan, tt verification receipt and the done save with queue acceptance (tt work-items update --status done --worktree DIR --branch B --commit SHA), and the plan's verifier may run tt verification receipt; the hub validates each call. Every other work-item read and write stays with the handler."
+	for _, name := range []string{"lead", "builder", "verifier"} {
+		got := agentTaskBriefing(task, name, "", "", roster)
+		for _, required := range []string{
+			"ALL agent work-item database reads and writes, including list/get/create/update/dispatch, must go through the Database handler.",
+			"Do not use tt work-items, direct API calls, or database files yourself, even if the handler is unavailable. " + exception + " Send requests with the work-item ID",
+			"retired/offline/unavailable is not permission to bypass the handler",
+		} {
+			if !strings.Contains(got, required) {
+				t.Fatalf("%s briefing lacks %q in %s", name, required, got)
+			}
+		}
+		if n := strings.Count(got, "One exception, only for your own running team queue entry"); n != 1 {
+			t.Fatalf("%s briefing states the exception %d times", name, n)
+		}
+	}
+	if handler := agentTaskBriefing(task, "handler", api.AgentRoleDatabaseHandler, "", roster); strings.Contains(handler, "One exception, only for your own running team queue entry") || strings.Contains(handler, "Do not use tt work-items") {
+		t.Fatalf("handler briefing carries the agent rule: %s", handler)
+	}
+}

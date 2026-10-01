@@ -42,6 +42,13 @@ Persistent owner instructions:
   One exception (owner decision #15466): the backlog steward reads work items,
   their history, the queue and triage directly; all its writes still go through
   the database handler.
+  A second exception (owner helper answer #18182, `wi_26c0698de7d3eef2`): for
+  its own running team queue entry, an item lead may run `tt verification
+  plan`, `tt verification receipt` and the done save with queue acceptance
+  (`tt work-items update --status done --worktree --branch --commit`), and the
+  plan's verifier may run `tt verification receipt`. The hub validates each
+  call. Every other work-item read and write stays with the database handler,
+  and a refusal is not permission to bypass it.
 - The database handler verifies committed records, preserves source provenance,
   revision checks and retry identities, and records assignment/result links and
   acceptance evidence. Only report item completion after its saved confirmation.
