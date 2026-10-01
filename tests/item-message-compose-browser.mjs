@@ -52,15 +52,76 @@ function holdNextMessage() {
   hold = { started, releasePromise };
   return { started: startedPromise, release };
 }
+// A composer re-render replaces #board-audit-kind. Playwright keeps retrying
+// the detached select it resolved as "option being selected is not enabled"
+// until its whole timeout, so wait for a connected, enabled option, select
+// through a freshly resolved locator with a short action timeout, and report
+// the option's state if it never becomes selectable.
 async function selectAuditKind(page, value) {
-  const select = page.locator("#board-audit-kind");
-  await select.evaluate((element) => (element.closest("details").open = true));
-  await select.selectOption(value, { force: true });
-  await page.waitForFunction(
-    (expected) =>
-      document.querySelector("#board-audit-kind")?.value === expected,
-    value,
-  );
+  const optionState = () =>
+    page.evaluate((expected) => {
+      const select = document.querySelector("#board-audit-kind");
+      const option = [...(select?.options || [])].find(
+        (candidate) => candidate.value === expected,
+      );
+      return {
+        selectPresent: !!select,
+        selectDisabled: select?.disabled ?? null,
+        selectValue: select?.value ?? null,
+        optionPresent: !!option,
+        optionDisabled: option?.disabled ?? null,
+        disabledAncestor: !!option?.closest(
+          "fieldset[disabled], optgroup[disabled]",
+        ),
+        detailsOpen: select?.closest("details")?.open ?? null,
+      };
+    }, value);
+  const selectable = (expected) => {
+    const select = document.querySelector("#board-audit-kind");
+    const option = [...(select?.options || [])].find(
+      (candidate) => candidate.value === expected,
+    );
+    return (
+      !!option &&
+      !select.disabled &&
+      !option.disabled &&
+      !option.closest("fieldset[disabled], optgroup[disabled]")
+    );
+  };
+  const unselectable = async (reason, cause) =>
+    new Error(
+      `Audit kind ${JSON.stringify(value)} ${reason}: ${JSON.stringify(await optionState())}`,
+      { cause },
+    );
+  let failure;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      await page.waitForFunction(selectable, value, { timeout: 10000 });
+    } catch (error) {
+      if (error.name !== "TimeoutError") throw error;
+      throw await unselectable("never became selectable", error);
+    }
+    try {
+      const select = page.locator("#board-audit-kind");
+      await select.evaluate(
+        (element) => (element.closest("details").open = true),
+        null,
+        { timeout: 2000 },
+      );
+      await select.selectOption(value, { force: true, timeout: 2000 });
+      await page.waitForFunction(
+        (expected) =>
+          document.querySelector("#board-audit-kind")?.value === expected,
+        value,
+        { timeout: 2000 },
+      );
+      return;
+    } catch (error) {
+      if (error.name !== "TimeoutError") throw error;
+      failure = error;
+    }
+  }
+  throw await unselectable("could not be selected", failure);
 }
 
 const html = `<!doctype html><html><head><meta charset="utf-8">
@@ -321,6 +382,32 @@ try {
               ?.values,
         );
       }
+      // The Board renders the item context before it saves the draft, and an
+      // older draft for the same item can already be on screen, so the composer
+      // text does not prove the draft: wait for the saved draft itself.
+      async function draftFor(item) {
+        try {
+          await page.waitForFunction(
+            ({ id, revision }) => {
+              const values = qa
+                .drafts()
+                .find((x) => x.id === `draft:${qa.board.selected()}`)?.values;
+              return (
+                values?.primaryItem === id &&
+                values?.primaryRevision === revision
+              );
+            },
+            { id: item.id, revision: String(item.revision) },
+          );
+        } catch (error) {
+          if (error.name !== "TimeoutError") throw error;
+          throw new Error(
+            `${name} draft never reached ${item.id}@${item.revision}: ${JSON.stringify(await draftValue())}`,
+            { cause: error },
+          );
+        }
+        return draftValue();
+      }
       async function openItem(kind, item) {
         await page.evaluate(async ({ kind, id }) => qa.showItems(kind, id), {
           kind,
@@ -358,6 +445,7 @@ try {
               ?.textContent.includes(id),
           item.id,
         );
+        await draftFor(item);
       }
       async function showBoard(project) {
         if (await input.count()) await input.blur();
@@ -552,7 +640,7 @@ try {
                 ?.textContent.includes(id),
             current.id,
           );
-          const selected = await draftValue();
+          const selected = await draftFor(displayed);
           assert.equal(selected.primaryRevision, String(displayed.revision));
           assert.equal(selected.itemTitle, displayed.title);
           assert.equal(selected.primaryTask, displayed.taskId);
@@ -610,6 +698,9 @@ try {
       }, fixture.task.id);
       await page.locator(`[data-item-message="${active.id}"]`).click();
       await input.waitFor();
+      // The item context re-renders the composer and would overwrite an
+      // earlier classification, so let it settle before changing the kind.
+      await draftFor(active);
       // Start the existing empty-selection checks with an ordinary draft.
       await selectAuditKind(page, "");
       await page.locator("#board-message-item-mode").click();
