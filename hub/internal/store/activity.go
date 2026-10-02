@@ -47,6 +47,9 @@ func validActivity(a api.AgentActivity) bool {
 	if (a.State == "provider_blocked") != (a.Provider != nil) || (a.Provider != nil && !a.Provider.Valid()) {
 		return false
 	}
+	if a.MatrixWait != nil && !a.MatrixWait.Valid() {
+		return false
+	}
 	if a.ObservedAt.IsZero() || len(a.PendingTool) > 120 || len(a.Reason) > 240 || strings.ContainsAny(a.PendingTool+a.Reason, "\n\r") {
 		return false
 	}
@@ -118,7 +121,7 @@ func (s *Store) ReportActivity(ctx context.Context, task, agent string, report a
 	}
 	// The reason is compared too, so an idle report whose reason becomes an
 	// API-error rate limit is stored and reaches the handler arm hook.
-	if oldState == report.Activity.State && oldActivity.Reason == report.Activity.Reason && sameWakeOutcome(oldActivity.Wake, report.Activity.Wake) && sameRuntimePrompt(oldActivity.Prompt, report.Activity.Prompt) && api.SameProviderBlock(oldActivity.Provider, report.Activity.Provider) {
+	if oldState == report.Activity.State && oldActivity.Reason == report.Activity.Reason && sameWakeOutcome(oldActivity.Wake, report.Activity.Wake) && sameRuntimePrompt(oldActivity.Prompt, report.Activity.Prompt) && api.SameProviderBlock(oldActivity.Provider, report.Activity.Provider) && api.SameMatrixWait(oldActivity.MatrixWait, report.Activity.MatrixWait) {
 		var saved api.AgentActivity
 		if json.Unmarshal([]byte(oldPayload), &saved) != nil {
 			return zero, api.ErrConflict

@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -19,6 +20,10 @@ import (
 const (
 	defaultQueueIdleThreshold = 30 * time.Minute
 	defaultQueueStallGrace    = 5 * time.Minute
+	// A reported matrix wait stops counting this long after its since: the
+	// host lock's 240-minute wait limit plus slack, and above its 122-minute
+	// holder limit. It only matters when the relay stops reporting.
+	defaultQueueMatrixWaitBound = 4*time.Hour + 30*time.Minute
 )
 
 // SetQueueStallTiming overrides the idle threshold and the notice grace;
@@ -106,7 +111,7 @@ func (s *Store) classifyStallBlocker(ctx context.Context, q queryRower, e api.Te
 	}
 	// idle-entry: every live member idle or done, no open work between them
 	// and anyone, for at least the idle threshold.
-	rows, err := q.QueryContext(ctx, `SELECT a.status,COALESCE(x.state,''),COALESCE(x.observed_at,'') FROM agent_work_item_bindings b JOIN agents a ON a.id=b.agent_id AND a.run_id=b.run_id
+	rows, err := q.QueryContext(ctx, `SELECT a.status,COALESCE(x.state,''),COALESCE(x.observed_at,''),COALESCE(x.payload,'') FROM agent_work_item_bindings b JOIN agents a ON a.id=b.agent_id AND a.run_id=b.run_id
  LEFT JOIN agent_activity x ON x.agent_id=b.agent_id AND x.run_id=b.run_id
  WHERE b.item_task_id=? AND b.item_id=? AND a.status NOT IN ('closed','exited')`, e.TaskID, e.ItemID)
 	if err != nil {
@@ -115,13 +120,21 @@ func (s *Store) classifyStallBlocker(ctx context.Context, q queryRower, e api.Te
 	since := parseStallTime(e.UpdatedAt)
 	idle := true
 	for rows.Next() {
-		var status, state, observed string
-		if err := rows.Scan(&status, &state, &observed); err != nil {
+		var status, state, observed, payload string
+		if err := rows.Scan(&status, &state, &observed, &payload); err != nil {
 			rows.Close()
 			return nil, err
 		}
 		if status != api.AgentDone && state != "idle" && state != "finished_silent" {
 			idle = false
+		}
+		// A member's verification run waiting for or holding the matrix
+		// host is the team's open work, whatever the member's own state.
+		if strings.Contains(payload, `"matrixWait"`) {
+			var activity api.AgentActivity
+			if json.Unmarshal([]byte(payload), &activity) == nil && activity.MatrixWait.Valid() && s.now().Sub(activity.MatrixWait.Since) < defaultQueueMatrixWaitBound {
+				idle = false
+			}
 		}
 		if at := parseStallTime(observed); at.After(since) {
 			since = at
@@ -143,6 +156,22 @@ func (s *Store) classifyStallBlocker(ctx context.Context, q queryRower, e api.Te
 		return nil, nil // someone owes this team, or it owes someone
 	}
 	if at := parseStallTime(changed.String); at.After(since) {
+		since = at
+	}
+	// An owner decision (tt ask) is no obligation, so it is counted here: an
+	// unanswered one from a member is open work, and an answer restarts the
+	// idle time.
+	var unanswered int
+	var answered sql.NullString
+	if err := q.QueryRowContext(ctx, `SELECT COALESCE(SUM(CASE WHEN d.message_seq IS NULL THEN 1 ELSE 0 END),0),MAX(d.created_at) FROM decision_requests r JOIN messages m ON m.seq=r.message_seq
+ LEFT JOIN decision_answers d ON d.task_id=r.task_id AND d.request_seq=r.message_seq WHERE r.task_id=? AND m.from_agent IN (`+team+`)`,
+		e.TaskID, e.TaskID, e.ItemID, api.AgentRoleDatabaseHandler).Scan(&unanswered, &answered); err != nil {
+		return nil, err
+	}
+	if unanswered > 0 {
+		return nil, nil // the owner owes this team an answer
+	}
+	if at := parseStallTime(answered.String); at.After(since) {
 		since = at
 	}
 	if s.now().Sub(since) < s.queueIdleAfter() {

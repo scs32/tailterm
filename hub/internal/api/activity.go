@@ -33,6 +33,48 @@ type AgentActivity struct {
 	// Provider is set only with state provider_blocked: the provider refused
 	// the agent's requests (docs/provider-blocked.md).
 	Provider *ProviderBlock `json:"provider,omitempty"`
+	// MatrixWait is set, beside any state, while the agent has a live
+	// verification run in its host's matrix lock (docs/agent-activity.md).
+	MatrixWait *MatrixWait `json:"matrixWait,omitempty"`
+}
+
+// Matrix wait roles: a run in the host lock's waitlist, or holding the host.
+const (
+	MatrixWaitWaiting = "waiting"
+	MatrixWaitRunning = "running"
+)
+
+// MatrixWait is an agent's verification run in its host's matrix lock. No
+// path, commit, pid or output of the run is carried.
+type MatrixWait struct {
+	Role     string    `json:"role"`               // waiting | running
+	Item     string    `json:"item,omitempty"`     // the run's work item, when the lock names one
+	Position int       `json:"position,omitempty"` // 1-based place among the waiters
+	Length   int       `json:"length,omitempty"`   // waiters in the lock
+	Since    time.Time `json:"since"`              // waiting: requested; running: started
+}
+
+// Valid reports whether every field is an allowed enum or range.
+func (w *MatrixWait) Valid() bool {
+	if w == nil || w.Since.IsZero() || (w.Item != "" && !ValidID(w.Item, "wi")) {
+		return false
+	}
+	switch w.Role {
+	case MatrixWaitWaiting:
+		return w.Position >= 1 && w.Position <= w.Length && w.Length <= 1000
+	case MatrixWaitRunning:
+		return w.Position == 0 && w.Length == 0
+	}
+	return false
+}
+
+// SameMatrixWait compares the parts of a wait that make a new report. The
+// position is left out: a moving waitlist is not a transition.
+func SameMatrixWait(a, b *MatrixWait) bool {
+	if a == nil || b == nil {
+		return a == nil && b == nil
+	}
+	return a.Role == b.Role && a.Item == b.Item && a.Since.Equal(b.Since)
 }
 
 // Provider block classes. Class, code and status together are the exact error

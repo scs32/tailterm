@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"path/filepath"
@@ -603,6 +604,156 @@ func TestQueueStallIdleEntry(t *testing.T) {
 	}
 	advance(40 * time.Minute)
 	assertNoStall(t, f, b.ID, "an open obligation")
+}
+
+// report sends a member's idle activity through ReportActivity at the store's
+// now, with or without a matrix wait.
+func (f *choresQueue) report(t *testing.T, a api.Agent, wait *api.MatrixWait) (api.AgentActivity, error) {
+	t.Helper()
+	return f.s.ReportActivity(context.Background(), f.task.ID, a.ID, api.ActivityReport{RequestID: api.NewID("req"), RunID: a.RunID, Activity: api.AgentActivity{State: "idle", ObservedAt: f.s.now(), MatrixWait: wait}})
+}
+
+// idleTeam is a running entry whose lead and worker are idle, with a queued
+// entry behind it that overlaps its ownership.
+func idleTeam(t *testing.T) (f *choresQueue, advance func(time.Duration), a, b api.TeamQueueEntry, lead, worker api.Agent) {
+	t.Helper()
+	f = newChoresQueue(t, 2, 2, 0)
+	f.s.queueIdleThreshold = 30 * time.Minute
+	advance = f.clock(t)
+	a = f.run(t, f.add(t, 0, "src"))
+	lead, worker = f.member(t, 0, "lead-a"), f.member(t, 0, "worker-a")
+	b = f.add(t, 1, "src/b")
+	f.activity(t, lead, "idle")
+	f.activity(t, worker, "idle")
+	return
+}
+
+// s1: an unanswered owner decision (tt ask) from a member is open work; the
+// answer restarts the idle time.
+func TestQueueStallIdleEntryOwnerDecision(t *testing.T) {
+	f, advance, a, b, lead, _ := idleTeam(t)
+	ctx := context.Background()
+	// In a parallel project only the item's lead may ask, with its item link.
+	if _, err := f.s.db.Exec(`UPDATE item_team_leads SET agent_id=?,run_id=?,state='running' WHERE task_id=? AND item_id=?`, lead.ID, lead.RunID, f.task.ID, f.items[0].ID); err != nil {
+		t.Fatal(err)
+	}
+	req := decisionRequest(lead, "stall-ask")
+	req.WorkItems = []api.MessageWorkItem{{ItemTaskID: f.task.ID, ItemID: f.items[0].ID, ItemRevision: f.items[0].Revision, Relationship: "primary"}}
+	req.WorkOrderMessage = &api.MessageReference{TaskID: f.task.ID, Seq: f.orders[0].Seq}
+	ask, err := f.s.CreateDecision(ctx, f.task.ID, req, f.by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var obligations int
+	if err := f.s.db.QueryRow(`SELECT count(*) FROM obligations WHERE task_id=?`, f.task.ID).Scan(&obligations); err != nil || obligations != 0 {
+		t.Fatalf("a decision request made %d obligations (%v); this test needs none", obligations, err)
+	}
+	advance(40 * time.Minute)
+	assertNoStall(t, f, b.ID, "an unanswered owner decision")
+	advance(5 * time.Hour)
+	assertNoStall(t, f, b.ID, "an owner decision has no stall bound")
+	if _, err := f.s.AnswerDecision(ctx, f.task.ID, ask.Seq, api.AnswerDecisionRequest{RequestID: "stall-answer", OptionID: "staged"}, f.by); err != nil {
+		t.Fatal(err)
+	}
+	advance(10 * time.Minute)
+	assertNoStall(t, f, b.ID, "idle below the threshold since the answer")
+	advance(25 * time.Minute)
+	assertStall(t, f, b.ID, api.StallIdleEntry, a.ID, "tt team queue scope --task "+f.task.ID+" --entry "+a.ID)
+}
+
+// s2, s4: a member's reported matrix wait, waiting or running, is open work
+// though every member is idle; a report without it restarts the idle time.
+func TestQueueStallIdleEntryMatrixWait(t *testing.T) {
+	f, advance, a, b, lead, _ := idleTeam(t)
+	if _, err := f.report(t, lead, &api.MatrixWait{Role: api.MatrixWaitWaiting, Item: f.items[0].ID, Position: 2, Length: 3, Since: f.s.now()}); err != nil {
+		t.Fatal(err)
+	}
+	advance(40 * time.Minute)
+	assertNoStall(t, f, b.ID, "a member waits for the matrix host")
+	if _, err := f.report(t, lead, &api.MatrixWait{Role: api.MatrixWaitRunning, Item: f.items[0].ID, Since: f.s.now()}); err != nil {
+		t.Fatal(err)
+	}
+	advance(40 * time.Minute)
+	assertNoStall(t, f, b.ID, "a member's matrix run holds the host")
+	if _, err := f.report(t, lead, nil); err != nil {
+		t.Fatal(err)
+	}
+	advance(10 * time.Minute)
+	assertNoStall(t, f, b.ID, "idle below the threshold since the wait ended")
+	advance(25 * time.Minute)
+	assertStall(t, f, b.ID, api.StallIdleEntry, a.ID, "tt team queue integrated", "tt team queue scope --task "+f.task.ID+" --entry "+a.ID)
+}
+
+// s2: a matrix wait the relay stopped updating counts only within the bound.
+func TestQueueStallIdleEntryMatrixWaitBound(t *testing.T) {
+	f, advance, a, b, lead, _ := idleTeam(t)
+	if _, err := f.report(t, lead, &api.MatrixWait{Role: api.MatrixWaitWaiting, Position: 1, Length: 1, Since: f.s.now().Add(-(defaultQueueMatrixWaitBound - 40*time.Minute))}); err != nil {
+		t.Fatal(err)
+	}
+	advance(35 * time.Minute)
+	assertNoStall(t, f, b.ID, "a wait five minutes inside the bound")
+	advance(10 * time.Minute)
+	assertStall(t, f, b.ID, api.StallIdleEntry, a.ID)
+}
+
+// s4: the hub stores a matrix wait appearing, changing and ending as
+// transitions, ignores a moved position, and refuses an invalid wait.
+func TestQueueStallMatrixWaitReport(t *testing.T) {
+	f, advance, _, _, _, _ := idleTeam(t)
+	member := f.member(t, 0, "verifier-a") // no activity saved yet
+	saved := func() (observed string, wait *api.MatrixWait) {
+		t.Helper()
+		var payload string
+		err := f.s.db.QueryRow(`SELECT observed_at,payload FROM agent_activity WHERE agent_id=? AND run_id=?`, member.ID, member.RunID).Scan(&observed, &payload)
+		if errors.Is(err, sql.ErrNoRows) {
+			return "", nil
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		var activity api.AgentActivity
+		if err := json.Unmarshal([]byte(payload), &activity); err != nil {
+			t.Fatal(err)
+		}
+		return observed, activity.MatrixWait
+	}
+	step := func(why string, wait *api.MatrixWait, stored bool) {
+		t.Helper()
+		advance(time.Minute)
+		before, _ := saved()
+		if _, err := f.report(t, member, wait); err != nil {
+			t.Fatalf("%s: %v", why, err)
+		}
+		after, got := saved()
+		if (after != before) != stored {
+			t.Fatalf("%s: stored=%v, want %v", why, after != before, stored)
+		}
+		if stored && !api.SameMatrixWait(got, wait) {
+			t.Fatalf("%s: saved wait %+v, want %+v", why, got, wait)
+		}
+	}
+	since := f.s.now()
+	step("idle", nil, true)
+	step("idle with a wait", &api.MatrixWait{Role: api.MatrixWaitWaiting, Item: f.items[0].ID, Position: 3, Length: 3, Since: since}, true)
+	step("only the position moved", &api.MatrixWait{Role: api.MatrixWaitWaiting, Item: f.items[0].ID, Position: 1, Length: 2, Since: since}, false)
+	if _, got := saved(); got == nil || got.Position != 3 {
+		t.Fatalf("a repeat replaced the saved wait: %+v", got)
+	}
+	step("the run got the host", &api.MatrixWait{Role: api.MatrixWaitRunning, Item: f.items[0].ID, Since: since.Add(time.Minute)}, true)
+	step("idle again", nil, true)
+	for name, wait := range map[string]*api.MatrixWait{
+		"unknown role":          {Role: "queued", Position: 1, Length: 1, Since: since},
+		"no since":              {Role: api.MatrixWaitWaiting, Position: 1, Length: 1},
+		"waiting at position 0": {Role: api.MatrixWaitWaiting, Length: 1, Since: since},
+		"position past length":  {Role: api.MatrixWaitWaiting, Position: 2, Length: 1, Since: since},
+		"length over the cap":   {Role: api.MatrixWaitWaiting, Position: 1, Length: 1001, Since: since},
+		"running with a place":  {Role: api.MatrixWaitRunning, Position: 1, Length: 1, Since: since},
+		"item is not an id":     {Role: api.MatrixWaitRunning, Item: "release", Since: since},
+	} {
+		if _, err := f.report(t, member, wait); !errors.Is(err, api.ErrInvalid) {
+			t.Fatalf("%s: %v", name, err)
+		}
+	}
 }
 
 // a6 (c3): no-handler only when no online, non-retired handler exists.

@@ -429,6 +429,9 @@ func relayActivityTick(ctx context.Context, b runtimeBinding, client *api.Client
 	if state.State == "stuck" && c.StuckUnsupported {
 		downgradeStuck(&state)
 	}
+	// A verification run in this host's matrix lock is the agent's open work
+	// even when its transcript is quiet (docs/agent-activity.md).
+	state.MatrixWait = matrixWaitFor(a, now)
 	key := activityReportKey(state)
 	sameLast := state.State == c.LastState && sameActivityKey(c.LastWakeKey, state)
 	if sameLast || (state.State == c.RejectedState && sameActivityKey(c.RejectedWakeKey, state)) {
@@ -603,7 +606,7 @@ func activityReportKey(a api.AgentActivity) string {
 	if p := a.Provider; a.State == "provider_blocked" && p != nil {
 		key += "\x00provider=" + p.Class + "\x00" + p.Since.UTC().Format(time.RFC3339Nano)
 	}
-	return key
+	return key + matrixWaitKey(a.MatrixWait)
 }
 
 const activityKeyVersion = "k2\x00"
