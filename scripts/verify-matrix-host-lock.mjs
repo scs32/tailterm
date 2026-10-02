@@ -17,7 +17,7 @@ import {
 import { join, dirname, isAbsolute, resolve } from "node:path";
 import { homedir, hostname, loadavg, availableParallelism } from "node:os";
 import { randomUUID } from "node:crypto";
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
 export const PRIORITIES = ["urgent", "high", "normal"];
@@ -82,6 +82,73 @@ export function resolvePriority(flag, environment = process.env) {
       prioritySource: "environment",
     };
   return { priority: "normal", prioritySource: "default" };
+}
+// How long one item priority lookup may take before the run joins at normal.
+export const ITEM_PRIORITY_LOOKUP_MS = 15000;
+// The work item's priority as tt reports it. Throws with the reason on a
+// failed, timed-out or unreadable lookup.
+export function lookupItemPriority(
+  item,
+  environment = process.env,
+  timeoutMs = ITEM_PRIORITY_LOOKUP_MS,
+) {
+  const result = spawnSync("tt", ["work-items", "get", "--json", item], {
+    env: environment,
+    encoding: "utf8",
+    stdio: ["ignore", "pipe", "pipe"],
+    timeout: timeoutMs,
+    killSignal: "SIGKILL",
+  });
+  if (result.error)
+    throw new Error(
+      result.error.code === "ETIMEDOUT"
+        ? `the lookup timed out after ${timeoutMs} ms`
+        : "the lookup could not run: " + result.error.message,
+    );
+  if (result.status !== 0)
+    throw new Error(
+      "the lookup failed: " +
+        ((result.stderr || "").trim().split("\n").pop() ||
+          (result.signal ? "signal " + result.signal : "exit " + result.status)),
+    );
+  let found;
+  try {
+    found = JSON.parse(result.stdout);
+  } catch {
+    throw new Error("the lookup returned no JSON");
+  }
+  return found?.priority;
+}
+// For a verification run: --priority, else TAILTERM_MATRIX_PRIORITY, else the
+// work item's own priority (low joins as normal), else normal with a warning
+// (wi_84a87bdf138275ae). The lookup runs only when neither override is set, and
+// it never fails the run.
+export function resolveRunPriority(flag, item, options = {}) {
+  const {
+    environment = process.env,
+    lookup = lookupItemPriority,
+    warn = (line) => console.error(line),
+  } = options;
+  const explicit = resolvePriority(flag, environment);
+  if (explicit.prioritySource !== "default") return explicit;
+  let reason;
+  if (typeof item !== "string" || !item || item === "unknown")
+    reason = "the run names no work item";
+  else
+    try {
+      const found = lookup(item, environment);
+      if (PRIORITIES.includes(found))
+        return { priority: found, prioritySource: "item" };
+      if (found === "low") return { priority: "normal", prioritySource: "item" };
+      reason =
+        found === undefined || found === null || found === ""
+          ? `work item ${item} has no priority`
+          : `work item ${item} has the unrecognised priority ${JSON.stringify(found)}`;
+    } catch (error) {
+      reason = `work item ${item}: ${error?.message || error}`;
+    }
+  warn(`matrix host: joining at normal priority (default): ${reason}`);
+  return explicit;
 }
 // TAILTERM_MATRIX_HOLDER_CAP_MINUTES in whole minutes, else the default.
 export function holderCapMs(environment = process.env) {

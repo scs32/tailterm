@@ -39,13 +39,50 @@ import {
 } from "../scripts/verify-matrix.mjs";
 // Named separately so the red tests load on a runner that lacks these exports.
 import * as matrixRunner from "../scripts/verify-matrix.mjs";
-import { acquireHostLock, readHostState, readJournal } from "../scripts/verify-matrix-host-lock.mjs";
+import {
+  acquireHostLock,
+  readHostState,
+  readJournal,
+  resolveRunPriority,
+  lookupItemPriority,
+} from "../scripts/verify-matrix-host-lock.mjs";
 // Every run in this file, in process or through the CLI, takes its host lock
 // in a private directory and never the host's own lock file.
 const hostLockDirectory = mkdtempSync(join(tmpdir(), "matrix-host-lock-"));
 process.env.TAILTERM_MATRIX_HOST_LOCK = join(hostLockDirectory, "host.json");
 delete process.env.TAILTERM_MATRIX_PRIORITY;
-process.on("exit", () => rmSync(hostLockDirectory, { recursive: true, force: true }));
+// A stand-in tt comes first on PATH, so an item priority lookup made by any
+// run in this file never reaches a hub. FAKE_TT_PRIORITY is the priority it
+// reports, FAKE_TT_MODE one of fail, garbage or hang, and it appends each
+// call's arguments to fakeTTCalls. With neither set it fails.
+const fakeTTDirectory = mkdtempSync(join(tmpdir(), "matrix-fake-tt-"));
+const fakeTTCalls = join(fakeTTDirectory, "calls.jsonl");
+writeFileSync(
+  join(fakeTTDirectory, "tt"),
+  `#!${process.execPath}
+const { appendFileSync } = require("node:fs");
+appendFileSync(${JSON.stringify(fakeTTCalls)}, JSON.stringify(process.argv.slice(2)) + "\\n");
+const mode = process.env.FAKE_TT_MODE, priority = process.env.FAKE_TT_PRIORITY;
+if (mode === "hang") setInterval(() => {}, 1000);
+else if (mode === "garbage") console.log("not json");
+else if (mode === "fail" || priority === undefined) {
+  console.error("work item not found");
+  process.exit(1);
+} else console.log(JSON.stringify({ id: process.argv.at(-1), priority: priority || undefined }));
+`,
+  { mode: 0o755 },
+);
+process.env.PATH = fakeTTDirectory + ":" + process.env.PATH;
+delete process.env.FAKE_TT_MODE;
+delete process.env.FAKE_TT_PRIORITY;
+const fakeTTLookups = () =>
+  existsSync(fakeTTCalls)
+    ? readFileSync(fakeTTCalls, "utf8").trim().split("\n").map((line) => JSON.parse(line))
+    : [];
+process.on("exit", () => {
+  rmSync(hostLockDirectory, { recursive: true, force: true });
+  rmSync(fakeTTDirectory, { recursive: true, force: true });
+});
 const makePlan = (context, cwd) =>
   rawMakePlan(
     {
@@ -1904,6 +1941,170 @@ test("V4 priority comes from the flag, then the environment, then normal, and ba
   }
   assert.equal(readHostState(hostLockFile()).requestSeq, requests, "no refused run joined the list");
   assert.equal(readFileSync(planFile, "utf8"), planBytes);
+});
+
+
+test("V4a with no flag and no environment override a run takes its work item's priority, low as normal, source item", () => {
+  const asked = [];
+  const from = (priority) =>
+    resolveRunPriority(undefined, "wi_mapped", {
+      environment: {},
+      lookup: (item) => (asked.push(item), priority),
+      warn: (line) => assert.fail("no warning expected: " + line),
+    });
+  assert.deepEqual(from("urgent"), { priority: "urgent", prioritySource: "item" });
+  assert.deepEqual(from("high"), { priority: "high", prioritySource: "item" });
+  assert.deepEqual(from("normal"), { priority: "normal", prioritySource: "item" });
+  assert.deepEqual(from("low"), { priority: "normal", prioritySource: "item" });
+  assert.deepEqual(asked, ["wi_mapped", "wi_mapped", "wi_mapped", "wi_mapped"]);
+});
+
+test("V4b --priority, then TAILTERM_MATRIX_PRIORITY, win over the item's priority without a lookup, and bad values still throw", () => {
+  const options = (environment) => ({
+    environment,
+    lookup: () => assert.fail("no lookup when a priority is given"),
+    warn: (line) => assert.fail("no warning expected: " + line),
+  });
+  assert.deepEqual(resolveRunPriority("high", "wi_urgent", options({})), { priority: "high", prioritySource: "flag" });
+  assert.deepEqual(
+    resolveRunPriority(undefined, "wi_urgent", options({ TAILTERM_MATRIX_PRIORITY: "normal" })),
+    { priority: "normal", prioritySource: "environment" },
+  );
+  assert.deepEqual(
+    resolveRunPriority("urgent", "wi_urgent", options({ TAILTERM_MATRIX_PRIORITY: "high" })),
+    { priority: "urgent", prioritySource: "flag" },
+  );
+  assert.throws(() => resolveRunPriority("low", "wi_urgent", options({})), /--priority must be urgent, high or normal/);
+  assert.throws(() => resolveRunPriority("", "wi_urgent", options({})), /--priority must be urgent, high or normal/);
+  assert.throws(
+    () => resolveRunPriority(undefined, "wi_urgent", options({ TAILTERM_MATRIX_PRIORITY: "low" })),
+    /TAILTERM_MATRIX_PRIORITY must be urgent, high or normal/,
+  );
+});
+
+test("V4c a lookup that fails, times out, finds no item or an unrecognised priority joins at normal, source default, with one warning", () => {
+  const fallback = (item, lookup) => {
+    const warnings = [];
+    const resolved = resolveRunPriority(undefined, item, { environment: {}, lookup, warn: (line) => warnings.push(line) });
+    assert.deepEqual(resolved, { priority: "normal", prioritySource: "default" });
+    assert.equal(warnings.length, 1, warnings.join(" | "));
+    assert(warnings[0].startsWith("matrix host: joining at normal priority (default): "), warnings[0]);
+    return warnings[0];
+  };
+  const never = () => assert.fail("no lookup without an item");
+  assert.match(fallback("wi_gone", () => { throw new Error("the lookup failed: work item not found"); }), /work item wi_gone: the lookup failed: work item not found$/);
+  assert.match(fallback("wi_slow", () => { throw new Error("the lookup timed out after 15000 ms"); }), /work item wi_slow: the lookup timed out after 15000 ms$/);
+  assert.match(fallback("wi_odd", () => "critical"), /work item wi_odd has the unrecognised priority "critical"$/);
+  assert.match(fallback("wi_odd", () => 2), /work item wi_odd has the unrecognised priority 2$/);
+  assert.match(fallback("wi_bare", () => undefined), /work item wi_bare has no priority$/);
+  assert.match(fallback(undefined, never), /the run names no work item$/);
+  assert.match(fallback("unknown", never), /the run names no work item$/);
+});
+
+test("V4d the tt lookup reads the item's priority and reports a failed, unreadable, missing or timed-out lookup within its bound", (t) => {
+  const environment = (extra) => ({ ...process.env, ...extra });
+  const before = fakeTTLookups().length;
+  assert.equal(lookupItemPriority("wi_real", environment({ FAKE_TT_PRIORITY: "urgent" })), "urgent");
+  assert.deepEqual(fakeTTLookups().slice(before), [["work-items", "get", "--json", "wi_real"]]);
+  assert.equal(lookupItemPriority("wi_real", environment({ FAKE_TT_PRIORITY: "" })), undefined);
+  assert.throws(() => lookupItemPriority("wi_gone", environment({ FAKE_TT_MODE: "fail" })), /^Error: the lookup failed: work item not found$/);
+  assert.throws(() => lookupItemPriority("wi_real", environment({ FAKE_TT_MODE: "garbage" })), /^Error: the lookup returned no JSON$/);
+  assert.throws(
+    () => lookupItemPriority("wi_real", environment({ PATH: tempDir(t, "matrix-no-tt-") })),
+    /^Error: the lookup could not run: /,
+  );
+  const started = Date.now();
+  assert.throws(
+    () => lookupItemPriority("wi_real", environment({ FAKE_TT_MODE: "hang" }), 400),
+    /^Error: the lookup timed out after 400 ms$/,
+  );
+  assert(Date.now() - started < 10000, "the hung lookup was cut off");
+});
+
+test("V4e a CLI run with no flag joins at its item's priority, recorded as item in the waiter, holder, journal, sidecar and receipt", async (t) => {
+  const { f, planFile } = plannedFixture(t, sleepingCheck(600)),
+    output = tempDir(t, "verification-host-logs-");
+  const holder = await holdHost("wi_v4e_holder");
+  const child = matrixCLI(t, f, ["run", planFile, output, "--min-free-bytes", "0", "--item", "wi_v4e"], { FAKE_TT_PRIORITY: "urgent" });
+  let waiter;
+  try {
+    await untilHost(() => (waiter = readHostState(hostLockFile()).waiters[0]), "the waiter; saw " + child.text);
+    assert.deepEqual(
+      [waiter.item, waiter.priority, waiter.prioritySource, waiter.pid],
+      ["wi_v4e", "urgent", "item", child.pid],
+    );
+  } finally {
+    await holder.release();
+  }
+  let held;
+  await untilHost(() => (held = readHostState(hostLockFile()).holder)?.id === waiter.id, "the run holding the host; saw " + child.text);
+  assert.deepEqual([held.priority, held.prioritySource], ["urgent", "item"]);
+  const [code] = await once(child, "close");
+  assert.equal(code, 0, child.text);
+  assert.doesNotMatch(child.text, /joining at normal priority/);
+  const request = readJournal(hostLockFile()).find((entry) => entry.id === waiter.id && entry.event === "request");
+  assert.deepEqual([request.item, request.priority, request.prioritySource], ["wi_v4e", "urgent", "item"]);
+  const sidecar = JSON.parse(readFileSync(join(output, "host-lock.json"), "utf8"));
+  assert.deepEqual([sidecar.priority, sidecar.prioritySource], ["urgent", "item"]);
+  const e = JSON.parse(readFileSync(join(output, "receipt.json"), "utf8")).environment;
+  assert.deepEqual([e.VERIFICATION_HOST_PRIORITY, e.VERIFICATION_HOST_PRIORITY_SOURCE], ["urgent", "item"]);
+});
+
+test("V4f CLI runs map each item priority, keep the flag and environment first without a lookup, and fall back with one warning", (t) => {
+  const { f, plan, planFile } = plannedFixture(t, "console.log('ran');");
+  const itemPlanFile = join(tempDir(t, "verification-host-plan-"), "plan.json");
+  writeFileSync(itemPlanFile, JSON.stringify({ ...plan, itemId: "wi_from_plan" }));
+  const run = (flags, environment = {}, file = planFile) => {
+    const output = tempDir(t, "verification-host-logs-");
+    const before = fakeTTLookups().length;
+    const result = spawnSync(process.execPath, [matrixScript, "run", file, output, "--min-free-bytes", "0", ...flags], {
+      cwd: f.cwd,
+      env: { ...process.env, ...environment },
+      encoding: "utf8",
+    });
+    assert.equal(result.status, 0, result.stderr);
+    const e = JSON.parse(readFileSync(join(output, "receipt.json"), "utf8")).environment;
+    return {
+      recorded: [e.VERIFICATION_HOST_PRIORITY, e.VERIFICATION_HOST_PRIORITY_SOURCE],
+      lookups: fakeTTLookups().slice(before),
+      warnings: result.stderr.split("\n").filter((line) => line.includes("joining at normal priority")),
+    };
+  };
+  const lookup = [["work-items", "get", "--json", "wi_cli"]];
+  for (const [priority, joined] of [["urgent", "urgent"], ["high", "high"], ["normal", "normal"], ["low", "normal"]])
+    assert.deepEqual(
+      run(["--item", "wi_cli"], { FAKE_TT_PRIORITY: priority }),
+      { recorded: [joined, "item"], lookups: lookup, warnings: [] },
+      priority,
+    );
+  assert.deepEqual(
+    run(["--item", "wi_cli"], { FAKE_TT_PRIORITY: "high" }, itemPlanFile),
+    { recorded: ["high", "item"], lookups: [["work-items", "get", "--json", "wi_from_plan"]], warnings: [] },
+    "the plan's item is the one looked up",
+  );
+  assert.deepEqual(
+    run(["--item", "wi_cli", "--priority", "high"], { FAKE_TT_PRIORITY: "urgent" }),
+    { recorded: ["high", "flag"], lookups: [], warnings: [] },
+  );
+  assert.deepEqual(
+    run(["--item", "wi_cli"], { FAKE_TT_PRIORITY: "urgent", TAILTERM_MATRIX_PRIORITY: "normal" }),
+    { recorded: ["normal", "environment"], lookups: [], warnings: [] },
+  );
+  for (const [environment, reason] of [
+    [{ FAKE_TT_MODE: "fail" }, "work item wi_cli: the lookup failed: work item not found"],
+    [{ FAKE_TT_MODE: "garbage" }, "work item wi_cli: the lookup returned no JSON"],
+    [{ FAKE_TT_PRIORITY: "critical" }, 'work item wi_cli has the unrecognised priority "critical"'],
+    [{ FAKE_TT_PRIORITY: "" }, "work item wi_cli has no priority"],
+  ])
+    assert.deepEqual(
+      run(["--item", "wi_cli"], environment),
+      { recorded: ["normal", "default"], lookups: lookup, warnings: ["matrix host: joining at normal priority (default): " + reason] },
+      reason,
+    );
+  assert.deepEqual(
+    run([]),
+    { recorded: ["normal", "default"], lookups: [], warnings: ["matrix host: joining at normal priority (default): the run names no work item"] },
+  );
 });
 
 test("V5 a check sees none of the host lock keys in its environment", async (t) => {

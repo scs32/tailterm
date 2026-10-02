@@ -26,7 +26,7 @@ import { fileURLToPath } from "node:url";
 import { buildHistoricalHub, buildMatrixBinaries, fileHash } from "../tests/test-binaries.mjs";
 import {
   acquireHostLock,
-  resolvePriority,
+  resolveRunPriority,
   receiptKeys,
   minutesFlag,
   DEFAULT_HOST_WAIT_MS,
@@ -1497,7 +1497,7 @@ if (
           jobs,
           abortSignal: interruption.signal,
           hostLock: {
-            ...resolvePriority(priority),
+            ...resolveRunPriority(priority, input?.itemId || item),
             maxWaitMs,
             item,
             print: (line) => console.log(line),
