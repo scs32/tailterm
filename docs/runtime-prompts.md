@@ -1,7 +1,9 @@
 # Runtime prompts
 
 Bug `wi_7d5050c57193db78` revision 1, owner order #13871, lead assignment
-#14367 (plan sha256 `4c878ff1…06d8`), lead decision #14370.
+#14367 (plan sha256 `4c878ff1…06d8`), lead decision #14370. One notice per
+open Claude prompt and the lead-notice condition: bug `wi_5875dd7785fe688e`
+revision 1, owner order #20578, lead assignment #20794.
 
 An agent's runtime sometimes stops on its own modal prompt instead of at its
 input: Codex's rate-limit model menu or model-migration menu, a Claude
@@ -35,7 +37,8 @@ selection marker before a numbered option or a key-hint phrase is `unknown`.
 Transcript text that quotes a menu or dialog above the prompt area is never
 read. The report holds only the kind, its fixed label, the policy action, the
 outcome, a bounded reason and a 16-byte SHA-256 fingerprint of the normalized
-prompt area; no screen text leaves the host. The agent's status, including
+prompt area (for an open Claude prompt, of the area as first seen; see
+Escalation); no screen text leaves the host. The agent's status, including
 `needs_input`, is left as it is. When the prompt goes, normal classification
 resumes.
 
@@ -101,12 +104,43 @@ Outcomes: `confirmed`, `failed`, `ambiguous`, `escalated`, `reported`,
 
 ## Escalation
 
-The hub posts one owner-facing notice, plus one notice to the item's lead when
-the agent belongs to an item team, for the first report of an agent run and
+The hub posts one owner-facing notice for the first report of an agent run and
 prompt fingerprint whose outcome is `escalated`, `failed` or `ambiguous`.
-Repeats, receipt replays, a prompt that clears and returns, and relay restarts
-post nothing more. A new fingerprint posts again. Confirmed answers and
-`report` post nothing. `unknown` always escalates.
+Repeats, receipt replays and relay restarts post nothing more. A new
+fingerprint posts again. Confirmed answers and `report` post nothing.
+`unknown` always escalates.
+
+A Claude prompt keeps its first identity until it clears. Claude redraws rows
+inside a dialog while it waits, so the hash of the prompt area changes from one
+capture to the next; while the relay's last report for the run is a Claude
+prompt of the same kind, it reports that prompt's first fingerprint and `since`
+again, and the hub posts nothing. The prompt clears when a capture of the quiet
+pane shows no prompt, when the transcript has an event inside the quiet window
+(the agent moved on), or when the binding has no session. An unreadable pane
+does not clear it. The next dialog after a clear is hashed afresh. Codex menus
+are static and always keep the hash of their own text.
+
+A prompt whose text is identical to one already reported in the same run posts
+nothing when it returns after a clear: the hub remembers every fingerprint of
+the run. A dialog that differs, such as a permission dialog for another
+command, posts again.
+
+The item's lead gets the same notice only when the agent belongs to an item
+team, is not `done`, and has at least one open obligation that needs more than
+delivery (an assign, request, review, question or block it has not closed).
+The owner is always told. The lead's own prompt goes to the owner only.
+
+Limits:
+
+- A transcript event while a still-changing dialog is open clears its
+  identity, so that dialog can notify once more per such event, not per scan.
+- Two different Claude dialogs of one kind with no clearing tick between them
+  are reported as one. That needs a quiet window shorter than the 15-second
+  tick, or two same-kind dialogs before the first turn.
+- The lead decision is made once, with the first report of a fingerprint. If
+  the agent is given work while that prompt is still open, the lead is not
+  told afterwards; the owner notice stands and the obligation's own overdue
+  escalation covers the stalled work.
 
 ## Logs and display
 
@@ -120,7 +154,8 @@ post nothing more. A new fingerprint posts again. Confirmed answers and
 
 ## Checks
 
-`go test ./cmd/tt -run 'TestRuntimePrompt|TestPromptPolicyCLI|TestAgentsRuntimePrompt'`,
+`go test ./cmd/tt -run 'TestRuntimePrompt|TestPromptPolicyCLI|TestAgentsRuntimePrompt'`
+(`TestRuntimePromptRepeat` covers a dialog whose rows change while it is open),
 `go test ./internal/store ./internal/server -run TestRuntimePrompt`,
 `node tests/activity-browser.mjs` and `node --test tests/activity-format.test.js`.
 Fixtures and their provenance are in `hub/cmd/tt/testdata/runtime-prompt/`.

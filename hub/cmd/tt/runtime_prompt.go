@@ -336,7 +336,8 @@ func nativeRuntimePromptDeps() *runtimePromptDeps {
 	}
 }
 
-// runtimePromptSeen is the decision for one prompt fingerprint in one run.
+// runtimePromptSeen is the decision for one prompt fingerprint in one run. An
+// open Claude dialog keeps the fingerprint it was first seen with.
 // Attempted is saved before the first key, so a relay that stops mid-answer
 // never types into that prompt again.
 type runtimePromptSeen struct {
@@ -466,7 +467,9 @@ func logRuntimePrompt(l *runtimePromptLocal, agent string, now time.Time) {
 // observeRuntimePrompt runs inside the activity tick for a live runtime. It
 // captures the pane only after the transcript has been quiet, classifies the
 // prompt area, applies the project's policy once per prompt, and returns the
-// prompt to report, or nil when the runtime is not on one.
+// prompt to report, or nil when the runtime is not on one. The prompt clears
+// when the pane shows none, when the transcript has an event inside the quiet
+// window, or when the binding has no session.
 func observeRuntimePrompt(ctx context.Context, deps *runtimePromptDeps, b runtimeBinding, client *api.Client, c *activityCursor, now time.Time) (*api.RuntimePrompt, error) {
 	l := loadRuntimePromptLocal(b)
 	save := func() error { return writePrivateJSON(runtimePromptPath(b), l) }
@@ -496,6 +499,14 @@ func observeRuntimePrompt(ctx context.Context, deps *runtimePromptDeps, b runtim
 	match, ok := classifyRuntimePrompt(runtime, plainRuntimeScreen(first.Raw))
 	if !ok {
 		return clear()
+	}
+	// A Claude dialog redraws rows while it waits, so its hash changes from
+	// one capture to the next. While a prompt of the same kind stays open it
+	// keeps its first identity; clear() ends that, and the next dialog is
+	// hashed afresh. Codex menus are static and keep their content hash,
+	// which the answer checks rely on.
+	if p := l.Prompt; runtime == "claude" && p != nil && p.Runtime == "claude" && p.Kind == match.Kind {
+		match.Fingerprint = p.Fingerprint
 	}
 	actions, err := runtimePromptActions(ctx, client, b, now)
 	if errors.Is(err, errRuntimePromptUnsupported) {

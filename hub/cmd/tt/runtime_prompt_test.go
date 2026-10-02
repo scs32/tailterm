@@ -352,6 +352,109 @@ func TestRuntimePromptActivity(t *testing.T) {
 	})
 }
 
+// TestRuntimePromptRepeat: a Claude dialog that stays open is one prompt
+// however its rows redraw, a different dialog after a clear is a new one, and
+// a Codex menu keeps its content identity (bug wi_5875dd7785fe688e a1-a3).
+func TestRuntimePromptRepeat(t *testing.T) {
+	const about = "Create empty file x in work directory"
+	// dialog is the captured permission dialog with its description replaced
+	// and, when waiting is set, one more row inside the dialog.
+	dialog := func(r *promptRig, describe, waiting string) string {
+		t.Helper()
+		screen := r.fixture("claude-pane/permission-dialog.ansi")
+		at := strings.LastIndex(screen, about)
+		if at < 0 {
+			t.Fatal("permission fixture has no description row")
+		}
+		end := at + strings.Index(screen[at:], "\n")
+		row := ""
+		if waiting != "" {
+			row = "\n   " + waiting
+		}
+		return screen[:at] + describe + screen[at+len(about):end] + row + screen[end:]
+	}
+	t.Run("changing rows", func(t *testing.T) {
+		r := newPromptRig(t, "claude")
+		r.transcript(r.clock.Add(-30*time.Second), true)
+		var first *api.RuntimePrompt
+		for i, waiting := range []string{"Waiting… 12s", "Waiting… 30s", "Waiting… 48s", "Waiting… 1m 6s", "Waiting… 1m 24s"} {
+			r.screen = dialog(r, about, waiting)
+			m, ok := classifyRuntimePrompt("claude", plainRuntimeScreen(r.screen))
+			got := r.tick()
+			if got.State != "runtime_prompt" || got.Prompt == nil || got.Prompt.Kind != api.RuntimePromptClaudePermission || got.Prompt.Outcome != api.RuntimePromptEscalated {
+				t.Fatalf("tick %d: activity %+v prompt %+v", i+1, got, got.Prompt)
+			}
+			if first == nil {
+				first = got.Prompt
+				if !ok || m.Fingerprint != first.Fingerprint || !first.Since.Equal(r.clock) {
+					t.Fatalf("first tick reported %+v, screen hashes to %+v", first, m)
+				}
+				continue
+			}
+			// The redrawn rows do change the screen's own hash.
+			if !ok || m.Kind != api.RuntimePromptClaudePermission || m.Fingerprint == first.Fingerprint {
+				t.Fatalf("tick %d: screen classified %v %+v, want a new hash of the same kind", i+1, ok, m)
+			}
+			if got.Prompt.Fingerprint != first.Fingerprint || !got.Prompt.Since.Equal(first.Since) {
+				t.Errorf("tick %d: prompt %s since %s, want the first identity %s since %s", i+1, got.Prompt.Fingerprint, got.Prompt.Since, first.Fingerprint, first.Since)
+			}
+		}
+		if n := r.ownerNotices(); n != 1 {
+			t.Errorf("owner notices %d, want 1", n)
+		}
+		if seen := loadRuntimePromptLocal(r.b).Seen; len(seen) != 1 {
+			t.Errorf("seen entries %d, want 1", len(seen))
+		}
+		if len(r.keys) != 0 {
+			t.Errorf("permission dialog typed %v", r.keys)
+		}
+		r.leaked("Do you want to proceed", "Waiting", "Esc to cancel")
+	})
+	t.Run("cleared and re-opened", func(t *testing.T) {
+		r := newPromptRig(t, "claude")
+		r.transcript(r.clock.Add(-30*time.Second), true)
+		r.screen = dialog(r, about, "Waiting… 12s")
+		first := r.tick().Prompt
+		r.screen = dialog(r, about, "Waiting… 30s")
+		if again := r.tick().Prompt; first == nil || again == nil || again.Fingerprint != first.Fingerprint {
+			t.Fatalf("open dialog changed identity: %+v then %+v", first, again)
+		}
+		r.screen = r.fixture("claude-pane/scrollback-dialog-words.ansi")
+		if cleared := r.tick(); cleared.State == "runtime_prompt" || cleared.Prompt != nil {
+			t.Fatalf("idle screen still a prompt: %+v", cleared)
+		}
+		r.screen = dialog(r, "Remove file y from work directory", "Waiting… 12s")
+		second := r.tick()
+		if second.State != "runtime_prompt" || second.Prompt == nil || second.Prompt.Fingerprint == first.Fingerprint || !second.Prompt.Since.After(first.Since) {
+			t.Fatalf("re-opened dialog %+v prompt %+v, first %+v", second, second.Prompt, first)
+		}
+		if n := r.ownerNotices(); n != 2 {
+			t.Errorf("owner notices %d, want 2", n)
+		}
+	})
+	t.Run("codex not sticky", func(t *testing.T) {
+		r := newPromptRig(t, "codex")
+		r.transcript(r.clock.Add(-30*time.Second), false)
+		menu := "  Pick a thing\n\n› 1. Alpha\n  2. Beta\n\n  enter select · esc back"
+		r.screen = menu
+		first := r.tick()
+		r.screen = strings.Replace(menu, "Pick a thing", "Pick another thing", 1)
+		second := r.tick()
+		if first.Prompt == nil || second.Prompt == nil || first.Prompt.Kind != api.RuntimePromptUnknown || second.Prompt.Kind != api.RuntimePromptUnknown {
+			t.Fatalf("codex menus %+v then %+v", first.Prompt, second.Prompt)
+		}
+		if second.Prompt.Fingerprint == first.Prompt.Fingerprint || !second.Prompt.Since.After(first.Prompt.Since) {
+			t.Errorf("codex menu with new text kept identity %s since %s", second.Prompt.Fingerprint, second.Prompt.Since)
+		}
+		if n := r.ownerNotices(); n != 2 {
+			t.Errorf("owner notices %d, want 2", n)
+		}
+		if len(r.keys) != 0 {
+			t.Errorf("unknown menu typed %v", r.keys)
+		}
+	})
+}
+
 // menuFrame redraws a plain menu capture with the marker on option at. The
 // menu's options are its last numbered rows; numbered transcript rows above
 // it are left alone.
