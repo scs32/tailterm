@@ -1,13 +1,29 @@
-import { preview } from "vite";
 import assert from "node:assert/strict";
+import { randomUUID } from "node:crypto";
+import { once } from "node:events";
 import { chromium, webkit } from "@playwright/test";
-const server = await preview({
-  build: { outDir: "dist-static" },
-  preview: { host: "127.0.0.1", port: 4319 },
-});
+import { createStaticPreviewServer } from "../scripts/preview-static.mjs";
+// The suite serves dist-static itself on a port the system picks, and checks a
+// per-run token so it never drives a server it did not start.
+const token = randomUUID();
+const server = createStaticPreviewServer("dist-static", { token });
+server.listen(0, "127.0.0.1");
+await once(server, "listening");
+const origin = `http://127.0.0.1:${server.address().port}`;
+let browser;
+for (const [signal, code] of [
+  ["SIGINT", 130],
+  ["SIGTERM", 143],
+])
+  process.once(signal, async () => {
+    setTimeout(() => process.exit(code), 8000).unref();
+    await browser?.close().catch(() => {});
+    server.close();
+    process.exit(code);
+  });
 try {
   for (const engine of [chromium, webkit]) {
-    const browser = await engine.launch();
+    browser = await engine.launch();
     try {
       const page = await browser.newPage({
         viewport: { width: 1100, height: 800 },
@@ -15,7 +31,12 @@ try {
       page.setDefaultTimeout(10000);
       const errors = [];
       page.on("pageerror", (e) => errors.push(e.message));
-      await page.goto(`http://127.0.0.1:${server.httpServer.address().port}/`);
+      const response = await page.goto(`${origin}/`);
+      assert.equal(
+        response.headers()["x-tailterm-preview-token"],
+        token,
+        `${engine.name()}: the page came from a server this run did not start`,
+      );
       await page
         .locator("#password")
         .fill("temporary appearance test password");
@@ -68,5 +89,6 @@ try {
     }
   }
 } finally {
-  await new Promise((r) => server.httpServer.close(r));
+  server.closeAllConnections();
+  await new Promise((r) => server.close(r));
 }

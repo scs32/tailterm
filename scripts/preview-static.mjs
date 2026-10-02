@@ -26,9 +26,10 @@ const contentTypes = new Map([
   [".woff2", "font/woff2"],
 ]);
 
-function reply(res, status, body) {
+function send(res, status, body, extraHeaders) {
   res.writeHead(status, {
     ...securityHeaders,
+    ...extraHeaders,
     "Cache-Control": "no-cache",
     "Content-Type": "text/plain; charset=utf-8",
     "Content-Length": Buffer.byteLength(body),
@@ -36,9 +37,13 @@ function reply(res, status, body) {
   res.end(body);
 }
 
-export function createStaticPreviewServer(rootDirectory) {
+// A caller that passes a token gets it back on every response, so a test can
+// tell the server it started from any other process answering on that port.
+export function createStaticPreviewServer(rootDirectory, { token } = {}) {
   const root = path.resolve(rootDirectory);
   const rootPrefix = `${root}${path.sep}`;
+  const tokenHeaders = token ? { "X-Tailterm-Preview-Token": token } : {};
+  const reply = (res, status, body) => send(res, status, body, tokenHeaders);
   return createServer(async (req, res) => {
     if (req.method !== "GET" && req.method !== "HEAD") {
       res.setHeader("Allow", "GET, HEAD");
@@ -91,6 +96,7 @@ export function createStaticPreviewServer(rootDirectory) {
     const extension = path.extname(filename).toLowerCase();
     res.writeHead(200, {
       ...securityHeaders,
+      ...tokenHeaders,
       "Cache-Control": "no-cache",
       "Content-Length": metadata.size,
       "Content-Type": contentTypes.get(extension) || "application/octet-stream",
@@ -107,11 +113,14 @@ if (path.resolve(process.argv[1] || "") === fileURLToPath(import.meta.url)) {
   const root = process.argv[2] || "dist-static";
   const host = process.argv[3] || "127.0.0.1";
   const port = Number(process.argv[4] || 4318);
-  if (!Number.isInteger(port) || port < 1 || port > 65535)
-    throw new Error("Preview port must be an integer from 1 to 65535");
+  // Port 0 asks the system for a free port; the printed URL names the bound one.
+  if (!Number.isInteger(port) || port < 0 || port > 65535)
+    throw new Error("Preview port must be an integer from 0 to 65535");
   const server = createStaticPreviewServer(root);
   server.listen(port, host, () => {
-    console.log(`Tailterm static preview: http://${host}:${port}`);
+    console.log(
+      `Tailterm static preview: http://${host}:${server.address().port}`,
+    );
   });
   for (const signal of ["SIGINT", "SIGTERM"])
     process.on(signal, () => server.close(() => process.exit(0)));

@@ -8,8 +8,71 @@ import os from "node:os";
 import path from "node:path";
 import { once } from "node:events";
 import { generateKeyPairSync } from "node:crypto";
+import { createServer as createNetServer } from "node:net";
 import ssh2 from "ssh2";
 import { exercisePaneGroups } from "./pane-groups-browser.mjs";
+// Start-of-fixture: tests/browser.mjs and tests/integration.test.js keep
+// identical copies of this block. The suite picks a free port, starts its own
+// server/index.js on it and takes the origin only from that child's readiness
+// line. Only one process can bind the port, so a live child that printed
+// readiness is the server answering there; a port another process holds is
+// refused, never reused.
+const running = (proc) => proc.exitCode === null && proc.signalCode === null;
+async function freePort() {
+  const probe = createNetServer();
+  probe.listen(0, "127.0.0.1");
+  await once(probe, "listening");
+  const { port } = probe.address();
+  probe.close();
+  await once(probe, "close");
+  return port;
+}
+async function stopAppServer(proc) {
+  // An exit that already happened never fires again; awaiting it would hang.
+  if (!running(proc)) return;
+  const exited = once(proc, "exit");
+  proc.kill("SIGTERM");
+  const force = setTimeout(() => proc.kill("SIGKILL"), 5000);
+  await exited;
+  clearTimeout(force);
+}
+async function startAppServer({ dir, allocate = freePort, onSpawn }) {
+  let refused;
+  for (let attempt = 0; attempt < 5; attempt++) {
+    const port = await allocate();
+    const proc = spawn(process.execPath, ["server/index.js"], {
+      env: {
+        ...process.env,
+        PORT: String(port),
+        VAULT_PATH: path.join(dir, "vault.enc"),
+        NODE_ENV: "production",
+      },
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    onSpawn?.(proc);
+    let log = "";
+    proc.stdout.on("data", (d) => (log += d));
+    proc.stderr.on("data", (d) => (log += d));
+    const closed = once(proc, "close");
+    const ready = new RegExp(`Tailterm: (http://127\\.0\\.0\\.1:${port})\\s`);
+    const deadline = Date.now() + 30000;
+    while (!ready.test(log) && running(proc) && Date.now() < deadline)
+      await new Promise((r) => setTimeout(r, 50));
+    const origin = ready.exec(log)?.[1];
+    if (origin && running(proc)) return { proc, port, origin, log: () => log };
+    await stopAppServer(proc);
+    await closed;
+    if (!log.includes("EADDRINUSE"))
+      throw new Error(
+        `server/index.js did not become ready on 127.0.0.1:${port}:\n${log}`,
+      );
+    refused = port;
+  }
+  throw new Error(
+    `refusing to use 127.0.0.1:${refused}: this run did not start the server on it`,
+  );
+}
+// End-of-fixture.
 const hostKey = generateKeyPairSync("rsa", {
   modulusLength: 2048,
   privateKeyEncoding: { type: "pkcs1", format: "pem" },
@@ -69,35 +132,63 @@ const ssh = new ssh2.Server({ hostKeys: [hostKey] }, (client) => {
 });
 ssh.listen(0, "127.0.0.1");
 await once(ssh, "listening");
-// NODE_ENV=production serves dist/, which the verification matrix does not
-// build (it builds dist-static). Build it from this checkout so the suite never
-// depends on, or serves, a missing or stale bundle.
-const build = spawn(process.execPath, ["node_modules/vite/bin/vite.js", "build"], {
-  stdio: ["ignore", "pipe", "pipe"],
+// Everything this run started is torn down exactly once: on success, on a
+// failed assertion, and on a signal (the matrix sends SIGTERM on a timeout).
+const children = new Set();
+let dir, browser, cleaning;
+function cleanup() {
+  cleaning ??= (async () => {
+    await Promise.allSettled([
+      browser?.close(),
+      ...[...children].map(stopAppServer),
+    ]);
+    ssh.close();
+    if (dir) rmSync(dir, { recursive: true, force: true });
+  })();
+  return cleaning;
+}
+for (const [signal, code] of [
+  ["SIGHUP", 129],
+  ["SIGINT", 130],
+  ["SIGTERM", 143],
+])
+  process.once(signal, async () => {
+    // A browser that will not close must not keep the server alive.
+    setTimeout(() => process.exit(code), 8000).unref();
+    await cleanup();
+    process.exit(code);
+  });
+// Last resort when the process exits without finishing cleanup.
+process.on("exit", () => {
+  for (const proc of children) if (running(proc)) proc.kill("SIGKILL");
+  if (dir) rmSync(dir, { recursive: true, force: true });
 });
-let buildLog = "";
-build.stdout.on("data", (d) => (buildLog += d));
-build.stderr.on("data", (d) => (buildLog += d));
-const [buildCode] = await once(build, "exit");
-assert.equal(buildCode, 0, "vite build failed:\n" + buildLog);
-const dir = mkdtempSync(path.join(os.tmpdir(), "tailterm-browser-"));
-const proc = spawn(process.execPath, ["server/index.js"], {
-  env: {
-    ...process.env,
-    PORT: "14318",
-    VAULT_PATH: path.join(dir, "vault.enc"),
-    NODE_ENV: "production",
-  },
-  stdio: ["ignore", "pipe", "pipe"],
-});
-let log = "";
-proc.stdout.on("data", (d) => (log += d));
-proc.stderr.on("data", (d) => (log += d));
-let browser;
 try {
-  for (let i = 0; i < 100 && !log.includes("Tailterm:"); i++)
-    await new Promise((r) => setTimeout(r, 50));
-  assert.match(log, /Tailterm:/);
+  // NODE_ENV=production serves dist/, which the verification matrix does not
+  // build (it builds dist-static). Build it from this checkout so the suite never
+  // depends on, or serves, a missing or stale bundle.
+  const build = spawn(
+    process.execPath,
+    ["node_modules/vite/bin/vite.js", "build"],
+    { stdio: ["ignore", "pipe", "pipe"] },
+  );
+  children.add(build);
+  let buildLog = "";
+  build.stdout.on("data", (d) => (buildLog += d));
+  build.stderr.on("data", (d) => (buildLog += d));
+  const [buildCode] = await once(build, "exit");
+  children.delete(build);
+  assert.equal(buildCode, 0, "vite build failed:\n" + buildLog);
+  dir = mkdtempSync(path.join(os.tmpdir(), "tailterm-browser-"));
+  // TAILTERM_TEST_PORT pins the port, only to prove that a port held by
+  // another process is refused.
+  const pinned = process.env.TAILTERM_TEST_PORT;
+  const { proc, origin } = await startAppServer({
+    dir,
+    allocate: pinned ? () => Number(pinned) : freePort,
+    onSpawn: (child) => children.add(child),
+  });
+  console.log(`Browser suite server: ${origin} pid ${proc.pid}`);
   const isWebKit = process.env.TEST_BROWSER === "webkit";
   browser = await (isWebKit ? webkit : chromium).launch();
   const page = await browser.newPage({
@@ -116,7 +207,7 @@ try {
   }
   const errors = [];
   page.on("pageerror", (e) => errors.push(e.message));
-  await page.goto("http://127.0.0.1:14318");
+  await page.goto(origin);
   await page.locator("#password").fill("browser test passphrase");
   await page.locator("#unlock-button").click();
   await page.locator("#workspace").waitFor();
@@ -618,13 +709,11 @@ try {
     { timeout: 30000 },
   );
   assert.deepEqual(errors, []);
+  // The child held the port for the whole run, so every request reached it.
+  assert.ok(running(proc), "the suite's own server exited during the run");
   console.log(
     "Browser checks passed: create/unlock, server create/edit, key dialog, lock/reopen, desktop/mobile layout, host trust, password retry/remember, live SSH input, tab/server synchronization, same-tab reconnect, tmux deduplication/discovery/failure, deletion cleanup, actual Tailscale WASM startup.",
   );
 } finally {
-  await browser?.close();
-  proc.kill("SIGTERM");
-  await once(proc, "exit");
-  ssh.close();
-  rmSync(dir, { recursive: true, force: true });
+  await cleanup();
 }
