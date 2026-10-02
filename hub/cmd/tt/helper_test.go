@@ -16,6 +16,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/scs32/tailterm/hub/internal/api"
 	"github.com/scs32/tailterm/hub/internal/spawn"
@@ -689,5 +690,111 @@ func TestHelperInboxDiscordHint(t *testing.T) {
 	agentMsg := api.Message{Seq: 44, From: api.Sender{AgentID: "agt_0123456789abcdef"}, Text: "from an agent"}
 	if got := helperMessageLine(agentMsg, names, "tsk_0123456789abcdef"); got != formatMessage(agentMsg, names) {
 		t.Fatalf("an agent message changed: %q", got)
+	}
+}
+
+// One tmux session carries one project's helper: a second project's
+// registration there is refused before anything is registered or written, so
+// the first project's wake and heartbeat keep working.
+func TestHelperRegisterSecondProjectSameSession(t *testing.T) {
+	f := newHelperFixture(t)
+	ctx := context.Background()
+	a := *f.mustRegister(t).Agent
+	second, err := f.c.CreateTask(ctx, api.CreateTaskRequest{Name: "Second project", Orchestrator: "lead"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	registerSecond := func(args ...string) (string, string, error) {
+		t.Helper()
+		old := os.Stderr
+		r, w, err := os.Pipe()
+		if err != nil {
+			t.Fatal(err)
+		}
+		os.Stderr = w
+		out, runErr := captureCLIOutput(t, func() error {
+			return cmdHelper(env{hub: f.owner.hub}, append([]string{"register", "--task", second.ID}, args...))
+		})
+		_ = w.Close()
+		os.Stderr = old
+		warning, _ := io.ReadAll(r)
+		_ = r.Close()
+		return out, string(warning), runErr
+	}
+	secondHelpers := func() []api.Agent {
+		t.Helper()
+		agents, err := f.c.ListAgents(ctx, second.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var helpers []api.Agent
+		for _, agent := range agents {
+			if agent.Role == api.AgentRoleOwnerHelper {
+				helpers = append(helpers, agent)
+			}
+		}
+		return helpers
+	}
+	tagsBefore := f.tags(t, "owner")
+	stateBefore, _ := os.ReadFile(ownerHelperPath(f.owner.hub, f.task.ID))
+	bindingBefore, _ := readBinding(t, f.owner.hub, a.ID)
+
+	_, _, err = registerSecond()
+	if err == nil || !strings.Contains(err.Error(), "one project per tmux session") || !strings.Contains(err.Error(), f.task.ID) || !strings.Contains(err.Error(), "--take-session") {
+		t.Fatalf("second project in the first project's session: %v", err)
+	}
+	if helpers := secondHelpers(); len(helpers) != 0 {
+		t.Fatalf("refused registration reached the hub: %+v", helpers)
+	}
+	if _, err := os.Stat(ownerHelperPath(f.owner.hub, second.ID)); !os.IsNotExist(err) {
+		t.Fatalf("refused registration wrote helper state: %v", err)
+	}
+	if tags := f.tags(t, "owner"); fmt.Sprint(tags) != fmt.Sprint(tagsBefore) || tags["TAILTERM_TASK"] != f.task.ID || tags["TAILTERM_AGENT"] != a.ID {
+		t.Fatalf("tags %v, want %v", tags, tagsBefore)
+	}
+	if state, _ := os.ReadFile(ownerHelperPath(f.owner.hub, f.task.ID)); !bytes.Equal(state, stateBefore) {
+		t.Fatalf("first project's helper file changed: %s", state)
+	}
+	b, ok := readBinding(t, f.owner.hub, a.ID)
+	if !ok || b != bindingBefore || b.Task != f.task.ID || b.Run != a.RunID {
+		t.Fatalf("first project's binding %+v, want %+v", b, bindingBefore)
+	}
+	// The first project's wake still verifies its pane and keeps it online.
+	if _, err := inspectRuntimePane(ctx, b, "Claude", false); err != nil {
+		t.Fatalf("first project's pane identity: %v", err)
+	}
+	var p relayProgress
+	before, _ := f.c.GetAgent(ctx, f.task.ID, a.ID)
+	time.Sleep(1100 * time.Millisecond)
+	if err := relayHelperHeartbeat(ctx, b, &p, f.c, time.Now(), activityProbeNative); err != nil {
+		t.Fatal(err)
+	}
+	if after, _ := f.c.GetAgent(ctx, f.task.ID, a.ID); !after.LastSeenAt.After(before.LastSeenAt) || !after.Online {
+		t.Fatalf("heartbeat %s -> %s online=%v", before.LastSeenAt, after.LastSeenAt, after.Online)
+	}
+
+	// The explicit flag moves the session, with a warning naming the cost.
+	_, warning, err := registerSecond("--take-session")
+	helpers := secondHelpers()
+	if err != nil || len(helpers) != 1 || !strings.Contains(warning, f.task.ID) || !strings.Contains(warning, "wake-ups stop") {
+		t.Fatalf("take-session: %v %+v %q", err, helpers, warning)
+	}
+	if tags := f.tags(t, "owner"); tags["TAILTERM_TASK"] != second.ID || tags["TAILTERM_AGENT"] != helpers[0].ID {
+		t.Fatalf("tags after take-session: %v", tags)
+	}
+	if _, err := inspectRuntimePane(ctx, b, "Claude", false); err == nil {
+		t.Fatal("the first project's pane identity still verifies after take-session")
+	}
+
+	// A closed helper no longer uses the session: no flag is needed.
+	if _, err := f.c.CloseAgent(ctx, second.ID, helpers[0].ID, helpers[0].RunID); err != nil {
+		t.Fatal(err)
+	}
+	back, err := f.register(t, f.owner)
+	if err != nil || back.Agent.ID != a.ID {
+		t.Fatalf("register after the other project's helper closed: %+v %v", back, err)
+	}
+	if tags := f.tags(t, "owner"); tags["TAILTERM_TASK"] != f.task.ID || tags["TAILTERM_RUN"] != back.Agent.RunID {
+		t.Fatalf("tags after the closed helper: %v", tags)
 	}
 }

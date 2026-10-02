@@ -22,7 +22,7 @@ import (
 // The owner helper (docs/owner-helper.md): the owner's own Claude Code
 // session, registered as the project's owner_helper agent.
 
-const helperUsage = "usage: tt helper register --task T [--name N] [--request-id K] [--json]\n" +
+const helperUsage = "usage: tt helper register --task T [--name N] [--request-id K] [--take-session] [--json]\n" +
 	"       tt helper env --task T\n" +
 	"       tt helper inbox --task T\n" +
 	"       tt helper reply --task T SEQ --text TEXT [--request-id K]"
@@ -168,6 +168,40 @@ func clearHelperTags(ctx context.Context, sessionID, created, agent string) erro
 	return nil
 }
 
+// otherProjectHelper reports the live owner helper of another project (or
+// hub) that this tmux session's tags name. One tmux session carries one
+// project's helper: tagging it for a second project would stop the first
+// one's wake and heartbeat. A helper that is closed, exited, gone from the hub
+// or registered again elsewhere no longer uses the session; a lookup that
+// fails any other way counts as live.
+func otherProjectHelper(ctx context.Context, c *api.Client, sessionID, hub, task string) (ownedSession, bool, error) {
+	sessions, err := localSessions(ctx)
+	if err != nil {
+		return ownedSession{}, false, fmt.Errorf("read this tmux session's tags: %w", err)
+	}
+	for _, s := range sessions {
+		if s.ID != sessionID {
+			continue
+		}
+		if s.Role != api.AgentRoleOwnerHelper || (s.Hub == hub && s.Task == task) {
+			return ownedSession{}, false, nil
+		}
+		if s.Hub != hub || !api.ValidID(s.Task, "tsk") || !api.ValidID(s.Agent, "agt") {
+			return s, true, nil // not this hub's to look up
+		}
+		a, err := c.GetAgent(ctx, s.Task, s.Agent)
+		var httpErr *api.HTTPError
+		if errors.As(err, &httpErr) && httpErr.Status == 404 {
+			return ownedSession{}, false, nil
+		}
+		if err != nil {
+			return s, true, nil
+		}
+		return s, a.Role == api.AgentRoleOwnerHelper && a.Status != api.AgentClosed && a.Status != api.AgentExited && a.RunID == s.Run, nil
+	}
+	return ownedSession{}, false, nil
+}
+
 func helperRequestHash(req api.RegisterOwnerHelperRequest) string {
 	req.RequestID = ""
 	data, _ := json.Marshal(req)
@@ -197,6 +231,7 @@ func helperRegister(e env, args []string) error {
 	task := fs.String("task", e.task, "project id")
 	name := fs.String("name", api.DefaultOwnerHelperName, "the helper's agent name")
 	requestID := fs.String("request-id", "", "stable retry key (default: a new key per registration)")
+	takeSession := fs.Bool("take-session", false, "register even when this tmux session is another project's live owner helper; that helper's wake stops")
 	asJSON := fs.Bool("json", false, "print JSON")
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -228,6 +263,24 @@ func helperRegister(e env, args []string) error {
 	session, inTmux, err := currentHelperSession(ctx)
 	if err != nil {
 		return err
+	}
+	// One project per tmux session: checked before anything is registered or
+	// written.
+	if inTmux {
+		other, live, err := otherProjectHelper(ctx, c, session.ID, e.hub, *task)
+		if err != nil {
+			return err
+		}
+		if live {
+			where := "project " + other.Task
+			if other.Hub != e.hub {
+				where += " on " + other.Hub
+			}
+			if !*takeSession {
+				return fmt.Errorf("tmux session %s is the owner helper of %s; one project per tmux session: register from another tmux session, or pass --take-session to move this one (that project's helper wake stops)", session.Name, where)
+			}
+			fmt.Fprintf(os.Stderr, "[tt] warning: taking tmux session %s from the owner helper of %s; its wake-ups stop and it shows offline until it registers from another tmux session\n", session.Name, where)
+		}
 	}
 	cwd, err := os.Getwd()
 	if err != nil {

@@ -42,6 +42,8 @@ It checks, before writing anything:
 - it is not an agent session, unless that session carries this project's helper
   identity (a pane of the helper's own tmux session);
 - the tmux session name is a valid agent session name (rename it if not);
+- the tmux session is not already another project's live owner helper (see
+  [One project per tmux session](#one-project-per-tmux-session));
 - the project is active: registration is refused (409) while the project is paused,
   cleaning up for a pause or resuming. Register again after resume.
 
@@ -193,6 +195,29 @@ New windows and panes in the tagged tmux session inherit the helper's identity:
 owner-only commands there refuse, and `tt post` there is authored as the helper.
 A second pane also stops wake-ups. Keep one pane in that session; re-registering
 from another session moves the tags.
+
+### One project per tmux session
+
+A tmux session carries one project's helper. Its tags name one task, agent and run,
+so tagging it for a second project would stop the first project's wake-ups and
+heartbeat and leave that helper offline with no message. To be the helper of
+several projects, register each from its own tmux session.
+
+`tt helper register` reads the session's current tags first. When they name the
+owner helper of another project (or another hub) that is still live, it refuses
+before registering with the hub or writing tags, state or a binding:
+
+```text
+tmux session owner is the owner helper of project tsk_…; one project per tmux
+session: register from another tmux session, or pass --take-session to move this
+one (that project's helper wake stops)
+```
+
+`--take-session` registers anyway and warns on stderr that the other project's
+wake-ups stop; that helper shows offline until it registers from another tmux
+session. The check does not apply when the tags name this project (a re-register),
+or a helper that is closed, exited, gone from the hub or registered again elsewhere.
+A helper on another hub, or one whose lookup fails, counts as live.
 
 ## Queue chores: product vs owner helper
 
