@@ -675,6 +675,15 @@ func TestClaudeWakeLivePrivateSession(t *testing.T) {
 	if !idle {
 		t.Fatalf("dedicated Claude pane did not become safe to wake: %v", idleErr)
 	}
+	// Stray terminal replies sit in the input, as on 2026-10-01: the wake must
+	// clear them with real Backspace keys before it types.
+	if out, err := exec.Command("tmux", "-L", os.Getenv("TT_TMUX_SOCKET"), "send-keys", "-t", session, "-l", "--", strayReplies).CombinedOutput(); err != nil {
+		t.Fatalf("stray text: %v %s", err, out)
+	}
+	time.Sleep(300 * time.Millisecond)
+	if _, err := nativeClaudeInspect(context.Background(), b, ""); err == nil {
+		t.Fatal("stray replies did not occupy the input")
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	prompt := claudeBrokerPrompt("Tailterm obligations #13260", 13260, "wake_0123456789abcdef")
@@ -689,6 +698,10 @@ func TestClaudeWakeLivePrivateSession(t *testing.T) {
 	if err != nil || json.Unmarshal(data, &intent) != nil || intent.Phase != "confirmed" || intent.EnterAt.Sub(intent.TextAt) < 100*time.Millisecond || intent.ConfirmedAt.Before(intent.EnterAt) {
 		t.Fatalf("confirmation guard: %v %s", err, data)
 	}
+	if intent.Clears != 1 || !strings.Contains(intent.Cleared, "cleared 14 characters of stray input") {
+		t.Fatalf("stray input clear not recorded: %s", data)
+	}
+	t.Logf("cleared before typing: %s", intent.Cleared)
 	t.Logf("confirmed pane=%s attempt=%s text=%s enter=%s user-turn=%s transcript=%s offset=%d", intent.Pane, intent.At.Format(time.RFC3339Nano), intent.TextAt.Format(time.RFC3339Nano), intent.EnterAt.Format(time.RFC3339Nano), intent.ConfirmedAt.Format(time.RFC3339Nano), intent.Path, intent.Offset)
 }
 
@@ -2169,5 +2182,497 @@ func TestClaudeEscalationRecipient(t *testing.T) {
 	}
 	if got := claudeEscalationRecipient([]api.Agent{agents[0], agents[2], agents[4], agents[5]}, "agt_h2"); got.ID != "" {
 		t.Fatalf("no one else live: recipient %q, want the Board", got.ID)
+	}
+}
+
+// strayReplies is the text found in agent inputs on 2026-10-01: the terminal's
+// answers to two device-attribute queries, with the escape introducers dropped.
+const strayReplies = "?1;2c>0;276;0c"
+
+// strayPane is a wakeRetryPane that draws its input as a Claude Code screen
+// (rule, ❯ row wrapped at words, rule, footer) and inspects that capture
+// through claudeInputScreen, as nativeClaudeInspect does. clear deletes
+// characters from the end of the input; refill is text that lands in the
+// input again after each clear, one entry per clear.
+type strayPane struct {
+	*wakeRetryPane
+	refill []string
+	clears []int
+}
+
+func newStrayPane(t *testing.T, input string) *strayPane {
+	f := &strayPane{wakeRetryPane: newWakeRetryPane(t)}
+	f.input = input
+	return f
+}
+
+func (f *strayPane) capture() (string, int, int) {
+	const width = 60
+	rows := []string{"❯ "}
+	for _, word := range strings.Fields(f.input) {
+		last := &rows[len(rows)-1]
+		switch {
+		case len([]rune(*last)) == 2:
+			*last += word
+		case len([]rune(*last))+1+len([]rune(word)) > width:
+			rows = append(rows, "  "+word)
+		default:
+			*last += " " + word
+		}
+	}
+	rule := strings.Repeat("─", width)
+	lines := append(append([]string{"Fixture answer.", "", rule}, rows...), rule, "  ⏵⏵ bypass permissions on (shift+tab to cycle)")
+	return strings.Join(lines, "\n") + "\n", len([]rune(rows[len(rows)-1])), 3 + len(rows) - 1
+}
+
+func (f *strayPane) ops() claudeWakeOps {
+	ops := f.wakeRetryPane.ops()
+	ops.inspect = func(_ context.Context, _ runtimeBinding, expected string) (claudeWakeSnapshot, error) {
+		raw, x, y := f.capture()
+		screen, err := claudeInputScreen(raw, x, y, expected)
+		if err != nil {
+			return claudeWakeSnapshot{}, err
+		}
+		info, err := os.Stat(f.transcript)
+		if err != nil {
+			return claudeWakeSnapshot{}, err
+		}
+		return claudeWakeSnapshot{Pane: "%1", SessionID: "$1", Created: "100", PanePID: 1001, Path: f.transcript, FileID: fileIdentity(info), Offset: info.Size(), Screen: screen, Cursor: activityCursor{Ready: true, SeenTurn: true, TurnComplete: !f.busy}}, nil
+	}
+	ops.clear = func(_ context.Context, pane string, n int) error {
+		if pane != "%1" {
+			f.t.Fatalf("cleared pane %q", pane)
+		}
+		f.clears = append(f.clears, n)
+		f.sends = append(f.sends, fmt.Sprintf("clear:%d", n))
+		text := []rune(f.input)
+		f.input = string(text[:max(len(text)-n, 0)])
+		if len(f.refill) > 0 {
+			f.input, f.refill = f.refill[0], f.refill[1:]
+		}
+		return nil
+	}
+	return ops
+}
+
+// userTurns returns the real user turns the fixture transcript holds.
+func (f *strayPane) userTurns() []string {
+	f.t.Helper()
+	data, err := os.ReadFile(f.transcript)
+	if err != nil {
+		f.t.Fatal(err)
+	}
+	var turns []string
+	for _, line := range strings.Split(strings.TrimSpace(string(data)), "\n") {
+		if text := claudeUserText([]byte(line)); text != "" {
+			turns = append(turns, text)
+		}
+	}
+	return turns
+}
+
+func TestClaudeStrayInputClassifier(t *testing.T) {
+	const own = "Tailterm messages #20. Run tt inbox --unread --mark-read."
+	for _, tc := range []struct {
+		name, text, own, want string
+	}{
+		{"observed replies", strayReplies, "", strayReplies},
+		{"primary attributes", "?1;2c", "", "?1;2c"},
+		{"secondary attributes with bracket", "[>0;276;0c", "", "[>0;276;0c"},
+		{"cursor position", "12;40R", "", "12;40R"},
+		{"mode report", "?2026;2$y", "", "?2026;2$y"},
+		{"keyboard report", "?1u", "", "?1u"},
+		{"wrapped replies", "?1;2c >0;276;0c", "", strayReplies},
+		{"own text then replies", own + strayReplies, own, strayReplies},
+		{"replies then own text", "?1;2c" + own, own, "?1;2c"},
+		{"empty", "", "", ""},
+		{"owner draft", "please check the build", "", ""},
+		{"replies then a draft", strayReplies + " please check", "", ""},
+		{"question", "?", "", ""},
+		{"bare letters", "c", "", ""},
+		{"number", "12", "", ""},
+		{"short status query", "5n", "", ""},
+		{"own text alone", own, own, ""},
+		{"own text and more", own + " and more", own, ""},
+		{"another wake text", own, "", ""},
+	} {
+		if got := claudeStrayInput(tc.text, tc.own); got != tc.want {
+			t.Errorf("%s: claudeStrayInput(%q) = %q, want %q", tc.name, tc.text, got, tc.want)
+		}
+	}
+}
+
+// The refusal of an occupied input carries its text only when one readable
+// input box holds it; a dialog or an unknown row carries none.
+func TestClaudeInputRefusalCarriesText(t *testing.T) {
+	const wake = "Tailterm messages #13260,#13261,#13262,#13263,#13264. Run tt inbox --unread --mark-read."
+	for _, input := range []string{strayReplies, "an owner draft", wake + strayReplies} {
+		f := newStrayPane(t, input)
+		raw, x, y := f.capture()
+		_, err := claudeInputScreen(raw, x, y, "")
+		var occupied claudeInputError
+		if !errors.As(err, &occupied) || occupied.Text != input || err.Error() != "Claude cursor is not at an empty input" {
+			t.Fatalf("%q: refusal %v carries %q", input, err, occupied.Text)
+		}
+		if screen, err := claudeInputScreen(raw, x, y, occupied.Text); err != nil || !exactClaudeInput(screen, input) {
+			t.Fatalf("%q: carried text does not match the input: %v", input, err)
+		}
+	}
+	rule := strings.Repeat("─", 40)
+	for name, raw := range map[string]string{
+		"empty input":       rule + "\n❯ \n" + rule + "\n  ⏵⏵ bypass permissions on\n",
+		"no input box":      "❯ " + strayReplies + "\n",
+		"unknown footer":    rule + "\n❯ " + strayReplies + "\n" + rule + "\n  1. Continue\n",
+		"unindented row":    rule + "\n❯ " + strayReplies + "\nmore\n" + rule + "\n",
+		"no lower rule":     rule + "\n❯ " + strayReplies + "\n",
+		"dialog under rule": rule + "\n❯ " + strayReplies + "\n" + rule + "\n  Esc to cancel\n",
+	} {
+		_, err := claudeInputScreen(raw, 7, 1, "")
+		var occupied claudeInputError
+		if err == nil || (errors.As(err, &occupied) && occupied.Text != "") {
+			t.Fatalf("%s: refusal %v carries %q", name, err, occupied.Text)
+		}
+	}
+}
+
+// s4, first wake: stray terminal replies are cleared, the empty input is
+// rechecked, and only then the wake is typed, submitted and confirmed. The
+// clear is logged once and kept in the intent.
+func TestClaudeWakeClearsStrayRepliesBeforeFirstWake(t *testing.T) {
+	f := newStrayPane(t, strayReplies)
+	f.submit = true
+	b := testClaudeBinding()
+	prompt := "Tailterm messages #20871. Run tt inbox --unread --mark-read."
+	var log strings.Builder
+	restore := captureStderr(t, &log)
+	err := claudeWakeWith(context.Background(), b, prompt, f.ops())
+	restore()
+	if err != nil {
+		t.Fatalf("wake: %v", err)
+	}
+	if want := []string{"clear:14", "text:" + prompt, "Enter"}; !slices.Equal(f.sends, want) {
+		t.Fatalf("sends %v, want %v", f.sends, want)
+	}
+	if turns := f.userTurns(); !slices.Equal(turns, []string{prompt}) || f.input != "" {
+		t.Fatalf("submitted turns %q, input %q", turns, f.input)
+	}
+	got := f.intent(b)
+	if got.Phase != "confirmed" || got.Clears != 1 || got.Cleared != `cleared 14 characters of stray input (terminal replies "?1;2c>0;276;0c")` {
+		t.Fatalf("intent: %+v", got)
+	}
+	if lines := strings.Count(log.String(), "\n"); lines != 1 || !strings.Contains(log.String(), " "+b.Agent+" Claude wake "+got.Cleared+" before typing\n") {
+		t.Fatalf("log %q", log.String())
+	}
+	if _, err := os.Stat(claudeWakeSkipPath(b)); !os.IsNotExist(err) {
+		t.Fatalf("skip record after a confirmed wake: %v", err)
+	}
+}
+
+// s4: input that is not a terminal reply is never cleared or typed after. The
+// skip names stray input without quoting it and escalates once after ten
+// minutes, like any other unchanged skip.
+func TestClaudeWakeReportsOtherStrayInput(t *testing.T) {
+	const draft = "an owner draft, secret words"
+	f := newStrayPane(t, draft)
+	f.submit = true
+	b := testClaudeBinding()
+	prompt := "Tailterm messages #20872. Run tt inbox --unread --mark-read."
+	var escalated []claudeWakeSkip
+	ops := f.ops()
+	ops.escalate = func(_ context.Context, _ runtimeBinding, skip claudeWakeSkip) error {
+		escalated = append(escalated, skip)
+		return nil
+	}
+	const want = "Claude cursor is not at an empty input: stray input in the input line (28 characters) is not a terminal reply; left untouched"
+	for minute := 0; minute <= 12; minute += 4 {
+		err := claudeWakeWith(context.Background(), b, prompt, ops)
+		if !errors.Is(err, errClaudeWakeUnsafe) || err.Error() != errClaudeWakeUnsafe.Error()+": "+want {
+			t.Fatalf("minute %d: %v", minute, err)
+		}
+		f.now = f.now.Add(4 * time.Minute)
+	}
+	if len(f.sends) != 0 || f.input != draft {
+		t.Fatalf("pane touched: sends %v input %q", f.sends, f.input)
+	}
+	if len(escalated) != 1 || escalated[0].Reason != want || strings.Contains(escalated[0].Reason, "secret") {
+		t.Fatalf("escalations %+v", escalated)
+	}
+	if _, err := os.Stat(claudeWakePath(b)); !os.IsNotExist(err) {
+		t.Fatalf("wake intent written: %v", err)
+	}
+}
+
+// s4 bounds and refusals: nothing is typed after leftover text.
+func TestClaudeWakeStrayClearIsBoundedAndChecked(t *testing.T) {
+	b := testClaudeBinding()
+	prompt := "Tailterm messages #20873. Run tt inbox --unread --mark-read."
+	t.Run("input refills", func(t *testing.T) {
+		f := newStrayPane(t, strayReplies)
+		f.submit, f.refill = true, []string{"?1;2c", "?1;2c", "?1;2c", "?1;2c"}
+		var log strings.Builder
+		restore := captureStderr(t, &log)
+		err := claudeWakeWith(context.Background(), b, prompt, f.ops())
+		restore()
+		if !errors.Is(err, errClaudeWakeUnsafe) || !strings.Contains(err.Error(), "stray input in the input line returned after 2 clears in one pass") {
+			t.Fatalf("refilled input: %v", err)
+		}
+		if want := []string{"clear:14", "clear:5"}; !slices.Equal(f.sends, want) || f.input != "?1;2c" {
+			t.Fatalf("sends %v input %q", f.sends, f.input)
+		}
+		if got := strings.Count(log.String(), "Claude wake cleared "); got != 2 {
+			t.Fatalf("%d clear log lines: %q", got, log.String())
+		}
+		var skip claudeWakeSkip
+		data, _ := os.ReadFile(claudeWakeSkipPath(b))
+		if json.Unmarshal(data, &skip) != nil || !strings.Contains(skip.Reason, "cleared 14 characters of stray input") || len(skip.Reason) > 200 {
+			t.Fatalf("skip record %s", data)
+		}
+	})
+	t.Run("refills once", func(t *testing.T) {
+		f := newStrayPane(t, strayReplies)
+		f.submit, f.refill = true, []string{"?1;2c"}
+		if err := claudeWakeWith(context.Background(), b, prompt, f.ops()); err != nil {
+			t.Fatalf("wake: %v", err)
+		}
+		if want := []string{"clear:14", "clear:5", "text:" + prompt, "Enter"}; !slices.Equal(f.sends, want) {
+			t.Fatalf("sends %v", f.sends)
+		}
+		if got := f.intent(b); got.Phase != "confirmed" || got.Clears != 2 || len(got.Cleared) > 240 {
+			t.Fatalf("intent %+v", got)
+		}
+	})
+	t.Run("clear leaves text", func(t *testing.T) {
+		f := newStrayPane(t, strayReplies)
+		f.submit, f.refill = true, []string{"left by someone"}
+		err := claudeWakeWith(context.Background(), b, prompt, f.ops())
+		if !errors.Is(err, errClaudeWakeUnsafe) || !strings.Contains(err.Error(), "left untouched (after it cleared 14 characters") {
+			t.Fatalf("leftover text: %v", err)
+		}
+		if want := []string{"clear:14"}; !slices.Equal(f.sends, want) || f.input != "left by someone" {
+			t.Fatalf("sends %v input %q", f.sends, f.input)
+		}
+	})
+	t.Run("busy", func(t *testing.T) {
+		f := newStrayPane(t, strayReplies)
+		f.busy = true
+		err := claudeWakeWith(context.Background(), b, prompt, f.ops())
+		if !errors.Is(err, errClaudeWakeUnsafe) || !strings.Contains(err.Error(), "not cleared: Claude is busy") || len(f.sends) != 0 {
+			t.Fatalf("busy pane: %v sends %v", err, f.sends)
+		}
+	})
+	t.Run("no clear available", func(t *testing.T) {
+		f := newStrayPane(t, strayReplies)
+		ops := f.ops()
+		ops.clear = nil
+		err := claudeWakeWith(context.Background(), b, prompt, ops)
+		if !errors.Is(err, errClaudeWakeUnsafe) || !strings.Contains(err.Error(), "14 characters of terminal replies); no clear available") || len(f.sends) != 0 {
+			t.Fatalf("no clear: %v sends %v", err, f.sends)
+		}
+	})
+	t.Run("clear fails", func(t *testing.T) {
+		f := newStrayPane(t, strayReplies)
+		ops := f.ops()
+		ops.clear = func(context.Context, string, int) error { return errors.New("synthetic tmux failure") }
+		err := claudeWakeWith(context.Background(), b, prompt, ops)
+		if !errors.Is(err, errClaudeWakeUnsafe) || !strings.Contains(err.Error(), "not cleared: synthetic tmux failure") || len(f.sends) != 0 {
+			t.Fatalf("failed clear: %v sends %v", err, f.sends)
+		}
+	})
+	t.Run("too long", func(t *testing.T) {
+		f := newStrayPane(t, strings.Repeat("?1;2c", claudeStrayClearRunes/5+1))
+		err := claudeWakeWith(context.Background(), b, prompt, f.ops())
+		if !errors.Is(err, errClaudeWakeUnsafe) || !strings.Contains(err.Error(), "too long to clear") || len(f.sends) != 0 {
+			t.Fatalf("long input: %v sends %v", err, f.sends)
+		}
+	})
+}
+
+// s7: a wake typed but not submitted is unconfirmed, and stray replies that
+// land beside it do not hold the retry: the input is cleared, the current
+// prompt is typed again, submitted and confirmed.
+func TestClaudeWakeRetryClearsStrayRepliesBesideOwnText(t *testing.T) {
+	b := testClaudeBinding()
+	// Long enough to wrap in the fixture's 60-column editor.
+	prompt := "Tailterm messages #13260,#13261,#13262,#13263,#13264. Run tt inbox --unread --mark-read."
+	current := "Tailterm messages #13260,#13261,#13262,#13263,#13264,#13265. Run tt inbox --unread --mark-read."
+	for _, tc := range []struct {
+		name, input string
+	}{
+		{"own text then replies", prompt + strayReplies},
+		{"replies then own text", strayReplies + prompt},
+		{"own text lost, replies alone", strayReplies},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newStrayPane(t, "")
+			if err := claudeWakeWith(context.Background(), b, prompt, f.ops()); err == nil || !strings.Contains(err.Error(), "did not confirm") {
+				t.Fatalf("unsubmitted wake: %v", err)
+			}
+			if got := f.intent(b); got.Phase != "uncertain" || !got.ConfirmedAt.IsZero() || f.input != prompt || len(f.userTurns()) != 0 {
+				t.Fatalf("unsubmitted wake counted: %+v input %q", got, f.input)
+			}
+			f.input = tc.input
+			sent := len(f.sends)
+			if err := claudeWakeWith(context.Background(), b, current, f.ops()); err == nil || !strings.Contains(err.Error(), "did not confirm") || len(f.sends) != sent {
+				t.Fatalf("acted before the backoff: %v sends %v", err, f.sends)
+			}
+			f.now = f.intent(b).RetryAt
+			f.submit = true
+			if err := claudeWakeWith(context.Background(), b, current, f.ops()); err != nil {
+				t.Fatalf("retry: %v", err)
+			}
+			if want := []string{"text:" + prompt, "Enter", fmt.Sprintf("clear:%d", len([]rune(tc.input))), "text:" + current, "Enter"}; !slices.Equal(f.sends, want) {
+				t.Fatalf("sends %v, want %v", f.sends, want)
+			}
+			if turns := f.userTurns(); !slices.Equal(turns, []string{current}) {
+				t.Fatalf("submitted turns %q", turns)
+			}
+			got := f.intent(b)
+			if got.Phase != "confirmed" || got.Attempts != 1 || got.Prompt != current || got.Clears != 1 || !strings.Contains(got.LastRetry, "retyped after clearing stray input") || !strings.Contains(got.Cleared, `"?1;2c>0;276;0c"`) || strings.Contains(got.Cleared, "Tailterm") {
+				t.Fatalf("intent after retry: %+v", got)
+			}
+		})
+	}
+}
+
+// s7: own unsubmitted text with stray replies beside it never confirms. With
+// a pane that keeps refusing to submit, the wake stays unconfirmed through
+// the bounded retries and ends exhausted; with no way to clear, or with other
+// text beside it, the pass is an unsafe skip and types nothing.
+func TestClaudeWakeUnsubmittedTextNeverConfirms(t *testing.T) {
+	b := testClaudeBinding()
+	prompt := "Tailterm messages #20874. Run tt inbox --unread --mark-read."
+	f := newStrayPane(t, "")
+	wake := func() error { return claudeWakeWith(context.Background(), b, prompt, f.ops()) }
+	if err := wake(); err == nil || !strings.Contains(err.Error(), "did not confirm") {
+		t.Fatalf("first wake: %v", err)
+	}
+	f.input = prompt + strayReplies
+	for retry := 1; retry <= claudeWakeMaxRetries; retry++ {
+		f.now = f.intent(b).RetryAt
+		err := wake()
+		if err == nil || !strings.Contains(err.Error(), "did not confirm") {
+			t.Fatalf("retry %d: %v", retry, err)
+		}
+		if got := f.intent(b); got.Phase != "uncertain" || got.Attempts != retry || !got.ConfirmedAt.IsZero() {
+			t.Fatalf("retry %d intent: %+v", retry, got)
+		}
+	}
+	// One clear and retype, then Enter alone on the relay's own text.
+	if want := []string{"text:" + prompt, "Enter", fmt.Sprintf("clear:%d", len(prompt)+len(strayReplies)), "text:" + prompt, "Enter", "Enter", "Enter", "Enter"}; !slices.Equal(f.sends, want) {
+		t.Fatalf("sends %v", f.sends)
+	}
+	f.now = f.intent(b).RetryAt
+	if err := wake(); err == nil || !strings.Contains(err.Error(), "did not confirm after 4 retries") {
+		t.Fatalf("exhaustion: %v", err)
+	}
+	if got := f.intent(b); got.Phase != "exhausted" || got.Clears != 1 || len(f.userTurns()) != 0 {
+		t.Fatalf("exhausted intent: %+v turns %q", got, f.userTurns())
+	}
+
+	for name, setup := range map[string]func(*strayPane, *claudeWakeOps){
+		"no clear available":     func(_ *strayPane, ops *claudeWakeOps) { ops.clear = nil },
+		"other text beside it":   func(g *strayPane, _ *claudeWakeOps) { g.input = prompt + " and more" },
+		"replies while busy":     func(g *strayPane, _ *claudeWakeOps) { g.busy = true },
+		"replies and other text": func(g *strayPane, _ *claudeWakeOps) { g.input = prompt + strayReplies + " and more" },
+	} {
+		g := newStrayPane(t, "")
+		if err := claudeWakeWith(context.Background(), b, prompt, g.ops()); err == nil {
+			t.Fatalf("%s: first wake confirmed", name)
+		}
+		g.input, g.submit = prompt+strayReplies, true
+		ops := g.ops()
+		setup(g, &ops)
+		g.now = g.intent(b).RetryAt
+		err := claudeWakeWith(context.Background(), b, prompt, ops)
+		if !errors.Is(err, errClaudeWakeUnsafe) || len(g.sends) != 2 || len(g.userTurns()) != 0 {
+			t.Fatalf("%s: %v sends %v", name, err, g.sends)
+		}
+		if got := g.intent(b); got.Phase != "uncertain" || got.Attempts != 0 || !strings.Contains(got.LastRetry, "pane not safe for retry") {
+			t.Fatalf("%s: intent %+v", name, got)
+		}
+	}
+}
+
+// nativeClaudeClear presses Backspace the given number of times in the named
+// pane, on a private tmux socket. The pane runs cat -v on a raw terminal, so
+// each Backspace shows as ^? after the stray text.
+func TestNativeClaudeClearPrivateSocket(t *testing.T) {
+	if _, err := exec.LookPath("tmux"); err != nil {
+		t.Skip("tmux unavailable")
+	}
+	socket := "tt-stray-" + strings.TrimPrefix(api.NewID("agt"), "agt_")
+	t.Setenv("TT_TMUX_SOCKET", socket)
+	ctx := context.Background()
+	t.Cleanup(func() { _ = exec.Command("tmux", "-L", socket, "kill-server").Run() })
+	if out, err := exec.Command("tmux", "-L", socket, "-f", "/dev/null", "new-session", "-d", "-s", "stray", "-x", "80", "-y", "24", "stty raw -echo; exec cat -v").CombinedOutput(); err != nil {
+		t.Fatalf("tmux: %v %s", err, out)
+	}
+	raw, err := startupTmux(ctx, "list-panes", "-s", "-t", "stray", "-F", "#{pane_id}")
+	if err != nil {
+		t.Fatal(err)
+	}
+	pane := strings.TrimSpace(string(raw))
+	screen := func(want string) string {
+		t.Helper()
+		var got string
+		for deadline := time.Now().Add(5 * time.Second); time.Now().Before(deadline); time.Sleep(50 * time.Millisecond) {
+			out, err := startupTmux(ctx, "capture-pane", "-p", "-t", pane)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got = strings.TrimSpace(string(out)); got == want {
+				return got
+			}
+		}
+		t.Fatalf("pane shows %q, want %q", got, want)
+		return ""
+	}
+	// Wait for cat to own the raw terminal before typing.
+	time.Sleep(300 * time.Millisecond)
+	if err := nativeClaudeSend(ctx, pane, strayReplies, true); err != nil {
+		t.Fatal(err)
+	}
+	screen(strayReplies)
+	if err := nativeClaudeClear(ctx, pane, len(strayReplies)); err != nil {
+		t.Fatal(err)
+	}
+	screen(strayReplies + strings.Repeat("^?", len(strayReplies)))
+	for _, n := range []int{0, -1, claudeStrayClearRunes + 1} {
+		if err := nativeClaudeClear(ctx, pane, n); err == nil || !strings.Contains(err.Error(), "out of bounds") {
+			t.Fatalf("clear of %d: %v", n, err)
+		}
+	}
+	screen(strayReplies + strings.Repeat("^?", len(strayReplies)))
+}
+
+// c1: the snapshot's ProviderBlock is a copy. Changing the snapshot does not
+// change the cached place, and a later check that advances the cached block
+// does not change an earlier snapshot.
+func TestClaudeTranscriptSnapshotCopiesProviderBlock(t *testing.T) {
+	now := time.Date(2026, 9, 25, 19, 1, 0, 0, time.UTC)
+	b, transcript := claudeTranscriptFixture(t, "queue-idle", claudeAPIErrorPrompt, claudeAPIErrorEndTurn, claudeAPIErrorRecord)
+	first, err := claudeTranscriptSnapshot(b, now)
+	if err != nil || first.Cursor.ProviderBlock == nil {
+		t.Fatalf("no provider block in the snapshot: %+v %v", first.Cursor.ProviderBlock, err)
+	}
+	want := *first.Cursor.ProviderBlock
+	first.Cursor.ProviderBlock.Count, first.Cursor.ProviderBlock.Class, first.Cursor.ProviderBlock.Since = 99, "changed", time.Time{}
+	second, err := claudeTranscriptSnapshot(b, now)
+	if err != nil || second.Cursor.ProviderBlock == nil || *second.Cursor.ProviderBlock != want || second.Cursor.ProviderBlock == first.Cursor.ProviderBlock {
+		t.Fatalf("changing a snapshot changed the cache: %+v, want %+v (%v)", second.Cursor.ProviderBlock, want, err)
+	}
+	// The same failure again extends the cached block in place.
+	appendClaudeRecords(t, transcript, claudeAPIErrorRecord)
+	third, err := claudeTranscriptSnapshot(b, now)
+	if err != nil || third.Cursor.ProviderBlock == nil || third.Cursor.ProviderBlock.Count != want.Count+1 {
+		t.Fatalf("cache did not advance: %+v (%v)", third.Cursor.ProviderBlock, err)
+	}
+	if *second.Cursor.ProviderBlock != want {
+		t.Fatalf("a later check changed an earlier snapshot: %+v, want %+v", second.Cursor.ProviderBlock, want)
+	}
+	// With no block the snapshot has none.
+	idle, _ := claudeTranscriptFixture(t, "queue-idle")
+	if snap, err := claudeTranscriptSnapshot(idle, now); err != nil || snap.Cursor.ProviderBlock != nil {
+		t.Fatalf("idle snapshot block %+v (%v)", snap.Cursor.ProviderBlock, err)
 	}
 }

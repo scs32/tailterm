@@ -13,6 +13,7 @@ import (
 	"maps"
 	"os"
 	"path/filepath"
+	"regexp"
 	"slices"
 	"strconv"
 	"strings"
@@ -26,9 +27,10 @@ import (
 
 // A wake is uncertain from the moment its intent is durable. A crash between
 // that write and terminal input cannot safely be distinguished from a crash
-// after input, so a later relay pass never retypes while its own text may still
-// be in the prompt: it retries only after a backoff, with Enter alone on its
-// own idle text or one retype into a proven-empty input (claudeWakeRetry). The
+// after input, so a later relay pass never types beside its own text in the
+// prompt: it retries only after a backoff, with Enter alone on its own idle
+// text or one retype into a proven-empty input, clearing stray terminal
+// replies first (claudeWakeRetry, claudeWakeEmpty). The
 // file is private host state, scoped to a run. Phases: uncertain, confirmed,
 // exhausted (retries used up; cooling down) and abandoned (the transcript moved
 // on without it).
@@ -59,6 +61,10 @@ type claudeWakeIntent struct {
 	// Safe records why the checks let this wake type: the turn state and how
 	// much of the transcript was read to reach it.
 	Safe string `json:"safe,omitempty"`
+	// Cleared describes the stray input removed before this attempt typed, and
+	// Clears counts such removals since FirstAt (see claudeWakeEmpty).
+	Cleared string `json:"cleared,omitempty"`
+	Clears  int    `json:"clears,omitempty"`
 }
 
 type claudeWakeSnapshot struct {
@@ -82,8 +88,11 @@ type claudeWakeSnapshot struct {
 type claudeWakeOps struct {
 	inspect func(context.Context, runtimeBinding, string) (claudeWakeSnapshot, error)
 	send    func(context.Context, string, string, bool) error
-	sleep   func(time.Duration)
-	now     func() time.Time
+	// clear deletes n characters before the cursor of a pane's input. Nil
+	// disables clearing: stray input is then only reported.
+	clear func(context.Context, string, int) error
+	sleep func(time.Duration)
+	now   func() time.Time
 	// escalate reports a wake skipped past claudeWakeSkipBound. Nil disables
 	// the report; the skip is still tracked.
 	escalate func(context.Context, runtimeBinding, claudeWakeSkip) error
@@ -233,6 +242,80 @@ func exactClaudeInput(screen, expected string) bool {
 		}
 	}
 	return strings.Join(strings.Fields(strings.Join(parts, " ")), " ") == strings.Join(strings.Fields(expected), " ")
+}
+
+// claudeInputError is a refused input check. Text is what the input box holds
+// when the relay could read it: one input box with typed text and nothing
+// else unknown in the prompt area. It is empty for any other refusal.
+type claudeInputError struct {
+	reason string
+	Text   string
+}
+
+func (e claudeInputError) Error() string { return e.reason }
+
+// claudeInputText reads the typed text of the active input box from a plain
+// screen: the last ❯ row under a rule, its wrapped rows, then the lower rule
+// and only known footer rows. Rows are joined with one space, as
+// exactClaudeInput compares them. Any other layout reports false.
+func claudeInputText(screen string) (string, bool) {
+	area, boxed := claudePromptArea(strings.Split(strings.TrimRight(screen, "\n"), "\n"))
+	if !boxed || len(area) > 12 {
+		return "", false
+	}
+	parts := []string{strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(area[1]), "❯"))}
+	border := false
+	for _, line := range area[2:] {
+		trimmed := strings.TrimSpace(line)
+		switch {
+		case claudeRuleLine(line):
+			border = true
+		case trimmed == "" || (border && (strings.HasPrefix(trimmed, "⏵⏵") || strings.HasPrefix(trimmed, "? for shortcuts"))):
+		case !border && strings.HasPrefix(line, "  "):
+			parts = append(parts, trimmed)
+		default:
+			return "", false
+		}
+	}
+	text := strings.Join(strings.Fields(strings.Join(parts, " ")), " ")
+	if !border || text == "" {
+		return "", false
+	}
+	return text, true
+}
+
+// claudeStrayReply matches input made only of terminal replies whose escape
+// introducer the editor dropped: device attributes (?1;2c, >0;276;0c), a
+// keyboard or mode report (?1u, ?2026;2$y) and a cursor position (12;40R). A
+// terminal answers such queries on the pane's input, so they land in Claude's
+// editor as text nobody typed. On 2026-10-01 "?1;2c>0;276;0c" sat in agent
+// inputs and every wake was skipped until it was cleared by hand.
+var claudeStrayReply = regexp.MustCompile(`^(?:\[?(?:[?>][0-9]+(?:;[0-9]+)*(?:c|u|\$y)|[0-9]+;[0-9]+R))+$`)
+
+const (
+	// claudeStrayClearMax bounds the clears in one wake pass, so an input that
+	// refills cannot hold the relay in a loop.
+	claudeStrayClearMax = 2
+	// claudeStrayClearRunes bounds how much input one clear deletes.
+	claudeStrayClearRunes = 1024
+)
+
+// claudeStrayInput returns the terminal replies in input text, or "" when the
+// text holds anything else. own is the relay's earlier wake text, which may
+// sit unsubmitted beside the replies; own text alone is not stray. Whitespace
+// is ignored, because the editor wraps long text across rows.
+func claudeStrayInput(text, own string) string {
+	compact := func(v string) string { return strings.Join(strings.Fields(v), "") }
+	stray := compact(text)
+	if own = compact(own); own != "" {
+		if i := strings.Index(stray, own); i >= 0 {
+			stray = stray[:i] + stray[i+len(own):]
+		}
+	}
+	if !claudeStrayReply.MatchString(stray) {
+		return ""
+	}
+	return stray
 }
 
 // claudeQueueStaleAfter bounds how long queued input can hold a wake after a
@@ -461,6 +544,10 @@ func claudeTranscriptSnapshotContext(ctx context.Context, b runtimeBinding, now 
 	// The caller gets a copy that shares nothing the next check will change.
 	snapshot := *cursor
 	snapshot.Pending, snapshot.ClaudeUsage, snapshot.Completed = maps.Clone(cursor.Pending), maps.Clone(cursor.ClaudeUsage), slices.Clone(cursor.Completed)
+	if cursor.ProviderBlock != nil {
+		block := *cursor.ProviderBlock
+		snapshot.ProviderBlock = &block
+	}
 	return claudeWakeSnapshot{Path: path, FileID: cursor.FileID, Offset: cursor.Offset, Cursor: snapshot, UnknownTypes: slices.Clone(st.unknownTypes), Safe: safe, ReadBytes: cursor.Offset - start}, nil
 }
 
@@ -562,15 +649,18 @@ func claudeInputScreen(raw string, cursorX, cursorY int, expected string) (strin
 	if match, blocked := claudeDialog(full); blocked {
 		return "", errors.New("Claude pane has a permission or selection prompt: " + match)
 	}
+	// A refusal carries the typed text when the input box is readable, so a
+	// wake can tell stray terminal replies from anything else.
+	held, _ := claudeInputText(visible)
 	if expected == "" {
 		lines := strings.Split(visible, "\n")
 		if cursorX != 2 || cursorY >= len(lines) {
-			return "", errors.New("Claude cursor is not at an empty input")
+			return "", claudeInputError{reason: "Claude cursor is not at an empty input", Text: held}
 		}
 		visible = strings.Join(lines[cursorY:], "\n")
 	}
 	if !exactClaudeInput(visible, expected) {
-		return "", errors.New("Claude input is occupied, prompting, or unknown")
+		return "", claudeInputError{reason: "Claude input is occupied, prompting, or unknown", Text: held}
 	}
 	return visible, nil
 }
@@ -732,6 +822,20 @@ func nativeClaudeSend(ctx context.Context, pane, value string, literal bool) err
 		args = append(args, "-l", "--", value)
 	} else {
 		args = append(args, "Enter")
+	}
+	_, err := startupTmux(ctx, args...)
+	return err
+}
+
+// nativeClaudeClear presses Backspace n times in one tmux command. Backspace
+// in an empty Claude input does nothing, so a count above the text is safe.
+func nativeClaudeClear(ctx context.Context, pane string, n int) error {
+	if n < 1 || n > claudeStrayClearRunes {
+		return fmt.Errorf("Claude input clear of %d characters is out of bounds", n)
+	}
+	args := []string{"send-keys", "-t", pane}
+	for range n {
+		args = append(args, "BSpace")
 	}
 	_, err := startupTmux(ctx, args...)
 	return err
@@ -998,7 +1102,7 @@ func claudeWakeAttempt(ctx context.Context, b runtimeBinding, prompt string, ops
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
-	first, err := ops.inspect(ctx, b, "")
+	first, cleared, err := claudeWakeEmpty(ctx, b, ops, "", "")
 	if err != nil {
 		return fmt.Errorf("%w: %v", errClaudeWakeUnsafe, err)
 	}
@@ -1007,7 +1111,87 @@ func claudeWakeAttempt(ctx context.Context, b runtimeBinding, prompt string, ops
 	}
 	now := ops.now().UTC()
 	intent := claudeWakeIntent{Run: b.Run, Thread: b.Thread, Session: b.Session, Phase: "uncertain", At: now, FirstAt: now, CycleAt: now}
+	claudeWakeNoteClears(&intent, cleared)
 	return claudeWakeType(ctx, b, prompt, ops, path, &intent, first)
+}
+
+// claudeWakeNoteClears records this pass's clears in the intent about to type.
+func claudeWakeNoteClears(intent *claudeWakeIntent, cleared []string) {
+	intent.Cleared = claudeClip(strings.Join(cleared, "; "), 240)
+	intent.Clears += len(cleared)
+}
+
+// claudeWakeEmpty inspects for an empty input, as ops.inspect(ctx, b, "")
+// does, and first clears an input that holds only stray terminal replies
+// (claudeStrayInput), with or without the relay's own unsubmitted wake text
+// own. Before a clear it proves, with the usual identity and transcript
+// checks, that the pane is idle and holds exactly the text it read; after it,
+// the empty check runs again, so the caller never types after leftover text.
+// Any other text is left untouched and the refusal names it. pane, when set,
+// is the only pane that may be cleared. cleared lists what each clear removed:
+// a count and a clipped sample of the replies, never other input text. Each
+// clear is logged in one line, and an error after a clear names it, so a skip
+// record keeps it. At most claudeStrayClearMax clears run in one call.
+func claudeWakeEmpty(ctx context.Context, b runtimeBinding, ops claudeWakeOps, own, pane string) (claudeWakeSnapshot, []string, error) {
+	var cleared []string
+	var before claudeWakeSnapshot
+	fail := func(err error) (claudeWakeSnapshot, []string, error) {
+		if len(cleared) > 0 {
+			err = fmt.Errorf("%v (after it %s)", err, strings.Join(cleared, "; "))
+		}
+		return claudeWakeSnapshot{}, cleared, err
+	}
+	for {
+		snap, err := ops.inspect(ctx, b, "")
+		if err == nil {
+			if len(cleared) > 0 && !sameClaudeSnapshot(before, snap) {
+				return fail(errors.New("Claude identity or transcript changed while stray input was cleared"))
+			}
+			return snap, cleared, nil
+		}
+		var occupied claudeInputError
+		if !errors.As(err, &occupied) || occupied.Text == "" {
+			return fail(err)
+		}
+		n := utf8.RuneCountInString(occupied.Text)
+		stray := claudeStrayInput(occupied.Text, own)
+		switch {
+		case own != "" && strings.Join(strings.Fields(occupied.Text), "") == strings.Join(strings.Fields(own), ""):
+			return fail(err) // the relay's own text alone: the Enter retry's case
+		case stray == "":
+			return fail(fmt.Errorf("%v: stray input in the input line (%d characters) is not a terminal reply; left untouched", err, n))
+		case ops.clear == nil:
+			return fail(fmt.Errorf("%v: stray input in the input line (%d characters of terminal replies); no clear available", err, n))
+		case n > claudeStrayClearRunes:
+			return fail(fmt.Errorf("%v: stray input in the input line (%d characters) is too long to clear", err, n))
+		case len(cleared) >= claudeStrayClearMax:
+			return fail(fmt.Errorf("%v: stray input in the input line returned after %d clears in one pass", err, len(cleared)))
+		}
+		held, err := ops.inspect(ctx, b, occupied.Text)
+		if err != nil {
+			return fail(fmt.Errorf("stray input in the input line not cleared: %v", err))
+		}
+		switch {
+		case !exactClaudeInput(held.Screen, occupied.Text) || !claudeWakeIdle(held, ops.now()):
+			return fail(errors.New("stray input in the input line not cleared: Claude is busy or its input changed"))
+		case pane != "" && held.Pane != pane:
+			return fail(errors.New("stray input in the input line not cleared: pane changed"))
+		case len(cleared) > 0 && !sameClaudeSnapshot(before, held):
+			return fail(errors.New("stray input in the input line not cleared: Claude identity or transcript changed"))
+		}
+		before = held
+		what := "terminal replies"
+		if n > utf8.RuneCountInString(stray) {
+			what = "the relay's own unsubmitted wake text and terminal replies"
+		}
+		note := fmt.Sprintf("cleared %d characters of stray input (%s %q)", n, what, claudeClip(stray, 40))
+		fmt.Fprintf(os.Stderr, "[tt relay] %s %s Claude wake %s before typing\n", ops.now().UTC().Format(time.RFC3339), b.Agent, note)
+		if err := ops.clear(ctx, held.Pane, n); err != nil {
+			return fail(fmt.Errorf("stray input in the input line not cleared: %v", err))
+		}
+		cleared = append(cleared, note)
+		ops.sleep(100 * time.Millisecond)
+	}
 }
 
 // claudeWakeRetry handles a saved intent that has not confirmed. It returns
@@ -1091,15 +1275,24 @@ func claudeWakeRetry(ctx context.Context, b runtimeBinding, prompt string, ops c
 		return true, claudeWakeAwait(ctx, ops, path, previous)
 	}
 	// One retype of the current prompt when the input is empty, Claude is idle
-	// and the transcript still lacks the earlier prompt.
-	empty, emptyErr := ops.inspect(ctx, b, "")
+	// and the transcript still lacks the earlier prompt. Stray terminal replies,
+	// alone or beside the relay's own unsubmitted text, are cleared first: that
+	// text was never submitted, so the wake is still undelivered.
+	empty, cleared, emptyErr := claudeWakeEmpty(ctx, b, ops, previous.Prompt, previous.Pane)
+	if len(cleared) > 0 {
+		claudeWakeNoteClears(previous, cleared)
+	}
 	if emptyErr == nil && empty.Pane == previous.Pane && emptyClaudeInput(empty.Screen) && claudeWakeIdle(empty, ops.now()) {
 		if found, other, err := claudeWakeScan(*previous); found || other || err != nil {
 			return true, errors.New("Claude transcript changed before retry; did not confirm")
 		}
 		retry := *previous
 		retry.Attempts++
-		claudeWakeSaveReason(&retry, fmt.Sprintf("retry %d/%d: retyped after lost text", retry.Attempts, claudeWakeMaxRetries))
+		reason := "retyped after lost text"
+		if len(cleared) > 0 {
+			reason = "retyped after clearing stray input"
+		}
+		claudeWakeSaveReason(&retry, fmt.Sprintf("retry %d/%d: %s", retry.Attempts, claudeWakeMaxRetries, reason))
 		fmt.Fprintf(os.Stderr, "[tt relay] %s %s Claude wake %s\n", now.Format(time.RFC3339), b.Agent, retry.LastRetry)
 		return true, claudeWakeType(ctx, b, prompt, ops, path, &retry, empty)
 	}
@@ -1207,5 +1400,5 @@ func claudeWakeAwait(ctx context.Context, ops claudeWakeOps, path string, intent
 }
 
 func claudeQueue(ctx context.Context, b runtimeBinding, prompt string) error {
-	return claudeWakeWith(ctx, b, prompt, claudeWakeOps{inspect: nativeClaudeInspect, send: nativeClaudeSend, sleep: time.Sleep, now: time.Now, escalate: nativeClaudeEscalate})
+	return claudeWakeWith(ctx, b, prompt, claudeWakeOps{inspect: nativeClaudeInspect, send: nativeClaudeSend, clear: nativeClaudeClear, sleep: time.Sleep, now: time.Now, escalate: nativeClaudeEscalate})
 }
