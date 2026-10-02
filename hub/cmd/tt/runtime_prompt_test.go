@@ -432,6 +432,41 @@ func TestRuntimePromptRepeat(t *testing.T) {
 			t.Errorf("owner notices %d, want 2", n)
 		}
 	})
+	// No tick lands between two dialogs (relay stopped, host asleep): the
+	// transcript event after the first prompt still makes the second new.
+	t.Run("missed clearing tick", func(t *testing.T) {
+		r := newPromptRig(t, "claude")
+		r.transcript(r.clock.Add(-30*time.Second), true)
+		r.screen = dialog(r, about, "Waiting… 12s")
+		first := r.tick().Prompt
+		r.screen = dialog(r, about, "Waiting… 30s")
+		if again := r.tick().Prompt; first == nil || again == nil || again.Fingerprint != first.Fingerprint {
+			t.Fatalf("open dialog changed identity: %+v then %+v", first, again)
+		}
+		r.clock = r.clock.Add(5 * time.Minute)
+		path := filepath.Join(os.Getenv("HOME"), ".claude", "projects", "rig", r.b.Thread+".jsonl")
+		f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0600)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, err = f.WriteString(`{"type":"assistant","timestamp":"` + r.clock.Add(-30*time.Second).Format(time.RFC3339) + `","message":{"id":"m2","content":[{"type":"tool_use","id":"t2","name":"Bash","input":{"command":"rm y"}}],"usage":{"input_tokens":1,"output_tokens":1}}}` + "\n")
+		if cerr := f.Close(); err != nil || cerr != nil {
+			t.Fatal(err, cerr)
+		}
+		r.screen = dialog(r, "Remove file y from work directory", "Waiting… 12s")
+		second := r.tick()
+		if second.State != "runtime_prompt" || second.Prompt == nil || second.Prompt.Fingerprint == first.Fingerprint || !second.Prompt.Since.After(first.Since) {
+			t.Fatalf("dialog after a missed clear %+v prompt %+v, first %+v", second, second.Prompt, first)
+		}
+		if n := r.ownerNotices(); n != 2 {
+			t.Errorf("owner notices %d, want 2", n)
+		}
+		// The new dialog is sticky in its turn.
+		r.screen = dialog(r, "Remove file y from work directory", "Waiting… 30s")
+		if again := r.tick().Prompt; again == nil || again.Fingerprint != second.Prompt.Fingerprint || r.ownerNotices() != 2 {
+			t.Errorf("second dialog changed identity: %+v, owner notices %d", again, r.ownerNotices())
+		}
+	})
 	t.Run("codex not sticky", func(t *testing.T) {
 		r := newPromptRig(t, "codex")
 		r.transcript(r.clock.Add(-30*time.Second), false)

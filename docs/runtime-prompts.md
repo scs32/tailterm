@@ -3,7 +3,7 @@
 Bug `wi_7d5050c57193db78` revision 1, owner order #13871, lead assignment
 #14367 (plan sha256 `4c878ff1…06d8`), lead decision #14370. One notice per
 open Claude prompt and the lead-notice condition: bug `wi_5875dd7785fe688e`
-revision 1, owner order #20578, lead assignment #20794.
+revision 2, owner order #20578, lead assignment #20798.
 
 An agent's runtime sometimes stops on its own modal prompt instead of at its
 input: Codex's rate-limit model menu or model-migration menu, a Claude
@@ -113,12 +113,16 @@ fingerprint posts again. Confirmed answers and `report` post nothing.
 A Claude prompt keeps its first identity until it clears. Claude redraws rows
 inside a dialog while it waits, so the hash of the prompt area changes from one
 capture to the next; while the relay's last report for the run is a Claude
-prompt of the same kind, it reports that prompt's first fingerprint and `since`
-again, and the hub posts nothing. The prompt clears when a capture of the quiet
-pane shows no prompt, when the transcript has an event inside the quiet window
-(the agent moved on), or when the binding has no session. An unreadable pane
-does not clear it. The next dialog after a clear is hashed afresh. Codex menus
-are static and always keep the hash of their own text.
+prompt of the same kind and the transcript has no event after that prompt's
+`since`, it reports that prompt's first fingerprint and `since` again, and the
+hub posts nothing. The prompt clears when a capture of the quiet pane shows no
+prompt, when the transcript has an event inside the quiet window (the agent
+moved on), or when the binding has no session. An unreadable pane does not
+clear it. The next dialog after a clear is hashed afresh. So is a dialog found
+after a transcript event newer than the held prompt's `since`, which covers a
+clearing tick that never ran (relay stopped or restarted, host asleep, ticks
+that skip the observer). Codex menus are static and always keep the hash of
+their own text.
 
 A prompt whose text is identical to one already reported in the same run posts
 nothing when it returns after a clear: the hub remembers every fingerprint of
@@ -134,9 +138,9 @@ Limits:
 
 - A transcript event while a still-changing dialog is open clears its
   identity, so that dialog can notify once more per such event, not per scan.
-- Two different Claude dialogs of one kind with no clearing tick between them
-  are reported as one. That needs a quiet window shorter than the 15-second
-  tick, or two same-kind dialogs before the first turn.
+- Two different Claude dialogs of one kind are reported as one only when no
+  clearing tick ran between them and the transcript has no event after the
+  first was seen: two same-kind dialogs before the first turn, for example.
 - The lead decision is made once, with the first report of a fingerprint. If
   the agent is given work while that prompt is still open, the lead is not
   told afterwards; the owner notice stands and the obligation's own overdue

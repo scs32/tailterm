@@ -503,9 +503,12 @@ func observeRuntimePrompt(ctx context.Context, deps *runtimePromptDeps, b runtim
 	// A Claude dialog redraws rows while it waits, so its hash changes from
 	// one capture to the next. While a prompt of the same kind stays open it
 	// keeps its first identity; clear() ends that, and the next dialog is
-	// hashed afresh. Codex menus are static and keep their content hash,
-	// which the answer checks rely on.
-	if p := l.Prompt; runtime == "claude" && p != nil && p.Runtime == "claude" && p.Kind == match.Kind {
+	// hashed afresh. A transcript event after the prompt was first seen means
+	// the agent moved on, so a dialog found then is a new one even when no
+	// tick cleared the old (relay stopped, host asleep, skipped ticks). Codex
+	// menus are static and keep their content hash, which the answer checks
+	// rely on.
+	if p := l.Prompt; runtime == "claude" && p != nil && p.Runtime == "claude" && p.Kind == match.Kind && !c.LastEventAt.After(p.Since) {
 		match.Fingerprint = p.Fingerprint
 	}
 	actions, err := runtimePromptActions(ctx, client, b, now)
