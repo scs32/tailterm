@@ -1070,12 +1070,22 @@ func (s *Store) CloseAgent(ctx context.Context, id string, by api.Caller) (api.A
 	return s.setAgentStatus(ctx, id, api.AgentClosed, by, true)
 }
 
-// setAgentStatus applies the handler floor (handler_floor.go) and then writes
-// the status. The caller holds s.writeMu.
+// setAgentStatus applies the handler floor (handler_floor.go) and the deployer
+// guard (deployer_guard.go) and then writes the status. The caller holds
+// s.writeMu.
 func (s *Store) setAgentStatus(ctx context.Context, id, status string, by api.Caller, emit bool) (api.Agent, error) {
 	a, err := s.GetAgent(ctx, id)
 	if err != nil {
 		return a, err
+	}
+	if a.Role == api.AgentRoleDeployment {
+		task, err := s.GetTask(ctx, a.TaskID)
+		if err != nil {
+			return a, err
+		}
+		if err = deployerGuardCheck(ctx, s.db, task, a, status); err != nil {
+			return a, err
+		}
 	}
 	if a.Role == api.AgentRoleDatabaseHandler {
 		task, err := s.GetTask(ctx, a.TaskID)
@@ -1095,8 +1105,8 @@ func (s *Store) setAgentStatus(ctx context.Context, id, status string, by api.Ca
 	return s.writeAgentStatus(ctx, id, status, by, emit)
 }
 
-// writeAgentStatus writes the status without the handler floor; only
-// CloseTask, which closes the whole project, calls it directly.
+// writeAgentStatus writes the status without the handler floor or the deployer
+// guard; only CloseTask, which closes the whole project, calls it directly.
 func (s *Store) writeAgentStatus(ctx context.Context, id, status string, by api.Caller, emit bool) (api.Agent, error) {
 	a, err := s.GetAgent(ctx, id)
 	if err != nil {
